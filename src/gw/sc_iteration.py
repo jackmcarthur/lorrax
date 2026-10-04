@@ -5676,18 +5676,23 @@ def _sc_checkpoint_identity(inputs, shape, history_depth):
     The deck digest drops comments, blank lines, the two lines a leg
     rewrites (``restart``, ``sc_initial_qp_rotations_file``) and the stop
     rule (``sc_max_iter``, ``sc_tol_ev``), which a continuation may change.
+    Each line is read as the deck parser reads it (``=`` or ``:``, the key
+    lower-cased, ``#`` comments dropped), so its spelling does not count.
     """
     import hashlib
+    import re
     from common.parallel_transport import fingerprint_from_binding, wfn_fingerprint
     lines = []
     if inputs.config.input_file:
         with open(inputs.config.input_file) as fh:
-            for line in (raw.strip() for raw in fh):
-                key = line.split("=", 1)[0].strip()
-                if line and not line.startswith("#") and key not in (
+            for raw in fh:
+                line = raw.split("#", 1)[0].strip()
+                pair = re.match(r"([^=:]*)[=:](.*)", line)
+                key = (pair.group(1) if pair else line).strip().lower()
+                if line and key not in (
                         "restart", "sc_initial_qp_rotations_file",
                         "sc_max_iter", "sc_tol_ev"):
-                    lines.append(line)
+                    lines.append(f"{key}={pair.group(2).strip()}" if pair else line)
     wfn = (wfn_fingerprint(inputs.wfn) if inputs.wfn_fingerprint_binding is None
            else fingerprint_from_binding(inputs.wfn_fingerprint_binding, inputs.wfn))
     return dict(deck_sha256=hashlib.sha256("\n".join(lines).encode()).hexdigest(),

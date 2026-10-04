@@ -153,3 +153,20 @@ def test_band_carrier_from_a_non_square_read():
     assert out.shape == (2, 3, 6, 6)
     assert np.array_equal(out[..., :5, :5], logical) and not out[..., 5:, :].any()
     assert not out[..., :, 5:].any()
+
+
+def test_deck_digest_reads_lines_as_the_parser_does(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import common.parallel_transport as pt
+    from gw.sc_iteration import _sc_checkpoint_identity
+    monkeypatch.setattr(pt, "wfn_fingerprint", lambda wfn: "wfn")
+
+    def digest(text):
+        deck = tmp_path / "deck.in"
+        deck.write_text(text)
+        inputs = SimpleNamespace(config=SimpleNamespace(input_file=str(deck)),
+                                 wfn=None, wfn_fingerprint_binding=None)
+        return _sc_checkpoint_identity(inputs, (1, 2, 2), 20)["deck_sha256"]
+    base = digest("[cohsex]\nnband = 60\nsc_max_iter = 30\n")
+    assert digest("[cohsex]\nnband=60  # more bands later\nSC_MAX_ITER: 40\n") == base
+    assert digest("[cohsex]\nnband = 61\nsc_max_iter = 30\n") != base
