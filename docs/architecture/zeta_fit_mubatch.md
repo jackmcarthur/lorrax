@@ -31,8 +31,11 @@ solve afterwards. When the charge channel's L and R windows differ, the LR+RL
 completion Z_q ← Z_q + conj Z_{−q} is applied in r space before the q
 selection, as it is for C_q
 ([normal equations](zeta_fit_face_psi_cct.md#normal-equations)). The current
-channels take the same LR+RL completion: they apply one vertex to both legs,
-so RL at q is the conjugate of LR at −q for them too.
+channels take the same LR+RL completion on each Cartesian vertex pair
+(α^i, α^j), before the channel's weights B_ci B_cj combine the pairs: each
+α^i is Hermitian, so RL at q is the conjugate of LR at −q pair by pair. A
+circular channel's combined vertex (α^± = (α^1 ± iα^2)/√2) is not Hermitian,
+so the completion of the combined channel is not its conjugate at −q.
 
 ## One μ batch
 
