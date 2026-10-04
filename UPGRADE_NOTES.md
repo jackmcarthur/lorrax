@@ -5,6 +5,38 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — half first Anderson step; the SC criterion pairs by sorted index
+
+The SC Anderson loop's first step is now half a plain step, x1 = x0 + f0/2.
+Later steps are unchanged (β = 1). The step index is the global map index,
+so a run resumed from a map-0 checkpoint takes the same half step. Along a
+mode with plain-step eigenvalue λ, the map-1 residual is |1 + λ|/2 of map 0's
+instead of |λ|.
+- CrI3 24×24 bispinor (λ ≈ −2.5): 0.75 instead of 2.5.
+- Si 4³ (λ ≈ +0.15): map 1 is worse (1117 against 343 meV), and the run
+  still converges in 8 maps.
+- On Si 4³, eqp0 at |E − VBM| ≤ 10 eV moves by at most 1.0 meV. The deepest
+  valence pair, 12 eV below the VBM, moves 6.2 meV. That is within that
+  state's dependence on the held Σ plan, which is 12.8 meV on the previous
+  code.
+
+The convergence criterion now pairs each input column with the output column
+of the same sorted index. Before, input and output were matched to the map-0
+labels by two separate assignments. On CrI3 24×24 charge QSGW, hybridized
+states then read 1.3 eV where the sorted pair moved 6 meV, so the 1 meV
+criterion fired at map 10 instead of map 9. The label now only names a pair.
+The `SC map gain` line pairs adjacent inputs by sorted index.
+
+Log lines:
+- `SC identity: max |dE| = ... eV, input and output paired by sorted index`
+  replaces `SC identity: max |dE| by overlap = ... (sorted-index value ...)`.
+- `SC matrix residual` ends with `FLAG` when max|dE| exceeds max_k‖f_k‖₂.
+
+Decks do not change. `sc_mixing` is still parsed and range-checked, but
+nothing reads it: the in-process linear-mixing path is deleted. A checkpoint
+written before this change still resumes. Its first `SC map gain` line after
+the resume compares a label-paired table with a sorted one.
+
 ## 2026-10-04 — an SC run continues across processes from sc_seed/sc_checkpoint.h5
 
 Every unconverged SC map except the budget's last now writes
