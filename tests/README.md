@@ -6,6 +6,9 @@
   `test_env_grammar.py`, `test_fft_shardmap_context.py`: static AST suites.
 - `test_sc_checkpoint_resume.py`: SC continuation on toy inputs (CPU): the
   Anderson trajectory across a stop, a refused held Σ rule, the band carrier.
+- `test_trs_qe_decides.py`: the 2c TRS verdict on toy loaders (CPU): QE's
+  t_rev rows and SCF magnetization decide, the wavefunction guard refuses an
+  inconsistent nonmagnetic WFN, and the SCF magnetization is found by density.
 - Benchmarks and backend checks for a standalone service live in that service's
   `services/<svc>/bench/`.
 

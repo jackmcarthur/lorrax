@@ -87,8 +87,10 @@ LORRAX takes the operations from the WFN header and each one's type
 when the schema's operations and k rows match the WFN's. A full-zone k that
 no authorized operation reaches refuses; LORRAX never adds an operation QE
 did not record. Time reversal alone (k ↔ −k pairing for every operation) is
-used only when the DFT reference's occupied-subspace check measures it to
-hold (`wfn.trs_holds`; `symmetry_maps.SymMaps._initialize_active_operations`).
+used only when QE's data says the reference is nonmagnetic: no row typed
+t_rev = 1 and an SCF absolute magnetization below 1e-4 μB/cell; a 2c WFN
+without that data has TRS off (`wfn.trs_holds`;
+`symmetry_maps.density_symmetry_check.qe_trs_off_reason`).
 Recipe: [inputs from DFT](../preprocessing.md#magnetic).
 
 **Why.** A magnet's time-reversal-composed operations are true symmetries;

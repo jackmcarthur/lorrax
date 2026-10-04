@@ -57,22 +57,25 @@ aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
 ## Contract
 
 * **The time-reversal verdict is measured once and consumed everywhere.**
-  `WfnLoader` authenticates the QE `data-file-schema.xml`; the
-  occupied-density check measures the two-component DFT state; the only
-  executable verdict is `WfnLoader.trs_holds` → `SymMaps.trs_allowed`.
-  Missing or inconclusive evidence disables global TR; it never defaults to
-  true. Every consumer (q-grid policy, W gates, GN probe, MPA contour, QSGW
+  `WfnLoader` authenticates the QE `data-file-schema.xml`. For a 2c WFN, TRS
+  holds only if QE types no row t_rev = 1 (if Θ were a symmetry, Θ⁻¹(Θg) = g
+  would be unitary) and the SCF absolute magnetization is below 1e-4 μB/cell
+  (the only TR-odd Kohn-Sham term is σ·B_xc[m]). The magnetization is the
+  schema's own when it is self-consistent, 0 when `do_magnetization` is
+  false, and otherwise that of the SCF schema whose charge-density file the
+  bound `.save` holds byte for byte (an NSCF schema writes 0). No schema or no
+  SCF magnetization means TRS off. The only executable verdict is
+  `WfnLoader.trs_holds` → `SymMaps.trs_allowed`. Every consumer (q-grid policy, W gates, GN probe, MPA contour, QSGW
   velocity parity) reads `SymMaps.trs_allowed`, and none accepts an override.
   The run record prints `QE schema`, `Stored QE type`, `DFT 2c TRS`,
   `Global TRS` and the active operation rows. The MPA ordered-orientation
   equation is owned by [Multipole frequency integration](../theory/THEORY_mpa_implementation.md#21-ordered-orientations-when-time-reversal-is-broken).
-* **The 2c check never uses an antiunitary-generated state as evidence.** Raw
-  `k/−k` pairs and TRIM closure are direct evidence. With only a spatial
-  partner, the check uses the canonical spatial unfold and labels the result
-  conditional; a mismatch then disables antiunitary unfolding without being
-  attributed to TRS alone. The metric is the occupied one-particle-subspace
-  residual in G space, invariant to band phases and to rotations within
-  degenerate blocks. TRIM-only or absent evidence is inconclusive.
+* **The 2c wavefunction check is a guard, run only when QE says
+  nonmagnetic.** Raw `k/−k` pairs, the spatial unfold of a stored partner
+  and TRIM closure are its evidence; any residual above tolerance refuses
+  (`GATE trs_qe_nonmagnetic_wfn_consistent`). The metric is the occupied
+  one-particle-subspace residual in G space, invariant to band phases and to
+  rotations within degenerate blocks.
 * **One measurement per WFN, across processes.** A completed measurement
   (passing or broken) is stamped in `lxkit.user_cache_dir("wfn_trs")`, never
   beside the WFN. The key is the resolved path, size, `mtime_ns` and inode,

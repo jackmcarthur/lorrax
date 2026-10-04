@@ -5,6 +5,28 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — QE's data decides two-component time reversal
+
+For a two-component WFN, TRS now holds only if QE types no operation
+t_rev = 1 and the SCF absolute magnetization is below 1e-4 μB/cell. A
+t_rev = 1 row proves Θ broken (Θ⁻¹(Θg) = g would be a unitary symmetry), and
+in noncollinear DFT the only TR-odd Kohn-Sham term is σ·B_xc[m], so TRS holds
+iff m(r) = 0. The tolerance splits Kramers pairs by about 0.1 meV at a Stoner
+I of 1 eV/μB. The magnetization comes from the bound schema when it is
+self-consistent, is 0 when `do_magnetization` is false, and otherwise comes
+from the SCF schema whose `charge-density` file the NSCF `.save` holds byte
+for byte (an NSCF schema writes `absolute` = 0).
+- No authenticated schema, or no matching SCF schema, means TRS off. Co-stage
+  the SCF `*.save` (QE's `scf/` beside `nscf/`) with the NSCF one.
+- The wavefunction check runs only when QE says nonmagnetic, as a guard: a
+  residual above tolerance refuses (`GATE trs_qe_nonmagnetic_wfn_consistent`).
+  A TRIM-only or empty guard no longer turns TRS off for a nonmagnetic,
+  non-centrosymmetric crystal.
+- Sandbox decks keep their verdicts: CrSBr, CrI3, NiPS3, Fe, Co, Ni off; Si,
+  Na, Bi, TaAs, MoS2 on; the H2⁻ hsuite fixture off. The stamp algorithm is
+  v3, so no cached verdict is reused.
+- Decks do not change.
+
 ## 2026-10-04 — bispinor sectors build whole q-local pole models per rank when parents ≥ ranks
 
 With at least as many irreducible q-parents as ranks, the bispinor CC/TT/CT

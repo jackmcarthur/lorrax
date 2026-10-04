@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import filecmp
 import hashlib
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -77,6 +78,8 @@ class QESymmetryReceipt:
     kpoints_crystal: np.ndarray
     nspinor: int
     do_magnetization: bool | None
+    calculation: str
+    absolute_magnetization: float | None
     nosym: bool
     noinv: bool
     no_t_rev: bool
@@ -95,6 +98,8 @@ class QESymmetryBinding:
     antiunitary: np.ndarray
     qe_permitted_pure_time_reversal: bool
     equivalent_schema_paths: tuple[str, ...] = ()
+    #: |m| (muB/cell) of the SCF that made the .save's density; None if unknown.
+    scf_absolute_magnetization: float | None = None
 
     @property
     def n_antiunitary(self) -> int:
@@ -150,6 +155,8 @@ def _read_qe_symmetry_receipt_cached(
     kgrid: np.ndarray | None = None
     noncolin = False
     do_magnetization: bool | None = None
+    calculation = ""
+    absolute_magnetization: float | None = None
     current_info_anti = False
     current_info_kind: str | None = None
     current_rotation: np.ndarray | None = None
@@ -177,6 +184,10 @@ def _read_qe_symmetry_receipt_cached(
             noncolin = _bool_text(elem.text)
         elif tag == "do_magnetization" and "magnetization" in ancestry:
             do_magnetization = _bool_text(elem.text)
+        elif tag == "absolute" and "magnetization" in ancestry:
+            absolute_magnetization = float(elem.text or "nan")
+        elif tag == "calculation" and "control_variables" in ancestry:
+            calculation = (elem.text or "").strip().lower()
         elif parent == "symmetries" and tag == "nsym":
             declared_nsym = int((elem.text or "").strip())
         elif tag in {"b1", "b2", "b3"} and "reciprocal_lattice" in ancestry:
@@ -287,6 +298,8 @@ def _read_qe_symmetry_receipt_cached(
         kpoints_crystal=k_crystal,
         nspinor=2 if noncolin else 1,
         do_magnetization=do_magnetization,
+        calculation=calculation,
+        absolute_magnetization=absolute_magnetization,
         nosym=flags.get("nosym", False),
         noinv=flags.get("noinv", False),
         no_t_rev=flags.get("no_t_rev", False),
@@ -409,6 +422,45 @@ def discover_qe_schema_paths(wfn_path: str | Path) -> tuple[str, ...]:
     return tuple(str(path) for path in sorted(candidates))
 
 
+#: QE calculations whose schema ``absolute`` is the magnetization of the density they write.
+_SELF_CONSISTENT = {"scf", "relax", "vc-relax", "md", "vc-md"}
+
+
+def _density_file(schema_path: str) -> Path | None:
+    directory = Path(schema_path).parent
+    for name in ("charge-density.hdf5", "charge-density.dat"):
+        if (directory / name).is_file():
+            return directory / name
+    return None
+
+
+def scf_absolute_magnetization(bound: list[QESymmetryReceipt],
+                               candidates) -> float | None:
+    """|m| (muB/cell) of the SCF whose charge density the bound ``.save`` holds.
+
+    An NSCF schema writes ``absolute`` = 0 because it does not recompute m, so
+    the value comes from a self-consistent schema whose density file is
+    byte-identical to the bound one. ``do_magnetization`` false means QE never
+    evolved m: m(r) = 0 identically. None when no such schema is found.
+    """
+    if any(r.do_magnetization is False for r in bound):
+        return 0.0
+    for r in bound:
+        if r.calculation in _SELF_CONSISTENT:
+            return r.absolute_magnetization
+    densities = [d for d in map(_density_file, (r.schema_path for r in bound)) if d]
+    for path in candidates:
+        try:
+            other = read_qe_symmetry_receipt(path)
+        except (OSError, ET.ParseError, ValueError):
+            continue
+        twin = _density_file(other.schema_path)
+        if (other.calculation in _SELF_CONSISTENT and twin is not None
+                and any(filecmp.cmp(twin, d, shallow=False) for d in densities)):
+            return other.absolute_magnetization
+    return None
+
+
 def _binding_signature(binding: QESymmetryBinding) -> tuple:
     return (
         tuple(bool(value) for value in binding.antiunitary),
@@ -435,11 +487,13 @@ def resolve_qe_symmetry_binding(
         return None, "no nearby data-file-schema.xml candidate was found"
 
     bindings: list[QESymmetryBinding] = []
+    receipts: list[QESymmetryReceipt] = []
     rejected: list[str] = []
     for path in paths:
         try:
             receipt = read_qe_symmetry_receipt(path)
             bindings.append(bind_qe_symmetry_receipt(wfn, receipt))
+            receipts.append(receipt)
         except (OSError, ET.ParseError, ValueError) as exc:
             rejected.append(f"{Path(path).resolve()}: {exc}")
     if explicit and not bindings:
@@ -475,6 +529,8 @@ def resolve_qe_symmetry_binding(
         qe_permitted_pure_time_reversal=(
             selected.qe_permitted_pure_time_reversal),
         equivalent_schema_paths=aliases,
+        scf_absolute_magnetization=scf_absolute_magnetization(
+            receipts, discover_qe_schema_paths(wfn_path)),
     )
     diagnostic = (
         f"authenticated {selected.schema_path} "
@@ -495,4 +551,5 @@ __all__ = [
     "qe_xml_seitz_to_bgw",
     "read_qe_symmetry_receipt",
     "resolve_qe_symmetry_binding",
+    "scf_absolute_magnetization",
 ]

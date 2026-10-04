@@ -33,7 +33,7 @@ import.
 | `unfold_parent_to_full_k(parent_psi, *, parent, full_k, bispinor=False)` | The canonical unitary/antiunitary action applied to one already-loaded parent row, so a star is realized with one child workspace and no parent re-read. |
 | `full_k_box_index_one_dev(full_k)`, `ibz_box_index_one_dev(parent)` | One `(1, ngkmax)` replicated sphere index, built on device from the current parent G row, for strict one-k streams. |
 | `symmetry()` | The loader's `SymMaps`; it consumes `trs_holds` (§ Contract). |
-| `trs_holds`, `trs_reference` | The 2c occupied-subspace TRS verdict and its receipt. `density_symmetry` is a compatibility alias of the receipt. |
+| `trs_holds`, `trs_reference` | The 2c TRS verdict (QE's data, wavefunction guard) and its receipt. `density_symmetry` is a compatibility alias of the receipt. |
 | `qe_symmetry_binding`, `qe_symmetry_diagnostic` | Authenticated per-operation unitary/antiunitary provenance, or the reason `SymMaps` uses the announced WFN-only fallback. |
 | `occupations_are_exact_integer`, `occupation_state_capacity`, `physical_density_band_stop`, `physical_density_occupations(*, k)` | The occupation table's integer test (smearing tails count), electrons per unit occupation, the exclusive band stop, and the `(n_k, n_b)` occupation operand for a physical density. |
 | `adopt_mesh(mesh)` | Late mesh binding, § Contract. May raise. |
@@ -78,8 +78,9 @@ grid; consumers decide that against authenticated symmetry metadata
     the coefficient dataset is read: the coefficient slicing hard-codes the
     complex axis, and treats axis 1 as spinor only, so an `nspin = 2` file
     would silently read spin up. `nspinor` may be 1 or 2.
-* **Time reversal.** The constructor measures the 2c occupied-subspace
-  residual (`trs_holds`, `trs_reference`); `symmetry()` passes the verdict to
+* **Time reversal.** The constructor takes the 2c verdict from QE's schema
+  and guards it with the occupied-subspace residual (`trs_holds`,
+  `trs_reference`); `symmetry()` passes the verdict to
   `SymMaps`, which refuses when it is missing. [`symmetry_maps`](symmetry_maps.md#contract)
   owns how the verdict is consumed.
 * **QE schema discovery is bounded.** `qe_schema=None` calls
@@ -88,7 +89,7 @@ grid; consumers decide that against authenticated symmetry metadata
   `scf`, `nscf`, `qe/scf` or `qe/nscf`, anchored at the WFN directory (given
   and resolved) and at most two directories above it. Failing to find one is
   not a refusal: `SymMaps` falls back to the conservative all-spatial header
-  interpretation plus the global TRS verdict and prints a
+  interpretation, a 2c WFN has TRS off, and it prints a
   `SYMMETRY PROVENANCE WARNING` naming `qe_symmetry_diagnostic`.
 * **Parent/star streaming holds one k.** Each full-k star loads its raw parent
   once per band tile and realizes children serially through
