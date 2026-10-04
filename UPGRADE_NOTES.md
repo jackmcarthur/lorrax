@@ -5,6 +5,13 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — the static head reads the deck's Hubbard input
+
+`HeadResolver` now passes `hubbard_input` and `hubbard_occupations` to the
+`dipole.h5` provenance check. Before, every DFT+U deck with the default
+`wcoul0_source = s_tensor` head refused with `GATE dftu_velocity_input`
+before map 0. No result moves; plain-DFT decks are unchanged.
+
 ## 2026-10-04 — QE's data decides two-component time reversal
 
 For a two-component WFN, TRS now holds only if QE types no operation
