@@ -194,19 +194,28 @@ K_POINTS {crystal_b}
 
 ## 6. Band character and moments
 
-Two options, for spinor WFNs, attach physical observables to the bands
-(`bandstructure.orbital`). Both need the `*.upf` files beside the deck.
+These options attach physical observables to the bands of a spinor WFN
+(`bandstructure.orbital`).
 
 **Operators.** On the coarse full Brillouin zone the driver forms the band
-matrices $\langle\psi_{nk}|O|\psi_{mk}\rangle$ of three kinds of operator:
-the Pauli matrices $\sigma_{x,y,z}$; for each atom $I$, the atomic-sphere
-angular momentum $L^I_{x,y,z}$, built from the Löwdin-orthogonalized atomic
-wavefunctions (`PP_PSWFC`) of the pseudopotential, with j-averaged radial
-functions (the projector of QE's `projwfc`); and, per requested channel, the
-projector on one element's $l$ shell. Each operator is carried into the
-Galerkin basis as $C^T O\, C^*$ and Fourier-interpolated exactly as $f(H)$ is.
-On the QP route only the eigenvectors change: $U$ is unitary on the fitted
-window, so the operator image is the same.
+matrices $\langle\psi_{nk}|O|\psi_{mk}\rangle$ of the Pauli matrices
+$\sigma_{x,y,z}$ and, per requested channel, of the projector on one
+element's $l$ shell (Löwdin-orthogonalized `PP_PSWFC` of the `*.upf` beside
+the deck, j-averaged radial functions: QE `projwfc`'s projector). With
+`--velocity` it also reads the stored velocity $v^a_{nm} = \langle
+nk|\partial_{k_a}H|mk\rangle$ of the WFN's states. Each operator is carried
+into the Galerkin basis as $C^T O\, C^*$ and Fourier-interpolated exactly as
+$f(H)$ is. On the `--qp-rotations` route only the eigenvectors change: $U$ is
+unitary on the fitted window, so the operator image is the same.
+
+**Velocity.** `dipole.h5` (`psp.get_dipole_mtxels`, $p + i[V_\mathrm{NL}, r]$)
+belongs to a DFT `WFN.h5`; for QSGW, run on the SC run's `WFN_qp.h5` with its
+`dipole_qsgw.h5`, $U^\dagger(v_\mathrm{DFT} + D_k\Delta H)U$ between the same
+states with their `band_energies`. The file's basis and WFN fingerprint are
+checked and its `velocity` attribute is printed. A QP velocity with no
+$\Sigma$ term refuses, and so does `--velocity` with `--qp-rotations` or
+`--eqp-file`: the DFT velocity with QP energies is not $\partial_k
+H_\mathrm{QP}$ (on a scissored toy model it gives a moment 22 % low).
 
 **Magnetization axis.** $\hat n$ is read from the QE schema that
 authenticates the WFN (`orbital.magnetization_axis`): the SCF output's
@@ -214,48 +223,52 @@ authenticates the WFN (`orbital.magnetization_axis`): the SCF output's
 (`angle1`/`angle2`, stored as `spin_teta`/`spin_phi`) of the magnetic species;
 otherwise $z$. The report names the source.
 
-**`--color spin` and `--color orbital:[EL:]l`** (repeatable; for example
-`orbital:d` or `orbital:Fe:d`) color the path bands by $\langle\sigma\cdot\hat
-n\rangle \in [-1, 1]$ or by the channel's character $\in [0, 1]$, and write
-`bands_<color>.png` (colon replaced by underscore) with the energy axis
-$E - E_F$, $E_F$ from the coarse grid. `band_operators_path.npz` holds every
-path operator matrix (`path_operators`, shape (path point, operator, band,
-band)), `operator_names`, `kpath_frac`, `x_path`, `spin_axis`, `energies_ev`
-(relative to the path VBM) and `energy_reference_ev` (the path VBM relative to
-the coarse $E_F$).
+**`--color spin|orbital|orbital:[EL:]l`** (repeatable) colors the path bands
+by $\langle\sigma\cdot\hat n\rangle \in [-1, 1]$, by the modern-theory
+wavepacket moment $\hat n\cdot\mathbf m_n$ (`orbital`, needs `--velocity`), or
+by a channel's character $\in [0, 1]$ (`orbital:d`, `orbital:Fe:d`), and
+writes `bands_<color>.png` (colon replaced by underscore) with the energy axis
+$E - E_F$, $E_F$ from the coarse grid. With $v$ on the path,
 
-**`--moments-grid NX NY NZ`** interpolates $f(H)$ and every $\sigma_a$ and
-$L^I_a$ to that uniform grid, finds $E_F$ there by Fermi–Dirac occupation of
-the window's electrons at `occ_smearing_width_ry` ($10^{-4}$ Ry when unset),
-and sums
+$$\frac{\mathbf m_n}{\mu_B} = -\tfrac12\,\mathrm{Im}\sum_{m\ne n}
+\frac{\mathbf v_{nm}\times\mathbf v_{mn}}{E_n - E_m}$$
 
-$$m_\mathrm{spin} = \frac{1}{N_q}\sum_{q,n} f_{qn}\langle qn|\boldsymbol\sigma|qn\rangle,
-\qquad m^I_\mathrm{orb} = \frac{1}{N_q}\sum_{q,n} f_{qn}\langle qn|\mathbf L^I|qn\rangle .$$
+(`psp.orbital_response.orbital_moments`; pairs closer than 1.4 meV are
+omitted and degenerate multiplets averaged, because an individual moment
+inside one is gauge dependent). The color scale is linear and clipped at the
+95th percentile of $|\hat n\cdot\mathbf m_n|$; the colorbar states the clip.
+`band_operators_path.npz` holds every path operator matrix (`path_operators`,
+shape (path point, operator, band, band)), `operator_names`, `kpath_frac`,
+`x_path`, `spin_axis`, `energies_ev` (relative to the path VBM),
+`energy_reference_ev` (the path VBM relative to the coarse $E_F$) and, for
+`orbital`, `orbital_moment_path` (path point, 3, band) and `orbital_color`.
 
-`moments.txt` gives the three components and the projection on $\hat n$ of
-each, the grid $E_F$, and the occupation of the top returned band (a warning
-to raise `ncond` above $10^{-6}$). The same sums taken directly on the coarse
-grid, with no interpolation, go to `htransform.out` as a check. Units and
-sign follow QE: $\mu_B$ per cell, $m_\mathrm{spin} = n_\uparrow - n_\downarrow$
-(QE's "total magnetization"), and $m_\mathrm{orb}$ with the same sign flip.
-The physical magnetic moments are therefore
-$\boldsymbol\mu_\mathrm{spin} = -\tfrac{g}{2}\mu_B\, m_\mathrm{spin}$ and
-$\boldsymbol\mu^I_\mathrm{orb} = -\mu_B\, m^I_\mathrm{orb}$ ($\hbar = 1$,
-$g \approx 2$), and $m_\mathrm{orb}/m_\mathrm{spin} > 0$ means
-$\mathbf L \parallel \mathbf S$. The grid runs one $q_z$ plane per pass, so
-one dense $(N_k, N_B, N_B)$ operator image is resident at a time.
+**Totals** (`--velocity`, `orbital_moments.txt`) are physical moments in
+$\mu_B$ per cell along $\hat n$ on the coarse grid. The orbital moment is
+`orbital_response.orbital_magnetization` at each parent k, star-weighted and
+averaged over the group's axial time-odd action: $T = 0$ at midgap without
+`occ_smearing_width_ry`, else the fixed-N Fermi–Dirac $\mu$. It is printed
+at the stored band ceiling and as the intercept $m_\infty$ of $m(c) =
+m_\infty + a/(E_c - \mu)$ over ceilings from 0.6 to 1 of the stored bands.
+The spin moment $-\tfrac{g_e}{2}\mu_B\sum_\mathrm{occ}\langle\boldsymbol
+\sigma\rangle$ ($g_e = 2.00232$) and the two sums follow on their own lines.
 
-The orbital moment is the atomic-sphere part only. The itinerant
-(modern-theory) orbital moment needs the Berry connection of the states and is
-not formed.
+**`--moments-grid NX NY NZ`** interpolates $f(H)$ and every $\sigma_a$ to
+that uniform grid, finds $E_F$ there by Fermi–Dirac occupation of the
+window's electrons at `occ_smearing_width_ry` ($10^{-4}$ Ry when unset), and
+writes $\sum_{q,n} f_{qn}\langle qn|\boldsymbol\sigma|qn\rangle/N_q$ to
+`moments.txt`, with its projection on $\hat n$, the grid $E_F$ and the
+occupation of the top returned band (a warning to raise `ncond` above
+$10^{-6}$). The same sum taken directly on the coarse grid goes to
+`htransform.out`. Signs follow QE ($n_\uparrow - n_\downarrow$). The grid
+runs one $q_z$ plane per pass, so one dense $(N_k, N_B, N_B)$ operator image
+is resident at a time.
 
 *Example.* bcc Fe with spin–orbit coupling on a $20^3$ grid, DFT states:
-interpolated to QE's own $8^3$ SCF grid, $m_\mathrm{spin} = 2.30679\,\mu_B$
+interpolated to QE's own $8^3$ SCF grid, $\sum\langle\sigma\rangle = 2.30679$
 against QE's total magnetization $2.30974\,\mu_B$, and $E_F$ 18.4859 against
-18.4833 eV. On a $40^3$ grid, $m_\mathrm{spin} = 2.28693\,\mu_B$ and the Fe
-$d$ orbital moment along $\hat n$ is $0.05254\,\mu_B$ ($\mathbf L \parallel
-\mathbf S$); the run takes 92–106 s on 9 A100 GPUs (a 3 × 3 mesh) at a device peak of
-17.2 GiB.
+18.4833 eV; on a $40^3$ grid, 2.28693, in 92–106 s on 9 A100 GPUs (a 3 × 3
+mesh) at a device peak of 17.2 GiB.
 
 ## 7. Exciton bands
 

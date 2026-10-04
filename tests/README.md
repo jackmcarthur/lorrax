@@ -9,6 +9,8 @@
 - `test_trs_qe_decides.py`: the 2c TRS verdict on toy loaders (CPU): QE's
   t_rev rows and SCF magnetization decide, the wavefunction guard refuses an
   inconsistent nonmagnetic WFN, and the SCF magnetization is found by density.
+- `test_orbital_modern_route.py`: htransform's orbital totals and velocity
+  refusals on toy inputs (CPU).
 - Benchmarks and backend checks for a standalone service live in that service's
   `services/<svc>/bench/`.
 

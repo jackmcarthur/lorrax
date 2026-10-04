@@ -287,7 +287,7 @@ The method and the flags: [band interpolation and exciton bands](how-to/htransfo
 | `htransform.py` | The htransform driver: `python -m bandstructure.htransform`; band coloring and grid moments. |
 | `fh_interp.py` | The $f(H)$ interpolation library: the $f$-transform, `build_fH_R`, the path solve, Newton inversion, the QP rotation of the compact state. |
 | `bse_setup.py` | Fine-k wavefunctions at the coarse centroids from the same $f(H)$ (`compute_wfns_fi`), for BSE densification and exciton bands. |
-| `orbital.py` | Band operators: spin, atomic-sphere orbital angular momentum, orbital character; their interpolation and grid moments. |
+| `orbital.py` | Band operators (spin, orbital character, the stored velocity), their interpolation, the path orbital moments and coarse orbital totals, and the grid spin moments. |
 | `production_report.py` | The rank-0 report `htransform.out`. |
 
 ## `src/isdf`

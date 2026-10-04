@@ -228,14 +228,15 @@ Interpolates band energies from the coarse grid to the deck's
 k-independent Galerkin basis, $f(H)_k = \sum_n f(\varepsilon_{nk})c_{nk}c_{nk}^\dagger$
 is Fourier-interpolated, and $f$ is inverted at each path point. Optional
 routes put QP energies on the path (`--qp-rotations` or `--eqp-file`), color
-the bands by spin or orbital character (`--color`) and sum spin and orbital
-moments on a uniform grid (`--moments-grid`).
+the bands by spin, orbital character or the modern-theory orbital moment
+(`--color`, the last with `--velocity`), print the coarse per-cell orbital and
+spin moments (`--velocity`) and sum the spin on a uniform grid (`--moments-grid`).
 
 Reads the deck, `WFN.h5` (or `--wfn-file WFN_qp.h5`) and `centroids_file`.
 Writes `bandstructure.dat` (eV, VBM at 0), `htransform.out` and the reusable
 basis `galerkin_dft.h5`; rank 0 writes.
 
-Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--moments-grid 40 40 40]`.
+Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin|orbital] [--velocity dipole.h5] [--moments-grid 40 40 40]`.
 
 [Band interpolation and exciton bands](how-to/htransform-and-exciton-bands.md)
 owns the method, every flag and key, the output formats and the refusals.

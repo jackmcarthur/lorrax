@@ -107,8 +107,9 @@ def plot_bands(result):
     plt.show() 
 
 
-def plot_colored_bands(result, values, *, label, path, signed, e_fermi_ry):
-    """Path bands colored by one band expectation value, saved to ``path``."""
+def plot_colored_bands(result, values, *, label, path, signed, e_fermi_ry,
+                       clip=1.0):
+    """Path bands colored by one band value on a linear scale clipped at ``clip``."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -120,7 +121,7 @@ def plot_colored_bands(result, values, *, label, path, signed, e_fermi_ry):
     sc = ax.scatter(np.repeat(x_path[:nq], nb), energies.ravel(),
                     c=np.asarray(values)[:nq].ravel(), s=3,
                     cmap="coolwarm" if signed else "viridis",
-                    vmin=-1.0 if signed else 0.0, vmax=1.0)
+                    vmin=-clip if signed else 0.0, vmax=clip)
     fig.colorbar(sc, ax=ax, label=label)
     ticks = x_path[np.asarray(node_indices, dtype=int)]
     for xpos in ticks:
@@ -135,61 +136,66 @@ def plot_colored_bands(result, values, *, label, path, signed, e_fermi_ry):
 
 
 def add_band_character_arguments(parser):
-    """The ``--color`` / ``--moments-grid`` flags of band_character_and_moments."""
+    """The ``--color`` / ``--velocity`` / ``--moments-grid`` flags."""
     parser.add_argument(
         "--color", action="append", default=[],
-        metavar="spin|orbital:[EL:]l",
+        metavar="spin|orbital|orbital:[EL:]l",
         help="Color the path bands by <sigma.n> (n: the coarse-grid spin "
-             "moment axis) or by an atomic-orbital character, e.g. "
-             "orbital:d or orbital:Fe:d; repeatable.  Writes "
-             "bands_<color>.png and band_operators_path.npz beside the deck. "
-             "Atomic functions: PP_PSWFC of the *.upf beside the deck.")
+             "moment axis), by the modern-theory orbital moment m_n.n "
+             "(orbital; needs --velocity), or by an atomic-orbital character, "
+             "e.g. orbital:d or orbital:Fe:d (PP_PSWFC of the *.upf beside "
+             "the deck); repeatable.  Writes bands_<color>.png and "
+             "band_operators_path.npz beside the deck.")
+    parser.add_argument(
+        "--velocity", default=None, metavar="dipole.h5|dipole_qsgw.h5",
+        help="The stored velocity of the WFN's own states, for --color "
+             "orbital and the per-cell orbital moment: dipole.h5 "
+             "(psp.get_dipole_mtxels) on a DFT WFN, an SC run's "
+             "dipole_qsgw.h5 on its WFN_qp.h5.  Basis and WFN fingerprint "
+             "are authenticated.")
     parser.add_argument(
         "--moments-grid", type=int, nargs=3, default=None,
         metavar=("NX", "NY", "NZ"),
-        help="Interpolate H, n.sigma and each atom's n.L to this uniform "
-             "grid and write moments.txt: sum_occ <sigma.n> and the "
-             "atomic-sphere <L.n>, Fermi-Dirac at occ_smearing_width_ry with "
-             "E_F re-found on the grid.")
+        help="Interpolate H and n.sigma to this uniform grid and write "
+             "moments.txt: sum_occ <sigma.n>, Fermi-Dirac at "
+             "occ_smearing_width_ry with E_F re-found on the grid.")
     return parser
 
 
-SIGN_CONVENTION = (
-    "mu_B per cell in QE's sign convention: m_spin = sum_occ <sigma> is the "
-    "spin polarization n_up - n_down (QE's 'total magnetization'); m_orb = "
-    "sum_occ <L> (hbar) with the same sign flip, so the physical moments are "
-    "-g/2 mu_B <sigma> and -mu_B <L>, and m_orb/m_spin > 0 means L parallel "
-    "to S")
-
-
-def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
-                               wfn_ctilde, enk_sigma, meta, result, mesh,
-                               input_dir, n_return_bands, a_band,
-                               energy_source, report):
-    """Spin / orbital-character path coloring and grid moments.
+def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
+                               wfn_path, params, ctilde, wfn_ctilde,
+                               enk_sigma, meta, result, mesh, input_dir,
+                               n_return_bands, a_band, energy_source, report):
+    """Spin / orbital path coloring, coarse orbital totals, grid moments.
 
     ``ctilde`` builds H (QP-rotated under ``--qp-rotations``); the operator
     images take ``wfn_ctilde``, the unrotated rows of the WFN band basis
     the operators are computed in.
 
-    1. ``<psi_kn|O|psi_km>`` on the coarse full BZ: sigma_a, the atomic-
-       sphere L_a of each atom, the requested orbital-character projectors.
+    1. ``<psi_kn|O|psi_km>`` on the coarse full BZ: sigma_a, the requested
+       orbital-character projectors and, with ``velocity``, the stored
+       velocity of the WFN's states (``orbital.stored_velocity``).
     2. Magnetization axis n from the WFN's QE schema
        (``bandstructure.orbital.magnetization_axis``).
-    3. Path: the operators in the fH eigenvectors; color by <sigma.n> or by
-       the channel character.
-    4. Grid: H, sigma_a and each atom's L_a interpolated to
-       ``moments_grid``; E_F re-found there; m = sum_q w sum_n f <O>.
+    3. Path: the operators in the fH eigenvectors; color by <sigma.n>, the
+       channel character, or n.m_n (``psp.orbital_response``; degenerate
+       multiplets averaged).
+    4. Coarse totals (``orbital.orbital_totals``), physical moments along n:
+       orbital at the stored ceiling and extrapolated in 1/E_ceiling, spin
+       -(g_e/2) sum_occ <sigma>, and their sum.
+    5. Grid: H and sigma_a on ``moments_grid``; m = sum_q w sum_n f <sigma>.
     """
-    if not colors and not moments_grid:
+    if not colors and not moments_grid and velocity is None:
         return []
     from functools import partial
     import jax.numpy as jnp
+    from gw.degen_average import average_within_degenerate_sets
     from psp.pseudos import load_pseudopotentials
     from .fh_interp import build_fH_R, require_newton_converged
     from .orbital import (band_operators, grid_moments, occupied_sums,
                           interpolate_band_operator, magnetization_axis,
-                          _operator_R)
+                          orbital_totals, path_orbital_moments,
+                          stored_velocity, _operator_R)
 
     report.heading("Band character and moments")
     log = report.emit
@@ -198,56 +204,82 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
     band_start = int(result["band_start"])
     # Electrons in the window: the count, less one per (spinor) band below.
     nelec = float(wfn.num_electrons) - band_start
-    kT = params.get("occ_smearing_width_ry")
-    kT_note = "occ_smearing_width_ry"
-    if kT is None:
-        kT, kT_note = 1.0e-4, "no occ_smearing_width_ry: insulator step at"
-    kT = float(kT)
+    width = params.get("occ_smearing_width_ry")
+    kT, kT_note = ((float(width), "occ_smearing_width_ry") if width is not None
+                   else (1.0e-4, "no occ_smearing_width_ry: insulator step at"))
     channels = [c.split(":", 1)[1] for c in colors if c.startswith("orbital:")]
     for c in colors:
-        if c != "spin" and not c.startswith("orbital:"):
-            raise ValueError(f"--color {c!r}: want spin or orbital:[EL:]l")
-    pseudos = load_pseudopotentials(input_dir)
-    if not pseudos:
+        if c not in ("spin", "orbital") and not c.startswith("orbital:"):
+            raise ValueError(f"--color {c!r}: want spin, orbital or "
+                             "orbital:[EL:]l")
+    if "orbital" in colors and velocity is None:
+        raise ValueError("--color orbital needs --velocity")
+    if velocity is not None and not energy_source.startswith("the WFN's"):
+        raise ValueError(
+            "--velocity is the WFN's own velocity and pairs with its own "
+            "energies; for QSGW run on the SC run's WFN_qp.h5 with its "
+            "dipole_qsgw.h5, not --qp-rotations/--eqp-file (claim 3218)")
+    pseudos = load_pseudopotentials(input_dir) if channels else {}
+    if channels and not pseudos:
         raise FileNotFoundError(
-            f"--color/--moments-grid need the *.upf beside the deck "
+            f"--color orbital:[EL:]l needs the *.upf beside the deck "
             f"({input_dir}) for the PP_PSWFC atomic functions")
     with mesh:
         ops, names = band_operators(
             wfn, (band_start, band_start + nb_fit), mesh, pseudos=pseudos,
             channels=channels)
-    n_vec = 3 + 3 * ((len(names) - 3 - len(channels)) // 3)
     axis, axis_source = magnetization_axis(wfn)
-    log(f"  sign convention: {SIGN_CONVENTION}")
     log(f"  [band operators] {len(names)} on {nk} coarse k x {nb_fit} "
         f"bands: {', '.join(names)}")
     log(f"  magnetization axis n = ({axis[0]:+.5f}, {axis[1]:+.5f}, "
         f"{axis[2]:+.5f}) from {axis_source}")
 
-    def moment_lines(where, mu, m):
-        out = [f"  [{where}] E_F = {mu * RYD_TO_EV:.5f} eV (Fermi-Dirac kT = "
-               f"{kT:.5f} Ry, {kT_note}; N = {nelec:g} electrons)"]
-        for i in range(0, n_vec, 3):
-            v = m[i:i + 3]
-            what = ("spin   sum_occ <sigma>" if i == 0 else
-                    f"orbital <L> {names[i][4:]} (atomic sphere)")
-            out.append(f"  [{where}] {what} = ({v[0]:+.5f}, {v[1]:+.5f}, "
-                       f"{v[2]:+.5f}); along n: {float(axis @ v):+.5f} mu_B")
-        return out
+    def spin_lines(where, mu, m):
+        return [f"  [{where}] E_F = {mu * RYD_TO_EV:.5f} eV (Fermi-Dirac kT = "
+                f"{kT:.5f} Ry, {kT_note}; N = {nelec:g} electrons)",
+                f"  [{where}] sum_occ <sigma> = ({m[0]:+.5f}, {m[1]:+.5f}, "
+                f"{m[2]:+.5f}); along n: {float(axis @ m):+.5f}"]
 
     # Coarse-grid sums: a direct (uninterpolated) check of the grid route.
     diag = np.asarray(gather_to_host(
         jnp.diagonal(ops, axis1=2, axis2=3)))[:, :, :nb_fit].real
     E_k = np.asarray(gather_to_host(enk_sigma), dtype=np.float64).T
-    mu_c, coarse, _ = occupied_sums(E_k, diag[:n_vec], nelec, kT)
-    for line in moment_lines(
-            f"coarse {kgrid[0]}x{kgrid[1]}x{kgrid[2]}"
-            + ("" if energy_source.startswith("DFT") else
-               " (WFN-band diagonals: a check of the DFT route only)"),
-            mu_c, coarse):
+    mu_c, sigma_c, _ = occupied_sums(E_k, diag[:3], nelec, kT)
+    for line in spin_lines(f"coarse {kgrid[0]}x{kgrid[1]}x{kgrid[2]}",
+                           mu_c, sigma_c):
         log(line)
 
     files = []
+    if velocity is not None:
+        deps_tol = 1.4e-3 / RYD_TO_EV    # psp.orbital_magnetization's default
+        parents, E_par, label = stored_velocity(
+            velocity, wfn=wfn, wfn_path=wfn_path, sym=sym, mesh=mesh)
+        mu, ceil, E_c, m = orbital_totals(
+            parents, E_par, sym, nelec=float(wfn.num_electrons),
+            width_ry=width, deps_tol_ry=deps_tol)
+        fit = np.linalg.lstsq(np.c_[np.ones(len(ceil)), 1 / (E_c - mu)], m,
+                              rcond=None)[0][0]
+        spin = -0.5 * 2.00232 * sigma_c          # g_e = 2.00232
+        lines = [
+            f"Orbital moment (modern theory, coarse {kgrid[0]}x{kgrid[1]}x"
+            f"{kgrid[2]}, energies: {energy_source})",
+            f"  velocity: {velocity} = {label}; band_energies of that file",
+            f"  mu = {mu * RYD_TO_EV:+.5f} eV ("
+            + ("T = 0, midgap" if width is None else
+               f"fixed-N Fermi-Dirac, k_B T = {float(width)} Ry") + "); "
+            f"physical moments in mu_B per cell along n",
+            f"  orbital, stored band ceiling {ceil[-1]} (E_c - mu = "
+            f"{(E_c[-1] - mu) * RYD_TO_EV:.2f} eV): {float(axis @ m[-1]):+.6f}"
+            f"  m = ({m[-1][0]:+.6f}, {m[-1][1]:+.6f}, {m[-1][2]:+.6f})",
+            f"  orbital, 1/E_ceiling extrapolation over ceilings {ceil[0]}-"
+            f"{ceil[-1]}: {float(axis @ fit):+.6f}",
+            "  spin -(g_e/2) sum_occ <sigma> (g_e = 2.00232): "
+            f"{float(axis @ spin):+.6f}",
+            f"  spin + orbital at ceiling {ceil[-1]}: "
+            f"{float(axis @ (spin + m[-1])):+.6f}",
+            f"  spin + orbital extrapolated: {float(axis @ (spin + fit)):+.6f}"]
+        for line in lines:
+            log(line)
     if colors:
         kpath_frac = result["kpath_data"][0]
         if kpath_frac is None:
@@ -258,10 +290,31 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
                 ops, wfn_ctilde, result["coeffs_on_path"],
                 np.asarray(kpath_frac), kgrid, mesh))[:nq]
         expect = np.einsum('qaii->qai', path_ops).real
+        extra = {}
+        if "orbital" in colors:
+            E_path = (np.asarray(gather_to_host(result["energies_sorted"]))
+                      + result["energy_reference_ry"])[:nq]
+            with mesh:
+                m_path = path_orbital_moments(
+                    parents, sym, slice(band_start, band_start + nb_fit),
+                    wfn_ctilde, result["coeffs_on_path"], kpath_frac, kgrid,
+                    mesh, E_path, deps_tol)
+            m_n = average_within_degenerate_sets(
+                np.einsum('a,qai->qi', axis, m_path), E_path, deps_tol)
+            clip = float(np.percentile(np.abs(m_n), 95))
+            log(f"  [orbital colors] n.m_n clipped at +-{clip:.4f} mu_B (95th "
+                f"percentile; {np.mean(np.abs(m_n) > clip):.1%} of states)")
+            extra = dict(orbital_moment_path=m_path, orbital_color=m_n,
+                         deps_tol_ry=deps_tol)
         for c in colors:
+            clip_c = 1.0
             if c == "spin":
                 values = np.einsum('a,qai->qi', axis, expect[:, :3])
                 label, signed = r"$\langle \sigma \cdot n \rangle$", True
+            elif c == "orbital":
+                values, signed, clip_c = m_n, True, clip
+                label = (r"$m_n \cdot n$ ($\mu_B$; modern theory; clipped "
+                         rf"at $\pm${clip:.3g})")
             else:
                 values = expect[:, names.index(f"char_{c.split(':', 1)[1]}")]
                 label, signed = f"{c.split(':', 1)[1]} character", False
@@ -269,7 +322,7 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
                                f"bands_{c.replace(':', '_')}.png")
             if jax.process_index() == 0:
                 plot_colored_bands(result, values, label=label, path=png,
-                                   signed=signed, e_fermi_ry=mu_c)
+                                   signed=signed, e_fermi_ry=mu_c, clip=clip_c)
             files.append((f"bands colored by {c}", "written", png))
         npz = os.path.join(input_dir, "band_operators_path.npz")
         if jax.process_index() == 0:
@@ -279,7 +332,7 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
                      energies_ev=result["energies_sorted"] * RYD_TO_EV,
                      energy_reference_ev=(result["energy_reference_ry"]
                                           - mu_c) * RYD_TO_EV,
-                     spin_axis=axis, path_operators=path_ops)
+                     spin_axis=axis, path_operators=path_ops, **extra)
         files.append(("path band operators", "written", npz))
 
     if moments_grid:
@@ -288,26 +341,22 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
             fH_R, f_params, _, _ = build_fH_R(
                 ctilde, enk_sigma, kgrid, mesh, a_band_index=a_band)
             builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde,
-                                kgrid, mesh) for i in range(n_vec)]
+                                kgrid, mesh) for i in range(3)]
             E, D, residual = grid_moments(
                 fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
             np.asarray(gather_to_host(E)), np.asarray(gather_to_host(D)),
             nelec, kT)
-        where = f"grid {grid[0]}x{grid[1]}x{grid[2]}"
         lines = [
             f"Moments on the {grid[0]}x{grid[1]}x{grid[2]} htransform grid "
             f"(energies: {energy_source})",
-            f"  units/sign: {SIGN_CONVENTION}",
+            "  QE's sign: sum_occ <sigma> = n_up - n_down; the physical spin "
+            "moment is -(g_e/2) mu_B sum_occ <sigma>",
             f"  magnetization axis n = ({axis[0]:+.5f}, {axis[1]:+.5f}, "
             f"{axis[2]:+.5f}) from {axis_source}",
-        ] + moment_lines(where, mu, m) + [
+        ] + spin_lines(f"grid {grid[0]}x{grid[1]}x{grid[2]}", mu, m) + [
             f"  max occupation of the top returned band = {f_top:.2e}",
-            "  approximation: <L> from Loewdin-orthogonalized PP_PSWFC "
-            "projections (j-averaged radial functions, QE projwfc's atomic "
-            "sphere); the itinerant modern-theory orbital term needs the "
-            "Berry connection and is not included",
         ]
         if f_top > 1e-6:
             lines.append("  WARNING: the returned window is not empty at "
@@ -424,7 +473,7 @@ def main(argv=None):
                 "diagonal quasiparticle energies from "
                 f"{os.path.basename(args.eqp_file)}")
         else:
-            _energy_source = "DFT eigenvalues from the WFN"
+            _energy_source = "the WFN's eigenvalues (QP for a WFN_qp.h5)"
         report.begin(input_file=args.input, output_file=output_path,
                      energy_source=_energy_source)
         report.architecture()
@@ -626,8 +675,10 @@ def main(argv=None):
                 f"enk_full={wfns_fi.enk_full.shape}")
 
         _moment_files = band_character_and_moments(
-                colors=args.color, moments_grid=args.moments_grid, wfn=wfn,
-                params=params, ctilde=ctilde, wfn_ctilde=wfn_ctilde,
+                colors=args.color, moments_grid=args.moments_grid,
+                velocity=args.velocity and _output_path(args.velocity),
+                wfn=wfn, sym=sym, wfn_path=_wfn_path, params=params,
+                ctilde=ctilde, wfn_ctilde=wfn_ctilde,
                 enk_sigma=enk_sigma, meta=meta,
                 result=result, mesh=mesh_xy, input_dir=input_dir,
                 n_return_bands=n_return_bands, a_band=args.a_band,

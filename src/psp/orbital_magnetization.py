@@ -59,8 +59,8 @@ _services.ensure_on_path()
 
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import Meta
-from common.wfn_transforms import load_kpoint_fftbox
-from psp.pseudos import load_pseudopotentials, print_atomic_structure
+from psp.orbital_response import orbital_pieces_at_k
+from psp.pseudos import load_pseudopotentials
 import psp.vnl_ops as vnl_ops
 
 
@@ -187,145 +187,6 @@ def spin_moment_ibz(wfn, sym, *, nocc):
 
 
 # ----------------------------------------------------------------------
-#  Modern-theory sum-over-states summand at one k
-# ----------------------------------------------------------------------
-def orbital_pieces_at_k(v, eps, nocc, deps_tol):
-    """mu-independent building blocks of the orbital-moment summand at one k.
-
-    Returns (PA, PB), each (3, nb, nb) complex, with the per-(gamma, n, m) terms
-
-        PA[g,n,m] = occ[n] * cross_g[n,m] * (eps_n + eps_m) / (eps_n-eps_m)^2
-        PB[g,n,m] = occ[n] * cross_g[n,m] /               (eps_n-eps_m)^2
-
-    where cross_g[n,m] = eps_{g a b} v^a_nm v^b_mn, index map v^a_nm = v[a,n,m]
-    (bra n, ket m), so cross_z = v[0]*v[1].T - v[1]*v[0].T (element-wise).
-    The full summand at chemical potential mu is then linear in mu:
-
-        summand_g(mu)[n,m] = PA[g,n,m] - 2*mu*PB[g,n,m]
-
-    so ANY mu, the per-band breakdown (sum over m), and the band-ceiling
-    convergence (cumsum over m) all follow from one pass — no recomputation.
-    The (+1/2) prefactor and Im[.] are applied by the caller.  Degenerate /
-    diagonal denominators (|eps_n-eps_m| <= deps_tol) are masked to 0.
-    """
-    from psp.orbital_response import orbital_velocity_products
-    cross, inverse, _ = orbital_velocity_products(v, eps, deps_tol)
-    cross, inv2 = np.asarray(cross), np.asarray(inverse) ** 2
-    occ = (np.arange(len(eps)) < nocc)[:, None]
-    return (cross * (occ * (eps[:, None] + eps[None, :]) * inv2)[None],
-            cross * (occ * inv2)[None])
-
-
-
-# ----------------------------------------------------------------------
-#  Band-sum-free orbital magnetization (Sternheimer covariant derivative)
-# ----------------------------------------------------------------------
-def run_sternheimer_orbmag(wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc,
-                           truncation_2d):
-    """Orbital magnetization WITHOUT an empty-band sum, via the covariant
-    derivative |∂̃_a u_v⟩ = Q_k ∂_{k_a} u_v solved from H, dH/dk and the
-    occupied projector (Sternheimer / DFPT linear response).
-
-    Per full-BZ k, per occupied band v: solve the Sternheimer equation (reusing
-    ``run_sternheimer.compute_kp_tangent_at_kvec``) for |∂̃_a u_v⟩ (a=x,y,z),
-    then the per-k orbital-moment AXIAL VECTOR
-        m_γ(k) = (+1/2) Im Σ_v ε_{γab} ⟨∂̃_a u_v|(H_k+ε_v−2μ)|∂̃_b u_v⟩.
-    The conduction manifold is summed exactly inside the Sternheimer inverse, so
-    the result is BAND-COUNT INDEPENDENT (no SOS tail).  μ-linear split:
-        cA from the (H_k+ε_v)-sandwich, cB from the overlap ⟨∂̃_a|∂̃_b⟩
-    ⇒ C_of_mu(μ) = cA − 2μ·cB, reusing the shared reporting verbatim.
-
-    Returns the same 7-tuple as :func:`run_ibz`.  V_scf (the local KS potential)
-    is reconstructed from the WFN's own density (`scf_potential`); no extra files.
-    """
-    import jax.numpy as jnp
-    from psp.dft_operators import (setup_H_k_from_kvec, apply_H_k_from_G,
-                                   compute_ngkmax)
-    from psp.run_sternheimer import (_psi_box_to_G_sphere,
-                                     compute_kp_tangent_at_kvec)
-    from psp.scf_potential import build_rho_val_from_wfn, build_dft_potentials
-    from solvers.sternheimer_precond import (compute_per_band_kinetic,
-                                             tpa_preconditioner_diag)
-
-    nk = int(sym.nk_tot)
-    w_k = 1.0 / nk
-    bdot = jnp.asarray(wfn.bdot, dtype=jnp.float64)
-    fft_grid = tuple(int(x) for x in wfn.fft_grid)
-
-    # --- V_scf = V_loc[UPF] + V_H[ρ_val] + V_xc[ρ_val] (rebuilt from the WFN) --
-    print("[orbmag-sternheimer] reconstructing V_scf from the WFN density "
-          "(full-BZ ρ_val; integral must equal nelec)...")
-    rho_val = build_rho_val_from_wfn(wfn, sym, meta, nocc, verbose=True)
-    V_scf, V_loc, _vnl2 = build_dft_potentials(
-        wfn, pseudos, rho_val, truncation_2d=truncation_2d, verbose=True)
-    kvecs_full = np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64)
-    ngkmax = int(compute_ngkmax(kvecs_full,
-                                np.asarray(wfn.bdot), float(wfn.ecutwfc), fft_grid))
-    # QE-DFPT level shift α_pv = 2(E_max − E_min) over occupied bands (all k)
-    en_occ = np.asarray(wfn.energies[0, :, :nocc], dtype=np.float64)
-    alpha_pv = jnp.asarray(2.0 * (float(en_occ.max()) - float(en_occ.min())),
-                           dtype=jnp.float64)
-
-    cA = np.zeros(3, dtype=np.complex128)
-    cB = np.zeros(3, dtype=np.complex128)
-    S_sum = 0.0
-    E = np.zeros((nk, nbnd), dtype=np.float64)
-    print(f"[orbmag-sternheimer] {nk} full-BZ k × {nocc} occ bands, "
-          f"α_pv={float(alpha_pv):.2f} Ry; solving Sternheimer (no band sum)...")
-
-    def _axial(M):                                       # M (nv,3,3) -> (3,) axial
-        A = M - jnp.swapaxes(M, 1, 2)
-        return jnp.stack([A[:, 1, 2], A[:, 2, 0], A[:, 0, 1]], axis=-1).sum(axis=0)
-
-    for ik in range(nk):
-        kv = np.asarray(kvecs_full[ik], dtype=np.float64)
-        k_red = int(sym.irr_idx_k[ik])
-        eps_full = np.asarray(wfn.energies[0, k_red, :nbnd], dtype=np.float64)
-        E[ik] = eps_full
-        eps_v = jnp.asarray(eps_full[:nocc], dtype=jnp.float64)
-
-        box = load_kpoint_fftbox(wfn, sym, meta, ik, nbnd)     # unfolded ψ box
-        H_k = setup_H_k_from_kvec(kv, V_scf, vnl_setup, wfn, meta,
-                                  V_loc_r=V_loc, ngkmax=ngkmax)
-        Gk_int = jnp.stack([H_k.Gx, H_k.Gy, H_k.Gz], axis=-1).astype(jnp.int32)
-        maskf = H_k.mask[None, None, :]
-        U_val_G = (_psi_box_to_G_sphere(box, Gk_int)[:nocc]
-                   * maskf.astype(box.dtype))               # (nv, ns, nG)
-
-        K_bar_sq = compute_per_band_kinetic(U_val_G, H_k.T_diag)
-        precond = tpa_preconditioner_diag(H_k.T_diag, K_bar_sq)
-
-        # |∂̃_a u_v⟩ via Sternheimer — (3, nv, ns, nG), occupied only, no band sum
-        d = compute_kp_tangent_at_kvec(
-            kv, np.asarray(Gk_int), vnl_setup, V_scf, H_k.mask,
-            H_k.Gx, H_k.Gy, H_k.Gz, fft_grid, bdot, H_k.vnl_E,
-            U_val_G, eps_v, alpha_pv, precond, tol=1e-10, max_iter=200)
-
-        md = d * maskf.astype(d.dtype)
-
-        def _Heps(da):                                   # (H_k + ε_v) |∂̃_a u_v⟩
-            Hd = apply_H_k_from_G(da, H_k.T_diag, H_k.V_scf, H_k.Gx, H_k.Gy,
-                                  H_k.Gz, H_k.vnl_Z, H_k.vnl_E, H_k.mask)
-            return Hd + eps_v[:, None, None] * (da * maskf.astype(da.dtype))
-        opA = jax.vmap(_Heps)(d)                         # (3, nv, ns, nG)
-
-        M0 = jnp.einsum('avsG,bvsG->vab', jnp.conj(md), opA, optimize=True)
-        M1 = jnp.einsum('avsG,bvsG->vab', jnp.conj(md), md, optimize=True)
-        cA += w_k * np.asarray(_axial(M0))               # (H+ε) sandwich
-        cB += w_k * np.asarray(_axial(M1))               # overlap (the −2μ piece)
-
-        psi_np = np.asarray(U_val_G)
-        sz = (np.abs(psi_np[:, 0]) ** 2 - np.abs(psi_np[:, 1]) ** 2).sum(axis=1).real
-        S_sum += w_k * float(sz.sum())
-        if (ik + 1) % 6 == 0 or ik == nk - 1:
-            print(f"         k {ik+1}/{nk}")
-
-    z = np.zeros((nbnd, nbnd), dtype=np.complex128)
-    info = {"nk_ibz": nk, "nG": 0, "idx": [], "method": "sternheimer"}
-    return cA, cB, z, z, -1.0 * S_sum, E, info
-
-
-# ----------------------------------------------------------------------
 #  Hellmann-Feynman group-velocity check of the loaded velocity
 # ----------------------------------------------------------------------
 def hf_group_velocity_check(V, eps_grid, kcrys_grid, B, kgrid):
@@ -405,15 +266,6 @@ def main(argv=None):
                    help="Degenerate-denominator skip tolerance in eV (default 1.4e-3)")
     p.add_argument("--pseudo-dir", default=None,
                    help="Directory of *.upf (default: auto-discover near WFN)")
-    p.add_argument("--method", choices=["sos", "sternheimer"], default="sos",
-                   help="Evaluation route: 'sos' = direct sum-over-states (band-"
-                        "convergence pathological); 'sternheimer' = band-sum-free "
-                        "covariant derivative (occupied states only, no empty-band "
-                        "sum). Default sos.")
-    p.add_argument("--truncation-2d", dest="truncation_2d",
-                   action=argparse.BooleanOptionalAction, default=True,
-                   help="2D slab Coulomb truncation in V_H when rebuilding V_scf "
-                        "(sternheimer mode). Default True (monolayer CrI3).")
     p.add_argument("--convergence", action="store_true",
                    help="Report m_z vs inner-m band ceiling")
     p.add_argument("--per-band", action="store_true",
@@ -430,6 +282,13 @@ def main(argv=None):
     wfn = WfnLoader(str(wfn_path), mesh=runtime.mesh)
     sym = wfn.symmetry()
 
+    from file_io.dipole import wfn_psi_basis
+    if wfn_psi_basis(wfn_path) == "qp":
+        sys.exit(f"[orbmag] GATE orbmag_qp_wfn: got the QP WFN {wfn_path}; want "
+                 "the DFT WFN of its velocity: this CLI's velocity is the DFT "
+                 "p + i[V_NL, r], and with QP energies it is not d(H_QP)/dk "
+                 "(claim 3218).  Fix: python -m bandstructure.htransform on the "
+                 "WFN_qp.h5 with --velocity dipole_qsgw.h5 (its Sigma velocity).")
     nspinor = int(wfn.nspinor)
     if nspinor != 2:
         sys.exit(f"[orbmag] ERROR: nspinor={nspinor}. Orbital magnetization is "
@@ -458,66 +317,41 @@ def main(argv=None):
                             f"{list(pseudos)}")
                 break
 
-    out_extra = {}                                   # branch-specific --out payload
-    if args.method == "sternheimer":
-        # ---- band-sum-free Sternheimer covariant-derivative branch -------
-        # This route assembles its OWN H_k and dH/dk and has no i[r, V_U]: a
-        # DFT+U mean field refuses through the one resolver.
-        from psp.hubbard_ops import resolve_hubbard_input
-        resolve_hubbard_input(
-            "", "", wfn=wfn, base_dir=str(wfn_path.parent),
-            caller="psp.orbital_magnetization sternheimer (no V_U term)")
-        if not pseudos:
-            sys.exit("[orbmag] ERROR: no *.upf found (the Sternheimer route "
-                     "needs the full KS H). Pass --pseudo-dir.")
-        print_atomic_structure(wfn, pseudos)
-        nval = int(wfn.nelec)
-        meta = Meta.from_system(wfn, sym, nval, max(0, nbnd - nval), nbnd,
-                                0, False)
-        vnl_setup = vnl_ops.build_vnl_setup(
-            wfn, sym, meta, pseudos, nspinor=nspinor)
-        cA, cB, PA_band_z, PB_band_z, m_spin_z, E, info = run_sternheimer_orbmag(
-            wfn, sym, meta, vnl_setup, pseudos, nbnd, nocc, args.truncation_2d)
+    V, source = dft_velocity_full_bz(
+        wfn, sym, nbnd=nbnd, mesh=runtime.mesh,
+        artifact=wfn_dir / VELOCITY_ARTIFACT, pseudos=pseudos)
+    rank0_print(f"[orbmag] velocity: {source}")
+    nk = int(sym.nk_tot)
+    w_k = 1.0 / nk                                   # uniform full-BZ weight
+    E = np.asarray(wfn.energies[0], dtype=np.float64)[
+        np.asarray(sym.irr_idx_k, dtype=np.int64), :nbnd]
+    hf = hf_group_velocity_check(
+        V, E, np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64),
+        np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat),
+        wfn.kgrid)
+    rank0_print(
+        "[orbmag] Hellmann-Feynman check of the loaded velocity: RMS "
+        f"|Re diag(v) - d eps/dk| = {hf['rms']:.4f} Ry*Bohr against RMS "
+        f"slope {hf['slope_rms']:.4f} ({hf['nsamples']} band/k samples). "
+        "Diagnostic only: the central difference spans two grid steps "
+        "and follows band index, so crossings on a coarse or flat-band "
+        "grid inflate it, and it is blind to the nonlocal sign")
+    PA = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+    PB = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
+    for ik in range(nk):
+        pa, pb = orbital_pieces_at_k(V[ik], E[ik], nocc, deps_tol)
+        PA += w_k * pa
+        PB += w_k * pb
+    del V
+    cA, cB = PA.sum(axis=(1, 2)), PB.sum(axis=(1, 2))
+    # The physical spin moment -mu_B sum_occ <sigma> fixes the reporting axis.
+    m_spin = -spin_moment_ibz(wfn, sym, nocc=nocc)
+    n_hat = m_spin / np.linalg.norm(m_spin)
+    PA_band_n = np.einsum("g,gnm->nm", n_hat, PA)
+    PB_band_n = np.einsum("g,gnm->nm", n_hat, PB)
 
-        def C_of_mu(m):
-            return cA - 2.0 * m * cB
-        out_extra = {"cA": cA, "cB": cB, "method": "sternheimer"}
-    else:
-        # ---- sum over states on the distributed full-BZ velocity ---------
-        V, source = dft_velocity_full_bz(
-            wfn, sym, nbnd=nbnd, mesh=runtime.mesh,
-            artifact=wfn_dir / VELOCITY_ARTIFACT, pseudos=pseudos)
-        rank0_print(f"[orbmag] velocity: {source}")
-        nk = int(sym.nk_tot)
-        w_k = 1.0 / nk                               # uniform full-BZ weight
-        E = np.asarray(wfn.energies[0], dtype=np.float64)[
-            np.asarray(sym.irr_idx_k, dtype=np.int64), :nbnd]
-        hf = hf_group_velocity_check(
-            V, E, np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64),
-            np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat),
-            wfn.kgrid)
-        rank0_print(
-            "[orbmag] Hellmann-Feynman check of the loaded velocity: RMS "
-            f"|Re diag(v) - d eps/dk| = {hf['rms']:.4f} Ry*Bohr against RMS "
-            f"slope {hf['slope_rms']:.4f} ({hf['nsamples']} band/k samples). "
-            "Diagnostic only: the central difference spans two grid steps "
-            "and follows band index, so crossings on a coarse or flat-band "
-            "grid inflate it, and it is blind to the nonlocal sign")
-        PA = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
-        PB = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
-        for ik in range(nk):
-            pa, pb = orbital_pieces_at_k(V[ik], E[ik], nocc, deps_tol)
-            PA += w_k * pa
-            PB += w_k * pb
-        del V
-        PA_band_z, PB_band_z = PA[2], PB[2]
-        cA, cB = PA.sum(axis=(1, 2)), PB.sum(axis=(1, 2))
-        m_spin_z = -float(spin_moment_ibz(wfn, sym, nocc=nocc)[2])
-        info = {"nk_full": nk, "velocity": source}
-
-        def C_of_mu(m):
-            return cA - 2.0 * m * cB
-        out_extra = {"cA": cA, "cB": cB, "velocity_source": source}
+    def C_of_mu(m):
+        return cA - 2.0 * m * cB
 
     # ---- shared: chemical potential + reporting --------------------------
     VBM = float(E[:, nocc - 1].max())
@@ -529,65 +363,54 @@ def main(argv=None):
     if gap_eV < 0:
         rank0_print("         NOTE: negative indirect gap at this k-sampling -> the "
               "moment is mu-dependent (run --mu-scan).")
-    rank0_print(f"\n[orbmag] spin moment  sum_occ <sigma_z> = {-m_spin_z:+.4f}  -> "
-          f"|m_spin| = {abs(m_spin_z):.3f} mu_B  (expect ~6 for CrI3)")
+    rank0_print(f"\n[orbmag] spin moment -mu_B sum_occ <sigma> = ({m_spin[0]:+.4f}, "
+                f"{m_spin[1]:+.4f}, {m_spin[2]:+.4f}): |m_spin| = "
+                f"{np.linalg.norm(m_spin):.3f} mu_B (g = 2)")
 
     m_orb = MU_B_PREFACTOR * C_of_mu(mu).imag       # (3,) mu_B, file frame
-    frame = 1.0 if m_spin_z >= 0 else -1.0
-    m_orb_par = float(frame * m_orb[2])              # along spin-moment axis
+    m_orb_par = float(m_orb @ n_hat)                 # along spin-moment axis
 
     rank0_print("\n" + "=" * 64)
     rank0_print("ORBITAL MAGNETIC MOMENT  (per unit cell, mu_B)")
     rank0_print("=" * 64)
-    rank0_print(f"  m_x = {m_orb[0]:+.5f}   m_y = {m_orb[1]:+.5f}   "
-          f"(should be ~0 by symmetry)")
-    rank0_print(f"  m_z = {m_orb[2]:+.5f}   (file z-axis = crystal c, out of plane)")
+    rank0_print(f"  m = ({m_orb[0]:+.5f}, {m_orb[1]:+.5f}, {m_orb[2]:+.5f})  "
+                "(Cartesian file frame)")
     rank0_print(f"  orbital moment along spin axis: {m_orb_par:+.5f} mu_B  "
           f"({'PARALLEL' if m_orb_par>0 else 'ANTIPARALLEL'} to spin)")
-    rank0_print(f"  spin moment |m_spin| = {abs(m_spin_z):.3f} mu_B")
-    if args.method == "sternheimer":
-        rank0_print(f"  [Sternheimer covariant-derivative: BAND-SUM-FREE, "
-              f"{info['nk_ibz']} full-BZ k, occupied-only]")
-    else:
-        rank0_print(f"  [full-BZ sum over {info['nk_full']} k; velocity: "
-                    f"{info['velocity']}]")
+    rank0_print(f"  [full-BZ sum over {nk} k; velocity: {source}]")
     rank0_print("=" * 64)
 
     if args.mu_scan and nocc < nbnd:
-        rank0_print("\n[orbmag] mu-scan (m_z, mu_B):")
+        rank0_print("\n[orbmag] mu-scan (m along the spin axis, mu_B):")
         for label, m in [("VBM", VBM), ("midgap", 0.5 * (VBM + CBM)), ("CBM", CBM)]:
-            rank0_print(f"   mu={m*RY2EV:8.4f} eV ({label:6s}):  "
-                  f"m_z = {MU_B_PREFACTOR*float(C_of_mu(m)[2].imag):+.5f}")
+            rank0_print(f"   mu={m*RY2EV:8.4f} eV ({label:6s}):  m = "
+                  f"{MU_B_PREFACTOR*float(C_of_mu(m).imag @ n_hat):+.5f}")
 
-    if args.method == "sternheimer" and (args.convergence or args.per_band):
-        rank0_print("\n[orbmag] (--convergence/--per-band N/A for sternheimer: the "
-              "result is BAND-COUNT INDEPENDENT by construction — the conduction "
-              "manifold is summed exactly inside the Sternheimer inverse.)")
-
-    if args.convergence and args.method != "sternheimer":
-        rank0_print("\n[orbmag] convergence vs inner-m band ceiling (m_z, mu_B):")
-        col_z = (PA_band_z - 2.0 * mu * PB_band_z).sum(axis=0)  # sum over occupied n
-        cum = np.cumsum(col_z)                                  # partial sums over m
+    if args.convergence:
+        rank0_print("\n[orbmag] convergence vs inner-m band ceiling (m along the "
+                    "spin axis, mu_B):")
+        col = (PA_band_n - 2.0 * mu * PB_band_n).sum(axis=0)    # sum over occupied n
+        cum = np.cumsum(col)                                    # partial sums over m
         for mc in sorted(set([int(0.5*nbnd), int(0.7*nbnd), int(0.85*nbnd), nbnd])):
-            rank0_print(f"   mceil={mc:4d}:  m_z = {MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
+            rank0_print(f"   mceil={mc:4d}:  m = {MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
 
-    if args.per_band and args.method != "sternheimer":
-        band_z = (PA_band_z - 2.0 * mu * PB_band_z).sum(axis=1)  # per outer-n
-        m_par_band = frame * (MU_B_PREFACTOR) * band_z.imag
-        rank0_print("\n[orbmag] per-occupied-band m_z (along spin axis, mu_B):")
+    if args.per_band:
+        band_n = (PA_band_n - 2.0 * mu * PB_band_n).sum(axis=1)  # per outer-n
+        m_par_band = MU_B_PREFACTOR * band_n.imag
+        rank0_print("\n[orbmag] per-occupied-band m (along spin axis, mu_B):")
         order = np.argsort(np.abs(m_par_band[:nocc]))[::-1]
         for n in order[:12]:
             rank0_print(f"   band {n:3d}: {m_par_band[n]:+.5f}")
 
     if args.out and jax.process_index() == 0:
-        # colA_z/colB_z: z-component band-resolved columns (summed over occ n,
-        # BZ-weighted) — cumsum over the inner-m index gives m_z vs band ceiling
-        # (the band-convergence curve) at any mu, in either mode.
-        _mode = args.method
+        # colA_n/colB_n: band-resolved columns along the spin axis (summed over
+        # occ n, BZ-weighted); cumsum over the inner-m index gives m vs band
+        # ceiling (the band-convergence curve) at any mu.
         np.savez_compressed(args.out, E=E, mu=mu, nocc=nocc, m_orb=m_orb,
-                            m_spin_z=m_spin_z, mode=_mode,
-                            colA_z=PA_band_z.sum(axis=0), colB_z=PB_band_z.sum(axis=0),
-                            **out_extra)
+                            m_spin=m_spin, spin_axis=n_hat,
+                            colA_n=PA_band_n.sum(axis=0),
+                            colB_n=PB_band_n.sum(axis=0), cA=cA, cB=cB,
+                            velocity_source=source)
         rank0_print(f"\n[orbmag] wrote {args.out}")
 
 

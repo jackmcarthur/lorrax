@@ -12,11 +12,10 @@ Fourier-interpolated exactly as fH is.  A QP rotation ``U`` is unitary on
 the fitted window, so ``C_QP^T O_QP C_QP^* = C^T O C^*``: the operators come
 from the WFN states, the QP enters only through the fH eigenvectors.
 
-This does not differentiate H.  The itinerant (modern-theory) orbital
-moment needs the Berry connection of the fitted states and is not formed;
-the orbital moment here is the atomic-sphere ``<L>`` of Loewdin-
-orthogonalized PP_PSWFC projections (QE projwfc's projector; radial
-functions j-averaged as in ``psp.hubbard_ops``).
+The orbital moment is the modern-theory one (``psp.orbital_response``): a
+stored velocity of the WFN's own states (:func:`stored_velocity`) is
+interpolated like any band operator and contracted on the path, and its
+coarse-grid parent rows give the per-cell total (:func:`orbital_totals`).
 """
 from functools import partial
 
@@ -36,36 +35,6 @@ PAULI = np.array([[[0, 1], [1, 0]],
                   [[1, 0], [0, -1]]], dtype=np.complex128)
 _AXES = ("x", "y", "z")
 _L_OF = {"s": 0, "p": 1, "d": 2, "f": 3}
-
-
-def angular_momentum_matrices(l: int) -> np.ndarray:
-    """``<Y_m'|L_a|Y_m>`` (3, 2l+1, 2l+1) in QE's real-harmonic order.
-
-    ``L_a = -i eps_abc x_b d_c`` acts on the solid harmonics of
-    ``psp.radial.solid_harmonics`` (the V_NL and atomic-row owner), so the
-    matrices carry its ordering and signs by construction.
-    """
-    from psp.radial.solid_harmonics import solid_harmonics_jax
-    n = 2 * l + 1
-    if l == 0:
-        return np.zeros((3, 1, 1), dtype=np.complex128)
-    x = np.random.default_rng(0).normal(size=(8 * n, 3))
-    x /= np.linalg.norm(x, axis=1, keepdims=True)
-    Y = np.asarray(solid_harmonics_jax(l, jnp.asarray(x)))          # (m, q)
-    dY = np.asarray(jax.vmap(jax.jacfwd(
-        lambda p: solid_harmonics_jax(l, p[None, :])[:, 0]))(jnp.asarray(x)))
-    eps = np.zeros((3, 3, 3))
-    for a, b, c in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
-        eps[a, b, c], eps[a, c, b] = 1.0, -1.0
-    LY = -1j * np.einsum("abc,qb,qmc->aqm", eps, x, dY)             # (a, q, m)
-    L = np.stack([np.linalg.lstsq(Y.T, LY[a], rcond=None)[0]
-                  for a in range(3)])                                 # (a, m', m)
-    L2 = np.einsum("aij,ajk->ik", L, L)
-    if (np.max(np.abs(L - np.conj(np.swapaxes(L, 1, 2)))) > 1e-10
-            or np.max(np.abs(L2 - l * (l + 1) * np.eye(n))) > 1e-9):
-        raise ValueError(f"angular_momentum_matrices: l={l} fit is not a "
-                         "Hermitian L with L^2 = l(l+1)")
-    return L
 
 
 def magnetization_axis(wfn):
@@ -108,31 +77,9 @@ def magnetization_axis(wfn):
                "directions, no output total)")
 
 
-def _atomic_operator_table(row_labels, channels):
-    """(n_op, R, R) atomic-row operators and their names.
-
-    Per atom I: ``L_a`` on each (atom, radial function) shell.  Per
-    channel ``[element:]l``: the projector on those rows.  The spin axis
-    is the identity (pure-spin spinor rows).
-    """
-    R = len(row_labels)
-    atoms = sorted({int(lab[0]) for lab in row_labels})
-    elements = {int(lab[0]): lab[1] for lab in row_labels}
-    L_of = {}
-    full = np.zeros((len(atoms), 3, R, R), dtype=np.complex128)
-    r = 0
-    while r < R:
-        atom, _el, _label, l, _m = row_labels[r]
-        n = 2 * int(l) + 1
-        if l not in L_of:
-            L_of[l] = angular_momentum_matrices(int(l))
-        full[atoms.index(int(atom)), :, r:r + n, r:r + n] = L_of[l]
-        r += n
-    ops, names = [], []
-    for i, atom in enumerate(atoms):
-        for a in range(3):
-            ops.append(full[i, a])
-            names.append(f"L_{_AXES[a]}:{elements[atom]}{atom}")
+def _character_table(row_labels, channels):
+    """(n_op, R, R) projectors on the atomic rows of each ``[element:]l``."""
+    ops = []
     for spec in channels:
         element, _, letter = spec.rpartition(":")
         if letter.lower() not in _L_OF:
@@ -144,18 +91,19 @@ def _atomic_operator_table(row_labels, channels):
             raise ValueError(f"orbital channel {spec!r}: no PP_PSWFC row "
                              f"(have {sorted({(l[1], l[2]) for l in row_labels})})")
         ops.append(np.diag(mask).astype(np.complex128))
-        names.append(f"char_{spec}")
-    return np.stack(ops), names
+    return np.stack(ops)
 
 
 def band_operators(wfn, band_range, mesh, *, pseudos, channels=()):
     """``<psi_kn|O|psi_km>`` on the full BZ, ``(n_op, nk, nb_pad, nb_pad)``.
 
-    Operators, in order: sigma_x, sigma_y, sigma_z; L_x, L_y, L_z of each
-    atom (atomic sphere); one projector per orbital ``channels`` entry.
-    psi is the loader's full-BZ unfold (the Galerkin fit's own source, so
-    the band gauge is ctilde's).  Bands stay sharded over the mesh; one k's
-    bands (and its atomic projections) are gathered at a time.
+    Operators, in order: sigma_x, sigma_y, sigma_z; one projector per orbital
+    ``channels`` entry, on the Loewdin-orthogonalized PP_PSWFC rows (QE
+    projwfc's projector; radial functions j-averaged as in
+    ``psp.hubbard_ops``).  psi is the loader's full-BZ unfold (the Galerkin
+    fit's own source, so the band gauge is ctilde's).  Bands stay sharded
+    over the mesh; one k's bands (and its atomic projections) are gathered at
+    a time.
     """
     from common.collectives import device_put_process_local
     from common.wfn_layout import band_sphere_spec
@@ -164,11 +112,13 @@ def band_operators(wfn, band_range, mesh, *, pseudos, channels=()):
     from psp.hubbard_ops import build_atwfc_setup
 
     if int(wfn.nspinor) != 2:
-        raise ValueError("band_operators: spin and L need a spinor WFN")
-    upf = {el: getattr(p, "_source_path") for el, p in pseudos.items()}
-    setup, row_labels = build_atwfc_setup(wfn, upf, nspinor=2)
-    table, atomic_names = _atomic_operator_table(row_labels, channels)
-    names = [f"sigma_{a}" for a in _AXES] + atomic_names
+        raise ValueError("band_operators: spin needs a spinor WFN")
+    names = [f"sigma_{a}" for a in _AXES] + [f"char_{c}" for c in channels]
+    setup, table = None, np.zeros((1,), dtype=np.complex128)
+    if channels:
+        upf = {el: getattr(p, "_source_path") for el, p in pseudos.items()}
+        setup, row_labels = build_atwfc_setup(wfn, upf, nspinor=2)
+        table = _character_table(row_labels, channels)
 
     psi = wfn.load(bands=tuple(int(b) for b in band_range), k="full_bz",
                    sharding=band_sphere_spec())
@@ -188,6 +138,8 @@ def band_operators(wfn, band_range, mesh, *, pseudos, channels=()):
             psi_all = jax.lax.all_gather(psi_k, axes, axis=0, tiled=True)
             spin = jnp.einsum("nsG,ast,mtG->anm", jnp.conj(psi_k), pauli,
                               psi_all, optimize=True)
+            if setup is None:
+                return spin
             Z = vnl_ops.build_vnl_kdata_traced(k, G, setup).Z * m[None, :]
             O = jnp.conj(Z) @ Z.T
             lam, U = jnp.linalg.eigh(0.5 * (O + jnp.conj(O.T)))
@@ -206,6 +158,94 @@ def band_operators(wfn, band_range, mesh, *, pseudos, channels=()):
     ops = run(psi, kvecs, gvecs, gmask, table)          # (k, op, n, m)
     del psi
     return jnp.moveaxis(ops, 1, 0), names
+
+
+def stored_velocity(path, *, wfn, wfn_path, sym, mesh):
+    """``(parents, energies, label)`` of the WFN's stored velocity at ``path``.
+
+    ``dipole.h5`` on a DFT WFN or an SC run's ``dipole_qsgw.h5`` on its
+    ``WFN_qp.h5``, authenticated by ``file_io.dipole.velocity_stamp``.
+    ``parents`` is ``(n_parent, 3, nb, nb)`` Ry Bohr (bra n, ket m, file band
+    order, every stored band) at the file-wedge rows ``sym.kirr_fullids``,
+    ``energies`` the file's ``band_energies`` there.  A QP velocity with no
+    Sigma term refuses.  COLLECTIVE over ``mesh``.
+    """
+    from file_io.dipole import velocity_stamp
+    from file_io.restart_bundle import read_dipole_parent_window
+    label, basis, energies = velocity_stamp(path, wfn=wfn, wfn_path=wfn_path)
+    if basis == "qp" and not label.startswith("v_DFT +"):
+        raise ValueError(
+            f"GATE qp_velocity_sigma_term: {path} is a QP-basis velocity "
+            f"labelled {label!r}; want v_DFT + a Sigma term "
+            "(sc_head_update = parallel_transport); why: the DFT velocity "
+            "with QP energies is not d(H_QP)/dk (claim 3218)")
+    rows = np.asarray(sym.kirr_fullids, dtype=np.int64)
+    parents = read_dipole_parent_window(
+        path, rows, 0, int(energies.shape[1]), nk_full=int(sym.nk_tot),
+        mesh=mesh)
+    return parents, energies[rows], label
+
+
+def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry,
+                   n_ceilings=9):
+    """Per-cell modern-theory orbital moment from parent rows, in mu_B.
+
+    ``psp.orbital_response.orbital_magnetization`` at each parent k with the
+    star weights of ``sym.irr_idx_k``, averaged over the group's axial
+    time-odd action: the full-BZ sum without the unfold.  ``width_ry =
+    None``: T = 0 at midgap of the ``nelec`` lowest bands; else the fixed-N
+    Fermi-Dirac mu.  Returns ``(mu_ry, ceilings, E_c_ry, m (n_ceilings, 3))``
+    for energy-ordered band ceilings from 0.6 nb to nb; ``E_c`` is the
+    star-weighted mean energy of band ``c - 1``.
+    """
+    from gw.efermi import solve_smearing_occupations
+    from psp.orbital_response import orbital_magnetization
+    weights = np.bincount(np.asarray(sym.irr_idx_k),
+                          minlength=len(energies)) / float(sym.nk_tot)
+    order = np.argsort(energies, axis=1, kind="stable")
+    E = np.take_along_axis(energies, order, axis=1)
+    if width_ry is None:
+        mu = 0.5 * (E[:, int(nelec) - 1].max() + E[:, int(nelec)].min())
+    else:
+        mu = float(solve_smearing_occupations(
+            E, weights, float(nelec), float(width_ry), state_capacity=1.0,
+            family="fd")[0])
+    nb = E.shape[1]
+    ceilings = np.unique(np.linspace(0.6 * nb, nb, n_ceilings).round()
+                         ).astype(int)
+    m = np.zeros((len(ceilings), 3))
+    for p, perm in enumerate(order):
+        v = jnp.asarray(parents[p][:, perm][:, :, perm])
+        for i, c in enumerate(ceilings):
+            m[i] += weights[p] * np.asarray(orbital_magnetization(
+                v[:, :c, :c], E[p, :c], mu_ry=mu, width_ry=width_ry or 0.0,
+                deps_tol_ry=deps_tol_ry))
+    rows = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
+    projector = np.asarray(sym.cartesian_action(
+        rows, axial=True, time_odd=True), dtype=np.float64).mean(axis=0)
+    return float(mu), ceilings, weights @ E[:, ceilings - 1], m @ projector.T
+
+
+def path_orbital_moments(parents, sym, window, source_coefficients,
+                         path_coefficients, kpath, kgrid, mesh, energies,
+                         deps_tol_ry):
+    """Wavepacket moments ``(q, 3, band)`` mu_B of the path states.
+
+    The ``window`` of the parent velocity, unfolded by the polar time-odd
+    action (replicated, 48 nk nb^2 B), is interpolated like every band
+    operator and contracted with the path ``energies`` (Ry).
+    """
+    from common.collectives import device_put_process_local, gather_to_host
+    from psp.orbital_response import orbital_moments
+    from symmetry_maps import unfold_file_wedge_polar_matrix
+    velocity = device_put_process_local(np.moveaxis(
+        unfold_file_wedge_polar_matrix(sym, parents[:, :, window, window]),
+        1, 0), NamedSharding(mesh, P()))
+    v_path = gather_to_host(interpolate_band_operator(
+        velocity, source_coefficients, path_coefficients, np.asarray(kpath),
+        kgrid, mesh))[:len(energies)]
+    return np.asarray(orbital_moments(v_path, energies,
+                                      deps_tol_ry=deps_tol_ry)[0])
 
 
 def _operator_R(operator_cart, source_coefficients, kgrid, mesh):

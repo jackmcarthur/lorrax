@@ -2856,7 +2856,7 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         gx, gy, gz = gamma_local
         # Hermiticity gives Gamma_b[m,n] = conj(Gamma_b[n,m]), avoiding a
         # transpose/all-to-all of the band tile.  This is exactly the axial
-        # product used by psp.orbital_magnetization.orbital_pieces_at_k.
+        # product used by psp.orbital_response.orbital_pieces_at_k.
         cross = jnp.stack((
             gy * jnp.conj(gz) - gz * jnp.conj(gy),
             gz * jnp.conj(gx) - gx * jnp.conj(gz),

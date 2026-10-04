@@ -49,6 +49,7 @@ __all__ = [
     "LEGACY_DELTA_E_DATASET",
     "band_energies_on_full_bz",
     "require_dipole_basis",
+    "velocity_stamp",
     "wfn_psi_basis",
     "delta_e",
     "delta_e_cv",
@@ -153,6 +154,34 @@ def require_dipole_basis(attrs, *, dipole_path, wfn_path) -> None:
             f"{want!r}-basis states.  Build the dipole from the WFN the BSE "
             f"runs on (python -m psp.get_dipole_mtxels -i <deck>); "
             f"dipole_qsgw.h5 pairs only with a QP WFN.")
+
+
+def velocity_stamp(path, *, wfn, wfn_path) -> tuple[str, str, np.ndarray]:
+    """``(velocity label, basis, band_energies)`` of a velocity of ``wfn``'s states.
+
+    Refuses another basis (:func:`require_dipole_basis`) or another WFN's
+    ``prov_wfn_sha256``.  A ``psp.get_dipole_mtxels`` file has no
+    ``velocity`` attribute: it is the DFT ``p + i[V_NL, r]``.
+    """
+    import h5py
+    from common.parallel_transport import wfn_fingerprint
+
+    def text(value):
+        return value.decode() if isinstance(value, bytes) else value
+
+    with h5py.File(str(path), "r") as h5:
+        attrs = dict(h5.attrs)
+        energies = np.asarray(h5[BAND_ENERGIES_DATASET][()], dtype=np.float64)
+    require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
+    want = wfn_fingerprint(wfn)
+    if text(attrs.get("prov_wfn_sha256")) != want:
+        raise ValueError(
+            f"GATE velocity_wfn_fingerprint: {path!s} is stamped for WFN "
+            f"{text(attrs.get('prov_wfn_sha256'))!r}, not {wfn_path!s} "
+            f"({want!r}); fix: the dipole.h5 built from this WFN, or the SC "
+            "run's dipole_qsgw.h5 beside its WFN_qp.h5")
+    label = text(attrs.get("velocity", "p + i[V_NL, r] (DFT velocity)"))
+    return str(label), str(text(attrs.get(DIPOLE_BASIS_ATTR, "dft"))), energies
 
 
 def write_dipole(path, velocity_kmajor, band_energies, *, mesh, attrs,

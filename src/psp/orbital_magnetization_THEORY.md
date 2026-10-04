@@ -140,50 +140,46 @@ It is SOC that ties the orbital/k degrees of freedom to the time-reversal-
 breaking spin order. The script therefore requires `nspinor == 2` (hard error
 otherwise).
 
-## 6. Sign relative to the spin moment, and order of magnitude
+## 6. Sign relative to the spin moment
 
-The formula contains **no spin operator** — the orbital moment's sign relative
-to the spin moment is an *emergent* result, not something the prefactor sign
-encodes. To make it physical and convention-robust, the script also computes
-the spin moment from the same wavefunction with the *same* electron-charge
-convention,
+The formula contains no spin operator: the orbital moment's orientation
+relative to the spin is a result, not a convention. The CLI computes the
+spin moment from the same wavefunction with the same electron-charge sign,
 
 ```
-m_spin,z = − μ_B  Σ_k w_k Σ_{n occ} ⟨σ_z⟩_nk ,   ⟨σ_z⟩_nk = Σ_G(|c↑|² − |c↓|²),
+m_spin = − μ_B Σ_k w_k Σ_{n occ} ⟨σ⟩_nk     (a vector; g = 2),
 ```
 
-which must come out `≈ ±6 μ_B` for CrI₃ (2 Cr³⁺, S = 3/2 each). Both moments
-carry the same `−μ_B` gyromagnetic sign, so their **relative** orientation is
-convention-independent; the script reports the orbital moment *projected onto
-the spin-moment axis* (positive = parallel). The free-ion Hund's-third-rule
-expectation for less-than-half-filled Cr³⁺ (3d³) is orbital *antiparallel* to
-spin, but crystal field and covalency can change this in the solid, so the
-computed sign is reported, not assumed. The expected magnitude for CrI₃ is
-`|m_orb| ~ 0.1 μ_B` per cell, likely under-converged on a coarse k-mesh.
+and reports `m_orb · m̂_spin` (positive = parallel), so an in-plane magnet is
+read on its own axis. htransform's totals use `g_e = 2.00232` and QE's
+magnetization axis `n̂` instead, and print both moments and their sum along
+it. The free-ion Hund's-rule expectation for Cr³⁺ (3d³) is orbital
+antiparallel to spin; crystal field and covalency can change this in the
+solid, so the computed sign is reported, not assumed.
 
-## 7. Validation built into the script
+## 7. Validation and the velocity
 
-* **Velocity source.** The script no longer assembles its own per-k velocity.
-  It reads the dipole producer's distributed q=0 DFT velocity
-  (`velocity_only.h5` beside the WFN, authenticated against the WFN
-  fingerprint, k grid, reciprocal lattice and band manifold) or runs the same
-  band-sharded sweep (`common.mtxel_sweep.dipole_operator`) itself. Both are
-  unfolded to the full BZ by the typed polar action.
+* **Velocity source.** The CLI reads the dipole producer's distributed q=0
+  DFT velocity (`velocity_only.h5` beside the WFN, authenticated against the
+  WFN fingerprint, k grid, reciprocal lattice and band manifold) or runs the
+  same band-sharded sweep (`common.mtxel_sweep.dipole_operator`) itself;
+  both are unfolded to the full BZ by the typed polar action. It refuses a
+  QP WFN: a DFT velocity divided by QP gaps is not `∂H_QP/∂k`. The QP
+  velocity is `U†(v_DFT + D_k ΔH)U` (`gw.qsgw_head.qp_velocity`), which an SC
+  run writes as `dipole_qsgw.h5` beside its `WFN_qp.h5`;
+  `python -m bandstructure.htransform --velocity dipole_qsgw.h5` on that WFN
+  forms the QP moment.
 * **Hellmann–Feynman group velocity.** The diagonal `Re⟨n|dH/dk|n⟩` of the
   loaded velocity is compared with the band group velocity `∂ε_n/∂k`
-  (finite-differenced on the k-mesh) and the RMS mismatch is printed. This
-  validates the kinetic magnitude, units and frame of a stored velocity. It
-  is *insensitive to the nonlocal sign*: `dV_NL/dk` is almost purely
-  off-diagonal (~900× on CrI₃), so the slope test ties between `p±vNL`.
-* **Nonlocal-velocity sign (definitive).** The sign of `dV_NL/dk` is fixed by a
-  direct off-diagonal finite difference of `⟨m|V_NL(k)|n⟩` (ψ held fixed):
-  the analytic derivative equals `+dV_NL/dk` to ratio +1.000. Hence the
-  physical velocity is **`v = p + vNL`**, the dipole producer's default arm
-  (`VNL_VELOCITY_SIGN_FLIPPED = +1` since 2026-08-09). The other arm would
-  flip the orbital moment's sign (CrI₃: `+0.026` → `−0.081 μ_B`).
+  (finite-differenced on the k-mesh). This validates the kinetic magnitude,
+  units and frame of a stored velocity and is insensitive to the nonlocal
+  sign: `dV_NL/dk` is almost purely off-diagonal (~900× on CrI₃).
+* **Nonlocal-velocity sign.** A direct off-diagonal finite difference of
+  `⟨m|V_NL(k)|n⟩` (ψ held fixed) equals the analytic `+dV_NL/dk` to ratio
+  +1.000, so the physical velocity is `v = p + vNL`, the dipole producer's
+  default arm (`VNL_VELOCITY_SIGN_FLIPPED = +1`). The other arm flips the
+  orbital moment (CrI₃: `+0.026` → `−0.081 μ_B`).
 * **Symmetry.** `m_x, m_y ≈ 0` for an out-of-plane ferromagnet.
-* **Spin moment.** `|m_spin| ≈ 6 μ_B` cross-checks the wavefunction/occupations
-  and pins the reporting axis.
 
 ## Sources
 
@@ -215,7 +211,8 @@ For finite-T Fermi-Dirac metals, the thermodynamic moment is
 `sum_kn w_k [f_n m_n + Omega_n T log(1+exp((mu-epsilon_n)/T))]`
 in Ry/Bohr units with the conversion to mu_B already included. Use the
 self-consistent fixed-N chemical potential and width, not a midgap estimate.
-The legacy CLI's integer-nocc/Sternheimer routes remain insulator routines.
+The CLI's integer-nocc route is an insulator routine; htransform's totals take
+the metal's fixed-N Fermi–Dirac μ.
 
 `common.bispinor_init.apply_dirac_velocity_to_ket` applies `c alpha_i` to
 already lifted four-component kets; `c=2/alpha_fs` in Ry units. For the raw

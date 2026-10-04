@@ -7,6 +7,7 @@ derivative of a nonlocal quasiparticle Hamiltonian.
 from __future__ import annotations
 
 import jax.numpy as jnp
+import numpy as np
 
 
 def orbital_velocity_products(velocity, energies, deps_tol):
@@ -74,3 +75,29 @@ def orbital_magnetization(velocity, energies, *, mu_ry, width_ry,
         grand = width_ry * jnp.logaddexp(0, x)
         f = fd_occupations(e, mu_ry, width_ry)
     return jnp.sum(moment * f[..., None, :] + berry * grand[..., None, :], axis=-1)
+
+
+def orbital_pieces_at_k(v, eps, nocc, deps_tol):
+    """mu-independent building blocks of the orbital-moment summand at one k.
+
+    Returns (PA, PB), each (3, nb, nb) complex, with the per-(gamma, n, m) terms
+
+        PA[g,n,m] = occ[n] * cross_g[n,m] * (eps_n + eps_m) / (eps_n-eps_m)^2
+        PB[g,n,m] = occ[n] * cross_g[n,m] /               (eps_n-eps_m)^2
+
+    where cross_g[n,m] = eps_{g a b} v^a_nm v^b_mn, index map v^a_nm = v[a,n,m]
+    (bra n, ket m), so cross_z = v[0]*v[1].T - v[1]*v[0].T (element-wise).
+    The full summand at chemical potential mu is then linear in mu:
+
+        summand_g(mu)[n,m] = PA[g,n,m] - 2*mu*PB[g,n,m]
+
+    so ANY mu, the per-band breakdown (sum over m), and the band-ceiling
+    convergence (cumsum over m) all follow from one pass — no recomputation.
+    The (+1/2) prefactor and Im[.] are applied by the caller.  Degenerate /
+    diagonal denominators (|eps_n-eps_m| <= deps_tol) are masked to 0.
+    """
+    cross, inverse, _ = orbital_velocity_products(v, eps, deps_tol)
+    cross, inv2 = np.asarray(cross), np.asarray(inverse) ** 2
+    occ = (np.arange(len(eps)) < nocc)[:, None]
+    return (cross * (occ * (eps[:, None] + eps[None, :]) * inv2)[None],
+            cross * (occ * inv2)[None])
