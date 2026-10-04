@@ -727,18 +727,19 @@ class WfnLoader:
         """
         from symmetry_maps import SymMaps
         if self._sym is None:
-            if not self._qe_symmetry_checked:
-                from symmetry_maps import resolve_qe_symmetry_binding
-                binding, diagnostic = resolve_qe_symmetry_binding(
-                    self,
-                    wfn_path=self._path,
-                    schema=self._qe_schema_request,
-                )
-                self.qe_symmetry_binding = binding
-                self.qe_symmetry_diagnostic = diagnostic
-                self._qe_symmetry_checked = True
+            self.resolve_qe_symmetry()
             self._sym = SymMaps(self._sym_wfn_stub())
         return self._sym
+
+    def resolve_qe_symmetry(self):
+        """The authenticated QE operation typing (``QESymmetryBinding``), or None; resolved once."""
+        if not self._qe_symmetry_checked:
+            from symmetry_maps import resolve_qe_symmetry_binding
+            self.qe_symmetry_binding, self.qe_symmetry_diagnostic = (
+                resolve_qe_symmetry_binding(
+                    self, wfn_path=self._path, schema=self._qe_schema_request))
+            self._qe_symmetry_checked = True
+        return self.qe_symmetry_binding
 
     #: Compat alias.  Internal call sites and the sibling wave-1 branches
     #: still spell ``_ensure_sym``; one line keeps them working.

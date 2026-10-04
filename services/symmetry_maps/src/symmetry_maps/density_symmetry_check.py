@@ -50,7 +50,7 @@ __all__ = [
 
 TOL_TRS = 1.0e-6
 MAX_K_DEFAULT = 12
-_ALGORITHM_VERSION = "occupied-density-subspace-v1"
+_ALGORITHM_VERSION = "occupied-density-subspace-v2-qe-unitary-partners"
 _STAMP_SCHEMA = "wfn-trs-stamp-v1"
 #: A stamp is ~1.6 kB and one exists per (WFN, tol, max_k, nocc); test runs
 #: leave one per temporary WFN.  A write that finds more than this many drops
@@ -208,10 +208,18 @@ def _plan_two_component_evidence(
     *,
     max_k: int,
     tol: float = 1.0e-7,
+    unitary=None,
 ) -> list[_TRSEvidence]:
-    """Choose raw, spatial-only, and TRIM comparisons."""
+    """Choose raw, spatial-only, and TRIM comparisons.
+
+    ``unitary`` [ntran] marks the rows a spatial partner may use (QE's
+    t_rev = 0 rows); None presumes every row unitary (no QE schema). A
+    QE-antiunitary row g applied as unitary makes the test compare
+    Theta*g with the identity, which passes by construction.
+    """
     kpts = np.asarray(kpoints, dtype=np.float64)
     spatial = np.asarray(sym_mats_k, dtype=np.int64)
+    rows = np.flatnonzero(np.ones(len(spatial), bool) if unitary is None else unitary)
     candidates: list[_TRSEvidence] = []
     for i, ki in enumerate(kpts):
         raw = [j for j, kj in enumerate(kpts)
@@ -226,9 +234,9 @@ def _plan_two_component_evidence(
 
         hit = None
         for j, kj in enumerate(kpts):
-            for s, S in enumerate(spatial):
-                if _periodic_max_delta(S @ kj, -ki) < tol:
-                    hit = _TRSEvidence("spatial-pair", i, j, s)
+            for s in rows:
+                if _periodic_max_delta(spatial[s] @ kj, -ki) < tol:
+                    hit = _TRSEvidence("spatial-pair", i, j, int(s))
                     break
             if hit is not None:
                 break
@@ -480,8 +488,10 @@ def _check_two_component_trs(
     ntran = int(getattr(loader, "ntran", 1) or 1)
     spatial = np.asarray(loader.sym_matrices, dtype=np.int64)[:ntran]
     sym_mats_k = spatial.transpose(0, 2, 1)
+    binding = loader.resolve_qe_symmetry() if hasattr(loader, "resolve_qe_symmetry") else None
     evidence = _plan_two_component_evidence(
-        kpoints, sym_mats_k, weights, max_k=max_k)
+        kpoints, sym_mats_k, weights, max_k=max_k,
+        unitary=None if binding is None else ~np.asarray(binding.antiunitary, bool)[:ntran])
 
     raw_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     t_io = 0.0
@@ -719,7 +729,10 @@ def _stamp_identity(loader, nocc: int, tol_trs: float,
         digest = _content_digest(loader)
     except (AttributeError, OSError, TypeError, ValueError):
         return None
+    # The spatial partners are QE's unitary rows, so the typing is part of the verdict.
+    binding = loader.resolve_qe_symmetry() if hasattr(loader, "resolve_qe_symmetry") else None
     return {
+        "qe_antiunitary": None if binding is None else np.asarray(binding.antiunitary, bool).tolist(),
         "schema": _STAMP_SCHEMA, "algorithm": _ALGORITHM_VERSION,
         "path": path, "size": int(st.st_size),
         "mtime_ns": int(st.st_mtime_ns), "inode": int(st.st_ino),
