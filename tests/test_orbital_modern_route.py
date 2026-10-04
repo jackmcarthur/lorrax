@@ -47,7 +47,8 @@ def test_parent_total_with_axial_star_weights_equals_the_full_bz_sum():
         cartesian_action=lambda rows, axial, time_odd: np.stack(
             [np.eye(3), _R])[np.asarray(rows)])
     mu, ceilings, _, m = orbital.orbital_totals(
-        v[None], e[None], sym, nelec=nelec, width_ry=None, deps_tol_ry=1e-8)
+        v[None], e[None], sym, nelec=nelec - 1e-7, width_ry=None,
+        deps_tol_ry=1e-8)                           # a float count, as QE writes
     assert ceilings[-1] == nb and mu == 0.5 * (e[nelec - 1] + e[nelec])
     full = 0.5 * sum(np.asarray(orbital_magnetization(
         x, e, mu_ry=mu, width_ry=0.0)) for x in (v, v_image))

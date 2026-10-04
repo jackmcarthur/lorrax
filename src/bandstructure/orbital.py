@@ -204,8 +204,9 @@ def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry,
                           minlength=len(energies)) / float(sym.nk_tot)
     order = np.argsort(energies, axis=1, kind="stable")
     E = np.take_along_axis(energies, order, axis=1)
-    if width_ry is None:
-        mu = 0.5 * (E[:, int(nelec) - 1].max() + E[:, int(nelec)].min())
+    if width_ry is None:            # QE's count is a float: 129.99999 is 130
+        n = int(round(float(nelec)))
+        mu = 0.5 * (E[:, n - 1].max() + E[:, n].min())
     else:
         mu = float(solve_smearing_occupations(
             E, weights, float(nelec), float(width_ry), state_capacity=1.0,
