@@ -85,16 +85,13 @@ def _round_kernels(mesh, layout="batch"):
         return program(lambda w: jnp.take(w, jnp.asarray(indices), axis=1), (batch,), batch)
 
     @lru_cache(maxsize=None)
-    def act(conjugate, even=False):
+    def act(conjugate):
         # Output and action of state x at sample j: W x, dW x (adjoints for a conjugate state).
-        # ``even``: a real-s support of the even route outputs Herm(W) x, the even part
-        # W(iu)+W(-iu) over 2 (W 3) that its pencil (W 18) reads; the rest is the odd channel.
         def body(w, dw, j, x, scale):
             a, d = sample(w, j), sample(dw, j)
             if conjugate:
                 a, d = adjoint(a), adjoint(d)
-            output = (mm(a,x) + mm(a,x,transa="C")) / 2 if even else mm(a,x)
-            return output, mm(d,x) * scale
+            return mm(a,x), mm(d,x) * scale
         return program(body, (batch, batch, rep, batch, rep), (batch, batch))
 
     @lru_cache(maxsize=None)
@@ -267,7 +264,7 @@ def _sample_states(k, W, dW, j, z, kind, direction, widths, recipe, *, ordered, 
         elif conjugate:
             direction = states[-1][2]
         scale = put(np.complex128(2 * (s.conjugate() if conjugate else s) if ordered else 1.0))
-        output, action = k.act(bool(conjugate), bool(not ordered and s.imag == 0))(W, dW, j, direction, scale)
+        output, action = k.act(bool(conjugate))(W, dW, j, direction, scale)
         states.append((s.conjugate() if conjugate else s, direction, output, action))
         flags.append(conjugate)
         counts.append(state_widths)
