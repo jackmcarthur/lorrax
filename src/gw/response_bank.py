@@ -1133,15 +1133,30 @@ def _finish_receipt(receipt, meta, header, started):
     return receipt
 
 
-def moment_q_width(ledger, *, n_q, face_bytes, per_q):
-    """q parents per moment batch: the most whose outputs, ``(per_q·w + 16)``
-    faces, fit the fixed tile (``runtime.tiles``), at least one q, at most every
-    parent.  The q batches are independent, so the width moves no number; the
-    batch's correlations, Coulomb read and Dyson temporaries reserve their own
-    footprints in the ledger.
+def parent_span(n_q, *, layer, parent_bytes, fixed_bytes=0):
+    """Parents per round of the bank's per-parent dense stages, sized in the layout they run in.
+
+    A round holds ``fixed_bytes`` plus ``parent_bytes`` per parent per rank (its
+    face stacks).  ``layer`` is how many parents fill the mesh once: the mesh
+    size P under ``linalg = local``, whose Dyson solves, line selection and
+    moment Dyson run one whole matrix per rank (``distrib_la.local_batch``), so
+    a round narrower than P leaves ranks idle; 1 on the full mesh.  The round
+    takes the most layers whose bytes fit the fixed tile (``runtime.tiles``),
+    at least one: P parents, ``P·parent_bytes`` per rank (about 6·16·n² for a
+    sample's value and slope with its unpack and prefetch, 6.6 GB at CrI3
+    24×24).  The rounds are balanced, ``ceil(n_q / rounds)`` parents each.  The
+    rounds are independent, so the width moves no number.
     """
     from runtime.tiles import TILE_BYTES
-    return max(1, min(int(n_q), int((TILE_BYTES / face_bytes - 16) // per_q)))
+    n_q, layer = int(n_q), max(1, int(layer))
+    layers = max(1, (int(TILE_BYTES) - int(fixed_bytes)) // max(1, layer * int(parent_bytes)))
+    width = max(1, min(n_q, layers * layer))
+    return -(-n_q // -(-n_q // width))
+
+
+def _parent_layer(receipt, mesh_xy):
+    """Parents per mesh layer of the bank's dense algebra: P when it runs whole matrices per rank."""
+    return int(mesh_xy.size) if receipt["algebra"]["linalg"] == "local" else 1
 
 
 @contextmanager
@@ -1282,8 +1297,11 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     n_total = 4 if ordered else 2
     streamed = finish = None
     streamed_per_q = (3 if vertex is None else 4) * n_total + 4
+    # A batch's outputs are (per_q·w + 16) faces; its Dyson runs in the dense layout.
+    moment_width = lambda per_q: parent_span(len(qids), layer=_parent_layer(receipt, mesh_xy),
+                                             parent_bytes=per_q * face_bytes, fixed_bytes=16 * face_bytes)
     if not np.asarray(header["moment_written"]).any():
-        qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=streamed_per_q)
+        qwidth = moment_width(streamed_per_q)
         with timing.section("bank.moment_stream"):
             stream_started = time.monotonic()
             streamed = streamed_moment_totals(wfns, meta, mesh_xy=mesh_xy, qids=qids,
@@ -1294,7 +1312,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
             receipt["seconds"]["moment_stream"] = time.monotonic() - stream_started
     per_q = streamed_per_q if streamed is not None else (12 if ordered else 8)
     if streamed is None:
-        qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=per_q)
+        qwidth = moment_width(per_q)
     receipt["q_width"] = int(qwidth)
     receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
     runs = None if streamed is None else streamed.reader(
@@ -1984,11 +2002,10 @@ def _minus_q_mirror(plan, sym, meta, mesh_xy):
     return mirror
 
 
-def sample_q_width(face_bytes, nq):
-    """Parents per q span of a streamed sample's read (``runtime.tiles``): the span's value
-    and slope rows, its unpack and the next prefetch fit one tile; ``None`` for one span."""
-    from runtime.tiles import tile_units
-    width = tile_units(3 * 2 * int(face_bytes), int(nq))
+def sample_q_width(face_bytes, nq, layer):
+    """Parents per q span of a streamed sample's read (:func:`parent_span`): the span's value
+    and slope rows, its unpack and the next prefetch; ``None`` for one span."""
+    width = parent_span(nq, layer=layer, parent_bytes=3 * 2 * int(face_bytes))
     return None if width >= int(nq) else width
 
 
@@ -2521,11 +2538,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 for q0, q1 in zip(edges[:-1], edges[1:]) if not marked[q0].all()]
 
     # On the streamed tier a sample's value and slope rows come back in q spans
-    # of one tile (the read, its unpack and the next prefetch live at once), so a
-    # sample larger than a card is solved span by span; one span when it fits.
+    # (the read, its unpack and the next prefetch live at once), so a sample
+    # larger than a card is solved span by span; one span when it fits.  Under
+    # local linalg a span is at least P parents, one whole matrix per rank.
     q_width = None
     if stream_bank is not None:
-        q_width = sample_q_width(face_bytes, len(qids))
+        q_width = sample_q_width(face_bytes, len(qids), _parent_layer(receipt, mesh_xy))
         receipt["bank_residence"]["q_width"] = q_width or len(qids)
     # A line sample selects span by span too when each parent's minus-q partner
     # comes from its own rows (no partner, or the inversion mirror); each span's

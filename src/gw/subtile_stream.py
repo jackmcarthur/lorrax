@@ -124,11 +124,13 @@ def plan_windows(local_rows, row_bytes, cuts):
 
     ``g`` is the orbit block, the most common spacing of the admissible cuts
     (``cuts()``, :func:`orbit_cuts`; called only when one tile does not hold
-    every row), and the window ``R = g·max(1, round(tile_rows / g))`` the
-    orbit-aligned size nearest the tile (:data:`runtime.tiles.TILE_BYTES` over
-    ``row_bytes``).  The passes are consecutive spans of at most ``R`` rows
-    ending on cuts (a longer one where no cut allows less), and ``R`` is the
-    longest span.  Pass ``p`` reads the window ``[s, s + R)`` of every X
+    every row), and ``g·max(1, round(tile_rows / g))`` the orbit-aligned size
+    nearest the tile (:data:`runtime.tiles.TILE_BYTES` over ``row_bytes``).
+    Spans of at most that size ending on cuts (a longer one where no cut
+    allows less) fix the pass count; the window ``R`` is then the shortest
+    longest span that keeps it, so every window is as full as the cuts allow
+    (a stored segment carries ``R`` rows, its dead rows ``passes·R − L``).
+    Pass ``p`` reads the window ``[s, s + R)`` of every X
     shard's local rows, ``s = min(x0, local_rows - R)``, and its live rows are
     ``[lo, hi)`` of the window: ``windows`` is ``((s, lo, hi), ...)``.  One
     window holding every row: ``(local_rows, ((0, 0, local_rows),))``.
@@ -143,15 +145,29 @@ def plan_windows(local_rows, row_bytes, cuts):
     if len(ends) == 1:
         return whole
     g = int(np.bincount(np.diff([0, *ends])).argmax())
-    target = g * max(1, int(round(rows / g)))
-    spans, start = [], 0
-    while start < L:
-        fit = [c for c in ends if start < c <= start + target]
-        end = max(fit) if fit else min(c for c in ends if c > start)
-        spans.append((start, end - start))
-        start = end
+
+    def spans_within(target):
+        spans, start = [], 0
+        while start < L:
+            fit = [c for c in ends if start < c <= start + target]
+            end = max(fit) if fit else min(c for c in ends if c > start)
+            spans.append((start, end - start))
+            start = end
+        return spans
+    spans = spans_within(g * max(1, int(round(rows / g))))
     if len(spans) == 1:
         return whole
+    # The shortest span bound that keeps the pass count (bisection: the count
+    # only falls as the bound grows).
+    lo, hi = -(-L // len(spans)), max(xr for _, xr in spans)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        trial = spans_within(mid)
+        if len(trial) <= len(spans) and max(xr for _, xr in trial) <= mid:
+            hi = mid
+        else:
+            lo = mid + 1
+    spans = spans_within(hi)
     R = max(xr for _, xr in spans)
     return R, tuple((min(x0, L - R), x0 - min(x0, L - R), x0 - min(x0, L - R) + xr)
                     for x0, xr in spans)
