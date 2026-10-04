@@ -302,7 +302,7 @@ rulings override anything here.
   `qsgw_density.BAND_TILE_BUDGET_FRACTION` of the per-device budget and the
   distributed backend resolves, else `native`
   (`sc_iteration._resolve_sc_eigh`). `LORRAX_SC_MAX_ITER`,
-  `LORRAX_SC_TOL_EV`, `LORRAX_SC_MIXING` and `LORRAX_SC_DUMP_DIR` override
+  `LORRAX_SC_TOL_EV` and `LORRAX_SC_DUMP_DIR` override
   their deck keys and print a deprecation note when set. The loop: [self-consistency](../self_consistency.md).
 - **`EQP2Config`** configures fixed-Σ eigenvalue self-consistency for the
   opt-in `eqp2.dat` (`write_eqp2`); it never rebuilds G, χ₀, W or Σ.

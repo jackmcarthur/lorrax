@@ -41,7 +41,6 @@ fit made at a different cutoff.
 | `LORRAX_ZETA_RCOND` | `zeta_rcond` (`1e-8`) | twin | float | Relative eigenvalue cutoff of the rank-revealing ζ pseudo-inverse (`rank_truncate`, `isdf/core.py`). |
 | `LORRAX_SC_MAX_ITER` | `sc_max_iter` | twin | int | Self-consistency iteration cap. |
 | `LORRAX_SC_TOL_EV` | `sc_tol_ev` | twin | float | Self-consistency convergence tolerance, eV. |
-| `LORRAX_SC_MIXING` | `sc_mixing` | twin | float | Self-consistency mixing weight. |
 | `LORRAX_SC_DUMP_DIR` | `sc_dump_dir` | twin | string | Directory for per-iteration self-consistency dumps. |
 
 ### 1b. Routing-affecting variables

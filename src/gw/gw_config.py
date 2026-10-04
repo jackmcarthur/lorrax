@@ -1364,8 +1364,9 @@ _DEFAULTS = {
     # measurements are claims 2686-2687); the conditioning filter drops dependent columns, so depth costs only
     # memory, 2(m+1) copies of the (nk, nb, nb) carry over the mesh.
     "sc_history_depth": 20,
-    # Retired linear-mixing α: nothing reads it (the linear path was deleted
-    # 2026-10-04); the key stays so decks that carry it still parse.
+    # Retired linear-mixing α: the linear path was deleted 2026-10-04; a deck
+    # that carries the default still parses, any other value refuses
+    # (GATE sc_mixing_retired).
     "sc_mixing": 1.0,
     "sc_dump_dir": "",           # E/U-history npy dump dir ("" = off)
     # Optional QP rotation seed.  The reader reconstructs U diag(E) U^H in the
@@ -2623,6 +2624,14 @@ def _input_iteration(
             f"  [config] {env_key}={raw_env} (deprecated env override; "
             f"set '{input_key} = {raw_env}' in cohsex.in instead)")
         return val
+    if float(params["sc_mixing"]) != 1.0:
+        raise ValueError(
+            "GATE sc_mixing_retired: nothing reads sc_mixing; Anderson "
+            "has no damping weight.\n"
+            f"  got:  sc_mixing = {params['sc_mixing']}\n"
+            "  want: no sc_mixing key\n"
+            "  fix:  delete the key\n"
+            "  doc:  docs/self_consistency.md")
     sc = SCConfig(
         max_iter=_sc_env(
             "LORRAX_SC_MAX_ITER", int, int(params["sc_max_iter"]),
@@ -2632,9 +2641,6 @@ def _input_iteration(
             "sc_tol_ev"),
         accelerator=str(params["sc_accelerator"]).strip().lower(),
         history_depth=int(params["sc_history_depth"]),
-        mixing=_sc_env(
-            "LORRAX_SC_MIXING", float, float(params["sc_mixing"]),
-            "sc_mixing"),
         dump_dir=_sc_env(
             "LORRAX_SC_DUMP_DIR", str, str(params["sc_dump_dir"] or ""),
             "sc_dump_dir") or None,
@@ -4458,7 +4464,6 @@ class SCConfig:
     tol_ev: float
     accelerator: str      # "anderson" — the only supported value
     history_depth: int
-    mixing: float
     dump_dir: str | None
     exact_degeneracy_tol_ev: float = 1.0e-4
     frozen_core_bands: int = 0
@@ -4510,8 +4515,6 @@ class SCConfig:
                 "  doc:  docs/self_consistency.md; claim 2391")
         if self.history_depth < 1:
             raise ValueError("sc_history_depth must be >= 1.")
-        if not (0.0 < self.mixing <= 1.0):
-            raise ValueError("sc_mixing must be in (0, 1].")
         if not (0.0 < self.exact_degeneracy_tol_ev <= 1.0e-4):
             raise ValueError(
                 "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
