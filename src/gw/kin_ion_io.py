@@ -330,8 +330,13 @@ def main(argv=None):
             wfn = WfnLoader(wfn_path, mesh=mesh_xy)
             sym = wfn.symmetry()
 
-        nval = int(params.get("nval", 5))
-        ncond = int(params.get("ncond", 5))
+        # nval/ncond as gw_jax resolves them (``LorraxConfig.with_band_request``:
+        # ``number_bands_protected`` sets nval = nelec, ncond = total - nelec).
+        bands = LorraxConfig.from_input_file(
+            args.input, print_fn=lambda *_a, **_k: None,
+            resolve_hardware=False).with_band_request(
+                wfn, print_fn=lambda *_a, **_k: None)
+        nval, ncond = int(bands.nval), int(bands.ncond)
         nband = int(params.get("nband", 100))
         bispinor = bool(params.get("bispinor", False))
         bispinor_gw_mode = coerce_bispinor_gw_mode(
@@ -343,17 +348,12 @@ def main(argv=None):
                 "bispinor=true; the selector does not enable spatial-current "
                 "channels implicitly.")
         # Band window the GW run will actually ask for: ``load_kin_ion_submatrix``
-        # reads [b_id_0, b_id_3) = [0, nelec + ncond), with ncond resolved as
-        # gw_jax resolves it (``LorraxConfig.with_band_request``:
-        # ``number_bands_protected`` sets ncond = total - nelec).  Sizing the
+        # reads [b_id_0, b_id_3) = [0, nelec + ncond).  Sizing the
         # file below that silently truncates the run's window, so it is a
         # hard floor, and it is the default: the sweep loads ψ(G) for every
         # band it writes, and ``nband`` (the polarizability window) is read by
         # no consumer (CrI3 24x24: 750 bands is 112 GB of ψ(G), 208 are read).
-        nb_window = int(wfn.nelec) + int(LorraxConfig.from_input_file(
-            args.input, print_fn=lambda *_a, **_k: None,
-            resolve_hardware=False).with_band_request(
-                wfn, print_fn=lambda *_a, **_k: None).ncond)
+        nb_window = int(wfn.nelec) + ncond
         nb_req = int(args.nb) if args.nb is not None else nb_window
         if nb_req < nb_window:
             raise SystemExit(
