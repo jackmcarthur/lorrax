@@ -865,13 +865,13 @@ def make_initial_state_from_qp_rotations(
     inputs: SCInputs,
     artifact_path: str,
 ) -> SCState:
-    """Seed a new SC run from a compact QP eigensystem in the DFT basis.
+    """Seed an SC run from a compact QP eigensystem in the DFT basis.
 
-    This is deliberately narrower than nonlinear restart.  The active
-    Hamiltonian ``U diag(E) U^H`` is imported.  The
-    selected mean-field WFN, pristine kinetic/ionic operator, current
-    occupation solve, sum-band-tail refit, fixed quadrature session and
-    Anderson history remain owned by the new run.
+    The active Hamiltonian ``U diag(E) U^H`` is imported.  The selected
+    mean-field WFN, pristine kinetic/ionic operator, current occupation solve,
+    sum-band-tail refit, fixed quadrature session and Anderson history remain
+    owned by this run, unless a checkpoint beside the seed continues another
+    one (:func:`_read_sc_checkpoint`).
     """
     from file_io.qp_wfn import authenticate_qp_rotations_source_wfn
     from file_io.restart_bundle import (
@@ -6426,9 +6426,8 @@ def _run_anderson(
     if resume is not None:
         st, cubes = resume["state"], resume["cubes"]
 
-        def _pin(a):  # the writer's padded extent, or another mesh's
-            return (jax.device_put(a, entry_sh) if a.shape == x0.shape
-                    else _to_entry(a[:, :nb, :nb]))
+        def _pin(a):  # SlabIO reads at the entry spec; another mesh pads differently
+            return a if a.shape == x0.shape else _to_entry(a[:, :nb, :nb])
         acc_resume = AndersonState(
             tuple((_pin(cubes[f"x{i:02d}"]), _pin(cubes[f"f{i:02d}"]))
                   for i in range(st["pairs"])),

@@ -911,8 +911,9 @@ def _sweep_checkpoint(config, input_dir, fit_identity, fit_digest, head, lorentz
                       *, e_qp_ev, body_options, band_slices, efermi_ry):
     """Path and identity of a one-shot shared-pole sweep checkpoint, or None.
 
-    Only one-shots: an SC rerun starts at map 0, SC retention deletes later
-    map directories, and map 0's sweep plans the Σ windows later maps hold.
+    Only one-shots: an SC run continues at map granularity from its own
+    checkpoint (``sc_seed/sc_checkpoint.h5``), and SC retention deletes
+    earlier map directories.
     The identity binds the W model (its digest names its identity, the WFN
     included), the energies Σ is read at, the ω grid and every sweep option.
     """

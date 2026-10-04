@@ -694,21 +694,61 @@ on `parallel_transport` it takes this map's `qp_velocity` through
 
 ## 8 Seeding, restart and outputs {#8-seeding-restart-and-outputs}
 
-**There is no checkpoint of the loop.** The mixer history is never written,
-so an interrupted run cannot continue where it stopped. A rerun in the same
-directory recomputes from map 0. It reuses a map's shared-pole scratch only
-when that scratch authenticates for the same map identity (WFN fingerprint,
-energies, occupations, centroids, recipe): a committed scalar `model.h5`, a
+**Warm seed and checkpoint.** After every map that does not converge, the
+loop writes two files to `sc_seed/`. `qp_wfn_rotations.h5`
+(`sc_iteration._write_sc_seed`) is that map's output eigensystem, the
+scissored tail energies and the fixed-N occupations. `sc_checkpoint.h5`
+(`file_io.sigma_checkpoint`, written by `sc_iteration._run_anderson`, one
+`SC checkpoint: map N written` line) is the state that fixes the next map:
+
+- the Anderson state (`mixing.acceleration.AndersonState`): the newest
+  $m + 1$ evaluated pairs $(x_i, f_i)$, the best pair, every residual norm
+  and the fallback flag. The next input $x_{n+1}$ is a function of these
+  alone, so it is recomputed, not stored;
+- the loop carry: the previous map's $Z$ (`SCState.tail_z_kn`), the map-0
+  identity labels of the convergence readout (§5), the stall history and the
+  diagnostic tails of the eqp comments;
+- the held plan of §4 and §6 without its rules: the ω grid, its envelope and
+  coarse windows, the Σ window names and certificate boxes, the shared-pole
+  supports and line sites, the K, CT-span and constructor carrier extents.
+  No quadrature rule is stored: a continuing process re-certifies every Σ
+  window on its padded box around the current states (one
+  `SC fixed quadrature recompute:` line per window) and plans the χ response
+  rule cold.
+
+The pairs are written from their shards through SlabIO; the rest is one
+record of plain Python and numpy containers. The file is built as a private
+sibling and published by `os.replace`, so a kill mid-write keeps the previous
+map's checkpoint. One entry is $16\,n_k N_b^2$ bytes and the file holds
+$2(m + 2) + 1$ of them: 1.9 GB on CrI3 24×24 (61 wedge k, 208 bands,
+$m = 20$).
+
+**Continuing a run.** A deck whose `sc_initial_qp_rotations_file` has an
+`sc_checkpoint.h5` beside it continues that trajectory when the checkpoint
+authenticates: the same deck less comments and the `restart` and
+`sc_initial_qp_rotations_file` lines (SHA-256), the same WFN fingerprint, k
+set, Σ window and `sc_history_depth`. The run logs `SC resume: continuing the
+Anderson trajectory at map n`, keeps the earlier map files, and numbers its
+maps globally: its first map is $n$, writing `eqp0_iter{n}.dat` and
+`tmp/mpa/sc_{n}_shared_pole`, so a continuation never meets a committed store
+of another map. `sc_max_iter` counts maps from the first process. A
+checkpoint that does not authenticate is left in place, and a WARNING names
+the differing fields; the run starts a new trajectory from the seed. A run
+split into one-map processes follows the one-process trajectory up to the
+re-certified Σ rules (the χ rule's share is about 1 µeV). On Fe 4³ bispinor
+from the charge seed, at `sigma_quadrature_eps` = 1e-4, they move a state by
+at most 1.3 meV per map, with a median of 0.1–0.2 meV within $E_F \pm 10$ eV.
+A seed without its checkpoint moves states by up to 485 meV at the second map,
+because every process then takes an unmixed step on a re-planned map.
+
+A rerun reuses a map's shared-pole scratch only when that scratch
+authenticates for the same map identity (WFN fingerprint, energies,
+occupations, centroids, recipe, map index): a committed scalar `model.h5`, a
 four-current `sectors.json` with every model file it names, or a complete
-response bank, which resumes the constructor. Any other partial
-directory is removed and rebuilt, with a WARNING line naming the files
+response bank, which resumes the constructor. Any other partial directory is
+removed and rebuilt, with a WARNING line naming the files
 (`shared_pole_screening.screen_shared_poles`). Only the newest map's scratch
 generation is kept (`shared_pole_screening.retain_iteration_scratch`).
-
-**Warm seed.** After every map that does not converge, the loop writes
-`sc_seed/qp_wfn_rotations.h5` (`sc_iteration._write_sc_seed`): that map's
-output eigensystem, the scissored tail energies and the fixed-N occupations.
-It holds no wavefunctions and no mixer history.
 
 **Seeding a new run.** `sc_initial_qp_rotations_file` imports an
 authenticated eigensystem as $H = U\,\mathrm{diag}(E)\,U^\dagger$ in the
@@ -723,8 +763,9 @@ largest change, and a seed whose Σ window cuts a multiplet refuses
 (`GATE little_group_band_representation`). A seed file that records a
 partial band partition or an active-window scissor refuses, because the loop
 keeps every QP-matrix state's full Σ and has nothing to apply such a law to.
-Occupations, the tail fit, the quadrature plan and the mixer history start
-fresh, so a seeded run is a new run, not a continuation. A charge SC seeds a
+Without a checkpoint beside it, occupations, the tail fit, the quadrature
+plan and the mixer history start fresh, so a seeded run is a new run. A
+charge SC seeds a
 bispinor SC on the same WFN
 ([production QSGW](how-to/production-qsgw.md#the-route)).
 
@@ -795,3 +836,4 @@ QP basis. A new run clears the previous run's managed snapshots.
 | tail scissor | `gw.sc_iteration._fit_sum_band_tail`, `gw.scissor` |
 | velocity and head | `gw.qsgw_head.qp_velocity`, `gw.sc_iteration.load_head_velocity_source` |
 | seeds and QP files | `gw.sc_iteration.make_initial_state_from_qp_rotations`, `dump_qp_wfn_artifacts`, `file_io.qp_wfn` |
+| checkpoint and continuation | `gw.sc_iteration._run_anderson`, `_read_sc_checkpoint`, `_held_session`, `file_io.sigma_checkpoint` |

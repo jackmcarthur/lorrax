@@ -4474,8 +4474,9 @@ class SCConfig:
     #: ``uses_metal_direct_drude_head``.  ``interband_commutator`` is
     #: insulator-only.
     head_update: str = "off"
-    #: Explicit seed-only ``qp_wfn_rotations.h5`` for a new SC run.  Empty
-    #: means the canonical diagonal DFT seed.  This is not nonlinear restart.
+    #: Explicit ``qp_wfn_rotations.h5`` seed.  Empty means the canonical
+    #: diagonal DFT seed; an authenticated ``sc_checkpoint.h5`` beside it
+    #: continues that run (docs/self_consistency.md §8).
     initial_qp_rotations_file: str | None = None
 
     def __post_init__(self):
