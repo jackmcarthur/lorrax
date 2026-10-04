@@ -204,16 +204,33 @@ def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry,
                           minlength=len(energies)) / float(sym.nk_tot)
     order = np.argsort(energies, axis=1, kind="stable")
     E = np.take_along_axis(energies, order, axis=1)
+    nb = E.shape[1]
     if width_ry is None:            # QE's count is a float: 129.99999 is 130
         n = int(round(float(nelec)))
+        if (abs(float(nelec) - n) > 1e-3 or not 0 < n < nb
+                or E[:, n - 1].max() >= E[:, n].min()):
+            raise ValueError(
+                "GATE orbital_totals_t0_gap: T = 0 needs an integer count "
+                f"below a gap; got N = {float(nelec):.6f} of {nb} bands"
+                + (f", top occupied {E[:, n - 1].max():.6f} Ry >= lowest "
+                   f"empty {E[:, n].min():.6f} Ry" if 0 < n < nb else "")
+                + "; fix: set occ_smearing_width_ry (fixed-N Fermi-Dirac)")
         mu = 0.5 * (E[:, n - 1].max() + E[:, n].min())
     else:
         mu = float(solve_smearing_occupations(
             E, weights, float(nelec), float(width_ry), state_capacity=1.0,
             family="fd")[0])
-    nb = E.shape[1]
-    ceilings = np.unique(np.linspace(0.6 * nb, nb, n_ceilings).round()
-                         ).astype(int)
+    # Ceilings from 0.6 nb, but above every band within 10 kT of mu: a
+    # ceiling inside the occupied set reads ~0 and E_c - mu < 0, which
+    # wrecks the 1/(E_c - mu) extrapolation.
+    empty = int(np.searchsorted(E.min(axis=0), mu + 10.0 * (width_ry or 0.0),
+                                side="right")) + 1
+    if empty > nb:
+        raise ValueError(
+            f"GATE orbital_totals_empty_band: no band of the {nb} lies wholly "
+            f"above mu = {mu:.6f} Ry + 10 kT; fix: raise ncond")
+    ceilings = np.unique(np.linspace(max(0.6 * nb, empty), nb, n_ceilings
+                                     ).round()).astype(int)
     m = np.zeros((len(ceilings), 3))
     for p, perm in enumerate(order):
         v = jnp.asarray(parents[p][:, perm][:, :, perm])

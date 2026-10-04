@@ -56,6 +56,37 @@ def test_parent_total_with_axial_star_weights_equals_the_full_bz_sum():
     assert abs(m[-1][0]) > 1e-3                     # the check sees a moment
 
 
+def _one_k_sym():
+    return SimpleNamespace(
+        irr_idx_k=np.array([0]), nk_tot=1, active_symmetry_rows=[0],
+        cartesian_action=lambda rows, axial, time_odd: np.eye(3)[None])
+
+
+def test_ceilings_lie_above_the_occupied_bands():
+    rng = np.random.default_rng(3)
+    nb, nelec = 12, 8                        # 0.6 nb = 7.2 is inside the occupied set
+    v, e = _velocity(rng, nb), np.sort(rng.standard_normal(nb))
+    _, ceilings, E_c, _ = orbital.orbital_totals(
+        v[None], e[None], _one_k_sym(), nelec=nelec, width_ry=None,
+        deps_tol_ry=1e-8)
+    assert ceilings[0] == nelec + 1 and np.all(E_c > 0.5 * (e[7] + e[8]))
+
+
+def test_t0_total_without_a_gap_refuses():
+    rng = np.random.default_rng(4)
+    v = np.stack([_velocity(rng, 4), _velocity(rng, 4)])
+    e = np.array([[0.0, 0.5, 1.0, 2.0], [-1.0, -0.2, 1.5, 2.5]])  # band 1 dips below band 0
+    sym = SimpleNamespace(
+        irr_idx_k=np.array([0, 1]), nk_tot=2, active_symmetry_rows=[0],
+        cartesian_action=lambda rows, axial, time_odd: np.eye(3)[None])
+    with pytest.raises(ValueError, match="GATE orbital_totals_t0_gap"):
+        orbital.orbital_totals(v, e, sym, nelec=1.0, width_ry=None,
+                               deps_tol_ry=1e-8)
+    with pytest.raises(ValueError, match="GATE orbital_totals_t0_gap"):
+        orbital.orbital_totals(v, e, sym, nelec=1.5, width_ry=None,
+                               deps_tol_ry=1e-8)
+
+
 def _stamped(path, *, basis, label=None, fingerprint="wfn-a"):
     with h5py.File(path, "w") as h5:
         h5["band_energies"] = np.zeros((2, 4))
