@@ -1183,32 +1183,57 @@ def _fit_fixed_sc_rules(
 
     rules = session["rules"]
     # A resumed SC process holds each window's rule box, never its rule
-    # (TASTE 70; ``gw.sc_iteration._held_session``): the rule is rebuilt cold
-    # on that box and accepted for the window as the plan that held it was.
-    # The builder is deterministic, so this is the held rule; not an escape.
-    resumed = same = 0
-    for spec in rows:
-        held = rules.get(spec["name"], {}).pop("held_rule", None)
-        if held is None:
-            continue
+    # (TASTE 70; ``gw.sc_iteration._held_session``). A window whose current
+    # box still lies inside it has that rule rebuilt cold, one rank per window
+    # (the builder is deterministic, so it is the held rule), and accepted as
+    # the plan that held it was; one that left it, or whose rule this map
+    # refuses, takes the escape below as an unbroken run would.
+    reasons_by_name = {}
+    held_rows = [spec for spec in rows if "held_rule" in rules.get(spec["name"], {})]
+    for spec in held_rows:
+        entry = rules[spec["name"]]
+        moved = _box_escape_reasons(entry["held_rule"]["rule_box"], spec["box"])
+        if moved:
+            reasons_by_name[spec["name"]] = (
+                f"escape: {_escape_attribution(entry, spec)} ({'; '.join(moved)})")
+    rebuild = [spec for spec in held_rows if spec["name"] not in reasons_by_name]
+
+    def _held_fit(index):
+        spec = rebuild[index]
+        held = rules[spec["name"]]["held_rule"]
         spec_eps = _spec_eps(spec, eps)
         rule = (analytic_line_box_rule(held["rule_box"], spec_eps) if held["analytic_line"]
                 else _BOX_RULE_BUILDER(held["rule_box"], spec_eps,
                                        mass_cap=_noise_amplification_cap()))
-        rules[spec["name"]]["fit"] = dict(
-            _accept_rule(spec, rule, spec_eps, rule_source="resume:sc-fixed"),
-            built=False, analytic_line=held["analytic_line"],
-            serve_ceiling_nodes=held["serve_ceiling_nodes"])
-        resumed += 1
-        same += rules[spec["name"]]["fit"]["node_digest"] == held["node_digest"]
+        try:
+            return dict(_accept_rule(spec, rule, spec_eps, rule_source="resume:sc-fixed"),
+                        analytic_line=held["analytic_line"])
+        except RuntimeError as exc:  # this map refuses the held rule
+            return {"refused": str(exc)[:300]}
+    same = 0
+    if rebuild:
+        with timing.section("sigma.rule_refit", announce=True,
+                            label=f"Sigma rule refit ({len(rebuild)} held windows, resume)"):
+            rebuilt, _ = _parallel_fits(rebuild, _held_fit, [
+                _fit_cost(spec, _spec_eta(spec, eta)) for spec in rebuild])
+        for spec, fit in zip(rebuild, rebuilt):
+            entry = rules[spec["name"]]
+            if "refused" in fit:
+                reasons_by_name[spec["name"]] = f"escape: held rule refused ({fit['refused']})"
+            else:
+                entry["fit"] = fit
+                same += fit["node_digest"] == entry["held_rule"]["node_digest"]
+    for spec in held_rows:
+        rules[spec["name"]].pop("held_rule")
     # From map 1 the rules are held: the plan's margin absorbs the map-to-map
     # motion (Na 8^3: the top state's +5 eV sits inside its 9.6 eV pad), and a
     # window is rebuilt only when its current box leaves its rule. Re-padding
     # every window at map 1 refit 8 of Na's 10 windows (the 10% far-state pad
     # moves with the state), which is the fit the plan exists to avoid.
-    reasons_by_name = {}
     for spec in rows:
         entry = rules.get(spec["name"])
+        if spec["name"] in reasons_by_name:
+            continue
         if entry is None:
             reasons_by_name[spec["name"]] = "escape: absent when the rules froze"
             continue
@@ -1273,8 +1298,8 @@ def _fit_fixed_sc_rules(
         session["rebuild_count"] = int(
             session.get("rebuild_count", 0)) + len(recomputed)
     event = "extend" if reasons_by_name else "hold"
-    if resumed:
-        event += f", resume: {resumed} rules rebuilt on their held boxes ({same} node-identical)"
+    if rebuild:
+        event += f", resume: {len(rebuild)} rules rebuilt on their held boxes ({same} node-identical)"
     return fits, fit_rows, receipt(
         "frozen", fits, event=event,
         rebuilt=(name for name in (spec["name"] for spec in rows) if name in recomputed),

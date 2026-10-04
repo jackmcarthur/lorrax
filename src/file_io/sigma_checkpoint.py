@@ -22,12 +22,15 @@ import hashlib
 import io
 import json
 import pickle
+import time
 from pathlib import Path
 
 import numpy as np
 
 SCHEMA = "sigma-sweep-checkpoint-v1"
 SC_SCHEMA = "sc-anderson-checkpoint-v1"
+#: Staging files older than this process's first checkpoint use are orphans.
+_STARTED = time.time()
 CUBES = ("body", "unextrap", "odd")
 #: Measured SlabIO write rate of a swept cube, one node at P4 (Na 8^3, 61.4 GB
 #: in 47.7 s); more ranks write faster, so this predicts long.
@@ -156,9 +159,11 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
     state digests) and the commit, and the file is published atomically
     (``collective_atomic_file_transaction``). ``state`` is pickled on rank 0
     (plain containers only, round-tripped through :func:`_plain_loads`).
-    Returns (bytes, seconds).
+    The cube digest is taken from the closed staging file, not from memory:
+    no rank holds a whole cube, and it binds the bytes that landed on disk
+    (INVARIANTS 26). Staging files a dead process left beside ``path`` are
+    removed. Returns (bytes, seconds).
     """
-    import time
     import h5py
     from common.collectives import collective_atomic_file_transaction, process_rank
     from .slab_io import SlabIO
@@ -174,6 +179,9 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
                 io.write_slab(name, cube)
         if process_rank() != 0:
             return
+        for orphan in Path(staging).parent.glob(f".{Path(path).name}.*.tmp"):
+            if orphan != Path(staging) and orphan.stat().st_mtime < _STARTED:
+                orphan.unlink(missing_ok=True)
         blob = None
         if state is not None:
             blob = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
@@ -237,19 +245,18 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
                 text = bytes(f["record"][()])
                 commit = str(f.attrs["commit"])
                 record = json.loads(text)
-                sound = (hashlib.sha256(text).hexdigest() == commit
-                         and record.get("schema") == schema
-                         and record.get("cubes_sha256") == _cubes_sha256(f, record["cubes"]))
-            if not sound:
-                reason = "partial, corrupt or other schema"
-            elif record.get("identity") == identity:
-                return ["match", commit]
-            elif isinstance(identity, dict) and isinstance(record.get("identity"), dict):
-                got = record["identity"]
-                reason = "identity differs: " + ", ".join(
-                    sorted(k for k in set(got) | set(identity) if got.get(k) != identity.get(k)))
-            else:
-                reason = "identity differs"
+                got = record.get("identity")
+                if (hashlib.sha256(text).hexdigest() != commit
+                        or record.get("schema") != schema):
+                    reason = "partial or other schema"
+                elif got != identity:
+                    reason = "identity differs" + (": " + ", ".join(sorted(
+                        k for k in set(got) | set(identity) if got.get(k) != identity.get(k)))
+                        if isinstance(got, dict) and isinstance(identity, dict) else "")
+                elif record.get("cubes_sha256") != _cubes_sha256(f, record["cubes"]):
+                    reason = "cube bytes differ from their digest"
+                else:
+                    return ["match", commit]
         except (OSError, KeyError, ValueError):
             reason = "unreadable or partial"
         if discard:

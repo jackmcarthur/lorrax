@@ -723,7 +723,10 @@ back through a loader that refuses any other class. The commit digest covers
 the record, the state and the cube bytes, and the file is published by
 `common.collectives.collective_atomic_file_transaction`, so a kill mid-write
 keeps the previous map's checkpoint; a failed write removes it. A converged run
-deletes its checkpoint. One entry is $16\,n_k N_b^2$ bytes and the file holds
+deletes its checkpoint once its terminal SC files are written. A checkpoint
+always sits beside the warm seed it was written with: a run reads the one
+beside the seed its deck names and writes and deletes its own in `sc_seed/`,
+so a run resumed in place reads and replaces one file. One entry is $16\,n_k N_b^2$ bytes and the file holds
 at most $2(m + 2)$ of them: 1.8 GB on CrI3 24×24 (61 wedge k, 208 bands,
 $m = 20$).
 
@@ -740,7 +743,13 @@ continuation never meets a committed store of another map. `sc_max_iter` counts
 maps from the first process; a checkpoint past it refuses
 (`GATE sc_resume_budget`). A checkpoint that does not authenticate is left in
 place, and a WARNING names the differing fields; the run starts a new
-trajectory from the seed. A run split into one-map processes follows the
+trajectory from the seed. The seed only triggers the continuation: the run
+continues from the checkpoint's own map, and the resume line says whether the
+seed is that map's output. After the map that exhausts the budget, or a stall,
+the warm seed is one map newer and that map is evaluated again. A held Σ
+window whose current box has left its rule box, or whose rebuilt rule the
+current map refuses, is refit as an escape, as in an unbroken run. A run split
+into one-map processes follows the
 one-process trajectory to the χ response rule, which is planned cold: on Fe 4³
 bispinor from the charge seed every rebuilt Σ rule is node-identical to the
 held one, and eqp0 agrees within 3 µeV per map. A seed without its checkpoint

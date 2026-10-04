@@ -5633,7 +5633,6 @@ def _held_session(session):
             return dict(entry)
         return dict({k: v for k, v in entry.items() if k != "fit"}, held_rule=dict(
             rule_box=tuple(fit["rule_box"]), analytic_line=bool(fit.get("analytic_line")),
-            serve_ceiling_nodes=fit.get("serve_ceiling_nodes"),
             node_digest=fit["node_digest"]))
 
     def strip(d, parent=None):
@@ -5645,6 +5644,39 @@ def _held_session(session):
                 out[key] = strip(value, key) if isinstance(value, dict) else value
         return out
     return strip(session)
+
+
+def _seed_sha256(path):
+    """SHA-256 of a warm seed file, read on rank 0 and agreed by every rank."""
+    import hashlib
+    from common.collectives import rank0_transaction
+
+    def digest():
+        sha = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 24), b""):
+                sha.update(block)
+        return sha.hexdigest()
+    return rank0_transaction(path, stage="sc.seed_digest", write=digest, return_value=True)
+
+
+def _fit_band_carrier(a, nb, nb_pad, sharding):
+    """``a`` on the (nb_pad, nb_pad) band carrier of its last two axes.
+
+    A checkpoint read on another mesh arrives padded to that mesh's divisors,
+    possibly to a different extent per axis; slice to the logical ``nb`` and
+    pad with zeros, which the carrier's pad zone holds anyway.
+    """
+    if tuple(a.shape[-2:]) == (nb_pad, nb_pad):
+        return a
+    pad = [(0, 0)] * (a.ndim - 2) + [(0, nb_pad - nb)] * 2
+    return jax.jit(lambda v: jnp.pad(v[..., :nb, :nb], pad), out_shardings=sharding)(a)
+
+
+def retire_sc_checkpoint(input_dir):
+    """Delete this run's checkpoint once its converged terminal files exist."""
+    from file_io.sigma_checkpoint import discard_sigma_checkpoint
+    discard_sigma_checkpoint(os.path.join(input_dir, "sc_seed", SC_CHECKPOINT))
 
 
 def _sc_checkpoint_identity(inputs, shape, history_depth):
@@ -5699,9 +5731,14 @@ def _read_sc_checkpoint(state_init, inputs, history_depth, max_iter):
         raise ValueError(
             f"GATE sc_resume_budget: {path} continues at map {n}, past sc_max_iter = "
             f"{max_iter}; raise sc_max_iter to continue, or remove the file to start fresh")
+    # The seed only triggers the resume; the trajectory continues from the
+    # checkpoint's own map. After a budget's last map or a stall the warm seed
+    # is one map newer than the checkpoint, so that map is evaluated again.
+    seed = ("its own map-" f"{n - 1} seed" if state["seed_sha256"] == _seed_sha256(
+        inputs.initial_seed_path) else "a seed that is not its map output (unused)")
     _record_sc(inputs, f"  SC resume: continuing the Anderson trajectory at map {n} "
-               f"from {path} (window {state['filled'] + 1}; Sigma rules re-fitted on "
-               "their held boxes, chi rule planned cold)")
+               f"from {path} beside {seed} (window {state['filled'] + 1}; Sigma rules "
+               "re-fitted on their held boxes, chi rule planned cold)")
     return dict(path=path, commit=commit, state=state)
 
 
@@ -6432,7 +6469,9 @@ def _run_anderson(
             tail_z=_tail_z[0], identity=dict(_identity_history),
             floor=list(_floor_history), e_history=list(_e_history),
             rms=list(rms_history), gain=_gain_previous[0],
-            session=_held_session(inputs.fixed_quadrature_session))
+            session=_held_session(inputs.fixed_quadrature_session),
+            seed_sha256=_seed_sha256(os.path.join(
+                inputs.input_dir, "sc_seed", "qp_wfn_rotations.h5")))
         try:
             nbytes, seconds = write_sigma_checkpoint(
                 checkpoint_path, identity=checkpoint_identity, cubes=cubes,
@@ -6467,13 +6506,8 @@ def _run_anderson(
             from file_io.sigma_checkpoint import read_checkpoint_cubes
             cubes = read_checkpoint_cubes(path, commit=commit, mesh=mesh)
 
-            def pin(name, sharding):  # another mesh pads the band axes differently
-                a = cubes.pop(name)
-                if a.shape[-1] == nb_pad:
-                    return a
-                pad = [(0, 0)] * (a.ndim - 2) + [(0, nb_pad - nb)] * 2
-                return jax.jit(lambda v: jnp.pad(v[..., :nb, :nb], pad),
-                               out_shardings=sharding)(a)
+            def pin(name, sharding):
+                return _fit_band_carrier(cubes.pop(name), nb, nb_pad, sharding)
             stack_sh = NamedSharding(mesh, P(None, *spec))
             best = ((pin("x_best", entry_sh), pin("f_best", entry_sh))
                     if "x_best" in cubes else None)
@@ -6494,9 +6528,6 @@ def _run_anderson(
             on_eval=_checkpoint,
         )
     except _Converged as stop:
-        if stop.verdict.converged:  # a finished run has nothing to continue
-            from file_io.sigma_checkpoint import discard_sigma_checkpoint
-            discard_sigma_checkpoint(checkpoint_path)
         # The criterion (or the stall rule) fired inside the map.  Return the accepted
         # map INPUT that met it, NOT F(input) and not rCROP's stale internal
         # x: only this input was accepted and evaluated with the SCOutputs
@@ -7616,6 +7647,8 @@ def run_sc_driver(
                        if sigma_result.efermi_dft_ev is not None
                        else float(wfn.efermi) * RYD_TO_EV),
     )
+    # Converged, with its terminal files written: nothing is left to continue.
+    retire_sc_checkpoint(input_dir)
     return SCDriverResult(
         sigma_result_dft=sigma_result_dft,
         sigma_total_dft=sigma_total,
