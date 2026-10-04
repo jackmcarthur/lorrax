@@ -519,8 +519,11 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
         # is the caller's, refused by name, never a solver failure to retry.
         # A distributed solver never owns complete local rows; checking
         # arbitrary off-diagonal faces still requires peer communication.
+        # W - W^H = 2 (W - Herm W), with Herm W kept on W's faces (blocks.hermitian_part):
+        # an eager swapaxes difference of a face stack comes back replicated.
+        from distrib_la.blocks import hermitian_part
         from distrib_la.tolerance import roundoff_tol
-        defect = jnp.max(jnp.abs(W - jnp.conj(jnp.swapaxes(W, -1, -2))), axis=(-2, -1))
+        defect = 2 * jnp.max(jnp.abs(W - hermitian_part(W)), axis=(-2, -1))
         scale = jnp.max(jnp.abs(W), axis=(-2, -1))
         tol = roundoff_tol(W.shape[-1], dtype=W.dtype)
         if not bool(jnp.all(jnp.isfinite(scale) & (defect <= tol * scale))):
