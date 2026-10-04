@@ -224,6 +224,10 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         raise FileNotFoundError(
             f"--color orbital:[EL:]l needs the *.upf beside the deck "
             f"({input_dir}) for the PP_PSWFC atomic functions")
+    if velocity is not None:          # authenticated before the psi load
+        deps_tol = 1.4e-3 / RYD_TO_EV    # psp.orbital_magnetization's default
+        parents, E_par, label = stored_velocity(
+            velocity, wfn=wfn, wfn_path=wfn_path, sym=sym, mesh=mesh)
     with mesh:
         ops, names = band_operators(
             wfn, (band_start, band_start + nb_fit), mesh, pseudos=pseudos,
@@ -251,9 +255,6 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
 
     files = []
     if velocity is not None:
-        deps_tol = 1.4e-3 / RYD_TO_EV    # psp.orbital_magnetization's default
-        parents, E_par, label = stored_velocity(
-            velocity, wfn=wfn, wfn_path=wfn_path, sym=sym, mesh=mesh)
         mu, ceil, E_c, m = orbital_totals(
             parents, E_par, sym, nelec=float(wfn.num_electrons),
             width_ry=width, deps_tol_ry=deps_tol)
@@ -270,7 +271,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
             f"physical moments in mu_B per cell along n",
             f"  orbital, stored band ceiling {ceil[-1]} (E_c - mu = "
             f"{(E_c[-1] - mu) * RYD_TO_EV:.2f} eV): {float(axis @ m[-1]):+.6f}"
-            f"  m = ({m[-1][0]:+.6f}, {m[-1][1]:+.6f}, {m[-1][2]:+.6f})",
+            f"  m = ({m[-1][0]:+.12f}, {m[-1][1]:+.12f}, {m[-1][2]:+.12f})",
             f"  orbital, 1/E_ceiling extrapolation over ceilings {ceil[0]}-"
             f"{ceil[-1]}: {float(axis @ fit):+.6f}",
             "  spin -(g_e/2) sum_occ <sigma> (g_e = 2.00232): "
