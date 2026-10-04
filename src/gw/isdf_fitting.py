@@ -387,8 +387,11 @@ def _fit_mubatch(
     # compiled batch (past that the source stage binds), in lockstep, so the
     # slow path stays reachable.
     from runtime.aot_memory import compiled_new_bytes, step_up
+    n_grp = -(-int(plan.n_planes) // n_pg_plan)
     n_run, batch_executable = step_up(
-        n_blk, -(-int(plan.n_planes) // n_pg_plan), compiled=batch_executable,
+        n_blk, n_grp, compiled=batch_executable,
+        # the fewest blocks ≥ v holding fewer plane groups each (the kernel's ceil(n_grp / n_blk))
+        snap=lambda v: v if v < 2 else -(-n_grp // (-(-n_grp // (v - 1)) - 1)),
         build=lambda n: build(agreed, n_blk=n), room=plan.target_bytes - ws0,
         figure=lambda ex: compiled_new_bytes(
             ex, extra=int(ex.memory_analysis().output_size_in_bytes)),

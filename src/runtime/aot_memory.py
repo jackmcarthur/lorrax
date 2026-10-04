@@ -566,21 +566,27 @@ def agreed_chunk(chunk: int) -> int:
     return int(np.min(np.asarray(all_gather_processes(np.asarray(int(chunk), dtype=np.int64)))))
 
 
-def step_up(value: int, top: int, *, build, compiled, figure, room: float, stage: str = ""):
-    """Double ``value`` (to at most ``top``) while the compiled figure is over
+def step_up(value: int, top: int, *, build, compiled, figure, room: float, stage: str = "",
+            snap=lambda v: v):
+    """Raise ``value`` (to at most ``top``) while the compiled figure is over
     ``room`` and each step lowers it; past that something the value does not
-    touch binds.  ``build(v)`` compiles at ``v``, ``figure(compiled)`` reads
+    touch binds.  Each step goes to the value the figure implies, bytes =
+    a + b/value (``a`` from the last two figures, 0 at the first; doubling
+    when ``a`` is over the room), rounded up by ``snap`` to the caller's next
+    distinct value.  ``build(v)`` compiles at ``v``, ``figure(compiled)`` reads
     its bytes.  Every rank decides on the largest figure, so all ranks step in
     lockstep (INVARIANTS 21).  Returns ``(value, compiled)`` that run."""
     agreed_max = lambda ex: -agreed_chunk(-int(figure(ex)))
-    got = agreed_max(compiled)
+    got, prev = agreed_max(compiled), None
     while got > room and value < top:
-        nxt_v = min(2 * int(value), int(top))
+        a = 0.0 if prev is None else (got * value - prev[1] * prev[0]) / (value - prev[0])
+        want = -(-value * (got - a) // (room - a)) if room > a else 2 * int(value)
+        nxt_v = min(snap(max(int(want), int(value) + 1)), int(top))
         nxt_c = build(nxt_v)
         nxt = agreed_max(nxt_c)
         if nxt >= got:
             break
-        value, compiled, got = nxt_v, nxt_c, nxt
+        prev, (value, compiled, got) = (value, got), (nxt_v, nxt_c, nxt)
         announce_once(f"step-up:{stage}:{value}", f"{stage}: compiled {got / 1e9:.2f} GB at {value}")
     return value, compiled
 

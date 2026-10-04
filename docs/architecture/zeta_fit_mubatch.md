@@ -309,9 +309,12 @@ split (one row, one plane group per block) when that is larger: the source
 stage does not depend on the split, so a split under the bytes it already
 holds costs nothing. The compiled
 check reads that price at the planned chunk, with the widest orbit as its
-minimum chunk. Still over the room, it doubles the plane blocks while that
+minimum chunk. Still over the room, it steps the plane blocks to the count
+the compiled figure implies (bytes a + b/n_blk through the last two figures),
+rounded up to the next count with fewer plane groups per block, while that
 lowers the compiled figure (every rank on the largest one), up to one plane
-group per block; a split that stays over the room warns and runs. Every rank runs
+group per block (CrI3 24×24 bispinor P16 currents, 0.3 % over at 50 blocks:
+63, where doubling took 100); a split that stays over the room warns and runs. Every rank runs
 the smallest chunk any rank chose (`runtime.aot_memory.agreed_chunk`).
 CrI3 8×8 charge, P4: packed c = 12 streamed at c_out = 3 put the route-G
 module's temp at 8.9 GB, where the unchunked all-plane cylinder alone was
