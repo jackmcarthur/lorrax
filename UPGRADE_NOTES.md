@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — the response bank's dense stages fill the mesh under `linalg = local`
+
+The sample Dyson, line selection and moment Dyson of the shared-pole bank run
+one whole matrix per rank under `linalg = local`, but their q span was sized
+as faces in the fixed tile, so a span of w < P parents left P − w ranks idle.
+The span is now at least P parents per round, balanced over the rounds
+(`response_bank.parent_span`): CrI3 24×24 at P64 goes from spans of 10 and
+moment batches of 2 to one round of 61; Ni 20³ from spans of 72 and moment
+batches of 21 to 11 rounds of 59. A streamed sample span holds about
+6·16·n² bytes per rank (6.6 GB at CrI3 24×24); the ledger warns if that is
+over budget. `linalg = distributed` keeps the face-tile span.
+`subtile_stream.plan_windows` keeps its pass count and takes the shortest
+orbit-aligned window that keeps it, so the streamed χ bank stores fewer dead
+rows. No deck change. eqp is bitwise against main on Fe 4³ bispinor SC maps 0–2
+and the CrI3 6×6 bispinor one-shot at P4, also with a test tile that makes
+both changes active.
+
 ## 2026-10-04 — robustness fixes: HL head, mini-BZ shares, SC resume, orbital totals
 
 - `hl_ppm`: the head plasma frequency counts the WFN's electrons

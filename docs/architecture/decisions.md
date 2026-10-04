@@ -147,6 +147,14 @@ grouping, and so results at round-off, to a user setting. One GiB per rank
 saturates the streaming kernels: on Fe 4³ and Na 8³ only the response sample
 group lost more than 10 % per map at 256 MiB.
 
+**A unit is counted in the layout the work runs in.** The response bank's
+per-parent dense stages (sample Dyson, line selection, moment Dyson) run one
+whole matrix per rank under `linalg = local`, so their unit is a layer of P
+parents and a round holds at least P of them, even where one layer's bytes
+exceed the tile (`gw.response_bank.parent_span`; about 6·16·n² per rank for a
+streamed sample, 6.6 GB at CrI3 24×24). A narrower round leaves P − w ranks
+idle (owner 2026-10-04).
+
 **Two sizes follow the budget by design**, through the capacity ledger,
 because a larger size is faster and moves no number: the shared-pole
 response sample group (`gw.response_bank.response_group_size`) and the
