@@ -39,9 +39,9 @@ def _screened_rows(rq, S, extra):
 
 
 @jax.jit
-def _screened_sums(rq, S, extra):
-    """The rows' sum over one process's share of a draw batch: [Z]."""
-    return jnp.sum(_screened_terms(rq, S, extra), axis=-1)
+def _screened_sums(rq, S, extra, live):
+    """The rows' sum over one process's share of a draw batch, ``live`` points only: [Z]."""
+    return jnp.sum(jnp.where(live, _screened_terms(rq, S, extra), 0.0), axis=-1)
 
 
 class Bulk3D:
@@ -175,10 +175,15 @@ class Bulk3D:
         rank, ranks = jax.process_index(), jax.process_count()
         sums, counts = [], []
         for rq in batches:
+            # One share length on every rank (the programs must agree): the
+            # last share is padded with a repeated point that the sum masks.
             n = int(rq.shape[0])
-            share = jnp.asarray(rq)[n * rank // ranks:n * (rank + 1) // ranks]
+            m = -(-n // ranks)
+            idx = rank * m + np.arange(m)
+            share = jnp.take(jnp.asarray(rq), jnp.asarray(np.minimum(idx, n - 1)), axis=0)
             sums.append(_screened_sums(
-                share, S, None if extra_chi_rows is None else extra_chi_rows(share)))
+                share, S, None if extra_chi_rows is None else extra_chi_rows(share),
+                jnp.asarray(idx < n)))
             counts.append(n)
         total = np.asarray(multihost_utils.process_allgather(
             np.asarray(jnp.stack(sums), dtype=np.complex128), tiled=False)).sum(axis=0)
