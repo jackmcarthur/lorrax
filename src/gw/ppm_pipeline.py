@@ -86,6 +86,7 @@ def _fit_head_correction(
     head_resolver: HeadResolver, *,
     config: LorraxConfig,
     meta,
+    num_electrons: float,
     probe_omega: complex,
     print_fn,
     iteration_head=None,
@@ -120,8 +121,9 @@ def _fit_head_correction(
     elif is_hl:
         # BGW-style analytic head pole: Ω_h² = ω_p² / (1 − ε_head⁻¹).
         # ω_p² = 16π · N_e / V_cell in Ry² (Hartree-AU energies → Ry²
-        # has factor 4 → 16π).
-        omega_p_sq_ry = 16.0 * float(np.pi) * float(meta.nelec) / float(meta.cell_volume)
+        # has factor 4 → 16π).  N_e is the WFN's electron count, not
+        # meta.nelec: that counts occupied bands, N_e/2 on a scalar WFN.
+        omega_p_sq_ry = 16.0 * float(np.pi) * float(num_electrons) / float(meta.cell_volume)
         head_gn = fit_head_hl_analytic_from_sample(
             head_static, omega_p_sq_ry=omega_p_sq_ry)
         print_fn(
@@ -838,6 +840,7 @@ def compute_ppm_sigma_pipeline(
         # Step 3: q→0 head construction (analytic, mini-BZ-averaged)
         head_gn = _fit_head_correction(
             head_resolver, config=config, meta=meta,
+            num_electrons=float(wfn.num_electrons),
             probe_omega=probe_omega, print_fn=print_fn,
             iteration_head=iteration_head,
         )
