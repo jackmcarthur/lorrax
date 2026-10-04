@@ -5,6 +5,27 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — htransform's orbital moment is the modern-theory one
+
+`--color orbital` colors the path bands by the wavepacket moment
+$\hat n\cdot\mathbf m_n$ of a stored velocity of the WFN's own states, and
+`--velocity FILE` prints the coarse per-cell orbital moment (stored band
+ceiling and 1/E_ceiling extrapolation), the spin moment with g_e = 2.00232
+and their sums to `htransform.out` (docs/how-to/htransform-and-exciton-bands.md
+§6). CrI3 24×24 at the 750-band ceiling: DFT −0.012136, bispinor QSGW
+−0.030802 μB/cell along QE's magnetization axis, parallel to the spin moment.
+- The atomic-sphere ⟨L⟩ (per-atom L rows, its `moments.txt` lines and the
+  `L_*` names in `band_operators_path.npz`) is gone; `--moments-grid` sums
+  spin only. `orbital:[EL:]l` character colors are unchanged.
+- QSGW: run on the SC run's `WFN_qp.h5` with `--wfn-file` and
+  `--velocity dipole_qsgw.h5`. A DFT `dipole.h5` on a QP WFN, a QP velocity
+  with no Σ term, and `--velocity` with `--qp-rotations`/`--eqp-file` refuse.
+- `psp.orbital_magnetization`: the Sternheimer branch (`--method`,
+  `--truncation-2d`) is gone; the CLI refuses a QP WFN and projects on the
+  spin-moment vector; its `--out` npz has `colA_n`/`colB_n`, `m_spin` (vector)
+  and `spin_axis` in place of `colA_z`/`colB_z`/`m_spin_z`.
+  `orbital_pieces_at_k` moved to `psp.orbital_response`.
+
 ## 2026-10-04 — the static head reads the deck's Hubbard input
 
 `HeadResolver` now passes `hubbard_input` and `hubbard_occupations` to the

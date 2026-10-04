@@ -243,7 +243,7 @@ shape (path point, operator, band, band)), `operator_names`, `kpath_frac`,
 `energy_reference_ev` (the path VBM relative to the coarse $E_F$) and, for
 `orbital`, `orbital_moment_path` (path point, 3, band) and `orbital_color`.
 
-**Totals** (`--velocity`, `orbital_moments.txt`) are physical moments in
+**Totals** (`--velocity`, in `htransform.out`) are physical moments in
 $\mu_B$ per cell along $\hat n$ on the coarse grid. The orbital moment is
 `orbital_response.orbital_magnetization` at each parent k, star-weighted and
 averaged over the group's axial time-odd action: $T = 0$ at midgap without
