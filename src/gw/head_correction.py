@@ -1383,6 +1383,8 @@ class HeadResolver:
             "ncond": config.ncond,
             "nband": config.nband,
             "vnl_velocity_sign": getattr(config, "vnl_velocity_sign", ""),
+            "hubbard_input": getattr(config, "hubbard_input", ""),
+            "hubbard_occupations": getattr(config, "hubbard_occupations", ""),
             "_charge_bispinor": representation.scalar_head_bispinor,
             "wcoul0_source": head.wcoul0_source,
             "wcoul0_eta": head.wcoul0_eta,
