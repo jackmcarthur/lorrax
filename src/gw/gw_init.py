@@ -2884,6 +2884,9 @@ def _write_fresh_restart(
     			with h5py.File(tensors_filename, 'a') as _f:
     				_f.attrs['centroids_charge_md5'] = (
     					_centroid_table_md5(centroid_indices))
+    				_f.attrs['charge_representation'] = (
+    					resolve_four_current_representation(
+    						cfg.bispinor, cfg.bispinor_gw).charge_representation)
     				if transverse_wfn_data is not None:
     					_f.attrs['centroids_transverse_md5'] = (
     						_centroid_table_md5(
@@ -2980,13 +2983,23 @@ def _restart_charge_basis(
     _stamped = {}
     try:
         from file_io.restart_bundle import read_metadata
-        _hashes = read_metadata(tensors_filename)["centroid_hashes"]
+        _bundle = read_metadata(tensors_filename)
+        _hashes = _bundle["centroid_hashes"]
         _stamped = {"centroids_charge_md5": _hashes["charge"],
-                    "centroids_transverse_md5": _hashes["current"]}
+                    "centroids_transverse_md5": _hashes["current"],
+                    "charge_representation": _bundle["charge_representation"]}
     except Exception as exc:
     	print0(f"  [restart guard] could not read centroid hash "
     	       f"attrs from {tensors_filename} "
     	       f"({type(exc).__name__}: {exc}).")
+    _charge = resolve_four_current_representation(int(meta.nspinor) == 4, None)
+    if (int(meta.nspinor) == 4 and _stamped.get('charge_representation')
+            != _charge.charge_representation):
+    	raise ValueError(
+    		f"GATE restart_bispinor_charge_carrier: {tensors_filename} "
+    		f"charge_representation={_stamped.get('charge_representation')!r}; "
+    		f"want {_charge.charge_representation!r} "
+    		f"(docs/theory/bispinor-gw.md#lift); fix: restart = false.")
     _have_c = _stamped.get('centroids_charge_md5')
     if _have_c is None:
     	print0(
@@ -3025,6 +3038,7 @@ def _restart_charge_basis(
     			basis_wfn_fingerprint_binding),
     		role='charge',
     		bispinor=bool(int(meta.nspinor) == 4),
+    		bispinor_lift=(_charge.charge_lift or "raw"),
     		band_interval=_basis_band_interval,
     		fft_grid=meta.fft_grid,
     		centroid_fft_idx=centroid_indices,

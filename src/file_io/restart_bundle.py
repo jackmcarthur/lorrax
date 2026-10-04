@@ -692,6 +692,8 @@ def read_metadata(filename):
                 (("charge", "psi_parent_y"), ("current", "psi_parent_y_transverse")) if name in f},
             centroid_hashes={family: f.attrs.get(name) for family, name in
                 (("charge", "centroids_charge_md5"), ("current", "centroids_transverse_md5"))},
+            charge_representation=(None if "charge_representation" not in f.attrs
+                                   else str(np.asarray(f.attrs["charge_representation"]).astype(str))),
         )
 
 
