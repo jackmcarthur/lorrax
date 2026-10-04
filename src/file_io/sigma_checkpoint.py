@@ -1,31 +1,33 @@
-"""The swept Σ(ω) state, kept between the τ sweep and finalize.
+"""Checkpoints of sharded cubes plus a small host record, read back by authenticated identity.
 
-A one-shot shared-pole Σ sweep can take over an hour, and finalize (head
-injection, at-DFT read, QSGW build, file writes) can still fail after it.
-``gw.sigma_dispatch`` hands the swept state to this owner once the sweep
-returns; a rerun with ``restart = true`` whose state authenticates goes
-straight to finalize. It covers one-shots only: an SC rerun starts at map 0,
-SC retention deletes later map directories, and map 0's sweep also plans the
-held Σ windows the later maps reuse.
+Two owners use it. ``gw.sigma_dispatch`` keeps a one-shot shared-pole Σ sweep
+(over an hour on large decks) between the τ sweep and finalize: a rerun with
+``restart = true`` whose state authenticates goes straight to finalize. The SC
+loop (``gw.sc_iteration``) keeps its Anderson window and carry beside each
+warm seed, ``sc_seed/sc_checkpoint.h5`` (``SC_SCHEMA``), so a fresh process
+continues the trajectory (docs/self_consistency.md §8).
 
-The cubes (``body`` and, when present, ``unextrap`` (a cube, or the raw
-twin's band-diagonal slots) and ``odd``) go through
-SlabIO from their own shards: no gather, no copy, and the file is closed
-before finalize donates the body. The small host fields (the head diagonal's
-closed-form fields, the band-extrapolation payload, the padded band axis, one
-ratio) are written by rank 0 after the cubes, and the ``commit`` attribute, the record's digest,
-is written last. A file without it, or whose identity differs, is removed
-and the sweep recomputed.
+The cubes go through SlabIO from their own shards: no gather, no copy. The
+host record (JSON) and, for the SC loop, one ``state`` blob are written by
+rank 0 after the cubes, and the ``commit`` attribute, the record's digest, is
+written last; the file is built as a private sibling and published by
+``os.replace``, so a kill mid-write leaves the previous checkpoint. The blob
+is a pickle of plain Python and numpy containers only (dict, list, tuple,
+str, numbers, None, ndarray); :func:`_plain_loads` refuses any other class,
+and the writer round-trips it through that loader before publishing.
 """
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import pickle
 from pathlib import Path
 
 import numpy as np
 
 SCHEMA = "sigma-sweep-checkpoint-v1"
+SC_SCHEMA = "sc-anderson-checkpoint-v1"
 CUBES = ("body", "unextrap", "odd")
 #: Measured SlabIO write rate of a swept cube, one node at P4 (Na 8^3, 61.4 GB
 #: in 47.7 s); more ranks write faster, so this predicts long.
@@ -111,36 +113,67 @@ def checkpointable(cubes):
     return all(cube is None or _spec(cube) is not None for cube in cubes.values())
 
 
-def write_sigma_checkpoint(path, *, identity, cubes, host, mesh):
-    """Write the swept state collectively; returns (bytes, seconds)."""
+class _PlainLoader(pickle.Unpickler):
+    """Unpickle plain containers and numpy arrays; refuse every other class."""
+
+    def find_class(self, module, name):
+        if ((module.split(".")[0] == "numpy"
+             and name in ("_reconstruct", "ndarray", "dtype", "scalar", "_frombuffer"))
+                or (module == "builtins" and name == "complex")):
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(
+            f"checkpoint state holds {module}.{name}; only plain containers "
+            "and numpy arrays are stored")
+
+
+def _plain_loads(data):
+    return _PlainLoader(io.BytesIO(data)).load()
+
+
+def write_sigma_checkpoint(path, *, identity, cubes, host, mesh,
+                           schema=SCHEMA, state=None):
+    """Write the cubes, host record and optional ``state`` collectively.
+
+    Returns (bytes, seconds). ``state`` is pickled (plain containers only).
+    """
+    import os
     import time
     import h5py
     from common.collectives import rank0_transaction
     from .slab_io import SlabIO
 
     path = Path(path)
+    partial = path.with_name(path.name + ".partial")
     started = time.monotonic()
-    rank0_transaction(path, stage="sigma_checkpoint.clear",
-                      write=lambda: path.unlink(missing_ok=True))
+    blob = None
+    if state is not None:
+        blob = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
+        _plain_loads(blob)
+    rank0_transaction(partial, stage="checkpoint.clear",
+                      write=lambda: partial.unlink(missing_ok=True))
     present = {name: cube for name, cube in cubes.items() if cube is not None}
-    with SlabIO(str(path), mode="w", mesh=mesh) as io:
+    with SlabIO(str(partial), mode="w", mesh=mesh) as io:
         for name, cube in present.items():
             io.create_dataset(name, shape=tuple(cube.shape), dtype=cube.dtype)
             io.write_slab(name, cube)
-    record = dict(schema=SCHEMA, identity=identity,
+    record = dict(schema=schema, identity=identity,
                   cubes={name: dict(shape=list(cube.shape), dtype=str(cube.dtype),
                                     spec=_spec(cube))
                          for name, cube in present.items()},
-                  host=host)
+                  host=host,
+                  state_sha256=None if blob is None else hashlib.sha256(blob).hexdigest())
     text = _json(record)
 
     def commit():
-        with h5py.File(path, "a") as f:
+        with h5py.File(partial, "a") as f:
+            if blob is not None:
+                f.create_dataset("state", data=np.frombuffer(blob, np.uint8))
             f.create_dataset("record", data=np.bytes_(text))
             f.attrs["commit"] = hashlib.sha256(text.encode()).hexdigest()
-    rank0_transaction(path, stage="sigma_checkpoint.commit", write=commit)
+        os.replace(partial, path)
+    rank0_transaction(path, stage="checkpoint.commit", write=commit)
     nbytes = sum(int(np.prod(c.shape)) * np.dtype(c.dtype).itemsize for c in present.values())
-    return nbytes, time.monotonic() - started
+    return nbytes + (0 if blob is None else len(blob)), time.monotonic() - started
 
 
 def discard_sigma_checkpoint(path):
@@ -151,11 +184,14 @@ def discard_sigma_checkpoint(path):
                       write=lambda: path.unlink(missing_ok=True))
 
 
-def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print):
-    """Return ``(cubes, host)`` for an authenticated checkpoint, else None.
+def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
+                          schema=SCHEMA, discard=True):
+    """Return ``(cubes, host, state)`` for an authenticated checkpoint, else
+    ``(None, reason)``.
 
-    Rank 0 decides; a partial or foreign file is removed so the sweep
-    recomputes and writes a fresh one.
+    Rank 0 decides. A partial or foreign file is removed (``discard``) so the
+    caller recomputes; with ``discard=False`` it is left in place and the
+    reason names the identity fields that differ.
     """
     import h5py
     from jax.sharding import PartitionSpec as P
@@ -173,31 +209,44 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print):
                 commit = f.attrs["commit"]
             text = text.decode() if isinstance(text, bytes) else str(text)
             commit = commit.decode() if isinstance(commit, bytes) else str(commit)
-            ok = (hashlib.sha256(text.encode()).hexdigest() == commit
-                  and json.loads(text).get("identity") == identity
-                  and json.loads(text).get("schema") == SCHEMA)
+            record = json.loads(text)
+            if (hashlib.sha256(text.encode()).hexdigest() != commit
+                    or record.get("schema") != schema):
+                reason = "partial or other schema"
+            elif record.get("identity") == identity:
+                return "match"
+            elif isinstance(identity, dict) and isinstance(record.get("identity"), dict):
+                got = record["identity"]
+                reason = "identity differs: " + ", ".join(
+                    sorted(k for k in set(got) | set(identity) if got.get(k) != identity.get(k)))
+            else:
+                reason = "identity differs"
         except (OSError, KeyError, ValueError):
-            ok = False
-        if ok:
-            return "match"
-        path.unlink()
-        return "removed"
-    verdict = rank0_transaction(path, stage="sigma_checkpoint.check", write=check,
+            reason = "unreadable or partial"
+        if discard:
+            path.unlink()
+            return f"removed ({reason})"
+        return reason
+    verdict = rank0_transaction(path, stage="checkpoint.check", write=check,
                                 return_value=True)
-    if verdict == "removed":
-        print_fn(f"WARNING Sigma checkpoint: removed {path} (partial, or another "
-                 "identity); recomputing the sweep")
+    if verdict.startswith("removed"):
+        print_fn(f"WARNING checkpoint: {verdict} {path}; recomputing")
     if verdict != "match":
-        return None
-    record, error = None, None
+        return None, verdict
+    record, state, error = None, None, None
     try:
         with h5py.File(path, "r") as f:
             text = f["record"][()]
             record = json.loads(text.decode() if isinstance(text, bytes) else str(text))
+            if record.get("state_sha256") is not None:
+                blob = f["state"][()].tobytes()
+                if hashlib.sha256(blob).hexdigest() != record["state_sha256"]:
+                    raise ValueError("checkpoint state digest differs from its record")
+                state = _plain_loads(blob)
     except (OSError, KeyError, ValueError) as exc:
         error = exc
-    agree_io_error(error, path=path, stage="sigma_checkpoint.record")
-    cubes = dict.fromkeys(CUBES)
+    agree_io_error(error, path=path, stage="checkpoint.record")
+    cubes = dict.fromkeys(CUBES) if schema == SCHEMA else {}
     with SlabIO(str(path), mode="r", mesh=mesh) as io:
         for name, meta in record["cubes"].items():
             spec = P(*[tuple(a) if isinstance(a, list) else a for a in meta["spec"]])
@@ -205,5 +254,5 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print):
                                        dtype=np.dtype(meta["dtype"]), mesh=mesh,
                                        partition_spec=spec)
     host = _decode(record["host"])
-    print_fn(f"Sigma checkpoint: authenticated swept state reused from {path}; sweep skipped")
-    return cubes, host
+    print_fn(f"checkpoint: authenticated {schema} state read from {path}")
+    return cubes, host, state

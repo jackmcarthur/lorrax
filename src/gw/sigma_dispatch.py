@@ -1428,8 +1428,8 @@ def _compute_mpa_sigma(
         with timing.section("sigma.checkpoint_read", announce=True):
             restored = read_sigma_checkpoint(checkpoint[0], identity=checkpoint[1],
                                              mesh=mesh_xy, print_fn=print_fn)
-        if restored is not None:
-            return finalize(*restored)
+        if restored[0] is not None:
+            return finalize(*restored[:2])
     import time
     sweep_started = time.monotonic()
     plan = None

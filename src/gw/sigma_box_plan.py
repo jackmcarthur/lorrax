@@ -1190,8 +1190,12 @@ def _fit_fixed_sc_rules(
     reasons_by_name = {}
     for spec in rows:
         entry = rules.get(spec["name"])
-        if entry is None:
-            reasons_by_name[spec["name"]] = "escape: absent when the rules froze"
+        if entry is None or "fit" not in entry:
+            # A resumed SC process holds the window names and boxes, never a
+            # rule (``gw.sc_iteration._held_session``): it re-certifies here.
+            reasons_by_name[spec["name"]] = (
+                "escape: absent when the rules froze" if entry is None else
+                "escape: resumed process (rules are never stored)")
             continue
         reasons = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
         if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):

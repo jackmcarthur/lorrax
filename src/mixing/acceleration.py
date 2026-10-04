@@ -46,6 +46,22 @@ class AccelerationResult(NamedTuple):
     converged: bool  # Whether tolerance was reached
 
 
+class AndersonState(NamedTuple):
+    """Everything :func:`anderson_nojit` carries from one evaluation to the next.
+
+    ``pairs`` are the newest m + 1 evaluated ``(x, f)``, oldest first, the
+    last one current; ``best`` is the evaluated pair of least residual;
+    ``res`` every residual norm so far; ``fallback`` whether the next step is
+    the secant fallback.  The next iterate is a function of these alone, so a
+    fresh process handed this state continues the same trajectory.
+    """
+
+    pairs: tuple
+    best: tuple
+    res: tuple
+    fallback: bool
+
+
 def _pin_entry(v, entry_sharding):
     """Pin one history entry to the operand layout (identity if unsharded).
 
@@ -334,8 +350,15 @@ def anderson_nojit(
     print_fn: Callable = None,
     entry_sharding=None,
     metric=None,
+    resume: AndersonState | None = None,
+    on_eval: Callable[[AndersonState], None] | None = None,
 ) -> AccelerationResult:
     """Anderson type II (Pulay/DIIS): ONE map evaluation per iteration.
+
+    ``on_eval`` receives the :class:`AndersonState` after every evaluation;
+    ``resume`` restores one and skips the evaluation of ``x0`` (which then
+    fixes only shape and layout), so the run continues at the step that state
+    implies, with ``maxit`` counting from the original first step.
 
     Every evaluated pair (x_i, f_i = G(x_i) - x_i) enters a history of the
     newest ``m + 1``; the next and only evaluation is at
@@ -402,21 +425,40 @@ def anderson_nojit(
     def _norm(v):
         return float(jnp.sqrt(jnp.sum(jnp.abs(_weighted(v)) ** 2)))
 
-    x = _entry(x0)
-    f = _entry(residual_fn(x))
     Xhist = _zeros_hist()
     Fhist = _zeros_hist()
-    head, filled = 0, 0
-    res_history = [_norm(f)]
-    if res_history[0] <= tol:
-        return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
-                                  iterations=0, converged=True)
-    mask_shape = (m,) + (1,) * len(shape)
-    best, best_res = (x, f), res_history[0]
-    window_res = [res_history[0]]
-    fallback = False
+    if resume is None:
+        x = _entry(x0)
+        f = _entry(residual_fn(x))
+        older, res_history, fallback = (), [_norm(f)], False
+        best = (x, f)
+    else:
+        *older, (x, f) = [(_entry(a), _entry(b)) for a, b in resume.pairs]
+        res_history, fallback = list(resume.res), bool(resume.fallback)
+        best = tuple(_entry(v) for v in resume.best)
+    # The ring in chronological order from slot 0, as the loop leaves it
+    # (the window is rolled to that order before every solve).
+    for i, (a, b) in enumerate(older):
+        Xhist, Fhist = Xhist.at[i].set(a), Fhist.at[i].set(b)
+    head, filled = len(older) % m, len(older)
+    best_res = min(res_history)
+    window_res = res_history[-(m + 1):]
 
-    for it in range(maxit):
+    def _state():
+        order = [(head - filled + i) % m for i in range(filled)]
+        return AndersonState(
+            tuple((_entry(Xhist[i]), _entry(Fhist[i])) for i in order) + ((x, f),),
+            best, tuple(res_history), fallback)
+
+    if resume is None:
+        if res_history[0] <= tol:
+            return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
+                                      iterations=0, converged=True)
+        if on_eval is not None:
+            on_eval(_state())
+    mask_shape = (m,) + (1,) * len(shape)
+
+    for it in range(len(res_history) - 1, maxit):
         oldest_pos = (head - filled) % m
         X_ord = jnp.roll(Xhist, shift=-oldest_pos, axis=0)
         F_ord = jnp.roll(Fhist, shift=-oldest_pos, axis=0)
@@ -452,6 +494,8 @@ def anderson_nojit(
         if res <= tol:
             return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
                                       iterations=it + 1, converged=True)
+        if on_eval is not None:
+            on_eval(_state())
 
     return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
                               iterations=maxit, converged=False)
