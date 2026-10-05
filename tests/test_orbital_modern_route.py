@@ -1,7 +1,8 @@
 """htransform's modern-theory orbital route on toy inputs (CPU, seconds).
 
-The star-weighted parent total equals the full-BZ sum, the moved SOS pieces
-equal ``orbital_response.orbital_magnetization``, and a stored velocity that
+The star-weighted parent total equals the full-BZ sum and is one mapped
+call over the parents, the moved SOS pieces equal
+``orbital_response.orbital_magnetization``, and a stored velocity that
 is not the WFN's, or a QP velocity with no Sigma term, refuses before any
 payload read.
 """
@@ -46,30 +47,52 @@ def test_parent_total_with_axial_star_weights_equals_the_full_bz_sum():
         irr_idx_k=np.array([0, 0]), nk_tot=2, active_symmetry_rows=[0, 1],
         cartesian_action=lambda rows, axial, time_odd: np.stack(
             [np.eye(3), _R])[np.asarray(rows)])
-    mu, ceilings, _, m = orbital.orbital_totals(
+    mu, E_top, m = orbital.orbital_totals(
         v[None], e[None], sym, nelec=nelec - 1e-7, width_ry=None,
         deps_tol_ry=1e-8)                           # a float count, as QE writes
-    assert ceilings[-1] == nb and mu == 0.5 * (e[nelec - 1] + e[nelec])
+    assert mu == 0.5 * (e[nelec - 1] + e[nelec]) and E_top == e[-1]
     full = 0.5 * sum(np.asarray(orbital_magnetization(
         x, e, mu_ry=mu, width_ry=0.0)) for x in (v, v_image))
-    np.testing.assert_allclose(m[-1], full, atol=1e-12)
-    assert abs(m[-1][0]) > 1e-3                     # the check sees a moment
+    np.testing.assert_allclose(m, full, atol=1e-12)
+    assert abs(m[0]) > 1e-3                         # the check sees a moment
 
 
-def _one_k_sym():
-    return SimpleNamespace(
+def test_parent_total_is_one_mapped_call_over_unsorted_parents(monkeypatch):
+    """Three parents, file band order, Fermi-Dirac: one traced
+    orbital_magnetization over all parents equals the per-parent sum."""
+    import psp.orbital_response as response
+    rng = np.random.default_rng(5)
+    nb, nelec, kT = 10, 4.0, 0.05
+    v = np.stack([_velocity(rng, nb) for _ in range(3)])
+    e = np.stack([rng.permutation(np.linspace(-1, 2, nb)) + 0.01 * rng.standard_normal(nb)
+                  for _ in range(3)])
+    sym = SimpleNamespace(
+        irr_idx_k=np.array([0, 1, 1, 2, 2, 2]), nk_tot=6,
+        active_symmetry_rows=[0],
+        cartesian_action=lambda rows, axial, time_odd: np.eye(3)[None])
+    calls = []
+    real = response.orbital_magnetization
+    monkeypatch.setattr(response, "orbital_magnetization",
+                        lambda *a, **k: calls.append(1) or real(*a, **k))
+    mu, _, m = orbital.orbital_totals(v, e, sym, nelec=nelec, width_ry=kT,
+                                      deps_tol_ry=1e-8)
+    assert len(calls) == 1
+    w = np.array([1, 2, 3]) / 6.0
+    ref = sum(w[p] * np.asarray(real(v[p], e[p], mu_ry=mu, width_ry=kT))
+              for p in range(3))
+    np.testing.assert_allclose(m, ref, atol=1e-13)
+    assert np.abs(ref).max() > 1e-3
+
+
+def test_a_top_band_inside_the_fermi_window_refuses():
+    rng = np.random.default_rng(3)
+    v, e = _velocity(rng, 6), np.sort(rng.standard_normal(6))
+    sym = SimpleNamespace(
         irr_idx_k=np.array([0]), nk_tot=1, active_symmetry_rows=[0],
         cartesian_action=lambda rows, axial, time_odd: np.eye(3)[None])
-
-
-def test_ceilings_lie_above_the_occupied_bands():
-    rng = np.random.default_rng(3)
-    nb, nelec = 12, 8                        # 0.6 nb = 7.2 is inside the occupied set
-    v, e = _velocity(rng, nb), np.sort(rng.standard_normal(nb))
-    _, ceilings, E_c, _ = orbital.orbital_totals(
-        v[None], e[None], _one_k_sym(), nelec=nelec, width_ry=None,
-        deps_tol_ry=1e-8)
-    assert ceilings[0] == nelec + 1 and np.all(E_c > 0.5 * (e[7] + e[8]))
+    with pytest.raises(ValueError, match="GATE orbital_totals_empty_band"):
+        orbital.orbital_totals(v[None], e[None], sym, nelec=5.5,
+                               width_ry=1.0, deps_tol_ry=1e-8)
 
 
 def test_t0_total_without_a_gap_refuses():

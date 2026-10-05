@@ -2,7 +2,7 @@
 
 Three steps, one owner each:
 
-    band_operators             <psi_kn|O|psi_km> on the coarse full BZ
+    band_operators             <psi_kn|O|psi_km> on the parents, unfolded
     interpolate_band_operator  the operator on htransform path states
     grid_moments               sum_n f(e_qn) <qn|O|qn> on a uniform q grid
 
@@ -25,7 +25,6 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import make_flat_k_ifftn
-from common.shard_map import shard_map
 from common.staged_reshard import face_to_batch_reshard
 from gw.qsgw_head import rotate_velocity_to_qp
 from runtime.padding import pad_axis, padded_axis
@@ -94,70 +93,81 @@ def _character_table(row_labels, channels):
     return np.stack(ops)
 
 
-def band_operators(wfn, band_range, mesh, *, pseudos, channels=()):
+def _spin_operator(geom):
+    """``sigma_a psi``: spinor mixing, diagonal in G (a sweep ``apply_g``)."""
+    from common.mtxel_sweep import Operator
+    return Operator(
+        apply_g=lambda psi, gvec, gmask, kvec, pauli: jnp.einsum(
+            "ast,ntg->nsga", pauli, psi),
+        ncomp=3, consts=(jnp.asarray(PAULI),), key=("spin", geom.ngkmax))
+
+
+def _character_operator(geom, setup, table):
+    """``sum_rq |Zt_r> T_o,rq <Zt_q| psi`` on the Loewdin rows ``Zt``.
+
+    Band layout (a sweep ``apply``): the Loewdin overlap needs all of G.
+    """
+    from common.mtxel_sweep import Operator
+    from psp import vnl_ops
+
+    def apply(psi_n, gvec, gmask, bidx, kvec, tab):
+        Z = vnl_ops.build_vnl_kdata_traced(kvec, gvec, setup).Z * gmask[None, :]
+        lam, U = jnp.linalg.eigh(jnp.conj(Z) @ Z.T)
+        Zt = ((U / jnp.sqrt(lam)[None, :]) @ jnp.conj(U.T)).T @ Z
+        proj = jnp.einsum("rG,nsG->rsn", jnp.conj(Zt), psi_n[0])
+        return jnp.einsum("rG,orq,qsn->nsGo", Zt, tab, proj,
+                          optimize=True)[None]
+
+    return Operator(apply=apply, ncomp=int(table.shape[0]), consts=(table,),
+                    key=("atomic_character", geom.ngkmax, id(setup)))
+
+
+def band_operators(wfn, band_range, mesh, sym, *, pseudos, channels=()):
     """``<psi_kn|O|psi_km>`` on the full BZ, ``(n_op, nk, nb_pad, nb_pad)``.
 
     Operators, in order: sigma_x, sigma_y, sigma_z; one projector per orbital
     ``channels`` entry, on the Loewdin-orthogonalized PP_PSWFC rows (QE
     projwfc's projector; radial functions j-averaged as in
-    ``psp.hubbard_ops``).  psi is the loader's full-BZ unfold (the Galerkin
-    fit's own source, so the band gauge is ctilde's).  Bands stay sharded
-    over the mesh; one k's bands (and its atomic projections) are gathered at
-    a time.
+    ``psp.hubbard_ops``).  The dipole driver's route: the WFN's own
+    (file-wedge) psi at ``band_sphere_spec``, one ``common.mtxel_sweep``
+    pass, then ``symmetry_maps``' file-wedge unfold, sigma as an axial
+    time-odd vector and a projector as an invariant scalar.  The full BZ is
+    then in the loader's unfold gauge, the Galerkin fit's (ctilde's).  Per
+    rank: nk_irr nb ns ngkmax 16 / P bytes of psi.
     """
-    from common.collectives import device_put_process_local
+    from common.mtxel_sweep import SweepGeometry, sweep_matrix_elements
     from common.wfn_layout import band_sphere_spec
-    from psp import vnl_ops
     from psp.dft_operators import padded_gvectors
     from psp.hubbard_ops import build_atwfc_setup
+    from symmetry_maps import (apply_band_matrix_symmetry,
+                               unfold_file_wedge_to_full_bz)
 
     if int(wfn.nspinor) != 2:
         raise ValueError("band_operators: spin needs a spinor WFN")
     names = [f"sigma_{a}" for a in _AXES] + [f"char_{c}" for c in channels]
-    setup, table = None, np.zeros((1,), dtype=np.complex128)
+    lo, hi = (int(b) for b in band_range)
+    psi = wfn.load(bands=(lo, hi), k="ibz", sharding=band_sphere_spec())
+    geom = SweepGeometry(mesh=mesh, fft_grid=wfn.fft_grid,
+                         ngkmax=int(psi.shape[3]), nb=hi - lo, ns=2,
+                         nk=int(psi.shape[0]),
+                         cell_volume=float(wfn.cell_volume))
+    ops = [_spin_operator(geom)]
     if channels:
         upf = {el: getattr(p, "_source_path") for el, p in pseudos.items()}
         setup, row_labels = build_atwfc_setup(wfn, upf, nspinor=2)
-        table = _character_table(row_labels, channels)
-
-    psi = wfn.load(bands=tuple(int(b) for b in band_range), k="full_bz",
-                   sharding=band_sphere_spec())
-    gtab = padded_gvectors(wfn, k="full_bz")
-    rep = NamedSharding(mesh, P())
-    kvecs, gvecs, gmask, table = (
-        device_put_process_local(np.asarray(a), rep) for a in (
-            np.asarray(gtab.kvecs, dtype=np.float64),
-            np.asarray(gtab.gvecs, dtype=np.int32),
-            np.asarray(gtab.mask, dtype=np.float64), table))
-    axes = ("x", "y")
-    pauli = jnp.asarray(PAULI)
-
-    def _local(psi_l, kv, gv, gm, tab):
-        def one_k(args):
-            psi_k, k, G, m = args                       # (nb_loc, 2, nG)
-            psi_all = jax.lax.all_gather(psi_k, axes, axis=0, tiled=True)
-            spin = jnp.einsum("nsG,ast,mtG->anm", jnp.conj(psi_k), pauli,
-                              psi_all, optimize=True)
-            if setup is None:
-                return spin
-            Z = vnl_ops.build_vnl_kdata_traced(k, G, setup).Z * m[None, :]
-            O = jnp.conj(Z) @ Z.T
-            lam, U = jnp.linalg.eigh(0.5 * (O + jnp.conj(O.T)))
-            Zt = ((U / jnp.sqrt(lam)[None, :]) @ jnp.conj(U.T)).T @ Z
-            proj = jnp.einsum("rG,nsG->rsn", jnp.conj(Zt), psi_k)
-            proj_all = jax.lax.all_gather(proj, axes, axis=2, tiled=True)
-            atomic = jnp.einsum("rsn,orq,qsm->onm", jnp.conj(proj), tab,
-                                proj_all, optimize=True)
-            return jnp.concatenate([spin, atomic], axis=0)
-        return jax.lax.map(one_k, (psi_l, kv, gv, gm))
-
-    run = jax.jit(shard_map(
-        _local, mesh=mesh,
-        in_specs=(band_sphere_spec(), P(), P(), P(), P()),
-        out_specs=P(None, None, axes, None), check_vma=False))
-    ops = run(psi, kvecs, gvecs, gmask, table)          # (k, op, n, m)
+        ops.append(_character_operator(
+            geom, setup, _character_table(row_labels, channels)))
+    gtab = padded_gvectors(wfn, k="ibz")
+    blocks = sweep_matrix_elements(
+        psi, geom=geom, operator=tuple(ops), gvecs=gtab.gvecs,
+        gmask=gtab.mask, box_index=wfn.box_index(k="ibz"),
+        kvecs=np.asarray(gtab.kvecs))
     del psi
-    return jnp.moveaxis(ops, 1, 0), names
+    full = [unfold_file_wedge_to_full_bz(sym, b) for b in blocks]
+    full[0] = apply_band_matrix_symmetry(full[0], component_mix=(
+        sym.cartesian_action(np.asarray(sym.sym_idx_k), axial=True,
+                             time_odd=True)))
+    return jnp.moveaxis(jnp.concatenate(full, axis=1), 1, 0), names
 
 
 def stored_velocity(path, *, wfn, wfn_path, sym, mesh):
@@ -186,24 +196,22 @@ def stored_velocity(path, *, wfn, wfn_path, sym, mesh):
     return parents, energies[rows], label
 
 
-def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry,
-                   n_ceilings=9):
+def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry):
     """Per-cell modern-theory orbital moment from parent rows, in mu_B.
 
-    ``psp.orbital_response.orbital_magnetization`` at each parent k with the
-    star weights of ``sym.irr_idx_k``, averaged over the group's axial
-    time-odd action: the full-BZ sum without the unfold.  ``width_ry =
-    None``: T = 0 at midgap of the ``nelec`` lowest bands; else the fixed-N
-    Fermi-Dirac mu.  Returns ``(mu_ry, ceilings, E_c_ry, m (n_ceilings, 3))``
-    for energy-ordered band ceilings from 0.6 nb to nb; ``E_c`` is the
-    star-weighted mean energy of band ``c - 1``.
+    ``psp.orbital_response.orbital_magnetization`` over every stored band,
+    one mapped call over the parent k, with the star weights of
+    ``sym.irr_idx_k`` and averaged over the group's axial time-odd action:
+    the full-BZ sum without the unfold.  ``width_ry = None``: T = 0 at
+    midgap of the ``nelec`` lowest bands; else the fixed-N Fermi-Dirac mu.
+    Returns ``(mu_ry, E_top_ry, m (3,))``; ``E_top`` is the star-weighted
+    mean energy of the highest stored band.
     """
     from gw.efermi import solve_smearing_occupations
     from psp.orbital_response import orbital_magnetization
     weights = np.bincount(np.asarray(sym.irr_idx_k),
                           minlength=len(energies)) / float(sym.nk_tot)
-    order = np.argsort(energies, axis=1, kind="stable")
-    E = np.take_along_axis(energies, order, axis=1)
+    E = np.sort(energies, axis=1)
     nb = E.shape[1]
     if width_ry is None:            # QE's count is a float: 129.99999 is 130
         n = int(round(float(nelec)))
@@ -220,28 +228,17 @@ def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry,
         mu = float(solve_smearing_occupations(
             E, weights, float(nelec), float(width_ry), state_capacity=1.0,
             family="fd")[0])
-    # Ceilings from 0.6 nb, but above every band within 10 kT of mu: a
-    # ceiling inside the occupied set reads ~0 and E_c - mu < 0, which
-    # wrecks the 1/(E_c - mu) extrapolation.
-    empty = int(np.searchsorted(E.min(axis=0), mu + 10.0 * (width_ry or 0.0),
-                                side="right")) + 1
-    if empty > nb:
+    if E[:, -1].min() <= mu + 10.0 * (width_ry or 0.0):
         raise ValueError(
             f"GATE orbital_totals_empty_band: no band of the {nb} lies wholly "
             f"above mu = {mu:.6f} Ry + 10 kT; fix: raise ncond")
-    ceilings = np.unique(np.linspace(max(0.6 * nb, empty), nb, n_ceilings
-                                     ).round()).astype(int)
-    m = np.zeros((len(ceilings), 3))
-    for p, perm in enumerate(order):
-        v = jnp.asarray(parents[p][:, perm][:, :, perm])
-        for i, c in enumerate(ceilings):
-            m[i] += weights[p] * np.asarray(orbital_magnetization(
-                v[:, :c, :c], E[p, :c], mu_ry=mu, width_ry=width_ry or 0.0,
-                deps_tol_ry=deps_tol_ry))
+    m_k = jax.jit(lambda v, e: jax.lax.map(lambda x: orbital_magnetization(
+        *x, mu_ry=mu, width_ry=width_ry or 0.0, deps_tol_ry=deps_tol_ry),
+        (v, e)))(parents, energies)
     rows = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
     projector = np.asarray(sym.cartesian_action(
         rows, axial=True, time_odd=True), dtype=np.float64).mean(axis=0)
-    return float(mu), ceilings, weights @ E[:, ceilings - 1], m @ projector.T
+    return float(mu), weights @ E[:, -1], weights @ np.asarray(m_k) @ projector.T
 
 
 def path_orbital_moments(parents, sym, window, source_coefficients,

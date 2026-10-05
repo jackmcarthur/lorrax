@@ -181,8 +181,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
        channel character, or n.m_n (``psp.orbital_response``; degenerate
        multiplets averaged).
     4. Coarse totals (``orbital.orbital_totals``), physical moments along n:
-       orbital at the stored ceiling and extrapolated in 1/E_ceiling, spin
-       -(g_e/2) sum_occ <sigma>, and their sum.
+       orbital over every stored band, spin -(g_e/2) sum_occ <sigma>, and
+       their sum.
     5. Grid: H and sigma_a on ``moments_grid``; m = sum_q w sum_n f <sigma>.
     """
     if not colors and not moments_grid and velocity is None:
@@ -232,8 +232,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
             velocity, wfn=wfn, wfn_path=wfn_path, sym=sym, mesh=mesh)
     with mesh:
         ops, names = band_operators(
-            wfn, (band_start, band_start + nb_fit), mesh, pseudos=pseudos,
-            channels=channels)
+            wfn, (band_start, band_start + nb_fit), mesh, sym,
+            pseudos=pseudos, channels=channels)
     axis, axis_source = magnetization_axis(wfn)
     log(f"  [band operators] {len(names)} on {nk} coarse k x {nb_fit} "
         f"bands: {', '.join(names)}")
@@ -257,11 +257,10 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
 
     files = []
     if velocity is not None:
-        mu, ceil, E_c, m = orbital_totals(
+        mu, E_top, m = orbital_totals(
             parents, E_par, sym, nelec=float(wfn.num_electrons),
             width_ry=width, deps_tol_ry=deps_tol)
-        fit = np.linalg.lstsq(np.c_[np.ones(len(ceil)), 1 / (E_c - mu)], m,
-                              rcond=None)[0][0]
+        top = int(E_par.shape[1])
         spin = -0.5 * 2.00232 * sigma_c          # g_e = 2.00232
         lines = [
             f"Orbital moment (modern theory, coarse {kgrid[0]}x{kgrid[1]}x"
@@ -271,16 +270,13 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
             + ("T = 0, midgap" if width is None else
                f"fixed-N Fermi-Dirac, k_B T = {float(width)} Ry") + "); "
             f"physical moments in mu_B per cell along n",
-            f"  orbital, stored band ceiling {ceil[-1]} (E_c - mu = "
-            f"{(E_c[-1] - mu) * RYD_TO_EV:.2f} eV): {float(axis @ m[-1]):+.6f}"
-            f"  m = ({m[-1][0]:+.12f}, {m[-1][1]:+.12f}, {m[-1][2]:+.12f})",
-            f"  orbital, 1/E_ceiling extrapolation over ceilings {ceil[0]}-"
-            f"{ceil[-1]}: {float(axis @ fit):+.6f}",
+            f"  orbital, stored band ceiling {top} (E_c - mu = "
+            f"{(E_top - mu) * RYD_TO_EV:.2f} eV): {float(axis @ m):+.6f}"
+            f"  m = ({m[0]:+.12f}, {m[1]:+.12f}, {m[2]:+.12f})",
             "  spin -(g_e/2) sum_occ <sigma> (g_e = 2.00232): "
             f"{float(axis @ spin):+.6f}",
-            f"  spin + orbital at ceiling {ceil[-1]}: "
-            f"{float(axis @ (spin + m[-1])):+.6f}",
-            f"  spin + orbital extrapolated: {float(axis @ (spin + fit)):+.6f}"]
+            f"  spin + orbital at ceiling {top}: "
+            f"{float(axis @ (spin + m)):+.6f}"]
         for line in lines:
             log(line)
     if colors:

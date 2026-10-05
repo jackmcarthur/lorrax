@@ -251,12 +251,13 @@ averaged over the group's axial time-odd action: $T = 0$ at midgap without
 width, the rounded electron count must sit below a gap on the coarse grid;
 overlapping bands or a fractional count refuse
 (`GATE orbital_totals_t0_gap`; `bandstructure.orbital.orbital_totals`). It
-is printed at the stored band ceiling and as the intercept $m_\infty$ of
-$m(c) = m_\infty + a/(E_c - \mu)$ over ceilings from 0.6 to 1 of the stored
-bands, each above every band within 10 kT of $\mu$; with no such band left,
-`GATE orbital_totals_empty_band` asks for more `ncond`.
+sums every stored band of the velocity file; when the highest stored band
+is not wholly above $\mu$ + 10 kT, `GATE orbital_totals_empty_band` asks
+for more `ncond`. The spin and character matrices are formed at the WFN's
+own k-points, as the dipole driver forms the velocity, and unfolded by
+symmetry; no full-BZ ψ is loaded.
 The spin moment $-\tfrac{g_e}{2}\mu_B\sum_\mathrm{occ}\langle\boldsymbol
-\sigma\rangle$ ($g_e = 2.00232$) and the two sums follow on their own lines.
+\sigma\rangle$ ($g_e = 2.00232$) and the spin + orbital sum follow on their own lines.
 
 **`--moments-grid NX NY NZ`** interpolates $f(H)$ and every $\sigma_a$ to
 that uniform grid, finds $E_F$ there by Fermi–Dirac occupation of the
