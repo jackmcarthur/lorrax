@@ -479,13 +479,10 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         live = int(K.max(initial=0))
         width = _k_extent(meta, header, live, record=False)
         name = f"staging/q{lo}_{hi}"
-        # The final column extent, when it is known before this batch lands
-        # (``_direct_extent``): the batch then goes straight into the final
-        # datasets, with no staging group written, synced, read back, copied
-        # and deleted (Ni 20^3 P64 bispinor: 267 s per map in the last
-        # round's finalize, at 0.2-5 % GPU).  The census and ``finalized``
-        # commit exactly as for a staged batch, so an interrupted write is
-        # refused by name and rebuilt.
+        # A known final extent (``_direct_extent``) puts the batch straight into
+        # the final datasets: no staging group written, synced, read back,
+        # copied and deleted (Ni 20^3 P64 bispinor: 267 s per map, 0.2-5 % GPU).
+        # The census and the commit land as for a staged batch.
         extent = (previous.get("direct_extent") if previous is not None
                   else _direct_extent(meta, header, live, whole=(lo, hi) == (0, header["n_q_irr"])))
     with timing.section("canonical_basis_conversion_and_packing"):
@@ -571,14 +568,8 @@ def _direct_extent(meta, header, live, *, whole):
 
 
 def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent):
-    """One batch into the final datasets at rows ``[lo, lo + b)``.
-
-    Every column is written (the native provider never fills): the factor's
-    own columns, exact zeros past its carrier, and unit poles past each
-    parent's K.  ``write_slab`` keeps min(A.shape, dataset) per axis: rows
-    past N_mu and columns past the extent are dropped (the columns past each
-    parent's K are exact zeros, the writer's sentinel gate).
-    """
+    """One batch into the final datasets at rows ``[lo, lo + b)``: every column written
+    (the native provider never fills), exact zeros past the carrier, unit poles past K."""
     spec = P(None, "x", None, "y")
     components = header.get("factor_components", 1)
     b, written = int(canonical.shape[0]), min(int(canonical.shape[-1]), extent)
@@ -594,12 +585,8 @@ def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent
 
 
 def _stage_direct(path, header):
-    """Move a direct model's datasets into the staging group (one rank-0 link move).
-
-    The batches already in them become staged batches read at their row
-    offset, so finalization copies them into the final datasets at the grown
-    extent exactly as it copies any staged batch.
-    """
+    """Move a direct model's datasets into the staging group (one rank-0 link move);
+    its batches become staged batches read at their row offset."""
     name = "staging/direct"
     def move():
         with h5py.File(path, "a") as f:
@@ -611,27 +598,6 @@ def _stage_direct(path, header):
         if batch["name"] is None:
             batch.update(name=name, offset=batch["lo"])
     header["direct_extent"] = None
-
-
-def finalize_shared_pole_model(path, *, meta, expected_identity, basis=None):
-    """Resume finalization from a successfully closed, complete staging census.
-
-    A native write failure retains the global incomplete marker and refuses;
-    this retries the recoverable boundary after all staged batches closed.
-    """
-    header = _read_staging_header(path)
-    if header is None:
-        _refuse("missing staged model")
-    _check_identity(header["identity"], expected_identity)
-    basis = _check_basis(meta, header, basis)
-    if header["schema"] != SCHEMA or not all(header["written_q"]):
-        _refuse("finalization requires every staged parent (a one-batch write "
-                "stages none: an interrupted one is rebuilt, not resumed)")
-    if header["finalized"]:
-        return validate_shared_pole_model(
-            path, expected_identity=expected_identity, mesh_xy=meta.mu_basis.mesh_xy,
-            capacity=_capacity(meta))
-    return _finalize_model(path, meta=meta, header=header, basis=basis)
 
 
 #: Headroom of the SC run's held pole-column extent over the live Kmax it is
@@ -715,16 +681,13 @@ def _finalize_model(path, *, meta, header, basis=None):
                device_panel=batch_width*max(int(panel),8*kmax), native_host=True)
     header["Kmax"] = kmax
     header["compact_payload_bytes"] = nq * (16*nmu*components*kmax + 8*kmax + 8)
-    header["staging_payload_bytes"] = sum((v["hi"]-v["lo"]) * v["width"] * (16*nmu*components+8)
-                                          for v in header["batches"] if v["name"] is not None)
-    header["peak_payload_bytes"] = header["compact_payload_bytes"] + header["staging_payload_bytes"]
     if isinstance(path, ResidentSectorModel):
         path.finalize_payload(header, n_canonical=basis.n_canonical)
         # In-process payload: nothing can drift from the header it was built
         # with, so the digest binds the metadata only (no payload rehash; the
         # writer already checked every factor). Files keep the payload digest.
         identity = {k: v for k, v in header.items() if k not in
-                    ("digest", "finalized", "batches", "direct_extent", "staging_payload_bytes", "peak_payload_bytes")}
+                    ("digest", "finalized", "batches", "direct_extent")}
         header["digest"] = "resident:" + hashlib.sha256(_json(identity).encode()).hexdigest()
         header["finalized"] = True
         path.header_json = _json(header)
@@ -841,7 +804,7 @@ def _model_digest(path, header, mesh, *, capacity):
     """
     _check_io_capacity(capacity,mesh,header)
     identity = {k:v for k,v in header.items() if k not in
-                ("digest", "finalized", "batches", "direct_extent", "staging_payload_bytes", "peak_payload_bytes")}
+                ("digest", "finalized", "batches", "direct_extent")}
     digest = hashlib.sha256(_json(identity).encode())
     nmu, kmax = header["n_mu_logical"], header["Kmax"]
     components = header.get("factor_components", 1)
