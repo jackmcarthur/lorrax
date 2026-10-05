@@ -803,7 +803,8 @@ def _oneshot_sampled_support(config, enk_dft, wfn, meta, occupation_state,
         occupation_state if metal else None)
     requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
     energy = e_ry * RYD_TO_EV - mu_ev
-    semicore = coarse_identities(meta.coarse_class, e_ry, config.compute_mode)
+    semicore = coarse_identities(
+        getattr(meta, "coarse_class", None), e_ry, config.compute_mode)
     states = requested_states(
         config.sigma, config.sc.frozen_core_bands, energy,
         np.ones(e_ry.shape, dtype=bool), active_band_mask(e_ry, float(wfn.efermi)))
