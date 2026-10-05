@@ -265,8 +265,7 @@ def _notices(status, op, n, dtype, site, *, final):
                   f"accept {tol:.1e}); {what}", file=sys.stderr, flush=True)
 
 
-def checked(op, attempts, errors_of, operands, *, site, n=None, dtype=None, constrain=None,
-            final=True):
+def checked(op, attempts, errors_of, operands, *, n=None, dtype=None, constrain=None, final=True):
     """Run ``attempts`` until one passes ``errors_of``: ``(result, (failed, errors))``.
 
     Each attempt maps ``operands`` to a result; ``errors_of(result)`` returns
@@ -318,10 +317,10 @@ def eigh_layout(mesh, ndim):
                       jax.lax.with_sharding_constraint(r[1], vectors))
 
 
-def checked_eigh(attempts, a, *, site, mesh=None, final=True):
+def checked_eigh(attempts, a, *, mesh=None, final=True):
     """A distributed eigh, checked: ``attempts`` solve ``a`` in order of preference; ``(result, failed)``."""
     constrain = None if mesh is None else eigh_layout(mesh, a.ndim)
-    return checked("eigh", attempts, lambda r: eigh_errors(a, *r, mesh=mesh), (a,), site=site,
+    return checked("eigh", attempts, lambda r: eigh_errors(a, *r, mesh=mesh), (a,),
                    constrain=constrain, final=final)
 
 
@@ -381,7 +380,7 @@ def checked_shapes(fn, *args):
     return jax.eval_shape(_in_phase(fn, "first"), *args)[0]
 
 
-def checked_program(fn, mesh, out_shardings):
+def checked_program(fn, mesh, out_shardings, in_shardings=None):
     """A caller's jitted program over checked solves, run as an eager eigh is.
 
     The first program holds each checked solve's first attempt and check and
@@ -392,16 +391,28 @@ def checked_program(fn, mesh, out_shardings):
     program with no checked solve returns no flag and is never synced on.
     ``call.lower`` lowers the whole-chain program, so a caller that admits it
     by its compiled size has sized the retry, and a first program run beside
-    that size fits.
+    that size fits. A caller that runs ``call.lower(*args).compile()`` itself
+    hands that executable's ``(out, status)`` to ``call.finish(args, result)``,
+    which prints the notices, refuses by name and returns ``out``.
     """
     rep = NamedSharding(mesh, P())
     phases = {phase: _in_phase(fn, phase) for phase in ("first", "all")}
-    first, again = (jax.jit(phases[phase], out_shardings=(out_shardings, rep))
+    shardings = {} if in_shardings is None else dict(in_shardings=in_shardings)
+    first, again = (jax.jit(phases[phase], out_shardings=(out_shardings, rep), **shardings)
                     for phase in ("first", "all"))
 
     def report(phase, args, status, final):
         for (op, n, dtype, site), table in zip(phases[phase].infos[_signature(args)], status[1]):
             _notices((status[0], table), op, n, dtype, site, final=final)
+
+    def finish(args, result):
+        out, status = result
+        if status:
+            report("all", args, status, final=True)
+            if _flag(status):
+                raise ValueError(f"GATE distrib_la_result_check: a checked solve in the program at "
+                                 f"{call_site()} failed every attempt (named above); result set to NaN")
+        return out
 
     def call(*args):
         out, status = first(*args)
@@ -409,14 +420,13 @@ def checked_program(fn, mesh, out_shardings):
             return out
         report("first", args, status, final=False)
         del out
-        out, status = again(*args)
-        report("all", args, status, final=True)
-        if _flag(status):
-            raise ValueError(f"GATE distrib_la_result_check: a checked solve in the program at "
-                             f"{call_site()} failed every attempt (named above); result set to NaN")
-        return out
-    call.lower = again.lower
+        return finish(args, again(*args))
+    call.lower, call.finish = again.lower, finish
     return call
+
+
+#: Sites whose traced status took the host-callback fallback (warned once each).
+_UNCACHEABLE: set = set()
 
 
 def raise_if_failed(status, op, n, dtype, site):
@@ -427,12 +437,20 @@ def raise_if_failed(status, op, n, dtype, site):
     together; only the printing depends on the rank. A traced status goes to
     the enclosing :func:`checked_program`, if any; a traced status outside
     one prints its notices through a host callback (the only program that
-    keeps one, and so is not stored by JAX's persistent cache).
+    keeps one, and so is not stored by JAX's persistent cache: it warns once
+    per site, naming it).
     """
     if isinstance(status[0], jax.core.Tracer):
         if _program_context() is not None:
             _program_context()[1].append((status, (op, int(n), dtype, site)))
         else:
+            if site not in _UNCACHEABLE and jax.process_index() == 0:
+                print(f"distrib_la: UNCACHEABLE: a checked {op} at {site} is traced outside "
+                      f"distrib_la.checked_program, so the program holding it carries a host callback "
+                      f"and JAX's persistent cache never stores it (it compiles again in every "
+                      f"process); build that program with distrib_la.checked_program",
+                      file=sys.stderr, flush=True)
+            _UNCACHEABLE.add(site)
             jax.debug.callback(lambda failed, errors: _notices((failed, errors), op, int(n), dtype, site,
                                                                final=True), *status)
         return

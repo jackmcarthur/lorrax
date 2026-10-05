@@ -18,6 +18,24 @@ thread, every entry unused for 7 days. No results move. The first run after
 this change starts cold once; the old per-commit namespaces are retired by
 the existing pruner after 7 days unused.
 
+## 2026-10-05 — distrib_la programs are keyed on what enters the HLO; sqrt_v and the Dyson programs are checked programs
+
+Compile audit rows 5 and 6. A distrib_la program key (`_program_key`,
+`_stack_bytes`, `_reshard_stack_program`, `Plan._program`,
+`_scan_over_single`) held the call site and the plan's byte budget, so one
+eigh stack compiled once per calling line and per room (CrI3 24×24 P64:
+8 extra compiles, 22 s cold per process). The keys now hold op, mesh,
+shape, dtype, rounds and phase only; the refusal still names its site, on
+the host. `checked()` and `checked_eigh()` no longer take `site=`.
+response_bank's `sqrt_v` and its Dyson, slope and moment programs are
+`distrib_la.checked_program`s (`checked_program` takes `in_shardings`, and
+an AOT caller hands its executable's `(out, status)` to `call.finish`), so
+they hold no host callback and the persistent cache stores them; a checked
+solve traced in a bare jit outside any `checked_program` still prints its
+notices through one callback, and now warns once per site (`UNCACHEABLE`).
+No
+deck or environment change; results do not move.
+
 ## 2026-10-05 — kmeans sizes from the shapes; a CT face fallback; the checkpoint digest splits over ranks
 
 - **kmeans.** The candidate Gram's k batches and square tiles, and the

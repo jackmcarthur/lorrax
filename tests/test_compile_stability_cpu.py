@@ -64,7 +64,7 @@ def test_rank_fingerprint_env_mirrors_ffi_dials():
 
 def _checked_eigh(a, site="test eigh"):
     from distrib_la import _result_check as rc
-    (w, v), status = rc.checked_eigh((jnp.linalg.eigh,), a, site=site)
+    (w, v), status = rc.checked_eigh((jnp.linalg.eigh,), a)
     rc.raise_if_failed(status, "eigh", a.shape[-1], a.dtype, site)
     return w, v
 
@@ -89,8 +89,6 @@ def test_checked_program_has_no_host_callback():
     assert _host_callbacks(bare.lower(a)) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="audit row 6: the traced fallback is silent until it warns "
-                   "once per site; flip when row 6 lands")
 def test_traced_fallback_warns_once(capsys):
     a = _hermitian(8)
     for _ in range(2):
@@ -114,7 +112,7 @@ class _CheckedPlan:
         B, = rest
         sketch = (*rc.matrix_sketch(A), *rc.rhs_sketch(B))
         X, status = rc.checked("solve_lu", (lambda x: x,), lambda x: rc.solve_errors(sketch, x),
-                               (jnp.linalg.solve(A, B),), site="test solve", n=A.shape[-1],
+                               (jnp.linalg.solve(A, B),), n=A.shape[-1],
                                dtype=A.dtype)
         rc.raise_if_failed(status, "solve_lu", A.shape[-1], A.dtype, "test solve")
         return X
@@ -133,8 +131,6 @@ def checked_service(monkeypatch):
     monkeypatch.setattr(distrib_la, "matmul", _matmul)
 
 
-@pytest.mark.xfail(strict=True, reason="audit row 6: response_bank's Dyson and sqrt_v programs "
-                   "trace checked solves outside checked_program; flip when row 6 lands")
 def test_response_programs_have_no_host_callback(checked_service):
     from gw import response_bank as rb
     mesh, n, nq = _mesh(), 8, 2
@@ -171,7 +167,7 @@ _REUSE = textwrap.dedent("""
     monitoring.register_event_listener(
         lambda name, **kw: hits.append(1) if name == "/jax/compilation_cache/cache_hits" else None)
     def fn(a):
-        (w, v), status = rc.checked_eigh((jnp.linalg.eigh,), a, site="reuse")
+        (w, v), status = rc.checked_eigh((jnp.linalg.eigh,), a)
         rc.raise_if_failed(status, "eigh", a.shape[-1], a.dtype, "reuse")
         return w
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
@@ -199,8 +195,6 @@ def test_checked_program_is_reused_by_a_second_process(tmp_path):
     assert second == (0, second[1]) and second[1] >= 1, (first, second)
 
 
-@pytest.mark.xfail(strict=True, reason="audit row 5: distrib_la keys programs on the call site; "
-                   "flip when row 5 lands")
 def test_one_stack_from_two_call_sites_compiles_once():
     from distrib_la import plan
     mesh = _mesh()
