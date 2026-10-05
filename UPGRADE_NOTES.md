@@ -178,10 +178,13 @@ it was traced with. No deck or environment change; results do not move.
   every CC, TT, CT and held program, about 120 s cold and 30 s warm per
   leg). A padded tail costs no measurable time: the width-1 round already
   took as long as a width-3 round.
-- **Pencil extent fixed before the first round.** Every state panel is
-  padded to its recipe carrier (`recipe_panel_widths`: the imaginary width,
-  the line cap, Q's carrier for a partner) and `round_tables` sizes the
-  pencil at those panels' capacity, the same in every round and SC map. Before,
+- **Pencil extent fixed before the first round.** Every state panel and the
+  infinity block are padded to their recipe carriers (`recipe_panel_widths`,
+  `recipe_infinity_width`: the imaginary width, the line cap, Q's carrier
+  for a partner, the infinity width; a selection closed over a multiplet
+  past its width keeps its own, wider carrier, as a metal's M1 directions
+  do) and `round_tables` sizes the pencil at those panels' capacity, the
+  same in every round and SC map. Before,
   the extent followed the largest selection seen so far and grew parent by
   parent in map 0 (CrI3 24×24: CC side 6976 → 11072 → 15168 → 17472, TT
   7424 → 24832 in five steps; eight recompiles of the CC, TT and CT programs
