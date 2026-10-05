@@ -76,7 +76,7 @@ REPLICATED.  Eigenvectors are COLUMNS.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import Any, Callable, NamedTuple
 
@@ -621,7 +621,10 @@ class Plan:
     in_sharding: NamedSharding | None
     batch_in_sharding: NamedSharding | None
     requested_batched_route: str = BATCHED_ROUTE_DEFAULT
-    budget_bytes: int | None = None
+    # A decision input, never program identity: plans that differ only by
+    # room are equal, so every program cached on a plan is shared across
+    # rooms (the room enters no HLO; the decided route does, per shape).
+    budget_bytes: int | None = field(default=None, compare=False)
 
     # ---- introspection -------------------------------------------------
     @property
