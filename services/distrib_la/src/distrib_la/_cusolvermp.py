@@ -245,13 +245,14 @@ _BLOCK_MAX = 256
 def _block_size(n: int, p: int) -> int:
     """The eigh block edge for an ``n x n`` operand on a ``p x p`` grid.
 
-    The largest divisor of ``n/p`` that is at most :data:`_BLOCK_MAX`, so
-    every rank keeps its ``(n/p, n/p)`` buffer; ``n/p`` itself when it is
-    that small.
+    The largest divisor of ``n/p`` in ``(_BLOCK_MAX/2, _BLOCK_MAX]``, so
+    every rank keeps its ``(n/p, n/p)`` buffer; one tile per rank (``n/p``)
+    when ``n/p`` is that small or has no such divisor (a prime ``n/p`` gave
+    block 1, 12x slower than one tile per rank).
     """
     local = n // p
-    return max(d for d in range(1, min(local, _BLOCK_MAX) + 1)
-               if local % d == 0)
+    return next((d for d in range(min(local, _BLOCK_MAX), _BLOCK_MAX // 2, -1)
+                 if local % d == 0), local)
 
 
 def retry_block(n: int, p: int) -> int | None:
