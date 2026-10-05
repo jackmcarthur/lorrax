@@ -3063,8 +3063,9 @@ def format_startup_report(f: dict) -> list:
     elif cc.get("enabled"):
         _np = cc.get("n_proc") or 1
         _share = ("used by this single rank" if int(_np) <= 1 else
-                  f"shared by all {_np} ranks through the hit/miss agreement "
-                  f"layer")
+                  f"shared by all {_np} ranks (process 0 writes, every rank "
+                  f"reads; the cross-rank compile agreement refuses a "
+                  f"rank-divergent program by name)")
         add(f"  The JAX persistent compile cache is enabled at "
             f"{cc.get('dir')}, {_share}.")
     else:

@@ -1,289 +1,55 @@
-"""JAX persistent compile cache — SAFE and EFFECTIVE at ``process_count() > 1``.
+"""JAX's persistent compile cache, armed once per process by the runtime.
 
-DRIVERS MUST NOT CALL :func:`ensure_jax_compile_cache`.  Arming it is
-owned by ``runtime.initialize_communicator_stack`` (step 7), which every
-driver already runs at module scope — above its own ``import jax`` and
-therefore above every jit in the process.  That ordering is the whole
-requirement: arming late means the expensive early compiles miss the
-cache.  A driver-local second call cannot advance that moment, so it buys
-nothing and its error handling is unreachable; a driver that needs the
-cache earlier needs the startup call earlier, not a second arming.
+JAX 0.9.1 does the caching: ``jax_compilation_cache_dir`` names the store,
+the key hashes the module, the compile options, XLA flags, jaxlib and the
+backend version, process 0 is the only writer, and on GPU the key is the
+same on every rank (the device assignment is stripped). What this file adds
+is only what that cannot see or say:
 
-Two callers are deliberately NOT drivers and are not covered by the
-above: kernel factories that arm the cache for callers arriving without
-a driver (``gw.w_isdf``, ``gw.ppm_tau_kernel``), and the drivers that run
-bare ``runtime.bootstrap()`` rather than the full startup call
-(``psp.run_nscf``, ``psp.run_sternheimer``, ``bse.bse_feast``), where
-nothing else arms it.
+* the location: ``$SCRATCH/.cache/lorrax/jax_compile/<namespace>/np{P}``
+  (:func:`default_cache_dir`), where the namespace names jax, jaxlib, the
+  native FFI bundle and this file's key schema, never the LORRAX source (a
+  commit reaches a program only through its HLO, which the key hashes);
+  rank 0 touches the entries it uses and retires the unused after a week
+  (:func:`_prune_namespaces`). ``ISDF_JAX_CACHE_DIR`` overrides, ``""``
+  opts out (``docs/reference/env_vars.md``);
+* a threshold of 0 s (JAX's 1 s default kept 2 of 666 MoS2 executables), and
+  JAX's own per-fusion XLA caches off at P > 1 (they are rank-asymmetric,
+  UPDATE on process 0 and READ on its peers);
+* the cross-rank compile agreement (:func:`install_compile_agreement`): a
+  rank that lowers a different program than its peers is refused by name
+  before the backend compile instead of hanging in its next collective
+  (INVARIANTS 21), with the compile counter the receipt reads;
+* GATE xla_rematerialization (:func:`_install_device_fit_gate`): a module
+  larger than the device is refused before its first execution.
 
-Knobs (all optional):
+What this file no longer does, and why. Until 2026-10-05 it froze an
+all-rank agreed entry set at startup and vetoed every other lookup, made
+the key process-invariant on CPU, canonicalized ``jit__multi_slice``, wrote
+entries atomically and prefetched them: all against XLA:GPU's collective
+autotuner, which hung when one rank hit the cache and skipped the exchange
+(7648fd417, jax 0.7.0). The runtime has run at ``xla_gpu_autotune_level=0``
+since 969d56431, so a divergent hit/miss pattern now costs the missing rank
+one compile and nothing waits. Measured at P4 (runs/DEV/771, agreement
+off on a warm namespace): completes, eqp bitwise, hits on every rank.
 
-  ``ISDF_JAX_CACHE_DIR=/some/path``    — use this directory as-is (no
-                                          namespace, never pruned).
-  ``ISDF_JAX_CACHE_DIR=""``             — opt out entirely.
-  ``LORRAX_JAX_CACHE_MULTIPROCESS=0``   — restore the scorecard-AG refusal
-                                          (no cache at all when P > 1).
-  ``LORRAX_JAX_CACHE_AGREE_TIMEOUT_S``  — agreement timeout, default 300.
-  ``LORRAX_JAX_COMPILE_AGREEMENT=0``    — UNSAFE bisect-only opt-out from the
-                                          per-module cross-rank compile-key
-                                          refusal (default on at P > 1).
-  ``LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S`` — per-module agreement deadline in
-                                          seconds; default 0 = no deadline
-                                          (a heartbeat names the missing rank).
-  ``LORRAX_JAX_CACHE_STRICT=0``         — on an agreed entry that then fails
-                                          to load, warn instead of aborting
-                                          (UNSAFE on GPU: can hang).
-  ``LORRAX_JAX_CACHE_FORCE_DIVERGE=N``  — TEST HOOK (positive control): every
-                                          rank != 0 pretends its N
-                                          alphabetically-last cache entries
-                                          are missing, forcing the agreement
-                                          to drop them.
-  ``LORRAX_JAX_CACHE_NO_AGREE=1``       — TEST HOOK: shared dir with the
-                                          agreement layer DISABLED, i.e. the
-                                          naive shared-dir design.  This is
-                                          the deadlock reproducer; never use
-                                          it in production.
-  ``JAX_EXPLAIN_CACHE_MISSES=1``        — opt in to JAX cache-miss explanations.
-                                          This is intentionally independent of
-                                          ``LORRAX_DEBUG_PRINT``: explanation
-                                          construction is diagnostic work, not
-                                          ordinary stage logging.
-  ``LORRAX_JAX_CACHE_KEYDUMP=<dir>``    — every rank writes the SET of
-                                          persistent-cache keys it asked
-                                          about to ``<dir>/rank{i}_of{N}.json``
-                                          at exit.  This is what makes the
-                                          key-symmetry invariant falsifiable:
-                                          JAX cache-miss logging names
-                                          only the keys that MISSED, so on a
-                                          healthy warm run it prints nothing
-                                          and two ranks asking about
-                                          different programs look identical.
-  ``LORRAX_JAX_CACHE_SHARD_SLICE=0``    — TEST HOOK (red twin): leave JAX's
-                                          ``ArrayImpl._multi_slice`` alone, so
-                                          each rank bakes its own shard
-                                          offsets into the jit signature and
-                                          gets its own ``jit__multi_slice``
-                                          cache key.  That is the divergent
-                                          hit/miss pattern; never in production.
-  ``LORRAX_JAX_CACHE_INVARIANT_KEY=0``  — TEST HOOK: do NOT make the cache key
-                                          process-invariant.  At P > 1 this
-                                          also switches the cache OFF, because
-                                          hitting it would be unsafe (only
-                                          process 0 could).
-  ``LORRAX_JAX_CACHE_PREFETCH``         — pull the agreed entries into the
-                                          page cache from a thread pool right
-                                          after the agreement (default in
-                                          ``_PREFETCH_DEFAULT``), with
-                                          ``LORRAX_JAX_CACHE_PREFETCH_THREADS``
-                                          workers (16).
-  ``JAX_COMPILATION_CACHE_MAX_SIZE``    — JAX's byte cap. ``0`` disables the
-                                          cache; a positive cap is supported
-                                          only at P=1. Live LRU eviction is
-                                          refused at P>1 because it can
-                                          invalidate the agreed startup set.
-  ``JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS`` — standard JAX write
-                                          threshold.  Unset, LORRAX sets 0:
-                                          almost every LORRAX executable
-                                          compiles in under JAX's default 1 s,
-                                          so that default persisted 2 of 666
-                                          (MoS2 bispinor P4).  An export wins.
-
-DEFAULT POLICY (``ISDF_JAX_CACHE_DIR`` unset): ON, at
-``$SCRATCH/.cache/lorrax/jax_compile/<namespace>/np{P}``
-(:func:`default_cache_dir`), threshold 0.  The namespace names the jax/jaxlib
-versions, the native FFI bundle and this file's key schema, never the LORRAX
-source (:func:`cache_namespace`): JAX's own key covers the module, the compile
-options and the backend, and the namespace covers what the key cannot see (a
-rebuilt FFI bundle behind an unchanged custom-call name).  Rank 0 touches the
-entries it uses and prunes in a background thread (:func:`_prune_namespaces`):
-an entry or a namespace a week unused, or least-recently-used namespaces past
-a byte or file cap, never one used in the last five days.  MEASURED (P4,
-3697ea6e, explicit directory and threshold 0): MoS2 bispinor 71.8 s cold ->
-40.1 s warm.  An empty or whitespace-only value is the
-retained explicit opt-out; JAX's in-process executable cache is active in
-every case.
-
-Within an enabled base, ``np{N_proc}`` is ONE directory shared by every rank
-of that world size (the old ``rank{i}/`` partitioning is gone; see below).
-
-The ``ISDF_*`` env-var naming is legacy — historically this was for ISDF
-kernels only, now it caches the whole run.  Left as-is for backward
-compat with existing user shell aliases and run scripts.
-
-**Expect a wall of scary-looking XLA:CPU log lines on every warm run, and
-ignore them.**  ``cpu_aot_loader.cc`` compares the feature list the entry was
-compiled with against the host's and shouts
-
-    E cpu_aot_loader.cc:220] Loading XLA:CPU AOT result. Target machine
-    feature +prefer-no-gather is not supported on the host machine ...
-    This could lead to execution errors such as SIGILL.
-
-``prefer-no-gather`` / ``prefer-no-scatter`` are LLVM *cost-model pseudo-
-features*: they exist at compile time and never appear in a runtime CPU
-feature list, so this comparison mismatches on every load on every machine.
-It is a ``LOG(ERROR)``, not a rejection — MEASURED on the same run that emits
-738 of these lines: 369/373 cache hits and 4 compiles; and on htransform, 304
-lines with 152/152 hits and ZERO compiles.  ADVICE section 4's "each forcing a
-recompile" is not true of jax 0.9.1.
-
-===========================================================================
-WHY THIS FILE IS COMPLICATED: XLA:GPU COMPILATION IS A COLLECTIVE
-===========================================================================
-Scorecard AG root-caused the ``load_centroid_wfns`` hang that blocked every
-multi-process GPU run on Frontera's ``rtx`` queue, from a live C-level stack:
-
-    xla::gpu::AutotunerPass::RunImpl
-      xla::Autotuner::Autotune(HloModule*, ..., MultiProcessKeyValueStore&)
-        xla::DistributedKeyValueStore::Get
-          xla::CoordinationServiceAgent::GetKeyValue    <-- blocks forever
-
-``AutotunerPass`` shards autotuning across processes and exchanges the
-results through the JAX coordination service.  **A process that skips
-compilation never publishes its share, so every peer blocks forever.**
-Therefore the hit/miss pattern of the persistent cache must be IDENTICAL
-on every rank, for every module, or the job hangs.
-
-The old layout made that impossible on purpose: entries were nested under
-``{base}/np{P}/rank{i}/`` while JAX writes cache entries from process 0
-only (``jax/_src/compiler.py::_cache_write``, unconditional::
-
-      # Only write cache entries from the first process. Otherwise we
-      # create problems with contention for writes on some filesystems
-      if distributed.global_state.process_id != 0:
-        return
-
-), so ``np4/rank0`` accumulated 882 entries while ``np4/rank{1,2,3}``
-stayed empty forever.  AG's fix was to REFUSE the cache at P > 1.  This
-file replaces that refusal with a working implementation.
-
-===========================================================================
-THE DESIGN (workstream AH): SNAPSHOT AGREEMENT OVER A SHARED DIRECTORY
-===========================================================================
-1. **One shared directory per world size**, ``{base}/np{P}/``, plus a patch
-   that makes the cache KEY process-invariant.
-
-   AG.7 is right that a bare shared directory buys nothing: MEASURED at 4 CPU
-   ranks, the ranks compute DIFFERENT keys for the same SPMD module, so
-   process 0 — the only writer — is the only rank that ever hits, and its
-   peers recompile everything.  jax/_src/cache_key.py strips the device
-   assignment from the hashed compile options only for GPU
-
-       strip_device_assignment=(backend.platform == "gpu")
-       # In case of GPU multi-process tasks we need to strip device
-       # assignment to use cache key as invariant between processes.
-
-   and hashes the accelerator config as a serialized topology blob that also
-   carries process-local content.  :func:`_install_invariant_key_patch` does
-   for every platform what JAX already does for GPU (see its docstring).
-   That is what turns the cache from *safe* into *effective*.
-
-2. **Hit/miss agreement, taken once per run as a snapshot.**  Right here in
-   :func:`ensure_jax_compile_cache`, after ``jax.distributed.initialize``:
-
-   * process 0 lists the shared dir and publishes the sorted list of cache
-     keys it can see, through the coordination-service KV store;
-   * every rank fetches that list, checks which of those entries it can
-     itself see, and publishes a presence BITMASK (one bit per key — 882
-     entries is 111 bytes, so this scales to any world size);
-   * process 0 ANDs the masks and publishes the result; every rank fetches
-     it and a barrier commits the decision.
-
-   The intersection is the set of entries the run is allowed to use.  Every
-   subsequent cache probe is answered from that frozen set, so **hit/miss
-   is identical on every rank by construction** — including for entries
-   process 0 writes *during* this run, which are deliberately invisible
-   until the next run.  That closes the within-run race that makes a naive
-   shared directory unsafe: JAX's ``LRUCache.put`` is a plain
-   ``cache_path.write_bytes(val)`` (NOT tmp+rename — verified in
-   jax/_src/lru_cache.py 0.9.1), so a peer reading an entry the writer is
-   still writing gets a truncated file, its read raises, ``_cache_read``
-   swallows it into a MISS, and the ranks diverge.
-
-3. **Writes stay process-0-only** (JAX's own rule).  Under SPMD process 0
-   compiles the same module set as everyone else, so its writes cover the
-   whole set; all-rank writes would only add Lustre contention.  We do
-   however make the write ATOMIC (temp file + ``os.replace``) so a
-   concurrently-running job can never observe a torn entry.
-
-4. **JAX's auto-enabled XLA sub-caches are turned OFF at P > 1, and whenever
-   the LORRAX persistent cache is explicitly off.**  When the
-   persistent cache is on, ``jax/_src/compiler.py::get_compile_options``
-   also points XLA at ``{cache_dir}/xla_gpu_per_fusion_autotune_cache_dir``
-   with ``AutotuneCacheMode.UPDATE`` on process 0 and ``READ`` on the peers.
-   That is a *second*, rank-asymmetric cache that changes the set of fusions
-   each process still has to autotune — which is exactly the input to
-   AutotunerPass' modulo-P work split.  Different sets on different ranks =
-   the same deadlock one level down.  We set
-   ``jax_persistent_cache_enable_xla_caches=""``.
-
-5. **A key-environment fingerprint** rides along with each rank's bitmask
-   (:func:`_key_env_fingerprint`).  The agreement decides which cache ENTRIES
-   may be used; it cannot see that two ranks would compute different KEYS for
-   the same module because they were launched with different ``XLA_FLAGS``.
-   Any mismatch turns the cache off on every rank, loudly.
-
-6. **Graceful degradation, never a hang.**  If the coordination client is
-   missing, or any KV/barrier step fails or times out, or the key cannot be
-   made process-invariant, the agreed set is EMPTY: every rank misses
-   everything and compiles, which is the pre-AH behaviour and is always
-   correct.  The reason is printed on every rank.  If an entry that *was*
-   agreed then fails to load (corrupt file, deserialisation error) the ranks
-   would diverge, so that path aborts the process loudly
-   (``LORRAX_JAX_CACHE_STRICT=0`` downgrades it to a warning).
-
-The load-bearing-ness of (2) was A/B'd on GPU with a node-local cache
-directory, which JAX's process-0-only write leaves populated on one node and
-empty on the others: without the agreement the warm run HANGS (rc=124 at
-600 s); with it the same run completes in 48 s after dropping all 287
-unshared entries.  With a genuinely shared directory and (1) in place there is
-nothing left to diverge, so the agreement is insurance — but it is the
-difference between a loud message and a dead job.
-
-Considered and rejected: ``jax_share_binary_between_hosts`` — it is only
-reached on a cache MISS (``compile_or_get_cached`` returns early on a hit),
-so when process 0 hits and its peers miss, the peers wait forever on a
-publication that never happens: the same deadlock.  Worse on CPU, where it
-keys the broadcast on the per-rank cache key, so the peers would block on a
-key process 0 never sets even on a symmetric cold miss.  (It also has exactly
-one process compile, which reads as incompatible with a sharded autotuner —
-but that is inference from the sources, not something measured here.)  It is
-orthogonal to, not a substitute for, the agreement step.
-
-===========================================================================
-WHICH JAX THIS FILE IS WRITTEN AGAINST
-===========================================================================
-The four patches above reach into ``jax._src``.  Both production legs now run
-a generation with the same shapes: Frontera's venv has the released jax 0.9.1,
-Perlmutter's GPU container (``ghcr.io/nvidia/jax:jax-2025-07-21``) has jax
-0.7.0.  Every hook this file patches was MEASURED identical on the two — see
-the table in the ``jax._src surface this file patches`` block below.
-
-Until 2026-08-06 the GPU container was ``nvcr.io/nvidia/jax:25.04-py3`` (jax
-0.5.3), which differed on four of them, and this file carried five named
-compatibility shims for that.  Four are DELETED with the 0.5.3 support: the
-detection duty they served now belongs to ``runtime.jax_support``, which
-asserts those arities and symbols once at startup and refuses by name.  The
-FIFTH survives and is not a version shim at all — ``VerificationCache`` and
-``compilation_cache_check_contents`` are absent from every NVIDIA container at
-every tag, including the 0.9 ones, and present only in the released wheel.
-
-Do not read a container's ``jax.__version__``: NVIDIA re-stamps it with the
-build date, so ten images all print ``.dev<today>`` regardless of which line
-they were cut from.  ``jax.version.__version_info__`` is the honest tuple.
+DRIVERS MUST NOT CALL :func:`ensure_jax_compile_cache`: ``runtime.
+initialize_communicator_stack`` step 7 owns it, above every jit in the
+process. The two non-driver callers (``gw.w_isdf`` and ``gw.ppm_tau_kernel``
+kernels imported standalone by tests) are idempotent re-entries.
 """
 from __future__ import annotations
 
 import atexit
 import functools
 import hashlib
-import re
 import json
 import os
+import re
 import sys
 import threading
 import time
 import uuid
-import warnings
 from pathlib import Path
 
 _COMPILATION_CACHE_READY = False
@@ -291,8 +57,6 @@ _COMPILATION_CACHE_READY = False
 # jax/_src/lru_cache.py
 _CACHE_SUFFIX = "-cache"
 
-# Coordination-service key namespace.  The KV store lives and dies with one
-# `jax.distributed` session (one srun step), so a fixed namespace is safe.
 _KV_NS = "lorrax/compile_cache/v1"
 
 # Per-module compile fingerprints use a separate protocol.  Unlike the
@@ -342,24 +106,20 @@ def _timeout_ms(timeout_s: float) -> int:
 # rank and 8.8 s on another, against the ~4.5 s of XLA compile they replace —
 # i.e. without this the cache is a net LOSS on a cold-read CPU run.  876 kB of
 # payload, so it is pure per-file Lustre latency under 16-way concurrency.
-_PREFETCH_DEFAULT = "1"
 
 
 class _CacheState:
-    """Per-process bookkeeping for the agreed cache (also the atexit report)."""
+    """Per-process counters: the receipt (:func:`compile_cache_stats`)."""
 
     def __init__(self) -> None:
-        self._write_lock = threading.Lock()
-        self._compile_event_lock = threading.Lock()
+        self._compile_event_lock = threading.RLock()
+        self._compile_current = None   # (module, key, request number) under the lock
         self.enabled = False
         self.dir = ""
         self.n_proc = 1
         self.proc_idx = 0
-        self.n_seen = 0        # entries process 0 advertised
-        self.n_agreed = 0      # entries every rank could see
         self.probes = 0        # persistent-cache lookups JAX asked for
         self.hits = 0          # lookups served from disk
-        self.blocked = 0       # lookups vetoed by the agreement
         self.compiles = 0      # actual XLA compiles (backend_compile_and_load)
         self.compile_secs = 0.0
         # Compiles of modules with host callbacks, which JAX's persistent
@@ -367,8 +127,6 @@ class _CacheState:
         self.uncacheable: dict = {}
         self.receipt_mark = (0, 0.0, 0, {})   # compile_receipt's last window edge
         self.read_secs = 0.0   # time spent loading executables from disk
-        self.prefetch_secs = 0.0
-        self.agree_secs = 0.0  # startup listing + agreement + prefetch
         self.namespace = ""    # default-policy namespace ("" when explicit/off)
         self.compile_agreement_configured = False
         self.compile_agreement_enabled = False
@@ -379,65 +137,10 @@ class _CacheState:
         self.compile_agreement_secs = 0.0
         self._compile_client = None
         self._compile_sequence = 0
-        # JAX calls the file-cache writer on process 0 only.  Keep these
-        # explicitly process-local: summing them across ranks would turn one
-        # physical write into a fictitious P writes.  The atomic, unlimited
-        # path below is the only path whose successful writes and exact
-        # payload bytes we can observe without changing JAX's LRU policy.
-        self.write_metrics_available = False
-        self.reset_write_metrics()
-        self.agreed: frozenset[str] = frozenset()
-        # THE KEY SET.  Every persistent-cache key this rank asked about,
-        # hit or miss.  The counters above cannot express the invariant the
-        # cache contract is actually about: two ranks can both report
-        # ``xla_compiles=0 vetoed=0`` while asking about DIFFERENT programs,
-        # which is the state that precedes the collective-compile deadlock.
-        # A set of keys is the only observable that separates those.
         self.probe_keys: set[str] = set()
-
-    def reset_write_metrics(self) -> None:
-        """Reset this process's successful-write receipt deterministically."""
-        with self._write_lock:
-            self.local_writes = 0
-            self.local_write_bytes = 0
-            self.local_write_secs = 0.0
-
-    def set_write_metrics_available(self, available: bool) -> None:
-        """Record whether this cache policy has an observable write boundary."""
-        with self._write_lock:
-            self.write_metrics_available = bool(available)
-
-    def record_write(self, nbytes: int, elapsed_s: float) -> None:
-        """Record one completed local write; callers hold no state lock."""
-        with self._write_lock:
-            # The actual instrumented boundary is stronger evidence than an
-            # earlier setup-time guess (JAX may have constructed its cache
-            # lazily before LORRAX initialization).
-            self.write_metrics_available = True
-            self.local_writes += 1
-            self.local_write_bytes += int(nbytes)
-            self.local_write_secs += max(0.0, float(elapsed_s))
-
-    def write_metrics(self) -> dict:
-        """Snapshot process-local write metrics without torn counter reads."""
-        with self._write_lock:
-            available = self.write_metrics_available
-            return {
-                "write_metrics_available": available,
-                "local_writes": self.local_writes if available else None,
-                "local_write_bytes": (
-                    self.local_write_bytes if available else None),
-                "local_write_secs": (
-                    self.local_write_secs if available else None),
-            }
 
 
 _STATE = _CacheState()
-
-
-class _KeyEnvMismatch(RuntimeError):
-    """The ranks would compute different cache keys — see _key_env_fingerprint."""
-
 
 class UnsafeCachePolicy(RuntimeError):
     """A requested disk-cache lifecycle would violate the cache contract."""
@@ -447,45 +150,15 @@ class CompileAgreementError(RuntimeError):
     """The ranks did not present the same module to the compile boundary."""
 
 
-def _positive_float_env(name: str, default: float) -> float:
-    """Read a positive finite duration, refusing an unbounded spelling."""
-    raw = os.environ.get(name)
-    try:
-        value = default if raw is None or not raw.strip() else float(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"{name} must be a positive number of seconds, got {raw!r}") \
-            from exc
-    if not (value > 0.0 and value < float("inf")):
-        raise ValueError(
-            f"{name} must be a finite positive number of seconds, "
-            f"got {raw!r}")
-    return value
-
-
-def _truthy(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() not in (
-        "", "0", "false", "no", "off")
-
-
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "").strip())
-    except (TypeError, ValueError):
-        return default
-
-
 def _cache_size_policy(n_proc: int, max_size: int) -> bool:
     """Whether the persistent cache may run under JAX's size policy.
 
-    JAX's ``0`` spelling is an explicit cache-off request.  A positive limit
-    enables live LRU eviction: safe at P=1, but unsafe after the P>1 agreement
-    freezes the entries every rank is allowed to read.  Rank 0 evicting one
-    of those files before a peer's first lookup invalidates that snapshot and
-    creates the hit/miss divergence this module exists to prevent.
-
-    Returns ``False`` only for the standard cache-off spelling.  Every unsafe
-    or invalid spelling refuses before a cache object is armed.
+    JAX's ``0`` is an explicit cache-off request. A positive limit enables
+    JAX's live LRU eviction, whose ``get`` rewrites an atime file under a
+    file lock on every hit on every rank: at P64 and a thousand programs
+    that is a Lustre metadata storm, so it is refused at P > 1 (rank 0's
+    age pruner, :func:`_prune_namespaces`, bounds the default location).
+    Returns ``False`` only for the standard cache-off spelling.
     """
     n_proc = int(n_proc)
     max_size = int(max_size)
@@ -497,14 +170,12 @@ def _cache_size_policy(n_proc: int, max_size: int) -> bool:
         return False
     if n_proc > 1 and max_size > 0:
         raise UnsafeCachePolicy(
-            "JAX_COMPILATION_CACHE_MAX_SIZE enables live LRU eviction, which "
-            f"is unsafe at P={n_proc}: LORRAX freezes an all-rank readable-"
-            "entry set at startup, and rank-0 eviction can remove an agreed "
-            "entry before a peer reads it. Use ISDF_JAX_CACHE_DIR=\"\" for "
-            "a one-shot run, or an explicit run-local cache directory that "
-            "the outer launcher removes after every rank has exited.")
+            "JAX_COMPILATION_CACHE_MAX_SIZE enables JAX's live LRU eviction, "
+            f"which rewrites an atime file on every hit on every rank: unsafe "
+            f"on a shared filesystem at P={n_proc}. Leave it unset (the "
+            "default location is pruned by age) or use ISDF_JAX_CACHE_DIR=\"\" "
+            "for a one-shot run.")
     return True
-
 
 def _say(msg: str) -> None:
     # stderr: a driver's production stdout sinks incidental prints, and these
@@ -521,91 +192,6 @@ def _debug_say(msg: str) -> None:
         enabled = False
     if enabled:
         _say(msg)
-
-
-# ---------------------------------------------------------------------------
-# jax._src surface this file patches
-# ---------------------------------------------------------------------------
-# This file monkeypatches five ``jax._src`` privates.  The fifth,
-# ``ArrayImpl._multi_slice`` (see :func:`_install_shard_slice_patch`), is not
-# about the cache LAYER at all — it is about the ranks compiling the same
-# module — but it lives here because it defends the same invariant as
-# everything else in this file and would be invisible anywhere else.
-#
-# It used to carry FIVE
-# named compatibility shims so that one source ran on both the jax 0.5.3 line
-# (Perlmutter's old ``nvcr.io/nvidia/jax:25.04-py3``) and the jax 0.9 line.
-# **Four of the five are gone**: the GPU leg moved to
-# ``ghcr.io/nvidia/jax:jax-2025-07-21`` (jax 0.7.0) and the owner ruled against
-# keeping a permanent compatibility layer for a version being abandoned.
-#
-# Re-measured in-container on a Perlmutter A100, both images, one srun step
-# each, reading ``jax.version.__version_info__`` and ``inspect.signature`` —
-# capability-probed, never inferred from a version string (every container jax
-# is a dev build that restamps ``__version__`` to the run date; both of these
-# printed ``.dev20260806``):
-#
-#   hook                                       0.5.3    0.7.0    0.9.1†
-#   -----------------------------------------  -------  -------  -------
-#   cache_key._hash_accelerator_config          3        2        2
-#   cache_key._hash_serialized_compile_options  3        3        3
-#   compilation_cache.get_executable_and_time   3        4        4
-#   compilation_cache.is_executable_in_cache    2        2        2
-#   compiler.backend_compile_and_load           ABSENT   present  present
-#   compilation_cache.VerificationCache         ABSENT   ABSENT   present
-#   config.compilation_cache_check_contents     ABSENT   ABSENT   present
-#   lru_cache.LRUCache.put                      write_bytes, no rename, all three
-#
-#   † the 0.9.1 column is the released wheel in the Frontera venv, measured
-#     2026-08-06 and NOT re-measured here.  Both CONTAINER columns are
-#     re-measured, and a container is what the GPU leg runs.
-#
-# Read the 0.7.0 column against the 0.9.1 one: on every row except the two
-# verification symbols they are the SAME SHAPE.  So shims 1 (accelerator-config
-# arity), 2 (lookup arity), 4 (compile entry point) and 5 (the P>1 degradation
-# for a jax that cannot rebind a cached executable to the reading process's
-# devices) had nothing left to bridge and were deleted.  Their detection duty
-# did not vanish with them: ``runtime.jax_support`` asserts exactly these
-# arities and symbols at startup and REFUSES by name, which is a better
-# instrument than an in-line branch — it fires once, before anything compiles,
-# instead of shaping every call site forever.
-#
-# **ONE shim survives, and it is NOT a 0.5.3 shim.**  ``VerificationCache`` and
-# ``compilation_cache_check_contents`` are ABSENT on the 0.7.0 container just
-# as they were on 0.5.3 — and, per CLAIMS 112, on all TEN NVIDIA JAX images
-# probed at any tag, INCLUDING the 0.9.0/0.9.1 ones.  They exist only in the
-# released wheel.  So this is a container-vs-released-wheel difference, not a
-# generation one, and removing its guard would restore the CLAIMS 114 defect
-# verbatim on the new image: every cache read raising ``AttributeError`` inside
-# JAX's own swallowing read path, zero entries written, ``enabled=True``
-# reported.  It stays, renamed for what it actually is.
-#
-# What we deliberately do NOT do is wrap the installers in a blanket
-# ``try/except``: that is what hid this for months.  Installing a patch is an
-# attribute ASSIGNMENT and never raises, so an ``except`` around installation
-# catches nothing — the error fires later, when JAX CALLS the hook, long after
-# that scope has exited.
-#
-# The surviving shim announces.  A compatibility path nobody can see in the log
-# is indistinguishable from the bug it replaced.
-_COMPAT_SAID: set[str] = set()
-
-
-def _compat(key: str, msg: str) -> None:
-    """Announce once, on rank 0, that a patch took its compatibility path.
-
-    Rank 0 speaks alone because the private-API generation is a property of
-    the image, not of the process: every rank of one launch imports the same
-    ``jax._src``.  Ranks that somehow did NOT are caught by a different
-    instrument — :func:`_key_env_fingerprint` folds ``jaxlib``'s version
-    string into the digest the agreement compares, and a mismatch turns the
-    cache off on every rank, loudly.
-    """
-    if key in _COMPAT_SAID:
-        return
-    _COMPAT_SAID.add(key)
-    if _STATE.proc_idx == 0:
-        _say(f"jax-compat: {msg}")
 
 
 class _JaxSurfaceUnsupported(RuntimeError):
@@ -631,400 +217,13 @@ def _jax_generation() -> str:
         return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# local view of the shared cache directory
-# ---------------------------------------------------------------------------
-def _local_entry_keys(cache_path: Path) -> list[str]:
-    """Cache keys this rank can see on disk, sorted: one ``listdir``.
-
-    No per-entry ``stat``: on Lustre that is a size glimpse per file on every
-    rank (0.12 ms each, measured on 1261 entries), and the atomic ``put``
-    never publishes a partial file under its final name.  An entry that is
-    unreadable anyway (a node lost before its data reached the OSTs) is
-    removed by :func:`_fatal` so the next run is clean.
-    """
-    try:
-        names = os.listdir(cache_path)
-    except OSError:
-        return []
-    return sorted(name[: -len(_CACHE_SUFFIX)] for name in names
-                  if name.endswith(_CACHE_SUFFIX) and not name.startswith("."))
-
-
-def _mask_bytes(n: int) -> bytearray:
-    return bytearray((n + 7) // 8)
-
-
-def _bit(mask, i: int) -> bool:
-    return bool(mask[i >> 3] & (1 << (i & 7)))
-
-
-def _set_bit(mask: bytearray, i: int) -> None:
-    mask[i >> 3] |= 1 << (i & 7)
-
-
-# ---------------------------------------------------------------------------
-# the agreement
-# ---------------------------------------------------------------------------
-def _forced_divergence_hidden(keys: list[str], proc_idx: int) -> set[str]:
-    """TEST HOOK — positive control for the agreement layer.
-
-    ``LORRAX_JAX_CACHE_FORCE_DIVERGE=N`` makes every rank != 0 pretend the N
-    alphabetically-last advertised entries are missing.  A correct agreement
-    layer must drop them (all ranks then compile those modules) and say so;
-    a broken one lets process 0 hit them alone and the job hangs.
-    """
-    n = _int_env("LORRAX_JAX_CACHE_FORCE_DIVERGE", 0)
-    if n <= 0 or proc_idx == 0 or not keys:
-        return set()
-    return set(keys[-min(n, len(keys)):])
-
-
-_HOST_TARGET_ID: str | None = None
-
-
-def _host_target_id() -> str:
-    """Rank-invariant identity of the machine the code is compiled FOR.
-
-    :func:`_install_invariant_key_patch` replaces JAX's serialized-topology
-    hash (which carries process-local content) with a canonical string; this
-    is the part of the topology that actually matters for whether a cached
-    executable is *valid* here.  XLA:CPU bakes host CPU features into the AOT
-    result — loading an entry built for another CPU model produces the
-    "Target machine feature ... is not supported on the host machine"
-    reload-reject storm this cluster hit before (ADVICE section 4).  Folding
-    the CPU model into the key keeps entries from different machine types
-    apart; folding it into the env fingerprint additionally turns the cache
-    off (loudly) if one job somehow spans two machine types.
-    """
-    global _HOST_TARGET_ID
-    if _HOST_TARGET_ID is not None:
-        return _HOST_TARGET_ID
-    import platform as _platform
-
-    bits = [_platform.machine()]
-    try:
-        with open("/proc/cpuinfo") as fh:
-            for line in fh:
-                if line.startswith("model name"):
-                    bits.append(line.split(":", 1)[1].strip())
-                    break
-    except OSError:
-        pass
-    _HOST_TARGET_ID = "|".join(bits)
-    return _HOST_TARGET_ID
-
-
-#: PER-PROCESS ENVIRONMENT THAT CHANGES THE EMITTED MODULE, by name.
-#:
-#: Everything else in :func:`_key_env_fingerprint` is about the cache KEY of
-#: the same module.  These are different and worse: they change the module
-#: ITSELF.  ``LORRAX_BANDS_GEMM_FFI`` picks between a vendor-GEMM
-#: ``ffi_call`` and a native ``dot`` inside the band contractions, so a rank
-#: launched with a different value emits different HLO, compiles a different
-#: program, and misses where its peers hit — ``jit__multi_slice``'s
-#: divergence (FIX_multislice_cachekey.md §6.1, sibling 5) arriving through
-#: the environment rather than through a shard offset.
-#:
-#: These are also the ones the GEMM/FFT autotuner actually sees: the affected
-#: kernels are Σ_kij, Σ_τ, the cohsex Σ chain and χ⁰, i.e. the modules with
-#: the largest autotune candidate sets in the tree.  A divergent autotune set
-#: is the deadlock one level below the cache (module docstring, above).
-#:
-#: THE SOURCE OF TRUTH IS ``src/ffi/__init__.py::FFI_DIAL_ENV`` and this list
-#: mirrors it; ``tests/test_compile_stability_cpu.py`` fails when the two
-#: disagree.  Mirrored rather than imported because this function runs
-#: during the agreement, on every rank, on machines with no FFI library
-#: present — an ImportError here would turn the cache off for a reason that
-#: has nothing to do with the cache.
-RANK_FINGERPRINT_ENV = (
-    "LORRAX_FFT_FFI",
-    "LORRAX_BANDS_GEMM_FFI",
-)
-
-
-def _key_env_fingerprint(namespace: str = "") -> bytes:
-    """32-byte digest of everything OUTSIDE the module that feeds the cache key.
-
-    The agreement below decides which cache ENTRIES may be used; it cannot see
-    that two ranks would compute different KEYS for the same module.  The one
-    realistic way that happens once the key is process-invariant is a rank that
-    was launched with different key-affecting environment — the classic case
-    being a harness that sets ``XLA_FLAGS`` on rank 0 only for an HLO dump
-    (workstream Y's probe does exactly that).  Process 0 would then MISS while
-    its peers HIT: the AG deadlock with the roles reversed.
-
-    So every rank fingerprints that environment, the fingerprints are compared
-    during the agreement, and any mismatch turns the cache off for everyone
-    with a printed reason.  Flags JAX itself excludes from the cache key
-    (``--xla_dump_*`` and friends) are excluded here too.
-    """
-    import hashlib
-
-    h = hashlib.sha256()
-    # The runtime-default namespace is computed on every rank (git, the FFI
-    # bundle); ranks that resolved different ones would agree on rank 0's key
-    # list while reading their own directories.
-    h.update(f"namespace={namespace};".encode("utf-8"))
-    try:
-        from jax._src import cache_key as _ck
-        excluded = set(_ck.xla_flags_to_exclude_from_cache_key)
-        prefixes = tuple(_ck.get_flag_prefixes())
-    except Exception:
-        excluded, prefixes = set(), ()
-    flags = []
-    for tok in os.environ.get("XLA_FLAGS", "").split():
-        name = tok.split("=", 1)[0]
-        if name in excluded:
-            continue
-        flags.append(tok)
-    h.update(("|".join(sorted(flags))).encode("utf-8"))
-    h.update(("|".join(sorted(prefixes))).encode("utf-8"))
-    h.update(_host_target_id().encode("utf-8"))
-    # The per-process dials that change the emitted MODULE, not just its key.
-    # Unset and empty are folded to the same token deliberately: the gates
-    # (``ffi/gate.py::Gate.mode``) treat "" as "take the default", so two
-    # ranks that differ only in whether the variable exists are NOT
-    # divergent and must not be reported as such.
-    for name in RANK_FINGERPRINT_ENV:
-        val = os.environ.get(name, "").strip().lower()
-        h.update(f"{name}={val};".encode("utf-8"))
-    try:
-        from jax._src.lib import version_str as _jaxlib_version_str
-        h.update(_jaxlib_version_str.encode("utf-8"))
-    except Exception:
-        pass
-    try:
-        import jax as _jax
-        for knob in ("jax_persistent_cache_min_compile_time_secs",
-                     "jax_persistent_cache_enable_xla_caches",
-                     "jax_compilation_cache_include_metadata_in_key",
-                     "jax_enable_x64"):
-            h.update(f"{knob}={getattr(_jax.config, knob, None)!r};"
-                     .encode("utf-8"))
-    except Exception:
-        pass
-    return h.digest()
-
-
-def _agree_on_entries(cache_path: Path, n_proc: int, proc_idx: int,
-                      timeout_s: float, client=None
-                      ) -> tuple[int, frozenset[str]]:
-    """Return ``(n_advertised, agreed_keys)``; raises on any failure.
-
-    Protocol (coordination-service KV store, O(1) RPCs per rank):
-      p0   set   {ns}/keylist  = sorted keys p0 can see
-      all  get   {ns}/keylist
-      p!=0 set   {ns}/mask/{p} = presence bitmask over that list
-      p0   get   {ns}/mask/{1..P-1}, AND them into its own, set {ns}/final
-      p!=0 get   {ns}/final
-      all  barrier {ns}/commit          <- collective commit point
-
-    ``client`` defaults to the live ``jax.distributed`` coordination client;
-    the tests inject a fake one.
-    """
-    if client is None:
-        from jax._src import distributed as _dist
-        client = _dist.global_state.client
-    if client is None:
-        raise RuntimeError("jax.distributed coordination client is None "
-                           "(was jax.distributed.initialize() called?)")
-    tmo = int(timeout_s * 1000)
-
-    local = _local_entry_keys(cache_path)
-
-    if proc_idx == 0:
-        payload = b"K" + "\n".join(local).encode("utf-8")
-        client.key_value_set_bytes(f"{_KV_NS}/keylist", payload)
-    else:
-        payload = client.blocking_key_value_get_bytes(
-            f"{_KV_NS}/keylist", tmo)
-    keys = [k for k in payload[1:].decode("utf-8").split("\n") if k]
-
-    hidden = _forced_divergence_hidden(keys, proc_idx)
-    local_set = set(local)
-    mask = _mask_bytes(len(keys))
-    for i, k in enumerate(keys):
-        if k in local_set and k not in hidden:
-            _set_bit(mask, i)
-
-    fp = _key_env_fingerprint(_STATE.namespace)
-    if proc_idx != 0:
-        client.key_value_set_bytes(f"{_KV_NS}/mask/{proc_idx}",
-                                   b"M" + fp + bytes(mask))
-        payload = client.blocking_key_value_get_bytes(f"{_KV_NS}/final", tmo)
-        status, final = payload[1:2], payload[2:]
-    else:
-        acc = bytearray(mask)
-        status = b"\x01"
-        for p in range(1, n_proc):
-            other = client.blocking_key_value_get_bytes(
-                f"{_KV_NS}/mask/{p}", tmo)[1:]
-            other_fp, other_mask = other[:32], other[32:]
-            if other_fp != fp:
-                status = b"\x00"
-            if len(other_mask) != len(acc):
-                raise RuntimeError(
-                    f"rank {p} returned a {len(other_mask)}-byte mask, "
-                    f"expected {len(acc)} — cache-key list disagreement")
-            for i in range(len(acc)):
-                acc[i] &= other_mask[i]
-        final = bytes(acc)
-        client.key_value_set_bytes(f"{_KV_NS}/final", b"F" + status + final)
-
-    # Collective commit: if ANY rank failed to get this far the barrier fails
-    # on ALL of them, so nobody is left believing the cache is usable.
-    client.wait_at_barrier(f"{_KV_NS}/commit", timeout_in_ms=tmo)
-
-    if status != b"\x01":
-        # Symmetric on every rank (the verdict was broadcast), so all of them
-        # degrade to cache-off together — which is always correct.
-        raise _KeyEnvMismatch(
-            "the ranks were launched with DIFFERENT key-affecting environment "
-            "(XLA_FLAGS / jaxlib version / jax cache config / the per-process "
-            f"FFI dials {list(RANK_FINGERPRINT_ENV)}), so they would compute "
-            "different cache keys — and in the FFI-dial case a different "
-            "emitted MODULE — for the same computation, and their hit/miss "
-            "patterns would diverge: the scorecard-AG deadlock. Make the "
-            "environment identical on every rank (a rank-0-only XLA_FLAGS for "
-            "an HLO dump is the usual cause; a per-node FFI dial is the other)")
-
-    agreed = frozenset(k for i, k in enumerate(keys) if _bit(final, i))
-    return len(keys), agreed
-
-
-def _prefetch_agreed(cache_path: Path, agreed, n_threads: int) -> float:
-    """Pull the agreed entries into the page cache, in parallel.
-
-    MEASURED (wk_AH job 3, CPU P=8 fixture): a warm run's 368 cache reads cost
-    2-3 s on the node that wrote them and **12 s** on the second node, against
-    the 9.6 s of XLA compile they replace — i.e. on Lustre the serial
-    open()+read() latency of a few hundred tiny files can eat the whole win.
-    The files total ~1.5 MB, so this is pure per-file latency, and issuing the
-    reads from a thread pool hides it.  Reads are discarded; the point is the
-    client page cache, which JAX's own read then hits.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
-    if not agreed:
-        return 0.0
-    t0 = time.monotonic()
-
-    def _rd(key: str) -> None:
-        try:
-            with open(os.path.join(cache_path, key + _CACHE_SUFFIX), "rb") as fh:
-                while fh.read(1 << 20):
-                    pass
-        except OSError:
-            pass
-
-    try:
-        with ThreadPoolExecutor(max_workers=max(1, n_threads)) as pool:
-            list(pool.map(_rd, agreed))
-    except Exception:
-        pass
-    return time.monotonic() - t0
-
-
-# ---------------------------------------------------------------------------
-# the monkeypatches
-# ---------------------------------------------------------------------------
-def _fatal(cache_key: str, why: str) -> None:
-    # Remove the bad entry first: with the cache on by default, an entry that
-    # cannot be read would otherwise abort every later run in its namespace.
-    # A missing file is the "disappeared" case and needs no removal.
-    removed = ""
-    try:
-        os.unlink(os.path.join(_STATE.dir, cache_key + _CACHE_SUFFIX))
-        removed = " The entry has been removed; the next run recompiles it."
-    except OSError:
-        pass
-    msg = (f"  [compile-cache] FATAL: entry '{cache_key[:48]}...' was agreed "
-           f"readable by every rank but this rank ({_STATE.proc_idx}) cannot "
-           f"load it ({why}).  Continuing would make the ranks' hit/miss "
-           f"patterns diverge, which deadlocks XLA:GPU's cross-process "
-           f"autotune exchange (scorecard AG).  Aborting instead of hanging."
-           f"{removed} Set LORRAX_JAX_CACHE_STRICT=0 to downgrade this to a "
-           f"warning (UNSAFE on GPU).")
-    if _truthy("LORRAX_JAX_CACHE_STRICT", "1"):
-        print(msg, file=sys.stderr, flush=True)
-        print(msg, flush=True)
-        sys.stderr.flush()
-        sys.stdout.flush()
-        os._exit(70)
-    warnings.warn(msg)
-
-
-def _install_invariant_key_patch() -> None:
-    """Make the persistent-cache key IDENTICAL on every rank.
-
-    MEASURED (wk_AH keyprobe, 4 CPU ranks): out of the box the ranks compute
-    DIFFERENT keys for the same SPMD module, so with a shared directory only
-    process 0 — the only writer — ever hits.  jax/_src/cache_key.py strips the
-    device assignment from the hashed compile options only when
-    ``backend.platform == "gpu"``::
-
-        # In case of GPU multi-process tasks we need to strip device
-        # assignment to use cache key as invariant between processes.
-        strip_device_assignment=(backend.platform == "gpu")
-
-    and hashes the accelerator config as
-    ``get_topology_for_devices(devices).serialize()``, which carries
-    process-local content.  We do for every platform what JAX already does for
-    GPU: force the strip, and replace the topology blob with a canonical
-    ``platform:count:device_kinds:host_target`` string (see
-    :func:`_host_target_id` for why the host target belongs in there).
-    Everything else in the key — the module IR, the jaxlib version, the backend
-    version, XLA flags, the remaining compile options — is identical across
-    ranks of one SPMD program by construction, so the key becomes
-    process-invariant.
-
-    This is what turns the cache from merely *safe* into *effective*: with it,
-    ranks 1..P-1 hit process 0's entries instead of recompiling every module
-    (scorecard D's storm).  It is also load-bearing for SAFETY:
-    ``LORRAX_JAX_CACHE_INVARIANT_KEY=0`` therefore switches the cache OFF at
-    P > 1 rather than leaving process 0 hitting alone.
-
-    Not applied at P == 1, where there is nothing to make invariant.
-    """
-    from jax._src import cache_key as _ck
-
-    if getattr(_ck, "_lorrax_invariant_key_installed", False):
-        return
-    _orig_opts = _ck._hash_serialized_compile_options
-
-    def _stripped(hash_obj, compile_options_obj, strip_device_assignment=False):
-        return _orig_opts(hash_obj, compile_options_obj,
-                          strip_device_assignment=True)
-
-    # Two parameters, matching ``_hash_accelerator_config`` on every jax this
-    # tree supports (0.7.0 container and 0.9.1 wheel, both MEASURED).  It used
-    # to end in ``*_compat_tail`` to swallow the third positional jax 0.5.3
-    # passed (``backend``, never read); that shim is gone with 0.5.3, and
-    # ``runtime.jax_support`` asserts the arity at startup instead, so a jax
-    # that reintroduces a third argument is a named refusal rather than a
-    # silently discarded one.
-    def _canonical_accelerator(hash_obj, accelerators):
-        devs = list(accelerators.flat)
-        plat = getattr(devs[0], "platform", "?") if devs else "?"
-        kinds = sorted(str(getattr(d, "device_kind", "?")) for d in devs)
-        _ck._hash_string(
-            hash_obj,
-            f"lorrax-canon:{plat}:{len(devs)}:{','.join(kinds)}:"
-            f"{_host_target_id()}")
-
-    _ck._hash_serialized_compile_options = _stripped
-    _ck._hash_accelerator_config = _canonical_accelerator
-    _ck._lorrax_invariant_key_installed = True
-
-
-# ---------------------------------------------------------------------------
 # the shard-slice patch: one ``jit__multi_slice`` program for every rank
 # ---------------------------------------------------------------------------
-# Everything above makes the ranks compute the same KEY for the same MODULE.
-# This one is the other half of the same safety property: it makes them
-# compile the same MODULE in the first place, for the one JAX-internal jit
-# whose program is built out of per-rank shard offsets.
+# The cross-rank compile agreement refuses a program that differs between
+# ranks. JAX's own ``ArrayImpl._multi_slice`` is one: ``shard_device_array``
+# bakes THIS rank's shard offsets into a ``jit(static_argnums=...)``
+# signature (507e16eda). This makes it one program on every rank: shard
+# sizes static, offsets dynamic.
 _CANON_SLICE_JIT = None
 
 
@@ -1135,8 +334,7 @@ def _install_shard_slice_patch() -> None:
 
     orig = ArrayImpl.__dict__.get("_multi_slice")
     if orig is None:
-        _compat("shard-slice-absent",
-                f"jax {_jax_generation()} has no ArrayImpl._multi_slice; the "
+        _say("shard-slice-absent: " f"jax {_jax_generation()} has no ArrayImpl._multi_slice; the "
                 f"rank-dependent shard-slice key cannot arise here and the "
                 f"patch is not installed.")
         return
@@ -1160,8 +358,7 @@ def _install_shard_slice_patch() -> None:
             # JAX's own slicer, which is right and merely rank-dependent.  It
             # ANNOUNCES, because a compatibility path nobody can see in the
             # log is indistinguishable from the bug it replaced.
-            _compat("shard-slice-fallback",
-                    f"the canonical shard slicer declined "
+            _say("shard-slice-fallback: " f"the canonical shard slicer declined "
                     f"({type(exc).__name__}: {exc}); falling back to JAX's "
                     f"rank-dependent ArrayImpl._multi_slice.  Expect one "
                     f"jit__multi_slice cache key PER RANK.")
@@ -1172,216 +369,46 @@ def _install_shard_slice_patch() -> None:
     ArrayImpl._lorrax_shard_slice_installed = True
 
 
-def _install_lookup_patch(*, enforce_agreement: bool) -> None:
-    """Instrument cache lookups, optionally enforcing the all-rank set.
+# ---------------------------------------------------------------------------
+# the one jax._src lookup this file observes (counts only; JAX decides)
+# ---------------------------------------------------------------------------
+def _install_observation_patch() -> None:
+    """Count persistent-cache probes and hits; rank 0 touches what it hits.
 
-    ``P == 1`` needs the counters but not the policy: JAX's answer is returned
-    unchanged, including an ordinary cache miss.  ``P > 1`` additionally
-    vetoes keys outside :attr:`_CacheState.agreed` and treats disappearance of
-    an agreed entry as fatal.  Keeping both modes in this one wrapper prevents
-    the observation-only path from drifting away from the lookup surface whose
-    multi-process twin it is measuring.
+    ``get_executable_and_time`` is ``(cache_key, compile_options, backend,
+    executable_devices)`` on the supported 0.9.1 wheel (``runtime.jax_support``
+    asserts the arity at startup). ``*passthrough`` forwards the rest
+    untouched; ``wraps`` keeps ``__wrapped__`` for that startup check.
     """
     from jax._src import compilation_cache as _cc
 
-    marker = ("_lorrax_agreement_installed" if enforce_agreement
-              else "_lorrax_observer_installed")
-    other = ("_lorrax_observer_installed" if enforce_agreement
-             else "_lorrax_agreement_installed")
-    if getattr(_cc, marker, False):
+    if getattr(_cc, "_lorrax_observer_installed", False):
         return
-    if getattr(_cc, other, False):
-        raise RuntimeError(
-            "the JAX persistent-cache lookup hook is already installed in "
-            f"{'observation' if enforce_agreement else 'agreement'} mode; "
-            "jax.process_count() cannot change within one process")
     _orig_get = _cc.get_executable_and_time
-    _orig_in_cache = _cc.is_executable_in_cache
 
-    # ``get_executable_and_time`` is ``(cache_key, compile_options, backend,
-    # executable_devices)`` on the supported 0.9.1 wheel (and was the same on
-    # the historical 0.7.0 container — MEASURED).  The arity PROBE and its
-    # announcement, which existed
-    # to report jax 0.5.3's 3-parameter form, are gone; ``runtime.jax_support``
-    # asserts the 4 at startup.
-    #
-    # ``*passthrough`` is NOT a leftover compatibility branch and is kept
-    # deliberately: this wrapper reads the cache key and nothing else, so
-    # naming three arguments it never interprets would be a claim about their
-    # meaning that this file has no reason to make.  It forwards them
-    # untouched, which is exact for any arity.
-    # ``wraps`` is load-bearing even though the forwarding body does not need
-    # it: runtime.jax_support checks this private surface with
-    # ``inspect.signature``.  Without ``__wrapped__``, that later check sees
-    # this implementation's two syntactic parameters and refuses our own
-    # transparent observer as an incompatible JAX installation.
     @functools.wraps(_orig_get)
     def _observed_get(cache_key, *passthrough):
         _STATE.probes += 1
         _STATE.probe_keys.add(cache_key)
-        if enforce_agreement and cache_key not in _STATE.agreed:
-            _STATE.blocked += 1
-            return None, None
         t0 = time.monotonic()
         try:
             executable, compile_time = _orig_get(cache_key, *passthrough)
-        except BaseException as exc:  # noqa: BLE001 - deliberate
-            if enforce_agreement:
-                _fatal(cache_key, f"{type(exc).__name__}: {exc}")
-                return None, None
-            # Observation at P=1 is transparent: JAX still owns the error
-            # policy, so an instrument must not turn a failing read into a
-            # cache miss (or vice versa).
-            raise
         finally:
             _STATE.read_secs += time.monotonic() - t0
-        if executable is None:
-            if enforce_agreement:
-                _fatal(cache_key, "entry disappeared between agreement and read")
-                return None, None
-            return executable, compile_time
-        _STATE.hits += 1
-        if not enforce_agreement and _STATE.namespace:
-            _touch((cache_key,))     # P > 1 touches its agreed set instead
+        if executable is not None:
+            _STATE.hits += 1
+            if _STATE.proc_idx == 0 and _STATE.namespace:
+                _touch((cache_key,))
         return executable, compile_time
 
-    @functools.wraps(_orig_in_cache)
-    def _observed_in_cache(backend, cache_key):
-        _STATE.probe_keys.add(cache_key)
-        if enforce_agreement and cache_key not in _STATE.agreed:
-            return False
-        return _orig_in_cache(backend, cache_key)
-
     _cc.get_executable_and_time = _observed_get
-    _cc.is_executable_in_cache = _observed_in_cache
-    setattr(_cc, marker, True)
+    _cc._lorrax_observer_installed = True
 
 
-def _install_observation_patch() -> None:
-    """Count P=1 cache probes/hits without changing JAX's decision."""
-    _install_lookup_patch(enforce_agreement=False)
-
-
-def _install_agreement_patch() -> None:
-    """Answer every P>1 persistent-cache lookup from the agreed set."""
-    _install_lookup_patch(enforce_agreement=True)
-
-
-def _install_atomic_put_patch() -> None:
-    """Make cache writes atomic (tmp + rename).
-
-    jax 0.9.1's ``LRUCache.put`` does ``cache_path.write_bytes(val)`` with no
-    rename, so a reader in another process can observe a truncated entry.
-    Only the eviction-disabled path (``jax_compilation_cache_max_size=-1``,
-    the default) is replaced; if eviction is on, JAX takes a file lock and we
-    defer to it.
-
-    ``LRUCache.put`` writes with ``write_bytes`` and no rename, and
-    ``eviction_enabled``/``path`` are instance attributes, on 0.5.3, 0.7.0 and
-    0.9.1 alike (MEASURED), so the subclass below needs no shim.  What is NOT
-    uniform is the content-verification wrapper — see THE SURVIVING SHIM in
-    the body.
-    """
-    from jax._src import compilation_cache as _cc
-    from jax._src import config as _cfg
-    from jax._src import lru_cache as _lru
-
-    if getattr(_cc, "_lorrax_atomic_put_installed", False):
-        return
-
-    class _AtomicLRUCache(_lru.LRUCache):
-        def put(self, key: str, val: bytes) -> None:
-            if self.eviction_enabled:
-                # Stock LRUCache.put returns None for both a write and a
-                # pre-existing entry, and may evict under its file lock.  Do
-                # not manufacture write/eviction numbers for that opaque P=1
-                # policy path.
-                return super().put(key, val)
-            if not key:
-                raise ValueError("key cannot be empty")
-            final = self.path / f"{key}{_lru._CACHE_SUFFIX}"
-            if final.exists():
-                return
-            tmp = self.path / (f".{key}{_lru._CACHE_SUFFIX}.tmp."
-                               f"{os.getpid()}.{uuid.uuid4().hex[:8]}")
-            t0 = time.monotonic()
-            try:
-                tmp.write_bytes(val)
-                os.replace(str(tmp), str(final))
-            except BaseException:
-                try:
-                    os.unlink(str(tmp))
-                except OSError:
-                    pass
-                raise
-            # ``val`` is the serialized/compressed payload JAX hands to the
-            # file cache.  Count only after the atomic rename succeeds: a
-            # failed write remains an exception and never becomes a receipt.
-            _STATE.record_write(len(val), time.monotonic() - t0)
-
-    # THE SURVIVING SHIM — and the reason it survives is NOT a jax version.
-    #
-    # ``VerificationCache`` and the ``compilation_cache_check_contents`` flag
-    # that selects it are absent from every NVIDIA JAX CONTAINER at every tag
-    # probed — ten of them, 0.5.3 through 0.9.1, CLAIMS 112 — and are present
-    # only in the released wheel (the Frontera venv's 0.9.1).  Re-confirmed
-    # here on the new GPU image: on jax 0.7.0 both are still ABSENT.  So this
-    # is a container-vs-wheel difference, and moving the GPU leg off 0.5.3
-    # does nothing to it.
-    #
-    # Deleting this guard with the other four would have restored the CLAIMS
-    # 114 defect verbatim on the new image: both names were read at CALL time
-    # by the body below, so on the GPU leg EVERY cache read raised
-    # ``AttributeError`` inside JAX's own swallowing read path — zero entries
-    # written, ``enabled=True`` reported, one ``UserWarning`` per jit the only
-    # trace.
-    #
-    # Resolve them ONCE, here, where absence is a fact we can name.  Skipping
-    # verification on a jax that has no such feature is not a downgrade: it is
-    # exactly what that jax's own ``get_file_cache`` does (MEASURED — its
-    # source is ``return LRUCache(path, max_size=max_size), path``, with no
-    # branch).  The atomic write, which is the whole point of this patch, is
-    # unaffected either way.
-    _verification_cache = getattr(_cc, "VerificationCache", None)
-    _check_contents = getattr(_cfg, "compilation_cache_check_contents", None)
-    if _verification_cache is None or _check_contents is None:
-        _missing = ", ".join(
-            n for n, o in (("compilation_cache.VerificationCache",
-                            _verification_cache),
-                           ("config.compilation_cache_check_contents",
-                            _check_contents)) if o is None)
-        _compat(
-            "compilation_cache.verification",
-            f"jax._src has no {_missing} on this jax ({_jax_generation()}); "
-            f"cache-content verification is a jax 0.9 feature.  Writes stay "
-            f"atomic; reads are unverified, which is this jax's own "
-            f"behaviour.  Set jax_compilation_cache_check_contents on a jax "
-            f">= 0.9 to get verification back.")
-
-    def _atomic_get_file_cache(path: str):
-        cache = _AtomicLRUCache(
-            path, max_size=_cfg.compilation_cache_max_size.value)
-        _STATE.set_write_metrics_available(not cache.eviction_enabled)
-        if (_verification_cache is not None and _check_contents is not None
-                and _check_contents.value):
-            return _verification_cache(cache), path
-        return cache, path
-
-    _cc.get_file_cache = _atomic_get_file_cache
-    _cc._lorrax_atomic_put_installed = True
-
-
-#: The ``jax._src.compiler`` entry point a real XLA compile goes through.
-#: The supported 0.9 series routes compiles through
-#: ``backend_compile_and_load`` (MEASURED on the 0.9.1 wheel; also present on
-#: the historical 0.7.0 container), and it
-#: itself calls ``backend_compile`` — so exactly ONE of them may be patched or
-#: every compile is counted twice.
-#:
-#: This used to be a two-element preference tuple with a fallback to
-#: ``backend_compile``, because jax 0.5.3 had no ``backend_compile_and_load``
-#: at all.  The fallback went with 0.5.3.
 _COMPILE_ENTRY_POINT = "backend_compile_and_load"
+#: The ``jax._src.compiler`` entry point every compile request goes through,
+#: before the persistent-cache lookup.
+_COMPILE_REQUEST_POINT = "compile_or_get_cached"
 
 
 def _compile_module_identity(module) -> tuple[str, str, float]:
@@ -1463,32 +490,7 @@ def _decode_compile_record(payload: bytes, rank: int) -> dict:
     return record
 
 
-def _snapshot_compile_records(client, prefix: str, n_proc: int,
-                              local_rank: int, local_record: dict) -> list:
-    """Best-effort all-rank snapshot (one directory get) for a refusal."""
-    from ffi.common.broadcast import rank_records
-
-    records: list[dict | None] = [None] * n_proc
-    try:
-        payloads = rank_records(client, prefix, n_proc)
-    except Exception:                                      # noqa: BLE001
-        payloads = [None] * n_proc
-    for rank, payload in enumerate(payloads):
-        if payload is None:
-            continue
-        try:
-            records[rank] = _decode_compile_record(payload, rank)
-        except Exception:                                  # noqa: BLE001
-            pass
-    records[local_rank] = local_record
-    return records
-
-
-def _format_compile_refusal(verdict: dict) -> str:
-    module_name = verdict.get("module", "<unknown-module>")
-    occurrence = verdict.get("occurrence", "?")
-    reason = verdict.get("reason", "compile-key disagreement")
-    records = verdict.get("records") or []
+def _format_compile_refusal(module_name, occurrence, reason, records) -> str:
     rank_lines = []
     for rank, record in enumerate(records):
         if record is None:
@@ -1498,108 +500,74 @@ def _format_compile_refusal(verdict: dict) -> str:
                 f"rank {rank}: key={record.get('key', '<missing>')} "
                 f"module={record.get('module', '<missing>')!r}")
     return (
-        "GATE cross_rank_compile_agreement: REFUSED before XLA execution.\n"
-        f"  got: {reason}; stalled module {module_name!r}, occurrence "
+        "GATE cross_rank_compile_agreement: REFUSED before XLA compilation.\n"
+        f"  got: {reason}; module {module_name!r}, compile request "
         f"{occurrence}.\n"
         f"  rank keys: {'; '.join(rank_lines)}.\n"
-        "  want: every rank to present the same stable MLIR/HLO key before "
-        "any rank enters backend compilation.\n"
-        "  why: a rank-divergent GPU compile can enter collective autotuning "
-        "on only part of the world and hang silently.\n"
+        "  want: every rank to present the same stable MLIR/HLO key for the "
+        "same compile request.\n"
+        "  why: a rank-divergent program hangs silently in its next "
+        "collective (INVARIANTS 21).\n"
         "  fix: remove rank-conditional shapes/jits or make the emitted "
         "module identical; LORRAX_JAX_COMPILE_AGREEMENT=0 is an UNSAFE "
         "bisect-only opt-out.")
 
 
-def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
-                                 *, client=None, n_proc: int | None = None,
-                                 proc_idx: int | None = None,
-                                 timeout_s: float | None = None) -> None:
-    """Exchange one compile fingerprint and refuse divergence or absence."""
-    from ffi.common.broadcast import (
-        collect_rank_records, publish_rank_record, wait_for_key)
-
+def _publish_compile_record(module_name: str, key: str, occurrence: int) -> None:
+    """Every rank, on every compile request (a cache hit included): its fingerprint."""
+    from ffi.common.broadcast import publish_rank_record
     s = _STATE
-    client = s._compile_client if client is None else client
-    n_proc = int(s.n_proc if n_proc is None else n_proc)
-    proc_idx = int(s.proc_idx if proc_idx is None else proc_idx)
-    timeout_s = float(
-        s.compile_agreement_timeout_s if timeout_s is None else timeout_s)
-    prefix = _compile_event_prefix(occurrence)
-    record = {
-        "rank": proc_idx,
-        "module": module_name,
-        "occurrence": occurrence,
-        "key": key,
-    }
-    t0 = time.monotonic()
-    publish_rank_record(client, prefix, proc_idx, n_proc,
+    record = {"rank": s.proc_idx, "module": module_name,
+              "occurrence": occurrence, "key": key}
+    publish_rank_record(s._compile_client, _compile_event_prefix(occurrence),
+                        s.proc_idx, s.n_proc,
                         json.dumps(record, sort_keys=True).encode("utf-8"))
-    if proc_idx == 0:
-        reason = ""
-        try:
+
+
+def _check_compile_record(module_name: str, key: str, occurrence: int) -> None:
+    """A rank about to compile: refuse by name if any rank's record differs.
+
+    Rank 0 reads every rank's record for this request (they all publish,
+    whether they hit or compile, so nobody is waited on for a compile it
+    never does); a peer reads rank 0's. A rank that hits the cache checks
+    nothing and waits for nothing, so an asymmetric hit costs it nothing
+    and the compiling ranks one exchange. With no deadline (the default)
+    the wait names a missing rank every 60 s.
+    """
+    from ffi.common.broadcast import collect_rank_records, wait_for_key
+    s = _STATE
+    prefix = _compile_event_prefix(occurrence)
+    timeout_s = s.compile_agreement_timeout_s
+    t0 = time.monotonic()
+    reason = ""
+    try:
+        if s.proc_idx == 0:
             payloads = collect_rank_records(
-                client, prefix, n_proc, _timeout_ms(timeout_s),
-                what=f"every rank to reach the {module_name} compile")
+                s._compile_client, prefix, s.n_proc, _timeout_ms(timeout_s),
+                what=f"every rank's record of the {module_name} compile request")
             records = [_decode_compile_record(payload, rank)
                        for rank, payload in enumerate(payloads)]
-        except Exception as exc:                            # noqa: BLE001
-            records = _snapshot_compile_records(
-                client, prefix, n_proc, proc_idx, record)
-            missing = [rank for rank, item in enumerate(records)
-                       if item is None]
-            reason = (
-                f"rank(s) {missing} did not arrive within {timeout_s:g} "
-                f"seconds ({type(exc).__name__})")
-        keys = {item["key"] for item in records if item is not None}
-        modules = {item.get("module") for item in records if item is not None}
-        passed = len(records) == n_proc and None not in records \
-            and len(keys) == 1 and modules == {module_name}
-        if not passed and not reason:
-            reason = "ranks published different stable MLIR/HLO keys"
-        verdict = {
-            "passed": passed,
-            "module": module_name,
-            "occurrence": occurrence,
-            "reason": reason,
-            "records": records,
-        }
-        client.key_value_set_bytes(
-            f"{prefix}/verdict",
-            json.dumps(verdict, sort_keys=True).encode("utf-8"))
-    else:
-        # A peer may reach this slot nearly one full deadline before rank 0;
-        # rank 0 may then legitimately consume its own full deadline waiting
-        # for the last rank.  Therefore an early peer needs two intervals plus
-        # a small handoff allowance.  Anything shorter can time out a peer
-        # milliseconds before rank 0 publishes a passing verdict, leaving the
-        # remaining ranks to enter a collective without it (measured on the Si
-        # MPA P4 path, JID 57909046.123).
-        handoff_s = min(2.0, max(0.1, timeout_s * 0.1))
-        peer_wait_s = 2.0 * timeout_s + handoff_s if timeout_s > 0 else 0.0
-        try:
+        else:
+            # An early peer may wait nearly a whole deadline for rank 0, so a
+            # finite deadline is doubled with a handoff allowance.
+            peer_wait_s = 2.0 * timeout_s + min(2.0, max(0.1, timeout_s * 0.1)) if timeout_s > 0 else 0.0
             payload = wait_for_key(
-                client, f"{prefix}/verdict", _timeout_ms(peer_wait_s),
-                what=f"rank 0's verdict on the {module_name} compile")
-            verdict = json.loads(payload.decode("utf-8"))
-        except Exception as exc:                            # noqa: BLE001
-            records = _snapshot_compile_records(
-                client, prefix, n_proc, proc_idx, record)
-            verdict = {
-                "passed": False,
-                "module": module_name,
-                "occurrence": occurrence,
-                "reason": (
-                    f"rank 0 published no verdict within "
-                    f"{peer_wait_s:g} seconds "
-                    f"({type(exc).__name__})"),
-                "records": records,
-            }
-
+                s._compile_client, f"{prefix}/rank/0", _timeout_ms(peer_wait_s),
+                what=f"rank 0's record of the {module_name} compile request")
+            records = [_decode_compile_record(payload, 0)]
+    except CompileAgreementError:
+        raise
+    except Exception as exc:                               # noqa: BLE001
+        records, reason = [], (f"a rank's record did not arrive within the "
+                               f"deadline ({type(exc).__name__}: {exc})")
     s.compile_agreement_checks += 1
     s.compile_agreement_secs += time.monotonic() - t0
-    if not verdict.get("passed"):
-        raise CompileAgreementError(_format_compile_refusal(verdict))
+    if not reason and any(r.get("key") != key or r.get("module") != module_name
+                          for r in records):
+        reason = "ranks published different stable MLIR/HLO keys"
+    if reason:
+        raise CompileAgreementError(
+            _format_compile_refusal(module_name, occurrence, reason, records))
 
 
 def _configure_compile_agreement() -> None:
@@ -1622,13 +590,10 @@ def _configure_compile_agreement() -> None:
             _say("cross-rank compile agreement no-op: process_count=1.")
         return
 
-    # Install the known rank-local shard-offset canonicalization before the
-    # mesh warmup can compile ``jit__multi_slice``.  ``ensure_jax_compile_cache``
-    # repeats this idempotently later for direct cache callers, but doing it
-    # only there would put the new refusal in front of the existing repair.
-    if _truthy("LORRAX_JAX_CACHE_SHARD_SLICE", "1"):
-        _install_shard_slice_patch()
 
+    # One ``jit__multi_slice`` program on every rank before the mesh warm-up
+    # compiles it; otherwise the agreement below refuses JAX's own slicer.
+    _install_shard_slice_patch()
     from runtime.env_flags import env_bool
     requested = env_bool(
         "LORRAX_JAX_COMPILE_AGREEMENT", True, print_fn=_say)
@@ -1752,28 +717,49 @@ def _fit_gate_notice(msg: str) -> None:
 
 
 def _install_compile_counter() -> None:
-    """Count real XLA compiles so the storm is measurable, warm vs cold.
+    """Count real XLA compiles and run the compile agreement around them.
 
-    Raises :class:`_JaxSurfaceUnsupported` when
-    :data:`_COMPILE_ENTRY_POINT` is absent, so the caller can report that the
-    storm telemetry is OFF rather than leave
-    ``compile_cache_stats()['compiles']`` reading a confident 0.  That is a
-    refusal, not a compatibility branch: there is no second entry point left
-    to silently prefer.
+    ``compile_or_get_cached`` is every compile request (the persistent-cache
+    lookup included) and ``backend_compile_and_load`` every real compile;
+    both are module attributes of ``jax._src.compiler`` on the supported
+    0.9.1 wheel. A request publishes this rank's fingerprint under its
+    global request number; a real compile checks the other ranks' records
+    (:func:`_check_compile_record`). One lock keeps a process's requests in
+    one order, so request numbers agree across ranks that request the same
+    programs in the same order (INVARIANTS 21).
+
+    Raises :class:`_JaxSurfaceUnsupported` when an entry point is absent, so
+    the caller reports the storm telemetry OFF instead of a confident 0.
     """
     from jax._src import compiler as _compiler
 
     if getattr(_compiler, "_lorrax_compile_counter_installed", False):
         return
+    for name in (_COMPILE_ENTRY_POINT, _COMPILE_REQUEST_POINT):
+        if getattr(_compiler, name, None) is None:
+            raise _JaxSurfaceUnsupported(
+                f"jax._src.compiler has no {name} on this jax "
+                f"({_jax_generation()}): no entry point to count real XLA "
+                f"compiles at (jax 0.5.3 spelled it backend_compile; that "
+                f"line was dropped with the move to jax 0.7.0).")
+    _orig = getattr(_compiler, _COMPILE_ENTRY_POINT)
+    _orig_request = getattr(_compiler, _COMPILE_REQUEST_POINT)
 
-    name = _COMPILE_ENTRY_POINT
-    if getattr(_compiler, name, None) is None:
-        raise _JaxSurfaceUnsupported(
-            f"jax._src.compiler has no {name} on this jax "
-            f"({_jax_generation()}) — no entry point left to count real XLA "
-            f"compiles at.  jax 0.5.3 spelled it backend_compile; support for "
-            f"that line was dropped when the GPU leg moved to jax 0.7.0.")
-    _orig = getattr(_compiler, name)
+    def _requested(*args, **kwargs):
+        if not _STATE.compile_agreement_enabled:
+            return _orig_request(*args, **kwargs)
+        module = args[1] if len(args) > 1 else kwargs.get("computation")
+        module_name, key, fingerprint_secs = _compile_module_identity(module)
+        _STATE.compile_fingerprint_secs += fingerprint_secs
+        with _STATE._compile_event_lock:
+            occurrence = _STATE._compile_sequence
+            _STATE._compile_sequence += 1
+            _publish_compile_record(module_name, key, occurrence)
+            _STATE._compile_current = (module_name, key, occurrence)
+            try:
+                return _orig_request(*args, **kwargs)
+            finally:
+                _STATE._compile_current = None
 
     def _uncacheable(module, host_callbacks, seconds):
         # backend_compile_and_load(backend, module, devices, options, host_callbacks)
@@ -1793,29 +779,10 @@ def _install_compile_counter() -> None:
                  f"compiles again in every process")
 
     def _counting(*args, **kwargs):
+        if _STATE.compile_agreement_enabled and _STATE._compile_current is not None:
+            _check_compile_record(*_STATE._compile_current)
         module = args[1] if len(args) > 1 else kwargs.get("module")
         callbacks = args[4] if len(args) > 4 else kwargs.get("host_callbacks")
-        if _STATE.compile_agreement_enabled:
-            module_name, key, fingerprint_secs = _compile_module_identity(
-                module)
-            _STATE.compile_fingerprint_secs += fingerprint_secs
-            # JAX may ask host threads to lower independent modules at once.
-            # Keep each process's exchange *and backend entry* in one order;
-            # otherwise a later local thread can overtake a module whose
-            # all-rank agreement just passed.  The slot is global across
-            # module names, so another rank choosing a different first module
-            # refuses with both names instead of approving both out of order.
-            with _STATE._compile_event_lock:
-                occurrence = _STATE._compile_sequence
-                _STATE._compile_sequence += 1
-                _agree_before_module_compile(module_name, key, occurrence)
-                t0 = time.monotonic()
-                try:
-                    return _orig(*args, **kwargs)
-                finally:
-                    _STATE.compiles += 1
-                    _STATE.compile_secs += time.monotonic() - t0
-                    _uncacheable(module, callbacks, time.monotonic() - t0)
         t0 = time.monotonic()
         try:
             return _orig(*args, **kwargs)
@@ -1824,8 +791,10 @@ def _install_compile_counter() -> None:
             _STATE.compile_secs += time.monotonic() - t0
             _uncacheable(module, callbacks, time.monotonic() - t0)
 
-    setattr(_compiler, name, _counting)
+    setattr(_compiler, _COMPILE_REQUEST_POINT, _requested)
+    setattr(_compiler, _COMPILE_ENTRY_POINT, _counting)
     _compiler._lorrax_compile_counter_installed = True
+
 
 
 def compile_receipt(label: str, emit=None) -> str:
@@ -1856,191 +825,28 @@ def compile_receipt(label: str, emit=None) -> str:
 def _report() -> None:
     try:
         _report_impl()
-    except Exception:
+    except Exception:                                      # noqa: BLE001
         pass
-    try:
-        _dump_keys()
-    except Exception:
-        pass
-
-
-#: Filename a rank writes under ``LORRAX_JAX_CACHE_KEYDUMP``.  Spelled once,
-#: here, because the contract gate globs for it and a launcher that renamed
-#: it would give the gate an empty directory to be green about.
-def keydump_name(proc_idx: int, n_proc: int) -> str:
-    return f"rank{int(proc_idx):03d}_of{int(n_proc):03d}.json"
-
-
-def _dump_keys() -> None:
-    """Write this rank's cache-key set, when ``LORRAX_JAX_CACHE_KEYDUMP`` asks.
-
-    THE POINT.  ``xla_compiles`` and ``vetoed`` are per-rank COUNTS, and the
-    defect class this dump exists for is invisible to counts: four ranks
-    that each compiled a different program report the same four numbers as
-    four ranks that shared one.  What separates them is WHICH keys each rank
-    named, so that is what gets written.
-
-    Not the explain log.  ``jax_explain_cache_misses`` prints only the keys
-    that MISSED; a run where every rank hits every one of its own private
-    entries prints nothing at all on any rank, which is exactly the state
-    this dump has to be able to fail on.
-    """
-    dest = (os.environ.get("LORRAX_JAX_CACHE_KEYDUMP") or "").strip()
-    if not dest:
-        return
-    s = _STATE
-    writes = s.write_metrics()
-    path = Path(dest)
-    path.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "proc_idx": s.proc_idx,
-        "n_proc": s.n_proc,
-        "enabled": s.enabled,
-        "dir": s.dir,
-        "bound_dir": bound_cache_dir(),
-        "xla_compiles": s.compiles,
-        "compile_secs": s.compile_secs,
-        "compile_agreement_enabled": s.compile_agreement_enabled,
-        "compile_agreement_reason": s.compile_agreement_reason,
-        "compile_agreement_timeout_s": s.compile_agreement_timeout_s,
-        "compile_agreement_checks": s.compile_agreement_checks,
-        "compile_fingerprint_secs": s.compile_fingerprint_secs,
-        "compile_agreement_secs": s.compile_agreement_secs,
-        "probes": s.probes,
-        "hits": s.hits,
-        "vetoed": s.blocked,
-        "n_seen": s.n_seen,
-        "n_agreed": s.n_agreed,
-        "namespace": s.namespace,
-        "agree_secs": s.agree_secs,
-        "prefetch_secs": s.prefetch_secs,
-        "read_secs": s.read_secs,
-        # These are THIS PROCESS'S completed writes.  JAX invokes its
-        # persistent-cache writer on process 0 only, so peers correctly
-        # report zero rather than duplicating p0's work.
-        **writes,
-        "is_cache_writer": s.proc_idx == 0,
-        "write_scope": "process-local; JAX writes on process 0 only",
-        # SORTED, so a reader diffing two ranks' files sees the divergence
-        # and not an iteration order.
-        "keys": sorted(s.probe_keys),
-    }
-    # Same tmp+rename discipline as the cache writes themselves: four ranks
-    # write into one directory and the gate globs it, so a reader must never
-    # be able to observe a half-written file and call it a short key set.
-    final = path / keydump_name(s.proc_idx, s.n_proc)
-    tmp = path / f".{final.name}.tmp.{os.getpid()}"
-    tmp.write_text(json.dumps(payload, indent=1, sort_keys=True))
-    os.replace(str(tmp), str(final))
-
-
-def bound_cache_dir() -> str:
-    """The directory JAX's cache object is ACTUALLY bound to, or ``""``.
-
-    NOT the same question as :attr:`_CacheState.dir`, which records the
-    directory this module ASKED for.  ``jax._src.compilation_cache._cache``
-    is built once, lazily, at the first compile that consults the cache,
-    from ``jax_compilation_cache_dir`` AS IT READ THEN — and a later
-    ``config.update`` does not rebind it.  So the two can disagree, and
-    when they do every symptom is silent: the agreement lists the
-    directory we asked for while JAX reads and writes another one, so
-    every probe is vetoed, every write lands on a key that already exists
-    somewhere else, and the summary line reports a healthy-looking
-    ``enabled=True`` with a directory nothing used.  Reporting the bound
-    directory is what makes that state visible instead of inferable.
-    """
-    try:
-        from jax._src import compilation_cache as _cc
-        cache = getattr(_cc, "_cache", None)
-        if cache is None:
-            return ""
-        path = getattr(cache, "path", None) or getattr(cache, "_path", None)
-        return str(path) if path is not None else ""
-    except Exception:                                          # noqa: BLE001
-        return ""
-
-
-def _reset_bound_cache_for_atomic_writer(cache_path: Path,
-                                         proc_idx: int) -> None:
-    """Rebuild any live stock-JAX cache through LORRAX's patched factory.
-
-    Patching ``get_file_cache`` only affects future cache objects.  Even when
-    JAX is already bound to the requested path, keeping that object would keep
-    stock non-atomic writes and make write telemetry unavailable.  Reset the
-    object unconditionally; persistent files at the path are not removed.
-    """
-    previous = bound_cache_dir()
-    if not previous:
-        return
-
-    same_path = (os.path.realpath(previous)
-                 == os.path.realpath(str(cache_path)))
-    try:
-        from jax._src import compilation_cache as _cc_rebind
-        _cc_rebind.reset_cache()
-    except Exception as exc:                                   # noqa: BLE001
-        raise RuntimeError(
-            "LORRAX patched JAX's cache factory for atomic writes but could "
-            f"not reset the already-bound cache object at {previous}; "
-            "continuing would silently retain stock non-atomic writes"
-        ) from exc
-
-    if proc_idx == 0:
-        if same_path:
-            _debug_say(
-                f"rebuilt JAX's cache object at {cache_path} through the "
-                f"atomic LORRAX writer; persistent entries were retained.")
-        else:
-            _debug_say(
-                f"rebound JAX's compile cache from {previous} "
-                f"(inherited through JAX_COMPILATION_CACHE_DIR) to "
-                f"{cache_path}.  The inherited directory is not "
-                f"per-world-size, so the P>1 agreement cannot use it.")
 
 
 def _report_impl() -> None:
     s = _STATE
-    writes = s.write_metrics()
-    bound = bound_cache_dir()
-    # Only spelled out when it DISAGREES with what we asked for: the
-    # agreement, the veto and the writes all key off the asked-for
-    # directory, so a disagreement means the cache is inert in a way no
-    # other number on this line shows.
-    where = "" if (not bound or bound == s.dir) else f" BOUND-ELSEWHERE={bound}"
-    if writes["write_metrics_available"]:
-        write_receipt = (
-            f"cache_writes_local={writes['local_writes']} "
-            f"bytes={writes['local_write_bytes']} "
-            f"({writes['local_write_secs']:.2f}s; JAX p0-only)  ")
-    else:
-        write_receipt = (
-            "cache_writes_local=unmeasured "
-            "(cache off or capped-LRU path; JAX p0-only)  ")
-    msg = (f"rank {s.proc_idx}/{s.n_proc} summary: "
-           f"xla_compiles={s.compiles} ({s.compile_secs:.2f}s)  "
-           f"compile_agreement={s.compile_agreement_checks} "
-           f"({s.compile_fingerprint_secs:.3f}s fingerprint + "
-           f"{s.compile_agreement_secs:.3f}s exchange; "
-           f"{s.compile_agreement_reason})  "
-           f"cache_probes={s.probes} hits={s.hits} "
-           f"({s.read_secs:.2f}s) vetoed={s.blocked}  "
-           f"{write_receipt}"
-           f"agreed={s.n_agreed}/{s.n_seen} "
-           f"prefetch={s.prefetch_secs:.2f}s  enabled={s.enabled}{where}")
-    # A healthy per-rank performance receipt is forensic detail.  Binding to
-    # a different directory is a broken agreement contract and remains loud
-    # in production.
-    (_say if where else _debug_say)(msg)
+    _debug_say(f"rank {s.proc_idx}/{s.n_proc} summary: "
+               f"xla_compiles={s.compiles} ({s.compile_secs:.2f}s)  "
+               f"compile_agreement={s.compile_agreement_checks} "
+               f"({s.compile_fingerprint_secs:.3f}s fingerprint + "
+               f"{s.compile_agreement_secs:.3f}s exchange; "
+               f"{s.compile_agreement_reason})  "
+               f"cache_probes={s.probes} hits={s.hits} ({s.read_secs:.2f}s)  "
+               f"enabled={s.enabled} dir={s.dir}")
 
 
 def compile_cache_stats() -> dict:
-    """Snapshot this rank's cache counters; unavailable writes are ``None``."""
+    """Snapshot this rank's cache counters."""
     s = _STATE
-    writes = s.write_metrics()
     return {
         "enabled": s.enabled, "dir": s.dir, "n_proc": s.n_proc,
-        "proc_idx": s.proc_idx, "n_seen": s.n_seen, "n_agreed": s.n_agreed,
-        "probes": s.probes, "hits": s.hits, "vetoed": s.blocked,
+        "proc_idx": s.proc_idx, "probes": s.probes, "hits": s.hits,
         "compiles": s.compiles, "compile_secs": s.compile_secs,
         "compile_agreement_configured": s.compile_agreement_configured,
         "compile_agreement_enabled": s.compile_agreement_enabled,
@@ -2049,17 +855,13 @@ def compile_cache_stats() -> dict:
         "compile_agreement_checks": s.compile_agreement_checks,
         "compile_fingerprint_secs": s.compile_fingerprint_secs,
         "compile_agreement_secs": s.compile_agreement_secs,
-        "read_secs": s.read_secs, "prefetch_secs": s.prefetch_secs,
-        "agree_secs": s.agree_secs, "namespace": s.namespace,
-        **writes,
+        "read_secs": s.read_secs, "namespace": s.namespace,
         "is_cache_writer": s.proc_idx == 0,
         "write_scope": "process-local; JAX writes on process 0 only",
-        "bound_dir": bound_cache_dir(),
         "keys": sorted(s.probe_keys),
     }
 
 
-# ---------------------------------------------------------------------------
 # the default location: one namespace per jax/jaxlib/FFI bundle, pruned by rank 0
 # ---------------------------------------------------------------------------
 #: Retention.  Nothing used in the last five days is removed: the longest job
@@ -2269,80 +1071,41 @@ def _resolve_cache_base_dir() -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
 def ensure_jax_compile_cache() -> None:
-    """Enable the JAX persistent compile cache once per process.
-
-    At ``jax.process_count() == 1`` this simply arms JAX's persistent cache
-    at ``{base}/np1/``.
-
-    At ``jax.process_count() > 1`` it additionally installs the LORRAX
-    hit/miss AGREEMENT layer described in the module docstring, so that a
-    shared cache directory is safe: every rank uses exactly the same set of
-    cache entries, so no rank can skip a compile its peers are performing.
-    Set ``LORRAX_JAX_CACHE_MULTIPROCESS=0`` to fall back to the scorecard-AG
-    behaviour (no cache at all when P > 1).
+    """Arm JAX's persistent compile cache once per process (see the module docstring).
 
     ONE caller owns this: ``runtime.initialize_communicator_stack`` step 7.
-    Idempotence is not a licence for a second call site — it is what makes a
-    stray re-entry through an unlucky import order harmless rather than a
-    second, differently-configured cache.  See the module docstring for the
-    two non-driver exceptions.
+    Idempotent, so a stray re-entry through an import order is harmless
+    rather than a second, differently configured cache.
     """
     global _COMPILATION_CACHE_READY
     if _COMPILATION_CACHE_READY:
         return
     _COMPILATION_CACHE_READY = True
 
+    import jax as _jax
     try:
-        import jax as _jax
         n_proc = _jax.process_count()
         proc_idx = _jax.process_index()
-    except Exception:
-        n_proc = 1
-        proc_idx = 0
-    _STATE.n_proc = n_proc
-    _STATE.proc_idx = proc_idx
-    _STATE.reset_write_metrics()
-    _STATE.set_write_metrics_available(False)
+    except Exception:                                      # noqa: BLE001
+        n_proc, proc_idx = 1, 0
+    _STATE.n_proc, _STATE.proc_idx = n_proc, proc_idx
 
-    # Legacy shared caches (pre-AH) can still be on disk with entries whose
-    # device binding does not match; JAX warns once per primitive per jit.
-    # Non-fatal (JAX recompiles) but noisy.  Suppressed ONLY at P > 1, where
-    # any agreed entry that fails to load is already reported loudly by
-    # ``_fatal``.  At P == 1 no agreement layer is installed, so this
-    # warning is the only observable that distinguishes "cache warm" from
-    # "cache rotting" (torn pre-AH write, scratch bit rot) — a blanket
-    # filter made healthy and corrupt caches log identically there
-    # (QUALITY_PATTERNS #7 addendum; release audit 2026-07-28).
-    if n_proc > 1:
-        warnings.filterwarnings(
-            "ignore",
-            message=r"Error reading persistent compilation cache entry .*",
-            category=UserWarning,
-        )
-
-    # The compile counter goes in on EVERY path, including cache-off, so that
-    # "compiles with the cache" and "compiles without it" are the same
-    # measurement (scorecard D's storm number, per rank, per run).
-    #
-    # This except used to be a bare ``pass``, and that is how the counter came
-    # to be silently absent on the whole GPU leg for months: its jax-0.9 target
-    # does not exist on the 0.5.3 line, the exception was swallowed here, and
-    # every run then reported ``xla_compiles=0`` with total confidence.  A
-    # counter that is not installed must SAY it is not installed — the number
-    # it stops producing is the one the docstring above promises.
+    # The compile counter goes in on EVERY path, cache-off included, so
+    # "compiles with the cache" and "compiles without it" are one measurement.
     try:
         install_compile_agreement()
         atexit.register(_report)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:                               # noqa: BLE001
         if proc_idx == 0:
             _say(f"compile-storm telemetry OFF: the XLA compile counter did "
-                 f"not install ({type(exc).__name__}: {exc}).  The cache "
-                 f"itself is unaffected, but xla_compiles / compile_secs "
-                 f"will read 0 no matter what this run compiles — do not "
-                 f"read that as a cache hit.")
+                 f"not install ({type(exc).__name__}: {exc}); xla_compiles "
+                 f"will read 0 whatever this run compiles.")
 
     try:
         cache_dir, cache_source = _resolve_cache_base_dir()
@@ -2351,10 +1114,8 @@ def ensure_jax_compile_cache() -> None:
             f"the runtime-default namespace could not be resolved "
             f"({type(exc).__name__}: {exc})")
     if n_proc > 1 or not cache_dir:
-        # This setting belongs before every early return below.  Otherwise an
-        # explicit cache opt-out leaves JAX's process-0 UPDATE / peer READ
-        # per-fusion cache active but gives it no real base directory.  Rank 0
-        # then fails alone while its peers continue towards a collective.
+        # JAX would otherwise auto-enable XLA's per-fusion caches, UPDATE on
+        # process 0 and READ on its peers, with no real base directory.
         _jax.config.update("jax_persistent_cache_enable_xla_caches", "")
     if not cache_dir:
         if proc_idx == 0:
@@ -2364,248 +1125,41 @@ def ensure_jax_compile_cache() -> None:
                  f"executable cache remains active.")
         return
 
-    if cache_source != "explicit":
-        _STATE.namespace = Path(cache_dir).name
-        if proc_idx == 0:
-            # A derived location must be visible in the log (quality-pattern
-            # #8).  The stamp is what the pruner reads as "last used".
-            try:
-                Path(cache_dir).mkdir(parents=True, exist_ok=True)
-                (Path(cache_dir) / _NS_STAMP).touch()
-            except OSError as exc:
-                _say(f"cannot stamp {cache_dir} ({exc}); it may be pruned "
-                     f"early.")
-            _debug_say(
-                f"cache dir (runtime default): {cache_dir} "
-                f"(ISDF_JAX_CACHE_DIR overrides, \"\" opts out).")
-
-    # ---- back-compat escape hatch: the scorecard-AG refusal --------------
-    if n_proc > 1 and not _truthy("LORRAX_JAX_CACHE_MULTIPROCESS", "1"):
-        if proc_idx == 0:
-            _say(f"DISABLED at {n_proc} processes by "
-                 f"LORRAX_JAX_CACHE_MULTIPROCESS=0 (scorecard-AG refusal). "
-                 f"Every rank compiles from scratch; correct, ~1 min slower. "
-                 f"Would have used {cache_dir}/np{n_proc}.")
-        return
-
     from jax._src import config as _jax_config
-    _max_size = int(_jax_config.compilation_cache_max_size.value)
-    if not _cache_size_policy(n_proc, _max_size):
+    if not _cache_size_policy(n_proc, int(_jax_config.compilation_cache_max_size.value)):
         if proc_idx == 0:
-            _say("persistent compile cache OFF "
-                 "(JAX_COMPILATION_CACHE_MAX_SIZE=0).")
+            _say("persistent compile cache OFF (JAX_COMPILATION_CACHE_MAX_SIZE=0).")
         return
-    # ONE directory per world size, shared by every rank (see docstring).
+    # ONE directory per world size: entries are compiled for P devices.
     cache_path = Path(cache_dir).expanduser() / f"np{n_proc}"
     _STATE.dir = str(cache_path)
     try:
         cache_path.mkdir(parents=True, exist_ok=True)
-    except Exception as exc:
-        if proc_idx == 0:
-            _say(f"DISABLED: cannot create {cache_path} ({exc}). "
-                 f"Every rank compiles from scratch.")
-        return
-
-    try:
-        import jax as _jax
         _jax.config.update("jax_compilation_cache_dir", str(cache_path))
         # Threshold 0 unless exported: JAX's 1 s default persisted 2 of 666
-        # executables on the MoS2 bispinor deck, whose cold compile is 65 %
-        # of its wall.  The file count this adds is bounded by the namespace
-        # pruner (default location) or by whoever owns an explicit directory.
+        # executables on the MoS2 bispinor deck.
         if os.environ.get("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS") is None:
-            _jax.config.update(
-                "jax_persistent_cache_min_compile_time_secs", 0.0)
-        if n_proc > 1:
-            # See docstring §4: JAX would otherwise auto-enable XLA's own
-            # per-fusion autotune cache in UPDATE(p0)/READ(peers) mode, which
-            # desynchronises AutotunerPass' modulo-P work split.
-            _jax.config.update("jax_persistent_cache_enable_xla_caches", "")
-        # Cache-miss explanations are opt-in via JAX_EXPLAIN_CACHE_MISSES=1
-        # only; LORRAX_DEBUG_PRINT deliberately does NOT imply them (the
-        # coupling produced 56.6% log spam — io-overhead audit 2026-08-30).
-    except Exception as exc:
+            _jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+        # JAX binds its cache object at the first compile that consults it
+        # (the mesh warm-up runs before this step) and a later config update
+        # does not rebind it; the reset makes the next compile read this dir.
+        from jax._src import compilation_cache as _cc
+        _cc.reset_cache()
+    except Exception as exc:                               # noqa: BLE001
         if proc_idx == 0:
-            _say(f"DISABLED: jax.config.update failed ({exc}).")
+            _say(f"DISABLED: cannot arm {cache_path} ({exc}). Every rank "
+                 f"compiles from scratch.")
         return
-
-    _install_atomic_put_patch()
-
-    # ---- make JAX's cache OBJECT follow the directory we just chose -------
-    # MEASURED, Perlmutter 2026-08-07, the centroid deck at P=4: without this
-    # the run reports `cache_probes=149 hits=0 vetoed=149 agreed=622/622` and
-    # never warms up, on consecutive runs, forever.
-    #
-    # `jax._src.compilation_cache._cache` is built ONCE, lazily, at the first
-    # compile that consults the cache, from `jax_compilation_cache_dir` AS IT
-    # READ THEN — and `reset_cache()` is the only way to rebind it; a later
-    # `config.update` does not.  Older deployed modulefiles exported
-    # `JAX_COMPILATION_CACHE_DIR=$SCRATCH/.jax_cache` into the Shifter
-    # container, JAX picked that up at import, and the mesh warm-up in
-    # `runtime.initialize_communicator_stack` compiles before this function is
-    # reached.  So by the time we get here the cache is already bound to
-    # `.jax_cache` (19950 entries, actively written) while everything in THIS
-    # file — the directory listing, the agreement, the veto — is about
-    # `{base}/np{P}`.
-    #
-    # The two failure modes that produces are both silent:
-    #   * every probe is vetoed, because `_STATE.agreed` was built by listing
-    #     a directory JAX is not reading;
-    #   * every write lands in `.jax_cache` on a key that is usually already
-    #     there, so `LRUCache.put`'s `if cache_path.exists(): return` makes it
-    #     a no-op and NOTHING appears to be written anywhere.
-    # and the summary line still says `enabled=True`.  At P == 1 there is no
-    # agreement patch, so JAX reads `.jax_cache` unimpeded and HITS — which is
-    # exactly why the 1-rank leg warms up (12.5 s -> 6.0 s) and the 4-rank leg
-    # does not.  The asymmetry read like a P>1 cache policy and was not one.
-    #
-    # Rebinding rather than adopting the inherited directory: `{base}/np{P}`
-    # is per-world-size BY DESIGN (the whole agreement rests on every rank
-    # seeing the same set), and `.jax_cache` is one flat directory shared by
-    # every world size, so adopting it would put P=1 and P=16 entries in one
-    # namespace and hand the agreement a set that changes under it.
-    _reset_bound_cache_for_atomic_writer(cache_path, proc_idx)
-
-    if n_proc == 1:
-        # There is no all-rank agreement to enforce, but the exit receipt and
-        # optional key dump still promise real probe/hit counts.  The old early
-        # return left those counters at their initial zeros even on a warm run
-        # that deserialized hundreds of executables.  This wrapper delegates
-        # every decision unchanged and observes only JAX's actual answer.
-        _install_observation_patch()
-        _STATE.enabled = True
-        if _STATE.namespace:
-            _start_namespace_prune(Path(cache_dir).parent, _STATE.namespace)
-        return
-
-    # Make the ranks compile the SAME MODULE before making them agree on which
-    # keys they may use.  This is not part of the agreement and does not
-    # depend on its outcome: the agreement equalises hit/miss for a given key,
-    # and `jit__multi_slice` diverges one level below that, by building a
-    # different program per rank out of that rank's own shard offsets.  See
-    # `_install_shard_slice_patch` for the mechanism and the measurement.
-    # It is installed on every P>1 path, including the degraded ones, because
-    # fewer distinct modules is never the wrong direction.
-    if _truthy("LORRAX_JAX_CACHE_SHARD_SLICE", "1"):
-        _install_shard_slice_patch()
-    elif proc_idx == 0:
-        _say("LORRAX_JAX_CACHE_SHARD_SLICE=0: JAX's rank-dependent "
-             "ArrayImpl._multi_slice is left in place.  Expect one "
-             "jit__multi_slice cache key PER RANK — this is the red twin of "
-             "the shard-slice canonicalization, not a supported mode.")
-
-    # NOTE for anyone re-reading the P>1 path.  There used to be a fifth
-    # compatibility shim here: a whole-cache degradation for a jax whose
-    # ``get_executable_and_time`` has no ``executable_devices`` parameter.
-    # Sharing a cache across processes needs the reading rank to bind the
-    # deserialized executable to ITS OWN devices, and jax 0.5.3 had no way to
-    # be told — so a process-invariant key was ACTIVELY HARMFUL there: rank 1
-    # named rank 0's entry, fetched it, and died loading it (MEASURED on one
-    # node, 2 GPUs, container 25.04, warm: rank 0 hit 9/9, rank 1 raised
-    # ``XlaRuntimeError: INVALID_ARGUMENT: Device assignment ... does not have
-    # any local devices`` and ``_fatal`` aborted the job, rc 70).
-    #
-    # The supported 0.9.1 wheel HAS the parameter (the historical 0.7.0
-    # container also measured 4 parameters with ``executable_devices`` named),
-    # so the branch was unreachable and is deleted rather than left as a
-    # permanent compatibility layer for a version being abandoned.  The
-    # condition itself is not unguarded: ``runtime.jax_support`` requires
-    # ``compilation_cache.get_executable_and_time`` to take 4 parameters and
-    # refuses at startup, by name, on a jax that does not.
-
-    # A process-invariant key is load-bearing for SAFETY, not just for the
-    # win: without it process 0 hits the entries it wrote while every peer
-    # computes a different key, misses, and compiles — which is precisely the
-    # divergent hit/miss pattern that deadlocks XLA:GPU's collective autotune.
-    # (MEASURED on CPU: rank 0 hits 7/7, ranks 1-3 hit 0/7 and compile 7.)
-    # So if we cannot install it, the cache must not be USED at all.
-    invariant_key = False
-    if _truthy("LORRAX_JAX_CACHE_INVARIANT_KEY", "1"):
-        try:
-            _install_invariant_key_patch()
-            invariant_key = True
-        except Exception as exc:
-            _say(f"rank {proc_idx}: could not make the cache key "
-                 f"process-invariant ({type(exc).__name__}: {exc}).")
-    if not invariant_key and not _truthy("LORRAX_JAX_CACHE_NO_AGREE"):
-        _STATE.agreed = frozenset()
-        _install_agreement_patch()   # veto everything -> symmetric miss
-        if proc_idx == 0:
-            _say(f"DEGRADED TO CACHE-OFF at {n_proc} processes: the cache key "
-                 f"is not process-invariant here, so process 0 would hit "
-                 f"entries its peers cannot even name — the scorecard-AG "
-                 f"divergence.  Every rank compiles from scratch, which is "
-                 f"correct.  (Set LORRAX_JAX_CACHE_INVARIANT_KEY=1, the "
-                 f"default, to get the cache back.)")
-        return
-
-    # ---------------- P > 1: the hit/miss agreement -----------------------
-    if _truthy("LORRAX_JAX_CACHE_NO_AGREE"):
-        _STATE.enabled = True
-        if proc_idx == 0:
-            _say("*** LORRAX_JAX_CACHE_NO_AGREE=1: naive shared directory, "
-                 "NO hit/miss agreement.  This is the DEADLOCK REPRODUCER, "
-                 "not a supported mode. ***")
-        return
-
-    t0 = time.monotonic()
-    timeout_s = float(_int_env("LORRAX_JAX_CACHE_AGREE_TIMEOUT_S", 300))
-    try:
-        n_seen, agreed = _agree_on_entries(
-            cache_path, n_proc, proc_idx, timeout_s)
-    except BaseException as exc:  # noqa: BLE001 - never let this hang a run
-        _STATE.agreed = frozenset()
-        _STATE.n_seen = 0
-        _STATE.n_agreed = 0
-        _install_agreement_patch()   # veto everything -> symmetric miss
-        tail = (f"Entries are still being written to {cache_path} for next "
-                f"time.")
-        if isinstance(exc, _KeyEnvMismatch):
-            # Writing here would populate a SECOND key space that no
-            # correctly-launched run can ever hit — pure bloat.  Turn the
-            # persistent cache off outright (nothing has compiled yet).
-            try:
-                import jax as _jax
-                _jax.config.update("jax_compilation_cache_dir", None)
-                tail = "Nothing is being written either (it would be unusable)."
-            except Exception:
-                pass
-        _say(f"rank {proc_idx}: DEGRADED TO CACHE-OFF — the hit/miss "
-             f"agreement failed ({type(exc).__name__}: {exc}). Every rank "
-             f"compiles from scratch this run, which is correct and slower. "
-             f"{tail}")
-        return
-
-    _STATE.n_seen = n_seen
-    _STATE.n_agreed = len(agreed)
-    _STATE.agreed = agreed
+    _install_observation_patch()
     _STATE.enabled = True
-    _install_agreement_patch()
-    if _STATE.namespace and proc_idx == 0:
-        # After the agreement: the prune must not take an agreed entry.
-        _start_namespace_prune(Path(cache_dir).parent, _STATE.namespace,
-                               keep=agreed)
-
-    if _truthy("LORRAX_JAX_CACHE_PREFETCH", _PREFETCH_DEFAULT):
-        _STATE.prefetch_secs = _prefetch_agreed(
-            cache_path, agreed,
-            _int_env("LORRAX_JAX_CACHE_PREFETCH_THREADS", 16))
-
-    _STATE.agree_secs = time.monotonic() - t0
-    dropped = n_seen - len(agreed)
+    if cache_source != "explicit":
+        _STATE.namespace = Path(cache_dir).name
+        if proc_idx == 0:
+            try:
+                (Path(cache_dir) / _NS_STAMP).touch()
+            except OSError as exc:
+                _say(f"cannot stamp {cache_dir} ({exc}); it may be pruned early.")
+            _start_namespace_prune(Path(cache_dir).parent, _STATE.namespace)
     if proc_idx == 0:
-        _debug_say(
-            f"ARMED at {n_proc} processes, shared dir {cache_path} "
-            f"({n_seen} entries advertised, {len(agreed)} agreed by all "
-            f"ranks; agree+prefetch {time.monotonic() - t0:.2f}s of which "
-            f"prefetch {_STATE.prefetch_secs:.2f}s).")
-        if dropped:
-            _say(f"*** {dropped} entr{'y' if dropped == 1 else 'ies'} DROPPED "
-                 f"— at least one rank could not see them, so NO rank will "
-                 f"use them and every rank will compile those modules.  This "
-                 f"is the agreement doing its job (a divergent hit/miss "
-                 f"pattern is what deadlocks XLA:GPU autotuning). ***")
-        if n_seen == 0:
-            _debug_say(
-                "cold cache: nothing to reuse this run; process 0 will "
-                "populate it for the next one.")
+        _debug_say(f"ARMED at {n_proc} processes, {cache_path} "
+                   f"({cache_source}; ISDF_JAX_CACHE_DIR overrides, \"\" opts out).")

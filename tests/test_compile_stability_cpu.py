@@ -14,7 +14,6 @@ shape, not on a timing:
 4. Partner directions keep one carrier whatever their count (e2200b174).
 5. Face constructor rounds share one width, the ragged tail included.
 """
-import ast
 import os
 import subprocess
 import sys
@@ -48,18 +47,6 @@ def _backend_compiles():
         lambda event, secs, **kw: names.append(kw.get("fun_name", "?"))
         if event == dispatch.BACKEND_COMPILE_EVENT else None)
     return names
-
-
-def _tuple_of(path, name):
-    for node in ast.walk(ast.parse(path.read_text())):
-        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
-            return tuple(ast.literal_eval(node.value))
-    raise AssertionError(f"{name} not found in {path}")
-
-
-def test_rank_fingerprint_env_mirrors_ffi_dials():
-    assert (_tuple_of(ROOT / "src/common/jax_compile_cache.py", "RANK_FINGERPRINT_ENV")
-            == _tuple_of(ROOT / "src/ffi/__init__.py", "FFI_DIAL_ENV"))
 
 
 def _checked_eigh(a, site="test eigh"):
