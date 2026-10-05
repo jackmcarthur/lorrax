@@ -103,7 +103,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
     with phase("entry"):
         import numpy as np
         from jax.sharding import NamedSharding, PartitionSpec as P
-        from runtime.padding import mesh_divisor
         from file_io.shared_pole_store import (
             charge_representation, validate_shared_pole_bank, open_shared_pole_bank,
             read_line_panels, read_shared_pole_bank, write_shared_pole_model,
@@ -203,7 +202,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         # A local round runs one parent per rank from its sample read to its
         # sorted model. A face round runs a budget-sized batch of physical
         # parents over all ranks (one schedule owner for both constructors).
-        ranks = mesh_divisor(mesh_xy)
         face_batch = 1
         if execution == 'face':
             from gw.shared_pole_capacity import face_eigh_room
@@ -236,7 +234,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         to_face, to_batch = batch_to_face(mesh_xy), face_to_batch_reshard(mesh_xy)
     for ids, real, slots in rounds:
         with phase("batch_admission"):
-            budget.batch_width = ranks if execution == 'local' else real
+            budget.batch_width = len(ids)
             budget.retained_panels = tuple(factors)
             budget.plan(
                 conservative_side, phase="selection",
@@ -286,7 +284,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             round_key = ("scalar", logical_n, ordered, odd_moments)
             history = carrier_history(meta)
             budget.retained_panels = tuple(factors)
-            budget.batch_width = ranks if execution == 'local' else real
+            budget.batch_width = len(ids)
             def _tables(widths, infinity_width, reuse):
                 return round_tables(
                     round_counts, widths, [st[0] for st in round_states],
@@ -337,7 +335,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 room = lambda compiled: face_eigh_room(dict(row, aggregate_bytes_per_rank=(
                     row['aggregate_bytes_per_rank'] - budget.program_bytes + compiled)), retained_bound)
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
-                    round_states, infinity, tables, real=real, mesh=mesh_xy,
+                    round_states, infinity, tables, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
                     keep_budget=keep_budget, admit=False, room=room,
                     carrier=sizing['carrier'])
@@ -378,7 +376,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
             reductions = own_extent_receipts(round_reduction, tables["own"][:real])
         with phase("coulomb"):
-            budget.batch_width = ranks if execution == 'local' else real
+            budget.batch_width = len(ids)
             model_row = budget.plan(side, phase="model", sample_batch=len(held_ids))
             budget.live((*round_model, *round_signed, qi))
             # V^-1/2 of the round's parents: one owner call per contiguous run of ids, rows in slot order.

@@ -237,18 +237,20 @@ _EXECUTABLES: dict = {}
 PHASES = ("all", "first", "retry")
 
 
-def _program_key(op, mesh, shape, dtype, rounds, site, phase):
-    return (op, mesh_key(mesh), tuple(shape), str(dtype), int(rounds), site, phase)
+def _program_key(op, mesh, shape, dtype, rounds, phase):
+    # Only what enters the HLO: a call site or a room never does (the refusal
+    # names its site on the host, after the call).
+    return (op, mesh_key(mesh), tuple(shape), str(dtype), int(rounds), phase)
 
 
 @lru_cache(maxsize=None)
 def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int,
-                 site: str, phase: str) -> tuple[int, float]:
+                 phase: str) -> tuple[int, float]:
     """Per-rank device bytes route (c) adds for a face stack of ``nb`` matrices
     in ``rounds``, and the seconds the compile took.
 
     The compiled size of what the program reserves
-    (:func:`_reshard_stack_program` for this call ``site`` and ``phase``:
+    (:func:`_reshard_stack_program` for this ``phase``:
     the slices' exchanges, local eighs, inverse exchanges and the result
     check, with the retries only in ``"all"``; outputs and temporaries, the
     caller's operand excluded) plus the local solver's runtime workspace for
@@ -263,12 +265,12 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int,
     from distrib_la.workspace import _vendor_query
     face = NamedSharding(mesh, P(None, "x", "y"))
     started = time.perf_counter()
-    program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, site, phase)
+    program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, phase)
     executable = program.lower(jax.ShapeDtypeStruct((nb, n, n), np.dtype(dtype), sharding=face)
                                ).compile()
     seconds = time.perf_counter() - started
     if phase == "first" and traced_phase() == "all":
-        _EXECUTABLES[_program_key(op, mesh, (nb, n, n), dtype, rounds, site, phase)] = executable
+        _EXECUTABLES[_program_key(op, mesh, (nb, n, n), dtype, rounds, phase)] = executable
     stats = executable.memory_analysis()
     if stats is None:
         raise RuntimeError("route (c) admission: the compiler returned no memory analysis")
@@ -288,11 +290,11 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int,
 _SIZING_FAILED = 1 << 62
 
 
-def _sized_or_failed(op, mesh, nb, n, dtype, rounds, site, phase) -> tuple[int, float]:
+def _sized_or_failed(op, mesh, nb, n, dtype, rounds, phase) -> tuple[int, float]:
     """:func:`_stack_bytes`, or the failure sentinel: never raises before the exchange."""
     import sys
     try:
-        return _stack_bytes(op, mesh, nb, n, dtype, rounds, site, phase)
+        return _stack_bytes(op, mesh, nb, n, dtype, rounds, phase)
     except Exception as exc:        # any failure means "does not fit", on every rank
         print(f"distrib_la: route (c) sizing of {op} {nb} x {n}^2 in {rounds} round(s) failed "
               f"on process {jax.process_index()} ({type(exc).__name__}: {exc}); the candidate "
@@ -311,8 +313,7 @@ def _gathered_admitted(shape, dtype) -> bool:
 
 
 @lru_cache(maxsize=None)
-def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, site: str,
-                           phase: str):
+def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, phase: str):
     """The jitted route-(c) program for one face stack and ``phase`` (:data:`PHASES`).
 
     ``rounds`` slices (:func:`distrib_la._batch_reshard.reshard_rounds_call`),
@@ -337,7 +338,7 @@ def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds
         attempts.append(partial(_gathered_eigh, mesh=mesh))
     attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[phase]
     return jax.jit(lambda a: checked("eigh", tuple(attempts), lambda r: _local_eigh_errors(a, *r, mesh=mesh),
-                                     (a,), site=site, constrain=eigh_layout(mesh, 3),
+                                     (a,), constrain=eigh_layout(mesh, 3),
                                      final=phase != "first"),
                    out_shardings=(out, replicated))
 
@@ -714,12 +715,10 @@ class Plan:
         if self.budget_bytes == 0 or in_checked_retry():
             # A checked program's retry is the whole-mesh program its caller sized.
             return StackRoute(static, room=0)
-        from distrib_la._result_check import call_site
         key = self._stack_key(op, nb, shape[-1], dtype, traced)
         decided = _STACK_ROUTES.get(key)
         if decided is None:
-            decided = _STACK_ROUTES[key] = self._decide_stack(
-                op, nb, key[3], key[4], call_site(), key[6])
+            decided = _STACK_ROUTES[key] = self._decide_stack(op, nb, key[3], key[4], key[6])
         return decided
 
     def _stack_key(self, op, nb, n, dtype, traced):
@@ -742,7 +741,7 @@ class Plan:
                 return decided.route
         return static
 
-    def _decide_stack(self, op, nb, n, dtype, site, phase) -> StackRoute:
+    def _decide_stack(self, op, nb, n, dtype, phase) -> StackRoute:
         """Route (c) at the most whole matrices per rank whose program fits the room on every rank.
 
         In lockstep over ranks (INVARIANTS 21): the candidates (whole
@@ -769,7 +768,7 @@ class Plan:
             if -(-m // ranks) * floor > room:
                 per_rank = min(per_rank - 1, room // floor)
                 continue
-            local, seconds = _sized_or_failed(op, self.mesh, nb, n, dtype, rounds, site, phase)
+            local, seconds = _sized_or_failed(op, self.mesh, nb, n, dtype, rounds, phase)
             agreed, = agreed_minimum((-int(local),), tag="eigh stack size")
             tried, compiled, wall = -(-m // ranks), -agreed, wall + seconds
             if compiled >= _SIZING_FAILED:
@@ -868,18 +867,18 @@ class Plan:
     def _program(self, fn, ops, kwargs, tag, site):
         """A checked entry as one cached program for an eager call; a traced caller inlines it.
 
-        Keyed by the call's signature, the plan's budget and the call site
-        (the refusal names it), so a repeated eager call compiles once.
+        Keyed by the call's signature only (the refusal names its site on the
+        host), so a repeated eager call compiles once from every call site.
         """
         if any(isinstance(o, jax.core.Tracer) for o in ops):
-            return fn(*ops, mesh=self.mesh, _site=site, _phase=traced_phase(), **kwargs)
+            return fn(*ops, mesh=self.mesh, _phase=traced_phase(), **kwargs)
         mesh = self.mesh
 
         def program(phase, donate):
             key = scan_signature(self.op, self.backend, mesh, ops, kwargs,
-                                 extra=(tag, phase, self.budget_bytes, site))
+                                 extra=(tag, phase))
             return cached_scan(key, lambda: jax.jit(
-                lambda *o: fn(*o, mesh=mesh, _site=site, _phase=phase, **kwargs),
+                lambda *o: fn(*o, mesh=mesh, _phase=phase, **kwargs),
                 donate_argnums=donate))
         if self.op != "eigh":
             return program("all", self.donates)(*ops)
@@ -895,11 +894,11 @@ class Plan:
         return program("retry", ())(*ops)
 
     def _checked_eigh(self, call, post):
-        from distrib_la._result_check import call_site, checked_eigh, eigh_layout, shifted
+        from distrib_la._result_check import checked_eigh, eigh_layout, shifted
         from distrib_la.matmul import matmul
         backend = self.backend
 
-        def safe(A, *, mesh, _site=None, _phase="all", **kwargs):
+        def safe(A, *, mesh, _phase="all", **kwargs):
             def solve(a, **extra):
                 return post(backend, *call(a, mesh=mesh, **kwargs, **extra))
             # Zero rows leave the solver as distinct sentinels (deflate_zero_rows),
@@ -927,20 +926,19 @@ class Plan:
             # An eager call's first program holds the first attempt; its retry
             # program the rest (Plan._program). A traced call holds them all.
             attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[_phase]
-            (values, vectors), failed = checked_eigh(attempts, A, site=_site or call_site(), mesh=mesh,
-                                                     final=_phase != "first")
+            (values, vectors), failed = checked_eigh(attempts, A, mesh=mesh, final=_phase != "first")
             return values, vectors, failed
         return safe
 
     def _checked_solve(self, call):
-        from distrib_la._result_check import call_site, checked, matrix_sketch, rhs_sketch, solve_errors
+        from distrib_la._result_check import checked, matrix_sketch, rhs_sketch, solve_errors
 
-        def safe(A, B, *, mesh, _site=None, _phase="all", **kwargs):
+        def safe(A, B, *, mesh, _phase="all", **kwargs):
             # The sketch is taken before the call, which may consume A and B.
             sketch = (*matrix_sketch(A), *rhs_sketch(B))
             X = call(A, B, mesh=mesh, **kwargs)
             return checked("solve_lu", (lambda x: x,), lambda x: solve_errors(sketch, x),
-                           (X,), site=_site or call_site(), n=A.shape[-1], dtype=A.dtype)
+                           (X,), n=A.shape[-1], dtype=A.dtype)
         return safe
 
     def __call__(self, A, *args, **kwargs):
@@ -1051,13 +1049,13 @@ class Plan:
                 site = call_site()
                 if self.op != "eigh" or isinstance(A, jax.core.Tracer):
                     phase = traced_phase() if isinstance(A, jax.core.Tracer) else "all"
-                    return self._finish(self._scan_over_single(ops, kwargs, site=site, phase=phase), A, site)
+                    return self._finish(self._scan_over_single(ops, kwargs, phase=phase), A, site)
                 # Eager: the retries run as a second scan only when a matrix failed.
-                out = self._scan_over_single(ops, kwargs, site=site, phase="first")
+                out = self._scan_over_single(ops, kwargs, phase="first")
                 if _flag(out[-1]):
                     _notices(out[-1], self.op, int(A.shape[-1]), A.dtype, site, final=False)
                     del out
-                    out = self._scan_over_single(ops, kwargs, site=site, phase="retry")
+                    out = self._scan_over_single(ops, kwargs, phase="retry")
                 return self._finish(out, A, site)
             return self._scan_over_single(ops, kwargs)
         raise AssertionError(f"unhandled batched route {route!r}")
@@ -1085,14 +1083,14 @@ class Plan:
         shape, dtype, site = tuple(int(v) for v in A.shape), str(A.dtype), call_site()
 
         def program(phase):
-            return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), site, phase)
+            return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), phase)
         if op == "normal_eigh":
             return program("all")(A)
         if isinstance(A, jax.core.Tracer):
             values_vectors, failed = program(traced_phase())(A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
             return values_vectors
-        executable = _EXECUTABLES.get(_program_key(op, self.mesh, shape, dtype, rounds, site, "first"))
+        executable = _EXECUTABLES.get(_program_key(op, self.mesh, shape, dtype, rounds, "first"))
         if executable is None or not A.sharding.is_equivalent_to(face, 3):
             executable = program("first")
         values_vectors, failed = executable(A)
@@ -1131,7 +1129,7 @@ class Plan:
         ops = tuple(ensure_sharding(x, self.batch_in_sharding) for x in ops)
         return batch_reshard_call(self.op, self.mesh, ops)
 
-    def _scan_over_single(self, ops: tuple, kwargs: dict, *, site=None, phase="all"):
+    def _scan_over_single(self, ops: tuple, kwargs: dict, *, phase=None):
         """Route (a): ``lax.scan`` over this plan's own single-matrix call.
 
         The body is exactly what :meth:`__call__` does to one tile —
@@ -1167,7 +1165,7 @@ class Plan:
         def _build():
             def _one_matrix(carry, tiles):
                 # A checked entry returns its failure flag too; the scan stacks it.
-                extra = {} if site is None else {"_site": site, "_phase": phase}
+                extra = {} if phase is None else {"_phase": phase}
                 out = one(*(ensure_sharding(t, tile) for t in tiles),
                           mesh=mesh, **extra, **kwargs)
                 return carry, (post(backend, *out) if post is not None
@@ -1183,9 +1181,7 @@ class Plan:
 
             return jax.jit(_scanned)
 
-        # The budget sets the retry chain and the site is named by a refusal.
-        key = scan_signature(self.op, self.backend, mesh, ops, kwargs,
-                             extra=(self.budget_bytes, site, phase))
+        key = scan_signature(self.op, self.backend, mesh, ops, kwargs, extra=(phase,))
         return cached_scan(key, _build)(*ops)
 
 

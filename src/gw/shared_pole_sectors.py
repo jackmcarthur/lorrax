@@ -717,7 +717,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
     if execution == 'face':
-        reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
+        reduced=face_reduce_round(states,infinity,tables,mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
             gram_keep=gram_keep,admit=False,room=budget.face_room,
             carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget']))

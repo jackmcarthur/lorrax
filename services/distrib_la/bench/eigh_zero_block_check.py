@@ -89,7 +89,7 @@ def main():
     line("plan", w[0], v[0], lambda values, r, o: (
         r <= accept(n) and o <= accept(n) and np.max(np.abs(values - reference)) <= 1e-12))
 
-    line("guard", *jax.jit(lambda x: checked_eigh([bare, retry], x, site="bench guard", mesh=mesh)[0])(A),
+    line("guard", *jax.jit(lambda x: checked_eigh([bare, retry], x, mesh=mesh)[0])(A),
          lambda values, r, o: np.max(np.abs(values - reference)) <= 1e-12 and r <= accept(n) and o <= accept(n))
 
     # A small-norm zero-row matrix (1/c-scaled transverse metrics): the
@@ -112,7 +112,7 @@ def main():
         return values, jnp.roll(vectors, 1, axis=-1)
     # Inside a jit the refused result comes back NaN on every rank; an eager
     # caller (Plan, factor/solve) then raises the GATE by name.
-    (w, v), flag = jax.jit(lambda x: checked_eigh([wrong], x, site="bench refuse", mesh=mesh))(A)
+    (w, v), flag = jax.jit(lambda x: checked_eigh([wrong], x, mesh=mesh))(A)
     poisoned = bool(np.isnan(np.asarray(gather_to_host(w))).all())
     try:
         raise_if_failed(flag, "eigh", n, A.dtype, "bench refuse")

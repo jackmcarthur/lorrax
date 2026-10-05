@@ -400,7 +400,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
     return face_program(body,mesh,outputs='parent')
 
 
-def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_moments,
+def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
                       keep_budget,retain_span=False,admit=True,gram_keep=None,room=None,carrier=None):
     """A batch of physical parents with every matrix tiled over all ranks.
 
@@ -408,9 +408,9 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
     (``face_eigh``), or a function of this round's program size: its
     whole-chain program on the whole mesh, compiled on the arrays it runs,
     which is also its retry. ``carrier`` is the kept-span width of an
-    ordered reduction (``face_ritz_carrier``), None solving the whole H'_vv side."""
-    if real != len(tables['own']):
-        raise ValueError('distributed constructor batches contain physical parents only')
+    ordered reduction (``face_ritz_carrier``), None solving the whole H'_vv side.
+    A short last round's synthetic slots repeat its last parent; callers read
+    only the leading real slots."""
     side=tables['active'].shape[-1]
     if admit:
         budget.plan(side,phase='reduction')
@@ -444,21 +444,21 @@ def face_round_check_program(mesh, ordered, eigh_plan):
 
 
 def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_width=1):
-    """Schedule local parent rounds or bounded batches on the whole mesh."""
+    """Schedule local parent rounds or bounded batches on the whole mesh.
+
+    Every round has one width (P local slots, ``batch_width`` face parents):
+    a short last round repeats its last real parent, and every consumer reads
+    only its ``real`` leading slots, so no round program compiles for a
+    ragged tail. Every parent's minus-q actions are in its own bank panels,
+    so no round needs another parent."""
     from gw.shared_pole_local import parent_rounds
     from gw.gw_config import linalg_resolution
     resolution=linalg_resolution({'linalg':config.backend.linalg})
     execution = resolution.layout if execution is None else execution
-    if execution == 'local':
-        return [(*row,'local') for row in parent_rounds(header['n_q_irr'],mesh.size)]
-    if execution not in ('distributed', 'face'):
+    if execution not in ('local', 'distributed', 'face'):
         raise ValueError('unsupported resolved constructor linalg layout')
-    # Every parent's minus-q actions are in its own bank panels; face parents
-    # need neither simultaneous partner parents nor artificial rank padding.
-    nq = int(header['n_q_irr'])
-    return [(list(range(q, min(q + batch_width, nq))), min(batch_width, nq-q),
-             np.arange(min(batch_width, nq-q), dtype=np.int64), 'face')
-            for q in range(0, nq, batch_width)]
+    label, width = ('local', mesh.size) if execution == 'local' else ('face', batch_width)
+    return [(*row, label) for row in parent_rounds(header['n_q_irr'], width)]
 
 
 def _spec(mesh, shape, dtype=jnp.complex128, spec=P(None, 'x', 'y')):
