@@ -237,7 +237,10 @@ and agree to round-off.
 (W 25)–(W 26) for an ordered bank, from `Q`, `O`, `D` and the moments only;
 blocks come out `P(None,'x','y')` on either route.
 `gw.shared_pole_reduction` applies
-(W 20): diagonal equilibration, keep cut `normalized_gram_keep`, the coupled
+(W 20): diagonal equilibration, keep cut `normalized_gram_keep` and the pole
+budget (the largest `pole_budget` directions, less an edge member tied to its
+neighbour below the cut within `multiplet_relative_tolerance` or the eigh's
+$R u \gamma_{\max}$, so a degenerate multiplet is never split), the coupled
 Newton–Schulz inverse root (iteration count fixed from the initial
 infinity-norm bound, never from an on-device residual), and one Hermitian
 `eigh`. The ordered route applies the paired basis (W 28), the cut on the
@@ -287,7 +290,8 @@ and sorts its poles; synthetic slots are skipped. Otherwise the **face route**
 runs a parent batch on the complete mesh with `distrib_la` GEMM/`eigh`, both
 matrix axes distributed and only spectra and masks replicated. An ordered
 face reduction solves its kept span on `face_ritz_carrier` (the pole budget
-with its per-rank tile on the extent ladder), as a local round does on its
+with its per-rank tile on the extent ladder; the whole side on the `relaxed`
+tier, which has no budget), as a local round does on its
 Ritz carrier: the Schur and final eighs run at the carrier and twice it
 (CrI3 24×24 on 4×4: 6144 and 12288 instead of 9152 and 18304). Its eigh stacks
 (infinity, directions, partners, passivity, the Gram reduction, CT and the

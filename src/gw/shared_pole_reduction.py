@@ -131,10 +131,25 @@ def gram_rounding_floor(scale, rounding, output_norm, *, finite):
 
 
 def _within_budget(gamma, budget):
-    """The largest ``budget`` entries of each ascending spectrum row (all when None)."""
-    if budget is None:
+    """The largest ``budget`` entries of each ascending spectrum row (all when None),
+    closed downward over the edge multiplet: an entry tied to its neighbour below
+    the cut (the direction selection's relative multiplet tolerance, or within
+    the eigensolver's R u gamma_max) leaves with it.  The kept span then never
+    depends on the eigenbasis a solver route chose inside a degenerate multiplet,
+    and K <= budget, so every carrier sized on the budget still holds it."""
+    side = gamma.shape[-1]
+    if budget is None or int(budget) >= side:
         return True
-    return jnp.arange(gamma.shape[-1])[None, :] >= gamma.shape[-1] - int(budget)
+    from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    edge = side - int(budget)
+    lo, hi = gamma[:, edge - 1:-1], gamma[:, edge:]
+    tied = jnp.abs(hi - lo) <= jnp.maximum(
+        shared_real_pole_v1_r3b["multiplet_relative_tolerance"] * jnp.maximum(jnp.abs(hi), jnp.abs(lo)),
+        side * _UNIT_ROUNDOFF * jnp.abs(gamma[:, -1:]))
+    dropped = jnp.sum(jnp.cumprod(tied, axis=-1), axis=-1)
+    # One tied run over the whole kept set has no multiplet edge: the index cut stays.
+    dropped = jnp.where(dropped < int(budget), dropped, 0)
+    return jnp.arange(side)[None, :] >= edge + dropped[:, None]
 
 
 def _validity_floor(scale, rounding, output_norm, largest, *, gates):
