@@ -7,7 +7,7 @@ release end in :func:`common.collectives.agree_io_error`, which every rank
 calls at the same point (INVARIANTS 21).
 
 Layout per device: a record is segment ``s``'s ``[q, rows_s, cols_s]`` tile
-of output ``o``, padded to 4 KiB, at ``o·S + start_s`` (``S = Σ_s
+of output ``o``, padded to the page size, at ``o·S + start_s`` (``S = Σ_s
 padded_s``), so outputs ``[o0, o1)`` are one contiguous run.  On read, each
 segment's rectangles go back to their places in the local tile.
 
@@ -23,7 +23,7 @@ platform and filesystem accept it (aligned pieces; else plain buffered I/O),
 a 4 x 4 MiB stripe layout where ``lfs`` exists, a reservation of every byte
 where ``fallocate`` works, and a capacity check against the filesystem's free
 space and, where ``lfs`` exists, the room under the user's Lustre quota (Lustre
-here has no fallocate), less the bytes live stores have promised; a bank the
+here has no fallocate), less the bytes live sparse stores have promised; a bank the
 disk or quota cannot hold is refused on every rank before any compute
 (:attr:`StreamedBank.fits`).
 """
@@ -61,15 +61,6 @@ PIECES_IN_FLIGHT = 4    # pieces staged per rank before the next is moved
 
 def padded(nbytes: int, align: int) -> int:
     return -(-int(nbytes) // int(align)) * int(align)
-
-
-def _alignment(directory):
-    """Direct-I/O alignment here: the larger of the page size and the filesystem block."""
-    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
-    try:
-        return max(int(page), int(os.statvfs(_existing(directory)).f_bsize))
-    except OSError:
-        return int(page)
 
 
 def _digest(flat):
@@ -175,22 +166,26 @@ def _aligned(nbytes):
 
 
 def _reserve(fd, nbytes):
-    """Allocate every byte where ``fallocate`` exists (never emulated by writing)."""
+    """Allocate every byte where ``fallocate`` exists (never emulated by writing);
+    True when the bytes are allocated, False when the file stays sparse."""
     try:
         fallocate = ctypes.CDLL(None, use_errno=True).fallocate
     except (OSError, AttributeError):
-        return
+        return False
     fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
     if fallocate(int(fd), 0, 0, int(nbytes)) != 0:
         err = ctypes.get_errno()
         if err not in (errno.EOPNOTSUPP, errno.ENOSYS):
             raise OSError(err, f"GATE streamed_bank_capacity: cannot reserve {nbytes} bytes: "
                                f"{os.strerror(err)}")
+        return False
+    return True
 
 
-#: Bytes this process's live file stores have promised: a store's file stays
-#: sparse (and outside the quota) until it is written, so the free space a new
-#: store sees must leave them out.
+#: Bytes this process's live sparse file stores have promised: where fallocate
+#: fails the file stays sparse (and outside the quota) until it is written, so
+#: the free space a new store sees must leave them out.  A reserved store's
+#: bytes have already left the free space and are not promised again.
 _PROMISED = [0]
 _PROMISE_LOCK = threading.Lock()
 
@@ -205,8 +200,9 @@ def _existing(directory):
 
 def _free_bytes(directory):
     """Bytes the user may still write under ``directory``: the filesystem's free space
-    and, where ``lfs`` exists, the room under the Lustre user quota (soft limit, else
-    hard); ``-1`` when neither is known. Lustre here has no fallocate, so this is the
+    and, where ``lfs`` exists, the room under the Lustre user quota (hard limit, else
+    soft: Lustre writes past the soft limit in its grace period); ``-1`` when neither
+    is known. Lustre here has no fallocate, so this is the
     capacity probe."""
     free, directory = None, _existing(directory)
     try:
@@ -220,7 +216,7 @@ def _free_bytes(directory):
                                     capture_output=True, text=True, timeout=60).stdout.split()
             used, soft, hard = (1024 * int(v.rstrip("*")) for v in fields[1:4])
             if soft or hard:
-                room = (soft or hard) - used
+                room = (hard or soft) - used
                 free = room if free is None else min(free, room)
         except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             pass
@@ -236,6 +232,7 @@ class _Store:
 
     def __init__(self, path, nbytes, kind):
         self.path, self.fd, self.host, self.direct = Path(path), None, None, False
+        self.reserved = False
         self._lock = threading.Lock()
         if kind == "host":
             self.host = _aligned(nbytes)
@@ -259,7 +256,7 @@ class _Store:
         # descriptor, so no way the process ends (refusal, kill, SIGKILL) leaves them.
         os.unlink(self.path)
         try:
-            _reserve(self.fd, nbytes)
+            self.reserved = _reserve(self.fd, nbytes)
         except OSError:
             self.close()
             raise
@@ -339,12 +336,13 @@ class StreamedBank:
         # A store that is read before every record is written (the W bank) reads
         # unwritten records as the zeros the reservation holds (digest 0).
         self.unwritten_zero = bool(unwritten_zero)
-        # One alignment on every rank (the largest page or filesystem block), so the
-        # record offsets are the same everywhere.
-        # One all-gather agrees the alignment (the largest on any rank), rank 0's
-        # free bytes and every process's promised bytes, so the capacity verdict
-        # below is the same on every rank.
-        probe = (_alignment(root) if kind == "file" else mmap.PAGESIZE,
+        # Records are page-aligned, the direct-I/O alignment; never the filesystem
+        # block (16 MiB on GPFS would pad every record to it), and a filesystem that
+        # wants more takes the buffered fallback (_Store._call).  One all-gather
+        # agrees the alignment (the largest page on any rank), rank 0's free bytes
+        # and every process's promised bytes, so the record offsets and the
+        # capacity verdict below are the same on every rank.
+        probe = (mmap.PAGESIZE,
                  _free_bytes(root) if kind == "file" and jax.process_index() == 0 else 0,
                  _PROMISED[0])
         agreed = np.asarray(all_gather_processes(np.asarray(probe, np.int64))).reshape(-1, 3)
@@ -385,7 +383,7 @@ class StreamedBank:
             self._refused = str(exc)
             self._close_stores()
             self.fits = False
-        self.promised = self.nbytes * len(self.stores) if kind == "file" else 0
+        self.promised = self.nbytes * sum(not s.reserved for s in self.stores.values()) if kind == "file" else 0
         _PROMISED[0] += self.promised
 
     def receipt(self):
