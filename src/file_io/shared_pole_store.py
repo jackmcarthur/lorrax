@@ -1383,6 +1383,7 @@ class ResidentBankPayload:
         self.root = root
         self.header_json = None
         self.fits = True
+        self._late_host = False
         self._fields = {}
         self._logical = {}
         self._stored = {}
@@ -1463,9 +1464,12 @@ class ResidentBankPayload:
                 # (agreed on every rank at creation), never refused mid-map.
                 store.release()
                 store = self._tier_store(name, stored, "host")
-                if jax.process_index() == 0:
-                    print(f"WARNING {self}: {name} ({16 * int(np.prod(stored)) / 2**30:.3f} GiB) "
-                          "refused by the filesystem (capacity); held in host memory", flush=True)
+                if jax.process_index() == 0 and not self._late_host:
+                    # A RuntimeWarning, so the production report's WARNINGS block keeps it.
+                    import warnings
+                    warnings.warn(f"{self}: {name} and any later field the filesystem refuses "
+                                  "(capacity) are held in host memory", RuntimeWarning, stacklevel=2)
+                self._late_host = True
         self._fields[name] = store
         self._logical[name] = shape
         self._stored[name] = stored

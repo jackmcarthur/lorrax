@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
@@ -81,7 +82,6 @@ def test_reserved_bytes_are_not_promised_twice(tmp_path, monkeypatch):
     try:
         assert a.fits
         if allocated() < per_store:
-            import pytest
             pytest.skip("fallocate does not allocate under the test's tmp_path")
         assert a.promised == 0                 # its bytes left statvfs at once
         b = _bank(root, "b", 16)
@@ -139,7 +139,8 @@ def test_late_bank_field_refused_by_the_disk_is_held_in_host_memory(tmp_path, mo
                                            NamedSharding(mesh, P(None, None, "x", "y")))
         pay.write_slab("Wc", put((nq, ns, d, d)), offset=(0, 0, 0, 0))
         panel = (nq, 3, d, 8)                      # a line sample's panels, made at first write
-        pay.create_dataset("line_charge_003", shape=panel, dtype=np.complex128)
+        with pytest.warns(RuntimeWarning, match="held in host memory"):
+            pay.create_dataset("line_charge_003", shape=panel, dtype=np.complex128)
         assert pay._fields["line_charge_003"].kind == "host"
         pay.write_slab("line_charge_003", put(panel), offset=(0, 0, 0, 0))
         with pay:
