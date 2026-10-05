@@ -16,7 +16,7 @@ the two carrier-comparison spellings were retired, ``gw_config``'s
 
 * ``bare_transverse`` (default), ``full_static_cohsex`` (the packed
   static photon mode) and ``full_shared_pole``: charge and currents on the
-  normalized kinetic-balance lift
+  normalized restricted-kinetic-balance (RKB) lift
   ``Psi = [I; X](I + X^dagger X)^(-1/2) Psi_L``, ``X = (alpha_FS/2) sigma.p``,
   and the four-spinor scalar head/dipole artifact
   (``scalar_head_bispinor = True``).
@@ -37,8 +37,8 @@ altitude.
 
 from dataclasses import dataclass
 
-ISOMETRIC_FOUR_CURRENT_REPRESENTATION = (
-    "isometric_kinetic_balance_four_current_v1")
+NORMALIZED_RKB_FOUR_CURRENT_REPRESENTATION = (
+    "normalized_rkb_four_current_v1")
 SOURCE_WFN_CHARGE_REPRESENTATION = "source_wfn_normalized_charge_v1"
 
 
@@ -47,7 +47,7 @@ class FourCurrentRepresentation:
     """Resolved carrier choices for one GW model.
 
     Charge and current body carriers are named separately so each consumer
-    reads the one it contracts; today both are the isometric lift.
+    reads the one it contracts; today both are the normalized RKB lift.
     ``scalar_head_bispinor`` separately governs the canonical scalar
     dipole/head producer.  Keeping those decisions together is what stops
     preprocessing, ISDF, Hartree, and Sigma from inventing local model maps.
@@ -72,7 +72,7 @@ def resolve_four_current_representation(
     sites keep naming the mode they resolved -- when a phase-3 mode needs a
     different carrier, this is the one function that has to learn about it.
     """
-    from common.bispinor_init import ISOMETRIC_KINETIC_BALANCE_LIFT
+    from common.bispinor_init import NORMALIZED_RKB_LIFT
 
     if not bool(bispinor):
         return FourCurrentRepresentation(
@@ -85,9 +85,9 @@ def resolve_four_current_representation(
         )
     return FourCurrentRepresentation(
         charge_bispinor=True,
-        charge_lift=ISOMETRIC_KINETIC_BALANCE_LIFT,
+        charge_lift=NORMALIZED_RKB_LIFT,
         current_bispinor=True,
-        current_lift=ISOMETRIC_KINETIC_BALANCE_LIFT,
+        current_lift=NORMALIZED_RKB_LIFT,
         scalar_head_bispinor=True,
-        charge_representation=ISOMETRIC_FOUR_CURRENT_REPRESENTATION,
+        charge_representation=NORMALIZED_RKB_FOUR_CURRENT_REPRESENTATION,
     )

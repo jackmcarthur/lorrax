@@ -27,7 +27,7 @@ $$
 
 $\psi_L$ is the noncollinear DFT two-spinor (spin–orbit in the
 pseudopotential). Every vertex, charge and current, takes one carrier, the
-normalized lift (`ISOMETRIC_KINETIC_BALANCE_LIFT`;
+normalized RKB lift (`NORMALIZED_RKB_LIFT`;
 `common.four_current_model.resolve_four_current_representation`,
 `common.bispinor_init.lift_to_4spinor`):
 
@@ -44,6 +44,25 @@ scalar $r$ on each plane wave. The lift is an isometry,
 $\langle\Psi_m|\Psi_n\rangle=\langle\psi_{Lm}|\psi_{Ln}\rangle$: the lifted
 bands stay orthonormal and the four-component density integrates to the
 electron count. Negative-energy states are absent (no-pair).
+
+**Name and references.** $[I;X]\psi_L$ is restricted kinetic balance (RKB),
+the small component of Stanton and Havriliak, J. Chem. Phys. 81, 1910 (1984),
+doi:10.1063/1.447865. The factor $(I+X^\dagger X)^{-1/2}$ is the
+renormalization of the normalized elimination of the small component (NESC),
+Dyall, J. Chem. Phys. 106, 9618 (1997), doi:10.1063/1.473860, and of exact
+two-component (X2C) theory, Kutzelnigg and Liu, J. Chem. Phys. 123, 241102
+(2005), doi:10.1063/1.2137315; Iliaš and Saue, J. Chem. Phys. 126, 064102
+(2007), doi:10.1063/1.2436882. In an orthonormal plane-wave basis, with the
+small component written directly as $X\psi_L$, the X2C renormalization
+$R=(S^{-1}\tilde S)^{-1/2}$ reduces to $(I+X^\dagger X)^{-1/2}$. The lift
+is therefore the X2C positive-energy column $[I;X]R$ with the RKB decoupling
+$X=\boldsymbol\sigma\cdot\mathbf p/2c$ (Hartree units) in place of the
+exact one. It is not the free-particle Foldy–Wouthuysen state
+(Phys. Rev. 78, 29 (1950), doi:10.1103/PhysRev.78.29), whose
+$X=c\,\boldsymbol\sigma\cdot\mathbf p/(E+c^2)$ agrees with the RKB $X$ only
+to leading order in $p/c$. Until the 2026-10-05 rename the code called this
+construction the "isometric" lift (stamp
+`isometric_kinetic_balance_four_current_v1`); the construction is the same.
 
 The fully relativistic pseudopotential is a Dirac–Coulomb atom with no
 Breit term. The Coulomb and Hartree terms use the normalized four-component

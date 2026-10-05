@@ -16,8 +16,9 @@ The GW driver's phase invariants and the per-function contracts of
 
 **Rule (owner).** The Coulomb interaction and the Hartree field are evaluated
 with the normalized four-component wavefunctions
-$\Psi=[I;X](I+X^\dagger X)^{-1/2}\psi_L$, $X=(\alpha_{\rm FS}/2)\boldsymbol\sigma\cdot\mathbf p$,
-as prior four-component GW does. The current vertices take the same carrier,
+$\Psi=[I;X](I+X^\dagger X)^{-1/2}\psi_L$, $X=(\alpha_{\rm FS}/2)\boldsymbol\sigma\cdot\mathbf p$
+(the normalized RKB lift; name and references in
+[theory](../theory/bispinor-gw.md#lift)), as prior four-component GW does. The current vertices take the same carrier,
 so the direct field is the four-current Hartree $V_H[\rho]+\boldsymbol\alpha\cdot\mathbf A[J]$
 of one $\Psi$ ([theory](../theory/bispinor-gw.md#lift)).
 

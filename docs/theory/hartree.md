@@ -17,7 +17,7 @@ $$
 
 $f_{n\mathbf k}$ is the physical occupation, fractional on a metal; the
 screening band window does not truncate the density. On bispinor decks
-$\psi$ is the normalized four-component lift
+$\psi$ is the normalized RKB four-component lift
 ([carrier](bispinor-gw.md#lift)), and $\rho$ and $J$ come from one scan of
 it: the direct field is the full four-current Hartree
 $V_H[\rho]+\boldsymbol\alpha\cdot\mathbf A[J]$ on one carrier, and

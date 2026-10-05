@@ -18,7 +18,7 @@ is the q-IBZ count, $N_k$ the full k count, and $P$ the process count.
 `bispinor_gw ∈ {bare_transverse, full_static_cohsex, full_shared_pole}`
 (`gw_config.BispinorGWMode`). The value selects which Lorentz blocks are
 screened and who contracts Σ; every value resolves to the same normalized
-kinetic-balance carrier. The retired spellings `charge_hall_cubature`,
+RKB carrier. The retired spellings `charge_hall_cubature`,
 `pauli_reference_bare_transverse` and
 `isometric_kinetic_balance_bare_transverse` refuse by name
 (`_RETIRED_BISPINOR_GW_MODES`, read by `coerce_bispinor_gw_mode`), and each
@@ -89,7 +89,7 @@ flowchart TD
   end
   subgraph INIT["gw_init"]
     C["charge + current centroids"]
-    L["four-spinor parents (charge and current: normalized kinetic-balance lift)"]
+    L["four-spinor parents (charge and current: normalized RKB lift)"]
     Z["zeta_q.h5 + zeta_q_mu{1,2,3}.h5"]
     VQ["v_q_bispinor.h5: 7 unique tiles + photon_g0_vectors"]
   end
@@ -153,8 +153,8 @@ returns a frozen `FourCurrentRepresentation` with the fields
 `charge_bispinor`, `charge_lift`, `current_bispinor`, `current_lift`,
 `scalar_head_bispinor` and `charge_representation`. It has two outcomes:
 scalar (all false, source-WFN charge) and bispinor (charge and currents on
-the normalized lift `isometric`, stamp
-`isometric_kinetic_balance_four_current_v1`;
+the normalized RKB lift `normalized_rkb`, stamp
+`normalized_rkb_four_current_v1`;
 [theory](../theory/bispinor-gw.md#lift)). `model` is accepted and ignored.
 The resolver exists because the lift and the stamp are what the ζ, restart
 bundle, SC checkpoint and Hall-artifact authenticators compare, and they
@@ -421,7 +421,7 @@ driver entry.
 | `bispinor_head_correction_no_local_fields_unavailable` | `refuse_unsupported_bispinor_gw` | `no_local_fields` on any bispinor route except SP-hybrid and SP-full |
 | `bispinor_self_consistency_requires_live_four_current` | same | bispinor QSGW with `density_self_consistent = false` |
 | `bare_tt_gamma_restart_unstamped` | same | `restart = true` where the bare TT overlay is on (`x_only`, B with GN/HL): restart $V$ does not stamp it |
-| `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not `isometric_kinetic_balance_four_current_v1` (every bispinor bundle written before 2026-10-05) |
+| `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not `normalized_rkb_four_current_v1` (every bispinor bundle written before this name, including the 2026-10-05 `isometric_kinetic_balance_four_current_v1` bundles) |
 | `full_shared_pole_envelope` / `full_shared_pole_head` | same | `full_shared_pole` without bispinor, MPA, `sigma_w_model = shared_pole` and `w_rpa`; or with an explicit `head_correction = full` (unset resolves to `no_local_fields`, logged) |
 | `bispinor_gw_requires_bispinor` | same | `full_static_cohsex` with `bispinor = false` |
 | `static_bispinor_photon_head_slab_only` | same | P-screened with `head_correction = full` and `sys_dim ≠ 2` |

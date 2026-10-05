@@ -233,9 +233,8 @@ _RETIRED_BISPINOR_GW_MODES: dict[str, tuple[str, str, str]] = {
         "bispinor_gw = bare_transverse",
         "this was a carrier-comparison mode whose own scalar q->0 head was "
         "the two-spinor artifact -- a mode that admits its own head is not "
-        "a calculation.  The isometric lift itself remains library code "
-        "(common.bispinor_init.kinetic_balance_lift_jet) for the jet tests "
-        "that own it (lane J section 2)"),
+        "a calculation.  Its lift, then named 'isometric', is the normalized "
+        "RKB carrier every shipped mode now uses (lane J section 2)"),
 }
 
 

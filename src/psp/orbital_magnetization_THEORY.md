@@ -217,7 +217,7 @@ the metal's fixed-N Fermi–Dirac μ.
 `common.bispinor_init.apply_dirac_velocity_to_ket` applies `c alpha_i` to
 already lifted four-component kets; `c=2/alpha_fs` in Ry units. For the raw
 lift `[psi; (alpha_fs/2) sigma.p psi]`, its same-k band matrix is exactly
-`<psi|2 p_i|psi>`, by the Pauli anticommutator. Isometric normalization changes
+`<psi|2 p_i|psi>`, by the Pauli anticommutator. The normalized RKB lift changes
 that equality. Neither a bare Dirac current nor bare DFT velocity supplies
 the nonlocal QP velocity correction. The existing covariant-link derivative
 owns that correction; omitting it must be reported as an approximation.

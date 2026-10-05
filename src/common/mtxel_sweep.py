@@ -1028,7 +1028,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 
     from common.bispinor_init import (
         HALFALPHA,
-        ISOMETRIC_KINETIC_BALANCE_LIFT,
+        NORMALIZED_RKB_LIFT,
         RAW_KINETIC_BALANCE_LIFT,
         kinetic_balance_lift_provenance,
     )
@@ -1046,9 +1046,9 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     halfalpha = jnp.asarray(HALFALPHA, dtype=jnp.float64)
     lift_mode = str(kinetic_balance_lift).strip().lower()
     lift_provenance = kinetic_balance_lift_provenance(lift_mode)
-    isometric_lift = lift_mode == ISOMETRIC_KINETIC_BALANCE_LIFT
+    normalized_lift = lift_mode == NORMALIZED_RKB_LIFT
     if lift_mode not in (
-            RAW_KINETIC_BALANCE_LIFT, ISOMETRIC_KINETIC_BALANCE_LIFT):
+            RAW_KINETIC_BALANCE_LIFT, NORMALIZED_RKB_LIFT):
         raise AssertionError("kinetic-balance lift owner admitted a bad mode")
 
     def op(psi_n, gvec, gmask, bidx, kvec):
@@ -1087,7 +1087,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         ("uniform_gauge_current_contact" if contact_enabled
          else "uniform_gauge_current"), geom.ngkmax, geom.ns,
         float(blat), id(vnl_setup), sign)
-    if isometric_lift:
+    if normalized_lift:
         operator_key += ("kinetic_balance", lift_provenance)
     return Operator(
         apply=op, post=1.0,

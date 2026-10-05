@@ -34,15 +34,15 @@ NO_PAIR_DIRAC_CURRENT_MODEL = (
 KINETIC_BALANCE_LIFT_PROVENANCE = (
     "psi_S=(alpha_fs/2)*sigma.p*psi_L"
 )
-ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE = (
+NORMALIZED_RKB_LIFT_PROVENANCE = (
     "Psi=[I;X](I+X^dagger*X)^(-1/2)*psi_L;X=(alpha_fs/2)*sigma.p"
 )
 RAW_KINETIC_BALANCE_LIFT = "raw"
 # The carrier of every bispinor vertex (docs/theory/bispinor-gw.md#lift).
-ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"
+NORMALIZED_RKB_LIFT = "normalized_rkb"
 LIFT_PROVENANCE = {
     RAW_KINETIC_BALANCE_LIFT: KINETIC_BALANCE_LIFT_PROVENANCE,
-    ISOMETRIC_KINETIC_BALANCE_LIFT: ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
+    NORMALIZED_RKB_LIFT: NORMALIZED_RKB_LIFT_PROVENANCE,
 }
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
@@ -75,7 +75,7 @@ def apply_dirac_velocity_to_ket(psi):
         for alpha in (gamma1, gamma2, gamma3)))
 
 
-def _isometric_kinetic_balance_factor(K_cart_bohr_inv):
+def _normalized_rkb_factor(K_cart_bohr_inv):
     """The sole pointwise ``(I + X^dagger X)^(-1/2)`` spelling."""
     K = jnp.asarray(K_cart_bohr_inv)
     h2 = jnp.float64(HALFALPHA) ** 2
@@ -121,7 +121,7 @@ def kinetic_balance_lift_jet(
 
     ``psi_L`` is the large block *in the selected representation* at the
     expansion point.  For ``raw`` it is the source Pauli spinor.  For
-    ``isometric`` it is already ``r(K) psi_source``; the function must not
+    ``normalized_rkb`` it is already ``r(K) psi_source``; the function must not
     normalize it a second time.  Holding ``psi_source`` fixed, the lifted
     endpoint is
 
@@ -140,7 +140,7 @@ def kinetic_balance_lift_jet(
     The bounded selector lets that operator consume a derivative immediately
     instead of materializing a three- or nine-WFN jet.
 
-    For the isometric representation,
+    For the normalized_rkb representation,
 
     ``r=(1+h^2 K^2)^(-1/2)``,
     ``r_a/r=-h^2 K_a r^2``, and
@@ -195,7 +195,7 @@ def kinetic_balance_lift_jet(
         return jnp.zeros_like(lifted)
 
     h2 = jnp.float64(HALFALPHA) ** 2
-    r = _isometric_kinetic_balance_factor(K)
+    r = _normalized_rkb_factor(K)
     r2 = r * r
 
     def first(axis: int):
@@ -257,7 +257,7 @@ def lift_to_4spinor(
 
     Appends ``ψ_S = (α/2)(σ·(k+G)) ψ_L`` to the large components.
     The default ``representation='raw'`` is the historical map, unchanged.
-    ``representation='isometric'`` applies the pointwise scalar
+    ``representation='normalized_rkb'`` applies the pointwise scalar
 
     ``r(G) = 1/sqrt(1 + [(α/2)|k+G|]^2)``
 
@@ -298,5 +298,5 @@ def lift_to_4spinor(
     lifted = jnp.concatenate([psi_2, psi_S], axis=2)
     if mode == RAW_KINETIC_BALANCE_LIFT:
         return lifted
-    r = _isometric_kinetic_balance_factor(p_cart)
+    r = _normalized_rkb_factor(p_cart)
     return lifted * r[:, None, None, :]

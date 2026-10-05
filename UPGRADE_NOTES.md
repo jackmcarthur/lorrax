@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — the bispinor carrier is named the normalized RKB lift
+
+The four-component carrier $[I;X](I+X^\dagger X)^{-1/2}\psi_L$ was called
+the "isometric" lift. It is now the normalized restricted-kinetic-balance
+(RKB) lift, after the RKB and X2C/NESC literature
+(docs/theory/bispinor-gw.md §1). The construction and every number are
+unchanged.
+- Code: `NORMALIZED_RKB_LIFT = "normalized_rkb"` and
+  `NORMALIZED_RKB_FOUR_CURRENT_REPRESENTATION` replace the `ISOMETRIC_*`
+  names. No deck key changes.
+- Files. The charge-carrier stamp is now `normalized_rkb_four_current_v1`.
+  A bispinor restart bundle stamped `isometric_kinetic_balance_four_current_v1`
+  refuses with `GATE restart_bispinor_charge_carrier`; set `restart = false`
+  once. A bispinor SC checkpoint with the old stamp does not continue: the
+  trajectory restarts from the seed, with a warning. The lift provenance
+  that ζ and Hall artifacts carry is the formula string, which is unchanged.
+
 ## 2026-10-05 — checked-solve programs are stored by the persistent compile cache
 
 distrib_la's checked eigh and LU solves printed their retry notices and their
