@@ -419,6 +419,7 @@ driver entry.
 | `bispinor_head_correction_no_local_fields_unavailable` | `refuse_unsupported_bispinor_gw` | `no_local_fields` on any bispinor route except SP-hybrid and SP-full |
 | `bispinor_self_consistency_requires_live_four_current` | same | bispinor QSGW with `density_self_consistent = false` |
 | `bare_tt_gamma_restart_unstamped` | same | `restart = true` where the bare TT overlay is on (`x_only`, B with GN/HL): restart $V$ does not stamp it |
+| `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not the large-block charge (every bispinor bundle written before 2026-10-04) |
 | `full_shared_pole_envelope` / `full_shared_pole_head` | same | `full_shared_pole` without bispinor, MPA, `sigma_w_model = shared_pole` and `w_rpa`; or with an explicit `head_correction = full` (unset resolves to `no_local_fields`, logged) |
 | `bispinor_gw_requires_bispinor` | same | `full_static_cohsex` with `bispinor = false` |
 | `static_bispinor_photon_head_slab_only` | same | P-screened with `head_correction = full` and `sys_dim ≠ 2` |
