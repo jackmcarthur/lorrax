@@ -763,6 +763,10 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
             if not charge:
                 opts.pop('band_brackets',None)
                 opts.pop('band_counts',None)
+                import os
+                if os.environ.get('BISPSIG_SECTOR_EPS'):
+                    # BISPSIG measurement (not for main): the current sectors' rules at a looser eps.
+                    opts['quadrature_eps']=float(os.environ['BISPSIG_SECTOR_EPS'])
             sessions=opts.pop('fixed_quadrature_session',None)
             if sessions is not None:opts['fixed_quadrature_session']=sessions.setdefault('_'.join(names),{})
             value=compute_sigma_c_mpa_omega_grid(families[a],sectors[names[0]]['path'],meta,mesh_xy,
