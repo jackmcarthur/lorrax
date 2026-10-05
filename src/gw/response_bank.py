@@ -92,7 +92,7 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
 def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     """Reuse compiled algebra across SC maps without retaining state arrays."""
     from types import SimpleNamespace
-    from distrib_la import batch_layout, local_batch, matmul, plan
+    from distrib_la import batch_layout, checked_program, local_batch, matmul, plan
 
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
               batched_route=route)
@@ -102,8 +102,9 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
         def wrap(fn):
             if backend == "off":
                 return local_batch(fn, mesh_xy, resident=resident, out_layout=layout)
-            return jax.jit(fn, in_shardings=(face,) * inputs,
-                out_shardings=face if outputs == 1 else (face,) * outputs)
+            # The checked LU solves return their status: no host callback.
+            return checked_program(fn, mesh_xy, face if outputs == 1 else (face,) * outputs,
+                                   in_shardings=(face,) * inputs)
         return wrap
 
     solve = jnp.linalg.solve if backend == "off" else lu.batched
@@ -906,6 +907,9 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                             label=f"shared-pole bank {stage} dispatch"):
             started = time.monotonic()
             result = executable(*args)
+            # A checked program's executable returns its status too (checked_program).
+            if hasattr(kernel, "finish"):
+                result = kernel.finish(args, result)
             receipt["seconds"][stage+"_dispatch"] = receipt["seconds"].get(stage+"_dispatch", 0.) + time.monotonic()-started
         return result
     return execute
@@ -914,7 +918,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
 @lru_cache(maxsize=8)
 def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
     """One cached service plan for H=V^(1/2) and its supported inverse."""
-    from distrib_la import matmul, plan
+    from distrib_la import checked_program, matmul, plan
     from .gw_config import linalg_resolution
     resolution = linalg_resolution({"linalg": layout})
     backend = "off" if resolution.layout == "local" else "distributed"
@@ -923,7 +927,8 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     rep = NamedSharding(mesh_xy, P())
 
-    @partial(jax.jit, in_shardings=(face,), out_shardings=(face, face, rep, rep))
+    # The checked eigh returns its status: no host callback.
+    @partial(checked_program, mesh=mesh_xy, out_shardings=(face, face, rep, rep), in_shardings=(face,))
     def sqrt_v(value):
         lam, vectors = eig.batched(value)
         tolerance = n_logical * np.finfo(np.float64).eps
