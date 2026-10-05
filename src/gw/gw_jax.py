@@ -777,11 +777,12 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
     return (static_head_terms)
 
 
-def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
+def _oneshot_sampled_support(config, enk_dft, wfn, meta, occupation_state,
                              material_class, print_fn):
     """The one-shot's sampled Sigma(omega) support: the first plan of
     ``gw.qp_support`` (the deck request joined with every requested state's
-    E_DFT +/- 2 eV), the plan SC map 0 makes, so SC map 0 is this calculation.
+    E_DFT +/- 2 eV, and the coarse class on its own windows), the plan SC
+    map 0 makes, so SC map 0 is this calculation.
 
     The requested states are the Sigma window's identities the W model treats
     as active, judged in the frame the Sigma build measures from
@@ -791,7 +792,8 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
     from dataclasses import replace
 
     from .efermi import sigma_frame_mu_ev
-    from .qp_support import plan_support_ev, requested_states
+    from .qp_support import (coarse_identities, coarse_windows_plan, joined_grid_ev,
+                             plan_support_ev, requested_states)
     from .shared_pole_recipe import active_band_mask
     e_ry = np.asarray(enk_dft, dtype=np.float64)
     metal = material_class == "metal" and occupation_state is not None
@@ -801,16 +803,20 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
         occupation_state if metal else None)
     requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
     energy = e_ry * RYD_TO_EV - mu_ev
+    semicore = coarse_identities(meta.coarse_class, e_ry, config.compute_mode)
     states = requested_states(
         config.sigma, config.sc.frozen_core_bands, energy,
         np.ones(e_ry.shape, dtype=bool), active_band_mask(e_ry, float(wfn.efermi)))
-    grown, _ = plan_support_ev(config.sigma, requested, energy, states)
-    if grown.size == requested.size:
+    grown, _ = plan_support_ev(config.sigma, requested, energy, states & ~semicore)
+    _, _, windows = coarse_windows_plan(config.sigma, energy, semicore, float(grown[0]))
+    if grown.size == requested.size and not windows:
         return config
     print_fn(f"  Sigma sampled support ({config.sigma.out_of_grid}, plan 0): "
              f"[{requested[0]:+.6f}, {requested[-1]:+.6f}] -> "
-             f"[{grown[0]:+.6f}, {grown[-1]:+.6f}] eV")
-    return replace(config, sc_omega_grid_ev=tuple(float(x) for x in grown))
+             f"[{grown[0]:+.6f}, {grown[-1]:+.6f}] eV, {len(windows)} coarse window(s)")
+    return replace(config, sc_omega_grid_ev=tuple(
+        float(x) for x in joined_grid_ev(grown, windows)),
+        sc_coarse_windows_ev=tuple(windows) or None)
 
 
 def _run_oneshot_sigma(
@@ -824,7 +830,7 @@ def _run_oneshot_sigma(
     if qp_solver is not QPSolver.SELF_CONSISTENT:
         if mode.is_dynamic:
             config = _oneshot_sampled_support(
-                config, enk_dft, wfn, oneshot_occupation_state,
+                config, enk_dft, wfn, meta, oneshot_occupation_state,
                 material_class, print0)
         with timing.section("gw_jax.sigma"):
             sigma_result = compute_sigma_xc(

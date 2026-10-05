@@ -37,6 +37,8 @@ class OmegaCoverage:
     fixed value ``"static_omega0"`` (uncovered states use Sigma(omega=0)), so a reader
     knows whether the uncovered cells hold an endpoint value (``clamp``) or
     a non-finite marker (``mask``); ``refuse`` never reaches a consumer.
+    ``uncovered_bands`` names them, one ``band N: [lo, hi] eV on k/nk k``
+    line per band (``band_partition.coarse_band_report``).
     """
 
     mask_kn: np.ndarray
@@ -45,6 +47,7 @@ class OmegaCoverage:
     omega_min_ev: float
     omega_max_ev: float
     policy: str
+    uncovered_bands: tuple = ()
 
     def summary(self) -> str:
         """One line, suitable for an artifact comment or a log."""
@@ -239,12 +242,17 @@ def eval_sigma_c_at_dft_energies(
         f"({provenance}; VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
 
+    from .band_partition import coarse_band_report
     from .qsgw_utils import interp_sigma_diag_along_omega, omega_coverage
     grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
-    # Uncovered states take Sigma(omega=0), counted and reported (owner rule 2026-09-22).
+    # Uncovered states take Sigma(omega=0), named and reported (owner rule
+    # 2026-09-22), as the SC cover rule reads them (qsgw_utils.sigma_eval_omega).
     policy = "static_omega0"
     covered, n_uncovered, frac_uncovered = omega_coverage(
         grid_ev, omega_dft_rel_ev)
+    uncovered_bands = tuple(coarse_band_report(
+        omega_dft_rel_ev, ~covered, mu_ev=0.0,
+        band_offset=band_slices.sigma_range[0]))
     # Two omega slots per (k, n) leave the cube; the (n_omega, nk, nb)
     # diagonal is not made on any host (full BZ: 3.7 GB per rank at Fe 20^3).
     sigma_c_at_dft_ev = interp_sigma_diag_along_omega(
@@ -262,7 +270,7 @@ def eval_sigma_c_at_dft_energies(
                       fraction_uncovered=frac_uncovered,
                       omega_min_ev=float(grid_ev[0]),
                       omega_max_ev=float(grid_ev[-1]),
-                      policy=policy),
+                      policy=policy, uncovered_bands=uncovered_bands),
     )
 
 

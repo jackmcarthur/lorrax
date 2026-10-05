@@ -3370,7 +3370,7 @@ def prepare_isdf_and_wavefunctions(
 
 
 def coarse_class_for_deck(config, wfn, print0):
-    """The SC run's coarse (semicore) read class from the loaded DFT ladder.
+    """The coarse (semicore) read class of a dynamic run from the DFT ladder.
 
     Sigma_c(omega) quadrature only (``band_partition.semicore_floor``): it sets
     no band count; b3 and the zeta fit are the counted bands, as on main.  A
@@ -3406,10 +3406,12 @@ def coarse_class_for_deck(config, wfn, print0):
     say = print0 if jax.process_index() else (
         lambda line: print(line, file=sys.stderr, flush=True))
     top = n_occ + int(config.ncond)
+    sc = config.qp_solver == "self_consistent"
     say(f"  QP matrix: bands 1-{top} counted (nval={int(config.nval)}, "
-        f"ncond={int(config.ncond)}), rotated among themselves; "
-        + (f"bands {top + 1}-{int(config.nband)} scissored (no Sigma, no mixing); "
-           if top < int(config.nband) else "no scissored tail; ")
+        f"ncond={int(config.ncond)})"
+        + ((", rotated among themselves; "
+            + (f"bands {top + 1}-{int(config.nband)} scissored (no Sigma, no mixing); "
+               if top < int(config.nband) else "no scissored tail; ")) if sc else "; ")
         + "coarse (semicore) Sigma read: "
         + ((f"{coarse.n_coarse} (k,state) below E-mu = {coarse.coarse_floor_ev - mu:+.3f} eV, "
             + (f"the lowest requested valence band (nval={int(config.nval)})"
@@ -3431,8 +3433,9 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
     print0(f"  {mu_basis.describe()}")
     coarse = None
-    if config.compute_mode.is_dynamic and config.qp_solver == "self_consistent":
-        # b3 counts bands as on main; the coarse class is a Sigma read class.
+    if config.compute_mode.is_dynamic:
+        # b3 counts bands as on main; the coarse class is a Sigma read class,
+        # the same for the one-shot and every SC map.
         coarse = coarse_class_for_deck(config, wfn, print0)
     meta = Meta.from_system(wfn, sym,
                             int(config.nval),

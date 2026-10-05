@@ -370,6 +370,46 @@ def window_labels(omega_ev, windows, eta_ev):
     return eta, group
 
 
+def coarse_identities(coarse_class, e_dft_ry, compute_mode):
+    """Coarse (semicore) identities: DFT energy below ``meta.coarse_class``'s floor
+    on a route that reads the patch (:func:`semicore_patch_route`), a bool mask."""
+    from common.units import RYD_TO_EV
+    e_ev = np.asarray(e_dft_ry, dtype=np.float64) * RYD_TO_EV
+    if (coarse_class is None or not coarse_class.n_coarse
+            or not semicore_patch_route(compute_mode)):
+        return np.zeros(e_ev.shape, dtype=bool)
+    return e_ev < float(coarse_class.coarse_floor_ev)
+
+
+def coarse_windows_plan(sigma, energy_rel_ev, semicore_kn, near_lo_ev, held=None):
+    """The coarse windows of a map: ``(patch, event, windows)``; one rule for the
+    one-shot and every SC map.
+
+    ``held=None`` plans (the one-shot and SC map 0); a held patch is kept, or
+    extended when a coarse read support leaves it.  The deck's ``lo:hi:eta``
+    windows serve only the coarse class and refuse without one.
+    """
+    users = getattr(sigma, "coarse_windows_ev", tuple)()
+    semicore = np.asarray(semicore_kn, dtype=bool)
+    if not semicore.any():
+        if users:
+            raise ValueError(
+                "GATE sigma_coarse_window: sigma_omega_patches_ev lo:hi:eta windows serve "
+                "the coarse (semicore) class of the MPA/shared-pole Sigma (scalar or "
+                "sector), and no occupied state of this run lies below the coarse floor "
+                "(or its Sigma is PPM/static).")
+        return None, "", ()
+    auto = semicore & ~_inside_any(energy_rel_ev, users)
+    if held is None:
+        patch, event = semicore_patches_ev(energy_rel_ev, auto, near_lo_ev), "plan"
+    elif semicore_patch_escapes(energy_rel_ev, semicore, near_lo_ev, held, users).any():
+        patch, event = semicore_patches_ev(
+            energy_rel_ev, auto, near_lo_ev, previous=held), "extend"
+    else:
+        patch, event = held, "hold"
+    return patch, event, coarse_windows_ev(near_lo_ev, patch, users)
+
+
 def semicore_patch_route(compute_mode):
     """THE one predicate for a Sigma route that reads the semicore patch.
 

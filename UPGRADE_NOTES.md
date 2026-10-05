@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — the one-shot reads the coarse (semicore) class as SC map 0 does
+
+A dynamic one-shot builds the coarse class (`nval` below every occupied band,
+or a ≥ 4 eV gap under `number_bands_protected`) and reads it on the same
+coarse windows at η 5 eV that SC map 0 plans (`qp_support.coarse_windows_plan`,
+one function for both). Before, those states read Σ(ω = 0) in the one-shot.
+States inside the near grid keep their rule. A deck whose `nval` covers every
+occupied band has no coarse class and does not move. States still read at
+ω = 0 are now named per band in the coverage warning (band, energy range
+about E_F, k count). `sigma_omega_patches_ev` `lo:hi:eta` windows now act in
+the one-shot too, and refuse without a coarse class as in SC.
+
 ## 2026-10-05 — kmeans reads the deck's `wfn_file`
 
 `centroid.kmeans_cli -i DECK` opens the deck's `wfn_file`, relative to the

@@ -574,12 +574,15 @@ class GWProductionReport:
                     if mask.size:
                         affected = (f"; Sigma(E_DFT) has {n_uncovered}/"
                                     f"{mask.size} out-of-grid cells")
+                named = "; ".join(getattr(coverage, "uncovered_bands", ()))
                 self._retain_warning(
                     "WARNING: dynamic Sigma grid is incomplete for requested "
                     "DFT output bands (" + "; ".join(shortfalls) + f"){affected}; "
                     f"out-of-range policy={policy_name}: those states use "
-                    "Sigma(omega=0). Widen sigma_omega_min_ev / sigma_omega_max_ev "
-                    "or add a sigma_omega_patches_ev window to sample them.")
+                    "Sigma(omega=0)" + (f" ({named})" if named else "")
+                    + ". Widen sigma_omega_min_ev / sigma_omega_max_ev, add a "
+                    "sigma_omega_patches_ev window, or lower nval so they join "
+                    "the coarse class, which reads its own window.")
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(
