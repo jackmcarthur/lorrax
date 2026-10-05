@@ -7,6 +7,8 @@
 3. The pole-budget keep cut never splits a degenerate multiplet at its edge:
    the tied member leaves with its partner, so K <= budget and the kept span
    does not depend on the eigenbasis inside the multiplet.
+4. A local CT round whose actual spans do not fit is handed back (None) for
+   the face rerun instead of running one whole parent per rank over budget.
 """
 import json
 from types import SimpleNamespace
@@ -76,3 +78,56 @@ def test_budget_cut_never_splits_the_edge_multiplet():
     assert kept(pair, 2) == [2.0, 3.0]
     assert kept(pair, None) == pair
     assert kept([1.0] * 4, 2) == [1.0, 1.0]                  # no edge in one tied run: index cut
+
+
+def test_local_ct_over_budget_takes_the_face_fallback(monkeypatch):
+    import file_io  # noqa: F401  (service path bootstrap)
+    import gw.gw_config as cfg
+    import gw.shared_pole_capacity as cap
+    import gw.shared_pole_execution as ex
+    import gw.shared_pole_sectors as sectors
+
+    class Ran(Exception):
+        pass
+
+    class Capacity:
+        status = "FAIL"
+
+        def __init__(self, *a, **k):
+            self.face_room = None
+
+        def preview(self, side, **_):
+            return dict(device_budget_status=Capacity.status)
+
+        def plan(self, *a, **k):
+            return {}
+
+        def eigenplan(self, side):
+            return None
+
+    def reduce(*a, **k):
+        raise Ran
+    monkeypatch.setattr(cap, "ConstructorCapacity", Capacity)
+    monkeypatch.setattr(ex, "is_face", lambda array: False)
+    monkeypatch.setattr(cfg, "linalg_resolution", lambda deck: None)
+    monkeypatch.setattr(sectors, "cross_span_widths", lambda meta, s: ([2, 2], [2, 2]))
+    monkeypatch.setattr(sectors, "cross_round_actions", lambda *a, **k: ())
+    monkeypatch.setattr(sectors, "_pack_cross_spans", lambda s, widths, **k: [
+        (None, None, None, None, np.zeros((1, 3, w))) for w in widths])
+    monkeypatch.setattr(sectors, "reduce_cross_round", reduce)
+    sector = dict(model=(np.zeros((1, 3, 2)),), signed=(), coefficients=np.zeros((1, 3, 2)),
+                  infinity=(), states=(), roles=((),), recipe={}, budget=SimpleNamespace(face_room=None))
+    meta = SimpleNamespace(shared_pole_capacity=SimpleNamespace(live_stages=()))
+    config = SimpleNamespace(backend=SimpleNamespace(linalg="local"))
+    panels = dict(Wc=None, dWc_ds=None)
+    args = ((sector, sector), (panels, panels), {f"M{i}": None for i in range(4)}, meta, config)
+    kwargs = dict(mesh_xy=None, sample_ids=(), line_cross=({}, {}), real=1)
+    assert sectors.construct_cross_sector_round(*args, **kwargs) is None
+    Capacity.status = "PASS"
+    try:
+        sectors.construct_cross_sector_round(*args, **kwargs)
+    except Ran:
+        pass
+    else:
+        raise AssertionError("a local CT round that fits did not run")
+

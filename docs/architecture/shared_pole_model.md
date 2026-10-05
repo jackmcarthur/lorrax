@@ -316,9 +316,11 @@ and CT all run on the face when the CT joint pencil or any sector prices face,
 else all local. With at least as many parents as ranks the joint pencil's
 conservative price (both spans at twice their pole budgets) does not send the
 sectors to the face: each rank builds whole q-local models, and the round
-admits the CT pencil at its actual retained spans. The route is fixed before
-any read and the report line `Shared-pole constructor:` names it and its
-prices; there is no route change inside a stage. A face program holds its eighs' first attempts; a failed check
+admits the CT pencil at its actual retained spans. A local round whose CT does
+not fit there warns and reruns its parents, CC and TT included, as face
+batches (the slow fallback). The route is fixed before any read and the report
+line `Shared-pole constructor:` names it and its prices; that fallback is the
+only route change inside a stage. A face program holds its eighs' first attempts; a failed check
 reruns that round's whole-chain program on the whole mesh, the program its
 admission compiled (`distrib_la.checked_program`).
 

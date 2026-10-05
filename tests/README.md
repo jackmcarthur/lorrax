@@ -13,7 +13,8 @@ A new test needs no bootstrap import of its own.
 - `test_layering.py`, `test_crossfile_requests.py`, `test_env_registry.py`,
   `test_env_grammar.py`, `test_fft_shardmap_context.py`: static AST suites.
 - `test_sc_checkpoint_resume.py`: SC continuation on toy inputs (CPU): the
-  Anderson trajectory across a stop, a refused held Σ rule, the band carrier.
+  Anderson trajectory across a stop, a refused held Σ rule, the band carrier,
+  the checkpoint cube digest split over ranks (the same at any P).
 - `test_trs_qe_decides.py`: the 2c TRS verdict on toy loaders (CPU): QE's
   t_rev rows and SCF magnetization decide, the wavefunction guard refuses an
   inconsistent WFN at m = 0 and turns TRS off at a small moment, the SCF
@@ -41,7 +42,11 @@ A new test needs no bootstrap import of its own.
   in host memory.
 - `test_shared_pole_guards.py`: shared-pole guards on toy inputs (CPU): the
   relaxed tier's sector face batch has no Ritz carrier, a bank of another
-  bare-V digest is rebuilt, the pole-budget cut never splits a multiplet.
+  bare-V digest is rebuilt, the pole-budget cut never splits a multiplet, a
+  local CT round over budget is handed back for the face rerun.
+- `test_centroid_fixed_tile.py`: the kmeans candidate Gram's k batches and
+  tiles and the feature metric's chunks do not read the budget (CPU, toy
+  faces).
 - Benchmarks and backend checks for a standalone service live in that service's
   `services/<svc>/bench/`.
 
