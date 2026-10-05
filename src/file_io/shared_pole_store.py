@@ -572,16 +572,20 @@ def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent
     (the native provider never fills), exact zeros past the carrier, unit poles past K."""
     spec = P(None, "x", None, "y")
     components = header.get("factor_components", 1)
+    # The datasets were created by an earlier transaction, so each write names
+    # their extent (a handle only knows the datasets it created or opened).
+    shape = (header["n_q_irr"], header["n_mu_logical"], components, extent)
     b, written = int(canonical.shape[0]), min(int(canonical.shape[-1]), extent)
     if written:
-        io.write_slab("factor", canonical, offset=(lo, 0, 0, 0))
+        io.write_slab("factor", canonical, offset=(lo, 0, 0, 0), global_shape=shape)
     if extent > written:
         pad = mesh_divisible_shape((b, basis.n_canonical, components, extent-written), mesh, spec)
-        io.write_slab("factor", _zeros_program(mesh, spec, tuple(pad))(), offset=(lo, 0, 0, written))
+        io.write_slab("factor", _zeros_program(mesh, spec, tuple(pad))(), offset=(lo, 0, 0, written),
+                      global_shape=shape)
     active = jnp.arange(extent)[None, :] < jnp.asarray(K)[:, None]
     poles = jnp.pad(poles2[:, :extent], ((0, 0), (0, max(extent-int(poles2.shape[-1]), 0))),
                     constant_values=1.0)
-    io.write_slab("poles2_ry2", jnp.where(active, poles, 1.0), offset=(lo, 0))
+    io.write_slab("poles2_ry2", jnp.where(active, poles, 1.0), offset=(lo, 0), global_shape=shape[::3])
 
 
 def _stage_direct(path, header):
