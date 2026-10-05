@@ -12,6 +12,35 @@ The GW driver's phase invariants and the per-function contracts of
 `gw.gw_config` are developer reference, not rulings:
 [GW driver and configuration contracts](../dev/gw_config_contracts.md).
 
+## 2026-10-05 — A per-round program's shape is decided before the first round {#fixed-round-shapes}
+
+**Rule (owner).** Every argument of a program that runs once per round or
+per SC map has a shape and pytree structure fixed for the run, decided from
+quantities known before the first round: the recipe's carriers, the deck,
+$N_\mu$, $n_b$ and the admitted batch width. A batch loop runs at one width
+and pads its last round with a repeated real item behind a `real` count. A
+carrier is never discovered by running: no high-water history, no grow-only
+extent, no optional pytree member. Where the known bound is wider than the
+data, the padding is inert zero columns that the zero-row-safe eigensolver
+keeps out of every spectrum.
+
+**Why.** Seven fixes in three weeks (`held_writer_width`,
+`cross_span_widths`, the face batch widths, the SC window hold, the partner
+panels, the carrier growth, the ragged face tail) each remembered the maximum
+seen at one site; the next site that sized a shape from its own data
+recompiled again. On CrI3 24×24 at P64 the two 2026-10-05 instances cost
+about 120 s per leg and 220–270 s per chain of recompiles that no production
+output reported.
+
+**Deletes.** `shared_pole_local.grow_round`, the extent and Ritz carrier
+histories, the face route's own ragged schedule and the
+`real != len(own)` refusal; `parent_rounds` is the one schedule.
+
+**Not yet conforming.** The sector writer widths (`held_writer_width`) and
+the CT span widths (`cross_span_widths`) still hold a maximum from map 1,
+bounded by the pole budget; the writer width is a store carrier, not a
+program shape.
+
 ## 2026-10-05 — Bispinor Coulomb and Hartree use the normalized four-component wavefunctions {#four-component-carrier}
 
 **Rule (owner).** The Coulomb interaction and the Hartree field are evaluated

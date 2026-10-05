@@ -131,9 +131,11 @@ def test_local_ct_over_budget_takes_the_face_fallback(monkeypatch):
         pass
     else:
         raise AssertionError("a local CT round that fits did not run")
-    # The rerun takes the round's real parents only, never its padded slots.
+    # The rerun takes the round's real parents only, never its padded slots,
+    # in fixed-width face rounds (parent_rounds): a short last round repeats
+    # its last real parent.
     rounds = sectors.face_rerun_rounds([12, 12, 12, 12], 1, 4)
-    assert [(r[0], r[1], r[3]) for r in rounds] == [([12], 1, "face")]
+    assert [(r[0], r[1], r[3]) for r in rounds] == [([12, 12, 12, 12], 1, "face")]
     rounds = sectors.face_rerun_rounds([4, 5, 6, 7], 4, 3)
-    assert [r[0] for r in rounds] == [[4, 5, 6], [7]]
+    assert [(r[0], r[1]) for r in rounds] == [([4, 5, 6], 3), ([7, 7, 7], 1)]
 

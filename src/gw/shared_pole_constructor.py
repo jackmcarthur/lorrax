@@ -103,7 +103,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
     with phase("entry"):
         import numpy as np
         from jax.sharding import NamedSharding, PartitionSpec as P
-        from runtime.padding import mesh_divisor
         from file_io.shared_pole_store import (
             charge_representation, validate_shared_pole_bank, open_shared_pole_bank,
             read_line_panels, read_shared_pole_bank, write_shared_pole_model,
@@ -111,9 +110,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         from gw.gw_config import linalg_resolution
         from common.staged_reshard import face_to_batch_reshard
         from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
-                                          own_extent_receipts, reduce_round, round_tables, grow_round,
-                                          carrier_history)
-        from gw.shared_pole_capacity import round_padding_output_bytes
+                                          own_extent_receipts, reduce_round, round_tables)
         from gw.shared_pole_recipe import (
             build_construction_row, charge4_gates, construction_receipt,
             shared_real_pole_gates_v1_r3b as gates,
@@ -201,9 +198,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         held_lo, held_hi = min(held_ids), max(held_ids) + 1
         nq = int(header["bank_shape"]["nq"])
         # A local round runs one parent per rank from its sample read to its
-        # sorted model. A face round runs a budget-sized batch of physical
-        # parents over all ranks (one schedule owner for both constructors).
-        ranks = mesh_divisor(mesh_xy)
+        # sorted model. A face round runs a budget-sized batch of parents over
+        # all ranks. Both take fixed-width rounds from the one schedule
+        # (``parent_rounds``); a short last round repeats its last parent.
         face_batch = 1
         if execution == 'face':
             from gw.shared_pole_capacity import face_eigh_room
@@ -236,7 +233,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         to_face, to_batch = batch_to_face(mesh_xy), face_to_batch_reshard(mesh_xy)
     for ids, real, slots in rounds:
         with phase("batch_admission"):
-            budget.batch_width = ranks if execution == 'local' else real
+            budget.batch_width = len(ids)
             budget.retained_panels = tuple(factors)
             budget.plan(
                 conservative_side, phase="selection",
@@ -280,51 +277,21 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             del samples, line, line_states, qi
         with phase("reduction_admission"):
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]
-            # Reuse widths only when the current ledger admits them.  The
-            # table is host metadata, so its side is known before any panel
-            # padding is allocated.
-            round_key = ("scalar", logical_n, ordered, odd_moments)
-            history = carrier_history(meta)
             budget.retained_panels = tuple(factors)
-            budget.batch_width = ranks if execution == 'local' else real
-            def _tables(widths, infinity_width, reuse):
-                return round_tables(
-                    round_counts, widths, [st[0] for st in round_states],
-                    infinity_counts, infinity_width,
-                    column_extent=column_extent, ordered=ordered,
-                    odd_moments=odd_moments,
-                    key=round_key if reuse else None,
-                    history=history if reuse else None)
-
-            def _preview(widths, infinity_width, reuse):
-                table = _tables(widths, infinity_width, reuse)
-                side = int(table["active"].shape[-1])
-                padding_bytes = round_padding_output_bytes(
-                    round_states, infinity, widths, infinity_width)
-                # One price per program: the reduction phase's route price
-                # (shared_pole_capacity.shared_pole_byte_terms) and its eigh
-                # workspace, for the local and the face route alike.
-                return budget.preview(side, phase="reduction",
-                    padding_output_bytes_per_rank=padding_bytes)["device_budget_status"] == "PASS"
-
-            def _admit(widths, infinity_width, reuse):
-                table = _tables(widths, infinity_width, reuse)
-                side = int(table["active"].shape[-1])
-                padding_bytes = round_padding_output_bytes(
-                    round_states, infinity, widths, infinity_width)
-                # Resolve before either reduction program is traced; the
-                # ledger warns when the route price is over the budget.
-                local_eigh = budget.eigenplan(side)
-                budget.plan(side, phase="reduction",
-                    padding_output_bytes_per_rank=padding_bytes)
-                if reuse:
-                    extent_key = (round_key, "extent", 2 if ordered else 1, len(widths))
-                    history[extent_key] = (table["order"].shape[1] // (2 if ordered else 1),)
-                return table, side, local_eigh
-
-            round_states, infinity, (tables, side, local_eigh) = grow_round(
-                round_key, round_states, infinity, history=history,
-                preview=_preview, admit=_admit)
+            budget.batch_width = len(ids)
+            # Every state panel is on its recipe carrier and the pencil extent
+            # is their capacity (round_tables), so the side is the same in
+            # every round and SC map: one reduction program per route. The
+            # table is host metadata, known before any panel is allocated.
+            tables = round_tables(
+                round_counts, [int(st[1].shape[-1]) for st in round_states],
+                [st[0] for st in round_states], infinity_counts, int(infinity[0].shape[-1]),
+                column_extent=column_extent, ordered=ordered, odd_moments=odd_moments)
+            side = int(tables["active"].shape[-1])
+            # Resolve before either reduction program is traced; the ledger
+            # warns when the route price is over the budget.
+            local_eigh = budget.eigenplan(side)
+            budget.plan(side, phase="reduction")
         with phase("gram_reduction"):
             if execution == 'face':
                 from gw.shared_pole_execution import face_reduce_round
@@ -337,7 +304,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 room = lambda compiled: face_eigh_room(dict(row, aggregate_bytes_per_rank=(
                     row['aggregate_bytes_per_rank'] - budget.program_bytes + compiled)), retained_bound)
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
-                    round_states, infinity, tables, real=real, mesh=mesh_xy,
+                    round_states, infinity, tables, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
                     keep_budget=keep_budget, admit=False, room=room,
                     carrier=sizing['carrier'])
@@ -345,8 +312,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
                     native_eigh=local_eigh.native_fn, ordered=ordered,
-                    odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"),
-                    history=history, key=round_key)
+                    odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
             qi = infinity[0]
             del round_states, infinity
             round_reduction, round_zero, round_retained, round_permutation = jax.tree.map(np.asarray, round_diagnostics)
@@ -378,7 +344,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     raise ValueError(f"GATE shared_pole_retained_moments: got: failed at q={q}; want: projected latent moment identity <=1e-10; why: corrected Ritz algebra")
             reductions = own_extent_receipts(round_reduction, tables["own"][:real])
         with phase("coulomb"):
-            budget.batch_width = ranks if execution == 'local' else real
+            budget.batch_width = len(ids)
             model_row = budget.plan(side, phase="model", sample_batch=len(held_ids))
             budget.live((*round_model, *round_signed, qi))
             # V^-1/2 of the round's parents: one owner call per contiguous run of ids, rows in slot order.

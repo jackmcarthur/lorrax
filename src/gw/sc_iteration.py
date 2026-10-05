@@ -3725,8 +3725,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         inputs.meta.shared_pole_rank_capacity = (
             None if inputs.fixed_quadrature_session is None
             else inputs.fixed_quadrature_session.setdefault("shared_pole_rank_capacity", {}))
-        # The constructor's held carrier widths (shared_pole_local.carrier_history)
-        # live in the session too, the one owner of held SC state.
+        # The sector writers' held carrier widths (shared_pole_local.carrier_history,
+        # held_writer_width) live in the session too, the one owner of held SC
+        # state. The round pencils need no hold: their extent is the panels'
+        # capacity, fixed before the first round (round_tables).
         if inputs.fixed_quadrature_session is not None:
             inputs.meta._shared_pole_carrier_history = (
                 inputs.fixed_quadrature_session.setdefault("shared_pole_carriers", {}))

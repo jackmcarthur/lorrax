@@ -143,6 +143,35 @@ across rooms, so a room that crosses a GiB between SC maps no longer
 recompiles the face programs; a shape's face program keeps the stack route
 it was traced with. No deck or environment change; results do not move.
 
+## 2026-10-05 — Shared-pole rounds have one shape per run: fixed-width rounds and a pencil at capacity
+
+- **One round schedule.** The local, face, scalar and CT-rerun routes all
+  take fixed-width rounds from `shared_pole_local.parent_rounds`: a short
+  last round repeats its last real parent and every consumer reads the
+  leading `real` slots. Before, the face route cut a ragged last batch
+  (CrI3 24×24: 61 parents at width 3 left a width-1 tail that recompiled
+  every CC, TT, CT and held program, about 120 s cold and 30 s warm per
+  leg). A padded tail costs no measurable time: the width-1 round already
+  took as long as a width-3 round.
+- **Pencil extent fixed before the first round.** `round_tables` sizes the
+  pencil at the state panels' capacity (the recipe's imaginary width, line
+  cap and partner carrier), the same in every round and SC map. Before,
+  the extent followed the largest selection seen so far and grew parent by
+  parent in map 0 (CrI3 24×24: CC side 6976 → 11072 → 15168 → 17472, TT
+  7424 → 24832 in five steps; eight recompiles of the CC, TT and CT programs
+  and their eigh stacks, about 220–270 s cold per chain or one-shot) and
+  reached the same capacity anyway, so maps 1 and later and every warm leg
+  run the same sides as before. In map 0 the early rounds now solve the
+  full-side pencil: on CrI3 24×24 P64 that is about 160 s of extra eigh
+  time if the pencil eigh is the round's cost, against the recompiles it
+  removes. The local ordered round's kept span sits on its pole budget, as
+  the face round's does; the grown-then-rerun Ritz rung is gone.
+- **Deleted.** `grow_round`, the carrier/extent/Ritz histories (the session's
+  `shared_pole_carriers` now holds only the writer widths), the reduction
+  preview/admit closures and the "selection exceeds its held carrier" log
+  lines. Results: eqp moves at most at the eigh's bit level where the map-0
+  side changed; later maps are bitwise.
+
 ## 2026-10-05 — kmeans sizes from the shapes; a CT face fallback; the checkpoint digest splits over ranks
 
 - **kmeans.** The candidate Gram's k batches and square tiles, and the

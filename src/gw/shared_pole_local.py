@@ -10,24 +10,30 @@ from functools import lru_cache, partial
 BATCH = ('x', 'y')
 
 
-def parent_rounds(nq, ranks):
-    """Rounds of ``ranks`` parent slots, one parent per rank, in canonical order.
+def parent_rounds(parents, width):
+    """Fixed-width rounds of parent slots in canonical order: the one schedule of every route.
 
-    A round is the next contiguous run of parents; every parent's minus-q
-    actions are already in its own bank panels, so no round needs another
-    parent. A short round repeats its last real parent in the synthetic slots,
-    which are never solved.
+    ``parents`` is a parent count or a sequence of parent ids; ``width`` the
+    slots of every round (P on the local route, the admitted batch on the
+    face). Every parent's minus-q actions are already in its own bank panels,
+    so no round needs another parent. A short last round repeats its last
+    real parent in the synthetic slots, so every round program sees one
+    shape; consumers read the leading ``real`` slots (gates, receipts, the
+    writer), and a local synthetic slot is never solved.
 
-    Returns ``[(ids, real, slots)]``: ``ids`` the ``ranks`` parent ids, ``real``
+    Returns ``[(ids, real, slots)]``: ``ids`` the ``width`` parent ids, ``real``
     the number of leading real slots, ``slots`` the slot index of each slot.
     """
     import numpy as np
 
+    ids = (list(range(int(parents))) if isinstance(parents, (int, np.integer))
+           else [int(q) for q in parents])
+    width = int(width)
     out = []
-    for q0 in range(0, int(nq), int(ranks)):
-        ids = list(range(q0, min(q0 + int(ranks), int(nq))))
-        real = len(ids)
-        out.append((ids + [ids[-1]] * (int(ranks) - real), real, np.arange(int(ranks), dtype=np.int64)))
+    for q0 in range(0, len(ids), width):
+        chunk = ids[q0:q0 + width]
+        out.append((chunk + [chunk[-1]] * (width - len(chunk)), len(chunk),
+                    np.arange(width, dtype=np.int64)))
     return out
 
 
@@ -132,7 +138,7 @@ def canonical_factors(mesh_xy, order, components=1):
 
 
 def carrier_history(meta):
-    """One model's optional executable-reuse widths, shared by its SC maps."""
+    """One model's held writer widths (``held_writer_width``), shared by its SC maps."""
     history = getattr(meta, "_shared_pole_carrier_history", None)
     if history is None:
         history = {}
@@ -148,41 +154,8 @@ def _pad_columns(sharding, shape, width):
     return jax.jit(lambda a: jnp.pad(a, pad), out_shardings=sharding)
 
 
-def grow_round(key, states, infinity, *, history, preview, admit):
-    """Admit optional high-water carriers before allocating their padding.
-
-    ``preview`` checks the candidate via ConstructorCapacity.  If reuse does
-    not fit, ``admit`` prices the actual current widths and propagates a real
-    capacity refusal.  The host table and its admitted side come back from
-    ``admit``; every rank makes the same decision from the same receipt.
-    """
-    pad = lambda a, w: a if a.shape[-1] == w else _pad_columns(a.sharding, a.shape, w)(a)
-    current = tuple(int(st[1].shape[-1]) for st in states)
-    current_infinity = int(infinity[0].shape[-1])
-    state_key, infinity_key = (key, "states", len(states)), (key, "infinity")
-    old_states = history.get(state_key, current)
-    old_infinity = history.get(infinity_key, (current_infinity,))[0]
-    widths = tuple(max(a, b) for a, b in zip(current, old_states))
-    width = max(current_infinity, old_infinity)
-    try:
-        reuse = bool(preview(widths, width, True))
-    except (ValueError, MemoryError, RuntimeError):
-        # A historical width may exceed this run's budget or native route.
-        # The actual current round is still admitted below, where any real
-        # failure propagates rather than being mistaken for optional reuse.
-        reuse = False
-    if not reuse:
-        widths, width = current, current_infinity
-    admitted = admit(widths, width, reuse)
-    if reuse:
-        history[state_key] = widths
-        history[infinity_key] = (width,)
-    states = [(st[0], *(pad(a, w) for a in st[1:])) for st, w in zip(states, widths)]
-    return states, tuple(pad(a, width) for a in infinity), admitted
-
-
 def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, column_extent, ordered,
-                 odd_moments, key=None, history=None):
+                 odd_moments):
     """Host column tables of one round: each slot's states packed into its pencil columns.
 
     ``counts`` int [P, A] retained widths per slot and state, ``widths`` the A
@@ -191,9 +164,9 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     ``infinity_width``] infinity panels. A state keeps its carrier
     ``column_extent(count)`` with the inert tail inside, as a per-parent pack
     does; each slot is compacted in state order and padded with zero columns to
-    the round extent. An ordered round packs originals (the first A/2 states) and
-    mirrors (the last A/2) as two halves of one extent, so every slot stays in the
-    paired layout [X(z); X(-z)].
+    the round extent, the panels' capacity. An ordered round packs originals
+    (the first A/2 states) and mirrors (the last A/2) as two halves of one
+    extent, so every slot stays in the paired layout [X(z); X(-z)].
 
     Returns a dict: ``order`` int32 [P, F] (index sum(widths) is the zero
     column), ``points`` complex128 [P, F], ``active`` bool [P, side] (finite
@@ -209,26 +182,19 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     offsets = np.concatenate(([0], np.cumsum(widths))).astype(np.int64)
     carriers = np.asarray([[column_extent(int(c)) for c in row] for row in counts], np.int64)
     halves = (range(states // 2), range(states // 2, states)) if ordered else (range(states),)
-    # The round extent is the carrier (``column_extent``, on the ladder of
-    # ``runtime.padding.ladder_extent`` in the constructors) of the largest
-    # selection, at most every state's full panel, so rounds and SC maps
-    # share round executables. The padding is inert: zero columns that the
-    # zero-row-safe eigensolver keeps out of every spectrum.
+    # The round extent is every state's full panel: the recipe's carriers
+    # (the imaginary width, the line cap, the partner on Q's carrier), known
+    # before the first round, so one round program serves every round and SC
+    # map. The padding is inert: zero columns that the zero-row-safe
+    # eigensolver keeps out of every spectrum. An extent sized to the
+    # selection grew with the parents seen (CrI3 24x24 map 0: CC side 6976
+    # -> 17472, TT 7424 -> 24832, eight recompiles) and reached this
+    # capacity anyway.
     if np.any(carriers > np.asarray(widths, np.int64)[None, :]):
         raise ValueError("GATE shared_pole_round_tables: got: a state carrier wider than its "
                          "panel; want: column_extent(count) <= panel width; why: its columns "
                          "would index the next state's panel")
-    capacity = max(sum(int(widths[a]) for a in half) for half in halves)
-    selected = max(int(carriers[:, list(half)].sum(axis=1).max()) for half in halves)
-    # Never below the selection: an extent function may saturate on a sum.
-    extent = min(capacity, max(selected, column_extent(selected)))
-    if key is not None:
-        if history is None:
-            raise ValueError("round_tables high water requires a model-local history")
-        # Grow-only with the panels (grow_round); a round with a different
-        # state count can have less capacity, which only costs a compile.
-        old = history.get((key, "extent", len(halves), len(widths)), (extent,))[0]
-        extent = min(capacity, max(extent, old))
+    extent = max(sum(int(widths[a]) for a in half) for half in halves)
     order = np.full((ranks, extent * len(halves)), offsets[-1], np.int32)
     points = np.zeros(order.shape, np.complex128)
     live = np.zeros(order.shape, bool)
@@ -282,17 +248,16 @@ def _batch_put(mesh_xy, a):
 
 
 def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget,
-                 retain_span=False, gram_keep=None, history=None, key=None):
+                 retain_span=False, gram_keep=None):
     """Run ``round_program`` on one round: host tables in, round-order results out.
 
-    With a model ``history`` (``carrier_history``), an ordered round solves its
-    kept span on the Ritz carrier: the ladder rung (``port_extent``) of the
-    largest kept count this model has had, capped at ``keep_budget``, which is
-    also the first round's carrier. A round whose kept count exceeds its carrier
-    reruns on the wider rung, so only exact-zero columns ever leave the solve.
+    An ordered round solves its kept span on the carrier of its pole budget
+    (the keep cut retains at most ``keep_budget`` directions), as the face
+    round does on ``face_ritz_carrier``: the carrier is known before the
+    first round, so one program serves every round and SC map, and only
+    exact-zero columns ever leave the solve.
     """
     import numpy as np
-    from gw.shared_pole_directions import port_extent
 
     put = lambda a: _batch_put(mesh_xy, np.asarray(a))
     live = np.arange(len(tables["own"])) < int(real)
@@ -300,19 +265,8 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
             tuple(st[1] for st in states), tuple(st[2] for st in states),
             tuple(st[3] for st in states), tuple(infinity))
     budget = None if keep_budget is None else int(keep_budget)
-    track = history is not None and bool(ordered) and budget is not None
-    carrier = history.get((key, "ritz"), budget) if track else budget
-    while True:
-        result = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
-                               bool(retain_span), gram_keep, carrier)(*args)
-        if not track:
-            return result
-        kept = int(np.max(np.asarray(result[3][0]["retained_rank"])[:int(real)]))
-        rung = min(budget, port_extent(mesh_xy)(kept))
-        history[(key, "ritz")] = max(rung, history.get((key, "ritz"), 0))
-        if kept <= carrier:
-            return result
-        carrier = rung
+    return round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
+                         bool(retain_span), gram_keep, budget)(*args)
 
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
@@ -462,12 +416,10 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
 
     from gw.shared_pole_execution import is_face
     if is_face(model[0]):
-        # A face round holds ``real`` physical parents on the leading axis;
+        # A face round holds ``real`` physical parents in its leading slots;
         # the gate equations are per parent, so each is checked on its own
         # leading row (no data moves) and the replicated rows are stacked.
         from gw.shared_pole_execution import compiled_bytes, face_eigh, face_round_check_program
-        if int(model[0].shape[0]) != int(real):
-            raise ValueError('whole-mesh shared-pole checks take physical parents only')
         if eigh_plan.n not in (None, int(model[0].shape[-2])):
             raise ValueError('whole-mesh shared-pole checks need the n x n eigh plan')
         program = lambda plan: face_round_check_program(mesh_xy, bool(ordered), plan)

@@ -456,11 +456,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
 
 
 def face_rerun_rounds(ids, real, width):
-    """Face rounds of at most ``width`` parents for a local round's ``real`` leading
-    parents; the slots past them are padded copies of the last one and never rerun."""
-    import numpy as np
-    chunks=[list(ids[q:min(q+int(width),int(real))]) for q in range(0,int(real),int(width))]
-    return [(c,len(c),np.arange(len(c),dtype=np.int64),'face') for c in chunks]
+    """Fixed-width face rounds over a local round's ``real`` leading parents
+    (``parent_rounds``); its padded slots are never rerun."""
+    from gw.shared_pole_local import parent_rounds
+    return [(*row,'face') for row in parent_rounds(ids[:int(real)],width)]
 
 
 @lru_cache(maxsize=None)
@@ -645,10 +644,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     import jax
     import numpy as np
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_capacity import ConstructorCapacity,round_padding_output_bytes
+    from gw.shared_pole_capacity import ConstructorCapacity
     from gw.shared_pole_directions import (_round_kernels,line_panel_states,port_extent,
                                            select_round_states,infinity_directions)
-    from gw.shared_pole_local import round_tables,reduce_round,grow_round,carrier_history
+    from gw.shared_pole_local import round_tables,reduce_round
 
     from gw.shared_pole_execution import is_face, face_reduce_round, face_ritz_carrier
     execution='face' if is_face(samples['Wc']) else 'local'
@@ -702,60 +701,30 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
         real=real,mesh_xy=mesh_xy,eigh_plan=eig,column_extent=extent,
         logical_n=n,ordered=True,line_states=line_states)
     del line_states
-    # Reuse admitted carrier widths across this model's later SC maps.
-    round_key=('sector',geometry['sector'],n)
     # The reduction envelope already includes current Q/O/dO and infinity
     # panels. Full sample/moment stacks remain caller-live through this call,
     # so those and earlier-sector outputs are the only additional arrays.
     budget.retained_panels=(*retained,*samples.values(),*moments.values(),
                             *(panels for panels,_ in line.values()))
-    history=carrier_history(meta)
-    def _tables(widths,infinity_width,reuse):
-        return round_tables(counts,widths,[s[0] for s in states],
-            [v.shape[-1] for v in values],infinity_width,column_extent=extent,
-            ordered=True,odd_moments=True,key=round_key if reuse else None,
-            history=history if reuse else None)
-    def _preview(widths,infinity_width,reuse):
-        table=_tables(widths,infinity_width,reuse)
-        padding_bytes=round_padding_output_bytes(states,infinity,widths,infinity_width)
-        return budget.preview(table['active'].shape[-1],phase='reduction',
-            padding_output_bytes_per_rank=padding_bytes)[
-            'device_budget_status']=='PASS'
-    def _admit(widths,infinity_width,reuse):
-        table=_tables(widths,infinity_width,reuse)
-        side=table['active'].shape[-1]
-        padding_bytes=round_padding_output_bytes(states,infinity,widths,infinity_width)
-        budget.plan(side,phase='reduction',padding_output_bytes_per_rank=padding_bytes)
-        if reuse:
-            history[(round_key,'extent',2,len(widths))]=(table['order'].shape[1]//2,)
-        return table,side
-    states,infinity,(tables,side)=grow_round(
-        round_key,states,infinity,history=history,preview=_preview,admit=_admit)
-    # The held per-state carriers grow only when a state's selection exceeds
-    # them; each growth widens this sector's pencil and every program keyed by
-    # it. An SC map past 0 says so in its log, as the CT span and K holds do.
-    before=history.get((round_key,'side'),(0,))[0]
-    if side>before:
-        capacity=getattr(meta,'shared_pole_rank_capacity',None)
-        if before and capacity is not None:
-            capacity.setdefault('_events',[]).append(
-                f"shared-pole {geometry['sector']} round: a state's selection exceeds its held carrier; "
-                f"pencil side {before} -> {side}")
-        history[(round_key,'side')]=(int(side),)
+    # Every state panel is on its recipe carrier and the pencil extent is
+    # their capacity (round_tables): one side, hence one program per sector,
+    # in every round and SC map.
+    tables=round_tables(counts,[int(s[1].shape[-1]) for s in states],[s[0] for s in states],
+        [v.shape[-1] for v in values],int(infinity[0].shape[-1]),column_extent=extent,
+        ordered=True,odd_moments=True)
+    side=int(tables['active'].shape[-1])
+    budget.plan(side,phase='reduction')
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
     if execution == 'face':
-        reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
+        reduced=face_reduce_round(states,infinity,tables,mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
             gram_keep=gram_keep,admit=False,room=budget.face_room,
             carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget']))
     else:
-        # The kept span on the Ritz carrier: the ladder rung of this sector's
-        # largest kept count so far (carrier_history), as the scalar model's.
         reduced=reduce_round(states,infinity,tables,real=geometry['real'],mesh_xy=mesh_xy,
             native_eigh=budget.eigenplan(side).native_fn,ordered=True,odd_moments=True,
-            keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=gram_keep,
-            history=history,key=round_key)
+            keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=gram_keep)
     model,signed,vectors,diagnostics,y=reduced
     reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
     for name in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):
@@ -1068,7 +1037,7 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, 
                 panels=line_cross[sid][0]
                 stored[sid]=list(k.columns(int(panels.shape[1]))(panels))
             # The round padded the state's direction to its carrier
-            # (grow_round); its padding columns act as zero.
+            # (its recipe carrier); its padding columns act as zero.
             width=int(state[1].shape[-1])
             field=2*(2*mirror+conjugate)
             outputs.append(tuple(a if int(a.shape[-1])==width else
