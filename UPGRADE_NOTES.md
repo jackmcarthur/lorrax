@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — `full_shared_pole` on a WFN with time reversal refuses at driver entry
+
+`bispinor_gw = full_shared_pole` on a WFN with time reversal now refuses at
+driver entry, on the measured symmetry and before any basis, ζ or W work
+(`GATE full_shared_pole_trs`), instead of in the sector store after the
+screening stage. With time reversal the static charge–current coupling
+vanishes and the mixed CT/TC terms are purely dynamical; use
+`bispinor_gw = bare_transverse` (docs/theory/bispinor-gw.md §10).
+
 ## 2026-10-05 — the one-shot names every band it reads at Σ(ω = 0)
 
 The one-shot's incomplete-grid warning now lists each band read at

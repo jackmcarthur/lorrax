@@ -416,6 +416,7 @@ driver entry.
 |---|---|---|
 | `bispinor_gw_*_retired` (three) | `coerce_bispinor_gw_mode` | a retired mode spelling; names the replacement |
 | (deck key) `bispinor_tt_head_correction` | `read_lorrax_input` | the removed key appears at any value |
+| `full_shared_pole_trs` | `screening.refuse_full_shared_pole_with_trs` (driver entry, on the measured symmetry) | `full_shared_pole` on a WFN with time reversal; use `bare_transverse` |
 | `packed_bare_transverse_tt_head_double_count` | `refuse_unsupported_bispinor_gw` | a hand-built `head.bispinor_tt_head_correction = True` on a packed route |
 | `bispinor_tt_head_unsupported` | `refuse_unsupported_bispinor_tt_head_correction` | a hand-built overlay without bispinor or with `sys_dim ∉ {2,3}` |
 | `bispinor_head_correction_no_local_fields_unavailable` | `refuse_unsupported_bispinor_gw` | `no_local_fields` on any bispinor route except SP-hybrid and SP-full |
