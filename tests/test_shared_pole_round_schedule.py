@@ -1,10 +1,9 @@
-"""Every shared-pole round program sees one shape per run (CPU, seconds).
+"""Shared-pole rounds: one fixed-width schedule, and a pencil extent that grows only in map 0 (CPU).
 
-Rows 2 and 3 of the 2026-10-05 compile audit: a ragged face tail and a
-selection-sized pencil extent each recompiled every round program. One
-fixed-width schedule (``parent_rounds``) serves the local, face, scalar and
-rerun routes, and ``round_tables`` sizes the pencil at the panels' capacity,
-known before the first round.
+Rows 2 and 3 of the 2026-10-05 compile audit: a ragged face tail recompiled every
+round program, and a selection-sized extent recompiled them on every growth in
+every map. One schedule (``parent_rounds``) serves the local, face, scalar and
+rerun routes; ``round_tables`` grows the extent in map 0 and holds it from map 1.
 """
 from types import SimpleNamespace
 
@@ -46,42 +45,6 @@ def test_ragged_tail_traces_once():
     for ids, real, slots, _ in _schedule("face", 3):
         round_program(jnp.stack([jnp.eye(4) * (q + 1) for q in ids]))
     assert len(traces) == 1
-
-
-def test_recipe_panel_widths_are_known_before_round_one():
-    """Panels of a selection narrower than its recipe width are padded to that width; a wider one keeps its own."""
-    from types import SimpleNamespace
-    from gw.shared_pole_local import recipe_panel_widths
-    recipe = {"imaginary_width": 100, "line_direction_cap": 25}
-    roles = [{"role": "imaginary:0"}, {"role": "imaginary:0", "conjugate": True},
-             {"role": "line:1"}, {"role": "line:1", "conjugate": True},
-             {"role": "imaginary:0", "mirror": True}, {"role": "line:1", "mirror": True}]
-    panel = lambda w: (0j, SimpleNamespace(shape=(4, 432, w)))
-    states = [panel(64), panel(64), panel(20), panel(20), panel(64), panel(112)]
-    widths = recipe_panel_widths(roles, states, recipe, column_extent=lambda w: -(-w // 8) * 8, logical_n=432)
-    assert widths == [104, 104, 32, 32, 104, 112]
-    # No line cap: the logical extent bounds the line panels.
-    widths = recipe_panel_widths(roles[2:3], states[2:3], {"imaginary_width": 100}, column_extent=int, logical_n=432)
-    assert widths == [432]
-
-
-def test_infinity_block_wider_than_the_recipe_keeps_its_own_carrier():
-    """An M1 selection closed over a multiplet past the recipe width is never cut (Na, a metal)."""
-    import pytest
-    from types import SimpleNamespace
-    from gw.shared_pole_local import recipe_infinity_width, pad_states
-    recipe = {"infinity_width": 54}
-    extent = lambda w: -(-w // 8) * 8
-    narrow = (SimpleNamespace(shape=(4, 432, 40)),)
-    wide = (SimpleNamespace(shape=(4, 432, 72)),)
-    assert recipe_infinity_width(narrow, recipe, column_extent=extent, logical_n=432) == 56
-    assert recipe_infinity_width(wide, recipe, column_extent=extent, logical_n=432) == 72
-    assert recipe_infinity_width(wide, recipe, column_extent=extent, logical_n=60) == 72
-    # A carrier below a panel is refused by name, never a negative pad.
-    block = (jnp.ones((1, 4, 72)),)
-    with pytest.raises(ValueError, match="GATE shared_pole_carrier"):
-        pad_states([], [], block, 56)
-    assert pad_states([], [], block, 72)[1][0].shape == (1, 4, 72)
 
 
 def test_pencil_extent_grows_in_map_zero_then_holds():

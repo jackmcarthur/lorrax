@@ -555,28 +555,7 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
                  max(1, min(width - 1, width * max(room, 0) // compiled)))
 
 
-def sized_sector_sides(routes, held=None):
-    """Each diagonal sector's pencil side and CT span the face batch is sized at.
-
-    Map 0 and a one-shot take the recipe bound (``conservative_pencil_side``,
-    the span at most the signed side bound). From map 1 on, ``held`` (the SC
-    session's ``shared_pole_rank_capacity``) carries each sector's pencil side
-    and CT span width from map 0 (``construct_diagonal_sector_round``,
-    ``cross_span_widths``), and the batch is sized at those: CrI3 24x24 CC
-    17472 against a bound of 20800, TT 24832 against 32000, so more parents
-    fit one round and the sector stage runs fewer rounds (owner 2026-10-05).
-    Returns ``(sides, spans)`` in the routes' order.
-    """
-    held = held or {}
-    names = ('CC', 'TT')           # routes are (charge, current)
-    sides = [int(held.get(name + '_pencil_side', row['conservative_pencil_side']))
-             for name, row in zip(names, routes)]
-    spans = [min(row['signed_side_bound'], side, int(held.get(name, row['signed_side_bound'])))
-             for name, row, side in zip(names, routes, sides)]
-    return sides, spans
-
-
-def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq, held=None):
+def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     """The common CC/TT/CT face batch, before reading any sample matrix (``face_batch_width``).
 
     The joint extent covers both retained diagonal spans and the rectangular
@@ -584,8 +563,11 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq, he
     samples), the moments and the cross panels that the caller still holds
     during the cross reduction are priced beside it. A width is admitted by
     the largest compiled size of the round's three whole-chain programs at the
-    sized shapes (``sized_sector_sides``), CC's and TT's ``face_parent_program``
-    and CT's ``cross_parent_program`` (``sector_program_bytes_per_rank``).
+    conservative shapes, CC's and TT's ``face_parent_program`` and CT's
+    ``cross_parent_program`` (``sector_program_bytes_per_rank``). Sizing at
+    the sides held after map 0 was measured and declined (CrI3 24x24 P64:
+    batch 3 -> 5, a round's cost scales with its parents, -9 % per parent at
+    best, one more sizing pass per process).
     """
     import copy
     import time
@@ -593,11 +575,11 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq, he
 
     joint = copy.copy(meta)
     joint.n_rmu_padded = sum(row['packed_extent'] for row in routes)
-    sides, spans = sized_sector_sides(routes, held)
-    side = sum(sides)
+    side = sum(row['conservative_pencil_side'] for row in routes)
     # CT diagonalizes the retained joint span, never the unreduced
     # rectangular C/T pencil. Diagonal sectors still solve their own side.
-    eigen_side = max(max(sides), sum(spans))
+    spans = [min(row['signed_side_bound'], row['conservative_pencil_side']) for row in routes]
+    eigen_side = max(max(row['conservative_pencil_side'] for row in routes), sum(spans))
     lines = line_panel_count(recipe)
     dense = len(recipe['fit_ids']) - lines
     # Each family's cross panels: 8 [rows of the other family, line width]
@@ -605,9 +587,8 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq, he
     charge, current = routes
     cross = lines * 8 * (current['packed_extent'] * charge['line_width']
                          + charge['packed_extent'] * current['line_width'])
-    shapes = [dict(rows=row['packed_extent'], side=sized,
-                   infinity_width=row['infinity_width'], ordered=True, odd_moments=True)
-              for row, sized in zip(routes, sides)]
+    shapes = [dict(rows=row['packed_extent'], side=row['conservative_pencil_side'],
+                   infinity_width=row['infinity_width'], ordered=True, odd_moments=True) for row in routes]
     sizes, seconds = {}, dict(CC=0.0, TT=0.0, CT=0.0)
 
     def program_bytes(width):
@@ -627,8 +608,7 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq, he
         program_bytes=program_bytes, eigen_side=eigen_side,
         extra=lambda width: int(np.ceil(16 * width * ((4 * dense + 8) * joint.n_rmu_padded**2 + cross)
                                         / mesh.size)))
-    return width, dict(receipt, sector_program_bytes_per_rank=sizes, sector_program_seconds=seconds,
-                       sized_pencil_sides=dict(zip(('CC', 'TT'), sides)), sized_cross_spans=dict(zip(('CC', 'TT'), spans)))
+    return width, dict(receipt, sector_program_bytes_per_rank=sizes, sector_program_seconds=seconds)
 
 
 @lru_cache(maxsize=None)

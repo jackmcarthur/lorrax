@@ -229,42 +229,20 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     def admit_face(nq):
         nonlocal batch_width,sizes,face_room
         from gw.shared_pole_capacity import face_eigh_room
-        from gw.shared_pole_execution import sector_batch_width,sized_sector_sides
-        # From map 1 on the session holds map 0's pencil sides and CT spans
-        # (sized_sector_sides); map 0 and a one-shot size at the recipe bound.
-        held=getattr(meta,'shared_pole_rank_capacity',None)
-        sides,spans=sized_sector_sides(execution_rows,held)
-        earlier=None if held is None else held.get('face_batch')
-        side=sum(sides)+sum(spans)
-        if earlier is not None and earlier['nq']==int(nq) and (earlier['width']>=int(nq) or
-                earlier['bytes']*(side/earlier['side'])**2*(earlier['width']+1)/earlier['width']>earlier['room']):
-            # The program bytes scale with the side squared: at the held sides a wider
-            # batch still cannot fit the map-0 room, so the second sizing pass (its
-            # whole-chain compiles) is skipped and map 0's batch and sizes are kept.
-            batch_width,sizes,face_room=earlier['width'],dict(earlier['sizes']),earlier['face_room']
-            batch_admission=dict(reused_from_map_0=True,parent_batch=batch_width,reduction=None,
-                                 sector_program_bytes_per_rank=sizes,sector_program_seconds=dict.fromkeys(sizes,0.0))
-            seconds=batch_admission['sector_program_seconds']
-        else:
-            batch_width, batch_admission = sector_batch_width(
-                meta,linalg_resolution({'linalg':config.backend.linalg}),recipe,execution_rows,
-                mesh=mesh_xy,ledger=ledger,nq=nq,held=held)
-            sizes,seconds = (batch_admission[f'sector_program_{key}'] for key in ('bytes_per_rank','seconds'))
-            # distrib_la decides every face eigh stack against the room beside the
-            # admitted batch, whose row holds the largest whole-chain program, so
-            # it bounds every round's retry (whole matrices per rank where they fit).
-            face_room = face_eigh_room(batch_admission['reduction'])
-            if held is not None:
-                reduction=batch_admission['reduction']
-                held['face_batch']=dict(nq=int(nq),width=int(batch_width),side=int(side),face_room=face_room,
-                    sizes={k:int(v) for k,v in sizes.items()},bytes=int(max(sizes.values())),
-                    room=int(reduction['available_device_bytes_per_rank']-reduction['aggregate_bytes_per_rank']
-                             +max(sizes.values())))
+        from gw.shared_pole_execution import sector_batch_width
+        batch_width, batch_admission = sector_batch_width(
+            meta,linalg_resolution({'linalg':config.backend.linalg}),recipe,execution_rows,
+            mesh=mesh_xy,ledger=ledger,nq=nq)
+        sizes,seconds = (batch_admission[f'sector_program_{key}'] for key in ('bytes_per_rank','seconds'))
+        # distrib_la decides every face eigh stack against the room beside the
+        # admitted batch, whose row holds the largest whole-chain program, so
+        # it bounds every round's retry (whole matrices per rank where they fit).
+        face_room = face_eigh_room(batch_admission['reduction'])
+        # The decision is printed when it is made; the constructor's summary
+        # line comes only after the stage, so a leg that ends mid-stage has none.
         if jax.process_index()==0:
-            print(f"Shared-pole face batch: {batch_width} parent(s) of {int(nq)} at pencil sides "
-                  f"CC {sides[0]} TT {sides[1]} (CT spans {spans[0]}+{spans[1]}); "
-                  + ("map-0 batch kept, no sizing" if batch_admission.get('reused_from_map_0') else
-                     "sized in %.1f s" % sum(seconds.values())),flush=True)
+            print(f"Shared-pole face batch: {batch_width} parent(s) of {int(nq)} per round; "
+                  f"sized in {sum(seconds.values()):.1f} s",flush=True)
         for row in (*execution_rows,execution_rows[0]['joint']):
             row['batch_admission'] = batch_admission
             name = row.get('sector','CT')
@@ -740,26 +718,22 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     # held from map 1.
     widths=recipe_panel_widths(roles[0],states,recipe,column_extent=extent,logical_n=n)
     infinity_width=recipe_infinity_width(infinity,recipe,column_extent=extent,logical_n=n)
+    history=carrier_history(meta)
+    name=(('sector',geometry['sector'],n),'extent',2,len(states))
+    before=int(history.get(name,(0,))[0])
     tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],
-        infinity_width,column_extent=extent,ordered=True,odd_moments=True,
-        key=('sector',geometry['sector'],n),history=carrier_history(meta))
+        infinity_width,column_extent=extent,ordered=True,odd_moments=True,key=name[0],history=history)
     side=int(tables['active'].shape[-1])
     budget.plan(side,phase='reduction',padding_output_bytes_per_rank=round_padding_output_bytes(
         states,infinity,widths,infinity_width))
     states,infinity=pad_states(states,widths,infinity,infinity_width)
-    # The session keeps this sector's held pencil side for the later maps'
-    # face batch (sized_sector_sides). An SC map past 0 that still grows
-    # says so in its log, as the CT span and K holds do.
+    # An SC map past 0 that still grows its extent says so in its log, as
+    # the CT span and K holds do.
     capacity=getattr(meta,'shared_pole_rank_capacity',None)
-    if capacity is not None:
-        key=geometry['sector']+'_pencil_side'
-        before=int(capacity.get(key,0))
-        if side>before:
-            if before:
-                capacity.setdefault('_events',[]).append(
-                    f"shared-pole {geometry['sector']} round: a state's selection exceeds its held carrier; "
-                    f"pencil side {before} -> {side}")
-            capacity[key]=side
+    if before and capacity is not None and int(history[name][0])>before:
+        capacity.setdefault('_events',[]).append(
+            f"shared-pole {geometry['sector']} round: a state's selection exceeds its held carrier; "
+            f"pencil extent {before} -> {int(history[name][0])}")
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
     if execution == 'face':
