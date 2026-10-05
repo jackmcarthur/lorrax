@@ -169,6 +169,10 @@ def test_scf_magnetization_from_the_matching_density(tmp_path):
                     absolute=0.0, density=b"rho-old")
     assert scf_absolute_magnetization([nscf], [other, scf]) == 6.66
     assert scf_absolute_magnetization([nscf], [other]) is None
+    unreadable = Path(_schema(tmp_path / "locked/x.save", calculation="scf", do_mag="true",
+                              absolute=1.0, density=b"rho-scf")).parent / "charge-density.hdf5"
+    unreadable.chmod(0)
+    assert scf_absolute_magnetization([nscf], [unreadable.parent / "data-file-schema.xml"]) is None
     plain = read_qe_symmetry_receipt(_schema(
         tmp_path / "nm/x.save", calculation="nscf", do_mag="false",
         absolute=0.0, density=b"rho-nm"))

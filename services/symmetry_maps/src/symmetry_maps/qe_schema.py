@@ -20,7 +20,7 @@ transpose/translation defect this receipt is intended to prevent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import filecmp
 import hashlib
@@ -459,12 +459,12 @@ def scf_absolute_magnetization(bound: list[QESymmetryReceipt],
     for path in candidates:
         try:
             other = read_qe_symmetry_receipt(path)
+            twin = _density_file(other.schema_path)
+            if (other.calculation in _SELF_CONSISTENT and twin is not None
+                    and any(filecmp.cmp(twin, d, shallow=False) for d in densities)):
+                return other.absolute_magnetization
         except (OSError, ET.ParseError, ValueError):
             continue
-        twin = _density_file(other.schema_path)
-        if (other.calculation in _SELF_CONSISTENT and twin is not None
-                and any(filecmp.cmp(twin, d, shallow=False) for d in densities)):
-            return other.absolute_magnetization
     return None
 
 
@@ -529,20 +529,17 @@ def resolve_qe_symmetry_binding(
         path = binding.schema_path
         return (0 if "/nscf/" in path else 1, len(Path(path).parts), path)
 
-    selected = sorted(bindings, key=rank)[0]
+    best = sorted(bindings, key=rank)[0]
     aliases = tuple(
         binding.schema_path for binding in bindings
-        if binding.schema_path != selected.schema_path)
-    selected = QESymmetryBinding(
-        schema_path=selected.schema_path,
-        schema_sha256=selected.schema_sha256,
-        antiunitary=selected.antiunitary,
-        qe_permitted_pure_time_reversal=(
-            selected.qe_permitted_pure_time_reversal),
-        equivalent_schema_paths=aliases,
-        scf_absolute_magnetization=scf_absolute_magnetization(
-            receipts, discover_qe_schema_paths(*anchors)),
-    )
+        if binding.schema_path != best.schema_path)
+    # m from the selected schema's own receipt (an alias's only through the
+    # byte-identical density check), and only when no t_rev row decides.
+    selected = replace(
+        best, equivalent_schema_paths=aliases,
+        scf_absolute_magnetization=None if best.n_antiunitary else scf_absolute_magnetization(
+            [next(r for b, r in zip(bindings, receipts) if b is best)],
+            discover_qe_schema_paths(*anchors)))
     diagnostic = (
         f"authenticated {selected.schema_path} "
         f"(sha256={selected.schema_sha256[:12]}, "
