@@ -279,8 +279,6 @@ $H$ keeps the full operator inside a degenerate multiplet. Averaging only the
 diagonal of a degenerate block would depend on the arbitrary basis inside it
 and break the symmetry of the next map. BerkeleyGW's degeneracy averaging
 (`no_degen_averaging`) applies only to reported diagonals.
-`sc_exact_degeneracy_tol_ev` (at most and by default 1e-4 eV) groups levels
-into multiplets for the label assignment of §5; it is not a convergence knob.
 
 ## 3 The head and the velocity on each map
 
@@ -518,11 +516,10 @@ the coarse pin, the convergence test) is indexed by $(k,$ DFT label$)$, not by
 sorted position; a level crossing must not relabel a state.
 `sc_state_identity.assign_qp_identity` assigns, at each k, QP columns to DFT
 labels by maximizing the summed projector overlap $\sum |\langle \psi^{\rm
-DFT}_m | \psi^{\rm QP}_n \rangle|^2$ (a linear assignment). Levels within
-`sc_exact_degeneracy_tol_ev` form multiplets; a multiplet is one capacity
-block scored by its summed overlap, so its internal gauge does not enter, and
-its members report the block-mean energy. A label set that cuts a DFT
-multiplet refuses. The convergence readout (`sc_iteration._sc_identity_for_call`)
+DFT}_m | \psi^{\rm QP}_n \rangle|^2$ (a linear assignment). Inside an
+exactly degenerate multiplet which label takes which column is a gauge
+choice, but the set of columns is not, and every consumer reads energies,
+which are equal there. The convergence readout (`sc_iteration._sc_identity_for_call`)
 matches each map's input to the labels of the map-0 output and pairs each
 input column with the output column of the same sorted index, so a label only
 names a pair. Matching the output to the labels separately compared two
@@ -540,7 +537,7 @@ input:
 
 | verdict | rule |
 |---|---|
-| **CONVERGED** | $\max \lvert E_{\rm out} - E_{\rm in}\rvert$ over the QP-matrix labels is below `sc_tol_ev` (default 1e-4 eV). $E_{\rm in}$ are the eigenvalues of the input $H$, $E_{\rm out}$ those of $F(H)$, paired by sorted index and named by label. The loop returns that input with its own Σ, W and head. |
+| **CONVERGED** | $\max \lvert E_{\rm out} - E_{\rm in}\rvert$ over the QP-matrix labels is below `sc_tol_ev` (default 1e-4 eV). $E_{\rm in}$ are the eigenvalues of the input $H$, $E_{\rm out}$ those of $F(H)$, paired by sorted index and named by label, each pair on its own (no block mean: sorted energies are basis-free inside an exact multiplet, and a mean over a split block hides the change of its splitting). The loop returns that input with its own Σ, W and head. |
 | **STALLED at floor, not converged** | the label-free residual $r_n = \max_k \lVert P\,(F(H_n) - H_n)\,P\rVert_2$ (logged as `SC matrix residual`) has not improved by 10 % over the last 12 maps. |
 | budget | `sc_max_iter = N` (default 30): N ≥ 2 runs map 0 plus N accelerated maps; N = 1 is a special case that runs map 0 only, as a labelled one-map diagnostic. |
 

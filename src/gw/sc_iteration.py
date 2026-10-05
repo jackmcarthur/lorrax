@@ -294,7 +294,7 @@ def protected_band_convergence(
 
     ``e_*_ev`` are ``(nk, nb_active)`` eV indexed by map-0 QP identity: the
     SC caller puts each identity's input and output at the same sorted
-    columns and averages them within exact multiplets.
+    column, unaveraged.
     The test set is the current per-k ``protected_mask | in_range_mask``: full
     protected diagonals plus the unprotected in-range diagonals. This is
     exactly the diagonal-retention mask in ``apply_band_partition``.
@@ -3062,17 +3062,11 @@ def _classify_sc_partition(
     from .sc_state_identity import assign_qp_identity
 
     ks = _kstar(inputs)
-    e_reference = np.asarray(inputs.e_dft_active_kn_ry) * RYD_TO_EV
-    e_reference_loop = (
-        e_reference if ks.is_identity else np.asarray(ks.select(e_reference)))
     e_current_loop = np.asarray(E_qp_ry) * RYD_TO_EV
     nb_identity = e_current_loop.shape[1]
     # The reference is the DFT basis itself (U = I): its overlaps are |U|^2.
-    indices_loop, _, _, _ = assign_qp_identity(
-        None, e_reference_loop,
-        np.asarray(gather_to_host(U_qp)), e_current_loop,
-        np.ones(nb_identity, dtype=bool),
-        degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
+    indices_loop, _ = assign_qp_identity(
+        None, np.asarray(gather_to_host(U_qp)), np.ones(nb_identity, dtype=bool))
     energies_loop = np.take_along_axis(e_current_loop, indices_loop, axis=1)
     if occupation_state is not None:
         mu_ry = float(occupation_state.mu_ry)
@@ -5081,7 +5075,7 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     """Read a map's residual per QP state; retain only small host diagnostics.
 
     The reference is the first map OUTPUT. Its labels are the trusted DFT
-    bands: at map 0 each trusted DFT band is assigned (by multiplet
+    bands: at map 0 each trusted DFT band is assigned (by projector
     overlap from the DFT basis, including for a reordered warm seed) to the
     output column that carries it. Each map's INPUT is matched to those
     labels, and each input column is paired with the output column of the
@@ -5109,83 +5103,47 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
     nb = e_output_ev.shape[1]
     u_in = u_in[:, :nb, :nb]
     u_out = u_out[:, :nb, :nb]
-    kw = dict(degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
     if not history:
-        reference_u, reference_e = u_in, e_input_ev
+        reference_u = u_in
         if getattr(inputs, 'initial_state_role', 'dft_seed') == 'external_qp_seed':
             # A warm seed may already reorder the protected DFT identities.
             # Its sorted columns cannot label the frozen partition.
-            ks = _kstar(inputs)
-            reference_e = np.asarray(inputs.e_dft_active_kn_ry) * RYD_TO_EV
-            if not ks.is_identity:
-                reference_e = np.asarray(ks.select(reference_e))
             reference_u = np.broadcast_to(np.eye(nb), u_in.shape)
-        # DFT band -> map-0 output column, whole DFT multiplets (the
-        # partition promotes to whole multiplets, so the trusted band mask
-        # never cuts one in the input spectrum).
-        # Validate whole trusted reference multiplets using the established
-        # readout, then fill the rest without changing those assignments.
-        assign_qp_identity(reference_u, reference_e, u_out, e_output_ev, mask, **kw)
-        slot, _, blocks0, _ = assign_qp_identity(
-            reference_u, reference_e, u_out, e_output_ev,
-            np.ones(mask.shape, dtype=bool), priority_mask=mask, **kw)
+        # DFT band -> map-0 output column; trusted bands first.
+        slot, _ = assign_qp_identity(
+            reference_u, u_out, np.ones(mask.shape, dtype=bool), priority_mask=mask)
         labels = np.zeros(slot.shape, dtype=bool)
         labels[np.nonzero(mask)[0], slot[mask]] = True
-        # The reference groups are the DFT (symmetry) multiplets, not the
-        # adjacent-gap groups of the map-0 output spectrum: a degenerate
-        # pair that the map splits by more than the exact tolerance would
-        # otherwise become two gauge-dependent singlets.  Members of one
-        # DFT multiplet therefore carry their block-mean output energy in
-        # the reference spectrum (Si replay6, 2026-09-05).
-        e_ref = np.array(e_output_ev, dtype=np.float64)
-        for k in range(slot.shape[0]):
-            for block in np.unique(blocks0[k][blocks0[k] >= 0]):
-                members = slot[k, blocks0[k] == block]
-                e_ref[k, members] = e_ref[k, members].mean()
-        history.update(u=u_out.copy(), e=e_ref, mask=mask.copy(),
-                       labels=labels, slot=slot, previous=None)
+        history.update(u=u_out.copy(), labels=labels, slot=slot, previous=None)
     slot = history['slot']
     found = slot >= 0
     rows = np.arange(slot.shape[0])[:, None]
-    cols = np.where(found, slot, 0)
-    dft_of_label = np.full(slot.shape, -1, dtype=int)
-    dft_of_label[np.nonzero(found)[0], slot[found]] = np.nonzero(found)[1]
-
-    def by_dft_band(table, fill):
-        # label-indexed (map-0 output column) -> DFT-band-indexed
-        return np.where(found, np.asarray(table)[rows, cols], fill)
-
-    in_index, in_e, block_label, weight = assign_qp_identity(
-        history['u'], history['e'], u_in, e_input_ev,
-        np.ones(mask.shape, dtype=bool), priority_mask=history['labels'], **kw)
-    # The output at the input's columns, averaged over the same label blocks.
-    group = block_label + nb * np.arange(block_label.shape[0])[:, None]
-    out_e = np.bincount(group.ravel(), np.take_along_axis(
-        e_output_ev, in_index, axis=1).ravel(), group.size)
-    out_e = (out_e / np.maximum(np.bincount(group.ravel(), minlength=group.size), 1))[group]
-    out_index = in_index = by_dft_band(in_index, -1)
-    out_e, in_e = by_dft_band(out_e, np.nan), by_dft_band(in_e, np.nan)
-    weight = by_dft_band(weight, np.nan)
-    # block labels in DFT-band terms, from the same reference grouping that
-    # produced the block means (so the eqp comments and the body agree)
-    first_label = by_dft_band(block_label, 0)
-    blocks = np.where(found, dft_of_label[rows, first_label], -1)
-    # Only trusted columns enter the criterion and receive the block means.
-    aligned_in, aligned_out = np.array(e_input_ev), np.array(e_output_ev)
-    aligned_in[mask], aligned_out[mask] = in_e[mask], out_e[mask]
+    in_index, weight = assign_qp_identity(
+        history['u'], u_in, np.ones(mask.shape, dtype=bool),
+        priority_mask=history['labels'])
+    # label-indexed (map-0 output column) -> DFT-band-indexed
+    col = np.where(found, in_index[rows, np.where(found, slot, 0)], -1)
+    weight = np.where(found, weight[rows, np.where(found, slot, 0)], np.nan)
+    if (col[mask] < 0).any():
+        raise ValueError("SC identity: a trusted DFT band has no input column")
+    # THE CRITERION: each trusted label's input column against the output
+    # column of the same sorted index, unaveraged.  Sorted energies do not
+    # depend on the basis inside an exact multiplet, and a mean over a
+    # block the map splits would hide the change of its splitting.
+    in_e = np.take_along_axis(e_input_ev, np.maximum(col, 0), axis=1)
+    out_e = np.take_along_axis(e_output_ev, np.maximum(col, 0), axis=1)
     verdict = protected_band_convergence(
-        aligned_out, aligned_in, protected, in_range, cutoff_ev)
+        np.where(mask, out_e, e_output_ev), np.where(mask, in_e, e_input_ev),
+        protected, in_range, cutoff_ev)
     previous = history['previous']
     motion = (np.full(out_e.shape, np.nan) if previous is None else out_e - previous)
     history['previous'] = out_e.copy()
-    reassigned = np.sum(mask & (out_index != np.arange(nb)[None, :]), axis=1)
+    reassigned = np.sum(mask & (col != np.arange(nb)[None, :]), axis=1)
     worst_k = int(np.argmax(reassigned))
-    info = dict(input_indices=np.where(mask, in_index, -1),
-                output_indices=np.where(mask, out_index, -1),
-                blocks=np.where(mask, blocks, -1),
+    info = dict(input_indices=np.where(mask, col, -1),
                 input_ev=np.where(mask, in_e, np.nan),
                 output_ev=np.where(mask, out_e, np.nan),
-                residual_ev=np.where(mask, out_e-in_e, np.nan),
+                residual_ev=np.where(mask, out_e - in_e, np.nan),
                 motion_ev=np.where(mask, motion, np.nan),
                 weight=np.where(mask, weight, np.nan))
     state_out = replace(state_out, outputs=replace(state_out.outputs, identity=info))
@@ -5511,20 +5469,20 @@ def _write_sc_eqp_snapshot(
     identity = getattr(state_out.outputs, 'identity', None)
     if identity is not None:
         tables = {key: _loop_to_file_wedge(identity[key]) for key in
-                  ('input_indices', 'output_indices', 'blocks', 'input_ev',
-                   'output_ev', 'residual_ev', 'motion_ev', 'weight')}
+                  ('input_indices', 'input_ev', 'output_ev', 'residual_ev',
+                   'motion_ev', 'weight')}
         comments.append('SC_identity refers to eqp0 map output; labels are '
                         'the trusted DFT bands, matched at map 0 to the output '
-                        'columns that carry them; QP multiplet means; '
-                        'k_file_0based indexes the k block, body columns '
-                        'remain ispin, iband, E_DFT, E_QP')
+                        'columns that carry them; input and output share the '
+                        'sorted column; k_file_0based indexes the k block, '
+                        'body columns remain ispin, iband, E_DFT, E_QP')
         protected_file = _loop_to_file_wedge(np.broadcast_to(
             np.asarray(snapshot_partition.protected_mask, bool),
             np.shape(state_out.H_qp_dft)[:2])).astype(bool)
         in_range_file = _loop_to_file_wedge(np.broadcast_to(
             np.asarray(snapshot_partition.in_range_mask, bool),
             np.shape(state_out.H_qp_dft)[:2])).astype(bool)
-        for k, row in enumerate(tables['blocks'].astype(int)):
+        for k, row in enumerate(tables['input_indices'].astype(int)):
             def mask_bands(mask):
                 return ','.join(str(int(n) + band_offset + 1)
                                 for n in np.flatnonzero(mask)) or 'none'
@@ -5534,21 +5492,18 @@ def _write_sc_eqp_snapshot(
                 f'in_range_DFT_bands_1based={mask_bands(in_range_file[k])} '
                 f'scissored_DFT_bands_1based='
                 f'{mask_bands(~(protected_file[k] | in_range_file[k]))}')
-            for block in np.unique(row[row >= 0]):
-                labels = np.flatnonzero(row == block)
-                first = labels[0]
-                def band_list(a):
-                    return ','.join(str(int(v) + band_offset + 1) for v in a)
+            # One row per label; the *_mean_ev keys keep the parsers' grammar.
+            for label in np.flatnonzero(row >= 0):
                 comments.append(
                     f'SC_identity k_file_0based={k} '
-                    f'map0_bands_1based={band_list(labels)} '
-                    f'input_sorted_bands_1based={band_list(tables["input_indices"][k, labels])} '
-                    f'output_sorted_bands_1based={band_list(tables["output_indices"][k, labels])} '
-                    f'E_input_mean_ev={tables["input_ev"][k, first]:.12e} '
-                    f'E_output_mean_ev={tables["output_ev"][k, first]:.12e} '
-                    f'residual_ev={tables["residual_ev"][k, first]:.12e} '
-                    f'motion_ev={tables["motion_ev"][k, first]:.12e} '
-                    f'projector_weight={tables["weight"][k, first]:.12e}')
+                    f'map0_bands_1based={label + band_offset + 1} '
+                    f'input_sorted_bands_1based={row[label] + band_offset + 1} '
+                    f'output_sorted_bands_1based={row[label] + band_offset + 1} '
+                    f'E_input_mean_ev={tables["input_ev"][k, label]:.12e} '
+                    f'E_output_mean_ev={tables["output_ev"][k, label]:.12e} '
+                    f'residual_ev={tables["residual_ev"][k, label]:.12e} '
+                    f'motion_ev={tables["motion_ev"][k, label]:.12e} '
+                    f'projector_weight={tables["weight"][k, label]:.12e}')
     comments = tuple(comments)
     path = os.path.join(
         inputs.input_dir, f"eqp0_iter{int(call_index):04d}.dat")
@@ -7125,7 +7080,6 @@ def run_sc_driver(
         inputs,
         f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
         f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}, "
-        f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV, "
         f"depth={sc.history_depth}")
     state_final, rms_history = run_self_consistency(
         state_init, inputs,

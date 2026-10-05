@@ -1373,10 +1373,6 @@ _DEFAULTS = {
     # sc_checkpoint.h5 beside it continues that run instead
     # (docs/self_consistency.md section 8).
     "sc_initial_qp_rotations_file": "",
-    # Symmetric correction averaging is legal only for accidental/exact
-    # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more
-    # than an order below MoS2's physical 1.7--3.6 meV SOC-split K pair.
-    "sc_exact_degeneracy_tol_ev": 1.0e-4,
     # Owner 2026-09-23: the lowest N bands (1-based 1..N; semicore) are held
     # at their DFT Hamiltonian block in every QSGW map -- still in the Sigma_x
     # and chi0 sums, never updated.  0 updates every QP-window band.
@@ -2643,8 +2639,6 @@ def _input_iteration(
         dump_dir=_sc_env(
             "LORRAX_SC_DUMP_DIR", str, str(params["sc_dump_dir"] or ""),
             "sc_dump_dir") or None,
-        exact_degeneracy_tol_ev=float(
-            params["sc_exact_degeneracy_tol_ev"]),
         frozen_core_bands=int(params["sc_frozen_core_bands"]),
         semicore=str(params["sc_semicore"]).strip().lower(),
         eigh=_linalg.sc_eigh,
@@ -3158,6 +3152,12 @@ def _report_remaining_retired_keys(
         raise ValueError(
             "Input key 'band_chunk_size' is retired; band chunks are sized "
             "from memory_per_device_gb.  Remove the key.")
+    if section.get("sc_exact_degeneracy_tol_ev", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'sc_exact_degeneracy_tol_ev' is retired: the SC stop "
+            "test reads each sorted pair on its own and the state identity "
+            "matches single projector overlaps, so nothing groups levels into "
+            "multiplets.  Remove the key.")
     if section.get("sc_tail_fit", fallback=None) is not None:
         raise ValueError(
             "Input key 'sc_tail_fit' is retired: the sum-band tail is always "
@@ -4464,7 +4464,6 @@ class SCConfig:
     accelerator: str      # "anderson" — the only supported value
     history_depth: int
     dump_dir: str | None
-    exact_degeneracy_tol_ev: float = 1.0e-4
     frozen_core_bands: int = 0
     #: "qp" | "dft": the coarse (semicore) class moves with its own Sigma, or
     #: its DFT-basis block stays DFT and it reads Sigma at E_DFT (mixing kept).
@@ -4514,11 +4513,6 @@ class SCConfig:
                 "  doc:  docs/self_consistency.md; claim 2391")
         if self.history_depth < 1:
             raise ValueError("sc_history_depth must be >= 1.")
-        if not (0.0 < self.exact_degeneracy_tol_ev <= 1.0e-4):
-            raise ValueError(
-                "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
-                "The 0.1 meV ceiling separates accidental degeneracy from "
-                "resolved physical splittings; it is not an SC damping knob.")
         if self.frozen_core_bands < 0:
             raise ValueError("sc_frozen_core_bands must be >= 0.")
         if self.semicore not in ("qp", "dft"):

@@ -5,6 +5,22 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — the SC stop test reads each sorted pair on its own; `sc_exact_degeneracy_tol_ev` is retired
+
+The SC criterion is max over k and trusted labels of |E_out − E_in| at the
+label's own sorted column (the spectral distance on the trusted columns). It
+no longer averages input and output over a label block first. Inside an exact
+multiplet the sorted energies are equal, so nothing changes there; over a
+block that Σ splits, the mean hid the change of the splitting (a pair whose
+splitting moved 0 → 10 meV at a fixed centre read 0 and CONVERGED). The state
+identity now matches single projector overlaps, with no multiplet grouping,
+so the eqp `SC_identity` comments carry one row per label (same keys). That
+also removes the spurious blocks formed when the multiplet means made the
+reference spectrum non-monotonic. Replayed on nine existing SC histories
+(CrI3 24×24, CrSBr 16×12 and 20×15, AgI, Ni 20³, Fe 20³ and 4³), the stop map
+does not move; the largest within-block motion the mean removed at a stop map
+was 0.023 meV. A deck that sets `sc_exact_degeneracy_tol_ev` refuses by name:
+delete the line.
 ## 2026-10-05 — `full_shared_pole` on a WFN with time reversal refuses at driver entry
 
 `bispinor_gw = full_shared_pole` on a WFN with time reversal now refuses at
