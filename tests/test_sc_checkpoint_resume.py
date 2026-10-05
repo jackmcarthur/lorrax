@@ -164,7 +164,7 @@ def test_deck_digest_reads_lines_as_the_parser_does(monkeypatch, tmp_path):
     def digest(text):
         deck = tmp_path / "deck.in"
         deck.write_text(text)
-        inputs = SimpleNamespace(config=SimpleNamespace(input_file=str(deck)),
+        inputs = SimpleNamespace(config=SimpleNamespace(input_file=str(deck), bispinor=False),
                                  wfn=None, wfn_fingerprint_binding=None)
         return _sc_checkpoint_identity(inputs, (1, 2, 2), 20)["deck_sha256"]
     base = digest("[cohsex]\nnband = 60\nsc_max_iter = 30\n")

@@ -28,10 +28,7 @@ from common import jax_profile
 # being attribute-reachable off a bare ``import jax`` (an import-order
 # accident).  (audit fix/zq 2026-07-28)
 from common.collectives import barrier
-from common.four_current_model import (
-	RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION,
-	resolve_four_current_representation,
-)
+from common.four_current_model import resolve_four_current_representation
 from runtime import debug_print_enabled
 from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 
@@ -423,8 +420,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'wfn_file':             os.path.realpath(wfn_path) if wfn_path else '',
 		'wfn_bytes':            wfn_bytes,
 	}
-	# Additive only for a non-raw carrier (the large-block charge); raw
-	# stamps remain byte-for-byte reusable.
+	# Additive only for a non-raw carrier; raw stamps remain byte-for-byte
+	# reusable.
 	if carrier_lift is not None:
 		prov['bispinor_lift'] = str(carrier_lift)
 	# Stamp only the path whose physics changed.  Equal-window charge fits and
@@ -1572,8 +1569,7 @@ def _resolve_zeta_fit_contract(
 
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
-	# The charge zeta names its large-block carrier, so a raw-lift charge
-	# zeta refits; the current zeta stamp (raw lift) stays byte-identical.
+	# Every zeta names its carrier, so a zeta fit on another lift refits.
 	provenance = _zeta_fit_provenance(
 		wfn=wfn, meta=meta, cfg=cfg,
 		band_range_left=band_range_left,
@@ -1596,7 +1592,7 @@ def _resolve_zeta_fit_contract(
 			zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 			write_ibz_only=write_ibz_only_transverse,
 			band_norms=band_norms, carrier_bispinor=True,
-			carrier_lift=None,
+			carrier_lift=representation.current_lift,
 			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
 		for mu_L in ((1, 2, 3) if cfg.bispinor else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)
@@ -2445,9 +2441,6 @@ def _compute_photon_vq(
                     use_ibz=True,
                     tt_head_correction=_bispinor_tt_head(cfg),
                     policy=_bispinor_v_policy(cfg, meta),
-                    bispinor_gw_mode=None,
-                    charge_representation=None,
-                    spatial_current_representation=None,
                     cc_tile=cc_tile, tt_tiles=tt_tiles,
                     current_basis_rows=meta.current_basis_rows,
                     mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
@@ -3186,6 +3179,8 @@ def _restart_current_carrier(
     				wfn_fingerprint_binding=(
     					basis_wfn_fingerprint_binding),
     				role='transverse', bispinor=True,
+    				bispinor_lift=resolve_four_current_representation(
+    					True, cfg.bispinor_gw).current_lift,
     				band_interval=_basis_band_interval,
     				fft_grid=meta.fft_grid,
     				centroid_fft_idx=_cent_T_idx_now,

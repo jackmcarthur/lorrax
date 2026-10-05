@@ -17,7 +17,7 @@ is the q-IBZ count, $N_k$ the full k count, and $P$ the process count.
 
 `bispinor_gw ∈ {bare_transverse, full_static_cohsex, full_shared_pole}`
 (`gw_config.BispinorGWMode`). The value selects which Lorentz blocks are
-screened and who contracts Σ; every value resolves to the same raw
+screened and who contracts Σ; every value resolves to the same normalized
 kinetic-balance carrier. The retired spellings `charge_hall_cubature`,
 `pauli_reference_bare_transverse` and
 `isometric_kinetic_balance_bare_transverse` refuse by name
@@ -89,7 +89,7 @@ flowchart TD
   end
   subgraph INIT["gw_init"]
     C["charge + current centroids"]
-    L["four-spinor parents (charge: large block; current: raw kinetic-balance lift)"]
+    L["four-spinor parents (charge and current: normalized kinetic-balance lift)"]
     Z["zeta_q.h5 + zeta_q_mu{1,2,3}.h5"]
     VQ["v_q_bispinor.h5: 7 unique tiles + photon_g0_vectors"]
   end
@@ -151,12 +151,14 @@ guards a hand-built `True` on a packed route. The overlay is decided by
 `common.four_current_model.resolve_four_current_representation(bispinor, model)`
 returns a frozen `FourCurrentRepresentation` with the fields
 `charge_bispinor`, `charge_lift`, `current_bispinor`, `current_lift`,
-`scalar_head_bispinor`, `charge_representation` and
-`spatial_current_representation`. It has two outcomes: scalar (all false,
-source-WFN charge) and bispinor (charge on the large block $(\psi_L,0)$,
-currents on the raw kinetic-balance lift; [theory](../theory/bispinor-gw.md#lift)). `model` is accepted and ignored. The resolver exists because the
-representation strings are the provenance stamps that the `dipole.h5`,
-`kin_ion.h5` and ζ authenticators compare, and they need one producer. It
+`scalar_head_bispinor` and `charge_representation`. It has two outcomes:
+scalar (all false, source-WFN charge) and bispinor (charge and currents on
+the normalized lift `isometric`, stamp
+`isometric_kinetic_balance_four_current_v1`;
+[theory](../theory/bispinor-gw.md#lift)). `model` is accepted and ignored.
+The resolver exists because the lift and the stamp are what the ζ, restart
+bundle, SC checkpoint and Hall-artifact authenticators compare, and they
+need one producer. It
 is not stored on the config: consumers call it, so grep for the function
 name.
 
@@ -166,7 +168,7 @@ name.
 |---|---|---|---|---|
 | charge centroids | `file_io.centroids.load_centroid_basis` | `(n_C, 3)` | host | all |
 | current centroids and `meta_transverse` | `gw_init` (refuses without `centroids_file_current`) | `(n_T, 3)` i32; `Meta` with `n_rmu = n_T`, `nspinor = npol = 4`, orbit-packed basis | host | all |
-| four-spinor ψ | `common.bispinor_init.lift_to_4spinor` (via `WfnLoader`) | `(n_k, n_b, 4, n_G)` c128; current $[\psi_L;\ (\alpha_{FS}/2)\sigma\cdot(k+G)\psi_L]$, charge $[\psi_L;\ 0]$ | caller's | all |
+| four-spinor ψ | `common.bispinor_init.lift_to_4spinor` (via `WfnLoader`) | `(n_k, n_b, 4, n_G)` c128; $r(G)\,[\psi_L;\ (\alpha_{FS}/2)\sigma\cdot(k+G)\psi_L]$, $r=(1+\alpha_{FS}^2|k+G|^2/4)^{-1/2}$, for charge and current | caller's | all |
 | parent faces | `wavefunction_bundle.ParentGreenCarrier`, separate C and T families | `psi_nmu (n_parent, n_b, 4, μ)`, `psi_mun (n_parent, 4, μ, n_b)` | `P(None,'x',None,'y')`, `P(None,None,'x','y')` | all |
 | charge ζ | `isdf_fitting.fit_zeta_to_h5` | `tmp/zeta_q.h5`, G-flat `(n_q, n_C, n_G)` c128 | written through SlabIO | all |
 | three current ζ | the same fit, `vertex_mu_L ∈ {1,2,3}` | `tmp/zeta_q_mu{1,2,3}.h5`, `(n_q, n_T, n_G)` c128 | same | all |
@@ -419,7 +421,7 @@ driver entry.
 | `bispinor_head_correction_no_local_fields_unavailable` | `refuse_unsupported_bispinor_gw` | `no_local_fields` on any bispinor route except SP-hybrid and SP-full |
 | `bispinor_self_consistency_requires_live_four_current` | same | bispinor QSGW with `density_self_consistent = false` |
 | `bare_tt_gamma_restart_unstamped` | same | `restart = true` where the bare TT overlay is on (`x_only`, B with GN/HL): restart $V$ does not stamp it |
-| `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not the large-block charge (every bispinor bundle written before 2026-10-04) |
+| `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not `isometric_kinetic_balance_four_current_v1` (every bispinor bundle written before 2026-10-05) |
 | `full_shared_pole_envelope` / `full_shared_pole_head` | same | `full_shared_pole` without bispinor, MPA, `sigma_w_model = shared_pole` and `w_rpa`; or with an explicit `head_correction = full` (unset resolves to `no_local_fields`, logged) |
 | `bispinor_gw_requires_bispinor` | same | `full_static_cohsex` with `bispinor = false` |
 | `static_bispinor_photon_head_slab_only` | same | P-screened with `head_correction = full` and `sys_dim ≠ 2` |

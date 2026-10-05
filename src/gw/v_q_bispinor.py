@@ -170,9 +170,6 @@ def _validate_unique_tile_datasets(
 def _publish_unique_tile_inventory(
     h5_file, *, filename: Path, n_q_total: int,
     n_rmu_C: int, n_rmu_T: int,
-    bispinor_gw_mode: str | None = None,
-    charge_representation: str | None = None,
-    spatial_current_representation: str | None = None,
 ) -> None:
     """Certify a staged tile file, publishing readiness as the last write."""
     h5_file.create_dataset(
@@ -193,14 +190,6 @@ def _publish_unique_tile_inventory(
         [list(t) for t in sorted(ZERO_TILES)])
     h5_file.attrs["hermitian_pairs"] = json.dumps(
         [[list(k), list(v)] for k, v in HERMITIAN_PAIRS.items()])
-    if bispinor_gw_mode is not None:
-        h5_file.attrs["bispinor_gw_mode"] = str(bispinor_gw_mode)
-    if charge_representation is not None:
-        h5_file.attrs["charge_representation"] = str(
-            charge_representation)
-    if spatial_current_representation is not None:
-        h5_file.attrs["spatial_current_representation"] = str(
-            spatial_current_representation)
     h5_file.flush()
     h5_file[V_QMUNU_DATA_READY_DATASET][()] = np.bool_(True)
     h5_file.flush()
@@ -765,11 +754,6 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # (default off — every existing deck's TT tiles are byte-identical).
     # See _make_per_q_v_builder_for_tile's tt_head_correction docstring.
     tt_head_correction: bool = False,
-    # Present only for the explicit mixed-representation comparison.  Leaving
-    # these unset preserves the historical bare_transverse artifact exactly.
-    bispinor_gw_mode: str | None = None,
-    charge_representation: str | None = None,
-    spatial_current_representation: str | None = None,
     cc_tile: "ParkedVTiles | None" = None,
     tt_tiles: "ParkedVTiles | None" = None,
     current_basis_rows=None,
@@ -943,11 +927,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
                     sort_keys=True))
             _publish_unique_tile_inventory(
                 f, filename=output_h5_path, n_q_total=nq_total,
-                n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
-                bispinor_gw_mode=bispinor_gw_mode,
-                charge_representation=charge_representation,
-                spatial_current_representation=(
-                    spatial_current_representation))
+                n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T)
     barrier("v_q_bispinor_g_flat_tile_layout_meta")
     return output_h5_path, tuple(g0_by_channel)
 

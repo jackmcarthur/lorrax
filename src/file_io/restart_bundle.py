@@ -2501,15 +2501,15 @@ def validate_kin_ion_against_run(
 	h5_path: str,
 	*,
 	expected_bispinor: bool,
-	expected_bispinor_gw_mode: str | None = None,
 	sys_dim: int | None = None,
 	nk: int | None = None,
 	band_stop: int | None = None,
 	nspinor: int | None = None,
 	print_fn=print,
 ) -> dict:
-	"""Validate pristine kinetic+ionic provenance before its slab is read."""
-	from file_io.kin_ion import (resolve_four_current_representation)
+	"""Validate pristine kinetic+ionic provenance before its slab is read.
+
+	kin_ion is an operator on psi_L, so no four-current carrier enters it."""
 	attrs = read_kin_ion_provenance(h5_path)
 	if bool(attrs.get("has_hartree", False)):
 		raise ValueError(
@@ -2526,18 +2526,6 @@ def validate_kin_ion_against_run(
 		raise ValueError(
 			f"kin_ion.h5 has bispinor={bool(stored_bispinor)} but this run "
 			f"uses bispinor={bool(expected_bispinor)}; regenerate it.")
-
-	representation = resolve_four_current_representation(
-		expected_bispinor, expected_bispinor_gw_mode)
-	if expected_bispinor:
-		# kin_ion is an operator on psi_L, so no charge carrier enters it;
-		# only a pre-2026-09-02 file still carries a current stamp.
-		attr = "spatial_current_representation"
-		expected = representation.spatial_current_representation
-		stored = attrs.get(attr)
-		if stored is not None and str(stored) != str(expected):
-			raise ValueError(
-				f"kin_ion.h5 {attr}={stored!r}, expected {expected!r}.")
 
 	stored_sys_dim = attrs.get("sys_dim")
 	if (sys_dim is not None and stored_sys_dim is not None

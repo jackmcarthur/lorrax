@@ -38,15 +38,11 @@ ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE = (
     "Psi=[I;X](I+X^dagger*X)^(-1/2)*psi_L;X=(alpha_fs/2)*sigma.p"
 )
 RAW_KINETIC_BALANCE_LIFT = "raw"
+# The carrier of every bispinor vertex (docs/theory/bispinor-gw.md#lift).
 ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"
-# The charge carrier (docs/theory/bispinor-gw.md#lift): the Pauli spinor in
-# the large block, zero small block.  The Coulomb kernel's O(c^-2) terms are
-# in the fully relativistic pseudopotential already.
-LARGE_BLOCK_LIFT = "large"
 LIFT_PROVENANCE = {
     RAW_KINETIC_BALANCE_LIFT: KINETIC_BALANCE_LIFT_PROVENANCE,
     ISOMETRIC_KINETIC_BALANCE_LIFT: ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
-    LARGE_BLOCK_LIFT: "Psi=[psi_L;0]",
 }
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
@@ -166,9 +162,6 @@ def kinetic_balance_lift_jet(
     # returned string unused is deliberate: this numerical helper does not
     # manufacture an artifact identity.
     kinetic_balance_lift_provenance(mode)
-    if mode == LARGE_BLOCK_LIFT:
-        raise ValueError("kinetic_balance_lift_jet: the large-block charge "
-                         "carrier has no kinetic-balance K jet")
     axes = (None if cartesian_K_derivative_axes is None else tuple(
         int(axis) for axis in cartesian_K_derivative_axes))
     if axes is not None and len(axes) not in (1, 2):
@@ -264,7 +257,6 @@ def lift_to_4spinor(
 
     Appends ``ψ_S = (α/2)(σ·(k+G)) ψ_L`` to the large components.
     The default ``representation='raw'`` is the historical map, unchanged.
-    ``representation='large'`` appends zeros (the charge carrier).
     ``representation='isometric'`` applies the pointwise scalar
 
     ``r(G) = 1/sqrt(1 + [(α/2)|k+G|]^2)``
@@ -298,8 +290,6 @@ def lift_to_4spinor(
     """
     mode = str(representation).strip().lower()
     kinetic_balance_lift_provenance(mode)
-    if mode == LARGE_BLOCK_LIFT:
-        return jnp.concatenate([psi_2, jnp.zeros_like(psi_2)], axis=2)
     # (k + G) in cartesian, per (k, g).
     pkG = gvecs + kvecs[:, None, :]                          # (n_k, ngkmax, 3)
     p_cart = pkG @ bvec_cart_bohr                             # (n_k, ngkmax, 3)

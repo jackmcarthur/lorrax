@@ -517,7 +517,6 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
         truncation_2d=(int(config.sys_dim) == 2),
         nb=int(band_slices.b3), mesh=mesh_xy,
         include_transverse=include_transverse,
-        charge_nspinor=int(wfn.nspinor) if include_transverse else None,
         bispinor_lift=(representation.current_lift or "raw"),
         print_fn=print_fn, return_sharded=True)
     charge = exact.charge if include_transverse else exact

@@ -111,10 +111,9 @@ Robustness-review fixes (reports A1–A3, #7, #9, #12, #14, #15):
 `bispinor = true` builds the charge vertex on $\Psi_C=(\psi_L,0)$: the direct
 Hartree field, the charge ζ, $\Pi_{00}$, $W_C$ and the CC Σ see $\psi_L$ only,
 and the current vertices keep the raw kinetic-balance lift
-(docs/theory/bispinor-gw.md §1). The fully relativistic pseudopotential
-already holds the Coulomb kernel's $O(c^{-2})$ terms; the raw lift had added
+(docs/theory/bispinor-gw.md §1). The raw lift had added
 $(\alpha^2/4)\langle p^2\rangle\bar V_H$, a V_H-gauge term that grows with the
-vacuum.
+vacuum. The 2026-10-05 entry replaces this carrier.
 - Results move. CrI3 6×6 slab one-shot: the direct field drops by 112–310 meV
   per state, and the Γ gap by about 21 meV. Bispinor − charge is now α·A
   (≤ 1 meV), the Breit TT term, CT and the Γ head. Fe 4³: the direct field

@@ -877,7 +877,6 @@ def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, 
     validate_kin_ion_against_run(
         config.paths.kin_ion_file,
         expected_bispinor=config.bispinor,
-        expected_bispinor_gw_mode=config.bispinor_gw.value,
         sys_dim=config.sys_dim,
         nk=meta.nk_tot,
         band_stop=band_slices.b3,

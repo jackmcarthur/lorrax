@@ -1304,7 +1304,8 @@ def main(argv=None):
 
 			psi_G = wfn.load(
 				bands=(0, nb), k="full_bz", sharding=band_sphere_spec(),
-				bispinor=True)
+				bispinor=True, bispinor_lift=resolve_four_current_representation(
+					True, bispinor_gw_mode).current_lift)
 			geom = SweepGeometry(
 				mesh=RUNTIME.mesh, fft_grid=meta.fft_grid,
 				ngkmax=int(psi_G.shape[3]), nb=nb, ns=int(psi_G.shape[2]),
@@ -1316,7 +1317,9 @@ def main(argv=None):
 					gvecs=gtab.gvecs, gmask=gtab.mask,
 					box_index=wfn.box_index(k="full_bz"),
 					kvecs=np.asarray(gtab.kvecs),
-					vnl_velocity_sign=vnl_velocity_sign)
+					vnl_velocity_sign=vnl_velocity_sign,
+					kinetic_balance_lift=resolve_four_current_representation(
+						True, bispinor_gw_mode).current_lift)
 			with timing.section("static_gauge_hall_reduce"):
 				hall = static_gauge_hall_transaction(
 					uniform_gauge, wfn=wfn, sym=sym, band_start=0,
@@ -1331,7 +1334,8 @@ def main(argv=None):
 						operator_stamps=hall_operator_stamps(
 							skip_vnl=False, vnl_mode="analytic",
 							vnl_velocity_sign=vnl_velocity_sign,
-							kinetic_balance_lift="raw"))
+							kinetic_balance_lift=resolve_four_current_representation(
+								True, bispinor_gw_mode).current_lift))
 			if jax.process_index() == 0:
 				print(
 					"STATIC_GAUGE_HALL_TRANSACTION "

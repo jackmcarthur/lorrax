@@ -2430,8 +2430,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     representation = resolve_four_current_representation(
         bool(inputs.config.bispinor), inputs.config.bispinor_gw)
     include_current = bool(representation.current_bispinor)
-    # The charge is psi_L (docs/theory/bispinor-gw.md#lift).
-    charge_ns = int(inputs.wfn.nspinor)
+    # One carrier for charge and current (docs/theory/bispinor-gw.md#lift).
+    charge_ns = int(psi_G.shape[2])
     # One density-scan shape per SC run: the rotated band count only grows
     # (a metal's occupied count drifts map to map; Fe 4^3 map 2 recompiled).
     from .qsgw_density import density_active_band_count
@@ -2490,14 +2490,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
                 tt_metric_sign=float(COULOMB_GAUGE_TT_SIGN))
 
     gtab = padded_gvectors(inputs.wfn, k=inputs.sym.parent_k_domain)
-    # Both branches sweep the resident sphere itself.  The four-current
-    # operator takes the charge block by ``charge_nspinor``; without a
-    # current the loader read no bispinor, so the charge IS every loaded
-    # component and a spinor slice would only be a second copy of ψ.
-    if V_T_r is None and charge_ns != int(psi_G.shape[2]):
-        raise ValueError(
-            f'SC exact Hartree: scalar sweep needs charge nspinor '
-            f'{charge_ns} == loaded nspinor {int(psi_G.shape[2])}')
+    # Both branches sweep the resident sphere itself: the charge is every
+    # loaded component.
     geom_matrix = SweepGeometry(
         mesh=inputs.mesh_xy, fft_grid=grid,
         ngkmax=int(psi_G.shape[3]), nb=nb_logical,
@@ -5671,7 +5665,7 @@ def retire_sc_checkpoint(input_dir):
 
 
 def _sc_checkpoint_identity(inputs, shape, history_depth):
-    """What a checkpoint must share with this run: deck, WFN, carry, depth.
+    """What a checkpoint must share with this run: deck, WFN, carry, depth, carrier.
 
     The deck digest drops comments, blank lines, the two lines a leg
     rewrites (``restart``, ``sc_initial_qp_rotations_file``) and the stop
@@ -5695,9 +5689,15 @@ def _sc_checkpoint_identity(inputs, shape, history_depth):
                     lines.append(f"{key}={pair.group(2).strip()}" if pair else line)
     wfn = (wfn_fingerprint(inputs.wfn) if inputs.wfn_fingerprint_binding is None
            else fingerprint_from_binding(inputs.wfn_fingerprint_binding, inputs.wfn))
-    return dict(deck_sha256=hashlib.sha256("\n".join(lines).encode()).hexdigest(),
-                wfn=str(wfn), carry=[int(v) for v in shape],
-                history_depth=int(history_depth))
+    identity = dict(deck_sha256=hashlib.sha256("\n".join(lines).encode()).hexdigest(),
+                    wfn=str(wfn), carry=[int(v) for v in shape],
+                    history_depth=int(history_depth))
+    if inputs.config.bispinor:
+        # A trajectory mapped on another four-current carrier does not continue.
+        from common.four_current_model import resolve_four_current_representation
+        identity["carrier"] = resolve_four_current_representation(
+            True, inputs.config.bispinor_gw).charge_representation
+    return identity
 
 
 def _read_sc_checkpoint(state_init, inputs, history_depth, max_iter):

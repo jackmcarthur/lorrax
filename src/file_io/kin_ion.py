@@ -42,8 +42,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.four_current_model import resolve_four_current_representation
-
 from .slab_io import SlabIO
 
 #: Per-dataset attr naming the k-set the array is STORED on.  **Absent

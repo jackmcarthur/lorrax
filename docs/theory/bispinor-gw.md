@@ -21,34 +21,40 @@ related by kinetic balance:
 
 $$
 \Psi=\begin{pmatrix}\psi_L\\\psi_S\end{pmatrix},\qquad
-\psi_S=\frac{\alpha_{\rm FS}}{2}\,\boldsymbol\sigma\cdot\mathbf p\,\psi_L+O(c^{-3}).
+\psi_S=X\psi_L+O(c^{-3}),\qquad
+X=\frac{\alpha_{\rm FS}}{2}\,\boldsymbol\sigma\cdot\mathbf p .
 $$
 
 $\psi_L$ is the noncollinear DFT two-spinor (spin–orbit in the
-pseudopotential). $\psi_S$ is built in plane waves,
-$\psi_S(\mathbf G)=(\alpha_{\rm FS}/2)\,\boldsymbol\sigma\cdot(\mathbf k+\mathbf G)\,\psi_L(\mathbf G)$,
-$\mathbf k+\mathbf G$ Cartesian in bohr⁻¹ (`common.bispinor_init.lift_to_4spinor`).
-Negative-energy states are absent (no-pair).
+pseudopotential). Every vertex, charge and current, takes one carrier, the
+normalized lift (`ISOMETRIC_KINETIC_BALANCE_LIFT`;
+`common.four_current_model.resolve_four_current_representation`,
+`common.bispinor_init.lift_to_4spinor`):
 
-The two kernels take different carriers
-(`common.four_current_model.resolve_four_current_representation`):
+$$
+\Psi=\begin{pmatrix}I\\X\end{pmatrix}(I+X^\dagger X)^{-1/2}\psi_L,\qquad
+\Psi(\mathbf G)=r(\mathbf G)\begin{pmatrix}\psi_L(\mathbf G)\\
+\tfrac{\alpha_{\rm FS}}{2}\,\boldsymbol\sigma\cdot(\mathbf k+\mathbf G)\,\psi_L(\mathbf G)\end{pmatrix},\qquad
+r=\Bigl(1+\tfrac{\alpha_{\rm FS}^2}{4}|\mathbf k+\mathbf G|^2\Bigr)^{-1/2},
+$$
 
-* **Current vertices: the raw lift above**, $\langle\Psi|\Psi\rangle=1+(\alpha_{\rm FS}^2/4)\langle p^2\rangle$.
-  The norm excess enters $\mathbf J$ at $O(c^{-3})$ and $\Sigma^B$ at
-  $O(c^{-4})$, so no metric is needed. No pseudopotential contains the
-  transverse kernel $t$ (Breit), so GW supplies all of it.
-* **Charge vertex: the large block, $\Psi_C=(\psi_L,0)$** (`LARGE_BLOCK_LIFT`).
-  A fully relativistic pseudopotential is the Dirac–Kohn–Sham atom in
-  $V_{\rm nuc}+V_H+V_{xc}$, descreened by scalar potentials. So for its
-  reference atom it already holds every $O(c^{-2})$ term of the Coulomb kernel $v$:
-  the direct Darwin and spin-same-orbit terms exactly, and the exchange
-  spin-same-orbit through its local $V_{xc}$.
-  A four-component charge would add these terms a second time (the
-  exchange one on top of its local-$V_{xc}$ stand-in). A raw one would also
-  add $(\alpha_{\rm FS}^2/4)\langle p^2\rangle\bar V_H$, which depends on the $V_H$ gauge: +0.1 to +0.3 eV on a CrI₃ slab (CLAIMS 3228).
+with $\mathbf k+\mathbf G$ Cartesian in bohr⁻¹. Because
+$(\boldsymbol\sigma\cdot\mathbf K)^2=K^2$, the inverse square root is the
+scalar $r$ on each plane wave. The lift is an isometry,
+$\langle\Psi_m|\Psi_n\rangle=\langle\psi_{Lm}|\psi_{Ln}\rangle$: the lifted
+bands stay orthonormal and the four-component density integrates to the
+electron count. Negative-energy states are absent (no-pair).
 
-Left out: the exchange spin-same-orbit beyond the pseudopotential's local
-$V_{xc}$.
+The fully relativistic pseudopotential is a Dirac–Coulomb atom with no
+Breit term. The Coulomb and Hartree terms use the normalized four-component
+wavefunctions, as prior four-component GW does (owner, 2026-10-05). GW
+supplies all of the transverse kernel $t$.
+
+One exception remains: the scalar Γ-head dipole (`psp.get_dipole_mtxels`,
+`dipole.h5`) is built on the raw lift $[\psi_L;X\psi_L]$. Its relative
+difference is of the order of the raw norm excess
+$(\alpha_{\rm FS}^2/4)\langle p^2\rangle$, at most $1.5\times10^{-4}$ on
+CrI₃ (CLAIMS 3228).
 
 The stored vertices are $\tilde\gamma^I=\gamma^0\gamma^I$:
 $\tilde\gamma^0=1_4$, $\tilde\gamma^i=\alpha^i=\bigl(\begin{smallmatrix}0&\sigma^i\\\sigma^i&0\end{smallmatrix}\bigr)$
@@ -60,7 +66,7 @@ current channels T. Densities are $\Psi^\dagger\tilde\gamma^I\Psi$.
 For states $m,n$:
 
 $$
-\rho_{mn}=\psi_{Lm}^\dagger\psi_{Ln},\qquad
+\rho_{mn}=\Psi_m^\dagger\Psi_n,\qquad
 J^i_{mn}=\Psi_m^\dagger\alpha^i\Psi_n
 =\tfrac{\alpha_{\rm FS}}{2}\bigl[\psi_{Lm}^\dagger p^i\psi_{Ln}+(p^i\psi_{Lm})^\dagger\psi_{Ln}\bigr]
 +\tfrac{\alpha_{\rm FS}}{2}\bigl[\nabla\times(\psi_{Lm}^\dagger\boldsymbol\sigma\psi_{Ln})\bigr]^i+O(c^{-3}).
@@ -90,8 +96,9 @@ $$
 ## 3. Order in $1/c$ {#counting}
 
 Kinetic balance gives $\psi_S=O(c^{-1})\psi_L$, hence
-$J^T\equiv P^T\mathbf J=O(c^{-1})$, while $\rho=\rho^{LL}=O(1)$: its
-$O(c^{-2})$ part $\rho^{SS}$ belongs to the pseudopotential (§1).
+$J^T\equiv P^T\mathbf J=O(c^{-1})$, while $\rho=\rho^{LL}+\rho^{SS}=O(1)$.
+Its $O(c^{-2})$ parts, $\rho^{SS}$ and the $r^2$ renormalization of
+$\rho^{LL}$, are kept.
 
 The polarization $\Pi$ (the code's $\chi_0$) has sectors CC, CT, TC, TT
 ($\Pi_{00},\Pi_{0T},\Pi_{T0},\Pi_{TT}$), one source at each end:
@@ -157,16 +164,14 @@ two-component GW is recovered exactly; this is a gate for any change here.
 
 ## 5. `bare_transverse` {#bare-transverse}
 
-Two-component GW builds $\rho$ from $\psi_L$ and uses $v$ alone. Its
-$c^{-2}$ Coulomb terms, the small-component charge
-$\rho^{LL}v\rho^{SS}+\rho^{SS}v\rho^{LL}$, are in the pseudopotential (§1).
-It drops the transverse exchange $J^TtJ^T$ (Breit: spin-other-orbit,
-orbit-orbit, spin–spin) and its direct part $\boldsymbol\alpha\cdot\mathbf A$.
-`bare_transverse` adds them. This is the largest
-energy term that two-component GW misses (owner, 2026-09-24): it acts on
-every occupied state, its vertex grows with $\mathbf p$ (semicore states feel
-it most), and by §3 it is unscreened through $c^{-2}$. It needs no response,
-no current Dyson solve and no frequency model.
+Two-component GW builds $\rho$ from $\psi_L$ and uses $v$ alone. It drops
+the $c^{-2}$ part of the four-component charge (§3) and the transverse
+exchange $J^TtJ^T$ (Breit: spin-other-orbit, orbit-orbit, spin–spin) with
+its direct part $\boldsymbol\alpha\cdot\mathbf A$. `bare_transverse` adds
+them. The transverse exchange acts on every occupied state, its vertex grows
+with $\mathbf p$ (semicore states feel it most), and by §3 it is unscreened
+through $c^{-2}$. It needs no response, no current Dyson solve and no
+frequency model.
 
 The route sets $\Pi_{0T}=\Pi_{T0}=\Pi_{TT}=0$ by declaration and never builds
 or reads $\chi_{CT}$ or $\chi_{TT}$ (owner rule). Then
@@ -210,7 +215,7 @@ on time reversal:
 ## 6. Routes {#routes}
 
 `bispinor_gw` (`gw.gw_config.BispinorGWMode`) is orthogonal to
-`compute_mode`; all routes use the carriers of §1. Admission:
+`compute_mode`; all routes use the carrier of §1. Admission:
 [wiring](../architecture/four_current_wiring.md#routes-and-predicates).
 
 | term | order | `bare_transverse` | `full_static_cohsex` | `full_shared_pole` |
