@@ -5,6 +5,22 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — checked-solve programs are stored by the persistent compile cache
+
+distrib_la's checked eigh and LU solves printed their retry notices and their
+refusal through `jax.debug.callback`, and JAX never writes a program with a
+host callback to its persistent cache, so every program holding a checked
+solve (the shared-pole round programs, `checked_program`'s `jit(run)`, and
+their sizing compiles) compiled again in each process: 274.6 s of rank-0
+compile per CrI3 24×24 P64 chain leg. The program now returns every attempt's
+check errors beside its failure flag, and the host prints the same notices and
+the named `GATE distrib_la_result_check` refusal after the call. Fe 4³
+bispinor on the face route at P4, second process on a warm cache: 32 → 12
+compiles, 209 → 1.5 s of compile, W response 306 → 101 s; eqp bitwise. A
+checked solve traced in a caller's own jit, scan or cond (outside any
+`checked_program`) still names its refusal, through one host callback in that
+program. The shifted retry's Newton–Schulz step count is no longer printed.
+
 ## 2026-10-05 — bispinor charge and current on one normalized four-component carrier
 
 `bispinor = true` now evaluates every vertex on the normalized lift
