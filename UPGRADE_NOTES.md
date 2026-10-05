@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — kmeans reads the deck's `wfn_file`
+
+`centroid.kmeans_cli -i DECK` opens the deck's `wfn_file`, relative to the
+deck as in `kin_ion_io` and `gw_jax`, instead of `./WFN.h5` in the working
+directory. Without `-i` it still reads `./WFN.h5`. The centroid header's
+`source wavefunctions` line names the file read. Centroids do not move.
+A deck whose `wfn_file` is unset now reads `WFN.h5` beside the deck, not in
+the working directory.
+
 ## 2026-10-05 — the V_NL spin-orbit mode is read from QE's `<spinorbit>`
 
 `kin_ion_io`, the dipole driver and every other V_NL user read j-resolved

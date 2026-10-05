@@ -46,7 +46,8 @@ pool is reported, not refused, because an over-complete interpolation set can
 be accurate; non-PSD input, pool exhaustion and invalid pivots refuse
 ([rank policy](architecture/rank_truncation_policy.md)).
 
-Reads `WFN.h5` in the working directory. Writes `centroids_frac_<n>[<suffix>].txt`
+Reads the deck's `wfn_file` (`-i`; relative to the deck), else `WFN.h5` in the
+working directory. Writes `centroids_frac_<n>[<suffix>].txt`
 (fractional coordinates, with a provenance header) and `kmeans[<suffix>].out`.
 The GW deck names the table with `centroids_file`, and the current-channel table
 with `centroids_file_current`. The GW run guards reuse by the table's content

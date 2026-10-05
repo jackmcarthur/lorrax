@@ -50,9 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Override pivoted-Cholesky n_val (default = wfn.nelec; "
                         "a value below nelec drops occupied bands and refuses).")
     p.add_argument("-i", "--input", default=None,
-                   help="GW deck. Its ncond sets the Sigma conduction window "
-                        "on the default v_x_vc left leg; without it the left "
-                        "leg falls back to vc_x_vc (all bands).")
+                   help="GW deck. Its wfn_file is the WFN read (default "
+                        "./WFN.h5) and its ncond sets the Sigma conduction "
+                        "window on the default v_x_vc left leg; without it "
+                        "the left leg falls back to vc_x_vc (all bands).")
     p.add_argument("--prune-n-cond", type=int, default=None,
                    help="Override pivoted-Cholesky n_cond (default = the FULL "
                         "conduction window in the WFN, nbands - n_val, which "
@@ -140,6 +141,7 @@ RUNTIME = initialize_communicator_stack(print_fn=debug_print)
 print0 = debug_print
 
 import gc
+import os
 import time
 
 import jax
@@ -281,11 +283,13 @@ def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
     return n_val, n_cond
 
 
-def _resolve_deck_sigma_ncond(args):
-    """The deck's Σ conduction count ``ncond``, or ``None`` without a deck.
+def _resolve_deck(args) -> tuple[int | None, str]:
+    """The deck's Σ conduction count ``ncond`` and its ``wfn_file``.
 
-    Resolved once in :func:`main`; ``prune_band_ranges`` reads it from
-    ``args.sigma_ncond`` for the default ``v_x_vc`` left leg.
+    Without a deck: ``(None, "WFN.h5")``.  A relative ``wfn_file`` joins the
+    deck's directory, as in ``gw.kin_ion_io``.  Resolved once in
+    :func:`main`; ``prune_band_ranges`` reads ``args.sigma_ncond`` for the
+    default ``v_x_vc`` left leg.
     """
     if args.input is None:
         if args.prune_window == "v_x_vc" and args.fit_window is None:
@@ -295,7 +299,8 @@ def _resolve_deck_sigma_ncond(args):
                 "prune left leg falls back to vc_x_vc (all bands), a safe "
                 "superset of occupied + Sigma conduction.", RuntimeWarning,
                 stacklevel=2)
-        return None
+        return None, "WFN.h5"
+    from file_io.paths import resolve_input_path
     from gw.gw_config import read_lorrax_input
     deck = read_lorrax_input(args.input)
     # Every planner of this run prices against the deck's device budget, as
@@ -305,7 +310,8 @@ def _resolve_deck_sigma_ncond(args):
         from common.gpu_utils import (minimum_process_budget_gb,
                                       set_device_budget_gb)
         set_device_budget_gb(minimum_process_budget_gb(deck_gb))
-    return int(deck["ncond"])
+    return int(deck["ncond"]), resolve_input_path(
+        os.path.dirname(os.path.abspath(args.input)), str(deck["wfn_file"]))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -498,7 +504,7 @@ def main():
 
     timing.reset()
     selection_start = time.perf_counter()
-    args.sigma_ncond = _resolve_deck_sigma_ncond(args)
+    args.sigma_ncond, wfn_path = _resolve_deck(args)
 
     N_c = int(args.N_c)
     oversample = float(args.oversample)
@@ -510,7 +516,7 @@ def main():
         print0(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
 
     with timing.section("setup.wfn_io"):
-        wfn = WfnLoader("WFN.h5")
+        wfn = WfnLoader(wfn_path)
         sym = wfn.symmetry()
 
         n_rtot = int(np.prod(wfn.fft_grid))
@@ -649,7 +655,7 @@ def main():
     shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
     prune_state = "pivoted Cholesky" if pruned else "not applied"
     header = format_centroid_header(
-        feature_fit=feature_fit, source_wfn="WFN.h5",
+        feature_fit=feature_fit, source_wfn=wfn_path,
         weight_label=weight_label,
         num_electrons=float(getattr(wfn, "num_electrons", np.nan)),
         occupied_boundary=int(wfn.nelec), fft_grid=fft_grid,
@@ -689,7 +695,7 @@ def main():
         # rank.  The centroid table was already suffixed; the report was not.
         report_file = f"kmeans{out_suffix}.out"
         report_text = format_kmeans_report(
-            header=header, source_wfn="WFN.h5", centroid_file=out_file,
+            header=header, source_wfn=wfn_path, centroid_file=out_file,
             report_file=report_file,
             wfn_backend=str(getattr(wfn, "backend", "unknown")),
             elapsed_s=selection_wall, timing_records=timing.records(),
