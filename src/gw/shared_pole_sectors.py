@@ -230,9 +230,11 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         nonlocal batch_width,sizes,face_room
         from gw.shared_pole_capacity import face_eigh_room
         from gw.shared_pole_execution import sector_batch_width
+        # From map 1 on the session holds map 0's pencil sides and CT spans
+        # (sized_sector_sides); map 0 and a one-shot size at the recipe bound.
         batch_width, batch_admission = sector_batch_width(
             meta,linalg_resolution({'linalg':config.backend.linalg}),recipe,execution_rows,
-            mesh=mesh_xy,ledger=ledger,nq=nq)
+            mesh=mesh_xy,ledger=ledger,nq=nq,held=getattr(meta,'shared_pole_rank_capacity',None))
         sizes,seconds = (batch_admission[f'sector_program_{key}'] for key in ('bytes_per_rank','seconds'))
         # distrib_la decides every face eigh stack against the room beside the
         # admitted batch, whose row holds the largest whole-chain program, so
@@ -714,6 +716,12 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
         ordered=True,odd_moments=True)
     side=int(tables['active'].shape[-1])
     budget.plan(side,phase='reduction')
+    # The session keeps this sector's pencil side for the later maps' face
+    # batch (sized_sector_sides); it is the same in every round and map.
+    capacity=getattr(meta,'shared_pole_rank_capacity',None)
+    if capacity is not None:
+        key=geometry['sector']+'_pencil_side'
+        capacity[key]=max(side,int(capacity.get(key,0)))
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
     if execution == 'face':

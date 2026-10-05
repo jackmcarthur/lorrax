@@ -166,6 +166,15 @@ it was traced with. No deck or environment change; results do not move.
   time if the pencil eigh is the round's cost, against the recompiles it
   removes. The local ordered round's kept span sits on its pole budget, as
   the face round's does; the grown-then-rerun Ritz rung is gone.
+- **Face batch from map 0's sides (BISPPERF lever 1, owner 2026-10-05).**
+  From SC map 1 on, the bispinor sectors' face batch is sized at the CC and
+  TT pencil sides and CT span widths the session recorded in map 0
+  (`sized_sector_sides`), not at the recipe bound (CrI3 24×24: CC 17472
+  against 20800, TT 24832 against 32000, spans at the held widths against
+  2 × the pole budget). More parents fit one round, so the sector stage
+  runs fewer rounds; predicted −1000 to −1500 s per CrI3 24×24 map at P64.
+  Map 0 and a one-shot keep the bound. The receipt's `face_batch` row now
+  carries `sized_pencil_sides` and `sized_cross_spans`.
 - **Deleted.** `grow_round`, the carrier/extent/Ritz histories (the session's
   `shared_pole_carriers` now holds only the writer widths), the reduction
   preview/admit closures and the "selection exceeds its held carrier" log
