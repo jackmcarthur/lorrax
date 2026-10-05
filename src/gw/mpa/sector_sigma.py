@@ -728,6 +728,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                  [sum(int(c[q]) for _,c in census) for q in range(len(census[0][1]))])
     total=counts=None
     currents=[None,None]
+    mixed={}
     for names,endpoints in ((('CC','CC'),(0,0)),(('TT','TT'),(1,1)),
                             (('CT_C','CT_T'),(0,1)),(('CT_T','CT_C'),(1,0))):
         a,b=endpoints
@@ -765,6 +766,20 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 sigma_w_model='shared_pole',fit_identity=sectors[names[0]]['identity'],
                 fit_digest=sectors[names[0]]['digest'],sector_context=context,**opts)
             for builder in bound:builder.close(value.sigma_c_kij)
+            if a!=b:
+                # BISPSIG measurement (2026-10-05): is Sigma_TC(omega) the band-index conjugate
+                # transpose of Sigma_CT(omega), and does the QSGW on-shell block see any difference?
+                mixed[names[0]]=value
+                if len(mixed)==2:
+                    from common.units import RYD_TO_EV
+                    ct,tc=mixed['CT_C'].sigma_c_kij,mixed['CT_T'].sigma_c_kij
+                    dag=lambda m:jnp.swapaxes(jnp.conj(m),-1,-2)
+                    line=(f"  sector Sigma(omega): max|TC - CT^dagger| = {float(jnp.max(jnp.abs(tc-dag(ct))))*RYD_TO_EV:.3e} eV"
+                          f" (max|CT| = {float(jnp.max(jnp.abs(ct)))*RYD_TO_EV:.3e} eV)")
+                    if on_shell is not None:
+                        diff=on_shell(replace(value,sigma_c_kij=ct+tc))-on_shell(replace(value,sigma_c_kij=ct+dag(ct)))
+                        line+=f"; on-shell max|(CT+TC) - (CT+CT^dagger)| = {float(jnp.max(jnp.abs(diff)))*RYD_TO_EV:.3e} eV"
+                    if jax.process_index()==0:print(line,flush=True)
             if on_shell is not None and (a or b):
                 channel=int(bool(a and b))  # 0: CT+TC, 1: TT
                 shell=on_shell(value)
