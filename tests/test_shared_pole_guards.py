@@ -8,7 +8,8 @@
    the tied member leaves with its partner, so K <= budget and the kept span
    does not depend on the eigenbasis inside the multiplet.
 4. A local CT round whose actual spans do not fit is handed back (None) for
-   the face rerun instead of running one whole parent per rank over budget.
+   the face rerun instead of running one whole parent per rank over budget;
+   the rerun takes the round's real parents, never its padded slots.
 """
 import json
 from types import SimpleNamespace
@@ -130,4 +131,9 @@ def test_local_ct_over_budget_takes_the_face_fallback(monkeypatch):
         pass
     else:
         raise AssertionError("a local CT round that fits did not run")
+    # The rerun takes the round's real parents only, never its padded slots.
+    rounds = sectors.face_rerun_rounds([12, 12, 12, 12], 1, 4)
+    assert [(r[0], r[1], r[3]) for r in rounds] == [([12], 1, "face")]
+    rounds = sectors.face_rerun_rounds([4, 5, 6, 7], 4, 3)
+    assert [r[0] for r in rounds] == [[4, 5, 6], [7]]
 

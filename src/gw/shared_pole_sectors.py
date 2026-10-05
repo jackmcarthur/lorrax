@@ -308,9 +308,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             warnings.warn(f'shared-pole CT: the local round of parents {ids[:real]} does not '
                           'fit at its actual spans; it reruns on the face route in batches '
                           f'of {batch_width} parents (slow fallback)',RuntimeWarning,stacklevel=2)
-            rounds[:0]=[(ids[q:q+batch_width],len(ids[q:q+batch_width]),
-                         np.arange(len(ids[q:q+batch_width]),dtype=np.int64),'face')
-                        for q in range(0,real,batch_width)]
+            rounds[:0]=face_rerun_rounds(ids,real,batch_width)
             continue
         models=(sectors[0]['model'],sectors[1]['model'],*cross['models'])
         treatment_policy=recipe.get('sector_pole_treatment')
@@ -455,6 +453,14 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     return dict(handle=handle,identity=bank['identity'],status='CONSTRUCTED',
                 q_receipts=receipts,capacity=ledger.receipt(),
                 execution=execution_rows,model_residence=model_residence)
+
+
+def face_rerun_rounds(ids, real, width):
+    """Face rounds of at most ``width`` parents for a local round's ``real`` leading
+    parents; the slots past them are padded copies of the last one and never rerun."""
+    import numpy as np
+    chunks=[list(ids[q:min(q+int(width),int(real))]) for q in range(0,int(real),int(width))]
+    return [(c,len(c),np.arange(len(c),dtype=np.int64),'face') for c in chunks]
 
 
 @lru_cache(maxsize=None)
