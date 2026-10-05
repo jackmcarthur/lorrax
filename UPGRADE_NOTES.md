@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — the compile-cache namespace no longer names the source commit
+
+The default persistent-cache directory is now
+`$SCRATCH/.cache/lorrax/jax_compile/jax<v>-jaxlib<v>_<ffi bundle>_k1/np{P}`.
+The LORRAX commit or release left the namespace, so a commit or a `lorrax_A`
+republish that leaves a program's HLO unchanged reuses its entry instead of
+starting cold. JAX's key still covers the module, compile options, XLA flags
+and backend; the FFI bundle and a hand-bumped key schema (`_KEY_SCHEMA`) cover
+the rest. Rank 0 touches the entries it uses and prunes, in a background
+thread, every entry unused for 7 days. No results move. The first run after
+this change starts cold once; the old per-commit namespaces are retired by
+the existing pruner after 7 days unused.
+
 ## 2026-10-05 — kmeans sizes from the shapes; a CT face fallback; the checkpoint digest splits over ranks
 
 - **kmeans.** The candidate Gram's k batches and square tiles, and the

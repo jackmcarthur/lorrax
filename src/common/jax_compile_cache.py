@@ -90,16 +90,16 @@ Knobs (all optional):
 
 DEFAULT POLICY (``ISDF_JAX_CACHE_DIR`` unset): ON, at
 ``$SCRATCH/.cache/lorrax/jax_compile/<namespace>/np{P}``
-(:func:`default_cache_dir`), threshold 0.  The namespace names the source
-release or commit, the jax/jaxlib versions and the native FFI bundle
-(:func:`cache_namespace`); JAX's own key covers the module, the compile
+(:func:`default_cache_dir`), threshold 0.  The namespace names the jax/jaxlib
+versions, the native FFI bundle and this file's key schema, never the LORRAX
+source (:func:`cache_namespace`): JAX's own key covers the module, the compile
 options and the backend, and the namespace covers what the key cannot see (a
-rebuilt FFI bundle behind an unchanged custom-call name).  Rank 0 prunes
-whole namespaces in a background thread (:func:`_prune_namespaces`): past a
-week unused, or least-recently-used first past a byte or file cap, and never
-one used in the last five days, so a namespace a live job agreed on is never
-removed.  MEASURED (P4, 3697ea6e, explicit directory and threshold 0): MoS2
-bispinor 71.8 s cold -> 40.1 s warm.  An empty or whitespace-only value is the
+rebuilt FFI bundle behind an unchanged custom-call name).  Rank 0 touches the
+entries it uses and prunes in a background thread (:func:`_prune_namespaces`):
+an entry or a namespace a week unused, or least-recently-used namespaces past
+a byte or file cap, never one used in the last five days.  MEASURED (P4,
+3697ea6e, explicit directory and threshold 0): MoS2 bispinor 71.8 s cold ->
+40.1 s warm.  An empty or whitespace-only value is the
 retained explicit opt-out; JAX's in-process executable cache is active in
 every case.
 
@@ -1235,6 +1235,8 @@ def _install_lookup_patch(*, enforce_agreement: bool) -> None:
                 return None, None
             return executable, compile_time
         _STATE.hits += 1
+        if not enforce_agreement and _STATE.namespace:
+            _touch((cache_key,))     # P > 1 touches its agreed set instead
         return executable, compile_time
 
     @functools.wraps(_orig_in_cache)
@@ -2007,16 +2009,16 @@ def compile_cache_stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# the default location: one namespace per release, pruned by rank 0
+# the default location: one namespace per jax/jaxlib/FFI bundle, pruned by rank 0
 # ---------------------------------------------------------------------------
-#: Namespace retention.  A namespace used in the last five days is never
-#: removed: the longest job wall on either machine is 120 h (Frontera's long
-#: queue; Perlmutter's is 48 h), and a live job's agreed entries
-#: must stay readable until it exits (an agreed entry that vanishes aborts
-#: the run, :func:`_fatal`).  Past that a namespace goes after a week unused,
-#: or earlier, least recently used first, while the tree exceeds either cap.
-#: Measured sizes (P4, 3697ea6e): MoS2 bispinor 606 entries / 4.0 MB, Fe 4^3
-#: bispinor 1261 / 18 MB, so the caps hold roughly a hundred deck-releases.
+#: Retention.  Nothing used in the last five days is removed: the longest job
+#: wall on either machine is 120 h (Frontera's long queue; Perlmutter's is
+#: 48 h), and a live job's agreed entries must stay readable until it exits
+#: (an agreed entry that vanishes aborts the run, :func:`_fatal`).  Rank 0
+#: touches what it uses, so an mtime is a last use.  An entry goes after a week
+#: unused; another namespace too, or earlier, least recently used first, while
+#: the tree exceeds either cap.  Measured (P4, 3697ea6e): MoS2 bispinor 606
+#: entries / 4.0 MB, Fe 4^3 bispinor 1261 / 18 MB.
 _NS_LIVE_S = 5 * 86400
 _NS_TTL_S = 7 * 86400
 _NS_MAX_BYTES = 2 << 30
@@ -2024,6 +2026,10 @@ _NS_MAX_FILES = 200_000
 _NS_PRUNE_EVERY_S = 6 * 3600
 _NS_STAMP = ".last_used"
 _NS_PRUNE_STAMP = ".last_prune"
+#: Bump when this file changes how a key is hashed (the invariant-key and
+#: shard-slice patches) or how an entry is stored (the atomic writer): those
+#: change what an entry means without changing jax, jaxlib or the FFI bundle.
+_KEY_SCHEMA = "k1"
 
 
 def default_cache_root() -> Path:
@@ -2034,42 +2040,6 @@ def default_cache_root() -> Path:
     """
     from lxkit import user_cache_dir
     return user_cache_dir("jax_compile")
-
-
-def _source_identity() -> str:
-    """The LORRAX source this process runs: a git commit or a release name.
-
-    A checkout reports ``git-<12 hex>``; a release copy (the module's
-    ``releases/source-3697ea6e``) has no ``.git`` and reports its directory
-    name; an installed distribution reports its version.
-    """
-    root = None
-    try:
-        from runtime import source_closure as _sc
-        rec = _sc._RECEIPT
-        if rec is None:
-            root = _sc._runtime_source_root(
-                Path(_sc.__file__).with_name("__init__.py"))
-        elif rec.mode == "source":
-            root = Path(rec.root)
-    except Exception:                                      # noqa: BLE001
-        root = None
-    if root is None:
-        try:
-            from importlib import metadata
-            return "lorrax-" + metadata.version("lorrax")
-        except Exception:                                  # noqa: BLE001
-            return "source-unknown"
-    if (root / ".git").exists():
-        import subprocess
-        try:
-            out = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "--short=12", "HEAD"],
-                capture_output=True, text=True, timeout=60, check=True)
-            return "git-" + out.stdout.strip()
-        except Exception:                                  # noqa: BLE001
-            pass
-    return root.name
 
 
 def _library_identity(path) -> str:
@@ -2108,18 +2078,18 @@ def _ffi_identity() -> str:
 
 
 def cache_namespace() -> str:
-    """``<source>_jax<v>-jaxlib<v>_<ffi>``: what JAX's own key cannot see.
+    """``jax<v>-jaxlib<v>_<ffi>_<schema>``: what JAX's own key cannot see.
 
     JAX keys an entry on the module, the compile options, the jaxlib version
     and the backend.  It does not see the native bundle behind a custom-call
     name (a handler's traits, e.g. command-buffer compatibility, are read at
-    compile time), and grouping by source release is what lets the pruner
-    retire a whole release at once.
+    compile time).  The LORRAX source is deliberately absent: a commit reaches
+    a compiled program only through its HLO, which the key already hashes.
     """
     import jax
     from jax._src.lib import version_str as jaxlib_version
-    raw = (f"{_source_identity()}_jax{jax.__version__}-jaxlib{jaxlib_version}"
-           f"_{_ffi_identity()}")
+    raw = (f"jax{jax.__version__}-jaxlib{jaxlib_version}_{_ffi_identity()}"
+           f"_{_KEY_SCHEMA}")
     return re.sub(r"[^A-Za-z0-9._+-]", "-", raw)
 
 
@@ -2128,20 +2098,21 @@ def default_cache_dir() -> Path:
     return default_cache_root() / cache_namespace()
 
 
-def _prune_namespaces(root: Path, current: str, *,
+def _prune_namespaces(root: Path, current: str, *, keep=frozenset(),
                       now: float | None = None) -> list[str]:
-    """Retire whole stale namespaces under ``root``; return their names.
+    """Retire stale entries and namespaces under ``root``; return what went.
 
-    Newest-used first, a namespace is kept while it is ``current``, used
-    within :data:`_NS_LIVE_S`, or both younger than :data:`_NS_TTL_S` and
-    inside the byte and file caps counted so far.  Removal is a rename into
-    ``root/.trash`` (atomic, so no run ever lists a half-deleted namespace)
-    and then a best-effort delete.
+    In ``current``, an entry untouched for :data:`_NS_TTL_S` and not in ``keep``
+    goes.  Another namespace is kept, newest-used first, while used within
+    :data:`_NS_LIVE_S`, or both younger than :data:`_NS_TTL_S` and inside the
+    caps counted so far.  Removal is a rename into ``root/.trash`` (atomic, so
+    no run lists a half-deleted one) and then a best-effort delete.
     """
     import shutil
 
     now = time.time() if now is None else float(now)
-    usage = []
+    trash = root / ".trash"
+    usage, stale = [], []
     for entry in os.scandir(root):
         if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
             continue
@@ -2154,9 +2125,14 @@ def _prune_namespaces(root: Path, current: str, *,
             nfiles += len(files)
             for name in files:
                 try:
-                    nbytes += os.stat(os.path.join(dirpath, name)).st_size
+                    st = os.stat(os.path.join(dirpath, name))
                 except OSError:
-                    pass
+                    continue
+                nbytes += st.st_size
+                if (entry.name == current and name.endswith(_CACHE_SUFFIX)
+                        and now - st.st_mtime > _NS_TTL_S
+                        and name[: -len(_CACHE_SUFFIX)] not in keep):
+                    stale.append(os.path.join(dirpath, name))
         usage.append((used, entry.name, nbytes, nfiles))
     usage.sort(reverse=True)
     removed: list[str] = []
@@ -2169,43 +2145,55 @@ def _prune_namespaces(root: Path, current: str, *,
             continue
         if (age > _NS_TTL_S or total_bytes > _NS_MAX_BYTES
                 or total_files > _NS_MAX_FILES):
-            trash = root / ".trash" / f"{name}.{uuid.uuid4().hex[:8]}"
             try:
-                trash.parent.mkdir(exist_ok=True)
-                os.rename(root / name, trash)
+                trash.mkdir(exist_ok=True)
+                os.rename(root / name, trash / f"{name}.{uuid.uuid4().hex[:8]}")
             except OSError:
                 continue
             removed.append(name)
             total_bytes -= nbytes
             total_files -= nfiles
-    shutil.rmtree(root / ".trash", ignore_errors=True)
+    gone = 0
+    for path in stale:
+        try:
+            trash.mkdir(exist_ok=True)
+            os.rename(path, trash / f"entry.{uuid.uuid4().hex}")
+            gone += 1
+        except OSError:
+            pass
+    if gone:
+        removed.append(f"{gone} entries of {current}")
+    shutil.rmtree(trash, ignore_errors=True)
     return removed
 
 
-def _start_namespace_prune(root: Path, current: str) -> None:
-    """Rank 0, at most every :data:`_NS_PRUNE_EVERY_S`: prune in a daemon thread.
+def _touch(keys) -> None:
+    """Mark these entries of the bound directory used now (rank 0 only)."""
+    for key in keys:
+        try:
+            os.utime(os.path.join(_STATE.dir, key + _CACHE_SUFFIX))
+        except OSError:
+            pass
 
-    Off the startup path: the walk stats every file of every namespace.  A
-    process that exits mid-walk leaves only atomic renames behind, and the
-    next prune finishes the ``.trash`` delete.
+
+def _start_namespace_prune(root: Path, current: str, keep=frozenset()) -> None:
+    """Rank 0, in a daemon thread: touch ``keep`` (the agreed set), then prune.
+
+    The touch runs every time, the prune at most every :data:`_NS_PRUNE_EVERY_S`,
+    off the startup path (the walk stats every file).  A process that exits
+    mid-walk leaves only atomic renames; the next prune finishes the delete.
     """
-    stamp = root / _NS_PRUNE_STAMP
-    try:
-        if time.time() - stamp.stat().st_mtime < _NS_PRUNE_EVERY_S:
-            return
-    except OSError:
-        pass
-    try:
-        stamp.touch()
-    except OSError:
-        return
-
     def _run() -> None:
         try:
-            removed = _prune_namespaces(root, current)
+            _touch(keep)
+            stamp = root / _NS_PRUNE_STAMP
+            if (stamp.exists() and time.time() - stamp.stat().st_mtime
+                    < _NS_PRUNE_EVERY_S):
+                return
+            stamp.touch()
+            removed = _prune_namespaces(root, current, keep=keep)
             if removed:
-                _debug_say(f"pruned {len(removed)} stale namespace(s) under "
-                           f"{root}: {', '.join(removed)}")
+                _debug_say(f"pruned under {root}: {', '.join(removed)}")
         except Exception as exc:                           # noqa: BLE001
             _say(f"namespace prune under {root} failed "
                  f"({type(exc).__name__}: {exc}); nothing is lost but space.")
@@ -2333,8 +2321,6 @@ def ensure_jax_compile_cache() -> None:
             try:
                 Path(cache_dir).mkdir(parents=True, exist_ok=True)
                 (Path(cache_dir) / _NS_STAMP).touch()
-                _start_namespace_prune(Path(cache_dir).parent,
-                                       Path(cache_dir).name)
             except OSError as exc:
                 _say(f"cannot stamp {cache_dir} ({exc}); it may be pruned "
                      f"early.")
@@ -2437,6 +2423,8 @@ def ensure_jax_compile_cache() -> None:
         # every decision unchanged and observes only JAX's actual answer.
         _install_observation_patch()
         _STATE.enabled = True
+        if _STATE.namespace:
+            _start_namespace_prune(Path(cache_dir).parent, _STATE.namespace)
         return
 
     # Make the ranks compile the SAME MODULE before making them agree on which
@@ -2542,6 +2530,10 @@ def ensure_jax_compile_cache() -> None:
     _STATE.agreed = agreed
     _STATE.enabled = True
     _install_agreement_patch()
+    if _STATE.namespace and proc_idx == 0:
+        # After the agreement: the prune must not take an agreed entry.
+        _start_namespace_prune(Path(cache_dir).parent, _STATE.namespace,
+                               keep=agreed)
 
     if _truthy("LORRAX_JAX_CACHE_PREFETCH", _PREFETCH_DEFAULT):
         _STATE.prefetch_secs = _prefetch_agreed(
