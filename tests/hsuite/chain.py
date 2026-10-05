@@ -238,6 +238,16 @@ sc_tol_ev = 3.0
 sc_head_update = dft_velocity
 density_self_consistent = true
 """),
+    # The compile check (steady_compile_problems), run only when named in
+    # --only: the bisp_sc deck on the face route (linalg = distributed at P4)
+    # for three maps, so map 2 is a steady map. It ends unconverged by design.
+    "bisp_sc3.in": _bisp_deck("bsc3", """restart = false
+qp_solver = self_consistent
+sc_max_iter = 3
+sc_tol_ev = 1e-9
+sc_head_update = dft_velocity
+density_self_consistent = true
+""").replace("linalg = local\n", "linalg = distributed\n"),
 })
 _P = ["--px", _SIDE, "--py", _SIDE]
 
@@ -282,7 +292,23 @@ NA_SC_TOL_EV = "1.5"
 # fresh model in a run directory that already holds the scalar shared-pole
 # models (checked at sp_export), and a fresh run refuses to overwrite a
 # completed model (GATE shared_pole_output).
-_CLEAR_BEFORE = {"bisp_sc": ("tmp/mpa",)}
+_CLEAR_BEFORE = {"bisp_sc": ("tmp/mpa",), "bisp_sc3": ("tmp/mpa",)}
+# Stages that run only when --only names them, and have no reference.
+OPT_IN = ("bisp_sc3",)
+_UNCONVERGED = "RuntimeError: GATE sc_fixed_point_not_converged"
+# Each SC map's compile receipt (common.jax_compile_cache.compile_receipt).
+_RECEIPT = re.compile(r"SC map (\d+) compile: real (\d+) \(([0-9.]+) s\), "
+                      r"cache hits \d+, uncacheable (\d+)(.*)")
+
+
+def steady_compile_problems(run, name):
+    """From SC map 2 on nothing compiles, and no program is one JAX's cache cannot store."""
+    text = (run / f"{name}.rank0.log").read_text(errors="replace")
+    rows = _RECEIPT.findall(text)
+    if not rows:
+        return [f"{name}: no SC map compile receipt in the rank-0 log"]
+    return [f"{name}: SC map {m} compile: real {r} ({sec} s), uncacheable {u}{rest}"
+            for m, r, sec, u, rest in rows if (int(m) >= 2 and int(r)) or int(u)]
 
 # (name, module, argv, deck name -> template).  The decks are written into
 # the run directory after kmeans, which names the centroid file.
@@ -319,6 +345,7 @@ STAGES = (
     # the four-component route writes its own (over the scalar one).
     ("dipole_bisp", "psp.get_dipole_mtxels", ["-i", "bisp_sc.in"]),
     ("bisp_sc", "gw.gw_jax", ["-i", "bisp_sc.in"]),
+    ("bisp_sc3", "gw.gw_jax", ["-i", "bisp_sc3.in"]),
     # BSE after SP-full: the final map's W0 = V + Wc_CC(0) (charge sector
     # only; CT/TC/TT are not stored), on the four-component restart.
     ("bse_bisp", "bse.bse_jax",
@@ -713,7 +740,7 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
     walls, problems, ranks = {}, [], {}
     t_all = time.monotonic()
     for name, module, argv in STAGES:
-        if only and name not in only:
+        if name not in only if only else name in OPT_IN:
             continue
         where = run / _STAGE_DIR.get(name, "")
         if name == "kin_ion" and lead:
@@ -727,6 +754,11 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         records, walls[name] = run_stage(where, name, module, argv, env, timeout)
         ranks[name] = [{k: rec[k] for k in ("rank", "rc", "hits", "gates")}
                        for rec in records]
+        if name in OPT_IN:
+            for rec in records:      # its expected end: same on every rank
+                if _UNCONVERGED in rec["hits"]:
+                    rec["rc"], rec["hits"] = 0, [h for h in rec["hits"] if h not in (
+                        _UNCONVERGED, "Traceback (most recent call last)", "[EXC] ")]
         # One verdict for every rank (every rank holds the same records): a
         # rank that walks on alone hangs.
         failed = stage_verdict(name, records)
@@ -734,6 +766,9 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             problems += failed
             break
         if not lead:
+            continue
+        if name in OPT_IN:
+            problems += steady_compile_problems(where, name)
             continue
         rule = CHECKS.get(name, {})
         problems += missing_lines(where, name)

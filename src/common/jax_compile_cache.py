@@ -362,6 +362,10 @@ class _CacheState:
         self.blocked = 0       # lookups vetoed by the agreement
         self.compiles = 0      # actual XLA compiles (backend_compile_and_load)
         self.compile_secs = 0.0
+        # Compiles of modules with host callbacks, which JAX's persistent
+        # cache never writes (compiler._cache_write): name -> [count, secs].
+        self.uncacheable: dict = {}
+        self.receipt_mark = (0, 0.0, 0, {})   # compile_receipt's last window edge
         self.read_secs = 0.0   # time spent loading executables from disk
         self.prefetch_secs = 0.0
         self.agree_secs = 0.0  # startup listing + agreement + prefetch
@@ -503,7 +507,9 @@ def _cache_size_policy(n_proc: int, max_size: int) -> bool:
 
 
 def _say(msg: str) -> None:
-    print(f"  [compile-cache] {msg}", flush=True)
+    # stderr: a driver's production stdout sinks incidental prints, and these
+    # lines are the ones meant to stay loud in production.
+    print(f"  [compile-cache] {msg}", file=sys.stderr, flush=True)
 
 
 def _debug_say(msg: str) -> None:
@@ -726,8 +732,8 @@ def _host_target_id() -> str:
 #: is the deadlock one level below the cache (module docstring, above).
 #:
 #: THE SOURCE OF TRUTH IS ``src/ffi/__init__.py::FFI_DIAL_ENV`` and this list
-#: mirrors it; ``tests/cache_key_lint.py``'s ``env-dial`` rule fails when the
-#: two disagree.  Mirrored rather than imported because this function runs
+#: mirrors it; ``tests/test_compile_stability_cpu.py`` fails when the two
+#: disagree.  Mirrored rather than imported because this function runs
 #: during the agreement, on every rank, on machines with no FFI library
 #: present — an ImportError here would turn the cache off for a reason that
 #: has nothing to do with the cache.
@@ -1769,9 +1775,27 @@ def _install_compile_counter() -> None:
             f"that line was dropped when the GPU leg moved to jax 0.7.0.")
     _orig = getattr(_compiler, name)
 
+    def _uncacheable(module, host_callbacks, seconds):
+        # backend_compile_and_load(backend, module, devices, options, host_callbacks)
+        if not host_callbacks:
+            return
+        try:
+            attr = module.operation.attributes["sym_name"]
+            module_name = str(getattr(attr, "value", attr)).strip('"')
+        except Exception:                                  # noqa: BLE001
+            module_name = "<unnamed-module>"
+        row = _STATE.uncacheable.setdefault(module_name, [0, 0.0])
+        row[0] += 1
+        row[1] += seconds
+        if row[0] == 1 and _STATE.proc_idx == 0:
+            _say(f"UNCACHEABLE {module_name}: {len(host_callbacks)} host callbacks "
+                 f"({seconds:.1f} s); JAX's persistent cache never stores it, so it "
+                 f"compiles again in every process")
+
     def _counting(*args, **kwargs):
+        module = args[1] if len(args) > 1 else kwargs.get("module")
+        callbacks = args[4] if len(args) > 4 else kwargs.get("host_callbacks")
         if _STATE.compile_agreement_enabled:
-            module = args[1] if len(args) > 1 else kwargs.get("module")
             module_name, key, fingerprint_secs = _compile_module_identity(
                 module)
             _STATE.compile_fingerprint_secs += fingerprint_secs
@@ -1791,15 +1815,42 @@ def _install_compile_counter() -> None:
                 finally:
                     _STATE.compiles += 1
                     _STATE.compile_secs += time.monotonic() - t0
+                    _uncacheable(module, callbacks, time.monotonic() - t0)
         t0 = time.monotonic()
         try:
             return _orig(*args, **kwargs)
         finally:
             _STATE.compiles += 1
             _STATE.compile_secs += time.monotonic() - t0
+            _uncacheable(module, callbacks, time.monotonic() - t0)
 
     setattr(_compiler, name, _counting)
     _compiler._lorrax_compile_counter_installed = True
+
+
+def compile_receipt(label: str, emit=None) -> str:
+    """Print this window's compile receipt on rank 0 and start the next window.
+
+    ``<label> compile: real R (S s), cache hits H, uncacheable U [names]``:
+    XLA compiles, their seconds, persistent-cache hits and compiles of modules
+    JAX's cache cannot store (host callbacks), since the previous receipt.  The
+    SC loop prints one per map and each driver one at its end, so a run that is
+    killed still reports every finished map.  A map past the second with R > 0
+    recompiled something it already had; U > 0 recompiles in every process.
+    ``emit`` writes the line (the SC map's record), else :func:`_say`.
+    """
+    s = _STATE
+    compiles, secs, hits, seen = s.receipt_mark
+    names = sorted(n for n, row in s.uncacheable.items() if row[0] > seen.get(n, 0))
+    uncacheable = sum(row[0] - seen.get(n, 0) for n, row in s.uncacheable.items())
+    line = (f"{label} compile: real {s.compiles - compiles} ({s.compile_secs - secs:.1f} s), "
+            f"cache hits {s.hits - hits}, uncacheable {uncacheable}"
+            + (f" [{', '.join(names)}]" if names else ""))
+    s.receipt_mark = (s.compiles, s.compile_secs, s.hits,
+                      {n: row[0] for n, row in s.uncacheable.items()})
+    if s.proc_idx == 0:
+        (emit or _say)(line)
+    return line
 
 
 def _report() -> None:

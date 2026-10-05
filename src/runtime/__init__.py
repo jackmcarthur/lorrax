@@ -2250,6 +2250,12 @@ def run_main_and_finalize(main, argv=None) -> None:
             os._exit(1)
         traceback.print_exception(*exc_info)
         rc = 1
+    try:
+        from common.jax_compile_cache import compile_receipt
+        spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+        compile_receipt(f"stage {spec.name if spec is not None else main.__module__}")
+    except Exception:                                      # noqa: BLE001
+        pass
     if rc is None:
         rc = 0
     else:

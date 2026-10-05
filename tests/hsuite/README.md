@@ -118,3 +118,15 @@ the scalar restarted steps read.
 [Contributing](../../docs/contributing.md#the-test-suite) owns the canonical
 invocation (`lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite`) and the
 regenerate command.
+
+## Steady compiles (`bisp_sc3`)
+
+The opt-in stage `bisp_sc3` runs the `bisp_sc` deck on the face route for
+three maps (it ends unconverged by design and has no reference). Its check
+reads the SC maps' compile receipts: from map 2 on nothing compiles, and no
+program carries a host callback (which JAX's persistent cache never stores).
+Run it a second time on the same `--cache-dir` and its receipts show what a
+warm process still compiles.
+
+    lx run -N 1 -G 4 -n 4 -- python3 -m tests.hsuite.chain --out DIR --cache-dir CACHE \
+        --only kmeans kin_ion kin_ion_bisp dipole_bisp bisp_sc3

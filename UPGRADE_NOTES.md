@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — every SC map and driver prints its compile receipt
+
+Rank 0 prints one line per SC map and one at the end of each driver, in
+production, without a debug flag and before a run can be killed:
+`  [compile-cache] SC map N compile: real R (S s), cache hits H, uncacheable U [names]`
+(`stage <driver module> compile: ...` at a driver's end). The counts are since
+the previous receipt: R real XLA compiles and their S seconds, H persistent
+cache hits, U compiles of programs with host callbacks, which JAX's cache
+never stores, named. Each such program also prints
+`UNCACHEABLE <module>: N host callbacks (S s)` once. A map past the second
+with R > 0, or any U > 0, compiles work it already did; the sandbox's
+`tools/parse_compile_receipts.py` flags both. The SC map line is in the
+report and stdout; the driver line, the UNCACHEABLE warning and every other
+`[compile-cache]` notice go to stderr (production stdout used to swallow
+them). No result moves and nothing needs to change. Fe 4³ bispinor at P4,
+cold: SC map 2 still compiles 23 programs (4.9 s); a warm second process
+compiles 12 (1.5 s) at map 0 and none after, one of them the uncacheable ζ
+factor (`isdf/core.py`).
 ## 2026-10-05 — htransform band operators come from the WFN's own k-points
 
 `--color` and `--velocity` no longer load the full-BZ ψ of the fitted

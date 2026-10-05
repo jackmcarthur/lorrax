@@ -3166,6 +3166,9 @@ def _record_sc_map_stages(inputs, iteration, started, before) -> None:
         + " | ".join(f"{label} {seconds:.1f}" for label, seconds in parts)
         + f" | other {wall - sum(seconds for _, seconds in parts):.1f}"
         + f" | wall {wall:.1f}")
+    from common.jax_compile_cache import compile_receipt
+    compile_receipt(f"SC map {int(iteration)}",
+                    emit=lambda line: _record_sc(inputs, f"  [compile-cache] {line}"))
 
 
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
