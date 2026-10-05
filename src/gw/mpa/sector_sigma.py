@@ -779,7 +779,10 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                     if on_shell is not None:
                         diff=on_shell(replace(value,sigma_c_kij=ct+tc))-on_shell(replace(value,sigma_c_kij=ct+dag(ct)))
                         line+=f"; on-shell max|(CT+TC) - (CT+CT^dagger)| = {float(jnp.max(jnp.abs(diff)))*RYD_TO_EV:.3e} eV"
-                    if jax.process_index()==0:print(line,flush=True)
+                    if jax.process_index()==0:
+                        # Bare print is /dev/null in production: the driver's print_fn and a file.
+                        options.get('print_fn',print)(line)
+                        with open('bispsig_tc_ct.txt','a') as f:f.write(line+'\n')
             if on_shell is not None and (a or b):
                 channel=int(bool(a and b))  # 0: CT+TC, 1: TT
                 shell=on_shell(value)
