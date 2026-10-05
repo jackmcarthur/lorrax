@@ -2,10 +2,11 @@
 
 TRS holds only if QE types no row t_rev = 1 and the SCF absolute
 magnetization is below tolerance; no schema means TRS off. When QE says
-nonmagnetic the occupied-density check runs as a guard and refuses on a
-residual above tolerance. ``scf_absolute_magnetization`` reads |m| from the
-SCF schema whose density file the NSCF .save holds byte for byte, because
-an NSCF schema writes ``absolute`` = 0.
+nonmagnetic the occupied-density check runs as a guard: a residual above
+tolerance refuses at m = 0 and takes TRS off at 0 < m < tolerance.
+``scf_absolute_magnetization`` reads |m| from the SCF schema whose density
+file the NSCF .save holds byte for byte, because an NSCF schema writes
+``absolute`` = 0.
 """
 import numpy as np
 import pytest
@@ -127,6 +128,17 @@ def test_nonmagnetic_guard_refuses_inconsistent_wfn():
                         [np.eye(3)], _binding([False], 0.0))
     with pytest.raises(RuntimeError, match="GATE trs_qe_nonmagnetic_wfn_consistent"):
         check_spinor_reference_trs(loader)
+
+
+def test_small_moment_guard_failure_is_off():
+    """0 < m < 1e-4 muB/cell breaks Theta at ~Delta/gap: the guard takes TRS off, no refusal."""
+    rng = np.random.default_rng(2)
+    loader = _ToyLoader([_K, [-v for v in _K]],
+                        [_orthonormal(rng, 2), _orthonormal(rng, 2)],
+                        [np.eye(3)], _binding([False], 5.0e-5))
+    report = check_spinor_reference_trs(loader)
+    assert report.trs_basis == "raw-pair-falsified" and not report.trs_holds
+    assert "TRS off" in report.messages[0]
 
 
 def _schema(directory, *, calculation, do_mag, absolute, density):

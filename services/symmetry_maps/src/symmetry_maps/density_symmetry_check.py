@@ -8,9 +8,11 @@ only TR-odd Kohn-Sham term is sigma.B_xc[m] (+U through the spin-resolved
 occupations), so TRS holds iff m(r) = 0. Without an authenticated schema or
 an SCF magnetization, TRS is off.
 
-When QE says nonmagnetic, the wavefunction check is a consistency guard;
-any residual above tolerance refuses (``GATE
-trs_qe_nonmagnetic_wfn_consistent``). It compares occupied one-particle
+When QE says nonmagnetic, the wavefunction check is a consistency guard. A
+raw-pair or TRIM residual above tolerance refuses when QE's moment is 0
+(``GATE trs_qe_nonmagnetic_wfn_consistent``); at 0 < m <
+``TOL_ABS_MAGNETIZATION``, or on a spatial-pair failure, TRS goes off with a
+loud warning. It compares occupied one-particle
 density operators at ``k`` and ``-k`` directly in G space, from a raw stored
 partner, the spatial unfold of a stored partner, or Kramers closure at a
 TRIM; when QE says magnetic it does not run.
@@ -565,16 +567,25 @@ def _check_two_component_trs(
     max_residual = max(residuals, default=None)
     min_singular = min(singular_values, default=None)
     failed, basis = _classify_trs_evidence(evidence, residuals, tol_trs=tol_trs)
+    # QE's m = 0 (do_magnetization false) makes Theta exact, so a falsified
+    # Kramers pair is an inconsistent WFN.  A moment 0 < m < 1e-4 muB/cell
+    # breaks Theta at ~Delta/gap and QE did not TR-reduce that mesh, and a
+    # spatial-pair failure may be the unfold's: both take TRS off, loudly.
+    messages = ()
     if failed:
-        raise RuntimeError(
-            "GATE trs_qe_nonmagnetic_wfn_consistent: QE reports no t_rev row "
-            f"and no magnetization, but the WFN fails the TRS guard ({basis}, "
-            f"residual {max_residual:.3e} > {tol_trs:.1e}) for "
-            f"{getattr(loader, 'path', '<wfn>')}.")
+        m = loader.resolve_qe_symmetry().scf_absolute_magnetization
+        message = (f"the WFN fails the TRS guard ({basis}, residual "
+                   f"{max_residual:.3e} > {tol_trs:.1e}) for "
+                   f"{getattr(loader, 'path', '<wfn>')}")
+        if m == 0.0 and basis != "spatial-pair-falsified":
+            raise RuntimeError(
+                "GATE trs_qe_nonmagnetic_wfn_consistent: QE reports no t_rev "
+                f"row and m = 0, but {message}.")
+        messages = (f"TRS off: SCF |m| = {m:.1e} muB/cell and {message}.",)
     charge_expected = float(getattr(loader, "num_electrons", np.nan))
     n_used = int(np.count_nonzero(covered))
     return DensitySymmetryReport(
-        trs_holds=True, trs_basis=basis,
+        trs_holds=not failed, trs_basis=basis,
         m_rel=max_residual, m_rel_total=None,
         trs_coverage=float(np.sum(weights[covered]) / weight_norm),
         tol_trs=tol_trs, trs_implied_by_mesh=None,
@@ -588,7 +599,7 @@ def _check_two_component_trs(
         n_k_total=int(kpoints.shape[0]), subsampled=bool(n_used < kpoints.shape[0]),
         fft_grid=tuple(int(v) for v in loader.fft_grid),
         seconds=time.perf_counter() - t0, seconds_io=t_io,
-        seconds_quad=t_overlap, messages=(),
+        seconds_quad=t_overlap, messages=messages,
         method="occupied-density-subspace",
         subspace_residual=max_residual,
         min_overlap_singular_value=min_singular,

@@ -72,8 +72,10 @@ aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
   equation is owned by [Multipole frequency integration](../theory/THEORY_mpa_implementation.md#21-ordered-orientations-when-time-reversal-is-broken).
 * **The 2c wavefunction check is a guard, run only when QE says
   nonmagnetic.** Raw `k/−k` pairs, the spatial unfold of a stored partner
-  and TRIM closure are its evidence; any residual above tolerance refuses
-  (`GATE trs_qe_nonmagnetic_wfn_consistent`). The metric is the occupied
+  and TRIM closure are its evidence. A raw-pair or TRIM residual above
+  tolerance refuses when QE's moment is 0 (`GATE
+  trs_qe_nonmagnetic_wfn_consistent`); at 0 < m < 1e-4 μB/cell, or on a
+  spatial-pair failure, TRS goes off with a loud warning. The metric is the occupied
   one-particle-subspace residual in G space, invariant to band phases and to
   rotations within degenerate blocks.
 * **One measurement per WFN, across processes.** A completed measurement
