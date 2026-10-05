@@ -5,6 +5,21 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — htransform band operators come from the WFN's own k-points
+
+`--color` and `--velocity` no longer load the full-BZ ψ of the fitted
+window. σ and the atomic-character projectors are formed at the WFN's own
+k-points in one `common.mtxel_sweep` pass, as the dipole driver forms the
+velocity, and `symmetry_maps` unfolds them: σ as an axial time-odd vector,
+a projector as an invariant scalar. Per rank ψ costs N_k,irr·nb·n_s·N_G·16/P
+bytes. CrI3 24×24 with 208 bands refused at 155 GB per device at P4; it now
+runs on one A100-80GB node at a 23 GiB peak. The orbital total sums every
+stored band in one mapped call. Its value is unchanged: CrI3 bispinor and
+charge to 1e-12 μB, Fe 4³ to 12 digits, path operators to 5e-11. The
+`htransform.out` orbital block loses the `1/E_ceiling extrapolation` and
+`spin + orbital extrapolated` lines; the intercept moved with the fit range.
+No deck change.
+
 ## 2026-10-05 — the compile-cache namespace no longer names the source commit
 
 The default persistent-cache directory is now
