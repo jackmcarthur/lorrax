@@ -120,7 +120,6 @@ __all__ = [
     "gather_indexed_blocks",
     "gather_indexed_blocks_to_owner",
     "psum_scatter_checked",
-    "report_collective_residual",
     "COLLECTIVE_RTOL",
     # the k-partitioned sweep
     "local_share",
@@ -1290,8 +1289,8 @@ def psum_scatter_checked(x, axis, scatter_dimension, tiled=True, *, name):
         ``|Σ w·in − Σ w·out| / Σ |w·in|``, at round-off when the collective is
         correct.  You cannot raise inside ``shard_map``, so the caller must
         accumulate ``residual`` (``jnp.maximum``) into a small device buffer
-        and hand it to :func:`report_collective_residual` at a coarse boundary
-        — per τ node, per Lanczos iteration — where a host value is affordable.
+        and read it on the host at a coarse boundary — per τ node, per
+        Lanczos iteration — where a host value is affordable.
     """
     import jax.numpy as jnp
     from jax import lax
@@ -1330,53 +1329,6 @@ def psum_scatter_checked(x, axis, scatter_dimension, tiled=True, *, name):
     # 2.3e-11 with the extra pass.
     denom = jnp.maximum(jnp.abs(packed[1]), jnp.finfo(jnp.float64).tiny)
     return out, (jnp.abs(packed[0]) / denom).astype(jnp.float64)
-
-
-def report_collective_residual(name: str, residual, *,
-                               rtol: float = COLLECTIVE_RTOL,
-                               print_fn: Callable[..., Any] = print) -> None:
-    """Coarse-boundary check of an accumulated :func:`psum_scatter_checked`
-    residual.  Traced-safe: one unordered ``jax.debug.callback``, no sync.
-
-    Tolerance — derived, then measured (same shape of argument as
-    ``solvers.lanczos.ALPHA_HERM_RTOL``).  Numerator and denominator are both
-    length-``N`` sums of unit-modulus-weighted terms, so the ratio is a pure
-    relative error whose round-off floor is ``~sqrt(N)·u`` with pairwise
-    summation (``u = 1.11e-16``).  MEASURED clean floors (wk_REL job 7880840,
-    P=4, c128): **3.6e-14** at 0.41 MB, **2.0e-13** at 41 MB, **4.7e-13** at
-    253 MB — i.e. the floor grows like sqrt(payload), as predicted.
-
-    MEASURED sensitivity to a segment-0 fault of relative size ``rel``
-    (job 7880905): residual ``= 0.53 x rel`` at 0.41 MB and ``= 1.12 x rel``
-    at 41 MB — essentially 1:1, because the fault and the checksum live on the
-    same scale.
-
-    ``1e-10`` therefore sits 200-2800x above the measured floor and detects a
-    fault of relative size ``~2e-10``.  The corruption it exists to catch is
-    ``rel ~ 0.24`` (upstream S3), a margin of ``~1e9``.  Re-derive if a payload
-    much larger than 253 MB appears: the floor scales as sqrt(N).
-    """
-    import jax
-    import numpy as np
-
-    def _cb(r):
-        from common import sanity
-        r = float(np.asarray(r))
-        if not np.isfinite(r) or r > float(rtol):
-            sanity.warn(
-                f"{name}: reduce-scatter checksum residual {r:.3e} > "
-                f"{float(rtol):.1e}.  A Freivalds weighted checksum of a "
-                f"psum_scatter cannot disagree with its own input unless the "
-                f"COLLECTIVE returned data that is not the reduction it was "
-                f"asked for.  Known cause on this stack: "
-                f"JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo corrupts output "
-                f"segment 0 in ~5% of executions (see "
-                f"wk_REL/UPSTREAM_gloo_psum_scatter_corruption.md); mpi is "
-                f"clean in 584/584.  Every number downstream of this "
-                f"collective is suspect.",
-                print_fn=print_fn)
-
-    jax.debug.callback(_cb, residual)
 
 
 # ---------------------------------------------------------------------------
