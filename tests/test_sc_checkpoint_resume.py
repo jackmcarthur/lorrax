@@ -170,3 +170,37 @@ def test_deck_digest_reads_lines_as_the_parser_does(monkeypatch, tmp_path):
     base = digest("[cohsex]\nnband = 60\nsc_max_iter = 30\n")
     assert digest("[cohsex]\nnband=60  # more bands later\nSC_MAX_ITER: 40\n") == base
     assert digest("[cohsex]\nnband = 61\nsc_max_iter = 30\n") != base
+
+
+def test_cube_digest_splits_over_ranks(monkeypatch, tmp_path):
+    """Rank r hashes the slices t = r mod P; their XOR is the P = 1 digest."""
+    from functools import reduce
+    import h5py
+    import common.collectives as cc
+    from file_io.sigma_checkpoint import _cubes_digest
+
+    rng = np.random.default_rng(3)
+    path = tmp_path / "cubes.h5"
+    with h5py.File(path, "w") as f:
+        f["X"] = rng.standard_normal((5, 3, 4)) + 1j * rng.standard_normal((5, 3, 4))
+        f["x"] = rng.standard_normal((3, 4))
+    reads = []
+
+    def agree(error, **_):
+        if error is not None:
+            raise RuntimeError(str(error))
+    monkeypatch.setattr(cc, "agree_io_error", agree)
+    monkeypatch.setattr(cc, "xor_to_all", lambda local, **_: (reads.append(local), local)[1])
+
+    def digest(rank, size):
+        monkeypatch.setattr(cc, "process_rank", lambda: rank)
+        monkeypatch.setattr(cc, "process_count", lambda: size)
+        return int(_cubes_digest(path, ["x", "X"], stage="t"), 16)
+    whole = digest(0, 1)
+    for size in (2, 3, 8):
+        parts = [digest(r, size) for r in range(size)]
+        assert reduce(int.__xor__, parts) == whole
+        assert sum(p != 0 for p in parts) == min(size, 8)   # 8 slices, each hashed once
+    with h5py.File(path, "a") as f:
+        f["X"][4, 2, 3] += 1e-15
+    assert digest(0, 1) != whole

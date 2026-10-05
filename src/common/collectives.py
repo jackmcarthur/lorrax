@@ -96,6 +96,7 @@ __all__ = [
     # barriers
     "barrier",
     "agree_io_error",
+    "xor_to_all",
     "rank0_transaction",
     "rank0_atomic_file_transaction",
     "collective_atomic_file_transaction",
@@ -1558,6 +1559,20 @@ def agree_io_error(error, *, path, stage):
         _io_error_receipt(error), path=path, stage=stage,
         reduce=_first_io_error)
     _raise_io_receipts([receipt], path=path, stage=stage)
+
+
+def xor_to_all(digest, *, path, stage):
+    """The XOR of every rank's equal-length ``digest`` bytes, on every rank.
+
+    A bounded receipt through the host control store, like
+    :func:`agree_io_error` (no device collective); every rank must call.
+    """
+    import numpy as np
+
+    data = np.frombuffer(bytes(digest), dtype=np.uint8).copy()
+    return bytes(_reduce_io_control(
+        data, path=path, stage=f"{stage}/xor",
+        reduce=lambda records: np.bitwise_xor.reduce(np.stack(records), axis=0)))
 
 
 def rank0_transaction(path, *, stage, write, validate=None, return_value=False):

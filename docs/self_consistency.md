@@ -739,7 +739,10 @@ state that fixes the next map:
 The stacks and pairs are written from their shards through SlabIO; the rest is
 one record of plain Python and numpy containers, pickled on rank 0 and read
 back through a loader that refuses any other class. The commit digest covers
-the record, the state and the cube bytes, and the file is published by
+the record, the state and the cube bytes. The ranks take the cube digest
+together from the closed file: rank t mod P hashes leading-axis slice t, and
+the slice digests combine by XOR, so each rank reads 1/P of the file and a
+continuation on another P authenticates. The file is published by
 `common.collectives.collective_atomic_file_transaction`, so a kill mid-write
 keeps the previous map's checkpoint; a failed write removes it. A converged run
 deletes its checkpoint once its terminal SC files are written. A checkpoint

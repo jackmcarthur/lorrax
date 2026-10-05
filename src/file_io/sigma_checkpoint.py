@@ -140,16 +140,35 @@ def _plain_loads(data):
     return _PlainLoader(io.BytesIO(data)).load()
 
 
-def _cubes_sha256(f, names):
-    """One digest of the stored cube bytes, read slice by slice (mesh-free); each
-    slice is hashed through its buffer, with no second host copy."""
-    digest = hashlib.sha256()
-    for name in sorted(names):
-        ds = f[name]
-        digest.update(f"{name}{ds.dtype}{ds.shape}".encode())
-        for i in range(ds.shape[0]):
-            digest.update(np.ascontiguousarray(ds[i]))
-    return digest.hexdigest()
+def _cubes_digest(path, names, *, stage):
+    """One digest of the stored cube bytes, taken by every rank (collective).
+
+    Leading-axis slice t of the sorted cubes is read from the closed file and
+    SHA-256-hashed with its name, dtype, shape and index by rank t mod P; the
+    slice digests combine by XOR through the host control store, so each rank
+    hashes 1/P of the file and the value is the same at any P (a continuation
+    on another mesh authenticates). A failed read raises on every rank.
+    """
+    import h5py
+    from common.collectives import agree_io_error, process_count, process_rank, xor_to_all
+
+    rank, size, local, error = process_rank(), process_count(), 0, None
+    try:
+        with h5py.File(path, "r") as f:
+            t = 0
+            for name in sorted(names):
+                ds = f[name]
+                head = f"{name}{ds.dtype}{ds.shape}".encode()
+                for i in range(ds.shape[0]):
+                    if t % size == rank:
+                        digest = hashlib.sha256(head + f"[{i}]".encode())
+                        digest.update(np.ascontiguousarray(ds[i]))
+                        local ^= int.from_bytes(digest.digest(), "big")
+                    t += 1
+    except (OSError, KeyError, ValueError) as exc:
+        error = exc
+    agree_io_error(error, path=path, stage=stage)
+    return xor_to_all(local.to_bytes(32, "big"), path=path, stage=stage).hex()
 
 
 def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
@@ -160,9 +179,9 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
     state digests) and the commit, and the file is published atomically
     (``collective_atomic_file_transaction``). ``state`` is pickled on rank 0
     (plain containers only, round-tripped through :func:`_plain_loads`).
-    The cube digest is taken from the closed staging file, not from memory:
-    no rank holds a whole cube, and it binds the bytes that landed on disk
-    (INVARIANTS 26). Staging files a dead process left beside ``path`` are
+    The cube digest is taken by every rank from the closed staging file
+    (:func:`_cubes_digest`), not from memory: no rank holds a whole cube,
+    and it binds the bytes that landed on disk. Staging files a dead process left beside ``path`` are
     removed. Returns (bytes, seconds).
     """
     import h5py
@@ -178,6 +197,7 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
             for name, cube in present.items():
                 io.create_dataset(name, shape=tuple(cube.shape), dtype=cube.dtype)
                 io.write_slab(name, cube)
+        digest = _cubes_digest(staging, present, stage="checkpoint.digest")
         if process_rank() != 0:
             return
         for orphan in Path(staging).parent.glob(f".{Path(path).name}.*.tmp"):
@@ -193,7 +213,7 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
                 schema=schema, identity=identity,
                 cubes={name: dict(shape=list(cube.shape), dtype=str(cube.dtype),
                                   spec=_spec(cube)) for name, cube in present.items()},
-                host=host, cubes_sha256=_cubes_sha256(f, present),
+                host=host, cubes_digest=digest,
                 state_sha256=None if blob is None else hashlib.sha256(blob).hexdigest())
             text = _json(record)
             if blob is not None:
@@ -226,11 +246,12 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
     """Return ``(cubes, host, state, commit)`` for an authenticated
     checkpoint, else ``(None, reason)``.
 
-    Rank 0 checks the commit, the cube digest and the identity, and returns
-    the commit; every rank then checks that the record it reads carries that
-    commit. A partial or foreign file is removed (``discard``) so the caller
-    recomputes; with ``discard=False`` it is left in place and the reason
-    names the identity fields that differ. ``cubes=False`` defers the cubes
+    Rank 0 checks the commit and the identity, and returns the commit; every
+    rank then checks that the record it reads carries that commit, and the
+    ranks take the cube digest together (:func:`_cubes_digest`). A partial
+    or foreign file is removed (``discard``) so the caller recomputes; with
+    ``discard=False`` it is left in place and the reason names the identity
+    fields that differ. ``cubes=False`` defers the cubes
     to :func:`read_checkpoint_cubes`.
     """
     import h5py
@@ -254,8 +275,8 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
                     reason = "identity differs" + (": " + ", ".join(sorted(
                         k for k in set(got) | set(identity) if got.get(k) != identity.get(k)))
                         if isinstance(got, dict) and isinstance(identity, dict) else "")
-                elif record.get("cubes_sha256") != _cubes_sha256(f, record["cubes"]):
-                    reason = "cube bytes differ from their digest"
+                elif "cubes_digest" not in record:
+                    reason = "cube digest of an older format"
                 else:
                     return ["match", commit]
         except (OSError, KeyError, ValueError):
@@ -285,6 +306,17 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
     except (OSError, KeyError, ValueError) as exc:
         error = exc
     agree_io_error(error, path=path, stage="checkpoint.record")
+    try:
+        digest = _cubes_digest(path, record["cubes"], stage="checkpoint.digest")
+    except RuntimeError:                       # raised alike on every rank
+        digest = None
+    if digest != record["cubes_digest"]:
+        reason = "cube bytes differ from their digest"
+        if discard:
+            discard_sigma_checkpoint(path)
+            print_fn(f"WARNING checkpoint: removed ({reason}) {path}; recomputing")
+            return None, f"removed ({reason})"
+        return None, reason
     host = _decode(record["host"])
     if not cubes:
         return {}, host, state, commit
