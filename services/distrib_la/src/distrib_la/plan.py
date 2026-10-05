@@ -302,6 +302,29 @@ def _sized_or_failed(op, mesh, nb, n, dtype, rounds, phase) -> tuple[int, float]
         return _SIZING_FAILED, 0.0
 
 
+def _stack_price(op, mesh, nb, n, dtype, rounds) -> int:
+    """Per-rank device bytes of a route-(c) stack program in ``rounds``, priced from the shapes.
+
+    The planners' formula (``distrib_la.workspace``): each whole matrix a
+    rank holds at a time with its vectors and, on CUDA, the local solver's
+    workspace, plus the checked chain's temporaries (:data:`CHECKED_EIGH_TILES`)
+    and its gathered retry where admitted. For a traced caller, whose own
+    program is the one compiled and sized.
+    """
+    from distrib_la.resolve import mesh_platform
+    from distrib_la.workspace import _vendor_query
+    ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    per_rank = -(-(-(-nb // rounds)) // ranks)
+    item = np.dtype(dtype).itemsize
+    whole = 2 * n * n * item
+    if mesh_platform(mesh) == "CUDA":
+        whole += _vendor_query(0, "eigh", (n,), np.dtype(dtype).str)[0] + 4
+    checked = CHECKED_EIGH_TILES * (n * n // ranks) * item
+    if op != "normal_eigh" and _gathered_admitted((n, n), dtype):
+        checked += GATHERED_EIGH_FACTOR * n * n * item
+    return per_rank * whole + checked
+
+
 def _gathered_admitted(shape, dtype) -> bool:
     """Whether an eigh's gathered retry joins its chain: the matrices, their
     vectors and the solver's copy (GATHERED_EIGH_FACTOR n^2 elements each)
@@ -542,7 +565,8 @@ def _native2d_trace_fn(impl: Callable, mesh: Mesh) -> Callable:
 def _describe_stack(route: StackRoute) -> str:
     """One phrase for a decided stack route (log line and :meth:`Plan.describe`)."""
     gb = lambda v: "n/a" if v is None else f"{v / 1e9:.2f} GB"
-    sized = f", sized in {route.sizing_seconds:.1f} s" if route.sizing_seconds else ""
+    sized = (f", sized in {route.sizing_seconds:.1f} s" if route.sizing_seconds
+             else ", priced from the shapes" if route.program_bytes is not None else "")
     if route.route == ROUTE_BATCH_RESHARD:
         return (f"{route.route}, {route.per_rank} whole matrix(es) per rank, "
                 f"{route.rounds} round(s), compiled {gb(route.program_bytes)}/rank of room "
@@ -692,8 +716,9 @@ class Plan:
         an eigh plan built with ``budget_bytes`` (the caller's room per rank,
         beside its own live set) and no explicit route. Then capacity decides:
         the stack runs route (c), one or more whole matrices per rank, when
-        the compiled program that runs it fits the room (:func:`_stack_bytes`:
-        only a compiled figure accepts; a shape bound may only reject); the
+        the program that runs it fits the room (an eager call compiles its
+        first-attempt program once and runs it, :func:`_stack_bytes`; a
+        traced caller's is priced from the shapes, :func:`_stack_price`); the
         stack is cut into as many equal slices (rounds) as that needs. When not
         even one whole matrix per rank fits, it runs on the whole mesh. The room
         is a caller value every rank shares and the decision runs in lockstep
@@ -718,7 +743,7 @@ class Plan:
         key = self._stack_key(op, nb, shape[-1], dtype, traced)
         decided = _STACK_ROUTES.get(key)
         if decided is None:
-            decided = _STACK_ROUTES[key] = self._decide_stack(op, nb, key[3], key[4], key[6])
+            decided = _STACK_ROUTES[key] = self._decide_stack(op, nb, key[3], key[4], key[6], traced)
         return decided
 
     def _stack_key(self, op, nb, n, dtype, traced):
@@ -741,19 +766,24 @@ class Plan:
                 return decided.route
         return static
 
-    def _decide_stack(self, op, nb, n, dtype, phase) -> StackRoute:
+    def _decide_stack(self, op, nb, n, dtype, phase, traced=True) -> StackRoute:
         """Route (c) at the most whole matrices per rank whose program fits the room on every rank.
 
         In lockstep over ranks (INVARIANTS 21): the candidates (whole
         matrices per rank, from ceil(nb/P) down) follow from the shape, the
         room and agreed sizes only, so every rank walks the same ones; for
-        each, every rank compiles the same program and the compiled size is
-        agreed (the largest any rank measured) before the comparison with
-        the room. The first candidate whose agreed size fits wins; a
+        each, the size is agreed (the largest any rank posted) before the
+        comparison with the room, and the first candidate that fits wins; a
         candidate whose matrices and vectors alone (2 n^2 each) exceed the
-        room is rejected without a compile. Only a compiled figure accepts. A
-        rank whose sizing fails posts a failure sentinel instead of raising,
-        so every rank still reaches the exchange and rejects the candidate.
+        room is rejected before any sizing. An eager call sizes a candidate
+        by compiling its first-attempt program once (:func:`_stack_bytes`),
+        and that executable runs the call. A traced caller never compiles
+        here: the program that runs is the caller's own, compiled and sized
+        by whoever admits it, so a stack program compiled only to be
+        measured would be thrown away; its candidates are priced from the
+        shapes (:func:`_stack_price`). A rank whose sizing fails posts a
+        failure sentinel instead of raising, so every rank still reaches
+        the exchange and rejects the candidate.
         """
         from distrib_la._collectives import agreed_minimum
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
@@ -768,7 +798,10 @@ class Plan:
             if -(-m // ranks) * floor > room:
                 per_rank = min(per_rank - 1, room // floor)
                 continue
-            local, seconds = _sized_or_failed(op, self.mesh, nb, n, dtype, rounds, phase)
+            if traced:
+                local, seconds = _stack_price(op, self.mesh, nb, n, dtype, rounds), 0.0
+            else:
+                local, seconds = _sized_or_failed(op, self.mesh, nb, n, dtype, rounds, phase)
             agreed, = agreed_minimum((-int(local),), tag="eigh stack size")
             tried, compiled, wall = -(-m // ranks), -agreed, wall + seconds
             if compiled >= _SIZING_FAILED:

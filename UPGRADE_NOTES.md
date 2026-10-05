@@ -51,9 +51,9 @@ thread, every entry unused for 7 days. No results move. The first run after
 this change starts cold once; the old per-commit namespaces are retired by
 the existing pruner after 7 days unused.
 
-## 2026-10-05 — distrib_la programs are keyed on what enters the HLO; sqrt_v and the Dyson programs are checked programs
+## 2026-10-05 — distrib_la programs are keyed on what enters the HLO; sqrt_v and the Dyson programs are checked programs; a traced stack route is priced, not compiled
 
-Compile audit rows 5 and 6. A distrib_la program key (`_program_key`,
+Compile audit rows 4, 5 and 6. A distrib_la program key (`_program_key`,
 `_stack_bytes`, `_reshard_stack_program`, `Plan._program`,
 `_scan_over_single`) held the call site and the plan's byte budget, so one
 eigh stack compiled once per calling line and per room (CrI3 24×24 P64:
@@ -66,7 +66,11 @@ an AOT caller hands its executable's `(out, status)` to `call.finish`), so
 they hold no host callback and the persistent cache stores them; a checked
 solve traced in a bare jit outside any `checked_program` still prints its
 notices through one callback, and now warns once per site (`UNCACHEABLE`).
-No
+A traced route-(c) decision no longer compiles a stack program to measure
+it (that program was thrown away: 14 compiles, about 40 s cold on CrI3
+P64); it prices each candidate from the shapes with the planners' formula
+(`_stack_price`), and the route line says "priced from the shapes". An
+eager call still compiles its first-attempt program once and runs it. No
 deck or environment change; results do not move.
 
 ## 2026-10-05 — kmeans sizes from the shapes; a CT face fallback; the checkpoint digest splits over ranks
