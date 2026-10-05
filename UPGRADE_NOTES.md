@@ -21,6 +21,18 @@ reference spectrum non-monotonic. Replayed on nine existing SC histories
 does not move; the largest within-block motion the mean removed at a stop map
 was 0.023 meV. A deck that sets `sc_exact_degeneracy_tol_ev` refuses by name:
 delete the line.
+## 2026-10-05 — shared-pole SC rounds write their model files directly
+
+A model round whose K extent is already held (SC map 2 on; map 1 records
+the extent at its finalize) writes its batch into the final
+`factor`/`poles2_ry2` datasets at once; map 0, map 1 and a one-shot still
+stage. The file holds the same bytes, census, digest and commit (Fe 4³
+bispinor P4, file route: eqp bitwise over maps 0–2; a job killed mid-write
+leaves `finalized = false` and no commit, refused by name), and the scalar
+constructor's one-batch write is the same direct write. The header carries
+`direct_extent`; `staging_payload_bytes` and `peak_payload_bytes` are gone.
+No deck change.
+
 ## 2026-10-05 — `full_shared_pole` on a WFN with time reversal refuses at driver entry
 
 `bispinor_gw = full_shared_pole` on a WFN with time reversal now refuses at
