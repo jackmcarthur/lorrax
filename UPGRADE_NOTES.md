@@ -5,6 +5,29 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — compiled sizes agree over ranks; PT magnets stream their −q rows
+
+- `check_chunk` (the ζ μ batch, the response direct stream) and the Σ τ
+  window's overlap test and reservation compare the largest compiled figure
+  any rank read. A figure that differed across ranks could split the ranks
+  between a recompile and an all-gather and hang. No result moves.
+- `step_up` clamps a step to its top before the caller's snap. A route-G
+  plane step-up whose implied block count passed the plane-group count raised
+  ZeroDivisionError; it now steps to one plane group per block and warns.
+- The shared-pole −q mirror uses inversion only where SymMaps authorizes it
+  as a unitary row. A magnet whose inversion holds only with time reversal
+  (QE t_rev = 1, e.g. a PT-symmetric antiferromagnet) now streams its −q rows;
+  before, W at the line samples was built from a non-symmetry. Nonmagnetic
+  decks and magnets with unitary inversion (Fe, Ni, CrI3 FM) are unchanged.
+- The sector CT reduction's final eigh reads the Hermitian part of Y^H V Y.
+  On the face route the whole-mesh eigh's result check could refuse it near
+  the keep cut. Fe 4³ bispinor P4 maps 0–2, local and forced face: map 0
+  eqp bitwise, CC/TT models bitwise, CT W(z) within 2e-11; through the SC
+  maps eqp moves at most 0.14 µeV.
+- The bare-moment Hermiticity gate and `distrib_la.leading_eigenvectors`'
+  face check no longer replicate their stacks on every rank.
+- Decks do not change.
+
 ## 2026-10-04 — bispinor charge on the large block
 
 `bispinor = true` builds the charge vertex on $\Psi_C=(\psi_L,0)$: the direct

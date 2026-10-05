@@ -15,6 +15,10 @@
   (CPU).
 - `test_minibz_equal_shares.py`: the shared mini-BZ head average gives every
   rank one share shape (CPU, three simulated ranks).
+- `test_lockstep_guards.py`: run-condition guards on toy inputs (CPU):
+  compiled-size checks agree over ranks, `step_up` never snaps past its top,
+  the sector CT eigh operand is Hermitian, the −q mirror's inversion is an
+  authorized unitary row.
 - Benchmarks and backend checks for a standalone service live in that service's
   `services/<svc>/bench/`.
 
