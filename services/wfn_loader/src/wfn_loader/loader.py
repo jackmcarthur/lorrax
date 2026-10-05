@@ -732,12 +732,20 @@ class WfnLoader:
         return self._sym
 
     def resolve_qe_symmetry(self):
-        """The authenticated QE operation typing (``QESymmetryBinding``), or None; resolved once."""
+        """The authenticated QE operation typing (``QESymmetryBinding``), or None; resolved once.
+
+        A ``WFN_qp.h5`` is also discovered from its stamped source WFN
+        (``qp_wfn_source``), so it gets the schema, and the TRS verdict, its
+        source got wherever it sits.
+        """
         if not self._qe_symmetry_checked:
             from symmetry_maps import resolve_qe_symmetry_binding
+            source = self._file.attrs.get("qp_wfn_source", "")
+            source = source.decode() if isinstance(source, bytes) else str(source)
             self.qe_symmetry_binding, self.qe_symmetry_diagnostic = (
                 resolve_qe_symmetry_binding(
-                    self, wfn_path=self._path, schema=self._qe_schema_request))
+                    self, wfn_path=(self._path, *((source,) if source else ())),
+                    schema=self._qe_schema_request))
             self._qe_symmetry_checked = True
         return self.qe_symmetry_binding
 

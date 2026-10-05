@@ -391,16 +391,23 @@ def bind_qe_symmetry_receipt(wfn, receipt: QESymmetryReceipt) -> QESymmetryBindi
     )
 
 
-def discover_qe_schema_paths(wfn_path: str | Path) -> tuple[str, ...]:
-    """Return a bounded, WFN-anchored set of nearby QE schema candidates."""
-    given = Path(wfn_path).expanduser().absolute()
-    anchors = [given.parent]
-    try:
-        resolved_parent = given.resolve().parent
-    except OSError:
-        resolved_parent = given.parent
-    if resolved_parent not in anchors:
-        anchors.append(resolved_parent)
+def discover_qe_schema_paths(*wfn_paths: str | Path) -> tuple[str, ...]:
+    """Return a bounded, WFN-anchored set of nearby QE schema candidates.
+
+    Each path anchors at its directory and its symlink-resolved directory; a
+    LORRAX-written WFN passes its stamped source too, so it finds what its
+    source found.
+    """
+    anchors: list[Path] = []
+    for wfn_path in wfn_paths:
+        given = Path(wfn_path).expanduser().absolute()
+        try:
+            resolved_parent = given.resolve().parent
+        except OSError:
+            resolved_parent = given.parent
+        for anchor in (given.parent, resolved_parent):
+            if anchor not in anchors:
+                anchors.append(anchor)
 
     bases: list[Path] = []
     for anchor in anchors:
@@ -471,18 +478,21 @@ def _binding_signature(binding: QESymmetryBinding) -> tuple:
 def resolve_qe_symmetry_binding(
     wfn,
     *,
-    wfn_path: str | Path,
+    wfn_path: str | Path | tuple,
     schema: str | Path | None = None,
 ) -> tuple[QESymmetryBinding | None, str]:
     """Resolve an explicit or bounded-auto QE schema for one WFN.
 
-    Explicit schema mismatch is a refusal.  Auto mode returns ``None`` plus
-    a detailed diagnostic so :class:`SymMaps` can announce its conservative
-    legacy fallback at the exact symmetry-initialization seam.
+    ``wfn_path`` is the WFN's path, or a tuple of discovery anchors
+    (:func:`discover_qe_schema_paths`).  Explicit schema mismatch is a
+    refusal.  Auto mode returns ``None`` plus a detailed diagnostic so
+    :class:`SymMaps` can announce its conservative legacy fallback at the
+    exact symmetry-initialization seam.
     """
     explicit = schema is not None
+    anchors = (wfn_path,) if isinstance(wfn_path, (str, Path)) else tuple(wfn_path)
     paths = ((str(Path(schema).expanduser()),) if explicit
-             else discover_qe_schema_paths(wfn_path))
+             else discover_qe_schema_paths(*anchors))
     if not paths:
         return None, "no nearby data-file-schema.xml candidate was found"
 
@@ -531,7 +541,7 @@ def resolve_qe_symmetry_binding(
             selected.qe_permitted_pure_time_reversal),
         equivalent_schema_paths=aliases,
         scf_absolute_magnetization=scf_absolute_magnetization(
-            receipts, discover_qe_schema_paths(wfn_path)),
+            receipts, discover_qe_schema_paths(*anchors)),
     )
     diagnostic = (
         f"authenticated {selected.schema_path} "

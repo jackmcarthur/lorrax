@@ -8,6 +8,9 @@ tolerance refuses at m = 0 and takes TRS off at 0 < m < tolerance.
 file the NSCF .save holds byte for byte, because an NSCF schema writes
 ``absolute`` = 0.
 """
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -170,3 +173,30 @@ def test_scf_magnetization_from_the_matching_density(tmp_path):
         tmp_path / "nm/x.save", calculation="nscf", do_mag="false",
         absolute=0.0, density=b"rho-nm"))
     assert scf_absolute_magnetization([plain], []) == 0.0
+
+
+def test_qp_wfn_is_discovered_from_its_source(tmp_path, monkeypatch):
+    """A real-file WFN_qp.h5 beside a symlinked WFN.h5 finds the schema its source finds."""
+    import symmetry_maps
+    from symmetry_maps.qe_schema import discover_qe_schema_paths
+    from wfn_loader.loader import WfnLoader
+
+    schema = _schema(tmp_path / "qe/nscf/x.save", calculation="nscf", do_mag="false",
+                     absolute=0.0, density=b"rho")
+    (tmp_path / "qe/nscf/WFN.h5").write_bytes(b"")
+    run = tmp_path / "runs/a/b/c"
+    run.mkdir(parents=True)
+    (run / "WFN.h5").symlink_to(tmp_path / "qe/nscf/WFN.h5")
+    (run / "WFN_qp.h5").write_bytes(b"")
+    assert discover_qe_schema_paths(run / "WFN_qp.h5") == ()
+    assert discover_qe_schema_paths(run / "WFN_qp.h5", run / "WFN.h5") == (
+        str(Path(schema).resolve()),)
+
+    seen = {}
+    monkeypatch.setattr(symmetry_maps, "resolve_qe_symmetry_binding",
+                        lambda wfn, *, wfn_path, schema: (seen.update(paths=wfn_path), (None, ""))[1])
+    loader = SimpleNamespace(_qe_symmetry_checked=False, _qe_schema_request=None,
+                             _path=str(run / "WFN_qp.h5"),
+                             _file=SimpleNamespace(attrs={"qp_wfn_source": str(run / "WFN.h5")}))
+    WfnLoader.resolve_qe_symmetry(loader)
+    assert seen["paths"] == (str(run / "WFN_qp.h5"), str(run / "WFN.h5"))

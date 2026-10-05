@@ -645,13 +645,9 @@ def qe_dftu_declaration(wfn):
     0.0588 = 0.8 eV -- so J is never read from the XML.)
     """
     import xml.etree.ElementTree as ET
-    binding = getattr(wfn, "qe_symmetry_binding", None)
-    if binding is None and getattr(wfn, "_qe_symmetry_checked", True) is False:
-        # The loader binds its schema lazily inside symmetry(); bind here with
-        # the SAME resolver (no SymMaps needed) rather than forcing the k maps.
-        from symmetry_maps import resolve_qe_symmetry_binding
-        binding, _ = resolve_qe_symmetry_binding(
-            wfn, wfn_path=wfn.path, schema=getattr(wfn, "_qe_schema_request", None))
+    # The loader's own lazy, cached resolution (no SymMaps needed).
+    binding = (wfn.resolve_qe_symmetry() if hasattr(wfn, "resolve_qe_symmetry")
+               else getattr(wfn, "qe_symmetry_binding", None))
     if binding is None:
         return None
     root = ET.parse(binding.schema_path).getroot()
