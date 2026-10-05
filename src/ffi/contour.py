@@ -105,16 +105,16 @@ def contour_block_accumulate_local(accumulator, contribution, projection, valid,
     if any(a.dtype != jnp.complex128 for a in (accumulator, contribution, projection)):
         raise TypeError("contour block accumulator requires complex128 operands")
     if _host(mesh):
+        # One index dtype: a traced int32 offset beside x64 Python ints is a TypeError.
+        start = tuple(jnp.asarray(v, jnp.int32) for v in (0, 0, m0, n0))
         bm, bn = contribution.shape[2:]
-        block = jax.lax.dynamic_slice(accumulator, (0, 0, m0, n0),
-                                      (*accumulator.shape[:2], bm, bn))
+        block = jax.lax.dynamic_slice(accumulator, start, (*accumulator.shape[:2], bm, bn))
         new = block
         for s in range(contribution.shape[0]):
             new = new + projection[s][:, None, None, None] * contribution[s][None]
         live = ((jnp.arange(bm)[:, None] < valid[0])
                 & (jnp.arange(bn)[None, :] < valid[1]))
-        return jax.lax.dynamic_update_slice(
-            accumulator, jnp.where(live, new, block), (0, 0, m0, n0))
+        return jax.lax.dynamic_update_slice(accumulator, jnp.where(live, new, block), start)
     _require(BLOCK_TARGET)
     static = all(isinstance(v, (int, np.integer)) for v in (m0, n0))
     origin = () if static else (jnp.stack([jnp.asarray(m0, jnp.int32), jnp.asarray(n0, jnp.int32)]),)
