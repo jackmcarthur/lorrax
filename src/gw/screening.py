@@ -1001,6 +1001,26 @@ def refuse_w_bse_without_trs(config, sym) -> None:
             "ladder owns a general ordered-response construction.")
 
 
+def refuse_full_shared_pole_with_trs(config, sym) -> None:
+    """``GATE full_shared_pole_trs``, before any basis, zeta or V, as above.
+
+    With time reversal Pi_T0(q, 0) = 0: the CT/TC block is odd in omega and CC,
+    TT are even. The sector store writes CC and TT only in the ordered
+    representation, which needs broken time reversal
+    (``file_io.shared_pole_store._metadata``), so the run would refuse after
+    the screening stage.
+    """
+    from .gw_config import uses_full_bispinor_shared_pole
+    if uses_full_bispinor_shared_pole(config) and _trs_verdict(sym):
+        raise ValueError(
+            "GATE full_shared_pole_trs: bispinor_gw = full_shared_pole on a WFN "
+            "with time reversal (SymMaps.trs_allowed); the sector store holds CC "
+            "and TT only in the ordered representation, which needs broken time "
+            "reversal.  With time reversal the static charge-current coupling "
+            "vanishes and the mixed terms are purely dynamical; use bispinor_gw "
+            "= bare_transverse (docs/theory/bispinor-gw.md section 10).")
+
+
 def _trs_verdict(sym) -> bool:
     """Return the deck's required MEASURED time-reversal verdict.
 
