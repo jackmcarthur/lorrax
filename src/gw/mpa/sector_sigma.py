@@ -775,6 +775,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                     ct,tc=mixed['CT_C'].sigma_c_kij,mixed['CT_T'].sigma_c_kij
                     dag=lambda m:jnp.swapaxes(jnp.conj(m),-1,-2)
                     line=(f"  sector Sigma(omega): max|TC - CT^dagger| = {float(jnp.max(jnp.abs(tc-dag(ct))))*RYD_TO_EV:.3e} eV"
+                          f", max|TC - CT^T| = {float(jnp.max(jnp.abs(tc-jnp.swapaxes(ct,-1,-2))))*RYD_TO_EV:.3e} eV"
                           f" (max|CT| = {float(jnp.max(jnp.abs(ct)))*RYD_TO_EV:.3e} eV)")
                     if on_shell is not None:
                         diff=on_shell(replace(value,sigma_c_kij=ct+tc))-on_shell(replace(value,sigma_c_kij=ct+dag(ct)))
