@@ -301,17 +301,16 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             # The slow fallback (owner: warn, never refuse on budget): this
             # round's parents run again as face batches, CC and TT included.
             import warnings
+            del sectors,retained,model,cross,receipts[first_receipt:]
+            ledger.live_stages=upstream
             if not sizes:
                 admit_face(real)
             warnings.warn(f'shared-pole CT: the local round of parents {ids[:real]} does not '
                           'fit at its actual spans; it reruns on the face route in batches '
                           f'of {batch_width} parents (slow fallback)',RuntimeWarning,stacklevel=2)
-            del receipts[first_receipt:]
-            ledger.live_stages=upstream
             rounds[:0]=[(ids[q:q+batch_width],len(ids[q:q+batch_width]),
                          np.arange(len(ids[q:q+batch_width]),dtype=np.int64),'face')
                         for q in range(0,real,batch_width)]
-            del sectors,retained,model,cross
             continue
         models=(sectors[0]['model'],sectors[1]['model'],*cross['models'])
         treatment_policy=recipe.get('sector_pole_treatment')
