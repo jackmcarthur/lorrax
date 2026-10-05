@@ -171,9 +171,31 @@ def recipe_panel_widths(roles, states, recipe, *, column_extent, logical_n):
     return widths
 
 
+def recipe_infinity_width(infinity, recipe, *, column_extent, logical_n):
+    """The infinity block's carrier: the recipe's infinity width, or the block's own width when wider.
+
+    The leading directions of M1 close over a boundary multiplet, so a block
+    can exceed the recipe width (Na, a metal); as a state panel keeps its
+    wider carrier (``recipe_panel_widths``), so does the block. Decided once,
+    before the tables, and never below the block.
+    """
+    return max(column_extent(min(int(logical_n), max(1, int(recipe["infinity_width"])))),
+               int(infinity[0].shape[-1]))
+
+
 def pad_states(states, widths, infinity, infinity_width):
-    """Zero-pad every state panel and the infinity block to their recipe carriers (inert columns)."""
-    pad = lambda a, w: a if a.shape[-1] == w else _pad_columns(a.sharding, a.shape, w)(a)
+    """Zero-pad every state panel and the infinity block to their carriers (inert columns).
+
+    A carrier is a recipe bound or the array's own width when wider
+    (``recipe_panel_widths``, ``recipe_infinity_width``); it is never below
+    the array, so no panel is ever cut.
+    """
+    def pad(a, w):
+        if int(a.shape[-1]) > int(w):
+            raise ValueError(f"GATE shared_pole_carrier: got: a panel of {int(a.shape[-1])} columns on a "
+                             f"carrier of {int(w)}; want: carrier >= panel; why: a carrier is the recipe "
+                             "bound or the panel's own width, never narrower")
+        return a if int(a.shape[-1]) == int(w) else _pad_columns(a.sharding, a.shape, int(w))(a)
     return ([(st[0], *(pad(a, w) for a in st[1:])) for st, w in zip(states, widths)],
             tuple(pad(a, infinity_width) for a in infinity))
 

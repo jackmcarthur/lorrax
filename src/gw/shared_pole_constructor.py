@@ -111,7 +111,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         from common.staged_reshard import face_to_batch_reshard
         from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
                                           own_extent_receipts, reduce_round, round_tables,
-                                          recipe_panel_widths, pad_states)
+                                          recipe_panel_widths, recipe_infinity_width, pad_states)
         from gw.shared_pole_capacity import round_padding_output_bytes
         from gw.shared_pole_recipe import (
             build_construction_row, charge4_gates, construction_receipt,
@@ -287,7 +287,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             # table is host metadata, known before any panel is allocated.
             widths = recipe_panel_widths(round_roles[0], round_states, recipe,
                                          column_extent=column_extent, logical_n=logical_n)
-            infinity_width = column_extent(min(logical_n, max(1, int(recipe["infinity_width"]))))
+            infinity_width = recipe_infinity_width(infinity, recipe, column_extent=column_extent,
+                                                   logical_n=logical_n)
             tables = round_tables(
                 round_counts, widths, [st[0] for st in round_states], infinity_counts, infinity_width,
                 column_extent=column_extent, ordered=ordered, odd_moments=odd_moments)

@@ -65,6 +65,25 @@ def test_recipe_panel_widths_are_known_before_round_one():
     assert widths == [432]
 
 
+def test_infinity_block_wider_than_the_recipe_keeps_its_own_carrier():
+    """An M1 selection closed over a multiplet past the recipe width is never cut (Na, a metal)."""
+    import pytest
+    from types import SimpleNamespace
+    from gw.shared_pole_local import recipe_infinity_width, pad_states
+    recipe = {"infinity_width": 54}
+    extent = lambda w: -(-w // 8) * 8
+    narrow = (SimpleNamespace(shape=(4, 432, 40)),)
+    wide = (SimpleNamespace(shape=(4, 432, 72)),)
+    assert recipe_infinity_width(narrow, recipe, column_extent=extent, logical_n=432) == 56
+    assert recipe_infinity_width(wide, recipe, column_extent=extent, logical_n=432) == 72
+    assert recipe_infinity_width(wide, recipe, column_extent=extent, logical_n=60) == 72
+    # A carrier below a panel is refused by name, never a negative pad.
+    block = (jnp.ones((1, 4, 72)),)
+    with pytest.raises(ValueError, match="GATE shared_pole_carrier"):
+        pad_states([], [], block, 56)
+    assert pad_states([], [], block, 72)[1][0].shape == (1, 4, 72)
+
+
 def test_pencil_extent_fixed_before_round_one():
     """Selections growing parent by parent give one pencil side, the panels' capacity."""
     from runtime.padding import ladder_extent
