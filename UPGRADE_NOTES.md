@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — the one-shot names every band it reads at Σ(ω = 0)
+
+The one-shot's incomplete-grid warning now lists each band read at
+Σ(ω = 0), with its DFT energy range about E_F and its k count, instead of
+only a cell count. Those are the requested states the sampled grid does not
+reach: deep states the W model treats as inactive. No number moves. To
+sample them, widen `sigma_omega_min_ev` or add a `sigma_omega_patches_ev`
+window.
+
 ## 2026-10-05 — kmeans reads the deck's `wfn_file`
 
 `centroid.kmeans_cli -i DECK` opens the deck's `wfn_file`, relative to the
