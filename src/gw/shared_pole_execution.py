@@ -333,17 +333,24 @@ def face_matmul(mesh):
 
 
 @lru_cache(maxsize=None)
+def _face_eigh(mesh, n):
+    from distrib_la import plan
+    return plan('eigh',mesh,n=int(n),backend='distributed',budget_bytes=0)
+
+
 def face_eigh(mesh, n, room=None):
     """The whole-mesh constructor's n x n eigh plan.
 
     ``room`` is the caller's device bytes per rank beside its admitted live
     set (``face_eigh_room``), the same on every rank. distrib_la decides each
     stack from it: whole matrices per rank where the program that runs it
-    compiles within the room, else the whole mesh. Without a room every stack
-    runs on the mesh.
+    fits the room, else the whole mesh. Without a room every stack runs on
+    the mesh. The room rides on the plan as its decision input and is in no
+    cache key: plans that differ only by room are equal, so the programs
+    built on them (``face_parent_program`` and the others) are shared.
     """
-    from distrib_la import plan
-    return plan('eigh',mesh,n=int(n),backend='distributed',budget_bytes=int(room or 0))
+    import dataclasses
+    return dataclasses.replace(_face_eigh(mesh, int(n)), budget_bytes=int(room or 0))
 
 
 def face_ritz_carrier(mesh, keep_budget):

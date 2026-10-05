@@ -160,18 +160,20 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
             "sample_face_count": sample_faces}
 
 
-@lru_cache(maxsize=None)
 def constructor_eigenplan(mesh_xy, side, execution, room=None):
     """The eigh service plan of a constructor layout: whole parents per rank
     ('local', the q-local kernel) or the complete mesh ('face', ``face_eigh``:
-    distrib_la decides each stack against ``room``)."""
-    import distrib_la
-
+    distrib_la decides each stack against ``room``, which is in no cache key)."""
     if execution == "face":
         from gw.shared_pole_execution import face_eigh
         return face_eigh(mesh_xy, int(side), room)
-    return distrib_la.plan("eigh", mesh_xy, n=int(side), backend="off",
-                           batched_route="batch_reshard")
+    return _local_eigenplan(mesh_xy, int(side))
+
+
+@lru_cache(maxsize=None)
+def _local_eigenplan(mesh_xy, side):
+    import distrib_la
+    return distrib_la.plan("eigh", mesh_xy, n=side, backend="off", batched_route="batch_reshard")
 
 
 def face_eigh_room(admission, held=0):

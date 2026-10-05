@@ -71,6 +71,18 @@ def test_eager_stack_route_compiles_once(monkeypatch):
     assert "sized in 0.5 s" in plan_mod._describe_stack(first)
 
 
+def test_face_plans_differ_by_room_share_programs(monkeypatch):
+    from gw import shared_pole_execution as spe
+    from gw.shared_pole_capacity import constructor_eigenplan
+    from gw.shared_pole_execution import face_eigh
+    mesh = _mesh()
+    monkeypatch.setattr(spe, "_face_eigh", lambda mesh, n: _plan(mesh))   # CPU has no distributed eigh
+    a, b = face_eigh(mesh, 8, 1 << 30), face_eigh(mesh, 8, 1 << 31)
+    assert a == b and hash(a) == hash(b) and a.budget_bytes != b.budget_bytes
+    assert constructor_eigenplan(mesh, 8, "face", 1 << 30) == constructor_eigenplan(mesh, 8, "face", None)
+    assert constructor_eigenplan(mesh, 8, "local") is constructor_eigenplan(mesh, 8, "local", 1 << 30)
+
+
 def test_program_keys_hold_no_site_or_budget():
     import inspect
     plan_mod = importlib.import_module("distrib_la.plan")
