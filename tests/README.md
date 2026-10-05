@@ -8,13 +8,21 @@
   Anderson trajectory across a stop, a refused held Σ rule, the band carrier.
 - `test_trs_qe_decides.py`: the 2c TRS verdict on toy loaders (CPU): QE's
   t_rev rows and SCF magnetization decide, the wavefunction guard refuses an
-  inconsistent nonmagnetic WFN, and the SCF magnetization is found by density.
+  inconsistent WFN at m = 0 and turns TRS off at a small moment, the SCF
+  magnetization is found by density, and a WFN_qp.h5 is discovered from its
+  source WFN.
 - `test_orbital_modern_route.py`: htransform's orbital totals and velocity
   refusals on toy inputs (CPU).
 - `test_hl_head_plasma_count.py`: the HL-PPM head ω_p² counts electrons
   (CPU).
 - `test_minibz_equal_shares.py`: the shared mini-BZ head average gives every
   rank one share shape (CPU, three simulated ranks).
+- `test_stream_passes_cpu.py`: the scanned row-pass loop on a host mesh
+  under x64 (CPU): two windows add the bytes of one.
+- `test_sigma_kconv_scratch.py`: mode 7's split-arm scratch follows the
+  handler's rule and is priced in the Σ pass and the τ window checks (CPU).
+- `test_head_resolver_hubbard.py`: the one-shot static head carries the
+  deck's DFT+U input and refuses a dipole without i[r, V_U] (CPU).
 - `test_lockstep_guards.py`: run-condition guards on toy inputs (CPU):
   compiled-size checks agree over ranks, `step_up` never snaps past its top,
   the sector CT eigh operand is Hermitian, the −q mirror's inversion is an

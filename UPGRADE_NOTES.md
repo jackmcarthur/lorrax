@@ -5,6 +5,35 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — review fixes: CPU row passes, the DFT+U static head, 2c TRS for WFN_qp, mode-7 scratch
+
+- CPU (host mesh) runs whose direct response stream needs two or more row
+  windows no longer die with a TypeError under x64 in the contour block
+  accumulate. GPU runs are unchanged.
+- The one-shot static head refuses a dipole.h5 without i[r, V_U] on a DFT+U
+  deck (`GATE static_head_dipole_operator`), whatever `LORRAX_SANITY` says;
+  it had warned, or with `LORRAX_SANITY=0` skipped the check. Regenerate such
+  a dipole.h5 with `python -m psp.get_dipole_mtxels -i <deck>`.
+- 2c TRS: a `WFN_qp.h5` also finds the QE schema from its source WFN
+  (`qp_wfn_source`), so it gets its source's verdict; a nonmagnetic SOC
+  `WFN_qp.h5` read by BSE, htransform or a restart had taken TRS off. The
+  wavefunction guard refuses (`GATE trs_qe_nonmagnetic_wfn_consistent`) only
+  at a QE moment of exactly 0; at 0 < m < 1e-4 μB/cell, or on a spatial-pair
+  failure, TRS goes off with a warning. The SCF moment is read from the
+  selected schema only, and not at all when a t_rev row decides.
+- Files. A nonmagnetic SOC `WFN_qp.h5` written before 09e4bcd81 (2026-09-30)
+  that stores both k and −k now refuses with `GATE
+  trs_qe_nonmagnetic_wfn_consistent`: its −k rows were rotated in the wrong
+  gauge (raw-pair residual 3.2e-2 on a MoS2 3×3 file). Before, it took TRS
+  off without saying why. Regenerate it with the current gwjax.
+- The Σ τ window prices mode 7's run-time split-arm scratch (up to 1 GiB per
+  call on bulk grids from about 14³) and counts it in its overlap check and
+  ledger reservation, which warns when over budget. Grids below about 14³
+  are unchanged.
+- Fe 4³ bispinor SC and Si 4³ SOC SC (maps 0–2) and a MoS2 3×3 SOC one-shot,
+  P4: eqp bitwise against main 88785c2e8.
+- Decks do not change.
+
 ## 2026-10-04 — compiled sizes agree over ranks; PT magnets stream their −q rows
 
 - `check_chunk` (the ζ μ batch, the response direct stream) and the Σ τ

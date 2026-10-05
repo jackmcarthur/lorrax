@@ -87,8 +87,9 @@ grid; consumers decide that against authenticated symmetry metadata
   `symmetry_maps.discover_qe_schema_paths(wfn_path)`: a
   `data-file-schema.xml` beside the WFN, or one inside a `*.save/` under `.`,
   `scf`, `nscf`, `qe/scf` or `qe/nscf`, anchored at the WFN directory (given
-  and resolved) and at most two directories above it. Failing to find one is
-  not a refusal: `SymMaps` falls back to the conservative all-spatial header
+  and resolved) and at most two directories above it. A `WFN_qp.h5` is also
+  anchored at its stamped source WFN (`qp_wfn_source`), so it finds what its
+  source found. Failing to find one is not a refusal: `SymMaps` falls back to the conservative all-spatial header
   interpretation, a 2c WFN has TRS off, and it prints a
   `SYMMETRY PROVENANCE WARNING` naming `qe_symmetry_diagnostic`.
 * **Parent/star streaming holds one k.** Each full-k star loads its raw parent
