@@ -5,6 +5,35 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — W-bank file tier warns instead of refusing; the pole-budget cut keeps whole multiplets
+
+Robustness-review fixes (reports A1–A3, #7, #9, #12, #14, #15):
+- A W-bank field created after the bank's initialization (line panels, photon
+  contact fields) that the disk or quota refuses is held in host memory with
+  a warning in the report's WARNINGS block, so the map runs on. Before, its first write refused the map on
+  every rank (`GATE streamed_bank_capacity … refused at creation`), after the
+  whole χ stream.
+- The per-rank streamed tier pads records to the page size, not the
+  filesystem block (16 MiB on CFS/GPFS). Where `fallocate` works, reserved
+  bytes are no longer promised a second time, so a bank no longer needs
+  twice its size free. The Lustre quota room is taken under the hard limit,
+  so the soft-limit grace period no longer refuses every file-tier bank.
+- `sigma_w_accuracy = relaxed` on a bispinor deck whose sectors take the face
+  route ran into a TypeError at batch admission; it now runs.
+- A complete shared-pole bank built against another bare-V digest (another
+  P, or code before this change) is rebuilt instead of refused with
+  `GATE shared_pole_output: … built with another bare V`.
+- The pole-budget keep cut no longer splits a degenerate multiplet at its
+  edge: a member tied to its neighbour below the cut leaves with it, so K can
+  be a few below the budget at a high-symmetry parent. Results move only
+  where the budget binds at a multiplet; W(q) then keeps its little-group
+  symmetry and no longer depends on the eigh route (P, card memory).
+  Fe 4³ scalar and bispinor SC (maps 0–2, local and forced face) and the
+  CrI3 6×6 one-shots (charge, charge with band extrapolation, bispinor) at
+  P4: eqp bitwise to main.
+- The one-shot Σ checkpoint identity includes the band-bracket plan, so a
+  restart after a change of `band_extrapolation_bracket_scheme` recomputes.
+
 ## 2026-10-05 — review fixes: CPU row passes, the DFT+U static head, 2c TRS for WFN_qp, mode-7 scratch
 
 - CPU (host mesh) runs whose direct response stream needs two or more row

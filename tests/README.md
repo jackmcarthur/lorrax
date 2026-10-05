@@ -27,6 +27,13 @@
   compiled-size checks agree over ranks, `step_up` never snaps past its top,
   the sector CT eigh operand is Hermitian, the −q mirror's inversion is an
   authorized unitary row.
+- `test_streamed_bank_capacity.py`: the per-rank streamed tier's capacity probe
+  on toy stores (CPU): page-aligned records, reserved bytes promised once, the
+  quota room under the hard limit, a late W-bank field the disk refuses held
+  in host memory.
+- `test_shared_pole_guards.py`: shared-pole guards on toy inputs (CPU): the
+  relaxed tier's sector face batch has no Ritz carrier, a bank of another
+  bare-V digest is rebuilt, the pole-budget cut never splits a multiplet.
 - Benchmarks and backend checks for a standalone service live in that service's
   `services/<svc>/bench/`.
 
