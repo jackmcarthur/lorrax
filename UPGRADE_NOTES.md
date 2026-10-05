@@ -70,8 +70,12 @@ A traced route-(c) decision no longer compiles a stack program to measure
 it (that program was thrown away: 14 compiles, about 40 s cold on CrI3
 P64); it prices each candidate from the shapes with the planners' formula
 (`_stack_price`), and the route line says "priced from the shapes". An
-eager call still compiles its first-attempt program once and runs it. No
-deck or environment change; results do not move.
+eager call still compiles its first-attempt program once and runs it. A
+plan's room (`budget_bytes`) is a decision input and no longer part of a
+plan's identity: the face plans and the programs built on them are shared
+across rooms, so a room that crosses a GiB between SC maps no longer
+recompiles the face programs; a shape's face program keeps the stack route
+it was traced with. No deck or environment change; results do not move.
 
 ## 2026-10-05 — kmeans sizes from the shapes; a CT face fallback; the checkpoint digest splits over ranks
 
