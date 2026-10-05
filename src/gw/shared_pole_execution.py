@@ -358,9 +358,12 @@ def face_ritz_carrier(mesh, keep_budget):
     largest divisor of n/p up to 256, and the budget rounded only to the mesh
     can give a prime n/p (Fe 4^3 on 2x2: 778/2 = 389, block 1, and the face
     reduction ran 12x slower). CrI3 24x24 on 8x8: 5991 -> 6144, tile 768.
+    No budget (the relaxed tier) gives None: the face solves the whole side.
     """
     import math
     from runtime.padding import ladder_extent
+    if keep_budget is None:
+        return None
     divisor = math.lcm(int(mesh.shape['x']), int(mesh.shape['y']))
     return divisor * ladder_extent(-(-int(keep_budget) // divisor))
 

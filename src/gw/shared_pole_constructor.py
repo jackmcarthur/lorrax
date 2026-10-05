@@ -212,8 +212,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             sizing = dict(rows=n, side=conservative_side, ordered=ordered, odd_moments=odd_moments,
                           infinity_width=column_extent(max(1, int(recipe["infinity_width"]))),
                           infinity_arrays=1 + len(moment_fields), keep_budget=keep_budget,
-                          carrier=(face_ritz_carrier(mesh_xy, keep_budget)
-                                   if ordered and keep_budget is not None else None))
+                          carrier=face_ritz_carrier(mesh_xy, keep_budget) if ordered else None)
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, nq=nq,
