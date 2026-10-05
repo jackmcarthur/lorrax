@@ -160,8 +160,9 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   program returns every attempt's errors beside its flag and the host prints
   the notices after the call: a checked program carries no host callback,
   so JAX's persistent compile cache can store it (it never stores one with a
-  callback). A status traced outside a `checked_program` (a caller's own scan
-  or cond) leaves its NaN-poisoned result unnamed. An eager checked call runs
+  callback). A status traced outside a `checked_program` (a caller's own jit,
+  scan or cond) still names its refusal, through a host callback in that
+  caller's program, which JAX then does not cache. An eager checked call runs
   as one cached program per signature, call site and budget.
 
 Scope: the probes catch gross errors and missing, duplicated or

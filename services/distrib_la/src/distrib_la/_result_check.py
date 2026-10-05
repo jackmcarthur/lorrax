@@ -247,7 +247,8 @@ def _notices(status, op, n, dtype, site, *, final):
     """
     if jax.process_index() != 0:
         return
-    errors = np.asarray(jax.device_get(status[1].addressable_data(0)))
+    errors = status[1]
+    errors = np.asarray(errors if isinstance(errors, np.ndarray) else jax.device_get(errors.addressable_data(0)))
     tol = accept(n, dtype)
     for table in errors.reshape(-1, *errors.shape[-2:]):
         for i, row in enumerate(table):
@@ -425,11 +426,15 @@ def raise_if_failed(status, op, n, dtype, site):
     from a scan), replicated, so every rank reads the same values and raises
     together; only the printing depends on the rank. A traced status goes to
     the enclosing :func:`checked_program`, if any; a traced status outside
-    one leaves a NaN-poisoned result unnamed.
+    one prints its notices through a host callback (the only program that
+    keeps one, and so is not stored by JAX's persistent cache).
     """
     if isinstance(status[0], jax.core.Tracer):
         if _program_context() is not None:
             _program_context()[1].append((status, (op, int(n), dtype, site)))
+        else:
+            jax.debug.callback(lambda failed, errors: _notices((failed, errors), op, int(n), dtype, site,
+                                                               final=True), *status)
         return
     _notices(status, op, n, dtype, site, final=True)
     if _flag(status):
