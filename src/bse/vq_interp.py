@@ -1308,8 +1308,7 @@ def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, chunk):
     dict has it is a function of ``chunk``.  Keeping it in the key would put
     the rank slab back into a cache key for no lookup that could ever
     benefit — a host memo is per-process and cross-rank sharing was never on
-    offer — and ``tests/cache_key_lint.py``'s ``rank-cache-key`` rule would
-    be right to say so.
+    offer.
 
     NOTHING here depends on the target Q.  The draws are indexed by global
     slot only; the Voronoi wrap and the ``randlims`` affine map are pure cell

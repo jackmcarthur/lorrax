@@ -20,7 +20,7 @@ See `AGENTS.md` for the directory layout and how to add a new target.
 #: ``common/jax_compile_cache.py::RANK_FINGERPRINT_ENV`` now folds these into
 #: the cross-rank fingerprint, so a non-uniform dial turns the cache off on
 #: every rank LOUDLY instead of silently diverging.  The two lists are kept
-#: in agreement by ``tests/cache_key_lint.py``'s ``env-dial`` rule, which is
+#: in agreement by ``tests/test_compile_stability_cpu.py``, which is
 #: why this tuple exists as data rather than being spelled inside
 #: :func:`ffi_dial_key`'s body: a lint that has to execute the function
 #: cannot run on a machine with no FFI library, which is exactly the machine
