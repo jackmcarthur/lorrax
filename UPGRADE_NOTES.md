@@ -5,6 +5,34 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — bispinor charge and current on one normalized four-component carrier
+
+`bispinor = true` now evaluates every vertex on the normalized lift
+$\Psi=[I;X](I+X^\dagger X)^{-1/2}\psi_L$, $X=(\alpha_{\rm FS}/2)\boldsymbol\sigma\cdot\mathbf p$
+(owner ruling; docs/theory/bispinor-gw.md §1, decisions.md). The direct
+field ($V_H[\rho]+\boldsymbol\alpha\cdot\mathbf A[J]$), the charge ζ,
+$\Pi_{00}$, $W_C$ and the CC Σ use it, and so do the current vertices
+(α·A, the current ζ, CT/TT). This replaces the 2026-10-04 large-block charge
+$(\psi_L,0)$. The lift is an isometry, so $\int\rho$ is the electron count.
+- Results move (sandbox claims 3251–3253, P4). CrI3 6×6 slab: the direct
+  field moves −0.3 to −5.3 meV per state group against the two-spinor V_H
+  (Cr 3s −5.3, VBM −2.3, CBM −2.5); the CC Σ gains +0.5 meV mean (≤ 2.1);
+  CT and TT move ≤ 0.001 meV. Γ-gap bispinor − charge: +0.26 meV
+  (bare_transverse; fix A +0.88) and +0.92 meV (full_shared_pole, head off;
+  fix A +1.55). Fe 4³, one map from the charge fixed point: the direct field
+  moves −4.5 meV mean near E_F; m_orb drops 8.1 % against fix A
+  (0.0330 → 0.0303 μB at 35 bands).
+- Files. Charge and current ζ fitted on another lift refit. A bispinor
+  restart bundle written before this change refuses with
+  `GATE restart_bispinor_charge_carrier`; set `restart = false` once. A
+  bispinor SC checkpoint (`sc_seed/sc_checkpoint.h5`) from before this
+  change does not continue: the trajectory restarts from the seed, with a
+  warning. A static-gauge Hall artifact from before this change refuses on
+  its lift stamp; rebuild it with `--static-gauge-hall-only`.
+  kin_ion.h5 and dipole.h5 are reused unchanged; the scalar Γ-head dipole
+  stays on the raw lift (bispinor-gw.md §1).
+- Decks: no change.
+
 ## 2026-10-05 — the ordered partner state keeps one carrier, so constructor rounds recompile less
 
 At an imaginary (or Re z = 0) support of an ordered shared-pole round, the
