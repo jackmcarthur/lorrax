@@ -40,14 +40,16 @@ def _json(value):
     return json.dumps(value, default=encode, sort_keys=True, allow_nan=False)
 
 
-def _authenticated_constructor_resume(root, identity, recipe, *, photon=False):
+def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, coulomb_sha256=None):
     """Authenticate a complete producer bank before preserving it.
 
     This is deliberately narrower than restart: it resumes only the missing
     constructor after the producer receipts and store validator bind the exact
     current map identity, resolved recipe, response convention and final commit.
-    Photon moments are in the bank receipt; scalar moments have a second receipt.
-    Any other partial directory follows the existing remove-and-rebuild path.
+    Photon moments are in the bank receipt; scalar moments have a second receipt,
+    and both bind the bare V digest ``coulomb_sha256`` (``_coulomb_resource``).
+    Any other partial directory follows the existing remove-and-rebuild path,
+    including a bank built against another V digest (another P, older code).
     """
     from file_io.shared_pole_store import validate_shared_pole_bank
 
@@ -71,7 +73,8 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False):
     elif (moments_receipt.get('identity') != identity
           or moments_receipt.get('completion') is not True
           or moments_receipt.get('bank_complete') is not True
-          or bank_receipt.get('coulomb_identity') != moments_receipt.get('coulomb_identity')):
+          or bank_receipt.get('coulomb_identity') != moments_receipt.get('coulomb_identity')
+          or (bank_receipt.get('coulomb_identity') or {}).get('sha256') != coulomb_sha256):
         return False
     try:
         header = validate_shared_pole_bank(
@@ -168,8 +171,9 @@ def _coulomb_resource(value, meta, sym, mesh_xy):
     response owner roots the parents straight from this operator
     (``response_bank._coulomb_roots``); no copy is staged on disk (54.6 GB and
     41 s at Ni 20^3 when it was).  The identity is a device digest of the
-    parents, the same on every rank and at every P, so a bank's receipts and a
-    constructor resume bind the operator's values.
+    packed parents, the same on every rank, so a bank's receipts and a
+    constructor resume bind the operator's values.  The packed layout follows
+    the mesh, so a bank built at another P does not match and is rebuilt.
     """
     from symmetry_maps import QirrOperator
     from .response_bank import _operator_token, operator_digest
@@ -500,6 +504,9 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                             tables=_shared_pole_tables(meta, sym, centroid_indices))
                 return result
         root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
+        # The bare V parents (a collective device digest, before the rank-0 resume
+        # decision): a complete bank resumes only when built against these values.
+        coulomb = None if photon else _coulomb_resource(V_q, meta, sym, mesh_xy)
         from common.collectives import rank0_transaction
         from file_io.commit_state import assert_committed
 
@@ -545,7 +552,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if complete:
                 print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
                 raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
-            if _authenticated_constructor_resume(root, identity, recipe, photon=photon):
+            if _authenticated_constructor_resume(root, identity, recipe, photon=photon,
+                                                 coulomb_sha256=None if photon else coulomb['sha256']):
                 print_fn(f"shared-pole output: authenticated complete bank retained at {root}; resuming constructor")
                 stale = [name for name in (_SECTOR_OUTPUTS if photon else ())
                          if (root / name).exists()]
@@ -581,17 +589,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             _mark_photon_head(handle, config)
             return dict(shared_pole=handle)
         tables = _shared_pole_tables(meta, sym, centroid_indices)
-    with timing.section("spole.coulomb_staging"):
-        if resume_constructor == "committed":
-            coulomb = None
-        else:
-            coulomb = None if photon else _coulomb_resource(V_q, meta, sym, mesh_xy)
-            if coulomb is not None and resume_constructor:
-                # The resumed bank was produced against these V values (its receipt's digest).
-                saved = json.loads((root / 'bank_receipt.json').read_text())['coulomb_identity']
-                if saved.get('sha256') != coulomb['sha256']:
-                    raise ValueError(f"GATE shared_pole_output: the bank at {root} was built "
-                                     "with another bare V; use a fresh run directory")
+    if resume_constructor == "committed":
+        coulomb = None
     with timing.section("spole.bank_setup"):
         resident, residence = (None, dict(residence="file", reason=(
             "committed model reused" if resume_constructor == "committed" else "authenticated resume")))
