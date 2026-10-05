@@ -152,14 +152,17 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   sketches taken before the library consumes A and B:
   ‖Wᴴ(AX − B)‖/(√k (‖A‖‖X‖ + ‖B‖)) within `roundoff_tol(n)`. Its operands are
   gone, so there is no retry.
-- A result that still fails prints `GATE distrib_la_result_check` (op, n, the
-  call site, the errors) on rank 0's stderr and comes back NaN-poisoned on
-  every rank, so a caller's finite-result gate refuses; an eager call raises
-  the GATE itself if any matrix of its stack failed. The verdict is one
-  mesh-reduced scalar, so every rank takes the same branch. (A raise inside
-  the host callback is not used: it is an unordered effect, which each rank
-  meets at a different point.) An eager checked call runs as one cached
-  program per signature, call site and budget.
+- A result that still fails comes back NaN-poisoned on every rank, so a
+  caller's finite-result gate refuses; an eager call and a `checked_program`
+  print `GATE distrib_la_result_check` (op, n, the call site, the errors) on
+  rank 0's stderr and raise it if any matrix of the call failed. The verdict
+  is one mesh-reduced scalar, so every rank takes the same branch. The
+  program returns every attempt's errors beside its flag and the host prints
+  the notices after the call: a checked program carries no host callback,
+  so JAX's persistent compile cache can store it (it never stores one with a
+  callback). A status traced outside a `checked_program` (a caller's own scan
+  or cond) leaves its NaN-poisoned result unnamed. An eager checked call runs
+  as one cached program per signature, call site and budget.
 
 Scope: the probes catch gross errors and missing, duplicated or
 non-orthogonal eigenpairs. They are a projection, so one eigenvalue wrong by
