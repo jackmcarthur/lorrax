@@ -73,7 +73,7 @@ not differenced: it is exact at each $k$ for the given states.
 **Bispinors.** With `bispinor = true`, `dipole.h5` is built on the raw
 kinetic-balance four-spinor $\Psi = (\Psi_L, (\alpha_\mathrm{fs}/2)\,\sigma\cdot p\,\Psi_L)$
 ($\alpha_\mathrm{fs}$ the fine-structure constant). The GW vertices use the
-normalized lift ([carrier](bispinor-gw.md#lift)); the dipole is the one
+normalized RKB lift ([carrier](bispinor-gw.md#lift)); the dipole is the one
 exception ([decisions](../architecture/decisions.md#four-component-carrier)).
 The kinetic velocity acts on all four components and $V_\mathrm{NL}$ on the
 two large ones (`common.mtxel_sweep.dipole_operator`).

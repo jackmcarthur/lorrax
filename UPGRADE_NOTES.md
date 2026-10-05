@@ -40,7 +40,7 @@ program. The shifted retry's Newton–Schulz step count is no longer printed.
 
 ## 2026-10-05 — bispinor charge and current on one normalized four-component carrier
 
-`bispinor = true` now evaluates every vertex on the normalized lift
+`bispinor = true` now evaluates every vertex on the normalized RKB lift
 $\Psi=[I;X](I+X^\dagger X)^{-1/2}\psi_L$, $X=(\alpha_{\rm FS}/2)\boldsymbol\sigma\cdot\mathbf p$
 (owner ruling; docs/theory/bispinor-gw.md §1, decisions.md). The direct
 field ($V_H[\rho]+\boldsymbol\alpha\cdot\mathbf A[J]$), the charge ζ,
