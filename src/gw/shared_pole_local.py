@@ -154,6 +154,30 @@ def _pad_columns(sharding, shape, width):
     return jax.jit(lambda a: jnp.pad(a, pad), out_shardings=sharding)
 
 
+def recipe_panel_widths(roles, states, recipe, *, column_extent, logical_n):
+    """Each state's panel carrier from the recipe alone, known before round 1.
+
+    An imaginary support (and its partner, on Q's carrier) carries the recipe's
+    imaginary width; a line support (and its conjugate) the line cap; a mirror
+    its original's. ``roles`` are one slot's role records (``_roles``), one per
+    state. A selection closed over a boundary multiplet can exceed its width;
+    such a panel keeps its own, wider carrier.
+    """
+    widths = []
+    for record, state in zip(roles, states):
+        kind = record["role"].split(":", 1)[0]
+        width = recipe["imaginary_width"] if kind == "imaginary" else (recipe.get("line_direction_cap") or logical_n)
+        widths.append(max(column_extent(min(int(logical_n), max(1, int(width)))), int(state[1].shape[-1])))
+    return widths
+
+
+def pad_states(states, widths, infinity, infinity_width):
+    """Zero-pad every state panel and the infinity block to their recipe carriers (inert columns)."""
+    pad = lambda a, w: a if a.shape[-1] == w else _pad_columns(a.sharding, a.shape, w)(a)
+    return ([(st[0], *(pad(a, w) for a in st[1:])) for st, w in zip(states, widths)],
+            tuple(pad(a, infinity_width) for a in infinity))
+
+
 def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, column_extent, ordered,
                  odd_moments):
     """Host column tables of one round: each slot's states packed into its pencil columns.
@@ -183,13 +207,13 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     carriers = np.asarray([[column_extent(int(c)) for c in row] for row in counts], np.int64)
     halves = (range(states // 2), range(states // 2, states)) if ordered else (range(states),)
     # The round extent is every state's full panel: the recipe's carriers
-    # (the imaginary width, the line cap, the partner on Q's carrier), known
-    # before the first round, so one round program serves every round and SC
-    # map. The padding is inert: zero columns that the zero-row-safe
-    # eigensolver keeps out of every spectrum. An extent sized to the
-    # selection grew with the parents seen (CrI3 24x24 map 0: CC side 6976
-    # -> 17472, TT 7424 -> 24832, eight recompiles) and reached this
-    # capacity anyway.
+    # (``recipe_panel_widths``: the imaginary width, the line cap, the partner
+    # on Q's carrier), known before the first round, so one round program
+    # serves every round and SC map. The padding is inert: zero columns that
+    # the zero-row-safe eigensolver keeps out of every spectrum. An extent
+    # sized to the selection grew with the parents seen (CrI3 24x24 map 0: CC
+    # side 6976 -> 17472, TT 7424 -> 24832, eight recompiles) and reached
+    # this capacity anyway.
     if np.any(carriers > np.asarray(widths, np.int64)[None, :]):
         raise ValueError("GATE shared_pole_round_tables: got: a state carrier wider than its "
                          "panel; want: column_extent(count) <= panel width; why: its columns "

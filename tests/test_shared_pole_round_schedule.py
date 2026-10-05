@@ -48,6 +48,23 @@ def test_ragged_tail_traces_once():
     assert len(traces) == 1
 
 
+def test_recipe_panel_widths_are_known_before_round_one():
+    """Panels of a selection narrower than its recipe width are padded to that width; a wider one keeps its own."""
+    from types import SimpleNamespace
+    from gw.shared_pole_local import recipe_panel_widths
+    recipe = {"imaginary_width": 100, "line_direction_cap": 25}
+    roles = [{"role": "imaginary:0"}, {"role": "imaginary:0", "conjugate": True},
+             {"role": "line:1"}, {"role": "line:1", "conjugate": True},
+             {"role": "imaginary:0", "mirror": True}, {"role": "line:1", "mirror": True}]
+    panel = lambda w: (0j, SimpleNamespace(shape=(4, 432, w)))
+    states = [panel(64), panel(64), panel(20), panel(20), panel(64), panel(112)]
+    widths = recipe_panel_widths(roles, states, recipe, column_extent=lambda w: -(-w // 8) * 8, logical_n=432)
+    assert widths == [104, 104, 32, 32, 104, 112]
+    # No line cap: the logical extent bounds the line panels.
+    widths = recipe_panel_widths(roles[2:3], states[2:3], {"imaginary_width": 100}, column_extent=int, logical_n=432)
+    assert widths == [432]
+
+
 def test_pencil_extent_fixed_before_round_one():
     """Selections growing parent by parent give one pencil side, the panels' capacity."""
     from runtime.padding import ladder_extent

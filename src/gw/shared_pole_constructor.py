@@ -110,7 +110,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         from gw.gw_config import linalg_resolution
         from common.staged_reshard import face_to_batch_reshard
         from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
-                                          own_extent_receipts, reduce_round, round_tables)
+                                          own_extent_receipts, reduce_round, round_tables,
+                                          recipe_panel_widths, pad_states)
+        from gw.shared_pole_capacity import round_padding_output_bytes
         from gw.shared_pole_recipe import (
             build_construction_row, charge4_gates, construction_receipt,
             shared_real_pole_gates_v1_r3b as gates,
@@ -279,19 +281,23 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]
             budget.retained_panels = tuple(factors)
             budget.batch_width = len(ids)
-            # Every state panel is on its recipe carrier and the pencil extent
-            # is their capacity (round_tables), so the side is the same in
-            # every round and SC map: one reduction program per route. The
+            # Every state panel is padded to its recipe carrier and the pencil
+            # extent is their capacity (round_tables), so the side is the same
+            # in every round and SC map: one reduction program per route. The
             # table is host metadata, known before any panel is allocated.
+            widths = recipe_panel_widths(round_roles[0], round_states, recipe,
+                                         column_extent=column_extent, logical_n=logical_n)
+            infinity_width = column_extent(min(logical_n, max(1, int(recipe["infinity_width"]))))
             tables = round_tables(
-                round_counts, [int(st[1].shape[-1]) for st in round_states],
-                [st[0] for st in round_states], infinity_counts, int(infinity[0].shape[-1]),
+                round_counts, widths, [st[0] for st in round_states], infinity_counts, infinity_width,
                 column_extent=column_extent, ordered=ordered, odd_moments=odd_moments)
             side = int(tables["active"].shape[-1])
             # Resolve before either reduction program is traced; the ledger
             # warns when the route price is over the budget.
             local_eigh = budget.eigenplan(side)
-            budget.plan(side, phase="reduction")
+            budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
+                round_states, infinity, widths, infinity_width))
+            round_states, infinity = pad_states(round_states, widths, infinity, infinity_width)
         with phase("gram_reduction"):
             if execution == 'face':
                 from gw.shared_pole_execution import face_reduce_round

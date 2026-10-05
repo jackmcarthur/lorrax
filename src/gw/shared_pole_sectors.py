@@ -646,10 +646,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     import jax
     import numpy as np
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_capacity import ConstructorCapacity
+    from gw.shared_pole_capacity import ConstructorCapacity,round_padding_output_bytes
     from gw.shared_pole_directions import (_round_kernels,line_panel_states,port_extent,
                                            select_round_states,infinity_directions)
-    from gw.shared_pole_local import round_tables,reduce_round
+    from gw.shared_pole_local import round_tables,reduce_round,recipe_panel_widths,pad_states
 
     from gw.shared_pole_execution import is_face, face_reduce_round, face_ritz_carrier
     execution='face' if is_face(samples['Wc']) else 'local'
@@ -708,14 +708,17 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     # so those and earlier-sector outputs are the only additional arrays.
     budget.retained_panels=(*retained,*samples.values(),*moments.values(),
                             *(panels for panels,_ in line.values()))
-    # Every state panel is on its recipe carrier and the pencil extent is
-    # their capacity (round_tables): one side, hence one program per sector,
-    # in every round and SC map.
-    tables=round_tables(counts,[int(s[1].shape[-1]) for s in states],[s[0] for s in states],
-        [v.shape[-1] for v in values],int(infinity[0].shape[-1]),column_extent=extent,
-        ordered=True,odd_moments=True)
+    # Every state panel is padded to its recipe carrier and the pencil extent
+    # is their capacity (round_tables): one side, hence one program per
+    # sector, in every round and SC map.
+    widths=recipe_panel_widths(roles[0],states,recipe,column_extent=extent,logical_n=n)
+    infinity_width=extent(min(n,max(1,int(recipe['infinity_width']))))
+    tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],
+        infinity_width,column_extent=extent,ordered=True,odd_moments=True)
     side=int(tables['active'].shape[-1])
-    budget.plan(side,phase='reduction')
+    budget.plan(side,phase='reduction',padding_output_bytes_per_rank=round_padding_output_bytes(
+        states,infinity,widths,infinity_width))
+    states,infinity=pad_states(states,widths,infinity,infinity_width)
     # The session keeps this sector's pencil side for the later maps' face
     # batch (sized_sector_sides); it is the same in every round and map.
     capacity=getattr(meta,'shared_pole_rank_capacity',None)
