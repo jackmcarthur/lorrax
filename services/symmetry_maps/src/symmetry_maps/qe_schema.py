@@ -87,6 +87,8 @@ class QESymmetryReceipt:
     sym_matrices: np.ndarray
     translations: np.ndarray
     antiunitary: np.ndarray
+    #: QE lspinorb (``band_structure/spinorbit``); None if the schema omits it.
+    spinorbit: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,8 @@ class QESymmetryBinding:
     equivalent_schema_paths: tuple[str, ...] = ()
     #: |m| (muB/cell) of the SCF that made the .save's density; None if unknown.
     scf_absolute_magnetization: float | None = None
+    #: QE lspinorb, which ``noncolin`` does not imply; None if not recorded.
+    spinorbit: bool | None = None
 
     @property
     def n_antiunitary(self) -> int:
@@ -154,6 +158,7 @@ def _read_qe_symmetry_receipt_cached(
     kpoints_cart_input: list[np.ndarray] = []
     kgrid: np.ndarray | None = None
     noncolin = False
+    spinorbit: bool | None = None
     do_magnetization: bool | None = None
     calculation = ""
     absolute_magnetization: float | None = None
@@ -182,6 +187,8 @@ def _read_qe_symmetry_receipt_cached(
             flags[tag] = _bool_text(elem.text)
         elif tag == "noncolin" and "band_structure" in ancestry:
             noncolin = _bool_text(elem.text)
+        elif tag == "spinorbit" and "band_structure" in ancestry:
+            spinorbit = _bool_text(elem.text)
         elif tag == "do_magnetization" and "magnetization" in ancestry:
             do_magnetization = _bool_text(elem.text)
         elif tag == "absolute" and "magnetization" in ancestry:
@@ -307,6 +314,7 @@ def _read_qe_symmetry_receipt_cached(
         sym_matrices=matrices,
         translations=tnp,
         antiunitary=typed,
+        spinorbit=spinorbit,
     )
 
 
@@ -388,6 +396,7 @@ def bind_qe_symmetry_receipt(wfn, receipt: QESymmetryReceipt) -> QESymmetryBindi
         antiunitary=typed,
         qe_permitted_pure_time_reversal=(
             not bool(receipt.noinv) and not magnetic_symmetry),
+        spinorbit=receipt.spinorbit,
     )
 
 
@@ -472,6 +481,7 @@ def _binding_signature(binding: QESymmetryBinding) -> tuple:
     return (
         tuple(bool(value) for value in binding.antiunitary),
         bool(binding.qe_permitted_pure_time_reversal),
+        binding.spinorbit,
     )
 
 
@@ -521,8 +531,8 @@ def resolve_qe_symmetry_binding(
         paths_text = ", ".join(binding.schema_path for binding in bindings)
         raise ValueError(
             "Multiple QE schemas authenticate the WFN but disagree on "
-            f"antiunitary operation typing: {paths_text}. Keep only the "
-            "WFN-generating NSCF *.save beside WFN.h5 (its directory and the "
+            f"antiunitary operation typing or spinorbit: {paths_text}. Keep "
+            "only the WFN-generating NSCF *.save beside WFN.h5 (its directory and the "
             "two above it).")
 
     def rank(binding: QESymmetryBinding) -> tuple[int, int, str]:

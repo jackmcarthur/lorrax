@@ -459,11 +459,9 @@ def main(argv=None):
         if pseudos:
             print0("Building unified V_NL setup...")
             # Which PROJECTORS get built — j-resolved (spin-orbit) or j-averaged
-            # (scalar-relativistic) — is resolved automatically inside
-            # ``build_vnl_setup``: QE's <spinorbit> when the structure came from
-            # a .save, nspinor=1 by force, and otherwise MEASURED against the
-            # wavefunctions (see psp.vnl_ops.measure_soc_mode).  The choice is
-            # upstream of the projector contraction and does not touch it.
+            # (scalar-relativistic) — is read from QE's <spinorbit> inside
+            # ``build_vnl_setup`` (psp.vnl_ops.resolve_soc_mode).  The choice
+            # is upstream of the projector contraction and does not touch it.
             vnl_progress = LoopProgress(
                 1, report.progress, title="nonlocal projector construction",
                 item_name="projector setup")

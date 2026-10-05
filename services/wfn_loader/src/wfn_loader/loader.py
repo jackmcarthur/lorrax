@@ -749,6 +749,12 @@ class WfnLoader:
             self._qe_symmetry_checked = True
         return self.qe_symmetry_binding
 
+    @property
+    def spinorbit(self) -> bool | None:
+        """QE ``<spinorbit>`` from the authenticated schema; None if none binds."""
+        binding = self.resolve_qe_symmetry()
+        return None if binding is None else binding.spinorbit
+
     #: Compat alias.  Internal call sites and the sibling wave-1 branches
     #: still spell ``_ensure_sym``; one line keeps them working.
     _ensure_sym = symmetry

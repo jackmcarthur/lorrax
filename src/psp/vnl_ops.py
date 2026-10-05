@@ -17,7 +17,6 @@ autodiff-safe behaviour at K=0.
 from __future__ import annotations
 
 import functools
-import time
 from dataclasses import dataclass
 import numpy as np
 import jax
@@ -136,17 +135,15 @@ class VNLSetup:
     E_super: jax.Array | None = None  # (nspinor, nspinor, total_R, total_R)
     l_max: int = 0
     # WHICH PROJECTORS THESE ARE.  True = j-resolved (spin-orbit in V_NL);
-    # False = j-averaged scalar-relativistic (QE average_pp).  Resolved
-    # AUTOMATICALLY (metadata via ``resolve_soc_mode``, else measured
-    # against the wavefunctions by ``measure_soc_mode``) and carried so a
-    # consumer can stamp it into an artifact's provenance instead of
-    # guessing from ``nspinor``.
+    # False = j-averaged scalar-relativistic (QE average_pp).  Read from
+    # QE <spinorbit> by ``resolve_soc_mode`` and carried so a consumer can
+    # stamp it into an artifact's provenance instead of guessing from
+    # ``nspinor``.
     soc: bool = True
     # HOW ``soc`` was decided, as one human-readable line for the
-    # producers' report blocks (e.g. "j-AVERAGED selected by measurement —
-    # multiplet consistency 1.5e-08 eV vs 4.8e-02 eV j-resolved").  The
-    # production stdout filter keeps only WARNING-class legacy prints, so
-    # this line is how an informational verdict reaches the report.
+    # producers' report blocks.  The production stdout filter keeps only
+    # WARNING-class legacy prints, so this line is how an informational
+    # verdict reaches the report.
     soc_provenance: str = ""
     # ── Pre-flattened per-row metadata for vectorized Z assembly ──
     # Each row r of Z(total_R, nG) is: c_il * G[beta_idx[r], q] * S[l[r], m[r], G] * phase[tau[r], G]
@@ -222,56 +219,24 @@ ICL_STRAIGHT_GAUGE_PATH = "icl_straight_segment_v1"
 
 RY_TO_EV = 13.605693122994
 
-#: Two bands are "the same el manifold" within this (Ry) — the same
-#: identity tolerance ``operator_checks.check_degeneracy_consistency``
-#: defaults to.  Exact degeneracies on these fixtures sit at ~1e-11 Ry.
-_MEASURE_EL_TOL_RY = 1e-9
-
-#: A candidate operator whose worst within-manifold spectrum spread stays
-#: below this is CONSISTENT with the wavefunctions.  Measured brackets on
-#: the Si 4x4x4 spinor fixture (lspinorb=false WFN + FR Si): the correct
-#: j-averaged operator sits at 1.1e-9 Ry, the wrong j-resolved one at
-#: 3.5e-3 Ry — this floor is ~3 decades above the first and ~3.5 below
-#: the second.
-_MEASURE_SPLIT_FLOOR_RY = 1e-6
-
-#: Probe size: bands x k-rows actually evaluated.  24 bands x 3 rows costs
-#: ~0.4 s on the Si fixture (one eager ψ read + three small Z builds) —
-#: measured 2026-08-28; the full k-set is never built twice.
-_MEASURE_NB = 24
-_MEASURE_NK = 3
-
-
 def resolve_soc_mode(pseudos, wfn=None, *, nspinor,
-                     caller: str = "", print_fn=print) -> bool | None:
-    """Decide j-RESOLVED vs j-AVERAGED projectors from METADATA, and SAY SO.
+                     caller: str = "", print_fn=print) -> bool:
+    """j-RESOLVED vs j-AVERAGED projectors, READ from QE and announced.
 
-    There is deliberately no caller/deck/CLI ``soc`` input: the resolution
-    is automatic, always, from evidence (owner ruling 2026-08-28).  The
-    full contract has five arms; this function owns the three that need no
-    wavefunction data and returns ``None`` for the one that does:
+    There is no caller/deck/CLI ``soc`` input: QE reports the choice and
+    LORRAX assumes nothing QE does not report (owner rule 2026-10-01).
 
     1. No pseudo resolves j = ℓ±1/2 (scalar-relativistic UPFs, or ℓ=0
-       only) → ``False``, quietly: there is no choice to make, both paths
-       build the same spin-scalar operator.
-    2. ``wfn.spinorbit`` — QE's ``<spinorbit>`` from
-       ``data-file-schema.xml``, present when the structure came from a QE
-       ``.save`` (see ``file_io.qe_save_reader``) → honored and announced.
-       That is DATA about the run, not a flag.  ``spinorbit=true`` with
-       nspinor=1 RAISES (below).
-    3. Undetermined + nspinor=1 → ``False``, FORCED and announced: a
-       j-resolved V_NL needs 2-component spinors, so there is only one
-       representable choice (= QE ``average_pp``).
-    4. Undetermined + nspinor=2 → ``None``: nothing in a BerkeleyGW
-       ``WFN.h5`` records lspinorb (``mf_header`` carries ``nspinor`` and
-       nothing else — noncollinear does NOT imply spin-orbit), so the
-       answer is MEASURED against the wavefunctions themselves by
-       :func:`measure_soc_mode`; ``build_vnl_setup`` runs that measurement
-       because it owns the projector tables the probe needs.
-    5. (In ``measure_soc_mode``.)  Both candidate operators are evaluated
-       on degenerate multiplets of the WFN; the one consistent with the
-       spectrum wins, the verdict is announced with both numbers, and an
-       unmeasurable or contradictory input REFUSES loudly.
+       only) → ``False``, quietly: both paths build the same operator.
+    2. ``wfn.spinorbit`` — QE's ``<spinorbit>`` (lspinorb) from the
+       ``data-file-schema.xml`` that authenticates the WFN
+       (``WfnLoader.spinorbit``) or from a ``.save`` structure
+       (``file_io.qe_save_reader``) → honored and announced.  It is not
+       implied by nspinor=2: ``lspinorb=.false.`` with ``noncolin`` runs
+       QE's average_pp.
+    3. Not recorded + nspinor=1 → ``False``, forced and announced: a
+       j-resolved V_NL needs 2-component spinors (= QE ``average_pp``).
+    4. Not recorded + nspinor=2 → ``ValueError`` naming the missing schema.
 
     RAISES ``ValueError`` for spinorbit=true with nspinor=1: a j-resolved
     V_NL has no representation on one-component wavefunctions, and
@@ -308,8 +273,14 @@ def resolve_soc_mode(pseudos, wfn=None, *, nspinor,
                      f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV of "
                      f"spin-orbit.")
             return False
-        # ── UNDETERMINED: measure, never assume.  (Arm 4 → arm 5.) ──
-        return None
+        why = getattr(wfn, "qe_symmetry_diagnostic", "no QE schema reader")
+        raise ValueError(
+            f"{tag}V_NL spin-orbit mode unknown: fully relativistic pseudos "
+            f"{sorted(j_pseudos)} (ΔD = {worst_ev:.4f} eV at stake) on an "
+            f"nspinor=2 WFN, and no QE <spinorbit> record — a WFN.h5 does not "
+            f"carry lspinorb ({why}).  want: the NSCF data-file-schema.xml "
+            f"(or its .save) beside WFN.h5, in its directory or the two "
+            f"above it.")
 
     declared = bool(declared)
     if declared:
@@ -339,241 +310,6 @@ def resolve_soc_mode(pseudos, wfn=None, *, nspinor,
     return False
 
 
-def _row_manifolds(e_row: np.ndarray, tol: float) -> list[tuple[int, int]]:
-    """Degenerate groups ``(i, j)`` inclusive in one ascending el row."""
-    out, i, nb = [], 0, e_row.shape[0]
-    while i < nb:
-        j = i
-        while j + 1 < nb and abs(e_row[j + 1] - e_row[i]) <= tol:
-            j += 1
-        if j > i:
-            out.append((i, j))
-        i = j + 1
-    return out
-
-
-def _spin_pairing_break_ry(en: np.ndarray, tol: float) -> float:
-    """How badly ``el`` breaks exact spin degeneracy, in Ry (0.0 = paired).
-
-    A j-averaged (lspinorb=.false., noncolin) Hamiltonian commutes with
-    every spin rotation, so EVERY eigenvalue has even multiplicity at
-    every k.  An odd-sized degenerate group anywhere is therefore proof
-    the run was NOT average_pp — the positive lspinorb signature the
-    multiplet-consistency probe alone cannot give (both candidate
-    operators are (P)T-even, hence exactly scalar on protected Kramers
-    doublets).  The returned magnitude is the gap to the nearest level
-    that would have completed the odd group — i.e. the spin splitting
-    itself.  Groups touching the TOP probed band are skipped: their
-    partner may simply be truncated off the window.
-    """
-    worst = 0.0
-    nb = en.shape[1]
-    for row in en:
-        i = 0
-        while i < nb:
-            j = i
-            while j + 1 < nb and abs(row[j + 1] - row[i]) <= tol:
-                j += 1
-            if (j - i + 1) % 2 == 1 and j < nb - 1:
-                below = row[i] - row[i - 1] if i > 0 else np.inf
-                worst = max(worst, float(min(below, row[j + 1] - row[j])))
-            i = j + 1
-    return worst
-
-
-def measure_soc_mode(wfn, setup: VNLSetup, E_super_avg, E_super_res, *,
-                     delta_d_ry: float, caller: str = "",
-                     print_fn=print) -> tuple[bool, str]:
-    """Arm 5 of the automatic resolution: MEASURE which V_NL the WFN wants.
-
-    The Z projector tables are soc-independent — only the small E blocks
-    differ between the j-resolved and j-averaged candidates — so both
-    operators are evaluated on a handful of DEGENERATE multiplets of the
-    wavefunctions (≤ :data:`_MEASURE_NK` k-rows × :data:`_MEASURE_NB`
-    bands; the full k-set is never built twice).  The correct operator
-    leaves each degenerate subspace invariant; the wrong one splits it at
-    the SOC scale.  Calibration on the Si 4x4x4 spinor fixture
-    (lspinorb=false WFN + FR Si, 2026-08-28): the j-resolved candidate
-    splits the probed multiplets by 4.8e-2 eV while the j-averaged one
-    sits at 1.5e-8 eV — seven decades of discrimination.  The consistency
-    numbers come from ``operator_checks.check_degeneracy_consistency``,
-    the same gauge-invariant block-spectrum detector the kin_ion producer
-    already runs post hoc.
-
-    Decision rule, in order:
-
-    * one candidate consistent (≤ :data:`_MEASURE_SPLIT_FLOOR_RY`), the
-      other split above it → the consistent one, announced with both
-      numbers;
-    * both split → RuntimeError: the wavefunctions disagree with this
-      pseudopotential under BOTH hypotheses (wrong WFN/UPF pairing);
-    * both consistent and ΔD ≤ floor → the operators are numerically the
-      same object; j-resolved, announced with the bound;
-    * both consistent, ΔD material: ``el`` breaking exact spin pairing
-      anywhere (see :func:`_spin_pairing_break_ry`) is proof of
-      lspinorb=.true. → j-resolved; failing that, a ≥3-fold multiplet
-      that FEELS the operator difference (identity shift > floor) yet is
-      split by neither is the double-group signature → j-resolved;
-      otherwise nothing probed discriminates → RuntimeError naming
-      exactly what was measured.
-
-    Returns ``(soc, provenance_line)``.  The caller routes
-    ``provenance_line`` into the production report (the stdout filter
-    would drop a non-WARNING legacy print).
-    """
-    tag = f"[{caller}] " if caller else ""
-    from psp.dft_operators import _as_loader
-    from psp.operator_checks import check_degeneracy_consistency
-    try:
-        loader = _as_loader(wfn)
-    except Exception as exc:                              # noqa: BLE001
-        raise RuntimeError(
-            f"{tag}V_NL spin-orbit mode is undetermined (FR pseudopotential, "
-            f"nspinor=2, no QE <spinorbit> record) and cannot be measured: "
-            f"no WFN reader behind {type(wfn).__name__!r} ({exc}).  "
-            f"want: a loadable WFN.h5, or a QE .save whose <spinorbit> is "
-            f"authoritative.") from exc
-
-    t0 = time.perf_counter()
-    from wfn_loader import IBZRows
-
-    en = np.asarray(loader.energies, dtype=np.float64)
-    en = en[0] if en.ndim == 3 else en                     # (nk, nb) Ry
-    nb_probe = min(en.shape[1], _MEASURE_NB)
-    en = en[:, :nb_probe]
-    kpts = np.asarray(loader.kpoints, dtype=np.float64)
-    tol = _MEASURE_EL_TOL_RY
-    floor = _MEASURE_SPLIT_FLOOR_RY
-    ev = RY_TO_EV
-
-    pair_break = _spin_pairing_break_ry(en, floor)
-
-    # Rank the WFN's own rows: biggest multiplet first (a Γ 6-fold decides
-    # in one block), then non-TRIM (at k ≢ −k a same-k doublet is NOT the
-    # T-protected Kramers pair, so the j-resolved candidate can split it —
-    # the MoS2 average_pp discriminator), then multiplet count.
-    scored = []
-    for r in range(en.shape[0]):
-        mf = _row_manifolds(en[r], tol)
-        big = max((b - a + 1 for a, b in mf), default=0)
-        trim = bool(np.allclose(2 * kpts[r] - np.round(2 * kpts[r]), 0.0,
-                                atol=1e-8))
-        scored.append((big, not trim, len(mf), r))
-    scored.sort(reverse=True)
-    rows = [s[3] for s in scored[:_MEASURE_NK] if s[0] >= 2]
-
-    def _verdict(soc: bool, why: str) -> tuple[bool, str]:
-        line = (f"{'j-RESOLVED' if soc else 'j-AVERAGED'} selected by "
-                f"measurement — {why}")
-        print_fn(f"{tag}V_NL: {line}")
-        return soc, line
-
-    if not rows:
-        if delta_d_ry <= floor:
-            return _verdict(True, f"no degenerate multiplets to test, but "
-                            f"ΔD = {delta_d_ry * ev:.1e} eV ≤ floor: the two "
-                            f"operators are equivalent below that bound")
-        if pair_break > floor:
-            return _verdict(True, f"el breaks exact spin degeneracy by up to "
-                            f"{pair_break * ev:.3e} eV (lspinorb signature; "
-                            f"average_pp eigenvalues all have even "
-                            f"multiplicity); no multiplets to block-test")
-        raise RuntimeError(
-            f"{tag}V_NL spin-orbit mode UNMEASURABLE: FR pseudopotential "
-            f"(ΔD = {delta_d_ry * ev:.4f} eV at stake), nspinor=2, no QE "
-            f"<spinorbit> record, and the WFN offers no evidence — all "
-            f"{en.shape[0]} k-rows × {nb_probe} bands scanned: zero "
-            f"degenerate multiplets at {tol:.0e} Ry and exact spin pairing "
-            f"everywhere.  want: the QE .save (its <spinorbit> is "
-            f"authoritative), or a WFN sampling a k with degenerate bands.")
-
-    # ── evaluate BOTH candidates on the probe rows (Z shared, E swapped) ──
-    kspec = IBZRows(tuple(int(r) for r in rows))
-    psi = np.asarray(loader.load_process_local(bands=(0, nb_probe), k=kspec))
-    gvecs = np.asarray(loader.gvecs(k=kspec))
-    H = {False: [], True: []}
-    for i, r in enumerate(rows):
-        # ψ pad-G coefficients are zero by the loader contract, and every
-        # contraction below passes through ψ, so the pad columns of Z
-        # (finite by design — see _build_vnl_kdata_core) are inert.
-        kdata = build_vnl_kdata_from_kvec(kpts[r], gvecs[i], setup)
-        P = jnp.einsum('RG,nsG->Rsn', jnp.conj(kdata.Z),
-                       jnp.asarray(psi[i]), optimize=True)
-        for soc, E in ((False, E_super_avg), (True, E_super_res)):
-            D = jnp.einsum('stRQ,Qtn->Rsn', E, P, optimize=True)
-            H[soc].append(np.asarray(
-                jnp.einsum('Rsm,Rsn->mn', jnp.conj(P), D, optimize=True)))
-
-    silent = lambda *a, **k: None                          # noqa: E731
-    res = {soc: check_degeneracy_consistency(
-        np.stack(H[soc]), en[rows], el_tol_ry=tol, split_tol_ry=floor,
-        label=f"V_NL probe soc={soc}", print_fn=silent) for soc in (False, True)}
-    s_avg = float(res[False]["max_split_ry"])
-    s_res = float(res[True]["max_split_ry"])
-    n_m = int(res[False]["n_manifolds"])
-    cost = time.perf_counter() - t0
-    both = (f"multiplet consistency {s_avg * ev:.1e} eV j-averaged vs "
-            f"{s_res * ev:.1e} eV j-resolved ({len(rows)} k, {n_m} "
-            f"multiplets, {cost:.1f} s)")
-
-    if s_avg > floor and s_res > floor:
-        raise RuntimeError(
-            f"{tag}V_NL REFUSED: BOTH candidate operators split el "
-            f"multiplets the wavefunctions hold degenerate — {both}.  "
-            f"Neither lspinorb hypothesis fits: the WFN and these "
-            f"pseudopotentials do not belong together (wrong UPF set, or a "
-            f"broken WFN).")
-    if s_avg <= floor < s_res:
-        if pair_break > floor:
-            raise RuntimeError(
-                f"{tag}V_NL REFUSED: contradictory evidence — el breaks "
-                f"spin degeneracy by {pair_break * ev:.3e} eV (lspinorb "
-                f"signature) yet the j-resolved candidate splits el "
-                f"multiplets ({both}).  Check the WFN/pseudopotential "
-                f"pairing.")
-        return _verdict(False, both)
-    if s_res <= floor < s_avg:
-        return _verdict(True, both)
-
-    # ── both candidates consistent ──
-    if delta_d_ry <= floor:
-        return _verdict(True, f"operators equivalent below "
-                        f"ΔD = {delta_d_ry * ev:.1e} eV; {both}")
-    if pair_break > floor:
-        return _verdict(True, f"el breaks exact spin degeneracy by up to "
-                        f"{pair_break * ev:.3e} eV (lspinorb signature); "
-                        f"{both}")
-    # Everything spin-paired and both candidates scalar on every probed
-    # multiplet.  A ≥3-fold multiplet whose restricted operator DIFFERENCE
-    # is a material identity shift (both blocks ~λ·1 with λ_res ≠ λ_avg)
-    # can only be a double-group irrep — an average_pp multiplet of size
-    # ≥3 with ℓ>0 character MUST be split by the j-resolved candidate.
-    shift = 0.0
-    for i, r in enumerate(rows):
-        dM = H[True][i] - H[False][i]
-        for a, b in _row_manifolds(en[r], tol):
-            if b - a + 1 < 3:
-                continue
-            blk = dM[a:b + 1, a:b + 1]
-            w = np.linalg.eigvalsh((blk + blk.conj().T) / 2.0).real
-            shift = max(shift, float(np.max(np.abs(w))))
-    if shift > floor:
-        return _verdict(True, f"spectrum already resolves j: a ≥3-fold el "
-                        f"multiplet feels the operator difference "
-                        f"({shift * ev:.1e} eV identity shift) yet neither "
-                        f"candidate splits it — double-group signature; "
-                        f"{both}")
-    raise RuntimeError(
-        f"{tag}V_NL spin-orbit mode UNMEASURABLE: the candidates differ "
-        f"materially (ΔD = {delta_d_ry * ev:.4f} eV) but nothing probed "
-        f"discriminates — {both}; exact spin pairing everywhere and every "
-        f"probed multiplet is insensitive to the difference (worst "
-        f"restricted shift {shift * ev:.1e} eV ≤ {floor * ev:.1e} eV).  "
-        f"want: the QE .save (its <spinorbit> is authoritative), or a WFN "
-        f"sampling a high-symmetry k whose multiplets the candidates "
-        f"treat differently.")
-
-
 def build_vnl_setup(
     wfn, sym=None, meta=None, pseudos=None,
     n_q: int | None = None,
@@ -601,16 +337,10 @@ def build_vnl_setup(
         per-run table build.  Pass an explicit n_q to override.
     q_max : float, optional — if provided, skip the k-point scan for q_max.
 
-    j-RESOLVED vs j-AVERAGED projectors are resolved AUTOMATICALLY —
-    there is deliberately no ``soc`` input anywhere: metadata first
-    (:func:`resolve_soc_mode`: scalar pseudos are quiet, QE
-    ``<spinorbit>`` is authoritative, nspinor=1 forces j-averaged), and
-    the previously-ambiguous FR + nspinor=2 + BGW-WFN case is MEASURED
-    against the wavefunctions (:func:`measure_soc_mode`) using the same
-    Z tables built here — the E blocks are the only soc-dependent piece,
-    so the measurement costs a few small multiplet blocks, never a
-    second k-set.  The verdict lands in :attr:`VNLSetup.soc` and, as one
-    human-readable line, :attr:`VNLSetup.soc_provenance`.
+    j-RESOLVED vs j-AVERAGED projectors are read from QE's
+    ``<spinorbit>`` (:func:`resolve_soc_mode`); there is no ``soc`` input.
+    The verdict lands in :attr:`VNLSetup.soc` and, as one human-readable
+    line, :attr:`VNLSetup.soc_provenance`.
 
     compute_contact : bool
         Opt in to the extra analytic ``G''`` radial table needed by the
@@ -671,40 +401,13 @@ def build_vnl_setup(
     dq = tables["dq"]
 
     # ── E blocks: the ONLY soc-dependent piece of the whole setup ──
-    # (Z tables, channel layout and row metadata are identical for both
-    # arms, which is what makes the measured resolution below cheap.)
-    # ``soc_resolved is None`` = arm 4 of resolve_soc_mode: build BOTH
-    # arms and let the wavefunctions choose.  A non-j-averageable FR
-    # pseudopotential (opposite-sign D_jj, QE's average_pp would NaN)
-    # removes the averaged candidate: an lspinorb=.false. run cannot
-    # exist with that file, so j-resolved is the only operator — forced,
-    # announced.  In the DECIDED-False arms the same ValueError
-    # propagates: there the averaged operator was promised (QE
-    # <spinorbit>=false, or nspinor=1) and cannot be built.
-    measure = soc_resolved is None
+    # A non-j-averageable FR pseudopotential (opposite-sign D_jj, QE's
+    # average_pp would NaN) raises ValueError here when QE <spinorbit>=false
+    # or nspinor=1 promised the averaged operator.
     live = [sp.element for isp, sp in enumerate(species_list)
             if int(species_natoms[isp]) > 0]
-
-    def _species_blocks(arm: bool) -> dict:
-        return {el: build_E_blocks_full(pseudos[el], soc=arm) for el in live}
-
-    blocks_by_arm: dict[bool, dict] = {}
-    forced_line = None
-    if measure:
-        blocks_by_arm[True] = _species_blocks(True)
-        try:
-            blocks_by_arm[False] = _species_blocks(False)
-        except ValueError as exc:
-            soc_resolved, measure = True, False
-            forced_line = (f"j-RESOLVED forced — FR pseudopotential not "
-                           f"j-averageable ({exc})")
-            print_fn(f"[build_vnl_setup] V_NL: {forced_line}")
-    else:
-        blocks_by_arm[bool(soc_resolved)] = _species_blocks(bool(soc_resolved))
-
-    # Channels carry the arm-0 blocks; the measured path swaps them for
-    # the selected arm below.
-    arm0 = True if measure else bool(soc_resolved)
+    E_by_el = {el: build_E_blocks_full(pseudos[el], soc=soc_resolved)
+               for el in live}
 
     # Build channels and G_l/G'_l tables from species projectors
     channels: list[ChannelMeta] = []
@@ -720,7 +423,7 @@ def build_vnl_setup(
             continue
         tau = species_tau[isp, :natoms]
 
-        E_blocks = blocks_by_arm[arm0][sp.element]
+        E_blocks = E_by_el[sp.element]
 
         # Group projectors by l
         per_l: dict[int, list[int]] = {}
@@ -818,17 +521,14 @@ def build_vnl_setup(
     row_tau_j = jnp.asarray(row_tau_np, dtype=jnp.float64)
 
     # ── Pre-build E_super (k-independent block-diagonal D-matrix) ──
-    def _assemble_E_super(blocks_by_el: dict) -> jax.Array:
-        E_super = np.zeros((nspinor, nspinor, total_R, total_R),
-                           dtype=np.complex128)
-        offset = 0
-        for ch, el in zip(channels, channel_elements):
-            E_np = np.asarray(blocks_by_el[el][ch.l])[:nspinor, :nspinor]
-            R = ch.R
-            for _a in range(ch.natoms):
-                E_super[:, :, offset:offset + R, offset:offset + R] = E_np
-                offset += R
-        return jnp.asarray(E_super, dtype=jnp.complex128)
+    E_super = np.zeros((nspinor, nspinor, total_R, total_R),
+                       dtype=np.complex128)
+    offset = 0
+    for ch, el in zip(channels, channel_elements):
+        E_np = np.asarray(E_by_el[el][ch.l])[:nspinor, :nspinor]
+        for _a in range(ch.natoms):
+            E_super[:, :, offset:offset + ch.R, offset:offset + ch.R] = E_np
+            offset += ch.R
 
     uniform_gauge_fingerprint = ""
     setup = VNLSetup(
@@ -838,8 +538,8 @@ def build_vnl_setup(
         prefactor=prefactor,
         B=B, cell_volume=cell_volume,
         total_R=total_R, nspinor=nspinor,
-        E_super=_assemble_E_super(blocks_by_arm[arm0]), l_max=l_max,
-        soc=bool(arm0),
+        E_super=jnp.asarray(E_super, dtype=jnp.complex128), l_max=l_max,
+        soc=bool(soc_resolved),
         row_beta_idx=row_beta_idx_j,
         row_l=row_l_j, row_m=row_m_j, row_tau=row_tau_j,
         coupled_row_blocks=tuple(coupled_row_blocks),
@@ -848,23 +548,7 @@ def build_vnl_setup(
     )
 
     # ── say HOW the mode was decided (one line, report-block ready) ──
-    j_present = [el for el in live if pseudo_has_j_channels(pseudos[el])]
-    if measure:
-        # Arm 5: both candidates exist and nothing declared — measure.
-        delta_d = max((pseudo_soc_strength_ry(pseudos[el])
-                       for el in j_present), default=0.0)
-        E_avg_super = _assemble_E_super(blocks_by_arm[False])
-        soc_resolved, provenance = measure_soc_mode(
-            wfn, setup, E_avg_super, setup.E_super, delta_d_ry=delta_d,
-            caller="build_vnl_setup", print_fn=print_fn)
-        if not soc_resolved:
-            setup.E_super = E_avg_super
-            for ch, el in zip(channels, channel_elements):
-                ch.E = np.asarray(blocks_by_arm[False][el][ch.l])
-        setup.soc = bool(soc_resolved)
-    elif forced_line is not None:
-        provenance = forced_line
-    elif not j_present:
+    if not any(pseudo_has_j_channels(pseudos[el]) for el in live):
         provenance = ("spin-scalar (scalar-relativistic pseudopotentials — "
                       "no j channels to resolve)")
     elif getattr(wfn, "spinorbit", None) is not None:
@@ -873,10 +557,6 @@ def build_vnl_setup(
     else:
         provenance = "j-AVERAGED, forced by nspinor=1 (QE average_pp)"
     setup.soc_provenance = provenance
-    # Computed AFTER the soc measurement above, so the identity hashes
-    # the operator ACTUALLY SHIPPED (a measured j-AVERAGED demotion
-    # replaces setup.E_super and setup.soc; hashing the candidate would
-    # authenticate an operator no consumer ever sees).
     if compute_contact:
         # Authenticate the exact host values before device transfer.  This is
         # the single PP/SOC/radial identity consumed by the uniform current,

@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — the V_NL spin-orbit mode is read from QE's `<spinorbit>`
+
+`kin_ion_io`, the dipole driver and every other V_NL user read j-resolved
+versus j-averaged projectors from `<spinorbit>` in the QE
+`data-file-schema.xml` that authenticates the WFN (`WfnLoader.spinorbit`).
+The measurement against degenerate multiplets is gone. It refused every
+centrosymmetric crystal with time reversal whose double group has no irrep
+larger than two (D3d: Bi, 2H-PbI2); those now run. Fully relativistic
+pseudopotentials on an nspinor = 2 WFN with no authenticating schema now
+refuse by name: put the NSCF `data-file-schema.xml` (or its `.save`) beside
+`WFN.h5`, in its directory or the two above it. Results that ran before do
+not move. No deck change.
+
 ## 2026-10-05 — the compile cache is JAX's own, plus the namespace, the compile agreement and the receipt
 
 `common/jax_compile_cache.py` no longer freezes an all-rank agreed entry

@@ -787,9 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
 		     "needs this flag — see gw.kin_ion_io, which has had it all along.",
 	)
 	# There is deliberately NO --soc flag: j-resolved vs j-averaged V_NL is
-	# resolved automatically inside build_vnl_setup — QE's <spinorbit> when
-	# available, nspinor=1 by force, and the FR + nspinor=2 + BGW-WFN case
-	# by MEASUREMENT against the wavefunctions (psp.vnl_ops.measure_soc_mode).
+	# read from QE's <spinorbit> inside build_vnl_setup (resolve_soc_mode).
 	parser.add_argument(
 		"--vnl-velocity-sign",
 		type=float,

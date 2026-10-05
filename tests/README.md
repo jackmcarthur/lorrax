@@ -30,6 +30,8 @@ A new test needs no bootstrap import of its own.
   under x64 (CPU): two windows add the bytes of one.
 - `test_sigma_kconv_scratch.py`: mode 7's split-arm scratch follows the
   handler's rule and is priced in the Σ pass and the τ window checks (CPU).
+- `test_qe_reported_inputs.py`: the V_NL spin-orbit mode is QE's
+  `<spinorbit>` or a named refusal (CPU).
 - `test_head_resolver_hubbard.py`: the one-shot static head carries the
   deck's DFT+U input and refuses a dipole without i[r, V_U] (CPU).
 - `test_lockstep_guards.py`: run-condition guards on toy inputs (CPU):
