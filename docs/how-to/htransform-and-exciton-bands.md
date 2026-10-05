@@ -247,9 +247,14 @@ shape (path point, operator, band, band)), `operator_names`, `kpath_frac`,
 $\mu_B$ per cell along $\hat n$ on the coarse grid. The orbital moment is
 `orbital_response.orbital_magnetization` at each parent k, star-weighted and
 averaged over the group's axial time-odd action: $T = 0$ at midgap without
-`occ_smearing_width_ry`, else the fixed-N Fermi–Dirac $\mu$. It is printed
-at the stored band ceiling and as the intercept $m_\infty$ of $m(c) =
-m_\infty + a/(E_c - \mu)$ over ceilings from 0.6 to 1 of the stored bands.
+`occ_smearing_width_ry`, else the fixed-N Fermi–Dirac $\mu$. Without a
+width, the rounded electron count must sit below a gap on the coarse grid;
+overlapping bands or a fractional count refuse
+(`GATE orbital_totals_t0_gap`; `bandstructure.orbital.orbital_totals`). It
+is printed at the stored band ceiling and as the intercept $m_\infty$ of
+$m(c) = m_\infty + a/(E_c - \mu)$ over ceilings from 0.6 to 1 of the stored
+bands, each above every band within 10 kT of $\mu$; with no such band left,
+`GATE orbital_totals_empty_band` asks for more `ncond`.
 The spin moment $-\tfrac{g_e}{2}\mu_B\sum_\mathrm{occ}\langle\boldsymbol
 \sigma\rangle$ ($g_e = 2.00232$) and the two sums follow on their own lines.
 
@@ -258,8 +263,10 @@ that uniform grid, finds $E_F$ there by Fermi–Dirac occupation of the
 window's electrons at `occ_smearing_width_ry` ($10^{-4}$ Ry when unset), and
 writes $\sum_{q,n} f_{qn}\langle qn|\boldsymbol\sigma|qn\rangle/N_q$ to
 `moments.txt`, with its projection on $\hat n$, the grid $E_F$ and the
-occupation of the top returned band (a warning to raise `ncond` above
-$10^{-6}$). The same sum taken directly on the coarse grid goes to
+occupation of the top returned band. Above $10^{-6}$ that occupation biases
+the fixed-N sums and refuses (`GATE htransform_moments_window`; raise
+`ncond`). With no width, the coarse and grid $E_F$ use the rounded electron
+count (`bandstructure.htransform`). The same sum taken directly on the coarse grid goes to
 `htransform.out`. Signs follow QE ($n_\uparrow - n_\downarrow$). The grid
 runs one $q_z$ plane per pass, so one dense $(N_k, N_B, N_B)$ operator image
 is resident at a time.
@@ -398,6 +405,8 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | standalone window cuts the occupied bands | `nval` ≠ occupied bands | set `nval` to the occupied count |
 | QP block not inside the fitted window | `--qp-rotations` block extends past $[b_0, b_1)$ | widen `ncond` |
 | conflicting QP sources | `WFN_qp.h5` with `--eqp-file` or `--qp-rotations` | give one |
+| `orbital_totals_t0_gap` | `--velocity` totals at $T = 0$ with overlapping bands or a fractional count | set `occ_smearing_width_ry` |
+| `orbital_totals_empty_band`, `htransform_moments_window` | no returned band lies wholly above $\mu$ + 10 kT; the top returned band holds more than $10^{-6}$ occupation | raise `ncond` |
 | exciton bands: no `K_POINTS {crystal_b}` block; `interp` on a bulk deck or on IBZ-only ζ; `ongrid` at an off-grid $Q$; failed `bse`-window certificate | §7 gives each condition | add the path block; use `refit` on a bulk deck, or a full-BZ `zeta_q.h5` for `interp`; use `interp` or `refit` off the grid; widen the refit's guard bands or use `--refit-window zeta` |
 
 The method interpolates within the fitted window only; a band that leaves the

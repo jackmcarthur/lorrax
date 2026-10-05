@@ -585,9 +585,15 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
   they leave the promise; a reserved store's bytes have already left the free
   space and are not promised). A bank that does not fit is refused on every
   rank before any compute (`GATE streamed_bank_capacity`, `fits = False`);
-  the caller then takes a smaller bank. A W-bank field created after the
-  bank's initialization (line panels, contact fields) that the disk refuses
-  is held in host memory with a warning. A verdict costs 45–64 ms at P4 (claim
+  the caller falls back. The χ bank streams in halved disk groups, then in
+  device groups ([memory model](memory-model.md#streamed-chi-bank)); the
+  moments are computed per q batch without the stream (`response_bank`); the
+  W bank takes the shared scratch file `bank.h5`
+  (`gw.shared_pole_screening`). A W-bank
+  field created after the bank's initialization (line panels, contact fields)
+  that the disk refuses is held in host memory instead, agreed on every rank,
+  with one `RuntimeWarning` per bank in the report's WARNINGS block
+  (`shared_pole_store.ResidentBankPayload`). A verdict costs 45–64 ms at P4 (claim
   3111).
 - **Lifetime.** A store file is unlinked as soon as it is opened. Its bytes
   live as long as the process's descriptor, so a refusal, a kill or a SIGKILL

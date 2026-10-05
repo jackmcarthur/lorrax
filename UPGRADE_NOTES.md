@@ -45,16 +45,22 @@ $\Psi=[I;X](I+X^\dagger X)^{-1/2}\psi_L$, $X=(\alpha_{\rm FS}/2)\boldsymbol\sigm
 (owner ruling; docs/theory/bispinor-gw.md §1, decisions.md). The direct
 field ($V_H[\rho]+\boldsymbol\alpha\cdot\mathbf A[J]$), the charge ζ,
 $\Pi_{00}$, $W_C$ and the CC Σ use it, and so do the current vertices
-(α·A, the current ζ, CT/TT). This replaces the 2026-10-04 large-block charge
-$(\psi_L,0)$. The lift is an isometry, so $\int\rho$ is the electron count.
-- Results move (sandbox claims 3251–3253, P4). CrI3 6×6 slab: the direct
-  field moves −0.3 to −5.3 meV per state group against the two-spinor V_H
-  (Cr 3s −5.3, VBM −2.3, CBM −2.5); the CC Σ gains +0.5 meV mean (≤ 2.1);
-  CT and TT move ≤ 0.001 meV. Γ-gap bispinor − charge: +0.26 meV
-  (bare_transverse; fix A +0.88) and +0.92 meV (full_shared_pole, head off;
-  fix A +1.55). Fe 4³, one map from the charge fixed point: the direct field
-  moves −4.5 meV mean near E_F; m_orb drops 8.1 % against fix A
-  (0.0330 → 0.0303 μB at 35 bands).
+(α·A, the current ζ, CT/TT). The lift is an isometry, so $\int\rho$ is the
+electron count. Before, every vertex took the raw lift $[\psi_L;X\psi_L]$,
+whose norm exceeds one by $(\alpha^2/4)\langle p^2\rangle$; its excess
+small-component charge added to the direct field a V_H-gauge term that grows
+with the vacuum. A large-block charge $(\psi_L,0)$ was on main for one day
+(2026-10-04) and is gone.
+- Results move against the raw lift (sandbox claims 3228, 3238, 3251–3253,
+  P4). CrI3 6×6 slab one-shot: the direct field drops by 110–320 meV per
+  state. It now differs from the two-spinor V_H by −0.2 to −7.9 meV per state
+  (group means Cr 3s −5.3, VBM −2.3, CBM −2.5). The CC Σ differs from the
+  charge Σ by +0.55 meV mean (≤ 2.1). The Γ gap, bispinor − charge, is
+  +0.26 meV (bare_transverse) and +0.92 meV (full_shared_pole, head off),
+  against +22.1 and +23.0 meV on the raw lift. Fe 4³, one map from the
+  charge fixed point: the direct field within 2 eV of E_F drops by about
+  32 meV mean; m_orb (0.0303 μB at 35 bands) is within 0.2 % of the raw-lift
+  value.
 - Files. Charge and current ζ fitted on another lift refit. A bispinor
   restart bundle written before this change refuses with
   `GATE restart_bispinor_charge_carrier`; set `restart = false` once. A
@@ -63,7 +69,7 @@ $(\psi_L,0)$. The lift is an isometry, so $\int\rho$ is the electron count.
   warning. A static-gauge Hall artifact from before this change refuses on
   its lift stamp; rebuild it with `--static-gauge-hall-only`.
   kin_ion.h5 and dipole.h5 are reused unchanged; the scalar Γ-head dipole
-  stays on the raw lift (bispinor-gw.md §1).
+  stays on the raw lift (decisions.md, "Not yet conforming").
 - Decks: no change.
 
 ## 2026-10-05 — the ordered partner state keeps one carrier, so constructor rounds recompile less
@@ -126,11 +132,13 @@ Robustness-review fixes (reports A1–A3, #7, #9, #12, #14, #15):
   a dipole.h5 with `python -m psp.get_dipole_mtxels -i <deck>`.
 - 2c TRS: a `WFN_qp.h5` also finds the QE schema from its source WFN
   (`qp_wfn_source`), so it gets its source's verdict; a nonmagnetic SOC
-  `WFN_qp.h5` read by BSE, htransform or a restart had taken TRS off. The
-  wavefunction guard refuses (`GATE trs_qe_nonmagnetic_wfn_consistent`) only
-  at a QE moment of exactly 0; at 0 < m < 1e-4 μB/cell, or on a spatial-pair
-  failure, TRS goes off with a warning. The SCF moment is read from the
-  selected schema only, and not at all when a t_rev row decides.
+  `WFN_qp.h5` read by BSE, htransform or a restart had taken TRS off.
+- 2c TRS: this narrows the 2026-10-04 guard. The wavefunction guard refuses
+  (`GATE trs_qe_nonmagnetic_wfn_consistent`) only at a QE moment of exactly
+  0; at 0 < m < 1e-4 μB/cell, or on a spatial-pair failure, TRS goes off
+  with a warning. The SCF moment is read from the selected schema only (an
+  alias schema only when its density file matches byte for byte), and not at
+  all when a t_rev row decides.
 - Files. A nonmagnetic SOC `WFN_qp.h5` written before 09e4bcd81 (2026-09-30)
   that stores both k and −k now refuses with `GATE
   trs_qe_nonmagnetic_wfn_consistent`: its −k rows were rotated in the wrong
@@ -167,23 +175,6 @@ Robustness-review fixes (reports A1–A3, #7, #9, #12, #14, #15):
   face check no longer replicate their stacks on every rank.
 - Decks do not change.
 
-## 2026-10-04 — bispinor charge on the large block
-
-`bispinor = true` builds the charge vertex on $\Psi_C=(\psi_L,0)$: the direct
-Hartree field, the charge ζ, $\Pi_{00}$, $W_C$ and the CC Σ see $\psi_L$ only,
-and the current vertices keep the raw kinetic-balance lift
-(docs/theory/bispinor-gw.md §1). The raw lift had added
-$(\alpha^2/4)\langle p^2\rangle\bar V_H$, a V_H-gauge term that grows with the
-vacuum. The 2026-10-05 entry replaces this carrier.
-- Results move. CrI3 6×6 slab one-shot: the direct field drops by 112–310 meV
-  per state, and the Γ gap by about 21 meV. Bispinor − charge is now α·A
-  (≤ 1 meV), the Breit TT term, CT and the Γ head. Fe 4³: the direct field
-  drops by up to 39 meV per state.
-- Files. A raw-lift charge ζ refits. A bispinor restart bundle written before
-  this change refuses with `GATE restart_bispinor_charge_carrier`; set
-  `restart = false` once. kin_ion.h5 and dipole.h5 are reused unchanged.
-- Decks: no change.
-
 ## 2026-10-04 — the response bank's dense stages fill the mesh under `linalg = local`
 
 The sample Dyson, line selection and moment Dyson of the shared-pole bank run
@@ -210,7 +201,8 @@ both changes active.
   P = 9, 25, 36, 49, 100 it refused (`GATE cross_rank_compile_agreement`);
   P = 4, 16, 64 are unchanged.
 - `sc_mixing` other than 1.0 refuses (`GATE sc_mixing_retired`): nothing has
-  read it since the linear path was deleted. `LORRAX_SC_MIXING` is gone.
+  read it since the linear path was deleted. Delete the key from decks that
+  set it. `LORRAX_SC_MIXING` is gone.
 - The SC checkpoint's deck digest reads lines as the deck parser does (`=`
   or `:`, case, `#` comments). A checkpoint written before this change does
   not match it: the run warns and starts again from the seed.
@@ -341,8 +333,7 @@ Log lines:
   replaces `SC identity: max |dE| by overlap = ... (sorted-index value ...)`.
 - `SC matrix residual` ends with `FLAG` when max|dE| exceeds max_k‖f_k‖₂.
 
-Decks do not change. `sc_mixing` is still parsed and range-checked, but
-nothing reads it: the in-process linear-mixing path is deleted. A checkpoint
+Decks do not change. The in-process linear-mixing path is deleted. A checkpoint
 written before this change still resumes. Its first `SC map gain` line after
 the resume compares a label-paired table with a sorted one.
 

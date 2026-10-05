@@ -493,7 +493,9 @@ on most calls, and restarting there reduces the method to plain steps, which
 diverge on an expansive map.
 
 Plain iteration is refused (`sc_accelerator` accepts only `anderson`,
-`GATE sc_accelerator_anderson_only`). On dense band manifolds the QSGW
+`GATE sc_accelerator_anderson_only`), and there is no linear mixing
+parameter: `sc_mixing` other than its default refuses
+(`GATE sc_mixing_retired`; [input reference](input_reference.md)). On dense band manifolds the QSGW
 Jacobian has eigenvalues of about −3 or below along cycle directions on
 GN-PPM decks with many bands near the gap, so a plain fixed point 2-cycles
 and damping only shrinks the cycle; undamped linear mixing also amplifies
@@ -749,9 +751,12 @@ $m = 20$).
 
 **Continuing a run.** A deck whose `sc_initial_qp_rotations_file` has an
 `sc_checkpoint.h5` beside it continues that trajectory when the checkpoint
-authenticates: the same deck (SHA-256 of the deck less comments and the
-`restart`, `sc_initial_qp_rotations_file`, `sc_max_iter` and `sc_tol_ev`
-lines), the same WFN fingerprint, k set, Σ window and `sc_history_depth`. The
+authenticates: the same deck (SHA-256 of its lines read as the deck parser
+reads them, `=` or `:`, keys lower-cased, `#` comments and blank lines
+dropped, less the `restart`, `sc_initial_qp_rotations_file`, `sc_max_iter`
+and `sc_tol_ev` lines), the same WFN fingerprint, k set, Σ window and
+`sc_history_depth`, and on a bispinor deck the same four-current carrier
+stamp (`sc_iteration._sc_checkpoint_identity`). The
 continuation is implicit; to start a new trajectory from the same seed, remove
 the file. The run logs `SC resume: continuing the Anderson trajectory at map
 n`, keeps the earlier map files, and numbers its maps globally: its first map
@@ -777,8 +782,10 @@ A rerun reuses a map's shared-pole scratch only when that scratch
 authenticates for the same map identity (WFN fingerprint, energies,
 occupations, centroids, recipe, map index): a committed scalar `model.h5`, a
 four-current `sectors.json` with every model file it names, or a complete
-response bank, which resumes the constructor. Any other partial directory is
-removed and rebuilt, with a WARNING line naming the files
+response bank, which resumes the constructor. A scalar bank must also bind
+the current bare-V digest; one built at another P, or by older code, is
+rebuilt (`shared_pole_screening._authenticated_constructor_resume`). Any
+other partial directory is removed and rebuilt, with a WARNING line naming the files
 (`shared_pole_screening.screen_shared_poles`). Only the newest map's scratch
 generation is kept (`shared_pole_screening.retain_iteration_scratch`).
 

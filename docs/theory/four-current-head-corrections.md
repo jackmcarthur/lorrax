@@ -385,8 +385,8 @@ first order in the long-wavelength vertex:
   static limit, the Fermi–Dirac zero-Matsubara $\Pi(0,0)$
   (`response_bank.photon_static_contact`), whose diagonal transitions carry
   $-D$. The two producers differ in the current vertex and the Fermi
-  surface (dipole velocity and tetrahedron atoms against the raw
-  kinetic-balance current and Fermi–Dirac weights), so neither can borrow
+  surface (dipole velocity and tetrahedron atoms against the normalized-lift
+  current and Fermi–Dirac weights), so neither can borrow
   the other's limit.
 
 The head solves

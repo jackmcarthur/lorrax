@@ -113,6 +113,18 @@ Run `pw2bgw.x` right after the NSCF: each `pw.x` run overwrites `<prefix>.save/`
   only when the schema's operations and k rows are those of the WFN
   ([`symmetry_maps`](services/symmetry_maps.md)). gwjax.out then prints
   `Active op rows : 8 unitary; 8 TR-composed` (Fe, Ni).
+- **Keep the SCF `.save` too, for a spinor WFN QE ran with
+  `do_magnetization` true.** With no t_rev row, two-component time reversal
+  holds only if the SCF moment is below 1e-4 μB/cell, and an NSCF schema
+  writes 0. LORRAX takes the moment from the SCF schema whose charge-density
+  file is byte-identical to the NSCF `.save`'s, so both `.save` directories,
+  with their charge densities, must be found: in the WFN's directory or the
+  two above it, directly or under `scf/`, `nscf/`, `qe/scf/` or `qe/nscf/`
+  (`symmetry_maps.qe_schema.discover_qe_schema_paths`,
+  `scf_absolute_magnetization`). A copied `data-file-schema.xml` alone has
+  no density beside it. Without the SCF the verdict is TRS off, and the
+  `[2c-TRS]` run-record line names the reason
+  ([`symmetry_maps`](services/symmetry_maps.md#contract)).
 - **Effect.** A WFN with the time-reversal-composed operations and one
   without them, both from the same SCF density, give eqp within 0.07 meV:
   Fe 4³ scalar and bispinor, one-shot and SC; Ni 4³, Co 4³ and Co 6×6×4

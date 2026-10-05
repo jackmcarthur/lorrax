@@ -57,6 +57,10 @@ $$v_a = 2(k+G)_a \;+\; s\,\frac{\partial V_\mathrm{NL}(k)}{\partial k_a}
   15 %, and $s = -1$ by 31 %.
 - **DFT+U.** With `hubbard_input` and `hubbard_occupations`, the derivative of
   QE's ortho-atomic $V_U(k)$ is added (`psp.hubbard_ops`); it refuses $s = -1$.
+  The one-shot static head refuses a `dipole.h5` built with another velocity
+  operator, including one without $i[r, V_U]$ on a DFT+U deck
+  (`GATE static_head_dipole_operator`, `gw.head_correction`); regenerate it
+  with `python -m psp.get_dipole_mtxels -i <deck>`.
 - **Momentum only.** `--skip-vnl` writes $2(k+G)$ alone (BerkeleyGW's
   `use_momentum`). It is for comparison; the GW head refuses such a file
   (`GATE dft_head_dipole_provenance`).
@@ -66,11 +70,13 @@ $$v_a = 2(k+G)_a \;+\; s\,\frac{\partial V_\mathrm{NL}(k)}{\partial k_a}
 ([outputs](../how-to/berkeleygw-users.md#outputs)). The velocity is computed,
 not differenced: it is exact at each $k$ for the given states.
 
-**Bispinors.** With `bispinor = true` the state is the kinetic-balance
-four-spinor $\Psi = (\Psi_L, (\alpha_\mathrm{fs}/2)\,\sigma\cdot p\,\Psi_L)$
-($\alpha_\mathrm{fs}$ the fine-structure constant). The kinetic velocity acts on all four
-components and $V_\mathrm{NL}$ on the two large ones
-(`common.mtxel_sweep.dipole_operator`).
+**Bispinors.** With `bispinor = true`, `dipole.h5` is built on the raw
+kinetic-balance four-spinor $\Psi = (\Psi_L, (\alpha_\mathrm{fs}/2)\,\sigma\cdot p\,\Psi_L)$
+($\alpha_\mathrm{fs}$ the fine-structure constant). The GW vertices use the
+normalized lift ([carrier](bispinor-gw.md#lift)); the dipole is the one
+exception ([decisions](../architecture/decisions.md#four-component-carrier)).
+The kinetic velocity acts on all four components and $V_\mathrm{NL}$ on the
+two large ones (`common.mtxel_sweep.dipole_operator`).
 
 ## 3. The quasiparticle Hamiltonian adds a nonlocal term
 

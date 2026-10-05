@@ -60,11 +60,17 @@ aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
   `WfnLoader` authenticates the QE `data-file-schema.xml`. For a 2c WFN, TRS
   holds only if QE types no row t_rev = 1 (if Θ were a symmetry, Θ⁻¹(Θg) = g
   would be unitary) and the SCF absolute magnetization is below 1e-4 μB/cell
-  (the only TR-odd Kohn-Sham term is σ·B_xc[m]). The magnetization is the
-  schema's own when it is self-consistent, 0 when `do_magnetization` is
-  false, and otherwise that of the SCF schema whose charge-density file the
-  bound `.save` holds byte for byte (an NSCF schema writes 0). No schema or no
-  SCF magnetization means TRS off. The only executable verdict is
+  (the only TR-odd Kohn-Sham term is σ·B_xc[m]). The magnetization is read
+  only when no t_rev row decides, and only from the selected schema: its own
+  value when it is self-consistent, 0 when `do_magnetization` is false, and
+  otherwise that of the SCF schema whose charge-density file the selected
+  `.save` holds byte for byte (an NSCF schema writes 0; an unreadable
+  candidate is skipped) (`qe_schema.scf_absolute_magnetization`,
+  `resolve_qe_symmetry_binding`). The schema is found beside the WFN; a
+  `WFN_qp.h5` also finds it beside its stamped `qp_wfn_source`, so it gets its
+  source's verdict (`WfnLoader`). No schema or no SCF magnetization means TRS
+  off, and a refusal that needs TRS names that reason and asks for the NSCF
+  and SCF `.save` to be co-staged. The only executable verdict is
   `WfnLoader.trs_holds` → `SymMaps.trs_allowed`. Every consumer (q-grid policy, W gates, GN probe, MPA contour, QSGW
   velocity parity) reads `SymMaps.trs_allowed`, and none accepts an override.
   The run record prints `QE schema`, `Stored QE type`, `DFT 2c TRS`,
@@ -86,7 +92,9 @@ aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
   `(tol, max_k, nocc)`. A hit skips the coefficient reads, replays the
   on/strict policy and prints the stamp path. A check that raised is never
   stamped. Processes that share the check's collective agree on hit or miss
-  by one all-gather, and rank 0 writes. There is no dial.
+  by one all-gather, and rank 0 writes. The in-process cache keys on that
+  collective's world size, so a rank-0-only open never answers a later
+  all-rank open (`density_symmetry_check.cached_density_symmetry_check`). There is no dial.
 * **Env surface.** `LORRAX_TRS_CHECK` takes `1`/`on` (default) or `strict`
   (a broken or inconclusive verdict refuses); `0`/`off` refuses.
   `LORRAX_TRS_TOL` and `LORRAX_TRS_MAX_K` tune the measurement. The

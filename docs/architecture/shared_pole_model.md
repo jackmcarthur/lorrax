@@ -60,7 +60,10 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    host budget, else one file per rank. The tier is released once the
    constructor has committed. The shared scratch file `bank.h5` is used only
    for `write_w` (which re-reads the bank), a distributed `linalg`, and a
-   per-rank store the disk or quota refuses; a scalar `bank.h5` is unlinked
+   per-rank store the disk or quota refuses at initialization
+   (`gw.shared_pole_screening`). A field created later (line panels, photon
+   contact fields) that the disk refuses is held in host memory, with one
+   `RuntimeWarning` per bank (`ResidentBankPayload`); a scalar `bank.h5` is unlinked
    once the constructor has committed `model.h5` (kept for `write_w`; the
    photon Σ reads its constant), and the receipt records the bytes and the
    link count. Either way a run holds at most one bank. Its size is
@@ -171,7 +174,12 @@ is its own partner. At each fitted line support off the imaginary axis the
 producer solves it beside $W_q(z)$: the stream's output rows are the union of
 the parent rows and their $-q$ rows in one panel, and the partner is formed
 from the conjugated $-q$ rows with the **original parent's $V$** (and contact).
-It is consumed by the line selection (§3) and never stored. Rebuilding it from
+Where the plan holds a spatial inversion row that `SymMaps.active_symmetry_rows`
+authorizes as unitary, with a complete centroid map, $\chi_{-q}$ comes from
+that row and the $-q$ rows are not streamed (`response_bank._unitary_inversion`).
+Where QE types inversion only with time reversal (a PT-symmetric
+antiferromagnet), inversion alone is no symmetry and the $-q$ rows are
+streamed. It is consumed by the line selection (§3) and never stored. Rebuilding it from
 the $-q$ parent through the symmetry tables is not exact: the ISDF $V_q$ is
 covariant only to about $2\times10^{-6}$, and the ordered Gram amplifies that
 into a refusal (sandbox claim 2452, bcc Fe).
@@ -451,8 +459,9 @@ compiled with XLA's latency-hiding scheduler
 the process-wide flag stays off. With one node per trip the scheduler gains
 nothing (+0.3 %). The window pairs only when its compiled paired executable
 fits the device budget beside the live stages
-(`gw.mpa.sigma.SynthesisTau.fits`: the executable's peak against the
-capacity ledger, the same on every rank); otherwise it runs one node per
+(`gw.mpa.sigma.SynthesisTau.fits`: the largest executable peak any rank
+read, against the capacity ledger, so every rank decides alike; the ledger
+reservation takes the same figure, `gw.mpa.sigma._admit`); otherwise it runs one node per
 trip with the default schedule. The paired program holds a second node's
 live set (Ni 20³ P64: 9.76 → 16.95 GB compiled per rank), and its window
 line in gwjax.out's memory table says "two nodes per trip". Every

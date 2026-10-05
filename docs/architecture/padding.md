@@ -117,7 +117,8 @@ different centroid table.
 ## Refusals that are not pad opportunities
 
 1. The runtime and the BSE ring require a supported square process topology.
-2. The indefinite current-channel LU solves at the logical extent. When that
+2. The current-channel ridge LU (a signed semidefinite Gram) solves at the
+   logical extent. When that
    extent does not divide the mesh axes, `linalg = local` demotes to the per-q
    replicated LU and `linalg = distributed` refuses
    ([factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve)).
