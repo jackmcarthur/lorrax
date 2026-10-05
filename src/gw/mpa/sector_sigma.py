@@ -449,7 +449,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy, brackets=None):
         right_g, right_p = sector_right_operands(right, band_axis, mesh_xy)
         return SynthesisTau(node.spatial, synthesis, right_g, right_p, synthesis.native,
                             f'sigma.sector.tau.{keys[0]}', meta, node.key, (*node.plans, *w_tables),
-                            kconv_tables=node.loads)
+                            kconv_tables=node.loads, overlap=True)
     return factory
 
 
