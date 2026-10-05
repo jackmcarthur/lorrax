@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — shared-pole SC rounds write their model files directly; the sector Σ τ windows overlap
+
+From SC map 1 on, a sector or scalar model round whose K extent is held
+writes its batch into the final `factor`/`poles2_ry2` datasets at once;
+map 0 and a one-shot still stage. The file holds the same bytes, census,
+digest and commit, and an interrupted write is refused by name as before.
+The header carries `direct_extent`; `staging_payload_bytes` and
+`peak_payload_bytes` are gone. The four sector Σ τ windows run two τ
+nodes per loop trip like the scalar route (round-off). No deck change.
+
 ## 2026-10-05 — `full_shared_pole` on a WFN with time reversal refuses at driver entry
 
 `bispinor_gw = full_shared_pole` on a WFN with time reversal now refuses at
