@@ -1416,6 +1416,17 @@ def _compute_mpa_sigma(
             efermi_ry=sigma_efermi_ry,
             efermi_provenance=sigma_efermi_provenance)
 
+    plan = None
+    # Every MPA pole sum brackets its Green band sum exactly as the PPM route
+    # does (one executor, one plan owner, one pooled fit): the scalar body,
+    # and the four-current body's CC class (mpa.sector_sigma).
+    if bool(config.sigma.band_extrapolation) and band_extrapolation_is_consumable(
+            (ComputeMode.MPA,), scalar_mpa=mpa_sigma_runs_scalar_executor(config)):
+        plan = plan_sigma_band_brackets(
+            config, wfns, meta, print_fn=print_fn,
+            where="sigma_dispatch MPA plan seam")
+        # Before the checkpoint: the bracket plan is part of the sweep's identity.
+        body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
     checkpoint = _sweep_checkpoint(
         config, input_dir, fit_identity, fit_digest, head, lorentz_output,
         e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
@@ -1430,16 +1441,6 @@ def _compute_mpa_sigma(
             return finalize(*restored[:2])
     import time
     sweep_started = time.monotonic()
-    plan = None
-    # Every MPA pole sum brackets its Green band sum exactly as the PPM route
-    # does (one executor, one plan owner, one pooled fit): the scalar body,
-    # and the four-current body's CC class (mpa.sector_sigma).
-    if bool(config.sigma.band_extrapolation) and band_extrapolation_is_consumable(
-            (ComputeMode.MPA,), scalar_mpa=mpa_sigma_runs_scalar_executor(config)):
-        plan = plan_sigma_band_brackets(
-            config, wfns, meta, print_fn=print_fn,
-            where="sigma_dispatch MPA plan seam")
-        body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
         on_shell = None
