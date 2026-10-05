@@ -141,13 +141,14 @@ def _plain_loads(data):
 
 
 def _cubes_sha256(f, names):
-    """One digest of the stored cube bytes, read slice by slice (mesh-free)."""
+    """One digest of the stored cube bytes, read slice by slice (mesh-free); each
+    slice is hashed through its buffer, with no second host copy."""
     digest = hashlib.sha256()
     for name in sorted(names):
         ds = f[name]
         digest.update(f"{name}{ds.dtype}{ds.shape}".encode())
         for i in range(ds.shape[0]):
-            digest.update(np.ascontiguousarray(ds[i]).tobytes())
+            digest.update(np.ascontiguousarray(ds[i]))
     return digest.hexdigest()
 
 
