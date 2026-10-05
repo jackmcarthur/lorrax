@@ -223,8 +223,6 @@ def test_partner_directions_keep_one_carrier():
     assert shapes == {tuple(q.shape)}
 
 
-@pytest.mark.xfail(strict=True, reason="audit row 3: the face schedule's last round is ragged; "
-                   "flip when row 3 lands")
 def test_face_rounds_share_one_width():
     from types import SimpleNamespace
     from gw.shared_pole_execution import sector_round_schedule
