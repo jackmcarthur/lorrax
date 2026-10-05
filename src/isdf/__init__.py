@@ -7,7 +7,6 @@ from isdf.core import (
     gram_q0_aot_peak_bytes,       # compiler peak for the same fold
     gram_q0_from_psi_sm,  # fused centroid-WFN faces -> q=0 Gram
     gram_q0_tiled_from_psi_sm,  # one donated scan over fixed Gram tiles
-    gram_q0_tiled_from_psi_aot_resident_increment_bytes,
     gram_q0_from_psi_aot_peak_bytes,  # compiler peak for fused route
     c_q_from_psi_sm,     # centroid ψ -> C_q metric
     complete_ordered_pair_normal_equations,  # LR -> conjugation-closed LR+RL
@@ -22,7 +21,6 @@ __all__ = [
     "gram_q0_from_pair", "transverse_gram_q0_from_pair",
     "gram_q0_aot_peak_bytes", "gram_q0_from_psi_sm",
     "gram_q0_tiled_from_psi_sm",
-    "gram_q0_tiled_from_psi_aot_resident_increment_bytes",
     "gram_q0_from_psi_aot_peak_bytes",
     "c_q_from_psi_sm",
     "complete_ordered_pair_normal_equations",

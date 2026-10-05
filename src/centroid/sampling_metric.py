@@ -209,25 +209,26 @@ def _metric_chunk_plan(
     ngkmax: int,
     n_grid: int,
     n_windows: int,
-    device_memory_bytes: int | None,
 ) -> tuple[int, int, int]:
     """Return ``(k_chunk, band_chunk, budget_bytes)`` for the metric scan.
 
-    One quarter of the device is the budget, half for the scan's FFT box
-    transient and half for the resident k chunk.  The density scan transforms
-    every local band of one k at once, ``2 * nb/P * ns * N_grid`` complex
-    values, so the band chunk bounds that transient.  A k chunk holds its
-    ``psi(G)`` band shard plus the replicated per-k density matrices and their
-    psum buffer.  The k chunk divides the parent count, so one executable
-    serves every chunk.  A single k whose replicated matrices exceed the
-    budget runs alone with one warning: this route does not spatially shard ``D_k(r)``.
+    One fixed tile (:data:`runtime.tiles.TILE_BYTES`) bounds the scan's FFT
+    box transient and another the resident k chunk, from the shapes alone
+    (TASTE 96): the band and k grouping of the metric's sums, and so the
+    k-means weights, never depend on the budget or the card.  The density
+    scan transforms every local band of one k at once,
+    ``2 * nb/P * ns * N_grid`` complex values, so the band chunk bounds that
+    transient.  A k chunk holds its ``psi(G)`` band shard plus the replicated
+    per-k density matrices and their psum buffer.  The k chunk divides the
+    parent count, so one executable serves every chunk.  A single k larger
+    than its tile runs alone, with one warning when it and the transient
+    exceed the budget: this route does not spatially shard ``D_k(r)``.
     """
     from runtime.padding import bounded_partition_tile
+    from runtime.tiles import TILE_BYTES
 
     c128 = np.dtype(np.complex128).itemsize
-    budget = int(device_memory_bytes or 0) // 4
-    if budget <= 0:
-        budget = 2 * 1024 ** 3
+    budget = 2 * TILE_BYTES
     per_band = 2 * int(ns) * int(n_grid) * c128
     local_bands = max(1, (budget // 2) // per_band)
     band_chunk = int(min(int(n_bands), local_bands * int(n_band_shards)))
@@ -237,8 +238,10 @@ def _metric_chunk_plan(
     if per_k > budget // 2:
         # One k runs: this route band-shards psi but does not spatially
         # shard the replicated D_k(r).
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("centroid feature metric (one k)", per_k, budget // 2)
+        from common.gpu_utils import device_budget_bytes, warn_over_budget
+        if per_k + budget // 2 > device_budget_bytes():
+            warn_over_budget("centroid feature metric (one k)",
+                             per_k + budget // 2, device_budget_bytes())
     k_chunk = bounded_partition_tile(
         int(n_parents), max(1, (budget // 2) // per_k), 1)
     return max(1, k_chunk), band_chunk, budget
@@ -332,13 +335,10 @@ def build_feature_metric_diagonal(
                else (left_range, right_range))
     union_lo = min(left_range[0], right_range[0])
     union_hi = max(left_range[1], right_range[1])
-    from common.gpu_utils import device_budget_bytes
-    device_memory_bytes = int(device_budget_bytes())
     k_chunk, band_chunk, budget = _metric_chunk_plan(
         n_parents=int(parents_used.size), n_bands=union_hi - union_lo,
         n_band_shards=int(mesh.devices.size), ns=ns,
-        ngkmax=int(wfn.ngkmax), n_grid=n_grid, n_windows=len(windows),
-        device_memory_bytes=device_memory_bytes)
+        ngkmax=int(wfn.ngkmax), n_grid=n_grid, n_windows=len(windows))
     if rank == 0:
         print(
             f"  {mode} metric plan: {len(parents_used)} parent(s) in "

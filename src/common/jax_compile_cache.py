@@ -1680,9 +1680,8 @@ def _install_device_fit_gate() -> None:
     compiled module, on every path (jit dispatch and AOT ``Compiled``), before
     any of the module's buffers exist.  It does not run at compile: planners
     compile larger candidates on purpose to read their figures and then
-    shrink (``centroid.pivoted_cholesky._auto_gram_width_from_compiled_peaks``,
-    ``runtime.aot_memory.check_chunk``), and a candidate that never runs must
-    not refuse.
+    shrink (``runtime.aot_memory.check_chunk``), and a candidate that never
+    runs must not refuse.
 
     The wrap is signature-checked at install, like the other ``jax._src``
     patches here: when ``ExecuteReplicated`` is absent or its ``__init__`` does

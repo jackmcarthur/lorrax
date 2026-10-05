@@ -12,9 +12,10 @@ implemented production routes or measured speedups.
 
 ## What is being optimized?
 
-The candidate Gram accumulates memory-sized k batches, with the original
-weights; batching changes floating-point summation grouping rather than the
-training metric.
+The candidate Gram accumulates k batches and square tiles sized from the
+shapes alone (`runtime.tiles`), with the original weights; batching changes
+floating-point summation grouping rather than the training metric, and the
+memory budget never changes that grouping or the selected set.
 
 Write the feature at position r as
 

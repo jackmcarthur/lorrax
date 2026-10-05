@@ -72,7 +72,7 @@ if TYPE_CHECKING:                                                   # pragma: no
     from wfn_loader import WfnLoader
 from common import timing
 from common.collectives import device_put_process_local, process_rank
-from common.gpu_utils import minimum_process_budget_gb, worst_process_resident_bytes
+from common.gpu_utils import minimum_process_budget_gb
 from common.pivoted_cholesky import (
     make_sharded_group_block_pivoted_cholesky_select as _make_sharded_block_select,
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
@@ -88,8 +88,6 @@ _SELECT_HEARTBEAT_S = 60.0
 
 _GRAM_MIN_COL_BLOCK = 1
 _GRAM_COMPLEX_BYTES = 16
-_GRAM_SEED_BUDGET_FRACTION = 0.25
-_GRAM_FINAL_FOLD_SLOTS = 3
 _CANDIDATE_GAMMA_MODES = ("charge", "transverse")
 
 
@@ -287,58 +285,6 @@ def _resolve_candidate_gamma_mode(gamma_mode: str, *, bispinor: bool) -> str:
     return mode
 
 
-def candidate_gram_q0_from_pair(
-    P_l_k: jax.Array,
-    P_r_k: jax.Array,
-    k_weights: jax.Array,
-    *,
-    mesh_xy: Mesh,
-    gamma_mode: str = "charge",
-    symmetrize: bool = True,
-) -> jax.Array:
-    """Fold canonical pair densities into the selected candidate metric.
-
-    ``charge`` delegates byte-for-byte to the historical scalar q=0 fold.
-    ``transverse`` delegates to :mod:`isdf.core`'s fused three-component
-    transition-feature fold, which computes the PSD sum
-    ``G_perp = sum_i Z_i Z_i†`` without materialising ``Z_i`` or summing raw
-    indefinite transverse CCTs.
-    """
-    mode = str(gamma_mode).strip().lower()
-    if mode == "charge":
-        from isdf import gram_q0_from_pair
-        return gram_q0_from_pair(
-            P_l_k, P_r_k, k_weights,
-            mesh_xy=mesh_xy, symmetrize=symmetrize)
-    if mode == "transverse":
-        from isdf import transverse_gram_q0_from_pair
-        return transverse_gram_q0_from_pair(
-            P_l_k, P_r_k, k_weights,
-            mesh_xy=mesh_xy, symmetrize=symmetrize)
-    raise ValueError(
-        "gamma_mode must be 'charge' or 'transverse'; got "
-        f"{gamma_mode!r}")
-
-
-def candidate_gram_q0_from_psi(
-    psi_l_X: jax.Array,
-    psi_l_Y: jax.Array,
-    psi_r_X: jax.Array,
-    psi_r_Y: jax.Array,
-    k_weights: jax.Array,
-    *,
-    mesh_xy: Mesh,
-    gamma_mode: str = "charge",
-    symmetrize: bool = True,
-) -> jax.Array:
-    """Build one candidate Gram tile through the fused ISDF owner."""
-    from isdf import gram_q0_from_psi_sm
-    return gram_q0_from_psi_sm(
-        psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
-        mesh_xy=mesh_xy, gamma_mode=gamma_mode, symmetrize=symmetrize,
-    )
-
-
 def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
     """Transient bytes priced for one open-spin Gram column block.
 
@@ -368,26 +314,26 @@ def auto_gram_col_block_width(
     x_shards: int = 1,
     y_shards: int = 1,
 ) -> int:
-    """Largest mesh-aligned Gram seed tile whose square-law price fits.
+    """Largest mesh-aligned square Gram tile whose pair-density price fits
+    ``budget_bytes`` per rank (:func:`gram_tile_width` passes the fixed tile).
 
-    Auto widths align *down* so rounding for a mesh can never invalidate the
-    memory bound.  When even the supported minimum block does not fit, that
+    Widths align *down* so rounding for a mesh can never invalidate the
+    bound.  When even the supported minimum block does not fit, that
     block is returned with one warning line.
     """
     budget_i = max(0, int(budget_bytes))
     divisor_i = max(1, int(divisor))
     min_aligned = ((max(1, int(min_width)) + divisor_i - 1)
                    // divisor_i) * divisor_i
-    # The seed is a per-device screen, as is the budget. Legal square
-    # tiles divide both mesh axes; price one aligned unit and scale its
-    # square, then let the actual executable certify the full live set.
+    # Legal square tiles divide both mesh axes; price one aligned unit and
+    # scale its square.
     coefficient = gram_col_block_device_bytes(
         nk, nspinor, divisor_i, divisor_i,
         x_shards=x_shards, y_shards=y_shards)
     width = math.isqrt(budget_i // coefficient) * divisor_i
     if width < min_aligned:
         from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"kmeans Gram seed tile (block {min_aligned})",
+        warn_over_budget(f"kmeans Gram tile (block {min_aligned})",
                          gram_col_block_device_bytes(nk, nspinor, min_aligned, min_aligned,
                                                      x_shards=x_shards, y_shards=y_shards),
                          budget_i)
@@ -423,31 +369,6 @@ def gram_col_block_device_bytes(
     return gram_col_block_bytes(nk, nspinor, 1) * rows_local * cols_local
 
 
-def gram_scan_live_set_bytes(
-    *,
-    resident_bytes: int,
-    scan_resident_increment_bytes: int,
-    gram_matrix_local_bytes: int,
-) -> dict[str, int]:
-    """Complete per-device live set for the one-dispatch tiled Gram scan.
-
-    ``resident_bytes`` is sampled after both complete candidate-WFN windows
-    exist.  The exact production executable reports only its bytes above
-    those four inputs and the donated local ``P('x','y')`` Gram.  The final
-    Hermitian fold can hold input, transpose/conjugate and output: three
-    local-Gram slots, with no global concatenate.
-    """
-    resident = int(resident_bytes)
-    gram_local = int(gram_matrix_local_bytes)
-    stages = {
-        "scan": (resident + gram_local
-                 + int(scan_resident_increment_bytes)),
-        "final_fold": resident + _GRAM_FINAL_FOLD_SLOTS * gram_local,
-    }
-    stages["peak"] = max(stages.values())
-    return stages
-
-
 def gram_tile_schedule(extent: int, width: int) -> tuple[int, int, float]:
     """Return tile count, padded extent and square-work inflation."""
     extent_i = int(extent)
@@ -462,71 +383,24 @@ def gram_tile_schedule(extent: int, width: int) -> tuple[int, int, float]:
     return ntiles, executed, inflation
 
 
-def _auto_gram_width_from_compiled_peaks(
-    seed_width: int,
-    *,
-    max_width: int,
-    divisor: int,
-    budget_bytes: int,
-    peak_for_width,
-) -> tuple[int, dict[str, int]]:
-    """Find a certified rung, then remove padding at the same tile count.
+def gram_tile_width(nk: int, nspinor: int, n_points: int, *, divisor: int,
+                    x_shards: int, y_shards: int) -> int:
+    """The candidate-Gram tile width from the shapes alone (TASTE 96).
 
-    Each rung compiles the SAME canonical tile executables production will
-    run.  A geometric ladder avoids a dozen throw-away production-shape
-    compilations. Once the largest feasible rung is known, its tile count is
-    fixed and the width is reduced to the smallest mesh-aligned value that
-    covers the logical extent in that many tiles. This preserves scan-iteration
-    count while minimizing zero-padded pair-density work. The returned width
-    itself is always queried and certified.
+    The widest mesh-aligned square tile whose two pair-density tiles fit
+    :data:`runtime.tiles.TILE_BYTES` per rank, then the narrowest aligned
+    width that covers ``n_points`` in the same number of tiles, so the
+    padded tail does no extra work.  The budget never enters, so a 40 GB and
+    an 80 GB card run the same GEMM shapes in the same order.
     """
-    d = max(1, int(divisor))
     from runtime.padding import padded_axis
-    floor = padded_axis(
-        max(1, _GRAM_MIN_COL_BLOCK), d,
-        name="pivoted-Cholesky Gram floor").carrier
-    ceiling = (int(max_width) // d) * d
-    width = min(max(floor, (int(seed_width) // d) * d), ceiling)
-    checked: dict[int, dict[str, int]] = {}
-
-    def check(w):
-        if w not in checked:
-            checked[w] = peak_for_width(w)
-        return checked[w]
-
-    facts = check(width)
-    while facts["peak"] > int(budget_bytes) and width > floor:
-        width = max(floor, ((width // 2) // d) * d)
-        facts = check(width)
-    if facts["peak"] > int(budget_bytes):
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"kmeans Gram tile (minimum {floor}, compiled)",
-                         facts["peak"], int(budget_bytes))
-
-    while width < ceiling:
-        wider = min(ceiling, ((2 * width) // d) * d)
-        if wider <= width:
-            break
-        wider_facts = check(wider)
-        if wider_facts["peak"] > int(budget_bytes):
-            break
-        width, facts = wider, wider_facts
-
-    # Largest-width is not a runtime optimum with fixed-shape tail padding.
-    # Example: extent 3008, width 3004 executes two 3004-wide tiles per axis,
-    # nearly 4x the useful square work.  Keep the SAME number of scan iterations
-    # and shrink to the minimum aligned width that still covers the extent.
-    ntiles, _, _ = gram_tile_schedule(ceiling, width)
-    from runtime.padding import padded_axis
-    compact = padded_axis(
-        -(-ceiling // ntiles), d,
-        name="pivoted-Cholesky compact tile").carrier
-    compact = min(width, max(floor, compact))
-    if compact != width:
-        compact_facts = check(compact)
-        if compact_facts["peak"] <= int(budget_bytes):
-            width, facts = compact, compact_facts
-    return width, facts
+    from runtime.tiles import TILE_BYTES
+    widest = min(int(n_points), auto_gram_col_block_width(
+        nk, nspinor, TILE_BYTES, divisor=divisor,
+        x_shards=x_shards, y_shards=y_shards))
+    ntiles, _, _ = gram_tile_schedule(n_points, widest)
+    return padded_axis(-(-int(n_points) // ntiles), divisor,
+                       name="pivoted-Cholesky Gram tile").carrier
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1414,22 +1288,22 @@ def build_gram_q0_via_loadwfns(
     band_chunk_size: int = 64,
     memory_per_device_gb: float | None = None,
 ) -> jnp.ndarray:
-    """Accumulate the exact q=0 Gram over memory-sized full-BZ k batches.
+    """Accumulate the exact q=0 Gram over fixed-tile full-BZ k batches.
 
     The only persistent result is the P(x,y) candidate Gram. The shared WFN
     sampler returns X/Y faces for this batch alone. k weights retain their
     original full-zone normalization, so batching changes summation grouping,
     not the metric, band windows, spin vertices or physical k grid.
 
-    The batch size comes from the run's budget (the deck's
-    ``memory_per_device_gb``, else the card) and the face shapes, never from
-    live allocator room.  When more than one batch is needed, the batches hold
-    whole symmetry stars, so each batch reads each raw WFN parent once per
-    band tile instead of once per child; one batch keeps the canonical
-    full-BZ order.
+    A batch takes the most k whose faces fit :data:`runtime.tiles.TILE_BYTES`
+    per rank (TASTE 96): the grouping, and so the Gram's rounding and the
+    selected centroids, never depend on the budget or the card.  When more
+    than one batch is needed, the batches hold whole symmetry stars, so each
+    batch reads each raw WFN parent once per band tile instead of once per
+    child; one batch keeps the canonical full-BZ order.
     """
-    from common.gpu_utils import device_budget_bytes
     from runtime.padding import padded_axis, padded_mu_extent
+    from runtime.tiles import tile_units
     if band_range_left is None or band_range_right is None:
         if n_val is None or n_cond is None:
             raise ValueError("supply n_val/n_cond or both explicit band windows")
@@ -1450,10 +1324,6 @@ def build_gram_q0_via_loadwfns(
     selected_rows = np.flatnonzero(weights > 0)
     weights = weights[selected_rows]
     nk = int(selected_rows.size)
-    budget = (float(memory_per_device_gb)*1e9
-              if memory_per_device_gb and memory_per_device_gb > 0
-              else float(device_budget_bytes()))
-    budget = minimum_process_budget_gb(budget/1e9)*1e9
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
     mu = padded_mu_extent(int(cand_idx.shape[0]), mesh_xy)
     ns = 4 if bispinor else int(wfn.nspinor)
@@ -1468,9 +1338,7 @@ def build_gram_q0_via_loadwfns(
     nb_faces = bands(nb_r) + (
         0 if _left_band_slice(left, right) is not None else bands(nb_l))
     per_k = 16*ns*mu*nb_faces*(1.0/px+1.0/py)
-    # Faces take at most half the budget; the rest is the loader's tile and
-    # FFT scan and the compiler-certified Gram tile work.
-    k_limit = max(1, int(0.5*budget/max(per_k, 1)))
+    k_limit = tile_units(per_k, nk)
     n_chunks = -(-nk // k_limit)
     k_batch = -(-nk // n_chunks)
     if n_chunks > 1:
@@ -1485,7 +1353,7 @@ def build_gram_q0_via_loadwfns(
     if verbose:
         print(f"[candidate Gram k batches] nk={nk}, batch={k_batch}, "
               f"chunks={n_chunks}, WFN faces<= {per_k*k_batch/2**30:.2f} "
-              f"GiB/device of budget {budget/2**30:.2f}; same full-zone "
+              f"GiB/device (fixed tile); same full-zone "
               f"weights and band windows"
               f"{'; star-ordered batches' if n_chunks > 1 else ''}")
     result = None
@@ -1498,8 +1366,8 @@ def build_gram_q0_via_loadwfns(
             bispinor=bispinor, gamma_mode=gamma_mode, verbose=verbose,
             band_range_left=left, band_range_right=right,
             band_norms=band_norms, k_weights=weights[k0:k1],
-            band_chunk_size=band_chunk_size, memory_per_device_gb=budget/1e9,
-            full_k_rows=rows)
+            band_chunk_size=band_chunk_size,
+            memory_per_device_gb=memory_per_device_gb, full_k_rows=rows)
         result = block if result is None else _candidate_gram_add_kernel(mesh_xy)(result, block)
         jax.block_until_ready(result)
     return result
@@ -1556,9 +1424,9 @@ def _build_gram_q0_kbatch(
     Grams. It never consumes occupations or ``band_norms``.
 
     The shared WFN transform service unfolds each band window onto candidate
-    points. Small Grams retain the sequential low-residency pair route; large
-    Grams keep both final WFN faces and fuse each bounded pair-density/q=0
-    tile through :mod:`isdf`. k-weights are supplied in full-BZ order.
+    points. Every Gram keeps the final WFN faces and fuses each pair-density/q=0
+    tile, sized from the shapes (:func:`gram_tile_width`), through
+    :mod:`isdf`. k-weights are supplied in full-BZ order.
     ``None`` retains uniform ``1 / nk_tot`` for standalone callers.
 
     Args:
@@ -1602,11 +1470,7 @@ def _build_gram_q0_kbatch(
     # we don't want to charge the single-device prune path for it.
     from common.meta import Meta
     from common.wfn_transforms import load_centroids_band_chunked
-    from isdf import (
-        pair_density,
-        gram_q0_tiled_from_psi_sm,
-        gram_q0_tiled_from_psi_aot_resident_increment_bytes,
-    )
+    from isdf import gram_q0_tiled_from_psi_sm
 
     gamma_mode = _resolve_candidate_gamma_mode(
         gamma_mode, bispinor=bispinor)
@@ -1758,20 +1622,18 @@ def _build_gram_q0_kbatch(
         psi_l_rmu_Y, psi_l_rmuT_X = psi_a_rmu_Y, psi_a_rmuT_X
     del psi_a_rmuT_X
 
-    # ---- 2-D tiled path (size-ladder wall fix) ----
+    # ---- 2-D tiled path ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
-    # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309).
-    # Per-element contraction order is unchanged by tiling BOTH candidate
-    # axes, so G is numerically the same map; only materialization moves.  The
-    # two-axis tile is important: the nk-aware square law must price the same
-    # object the pair-density compiler sees, never an unpriced M x block.
+    # M~9.8k (c7000 kmeans killed a 192 GB node — 2026-07-28 job 7878309), so
+    # both candidate axes are tiled.  The tile comes from the shapes alone
+    # (``gram_tile_width``, TASTE 96): the budget never changes the GEMM
+    # shapes, so it never changes the Gram's rounding or the pivots.
     n_dev_total = mesh_xy.devices.size
     n_x = int(mesh_xy.shape['x']) if 'x' in mesh_xy.axis_names else 1
     n_y = int(mesh_xy.shape['y']) if 'y' in mesh_xy.axis_names else 1
-    col_block = 0
     # LORRAX_GRAM_COL_BLOCK: historical name, now an explicit square-tile
     # width; a falsy token
-    # means "no override", i.e. the auto budget below.  This USED to be a
+    # means "no override", i.e. the shape-sized tile below.  This USED to be a
     # bare presence test — ``=0`` and ``=off`` are the two spellings a user
     # reaches for to DISABLE a knob, and they did the opposite or crashed.
     env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
@@ -1779,204 +1641,92 @@ def _build_gram_q0_kbatch(
         env_cb = ""
     nk_, _, ns_, M_cols = (int(x) for x in psi_a_rmu_Y.shape)
     del psi_a_rmu_Y
-    seed_budget_bytes = int(
-        float(meta.memory_per_device_gb) * 1e9
-        * _GRAM_SEED_BUDGET_FRACTION
-    )
     from runtime.padding import padded_axis
     tile_divisor = padded_axis(
         1, mesh_xy, name="Gram square-tile divisor",
         specs=((PartitionSpec('x', None), 0),
                (PartitionSpec(None, 'y'), 1))).divisor
-    block_source = "auto"
+    block_source = "fixed tile"
     if env_cb:
         block_source = "LORRAX_GRAM_COL_BLOCK override"
         try:
             requested_block = int(env_cb)
             if requested_block <= 0:
                 raise ValueError
-            col_block = max(_GRAM_MIN_COL_BLOCK, requested_block)
         except ValueError:
             raise ValueError(
                 f"LORRAX_GRAM_COL_BLOCK={env_cb!r} is neither a positive "
                 f"integer tile width nor a falsy token "
                 f"('', 0, false, no, off)."
             ) from None
-        # A manual width keeps its historical floor and is rounded UP so the
-        # now-square tile divides BOTH mesh axes.  It is an explicit override,
-        # so it may exceed auto's target and the diagnostic below says so.
-        from runtime.padding import padded_axis
-        col_block = padded_axis(
-            col_block, tile_divisor,
-            name="pivoted-Cholesky column block").carrier
+        # A manual width is rounded UP so the square tile divides BOTH mesh
+        # axes, and capped at the candidate extent.
+        col_block = min(M_cols, padded_axis(
+            max(_GRAM_MIN_COL_BLOCK, requested_block), tile_divisor,
+            name="pivoted-Cholesky column block").carrier)
     else:
-        if gram_col_block_bytes(nk_, ns_, M_cols) <= seed_budget_bytes:
-            col_block = M_cols
-        else:
-            col_block = auto_gram_col_block_width(
-                nk_, ns_, seed_budget_bytes, divisor=tile_divisor,
-                x_shards=n_x, y_shards=n_y,
-            )
-    if col_block >= M_cols:
-        col_block = 0  # one full block == the original computation
+        col_block = gram_tile_width(nk_, ns_, M_cols, divisor=tile_divisor,
+                                    x_shards=n_x, y_shards=n_y)
 
-    if col_block:
-        if same_window:
-            psi_r_rmu_Y, psi_r_rmuT_X = psi_l_rmu_Y, psi_l_rmuT_X
-        elif left_slice is None:
-            with timing.section("right.load"):
-                psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-                    wfn, sym, meta, cand_idx, bispinor, mesh_xy,
-                    right_range,
-                    band_chunk_size=band_chunk_size,
-                    k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
-                )
-                if norms_r_j is not None:
-                    psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-                    psi_r_rmuT_X = (
-                        psi_r_rmuT_X / norms_r_j[None, None, :, None])
-                psi_r_rmu_Y.block_until_ready()
-
-        # Compiler-aware width selection happens only after BOTH canonical
-        # WFN windows exist.  The resident floor is priced from the shapes:
-        # the bytes of this rank's distinct face shards, never a live
-        # allocator reading (sizes come from the budget and the shapes).
-        faces = {id(arr): arr for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
-                                          psi_r_rmu_Y, psi_r_rmuT_X)
-                 if arr is not None}
-        resident_local_bytes = sum(
-            int(sh.data.nbytes)
-            for arr in faces.values() for sh in arr.addressable_shards)
-        del faces
-
-        # The selected width controls static executable shapes and loop counts
-        # on every process.  Allocator residency itself is rank-local, so price
-        # from one shared worst-rank value before entering that host branch.
-        resident_bytes = worst_process_resident_bytes(resident_local_bytes)
-
-        target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
-        from runtime.padding import padded_axis
-        gram_rows_local = padded_axis(
-            M_cols, n_x, name="Gram resident row carrier").carrier // n_x
-        gram_cols_local = padded_axis(
-            M_cols, n_y, name="Gram resident column carrier").carrier // n_y
-        gram_local_bytes = (
-            gram_rows_local * gram_cols_local * _GRAM_COMPLEX_BYTES)
-
-        def _compiled_live_set(tile_width):
-            tile_width = int(tile_width)
-            scan_increment = worst_process_resident_bytes(
-                gram_q0_tiled_from_psi_aot_resident_increment_bytes(
-                    mesh_xy=mesh_xy, nk=nk_, n_points=M_cols,
-                    nb_l=nb_left, nb_r=nb_right, nspinor=ns_,
-                    tile_width=tile_width, gamma_mode=gamma_mode,
-                    left_bands=left_slice,
-                )
-            )
-            facts = gram_scan_live_set_bytes(
-                resident_bytes=resident_bytes,
-                scan_resident_increment_bytes=scan_increment,
-                gram_matrix_local_bytes=gram_local_bytes,
-            )
-            facts["scan_increment"] = int(scan_increment)
-            return facts
-
-        # The sequential full-M path below still has the smaller WFN live set
-        # and wins whenever the cheap square-law screen selected it. Once the
-        # blocked route is entered, however, a full-width fused tile is valid
-        # if its exact compiled live set fits; stopping at M-1 forced two
-        # almost-full padded tiles per axis.
-        max_tile_width = M_cols
-        if not env_cb:
-            col_block, live_facts = _auto_gram_width_from_compiled_peaks(
-                col_block,
-                max_width=max_tile_width,
-                divisor=tile_divisor,
-                budget_bytes=target_bytes,
-                peak_for_width=_compiled_live_set,
-            )
-        else:
-            live_facts = _compiled_live_set(col_block)
-
-        if verbose:
-            square_gib = (
-                gram_col_block_bytes(nk_, ns_, col_block) / 2**30
-            )
-            local_gib = gram_col_block_device_bytes(
-                nk_, ns_, M_cols, col_block,
-                x_shards=n_x, y_shards=n_y,
-            ) / 2**30
-            ntiles, executed_extent, work_inflation = gram_tile_schedule(
-                M_cols, col_block)
-            print(
-                f"[pivoted_cholesky] 2-D blocked Gram: M={M_cols}, "
-                f"tile={col_block} ({ntiles}x{ntiles} tiles; "
-                f"executed_extent={executed_extent}, "
-                f"padded_work={work_inflation:.3f}x; "
-                f"{n_dev_total}-device path; {block_source}; "
-                f"square-law={square_gib:.2f} GiB global, "
-                f"pair-workspace model={local_gib:.2f} GiB/device; "
-                f"resident({'one shared' if same_window or left_slice else 'two'} "
-                f"WFN window(s); worst rank)="
-                f"{resident_bytes / 2**30:.2f}, "
-                f"compiled scan increment="
-                f"{live_facts['scan_increment'] / 2**30:.2f}, "
-                f"full-live peak={live_facts['peak'] / 2**30:.2f} "
-                f"of target={target_bytes / 2**30:.2f} GiB/device)"
-            )
-        G = _candidate_gram_zero_kernel(mesh_xy, M_cols)()
-
-        with timing.section("q0_sum.fused"):
-            G = gram_q0_tiled_from_psi_sm(
-                G, psi_l_rmuT_X, psi_l_rmu_Y,
-                psi_r_rmuT_X, psi_r_rmu_Y, kw,
-                mesh_xy=mesh_xy, tile_width=col_block,
-                gamma_mode=gamma_mode, left_bands=left_slice,
-            )
-            # Same Hermitian symmetrization the unblocked kernel applies,
-            # once, on the assembled square matrix.
-            G = _candidate_gram_hermitian_fold_kernel(mesh_xy)(G)
-            G.block_until_ready()
-        del psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
-        return G
-
-    with timing.section("left.pair"):
-        if left_slice is not None:
-            lo, hi = left_slice
-            P_l_k = pair_density(psi_r_rmuT_X[:, :, lo:hi, :],
-                                 psi_r_rmu_Y[:, lo:hi], mesh_xy)
-        else:
-            P_l_k = pair_density(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
-        P_l_k.block_until_ready()
-    del psi_l_rmu_Y, psi_l_rmuT_X
-
-    # ---- Right window ----
     if same_window:
-        P_r_k = P_l_k
-    else:
-        if left_slice is None:
-            with timing.section("right.load"):
-                psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-                    wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
-                    band_chunk_size=band_chunk_size,
-                    k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
-                )
-                if norms_r_j is not None:
-                    psi_r_rmu_Y = (
-                        psi_r_rmu_Y / norms_r_j[None, :, None, None])
-                    psi_r_rmuT_X = (
-                        psi_r_rmuT_X / norms_r_j[None, None, :, None])
-                psi_r_rmu_Y.block_until_ready()
-        with timing.section("right.pair"):
-            P_r_k = pair_density(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
-            P_r_k.block_until_ready()
-        del psi_r_rmu_Y, psi_r_rmuT_X
+        psi_r_rmu_Y, psi_r_rmuT_X = psi_l_rmu_Y, psi_l_rmuT_X
+    elif left_slice is None:
+        with timing.section("right.load"):
+            psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
+                wfn, sym, meta, cand_idx, bispinor, mesh_xy,
+                right_range,
+                band_chunk_size=band_chunk_size,
+                k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
+            )
+            if norms_r_j is not None:
+                psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
+                psi_r_rmuT_X = (
+                    psi_r_rmuT_X / norms_r_j[None, None, :, None])
+            psi_r_rmu_Y.block_until_ready()
 
-    # ---- q=0 Gram: sum_k w_k · Σ_{αβ} conj(P_l_k,αβ) · P_r_k,αβ ----
-    # γ̃ identity (charge channel) — open-spin Frobenius reduction.
-    with timing.section("q0_sum.sequential"):
-        G = candidate_gram_q0_from_pair(
-            P_l_k, P_r_k, kw, mesh_xy=mesh_xy,
-            gamma_mode=gamma_mode)
+    # A price over the budget warns and runs (TASTE 96): this rank's faces,
+    # the final fold's three local-Gram slots and the tile's pair densities.
+    faces = {id(arr): arr for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
+                                      psi_r_rmu_Y, psi_r_rmuT_X)
+             if arr is not None}
+    resident_bytes = sum(int(sh.data.nbytes) for arr in faces.values()
+                         for sh in arr.addressable_shards)
+    del faces
+    gram_local_bytes = (M_cols // n_x) * (M_cols // n_y) * _GRAM_COMPLEX_BYTES
+    tile_bytes = gram_col_block_device_bytes(
+        nk_, ns_, M_cols, col_block, x_shards=n_x, y_shards=n_y)
+    target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
+    price = resident_bytes + 3 * gram_local_bytes + tile_bytes
+    if price > target_bytes:
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("kmeans candidate Gram (faces, fold, tile)",
+                         price, target_bytes)
+    if verbose:
+        ntiles, executed_extent, work_inflation = gram_tile_schedule(
+            M_cols, col_block)
+        print(
+            f"[pivoted_cholesky] 2-D blocked Gram: M={M_cols}, "
+            f"tile={col_block} ({ntiles}x{ntiles} tiles; "
+            f"executed_extent={executed_extent}, "
+            f"padded_work={work_inflation:.3f}x; "
+            f"{n_dev_total}-device path; {block_source}; "
+            f"pair tiles={tile_bytes / 2**30:.2f}, "
+            f"faces={resident_bytes / 2**30:.2f}, "
+            f"price={price / 2**30:.2f} of "
+            f"target={target_bytes / 2**30:.2f} GiB/device)"
+        )
+    G = _candidate_gram_zero_kernel(mesh_xy, M_cols)()
+
+    with timing.section("q0_sum.fused"):
+        G = gram_q0_tiled_from_psi_sm(
+            G, psi_l_rmuT_X, psi_l_rmu_Y,
+            psi_r_rmuT_X, psi_r_rmu_Y, kw,
+            mesh_xy=mesh_xy, tile_width=col_block,
+            gamma_mode=gamma_mode, left_bands=left_slice,
+        )
+        # Same Hermitian symmetrization the unblocked kernel applies,
+        # once, on the assembled square matrix.
+        G = _candidate_gram_hermitian_fold_kernel(mesh_xy)(G)
         G.block_until_ready()
+    del psi_l_rmu_Y, psi_l_rmuT_X, psi_r_rmu_Y, psi_r_rmuT_X
     return G

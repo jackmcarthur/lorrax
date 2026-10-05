@@ -185,9 +185,7 @@ htransform Galerkin whole-state fit (`bandstructure.fh_interp`,
 deadlock): the ζ μ-batch planner (`gw.gflat_memory_model.plan_zeta_route_g`),
 the scalar shared-pole W-synthesis panel schedule (`gw.mpa.sigma`, parent and
 pole-column capacities from the ledger), the pair-convolution chunks
-(`gw.mixed_basis_pair_convolution._budget_target`), the kmeans candidate-Gram
-k batches and feature metric (`centroid.pivoted_cholesky`,
-`centroid.sampling_metric.build_feature_metric_diagonal`), the W-av stage
+(`gw.mixed_basis_pair_convolution._budget_target`), the W-av stage
 (`file_io.parallel_transport._write_w_av_stage`), the non-TDA BSE column
 chunk (`bse.bse_nontda.dense_col_chunk`), the head Γ GEMM route
 (`gw.shared_pole_head`) and the plane-wave screening route
