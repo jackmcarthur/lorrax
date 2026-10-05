@@ -2530,7 +2530,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             slope = gamma_add(slope, coefficient)
             value = gamma_add(value, head_update)
         if need_value and not partner:
-            if vertex is not None:
+            if vertex is not None and config.sigma_lorentz_debug_output:
+                # A receipt diagnostic nobody reads in production: 242 host syncs, 22 s per Ni 20^3 map.
                 _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
             for iq in range(q0,q1):
                 # Both censuses read only self-negative (TRIM) parents at real
