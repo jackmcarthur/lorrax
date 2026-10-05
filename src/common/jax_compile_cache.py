@@ -112,7 +112,8 @@ class _CacheState:
     """Per-process counters: the receipt (:func:`compile_cache_stats`)."""
 
     def __init__(self) -> None:
-        self._compile_event_lock = threading.Lock()
+        self._compile_event_lock = threading.RLock()
+        self._compile_current = None   # (module, key, request number) under the lock
         self.enabled = False
         self.dir = ""
         self.n_proc = 1
@@ -247,6 +248,9 @@ def _install_observation_patch() -> None:
 
 
 _COMPILE_ENTRY_POINT = "backend_compile_and_load"
+#: The ``jax._src.compiler`` entry point every compile request goes through,
+#: before the persistent-cache lookup.
+_COMPILE_REQUEST_POINT = "compile_or_get_cached"
 
 
 def _compile_module_identity(module) -> tuple[str, str, float]:
@@ -328,32 +332,7 @@ def _decode_compile_record(payload: bytes, rank: int) -> dict:
     return record
 
 
-def _snapshot_compile_records(client, prefix: str, n_proc: int,
-                              local_rank: int, local_record: dict) -> list:
-    """Best-effort all-rank snapshot (one directory get) for a refusal."""
-    from ffi.common.broadcast import rank_records
-
-    records: list[dict | None] = [None] * n_proc
-    try:
-        payloads = rank_records(client, prefix, n_proc)
-    except Exception:                                      # noqa: BLE001
-        payloads = [None] * n_proc
-    for rank, payload in enumerate(payloads):
-        if payload is None:
-            continue
-        try:
-            records[rank] = _decode_compile_record(payload, rank)
-        except Exception:                                  # noqa: BLE001
-            pass
-    records[local_rank] = local_record
-    return records
-
-
-def _format_compile_refusal(verdict: dict) -> str:
-    module_name = verdict.get("module", "<unknown-module>")
-    occurrence = verdict.get("occurrence", "?")
-    reason = verdict.get("reason", "compile-key disagreement")
-    records = verdict.get("records") or []
+def _format_compile_refusal(module_name, occurrence, reason, records) -> str:
     rank_lines = []
     for rank, record in enumerate(records):
         if record is None:
@@ -363,108 +342,74 @@ def _format_compile_refusal(verdict: dict) -> str:
                 f"rank {rank}: key={record.get('key', '<missing>')} "
                 f"module={record.get('module', '<missing>')!r}")
     return (
-        "GATE cross_rank_compile_agreement: REFUSED before XLA execution.\n"
-        f"  got: {reason}; stalled module {module_name!r}, occurrence "
+        "GATE cross_rank_compile_agreement: REFUSED before XLA compilation.\n"
+        f"  got: {reason}; module {module_name!r}, compile request "
         f"{occurrence}.\n"
         f"  rank keys: {'; '.join(rank_lines)}.\n"
-        "  want: every rank to present the same stable MLIR/HLO key before "
-        "any rank enters backend compilation.\n"
-        "  why: a rank-divergent GPU compile can enter collective autotuning "
-        "on only part of the world and hang silently.\n"
+        "  want: every rank to present the same stable MLIR/HLO key for the "
+        "same compile request.\n"
+        "  why: a rank-divergent program hangs silently in its next "
+        "collective (INVARIANTS 21).\n"
         "  fix: remove rank-conditional shapes/jits or make the emitted "
         "module identical; LORRAX_JAX_COMPILE_AGREEMENT=0 is an UNSAFE "
         "bisect-only opt-out.")
 
 
-def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
-                                 *, client=None, n_proc: int | None = None,
-                                 proc_idx: int | None = None,
-                                 timeout_s: float | None = None) -> None:
-    """Exchange one compile fingerprint and refuse divergence or absence."""
-    from ffi.common.broadcast import (
-        collect_rank_records, publish_rank_record, wait_for_key)
-
+def _publish_compile_record(module_name: str, key: str, occurrence: int) -> None:
+    """Every rank, on every compile request (a cache hit included): its fingerprint."""
+    from ffi.common.broadcast import publish_rank_record
     s = _STATE
-    client = s._compile_client if client is None else client
-    n_proc = int(s.n_proc if n_proc is None else n_proc)
-    proc_idx = int(s.proc_idx if proc_idx is None else proc_idx)
-    timeout_s = float(
-        s.compile_agreement_timeout_s if timeout_s is None else timeout_s)
-    prefix = _compile_event_prefix(occurrence)
-    record = {
-        "rank": proc_idx,
-        "module": module_name,
-        "occurrence": occurrence,
-        "key": key,
-    }
-    t0 = time.monotonic()
-    publish_rank_record(client, prefix, proc_idx, n_proc,
+    record = {"rank": s.proc_idx, "module": module_name,
+              "occurrence": occurrence, "key": key}
+    publish_rank_record(s._compile_client, _compile_event_prefix(occurrence),
+                        s.proc_idx, s.n_proc,
                         json.dumps(record, sort_keys=True).encode("utf-8"))
-    if proc_idx == 0:
-        reason = ""
-        try:
+
+
+def _check_compile_record(module_name: str, key: str, occurrence: int) -> None:
+    """A rank about to compile: refuse by name if any rank's record differs.
+
+    Rank 0 reads every rank's record for this request (they all publish,
+    whether they hit or compile, so nobody is waited on for a compile it
+    never does); a peer reads rank 0's. A rank that hits the cache checks
+    nothing and waits for nothing, so an asymmetric hit costs it nothing
+    and the compiling ranks one exchange. With no deadline (the default)
+    the wait names a missing rank every 60 s.
+    """
+    from ffi.common.broadcast import collect_rank_records, wait_for_key
+    s = _STATE
+    prefix = _compile_event_prefix(occurrence)
+    timeout_s = s.compile_agreement_timeout_s
+    t0 = time.monotonic()
+    reason = ""
+    try:
+        if s.proc_idx == 0:
             payloads = collect_rank_records(
-                client, prefix, n_proc, _timeout_ms(timeout_s),
-                what=f"every rank to reach the {module_name} compile")
+                s._compile_client, prefix, s.n_proc, _timeout_ms(timeout_s),
+                what=f"every rank's record of the {module_name} compile request")
             records = [_decode_compile_record(payload, rank)
                        for rank, payload in enumerate(payloads)]
-        except Exception as exc:                            # noqa: BLE001
-            records = _snapshot_compile_records(
-                client, prefix, n_proc, proc_idx, record)
-            missing = [rank for rank, item in enumerate(records)
-                       if item is None]
-            reason = (
-                f"rank(s) {missing} did not arrive within {timeout_s:g} "
-                f"seconds ({type(exc).__name__})")
-        keys = {item["key"] for item in records if item is not None}
-        modules = {item.get("module") for item in records if item is not None}
-        passed = len(records) == n_proc and None not in records \
-            and len(keys) == 1 and modules == {module_name}
-        if not passed and not reason:
-            reason = "ranks published different stable MLIR/HLO keys"
-        verdict = {
-            "passed": passed,
-            "module": module_name,
-            "occurrence": occurrence,
-            "reason": reason,
-            "records": records,
-        }
-        client.key_value_set_bytes(
-            f"{prefix}/verdict",
-            json.dumps(verdict, sort_keys=True).encode("utf-8"))
-    else:
-        # A peer may reach this slot nearly one full deadline before rank 0;
-        # rank 0 may then legitimately consume its own full deadline waiting
-        # for the last rank.  Therefore an early peer needs two intervals plus
-        # a small handoff allowance.  Anything shorter can time out a peer
-        # milliseconds before rank 0 publishes a passing verdict, leaving the
-        # remaining ranks to enter a collective without it (measured on the Si
-        # MPA P4 path, JID 57909046.123).
-        handoff_s = min(2.0, max(0.1, timeout_s * 0.1))
-        peer_wait_s = 2.0 * timeout_s + handoff_s if timeout_s > 0 else 0.0
-        try:
+        else:
+            # An early peer may wait nearly a whole deadline for rank 0, so a
+            # finite deadline is doubled with a handoff allowance.
+            peer_wait_s = 2.0 * timeout_s + min(2.0, max(0.1, timeout_s * 0.1)) if timeout_s > 0 else 0.0
             payload = wait_for_key(
-                client, f"{prefix}/verdict", _timeout_ms(peer_wait_s),
-                what=f"rank 0's verdict on the {module_name} compile")
-            verdict = json.loads(payload.decode("utf-8"))
-        except Exception as exc:                            # noqa: BLE001
-            records = _snapshot_compile_records(
-                client, prefix, n_proc, proc_idx, record)
-            verdict = {
-                "passed": False,
-                "module": module_name,
-                "occurrence": occurrence,
-                "reason": (
-                    f"rank 0 published no verdict within "
-                    f"{peer_wait_s:g} seconds "
-                    f"({type(exc).__name__})"),
-                "records": records,
-            }
-
+                s._compile_client, f"{prefix}/rank/0", _timeout_ms(peer_wait_s),
+                what=f"rank 0's record of the {module_name} compile request")
+            records = [_decode_compile_record(payload, 0)]
+    except CompileAgreementError:
+        raise
+    except Exception as exc:                               # noqa: BLE001
+        records, reason = [], (f"a rank's record did not arrive within the "
+                               f"deadline ({type(exc).__name__}: {exc})")
     s.compile_agreement_checks += 1
     s.compile_agreement_secs += time.monotonic() - t0
-    if not verdict.get("passed"):
-        raise CompileAgreementError(_format_compile_refusal(verdict))
+    if not reason and any(r.get("key") != key or r.get("module") != module_name
+                          for r in records):
+        reason = "ranks published different stable MLIR/HLO keys"
+    if reason:
+        raise CompileAgreementError(
+            _format_compile_refusal(module_name, occurrence, reason, records))
 
 
 def _configure_compile_agreement() -> None:
@@ -611,51 +556,53 @@ def _fit_gate_notice(msg: str) -> None:
 
 
 def _install_compile_counter() -> None:
-    """Count real XLA compiles so the storm is measurable, warm vs cold.
+    """Count real XLA compiles and run the compile agreement around them.
 
-    Raises :class:`_JaxSurfaceUnsupported` when
-    :data:`_COMPILE_ENTRY_POINT` is absent, so the caller can report that the
-    storm telemetry is OFF rather than leave
-    ``compile_cache_stats()['compiles']`` reading a confident 0.  That is a
-    refusal, not a compatibility branch: there is no second entry point left
-    to silently prefer.
+    ``compile_or_get_cached`` is every compile request (the persistent-cache
+    lookup included) and ``backend_compile_and_load`` every real compile;
+    both are module attributes of ``jax._src.compiler`` on the supported
+    0.9.1 wheel. A request publishes this rank's fingerprint under its
+    global request number; a real compile checks the other ranks' records
+    (:func:`_check_compile_record`). One lock keeps a process's requests in
+    one order, so request numbers agree across ranks that request the same
+    programs in the same order (INVARIANTS 21).
+
+    Raises :class:`_JaxSurfaceUnsupported` when an entry point is absent, so
+    the caller reports the storm telemetry OFF instead of a confident 0.
     """
     from jax._src import compiler as _compiler
 
     if getattr(_compiler, "_lorrax_compile_counter_installed", False):
         return
+    for name in (_COMPILE_ENTRY_POINT, _COMPILE_REQUEST_POINT):
+        if getattr(_compiler, name, None) is None:
+            raise _JaxSurfaceUnsupported(
+                f"jax._src.compiler has no {name} on this jax "
+                f"({_jax_generation()}): no entry point to count real XLA "
+                f"compiles at (jax 0.5.3 spelled it backend_compile; that "
+                f"line was dropped with the move to jax 0.7.0).")
+    _orig = getattr(_compiler, _COMPILE_ENTRY_POINT)
+    _orig_request = getattr(_compiler, _COMPILE_REQUEST_POINT)
 
-    name = _COMPILE_ENTRY_POINT
-    if getattr(_compiler, name, None) is None:
-        raise _JaxSurfaceUnsupported(
-            f"jax._src.compiler has no {name} on this jax "
-            f"({_jax_generation()}) — no entry point left to count real XLA "
-            f"compiles at.  jax 0.5.3 spelled it backend_compile; support for "
-            f"that line was dropped when the GPU leg moved to jax 0.7.0.")
-    _orig = getattr(_compiler, name)
+    def _requested(*args, **kwargs):
+        if not _STATE.compile_agreement_enabled:
+            return _orig_request(*args, **kwargs)
+        module = args[1] if len(args) > 1 else kwargs.get("computation")
+        module_name, key, fingerprint_secs = _compile_module_identity(module)
+        _STATE.compile_fingerprint_secs += fingerprint_secs
+        with _STATE._compile_event_lock:
+            occurrence = _STATE._compile_sequence
+            _STATE._compile_sequence += 1
+            _publish_compile_record(module_name, key, occurrence)
+            _STATE._compile_current = (module_name, key, occurrence)
+            try:
+                return _orig_request(*args, **kwargs)
+            finally:
+                _STATE._compile_current = None
 
     def _counting(*args, **kwargs):
-        if _STATE.compile_agreement_enabled:
-            module = args[1] if len(args) > 1 else kwargs.get("module")
-            module_name, key, fingerprint_secs = _compile_module_identity(
-                module)
-            _STATE.compile_fingerprint_secs += fingerprint_secs
-            # JAX may ask host threads to lower independent modules at once.
-            # Keep each process's exchange *and backend entry* in one order;
-            # otherwise a later local thread can overtake a module whose
-            # all-rank agreement just passed.  The slot is global across
-            # module names, so another rank choosing a different first module
-            # refuses with both names instead of approving both out of order.
-            with _STATE._compile_event_lock:
-                occurrence = _STATE._compile_sequence
-                _STATE._compile_sequence += 1
-                _agree_before_module_compile(module_name, key, occurrence)
-                t0 = time.monotonic()
-                try:
-                    return _orig(*args, **kwargs)
-                finally:
-                    _STATE.compiles += 1
-                    _STATE.compile_secs += time.monotonic() - t0
+        if _STATE.compile_agreement_enabled and _STATE._compile_current is not None:
+            _check_compile_record(*_STATE._compile_current)
         t0 = time.monotonic()
         try:
             return _orig(*args, **kwargs)
@@ -663,8 +610,10 @@ def _install_compile_counter() -> None:
             _STATE.compiles += 1
             _STATE.compile_secs += time.monotonic() - t0
 
-    setattr(_compiler, name, _counting)
+    setattr(_compiler, _COMPILE_REQUEST_POINT, _requested)
+    setattr(_compiler, _COMPILE_ENTRY_POINT, _counting)
     _compiler._lorrax_compile_counter_installed = True
+
 
 
 def _report() -> None:

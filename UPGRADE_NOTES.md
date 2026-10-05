@@ -17,7 +17,16 @@ divergent hit/miss pattern now costs the missing rank one compile. What
 remains: the default location and namespace, threshold 0, JAX's per-fusion
 XLA caches off at P > 1, rank 0's age pruner, the cross-rank compile
 agreement (a rank lowering a different program is still refused by name),
-the device-fit gate and the compile receipt. 2560 → about 1000 lines.
+the device-fit gate and the compile receipt. 2560 → 960 lines.
+- The compile agreement's protocol changed with it. Every rank now
+  publishes its module fingerprint on every compile request, a cache hit
+  included, and only a rank that actually compiles reads the others' (rank
+  0 reads all, a peer reads rank 0's). Before, only compiling ranks
+  published and rank 0 collected a verdict, so a rank that hit an entry
+  its peers were compiling left them waiting forever (measured on CPU at
+  P2: 300 s, named every 60 s); the frozen agreed set existed to make
+  that impossible. An asymmetric hit now costs nothing; a warm run pays
+  one KV set per program per rank.
 - Environment: `LORRAX_JAX_CACHE_MULTIPROCESS`, `_INVARIANT_KEY`,
   `_SHARD_SLICE`, `_AGREE_TIMEOUT_S`, `_STRICT`, `_PREFETCH`,
   `_PREFETCH_THREADS`, `_FORCE_DIVERGE`, `_NO_AGREE` and `_KEYDUMP` are
