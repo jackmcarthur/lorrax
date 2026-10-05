@@ -391,7 +391,8 @@ cube (and, when present, the odd cube and the raw twin's N₃ band-diagonal
 slots) through SlabIO from their own shards, then the head
 diagonal, band-extrapolation payload and band axis, then a commit digest. A
 rerun with `restart = true` whose identity matches (the W model's digest and
-identity, the energies Σ is read at, the ω grid, every sweep option) goes
+identity, the energies Σ is read at, the ω grid, every sweep option, and
+the band-extrapolation bracket plan, `gw.sigma_dispatch`) goes
 straight to finalize; any other file is removed, named in one WARNING line,
 and the sweep recomputed. It covers one-shots only: an SC rerun starts at
 map 0, retention deletes later maps, and map 0's sweep plans the Σ windows

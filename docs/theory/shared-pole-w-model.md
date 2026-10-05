@@ -619,6 +619,9 @@ The retained rank is the smaller of
 1. the **natural rank**: equilibrated-Gram directions with
    $\gamma>10^{-8}\gamma_{\max}$ at the recipe's direction widths; and
 2. the **pole budget** $\lceil1.8\,N_\mu\rceil$, largest first, per parent.
+   The cut never splits a degenerate multiplet: a member tied to its
+   neighbour below the cut leaves with it, so $K$ can sit a few below the
+   budget at a high-symmetry parent (`gw.shared_pole_reduction`).
 
 Where the port-space spectrum is rich the budget binds; where it cuts first
 the natural rank does. $K/N_\mu$ alone does not say which.
