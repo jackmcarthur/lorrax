@@ -522,18 +522,20 @@ def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh, n_right=None):
     return tile, panels
 
 
-def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles, plan=None):
+def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles, kgrid,
+                     plan=None):
     """The block size ``d`` (a divisor of ``ns``): a parent-row Σ convolution stores its output in (ns/d)² x blocks.
 
     New per rank beside what is live: the parent Green ``T_p``, ``partner_tiles`` more of
     it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
     the widest stored x block ``T_p·xn·bx/μ_x`` (``(d/ns)²`` of it up to a row per slab
     piece, :func:`sigma_row_blocks`), the full-k W(τ) out of the k-convolution
-    ``16·N_k·μ²/P``, and the panels of the Green and partner builds ``2·M_axis``.  The
+    ``16·N_k·μ²/P``, the panels of the Green and partner builds ``2·M_axis`` and mode 7's
+    run-time scratch for that block (:func:`sigma_kconv_scratch`).  The
     stored x block is the tiled part: the largest ``d`` whose block fits the fixed tile
     (``runtime.tiles.TILE_BYTES``) wins, else 1, so every process computes the same
     ``d`` from the shapes alone.  ``plan`` (a dict) receives ``d``, the pass's new
-    bytes and the tile, for the compiled check of the window executable
+    bytes, its scratch and the tile, for the compiled check of the window executable
     (``gw.mpa.sigma.SynthesisTau.admit``).
     """
     if int(ns) <= 1:
@@ -544,18 +546,21 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     from runtime.tiles import TILE_BYTES
     mx = int(n_rmu) // int(mesh.shape['x'])
 
-    def frac(d):
+    def rows(d):
         b = sigma_row_blocks(n_rmu=n_rmu, ns=ns, d=d, mesh=mesh)[0]
-        return 1.0 if b is None else b[1] * b[3] / mx
-    new = lambda d: ((1.0 + float(partner_tiles) + frac(d)) * tile + w_tau
-                     + (1.0 + float(partner_tiles)) * panels)
+        return mx if b is None else b[1] * b[3]
+    scratch = lambda d: sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=rows(d), mesh=mesh,
+                                            n_right=int(n_rmu) // int(mesh.shape['y']))
+    new = lambda d: ((1.0 + float(partner_tiles) + rows(d) / mx) * tile + w_tau
+                     + (1.0 + float(partner_tiles)) * panels + scratch(d))
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
-    d = next((d for d in divisors if frac(d) * tile <= TILE_BYTES), 1)
+    d = next((d for d in divisors if rows(d) / mx * tile <= TILE_BYTES), 1)
     from common.gpu_utils import record_stage_price
     record_stage_price(f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", new(d),
                        section="sigma.tau_sweep")
     if plan is not None:
-        plan.update(d=int(d), ns=int(ns), new=float(new(d)), tile=float(TILE_BYTES))
+        plan.update(d=int(d), ns=int(ns), new=float(new(d)), scratch=int(scratch(d)),
+                    tile=float(TILE_BYTES))
     return d
 
 
@@ -569,6 +574,16 @@ def chi0_kconv_scratch(*, kgrid, n_parent, n_rmu, ns, mesh, n_right=None):
     tile, _ = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=0, mesh=mesh,
                            n_right=n_right)
     return F.chi_unfold_scratch_bytes(kgrid, ns, int(tile))
+
+
+def sigma_kconv_scratch(*, kgrid, ns, rows, n_right, mesh):
+    """Per-rank run-time scratch of one mathdx mode-7 Σ call storing ``rows`` local μ rows
+    of ``n_right`` local ν: the bound owned by ``ffi.fft.klead_unfold_scratch_bytes``;
+    0 on the single arm and off the mathdx backend."""
+    from ffi import fft as F
+    if F.kconv_backend(mesh) != "mathdx":
+        return 0
+    return F.klead_unfold_scratch_bytes(kgrid, ns, int(rows) * int(n_right))
 
 
 def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner, kgrid):

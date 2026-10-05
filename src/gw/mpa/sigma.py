@@ -1195,6 +1195,10 @@ class SynthesisTau:
         self._spatial, self._synthesis = spatial, synthesis
         self.overlap = bool(overlap)
         self._right = (right_yr, right_proj)
+        # Mode 7's run-time split-arm scratch (the pass plan's ``scratch``) is outside the
+        # compiled figure, so it joins the native workspace of every check.
+        from gw.ppm_tau_kernel import sigma_pass_price
+        native += int((sigma_pass_price(spatial) or {}).get("scratch", 0))
         self._native, self._stage, self._meta = native, stage, meta
         self._key, self._plans = key, plans
         self._kconv_tables = kconv_tables

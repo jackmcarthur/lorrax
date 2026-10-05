@@ -173,7 +173,7 @@ def get_sigma_spatial_kernel(
     price = {}
     d = sigma_spin_block(n_parent=k_unfold_plan.n_parent, n_rmu=int(face_shape[2]), ns=ns,
                          n_full=nk_tot, n_band=int(face_shape[1]), mesh=mesh_xy,
-                         partner_tiles=partner_tiles, plan=price)
+                         partner_tiles=partner_tiles, kgrid=kgrid, plan=price)
     unfold_conv = make_kconv_klead_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
                                           store_rows=k_unfold_plan.parent_full_rows,
                                           norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
@@ -320,7 +320,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead_unfold
     from distrib_la import gemm_plan
     from runtime.tiles import TILE_BYTES
-    from .greens_function_kernel import build_G_tau, has_antiunitary_rows
+    from .greens_function_kernel import build_G_tau, has_antiunitary_rows, sigma_kconv_scratch
     from .subtile_stream import (GREEN_ROWS_SPEC, orbit_cuts, plan_windows, projection_complete,
                                  scan_passes, window_green_rows, window_load, window_rows,
                                  window_tables)
@@ -369,8 +369,9 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     # ψ rows and columns, the projection faces, and the Green's right operand (one copy of the
     # columns, formed once per node).
     psi_bytes = 16 * n_parent * ns * ((nb + nb_sig) * (local_rows + nu) + nb * nu)
-    price = dict(d=ns, ns=ns, passes=len(windows), tile=float(TILE_BYTES),
-                 new=float(R * row_bytes + psi_bytes))
+    scratch = sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=R, n_right=nu, mesh=mesh_xy)
+    price = dict(d=ns, ns=ns, passes=len(windows), tile=float(TILE_BYTES), scratch=int(scratch),
+                 new=float(R * row_bytes + psi_bytes + scratch))
     from common.gpu_utils import record_stage_price
     # A static node is priced in its caller's section (Σ exchange, static COHSEX).
     label = "Sigma static" if static else "Sigma tau"

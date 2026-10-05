@@ -162,6 +162,7 @@ __all__ = [
     "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
     "KCONV_PLANE_TARGET",
     "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET",
+    "klead_unfold_scratch_bytes",
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET", "live_row_mask",
     "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET", "chi_unfold_refusal",
@@ -2199,6 +2200,27 @@ def chi_unfold_scratch_bytes(kgrid, ns: int, tile_bytes: int, optin: int | None 
     single = have is not None and grp * (((nx * ny * (nz | 1)) | 1) * 16) <= have
     per_pair = nx * ny * nz * grp * 16
     return 0 if single else max(per_pair, min(int(tile_bytes), 1 << 30))
+
+
+def klead_unfold_scratch_bytes(kgrid, ns: int, pairs: int, optin: int | None = None) -> int:
+    """Per-rank bytes one mode-7 call (:func:`make_kconv_klead_unfold`) draws from XLA's
+    scratch allocator at run time, for ``pairs`` stored (μ, ν) pairs of the whole spin group.
+
+    The handler's build() takes a split arm when a block cannot hold a spin group of two or
+    more columns: the group's ``ns²`` columns of ``16·((nx·ny·(nz|1))|1)`` B exceed the
+    opt-in shared memory, or (``ns = 1``) four columns do.  The split arm chunks the pairs
+    through an ``(N_k, chunk·ns²)`` intermediate of at most 1 GiB and at least one pair; the
+    single arm draws none.  A runtime allocation: compiled ``memory_analysis()`` does not
+    count it, so callers price it.
+    """
+    nx, ny, nz = (int(v) for v in kgrid)
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    grp = int(ns) * int(ns)
+    col = grp * (((nx * ny * (nz | 1)) | 1) * 16)
+    if have is not None and col <= have and (grp > 1 or 4 * col <= have):
+        return 0
+    per_pair = nx * ny * nz * grp * 16
+    return max(1, min(int(pairs), (1 << 30) // per_pair)) * per_pair
 
 
 def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bool,

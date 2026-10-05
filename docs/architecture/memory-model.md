@@ -168,10 +168,14 @@ rank beside what is live:
 ```text
 χ₀ node   = 2·(1 + partner)·(T_p + M_panel) + 16·n_out·N_k·μ²/P + S_11   nothing chunks
 Σ(τ) row  = 16·[(2 + partner)·n_par·n_s²·ν + N_k·ν + 2·n_q,irr·ν + n_par·n_s·(N_b + 2·N_bΣ)]
+Σ(τ) pass = R·(Σ(τ) row) + ψ + S_7
 ```
 
 `S_11` is mode 11's split-arm scratch, at most one `T_p`
 (`greens_function_kernel.chi0_kconv_scratch`); it is 0 on the single pass.
+`S_7` is mode 7's, `min(R·ν, ⌊1 GiB / 16·N_k·n_s²⌋)` pairs of `16·N_k·n_s²` B,
+at most 1 GiB (`greens_function_kernel.sigma_kconv_scratch`); it is 0 on the
+single arm (bulk grids below about 14³ at n_s = 1 or 2).
 
 The q-wedge Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
 rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
@@ -338,7 +342,7 @@ temporaries is compiled once at map 0 and never runs (Fe 8³: 2.3 s cold,
 | stage | chunk | compiled figure available | what it misses (priced elsewhere) |
 |---|---|---|---|
 | response direct stream (`gw.response_bank`) | samples per group | yes: temporaries | the donated carry (an argument), mode 11's split-arm scratch (`chi0_kconv_scratch`) |
-| Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | row pass | yes: the first window executable | the synthesis GEMM's native workspace (added); the passes are not re-solved |
+| Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | row pass | yes: the first window executable | the synthesis GEMM's native workspace and mode 7's split-arm scratch `S_7` (added); the passes are not re-solved |
 | ζ μ batch (`gw.isdf_fitting`, route G) | centroids per owner | yes: the batch executable, which the loop then runs | the lookahead batch's rows (its output, added) |
 
 The direct stream's group is the one shared-pole size that follows the
