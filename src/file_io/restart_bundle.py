@@ -2428,17 +2428,23 @@ def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
     return out
 
 
-def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, vnl_velocity_sign):
+def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, vnl_velocity_sign, hubbard=None):
     """``[(stamp, file value, run value)]`` for the velocity-operator stamps of
     ``dipole.h5`` that differ from the run's; an absent stamp counts as different
-    (the operator that built the file cannot be named).  Empty when all agree."""
+    (the operator that built the file cannot be named).  ``hubbard`` (``'none'``
+    or ``psp.hubbard_ops``' JSON) joins them when given; an absent
+    ``prov_hubbard`` predates V_U and reads as ``'none'``.  Empty when all agree."""
     from psp.get_dipole_mtxels import _prov_ne
     want ={"prov_skip_vnl": skip_vnl, "prov_vnl_mode": vnl_mode,
             "prov_vnl_velocity_sign": vnl_velocity_sign}
     with h5py.File(str(path), "r") as h5:
-        attrs = {k: h5.attrs[k] for k in want if k in h5.attrs}
-    return [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
-            if k not in attrs or _prov_ne(attrs[k], v)]
+        attrs = {k: h5.attrs[k] for k in (*want, "prov_hubbard") if k in h5.attrs}
+    bad = [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
+           if k not in attrs or _prov_ne(attrs[k], v)]
+    got_hub = attrs.get("prov_hubbard", "none")
+    if hubbard is not None and _prov_ne(got_hub, str(hubbard)):
+        bad.append(("prov_hubbard", got_hub, hubbard))
+    return bad
 
 
 def load_kin_ion_submatrix(

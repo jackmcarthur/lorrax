@@ -388,26 +388,33 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     """Was ``dipole.h5`` built from THIS DFT solution, THIS band window and THIS velocity operator?; see docs/theory/bispinor-gw.md#head.
 
     The velocity operator (V_NL included, the analytic arm, the deck's
-    resolved ``vnl_velocity_sign``) is REFUSED by name on a mismatch, whatever
-    ``LORRAX_SANITY`` says, as the SC and full heads refuse it
-    (``qsgw_head.read_authenticated_dipole_velocity``): a missing or flipped
-    i[r, V_NL] changes S(ω) by tens of percent (31 % in Si ε₀₀) and leaves the
-    file's shape intact.  The WFN and band-window stamps go through
+    resolved ``vnl_velocity_sign``, the DFT+U i[r, V_U] stamp) is REFUSED by
+    name on a mismatch, whatever ``LORRAX_SANITY`` says, as the SC and full
+    heads refuse it (``qsgw_head.read_authenticated_dipole_velocity``): a
+    missing or flipped i[r, V_NL] changes S(ω) by tens of percent (31 % in Si
+    ε₀₀), a missing i[r, V_U] by ~5 % of |v_cv| (VI3, U = 6 eV), and either
+    leaves the file's shape intact.  The WFN and band-window stamps go through
     ``common.sanity`` as before.
     """
+    import os
     from common import sanity
     from file_io.restart_bundle import (
         check_dipole_provenance,
         dipole_operator_mismatches,
     )
     from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
+    from psp.hubbard_ops import hubbard_provenance_for
 
     nval, ncond, nband = _dipole_window_from_params(params, wfn)
     operator = dict(
         skip_vnl=False, vnl_mode="analytic",
         vnl_velocity_sign=resolve_vnl_velocity_sign(
             None, params.get("vnl_velocity_sign", "")))
-    bad = dipole_operator_mismatches(dipole_path, **operator)
+    hubbard = hubbard_provenance_for(
+        params.get("hubbard_input", ""), params.get("hubbard_occupations", ""),
+        wfn=wfn, base_dir=os.path.dirname(os.path.abspath(dipole_path)),
+        caller="gw.head_correction dipole")
+    bad = dipole_operator_mismatches(dipole_path, hubbard=hubbard, **operator)
     if bad:
         detail = "; ".join(f"{k}: file={got!r} run={want!r}"
                            for k, got, want in bad)
@@ -415,24 +422,16 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
             "GATE static_head_dipole_operator: the q->0 head received a "
             "dipole built with a different velocity operator.\n"
             f"  got:  dipole_file = {str(dipole_path)!r}; {detail}\n"
-            "  want: p - i[r, V_NL], analytic arm, the deck's "
-            "vnl_velocity_sign (regenerate with python -m "
+            "  want: p - i[r, V_NL] (+ i[r, V_U] on a DFT+U deck), analytic "
+            "arm, the deck's vnl_velocity_sign (regenerate with python -m "
             "psp.get_dipole_mtxels -i <deck>)\n"
-            "  why:  S(omega) would lack or flip the nonlocal commutator "
+            "  why:  S(omega) would lack or flip a nonlocal commutator "
             "while the file keeps its shape")
     if not sanity.sanity_enabled():
         return
-    expected_bispinor = params.get("_charge_bispinor")
-    import os
-    from psp.hubbard_ops import hubbard_provenance_for
-    expected_hubbard = hubbard_provenance_for(
-        params.get("hubbard_input", ""), params.get("hubbard_occupations", ""),
-        wfn=wfn, base_dir=os.path.dirname(os.path.abspath(dipole_path)),
-        caller="gw.head_correction dipole")
     check_dipole_provenance(
         dipole_path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
-        bispinor=expected_bispinor, print_fn=print_fn,
-        hubbard=expected_hubbard, **operator)
+        bispinor=params.get("_charge_bispinor"), print_fn=print_fn, **operator)
 
 
 def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> HeadSample:
