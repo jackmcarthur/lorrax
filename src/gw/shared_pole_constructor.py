@@ -111,7 +111,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         from common.staged_reshard import face_to_batch_reshard
         from gw.shared_pole_local import (batch_to_face, canonical_factors, check_round, face_rows,
                                           own_extent_receipts, reduce_round, round_tables,
-                                          recipe_panel_widths, recipe_infinity_width, pad_states)
+                                          recipe_panel_widths, recipe_infinity_width, pad_states,
+                                          carrier_history)
         from gw.shared_pole_capacity import round_padding_output_bytes
         from gw.shared_pole_recipe import (
             build_construction_row, charge4_gates, construction_receipt,
@@ -281,17 +282,19 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]
             budget.retained_panels = tuple(factors)
             budget.batch_width = len(ids)
-            # Every state panel is padded to its recipe carrier and the pencil
-            # extent is their capacity (round_tables), so the side is the same
-            # in every round and SC map: one reduction program per route. The
-            # table is host metadata, known before any panel is allocated.
+            # Every state panel is padded to its recipe carrier, so the round
+            # program's inputs have one shape; the pencil extent is grow-only
+            # over this model's rounds and SC maps (round_tables): discovered
+            # in map 0, held from map 1. The table is host metadata, known
+            # before any panel is allocated.
             widths = recipe_panel_widths(round_roles[0], round_states, recipe,
                                          column_extent=column_extent, logical_n=logical_n)
             infinity_width = recipe_infinity_width(infinity, recipe, column_extent=column_extent,
                                                    logical_n=logical_n)
             tables = round_tables(
                 round_counts, widths, [st[0] for st in round_states], infinity_counts, infinity_width,
-                column_extent=column_extent, ordered=ordered, odd_moments=odd_moments)
+                column_extent=column_extent, ordered=ordered, odd_moments=odd_moments,
+                key=("scalar", logical_n, ordered, odd_moments), history=carrier_history(meta))
             side = int(tables["active"].shape[-1])
             # Resolve before either reduction program is traced; the ledger
             # warns when the route price is over the budget.

@@ -190,32 +190,34 @@ it was traced with. No deck or environment change; results do not move.
   every CC, TT, CT and held program, about 120 s cold and 30 s warm per
   leg). A padded tail costs no measurable time: the width-1 round already
   took as long as a width-3 round.
-- **Pencil extent fixed before the first round.** Every state panel and the
-  infinity block are padded to their recipe carriers (`recipe_panel_widths`,
-  `recipe_infinity_width`: the imaginary width, the line cap, Q's carrier
-  for a partner, the infinity width; a selection closed over a multiplet
-  past its width keeps its own, wider carrier, as a metal's M1 directions
-  do) and `round_tables` sizes the pencil at those panels' capacity, the
-  same in every round and SC map. Before,
-  the extent followed the largest selection seen so far and grew parent by
-  parent in map 0 (CrI3 24×24: CC side 6976 → 11072 → 15168 → 17472, TT
-  7424 → 24832 in five steps; eight recompiles of the CC, TT and CT programs
-  and their eigh stacks, about 220–270 s cold per chain or one-shot) and
-  reached the same capacity anyway, so maps 1 and later and every warm leg
-  run the same sides as before. In map 0 the early rounds now solve the
-  full-side pencil: on CrI3 24×24 P64 that is about 160 s of extra eigh
-  time if the pencil eigh is the round's cost, against the recompiles it
-  removes. The local ordered round's kept span sits on its pole budget, as
-  the face round's does; the grown-then-rerun Ritz rung is gone.
+- **Round inputs on recipe carriers; the pencil extent grows in map 0 and
+  holds from map 1.** Every state panel and the infinity block are padded
+  to their recipe carriers (`recipe_panel_widths`, `recipe_infinity_width`:
+  the imaginary width, the line cap, Q's carrier for a partner, the infinity
+  width; a selection closed over a multiplet past its width keeps its own,
+  wider carrier, as a metal's M1 directions do), so a round program's inputs
+  have one shape. The pencil extent (`round_tables`) is the carrier of the
+  largest selection, grow-only across the model's rounds and SC maps: the
+  partner (TRS-odd) counts have no bound below the panels' capacity, and a
+  pencil at that capacity costs the eigh (capacity / high water)^3 on every
+  round of every map (CrI3 24×24 P64: CC 20800 against 17472, TT 32000
+  against 24832, +616 s per map, measured), so the extent is discovered in
+  map 0 (CrI3: eight growths, about 250 s of recompiles once per chain) and
+  held from map 1. The local ordered round's kept span sits on its pole
+  budget, as the face round's does; the grown-then-rerun Ritz rung is gone.
 - **Face batch from map 0's sides (BISPPERF lever 1, owner 2026-10-05).**
   From SC map 1 on, the bispinor sectors' face batch is sized at the CC and
   TT pencil sides and CT span widths the session recorded in map 0
   (`sized_sector_sides`), not at the recipe bound (CrI3 24×24: CC 17472
   against 20800, TT 24832 against 32000, spans at the held widths against
   2 × the pole budget). More parents fit one round, so the sector stage
-  runs fewer rounds; predicted −1000 to −1500 s per CrI3 24×24 map at P64.
-  Map 0 and a one-shot keep the bound. The receipt's `face_batch` row now
-  carries `sized_pencil_sides` and `sized_cross_spans`.
+  runs fewer rounds (CrI3 24×24 P64, held spans alone: batch 3 → 5, about
+  −9 % per parent). Map 0 and a one-shot keep the bound. When the map-0
+  receipt shows that no wider batch can fit at the held sides (program bytes
+  scale with the side squared), the second sizing pass is skipped and map
+  0's batch kept. The decision prints when it is made: `Shared-pole face
+  batch: N parent(s) of nq at pencil sides ...`. The receipt's `face_batch`
+  row carries `sized_pencil_sides` and `sized_cross_spans`.
 - **Deleted.** `grow_round`, the carrier/extent/Ritz histories (the session's
   `shared_pole_carriers` now holds only the writer widths), the reduction
   preview/admit closures and the "selection exceeds its held carrier" log

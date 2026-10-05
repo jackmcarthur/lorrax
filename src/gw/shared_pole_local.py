@@ -201,7 +201,7 @@ def pad_states(states, widths, infinity, infinity_width):
 
 
 def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, column_extent, ordered,
-                 odd_moments):
+                 odd_moments, key=None, history=None):
     """Host column tables of one round: each slot's states packed into its pencil columns.
 
     ``counts`` int [P, A] retained widths per slot and state, ``widths`` the A
@@ -210,9 +210,19 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     ``infinity_width``] infinity panels. A state keeps its carrier
     ``column_extent(count)`` with the inert tail inside, as a per-parent pack
     does; each slot is compacted in state order and padded with zero columns to
-    the round extent, the panels' capacity. An ordered round packs originals
-    (the first A/2 states) and mirrors (the last A/2) as two halves of one
-    extent, so every slot stays in the paired layout [X(z); X(-z)].
+    the round extent. An ordered round packs originals (the first A/2 states)
+    and mirrors (the last A/2) as two halves of one extent, so every slot stays
+    in the paired layout [X(z); X(-z)].
+
+    The extent is the carrier of the largest selection, at most the panels'
+    capacity. With ``key`` and ``history`` (``carrier_history``, in the SC
+    session) it is grow-only across the model's rounds and SC maps: the partner
+    (TRS-odd) counts have no bound below the capacity, and the capacity costs
+    the pencil eigh (capacity / high water)^3 on every round of every map (CrI3
+    24x24 at P64: CC 20800 against 17472, TT 32000 against 24832, +616 s per
+    map), so the extent is discovered in map 0, each growth recompiling the
+    round programs once (about 8 growths, about 250 s per chain), and held from
+    map 1 on.
 
     Returns a dict: ``order`` int32 [P, F] (index sum(widths) is the zero
     column), ``points`` complex128 [P, F], ``active`` bool [P, side] (finite
@@ -228,19 +238,24 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     offsets = np.concatenate(([0], np.cumsum(widths))).astype(np.int64)
     carriers = np.asarray([[column_extent(int(c)) for c in row] for row in counts], np.int64)
     halves = (range(states // 2), range(states // 2, states)) if ordered else (range(states),)
-    # The round extent is every state's full panel: the recipe's carriers
-    # (``recipe_panel_widths``: the imaginary width, the line cap, the partner
-    # on Q's carrier), known before the first round, so one round program
-    # serves every round and SC map. The padding is inert: zero columns that
-    # the zero-row-safe eigensolver keeps out of every spectrum. An extent
-    # sized to the selection grew with the parents seen (CrI3 24x24 map 0: CC
-    # side 6976 -> 17472, TT 7424 -> 24832, eight recompiles) and reached
-    # this capacity anyway.
+    # The state panels sit on their recipe carriers (``recipe_panel_widths``),
+    # so a round program's inputs have one shape; only this extent, the pencil
+    # side, follows the selection. The padding is inert: zero columns that
+    # the zero-row-safe eigensolver keeps out of every spectrum.
     if np.any(carriers > np.asarray(widths, np.int64)[None, :]):
         raise ValueError("GATE shared_pole_round_tables: got: a state carrier wider than its "
                          "panel; want: column_extent(count) <= panel width; why: its columns "
                          "would index the next state's panel")
-    extent = max(sum(int(widths[a]) for a in half) for half in halves)
+    capacity = max(sum(int(widths[a]) for a in half) for half in halves)
+    selected = max(int(carriers[:, list(half)].sum(axis=1).max()) for half in halves)
+    # Never below the selection: an extent function may saturate on a sum.
+    extent = min(capacity, max(selected, column_extent(selected)))
+    if key is not None:
+        if history is None:
+            raise ValueError("round_tables: a grow-only extent needs the model's carrier history")
+        name = (key, "extent", len(halves), len(widths))
+        extent = min(capacity, max(extent, int(history.get(name, (0,))[0])))
+        history[name] = (extent,)
     order = np.full((ranks, extent * len(halves)), offsets[-1], np.int32)
     points = np.zeros(order.shape, np.complex128)
     live = np.zeros(order.shape, bool)

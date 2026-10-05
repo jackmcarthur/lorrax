@@ -84,8 +84,9 @@ def test_infinity_block_wider_than_the_recipe_keeps_its_own_carrier():
     assert pad_states([], [], block, 72)[1][0].shape == (1, 4, 72)
 
 
-def test_pencil_extent_fixed_before_round_one():
-    """Selections growing parent by parent give one pencil side, the panels' capacity."""
+def test_pencil_extent_grows_in_map_zero_then_holds():
+    """The extent grows with the selections seen in map 0 (one compile per growth, never above
+    the panels' capacity) and a later map with the same history compiles nothing."""
     from runtime.padding import ladder_extent
     from gw.shared_pole_local import parent_rounds, round_tables
     extent = lambda w: ladder_extent(int(w))
@@ -94,20 +95,32 @@ def test_pencil_extent_fixed_before_round_one():
     per_parent = (rng.uniform(0.4, 1.0, nq) * 2000).astype(int)
     per_parent[[1, 2, 3, 13, 19]] = [1300, 1600, 1900, 2050, 2150]   # later parents select more
     widths = [2304] * states
-    sides, traces = [], []
+    history, traces = {}, []
 
     @jax.jit
     def round_program(active):
         traces.append(active.shape)
         return active.sum()
 
-    for ids, real, _ in parent_rounds(nq, width):
-        counts = np.repeat(per_parent[ids][:, None], states, axis=1)
-        tables = round_tables(counts, widths, [0j] * states, [0] * width, 0, column_extent=extent,
-                              ordered=True, odd_moments=False)
-        sides.append(tables["active"].shape[-1])
-        # Each slot's live columns are its own selection; the rest is inert padding.
-        assert tables["active"].sum(axis=1).tolist() == counts.sum(axis=1).tolist()
-        assert tables["own"].tolist() == [sum(extent(c) for c in row[:states // 2]) for row in counts]
-        round_program(jnp.asarray(tables["active"]))
-    assert set(sides) == {2 * (states // 2) * 2304} and len(traces) == 1
+    def sc_map():
+        sides = []
+        for ids, real, _ in parent_rounds(nq, width):
+            counts = np.repeat(per_parent[ids][:, None], states, axis=1)
+            tables = round_tables(counts, widths, [0j] * states, [0] * width, 0, column_extent=extent,
+                                  ordered=True, odd_moments=False, key=("sector", "CC", 8), history=history)
+            sides.append(tables["active"].shape[-1])
+            # Each slot's live columns are its own selection; the rest is inert padding.
+            assert tables["active"].sum(axis=1).tolist() == counts.sum(axis=1).tolist()
+            assert tables["own"].tolist() == [sum(extent(c) for c in row[:states // 2]) for row in counts]
+            round_program(jnp.asarray(tables["active"]))
+        return sides
+
+    sides = sc_map()
+    assert sides == sorted(sides) and max(sides) <= 2 * (states // 2) * 2304
+    growths = len(set(sides))
+    assert 1 < growths == len(traces) <= 8
+    assert sc_map() == [sides[-1]] * len(sides) and len(traces) == growths
+    # Without a history every round takes its own selection's extent.
+    bare = round_tables(np.full((width, states), 100), widths, [0j] * states, [0] * width, 0,
+                        column_extent=extent, ordered=True, odd_moments=False)
+    assert bare["active"].shape[-1] == 2 * extent(2 * extent(100))

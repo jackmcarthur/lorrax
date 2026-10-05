@@ -18,11 +18,13 @@ The GW driver's phase invariants and the per-function contracts of
 per SC map has a shape and pytree structure fixed for the run, decided from
 quantities known before the first round: the recipe's carriers, the deck,
 $N_\mu$, $n_b$ and the admitted batch width. A batch loop runs at one width
-and pads its last round with a repeated real item behind a `real` count. A
-carrier is never discovered by running: no high-water history, no grow-only
-extent, no optional pytree member. Where the known bound is wider than the
-data, the padding is inert zero columns that the zero-row-safe eigensolver
-keeps out of every spectrum.
+and pads its last round with a repeated real item behind a `real` count. No
+optional pytree member. Where the known bound is wider than the data, the
+padding is inert zero columns that the zero-row-safe eigensolver keeps out
+of every spectrum. One quantity has no bound below its capacity, the
+partner (TRS-odd) selection count: its extent is discovered in SC map 0,
+grow-only, and held from map 1 (the cold reference: a pencil at capacity
+cost +616 s per CrI3 24×24 map at P64, the map-0 growth about 250 s once).
 
 **Why.** Seven fixes in three weeks (`held_writer_width`,
 `cross_span_widths`, the face batch widths, the SC window hold, the partner
@@ -32,9 +34,10 @@ recompiled again. On CrI3 24×24 at P64 the two 2026-10-05 instances cost
 about 120 s per leg and 220–270 s per chain of recompiles that no production
 output reported.
 
-**Deletes.** `shared_pole_local.grow_round`, the extent and Ritz carrier
-histories, the face route's own ragged schedule and the
-`real != len(own)` refusal; `parent_rounds` is the one schedule.
+**Deletes.** `shared_pole_local.grow_round` and the Ritz carrier history,
+the face route's own ragged schedule and the `real != len(own)` refusal;
+`parent_rounds` is the one schedule; the one remaining history is the
+pencil extent's (`round_tables`, in the SC session).
 
 **Not yet conforming.** The sector writer widths (`held_writer_width`) and
 the CT span widths (`cross_span_widths`) still hold a maximum from map 1,
