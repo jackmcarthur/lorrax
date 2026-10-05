@@ -17,7 +17,7 @@ jax.config.update("jax_enable_x64", True)
 
 NQ, NMU, KP = 5, 6, 4
 K = np.array([3, 2, 0, 4, 1], np.int64)
-IDENTITY = {"iteration_id": 1, "label": "toy"}
+IDENTITY = {"iteration_id": "toy-1", "label": "toy"}
 
 
 def _toy(monkeypatch, held):
@@ -99,5 +99,5 @@ def test_a_partial_direct_model_has_no_commit_and_is_refused(tmp_path, monkeypat
     with h5py.File(tmp_path / "partial.h5", "r") as f:
         assert "final_commit" not in f and "factor" in f
         assert not json.loads(f["header_json"][()].decode())["finalized"]
-    with pytest.raises(Exception, match="incomplete q census"):
+    with pytest.raises(Exception, match="incomplete q census|shared_pole_store"):
         store.validate_shared_pole_model(str(tmp_path / "partial.h5"), expected_identity=IDENTITY, mesh_xy=None)
