@@ -682,27 +682,16 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     budget.retained_panels=(*retained,*samples.values(),*moments.values(),
                             *(panels for panels,_ in line.values()))
     history=carrier_history(meta)
-    def _tables(widths,infinity_width,reuse):
-        return round_tables(counts,widths,[s[0] for s in states],
+    def _admit(widths,infinity_width):
+        table=round_tables(counts,widths,[s[0] for s in states],
             [v.shape[-1] for v in values],infinity_width,column_extent=extent,
-            ordered=True,odd_moments=True,key=round_key if reuse else None,
-            history=history if reuse else None)
-    def _preview(widths,infinity_width,reuse):
-        table=_tables(widths,infinity_width,reuse)
-        padding_bytes=round_padding_output_bytes(states,infinity,widths,infinity_width)
-        return budget.preview(table['active'].shape[-1],phase='reduction',
-            padding_output_bytes_per_rank=padding_bytes)[
-            'device_budget_status']=='PASS'
-    def _admit(widths,infinity_width,reuse):
-        table=_tables(widths,infinity_width,reuse)
+            ordered=True,odd_moments=True,key=round_key,history=history)
         side=table['active'].shape[-1]
         padding_bytes=round_padding_output_bytes(states,infinity,widths,infinity_width)
         budget.plan(side,phase='reduction',padding_output_bytes_per_rank=padding_bytes)
-        if reuse:
-            history[(round_key,'extent',2,len(widths))]=(table['order'].shape[1]//2,)
+        history[(round_key,'extent',2,len(widths))]=(table['order'].shape[1]//2,)
         return table,side
-    states,infinity,(tables,side)=grow_round(
-        round_key,states,infinity,history=history,preview=_preview,admit=_admit)
+    states,infinity,(tables,side)=grow_round(round_key,states,infinity,history=history,admit=_admit)
     # The held per-state carriers grow only when a state's selection exceeds
     # them; each growth widens this sector's pencil and every program keyed by
     # it. An SC map past 0 says so in its log, as the CT span and K holds do.

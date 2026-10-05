@@ -281,35 +281,20 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             del samples, line, line_states, qi
         with phase("reduction_admission"):
             infinity_counts = [int(v.shape[-1]) for v in round_infinity_values]
-            # Reuse widths only when the current ledger admits them.  The
+            # The round pads to the model's held carriers (grow_round); the
             # table is host metadata, so its side is known before any panel
             # padding is allocated.
             round_key = ("scalar", logical_n, ordered, odd_moments)
             history = carrier_history(meta)
             budget.retained_panels = tuple(factors)
             budget.batch_width = ranks if execution == 'local' else real
-            def _tables(widths, infinity_width, reuse):
-                return round_tables(
+
+            def _admit(widths, infinity_width):
+                table = round_tables(
                     round_counts, widths, [st[0] for st in round_states],
                     infinity_counts, infinity_width,
                     column_extent=column_extent, ordered=ordered,
-                    odd_moments=odd_moments,
-                    key=round_key if reuse else None,
-                    history=history if reuse else None)
-
-            def _preview(widths, infinity_width, reuse):
-                table = _tables(widths, infinity_width, reuse)
-                side = int(table["active"].shape[-1])
-                padding_bytes = round_padding_output_bytes(
-                    round_states, infinity, widths, infinity_width)
-                # One price per program: the reduction phase's route price
-                # (shared_pole_capacity.shared_pole_byte_terms) and its eigh
-                # workspace, for the local and the face route alike.
-                return budget.preview(side, phase="reduction",
-                    padding_output_bytes_per_rank=padding_bytes)["device_budget_status"] == "PASS"
-
-            def _admit(widths, infinity_width, reuse):
-                table = _tables(widths, infinity_width, reuse)
+                    odd_moments=odd_moments, key=round_key, history=history)
                 side = int(table["active"].shape[-1])
                 padding_bytes = round_padding_output_bytes(
                     round_states, infinity, widths, infinity_width)
@@ -318,14 +303,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 local_eigh = budget.eigenplan(side)
                 budget.plan(side, phase="reduction",
                     padding_output_bytes_per_rank=padding_bytes)
-                if reuse:
-                    extent_key = (round_key, "extent", 2 if ordered else 1, len(widths))
-                    history[extent_key] = (table["order"].shape[1] // (2 if ordered else 1),)
+                extent_key = (round_key, "extent", 2 if ordered else 1, len(widths))
+                history[extent_key] = (table["order"].shape[1] // (2 if ordered else 1),)
                 return table, side, local_eigh
 
             round_states, infinity, (tables, side, local_eigh) = grow_round(
-                round_key, round_states, infinity, history=history,
-                preview=_preview, admit=_admit)
+                round_key, round_states, infinity, history=history, admit=_admit)
         with phase("gram_reduction"):
             if execution == 'face':
                 from gw.shared_pole_execution import face_reduce_round

@@ -148,35 +148,24 @@ def _pad_columns(sharding, shape, width):
     return jax.jit(lambda a: jnp.pad(a, pad), out_shardings=sharding)
 
 
-def grow_round(key, states, infinity, *, history, preview, admit):
-    """Admit optional high-water carriers before allocating their padding.
+def grow_round(key, states, infinity, *, history, admit):
+    """Pad a round to this model's held high-water carriers, growing them when it exceeds them.
 
-    ``preview`` checks the candidate via ConstructorCapacity.  If reuse does
-    not fit, ``admit`` prices the actual current widths and propagates a real
-    capacity refusal.  The host table and its admitted side come back from
-    ``admit``; every rank makes the same decision from the same receipt.
+    One carrier per model across rounds and SC maps, never a per-round side:
+    a round with a smaller selection reuses the programs compiled at the held
+    side, and only a selection past it compiles again.  ``admit(widths,
+    width)`` prices the held widths, where the ledger warns when that is over
+    the budget (decisions.md#warn-not-refuse), and returns the host table and
+    its admitted side.  Every rank makes the same decision from the same counts.
     """
     pad = lambda a, w: a if a.shape[-1] == w else _pad_columns(a.sharding, a.shape, w)(a)
     current = tuple(int(st[1].shape[-1]) for st in states)
-    current_infinity = int(infinity[0].shape[-1])
     state_key, infinity_key = (key, "states", len(states)), (key, "infinity")
-    old_states = history.get(state_key, current)
-    old_infinity = history.get(infinity_key, (current_infinity,))[0]
-    widths = tuple(max(a, b) for a, b in zip(current, old_states))
-    width = max(current_infinity, old_infinity)
-    try:
-        reuse = bool(preview(widths, width, True))
-    except (ValueError, MemoryError, RuntimeError):
-        # A historical width may exceed this run's budget or native route.
-        # The actual current round is still admitted below, where any real
-        # failure propagates rather than being mistaken for optional reuse.
-        reuse = False
-    if not reuse:
-        widths, width = current, current_infinity
-    admitted = admit(widths, width, reuse)
-    if reuse:
-        history[state_key] = widths
-        history[infinity_key] = (width,)
+    widths = tuple(max(a, b) for a, b in zip(current, history.get(state_key, current)))
+    width = max(int(infinity[0].shape[-1]), history.get(infinity_key, (0,))[0])
+    admitted = admit(widths, width)
+    history[state_key] = widths
+    history[infinity_key] = (width,)
     states = [(st[0], *(pad(a, w) for a in st[1:])) for st, w in zip(states, widths)]
     return states, tuple(pad(a, width) for a in infinity), admitted
 
