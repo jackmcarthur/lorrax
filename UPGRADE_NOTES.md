@@ -5,6 +5,32 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — the compile cache is JAX's own, plus the namespace, the compile agreement and the receipt
+
+`common/jax_compile_cache.py` no longer freezes an all-rank agreed entry
+set at startup, vetoes other lookups, makes the key process-invariant,
+canonicalizes `jit__multi_slice`, writes entries atomically or prefetches
+them. Those layers guarded XLA:GPU's collective autotuner, which hung when
+one rank hit the cache and skipped the exchange (2026-07-27, jax 0.7.0);
+the runtime has run at `xla_gpu_autotune_level=0` since 2026-09-03, so a
+divergent hit/miss pattern now costs the missing rank one compile. What
+remains: the default location and namespace, threshold 0, JAX's per-fusion
+XLA caches off at P > 1, rank 0's age pruner, the cross-rank compile
+agreement (a rank lowering a different program is still refused by name),
+the device-fit gate and the compile receipt. 2560 → about 1000 lines.
+- Environment: `LORRAX_JAX_CACHE_MULTIPROCESS`, `_INVARIANT_KEY`,
+  `_SHARD_SLICE`, `_AGREE_TIMEOUT_S`, `_STRICT`, `_PREFETCH`,
+  `_PREFETCH_THREADS`, `_FORCE_DIVERGE`, `_NO_AGREE` and `_KEYDUMP` are
+  gone and ignored. `ISDF_JAX_CACHE_DIR`, `LORRAX_JAX_COMPILE_AGREEMENT`
+  and `LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S` stay.
+- Log: the `ARMED` line and the per-rank summary keep their shape without
+  the agreed/vetoed/prefetch fields. On CPU runs peers may compile a few
+  rank-local programs process 0 has cached (the key is process-invariant
+  on GPU only); that is a compile, not a hang.
+- Results do not move. A run that sets `xla_gpu_autotune_level` above 0
+  with a shared cache is back in the 2026-07 regime and must set
+  `ISDF_JAX_CACHE_DIR=""`.
+
 ## 2026-10-05 — the compile-cache namespace no longer names the source commit
 
 The default persistent-cache directory is now

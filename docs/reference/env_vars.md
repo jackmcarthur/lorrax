@@ -132,20 +132,14 @@ kept by hand.
 
 ### 2e. Compile cache
 
-The `LORRAX_JAX_CACHE_` rows use the *falsy-set* grammar, so a blank value
-turns a default-on switch off. Read in `common/jax_compile_cache.py`.
+Read in `common/jax_compile_cache.py`, which arms JAX's own persistent cache
+and adds only the namespace, the compile agreement and the receipt.
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
 | `ISDF_JAX_CACHE_DIR` | unset: the runtime default, `$SCRATCH/.cache/lorrax/jax_compile/<jax/jaxlib>_<ffi bundle>_<key schema>/np{P}` | machine | Unset, `common.jax_compile_cache` arms the cache in one namespace per jax/jaxlib, FFI bundle and key schema (never per source commit), and rank 0 prunes entries and namespaces it has not used for 7 days (never one used in the last 5 days; other namespaces also LRU past 2 GiB or 200k files). A non-empty value is used as-is, never namespaced or pruned; blank or whitespace opts out. Launchers and modules do not set it. |
 | `JAX_COMPILATION_CACHE_MAX_SIZE` | `-1` (unlimited) | external | JAX's own control; `0` disables the cache. A positive cap (JAX's LRU eviction) is supported only at P=1 and refuses at P>1, where LORRAX freezes an agreed all-rank entry set at startup. |
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | unset: LORRAX sets `0` whenever the cache is on | external | JAX's write threshold. JAX's own `1.0` default persisted 2 of 666 MoS2 bispinor executables; an exported value wins. |
-| `LORRAX_JAX_CACHE_MULTIPROCESS` | `1` | machine | *falsy-set*. `0` disables the persistent cache at P>1. |
-| `LORRAX_JAX_CACHE_INVARIANT_KEY` | `1` (P>1) | machine | *falsy-set*. Makes the persistent-cache key process-invariant (strips the device assignment, canonicalises the accelerator-config hash). Off, ranks key differently and the cache is switched off at P>1. |
-| `LORRAX_JAX_CACHE_SHARD_SLICE` | `1` (P>1) | machine | *falsy-set*. Patches `ArrayImpl._multi_slice` so every rank compiles one program (static shard sizes, dynamic offsets; bit-identical). Reached on every P>1 GPU run through `runtime.nccl_warmup`. `0` is the red-twin test hook that restores per-rank programs. |
-| `LORRAX_JAX_CACHE_AGREE_TIMEOUT_S` | `300` | machine | Integer seconds (a malformed value uses the default) for the P>1 hit/miss agreement; expiry degrades to cache-off with a printed reason. |
-| `LORRAX_JAX_CACHE_STRICT` | `1` | machine | *falsy-set*. An agreed entry this rank cannot load aborts; `0` warns instead (unsafe on GPU: can hang). |
-| `LORRAX_JAX_CACHE_PREFETCH` / `LORRAX_JAX_CACHE_PREFETCH_THREADS` | `1` (P>1) / `16` | machine | *falsy-set* / integer. After the agreement, reads the agreed entries into the page cache from a thread pool: serial reads cost 29 s at P=16 against ~4.5 s of compile saved. |
 | `LORRAX_JAX_COMPILE_AGREEMENT` | `1` (P>1 with a coordination client) | machine | *bool*. Before every backend compile, hashes the location-free module and exchanges it over the coordination service in one global compile order; a different key, a different module in the same slot, or a missing rank refuses before execution, naming every rank's key. Process-local handle literals are canonicalised. `0` is an unsafe bisect-only opt-out. |
 | `LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S` | `0` | machine | Seconds; `0` waits without bound and prints a heartbeat every 60 s naming the missing rank. A late rank is skew, not disagreement, so set a finite value only in tests. |
 
@@ -216,9 +210,6 @@ refusals stay on by default; per-file and per-operation instruments are opt-in.
 | `LORRAX_LU_DEBUG_DUMP` | off | test hook | Array sidecar written by `services/distrib_la/bench/cusolvermp_solve_lu_test.py`; nothing else reads it. |
 | `LORRAX_BSE_OUTER_KSUM` | `dmma` | debug, **A/B** | Stripped, case-insensitive `dmma` or `fma`; anything else refuses. In the BSE W term's outer k-conv load and its fused decode (`ffi/fft.py::make_local_kconv_klead_outer`, `make_local_kconv_klead_outer_decode`; `cpp/cufft/kconv_outer_cuda_ffi.cc`; the outer load through the additive target `lorrax_mathdx_kconv_klead_outer_ksum`), `fma` runs the K sums on the fp64 FMA pipe instead of the fp64 tensor cores (same fragment contract, round-off class; announced once), to compare the two where their rates differ (H100, B200). |
 | `LORRAX_KFFT_CPU_TEST_XLA` | unset | test hook | Exactly `1`. On a CPU mesh the k-convolution router (`ffi/fft.py`) takes an announced XLA FFT arm instead of the host plan handlers, because in-process pytest CPU meshes have no host FFI library; never read on CUDA. The router itself has no dial and keeps compiled mathdx images in `$SCRATCH/.cache/lorrax/kconv_mathdx` (else `~/.cache/lorrax/kconv_mathdx`). |
-| `LORRAX_JAX_CACHE_FORCE_DIVERGE` | `0` | test hook | Integer N: every rank ≠ 0 pretends its N alphabetically last cache entries are missing; the agreement must drop them and say so, never hang. |
-| `LORRAX_JAX_CACHE_NO_AGREE` | `0` | test hook | *falsy-set*. Shared cache directory with the agreement off: the deadlock reproducer. |
-| `LORRAX_JAX_CACHE_KEYDUMP` | unset | test hook | Directory; at exit every rank writes the set of persistent-cache keys it asked about to `<dir>/rank{i:03d}_of{N:03d}.json` (atomic rename). Only the key set separates shared from private programs. |
 
 ---
 
