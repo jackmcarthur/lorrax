@@ -33,6 +33,12 @@ Robustness-review fixes (reports A1–A3, #7, #9, #12, #14, #15):
   P4: eqp bitwise to main.
 - The one-shot Σ checkpoint identity includes the band-bracket plan, so a
   restart after a change of `band_extrapolation_bracket_scheme` recomputes.
+- Test harness: `tests/conftest.py` seals the source closure once per test
+  process. Under `lx test` a test that imported `gw.*` before `file_io` took
+  the release's services, and a later import in the same xdist worker raised
+  `SourceClosureError` (6 of 16 focused tests failed, other lanes' included).
+  Tests need no bootstrap import of their own.
+- Decks do not change.
 
 ## 2026-10-05 — review fixes: CPU row passes, the DFT+U static head, 2c TRS for WFN_qp, mode-7 scratch
 

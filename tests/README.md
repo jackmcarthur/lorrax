@@ -1,5 +1,13 @@
 # LORRAX tests
 
+`conftest.py` seals the first-party source closure
+(`runtime.source_closure.ensure_source_closure`) once per test process, before
+any test imports a service, as the drivers do at start-up. Without it a test
+that imports `gw.*` first takes `distrib_la` and its peers from the
+interpreter's install (the sealed release under `lx test`), and a later
+`file_io` import in the same pytest worker refuses with `SourceClosureError`.
+A new test needs no bootstrap import of its own.
+
 - `hsuite/`: the test suite, the production drivers run end to end on a tiny
   magnetic H2⁻ fixture at P4 ([README](hsuite/README.md)).
 - `test_layering.py`, `test_crossfile_requests.py`, `test_env_registry.py`,
