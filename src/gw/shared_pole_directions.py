@@ -259,8 +259,6 @@ def _sample_states(k, W, dW, j, z, kind, direction, widths, recipe, *, ordered, 
                 states[-1][1], states[-1][2], recipe["direction_cutoff"], real=real,
                 kernels=k, eigh_plan=eigh_plan, column_extent=column_extent,
                 tol=recipe["multiplet_relative_tolerance"])
-            if direction is None:
-                continue
         elif conjugate:
             direction = states[-1][2]
         scale = put(np.complex128(2 * (s.conjugate() if conjugate else s) if ordered else 1.0))
@@ -291,8 +289,7 @@ def _mirror_states(k, states, flags, z, *, W=None, dW=None, j=None, partner=None
         results = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(states))]
         del xs
     else:
-        # An imaginary support's optional partner direction can have a
-        # different carrier width, so act on each state separately.
+        # An imaginary support's states act one at a time, each on its own panel.
         results = [k.act(not flag)(W, dW, j, st[1], put(np.complex128(-2 * st[0])))
                    for st, flag in zip(states, flags)]
     return [(-st[0], st[1], output, action) for st, (output, action) in zip(states, results)]
@@ -610,7 +607,9 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     The component of O outside span(Q) is rank-revealed against the largest
     singular value of O with the line cutoff; on a magnet the survivors carry the
     odd channel. Each slot keeps its own count (0 allowed); only spectra cross the
-    host. Returns (directions [P, n, r], widths) or (None, None) when no slot has any.
+    host. Returns (directions [P, n, r], widths) on Q's own carrier r in every
+    round, empty slots included, so a round's state list and panel widths (and
+    every program keyed on them) repeat from round to round.
     """
     from gw.shared_pole_execution import is_face
     spectral_rows = None if is_face(q) else real
@@ -624,10 +623,13 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
                    if i < real else 0 for i, (values, t) in enumerate(zip(spectrum, largest)))
     if max(counts) == 0:
-        return None, None
+        return q * 0, counts
+    from gw.shared_pole_local import _pad_columns
     directions, kept = distrib_la.retain_leading_eigenvectors(
         directions, spectrum, counts, mesh=eigh_plan.mesh,
         column_extent=column_extent, multiplet_tol=tol, real_rows=spectral_rows)
+    if directions.shape[-1] < q.shape[-1]:
+        directions = _pad_columns(directions.sharding, directions.shape, int(q.shape[-1]))(directions)
     return directions, tuple(int(v.size) for v in kept)
 
 
