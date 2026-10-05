@@ -5,6 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — the ordered partner state keeps one carrier, so constructor rounds recompile less
+
+At an imaginary (or Re z = 0) support of an ordered shared-pole round, the
+conjugate state holds the part of O = W Q outside span(Q). It used to be
+dropped when no parent kept a partner direction, and otherwise to carry its
+own count's width, so a round's state list moved parent by parent and the TT
+and CT round programs compiled again in nearly every round
+(`shared_pole_directions._round_partner_directions`). The state is now always
+present on Q's own carrier (count 0 when empty); its live columns are
+unchanged. Fe 4³ bispinor SC maps 0–2 on the face route at P4 (1.5 GB budget,
+compile cache off): 169 → 101 round-program compiles, W construction 610 →
+347 s. eqp: bitwise at map 0, ≤ 0.13 µeV at maps 1–2 (inert padding columns
+in the pencil); the CrI3 6×6 bispinor one-shot is bitwise. No deck change.
+
 ## 2026-10-05 — W-bank file tier warns instead of refusing; the pole-budget cut keeps whole multiplets
 
 Robustness-review fixes (reports A1–A3, #7, #9, #12, #14, #15):
