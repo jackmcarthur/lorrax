@@ -1493,6 +1493,14 @@ def _integrate_sigma_batches(
                         psi_coh_xn, psi_proj_xr, E_A_call, selector,
                         jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B),
                         row.space, row.pole_indices, row.bounds)
+                    if not sweep_started and str(getattr(tau_kernel, "_stage", "")).startswith("sigma.sector.tau.("):
+                        # BISPSIG measurement (not for main): Sigma(tau_j) of the mixed sectors at the
+                        # sweep's own nodes, before any frequency synthesis (owner test 2026-10-05).
+                        from gw.mpa import sector_sigma as _ss
+                        for _j in range(min(3, len(win.nodes.t))):
+                            _val = jax.jit(row_kernel)(*tau_arguments, win.nodes.t[_j], active_count)
+                            _ss._BISPSIG_TAU.setdefault(tau_kernel._stage, []).append(
+                                (complex(np.asarray(jax.device_get(win.nodes.t[_j]))), row.space, _val))
                 else:
                     pole_indices, bounds, phase_real = (
                         device_put_process_local(x, small)

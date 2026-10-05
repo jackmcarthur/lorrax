@@ -675,6 +675,9 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     return finish(total)
 
 
+_BISPSIG_TAU: dict = {}
+
+
 def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                          on_shell=None, linalg=None, **options):
     """Integrate CC, TT and both ordered mixed endpoints on their own pole sets.
@@ -780,6 +783,15 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                     if on_shell is not None:
                         diff=on_shell(replace(value,sigma_c_kij=ct+tc))-on_shell(replace(value,sigma_c_kij=ct+dag(ct)))
                         line+=f"; on-shell max|(CT+TC) - (CT+CT^dagger)| = {float(jnp.max(jnp.abs(diff)))*RYD_TO_EV:.3e} eV"
+                    ct_tau,tc_tau=_BISPSIG_TAU.get('sigma.sector.tau.(0, 1)',[]),_BISPSIG_TAU.get('sigma.sector.tau.(1, 0)',[])
+                    for (t1,sp1,s1),(t2,sp2,s2) in zip(ct_tau,tc_tau):
+                        n=float(jnp.max(jnp.abs(s1)))
+                        line+=(f"\n  sector Sigma(tau) node t={t1:.6g} [{sp1}] vs t={t2:.6g} [{sp2}]: "
+                               f"|TC - CT^dagger|/|CT| = {float(jnp.max(jnp.abs(s2-dag(s1))))/n:.3e}, "
+                               f"|TC - CT^T|/|CT| = {float(jnp.max(jnp.abs(s2-jnp.swapaxes(s1,-1,-2))))/n:.3e}, "
+                               f"|TC - conj(CT)|/|CT| = {float(jnp.max(jnp.abs(s2-jnp.conj(s1))))/n:.3e}, "
+                               f"|TC - CT|/|CT| = {float(jnp.max(jnp.abs(s2-s1)))/n:.3e}, |TC|/|CT| = {float(jnp.max(jnp.abs(s2)))/n:.3e}")
+                    _BISPSIG_TAU.clear()
                     if jax.process_index()==0:
                         # Bare print is /dev/null in production: the driver's print_fn and a file.
                         options.get('print_fn',print)(line)
