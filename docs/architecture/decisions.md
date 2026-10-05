@@ -12,6 +12,24 @@ The GW driver's phase invariants and the per-function contracts of
 `gw.gw_config` are developer reference, not rulings:
 [GW driver and configuration contracts](../dev/gw_config_contracts.md).
 
+## 2026-10-05 — Bispinor Coulomb and Hartree use the normalized four-component wavefunctions {#four-component-carrier}
+
+**Rule (owner).** The Coulomb interaction and the Hartree field are evaluated
+with the normalized four-component wavefunctions
+$\Psi=[I;X](I+X^\dagger X)^{-1/2}\psi_L$, $X=(\alpha_{\rm FS}/2)\boldsymbol\sigma\cdot\mathbf p$,
+as prior four-component GW does. The current vertices take the same carrier,
+so the direct field is the four-current Hartree $V_H[\rho]+\boldsymbol\alpha\cdot\mathbf A[J]$
+of one $\Psi$ ([theory](../theory/bispinor-gw.md#lift)).
+
+**Why.** The fully relativistic pseudopotential is a Dirac–Coulomb atom with
+no Breit term; it does not stand in for the two-electron relativistic terms.
+
+**Deletes.** The large-block charge carrier $(\psi_L,0)$, its stamp, and the
+direct field's separate charge spinor block.
+
+**Not yet conforming.** The scalar Γ-head dipole (`psp.get_dipole_mtxels`)
+is built on the raw lift $[\psi_L;X\psi_L]$.
+
 ## 2026-10-01 — Per-pass loops are scans over device tables {#scan-pass-loops}
 
 **Rule (owner).** A loop over row passes or tiles runs as one `jax.lax.scan`
