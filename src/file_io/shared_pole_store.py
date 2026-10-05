@@ -1367,8 +1367,10 @@ class ResidentBankPayload:
     a q span of one sample is one contiguous run. A write returns once its
     tiles are queued (they leave the device in pinned pieces behind it); the
     first read of a field waits for its writes. ``fits`` is False on every
-    rank when a file store cannot reserve its bytes. The devices hold only the
-    span being read.
+    rank when a file store made at initialization cannot reserve its bytes; a
+    field created later (line panels, contact fields) that the filesystem
+    refuses is held in host memory instead. The devices hold only the span
+    being read.
     """
 
     def __init__(self, mesh, *, carrier, label, memory_kind="device", root=None):
@@ -1449,20 +1451,32 @@ class ResidentBankPayload:
         # Host and file tiers: SlabIO's per-rank streamed store, one record per
         # (lead index, q) tile, q-major within each lead index so a q span of
         # one sample is one contiguous run; an unwritten tile reads as zeros.
-        self._fields[name] = (_resident_zeros(self.mesh, stored)()
-                              if self.memory_kind == "device" else self._tier_store(name, stored))
-        if self.memory_kind != "device" and not self._fields[name].fits:
-            self.fits = False
+        store = (_resident_zeros(self.mesh, stored)()
+                 if self.memory_kind == "device" else self._tier_store(name, stored, self.memory_kind))
+        if self.memory_kind != "device" and not store.fits:
+            if self.header_json is None:
+                # At initialization: the caller takes the shared scratch file.
+                self.fits = False
+            else:
+                # A field created after initialization (a line panel, a contact
+                # field) has no route left to change: it is held in host memory
+                # (agreed on every rank at creation), never refused mid-map.
+                store.release()
+                store = self._tier_store(name, stored, "host")
+                if jax.process_index() == 0:
+                    print(f"WARNING {self}: {name} ({16 * int(np.prod(stored)) / 2**30:.3f} GiB) "
+                          "refused by the filesystem (capacity); held in host memory", flush=True)
+        self._fields[name] = store
         self._logical[name] = shape
         self._stored[name] = stored
 
-    def _tier_store(self, name, stored):
+    def _tier_store(self, name, stored, kind):
         from file_io.slab_io import StreamedBank
         px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
         if stored[-2] % px or stored[-1] % py:
             _refuse(f"resident bank {name} face {stored[-2:]} is not mesh-divisible")
         r, c = stored[-2] // px, stored[-1] // py
-        return StreamedBank(self.mesh, root=self.root, label=f"bank_{name}", kind=self.memory_kind,
+        return StreamedBank(self.mesh, root=self.root, label=f"bank_{name}", kind=kind,
                             n_out=int(np.prod(stored[:-2])), q=1,
                             segments=((r, c, ((0, 0, 0, 0, r, c),)),), tile=(r, c),
                             unwritten_zero=True)

@@ -550,8 +550,9 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
 | `file` | one file, `<run dir>/<label>_shared_pole/streamed_bank/<label>.<device id>` |
 
 - **Layout.** A record is one segment's `[q, rows, cols]` tile of one
-  output, padded to the alignment (the largest page or filesystem block on
-  any rank), at `output·S + segment start`, so a range of outputs is one
+  output, padded to the page size (the largest on any rank; never the
+  filesystem block, which is 16 MiB on GPFS), at `output·S + segment start`,
+  so a range of outputs is one
   contiguous run. Every record carries a digest taken on the device at write
   and checked on the device at read, one per (output, q row), so a q-span
   read is checked too.
@@ -577,12 +578,16 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
 - **Capacity.** One all-gather at creation agrees the alignment, rank 0's
   free bytes and every process's promised bytes. Free bytes are the
   filesystem's free space and, where `lfs` exists, the room under the user's
-  Lustre quota (soft limit, else hard), less the bytes live stores have
-  reserved and not yet written (a file stays sparse, and outside the quota,
-  until it is written; written bytes are in the quota's used count, so they
-  leave the promise). A bank that does not fit is refused on every rank
-  before any compute (`GATE streamed_bank_capacity`, `fits = False`); the
-  caller then takes a smaller bank. A verdict costs 45–64 ms at P4 (claim
+  Lustre quota (hard limit, else soft: Lustre writes past the soft limit in
+  its grace period), less the bytes live sparse stores have promised and not
+  yet written (where `fallocate` fails a file stays sparse, and outside the
+  quota, until it is written; written bytes are in the quota's used count, so
+  they leave the promise; a reserved store's bytes have already left the free
+  space and are not promised). A bank that does not fit is refused on every
+  rank before any compute (`GATE streamed_bank_capacity`, `fits = False`);
+  the caller then takes a smaller bank. A W-bank field created after the
+  bank's initialization (line panels, contact fields) that the disk refuses
+  is held in host memory with a warning. A verdict costs 45–64 ms at P4 (claim
   3111).
 - **Lifetime.** A store file is unlinked as soon as it is opened. Its bytes
   live as long as the process's descriptor, so a refusal, a kill or a SIGKILL
@@ -602,7 +607,7 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
 | refusal | cause |
 |---|---|
 | `GATE streamed_bank_capacity` | the disk or quota cannot hold the store, or a reservation failed; the caller falls back |
-| `GATE streamed_bank_capacity: store … was refused at creation and cannot be written` | a `put` to a refused store (every rank alike): a caller wrote without falling back, e.g. a W-bank field store created during the map |
+| `GATE streamed_bank_capacity: store … was refused at creation and cannot be written` | a `put` to a refused store (every rank alike): a caller wrote without falling back |
 | `GATE io_global_commit … streamed_bank.commit` | a drain failed on some rank; the message carries that rank's error and its innermost frame |
 | `GATE streamed_bank: … unread` / `short read` | a read of the named outputs and rows failed |
 | `GATE streamed_bank: … do not match their write digests` | the bytes read back differ from the bytes written |
