@@ -5,6 +5,36 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-05 — kmeans sizes from the shapes; a CT face fallback; the checkpoint digest splits over ranks
+
+- **kmeans.** The candidate Gram's k batches and square tiles, and the
+  feature metric's band and k chunks, are sized from the shapes and the
+  fixed 1 GiB tile (`runtime.tiles`), never from `memory_per_device_gb` or
+  the card. Before, the Gram used one full block when it fit a quarter of
+  the budget, else budget-sized tiles from a compiled-peak ladder, and the k
+  batches took half the budget. So the summation order, and through a
+  near-tie pivot the centroid set, could change with the budget. On Fe 4³
+  and CrI3 6×6 the selected sets equal main's bit for bit at two budgets
+  each, so Σ and eqp do not move there. CrI3 6×6 selection wall: +2 %. The
+  Gram build is 17 % faster; the feature metric is 0.7 s slower, because it
+  now takes two band chunks. `LORRAX_GRAM_COL_BLOCK` still pins a tile
+  width. A price over the budget warns and runs.
+- **Bispinor sectors.** With at least as many parents as ranks the sector
+  rounds run local. A local round whose CT pencil does not fit at its actual
+  spans now warns and reruns its parents as face batches, CC and TT
+  included. Before, it ran over budget and failed in compile or OOM after CC
+  and TT. Rounds that fit are unchanged. A forced fallback on Fe 4³
+  bispinor gives eqp bitwise equal to the local and the face routes.
+- **SC and one-shot Σ checkpoints.** Every rank hashes 1/P of the cube
+  slices from the closed file, and the slice digests combine by XOR. Before,
+  rank 0 re-read and hashed the whole file after every write and on resume.
+  At CrI3 24×24 carry size (1.77 GB, P4) the digest takes 0.5 s instead of
+  1.8 s. The digest is the same at any P, so a P1 continuation of a P4
+  checkpoint authenticates. A checkpoint written before this change does not
+  (`cube digest of an older format`): the SC trajectory restarts from its
+  warm seed with a warning, and a one-shot Σ sweep is recomputed once.
+- Decks do not change.
+
 ## 2026-10-05 — the bispinor carrier is named the normalized RKB lift
 
 The four-component carrier $[I;X](I+X^\dagger X)^{-1/2}\psi_L$ was called
