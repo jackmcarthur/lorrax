@@ -85,7 +85,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la._result_check import deflate_zero_rows, in_checked_retry, native_eigh, traced_phase
+from distrib_la._result_check import (_flag, _notices, deflate_zero_rows, in_checked_retry, native_eigh,
+                                      traced_phase)
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
                                 mesh_key, resolve_backend)
 
@@ -887,8 +888,9 @@ class Plan:
         # failure flag, so their buffers are never reserved beside the first
         # attempt's (EIGHSTACK: n 18304, P4, 80 GB).
         out = program("first", ())(*ops)
-        if not bool(np.any(np.asarray(jax.device_get(out[-1].addressable_data(0))))):
+        if not _flag(out[-1]):
             return out
+        _notices(out[-1], self.op, int(ops[0].shape[-1]), ops[0].dtype, site, final=False)
         del out
         return program("retry", ())(*ops)
 
@@ -1052,7 +1054,8 @@ class Plan:
                     return self._finish(self._scan_over_single(ops, kwargs, site=site, phase=phase), A, site)
                 # Eager: the retries run as a second scan only when a matrix failed.
                 out = self._scan_over_single(ops, kwargs, site=site, phase="first")
-                if bool(np.any(np.asarray(jax.device_get(out[-1].addressable_data(0))))):
+                if _flag(out[-1]):
+                    _notices(out[-1], self.op, int(A.shape[-1]), A.dtype, site, final=False)
                     del out
                     out = self._scan_over_single(ops, kwargs, site=site, phase="retry")
                 return self._finish(out, A, site)
@@ -1093,7 +1096,8 @@ class Plan:
         if executable is None or not A.sharding.is_equivalent_to(face, 3):
             executable = program("first")
         values_vectors, failed = executable(A)
-        if bool(np.any(np.asarray(jax.device_get(failed.addressable_data(0))))):
+        if _flag(failed):
+            _notices(failed, "eigh", shape[-1], A.dtype, site, final=False)
             del values_vectors
             values_vectors, failed = program("retry")(A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)

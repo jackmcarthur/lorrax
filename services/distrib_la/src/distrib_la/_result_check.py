@@ -8,9 +8,13 @@ reproduced outside LORRAX. So every eigh takes its exact-zero rows out of the
 solver (:func:`deflate_zero_rows`), and every distributed eigh and LU solve is
 checked on its own output against fixed-seed random probes before it is
 returned (:func:`checked`), at O(n^2 k) beside the O(n^3) solve. A failed
-check retries where the operands survive; a result that still fails is named
-on rank 0's stderr (GATE distrib_la_result_check), NaN-poisoned on every rank,
-and raised by an eager caller. There is no dial.
+check retries where the operands survive; a result that still fails is
+NaN-poisoned on every rank, named on rank 0's stderr (GATE
+distrib_la_result_check) and raised. The device returns each check's
+errors with its flag (:func:`checked`) and the host prints the notices after
+the call, so no program carries a host callback: JAX's persistent compile
+cache never stores a program with one, and every checked program would
+compile again in every process. There is no dial.
 
 Acceptance (:func:`accept`) is on backward errors, which a backward-stable
 solver keeps near n * eps whatever the condition number:
@@ -31,7 +35,6 @@ import contextvars
 import os
 import sys
 import traceback
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -145,12 +148,6 @@ def orthonormalize(vectors, *, matmul):
     return vectors, steps
 
 
-def _orthonormalize_notice(n, steps):
-    if jax.process_index() == 0 and int(steps):
-        print(f"distrib_la: eigh n={n}: shifted retry vectors re-orthonormalized in {int(steps)} "
-              f"Newton-Schulz step(s)", file=sys.stderr, flush=True)
-
-
 def shifted(eigh, *, matmul):
     """Solve A + s I, s = ||live part of A||_F, re-orthonormalize, return A's eigenpairs.
 
@@ -172,8 +169,7 @@ def shifted(eigh, *, matmul):
             jnp.where(decoupled, jnp.abs(diagonal) ** 2, 0), axis=-1)
         s = jnp.sqrt(jnp.maximum(live, 0))
         values, vectors = eigh(a + s[..., None, None] * _eye_like(a))
-        vectors, steps = orthonormalize(vectors, matmul=matmul)
-        jax.debug.callback(partial(_orthonormalize_notice, int(a.shape[-1])), steps)
+        vectors, _ = orthonormalize(vectors, matmul=matmul)
         return values - s[..., None], vectors
     return solve
 
@@ -236,73 +232,81 @@ def refusal_message(op, n, dtype, site, attempts, *errors):
             f"and no retry repaired it; result set to NaN")
 
 
-def _report_refusal(op, n, dtype, site, attempts, *errors):
-    """Host side of a failed final check: the named refusal on rank 0's stderr.
+def _flag(status):
+    """Whether a replicated check status ``(failed, errors)`` failed (every rank reads the same bytes)."""
+    return bool(np.any(np.asarray(jax.device_get(status[0].addressable_data(0)))))
 
-    It does not raise: a host callback's exception is an unordered effect that
-    each rank meets at a different point. The result is NaN-poisoned instead,
-    identically on every rank; an eager caller raises from the returned flag.
+
+def _notices(status, op, n, dtype, site, *, final):
+    """Print a check status's notices on rank 0: each failed attempt, then the refusal.
+
+    ``errors`` [..., k, e] holds every attempt's errors (NaN where an attempt
+    did not run); a stack (a scan) reports each matrix that failed. A failed
+    last attempt is the refusal when ``final``, else the first program's
+    retry notice. Only the printing depends on the rank.
     """
-    if jax.process_index() == 0:
-        print(refusal_message(op, n, dtype, site, attempts, *errors), file=sys.stderr, flush=True)
-
-
-def _notice(op, n, dtype, site, what, *errors):
-    if jax.process_index() == 0:
-        detail = ", ".join(f"{name} {float(value):.2e}" for name, value in
-                           zip(("residual", "orthogonality"), errors))
-        print(f"distrib_la: {op} n={n} at {site} failed its result check ({detail}, "
-              f"accept {accept(n, dtype):.1e}); {what}", file=sys.stderr, flush=True)
+    if jax.process_index() != 0:
+        return
+    errors = np.asarray(jax.device_get(status[1].addressable_data(0)))
+    tol = accept(n, dtype)
+    for table in errors.reshape(-1, *errors.shape[-2:]):
+        for i, row in enumerate(table):
+            if np.isnan(row).all() or np.all(row <= tol):
+                break
+            if i + 1 == len(table) and final:
+                print(refusal_message(op, n, dtype, site, len(table), *row), file=sys.stderr, flush=True)
+                break
+            what = ("solving again in a separate program" if i + 1 == len(table) else
+                    f"attempt {i + 1} of {len(table)} failed; solving again")
+            detail = ", ".join(f"{name} {float(value):.2e}" for name, value in
+                               zip(("residual", "orthogonality"), row))
+            print(f"distrib_la: {op} n={n} at {site} failed its result check ({detail}, "
+                  f"accept {tol:.1e}); {what}", file=sys.stderr, flush=True)
 
 
 def checked(op, attempts, errors_of, operands, *, site, n=None, dtype=None, constrain=None,
             final=True):
-    """Run ``attempts`` until one passes ``errors_of``: ``(result, failed)``.
+    """Run ``attempts`` until one passes ``errors_of``: ``(result, (failed, errors))``.
 
     Each attempt maps ``operands`` to a result; ``errors_of(result)`` returns
     replicated (mesh-reduced) scalars, accepted at ``accept(n, dtype)``. Later
-    attempts run only when the earlier ones failed (``lax.cond``). A final
-    failure prints GATE distrib_la_result_check on rank 0's stderr, poisons
-    the result with NaN on every rank, and sets ``failed`` (a replicated
-    bool), which an eager caller raises on (``raise_if_failed``).
-    ``constrain`` pins each result (and each cond's output) to its layout.
-    ``final=False`` (a first program, whose retries run in a separate program
-    on its flag) notes a failure instead of naming the refusal and returns
-    zeros, not NaN, so the rest of that program stays finite.
+    attempts run only when the earlier ones failed (``lax.cond``). ``failed``
+    is a replicated bool, ``errors`` [len(attempts), e] every attempt's
+    errors (NaN where it did not run); the caller's host prints the notices
+    (:func:`raise_if_failed`). A final failure poisons the result with NaN on
+    every rank. ``constrain`` pins each result (and each cond's output) to its
+    layout. ``final=False`` (a first program, whose retries run in a separate
+    program on its flag) returns zeros, not NaN, so the rest of that program
+    stays finite.
     """
     pin = (lambda r: r) if constrain is None else constrain
     n = int(operands[0].shape[-1]) if n is None else int(n)
     dtype = operands[0].dtype if dtype is None else dtype
+    k = len(attempts)
 
     def verdict(errors):
-        return jnp.all(jnp.stack(errors) <= accept(n, dtype))
+        return jnp.all(errors <= accept(n, dtype))
 
-    def accepted(r):
-        return pin(r), jnp.bool_(False)
-
-    def run(index):
+    def run(index, table):
         result = pin(attempts[index](*operands))
-        errors = errors_of(result)
-        if index + 1 == len(attempts):
-            def refuse(r):
-                if final:
-                    jax.debug.callback(partial(_report_refusal, op, n, dtype, site, len(attempts)), *errors)
-                else:
-                    jax.debug.callback(partial(_notice, op, n, dtype, site,
-                                               "solving again in a separate program"), *errors)
-                # A first attempt's caller reruns it: zeros keep the rest of its program finite.
-                return pin(jax.tree.map(lambda a: jnp.full_like(a, jnp.nan if final else 0), r)), jnp.bool_(True)
-            out, failed = jax.lax.cond(verdict(errors), accepted, refuse, result)
-            return pin(out), failed
+        errors = jnp.stack(errors_of(result)).astype(jnp.float64)
+        if table is None:
+            table = jnp.full((k, errors.shape[0]), jnp.nan, jnp.float64)
+        table = table.at[index].set(errors)
 
-        def again(_):
-            jax.debug.callback(partial(_notice, op, n, dtype, site,
-                                       f"attempt {index + 1} of {len(attempts)} failed; solving again"),
-                               *errors)
-            return run(index + 1)
-        out, failed = jax.lax.cond(verdict(errors), accepted, again, result)
-        return pin(out), failed
-    return run(0)
+        def accepted(r):
+            return pin(r), jnp.bool_(False), table
+        if index + 1 == k:
+            def refuse(r):
+                return (pin(jax.tree.map(lambda a: jnp.full_like(a, jnp.nan if final else 0), r)),
+                        jnp.bool_(True), table)
+            out, failed, table = jax.lax.cond(verdict(errors), accepted, refuse, result)
+            return pin(out), failed, table
+        out, failed, table = jax.lax.cond(verdict(errors), accepted,
+                                          lambda _: run(index + 1, table), result)
+        return pin(out), failed, table
+    out, failed, table = run(0, None)
+    return out, (failed, table)
 
 
 def eigh_layout(mesh, ndim):
@@ -320,10 +324,10 @@ def checked_eigh(attempts, a, *, site, mesh=None, final=True):
                    constrain=constrain, final=final)
 
 
-#: Inside :func:`checked_program`'s trace: (phase, flags, trace). A checked
+#: Inside :func:`checked_program`'s trace: (phase, entries, trace). A checked
 #: solve traced at that level holds only that phase of its chain and hands
-#: its failure flag here; elsewhere (no program, or a nested scan, cond or
-#: shard_map trace) it holds the whole chain ("all"), as before.
+#: its status and (op, n, dtype, site) here; elsewhere (no program, or a
+#: nested scan, cond or shard_map trace) it holds the whole chain ("all").
 _TRACED = contextvars.ContextVar("distrib_la_traced", default=None)
 
 
@@ -345,16 +349,29 @@ def in_checked_retry():
     return traced_phase() == "all" and _program_context() is not None
 
 
+def _signature(args):
+    return jax.tree.structure(args), tuple((tuple(a.shape), str(a.dtype)) for a in jax.tree.leaves(args))
+
+
 def _in_phase(fn, phase):
-    """``fn`` traced with its checked solves on ``phase``, returning (out, reduced failure flag or ())."""
+    """``fn`` traced with its checked solves on ``phase``: ``(out, ())`` or
+    ``(out, (reduced failure flag, every solve's error table))``; each trace's
+    (op, n, dtype, site) per solve is kept in ``run.infos`` by signature."""
+    infos = {}
+
     def run(*args):
         from jax._src.core import trace_ctx
         token = _TRACED.set((phase, [], trace_ctx.trace))
         try:
-            out, flags = fn(*args), _TRACED.get()[1]
+            out, entries = fn(*args), _TRACED.get()[1]
         finally:
             _TRACED.reset(token)
-        return out, (jnp.any(jnp.stack([jnp.any(f) for f in flags])) if flags else ())
+        infos[_signature(args)] = tuple(info for _, info in entries)
+        if not entries:
+            return out, ()
+        return out, (jnp.any(jnp.stack([jnp.any(s[0]) for s, _ in entries])),
+                     tuple(s[1] for s, _ in entries))
+    run.infos = infos
     return run
 
 
@@ -367,24 +384,33 @@ def checked_program(fn, mesh, out_shardings):
     """A caller's jitted program over checked solves, run as an eager eigh is.
 
     The first program holds each checked solve's first attempt and check and
-    returns their mesh-reduced failure flag; only when it is set does the
-    whole-chain program run: every solve's whole chain, every stack on the
-    whole mesh, refused by name if a solve fails every attempt. A program with
-    no checked solve returns no flag and is never synced on. ``call.lower``
-    lowers the whole-chain program, so a caller that admits it by its compiled
-    size has sized the retry, and a first program run beside that size fits.
+    returns their mesh-reduced failure flag and error tables; only when the
+    flag is set does the whole-chain program run: every solve's whole chain,
+    every stack on the whole mesh, refused by name if a solve fails every
+    attempt. The notices print on the host from the returned tables. A
+    program with no checked solve returns no flag and is never synced on.
+    ``call.lower`` lowers the whole-chain program, so a caller that admits it
+    by its compiled size has sized the retry, and a first program run beside
+    that size fits.
     """
     rep = NamedSharding(mesh, P())
-    first, again = (jax.jit(_in_phase(fn, phase), out_shardings=(out_shardings, rep))
+    phases = {phase: _in_phase(fn, phase) for phase in ("first", "all")}
+    first, again = (jax.jit(phases[phase], out_shardings=(out_shardings, rep))
                     for phase in ("first", "all"))
 
+    def report(phase, args, status, final):
+        for (op, n, dtype, site), table in zip(phases[phase].infos[_signature(args)], status[1]):
+            _notices((status[0], table), op, n, dtype, site, final=final)
+
     def call(*args):
-        out, failed = first(*args)
-        if isinstance(failed, tuple) or not _flag(failed):
+        out, status = first(*args)
+        if not status or not _flag(status):
             return out
+        report("first", args, status, final=False)
         del out
-        out, failed = again(*args)
-        if _flag(failed):
+        out, status = again(*args)
+        report("all", args, status, final=True)
+        if _flag(status):
             raise ValueError(f"GATE distrib_la_result_check: a checked solve in the program at "
                              f"{call_site()} failed every attempt (named above); result set to NaN")
         return out
@@ -392,22 +418,21 @@ def checked_program(fn, mesh, out_shardings):
     return call
 
 
-def _flag(failed):
-    return bool(np.any(np.asarray(jax.device_get(failed.addressable_data(0)))))
+def raise_if_failed(status, op, n, dtype, site):
+    """An eager call's notices and refusal: raise by name when any matrix failed every attempt.
 
-
-def raise_if_failed(failed, op, n, dtype, site):
-    """An eager call's refusal: raise by name when any matrix of the call failed every attempt.
-
-    ``failed`` is one replicated bool (or a stack of them, from a scan), the
-    same on every rank, so every rank raises together; only that flag is read.
-    A traced flag goes to the enclosing :func:`checked_program`, if any.
+    ``status`` is :func:`checked`'s ``(failed, errors)`` (or a stack of them,
+    from a scan), replicated, so every rank reads the same values and raises
+    together; only the printing depends on the rank. A traced status goes to
+    the enclosing :func:`checked_program`, if any; a traced status outside
+    one leaves a NaN-poisoned result unnamed.
     """
-    if isinstance(failed, jax.core.Tracer):
+    if isinstance(status[0], jax.core.Tracer):
         if _program_context() is not None:
-            _program_context()[1].append(failed)
+            _program_context()[1].append((status, (op, int(n), dtype, site)))
         return
-    if _flag(failed):
+    _notices(status, op, n, dtype, site, final=True)
+    if _flag(status):
         raise ValueError(refusal_message(op, n, dtype, site, "every"))
 
 
