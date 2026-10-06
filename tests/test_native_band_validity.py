@@ -59,9 +59,10 @@ def test_fixed_step_and_fd_solve_brackets_ignore_ghost_extrema(ghost):
     step=OccupationState.step(w.enk,[.5,.5],2.,state_capacity=2.,valid_kn=w.valid_kn)
     assert np.array_equal(np.asarray(step.f_kn),np.asarray(w.occ))
     assert assert_fixed_n(step,[.5,.5],state_capacity=2.)==4.
-    fd=OccupationState.solve_smearing(w.enk,[.5,.5],4.,.02,state_capacity=2.,family="fd",valid_kn=w.valid_kn)
-    compact=OccupationState.solve_smearing(np.asarray(w.enk)[valid,None],np.broadcast_to([.5,.5],(6,2)).T[valid],
-        4.,.02,state_capacity=2.,family="fd")
+    fd=OccupationState.solve_smearing(w.enk,[.5,.5],3.3,.02,state_capacity=2.,family="fd",valid_kn=w.valid_kn)
+    weights=np.broadcast_to([.5,.5],(6,2)).T[valid]
+    compact=OccupationState.solve_smearing(np.asarray(w.enk)[valid,None],weights/weights.sum(),
+        3.3/weights.sum(),.02,state_capacity=2.,family="fd")
     assert abs(fd.mu_ry-compact.mu_ry)<1e-12
     assert np.max(np.abs(np.asarray(fd.f_kn)[valid]-np.asarray(compact.f_kn).ravel()))<1e-12
     assert np.array_equal(np.asarray(fd.f_kn)[~valid],np.zeros((~valid).sum()))
@@ -176,7 +177,7 @@ def test_direct_chi_and_slope_against_independent_physical_lehmann_sum(mesh,orde
     w.psi_mun=jax.device_put(psi.transpose(0,2,3,1),NamedSharding(mesh,P(None,None,"x","y")))
     state=OccupationState.step(w.enk,[.5,.5],2.,state_capacity=2.,valid_kn=w.valid_kn)
     z=np.asarray([.7+.25j,1.4+.5j]);maps=np.asarray([[0,1],[1,0]])
-    actual,slope=compute_chi0_direct_fractional(w,meta(),mesh,z_values=z,occupation_state=state,
+    actual,slope=compute_chi0_direct_fractional(w,z,meta(),mesh,occupation_state=state,
         kminq_rows=maps,nb_logical=6,ordered=ordered,with_derivative=True,pair_tile=2)
     expected=np.zeros((2,2,2,2),complex);derivative=np.zeros_like(expected)
     e=np.asarray(w.enk);f=np.asarray(state.f_kn)
