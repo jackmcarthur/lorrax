@@ -21,7 +21,17 @@ on the compiled figure: two tiled copies of the local round's term, where the
 CrI3 24×24 P64 receipt's compiled programs held 1.57–1.63 of one, so the
 admission lands on the same batch as before (3 of 61 parents at P64, replayed
 by `tests/test_shared_pole_face_price.py`; 1 on the P4 face decks). The
-programs that run, their shapes and the results are unchanged. No deck change.
+programs that run and their shapes are unchanged. Measured cold at P4
+(every leg on a fresh cache): CrI3 6×6 forced-face SC, map-0 compile 399.4 →
+235.7 s, W 497.2 → 324.0 s, eqp bitwise at maps 0–2 and maps 1–2 unchanged;
+Fe 4³ face deck at a 2 GB budget, map-0 compile 325.5 → 257.1 s, W 405.5 →
+330.6 s, eqp bitwise at map 0. Known cost on a memory-starved deck: the price
+is 0.25–0.4 GB above the compiled figure, so the eigh room beside the admitted
+batch is that much smaller; on the 2 GB Fe deck map 1 compiled the per-parent
+CT face-rerun programs two to three times at the same shapes (29 more
+compiles, 42.4 vs 13.7 s; W 71.9 → 104.0 s) and maps 1–2 moved by ≤ 0.09 µeV;
+the held widths, growth events and program shapes are identical on both arms.
+No deck change.
 
 ## 2026-10-06 — kmeans names the pool rank and its stop; a budget-stopped selection warns
 
