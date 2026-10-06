@@ -438,15 +438,21 @@ def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_wi
     return [(*row, label) for row in parent_rounds(header['n_q_irr'], width)]
 
 
-#: A face program holds twice the local round's dense term per parent: the
-#: SPMD-partitioned program stages its distributed matmul and eigh operands
-#: beside the tiles the one-device term was calibrated on (every stack of the
-#: sized whole-chain program runs on the mesh, so no whole matrix per rank is
-#: among them). Measured on the CrI3 24x24 P64 cold map-0 receipt (2026-10-05,
-#: three parents per round): the compiled programs held 1.57x (CC), 1.57x (TT)
-#: and 1.63x (CT) the tiled term, so two copies bound them with a fifth to
-#: spare, and the admission lands on the batch the compiled sizing chose
-#: (``tests/test_shared_pole_face_price.py`` replays that receipt).
+#: A face program holds each dense operand twice at its peak: the tile the
+#: byte model counts ([w, r/Px, r/Py] per rank) and the collective's staged
+#: copy of it, in the layout the exchange needs. The optimized HLO of the face
+#: parent program (main 0a393dd72, 2x2 mesh, side 1024 and 2048, width 2)
+#: holds, beside 230/208 tiles c128[w, r/2, r/2], their regrouped copies
+#: c128[w, Px, 1, r/2/Px, r/2] and c128[1, Px, r/2, Py, r/2]: the all-to-all
+#: source and destination buffers of the distributed matmul's panel exchange
+#: and of the eigh stack's reshard, each the same bytes as the tile it moves,
+#: live while the tile itself is. XLA cannot alias a collective's source with
+#: its destination, so the second copy is structural, not a fusion accident.
+#: Measured against one tiled copy: the probe's temp + output 1.17 (side 1024)
+#: and 1.46 (2048); the compiled sizing figures of the P4 Fe 4^3 (0.95, CT
+#: 1.09-1.51) and CrI3 6x6 (0.82-1.06) receipts and of the P64 CrI3 24x24
+#: receipt (1.57-1.63). Two copies bound every one of them
+#: (``tests/test_shared_pole_face_price.py`` replays those receipts).
 FACE_PROGRAM_COPIES = 2
 
 
