@@ -26,14 +26,17 @@ the fitting law and numerical behavior are unchanged.
 
 The shared-pole recipe (`shared_real_pole_v1_r4`, new recipe hash) places W's
 line sites over the energies at which the run's requested states read Σ
-(each state's E_in ± 2 eV, `gw.qp_support.requested_reads_ev`), with a
+(each state's E_in ± 5 eV, `gw.qp_support.requested_reads_ev`), with a
 closed-form count ⌈(Ω_R − h)·ln(4/ε)/(πh)⌉ held between 18 − n_imag and a
 40-sample cap. They were placed for states within a fixed ±5 eV of μ, so a
 requested state further out read an extrapolated W (Si 0.5–0.7 eV, Ni 20³ up
 to 0.92 eV). The model header records `support_top_ev` and `support_reads_ev`;
 the Σ planner warns, never refuses, when a sample group reads outside them
 (the coarse semicore windows always do). `support_delivery_window_ev` is gone;
-ω_p + 3.5 eV still tops the imaginary ladder only. Against each deck's dense
+ω_p + 3.5 eV still tops the imaginary ladder only. The Sigma planner's
+separate read pad remains 2 eV. The numerical comparisons below describe
+the earlier support placement with a 2 eV W-read pad; they are not a new
+benchmark of the current 5 eV placement. Against each deck's dense
 line ladder (max / RMS meV, cold P4): Fe 4³ charge ±2 eV 2.56/1.72 → 1.38/0.87,
 ±10 eV 43.1/7.50 → 22.6/3.94, far 274/56.4 → 80.8/14.6; Fe 4³ bispinor
 8.03/4.26 → 6.97/3.40, 39.3/7.77 → 46.2/6.87, 850/143 → 99/19.9; Si 4³ (eqp0)

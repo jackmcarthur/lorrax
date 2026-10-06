@@ -37,7 +37,7 @@ shared_real_pole_v1_r3b = {
     # Production line sites (report section IV.B, the support rule): quantiles of the
     # consumer's crossing-pair density to the power alpha on [omega_lo, omega_reach].
     # The reads are the requested states' Sigma frequencies (gw.qp_support
-    # .requested_reads_ev: E_in +/- the plan pad on the Sigma step), so the line reaches
+    # .requested_reads_ev: E_in +/- this recipe's support_read_pad_ev), so the line reaches
     # every state the run asks for (WSUPPORT, claims 3282/3284; was a fixed +/-5 eV
     # window). Si Sigma optimum flat over alpha 0.25-0.75.
     "support_density_power": 0.5,
