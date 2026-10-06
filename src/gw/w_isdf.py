@@ -3393,7 +3393,7 @@ def _fractional_pair_scan_face(
     psi_mun_a, psi_nmu_a, psi_mun_b, psi_nmu_b, energy_a, energy_b,
     occ_a, occ_b, z_values, *,
     nb_full, nb_logical, tile, unfold_x=None, unfold_y=None, roll_b=None,
-    k_unfold_plan=None, ordered=False,
+    k_unfold_plan=None, ordered=False, with_derivative=False,
 ):
     """Stream ordered band-pair tiles ``(f_a - f_b) / (e_a - e_b + z)`` at nonzero z from canonical faces with optional typed parent transport.
 
@@ -3496,6 +3496,12 @@ def _fractional_pair_scan_face(
         de = ea[:, :, None] - eb[:, None, :]
         df = fa[:, :, None] - fb[:, None, :]
         weights = df[None, :, :, :] / (de[None, :, :, :] + z[:, None, None, None])
+        if with_derivative:
+            # Exact reference slope d/ds=(d/dz)/(2z), accumulated by the
+            # same ordered density pairs. Nonzero z is required at the door.
+            slope = -weights / ((de[None, :, :, :] + z[:, None, None, None])
+                                * (2 * z[:, None, None, None]))
+            weights = jnp.concatenate((weights, slope), axis=0)
         logical = (
             (ga[:, None] < int(nb_logical)) & (gb[None, :] < int(nb_logical))
         )[None, :, :]
@@ -3514,7 +3520,7 @@ def _fractional_pair_scan_face(
             "zkab,kmab,knab->zmn", weights, density_x, jnp.conj(density_y),
             optimize=True)
 
-    zero = jnp.zeros((z.size, nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
+    zero = jnp.zeros((z.size * (2 if with_derivative else 1), nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
 
     def _outer(acc, ia_step):
         ia = ia_step * tile
@@ -3586,6 +3592,7 @@ def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
 def _get_chi_fractional_q_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
     n_z: int, k_unfold_plan=None, layout="face", ordered=False,
+    with_derivative=False,
 ):
     """Roll the unfolded b endpoint to k−q inside the ordered-pair contraction.
 
@@ -3600,7 +3607,8 @@ def _get_chi_fractional_q_kernel_face(
     tile = int(pair_tile)
     ordered = bool(ordered)
     key = ("direct_fractional_q_face", _mesh_key(mesh_xy), int(nb_full),
-           int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout, ordered)
+           int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout, ordered,
+           bool(with_derivative))
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -3616,7 +3624,7 @@ def _get_chi_fractional_q_kernel_face(
                 psi_mun, psi_nmu, psi_mun_b, psi_nmu_b, energies, eb,
                 occupations, fb, z_values,
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
-                ordered=ordered)
+                ordered=ordered, with_derivative=with_derivative)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None))
     else:
@@ -3636,7 +3644,8 @@ def _get_chi_fractional_q_kernel_face(
                 occupations, fb, z_values,
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
                 unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx,
-                k_unfold_plan=k_unfold_plan, ordered=ordered)
+                k_unfold_plan=k_unfold_plan, ordered=ordered,
+                with_derivative=with_derivative)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None)) + _PARENT_UNFOLD_SPECS
 
@@ -3669,6 +3678,7 @@ def compute_chi0_direct_fractional(
     nb_logical=None,
     progress_fn=None,
     ordered=False,
+    with_derivative=False,
 ):
     """Exact finite-occupation chi0 at selected nonzero complex frequencies; see docs/architecture/fractional_chi0_response_face.md.
 
@@ -3680,6 +3690,11 @@ def compute_chi0_direct_fractional(
     conjugation on the ``mu`` density (:func:`_fractional_pair_scan_face`).
     The incumbent trace, ``FT_q[chi^T]``, is kept bit for bit when
     ``ordered=False``; the two agree under time reversal.
+
+    ``with_derivative=True`` returns ``(chi, dchi_ds)`` from the same
+    band-pair scan, with the exact derivative of its Lehmann denominator
+    ``d/ds=(d/dz)/(2z)``. This is a numerical-oracle capability for contour
+    references; default production samples retain their original output.
     """
     e = jnp.asarray(wfns.enk, dtype=jnp.float64)
     f = jnp.asarray(occupation_state.f_kn, dtype=jnp.float64)
@@ -3748,7 +3763,8 @@ def compute_chi0_direct_fractional(
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
         pair_tile=_FRACTIONAL_PAIR_TILE, n_z=z.size,
-        k_unfold_plan=plan, layout=wfns.layout, ordered=ordered)
+        k_unfold_plan=plan, layout=wfns.layout, ordered=ordered,
+        with_derivative=bool(with_derivative))
     rows = []
     for q_row, row in enumerate(kmq):
         started = time.monotonic()
@@ -3760,6 +3776,9 @@ def compute_chi0_direct_fractional(
             progress_fn(q_row + 1, len(kmq), time.monotonic() - started)
         rows.append(value)
     values = jnp.stack(rows, axis=1)
+    if with_derivative:
+        chi, slope = values[:z.size], values[z.size:]
+        return (chi[0], slope[0]) if z.size == 1 else (chi, slope)
     return values[0] if z.size == 1 else values
 
 

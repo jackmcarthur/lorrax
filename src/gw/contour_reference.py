@@ -1,0 +1,248 @@
+"""Ordered contour-deformation algebra for small scalar GW references.
+
+This reference helper consumes contractions of *minus* the decaying
+correlation interaction, ``-W_c``. It builds neither a response nor a Green
+function. The caller retains their shared physics owners and all-P layouts,
+and supplies bounded external-state blocks. Frequencies and spacings are in
+Ry. Values/derivatives have shape ``(k, a, b, m)``, external-minus-internal
+energies ``x`` and occupations have shape ``(k, a, E, m)``. Derivatives are
+with respect to ``s=z**2``. The output is ``(k, a, b, E)``.
+
+The ordered split is the authenticated historical TRREF algebra, with
+``W(-iu)=W(iu)^dagger`` and occupied residues from ``W_-q(|x|+i eta)^T``.
+A decaying two-pole anchor matches the exactly known value and slope at
+``i eta``. Its integral is analytic; subtraction occurs before multiplying
+the singular imaginary-axis kernel. Infinite-domain refinements are empirical
+checks, not a certified bound on an unsampled physical response. An exactly
+known instantaneous term must be removed by its owner before this helper and
+its self-energy added separately; it is not a decaying ``W_c`` sample.
+
+The default finite-eta convention is ``time_ordered_fractional``:
+occupied pole denominators have ``x+Omega-i eta`` and empty denominators
+``x-Omega+i eta``. A retarded self-energy uses ``+i eta`` on both poles;
+their imaginary parts must not be compared as the same observable. Their
+diagonal real parts coincide for real Hermitian pole residues.
+``analytic_convention="retarded"`` selects the common upper-half-plane
+external energy and conjugates the occupied residue's complete derivative.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from common.units import RYD_TO_EV
+
+
+def imaginary_rule(n, eta, *, scale=None):
+    """Gauss rules on ``[0, eta]`` and ``[eta, infinity)``, both open.
+
+    ``n`` nodes are divided between the finite segment and the rationally
+    mapped tail. No finite cutoff or missing tail changes with ``n``. ``scale``
+    sets the tail map's stretch in Ry and is held fixed across refinements.
+    Returns positive nodes and weights in Ry; no node equals the Green pole.
+    """
+    eta = float(eta)
+    scale = eta if scale is None else float(scale)
+    if int(n) != n or int(n) < 8 or not np.isfinite([eta, scale]).all() or min(eta, scale) <= 0:
+        raise ValueError("CD imaginary rule needs n >= 8 and positive finite eta/scale")
+    low = max(2, int(n) // 5)
+    out = []
+    for count, tail in ((low, False), (int(n) - low, True)):
+        t, w = np.polynomial.legendre.leggauss(count)
+        t, w = (t + 1) / 2, w / 2
+        if tail:
+            out.append((eta + scale * t / (1 - t), w * scale / (1 - t)**2))
+        else:
+            out.append((eta * t, eta * w))
+    return tuple(np.concatenate([part[j] for part in out]) for j in (0, 1))
+
+
+def _inputs(x, occ, eta):
+    x = np.asarray(x, np.float64)
+    f = np.broadcast_to(np.asarray(occ, np.float64), x.shape)
+    if x.ndim != 4 or not np.isfinite(x).all() or not np.isfinite(f).all():
+        raise ValueError("CD x/occupations must be finite (k,a,E,m) arrays")
+    if np.any((f < 0) | (f > 1)) or not np.isfinite(eta) or eta <= 0:
+        raise ValueError("CD needs occupations in [0,1] and positive finite eta")
+    return x, f
+
+
+def _apply(a, weights, xp):
+    return xp.einsum("kabl,kael->kabe", a, weights)
+
+
+def _dagger(a, xp):
+    return xp.conj(xp.swapaxes(a, -3, -2))
+
+
+def _kernels(x, occ, eta, analytic_convention, xp):
+    if analytic_convention not in ("time_ordered_fractional", "retarded"):
+        raise ValueError("CD analytic_convention must be time_ordered_fractional or retarded")
+    f = xp.broadcast_to(xp.asarray(occ), x.shape)
+    dc = x + 1j * eta
+    return f, (dc if analytic_convention == "retarded" else x - 1j * eta), dc
+
+
+def anchor_coefficients(value, derivative_s, eta, *, betas=None):
+    """Two decaying poles matching value and exact ``d/ds`` at ``z=i eta``.
+
+    Returns ``(c1,c2)`` for ``A(u)=sum_j c_j/(u**2+beta_j**2)``.
+    The anchor poles are numerical auxiliaries, held fixed in every refinement.
+    """
+    beta = np.asarray([.5, 4.], np.float64) / RYD_TO_EV if betas is None else np.asarray(betas, np.float64)
+    if beta.shape != (2,) or not np.isfinite(beta).all() or np.any(beta <= 0) or beta[0] == beta[1]:
+        raise ValueError("CD anchor needs two distinct positive finite beta values")
+    d1, d2 = eta**2 + beta**2
+    y1 = (-derivative_s + value / d2) / (1 / d2 - 1 / d1)
+    return (y1 * d1, (value - y1) * d2), beta
+
+
+def _odd_anchor(d, x, beta, zero_angle, xp):
+    d2 = d * d
+    angle = xp.where(x == 0, zero_angle, xp.angle(d2))
+    return (np.log(beta**2) - (xp.log(xp.abs(d2)) + 1j * angle)) / (2 * (beta**2 - d2))
+
+
+def anchor_part(value0, deriv0, x, occ, *, eta, betas=None,
+                analytic_convention="time_ordered_fractional", xp=np):
+    """Analytic anchor integral, and its two ordered half-line coefficients."""
+    xh, fh = _inputs(x, occ, eta)
+    x, f = xp.asarray(xh), xp.asarray(fh)
+    cp, beta = anchor_coefficients(value0, deriv0, eta, betas=betas)
+    cm, _ = anchor_coefficients(_dagger(value0, xp), _dagger(deriv0, xp), eta, betas=beta)
+    f, dv, dc = _kernels(x, f, eta, analytic_convention, xp)
+    angle_v = np.pi if analytic_convention == "retarded" else -np.pi
+    sign = xp.where(x >= 0, 1., -1.)
+    total = 0
+    for p, m, b in zip(cp, cm, beta):
+        even = f * sign / (2 * b * (b + sign * dv)) + (1 - f) * sign / (2 * b * (b + sign * dc))
+        odd = (f * _odd_anchor(dv, x, b, angle_v, xp)
+               + (1 - f) * _odd_anchor(dc, x, b, np.pi, xp)) * (1j / (2 * np.pi))
+        total = total + _apply(.5 * (p + m), even, xp) + _apply(p - m, odd, xp)
+    return total, cp, cm, beta
+
+
+def imag_remainder_node(value_i, u, weight, x, occ, cp, cm, betas, *, eta,
+                        analytic_convention="time_ordered_fractional", xp=np):
+    """One imaginary node with its known Green-pole limit subtracted first.
+
+    ``value_i`` is the contraction of ``-W_c(iu)``. The two independently
+    ordered half-lines are retained. Rules must avoid ``u=eta``; their open
+    intervals do so even for the own-energy column ``x=0``.
+    """
+    if float(u) <= 0 or not np.isfinite([u, weight]).all() or weight <= 0 or float(u) == float(eta):
+        raise ValueError("CD imaginary node needs u>0, weight>0, u!=eta")
+    f, dv, dc = _kernels(x, occ, eta, analytic_convention, xp)
+    minus = (f / (dv - 1j * u) + (1 - f) / (dc - 1j * u)) * (weight / (2 * np.pi))
+    plus = (f / (dv + 1j * u) + (1 - f) / (dc + 1j * u)) * (weight / (2 * np.pi))
+    ap, am = 0, 0
+    for p, m, beta in zip(cp, cm, betas):
+        ap = ap + p / (u * u + beta * beta)
+        am = am + m / (u * u + beta * beta)
+    return _apply(value_i - ap, minus, xp) + _apply(_dagger(value_i, xp) - am, plus, xp)
+
+
+def real_part(values, derivatives_s, values_t, derivatives_t_s, x, occ, nodes,
+              *, eta, n_active=None, band_valid=None, spacing=None,
+              analytic_convention="time_ordered_fractional", xp=np):
+    """Cubic Hermite residues on an authenticated uniform positive real grid.
+
+    Values are sampled at ``nodes+i eta``; the partner samples are already
+    transposed and contracted with the current pair density. Both derivative
+    arrays use the derivative of that same positive real coordinate. Every
+    nonzero physical residue must have two bracketing nodes. ``n_active``
+    excludes explicitly zero carrier bands, never a physical band tail.
+    ``band_valid`` optionally masks per-k ragged spectrum padding explicitly;
+    padded wavefunction coefficients must already be exact zero at the caller.
+    ``spacing`` can select an integer coarsening of the same node grid.
+    """
+    xh, fh = _inputs(x, occ, eta)
+    _kernels(xh, fh, eta, analytic_convention, np)
+    nodes = np.asarray(nodes, np.float64)
+    if nodes.ndim != 1 or nodes.size < 2 or nodes[0] != 0 or not np.isfinite(nodes).all():
+        raise ValueError("CD residues need a finite uniform grid starting at zero")
+    base = nodes[1] - nodes[0]
+    if base <= 0 or not np.allclose(np.diff(nodes), base, rtol=2e-12, atol=2e-14 * base):
+        raise ValueError("CD residue grid must be strictly increasing and uniform")
+    spacing = base if spacing is None else float(spacing)
+    stride = round(spacing / base)
+    if stride < 1 or not np.isclose(stride * base, spacing, rtol=2e-12, atol=0):
+        raise ValueError("CD residue spacing must be an integer multiple of its base grid")
+    count = xh.shape[-1] if n_active is None else int(n_active)
+    if not 0 < count <= xh.shape[-1]:
+        raise ValueError("CD n_active must include a positive physical band extent")
+    active = np.arange(xh.shape[-1])[None, None, None, :] < count
+    if band_valid is not None:
+        valid = np.asarray(band_valid)
+        if valid.dtype != np.bool_:
+            raise ValueError("CD band_valid must be an explicit boolean physical-state mask")
+        active = active & np.broadcast_to(valid, xh.shape)
+    residue = np.where(xh < 0, fh, -(1 - fh))
+    query = np.abs(xh)
+    last = nodes[((nodes.size - 1) // stride) * stride]
+    if np.any(active & (residue != 0) & (query > last)):
+        raise ValueError("CD residue coverage: an active crossing exceeds the last coarse-grid node")
+    for samples in (values, derivatives_s, values_t, derivatives_t_s):
+        if len(samples) != len(nodes):
+            raise ValueError("CD values/derivatives must cover every declared real node")
+    index = np.floor(query / spacing).astype(np.int64)
+    index = np.minimum(index, max(0, (nodes.size - 1) // stride - 1))
+    t = query / spacing - index
+    coeff = (2*t**3 - 3*t**2 + 1, -2*t**3 + 3*t**2,
+             spacing*(t**3 - 2*t**2 + t), spacing*(t**3 - t**2))
+    sign = xp.asarray(xh < 0)
+    active = xp.asarray(active)
+    index = xp.asarray(index)
+    residue = xp.asarray(residue)
+    coeff = tuple(xp.asarray(c) for c in coeff)
+    total = 0
+    for inode in range(0, len(nodes), stride):
+        node = inode // stride
+        z = nodes[inode] + 1j * eta
+        partner_value = values_t[inode]
+        partner_slope = 2*z*derivatives_t_s[inode]
+        if analytic_convention == "retarded":
+            partner_value = _dagger(partner_value, xp)
+            partner_slope = _dagger(partner_slope, xp)
+        for deriv, value, partner in ((False, values[inode], partner_value),
+                                      (True, 2*z*derivatives_s[inode], partner_slope)):
+            left, right = coeff[2:] if deriv else coeff[:2]
+            selected = xp.where(active, residue * (xp.where(index == node, left, 0.)
+                                                   + xp.where(index + 1 == node, right, 0.)), 0.)
+            total = total + _apply(value, xp.where(sign, 0., selected), xp)
+            total = total + _apply(partner, xp.where(sign, selected, 0.), xp)
+    return total
+
+
+def integrate_ordered(values, derivatives_s, values_t, derivatives_t_s, x, occ,
+                      schedule, *, eta, n_active=None, band_valid=None, spacings=None,
+                      analytic_convention="time_ordered_fractional", xp=np):
+    """Combine analytic anchor, infinite imaginary integral and real residues.
+
+    ``schedule`` declares ``real_nodes`` and ``imaginary`` rules, each with
+    ``indices``, ``nodes`` and ``weights``. The sample at index zero is
+    ``z=i eta``. Returns a dictionary keyed by ``(n_imaginary, spacing_Ry)``.
+    Refinement comparisons must keep eta, physical bands, states and tail-map
+    scale fixed. No embedded estimator or accuracy refusal is implied.
+    """
+    x, occ = _inputs(x, occ, eta)
+    anchor, cp, cm, beta = anchor_part(values[0], derivatives_s[0], x, occ, eta=eta,
+                                      analytic_convention=analytic_convention, xp=xp)
+    nodes = np.asarray(schedule["real_nodes"], np.float64)
+    spacings = (nodes[1] - nodes[0],) if spacings is None else tuple(spacings)
+    real = {h: real_part(values[:len(nodes)], derivatives_s[:len(nodes)],
+                        values_t[:len(nodes)], derivatives_t_s[:len(nodes)], x, occ, nodes,
+                        eta=eta, n_active=n_active, band_valid=band_valid, spacing=h,
+                        analytic_convention=analytic_convention, xp=xp) for h in spacings}
+    out = {}
+    for rule in schedule["imaginary"]:
+        indices, u, weights = rule["indices"], rule["nodes"], rule["weights"]
+        if len(indices) != len(u) or len(u) != len(weights) or not len(u):
+            raise ValueError("CD imaginary rule has inconsistent or empty arrays")
+        remainder = 0
+        for i, ui, wi in zip(indices, u, weights):
+            remainder = remainder + imag_remainder_node(values[i], ui, wi, xp.asarray(x), occ,
+                                                         cp, cm, beta, eta=eta,
+                                                         analytic_convention=analytic_convention, xp=xp)
+        for h, residues in real.items():
+            out[(len(u), h)] = anchor + remainder + residues
+    return out
