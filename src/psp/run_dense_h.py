@@ -73,7 +73,10 @@ def solve_k(H_k, gvecs_file, nspinor, eigh, nbands, *, full_spectrum=False):
             f"> {tol:.1e}.")
     energies, vectors = eigh(H)                    # eigenvectors as columns
     nphysical = nspinor * H_k.nG
-    keep = nphysical if full_spectrum else nbands
+    # Ranks own different k spheres. Every device operation keeps the same
+    # padded shape so the compile-agreement sequence is identical; native
+    # truncation happens only after the synchronous host copy.
+    keep = H.shape[-1] if full_spectrum else nbands
     selected = vectors[:, :keep]
     residual = float(jnp.max(jnp.abs(H @ selected - selected * energies[:keep])) / h_pad)
     orthogonality = float(jnp.max(jnp.abs(jnp.conj(selected.T) @ selected - jnp.eye(keep))))
@@ -81,12 +84,17 @@ def solve_k(H_k, gvecs_file, nspinor, eigh, nbands, *, full_spectrum=False):
         raise RuntimeError(f"dense eigenpairs failed: residual={residual:.2e}, "
                            f"orthogonality={orthogonality:.2e}, tolerance={tol:.2e}")
     psi = np.asarray(selected.T).reshape(keep, nspinor, ngkmax)
+    if full_spectrum:
+        psi = psi[:nphysical]
     leak = float(np.max(np.abs(psi[:, :, H_k.nG:]), initial=0.0))
     if not leak <= 1e-10:
         raise RuntimeError(
             f"dense H_k: a physical eigenvector has weight {leak:.1e} on the "
             f"padded G block; the pad did not separate from the spectrum.")
-    return (np.asarray(energies[:keep]), reorder_to_qe(psi, H_k, gvecs_file),
+    energies_host = np.asarray(energies[:keep])
+    if full_spectrum:
+        energies_host = energies_host[:nphysical]
+    return (energies_host, reorder_to_qe(psi, H_k, gvecs_file),
             nphysical, skew, np.asarray([skew, residual, orthogonality]))
 
 
