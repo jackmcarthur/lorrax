@@ -101,11 +101,18 @@ def test_decoupled_face_matches_local():
     local = reduce_round(ls, li, tables, real=q, mesh_xy=mesh, native_eigh=_local_eigenplan(mesh, side).native_fn,
                          ordered=True, odd_moments=True, keep_budget=budget, retain_span=True, gram_keep=gram_keep)
     fs, fi = place(NamedSharding(mesh, P(None, "x", "y")))
-    for sub in (q, 2, 1):
-        dec = face_reduce_decoupled(fs, fi, tables, mesh=mesh, eigh_plan=_local_eigenplan(mesh, side), width=sub,
+    import distrib_la
+    # Route (c) plans give the paired metric's inverse root by eigh; the provider
+    # plan (its stacks not one whole matrix per rank) keeps Newton-Schulz.
+    by_eigh = _local_eigenplan(mesh, side)
+    provider = distrib_la.plan("eigh", mesh, n=side, backend="off", batched_route="auto")
+    assert provider.stack_route((q, 16, 16), np.complex128, traced=False).route != "batch_reshard"
+    for sub, plan in ((q, by_eigh), (2, by_eigh), (1, by_eigh), (2, provider)):
+        dec = face_reduce_decoupled(fs, fi, tables, mesh=mesh, eigh_plan=plan, width=sub,
                                     ordered=True, odd_moments=True, keep_budget=budget, retain_span=True,
                                     gram_keep=gram_keep, carrier=face_ritz_carrier(mesh, budget))
         ld, dd = (jax.tree.map(np.asarray, r[3][0]) for r in (local, dec))
+        assert np.all(dd["paired_metric_inverse_root_residual_relative"] < 1e-12), sub
         for key in ("gram_spectrum_relative", "gram_min_relative", "paired_min_relative", "retained_metric_relative"):
             assert np.allclose(ld[key], dd[key], rtol=1e-8, atol=1e-12), (sub, key)
         for key in ("retained_rank", "paired_rank", "positive_count", "gram_valid", "orientation_paired"):

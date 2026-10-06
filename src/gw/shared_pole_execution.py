@@ -659,7 +659,7 @@ def compact_program(mesh,width):
 
 # ---- the decoupled face route: every parent in flight, stage programs over sub-batches ----
 #
-# The paired reduction is four GEMM stages with an eigh between them
+# The paired reduction is GEMM stages with an eigh between them
 # (``shared_pole_reduction``). A face round of w parents runs them as one
 # program, so its eigh stacks hold w matrices and the round count sets the
 # eigh wall: 21 rounds of 3 at CrI3 24x24 P64 cost 21 serial local eighs
@@ -667,6 +667,11 @@ def compact_program(mesh,width):
 # of ``width`` parents, its outputs stacked for every parent, and each eigh
 # runs once over the whole stack, one matrix per rank (route (c), flat to
 # b = P). Nothing between stages is held that the next stage does not read.
+# Where the paired [2c, 2c] metric's stack runs route (c) too, its inverse root
+# is V diag(lambda**-1/2) V^H from one more such eigh: 3 GEMMs of side 2c with the
+# residual check, against Newton-Schulz's 3 per iteration plus the check (CrI3 24x24
+# TT: 14 GEMMs, 700 TF per parent, the bulk of the reduction's flops). A metric
+# whose stack would run on the whole mesh keeps Newton-Schulz.
 
 
 @lru_cache(maxsize=None)
@@ -681,6 +686,32 @@ def _stack(mesh, parts):
     def join(*leaves):
         return leaves[0] if jnp.ndim(leaves[0]) == 0 else _stack_parents(mesh, leaves[0].ndim)(*leaves)
     return jax.tree.map(join, *parts)
+
+
+@lru_cache(maxsize=None)
+def _stack_slot(mesh, shape, dtype):
+    """The program writing one sub-batch into its rows of a parent stack, in place
+    (the stack donated), and the program allocating that stack."""
+    sharding = NamedSharding(mesh, P(None, 'x', 'y')) if len(shape) >= 3 else NamedSharding(mesh, P())
+    write = jax.jit(lambda full, part, i0: jax.lax.dynamic_update_slice_in_dim(full, part, i0, axis=0),
+                    donate_argnums=0, out_shardings=sharding)
+    return write, jax.jit(partial(jnp.zeros, shape, dtype), out_shardings=sharding)
+
+
+def _assemble(mesh, nq, parts):
+    """``_stack`` with the stack allocated once and each sub-batch written into it in
+    place as it arrives (``parts`` an iterator of (offset, tree)): one stack and one
+    sub-batch live, not the sub-batches and their concatenation."""
+    stack = None
+    for i0, part in parts:
+        if stack is None:
+            stack = jax.tree.map(lambda a: a if jnp.ndim(a) == 0 else
+                                 _stack_slot(mesh, (int(nq), *a.shape[1:]), a.dtype)[1](), part)
+        stack = jax.tree.map(lambda full, a: full if jnp.ndim(a) == 0 else
+                             _stack_slot(mesh, full.shape, full.dtype)[0](full, a, jnp.asarray(i0, jnp.int32)),
+                             stack, part)
+        del part
+    return stack
 
 
 def _take(mesh, tree, i0, i1):
@@ -698,7 +729,7 @@ def _take(mesh, tree, i0, i1):
 def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_keep, carrier):
     """The four stage programs of the decoupled face reduction, each jitted on the face."""
     from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, _matrix_take_columns
-    from gw.shared_pole_reduction import paired_members, keep_stage, paired_stage, output_stage
+    from gw.shared_pole_reduction import paired_members, keep_stage, paired_stage, paired_correct, output_stage
     from gw.shared_pole_gates import sort_shared_pole_columns, apply_shared_pole_zero_policy, ordered_moment_identity
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     if not (ordered and odd_moments):
@@ -708,8 +739,17 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
 
     # The stage dicts cross program boundaries, so they carry arrays only; a stage's
     # static extents are read back from the shapes it holds (R = 2 hvv, half from the
-    # inverse nodes, the kept width from its mask) before the equations run.
+    # inverse nodes, the kept width from its mask) before the equations run. A stage
+    # returns only what it computes: the keys it passes through unchanged are named
+    # (at trace time, ``passthrough``) and the caller keeps its own stacks for them,
+    # so no program copies a held stack.
     arrays = lambda d: {k: v for k, v in d.items() if not isinstance(v, int)}
+    passthrough = {}
+
+    def new_only(name, before, after):
+        same = tuple(sorted(k for k, v in after.items() if k in before and v is before[k]))
+        passthrough[name] = same
+        return arrays({k: v for k, v in after.items() if k not in same})
 
     def extents(stage):
         return dict(stage, side=2 * int(stage['scale'].shape[-1]), half=int(stage['inverse'].shape[-1]),
@@ -726,11 +766,16 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
         return arrays(stage)
 
     def stage2(stage, gamma, u):
-        return arrays(keep_stage(extents(stage), gamma, u, matmul=mm, gates=gates, keep_budget=keep_budget,
-                                 retain_span=retain_span, matrix_sharding=ms, gram_keep=gram_keep, carrier=carrier))
+        return new_only('keep', stage, keep_stage(extents(stage), gamma, u, matmul=mm, gates=gates,
+            keep_budget=keep_budget, retain_span=retain_span, matrix_sharding=ms, gram_keep=gram_keep, carrier=carrier))
 
     def stage3(stage, gamma_r, u_r):
-        return arrays(paired_stage(extents(stage), gamma_r, u_r, matmul=mm, gates=gates, matrix_sharding=ms))
+        return new_only('paired', stage, paired_stage(extents(stage), gamma_r, u_r, matmul=mm, gates=gates,
+                                                      matrix_sharding=ms))
+
+    def stage3b(stage, *eigen):
+        return new_only('correct', stage, paired_correct(stage, tuple(eigen) or None, matmul=mm, gates=gates,
+                                                         matrix_sharding=ms))
 
     def stage4(stage, mu, rotation, infinity):
         reduced = output_stage(extents(stage), mu, rotation, matmul=mm, gates=gates, retain_span=retain_span,
@@ -742,8 +787,8 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
         model, permutation = sort_shared_pole_columns(model, matrix_sharding=ms)
         result = model, signed, (reduction, zero, retained, permutation)
         return (*result, reduced[3]) if retain_span else result
-    return tuple(face_program(fn, mesh, outputs='mixed' if i < 3 else 'parent')
-                 for i, fn in enumerate((stage1, stage2, stage3, stage4)))
+    return tuple(face_program(fn, mesh, outputs='mixed' if i < 4 else 'parent')
+                 for i, fn in enumerate((stage1, stage2, stage3, stage3b, stage4))), passthrough
 
 
 def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, ordered, odd_moments,
@@ -754,22 +799,35 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, o
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
-    stage1, stage2, stage3, stage4 = programs
+    (stage1, stage2, stage3, stage3b, stage4), passthrough = programs
     eigh = eigh_plan.batched
     cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
     inputs = (tables['points'], tables['order'], tables['active'],
               tuple(s[1] for s in states), tuple(s[2] for s in states), tuple(s[3] for s in states), tuple(infinity))
 
     def run(program, *stacks):
-        parts = [program(*_take(mesh, stacks, i0, i1)) for i0, i1 in cuts]
-        return _stack(mesh, parts)
+        return _assemble(mesh, nq, ((i0, program(*_take(mesh, stacks, i0, i1))) for i0, i1 in cuts))
+
+    def advance(name, program, stage, *operands):
+        new = run(program, stage, *operands)
+        return {**{k: stage[k] for k in passthrough[name]}, **new}
     stage = run(stage1, *inputs)
     gamma, u = eigh(stage['h_vv'])
-    stage = run(stage2, stage, gamma, u)
+    stage = advance('keep', stage2, stage, gamma, u)
     del gamma, u
     gamma_r, u_r = eigh(stage['schur'])
-    stage = run(stage3, stage, gamma_r, u_r)
+    stage = advance('paired', stage3, stage, gamma_r, u_r)
     del gamma_r, u_r
+    metric = stage['metric_r']
+    by_eigh = eigh_plan.stack_route(metric.shape, metric.dtype, traced=False).route == 'batch_reshard'
+    if jax.process_index() == 0:
+        print(f"Shared-pole decoupled: paired metric [{int(metric.shape[-1])}] inverse root by "
+              f"{'eigh, one whole matrix per rank' if by_eigh else 'Newton-Schulz (its stack runs on the whole mesh)'}",
+              flush=True)
+    eigen = eigh(metric) if by_eigh else ()
+    del metric
+    stage = advance('correct', stage3b, stage, *eigen)
+    del eigen
     mu, rotation = eigh(stage['reduced'])
     result = run(stage4, stage, mu, rotation, inputs[6])
     del stage, mu, rotation

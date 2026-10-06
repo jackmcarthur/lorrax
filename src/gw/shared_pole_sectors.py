@@ -894,24 +894,28 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     # stacks of every parent are reserved below, apart from them.
     budget.plan(side,phase='reduction',padding_output_bytes_per_rank=0)
     budget.batch_width=int(nq)
-    # The stage stacks of every parent sit beside the eigh stacks. The peak is the
-    # second stage's run, both its input stack (the paired members) and its output
-    # stack (the restricted pencil) live; the eighs run beside the state panels and
-    # one stack, and take their room from the ledger beside exactly that.
+    # The stage stacks of every parent sit beside the eigh stacks. A stage's run holds
+    # its input stack and the stack it writes in place (face_reduce_decoupled): the
+    # keep stage the paired members and the restricted pencil, the paired stage the
+    # restricted pencil and (Y, metric_r), the correction (Y, G_r, metric_r), the
+    # metric's eigenvectors and (Y, Y^H G_r Y). The eighs run beside the state panels
+    # and one boundary stack, and take their room from the ledger beside the largest.
     hvv=side//2
     c=int(face_ritz_carrier(mesh_xy,recipe['pole_budget']) or hvv)
+    two=2*c
     packed=int(local_meta.n_rmu_padded)
     members=16*(6*hvv*hvv+2*packed*hvv)
-    restricted=16*(2*(2*c)**2+2*c*c+hvv*c+packed*2*c)
+    restricted=16*(2*two**2+2*c*c+hvv*c+packed*two)
+    metric=16*(3*two**2+hvv*c+packed*two)
     per_rank=lambda bytes_per_parent:-(-int(bytes_per_parent)*int(nq)//int(mesh_xy.size))
     panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:])
     panels+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
-    stacks=per_rank(members+restricted)
+    stacks=per_rank(max(members+restricted,restricted+16*2*two**2,metric+16*3*two**2))
     row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=stacks+panels,
                        workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)
     ambient=ledger.live_stages
     ledger.live_stages=(*ambient,row['stage'])
-    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members,restricted))+panels,
+    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members,restricted,metric))+panels,
                           workspace_bytes_per_rank=0,concurrent_with=ambient)
     room=face_eigh_room(beside)
     admitted=row['device_budget_status']=='PASS'
@@ -947,6 +951,11 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
         ledger.live_stages=ambient
     model,signed,vectors,diagnostics,y=reduced
     _sector_gates(diagnostics,geometry['sector'],list(range(int(nq))),int(nq))
+    if jax.process_index()==0:
+        residual=lambda key:float(np.max(np.asarray(diagnostics[0][key])[:int(nq)]))
+        print(f"Shared-pole {geometry['sector']} metric inverse roots, max |ZAZ-I|_F/sqrt(R) over parents: "
+              f"keep {residual('metric_inverse_root_residual_relative'):.1e}, "
+              f"paired {residual('paired_metric_inverse_root_residual_relative'):.1e}",flush=True)
     budget.retained_panels=tuple(retained)
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
