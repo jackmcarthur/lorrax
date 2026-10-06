@@ -1453,17 +1453,9 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')
-    if resolved_execution=='face':
-        # The row route (parents over x, matrices over y; XLA products, rank-local
-        # eighs once per round) at the widest round the byte model admits; the
-        # face route below Px parents.
-        from gw.shared_pole_execution import row_width
-        width=row_width(execution_rows,mesh_xy=mesh_xy,ledger=ledger,
-                        resolution=linalg_resolution({'linalg':config.backend.linalg}))
-        if width:
-            resolved_execution='row'
-            for row in execution_rows:
-                row['row_width']=int(width)
+    # The 1-D row route (parents over x, matrices over y) is never resolved: the
+    # owner keeps every matrix 2-D over all P (2026-10-06); it stays as the
+    # measured baseline (``row_width`` admits it) until the 2-D decoupled route lands.
     for row in execution_rows:
         row['joint']=dict(mode=joint_mode,**joint_route)
     return resolved_execution,execution_rows
