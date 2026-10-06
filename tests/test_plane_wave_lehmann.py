@@ -9,6 +9,7 @@ from gw.lehmann_response import lehmann_pair_weights
 from gw.plane_wave_lehmann import gamma_transition_vertices, GammaLehmannResponse
 from gw.plane_wave_screening import SphereScreening
 from gw.response_bank import screened_interaction_slope
+from runtime.padding import padded_axis
 
 
 @pytest.fixture
@@ -58,7 +59,9 @@ def test_ordered_complex_g_vertices_and_slope_match_independent_sum(mesh):
     value,derivative=bank.evaluate(z,with_derivative=True)
     np.testing.assert_allclose(value,expected,rtol=3e-12,atol=3e-12)
     np.testing.assert_allclose(derivative,ds,rtol=3e-12,atol=3e-12)
-    np.testing.assert_array_equal(bank.evaluate(z),value)
+    # Separate compilations may change floating-point fusion; both value
+    # paths must satisfy the same independent physical oracle.
+    np.testing.assert_allclose(bank.evaluate(z),expected,rtol=3e-12,atol=3e-12)
     assert bank.receipt["physical_pair_count"]==10
     assert np.max(np.abs(np.asarray(value)[...,3,:]))==0.
     assert np.max(np.abs(np.asarray(value)[...,:,3]))==0.
@@ -168,7 +171,8 @@ def test_full_noncommuting_dyson_slope_without_transpose_or_adjoint(mesh):
         np.testing.assert_allclose((exact(s+h)-exact(s-h))/(2*h),expected,atol=2e-9,rtol=2e-9)
     # Test the canonical value+slope composition with a planted bare operator.
     solver=SphereScreening.__new__(SphereScreening)
-    solver.mesh=mesh;solver.linalg="local";solver.batched_route="auto";solver.axis=None
+    solver.mesh=mesh;solver.linalg="local";solver.batched_route="auto"
+    solver.axis=padded_axis(4,mesh,name="planted response sphere")
     solver._V=jax.device_put(v[None].astype(complex),face)
     value,slope=solver.solve_pair(jax.device_put(chi[None],face),device_dchi)
     np.testing.assert_allclose(value[0],w,atol=2e-12,rtol=2e-12)
