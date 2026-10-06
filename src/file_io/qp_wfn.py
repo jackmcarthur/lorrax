@@ -1080,8 +1080,16 @@ def write_dense_spectrum_h5(output_path, wfn, local_spectra, *, mesh, stamps):
             dst.write_attr(f"{group}/energies_ry", e)
             dst.write_attr(f"{group}/gvecs", gvecs[ik, :n_g])
             dst.write_attr(f"{group}/checks", checks)
+    # SlabIO metadata is deferred until close. Land the native per-k groups
+    # before the collective coefficient create, just as _write_source_header
+    # lands the wfns group before the rectangular writer's second handle.
+    with SlabIO(output_path, mode="a", mesh=mesh) as dst:
+        for ik, n_g_value in enumerate(ngk):
+            n_g, nb = int(n_g_value), ns * int(n_g_value)
+            values = local_spectra.get(ik)
+            c = np.zeros((nb, ns, n_g), np.complex128) if values is None else values[1]
             width = _coefficient_window(mesh, nbands=nb, nspinor=ns, ngkmax=n_g)
-            name = f"{group}/coefficients"
+            name = f"k{ik:05d}/coefficients"
             dst.create_dataset(name, shape=(nb, ns, n_g, 2), dtype=np.float64)
             for g0 in range(0, n_g, width):
                 count = min(width, n_g - g0)

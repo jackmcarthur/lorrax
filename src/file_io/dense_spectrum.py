@@ -18,7 +18,7 @@ import h5py
 import numpy as np
 
 from .slab_io import SlabIO
-from .commit_state import COMMIT_STATE, assert_committed
+from .commit_state import COMMIT_STATE, assert_committed, agree_io_refusal
 
 
 SCHEMA = "lorrax.dense-native-spectrum.v1"
@@ -112,6 +112,18 @@ class DenseSpectrumReader:
         self.mesh = mesh
         self.max_local_read_bytes = int(max_local_read_bytes)
         self._io = None
+        error = None
+        try:
+            self._authenticate(expected_source_sha256, expected_archive_sha256)
+        except Exception as exc:
+            error = exc
+        agree_io_refusal(error, path=self.path, stage="native spectrum reference open")
+        if error is not None:
+            raise error
+        self._io = SlabIO(self.path, mode="r", mesh=mesh)
+
+    def _authenticate(self, expected_source_sha256, expected_archive_sha256):
+        source_wfn = self.source_wfn
         archive_digest = str(expected_archive_sha256)
         if len(archive_digest) != 64 or _sha256(self.path) != archive_digest:
             _refuse("archive SHA256 differs from the independently checked receipt")
@@ -189,7 +201,6 @@ class DenseSpectrumReader:
                           "archive_sha256": archive_digest,
                           "source_sha256_bindings": bindings,
                           "complete_native_basis": True}
-        self._io = SlabIO(self.path, mode="r", mesh=mesh)
 
     def __enter__(self):
         return self
