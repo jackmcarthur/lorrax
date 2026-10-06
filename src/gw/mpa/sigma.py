@@ -1497,10 +1497,14 @@ def _integrate_sigma_batches(
                         # BISPSIG measurement (not for main): Sigma(tau_j) of the mixed sectors at the
                         # sweep's own nodes, before any frequency synthesis (owner test 2026-10-05).
                         from gw.mpa import sector_sigma as _ss
+                        _t = np.asarray(jax.device_get(win.nodes.t), np.complex128)
+                        _ss._BISPSIG_NODES.setdefault(tau_kernel._stage, []).append((row.space, _t))
                         for _j in range(min(3, len(win.nodes.t))):
                             _val = jax.jit(row_kernel)(*tau_arguments, win.nodes.t[_j], active_count)
+                            # The mirrored node -conj(t_j): the kernel at a time off the grid.
+                            _mir = jax.jit(row_kernel)(*tau_arguments, -jnp.conj(win.nodes.t[_j]), active_count)
                             _ss._BISPSIG_TAU.setdefault(tau_kernel._stage, []).append(
-                                (complex(np.asarray(jax.device_get(win.nodes.t[_j]))), row.space, _val))
+                                (complex(_t[_j]), row.space, _val, _mir))
                 else:
                     pole_indices, bounds, phase_real = (
                         device_put_process_local(x, small)
