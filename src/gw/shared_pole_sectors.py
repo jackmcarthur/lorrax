@@ -938,8 +938,11 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],
         infinity_width,column_extent=extent,ordered=True,odd_moments=True,key=name[0],history=history)
     side=int(tables['active'].shape[-1])
-    budget.batch_width=int(nq)
     budget.retained_panels=(*retained,*(a for s in states for a in s[1:]),*infinity)
+    # The stage programs run at the sub-batch width (priced as the face round is); the
+    # stacks of every parent are reserved below, apart from them.
+    budget.plan(side,phase='reduction',padding_output_bytes_per_rank=0)
+    budget.batch_width=int(nq)
     # The stage stacks of every parent sit beside the eigh stacks. The peak is the
     # second stage's run, both its input stack (the paired members) and its output
     # stack (the restricted pencil) live; the eighs run beside the state panels and
