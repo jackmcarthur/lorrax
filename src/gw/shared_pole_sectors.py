@@ -277,6 +277,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     model=construct_diagonal_sector_all(read,int(header['n_q_irr']),meta,config,geometry,
                         mesh_xy=mesh_xy,retained=held_leaves,width=batch_width)
                     whole.append(model)
+                    execution_rows[family]['decoupled']=model['decoupled']
                     used_room(execution_rows[family],model['budget'])
                     held_leaves.extend(jax.tree.leaves((model['model'],model['signed'],
                         model['coefficients'],model['infinity'],tuple(s[1:] for s in model['states']))))
@@ -920,11 +921,13 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
                           workspace_bytes_per_rank=0,concurrent_with=ambient)
     room=face_eigh_room(beside)
     admitted=row['device_budget_status']=='PASS'
-    if jax.process_index()==0:
-        print(f"Shared-pole {geometry['sector']} decoupled: {int(nq)} parents, sub-batches of {int(width)}, "
-              f"pencil side {side}; stacks {stacks/1e9:.1f} GB/rank, panels {panels/1e9:.1f} GB/rank, "
-              f"eigh room {'none' if room is None else f'{room/1e9:.1f} GB/rank'}; "
-              f"{'every eigh once over the stack' if admitted else 'stacks over budget: face rounds over the stacked panels'}",flush=True)
+    receipt=dict(parents=int(nq),sub_batch=int(width),pencil_side=int(side),stacks_bytes_per_rank=int(stacks),
+                 panels_bytes_per_rank=int(panels),eigh_room_bytes_per_rank=room,admitted=bool(admitted))
+    if not admitted:
+        import warnings
+        warnings.warn(f"shared-pole {geometry['sector']}: the decoupled stacks of {int(nq)} parents "
+                      f"({stacks/1e9:.1f} GB/rank) do not fit beside the live set; the stacked panels "
+                      f"reduce in face rounds of {int(width)} (the slow fallback)",RuntimeWarning)
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep=shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
     carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget'])
@@ -932,7 +935,7 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
         if admitted:
             reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,eigh_plan=face_eigh(mesh_xy,side,room),
                 width=int(width),ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-                gram_keep=gram_keep,carrier=carrier)
+                gram_keep=gram_keep,carrier=carrier,receipt=receipt)
         else:
             # The stacks do not fit beside the live set (warn, never refuse): the same
             # stacked panels reduce in face rounds of the admitted width, the eighs per round.
@@ -952,15 +955,13 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
         ledger.live_stages=ambient
     model,signed,vectors,diagnostics,y=reduced
     _sector_gates(diagnostics,geometry['sector'],list(range(int(nq))),int(nq))
-    if jax.process_index()==0:
-        residual=lambda key:float(np.max(np.asarray(diagnostics[0][key])[:int(nq)]))
-        print(f"Shared-pole {geometry['sector']} metric inverse roots, max |ZAZ-I|_F/sqrt(R) over parents: "
-              f"keep {residual('metric_inverse_root_residual_relative'):.1e}, "
-              f"paired {residual('paired_metric_inverse_root_residual_relative'):.1e}",flush=True)
+    residual=lambda key:float(np.max(np.asarray(diagnostics[0][key])[:int(nq)]))
+    receipt.update(keep_residual=residual('metric_inverse_root_residual_relative'),
+                   paired_residual=residual('paired_metric_inverse_root_residual_relative'))
     budget.retained_panels=tuple(retained)
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
-                recipe=recipe,budget=budget,execution='face')
+                recipe=recipe,budget=budget,execution='face',decoupled=receipt)
 
 
 def slice_sector(sector, slots, mesh_xy):

@@ -235,6 +235,16 @@ def route_summary(mode, receipt):
                    (receipt.get("local_selection"), receipt.get("local_reduction")) if row), None)
     price = "" if budget is None else f"; local parent GB/rank: {rows} of {budget / 1e9:.1f}"
     batch = receipt.get("face_batch")
+    decoupled = receipt.get("decoupled")
+    if decoupled is not None:
+        price += (f"; decoupled: {decoupled['parents']} parents in sub-batches of {decoupled['sub_batch']}, "
+                  f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh room "
+                  + ("none, " if decoupled.get('eigh_room_bytes_per_rank') is None
+                     else f"{decoupled['eigh_room_bytes_per_rank'] / 1e9:.1f} GB/rank, ")
+                  + ("every eigh once over the stack, paired metric root by "
+                     f"{decoupled.get('paired_inverse_root', '?')}" if decoupled['admitted']
+                     else "stacks over budget: face rounds over the stacked panels")
+                  + f", max |ZAZ-I|/sqrt(R) keep {decoupled['keep_residual']:.1e} paired {decoupled['paired_residual']:.1e}")
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
@@ -808,10 +818,11 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
 
 
 def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, ordered, odd_moments,
-                          keep_budget, retain_span=False, gram_keep=None, carrier=None):
+                          keep_budget, retain_span=False, gram_keep=None, carrier=None, receipt=None):
     """All ``nq`` parents' ordered reduction: stage programs over ``width`` parents at a
     time, each eigh over the whole stack (``eigh_plan.batched``, route (c) when its
-    room allows). Returns what ``face_reduce_round`` returns, for every parent."""
+    room allows). Returns what ``face_reduce_round`` returns, for every parent;
+    ``receipt`` (a dict) gets the paired metric's inverse-root route."""
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
@@ -836,10 +847,8 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, o
     del gamma_r, u_r
     metric = stage['metric_r']
     by_eigh = eigh_plan.stack_route(metric.shape, metric.dtype, traced=False).route == 'batch_reshard'
-    if jax.process_index() == 0:
-        print(f"Shared-pole decoupled: paired metric [{int(metric.shape[-1])}] inverse root by "
-              f"{'eigh, one whole matrix per rank' if by_eigh else 'Newton-Schulz (its stack runs on the whole mesh)'}",
-              flush=True)
+    if receipt is not None:
+        receipt['paired_inverse_root'] = 'eigh' if by_eigh else 'newton-schulz'
     eigen = eigh(metric) if by_eigh else ()
     del metric
     stage = advance('correct', stage3b, stage, *eigen)
