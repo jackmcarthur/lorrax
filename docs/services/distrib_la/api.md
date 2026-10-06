@@ -449,7 +449,7 @@ plans refuse the option. How each route implements the interval is in
 The Green build multiplies face matrices whose contraction axis is the band
 index, and the layout rule forbids any rank to hold a band-complete row or
 column panel. `panel_matmul(A, B, *, mesh, panel_bytes, bounds=None,
-weights=None, partner=False)` forms $A B$ as a batched 2-D SUMMA inside one
+weights=None, partner=False, transa='N', transb='N', compiler_options=None)` forms $A B$ as a batched 2-D SUMMA inside one
 `shard_map`:
 
 - `A` is `(q, m, k)` at `P(None,'x','y')`; `B` is `(q, k, n)` in the same
@@ -472,6 +472,13 @@ weights=None, partner=False)` forms $A B$ as a batched 2-D SUMMA inside one
   column). XLA folds one `c + a @ b` into its GEMM but leaves one of two
   adjacent ones as a separate add that holds two extra output tiles; a
   two-panel product without bounds stays on XLA.
+- **`transa`, `transb`** (`'N'`, `'T'`, `'C'`; square mesh, 3-D `B`, no
+  `weights` or `partner`): the operand is given as `op`'s transpose on the
+  face; its tile crosses the grid diagonal in one `ppermute` and is
+  transposed locally, which is the `'N'` tile, so the panel loop is unchanged
+  and no distributed transpose runs. **`compiler_options`** go to the
+  kernel's `jax.jit` (a caller's jit takes its own: options are top-level
+  only).
 - **`weights`** `(q, k)` scale each panel slice of `A` on its way into the
   gather, so no weighted copy of `A` exists. **`partner=True`** also returns
   $\bar A\,\mathrm{diag}(w)\,\bar B$ from the same exchange (the Green's
