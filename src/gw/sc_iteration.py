@@ -3686,7 +3686,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
     if inputs.config.sigma.w_model == "shared_pole":
         from .shared_pole_recipe import (
-            bind_shared_pole_census, resolve_shared_pole_recipe,
+            SUPPORT_READ_PAD_EV, bind_shared_pole_census, resolve_shared_pole_recipe,
             bind_shared_pole_sc_identity,
         )
         from centroid.sampling_metric import full_k_quadrature_weights
@@ -3702,7 +3702,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
             print_fn=inputs.print_fn,
             support_reads_ev=frame_mu_ev + requested_reads_ev(
-                sc_support.energy, sc_support.requested, inputs.config.sigma.omega_step_ev),
+                sc_support.energy, sc_support.requested, inputs.config.sigma.omega_step_ev,
+                pad_ev=SUPPORT_READ_PAD_EV),
             support_session=(None if inputs.fixed_quadrature_session is None else
                              inputs.fixed_quadrature_session.setdefault(
                                  "shared_pole_supports", {})))

@@ -7,6 +7,8 @@
    (the defect of claims 2868/3268).
 4. The Sigma planner names a sample group that reads outside the support, and warns
    only.
+5. With the recipe's 5 eV read pad the line top is never below the former rule's
+   (states within +-5 eV of mu at +-5 eV offsets) when those states are requested.
 """
 import numpy as np
 
@@ -52,3 +54,15 @@ def test_planner_names_reads_past_support():
     past = support_reads_past(omega, group, (-12.0 / RYD_TO_EV, 12.0 / RYD_TO_EV))
     assert [p["group"] for p in past] == [0]
     assert support_reads_past(omega, group, (-25.0 / RYD_TO_EV, 12.0 / RYD_TO_EV)) == []
+
+
+def test_read_pad_keeps_the_former_reach():
+    from gw.qp_support import requested_reads_ev
+    from gw.shared_pole_recipe import SUPPORT_READ_PAD_EV, support_rule_line_sites
+    rng = np.random.default_rng(1)
+    levels = np.sort(rng.uniform(-6.0, 6.0, 300))
+    old_reads = (levels[np.abs(levels) <= 5.0][:, None] + np.arange(-5.0, 5.125, 0.25)[None, :]).ravel()
+    new_reads = requested_reads_ev(levels, np.abs(levels) <= 5.0, 0.25, pad_ev=SUPPORT_READ_PAD_EV)
+    old_top = support_rule_line_sites(levels, 0.0, 0.25, 2.6, old_reads, 14)[-1]
+    new_top = support_rule_line_sites(levels, 0.0, 0.25, 2.6, new_reads, 14)[-1]
+    assert SUPPORT_READ_PAD_EV == 5.0 and new_top >= old_top - 1e-9

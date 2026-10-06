@@ -109,10 +109,11 @@ def support_envelope_ev(energy_relative_ev, requested_kn, pad_ev):
 
 
 def requested_reads_ev(energy_relative_ev, requested_kn, step_ev, pad_ev=SUPPORT_PAD_EV):
-    """The energies at which the requested states read Sigma, ``E - mu`` (eV), 1-D.
+    """The energies around the requested states that W's line must cover, ``E - mu`` (eV), 1-D.
 
     Each requested state's input energy at every offset of ``[-pad, +pad]`` on the
-    Sigma step: the frequencies the plan pads around it.  The one source of where
+    Sigma step.  The W recipe passes its own pad (``shared_pole_recipe
+    .SUPPORT_READ_PAD_EV``, 5 eV), wider than the plan's 2 eV.  The one source of where
     W's line supports must hold (``shared_pole_recipe.support_rule_line_sites``);
     the caller passes its own requested mask (one-shot or SC map), so neither
     path's semicore rule is decided here.  Empty when nothing is requested.
