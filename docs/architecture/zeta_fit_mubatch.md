@@ -279,9 +279,17 @@ The planner decides in this order:
    (`centroid_k_unfold.widest_unfold_orbit`, the orbits the packing keeps
    together) is the smallest owner bin and b ≥ P·c_orb. For each n_pg = 1, 2, 4, …, n_a, b is the largest
    multiple of P whose working set, with the whole plane axis in one block,
-   fits M_f − Ψ, capped at ceil(μ/P)·P and balanced across batches; with no
-   such b, b = P·c_orb and its owner plane stage streams rows and plane
-   blocks (`_plane_stage`, the rule `route_g_plane_chunk` applies below).
+   fits M_f − Ψ, capped at ceil(μ/P)·P and balanced across batches. When no
+   full-plane candidate fits and the canonical centroid plan is available,
+   the fallback scans source-owner capacities from c_orb to ceil(μ/P).
+   Each capacity uses the same whole-orbit packing, `working_set` and
+   `_plane_stage` prices: the source batch can hold several orbits while
+   the owner plane stage streams fewer rows and plane blocks. The candidate
+   cost includes its actual packed batch count, row chunks and plane blocks.
+   Geometry-only callers without the typed plan scan the same capacities
+   using b_src = P·cap and ceil(μ/b_src) as their batch-count estimate;
+   typed callers price the actual canonical whole-orbit packing instead.
+   No input key changes this search.
    The HWM is the working set of that configuration; over the target, the
    planner prints one warning line before anything is compiled, and the plan
    runs.
@@ -300,7 +308,20 @@ The planner decides in this order:
    ([memory model](memory-model.md#the-compiled-check)).
 
 The fit then packs whole orbits into bins of at most the planned b/P with
-the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). The
+the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). Packing
+previews call `orbit_mu_batches(..., build_tables=False)`, using the exact
+same LPT placement, active rows and padding as the default materialized
+packing. The search computes the canonical unfold-orbit partition once and
+does not build permutation or lattice-wrap tables for discarded candidates.
+Only the selected executable batch materializes those transport tables.
+An `OwnerOrbitBatches` preview has no transport, and `transport(beta)`
+refuses its use by a GPU kernel. The default helper still returns the same
+μ, permutation and wrap arrays; previews do not change their byte layout.
+The planner's analytic and compiled/AOT checks remain in force on the
+materialized winner. Claim3375 records a P4 larger-source direct-Z bitwise
+oracle and complete216-k matrix parity for the actual augmented AgI run;
+its numerical accuracy and whole-stage time gates are recorded separately.
+The
 planner's floor keeps every bin within the plan (CrI3 24×24 P36: 12-member
 orbits make the batch 432, which the plan prices, not 36).
 `route_g_plane_chunk` prices the packed batch: the source rows (X_B, pair

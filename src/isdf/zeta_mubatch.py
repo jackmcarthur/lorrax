@@ -55,8 +55,8 @@ def _mesh_id(mesh: Mesh) -> tuple:
 class OwnerOrbitBatches(NamedTuple):
     """μ batches whose every owner (``c`` slots per rank) holds whole orbits."""
     mu: np.ndarray            # (n_batch, P·c) packed centroid per slot, −1 pad
-    left_perm: np.ndarray     # (n_batch, P, n_rows, c) owner-local source slot
-    left_L: np.ndarray        # (n_batch, P, n_rows, c, 3) lattice wrap
+    left_perm: np.ndarray | None  # (n_batch, P, n_rows, c) source slot
+    left_L: np.ndarray | None     # (n_batch, P, n_rows, c, 3) lattice wrap
     c: int
     n_batch: int
     slot_of_packed: np.ndarray  # (μ_pad,) store slot β·P·c + p·c + j, −1 pad
@@ -65,8 +65,15 @@ class OwnerOrbitBatches(NamedTuple):
     def b(self) -> int:
         return int(self.mu.shape[1])
 
+    def transport(self, beta):
+        """Return executable endpoint tables; planning previews cannot unfold."""
+        if self.left_perm is None or self.left_L is None:
+            raise ValueError('a centroid-batch transport preview cannot serve the GPU kernel')
+        return self.left_perm[beta],self.left_L[beta]
 
-def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int):
+
+def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int, build_tables=True,
+                        _orbit_groups=None):
     """Whole-orbit bins of about ``c_target`` (one per owner), ``P`` bins a batch.
 
     The owner unfolds the left endpoint of its pair projectors inside its own
@@ -76,25 +83,27 @@ def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int):
     """
     from gw.centroid_k_unfold import orbit_mu_batches
     P_ = int(n_ranks)
-    bins = orbit_mu_batches(plan, int(mu_pad), 1, b_target=max(1, int(c_target)))
+    bins = orbit_mu_batches(plan,int(mu_pad),1,b_target=max(1,int(c_target)),
+        build_tables=build_tables,_orbit_groups=_orbit_groups)
     c = int(bins.b)
     n_bins = int(bins.n_batch)
     n_batch = -(-n_bins // P_)
     pad = n_batch * P_ - n_bins
-    n_rows = int(bins.left_perm.shape[1])
     mu = np.concatenate([bins.mu, np.full((pad, c), -1, bins.mu.dtype)])
-    lp = np.concatenate([bins.left_perm, np.broadcast_to(
-        np.arange(c, dtype=bins.left_perm.dtype), (pad, n_rows, c))])
-    lL = np.concatenate([bins.left_L, np.zeros((pad, n_rows, c, 3), bins.left_L.dtype)])
+    lp = lL = None
+    if build_tables:
+        n_rows = int(bins.left_perm.shape[1])
+        lp = np.concatenate([bins.left_perm,np.broadcast_to(
+            np.arange(c,dtype=bins.left_perm.dtype),(pad,n_rows,c))]).reshape(n_batch,P_,n_rows,c).astype(np.int32)
+        lL = np.concatenate([bins.left_L,np.zeros((pad,n_rows,c,3),bins.left_L.dtype)]).reshape(n_batch,P_,n_rows,c,3).astype(np.int32)
     return OwnerOrbitBatches(
         mu=mu.reshape(n_batch, P_ * c),
-        left_perm=lp.reshape(n_batch, P_, n_rows, c).astype(np.int32),
-        left_L=lL.reshape(n_batch, P_, n_rows, c, 3).astype(np.int32),
+        left_perm=lp,left_L=lL,
         c=c, n_batch=n_batch,
         slot_of_packed=np.asarray(bins.packed_to_slot(int(mu_pad)), dtype=np.int32))
 
 
-def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
+def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int, build_tables=True):
     """The whole-orbit batching with the least padded work, bins of at most ``c_max``.
 
     Bins hold whole orbits, so the planned ``c = b/P`` can pack badly (CrI3
@@ -107,17 +116,23 @@ def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
     every bin fits ``c_max`` and the plan prices the widest batch that runs
     (CrI3 24x24 P36: 12-member orbits make the batch 432, not the 36 of
     c_max = 1).
+    Candidates preview the same canonical packing without transport tables;
+    only the winning executable batch materializes those tables. The optional
+    host-only preview return refuses kernel transport through its accessor.
     ponytail: a linear scan over c and a fixed-cost guess of one centroid.
     """
     best = None
+    from gw.centroid_k_unfold import unfold_orbits
+    groups = unfold_orbits(plan)
     for c in range(max(1, int(c_max)), 0, -1):
-        mb = owner_orbit_batches(plan, mu_pad, n_ranks, c_target=c)
+        mb = owner_orbit_batches(plan,mu_pad,n_ranks,c_target=c,build_tables=False,_orbit_groups=groups)
         if best is not None and mb.c > c_max:
             continue                      # an orbit wider than c: no gain
         cost = mb.n_batch * (mb.c + 1)
         if best is None or cost < best[0]:
             best = (cost, mb)
-    return best[1]
+    return (owner_orbit_batches(plan,mu_pad,n_ranks,c_target=best[1].c,_orbit_groups=groups)
+            if build_tables else best[1])
 
 
 def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,

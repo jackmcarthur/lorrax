@@ -239,6 +239,31 @@ and the exact normalized-lift owner sources. An explicit missing or mismatched
 cache refuses; it never silently rebuilds. One-time atomic preparation and
 cache generation are reported separately from recurring fitting time.
 
+An independent optional pair, `cache.local_coulomb_fourier_file` and
+`cache.local_coulomb_fourier_sha256`, supplies a prepared reciprocal table for
+the chosen radial density interpolant. This artifact preserves the existing
+cubic Fourier spline coefficients and knots exactly. Its source, quadrature,
+origin treatment, angular degrees, compensation and payload are authenticated;
+the consuming momentum range must fit its declared extent. Reload repeats the
+ordinary direct-quadrature and zero-momentum pins. Missing or mismatched
+explicit artifacts refuse. These keys do not change the separate normalized
+atomic-cache controls. The rows are independent of cell volume and FFT size;
+the provider applies its usual unit conversion after evaluation.
+
+`tools/generate_local_coulomb_fourier_cache.py --manifest DIR
+--maximum-wavevector KMAX --output NEW_DIR` prepares this table on one allocated
+CPU rank and writes an immutable receipt. The ordinary factory remains the
+default. Preparation time and complete fitting time are reported separately;
+a fast reload alone does not meet a whole-stage performance target.
+
+The route-G planner distinguishes the source centroid batch from the smaller
+plane workspace it streams. When a complete owner plane axis does not fit, it
+prices larger source batches with the existing streamed plane stage and the
+same compiled-memory admission. Packing previews use the canonical orbit
+assignment and omit expensive transport tables; the selected batch builds
+those tables once. A preview refuses transport consumption. This changes
+planning and allocation, not the sampled pair products or normal equations.
+
 The higher-order charge metric uses an analytically integrated piecewise density
 interpolant and the positive Poisson field-energy identity. Its moments and
 Fourier transforms use the same interpolant, including regular behavior at the

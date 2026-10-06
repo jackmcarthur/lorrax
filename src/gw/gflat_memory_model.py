@@ -194,7 +194,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       budget_gb: float,
                       target_utilization: float | None = None,
                       psi_face_bytes: float = 0.0, n_vertex: int = 1,
-                      n_parent: int | None = None, orbit_width: int = 1) -> MuBatchPlan:
+                      n_parent: int | None = None, orbit_width: int = 1,
+                      k_unfold_plan=None) -> MuBatchPlan:
     """Size the route-G μ-batch fit (docs/architecture/zeta_fit_mubatch.md).
 
     Per rank: conj ψ(G) on its G slice (full zone), the owner's pair
@@ -324,6 +325,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     need_min = working_set(b_min, 1, 1, n_a)
     b_top = math.ceil(mu / P_) * P_
     cands = []
+    packed_batch_counts = {}
     n_pg = 1
     while True:
         c_mu = (batch_bytes(2 * P_, n_pg) - batch_bytes(P_, n_pg)) / P_
@@ -351,8 +353,35 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         if n_pg >= n_a:
             break
         n_pg = min(2 * n_pg, n_a)
-    if not cands:      # no batch holds the whole plane axis: blocks engage
-        cands.append((float("nan"), 1, b_min))
+    if not cands:      # no whole-owner plane axis fits: stream owner rows
+        # Source projectors and the plane stage have independent row axes.
+        # Keeping the source at one orbit wastes available source storage
+        # when the plane stage already streams a smaller c_out. Price that
+        # existing split at larger whole-orbit source bins; compiled/AOT
+        # admission remains the fit owner's unchanged final guard.
+        c_top = max(c_orb,math.ceil(mu/P_))
+        caps = sorted({min(c,c_top) for c in range(c_orb,c_top+c_orb,c_orb)})
+        for cap in caps:
+            if k_unfold_plan is None:
+                b_src,n_b = P_*cap,math.ceil(mu/(P_*cap))
+            else:
+                from isdf.zeta_mubatch import best_owner_orbit_batches
+                bins = best_owner_orbit_batches(k_unfold_plan,mu,P_,c_max=cap,build_tables=False)
+                b_src,n_b = int(bins.b),int(bins.n_batch)
+            c_src = b_src//P_
+            co,blocks,fits = _plane_stage(working_set,target,c_plan=c_src,c_src=c_src,
+                n_pg=1,n_planes=n_a,n_ranks=P_)
+            if not fits:
+                continue
+            chunks = math.ceil(c_src/co)*blocks
+            n_pc = p_chunk(b_src)
+            t_b = (math.ceil(n_p/n_pc)*(comm_model.comm_time(_c128(n_pc,nb,ns,b_src),P_-1)
+                      +comm_model.comm_time(2*_c128(n_pc,ns,b_src,ns,Gp),P_-1))
+                   +3e-3*n_a*chunks+.65*(c_src+chunks)/2)
+            cands.append((n_b*t_b,1,b_src))
+            packed_batch_counts[(1,b_src)] = n_b
+        if not cands:
+            cands.append((float("nan"),1,b_min))
     cands.sort()
     t_model, n_pg, b = cands[0]
     ru = (f"n_pg={cands[1][1]} b={cands[1][2]}: {cands[1][0]:.0f} s"
@@ -360,7 +389,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     base["conj ψ(G) slice (resident)"] = psi_bytes
     # The all-to-all floor: every pair projector crosses the network once.
     t_a2a_floor = mu * 2 * _c128(n_p, ns, 1, ns, Gp) / comm_model.BETA_BPS
-    n_batch = math.ceil(mu / b)
+    n_batch = packed_batch_counts.get((n_pg,b),math.ceil(mu / b))
     n_pc = p_chunk(b)
     n_ch0 = -(-n_p // n_pc)
     per_g = 6.0 * _c128(Q_pad, mu, 1, shard=P_)

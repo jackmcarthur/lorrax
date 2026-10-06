@@ -432,7 +432,7 @@ def _fit_mubatch(
         live = (slots >= 0).astype(np.float64)
         xmu = x_cent[canon[np.clip(slots, 0, None)]] * live[:, None]
         lt = tuple(jax.make_array_from_callback(a.shape, rank_sh, lambda i, a=a: a[i])
-                   for a in (mb.left_perm[beta], mb.left_L[beta]))
+                   for a in mb.transport(beta))
         args = (cbar, *ops, g3, _device_put_process_local(xmu, rep),
                 _device_put_process_local(live, rep), *tabs, unf, lt)
         if use_augmented_samples:

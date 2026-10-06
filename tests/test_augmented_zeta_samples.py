@@ -88,6 +88,20 @@ def check_samples(runtime):
     smooth = np.asarray(gather_to_host(smooth_kernel(*args)[0]))
     zero = np.asarray(gather_to_host(augmented_kernel(*args, sample_put(samples))[0]))
     altered = np.asarray(gather_to_host(augmented_kernel(*args, sample_put(changed))[0]))
+    # A larger source batch retains the same streamed one-row plane stage.
+    # This is the fallback planner's independent axis: all logical rows must
+    # agree, while additional source slots remain exact zero padding.
+    expanded_b = 2*b
+    expanded_args = list(args)
+    expanded_args[5] = put(np.pad(xmu,((0,b),(0,0))))
+    expanded_args[6] = put(np.pad(live,(0,b)))
+    expanded_c = expanded_b//nranks
+    expanded_lp = np.broadcast_to(np.arange(expanded_c,dtype=np.int32),(nranks,1,expanded_c))
+    expanded_ll = np.zeros((nranks,1,expanded_c,3),np.int32)
+    expanded_args[-1] = (put(expanded_lp,P(('x','y'))),put(expanded_ll,P(('x','y'))))
+    expanded_sample = np.pad(changed,((0,0),(0,0),(0,0),(0,b)))
+    expanded_kernel = make_route_g_kernel(**dict(factory,b=expanded_b),use_augmented_samples=True)
+    expanded = np.asarray(gather_to_host(expanded_kernel(*expanded_args,sample_put(expanded_sample))[0]))
     reference, expected_changed = explicit(samples), explicit(changed)
     rel = lambda a, e: float(np.linalg.norm(a-e) / np.linalg.norm(e))
     results = dict(P=nranks, ns=ns, parents=nk, parent_chunk=1, batch=b,
@@ -95,12 +109,16 @@ def check_samples(runtime):
                    zero_augmentation_relative_error=rel(zero, smooth),
                    smooth_direct_relative_error=rel(smooth, reference),
                    altered_direct_relative_error=rel(altered, expected_changed),
+                   expanded_source_stream_relative_error=rel(expanded[:,:b],altered),
+                   expanded_source_padding_max=float(np.max(abs(expanded[:,b:]))),
                    planted_signal_relative_norm=rel(altered, smooth),
                    pad_max_abs=float(np.max(np.abs(altered[:, -1]))),
                    wall_s=time.monotonic()-t0)
     assert results['zero_augmentation_relative_error'] < 2e-13, results
     assert results['smooth_direct_relative_error'] < 2e-13, results
     assert results['altered_direct_relative_error'] < 2e-13, results
+    assert results['expanded_source_stream_relative_error'] < 2e-13, results
+    assert results['expanded_source_padding_max'] == 0.,results
     assert results['planted_signal_relative_norm'] > 0.1, results
     assert results['pad_max_abs'] == 0.0, results
     executable = augmented_kernel.lower(*args, sample_put(changed)).compile()

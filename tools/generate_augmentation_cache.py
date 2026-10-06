@@ -17,13 +17,14 @@ def main():
     from psp.atomic_reconstruction import load_atomic_reconstruction
     from psp.augmentation_cache import (build_normalized_cache, write_normalized_cache,
         load_normalized_cache, normalized_cache_tail_diagnostics)
+    from gw.isdf_augmentation import _normalized_cache_control
 
     root, output = args.manifest.resolve(), args.output.resolve()
     manifest = json.loads((root / "manifest.json").read_text())
     if (manifest.get("schema") != "lorrax.isdf_augmentation.v1"
             or manifest.get("carrier") != "normalized_rkb"):
         raise ValueError("normalized cache generation requires an authenticated augmentation manifest")
-    control = manifest["cache"]
+    control = _normalized_cache_control(manifest["cache"])
     radial = manifest["radial"]
     support = float(radial["support_radius"] if "support_radius" in radial else radial["r_max"])
     output.mkdir(parents=True, exist_ok=False)

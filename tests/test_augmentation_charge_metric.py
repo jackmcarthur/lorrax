@@ -49,6 +49,23 @@ def test_served_moment_admission_has_no_implicit_data_fallback(tmp_path,served,d
     with pytest.raises(ValueError,match=diagnostic):read_augmentation_manifest(tmp_path)
 
 
+def test_prepared_local_cache_requires_pair_before_atomic_reads(tmp_path):
+    from gw.isdf_augmentation import read_augmentation_manifest
+    control=dict(schema='lorrax.isdf_augmentation.v1',carrier='normalized_rkb',
+        frozen_core_policy='reconstruct_valence_only',species={'47':{}},radial={},angular={},
+        cache={'local_coulomb_fourier_file':'absent.npz'},runtime={})
+    (tmp_path/'manifest.json').write_text(json.dumps(control))
+    with pytest.raises(ValueError,match='file/SHA pair'):read_augmentation_manifest(tmp_path)
+
+
+def test_local_fourier_metadata_does_not_change_normalized_field_controls():
+    from gw.isdf_augmentation import _normalized_cache_control
+    original={'momentum_max':400.,'radius_points':8800,'species_files':{'47':'normalized.npz'}}
+    augmented=dict(original,local_coulomb_fourier_file='local.npz',local_coulomb_fourier_sha256='0'*64)
+    assert _normalized_cache_control(augmented)==original
+    assert augmented['local_coulomb_fourier_file']=='local.npz'
+
+
 def test_indexed_workspace_keeps_full_native_outputs_in_its_bound():
     from gw.isdf_augmentation import _local_rhs_workspace_bytes
     full = _local_rhs_workspace_bytes(16,216,2304,17280,16,retain_smooth=True)

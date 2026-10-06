@@ -215,7 +215,7 @@ def _smooth_neutral_tables(tables, *, support_radius, fft_points, cell_volume):
 def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, radius, weights_dr, lm,
                             centers_cart, q_plus_G_cart, cell_volume,
                             fft_points, support_radius, interpolation_degree=None,
-                            quadrature_order=None, fourier_points=4097):
+                            quadrature_order=None, fourier_points=4097, prepared_cache=None):
     r"""Build the procedural local provider consumed by ZetaG.contract_v.
 
     Parameters
@@ -252,6 +252,10 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
         analytic r^l(1-r^2/R^2)^6 with exact unit multipole, and a cubic radial
         |q+G| table (default4097 points) replaces per-tile large quadrature maps.
         Direct off-grid and G=0 pins refuse an unconverged Fourier table.
+    prepared_cache : authenticated dict, optional
+        Explicitly loaded exact CubicSpline artifact. Its source, density
+        model, resolution and consuming extent are checked, then the same
+        direct pins are repeated. A mismatch refuses without rebuilding.
 
     Returns
     -------
@@ -312,10 +316,16 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
     else:
         cross_tables, provider_rhs = None, rhs
     cache = None
+    if prepared_cache is not None and interpolation_degree is None:
+        raise ValueError("prepared Fourier cache requires physical density interpolation")
     if interpolation_degree is not None:
         valid = np.arange(kg.shape[1])[None, :] < zeta_g.ngk_per_q[:, None]
         maximum = np.max(np.where(valid, np.linalg.norm(kg, axis=-1), 0.))
-        cache = _radial_fourier_cache(tables, maximum, fourier_points)
+        if prepared_cache is None:
+            cache = _radial_fourier_cache(tables, maximum, fourier_points)
+        else:
+            from isdf.coulomb_fourier_cache import validate_coulomb_fourier_cache
+            cache = validate_coulomb_fourier_cache(prepared_cache, tables, maximum, fourier_points)
     degrees = tables['degrees']
     degree_row = np.searchsorted(degrees, harmonics[:, 0])
     steps = np.asarray([(a, h) for a in range(na) for h in range(nh)], dtype=np.int32)

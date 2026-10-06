@@ -491,9 +491,9 @@ class MuOrbitBatches(NamedTuple):
     pad slots map to themselves with zero wrap.
     """
     mu: np.ndarray
-    left_perm: np.ndarray
-    left_L: np.ndarray
-    rows: np.ndarray
+    left_perm: np.ndarray | None
+    left_L: np.ndarray | None
+    rows: np.ndarray | None
     n_ranks: int
 
     @property
@@ -601,7 +601,8 @@ def widest_unfold_orbit(k_unfold_plan) -> int:
 
 
 def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
-                     b_target: int) -> MuOrbitBatches:
+                     b_target: int, build_tables: bool = True,
+                     _orbit_groups=None) -> MuOrbitBatches:
     """Pack the plan's centroid orbits whole into batches of about ``b_target``.
 
     Orbits are those of the rows ``plan.sym_idx`` selects (the only ones the
@@ -616,6 +617,8 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
     ``⌊n/P⌋`` or ``⌈n/P⌉`` of them, pads trailing.  An orbit may span ranks:
     the batch is replicated and unfolded before the transpose.  The layout's
     pad slots belong to no batch (their face rows, hence Z rows, are zero).
+    ``build_tables=False`` previews exactly this packing for host costing;
+    its absent permutation/wrap tables cannot serve an unfold kernel.
     """
     import heapq
 
@@ -628,7 +631,7 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
     if P_ < 1 or int(b_target) < 1:
         raise ValueError(
             f"orbit_mu_batches: need n_ranks, b_target >= 1; got {P_}, {b_target}.")
-    members, sizes = unfold_orbits(plan)
+    members,sizes = unfold_orbits(plan) if _orbit_groups is None else _orbit_groups
     up = lambda v: -(-int(v) // P_) * P_
     b_cap = max(up(int(sizes.max())), (int(b_target) // P_) * P_)
     by_size = sorted(range(len(members)),
@@ -662,7 +665,11 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
             take = q + (1 if p < r else 0)
             mu[beta, p * c:p * c + take] = mem[cursor:cursor + take]
             cursor += take
-    left_perm, left_L, rows = mu_batch_tables(plan, mu)
+    if build_tables:
+        left_perm,left_L,rows = mu_batch_tables(plan,mu)
+        rows = rows.astype(np.int32)
+    else:
+        left_perm = left_L = rows = None
     return MuOrbitBatches(mu=mu, left_perm=left_perm, left_L=left_L,
                           rows=rows, n_ranks=P_)
 

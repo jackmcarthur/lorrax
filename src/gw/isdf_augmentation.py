@@ -21,6 +21,12 @@ SCHEMA = "lorrax.isdf_augmentation.v1"
 AUGMENTED_CHARGE_PAYLOAD_SCHEMA = "smooth_plus_local_delta_v1"
 
 
+def _normalized_cache_control(control):
+    """Normalized-field controls exclude the independent local Fourier artifact."""
+    return {key:value for key,value in control.items()
+            if key not in ('local_coulomb_fourier_file','local_coulomb_fourier_sha256')}
+
+
 def read_augmentation_manifest(directory):
     """Authenticate one manifest and its small matched atomic sidecars.
 
@@ -50,6 +56,11 @@ def read_augmentation_manifest(directory):
     required = ("species", "radial", "angular", "cache", "runtime")
     if any(not isinstance(manifest.get(key), dict) for key in required):
         raise ValueError("augmentation manifest requires species/radial/angular/cache/runtime dictionaries")
+    local_keys = {'local_coulomb_fourier_file','local_coulomb_fourier_sha256'}
+    present = local_keys.intersection(manifest['cache'])
+    if present and present != local_keys:
+        raise ValueError("prepared local Coulomb Fourier cache requires explicit file/SHA pair")
+    normal_control = _normalized_cache_control(manifest['cache'])
     if 'charge_fit' in manifest and manifest['charge_fit'] != {'conditioning':'unit_diagonal'}:
         raise ValueError("explicit charge_fit must contain exactly conditioning=unit_diagonal")
     if 'charge_metric' in manifest:
@@ -150,7 +161,7 @@ def read_augmentation_manifest(directory):
         support = float(manifest['radial']['support_radius'])
         for z,data in tables.items():
             cache_path = (root/cache_files[str(z)]).resolve()
-            cached[z] = load_normalized_cache(cache_path,data,manifest['cache'],support_radius=support)
+            cached[z] = load_normalized_cache(cache_path,data,normal_control,support_radius=support)
             digest.update(hashlib.sha256(cache_path.read_bytes()).digest())
     fourier_caches = None
     if 'fourier_cache' in manifest:
@@ -190,9 +201,17 @@ def read_augmentation_manifest(directory):
             if hashlib.sha256(Path(importlib.util.find_spec(owner).origin).read_bytes()).hexdigest() != sha:
                 raise ValueError(f"raw served-moment owner identity mismatch: {owner}")
         digest.update(bytes.fromhex(served['raw_parent_sha256']))
+    prepared_cache = None
+    if present:
+        from isdf.coulomb_fourier_cache import load_coulomb_fourier_cache
+        local_path = (root/manifest['cache']['local_coulomb_fourier_file']).resolve()
+        local_sha = manifest['cache']['local_coulomb_fourier_sha256']
+        prepared_cache = load_coulomb_fourier_cache(local_path,expected_file_sha256=local_sha)
+        digest.update(bytes.fromhex(local_sha))
     return dict(manifest,tables=tables,normalized_caches=cached,
                 fourier_caches=fourier_caches,served_moment_caches=served_caches,
-                raw_parent_moments=raw_moments,identity=digest.hexdigest(),directory=str(root))
+                raw_parent_moments=raw_moments,prepared_fourier_cache=prepared_cache,
+                identity=digest.hexdigest(),directory=str(root))
 
 
 def augmentation_identity(directory):
@@ -891,7 +910,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             quadrature_order=artifact['radial'].get('quadrature_order'))['moments'][0]
     nearest = _certify_spheres(centers, lattice, support)
     with timing.section('augmentation.spinor_cache'):
-        caches, tails = _normalized_caches(artifact['tables'],artifact['cache'],support,
+        caches, tails = _normalized_caches(artifact['tables'],_normalized_cache_control(artifact['cache']),support,
                                           validated_caches=artifact.get('normalized_caches'))
     directions, angles_w, lm, Y, angular_error = _orbit_angular_quadrature(
         artifact['angular'],np.asarray(sym.R_cart)[:int(plan.n_sym_spatial)])
@@ -1220,6 +1239,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     state['local_rhs_workspace_bytes_per_rank'] = point_workspace
     state['resident_rhs_copies'] = rhs_copies
     state['indexed_local_q_union'] = q_union
+    if artifact.get('prepared_fourier_cache') is not None:
+        state['prepared_fourier_cache'] = artifact['prepared_fourier_cache']
     if onsite_cross:
         state['smooth_rhs'] = smooth_rhs
         state['smooth_neutral_cross'] = 'onsite'
@@ -1280,6 +1301,8 @@ def attach_local_augmentation(zeta_g, state):
         if state.get('moment_enrichment') != 'served_monopole' or 'smooth_rhs' not in state:
             raise ValueError("served monopole RHS requires the explicit onsite smooth-neutral charge metric")
         radial_controls['monopole_rhs'] = state['monopole_rhs']
+    if 'prepared_fourier_cache' in state:
+        radial_controls['prepared_cache'] = state['prepared_fourier_cache']
     provider = radial_coulomb_provider(zeta_g,state['rhs'],radius=state['radius'],weights_dr=state['weights_dr'],
         lm=state['lm'],centers_cart=state['centers_cart'],q_plus_G_cart=kg,
         cell_volume=state['cell_volume'],fft_points=state['fft_points'],support_radius=state['support_radius'],
