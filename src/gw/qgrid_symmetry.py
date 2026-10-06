@@ -168,6 +168,7 @@ def resolve_qgrid_symmetry_tables(
     context: str,
     translations=None,
     announce_fallback: bool = True,
+    coordinate_kind: str = "fft_indices",
 ):
     """Resolve the q-grid reduction for one centroid set, announcing once.
 
@@ -227,13 +228,15 @@ def resolve_qgrid_symmetry_tables(
     tnp = (np.asarray(sym.translations) if translations is None
            else np.asarray(translations))
     res = resolve_qgrid_symmetry(
-        np.asarray(jax.device_get(centroid_indices), dtype=np.int32),
+        np.asarray(jax.device_get(centroid_indices),
+                   dtype=(np.float64 if coordinate_kind == "fractional" else np.int32)),
         np.asarray(sym.sym_matrices[:n_tran]),
         tnp=tnp[:n_tran],
         fft_grid=np.asarray(fft_grid, dtype=np.int32),
         extend_trs=True,
         required_rows=np.asarray(sym.sym_idx_q),
         context=context,
+        coordinate_kind=coordinate_kind,
     )
     msg = res.announcement() if announce_fallback else None
     if msg is not None:

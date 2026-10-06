@@ -100,6 +100,7 @@ from .gw_config import (
 	uses_direct_bispinor_shared_pole_head,
 	uses_full_bispinor_shared_pole, uses_bare_transverse_shared_pole,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
+	uses_transverse_interaction,
 	infer_material_class, resolve_mpa_sampling_alpha,
 	validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
@@ -198,8 +199,11 @@ def _compute_static_head(
 	Used by every mode: the bare-X head piece applies to static and
 	dynamic Σ alike (the SX/COH pieces additionally apply when screened).
 	"""
-	head = (head_resolver.at(0.0 + 0.0j) if require_screened
-	        else head_resolver.direct_at(0.0 + 0.0j))
+	if not do_screened:
+		head = head_resolver.bare_at(0.0 + 0.0j)
+	else:
+		head = (head_resolver.at(0.0 + 0.0j) if require_screened
+		        else head_resolver.direct_at(0.0 + 0.0j))
 	print0(format_head_sample_diagnostics(head, include_screened=do_screened))
 	occ_mask = (np.arange(meta.nb_sigma, dtype=np.int32) < meta.nelec
 	            if occupation_state is None else
@@ -273,7 +277,11 @@ def _report_head_and_photon_policy(config, print0, report):
             f"  Bispinor GW policy: bispinor_gw={config.bispinor_gw.value}"
             f"{_bispinor_note}")
         _bare_taken, _bare_reason = packed_bare_transverse_route(config)
-        if uses_full_bispinor_shared_pole(config):
+        if not uses_transverse_interaction(config):
+            report.progress(
+                "Interaction    : Coulomb only on normalized four-component "
+                "RKB charge; scalar GW/head, exact charge Hartree")
+        elif uses_full_bispinor_shared_pole(config):
             report.progress(
                 "Photon route   : FULL shared-pole CC/CT/TC/TT screening "
                 "and sector Sigma; four-current Dyson at each bank frequency")
@@ -319,7 +327,7 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
     centroid_basis = load_centroid_basis(
         config.paths.centroids_file, wfn.fft_grid, sym=sym)
     centroid_sets = [centroid_basis]
-    if config.bispinor and config.paths.centroids_file_current:
+    if uses_transverse_interaction(config) and config.paths.centroids_file_current:
         centroid_sets.append(load_centroid_basis(
             config.paths.centroids_file_current, wfn.fft_grid, sym=sym))
     nonclosed = [basis.path for basis in centroid_sets if not basis.orbit_closed]
@@ -451,7 +459,7 @@ def _prepare_isdf_carriers(
         meta.shared_pole_recipe = resolve_shared_pole_recipe(
             config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0)
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
-    if config.bispinor and wfns_transverse is None:
+    if uses_transverse_interaction(config) and wfns_transverse is None:
         raise RuntimeError(
             "bispinor = true but no transverse-centroid Wfns bundle was "
             "produced (Σ^B would be silently dropped).  Check "
@@ -1120,7 +1128,7 @@ def _sigma_diagnostic_fields(
         else None
     )
     head_sigma_split_skn_ry = None
-    if config.bispinor and config.debug.sigma_freq_debug_output:
+    if uses_transverse_interaction(config) and config.debug.sigma_freq_debug_output:
         head_sigma_split_skn_ry = np.asarray(
             photon_head_sigma_diag_tskn_ry[1]
             + photon_head_sigma_diag_tskn_ry[2]).copy()
@@ -1549,7 +1557,8 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    config, input_dir, mesh_xy, report, print0, _config_provenance)
 	(
 	    meta, band_slices, zeta_fit_edge) = prepare_band_metadata(
-	    centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn)
+	    centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn,
+	    coordinate_kind=centroid_basis.coordinate_kind)
 	(
 	    enk_dft) = _report_sampling_and_bands(
 	    band_slices, centroid_basis, config, material_class, mesh_xy, meta, mode, print0,

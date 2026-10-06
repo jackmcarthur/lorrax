@@ -15,13 +15,13 @@ What lives in ``isdf_header``
   :class:`centroid.centroid_io.CentroidFile`.
 - ``vertex_mu_L`` (scalar int): the Lorentz vertex this ζ is for —
   ``0`` (charge γ̃⁰ = I) or ``1, 2, 3`` (transverse γ̃ⁱ = αⁱ).
-- ``centroids/r_mu_fft_idx``  (n_rmu, 3) int32: FFT-grid indices of
-  the centroid positions.  Primary representation — closure under
-  the WFN symmetry group is checked against this table.
+- ``centroids/coordinate_kind``: ``'fft_indices'`` (legacy default) or
+  ``'fractional'``.  The explicit kind determines the consumed coordinates.
+- ``centroids/r_mu_fft_idx``  (n_rmu, 3) int32: primary representation
+  for FFT centroids; absent for genuine fractional centroids.
 - ``centroids/r_mu_crystal``  (n_rmu, 3) float64: fractional coords
-  (= ``r_mu_fft_idx / FFTgrid``).  Carried for human-readable
-  inspection and for downstream callers that work in fractional
-  coords; redundant with ``r_mu_fft_idx``.
+  (= ``r_mu_fft_idx / FFTgrid`` for FFT centroids).  Authoritative real
+  positions for fractional centroids; they are never silently snapped.
 - ``zeta_is_done`` (scalar bool, dataset shape ()):  ``True`` once the
   whole ``zeta_q`` dataset has been written.  The writer initially
   writes ``False`` alongside ``mf_header`` / centroid tables, and
@@ -61,8 +61,10 @@ import numpy as np
 # worktrees while keeping the receipt implementation out of the ζ header.
 from .wfn_basis import (
     CENTROID_TABLE_FINGERPRINT_SCHEME,
+    FRACTIONAL_CENTROID_TABLE_FINGERPRINT_SCHEME,
     WavefunctionBasisReceipt,
     centroid_table_md5,
+    centroid_table_fingerprint_scheme,
 )
 
 
@@ -73,7 +75,7 @@ _GROUP = 'isdf_header'
 class IsdfHeader:
     density: str                 # 'scalar' | 'current' | 'mu_L=<int>' | 'unknown'
     vertex_mu_L: int             # 0 (charge) | 1, 2, 3 (transverse)
-    r_mu_fft_idx: np.ndarray     # (n_rmu, 3) int32
+    r_mu_fft_idx: np.ndarray | None  # (n_rmu, 3) int32; None for fractional
     r_mu_crystal: np.ndarray     # (n_rmu, 3) float64
     zeta_is_done: bool = True    # ``False`` between writer header-write and the
                                  # final ``mark_zeta_done`` call.  Defaulted
@@ -130,9 +132,23 @@ class IsdfHeader:
                                  # EXACTLY.  ``None`` on legacy files => no
                                  # reuse (refit), which is the safe direction.
 
+    coordinate_kind: str = 'fft_indices'
+
+    def __post_init__(self) -> None:
+        idx, crystal = _validate_centroid_coordinates(
+            self.coordinate_kind, self.r_mu_fft_idx, self.r_mu_crystal)
+        object.__setattr__(self, 'r_mu_fft_idx', idx)
+        object.__setattr__(self, 'r_mu_crystal', crystal)
+
     @property
     def n_rmu(self) -> int:
-        return int(self.r_mu_fft_idx.shape[0])
+        return int(self.r_mu_crystal.shape[0])
+
+    @property
+    def centroid_coordinates(self) -> np.ndarray:
+        """The ordered consumed table, typed by ``coordinate_kind``."""
+        return (self.r_mu_crystal if self.coordinate_kind == 'fractional'
+                else self.r_mu_fft_idx)
 
     @property
     def ngkmax(self) -> int | None:
@@ -144,7 +160,7 @@ class IsdfHeader:
     def build(
         cls,
         *,
-        r_mu_fft_idx: np.ndarray,
+        r_mu_fft_idx: np.ndarray | None = None,
         fft_grid: np.ndarray | tuple[int, int, int],
         density: str,
         vertex_mu_L: int,
@@ -154,10 +170,13 @@ class IsdfHeader:
         ngk_per_q: np.ndarray | None = None,
         zeta_cutoff_ry: float | None = None,
         fit_provenance: str | None = None,
+        coordinate_kind: str = 'fft_indices',
+        r_mu_crystal: np.ndarray | None = None,
     ) -> 'IsdfHeader':
-        """Build a header from centroid FFT-grid indices.
+        """Build a header from explicitly typed centroid coordinates.
 
-        ``r_mu_crystal`` is derived as ``r_mu_fft_idx / fft_grid``.
+        FFT centroids derive ``r_mu_crystal = r_mu_fft_idx / fft_grid``.
+        Fractional centroids require ``r_mu_crystal`` and no index table.
         ``zeta_is_done`` defaults ``False`` for the writer path — the
         writer flips it to ``True`` via :func:`mark_zeta_done` after
         the final chunk is on disk.  ``zeta_layout`` defaults to
@@ -170,12 +189,24 @@ class IsdfHeader:
             raise ValueError(
                 f"zeta_layout must be 'r_space' or 'G_flat'; got "
                 f"{zeta_layout!r}")
-        idx = np.asarray(r_mu_fft_idx, dtype=np.int32)
-        if idx.ndim != 2 or idx.shape[1] != 3:
-            raise ValueError(
-                f"r_mu_fft_idx must be (n_rmu, 3); got {idx.shape}")
         fg = np.asarray(fft_grid, dtype=np.float64).reshape(3)
-        crystal = idx.astype(np.float64) / fg[None, :]
+        if not np.isfinite(fg).all() or np.any(fg <= 0):
+            raise ValueError('fft_grid must contain three positive extents')
+        centroid_table_fingerprint_scheme(coordinate_kind)
+        if coordinate_kind == 'fractional':
+            idx, crystal = _validate_centroid_coordinates(
+                coordinate_kind, r_mu_fft_idx, r_mu_crystal)
+        else:
+            if r_mu_fft_idx is None:
+                raise ValueError('FFT centroids require r_mu_fft_idx')
+            idx = np.asarray(r_mu_fft_idx, dtype=np.int32)
+            if idx.ndim != 2 or idx.shape[1] != 3:
+                raise ValueError(
+                    f'r_mu_fft_idx must be (n_rmu, 3); got {idx.shape}')
+            crystal = idx.astype(np.float64) / fg[None, :]
+            if r_mu_crystal is not None and not np.array_equal(
+                    np.asarray(r_mu_crystal, dtype=np.float64), crystal):
+                raise ValueError('FFT crystal coordinates disagree with indices')
 
         # G-flat metadata coercion / validation.
         gv = None
@@ -215,6 +246,7 @@ class IsdfHeader:
             zeta_cutoff_ry=cutoff,
             fit_provenance=(None if fit_provenance is None
                             else str(fit_provenance)),
+            coordinate_kind=coordinate_kind,
         )
 
 
@@ -238,6 +270,8 @@ def bind_isdf_attrs(obj: object, isdf: IsdfHeader) -> None:
     obj.vertex_mu_L = isdf.vertex_mu_L
     obj.r_mu_fft_idx = isdf.r_mu_fft_idx
     obj.r_mu_crystal = isdf.r_mu_crystal
+    obj.coordinate_kind = isdf.coordinate_kind
+    obj.centroid_coordinates = isdf.centroid_coordinates
     obj.n_rmu = int(isdf.n_rmu)
     obj.zeta_is_done = bool(isdf.zeta_is_done)
     obj.zeta_layout = str(isdf.zeta_layout)   # 'r_space' | 'G_flat'
@@ -265,15 +299,42 @@ def bind_isdf_attrs(obj: object, isdf: IsdfHeader) -> None:
 # Write
 # ---------------------------------------------------------------------------
 
-def write_centroid_coordinates(group, r_mu_fft_idx, r_mu_crystal):
+def _validate_centroid_coordinates(coordinate_kind, r_mu_fft_idx, r_mu_crystal):
+    """Validate the explicit type and return its small host coordinate tables."""
+    centroid_table_fingerprint_scheme(coordinate_kind)
+    if r_mu_crystal is None:
+        raise ValueError('centroids require r_mu_crystal')
+    crystal = np.asarray(r_mu_crystal, dtype=np.float64)
+    if crystal.ndim != 2 or crystal.shape[1] != 3 or not crystal.shape[0]:
+        raise ValueError(f'r_mu_crystal must be nonempty (n_rmu, 3); got {crystal.shape}')
+    if not np.isfinite(crystal).all():
+        raise ValueError('r_mu_crystal must contain finite positions')
+    if coordinate_kind == 'fractional':
+        if r_mu_fft_idx is not None:
+            raise ValueError('fractional centroids must not carry r_mu_fft_idx')
+        return None, crystal
+    if r_mu_fft_idx is None:
+        raise ValueError('FFT centroids require r_mu_fft_idx')
+    idx = np.asarray(r_mu_fft_idx)
+    if idx.dtype.kind not in 'iu' or idx.shape != crystal.shape:
+        raise ValueError('r_mu_fft_idx must be an integer table matching r_mu_crystal')
+    return idx, crystal
+
+
+def write_centroid_coordinates(group, r_mu_fft_idx, r_mu_crystal, *,
+                               coordinate_kind='fft_indices'):
     """Write the shared spatial-coordinate table below an HDF5 header group.
 
-    Both arrays have shape (n_mu, 3), in FFT-grid and fractional crystal
-    coordinates respectively. Only small host metadata enters this routine.
+    The fractional float64 table is always present.  FFT indices exist only
+    for the explicitly declared FFT basis.  Only small host metadata enters.
     """
+    idx, crystal = _validate_centroid_coordinates(
+        coordinate_kind, r_mu_fft_idx, r_mu_crystal)
     c = group.create_group('centroids')
-    c.create_dataset('r_mu_fft_idx', data=r_mu_fft_idx)
-    c.create_dataset('r_mu_crystal', data=r_mu_crystal)
+    c.create_dataset('coordinate_kind', data=np.bytes_(coordinate_kind))
+    if idx is not None:
+        c.create_dataset('r_mu_fft_idx', data=idx)
+    c.create_dataset('r_mu_crystal', data=crystal)
 
 
 def write_isdf_header(
@@ -297,7 +358,8 @@ def write_isdf_header(
         g.create_dataset('vertex_mu_L', data=np.int32(header.vertex_mu_L))
         g.create_dataset('zeta_is_done', data=np.bool_(header.zeta_is_done))
         g.create_dataset('zeta_layout', data=np.bytes_(header.zeta_layout))
-        write_centroid_coordinates(g, header.r_mu_fft_idx, header.r_mu_crystal)
+        write_centroid_coordinates(g, header.r_mu_fft_idx, header.r_mu_crystal,
+                                   coordinate_kind=header.coordinate_kind)
         # G-flat metadata — only written when present.
         if header.gvec_components is not None:
             g.create_dataset('gvec_components', data=header.gvec_components)
@@ -355,7 +417,9 @@ def stamp_fit_provenance(path: str | Path, provenance: str) -> None:
 
 __all__ = [
     'CENTROID_TABLE_FINGERPRINT_SCHEME',
+    'FRACTIONAL_CENTROID_TABLE_FINGERPRINT_SCHEME',
     'centroid_table_md5',
+    'centroid_table_fingerprint_scheme',
     'IsdfHeader',
     'WavefunctionBasisReceipt',
     'bind_isdf_attrs',

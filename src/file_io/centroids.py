@@ -1,9 +1,9 @@
 """Centroid-coordinate loading behind one format and symmetry entry point.
 
-The text file contains fractional crystal coordinates.  This module owns the
-one conversion from those coordinates to the integer FFT-grid rows consumed by
-the ISDF kernels.  Orbit closure itself remains the responsibility of the
-``symmetry_maps`` service: :func:`load_centroid_basis` calls its public
+The text file contains fractional crystal coordinates.  An explicit
+``# centroid coordinate kind: fractional`` header retains those real positions;
+otherwise the historical FFT-grid snapping applies.  Orbit closure remains
+with ``symmetry_maps``: :func:`load_centroid_basis` calls its public
 measurement and returns the resulting structured verdict without printing or
 choosing an IBZ/full-BZ policy.
 """
@@ -25,11 +25,11 @@ class LoadedCentroids:
     """One loaded ISDF centroid basis and its canonical closure verdict.
 
     ``centroids_frac`` records the coordinates as written;
-    ``centroid_indices`` records the periodically wrapped integer FFT-grid
-    points the physics actually consumes.  ``closure`` is a
-    ``symmetry_maps.CentroidClosureVerdict`` measured on those consumed grid
-    points.  Keeping the verdict structured lets each driver render it in its
-    own report without putting presentation or q-grid policy in file I/O.
+    ``centroid_indices`` records the coordinates the physics consumes: integer
+    FFT-grid rows for ``coordinate_kind='fft_indices'`` or exact float64
+    fractional positions for ``'fractional'``.  ``closure`` is measured on
+    those consumed positions.  Keeping the verdict structured lets each driver
+    render it without putting presentation or q-grid policy in file I/O.
     """
 
     path: str
@@ -38,6 +38,7 @@ class LoadedCentroids:
     n_rmu: int
     source_n_rmu: int
     closure: CentroidClosureVerdict
+    coordinate_kind: str = "fft_indices"
 
     @property
     def orbit_closed(self) -> bool:
@@ -64,6 +65,40 @@ def _read_centroid_coordinates(centroids_file: str) -> np.ndarray:
             f"Centroid file {centroids_file} contains a non-finite "
             "coordinate.")
     return centroids_frac
+
+
+_COORDINATE_KIND = re.compile(
+    r"^\s*#\s*centroid coordinate kind\s*:\s*(.*?)\s*$")
+
+
+def read_centroid_coordinate_kind(centroids_file: str) -> str:
+    """Read the explicit coordinate type, defaulting to legacy FFT snapping.
+
+    The header must precede the data.  Repeated identical declarations are
+    harmless; conflicting or unsupported declarations refuse at the file
+    boundary.  The numeric table's dtype never determines its meaning.
+    """
+    declared = None
+    with open(centroids_file, "r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            if not line.lstrip().startswith("#"):
+                break
+            match = _COORDINATE_KIND.match(line)
+            if match is None:
+                continue
+            kind = match.group(1)
+            if kind not in ("fft_indices", "fractional"):
+                raise ValueError(
+                    f"Centroid file {centroids_file}: coordinate kind must be "
+                    f"'fft_indices' or 'fractional'; got {kind!r}.")
+            if declared is not None and kind != declared:
+                raise ValueError(
+                    f"Centroid file {centroids_file} has conflicting "
+                    "coordinate kind declarations.")
+            declared = kind
+    return "fft_indices" if declared is None else declared
 
 
 
@@ -183,7 +218,7 @@ def load_centroids(
     centroids_file: str,
     fft_grid: tuple[int, int, int] | np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    """Load centroid coordinates and convert them to periodic FFT-grid rows.
+    """Load centroid coordinates with their explicitly declared meaning.
 
     This is the compatibility surface for consumers that do not hold a
     ``SymMaps`` yet.  Drivers that already constructed the canonical symmetry
@@ -191,8 +226,18 @@ def load_centroids(
     verdict.
     """
     centroids_frac = _read_centroid_coordinates(centroids_file)
-    _grid, centroid_indices = _centroid_grid_indices(
-        centroids_frac, fft_grid)
+    coordinate_kind = read_centroid_coordinate_kind(centroids_file)
+    if coordinate_kind == "fractional":
+        # Validate the FFT-grid contract even though these positions are not
+        # snapped to it.  Preserve lattice images: full-Bloch samples depend
+        # on the actual point, and transport records the image phase.
+        grid = np.asarray(fft_grid, dtype=np.int64)
+        if grid.shape != (3,) or np.any(grid <= 0):
+            raise ValueError("fft_grid must contain three positive extents.")
+        centroid_indices = centroids_frac.copy()
+    else:
+        _grid, centroid_indices = _centroid_grid_indices(
+            centroids_frac, fft_grid)
     return centroids_frac, centroid_indices, int(centroids_frac.shape[0])
 
 
@@ -213,6 +258,7 @@ def load_centroid_basis(
     """
     centroids_frac, centroid_indices, source_n_rmu = load_centroids(
         centroids_file, fft_grid)
+    coordinate_kind = read_centroid_coordinate_kind(centroids_file)
     if selection is not None:
         selection = validate_centroid_selection(selection, source_n_rmu)
         centroids_frac = centroids_frac[selection]
@@ -221,8 +267,8 @@ def load_centroid_basis(
     grid = np.asarray(fft_grid, dtype=np.int64).reshape(3)
 
     # Import through the service's public API, never through an implementation
-    # submodule.  Measure the grid rows the kernels consume rather than the
-    # rounded text spellings, matching ``resolve_qgrid_symmetry`` exactly.
+    # submodule.  Measure the positions the kernels consume, matching
+    # ``resolve_qgrid_symmetry`` exactly.
     from symmetry_maps import verify_centroid_orbit_closure
 
     sym_matrices = np.asarray(sym.sym_matrices)
@@ -234,8 +280,8 @@ def load_centroid_basis(
             "load_centroid_basis: SymMaps translations and spatial symmetry "
             f"rows disagree: sym_matrices={sym_matrices.shape}, "
             f"translations={translations.shape}.")
-    consumed_frac = (
-        centroid_indices.astype(np.float64) / grid[None, :].astype(np.float64))
+    consumed_frac = (centroid_indices if coordinate_kind == "fractional" else
+                     centroid_indices.astype(np.float64) / grid[None, :])
     closure = verify_centroid_orbit_closure(
         consumed_frac,
         sym_matrices,
@@ -248,4 +294,5 @@ def load_centroid_basis(
         n_rmu=n_rmu,
         source_n_rmu=source_n_rmu,
         closure=closure,
+        coordinate_kind=coordinate_kind,
     )

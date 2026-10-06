@@ -639,20 +639,23 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
             "current": cfg.paths.centroids_file_current}[family]
     centroids = load_centroid_basis(path, wfn.fft_grid, sym=sym)
     idx = centroids.centroid_indices
-    if digest != centroid_table_md5(idx):
+    if digest != centroid_table_md5(idx, coordinate_kind=centroids.coordinate_kind):
         raise ValueError("BSE parent restart centroid content does not match its deck")
     if not centroids.orbit_closed or (
             np.array_equal(rows, np.arange(sym.nk_tot)) and sym.nk_red != sym.nk_tot):
         sym = sym.trivial_view()
     from gw.gw_init import prepare_band_metadata
     _, bands, _ = prepare_band_metadata(
-        idx, cfg, mesh_xy, centroids.n_rmu, lambda *args: None, sym, wfn)
+        idx, cfg, mesh_xy, centroids.n_rmu, lambda *args: None, sym, wfn,
+        coordinate_kind=centroids.coordinate_kind)
     assert_restart_window_matches(
         restart_file, band_slices=bands, n_rmu_logical=centroids.n_rmu)
-    basis = PackedCentroidBasis.build(idx, sym, wfn.fft_grid, mesh_xy)
+    basis = PackedCentroidBasis.build(idx, sym, wfn.fft_grid, mesh_xy,
+                                     coordinate_kind=centroids.coordinate_kind)
     plan = build_centroid_k_unfold_plan(
         sym, idx, wfn.fft_grid, mesh_xy, nspinor=faces[0].shape[2],
-        parent_k_frac=wfn.kvecs(k=sym.parent_k_domain), layout=basis.layout)
+        parent_k_frac=wfn.kvecs(k=sym.parent_k_domain), layout=basis.layout,
+        coordinate_kind=centroids.coordinate_kind)
     if not np.array_equal(rows, plan.parent_full_rows):
         raise ValueError("BSE parent restart rows do not match the authenticated file wedge")
     spec = P(None, None, None, "x")
@@ -692,9 +695,25 @@ def read_metadata(filename):
                 (("charge", "psi_parent_y"), ("current", "psi_parent_y_transverse")) if name in f},
             centroid_hashes={family: f.attrs.get(name) for family, name in
                 (("charge", "centroids_charge_md5"), ("current", "centroids_transverse_md5"))},
+            bispinor_gw=(None if "bispinor_gw" not in f.attrs
+                         else str(np.asarray(f.attrs["bispinor_gw"]).astype(str))),
             charge_representation=(None if "charge_representation" not in f.attrs
                                    else str(np.asarray(f.attrs["charge_representation"]).astype(str))),
+            atomic_augmentation=(None if "atomic_augmentation" not in f.attrs
+                                 else str(np.asarray(f.attrs["atomic_augmentation"]).astype(str))),
         )
+
+
+def require_atomic_augmentation_match(filename, identity):
+    """Reject corrected faces/V paired with a different atomic reconstruction."""
+    with h5py.File(filename, "r") as f:
+        stored = f.attrs.get("atomic_augmentation")
+        stored = None if stored is None else str(np.asarray(stored).astype(str))
+    if stored != identity:
+        raise ValueError(
+            f"GATE restart_atomic_augmentation: {filename} carries "
+            f"atomic_augmentation={stored!r}; want {identity!r}. "
+            "Regenerate with restart=false under the requested matched atomic data.")
 
 
 def read_interaction(filename, kind, mesh_xy, *, nohead=False):
@@ -3789,6 +3808,11 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     zx.update(read_coarse_interactions(restart_file, input_file, mesh))
     _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
     zl = open_zeta(zeta_file, mesh=_mesh_for_loader)
+    if zl.coordinate_kind != 'fft_indices':
+        zl.close()
+        raise NotImplementedError(
+            "vq_interp refitting requires FFT centroid samples; fractional "
+            "augmented centroids are supported by the GW fitting/restart path.")
     zx["_zeta_loader"] = zl
     zx["zeta_distributed"] = _distributed
     zx["ZG"] = _ZetaGTiles(zl, path=zeta_file, distributed=_distributed)
@@ -4418,17 +4442,25 @@ def _read_isdf_group(f: h5py.File) -> IsdfHeader:
               if 'zeta_cutoff_ry' in g else None)
     prov = (_decode_isdf_str(g['fit_provenance'][()])
             if 'fit_provenance' in g else None)
+    kind = (_decode_isdf_str(g['centroids/coordinate_kind'][()])
+            if 'centroids/coordinate_kind' in g else 'fft_indices')
+    idx = (np.asarray(g['centroids/r_mu_fft_idx'][:])
+           if 'centroids/r_mu_fft_idx' in g else None)
+    crystal = g['centroids/r_mu_crystal']
+    if kind == 'fractional' and (crystal.dtype.kind != 'f' or crystal.dtype.itemsize != 8):
+        raise ValueError('fractional r_mu_crystal must be a float64 table')
     return IsdfHeader(
         density=_decode_isdf_str(g['density'][()]),
         vertex_mu_L=int(g['vertex_mu_L'][()]),
-        r_mu_fft_idx=np.asarray(g['centroids/r_mu_fft_idx'][:], dtype=np.int32),
-        r_mu_crystal=np.asarray(g['centroids/r_mu_crystal'][:], dtype=np.float64),
+        r_mu_fft_idx=idx,
+        r_mu_crystal=np.asarray(crystal[:], dtype=np.float64),
         zeta_is_done=zeta_done,
         zeta_layout=zeta_layout,
         gvec_components=gv,
         ngk_per_q=nk,
         zeta_cutoff_ry=cutoff,
         fit_provenance=prov,
+        coordinate_kind=kind,
     )
 
 

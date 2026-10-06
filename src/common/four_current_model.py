@@ -10,17 +10,20 @@ decisions (:class:`FourCurrentRepresentation`), so preprocessing
 ISDF fits, the exact Hartree, the scalar head producer and the Sigma
 dispatch never derive the representation on their own.
 
-Models -- all three of them (the deck grammar added `full_shared_pole` in 2026-09;
+Models (the deck grammar added `full_shared_pole` in 2026-09;
 the two carrier-comparison spellings were retired, ``gw_config``'s
 ``_RETIRED_BISPINOR_GW_MODES``):
 
-* ``bare_transverse`` (default), ``full_static_cohsex`` (the packed
+* ``coulomb_only``, ``bare_transverse`` (default), ``full_static_cohsex`` (the packed
   static photon mode) and ``full_shared_pole``: charge and currents on the
   normalized restricted-kinetic-balance (RKB) lift
   ``Psi = [I; X](I + X^dagger X)^(-1/2) Psi_L``, ``X = (alpha_FS/2) sigma.p``,
   and the four-spinor scalar head/dipole artifact
   (``scalar_head_bispinor = True``).
   Theory: ``docs/theory/bispinor-gw.md#lift``.
+
+``coulomb_only`` omits spatial-current interactions but retains the same
+normalized four-component charge carrier and scalar-head artifact.
 
 They resolve to the SAME carrier -- ``bispinor_gw`` selects which Lorentz
 blocks are screened, never which four-spinor represents them -- so this

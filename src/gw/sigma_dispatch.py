@@ -56,7 +56,8 @@ from .gw_config import (
     mode_builds_channels, refuse_explicit_gij,
     refuse_unimplemented_compute_mode,
     packed_photon_replaces_charge_sigma, sigma_stage_modes,
-    uses_dynamic_packed_photon_route, uses_static_photon_response)
+    uses_dynamic_packed_photon_route, uses_static_photon_response,
+    uses_transverse_interaction)
 
 
 # ---------------------------------------------------------------------------
@@ -505,9 +506,9 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
 
     representation = resolve_four_current_representation(
         config.bispinor, config.bispinor_gw)
-    include_transverse = bool(config.bispinor)
+    include_transverse = uses_transverse_interaction(config)
     hartree_meta = (replace(meta, nspinor=4, npol=4)
-                    if include_transverse and int(meta.nspinor) != 4 else meta)
+                    if representation.charge_bispinor and int(meta.nspinor) != 4 else meta)
     print_fn(
         "  V_H: exact FFT-grid matrix built live in G-space "
         "(ρ: one psum; Poisson: replicated; matrix elements: two-axis "
@@ -517,7 +518,7 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
         truncation_2d=(int(config.sys_dim) == 2),
         nb=int(band_slices.b3), mesh=mesh_xy,
         include_transverse=include_transverse,
-        bispinor_lift=(representation.current_lift or "raw"),
+        bispinor_lift=(representation.charge_lift or "raw"),
         print_fn=print_fn, return_sharded=True)
     charge = exact.charge if include_transverse else exact
     window = (slice(None),

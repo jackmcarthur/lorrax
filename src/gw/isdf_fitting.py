@@ -44,6 +44,17 @@ _NVSMI_PEAK_MB = 0
 _NVSMI_LAST_MB = 0
 
 
+def fitting_band_weights(nb_face, band_range_left, band_range_right):
+    """The shared zero-padded band-window weights for every normal-equation RHS."""
+    origin = min(int(band_range_left[0]), int(band_range_right[0]))
+    index = np.arange(int(nb_face))
+    def weight(interval):
+        return jnp.asarray(np.where(
+            (index >= int(interval[0])-origin)
+            & (index < int(interval[1])-origin), 1.0, 0.0), dtype=jnp.float64)
+    return weight(band_range_left), weight(band_range_right)
+
+
 
 
 
@@ -188,6 +199,64 @@ def add_pad_diagonal_sharded(C, active_mask, n_logical, *, mesh_xy):
     return kernel(C, pad)
 
 
+def equilibrate_charge_gram(C, active_mask, *, mesh_xy):
+    """Return ``D C D, D`` with D=diag(C)^(-1/2) on physical samples.
+
+    The charge factor and its rank policy remain the canonical owners.
+    This is an explicit change of the fit's truncation metric; callers
+    must return ``D B_equilibrated`` as the physical factor. Transport
+    pads have D=1 and receive their inert diagonal only after this step.
+    Only row-local diagonals and per-q validation scalars are reduced.
+    """
+    from common.shard_map import shard_map
+    from common.collectives import gather_to_host
+
+    nq,n,n2 = map(int,C.shape)
+    px,py = int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
+    active = np.asarray(active_mask,dtype=bool)
+    if n != n2 or n % px or n % py or active.shape != (n,) or not np.any(active):
+        raise ValueError("charge equilibration requires a square mesh-divisible carrier and physical active mask")
+    active_dev = _device_put_process_local(active,NamedSharding(mesh_xy,P()))
+    rows_per_rank,cols_per_rank = n//px,n//py
+
+    def extract(c,mask):
+        rows = jax.lax.axis_index('x')*rows_per_rank+jnp.arange(rows_per_rank)
+        cols = jax.lax.axis_index('y')*cols_per_rank+jnp.arange(cols_per_rank)
+        diagonal = jax.lax.psum(jnp.sum(jnp.where(
+            rows[:,None] == cols[None,:],c,0),axis=-1),'y')
+        physical = jnp.take(mask,rows)
+        minimum = jax.lax.pmin(jnp.min(jnp.where(physical,diagonal.real,jnp.inf),axis=-1),'x')
+        maximum = jax.lax.pmax(jnp.max(jnp.where(physical,jnp.abs(diagonal.real),0),axis=-1),'x')
+        imaginary = jax.lax.pmax(jnp.max(jnp.where(physical,jnp.abs(diagonal.imag),0),axis=-1),'x')
+        finite = jax.lax.pmin(jnp.all(jnp.where(physical,jnp.isfinite(diagonal),True),axis=-1).astype(jnp.int32),'x')
+        # Off-physical slots are exactly one; invalid physical diagonals
+        # are refused by the host scalar seam before this scale is used.
+        scale = jnp.where(physical,jax.lax.rsqrt(jnp.where(physical,diagonal.real,1)),1)
+        return scale,jnp.stack((minimum,maximum,imaginary,finite),axis=-1)
+
+    extract_jit = jax.jit(shard_map(extract,mesh=mesh_xy,
+        in_specs=(P(None,'x','y'),P()),out_specs=(P(None,'x'),P()),check_vma=False))
+    scale,receipt = extract_jit(C,active_dev)
+    receipt = np.asarray(gather_to_host(receipt))
+    tolerance = 128*np.finfo(np.float64).eps*np.maximum(receipt[:,1],1e-300)
+    if (np.any(receipt[:,0] <= 0) or np.any(receipt[:,3] != 1)
+            or np.any(receipt[:,2] > tolerance)):
+        raise ValueError("unit-diagonal charge fit requires finite, real, strictly positive physical C diagonals")
+    scale_col = jax.jit(lambda a:a,
+                        out_shardings=NamedSharding(mesh_xy,P(None,'y')))(scale)
+    scaled = jax.jit(lambda c,d,e:c*d[:,:,None]*e[:,None,:],
+                     out_shardings=NamedSharding(mesh_xy,P(None,'x','y')))(C,scale,scale_col)
+    return scaled,scale
+
+
+def scale_charge_factor_rows(factor, diagonal_scale, *, mesh_xy):
+    """Physical factor ``D B'`` shared unchanged by PW and local RHS solves."""
+    if factor.ndim != 3 or diagonal_scale.shape != factor.shape[:2]:
+        raise ValueError("charge factor row scale disagrees with its q/centroid carrier")
+    return jax.jit(lambda b,d:b*d[:,:,None],
+        out_shardings=NamedSharding(mesh_xy,P(None,'x','y')))(factor,diagonal_scale)
+
+
 def _host_mem(label):
     """Rank-local host line: this process's VmRSS and the node's MemAvailable."""
     from common.gpu_utils import get_host_memory_available_gb
@@ -214,6 +283,7 @@ def _fit_mubatch(
     distrib_la_batched_route, n_rmu_solve,
     q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q,
     mu_basis, gvec_components, scratch_dir, print_fn,
+    psi_nmu_parent=None, use_augmented_samples=False,
 ):
     """The μ-batch fit: Z^{μ_L}_q(G) of every channel by batches, C⁻¹ on the sphere.
 
@@ -322,12 +392,40 @@ def _fit_mubatch(
     from gw.gflat_memory_model import route_g_plane_chunk
     plane_from_col = np.asarray(jax.device_get(cyl[2]))
     canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)
-    x_cent = np.asarray(centroid_indices, dtype=np.float64) / np.asarray(fft_grid)
+    x_cent = np.asarray(centroid_indices,dtype=np.float64)
+    if getattr(k_unfold_plan,'coordinate_kind','fft_indices') == 'fft_indices':
+        x_cent = x_cent/np.asarray(fft_grid)
     ops = (_device_put_process_local(w_l, rep), _device_put_process_local(w_r, rep),
            _device_put_process_local(kpar, rep))
     rank_sh = NamedSharding(mesh_xy, P(('x', 'y')))
     tabs = (tuple(_device_put_process_local(np.asarray(a), rep) for a in cyl[:2]),
             tuple(_device_put_process_local(a, rep) for a in zt))
+
+    # C and every RHS must use the SAME augmented endpoint samples.  Route G
+    # still contracts against smooth psi(G); only its centroid operand changes.
+    # Gather a bounded batch on device from the persistent face, then lay it
+    # out by centroid over all ranks.  The source scan gathers only n_pc
+    # parents, rather than replicating the whole parent face.
+    sample_batch = None
+    if use_augmented_samples:
+        if (psi_nmu_parent is None or psi_nmu_parent.ndim != 4
+                or int(psi_nmu_parent.shape[0]) != n_par
+                or int(psi_nmu_parent.shape[2]) != ns
+                or int(psi_nmu_parent.shape[3]) != mu_pad
+                or int(psi_nmu_parent.shape[1]) < nb):
+            raise ValueError(
+                "augmented route-G samples must share the Gram's parent, "
+                "spin, packed-centroid and logical-band carriers")
+        sample_spec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
+
+        @jax.jit(out_shardings=sample_spec)
+        def sample_batch(samples, slots):
+            on = slots >= 0
+            out = jnp.take(samples[:, :nb_p], jnp.maximum(slots, 0), axis=-1)
+            # Faces divide over X; reciprocal bands divide over all XY ranks.
+            # Their legitimate carrier pads can differ (AgI120->128 at P16).
+            out = jnp.pad(out, ((0, 0), (0, nb_p-out.shape[1]), (0, 0), (0, 0)))
+            return jnp.where(on[None, None, None, :], out, 0)
 
     def launch_args(beta, mb):
         slots = mb.mu[beta]
@@ -335,8 +433,12 @@ def _fit_mubatch(
         xmu = x_cent[canon[np.clip(slots, 0, None)]] * live[:, None]
         lt = tuple(jax.make_array_from_callback(a.shape, rank_sh, lambda i, a=a: a[i])
                    for a in (mb.left_perm[beta], mb.left_L[beta]))
-        return (cbar, *ops, g3, _device_put_process_local(xmu, rep),
+        args = (cbar, *ops, g3, _device_put_process_local(xmu, rep),
                 _device_put_process_local(live, rep), *tabs, unf, lt)
+        if use_augmented_samples:
+            args += (sample_batch(psi_nmu_parent,
+                                  _device_put_process_local(slots, rep)),)
+        return args
 
     builds = {}
 
@@ -351,7 +453,8 @@ def _fit_mubatch(
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
             plane_from_col=plane_from_col, n_pg=int(plan.r_sub),
             axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk,
-            n_pc=int(plan.p_chunk(int(mb.b))), vertex_terms=vertex_terms)
+            n_pc=int(plan.p_chunk(int(mb.b))), vertex_terms=vertex_terms,
+            use_augmented_samples=bool(use_augmented_samples))
         kernel = zmb.make_route_g_kernel(**kern_args)
         with timing.section("zeta_fit.mubatch.compile"):
             compiled = kernel.lower(*launch_args(0, mb)).compile()
@@ -531,6 +634,13 @@ def _fit_mubatch(
     return zetas, n_run, n_batch
 
 
+def _validate_deferred_zeta_write(*, defer, write_file, augmented, vertices):
+    """Only an augmented charge owner can finish its physical payload in V."""
+    if defer and (not write_file or not augmented or vertices != (0,)):
+        raise ValueError(
+            "defer_zeta_write requires an augmented charge fit with write_zeta_file=True")
+
+
 def fit_zeta_to_h5(
     wfn,
     sym,
@@ -556,7 +666,10 @@ def fit_zeta_to_h5(
     mubatch_plan=None,
     parent_psi=None,
     write_zeta_file: bool = True,
+    defer_zeta_write: bool = False,
     current_basis_rows=None,
+    use_augmented_samples: bool = False,
+    charge_factor_equilibration: str | None = None,
     print_fn=print,
 ):
     """Fit canonical q-IBZ ζ for each channel of ``output_files`` on route G.
@@ -570,6 +683,11 @@ def fit_zeta_to_h5(
     current channels, which share one μ-batch loop
     (docs/architecture/zeta_fit_mubatch.md).  Each channel owns its C_q, its
     factor and its file.  Returns ``(peak_bytes, {μ_L: ZetaG})``.
+
+    An augmented charge fit may defer its payload until its local provider
+    exists. Its header stays incomplete and the returned ZetaG carries
+    ``pending_zeta_write``; the V owner writes physical s+delta in the same
+    contraction pass and completes the file only after its collective close.
     """
     if k_unfold_plan is None or psi_nmu_parent is None or psi_mun_parent is None:
         raise ValueError("fit_zeta_to_h5 requires a typed plan and both raw-parent faces.")
@@ -588,6 +706,18 @@ def fit_zeta_to_h5(
             f"fit_zeta_to_h5: channels {vertices} must be (0,) (charge) or a "
             "subset of the current channels (1, 2, 3).")
     transverse = vertices != (0,)
+    _validate_deferred_zeta_write(
+        defer=defer_zeta_write, write_file=write_zeta_file,
+        augmented=use_augmented_samples, vertices=vertices)
+    coordinate_kind = getattr(k_unfold_plan,'coordinate_kind','fft_indices')
+    if coordinate_kind not in ('fft_indices','fractional'):
+        raise ValueError("unknown centroid coordinate kind in typed fitting plan")
+    if coordinate_kind == 'fractional' and (not use_augmented_samples or transverse):
+        raise ValueError("fractional fitting currently requires augmented charge samples")
+    if charge_factor_equilibration not in (None,'unit_diagonal'):
+        raise ValueError("unknown charge factor equilibration convention")
+    if charge_factor_equilibration is not None and (not use_augmented_samples or transverse):
+        raise ValueError("explicit unit-diagonal charge fitting requires augmented charge samples")
     mem_probe("zeta_fit_start")
 
     # Two μ extents (common/meta.py): ``n_rmu`` is the LOGICAL centroid count
@@ -655,6 +785,7 @@ def fit_zeta_to_h5(
             context=("bispinor transverse ζ̃_T IBZ write"
                      if transverse else "ζ̃ IBZ write"),
             announce_fallback=not transverse,
+            **({'coordinate_kind':coordinate_kind} if coordinate_kind == 'fractional' else {}),
         )
         if not _res.use_ibz:
             if transverse:
@@ -673,14 +804,8 @@ def fit_zeta_to_h5(
     if (int(psi_nmu_parent.shape[1]) != _nb_face
             or int(psi_nmu_parent.shape[2]) != _ns_face):
         raise ValueError("fit_zeta_to_h5: parent face band/spin extents differ.")
-    _off = int(band_range_full[0])
-    _idx = np.arange(_nb_face)
-    weight_l_face = jnp.asarray(np.where(
-        (_idx >= band_range_left[0] - _off)
-        & (_idx < band_range_left[1] - _off), 1.0, 0.0), dtype=jnp.float64)
-    weight_r_face = jnp.asarray(np.where(
-        (_idx >= band_range_right[0] - _off)
-        & (_idx < band_range_right[1] - _off), 1.0, 0.0), dtype=jnp.float64)
+    weight_l_face, weight_r_face = fitting_band_weights(
+        _nb_face, band_range_left, band_range_right)
     flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     # ---- q rows, the per-q ζ sphere (shared by every channel) ------------
@@ -732,7 +857,8 @@ def fit_zeta_to_h5(
             "fit_zeta_to_h5: wfn must expose '_filename' (the source "
             "WFN.h5 path) so mf_header can be copied verbatim into "
             "zeta_q.h5.")
-    _cent_idx_np = np.asarray(jax.device_get(centroid_indices), dtype=np.int32)
+    _cent_idx_np = np.asarray(jax.device_get(centroid_indices),
+        dtype=np.float64 if coordinate_kind == 'fractional' else np.int32)
     if _cent_idx_np.shape != (n_rmu, 3):
         raise ValueError(
             f"fit_zeta_to_h5: centroid_indices has shape "
@@ -790,7 +916,8 @@ def fit_zeta_to_h5(
             C_q_flat = jax.lax.with_sharding_constraint(
                 C_q.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard)
             del C_q
-            if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
+            if (charge_factor_equilibration is None
+                    and n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu):
                 # Interleaved pad slots (orbit-packed order): C_q's pad rows and
                 # columns are exact zeros.  Put C's own MEAN DIAGONAL (tr C/n per
                 # q) on the pad diagonal: the factor is nonsingular, Z's zero pad
@@ -810,6 +937,19 @@ def fit_zeta_to_h5(
                     C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
             C_q_flat.block_until_ready()
 
+        diagonal_scale = None
+        if charge_factor_equilibration is not None:
+            with timing.section("zeta_fit.charge_equilibration"):
+                active = (np.asarray(mu_basis.active_mask) if mu_basis is not None
+                          else np.arange(n_rmu_padded) < n_rmu)
+                C_q_flat,diagonal_scale = equilibrate_charge_gram(
+                    C_q_flat,active,mesh_xy=mesh_xy)
+                if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
+                    C_q_flat = add_pad_diagonal_sharded(
+                        C_q_flat,active,float(n_rmu),mesh_xy=mesh_xy)
+                print_fn("  charge fit: explicit unit-diagonal truncation metric; "
+                         "canonical rank policy and physical D B factor for both PW/local RHS")
+
         with timing.section("zeta_fit.cholesky"):
             # Route G applies a WHOLE-TILE factor on each G tile: the charge
             # channel's rank-truncated pseudo-inverse, or a current channel's
@@ -823,6 +963,8 @@ def fit_zeta_to_h5(
                 zeta_rcond=zeta_rcond)
             # The charge factor is one array; a current factor is (factor, piv).
             L_q, lu_piv = _factor if v != 0 else (_factor, None)
+            if diagonal_scale is not None:
+                L_q = scale_charge_factor_rows(L_q,diagonal_scale,mesh_xy=mesh_xy)
             jax.block_until_ready(L_q)
             print_fn(f"  μ_L={v} factor: {_kind} -> "
                      f"{'hoisted pivoted LU' if lu_piv is not None else 'whole-tile'} "
@@ -843,7 +985,10 @@ def fit_zeta_to_h5(
         if _write_file:
             path = output_files[v]
             _isdf_hdr = IsdfHeader.build(
-                r_mu_fft_idx=_cent_idx_np, fft_grid=meta.fft_grid,
+                r_mu_fft_idx=_cent_idx_np if coordinate_kind == 'fft_indices' else None,
+                **({'coordinate_kind':coordinate_kind,'r_mu_crystal':_cent_idx_np}
+                   if coordinate_kind == 'fractional' else {}),
+                fft_grid=meta.fft_grid,
                 density='scalar' if v == 0 else 'current', vertex_mu_L=v,
                 zeta_layout='G_flat', gvec_components=_gflat_gvec_components,
                 ngk_per_q=_gflat_ngk_per_q, zeta_cutoff_ry=float(zeta_cutoff_ry))
@@ -855,7 +1000,8 @@ def fit_zeta_to_h5(
                     write_isdf_header(path, _isdf_hdr, mode='a')
                 jax.experimental.multihost_utils.sync_global_devices(
                     "zeta_fit_headers_written")
-        channels.append(ZetaChannel(v, L_q, lu_piv, _kind, _write_file, output_files[v]))
+        channels.append(ZetaChannel(
+            v, L_q, lu_piv, _kind, _write_file and not defer_zeta_write, output_files[v]))
     del _face_gemm
     gc.collect()
 
@@ -875,7 +1021,8 @@ def fit_zeta_to_h5(
         sphere_idx=_gflat_sphere_idx_padded, ngk_per_q=_gflat_ngk_per_q,
         mu_basis=mu_basis, gvec_components=_gflat_gvec_components,
         scratch_dir=os.path.dirname(os.path.abspath(output_files[vertices[0]])),
-        print_fn=print_fn)
+        print_fn=print_fn, psi_nmu_parent=psi_nmu_parent,
+        use_augmented_samples=bool(use_augmented_samples))
     # ``isdf_header/zeta_is_done`` is the file's own claim that the writer
     # finished; a truncating knob (gw_config.ZETA_TRUNCATING_ENV_KNOBS) leaves
     # it False so no restart or reuse path trusts a PARTIAL ζ.
@@ -884,10 +1031,7 @@ def fit_zeta_to_h5(
         print_fn(f"  *** LORRAX SANITY: {_trunc} truncated this ζ fit "
                  f"({n_run} of {n_total} μ batches); ζ is PARTIAL"
                  + (" and its files are NOT marked complete." if _write_file else "."))
-    for ch in channels:
-        if ch.write and not _trunc and jax.process_index() == 0:
-            from file_io.isdf_header import mark_zeta_done
-            mark_zeta_done(ch.output_file)
+    _finish_zeta_fit_files(zetas, channels, defer=defer_zeta_write, trunc=_trunc)
     _track_peak_mb = 0
     try:
         _st = jax.local_devices()[0].memory_stats() or {}
@@ -899,3 +1043,16 @@ def fit_zeta_to_h5(
              f"device peak {_track_peak_mb / 1e9:.2f} GB")
     mem_probe("zeta_fit_end")
     return _track_peak_mb, zetas
+
+
+def _finish_zeta_fit_files(zetas, channels, *, defer, trunc):
+    """Leave deferred or partial headers incomplete until their physical writer."""
+    if defer:
+        for zeta in zetas.values():
+            zeta.pending_zeta_write = not bool(trunc)
+        return
+    if not trunc and jax.process_index() == 0:
+        from file_io.isdf_header import mark_zeta_done
+        for channel in channels:
+            if channel.write:
+                mark_zeta_done(channel.output_file)

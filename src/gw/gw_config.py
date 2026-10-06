@@ -192,6 +192,7 @@ class ComputeMode(str, enum.Enum):
 class BispinorGWMode(str, enum.Enum):
     """How the four-current photon channels enter the GW self-energy; see docs/dev/gw_config_contracts.md."""
 
+    COULOMB_ONLY = "coulomb_only"
     BARE_TRANSVERSE = "bare_transverse"
     FULL_SHARED_POLE = "full_shared_pole"
     FULL_STATIC_COHSEX = "full_static_cohsex"
@@ -266,6 +267,19 @@ def uses_four_spinor_finite_q_charge(bispinor: bool, bispinor_gw) -> bool:
     return resolve_four_current_representation(
         bool(bispinor), coerce_bispinor_gw_mode(bispinor_gw)
     ).charge_bispinor
+
+
+def uses_transverse_interaction(config) -> bool:
+    """Select spatial-current interactions independently of the RKB carrier.
+
+    ``bispinor`` chooses the normalized four-component representation;
+    ``bispinor_gw = coulomb_only`` keeps its charge vertices and scalar
+    screening while omitting every transverse construction and contraction.
+    """
+    return (bool(config.bispinor)
+            and coerce_bispinor_gw_mode(getattr(
+                config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+                is not BispinorGWMode.COULOMB_ONLY)
 
 
 #: The LEGACY spellings of the self-energy axis, and the canonical key that
@@ -1116,6 +1130,8 @@ _DEFAULTS = {
     # charge feature metric used by ``centroids_file``.
     # Empty string == "not set" (cfg.centroids_file_current is None then).
     "centroids_file_current": "",
+    # Optional authenticated matched AE/PS data and local fitting controls.
+    "atomic_reconstruction_dir": "",
     "kin_ion_file": "kin_ion.h5",
     # Three human-readable text outputs (always written), plus one opt-in
     # fixed-Sigma eigenvalue-self-consistent QP ladder:
@@ -2178,7 +2194,7 @@ def mpa_sigma_runs_scalar_executor(config) -> bool:
     Green band sum.  A bispinor MPA fit is unmeasured and keeps the full-band
     sum.
     """
-    return (not bool(getattr(config, "bispinor", False))
+    return (not uses_transverse_interaction(config)
             or uses_bare_transverse_shared_pole(config)
             or uses_full_bispinor_shared_pole(config))
 
@@ -2441,6 +2457,8 @@ def _input_paths(
         wfn_file=str(params["wfn_file"]),
         centroids_file=str(params["centroids_file"]),
         centroids_file_current=cents_curr_resolved,
+        atomic_reconstruction_dir=(str(params["atomic_reconstruction_dir"])
+                                   if params["atomic_reconstruction_dir"] else None),
         kin_ion_file=str(params["kin_ion_file"]),
         parallel_transport_file=str(params["parallel_transport_file"]),
         static_gauge_hall_file=str(params["static_gauge_hall_file"]),
@@ -2862,7 +2880,7 @@ def _apply_input_envelope(
         print_fn(
             "  [config provenance] qp_solver=self_consistent: "
             "density_self_consistent was not named; enabling the live "
-            + ("(rho, J)" if bool(resolved.bispinor) else "rho")
+            + ("(rho, J)" if uses_transverse_interaction(resolved) else "rho")
             + " Hartree rebuild")
     elif (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(resolved.density_self_consistent)):
@@ -2880,7 +2898,7 @@ def _apply_input_envelope(
     if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and "sc_head_update" not in _named_keys
             and resolved.sc.head_update == "off"
-            and (not bool(resolved.bispinor)
+            and (not uses_transverse_interaction(resolved)
                  or uses_full_bispinor_shared_pole(resolved))
             and bool(resolved.do_G0)
             and resolved.sigma.w_model == "shared_pole"
@@ -2923,6 +2941,15 @@ def _apply_input_envelope(
     refuse_unsupported_bgw_metal_q0_treatment(resolved)
     refuse_unsupported_screening_diagrams(resolved)
     refuse_unsupported_bispinor_gw(resolved)
+    if resolved.paths.atomic_reconstruction_dir:
+        if (not resolved.bispinor
+                or resolved.bispinor_gw is not BispinorGWMode.COULOMB_ONLY
+                or int(resolved.sys_dim) != 3):
+            raise ValueError(
+                "GATE atomic_augmentation_domain: atomic_reconstruction_dir "
+                "requires bispinor=true, bispinor_gw=coulomb_only and sys_dim=3. "
+                "The local correction is certified for ordinary 3D Coulomb; "
+                "transverse and truncated kernels require their own compensation.")
     warn_headless_shared_pole_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
         _named_keys, resolved.compute_mode, resolved.qp_solver,
@@ -3382,6 +3409,7 @@ class FilePaths:
     eqp2_file: str
     report_file: str
     sigma_omega_h5_file: str
+    atomic_reconstruction_dir: str | None = None
 
 
 def _normalize_placement(value):
@@ -3658,6 +3686,13 @@ def uses_direct_bispinor_shared_pole_head(config) -> bool:
 
 def incumbent_bispinor_head_record(config) -> tuple[str, str]:
     """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route; see docs/dev/gw_config_contracts.md."""
+    if not uses_transverse_interaction(config):
+        return "", (
+            "Coulomb-only normalized RKB charge: "
+            + {HeadCorrection.FULL: "scalar Gamma-cell charge head",
+               HeadCorrection.NO_LOCAL_FIELDS: "direct scalar Gamma charge head",
+               HeadCorrection.OFF: "DEBUG: Gamma-cell charge head disabled"}[
+                   config.head.correction])
     if config.head.correction is HeadCorrection.OFF:
         return (
             "\n  ==========================================================\n"
@@ -3759,7 +3794,7 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     shared_pole_direct = (uses_direct_bispinor_shared_pole_head(config)
                           or (uses_bare_transverse_shared_pole(config)
                               and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS))
-    if (bool(config.bispinor)
+    if (uses_transverse_interaction(config)
             and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
             and not shared_pole_direct):
         raise ValueError(
@@ -3824,6 +3859,17 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "head is on by default with the charge head\n"
                 "  doc:  docs/input_reference.md '## Screening', "
                 "head_correction.")
+    if mode is BispinorGWMode.COULOMB_ONLY:
+        if not bool(config.bispinor):
+            raise ValueError(
+                "GATE coulomb_only_requires_bispinor: bispinor_gw=coulomb_only "
+                "requires bispinor=true; bispinor selects the normalized RKB "
+                "four-component charge carrier.")
+        if bool(config.head.bispinor_tt_head_correction):
+            raise ValueError(
+                "GATE coulomb_only_transverse_head: Coulomb-only interactions "
+                "cannot carry a transverse Gamma head.")
+        return
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if mode is BispinorGWMode.FULL_SHARED_POLE:
@@ -4447,13 +4493,16 @@ def uses_metal_direct_drude_head(config) -> bool:
             and config.sigma.w_model == "shared_pole"):
         return False
     if config.sc.head_update == "parallel_transport":
-        return ((not config.bispinor or uses_direct_bispinor_shared_pole_head(config))
+        return ((not uses_transverse_interaction(config)
+                 or uses_direct_bispinor_shared_pole_head(config))
                 and config.head.correction in (
                     HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL))
     if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
-        return (not config.bispinor or uses_bare_transverse_shared_pole(config)
+        return (not uses_transverse_interaction(config)
+                or uses_bare_transverse_shared_pole(config)
                 or uses_full_bispinor_shared_pole(config))
-    return config.head.correction is HeadCorrection.FULL and not config.bispinor
+    return (config.head.correction is HeadCorrection.FULL
+            and not uses_transverse_interaction(config))
 
 
 @dataclass(frozen=True)

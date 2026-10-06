@@ -42,7 +42,7 @@ _ZETA_DATASETS: tuple[tuple[str, int], ...] = (("zeta_q_G", 1), ("zeta_q", 2))
 class ZetaFileProbe:
     """What :func:`probe_zeta_file` found.  Every field may be absent.
 
-    ``eq=False`` because :attr:`r_mu_fft_idx` is an array and a generated
+    ``eq=False`` because the coordinate tables are arrays and a generated
     ``__eq__`` would compare it elementwise and then raise on the truth
     value — a record whose equality operator raises is worse than one
     that has none.
@@ -69,7 +69,7 @@ class ZetaFileProbe:
         The centroid count the ζ BLOCK was written at: axis 1 for
         G-flat, axis 2 for r-space.  ``None`` iff ``dataset_name`` is.
         This is the DATASET's opinion; the header's is
-        :attr:`r_mu_fft_idx`, and the two disagreeing is a corrupt file.
+        :attr:`centroid_coordinates`, and the two disagreeing is a corrupt file.
     zeta_done
         ``isdf_header/zeta_is_done``, or ``None`` when the file predates
         the flag or has no ``isdf_header``.  ``None`` is NOT ``False``:
@@ -77,9 +77,12 @@ class ZetaFileProbe:
         means "a writer stamped this and never came back".
     r_mu_fft_idx
         ``isdf_header/centroids/r_mu_fft_idx`` as ``int64``, or ``None``.
-        Its ``shape[0]`` is the HEADER's centroid count and its values
-        are flat FFT-box indices, so a caller can check both the count
-        and the grid they were built on.
+        Present only for the FFT basis.  Fractional files omit this dataset.
+    coordinate_kind
+        Explicit ``'fft_indices'`` or ``'fractional'``; missing type metadata
+        means the legacy FFT basis.  Array dtype never selects the type.
+    r_mu_crystal
+        Fractional float64 positions.  Authoritative for a fractional basis.
     """
 
     exists: bool
@@ -89,6 +92,14 @@ class ZetaFileProbe:
     mu_extent: int | None
     zeta_done: bool | None
     r_mu_fft_idx: np.ndarray | None
+    coordinate_kind: str = 'fft_indices'
+    r_mu_crystal: np.ndarray | None = None
+
+    @property
+    def centroid_coordinates(self) -> np.ndarray | None:
+        """The typed consumed coordinate table, if the header provides it."""
+        return (self.r_mu_crystal if self.coordinate_kind == 'fractional'
+                else self.r_mu_fft_idx)
 
 
 def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
@@ -123,6 +134,8 @@ def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
     mu_extent: int | None = None
     zeta_done: bool | None = None
     r_mu: np.ndarray | None = None
+    crystal: np.ndarray | None = None
+    coordinate_kind = 'fft_indices'
     try:
         with h5.File(p, "r") as f:
             for _name, _mu_axis in _ZETA_DATASETS:
@@ -135,9 +148,31 @@ def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
             if hdr is not None:
                 if "zeta_is_done" in hdr:
                     zeta_done = bool(np.asarray(hdr["zeta_is_done"])[()])
+                kind = hdr.get('centroids/coordinate_kind')
+                if kind is not None:
+                    value = kind[()]
+                    coordinate_kind = (value.decode('utf-8')
+                                       if isinstance(value, bytes) else str(value))
+                if coordinate_kind not in ('fft_indices', 'fractional'):
+                    raise ValueError(f'unsupported centroid coordinate_kind {coordinate_kind!r}')
                 cent = hdr.get("centroids/r_mu_fft_idx")
                 if cent is not None:
+                    if coordinate_kind == 'fractional':
+                        raise ValueError('fractional centroids must not carry r_mu_fft_idx')
+                    if cent.dtype.kind not in 'iu':
+                        raise ValueError('r_mu_fft_idx must be an integer table')
                     r_mu = np.asarray(cent, dtype=np.int64)
+                    if r_mu.ndim != 2 or r_mu.shape[1] != 3:
+                        raise ValueError('r_mu_fft_idx must have shape (n_rmu, 3)')
+                frac = hdr.get('centroids/r_mu_crystal')
+                if frac is not None:
+                    if coordinate_kind == 'fractional' and (frac.dtype.kind != 'f' or frac.dtype.itemsize != 8):
+                        raise ValueError('fractional r_mu_crystal must be a float64 table')
+                    crystal = np.asarray(frac, dtype=np.float64)
+                    if crystal.ndim != 2 or crystal.shape[1] != 3 or not np.isfinite(crystal).all():
+                        raise ValueError('r_mu_crystal must have shape (n_rmu, 3) and be finite')
+                if coordinate_kind == 'fractional' and crystal is None:
+                    raise ValueError('fractional centroids require r_mu_crystal')
     except Exception as exc:                                # noqa: BLE001
         # Everything: OSError from a non-HDF5 or truncated file, KeyError
         # from a half-written group, IsADirectoryError, a native h5py
@@ -146,4 +181,5 @@ def probe_zeta_file(path: str | Path) -> ZetaFileProbe:
         return ZetaFileProbe(True, False, f"{type(exc).__name__}: {exc}",
                              None, None, None, None)
 
-    return ZetaFileProbe(True, True, None, name, mu_extent, zeta_done, r_mu)
+    return ZetaFileProbe(True, True, None, name, mu_extent, zeta_done, r_mu,
+                         coordinate_kind, crystal)

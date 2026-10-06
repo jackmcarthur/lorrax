@@ -133,6 +133,7 @@ class CentroidKUnfoldPlan:
     #: hand-assembled test plans.
     parent_full_rows: np.ndarray | None = None
     sym: object = None
+    coordinate_kind: str = "fft_indices"
 
     @property
     def n_parent(self) -> int:
@@ -370,6 +371,7 @@ def build_centroid_k_unfold_plan(
     nspinor: int,
     parent_k_frac=None,
     layout=None,
+    coordinate_kind: str = "fft_indices",
 ) -> CentroidKUnfoldPlan:
     """Bind canonical symmetry tables to one orbit-packed centroid basis.
 
@@ -382,6 +384,10 @@ def build_centroid_k_unfold_plan(
     wedge rows owned by ``SymMaps.kirr_fullids`` are used; that mapping is
     coordinate-authenticated and ordered like the raw WFN.  It is used only
     for Bloch phases here, never as a source of parent wavefunctions.
+
+    ``coordinate_kind='fractional'`` binds exact off-grid fractional points
+    through the same symmetry service.  This is the atom-quadrature RHS
+    endpoint; it never changes or invents FFT-grid indices.
     """
     shape = tuple(int(mesh_xy.shape[a]) for a in ('x', 'y'))
     if shape[0] != shape[1]:
@@ -395,11 +401,13 @@ def build_centroid_k_unfold_plan(
 
     n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
     sym_perm, wraps = centroid_source_map_and_wrap(
-        np.asarray(centroid_fft_idx, dtype=np.int32),
+        np.asarray(centroid_fft_idx, dtype=(np.float64 if coordinate_kind == "fractional"
+                                          else np.int32)),
         np.asarray(sym.sym_matrices)[:n_spatial],
         np.asarray(sym.translations)[:n_spatial],
         np.asarray(fft_grid, dtype=np.int32),
         extend_trs=True, required_rows=np.asarray(sym.sym_idx_k),
+        coordinate_kind=coordinate_kind,
     )
     available = np.all(sym_perm >= 0, axis=1)
     groups = permutation_orbit_labels(sym_perm[available])
@@ -455,6 +463,7 @@ def build_centroid_k_unfold_plan(
             and int(np.asarray(sym.kirr_fullids).shape[0]) == parent_k.shape[0]
             else None),
         sym=sym,
+        coordinate_kind=coordinate_kind,
     )
 
 

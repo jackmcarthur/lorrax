@@ -240,9 +240,16 @@ rulings override anything here.
 ### Four-current (bispinor) envelope
 
 - **`BispinorGWMode`** is orthogonal to `ComputeMode`: it selects which Lorentz
-  blocks are screened and contracted. Values: `bare_transverse` (the default),
+  blocks are screened and contracted. Values: `coulomb_only` (charge interaction
+  on the normalized RKB carrier), `bare_transverse` (the default),
   `full_shared_pole`, `full_static_cohsex`. Retired spellings refuse by name
   in `coerce_bispinor_gw_mode`, never aliased.
+- **`uses_transverse_interaction`** is the interaction resolver: false on
+  scalar and `coulomb_only` decks, true on the existing four-current modes.
+  Charge representation/lift and scalar-head provenance still come from
+  `common.four_current_model`; no interaction choice changes that carrier.
+  Fresh restart bundles stamp `bispinor_gw`; a four-component restart refuses
+  a mismatched stamped policy, and Coulomb-only refuses an unstamped policy.
 - **`packed_static_envelope`** is the one table of the packed static photon
   operator's conditions. It yields `(accepted, got, want, klass, why,
   derived_key)` rows; the refusals and `packed_bare_transverse_route` read the

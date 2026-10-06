@@ -1084,33 +1084,57 @@ def c_q_downfold(
 
 
 def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
-                        kgrid, mesh_xy, gemm, gamma_L, gamma_R):
-	"""Exact four-spinor CCT, four Pauli-quarter pairs through the native owner.
+                        kgrid, mesh_xy, gemm, gamma_L, gamma_R, right_plan=None,
+                        q_indices=None):
+	"""Exact four-spinor pair Gram/RHS through four Pauli-quarter pairs.
+
+	The default is the square centroid Gram. ``right_plan`` supplies an
+	independently authenticated right point axis for a rectangular local RHS;
+	the caller must authenticate identical raw-parent and spin-action tables.
+	``psi_mun`` is ``(n_parent,4,mu,nb)``, ``psi_nmu`` is
+	``(n_parent,nb,4,nu)`` on the service GEMM's complementary faces. The
+	output is ``(N_k,mu,nu)`` at ``P(None,'x','y')``.
+	An optional integer q table gathers each native quarter immediately;
+	the accumulator then holds only those rows. The native ABI and full-k
+	FFT/parent tables remain unchanged, and the default is the original path.
 
 	What would the owner object to? A second convolution/vertex convention,
 	unfolded psi, or a replicated normal matrix. None is introduced: the
 	typed half action, monomial tables, SUMMA and parent convolution are the
 	existing owners. All 16 spin-pair terms survive. The quarter sum changes
 	reduction order (value parity), never the band contraction or fit metric.
-	For P=px*py, parent scratch is O(4*nparent*M²/P), not the full spin
-	16*nparent*M²/P; the scalar output stays 16*Nk*M²/P bytes. Band panels
+	For P=px*py, parent scratch is O(4*nparent*mu*nu/P), not the full spin
+	16*nparent*mu*nu/P; the scalar output stays 16*Nk*mu*nu/P bytes. Band panels
 	keep their existing SUMMA bound on GPU and the service's CPU contract.
 	"""
 	from common.gamma_matrices import gamma_perm_phase_host
 	from distrib_la import gemm_plan
 	from ffi.fft import make_fused_conv_kparent
 
+	right_plan = plan if right_plan is None else right_plan
 	half, parity = plan.dirac_halves()  # authenticates diag(U, parity*U)
+	right_half, _ = right_plan.dirac_halves()
 	np_, _, mu, nb = map(int, psi_mun.shape)
+	nu = int(psi_nmu.shape[-1])
 	pl, fl = gamma_perm_phase_host(gamma_L)
 	pr, fr = gamma_perm_phase_host(gamma_R)
 	px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
-	mu_loc, col_loc = mu // px, mu // py
-	key = ('c_q_dirac_quarters', mesh_xy, plan, gemm, tuple(kgrid),
-	       tuple(psi_mun.shape), str(psi_mun.dtype), gamma_L, gamma_R)
+	mu_loc, col_loc = mu // px, nu // py
+	selected_q = None
+	if q_indices is not None:
+		ids = np.asarray(q_indices)
+		if (ids.ndim != 1 or ids.dtype.kind not in 'iu' or len(ids) < 1
+		        or len(np.unique(ids)) != len(ids) or np.any(ids < 0)
+		        or np.any(ids >= math.prod(kgrid))):
+			raise ValueError("_c_q_dirac_quarters: q_indices must name unique full-q rows")
+		selected_q = tuple(int(q) for q in ids)
+	key = ('c_q_dirac_quarters', mesh_xy, plan, right_plan, gemm, tuple(kgrid),
+	       tuple(psi_mun.shape), tuple(psi_nmu.shape), str(psi_mun.dtype), gamma_L, gamma_R)
+	if selected_q is not None:
+		key += ('selected_q', selected_q)
 	if key not in _isdf_pipeline_cache:
 		layout = 'face' if gemm.in_sharding_a.spec == P(None, 'x', 'y') else 'axis'
-		quarter_gemm = gemm_plan(mesh_xy, m=2*mu, n=2*mu, k=nb, nq=np_,
+		quarter_gemm = gemm_plan(mesh_xy, m=2*mu, n=2*nu, k=nb, nq=np_,
 		                         dtype=psi_mun.dtype, backend=gemm.backend,
 		                         alpha=gemm.alpha, beta=gemm.beta,
 		                         layout=layout, reduction_axis=gemm.reduction_axis,
@@ -1129,8 +1153,8 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 		         in_specs=(pair_spec, pair_spec, P(), P()),
 		         out_specs=P(None, 'x', 'y'), check_vma=False)
 		def tail(dl, dr, h, g):
-			tables = _parent_conv_tables(half, half.centroid_local_perm,
-			                              half.L_table, mu_loc, col_loc)
+			tables = _parent_conv_tables(half, right_half.centroid_local_perm,
+			                              right_half.L_table, mu_loc, col_loc)
 			uh, ug = h ^ int(gamma_L != 0), g ^ int(gamma_R != 0)
 			# A quarter's parity belongs to its typed unfold, before vertices.
 			left_sign = jnp.where(h == g, 1., jnp.asarray(parity))
@@ -1139,7 +1163,10 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 			          tables[-1]*right_sign[:, None, None])
 			vl = (jnp.asarray(pl[:2] % 2), jax.lax.dynamic_slice_in_dim(jnp.asarray(fl), 2*h, 2))
 			vr = (jnp.asarray(pr[:2] % 2), jax.lax.dynamic_slice_in_dim(jnp.asarray(fr), 2*g, 2))
-			return pair(dl, dr, _parent_conv_vertices(tables, vl, vr))
+			value = pair(dl, dr, _parent_conv_vertices(tables, vl, vr))
+			if selected_q is not None:
+				value = jnp.take(value, jnp.asarray(selected_q, jnp.int32), axis=0)
+			return value
 
 		@partial(jax.jit, in_shardings=(mun, nmu, rep, rep), out_shardings=out)
 		def run(pm, pn, wl, wr):
@@ -1148,7 +1175,7 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 				r = jax.lax.dynamic_slice_in_dim(pn, 2*g, 2, axis=2)
 				a = merge_spin_centroid(l, 1, 2) * w[None, None, :].astype(pm.dtype)
 				b = merge_spin_centroid(jnp.conj(r), 2, 3)
-				d = quarter_gemm(a, b).reshape(np_, mu, 2, mu, 2)
+				d = quarter_gemm(a, b).reshape(np_, mu, 2, nu, 2)
 				return jnp.transpose(d, (0, 2, 1, 4, 3))
 			def add(total, hg):
 				total, wl_ = jax.lax.optimization_barrier((total, wl))
@@ -1157,8 +1184,8 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 				dl, wr_ = jax.lax.optimization_barrier((dl, wr))
 				dr = projector(wr_, h ^ int(gamma_L != 0), g ^ int(gamma_R != 0))
 				return total + tail(dl, dr, h, g), None
-			nk = math.prod(kgrid)
-			zero = jax.lax.with_sharding_constraint(jnp.zeros((nk, mu, mu), pm.dtype), out)
+			nk = math.prod(kgrid) if selected_q is None else len(selected_q)
+			zero = jax.lax.with_sharding_constraint(jnp.zeros((nk, mu, nu), pm.dtype), out)
 			return jax.lax.scan(add, zero, jnp.asarray(((0,0),(0,1),(1,0),(1,1)), jnp.int32), unroll=1)[0]
 		_isdf_pipeline_cache[key] = run
 	return _isdf_pipeline_cache[key](psi_mun, psi_nmu,

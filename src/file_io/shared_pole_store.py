@@ -2778,9 +2778,13 @@ def _export_spatial_header(path, source_wfn, meta, *, kind, source):
         copy_mf_header(source_wfn, path, dst_mode="a")
         with h5py.File(path, "a") as f:
             group = f.create_group(kind + "_header")
-            indices = np.asarray(meta.mu_basis.canonical_indices, np.int32)
+            coordinate_kind = meta.mu_basis.coordinate_kind
+            coordinates = np.asarray(meta.mu_basis.canonical_indices)
+            indices = (coordinates.astype(np.int32) if coordinate_kind == 'fft_indices' else None)
+            fractional = (coordinates / np.asarray(meta.fft_grid, np.float64)
+                          if coordinate_kind == 'fft_indices' else coordinates)
             write_centroid_coordinates(
-                group, indices, indices / np.asarray(meta.fft_grid, np.float64))
+                group, indices, fractional, coordinate_kind=coordinate_kind)
             group.create_dataset("source_store", data=np.bytes_(str(source)))
             group.create_dataset("q_order", data=np.bytes_("canonical raw irreducible parents"))
             if kind == "poles":

@@ -237,6 +237,11 @@ on time reversal:
 `compute_mode`; all routes use the carrier of §1. Admission:
 [wiring](../architecture/four_current_wiring.md#routes-and-predicates).
 
+`coulomb_only` uses the same normalized four-component charge carrier with
+only $\rho W_C\rho$ and $V_H[\rho]$: it follows the existing scalar frequency,
+head and self-energy machinery while omitting all spatial-current vertices,
+transverse fits and vector direct fields.  No current centroid table is needed.
+
 | term | order | `bare_transverse` | `full_static_cohsex` | `full_shared_pole` |
 |---|---:|---|---|---|
 | $\rho W_C\rho$ | $c^0$ | run's frequency model ($v$ under `x_only`) | `cohsex`: packed $W_{00}(0)$; GN/HL: scalar $W_C(\omega)$ | full frequency |

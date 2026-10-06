@@ -101,6 +101,7 @@ from .centroids import (
     LoadedCentroids,
     load_centroid_basis,
     load_centroids,
+    read_centroid_coordinate_kind,
     validate_centroid_selection,
 )
 from .paths import resolve_input_paths

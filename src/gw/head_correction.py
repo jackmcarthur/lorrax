@@ -321,6 +321,33 @@ def resolve_head_override(params, omega) -> HeadSample | None:
     )
 
 
+def resolve_bare_head_sample(params, wfn, meta, omega) -> HeadSample:
+    """Resolve the bare Coulomb cell average without a dielectric response.
+
+    Bare exchange consumes only v.  In particular it must not read dipoles
+    or an epsilon file merely to obtain a screened W value it will discard.
+    A deck's explicit vhead still overrides the same canonical v estimator.
+    """
+    value = params.get("vhead")
+    if value is None:
+        from gw.vcoul import compute_q0_averages
+
+        value, _ = compute_q0_averages(
+            wfn, jnp.asarray(1.0, dtype=jnp.float64), meta, S_cart=None,
+            analytic_sphere=_analytic_q0_sphere(params),
+            certificate_fn=params.get("_q0_certificate_fn"))
+        source = "bare Coulomb cell average"
+    else:
+        source = "bare Coulomb vhead override"
+    value = complex(value)
+    if not np.isfinite(value):
+        raise ValueError("bare Coulomb head must be finite")
+    return HeadSample(
+        vc0=value, wcoul0=value, source=source, omega=complex(omega),
+        response_kind=HeadResponseKind.OVERRIDE if params.get("vhead") is not None
+        else HeadResponseKind.DIRECT_IRREDUCIBLE)
+
+
 def _check_dipole_coverage(
     dipole_path, *, nb_file, nk_file, nk_run, nb_run, nelec, print_fn,
 ):
@@ -1364,7 +1391,7 @@ class HeadResolver:
     """Memoized q=0 head-sample resolver for a single GW run; see docs/theory/bispinor-gw.md#head."""
 
     __slots__ = ("_params", "_input_dir", "_wfn", "_sym", "_meta",
-                 "_print_fn", "_cache", "_direct_cache", "_policy",
+                 "_print_fn", "_cache", "_direct_cache", "_bare_cache", "_policy",
                  "_screened")
 
     def __init__(self, config, input_dir, wfn, sym, meta, print_fn,
@@ -1406,6 +1433,7 @@ class HeadResolver:
         self._print_fn = print_fn
         self._cache: dict[tuple[float, float], HeadSample] = {}
         self._direct_cache: dict[tuple[float, float], HeadSample] = {}
+        self._bare_cache: dict[tuple[float, float], HeadSample] = {}
 
     def _cache_key(self, omega) -> tuple[float, float]:
         z = complex(omega)
@@ -1428,6 +1456,18 @@ class HeadResolver:
         )
         self._direct_cache[key] = sample
         return sample
+
+    def bare_at(self, omega) -> HeadSample:
+        """Return bare v without resolving an unused screened response."""
+        from gw.gw_config import HeadCorrection
+
+        if self._policy is HeadCorrection.OFF:
+            return self.at(omega)
+        key = self._cache_key(omega)
+        if key not in self._bare_cache:
+            self._bare_cache[key] = resolve_bare_head_sample(
+                self._params, self._wfn, self._meta, omega)
+        return self._bare_cache[key]
 
     def install_samples(self, samples) -> None:
         """Install finalized samples, rejecting incomplete or double folds."""

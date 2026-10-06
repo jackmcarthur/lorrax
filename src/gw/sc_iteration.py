@@ -69,7 +69,8 @@ from .band_partition import (
     BandPartition, apply_band_partition, build_omega_band_partition)
 from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
                      as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
-from .gw_config import ComputeMode, HeadCorrection, sigma_classification_window_ev
+from .gw_config import (ComputeMode, HeadCorrection, sigma_classification_window_ev,
+                        uses_transverse_interaction)
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
 from .sigma_dispatch import (
@@ -2225,8 +2226,8 @@ def _dft_psi_sphere(inputs):
     from common.four_current_model import resolve_four_current_representation
     representation = resolve_four_current_representation(
         bool(inputs.config.bispinor), inputs.config.bispinor_gw)
-    carrier_bispinor = bool(representation.current_bispinor)
-    carrier_lift = representation.current_lift or "raw"
+    carrier_bispinor = bool(representation.charge_bispinor)
+    carrier_lift = representation.charge_lift or "raw"
     # The device placement is mesh-specific.  Keeping the mesh in the key
     # prevents a later calculation in the same process from reusing a buffer
     # whose devices belong to an earlier runtime.
@@ -2374,7 +2375,6 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     """
     from gw.efermi import occupied_band_count
     from gw.qsgw_density import rho_from_wfns
-    from common.four_current_model import resolve_four_current_representation
     from psp.get_DFT_mtxels import spin_degeneracy_factor
     from psp.get_DFT_mtxels import build_hartree_potential
     from common.mtxel_sweep import (SweepGeometry,
@@ -2427,9 +2427,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         f'mu={float(efermi_ry) * RYD_TO_EV:.8f} eV')
 
     grid = tuple(int(v) for v in inputs.wfn.fft_grid)
-    representation = resolve_four_current_representation(
-        bool(inputs.config.bispinor), inputs.config.bispinor_gw)
-    include_current = bool(representation.current_bispinor)
+    include_current = uses_transverse_interaction(inputs.config)
     # One carrier for charge and current (docs/theory/bispinor-gw.md#lift).
     charge_ns = int(psi_G.shape[2])
     # One density-scan shape per SC run: the rotated band count only grows
