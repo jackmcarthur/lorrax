@@ -920,7 +920,8 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
                        workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)
     ambient=ledger.live_stages
     ledger.live_stages=(*ambient,row['stage'])
-    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members,restricted))+panels,
+    # (the H'_vv eigh reads its Hermitian part, one more [hvv, hvv] stack beside the members)
+    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members+16*hvv*hvv,restricted))+panels,
                           workspace_bytes_per_rank=0,concurrent_with=ambient)
     room=face_eigh_room(beside)
     admitted=row['device_budget_status']=='PASS'

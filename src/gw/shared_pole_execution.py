@@ -746,6 +746,13 @@ def parent_rows(mesh, tree, index):
     return jax.tree.map(one, tree)
 
 
+@lru_cache(maxsize=None)
+def _hermitian_stack(mesh):
+    """(A + A^H) / 2 of a face stack, on the face (the eigh input of H'_vv, as the round forms it)."""
+    from distrib_la import hermitian_part
+    return jax.jit(hermitian_part, out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
+
+
 def _take(mesh, tree, i0, i1):
     return parent_rows(mesh, tree, np.arange(i0, i1))
 
@@ -796,7 +803,7 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
 
     def stage3(stage, gamma_r, u_r):
         return new_only('paired', stage, paired_stage(extents(stage), gamma_r, u_r, matmul=mm, gates=gates,
-                                                      matrix_sharding=ms))
+                                                      matrix_sharding=ms, gram_keep=gram_keep))
 
     def stage4(stage, mu, rotation, infinity):
         reduced = output_stage(extents(stage), mu, rotation, matmul=mm, gates=gates, retain_span=retain_span,
@@ -833,7 +840,7 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, o
         new = run(program, stage, *operands)
         return {**{k: stage[k] for k in passthrough[name]}, **new}
     stage = run(stage1, *inputs)
-    gamma, u = eigh(stage['h_vv'])
+    gamma, u = eigh(_hermitian_stack(mesh)(stage['h_vv']))
     stage = advance('keep', stage2, stage, gamma, u)
     del gamma, u
     gamma_r, u_r = eigh(stage['schur'])

@@ -369,12 +369,13 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     if not isinstance(paired, jax.core.Tracer) and not bool(paired):
         raise ValueError(ORIENTATION_PAIR_REFUSAL)
     stage = paired_members(pencil, active_columns, gates=gates, matrix_sharding=matrix_sharding)
-    gamma, u = eigh(stage["h_vv"])
+    gamma, u = eigh(hermitian_part(stage["h_vv"]))
     stage = keep_stage(stage, gamma, u, matmul=matmul, gates=gates, keep_budget=keep_budget,
                        retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep,
                        carrier=carrier)
     gamma_r, u_r = eigh(stage["schur"])
-    stage = paired_stage(stage, gamma_r, u_r, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding)
+    stage = paired_stage(stage, gamma_r, u_r, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding,
+                         gram_keep=gram_keep)
     mu, rotation = eigh(stage["reduced"])
     return output_stage(stage, mu, rotation, matmul=matmul, gates=gates, retain_span=retain_span,
                         matrix_sharding=matrix_sharding)
@@ -494,10 +495,11 @@ def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=
     return out
 
 
-def paired_stage(stage, gamma_r, u_r, *, matmul, gates, matrix_sharding=None):
+def paired_stage(stage, gamma_r, u_r, *, matmul, gates, matrix_sharding=None, gram_keep=None):
     """Stage 3: the Schur cut, Y = L^-H on the kept span and its metric correction; ``reduced`` goes to the last eigh."""
     face = None
-    keep_cut = gates["normalized_gram_keep"]["threshold"]
+    # The Schur cut uses the same relative keep as the H'_vv cut (the sector threshold).
+    keep_cut = gates["normalized_gram_keep"]["threshold"] if gram_keep is None else gram_keep
     kept, b_r, h_r, g_r = stage["kept"], stage["b_r"], stage["h_r"], stage["g_r"]
     # diag(S, I) is H_r's congruent form: its spectrum is spec(S) plus the unit
     # block, so the relative cut and the validity ratio are taken against
