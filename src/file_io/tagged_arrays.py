@@ -5,6 +5,7 @@ This module reads/writes HDF5 restart files in the v2 format used by gw_jax.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 import os
 from pathlib import Path
@@ -38,6 +39,8 @@ BAND_WINDOW_SCHEMA_VERSION = 2
 BAND_WINDOW_CARRIER_DATASET = "band_window_carrier"
 ZETA_FIT_WINDOWS_DATASET = "zeta_fit_windows"
 CHARGE_ZETA_IDENTITY_DATASET = "charge_zeta_identity"
+CHARGE_ZETA_PROVENANCE_DATASET = "charge_zeta_provenance"
+CHARGE_ZETA_PROVENANCE_MAX_BYTES = 65536
 # Copy of the paired v_q_bispinor.h5 generation receipt (bispinor runs only).
 BISPINOR_V_RECEIPT_DATASET = "bispinor_v_receipt"
 SHARED_POLE_MEMBER_DATASET = "shared_pole_member"
@@ -271,6 +274,28 @@ def _decode_charge_zeta_identity(value, *, where):
                 f"{where}: charge-zeta receipt fields must be nonempty strings")
         out.append(item)
     return {"scheme": out[0], "digest": out[1]}
+
+
+def _encode_charge_zeta_provenance(provenance, *, identity):
+    """Keep the exact bounded JSON text; its physical identity belongs to GW."""
+    if provenance is None:
+        return None
+    if identity is None:
+        raise ValueError("charge_zeta_provenance requires charge_zeta_identity")
+    if not isinstance(provenance, str) or not provenance:
+        raise ValueError("charge_zeta_provenance must be a nonempty JSON string")
+    encoded = provenance.encode("utf-8")
+    if len(encoded) > CHARGE_ZETA_PROVENANCE_MAX_BYTES:
+        raise ValueError("charge_zeta_provenance exceeds its bounded metadata size")
+    def refuse_constant(value):
+        raise ValueError(f"nonfinite JSON constant {value}")
+    try:
+        record = json.loads(provenance, parse_constant=refuse_constant)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("charge_zeta_provenance must be finite JSON") from exc
+    if not isinstance(record, dict):
+        raise ValueError("charge_zeta_provenance must describe a JSON object")
+    return np.bytes_(encoded)
 
 
 def _logical_storage_shape(shape, logical_axes, logical_extent, *, where):
@@ -656,6 +681,7 @@ def write_restart_state_to_h5(
     coulomb_policy=None,
     qp_state_source_record: dict | None = None,
     charge_zeta_identity: dict | None = None,
+    charge_zeta_provenance: str | None = None,
     zeta_fit_windows=None,
     bispinor_v_receipt: str | None = None,
 ):
@@ -706,9 +732,15 @@ def write_restart_state_to_h5(
 
     encoded_charge_zeta_identity = _encode_charge_zeta_identity(
         charge_zeta_identity)
+    encoded_charge_zeta_provenance = _encode_charge_zeta_provenance(
+        charge_zeta_provenance, identity=encoded_charge_zeta_identity)
     if encoded_charge_zeta_identity is not None and mode != "w":
         raise ValueError(
             "charge_zeta_identity is immutable restart provenance and may "
+            "only be stamped by the mode='w' transaction")
+    if encoded_charge_zeta_provenance is not None and mode != "w":
+        raise ValueError(
+            "charge_zeta_provenance is immutable restart provenance and may "
             "only be stamped by the mode='w' transaction")
 
     # ---- THE ONE RESOLUTION, APPLIED ONCE, BEFORE ANY WRITE -----------
@@ -879,6 +911,10 @@ def write_restart_state_to_h5(
                 io.write_attr(
                     CHARGE_ZETA_IDENTITY_DATASET,
                     encoded_charge_zeta_identity)
+            if encoded_charge_zeta_provenance is not None:
+                io.write_attr(
+                    CHARGE_ZETA_PROVENANCE_DATASET,
+                    encoded_charge_zeta_provenance)
             if bispinor_v_receipt is not None:
                 io.write_attr(
                     BISPINOR_V_RECEIPT_DATASET,

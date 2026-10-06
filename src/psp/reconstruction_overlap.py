@@ -1,13 +1,9 @@
 """Explicit reconstruction metric and finite-WFN symmetric Lowdin convention.
 
-U=[I,X](I+X^dagger X)^(-1/2) is isometric. An unwindowed Pauli
-reconstruction can therefore supply its Gram through raw Pauli overlaps.
-A compact four-spinor field instead supplies B and D measured from that
-actual served field, including its taper derivative. Raw Pauli blocks do
-not describe the compact field. The common Gram contraction accepts the
-declared consistent source, cross and atomic blocks in either convention.
-Atomic spheres must not overlap; the caller authenticates geometry and
-atomic source identity.
+U=[I,X](I+X^dagger X)^(-1/2) is isometric. The full reconstructed Gram
+therefore follows from Pauli overlaps with raw atomic differences, without
+four-spinor quadrature or a normalized-tail cutoff. Atomic spheres must
+not overlap; the caller authenticates geometry and atomic source identity.
 
 Lowdin is opt-in at the fitting owner. Retaining the original energy labels
 after nonunitary band mixing defines an effective vertex model, not exact

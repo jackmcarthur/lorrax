@@ -29,8 +29,10 @@ from runtime.padding import (authenticate_axis, authenticate_padded_axis,
     pad_axis)
 from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSION,
     BAND_WINDOW_CARRIER_DATASET, CHARGE_ZETA_IDENTITY_DATASET,
+    CHARGE_ZETA_PROVENANCE_DATASET, CHARGE_ZETA_PROVENANCE_MAX_BYTES,
     COULOMB_POLICY_DATASET, DOWNFOLD_PROVENANCE_GROUP,
-    _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
+    _decode_charge_zeta_identity, _encode_charge_zeta_provenance,
+    _loaded_band_axis, _validate_shape_receipt,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
 
@@ -664,6 +666,42 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
         mesh=mesh_xy, in_specs=spec, out_specs=spec, check_vma=False))
     return tuple(basis.unpack_axis(unfold(basis.pack_axis(a, 3, spec=spec)),
                                    3, spec=spec) for a in faces)
+
+
+def read_charge_zeta_provenance(filename):
+    """Read only the two bounded charge-fit metadata datasets.
+
+    No tensor or wavefunction bytes move. Missing legacy records remain
+    explicit ``None`` values; the GW owner decides whether that legacy state
+    may serve the requested fitting policy and authenticates the JSON against
+    the authoritative WFN-bound identity.
+    """
+    from .commit_state import assert_committed
+    with h5py.File(filename, "r") as f:
+        assert_committed(f)
+        def bounded(name, shape):
+            if name not in f:
+                return None
+            dataset = f[name]
+            if (dataset.shape != shape or dataset.dtype.kind != "S"
+                    or dataset.dtype.itemsize > CHARGE_ZETA_PROVENANCE_MAX_BYTES):
+                raise ValueError(
+                    f"{filename}: {name} must be bounded fixed UTF-8 metadata "
+                    f"with shape={shape}")
+            return dataset[()]
+        encoded_identity = bounded(CHARGE_ZETA_IDENTITY_DATASET, (2,))
+        identity = (None if encoded_identity is None else
+                    _decode_charge_zeta_identity(encoded_identity, where=filename))
+        encoded_provenance = bounded(CHARGE_ZETA_PROVENANCE_DATASET, ())
+        provenance = None
+        if encoded_provenance is not None:
+            try:
+                provenance = bytes(encoded_provenance).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{filename}: charge_zeta_provenance is not UTF-8") from exc
+            _encode_charge_zeta_provenance(provenance, identity=identity)
+        return dict(charge_zeta_provenance=provenance,
+                    charge_zeta_identity=identity)
 
 
 def read_metadata(filename):

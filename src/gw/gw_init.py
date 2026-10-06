@@ -1492,6 +1492,30 @@ def _check_centroid_selection_windows(cfg, band_slices, band_range_left,
 			_CENTROID_WINDOW_WARNED.add(path)
 			warnings.warn(warning, RuntimeWarning, stacklevel=2)
 
+def _charge_fit_endpoint_weights(cfg, wfn, band_slices, *, print_fn=print):
+	"""Resolve the charge loss from the source occupations, never GW occupations."""
+	occupied_weight = float(getattr(cfg.backend, 'zeta_occupied_weight', 1.0))
+	if not (np.isfinite(occupied_weight) and occupied_weight >= 1.0):
+		raise ValueError("zeta_occupied_weight must be finite and >= 1")
+	if occupied_weight == 1.0:
+		return None
+	from .gw_config import infer_material_class
+	occ = np.asarray(wfn.occs, dtype=np.float64)
+	occupied_stop = int(band_slices.b2)
+	if (infer_material_class(occ) != 'insulator'
+			or getattr(cfg, 'occ_smearing_width_ry', None) is not None
+			or float(getattr(getattr(cfg, 'screening', None), 'occ_broadening_ev', 0.0)) > 0.0):
+		raise ValueError("zeta_occupied_weight != 1 requires integer, unsmeared source occupations")
+	if (occ.ndim != 3 or not 0 < occupied_stop < occ.shape[-1]
+			or np.any(occ < -1.e-6)
+			or not np.all((occ > 1.e-6)
+				== (np.arange(occ.shape[-1]) < occupied_stop)[None, None, :])):
+		raise ValueError("zeta_occupied_weight requires the same contiguous occupied band boundary at every source k and spin")
+	print_fn(f"  Charge-fit endpoint weights: occupied={occupied_weight:g}, "
+	         f"empty=1, occupied boundary={occupied_stop} bands.")
+	return {'occupied_stop': occupied_stop, 'occupied_weight': occupied_weight}
+
+
 def _resolve_zeta_fit_contract(
 		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
 		*, print_fn=print, atomic_augmentation_identity=None):
@@ -1512,27 +1536,8 @@ def _resolve_zeta_fit_contract(
 		band_slices, band_range_left, band_range_right)
 	# Resolve a fitting loss once. Its weights never enter Green functions,
 	# physical occupations, the orbital frame, or atomic cache identities.
-	charge_fit_weights = None
-	occupied_weight = float(getattr(cfg.backend, 'zeta_occupied_weight', 1.0))
-	if not (np.isfinite(occupied_weight) and occupied_weight >= 1.0):
-		raise ValueError("zeta_occupied_weight must be finite and >= 1")
-	if occupied_weight != 1.0:
-		from .gw_config import infer_material_class
-		occ = np.asarray(wfn.occs, dtype=np.float64)
-		occupied_stop = int(band_slices.b2)
-		if (infer_material_class(occ) != 'insulator'
-				or getattr(cfg, 'occ_smearing_width_ry', None) is not None
-				or float(getattr(getattr(cfg, 'screening', None), 'occ_broadening_ev', 0.0)) > 0.0):
-			raise ValueError("zeta_occupied_weight != 1 requires integer, unsmeared source occupations")
-		if (occ.ndim != 3 or not 0 < occupied_stop < occ.shape[-1]
-				or np.any(occ < -1.e-6)
-				or not np.all((occ > 1.e-6)
-					== (np.arange(occ.shape[-1]) < occupied_stop)[None, None, :])):
-			raise ValueError("zeta_occupied_weight requires the same contiguous occupied band boundary at every source k and spin")
-		charge_fit_weights = {'occupied_stop': occupied_stop,
-		                     'occupied_weight': occupied_weight}
-		print_fn(f"  Charge-fit endpoint weights: occupied={occupied_weight:g}, "
-		         f"empty=1, occupied boundary={occupied_stop} bands.")
+	charge_fit_weights = _charge_fit_endpoint_weights(
+		cfg, wfn, band_slices, print_fn=print_fn)
 	_check_centroid_selection_windows(
 		cfg, band_slices, band_range_left, band_range_right)
 	logical_band_stop = (
@@ -2952,7 +2957,8 @@ def _write_fresh_restart(
         get_enk_bandrange, mesh_xy, meta, print0, resolve_restart_q_storage_for_run,
         restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
         tensors_filename, transverse_wfn_data, wfn, wfns_transverse,
-        write_restart_state_to_h5, *, atomic_augmentation_identity=None):
+        write_restart_state_to_h5, *, charge_zeta_provenance,
+        atomic_augmentation_identity=None):
     """Write the existing authenticated Coulomb and parent-face restart bundle."""
     enk_full, _ = get_enk_bandrange(
         wfn, sym, band_slices.full_range,
@@ -2986,6 +2992,7 @@ def _write_fresh_restart(
                         wfn_fingerprint_binding=(
                                 basis_wfn_fingerprint_binding))),
                 charge_zeta_identity=charge_zeta_identity_receipt,
+                charge_zeta_provenance=charge_zeta_provenance,
                 bispinor_v_receipt=(None if wfns_transverse is None else
                         read_bispinor_v_receipt(os.path.join(
                                 os.path.dirname(tensors_filename), "v_q_bispinor.h5"))),
@@ -3082,6 +3089,7 @@ def _prepare_fresh_isdf(
             restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
             tensors_filename, transverse_wfn_data, wfn, wfns_transverse,
             write_restart_state_to_h5,
+            charge_zeta_provenance=zeta_contract.provenance,
             atomic_augmentation_identity=json.loads(
                 zeta_contract.provenance).get('atomic_augmentation'))
         if ((hasattr(zeta_path, 'contract_v') or cfg.bispinor)
@@ -3097,9 +3105,61 @@ def _prepare_fresh_isdf(
     print0("  Chunked ISDF path complete")
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
 
+def _require_restart_charge_fit_weights(tensors_filename, expected_policy, *,
+        wfn, wfn_fingerprint_binding, tmp_dir):
+    """Authenticate the stored charge loss before loading large restart arrays.
+
+    The stored provenance owns the original training window. Only the loss
+    policy is compared with this run, preserving supported changes to the
+    Sigma-only output window. Older identified bundles need their matching
+    charge-zeta header; an opaque digest cannot establish the old loss.
+    """
+    from file_io.restart_bundle import (
+        read_charge_zeta_provenance, read_isdf_header)
+    stored = read_charge_zeta_provenance(tensors_filename)
+    identity = stored['charge_zeta_identity']
+    provenance = stored['charge_zeta_provenance']
+    if identity is None:
+        if expected_policy is None:
+            return
+        raise ValueError(
+            "GATE restart_charge_fit_weights: legacy restart has no "
+            "authenticated charge-fit policy; rebuild with restart=false.")
+    if provenance is None:
+        zeta_path = os.path.join(tmp_dir, 'zeta_q.h5')
+        if os.path.isfile(zeta_path):
+            header = read_isdf_header(zeta_path)
+            if header.zeta_is_done:
+                provenance = header.fit_provenance
+    if provenance is None:
+        raise ValueError(
+            "GATE restart_charge_fit_weights: identified restart has no "
+            "embedded charge provenance or completed matching zeta_q.h5; "
+            "rebuild with restart=false.")
+    resolved_identity = charge_zeta_identity(
+        provenance, wfn=wfn,
+        wfn_fingerprint_binding=wfn_fingerprint_binding)
+    if resolved_identity != identity:
+        raise ValueError(
+            "GATE restart_charge_fit_weights: stored charge provenance does "
+            "not match the authoritative WFN-bound charge-zeta identity; "
+            "rebuild with restart=false.")
+    requested = (None if expected_policy is None else {
+        'schema': 'occupied_band_endpoints_v1', **expected_policy,
+        'empty_weight': 1.0})
+    observed = json.loads(provenance).get('charge_fit_endpoint_weights')
+    canonical = lambda policy: json.dumps(
+        policy, sort_keys=True, separators=(',', ':'), allow_nan=False)
+    if canonical(observed) != canonical(requested):
+        raise ValueError(
+            "GATE restart_charge_fit_weights: charge_fit_endpoint_weights "
+            f"changed from {observed!r} to {requested!r}; rebuild with "
+            "restart=false.")
+
+
 def _read_authenticated_restart(
         _to_run_order, band_slices, cfg, load_restart_state_from_h5, mesh_xy, meta, print0,
-        tensors_filename):
+        tensors_filename, *, charge_fit_context):
     """Produce the validated stored tensors and their charge zeta identity."""
     from file_io.restart_bundle import require_atomic_augmentation_match
     identity = None
@@ -3107,6 +3167,10 @@ def _read_authenticated_restart(
         from .isdf_augmentation import augmentation_identity
         identity = augmentation_identity(cfg.paths.atomic_reconstruction_dir)
     require_atomic_augmentation_match(tensors_filename, identity)
+    expected_policy = _charge_fit_endpoint_weights(
+        cfg, charge_fit_context['wfn'], band_slices, print_fn=print0)
+    _require_restart_charge_fit_weights(
+        tensors_filename, expected_policy, **charge_fit_context)
     rs = load_restart_state_from_h5(
     	tensors_filename, mesh_xy, band_slices=band_slices,
     	n_rmu_logical=int(meta.n_rmu))
@@ -3416,7 +3480,10 @@ def _prepare_restart_isdf(
     		label="restart load (metadata, SlabIO tensors, wedge, reshard)"):
         (rs, charge_zeta_identity_receipt, V_qmunu) = _read_authenticated_restart(
             _to_run_order, band_slices, cfg, load_restart_state_from_h5, mesh_xy, meta, print0,
-            tensors_filename)
+            tensors_filename, charge_fit_context={
+                'wfn': wfn,
+                'wfn_fingerprint_binding': basis_wfn_fingerprint_binding,
+                'tmp_dir': tmp_dir})
         (_stamped, charge_basis_receipt) = _restart_charge_basis(
             WavefunctionBasisReceipt, _basis_band_interval, _restart_wfn_provenance_complete,
             basis_wfn_fingerprint_binding, centroid_indices, charge_basis_receipt, meta, print0,
