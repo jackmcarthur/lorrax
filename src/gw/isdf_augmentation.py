@@ -1,8 +1,11 @@
 """Prepare atom-local RHSs for the existing four-component charge ISDF fit.
 
-The source is U T psi, with U=[I;X](I+X†X)^(-1/2). Both sampled
-endpoints use the same reconstructed carrier. An explicit full-WFN Lowdin
-convention additionally rotates all endpoints by one measured band factor.
+The source uses the normalized graph U=[I;X](I+X†X)^(-1/2). Compact
+atomic fields taper the served large block and derive its small block from
+the same gradient; their implicit Pauli precursor is R^-1(w R delta_phi).
+Both sampled endpoints use that same reconstructed carrier. An explicit
+full-WFN Lowdin convention rotates all endpoints by one factor measured
+from the actual served four-spinor overlap.
 Atomic density RHSs are projected onto Y_lm, then solved
 by the smooth fit's existing factor in ``ZetaG.contract_v``.  This module
 owns stage assembly, never symmetry transport, band-pair storage or FFTs.
@@ -27,7 +30,7 @@ def _normalized_cache_control(control):
             if key not in ('local_coulomb_fourier_file','local_coulomb_fourier_sha256')}
 
 
-def read_augmentation_manifest(directory):
+def read_augmentation_manifest(directory, *, load_raw_parent=True):
     """Authenticate one manifest and its small matched atomic sidecars.
 
     Parameters
@@ -36,6 +39,10 @@ def read_augmentation_manifest(directory):
         Directory containing manifest.json. Species paths are relative to
         that directory. Numerical quadratures belong to this immutable
         artifact, rather than additional GW input switches.
+    load_raw_parent : bool
+        Keep True for fitting and restart authentication. False is solely
+        for preparing the raw-parent artifact: authenticate the same
+        species inputs while permitting the raw file/SHA pair to be absent.
 
     Returns
     -------
@@ -45,6 +52,8 @@ def read_augmentation_manifest(directory):
     """
     from psp.atomic_reconstruction import load_atomic_reconstruction, upf_identity
 
+    if not isinstance(load_raw_parent,bool):
+        raise TypeError("load_raw_parent must be a preparation-only boolean")
     root = Path(directory).resolve()
     path = root / "manifest.json"
     raw = path.read_bytes()
@@ -72,11 +81,14 @@ def read_augmentation_manifest(directory):
             raise ValueError("onsite smooth-neutral charge cross requires radial interpolation_degree")
     enrich = manifest.get('charge_metric',{}).get('moment_enrichment') == 'served_monopole'
     served = manifest.get('served_moments')
-    if enrich != (served is not None):
-        raise ValueError("served monopole enrichment requires an explicit served_moments artifact table")
-    if enrich:
-        if (not isinstance(served,dict) or set(served) != {
-                'species_files','species_sha256','raw_parent_file','raw_parent_sha256'}
+    served_overlap = manifest.get('overlap',{}).get('mode') == 'full_wfn_lowdin'
+    if (enrich or served_overlap) and served is None:
+        raise ValueError("full-WFN served overlap or monopole enrichment requires an explicit served_moments artifact table")
+    if served is not None:
+        species_keys = {'species_files','species_sha256'}
+        full_keys = species_keys | {'raw_parent_file','raw_parent_sha256'}
+        accepted_keys = (full_keys,) if load_raw_parent else (species_keys,full_keys)
+        if (not isinstance(served,dict) or set(served) not in accepted_keys
                 or not isinstance(served['species_files'],dict)
                 or not isinstance(served['species_sha256'],dict)
                 or set(served['species_files']) != set(manifest['species'])
@@ -176,7 +188,7 @@ def read_augmentation_manifest(directory):
             fourier_caches[z] = load_atomic_fourier_caches(cache_path,data,control)
             digest.update(hashlib.sha256(cache_path.read_bytes()).digest())
     served_caches = raw_moments = None
-    if enrich:
+    if served is not None:
         from isdf.atomic_moments import load_served_moment_cache, load_raw_parent_moments
         served_caches = {}
         for z in tables:
@@ -189,18 +201,19 @@ def read_augmentation_manifest(directory):
                 normalized_cache_sha256=hashlib.sha256(norm_path.read_bytes()).hexdigest(),
                 support_radius=float(manifest['radial']['support_radius']))
             digest.update(bytes.fromhex(sha))
-        raw_path = (root/served['raw_parent_file']).resolve()
-        # Authenticate the file and its internal payload now. Preparation
-        # independently reconstructs this binding from the actual WFN.
-        with np.load(raw_path,allow_pickle=False) as archive:
-            binding = json.loads(str(archive['metadata_json']))['binding']
-        raw_moments = load_raw_parent_moments(raw_path,expected_binding=binding,
-            expected_file_sha256=served['raw_parent_sha256'])
-        import importlib.util
-        for owner,sha in binding['source_identity']['owner_sources_sha256'].items():
-            if hashlib.sha256(Path(importlib.util.find_spec(owner).origin).read_bytes()).hexdigest() != sha:
-                raise ValueError(f"raw served-moment owner identity mismatch: {owner}")
-        digest.update(bytes.fromhex(served['raw_parent_sha256']))
+        if load_raw_parent:
+            raw_path = (root/served['raw_parent_file']).resolve()
+            # Authenticate the file and its internal payload now. Preparation
+            # independently reconstructs this binding from the actual WFN.
+            with np.load(raw_path,allow_pickle=False) as archive:
+                binding = json.loads(str(archive['metadata_json']))['binding']
+            raw_moments = load_raw_parent_moments(raw_path,expected_binding=binding,
+                expected_file_sha256=served['raw_parent_sha256'])
+            import importlib.util
+            for owner,sha in binding['source_identity']['owner_sources_sha256'].items():
+                if hashlib.sha256(Path(importlib.util.find_spec(owner).origin).read_bytes()).hexdigest() != sha:
+                    raise ValueError(f"raw served-moment owner identity mismatch: {owner}")
+            digest.update(bytes.fromhex(served['raw_parent_sha256']))
     prepared_cache = None
     if present:
         from isdf.coulomb_fourier_cache import load_coulomb_fourier_cache
@@ -475,6 +488,30 @@ def _point_samples_kernel(mesh, pc, bc, npoint, g_block, fft_points):
         out_specs=fs, check_vma=False))
 
 
+def _smooth_point_faces(source, wavevectors, points, active, mesh, *, lattice,
+                        parent_chunk, band_chunk, g_block, fft_points):
+    """Sample one already selected reciprocal carrier with the blocked DFT owner."""
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding,PartitionSpec as P
+
+    npar,nb = map(int,source.shape[:2])
+    pc,bc,mu = int(parent_chunk),int(band_chunk),len(points)
+    kernels = _tile_kernels(mesh,pc,bc)
+    faces = jnp.zeros((npar,nb,4,mu),jnp.complex128,
+                      device=NamedSharding(mesh,P(None,'x',None,'y')))
+    sampler = _point_samples_kernel(mesh,pc,bc,mu,g_block,fft_points)
+    phase_kernel = _point_phase_kernel(mesh)
+    cart,live = _put(points @ lattice,mesh,P()),_put(active.astype(float),mesh,P())
+    for p0 in range(0,npar,pc):
+        K = _put(wavevectors[p0:p0+pc],mesh,P(None,('x','y'),None))
+        phase = phase_kernel(K,cart)
+        for b0 in range(0,nb,bc):
+            tile = sampler(kernels['source'](source,jnp.int32(p0),jnp.int32(b0)),phase,live)
+            faces = kernels['update_face'](faces,tile,jnp.int32(p0),jnp.int32(b0))
+        faces.block_until_ready()
+    return faces
+
+
 def _sample_geometry(points, active, centers, lattice, caches, atom_types, kfrac, support, scale):
     """Bounded host delta tables; samples use sqrt(Omega/Nfft) U delta_phi."""
     from psp.augmented_samples import atomic_image_geometry
@@ -610,41 +647,35 @@ def _band_rotation_kernel(mesh, pc, layout, output_bands, public_start, physical
                             out_specs=spec,check_vma=False))
 
 
-def _full_wfn_rotation(smooth, nmu, coefficients, geometry, control, mesh):
-    """Measure native compact-T Gram and coherently rotate one full WFN.
+def _full_wfn_rotation(smooth, nmu, coefficients, geometry, mesh):
+    """Measure the actual served four-spinor Gram and rotate one full WFN.
 
     Only bounded parent packets of the small C/D/Gram arrays reach the host.
-    The reciprocal wavefunctions remain G-sharded. The native radial metric
-    is independent of the coarse atom-grid quadrature used for the local RHS.
+    The reciprocal wavefunctions remain G-sharded. Authenticated prepared
+    four-component D and B describe the same served field as the samples;
+    the coarse local-density quadrature never supplies the overlap metric.
     """
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from common.shard_map import shard_map
     from common.collectives import gather_to_host
-    from psp.augmented_samples import make_atomic_projection
-    from psp.reconstruction_overlap import (atomic_delta_gram,build_delta_radial_cache,
-        reconstruction_gram,lowdin_factor)
+    from psp.reconstruction_overlap import reconstruction_gram,lowdin_factor
 
     npar,nb = map(int,smooth.shape[:2])
     pc = int(geometry['parent_chunk'])
     kernels = _tile_kernels(mesh,pc,nb)
-    project = make_atomic_projection(mesh)
     def source_gram(a):
         return jax.lax.psum(jnp.einsum('pnsg,pmsg->pnm',a.conj(),a),('x','y'))
     gram_kernel = jax.jit(shard_map(source_gram,mesh=mesh,
         in_specs=P(None,None,None,('x','y')),out_specs=P(),check_vma=False))
-    caches = ({} if geometry.get('fourier_caches') is None else
-              {int(z):pair['delta'] for z,pair in geometry['fourier_caches'].items()})
-    Kmax = float(np.max(np.linalg.norm(geometry['wavevectors'],axis=-1)))*(1+1e-12)
-    for z in set(geometry['atom_types']):
-        if geometry.get('fourier_caches') is None and 'projection_momentum_points' in control:
-            caches[int(z)] = build_delta_radial_cache(geometry['tables'][int(z)],
-                momentum_max=Kmax,momentum_points=int(control['projection_momentum_points']),
-                relative_tolerance=float(control.get('projection_relative_tolerance',1e-10)),
-                absolute_tolerance=float(control.get('projection_absolute_tolerance',1e-12)),
-                validation_points=int(control.get('projection_validation_points',64)))
-    atomic_grams = [atomic_delta_gram(geometry['tables'][int(z)]) for z in geometry['atom_types']]
+    atomic_grams = [geometry['served_caches'][int(z)]['B'] for z in geometry['atom_types']]
+    raw_D = geometry['raw_served_D']
+    physical_bands = int(geometry['physical_bands'])
+    if (len(raw_D) != len(coefficients) or any(
+            d.shape != (npar,physical_bands,len(B)) or not np.isfinite(d).all()
+            for d,B in zip(raw_D,atomic_grams))):
+        raise ValueError("prepared served overlap rows/channels disagree with the full-WFN carrier")
     receipts, factors = [], []
     source_grams = []
     raw_coefficients = [[] for _ in coefficients]
@@ -653,14 +684,10 @@ def _full_wfn_rotation(smooth, nmu, coefficients, geometry, control, mesh):
         source = kernels['source'](smooth,jnp.int32(p0),jnp.int32(0))
         gram = gather_to_host(gram_kernel(source))
         source_grams.append(gram)
-        for atom,z in enumerate(geometry['atom_types']):
-            data = geometry['tables'][int(z)]
-            table = _atomic_fourier_table(data,geometry['wavevectors'][p0:p0+pc],
-                dict(center_cart=geometry['centers_cart'][atom],cell_volume=geometry['cell_volume']),
-                mesh,radial_cache=caches.get(int(z)),delta_overlap=True)
-            delta_overlap = project(source[:,:,:2],table)
+        for atom in range(len(coefficients)):
             coeff = kernels['read_coeff'](coefficients[atom],jnp.int32(p0),jnp.int32(0))
-            c_host,d_host = gather_to_host(coeff),gather_to_host(delta_overlap)
+            c_host = gather_to_host(coeff)
+            d_host = np.pad(raw_D[atom][p0:p0+pc],((0,0),(0,nb-physical_bands),(0,0)))
             raw_coefficients[atom].append(c_host)
             raw_delta_overlaps[atom].append(d_host)
             gram = reconstruction_gram(gram,c_host,d_host,atomic_grams[atom])
@@ -671,16 +698,17 @@ def _full_wfn_rotation(smooth, nmu, coefficients, geometry, control, mesh):
     factor = _put(factor_host,mesh,P())
     args = (mesh,pc,geometry['output_bands'],geometry['public_start'],geometry['physical_stop'])
     source_rotation = _band_rotation_kernel(args[0],args[1],'source',*args[2:])
-    face_rotation = _band_rotation_kernel(args[0],args[1],'face',*args[2:])
     coefficient_rotation = _band_rotation_kernel(args[0],args[1],'coefficients',*args[2:])
     smooth = source_rotation(smooth,factor)
-    nmu = face_rotation(nmu,factor)
+    if nmu is not None:
+        nmu = _band_rotation_kernel(args[0],args[1],'face',*args[2:])(nmu,factor)
     coefficients = [coefficient_rotation(c,factor) for c in coefficients]
     smooth.block_until_ready()
     receipt = {key:np.concatenate([r[key] for r in receipts],axis=0)
                for key in receipts[0] if isinstance(receipts[0][key],np.ndarray)}
     receipt.update(physical_bands=int(geometry['physical_bands']),inverse_sqrt=factor_host,
-                   convention='full_wfn_lowdin_effective_vertex')
+                   convention='full_wfn_lowdin_effective_vertex',
+                   overlap_operator='actual_served_four_spinor')
     receipt.update(source_gram=np.concatenate(source_grams),
         atomic_coefficients=tuple(np.concatenate(c) for c in raw_coefficients),
         delta_overlaps=tuple(np.concatenate(d) for d in raw_delta_overlaps),
@@ -828,7 +856,7 @@ def _served_monopole_rhs(plan, faces, coefficients, overlaps, geometry, mesh):
 def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                          centroid_indices, parent_psi, parent_faces,
                          band_range_left, band_range_right, print_fn=print,
-                         write_ibz_only=True, public_band_range=None):
+                         write_ibz_only=True, public_band_range=None, artifact=None):
     """Correct persistent samples and assemble the atom-local charge RHS.
 
     Run this before the smooth fit's conjugation/donation. The raw mode
@@ -838,6 +866,10 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     raw RHS, small geometry and provenance for ``attach_local_augmentation``.
     The typed input plan owns the sample coordinates, including any explicit
     fractional atomic samples. The state adds the atom-local charge RHS.
+    ``artifact`` may be the same strictly authenticated reader result from
+    this fresh invocation. Supplying it avoids duplicate file reads without
+    retaining global state; fitting callers never supply an unvalidated
+    manifest dictionary. The default authenticates the files here.
     """
     import jax
     import jax.numpy as jnp
@@ -852,7 +884,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     from symmetry_maps import q_negation_index
 
     with timing.section('augmentation.manifest_and_cache_read'):
-        artifact = read_augmentation_manifest(cfg.paths.atomic_reconstruction_dir)
+        if artifact is None:
+            artifact = read_augmentation_manifest(cfg.paths.atomic_reconstruction_dir)
     overlap_mode = artifact.get('overlap',{}).get('mode','none')
     if overlap_mode not in ('none','full_wfn_lowdin'):
         raise ValueError(f"unsupported explicit reconstruction overlap mode {overlap_mode!r}")
@@ -894,6 +927,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                 or int(parent_psi.band_range[0]) != 0
                 or face_bands < physical_bands or nb < physical_bands):
             raise ValueError("full_wfn_lowdin requires every available WFN band, loaded from band zero")
+        if (artifact.get('served_moment_caches') is None
+                or artifact.get('raw_parent_moments') is None):
+            raise ValueError("full_wfn_lowdin requires authenticated prepared overlap of the actual served four-spinor")
     elif fit_origin != parent_psi.band_range[0]:
         raise ValueError("augmentation band weights must use the same raw-parent band origin as the smooth fit")
     lattice = float(wfn.alat)*np.asarray(wfn.avec, dtype=np.float64)
@@ -985,6 +1021,11 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     overlap_bytes = (3*source_bytes+16*npar*nb*nb*3
                      +sum(32*npar*nb*np.sum(2*abs(artifact['tables'][int(z)]['kappa']))/Ptot for z in atom_types)
                      if overlap_mode == 'full_wfn_lowdin' else 0.)
+    # Prepared physical D is resident host data even without the auxiliary
+    # monopole stage. Charge its full per-process payload conservatively in
+    # admission; device copies/rotation belong to the separate moment term.
+    prepared_overlap_host_bytes = (sum(d.nbytes for d in artifact['raw_parent_moments']['atom_D'])
+                                   if overlap_mode == 'full_wfn_lowdin' else 0.)
     moment_bytes = 0.
     if moment_enrichment:
         # Cached full-band D_R and both its rotated carrier and signed field
@@ -1009,7 +1050,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             +32*npar*nb*aux_functions/Ptot+64*4*aux_functions*aux_points/int(mesh_xy.shape['y'])
             +32*qpad*mu*na/Ptot)
     price = (source_bytes+4*face_bytes+rhs_copies*rhs_bytes+3*factor_v_bytes+4*point_faces
-             +point_workspace['total']+dft_tile+phase_bytes+smooth_tile+overlap_bytes+moment_bytes)
+             +point_workspace['total']+dft_tile+phase_bytes+smooth_tile+overlap_bytes+moment_bytes
+             +prepared_overlap_host_bytes)
     budget = float(device_budget_bytes())
     if price > budget:
         warn_over_budget('isdf.augmentation',price,budget)
@@ -1033,7 +1075,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         raise ValueError("augmentation raw-parent G logical counts disagree with source")
     wavevectors[np.arange(ng)[None,:] >= counts[:,None]] = 0.
     raw_served_D = None
-    if moment_enrichment:
+    if overlap_mode == 'full_wfn_lowdin':
         from isdf.atomic_moments import raw_parent_moment_binding
         expected = raw_parent_moment_binding(wfn,k_parent_frac=kfrac,gvecs=gv,ngk_valid=counts,
             centers_cart=centers @ lattice,atom_types=atom_types,cell_volume=float(meta.cell_volume),
@@ -1042,8 +1084,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         raw = artifact['raw_parent_moments']
         if raw['metadata']['binding'] != expected:
             raise ValueError("raw served-moment cache disagrees with the actual WFN, parent/G geometry or full band window")
-        raw_served_D = [_put(np.pad(d,((0,0),(0,nb-d.shape[1]),(0,0))),mesh_xy,cs)
-                        for d in raw['atom_D']]
+        if moment_enrichment:
+            raw_served_D = [_put(np.pad(d,((0,0),(0,nb-d.shape[1]),(0,0))),mesh_xy,cs)
+                            for d in raw['atom_D']]
     with timing.section('augmentation.projection_cache'):
         projection_caches = {}
         Kmax = float(np.max(np.linalg.norm(wavevectors,axis=-1)))*(1+1e-12)
@@ -1071,19 +1114,11 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     coefficients = []
     phase_kernel = _point_phase_kernel(mesh_xy)
     nmu = None if parent_faces is None else parent_faces[0]
-    if parent_faces is None:
+    if parent_faces is None and overlap_mode != 'full_wfn_lowdin':
         with timing.section('augmentation.fractional_mu_samples'):
-            nmu = jnp.zeros((npar,nb,4,mu),jnp.complex128,device=NamedSharding(mesh_xy,fs))
-            sample_mu = _point_samples_kernel(mesh_xy,pc,bc,mu,gblock,meta.n_rtot)
-            cart_mu,live_mu = _put(mu_points @ lattice,mesh_xy,P()),_put(active.astype(float),mesh_xy,P())
-            for p0 in range(0,npar,pc):
-                K = _put(wavevectors[p0:p0+pc],mesh_xy,P(None,('x','y'),None))
-                phases = phase_kernel(K,cart_mu)
-                for b0 in range(0,nb,bc):
-                    tile = sample_mu(kernels['source'](smooth,jnp.int32(p0),jnp.int32(b0)),phases,live_mu)
-                    nmu = kernels['update_face'](nmu,tile,jnp.int32(p0),jnp.int32(b0))
-                nmu.block_until_ready()
-    if face_bands < nb:
+            nmu = _smooth_point_faces(smooth,wavevectors,mu_points,active,mesh_xy,lattice=lattice,
+                parent_chunk=pc,band_chunk=bc,g_block=gblock,fft_points=meta.n_rtot)
+    if nmu is not None and face_bands < nb:
         # The G-slot carrier pads bands to the whole mesh; public faces
         # need only X divisibility and keep their existing smaller extent.
         # Internal zero padding permits one fixed P-compatible band tile.
@@ -1117,9 +1152,10 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             geometry = dict(parent_chunk=pc,tables=artifact['tables'],atom_types=atom_types,
                 wavevectors=wavevectors,centers_cart=centers @ lattice,cell_volume=meta.cell_volume,
                 physical_bands=physical_bands,output_bands=output_bands,public_start=public_start,
-                physical_stop=physical_stop,fourier_caches=artifact.get('fourier_caches'))
+                physical_stop=physical_stop,served_caches=artifact['served_moment_caches'],
+                raw_served_D=artifact['raw_parent_moments']['atom_D'])
             smooth,nmu,coefficients,overlap_receipt = _full_wfn_rotation(
-                smooth,nmu,coefficients,geometry,artifact['cache'],mesh_xy)
+                smooth,nmu,coefficients,geometry,mesh_xy)
             if raw_served_D is not None:
                 rotation = _band_rotation_kernel(mesh_xy,pc,'coefficients',output_bands,public_start,physical_stop)
                 factor = _put(overlap_receipt['inverse_sqrt'],mesh_xy,P())
@@ -1133,6 +1169,13 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             if bc < Ptot or bc%Ptot:
                 raise ValueError("rotated public band carrier must admit the fixed mesh-compatible band chunk")
             kernels = _tile_kernels(mesh_xy,pc,bc)
+            if nmu is None:
+                # The full physical Gram/factor was measured first. Sampling
+                # the selected G carrier avoids unused full-WFN point bands;
+                # its rotation owner has already zeroed every public ghost.
+                with timing.section('augmentation.fractional_mu_samples'):
+                    nmu = _smooth_point_faces(smooth,wavevectors,mu_points,active,mesh_xy,lattice=lattice,
+                        parent_chunk=pc,band_chunk=bc,g_block=gblock,fft_points=meta.n_rtot)
             delta_iter = _sample_geometry(mu_points,active,centers,lattice,caches,atom_types,kfrac,support,scale)
             for atom,(delta,phase) in enumerate(delta_iter):
                 delta_device = _put(delta,mesh_xy,P(None,None,'y'))
@@ -1237,6 +1280,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         identity=artifact['identity'],tail_relative_norm=tails,angular_gram_error=angular_error,
         nearest_atom_image=nearest,raw_rhs_bytes_per_rank=rhs_bytes,resident_estimate_bytes_per_rank=price)
     state['local_rhs_workspace_bytes_per_rank'] = point_workspace
+    state['prepared_served_overlap_host_bytes_per_process'] = prepared_overlap_host_bytes
     state['resident_rhs_copies'] = rhs_copies
     state['indexed_local_q_union'] = q_union
     if artifact.get('prepared_fourier_cache') is not None:

@@ -66,6 +66,61 @@ def test_local_fourier_metadata_does_not_change_normalized_field_controls():
     assert augmented['local_coulomb_fourier_file']=='local.npz'
 
 
+def test_full_wfn_overlap_requires_served_data_without_monopole(tmp_path):
+    from gw.isdf_augmentation import read_augmentation_manifest
+    control=dict(schema='lorrax.isdf_augmentation.v1',carrier='normalized_rkb',
+        frozen_core_policy='reconstruct_valence_only',species={'47':{}},
+        radial={},angular={},cache={},runtime={},overlap={'mode':'full_wfn_lowdin','bands':1})
+    (tmp_path/'manifest.json').write_text(json.dumps(control))
+    with pytest.raises(ValueError,match='served_moments artifact table'):
+        read_augmentation_manifest(tmp_path)
+
+
+def test_served_overlap_table_admitted_independently_of_monopole(tmp_path,monkeypatch):
+    from gw.isdf_augmentation import read_augmentation_manifest
+    from psp import atomic_reconstruction
+    class AtomicReadReached(Exception):
+        pass
+    def reached(*args,**kwargs):
+        raise AtomicReadReached
+    monkeypatch.setattr(atomic_reconstruction,'load_atomic_reconstruction',reached)
+    control=dict(schema='lorrax.isdf_augmentation.v1',carrier='normalized_rkb',
+        frozen_core_policy='reconstruct_valence_only',
+        species={'47':{'source_upf':'absent.upf','reconstruction':'absent.npz'}},
+        radial={},angular={},cache={'species_files':{'47':'absent.npz'}},runtime={},
+        overlap={'mode':'full_wfn_lowdin','bands':1},served_moments={
+            'species_files':{'47':'absent.npz'},'species_sha256':{'47':'0'*64},
+            'raw_parent_file':'absent.npz','raw_parent_sha256':'0'*64})
+    (tmp_path/'manifest.json').write_text(json.dumps(control))
+    with pytest.raises(AtomicReadReached):
+        read_augmentation_manifest(tmp_path)
+
+
+def test_raw_parent_preparation_authenticates_species_with_strict_fitting_default(tmp_path,monkeypatch):
+    from gw.isdf_augmentation import read_augmentation_manifest
+    from psp import atomic_reconstruction
+    class AtomicReadReached(Exception):
+        pass
+    def reached(*args,**kwargs):
+        raise AtomicReadReached
+    monkeypatch.setattr(atomic_reconstruction,'load_atomic_reconstruction',reached)
+    control=dict(schema='lorrax.isdf_augmentation.v1',carrier='normalized_rkb',
+        frozen_core_policy='reconstruct_valence_only',
+        species={'47':{'source_upf':'absent.upf','reconstruction':'absent.npz'}},
+        radial={},angular={},cache={'species_files':{'47':'absent.npz'}},runtime={},
+        overlap={'mode':'full_wfn_lowdin','bands':1},served_moments={
+            'species_files':{'47':'absent.npz'},'species_sha256':{'47':'0'*64}})
+    (tmp_path/'manifest.json').write_text(json.dumps(control))
+    with pytest.raises(ValueError,match='exact species'):
+        read_augmentation_manifest(tmp_path)
+    with pytest.raises(AtomicReadReached):
+        read_augmentation_manifest(tmp_path,load_raw_parent=False)
+    control['served_moments']['raw_parent_file']='absent.npz'
+    (tmp_path/'manifest.json').write_text(json.dumps(control))
+    with pytest.raises(ValueError,match='exact species'):
+        read_augmentation_manifest(tmp_path,load_raw_parent=False)
+
+
 def test_indexed_workspace_keeps_full_native_outputs_in_its_bound():
     from gw.isdf_augmentation import _local_rhs_workspace_bytes
     full = _local_rhs_workspace_bytes(16,216,2304,17280,16,retain_smooth=True)

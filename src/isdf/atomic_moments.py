@@ -15,12 +15,25 @@ from pathlib import Path
 
 import numpy as np
 
-SCHEMA = 'lorrax.served_moment_cache.v1'
+SCHEMA = 'lorrax.served_moment_cache.v2'
 CARRIER = 'auxiliary_charge_functional'
 
 
 def _json_bytes(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+
+
+def _served_radial_edges(radius, support, taper_start=None):
+    """Split exact boundaries without unrepresentable sub-ulp GL cells."""
+    edges = np.asarray(radius)[np.asarray(radius) < support]
+    boundaries = [float(support)]
+    if taper_start is not None:
+        boundaries.append(float(taper_start))
+    for boundary in boundaries:
+        # A cache knot within floating-point roundoff of an exact boundary
+        # cannot support distinct positive Gauss nodes. Retain the boundary.
+        edges = edges[np.abs(edges-boundary) > 8*np.spacing(abs(boundary))]
+    return np.unique(np.r_[edges, boundaries])
 
 
 def _served_operator_identity():
@@ -30,50 +43,80 @@ def _served_operator_identity():
                    'psp.augmentation_spinors', 'psp.atomic_reconstruction',
                    'psp.augmentation_cache'):
         owners[module] = hashlib.sha256(Path(importlib.util.find_spec(module).origin).read_bytes()).hexdigest()
-    source = inspect.getsource(build_served_overlap_cache) + inspect.getsource(served_overlap_table)
-    return dict(operator='compact_cubic_hermite_four_spinor_gl5_v1',
+    source = (inspect.getsource(build_served_overlap_cache) + inspect.getsource(served_overlap_table)
+              + inspect.getsource(_served_radial_edges))
+    import scipy
+    return dict(operator='declared_hermite_compact_graph_gl10_v2', scipy_version=scipy.__version__,
                 operator_source_sha256=hashlib.sha256(source.encode()).hexdigest(),
                 owner_sources_sha256=owners)
 
 
 def build_served_overlap_cache(normalized_cache, *, support_radius,
                                momentum_max=16., momentum_points=4097,
-                               source_quad_order=5):
+                               source_quad_order=None):
     """Prepare exact Hermite-cell B and Fourier bra tables once, offline.
 
-    GL5 exactly integrates products of served cubic radial functions times
-    r². Fourier rows have their own independent interpolation validation.
+    Compact fields require GL10 and cells split at the taper boundaries.
+    Their lower Fourier block is sigma.K of the same upper transform.
+    Raw utility caches retain GL5 for independent cubic-block products.
     No native partial-wave metric or omitted tail is substituted for this B.
     """
-    from scipy.interpolate import CubicHermiteSpline
-    from psp.augmentation_spinors import build_pauli_fourier_cache, spinor_function_labels
+    from scipy.interpolate import CubicSpline
+    from psp.augmentation_spinors import (build_pauli_fourier_cache, spinor_function_labels,
+        evaluate_normalized_radials, radial_fourier_bessel, COMPACT_GRAPH_FIELD_MODEL)
 
     radius = np.asarray(normalized_cache['radius'])
-    support, order = float(support_radius), int(source_quad_order)
+    support = float(support_radius)
+    compact = 'field_model' in normalized_cache
+    requested_order = (10 if compact else 5) if source_quad_order is None else source_quad_order
+    order = int(requested_order)
     if (radius.ndim != 1 or len(radius) < 2 or not np.isfinite(radius).all()
             or radius[0] != 0. or np.any(np.diff(radius) <= 0)
-            or order != source_quad_order or order < 5 or not np.isfinite(support)
+            or order != requested_order or order < (10 if compact else 5) or not np.isfinite(support)
             or not 0 < support <= radius[-1]):
-        raise ValueError('served moments require a radial cache from zero, support within cache, and GL order >=5')
-    edges = np.concatenate((radius[radius < support], [support]))
+        raise ValueError('served moments require a radial cache from zero, support within cache, and GL order >=10 for compact graphs (>=5 for raw utilities)')
+    start = None
+    if compact:
+        if (str(normalized_cache['field_model']) != COMPACT_GRAPH_FIELD_MODEL
+                or float(normalized_cache['support_radius']) != support):
+            raise ValueError('served moment support must match the declared compact graph')
+        start = float(normalized_cache['taper_start'])
+    edges = _served_radial_edges(radius, support, start)
     x, w = np.polynomial.legendre.leggauss(order)
     half, mid = np.diff(edges)/2, (edges[:-1]+edges[1:])/2
     r, wr = (mid[:, None]+half[:, None]*x).ravel(), (half[:, None]*w).ravel()
-    large = CubicHermiteSpline(radius, normalized_cache['large_R'],
-                              normalized_cache['dlarge_R_dr'], axis=0)(r)
-    small = CubicHermiteSpline(radius, normalized_cache['small_R'],
-                              normalized_cache['dsmall_R_dr'], axis=0)(r)
+    large, small = evaluate_normalized_radials(normalized_cache, r)
     ell, kappa = np.asarray(normalized_cache['ell']), np.asarray(normalized_cache['kappa'])
     controls = dict(momentum_max=momentum_max, momentum_points=momentum_points,
                     relative_tolerance=1e-10, absolute_tolerance=1e-12)
     upper = build_pauli_fourier_cache(large, r, wr, ell, kappa, **controls)
-    lower = build_pauli_fourier_cache(small, r, wr, 2*np.abs(kappa)-1-ell, -kappa, **controls)
+    if compact:
+        h = float(normalized_cache['half_alpha'])
+        lower = dict(momentum=upper['momentum'].copy(), ell=2*np.abs(kappa)-1-ell, kappa=-kappa,
+            radial=1j*np.sign(kappa)[None]*h*upper['momentum'][:, None]*upper['radial'])
+        cells = np.unique(np.linspace(0, len(upper['momentum'])-2, 128).astype(int))
+        query = np.r_[0., (upper['momentum'][cells]+upper['momentum'][cells+1])/2]
+        direct = radial_fourier_bessel(small, r, wr, lower['ell'], query)
+        derived = 1j*np.sign(kappa)[None]*h*query[:, None]*CubicSpline(
+            upper['momentum'], upper['radial'], axis=0)(query)
+        scales = np.maximum(np.max(abs(lower['radial']), axis=0), 1e-30)
+        errors = np.max(abs(derived-direct), axis=0)
+        limits = controls['absolute_tolerance']+controls['relative_tolerance']*scales
+        if np.any(errors > limits):
+            raise ValueError('compact lower Fourier derivative pins exceed the mixed tolerance')
+        lower.update(maximum_absolute_error=float(errors.max()),
+            maximum_scaled_error=float(np.max(errors/scales)), validation_points=len(query))
+    else:
+        lower = build_pauli_fourier_cache(small, r, wr, 2*np.abs(kappa)-1-ell, -kappa, **controls)
     labels = spinor_function_labels(ell, kappa)
     opf, mj = labels.T
     radial = (large.conj().T*(wr*r*r)) @ large + (small.conj().T*(wr*r*r)) @ small
     metric = radial[opf[:, None], opf[None, :]]
     metric *= ((kappa[opf, None] == kappa[None, opf]) & (mj[:, None] == mj[None, :]))
-    return dict(upper=upper, lower=lower, B=metric, labels=labels,
+    field = dict(field_model=str(normalized_cache['field_model']),
+        taper_start=float(normalized_cache['taper_start']), half_alpha=float(normalized_cache['half_alpha'])) if compact else dict(
+        field_model='unwindowed_independent_hermite')
+    return dict(upper=upper, lower=lower, B=metric, labels=labels, **field,
                 support_radius=support, lower_radius=0., source_quad_order=order,
                 source_identity=_served_operator_identity())
 
@@ -85,13 +128,36 @@ def served_overlap_table(cache, K_cart, *, center_cart, cell_volume):
     this overlap. The caller must mask every ghost source G coefficient.
     """
     from psp.augmentation_spinors import evaluate_pauli_fourier_cache
+    _served_field_descriptor(cache)
 
     volume = float(cell_volume)
     if not np.isfinite(volume) or volume <= 0:
         raise ValueError('served moment overlap requires a positive physical volume')
     upper = evaluate_pauli_fourier_cache(cache['upper'], K_cart, center_cart=center_cart)
-    lower = evaluate_pauli_fourier_cache(cache['lower'], K_cart, center_cart=center_cart)
+    from psp.augmentation_spinors import COMPACT_GRAPH_FIELD_MODEL
+    if cache.get('field_model') == COMPACT_GRAPH_FIELD_MODEL:
+        K, h = np.asarray(K_cart), float(cache['half_alpha'])
+        lower = h*np.stack((K[:, 2]*upper[:, 0]+(K[:, 0]-1j*K[:, 1])*upper[:, 1],
+            (K[:, 0]+1j*K[:, 1])*upper[:, 0]-K[:, 2]*upper[:, 1]), axis=1)
+    else:
+        lower = evaluate_pauli_fourier_cache(cache['lower'], K_cart, center_cart=center_cart)
     return np.concatenate((upper, lower), axis=1).conj()/np.sqrt(volume)
+
+
+def _served_field_descriptor(cache):
+    """Authenticate which physical radial field the stored metric represents."""
+    from psp.augmentation_spinors import COMPACT_GRAPH_FIELD_MODEL
+    from common.bispinor_init import HALFALPHA
+    model = cache.get('field_model')
+    if model == 'unwindowed_independent_hermite':
+        return dict(field_model=model)
+    if model != COMPACT_GRAPH_FIELD_MODEL:
+        raise ValueError('served moment field model is missing or unsupported')
+    start, stop, h = (float(cache[key]) for key in ('taper_start', 'support_radius', 'half_alpha'))
+    if (not np.isfinite((start, stop, h)).all() or not 0 < start < stop
+            or h != float(HALFALPHA) or int(cache['source_quad_order']) < 10):
+        raise ValueError('served compact graph taper, gradient constant or quadrature differs')
+    return dict(field_model=model, taper_start=start, half_alpha=h)
 
 
 def _cache_arrays(cache):
@@ -153,6 +219,7 @@ def write_served_moment_cache(path, cache, *, normalized_cache_sha256):
         raise ValueError('served moment operator source identity mismatch')
     arrays = _validate_cache_arrays(_cache_arrays(cache))
     metadata = dict(schema=SCHEMA, normalized_cache_sha256=str(normalized_cache_sha256),
+        **_served_field_descriptor(cache),
         payload_sha256=_payload_hash(arrays), source_identity=cache['source_identity'],
         support_radius=float(cache['support_radius']), lower_radius=float(cache['lower_radius']),
         source_quad_order=int(cache['source_quad_order']),
@@ -178,13 +245,19 @@ def load_served_moment_cache(path, *, normalized_cache_sha256, support_radius):
             or metadata.get('source_identity') != _served_operator_identity()):
         raise ValueError('served moment artifact source or field identity mismatch')
     _validate_cache_arrays(arrays)
+    field = _served_field_descriptor(metadata)
     if metadata.get('payload_sha256') != _payload_hash(arrays):
         raise ValueError('served moment artifact payload identity mismatch')
     cache = {key: metadata[key] for key in ('support_radius', 'lower_radius', 'source_quad_order', 'source_identity')}
+    cache.update(field)
     cache.update(B=arrays['B'], labels=arrays['labels'], metadata=metadata)
     for leg in ('upper', 'lower'):
         cache[leg] = {name: arrays[f'{leg}_{name}'] for name in ('momentum', 'radial', 'ell', 'kappa')}
         cache[leg].update(metadata['validation'][leg])
+    if field['field_model'] != 'unwindowed_independent_hermite':
+        expected = 1j*np.sign(cache['upper']['kappa'])[None]*cache['half_alpha']*cache['upper']['momentum'][:, None]*cache['upper']['radial']
+        if not np.array_equal(cache['lower']['radial'], expected):
+            raise ValueError('served compact lower table differs from its exact upper gradient')
     return cache
 
 

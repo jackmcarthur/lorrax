@@ -1,8 +1,8 @@
-"""Immutable normalized-RKB radial caches shared by generation and fitting.
+"""Immutable normalized-RKB upper caches and their compact graph descriptor.
 
-The Hankel factory is the former fitting-stage implementation, with identical
-quadratures. Persisting its result changes preparation cost, not the carrier.
-All lengths are bohr and the source radial functions use normalized u=rR.
+The stored Hankel arrays retain the original unwindowed transform evidence.
+Production fields taper the large Hermite polynomial and derive the small
+block from its gradient. All lengths are bohr; atomic source waves use u=rR.
 """
 from __future__ import annotations
 
@@ -13,9 +13,10 @@ from pathlib import Path
 
 import numpy as np
 
-SCHEMA = "lorrax.normalized_augmentation_cache.v1"
+SCHEMA = "lorrax.normalized_augmentation_cache.v2"
 ARRAY_KEYS = frozenset(("radius", "ell", "kappa", "large_R", "dlarge_R_dr",
-                        "small_R", "dsmall_R_dr"))
+                        "small_R", "dsmall_R_dr", "field_model", "taper_start",
+                        "support_radius", "half_alpha"))
 RADIAL_KEYS = ("large_R", "dlarge_R_dr", "small_R", "dsmall_R_dr")
 
 
@@ -27,9 +28,13 @@ def _controls(control, support_radius):
     result = {key: value for key, value in control.items() if key != "species_files"}
     km, nk = float(result["momentum_max"]), int(result["momentum_points"])
     rm, nr = float(result["radius_max"]), int(result["radius_points"])
+    if "taper_start" not in result:
+        raise ValueError("compact normalized cache requires an explicit taper_start preserving the native core")
+    start = float(result["taper_start"])
     if (not np.isfinite((km, rm, support_radius)).all() or km <= 0 or nk < 4
             or rm <= support_radius or nr < 8 or support_radius <= 0
-            or nk != result["momentum_points"] or nr != result["radius_points"]):
+            or nk != result["momentum_points"] or nr != result["radius_points"]
+            or not np.isfinite(start) or not 0 < start < support_radius):
         raise ValueError("normalized cache requires positive resolved momentum and radii beyond support")
     if result.get("momentum_quadrature", "midpoint") not in ("midpoint", "gauss_legendre"):
         raise ValueError("unknown normalized-cache momentum quadrature")
@@ -56,6 +61,7 @@ def _radius_grid(control):
 def normalized_cache_binding(data, control, *, support_radius):
     """Bind atomic payload/metadata, numerical controls and carrier sources."""
     from common.bispinor_init import NORMALIZED_RKB_LIFT_PROVENANCE, HALFALPHA
+    from psp.augmentation_spinors import COMPACT_GRAPH_FIELD_MODEL
 
     metadata = data["metadata"]
     if (metadata.get("operator_comparison", {}).get("authenticated") is not True
@@ -66,18 +72,26 @@ def normalized_cache_binding(data, control, *, support_radius):
                    "psp.atomic_reconstruction", "psp.augmentation_cache"):
         origin = importlib.util.find_spec(module).origin
         owners[module] = hashlib.sha256(Path(origin).read_bytes()).hexdigest()
+    controls = _controls(control, support_radius)
+    if float(data["r"][-1]) > float(controls["taper_start"]):
+        raise ValueError("compact taper would alter the authenticated native reconstruction sphere")
     return {"schema": SCHEMA, "carrier": "normalized_rkb",
             "carrier_provenance": NORMALIZED_RKB_LIFT_PROVENANCE,
+            "field_model": COMPACT_GRAPH_FIELD_MODEL,
+            "pauli_precursor": "R^-1(w R delta_phi)",
+            "tail_diagnostic_field": "unwindowed_hankel",
             "half_alpha_fs": float(HALFALPHA), "owner_sources_sha256": owners,
             "atomic_source_sha256": metadata["source_sha256"],
             "atomic_payload_sha256": metadata["payload_sha256"],
             "atomic_metadata_sha256": hashlib.sha256(_json_bytes(metadata)).hexdigest(),
-            "controls": _controls(control, support_radius), "support_radius": float(support_radius),
+            "controls": controls, "support_radius": float(support_radius),
             "units": {"radius": "bohr", "momentum": "bohr^-1",
                       "radial_wavefunction": "bohr^-3/2", "radial_derivative": "bohr^-5/2"}}
 
 
-def _validate_arrays(cache, data, control):
+def _validate_arrays(cache, data, control, *, support_radius):
+    from common.bispinor_init import HALFALPHA
+    from psp.augmentation_spinors import COMPACT_GRAPH_FIELD_MODEL
     if set(cache) != ARRAY_KEYS:
         raise ValueError("normalized cache array keys differ from schema")
     r, l, k = (np.asarray(cache[name]) for name in ("radius", "ell", "kappa"))
@@ -91,6 +105,10 @@ def _validate_arrays(cache, data, control):
         value = np.asarray(cache[name])
         if value.shape != (len(r), len(l)) or value.dtype != np.complex128 or not np.isfinite(value).all():
             raise ValueError(f"normalized cache {name} must be finite complex128 on the radial/OPF grid")
+    expected = dict(field_model=COMPACT_GRAPH_FIELD_MODEL, taper_start=float(control['taper_start']),
+                    support_radius=float(support_radius), half_alpha=float(HALFALPHA))
+    if any(np.asarray(cache[name]).shape != () or cache[name] != value for name, value in expected.items()):
+        raise ValueError("normalized cache compact field descriptor differs from controls")
 
 
 def _payload_hash(cache):
@@ -105,14 +123,15 @@ def _payload_hash(cache):
 
 
 def build_normalized_cache(data, control, *, support_radius):
-    """Build the unchanged fitting-stage Hankel cache exactly once."""
+    """Build the raw Hankel samples and explicit compact graph exactly once."""
     from scipy.special import roots_legendre
     from psp.atomic_reconstruction import evaluate_radial_correction
-    from psp.augmentation_spinors import build_normalized_radial_cache
+    from psp.augmentation_spinors import build_normalized_radial_cache, COMPACT_GRAPH_FIELD_MODEL
+    from common.bispinor_init import HALFALPHA
 
     control = _controls(control, support_radius)
-    if float(data["r"][-1]) > support_radius:
-        raise ValueError("atomic pre-lift reconstruction radius exceeds compact support")
+    if float(data["r"][-1]) > float(control["taper_start"]):
+        raise ValueError("atomic pre-lift reconstruction radius exceeds compact taper start")
     km, nk = float(control["momentum_max"]), int(control["momentum_points"])
     if control.get("momentum_quadrature", "midpoint") == "gauss_legendre":
         nodes, weights = roots_legendre(nk)
@@ -129,12 +148,15 @@ def build_normalized_cache(data, control, *, support_radius):
         source_delta = evaluate_radial_correction(data, source_r)[0]
     cache = build_normalized_radial_cache(source_delta, source_r, source_w,
         data["l"], data["kappa"], momentum, dk_weights, _radius_grid(control))
-    _validate_arrays(cache, data, control)
+    cache.update(field_model=np.asarray(COMPACT_GRAPH_FIELD_MODEL),
+        taper_start=np.asarray(float(control['taper_start'])),
+        support_radius=np.asarray(float(support_radius)), half_alpha=np.asarray(float(HALFALPHA)))
+    _validate_arrays(cache, data, control, support_radius=support_radius)
     return cache
 
 
 def normalized_cache_tail_diagnostics(cache, *, support_radius):
-    """Same radial tail estimates as the fitting stage; no accuracy claim."""
+    """Unwindowed Hankel tail estimates; no compact-field accuracy claim."""
     radius = cache["radius"]
     outside = radius >= support_radius
     l, k = cache["ell"], cache["kappa"]
@@ -157,7 +179,7 @@ def write_normalized_cache(path, cache, data, control, *, support_radius):
     if path.exists():
         raise FileExistsError(f"preserve existing normalized cache: {path}")
     binding = normalized_cache_binding(data, control, support_radius=support_radius)
-    _validate_arrays(cache, data, binding["controls"])
+    _validate_arrays(cache, data, binding["controls"], support_radius=support_radius)
     metadata = {"binding": binding, "payload_sha256": _payload_hash(cache)}
     metadata["metadata_sha256"] = hashlib.sha256(_json_bytes(metadata)).hexdigest()
     np.savez_compressed(path, **cache, metadata_json=np.asarray(_json_bytes(metadata).decode()))
@@ -175,7 +197,7 @@ def load_normalized_cache(path, data, control, *, support_radius):
     expected = normalized_cache_binding(data, control, support_radius=support_radius)
     if metadata.get("binding") != expected:
         raise ValueError("normalized cache source, metadata, controls or carrier provenance mismatch")
-    _validate_arrays(cache, data, expected["controls"])
+    _validate_arrays(cache, data, expected["controls"], support_radius=support_radius)
     if metadata.get("payload_sha256") != _payload_hash(cache):
         raise ValueError("normalized cache array payload checksum mismatch")
     return cache

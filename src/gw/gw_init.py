@@ -225,7 +225,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          logical_band_stop, zeta_cutoff, zeta_vcoul_cutoff,
                          write_ibz_only, band_norms, vertex_mu_L=0,
                          carrier_bispinor=None, carrier_lift=None,
-                         transverse_identity=None):
+                         transverse_identity=None,
+                         atomic_augmentation_identity=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
 	Every entry is an input that CHANGES ζ numerically.  Deliberately
@@ -431,8 +432,10 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
 		from .isdf_augmentation import (AUGMENTED_CHARGE_PAYLOAD_SCHEMA,
 		                              augmentation_identity)
-		prov['atomic_augmentation'] = augmentation_identity(
-			cfg.paths.atomic_reconstruction_dir)
+		prov['atomic_augmentation'] = (
+			augmentation_identity(cfg.paths.atomic_reconstruction_dir)
+			if atomic_augmentation_identity is None
+			else atomic_augmentation_identity)
 		prov['augmented_charge_payload_schema'] = AUGMENTED_CHARGE_PAYLOAD_SCHEMA
 	# Stamp only the path whose physics changed.  Equal-window charge fits and
 	# every transverse fit retain their byte-identical schema-1 provenance;
@@ -1472,7 +1475,7 @@ def _check_centroid_selection_windows(cfg, band_slices, band_range_left,
 
 def _resolve_zeta_fit_contract(
 		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
-		*, print_fn=print):
+		*, print_fn=print, atomic_augmentation_identity=None):
 	"""Resolve all zeta identities and reuse verdicts before fit planning.
 
 	Only host metadata and the canonical :func:`_zeta_reuse_ok` owner are used.
@@ -1602,7 +1605,8 @@ def _resolve_zeta_fit_contract(
 		band_norms=band_norms,
 		carrier_bispinor=bool(int(meta.nspinor) == 4),
 		carrier_lift=representation.charge_lift,
-		vertex_mu_L=0, transverse_identity=transverse_identity)
+		vertex_mu_L=0, transverse_identity=transverse_identity,
+		atomic_augmentation_identity=atomic_augmentation_identity)
 	provenance_transverse = tuple(
 		_zeta_fit_provenance(
 			wfn=wfn, meta=meta_transverse, cfg=cfg,
@@ -1614,7 +1618,8 @@ def _resolve_zeta_fit_contract(
 			write_ibz_only=write_ibz_only_transverse,
 			band_norms=band_norms, carrier_bispinor=True,
 			carrier_lift=representation.current_lift,
-			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
+			vertex_mu_L=mu_L, transverse_identity=transverse_identity,
+			atomic_augmentation_identity=atomic_augmentation_identity)
 		for mu_L in ((1, 2, 3) if uses_transverse_interaction(cfg) else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)
 	reuse_charge = _zeta_reuse_ok(
@@ -2660,9 +2665,20 @@ def _prepare_fresh_parent_faces(
         load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir,
         wfn):
     """Produce the authenticated fit contract and loaded raw-parent faces."""
+    # One strict read supplies this fresh invocation's fields and provenance.
+    # Restart loading authenticates independently on every invocation; there
+    # is no process-global memoization of files that could later be replaced.
+    augmentation_artifact = None
+    if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
+        from .isdf_augmentation import read_augmentation_manifest
+        with timing.section('augmentation.manifest_and_cache_read'):
+            augmentation_artifact = read_augmentation_manifest(
+                cfg.paths.atomic_reconstruction_dir)
     zeta_contract = _resolve_zeta_fit_contract(
         wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices,
-        tmp_dir, print_fn=print0)
+        tmp_dir, print_fn=print0,
+        atomic_augmentation_identity=(None if augmentation_artifact is None
+                                      else augmentation_artifact['identity']))
     charge_zeta_identity_receipt = charge_zeta_identity(
         zeta_contract.provenance, wfn=wfn,
         wfn_fingerprint_binding=basis_wfn_fingerprint_binding)
@@ -2691,8 +2707,7 @@ def _prepare_fresh_parent_faces(
         raise ValueError("fractional centroids require the resident atomic augmentation fitting stage")
     _load_meta, _load_range = meta, band_slices.full_range
     if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
-        from .isdf_augmentation import read_augmentation_manifest
-        _overlap = read_augmentation_manifest(cfg.paths.atomic_reconstruction_dir).get('overlap', {})
+        _overlap = augmentation_artifact.get('overlap', {})
         if _overlap.get('mode') == 'full_wfn_lowdin':
             from runtime.padding import padded_axis
             _all_bands = int(wfn.nbands)
@@ -2756,7 +2771,7 @@ def _prepare_fresh_parent_faces(
                 band_range_right=zeta_contract.band_range_right,
                 write_ibz_only=zeta_contract.write_ibz_only_charge,
                 public_band_range=band_slices.full_range,
-                print_fn=print0)
+                print_fn=print0, artifact=augmentation_artifact)
         if 'parent_psi' in chunks['augmentation']:
             chunks['parent_psi'] = chunks['augmentation'].pop('parent_psi')
     print0("  ψ storage: parents only -- "
@@ -2891,7 +2906,7 @@ def _write_fresh_restart(
         get_enk_bandrange, mesh_xy, meta, print0, resolve_restart_q_storage_for_run,
         restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
         tensors_filename, transverse_wfn_data, wfn, wfns_transverse,
-        write_restart_state_to_h5):
+        write_restart_state_to_h5, *, atomic_augmentation_identity=None):
     """Write the existing authenticated Coulomb and parent-face restart bundle."""
     enk_full, _ = get_enk_bandrange(
         wfn, sym, band_slices.full_range,
@@ -2900,8 +2915,9 @@ def _write_fresh_restart(
         cfg, tensors_filename)
     _augmentation_identity = None
     if _write_restart and getattr(cfg.paths, 'atomic_reconstruction_dir', None):
-        from .isdf_augmentation import augmentation_identity
-        _augmentation_identity = augmentation_identity(cfg.paths.atomic_reconstruction_dir)
+        if not atomic_augmentation_identity:
+            raise AssertionError("fresh augmented restart requires its fitted atomic identity")
+        _augmentation_identity = atomic_augmentation_identity
     _qirr = resolve_restart_q_storage_for_run(
         cfg, sym=sym, centroid_indices=centroid_indices,
         fft_grid=meta.fft_grid, print_fn=print0, coordinate_kind=meta.mu_basis.coordinate_kind)
@@ -3018,7 +3034,10 @@ def _prepare_fresh_isdf(
             basis_wfn_fingerprint_binding, centroid_indices, cfg, charge_zeta_identity_receipt,
             get_enk_bandrange, mesh_xy, meta, print0, resolve_restart_q_storage_for_run,
             restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
-            tensors_filename, transverse_wfn_data, wfn, wfns_transverse, write_restart_state_to_h5)
+            tensors_filename, transverse_wfn_data, wfn, wfns_transverse,
+            write_restart_state_to_h5,
+            atomic_augmentation_identity=json.loads(
+                zeta_contract.provenance).get('atomic_augmentation'))
         if ((hasattr(zeta_path, 'contract_v') or cfg.bispinor)
                 and jax.process_index() == 0):
             # Route G's stage split through V_q (read, faces, C, fit, V_q),

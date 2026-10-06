@@ -7,19 +7,23 @@ from runtime import bootstrap
 bootstrap()
 
 from psp.augmentation_cache import write_normalized_cache, load_normalized_cache
+from psp.augmentation_spinors import COMPACT_GRAPH_FIELD_MODEL
+from common.bispinor_init import HALFALPHA
 
 
 def fixture_cache():
     control = dict(momentum_max=30., momentum_points=24, momentum_quadrature="gauss_legendre",
                    radius_kind="log", radius_min=1e-7, radius_max=1.8, radius_points=32,
-                   tail_relative_tolerance=1.)
+                   tail_relative_tolerance=1., taper_start=1.)
     radius = np.concatenate(([0.], np.geomspace(1e-7, 1.8, 31)))
-    data = dict(l=np.asarray((0, 1)), kappa=np.asarray((-1, 1)),
+    data = dict(r=np.asarray((.1, .9)), l=np.asarray((0, 1)), kappa=np.asarray((-1, 1)),
                 metadata=dict(source_sha256="a"*64, payload_sha256="b"*64,
                               operator_comparison={"authenticated": True}, phase_branch_validated=True))
     value = np.asarray(np.exp(-radius[:, None])*np.asarray((1., 0.7))[None], dtype=np.complex128)
     cache = dict(radius=radius, ell=data["l"], kappa=data["kappa"], large_R=value,
-                 dlarge_R_dr=-value, small_R=0.1j*value, dsmall_R_dr=-0.1j*value)
+                 dlarge_R_dr=-value, small_R=0.1j*value, dsmall_R_dr=-0.1j*value,
+                 field_model=np.asarray(COMPACT_GRAPH_FIELD_MODEL), taper_start=np.asarray(1.),
+                 support_radius=np.asarray(1.2), half_alpha=np.asarray(float(HALFALPHA)))
     return data, control, cache
 
 
@@ -83,3 +87,16 @@ def test_cache_cannot_be_overwritten(tmp_path):
     write_normalized_cache(path, cache, data, control, support_radius=1.2)
     with pytest.raises(FileExistsError):
         write_normalized_cache(path, cache, data, control, support_radius=1.2)
+
+
+def test_cache_requires_explicit_native_preserving_compact_descriptor(tmp_path):
+    data, control, cache = fixture_cache()
+    with pytest.raises(ValueError, match='explicit taper_start'):
+        write_normalized_cache(tmp_path/'missing.npz', cache, data,
+            {key: value for key, value in control.items() if key != 'taper_start'}, support_radius=1.2)
+    with pytest.raises(ValueError, match='native reconstruction sphere'):
+        write_normalized_cache(tmp_path/'core.npz', cache, data, dict(control, taper_start=.8), support_radius=1.2)
+    for key, value in (('field_model', np.asarray('hard_mask')), ('half_alpha', np.asarray(2*HALFALPHA)),
+                       ('taper_start', np.asarray(.7))):
+        with pytest.raises(ValueError, match='descriptor'):
+            write_normalized_cache(tmp_path/f'{key}.npz', dict(cache, **{key: value}), data, control, support_radius=1.2)

@@ -22,7 +22,8 @@ def _synthetic_cache():
     leg = lambda l, k: dict(momentum=momentum.copy(), radial=np.zeros((8, len(kappa)), complex),
         ell=l.copy(), kappa=k.copy(), maximum_absolute_error=0., maximum_scaled_error=0., validation_points=7)
     return dict(B=B, labels=labels, upper=leg(ell, kappa), lower=leg(2*abs(kappa)-1-ell, -kappa),
-        support_radius=2.6, lower_radius=0., source_quad_order=5, source_identity=_served_operator_identity())
+        support_radius=2.6, lower_radius=0., source_quad_order=5, source_identity=_served_operator_identity(),
+        field_model='unwindowed_independent_hermite')
 
 
 def test_auxiliary_signed_integral_and_finite_q():

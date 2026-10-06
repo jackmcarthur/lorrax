@@ -279,22 +279,76 @@ def build_normalized_radial_cache(delta_R, radius, weights_dr, ell, kappa,
                 small_R=lower, dsmall_R_dr=dlower)
 
 
-def evaluate_normalized_delta(cache: dict, relative_cart):
-    """Evaluate a cached U delta_phi at atom-relative points, (function,4,point).
+COMPACT_GRAPH_FIELD_MODEL = "compact_upper_hermite_sigma_gradient"
 
-    Cubic Hermite interpolation uses the exported spectral derivatives.
-    There is no implicit atomic cutoff and no assumed norm conservation.
+
+def compact_graph_taper(radius, taper_start, support_radius):
+    """C2 radial window and its derivative, retaining the native sphere."""
+    radius = np.asarray(radius, dtype=np.float64)
+    start, stop = float(taper_start), float(support_radius)
+    if (not np.isfinite(radius).all() or np.any(radius < 0)
+            or not np.isfinite((start, stop)).all() or not 0 < start < stop):
+        raise ValueError("compact graph requires finite radii and 0 < taper_start < support_radius")
+    t = np.clip((radius-start)/(stop-start), 0., 1.)
+    window = 1-10*t**3+15*t**4-6*t**5
+    derivative = (-30*t*t+60*t**3-30*t**4)/(stop-start)
+    window = np.where(radius <= start, 1., np.where(radius >= stop, 0., window))
+    derivative = np.where((radius > start) & (radius < stop), derivative, 0.)
+    return window, derivative
+
+
+def evaluate_normalized_radials(cache: dict, radius):
+    r"""Return the declared large/small field from the same radial cache.
+
+    Raw Hankel caches retain the unwindowed U delta_phi evaluator. An explicit
+    compact descriptor serves L=w f and S=i h[(wf)' +(kappa+1)wf/r], using
+    ONE large Hermite polynomial. Its Pauli precursor is R^-1(w R delta_phi),
+    not the original pre-U correction. No pointwise normalization is applied.
     """
     from scipy.interpolate import CubicHermiteSpline
 
-    vectors = _vectors(relative_cart, "atomic sample coordinates")
-    r = np.linalg.norm(vectors, axis=1)
-    if np.any(r < cache['radius'][0]) or np.any(r > cache['radius'][-1]):
+    r = np.asarray(radius, dtype=np.float64)
+    if r.ndim != 1 or not np.isfinite(r).all() or np.any(r < 0):
+        raise ValueError("atomic radial samples must be finite nonnegative vectors")
+    compact = "field_model" in cache
+    if not compact and (np.any(r < cache['radius'][0]) or np.any(r > cache['radius'][-1])):
         raise ValueError("atomic samples lie outside the normalized radial cache; extend and converge its tail")
-    large = CubicHermiteSpline(cache['radius'], cache['large_R'],
-                              cache['dlarge_R_dr'], axis=0)(r)
-    small = CubicHermiteSpline(cache['radius'], cache['small_R'],
-                              cache['dsmall_R_dr'], axis=0)(r)
+    spline = CubicHermiteSpline(cache['radius'], cache['large_R'], cache['dlarge_R_dr'], axis=0)
+    if not compact:
+        return spline(r), CubicHermiteSpline(cache['radius'], cache['small_R'],
+                                            cache['dsmall_R_dr'], axis=0)(r)
+    from common.bispinor_init import HALFALPHA
+
+    start, stop, h = (float(cache[name]) for name in ('taper_start', 'support_radius', 'half_alpha'))
+    if (str(cache['field_model']) != COMPACT_GRAPH_FIELD_MODEL or h != float(HALFALPHA)
+            or not np.isfinite((start, stop)).all() or not 0 < start < stop <= cache['radius'][-1]
+            or cache['radius'][0] != 0):
+        raise ValueError("normalized cache compact graph descriptor or kinetic-balance constant differs")
+    large = np.zeros((len(r), len(cache['ell'])), dtype=np.complex128)
+    small = np.zeros_like(large)
+    live = r < stop
+    if not np.any(live):
+        return large, small
+    rr = r[live]
+    f, df = spline(rr), spline(rr, 1)
+    w, dw = compact_graph_taper(rr, start, stop)
+    large[live] = w[:, None]*f
+    ratio = np.divide(f, rr[:, None], out=np.zeros_like(f), where=rr[:, None] > 0)
+    lower = 1j*h*(w[:, None]*df+dw[:, None]*f+(cache['kappa'][None]+1)*w[:, None]*ratio)
+    origin = rr == 0
+    lower[origin] = 0
+    # For regular upper p,kappa=+1 the lower s limit is 3 i h f'(0).
+    # Every other retained angular channel has a vanishing lower at r=0.
+    p = np.flatnonzero(cache['kappa'] == 1)
+    lower[np.ix_(origin, p)] = 3j*h*df[np.ix_(origin, p)]
+    small[live] = lower
+    return large, small
+
+
+def evaluate_normalized_delta(cache: dict, relative_cart):
+    """Evaluate the declared cached field, with shape (function,4,point)."""
+    vectors = _vectors(relative_cart, "atomic sample coordinates")
+    large, small = evaluate_normalized_radials(cache, np.linalg.norm(vectors, axis=1))
     labels = spinor_function_labels(cache['ell'], cache['kappa'])
     result = np.empty((len(labels), 4, len(vectors)), dtype=np.complex128)
     for row, (i, m2) in enumerate(labels):

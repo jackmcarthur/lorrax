@@ -38,20 +38,62 @@ Every atomic difference therefore receives the same Fourier multiplier
 as the smooth orbital. An unnormalized small-component derivative added after
 the smooth lift is a different operator. The normalized atomic differences have
 short noncompact tails, so any buffered sphere needs a measured tail bound.
-The lift is isometric, \(U^\dagger U=I\), but reconstruction need not be:
-\(\langle UT\psi_m|UT\psi_n\rangle=\langle T\psi_m|T\psi_n\rangle\).
-The full reconstructed overlap, including smooth–atomic cross terms, is an
-independent diagnostic. The explicit manifest mode `full_wfn_lowdin` measures
-this overlap on every available WFN band, forms its symmetric inverse square
-root A, and uses the carrier U(Tψ A). It rotates the smooth Fourier rows, atomic
-coefficients and sample faces with the same A before selecting the public fit
-window. Padded bands remain exactly zero. The raw mode `none` is diagnostic.
+The production field uses a compact normalized graph. If H denotes the served
+large-component Hermite interpolant, it defines
+
+\[
+\delta L_i=wH[R\delta\phi_i],\qquad
+\delta S_i=X\delta L_i,\qquad
+\delta\chi_i=R^{-1}\delta L_i.
+\]
+
+The radial C² taper is one through `cache.taper_start` and zero at the declared
+support radius. Its start must be at or beyond every authenticated native
+atomic radial bound. The lower field is derived from that **same** large
+interpolant, including the taper derivative and the regular origin limits.
+The resulting orbital is exactly in the prescribed free graph,
+\(\Psi=U(\psi+\sum_i c_i\delta\chi_i)\). Its implicit Pauli correction differs
+from the unwindowed raw correction above; it is not a pointwise normalization.
+The generic uncut Hankel utility remains an operator control. A hard cutoff
+on separately interpolated upper/lower fields would add a derivative surface
+term and is not the production model.
+
+The lift is isometric, \(U^\dagger U=I\), but reconstruction need not be. The
+explicit manifest mode `full_wfn_lowdin` measures the **actual served
+four-spinor** overlap on every available WFN band. With C the unrotated atomic
+coefficients, D the served-field/source overlaps and B the served local Gram,
+this metric is sourceGram plus the sum of D†C+C†D+C†BC. In this equation C,D
+have function-by-band orientation; the API stores band-by-function rows. Its
+symmetric inverse square root A rotates the full smooth Fourier rows, atomic
+coefficients and served D before selecting the public fit window. Existing
+FFT faces receive the same rotation. Fractional faces are sampled from the
+rotated public Fourier rows, which is algebraically equivalent to sampling
+every full-band row first and then rotating those samples. Padded bands remain
+exactly zero. Native ideal-Pauli overlap is not substituted for this changed
+field. The raw mode `none` remains diagnostic.
 
 This convention retains the original DFT energy labels in the existing GW
 contractions. It therefore defines an effective reconstructed-vertex model;
 it does not claim that the mixed orbitals are exact AE eigenstates. Changing
 the available WFN window changes A and requires an observable convergence
 control. Frozen-core orbitals are not added to the occupied GW manifold.
+
+A fresh invocation authenticates the complete atomic manifest once and passes
+that loaded artifact to overlap construction and fitting. Its fitted identity
+also stamps the restart; no process-global file cache is used. Every restart
+invocation independently authenticates the requested manifest before accepting
+stored tensors and samples.
+
+The current augmentation reaches the fitted exchange and screening vertices.
+The live Hartree owner, `gw.hartree.direct_field_matrices`, independently
+reloads the original WFN and currently constructs its smooth occupied density.
+It does not consume these reconstructed fitting samples or local corrections.
+Unchanged Hartree matrices in fitting regression checks therefore certify
+existing-flow parity, not augmented Hartree. The current path alone cannot
+establish the total reconstructed Coulomb contribution to a band shift.
+Hartree uses its full FFT-grid Poisson operator with G=0 omitted, whereas the
+exchange fitting benchmark may use an explicit Fourier-body cutoff; these
+operator domains require separate comparisons.
 
 At interpolation points define
 
@@ -66,8 +108,10 @@ float64 positions, including lattice images, through symmetry transport, fitting
 fingerprints and restart receipts. A fractional ζ header stores `r_mu_crystal`
 and its coordinate kind and omits `r_mu_fft_idx`. Integer Bloch wraps refer to
 the original physical positions. The smooth samples are evaluated from the
-resident Fourier rows at those positions before reconstruction and the common
-full-WFN factor A. A rounded FFT gather would consume a different orbital map.
+resident Fourier rows at those positions. In full-WFN mode the complete factor
+A acts on the reciprocal rows and atomic coefficients first, so only the
+public band columns need the sample DFT. All available bands still enter the
+overlap and rotation. A rounded FFT gather would consume a different orbital map.
 The current admission is augmented charge fitting; an unsupported FFT-only
 refitting consumer refuses this basis explicitly.
 
@@ -238,6 +282,27 @@ Their loader binds atomic payload and metadata, quadrature and support controls,
 and the exact normalized-lift owner sources. An explicit missing or mismatched
 cache refuses; it never silently rebuilds. One-time atomic preparation and
 cache generation are reported separately from recurring fitting time.
+
+Normalized species caches use the explicit compact-field descriptor and
+source-bound v2 schema. Raw Hankel arrays remain preparation/tail evidence;
+the served lower field comes from the upper gradient. Served overlap caches
+also use v2: GL10 integrates the Hermite/taper products, with cell splits at
+the taper and support boundaries, and the lower Fourier row follows the same
+upper row through σ·K. Old or mismatched artifacts refuse. Prepared served
+species and raw-parent overlaps are required for full-WFN normalization even
+when auxiliary monopole enrichment is disabled.
+
+Preparation uses two allocated-compute commands. First,
+`tools/generate_augmentation_cache.py --manifest DIR --output NEW_DIR
+--served-moments` creates normalized and species served artifacts. Merge its
+emitted patches into the existing `cache` and `served_moments` dictionaries.
+Then `tools/generate_raw_parent_moments.py --manifest DIR --wfn WFN.h5
+--output NEW_DIR` computes unrotated overlaps on every physical band, with raw
+parent blocks distributed across the processes, and emits the raw-parent
+file/hash patch. The preparation reader skips only the not-yet-created raw
+artifact; fitting always uses the complete strict reader. The public raw
+producer checks a bounded independent host contraction and strict reload.
+Preparation costs are separate from the recurring fitting stage.
 
 An independent optional pair, `cache.local_coulomb_fourier_file` and
 `cache.local_coulomb_fourier_sha256`, supplies a prepared reciprocal table for

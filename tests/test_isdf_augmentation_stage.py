@@ -36,7 +36,8 @@ def _blocked_point_sample_reference(mesh,pc,bc,npoint,g_block,fft_points):
         out_specs=P(None,'x',None,'y'),check_vma=False))
 
 
-def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_chunk=4, onsite_cross=False):
+def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_chunk=4, onsite_cross=False,
+                             supplied_artifact=False):
     from types import SimpleNamespace
     import numpy as np
     import jax
@@ -100,7 +101,8 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     artifact = dict(tables={47:data},identity='planted-stage',
         radial=dict(radius=[.06,.16,.34,.61],weights_dr=[.1,.2,.3,.2],support_radius=1.1),
         angular=dict(lebedev_order=5,lmax=2,orthogonality_tolerance=2e-12),
-        cache=dict(momentum_max=60.,momentum_points=512,radius_max=2.,radius_points=512,tail_relative_tolerance=1.),
+        cache=dict(momentum_max=60.,momentum_points=512,radius_max=2.,radius_points=512,
+                   taper_start=.7,tail_relative_tolerance=1.),
         runtime=dict(parent_chunk=1,band_chunk=band_chunk,radial_packet=2,g_block=3))
     fitting_bands = 4 if overlap else logical_bands
     if overlap:
@@ -113,7 +115,15 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     # provenance has separate source/payload negative tests. This oracle
     # targets the complete distributed stage rather than regenerating ONCV.
     original = aug.read_augmentation_manifest
-    aug.read_augmentation_manifest = lambda directory: artifact
+    read_count = 0
+    def read_fixture(directory):
+        nonlocal read_count
+        read_count += 1
+        if supplied_artifact:
+            raise AssertionError('the same authenticated artifact must not be reread')
+        return artifact
+    aug.read_augmentation_manifest = read_fixture
+    artifact_argument = {'artifact':artifact} if supplied_artifact else {}
     meta = SimpleNamespace(nspinor=4,cell_volume=12**3,n_rtot=np.prod(grid),fft_grid=grid,
                            nk_tot=3,kgrid=kgrid,b_id_4_user=fitting_bands)
     wfn = SimpleNamespace(alat=1.,avec=lattice,blat=1.,bvec=reciprocal,
@@ -127,6 +137,36 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     parent_faces = (put(packed_mu[:,:logical_bands],P(None,'x',None,'y')),
                     put(packed_mu[:,:logical_bands].transpose(0,2,3,1),P(None,None,'x','y')))
     source_device = put(source,P(None,None,None,('x','y')))
+    caches,_ = aug._normalized_caches(artifact['tables'],artifact['cache'],1.1)
+    artifact['normalized_caches'] = caches
+    served_D = served_B = None
+    from isdf import atomic_moments
+    original_binding = atomic_moments.raw_parent_moment_binding
+    if overlap:
+        from isdf.atomic_moments import build_served_overlap_cache,served_overlap_table
+        served_cache = build_served_overlap_cache(caches[47],support_radius=1.1,
+            momentum_max=float(np.linalg.norm(K,axis=-1).max())*(1+1e-12),momentum_points=1025)
+        served_D = np.stack([np.einsum('isg,nsg->ni',served_overlap_table(served_cache,K[p],
+            center_cart=center[0] @ lattice,cell_volume=meta.cell_volume),source[p]) for p in range(npar)])
+        served_B = served_cache['B']
+        fixture_binding = {'oracle':'planted-full-four-spinor-source'}
+        artifact['served_moment_caches'] = {47:served_cache}
+        artifact['served_moments'] = {'species_sha256':{'47':'planted-served-source'}}
+        artifact['raw_parent_moments'] = dict(atom_D=[served_D[:,:logical_bands]],
+            metadata={'binding':fixture_binding})
+        def planted_binding(bound_wfn,**inputs):
+            assert bound_wfn is wfn and inputs['physical_bands'] == logical_bands
+            assert np.array_equal(inputs['k_parent_frac'],kfrac)
+            assert np.array_equal(inputs['gvecs'],gv)
+            assert np.array_equal(inputs['ngk_valid'],np.full(npar,valid_g))
+            assert np.array_equal(inputs['centers_cart'],center @ lattice)
+            assert np.array_equal(inputs['atom_types'],np.array([47]))
+            assert inputs['cell_volume'] == meta.cell_volume
+            assert inputs['served_cache_sha256_by_species'] == {'47':'planted-served-source'}
+            return fixture_binding
+        # The distributed stage consumes authenticated preparation output;
+        # actual WFN source/owner bindings have independent artifact tests.
+        atomic_moments.raw_parent_moment_binding = planted_binding
     phase_K = K.copy();phase_K[:,valid_g:] = 0.
     K_dev,points_dev,live_dev = (put(phase_K,P(None,('x','y'),None)),
         put(mu_coordinates @ lattice,P()),put(np.ones(len(mu_coordinates)),P()))
@@ -137,6 +177,20 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     new_sample = np.asarray(gather_to_host(hoisted(source_device,phase,live_dev)))
     phase_error = float(np.linalg.norm(new_sample-old_sample)/np.linalg.norm(old_sample))
     assert phase_error < 2e-14,phase_error
+    # Linear public-column rotation must precede the smaller DFT without
+    # losing any full-window input row or exposing real source columns as
+    # public ghost bands. The independent reference samples all eight rows.
+    probe_factor = (rng.normal(size=(npar,nb,nb))+1j*rng.normal(size=(npar,nb,nb)))/np.sqrt(nb)
+    rotated_g = aug._band_rotation_kernel(mesh,npar,'source',4,0,3)(source_device,put(probe_factor,P()))
+    sampled_public = np.asarray(gather_to_host(aug._smooth_point_faces(
+        rotated_g,phase_K,mu_coordinates,np.ones(len(mu_coordinates),dtype=bool),mesh,
+        lattice=lattice,parent_chunk=npar,band_chunk=4,g_block=3,fft_points=meta.n_rtot)))
+    sampled_then_rotated = np.einsum('pmn,pmsu->pnsu',probe_factor[...,:4],old_sample)
+    sampled_then_rotated[:,3:] = 0.
+    public_sample_error = float(np.linalg.norm(sampled_public-sampled_then_rotated)
+                               /np.linalg.norm(sampled_then_rotated))
+    assert public_sample_error < 2e-14,public_sample_error
+    assert np.max(abs(sampled_public[:,3:])) == 0.,'public pad must not expose source band four'
     placement_error = 0.
     if overlap:
         from psp.augmented_samples import build_projection_radial_cache
@@ -162,7 +216,23 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
             plan=plan,centroid_indices=centroid_coordinates,parent_psi=parent_psi,
             parent_faces=None if fractional else parent_faces,
             band_range_left=(0,2),band_range_right=(1,fitting_bands),write_ibz_only=False,
-            public_band_range=(0,logical_bands))
+            public_band_range=(0,logical_bands),**artifact_argument)
+        assert read_count == (0 if supplied_artifact else 1)
+        if overlap:
+            import pytest
+            assert state['prepared_served_overlap_host_bytes_per_process'] == served_D[:,:logical_bands].nbytes
+            assert 'monopole_rhs' not in state, 'served overlap admission must not enable monopole enrichment'
+            saved_binding = artifact['raw_parent_moments']['metadata']['binding']
+            artifact['raw_parent_moments']['metadata']['binding'] = {'oracle':'different-source'}
+            try:
+                with pytest.raises(ValueError,match='raw served-moment cache disagrees'):
+                    aug.prepare_augmentation(wfn=wfn,sym=sym,meta=meta,cfg=cfg,mesh_xy=mesh,
+                        plan=plan,centroid_indices=centroid_coordinates,parent_psi=parent_psi,
+                        parent_faces=None if fractional else parent_faces,
+                        band_range_left=(0,2),band_range_right=(1,fitting_bands),write_ibz_only=False,
+                        public_band_range=(0,logical_bands),**artifact_argument)
+            finally:
+                artifact['raw_parent_moments']['metadata']['binding'] = saved_binding
         memory_refusal = False
         if not overlap and not fractional:
             import pytest
@@ -183,25 +253,22 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
                         plan=plan,centroid_indices=centroid_coordinates,parent_psi=parent_psi,
                         parent_faces=parent_faces,band_range_left=(0,2),
                         band_range_right=(1,fitting_bands),write_ibz_only=False,
-                        public_band_range=(0,logical_bands))
+                        public_band_range=(0,logical_bands),**artifact_argument)
                 assert len(warnings) == 1 and warnings[0][1] > budget
                 memory_refusal = True
             finally:
                 gpu_utils.device_budget_bytes,gpu_utils.warn_over_budget = old_budget,old_warn
     finally:
         aug.read_augmentation_manifest = original
+        atomic_moments.raw_parent_moment_binding = original_binding
     got_faces = tuple(np.asarray(gather_to_host(x)) for x in faces)
     got_rhs = np.asarray(gather_to_host(state['rhs']))
     assert np.array_equal(np.asarray(gather_to_host(source_device)),source), 'smooth source changed/donated'
-    caches,_ = aug._normalized_caches(artifact['tables'],artifact['cache'],1.1)
     coefficients = np.stack([np.einsum('isg,nsg->ni',atomic_projection_table(data,K[p],
         center_cart=center[0] @ lattice,cell_volume=meta.cell_volume,normalized_rkb_source=True),source[p,:,:2])
         for p in range(npar)])
     if overlap:
-        D = np.stack([np.einsum('isg,nsg->ni',atomic_delta_overlap_table(data,K[p],
-            center_cart=center[0] @ lattice,cell_volume=meta.cell_volume,normalized_rkb_source=True),source[p,:,:2])
-            for p in range(npar)])
-        B = atomic_delta_gram(data)
+        D,B = served_D,served_B
         S = np.einsum('pnsg,pmsg->pnm',source.conj(),source)
         cross = np.einsum('pni,pmi->pnm',D.conj(),coefficients)
         S += cross+cross.conj().transpose(0,2,1)+np.einsum('pni,ij,pmj->pnm',coefficients.conj(),B,coefficients)
@@ -220,6 +287,9 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
         assert np.max(abs(rotated_source[:,fitting_bands:])) == 0., 'public face and G transport pads must be zero'
         assert np.max(abs(state['overlap_receipt']['inverse_sqrt']-A_full)) < 3e-13
         assert np.max(state['overlap_receipt']['factor_isometry_error']) < 3e-13
+        assert state['overlap_receipt']['overlap_operator'] == 'actual_served_four_spinor'
+        assert np.max(abs(state['overlap_receipt']['delta_overlaps'][0]-D)) < 3e-14
+        assert np.array_equal(state['overlap_receipt']['atomic_delta_grams'][0],B)
         assert np.max(abs(A[:,:fitting_bands,fitting_bands:])) > .01, 'full-WFN factor must mix discarded fitting bands'
         # A finite fitting-only factor is a deliberately different model.
         e,v = np.linalg.eigh(S[:,:fitting_bands,:fitting_bands])
@@ -312,14 +382,17 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     receipt['live_local_rhs_memory_budget_refused'] = memory_refusal
     receipt['q_selection_before_angular_projection_relative_error'] = q_selection_error
     receipt['hoisted_phase_vs_incumbent_blocked_dft_relative_error'] = phase_error
+    receipt['post_rotation_public_dft_relative_error'] = public_sample_error
     if overlap:
-        receipt['maximum_restored_native_gram_error'] = float(np.max(state['overlap_receipt']['factor_isometry_error']))
+        receipt['maximum_restored_served_gram_error'] = float(np.max(state['overlap_receipt']['factor_isometry_error']))
+        receipt['overlap_operator'] = state['overlap_receipt']['overlap_operator']
         receipt['full_physical_bands'] = logical_bands
         receipt['fitting_bands'] = fitting_bands
         receipt['maximum_shard_native_fourier_table_error'] = placement_error
         receipt['nontrim_parent_and_dead_G_table_control'] = True
     receipt['maximum_norm_diagnostic_absolute_error'] = norm_error
     receipt['onsite_smooth_rhs_relative_error'] = smooth_rhs_error
+    receipt['authenticated_artifact_reused_without_read'] = supplied_artifact
     if jax.process_index() == 0:
         print(json.dumps(receipt),flush=True)
         out = os.environ.get('AUGMENTATION_STAGE_REPORT')
@@ -337,5 +410,7 @@ if __name__ == '__main__':
         check_augmentation_stage(runtime,overlap=True,fractional=True)
         check_augmentation_stage(runtime,overlap=True,fractional=True,band_chunk=8)
         check_augmentation_stage(runtime,overlap=True,fractional=True,band_chunk=8,onsite_cross=True)
+        check_augmentation_stage(runtime,overlap=True,fractional=True,band_chunk=8,onsite_cross=True,
+                                 supplied_artifact=True)
         return 0
     run_main_and_finalize(main)
