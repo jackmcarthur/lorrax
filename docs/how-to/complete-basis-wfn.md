@@ -1,9 +1,12 @@
 # A complete-basis WFN from the dense H_k
 
 `psp.run_dense_h` rebuilds the Kohn–Sham Hamiltonian of a QE run as a dense
-matrix on each k's whole plane-wave sphere, diagonalizes it completely, and
-writes every band as a `WFN.h5`. The result is a drop-in WFN whose band sum is
-complete.
+matrix on each k's whole plane-wave sphere and diagonalizes it completely.
+Its drop-in rectangular `WFN.h5` retains the smallest native dimension at
+every k. That band sum is complete only when every native dimension is
+equal. `--spectrum-output PATH` additionally preserves all eigenpairs in
+the source-bound ragged native reference archive; that archive is not a
+production WFN replacement.
 
 ## What it builds
 
@@ -16,6 +19,15 @@ from the SCF density of the `.save` (`psp.scf_potential.build_dft_potentials`).
 On a noncollinear magnetic run $V_{xc} = v\,\delta + B\cdot\sigma$ from ρ and m
 (`psp.xc.compute_V_xc_noncollinear`), in QE's general noncollinear GGA branch,
 with gradients kept on the density sphere $|G|^2 \le E_\mathrm{rho}$.
+
+The PBE registry supplies separate exchange and correlation components to
+this magnetic potential owner. Exchange gradient corrections use each
+spin-density channel; correlation uses the total charge gradient. A varying
+magnetization can therefore produce an exchange field even at uniform
+charge. The public combined polarized PBE callable still uses the same
+generated kernels. The scalar potential route is unchanged. Analytic and
+directional derivative controls test this gate, while a particular native
+QE density still needs its own matched operator/FFT/core check.
 
 - **Operator.** `psp.dft_operators.dense_matrix_k` applies
   `apply_H_k_batched`, the Davidson route's operator, to the unit basis. H is
@@ -31,8 +43,14 @@ with gradients kept on the density sphere $|G|^2 \le E_\mathrm{rho}$.
 - **Output.** `file_io.qp_wfn.write_complete_wfn_h5` writes
   `min_k nspinor·ngk(k)` bands through SlabIO. The file keeps the source's
   k-set, symmetry, G-lists and occupations (zero past the source's last band).
-  The root carries `lorrax_complete_basis_wfn` (the band count),
+  The root carries `lorrax_complete_basis_wfn` only if all native dimensions
+  equal the written extent; otherwise the crop is explicitly recorded,
   `dense_h_source_wfn` and `dense_h_qe_save`.
+- **Native reference.** `--spectrum-output` writes every native eigenpair,
+  paired source G lists, per-k dimensions and residual/orthogonality checks,
+  source SHA bindings and finalization/commit guards. The reference reader
+  retains an explicit per-k band-validity mask when constructing a padded
+  numerical carrier. Ghost coefficients and occupations must be zero.
 - **One calculation.** `CrystalData.validate_against_wfn` checks the `.save`
   against the WFN header (cell, atoms, electron count, spinors, FFT grid,
   symmetries), and each k's ecutwfc sphere must hold the WFN's `ngk`.

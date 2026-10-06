@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — magnetic PBE retains spin gradients at uniform total charge
+
+The reconstructed noncollinear PBE potential now gates exchange gradients
+on each spin-density channel and correlation gradients on total charge.
+Previously one total-charge-gradient gate suppressed both components,
+including the exchange field of a varying magnetization at constant charge.
+The generated PBE kernels, scalar potential path and public combined PBE
+functional remain the same owners. Magnetic reconstructed Hamiltonians,
+kin_ion/Vxc and dense spectra can change; regenerate them before comparing
+new magnetic results. No deck migration is needed. This fixes the analytic
+spin-gradient gate; agreement with a particular native QE magnetic density
+and its FFT/core representation still requires a matched operator control.
+
 ## 2026-10-06 — optional physical-band validity for ragged native references
 
 `gw.wavefunction_bundle.Wavefunctions.valid_kn` optionally carries replicated

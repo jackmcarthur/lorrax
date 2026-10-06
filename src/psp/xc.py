@@ -66,23 +66,37 @@ def pbe_functional():
 def pbe_functional_polarized():
     """Spin-polarized PBE.  Returns ``eps_xc(rho_up, rho_dn, s_uu, s_ud, s_dd)``
     in Ry per electron, ``s_ab = ∇ρ_a·∇ρ_b`` (libxc's σ ordering)."""
+    exchange, correlation = pbe_functional_polarized_components()
+
+    def eps_xc(ru, rd, suu, sud, sdd):
+        return exchange(ru, rd, suu, sud, sdd) + correlation(ru, rd, suu, sud, sdd)
+
+    return eps_xc
+
+
+def pbe_functional_polarized_components():
+    """PBE exchange/correlation callables for their distinct QE GGA gates.
+
+    The same generated kernels and parameters own both the combined public
+    functional and these components. No second XC backend is selected.
+    """
     from jax_xc.impl import gga_x_pbe, gga_c_pbe
     from jax_xc.utils import get_p
 
     exchange = get_p("gga_x_pbe", True)
     correlation = get_p("gga_c_pbe", True)
 
-    def scalar_eps(ru, rd, suu, sud, sdd):
-        r, sig = (ru, rd), (suu, sud, sdd)
-        return 2.0 * (gga_x_pbe.pol(exchange, r, sig)
-                      + gga_c_pbe.pol(correlation, r, sig))
+    def component(kernel, parameters):
+        def scalar(ru, rd, suu, sud, sdd):
+            return 2.0 * kernel(parameters, (ru, rd), (suu, sud, sdd))
 
-    def eps_xc(ru, rd, suu, sud, sdd):
-        args = jnp.broadcast_arrays(ru, rd, suu, sud, sdd)
-        flat = [a.reshape(-1) for a in args]
-        return jax.vmap(scalar_eps)(*flat).reshape(args[0].shape)
+        def eps(ru, rd, suu, sud, sdd):
+            args = jnp.broadcast_arrays(ru, rd, suu, sud, sdd)
+            return jax.vmap(scalar)(*[a.reshape(-1) for a in args]).reshape(args[0].shape)
 
-    return eps_xc
+        return eps
+
+    return component(gga_x_pbe.pol, exchange), component(gga_c_pbe.pol, correlation)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -214,7 +228,7 @@ def _vxc_mgga(rho, rho_raw, sigma, tau, rho_G, G_cart, xc_fn):
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn,
-                              ecutrho):
+                              ecutrho, *, xc_components=None):
     """V_xc^{αβ}(r) = v(r) δ_αβ + B(r)·σ_αβ from ρ and m for a spin-polarized GGA.
 
     The local-frame construction QE uses with ``lsign = .false.`` (the general
@@ -232,8 +246,11 @@ def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn,
         v = (v_↑ + v_↓)/2,     B = (v_↑ − v_↓)/2 · m/|m|,
 
     i.e. B_i = δE_xc/δm_i, exact because E depends on m only through the
-    field |m|.  Gradient terms are dropped where ρ ≤ 1e-6 or |∇ρ|² ≤ 1e-10
-    (the scalar route's QE thresholds); B = 0 where |m| ≤ 1e-20.
+    field |m|. PBE's explicit ``xc_components=(exchange, correlation)``
+    separates QE's channel exchange gates from its total-gradient
+    correlation gate. The generic callable path keeps spin-gradient
+    support even when the total-charge gradient vanishes. B = 0 where
+    |m| ≤ 1e-20.
 
     Every gradient and divergence keeps only the density sphere
     |G|² ≤ ``ecutrho`` (QE's ``fft_gradient_g2r``/``fft_graddot`` act on the
@@ -243,7 +260,8 @@ def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn,
 
     Parameters: ``rho_total`` (nx,ny,nz), ``rho_G_total`` its complex FFT,
     ``mag`` (3,nx,ny,nz) m in the same density units, ``G_cart``
-    (nx,ny,nz,3), ``xc_fn`` from :func:`pbe_functional_polarized`.
+    (nx,ny,nz,3), ``xc_fn`` a combined functional, or ``None`` when
+    explicit components come from :func:`pbe_functional_polarized_components`.
     Returns ``(v, B)`` in Ry, shapes (nx,ny,nz) and (3,nx,ny,nz).
     """
     rho = jnp.maximum(rho_total, 1e-10)
@@ -261,18 +279,36 @@ def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn,
     sud = sum(a * b for a, b in zip(gu, gd))
     sdd = sum(b * b for b in gd)
 
-    def energy(ru_, rd_, suu_, sud_, sdd_):
-        return jnp.sum((ru_ + rd_) * xc_fn(ru_, rd_, suu_, sud_, sdd_))
-
     zero = jnp.zeros_like(rho)
-    lda_u, lda_d = jax.grad(energy, argnums=(0, 1))(ru, rd, zero, zero, zero)
-    f_u, f_d, f_uu, f_ud, f_dd = jax.grad(energy, argnums=(0, 1, 2, 3, 4))(
-        ru, rd, suu, sud, sdd)
-    sigma = sum(a * a for a in grad_rho)
-    active = (rho_total > 1e-6) & (sigma > 1e-10)
-    f_u = jnp.where(active, f_u, lda_u)
-    f_d = jnp.where(active, f_d, lda_d)
-    f_uu, f_ud, f_dd = (jnp.where(active, x, 0.0) for x in (f_uu, f_ud, f_dd))
+
+    def derivatives(functional):
+        def energy(ru_, rd_, suu_, sud_, sdd_):
+            return jnp.sum((ru_ + rd_) * functional(ru_, rd_, suu_, sud_, sdd_))
+
+        lda = jax.grad(energy, argnums=(0, 1))(ru, rd, zero, zero, zero)
+        full = jax.grad(energy, argnums=(0, 1, 2, 3, 4))(ru, rd, suu, sud, sdd)
+        return lda, full
+
+    if xc_components is None:
+        lda, full = derivatives(xc_fn)
+        active = (rho_total > 1e-6) & ((suu + sdd) > 1e-10)
+        f_u, f_d = (jnp.where(active, full[i], lda[i]) for i in (0, 1))
+        f_uu, f_ud, f_dd = (jnp.where(active, x, 0.) for x in full[2:])
+    else:
+        exchange, correlation = xc_components
+        lda_x, full_x = derivatives(exchange)
+        lda_c, full_c = derivatives(correlation)
+        # QE7.5 gcx_spin: each density/gradient channel must exceed 1e-10.
+        # gcc_spin: rho and |grad rho| must exceed rho_threshold_gga=1e-6.
+        active_u = (rho_total > 1e-10) & (ru > 1e-10) & (suu > 1e-20)
+        active_d = (rho_total > 1e-10) & (rd > 1e-10) & (sdd > 1e-20)
+        sigma = sum(a * a for a in grad_rho)
+        active_c = (rho_total > 1e-6) & (sigma > 1e-12) & (amag <= rho)
+        f_u = jnp.where(active_u, full_x[0], lda_x[0]) + jnp.where(active_c, full_c[0], lda_c[0])
+        f_d = jnp.where(active_d, full_x[1], lda_x[1]) + jnp.where(active_c, full_c[1], lda_c[1])
+        f_uu = jnp.where(active_u, full_x[2], 0.) + jnp.where(active_c, full_c[2], 0.)
+        f_ud = jnp.where(active_u | active_d, full_x[3], 0.) + jnp.where(active_c, full_c[3], 0.)
+        f_dd = jnp.where(active_d, full_x[4], 0.) + jnp.where(active_c, full_c[4], 0.)
 
     def divergence(field):
         out = jnp.zeros_like(rho)

@@ -573,7 +573,7 @@ def compute_V_H_and_V_xc_noncollinear(
     ``mag`` is m(r) (3, nx, ny, nz) in ρ's units; ρ_core enters ρ only.
     Returns ``(V_H_r, v_xc_r, B_xc_r)``; see :func:`psp.xc.compute_V_xc_noncollinear`.
     """
-    from psp.xc import compute_V_xc_noncollinear, pbe_functional_polarized
+    from psp.xc import compute_V_xc_noncollinear, pbe_functional_polarized_components
 
     rho_G_ortho = local_fftn3(rho_val, norm='ortho')
     V_H_r = jnp.real(poisson_potential_from_rhoG(
@@ -581,9 +581,10 @@ def compute_V_H_and_V_xc_noncollinear(
     rho_total = rho_val + rho_core
     rho_core_gridded = jnp.real(local_ifftn3(rhog_core))
     rho_G_total = local_fftn3(rho_total - rho_core_gridded) + rhog_core
+    exchange, correlation = pbe_functional_polarized_components()
     v_xc, B_xc = compute_V_xc_noncollinear(
-        rho_total, rho_G_total, mag, G_cart, pbe_functional_polarized(),
-        ecutrho)
+        rho_total, rho_G_total, mag, G_cart, None,
+        ecutrho, xc_components=(exchange, correlation))
     return V_H_r, v_xc, B_xc
 
 
