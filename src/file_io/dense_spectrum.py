@@ -18,6 +18,7 @@ import h5py
 import numpy as np
 
 from .slab_io import SlabIO
+from .commit_state import COMMIT_STATE, assert_committed
 
 
 SCHEMA = "lorrax.dense-native-spectrum.v1"
@@ -42,10 +43,14 @@ def _text(value):
 def _read_metadata(path):
     """Only metadata/eigenvalue vectors; never coefficient payloads."""
     with h5py.File(path, "r") as handle:
+        if COMMIT_STATE not in handle or handle[COMMIT_STATE].shape != (1,):
+            _refuse("new native archive misses the canonical length-one commit dataset")
+        assert_committed(handle, path=str(path))
         attrs = dict(handle.attrs)
         names = ("ngk", "basis_dimensions", "kpoints_crystal", "kweights",
                  "kgrid", "source_occupations", "num_electrons")
         data = {name: np.asarray(handle[name]) for name in names}
+        data["io_committed"] = int(handle[COMMIT_STATE][0])
         parents = []
         for ik in range(len(data["ngk"])):
             group = handle[f"k{ik:05d}"]
@@ -116,7 +121,7 @@ class DenseSpectrumReader:
             _refuse(f"archive metadata/groups could not be authenticated: {error}")
         if (_text(attrs.get("schema", "")) != SCHEMA
                 or attrs.get("finalized") != 1 or attrs.get("complete_native_basis") != 1
-                or attrs.get("lorrax_io_committed") != 1):
+                or data.get("io_committed") != 1):
             _refuse("archive is not finalized, committed, and complete")
         if (_text(attrs.get("energy_units", "")) != "Ry"
                 or _text(attrs.get("coefficient_convention", ""))

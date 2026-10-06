@@ -7,10 +7,13 @@ from pathlib import Path
 from types import SimpleNamespace
 import json
 
+import h5py
 import numpy as np
 import pytest
 
 from file_io import dense_spectrum as ds
+
+_ORIGINAL_READ_METADATA = ds._read_metadata
 
 
 class _Source:
@@ -47,14 +50,14 @@ def archive(monkeypatch):
     for name in ("data-file-schema.xml", "charge-density.hdf5", "Si.upf", "run_dense_h.py", "qp_wfn.py"):
         bindings[f"/bounded/source/{name}"] = "1" * 64
     attrs = dict(schema=ds.SCHEMA, finalized=1, complete_native_basis=1,
-                 lorrax_io_committed=1, nspinor=1, energy_units="Ry",
+                 nspinor=1, energy_units="Ry",
                  coefficient_convention="band,spinor,source-QE-G,real-imag",
                  dense_h_source_wfn=source.path,
                  source_sha256_bindings=json.dumps(bindings))
     data = dict(ngk=source.ngk_valid(k="ibz"), basis_dimensions=np.asarray([2, 3]),
                 kpoints_crystal=source.kpoints.copy(), kweights=source.kweights.copy(),
                 kgrid=source.kgrid.copy(), source_occupations=source.occs.copy(),
-                num_electrons=np.asarray(source.num_electrons))
+                num_electrons=np.asarray(source.num_electrons), io_committed=1)
     parents = [dict(energies_ry=np.arange(parent + 2, dtype=float),
                     gvecs=source.get_gvec_nk(parent), checks=np.zeros(3),
                     coefficient_shape=(parent + 2, 1, parent + 2, 2),
@@ -82,10 +85,16 @@ def test_native_dimensions_survive_and_reader_owns_only_archive(archive):
     reader.close()
 
 
-@pytest.mark.parametrize("attribute", ["finalized", "complete_native_basis", "lorrax_io_committed"])
+@pytest.mark.parametrize("attribute", ["finalized", "complete_native_basis"])
 def test_incomplete_archive_is_refused_before_transport(archive, attribute):
     archive[1][attribute] = 0
     with pytest.raises(ValueError, match="finalized"):
+        _open(archive)
+
+
+def test_uncommitted_dataset_metadata_refuses(archive):
+    archive[2]["io_committed"] = 0
+    with pytest.raises(ValueError, match="committed"):
         _open(archive)
 
 
@@ -133,6 +142,41 @@ def test_missing_native_group_is_a_named_refusal(archive, monkeypatch):
     monkeypatch.setattr(ds, "_read_metadata", missing)
     with pytest.raises(ValueError, match="metadata/groups.*k00001"):
         _open(archive)
+
+
+@pytest.mark.parametrize("layout", ["attribute_only", "dataset_zero", "wrong_dataset_shape"])
+def test_actual_hdf5_commit_layout_negative_controls(tmp_path, layout):
+    path = tmp_path / "native_layout.h5"
+    with h5py.File(path, "w") as handle:
+        # This deliberately reproduces the original faulty synthetic fixture.
+        handle.attrs["lorrax_io_committed"] = 1
+        if layout == "dataset_zero":
+            handle.create_dataset("lorrax_io_committed", data=np.asarray([0], np.int32))
+        elif layout == "wrong_dataset_shape":
+            handle.create_dataset("lorrax_io_committed", data=np.asarray(1, np.int32))
+    with pytest.raises(ValueError, match="commit"):
+        ds._read_metadata(path)
+
+
+def test_actual_hdf5_dataset_receipt_is_read(archive, tmp_path):
+    path = tmp_path / "native_complete.h5"
+    _, attrs, data, parents = archive
+    with h5py.File(path, "w") as handle:
+        for key, value in attrs.items():
+            handle.attrs[key] = value
+        handle.create_dataset("lorrax_io_committed", data=np.asarray([1], np.int32))
+        for key, value in data.items():
+            if key != "io_committed":
+                handle.create_dataset(key, data=value)
+        for ik, parent in enumerate(parents):
+            group = handle.create_group(f"k{ik:05d}")
+            for key in ("energies_ry", "gvecs", "checks"):
+                group.create_dataset(key, data=parent[key])
+            group.create_dataset("coefficients", shape=parent["coefficient_shape"], dtype=np.float64)
+    # The fixture stubs metadata at the resource guard. Read this real file
+    # with the original metadata owner to exercise the actual disk layout.
+    _, actual_data, _ = _ORIGINAL_READ_METADATA(path)
+    assert actual_data["io_committed"] == 1
 
 
 def test_ragged_tile_masks_do_not_invent_high_empty_bands():

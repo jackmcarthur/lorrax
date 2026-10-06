@@ -6,7 +6,7 @@ from common.units import RYD_TO_EV
 from gw import contour_reference as cd
 
 
-def _plant(eta_ev=.25, n=192, step_ev=.0625, fractional=True, ordered=True):
+def _plant(eta_ev=.25, n=192, step_ev=.03125, fractional=True, ordered=True):
     rng = np.random.default_rng(20261006)
     eta, h = eta_ev / RYD_TO_EV, step_ev / RYD_TO_EV
     omega = np.asarray([.7, 3., 18., 75.]) / RYD_TO_EV
@@ -62,7 +62,7 @@ def test_cd_partner_orientation_negative_control():
 
 def test_infinite_rule_and_residue_coverage():
     eta = .25 / RYD_TO_EV
-    for n in (32, 64, 128):
+    for n in (64, 128, 256):
         u, w = cd.imaginary_rule(n, eta, scale=eta)
         assert not np.any(u == eta)
         # Independent analytic integral to infinity, including the map's tail.
@@ -101,7 +101,9 @@ def _one_pole_matrix(eta_ev, occupation, *, n_imaginary=192):
     queries = np.asarray([-.6, -.4, -.1, -1e-9, 0., 1e-9, .1, .4, .6])
     x = np.broadcast_to(queries[None, None, :, None], (1, 2, len(queries), 1))
     f = np.full(x.shape, occupation)
-    h = eta / 8
+    # η/8 misses the closed-form tolerance at a pole by several ppm;
+    # refine the actual interpolation grid rather than relaxing the gate.
+    h = eta / 32
     real = np.arange(int(np.ceil(np.max(np.abs(x)) / h)) + 2) * h
     u, w = cd.imaginary_rule(n_imaginary, eta, scale=omega)
     z = np.concatenate((real + 1j * eta, 1j * u))

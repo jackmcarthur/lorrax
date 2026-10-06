@@ -3506,19 +3506,31 @@ def _fractional_pair_scan_face(
             (ga[:, None] < int(nb_logical)) & (gb[None, :] < int(nb_logical))
         )[None, :, :]
         weights = jnp.where(logical[None, :, :, :], weights, 0.0)
-        density_x = jnp.einsum(
-            "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
-        density_y = jnp.einsum(
-            "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
-        if ordered:
-            # Physical orientation: rows at -q (b rolled to k+q by the
-            # caller) with the conjugation on the mu density; see docstring.
+        def contract(_):
+            density_x = jnp.einsum(
+                "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
+            density_y = jnp.einsum(
+                "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
+            if ordered:
+                # Physical orientation: rows at -q (b rolled to k+q by the
+                # caller) with the conjugation on mu; see docstring.
+                return jnp.einsum(
+                    "zkab,kmab,knab->zmn", weights, jnp.conj(density_x),
+                    density_y, optimize=True)
             return jnp.einsum(
-                "zkab,kmab,knab->zmn", weights, jnp.conj(density_x),
-                density_y, optimize=True)
-        return jnp.einsum(
-            "zkab,kmab,knab->zmn", weights, density_x, jnp.conj(density_y),
-            optimize=True)
+                "zkab,kmab,knab->zmn", weights, density_x, jnp.conj(density_y),
+                optimize=True)
+
+        if with_derivative:
+            # The complete-band reference has many occupied/occupied and
+            # empty/empty tiles with exactly zero df. Replicated scalar
+            # metadata makes every rank take the same branch. The default
+            # production sample retains its existing unconditional program.
+            live = jnp.any((df != 0) & logical)
+            return jax.lax.cond(live, contract,
+                lambda _: jnp.zeros((weights.shape[0], nmu_x_loc, nmu_y_loc), jnp.complex128),
+                operand=None)
+        return contract(None)
 
     zero = jnp.zeros((z.size * (2 if with_derivative else 1), nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
 
