@@ -108,6 +108,23 @@ def support_envelope_ev(energy_relative_ev, requested_kn, pad_ev):
             float(np.max(energy[requested])) + float(pad_ev))
 
 
+def requested_reads_ev(energy_relative_ev, requested_kn, step_ev, pad_ev=SUPPORT_PAD_EV):
+    """The energies at which the requested states read Sigma, ``E - mu`` (eV), 1-D.
+
+    Each requested state's input energy at every offset of ``[-pad, +pad]`` on the
+    Sigma step: the frequencies the plan pads around it.  The one source of where
+    W's line supports must hold (``shared_pole_recipe.support_rule_line_sites``);
+    the caller passes its own requested mask (one-shot or SC map), so neither
+    path's semicore rule is decided here.  Empty when nothing is requested.
+    """
+    energy = np.asarray(energy_relative_ev, dtype=np.float64)
+    requested = np.broadcast_to(np.asarray(requested_kn, dtype=bool), energy.shape)
+    step, pad = float(step_ev), float(pad_ev)
+    offsets = step * np.arange(-int(np.floor(pad / step + 1e-9)),
+                               int(np.floor(pad / step + 1e-9)) + 1)
+    return (energy[requested][:, None] + offsets[None, :]).ravel()
+
+
 def union_envelope(first, second):
     """The smallest interval holding both envelopes (None is empty)."""
     if first is None:

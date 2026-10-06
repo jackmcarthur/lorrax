@@ -1424,6 +1424,28 @@ def _coarse_runs(base_name, owned, positions, frequencies, omega_eta, omega_grp,
     return pieces, report
 
 
+def support_reads_past(omega_ry, omega_group, support_window_ry):
+    """Sample groups that read Sigma outside W's line support (eV records).
+
+    ``support_window_ry`` is the ``(lo, hi)`` extent of the reads the W line
+    sites were placed for (``shared_pole_recipe`` ``support_reads_ev``, in the
+    ``omega_ry`` frame).  Each sample group (-1 = the near grid, else a coarse
+    window) whose samples leave it reads W where the model extrapolates.
+    """
+    omega = np.asarray(omega_ry, dtype=np.float64)
+    group = (np.full(omega.shape, -1, dtype=np.int64) if omega_group is None
+             else np.asarray(omega_group, dtype=np.int64))
+    lo, hi = (float(v) for v in support_window_ry)
+    tol = 1e-9
+    past = []
+    for g in np.unique(group):
+        w = omega[group == g]
+        if w.min() < lo - tol or w.max() > hi + tol:
+            past.append(dict(group=int(g), samples_ev=[float(w.min() * RYD_TO_EV),
+                                                       float(w.max() * RYD_TO_EV)]))
+    return past
+
+
 def plan_sigma_windows(
     pole_summaries,
     branches,
@@ -1443,6 +1465,8 @@ def plan_sigma_windows(
     omega_eta_ry=None,
     omega_group=None,
     group_fixed=None,
+    support_window_ry=None,
+    support_top_ev=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -1498,6 +1522,12 @@ def plan_sigma_windows(
         ``-X`` in its own coordinate, so the SC plan clips a crossing window's
         inner state pad there.  None (an insulator) leaves the 2 eta pad.
         Used only with ``fixed_rule_session``.
+    support_window_ry, support_top_ev
+        A shared-pole model's line support, read from its header: the reads'
+        extent in the ``omega_ry`` frame and the top line site (eV).  A sample
+        group outside the extent is warned about by name, never refused (the
+        coarse semicore windows sit below it by design); recorded in the
+        geometry as ``support_reads_past``.
     omega_eta_ry, omega_group, group_fixed
         Optional per-frequency broadening (one value >= ``eta_ry`` per
         ``omega_ry`` sample), coarse-window index (-1 = the near grid) and,
@@ -1543,6 +1573,16 @@ def plan_sigma_windows(
       551/579 to 690/831 (+25.23%/+43.52%) without measurable accuracy gain.
     """
     started = time.perf_counter()
+    past = ([] if support_window_ry is None else
+            support_reads_past(omega_ry, omega_group, support_window_ry))
+    for item in past:
+        where = "near grid" if item["group"] < 0 else f"coarse window {item['group']}"
+        print_fn(f"  WARNING Sigma reads past the W line support: {where} samples "
+                 f"[{item['samples_ev'][0]:+.3f}, {item['samples_ev'][1]:+.3f}] eV, line sites "
+                 f"placed for reads [{support_window_ry[0] * RYD_TO_EV:+.3f}, "
+                 f"{support_window_ry[1] * RYD_TO_EV:+.3f}] eV (top site "
+                 f"{float(support_top_ev or float('nan')):.3f} eV); W there is the "
+                 "model's extrapolation")
     eta, tolerance = float(eta_ry), float(eps)
     edge = float(edge_factor)
     if not np.isfinite(eta) or eta <= 0.0:
@@ -1765,6 +1805,7 @@ def plan_sigma_windows(
         for value in np.asarray(row.window.nodes.t)
     }) for report in branch_reports)
     geometry.update({
+        "support_reads_past": past,
         "planner": "uniform_denominator_boxes",
         "eta_ry": eta, "eps": tolerance,
         "rule_eps": tolerance,

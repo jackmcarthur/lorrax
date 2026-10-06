@@ -407,7 +407,7 @@ def _report_sampling_and_bands(
 
 def _prepare_isdf_carriers(
         band_slices, bgw_v_grid_fn, centroid_indices, config, material_class, mesh_xy, meta,
-        mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn):
+        mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn, enk_dft):
     """Produce the fitted ISDF operators and wavefunction views."""
     with timing.section("gw_jax.isdf", announce=True,
                         label="ISDF basis + wavefunctions"):
@@ -448,8 +448,13 @@ def _prepare_isdf_carriers(
             trs_allowed=sym.trs_allowed,
             state_capacity=wfn.occupation_state_capacity,
             kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
+        from .qp_support import requested_reads_ev
+        energy, states, frame_mu_ev = _oneshot_requested(
+            config, enk_dft, wfn, oneshot_occupation_state, material_class)
         meta.shared_pole_recipe = resolve_shared_pole_recipe(
-            config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0)
+            config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0,
+            support_reads_ev=frame_mu_ev + requested_reads_ev(
+                energy, states, config.sigma.omega_step_ev))
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
     if config.bispinor and wfns_transverse is None:
         raise RuntimeError(
@@ -778,6 +783,30 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
     return (static_head_terms)
 
 
+def _oneshot_requested(config, enk_dft, wfn, occupation_state, material_class):
+    """The one-shot's requested states: ``(E - mu [k, band] eV, mask, mu eV)``.
+
+    The Sigma window's identities the W model treats as active, judged in the
+    frame the Sigma build measures from (``efermi.sigma_frame_mu_ev``).  One
+    source for the sampled Sigma support and W's line sites
+    (``qp_support.requested_reads_ev``).
+    """
+    from .efermi import sigma_frame_mu_ev
+    from .qp_support import requested_states
+    from .shared_pole_recipe import active_band_mask
+    e_ry = np.asarray(enk_dft, dtype=np.float64)
+    metal = material_class == "metal" and occupation_state is not None
+    mu_ev = sigma_frame_mu_ev(
+        config, wfn, e_ry,
+        float(occupation_state.mu_ry) if metal else float(wfn.efermi),
+        occupation_state if metal else None)
+    energy = e_ry * RYD_TO_EV - mu_ev
+    states = requested_states(
+        config.sigma, config.sc.frozen_core_bands, energy,
+        np.ones(e_ry.shape, dtype=bool), active_band_mask(e_ry, float(wfn.efermi)))
+    return energy, states, mu_ev
+
+
 def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
                              material_class, print_fn):
     """The one-shot's sampled Sigma(omega) support: the first plan of
@@ -791,20 +820,10 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
     """
     from dataclasses import replace
 
-    from .efermi import sigma_frame_mu_ev
-    from .qp_support import plan_support_ev, requested_states
-    from .shared_pole_recipe import active_band_mask
-    e_ry = np.asarray(enk_dft, dtype=np.float64)
-    metal = material_class == "metal" and occupation_state is not None
-    mu_ev = sigma_frame_mu_ev(
-        config, wfn, e_ry,
-        float(occupation_state.mu_ry) if metal else float(wfn.efermi),
-        occupation_state if metal else None)
+    from .qp_support import plan_support_ev
     requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
-    energy = e_ry * RYD_TO_EV - mu_ev
-    states = requested_states(
-        config.sigma, config.sc.frozen_core_bands, energy,
-        np.ones(e_ry.shape, dtype=bool), active_band_mask(e_ry, float(wfn.efermi)))
+    energy, states, _ = _oneshot_requested(
+        config, enk_dft, wfn, occupation_state, material_class)
     grown, _ = plan_support_ev(config.sigma, requested, energy, states)
     if grown.size == requested.size:
         return config
@@ -1565,7 +1584,7 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    V_qmunu, bispinor_v_q_path, green_parent_carrier, isdf, oneshot_occupation_state, wfns,
 	    wfns_screening, wfns_sigma, wfns_transverse) = _prepare_isdf_carriers(
 	    band_slices, bgw_v_grid_fn, centroid_indices, config, material_class, mesh_xy, meta,
-	    mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn)
+	    mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn, enk_dft)
 	V_q = V_qmunu               # flat-q (nq, μ, μ) — compute and restart alike
 	(
 	    quad, e_ref, oneshot_head_response, oneshot_head_requests, oneshot_mpa_plan) = _prepare_oneshot_response(

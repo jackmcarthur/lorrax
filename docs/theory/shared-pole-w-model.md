@@ -292,8 +292,9 @@ a fixed set of **supports** $z_a$: points on the damped line $z=\omega+ih$ and
 on the imaginary axis $z=iu$. $W$ is never formed at a real frequency; one
 occupation-weighted time rule covers the whole active transition interval
 ([the bank](../architecture/shared_pole_model.md#2-the-response-bank)), and the
-moments are exact band sums. Production uses 18 fitted supports; held
-diagnostic supports and the $M_1/M_3$ block are additional.
+moments are exact band sums. Production uses at least 18 fitted supports and at
+most 40 bank samples including the held diagnostic supports; the $M_1/M_3$ block
+is additional.
 
 Placement is a condenser problem, not a choice of interesting frequencies:
 
@@ -301,12 +302,23 @@ Placement is a condenser problem, not a choice of interesting frequencies:
   $u_{\min}=\max(4\eta,E_g)$, $u_{\max}=\max(16\ \mathrm{eV},L)$,
   $L=\omega_p+3.5\ \mathrm{eV}$ ($\omega_p$ from the active electron density),
   $\kappa=L/u_{\min}$, and the count of (W 23).
-* **Line ladder.** Height $h=\max(2.6\ \mathrm{eV},4\eta)$; the remaining
-  $18-m$ sites are equal quantiles of $\rho^{1/2}$ on
+* **Line ladder.** Height $h=\max(2.6\ \mathrm{eV},4\eta)$. The sites are
+  equal quantiles of $\rho^{1/2}$ on
   $[\max(h,\text{first spacing}),\,\omega_{\rm reach}]$, where $\rho$ is the
   $\eta$-broadened density of the crossings $|E-\epsilon_{mk}|$ that contour
-  deformation actually meets for states delivered within $\pm5$ eV of $\mu$.
-  The rule reads band energies, $\mu$ and $\eta$ only; it is not fitted to $W$.
+  deformation actually meets for the **reads**: every requested state's input
+  energy $\pm P$ on the $\Sigma$ step ($P = 2$ eV, `gw.qp_support.requested_reads_ev`),
+  so the line reaches every state the run asks for. Their count is the strip law
+  $n=\lceil(\Omega_R-h)\ln(4/\epsilon)/(\pi h)\rceil$, $\Omega_R=\max|E_{\rm read}-\mu|$,
+  $\epsilon=10^{-3}$: $W(x+ih)$ is analytic in a strip of half-width $h$, so a
+  spacing $\pi h/\ln(4/\epsilon)$ aliases at most $\epsilon/4$. It is held between
+  $18-m$ and the 40-sample cap less the held supports. The rule reads band
+  energies, the reads, $\mu$ and $\eta$ only; it is not fitted to $W$. The model
+  header records the top site (`support_top_ev`) and the reads' extent
+  (`support_reads_ev`); the $\Sigma$ planner warns when a sample group reads
+  outside it (the coarse semicore windows do, by design). Placing the sites for a
+  fixed $\pm5$ eV window instead left states beyond it $0.1$–$0.9$ eV off on Fe,
+  Ni and Si (claims 2868, 3268, 3282).
 
 At each fitted support a narrow direction set $Q_a\in\mathbb C^{n\times r_a}$
 is selected from the sample itself:
