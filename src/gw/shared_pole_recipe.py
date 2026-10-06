@@ -41,11 +41,13 @@ shared_real_pole_v1_r3b = {
     # every state the run asks for (WSUPPORT, claims 3282/3284; was a fixed +/-5 eV
     # window). Si Sigma optimum flat over alpha 0.25-0.75.
     "support_density_power": 0.5,
-    # The line reads each requested state at +-5 eV (the Sigma plan pads only 2 eV):
-    # the old rule's offsets, now for every requested state, so the line never reaches
-    # less far than it did (the H2- hsuite one-shot moved 52 meV near E_F against a
-    # dense ladder when its reach fell from 9.9 to 7.0 eV at +-2 eV).
-    "support_read_pad_ev": 5.0,
+    # The line reads each requested state at +-2 eV (the Sigma plan pad) and, for the
+    # requested states within this window of mu, at +-window: the former rule's reads, so
+    # the line never reaches less far than it did (the H2- hsuite one-shot moved 52 meV
+    # near E_F against a dense ladder when its reach fell from 9.9 to 7.0 eV at +-2 eV).
+    # +-5 eV for every state waits on the response-rule refusal near the transition-span
+    # top (KNOWN_LORRAX_ISSUES; Si 4^3 refuses a line site at 44.8 eV, builds at 41.78).
+    "support_near_window_ev": 5.0,
     "multiplet_relative_tolerance": 1.0e-6,
     "moment_convention": "S_m = 2 M_(2m+1); physical M1 and M3 only",
     "operator_realization": "little-group-reynolds-v1",
@@ -129,8 +131,9 @@ def table_hash(table):
 
 
 RECIPE_HASH = table_hash(shared_real_pole_v1_r3b)
-#: Pad (eV) of the W line reads around each requested state (``qp_support.requested_reads_ev``).
-SUPPORT_READ_PAD_EV = shared_real_pole_v1_r3b["support_read_pad_ev"]
+#: Window (eV) of the former rule's reads kept for the requested states near mu
+#: (``qp_support.requested_reads_ev``).
+SUPPORT_NEAR_WINDOW_EV = shared_real_pole_v1_r3b["support_near_window_ev"]
 #: The Sigma quadrature is not W.  A tier's default for an omitted
 #: sigma_quadrature_eps lives outside the hashed table above, whose every field
 #: sets W's sampling or poles, so RECIPE_HASH (restart and bank identity) binds

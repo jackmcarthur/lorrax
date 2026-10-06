@@ -108,22 +108,33 @@ def support_envelope_ev(energy_relative_ev, requested_kn, pad_ev):
             float(np.max(energy[requested])) + float(pad_ev))
 
 
-def requested_reads_ev(energy_relative_ev, requested_kn, step_ev, pad_ev=SUPPORT_PAD_EV):
+def requested_reads_ev(energy_relative_ev, requested_kn, step_ev, pad_ev=SUPPORT_PAD_EV,
+                       near_window_ev=0.0):
     """The energies around the requested states that W's line must cover, ``E - mu`` (eV), 1-D.
 
     Each requested state's input energy at every offset of ``[-pad, +pad]`` on the
-    Sigma step.  The W recipe passes its own pad (``shared_pole_recipe
-    .SUPPORT_READ_PAD_EV``, 5 eV), wider than the plan's 2 eV.  The one source of where
-    W's line supports must hold (``shared_pole_recipe.support_rule_line_sites``);
-    the caller passes its own requested mask (one-shot or SC map), so neither
-    path's semicore rule is decided here.  Empty when nothing is requested.
+    Sigma step, plus, for the requested states within ``near_window_ev`` of mu, every
+    offset of ``[-near_window_ev, +near_window_ev]``: the former +-5 eV window's own
+    reads, so the W recipe (``shared_pole_recipe.SUPPORT_NEAR_WINDOW_EV``) never reaches
+    less far than it did.  The one source of where W's line supports must hold
+    (``shared_pole_recipe.support_rule_line_sites``); the caller passes its own
+    requested mask (one-shot or SC map), so neither path's semicore rule is decided
+    here.  Empty when nothing is requested.
     """
     energy = np.asarray(energy_relative_ev, dtype=np.float64)
     requested = np.broadcast_to(np.asarray(requested_kn, dtype=bool), energy.shape)
-    step, pad = float(step_ev), float(pad_ev)
-    offsets = step * np.arange(-int(np.floor(pad / step + 1e-9)),
-                               int(np.floor(pad / step + 1e-9)) + 1)
-    return (energy[requested][:, None] + offsets[None, :]).ravel()
+    step = float(step_ev)
+
+    def offsets(pad):
+        n = int(np.floor(float(pad) / step + 1e-9))
+        return step * np.arange(-n, n + 1)
+
+    reads = (energy[requested][:, None] + offsets(pad_ev)[None, :]).ravel()
+    window = float(near_window_ev)
+    if window > 0.0:
+        near = requested & (np.abs(energy) <= window)
+        reads = np.concatenate([reads, (energy[near][:, None] + offsets(window)[None, :]).ravel()])
+    return reads
 
 
 def union_envelope(first, second):

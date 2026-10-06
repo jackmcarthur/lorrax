@@ -441,7 +441,7 @@ def _prepare_isdf_carriers(
             f"width={oneshot_occupation_state.smearing_width_ry:.10f} Ry, "
             f"occ_hash={oneshot_occupation_state.occ_hash}")
     if config.sigma.w_model == "shared_pole" and qp_solver is not QPSolver.SELF_CONSISTENT:
-        from .shared_pole_recipe import (SUPPORT_READ_PAD_EV, bind_shared_pole_census,
+        from .shared_pole_recipe import (SUPPORT_NEAR_WINDOW_EV, bind_shared_pole_census,
                                          resolve_shared_pole_recipe)
         from centroid.sampling_metric import full_k_quadrature_weights
         bind_shared_pole_census(
@@ -455,7 +455,7 @@ def _prepare_isdf_carriers(
         meta.shared_pole_recipe = resolve_shared_pole_recipe(
             config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0,
             support_reads_ev=frame_mu_ev + requested_reads_ev(
-                energy, states, config.sigma.omega_step_ev, pad_ev=SUPPORT_READ_PAD_EV))
+                energy, states, config.sigma.omega_step_ev, near_window_ev=SUPPORT_NEAR_WINDOW_EV))
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
     if config.bispinor and wfns_transverse is None:
         raise RuntimeError(
