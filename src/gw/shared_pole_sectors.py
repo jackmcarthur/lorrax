@@ -759,7 +759,14 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
             f"pencil extent {before} -> {int(history[name][0])}")
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
-    if execution == 'face':
+    if execution == 'face' and geometry.get('decoupled'):
+        # Every parent in flight: stage programs over sub-batches, each eigh once over the stack.
+        from gw.shared_pole_execution import face_reduce_decoupled, face_eigh
+        reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,
+            eigh_plan=face_eigh(mesh_xy,side,budget.face_room),width=int(geometry['decoupled']),
+            ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
+            gram_keep=gram_keep,carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget']))
+    elif execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
             gram_keep=gram_keep,admit=False,room=budget.face_room,

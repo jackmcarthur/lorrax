@@ -155,3 +155,49 @@ def test_row_eigh_matches_local():
         padded = np.sort(np.concatenate((live, np.zeros((q, 3))), axis=-1), axis=-1)
         assert np.allclose(np.sort(w, axis=-1), padded, atol=1e-12)
         assert np.allclose(np.einsum("qij,qjk->qik", a, v), v * w[:, None, :], atol=1e-12)
+
+
+def test_decoupled_face_matches_local():
+    """The decoupled face route (stage programs over sub-batches, eighs over every parent)
+    against the local round on the synthetic pencil; the face products are panel_matmul."""
+    mesh = _mesh()
+    from gw.shared_pole_directions import port_extent
+    from gw.shared_pole_execution import face_reduce_decoupled, face_ritz_carrier
+    from gw.shared_pole_local import BATCH, reduce_round
+    from gw.shared_pole_capacity import _local_eigenplan
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
+    extent = port_extent(mesh)
+    states, infinity, tables, models = _pencil(mesh)
+    q = len(models)
+    width, iw = extent(4), extent(2)
+    gram_keep = shared_real_pole_gates_ordered_v1["normalized_gram_keep"]["sector_threshold"]
+    budget = 8
+    side = int(tables["active"].shape[-1])
+
+    def place(sharding):
+        put = lambda a: jax.device_put(np.asarray(a), sharding)
+        return ([(s[0], put(_pad(s[1], width)), put(_pad(s[2], width)), put(_pad(s[3], width))) for s in states],
+                tuple(put(_pad(a, iw)) for a in infinity))
+    ls, li = place(NamedSharding(mesh, P(BATCH)))
+    local = reduce_round(ls, li, tables, real=q, mesh_xy=mesh, native_eigh=_local_eigenplan(mesh, side).native_fn,
+                         ordered=True, odd_moments=True, keep_budget=budget, retain_span=True, gram_keep=gram_keep)
+    fs, fi = place(NamedSharding(mesh, P(None, "x", "y")))
+    for sub in (q, 2, 1):
+        dec = face_reduce_decoupled(fs, fi, tables, mesh=mesh, eigh_plan=_local_eigenplan(mesh, side), width=sub,
+                                    ordered=True, odd_moments=True, keep_budget=budget, retain_span=True,
+                                    gram_keep=gram_keep, carrier=face_ritz_carrier(mesh, budget))
+        ld, dd = (jax.tree.map(np.asarray, r[3][0]) for r in (local, dec))
+        for key in ("gram_spectrum_relative", "gram_min_relative", "paired_min_relative", "retained_metric_relative"):
+            assert np.allclose(ld[key], dd[key], rtol=1e-8, atol=1e-12), (sub, key)
+        for key in ("retained_rank", "paired_rank", "positive_count", "gram_valid", "orientation_paired"):
+            assert np.array_equal(ld[key], dd[key]), (sub, key)
+        lb, lp, la = (np.asarray(a) for a in local[0])
+        db, dp, da = (np.asarray(a) for a in dec[0])
+        assert dec[0][0].sharding.spec == P(None, "x", "y")
+        assert np.array_equal(la, da)
+        assert np.allclose(np.where(la, lp, 0), np.where(da, dp, 0), rtol=1e-8, atol=1e-10), sub
+        for p in range(q):
+            assert np.allclose(lb[p] @ np.conj(lb[p].T), db[p] @ np.conj(db[p].T), rtol=1e-7, atol=1e-9), (sub, p)
+        ly, dy = np.asarray(local[4]), np.asarray(dec[4])
+        for p in range(q):
+            assert np.allclose(ly[p] @ np.conj(ly[p].T), dy[p] @ np.conj(dy[p].T), rtol=1e-7, atol=1e-9), (sub, p)
