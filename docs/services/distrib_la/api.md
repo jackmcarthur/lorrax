@@ -131,11 +131,18 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   moves a large near-zero cluster off the origin; its vectors are then
   re-orthonormalized by a Newton–Schulz polar iteration, GEMMs only, which
   converges while the singular values of Z lie in (0, √3) and otherwise falls
-  through to the next attempt), then in cuSOLVERMp's other layout, then
-  gathered on every rank when its two n² copies fit 64 MiB
+  through to the next attempt), then gathered on every rank when its two n²
+  copies fit 64 MiB
   (`GATHERED_EIGH_BYTES`, n ≤ 1448 complex; a face plan's room does not
   raise it, because XLA reserves the retry in every program). XLA reserves every
-  retry inside the program whether or not it runs; the chain's temporaries
+  retry inside the program whether or not it runs. On cuSOLVERMp, which
+  returns vectors that are not orthonormal inside a near-zero cluster with
+  status 0 and info 0 at some (matrix, block, shift) and not others, the
+  chain changes one thing at a time: unshifted, unshifted at a smaller block
+  (`retry_block`, whose workspace is not larger), shifted and
+  re-orthonormalized, shifted at the smaller block, then gathered when
+  admitted. The one-tile-per-rank layout is never a retry: at n 7908 on P4
+  its workspace is 2.0 GB against 0.25–0.32 GB at blocks 6–172. The chain's temporaries
   (7 n²/P per rank, measured) and an admitted gathered retry are priced by
   `workspace_bytes_per_rank`.
 - Every route-(c) eigh is checked the same way on its face-layout result,

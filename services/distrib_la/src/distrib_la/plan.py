@@ -949,17 +949,17 @@ class Plan:
             n = int(A.shape[-1])
             if backend == "cusolvermp":
                 # cuSOLVERMp 0.9.1 syevd returns vectors that are not orthonormal
-                # inside a near-zero cluster, with status 0 and info 0, on
-                # rank-deficient PSD responses (CrI3 6x6 TT, n 7908: orthogonality
-                # 4-5e-2 in every TT round), so it solves shifted first, in the
-                # deflation's pass. Then shifted and re-orthonormalized, shifted
-                # at a smaller block (retry_block: no more workspace), unshifted.
+                # inside a near-zero cluster, with status 0 and info 0, at some
+                # (matrix, layout, shift) and not others; no one of them is safe
+                # (EIGHOOM, n 7908 and 11776-15872, P4). The retries change one
+                # at a time: the layout first (retry_block, a smaller block on the
+                # same side: no more workspace), then the shift with
+                # re-orthonormalization, then the shift at the smaller block.
                 from distrib_la._cusolvermp import retry_block
-                attempts = [deflate(solve, shift=True), attempts[1]]
                 block = retry_block(n, int(mesh.shape["x"]))
                 if block is not None:
-                    attempts.append(deflate(partial(solve, block=block), shift=True))
-                attempts.append(deflate(solve))
+                    attempts = [attempts[0], deflate(partial(solve, block=block)), attempts[1],
+                                deflate(partial(solve, block=block), shift=True)]
             # A gathered local solve, where the whole matrix, its vectors and
             # the solver's copy fit GATHERED_EIGH_BYTES on every rank (a shape
             # rule, the same on every rank). XLA reserves it in every program

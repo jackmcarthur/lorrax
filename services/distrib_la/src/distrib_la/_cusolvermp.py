@@ -315,10 +315,11 @@ def retry_block(n: int, p: int) -> int | None:
     the default block. The checked eigh solves there again when the default
     layout's result fails its check; the solve side, its operand and its
     output are the first attempt's, and the vendor workspace of a smaller
-    block is not larger (``workspace_bytes_per_rank``), so the retry needs no
-    more memory than the attempt it replaces. One tile per rank is never a
-    retry: its workspace and wall exceed the default's at large n/p. Below
-    block 8 there is none (blocks 1-4 ran 5-34x slower than one tile).
+    block is not larger (n 7912, P4, complex: 284 MB at block 86, 317 MB at
+    172), so the retry needs no more memory than the attempt it replaces. One
+    tile per rank is never a retry: its workspace is 2.0 GB there and its wall
+    exceeds the default's at large n/p. Below block 8 there is none (blocks
+    1-4 ran 5-34x slower than one tile).
     """
     side, block = solve_layout(n, p)
     local = side // p

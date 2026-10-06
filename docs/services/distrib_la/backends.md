@@ -191,7 +191,16 @@ to ascending order. The tridiagonalization then keeps every rank busy as the
 trailing matrix shrinks. Measured (complex128, median seconds, one tile per
 rank → `mb = 250`, the un-permute included): P16 `n = 16000` 17.50 → 10.59,
 `n = 8000` 4.46 → 3.56; P64 `n = 16000` 20.05 → 15.65, `n = 8000`
-7.13 → 6.47; no change at `n/p ≤ 256`. LU and Cholesky keep one tile per rank,
+7.13 → 6.47; no change at `n/p ≤ 256`. Where the largest divisor of `n/p` up
+to 256 is below 128 (`n/p` prime or a small multiple of one: 3954 = 2·3·659
+gives 6), the solve pads each tile to the smallest edge with a divisor in
+[128, 256] (`_cusolvermp.solve_layout`, at most 127 rows per rank: 7908 →
+7912, block 172). The padded rows are zero except a diagonal of distinct
+sentinels below the Gershgorin bound, so they are the lowest eigenpairs and
+are dropped before the result leaves the wrapper. The cuSOLVERMp handlers
+zero and read the solver's `info` after every `syevd`, `potrf`, `potrs`,
+`getrf` and `getrs` and return a nonzero value as an error naming the
+routine (`src/ffi/cpp/cusolvermp/info.h`). LU and Cholesky keep one tile per rank,
 because block-cyclic `getrs`/`potrs` are 2–3× slower and `getrf` gains
 nothing.
 

@@ -106,7 +106,7 @@ def main():
                 failed.append(f"{family} n={n}")
             say(f"eigh_large P{p * p} {family:8s} n={n} carrier={carrier} | before block={old_block:3d} "
                 f"residual={r0:.1e} orth={o0:.1e}{' WRONG' if max(r0, o0) > accept(carrier) else ''} "
-                f"wall={old_wall:.1f}s(cold) | first side={side} block={block} shifted residual={r:.1e} "
+                f"wall={old_wall:.1f}s(cold) | first side={side} block={block} residual={r:.1e} "
                 f"orth={o:.1e} check={table[0]:.1e}/{table[1]:.1e} wall={wall:.2f}s {'PASS' if ok else 'FAIL'}")
             del a, w, v
         if carrier == 7908 and n == 7908:
