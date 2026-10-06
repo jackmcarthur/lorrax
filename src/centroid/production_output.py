@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 from common.scientific_output import (
@@ -80,6 +81,54 @@ def prune_band_ranges(args, n_val: int, n_cond: int):
             "(occupied + Sigma conduction) x all bands")
 
 
+class CentroidRankNotEstablished(RuntimeWarning):
+    """The point budget stopped the select before the pool was spent."""
+
+
+def rank_law_estimate(*, left, right, nspinor: int, kgrid, ng: int,
+                      ecutwfc: float, ecutrho: float):
+    """``(N_mu, L, B, terms)`` of the charge pair-set rank law, or ``None``.
+
+    N_mu(1 meV RMS Σ_x) ≈ 0.5·min(P, 445 L^0.107 B^0.322, 0.97 N_G(4E_wfc))
+    (docs/theory/isdf-exchange-accuracy.md#rank-law).  L and B are the left
+    and right window widths, per Kramers pair on a spinor WFN; P = N_k·L·B
+    bounds the pair functions; N_G(4E_wfc) scales the WFN's density sphere
+    ``ng`` at ``ecutrho``.  A Si calibration checked on Fe and Ni 20³.
+    """
+    per = 2.0 if int(nspinor) == 2 else 1.0
+    L = (int(left[1]) - int(left[0])) / per
+    B = (int(right[1]) - int(right[0])) / per
+    if not (L > 0 and B > 0 and float(ecutrho) > 0 and int(ng) > 0):
+        return None
+    terms = (math.prod(int(n) for n in kgrid) * L * B,
+             445.0 * L ** 0.107 * B ** 0.322,
+             0.97 * int(ng) * (4.0 * float(ecutwfc) / float(ecutrho)) ** 1.5)
+    return 0.5 * min(terms), L, B, terms
+
+
+def pool_rank_warning(*, pool: int, written: int, unpicked: float | None,
+                      rank_law=None) -> str | None:
+    """The warning for a select the point budget stopped, else ``None``.
+
+    ``unpicked`` is the largest never-picked residual over the floor
+    (``prune_candidates_by_pivoted_cholesky``); above 1 the pool still held
+    directions when the budget ran out, so the pair-space rank is unmeasured.
+    """
+    if unpicked is None or float(unpicked) <= 1.0:
+        return None
+    law = ("" if rank_law is None else
+           f"  The rank law puts N_mu for 1 meV RMS Sigma_x near "
+           f"{rank_law[0]:.0f} (written/estimate = "
+           f"{int(written) / rank_law[0]:.2f}).")
+    return (f"pair-space rank not established: the point budget stopped the "
+            f"pivoted Cholesky at {int(written)} points while unpicked "
+            f"candidates of the {int(pool)}-point pool still carry "
+            f"{float(unpicked):.3g}x its floor, so {int(written)} centroids "
+            f"are not a complete ISDF basis.{law}  Raise the request or the "
+            f"pool (--oversample) until the header reads 'stop: pool spent' "
+            f"to measure the rank.")
+
+
 def format_centroid_header(*, feature_fit: str, source_wfn: str,
                            weight_label: str, num_electrons: float,
                            occupied_boundary: int, fft_grid, kgrid, shift,
@@ -87,10 +136,28 @@ def format_centroid_header(*, feature_fit: str, source_wfn: str,
                            candidates: int, written: int, pruning: str,
                            prune_rank: int | None, prune_left, prune_right,
                            prune_label: str, orbit_aware: bool, n_sym: int,
-                           density_mode: str) -> str:
+                           density_mode: str, pool: int,
+                           unpicked: float | None = None,
+                           rank_law=None) -> str:
     """Centroid-table provenance, kept pure so the file contract is gated."""
-    rank_note = ("" if prune_rank is None else
-                 f"; achieved numerical rank={int(prune_rank)}")
+    rank_note = ""
+    if prune_rank is not None:
+        stop = (f"stop: pool spent, largest unpicked residual "
+                f"{float(unpicked):.3g}x the floor; the pair-space rank is at "
+                f"least {int(prune_rank)} and a larger pool can raise it"
+                if float(unpicked) <= 1.0 else
+                f"stop: point budget, largest unpicked residual "
+                f"{float(unpicked):.3g}x the floor; the pair-space rank "
+                f"exceeds {int(prune_rank)} and is not measured")
+        rank_note = (f"\npool rank={int(prune_rank)} of {int(written)} kept "
+                     f"pivots on a {int(pool)}-point pool; {stop}")
+    if rank_law is not None:
+        n_mu, L, B, terms = rank_law
+        rank_note += (
+            f"\nrank law: N_mu(1 meV RMS Sigma_x) ~ 0.5 min(P, 445 L^0.107 "
+            f"B^0.322, 0.97 N_G(4E_wfc)) = 0.5 min({terms[0]:.4g}, "
+            f"{terms[1]:.0f}, {terms[2]:.0f}) = {n_mu:.0f} at L={L:g}, "
+            f"B={B:g}; written/estimate={int(written) / n_mu:.2f}")
     channel = ("gamma^0 (charge) ISDF" if density_mode == "scalar" else
                "gamma^{1,2,3} (current) ISDF")
     return (
@@ -105,9 +172,9 @@ def format_centroid_header(*, feature_fit: str, source_wfn: str,
         f"selection: weighted k-means; seed={int(seed)}; "
         f"rho_power={float(rho_power):g}; requested={int(requested)}; "
         f"candidates={int(candidates)}; written={int(written)}\n"
-        f"pruning: {pruning}{rank_note}; pair-density windows "
+        f"pruning: {pruning}; pair-density windows "
         f"left={tuple(prune_left)}, right={tuple(prune_right)} "
-        f"({prune_label})\n"
+        f"({prune_label}){rank_note}\n"
         f"symmetry closure: {'orbit-aware' if orbit_aware else 'literal points'}; "
         f"spatial operations={int(n_sym)}\n"
         f"coordinates: x y z snapped to FFT grid; {int(written)} unique points\n"
@@ -205,8 +272,11 @@ def format_kmeans_report(*, header: str, source_wfn: str,
 
 
 __all__ = [
+    "CentroidRankNotEstablished",
     "format_centroid_header",
     "format_kmeans_report",
+    "pool_rank_warning",
     "prune_band_ranges",
+    "rank_law_estimate",
     "validate_mode_policy",
 ]

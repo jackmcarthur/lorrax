@@ -788,6 +788,14 @@ def _emit_complete_groups(cand_idx, dense_group_id, piv):
     return keep_idx, in_kept, order, piv_used
 
 
+def _unpicked_over_floor(d_final, d0max, tol_rel) -> float:
+    """Largest never-picked residual over the select's floor tol·max diag G."""
+    d_final = np.asarray(d_final)
+    tol = (float(np.sqrt(np.finfo(d_final.dtype).eps)) if tol_rel is None
+           else float(tol_rel))
+    return float(np.max(d_final, initial=0.0)) / (tol * float(d0max))
+
+
 def prune_candidates_by_pivoted_cholesky(
     wfn: "WfnLoader",
     sym: symmetry_maps.SymMaps,
@@ -826,7 +834,10 @@ def prune_candidates_by_pivoted_cholesky(
     centroid-pruning path.
 
     Returns ``(keep_idx, rank, G, d_final, d_taken, trR_over_trG,
-    psd_info)``.
+    psd_info, unpicked)``.  ``unpicked`` is the largest residual left on a
+    candidate the select never picked, in units of its floor: at most 1 means
+    the pool is spent and ``rank`` is its rank; above 1 the point budget
+    stopped the select while the pool still held directions.
 
     ``n_point_budget`` is THE FLOOR (owner ruling, 2026-08-10: "everything
     the user has input on they should be specifying in units of points, and
@@ -1079,7 +1090,8 @@ def prune_candidates_by_pivoted_cholesky(
                   f"first={float(trR_over_trG_np[1]):.3e}, "
                   f"last-delivered={float(trR_over_trG_np[n_delivered]):.3e}")
         return (keep_idx, rank_i, G, d_final_np, d_taken_np,
-                trR_over_trG_np, psd_host)
+                trR_over_trG_np, psd_host,
+                _unpicked_over_floor(d_final_np, diag_host.max(), tol_rel))
 
     # Compatibility selector: orbit-aware mode chooses one representative and
     # then emits its whole orbit. Production centroid pruning returns above
@@ -1211,7 +1223,8 @@ def prune_candidates_by_pivoted_cholesky(
     if n_pad:
         G = G[:M, :M]        # hand back the LOGICAL Gram, not the padded one
     return (keep_idx, rank_i, G, d_final_np, d_taken_np,
-            trR_over_trG_np, psd_host)
+            trR_over_trG_np, psd_host,
+            _unpicked_over_floor(d_final_np, diag_host.max(), tol_rel))
 
 
 # ═══════════════════════════════════════════════════════════════════════

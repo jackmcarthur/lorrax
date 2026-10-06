@@ -143,6 +143,7 @@ print0 = debug_print
 import gc
 import os
 import time
+import warnings
 
 import jax
 import numpy as np
@@ -162,9 +163,12 @@ from .kmeans_isdf import (
     ensure_unique_centroids,
 )
 from .production_output import (
+    CentroidRankNotEstablished,
     format_centroid_header,
     format_kmeans_report,
+    pool_rank_warning,
     prune_band_ranges,
+    rank_law_estimate,
     validate_mode_policy,
 )
 
@@ -293,7 +297,6 @@ def _resolve_deck(args) -> tuple[int | None, str]:
     """
     if args.input is None:
         if args.prune_window == "v_x_vc" and args.fit_window is None:
-            import warnings
             warnings.warn(
                 "kmeans: no deck (-i), so the Sigma window is unknown; the "
                 "prune left leg falls back to vc_x_vc (all bands), a safe "
@@ -439,8 +442,9 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
     Greedy pivoting on the pair-density Gram keeps the candidates that add
     the most independent interpolation directions over the σ band window;
-    the achieved rank is the number it actually certified. Returns
-    ``(indices, rank)``.
+    the rank is the number it actually certified. Returns
+    ``(indices, rank, unpicked)``, the last the largest never-picked residual
+    over the floor (at most 1: the pool is spent).
     """
     from .pivoted_cholesky import prune_candidates_by_pivoted_cholesky
     from .sampling_metric import full_k_quadrature_weights
@@ -479,10 +483,11 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
            f"{'Σ_i Z_i Z_i† (i=1,2,3)' if args.density_mode == 'current' else 'charge'}")
 
     with timing.section("prune"):
-        keep_idx, rank, *_ = prune_candidates_by_pivoted_cholesky(**kwargs)
+        keep_idx, rank, *_, unpicked = prune_candidates_by_pivoted_cholesky(
+            **kwargs)
     indices = np.asarray(keep_idx, dtype=np.int64)
     print0(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
-    return indices, int(rank)
+    return indices, int(rank), float(unpicked)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -607,7 +612,8 @@ def main():
                              Rinv, tau, n_sym, M_cand)
 
     pruned = False
-    prune_rank = None
+    prune_rank = unpicked = None
+    n_pool = int(n_unique)
     if oversample > 1.0 and n_unique > N_c:
         release_arrays = [labels, centroids]
         for array in (weight, kmeans_weight):
@@ -621,7 +627,7 @@ def main():
         del release_arrays, labels, centroids, kmeans_weight
         if not args.plot:
             del weight
-        centroid_indices, rank = _prune(
+        centroid_indices, rank, unpicked = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
         n_unique = int(centroid_indices.shape[0])
@@ -654,6 +660,15 @@ def main():
     kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
     shift = tuple(float(v) for v in np.asarray(wfn.shift).reshape(-1)[:3])
     prune_state = "pivoted Cholesky" if pruned else "not applied"
+    rank_law = (None if args.density_mode == "current" else
+                rank_law_estimate(
+                    left=prune_left, right=prune_right, nspinor=wfn.nspinor,
+                    kgrid=kgrid, ng=wfn.ng, ecutwfc=wfn.ecutwfc,
+                    ecutrho=wfn.ecutrho))
+    rank_warning = pool_rank_warning(
+        pool=n_pool, written=n_unique, unpicked=unpicked, rank_law=rank_law)
+    if rank_warning is not None:
+        warnings.warn(rank_warning, CentroidRankNotEstablished)
     header = format_centroid_header(
         feature_fit=feature_fit, source_wfn=wfn_path,
         weight_label=weight_label,
@@ -664,7 +679,8 @@ def main():
         pruning=prune_state, prune_rank=prune_rank,
         prune_left=prune_left, prune_right=prune_right,
         prune_label=prune_label, orbit_aware=orbit_aware, n_sym=n_sym,
-        density_mode=args.density_mode)
+        density_mode=args.density_mode, pool=n_pool, unpicked=unpicked,
+        rank_law=rank_law)
     # ONE writer.  Every rank used to reach this savetxt on the same shared
     # path.  It survived P=16 only because all ranks write identical bytes —
     # which is precisely the latent form of the bug that DID bite at P=64 in

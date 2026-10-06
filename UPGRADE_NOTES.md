@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — kmeans names the pool rank and its stop; a budget-stopped selection warns
+
+The centroid header's `achieved numerical rank=N` is now `pool rank=N of W
+kept pivots on a M-point pool` with the stop: `pool spent` (no unpicked
+candidate's residual is above the floor, so N is the pool's rank, a lower
+bound on the pair-set rank) or `point budget` (the pool still held
+directions, so the rank is not measured). The second case warns
+`CentroidRankNotEstablished` in `kmeans.out`: the Fe 4³ deck's 312 points
+read "rank 312" while its pair set ranks above 1304. A charge selection also
+prints the rank law's N_μ for 1 meV RMS Σ_x and written/estimate. Centroid
+coordinates do not change. Scripts that parse `achieved numerical rank=`
+must read `pool rank=`.
+
 ## 2026-10-06 — the bispinor Σ runs the mixed pair CT + TC as one fused window
 
 `bispinor_gw = full_shared_pole` Σ made four τ sweeps per map, one per

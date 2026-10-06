@@ -44,7 +44,14 @@ atoms' spatial Seitz group (improper and nonsymmorphic operations included) and
 pruning admits only whole orbits that fit the budget. Numerical flatness of the
 pool is reported, not refused, because an over-complete interpolation set can
 be accurate; non-PSD input, pool exhaustion and invalid pivots refuse
-([rank policy](architecture/rank_truncation_policy.md)).
+([rank policy](architecture/rank_truncation_policy.md)). The header's `pool
+rank=` line names the stop: `pool spent` (no unpicked candidate's residual
+is above the floor, so the count is the pool's rank, a lower bound on the
+pair-set rank) or `point budget` (the pool still held directions; the rank is
+not measured and kmeans warns `CentroidRankNotEstablished`). For the
+charge channel a `rank law:` line gives the
+[rank law](theory/isdf-exchange-accuracy.md#rank-law)'s $N_\mu$ for 1 meV RMS
+Σ_x beside the written count.
 
 Reads the deck's `wfn_file` (`-i`; relative to the deck), else `WFN.h5` in the
 working directory. Writes `centroids_frac_<n>[<suffix>].txt`

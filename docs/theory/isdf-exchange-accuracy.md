@@ -33,7 +33,7 @@ feature Gram \(K(\mathbf r,\mathbf r')\) (centroid selection, "What is being
 optimized?"). The rank counts eigenvalues above \(\sqrt{\epsilon}\) times the
 largest diagonal (`centroid/pivoted_cholesky.point_granularity_rank`). It is
 measured on a 9000-point candidate pool (request \(N_c=6000\)) and printed as
-"achieved numerical rank" in `kmeans.out`. Once \(N_\mu\ge r(B)\), extra points
+`pool rank=` in `kmeans.out`. Once \(N_\mu\ge r(B)\), extra points
 add no new directions at that tolerance.
 
 **Exact Σ_x.**
@@ -103,7 +103,7 @@ On this system, with the centroids selected on the Σ pair set (`--fit-window` =
 | Σ_x max ≤ 0.1 meV | ≈ 1.3 r(B) (measured at B = 296, 412; at B ≤ 152 a 0.5–1 meV floor on valence bands 1–8 remains at 1.3 r) |
 
 **Procedure.**
-1. Measure \(r(B)\) before choosing \(N_\mu\): run `kmeans_cli` with a large \(N_c\) and the deck's `--fit-window`, and read "achieved numerical rank" in `kmeans.out`. That costs about 30 s on one node here. Where the probe does not fit the device, estimate \(r\) from the law below.
+1. Measure \(r(B)\) before choosing \(N_\mu\): run `kmeans_cli` with a large \(N_c\) and the deck's `--fit-window`, and read `pool rank=` in `kmeans.out`. It is the pool's rank only when that line says `stop: pool spent`; `stop: point budget` means the request is below the rank, and kmeans warns `CentroidRankNotEstablished`. A spent pool's rank is a lower bound: compare two pool sizes. That costs about 30 s on one node here. Where the probe does not fit the device, estimate \(r\) from the law below.
 2. Take \(N_\mu\) as a fraction of \(r\).
 
 ### Estimating r(L, B) without a probe {#rank-law}
@@ -188,7 +188,7 @@ keeps. The full window costs +13 % wall and +15 GB peak in the selection.
   `--prune-n-cond` narrows it; keep it at or above
   `max(number_bands_chi, number_bands_sigma)` of every deck the centroid file
   serves ([flags](../drivers.md#centroids-centroidkmeans_cli)). `kmeans.out` prints
-  `After pruning: N centroids (rank=R)`. `centroid/pivoted_cholesky.py`
+  the `pool rank=` line. `centroid/pivoted_cholesky.py`
   refuses a window whose top band exceeds half the plane-wave basis
   (`max_band > 0.5·ngk_max·n_spinor`): raise the cutoff or lower the band
   count.
