@@ -158,6 +158,7 @@ from distrib_la.resolve import (
 )
 
 from ._batch_reshard import batch_layout, is_batch_layout, local_batch
+from ._summa import summa
 from ._result_check import checked_program, checked_shapes
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
@@ -178,6 +179,7 @@ __all__ = [
     "retain_leading_eigenvectors",
     # distributed matrix multiplication
     "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
+    "summa",
     # planned N,N GEMM (trace-safe, for hot loops)
     "GemmPlan", "gemm_plan", "local_gemm_plan", "panel_matmul", "batch_gram",
     # the batched route toggle and its dial

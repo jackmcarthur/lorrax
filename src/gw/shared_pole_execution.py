@@ -298,8 +298,11 @@ def face_program(fn, mesh, *, outputs='matrices'):
 
 @lru_cache(maxsize=None)
 def face_matmul(mesh):
-    from distrib_la import matmul
-    return partial(matmul, mesh=mesh, backend='distributed', batched_route='auto')
+    """The whole-mesh constructor's product: the batched 2-D SUMMA of the service
+    (``distrib_la.summa``), pure JAX on the x/y face, so the face programs hold no
+    vendor GEMM; measured at the cuBLASMp provider's throughput (SECTFAST 2026-10-06)."""
+    from distrib_la import summa
+    return partial(summa, mesh=mesh)
 
 
 @lru_cache(maxsize=None)
