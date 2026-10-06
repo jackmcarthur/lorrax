@@ -256,7 +256,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     # The decoupled face route: CC and TT for every parent at once (the selection in
     # sub-batches of the admitted width, every eigh once over the stack), then the CT
     # rounds over slices of the held outputs. The stacks are reserved at their actual
-    # side; a refusal keeps today's rounds (warn, never refuse).
+    # side; stacks over budget reduce in face rounds (construct_diagonal_sector_all warns).
     whole=None
     if resolved_execution=='face' and int(header['n_q_irr'])>batch_width:
         whole=[];held_leaves=[]
@@ -827,7 +827,7 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     import jax
     import numpy as np
     from gw.gw_config import linalg_resolution
-    from gw.shared_pole_capacity import ConstructorCapacity,face_eigh_room,round_padding_output_bytes
+    from gw.shared_pole_capacity import ConstructorCapacity,face_eigh_room
     from gw.shared_pole_directions import port_extent
     from gw.shared_pole_local import (round_tables,recipe_panel_widths,recipe_infinity_width,pad_states,
                                       carrier_history,parent_rounds)
