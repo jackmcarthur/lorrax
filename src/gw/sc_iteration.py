@@ -3702,7 +3702,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
             print_fn=inputs.print_fn,
             support_reads_ev=frame_mu_ev + requested_reads_ev(
-                sc_support.energy, sc_support.states, inputs.config.sigma.omega_step_ev),
+                sc_support.energy, sc_support.requested, inputs.config.sigma.omega_step_ev),
             support_session=(None if inputs.fixed_quadrature_session is None else
                              inputs.fixed_quadrature_session.setdefault(
                                  "shared_pole_supports", {})))
