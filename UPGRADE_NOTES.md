@@ -16,11 +16,12 @@ program that runs. On CrI3 24×24 at P64 that was six programs that never ran,
 byte model that admits every local round (`shared_pole_byte_terms`, `b/P`
 copies per rank), with the eigh and matmul workspace quoted once beside it;
 the constructor line reads `face program N GB/rank priced from the shapes`
-and the receipt key is `program_bytes_per_rank`. The compiled figure counted
-the eigh stack's buffers a second time, so the admitted width can be larger
-than before on a deck that is not budget-bound at batch 1; a round's cost per
-parent does not depend on the width (CCB, 2026-10-05: batch 3 → 5 broke even).
-The programs that run and their shapes are unchanged. No deck change.
+and the receipt key is `program_bytes_per_rank`. The price is an upper bound
+on the compiled figure: two tiled copies of the local round's term, where the
+CrI3 24×24 P64 receipt's compiled programs held 1.57–1.63 of one, so the
+admission lands on the same batch as before (3 of 61 parents at P64, replayed
+by `tests/test_shared_pole_face_price.py`; 1 on the P4 face decks). The
+programs that run, their shapes and the results are unchanged. No deck change.
 
 ## 2026-10-06 — kmeans names the pool rank and its stop; a budget-stopped selection warns
 

@@ -438,13 +438,26 @@ def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_wi
     return [(*row, label) for row in parent_rounds(header['n_q_irr'], width)]
 
 
-def _face_price(mesh, rows, width, side, phase, **terms):
-    """Bytes per rank of one face round program's dense temporaries for ``width`` parents.
+#: A face program holds twice the local round's dense term per parent: the
+#: SPMD-partitioned program stages its distributed matmul and eigh operands
+#: beside the tiles the one-device term was calibrated on (every stack of the
+#: sized whole-chain program runs on the mesh, so no whole matrix per rank is
+#: among them). Measured on the CrI3 24x24 P64 cold map-0 receipt (2026-10-05,
+#: three parents per round): the compiled programs held 1.57x (CC), 1.57x (TT)
+#: and 1.63x (CT) the tiled term, so two copies bound them with a fifth to
+#: spare, and the admission lands on the batch the compiled sizing chose
+#: (``tests/test_shared_pole_face_price.py`` replays that receipt).
+FACE_PROGRAM_COPIES = 2
 
-    The byte model that admits every local round (``shared_pole_byte_terms``),
-    tiled over the mesh (``width / P`` copies). The eigh and matmul workspace
-    is quoted beside it (``ConstructorCapacity.quote``), so nothing is priced
-    twice, and nothing is compiled to be measured. Every rank prices the same
+
+def _face_price(mesh, rows, width, side, phase, **terms):
+    """Bytes per rank of one face round program for ``width`` parents: an upper bound.
+
+    ``FACE_PROGRAM_COPIES`` of the byte model that admits every local round
+    (``shared_pole_byte_terms``), tiled over the mesh (``width / P`` copies
+    each). The eigh and matmul workspace is quoted beside it
+    (``ConstructorCapacity.quote``), as it was beside the compiled figure.
+    Nothing is compiled to be measured, and every rank prices the same
     shapes, so the figure is agreed by construction.
     """
     from types import SimpleNamespace
@@ -452,7 +465,7 @@ def _face_price(mesh, rows, width, side, phase, **terms):
     price = shared_pole_byte_terms(SimpleNamespace(n_rmu_padded=int(rows)), mesh_xy=mesh,
                                    resolution=SimpleNamespace(layout='distributed'), pencil_side=int(side),
                                    parent_batch=int(width), sample_batch=1, phase=phase, **terms)
-    return int(price['terms_bytes_per_rank']['phase_dense_temporaries'])
+    return FACE_PROGRAM_COPIES * int(price['terms_bytes_per_rank']['phase_dense_temporaries'])
 
 
 def face_reduction_bytes(mesh, width, *, rows, side, carrier, retain_span=False):
