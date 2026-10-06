@@ -251,6 +251,17 @@ def is_face(array):
     return len(spec) == array.ndim and spec[-2:] == ('x', 'y')
 
 
+#: Face programs compile with XLA's latency-hiding scheduler, which runs the
+#: panel all-gathers of ``panel_matmul`` beside the local GEMMs (claims 2953,
+#: 3115: Sigma tau -4 to -10 % on the same option; +0.5 GB per rank, inside
+#: ``FACE_PROGRAM_COPIES``). Remat is off globally, so the hazard of claim 2961 is closed.
+FACE_COMPILER_OPTIONS = {"xla_gpu_enable_latency_hiding_scheduler": True}
+
+#: Local GEMM depth of one interleaved SUMMA panel: ``panel_matmul`` gathers
+#: ``p * FACE_PANEL_DEPTH`` contraction columns per step for the whole batch.
+FACE_PANEL_DEPTH = 256
+
+
 def face_program(fn, mesh, *, outputs='matrices'):
     """Compile glue with an explicit matrix/scalar output contract.
 
@@ -291,18 +302,32 @@ def face_program(fn, mesh, *, outputs='matrices'):
                 out=(matrix(shapes[0]),model(shapes[1]))
             else:
                 raise ValueError('unknown explicit constructor output contract '+outputs)
-            compiled[signature]=distrib_la.checked_program(fn,mesh,out)
+            compiled[signature]=distrib_la.checked_program(fn,mesh,out,compiler_options=FACE_COMPILER_OPTIONS)
         return compiled[signature]
     return lambda *args: program(*args)(*args)
 
 
 @lru_cache(maxsize=None)
 def face_matmul(mesh):
-    """The whole-mesh constructor's product: the batched 2-D SUMMA of the service
-    (``distrib_la.summa``), pure JAX on the x/y face, so the face programs hold no
-    vendor GEMM; measured at the cuBLASMp provider's throughput (SECTFAST 2026-10-06)."""
-    from distrib_la import summa
-    return partial(summa, mesh=mesh)
+    """The whole-mesh constructor's product: ``distrib_la.panel_matmul``, the batched
+    2-D SUMMA of the Green builder (one all_gather per operand per panel for the whole
+    stack, a panel prefetched, transposed operands by one grid-transpose exchange), so
+    a face program holds no distributed-library GEMM and runs on any backend. The
+    panel holds ``p * FACE_PANEL_DEPTH`` contraction columns. A non-square mesh keeps
+    the provider product (the slow fallback)."""
+    from distrib_la import matmul, panel_matmul
+    p = int(mesh.shape['x'])
+    if p != int(mesh.shape['y']):
+        return partial(matmul, mesh=mesh, backend='distributed', batched_route='auto')
+
+    def product(a, b, *, transa='N', transb='N'):
+        q = int(a.shape[0])
+        m = int(a.shape[2] if transa != 'N' else a.shape[1])
+        n = int(b.shape[1] if transb != 'N' else b.shape[2])
+        per_column = a.dtype.itemsize * q * (m // p + n // p)
+        return panel_matmul(a, b, mesh=mesh, panel_bytes=per_column * 2 * p * FACE_PANEL_DEPTH,
+                            transa=transa, transb=transb)
+    return product
 
 
 @lru_cache(maxsize=None)
