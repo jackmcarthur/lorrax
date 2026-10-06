@@ -15,58 +15,42 @@ from distrib_la import (diagonal_like, face_sharding, hermitian_part,
 from gw.shared_pole_pencil import _adjoint, _matrix_layout
 
 
-def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None, eigen=None):
-    """Correct a dimensionless Hermitian metric: Z = A**(-1/2), by Newton–Schulz or from its eigh.
+def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None):
+    """Correct a dimensionless Hermitian metric by coupled Newton–Schulz.
 
     ``metric`` is [b,R,R], complex128 in the caller's face layout. Products
-    use the resolved distrib_la GEMM. Without ``eigen``: coupled Newton–Schulz.
-    Y starts at A and Z at I; the coupled
+    use the resolved distrib_la GEMM. Y starts at A and Z at I; the coupled
     update T=(3I-ZY)/2, Y=YT, Z=TZ computes A**(-1/2) without eigenvectors.
     The initial infinity norm bounds the spectral error. For radius d<1,
     d_next <= d**2*(3+d)/4 <= d**2; choose the entire iteration count from
     that initial bound, never from an on-device residual convergence test.
-    ``eigen`` = (values, vectors) of ``metric`` (the caller's eigh, one whole
-    matrix per rank over every parent in flight) gives Z = V diag(values**-1/2) V^H,
-    one product instead of three per iteration; a parent with a nonpositive or
-    nonfinite value is invalid. Either way the returned diagnostics include the
-    measured ZAZ-I residual, which the caller gates.
+    The returned diagnostics include the measured ZAZ-I residual and guard.
     """
     identity = _matrix_layout(diagonal_like(jnp.ones(metric.shape[:1] + metric.shape[-1:]), metric), matrix_sharding)
     radius = jnp.max(jnp.sum(jnp.abs(identity - metric), axis=-1), axis=-1)
+    valid = jnp.isfinite(radius) & (radius < 1)
+    if not isinstance(radius, jax.core.Tracer) and not bool(jnp.all(valid)):
+        raise ValueError(f"GATE shared_pole_metric_inverse_root: got: infinity norm {radius.tolist()}; want: finite norm < 1; why: Newton-Schulz convergence bound")
     # Aim near float64 roundoff, leaving the physical residual gate intact.
     target = min(float(tolerance), 32 * jnp.finfo(metric.real.dtype).eps)
-    bounded = jnp.isfinite(radius) & (radius < 1)
-    safe_radius = jnp.where(bounded & (radius > target), radius, .5)
+    safe_radius = jnp.where(valid & (radius > target), radius, .5)
     counts = jnp.maximum(0, jnp.ceil(jnp.log2(
         jnp.log(target) / jnp.log(safe_radius)))).astype(jnp.int32)
-    # Newton-Schulz's count from the bound, per parent (-1: no bound), run or not.
-    counts = jnp.where(bounded, jnp.where(radius > target, counts, 0), -1)
-    if eigen is not None:
-        values, vectors = eigen
-        valid = jnp.all(jnp.isfinite(values), axis=-1) & (values[:, 0] > 0)
-        root = jnp.where(valid[:, None], 1 / jnp.sqrt(jnp.where(values > 0, values, 1)), 0)
-        correction = _matrix_layout(matmul(_matrix_layout(vectors * root[:, None, :], matrix_sharding), vectors,
-                                           transb="C"), matrix_sharding)
-        iterations = jnp.zeros((), jnp.int32)
-    else:
-        valid = bounded
-        if not isinstance(radius, jax.core.Tracer) and not bool(jnp.all(valid)):
-            raise ValueError(f"GATE shared_pole_metric_inverse_root: got: infinity norm {radius.tolist()}; want: finite norm < 1; why: Newton-Schulz convergence bound")
-        iterations = jnp.where(jnp.all(valid), jnp.max(counts), 0)
+    counts = jnp.where(valid & (radius > target), counts, 0)
+    iterations = jnp.where(jnp.all(valid), jnp.max(counts), 0)
 
-        def step(_, state):
-            y, z = state
-            t = (3 * identity - matmul(z, y)) * .5
-            return matmul(y, t), matmul(t, z)
+    def step(_, state):
+        y, z = state
+        t = (3 * identity - matmul(z, y)) * .5
+        return matmul(y, t), matmul(t, z)
 
-        _, correction = jax.lax.fori_loop(0, iterations, step, (metric, identity))
+    _, correction = jax.lax.fori_loop(0, iterations, step, (metric, identity))
     residual = matmul(correction, matmul(metric, correction)) - identity
     absolute = jnp.linalg.norm(residual, axis=(-2, -1))
     relative = absolute / jnp.sqrt(metric.shape[-1])
     diagnostics = {
         "metric_initial_infinity_norm": radius,
         "metric_inverse_root_iterations": jnp.full(radius.shape, iterations),
-        "metric_newton_schulz_bound_iterations": counts,
         "metric_inverse_root_residual_fro": absolute,
         "metric_inverse_root_residual_relative": relative,
     }
@@ -391,17 +375,15 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
                        carrier=carrier)
     gamma_r, u_r = eigh(stage["schur"])
     stage = paired_stage(stage, gamma_r, u_r, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding)
-    stage = paired_correct(stage, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding)
     mu, rotation = eigh(stage["reduced"])
     return output_stage(stage, mu, rotation, matmul=matmul, gates=gates, retain_span=retain_span,
                         matrix_sharding=matrix_sharding)
 
 
-# The five GEMM stages of the paired reduction, with the three eighs between them.
+# The four GEMM stages of the paired reduction, with the three eighs between them.
 # ``reduce_ordered_shared_pole_pencil`` composes them inside one program (the local
 # round, the face round); the decoupled face route runs each stage over a batch of
-# parents and each eigh over every parent in flight (``shared_pole_execution``),
-# where the paired metric's inverse root may come from a fourth eigh (``paired_correct``).
+# parents and each eigh over every parent in flight (``shared_pole_execution``).
 # A stage takes and returns a dict of arrays; no array crosses a stage boundary
 # that the next stage does not read.
 
@@ -513,7 +495,7 @@ def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=
 
 
 def paired_stage(stage, gamma_r, u_r, *, matmul, gates, matrix_sharding=None):
-    """Stage 3: the Schur cut, Y = L^-H on the kept span and its metric ``metric_r`` = Y^H H_r Y."""
+    """Stage 3: the Schur cut, Y = L^-H on the kept span and its metric correction; ``reduced`` goes to the last eigh."""
     face = None
     keep_cut = gates["normalized_gram_keep"]["threshold"]
     kept, b_r, h_r, g_r = stage["kept"], stage["b_r"], stage["h_r"], stage["g_r"]
@@ -536,24 +518,17 @@ def paired_stage(stage, gamma_r, u_r, *, matmul, gates, matrix_sharding=None):
     metric_r = hermitian_part(matmul(y, matmul(h_r, y), transa="C")) + null_r
     # The restricted sources are released before the second metric correction.
     del null_r, h_r
-    out = {k: v for k, v in stage.items() if k not in ("schur", "h_r", "b_r")}
-    out.update(metric_r=metric_r, y=y, keep_r=keep_r, count_r=count_r, gamma_r=gamma_r, ratio_r=ratio_r)
-    return out
-
-
-def paired_correct(stage, eigen=None, *, matmul, gates, matrix_sharding=None):
-    """Stage 3b: Y <- Y metric_r**(-1/2) (Newton–Schulz, or ``eigen`` = eigh(metric_r)); ``reduced`` = Y^H G_r Y goes to the last eigh."""
-    y, g_r, keep_r = stage["y"], stage["g_r"], stage["keep_r"]
     correction_r, metric_r_ok, paired_metric_diagnostics = _metric_inverse_root(
-        stage["metric_r"], matmul=matmul, tolerance=gates["retained_subspace_moments"]["threshold"],
-        matrix_sharding=matrix_sharding, eigen=eigen)
+        metric_r, matmul=matmul, tolerance=gates["retained_subspace_moments"]["threshold"], matrix_sharding=matrix_sharding)
+    del metric_r
     y = matmul(y, correction_r) * keep_r[:, None, :]
     del correction_r
     reduced = hermitian_part(matmul(y, matmul(g_r, y), transa="C"))
-    out = {k: v for k, v in stage.items() if k not in ("metric_r", "g_r")}
-    out.update(reduced=reduced, y=y, metric_r_ok=metric_r_ok,
+    out = {k: v for k, v in stage.items() if k not in ("schur", "h_r", "b_r", "g_r")}
+    out.update(reduced=reduced, y=y, keep_r=keep_r, count_r=count_r, gamma_r=gamma_r, ratio_r=ratio_r,
+               metric_r_ok=metric_r_ok,
                paired_metric_residual_relative=paired_metric_diagnostics["metric_inverse_root_residual_relative"],
-               paired_metric_ns_bound=paired_metric_diagnostics["metric_newton_schulz_bound_iterations"])
+               paired_metric_iterations=paired_metric_diagnostics["metric_inverse_root_iterations"])
     return out
 
 
@@ -593,7 +568,7 @@ def output_stage(stage, mu, rotation, *, matmul, gates, retain_span=False, matri
     diagnostics = {
         **stage["metric_diagnostics"],
         "paired_metric_inverse_root_residual_relative": stage["paired_metric_residual_relative"],
-        "paired_metric_newton_schulz_bound_iterations": stage["paired_metric_ns_bound"],
+        "paired_metric_inverse_root_iterations": stage["paired_metric_iterations"],
         "gram_diagonal_positive": stage["diagonal_ok"],
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,

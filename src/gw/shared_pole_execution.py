@@ -241,11 +241,10 @@ def route_summary(mode, receipt):
                   f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh room "
                   + ("none, " if decoupled.get('eigh_room_bytes_per_rank') is None
                      else f"{decoupled['eigh_room_bytes_per_rank'] / 1e9:.1f} GB/rank, ")
-                  + ("every eigh once over the stack, paired metric root by "
-                     f"{decoupled.get('paired_inverse_root', '?')}" if decoupled['admitted']
+                  + ("every eigh once over the stack" if decoupled['admitted']
                      else "stacks over budget: face rounds over the stacked panels")
                   + f", max |ZAZ-I|/sqrt(R) keep {decoupled['keep_residual']:.1e} paired {decoupled['paired_residual']:.1e}"
-                  + f", paired Newton-Schulz bound {decoupled.get('paired_ns_bound', '?')} iteration(s)")
+                  + f" ({decoupled['paired_iterations']} Newton-Schulz iteration(s))")
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
@@ -678,11 +677,10 @@ def compact_program(mesh,width):
 # of ``width`` parents, its outputs stacked for every parent, and each eigh
 # runs once over the whole stack, one matrix per rank (route (c), flat to
 # b = P). Nothing between stages is held that the next stage does not read.
-# Where the paired [2c, 2c] metric's stack runs route (c) too, its inverse root
-# is V diag(lambda**-1/2) V^H from one more such eigh: 3 GEMMs of side 2c with the
-# residual check, against Newton-Schulz's 3 per iteration plus the check (CrI3 24x24
-# TT: 14 GEMMs, 700 TF per parent, the bulk of the reduction's flops). A metric
-# whose stack would run on the whole mesh keeps Newton-Schulz.
+# The metric corrections stay Newton-Schulz inside their stage: the paired metric
+# Y^H H_r Y is the identity to ~1e-8 by construction, so its bound asks one
+# iteration (CrI3 6x6), cheaper than a further eigh of the stack (P64 TT: one
+# iteration of 61 parents 10.7 s, the eigh root 25.2 s; claim 3425).
 
 
 @lru_cache(maxsize=None)
@@ -756,7 +754,7 @@ def _take(mesh, tree, i0, i1):
 def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_keep, carrier):
     """The four stage programs of the decoupled face reduction, each jitted on the face."""
     from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, _matrix_take_columns
-    from gw.shared_pole_reduction import paired_members, keep_stage, paired_stage, paired_correct, output_stage
+    from gw.shared_pole_reduction import paired_members, keep_stage, paired_stage, output_stage
     from gw.shared_pole_gates import sort_shared_pole_columns, apply_shared_pole_zero_policy, ordered_moment_identity
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     if not (ordered and odd_moments):
@@ -800,10 +798,6 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
         return new_only('paired', stage, paired_stage(extents(stage), gamma_r, u_r, matmul=mm, gates=gates,
                                                       matrix_sharding=ms))
 
-    def stage3b(stage, *eigen):
-        return new_only('correct', stage, paired_correct(stage, tuple(eigen) or None, matmul=mm, gates=gates,
-                                                         matrix_sharding=ms))
-
     def stage4(stage, mu, rotation, infinity):
         reduced = output_stage(extents(stage), mu, rotation, matmul=mm, gates=gates, retain_span=retain_span,
                                matrix_sharding=ms)
@@ -814,20 +808,19 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
         model, permutation = sort_shared_pole_columns(model, matrix_sharding=ms)
         result = model, signed, (reduction, zero, retained, permutation)
         return (*result, reduced[3]) if retain_span else result
-    return tuple(face_program(fn, mesh, outputs='mixed' if i < 4 else 'parent')
-                 for i, fn in enumerate((stage1, stage2, stage3, stage3b, stage4))), passthrough
+    return tuple(face_program(fn, mesh, outputs='mixed' if i < 3 else 'parent')
+                 for i, fn in enumerate((stage1, stage2, stage3, stage4))), passthrough
 
 
 def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, ordered, odd_moments,
-                          keep_budget, retain_span=False, gram_keep=None, carrier=None, receipt=None):
+                          keep_budget, retain_span=False, gram_keep=None, carrier=None):
     """All ``nq`` parents' ordered reduction: stage programs over ``width`` parents at a
     time, each eigh over the whole stack (``eigh_plan.batched``, route (c) when its
-    room allows). Returns what ``face_reduce_round`` returns, for every parent;
-    ``receipt`` (a dict) gets the paired metric's inverse-root route."""
+    room allows). Returns what ``face_reduce_round`` returns, for every parent."""
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
-    (stage1, stage2, stage3, stage3b, stage4), passthrough = programs
+    (stage1, stage2, stage3, stage4), passthrough = programs
     eigh = eigh_plan.batched
     cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
     inputs = (tables['points'], tables['order'], tables['active'],
@@ -846,14 +839,6 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, o
     gamma_r, u_r = eigh(stage['schur'])
     stage = advance('paired', stage3, stage, gamma_r, u_r)
     del gamma_r, u_r
-    metric = stage['metric_r']
-    by_eigh = eigh_plan.stack_route(metric.shape, metric.dtype, traced=False).route == 'batch_reshard'
-    if receipt is not None:
-        receipt['paired_inverse_root'] = 'eigh' if by_eigh else 'newton-schulz'
-    eigen = eigh(metric) if by_eigh else ()
-    del metric
-    stage = advance('correct', stage3b, stage, *eigen)
-    del eigen
     mu, rotation = eigh(stage['reduced'])
     result = run(stage4, stage, mu, rotation, inputs[6])
     del stage, mu, rotation

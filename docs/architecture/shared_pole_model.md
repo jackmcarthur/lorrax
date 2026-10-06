@@ -251,9 +251,8 @@ budget (the largest `pole_budget` directions, less an edge member tied to its
 neighbour below the cut within `multiplet_relative_tolerance` or the eigh's
 $R u \gamma_{\max}$, so a degenerate multiplet is never split), the coupled
 Newton–Schulz inverse root (iteration count fixed from the initial
-infinity-norm bound, never from an on-device residual; the decoupled face
-route of §6 takes the paired metric's root from its `eigh` instead), and one
-Hermitian `eigh`. The ordered route applies the paired basis (W 28), the cut on the
+infinity-norm bound, never from an on-device residual), and one Hermitian
+`eigh`. The ordered route applies the paired basis (W 28), the cut on the
 $v$-block with keep $10^{-7}$, a second relative cut on the restricted pencil,
 and the signed model (W 27); poles with $|\mu|\le$ keep$\cdot\max|\mu|$ are at
 infinity and their output weight is reported (`infinite_weight_ok`). Dedupe
@@ -339,9 +338,10 @@ selection runs in sub-batches of the admitted width, the reduction's stage
 programs (`paired_members`, `keep_stage`, `paired_stage`, `paired_correct`,
 `output_stage`) run over sub-batches and write their rows of one stack per
 array in place, and each eigh runs once over the whole stack, one whole
-matrix per rank where its program fits the room. Where the paired metric's
-stack runs that way, its inverse root is $V\Lambda^{-1/2}V^H$ from one more
-such eigh, else Newton–Schulz; both report the residual
+matrix per rank where its program fits the room. The metric corrections stay
+Newton–Schulz inside their stages (the paired metric is the identity to about
+$10^{-8}$ by construction, one iteration; an eigh root of the stack costs more,
+claim 3425); the receipt reports the largest residual
 $\|ZAZ-I\|_F/\sqrt R$ that `retained_metric_positive` gates. The stacks are
 reserved in the ledger (`sector.decoupled.<sector>.stacks`); when they do not
 fit, the same stacked panels reduce in face rounds (warn, never refuse). CT

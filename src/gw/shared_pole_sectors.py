@@ -788,7 +788,12 @@ def _sector_gates(diagnostics, sector, ids, real):
                              f"Gram min/max={reduction['gram_min_relative'][:real].tolist()}, "
                              f"paired Schur S min/max={reduction['paired_min_relative'][:real].tolist()}; no repair")
     if not np.all(zero['zero_policy'][:real]):
-        raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={sector}")
+        bad=np.flatnonzero(~np.asarray(zero['zero_policy'][:real]))
+        raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={sector}, parents={[list(ids)[i] for i in bad]}, "
+                         f"dropped weight fraction={zero['dropped_factor_weight_fraction'][bad].tolist()}, "
+                         f"dropped={zero['dropped_count'][bad].tolist()}, retained={zero['retained_rank'][bad].tolist()}, "
+                         f"factor weight={zero['factor_weight'][bad].tolist()}, "
+                         f"infinite weight fraction={reduction['infinite_weight_fraction'][bad].tolist()}")
 
 
 def _sector_selection(samples, moments, line, recipe, geometry, local_meta, n, budget, *, mesh_xy, execution, retained):
@@ -899,25 +904,23 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     # The stage stacks of every parent sit beside the eigh stacks. A stage's run holds
     # its input stack and the stack it writes in place (face_reduce_decoupled): the
     # keep stage the paired members and the restricted pencil, the paired stage the
-    # restricted pencil and (Y, metric_r), the correction (Y, G_r, metric_r), the
-    # metric's eigenvectors and (Y, Y^H G_r Y). The eighs run beside the state panels
-    # and one boundary stack, and take their room from the ledger beside the largest.
+    # restricted pencil and (Y, Y^H G_r Y). The eighs run beside the state panels and
+    # one boundary stack, and take their room from the ledger beside the larger.
     hvv=side//2
     c=int(face_ritz_carrier(mesh_xy,recipe['pole_budget']) or hvv)
     two=2*c
     packed=int(local_meta.n_rmu_padded)
     members=16*(6*hvv*hvv+2*packed*hvv)
     restricted=16*(2*two**2+2*c*c+hvv*c+packed*two)
-    metric=16*(3*two**2+hvv*c+packed*two)
     per_rank=lambda bytes_per_parent:-(-int(bytes_per_parent)*int(nq)//int(mesh_xy.size))
     panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:])
     panels+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
-    stacks=per_rank(max(members+restricted,restricted+16*2*two**2,metric+16*3*two**2))
+    stacks=per_rank(max(members+restricted,restricted+16*2*two**2))
     row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=stacks+panels,
                        workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)
     ambient=ledger.live_stages
     ledger.live_stages=(*ambient,row['stage'])
-    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members,restricted,metric))+panels,
+    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members,restricted))+panels,
                           workspace_bytes_per_rank=0,concurrent_with=ambient)
     room=face_eigh_room(beside)
     admitted=row['device_budget_status']=='PASS'
@@ -935,7 +938,7 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
         if admitted:
             reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,eigh_plan=face_eigh(mesh_xy,side,room),
                 width=int(width),ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-                gram_keep=gram_keep,carrier=carrier,receipt=receipt)
+                gram_keep=gram_keep,carrier=carrier)
         else:
             # The stacks do not fit beside the live set (warn, never refuse): the same
             # stacked panels reduce in face rounds of the admitted width, the eighs per round.
@@ -958,7 +961,7 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     residual=lambda key:float(np.max(np.asarray(diagnostics[0][key])[:int(nq)]))
     receipt.update(keep_residual=residual('metric_inverse_root_residual_relative'),
                    paired_residual=residual('paired_metric_inverse_root_residual_relative'),
-                   paired_ns_bound=int(residual('paired_metric_newton_schulz_bound_iterations')))
+                   paired_iterations=int(residual('paired_metric_inverse_root_iterations')))
     budget.retained_panels=tuple(retained)
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
