@@ -368,6 +368,38 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     # Traced (a round program): the caller refuses on diagnostics["orientation_paired"].
     if not isinstance(paired, jax.core.Tracer) and not bool(paired):
         raise ValueError(ORIENTATION_PAIR_REFUSAL)
+    stage = paired_members(pencil, active_columns, gates=gates, matrix_sharding=matrix_sharding)
+    gamma, u = eigh(stage["h_vv"])
+    stage = keep_stage(stage, gamma, u, matmul=matmul, gates=gates, keep_budget=keep_budget,
+                       retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep,
+                       carrier=carrier)
+    gamma_r, u_r = eigh(stage["schur"])
+    stage = paired_stage(stage, gamma_r, u_r, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding)
+    mu, rotation = eigh(stage["reduced"])
+    return output_stage(stage, mu, rotation, matmul=matmul, gates=gates, retain_span=retain_span,
+                        matrix_sharding=matrix_sharding)
+
+
+# The four GEMM stages of the paired reduction, with the three eighs between them.
+# ``reduce_ordered_shared_pole_pencil`` composes them inside one program (the local
+# round, the face round); the decoupled face route runs each stage over a batch of
+# parents and each eigh over every parent in flight (``shared_pole_execution``).
+# A stage takes and returns a dict of arrays; no array crosses a stage boundary
+# that the next stage does not read.
+
+def paired_members(pencil, active_columns, *, gates, matrix_sharding=None):
+    """Stage 1: the paired-basis members of (G, H, O), equilibrated; ``h_vv`` goes to the first eigh."""
+    g, h, output, points = pencil
+    side, finite = int(g.shape[-1]), int(points.shape[-1])
+    half, n_inf = finite // 2, (side - finite) // 2
+    if finite % 2 or (side - finite) % 2:
+        raise ValueError(f"GATE shared_pole_orientation_pair: got: {finite} finite and {side - finite} infinity columns; want: even counts; why: the ordered cut acts in the paired basis")
+    paired = (jnp.all(points[:, half:] == -points[:, :half])
+              & jnp.all(active_columns[:, half:finite] == active_columns[:, :half])
+              & jnp.all(active_columns[:, finite + n_inf:] == active_columns[:, finite:finite + n_inf]))
+    # Traced (a round program): the caller refuses on diagnostics["orientation_paired"].
+    if not isinstance(paired, jax.core.Tracer) and not bool(paired):
+        raise ValueError(ORIENTATION_PAIR_REFUSAL)
     face = face_sharding(g)
     output_face = face if face_sharding(output) is None else face_sharding(output)
     statics = dict(half=half, finite=finite, n_inf=n_inf)
@@ -391,9 +423,18 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     sandwich = lambda a: scale[:, :, None] * a * scale[:, None, :]
     g_ww, g_wv, g_vv, h_ww, h_wv, h_vv = (sandwich(a) for a in (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv))
     o_w, o_v = o_w * scale[:, None, :], o_v * scale[:, None, :]
+    return dict(g_ww=g_ww, g_wv=g_wv, g_vv=g_vv, h_ww=h_ww, h_wv=h_wv, h_vv=h_vv, o_w=o_w, o_v=o_v,
+                scale=scale, inverse=inverse, diagonal_ok=diagonal_ok, paired=paired, side=side, half=half)
+
+
+def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=False,
+               matrix_sharding=None, gram_keep=None, carrier=None):
+    """Stage 2: the H'_vv keep cut, its metric correction and the restricted pencil; ``schur`` goes to the second eigh."""
+    scale = stage["scale"]
+    h_vv, h_ww, h_wv = stage["h_vv"], stage["h_ww"], stage["h_wv"]
+    face = None
     validity = gates["normalized_gram_validity"]["threshold"]
     keep_cut = gates["normalized_gram_keep"]["threshold"] if gram_keep is None else gram_keep
-    gamma, u = eigh(hermitian_part(h_vv))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
     floor = _validity_floor(scale, None, None, largest, gates=gates)
@@ -431,8 +472,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     # (identity after correction). On time-reversal-symmetric data H_r = diag(t_s, I),
     # t_s the even route's Z^H H_s Z; once time reversal is broken the halves mix and a
     # w combination can lie in span(v), so a second relative keep cut removes exactly
-    # those redundant combinations before the H-metric Ritz step. The cut acts on the
-    # Schur complement S = A - B B^H of the unit v-block: P^H H_r P = diag(S, I) with
+    # those redundant combinations before the H-metric Ritz step. The cut acts on
+    # the Schur complement S = A - B B^H of the unit v-block: P^H H_r P = diag(S, I) with
     # P = [[I, 0], [-B^H, I]], so only S is eigendecomposed and the structural unit
     # half of H_r never enters the eigensolver (whole-H_r eigh: backward error
     # 8e-4 top on Fe 4^3 complete-basis parents, claim of the PAIREDHR lane).
@@ -440,14 +481,24 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     h_r = _matrix_layout(on_face(_restricted_block, face, a_r, b_r, metric), matrix_sharding)
     schur = _matrix_layout(hermitian_part(a_r - matmul(b_r, b_r, transb="C")), matrix_sharding)
     del h_ww, h_wv, metric, a_r
-    g_r = _matrix_layout(on_face(_restricted_block, face, project(z, g_ww), project(z, g_wv), project(z, g_vv)), matrix_sharding)
-    del g_ww, g_wv, g_vv
-    o_r = _matrix_layout(join_columns(matmul(o_w, z), matmul(o_v, z)), matrix_sharding)
+    g_r = _matrix_layout(on_face(_restricted_block, face, project(z, stage["g_ww"]), project(z, stage["g_wv"]),
+                                 project(z, stage["g_vv"])), matrix_sharding)
+    o_r = _matrix_layout(join_columns(matmul(stage["o_w"], z), matmul(stage["o_v"], z)), matrix_sharding)
+    out = dict(schur=schur, h_r=h_r, g_r=g_r, o_r=o_r, b_r=b_r, kept=kept, keep=keep, gamma=gamma, largest=largest,
+               ratio=ratio, floor=floor, count=count, width=width, metric_ok=metric_ok,
+               metric_relative=metric_relative, metric_diagnostics=metric_diagnostics,
+               scale=scale, inverse=stage["inverse"], diagonal_ok=stage["diagonal_ok"],
+               paired=stage["paired"], side=stage["side"], half=stage["half"])
     if retain_span:
-        paired_span = scale[:, :, None] * z
-    del o_w, o_v, z
-    gamma_r, u_r = eigh(schur)
-    del schur
+        out["paired_span"] = scale[:, :, None] * z
+    return out
+
+
+def paired_stage(stage, gamma_r, u_r, *, matmul, gates, matrix_sharding=None):
+    """Stage 3: the Schur cut, Y = L^-H on the kept span and its metric correction; ``reduced`` goes to the last eigh."""
+    face = None
+    keep_cut = gates["normalized_gram_keep"]["threshold"]
+    kept, b_r, h_r, g_r = stage["kept"], stage["b_r"], stage["h_r"], stage["g_r"]
     # diag(S, I) is H_r's congruent form: its spectrum is spec(S) plus the unit
     # block, so the relative cut and the validity ratio are taken against
     # max(top(S), 1), as the whole-H_r cut was against top(H_r) >= 1. Relative
@@ -472,10 +523,23 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     del metric_r
     y = matmul(y, correction_r) * keep_r[:, None, :]
     del correction_r
-    mu, rotation = eigh(hermitian_part(matmul(y, matmul(g_r, y), transa="C")))
-    del g_r
+    reduced = hermitian_part(matmul(y, matmul(g_r, y), transa="C"))
+    out = {k: v for k, v in stage.items() if k not in ("schur", "h_r", "b_r", "g_r")}
+    out.update(reduced=reduced, y=y, keep_r=keep_r, count_r=count_r, gamma_r=gamma_r, ratio_r=ratio_r,
+               metric_r_ok=metric_r_ok)
+    return out
+
+
+def output_stage(stage, mu, rotation, *, matmul, gates, retain_span=False, matrix_sharding=None):
+    """Stage 4: the Ritz step's outputs, the signed and positive models and the diagnostics."""
+    y, o_r, kept, keep_r = stage["y"], stage["o_r"], stage["kept"], stage["keep_r"]
+    inverse, scale, side, half, width = stage["inverse"], stage["scale"], stage["side"], stage["half"], stage["width"]
+    gamma, largest, ratio, floor, count = stage["gamma"], stage["largest"], stage["ratio"], stage["floor"], stage["count"]
+    gamma_r, ratio_r, count_r = stage["gamma_r"], stage["ratio_r"], stage["count_r"]
+    validity = gates["normalized_gram_validity"]["threshold"]
     c = matmul(o_r, matmul(y, rotation))
     if retain_span:
+        paired_span = stage["paired_span"]
         ritz = matmul(y, rotation)
         span_w = matmul(paired_span, ritz[:, :width])
         span_v = matmul(paired_span, ritz[:, width:])
@@ -500,8 +564,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     gram_ok = ((largest > 0) & jnp.all(jnp.isfinite(gamma), axis=-1) & (gamma[:, 0] >= -floor)
                & jnp.all(jnp.isfinite(gamma_r), axis=-1) & (ratio_r >= validity))
     diagnostics = {
-        **metric_diagnostics,
-        "gram_diagonal_positive": diagonal_ok,
+        **stage["metric_diagnostics"],
+        "gram_diagonal_positive": stage["diagonal_ok"],
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,
         "gram_floor_relative": floor / jnp.where(largest > 0, largest, 1),
@@ -509,14 +573,14 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
         "paired_rank": count_r,
         "gram_spectrum_relative": gamma / jnp.where(largest > 0, largest, 1)[:, None],
         "retained_rank": count,
-        "gram_condition": largest / jnp.min(jnp.where(keep, gamma, jnp.inf), axis=-1),
-        "retained_metric_positive": metric_ok & metric_r_ok,
-        "retained_metric_relative": metric_relative,
+        "gram_condition": largest / jnp.min(jnp.where(stage["keep"], gamma, jnp.inf), axis=-1),
+        "retained_metric_positive": stage["metric_ok"] & stage["metric_r_ok"],
+        "retained_metric_relative": stage["metric_relative"],
         "positive_count": jnp.sum(positive, axis=-1, dtype=jnp.int64),
         "negative_count": jnp.sum(retained & (mu < 0), axis=-1, dtype=jnp.int64),
         "infinite_weight_fraction": infinite,
         "infinite_weight_ok": infinite <= budget,
-        "orientation_paired": jnp.broadcast_to(paired, count.shape),
+        "orientation_paired": jnp.broadcast_to(stage["paired"], count.shape),
     }
     if retain_span:
         coefficients = coefficients * retained[:, None, :]
