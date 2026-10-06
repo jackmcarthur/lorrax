@@ -82,6 +82,19 @@ def _kernels(x, occ, eta, analytic_convention, xp):
     return f, (dc if analytic_convention == "retarded" else x - 1j * eta), dc
 
 
+def _physical_band_mask(x, n_active, band_valid):
+    count = x.shape[-1] if n_active is None else int(n_active)
+    if not 0 < count <= x.shape[-1]:
+        raise ValueError("CD n_active must include a positive physical band extent")
+    active = np.arange(x.shape[-1])[None, None, None, :] < count
+    if band_valid is not None:
+        valid = np.asarray(band_valid)
+        if valid.dtype != np.bool_:
+            raise ValueError("CD band_valid must be an explicit boolean physical-state mask")
+        active = active & np.broadcast_to(valid, x.shape)
+    return active
+
+
 def anchor_coefficients(value, derivative_s, eta, *, betas=None):
     """Two decaying poles matching value and exact ``d/ds`` at ``z=i eta``.
 
@@ -102,7 +115,8 @@ def _odd_anchor(d, x, beta, zero_angle, xp):
     return (np.log(beta**2) - (xp.log(xp.abs(d2)) + 1j * angle)) / (2 * (beta**2 - d2))
 
 
-def anchor_part(value0, deriv0, x, occ, *, eta, betas=None,
+def anchor_part(value0, deriv0, x, occ, *, eta, betas=None, n_active=None,
+                band_valid=None,
                 analytic_convention="time_ordered_fractional", xp=np):
     """Analytic anchor integral, and its two ordered half-line coefficients."""
     xh, fh = _inputs(x, occ, eta)
@@ -117,11 +131,15 @@ def anchor_part(value0, deriv0, x, occ, *, eta, betas=None,
         even = f * sign / (2 * b * (b + sign * dv)) + (1 - f) * sign / (2 * b * (b + sign * dc))
         odd = (f * _odd_anchor(dv, x, b, angle_v, xp)
                + (1 - f) * _odd_anchor(dc, x, b, np.pi, xp)) * (1j / (2 * np.pi))
+        if n_active is not None or band_valid is not None:
+            active = xp.asarray(_physical_band_mask(xh, n_active, band_valid))
+            even, odd = xp.where(active, even, 0.), xp.where(active, odd, 0.)
         total = total + _apply(.5 * (p + m), even, xp) + _apply(p - m, odd, xp)
     return total, cp, cm, beta
 
 
 def imag_remainder_node(value_i, u, weight, x, occ, cp, cm, betas, *, eta,
+                        n_active=None, band_valid=None,
                         analytic_convention="time_ordered_fractional", xp=np):
     """One imaginary node with its known Green-pole limit subtracted first.
 
@@ -134,11 +152,44 @@ def imag_remainder_node(value_i, u, weight, x, occ, cp, cm, betas, *, eta,
     f, dv, dc = _kernels(x, occ, eta, analytic_convention, xp)
     minus = (f / (dv - 1j * u) + (1 - f) / (dc - 1j * u)) * (weight / (2 * np.pi))
     plus = (f / (dv + 1j * u) + (1 - f) / (dc + 1j * u)) * (weight / (2 * np.pi))
+    if n_active is not None or band_valid is not None:
+        active = xp.asarray(_physical_band_mask(np.asarray(x), n_active, band_valid))
+        minus, plus = xp.where(active, minus, 0.), xp.where(active, plus, 0.)
     ap, am = 0, 0
     for p, m, beta in zip(cp, cm, betas):
         ap = ap + p / (u * u + beta * beta)
         am = am + m / (u * u + beta * beta)
     return _apply(value_i - ap, minus, xp) + _apply(_dagger(value_i, xp) - am, plus, xp)
+
+
+def _residue_weights(x, f, n_active, band_valid):
+    return _physical_band_mask(x, n_active, band_valid), np.where(x < 0, f, -(1 - f))
+
+
+def real_residue_node(value, value_t, x, occ, node, *, eta, n_active=None,
+                      band_valid=None, analytic_convention="time_ordered_fractional",
+                      xp=np):
+    """One exact positive-line crossing, without an interpolating real grid.
+
+    Both values are evaluated at the common frequency ``node+i eta``;
+    ``value_t`` is the -q interaction already transposed and contracted.
+    Only states with exactly ``abs(x)==node`` contribute. The caller must
+    enumerate every active distinct crossing from its original x table and
+    authenticate that coverage; it must not round or cluster crossings.
+    Different external read energies are selected after the common-frequency
+    matrix sample is formed, never before its ordered partner dagger.
+    """
+    xh, fh = _inputs(x, occ, eta)
+    _kernels(xh, fh, eta, analytic_convention, np)
+    node = float(node)
+    if not np.isfinite(node) or node < 0:
+        raise ValueError("CD exact residue node must be finite and nonnegative")
+    active, residue = _residue_weights(xh, fh, n_active, band_valid)
+    selected = xp.asarray(np.where(active & (np.abs(xh) == node), residue, 0.))
+    sign = xp.asarray(xh < 0)
+    partner = _dagger(value_t, xp) if analytic_convention == "retarded" else value_t
+    return (_apply(value, xp.where(sign, 0., selected), xp)
+            + _apply(partner, xp.where(sign, selected, 0.), xp))
 
 
 def real_part(values, derivatives_s, values_t, derivatives_t_s, x, occ, nodes,
@@ -167,16 +218,7 @@ def real_part(values, derivatives_s, values_t, derivatives_t_s, x, occ, nodes,
     stride = round(spacing / base)
     if stride < 1 or not np.isclose(stride * base, spacing, rtol=2e-12, atol=0):
         raise ValueError("CD residue spacing must be an integer multiple of its base grid")
-    count = xh.shape[-1] if n_active is None else int(n_active)
-    if not 0 < count <= xh.shape[-1]:
-        raise ValueError("CD n_active must include a positive physical band extent")
-    active = np.arange(xh.shape[-1])[None, None, None, :] < count
-    if band_valid is not None:
-        valid = np.asarray(band_valid)
-        if valid.dtype != np.bool_:
-            raise ValueError("CD band_valid must be an explicit boolean physical-state mask")
-        active = active & np.broadcast_to(valid, xh.shape)
-    residue = np.where(xh < 0, fh, -(1 - fh))
+    active, residue = _residue_weights(xh, fh, n_active, band_valid)
     query = np.abs(xh)
     last = nodes[((nodes.size - 1) // stride) * stride]
     if np.any(active & (residue != 0) & (query > last)):
@@ -226,6 +268,7 @@ def integrate_ordered(values, derivatives_s, values_t, derivatives_t_s, x, occ,
     """
     x, occ = _inputs(x, occ, eta)
     anchor, cp, cm, beta = anchor_part(values[0], derivatives_s[0], x, occ, eta=eta,
+                                      n_active=n_active, band_valid=band_valid,
                                       analytic_convention=analytic_convention, xp=xp)
     nodes = np.asarray(schedule["real_nodes"], np.float64)
     spacings = (nodes[1] - nodes[0],) if spacings is None else tuple(spacings)
@@ -242,6 +285,7 @@ def integrate_ordered(values, derivatives_s, values_t, derivatives_t_s, x, occ,
         for i, ui, wi in zip(indices, u, weights):
             remainder = remainder + imag_remainder_node(values[i], ui, wi, xp.asarray(x), occ,
                                                          cp, cm, beta, eta=eta,
+                                                         n_active=n_active, band_valid=band_valid,
                                                          analytic_convention=analytic_convention, xp=xp)
         for h, residues in real.items():
             out[(len(u), h)] = anchor + remainder + residues

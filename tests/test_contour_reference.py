@@ -162,3 +162,94 @@ def test_infinite_rule_scale_refinement_checks_a_distinct_tail():
     exact = np.pi / (2 * beta)
     assert abs(values[-1] - exact) < 1e-10 * exact
     assert abs(values[-1] - values[0]) < 1e-10 * exact
+
+
+def _exact_node_one_pole(eta_ev, occupation, convention, *, masked=False,
+                         omit_node=None, perturb_node=None):
+    """A complete CD integral whose real samples have no interpolation error.
+
+    This plant evaluates an independently specified ordered Lehmann model
+    at each crossing. It deliberately supplies nonzero invalid coefficients
+    when masked, so a successful result requires every contour term to honor
+    the physical-band mask rather than relying on zero padded wavefunctions.
+    """
+    _, x, f, _, eta, omega, rp, rm = _one_pole_matrix(eta_ev, occupation)
+    valid, n_active = None, None
+    if masked:
+        x = x + np.asarray([0., .03, .19])[None, None, None, :]
+        f = np.broadcast_to(np.asarray([occupation, .7, .2]), x.shape)
+        scale = np.asarray([1., 7., 1000.])[None, None, None, :]
+        rp, rm = rp * scale, rm * scale
+        valid = np.asarray([True, False, True])[None, None, None, :]
+        n_active = 2
+    physical = np.ones(x.shape, bool)
+    if valid is not None:
+        physical &= np.broadcast_to(valid, x.shape)
+        physical &= np.arange(x.shape[-1])[None, None, None, :] < n_active
+
+    def value(z, partner=False):
+        a, b = (rm, rp) if partner else (rp, rm)
+        return -a / (z - omega) + b / (z + omega)
+
+    def slope(z):
+        return (rp / (z - omega)**2 - rm / (z + omega)**2) / (2 * z)
+
+    kwargs = dict(eta=eta, analytic_convention=convention,
+                  n_active=n_active, band_valid=valid)
+    total, cp, cm, beta = cd.anchor_part(value(1j * eta), slope(1j * eta),
+                                        x, f, **kwargs)
+    u, w = cd.imaginary_rule(192, eta, scale=omega)
+    for ui, wi in zip(u, w):
+        total += cd.imag_remainder_node(value(1j * ui), ui, wi, x, f,
+                                        cp, cm, beta, **kwargs)
+    residue_weight = np.where(x < 0, f, 1 - f)
+    nodes = np.unique(np.abs(x)[physical & (residue_weight != 0)])
+    for i, node in enumerate(nodes):
+        if i == omit_node:
+            continue
+        declared = np.nextafter(node, np.inf) if i == perturb_node else node
+        total += cd.real_residue_node(value(node + 1j * eta),
+                                      value(node + 1j * eta, partner=True),
+                                      x, f, declared, **kwargs)
+    occupied_sheet = -1 if convention == "time_ordered_fractional" else 1
+    expected = (np.einsum("kabl,kael->kabe", rp,
+                           np.where(physical, (1 - f) / (x - omega + 1j * eta), 0))
+                + np.einsum("kabl,kael->kabe", rm,
+                            np.where(physical, f / (x + omega + occupied_sheet * 1j * eta), 0)))
+    return total, expected, nodes
+
+
+@pytest.mark.parametrize("eta_ev", [.05, .25, 1.])
+@pytest.mark.parametrize("occupation", [0., .25, .5, 1.])
+@pytest.mark.parametrize("convention", ["time_ordered_fractional", "retarded"])
+def test_exact_crossing_integral_matches_independent_ordered_poles(eta_ev, occupation, convention):
+    got, expected, nodes = _exact_node_one_pole(eta_ev, occupation, convention)
+    assert np.max(np.abs(got - expected)) / np.max(np.abs(expected)) < 2e-7
+    if occupation != 1:
+        assert 0. in nodes
+
+
+@pytest.mark.parametrize("convention", ["time_ordered_fractional", "retarded"])
+def test_exact_crossings_mask_nonzero_invalid_coefficients_in_all_contour_terms(convention):
+    got, expected, _ = _exact_node_one_pole(.25, .25, convention, masked=True)
+    assert np.max(np.abs(got - expected)) / np.max(np.abs(expected)) < 2e-7
+
+
+@pytest.mark.parametrize("failure", ["omit", "perturb"])
+def test_exact_crossing_coverage_is_not_rounded_or_silently_complete(failure):
+    # Every sample is otherwise exact; dropping the x=0 crossing or moving its
+    # declared node by one representable float must expose the missing term.
+    kwargs = {"omit_node": 0} if failure == "omit" else {"perturb_node": 0}
+    got, expected, nodes = _exact_node_one_pole(.25, .25, "retarded", **kwargs)
+    assert nodes[0] == 0.
+    assert np.max(np.abs(got - expected)) / np.max(np.abs(expected)) > 1e-3
+
+
+def test_exact_crossing_rejects_invalid_frequency_and_nonboolean_mask():
+    samples, x, f, _, eta, _, _, _ = _one_pole_matrix(.25, .25)
+    for node in (-1., np.nan, np.inf):
+        with pytest.raises(ValueError, match="finite and nonnegative"):
+            cd.real_residue_node(samples[0][0], samples[2][0], x, f, node, eta=eta)
+    with pytest.raises(ValueError, match="boolean"):
+        cd.real_residue_node(samples[0][0], samples[2][0], x, f, 0., eta=eta,
+                             band_valid=np.ones(x.shape, np.int32))
