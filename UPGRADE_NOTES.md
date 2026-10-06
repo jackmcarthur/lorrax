@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — a response sample near the top of its interval builds instead of refusing
+
+The shared-pole χ response rule refused a line sample high in its own
+transition interval (Si 4³: 44.8 + 2.6i eV in 0.69–52.5 eV, `response
+exponential fit failed`). Its pencil proposes decaying times. A pole at Re z
+then needs coefficients ~e^{Re t·Re z}, and the coefficient-mass gate refuses
+every geometry. A group whose pencil fails now takes Gauss–Legendre times on
+the imaginary axis, which carry any pole with O(1) coefficient mass. This
+happens only when they fit the pencil's capacity (192 nodes; 384 for one
+sample), with the same projection and gates; otherwise the group is halved
+as before. A group whose pencil succeeds is unchanged: eqp is bitwise on main's
+Si 4³, Fe 4³ charge and CrI3 6×6 decks (cold P4).
+
+Measured on the WSUPPORT ±5 eV Si deck (top site 44.8 eV, 40 samples): it now
+builds. The rule takes 9.8 s with 52 pencil nodes plus 140 closed-form nodes
+(sampled error 3e-13), and W takes 59.7 s. Against the same-reach reference with
+twice the line sites, eqp0 within ±2 eV of μ agrees to 0.02 meV. Within ±10 eV
+the RMS is 2.2 meV (max 16 meV), less than the ±2 eV placement's 3.5 meV RMS
+against the same reference; the remainder is line-site density. No deck change.
+
 ## 2026-10-06 — direct finite-plane-wave Γ response reference
 
 An opt-in scalar, step-occupied Γ reference now composes canonical density

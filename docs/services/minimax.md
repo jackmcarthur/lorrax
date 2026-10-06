@@ -88,9 +88,16 @@ or response arrays, and none certifies W or Σ accuracy.
   (−z̄) pole of a sample group; linear projection fits 1/(d − p) and
   1/(d − p)² on those nodes. Each node is one Green-pair evaluation A(t):
   forward rows use exp[−(d − reference)t], reverse rows use conj(A(t)). A
-  group whose shared fit fails is halved down to single samples; a group
-  whose pencil is wider than both halves' (the narrowest height in one, the
-  farthest line reach in the other) is halved without a try. Each rule
+  group whose pencil fit fails takes a closed-form set when it fits the
+  pencil's capacity (192 nodes; 384 for one sample): Gauss–Legendre times on
+  the imaginary axis, t = i·s, s ∈ [0, horizon/η], n = ⌈W·horizon/4⌉ for the
+  interval width W in units of the narrowest height η. From
+  1/(x − z) = i∫₀^∞ e^{−i(x−z)s} ds its coefficient mass is O(1) wherever
+  Re z lies, so a pole near the interval top, which the pencil's decaying
+  nodes carry only with mass ~e^{Re t·Re z}, still builds. Otherwise the
+  group is halved down to single samples; a group whose pencil is wider than
+  both halves' (the narrowest height in one, the farthest line reach in the
+  other) is halved without a try. Each rule
   has `members`, `t[RESPONSE_NODE_CAPACITY]` (384; one pencil holds
   `RESPONSE_RULE_CAPACITY = 192`), `value`/`derivative` of shape
   `[members, 2, 384]`, `count`, `sampled_error`, `coefficient_mass` and

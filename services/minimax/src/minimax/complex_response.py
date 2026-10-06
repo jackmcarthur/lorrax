@@ -183,6 +183,32 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
     return None
 
 
+def _imaginary_times(lo, hi, poles, tol, decay_rate, capacity):
+    """Closed-form times on the imaginary axis shared by every pole, or None.
+
+    The pencil's decaying nodes (Re t > 0) must carry a pole at Re z with
+    coefficients ~exp(Re t * (Re z - reference)): far up the interval the
+    coefficient-mass gate refuses every geometry (Si 4^3, 44.8 + 2.6i eV in a
+    0.69-52.5 eV interval: 5.2e3 at best). For Im z > 0,
+    1/(x - z) = i int_0^inf exp(-i (x - z) s) ds, so nodes t = i s (Re t = 0:
+    no decay, no growth, inside every decay_rate bound) carry coefficients
+    bounded by the quadrature weights, mass O(1) wherever Re z lies. The
+    integral is cut at S = horizon (in 1/eta, tail exp(-S) < tol), and n
+    Gauss-Legendre nodes resolve the phase across the interval width W = (hi -
+    lo)/eta: n = W*S/4. The coefficients come from the same projection and
+    acceptance as the pencil's. None when n exceeds ``capacity``.
+    """
+    eta = float(poles.imag.min())
+    horizon = -np.log(tol) + np.log(-np.log(tol)) + 6.
+    n = int(np.ceil((hi-lo)/eta*horizon/4))
+    if n > capacity:
+        return None
+    u, _ = np.polynomial.legendre.leggauss(n)
+    times = 1j*horizon*(u+1)/(2*eta)
+    fits, _, _ = _fits(lo, hi, poles, times, tol, decay_rate)
+    return None if fits is None else (times, fits)
+
+
 def _rule(z, sets):
     """Scatter pole fits on node sets into forward and reverse sample rows.
 
@@ -233,8 +259,10 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     Every node t is ONE Green-pair evaluation A(t): forward rows use the
     exponential exp[-(d-reference_ry)*t] and fit 1/(d-z); reverse rows use
     conj(A(t)), i.e. the exponential at conj(t), and fit 1/(d+z). A group
-    whose shared fit fails is split in halves, down to single samples; a
-    group whose pencil is wider than both halves' is split without a try.
+    whose pencil fit fails takes the closed-form imaginary-axis set
+    (``_imaginary_times``) when that fits the pencil's capacity, else is split
+    in halves, down to single samples; a group whose pencil is wider than both
+    halves' is split without a try.
     A successful shared rule can use more nodes than one member would need
     alone; its Green-pair evaluations serve all members of the group.
 
@@ -274,6 +302,12 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
             return build(members[:half]) + build(members[half:])
         got = _shared_times(lo, hi, poles, rel_tol/2, old.get(frozenset(members)), decay_rate,
                             patience=None if len(members) == 1 else _STAGNATION_NODES)
+        if got is None:
+            # Where the pencil fails, the closed-form imaginary-axis set serves
+            # every pole when it fits the pencil's capacity (two pencils' for
+            # one sample, whose poles could otherwise take two sets).
+            got = _imaginary_times(lo, hi, poles, rel_tol/2, decay_rate, RESPONSE_NODE_CAPACITY
+                                   if len(members) == 1 else RESPONSE_RULE_CAPACITY)
         if got is not None:
             rule = _rule(z[members], [(*got[:1], poles, got[1])])
             return [dict(rule, members=list(members), reference_ry=reference)]
