@@ -3540,11 +3540,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         E_read = device_put_process_local(
             read_ry.astype(E_qp_ry.dtype), E_qp_ry.sharding)
         E_read_full = E_read if ks.is_identity else ks.broadcast(E_read)
+    frame_mu_ev = sigma_frame_mu_ev(
+        inputs.config, inputs.wfn, E_full, efermi_ry,
+        entry_occ_state if inputs.material_class == "metal" else None)
     sc_support = (None if not inputs.config.compute_mode.is_dynamic else
-                  _sc_sampled_support(inputs, partition, energies_read_loop, sigma_frame_mu_ev(
-                      inputs.config, inputs.wfn, E_full, efermi_ry,
-                      entry_occ_state if inputs.material_class == "metal" else None),
-                      _sc_active_identities(inputs), state.tail_z_kn))
+                  _sc_sampled_support(inputs, partition, energies_read_loop, frame_mu_ev,
+                                      _sc_active_identities(inputs), state.tail_z_kn))
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
                  else ~omega_coverage(sc_support.joined, sc_support.energy)[0])
 
@@ -3694,9 +3695,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             trs_allowed=inputs.sym.trs_allowed,
             state_capacity=inputs.wfn.occupation_state_capacity,
             kweights=full_k_quadrature_weights(inputs.wfn, inputs.wfn.symmetry()))
+        from .qp_support import requested_reads_ev
+        # W's line sites cover this map's requested reads: the states that set the
+        # sampled Sigma support (``_sc_sampled_support``), at E_in +/- the plan pad.
         inputs.meta.shared_pole_recipe = resolve_shared_pole_recipe(
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
             print_fn=inputs.print_fn,
+            support_reads_ev=frame_mu_ev + requested_reads_ev(
+                sc_support.energy, sc_support.states, inputs.config.sigma.omega_step_ev),
             support_session=(None if inputs.fixed_quadrature_session is None else
                              inputs.fixed_quadrature_session.setdefault(
                                  "shared_pole_supports", {})))
