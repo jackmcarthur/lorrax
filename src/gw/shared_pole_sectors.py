@@ -198,10 +198,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     def read_samples(io,endpoints,retained,ids=None,layout=None):
         # Wc/dWc_ds at the dense fitted samples.
         return read_sector_round(io,meta,bank,header,ids_of(ids),endpoints,sample_ids=dense_fit,
-            fields=('Wc','dWc_ds'),retained=retained,execution=layout or read_layout)
+            fields=('Wc','dWc_ds'),retained=retained,execution=layout or execution)
 
     def read_line(io,family,cross=False,ids=None,layout=None):
-        spec=None if (layout or read_layout)=='face' else P(('x','y'))
+        spec=None if (layout or execution)=='face' else P(('x','y'))
         name=('C','T')[family]
         return {sid:read_line_panels(io,meta=meta,header=header,family=name,sample=sid,cross=cross,
                                      q_ids=ids_of(ids),partition_spec=spec)
@@ -251,11 +251,6 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room)
     if resolved_execution == 'face':
         admit_face(header['n_q_irr'])
-    elif resolved_execution == 'row':
-        batch_width=int(execution_rows[0]['row_width'])
-        if jax.process_index()==0:
-            print(f"Shared-pole row route: {batch_width} parent(s) of {int(header['n_q_irr'])} per round "
-                  f"(parents over x, matrices over y; priced from the shapes)",flush=True)
     rounds=list(sector_round_schedule(bank,header,meta,config,mesh_xy,
         execution=resolved_execution,batch_width=batch_width))
     # The decoupled face route: CC and TT for every parent at once (the selection in
@@ -295,8 +290,6 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     while rounds:
         ids,real,slots,execution=rounds.pop(0)
         face=execution=='face'
-        # A row round reads its samples as face stacks; its programs move them.
-        read_layout='face' if execution=='row' else execution
         sectors=[];retained=[];first_receipt=len(receipts)
         model=None
         if whole is not None and face:
@@ -306,14 +299,14 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             with timing.section('spole.sector.'+name, announce=True):
                 with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
-                        fields=('M0','M1','M2','M3'),retained=retained,execution=read_layout)
+                        fields=('M0','M1','M2','M3'),retained=retained,execution=execution)
                     refuse_nonfinite_moment(name,exact['M1'],real,mesh_xy=mesh_xy)
                     samples=read_samples(io,(family,family),(*retained,*exact.values()))
                     line=read_line(io,family)
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
                     ids=ids,real=real,header=sector_headers[family],sample_ids=dense_fit,
                     sector=name,face_room=face_room if face else None,
-                    program_bytes=sizes.get(name) if face else None,execution=execution)
+                    program_bytes=sizes.get(name) if face else None)
                 model=construct_diagonal_sector_round(samples,exact,meta,config,geometry,
                     mesh_xy=mesh_xy,retained=retained,line=line)
                 del samples,exact,line
@@ -337,12 +330,12 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 ct=read_samples(io,(0,1),retained)
                 tc=read_samples(io,(1,0),(*retained,*ct.values()))
                 cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
-                                      retained=(*retained,*ct.values(),*tc.values()),execution=read_layout)
+                                      retained=(*retained,*ct.values(),*tc.values()),execution=execution)
                 refuse_nonfinite_moment('CT',cm['M1'],real,mesh_xy=mesh_xy)
                 line_cross=[read_line(io,family,cross=True) for family in (0,1)]
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
                 sample_ids=dense_fit,line_cross=line_cross,real=real,
-                program_bytes=sizes.get('CT') if face else None,execution=execution)
+                program_bytes=sizes.get('CT') if face else None)
             del line_cross
             del ct,tc,cm
             if execution=='face':
@@ -399,7 +392,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     for sample_id in recipe['held_ids']:
                         sample_id=int(sample_id)
                         held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
-                                               sample_span=(sample_id,sample_id+1),execution="local" if execution=='local' else "face")
+                                               sample_span=(sample_id,sample_id+1),execution="face" if is_face(model[0]) else "local")
                         errors=sector_held_errors(model,held,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
                         held_rows[name].append(dict(sample_id=sample_id,
                             Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
@@ -473,10 +466,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     if name=='CT_C':
                         ct_host_census=census
                     poles,active,counts,width=census
-                    from gw.shared_pole_execution import is_row,relayout
-                    face_factor=(treated_factor if is_face(treated_factor) else relayout(mesh_xy,3,'face')(treated_factor)
-                                 if is_row(treated_factor) else to_face(treated_factor))
-                    factor=face_rows(mesh_xy,tuple(range(real)),width)(face_factor)
+                    factor=face_rows(mesh_xy,tuple(range(real)),width)(treated_factor if is_face(treated_factor) else to_face(treated_factor))
                     for q0,q1,slots in _contiguous_q_spans(ids,real):
                         public=canonical_factors(mesh_xy,slots,components=3 if family else 1)(factor)
                         filename=root/(name+'.h5') if sector_models is None else sector_models[name]
@@ -634,11 +624,9 @@ def sector_held_errors(signed, samples, z, *, mesh_xy):
     """
     from common.collectives import device_put_process_local
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from gw.shared_pole_execution import is_face,is_row,held_program,row_held_program
+    from gw.shared_pole_execution import is_face,held_program
     if is_face(signed[0]):
         return held_program(mesh_xy)(*signed,samples['Wc'],samples['dWc_ds'],jnp.asarray(z))
-    if is_row(signed[0]):
-        return row_held_program(mesh_xy)(*signed,samples['Wc'],samples['dWc_ds'],jnp.asarray(z))
     value=_local_held_program(mesh_xy)(*signed,samples['Wc'],samples['dWc_ds'],jnp.asarray(z))
     return device_put_process_local(value,NamedSharding(mesh_xy,P()))
 
@@ -700,13 +688,12 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     import numpy as np
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_capacity import ConstructorCapacity,round_padding_output_bytes
-    from gw.shared_pole_directions import (_round_kernels,line_panel_states,port_extent,
-                                           select_round_states,infinity_directions)
+    from gw.shared_pole_directions import port_extent
     from gw.shared_pole_local import (round_tables,reduce_round,recipe_panel_widths,
                                       recipe_infinity_width,pad_states,carrier_history)
 
     from gw.shared_pole_execution import is_face, face_reduce_round, face_ritz_carrier
-    execution=geometry.get('execution') or ('face' if is_face(samples['Wc']) else 'local')
+    execution='face' if is_face(samples['Wc']) else 'local'
     components=int(geometry['components'])
     basis=geometry['basis']
     n=components*basis.n_logical
@@ -715,12 +702,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     local_meta.n_rmu=n
     local_meta.n_rmu_padded=components*basis.n_packed
     recipe=sector_recipe(meta.shared_pole_recipe,n)
-    # A row round selects on face stacks (priced as the face does) and reduces on
-    # the row layout (priced as the local round does, at q/P of one parent).
     budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
                                mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
                                upstream=meta.shared_pole_capacity.live_stages,
-                               execution='face' if execution=='row' else execution)
+                               execution=execution)
     budget.batch_width=len(geometry['ids'])
     budget.retained_panels=tuple(retained)
     budget.face_room=geometry.get('face_room')
@@ -739,34 +724,13 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                      +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
     selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
                           selection_faces=selection_faces)
-    if execution=='row':
-        from gw.shared_pole_capacity import face_eigh_room
-        budget.face_room=face_eigh_room(selection) or None
     if execution=='face' and budget.face_room is not None:
         # The selection eighs run beside the selection's own admitted live set.
         from gw.shared_pole_capacity import face_eigh_room
         budget.face_room=min(budget.face_room,face_eigh_room(selection) or 0) or None
-    eig=budget.eigenplan(local_meta.n_rmu_padded)
     extent=port_extent(mesh_xy)
-    kernels=_round_kernels(mesh_xy,'face' if execution=='face' else 'batch')
-    qi,values=infinity_directions(kernels,moments['M1'],min(n,recipe['infinity_width']),
-        eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
-        real_rows=None if execution=='face' else geometry['real'])
-    infinity=(qi,*(kernels.apply(moments[name],qi) for name in ('M0','M1','M2','M3')))
-    # Synthetic local slots select nothing, as a dense selection's do.
-    real=geometry['real']
-    line_states={sid:line_panel_states(panels,np.where(np.arange(len(counts))<real,counts,0),
-                                       recipe,sid=sid,ordered=True,mesh_xy=mesh_xy)
-                 for sid,(panels,counts) in line.items()}
-    states,counts,roles=select_round_states(samples,recipe,sample_ids=geometry['sample_ids'],
-        real=real,mesh_xy=mesh_xy,eigh_plan=eig,column_extent=extent,
-        logical_n=n,ordered=True,line_states=line_states)
-    del line_states
-    # The reduction envelope already includes current Q/O/dO and infinity
-    # panels. Full sample/moment stacks remain caller-live through this call,
-    # so those and earlier-sector outputs are the only additional arrays.
-    budget.retained_panels=(*retained,*samples.values(),*moments.values(),
-                            *(panels for panels,_ in line.values()))
+    states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,geometry,local_meta,n,
+        budget,mesh_xy=mesh_xy,execution=execution,retained=retained)
     # Every state panel is padded to its recipe carrier, so the round
     # program's inputs have one shape; the pencil extent is grow-only over
     # this sector's rounds and SC maps (round_tables): discovered in map 0,
@@ -779,13 +743,6 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],
         infinity_width,column_extent=extent,ordered=True,odd_moments=True,key=name[0],history=history)
     side=int(tables['active'].shape[-1])
-    if execution=='row':
-        from gw.shared_pole_execution import row_capacity,row_price
-        selection_budget,budget=budget,row_capacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
-            mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,q=len(geometry['ids']),budget=recipe['pole_budget'])
-        budget.retained_panels=selection_budget.retained_panels
-        budget.program_bytes=row_price(local_meta.n_rmu_padded,side,len(geometry['ids']),mesh=mesh_xy,
-                                       phase='reduction',budget=recipe['pole_budget'])
     budget.plan(side,phase='reduction',padding_output_bytes_per_rank=round_padding_output_bytes(
         states,infinity,widths,infinity_width))
     states,infinity=pad_states(states,widths,infinity,infinity_width)
@@ -798,38 +755,17 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
             f"pencil extent {before} -> {int(history[name][0])}")
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
-    if execution == 'face' and geometry.get('decoupled'):
-        # Every parent in flight: stage programs over sub-batches, each eigh once over the stack.
-        from gw.shared_pole_execution import face_reduce_decoupled, face_eigh
-        reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,
-            eigh_plan=face_eigh(mesh_xy,side,budget.face_room),width=int(geometry['decoupled']),
-            ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-            gram_keep=gram_keep,carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget']))
-    elif execution == 'face':
+    if execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
             gram_keep=gram_keep,admit=False,room=budget.face_room,
-            carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget']))
-    elif execution == 'row':
-        from gw.shared_pole_execution import row_reduce_round
-        reduced=row_reduce_round(states,infinity,tables,mesh=mesh_xy,ordered=True,odd_moments=True,
-            keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=gram_keep,
             carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget']))
     else:
         reduced=reduce_round(states,infinity,tables,real=geometry['real'],mesh_xy=mesh_xy,
             native_eigh=budget.eigenplan(side).native_fn,ordered=True,odd_moments=True,
             keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=gram_keep)
     model,signed,vectors,diagnostics,y=reduced
-    reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
-    for name in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):
-        if not np.all(reduction[name][:geometry['real']]):
-            raise ValueError(f"GATE shared_pole_sector_{name}: sector={geometry['sector']}, "
-                             f"parents={geometry['ids'][:geometry['real']]}, "
-                             f"passed={reduction[name][:geometry['real']].tolist()}, "
-                             f"Gram min/max={reduction['gram_min_relative'][:geometry['real']].tolist()}, "
-                             f"paired Schur S min/max={reduction['paired_min_relative'][:geometry['real']].tolist()}; no repair")
-    if not np.all(zero['zero_policy'][:geometry['real']]):
-        raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={geometry['sector']}")
+    _sector_gates(diagnostics,geometry['sector'],geometry['ids'],geometry['real'])
     # The returned planner must not retain the just-consumed full sample and
     # moment arrays through its accounting view after the caller releases them.
     budget.retained_panels=tuple(retained)
@@ -837,6 +773,21 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
                 recipe=recipe,budget=budget,execution=execution)
 
+
+def _sector_gates(diagnostics, sector, ids, real):
+    """Refuse a diagonal sector reduction whose leading ``real`` parents fail a gate (no repair)."""
+    import jax
+    import numpy as np
+    reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
+    for name in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):
+        if not np.all(reduction[name][:real]):
+            raise ValueError(f"GATE shared_pole_sector_{name}: sector={sector}, "
+                             f"parents={list(ids)[:real]}, "
+                             f"passed={reduction[name][:real].tolist()}, "
+                             f"Gram min/max={reduction['gram_min_relative'][:real].tolist()}, "
+                             f"paired Schur S min/max={reduction['paired_min_relative'][:real].tolist()}; no repair")
+    if not np.all(zero['zero_policy'][:real]):
+        raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={sector}")
 
 
 def _sector_selection(samples, moments, line, recipe, geometry, local_meta, n, budget, *, mesh_xy, execution, retained):
@@ -995,15 +946,7 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     finally:
         ledger.live_stages=ambient
     model,signed,vectors,diagnostics,y=reduced
-    reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
-    for key in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):
-        if not np.all(reduction[key][:nq]):
-            raise ValueError(f"GATE shared_pole_sector_{key}: sector={geometry['sector']}, "
-                             f"passed={reduction[key][:nq].tolist()}, "
-                             f"Gram min/max={reduction['gram_min_relative'][:nq].tolist()}, "
-                             f"paired Schur S min/max={reduction['paired_min_relative'][:nq].tolist()}; no repair")
-    if not np.all(zero['zero_policy'][:nq]):
-        raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={geometry['sector']}")
+    _sector_gates(diagnostics,geometry['sector'],list(range(int(nq))),int(nq))
     budget.retained_panels=tuple(retained)
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
@@ -1041,8 +984,7 @@ def slice_sector(sector, slots, mesh_xy):
 
 
 def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
-                                 mesh_xy, sample_ids, line_cross, real, program_bytes=None,
-                                 execution=None):
+                                 mesh_xy, sample_ids, line_cross, real, program_bytes=None):
     """Run CT on the two current-map diagonal spans, keeping both outputs.
 
     ``samples=(CT,TC)`` contains the native rectangular Wc/dWc_ds rounds at
@@ -1063,32 +1005,20 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     from gw.shared_pole_capacity import ConstructorCapacity
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
 
-    from gw.shared_pole_execution import is_face,to_row
-    if execution is None:
-        execution="face" if is_face(samples[0]["Wc"]) else "local"
+    from gw.shared_pole_execution import is_face
+    execution="face" if is_face(samples[0]["Wc"]) else "local"
     charge, transverse = sectors
     ct, tc = samples
-    if execution=='row':
-        # The rectangular samples move to the row layout once (one all_to_all over x).
-        ct={k:to_row(mesh_xy,v) for k,v in ct.items()}
-        tc={k:to_row(mesh_xy,v) for k,v in tc.items()}
-        moments={k:to_row(mesh_xy,v) for k,v in moments.items()}
     retained = jax.tree.leaves(tuple((s['model'],s['signed'],s['coefficients'],
         s['infinity'],tuple(state[1:] for state in s['states'])) for s in sectors))
     local_meta = copy.copy(meta)
     local_meta.n_rmu_padded = sum(s['model'][0].shape[-2] for s in sectors)
     budget = ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
         mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
-        upstream=meta.shared_pole_capacity.live_stages,execution='local' if execution=='row' else execution)
+        upstream=meta.shared_pole_capacity.live_stages,execution=execution)
     budget.batch_width = charge['model'][0].shape[0]
     budget.face_room = charge['budget'].face_room
     budget.program_bytes = program_bytes
-    if execution=='row':
-        # The joint side is admitted at its actual spans, q/P of one parent per rank.
-        from gw.shared_pole_execution import row_price
-        original_sides_row = tuple(s['coefficients'].shape[-2] for s in sectors)
-        row_program_bytes = lambda side: row_price(local_meta.n_rmu_padded,side,budget.batch_width,
-            mesh=mesh_xy,phase='cross_reduction',cross_sides=original_sides_row)
     budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values(),
         *(panels for stored in line_cross for panels,_ in stored.values()))
     # Cross assembly has rectangular original pencils; only the projected
@@ -1105,8 +1035,6 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
 
     def fits(widths):
         try:
-            if execution=='row':
-                budget.program_bytes=row_program_bytes(sum(widths))
             return budget.preview(sum(widths),phase='cross_reduction',
                 cross_original_sides=original_sides)['device_budget_status']=='PASS'
         except (ValueError,MemoryError,RuntimeError):
@@ -1132,13 +1060,11 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         packed=_pack_cross_spans(sectors,widths,mesh_xy=mesh_xy,execution=execution)
         budget.retained_panels=(*base_panels,*jax.tree.leaves((actions,packed)))
     side=sum(s[4].shape[-1] for s in packed)
-    if execution in ('local','row') and not fits([side]):
-        # One whole parent per rank (q/P of one on the row) does not fit at the
+    if execution=='local' and not fits([side]):
+        # One whole parent per rank does not fit at the
         # actual spans: the caller reruns the round on the face (construct_sector_poles).
         budget.retained_panels=tuple(retained)
         return None
-    if execution=='row':
-        budget.program_bytes=row_program_bytes(side)
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
     cross_eigh=budget.eigenplan(side)
     signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
@@ -1210,15 +1136,12 @@ def _pack_cross_spans(sectors, widths, *, mesh_xy, execution):
         if execution=='face':
             from gw.shared_pole_execution import compact_program
             compact=compact_program(mesh_xy,width)
-        elif execution=='row':
-            from gw.shared_pole_execution import row_compact_program
-            compact=row_compact_program(mesh_xy,width)
         else:
             compact=_local_compact_program(mesh_xy,width)
         y,signed=compact(sector['coefficients'],sector['signed'])
         # Host role coordinates/order are replicated metadata, not matrices.
         put=(lambda a:jax.make_array_from_callback(a.shape,NamedSharding(mesh_xy,P()),
-                                                   lambda index:a[index])) if execution in ('face','row') else (lambda a:_batch_put(mesh_xy,a))
+                                                   lambda index:a[index])) if execution=='face' else (lambda a:_batch_put(mesh_xy,a))
         packed.append((put(sector['tables']['points']),
             put(sector['tables']['order']),
             (tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states'])),
@@ -1254,11 +1177,9 @@ def positive_cross_models(signed, *, mesh_xy):
     on each physical endpoint; a large charge norm cannot hide a lost current
     factor. The signed model remains available for held-frequency checks.
     """
-    from gw.shared_pole_execution import is_face,is_row,positive_cross_program,row_positive_cross_program
+    from gw.shared_pole_execution import is_face,positive_cross_program
     if is_face(signed[0]):
         return positive_cross_program(mesh_xy)(*signed)
-    if is_row(signed[0]):
-        return row_positive_cross_program(mesh_xy)(*signed)
     return _local_positive_cross_program(mesh_xy)(*signed)
 
 
@@ -1339,11 +1260,10 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, 
     equation 5.3.
     """
     from gw.shared_pole_directions import _round_kernels, _sample_point
-    from gw.shared_pole_execution import is_face,is_row,cross_action_program,row_cross_action_program
+    from gw.shared_pole_execution import is_face,cross_action_program
     from gw.shared_pole_local import _pad_columns
     face=is_face(samples[0])
-    row=is_row(samples[0])
-    k=_round_kernels(mesh_xy,'face' if (face or row) else 'batch')
+    k=_round_kernels(mesh_xy,'face' if face else 'batch')
     index={int(sid):i for i,sid in enumerate(sample_ids)}
     stored={}
     outputs=[]
@@ -1370,8 +1290,6 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, 
         sample=jnp.asarray(index[sid],jnp.int32)
         if face:
             outputs.append(cross_action_program(mesh_xy,mirror,imaginary,conjugate)(samples,state[1],node,sample))
-        elif row:
-            outputs.append(row_cross_action_program(mesh_xy,mirror,imaginary,conjugate)(samples,state[1],node,sample))
         else:
             outputs.append(_local_cross_action_program(mesh_xy,mirror,imaginary,conjugate)(samples,state[1],node,sample))
     return tuple(outputs)
@@ -1404,11 +1322,9 @@ def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan
     service plan matching that layout. Returns two signed CT endpoint factors,
     inverse poles, active columns and the unchanged joint-metric diagnostics.
     """
-    from gw.shared_pole_execution import is_face,is_row,cross_parent_program,row_cross_program
+    from gw.shared_pole_execution import is_face,cross_parent_program
     if is_face(charge[4]):
         return cross_parent_program(mesh_xy,eigh_plan)(charge,transverse,cross,moments)
-    if is_row(charge[4]):
-        return row_cross_program(mesh_xy)(charge,transverse,cross,moments)
     return _local_cross_parent_program(mesh_xy,eigh_plan.native_fn)(charge,transverse,cross,moments)
 
 
@@ -1701,9 +1617,6 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')
-    # The 1-D row route (parents over x, matrices over y) is never resolved: the
-    # owner keeps every matrix 2-D over all P (2026-10-06); it stays as the
-    # measured baseline (``row_width`` admits it) until the 2-D decoupled route lands.
     for row in execution_rows:
         row['joint']=dict(mode=joint_mode,**joint_route)
     return resolved_execution,execution_rows

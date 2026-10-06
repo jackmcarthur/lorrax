@@ -719,9 +719,5 @@ def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
             x = jax.lax.slice_in_dim(x, 0, int(crop_to), axis=axis)
         return x
 
-    # A per-parent index table [b, k] follows the parent axis's sharding (the
-    # row layout P('x', None, 'y') carries parents over x), so each rank
-    # indexes its own parents; a replicated table is sliced the same way.
-    source_spec = P(spec[0], None) if per_parent and len(spec) == 3 and spec[0] is not None else P()
-    return shard_map(body, mesh=mesh, in_specs=((spec,) * len(arrays), source_spec),
+    return shard_map(body, mesh=mesh, in_specs=((spec,) * len(arrays), P()),
                      out_specs=spec, check_vma=False)(arrays, source)
