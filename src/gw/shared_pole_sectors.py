@@ -233,21 +233,20 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         batch_width, batch_admission = sector_batch_width(
             meta,linalg_resolution({'linalg':config.backend.linalg}),recipe,execution_rows,
             mesh=mesh_xy,ledger=ledger,nq=nq)
-        sizes,seconds = (batch_admission[f'sector_program_{key}'] for key in ('bytes_per_rank','seconds'))
+        sizes = batch_admission['sector_program_bytes_per_rank']
         # distrib_la decides every face eigh stack against the room beside the
-        # admitted batch, whose row holds the largest whole-chain program, so
-        # it bounds every round's retry (whole matrices per rank where they fit).
+        # admitted batch, whose row holds the largest program price, so it
+        # bounds every round's retry (whole matrices per rank where they fit).
         face_room = face_eigh_room(batch_admission['reduction'])
         # The decision is printed when it is made; the constructor's summary
         # line comes only after the stage, so a leg that ends mid-stage has none.
         if jax.process_index()==0:
-            print(f"Shared-pole face batch: {batch_width} parent(s) of {int(nq)} per round; "
-                  f"sized in {sum(seconds.values()):.1f} s",flush=True)
+            print(f"Shared-pole face batch: {batch_width} parent(s) of {int(nq)} per round "
+                  f"(priced from the shapes)",flush=True)
         for row in (*execution_rows,execution_rows[0]['joint']):
             row['batch_admission'] = batch_admission
             name = row.get('sector','CT')
-            row['face_batch'] = dict(parent_batch=batch_width,sizing_seconds=seconds[name],
-                                     compiled_program_bytes_per_rank=sizes[name])
+            row['face_batch'] = dict(parent_batch=batch_width,program_bytes_per_rank=sizes[name])
             row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room)
     if resolved_execution == 'face':
         admit_face(header['n_q_irr'])
@@ -774,7 +773,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     moments is the CT M0..M3 round. All operators are parent-sharded. The
     signed physical photon interaction is admitted by the unchanged positive
     retained-H checks, not by the scalar positive-V upper passivity bound.
-    A face round is priced at CT's compiled ``program_bytes`` (``sector_batch_width``).
+    A face round is priced at CT's ``program_bytes`` (``sector_batch_width``).
     Returns None for a local round whose CT does not fit at its actual spans.
     """
     import copy

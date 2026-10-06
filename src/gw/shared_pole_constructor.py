@@ -209,17 +209,15 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             from gw.shared_pole_capacity import face_eigh_room
             from gw.shared_pole_execution import face_batch_width, face_reduction_bytes, face_ritz_carrier
             keep_budget = recipe.get("pole_budget")
-            sizing = dict(rows=n, side=conservative_side, ordered=ordered, odd_moments=odd_moments,
-                          infinity_width=column_extent(max(1, int(recipe["infinity_width"]))),
-                          infinity_arrays=1 + len(moment_fields), keep_budget=keep_budget,
+            sizing = dict(rows=n, side=conservative_side,
                           carrier=face_ritz_carrier(mesh_xy, keep_budget) if ordered else None)
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, nq=nq,
                 selection=dict(sample_batch=len(dense_fit), selection_faces=selection_faces),
                 program_bytes=lambda width: face_reduction_bytes(mesh_xy, width, **sizing))
-            # Every face round's reduction is priced at this compiled size.
-            budget.program_bytes = execution_receipt['face_batch']['compiled_program_bytes_per_rank']
+            # Every face round's reduction is priced at this size.
+            budget.program_bytes = execution_receipt['face_batch']['program_bytes_per_rank']
             # distrib_la decides each eigh stack against the room beside the
             # admitted batch and the retained factors: whole matrices per rank
             # where they fit, else the whole mesh.
@@ -309,10 +307,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # solves it on its Ritz carrier: the Schur and final eigh run
                 # at about 2 x budget instead of the pencil side.
                 # The eigh room beside this round's own program: the batch row
-                # with the round's compiled size for the batch's.
+                # with the round's price at its actual side for the batch's.
                 row = execution_receipt['face_batch']['reduction']
-                room = lambda compiled: face_eigh_room(dict(row, aggregate_bytes_per_rank=(
-                    row['aggregate_bytes_per_rank'] - budget.program_bytes + compiled)), retained_bound)
+                room = lambda price: face_eigh_room(dict(row, aggregate_bytes_per_rank=(
+                    row['aggregate_bytes_per_rank'] - budget.program_bytes + price)), retained_bound)
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                     round_states, infinity, tables, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
@@ -402,8 +400,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
                 mesh_xy=mesh_xy, eigh_plan=eig if execution == 'face' else local_eigh, ordered=ordered,
                 # A face check decides its eighs beside the model phase and its own program.
-                room=lambda compiled: face_eigh_room(dict(model_row, aggregate_bytes_per_rank=(
-                    model_row['aggregate_bytes_per_rank'] + compiled))))
+                room=lambda price: face_eigh_room(dict(model_row, aggregate_bytes_per_rank=(
+                    model_row['aggregate_bytes_per_rank'] + price))))
             del inverse_sqrt, held, exact
         with phase("gates"):
             for slot, q in enumerate(ids[:real]):

@@ -29,8 +29,8 @@ def test_relaxed_sector_face_batch_has_no_carrier(monkeypatch):
 
     carriers = []
 
-    def reduction_bytes(mesh, width, *, keep_budget, carrier, **shape):
-        carriers.append((keep_budget, carrier))
+    def reduction_bytes(mesh, width, *, carrier, **shape):
+        carriers.append(carrier)
         return 0
     # The face batch search calls program_bytes once at its first width.
     monkeypatch.setattr(ex, "face_batch_width",
@@ -47,7 +47,7 @@ def test_relaxed_sector_face_batch_has_no_carrier(monkeypatch):
         ex.sector_batch_width(SimpleNamespace(n_rmu_padded=8), None, {"fit_ids": [0, 1, 2]}, rows,
                               mesh=mesh, ledger=SimpleNamespace(live_stages=()), nq=1)
         assert len(carriers) == 2
-        assert all((carrier is not None) == carried for _, carrier in carriers)
+        assert all((carrier is not None) == carried for carrier in carriers)
 
 
 def test_constructor_resume_rebuilds_a_bank_of_another_bare_v(tmp_path, monkeypatch):

@@ -238,9 +238,8 @@ def route_summary(mode, receipt):
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
-        if "compiled_program_bytes_per_rank" in batch:
-            price += (f"; face program {gb(batch['compiled_program_bytes_per_rank'])} GB/rank compiled, "
-                      f"sized in {batch['sizing_seconds']:.1f} s")
+        if "program_bytes_per_rank" in batch:
+            price += f"; face program {gb(batch['program_bytes_per_rank'])} GB/rank priced from the shapes"
         price += f"; face batch {batch['parent_batch']} parent(s)" + "".join(
             f", {phase} eigh room {gb(room)} GB/rank" for phase, room in rooms.items())
     return (f"{mode} ({receipt['reason']}, conservative pencil side "
@@ -259,8 +258,7 @@ def face_program(fn, mesh, *, outputs='matrices'):
     including real matrices. Mixed reducer contracts name their matrix
     leaves explicitly; diagnostics and spectra alone replicate. Its checked
     eighs hold their first attempts; a set flag reruns it whole-chain on the
-    whole mesh (``distrib_la.checked_program``), the program
-    ``call.lower(*args)`` lowers, for sizing.
+    whole mesh (``distrib_la.checked_program``).
     """
     # ponytail: a failed check reruns the whole round on the whole mesh (one
     # cached compile; CrI3 saw 1-10 failures per map). Upgrade path: retry
@@ -295,35 +293,7 @@ def face_program(fn, mesh, *, outputs='matrices'):
                 raise ValueError('unknown explicit constructor output contract '+outputs)
             compiled[signature]=distrib_la.checked_program(fn,mesh,out)
         return compiled[signature]
-    call=lambda *args: program(*args)(*args)
-    call.lower=lambda *args: program(*args).lower(*args)
-    return call
-
-
-#: Agreed sizes by (program, argument shapes); every rank asks the same keys.
-_SIZES = {}
-
-
-def compiled_bytes(program, *args):
-    """Compiled new bytes per rank of a ``face_program`` at ``args`` (arrays or shape structs).
-
-    Agreed over ranks (the largest any rank measured); a compile that fails on
-    any rank posts distrib_la's sizing-failure size, so every rank rejects it. Cached.
-    """
-    import sys
-    from distrib_la import SIZING_FAILED
-    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
-    key = program, jax.tree.structure(args), tuple((a.shape, str(a.dtype)) for a in jax.tree.leaves(args))
-    if key in _SIZES:
-        return _SIZES[key]
-    try:
-        local = compiled_new_bytes(program.lower(*args).compile())
-    except Exception as exc:        # any failure means "does not fit", on every rank
-        print(f"shared-pole face program: sizing failed on process {jax.process_index()} "
-              f"({type(exc).__name__}: {exc}); rejected on every rank", file=sys.stderr, flush=True)
-        local = SIZING_FAILED
-    _SIZES[key] = -agreed_chunk(-int(local))
-    return _SIZES[key]
+    return lambda *args: program(*args)(*args)
 
 
 @lru_cache(maxsize=None)
@@ -412,9 +382,8 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     """A fixed-width batch of parents with every matrix tiled over all ranks.
 
     ``room`` is the room the pencil's eigh stacks are decided against
-    (``face_eigh``), or a function of this round's program size: its
-    whole-chain program on the whole mesh, compiled on the arrays it runs,
-    which is also its retry. ``carrier`` is the kept-span width of an
+    (``face_eigh``), or a function of this round's program price at its
+    actual side (``face_reduction_bytes``). ``carrier`` is the kept-span width of an
     ordered reduction (``face_ritz_carrier``), None solving the whole H'_vv
     side. A short last round's synthetic slots repeat its last parent
     (``parent_rounds``); callers read only the leading real slots."""
@@ -426,7 +395,8 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     args=(tables['points'],tables['order'],tables['active'],tuple(s[1] for s in states),
           tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
     if callable(room):
-        room=room(compiled_bytes(program(None),*args))
+        room=room(face_reduction_bytes(mesh,int(tables['active'].shape[0]),rows=int(states[0][1].shape[-2]),
+                                       side=side,carrier=carrier,retain_span=retain_span))
     result=program(room)(*args)
     model,signed,diagnostics=result[:3]
     output=model,signed,model[1:],diagnostics
@@ -468,44 +438,41 @@ def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_wi
     return [(*row, label) for row in parent_rounds(header['n_q_irr'], width)]
 
 
-def _spec(mesh, shape, dtype=jnp.complex128, spec=P(None, 'x', 'y')):
-    return jax.ShapeDtypeStruct(tuple(map(int, shape)), dtype, sharding=NamedSharding(mesh, spec))
+def _face_price(mesh, rows, width, side, phase, **terms):
+    """Bytes per rank of one face round program's dense temporaries for ``width`` parents.
+
+    The byte model that admits every local round (``shared_pole_byte_terms``),
+    tiled over the mesh (``width / P`` copies). The eigh and matmul workspace
+    is quoted beside it (``ConstructorCapacity.quote``), so nothing is priced
+    twice, and nothing is compiled to be measured. Every rank prices the same
+    shapes, so the figure is agreed by construction.
+    """
+    from types import SimpleNamespace
+    from gw.shared_pole_capacity import shared_pole_byte_terms
+    price = shared_pole_byte_terms(SimpleNamespace(n_rmu_padded=int(rows)), mesh_xy=mesh,
+                                   resolution=SimpleNamespace(layout='distributed'), pencil_side=int(side),
+                                   parent_batch=int(width), sample_batch=1, phase=phase, **terms)
+    return int(price['terms_bytes_per_rank']['phase_dense_temporaries'])
 
 
-def _face_parent_args(mesh, width, *, rows, side, infinity_width, infinity_arrays, ordered, odd_moments):
-    """Shape structs of ``face_parent_program``'s arguments for ``width`` parents
-    at a pencil ``side`` whose last ``infinity_width``-wide blocks are the
-    infinity columns, every finite column on one state panel of ``rows``."""
-    finite = int(side) - ((2 if odd_moments else 0) if ordered else 1) * int(infinity_width)
-    panel = (_spec(mesh, (width, rows, finite)),)
-    return (_spec(mesh, (width, finite), jnp.complex128, P()), _spec(mesh, (width, finite), jnp.int32, P()),
-            _spec(mesh, (width, side), jnp.bool_, P()), panel, panel, panel,
-            (_spec(mesh, (width, rows, infinity_width)),) * int(infinity_arrays))
+def face_reduction_bytes(mesh, width, *, rows, side, carrier, retain_span=False):
+    """Price of ``face_parent_program`` for ``width`` parents of ``rows`` at a pencil
+    ``side``: an ordered pencil's kept span on ``carrier`` columns
+    (``face_ritz_carrier``), None (the relaxed tier) solving the whole side."""
+    return _face_price(mesh, rows, width, side, 'reduction', ritz_budget=carrier, retain_span=retain_span)
 
 
-def face_reduction_bytes(mesh, width, *, keep_budget, carrier, retain_span=False, gram_keep=None, **shape):
-    """``compiled_bytes`` of ``face_parent_program`` for ``width`` parents on
-    ``_face_parent_args(**shape)``, its eighs on the whole mesh."""
-    side = int(shape['side'])
-    program = face_parent_program(mesh, shape['ordered'], shape['odd_moments'], keep_budget, retain_span,
-                                  side, gram_keep, face_eigh(mesh, side), carrier)
-    return compiled_bytes(program, *_face_parent_args(mesh, width, **shape))
+def face_cross_bytes(mesh, width, rows, sides, spans):
+    """Price of ``cross_parent_program`` for ``width`` parents: the C-by-T pencil at the
+    sectors' ``sides`` projected on their retained ``spans`` (the joint side is their
+    sum) on the joint basis of ``rows``."""
+    return _face_price(mesh, rows, width, sum(map(int, spans)), 'cross_reduction',
+                       cross_original_sides=tuple(int(s) for s in sides))
 
 
-def face_cross_bytes(mesh, width, shapes, spans):
-    """``compiled_bytes`` of ``cross_parent_program`` for ``width`` parents: each
-    diagonal sector's ``_face_parent_args(**shape)`` with its retained span
-    compacted to ``spans`` columns, its cross actions (the other family's rows)
-    on its finite columns and the CT moments, its eighs on the whole mesh."""
-    args = [_face_parent_args(mesh, width, infinity_arrays=5, **shape) for shape in shapes]
-    rows = [int(shape['rows']) for shape in shapes]
-    sectors = tuple((points, order, (q, o), infinity, _spec(mesh, (width, shape['side'], k)),
-                     (_spec(mesh, (width, shape['rows'], k)), _spec(mesh, (width, k), jnp.float64, P()),
-                      _spec(mesh, (width, k), jnp.bool_, P())))
-                    for (points, order, _, q, o, _, infinity), shape, k in zip(args, shapes, spans))
-    actions = tuple(((_spec(mesh, (width, other, a[0].shape[-1])),) * 2,) for a, other in zip(args, rows[::-1]))
-    return compiled_bytes(cross_parent_program(mesh, face_eigh(mesh, sum(spans))), *sectors, actions,
-                          (_spec(mesh, (width, *rows)),) * 4)
+def face_check_bytes(mesh, rows, side):
+    """Price of ``face_round_check_program`` for one parent's model of ``rows`` x ``side``."""
+    return _face_price(mesh, rows, 1, side, 'model')
 
 
 def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, program_bytes,
@@ -515,22 +482,22 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
     A face route runs a batch of physical parents per round, every matrix
     tiled over all ranks (``face_reduce_round``, the sector rounds). Before
     any bank read, at the conservative recipe side, the ``selection`` price
-    (its ``quote`` arguments) may reject a width; only the reduction
-    program's compiled size at that width (``program_bytes(width)``, agreed
-    over ranks), beside ``extra(width)`` resident bytes, admits it. Widths
-    start at every parent, so a deck that fits runs one round and compiles
-    each program once per shape (Fe 4^3 bispinor at P4: one round of 13
-    instead of four, whose differing sides recompiled every program), and
-    step down in proportion to the room. The constructor still admits every
-    phase at its actual side.
+    (its ``quote`` arguments) may reject a width; the reduction program's
+    price at that width (``program_bytes(width)``: ``shared_pole_byte_terms``
+    tiled over the mesh, the same on every rank), beside ``extra(width)``
+    resident bytes, admits it. Nothing is compiled to be measured (CrI3 24x24
+    at P64 compiled six whole-chain programs that never ran, 187 s of every
+    cold map 0). Widths start at every parent, so a deck that fits runs one
+    round and compiles each program once per shape (Fe 4^3 bispinor at P4:
+    one round of 13 instead of four, whose differing sides recompiled every
+    program), and step down in proportion to the room. The constructor still
+    admits every phase at its actual side.
     """
-    import time
-    from distrib_la import SIZING_FAILED
     from gw.shared_pole_capacity import ConstructorCapacity
 
     budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
                                  upstream=upstream, execution='face')
-    width, seconds = int(nq), 0.0
+    width = int(nq)
 
     def row(phase, extra=0, **kwargs):
         price, native = budget.quote(side, phase=phase, **kwargs)
@@ -542,17 +509,13 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
         if picked is not None and picked['device_budget_status'] != 'PASS' and width > 1:
             width -= 1
             continue
-        started = time.perf_counter()
-        compiled = program_bytes(width)
-        budget.program_bytes, seconds = compiled, seconds + time.perf_counter() - started
+        price = budget.program_bytes = max(1, int(program_bytes(width)))
         reduction = row('reduction', extra(width), eigen_side=eigen_side)
-        receipt = dict(parent_batch=width, compiled_program_bytes_per_rank=compiled,
-                       sizing_seconds=seconds, selection=picked, reduction=reduction)
+        receipt = dict(parent_batch=width, program_bytes_per_rank=price, selection=picked, reduction=reduction)
         if reduction['device_budget_status'] == 'PASS' or width == 1:
             return width, receipt
-        room = reduction['available_device_bytes_per_rank'] - reduction['aggregate_bytes_per_rank'] + compiled
-        width = (width - 1 if compiled >= SIZING_FAILED else
-                 max(1, min(width - 1, width * max(room, 0) // compiled)))
+        room = reduction['available_device_bytes_per_rank'] - reduction['aggregate_bytes_per_rank'] + price
+        width = max(1, min(width - 1, width * max(room, 0) // price))
 
 
 def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
@@ -562,16 +525,14 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     cross pencil; the dense CT/TC stacks (W and dW/ds at the dense fitted
     samples), the moments and the cross panels that the caller still holds
     during the cross reduction are priced beside it. A width is admitted by
-    the largest compiled size of the round's three whole-chain programs at the
-    conservative shapes, CC's and TT's ``face_parent_program`` and CT's
-    ``cross_parent_program`` (``sector_program_bytes_per_rank``). Sizing at
-    the sides held after map 0 was measured and declined (CrI3 24x24 P64:
-    batch 3 -> 5, a round's cost scales with its parents, -9 % per parent at
-    best, one more sizing pass per process).
+    the largest price of the round's three programs at the conservative
+    shapes, CC's and TT's ``face_parent_program`` and CT's
+    ``cross_parent_program`` (``sector_program_bytes_per_rank``,
+    ``face_reduction_bytes`` and ``face_cross_bytes``). Sizing at the sides
+    held after map 0 was measured and declined (CrI3 24x24 P64: batch 3 -> 5,
+    a round's cost scales with its parents, -9 % per parent at best).
     """
     import copy
-    import time
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
 
     joint = copy.copy(meta)
     joint.n_rmu_padded = sum(row['packed_extent'] for row in routes)
@@ -587,28 +548,22 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     charge, current = routes
     cross = lines * 8 * (current['packed_extent'] * charge['line_width']
                          + charge['packed_extent'] * current['line_width'])
-    shapes = [dict(rows=row['packed_extent'], side=row['conservative_pencil_side'],
-                   infinity_width=row['infinity_width'], ordered=True, odd_moments=True) for row in routes]
-    sizes, seconds = {}, dict(CC=0.0, TT=0.0, CT=0.0)
+    sizes = {}
 
     def program_bytes(width):
-        sizers = {name: partial(face_reduction_bytes, mesh, width, keep_budget=row['pole_budget'],
-                                carrier=face_ritz_carrier(mesh, row['pole_budget']),
-                                retain_span=True, infinity_arrays=5, **shape,
-                                gram_keep=gates['normalized_gram_keep']['sector_threshold'])
-                  for name, shape, row in zip(('CC', 'TT'), shapes, routes)}
-        sizers['CT'] = partial(face_cross_bytes, mesh, width, shapes, spans)
-        for name, size in sizers.items():
-            started = time.perf_counter()
-            sizes[name] = size()
-            seconds[name] += time.perf_counter() - started
+        for name, row in zip(('CC', 'TT'), routes):
+            sizes[name] = face_reduction_bytes(mesh, width, rows=row['packed_extent'],
+                                               side=row['conservative_pencil_side'],
+                                               carrier=face_ritz_carrier(mesh, row['pole_budget']), retain_span=True)
+        sizes['CT'] = face_cross_bytes(mesh, width, joint.n_rmu_padded,
+                                       [row['conservative_pencil_side'] for row in routes], spans)
         return max(sizes.values())
     width, receipt = face_batch_width(
         joint, resolution, mesh=mesh, ledger=ledger, upstream=ledger.live_stages, side=side, nq=nq,
         program_bytes=program_bytes, eigen_side=eigen_side,
         extra=lambda width: int(np.ceil(16 * width * ((4 * dense + 8) * joint.n_rmu_padded**2 + cross)
                                         / mesh.size)))
-    return width, dict(receipt, sector_program_bytes_per_rank=sizes, sector_program_seconds=seconds)
+    return width, dict(receipt, sector_program_bytes_per_rank=sizes)
 
 
 @lru_cache(maxsize=None)

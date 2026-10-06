@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — the face batch is priced from the shapes, never compiled to be measured
+
+A face-route shared-pole construction (the CC/TT/CT sectors and the scalar
+constructor) admitted its parent batch by compiling each round's whole-chain
+program at the conservative side, reading its size, and then compiling the
+program that runs. On CrI3 24×24 at P64 that was six programs that never ran,
+187 s of every cold map 0 (CC 71 s, TT 80 s, CT 37 s); on the Fe 4³ and CrI3
+6×6 face decks at P4, 90–200 s per process. The batch is now admitted by the
+byte model that admits every local round (`shared_pole_byte_terms`, `b/P`
+copies per rank), with the eigh and matmul workspace quoted once beside it;
+the constructor line reads `face program N GB/rank priced from the shapes`
+and the receipt key is `program_bytes_per_rank`. The compiled figure counted
+the eigh stack's buffers a second time, so the admitted width can be larger
+than before on a deck that is not budget-bound at batch 1; a round's cost per
+parent does not depend on the width (CCB, 2026-10-05: batch 3 → 5 broke even).
+The programs that run and their shapes are unchanged. No deck change.
+
 ## 2026-10-06 — kmeans names the pool rank and its stop; a budget-stopped selection warns
 
 The centroid header's `achieved numerical rank=N` is now `pool rank=N of W

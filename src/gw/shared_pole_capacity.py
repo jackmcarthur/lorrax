@@ -58,9 +58,10 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     ``ritz_budget`` (the pole budget) prices the rank-local paired (ordered)
     reduction, whose kept span is solved on at most that many columns;
     ``retain_span`` adds its coefficient map output (a bispinor sector round).
-    ``program_bytes`` is a face reduction's or CT cross reduction's compiled
-    program size per rank (``face_batch_width``, ``sector_batch_width``),
-    which replaces its dense temporaries.
+    ``program_bytes`` is a face reduction's or CT cross reduction's price per
+    rank at the conservative side (``face_batch_width``,
+    ``sector_batch_width``: these terms tiled over the mesh), which replaces
+    its dense temporaries at the actual side.
     """
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
     # Constructor carriers are mu x mu charge operators on every admitted deck.
@@ -90,8 +91,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
         c, t = map(int, cross_original_sides)
         if min(c, t) <= 0:
             raise ValueError('cross reduction original sides must be positive')
-        # Local (one parent per rank): the rectangular C-by-T pencil,
-        # projected on the two compacted
+        # One parent (per rank on the local route, b/p per rank on the
+        # face): the rectangular C-by-T pencil, projected on the two compacted
         # retained spans (r = K_C + K_T) into the joint square, its eigh
         # chain on [r, r] (about 7.3-7.6 r^2 live) and the [n, r] outputs,
         # plus the compacted span maps Y_C [c, K_C], Y_T [t, K_T] the round
@@ -101,9 +102,7 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
         # at 2c, XLA rematerialization on and off: temp + output 0.73-0.82 of
         # this term; with the arguments, 0.80-0.87 of this term plus the
         # narrow actions.
-        # The face is its compiled CT program (``program_bytes``).
-        dense = (c*t + 8 * r*r + 4 * packed * r + max(c, t) * r
-                 if resolution.layout == "local" else 0)
+        dense = c*t + 8 * r*r + 4 * packed * r + max(c, t) * r
         sample_faces = 0
     elif phase == "reduction":
         if selection_faces is not None:
@@ -261,7 +260,7 @@ class ConstructorCapacity:
         # Face route: room per rank beside the admitted live set, which
         # distrib_la reads to run an eigh stack one whole matrix per rank.
         self.face_room = None
-        # Face route: the reduction program's compiled size per rank.
+        # Face route: the reduction program's price per rank (the batch admission).
         self.program_bytes = None
 
     def eigenplan(self, side):
