@@ -151,3 +151,23 @@ def test_face_products_match_matmul():
                                        compiler_options=options)
                     assert got.sharding.spec == P(None, "x", "y")
                     assert np.allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12), (ta, tb, columns)
+
+
+def test_paired_schur_cut_takes_the_sector_keep():
+    """The Schur cut of the paired stage uses the caller's keep (the ordered sector threshold),
+    as the H'_vv cut does: H_r = diag(S, I) with S = diag(gamma_r), B = 0, so the restricted
+    metric is the identity and the paired rank counts gamma_r above the cut plus the kept span."""
+    from gw.shared_pole_local import _mm
+    from gw.shared_pole_reduction import paired_stage
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    gamma_r = np.array([[1e-8 / 2, 1e-6, 0.5]])
+    c = gamma_r.shape[-1]
+    eye = np.eye(c, dtype=np.complex128)[None]
+    zero = np.zeros_like(eye)
+    h_r = np.block([[np.diag(gamma_r[0]).astype(np.complex128), zero[0]], [zero[0], eye[0]]])[None]
+    stage = dict(kept=np.ones((1, c), bool), b_r=zero, h_r=jnp.asarray(h_r), g_r=jnp.asarray(np.eye(2 * c, dtype=np.complex128)[None]),
+                 schur=jnp.asarray(np.diag(gamma_r[0]).astype(np.complex128)[None]))
+    for keep, want in ((gates["normalized_gram_keep"]["sector_threshold"], 1), (None, 2)):
+        out = paired_stage(dict(stage), jnp.asarray(gamma_r), jnp.asarray(eye), matmul=_mm, gates=gates, gram_keep=keep)
+        assert int(np.asarray(out["count_r"])[0]) == want + c, (keep, np.asarray(out["count_r"]))
+        assert float(np.asarray(out["paired_metric_residual_relative"])[0]) < 1e-12

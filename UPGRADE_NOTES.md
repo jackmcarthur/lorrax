@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — the bispinor sector constructor reduces every CC/TT parent at once; its face GEMMs are panel_matmul
+
+The face route of the sector constructor ran CC, TT and CT in rounds of a
+few parents (CrI3 24×24 at P64: 21 rounds of 3), one program per round with
+its eighs inside, so every round paid its eighs serially. When the face
+route has more parents than its batch, CC and TT now reduce every parent at
+once: the selection runs in sub-batches, the reduction's stage programs run
+over sub-batches and write one stack per array in place, and each eigh runs
+once over the stack, one whole matrix per rank where it fits the room.
+Stacks that do not fit beside the live set reduce in face rounds with a
+warning. CT still runs in rounds, on slices of the held outputs. Every
+constructor face GEMM is `distrib_la.panel_matmul` (transposed operands by
+one grid-transpose exchange, compiled with XLA's latency-hiding scheduler):
+at the P64 sector shapes 12.0–13.4 TF/s per A100 against 3.1–5.4 for the
+cuBLASMp face (claim 3425). The metric corrections stay Newton–Schulz (the
+paired metric needs one iteration). The constructor receipt names the
+decoupled stacks, the eigh room and the largest ‖ZAZ−I‖/√R per sector.
+Results move at round-off (product order): Fe 4³ bispinor eqp within
+0.18 µeV of main over three SC maps (claim 3435). No deck change.
+
 ## 2026-10-06 — the cuSOLVERMp eigh runs at a block of 128–256 and reads its info
 
 A cuSOLVERMp eigh ran at the largest divisor of n/p up to 256, which is
