@@ -307,8 +307,10 @@ Placement is a condenser problem, not a choice of interesting frequencies:
   $[\max(h,\text{first spacing}),\,\omega_{\rm reach}]$, where $\rho$ is the
   $\eta$-broadened density of the crossings $|E-\epsilon_{mk}|$ that contour
   deformation actually meets for the **reads**: every requested state's input
-  energy $\pm P$ on the $\Sigma$ step ($P = 2$ eV, `gw.qp_support.requested_reads_ev`),
-  so the line reaches every state the run asks for. Their count is the strip law
+  energy $\pm 5$ eV on the $\Sigma$ step (`gw.qp_support.requested_reads_ev` with
+  `shared_pole_recipe.SUPPORT_READ_PAD_EV`; the $\Sigma$ plan itself pads 2 eV),
+  so the line reaches every state the run asks for and never less far than the
+  former $\pm5$ eV window did. Their count is the strip law
   $n=\lceil(\Omega_R-h)\ln(4/\epsilon)/(\pi h)\rceil$, $\Omega_R=\max|E_{\rm read}-\mu|$,
   $\epsilon=10^{-3}$: $W(x+ih)$ is analytic in a strip of half-width $h$, so a
   spacing $\pi h/\ln(4/\epsilon)$ aliases at most $\epsilon/4$. It is held between
