@@ -22,6 +22,33 @@ The rigid SC conduction-tail fitter now lives in `gw.scissor.fit_sum_band_tail`.
 The SC map and reference diagnostics call that one pure NumPy implementation;
 the fitting law and numerical behavior are unchanged.
 
+## 2026-10-06 — shared-pole W line sites cover every requested state; far-state energies change by design
+
+The shared-pole recipe (`shared_real_pole_v1_r4`, new recipe hash) places W's
+line sites over the energies at which the run's requested states read Σ
+(each state's E_in ± 2 eV, `gw.qp_support.requested_reads_ev`), with a
+closed-form count ⌈(Ω_R − h)·ln(4/ε)/(πh)⌉ held between 18 − n_imag and a
+40-sample cap. They were placed for states within a fixed ±5 eV of μ, so a
+requested state further out read an extrapolated W (Si 0.5–0.7 eV, Ni 20³ up
+to 0.92 eV). The model header records `support_top_ev` and `support_reads_ev`;
+the Σ planner warns, never refuses, when a sample group reads outside them
+(the coarse semicore windows always do). `support_delivery_window_ev` is gone;
+ω_p + 3.5 eV still tops the imaginary ladder only. Against each deck's dense
+line ladder (max / RMS meV, cold P4): Fe 4³ charge ±2 eV 2.56/1.72 → 1.38/0.87,
+±10 eV 43.1/7.50 → 22.6/3.94, far 274/56.4 → 80.8/14.6; Fe 4³ bispinor
+8.03/4.26 → 6.97/3.40, 39.3/7.77 → 46.2/6.87, 850/143 → 99/19.9; Si 4³ (eqp0)
+0.02/0.02 → 0.01/0.01, 20.0/3.12 → 17.5/2.68, 514/142 → 149/27.9; CrI3 6×6
+(eqp1) 1.67/0.53 → 1.85/0.69, 10.4/1.63 → 7.88/1.12, I 5s 209/34.5 → 18.9/3.0.
+Cold W response: Fe charge 43.4 → 54.7 s, Fe bispinor 145.9 → 152.0 s, CrI3
+140.4 → 146.7 s, Si 37.6 → 75.2 s (14 → 32 line sites; 57.2 s with the
+response-rule split now on main, 4662eac7d). A deck that requests
+protected states to ~40 eV (Fe/Ni 20³) takes 32 line sites (14 if it asked
+only for states within ±10 eV); projected from these slopes with the rule
+split, cold W rises about 7 % on Ni 20³ bispinor and 10–30 % on Fe 20³ charge
+(map 0), 23–43 % on Fe 20³ charge's held maps; decks that request no state
+beyond about ±13 eV (CrI3 24×24, NiPS3 12×7, CrSBr 20×15) keep their count. A restart bundle
+written by the old recipe refuses by name (`recipe_hash` mismatch, rebuild).
+
 ## 2026-10-06 — the cuSOLVERMp eigh runs at a block of 128–256 and reads its info
 
 A cuSOLVERMp eigh ran at the largest divisor of n/p up to 256, which is

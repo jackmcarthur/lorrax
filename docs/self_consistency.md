@@ -621,12 +621,14 @@ rules, held so that each map is the same function of its input:
   with one line `Response rule rebuilt at a held map; failed reuse test: …`
   naming each failed field.
 - **Support enclosure** (`shared_pole_recipe._support_envelope`). Map 0 uses
-  its own supports. From map 1 the loop keeps the running maximum of the top
-  line endpoint and of $u_{\max}$ and the running minimum of $u_{\min}$, so
+  its own supports. From map 1 the loop keeps the running maximum of the
+  imaginary-ladder top $L=\omega_p+3.5$ eV and of $u_{\max}$ and the running
+  minimum of $u_{\min}$, so
   the smaller DFT gap of map 0, which lowers $u_{\min}$, is never locked in. The enclosure fixes sampling geometry
   only; it is not an interpolation-error certificate.
-- **Line sites.** The line sites, placed from the band structure by the
-  support rule of the theory page, are held while the support rule
+- **Line sites.** The line sites, placed by the support rule of the theory
+  page over this map's requested reads (the states that set the sampled
+  $\Sigma$ support, at $E_{\rm in}\pm2$ eV), are held while the support rule
   would place every site within
   max(3 meV, 0.1 × the previous map's max|dE|) of the held one
   (`shared_pole_recipe.LINE_SITE_HOLD_EV`), and re-placed from the current

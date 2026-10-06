@@ -15,7 +15,7 @@ import operator
 
 import numpy as np
 
-RECIPE_VERSION = "shared_real_pole_v1_r3b"
+RECIPE_VERSION = "shared_real_pole_v1_r4"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
 RECEIPT_SCHEMA = "lorrax.shared-real-pole.receipt.v1"
 ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_imaginary": 4}
@@ -26,6 +26,8 @@ shared_real_pole_v1_r3b = {
     "height_floor_ev": 2.6,
     "active_depth_ev": 15.0,
     "borderline_depth_ev": 25.0,
+    # L = omega_p + plasma_margin_ev tops the IMAGINARY ladder (u_max, kappa); the line
+    # ladder stops at the reach of the requested reads, not at L.
     "plasma_margin_ev": 3.5,
     "imaginary_floor_max_ev": 16.0,
     "imaginary_count_epsilon": 1.0e-3,
@@ -34,24 +36,31 @@ shared_real_pole_v1_r3b = {
     "held_line_fractions": (0.25, 0.65),
     # Production line sites (report section IV.B, the support rule): quantiles of the
     # consumer's crossing-pair density to the power alpha on [omega_lo, omega_reach].
-    # Delivered: states within the window of mu, at offsets of the window on its step
-    # (the Si rule's +/-5 eV, 0.25 eV grid). Si Sigma optimum flat over alpha 0.25-0.75.
+    # The reads are the requested states' Sigma frequencies (gw.qp_support
+    # .requested_reads_ev: E_in +/- the plan pad on the Sigma step), so the line reaches
+    # every state the run asks for (WSUPPORT, claims 3282/3284; was a fixed +/-5 eV
+    # window). Si Sigma optimum flat over alpha 0.25-0.75.
     "support_density_power": 0.5,
-    "support_delivery_window_ev": 5.0,
-    "support_offset_step_ev": 0.25,
+    # The line reads each requested state at +-5 eV (the Sigma plan pads only 2 eV):
+    # the old rule's offsets, now for every requested state, so the line never reaches
+    # less far than it did (the H2- hsuite one-shot moved 52 meV near E_F against a
+    # dense ladder when its reach fell from 9.9 to 7.0 eV at +-2 eV).
+    "support_read_pad_ev": 5.0,
     "multiplet_relative_tolerance": 1.0e-6,
     "moment_convention": "S_m = 2 M_(2m+1); physical M1 and M3 only",
     "operator_realization": "little-group-reynolds-v1",
     # bank_rule_tolerance is tier-owned (METAL 2026-09-16): the remote-cell certificate
     # floor on a deep-semicore metal (Fe: even rows 3.4e-9 against 1e-8/4/amp) is a
     # deck property; production keeps 1e-8 bit for bit, relaxed admits 1e-7.
-    # Production sizing (owner ruling 2026-09-17): 18 fitted supports counted as the sparse
-    # n14 rung counts them (line + imaginary; held and the M1/M3 block are extra), line
-    # sites by the support rule; at most N_mu/16 right singular directions per line
-    # support; at most 1.8 N_mu retained Gram directions, the pole count K per parent.
+    # Production sizing (owner rulings 2026-09-17, 2026-10-05): at least 18 fitted supports
+    # (line + imaginary; held and the M1/M3 block are extra) and at most sample_cap bank
+    # samples including the held ones; between the two, the line count is the strip law
+    # of support_line_count; at most N_mu/16 right singular directions per line support;
+    # at most 1.8 N_mu retained Gram directions, the pole count K per parent.
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125,
                    "bank_rule_tolerance": 1.0e-8, "fitted_support_count": 18,
+                   "sample_cap": 40,
                    "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625,
@@ -120,6 +129,8 @@ def table_hash(table):
 
 
 RECIPE_HASH = table_hash(shared_real_pole_v1_r3b)
+#: Pad (eV) of the W line reads around each requested state (``qp_support.requested_reads_ev``).
+SUPPORT_READ_PAD_EV = shared_real_pole_v1_r3b["support_read_pad_ev"]
 #: The Sigma quadrature is not W.  A tier's default for an omitted
 #: sigma_quadrature_eps lives outside the hashed table above, whose every field
 #: sets W's sampling or poles, so RECIPE_HASH (restart and bank identity) binds
@@ -900,12 +911,12 @@ def _support_envelope(required, key, session):
     previous = session.get("envelope")
     same_policy = previous is not None and session.get("key") == key
     # Compared and retained on the snap grid: 1 ulp of the census charge
-    # (line_top) otherwise flips hit/expanded, hence the SC sample sites.
+    # (imaginary_top) otherwise flips hit/expanded, hence the SC sample sites.
     envelope = {k: snap_outward(v, 1.0, -1 if k == "u_min_ev" else +1)
                 for k, v in required.items()}
     if same_policy:
         envelope = {
-            "line_top_ev": max(previous["line_top_ev"], envelope["line_top_ev"]),
+            "imaginary_top_ev": max(previous["imaginary_top_ev"], envelope["imaginary_top_ev"]),
             "u_min_ev": min(previous["u_min_ev"], envelope["u_min_ev"]),
             "u_max_ev": max(previous["u_max_ev"], envelope["u_max_ev"]),
         }
@@ -1032,25 +1043,45 @@ def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
 LINE_SITE_HOLD_EV = 3.0e-3
 
 
-def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, top_ev, count,
+def support_line_count(reads_ev, height_ev, imaginary_count, held_count,
+                       recipe=shared_real_pole_v1_r3b, tier='production'):
+    """Production line-site count for the requested reads: the strip law, clamped.
+
+    W(x + i h) is analytic in a strip of half-width h about the sampling line, so sites
+    spaced by Delta alias at most e^(-pi h / Delta): spacing pi h / ln(4/eps) keeps that
+    below eps/4, eps the recipe's imaginary_count_epsilon (one sampling accuracy for both
+    ladders).  Over the reach Omega_R = max |read - mu| that is
+    n = ceil((Omega_R - h) ln(4/eps) / (pi h)) sites, held between today's floor
+    (fitted_support_count - imaginary_count) and the sample cap (sample_cap - imaginary
+    - held).  Closed form, no fit (owner 2026-09-26).  Returns (count, receipt).
+    """
+    policy = recipe[tier]
+    reach = float(np.max(np.abs(reads_ev))) if np.size(reads_ev) else 0.0
+    eps, h = recipe['imaginary_count_epsilon'], float(height_ev)
+    strip = math.ceil(max(reach - h, 0.0) * math.log(4.0 / eps) / (math.pi * h))
+    floor = int(policy['fitted_support_count']) - int(imaginary_count)
+    cap = int(policy['sample_cap']) - int(imaginary_count) - int(held_count)
+    count = max(floor, min(strip, cap))
+    return count, dict(reach_ev=reach, strip=int(strip), floor=floor, cap=cap, count=count)
+
+
+def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, reads_ev, count,
                             recipe=shared_real_pole_v1_r3b, grid=4001):
     """Line sites from the band structure alone: the support rule (report section IV.B).
 
-    Sigma evaluates W on the line at the crossings |E - eps|: E a delivered energy (a
-    state within the delivery window W of ``mu_ev``, at an offset of the window's own
-    frequency grid) and eps any level, at any k (k - q spans the zone), strictly between
-    mu and E. ``energies_ev`` [k, bands]. The crossing density rho broadens each
-    crossing at ``eta_ev``; ``count`` sites sit at equal quantiles of rho**alpha on
-    [omega_lo, omega_reach], omega_reach the largest crossing and omega_lo the fixed point
-    max(height, first spacing). Crossings at or below the height count as none; with none
-    rho is flat on [omega_lo, ``top_ev``]. Distances from mu are binned at 0.01 eV (far
-    below eta) and paired by one correlation per side of mu; sites land on a grid of
-    ``grid`` points. Returns strictly increasing sites in eV.
+    Sigma evaluates W on the line at the crossings |E - eps|: E a read, the energy (eV,
+    relative to ``mu_ev``) at which a requested state reads Sigma
+    (``qp_support.requested_reads_ev``), and eps any level, at any k (k - q spans the
+    zone), strictly between mu and E. ``energies_ev`` [k, bands]. The crossing density
+    rho broadens each crossing at ``eta_ev``; ``count`` sites sit at equal quantiles of
+    rho**alpha on [omega_lo, omega_reach], omega_reach the largest crossing and omega_lo
+    the fixed point max(height, first spacing). Crossings at or below the height count
+    as none; with none rho is flat on [omega_lo, max(|reads|, 2 height)]. Distances from
+    mu are binned at 0.01 eV (far below eta) and paired by one correlation per side of
+    mu; sites land on a grid of ``grid`` points. Returns strictly increasing sites in eV.
     """
     levels = np.asarray(energies_ev, dtype=np.float64).ravel() - mu_ev
-    window, step, delta = (recipe['support_delivery_window_ev'], recipe['support_offset_step_ev'], 0.01)
-    offsets = np.arange(-window, window + step / 2, step)
-    evaluation = (levels[np.abs(levels) <= window][:, None] + offsets[None, :]).ravel()
+    evaluation, delta = np.asarray(reads_ev, dtype=np.float64).ravel(), 0.01
     pairs = np.zeros(1)
     for side in (1.0, -1.0):
         e, eps = side * evaluation, side * levels
@@ -1064,7 +1095,8 @@ def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, top_ev, count
         pairs = np.pad(pairs, (0, max(0, n - pairs.size))) + np.pad(lagged, (0, max(0, pairs.size - n)))
     pairs[:int(np.floor(height_ev / delta)) + 1] = 0
     lags = np.flatnonzero(pairs)
-    reach = float(lags[-1] * delta) if lags.size else float(top_ev)
+    flat = max(float(np.max(np.abs(evaluation))) if evaluation.size else 0.0, 2.0 * float(height_ev))
+    reach = float(lags[-1] * delta) if lags.size else flat
     x = np.linspace(0.0, reach, grid)
     rho = (eta_ev / math.pi * (pairs[lags] / ((x[:, None] - lags * delta) ** 2 + eta_ev ** 2)).sum(axis=1)
            ) ** recipe['support_density_power'] if lags.size else np.ones(grid)
@@ -1100,7 +1132,7 @@ def matsubara_indices(beta_ry_inv, bandwidth_ry, tier, recipe=shared_real_pole_v
 
 
 def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
-                              support_session=None):
+                              support_reads_ev, support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
 
     ``bind_shared_pole_census`` must have consumed this map's occupation state.
@@ -1110,6 +1142,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     role code is reserved (moments need no bank evaluation). Conjugates are
     constructor states, never bank calls. ``support_pair`` int64 [role,2]
     binds held endpoints; [-1,-1] means not a held midpoint.
+    ``support_reads_ev`` are the absolute energies (eV) at which this map's requested
+    states read Sigma (``qp_support.requested_reads_ev`` plus the caller's frame mu):
+    the line sites are placed over them and their count follows ``support_line_count``.
     ``support_session`` optionally retains support bounds, the small line-site
     tuple and a policy/basis key across SC maps, after one unretained reference map.
     Enclosed current intervals retain the same points and roles, while
@@ -1149,9 +1184,14 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     override = parse_support_sites(getattr(config.sigma, 'w_support_sites_ev', ''))
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
+    # L tops the imaginary ladder only (u_max, kappa); the line stops at the reads' reach.
     top = plasma_ry * RYD_TO_EV + recipe['plasma_margin_ev']
     umin = max(recipe['height_eta_factor'] * eta, census['gap_ev'])
     umax = max(recipe['imaginary_floor_max_ev'], top)
+    reads_abs = np.asarray(support_reads_ev, dtype=np.float64).ravel()
+    if not reads_abs.size or not np.isfinite(reads_abs).all():
+        raise ValueError("GATE shared_pole_support_reads: got: no finite requested reads; want: qp_support.requested_reads_ev of this map's requested states; why: the line sites are placed over the energies Sigma reads")
+    reads = reads_abs - census['mu_ry'] * RYD_TO_EV
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     support_receipt = None
@@ -1160,20 +1200,25 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                census['logical_band_count'],
                '' if override is None else override['text'])
         support_receipt = _support_envelope(
-            dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
+            dict(imaginary_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
             support_session)
         retained = support_receipt['retained']
-        top, umin, umax = (retained['line_top_ev'], retained['u_min_ev'],
+        top, umin, umax = (retained['imaginary_top_ev'], retained['u_min_ev'],
                            retained['u_max_ev'])
     kappa = top / umin
     count = imaginary_sample_count(kappa, tier, recipe)
     imaginary = np.geomspace(umin, umax, count)
+    line_count_rule = None
     if tier == 'relaxed':
-        line = np.linspace(0.0, top, policy['line_count'])
+        line = np.linspace(0.0, max(float(np.max(np.abs(reads))), 2.0 * height),
+                           policy['line_count'])
     else:
-        # The fitted budget less the imaginary ladder, placed by the support rule.
-        line = support_rule_line_sites(energies * RYD_TO_EV, census['mu_ry'] * RYD_TO_EV, eta, height, top,
-                                       policy['fitted_support_count'] - count)
+        # The strip-law count over the reads' reach, placed by the support rule.
+        held_count = len(recipe['held_line_fractions']) + np.unique(
+            np.sqrt(imaginary[[0, -2]] * imaginary[[1, -1]])).size
+        line_count, line_count_rule = support_line_count(reads, height, count, held_count, recipe, tier)
+        line = support_rule_line_sites(energies * RYD_TO_EV, census['mu_ry'] * RYD_TO_EV, eta, height,
+                                       reads, line_count)
         if support_receipt is not None and support_receipt['status'] != 'initial_reference':
             previous_line = support_session.get('line_ev')
             if support_receipt['status'] == 'hit' and previous_line is not None:
@@ -1277,8 +1322,12 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,
         'plasma_ev': plasma_ry * RYD_TO_EV, 'plasma_ry': plasma_ry,
-        'top_ev': top,
+        'imaginary_top_ev': top,
         'line_ev': line, 'imaginary_ev': imaginary,
+        # The Sigma planner reads these from the model header (gw.sigma_box_plan).
+        'support_top_ev': float(line[-1]),
+        'support_reads_ev': [float(reads_abs.min()), float(reads_abs.max())],
+        'line_count_rule': line_count_rule,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
         'u_min_ev': umin, 'u_max_ev': umax, 'kappa': kappa,
         'z_ry': np.asarray(role_z, dtype=np.complex128),
@@ -1316,8 +1365,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'support_sites': 'sigma_w_support_sites_ev; "" = the resolver ladder, else explicit line|imaginary eV sites folded into recipe_version/recipe_hash',
         'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
-        'top': 'L=omega_p+3.5 eV',
-        'line': 'production: 18 fitted supports less the imaginary count, quantiles of the band-structure crossing density; relaxed 8 endpoints',
+        'imaginary_top': 'L=omega_p+3.5 eV (imaginary ladder only)',
+        'line': 'production: strip-law count ceil((max|read-mu|-h) ln(4/eps)/(pi h)) within [18 - imaginary count, 40 - imaginary - held], quantiles of the crossing density of the requested reads; relaxed 8 sites on [0, max|read-mu|]',
+        'support_top': 'largest line site, eV; read by the Sigma planner',
+        'support_reads': 'absolute eV extent of the requested reads (E_in +/- the plan pad)',
         'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
         'pole_budget': 'production ceil(1.8 n) retained Gram directions per parent (largest first); relaxed none',
         'imaginary': 'log-spaced u_min..u_max; round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
@@ -1333,7 +1384,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'metadata': 'sum of replicated metadata array nbytes',
     }
     if support_receipt is not None:
-        rules.update(top='SC high-water envelope of omega_p+3.5 eV',
+        rules.update(imaginary_top='SC high-water envelope of omega_p+3.5 eV',
                      u_min='SC low-water envelope of max(h,logical gap)',
                      u_max='SC high-water envelope of max(16 eV,L)',
                      support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')

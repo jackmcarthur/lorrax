@@ -1980,6 +1980,7 @@ def compute_sigma_c_mpa_omega_grid(
             "compute_sigma_c_mpa_omega_grid: tau_kernel_factory serves the pole "
             "route; a shared-pole model passes its sector kernel through sector_context")
     fixed_pole_support_ry = None
+    support_window_ry = support_top_ev = None
     if shared_pole:
         from file_io.shared_pole_store import open_shared_pole_model, validate_shared_pole_model
         with timing.section("sigma.model_validate"):
@@ -1992,6 +1993,12 @@ def compute_sigma_c_mpa_omega_grid(
         if not np.isclose(regularization_width_ry * RYD_TO_EV,
                           recipe["eta_ev"], rtol=0, atol=1e-12):
             raise ValueError("GATE shared_pole_eta: Sigma and current recipe eta differ")
+        # W's line support as the model header records it (absolute eV reads).
+        header_recipe = ledger.get("recipe") or {}
+        if header_recipe.get("support_reads_ev") is not None:
+            lo, hi = header_recipe["support_reads_ev"]
+            support_window_ry = (lo / RYD_TO_EV - float(efermi_ry), hi / RYD_TO_EV - float(efermi_ry))
+            support_top_ev = header_recipe.get("support_top_ev")
         if fixed_quadrature_session is not None:
             fixed_pole_support_ry = (
                 recipe.get("sector_pole_treatment") or {}).get("ceiling_ry")
@@ -2106,7 +2113,8 @@ def compute_sigma_c_mpa_omega_grid(
                 certificate_pole_summaries=certificate,
                 occupation_reach_ry=occupation_floor_reach_ry(occupation_state),
                 omega_eta_ry=omega_eta_ry, omega_group=omega_group,
-                group_fixed=group_fixed)
+                group_fixed=group_fixed,
+                support_window_ry=support_window_ry, support_top_ev=support_top_ev)
         quadrature_log.record_sigma_plan(geometry)
         print_fn(
             f"  MPA windows [box]: "
