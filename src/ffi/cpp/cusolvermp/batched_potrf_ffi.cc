@@ -34,6 +34,7 @@
 #include "../common/ffi_helpers.h"
 #include "cusolvermp_interface.h"
 #include "ctx.h"
+#include "info.h"
 
 namespace lorrax_ffi::cusolvermp_batched_potrf {
 
@@ -125,6 +126,10 @@ static ffi::Error BatchedPotrfImpl(
                       static_cast<long long>(q));
         NvtxRange range(tag);
         T* slice_ptr = d_L_out + q * slice_elems;
+        if (auto err = reset_info(ctx); !err.success()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            return err;
+        }
         mp_st = mp::Potrf<T>(
             ctx->handle, CUBLAS_FILL_MODE_LOWER, n,
             slice_ptr, 1, 1, descA,
@@ -136,6 +141,11 @@ static ffi::Error BatchedPotrfImpl(
             std::ostringstream os;
             os << "cusolverMpPotrf (q=" << q << ") failed: status=" << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        if (auto err = read_info(ctx, "cusolverMpPotrf",
+                "the leading minor is not positive definite", n, mb, q); !err.success()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            return err;
         }
     }
 

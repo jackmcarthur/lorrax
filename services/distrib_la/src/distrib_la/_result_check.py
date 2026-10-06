@@ -67,7 +67,16 @@ def _norm(a):
     return jnp.linalg.norm(a, axis=(-2, -1))
 
 
-def deflate_zero_rows(eigh, *, constrain=None):
+def _live_norm(a):
+    """||A||_F without the rows that carry only a diagonal entry (sentinels, zero rows)."""
+    diagonal = jnp.diagonal(a, axis1=-2, axis2=-1)
+    decoupled = jnp.all((a == 0) | (_eye_like(a) != 0), axis=-1)
+    live = jnp.sum(jnp.abs(a) ** 2, axis=(-2, -1)) - jnp.sum(
+        jnp.where(decoupled, jnp.abs(diagonal) ** 2, 0), axis=-1)
+    return jnp.sqrt(jnp.maximum(live, 0))
+
+
+def deflate_zero_rows(eigh, *, constrain=None, shift=False):
     """Wrap a Hermitian eigensolver so exact zero rows never reach it.
 
     Capacity padding and unselected columns reach eigensolvers as exact zero
@@ -85,6 +94,12 @@ def deflate_zero_rows(eigh, *, constrain=None):
     through unchanged. ``constrain`` pins a distributed result to its layout
     (values replicated, vectors on the operand's faces), so the cond's output
     is never left to propagation, which replicated it (n^2 per rank).
+    ``shift`` also adds s = ||live A||_F to the live diagonal in the same
+    pass (one copy of A, as without it) and takes s off the eigenvalues: the
+    solver sees the live spectrum in [s - b, s + b], so a (near-)zero
+    cluster sits at s, away from the origin (:func:`shifted`, without its
+    re-orthonormalization). The eigenvalues come back with an absolute error
+    ~ eps (||A|| + s) <= eps sqrt(n) ||A||_2.
     """
     pin = (lambda r: r) if constrain is None else constrain
     def solve(a):
@@ -94,9 +109,10 @@ def deflate_zero_rows(eigh, *, constrain=None):
         bound = jnp.max(jnp.sum(jnp.abs(a), axis=-1), axis=-1)
         bound = jnp.where(bound > 0, bound, 1)
         sentinel = -2 * bound[..., None] * (1 + jnp.arange(n, dtype=bound.dtype) / n)
-        diagonal = jnp.where(dead, sentinel, 0).astype(a.dtype)
+        s = _live_norm(a)[..., None] if shift else 0
+        diagonal = jnp.where(dead, sentinel, s).astype(a.dtype)
         values, vectors = pin(eigh(a + diagonal[..., :, None] * _eye_like(a)))
-        restored = jnp.where(values < -1.5 * bound[..., None], 0, values)
+        restored = jnp.where(values < -1.5 * bound[..., None], 0, values - s)
         # Sentinels come out first; only a negative live eigenvalue must move ahead of the zeros.
         live_negative = jnp.any((restored < 0) & jnp.any(dead, axis=-1, keepdims=True))
 
@@ -163,11 +179,7 @@ def shifted(eigh, *, matmul):
     n eps lambda_max support line of the response callers.
     """
     def solve(a):
-        diagonal = jnp.diagonal(a, axis1=-2, axis2=-1)
-        decoupled = jnp.all((a == 0) | (_eye_like(a) != 0), axis=-1)
-        live = jnp.sum(jnp.abs(a) ** 2, axis=(-2, -1)) - jnp.sum(
-            jnp.where(decoupled, jnp.abs(diagonal) ** 2, 0), axis=-1)
-        s = jnp.sqrt(jnp.maximum(live, 0))
+        s = _live_norm(a)
         values, vectors = eigh(a + s[..., None, None] * _eye_like(a))
         vectors, _ = orthonormalize(vectors, matmul=matmul)
         return values - s[..., None], vectors

@@ -940,7 +940,7 @@ class Plan:
             # Zero rows leave the solver as distinct sentinels (deflate_zero_rows),
             # on every attempt. A failed check solves again: shifted (a near-zero
             # cluster moved off the origin, the vectors re-orthonormalized), then
-            # in the other cuSOLVERMp layout, then gathered.
+            # gathered.
             # The provider SUMMA (cuBLASMp): a single matrix never batch-reshards onto one device.
             gemm = partial(matmul, mesh=mesh, backend="distributed", batched_route="auto")
             pin = eigh_layout(mesh, A.ndim)
@@ -948,10 +948,18 @@ class Plan:
             attempts = [deflate(solve), deflate(shifted(solve, matmul=gemm))]
             n = int(A.shape[-1])
             if backend == "cusolvermp":
+                # cuSOLVERMp 0.9.1 syevd returns vectors that are not orthonormal
+                # inside a near-zero cluster, with status 0 and info 0, on
+                # rank-deficient PSD responses (CrI3 6x6 TT, n 7908: orthogonality
+                # 4-5e-2 in every TT round), so it solves shifted first, in the
+                # deflation's pass. Then shifted and re-orthonormalized, shifted
+                # at a smaller block (retry_block: no more workspace), unshifted.
                 from distrib_la._cusolvermp import retry_block
+                attempts = [deflate(solve, shift=True), attempts[1]]
                 block = retry_block(n, int(mesh.shape["x"]))
                 if block is not None:
-                    attempts.append(deflate(partial(solve, block=block)))
+                    attempts.append(deflate(partial(solve, block=block), shift=True))
+                attempts.append(deflate(solve))
             # A gathered local solve, where the whole matrix, its vectors and
             # the solver's copy fit GATHERED_EIGH_BYTES on every rank (a shape
             # rule, the same on every rank). XLA reserves it in every program

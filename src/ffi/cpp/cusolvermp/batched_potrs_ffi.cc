@@ -32,6 +32,7 @@
 #include "../common/ffi_helpers.h"
 #include "cusolvermp_interface.h"
 #include "ctx.h"
+#include "info.h"
 
 namespace lorrax_ffi::cusolvermp_batched_potrs {
 
@@ -138,6 +139,11 @@ static ffi::Error BatchedPotrsImpl(
         NvtxRange range(tag);
         T* A_slice_ptr = const_cast<T*>(d_L) + q * A_slice;
         T* X_slice_ptr = d_X_out + q * B_slice;
+        if (auto err = reset_info(ctx); !err.success()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            cusolverMpDestroyMatrixDesc(descB);
+            return err;
+        }
         mp_st = mp::Potrs<T>(
             ctx->handle, CUBLAS_FILL_MODE_LOWER, n, mrhs,
             A_slice_ptr, 1, 1, descA,
@@ -151,6 +157,12 @@ static ffi::Error BatchedPotrsImpl(
             std::ostringstream os;
             os << "cusolverMpPotrs (q=" << q << ") failed: status=" << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        if (auto err = read_info(ctx, "cusolverMpPotrs", "the solve failed", n, mb_a, q);
+                !err.success()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            cusolverMpDestroyMatrixDesc(descB);
+            return err;
         }
     }
 

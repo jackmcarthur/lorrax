@@ -23,6 +23,12 @@ def _vendor_query(ctx, op, sizes, dtype):
     from distrib_la.loader import get_lib
     lib = get_lib('CUDA')
     name = 'lrx_eigh_workspace_bytes' if op == 'eigh' else 'lrx_gemm_workspace_bytes'
+    if op == 'eigh' and len(sizes) == 2:
+        # (side, block): the descriptor the distributed solve runs at. A
+        # library without the block query prices one tile per rank at that side.
+        name = 'lrx_eigh_workspace_bytes_block'
+        if not hasattr(lib, name):
+            name, sizes = 'lrx_eigh_workspace_bytes', sizes[:1]
     if not hasattr(lib, name):
         raise RuntimeError(f'workspace query requires a native build exporting {name}')
     fn = getattr(lib, name)
@@ -92,7 +98,13 @@ def _workspace_details(plan, op, shapes, dtype):
         if not local and plan.backend != 'cusolvermp':
             raise ValueError('distributed eigh workspace query supports cusolvermp only')
         ctx = 0 if local else get_or_init_context(plan.mesh)
-        device, host = _vendor_query(ctx, op, (n,), dtype.str)
+        side = n
+        if local:
+            device, host = _vendor_query(ctx, op, (n,), dtype.str)
+        else:
+            from distrib_la._cusolvermp import solve_layout
+            side, block = solve_layout(n, px)
+            device, host = _vendor_query(ctx, op, (side, block), dtype.str)
         # Local kernels need an info integer in addition to vendor work.
         # Mp info is persistent context state, not per-operation scratch.
         # A native auto route executes the whole batch, and route (c) its
@@ -110,6 +122,9 @@ def _workspace_details(plan, op, shapes, dtype):
             from distrib_la.plan import (CHECKED_EIGH_TILES, GATHERED_EIGH_FACTOR,
                                          _gathered_admitted)
             checked = CHECKED_EIGH_TILES * (n * n // (px * py)) * dtype.itemsize
+            if side > n:
+                # The padded operand and the padded vectors before the slice.
+                checked += 2 * (side * side // (px * py)) * dtype.itemsize
             if _gathered_admitted((n, n), dtype):
                 checked += GATHERED_EIGH_FACTOR * n * n * dtype.itemsize
         scratch += checked
@@ -117,7 +132,7 @@ def _workspace_details(plan, op, shapes, dtype):
                     vendor_device_bytes=device if local else None,
                     native_device_bytes=device,
                     dynamic_xla_scratch_bytes=scratch,
-                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes include aligned vendor workspace and a private operand tile; checked = CHECKED_EIGH_TILES n^2/P (+ GATHERED_EIGH_FACTOR n^2 when admitted)',
+                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes include aligned vendor workspace and a private operand tile; checked = CHECKED_EIGH_TILES n^2/P (+ 2 N^2/P at a padded solve side N, + GATHERED_EIGH_FACTOR n^2 when admitted)',
                     checked_device_bytes=checked,
                     copies=copies,
                     provider='cusolverDn' if local else 'cusolverMp')

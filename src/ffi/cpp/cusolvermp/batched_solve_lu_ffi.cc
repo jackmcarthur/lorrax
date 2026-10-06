@@ -63,6 +63,7 @@
 #include "../common/ffi_helpers.h"
 #include "cusolvermp_interface.h"
 #include "ctx.h"
+#include "info.h"
 
 namespace lorrax_ffi::cusolvermp_batched_solve_lu {
 
@@ -229,6 +230,7 @@ static ffi::Error BatchedSolveLuImpl(
         T* X_slice_ptr = d_X_out + q * B_slice;
         int64_t* ipiv_slice_ptr = no_pivot ? nullptr : (d_ipiv + q * ipiv_slice);
 
+        if (auto err = reset_info(ctx); !err.success()) { cleanup_ws(); cleanup(); return err; }
         mp_st = mp::Getrf<T>(
             ctx->handle, n, n,
             A_slice_ptr, 1, 1, descA,
@@ -241,6 +243,10 @@ static ffi::Error BatchedSolveLuImpl(
             std::ostringstream os;
             os << "cusolverMpGetrf (q=" << q << ") failed: status=" << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        if (auto err = read_info(ctx, "cusolverMpGetrf", "U has an exactly zero diagonal entry",
+                                 n, mb_a, q); !err.success()) {
+            cleanup_ws(); cleanup(); return err;
         }
         mp_st = mp::Getrs<T>(
             ctx->handle, CUBLAS_OP_N, n, nrhs,
@@ -255,6 +261,10 @@ static ffi::Error BatchedSolveLuImpl(
             std::ostringstream os;
             os << "cusolverMpGetrs (q=" << q << ") failed: status=" << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        if (auto err = read_info(ctx, "cusolverMpGetrs", "the solve failed", n, mb_a, q);
+                !err.success()) {
+            cleanup_ws(); cleanup(); return err;
         }
     }
 
@@ -326,6 +336,10 @@ static ffi::Error BatchedGetrfImpl(
     for (int64_t q = 0; q < nq; ++q) {
         T* LU_q = d_LU_out + q * A_slice;
         int64_t* piv_q = no_pivot ? nullptr : d_ipiv_out + q * ipiv_len;
+        if (auto err = reset_info(ctx); !err.success()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            return err;
+        }
         mp_st = mp::Getrf<T>(
             ctx->handle, n, n, LU_q, 1, 1, descA, piv_q,
             ctx->d_workspace, ctx->d_workspace_bytes,
@@ -336,6 +350,11 @@ static ffi::Error BatchedGetrfImpl(
             os << "cusolverMpGetrf (q=" << q << ") failed: status="
                << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        if (auto err = read_info(ctx, "cusolverMpGetrf", "U has an exactly zero diagonal entry",
+                                 n, mb, q); !err.success()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            return err;
         }
     }
     cusolverMpDestroyMatrixDesc(descA);
@@ -417,6 +436,11 @@ static ffi::Error BatchedGetrsImpl(
         int64_t* piv_q = no_pivot ? nullptr
                                   : const_cast<int64_t*>(d_ipiv)
                                         + q * ipiv_len;
+        if (auto err = reset_info(ctx); !err.success()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            cusolverMpDestroyMatrixDesc(descB);
+            return err;
+        }
         mp_st = mp::Getrs<T>(
             ctx->handle, CUBLAS_OP_N, n, nrhs, LU_q, 1, 1, descA, piv_q,
             X_q, 1, 1, descB,
@@ -429,6 +453,12 @@ static ffi::Error BatchedGetrsImpl(
             os << "cusolverMpGetrs (q=" << q << ") failed: status="
                << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        if (auto err = read_info(ctx, "cusolverMpGetrs", "the solve failed", n, mb_a, q);
+                !err.success()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            cusolverMpDestroyMatrixDesc(descB);
+            return err;
         }
     }
     cusolverMpDestroyMatrixDesc(descA);

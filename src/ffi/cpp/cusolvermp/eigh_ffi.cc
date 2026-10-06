@@ -17,7 +17,8 @@
 //   - cusolverMpHandle_t / cal_comm_t / cusolverMpGrid_t  (one-time setup)
 //   - host-side workspace buffer (cuSOLVERMp needs a host malloc; XLA's
 //     scratch allocator is device-only)
-//   - d_info (tiny; allocated once on ctx)
+//   - d_info (tiny; allocated once on ctx; zeroed before and read after
+//     every solve, info.h)
 //   - NCCL scratch in the CAL→NCCL shim (lives outside any FFI call)
 
 #include "../common/ctx_registry.h"
@@ -35,6 +36,7 @@
 #include "../common/ffi_helpers.h"
 #include "cusolvermp_interface.h"
 #include "ctx.h"
+#include "info.h"
 
 namespace lorrax_ffi::cusolvermp {
 
@@ -171,8 +173,8 @@ static ffi::Error EighImpl(
         ctx->h_workspace_bytes = h_ws_bytes;
     }
 
-    // d_info is never read (mp_st already indicates success); skip the
-    // per-call memset.  cuSOLVERMp writes into d_info in Syevd.
+    // The status reports API errors only; a STEDC failure is in d_info (info.h).
+    FFI_RETURN_IF_ERROR(reset_info(ctx));
 
     // The public eigh operation does not donate A. cuSOLVERMp overwrites its
     // operand during tridiagonalisation, so only the private tile may be passed.
@@ -194,6 +196,8 @@ static ffi::Error EighImpl(
         os << "cusolverMpSyevd failed: status=" << (int)mp_st;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
+    FFI_RETURN_IF_ERROR(read_info(ctx, "cusolverMpSyevd",
+        "the tridiagonal eigensolver did not converge", n, mb));
 
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         xla_stream, ctx->stream, ctx->ev_ctx_out));
@@ -304,11 +308,29 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 
 // Query-only planning entry point. No matrix or workspace allocation and no solve.
 // ctx_handle==0 selects the device-local cuSOLVER route; otherwise the live
-// cuSOLVERMp grid supplies precisely the descriptors used by EighImpl.
+// cuSOLVERMp grid supplies the descriptors EighImpl builds at block ``mb``
+// (the block the solve runs at, distrib_la._cusolvermp.solve_layout).
 #include <cusolverDn.h>
 #include <algorithm>
+extern "C" int lrx_eigh_workspace_bytes_block(
+    int64_t ctx_handle, int64_t n, int64_t mb, int complex128,
+    uint64_t* device_bytes, uint64_t* host_bytes);
+
+// One tile per rank (mb = n/p): the descriptor of a solve at its own tile.
 extern "C" int lrx_eigh_workspace_bytes(
     int64_t ctx_handle, int64_t n, int complex128,
+    uint64_t* device_bytes, uint64_t* host_bytes) {
+    int64_t mb = n;
+    if (ctx_handle != 0) {
+        auto* ctx = reinterpret_cast<lorrax_ffi::cusolvermp::LorraxCusolverMpCtx*>(ctx_handle);
+        mb = ctx->p > 0 ? n / ctx->p : n;
+    }
+    return lrx_eigh_workspace_bytes_block(ctx_handle, n, mb, complex128,
+                                          device_bytes, host_bytes);
+}
+
+extern "C" int lrx_eigh_workspace_bytes_block(
+    int64_t ctx_handle, int64_t n, int64_t mb, int complex128,
     uint64_t* device_bytes, uint64_t* host_bytes) {
     if (!device_bytes || !host_bytes || n < 1 || n > INT32_MAX ||
         (complex128 != 0 && complex128 != 1)) return -1;
@@ -348,14 +370,15 @@ extern "C" int lrx_eigh_workspace_bytes(
     }
     using namespace lorrax_ffi::cusolvermp;
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
-    if (ctx->p != ctx->q || n % ctx->p || n % ctx->q) return -2;
+    if (ctx->p != ctx->q || n % ctx->p || n % ctx->q || mb < 1 || (n / ctx->p) % mb)
+        return -2;
     cusolverMpMatrixDescriptor_t a = nullptr, q = nullptr;
     const auto dtype = complex128 ? CUDA_C_64F : CUDA_R_64F;
     auto status = cusolverMpCreateMatrixDesc(&a, ctx->grid, dtype,
-        n, n, n/ctx->p, n/ctx->q, 0, 0, n/ctx->p);
+        n, n, mb, mb, 0, 0, n/ctx->p);
     if (status != CUSOLVER_STATUS_SUCCESS) return int(status);
     status = cusolverMpCreateMatrixDesc(&q, ctx->grid, dtype,
-        n, n, n/ctx->p, n/ctx->q, 0, 0, n/ctx->p);
+        n, n, mb, mb, 0, 0, n/ctx->p);
     // Mp sizing rejects null pointers, although it reads no matrix data.
     // Reuse the context's existing device-info allocation as an address
     // token; no operand-sized allocation or data access is required.

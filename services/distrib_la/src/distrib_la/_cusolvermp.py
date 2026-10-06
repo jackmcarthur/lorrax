@@ -24,7 +24,7 @@ from typing import Dict, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la import loader
 from distrib_la._collectives import broadcast_bytes
@@ -237,35 +237,92 @@ _mesh_key = mesh_key
 #   P16  n 16000: 17.50 -> 10.59   8000: 4.46 -> 3.56   4000: 1.43 -> 1.38
 #   P64  n 16000: 20.05 -> 15.65   8000: 7.13 -> 6.47   4000: 2.91 -> 2.80
 # mb 125 matches 250 at P16; 500 is slower at P64; n/p <= 256 is unchanged.
+# A tile whose largest divisor up to 256 is small (n/p prime or a small
+# multiple of one: 3954 = 2*3*659 gives block 6) is padded instead, to the
+# smallest tile with a divisor in [128, 256] (solve_layout): blocks 1-8 ran
+# 5-34x slower than one tile per rank (P4 bench, KNOWN_LORRAX_ISSUES).
 # LU and Cholesky keep one tile per rank: there block-cyclic getrs/potrs are
 # 2-3x slower and getrf gains nothing (same bench).
 _BLOCK_MAX = 256
+_BLOCK_MIN = 128
+
+
+def _largest_block(local: int) -> int:
+    """The largest divisor of a tile edge ``local`` that is at most :data:`_BLOCK_MAX`."""
+    return max(d for d in range(1, min(local, _BLOCK_MAX) + 1) if local % d == 0)
 
 
 def _block_size(n: int, p: int) -> int:
-    """The eigh block edge for an ``n x n`` operand on a ``p x p`` grid.
+    """The eigh block edge for an ``n x n`` operand on a ``p x p`` grid, unpadded.
 
     The largest divisor of ``n/p`` that is at most :data:`_BLOCK_MAX`, so
     every rank keeps its ``(n/p, n/p)`` buffer; ``n/p`` itself when it is
-    that small.
+    that small. :func:`solve_layout` decides whether the solve pads instead.
+    """
+    return _largest_block(n // p)
+
+
+def solve_layout(n: int, p: int) -> tuple[int, int]:
+    """``(N, mb)``: the side an ``n x n`` eigh solves at on a ``p x p`` grid, and its block.
+
+    ``(n, _block_size(n, p))`` when that block is at least :data:`_BLOCK_MIN`
+    or ``n/p`` is at most :data:`_BLOCK_MAX`. Otherwise each rank's tile is
+    padded to the smallest edge with a divisor in [128, 256] (at most 127
+    rows per rank; 3954 -> 3956, block 172), and the padded rows carry
+    sentinel eigenvalues below the spectrum (:func:`distributed_eigh`).
     """
     local = n // p
-    return max(d for d in range(1, min(local, _BLOCK_MAX) + 1)
-               if local % d == 0)
+    block = _largest_block(local)
+    if local <= _BLOCK_MAX or block >= _BLOCK_MIN:
+        return n, block
+    padded = next(m for m in range(local + 1, local + _BLOCK_MIN + 1)
+                  if _largest_block(m) >= _BLOCK_MIN)
+    return p * padded, _largest_block(padded)
+
+
+def pad_with_sentinels(a, side: int):
+    """``a`` (n x n) padded to ``side``, the padded diagonal below its spectrum.
+
+    The padded rows and columns are zero except their diagonal, which holds
+    distinct sentinels ``-2 b (1 + j/side)``, ``b`` the Gershgorin bound of
+    ``a``: decoupled eigenpairs below every eigenvalue of ``a``.
+    """
+    n = int(a.shape[-1])
+    bound = jnp.max(jnp.sum(jnp.abs(a), axis=-1))
+    bound = jnp.where(bound > 0, bound, 1).astype(jnp.float64)
+    row = jax.lax.broadcasted_iota(jnp.int32, (side, side), 0)
+    col = jax.lax.broadcasted_iota(jnp.int32, (side, side), 1)
+    sentinel = -2 * bound * (1 + (col - n).astype(jnp.float64) / side)
+    whole = jnp.pad(a, ((0, side - n), (0, side - n)))
+    return whole + jnp.where((row == col) & (col >= n), sentinel, 0).astype(a.dtype)
+
+
+def drop_sentinels(W, Q, n: int):
+    """The ``n`` live eigenpairs of a :func:`pad_with_sentinels` solve, raw layout.
+
+    The sentinels are the ``side - n`` lowest eigenvalues; ``Q``'s rows are
+    the eigenvalue index (cuSOLVERMp's raw buffer), its columns the operand's
+    rows, of which the first ``n`` are ``a``'s.
+    """
+    side = int(W.shape[-1])
+    return W[side - n:], Q[side - n:, :n]
 
 
 def retry_block(n: int, p: int) -> int | None:
-    """The other layout of an ``n x n`` eigh on a ``p x p`` grid, or None.
+    """A smaller block for the same solve side, or None: the retry layout.
 
-    One tile per rank (no block-cyclic relabeling) when the default block is
-    smaller; otherwise the largest divisor of ``n/p`` at most half of it. The
-    checked eigh solves there again when the default layout's result fails
-    its check.
+    The largest divisor of the solve tile (:func:`solve_layout`) at most half
+    the default block. The checked eigh solves there again when the default
+    layout's result fails its check; the solve side, its operand and its
+    output are the first attempt's, and the vendor workspace of a smaller
+    block is not larger (``workspace_bytes_per_rank``), so the retry needs no
+    more memory than the attempt it replaces. One tile per rank is never a
+    retry: its workspace and wall exceed the default's at large n/p. Below
+    block 8 there is none (blocks 1-4 ran 5-34x slower than one tile).
     """
-    local = n // p
-    if _block_size(n, p) != local:
-        return local
-    return next((d for d in range(local // 2, 1, -1) if local % d == 0), None)
+    side, block = solve_layout(n, p)
+    local = side // p
+    return next((d for d in range(block // 2, 7, -1) if local % d == 0), None)
 
 
 def _cyclic_rows_to_block(Q, *, n: int, p: int, mb: int):
@@ -315,6 +372,7 @@ def distributed_eigh(
     mesh: Mesh,
     compute_evecs: bool = True,
     block: int | None = None,
+    side: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition via cuSOLVERMp.
 
@@ -331,12 +389,21 @@ def distributed_eigh(
         Must be True.  ``False`` (jobz='N') is REFUSED — see the guard
         below and ``resolve.resolve_backend`` guard 2c (bug L-3).
     block
-        The square block edge, a divisor of ``n/p``; default
-        :func:`_block_size`.  ``n/p`` is one tile per rank, the layout the
-        checked eigh retries in (:func:`retry_block`).
+        The square block edge, a divisor of the solve tile; default
+        :func:`solve_layout`'s block. :func:`retry_block` is the smaller
+        block the checked eigh retries at.
+    side
+        The solve side ``N >= n``, a multiple of the mesh; default
+        :func:`solve_layout`'s (``side=n`` with ``block=_block_size(n, p)``
+        is the unpadded layout, for benches).
 
-    The solve runs block-cyclic at :func:`_block_size` on the operand's own
-    tiles (the relabeling note above :data:`_BLOCK_MAX`).
+    The solve runs block-cyclic on the operand's own tiles (the relabeling
+    note above :data:`_BLOCK_MAX`). Where the tile has no divisor in
+    [128, 256] it runs on a padded side ``N`` (:func:`solve_layout`): the
+    padded rows and columns are zero except their diagonal, which holds
+    distinct sentinels ``-2 b (1 + j/N)`` below the Gershgorin bound ``b`` of
+    ``A``, so they are decoupled, come out as the ``N - n`` lowest
+    eigenpairs, and are dropped. The result is ``A``'s ``n`` eigenpairs.
 
     Returns
     -------
@@ -384,9 +451,13 @@ def distributed_eigh(
     loader.get_lib("CUDA")                  # load the .so, register targets
     ctx_key = context_key(mesh)  # NCCL + cal_comm + cusolverMp
 
-    mb = nb = _block_size(n, p) if block is None else int(block)
-    if (n // p) % mb:
-        raise ValueError(f"distributed_eigh: block {mb} does not divide n/p = {n // p}")
+    if side is None:
+        side, default = solve_layout(n, p)
+    else:
+        side, default = int(side), _block_size(int(side), p)
+    mb = nb = default if block is None else int(block)
+    if side < n or side % p or (side // p) % mb:
+        raise ValueError(f"distributed_eigh: block {mb} does not divide the solve tile {side // p}")
 
     # jit(shard_map(...)) with a per-signature cache — the shape EVERY other
     # FFI wrapper in this package has.  This one was the exception: it
@@ -400,15 +471,15 @@ def distributed_eigh(
     # It also matters for correctness of the batched dispatcher's serial
     # fallback: that path is the one taken on CUDA, and it calls this
     # wrapper Nq times.
-    key = ("eigh", _mesh_key(mesh), A.dtype, n, mb, nb,
+    key = ("eigh", _mesh_key(mesh), A.dtype, n, side, mb, nb,
            bool(compute_evecs), int(ctx_key))
     jit_eigh = _JIT_CACHE.get(key)
     if jit_eigh is None:
         # Local output shapes + partition specs for shard_map.
-        W_local = jax.ShapeDtypeStruct((n,), jnp.float64)       # replicated
-        Q_local = jax.ShapeDtypeStruct((n // p, n // q), A.dtype)
+        W_local = jax.ShapeDtypeStruct((side,), jnp.float64)    # replicated
+        Q_local = jax.ShapeDtypeStruct((side // p, side // q), A.dtype)
         # Attributes forwarded to the C++ handler.
-        attrs = dict(n=n, mb=mb, nb=nb,
+        attrs = dict(n=side, mb=mb, nb=nb,
                      ctx_key=int(ctx_key),
                      compute_evecs=bool(compute_evecs))
 
@@ -423,16 +494,24 @@ def distributed_eigh(
             # Q's rows (axis 0, over 'x') are the eigenvalue index, which
             # cuSOLVERMp lays out block-cyclically like A's; put them back
             # in W's ascending order.
-            if mb != n // p:
-                Q = _cyclic_rows_to_block(Q, n=n, p=p, mb=mb)
+            if mb != side // p:
+                Q = _cyclic_rows_to_block(Q, n=side, p=p, mb=mb)
             return W, Q
+
+        face = NamedSharding(mesh, P("x", "y"))
+
+        def _padded(a):
+            whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)
+            W, Q = _call(whole)
+            W, Q = drop_sentinels(W, Q, n)
+            return W, jax.lax.with_sharding_constraint(Q, face)
 
         # NO donate_argnums / input_output_aliases, deliberately: this
         # wrapper never donated its operand and distrib_la.plan.DONATES
         # declares eigh as donating nothing.  Adding donation here would
         # silently invalidate A for the caller — and the serial batched
         # path slices A[q] out of a stack the next iteration still needs.
-        jit_eigh = jax.jit(_call)
+        jit_eigh = jax.jit(_call if side == n else _padded)
         _JIT_CACHE[key] = jit_eigh
 
     return jit_eigh(A)
