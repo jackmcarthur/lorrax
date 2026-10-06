@@ -113,6 +113,9 @@ def test_decoupled_face_matches_local():
                                     gram_keep=gram_keep, carrier=face_ritz_carrier(mesh, budget))
         ld, dd = (jax.tree.map(np.asarray, r[3][0]) for r in (local, dec))
         assert np.all(dd["paired_metric_inverse_root_residual_relative"] < 1e-12), sub
+        # the bound's Newton-Schulz count is the same whichever root ran
+        assert np.array_equal(ld["paired_metric_newton_schulz_bound_iterations"],
+                              dd["paired_metric_newton_schulz_bound_iterations"]), sub
         for key in ("gram_spectrum_relative", "gram_min_relative", "paired_min_relative", "retained_metric_relative"):
             assert np.allclose(ld[key], dd[key], rtol=1e-8, atol=1e-12), (sub, key)
         for key in ("retained_rank", "paired_rank", "positive_count", "gram_valid", "orientation_paired"):

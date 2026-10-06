@@ -33,6 +33,14 @@ def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None, eig
     """
     identity = _matrix_layout(diagonal_like(jnp.ones(metric.shape[:1] + metric.shape[-1:]), metric), matrix_sharding)
     radius = jnp.max(jnp.sum(jnp.abs(identity - metric), axis=-1), axis=-1)
+    # Aim near float64 roundoff, leaving the physical residual gate intact.
+    target = min(float(tolerance), 32 * jnp.finfo(metric.real.dtype).eps)
+    bounded = jnp.isfinite(radius) & (radius < 1)
+    safe_radius = jnp.where(bounded & (radius > target), radius, .5)
+    counts = jnp.maximum(0, jnp.ceil(jnp.log2(
+        jnp.log(target) / jnp.log(safe_radius)))).astype(jnp.int32)
+    # Newton-Schulz's count from the bound, per parent (-1: no bound), run or not.
+    counts = jnp.where(bounded, jnp.where(radius > target, counts, 0), -1)
     if eigen is not None:
         values, vectors = eigen
         valid = jnp.all(jnp.isfinite(values), axis=-1) & (values[:, 0] > 0)
@@ -41,15 +49,9 @@ def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None, eig
                                            transb="C"), matrix_sharding)
         iterations = jnp.zeros((), jnp.int32)
     else:
-        valid = jnp.isfinite(radius) & (radius < 1)
+        valid = bounded
         if not isinstance(radius, jax.core.Tracer) and not bool(jnp.all(valid)):
             raise ValueError(f"GATE shared_pole_metric_inverse_root: got: infinity norm {radius.tolist()}; want: finite norm < 1; why: Newton-Schulz convergence bound")
-        # Aim near float64 roundoff, leaving the physical residual gate intact.
-        target = min(float(tolerance), 32 * jnp.finfo(metric.real.dtype).eps)
-        safe_radius = jnp.where(valid & (radius > target), radius, .5)
-        counts = jnp.maximum(0, jnp.ceil(jnp.log2(
-            jnp.log(target) / jnp.log(safe_radius)))).astype(jnp.int32)
-        counts = jnp.where(valid & (radius > target), counts, 0)
         iterations = jnp.where(jnp.all(valid), jnp.max(counts), 0)
 
         def step(_, state):
@@ -64,6 +66,7 @@ def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None, eig
     diagnostics = {
         "metric_initial_infinity_norm": radius,
         "metric_inverse_root_iterations": jnp.full(radius.shape, iterations),
+        "metric_newton_schulz_bound_iterations": counts,
         "metric_inverse_root_residual_fro": absolute,
         "metric_inverse_root_residual_relative": relative,
     }
@@ -549,7 +552,8 @@ def paired_correct(stage, eigen=None, *, matmul, gates, matrix_sharding=None):
     reduced = hermitian_part(matmul(y, matmul(g_r, y), transa="C"))
     out = {k: v for k, v in stage.items() if k not in ("metric_r", "g_r")}
     out.update(reduced=reduced, y=y, metric_r_ok=metric_r_ok,
-               paired_metric_residual_relative=paired_metric_diagnostics["metric_inverse_root_residual_relative"])
+               paired_metric_residual_relative=paired_metric_diagnostics["metric_inverse_root_residual_relative"],
+               paired_metric_ns_bound=paired_metric_diagnostics["metric_newton_schulz_bound_iterations"])
     return out
 
 
@@ -589,6 +593,7 @@ def output_stage(stage, mu, rotation, *, matmul, gates, retain_span=False, matri
     diagnostics = {
         **stage["metric_diagnostics"],
         "paired_metric_inverse_root_residual_relative": stage["paired_metric_residual_relative"],
+        "paired_metric_newton_schulz_bound_iterations": stage["paired_metric_ns_bound"],
         "gram_diagonal_positive": stage["diagonal_ok"],
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,

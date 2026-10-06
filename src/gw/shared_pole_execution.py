@@ -244,7 +244,8 @@ def route_summary(mode, receipt):
                   + ("every eigh once over the stack, paired metric root by "
                      f"{decoupled.get('paired_inverse_root', '?')}" if decoupled['admitted']
                      else "stacks over budget: face rounds over the stacked panels")
-                  + f", max |ZAZ-I|/sqrt(R) keep {decoupled['keep_residual']:.1e} paired {decoupled['paired_residual']:.1e}")
+                  + f", max |ZAZ-I|/sqrt(R) keep {decoupled['keep_residual']:.1e} paired {decoupled['paired_residual']:.1e}"
+                  + f", paired Newton-Schulz bound {decoupled.get('paired_ns_bound', '?')} iteration(s)")
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}

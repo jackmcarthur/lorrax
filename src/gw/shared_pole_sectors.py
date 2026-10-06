@@ -957,7 +957,8 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     _sector_gates(diagnostics,geometry['sector'],list(range(int(nq))),int(nq))
     residual=lambda key:float(np.max(np.asarray(diagnostics[0][key])[:int(nq)]))
     receipt.update(keep_residual=residual('metric_inverse_root_residual_relative'),
-                   paired_residual=residual('paired_metric_inverse_root_residual_relative'))
+                   paired_residual=residual('paired_metric_inverse_root_residual_relative'),
+                   paired_ns_bound=int(residual('paired_metric_newton_schulz_bound_iterations')))
     budget.retained_panels=tuple(retained)
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
