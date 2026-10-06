@@ -195,17 +195,18 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     # cross actions; the dense fitted samples (imaginary axis) are read whole.
     dense_fit=[int(i) for i in recipe['fit_ids'] if not line_lo<=int(i)<line_hi]
 
-    def read_samples(io,endpoints,retained):
+    def read_samples(io,endpoints,retained,ids=None,layout=None):
         # Wc/dWc_ds at the dense fitted samples.
-        return read_sector_round(io,meta,bank,header,ids,endpoints,sample_ids=dense_fit,
-            fields=('Wc','dWc_ds'),retained=retained,execution=read_layout)
+        return read_sector_round(io,meta,bank,header,ids_of(ids),endpoints,sample_ids=dense_fit,
+            fields=('Wc','dWc_ds'),retained=retained,execution=layout or read_layout)
 
-    def read_line(io,family,cross=False):
-        spec=None if read_layout=='face' else P(('x','y'))
+    def read_line(io,family,cross=False,ids=None,layout=None):
+        spec=None if (layout or read_layout)=='face' else P(('x','y'))
         name=('C','T')[family]
         return {sid:read_line_panels(io,meta=meta,header=header,family=name,sample=sid,cross=cross,
-                                     q_ids=ids,partition_spec=spec)
+                                     q_ids=ids_of(ids),partition_spec=spec)
                 for sid in range(line_lo,line_hi)}
+    ids_of=lambda given:ids if given is None else given
     receipts=[];stores={};placed=[]
     root=Path(output).parent
     to_face=batch_to_face(mesh_xy)
@@ -257,13 +258,51 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                   f"(parents over x, matrices over y; priced from the shapes)",flush=True)
     rounds=list(sector_round_schedule(bank,header,meta,config,mesh_xy,
         execution=resolved_execution,batch_width=batch_width))
+    # The decoupled face route: CC and TT for every parent at once (the selection in
+    # sub-batches of the admitted width, every eigh once over the stack), then the CT
+    # rounds over slices of the held outputs. The stacks are reserved at their actual
+    # side; a refusal keeps today's rounds (warn, never refuse).
+    whole=None
+    if resolved_execution=='face' and int(header['n_q_irr'])>batch_width:
+        whole=[];held_leaves=[]
+        try:
+            for family,name in enumerate(('CC','TT')):
+                with timing.section('spole.sector.'+name+'.all', announce=True):
+                    def read(ids,family=family,name=name):
+                        with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+                            exact=read_sector_round(io,meta,bank,header,ids,(family,family),
+                                fields=('M0','M1','M2','M3'),retained=held_leaves,execution='face')
+                            refuse_nonfinite_moment(name,exact['M1'],len(ids),mesh_xy=mesh_xy)
+                            samples=read_samples(io,(family,family),(*held_leaves,*exact.values()),ids=ids,layout='face')
+                            line=read_line(io,family,ids=ids,layout='face')
+                        return samples,exact,line
+                    geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
+                        header=sector_headers[family],sample_ids=dense_fit,sector=name,
+                        face_room=face_room,program_bytes=sizes.get(name))
+                    model=construct_diagonal_sector_all(read,int(header['n_q_irr']),meta,config,geometry,
+                        mesh_xy=mesh_xy,retained=held_leaves,width=batch_width)
+                    whole.append(model)
+                    used_room(execution_rows[family],model['budget'])
+                    held_leaves.extend(jax.tree.leaves((model['model'],model['signed'],
+                        model['coefficients'],model['infinity'],tuple(s[1:] for s in model['states']))))
+                    reduction,zero,_,_=model['diagnostics']
+                    counts=np.asarray(model['vectors'][1]).sum(axis=-1).tolist()
+                    receipts.append(dict(sector=name,parents=list(range(int(header['n_q_irr']))),K=counts,
+                        gram_min_relative=np.asarray(reduction['gram_min_relative']).tolist(),
+                        zero_policy=np.asarray(zero['zero_policy']).tolist()))
+        finally:
+            ledger.live_stages=upstream
     while rounds:
         ids,real,slots,execution=rounds.pop(0)
         face=execution=='face'
         # A row round reads its samples as face stacks; its programs move them.
         read_layout='face' if execution=='row' else execution
         sectors=[];retained=[];first_receipt=len(receipts)
-        for family,name in enumerate(('CC','TT')):
+        model=None
+        if whole is not None and face:
+            sectors=[slice_sector(sec,ids,mesh_xy) for sec in whole]
+            retained=list(held_leaves)
+        for family,name in (() if sectors else enumerate(('CC','TT'))):
             with timing.section('spole.sector.'+name, announce=True):
                 with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
@@ -797,6 +836,205 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
                 tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
                 recipe=recipe,budget=budget,execution=execution)
+
+
+
+def _sector_selection(samples, moments, line, recipe, geometry, local_meta, n, budget, *, mesh_xy, execution, retained):
+    """The selection half of a diagonal sector round: infinity directions and the state panels
+    of one batch of parents (face stacks or batch layout). Returns (states, counts, roles,
+    infinity, values); the caller forms the tables and pads the panels."""
+    import numpy as np
+    from gw.shared_pole_directions import (_round_kernels,line_panel_states,port_extent,
+                                           select_round_states,infinity_directions)
+    eig=budget.eigenplan(local_meta.n_rmu_padded)
+    extent=port_extent(mesh_xy)
+    kernels=_round_kernels(mesh_xy,'face' if execution=='face' else 'batch')
+    qi,values=infinity_directions(kernels,moments['M1'],min(n,recipe['infinity_width']),
+        eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
+        real_rows=None if execution=='face' else geometry['real'])
+    infinity=(qi,*(kernels.apply(moments[name],qi) for name in ('M0','M1','M2','M3')))
+    real=geometry['real']
+    line_states={sid:line_panel_states(panels,np.where(np.arange(len(counts))<real,counts,0),
+                                       recipe,sid=sid,ordered=True,mesh_xy=mesh_xy)
+                 for sid,(panels,counts) in line.items()}
+    states,counts,roles=select_round_states(samples,recipe,sample_ids=geometry['sample_ids'],
+        real=real,mesh_xy=mesh_xy,eigh_plan=eig,column_extent=extent,
+        logical_n=n,ordered=True,line_states=line_states)
+    del line_states
+    budget.retained_panels=(*retained,*samples.values(),*moments.values(),
+                            *(panels for panels,_ in line.values()))
+    return states,counts,roles,infinity,values
+
+
+def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, retained=(), width):
+    """CC or TT for every parent at once: the selection in sub-batches of ``width`` parents
+    (``read(ids)`` returns that batch's samples, moments and line panels on the face), one
+    set of tables for every parent, and the decoupled reduction (stage programs over
+    sub-batches, each eigh once over the stack). Returns what the round returns, for every parent."""
+    import copy
+    import jax
+    import numpy as np
+    from gw.gw_config import linalg_resolution
+    from gw.shared_pole_capacity import ConstructorCapacity,face_eigh_room,round_padding_output_bytes
+    from gw.shared_pole_directions import port_extent
+    from gw.shared_pole_local import (round_tables,recipe_panel_widths,recipe_infinity_width,pad_states,
+                                      carrier_history,parent_rounds)
+    from gw.shared_pole_execution import face_reduce_decoupled,face_eigh,face_ritz_carrier,_stack
+    components=int(geometry['components'])
+    basis=geometry['basis']
+    n=components*basis.n_logical
+    local_meta=copy.copy(meta)
+    local_meta.mu_basis=basis
+    local_meta.n_rmu=n
+    local_meta.n_rmu_padded=components*basis.n_packed
+    recipe=sector_recipe(meta.shared_pole_recipe,n)
+    ledger=meta.shared_pole_capacity
+    budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
+                               mesh_xy=mesh_xy,ledger=ledger,upstream=ledger.live_stages,execution='face')
+    budget.batch_width=int(width)
+    budget.retained_panels=tuple(retained)
+    budget.face_room=geometry.get('face_room')
+    budget.program_bytes=geometry.get('program_bytes')
+    extent=port_extent(mesh_xy)
+    parts=[]
+    for ids,real,slots in parent_rounds(nq,int(width)):
+        samples,moments,line=read(ids)
+        line={} if line is None else line
+        panel_elements=sum(int(np.prod(panels.shape[1:])) for panels,_ in line.values())
+        selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
+                         +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
+        selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
+                              selection_faces=selection_faces)
+        if budget.face_room is not None:
+            budget.face_room=min(budget.face_room,face_eigh_room(selection) or 0) or None
+        sub=dict(geometry,ids=ids,real=real)
+        states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,sub,local_meta,n,budget,
+            mesh_xy=mesh_xy,execution='face',retained=retained)
+        # a short last sub-batch repeats its last parent: keep the real slots only
+        keep=slice(0,int(real))
+        parts.append((states,np.asarray(counts)[keep],roles,infinity,[v for v in values][keep],real))
+        del samples,moments,line
+        budget.retained_panels=tuple(retained)
+    # One carrier per state over every sub-batch (the widest selection), then one stack.
+    widths=[max(ws) for ws in zip(*(recipe_panel_widths(part[2][0],part[0],recipe,column_extent=extent,logical_n=n)
+                                    for part in parts))]
+    infinity_width=max(recipe_infinity_width(part[3],recipe,column_extent=extent,logical_n=n) for part in parts)
+    padded=[pad_states(part[0],widths,part[3],infinity_width) for part in parts]
+    take=lambda a,real:a if int(a.shape[0])==int(real) else jax.jit(lambda x:x[:real],out_shardings=a.sharding)(a)
+    def node(a):
+        z=padded[0][0][a][0]
+        if np.ndim(z)==0:
+            return z
+        return np.concatenate([np.asarray(sub[0][a][0])[:part[5]] for sub,part in zip(padded,parts)])
+    states=[(node(a),*_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[0][a][1:]) for sub,part in zip(padded,parts)]))
+            for a in range(len(padded[0][0]))]
+    infinity=_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[1]) for sub,part in zip(padded,parts)])
+    counts=np.concatenate([part[1] for part in parts])
+    values=[v for part in parts for v in part[4]]
+    roles=parts[0][2]
+    del padded,parts
+    history=carrier_history(meta)
+    name=(('sector',geometry['sector'],n),'extent',2,len(states))
+    tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],
+        infinity_width,column_extent=extent,ordered=True,odd_moments=True,key=name[0],history=history)
+    side=int(tables['active'].shape[-1])
+    budget.batch_width=int(nq)
+    budget.retained_panels=(*retained,*(a for s in states for a in s[1:]),*infinity)
+    # The stage stacks of every parent sit beside the eigh stacks. The peak is the
+    # second stage's run, both its input stack (the paired members) and its output
+    # stack (the restricted pencil) live; the eighs run beside the state panels and
+    # one stack, and take their room from the ledger beside exactly that.
+    hvv=side//2
+    c=int(face_ritz_carrier(mesh_xy,recipe['pole_budget']) or hvv)
+    packed=int(local_meta.n_rmu_padded)
+    members=16*(6*hvv*hvv+2*packed*hvv)
+    restricted=16*(2*(2*c)**2+2*c*c+hvv*c+packed*2*c)
+    per_rank=lambda bytes_per_parent:-(-int(bytes_per_parent)*int(nq)//int(mesh_xy.size))
+    panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:])
+    panels+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
+    stacks=per_rank(members+restricted)
+    row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=stacks+panels,
+                       workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)
+    ambient=ledger.live_stages
+    ledger.live_stages=(*ambient,row['stage'])
+    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members,restricted))+panels,
+                          workspace_bytes_per_rank=0,concurrent_with=ambient)
+    room=face_eigh_room(beside)
+    admitted=row['device_budget_status']=='PASS'
+    if jax.process_index()==0:
+        print(f"Shared-pole {geometry['sector']} decoupled: {int(nq)} parents, sub-batches of {int(width)}, "
+              f"pencil side {side}; stacks {stacks/1e9:.1f} GB/rank, panels {panels/1e9:.1f} GB/rank, "
+              f"eigh room {'none' if room is None else f'{room/1e9:.1f} GB/rank'}; "
+              f"{'every eigh once over the stack' if admitted else 'stacks over budget: face rounds over the stacked panels'}",flush=True)
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
+    gram_keep=shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
+    carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget'])
+    try:
+        if admitted:
+            reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,eigh_plan=face_eigh(mesh_xy,side,room),
+                width=int(width),ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
+                gram_keep=gram_keep,carrier=carrier)
+        else:
+            # The stacks do not fit beside the live set (warn, never refuse): the same
+            # stacked panels reduce in face rounds of the admitted width, the eighs per round.
+            from gw.shared_pole_execution import face_reduce_round,_take
+            ledger.live_stages=ambient
+            parts=[]
+            for i0 in range(0,int(nq),int(width)):
+                i1=min(i0+int(width),int(nq))
+                sub_states=[(st[0] if np.ndim(st[0])==0 else np.asarray(st[0])[i0:i1],*_take(mesh_xy,tuple(st[1:]),i0,i1))
+                            for st in states]
+                sub_tables={k:np.asarray(v)[i0:i1] for k,v in tables.items()}
+                parts.append(face_reduce_round(sub_states,_take(mesh_xy,infinity,i0,i1),sub_tables,mesh=mesh_xy,
+                    budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
+                    gram_keep=gram_keep,admit=False,room=budget.face_room,carrier=carrier))
+            reduced=_stack(mesh_xy,parts)
+    finally:
+        ledger.live_stages=ambient
+    model,signed,vectors,diagnostics,y=reduced
+    reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
+    for key in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):
+        if not np.all(reduction[key][:nq]):
+            raise ValueError(f"GATE shared_pole_sector_{key}: sector={geometry['sector']}, "
+                             f"passed={reduction[key][:nq].tolist()}, "
+                             f"Gram min/max={reduction['gram_min_relative'][:nq].tolist()}, "
+                             f"paired Schur S min/max={reduction['paired_min_relative'][:nq].tolist()}; no repair")
+    if not np.all(zero['zero_policy'][:nq]):
+        raise ValueError(f"GATE shared_pole_sector_zero_ritz: sector={geometry['sector']}")
+    budget.retained_panels=tuple(retained)
+    return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
+                tables=tables,roles=roles,diagnostics=diagnostics,vectors=vectors,
+                recipe=recipe,budget=budget,execution='face')
+
+
+def slice_sector(sector, slots, mesh_xy):
+    """One CT round's view of a sector built for every parent: the ``slots`` rows of every
+    per-parent array and table; shared records (roles, recipe, budget) pass through."""
+    import jax
+    import numpy as np
+    index=np.asarray(slots,np.int64)
+    def rows(a):
+        if isinstance(a,(int,float,bool,str,dict)) or a is None:
+            return a
+        if isinstance(a,np.ndarray):
+            return a[index] if a.ndim>=1 and a.shape[0]>int(index.max()) else a
+        if isinstance(a,(complex,float,int,bool,np.generic)):
+            return a
+        if hasattr(a,'shape') and hasattr(a,'sharding'):
+            if a.ndim==0:
+                return a
+            return jax.jit(lambda x:x[index],out_shardings=a.sharding)(a)
+        return a
+    out=dict(sector)
+    out['model']=tuple(rows(a) for a in sector['model'])
+    out['signed']=tuple(rows(a) for a in sector['signed'])
+    out['coefficients']=rows(sector['coefficients'])
+    out['states']=[tuple(rows(a) for a in st) for st in sector['states']]
+    out['infinity']=tuple(rows(a) for a in sector['infinity'])
+    out['tables']={k:rows(np.asarray(v)) for k,v in sector['tables'].items()}
+    out['vectors']=tuple(rows(a) for a in sector['vectors'])
+    out['diagnostics']=jax.tree.map(rows,sector['diagnostics'])
+    return out
 
 
 def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
