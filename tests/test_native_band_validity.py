@@ -191,5 +191,9 @@ def test_direct_chi_and_slope_against_independent_physical_lehmann_sum(mesh,orde
                     weight=(f[k,a]-f[kb,b])/den
                     expected[:,qi]+=weight[:,None,None]*outer
                     derivative[:,qi]+=(-weight/(2*z*den))[:,None,None]*outer
+    # API returns the documented orthogonal k-FFT χ (1/sqrt(Nk) band
+    # sum), before the spin/Nk factor folded into the Dyson prefactor.
+    expected/=np.sqrt(2.)
+    derivative/=np.sqrt(2.)
     np.testing.assert_allclose(actual,expected,rtol=2e-12,atol=2e-12)
     np.testing.assert_allclose(slope,derivative,rtol=2e-12,atol=2e-12)

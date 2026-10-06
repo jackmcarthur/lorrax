@@ -1326,6 +1326,13 @@ def build_static_quadrature(wfns, minimax_config, *,
     # therefore every MPA sample frequency) depend on process count.  Spectral
     # extrema are physics and end at the logical union carried alongside it.
     enk_c = wfns.enk[:, s.cond_all_logical]
+    if getattr(wfns, "valid_kn", None) is not None:
+        from .wavefunction_bundle import physical_band_mask
+        physical = physical_band_mask(wfns)
+        enk_v = np.asarray(jax.device_get(enk_v))[physical[:, s.val]]
+        enk_c = np.asarray(jax.device_get(enk_c))[physical[:, s.cond_all_logical]]
+        if not enk_v.size or not enk_c.size:
+            raise ValueError("GATE physical_band_validity: static minimax needs physical valence and conduction states")
     e_ref = resolve_minimax_energy_reference(
         enk_v, enk_c, reference=minimax_config.energy_reference)
 
