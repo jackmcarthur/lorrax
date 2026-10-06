@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — exact-derivative references skip zero-occupation transport
+
+The optional exact response derivative path skips pair tiles whose replicated
+occupation differences are identically zero before gathering and unfolding
+the second wavefunction face. The predicate is unchanged and agreed by all
+ranks. Both response and derivative sums are unchanged; the ordinary
+production response path remains unconditional. This affects reference
+scheduling only and requires no deck or file migration. Cross-source native
+P4 matrix parity and resource measurements are recorded separately.
+
 ## 2026-10-06 — dense-H references distinguish cropped and complete native spectra
 
 `psp.run_dense_h` still writes the same rectangular band set by default:

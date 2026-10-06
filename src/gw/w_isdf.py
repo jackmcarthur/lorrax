@@ -3538,15 +3538,6 @@ def _fractional_pair_scan_face(
                 "zkab,kmab,knab->zmn", weights, density_x, jnp.conj(density_y),
                 optimize=True)
 
-        if with_derivative:
-            # The complete-band reference has many occupied/occupied and
-            # empty/empty tiles with exactly zero df. Replicated scalar
-            # metadata makes every rank take the same branch. The default
-            # production sample retains its existing unconditional program.
-            live = jnp.any((df != 0) & logical)
-            return jax.lax.cond(live, contract,
-                lambda _: jnp.zeros((weights.shape[0], nmu_x_loc, nmu_y_loc), jnp.complex128),
-                operand=None)
         return contract(None)
 
     zero = jnp.zeros((z.size * (2 if with_derivative else 1), nmu_x_loc, nmu_y_loc), dtype=jnp.complex128)
@@ -3562,12 +3553,25 @@ def _fractional_pair_scan_face(
         def _inner(acc_inner, ib_step):
             ib = ib_step * tile
             gb = ib + jnp.arange(tile)
-            b_x = _roll(_children(_gather_mun(psi_mun_b, ib), unfold_x))
-            b_y = _roll(_children(_gather_nmu(psi_nmu_b, ib), unfold_y))
             eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
             fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
-            contribution = _pair_contribution(
-                a_x, b_x, a_y, b_y, ea, eb, fa, fb, ga, gb)
+
+            def contract(_):
+                b_x = _roll(_children(_gather_mun(psi_mun_b, ib), unfold_x))
+                b_y = _roll(_children(_gather_nmu(psi_nmu_b, ib), unfold_y))
+                return _pair_contribution(a_x, b_x, a_y, b_y, ea, eb, fa, fb, ga, gb)
+
+            if with_derivative:
+                # Same exact df/logical predicate as the reference density
+                # guard, now before transport too. All metadata here is
+                # replicated, so every rank takes the same collective branch.
+                logical = ((ga[:, None] < int(nb_logical))
+                           & (gb[None, :] < int(nb_logical)))[None, :, :]
+                live = jnp.any(((fa[:, :, None] - fb[:, None, :]) != 0) & logical)
+                contribution = jax.lax.cond(live, contract, lambda _: zero, operand=None)
+            else:
+                # The production sample remains the unconditional same sum.
+                contribution = contract(None)
             return acc_inner + contribution, None
 
         acc_inner, _ = jax.lax.scan(
