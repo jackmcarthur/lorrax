@@ -133,6 +133,32 @@ def test_actual_pbe_potential_directional_libxc_energy_derivative(component):
     assert abs(coarse-fine)<3e-7+3e-8*abs(predicted)
 
 
+@pytest.mark.parametrize("component",["exchange","correlation","combined"])
+def test_actual_pbe_uniform_charge_spin_texture_libxc_derivative(component):
+    """A nonuniform spin density retains exchange at exactly uniform charge."""
+    pytest.importorskip("jax_xc.impl")
+    fx,fc=pbe_functional_polarized_components()
+    g,r,gradient=geometry();x,y,z=r
+    rho=np.ones(g.shape[:-1]);mag=np.zeros((3,)+rho.shape)
+    mag[2]=.2+.05*np.cos(x)
+    np.testing.assert_allclose(gradient(rho),0.,atol=2e-15,rtol=0)
+    def zero(u,d,suu,sud,sdd):return jnp.zeros_like(u)
+    xp,cp=(fx if component!="correlation" else zero),(fc if component!="exchange" else zero)
+    v,b=potential(rho,mag,g,None,(xp,cp))
+    dm=np.asarray([.05*np.sin(y),.04*np.cos(x),.08*np.cos(x)+.03*np.sin(y)])
+    predicted=float(np.sum(b*dm))
+    def energy(m):
+        points=np.stack(inputs(rho,m,gradient),axis=-1);total=0.
+        for name in ("exchange","correlation"):
+            if component in (name,"combined"):
+                total+=float(np.sum((points[...,0]+points[...,1]).ravel()*libxc(name,points)[:,0]))
+        return total
+    h=1e-5;coarse=(energy(mag+h*dm)-energy(mag-h*dm))/(2*h)
+    h/=2;fine=(energy(mag+h*dm)-energy(mag-h*dm))/(2*h)
+    assert abs(predicted-fine)<2e-7+3e-8*abs(predicted)
+    assert abs(coarse-fine)<3e-7+3e-8*abs(predicted)
+
+
 def test_public_pbe_combined_api_preserved():
     pytest.importorskip("jax_xc.impl")
     fx,fc=pbe_functional_polarized_components();fn=pbe_functional_polarized()

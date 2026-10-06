@@ -25,6 +25,46 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from .efermi import OCCUPATION_WEIGHT_FLOOR, band_in_occupation_window
 
 
+def _screened_derivative(w, dchi_raw, *, prefactor, matmul):
+    """Dyson's exact derivative: full W on both sides, same complex site."""
+    return matmul(matmul(w, prefactor * dchi_raw), w)
+
+
+@lru_cache(maxsize=None)
+def _physical_slope_program(mesh_xy, n, backend, route, prefactor):
+    from distrib_la import checked_program, local_batch, matmul
+
+    def value(w, dchi):
+        mm = ((lambda a, b: a @ b) if backend == "off" else
+              (lambda a, b: matmul(a, b, mesh=mesh_xy, backend=backend,
+                                   batched_route=route)))
+        return _screened_derivative(w, dchi, prefactor=prefactor, matmul=mm)
+
+    if backend == "off":
+        return local_batch(value, mesh_xy)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    return checked_program(value, mesh_xy, face, in_shardings=(face, face))
+
+
+def screened_interaction_slope(W, dchi_ds, *, mesh_xy, prefactor=1.0,
+                                backend="distributed", batched_route="auto"):
+    """Exact ``dW/ds=W (prefactor dχ/ds) W`` of a full screened interaction.
+
+    W and dχ are equal square rank-3 physical operators on the x/y face.
+    Plane-wave χ already contains spin/k/volume normalization and passes
+    prefactor=1; the centroid response's raw χ uses its existing prefactor.
+    Backend choice stays in this shared algebra owner.
+    """
+    shape = tuple(int(v) for v in W.shape)
+    if (shape != tuple(int(v) for v in dchi_ds.shape) or len(shape) != 3
+            or shape[0] < 1 or shape[1] != shape[2]):
+        raise ValueError("Dyson slope requires equal rank-3 square physical operators")
+    if backend not in ("off", "distributed") or not np.isfinite(prefactor):
+        raise ValueError("Dyson slope needs a supported backend and finite prefactor")
+    return _physical_slope_program(mesh_xy, shape[1], backend, batched_route,
+                                   complex(prefactor))(W, dchi_ds)
+
+
 def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     """Plan physical Dyson samples and exact high-frequency moments.
 
@@ -126,7 +166,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
 
     def derivative(w, dchi_raw):
         # Full W on BOTH sides; no adjoint at complex frequency.
-        return mm(mm(w, pref * dchi_raw), w)
+        return _screened_derivative(w, dchi_raw, prefactor=pref, matmul=mm)
 
     @program(3)
     def slope(h, wc, dchi_raw):

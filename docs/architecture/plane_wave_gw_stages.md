@@ -162,6 +162,25 @@ that partner path first.
 
 ## Not built
 
+The separate finite-spectrum Γ reference in `gw.plane_wave_lehmann` does
+not use the minimax producer. `gamma_transition_vertices` composes the
+canonical ortho full-Bloch wavefunctions with backward density FFTs and
+the owner's retained-G sphere gather. `GammaLehmannResponse` contracts
+both occupied→empty and empty→occupied directions with
+`gw.lehmann_response.lehmann_pair_weights`, also used by the centroid
+direct scanner. Its conventional M coefficients require
+`chi_lehmann_sum_scale = 2/(n_spin*n_spinor*Omega*Nk)`; the raw pair
+convolution's `chi_pair_sum_scale` remains a different normalization.
+The reverse vertex is `conj(M_ab(-G))`, with exact G-negation closure.
+The caller authenticates the archive, full native per-k coverage,
+canonical child unfolding and retained-G alias proof. Two all-P face
+factors are retained; weighted `distrib_la.panel_matmul` uses bounded
+panels without full weighted copies. `SphereScreening.solve_pair` takes
+physical χ and dχ/ds and composes its existing solve with the shared
+Dyson derivative. Select `linalg='distributed', batched_route='auto'`
+for the all-P reference. This API is restricted to step occupations at
+Γ and supplies neither the head nor a QP energy readout.
+
 - A shared-pole W on the plane-wave sphere with Σ_c through the shared-pole route:
   `construct_shared_poles` must first take a bank reader and a basis axis.
 - The bispinor pathway, and a convergence study against ISDF gwjax and BerkeleyGW.

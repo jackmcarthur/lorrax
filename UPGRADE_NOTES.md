@@ -5,6 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — direct finite-plane-wave Γ response reference
+
+An opt-in scalar, step-occupied Γ reference now composes canonical density
+FFTs with the same ordered Lehmann weights and exact frequency slope as
+the centroid direct-response owner. Its physical M-matrix normalization
+is spin/(cell volume × full k count), distinct from the mixed-convolution
+FFT normalization. Native band ghosts vanish in both transition directions.
+The two transition faces and bounded contraction panels stay over all
+processors. SphereScreening can return the exact Dyson slope using the
+shared response algebra and select its existing distributed all-P route.
+Production drivers, default routes, decks and shared-pole laws are unchanged.
+This reference currently excludes metallic occupations, non-Γ q and head
+corrections; it does not establish a converged ISDF basis or QP readout.
+
 ## 2026-10-06 — magnetic PBE retains spin gradients at uniform total charge
 
 The reconstructed noncollinear PBE potential now gates exchange gradients

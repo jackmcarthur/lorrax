@@ -70,7 +70,7 @@ import vcoul                                                        # noqa: E402
 
 from .mixed_basis_pair_convolution import SphereSet, screened_sphere_set   # noqa: E402
 
-__all__ = ["ResponseSpheres", "response_spheres", "chi_pair_sum_scale", "accumulate_chi",
+__all__ = ["ResponseSpheres", "response_spheres", "chi_pair_sum_scale", "chi_lehmann_sum_scale", "accumulate_chi",
            "sphere_coulomb", "SphereScreening"]
 
 _C16 = 16
@@ -132,6 +132,21 @@ def response_spheres(*, fft_grid, psi: SphereSet, bvec, kgrid, q_irr_frac, ecutw
 def chi_pair_sum_scale(*, cell_volume: float, n_r: int, n_spin: int = 1, n_spinor: int = 1) -> float:
     """|χ_q| / |X_q|: s/(Ω·N_r²) with s = 2/(n_spin·n_spinor) (module docstring)."""
     return 2.0 / (int(n_spin) * int(n_spinor)) / (float(cell_volume) * float(n_r) ** 2)
+
+
+def chi_lehmann_sum_scale(*, cell_volume: float, n_k: int, n_spin: int = 1,
+                          n_spinor: int = 1) -> float:
+    """Direct conventional M-matrix Lehmann sum: ``s/(Ω Nk)``, not raw X.
+
+    The M coefficients are the coefficient convolution of unit-norm ψ(G),
+    equivalently ortho ψ(r) followed by a backward FFT of the density.
+    No FFT-size factor remains. Both ordered particle-hole directions are
+    included by the response owner; no further factor two is added.
+    """
+    if (not np.isfinite(cell_volume) or float(cell_volume) <= 0 or int(n_k) < 1
+            or int(n_spin) < 1 or int(n_spinor) < 1):
+        raise ValueError("direct plane-wave response needs positive volume and state counts")
+    return 2.0 / (int(n_spin) * int(n_spinor)) / (float(cell_volume) * int(n_k))
 
 
 @lru_cache(maxsize=None)
@@ -223,7 +238,8 @@ class SphereScreening:
     """
 
     def __init__(self, mesh: Mesh, *, sphere: SphereSet, geometry, sys_dim: int, kgrid,
-                 linalg: str = "local", v_head_fn=None):
+                 linalg: str = "local", v_head_fn=None,
+                 batched_route: str = "batch_reshard"):
         if linalg not in ("local", "distributed"):
             raise ValueError(f"SphereScreening: linalg must be 'local' or 'distributed', got {linalg!r}")
         self.mesh = mesh
@@ -233,6 +249,7 @@ class SphereScreening:
         self.sys_dim = int(sys_dim)
         self.kgrid = tuple(int(v) for v in kgrid)
         self.linalg = linalg
+        self.batched_route = batched_route
         self.axis: PaddedAxis = padded_axis(sphere.width, self.P, name="response sphere slots")
         self.M = int(self.axis.carrier)
         g0 = np.flatnonzero(np.all(np.abs(sphere.frac - np.rint(sphere.frac)) < 1e-12, axis=1))
@@ -252,7 +269,24 @@ class SphereScreening:
         """W_q = (I − v χ_q)⁻¹ v at every wedge q, ``chi (n_q, M, M)`` BerkeleyGW units (donated)."""
         from .w_isdf import solve_w
         return solve_w(self._V, chi, None, self.mesh, dyson_solver=self.linalg,
-                       pref=1.0, axis=self.axis)
+                       pref=1.0, axis=self.axis,
+                       distrib_la_batched_route=self.batched_route)
+
+    def solve_pair(self, chi, dchi_ds):
+        """Full W and exact dW/ds of physical χ; static v is retained exactly.
+
+        The value uses the existing sphere solve. The slope uses the shared
+        response-bank Dyson derivative ``W (dχ/ds) W`` at the same complex
+        site, without a transpose or adjoint. Reference all-P callers select
+        ``linalg='distributed', batched_route='auto'`` explicitly.
+        """
+        from .response_bank import screened_interaction_slope
+        W = self.solve(chi)
+        derivative = screened_interaction_slope(
+            W, dchi_ds, mesh_xy=self.mesh, prefactor=1.0,
+            backend="off" if self.linalg == "local" else "distributed",
+            batched_route=self.batched_route)
+        return W, derivative
 
     def solve_samples(self, chi_z):
         """``solve`` at each leading z of ``chi_z (n_z, n_q, M, M)``; W stacked the same way

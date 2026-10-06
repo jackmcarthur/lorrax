@@ -168,7 +168,7 @@ _PRODUCT_R_RESHARD: dict[tuple, tuple[Mesh, Callable]] = {}
 
 
 def band_to_product_r_reshard(
-    mesh: Mesh, *, axes: tuple[str, str] = ("x", "y")
+    mesh: Mesh, *, axes: tuple[str, str] = ("x", "y"), face: bool = False
 ) -> Callable:
     """Factory for the exact band-product → r-product wavefunction move.
 
@@ -196,6 +196,11 @@ def band_to_product_r_reshard(
     before this service.  This routine owns movement only; it neither pads
     nor changes values.
 
+    ``face=True`` stops after the SAME first manual exchange, returning
+    ``P(None,x,None,y)``. This exposes the existing intermediate for a
+    band-major transition bank that needs two operator faces. The default
+    two-exchange band-product to r-product route is unchanged.
+
     One program per ``(mesh, axes)``: the returned mover is memoised, and
     jax's own dispatch cache serves every chunk shape through it.  A fresh
     ``jax.jit`` per call made each r chunk of the Galerkin fit retrace and
@@ -204,7 +209,7 @@ def band_to_product_r_reshard(
     """
     # Keyed by value, served only to the same Mesh object: the mover's
     # source-layout guard below requires ``a.sharding.mesh is mesh``.
-    hit = _PRODUCT_R_RESHARD.get((mesh, tuple(axes)))
+    hit = _PRODUCT_R_RESHARD.get((mesh, tuple(axes), bool(face)))
     if hit is not None and hit[0] is mesh:
         return hit[1]
     from common.shard_map import shard_map
@@ -218,7 +223,7 @@ def band_to_product_r_reshard(
     p_x = int(mesh.shape[ax_x])
     p_y = int(mesh.shape[ax_y])
     in_spec = P(None, (ax_x, ax_y), None, None)
-    out_spec = P(None, None, None, (ax_y, ax_x))
+    out_spec = P(None, ax_x, None, ax_y) if face else P(None, None, None, (ax_y, ax_x))
     band_divisor = spec_divisor(mesh, in_spec, axis=1)
     r_divisor = spec_divisor(mesh, out_spec, axis=3)
 
@@ -226,7 +231,7 @@ def band_to_product_r_reshard(
         if p_y > 1:
             a = jax.lax.all_to_all(
                 a, ax_y, split_axis=3, concat_axis=1, tiled=True)
-        if p_x > 1:
+        if not face and p_x > 1:
             a = jax.lax.all_to_all(
                 a, ax_x, split_axis=3, concat_axis=1, tiled=True)
         return a
@@ -284,7 +289,7 @@ def band_to_product_r_reshard(
     _reshard.lower = compiled.lower
 
     warm_mesh_cliques(mesh)
-    _PRODUCT_R_RESHARD[(mesh, tuple(axes))] = (mesh, _reshard)
+    _PRODUCT_R_RESHARD[(mesh, tuple(axes), bool(face))] = (mesh, _reshard)
     return _reshard
 
 

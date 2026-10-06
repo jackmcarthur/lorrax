@@ -3548,17 +3548,13 @@ def _fractional_pair_scan_face(
         return logical
 
     def _pair_contribution(pa_x, pb_x, pa_y, pb_y, ea, eb, fa, fb, ga, gb):
+        from .lehmann_response import lehmann_pair_weights
         de = ea[:, :, None] - eb[:, None, :]
         df = fa[:, :, None] - fb[:, None, :]
-        weights = df[None, :, :, :] / (de[None, :, :, :] + z[:, None, None, None])
-        if with_derivative:
-            # Exact reference slope d/ds=(d/dz)/(2z), accumulated by the
-            # same ordered density pairs. Nonzero z is required at the door.
-            slope = -weights / ((de[None, :, :, :] + z[:, None, None, None])
-                                * (2 * z[:, None, None, None]))
-            weights = jnp.concatenate((weights, slope), axis=0)
         logical = logical_pair(ga, gb)
-        weights = jnp.where(logical[None, :, :, :], weights, 0.0)
+        weights = lehmann_pair_weights(de, df, z,
+                                      with_derivative=with_derivative,
+                                      pair_mask=logical)
         def contract(_):
             density_x = jnp.einsum(
                 "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
