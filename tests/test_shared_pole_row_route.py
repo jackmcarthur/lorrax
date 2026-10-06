@@ -149,6 +149,9 @@ def test_row_eigh_matches_local():
         w, v = jax.jit(row_eigh(mesh))(jax.device_put(a, row_sharding(mesh)))
         w, v = np.asarray(w), np.asarray(v)
         assert w.shape == (q, 12) and v.shape == (q, 12, 12)
+        # The deflated solver reports the zero rows as exact zero eigenvalues inside the
+        # ascending spectrum of the zero-padded matrix.
         live = np.linalg.eigvalsh(a[:, 3:, 3:])
-        assert np.allclose(np.sort(w, axis=-1)[:, 3:], live, atol=1e-12)
+        padded = np.sort(np.concatenate((live, np.zeros((q, 3))), axis=-1), axis=-1)
+        assert np.allclose(np.sort(w, axis=-1), padded, atol=1e-12)
         assert np.allclose(np.einsum("qij,qjk->qik", a, v), v * w[:, None, :], atol=1e-12)
