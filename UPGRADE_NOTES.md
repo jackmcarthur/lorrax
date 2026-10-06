@@ -8,29 +8,35 @@ The binding rulings behind breaking changes are in
 ## 2026-10-06 — shared-pole W line sites cover every requested state; far-state energies change by design
 
 The shared-pole recipe (`shared_real_pole_v1_r4`, new recipe hash) places W's
-line sites over the energies at which the run's requested states read Σ
-(each state's E_in ± 2 eV, `gw.qp_support.requested_reads_ev`), with a
-closed-form count ⌈(Ω_R − h)·ln(4/ε)/(πh)⌉ held between 18 − n_imag and a
-40-sample cap. They were placed for states within a fixed ±5 eV of μ, so a
-requested state further out read an extrapolated W (Si 0.5–0.7 eV, Ni 20³ up
-to 0.92 eV). The model header records `support_top_ev` and `support_reads_ev`;
-the Σ planner warns, never refuses, when a sample group reads outside them
-(the coarse semicore windows always do). `support_delivery_window_ev` is gone;
-ω_p + 3.5 eV still tops the imaginary ladder only. Against each deck's dense
-line ladder (max / RMS meV, cold P4): Fe 4³ charge ±2 eV 2.56/1.72 → 1.38/0.87,
-±10 eV 43.1/7.50 → 22.6/3.94, far 274/56.4 → 80.8/14.6; Fe 4³ bispinor
-8.03/4.26 → 6.97/3.40, 39.3/7.77 → 46.2/6.87, 850/143 → 99/19.9; Si 4³ (eqp0)
-0.02/0.02 → 0.01/0.01, 20.0/3.12 → 17.5/2.68, 514/142 → 149/27.9; CrI3 6×6
-(eqp1) 1.67/0.53 → 1.85/0.69, 10.4/1.63 → 7.88/1.12, I 5s 209/34.5 → 18.9/3.0.
-Cold W response: Fe charge 43.4 → 54.7 s, Fe bispinor 145.9 → 152.0 s, CrI3
-140.4 → 146.7 s, Si 37.6 → 75.2 s (14 → 32 line sites; 57.2 s with the
-response-rule split now on main, 4662eac7d). A deck that requests
-protected states to ~40 eV (Fe/Ni 20³) takes 32 line sites (14 if it asked
-only for states within ±10 eV); projected from these slopes with the rule
-split, cold W rises about 7 % on Ni 20³ bispinor and 10–30 % on Fe 20³ charge
-(map 0), 23–43 % on Fe 20³ charge's held maps; decks that request no state
-beyond about ±13 eV (CrI3 24×24, NiPS3 12×7, CrSBr 20×15) keep their count. A restart bundle
-written by the old recipe refuses by name (`recipe_hash` mismatch, rebuild).
+line sites over every requested state at E_in ± 5 eV
+(`gw.qp_support.requested_reads_ev`, `support_read_pad_ev`; the Σ plan pad
+stays 2 eV), so the line reaches every state the run asks for and never less
+far than the former fixed ±5 eV window did. Their count is closed form,
+⌈(Ω_R − h)·ln(4/ε)/(πh)⌉, held between 18 − n_imag and a 40-sample cap:
+Fe 4³ 22, CrI3 6×6 17, NiPS3 12×7 17, Si 4³ / Ni 20³ / Fe 20³ 32 (the cap),
+CrI3 24×24 16, CrSBr 20×15 15. A requested state beyond the old window read
+an extrapolated W (Si 0.5–0.7 eV, Ni 20³ up to 0.92 eV). The model header
+records `support_top_ev` and `support_reads_ev`; the Σ planner warns, never
+refuses, when a sample group reads outside them (the coarse semicore windows
+always do). `support_delivery_window_ev` is gone; ω_p + 3.5 eV still tops the
+imaginary ladder only. Against each deck's dense line ladder (max / RMS meV,
+main → this, cold P4; ±2 eV | 2–10 eV | far):
+Fe 4³ charge 2.56/1.72 → 0.95/0.54 | 43.1/7.66 → 15.6/3.22 | 274/56.4 → 61.0/9.96;
+Fe 4³ bispinor 8.03/4.26 → 2.87/1.44 | 39.3/7.89 → 31.1/6.45 | 850/143 → 82.5/18.4;
+CrI3 6×6 (eqp1) 1.67/0.53 → 1.83/0.67 | 10.4/1.81 → 10.3/1.45 | 209/34.5 → 68.2/11.8;
+Si 4³ (eqp0) 0.02/0.02 → 0.01/0.01 | 20.0/3.48 → 9.18/1.35 | 514/142 → 56.8/13.8.
+The hsuite fixtures, against the same kind of dense ladder: H2⁻ shared-pole
+one-shot (eqp0) 27.26/9.01 → 29.46/9.52 | RMS 12.45 → 12.92 (the same reach,
+9.99 against 9.93 eV, with the sites moved 0.02–0.5 eV on a 6-centroid toy);
+H2⁻ bispinor SC 21.59/5.62 → 21.42/6.06; bcc Na SC 0.57/0.36 → 0.31/0.18 |
+5.12 → 4.12 | 35.88/14.26 → 18.05/7.17 meV. The hsuite references of sp_export,
+bisp_sc, bse_bisp and na_sc are regenerated. Cold W response: Fe charge
+43.4 → 48.9 s, Fe bispinor 145.9 → 140.8 s, CrI3 6×6 140.4 → 155.0 s, Si
+37.6 → 58.7 s (14 → 32 line sites, with the response-rule fixes of e08a5c135
+and 4662eac7d). A deck that requests protected states to ~40 eV (Fe/Ni 20³)
+takes 32 line sites; projected, cold W rises about 7 % on Ni 20³ bispinor and
+10–30 % on Fe 20³ charge (map 0). A restart bundle written by the old recipe
+refuses by name (`recipe_hash` mismatch; rebuild).
 
 ## 2026-10-06 — a response sample near the top of its interval builds instead of refusing
 
