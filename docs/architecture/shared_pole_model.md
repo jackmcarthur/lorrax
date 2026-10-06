@@ -124,7 +124,8 @@ $\overline{A(t)}$. On a raw-parent plan the charge stream forms $A(t)$ with
 mathdx mode 11 from the two parent Greens, metals included
 ([fractional χ₀ response face](fractional_chi0_response_face.md)).
 The nodes come from a stacked Hankel shift pencil; a sample set
-whose shared fit fails is split in halves down to single samples. The rule never
+whose shared fit fails is split in halves down to single samples, and one whose
+pencil is wider than both halves' is split without a try. The rule never
 depends on the memory budget: the evaluation runs in groups of at most the group
 size, and each group streams its rule's whole node set for its own members. The
 group size is the largest whose donated carry `[2·members, q, μ_X, ν_Y]` and

@@ -88,7 +88,9 @@ or response arrays, and none certifies W or Σ accuracy.
   (−z̄) pole of a sample group; linear projection fits 1/(d − p) and
   1/(d − p)² on those nodes. Each node is one Green-pair evaluation A(t):
   forward rows use exp[−(d − reference)t], reverse rows use conj(A(t)). A
-  group whose shared fit fails is halved down to single samples. Each rule
+  group whose shared fit fails is halved down to single samples; a group
+  whose pencil is wider than both halves' (the narrowest height in one, the
+  farthest line reach in the other) is halved without a try. Each rule
   has `members`, `t[RESPONSE_NODE_CAPACITY]` (384; one pencil holds
   `RESPONSE_RULE_CAPACITY = 192`), `value`/`derivative` of shape
   `[members, 2, 384]`, `count`, `sampled_error`, `coefficient_mass` and

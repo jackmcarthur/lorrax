@@ -101,6 +101,24 @@ def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
     return fits, worst, False
 
 
+def _pencil(lo, hi, poles, tol, decay_rate):
+    """(eta, scaled poles, window, sample count) of a group's shift pencil.
+
+    The window is in units of the narrowest pole height and reaches 8x the
+    farthest pole, so one narrow and one far pole set the size together.
+    """
+    eta = float(poles.imag.min())
+    origin = 0. if decay_rate else lo
+    span = max(abs(lo), abs(hi))/eta if decay_rate else (hi-lo)/eta
+    zps = (poles-origin)/eta
+    geometry = max(span, 8*max(float(zps.real.max()), 0.))
+    # Resolve the reciprocal and its square before taking the shift pencil:
+    # principal-log modes stop at pi/step; their tails decay as t*exp(-t).
+    horizon = -np.log(tol) + np.log(-np.log(tol)) + 6.
+    size = max(800, int(np.ceil((geometry + 16.)*horizon/(2*np.pi))))
+    return eta, zps, geometry, size
+
+
 def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None):
     """Complex times shared by every pole, or None.
 
@@ -115,15 +133,7 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
         fits, _, _ = _fits(lo, hi, poles, previous, tol, decay_rate, order)
         if fits is not None:
             return previous, fits
-    eta = float(poles.imag.min())
-    origin = 0. if decay_rate else lo
-    span = max(abs(lo), abs(hi))/eta if decay_rate else (hi-lo)/eta
-    zps = (poles-origin)/eta
-    geometry = max(span, 8*max(float(zps.real.max()), 0.))
-    # Resolve the reciprocal and its square before taking the shift pencil:
-    # principal-log modes stop at pi/step; their tails decay as t*exp(-t).
-    horizon = -np.log(tol) + np.log(-np.log(tol)) + 6.
-    size = max(800, int(np.ceil((geometry + 16.)*horizon/(2*np.pi))))
+    eta, zps, geometry, size = _pencil(lo, hi, poles, tol, decay_rate)
     ids = np.arange(size)
     for padding, flatten in ((0., 1.), (2., .9), (4., .9), (8., 1.), (10., 1.), (16., .9)):
         # A short interval ending near the resonance gives growing modes.
@@ -223,7 +233,8 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     Every node t is ONE Green-pair evaluation A(t): forward rows use the
     exponential exp[-(d-reference_ry)*t] and fit 1/(d-z); reverse rows use
     conj(A(t)), i.e. the exponential at conj(t), and fit 1/(d+z). A group
-    whose shared fit fails is split in halves, down to single samples.
+    whose shared fit fails is split in halves, down to single samples; a
+    group whose pencil is wider than both halves' is split without a try.
     A successful shared rule can use more nodes than one member would need
     alone; its Green-pair evaluations serve all members of the group.
 
@@ -247,8 +258,20 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     old = {frozenset(rule["members"]): rule["t"][:rule["count"]]
            for rule in (previous or ())}
 
+    def size(members):
+        return _pencil(lo, hi, _poles(z[members]), rel_tol/2, decay_rate)[3]
+
     def build(members):
         poles = _poles(z[members])
+        half = len(members)//2
+        if len(members) > 1 and size(members) > max(size(members[:half]), size(members[half:])):
+            # The narrowest height (one half) and the farthest reach (the
+            # other) widen the whole pencil past both halves': it costs size^3
+            # per geometry, and every such group measured failed its shared
+            # fit after all six geometries (Si 40 and Fe 27 samples; Si 22
+            # samples reaching 22-42 eV; CHIRULE 2026-10-06), so the halves
+            # are built directly, exactly as they were after that failure.
+            return build(members[:half]) + build(members[half:])
         got = _shared_times(lo, hi, poles, rel_tol/2, old.get(frozenset(members)), decay_rate,
                             patience=None if len(members) == 1 else _STAGNATION_NODES)
         if got is not None:
@@ -267,7 +290,6 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
                 sets.append((got[0], one, got[1]))
             rule = _rule(z[members], sets)
             return [dict(rule, members=list(members), reference_ry=reference)]
-        half = len(members)//2
         return build(members[:half]) + build(members[half:])
 
     with _pinned_blas_threads():
