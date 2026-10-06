@@ -3,6 +3,7 @@ from ffi import _services
 _services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
 import time
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -42,6 +43,22 @@ _w_solve_cache: dict = {}
 # documented transient is 5.8 GiB/rank on the P36 geometry, well below an
 # 80 GiB A100.  A compile-time performance choice, not a physics/input dial.
 _FRACTIONAL_PAIR_TILE = 32
+
+# Direct contour references span much larger k meshes than the production
+# near-origin sample. Each of their two ordered density tensors has shape
+# (nk, mu_local, tile, tile). Bound each tensor to 1 GiB by a compile-time
+# tile choice; the production tile above remains unchanged.
+_REFERENCE_PAIR_DENSITY_BYTES = 1 << 30
+
+
+def _reference_fractional_pair_tile(nk, nmu_local):
+    tile = _FRACTIONAL_PAIR_TILE
+    bytes_per_pair = int(nk) * int(nmu_local) * np.dtype(np.complex128).itemsize
+    while tile > 1 and bytes_per_pair * tile * tile > _REFERENCE_PAIR_DENSITY_BYTES:
+        tile //= 2
+    if bytes_per_pair * tile * tile > _REFERENCE_PAIR_DENSITY_BYTES:
+        warnings.warn("direct fractional reference: even tile=1 exceeds the 1 GiB density planning target", RuntimeWarning)
+    return tile
 
 
 def _complete_static_vertex_orientations(forward_R, reverse_R=None):
@@ -3691,6 +3708,7 @@ def compute_chi0_direct_fractional(
     progress_fn=None,
     ordered=False,
     with_derivative=False,
+    pair_tile=None,
 ):
     """Exact finite-occupation chi0 at selected nonzero complex frequencies; see docs/architecture/fractional_chi0_response_face.md.
 
@@ -3707,6 +3725,10 @@ def compute_chi0_direct_fractional(
     band-pair scan, with the exact derivative of its Lehmann denominator
     ``d/ds=(d/dz)/(2z)``. This is a numerical-oracle capability for contour
     references; default production samples retain their original output.
+    The derivative reference's automatic tile uses the actual full-k and
+    local-centroid extents, targeting at most 1 GiB per density temporary.
+    ``pair_tile`` may explicitly set that reference resource schedule; it
+    is refused on the default production path. It changes no sum bounds.
     """
     e = jnp.asarray(wfns.enk, dtype=jnp.float64)
     f = jnp.asarray(occupation_state.f_kn, dtype=jnp.float64)
@@ -3772,9 +3794,21 @@ def compute_chi0_direct_fractional(
         (wfns.psi_mun, wfns.psi_nmu) if carrier is None
         else (carrier.psi_mun, carrier.psi_nmu))
     tables = () if plan is None else _parent_face_unfold_operands(plan, mesh_xy)[0]
+    if pair_tile is not None:
+        if not with_derivative:
+            raise ValueError("GATE direct_fractional_reference_tile: pair_tile belongs to the derivative reference path")
+        if isinstance(pair_tile, bool) or not isinstance(pair_tile, (int, np.integer)) or not 1 <= pair_tile <= _FRACTIONAL_PAIR_TILE:
+            raise ValueError("GATE direct_fractional_reference_tile: want an integer pair_tile between 1 and 32")
+        tile = int(pair_tile)
+    elif with_derivative:
+        nmu_local = max(int(psi_mun_in.shape[2]) // int(mesh_xy.shape["x"]),
+                         int(psi_nmu_in.shape[3]) // int(mesh_xy.shape["y"]))
+        tile = _reference_fractional_pair_tile(e.shape[0], nmu_local)
+    else:
+        tile = _FRACTIONAL_PAIR_TILE
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
-        pair_tile=_FRACTIONAL_PAIR_TILE, n_z=z.size,
+        pair_tile=tile, n_z=z.size,
         k_unfold_plan=plan, layout=wfns.layout, ordered=ordered,
         with_derivative=bool(with_derivative))
     rows = []
