@@ -5,6 +5,30 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — the cuSOLVERMp eigh runs at a block of 128–256 and reads its info
+
+A cuSOLVERMp eigh ran at the largest divisor of n/p up to 256, which is
+1–9 when n/p is prime or a small multiple of one: the CrI3 6×6 TT side at
+2634 current points, n 7908 on 2×2, ran at block 6. Such a tile is now
+padded to the smallest edge with a divisor in [128, 256] (7908 → 7912,
+block 172; at most 127 rows per rank), with sentinel rows that leave the
+result. cuSOLVERMp 0.9.1 returns vectors that are not orthonormal inside a
+near-zero cluster with status 0 and info 0 at some (matrix, block, shift):
+at n 7908 on rank-deficient PSD matrices it failed at block 6 shifted and
+at one tile per rank, never at blocks 86–247, and the retry at one tile per
+rank needed a 2.0 GB workspace against 0.25 GB at block 6. That retry is
+gone; the chain is unshifted, a smaller block, shifted and
+re-orthonormalized, shifted at the smaller block. Measured at P4: one eigh
+at n 7908 10.8 → 1.5 s (n 7894, n/p prime: 290 → 1.5 s); the block-table
+sizes 778–16832 are 1.3–37× faster and the sizes with a block of 128 or more
+are unchanged (claims 3314, 3315). Results move at round-off only where the
+layout changes; the 1316-point CrI3 6×6 deck has none (eqp identical). The
+cuSOLVERMp handlers now zero and read info after every syevd, potrf,
+potrs, getrf and getrs and return a nonzero value as a named error, and the
+workspace query prices the block the solve runs at; both take effect with
+the next bundle (B10 prices one tile per rank at the solve side, an
+over-price). No deck change.
+
 ## 2026-10-06 — the response rule skips the shared fit that cannot pass
 
 The shared-pole χ response rule (`minimax.response_group_rules`) sizes its
