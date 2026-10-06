@@ -44,15 +44,48 @@ _NVSMI_PEAK_MB = 0
 _NVSMI_LAST_MB = 0
 
 
-def fitting_band_weights(nb_face, band_range_left, band_range_right):
-    """The shared zero-padded band-window weights for every normal-equation RHS."""
+def fitting_band_weights(nb_face, band_range_left, band_range_right, *,
+                         occupied_stop=None, occupied_weight=1.):
+    """Shared positive endpoint weights for C and every normal-equation RHS.
+
+    Unit weight retains the original arrays. A nonunit occupied weight
+    changes only the loss within the same windows; empty endpoints retain
+    weight one and transport bands outside each window retain zero.
+    """
+    try:
+        weight_value = float(occupied_weight)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("occupied endpoint weight must be a real scalar") from exc
+    if (isinstance(occupied_weight, (bool, np.bool_)) or np.ndim(occupied_weight) != 0
+            or not np.isfinite(weight_value) or weight_value < 1):
+        raise ValueError("occupied endpoint weight must be finite and at least one")
+    if occupied_stop is not None and (isinstance(occupied_stop, (bool, np.bool_))
+            or not isinstance(occupied_stop, (int, np.integer)) or occupied_stop < 0):
+        raise ValueError("occupied endpoint stop must be a nonnegative integer")
     origin = min(int(band_range_left[0]), int(band_range_right[0]))
     index = np.arange(int(nb_face))
     def weight(interval):
         return jnp.asarray(np.where(
             (index >= int(interval[0])-origin)
             & (index < int(interval[1])-origin), 1.0, 0.0), dtype=jnp.float64)
-    return weight(band_range_left), weight(band_range_right)
+    left, right = weight(band_range_left), weight(band_range_right)
+    if weight_value == 1.:
+        return left, right
+    if (occupied_stop is None or occupied_stop < origin
+            or occupied_stop > min(int(band_range_left[1]), int(band_range_right[1]))):
+        raise ValueError("nonunit occupied weights require occupied coverage in both fitting windows")
+    scale = jnp.asarray(np.where(index+origin < occupied_stop,
+                                weight_value, 1.), dtype=jnp.float64)
+    return left*scale, right*scale
+
+
+def fitting_weight_options(policy):
+    """Admit one explicit endpoint policy shared by charge C and all RHSs."""
+    if policy is None:
+        return {}
+    if not isinstance(policy, dict) or set(policy) != {'occupied_stop', 'occupied_weight'}:
+        raise ValueError("charge fit weights require exactly occupied_stop and occupied_weight")
+    return dict(policy)
 
 
 
@@ -670,6 +703,7 @@ def fit_zeta_to_h5(
     current_basis_rows=None,
     use_augmented_samples: bool = False,
     charge_factor_equilibration: str | None = None,
+    charge_fit_weights=None,
     print_fn=print,
 ):
     """Fit canonical q-IBZ ζ for each channel of ``output_files`` on route G.
@@ -804,8 +838,11 @@ def fit_zeta_to_h5(
     if (int(psi_nmu_parent.shape[1]) != _nb_face
             or int(psi_nmu_parent.shape[2]) != _ns_face):
         raise ValueError("fit_zeta_to_h5: parent face band/spin extents differ.")
+    weight_options = fitting_weight_options(charge_fit_weights)
+    if float(weight_options.get('occupied_weight', 1.)) != 1. and vertices != (0,):
+        raise ValueError("nonunit occupied endpoint weights are admitted only for the charge fit")
     weight_l_face, weight_r_face = fitting_band_weights(
-        _nb_face, band_range_left, band_range_right)
+        _nb_face, band_range_left, band_range_right, **weight_options)
     flat_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     # ---- q rows, the per-q ζ sphere (shared by every channel) ------------

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare full-WFN served overlaps on allocated CPU or GPU processes.
+"""Prepare full-WFN pseudo projections and served overlaps on compute nodes.
 
 Run through lx with --manifest DIR --wfn WFN.h5 --output NEW_DIR. The
 manifest must already name authenticated normalized and species served
@@ -39,11 +39,13 @@ def _species_inputs(root):
     manifest = read_augmentation_manifest(root, load_raw_parent=False)
     if manifest.get('served_moment_caches') is None:
         raise ValueError('prepare the normalized and species served caches first')
+    if manifest.get('fourier_caches') is None:
+        raise ValueError('prepared raw C requires explicit authenticated atomic Fourier dual caches')
     return manifest, manifest['served_moment_caches']
 
 
-def _prepare_overlaps(wfn, caches, runtime):
-    """Return small unrotated D[parent,band,function] and source identities.
+def _prepare_overlaps(wfn, caches, runtime, *, projection_tables, projection_caches):
+    """Return small unrotated C/D[parent,band,function] and source identities.
 
     Every rank reads only its balanced parent block, with all physical bands
     and a common padded G carrier. Projection runs one parent at a time on
@@ -57,6 +59,7 @@ def _prepare_overlaps(wfn, caches, runtime):
     from common.collectives import (single_device_mesh, device_put_process_local,
         device_put_process_tiles, gather_to_host)
     from isdf.atomic_moments import served_overlap_table
+    from psp.augmented_samples import atomic_projection_table
     from wfn_loader import IBZRows
 
     domain = wfn.symmetry().parent_k_domain
@@ -86,9 +89,11 @@ def _prepare_overlaps(wfn, caches, runtime):
         raise ValueError('source loader did not preserve the common physical-band/G carrier')
     overlaps = [np.zeros((padded_count, nb, len(caches[int(z)]['labels'])), np.complex128)
                 for z in atom_types]
+    coefficients = [np.zeros_like(value) for value in overlaps]
     source_sha = np.zeros((padded_count, 32), np.uint8)
     reciprocal = float(wfn.blat)*np.asarray(wfn.bvec)
     oracle = 0.
+    coefficient_oracle = 0.
     for row, parent in enumerate(parents):
         source[row, ..., ng[parent]:] = 0.
         source_sha[row] = np.frombuffer(hashlib.sha256(
@@ -101,11 +106,22 @@ def _prepare_overlaps(wfn, caches, runtime):
                 center_cart=center, cell_volume=float(wfn.cell_volume))
             bra[..., ng[parent]:] = 0.
             overlaps[atom][row] = np.asarray(project(values, put(bra)))
+            dual = atomic_projection_table(projection_tables[int(z)], wavevectors,
+                center_cart=center, cell_volume=float(wfn.cell_volume),
+                normalized_rkb_source=True, radial_cache=projection_caches[int(z)]['projection'])
+            dual[..., ng[parent]:] = 0.
+            if dual.shape != (len(bra), 2, source.shape[-1]):
+                raise ValueError('pseudo dual and served overlap function order/extent disagree')
+            coefficients[atom][row] = np.asarray(project(values[:, :2], put(dual)))
             for band in {0, min(35, nb-1), min(63, nb-1), nb-1}:
                 for function in {0, len(bra)//2, len(bra)-1}:
                     oracle = max(oracle, float(abs(overlaps[atom][row, band, function]
                         -np.sum(source[row, band]*bra[function]))))
-    if not np.isfinite(oracle) or oracle > 2e-12:
+                    coefficient_oracle = max(coefficient_oracle, float(abs(
+                        coefficients[atom][row, band, function]
+                        -np.sum(source[row, band, :2]*dual[function]))))
+    if (not np.isfinite(oracle) or oracle > 2e-12
+            or not np.isfinite(coefficient_oracle) or coefficient_oracle > 2e-12):
         raise ValueError('bounded independent host overlap oracle failed')
     live = np.concatenate([np.arange(p*padded_count, p*padded_count+q+(p < remainder))
                            for p in range(ranks)])
@@ -119,9 +135,11 @@ def _prepare_overlaps(wfn, caches, runtime):
             return values
         return np.asarray(gather_to_host(device_put_process_tiles(shape, sharding, tile)))[live]
     return dict(atom_D=tuple(gather_small(value) for value in overlaps),
+        atom_C=tuple(gather_small(value) for value in coefficients),
         raw_source_sha256=gather_small(source_sha), k_parent_frac=k, gvecs=g, ngk_valid=ng,
         centers_cart=centers, atom_types=atom_types, cell_volume=float(wfn.cell_volume),
-        physical_bands=nb, local_parent_rows=parents.tolist(), oracle_maximum=oracle)
+        physical_bands=nb, local_parent_rows=parents.tolist(), oracle_maximum=oracle,
+        coefficient_oracle_maximum=coefficient_oracle)
 
 
 def generate(args, runtime):
@@ -137,11 +155,13 @@ def generate(args, runtime):
     started = time.perf_counter()
     manifest, caches = _species_inputs(root)
     with WfnLoader(str(args.wfn.resolve()), backend='eager') as wfn:
-        prepared = _prepare_overlaps(wfn, caches, runtime)
+        prepared = _prepare_overlaps(wfn, caches, runtime,
+            projection_tables=manifest['tables'], projection_caches=manifest['fourier_caches'])
         binding = raw_parent_moment_binding(wfn,
             **{key: prepared[key] for key in ('k_parent_frac', 'gvecs', 'ngk_valid',
                 'centers_cart', 'atom_types', 'cell_volume', 'physical_bands')},
-            served_cache_sha256_by_species=manifest['served_moments']['species_sha256'])
+            served_cache_sha256_by_species=manifest['served_moments']['species_sha256'],
+            projection_binding=manifest['raw_parent_projection_binding'])
         if (manifest.get('overlap', {}).get('mode') == 'full_wfn_lowdin'
                 and manifest['overlap'].get('bands') != prepared['physical_bands']):
             raise ValueError('manifest full-WFN window disagrees with the actual source')
@@ -149,7 +169,7 @@ def generate(args, runtime):
         def publish():
             output.mkdir(parents=True, exist_ok=False)
             write_raw_parent_moments(artifact, prepared['atom_D'],
-                prepared['raw_source_sha256'], binding=binding)
+                prepared['raw_source_sha256'], binding=binding, atom_C=prepared['atom_C'])
             patch = dict(served_moments=dict(
                 raw_parent_file=os.path.relpath(artifact, root), raw_parent_sha256=_sha256(artifact)))
             (output/'manifest_raw_parent_patch.json').write_text(json.dumps(patch, indent=2)+'\n')
@@ -158,13 +178,17 @@ def generate(args, runtime):
         loaded = load_raw_parent_moments(artifact, expected_binding=binding, expected_file_sha256=sha)
         for original, restored in zip(prepared['atom_D'], loaded['atom_D']):
             np.testing.assert_array_equal(original, restored)
-        record = dict(schema='lorrax.raw_parent_moment_preparation.v1', artifact=str(artifact),
+        for original, restored in zip(prepared['atom_C'], loaded['atom_C']):
+            np.testing.assert_array_equal(original, restored)
+        record = dict(schema='lorrax.raw_parent_moment_preparation.v2', artifact=str(artifact),
             artifact_sha256=sha, source_manifest_sha256=_sha256(root/'manifest.json'),
             authenticated_preparation_identity=manifest['identity'],
             generation_source_sha256=_sha256(__file__), binding=binding,
             atom_D_shapes=[list(value.shape) for value in prepared['atom_D']],
+            atom_C_shapes=[list(value.shape) for value in prepared['atom_C']],
             rank=int(runtime.process_index), local_parent_rows=prepared['local_parent_rows'],
             independent_host_oracle_maximum=prepared['oracle_maximum'],
+            independent_host_coefficient_oracle_maximum=prepared['coefficient_oracle_maximum'],
             total_seconds=time.perf_counter()-started,
             scope='Unrotated full physical WFN; source parent blocks distributed across all processes. No band crop, Gram pin, extra RKB multiplier or on-demand fitting rebuild.')
         with (output/f'receipt_rank{runtime.process_index:03d}.json').open('x') as stream:

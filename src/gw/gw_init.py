@@ -226,7 +226,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          write_ibz_only, band_norms, vertex_mu_L=0,
                          carrier_bispinor=None, carrier_lift=None,
                          transverse_identity=None,
-                         atomic_augmentation_identity=None):
+                         atomic_augmentation_identity=None,
+                         charge_fit_weights=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
 	Every entry is an input that CHANGES ζ numerically.  Deliberately
@@ -449,6 +450,23 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	if (int(vertex_mu_L) != 0
 			and tuple(band_range_left) != tuple(band_range_right)):
 		prov['current_pair_training_domain'] = 'ordered_lr_plus_rl'
+	if int(vertex_mu_L) == 0:
+		occupied_weight = float(getattr(cfg.backend, 'zeta_occupied_weight', 1.0))
+		if occupied_weight != 1.0:
+			if (charge_fit_weights is None
+					or float(charge_fit_weights['occupied_weight']) != occupied_weight):
+				raise ValueError("weighted charge provenance requires the resolved endpoint policy")
+			prov['charge_fit_endpoint_weights'] = {
+				'schema': 'occupied_band_endpoints_v1',
+				'occupied_stop': int(charge_fit_weights['occupied_stop']),
+				'occupied_weight': occupied_weight,
+				'empty_weight': 1.0,
+			}
+		elif charge_fit_weights is not None:
+			if float(charge_fit_weights['occupied_weight']) != 1.0:
+				raise ValueError("charge endpoint policy disagrees with zeta_occupied_weight")
+	elif charge_fit_weights is not None:
+		raise ValueError("charge endpoint weights cannot stamp a current-channel fit")
 	if int(vertex_mu_L) != 0 and meta.current_basis_rows is not None:
 		prov['current_fit_basis'] = 'circular'
 	return json.dumps(prov, sort_keys=True)
@@ -1432,6 +1450,7 @@ class _ZetaFitContract:
 	loader_k_chunk: int
 	provenance: str
 	reuse_charge: bool
+	charge_fit_weights: object = None
 	meta_transverse: object = None
 	centroids_transverse: object = None
 	transverse_identity: object = None
@@ -1491,6 +1510,29 @@ def _resolve_zeta_fit_contract(
 		band_slices, zeta_edge, log=print_fn)
 	assert_zeta_fit_keeps_occupied(
 		band_slices, band_range_left, band_range_right)
+	# Resolve a fitting loss once. Its weights never enter Green functions,
+	# physical occupations, the orbital frame, or atomic cache identities.
+	charge_fit_weights = None
+	occupied_weight = float(getattr(cfg.backend, 'zeta_occupied_weight', 1.0))
+	if not (np.isfinite(occupied_weight) and occupied_weight >= 1.0):
+		raise ValueError("zeta_occupied_weight must be finite and >= 1")
+	if occupied_weight != 1.0:
+		from .gw_config import infer_material_class
+		occ = np.asarray(wfn.occs, dtype=np.float64)
+		occupied_stop = int(band_slices.b2)
+		if (infer_material_class(occ) != 'insulator'
+				or getattr(cfg, 'occ_smearing_width_ry', None) is not None
+				or float(getattr(getattr(cfg, 'screening', None), 'occ_broadening_ev', 0.0)) > 0.0):
+			raise ValueError("zeta_occupied_weight != 1 requires integer, unsmeared source occupations")
+		if (occ.ndim != 3 or not 0 < occupied_stop < occ.shape[-1]
+				or np.any(occ < -1.e-6)
+				or not np.all((occ > 1.e-6)
+					== (np.arange(occ.shape[-1]) < occupied_stop)[None, None, :])):
+			raise ValueError("zeta_occupied_weight requires the same contiguous occupied band boundary at every source k and spin")
+		charge_fit_weights = {'occupied_stop': occupied_stop,
+		                     'occupied_weight': occupied_weight}
+		print_fn(f"  Charge-fit endpoint weights: occupied={occupied_weight:g}, "
+		         f"empty=1, occupied boundary={occupied_stop} bands.")
 	_check_centroid_selection_windows(
 		cfg, band_slices, band_range_left, band_range_right)
 	logical_band_stop = (
@@ -1606,7 +1648,8 @@ def _resolve_zeta_fit_contract(
 		carrier_bispinor=bool(int(meta.nspinor) == 4),
 		carrier_lift=representation.charge_lift,
 		vertex_mu_L=0, transverse_identity=transverse_identity,
-		atomic_augmentation_identity=atomic_augmentation_identity)
+		atomic_augmentation_identity=atomic_augmentation_identity,
+		charge_fit_weights=charge_fit_weights)
 	provenance_transverse = tuple(
 		_zeta_fit_provenance(
 			wfn=wfn, meta=meta_transverse, cfg=cfg,
@@ -1679,6 +1722,7 @@ def _resolve_zeta_fit_contract(
 		loader_k_chunk=loader_k_chunk,
 		provenance=provenance,
 		reuse_charge=bool(reuse_charge),
+		charge_fit_weights=charge_fit_weights,
 		meta_transverse=meta_transverse,
 		centroids_transverse=centroids_transverse,
 		transverse_identity=transverse_identity,
@@ -1930,7 +1974,7 @@ def _fit_charge_zeta_channel(
         _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
         band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
         mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
-        zeta_h5_path):
+        zeta_h5_path, charge_fit_weights=None):
     """Produce the charge fit peak and truncation verdict after its reuse stamp."""
     from gw.isdf_fitting import fit_zeta_to_h5
     if not _reuse_charge and chunks is None:
@@ -1975,6 +2019,7 @@ def _fit_charge_zeta_channel(
                 parent_psi=chunks.pop('parent_psi', None),
                 use_augmented_samples=('augmentation' in chunks),
                 charge_factor_equilibration=chunks.get('augmentation', {}).get('charge_factor_equilibration'),
+                charge_fit_weights=charge_fit_weights,
                 write_zeta_file=_write_zeta_file,
                 defer_zeta_write=_defer_zeta_write,
             )
@@ -2202,7 +2247,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	    _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
 	    band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
 	    mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
-	    zeta_h5_path)
+	    zeta_h5_path, charge_fit_weights=zeta_contract.charge_fit_weights)
 	_report_zeta_fit_peak(
 	    cfg, mem_est, peak_bytes, print_fn)
 	fit_v = None
@@ -2771,6 +2816,7 @@ def _prepare_fresh_parent_faces(
                 band_range_right=zeta_contract.band_range_right,
                 write_ibz_only=zeta_contract.write_ibz_only_charge,
                 public_band_range=band_slices.full_range,
+                charge_fit_weights=zeta_contract.charge_fit_weights,
                 print_fn=print0, artifact=augmentation_artifact)
         if 'parent_psi' in chunks['augmentation']:
             chunks['parent_psi'] = chunks['augmentation'].pop('parent_psi')

@@ -1468,6 +1468,12 @@ _DEFAULTS = {
     # ZETA_RCOND_DEFAULT (defined above _DEFAULTS) — one copy, no mirrors.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
     "zeta_rcond":           ZETA_RCOND_DEFAULT,
+    # Positive endpoint weights in the charge-fit least-squares objective.
+    # Every in-window empty state keeps weight one; each occupied endpoint
+    # receives this weight. This does not change occupations in GW. The
+    # default preserves the existing fit and provenance exactly. Nondefault
+    # values require a common integer-filled boundary at every source k.
+    "zeta_occupied_weight": 1.0,
     # γ̃-double-contract kernel variant inside the monolithic pair
     # pipeline (see ``common.gamma_matrices.gamma_double_contract``).
     # Math identical across all three; differ in HLO structure.
@@ -2708,6 +2714,15 @@ def _input_backend(
         _dist_lu = "scalapack" if _is_cpu_backend else "cusolvermp"
     elif _dist_lu == "auto" and _is_cpu_backend:
         _dist_lu = "off"
+    _weight_raw = params["zeta_occupied_weight"]
+    if isinstance(_weight_raw, (bool, np.bool_)):
+        raise ValueError("zeta_occupied_weight must be a finite number >= 1, not a boolean")
+    try:
+        _occupied_weight = float(_weight_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("zeta_occupied_weight must be a finite number >= 1") from exc
+    if not (np.isfinite(_occupied_weight) and _occupied_weight >= 1.0):
+        raise ValueError("zeta_occupied_weight must be finite and >= 1")
     backend = BackendConfig(
         linalg=_linalg.layout,
         linalg_provenance=_linalg.provenance,
@@ -2719,6 +2734,7 @@ def _input_backend(
         zeta_ridge=float(params["zeta_ridge"]),
         charge_zeta_solve=_linalg.charge_zeta_solve,
         zeta_rcond=float(params["zeta_rcond"]),
+        zeta_occupied_weight=_occupied_weight,
         gamma_contract_mode=str(params["gamma_contract_mode"]).strip().lower(),
     )
     return (backend)
@@ -4623,6 +4639,7 @@ class BackendConfig:
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
+    zeta_occupied_weight: float  # charge-fit endpoint priority; occupations unchanged
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:

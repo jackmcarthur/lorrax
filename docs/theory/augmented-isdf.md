@@ -131,6 +131,18 @@ an explicit band-pair carrier. Route G must receive the augmented samples when
 forming \(Z^s\); resampling the smooth plane waves there would solve a different
 normal equation from the augmented \(C\).
 
+The optional charge input `zeta_occupied_weight` changes the fitting loss,
+not the occupied density or the orbital map. At weight \(w\geq1\), an
+endpoint below the authenticated integer occupied boundary receives weight
+\(w\), while every other endpoint in its original fitting window retains
+weight one. Thus a pair has the product of its two endpoint weights. The
+same weights enter \(C\), the smooth Fourier RHS, the local AE-minus-PS
+and PS RHSs, and the auxiliary monopole RHS before ordered LR+RL completion.
+All original pairs remain covered. Unit weight preserves the default arrays
+and provenance; a nonunit policy binds its weight and occupied boundary into
+the charge-fit and restart identity. A smaller exchange residual alone does
+not certify screening or correlation accuracy under this changed loss.
+
 An explicit manifest control `charge_fit.conditioning=unit_diagonal` may
 equilibrate the sampled Gram. For \(D_{\mu\mu}=C_{\mu\mu}^{-1/2}\), factor
 \(C'=DCD\) with the existing rank policy and use the physical factor
@@ -297,11 +309,18 @@ Preparation uses two allocated-compute commands. First,
 --served-moments` creates normalized and species served artifacts. Merge its
 emitted patches into the existing `cache` and `served_moments` dictionaries.
 Then `tools/generate_raw_parent_moments.py --manifest DIR --wfn WFN.h5
---output NEW_DIR` computes unrotated overlaps on every physical band, with raw
-parent blocks distributed across the processes, and emits the raw-parent
-file/hash patch. The preparation reader skips only the not-yet-created raw
-artifact; fitting always uses the complete strict reader. The public raw
-producer checks a bounded independent host contraction and strict reload.
+--output NEW_DIR` computes unrotated served overlaps D and pseudo-dual
+projections C on every physical band, with raw parent blocks distributed
+across the processes, and emits the raw-parent file/hash patch. Preparation
+requires authenticated atomic Fourier dual caches. The v2 raw artifact binds
+the complete source, reciprocal and atomic geometry, full band window,
+atomic payloads, dual files and projection owners. Fitting loads these exact
+C rows instead of rebuilding the projection, then applies the same full-WFN
+factor before the public crop. A v2 artifact with missing C refuses; an
+explicit older v1 overlap artifact retains the original live projection.
+The preparation reader skips only the not-yet-created raw artifact; fitting
+always uses the complete strict reader. The public raw producer checks
+bounded independent host C and D contractions and strict reload.
 Preparation costs are separate from the recurring fitting stage.
 
 An independent optional pair, `cache.local_coulomb_fourier_file` and

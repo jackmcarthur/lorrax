@@ -37,7 +37,7 @@ def _blocked_point_sample_reference(mesh,pc,bc,npoint,g_block,fft_points):
 
 
 def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_chunk=4, onsite_cross=False,
-                             supplied_artifact=False):
+                             supplied_artifact=False, prepared_projection=False, occupied_weight=1.):
     from types import SimpleNamespace
     import numpy as np
     import jax
@@ -77,6 +77,8 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     pauli[:,logical_bands:] = 0.
     source = np.asarray(lift_to_4spinor(jnp.asarray(pauli),jnp.asarray(gv),jnp.asarray(kfrac),
                         jnp.asarray(reciprocal),representation='normalized_rkb'))
+    if prepared_projection and not overlap:
+        raise ValueError('prepared projections require the complete overlap fixture')
     mu_indices = np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],
                            [7,0,0],[0,7,0],[0,0,7],[1,1,1]],np.int32)
     spin = np.eye(4,dtype=np.complex128)
@@ -154,6 +156,12 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
         artifact['served_moments'] = {'species_sha256':{'47':'planted-served-source'}}
         artifact['raw_parent_moments'] = dict(atom_D=[served_D[:,:logical_bands]],
             metadata={'binding':fixture_binding})
+        if prepared_projection:
+            coefficients_raw = np.stack([np.einsum('isg,nsg->ni',atomic_projection_table(data,K[p],
+                center_cart=center[0] @ lattice,cell_volume=meta.cell_volume,
+                normalized_rkb_source=True),source[p,:,:2]) for p in range(npar)])
+            artifact['raw_parent_moments']['atom_C'] = [coefficients_raw[:,:logical_bands]]
+            artifact['raw_parent_projection_binding'] = {'oracle':'same-normalized-source-and-duals'}
         def planted_binding(bound_wfn,**inputs):
             assert bound_wfn is wfn and inputs['physical_bands'] == logical_bands
             assert np.array_equal(inputs['k_parent_frac'],kfrac)
@@ -163,6 +171,7 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
             assert np.array_equal(inputs['atom_types'],np.array([47]))
             assert inputs['cell_volume'] == meta.cell_volume
             assert inputs['served_cache_sha256_by_species'] == {'47':'planted-served-source'}
+            assert inputs.get('projection_binding') == artifact.get('raw_parent_projection_binding')
             return fixture_binding
         # The distributed stage consumes authenticated preparation output;
         # actual WFN source/owner bindings have independent artifact tests.
@@ -211,16 +220,25 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
             assert error < 3e-14,error
             placement_error = max(placement_error,error)
     parent_psi = ParentPsiG(source_device,None,None,kfrac,(0,logical_bands),None)
+    weight_policy = {'occupied_stop':2,'occupied_weight':occupied_weight}
+    original_fourier = aug._atomic_fourier_table
+    if prepared_projection:
+        def reject_live_projection(*args,**kwargs):
+            raise AssertionError('authenticated prepared C must not rebuild the Fourier projection')
+        aug._atomic_fourier_table = reject_live_projection
     try:
         faces,state = aug.prepare_augmentation(wfn=wfn,sym=sym,meta=meta,cfg=cfg,mesh_xy=mesh,
             plan=plan,centroid_indices=centroid_coordinates,parent_psi=parent_psi,
             parent_faces=None if fractional else parent_faces,
             band_range_left=(0,2),band_range_right=(1,fitting_bands),write_ibz_only=False,
-            public_band_range=(0,logical_bands),**artifact_argument)
+            public_band_range=(0,logical_bands),charge_fit_weights=weight_policy,**artifact_argument)
         assert read_count == (0 if supplied_artifact else 1)
         if overlap:
             import pytest
             assert state['prepared_served_overlap_host_bytes_per_process'] == served_D[:,:logical_bands].nbytes
+            if prepared_projection:
+                assert state['atomic_projection_source'] == 'prepared_full_window_v2'
+                assert state['prepared_atomic_projection_host_bytes_per_process'] == coefficients_raw[:,:logical_bands].nbytes
             assert 'monopole_rhs' not in state, 'served overlap admission must not enable monopole enrichment'
             saved_binding = artifact['raw_parent_moments']['metadata']['binding']
             artifact['raw_parent_moments']['metadata']['binding'] = {'oracle':'different-source'}
@@ -260,6 +278,7 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
                 gpu_utils.device_budget_bytes,gpu_utils.warn_over_budget = old_budget,old_warn
     finally:
         aug.read_augmentation_manifest = original
+        aug._atomic_fourier_table = original_fourier
         atomic_moments.raw_parent_moment_binding = original_binding
     got_faces = tuple(np.asarray(gather_to_host(x)) for x in faces)
     got_rhs = np.asarray(gather_to_host(state['rhs']))
@@ -344,10 +363,11 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
                 for n in range(1,fitting_bands):
                     left = np.sum(expected_mu[k,m].conj()*expected_mu[(k+q)%3,n],axis=0)
                     right = np.sum(ae[k,m].conj()*ae[(k+q)%3,n]-ps[k,m].conj()*ps[(k+q)%3,n],axis=0)
-                    dense[q] += left.conj()[:,None]*right[None]
+                    pair_weight = (occupied_weight if m < 2 else 1.)*(occupied_weight if n < 2 else 1.)
+                    dense[q] += pair_weight*left.conj()[:,None]*right[None]
                     if onsite_cross:
                         smooth_right = np.sum(ps[k,m].conj()*ps[(k+q)%3,n],axis=0)
-                        dense_smooth[q] += left.conj()[:,None]*smooth_right[None]
+                        dense_smooth[q] += pair_weight*left.conj()[:,None]*smooth_right[None]
     dense += dense[q_negation_index(kgrid)].conj()
     expected_rhs = np.einsum('qmrp,hp->qmhr',dense.reshape(3,expected_mu.shape[-1],len(radii),len(directions)),Y.conj()*weights)
     expected_rhs = expected_rhs.reshape(3,expected_mu.shape[-1],-1)
@@ -393,6 +413,8 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     receipt['maximum_norm_diagnostic_absolute_error'] = norm_error
     receipt['onsite_smooth_rhs_relative_error'] = smooth_rhs_error
     receipt['authenticated_artifact_reused_without_read'] = supplied_artifact
+    receipt['prepared_full_window_projection_used_without_rebuild'] = prepared_projection
+    receipt['occupied_endpoint_weight'] = occupied_weight
     if jax.process_index() == 0:
         print(json.dumps(receipt),flush=True)
         out = os.environ.get('AUGMENTATION_STAGE_REPORT')
@@ -412,5 +434,7 @@ if __name__ == '__main__':
         check_augmentation_stage(runtime,overlap=True,fractional=True,band_chunk=8,onsite_cross=True)
         check_augmentation_stage(runtime,overlap=True,fractional=True,band_chunk=8,onsite_cross=True,
                                  supplied_artifact=True)
+        check_augmentation_stage(runtime,overlap=True,fractional=True,band_chunk=8,onsite_cross=True,
+                                 supplied_artifact=True,prepared_projection=True,occupied_weight=4.)
         return 0
     run_main_and_finalize(main)

@@ -176,6 +176,7 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
             cached[z] = load_normalized_cache(cache_path,data,normal_control,support_radius=support)
             digest.update(hashlib.sha256(cache_path.read_bytes()).digest())
     fourier_caches = None
+    fourier_cache_hashes = {}
     if 'fourier_cache' in manifest:
         from psp.atomic_fourier_cache import load_atomic_fourier_caches
         control = manifest['fourier_cache']
@@ -186,7 +187,12 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
         for z,data in tables.items():
             cache_path = (root/control['species_files'][str(z)]).resolve()
             fourier_caches[z] = load_atomic_fourier_caches(cache_path,data,control)
-            digest.update(hashlib.sha256(cache_path.read_bytes()).digest())
+            fourier_cache_hashes[str(z)] = hashlib.sha256(cache_path.read_bytes()).hexdigest()
+            digest.update(bytes.fromhex(fourier_cache_hashes[str(z)]))
+    projection_binding = None
+    if fourier_caches is not None:
+        from isdf.atomic_moments import raw_parent_projection_binding
+        projection_binding = raw_parent_projection_binding(tables,fourier_cache_hashes)
     served_caches = raw_moments = None
     if served is not None:
         from isdf.atomic_moments import load_served_moment_cache, load_raw_parent_moments
@@ -209,6 +215,9 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
                 binding = json.loads(str(archive['metadata_json']))['binding']
             raw_moments = load_raw_parent_moments(raw_path,expected_binding=binding,
                 expected_file_sha256=served['raw_parent_sha256'])
+            if (raw_moments.get('atom_C') is not None
+                    and binding.get('projection_binding') != projection_binding):
+                raise ValueError("prepared raw C disagrees with the authenticated atomic tables or Fourier duals")
             import importlib.util
             for owner,sha in binding['source_identity']['owner_sources_sha256'].items():
                 if hashlib.sha256(Path(importlib.util.find_spec(owner).origin).read_bytes()).hexdigest() != sha:
@@ -224,6 +233,7 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
     return dict(manifest,tables=tables,normalized_caches=cached,
                 fourier_caches=fourier_caches,served_moment_caches=served_caches,
                 raw_parent_moments=raw_moments,prepared_fourier_cache=prepared_cache,
+                raw_parent_projection_binding=projection_binding,
                 identity=digest.hexdigest(),directory=str(root))
 
 
@@ -856,7 +866,8 @@ def _served_monopole_rhs(plan, faces, coefficients, overlaps, geometry, mesh):
 def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                          centroid_indices, parent_psi, parent_faces,
                          band_range_left, band_range_right, print_fn=print,
-                         write_ibz_only=True, public_band_range=None, artifact=None):
+                         write_ibz_only=True, public_band_range=None, artifact=None,
+                         charge_fit_weights=None):
     """Correct persistent samples and assemble the atom-local charge RHS.
 
     Run this before the smooth fit's conjugation/donation. The raw mode
@@ -870,6 +881,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     this fresh invocation. Supplying it avoids duplicate file reads without
     retaining global state; fitting callers never supply an unvalidated
     manifest dictionary. The default authenticates the files here.
+    ``charge_fit_weights`` is the already resolved fitting policy. The same
+    shared endpoint factory supplies the radial and auxiliary moment RHSs;
+    this stage does not independently infer occupations or configuration.
     """
     import jax
     import jax.numpy as jnp
@@ -880,7 +894,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     from isdf.local_rhs import local_density_rhs
     from psp.augmented_samples import (make_atomic_projection,
                                       make_sample_correction,build_projection_radial_cache)
-    from .isdf_fitting import fitting_band_weights
+    from .isdf_fitting import fitting_band_weights, fitting_weight_options
     from symmetry_maps import q_negation_index
 
     with timing.section('augmentation.manifest_and_cache_read'):
@@ -932,6 +946,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             raise ValueError("full_wfn_lowdin requires authenticated prepared overlap of the actual served four-spinor")
     elif fit_origin != parent_psi.band_range[0]:
         raise ValueError("augmentation band weights must use the same raw-parent band origin as the smooth fit")
+    cached_coefficients = (artifact.get('raw_parent_moments') or {}).get('atom_C')
+    if cached_coefficients is not None and overlap_mode != 'full_wfn_lowdin':
+        raise ValueError("prepared full-window atomic coefficients require the actual full-WFN overlap stage")
     lattice = float(wfn.alat)*np.asarray(wfn.avec, dtype=np.float64)
     centers = np.asarray(wfn.atom_crys, dtype=np.float64)%1.
     atom_types = np.asarray(wfn.atom_types, dtype=int)
@@ -1026,6 +1043,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     # admission; device copies/rotation belong to the separate moment term.
     prepared_overlap_host_bytes = (sum(d.nbytes for d in artifact['raw_parent_moments']['atom_D'])
                                    if overlap_mode == 'full_wfn_lowdin' else 0.)
+    prepared_projection_host_bytes = (sum(c.nbytes for c in cached_coefficients)
+                                     if cached_coefficients is not None else 0.)
     moment_bytes = 0.
     if moment_enrichment:
         # Cached full-band D_R and both its rotated carrier and signed field
@@ -1051,7 +1070,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             +32*qpad*mu*na/Ptot)
     price = (source_bytes+4*face_bytes+rhs_copies*rhs_bytes+3*factor_v_bytes+4*point_faces
              +point_workspace['total']+dft_tile+phase_bytes+smooth_tile+overlap_bytes+moment_bytes
-             +prepared_overlap_host_bytes)
+             +prepared_overlap_host_bytes+prepared_projection_host_bytes)
     budget = float(device_budget_bytes())
     if price > budget:
         warn_over_budget('isdf.augmentation',price,budget)
@@ -1080,7 +1099,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         expected = raw_parent_moment_binding(wfn,k_parent_frac=kfrac,gvecs=gv,ngk_valid=counts,
             centers_cart=centers @ lattice,atom_types=atom_types,cell_volume=float(meta.cell_volume),
             physical_bands=int(wfn.nbands),
-            served_cache_sha256_by_species=artifact['served_moments']['species_sha256'])
+            served_cache_sha256_by_species=artifact['served_moments']['species_sha256'],
+            projection_binding=(artifact['raw_parent_projection_binding']
+                                if cached_coefficients is not None else None))
         raw = artifact['raw_parent_moments']
         if raw['metadata']['binding'] != expected:
             raise ValueError("raw served-moment cache disagrees with the actual WFN, parent/G geometry or full band window")
@@ -1125,7 +1146,13 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         nmu = jax.jit(lambda a: jnp.pad(a,((0,0),(0,nb-face_bands),(0,0),(0,0))),
                       out_shardings=NamedSharding(mesh_xy,fs))(nmu)
     with timing.section('augmentation.project_and_initial_samples'):
-        delta_iter = _sample_geometry(mu_points,active,centers,lattice,caches,atom_types,kfrac,support,scale)
+        if cached_coefficients is not None:
+            # Exact unrotated full150 projections, authenticated against the
+            # actual WFN and dual owners above. The same A acts before crop.
+            coefficients = [_put(np.pad(c,((0,0),(0,nb-c.shape[1]),(0,0))),mesh_xy,cs)
+                            for c in cached_coefficients]
+        delta_iter = (() if cached_coefficients is not None else
+                      _sample_geometry(mu_points,active,centers,lattice,caches,atom_types,kfrac,support,scale))
         for atom,(delta,phase) in enumerate(delta_iter):
             z, data = int(atom_types[atom]), artifact['tables'][int(atom_types[atom])]
             delta_device = _put(delta,mesh_xy,P(None,None,'y'))
@@ -1194,7 +1221,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     norm_source,norm_local = _orbital_norm_kernels(mesh_xy)
     smooth_norm = norm_source(smooth)
     charge_delta = jnp.zeros((npar,nb),jnp.float64,device=NamedSharding(mesh_xy,P(None,'x')))
-    weight_l,weight_r = fitting_band_weights(nb,band_range_left,band_range_right)
+    weight_options = fitting_weight_options(charge_fit_weights)
+    weight_l,weight_r = fitting_band_weights(nb,band_range_left,band_range_right,
+                                           **weight_options)
     rhs = jnp.zeros((qpad,mu,na*nh*nr),jnp.complex128,device=NamedSharding(mesh_xy,qs))
     smooth_rhs = (jnp.zeros(rhs.shape,jnp.complex128,device=NamedSharding(mesh_xy,qs))
                   if onsite_cross else None)
@@ -1295,6 +1324,10 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         state['served_moment_workspace_bytes_per_rank'] = moment_bytes
         state['served_moment_local_workspace_bytes_per_rank'] = aux_workspace
     state['charge_factor_equilibration'] = artifact.get('charge_fit',{}).get('conditioning')
+    state['charge_fit_weights'] = dict(weight_options) if weight_options else None
+    state['prepared_atomic_projection_host_bytes_per_process'] = prepared_projection_host_bytes
+    state['atomic_projection_source'] = ('prepared_full_window_v2' if cached_coefficients is not None
+                                         else 'canonical_runtime_projection_v1')
     state['orbital_norm_change_estimate'] = charge_delta
     state['smooth_orbital_norm'] = smooth_norm
     state['orbital_norm_quadrature_convention'] = ('local_density_interpolant'

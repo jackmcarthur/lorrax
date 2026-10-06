@@ -398,9 +398,46 @@ def make_auxiliary_monopole_compressor(mesh, point_plan, canonical_atom_weights)
                 atom_count=len(weights), atom_pad=atom_pad)
 
 
+def _raw_projection_identity():
+    """Bind prepared C to its incumbent pseudo-dual projection owners."""
+    modules = ('psp.augmented_samples', 'psp.augmentation_spinors',
+               'psp.atomic_fourier_cache', 'common.bispinor_init',
+               'common.gamma_matrices', 'isdf.atomic_moments')
+    return dict(operator='normalized_rkb_upper_inverse_r_pseudo_dual_v1',
+        owner_sources_sha256={name: hashlib.sha256(
+            Path(importlib.util.find_spec(name).origin).read_bytes()).hexdigest()
+            for name in modules})
+
+
+def raw_parent_projection_binding(tables, dual_cache_sha256_by_species):
+    """Authenticate the source tables and prepared Fourier duals of raw C.
+
+    This adds no projection formula: preparation calls atomic_projection_table
+    on the same normalized upper source used by the fitting stage.
+    """
+    hashes = {str(int(z)): str(sha) for z, sha in dual_cache_sha256_by_species.items()}
+    if (set(hashes) != {str(int(z)) for z in tables}
+            or any(len(sha) != 64 or any(c not in '0123456789abcdef' for c in sha)
+                   for sha in hashes.values())):
+        raise ValueError('prepared raw C requires exact authenticated Fourier dual species coverage')
+    atomic = {}
+    for z, data in tables.items():
+        metadata = data['metadata']
+        payload = str(metadata.get('payload_sha256', ''))
+        if len(payload) != 64 or any(c not in '0123456789abcdef' for c in payload):
+            raise ValueError('prepared raw C requires an authenticated atomic payload')
+        atomic[str(int(z))] = dict(payload_sha256=payload,
+            metadata_sha256=hashlib.sha256(_json_bytes(metadata)).hexdigest())
+    return dict(schema='lorrax.raw_parent_projection_binding.v1',
+        source_identity=_raw_projection_identity(), atomic_source_by_species=atomic,
+        dual_cache_sha256_by_species=hashes,
+        coefficient_convention='C_ni = <pseudo_dual_i | upper_normalized4_source_n / R(K)>; unrotated full physical bands')
+
+
 def raw_parent_moment_binding(wfn, *, k_parent_frac, gvecs, ngk_valid, centers_cart,
                               atom_types, cell_volume, physical_bands,
-                              served_cache_sha256_by_species, wfn_fingerprint_binding=None):
+                              served_cache_sha256_by_species, wfn_fingerprint_binding=None,
+                              projection_binding=None):
     """Point-independent identity of cached unrotated full-window D_R.
 
     The canonical WFN fingerprint is a bounded gauge identity, not a full
@@ -440,7 +477,7 @@ def raw_parent_moment_binding(wfn, *, k_parent_frac, gvecs, ngk_valid, centers_c
     # Zero the G ghosts before hashing; their stored scratch values are inert.
     logical_g = np.asarray(g[:, :int(np.max(ng))], np.int64).copy()
     logical_g[np.arange(logical_g.shape[1])[None] >= ng[:, None]] = 0
-    return dict(schema='lorrax.raw_parent_served_moments.v1', carrier='normalized_rkb',
+    binding = dict(schema='lorrax.raw_parent_served_moments.v1', carrier='normalized_rkb',
         carrier_provenance=NORMALIZED_RKB_LIFT_PROVENANCE, band_range=[0, nb],
         wfn_fingerprint_scheme=WFN_FINGERPRINT_SCHEME, wfn_fingerprint=fingerprint,
         k_parent_frac=k.tolist(), ngk_valid=ng.astype(int).tolist(),
@@ -448,9 +485,25 @@ def raw_parent_moment_binding(wfn, *, k_parent_frac, gvecs, ngk_valid, centers_c
         centers_cart=centers.tolist(), atom_types=species.astype(int).tolist(), cell_volume=volume,
         served_cache_sha256_by_species=hashes, source_identity=identity,
         coefficient_convention='D_ni = <served_delta_i | normalized4_source_n>; unrotated full physical bands')
+    if projection_binding is not None:
+        wanted = {'schema', 'source_identity', 'atomic_source_by_species',
+                  'dual_cache_sha256_by_species', 'coefficient_convention'}
+        if (not isinstance(projection_binding, dict) or set(projection_binding) != wanted
+                or projection_binding['schema'] != 'lorrax.raw_parent_projection_binding.v1'
+                or projection_binding['source_identity'] != _raw_projection_identity()
+                or set(projection_binding['atomic_source_by_species']) != set(hashes)
+                or set(projection_binding['dual_cache_sha256_by_species']) != set(hashes)):
+            raise ValueError('raw-parent C projection identity differs from its current owners or species')
+        reciprocal = float(wfn.blat)*np.asarray(wfn.bvec, np.float64)
+        if (reciprocal.shape != (3, 3) or not np.isfinite(reciprocal).all()
+                or abs(np.linalg.det(reciprocal)) == 0):
+            raise ValueError('prepared raw C requires the authentic reciprocal lattice')
+        binding.update(schema='lorrax.raw_parent_served_moments.v2',
+            projection_binding=projection_binding, reciprocal_vectors_cart=reciprocal.tolist())
+    return binding
 
 
-def _raw_parent_arrays(atom_D, raw_source_sha256, binding):
+def _raw_parent_arrays(atom_D, raw_source_sha256, binding, atom_C=None):
     nb = int(binding['band_range'][1])
     nparent = len(binding['k_parent_frac'])
     source_sha = np.asarray(raw_source_sha256)
@@ -459,21 +512,35 @@ def _raw_parent_arrays(atom_D, raw_source_sha256, binding):
     if len(atom_D) != len(binding['atom_types']):
         raise ValueError('raw served-moment overlap tables disagree with atom count')
     arrays = dict(raw_source_sha256=source_sha)
+    prepared_c = binding.get('schema') == 'lorrax.raw_parent_served_moments.v2'
+    if binding.get('schema') not in ('lorrax.raw_parent_served_moments.v1',
+                                   'lorrax.raw_parent_served_moments.v2'):
+        raise ValueError('unsupported raw-parent served-moment schema')
+    if prepared_c != (atom_C is not None) or (prepared_c and len(atom_C) != len(atom_D)):
+        raise ValueError('raw-parent v2 requires complete prepared C and D; v1 cannot contain C')
+    if prepared_c and binding['projection_binding']['source_identity'] != _raw_projection_identity():
+        raise ValueError('prepared raw C source owner identity mismatch')
     for atom, value in enumerate(atom_D):
         value = np.asarray(value)
         if (value.ndim != 3 or value.shape[:2] != (nparent, nb) or value.shape[2] == 0
                 or value.dtype != np.complex128 or not np.isfinite(value).all()):
             raise ValueError('raw served-moment D_R must be finite complex128 on unpadded full physical bands')
         arrays[f'D_atom{atom}'] = value
+        if prepared_c:
+            coefficient = np.asarray(atom_C[atom])
+            if (coefficient.shape != value.shape or coefficient.dtype != np.complex128
+                    or not np.isfinite(coefficient).all()):
+                raise ValueError('prepared raw C must match unpadded full-window D channels in complex128')
+            arrays[f'C_atom{atom}'] = coefficient
     return arrays
 
 
-def write_raw_parent_moments(path, atom_D, raw_source_sha256, *, binding):
+def write_raw_parent_moments(path, atom_D, raw_source_sha256, *, binding, atom_C=None):
     """Persist one-time source overlaps; interpolation points are absent."""
     target = Path(path)
     if target.exists():
         raise FileExistsError(f'preserve raw-parent served moments: {target}')
-    arrays = _raw_parent_arrays(atom_D, raw_source_sha256, binding)
+    arrays = _raw_parent_arrays(atom_D, raw_source_sha256, binding, atom_C)
     metadata = dict(binding=binding, payload_sha256=_payload_hash(arrays))
     target.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(target, **arrays, metadata_json=np.asarray(_json_bytes(metadata).decode()))
@@ -490,11 +557,17 @@ def load_raw_parent_moments(path, *, expected_binding, expected_file_sha256):
         arrays = {key: archive[key].copy() for key in archive.files if key != 'metadata_json'}
     if metadata.get('binding') != expected_binding:
         raise ValueError('raw-parent served-moment source, geometry, or full-window identity mismatch')
+    prepared_c = expected_binding.get('schema') == 'lorrax.raw_parent_served_moments.v2'
     wanted = {'raw_source_sha256'} | {f'D_atom{atom}' for atom in range(len(expected_binding['atom_types']))}
+    if prepared_c:
+        wanted |= {f'C_atom{atom}' for atom in range(len(expected_binding['atom_types']))}
     if set(arrays) != wanted:
         raise ValueError('raw-parent served-moment payload schema mismatch')
     atom_D = tuple(arrays[f'D_atom{atom}'] for atom in range(len(expected_binding['atom_types'])))
-    _raw_parent_arrays(atom_D, arrays['raw_source_sha256'], expected_binding)
+    atom_C = (tuple(arrays[f'C_atom{atom}'] for atom in range(len(atom_D)))
+              if prepared_c else None)
+    _raw_parent_arrays(atom_D, arrays['raw_source_sha256'], expected_binding, atom_C)
     if metadata.get('payload_sha256') != _payload_hash(arrays):
         raise ValueError('raw-parent served-moment payload identity mismatch')
-    return dict(atom_D=atom_D, raw_source_sha256=arrays['raw_source_sha256'], metadata=metadata)
+    return dict(atom_D=atom_D, atom_C=atom_C,
+                raw_source_sha256=arrays['raw_source_sha256'], metadata=metadata)
