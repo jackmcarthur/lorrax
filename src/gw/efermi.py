@@ -478,7 +478,7 @@ def mp1_negative_derivative(
 
 
 @partial(jax.jit, static_argnames=("family",))
-def _solve_smearing_kernel(E, w, target, broadening, capacity, clamp_tol, family):
+def _solve_smearing_kernel(E, w, target, broadening, capacity, clamp_tol, family, valid_kn=None):
     """Pure fixed-shape device root plus final occupations.
 
     The selected family evaluates both the count and the returned table.
@@ -494,10 +494,17 @@ def _solve_smearing_kernel(E, w, target, broadening, capacity, clamp_tol, family
               lambda e, mu, width: _mp1_values(e, mu, width, clamp_tol))
     tail = (64.0 if family == "fd" else _MP1_BRACKET_WIDTHS) * broadening
     bracket0 = (jnp.min(E) - tail, jnp.max(E) + tail)
+    if valid_kn is not None:
+        bracket0 = (jnp.min(jnp.where(valid_kn, E, jnp.inf)) - tail,
+                    jnp.max(jnp.where(valid_kn, E, -jnp.inf)) + tail)
+
+    def occupations(mu):
+        f = values(E, mu, broadening)
+        return f if valid_kn is None else jnp.where(valid_kn, f, 0.)
 
     def count(mu):
         return capacity * jnp.einsum(
-            "k,kn->", w, values(E, mu, broadening))
+            "k,kn->", w, occupations(mu))
 
     def bisect(_iteration, bracket):
         lo, hi = bracket
@@ -510,7 +517,7 @@ def _solve_smearing_kernel(E, w, target, broadening, capacity, clamp_tol, family
     lo, hi = jax.lax.fori_loop(
         0, _MP1_BISECTION_STEPS, bisect, bracket0)
     mu = 0.5 * (lo + hi)
-    return mu, values(E, mu, broadening)
+    return mu, occupations(mu)
 
 
 def solve_smearing_occupations(
@@ -518,6 +525,7 @@ def solve_smearing_occupations(
     state_capacity: float,
     family: str,
     logical_nband: int | None = None,
+    valid_kn=None,
     clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
 ) -> tuple[jax.Array, jax.Array]:
     """Return ``(mu_ry, f_kn)`` satisfying the fixed-electron constraint.
@@ -578,13 +586,21 @@ def solve_smearing_occupations(
     if not np.isfinite(capacity) or capacity <= 0.0:
         raise ValueError("solve_smearing_occupations: state_capacity must be finite and > 0")
     maximum = capacity * weight_sum * logical
+    valid = None
+    if valid_kn is not None:
+        from .wavefunction_bundle import _validate_valid_kn
+        _validate_valid_kn(E_kn, valid_kn)
+        valid = np.asarray(jax.device_get(valid_kn), dtype=bool)[:, :logical]
+        if np.any(~np.any(valid, axis=1)):
+            raise ValueError("GATE physical_band_validity: fixed-N solve needs a physical state at every k")
+        maximum = capacity * float(np.sum(w[:, None] * valid))
     if not np.isfinite(target) or not (0.0 < target < maximum):
         raise ValueError(
             f"solve_smearing_occupations: n_electrons={target!r} outside (0, {maximum})")
 
     mu, physical_f = _solve_smearing_kernel(
         jnp.asarray(E_kn, dtype=jnp.float64)[:, :logical], w, target, broadening, capacity,
-        occupation_clamp_tol(clamp_tol), family)
+        occupation_clamp_tol(clamp_tol), family, valid)
     return mu, jnp.pad(physical_f, ((0, 0), (0, shape[1] - logical)),
                        mode="constant", constant_values=0.0)
 
@@ -684,7 +700,7 @@ def _fermi_level_step_kernel(E, w, target):
     return jnp.stack([e_f, degenerate.astype(jnp.float64), E_sorted[b_c]])
 
 
-def fermi_level_step(E_kn, kweights, n_occ_bands: float) -> float:
+def fermi_level_step(E_kn, kweights, n_occ_bands: float, *, valid_kn=None) -> float:
     """E_F for step (T = 0) occupations, k-weighted.
 
     Parameters
@@ -754,8 +770,22 @@ def fermi_level_step(E_kn, kweights, n_occ_bands: float) -> float:
             f"sum(w)*nb={float(w.sum()) * shape[1]}]; there are not enough "
             f"bands to hold it.")
 
-    e_f, degenerate, e_boundary = (
-        float(v) for v in np.asarray(_fermi_level_step_kernel(E_kn, w, target)))
+    if valid_kn is None:
+        result = _fermi_level_step_kernel(E_kn, w, target)
+    else:
+        from .wavefunction_bundle import _validate_valid_kn
+        _validate_valid_kn(E_kn, valid_kn)
+        valid = np.asarray(jax.device_get(valid_kn), dtype=bool) & (w[:, None] > 0)
+        maximum = float(np.sum(w[:, None] * valid))
+        if not 0. < target <= maximum + _EXACT_FILL_RTOL:
+            raise ValueError("GATE physical_band_validity: step target exceeds weighted physical state capacity")
+        indices = np.flatnonzero(valid.ravel())
+        energies = jnp.reshape(jnp.asarray(E_kn), (-1,))[indices, None]
+        weights = np.broadcast_to(w[:, None], shape).ravel()[indices]
+        # Same weighted-step kernel, on physical states only. Zero-weight
+        # ghosts cannot become gap endpoints in the sorted energy ladder.
+        result = _fermi_level_step_kernel(energies, weights, target)
+    e_f, degenerate, e_boundary = (float(v) for v in np.asarray(result))
     if degenerate != 0.0:
         raise ValueError(
             f"fermi_level_step: n_occ_bands={target} puts E_F inside a "
@@ -928,6 +958,7 @@ class OccupationState:
     def solve_smearing(cls, E_kn, kweights, n_electrons: float, width_ry: float, *,
                   state_capacity: float, family: str,
                   logical_nband: int | None = None,
+                  valid_kn=None,
                   clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
                   ) -> "OccupationState":
         """Fixed-N state of the selected family through the common bisection.
@@ -944,7 +975,7 @@ class OccupationState:
         mu, f = solve_smearing_occupations(
             E_kn, kweights, float(n_electrons), float(width_ry),
             state_capacity=float(state_capacity), family=family,
-            logical_nband=logical_nband,
+            logical_nband=logical_nband, valid_kn=valid_kn,
             clamp_tol=float(clamp_tol))
         state = cls(f_kn=f, mu_ry=float(mu), smearing_family=family,
                     smearing_width_ry=float(width_ry),
@@ -962,15 +993,17 @@ class OccupationState:
 
     @classmethod
     def step(cls, E_kn, kweights, n_occ_bands: float, *,
-             state_capacity: float = 1.0) -> "OccupationState":
+             state_capacity: float = 1.0, valid_kn=None) -> "OccupationState":
         """Insulating step state via the existing E_F/step machinery.
 
         Refuses the metallic partial-fill case by name: a step function
         realises only partial sums of the k-weights, so an inexact fill
         means the deck needs :meth:`solve_mp1`, not a silently short count.
         """
-        e_f = fermi_level_step(E_kn, kweights, float(n_occ_bands))
+        e_f = fermi_level_step(E_kn, kweights, float(n_occ_bands), valid_kn=valid_kn)
         f = step_occupations(E_kn, e_f)
+        if valid_kn is not None:
+            f = jnp.where(valid_kn, f, 0.)
         realized = occupied_band_count(f, kweights)
         target = float(n_occ_bands)
         tol = _EXACT_FILL_RTOL * max(target, 1.0)
@@ -1099,6 +1132,7 @@ def solve_oneshot_occupations(config, wfn, wfns, material_class,
 		float(config.occ_broadening_ry),
 		family=config.occ_smearing_family,
 		logical_nband=wfns.slices.nb_full_logical,
+		valid_kn=getattr(wfns, "valid_kn", None),
 		state_capacity=spin_degeneracy_factor(wfn),
 		clamp_tol=float(config.occupation_clamp_tol))
 	if mesh_xy is None or process_count() <= 1:

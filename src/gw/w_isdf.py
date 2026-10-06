@@ -2189,6 +2189,12 @@ def _gap_edges(wfns, energy_reference):
     eref = 0.0 if energy_reference is None else float(energy_reference)
     enk_v_host = np.asarray(jax.device_get(wfns.enk[:, s.val]), dtype=np.float64) - eref
     enk_c_host = np.asarray(jax.device_get(wfns.enk[:, s.cond]), dtype=np.float64) - eref
+    if getattr(wfns, "valid_kn", None) is not None:
+        from .wavefunction_bundle import physical_band_mask
+        valid = physical_band_mask(wfns)
+        enk_v_host, enk_c_host = enk_v_host[valid[:, s.val]], enk_c_host[valid[:, s.cond]]
+        if not enk_v_host.size or not enk_c_host.size:
+            raise ValueError("GATE chi0_laplace_needs_gap: both physical occupation windows must be nonempty")
     vmax, cmin = float(np.max(enk_v_host)), float(np.min(enk_c_host))
     if not cmin > vmax:
         raise ValueError(
@@ -2494,6 +2500,12 @@ def matsubara_rule(wfns, occupation_state, nu_indices, *, rel_tol):
             "  why:  every tau factor is rebuilt from these energies and checked "
             "against this table")
     fermi_dirac = np.exp(-np.logaddexp(0.0, beta * (energies - mu)))
+    selected = energies
+    if getattr(wfns, "valid_kn", None) is not None:
+        from .wavefunction_bundle import physical_band_mask
+        valid = physical_band_mask(wfns, occupations=occupation_state.f_kn)[:, :live_stop]
+        fermi_dirac = np.where(valid, fermi_dirac, 0.)
+        selected = energies[valid]
     mismatch = float(np.max(np.abs(occupied - fermi_dirac)))
     if not mismatch <= MATSUBARA_OCCUPATION_TOLERANCE:
         raise ValueError(
@@ -2504,7 +2516,7 @@ def matsubara_rule(wfns, occupation_state, nu_indices, *, rel_tol):
             "  why:  the tau factors are rebuilt from energies; a different table would "
             "describe another state")
     rule = minimax.matsubara_response_rule(
-        beta, float(energies.max() - energies.min()), nu_indices, rel_tol=rel_tol)
+        beta, float(selected.max() - selected.min()), nu_indices, rel_tol=rel_tol)
     return beta, mu, live_stop, rule
 
 
@@ -3254,7 +3266,7 @@ def chi_band_stop(meta, wfns):
     return None if top is None else int(top) - int(wfns.slices.b0)
 
 
-def _occupation_support_slices(occupations, band_stop=None):
+def _occupation_support_slices(occupations, band_stop=None, *, valid_kn=None):
     """Smallest contiguous f and (1-f) band supports inside the chi band window; see docs/architecture/fractional_chi0_response_face.md.
 
     ``band_stop`` (:func:`chi_band_stop`) ends both supports at the chi band
@@ -3265,10 +3277,21 @@ def _occupation_support_slices(occupations, band_stop=None):
         raise ValueError(
             "fractional contour occupations must have shape (nk, nb), got "
             + str(occ.shape))
+    valid = None
+    if valid_kn is not None:
+        from .wavefunction_bundle import _validate_valid_kn
+        _validate_valid_kn(occ, valid_kn)
+        valid = np.asarray(jax.device_get(valid_kn), dtype=bool)
+        if np.any(occ[~valid] != 0.):
+            raise ValueError("GATE physical_band_validity: ghost occupations must be exact zero")
     if band_stop is not None:
         occ = occ[:, :int(band_stop)]
+        valid = None if valid is None else valid[:, :int(band_stop)]
     f_support = np.any(band_in_occupation_window(occ), axis=0)
     u_support = np.any(band_in_occupation_window(1.0 - occ), axis=0)
+    if valid is not None:
+        f_support = np.any(valid & band_in_occupation_window(occ), axis=0)
+        u_support = np.any(valid & band_in_occupation_window(1.0 - occ), axis=0)
     if not np.any(f_support) or not np.any(u_support):
         raise ValueError(
             "fractional contour chi0 needs at least one band with a nonzero "
@@ -3326,7 +3349,8 @@ def _chi0_fractional_contour_args(
         raise ValueError(
             "fractional contour occupation shape {} does not match energies "
             "{}".format(occ_full.shape, wfns.enk.shape))
-    f_slice, u_slice = _occupation_support_slices(occ_full, band_stop)
+    valid = getattr(wfns, "valid_kn", None)
+    f_slice, u_slice = _occupation_support_slices(occ_full, band_stop, valid_kn=valid)
     eref = 0.0 if energy_reference is None else float(energy_reference)
     # Invert occupations before masking so excluded bands retain zero weight.
     nb_full = int(wfns.slices.nb_full)
@@ -3337,6 +3361,9 @@ def _chi0_fractional_contour_args(
         (idx >= u_slice.start) & (idx < u_slice.stop), dtype=occ_full.dtype)
     occ_f_face = occ_full * f_ind[None, :]
     occ_u_face = (1.0 - occ_full) * u_ind[None, :]
+    if valid is not None:
+        occ_f_face = jnp.where(valid, occ_f_face, 0.)
+        occ_u_face = jnp.where(valid, occ_u_face, 0.)
     carrier = wfns.green_parent
     if carrier is not None:
         # Raw parents: the packed parent faces and the parents' rows of
@@ -3411,6 +3438,7 @@ def _fractional_pair_scan_face(
     occ_a, occ_b, z_values, *,
     nb_full, nb_logical, tile, unfold_x=None, unfold_y=None, roll_b=None,
     k_unfold_plan=None, ordered=False, with_derivative=False,
+    valid_a=None, valid_b=None,
 ):
     """Stream ordered band-pair tiles ``(f_a - f_b) / (e_a - e_b + z)`` at nonzero z from canonical faces with optional typed parent transport.
 
@@ -3506,8 +3534,18 @@ def _fractional_pair_scan_face(
     eb_full = jnp.pad(energy_b, pad2)
     fa_full = jnp.pad(occ_a, pad2)
     fb_full = jnp.pad(occ_b, pad2)
+    va_full = None if valid_a is None else jnp.pad(valid_a, pad2, constant_values=False)
+    vb_full = None if valid_b is None else jnp.pad(valid_b, pad2, constant_values=False)
     z = jnp.asarray(z_values, dtype=jnp.complex128)
     ntiles = nb_pad // tile
+
+    def logical_pair(ga, gb):
+        logical = ((ga[:, None] < int(nb_logical))
+                   & (gb[None, :] < int(nb_logical)))[None, :, :]
+        if va_full is not None:
+            logical = (logical & jnp.take(va_full, ga, axis=1)[:, :, None]
+                       & jnp.take(vb_full, gb, axis=1)[:, None, :])
+        return logical
 
     def _pair_contribution(pa_x, pb_x, pa_y, pb_y, ea, eb, fa, fb, ga, gb):
         de = ea[:, :, None] - eb[:, None, :]
@@ -3519,9 +3557,7 @@ def _fractional_pair_scan_face(
             slope = -weights / ((de[None, :, :, :] + z[:, None, None, None])
                                 * (2 * z[:, None, None, None]))
             weights = jnp.concatenate((weights, slope), axis=0)
-        logical = (
-            (ga[:, None] < int(nb_logical)) & (gb[None, :] < int(nb_logical))
-        )[None, :, :]
+        logical = logical_pair(ga, gb)
         weights = jnp.where(logical[None, :, :, :], weights, 0.0)
         def contract(_):
             density_x = jnp.einsum(
@@ -3565,8 +3601,7 @@ def _fractional_pair_scan_face(
                 # Same exact df/logical predicate as the reference density
                 # guard, now before transport too. All metadata here is
                 # replicated, so every rank takes the same collective branch.
-                logical = ((ga[:, None] < int(nb_logical))
-                           & (gb[None, :] < int(nb_logical)))[None, :, :]
+                logical = logical_pair(ga, gb)
                 live = jnp.any(((fa[:, :, None] - fb[:, None, :]) != 0) & logical)
                 contribution = jax.lax.cond(live, contract, lambda _: zero, operand=None)
             else:
@@ -3625,7 +3660,7 @@ def _unfold_tables_from_operands(irr, sym, kfrac, U, perm_x, L_x, perm_y, L_y,
 def _get_chi_fractional_q_kernel_face(
     mesh_xy: Mesh, *, nb_full: int, nb_logical: int, pair_tile: int,
     n_z: int, k_unfold_plan=None, layout="face", ordered=False,
-    with_derivative=False,
+    with_derivative=False, with_validity=False,
 ):
     """Roll the unfolded b endpoint to k−q inside the ordered-pair contraction.
 
@@ -3641,14 +3676,16 @@ def _get_chi_fractional_q_kernel_face(
     ordered = bool(ordered)
     key = ("direct_fractional_q_face", _mesh_key(mesh_xy), int(nb_full),
            int(nb_logical), tile, int(n_z), id(k_unfold_plan), layout, ordered,
-           bool(with_derivative))
+           bool(with_derivative), bool(with_validity))
     hit = _chi_minimax_kernel_cache.get(key)
     if hit is not None:
         return hit
 
     if k_unfold_plan is None:
         def _local(psi_mun, psi_nmu, kminq_idx, energies, occupations,
-                   z_values):
+                   z_values, *valid_tables):
+            valid = valid_tables[0] if with_validity else None
+            vb = None if valid is None else jnp.take(valid, kminq_idx, axis=0)
             psi_mun_b = jnp.take(psi_mun, kminq_idx, axis=0)
             psi_nmu_b = jnp.take(psi_nmu, kminq_idx, axis=0)
             eb = jnp.take(energies, kminq_idx, axis=0)
@@ -3657,7 +3694,8 @@ def _get_chi_fractional_q_kernel_face(
                 psi_mun, psi_nmu, psi_mun_b, psi_nmu_b, energies, eb,
                 occupations, fb, z_values,
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
-                ordered=ordered, with_derivative=with_derivative)
+                ordered=ordered, with_derivative=with_derivative,
+                valid_a=valid, valid_b=vb)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None))
     else:
@@ -3668,6 +3706,9 @@ def _get_chi_fractional_q_kernel_face(
 
         def _local(psi_mun, psi_nmu, kminq_idx, energies, occupations,
                    z_values, *tables):
+            valid = tables[-1] if with_validity else None
+            tables = tables[:-1] if with_validity else tables
+            vb = None if valid is None else jnp.take(valid, kminq_idx, axis=0)
             unfold_x, unfold_y = _unfold_tables_from_operands(
                 *tables, n_sym_spatial=n_sym_spatial)
             eb = jnp.take(energies, kminq_idx, axis=0)
@@ -3678,9 +3719,12 @@ def _get_chi_fractional_q_kernel_face(
                 nb_full=nb_full, nb_logical=nb_logical, tile=tile,
                 unfold_x=unfold_x, unfold_y=unfold_y, roll_b=kminq_idx,
                 k_unfold_plan=k_unfold_plan, ordered=ordered,
-                with_derivative=with_derivative)
+                with_derivative=with_derivative, valid_a=valid, valid_b=vb)
         in_specs = (PSI_MUN_SPEC, PSI_NMU_SPEC, P(None), P(None, None),
                     P(None, None), P(None)) + _PARENT_UNFOLD_SPECS
+
+    if with_validity:
+        in_specs += (P(None, None),)
 
     kernel = jax.jit(shard_map(
         _local,
@@ -3693,11 +3737,14 @@ def _get_chi_fractional_q_kernel_face(
     return kernel
 
 
-def occupation_support_bandwidth(energies_kn_ry, occupations_kn, band_stop=None):
+def occupation_support_bandwidth(energies_kn_ry, occupations_kn, band_stop=None, *, valid_kn=None):
     """Largest transition energy over the occupation supports inside the chi band window, Ry; see docs/architecture/fractional_chi0_response_face.md."""
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
-    f_slice, u_slice = _occupation_support_slices(occupations_kn, band_stop)
-    return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
+    f_slice, u_slice = _occupation_support_slices(occupations_kn, band_stop, valid_kn=valid_kn)
+    if valid_kn is None:
+        return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
+    valid = np.asarray(jax.device_get(valid_kn), dtype=bool)
+    return float(np.max(e[:, u_slice][valid[:, u_slice]]) - np.min(e[:, f_slice][valid[:, f_slice]]))
 
 
 def compute_chi0_direct_fractional(
@@ -3810,17 +3857,21 @@ def compute_chi0_direct_fractional(
         tile = _reference_fractional_pair_tile(e.shape[0], nmu_local)
     else:
         tile = _FRACTIONAL_PAIR_TILE
+    valid_args = ()
+    if getattr(wfns, "valid_kn", None) is not None:
+        from .wavefunction_bundle import physical_band_mask
+        valid_args = (jnp.asarray(physical_band_mask(wfns, band_stop=nb_log, occupations=f)),)
     kernel = _get_chi_fractional_q_kernel_face(
         mesh_xy, nb_full=nb_full, nb_logical=nb_log,
         pair_tile=tile, n_z=z.size,
         k_unfold_plan=plan, layout=wfns.layout, ordered=ordered,
-        with_derivative=bool(with_derivative))
+        with_derivative=bool(with_derivative), with_validity=bool(valid_args))
     rows = []
     for q_row, row in enumerate(kmq):
         started = time.monotonic()
         value = kernel(
             psi_mun_in, psi_nmu_in, jnp.asarray(row), e_full, f_full,
-            jnp.asarray(z), *tables)
+            jnp.asarray(z), *tables, *valid_args)
         if progress_fn is not None:
             value.block_until_ready()
             progress_fn(q_row + 1, len(kmq), time.monotonic() - started)

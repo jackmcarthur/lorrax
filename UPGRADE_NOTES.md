@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — optional physical-band validity for ragged native references
+
+`gw.wavefunction_bundle.Wavefunctions.valid_kn` optionally carries replicated
+boolean validity for every full-k/carrier state. The parent carrier derives
+its mask through the existing typed row plan. Reference adapters must supply
+exact-zero ghost coefficients and occupations; shared Green weights,
+response moments, support/census geometry and Sigma branches exclude those
+states explicitly. Fixed-N FD and step occupation owners accept the same
+optional mask and exclude ghosts from brackets and charge counts.
+
+The default `valid_kn=None` keeps the existing uniform logical-band behavior.
+The shared-pole recipe hash, default sampling law and physical occupations
+are unchanged. Existing decks, environments and WFN files need no migration;
+this extends the native-reference numerical carrier, not the production WFN
+schema. The API and masking contract are described in
+`docs/architecture/fractional_chi0_response_face.md`.
+
 ## 2026-10-06 — exact-derivative references skip zero-occupation transport
 
 The optional exact response derivative path skips pair tiles whose replicated

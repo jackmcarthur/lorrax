@@ -147,8 +147,9 @@ def _within_budget(gamma, budget):
         shared_real_pole_v1_r3b["multiplet_relative_tolerance"] * jnp.maximum(jnp.abs(hi), jnp.abs(lo)),
         side * _UNIT_ROUNDOFF * jnp.abs(gamma[:, -1:]))
     dropped = jnp.sum(jnp.cumprod(tied, axis=-1), axis=-1)
-    # One tied run over the whole kept set has no multiplet edge: the index cut stays.
-    dropped = jnp.where(dropped < int(budget), dropped, 0)
+    # If the top tied run fills the entire budget, it still crosses the
+    # boundary. Drop that whole run; an empty closed span cannot depend
+    # on an eigensolver's gauge, whereas an arbitrary partial span does.
     return jnp.arange(side)[None, :] >= edge + dropped[:, None]
 
 

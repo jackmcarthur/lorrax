@@ -16,6 +16,7 @@ here.
 | `psi_mun` | (N_k^in, n_s, N_μ, N_b) | `P(None, None, 'x', 'y')` | `P(None, None, 'x', None)` |
 | `psi_nmu` | (N_k^in, N_b, n_s, N_μ) | `P(None, 'x', None, 'y')` | `P(None, None, None, 'y')` |
 | energies, occupations | (N_k, N_b) | replicated | replicated |
+| optional `valid_kn` | (N_k, N_b), bool | replicated | replicated |
 
 The face layout distributes the band axis over the mesh axis that does not
 carry μ; the axis layout replicates bands. N_k^in is the full grid, or the
@@ -23,6 +24,25 @@ N_k^par symmetry parents when the bundle carries raw parents
 (`wfns.green_parent`). In that case a typed unfold plan transports each Green
 tile or ψ tile to full k on its own rank. No kernel here constructs a
 band-replicated single-axis ψ on the face layout.
+
+Ragged native references may supply `Wavefunctions.valid_kn`, the explicit
+physical-state mask owned by the numerical carrier. `None` retains the
+uniform logical band interval. A supplied mask must be boolean, match the
+energy carrier, and remain replicated; its parent-row form is derived only
+through the existing typed plan. `physical_band_mask` combines it with the
+logical sum interval and refuses nonzero ghost occupations. The parent
+carrier builder also refuses nonzero ghost coefficients. Wavefunctions and
+Green/operator arrays retain their existing all-P storage contracts.
+
+Both particle weights are masked: f and u=1−f are zero for invalid states.
+The same validity governs Green supports, the direct-pair predicate,
+physical energy extrema, fixed-N occupation brackets/counts, Matsubara
+checks, energy-power moments, shared-pole census/support histograms and
+Sigma causal branches. Inactive moment operands are excluded before energy
+powers are formed; a finite placeholder energy is not a physical bound.
+Carrier provenance stays outside the numerical pytree. Native receipts bind
+the mask and per-k dimensions alongside the coefficient and occupation
+identities. No shared-pole recipe or default sampling law changes here.
 
 ## Why two kernels
 

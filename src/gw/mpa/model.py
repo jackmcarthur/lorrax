@@ -841,7 +841,8 @@ def _evaluate_samples(
     # slices no longer contain.
     if metal:
         delta_max = occupation_support_bandwidth(
-            wfns.enk, occupation_state.f_kn, chi_band_stop(meta, wfns))
+            wfns.enk, occupation_state.f_kn, chi_band_stop(meta, wfns),
+            valid_kn=getattr(wfns, "valid_kn", None))
 
     for point in routes["existing"]:
         if not metal:

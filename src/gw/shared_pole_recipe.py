@@ -782,7 +782,7 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
                 digest=member['digest'], K=list(header['K']))
 
 
-def active_band_mask(energies_kn_ry, mu_ry, recipe=None):
+def active_band_mask(energies_kn_ry, mu_ry, recipe=None, *, valid_kn=None):
     """Bands the W model treats as dynamically active: ``max_k E_nk >= mu -
     active_depth_ev``.  Deeper bands (semicore) carry no plasma charge.
 
@@ -792,8 +792,12 @@ def active_band_mask(energies_kn_ry, mu_ry, recipe=None):
     """
     from common.units import RYD_TO_EV
     recipe = shared_real_pole_v1_r3b if recipe is None else recipe
-    depth = (float(mu_ry) - np.max(np.asarray(energies_kn_ry, dtype=np.float64),
-                                   axis=0)) * RYD_TO_EV
+    energies = np.asarray(energies_kn_ry, dtype=np.float64)
+    if valid_kn is not None:
+        from .wavefunction_bundle import _validate_valid_kn
+        _validate_valid_kn(energies, valid_kn)
+        energies = np.where(np.asarray(valid_kn, bool), energies, -np.inf)
+    depth = (float(mu_ry) - np.max(energies, axis=0)) * RYD_TO_EV
     return depth <= recipe['active_depth_ev']
 
 
@@ -831,6 +835,10 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     energies = np.asarray(wfns.enk, dtype=np.float64)[:, :stop]
     occupations = np.asarray(wfns.occ if occupation_state is None else
                              occupation_state.f_kn, dtype=np.float64)[:, :stop]
+    valid = None
+    if getattr(wfns, "valid_kn", None) is not None:
+        from .wavefunction_bundle import physical_band_mask
+        valid = physical_band_mask(wfns, occupations=(None if occupation_state is None else occupation_state.f_kn))[:, :stop]
     if (energies.shape != occupations.shape or energies.ndim != 2
             or energies.shape[0] != meta.nk_tot or not energies.size
             or not np.all(np.isfinite(energies))
@@ -849,6 +857,10 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     val = energies[:, wfns.slices.val]
     cond = energies[:, wfns.slices.cond_all_logical]
     response_cond = energies[:, wfns.slices.cond]
+    if valid is not None:
+        val = val[valid[:, wfns.slices.val]]
+        cond = cond[valid[:, wfns.slices.cond_all_logical]]
+        response_cond = response_cond[valid[:, wfns.slices.cond]]
     if not val.size or not cond.size or not response_cond.size:
         raise ValueError("GATE shared_pole_gap: got: empty logical valence/conduction window; want: both nonempty; why: support geometry needs a physical gap")
     vbm, cbm = float(np.max(val)), float(np.min(cond))
@@ -856,6 +868,8 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
           else float(occupation_state.mu_ry))
     gap_ev = max(0.0, (cbm - vbm) * RYD_TO_EV)
     partial = (occupations > 0.0) & (occupations < 1.0)
+    if valid is not None:
+        partial &= valid
     weights = np.asarray(kweights, dtype=np.float64)
     if (weights.shape != (meta.nk_tot,) or not np.all(np.isfinite(weights))
             or np.any(weights < 0) or not np.isclose(weights.sum(), 1.0, rtol=0, atol=1e-12)):
@@ -863,10 +877,15 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     # A partially occupied BAND must cross mu across the k census; smearing
     # tails in a gapped band do not authorize metallic line spacing.
     crossing = (np.min(energies, axis=0) <= mu) & (np.max(energies, axis=0) >= mu)
+    top = np.max(energies, axis=0)
+    if valid is not None:
+        top = np.where(valid, energies, -np.inf).max(axis=0)
+        bottom = np.where(valid, energies, np.inf).min(axis=0)
+        crossing = (bottom <= mu) & (top >= mu)
     partial_at_mu = bool(np.any(np.any(partial, axis=0) & crossing))
-    depth = (mu - np.max(energies, axis=0)) * RYD_TO_EV
+    depth = (mu - top) * RYD_TO_EV
     recipe = shared_real_pole_v1_r3b
-    active = active_band_mask(energies, mu)
+    active = active_band_mask(energies, mu, valid_kn=valid)
     borderline = ((depth > recipe['active_depth_ev'])
                   & (depth <= recipe['borderline_depth_ev']))
     electrons = float(capacity * np.sum(weights[:, None] * np.where(active, occupations, 0.0)))
@@ -876,7 +895,7 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
         raise ValueError("GATE shared_pole_plasma: got: nonpositive/nonfinite active charge or cell volume; want: positive finite electrons and bohr^3; why: omega_p requires positive density")
     meta.shared_pole_census = {
         "mu_ry": mu, "gap_ev": gap_ev, "partial_at_mu": partial_at_mu,
-        "energy_span_ry": float(energies.max()-energies.min()),
+        "energy_span_ry": float(energies.max()-energies.min()) if valid is None else float(energies[valid].max()-energies[valid].min()),
         "response_transition_span_ry": float(response_cond.max()-val.min()),
         "active_electrons": electrons, "cell_volume_bohr3": volume,
         "state_capacity": capacity, "k_weights": weights.tolist(),
@@ -889,6 +908,10 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
         "occupation_sha256": hashlib.sha256(occupations.tobytes()).hexdigest(),
         "trs_allowed": bool(trs_allowed), "logical_band_count": stop,
     }
+    if valid is not None:
+        meta.shared_pole_census.update(
+            valid_kn_sha256=hashlib.sha256(np.asarray(wfns.valid_kn, bool).tobytes()).hexdigest(),
+            physical_bands_by_k=valid.sum(axis=1).tolist())
 
 
 def _support_envelope(required, key, session):
@@ -1066,7 +1089,7 @@ def support_line_count(reads_ev, height_ev, imaginary_count, held_count,
 
 
 def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, reads_ev, count,
-                            recipe=shared_real_pole_v1_r3b, grid=4001):
+                            recipe=shared_real_pole_v1_r3b, grid=4001, *, valid_kn=None):
     """Line sites from the band structure alone: the support rule (report section IV.B).
 
     Sigma evaluates W on the line at the crossings |E - eps|: E a read, the energy (eV,
@@ -1080,7 +1103,12 @@ def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, reads_ev, cou
     mu are binned at 0.01 eV (far below eta) and paired by one correlation per side of
     mu; sites land on a grid of ``grid`` points. Returns strictly increasing sites in eV.
     """
-    levels = np.asarray(energies_ev, dtype=np.float64).ravel() - mu_ev
+    energies = np.asarray(energies_ev, dtype=np.float64)
+    if valid_kn is not None:
+        from .wavefunction_bundle import _validate_valid_kn
+        _validate_valid_kn(energies, valid_kn)
+        energies = energies[np.asarray(valid_kn, bool)]
+    levels = energies.ravel() - mu_ev
     evaluation, delta = np.asarray(reads_ev, dtype=np.float64).ravel(), 0.01
     pairs = np.zeros(1)
     for side in (1.0, -1.0):
@@ -1168,6 +1196,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         raise ValueError("GATE shared_pole_census: got: absent current census; want: bind_shared_pole_census after current occupations; why: no guessed plasma charge or frozen recipe")
     stop = wfns.slices.b4_logical - wfns.slices.b0
     energies = np.asarray(wfns.enk, dtype=np.float64)[:, :stop]
+    valid = None
+    if getattr(wfns, "valid_kn", None) is not None:
+        from .wavefunction_bundle import physical_band_mask
+        valid = physical_band_mask(wfns)[:, :stop]
+        valid_hash = hashlib.sha256(np.asarray(wfns.valid_kn, bool).tobytes()).hexdigest()
+        if valid_hash != census.get('valid_kn_sha256'):
+            raise ValueError("GATE shared_pole_census: stale physical-band validity; rebind the current census")
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
         raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
     # The run's budget in decimal GB (was per_device_gb * 2**30: GiB, 7.4% over the deck).
@@ -1218,7 +1253,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
             np.sqrt(imaginary[[0, -2]] * imaginary[[1, -1]])).size
         line_count, line_count_rule = support_line_count(reads, height, count, held_count, recipe, tier)
         line = support_rule_line_sites(energies * RYD_TO_EV, census['mu_ry'] * RYD_TO_EV, eta, height,
-                                       reads, line_count)
+                                       reads, line_count, valid_kn=valid)
         if support_receipt is not None and support_receipt['status'] != 'initial_reference':
             previous_line = support_session.get('line_ev')
             if support_receipt['status'] == 'hit' and previous_line is not None:
