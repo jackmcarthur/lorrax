@@ -453,6 +453,55 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy, brackets=None):
     return factory
 
 
+def fused_mixed_tau_factory(families, headers, bases, meta, mesh_xy):
+    """Bind the mixed pair CT + TC to one window executor.
+
+    CT's W pair is synthesized once per τ node; TC's pair is its transposed pair,
+    ``W_TC = partner_CTᵀ`` and ``partner_TC = W_CTᵀ`` (one X↔Y exchange per node in
+    place of a second synthesis); both classes' nodes run in the same loop trip on
+    the same rule and their Σ(τ) are summed, so the pair costs one window's fixed
+    costs and one synthesis.  Round-off against two sweeps: the transposed GEMM
+    sums in another order (claim 3286: the identity holds to 1.9e-15).  The caller
+    places the charge family's left operands (``_integrate_sigma_batches``); the
+    current family's left operands and both right operands ride the window's
+    resident arguments, packed as pytrees.
+    """
+    c, t = families
+    syms = tuple(f.green_parent.plan.sym for f in families)
+    tables_tc = _w_tables((headers['CT_T'], headers['CT_C']), (bases[1], bases[0]),
+                          (syms[1], syms[0]), mesh_xy)[1:]
+    keys_ct = tuple((0, B) for B in range(1, 4))
+    keys_tc = tuple((A, 0) for A in range(1, 4))
+    perm = (0, 3, 4, 1, 2)
+    spec = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None))
+
+    def factory(synthesis, band_axis):
+        tables_ct = tuple(synthesis.w_tables)
+        node_ct = sector_node(c, t, keys_ct, meta, mesh_xy, tables_ct, band_axis)
+        node_tc = sector_node(t, c, keys_tc, meta, mesh_xy, tuple(tables_tc), band_axis)
+        yr_t, yn_t = sector_right_operands(t, band_axis, mesh_xy)
+        xn_t, xr_t = sector_left_operands(t, band_axis, mesh_xy)
+        yr_c, yn_c = sector_right_operands(c, band_axis, mesh_xy)
+
+        def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions, loads):
+            yr_t, xn_t, yr_c = yr
+            yn_t, xr_t, yn_c = yn
+            sigma = node_ct.spatial(xn, yr_t, xr, yn_t, energies, weight, reference, time,
+                                    interactions, loads[0])
+            flip = lambda w: jax.lax.with_sharding_constraint(jnp.transpose(w, perm), spec)
+            mirrored = ParentW(flip(interactions.partner), flip(interactions.W), interactions.hole)
+            return sigma + node_tc.spatial(xn_t, yr_c, xr_t, yn_c, energies, weight, reference, time,
+                                           mirrored, loads[1])
+        p1, p2 = node_ct.spatial.price, node_tc.spatial.price
+        spatial.price = dict(d=p1['d'], ns=p1['ns'], passes=p1['passes'] + p2['passes'],
+                             new=p1['new'] + p2['new'] + 2 * synthesis.tile_bytes)
+        return SynthesisTau(spatial, synthesis, (yr_t, xn_t, yr_c), (yn_t, xr_t, yn_c), synthesis.native,
+                            'sigma.sector.tau.(0, 1)+(1, 0)', meta, (node_ct.key, node_tc.key, 'fused'),
+                            (*node_ct.plans, *node_tc.plans, *tables_ct, *tables_tc),
+                            kconv_tables=(node_ct.loads, node_tc.loads))
+    return factory
+
+
 def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
                      *, weights_fn=None, stage='sigma', linalg=None):
     """Keep the endpoint factors on the irreducible q and form W(t) there, per tau.
@@ -677,7 +726,7 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
 
 def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                          on_shell=None, linalg=None, **options):
-    """Integrate CC, TT and both ordered mixed endpoints on their own pole sets.
+    """Integrate CC, TT and the mixed pair CT + TC (one fused window) on their own pole sets.
 
     ``options`` is the common MPA/shared-pole quadrature contract; its live
     occupation state and fixed-rule sessions remain owned by the caller.
@@ -728,8 +777,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                  [sum(int(c[q]) for _,c in census) for q in range(len(census[0][1]))])
     total=counts=None
     currents=[None,None]
-    for names,endpoints in ((('CC','CC'),(0,0)),(('TT','TT'),(1,1)),
-                            (('CT_C','CT_T'),(0,1)),(('CT_T','CT_C'),(1,0))):
+    for names,endpoints in ((('CC','CC'),(0,0)),(('TT','TT'),(1,1)),(('CT_C','CT_T'),(0,1))):
         a,b=endpoints
         pair=tuple(headers[n] for n in names)
         keys=tuple((A,B) for A in (range(1,4) if a else (0,))
@@ -751,10 +799,12 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 return builder
             # Only CC's band sum is bracketed (the extrapolated class).
             charge=names==('CC','CC')
+            # The mixed pair CT + TC runs as one fused window (fused_mixed_tau_factory).
             context=dict(schedule=lambda _header:dict(route='sector-panels'),
                 synthesis=synthesis,rule_census=rule_census,
-                tau_kernel=sector_tau_factory(families[a],families[b],keys,meta,mesh_xy,
-                                              brackets=brackets if charge else None))
+                tau_kernel=(fused_mixed_tau_factory(families,headers,bases,meta,mesh_xy) if a!=b else
+                            sector_tau_factory(families[a],families[b],keys,meta,mesh_xy,
+                                               brackets=brackets if charge else None)))
             opts=dict(options)
             if not charge:
                 opts.pop('band_brackets',None)
