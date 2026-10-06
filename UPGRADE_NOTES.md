@@ -13,7 +13,7 @@ other's transposed pair. The mixed pair now runs as one window: CT's pair
 synthesized once per τ node, TC's pair by one exchange, both contractions in
 the same loop trip. Results move at round-off only: Fe 4³ bispinor SC maps
 0–2 max |Δeqp| 0.13 µeV (map 0 bitwise), CrI3 6×6 one-shot bitwise (claim
-3289). Measured cold on Ni 20³ P64 (claim 3290): map 0 3126 → 3065 s, Σ τ
+3289). Measured cold on Ni 20³ P64 (claim 3294): map 0 3126 → 3065 s, Σ τ
 1803 → 1731 s, the mixed sweeps 829 → 760 s, −69 s per map (−2 % of the
 map, −4 % of Σ τ). The stage log shows three sector sweeps (CC, TT, CT+TC)
 instead of four. No deck change.
