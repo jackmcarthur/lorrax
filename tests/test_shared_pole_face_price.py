@@ -16,6 +16,8 @@ Receipts (all 2x2 or 8x8 meshes, bispinor sectors, retained spans):
 * ``fe_773``: the same deck on main 2f8bfd55a (runs/DEV/773_ccb_nafix_20261005/legs/fef_main3).
 * ``cri3_773``: CrI3 6x6 forced-face SC (6 GB), P4, main 2f8bfd55a
   (runs/DEV/773_ccb_nafix_20261005/legs/cri3f_main3): batch 1 of 36, over budget at 1.
+* ``cri3_774``: the same deck on main 0a393dd72, map 0 (runs/DEV/774_coldcompile_20261006/legs/cri3f_main);
+  its CT program compiled to 5.01 GB, 1.48 of one tiled copy, the largest ratio of any receipt.
 """
 from types import SimpleNamespace
 
@@ -42,6 +44,9 @@ RECEIPTS = {
     "cri3_773": (2, 2, 36, 2352, [route("CC", 984, 7168, 1761, 3584), route("TT", 1368, 9856, 2430, 5120)],
                  dict(CC=1.712494827, TT=2.814849419, CT=2.770165511), 1,
                  dict(aggregate=15575352715, resident=3823185803, workspace=10888652288, available=5999000000, limit=6611217408.0)),
+    "cri3_774": (2, 2, 36, 2352, [route("CC", 984, 7168, 1761, 3584), route("TT", 1368, 9856, 2430, 5120)],
+                 dict(CC=1.712494827, TT=2.814849419, CT=5.013647111), 1,
+                 dict(aggregate=17774150407, resident=6021983495, workspace=10888652288, available=5999000000, limit=6611217408.0)),
 }
 
 

@@ -450,7 +450,7 @@ def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_wi
 #: its destination, so the second copy is structural, not a fusion accident.
 #: Measured against one tiled copy: the probe's temp + output 1.17 (side 1024)
 #: and 1.46 (2048); the compiled sizing figures of the P4 Fe 4^3 (0.95, CT
-#: 1.09-1.51) and CrI3 6x6 (0.82-1.06) receipts and of the P64 CrI3 24x24
+#: 1.09-1.51) and CrI3 6x6 (0.82-1.48) receipts and of the P64 CrI3 24x24
 #: receipt (1.57-1.63). Two copies bound every one of them
 #: (``tests/test_shared_pole_face_price.py`` replays those receipts).
 FACE_PROGRAM_COPIES = 2
