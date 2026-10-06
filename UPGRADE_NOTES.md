@@ -5,6 +5,28 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — the response rule skips the shared fit that cannot pass
+
+The shared-pole χ response rule (`minimax.response_group_rules`) sizes its
+Hankel pencil by the narrowest sample height and 8× the farthest line site.
+When the 1 eV imaginary sample and line sites far above the gap fall in
+different halves of the sample set, the whole set's pencil is wider than
+either half's (Si 4³ with line sites to 41.78 eV: 1540 against 800). Every
+such set we measured failed its shared fit after all six geometries, because
+the coefficient-mass gate refuses the far line poles. The set was then halved.
+That wasted attempt was most of the cliff seen above 22 samples. The halves
+are now built directly. Rules, eqp and `sigma_diag.dat` are bitwise on every
+leg (cold P4, Si 4³, main against this change). Rule build and cold W, in s:
+
+| samples, top line site | rule build | W |
+|---|---|---|
+| 14 or 22 to 9.44 eV (main) | 0.8 / 0.9, unchanged | 34.3 / 37.7–38.9 |
+| 40 to 9.44 eV | 1.4, unchanged | 48.4–48.6 |
+| 32 to 23.9 eV | 13.4 → 3.8 | 56.1 → 46.6 |
+| 40 to 41.78 eV (the WSUPPORT Si placement) | 26.1 → 8.5 | 74.7 → 57.2 |
+
+The sample count does not set the build time; the reach does. No deck change.
+
 ## 2026-10-06 — the face batch is priced from the shapes, never compiled to be measured
 
 A face-route shared-pole construction (the CC/TT/CT sectors and the scalar
