@@ -708,21 +708,37 @@ def _assemble(mesh, nq, parts):
             stack = jax.tree.map(lambda a: a if jnp.ndim(a) == 0 else
                                  _stack_slot(mesh, (int(nq), *a.shape[1:]), a.dtype)[1](), part)
         stack = jax.tree.map(lambda full, a: full if jnp.ndim(a) == 0 else
-                             _stack_slot(mesh, full.shape, full.dtype)[0](full, a, jnp.asarray(i0, jnp.int32)),
+                             _stack_slot(mesh, full.shape, full.dtype)[0](full, a, np.int32(i0)),
                              stack, part)
         del part
     return stack
 
 
-def _take(mesh, tree, i0, i1):
-    face = NamedSharding(mesh, P(None, 'x', 'y'))
-    rep = NamedSharding(mesh, P())
+@lru_cache(maxsize=None)
+def _rows_program(sharding):
+    """One program taking a parent index set's rows of a stack, in the stack's own
+    layout; the index is an operand, so every round and sub-batch of one width shares
+    one compile."""
+    return jax.jit(lambda x, index: x[index], out_shardings=sharding)
+
+
+def parent_rows(mesh, tree, index):
+    """The ``index`` rows (parents) of every stacked leaf of ``tree`` (matrices on the
+    face, other leaves in their own named layout or replicated); 0-d leaves pass through."""
+    index = np.asarray(index, np.int32)
     def one(a):
         if jnp.ndim(a) == 0:
             return a
-        a = jnp.asarray(a)
-        return jax.jit(lambda x: x[i0:i1], out_shardings=face if a.ndim >= 3 else rep)(a)
+        if isinstance(a, np.ndarray):
+            return a[index]
+        own = a.sharding if isinstance(a.sharding, NamedSharding) and a.sharding.mesh == mesh else None
+        layout = NamedSharding(mesh, P(None, 'x', 'y')) if a.ndim >= 3 else NamedSharding(mesh, P())
+        return _rows_program(own or layout)(a, index)
     return jax.tree.map(one, tree)
+
+
+def _take(mesh, tree, i0, i1):
+    return parent_rows(mesh, tree, np.arange(i0, i1))
 
 
 @lru_cache(maxsize=None)

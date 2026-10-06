@@ -871,7 +871,8 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
                                     for part in parts))]
     infinity_width=max(recipe_infinity_width(part[3],recipe,column_extent=extent,logical_n=n) for part in parts)
     padded=[pad_states(part[0],widths,part[3],infinity_width) for part in parts]
-    take=lambda a,real:a if int(a.shape[0])==int(real) else jax.jit(lambda x:x[:real],out_shardings=a.sharding)(a)
+    from gw.shared_pole_execution import parent_rows
+    take=lambda a,real:a if int(a.shape[0])==int(real) else parent_rows(mesh_xy,a,np.arange(int(real)))
     def node(a):
         z=padded[0][0][a][0]
         if np.ndim(z)==0:
@@ -967,6 +968,7 @@ def slice_sector(sector, slots, mesh_xy):
     per-parent array and table; shared records (roles, recipe, budget) pass through."""
     import jax
     import numpy as np
+    from gw.shared_pole_execution import parent_rows
     index=np.asarray(slots,np.int64)
     def rows(a):
         if isinstance(a,(int,float,bool,str,dict)) or a is None:
@@ -976,9 +978,7 @@ def slice_sector(sector, slots, mesh_xy):
         if isinstance(a,(complex,float,int,bool,np.generic)):
             return a
         if hasattr(a,'shape') and hasattr(a,'sharding'):
-            if a.ndim==0:
-                return a
-            return jax.jit(lambda x:x[index],out_shardings=a.sharding)(a)
+            return parent_rows(mesh_xy,a,index)
         return a
     out=dict(sector)
     out['model']=tuple(rows(a) for a in sector['model'])
