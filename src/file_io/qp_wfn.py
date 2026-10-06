@@ -9,8 +9,10 @@ Three writers live here:
   consumed by downstream BSE / restart paths that just want a WFN.h5
   drop-in replacement.
 * :func:`write_complete_wfn_h5` — the same collective writer on the same
-  source header for a band set computed elsewhere (``psp.run_dense_h``:
-  every band of the G-sphere basis).
+  source header for a rectangular band set computed elsewhere. Native
+  spheres can differ in size; the complete-basis stamp requires equal sizes.
+* :func:`write_dense_spectrum_h5` — ragged full native eigenpairs, for small
+  finite-basis reference sums, with no fictitious padded states.
 
 WHICH k-SET ``qp_wfn_rotations.h5`` IS STORED ON
 ------------------------------------------------------------------------
@@ -928,7 +930,8 @@ def write_complete_wfn_h5(output_path: str, wfn, energies_ry: np.ndarray,
     is written collectively through ``file_io.slab_io`` as
     :func:`write_qp_wfn_h5` writes its rotated slabs.  Occupations are the
     source's, zero past its last band.  ``stamps`` land at the root beside
-    :data:`COMPLETE_WFN_ATTR` = the band count.
+    native dimensions. :data:`COMPLETE_WFN_ATTR` is present only when every
+    native dimension equals the written band count.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common import timing
@@ -954,7 +957,16 @@ def write_complete_wfn_h5(output_path: str, wfn, energies_ry: np.ndarray,
             f"source bands (occupation beyond band {keep}).")
     occupations = np.zeros(source_occ.shape[:-1] + (nbands,), np.float64)
     occupations[..., :keep] = source_occ[..., :keep]
-    stamps = {**stamps, COMPLETE_WFN_ATTR: nbands}
+    dimensions = nspinor * np.asarray(wfn.ngk_valid(k="ibz"), dtype=np.int64)
+    complete = bool(np.all(dimensions == nbands))
+    stamps = {**stamps,
+              "lorrax_dense_basis_complete": int(complete),
+              "lorrax_dense_written_bands": nbands,
+              "lorrax_dense_basis_min": int(dimensions.min()),
+              "lorrax_dense_basis_max": int(dimensions.max())}
+    stamps.pop(COMPLETE_WFN_ATTR, None)
+    if complete:
+        stamps[COMPLETE_WFN_ATTR] = nbands
     with timing.section("complete_wfn.write"):
         ngk = _write_source_header(
             output_path, wfn, nbands=nbands, energies_ry=energies_ry,
@@ -987,6 +999,102 @@ def write_complete_wfn_h5(output_path: str, wfn, energies_ry: np.ndarray,
                         "wfns/coeffs", device_put_process_local(host, sharding),
                         offset=(0, 0, int(kpt_starts[ik]) + g0, 0),
                         valid_shape=(nbands, nspinor, w, 2))
+
+
+def write_dense_spectrum_h5(output_path, wfn, local_spectra, *, mesh, stamps):
+    """COLLECTIVE: full native eigenpairs for every source k, without padding.
+
+    ``local_spectra[k] = (energies_ry, coefficients, diagnostics)`` lives on
+    the one owner rank. Coefficients are ``(nspinor*ngk, nspinor, ngk)``
+    complex128 in source-QE G order; diagnostics are small scalar checks.
+    The native dimensions are authenticated by the source G lists. This
+    archive is deliberately distinct from a rectangular production WFN.
+    Bounded G blocks are broadcast and written in sharded slabs using the
+    same transport as the rectangular writer; no full coefficient matrix
+    is broadcast before the slab loop.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import device_put_process_local, psum_replicate
+    from .slab_io import SlabIO
+    import distrib_la
+    import hashlib
+    from pathlib import Path
+
+    ngk = np.asarray(wfn.ngk_valid(k="ibz"), dtype=np.int64)
+    ns = int(wfn.nspinor)
+    gvecs = np.asarray(wfn.gvecs(k="ibz"), dtype=np.int32)
+    sharding = NamedSharding(mesh, P(None, None, tuple(mesh.axis_names), None))
+    bindings = {}
+    save = Path(stamps["dense_h_qe_save"])
+    source_root = Path(__file__).resolve().parents[2]
+    binding_paths = [Path(wfn.path), save / "data-file-schema.xml",
+                     save / "charge-density.hdf5",
+                     source_root / "src/psp/run_dense_h.py", Path(__file__)]
+    binding_paths += sorted(p for p in save.iterdir() if p.suffix.lower() == ".upf")
+    for path in binding_paths:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+        bindings[str(path.resolve())] = digest.hexdigest()
+    # Every native row has exactly one owner; absent/duplicate rows must never
+    # be confused with a complete all-zero spectral block.
+    for ik in range(len(ngk)):
+        owners = int(np.asarray(psum_replicate(
+            np.asarray(int(ik in local_spectra), np.int64), mesh)))
+        if owners != 1:
+            raise ValueError(f"dense spectrum k={ik}: {owners} owners, expected exactly one")
+    with SlabIO(output_path, mode="w", mesh=mesh) as dst:
+        dst.stamp_dataset_attrs("/", {
+            **stamps, "schema": "lorrax.dense-native-spectrum.v1",
+            "nspinor": ns, "energy_units": "Ry",
+            "coefficient_convention": "band,spinor,source-QE-G,real-imag",
+            "complete_native_basis": 0, "finalized": 0,
+            "source_sha256_bindings": json.dumps(bindings, sort_keys=True)})
+        dst.write_attr("ngk", ngk)
+        dst.write_attr("basis_dimensions", ns * ngk)
+        dst.write_attr("kpoints_crystal", np.asarray(wfn.kpoints))
+        dst.write_attr("kweights", np.asarray(wfn.kweights))
+        dst.write_attr("kgrid", np.asarray(wfn.kgrid))
+        dst.write_attr("source_occupations", np.asarray(wfn.occs))
+        dst.write_attr("num_electrons", float(wfn.num_electrons))
+        for ik, n_g_value in enumerate(ngk):
+            n_g, nb = int(n_g_value), ns * int(n_g_value)
+            values = local_spectra.get(ik)
+            e = np.zeros(nb, np.float64) if values is None else values[0]
+            c = np.zeros((nb, ns, n_g), np.complex128) if values is None else values[1]
+            checks = np.zeros(3, np.float64) if values is None else values[2]
+            if e.shape != (nb,) or c.shape != (nb, ns, n_g):
+                raise ValueError(f"dense spectrum k={ik}: incomplete native eigenpairs")
+            if checks.shape != (3,):
+                raise ValueError(f"dense spectrum k={ik}: malformed eigenpair checks")
+            e, checks = (np.asarray(psum_replicate(x, mesh)) for x in (e, checks))
+            tol = distrib_la.roundoff_tol(ns * int(ngk.max()), dtype=np.complex128)
+            if (not np.isfinite(e).all() or np.any(np.diff(e) < -tol)
+                    or not np.isfinite(checks).all() or np.any(checks < 0)
+                    or np.any(checks > tol)):
+                raise ValueError(f"dense spectrum k={ik}: invalid eigenvalues/eigenpair checks")
+            if len(np.unique(gvecs[ik, :n_g], axis=0)) != n_g:
+                raise ValueError(f"dense spectrum k={ik}: duplicate native G vectors")
+            group = f"k{ik:05d}"
+            dst.write_attr(f"{group}/energies_ry", e)
+            dst.write_attr(f"{group}/gvecs", gvecs[ik, :n_g])
+            dst.write_attr(f"{group}/checks", checks)
+            width = _coefficient_window(mesh, nbands=nb, nspinor=ns, ngkmax=n_g)
+            name = f"{group}/coefficients"
+            dst.create_dataset(name, shape=(nb, ns, n_g, 2), dtype=np.float64)
+            for g0 in range(0, n_g, width):
+                count = min(width, n_g - g0)
+                tile = np.asarray(psum_replicate(c[:, :, g0:g0 + count], mesh))
+                if not np.isfinite(tile).all():
+                    raise ValueError(f"dense spectrum k={ik}: nonfinite coefficient tile")
+                host = np.zeros((nb, ns, width, 2), np.float64)
+                host[:, :, :count, 0] = tile.real
+                host[:, :, :count, 1] = tile.imag
+                dst.write_slab(name, device_put_process_local(host, sharding),
+                               offset=(0, 0, g0, 0), valid_shape=(nb, ns, count, 2))
+        dst.sync_writes()
+        dst.stamp_dataset_attrs("/", {"complete_native_basis": 1, "finalized": 1})
 
 
 def _write_rotated_coefficients(src, dst, *, mesh, U_kmn, band_start,

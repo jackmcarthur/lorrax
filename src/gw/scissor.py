@@ -811,6 +811,53 @@ def fit_scissor(
     )
 
 
+def fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, z_kn=None):
+    """Owner ruling 2026-09-24: the sum-band tail law averages only states
+    that consume Sigma(E_nk).  A state off the sampled grid this map
+    (``sigma0_kn``, the uncovered set of ``qsgw_utils.omega_coverage`` on the
+    grid build_qsgw_sigma_xc uses; it reads the edge or omega = 0) is
+    excluded, so its energy cannot move the tail: on Fe 4^3 three such states
+    set a 14.9 meV tail shift (CLAIMS 2703).
+
+    Each sample is weighted by min(Z, 1/Z) (``z_kn``, the carried weights of
+    the previous map), 0 for Z <= 0: a state riding a satellite or pole has
+    small weight and cannot drag the tail, and the weight is continuous in
+    d Re Sigma/d omega, so the tail law has no jump where a Z crosses 1.  ``z_kn=None`` (map 0) is
+    unit weight, bit for bit the plain mean.  The upper bound is read on the
+    build grid (``snap_outward``, 1e-4 cells): a flat-Sigma state sits at
+    Z = 1 to within its finite-difference noise, and an exact ``z <= 1`` let
+    round-off drop it and move the tail law (Fe 4^3 SC: n = 76 vs 75).
+
+    No qualifying conduction state: no tail law (E_DFT), said in the log.
+    Never a previous map's law: the map reads only its carry
+    (tests/test_sc_sigma_retention.py).  Returns ``(fit or None,
+    n_excluded, note)``.
+    """
+    sigma0_kn = np.asarray(sigma0_kn, dtype=bool)
+    n_excluded = int(np.count_nonzero(fit_mask_kn & sigma0_kn))
+    mask = fit_mask_kn & ~sigma0_kn
+    weights = None
+    if z_kn is not None:
+        # CONTINUOUS weights (STACK/TAIL 2026-09-29): w = min(Z, 1/Z) for Z > 0,
+        # 0 otherwise.  With s = d Re Sigma/d omega, Z = 1/(1 - s): w = Z for
+        # s <= 0, 1 - s for 0 < s < 1, 0 for s >= 1, continuous in s (the hard
+        # cut at Z = 1 dropped a state whose Z crossed 1 by round-off and
+        # made the tail law, hence the SC map, discontinuous in H: on Na 8^3
+        # the fit set flipped 5 -> 4 -> 1 states between maps).
+        z = np.asarray(z_kn, dtype=np.float64)
+        positive = np.isfinite(z) & (z > 0.0)
+        mask = mask & positive
+        zs = np.where(positive, z, 1.0)
+        weights = np.where(positive, np.minimum(zs, 1.0 / zs), 1.0)
+    fit = fit_scissor(fit_mask_kn=mask, state_weights_kn=weights,
+                      conduction_rigid_mean=True, **fit_kwargs)
+    if int(fit.n_fit_c) > 0:
+        return fit, n_excluded, ""
+    return None, n_excluded, (
+        "no conduction state consumes Sigma(E); no tail law, tail at E_DFT")
+
+
+
 __all__ = [
     "FRACTIONAL_TOL",
     "ScissorBandClasses",
@@ -819,6 +866,7 @@ __all__ = [
     "classify_bands_in_grid",
     "classify_scissor_bands",
     "fit_scissor",
+    "fit_sum_band_tail",
     "k_star_weights",
     "qsgw_out_of_range_energies",
 ]

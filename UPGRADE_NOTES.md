@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-06 — dense-H references distinguish cropped and complete native spectra
+
+`psp.run_dense_h` still writes the same rectangular band set by default:
+the smallest native plane-wave sphere's band count on every k point. It
+now labels that output as truncated when larger spheres contain additional
+states, and only stamps a complete-basis WFN when every native dimension
+equals the written count. Existing numerical coefficients do not change.
+Use `--spectrum-output PATH` to retain every native eigenpair in a separate
+ragged reference archive, with per-k dimensions, residual/orthogonality
+checks, input fingerprints and a finalization guard. This archive is not a
+production WFN replacement. A rectangular sum must not be described as
+complete merely because every stored band was used.
+
+The rigid SC conduction-tail fitter now lives in `gw.scissor.fit_sum_band_tail`.
+The SC map and reference diagnostics call that one pure NumPy implementation;
+the fitting law and numerical behavior are unchanged.
+
 ## 2026-10-06 — the cuSOLVERMp eigh runs at a block of 128–256 and reads its info
 
 A cuSOLVERMp eigh ran at the largest divisor of n/p up to 256, which is

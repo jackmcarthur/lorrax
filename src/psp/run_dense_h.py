@@ -12,8 +12,9 @@ diagonalized completely,
     H_k c_nk = ε_nk c_nk,   n = 1 … nspinor·ngk(k),
 
 and ``min_k nspinor·ngk(k)`` bands are written on the source's k-set,
-symmetry and G-lists (``file_io.qp_wfn.write_complete_wfn_h5``): a drop-in
-WFN whose band sum is complete.
+symmetry and G-lists. This rectangular WFN truncates larger spheres.
+``--spectrum-output`` writes all native eigenpairs in a separate ragged
+archive; only that archive closes every varying-sphere band sum.
 
 Each process takes whole k-points (k ≡ rank mod P) and solves them with a
 local eigh; nothing is distributed inside one k.  Peak device bytes per k
@@ -44,7 +45,7 @@ from common.collectives import (process_count, process_rank, psum_replicate,
                                 single_device_mesh)
 from common.gpu_utils import device_budget_bytes, set_device_budget_gb
 from file_io import CrystalData
-from file_io.qp_wfn import write_complete_wfn_h5
+from file_io.qp_wfn import write_complete_wfn_h5, write_dense_spectrum_h5
 from psp.dft_operators import dense_matrix_k, setup_H_k_from_kvec
 from psp.gvec_utils import reorder_to_qe
 from psp.operator_checks import validate_dense_h_inputs
@@ -52,7 +53,7 @@ from psp.pseudos import load_pseudopotentials
 from psp.scf_potential import build_dft_potentials
 from wfn_loader import WfnLoader
 
-def solve_k(H_k, gvecs_file, nspinor, eigh, nbands):
+def solve_k(H_k, gvecs_file, nspinor, eigh, nbands, *, full_spectrum=False):
     """ε and c for one k: the dense H on its (padded) sphere, one full eigh, source G order."""
     if H_k.nG != gvecs_file.shape[0]:
         raise ValueError(
@@ -71,18 +72,26 @@ def solve_k(H_k, gvecs_file, nspinor, eigh, nbands):
             f"dense H_k is not Hermitian: max|H - H^H|/||H|| = {skew:.2e} "
             f"> {tol:.1e}.")
     energies, vectors = eigh(H)                    # eigenvectors as columns
-    psi = np.asarray(vectors[:, :nbands].T).reshape(nbands, nspinor, ngkmax)
+    nphysical = nspinor * H_k.nG
+    keep = nphysical if full_spectrum else nbands
+    selected = vectors[:, :keep]
+    residual = float(jnp.max(jnp.abs(H @ selected - selected * energies[:keep])) / h_pad)
+    orthogonality = float(jnp.max(jnp.abs(jnp.conj(selected.T) @ selected - jnp.eye(keep))))
+    if not residual <= tol or not orthogonality <= tol:
+        raise RuntimeError(f"dense eigenpairs failed: residual={residual:.2e}, "
+                           f"orthogonality={orthogonality:.2e}, tolerance={tol:.2e}")
+    psi = np.asarray(selected.T).reshape(keep, nspinor, ngkmax)
     leak = float(np.max(np.abs(psi[:, :, H_k.nG:]), initial=0.0))
     if not leak <= 1e-10:
         raise RuntimeError(
             f"dense H_k: a physical eigenvector has weight {leak:.1e} on the "
             f"padded G block; the pad did not separate from the spectrum.")
-    return (np.asarray(energies[:nbands]), reorder_to_qe(psi, H_k, gvecs_file),
-            nspinor * H_k.nG, skew)
+    return (np.asarray(energies[:keep]), reorder_to_qe(psi, H_k, gvecs_file),
+            nphysical, skew, np.asarray([skew, residual, orthogonality]))
 
 
 def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
-                nbands=None, nc_gga_branch=None):
+                nbands=None, nc_gga_branch=None, spectrum_output=None):
     rank, nproc = process_rank(), process_count()
     verbose = rank == 0
     mesh = RUNTIME.mesh
@@ -125,6 +134,7 @@ def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
         # own; a rank past nk solves the round's last k and discards it.
         energies = np.zeros((nk, nb))
         coefficients = {}
+        spectra = {}
         ngkmax = int(ngk.max())
         for first in range(0, nk, nproc):
             t0 = time.perf_counter()
@@ -135,11 +145,14 @@ def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
                     V_loc_r=V_loc, ngkmax=ngkmax)
                 if jk == min(ik, nk - 1):
                     H_k, k_run = H_jk, jk
-            e_k, c_k, n, skew = solve_k(
-                H_k, gvecs[k_run, :ngk[k_run]], int(crystal.nspinor), eigh, nb)
+            e_k, c_k, n, skew, checks = solve_k(
+                H_k, gvecs[k_run, :ngk[k_run]], int(crystal.nspinor), eigh, nb,
+                full_spectrum=spectrum_output is not None)
             if ik >= nk:
                 continue
-            energies[ik], coefficients[ik] = e_k, c_k
+            energies[ik], coefficients[ik] = e_k[:nb], c_k[:nb]
+            if spectrum_output is not None:
+                spectra[ik] = (e_k, c_k, checks)
             stats = jax.local_devices()[0].memory_stats() or {}
             print(f"  [rank {rank}] k={ik}: N={n} (padded "
                   f"{int(crystal.nspinor) * ngkmax}), "
@@ -151,8 +164,16 @@ def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
             output_path, wfn, energies, coefficients, mesh=mesh,
             stamps={"dense_h_source_wfn": os.path.abspath(wfn_path),
                     "dense_h_qe_save": os.path.abspath(save_dir)})
+        if spectrum_output is not None:
+            write_dense_spectrum_h5(
+                spectrum_output, wfn, spectra, mesh=mesh,
+                stamps={"dense_h_source_wfn": os.path.abspath(wfn_path),
+                        "dense_h_qe_save": os.path.abspath(save_dir)})
     if verbose:
-        print(f"wrote {output_path}: {nk} k x {nb} bands", flush=True)
+        scope = "complete" if np.all(n_basis == nb) else "truncated on larger native spheres"
+        print(f"wrote {output_path}: {nk} k x {nb} bands ({scope})", flush=True)
+        if spectrum_output is not None:
+            print(f"wrote {spectrum_output}: all native states at every k", flush=True)
     return energies
 
 
@@ -167,7 +188,9 @@ def main():
     parser.add_argument("--sys-dim", type=int, required=True, choices=(0, 2, 3))
     parser.add_argument("--pseudo-dir", default=None)
     parser.add_argument("--nbands", type=int, default=None,
-                        help="bands to write (default: the complete basis)")
+                        help="rectangular bands (default: smallest native basis)")
+    parser.add_argument("--spectrum-output", default=None,
+                        help="separate ragged archive with every native eigenpair")
     parser.add_argument("--memory-per-device-gb", type=float, default=None)
     parser.add_argument("--nc-gga-branch", choices=("general", "fixed_axis"),
                         default=None,
@@ -178,7 +201,7 @@ def main():
         set_device_budget_gb(args.memory_per_device_gb)
     run_dense_h(args.save, args.wfn, args.output, sys_dim=args.sys_dim,
                 pseudo_dir=args.pseudo_dir, nbands=args.nbands,
-                nc_gga_branch=args.nc_gga_branch)
+                nc_gga_branch=args.nc_gga_branch, spectrum_output=args.spectrum_output)
 
 
 if __name__ == "__main__":
