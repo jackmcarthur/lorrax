@@ -16,6 +16,18 @@ layouts and tolerances, with no new coefficient gather. Existing archives
 are untouched; an unordered historical reference requires a new variant.
 Eigenvalues, eigenvectors and the represented Hamiltonian are unchanged.
 
+## 2026-10-07 — explicit ordered plane-wave reference tiles
+
+The opt-in finite-PW reference owner can now contract one declared ordered
+pair tile, including exact finite FD occupation differences, with its
+shared Lehmann value/slope and bounded all-processor density faces. A Γ
+tile can add its exact G-negated reverse; finite q needs both actual
+directions. The density primitive accepts authenticated paired k/q
+representatives and reuses the canonical Bloch-phase owner. No occupation
+floor, time-reversal identity, head model or spectrum completeness is
+inferred. The existing step-occupied Γ bank keeps its original arithmetic;
+production drivers, default occupations and shared-pole laws are unchanged.
+
 ## 2026-10-07 — exact shared-model Γ correlation slope for reference controls
 
 `gw.shared_pole_head.realized_gamma_correlation_sampler` supplies all-P
