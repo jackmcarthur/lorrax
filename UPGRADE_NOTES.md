@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — the CT sector reduces every parent at once; decoupled eigh rows carry their own programs; the free-memory check only warns
+
+Beside the decoupled CC and TT, CT now assembles each face round's joint
+pencil (metric, value and the two output panels) from that round's samples at
+one compacted span for every parent, writes it in place into one stack, and
+runs the joint reduction's keep and output stages over sub-batches with its
+two eighs (the metric's keep cut and the Ritz step) once over the stack; the
+metric and value stacks are released after the keep stage. At CrI3 24×24
+P64 that replaces 21 rounds of two eighs each. Each decoupled eigh row now
+reserves its boundary plus its own program (the service's route-(c) program,
+or on the whole mesh its vectors stack and workspace) instead of its whole
+room, so the P64 replay bounds the measured peaks with priced rows (TT stacks
+row 67.08 against 64.91 GB, CC's 61 × 12288 eigh row 35.79 against 35.77).
+fdebbbd63's runtime guard could move an eigh stack to the whole mesh when the
+measured free pool was short; following the fixed-tile ruling (a route read
+from free memory moves results with allocator state) it now gives one
+warning naming the shortfall and never changes the route. Results move at
+round-off (CT eigh grouping): CrI3 6×6 and Fe 4³ bispinor eqp within
+0.06 µeV of main over three SC maps (claim 3618). No deck change.
+
 ## 2026-10-07 — ordinary density-face validity stays as runtime metadata
 
 `OrderedLehmannPair.from_density_face` now sends its one-dimensional pair
