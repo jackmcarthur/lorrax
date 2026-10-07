@@ -8,7 +8,7 @@ import pytest
 from psp.ionic_gspace import _ionic_gspace_jit, build_fft_G_data, build_ionic_and_core
 
 
-@pytest.mark.parametrize("cutoff", [1.0, 3.3, 9.0])
+@pytest.mark.parametrize("cutoff", [1.0, 3.3, 9.1])
 def test_analytic_fields_have_density_sphere_support_and_preserve_gzero(cutoff):
     shape = (5, 7, 9)
     b = np.asarray([[1., .2, 0.], [0., 1.1, .1], [0., 0., .9]])
