@@ -398,6 +398,26 @@ def _face_complement(nmu, mesh):
     return transpose_xy(transposed, mesh)
 
 
+def _preserve_for_donating_fit(value):
+    """Own bitwise complex operands before another fit donates their source.
+
+    Two separate conjugation dispatches prevent identity/copy elimination.
+    The first preserves its input and creates the intermediate; the second
+    donates that intermediate. Source and one additional buffer coexist,
+    on exactly the input sharding, with no host or reciprocal gather.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    if np.dtype(value.dtype) != np.dtype(np.complex128):
+        raise ValueError('preserved fitting operands must be complex128')
+    saved = jax.jit(jnp.conj,out_shardings=value.sharding)(value)
+    saved.block_until_ready()
+    saved = jax.jit(jnp.conj,out_shardings=value.sharding,donate_argnums=0)(saved)
+    saved.block_until_ready()
+    return saved
+
+
 def _tile_kernels(mesh, pc, bc):
     """Fixed parent/band tiles; only bounded projector coefficients replicate."""
     import jax
@@ -797,7 +817,7 @@ def _rhs_storage_kernels(mesh, q_indices, qpad, na, nh, nr, rp, feature_count):
 
 
 def _local_rhs_workspace_bytes(nparent, nq, nmu, npoint, mesh_size, *, retain_smooth=False,
-                               nq_accumulator=None):
+                               nq_accumulator=None, primitive_count=1):
     """Live rectangular charge buffers before selected-q angular projection.
 
     The AE endpoint output remains live while the PS quarter scan holds its
@@ -814,7 +834,10 @@ def _local_rhs_workspace_bytes(nparent, nq, nmu, npoint, mesh_size, *, retain_sm
     """
     scalar = 16.*int(nq)*int(nmu)*int(npoint)/int(mesh_size)
     parent = 16.*4*int(nparent)*int(nmu)*int(npoint)/int(mesh_size)
-    panels = 6 if retain_smooth else 4
+    if int(primitive_count) < 1:
+        raise ValueError("RHS workspace requires at least one vertex primitive")
+    # Previous delta/PS totals coexist with the next primitive scan.
+    panels = (6 if retain_smooth else 4)+(2 if retain_smooth else 1)*int(primitive_count>1)
     if nq_accumulator is None:
         endpoint_bytes, full_panels = panels*scalar, panels
         accumulator_rows = int(nq)
@@ -858,7 +881,8 @@ def _auxiliary_field_kernel(mesh, geometry, packed_tables, scale):
     return lambda c,d: kernel(c,d,table)
 
 
-def _served_monopole_rhs(plan, faces, coefficients, overlaps, geometry, mesh):
+def _served_monopole_rhs(plan, faces, coefficients, overlaps, geometry, mesh,
+                         source_capture=None):
     """Integrate the authenticated signed charge functional with the fit owner.
 
     The fixed GL8/Lebedev26 auxiliary geometry is an exact κ-covariant
@@ -893,6 +917,22 @@ def _served_monopole_rhs(plan, faces, coefficients, overlaps, geometry, mesh):
         a,b = _auxiliary_field_kernel(mesh,aux,packed,geometry['scale'])(c,d)
         plus,minus = plus+a,minus+b
         start = stop
+    if source_capture is not None:
+        from isdf.atomic_hartree import make_occupied_point_trace, make_occupied_density_projection
+        trace = make_occupied_point_trace(right, source_capture['public_occupations'],
+            source_capture['full_kweights'], cell_volume=source_capture['cell_volume'],
+            spin_degeneracy=source_capture['spin_degeneracy'])
+        physical = (trace(plus)-trace(minus))[None]
+        py = int(mesh.shape['y'])
+        local_points = int(right.n_centroid_packed)//py
+        columns = np.broadcast_to(np.arange(local_points, dtype=np.int32),
+                                  (py, 1, local_points)).copy()
+        packed_weights = axis.pack_host(weights, axis=1, fill_value=0.)
+        table = packed_weights.reshape(len(atoms), py, local_points).transpose(1,0,2)[:, :, None]
+        project_source = make_occupied_density_projection(mesh, columns, table,
+                                                          output_shape=(len(atoms),))
+        source_capture['exact_monopole'] = project_source(physical)/np.sqrt(4*np.pi)
+        source_capture['exact_monopole'].block_until_ready()
     compressor = make_auxiliary_monopole_compressor(mesh,right,weights)
     rhs = local_density_rhs(centroid_faces=faces,
         atom_ae_faces=(plus,_face_complement(plus,mesh)),
@@ -910,11 +950,262 @@ def _served_monopole_rhs(plan, faces, coefficients, overlaps, geometry, mesh):
                     signed_factor_receipts=[a['factor_receipts'] for a in atoms])
 
 
+def _hartree_source_request(request, *, wfn, plan, public_range):
+    """Resolve physical source occupations from the WFN, independent of fit loss."""
+    import hashlib
+
+    if request is None:
+        return None
+    if (not isinstance(request, dict)
+            or set(request) != {'occupations', 'full_kweights', 'spin_degeneracy'}
+            or plan.nspinor != 4 or isinstance(request['spin_degeneracy'], (bool,np.bool_))
+            or request['spin_degeneracy'] != 1.
+            or float(wfn.occupation_state_capacity) != 1.):
+        raise ValueError('Hartree source request requires canonical normalized4 physical occupations')
+    nb, stop = int(wfn.nbands), int(wfn.physical_density_band_stop)
+    domain = 'full_bz' if plan.sym.parent_k_domain == 'full_bz' else 'file'
+    values = wfn.physical_density_occupations(k=domain, unit_as_none=True)
+    canonical = np.zeros((plan.n_parent, nb), np.float64)
+    if values is None:
+        canonical[:, :stop] = 1.
+    elif np.asarray(values).shape == (plan.n_parent, stop):
+        canonical[:, :stop] = values
+    else:
+        raise ValueError('Hartree source WFN occupation rows differ from the actual raw-parent domain')
+    supplied = canonical if request['occupations'] is None else np.asarray(request['occupations'])
+    if (supplied.shape != canonical.shape or np.iscomplexobj(supplied)
+            or not np.isfinite(supplied).all() or np.any(supplied < 0) or np.any(supplied > 1)
+            or not np.array_equal(supplied, canonical)):
+        raise ValueError('Hartree source occupations differ from the canonical physical WFN source')
+    lo, hi = map(int, public_range)
+    if np.any(canonical[:, :lo]) or np.any(canonical[:, hi:]):
+        raise ValueError('Hartree source occupied support lies outside the public SAME150 fitting carrier')
+    full_values = wfn.physical_density_occupations(k='full_bz', unit_as_none=True)
+    full_values = np.ones((plan.n_full, stop)) if full_values is None else np.asarray(full_values)
+    if (full_values.shape != (plan.n_full, stop)
+            or not np.array_equal(canonical[np.asarray(plan.irr_idx), :stop], full_values)):
+        raise ValueError('Hartree source occupations disagree with the canonical full-zone parent unfold')
+    canonical_weights = np.full(plan.n_full, 1./plan.n_full, np.float64)
+    weights = (canonical_weights if request['full_kweights'] is None
+               else np.asarray(request['full_kweights']))
+    if (weights.shape != canonical_weights.shape or np.iscomplexobj(weights)
+            or not np.isfinite(weights).all() or not np.array_equal(weights, canonical_weights)):
+        raise ValueError('Hartree source requires the canonical uniform full-zone density weights')
+    parent_weights = np.bincount(np.asarray(plan.irr_idx), weights=weights,
+                                 minlength=plan.n_parent)
+    return dict(occupations=canonical, full_kweights=weights, parent_kweights=parent_weights,
+        spin_degeneracy=1., public_band_range=(lo, hi),
+        occupations_sha256=hashlib.sha256(canonical.tobytes()).hexdigest(),
+        full_kweights_sha256=hashlib.sha256(weights.tobytes()).hexdigest(),
+        electron_count=float(np.sum(canonical*parent_weights[:, None])),
+        cell_volume=float(wfn.cell_volume))
+
+
+def _hartree_atomic_feature_binding(state):
+    import hashlib
+    return dict(feature_order=['delta','PS','exact_Y00'],
+        radius_sha256=hashlib.sha256(np.asarray(state['radius'],np.float64).tobytes()).hexdigest(),
+        weights_dr_sha256=hashlib.sha256(np.asarray(state['weights_dr'],np.float64).tobytes()).hexdigest(),
+        lm_sha256=hashlib.sha256(np.asarray(state['lm'],np.int64).tobytes()).hexdigest(),
+        centers_cart_sha256=hashlib.sha256(np.asarray(state['centers_cart'],np.float64).tobytes()).hexdigest(),
+        fft_points=int(state['fft_points']),cell_volume=float(state['cell_volume']),
+        support_radius=float(state['support_radius']))
+
+
+def _physical_full_wfn_frame_binding(factor, physical_bands):
+    """Exact physical factor payload; transport ghost padding has no identity."""
+    import hashlib
+
+    a = np.asarray(factor)
+    nb = int(physical_bands)
+    if (a.ndim != 3 or nb < 1 or min(a.shape[1:]) < nb
+            or not np.isfinite(a[:, :nb, :nb]).all()):
+        raise ValueError('Hartree source requires the finite full physical WFN factor')
+    physical = np.asarray(a[:, :nb, :nb],np.complex128)
+    return dict(full150_frame_sha256=hashlib.sha256(physical.tobytes()).hexdigest(),
+        physical_frame_shape=list(physical.shape),physical_frame_band_domain=[0,nb],
+        physical_frame_convention='same full-WFN inverse_sqrt columns on reciprocal and atomic band rows')
+
+
+def charge_hartree_response_metadata(state, functional):
+    """Bind a real physical functional to this actual captured source/frame.
+
+    Called after the canonical Hartree numerical owner prepares its potential
+    and local response. It performs no second density, Poisson solve or fit.
+    """
+    import hashlib
+    import json
+    import jax
+
+    source = state.get('hartree_source')
+    if (source is None or 'exact_monopole' not in source
+            or functional.get('operator') != 'ordinary_3D_periodic_full_FFT_G0_zero'
+            or functional.get('neutral_mean_policy') != 'subtract_free_space_neutral_cell_mean'
+            or functional.get('local_feature_order') != ('delta','PS','exact_Y00')):
+        raise ValueError('Hartree response requires this actual physical source and exact local operator')
+    binding = source['source_binding']
+    digest = lambda value: hashlib.sha256(json.dumps(value,sort_keys=True,
+        separators=(',',':'),allow_nan=False).encode()).hexdigest()
+    if digest(binding) != source['source_identity']:
+        raise ValueError('Hartree source/frame identity differs from its actual captured binding')
+    potential = np.asarray(jax.device_get(functional['smooth_potential']))
+    local = np.asarray(jax.device_get(functional['local_response']))
+    if (potential.dtype != np.dtype(np.float64) or potential.shape != (1,*binding['fft_grid'])
+            or not np.isfinite(potential).all() or local.ndim != 2 or local.shape[0] != 1
+            or not np.isfinite(local).all()):
+        raise ValueError('Hartree functional payload differs from the actual source/grid')
+    atomic = _hartree_atomic_feature_binding(state)
+    potential_binding = dict(source_identity=source['source_identity'],
+        operator=functional['operator'],neutral_mean_policy=functional['neutral_mean_policy'],
+        potential_payload_sha256=hashlib.sha256(potential.tobytes()).hexdigest(),
+        local_response_sha256=hashlib.sha256(np.asarray(local,np.complex128).tobytes()).hexdigest(),
+        atomic_feature_binding=atomic)
+    return dict(source_identity=source['source_identity'],source_binding=binding,
+        potential_identity=digest(potential_binding),potential_binding=potential_binding)
+
+
+def _bind_charge_q0_source(zeta, state):
+    """Authenticate the response's physical source/feature order before solving."""
+    import hashlib
+    import json
+
+    metadata = getattr(zeta,'q0_response_metadata',None)
+    if metadata is None:
+        return
+    source = state.get('hartree_source')
+    digest = lambda value: hashlib.sha256(json.dumps(value,sort_keys=True,
+        separators=(',',':'),allow_nan=False).encode()).hexdigest()
+    if (source is None or metadata.get('source_identity') != source['source_identity']
+            or metadata.get('source_binding') != source['source_binding']
+            or digest(source['source_binding']) != source['source_identity']
+            or source['source_binding']['augmentation_identity'] != state['identity']
+            or metadata.get('potential_binding',{}).get('atomic_feature_binding') != _hartree_atomic_feature_binding(state)
+            or digest(metadata.get('potential_binding')) != metadata.get('potential_identity')):
+        raise ValueError('Hartree q0 response source/frame or atomic feature binding differs from the actual augmentation')
+    zeta.q0_response_source_identity = source['source_identity']
+
+
+def _current_augmentation_request(request, *, wfn, meta, plan, sym, public_range):
+    """Validate an internal current family against its authoritative typed basis.
+
+    This prepares operands only. Solved-current star and public finite-q head
+    admission remain owned by the canonical current family and kernel bundle.
+    """
+    from common.gamma_matrices import current_fit_terms
+    from symmetry_maps import select_current_basis
+    if request is None:
+        return None
+    required = {'meta','plan','centroid_indices','band_range_left','band_range_right',
+                'current_basis_rows','q_full_indices'}
+    if not isinstance(request,dict) or set(request) != required:
+        raise ValueError('current augmentation request requires one complete typed three-current family')
+    mt, pt = request['meta'], request['plan']
+    if int(mt.nspinor) != 4 or pt.nspinor != 4 or pt.n_parent != plan.n_parent:
+        raise ValueError('current augmentation requires the same physical four-spinor parents')
+    for name in ('fft_grid','kgrid','n_rtot','nk_tot','cell_volume'):
+        if not np.array_equal(np.asarray(getattr(mt,name)),np.asarray(getattr(meta,name))):
+            raise ValueError(f'current augmentation {name} differs from the shared physical source')
+    for name in ('fft_grid','kgrid','cell_volume'):
+        if not np.array_equal(np.asarray(getattr(meta,name)),np.asarray(getattr(wfn,name))):
+            raise ValueError(f'current augmentation {name} disagrees with the authoritative WFN')
+    if pt.mesh_xy != plan.mesh_xy or pt.sym is not plan.sym or pt.sym is not sym:
+        raise ValueError('current augmentation must use the same physical symmetry and mesh owners')
+    for name in ('irr_idx','sym_idx','k_parent_frac','spin_action_full','spatial_ops','translations',
+                 'fft_grid','parent_full_rows'):
+        if not np.array_equal(np.asarray(getattr(pt,name)),np.asarray(getattr(plan,name))):
+            raise ValueError(f'current augmentation raw-parent transport {name} differs')
+    kind = getattr(pt,'coordinate_kind','fft_indices')
+    basis = getattr(mt,'mu_basis',None)
+    points = np.asarray(request['centroid_indices'])
+    if (basis is None or kind != basis.coordinate_kind
+            or not np.array_equal(points,basis.canonical_indices)
+            or not np.array_equal(pt.layout.axis.packed_to_canonical,basis.layout.axis.packed_to_canonical)
+            or not np.array_equal(pt.layout.axis.active_mask,basis.layout.axis.active_mask)):
+        raise ValueError('current augmentation points/plan disagree with the authoritative typed T basis')
+    left, right = tuple(request['band_range_left']), tuple(request['band_range_right'])
+    if any(len(bounds)!=2 or any(int(v)!=v for v in bounds) for bounds in (left,right)):
+        raise ValueError('current augmentation fitting windows must be integer band intervals')
+    served_stop = min(public_range[1],int(meta.b_id_4_user),int(mt.b_id_4_user))
+    if (min(left[0],right[0]) != public_range[0]
+            or any(not public_range[0] <= bounds[0] < bounds[1] <= served_stop
+                   for bounds in (left,right))):
+        raise ValueError('GATE current_public_band_coverage: T windows exceed shared physical samples; separately cropped full-WFN output required')
+    rows = request['current_basis_rows']
+    rows = None if rows is None else np.asarray(rows,dtype=np.complex128)
+    # Resolve from the physical WFN group, as gw_init does. A reduced
+    # computational q table cannot choose a different component basis.
+    _, selected_rows = select_current_basis(wfn.symmetry())
+    for resolved_rows in (getattr(meta,'current_basis_rows',None),
+                          getattr(mt,'current_basis_rows',None),selected_rows):
+        if ((rows is None) != (resolved_rows is None)
+                or rows is not None and not np.array_equal(rows,np.asarray(resolved_rows))):
+            raise ValueError('current augmentation basis rows differ from the canonical physical-group selection')
+    terms = tuple(current_fit_terms(v,rows) for v in (1,2,3))
+    qrows = np.asarray(request['q_full_indices'])
+    if (qrows.ndim != 1 or not len(qrows) or not np.issubdtype(qrows.dtype,np.integer)
+            or len(np.unique(qrows)) != len(qrows)
+            or np.any(qrows < 0) or np.any(qrows >= int(meta.nk_tot))):
+        raise ValueError('current augmentation requires unique canonical full-q rows')
+    return dict(meta=mt,plan=pt,points=points,coordinate_kind=kind,band_range_left=left,
+                band_range_right=right,current_basis_rows=rows,vertex_terms=terms,
+                q_full_indices=np.asarray(qrows,dtype=np.int32))
+
+
+def _current_contract_workspace_bytes(*, qpad, mu, atoms, harmonics, radial_points,
+                                      g_tile, shards):
+    """Bound the separate q-owned current contraction phase, not point work.
+
+    The paired raw and solved operands remain resident. One channel's LU
+    scratch may coexist with all three solved operands. Fourier and pair
+    kernels use the actual store tile; no shape-derived tile is substituted.
+    Default provider field/centroid tiles are fixed internal execution sizes.
+    """
+    q = int(qpad)/int(shards)
+    na, nh, nr, mu, gt = map(int,(atoms,harmonics,radial_points,mu,g_tile))
+    mt, ft = 64, 128
+    mup = ((mu+mt-1)//mt)*mt
+    cloud = 16*q*mu*na*nh*nr
+    matrix = 16*q*mu*mu
+    moment = 16*q*mu*na*nh*2
+    radial_row = 16*q*mu*nr
+    degree = int(np.sqrt(nh))
+    # Three q-owned input pairs plus three solved pairs; one paired solve
+    # transient is separate. Bounded field gathers never retain half-clouds.
+    paired_operands = 12*cloud
+    # The canonical signed LU solve owns two paired working RHS banks and
+    # its factor/layout workspace in addition to input and solved outputs.
+    solve_scratch = 4*cloud+2*matrix
+    moments = 3*moment
+    moment_scratch = 2*moments+2*radial_row
+    # Six existing V accumulators, six logical correction outputs and the
+    # six-pair padded scan stack are simultaneously addressed at onsite.
+    matrices = 15*matrix+6*16*q*mup*mup
+    gathered = 16*q*mt*2*3*nr
+    fields = 16*q*mt*ft
+    onsite_scratch = 4*gathered+18*fields+4*6*16*q*mt*mt
+    # Bound every common VSH radial factor bucket, including width-two
+    # sectors and both delta/g factors, and their sparse angular metadata.
+    factor_tables = 16*3*(degree+1)*(2*nr+4)**2+64*9*nh
+    fourier_tables = (8*q*degree*gt*nr+16*q*na*nh*gt+8*q*degree*2*gt)
+    tile = 16*q*mu*gt
+    # Six delta/g outputs, their two running scans, source/smooth/current
+    # physical tiles, pair operands and worst-case retained shell columns.
+    # The full-G shell bound also covers the canonical short head bundle.
+    fourier_and_pair_scratch = 32*tile
+    return dict(paired_operands=paired_operands,solve_scratch=solve_scratch,
+        moments=moments,moment_scratch=moment_scratch,matrices=matrices,
+        onsite_scratch=onsite_scratch,factor_tables=factor_tables,
+        fourier_tables=fourier_tables,fourier_and_pair_scratch=fourier_and_pair_scratch,
+        total=sum((paired_operands,solve_scratch,moments,moment_scratch,matrices,
+                   onsite_scratch,factor_tables,fourier_tables,fourier_and_pair_scratch)))
+
+
 def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                          centroid_indices, parent_psi, parent_faces,
                          band_range_left, band_range_right, print_fn=print,
                          write_ibz_only=True, public_band_range=None, artifact=None,
-                         charge_fit_weights=None):
+                         charge_fit_weights=None, current_request=None,
+                         hartree_source_request=None):
     """Correct persistent samples and assemble the atom-local charge RHS.
 
     Run this before the smooth fit's conjugation/donation. The raw mode
@@ -931,6 +1222,13 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     ``charge_fit_weights`` is the already resolved fitting policy. The same
     shared endpoint factory supplies the radial and auxiliary moment RHSs;
     this stage does not independently infer occupations or configuration.
+    ``current_request`` is an internal complete-family operand request. It
+    samples its authoritative T basis once with the same full-WFN factor,
+    shares the atomic right endpoints, and retains three unit-loss delta/PS
+    RHSs. It does not enable current fitting or establish solved-star admission.
+    ``hartree_source_request`` captures a physical occupied source before
+    donation, using the same packets and full-WFN factor. Its occupations
+    come from the WFN, independently of the normal-equation loss weights.
     """
     import jax
     import jax.numpy as jnp
@@ -993,6 +1291,17 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             raise ValueError("full_wfn_lowdin requires authenticated prepared overlap of the actual served four-spinor")
     elif fit_origin != parent_psi.band_range[0]:
         raise ValueError("augmentation band weights must use the same raw-parent band origin as the smooth fit")
+    current = _current_augmentation_request(current_request,wfn=wfn,meta=meta,plan=plan,sym=sym,public_range=public_range)
+    source_capture = _hartree_source_request(hartree_source_request, wfn=wfn, plan=plan,
+                                             public_range=public_range)
+    if source_capture is not None and (overlap_mode != 'full_wfn_lowdin'
+            or artifact.get('charge_metric', {}).get('smooth_neutral_cross') != 'onsite'
+            or artifact.get('charge_metric', {}).get('moment_enrichment') != 'served_monopole'):
+        raise ValueError('Hartree source capture requires SAME150 served overlap, onsite cross and exact served monopoles')
+    if current is not None and overlap_mode != 'full_wfn_lowdin':
+        raise ValueError('current augmentation requires the actual served full150 physical overlap')
+    if current is not None and 'interpolation_degree' not in artifact['radial']:
+        raise ValueError('current augmentation requires the explicit physical density interpolant')
     cached_coefficients = (artifact.get('raw_parent_moments') or {}).get('atom_C')
     if cached_coefficients is not None and overlap_mode != 'full_wfn_lowdin':
         raise ValueError("prepared full-window atomic coefficients require the actual full-WFN overlap stage")
@@ -1117,9 +1426,60 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         moment_bytes = (aux_workspace['total']+64*npar*nb*aux_points/Ptot
             +32*npar*nb*aux_functions/Ptot+64*4*aux_functions*aux_points/int(mesh_xy.shape['y'])
             +32*qpad*mu*na/Ptot)
+    current_price = 0.
+    if current is not None:
+        from isdf.local_rhs import _selected_q_layout
+        cmu = int(current['plan'].n_centroid_packed)
+        cq = current['q_full_indices']
+        cpad = ((len(cq)+Ptot-1)//Ptot)*Ptot
+        cqneg = q_negation_index(meta.kgrid) if current['band_range_left'] != current['band_range_right'] else None
+        cindexed = cq if len(cq)<int(meta.nk_tot) else None
+        cunion = None if cindexed is None else _selected_q_layout(cindexed,meta.kgrid,cqneg)[0]
+        cw = _local_rhs_workspace_bytes(npar,meta.nk_tot,cmu,point_bound,Ptot,retain_smooth=True,
+            nq_accumulator=None if cunion is None else len(cunion),primitive_count=max(map(len,current['vertex_terms'])))
+        if convolution_backend == 'mathdx':
+            ccolumns = min(2048,(cmu//int(mesh_xy.shape['x']))*((point_bound+int(mesh_xy.shape['y'])-1)//int(mesh_xy.shape['y'])))
+            cscratch = 6.*16*int(meta.nk_tot)*ccolumns if pair_resident_refusal(meta.kgrid) else 0.
+        else:
+            cscratch = 24.*cw['full_q_scalar']
+        cw['convolution_transform_scratch']=cscratch;cw['total']+=cscratch
+        ca = _angular_compression_workspace_bytes(len(cq),cmu,na,nh,rp,len(directions),int(mesh_xy.shape['x']))
+        craw = 16*cpad*cmu*na*nh*nr/Ptot
+        # Preparation retains six raw delta/PS operands and the protected
+        # current source/faces. Factor/paired solves and V/Fourier scratch
+        # run only after point/quarter/angular workspaces have been released.
+        # Their separately authenticated phases are priced before fit/attach.
+        current_price = (6*craw+4*16*npar*nb*4*cmu/Ptot+source_bytes
+            +max(0.,cw['total']-point_workspace['total'])+max(0.,ca['total']-angular_workspace['total'])
+            +max(0.,32*pc*phase_g*cmu-phase_bytes)+max(0.,16*pc*bc*4*cmu-dft_tile))
+        current.update(qpad=cpad,qneg=cqneg,indexed_q=cindexed,workspace=cw,raw_rhs_bytes=craw,
+                       price=current_price,angular_workspace=ca)
     price = (source_bytes+4*face_bytes+rhs_copies*rhs_bytes+3*factor_v_bytes+4*point_faces
              +point_workspace['total']+dft_tile+phase_bytes+smooth_tile+overlap_bytes+moment_bytes
-             +prepared_overlap_host_bytes+prepared_projection_host_bytes+angular_workspace['total'])
+             +prepared_overlap_host_bytes+prepared_projection_host_bytes+angular_workspace['total']+current_price)
+    hartree_source_bytes = 0.
+    if source_capture is not None:
+        # Canonical local density scan: one additional band-owned G carrier,
+        # two FFT boxes plus transform/absolute-square intermediates for its
+        # local bands, and small replicated physical source outputs. No new
+        # source projection, full band-pair cloud or FFT implementation.
+        hartree_source_bytes = (source_bytes+6.*16*(public_bands+Ptot)*4*int(meta.n_rtot)/Ptot
+            +6.*16*int(meta.n_rtot)+4.*16*na*nh*nr
+            +8.*npar*point_bound/int(mesh_xy.shape['y']))
+        price += hartree_source_bytes
+    if current is not None:
+        # These arrays are local to this procedural preparation and are not
+        # returned/captured by the state. Its RHS completion blocks the last
+        # use before returning; distributed lifetime tests pin that boundary.
+        packet_transients = (4*point_faces+point_workspace['total']+dft_tile+phase_bytes
+                             +moment_bytes+angular_workspace['total'])
+        shared_persistent = price-current_price-packet_transients
+        current_persistent = 4*16*npar*nb*4*cmu/Ptot+source_bytes
+        current.update(phase_prices=dict(preparation=price,
+            shared_charge_persistent=shared_persistent,
+            protected_current_operands=current_persistent,
+            released_packet_workspaces=packet_transients),
+            fit_resident_extra_bytes_per_rank=shared_persistent+current_persistent+6*craw)
     budget = float(device_budget_bytes())
     if price > budget:
         warn_over_budget('isdf.augmentation',price,budget)
@@ -1267,6 +1627,75 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                      f"max restored-Gram error {np.max(overlap_receipt['factor_isometry_error']):.3e}; "
                      "same factor on reciprocal, atomic and sample carriers, DFT energy labels retained")
     corrected_faces = (nmu,_face_complement(nmu,mesh_xy))
+    if source_capture is not None:
+        import hashlib
+        import json
+        from common.wfn_layout import band_sphere_spec
+        from gw.qsgw_density import rho_from_wfns
+
+        lo, hi = source_capture['public_band_range']
+        source_capture['public_occupations'] = np.pad(
+            source_capture['occupations'][:, lo:hi], ((0,0),(0,nb-(hi-lo))))
+        with timing.section('augmentation.occupied_smooth_density'):
+            source_G = jax.jit(lambda a: a,
+                out_shardings=NamedSharding(mesh_xy,band_sphere_spec()))(smooth)
+            source_capture['smooth_density'] = rho_from_wfns(
+                source_G, source_capture['public_occupations'],source_capture['parent_kweights'],
+                mesh=mesh_xy,box_index=parent_psi.sphere_index,fft_grid=meta.fft_grid,
+                cell_volume=float(meta.cell_volume),spin_degeneracy=1.,sym=sym,
+                sym_perm=sym.fft_grid_pullback(sym.active_symmetry_rows,tuple(meta.fft_grid)),
+                print_fn=print_fn)
+            source_capture['smooth_density'].block_until_ready()
+            del source_G
+        binding = dict(schema='lorrax.augmentation_occupied_source.v1',
+            augmentation_identity=artifact['identity'],prepared_raw_binding=expected,
+            physical_bands=int(wfn.nbands),public_band_range=[lo,hi],
+            **_physical_full_wfn_frame_binding(overlap_receipt['inverse_sqrt'],int(wfn.nbands)),
+            occupations_sha256=source_capture['occupations_sha256'],
+            full_kweights_sha256=source_capture['full_kweights_sha256'],
+            spin_degeneracy=1.,fft_grid=list(map(int,meta.fft_grid)),
+            cell_volume=float(meta.cell_volume),source_frame_policy='same_actual_served_four_spinor_full_WFN_Lowdin')
+        source_capture['source_binding'] = binding
+        source_capture['source_identity'] = hashlib.sha256(
+            json.dumps(binding,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+        source_capture['local_ps_density'] = jnp.zeros((1,na,nh,nr),jnp.complex128,
+                                                       device=NamedSharding(mesh_xy,P()))
+        source_capture['local_delta_density'] = jnp.zeros_like(source_capture['local_ps_density'])
+    if current is not None:
+        cpplan = current['plan']
+        same_points = (current['coordinate_kind']==coordinate_kind
+            and np.array_equal(current['points'],np.asarray(centroid_indices))
+            and np.array_equal(cpplan.layout.axis.packed_to_canonical,plan.layout.axis.packed_to_canonical))
+        if same_points:
+            with timing.section('augmentation.current_preserved_operands'):
+                current['parent_faces'] = tuple(_preserve_for_donating_fit(a) for a in corrected_faces)
+        else:
+            cpoints = np.asarray(current['points'],dtype=np.float64)
+            if current['coordinate_kind']=='fft_indices':
+                cpoints = cpoints/np.asarray(meta.fft_grid)
+            cpoints = cpplan.layout.axis.pack_host(cpoints,axis=0,fill_value=0.)
+            cactive = np.asarray(cpplan.layout.axis.active_mask)
+            with timing.section('augmentation.current_T_samples'):
+                cnmu = _smooth_point_faces(smooth,wavevectors,cpoints,cactive,mesh_xy,lattice=lattice,
+                    parent_chunk=pc,band_chunk=bc,g_block=gblock,fft_points=meta.n_rtot)
+                for atom,(delta,phase) in enumerate(_sample_geometry(cpoints,cactive,centers,lattice,caches,atom_types,kfrac,support,scale)):
+                    delta_device=_put(delta,mesh_xy,P(None,None,'y'))
+                    for p0 in range(0,npar,pc):
+                        phase_device=_put(phase[p0:p0+pc],mesh_xy,P(None,'y'))
+                        for b0 in range(0,nb,bc):
+                            tile_coeff=kernels['read_coeff'](coefficients[atom],jnp.int32(p0),jnp.int32(b0))
+                            face=kernels['face'](cnmu,jnp.int32(p0),jnp.int32(b0))
+                            cnmu=kernels['update_face'](cnmu,correct(face,tile_coeff,delta_device,phase_device),jnp.int32(p0),jnp.int32(b0))
+                current['parent_faces']=(cnmu,_face_complement(cnmu,mesh_xy))
+        with timing.section('augmentation.current_preserved_operands'):
+            current['parent_psi'] = replacement_parent._replace(psi_G=_preserve_for_donating_fit(smooth))
+        current['preserved_source_bytes_per_rank'] = source_bytes
+        current['same_point_faces_preserved'] = same_points
+        current['weight_l'],current['weight_r']=fitting_band_weights(nb,current['band_range_left'],current['band_range_right'])
+        cshape=(current['qpad'],int(cpplan.n_centroid_packed),na*nh*nr)
+        current['rhs']=[jnp.zeros(cshape,jnp.complex128,device=NamedSharding(mesh_xy,qs)) for _ in range(3)]
+        current['smooth_rhs']=[jnp.zeros(cshape,jnp.complex128,device=NamedSharding(mesh_xy,qs)) for _ in range(3)]
+        current['selector']=current['store_rhs']=None
     norm_source,norm_local = _orbital_norm_kernels(mesh_xy)
     smooth_norm = norm_source(smooth)
     charge_delta = jnp.zeros((npar,nb),jnp.float64,device=NamedSharding(mesh_xy,P(None,'x')))
@@ -1277,6 +1706,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     smooth_rhs = (jnp.zeros(rhs.shape,jnp.complex128,device=NamedSharding(mesh_xy,qs))
                   if onsite_cross else None)
     right_plan = compressor = selector = store_rhs = sampler = None
+    occupied_trace = occupied_projection = None
     to_q = face_to_batch_reshard(mesh_xy)
     with timing.section('augmentation.atomic_density_rhs'):
         for r0 in range(0,nr,rp):
@@ -1296,6 +1726,13 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                 compressor,nf,nfp = _compress_rhs_kernel(mesh_xy,right_plan,na,nh,rp,Y.conj()*angles_w)
                 packet_q = q_indices if indexed_q is None else np.arange(len(q_indices))
                 selector,store_rhs = _rhs_storage_kernels(mesh_xy,packet_q,qpad,na,nh,nr,rp,nf)
+                if source_capture is not None:
+                    from isdf.atomic_hartree import make_occupied_point_trace,make_occupied_density_projection
+                    occupied_trace = make_occupied_point_trace(right_plan,source_capture['public_occupations'],
+                        source_capture['full_kweights'],cell_volume=float(meta.cell_volume),spin_degeneracy=1.)
+                    indices,angular = _angular_bucket_tables(right_plan,na,rp,Y.conj()*angles_w,int(mesh_xy.shape['y']))
+                    occupied_projection = make_occupied_density_projection(
+                        mesh_xy,indices,angular,output_shape=(na,rp,nh))
             ps = jnp.zeros((npar,nb,4,npoint),jnp.complex128,device=NamedSharding(mesh_xy,fs))
             ae = jnp.zeros((npar,nb,4,npoint),jnp.complex128,device=NamedSharding(mesh_xy,fs))
             cart_device,live_device = _put(points @ lattice,mesh_xy,P()),_put(live.astype(float),mesh_xy,P())
@@ -1324,9 +1761,19 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             volume_weights = right_plan.layout.axis.pack_host(volume_weights,axis=0,fill_value=0.)
             volume_weights *= int(meta.n_rtot)/float(meta.cell_volume)
             charge_delta = charge_delta+norm_local(ps,ae,_put(volume_weights,mesh_xy,P('y')))
+            if source_capture is not None:
+                with timing.section('augmentation.occupied_atomic_density'):
+                    ps_density,ae_density = occupied_trace(ps),occupied_trace(ae)
+                    density = jax.jit(lambda p,a: jnp.stack((p,a-p)),
+                        out_shardings=NamedSharding(mesh_xy,P(None,'y')))(ps_density,ae_density)
+                    projected = occupied_projection(density).transpose(0,1,3,2)
+                    source_capture['local_ps_density'] = source_capture['local_ps_density'].at[:,:,:,r0:r0+rp].set(projected[:1])
+                    source_capture['local_delta_density'] = source_capture['local_delta_density'].at[:,:,:,r0:r0+rp].set(projected[1:])
+                    jax.block_until_ready((source_capture['local_ps_density'],source_capture['local_delta_density']))
+                    del density,projected,ps_density,ae_density
+            ae_faces,ps_faces = (ae,_face_complement(ae,mesh_xy)),(ps,_face_complement(ps,mesh_xy))
             local = local_density_rhs(centroid_faces=corrected_faces,
-                        atom_ae_faces=(ae,_face_complement(ae,mesh_xy)),
-                        atom_ps_faces=(ps,_face_complement(ps,mesh_xy)),left_plan=plan,right_plan=right_plan,
+                        atom_ae_faces=ae_faces,atom_ps_faces=ps_faces,left_plan=plan,right_plan=right_plan,
                         weight_l=weight_l,weight_r=weight_r,kgrid=meta.kgrid,mesh_xy=mesh_xy,q_neg_idx=qneg,
                         return_smooth=onsite_cross,q_indices=indexed_q)
             if onsite_cross:
@@ -1341,23 +1788,62 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                 smooth_rhs = store_rhs(smooth_rhs,smooth_packet,jnp.int32(r0))
                 smooth_rhs.block_until_ready()
                 del local_smooth, smooth_packet
+            # Only compressed charge operands survive into the current
+            # scans. The exact same AE/PS right faces serve every channel.
+            del local, packet
+            if current is not None:
+                if current['selector'] is None:
+                    cids=current['q_full_indices'] if current['indexed_q'] is None else np.arange(len(current['q_full_indices']))
+                    current['selector'],current['store_rhs']=_rhs_storage_kernels(mesh_xy,cids,current['qpad'],na,nh,nr,rp,nf)
+                for channel,terms in enumerate(current['vertex_terms']):
+                    cd,csmooth=local_density_rhs(centroid_faces=current['parent_faces'],
+                        atom_ae_faces=ae_faces,atom_ps_faces=ps_faces,
+                        left_plan=current['plan'],right_plan=right_plan,weight_l=current['weight_l'],weight_r=current['weight_r'],
+                        kgrid=meta.kgrid,mesh_xy=mesh_xy,q_neg_idx=current['qneg'],q_indices=current['indexed_q'],
+                        vertex_terms=terms,return_smooth=True)
+                    for key,value in (('rhs',cd),('smooth_rhs',csmooth)):
+                        cpacket=to_q(compressor(current['selector'](value)))
+                        current[key][channel]=current['store_rhs'](current[key][channel],cpacket,jnp.int32(r0))
+                        current[key][channel].block_until_ready()
+                    del cd,csmooth,cpacket,value
             # The next endpoint scan must not retain the previous full-q
             # rectangular output. Only the compressed q-owner table survives.
-            del local, packet
+            del ae_faces,ps_faces
     monopole_rhs = moment_receipt = None
     if moment_enrichment:
         with timing.section('augmentation.served_monopole_rhs'):
             monopole_rhs,moment_receipt = _served_monopole_rhs(plan,corrected_faces,coefficients,raw_served_D,
                 dict(caches=artifact['served_moment_caches'],atom_types=atom_types,centers=centers,
                      lattice=lattice,scale=scale,weight_l=weight_l,weight_r=weight_r,kgrid=meta.kgrid,
-                     qneg=qneg,indexed_q=indexed_q,q_indices=q_indices,qpad=qpad),mesh_xy)
+                     qneg=qneg,indexed_q=indexed_q,q_indices=q_indices,qpad=qpad),mesh_xy,
+                     source_capture=source_capture)
             monopole_rhs.block_until_ready()
     state = dict(rhs=rhs,radius=radius,weights_dr=weights,lm=lm,centers_cart=centers @ lattice,
         q_full_indices=q_indices,reciprocal=reciprocal,cell_volume=float(meta.cell_volume),
         fft_points=int(meta.n_rtot),support_radius=support,kgrid=tuple(meta.kgrid),sym=sym,
         identity=artifact['identity'],tail_relative_norm=tails,angular_gram_error=angular_error,
         nearest_atom_image=nearest,raw_rhs_bytes_per_rank=rhs_bytes,resident_estimate_bytes_per_rank=price)
+    if current is not None:
+        for key in ('selector','store_rhs','weight_l','weight_r'):
+            del current[key]
+        current.update(radius=radius,weights_dr=weights,lm=lm,centers_cart=centers@lattice,
+            reciprocal=reciprocal,cell_volume=float(meta.cell_volume),fft_points=int(meta.n_rtot),
+            support_radius=support,minimum_atom_image_distance=nearest,identity=artifact['identity'],
+            sym=sym,kgrid=tuple(meta.kgrid),
+            shared_physical_bands=int(wfn.nbands),shared_public_band_range=public_range,
+            source_frame_policy='same_actual_served_four_spinor_full_WFN_Lowdin',unit_endpoint_loss=True)
+        current.update({key:artifact['radial'][key]
+                       for key in ('interpolation_degree','quadrature_order','fourier_points')
+                       if key in artifact['radial']})
+        if overlap_receipt is not None:
+            current['overlap_receipt']=overlap_receipt
+        state['current']=current
     state['local_rhs_workspace_bytes_per_rank'] = point_workspace
+    if source_capture is not None:
+        for key in ('public_occupations','occupations','full_kweights','parent_kweights'):
+            del source_capture[key]
+        source_capture['resident_bound_bytes_per_rank'] = hartree_source_bytes
+        state['hartree_source'] = source_capture
     state['angular_compression_workspace_bytes_per_rank'] = angular_workspace
     state['prepared_served_overlap_host_bytes_per_process'] = prepared_overlap_host_bytes
     state['resident_rhs_copies'] = rhs_copies
@@ -1414,6 +1900,7 @@ def attach_local_augmentation(zeta_g, state):
 
     if state['rhs'].shape[:2] != (zeta_g.store.Q_pad,zeta_g.store.mu_pad):
         raise ValueError("augmentation selected q/packed-mu carrier disagrees with fitted smooth ZetaG")
+    _bind_charge_q0_source(zeta_g,state)
     sym = state['sym']
     qfull = np.asarray(sym.kvecs_asints)
     qfrac = bgw_integer_q_to_fractional(qfull[state['q_full_indices']],state['kgrid'])
@@ -1443,3 +1930,67 @@ def attach_local_augmentation(zeta_g, state):
         del state['rhs'], state['smooth_rhs']
         state.pop('monopole_rhs',None)
     return zeta_g
+
+
+def attach_current_augmentation(zetas, state, *, body_contract):
+    """Consume a complete current operand into its OWN three fitted factors.
+
+    ``state`` is ``prepare_augmentation(...,current_request=...)['current']``.
+    ``body_contract`` contains the canonical reciprocal prefactor, Cartesian
+    head, physical body mask and authenticated public body-head slot bundle.
+    The physical current writer and solved-star admission are separate gates;
+    this internal no-file seam does not enable the public GW current flow.
+    """
+    from isdf.atomic_breit import radial_breit_providers
+    from symmetry_maps import bgw_integer_q_to_fractional
+
+    required = {'reciprocal_prefactor','head_cartesian','body_mask','body_head_slots'}
+    if (not isinstance(zetas,dict) or set(zetas)!={1,2,3} or not isinstance(body_contract,dict)
+            or set(body_contract)!=required or body_contract['body_head_slots'] is None):
+        raise ValueError('current augmentation requires complete OWN3 fits and the canonical body/head contract')
+    if (not isinstance(state,dict)
+            or state.get('source_frame_policy')!='same_actual_served_four_spinor_full_WFN_Lowdin'
+            or state.get('unit_endpoint_loss') is not True
+            or not isinstance(state.get('rhs'),list) or len(state['rhs'])!=3
+            or not isinstance(state.get('smooth_rhs'),list) or len(state['smooth_rhs'])!=3):
+        raise ValueError('current augmentation requires three prepared unit-loss delta/PS operands')
+    channels = tuple(zetas[v] for v in (1,2,3))
+    for v,z in zip((1,2,3),channels):
+        if (z.mesh is not state['plan'].mesh_xy or z.mu_basis is not state['meta'].mu_basis
+                or getattr(z,'fit_vertex_mu_L',None)!=v
+                or getattr(z,'fit_augmentation_identity',None)!=state['identity']
+                or not np.array_equal(getattr(z,'fit_q_full_indices',None),state['q_full_indices'])
+                or z.store.mu_pad!=state['plan'].n_centroid_packed
+                or z.store.Q!=len(state['q_full_indices'])):
+            raise ValueError('current augmentation q/basis/OWN-factor/source binding differs from its fit')
+    from common.gpu_utils import device_budget_bytes,warn_over_budget
+    workspace=_current_contract_workspace_bytes(qpad=channels[0].store.Q_pad,
+        mu=channels[0].store.mu_pad,atoms=len(state['centers_cart']),harmonics=len(state['lm']),
+        radial_points=len(state['radius']),g_tile=channels[0].store.g_tile,shards=channels[0].mesh.size)
+    phase=state['phase_prices']
+    contraction_price=(phase['shared_charge_persistent']+phase['protected_current_operands']+workspace['total'])
+    budget=float(device_budget_bytes())
+    if contraction_price>budget:
+        warn_over_budget('isdf.current_augmentation_contract',contraction_price,budget)
+        raise ValueError('current augmentation contraction exceeds its q-owned device memory budget')
+    state['contraction_workspace_bytes_per_rank']=workspace
+    phase['contraction']=contraction_price
+    qfrac = bgw_integer_q_to_fractional(
+        np.asarray(state['sym'].kvecs_asints)[state['q_full_indices']],state['kgrid'])
+    gv = np.asarray(channels[0].gvec_components).transpose(0,2,1)
+    kg = (gv+qfrac[:,None])@state['reciprocal']
+    controls={key:state[key] for key in ('interpolation_degree','quadrature_order','fourier_points') if key in state}
+    providers=radial_breit_providers(channels,state['rhs'],smooth_rhs=state['smooth_rhs'],
+        body_metric='compensated',radius=state['radius'],lm=state['lm'],centers_cart=state['centers_cart'],
+        q_plus_G_cart=kg,cell_volume=state['cell_volume'],fft_points=state['fft_points'],
+        support_radius=state['support_radius'],minimum_atom_image_distance=state['minimum_atom_image_distance'],
+        current_basis_rows=state['current_basis_rows'],**body_contract,**controls)
+    # Concatenation must finish before the six raw operands are released.
+    # The subsequent OWN3 solve coexists with six paired clouds, not eighteen.
+    for provider in providers:
+        provider['rhs'].block_until_ready()
+    for z,provider in zip(channels,providers):
+        provider['identity']=state['identity']
+        z.local_augmentation=provider
+    del state['rhs'],state['smooth_rhs']
+    return zetas

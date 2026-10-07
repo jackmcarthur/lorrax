@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## Unreleased — explicit atomic field targets create a new cache epoch
+
+The normalized atomic-cache owner admits an explicit AE-large-preserving
+RKB target through `cache.target`. The existing default numerical
+constructor is unchanged. Both targets use the same compact evaluator;
+the new target retains the original PS/PCA amplitudes and derives its
+small component from the same compact large field. This is a declared
+finite-K RKB model, not exact nuclear Dirac or spectral X2C reconstruction.
+
+Whole owner files enter cache identity. This source change invalidates old
+normalized, served and raw-parent artifacts in the active checkout even
+when their physical arrays are numerically unchanged. Generate fresh
+artifacts and branch manifests into new directories with the public cache
+and raw-parent tools. Preserve old artifacts with their immutable source
+snapshots; do not alias old file hashes or fitting-accuracy certificates.
+The descriptor and preparation contract are in
+[Atomic field targets and caches](docs/reference/augmentation_cache.md).
+
 ## 2026-10-06 — the face batch is priced from the shapes, never compiled to be measured
 
 A face-route shared-pole construction (the CC/TT/CT sectors and the scalar

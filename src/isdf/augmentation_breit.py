@@ -501,9 +501,11 @@ def static_transverse_block_factors(geometry,compensation):
 
     Magnetic L=J and electric L=J±1 sectors have at most nr and 2nr
     source coordinates; analytic compensation has 2 and 4 moment coordinates.
-    Thin QR retains ALL columns, including the structural J=0 longitudinal
-    null and finite-L edge sectors. No spectral cutoff or new fit points.
-    The signed delta/g difference cancels its common exterior field exactly.
+    One thin QR of the concatenated source and analytic-compensation field
+    maps retains ALL columns, including the structural J=0 longitudinal
+    null and finite-L edge sectors. Their common coordinates support smooth
+    source versus neutral-residual cross forms without a second radial fit.
+    No spectral cutoff or new fit points is introduced.
     """
     angular,radial=geometry['angular'],geometry['radial'];nh=len(angular['lm'])
     if (compensation['support_radius']!=radial['support_radius']
@@ -536,16 +538,18 @@ def static_transverse_block_factors(geometry,compensation):
                 cols=np.asarray([np.flatnonzero((modes==[J,L,M]).all(axis=1))[0] for L in Ls])
                 by_M.append(cols);value=branches[:,cols].reshape(branches.shape[0],-1)
                 covariance_error=max(covariance_error,float(np.max(abs(value.conj().T@value-H))))
-            def field_factor(upper,lower,width):
+            def field_map(upper,lower,width):
                 value=np.zeros((RA.shape[0],len(weight),len(Ls),width),complex)
                 for i,L in enumerate(Ls):
                     row=int(np.flatnonzero(radial['degrees']==L)[0])
                     value[:,:,i]=(RA[:,2*i,None,None]*upper[row][None]
                                    +RA[:,2*i+1,None,None]*lower[row][None])
                 value*=weight[None,:,None,None]
-                return np.linalg.qr(value.reshape(-1,len(Ls)*width),mode='reduced')[1]
-            fd=field_factor(radial['plus'],radial['minus'],radial['plus'].shape[-1])
-            fg=field_factor(gp['plus'],gp['minus'],2)
+                return value.reshape(-1,len(Ls)*width)
+            density=field_map(radial['plus'],radial['minus'],radial['plus'].shape[-1])
+            analytic=field_map(gp['plus'],gp['minus'],2)
+            joint=np.linalg.qr(np.concatenate((density,analytic),axis=1),mode='reduced')[1]
+            fd,fg=joint[:,:density.shape[1]],joint[:,density.shape[1]:]
             sectors.append(dict(J=int(J),kind=kind,Ls=Ls,indices_by_M=tuple(by_M),
                                 delta_factor=fd,compensation_factor=fg))
     tolerance=2048*np.finfo(float).eps*(int(angular['lm'][-1,0])+1)
@@ -553,6 +557,8 @@ def static_transverse_block_factors(geometry,compensation):
         raise ValueError("Cartesian vector block covariance or parity closure failed")
     return dict(basis=basis,sectors=tuple(sectors),angular_forbidden_error=forbidden_error,
         angular_M_covariance_error=covariance_error,no_cutoff=True,
-        retained_columns=sum((2*s['J']+1)*s['delta_factor'].shape[0] for s in sectors),
-        retained_compensation_columns=sum((2*s['J']+1)*s['compensation_factor'].shape[0] for s in sectors),
+        retained_columns=sum((2*s['J']+1)*s['delta_factor'].shape[1] for s in sectors),
+        retained_compensation_columns=sum((2*s['J']+1)*s['compensation_factor'].shape[1] for s in sectors),
+        common_field_coordinates=sum((2*s['J']+1)*s['delta_factor'].shape[0] for s in sectors),
+        cross_space='common_full_column_density_and_analytic_compensation',
         factor_bytes=sum(s['delta_factor'].nbytes+s['compensation_factor'].nbytes for s in sectors))

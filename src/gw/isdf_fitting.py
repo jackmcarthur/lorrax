@@ -88,6 +88,83 @@ def fitting_weight_options(policy):
     return dict(policy)
 
 
+def _prepare_charge_q0_response(potential, metadata, *, mesh, meta,
+                                q_full_indices, q_frac, typed_plan,
+                                centroid_indices):
+    """Authenticate an internal physical potential and its exact charge basis."""
+    import hashlib
+    import json
+
+    if (not isinstance(metadata, dict)
+            or any(not isinstance(metadata.get(k), str) or not metadata[k]
+                   for k in ('source_identity', 'potential_identity'))):
+        raise ValueError('q0 potential requires explicit physical source and potential identities')
+    try:
+        json.dumps(metadata, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('q0 potential provenance must be finite JSON metadata') from exc
+    q_full_indices = np.asarray(q_full_indices, np.int32)
+    q_frac = np.asarray(q_frac, np.float64)
+    gamma = np.flatnonzero((q_full_indices == 0) & np.all(q_frac == 0., axis=1))
+    if gamma.size != 1:
+        raise ValueError('q0 response requires unique physical Gamma in the stored charge q axis')
+    fft_grid = tuple(map(int, meta.fft_grid))
+    shape = tuple(potential.shape) if hasattr(potential, 'shape') else np.shape(potential)
+    if shape == fft_grid:
+        potential = potential[None] if hasattr(potential, 'shape') else np.asarray(potential)[None]
+        shape = (1, *fft_grid)
+    dtype = potential.dtype if hasattr(potential, 'dtype') else np.asarray(potential).dtype
+    if (len(shape) != 4 or shape[0] < 1 or shape[1:] != fft_grid
+            or np.dtype(dtype) != np.dtype(np.float64)):
+        raise ValueError('q0 potential must be real float64 (source,*canonical_fft_grid)')
+    layout = NamedSharding(mesh, P())
+    if isinstance(potential, jax.Array):
+        potential = jax.jit(lambda v: v, out_shardings=layout)(potential)
+    else:
+        potential = _device_put_process_local(np.asarray(potential), layout)
+    finite = jax.jit(lambda v: jnp.all(jnp.isfinite(v)), out_shardings=layout)(potential)
+    if not bool(np.asarray(jax.device_get(finite))):
+        raise ValueError('q0 potential contains nonfinite physical values')
+    if 'source_binding' in metadata:
+        digest = lambda value: hashlib.sha256(json.dumps(value,sort_keys=True,
+            separators=(',',':'),allow_nan=False).encode()).hexdigest()
+        binding, pb = metadata['source_binding'], metadata.get('potential_binding',{})
+        payload = hashlib.sha256(np.asarray(jax.device_get(potential),np.float64).tobytes()).hexdigest()
+        if (digest(binding) != metadata['source_identity']
+                or binding.get('source_frame_policy') != 'same_actual_served_four_spinor_full_WFN_Lowdin'
+                or binding.get('fft_grid') != list(fft_grid)
+                or pb.get('source_identity') != metadata['source_identity']
+                or pb.get('potential_payload_sha256') != payload
+                or digest(pb) != metadata['potential_identity']):
+            raise ValueError('q0 physical source/frame or actual potential payload identity differs from its binding')
+    axis = typed_plan.layout.axis
+    coordinates = np.asarray(centroid_indices,np.float64)
+    if (coordinates.ndim != 2 or coordinates.shape[1] != 3
+            or not np.isfinite(coordinates).all()):
+        raise ValueError('q0 response requires its exact canonical centroid coordinates')
+    basis = getattr(meta,'mu_basis',None)
+    if basis is not None and (not np.array_equal(coordinates,np.asarray(basis.canonical_indices,np.float64))
+            or basis.coordinate_kind != typed_plan.coordinate_kind):
+        raise ValueError('q0 response centroid geometry differs from the actual fitted basis')
+    geometry = dict(coordinate_kind=typed_plan.coordinate_kind,
+        canonical_shape=list(coordinates.shape),
+        canonical_coordinates_sha256=hashlib.sha256(coordinates.tobytes()).hexdigest())
+    reserved = dict(
+        schema='lorrax.charge_q0_response.v1', complete=False,
+        q0_full_index=0, q0_slot=int(gamma[0]),
+        q_full_indices=q_full_indices.tolist(), fft_grid=list(fft_grid),
+        fft_points=int(np.prod(fft_grid)), source_count=int(shape[0]),
+        coefficient_order='canonical_after_same_charge_solve', raw_rhs_order='packed',
+        units='physical_Ry_potential_times_grid_density_sum',
+        centroid_geometry=geometry,
+        packed_to_canonical_sha256=hashlib.sha256(
+            np.asarray(axis.packed_to_canonical, np.int64).tobytes()).hexdigest(),
+        active_mu_sha256=hashlib.sha256(np.asarray(axis.active_mask, bool).tobytes()).hexdigest())
+    if set(metadata) & set(reserved):
+        raise ValueError('q0 potential metadata cannot override the canonical fit placement')
+    return potential, dict(metadata, **reserved)
+
+
 
 
 
@@ -317,6 +394,7 @@ def _fit_mubatch(
     q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q,
     mu_basis, gvec_components, scratch_dir, print_fn,
     psi_nmu_parent=None, use_augmented_samples=False,
+    q0_potential=None, q0_response_metadata=None,
 ):
     """The μ-batch fit: Z^{μ_L}_q(G) of every channel by batches, C⁻¹ on the sphere.
 
@@ -340,6 +418,12 @@ def _fit_mubatch(
     ngkmax = int(sphere_idx.shape[1])
     kgrid = tuple(int(v) for v in meta.kgrid)
     vertices = tuple(int(ch.vertex) for ch in channels)
+    q0_response = q0_potential is not None
+    # The potential stays replicated during this fit. Raw scalar responses
+    # need only a few packed vectors, including owner-bin pads and finish scratch.
+    response_resident = (int(q0_potential.size)*8
+                         +int(q0_potential.shape[0])*16*8
+                         *(mu_pad+P_*int(plan.b))) if q0_response else 0
     # The fit window's LOGICAL bands: band_range_full is the P-padded transport
     # range, whose tail past the user's last band is an exact-zero pad on the
     # faces (PsiGStore zeroes it the same way); route G reads the file, so it
@@ -471,6 +555,8 @@ def _fit_mubatch(
         if use_augmented_samples:
             args += (sample_batch(psi_nmu_parent,
                                   _device_put_process_local(slots, rep)),)
+        if q0_response:
+            args += (q0_potential,)
         return args
 
     builds = {}
@@ -482,12 +568,13 @@ def _fit_mubatch(
         n_blk = n_blk_ if n_blk is None else int(n_blk)
         kern_args = dict(
             mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=int(mb.b),
-            q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
+            q_sel=(np.arange(nk) if q0_response and q_irr_full_idx is None
+                   else q_irr_full_idx), q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
             plane_from_col=plane_from_col, n_pg=int(plan.r_sub),
             axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk,
             n_pc=int(plan.p_chunk(int(mb.b))), vertex_terms=vertex_terms,
-            use_augmented_samples=bool(use_augmented_samples))
+            use_augmented_samples=bool(use_augmented_samples), q0_response=q0_response)
         kernel = zmb.make_route_g_kernel(**kern_args)
         with timing.section("zeta_fit.mubatch.compile"):
             compiled = kernel.lower(*launch_args(0, mb)).compile()
@@ -512,7 +599,7 @@ def _fit_mubatch(
         check = check_chunk(
             c_plan, build=build, stage="zeta route-G mu batch", minimum=c_min,
             fixed=at(c_plan) - c_plan * slope - ws0, per_unit=slope,
-            room=plan.target_bytes - ws0,
+            room=plan.target_bytes - ws0 - response_resident,
             extra=lambda c, compiled: int(compiled.memory_analysis().output_size_in_bytes))
     # check_chunk compares the largest figure any rank read, so every rank
     # built and returns the same chunk.
@@ -527,7 +614,7 @@ def _fit_mubatch(
         n_blk, n_grp, compiled=batch_executable,
         # the fewest blocks ≥ v holding fewer plane groups each (the kernel's ceil(n_grp / n_blk))
         snap=lambda v: v if v < 2 else -(-n_grp // (-(-n_grp // (v - 1)) - 1)),
-        build=lambda n: build(agreed, n_blk=n), room=plan.target_bytes - ws0,
+        build=lambda n: build(agreed, n_blk=n), room=plan.target_bytes - ws0 - response_resident,
         figure=lambda ex: compiled_new_bytes(
             ex, extra=int(ex.memory_analysis().output_size_in_bytes)),
         stage="zeta route-G mu batch, plane blocks")
@@ -536,12 +623,16 @@ def _fit_mubatch(
         n_blk, kernel = n_run, zmb.make_route_g_kernel(**kern_args)
     builds.clear()
     b = int(mb.b)
+    if q0_response:
+        scalar_bytes = int(mb.n_batch)*b*int(q0_potential.shape[0])*16
+        if scalar_bytes*4 + int(q0_potential.size)*8 > response_resident:
+            raise ValueError('q0 response owner-bin padding exceeds its reserved resident bound')
     print_fn(f"  μ-batch executable: new bytes/rank analytic {check.analytic / 1e9:.2f} GB, "
              f"compiled {check.compiled_bytes / 1e9:.2f} GB (read in {check.seconds:.3f} s)"
              f"{' (recompiled at ' + str(agreed) + ' rows per owner)' if agreed != c_plan else ''}")
     del check
     split_kernels = {}
-    if debug_print_enabled():
+    if debug_print_enabled() and not q0_response:
         # Debug split timers: the same kernel truncated after each stage.
         for stage in ('source', 'planes', 'kconv'):
             split_kernels[stage] = zmb.make_route_g_kernel(**kern_args, stop_at=stage)
@@ -576,6 +667,7 @@ def _fit_mubatch(
     t_batch = 0.0
     n_run = 0
     n_go = n_batch if _max_n is None else min(n_batch, _max_n)
+    response_batches = [] if q0_response else None
 
     def launch(beta):
         """Dispatch batch β (asynchronous); the caller writes it later."""
@@ -598,6 +690,9 @@ def _fit_mubatch(
             t0 = time.perf_counter()
             rows = pending
             pending = launch(beta + 1) if beta + 1 < n_go else None
+            if q0_response:
+                rows, response = rows
+                response_batches.append(response)
             for store, r in zip(stores, rows):
                 store.write_batch(beta, r)
                 if len(stores) > 1:
@@ -636,6 +731,16 @@ def _fit_mubatch(
 
     # ---- ζ = C⁻¹ Z, held lazily; written only for a file consumer --------
     zetas = {}
+    raw_response = None
+    if q0_response:
+        if n_run != n_batch:
+            raise ValueError('Hartree q0 response cannot consume a partial charge fit')
+        batch_spec = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+        batched = jax.jit(lambda *r: jnp.stack(r), out_shardings=batch_spec)(*response_batches)
+        raw_response = zmb.q0_response_from_batches(
+            mesh_xy, batched, q_axis=q_axis,
+            q0_slot=int(q0_response_metadata['q0_slot']),
+            packed_from_slot=mb.slot_of_packed)
     for ch, store in zip(channels, stores):
         zeta_g = zmb.ZetaG(
             store, mesh=mesh_xy, L_q=ch.L_q, lu_piv=ch.lu_piv,
@@ -644,6 +749,12 @@ def _fit_mubatch(
             n_rmu_solve=n_rmu_solve, n_rmu=int(meta.n_rmu), mu_basis=mu_basis,
             ngk_per_q=ngk_per_q, gvec_components=gvec_components,
             path=ch.output_file, print_fn=print_fn)
+        if q0_response:
+            zeta_g.q0_response_rhs = raw_response
+            zeta_g.q0_response_metadata = dict(q0_response_metadata, complete=True)
+            zeta_g.fit_vertex_mu_L = 0
+            zeta_g.fit_q_full_indices = np.asarray(q0_response_metadata['q_full_indices'], np.int32)
+            zeta_g.fit_centroid_geometry = dict(q0_response_metadata['centroid_geometry'])
         if ch.write:
             # ONE ζ file open at a time: the SlabIO writer is asynchronous
             # and its writes are collective MPI-IO, so two handles with
@@ -704,6 +815,9 @@ def fit_zeta_to_h5(
     use_augmented_samples: bool = False,
     charge_factor_equilibration: str | None = None,
     charge_fit_weights=None,
+    current_augmentation=None,
+    q0_potential=None,
+    q0_potential_metadata=None,
     print_fn=print,
 ):
     """Fit canonical q-IBZ ζ for each channel of ``output_files`` on route G.
@@ -722,6 +836,16 @@ def fit_zeta_to_h5(
     exists. Its header stays incomplete and the returned ZetaG carries
     ``pending_zeta_write``; the V owner writes physical s+delta in the same
     contraction pass and completes the file only after its collective close.
+
+    ``current_augmentation`` is an internal complete-family prepared operand.
+    It requires its exact protected source/faces and fits all three OWN current
+    factors with unit endpoint loss. Until the physical group writer is proven,
+    this seam requires ``write_zeta_file=False`` and does not enable GW currents.
+
+    ``q0_potential`` is an optional internal physical Hartree functional on
+    the canonical full FFT grid. It retains a tiny raw smooth response on
+    the charge ZetaG, separate from V; local scalar responses are added by
+    ``finalize_charge_q0_response`` before the same charge factor is applied.
     """
     if k_unfold_plan is None or psi_nmu_parent is None or psi_mun_parent is None:
         raise ValueError("fit_zeta_to_h5 requires a typed plan and both raw-parent faces.")
@@ -740,13 +864,41 @@ def fit_zeta_to_h5(
             f"fit_zeta_to_h5: channels {vertices} must be (0,) (charge) or a "
             "subset of the current channels (1, 2, 3).")
     transverse = vertices != (0,)
+    if q0_potential is not None:
+        if (transverse or active_zeta_truncating_knobs() or not use_augmented_samples
+                or not isinstance(q0_potential_metadata,dict)
+                or 'source_binding' not in q0_potential_metadata):
+            raise ValueError('q0 response requires a complete charge fit')
+    elif q0_potential_metadata is not None:
+        raise ValueError('q0 potential metadata requires its physical potential')
+    if current_augmentation is not None:
+        if (not isinstance(current_augmentation,dict)
+                or vertices!=(1,2,3) or not use_augmented_samples or write_zeta_file
+                or charge_fit_weights is not None
+                or current_augmentation.get('meta') is not meta
+                or current_augmentation.get('plan') is not k_unfold_plan
+                or current_augmentation.get('parent_psi') is not parent_psi
+                or current_augmentation.get('parent_faces',(None,None))[0] is not psi_nmu_parent
+                or current_augmentation.get('parent_faces',(None,None))[1] is not psi_mun_parent
+                or current_augmentation.get('unit_endpoint_loss') is not True
+                or current_augmentation.get('source_frame_policy')!='same_actual_served_four_spinor_full_WFN_Lowdin'
+                or current_augmentation.get('shared_physical_bands')!=int(wfn.nbands)):
+            raise ValueError('current augmentation requires complete no-file OWN3 fits on its protected typed source/faces')
+        if parent_psi.psi_G.is_deleted():
+            raise ValueError('current augmentation source was donated by the preceding charge fit')
+        rows=current_augmentation['current_basis_rows']
+        if ((rows is None)!=(current_basis_rows is None)
+                or rows is not None and not np.array_equal(rows,current_basis_rows)):
+            raise ValueError('current augmentation basis differs from the canonical fitting basis')
+    elif transverse and use_augmented_samples:
+        raise ValueError('augmented current fitting requires its complete prepared current operand')
     _validate_deferred_zeta_write(
         defer=defer_zeta_write, write_file=write_zeta_file,
         augmented=use_augmented_samples, vertices=vertices)
     coordinate_kind = getattr(k_unfold_plan,'coordinate_kind','fft_indices')
     if coordinate_kind not in ('fft_indices','fractional'):
         raise ValueError("unknown centroid coordinate kind in typed fitting plan")
-    if coordinate_kind == 'fractional' and (not use_augmented_samples or transverse):
+    if coordinate_kind == 'fractional' and (not use_augmented_samples or transverse and current_augmentation is None):
         raise ValueError("fractional fitting currently requires augmented charge samples")
     if charge_factor_equilibration not in (None,'unit_diagonal'):
         raise ValueError("unknown charge factor equilibration convention")
@@ -773,6 +925,10 @@ def fit_zeta_to_h5(
         band_range_left = (meta.b_id_0, meta.b_id_3)
     if band_range_right is None:
         band_range_right = (meta.b_id_0, meta.b_id_4)
+    if current_augmentation is not None and (
+            tuple(band_range_left)!=current_augmentation['band_range_left']
+            or tuple(band_range_right)!=current_augmentation['band_range_right']):
+        raise ValueError('current augmentation band windows differ from the shared unit-loss RHS')
 
     # The production fit uses asymmetric serving windows: L (the bra leg)
     # holds all occupied states plus the Sigma conduction window, R (the ket
@@ -862,6 +1018,23 @@ def fit_zeta_to_h5(
         q_irr_frac = bgw_integer_q_to_fractional(sym.kvecs_asints, meta.kgrid)
         print_fn(f"  q axis on disk: full BZ ({nq} q-points) "
                  f"(write_ibz_only=False or closure check failed)")
+    if q0_potential is not None:
+        q0_potential, q0_potential_metadata = _prepare_charge_q0_response(
+            q0_potential, q0_potential_metadata, mesh=mesh_xy, meta=meta,
+            q_full_indices=(np.arange(nq) if q_irr_full_idx is None else q_irr_full_idx),
+            q_frac=q_irr_frac, typed_plan=k_unfold_plan,centroid_indices=centroid_indices)
+    if current_augmentation is not None:
+        actual_q=np.arange(nq) if q_irr_full_idx is None else np.asarray(q_irr_full_idx)
+        if not np.array_equal(actual_q,current_augmentation['q_full_indices']):
+            raise ValueError('current augmentation canonical q rows differ from the current fit')
+        from common.gpu_utils import device_budget_bytes,warn_over_budget
+        price=(float(mubatch_plan.hwm_bytes)
+               +float(current_augmentation['fit_resident_extra_bytes_per_rank']))
+        budget=float(device_budget_bytes())
+        if price>budget:
+            warn_over_budget('isdf.current_augmentation_fit',price,budget)
+            raise ValueError('current augmentation fit exceeds its shared-resident device memory budget')
+        current_augmentation['phase_prices']['fit']=price
     if zeta_cutoff_ry is None or int(meta.sys_dim) == 0:
         raise ValueError(
             "G-flat ζ writer requires a ζ sphere — pass zeta_cutoff_ry to "
@@ -1059,7 +1232,8 @@ def fit_zeta_to_h5(
         mu_basis=mu_basis, gvec_components=_gflat_gvec_components,
         scratch_dir=os.path.dirname(os.path.abspath(output_files[vertices[0]])),
         print_fn=print_fn, psi_nmu_parent=psi_nmu_parent,
-        use_augmented_samples=bool(use_augmented_samples))
+        use_augmented_samples=bool(use_augmented_samples),
+        q0_potential=q0_potential, q0_response_metadata=q0_potential_metadata)
     # ``isdf_header/zeta_is_done`` is the file's own claim that the writer
     # finished; a truncating knob (gw_config.ZETA_TRUNCATING_ENV_KNOBS) leaves
     # it False so no restart or reuse path trusts a PARTIAL ζ.
@@ -1069,6 +1243,11 @@ def fit_zeta_to_h5(
                  f"({n_run} of {n_total} μ batches); ζ is PARTIAL"
                  + (" and its files are NOT marked complete." if _write_file else "."))
     _finish_zeta_fit_files(zetas, channels, defer=defer_zeta_write, trunc=_trunc)
+    if current_augmentation is not None:
+        for v,zeta in zetas.items():
+            zeta.fit_vertex_mu_L=v
+            zeta.fit_augmentation_identity=current_augmentation['identity']
+            zeta.fit_q_full_indices=np.asarray(actual_q,dtype=np.int32)
     _track_peak_mb = 0
     try:
         _st = jax.local_devices()[0].memory_stats() or {}

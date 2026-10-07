@@ -18,6 +18,155 @@ ARRAY_KEYS = frozenset(("radius", "ell", "kappa", "large_R", "dlarge_R_dr",
                         "small_R", "dsmall_R_dr", "field_model", "taper_start",
                         "support_radius", "half_alpha"))
 RADIAL_KEYS = ("large_R", "dlarge_R_dr", "small_R", "dsmall_R_dr")
+NATIVE_PAULI_TARGET = "native_large_as_pauli"
+AE_LARGE_TARGET = "ae_large_preserved_free_graph"
+_TARGET_KEYS = frozenset(("nuclear_charge", "matched_dirac_file", "matched_dirac_sha256",
+    "pseudo_exterior_file", "pseudo_exterior_sha256", "source_upf_file", "source_upf_sha256",
+    "dirac_window_start", "dirac_window_stop", "completion_start", "completion_stop"))
+
+
+def _sha256_file(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _target_entry(data, control):
+    """Resolve an explicit target by its authenticated pseudopotential source.
+
+    Paths are absolute preparation inputs, not search hints. A target does
+    not replace the original PS table or its dual; it selects the offline
+    physical-field constructor. The legacy name 'free_graph' denotes the
+    normalized RKB graph, not exact free-Dirac spectral decoupling.
+    """
+    target = control.get("target")
+    if target is None:
+        return None
+    if (not isinstance(target, dict) or set(target) != {"kind", "species"}
+            or target["kind"] != AE_LARGE_TARGET or not isinstance(target["species"], dict)
+            or not target["species"]):
+        raise ValueError("unknown or incomplete normalized-cache target descriptor")
+    for source, entry in target["species"].items():
+        if (not isinstance(source, str) or len(source) != 64
+                or any(c not in "0123456789abcdef" for c in source)
+                or not isinstance(entry, dict) or set(entry) != _TARGET_KEYS
+                or entry["source_upf_sha256"] != source):
+            raise ValueError("target species requires a closed descriptor keyed by source UPF SHA256")
+        for stem in ("matched_dirac", "pseudo_exterior", "source_upf"):
+            path, sha = entry[stem + "_file"], entry[stem + "_sha256"]
+            if (not isinstance(path, str) or not Path(path).is_absolute()
+                    or not isinstance(sha, str) or len(sha) != 64
+                    or any(c not in "0123456789abcdef" for c in sha)):
+                raise ValueError("target primitive requires an absolute file and explicit SHA256")
+        z = entry["nuclear_charge"]
+        radii = [entry[key] for key in ("dirac_window_start", "dirac_window_stop",
+                                       "completion_start", "completion_stop")]
+        if (isinstance(z, bool) or not isinstance(z, int) or z <= 0
+                or not np.isfinite(radii).all()
+                or not 0 < radii[0] < radii[1] <= radii[2] < radii[3]):
+            raise ValueError("target nuclear charge/window/completion controls are invalid")
+    source = data["metadata"]["source_sha256"]
+    if source not in target["species"]:
+        raise ValueError("target descriptor does not cover the authenticated atomic source")
+    return target["species"][source]
+
+
+def _target_inputs(data, control, support_radius):
+    """Authenticate the paired P/Q, exterior PS and unchanged original PCA."""
+    from psp.atomic_reconstruction import load_atomic_reconstruction, upf_identity
+    import xml.etree.ElementTree as ET
+
+    entry = _target_entry(data, control)
+    if entry is None:
+        return None
+    for stem in ("matched_dirac", "pseudo_exterior", "source_upf"):
+        if _sha256_file(entry[stem + "_file"]) != entry[stem + "_sha256"]:
+            raise ValueError("target primitive file SHA256 mismatch: " + stem)
+    source = upf_identity(entry["source_upf_file"])
+    if source["atomic_number"] != entry["nuclear_charge"]:
+        raise ValueError("target nuclear charge differs from authenticated UPF")
+    root = ET.parse(entry["source_upf_file"]).getroot()
+    beta = root.find("PP_NONLOCAL")
+    cutoffs = [float(node.attrib["cutoff_radius"]) for node in (() if beta is None else beta)
+               if node.tag.startswith("PP_BETA") and "cutoff_radius" in node.attrib]
+    if not cutoffs or entry["dirac_window_start"] < max(cutoffs):
+        raise ValueError("target Dirac window would alter the declared UPF projector support")
+    radial_node = root.find("PP_MESH/PP_R")
+    if radial_node is None:
+        raise ValueError("target UPF lacks the projector radial mesh")
+    radial = np.fromstring((radial_node.text or "").replace("D", "E"), sep=" ")
+    if not len(radial) or not np.isfinite(radial).all() or np.any(np.diff(radial) <= 0):
+        raise ValueError("target UPF projector radial mesh is invalid")
+    for node in beta:
+        if node.tag.startswith("PP_BETA"):
+            values = np.fromstring((node.text or "").replace("D", "E"), sep=" ")
+            if not len(values) or len(values) > len(radial) or not np.isfinite(values).all():
+                raise ValueError("target UPF projector radial payload is invalid")
+            live = np.flatnonzero(values)
+            if len(live) and entry["dirac_window_start"] < radial[live[-1]]:
+                raise ValueError("target Dirac window would alter actual nonzero UPF projector support")
+    paired = load_atomic_reconstruction(entry["matched_dirac_file"], entry["source_upf_file"])
+    if any(key not in paired or not np.array_equal(value, paired[key])
+           for key, value in data.items() if key != "metadata"):
+        raise ValueError("target paired P/Q changed original native fields, amplitudes or PCA coefficients")
+    qmeta = paired["metadata"].get("dev_matched_dirac_Q_OPF", {})
+    if (qmeta.get("schema") != "lorrax.dev.matched_dirac_q_opf.v1"
+            or qmeta.get("native_payload_sha256") != data["metadata"]["payload_sha256"]
+            or qmeta.get("source_UPF_sha256") != entry["source_upf_sha256"]):
+        raise ValueError("target matched P/Q lacks exact native-parent/source provenance")
+    with np.load(entry["pseudo_exterior_file"], allow_pickle=False) as archive:
+        exterior_meta = json.loads(str(archive["metadata_json"]))
+        exterior = {key: archive[key].copy() for key in archive.files if key != "metadata_json"}
+    if (exterior_meta.get("schema") != "lorrax.dev.native_ps_exterior.v1"
+            or exterior_meta.get("source_UPF_sha256") != entry["source_upf_sha256"]
+            or exterior_meta.get("native_payload_sha256") != data["metadata"]["payload_sha256"]
+            or exterior_meta.get("bank_sha256") != qmeta.get("raw_bank_sha256")):
+        raise ValueError("target PS exterior differs from the matched native source bank")
+    n, columns = len(data["r"]), len(data["l"])
+    er = exterior["r"]
+    if (er.dtype != np.float64 or er.ndim != 1 or not np.isfinite(er).all()
+            or np.any(er <= 0) or np.any(np.diff(er) <= 0)
+            or not np.array_equal(er[:n], data["r"])
+            or not np.array_equal(exterior["ell"], data["l"])
+            or not np.array_equal(exterior["kappa"], data["kappa"])):
+        raise ValueError("target exterior radial grid or angular labels differ")
+    for key in ("ps_u", "ps_du_dr"):
+        a = exterior[key]
+        if (a.shape != (len(er), columns) or not np.isfinite(a).all()
+                or not np.array_equal(a[:n], data[key])):
+            raise ValueError("target exterior changed native PS amplitudes or derivatives")
+    for key in ("ae_small_u", "ae_small_du_dr"):
+        if paired[key].shape != data["ps_u"].shape or not np.isfinite(paired[key]).all():
+            raise ValueError("target paired Q is not finite on the original OPF grid")
+    qchannels, pchannels = qmeta.get("channels", []), exterior_meta.get("channels", [])
+    if len(qchannels) != len(data["channel_nopf"]) or len(pchannels) != len(qchannels):
+        raise ValueError("target source PCA channel inventory differs")
+    for i, (l, k, rank) in enumerate(zip(data["channel_l"], data["channel_kappa"], data["channel_nopf"])):
+        coeff_sha = hashlib.sha256(np.ascontiguousarray(data[f"channel_{i}_coefficients"]).tobytes()).hexdigest()
+        q, p = qchannels[i], pchannels[i]
+        if ((q.get("l"), q.get("kappa"), q.get("rank")) != (int(l), int(k), int(rank))
+                or (p.get("ell"), p.get("kappa"), p.get("rank")) != (int(l), int(k), int(rank))
+                or q.get("PCA_coefficients_sha256") != coeff_sha
+                or p.get("coefficients_sha256") != coeff_sha):
+            raise ValueError("target source PCA coefficient or channel binding differs")
+        energies = paired[f"channel_{i}_training_energies_ps_ha"]
+        if (not np.isfinite(energies).all()
+                or energies.shape != (data[f"channel_{i}_coefficients"].shape[0],)
+                or not np.array_equal(energies, exterior[f"channel_{i}_training_energies"])):
+            raise ValueError("target paired/exterior training energies differ")
+    native = float(data["r"][-1])
+    if not (entry["dirac_window_stop"] == native <= entry["completion_start"]
+            < entry["completion_stop"] <= er[-1]
+            and native <= control["taper_start"] < support_radius < control["radius_max"]):
+        raise ValueError("target native window, virtual completion and compact support differ")
+    if entry["nuclear_charge"] / 137.036 >= np.min(np.abs(data["kappa"])):
+        raise ValueError("target point-nuclear radial exponent is not real")
+    import scipy
+    binding = dict(kind=AE_LARGE_TARGET, descriptor=entry, scipy_version=scipy.__version__,
+        matched_metadata_sha256=hashlib.sha256(_json_bytes(paired["metadata"])).hexdigest(),
+        exterior_metadata_sha256=hashlib.sha256(_json_bytes(exterior_meta)).hexdigest(),
+        graph="normalized_rkb_X=sigma.p/(2c); not exact free-Dirac spectral graph",
+        normalization="matched ONCV large-only amplitudes; original PS dual/PCA unchanged",
+        native_lower_role="diagnostic only; served lower is sigma-gradient of compact large")
+    return paired, exterior, entry, binding
 
 
 def _json_bytes(value):
@@ -75,7 +224,7 @@ def normalized_cache_binding(data, control, *, support_radius):
     controls = _controls(control, support_radius)
     if float(data["r"][-1]) > float(controls["taper_start"]):
         raise ValueError("compact taper would alter the authenticated native reconstruction sphere")
-    return {"schema": SCHEMA, "carrier": "normalized_rkb",
+    binding = {"schema": SCHEMA, "carrier": "normalized_rkb",
             "carrier_provenance": NORMALIZED_RKB_LIFT_PROVENANCE,
             "field_model": COMPACT_GRAPH_FIELD_MODEL,
             "pauli_precursor": "R^-1(w R delta_phi)",
@@ -87,6 +236,11 @@ def normalized_cache_binding(data, control, *, support_radius):
             "controls": controls, "support_radius": float(support_radius),
             "units": {"radius": "bohr", "momentum": "bohr^-1",
                       "radial_wavefunction": "bohr^-3/2", "radial_derivative": "bohr^-5/2"}}
+    inputs = _target_inputs(data, controls, support_radius)
+    binding["target_kind"] = NATIVE_PAULI_TARGET if inputs is None else AE_LARGE_TARGET
+    if inputs is not None:
+        binding["target"] = inputs[3]
+    return binding
 
 
 def _validate_arrays(cache, data, control, *, support_radius):
@@ -132,6 +286,11 @@ def build_normalized_cache(data, control, *, support_radius):
     control = _controls(control, support_radius)
     if float(data["r"][-1]) > float(control["taper_start"]):
         raise ValueError("atomic pre-lift reconstruction radius exceeds compact taper start")
+    inputs = _target_inputs(data, control, support_radius)
+    if inputs is not None:
+        cache = _build_ae_large_cache(*inputs[:3], control, support_radius)
+        _validate_arrays(cache, data, control, support_radius=support_radius)
+        return cache
     km, nk = float(control["momentum_max"]), int(control["momentum_points"])
     if control.get("momentum_quadrature", "midpoint") == "gauss_legendre":
         nodes, weights = roots_legendre(nk)
@@ -152,6 +311,127 @@ def build_normalized_cache(data, control, *, support_radius):
         taper_start=np.asarray(float(control['taper_start'])),
         support_radius=np.asarray(float(support_radius)), half_alpha=np.asarray(float(HALFALPHA)))
     _validate_arrays(cache, data, control, support_radius=support_radius)
+    return cache
+
+
+def _panels(radius, stop, breaks, order, momentum_max):
+    edges=np.asarray(radius)[np.asarray(radius)<stop]
+    for boundary in (stop,*breaks):
+        edges=edges[abs(edges-boundary)>8*np.spacing(abs(boundary))]
+    edges=np.unique(np.r_[0.,edges,stop,breaks])
+    resolved=[edges[0]]
+    for left,right in zip(edges[:-1],edges[1:]):
+        n=max(1,int(np.ceil(momentum_max*(right-left)/8)))
+        resolved.extend(np.linspace(left,right,n+1)[1:])
+    edges=np.asarray(resolved)
+    x,w=np.polynomial.legendre.leggauss(order)
+    half,mid=np.diff(edges)/2,(edges[1:]+edges[:-1])/2
+    return (mid[:,None]+half[:,None]*x).ravel(),(half[:,None]*w).ravel()
+
+
+def _radial_u(radius, u, du, query, exponent):
+    from scipy.interpolate import CubicHermiteSpline
+    r=np.asarray(radius);inside=query<r[0]
+    value=np.empty((len(query),u.shape[1]),complex)
+    value[~inside]=CubicHermiteSpline(r,u,du,axis=0,extrapolate=False)(query[~inside])
+    value[inside]=u[0][None]*(query[inside,None]/r[0])**exponent[None]
+    if not np.isfinite(value).all():
+        raise ValueError('target radial queries exceed the declared source continuation')
+    return value/query[:,None]
+
+
+def _momentum(control):
+    from scipy.special import roots_legendre
+    maximum,count=float(control['momentum_max']),int(control['momentum_points'])
+    if maximum<=0 or count<8 or count!=control['momentum_points']:
+        raise ValueError('invalid projected-target momentum controls')
+    if control.get('momentum_quadrature')=='gauss_legendre':
+        nodes,weights=roots_legendre(count)
+        return maximum*(nodes+1)/2,maximum*weights/2
+    if control.get('momentum_quadrature','midpoint')!='midpoint':
+        raise ValueError('unknown projected-target momentum quadrature')
+    return (np.arange(count)+.5)*maximum/count,np.full(count,maximum/count)
+
+
+def _inverse_pauli_spectrum(spectrum, ell, kappa, K, weights, radius):
+    from scipy.special import spherical_jn
+    from psp.augmentation_spinors import _lift_cartesian
+    pauli=np.zeros((len(ell),2,len(K)),complex);pauli[:,0]=spectrum.T
+    four=_lift_cartesian(pauli,np.column_stack((0*K,0*K,K)))
+    upper_spectrum,lower_spectrum=four[:,0].T,four[:,2].T
+    cache=dict(radius=radius,ell=ell.copy(),kappa=kappa.copy())
+    for name in ('large_R','dlarge_R_dr','small_R','dsmall_R_dr'):
+        cache[name]=np.empty((len(radius),len(ell)),complex)
+    kr=radius[:,None]*K
+    weight=(2/np.pi)*weights*K*K
+    for k in np.unique(kappa):
+        ids=np.flatnonzero(kappa==k);l=int(ell[ids[0]]);lb=2*abs(k)-1-l
+        a=weight[:,None]*upper_spectrum[:,ids]
+        b=-1j**(lb-l)*weight[:,None]*lower_spectrum[:,ids]
+        cache['large_R'][:,ids]=spherical_jn(l,kr)@a
+        cache['dlarge_R_dr'][:,ids]=spherical_jn(l,kr,derivative=True)@(K[:,None]*a)
+        cache['small_R'][:,ids]=spherical_jn(lb,kr)@b
+        cache['dsmall_R_dr'][:,ids]=spherical_jn(lb,kr,derivative=True)@(K[:,None]*b)
+    return cache
+
+
+def _build_ae_large_cache(data, pseudo_exterior, entry, control, support_radius):
+    """Preserve finite-K W(P_AE-L_PS,free) as large and derive free small.
+
+    Implicit Pauli correction is R_inverse DeltaL. Canonical U is applied
+    exactly once and its R cancels R_inverse; no pointwise normalization.
+    Native Dirac Q is a diagnostic, not an inserted kinetic-balance lower.
+
+    pseudo_exterior supplies r,ps_u,ps_du_dr,ell,kappa in the exact original
+    OPF order and amplitude. Its interior rows must be byte-identical. The
+    input bank's ONCV large-only matching convention is retained throughout.
+    """
+    from common.bispinor_init import HALFALPHA
+    from psp.augmentation_spinors import (build_normalized_radial_cache,
+        compact_graph_taper,radial_fourier_bessel,_lift_cartesian,COMPACT_GRAPH_FIELD_MODEL)
+    nuclear_charge = entry['nuclear_charge']
+    dirac_window_start, dirac_window_stop = entry['dirac_window_start'], entry['dirac_window_stop']
+    completion_start, completion_stop = entry['completion_start'], entry['completion_stop']
+    r=np.asarray(data['r']);l=np.asarray(data['l']);k=np.asarray(data['kappa'])
+    er=np.asarray(pseudo_exterior['r'])
+    if (not np.array_equal(er[:len(r)],r)
+            or not np.array_equal(pseudo_exterior['ps_u'][:len(r)],data['ps_u'])
+            or not np.array_equal(pseudo_exterior['ps_du_dr'][:len(r)],data['ps_du_dr'])
+            or not np.array_equal(pseudo_exterior['ell'],l)
+            or not np.array_equal(pseudo_exterior['kappa'],k)):
+        raise ValueError('pseudo completion changed the native interior, amplitude or OPF order')
+    if not (0<dirac_window_start<dirac_window_stop<=r[-1]
+            <=completion_start<completion_stop<=er[-1]
+            and r[-1]<=control['taper_start']<support_radius<=control['radius_max']):
+        raise ValueError('Dirac window, virtual completion and physical compact support are inconsistent')
+    K,wK=_momentum(control);order=int(control.get('source_quadrature_order',16))
+    if order<12:
+        raise ValueError('projected target requires resolved source quadrature')
+    qr,qw=_panels(er,completion_stop,(completion_start,),order,float(K[-1]))
+    pseudo=_radial_u(er,pseudo_exterior['ps_u'],pseudo_exterior['ps_du_dr'],qr,l+1)
+    virtual=compact_graph_taper(qr,completion_start,completion_stop)[0]
+    pseudo*=virtual[:,None]
+    dr,dw=_panels(r,dirac_window_stop,(dirac_window_start,),order,float(K[-1]))
+    # The declared virtual pseudo reference is unfolded once with canonical U.
+    ps4=build_normalized_radial_cache(pseudo,qr,qw,l,k,K,wK,dr)
+    gamma=np.sqrt(k*k-(float(nuclear_charge)/137.036)**2)
+    AE=_radial_u(r,data['ae_u'],data['ae_du_dr'],dr,gamma)
+    Q=_radial_u(r,data['ae_small_u'],data['ae_small_du_dr'],dr,gamma)
+    window=compact_graph_taper(dr,dirac_window_start,dirac_window_stop)[0]
+    raw_large=AE-ps4['large_R'];raw_small=1j*Q-ps4['small_R']
+    delta_large=window[:,None]*raw_large
+    delta_small=window[:,None]*raw_small
+    AL=radial_fourier_bessel(delta_large,dr,dw,l,K)
+    AQ=radial_fourier_bessel(-1j*delta_small,dr,dw,2*abs(k)-1-l,K)
+    unit=np.zeros((1,2,len(K)),complex);unit[0,0]=1.
+    R=_lift_cartesian(unit,np.column_stack((0*K,0*K,K)))[0,0].real
+    # Preserve large AL: canonical U(R_inverse AL) has large AL and
+    # lower sigma.p AL/(2c). AQ remains a native-Dirac diagnostic only.
+    pauli=AL/R[:,None]
+    cache=_inverse_pauli_spectrum(pauli,l,k,K,wK,_radius_grid(control))
+    cache.update(field_model=np.asarray(COMPACT_GRAPH_FIELD_MODEL),
+        taper_start=np.asarray(float(control['taper_start'])),support_radius=np.asarray(float(support_radius)),
+        half_alpha=np.asarray(float(HALFALPHA)))
     return cache
 
 

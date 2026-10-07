@@ -58,6 +58,18 @@ The generic uncut Hankel utility remains an operator control. A hard cutoff
 on separately interpolated upper/lower fields would add a derivative surface
 term and is not the production model.
 
+The explicit `ae_large_preserved_free_graph` target instead prepares the
+large field from a matched native Dirac large wave and the normalized free
+pseudo reference. Its declared native window gives
+\(\Delta L=W(P_{AE}/r-L_{PS,free})\). The finite-momentum preparation forms
+\(\Delta\chi=R^{-1}\Delta L\), so one canonical unfolding preserves
+\(\Delta L\) and gives \(\Delta S=X\Delta L\). The final compact field
+uses the same Hermite/taper derivative above. Native Dirac Q is retained as
+an atomic diagnostic; it is not independently inserted into the free graph.
+The native matching window, pseudo exterior completion, final compact taper
+and Coulomb compensation radius have separate meanings and identities.
+The [atomic-cache contract](../reference/augmentation_cache.md) binds them.
+
 The lift is isometric, \(U^\dagger U=I\), but reconstruction need not be. The
 explicit manifest mode `full_wfn_lowdin` measures the **actual served
 four-spinor** overlap on every available WFN band. With C the unrotated atomic
@@ -94,6 +106,48 @@ establish the total reconstructed Coulomb contribution to a band shift.
 Hartree uses its full FFT-grid Poisson operator with G=0 omitted, whereas the
 exchange fitting benchmark may use an explicit Fourier-body cutoff; these
 operator domains require separate comparisons.
+
+## Charge Hartree through the same ISDF factor
+
+The developing numerical seam `isdf.atomic_hartree` contracts reconstructed
+occupied sources and receiving vertices. It does not activate a public GW
+consumer. Physical source occupations \(f_{nk}\) and normalized full-zone
+weights define \(\rho=\sum_{nk}w_kf_{nk}\Psi_{nk}^\dagger\Psi_{nk}\);
+they are independent of the endpoint weights used in the fitting loss.
+Typed scalar point transport sums the occupation trace after spin and Bloch
+phases cancel. Source samples, smooth Fourier rows and exact local monopoles
+must use the same full-WFN factor and served-field identity.
+
+Let \(\eta^g_{ij}=(\Omega/N_{FFT})\Psi_i^\dagger\Psi_j\) denote the
+grid-normalized receiving pair. The existing charge normal equations fit
+\(\eta^g_{ij}(r)=\sum_\mu\eta^g_{ij}(r_\mu)\zeta_\mu(r)\). Thus
+
+\[
+J_{ij}=\sum_\mu\eta^g_{ij}(r_\mu)F_\mu,\qquad
+F=C_0^{+}H,
+\]
+
+where H contracts the **raw** smooth and local normal-equation RHSs with
+the physical Hartree source potential. There is no extra conjugation of
+\(\eta^g\). The smooth contribution is a full FFT-grid sum before the
+route-G transform, with no \(1/N_{FFT}\) factor. The local scalar dual
+acts on the provider's existing delta, PS and exact-Y00 columns, with the
+single \(N_{FFT}/\Omega\) conversion for their grid units. Smooth and
+local scalar RHSs are added before applying the existing charge factor,
+including its actual conditioning transformation. No new Gram or full-grid
+zeta artifact is needed.
+
+The compensated source uses ordinary periodic 3D Poisson on the full FFT
+grid with G=0 zero. Its local dual retains delta--delta minus
+compensation--compensation, both PS--neutral adjoints, coherent exact-M0
+enrichment and both periodic neutral-potential means. The source neutral
+mean shifts the smooth potential and exact receiving charge; the receiving
+neutral mean acts on the delta radial field. This matrix has no factor
+one-half. A receiving-functional identity alone does not establish actual
+Hartree ISDF accuracy: physical-source capture and matrix convergence must
+also be measured. An augmented direct field is not a complete AE
+Hamiltonian or quasiparticle prediction without consistent ionic, frozen-core
+and exchange-correlation reference treatment.
 
 At interpolation points define
 

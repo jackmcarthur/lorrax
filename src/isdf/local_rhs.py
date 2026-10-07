@@ -128,6 +128,8 @@ def local_density_rhs(*, centroid_faces, atom_ae_faces, atom_ps_faces,
         All sixteen four-spinor terms survive through the four Pauli-half
         pairs. Atomic compression and quadrature belong to the next stage.
         With ``return_smooth=True``, returns ``(delta_z, smooth_z)`` instead.
+        Every finite primitive contributes to both outputs after identical
+        LR+RL completion, q selection and complex weighting.
     """
     from isdf.core import (_c_q_dirac_quarters,
                            complete_ordered_pair_normal_equations)
@@ -149,11 +151,9 @@ def local_density_rhs(*, centroid_faces, atom_ae_faces, atom_ps_faces,
         raise ValueError("local_density_rhs: vertex terms must use Cartesian vertices 0..3")
     if any(not np.isfinite(w) for w, _, _ in terms):
         raise ValueError("local_density_rhs: vertex weights must be finite")
-    if return_smooth and terms != ((1.+0.j, 0, 0),):
-        raise ValueError("local_density_rhs: smooth retention requires the scalar charge vertex")
     gemm = _rhs_gemm(mesh_xy, npar, nb, ns, nmu, ae[-1])
     selected_q, completion_neg, output_rows = _selected_q_layout(q_indices,kgrid,q_neg_idx)
-    total = None
+    total = smooth_total = None
     for weight, left_vertex, right_vertex in terms:
         def endpoint_rhs(right_nmu):
             return _c_q_dirac_quarters(
@@ -174,10 +174,14 @@ def local_density_rhs(*, centroid_faces, atom_ae_faces, atom_ps_faces,
         if weight != 1.0:
             piece = weight * piece
         total = piece if total is None else total + piece
+        if return_smooth:
+            if completion_neg is not None:
+                ps_rhs = complete_ordered_pair_normal_equations(ps_rhs, completion_neg)
+            if output_rows is not None:
+                ps_rhs = jnp.take(ps_rhs,jnp.asarray(output_rows),axis=0)
+            if weight != 1.0:
+                ps_rhs = weight * ps_rhs
+            smooth_total = ps_rhs if smooth_total is None else smooth_total + ps_rhs
     if return_smooth:
-        if completion_neg is not None:
-            ps_rhs = complete_ordered_pair_normal_equations(ps_rhs, completion_neg)
-        if output_rows is not None:
-            ps_rhs = jnp.take(ps_rhs,jnp.asarray(output_rows),axis=0)
-        return total, ps_rhs
+        return total, smooth_total
     return total

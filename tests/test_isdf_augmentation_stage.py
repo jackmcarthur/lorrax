@@ -37,7 +37,8 @@ def _blocked_point_sample_reference(mesh,pc,bc,npoint,g_block,fft_points):
 
 
 def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_chunk=4, onsite_cross=False,
-                             supplied_artifact=False, prepared_projection=False, occupied_weight=1.):
+                             supplied_artifact=False, prepared_projection=False, occupied_weight=1.,
+                             prepare_current=False, current_same_points=False):
     from types import SimpleNamespace
     import numpy as np
     import jax
@@ -79,6 +80,8 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
                         jnp.asarray(reciprocal),representation='normalized_rkb'))
     if prepared_projection and not overlap:
         raise ValueError('prepared projections require the complete overlap fixture')
+    if prepare_current and not overlap:
+        raise ValueError('current preparation requires the complete physical overlap fixture')
     mu_indices = np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1],
                            [7,0,0],[0,7,0],[0,0,7],[1,1,1]],np.int32)
     spin = np.eye(4,dtype=np.complex128)
@@ -94,6 +97,28 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     centroid_coordinates = mu_coordinates if fractional else mu_indices
     plan = build_centroid_k_unfold_plan(sym,centroid_coordinates,grid,mesh,nspinor=4,parent_k_frac=kfrac,
         coordinate_kind='fractional' if fractional else 'fft_indices')
+    current_argument = {}
+    current_coordinates = current_plan = current_rows = None
+    if prepare_current:
+        from common.centroid_basis import PackedCentroidBasis
+        from symmetry_maps import select_current_basis
+        # The physical identity group selects circular rows. The fixture
+        # exercises all four mixed primitives, not three Cartesian stand-ins.
+        sym.sym_idx_q = np.zeros(npar,np.int32)
+        sym.cartesian_action = lambda rows,**kwargs: np.tile(np.eye(3)[None],(len(rows),1,1))
+        sym.operation_rows = lambda rows: (rows,np.zeros(len(rows),int),np.zeros(len(rows),bool))
+        _,current_rows = select_current_basis(sym)
+        current_coordinates = (mu_coordinates.copy() if current_same_points else
+            np.vstack((mu_coordinates+np.array([.019,-.011,.023]),[.217,.139,-.061])))
+        current_basis = PackedCentroidBasis.build(current_coordinates,sym,grid,mesh,coordinate_kind='fractional')
+        if current_same_points:
+            # Equal coordinates alone do not imply equal packed transport.
+            # The lifecycle case deliberately shares the authoritative layout
+            # so it exercises copying the SAME charge/current face buffers.
+            plan = build_centroid_k_unfold_plan(sym,centroid_coordinates,grid,mesh,nspinor=4,
+                parent_k_frac=kfrac,coordinate_kind='fractional',layout=current_basis.layout)
+        current_plan = build_centroid_k_unfold_plan(sym,current_coordinates,grid,mesh,nspinor=4,
+            parent_k_frac=kfrac,coordinate_kind='fractional',layout=current_basis.layout)
     radius = np.geomspace(1e-5,.7,65)
     dr = log_radial_weights(radius)
     ps_R = np.exp(-2*radius)[:,None]
@@ -106,6 +131,10 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
         cache=dict(momentum_max=60.,momentum_points=512,radius_max=2.,radius_points=512,
                    taper_start=.7,tail_relative_tolerance=1.),
         runtime=dict(parent_chunk=1,band_chunk=band_chunk,radial_packet=2,g_block=3))
+    if prepare_current:
+        # nf=1*9*1=9, padded to10 overY. Logical feature slicing at storage
+        # is necessary: the transport ghost is not an extra radial sample.
+        artifact['runtime']['radial_packet'] = 1
     fitting_bands = 4 if overlap else logical_bands
     if overlap:
         artifact['overlap'] = dict(mode='full_wfn_lowdin',bands=logical_bands)
@@ -131,6 +160,27 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     wfn = SimpleNamespace(alat=1.,avec=lattice,blat=1.,bvec=reciprocal,
                           atom_crys=center,atom_types=np.array([47]),gvecs=lambda k: gv,
                           ngk_valid=lambda k: np.full(npar,valid_g),nbands=logical_bands)
+    if prepare_current:
+        meta.current_basis_rows = current_rows
+        wfn.fft_grid,wfn.kgrid,wfn.cell_volume,wfn.symmetry = grid,kgrid,meta.cell_volume,lambda: sym
+        current_meta = SimpleNamespace(**vars(meta))
+        current_meta.mu_basis = current_basis
+        request = dict(meta=current_meta,plan=current_plan,centroid_indices=current_coordinates,
+            band_range_left=(0,2),band_range_right=(1,fitting_bands),current_basis_rows=current_rows,
+            q_full_indices=np.array([2,0],np.int32))
+        current_argument['current_request'] = request
+        import pytest
+        validate = lambda r: aug._current_augmentation_request(r,wfn=wfn,meta=meta,plan=plan,sym=sym,
+                                                              public_range=(0,logical_bands))
+        with pytest.raises(ValueError,match='canonical physical-group selection'):
+            validate(dict(request,current_basis_rows=np.eye(3)))
+        with pytest.raises(ValueError,match='current_public_band_coverage'):
+            validate(dict(request,band_range_right=(1,logical_bands+1)))
+        changed_meta = SimpleNamespace(**vars(current_meta));changed_meta.cell_volume *= 1.01
+        with pytest.raises(ValueError,match='cell_volume differs'):
+            validate(dict(request,meta=changed_meta))
+        with pytest.raises(ValueError,match='authoritative typed T basis'):
+            validate(dict(request,centroid_indices=current_coordinates+.001))
     cfg = SimpleNamespace(paths=SimpleNamespace(atomic_reconstruction_dir='planted'))
     put = lambda a,s: device_put_process_local(np.asarray(a),NamedSharding(mesh,s))
     smooth_mu = np.einsum('pnsg,pgm->pnsm',source,
@@ -226,13 +276,59 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
         def reject_live_projection(*args,**kwargs):
             raise AssertionError('authenticated prepared C must not rebuild the Fourier projection')
         aug._atomic_fourier_table = reject_live_projection
+    packet_refs=[]
+    if prepare_current:
+        import weakref
+        from isdf import local_rhs as rhs_owner
+        original_rhs,original_phase=rhs_owner.local_density_rhs,aug._point_phase_kernel
+        def observe_rhs(**kwargs):
+            for key in ('atom_ae_faces','atom_ps_faces'):
+                packet_refs.extend(weakref.ref(v) for v in kwargs[key])
+            result=original_rhs(**kwargs)
+            packet_refs.extend(weakref.ref(v) for v in (result if isinstance(result,tuple) else (result,)))
+            return result
+        def observe_phase(mesh):
+            kernel=original_phase(mesh)
+            def evaluate(*args):
+                value=kernel(*args);packet_refs.append(weakref.ref(value));return value
+            return evaluate
+        rhs_owner.local_density_rhs=observe_rhs;aug._point_phase_kernel=observe_phase
     try:
-        faces,state = aug.prepare_augmentation(wfn=wfn,sym=sym,meta=meta,cfg=cfg,mesh_xy=mesh,
-            plan=plan,centroid_indices=centroid_coordinates,parent_psi=parent_psi,
-            parent_faces=None if fractional else parent_faces,
-            band_range_left=(0,2),band_range_right=(1,fitting_bands),write_ibz_only=False,
-            public_band_range=(0,logical_bands),charge_fit_weights=weight_policy,**artifact_argument)
+        try:
+            faces,state = aug.prepare_augmentation(wfn=wfn,sym=sym,meta=meta,cfg=cfg,mesh_xy=mesh,
+                plan=plan,centroid_indices=centroid_coordinates,parent_psi=parent_psi,
+                parent_faces=None if fractional else parent_faces,
+                band_range_left=(0,2),band_range_right=(1,fitting_bands),write_ibz_only=False,
+                public_band_range=(0,logical_bands),charge_fit_weights=weight_policy,
+                **artifact_argument,**current_argument)
+        finally:
+            if prepare_current:
+                rhs_owner.local_density_rhs=original_rhs;aug._point_phase_kernel=original_phase
         assert read_count == (0 if supplied_artifact else 1)
+        if prepare_current:
+            import gc
+            gc.collect()
+            assert packet_refs
+            assert all(ref() is None or ref().is_deleted() for ref in packet_refs), \
+                'packet endpoints, rectangular RHS or phase arrays escaped preparation'
+            import pytest
+            from common import gpu_utils
+            current_price = state['current']['price']
+            test_budget = state['resident_estimate_bytes_per_rank']-.5*current_price
+            assert state['resident_estimate_bytes_per_rank']-current_price < test_budget
+            old_budget,old_warn = gpu_utils.device_budget_bytes,gpu_utils.warn_over_budget
+            gpu_utils.device_budget_bytes = lambda: test_budget
+            gpu_utils.warn_over_budget = lambda *args: None
+            try:
+                with pytest.raises(ValueError,match='augmentation manifest requires'):
+                    aug.prepare_augmentation(wfn=wfn,sym=sym,meta=meta,cfg=cfg,mesh_xy=mesh,
+                        plan=plan,centroid_indices=centroid_coordinates,parent_psi=parent_psi,
+                        parent_faces=None if fractional else parent_faces,band_range_left=(0,2),
+                        band_range_right=(1,fitting_bands),write_ibz_only=False,
+                        public_band_range=(0,logical_bands),charge_fit_weights=weight_policy,
+                        **artifact_argument,**current_argument)
+            finally:
+                gpu_utils.device_budget_bytes,gpu_utils.warn_over_budget = old_budget,old_warn
         if overlap:
             import pytest
             assert state['prepared_served_overlap_host_bytes_per_process'] == served_D[:,:logical_bands].nbytes
@@ -374,6 +470,69 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     rhs_error = float(np.linalg.norm(got_rhs[:3]-expected_rhs)/np.linalg.norm(expected_rhs))
     assert rhs_error < 3e-12,rhs_error
     assert np.max(abs(got_rhs[3])) == 0.
+    current_receipt = None
+    if prepare_current:
+        from common.gamma_matrices import _gamma_tables
+        current = state['current']
+        _,t_ae = reconstruct(current_coordinates)
+        expected_t = current_plan.layout.axis.pack_host(t_ae,axis=3,fill_value=0.)
+        actual_t = np.asarray(gather_to_host(current['parent_faces'][0]))
+        t_error = float(np.linalg.norm(actual_t-expected_t)/np.linalg.norm(expected_t))
+        assert t_error < 2e-13,t_error
+        assert np.max(abs(actual_t[...,~current_plan.layout.axis.active_mask]),initial=0.) == 0.
+        assert current['overlap_receipt'] is state['overlap_receipt']
+        assert current['unit_endpoint_loss'] and current['shared_physical_bands']==logical_bands
+        errors=[]
+        for channel,row in enumerate(current_rows):
+            gamma=sum(row[i]*_gamma_tables[i+1] for i in range(3))
+            assert np.array_equal(gamma,gamma.conj()),'physical identity group selects real-entry circular vertices'
+            # Literal four-spinor band pairs, unit loss despite occupied4
+            # on the charge fit. No local_rhs/core kernel is used here.
+            delta=np.zeros((3,expected_t.shape[-1],len(points)),complex)
+            smooth_current=np.zeros_like(delta)
+            for q in range(3):
+                for k in range(3):
+                    for m in range(fitting_bands):
+                        for n in range(fitting_bands):
+                            multiplicity = int(m<2 and n>=1)+int(n<2 and m>=1)
+                            if not multiplicity:
+                                continue
+                            eta=np.einsum('su,st,tu->u',expected_t[k,m].conj(),gamma,expected_t[(k+q)%3,n])
+                            density=np.einsum('sr,st,tr->r',ae[k,m].conj(),gamma,ae[(k+q)%3,n])
+                            density_ps=np.einsum('sr,st,tr->r',ps[k,m].conj(),gamma,ps[(k+q)%3,n])
+                            delta[q] += multiplicity*eta.conj()[:,None]*(density-density_ps)[None]
+                            smooth_current[q] += multiplicity*eta.conj()[:,None]*density_ps[None]
+            for key,dense_current in (('rhs',delta),('smooth_rhs',smooth_current)):
+                projected=np.einsum('qmrp,hp->qmhr',
+                    dense_current.reshape(3,expected_t.shape[-1],len(radii),len(directions)),Y.conj()*weights)
+                projected=projected.reshape(3,expected_t.shape[-1],-1)[request['q_full_indices']]
+                got=np.asarray(gather_to_host(current[key][channel]))
+                error=float(np.linalg.norm(got[:2]-projected)/np.linalg.norm(projected))
+                assert error < 3e-12,(channel,key,error)
+                assert np.max(abs(got[2:])) == 0.
+                errors.append(dict(channel=channel+1,operand=key,relative_error=error))
+        single_plan=aug._packet_plan(plan,points[:len(directions)],None)
+        _,logical_features,padded_features=aug._compress_rhs_kernel(mesh,single_plan,1,len(lm),1,Y.conj()*weights)
+        assert padded_features>logical_features
+        current_receipt=dict(separate_T_sample_relative_error=t_error,paired_operands=errors,
+            logical_features=logical_features,padded_features=padded_features,
+            current_loss_unit_charge_weight=occupied_weight,one_shared_full_WFN_factor=True,
+            selected_q_and_feature_ghosts_zero=True,invalid_basis_source_points_and_windows_refused=True,
+            additional_current_resident_budget_refused=True,
+            current_resident_price=current['price'],current_workspace=current['workspace'])
+        current_receipt.update(packet_arrays_released_after_blocked_preparation=True,
+            packet_array_weakrefs_checked=len(packet_refs),phase_prices=current['phase_prices'])
+        held_G=np.asarray(gather_to_host(current['parent_psi'].psi_G)).copy()
+        held_faces=tuple(np.asarray(gather_to_host(a)).copy() for a in current['parent_faces'])
+        for donor in (*faces,state['parent_psi'].psi_G):
+            jax.jit(jnp.conj,donate_argnums=0,out_shardings=donor.sharding)(donor).block_until_ready()
+            assert donor.is_deleted()
+        assert np.array_equal(np.asarray(gather_to_host(current['parent_psi'].psi_G)),held_G)
+        assert all(np.array_equal(np.asarray(gather_to_host(a)),old)
+                   for a,old in zip(current['parent_faces'],held_faces))
+        assert current['same_point_faces_preserved']==current_same_points
+        current_receipt.update(charge_donation_preserves_current_bitwise=True,
+            same_point_faces=current_same_points,preserved_source_bytes=current['preserved_source_bytes_per_rank'])
     smooth_rhs_error = None
     if onsite_cross:
         dense_smooth += dense_smooth[q_negation_index(kgrid)].conj()
@@ -415,6 +574,7 @@ def check_augmentation_stage(runtime, *, overlap=False, fractional=False, band_c
     receipt['authenticated_artifact_reused_without_read'] = supplied_artifact
     receipt['prepared_full_window_projection_used_without_rebuild'] = prepared_projection
     receipt['occupied_endpoint_weight'] = occupied_weight
+    receipt['current_preparation'] = current_receipt
     if jax.process_index() == 0:
         print(json.dumps(receipt),flush=True)
         out = os.environ.get('AUGMENTATION_STAGE_REPORT')
