@@ -440,16 +440,19 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         # Each held tile is read, scored, and released before the next support.
         held_rows={name:[] for name in ('CC','TT','CT')}
         with timing.section('spole.sector.held', announce=True):
+            held_ids=[int(i) for i in recipe['held_ids']]
             for name,endpoint_pair,model in zip(held_rows,((0,0),(1,1),(0,1)),signed):
+                # Every held sample of the sector in one read (one open, one transfer).
                 with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
-                    for sample_id in recipe['held_ids']:
-                        sample_id=int(sample_id)
-                        held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
-                                               sample_span=(sample_id,sample_id+1),execution="face" if is_face(model[0]) else "local")
-                        errors=sector_held_errors(model,held,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
-                        held_rows[name].append(dict(sample_id=sample_id,
-                            Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
-                        del held
+                    held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,sample_ids=held_ids,
+                                           execution="face" if is_face(model[0]) else "local")
+                for j,sample_id in enumerate(held_ids):
+                    one={k:v[:,j:j+1] for k,v in held.items()}
+                    errors=sector_held_errors(model,one,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
+                    held_rows[name].append(dict(sample_id=sample_id,
+                        Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
+                    del one
+                del held
         treatment_receipt=None
         if treatment is not None:
             treatment_receipt=dict(
