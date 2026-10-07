@@ -904,8 +904,10 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     # The stage stacks of every parent sit beside the eigh stacks. A stage's run holds
     # its input stack and the stack it writes in place (face_reduce_decoupled): the
     # keep stage the paired members and the restricted pencil, the paired stage the
-    # restricted pencil and (Y, Y^H G_r Y). The eighs run beside the state panels and
-    # one boundary stack, and take their room from the ledger beside the larger.
+    # restricted pencil and (Y, Y^H G_r Y). Each eigh runs beside the (node, Q, O) state
+    # panels (the dW Q panels are released after the pencil) and its own boundary stack:
+    # H'_vv beside the paired members and its Hermitian copy, the Schur complement beside
+    # the restricted pencil, Y^H G_r Y beside (Y, Y^H G_r Y, O_r, the paired span).
     hvv=side//2
     c=int(face_ritz_carrier(mesh_xy,recipe['pole_budget']) or hvv)
     two=2*c
@@ -913,20 +915,21 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     members=16*(6*hvv*hvv+2*packed*hvv)
     restricted=16*(2*two**2+2*c*c+hvv*c+packed*two)
     per_rank=lambda bytes_per_parent:-(-int(bytes_per_parent)*int(nq)//int(mesh_xy.size))
-    panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:])
-    panels+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
+    held=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:3])
+    held+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
+    panels=held+sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[3:])
+    ritz=16*(2*two**2+hvv*c+packed*two)
     stacks=per_rank(max(members+restricted,restricted+16*2*two**2))
     row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=stacks+panels,
                        workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)
     ambient=ledger.live_stages
     ledger.live_stages=(*ambient,row['stage'])
-    # (the H'_vv eigh reads its Hermitian part, one more [hvv, hvv] stack beside the members)
-    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members+16*hvv*hvv,restricted))+panels,
-                          workspace_bytes_per_rank=0,concurrent_with=ambient)
-    room=face_eigh_room(beside)
+    rooms=tuple(face_eigh_room(ledger.preview(resident_bytes_per_rank=per_rank(boundary)+held,
+                                              workspace_bytes_per_rank=0,concurrent_with=ambient))
+                for boundary in (members+16*hvv*hvv,restricted,ritz))
     admitted=row['device_budget_status']=='PASS'
     receipt=dict(parents=int(nq),sub_batch=int(width),pencil_side=int(side),stacks_bytes_per_rank=int(stacks),
-                 panels_bytes_per_rank=int(panels),eigh_room_bytes_per_rank=room,admitted=bool(admitted))
+                 panels_bytes_per_rank=int(panels),eigh_room_bytes_per_rank=rooms,admitted=bool(admitted))
     if not admitted:
         import warnings
         warnings.warn(f"shared-pole {geometry['sector']}: the decoupled stacks of {int(nq)} parents "
@@ -937,7 +940,10 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget'])
     try:
         if admitted:
-            reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,eigh_plan=face_eigh(mesh_xy,side,room),
+            # Only the states list holds the dW Q panels now, so the reduction can release them.
+            budget.retained_panels=(*retained,*(a for s in states for a in s[1:3]),*infinity)
+            reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,
+                eigh_plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms),
                 width=int(width),ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
                 gram_keep=gram_keep,carrier=carrier)
         else:

@@ -102,9 +102,12 @@ def test_decoupled_face_matches_local():
                          ordered=True, odd_moments=True, keep_budget=budget, retain_span=True, gram_keep=gram_keep)
     fs, fi = place(NamedSharding(mesh, P(None, "x", "y")))
     for sub in (q, 2, 1):
-        dec = face_reduce_decoupled(fs, fi, tables, mesh=mesh, eigh_plan=_local_eigenplan(mesh, side), width=sub,
+        plan = _local_eigenplan(mesh, side)
+        held = list(fs)
+        dec = face_reduce_decoupled(held, fi, tables, mesh=mesh, eigh_plans=(plan, plan, plan), width=sub,
                                     ordered=True, odd_moments=True, keep_budget=budget, retain_span=True,
                                     gram_keep=gram_keep, carrier=face_ritz_carrier(mesh, budget))
+        assert all(len(s) == 3 for s in held)          # the dW Q panels were released
         ld, dd = (jax.tree.map(np.asarray, r[3][0]) for r in (local, dec))
         assert np.all(dd["paired_metric_inverse_root_residual_relative"] < 1e-12), sub
         assert np.array_equal(ld["paired_metric_inverse_root_iterations"],

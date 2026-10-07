@@ -238,9 +238,9 @@ def route_summary(mode, receipt):
     decoupled = receipt.get("decoupled")
     if decoupled is not None:
         price += (f"; decoupled: {decoupled['parents']} parents in sub-batches of {decoupled['sub_batch']}, "
-                  f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh room "
-                  + ("none, " if decoupled.get('eigh_room_bytes_per_rank') is None
-                     else f"{decoupled['eigh_room_bytes_per_rank'] / 1e9:.1f} GB/rank, ")
+                  f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh rooms (H'_vv, Schur, reduced) "
+                  + "/".join("none" if r is None else f"{r / 1e9:.1f}" for r in decoupled['eigh_room_bytes_per_rank'])
+                  + " GB/rank, "
                   + ("every eigh once over the stack" if decoupled['admitted']
                      else "stacks over budget: face rounds over the stacked panels")
                   + f", max |ZAZ-I|/sqrt(R) keep {decoupled['keep_residual']:.1e} paired {decoupled['paired_residual']:.1e}"
@@ -819,16 +819,20 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
                  for i, fn in enumerate((stage1, stage2, stage3, stage4))), passthrough
 
 
-def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, ordered, odd_moments,
+def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, ordered, odd_moments,
                           keep_budget, retain_span=False, gram_keep=None, carrier=None):
     """All ``nq`` parents' ordered reduction: stage programs over ``width`` parents at a
-    time, each eigh over the whole stack (``eigh_plan.batched``, route (c) when its
-    room allows). Returns what ``face_reduce_round`` returns, for every parent."""
+    time, each eigh over the whole stack. ``eigh_plans`` are the three stacks' plans
+    (H'_vv, Schur, reduced), each carrying the room beside its own boundary stack
+    (``face_eigh``), so distrib_la runs each one whole matrix per rank where that fits.
+    ``states`` is the caller's list: the derivative panels (dW Q) enter the pencil only,
+    so after the first stage each entry keeps (node, Q, O) and they are released before
+    the eighs. Returns what ``face_reduce_round`` returns, for every parent."""
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
     (stage1, stage2, stage3, stage4), passthrough = programs
-    eigh = eigh_plan.batched
+    hvv_eigh, schur_eigh, reduced_eigh = (plan.batched for plan in eigh_plans)
     cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
     inputs = (tables['points'], tables['order'], tables['active'],
               tuple(s[1] for s in states), tuple(s[2] for s in states), tuple(s[3] for s in states), tuple(infinity))
@@ -840,14 +844,17 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, o
         new = run(program, stage, *operands)
         return {**{k: stage[k] for k in passthrough[name]}, **new}
     stage = run(stage1, *inputs)
-    gamma, u = eigh(_hermitian_stack(mesh)(stage['h_vv']))
+    infinity = inputs[6]
+    del inputs
+    states[:] = [s[:3] for s in states]
+    gamma, u = hvv_eigh(_hermitian_stack(mesh)(stage['h_vv']))
     stage = advance('keep', stage2, stage, gamma, u)
     del gamma, u
-    gamma_r, u_r = eigh(stage['schur'])
+    gamma_r, u_r = schur_eigh(stage['schur'])
     stage = advance('paired', stage3, stage, gamma_r, u_r)
     del gamma_r, u_r
-    mu, rotation = eigh(stage['reduced'])
-    result = run(stage4, stage, mu, rotation, inputs[6])
+    mu, rotation = reduced_eigh(stage['reduced'])
+    result = run(stage4, stage, mu, rotation, infinity)
     del stage, mu, rotation
     model, signed, diagnostics = result[:3]
     output = model, signed, model[1:], diagnostics
