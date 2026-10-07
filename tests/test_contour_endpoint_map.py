@@ -102,14 +102,19 @@ def test_asymmetric_complex_map_full_dyson_slope_and_sigma_equivalence(mesh):
     w, u = np.linalg.eigh(V)
     H = (u * np.sqrt(np.maximum(w, 0.))) @ u.conj().T
     meta = SimpleNamespace(nk_tot=nk, nspin=1, nspinor_wfnfile=1)
-    dyson, _, _, _ = rb.response_algebra(meta, {"linalg": "distributed"}, mesh_xy=mesh, n=M, ordered=True)
+    from gw.w_isdf import _w_solve_pref_scalar
+    # The P1 literal fixture uses the canonical native program; distributed
+    # LU is separately priced on a genuine one-process-per-cell P4 mesh.
+    dyson, _, _, _ = rb._response_programs(mesh, M, "off", "auto",
+                                          _w_solve_pref_scalar(meta), True, None)
+    placed_root = dyson.place(face(H[None], mesh))
     solver = SphereScreening.__new__(SphereScreening)
     solver.mesh=mesh; solver.linalg="local"; solver.batched_route="auto"
     solver.axis=padded_axis(G, mesh, name="endpoint algebra plant")
     solver._V=face(v[None], mesh)
     pair = rng.normal(size=(1, 2, M)) + 1j*rng.normal(size=(1, 2, M)); pair[..., 1]=0.
     for i in range(len(sites)):
-        wc_mu, dw_mu = dyson.pair("face")(face(H[None], mesh), chi[i], dchi[i])
+        wc_mu, dw_mu = dyson.pair("face")(placed_root, chi[i], dchi[i])
         Wg, dw_g = solver.solve_pair(chi_g[i], ds_g[i])
         wc_g = Wg-face(v[None], mesh)
         lift = cd.lift_interaction_endpoints(wc_g, face(zeta, mesh), mesh=mesh, prefactor=1./volume)
