@@ -46,6 +46,29 @@ identities. No shared-pole recipe or default sampling law changes here.
 
 ## Why two kernels
 
+### Explicit finite-plane-wave reference tiles
+
+`gw.plane_wave_lehmann.OrderedLehmannPair` contracts one declared ordered
+density tile through the same pure Lehmann weight/slope owner as the
+centroid pair scan. Its raw coefficient-convolution vertices have shape
+`[b,k,a,G]` at `P(('x','y'),None,None,None)`; explicit `de`, `df` and boolean
+pair validity have `[b,k,a]` order. Both persistent transition faces and
+bounded contraction panels remain over the complete mesh. `n_k` declares
+the full physical normalization census, even for a one-k stream. The
+physical scale is spin/(cell volume × full k count), with no FFT-size factor.
+
+The value and optional derivative are one directed contribution, with the
+derivative taken in `s=z²`. `evaluate_gamma_pair` additionally reads the
+exact G-negated reverse of the same paired-k density; an unordered Γ stream
+must supply every pair once. Finite-q references must construct both actual
+ordered directions and call `evaluate` for each. `transition_vertices`
+uses canonical full-Bloch fields and the public phase owner, retains their
+integer reciprocal wrap, and checks the declared paired k/q relation. It
+does not infer a time-reversal relation, occupation support or native
+completeness. FD tails are retained unless an exact zero occupation
+difference makes the pair vanish. Metallic static/intraband heads and
+finite-q symmetry reconstruction remain separate owner contracts.
+
 The Kubo weight (f_a − f_b)/(ε_a − ε_b + z) couples two band indices through
 its denominator, so no choice of u_a and v_b factors it as u_a v_b, and no
 GEMM over one band index produces it. Its time representation does factor:
