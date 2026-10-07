@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — sphere-response endpoint movers retain their callable identities
+
+The opt-in complex-frequency `transport_sphere_response` now caches two
+JIT wrappers around the existing all-P endpoint-permutation owner. Typed
+source-slot maps remain runtime metadata, so changing a physical child
+does not create a fresh eager `shard_map` compile identity. All typed
+relation, phase, finite and exact-zero ghost checks and the unitary or
+same-z endpoint-transposed antiunitary equation are unchanged. No ordinary
+pair-convolution caller, calculation default or input deck changes.
+
 ## 2026-10-07 — stable analytic Fermi–Dirac surface weight for finite-H references
 
 The opt-in `gw.efermi.fd_negative_derivative` returns `-df/dE` in Ry^-1 at

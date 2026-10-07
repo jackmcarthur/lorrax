@@ -361,6 +361,7 @@ class SphereTransport:
 
 @lru_cache(maxsize=None)
 def _sphere_response_programs(mesh):
+    from common.staged_reshard import permute_sharded_axis
     face = NamedSharding(mesh, P(None, "x", "y"))
     replicated = NamedSharding(mesh, P())
 
@@ -379,8 +380,18 @@ def _sphere_response_programs(mesh):
                       NamedSharding(mesh, P(None, "y"))), out_shardings=face)
     place_phase = jax.jit(lambda left: (left, left.conj()), in_shardings=replicated,
         out_shardings=(NamedSharding(mesh, P(None, "x")), NamedSharding(mesh, P(None, "y"))))
+    # The existing all-P two-exchange permutation stays unchanged. Keep
+    # its traced callable identity stable across child rows and queries;
+    # actual typed source-slot maps remain runtime replicated metadata.
+    permute_left = jax.jit(lambda value, source:
+        permute_sharded_axis(value, 1, source, mesh, P(None, "x", "y")),
+        in_shardings=(face, replicated), out_shardings=face)
+    permute_right = jax.jit(lambda value, source:
+        permute_sharded_axis(value, 2, source, mesh, P(None, "x", "y")),
+        in_shardings=(face, replicated), out_shardings=face)
     return (jax.jit(guard, in_shardings=(face, replicated),
-                    out_shardings=replicated), select, phase, place_phase)
+                    out_shardings=replicated), select, phase, place_phase,
+            permute_left, permute_right)
 
 
 def transport_sphere_response(parent_values, transport: SphereTransport,
@@ -404,7 +415,6 @@ def transport_sphere_response(parent_values, transport: SphereTransport,
     tensor, head correction, q-star weight or self-energy trace is inferred.
     """
     from common.collectives import replicate_to_mesh
-    from common.staged_reshard import permute_sharded_axis
 
     if (not isinstance(transport, SphereTransport) or not isinstance(children, SphereSet)
             or transport.ns != 1 or children.n != len(transport.row)
@@ -454,7 +464,7 @@ def transport_sphere_response(parent_values, transport: SphereTransport,
     if (not np.all(np.isfinite(phase[live]))
             or np.max(np.abs(np.abs(phase[live]) - 1.), initial=0.) > 1e-12):
         raise ValueError("sphere response physical endpoint phases must be finite and unit modulus")
-    guard, select, multiply, place_phase = _sphere_response_programs(mesh)
+    guard, select, multiply, place_phase, permute_left, permute_right = _sphere_response_programs(mesh)
     ngk = replicate_to_mesh(np.asarray(transport.parent.ngk, np.int32), mesh)
     for value in (parent_values, transposed_parent_same_z):
         if value is None:
@@ -465,8 +475,9 @@ def transport_sphere_response(parent_values, transport: SphereTransport,
     selected = select(parent_values, parent_values if transposed_parent_same_z is None
         else transposed_parent_same_z, replicate_to_mesh(owners.astype(np.int32), mesh),
         replicate_to_mesh(anti, mesh))
-    value = permute_sharded_axis(selected, 1, source, mesh, P(None, "x", "y"))
-    value = permute_sharded_axis(value, 2, source, mesh, P(None, "x", "y"))
+    source_device = replicate_to_mesh(source, mesh)
+    value = permute_left(selected, source_device)
+    value = permute_right(value, source_device)
     # SphereTransport's scalar endpoint equation: anti rows conjugate only
     # endpoint phases, while the already-transposed causal operand is kept.
     left = np.where(live, np.where(anti[:, None], phase.conj(), phase), 0.)
