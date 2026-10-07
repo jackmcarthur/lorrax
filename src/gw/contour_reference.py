@@ -350,16 +350,27 @@ def anchor_coefficients(value, derivative_s, eta, *, betas=None):
     return (y1 * d1, (value - y1) * d2), beta
 
 
-def _odd_anchor(d, x, beta, zero_angle, xp):
+def _odd_anchor(d, x, beta, zero_angle, xp, *, external_derivative=False):
     d2 = d * d
     angle = xp.where(x == 0, zero_angle, xp.angle(d2))
-    return (np.log(beta**2) - (xp.log(xp.abs(d2)) + 1j * angle)) / (2 * (beta**2 - d2))
+    numerator = np.log(beta**2) - (xp.log(xp.abs(d2)) + 1j * angle)
+    if external_derivative:
+        return (d * numerator - (beta**2 - d2) / d) / (beta**2 - d2)**2
+    return numerator / (2 * (beta**2 - d2))
 
 
 def anchor_part(value0, deriv0, x, occ, *, eta, betas=None, n_active=None,
                 band_valid=None,
-                analytic_convention="time_ordered_fractional", xp=np):
-    """Analytic anchor integral, and its two ordered half-line coefficients."""
+                analytic_convention="time_ordered_fractional", xp=np,
+                external_derivative=False):
+    """Analytic anchor integral, or its external-energy derivative.
+
+    Response inputs and auxiliary poles stay fixed when differentiating.
+    At ``x=0`` use the same branch as the value; the exact residue's slope
+    cancels the anchor's branch jump because both anchor conditions match.
+    """
+    if type(external_derivative) is not bool:
+        raise ValueError("CD external_derivative must be a static boolean")
     xh, fh = _inputs(x, occ, eta)
     x, f = xp.asarray(xh), xp.asarray(fh)
     cp, beta = anchor_coefficients(value0, deriv0, eta, betas=betas)
@@ -369,9 +380,12 @@ def anchor_part(value0, deriv0, x, occ, *, eta, betas=None, n_active=None,
     sign = xp.where(x >= 0, 1., -1.)
     total = 0
     for p, m, b in zip(cp, cm, beta):
-        even = f * sign / (2 * b * (b + sign * dv)) + (1 - f) * sign / (2 * b * (b + sign * dc))
-        odd = (f * _odd_anchor(dv, x, b, angle_v, xp)
-               + (1 - f) * _odd_anchor(dc, x, b, np.pi, xp)) * (1j / (2 * np.pi))
+        if external_derivative:
+            even = -f / (2 * b * (b + sign * dv)**2) - (1 - f) / (2 * b * (b + sign * dc)**2)
+        else:
+            even = f * sign / (2 * b * (b + sign * dv)) + (1 - f) * sign / (2 * b * (b + sign * dc))
+        odd = (f * _odd_anchor(dv, x, b, angle_v, xp, external_derivative=external_derivative)
+               + (1 - f) * _odd_anchor(dc, x, b, np.pi, xp, external_derivative=external_derivative)) * (1j / (2 * np.pi))
         if n_active is not None or band_valid is not None:
             active = xp.asarray(_physical_band_mask(xh, n_active, band_valid))
             even, odd = xp.where(active, even, 0.), xp.where(active, odd, 0.)
@@ -381,7 +395,8 @@ def anchor_part(value0, deriv0, x, occ, *, eta, betas=None, n_active=None,
 
 def imag_remainder_node(value_i, u, weight, x, occ, cp, cm, betas, *, eta,
                         n_active=None, band_valid=None,
-                        analytic_convention="time_ordered_fractional", xp=np):
+                        analytic_convention="time_ordered_fractional", xp=np,
+                        external_derivative=False):
     """One imaginary node with its known Green-pole limit subtracted first.
 
     ``value_i`` is the contraction of ``-W_c(iu)``. The two independently
@@ -390,9 +405,15 @@ def imag_remainder_node(value_i, u, weight, x, occ, cp, cm, betas, *, eta,
     """
     if float(u) <= 0 or not np.isfinite([u, weight]).all() or weight <= 0 or float(u) == float(eta):
         raise ValueError("CD imaginary node needs u>0, weight>0, u!=eta")
+    if type(external_derivative) is not bool:
+        raise ValueError("CD external_derivative must be a static boolean")
     f, dv, dc = _kernels(x, occ, eta, analytic_convention, xp)
-    minus = (f / (dv - 1j * u) + (1 - f) / (dc - 1j * u)) * (weight / (2 * np.pi))
-    plus = (f / (dv + 1j * u) + (1 - f) / (dc + 1j * u)) * (weight / (2 * np.pi))
+    if external_derivative:
+        minus = (-f / (dv - 1j * u)**2 - (1 - f) / (dc - 1j * u)**2) * (weight / (2 * np.pi))
+        plus = (-f / (dv + 1j * u)**2 - (1 - f) / (dc + 1j * u)**2) * (weight / (2 * np.pi))
+    else:
+        minus = (f / (dv - 1j * u) + (1 - f) / (dc - 1j * u)) * (weight / (2 * np.pi))
+        plus = (f / (dv + 1j * u) + (1 - f) / (dc + 1j * u)) * (weight / (2 * np.pi))
     if n_active is not None or band_valid is not None:
         active = xp.asarray(_physical_band_mask(np.asarray(x), n_active, band_valid))
         minus, plus = xp.where(active, minus, 0.), xp.where(active, plus, 0.)
@@ -405,6 +426,18 @@ def imag_remainder_node(value_i, u, weight, x, occ, cp, cm, betas, *, eta,
 
 def _residue_weights(x, f, n_active, band_valid):
     return _physical_band_mask(x, n_active, band_valid), np.where(x < 0, f, -(1 - f))
+
+
+def _exact_residue_inputs(x, occ, node, *, eta, n_active, band_valid,
+                          analytic_convention, xp):
+    xh, fh = _inputs(x, occ, eta)
+    _kernels(xh, fh, eta, analytic_convention, np)
+    node = float(node)
+    if not np.isfinite(node) or node < 0:
+        raise ValueError("CD exact residue node must be finite and nonnegative")
+    active, residue = _residue_weights(xh, fh, n_active, band_valid)
+    selected = xp.asarray(np.where(active & (np.abs(xh) == node), residue, 0.))
+    return node, selected, xp.asarray(xh < 0)
 
 
 def real_residue_node(value, value_t, x, occ, node, *, eta, n_active=None,
@@ -420,17 +453,32 @@ def real_residue_node(value, value_t, x, occ, node, *, eta, n_active=None,
     Different external read energies are selected after the common-frequency
     matrix sample is formed, never before its ordered partner dagger.
     """
-    xh, fh = _inputs(x, occ, eta)
-    _kernels(xh, fh, eta, analytic_convention, np)
-    node = float(node)
-    if not np.isfinite(node) or node < 0:
-        raise ValueError("CD exact residue node must be finite and nonnegative")
-    active, residue = _residue_weights(xh, fh, n_active, band_valid)
-    selected = xp.asarray(np.where(active & (np.abs(xh) == node), residue, 0.))
-    sign = xp.asarray(xh < 0)
+    node, selected, sign = _exact_residue_inputs(x, occ, node, eta=eta,
+        n_active=n_active, band_valid=band_valid, analytic_convention=analytic_convention, xp=xp)
     partner = _dagger(value_t, xp) if analytic_convention == "retarded" else value_t
     return (_apply(value, xp.where(sign, 0., selected), xp)
             + _apply(partner, xp.where(sign, selected, 0.), xp))
+
+
+def real_residue_derivative_node(derivative_s, derivative_t_s, x, occ, node, *,
+                                 eta, n_active=None, band_valid=None,
+                                 analytic_convention="time_ordered_fractional", xp=np):
+    """External-energy derivative at one authenticated exact crossing.
+
+    Both inputs are actual slopes ``d/ds`` at ``z=node+i eta`` with
+    ``s=z_Ry²``. Convert the complete slope to ``d/dz`` before the occupied
+    retarded partner's dagger, then apply ``d|x|/dE``. The ``x=0`` branch
+    matches :func:`real_residue_node`; the matched analytic anchor restores
+    the continuous derivative. This is not an interpolation of saved values.
+    """
+    node, selected, sign = _exact_residue_inputs(x, occ, node, eta=eta,
+        n_active=n_active, band_valid=band_valid, analytic_convention=analytic_convention, xp=xp)
+    z = node + 1j * eta
+    slope, partner = 2 * z * derivative_s, 2 * z * derivative_t_s
+    if analytic_convention == "retarded":
+        partner = _dagger(partner, xp)
+    return (_apply(slope, xp.where(sign, 0., selected), xp)
+            - _apply(partner, xp.where(sign, selected, 0.), xp))
 
 
 def real_part(values, derivatives_s, values_t, derivatives_t_s, x, occ, nodes,

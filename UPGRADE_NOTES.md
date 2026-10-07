@@ -5,6 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — opt-in contour references differentiate external read energy
+
+`gw.contour_reference.anchor_part` and `imag_remainder_node` accept
+`external_derivative=True` with the response and quadrature held fixed.
+`real_residue_derivative_node` consumes actual direct/partner slopes
+`dW/ds`, converts the complete slope through `2z`, and then applies the
+declared sheet and crossing orientation. The exact crossing and physical
+band mask have the same owner as the value consumer. At an own-energy
+crossing the anchor and residue slopes must cancel their branch jumps.
+Default value formulas, drivers, decks, broadening and head policy are
+unchanged. These opt-in helpers await named analytic-pole/actual-query
+controls and physical P4 admission; no quasiparticle-root claim follows
+from exposing a derivative.
+
 ## 2026-10-07 — optional Γ-only scalar reference fit keeps its factor and solve on matrix faces
 
 `fit_zeta_to_h5(selected_q=[0])` is an opt-in reference producer for equal,
