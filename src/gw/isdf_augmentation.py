@@ -553,38 +553,85 @@ def _packet_plan(plan, points, first=None):
     return first
 
 
+def _angular_bucket_tables(point_plan, na, rp, weights_y, py):
+    """Group each local point shard in canonical atom/radius/direction order.
+
+    The packed point axis represents exactly ``na * rp * nang`` logical
+    points, with direction fastest. The common point plan authenticates its
+    coordinates; this map checks the logical ordering used by compression.
+    All shards use one static bucket width, including wholly ghost shards.
+    """
+    packed = np.asarray(point_plan.layout.axis.packed_to_canonical)
+    active = np.asarray(point_plan.layout.axis.active_mask, dtype=bool)
+    weights_y = np.asarray(weights_y)
+    if weights_y.ndim != 2 or min(weights_y.shape) < 1 or not np.isfinite(weights_y).all():
+        raise ValueError("angular compression requires finite harmonic/direction weights")
+    nang = int(weights_y.shape[1])
+    logical = int(na)*int(rp)*nang
+    if (min(int(na),int(rp),int(py)) < 1 or packed.ndim != 1
+            or active.shape != packed.shape or len(packed)%int(py)
+            or int(point_plan.layout.axis.n_logical) != logical
+            or not np.array_equal(np.sort(packed[active]),np.arange(logical))):
+        raise ValueError("angular compression point axis must contain exactly atom/radius/direction rows")
+    local_points, rows = len(packed)//int(py), int(na)*int(rp)
+    groups = []
+    for y in range(int(py)):
+        labels = packed[y*local_points:(y+1)*local_points]
+        live = active[y*local_points:(y+1)*local_points]
+        groups.append([np.flatnonzero(live & (labels//nang == row)) for row in range(rows)])
+    width = max(1,max(len(indices) for shard in groups for indices in shard))
+    indices = np.zeros((int(py),rows,width),np.int32)
+    angular = np.zeros((int(py),weights_y.shape[0],rows,width),weights_y.dtype)
+    for y, shard in enumerate(groups):
+        for row, columns in enumerate(shard):
+            indices[y,row,:len(columns)] = columns
+            angular[y,:,row,:len(columns)] = weights_y[:,packed[y*local_points+columns]%nang]
+    return indices,angular
+
+
+def _angular_compression_workspace_bytes(nq, nmu, na, nh, rp, nang, px):
+    """Bound local bucket gather, pre-scatter result and index/weight tables.
+
+    A shard can own every direction of a radial row. Price that common
+    worst-case width before constructing the actual packed packet plan.
+    The full input RHS and stored output are charged by their own operands.
+    """
+    rows, mu_local = int(na)*int(rp), int(nmu)//int(px)
+    gather = 16.*int(nq)*mu_local*rows*int(nang)
+    # The GW mesh is square, so the feature-Y pad uses the same extent.
+    features = ((rows*int(nh)+int(px)-1)//int(px))*int(px)
+    partial = 16.*int(nq)*mu_local*features
+    tables = rows*int(nang)*(4.+16.*int(nh))
+    return dict(bucket_gather=gather,pre_scatter_result=partial,
+                index_and_angular_tables=tables,total=gather+partial+tables)
+
+
 def _compress_rhs_kernel(mesh, point_plan, na, nh, rp, weights_y):
-    """Angular projection on device; psum_scatter keeps packet features over Y."""
+    """Project local angular buckets; psum_scatter keeps features over Y."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from common.shard_map import shard_map
 
     py = int(mesh.shape['y'])
+    indices,angular = _angular_bucket_tables(point_plan,na,rp,weights_y,py)
+    if int(nh) != int(angular.shape[1]):
+        raise ValueError("angular compression harmonic extent disagrees with weights")
     nf = na*nh*rp
     nfp = ((nf+py-1)//py)*py
-    packed = point_plan.layout.axis.packed_to_canonical
-    active = point_plan.layout.axis.active_mask
-    nang = int(weights_y.shape[1])
-    labels = np.where(active, packed, 0)
-    a, rr, angle = labels//(rp*nang), (labels//nang)%rp, labels%nang
-    table = weights_y[:, angle]*active[None,:]
-    geometry = _put(np.stack((a,rr)), mesh, P(None,'y'))
-    table = _put(table, mesh, P(None,'y'))
-    def project(z, indices, angular):
-        zero = jnp.zeros((z.shape[0],z.shape[1],nfp), jnp.complex128)
-        def add(acc, step):
-            atom, radial = step//rp, step%rp
-            values = jnp.einsum('qmp,hp->qmh', z,
-                        angular*((indices[0] == atom)&(indices[1] == radial))[None,:])
-            destinations = atom*nh*rp+jnp.arange(nh)*rp+radial
-            return acc.at[:,:,destinations].set(values), None
-        partial = jax.lax.scan(add, zero, jnp.arange(na*rp), unroll=1)[0]
+    indices = _put(indices, mesh, P('y',None,None))
+    angular = _put(angular, mesh, P('y',None,None,None))
+    def project(z, columns, weights):
+        values = jnp.take(z,columns[0],axis=-1)
+        partial = jnp.einsum('qmfj,hfj->qmfh',values,weights[0])
+        partial = partial.reshape((z.shape[0],z.shape[1],na,rp,nh))
+        partial = partial.transpose(0,1,2,4,3).reshape((z.shape[0],z.shape[1],nf))
+        partial = jnp.pad(partial,((0,0),(0,0),(0,nfp-nf)))
         return jax.lax.psum_scatter(partial, 'y', scatter_dimension=2, tiled=True)
     kernel = jax.jit(shard_map(project, mesh=mesh,
-        in_specs=(P(None,'x','y'), P(None,'y'), P(None,'y')),
+        in_specs=(P(None,'x','y'), P('y',None,None), P('y',None,None,None)),
         out_specs=P(None,'x','y'), check_vma=False))
-    return lambda z: kernel(z, geometry, table), nf, nfp
+    return lambda z: kernel(z, indices, angular), nf, nfp
 
 
 def _orbital_norm_kernels(mesh):
@@ -1027,6 +1074,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         transform_scratch = 24.*point_workspace['full_q_scalar']
     point_workspace['convolution_transform_scratch'] = transform_scratch
     point_workspace['total'] += transform_scratch
+    angular_workspace = _angular_compression_workspace_bytes(
+        len(q_indices),mu,na,nh,rp,len(directions),int(mesh_xy.shape['x']))
     dft_tile = 16*pc*bc*4*point_bound
     # The original phase plus its G-block padding fit in two padded
     # packets. Parent-loop completion below bounds their lifetime.
@@ -1070,7 +1119,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             +32*qpad*mu*na/Ptot)
     price = (source_bytes+4*face_bytes+rhs_copies*rhs_bytes+3*factor_v_bytes+4*point_faces
              +point_workspace['total']+dft_tile+phase_bytes+smooth_tile+overlap_bytes+moment_bytes
-             +prepared_overlap_host_bytes+prepared_projection_host_bytes)
+             +prepared_overlap_host_bytes+prepared_projection_host_bytes+angular_workspace['total'])
     budget = float(device_budget_bytes())
     if price > budget:
         warn_over_budget('isdf.augmentation',price,budget)
@@ -1309,6 +1358,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         identity=artifact['identity'],tail_relative_norm=tails,angular_gram_error=angular_error,
         nearest_atom_image=nearest,raw_rhs_bytes_per_rank=rhs_bytes,resident_estimate_bytes_per_rank=price)
     state['local_rhs_workspace_bytes_per_rank'] = point_workspace
+    state['angular_compression_workspace_bytes_per_rank'] = angular_workspace
     state['prepared_served_overlap_host_bytes_per_process'] = prepared_overlap_host_bytes
     state['resident_rhs_copies'] = rhs_copies
     state['indexed_local_q_union'] = q_union
