@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — typed retained-sphere response transport is explicit about frequency
+
+An opt-in scalar-charge action transports complex response matrices and
+their derivatives through the existing SphereTransport G/phase tables and
+all-processor endpoint permutation owner. Antiunitary rows require the
+already-transposed same-parent operator at the same complex frequency;
+causal coefficients are never conjugated by this action. Integer images,
+physical slot bijections and exact-zero sphere ghosts are checked. Existing
+pair convolution and driver defaults are unchanged. This action alone
+certifies no q-star self-energy weight or closed-subspace trace reduction.
+
 ## 2026-10-07 — ordered Γ body references retain both causal pole branches
 
 An opt-in all-processor reference sampler returns ordered Γ Wc(z) and

@@ -117,6 +117,7 @@ representatives, so the r' chunk count and the all-to-all shrink by N_r/N_w too.
 from __future__ import annotations
 
 import dataclasses
+from functools import lru_cache
 
 import numpy as np
 import jax
@@ -128,7 +129,7 @@ from common.fourier_plan import LocalFourierPlan
 from common.shard_map import shard_map
 from runtime.padding import padded_axis
 
-__all__ = ["SphereSet", "SphereTransport", "PairOperand", "ColumnWedge", "MixedBasisPairConvolution",
+__all__ = ["SphereSet", "SphereTransport", "transport_sphere_response", "PairOperand", "ColumnWedge", "MixedBasisPairConvolution",
            "PairConvChunks", "plan_pair_convolution_chunks", "alias_free_margin"]
 
 _XY = ("x", "y")
@@ -356,6 +357,120 @@ class SphereTransport:
         return SphereTransport(row=self.row[kb], anti=~self.anti[kb], spin=np.conj(self.spin[kb]),
                                src=src, phase=phase, n_parent=self.n_parent, parent=self.parent,
                                rot=self.rot[kb], tnp=self.tnp[kb])
+
+
+@lru_cache(maxsize=None)
+def _sphere_response_programs(mesh):
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    replicated = NamedSharding(mesh, P())
+
+    def guard(value, ngk):
+        live = jnp.arange(value.shape[-1])[None, :] < ngk[:, None]
+        ghost = ~live[:, :, None] | ~live[:, None, :]
+        return jnp.stack((jnp.max(jnp.abs(jnp.where(ghost, value, 0))),
+                          jnp.all(jnp.isfinite(value)).astype(jnp.float64)))
+
+    select = jax.jit(lambda value, partner, rows, anti: jnp.where(
+        anti[:, None, None], partner[rows], value[rows]),
+        in_shardings=(face, face, replicated, replicated), out_shardings=face)
+    phase = jax.jit(lambda value, left, right:
+        left[:, :, None] * value * right[:, None, :],
+        in_shardings=(face, NamedSharding(mesh, P(None, "x")),
+                      NamedSharding(mesh, P(None, "y"))), out_shardings=face)
+    return (jax.jit(guard, in_shardings=(face, replicated),
+                    out_shardings=replicated), select, phase)
+
+
+def transport_sphere_response(parent_values, transport: SphereTransport,
+                              children: SphereSet, *, mesh: Mesh, child_rows,
+                              transposed_parent_same_z=None):
+    """Scalar charge response at one complex site under typed sphere actions.
+
+    Values and an optional partner are complex128 ``[n_parent,M,M]`` faces
+    at ``P(None,'x','y')``. Every selected physical child sphere must be a
+    bijective typed image of its parent. The two endpoint permutations use
+    the existing volume-preserving all-P owner, and exact-zero child pads
+    remain zero on the child's canonical padded face carrier. This action
+    is also the action on dχ/ds or dW/ds.
+
+    A unitary row reads ``phase_i W[src_i,src_j] conj(phase_j)``. An
+    antiunitary row requires the EXPLICIT endpoint-transposed SAME parent-q
+    response at the SAME complex frequency and reads it with conjugated
+    left phases. It never conjugates causal coefficients or substitutes an
+    independently computed minus-q response. The caller owns the partner's
+    same-site provenance; raw arrays carry no frequency identity. No spin
+    tensor, head correction, q-star weight or self-energy trace is inferred.
+    """
+    from common.collectives import replicate_to_mesh
+    from common.staged_reshard import permute_sharded_axis
+
+    if (not isinstance(transport, SphereTransport) or not isinstance(children, SphereSet)
+            or transport.ns != 1 or children.n != len(transport.row)
+            or children.width != transport.src.shape[1]):
+        raise ValueError("sphere response requires matching scalar-charge transport and child spheres")
+    rows = np.asarray(child_rows)
+    if (rows.ndim != 1 or rows.dtype.kind not in "iu" or not len(rows)
+            or len(np.unique(rows)) != len(rows) or np.any(rows < 0)
+            or np.any(rows >= children.n)):
+        raise ValueError("sphere response requires unique bounded integer child rows")
+    if (tuple(mesh.axis_names) != ("x", "y") or mesh.shape["x"] != mesh.shape["y"]):
+        raise ValueError("sphere response requires the square x/y face mesh")
+    face = NamedSharding(mesh, P(None, "x", "y"))
+
+    def require(value, name):
+        sharding = getattr(value, "sharding", None)
+        if (not isinstance(sharding, NamedSharding) or sharding != face
+                or value.ndim != 3 or value.shape[0] != transport.n_parent
+                or value.shape[-1] != value.shape[-2]
+                or value.shape[-1] < transport.parent.width or value.dtype != jnp.complex128):
+            raise ValueError(f"sphere response {name} needs a complex128 all-P parent face")
+
+    require(parent_values, "value")
+    anti = transport.anti[rows]
+    if np.any(anti) and transposed_parent_same_z is None:
+        raise ValueError("antiunitary sphere response needs transposed_parent_same_z explicitly")
+    if transposed_parent_same_z is not None:
+        require(transposed_parent_same_z, "same-z transposed partner")
+        if transposed_parent_same_z.shape != parent_values.shape:
+            raise ValueError("sphere response partner and parent shapes differ")
+    owners = transport.row[rows]
+    width = int(padded_axis(children.width, mesh, name="sphere response child slots").carrier)
+    live = np.arange(width)[None, :] < children.ngk[rows, None]
+    source = np.pad(np.where(live[:, :children.width], transport.src[rows], 0),
+                    ((0, 0), (0, width - children.width))).astype(np.int32)
+    for local, child in enumerate(rows):
+        parent = int(owners[local]); count = int(children.ngk[child])
+        if (count != int(transport.parent.ngk[parent])
+                or not np.array_equal(np.sort(source[local, :count]), np.arange(count))):
+            raise ValueError("sphere response physical source slots must biject the parent sphere")
+        parent_K = transport.parent.frac[parent] + transport.parent.gvecs[parent, source[local, :count]]
+        child_K = children.frac[child] + children.gvecs[child, :count]
+        mapped_K = (transport.rot[child].T @ parent_K.T).T
+        if np.max(np.abs(mapped_K - (-1. if anti[local] else 1.) * child_K), initial=0.) > 1e-10:
+            raise ValueError("sphere response typed G integer image/rotation differs from child sphere")
+    phase = np.pad(transport.phase[rows], ((0, 0), (0, width - children.width)))
+    if (not np.all(np.isfinite(phase[live]))
+            or np.max(np.abs(np.abs(phase[live]) - 1.), initial=0.) > 1e-12):
+        raise ValueError("sphere response physical endpoint phases must be finite and unit modulus")
+    guard, select, multiply = _sphere_response_programs(mesh)
+    ngk = replicate_to_mesh(np.asarray(transport.parent.ngk, np.int32), mesh)
+    for value in (parent_values, transposed_parent_same_z):
+        if value is None:
+            continue
+        ghost, finite = np.asarray(jax.device_get(guard(value, ngk)))
+        if ghost != 0. or not bool(finite):
+            raise ValueError("sphere response parent has nonzero sphere ghosts or nonfinite coefficients")
+    selected = select(parent_values, parent_values if transposed_parent_same_z is None
+        else transposed_parent_same_z, replicate_to_mesh(owners.astype(np.int32), mesh),
+        replicate_to_mesh(anti, mesh))
+    value = permute_sharded_axis(selected, 1, source, mesh, P(None, "x", "y"))
+    value = permute_sharded_axis(value, 2, source, mesh, P(None, "x", "y"))
+    # SphereTransport's scalar endpoint equation: anti rows conjugate only
+    # endpoint phases, while the already-transposed causal operand is kept.
+    left = np.where(live, np.where(anti[:, None], phase.conj(), phase), 0.)
+    return multiply(value,
+        jax.device_put(left, NamedSharding(mesh, P(None, "x"))),
+        jax.device_put(left.conj(), NamedSharding(mesh, P(None, "y"))))
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
