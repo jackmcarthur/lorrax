@@ -189,9 +189,12 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             # slope reads W = (Wc + (W_inf - V)) + V.
             value = w_minus_v(v, chi_raw, contact) - constant
             return value, derivative((value + constant) + v, dchi_raw)
-        dyson = SimpleNamespace(value=program(3)(w_minus_v),
-                                pair={"face": program(5, 2)(photon_pair)}.get,
-                                place=lambda v: v)
+        # 'resident': V, the contact and W_inf - V already in the batch layout (laid
+        # out once per bank, local linalg); only the two chi stacks move.
+        pairs = {"face": program(5, 2)(photon_pair)}
+        if backend == "off":
+            pairs["resident"] = program(5, 2, (0, 3, 4))(photon_pair)
+        dyson = SimpleNamespace(value=program(3)(w_minus_v), pair=pairs.get, place=lambda v: v)
 
         @program(3)
         def slope(v, wc, dchi_raw):
@@ -2282,6 +2285,15 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             ambient += (root_stage,)
     else:
         roots = held = bank_io["photon_v"]
+    # The photon pair's V, contact and W_inf - V in its batch layout, for every
+    # full-span solve: laid out at the first one, then no exchange of them per
+    # sample.  Priced here, before the group size and the line route.
+    resident_pair = None
+    if vertex is not None and dyson.pair("resident") is not None:
+        rows = -(-len(qids) // mesh_xy.size)
+        resident_stage, _ = _reserve(meta, "photon_pair_resident", 3*rows*16*n*n)
+        ambient += (resident_stage,)
+        resident_pair = {}
     carry_per_sample = 2*len(response_rows)*face_bytes
     selection = None
 
@@ -2446,10 +2458,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
                             item_name="frequency", max_updates=len(z)).start()
 
-    def read_constant(span, bank_handle):
-        """The photon W_inf - V of parents ``span`` (0 for charge), read from the bank."""
+    def read_constant(span, bank_handle, pair=True):
+        """The photon W_inf - V of parents ``span`` (0 for charge), read from the bank;
+        ``pair``: None where the resident batch copy serves the span's Dyson pair."""
         if vertex is None:
             return 0.
+        if pair and resident_pair is not None and span == (0, len(qids)):
+            return None
         io_started = time.monotonic()
         constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
                                          fields=("constant",))["constant"]
@@ -2482,8 +2497,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 jnp.concatenate(column, axis=0) for column in zip(*parts))
         span = (int(q0), int(q1))
         h = roots[q0:q1]
-        if constant is None:
-            constant = read_constant(span, bank_handle)
+        resident = need_value and resident_pair is not None and span == (0, len(qids))
+        if constant is None and not resident:
+            constant = read_constant(span, bank_handle, pair=False)
         head_update = None
         if direct_head is not None and q0 == 0:
             from .photon_direct_head import add_direct_gamma_field
@@ -2501,7 +2517,15 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             chi_value, = chi_value
             if partner:
                 chi_value = jnp.conj(chi_value)
-        if need_value and dyson.pair(layout) is not None:
+        if resident:
+            if not resident_pair:
+                from distrib_la import batch_broadcast, batch_layout
+                resident_pair.update(v=batch_layout(roots, mesh_xy),
+                    contact=batch_broadcast(contact, mesh_xy, len(qids)),
+                    constant=batch_layout(read_constant(span, bank_handle, pair=False), mesh_xy))
+            value, slope = execute(dyson.pair("resident"), (resident_pair["v"], chi_value, chi,
+                                   resident_pair["contact"], resident_pair["constant"]), "sample_dyson")
+        elif need_value and dyson.pair(layout) is not None:
             # Wc and dWc/ds in one program: on the held roots (charge), or
             # with the contact and W_inf - V (photon).
             value, slope = execute(dyson.pair(layout), (held if span == (0, len(qids))
@@ -2564,6 +2588,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     if stream_bank is not None:
         q_width = sample_q_width(face_bytes, len(qids), _parent_layer(receipt, mesh_xy))
         receipt["bank_residence"]["q_width"] = q_width or len(qids)
+    if q_width is not None and resident_pair is not None:
+        # Samples solve span by span: no full-span pair reads the resident copy.
+        ambient = tuple(stage for stage in ambient if stage != resident_stage)
+        resident_pair = None
     # A line sample selects span by span too when each parent's minus-q partner
     # comes from its own rows (no partner, or the inversion mirror); each span's
     # route is admitted at its width and the panels written per span.

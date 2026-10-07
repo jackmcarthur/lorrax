@@ -157,12 +157,12 @@ from distrib_la.resolve import (
     resolve_backend,
 )
 
-from ._batch_reshard import batch_layout, is_batch_layout, local_batch
+from ._batch_reshard import batch_broadcast, batch_layout, is_batch_layout, local_batch
 from ._result_check import checked_program, checked_shapes
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
 __all__ = [
-    "local_batch", "batch_layout", "is_batch_layout",
+    "local_batch", "batch_layout", "batch_broadcast", "is_batch_layout",
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
     "plan_orthogonalization",
     # face-pinned block glue for stacked [b, R, R] operators

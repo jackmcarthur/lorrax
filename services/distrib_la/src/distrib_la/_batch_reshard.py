@@ -45,7 +45,7 @@ from distrib_la._result_check import native_eigh
 from distrib_la._shard_map import shard_map
 from distrib_la.resolve import mesh_key
 
-__all__ = ["batch_layout", "batch_layout_eigh_call", "batch_reshard_call",
+__all__ = ["batch_broadcast", "batch_layout", "batch_layout_eigh_call", "batch_reshard_call",
            "is_batch_layout", "local_batch", "reshard_program", "reshard_rounds_call",
            "validate_batch_reshard_operands"]
 
@@ -338,6 +338,30 @@ def batch_layout(a, mesh):
             fn = jax.jit(lambda t: jnp.pad(t, widths),
                          out_shardings=NamedSharding(mesh, _batch_spec(a.ndim)))
         _JIT_CACHE[key] = fn
+    return fn(a)
+
+
+def batch_broadcast(a, mesh, nbatch):
+    """One face matrix ``a`` ``(1, M, N)`` at ``P(None,'x','y')`` as the batch layout of a
+    ``nbatch``-row stack of it, to stay resident across :func:`local_batch` calls.
+
+    Each rank gathers the matrix once and fills its own rows: one all-gather of one
+    matrix, where a singleton moving operand of :func:`local_batch` is broadcast to
+    ``nbatch`` face copies and exchanged on every call.  The rows are those copies
+    bit for bit (padded rows included, which never reach a kernel).
+    """
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    ndev = px * py
+    rows = -(-int(nbatch) // ndev)
+    key = ("batch_broadcast", mesh_key(mesh), tuple(int(s) for s in a.shape), str(a.dtype), rows)
+    fn = _JIT_CACHE.get(key)
+    if fn is None:
+        def fill(tile):
+            whole = jax.lax.all_gather(tile, "x", axis=1, tiled=True)
+            whole = jax.lax.all_gather(whole, "y", axis=2, tiled=True)
+            return jnp.broadcast_to(whole, (rows, *whole.shape[1:]))
+        fn = _JIT_CACHE[key] = jax.jit(shard_map(fill, mesh=mesh, in_specs=(P(None, "x", "y"),),
+                                                 out_specs=_batch_spec(3), check_vma=False))
     return fn(a)
 
 
