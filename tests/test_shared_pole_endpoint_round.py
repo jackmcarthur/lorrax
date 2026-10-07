@@ -165,6 +165,8 @@ def toy(mesh):
         sample_reader=samples,moment_reader=moments,coulomb_reader=coulomb,mesh_xy=mesh)
     recipe=dict(gate_hash=table_hash(GATES),recipe_hash=identity['recipe_hash'],fit_ids=[0,1],held_ids=[2,3],
         distinct_id=[0,1,2,3],role=[1,0,4,3],held=[False,False,True,True],z_ry=z,
+        role_codes={'line':0,'imaginary':1,'infinity':2,'held_line':3,'held_imaginary':4},
+        support_pair=[-1,-1,-1,-1],census={'physical_k_count':512},
         infinity_width=2,imaginary_width=2,line_direction_cap=2,direction_cutoff=1e-3,
         multiplet_relative_tolerance=1e-8,eta_ev=.25,pole_budget=None)
     # Ledger uses the actual incumbent metadata scale, separate from the
