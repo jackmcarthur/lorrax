@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import jax
+from jax.sharding import Mesh
 
 from gw.gw_config import (DynamicSigmaConfig, _DEFAULTS, _DECK_NAMED_KEYS,
                           _parse_input_keys, _resolve_shared_pole_inputs)
@@ -40,7 +42,8 @@ def resolve(monkeypatch, config=None, *, session=None):
     w,m = problem()
     return resolve_shared_pole_recipe(
         SimpleNamespace(sigma=sigma() if config is None else config,bispinor=False),
-        w,m,mesh_xy=SimpleNamespace(shape={"x":2,"y":2}),print_fn=lambda _:None,
+        w,m,mesh_xy=Mesh(np.asarray(jax.devices()[:1]).reshape(1,1),("x","y")),
+        print_fn=lambda _:None,
         support_reads_ev=[-12.,-4.,2.,12.,25.],support_session=session)
 
 
