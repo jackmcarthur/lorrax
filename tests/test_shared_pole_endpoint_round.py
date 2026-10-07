@@ -263,7 +263,8 @@ def test_default_store_constructor_reuses_selected_round_math(mesh,monkeypatch):
     assert calls==['packed-centroid-charge'] and captured['kwargs']['q_span']==(0,1)
     np.testing.assert_array_equal(captured['c'],reference.counts)
     np.testing.assert_allclose(captured['p'],reference.poles2,atol=2e-13,rtol=3e-12)
-    np.testing.assert_allclose(host(captured['b'])@host(captured['b']).conj().swapaxes(-1,-2),
+    public_factor=host(captured['b'])[:,:,0,:]
+    np.testing.assert_allclose(public_factor@public_factor.conj().swapaxes(-1,-2),
         host(reference.factor)@host(reference.factor).conj().swapaxes(-1,-2),atol=3e-13,rtol=3e-12)
     assert result['model_header']=={'test':'strict writer door'}
 
