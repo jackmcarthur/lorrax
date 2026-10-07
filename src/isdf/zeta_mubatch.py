@@ -609,8 +609,10 @@ class ZStore:
             self._io.sync_writes()
 
     # -- read -------------------------------------------------------------
-    def read_tile(self, t: int) -> jax.Array:
+    def read_tile(self, t: int, *, face: bool = False) -> jax.Array:
         """G tile ``t``, q-local (see class doc)."""
+        if face:
+            return self._read_tile_face(t)
         t0 = time.perf_counter()
         t = int(t)
         if self.placement == 'disk':
@@ -635,6 +637,45 @@ class ZStore:
         self.bytes_read += self.Q * self.mu_pad * self.g_tile * 16
         self.t_read += time.perf_counter() - t0
         return out
+
+    def _read_tile_face(self, t: int) -> jax.Array:
+        """Opt-in μ_X/G_Y read: even one physical q stays on all processors.
+
+        Host storage is rank-major; disk storage is batch-major. Their maps
+        compose that existing slot order with ``packed_from_slot`` before
+        the common volume-preserving sharded permutation. Neither arm
+        constructs a complete matrix on a q owner.
+        """
+        from common.staged_reshard import band_to_product_r_reshard, permute_sharded_axis
+        t0=time.perf_counter();t=int(t)
+        if not 0 <= t < self.n_Gt or self.g_tile % int(self.mesh.shape['y']):
+            raise ValueError('ZStore face read requires an in-range tile and G carrier divisible over Y')
+        spec=P(None,'x','y')
+        if self.placement == 'disk':
+            self._io.sync_writes()
+            raw=self._io.read_slab('Z',shape=(1,self.Q,self.n_batch*self.b,self.g_tile),
+                offset=(t,0,0,0),mesh=self.mesh,partition_spec=P(None,None,'x','y'))
+            value=jax.jit(lambda a:a[0],out_shardings=NamedSharding(self.mesh,spec))(raw)
+            source=np.clip(self._pfs,0,None)
+        else:
+            nc=self.n_batch*self.c
+            local=_host_tile_to_device(self.mesh,P(None,_XY,None),
+                (self.Q,self.P*nc,self.g_tile),
+                {dev:self._host[dev.id][t].reshape(self.Q,nc,self.g_tile)
+                    for dev in self.mesh.local_devices})
+            lifted=jax.jit(lambda a:a[:,:,None,:],
+                out_shardings=NamedSharding(self.mesh,P(None,_XY,None,None)))(local)
+            moved=band_to_product_r_reshard(self.mesh,face=True)(lifted)
+            value=jax.jit(lambda a:a[:,:,0,:],out_shardings=NamedSharding(self.mesh,spec))(moved)
+            slot=np.clip(self._pfs,0,None)
+            source=(slot % self.b // self.c)*nc+(slot // self.b)*self.c+slot % self.c
+        value=permute_sharded_axis(value,1,np.asarray(source,np.int32),self.mesh,spec)
+        live=jnp.asarray(self._pfs>=0)
+        value=jax.jit(lambda a,v:jnp.where(v[None,:,None],a,0),
+            out_shardings=NamedSharding(self.mesh,spec))(value,live)
+        self.bytes_read+=self.Q*self.mu_pad*self.g_tile*16
+        self.t_read+=time.perf_counter()-t0
+        return value
 
     def close(self) -> None:
         if self.placement == 'host':
@@ -779,10 +820,35 @@ class ZetaG:
 
     def write_file(self, zeta_io, *, print_fn=None):
         """Stream every G tile once and write ζ = C⁻¹Z into ``zeta_q_G`` (no V)."""
+        if self.solver_kind == 'distributed_rank_truncate':
+            return self._write_file_face(zeta_io,print_fn=print_fn)
         Q = self.store.Q
         self.contract_v(np.zeros((Q, self.ngkmax), np.complex128),
                         keep=np.zeros((Q, 1), np.int32), zeta_io=zeta_io,
                         print_fn=print_fn, with_v=False)
+
+    def _write_file_face(self,zeta_io,*,print_fn=None):
+        """The selected-q writer: shared Cplus solve and all-P output faces."""
+        from isdf import cplus
+        st=self.store;t0=time.perf_counter()
+        face=NamedSharding(self.mesh,P(None,'x','y'))
+        def physical(a,ng,t):
+            g=t*st.g_tile+jnp.arange(st.g_tile)
+            return jnp.where(g[None,None,:]<ng[:,None,None],a,0)
+        mask=jax.jit(physical,out_shardings=face)
+        ng=jnp.asarray(self.ngk_per_q)
+        for t in range(st.n_Gt):
+            raw=st.read_tile(t,face=True)
+            solved=cplus.apply(self.L_q,raw,mesh_xy=self.mesh)
+            solved=mask(solved,ng,jnp.asarray(t,jnp.int32))
+            self._write_tile(zeta_io,solved,t*st.g_tile)
+            # Source-store reads and output writes can otherwise enter
+            # collective MPI-IO in different thread order.
+            zeta_io.sync_writes()
+            del raw,solved
+        self.receipt=(f'  μ-batch selected-q ζ pass: {st.n_Gt} G tiles, all-P faces, '
+                      f'{time.perf_counter()-t0:.2f}s; zeta file written')
+        (print_fn or self.print_fn)(self.receipt)
 
 
     # -- the one pass ---------------------------------------------------
@@ -796,6 +862,8 @@ class ZetaG:
         ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``;
         ``with_v=False`` (:meth:`write_file`) forms and writes ζ only.
         """
+        if self.solver_kind == 'distributed_rank_truncate':
+            raise ValueError('Selected-q all-P fit writes ζ only; read its committed selected-q file through the existing endpoint/V owner')
         t0 = time.perf_counter()
         print_fn = print_fn or self.print_fn
         st = self.store
@@ -875,7 +943,8 @@ class ZetaG:
 
     def _write_tile(self, zeta_io, zt, g0):
         """One masked ζ tile into ``zeta_q_G`` (canonical μ order, clipped)."""
-        zt = _to_mu_owner(self.mesh, self.store.Q, 'mu')(zt)   # the writer's layout
+        if self.solver_kind != 'distributed_rank_truncate':
+            zt = _to_mu_owner(self.mesh, self.store.Q, 'mu')(zt)   # the writer's layout
         if self.mu_basis is not None:
             zt = self.mu_basis.unpack_axis(zt, 1)
         zeta_io.write_slab('zeta_q_G', zt, offset=(0, 0, int(g0)))

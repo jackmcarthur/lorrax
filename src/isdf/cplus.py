@@ -17,13 +17,33 @@ import jax.numpy as jnp
 from common import rank_criterion
 
 
-def apply(B, Z):
+def apply(B, Z, *, mesh_xy=None, panel_bytes=64 << 20):
     """ζ = C⁺Z = B(BᴴZ) for the factor ``B`` of :func:`factor`."""
+    if mesh_xy is not None:
+        from distrib_la import panel_matmul
+        _require_face(B, mesh_xy)
+        _require_face(Z, mesh_xy)
+        inner = panel_matmul(B, Z, mesh=mesh_xy, panel_bytes=panel_bytes, transa='C')
+        return panel_matmul(B, inner, mesh=mesh_xy, panel_bytes=panel_bytes)
     return B @ (jnp.conj(jnp.swapaxes(B, -1, -2)) @ Z)
 
 
 def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
     """B with B Bᴴ = C⁺ for a logical C_q stack; see the module docstring."""
+    lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
+    return factor_from_eigensystem(lam, V, rcond=rcond, rank_log=rank_log, n_log=n_log)
+
+
+def factor_from_eigensystem(lam, V, *, rcond: float, rank_log: bool, n_log: int):
+    """Apply the SAME charge cut/certification to ascending eigenpairs.
+
+    ``V`` contains eigenvectors as columns. The eigensolver owns their
+    distribution; conditioning performs only replicated O(n) spectral work
+    and column scaling. The default :func:`factor` calls this owner too.
+    """
+    if (V.ndim < 2 or V.shape[-2] != V.shape[-1]
+            or lam.shape != V.shape[:-2] + (V.shape[-1],)):
+        raise ValueError('cplus.factor_from_eigensystem: square column eigenvectors and matching eigenvalues required')
     from isdf.core import _certify_the_cut, _close_the_cut
     # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
     # n_μ over-completes the pair-density rank (κ~1e13); plain
@@ -31,7 +51,6 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
     # errors that GN-PPM magnifies to tens of eV.  Rank-truncation
     # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
     # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
-    lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
     lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
     keep = lam > (rcond * lam_max)       # near-null cut
     # …and the near-null cut is not allowed to stop mid-multiplet.  THIS
@@ -110,3 +129,30 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
             mg=margin,
             ordered=False)
     return V * inv_sqrt[..., None, :].astype(V.dtype)
+
+
+def _require_face(value, mesh_xy):
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import require_full_mesh
+    require_full_mesh(mesh_xy,origin='cplus')
+    if (value.ndim != 3 or not isinstance(value.sharding, NamedSharding)
+            or value.sharding != NamedSharding(mesh_xy, P(None, 'x', 'y'))
+            or int(mesh_xy.shape['x']) != int(mesh_xy.shape['y'])):
+        raise ValueError('cplus: all-P square-mesh matrix face required')
+
+
+def factor_distributed(C_log, mesh_xy, *, rcond: float, rank_log: bool, n_log: int):
+    """Opt-in all-P eigensolve followed by the existing charge conditioning.
+
+    The matrix is already at its declared solve extent. In particular, an
+    interleaved centroid carrier uses the SAME pad diagonal/solve extent as
+    the incumbent fit; no alternate pad eigenvalue or rank policy enters.
+    """
+    from distrib_la import dispatch_batched_eigh
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    _require_face(C_log, mesh_xy)
+    if C_log.shape[-2] != C_log.shape[-1] or int(n_log) != C_log.shape[-1]:
+        raise ValueError('cplus.factor_distributed: declared square solve extent required')
+    lam, V = dispatch_batched_eigh(C_log, mesh_xy, backend='distributed', batched_route='auto')
+    B = factor_from_eigensystem(lam, V, rcond=rcond, rank_log=rank_log, n_log=n_log)
+    return jax.lax.with_sharding_constraint(B, NamedSharding(mesh_xy, P(None, 'x', 'y')))

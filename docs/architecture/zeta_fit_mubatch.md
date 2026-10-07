@@ -65,6 +65,35 @@ product-mesh carrier. Both logical tails are exact zeros; an odd native
 edge is not sliced to an indivisible face dimension. Ordinary reader
 requests keep their existing final extent.
 
+## Selected Gamma reference
+
+The optional source API `fit_zeta_to_h5(selected_q=[0])` requires scalar
+charge, equal complete declared band windows, an actual physical Γ at full-q
+row0, and a written ζ file. The ordinary `selected_q=None` route is retained.
+This is a reference API, with no production deck switch or ordinary restart
+reuse claim; its controller binds the selected-q/native feature provenance.
+
+`gw.isdf_fitting._gamma_c_from_parent_faces` realizes bounded child-k panels
+through the existing typed unfold and sums `isdf.core.gram_q0_from_psi_sm`.
+It keeps the full electronic-k census while omitting the all-q C bank. The
+same route-G kernel constructs Z with q selection before its sphere output.
+`isdf.cplus.factor_distributed` uses the public distributed/auto eigensolver;
+`factor_from_eigensystem` owns the same conditioning as the ordinary factor.
+No alternative cut, ridge, spectral closure or normalization is introduced.
+
+`ZStore.read_tile(face=True)` reads disk batch-major slots or host rank-major
+slots into μ_X/G_Y faces, composes their slot map with the packed centroid
+map using the common volume-preserving movement owners, and zeroes inactive
+centroid rows. The selected `ZetaG.write_file` applies `B(B†Z)` through the
+distributed panel owner and preserves the original physical-G mask. Its
+factor, raw/solved tile and output stay on all processors. The old q-owned
+`contract_v` refuses this factor kind. Read a committed selected ζ file
+through the existing endpoint/V owner for the reference V/action controls.
+
+Focused source proof, actual native μ912 C/Z/ζ/V/action/Σ parity, compiler
+layouts and measured resident/workspace price are separate gates. The
+selected API alone certifies none of them, and does not authorize a large fit.
+
 ## One μ batch
 
 conj ψ(G) of the n_p raw parents k̄ is resident, with G slots sharded

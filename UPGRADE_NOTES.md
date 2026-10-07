@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — optional Γ-only scalar reference fit keeps its factor and solve on matrix faces
+
+`fit_zeta_to_h5(selected_q=[0])` is an opt-in reference producer for equal,
+complete declared scalar band windows. It checks that full-q row0 is physical
+Γ, sums the existing Γ Gram over bounded typed child-k panels, and retains
+the original route-G cross-normal calculation. The eigensystem comes from
+the distributed linear-algebra service with its explicit `auto` batch route;
+both eigensolver paths use the same charge cut, multiplet closure and rank
+certification in `isdf.cplus.factor_from_eigensystem`. The selected writer
+reads Z and applies the factor as all-P μ/G faces. Its incumbent q-owned lazy
+V pass is excluded: reference consumers read the committed Γ ζ through the
+existing endpoint/V owners. With `selected_q=None` the all-q fit and its
+conditioning/backend defaults are unchanged. No deck or environment change.
+
+This optional path is awaiting focused source and native μ912 numerical/
+resource admission; it does not certify a larger-μ fit or the spatial limit.
+See [route-G fit](docs/architecture/zeta_fit_mubatch.md#selected-gamma-reference).
+
 ## 2026-10-07 — QE saved geometry uses the output normalization
 
 `CrystalData.from_qe_save` now binds the saved output structure, lattice

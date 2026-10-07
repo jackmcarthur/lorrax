@@ -207,6 +207,53 @@ class ZetaChannel(NamedTuple):
     output_file: str
 
 
+def _gamma_c_from_parent_faces(psi_mun_parent, psi_nmu_parent, plan, mesh_xy, *, panel_k=8):
+    """Charge Γ Gram through the existing owner, with bounded typed k panels.
+
+    This optional equal-window reference route does not build the all-q C
+    bank. Each child panel uses the canonical wavefunction unfold; the
+    Gram arithmetic and spin trace remain in ``isdf.core``.
+    """
+    from functools import partial
+    from common.shard_map import shard_map
+    from isdf.core import gram_q0_from_psi_sm
+    if int(plan.nspinor) != 1 or type(panel_k) is not int or panel_k <= 0:
+        raise ValueError('Gamma selected-q fit requires scalar parent faces and a positive integer k panel')
+    tables = plan.wavefunction_unfold_tables()
+    def narrow(first):
+        result = dict(tables, **{key:np.asarray(tables[key])[first:first+panel_k]
+            for key in ('irr_idx','sym_idx','spin_action_full')})
+        del result['n_sym_spatial']
+        return result
+    specs = {key:P() for key in narrow(0)}
+    @partial(jax.jit, out_shardings=(NamedSharding(mesh_xy,P(None,'x','y',None)),
+                                   NamedSharding(mesh_xy,P(None,'x',None,'y'))))
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=(P(None,None,'x','y'),P(None,'x',None,'y'),specs),
+             out_specs=(P(None,'x','y',None),P(None,'x',None,'y')),check_vma=False)
+    def children(m,y,t):
+        t=dict(t,n_sym_spatial=plan.n_sym_spatial)
+        a=plan.unfold_face(m,spin_axis=1,mu_axis=2,mesh_axis='x',tables=t)
+        b=plan.unfold_face(y,spin_axis=2,mu_axis=3,mesh_axis='y',tables=t)
+        return a.transpose(0,2,3,1),jnp.conj(b)
+    as_x=jax.jit(lambda a:a,out_shardings=NamedSharding(mesh_xy,P(None,'x',None,None)))
+    as_y=jax.jit(lambda a:a,out_shardings=NamedSharding(mesh_xy,P(None,None,None,'y')))
+    n=int(plan.n_centroid_packed)
+    result=jax.jit(lambda:jnp.zeros((n,n),jnp.complex128),
+        out_shardings=NamedSharding(mesh_xy,P('x','y')))()
+    add=jax.jit(lambda a,b:a+b,out_shardings=result.sharding)
+    rep=NamedSharding(mesh_xy,P())
+    for first in range(0,len(tables['irr_idx']),panel_k):
+        a,b=children(psi_mun_parent,psi_nmu_parent,narrow(first))
+        a,b=as_x(a),as_y(b)
+        part=gram_q0_from_psi_sm(a,b,a,b,
+            _device_put_process_local(np.ones(a.shape[0],np.float64),rep),mesh_xy=mesh_xy,symmetrize=False)
+        result=add(result,part)
+        result.block_until_ready()
+        del a,b,part
+    return jax.jit(lambda a:a[None],out_shardings=NamedSharding(mesh_xy,P(None,'x','y')))(result)
+
+
 def _fit_mubatch(
     *, wfn, meta, centroid_indices, mesh_xy, plan, parent_psi,
     band_range_full, bispinor, bispinor_lift, k_unfold_plan,
@@ -557,6 +604,7 @@ def fit_zeta_to_h5(
     parent_psi=None,
     write_zeta_file: bool = True,
     current_basis_rows=None,
+    selected_q=None,
     print_fn=print,
 ):
     """Fit canonical q-IBZ ζ for each channel of ``output_files`` on route G.
@@ -588,6 +636,15 @@ def fit_zeta_to_h5(
             f"fit_zeta_to_h5: channels {vertices} must be (0,) (charge) or a "
             "subset of the current channels (1, 2, 3).")
     transverse = vertices != (0,)
+    if selected_q is not None:
+        requested=np.asarray(selected_q)
+        if (requested.dtype.kind not in 'iu' or requested.shape != (1,)
+                or int(requested[0]) != 0 or transverse or int(meta.nspinor) != 1):
+            raise ValueError('fit_zeta_to_h5: optional selected_q currently accepts only scalar charge Gamma [0]')
+        if not write_zeta_file:
+            raise ValueError('fit_zeta_to_h5: selected Gamma reference requires a committed ζ file; lazy q-owned V is excluded')
+        if solver_kind not in ('auto','distributed_rank_truncate'):
+            raise ValueError('fit_zeta_to_h5: selected Gamma uses the distributed rank-truncated charge factor')
     mem_probe("zeta_fit_start")
 
     # Two μ extents (common/meta.py): ``n_rmu`` is the LOGICAL centroid count
@@ -609,6 +666,9 @@ def fit_zeta_to_h5(
         band_range_left = (meta.b_id_0, meta.b_id_3)
     if band_range_right is None:
         band_range_right = (meta.b_id_0, meta.b_id_4)
+    if selected_q is not None and (tuple(band_range_left) != tuple(band_range_right)
+            or tuple(band_range_left) != (int(meta.b_id_0),int(meta.b_id_4_user))):
+        raise ValueError('fit_zeta_to_h5: selected Gamma reference requires equal complete declared native windows')
 
     # The production fit uses asymmetric serving windows: L (the bra leg)
     # holds all occupied states plus the Sigma conduction window, R (the ket
@@ -687,7 +747,16 @@ def fit_zeta_to_h5(
     from ffi import _services
     _services.ensure_on_path()
     from symmetry_maps import bgw_integer_q_to_fractional
-    if write_ibz_only:
+    if selected_q is not None:
+        actual_gamma=bgw_integer_q_to_fractional(np.asarray(sym.kvecs_asints)[[0]],meta.kgrid)
+        if (int(meta.nk_tot) != int(np.prod(meta.kgrid))
+                or actual_gamma.shape != (1,3) or np.any(actual_gamma != 0.)):
+            raise ValueError('fit_zeta_to_h5: selected full-q row0 must be physical Gamma on the complete canonical k grid')
+        q_irr_full_idx=np.asarray([0],np.int32)
+        n_q_disk=1
+        q_irr_frac=actual_gamma
+        print_fn('  selected-q reference: Gamma only, all-P Gram/factor/application')
+    elif write_ibz_only:
         q_irr_full_idx = sym.q_irr_full_idx
         n_q_disk = int(q_irr_full_idx.shape[0])
         # BGW wrap THEN divide by kgrid, the V_q kernel's phase convention.
@@ -772,12 +841,15 @@ def fit_zeta_to_h5(
             _per_pair_completion = (_q_neg_idx is not None and any(
                 complex(w).imag != 0.0 for w, _, _ in terms))
             for w, i, j in terms:
-                part = c_q_from_psi_sm(
-                    kgrid=kgrid, mesh_xy=mesh_xy,
-                    psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
-                    weight_l=weight_l_face, weight_r=weight_r_face,
-                    gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
-                    gamma_L=i, gamma_R=j)
+                if selected_q is not None:
+                    part=_gamma_c_from_parent_faces(psi_mun_parent,psi_nmu_parent,k_unfold_plan,mesh_xy)
+                else:
+                    part = c_q_from_psi_sm(
+                        kgrid=kgrid, mesh_xy=mesh_xy,
+                        psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
+                        weight_l=weight_l_face, weight_r=weight_r_face,
+                        gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
+                        gamma_L=i, gamma_R=j)
                 if _per_pair_completion:
                     part = complete_ordered_pair_normal_equations(
                         jax.lax.with_sharding_constraint(
@@ -788,7 +860,7 @@ def fit_zeta_to_h5(
                 C_q = part if C_q is None else C_q + part
                 del part
             C_q_flat = jax.lax.with_sharding_constraint(
-                C_q.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard)
+                C_q.reshape(1 if selected_q is not None else nq, n_rmu_padded, n_rmu_padded), flat_shard)
             del C_q
             if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
                 # Interleaved pad slots (orbit-packed order): C_q's pad rows and
@@ -804,7 +876,7 @@ def fit_zeta_to_h5(
                 C_q_flat = complete_ordered_pair_normal_equations(
                     C_q_flat, _q_neg_idx)
             # IBZ cascade: slice C_q to the stored rows before the per-q factor.
-            if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
+            if selected_q is None and write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
                 from symmetry_maps import slice_q_full_to_ibz
                 C_q_flat = slice_q_full_to_ibz(
                     C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
@@ -814,22 +886,32 @@ def fit_zeta_to_h5(
             # Route G applies a WHOLE-TILE factor on each G tile: the charge
             # channel's rank-truncated pseudo-inverse, or a current channel's
             # local pivoted LU.
-            _kind = 'lu' if v != 0 else _resolve_solver_kind(
-                0, solver_kind,
-                n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]))
-            _factor = factor_c_q(
-                C_q_flat, mesh_xy, vertex_mu_L=v,
-                n_rmu_logical=n_rmu_solve, solver_kind=_kind,
-                zeta_rcond=zeta_rcond)
+            if selected_q is not None:
+                from isdf import cplus
+                from isdf.core import _deprecated_env_float
+                _kind='distributed_rank_truncate'
+                effective_rcond=_deprecated_env_float('LORRAX_ZETA_RCOND','zeta_rcond',zeta_rcond)
+                _factor=cplus.factor_distributed(C_q_flat,mesh_xy,rcond=effective_rcond,
+                    rank_log=True,n_log=n_rmu_solve)
+            else:
+                _kind = 'lu' if v != 0 else _resolve_solver_kind(
+                    0, solver_kind,
+                    n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]))
+                _factor = factor_c_q(
+                    C_q_flat, mesh_xy, vertex_mu_L=v,
+                    n_rmu_logical=n_rmu_solve, solver_kind=_kind,
+                    zeta_rcond=zeta_rcond)
             # The charge factor is one array; a current factor is (factor, piv).
             L_q, lu_piv = _factor if v != 0 else (_factor, None)
             jax.block_until_ready(L_q)
             print_fn(f"  μ_L={v} factor: {_kind} -> "
                      f"{'hoisted pivoted LU' if lu_piv is not None else 'whole-tile'} "
-                     f"{tuple(L_q.shape)}, back-solve on the q owners")
+                     f"{tuple(L_q.shape)}, back-solve on "
+                     f"{'all-P faces' if selected_q is not None else 'the q owners'}")
         with timing.section("zeta_fit.factor_residency"):
-            L_q, lu_piv = zeta_factor_resident(
-                L_q, lu_piv, mesh_xy, solver_kind=_kind)
+            if selected_q is None:
+                L_q, lu_piv = zeta_factor_resident(
+                    L_q, lu_piv, mesh_xy, solver_kind=_kind)
         del C_q_flat
         gc.collect()
 
