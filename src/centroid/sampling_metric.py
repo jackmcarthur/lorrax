@@ -256,6 +256,8 @@ def build_feature_metric_diagonal(
     gamma_mode: str,
     dist_mesh=None,
     verbose: bool = True,
+    band_reader=None,
+    native_parent_band_counts=None,
 ):
     """Build the q=0 feature-Gram diagonal on the WFN FFT grid.
 
@@ -279,6 +281,14 @@ def build_feature_metric_diagonal(
     (every production deck) build one ``D`` and use it on both sides.  Each
     distinct symmetry row accumulates its weighted parent fields, and the
     FFT-grid pullback of that row is applied once at the end.
+
+    A reference caller may supply ``band_reader(band_range=(lo, hi),
+    pad_to=carrier, parent_ids=raw_parent_ids) -> (psi_G, native_valid)``
+    and complete native per-parent counts. The coefficient/validity seam
+    is the same guarded all-P input owner as ``load_parent_psi_G``; the
+    band density scan, quadrature and metric remain unchanged. The loader's
+    stored band count is never relabelled. Archive authentication and
+    distinct reference provenance belong to that caller.
     """
     from common import timing
     from common.collectives import (gather_to_host, process_rank_world,
@@ -299,10 +309,29 @@ def build_feature_metric_diagonal(
         raise ValueError(
             "gamma_mode='transverse' requires a two-component Pauli WFN; "
             f"got nspinor={int(wfn.nspinor)}")
+    logical_bands = int(wfn.nbands)
+    native_counts = None
+    if band_reader is not None:
+        from operator import index
+        from common.psi_G_store import native_parent_reader_counts
+        if not callable(band_reader) or mode != "charge":
+            raise ValueError("native centroid metric requires a callable charge-band reader")
+        native_counts = native_parent_reader_counts(
+            native_parent_band_counts, int(wfn.nkpts))
+        for window in (band_range_left, band_range_right):
+            if len(window) != 2 or any(isinstance(v, (bool, np.bool_)) for v in window):
+                raise ValueError("native centroid metric requires exact integer band windows")
+            try:
+                tuple(index(v) for v in window)
+            except TypeError as error:
+                raise ValueError("native centroid metric requires exact integer band windows") from error
+        logical_bands = int(native_counts.max())
+    elif native_parent_band_counts is not None:
+        raise ValueError("native centroid counts require the optional band reader")
     left_range = _validated_range(
-        band_range_left, int(wfn.nbands), "band_range_left")
+        band_range_left, logical_bands, "band_range_left")
     right_range = _validated_range(
-        band_range_right, int(wfn.nbands), "band_range_right")
+        band_range_right, logical_bands, "band_range_right")
 
     fft_grid = tuple(int(v) for v in wfn.fft_grid)
     n_grid = int(np.prod(fft_grid))
@@ -360,9 +389,26 @@ def build_feature_metric_diagonal(
             hi = min(lo + band_chunk, union_hi)
             bands = np.arange(lo, hi)
             with timing.section("metric.load"):
-                psi_g = wfn.load(bands=(lo, hi), k=k_spec,
-                                 sharding=band_sphere_spec(),
-                                 bispinor=(mode == "transverse"))
+                if band_reader is None:
+                    psi_g = wfn.load(bands=(lo, hi), k=k_spec,
+                                     sharding=band_sphere_spec(),
+                                     bispinor=(mode == "transverse"))
+                else:
+                    from common.psi_G_store import validate_native_parent_band_tile
+                    from runtime.padding import mesh_divisor, padded_axis
+                    pad = padded_axis(hi-lo, mesh_divisor(mesh),
+                                      name="native centroid metric bands").carrier
+                    read = band_reader(band_range=(lo, hi), pad_to=pad,
+                                       parent_ids=chunk)
+                    if not isinstance(read, tuple) or len(read) != 2:
+                        raise ValueError("native centroid reader must return coefficients and validity")
+                    psi_g = validate_native_parent_band_tile(
+                        *read, mesh_xy=mesh, n_parent=len(chunk),
+                        band_range=(lo, hi), pad_to=pad,
+                        nspinor=int(wfn.nspinor), ngkmax=int(wfn.ngkmax),
+                        physical_band_counts=native_counts[np.asarray(chunk)],
+                        physical_g_counts=np.asarray(wfn.ngk_valid(k=k_spec)))
+                    bands = np.arange(lo, lo+pad)
                 psi_g.block_until_ready()
             for w, (w_lo, w_hi) in enumerate(windows):
                 unit = ((bands >= w_lo) & (bands < w_hi)).astype(np.float64)

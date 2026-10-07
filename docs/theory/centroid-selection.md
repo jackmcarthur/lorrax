@@ -36,6 +36,17 @@ Their eigenvalues are different diagnostics.
 s(r)=K(r,r)/alpha_fs^2 for current on the FFT grid. This global positive
 scale changes neither Lloyd minimizers nor relative pivot/rank criteria;
 absolute Gram magnitudes must retain the distinction.
+
+The reference-only optional native coefficient reader in
+`sampling_metric.build_feature_metric_diagonal` supplies bounded raw-parent
+tiles and complete per-parent band counts, through the same input validator
+as `common.psi_G_store.load_parent_psi_G`. It keeps the existing band density
+scan, typed full-zone quadrature and metric contraction. The reference
+keyword door in `kmeans_cli.main` records archive/seed bindings, native
+counts and explicit fit windows in the coordinate header. It requires the
+unpruned charge route; native pivoted-Cholesky input is not implemented.
+The caller authenticates the archive and reader against those bindings.
+The ordinary WFN selector retains its stored band extent and defaults.
 `centroid.kmeans_cli` uses w(r)=sqrt(s(r)) as Lloyd's mass (before any
 explicit `rho_power`). Thus the objective is
 

@@ -351,7 +351,8 @@ def _resolve_symmetry(args, wfn):
     return None, None, None, 1, False
 
 
-def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
+def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None, *,
+                    band_reader=None, native_parent_band_counts=None):
     """Build the feature-row norm used by both k-means and pruning.
 
     The cheap stage uses ``sqrt(diag(G))`` for the exact left/right windows
@@ -380,11 +381,20 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
         f"k-means weight: sqrt(Σ_k w_k Σ_{{m∈{left_range},n∈{right_range}}} "
         f"{channel}); [{range_label}], unit band weights")
     from .sampling_metric import build_feature_metric_diagonal
-    metric_diagonal = build_feature_metric_diagonal(
-        wfn, sym, left_range, right_range, gamma_mode=mode,
-        dist_mesh=dist_mesh,
-        verbose=(debug_print_enabled() and process_rank() == 0),
-    )
+    if band_reader is None:
+        metric_diagonal = build_feature_metric_diagonal(
+            wfn, sym, left_range, right_range, gamma_mode=mode,
+            dist_mesh=dist_mesh,
+            verbose=(debug_print_enabled() and process_rank() == 0),
+        )
+    else:
+        metric_diagonal = build_feature_metric_diagonal(
+            wfn, sym, left_range, right_range, gamma_mode=mode,
+            dist_mesh=dist_mesh,
+            verbose=(debug_print_enabled() and process_rank() == 0),
+            band_reader=band_reader,
+            native_parent_band_counts=native_parent_band_counts,
+        )
     if R is not None:
         from .charge_density import symmetrize_on_grid
         metric_diagonal = symmetrize_on_grid(metric_diagonal, R, tau)
@@ -494,9 +504,33 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 # Main
 # ─────────────────────────────────────────────────────────────────────────
 
-def main():
+def _validate_native_selection_request(args, band_reader, counts, provenance):
+    """Preflight the reference-only reader door before any selection work."""
+    if band_reader is not None:
+        if (not callable(band_reader) or counts is None
+                or not isinstance(provenance, dict)
+                or args.fit_window is None or args.oversample != 1.0
+                or args.density_mode != "scalar"):
+            raise ValueError("native centroid selection requires an explicit complete reader/counts/provenance, fit window and unpruned charge route")
+        import json
+        if provenance.get("complete_native_basis") is not True:
+            raise ValueError("native centroid selection requires declared complete native provenance")
+        for name in ("archive_sha256", "seed_wfn_sha256"):
+            value = provenance.get(name)
+            if (not isinstance(value, str) or len(value) != 64
+                    or any(c not in "0123456789abcdef" for c in value)):
+                raise ValueError("native centroid selection requires archive and seed SHA bindings")
+        json.dumps(provenance, sort_keys=True, allow_nan=False)
+    elif counts is not None or provenance is not None:
+        raise ValueError("native centroid selection metadata requires the optional reader")
+
+
+def main(*, band_reader=None, native_parent_band_counts=None,
+         native_input_provenance=None):
     args = build_parser().parse_args()
     validate_mode_policy(args)
+    _validate_native_selection_request(args, band_reader,
+        native_parent_band_counts, native_input_provenance)
     production_warnings = []
     production_stdout = ProductionStdout(
         debug=debug_print_enabled(), rank=RUNTIME.process_index,
@@ -554,8 +588,14 @@ def main():
     R, Rinv, tau, n_sym, orbit_aware = _resolve_symmetry(args, wfn)
 
     with timing.section("setup.weight"):
-        weight, weight_label, weight_band_ranges = _resolve_weight(
-            args, wfn, sym, R, tau, dist_mesh=mesh)
+        if band_reader is None:
+            weight, weight_label, weight_band_ranges = _resolve_weight(
+                args, wfn, sym, R, tau, dist_mesh=mesh)
+        else:
+            weight, weight_label, weight_band_ranges = _resolve_weight(
+                args, wfn, sym, R, tau, dist_mesh=mesh,
+                band_reader=band_reader,
+                native_parent_band_counts=native_parent_band_counts)
 
     # w^α re-weighting.  Per Gersho the asymptotic centroid number density
     # goes as w^(3α/5), so α > 1 pulls points into high-density regions.
@@ -681,6 +721,13 @@ def main():
         prune_label=prune_label, orbit_aware=orbit_aware, n_sym=n_sym,
         density_mode=args.density_mode, pool=n_pool, unpicked=unpicked,
         rank_law=rank_law)
+    if band_reader is not None:
+        import json
+        native_record = dict(native_input_provenance,
+            native_bands_by_parent=np.asarray(native_parent_band_counts, np.int64).tolist(),
+            band_windows_zero_based=dict(left=list(weight_band_ranges[0]),right=list(weight_band_ranges[1])),
+            selection_rank="UNMEASURED: unpruned reference selection")
+        header += "\nnative_feature_input: " + json.dumps(native_record, sort_keys=True, allow_nan=False)
     # ONE writer.  Every rank used to reach this savetxt on the same shared
     # path.  It survived P=16 only because all ranks write identical bytes —
     # which is precisely the latent form of the bug that DID bite at P=64 in

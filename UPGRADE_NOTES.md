@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — reference-only native-band centroid metric input
+
+The charge centroid metric accepts an optional bounded raw-parent coefficient
+reader and complete native per-parent counts. It uses the existing all-P
+coefficient/mask validator and unchanged density, quadrature and metric owners;
+the stored WFN band extent is not relabelled. The reference keyword door in
+`centroid.kmeans_cli.main` forwards it and stamps archive/seed/count/window
+provenance. This opt-in route requires explicit fit windows and oversample1;
+native pivoted-Cholesky pruning refuses until it has a shared reader. Default
+WFN inputs and selection arithmetic are unchanged. Numerical source and
+physical selection/resource admissions remain separately scoped.
+
 ## 2026-10-07 — optional head cell draw refinement
 
 `gw.qsgw_head.head_samples_from_s` now forwards optional `nsamples`,
