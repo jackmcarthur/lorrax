@@ -37,6 +37,28 @@ channels take the same LR+RL completion on each Cartesian vertex pair
 circular channel's combined vertex (α^± = (α^1 ± iα^2)/√2) is not Hermitian,
 so the completion of the combined channel is not its conjugate at −q.
 
+## Native finite-basis parent inputs
+
+`common.psi_G_store.load_parent_psi_G` also accepts an optional
+`band_reader(band_range=(lo, hi), pad_to=wc, k_domain=...)` callback and
+`native_parent_band_counts`. The callback returns the coefficient tile and
+its explicit physical-band mask. The central producer checks complex128
+band-XY layout over the whole mesh, exact requested/native counts, finite
+coefficients and zero invalid band/G slots. Complete native dimensions must
+equal the source spinor count times its physical G count. The same existing
+G-slot exchange, centroid DFT and insertion build `ParentPsiG`; neither C_q
+nor Z_q has a second implementation. With no callback, the ordinary WFN
+reader path is unchanged.
+
+The caller authenticates the archive and paired source k/G geometry. A
+native fit records those input hashes, per-parent/full-k native counts and
+validity, logical feature windows and centroid identity in its own fit
+provenance. A common-band fit stamp cannot identify a ragged full-native
+fit. Invalid native bands are exact-zero coefficients rather than invented
+energies or occupied states. The reference controller sets the declared
+logical band extent before sampling, so centroid faces and the G-slot store
+cover the same fit windows.
+
 ## One μ batch
 
 conj ψ(G) of the n_p raw parents k̄ is resident, with G slots sharded

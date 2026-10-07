@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — guarded native parent coefficients can feed the existing ζ fit
+
+`common.psi_G_store.load_parent_psi_G` has optional `band_reader` and
+`native_parent_band_counts` inputs. A native archive reader can supply every
+valid per-parent state, with exact-zero ragged tails, to the existing G-slot
+exchange and centroid sampler. The producer validates physical dimensions,
+logical windows, complex128 all-P layout, explicit masks, finite values and
+zero band/G ghosts. `ParentPsiG`, the ordinary reader defaults, and the C/Z
+fit equations are unchanged. This seam does not authorize ordinary reuse of
+a native fit: the reference caller must bind archive/source hashes, native
+validity and feature windows separately. No production recipe/default law
+or deck change.
+
 ## 2026-10-07 — the decoupled sector route is admitted by its price; the decoupled CT needs route-(c) eighs and runs after the selection panels are released
 
 060697565's rule (decoupled only when parents < ranks) is replaced by a price, in this order:
