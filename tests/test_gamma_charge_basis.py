@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import transpose_xy
+from common.collectives import gather_to_host, transpose_xy
 from gw import contour_reference as cd
 from gw.gamma_charge_basis import (gamma_charge_basis,
                                   gamma_charge_basis_metadata, _map_program)
@@ -40,11 +40,17 @@ def face(value, mesh):
                           NamedSharding(mesh, P(None, "x", "y")))
 
 
+def host(value):
+    """Only tiny synthetic outputs may be gathered for independent literals."""
+    assert value.nbytes <= 16 * 1024
+    return np.asarray(gather_to_host(value))
+
+
 @pytest.mark.parametrize("order", [None, [4, 0, 3, 2, 1]])
 def test_literal_real_fourier_functions_and_physical_projector(mesh, order):
     s = sphere(order)
     u, adjoint, receipt = gamma_charge_basis(s, mesh=mesh)
-    a, b = np.asarray(u)[0], np.asarray(adjoint)[0]
+    a, b = host(u)[0], host(adjoint)[0]
     g = s.gvecs[0, :5]
     points = np.asarray([[.17, .23, -.31], [.39, -.41, .07], [0., 0., 0.]])
     waves = np.zeros((8, len(points)), complex)
@@ -137,7 +143,7 @@ def test_cached_program_keeps_reordered_geometry_dynamic(mesh):
     assert _map_program(mesh, 8) is _map_program(rebuilt, 8)
     second, _, other = gamma_charge_basis(sphere([4, 0, 3, 2, 1]), mesh=rebuilt)
     assert receipt["signature"] != other["signature"]
-    assert np.linalg.norm(np.asarray(first) - np.asarray(second)) > 1.
+    assert np.linalg.norm(host(first) - host(second)) > 1.
 
 
 def test_complex_both_density_roles_nonsymmetric_operator_and_wrong_twist(mesh):
@@ -149,22 +155,22 @@ def test_complex_both_density_roles_nonsymmetric_operator_and_wrong_twist(mesh):
     reverse = rho[..., receipt["g_negation"]].conj()
     direct_r = cd.project_density_endpoints(face(rho, mesh), adjoint, mesh=mesh)
     reverse_r = cd.project_density_endpoints(face(reverse, mesh), adjoint, mesh=mesh)
-    np.testing.assert_allclose(reverse_r, np.asarray(direct_r).conj(), atol=5e-16)
-    assert np.max(abs(np.asarray(direct_r).imag)) > .1
+    np.testing.assert_allclose(host(reverse_r), host(direct_r).conj(), atol=5e-16)
+    assert np.max(abs(host(direct_r).imag)) > .1
     field_r = cd.lift_interaction_endpoints(face(operator, mesh), u, mesh=mesh, prefactor=1.)
     restored = cd.lift_interaction_endpoints(field_r, adjoint, mesh=mesh, prefactor=1.)
-    np.testing.assert_allclose(restored, operator, rtol=3e-14, atol=3e-14)
+    np.testing.assert_allclose(host(restored), operator, rtol=3e-14, atol=3e-14)
     for original, mapped in [(rho, direct_r), (reverse, reverse_r)]:
         _, left = cd.project_interaction_diagonal(face(operator, mesh), face(original, mesh),
             mesh=mesh, prefactor=1/137., scalar_replication_bound_bytes=128)
         _, right = cd.project_interaction_diagonal(field_r, mapped,
             mesh=mesh, prefactor=1/137., scalar_replication_bound_bytes=128)
-        np.testing.assert_allclose(left, right, rtol=2e-14, atol=2e-15)
+        np.testing.assert_allclose(host(left), host(right), rtol=2e-14, atol=2e-15)
     partner_r = transpose_xy(field_r, mesh)
     partner_g = cd.lift_interaction_endpoints(partner_r, adjoint, mesh=mesh, prefactor=1.)
     j = receipt["g_negation"]
     expected = operator.swapaxes(-1, -2)[:, j][:, :, j]
-    np.testing.assert_allclose(partner_g, expected, rtol=3e-14, atol=3e-14)
+    np.testing.assert_allclose(host(partner_g), expected, rtol=3e-14, atol=3e-14)
     assert np.linalg.norm(expected - operator.swapaxes(-1, -2)) > 1.
     assert np.linalg.norm(expected - operator.conj()) > 1.
 
@@ -182,12 +188,12 @@ def test_ordered_complex_positive_residues_and_slope_round_trip(mesh):
         values += a[None]/(sites[:, None, None]-omega) - b[None]/(sites[:, None, None]+omega)
         slopes += -a[None]/(sites[:, None, None]-omega)**2 + b[None]/(sites[:, None, None]+omega)**2
     mapped_residues = cd.lift_interaction_endpoints(face(residues, mesh), u, mesh=mesh, prefactor=1.)
-    for a in np.asarray(mapped_residues):
+    for a in host(mapped_residues):
         np.testing.assert_allclose(a, a.conj().T, rtol=1e-15, atol=1e-15)
         assert np.linalg.eigvalsh(a).min() > -1e-13
     # Real charge functions do not imply symmetric residues or an even field.
-    assert np.linalg.norm(np.asarray(mapped_residues)-np.asarray(mapped_residues).swapaxes(-1, -2)) > 1.
+    assert np.linalg.norm(host(mapped_residues)-host(mapped_residues).swapaxes(-1, -2)) > 1.
     for original in [values, slopes, slopes/(2*sites[:, None, None])]:
         transformed = cd.lift_interaction_endpoints(face(original, mesh), u, mesh=mesh, prefactor=1.)
         restored = cd.lift_interaction_endpoints(transformed, adjoint, mesh=mesh, prefactor=1.)
-        np.testing.assert_allclose(restored, original, rtol=3e-15, atol=3e-14)
+        np.testing.assert_allclose(host(restored), original, rtol=3e-15, atol=3e-14)
