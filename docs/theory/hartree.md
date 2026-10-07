@@ -1,9 +1,11 @@
 # Direct Hartree field
 
-GW builds the direct field live from its own wavefunctions and occupations.
+GW builds the direct field from its own wavefunctions and occupations.
 `kin_ion.h5` carries only $T+V_{\rm loc}+V_{\rm NL}$. There is one
-implementation, `gw.hartree.direct_field_matrices`, and it always works
-on the WFN FFT grid: there is no stored, folded or ISDF Hartree.
+ordinary-WFN implementation, `gw.hartree.direct_field_matrices`, which works
+on the WFN FFT grid. Atomic reconstruction additionally retains a direct
+receiving band matrix from the shared fitting frame, as described below;
+it does not fit the Hartree matrix through ISDF points.
 
 ## Sources
 
@@ -33,6 +35,39 @@ Inside that scan the current is projected once onto the polar-vector
 representation of the magnetic group (`symmetry_maps.project_polar_fft_field`,
 antiunitary rows included); its receipt (the movement of the raw field, the
 covariance residual of the projected one) is the one the run reports.
+
+### Reconstructed fixed-source charge
+
+For `atomic_reconstruction_dir` with `bispinor_gw = coulomb_only`, the source
+and receiving orbitals use the same full-WFN Löwdin factor on their smooth
+and atomic pieces. Both large and small components enter $\rho$. Source
+weights are the physical occupations and full-zone k quadrature; the
+occupied-band weight in the ISDF loss never becomes a density weight.
+Physical bands and their padded transport carrier have separate domains.
+
+`gw.augmentation_hartree_receiving.build_resident_receiving_J` reuses the
+ordinary FFT Poisson and matrix sweep for the smooth field. The existing
+`isdf.atomic_hartree` owner supplies the compact local corrections and the
+periodic neutral-cell mean terms. The smooth receiving overlap is measured
+in the shared frame, rather than replaced by an identity matrix. Atomic
+endpoint samples remain distributed over both mesh axes; bounded band
+tiles construct the native FILE-wedge operator at `P(None,'x','y')` before
+the fitting stage releases its orbital store.
+
+`gw.augmentation_hartree` authenticates the density, frame, geometry and
+operator recipe, serves the saved native matrix with the canonical FILE/TR
+map, and lets the existing Sigma assembly apply a requested basis rotation
+once. The restart bundle stores the matrix with its source/operator binding
+and logical payload checksum. A missing or changed reconstructed source
+refuses before large restart tensors are read. The admitted lifecycle is
+fixed-source `one_shot_dft`; an updated density requires reconstruction of
+its source and is currently refused. Unaugmented runs retain the live path.
+
+The reconstruction changes the interaction vertices while retaining the
+original DFT energies and ionic/XC references. A consistent all-electron
+one-body reference and frozen-core counterterms require a separate physical
+comparison; correctness of this direct field alone does not establish
+all-electron quasiparticle energies.
 
 ## G-space solve
 

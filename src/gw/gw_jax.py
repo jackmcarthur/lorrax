@@ -850,6 +850,7 @@ def _run_oneshot_sigma(
                 bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
                 photon_response=photon_response,
                 occupation_state=oneshot_occupation_state,
+                resident_hartree=getattr(isdf, 'resident_hartree', None),
                 material_class=material_class,
                 print_fn=print0,
             )

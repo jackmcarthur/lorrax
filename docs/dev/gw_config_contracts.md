@@ -48,6 +48,18 @@ rulings override anything here.
   skips the one-shot Σ (`_run_oneshot_sigma`); the SC loop's first map computes
   it, with $U = I$, so it equals the one-shot bit for bit
   ([self-consistency](../self_consistency.md)).
+- **Reconstructed Hartree uses the fitting frame.** Atomic augmentation
+  finishes the fixed-source charge Hartree receiving matrix before the
+  shared orbital store is donated to the fit. Only its small FILE-wedge band
+  matrix and authenticated source/operator metadata survive. Fresh and
+  restart paths serve that matrix through the existing Sigma assembly and
+  apply the QP basis rotation once; they refuse a missing or changed source
+  instead of reconstructing a field from the original pseudo wavefunctions.
+  This route currently requires four-component ordinary 3D Coulomb and
+  `qp_solver = one_shot_dft`. Density self-consistency needs a reconstructed
+  source update and is refused. The original DFT energy and ionic/XC
+  references remain an effective reconstructed-vertex model; this does not
+  establish an all-electron one-body reference.
 - **Σ_x sign check.** Every Σ_x diagonal entry must be negative, because Σ_x is
   a negative-definite quadratic form. On the one-shot path `sanity.check_sign`
   prints a sanity failure line for a positive entry (a sign, conjugation or

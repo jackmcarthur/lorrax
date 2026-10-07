@@ -1237,21 +1237,37 @@ def _static_sigma_channels(
 
 def _sigma_hartree_fields(
         band_slices, config, hartree_basis_rotation, mesh_xy, meta, omit_v_h, print_fn,
-        sig_x, sym, wfn):
+        sig_x, sym, wfn, *, resident_hartree=None, occupation_state=None):
     """Produce the exact Hartree fields in the Sigma basis."""
     if omit_v_h:
         sig_h = jnp.asarray(0, dtype=sig_x.dtype)
         h_transverse = None
     else:
         with timing.section("sigma.hartree") as sec:
-            sig_h, h_transverse = _compute_live_hartree(
-                config, meta, band_slices, mesh_xy,
-                wfn=wfn, sym=sym, print_fn=print_fn)
+            if resident_hartree is None:
+                if getattr(config.paths, 'atomic_reconstruction_dir', None):
+                    raise ValueError('GATE resident_hartree_required: augmented charge requires its paired reconstructed Hartree field')
+                sig_h, h_transverse = _compute_live_hartree(
+                    config, meta, band_slices, mesh_xy,
+                    wfn=wfn, sym=sym, print_fn=print_fn)
+            else:
+                from .augmentation_hartree import serve_resident_hartree
+                sig_h = serve_resident_hartree(resident_hartree,
+                    config=config, wfn=wfn, sym=sym, mesh=mesh_xy,
+                    band_range=(int(band_slices.b0), int(band_slices.b3)),
+                    occupation_state=occupation_state)
+                h_transverse = None
             sec.watch(sig_h, h_transverse)
         sig_h = jnp.asarray(sig_h, dtype=sig_x.dtype)
         if hartree_basis_rotation is not None:
-            rotation = _place_band_rotation(
-                hartree_basis_rotation, mesh_xy, sig_h.dtype)
+            if resident_hartree is None:
+                rotation = _place_band_rotation(
+                    hartree_basis_rotation, mesh_xy, sig_h.dtype)
+            else:
+                from .augmentation_hartree import place_resident_hartree_rotation
+                rotation = place_resident_hartree_rotation(hartree_basis_rotation,
+                    mesh=mesh_xy, logical_bands=int(band_slices.b3-band_slices.b0),
+                    dtype=sig_h.dtype)
             sig_h = _rotate_v_h_to_qp(sig_h, rotation, mesh=mesh_xy)
     v_h_scalar = sig_h
     if h_transverse is not None and hartree_basis_rotation is not None:
@@ -1658,6 +1674,7 @@ def compute_sigma_xc(
     photon_response=None,
     write_sigma_omega_h5: bool = True,
     hartree_basis_rotation: jax.Array | None = None,
+    resident_hartree=None,
     omit_v_h: bool = False,
     iteration_head=None,
     occupation_state=None,
@@ -1687,7 +1704,7 @@ def compute_sigma_xc(
             packed.delete()
     (sig_h, v_h_scalar, h_transverse) = _sigma_hartree_fields(
         band_slices, config, hartree_basis_rotation, mesh_xy, meta, omit_v_h, print_fn, sig_x,
-        sym, wfn)
+        sym, wfn, resident_hartree=resident_hartree, occupation_state=occupation_state)
     if mode is ComputeMode.X_ONLY or mode is ComputeMode.COHSEX:
         return _static_sigma_result(
             h_transverse, mode, omit_v_h, photon_head_sigma_basis, photon_head_sigma_diag, sig_coh,

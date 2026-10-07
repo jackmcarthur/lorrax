@@ -33,6 +33,7 @@ from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSI
     COULOMB_POLICY_DATASET, DOWNFOLD_PROVENANCE_GROUP,
     _decode_charge_zeta_identity, _encode_charge_zeta_provenance,
     _loaded_band_axis, _validate_shape_receipt,
+    HARTREE_PARENT_DATASET, _read_hartree_provenance, _hartree_band_axis,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
 
@@ -44,6 +45,52 @@ if TYPE_CHECKING:
 _REGENERATE = (
     "this bundle predates the raw-parent format; "
     "regenerate it with gwjax at main >= 891047f4")
+
+
+def read_resident_hartree_metadata(filename, *, expected=None, required=False):
+    """Authenticate optional native J with bounded host reads.
+
+    Returns None for an absent optional member, otherwise the closed persisted
+    provenance. Shape, FILE rows, completion and logical payload checksum are
+    admitted before unrelated restart arrays are loaded. GW owns the requested
+    source/operator comparison through the supplied named expected fields.
+    """
+    from .commit_state import assert_committed
+    with h5py.File(filename, 'r') as stream:
+        assert_committed(stream)
+        return _read_hartree_provenance(
+            stream, expected=expected, required=required)
+
+
+def read_resident_hartree_from_h5(filename, mesh_xy, *, expected=None, required=False):
+    """Read authenticated native J with two band axes on P(None,x,y).
+
+    The logical receiving range determines its own padding, independently of
+    the parent wavefunction and centroid extents. The returned plain record
+    contains parent_kij_ry and the immutable persisted provenance.
+    """
+    from .slab_io import SlabIO
+    record = read_resident_hartree_metadata(
+        filename, expected=expected, required=required)
+    if record is None:
+        return None
+    with SlabIO(filename, mode='r', mesh=mesh_xy) as io:
+        return _read_resident_hartree_slab(io, record, mesh_xy)
+
+
+def _read_resident_hartree_slab(io, record, mesh_xy):
+    """The single band-tile read shared by dedicated and whole-bundle readers."""
+    nb = record['band_range'][1] - record['band_range'][0]
+    axis = _hartree_band_axis(nb, mesh_xy)
+    shape = (len(record['parent_full_rows']), axis.carrier, axis.carrier)
+    array = io.read_slab(
+        HARTREE_PARENT_DATASET, shape=shape, dtype=np.complex128,
+        offset=(0, 0, 0), mesh=mesh_xy, partition_spec=P(None, 'x', 'y'))
+    jax.block_until_ready(array)
+    for band_axis in (1, 2):
+        authenticate_axis(array, axis, axis=band_axis,
+                          where='resident Hartree restart')
+    return dict(parent_kij_ry=array, provenance=record)
 
 
 def _require_current(f):
@@ -334,6 +381,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *,
     # ---- pass 1: geometry + the small replicated arrays, serial h5py ----
     with h5py.File(filename, "r") as f:
         _require_current(f)
+        hartree_record = _read_hartree_provenance(f)
         parent_T = "psi_parent_y_transverse" in f
         if parent_T != ("psi_parent_y_transverse_mun" in f):
             raise ValueError("Restart has torn transverse parent faces")
@@ -478,6 +526,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *,
         psi_mun_parent = _read_psi(io, "psi_parent_y_mun", n_rmu_disk,
                                     spec=psi_mun_spec, mu_axis=-2,
                                     spinor_axis=1, band_axis=-1)
+        resident_hartree = (None if hartree_record is None else
+                            _read_resident_hartree_slab(io, hartree_record, mesh_xy))
         if n_rmu_T_disk is not None:
             psi_nmu_parent_T = _read_psi(io, transverse_name, n_rmu_T_disk,
                                         spec=psi_nmu_spec)
@@ -528,6 +578,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *,
         V0_noG0_munu=V0_noG0_munu, G0_mu_nu=G0_mu_nu,
         n_rmu_transverse_disk=n_rmu_T_disk,
         charge_zeta_identity=charge_zeta_identity,
+        resident_hartree=resident_hartree,
         psi_nmu_parent=psi_nmu_parent, psi_mun_parent=psi_mun_parent,
         parent_k_rows=parent_k_rows,
         psi_nmu_parent_transverse=psi_nmu_parent_T,

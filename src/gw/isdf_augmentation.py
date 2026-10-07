@@ -1292,8 +1292,12 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     elif fit_origin != parent_psi.band_range[0]:
         raise ValueError("augmentation band weights must use the same raw-parent band origin as the smooth fit")
     current = _current_augmentation_request(current_request,wfn=wfn,meta=meta,plan=plan,sym=sym,public_range=public_range)
+    # Density identity names physical bands; reciprocal/output storage keeps
+    # its independent mesh carrier. Source occupations are padded below.
+    source_range = (public_range[0], min(public_range[1], int(wfn.nbands),
+        int(getattr(meta, 'b_id_4_user', public_range[1]))))
     source_capture = _hartree_source_request(hartree_source_request, wfn=wfn, plan=plan,
-                                             public_range=public_range)
+                                             public_range=source_range)
     if source_capture is not None and (overlap_mode != 'full_wfn_lowdin'
             or artifact.get('charge_metric', {}).get('smooth_neutral_cross') != 'onsite'
             or artifact.get('charge_metric', {}).get('moment_enrichment') != 'served_monopole'):

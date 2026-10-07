@@ -2822,7 +2822,17 @@ def _prepare_fresh_parent_faces(
                 write_ibz_only=zeta_contract.write_ibz_only_charge,
                 public_band_range=band_slices.full_range,
                 charge_fit_weights=zeta_contract.charge_fit_weights,
+                hartree_source_request={'occupations': None, 'full_kweights': None,
+                                        'spin_degeneracy': 1.},
                 print_fn=print0, artifact=augmentation_artifact)
+        from .augmentation_hartree import prepare_resident_hartree
+        with timing.section('gw_jax.augmented_hartree_receiving'):
+            chunks['resident_hartree'], _hartree_diagnostics = prepare_resident_hartree(
+                wfn=wfn, sym=sym, mesh=mesh_xy, plan=_candidate_plan,
+                state=chunks['augmentation'], artifact=augmentation_artifact,
+                wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+                band_range=(int(band_slices.b0), int(band_slices.b3)))
+        chunks['augmentation'].pop('hartree_source')
         if 'parent_psi' in chunks['augmentation']:
             chunks['parent_psi'] = chunks['augmentation'].pop('parent_psi')
     print0("  ψ storage: parents only -- "
@@ -2958,7 +2968,7 @@ def _write_fresh_restart(
         restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
         tensors_filename, transverse_wfn_data, wfn, wfns_transverse,
         write_restart_state_to_h5, *, charge_zeta_provenance,
-        atomic_augmentation_identity=None):
+        atomic_augmentation_identity=None, resident_hartree=None):
     """Write the existing authenticated Coulomb and parent-face restart bundle."""
     enk_full, _ = get_enk_bandrange(
         wfn, sym, band_slices.full_range,
@@ -3003,6 +3013,9 @@ def _write_fresh_restart(
                         log=lambda _message: None),
                 qirr=_qirr.with_capture(
                         take_pre_unfold("V_qmunu")),
+                **({} if resident_hartree is None else dict(
+                    hartree_parent_kij_ry=resident_hartree['parent_kij_ry'],
+                    hartree_provenance=resident_hartree['provenance'])),
         )
     if _write_restart:
         parent_T = None if wfns_transverse is None else wfns_transverse.green_parent
@@ -3070,6 +3083,7 @@ def _prepare_fresh_isdf(
         (zeta_contract, charge_zeta_identity_receipt, _candidate_plan, _parent_green_plan, chunks, _parent_zeta_plan, _parent_green_faces) = _prepare_fresh_parent_faces(
             band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg,
             load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir, wfn)
+        resident_hartree = None if chunks is None else chunks.pop('resident_hartree', None)
         (zeta_path, mem_est, transverse_wfn_data, transverse_basis_receipt) = _prepare_fitted_zeta(
             WavefunctionBasisReceipt, _basis_band_interval, _parent_green_faces, _parent_zeta_plan,
             band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg, chunks, mesh_xy,
@@ -3091,7 +3105,8 @@ def _prepare_fresh_isdf(
             write_restart_state_to_h5,
             charge_zeta_provenance=zeta_contract.provenance,
             atomic_augmentation_identity=json.loads(
-                zeta_contract.provenance).get('atomic_augmentation'))
+                zeta_contract.provenance).get('atomic_augmentation'),
+            resident_hartree=resident_hartree)
         if ((hasattr(zeta_path, 'contract_v') or cfg.bispinor)
                 and jax.process_index() == 0):
             # Route G's stage split through V_q (read, faces, C, fit, V_q),
@@ -3103,7 +3118,7 @@ def _prepare_fresh_isdf(
             print0("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
     V_qmunu.block_until_ready()
     print0("  Chunked ISDF path complete")
-    return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
+    return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt, resident_hartree)
 
 def _require_restart_charge_fit_weights(tensors_filename, expected_policy, *,
         wfn, wfn_fingerprint_binding, tmp_dir):
@@ -3475,6 +3490,21 @@ def _prepare_restart_isdf(
     	where="gw_jax restart"))
     _restart_wfn_provenance_complete = (
     	_restart_source_record is not None)
+    resident_hartree = None
+    _hartree_artifact = None
+    if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
+        from .isdf_augmentation import read_augmentation_manifest
+        from .augmentation_hartree import require_resident_hartree_source
+        from file_io.restart_bundle import read_resident_hartree_metadata
+        _hartree_artifact = read_augmentation_manifest(cfg.paths.atomic_reconstruction_dir)
+        _hartree_plan, _, _ = _prepare_parent_wavefunction_plan(
+            cfg, meta, wfn, band_slices, sym=sym, centroid_indices=centroid_indices,
+            mesh_xy=mesh_xy, print_fn=print0)
+        _hartree_metadata = read_resident_hartree_metadata(tensors_filename, required=True)
+        require_resident_hartree_source(_hartree_metadata,
+            wfn=wfn, sym=sym, plan=_hartree_plan, artifact=_hartree_artifact,
+            wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+            band_range=(int(band_slices.b0), int(band_slices.b3)))
     with timing.section(
     		"gw_jax.restart_load", announce=True,
     		label="restart load (metadata, SlabIO tensors, wedge, reshard)"):
@@ -3502,6 +3532,14 @@ def _prepare_restart_isdf(
         (wfns, sigma_parent_carrier, green_parent_carrier, head_channel) = _restart_charge_carrier(
             _to_run_order, band_slices, centroid_indices, cfg, charge_basis_receipt, head_channel,
             mesh_xy, meta, print0, rs, sym, tensors_filename, tmp_dir, wfn)
+        if _hartree_artifact is not None:
+            from .augmentation_hartree import bind_resident_hartree
+            if green_parent_carrier is None or rs.resident_hartree is None:
+                raise ValueError('GATE resident_hartree_required: restart lacks a paired reconstructed native field')
+            resident_hartree = bind_resident_hartree(rs.resident_hartree,
+                wfn=wfn, sym=sym, plan=green_parent_carrier.plan, artifact=_hartree_artifact,
+                wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+                band_range=(int(band_slices.b0), int(band_slices.b3)))
         (wfns_transverse, transverse_basis_receipt, basis_T) = _restart_current_carrier(
             WavefunctionBasisReceipt, _basis_band_interval, _restart_wfn_provenance_complete,
             _stamped, _to_run_order, band_slices, basis_T, basis_wfn_fingerprint_binding, cfg,
@@ -3513,7 +3551,7 @@ def _prepare_restart_isdf(
                                    _bispinor_v_policy(cfg, meta))
     (photon_g0_vectors) = _restart_gamma_vectors(
         _to_run_order, basis_T, cfg, mesh_xy, meta, photon_g0_vectors, tmp_dir)
-    return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
+    return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt, resident_hartree)
 
 def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
@@ -3527,6 +3565,10 @@ def prepare_isdf_and_wavefunctions(
 	                                take_pre_unfold)
 	refuse_unsupported_bispinor_gw(cfg)
 	refuse_unsupported_bispinor_tt_head_correction(cfg)
+	if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
+	    from .gw_config import QPSolver
+	    if cfg.qp_solver is not QPSolver.ONE_SHOT_DFT:
+	        raise ValueError('GATE resident_hartree_fixed_source: augmented density self-consistency requires a reconstructed source rebuild')
 	from file_io.wfn_basis import WavefunctionBasisReceipt
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
@@ -3554,14 +3596,14 @@ def prepare_isdf_and_wavefunctions(
 			array = basis.unpack_axis(array, axis)
 		return array
 	if not cfg.restart:
-	    (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt) = _prepare_fresh_isdf(
+	    (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt, resident_hartree) = _prepare_fresh_isdf(
 	        WavefunctionBasisReceipt, _basis_band_interval, _to_file_order, band_slices,
 	        bgw_v_grid_fn, centroid_indices, cfg, load_centroids_band_chunked, mesh_xy, meta,
 	        print0, representation, resolve_restart_q_storage_for_run,
 	        restart_tensor_writes_enabled, sym, take_pre_unfold, tensors_filename, tmp_dir, wfn,
 	        write_restart_state_to_h5)
 	else:
-	    (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt) = _prepare_restart_isdf(
+	    (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt, resident_hartree) = _prepare_restart_isdf(
 	        WavefunctionBasisReceipt, _basis_band_interval, _to_run_order, band_slices, basis_T,
 	        centroid_indices, cfg, charge_basis_receipt, mesh_xy, meta, photon_g0_vectors, print0,
 	        sym, tensors_filename, tmp_dir, transverse_basis_receipt, wfn)
@@ -3594,6 +3636,7 @@ def prepare_isdf_and_wavefunctions(
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
 		mu_bases=(meta.mu_basis, basis_T),
+		resident_hartree=resident_hartree,
 		green_parent_carrier=green_parent_carrier,
 		sigma_parent_carrier=sigma_parent_carrier,
 		n_rmu_charge_logical=int(meta.n_rmu),

@@ -194,7 +194,7 @@ at its default, `false`.
 | key | type | default | meaning |
 |---|---|---|---|
 | `wfn_file` | str | `WFN.h5` | BerkeleyGW-format wavefunction input. |
-| `kin_ion_file` | str | `kin_ion.h5` | T + V_loc + V_NL matrix. Hartree is built live ([contract](theory/hartree.md)). |
+| `kin_ion_file` | str | `kin_ion.h5` | T + V_loc + V_NL matrix. The direct Hartree field uses the live WFN path or the authenticated reconstructed fixed-source matrix ([contract](theory/hartree.md)). |
 | `report_file` | str | `gwjax.out` | Rank-0 human-readable report: architecture, backends, symmetry and IBZ, band windows, QP gap, paths, warnings and stage timings. A QSGW run adds one row per map and the terminal verdict. |
 | `sigma_diag_file` | str | `sigma_diag.dat` | Per-(k, n) Σ decomposition, LORRAX text format ([columns](how-to/berkeleygw-users.md#33-sigma_diagdat)). With band extrapolation on, a one-shot run appends `sigC_raw`, `eqp0_raw`, `eqp1_raw` after `Z`: Σ_c truncated at the Σ band count with no tail, the numbers BerkeleyGW's truncated sum compares with. SC runs write no raw columns. |
 | `eqp0_file` | str | `eqp0.dat` | BerkeleyGW-format zeroth-order QP energies. |
