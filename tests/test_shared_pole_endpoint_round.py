@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.collectives import gather_to_host
+from common.collectives import gather_to_host, device_put_process_local
 from gw.response_bank import (physical_charge_response_algebra,
     physical_charge_coulomb_roots, PhysicalChargeRoundProvider)
 from gw.shared_pole_capacity import ConstructorCapacity, shared_pole_byte_terms
@@ -32,7 +32,7 @@ def mesh():
 
 def face(value, mesh):
     a=np.asarray(value, np.complex128)
-    return jax.device_put(a, NamedSharding(mesh,P(*((None,)*(a.ndim-2)),'x','y')))
+    return device_put_process_local(a, NamedSharding(mesh,P(*((None,)*(a.ndim-2)),'x','y')))
 
 
 def host(a):
