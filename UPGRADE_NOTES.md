@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — optional distributed Γ conditioning runs inside one cached program
+
+The opt-in Γ reference factor now compiles the existing spectral
+conditioning over runtime eigenvalues and all-P eigenvectors. Its mandatory
+rank diagnostics therefore execute within JIT rather than trying to move a
+non-addressable MPI array eagerly to a host device. The cut, multiplet
+closure, certification, factor formula and default fit route are unchanged.
+The first native backend control exposed this execution defect before ζ
+parity; corrected native parity and resource admission remain pending.
+
 ## 2026-10-07 — opt-in contour references differentiate external read energy
 
 `gw.contour_reference.anchor_part` and `imag_remainder_node` accept

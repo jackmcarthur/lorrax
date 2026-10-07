@@ -11,6 +11,8 @@ extent (``runtime.padding.solve_at_logical``); nothing here sees a pad.
 """
 from __future__ import annotations
 
+from functools import lru_cache
+
 import jax
 import jax.numpy as jnp
 
@@ -141,6 +143,24 @@ def _require_face(value, mesh_xy):
         raise ValueError('cplus: all-P square-mesh matrix face required')
 
 
+@lru_cache(maxsize=None)
+def _face_conditioner(mesh_xy, rcond, rank_log, n_log):
+    """One compiled shared conditioner for runtime distributed eigenpairs.
+
+    The mandatory diagnostics execute inside the compiled program, as in
+    the incumbent producer. Eager debug callbacks cannot host-place a
+    multi-process replicated scalar array. Only the O(n) spectrum is
+    replicated; eigenvectors and the conditioned factor remain all-P.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    rep = NamedSharding(mesh_xy, P())
+    return jax.jit(
+        lambda lam, V: factor_from_eigensystem(
+            lam, V, rcond=rcond, rank_log=rank_log, n_log=n_log),
+        in_shardings=(rep, face), out_shardings=face)
+
+
 def factor_distributed(C_log, mesh_xy, *, rcond: float, rank_log: bool, n_log: int):
     """Opt-in all-P eigensolve followed by the existing charge conditioning.
 
@@ -154,5 +174,5 @@ def factor_distributed(C_log, mesh_xy, *, rcond: float, rank_log: bool, n_log: i
     if C_log.shape[-2] != C_log.shape[-1] or int(n_log) != C_log.shape[-1]:
         raise ValueError('cplus.factor_distributed: declared square solve extent required')
     lam, V = dispatch_batched_eigh(C_log, mesh_xy, backend='distributed', batched_route='auto')
-    B = factor_from_eigensystem(lam, V, rcond=rcond, rank_log=rank_log, n_log=n_log)
+    B = _face_conditioner(mesh_xy, rcond, rank_log, n_log)(lam, V)
     return jax.lax.with_sharding_constraint(B, NamedSharding(mesh_xy, P(None, 'x', 'y')))
