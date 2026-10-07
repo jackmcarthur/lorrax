@@ -197,6 +197,73 @@ def project_interaction_diagonal(interaction, pair, *, mesh, prefactor,
         interaction, pair, jnp.asarray(prefactor, dtype=jnp.float64))
 
 
+@lru_cache(maxsize=16)
+def _target_block_program(mesh, n_targets):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    grouped = NamedSharding(mesh, P(None, "x", None, "y"))
+    replicated = NamedSharding(mesh, P())
+
+    def contract(product, pair, prefactor):
+        shape = (pair.shape[0], pair.shape[1] // n_targets,
+                 n_targets, pair.shape[2])
+        left = jax.lax.with_sharding_constraint(product.reshape(shape), grouped)
+        right = jax.lax.with_sharding_constraint(pair.reshape(shape), grouped)
+        return jnp.sum(left[:, :, :, None, :] * right[:, :, None, :, :],
+                       axis=-1) * prefactor
+
+    return jax.jit(contract, in_shardings=(face, face, replicated),
+                   out_shardings=replicated)
+
+
+def project_interaction_block(interaction, pair, *, mesh, n_targets,
+                              prefactor, scalar_replication_bound_bytes):
+    """Retain the complete target block for each internal state.
+
+    Pair rows on the same all-P face as :func:`project_interaction_diagonal`
+    are ordered ``[internal_m,target_a]``. The existing diagonal projector
+    supplies the unchanged product ``conj(pair) @ interaction``. The result
+    is the explicit contraction ``sum_G product[m,a,G]*pair[m,b,G]*pref``
+    with shape ``[batch,m,a,b]``. Only this caller-bounded small block is
+    replicated; product and both grouped contraction operands remain all-P.
+    Internal groups must divide the X axis, so reshaping never gathers pair
+    rows. Any padded target/internal entries must be zero at the caller.
+
+    Supply the physical prefactor and ``-W_c`` exactly as for the diagonal
+    projection. This function neither builds a response nor selects a
+    contour sheet or partner. A minus-q interaction contracted against the
+    reversed density roles needs its *external target block transpose*
+    before it represents the contour helper's already-transposed partner.
+    That transpose is distinct from an adjoint or a causal conjugation.
+    """
+    import jax.numpy as jnp
+
+    if (not isinstance(n_targets, (int, np.integer))
+            or isinstance(n_targets, (bool, np.bool_)) or n_targets < 1):
+        raise ValueError("CD block projection needs an exact positive target count")
+    n_targets = int(n_targets)
+    _endpoint_face(pair, mesh, "block pair")
+    if (pair.shape[1] % n_targets
+            or (pair.shape[1] // n_targets) % int(mesh.shape["x"])):
+        raise ValueError("CD block projection requires complete internal groups on the X face")
+    if (not isinstance(scalar_replication_bound_bytes, (int, np.integer))
+            or isinstance(scalar_replication_bound_bytes, (bool, np.bool_))):
+        raise ValueError("CD block projection needs an exact scalar replication bound")
+    scalar_bytes = (pair.shape[0] * pair.shape[1] * n_targets
+                    * pair.dtype.itemsize)
+    if scalar_replication_bound_bytes < scalar_bytes:
+        raise ValueError("CD block projection scalar output exceeds its explicit replication bound")
+    product, _ = project_interaction_diagonal(
+        interaction, pair, mesh=mesh, prefactor=prefactor,
+        scalar_replication_bound_bytes=scalar_replication_bound_bytes)
+    block = _target_block_program(mesh, n_targets)(
+        product, pair, jnp.asarray(prefactor, dtype=jnp.float64))
+    return product, block
+
+
 def imaginary_rule(n, eta, *, scale=None):
     """Gauss rules on ``[0, eta]`` and ``[eta, infinity)``, both open.
 

@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — bounded reference projections retain complete target blocks
+
+`gw.contour_reference.project_interaction_block` retains every target-pair
+matrix entry for each internal state, using the unchanged diagonal
+projection's all-P product. The caller declares row grouping, normalization
+and a small replicated output bound. Internal groups remain tiled over X;
+the interaction and pair operands remain tiled over X/Y. This opt-in helper
+changes no driver, diagonal default, contour formula, sheet or deck. An
+occupied minus-q projection with reversed density roles needs its external
+target transpose before the contour helper's already-transposed partner
+contract; a transpose does not conjugate causal frequency coefficients.
+
 ## 2026-10-07 — the decoupled sector rounds price CT's outputs and every array the sectors and rounds hold
 
 The round loop's rows on the decoupled route (`constructor.live`, the held checks and the writes)

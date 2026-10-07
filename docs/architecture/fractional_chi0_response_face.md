@@ -266,3 +266,22 @@ confined to the one near-origin sample.
 | face carrier narrower than the energy table | load at least as many bands as the table names |
 | `GATE response_vertex` | current vertices need ordered full-k endpoints, applied after the symmetry unfold |
 | negative or nonfinite time nodes, or weights not shaped (n_z, n_t) | caller error |
+
+A small reference can retain a full target block with
+`contour_reference.project_interaction_block`. Pair rows are ordered
+`[internal_m,target_a]`; its returned product is the unchanged diagonal
+projector's all-P `conj(pair) @ interaction`. The second output is
+`sum_G product[m,a,G]*pair[m,b,G]*prefactor`, shaped `[batch,m,a,b]`.
+The caller supplies the target count, physical prefactor and an explicit
+small replicated-output byte bound. Whole internal groups must divide X;
+both reshaped contraction operands remain on all P processors. Padded
+states and targets remain zero through the caller's physical masks.
+
+The helper infers no response, contour convention or ordered partner.
+For occupied residues, a minus-q field contracted with reversed density
+roles yields the external transpose of the desired already-transposed
+partner block. Transpose those target endpoints before supplying
+`value_t` to the contour owner. This is separate from the lower-imaginary
+same-q adjoint and from antiunitary same-z transport. Complete target-block
+measurements, rather than scalar trace histories, are needed to certify
+matrix scalarity or a matrix energy derivative.
