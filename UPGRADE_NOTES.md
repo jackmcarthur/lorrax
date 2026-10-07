@@ -5,6 +5,21 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — the face batch steps down by its whole price; decoupled stages run at the width that fits beside their stacks
+
+`face_batch_width` stepped down by the room left for the program, which is below
+zero whenever the width-proportional bytes outgrow the budget at the first width.
+It then jumped to one parent. It now steps by `width * available // aggregate`.
+Ni 20³ bispinor at P64, 36 GB, 32 line sites: 17 parents per round, where it ran
+1 (CPU replay). CrI3 24×24 at P64, 72 GB: 10 of 61, where main ran 3. On the
+decoupled route (parents < ranks) the selection still runs in sub-batches of the
+face batch. The CC, TT and CT stage programs, and CT's pencil rounds, run at the
+largest width whose program fits beside the sector's stacks row
+(`decoupled_width`): CrI3 P64 replay TT 5, CC 10. The receipt prints both widths.
+P4 gates against main (claim 3651): CrI3 6×6 and Fe 4³ bispinor eqp within
+0.04 µeV over three maps, where both decks keep their batch. A forced-decoupled
+CrI3 6×6 matches lever 2 to 0.001 µeV. No deck change.
+
 ## 2026-10-07 — the decoupled sector route takes fewer parents than ranks; at nq >= P the face rounds are warned with the q-local need
 
 The decoupled CC/TT/CT route (37baf6124, fdebbbd63, 302a519fe) holds every parent's

@@ -110,3 +110,31 @@ class _nothing:
 
     def __exit__(self, *exc):
         return False
+
+
+class _Ledger:
+    """The map ledger's preview at the leg's budget: aggregate = resident + the live set."""
+    def __init__(self, live):
+        self.live = live
+
+    def preview(self, *, resident_bytes_per_rank, workspace_bytes_per_rank, concurrent_with):
+        return dict(available_device_bytes_per_rank=AVAILABLE,
+                    aggregate_bytes_per_rank=resident_bytes_per_rank + workspace_bytes_per_rank + self.live)
+
+
+def test_stage_width_fits_beside_the_stacks_at_a_wider_face_batch():
+    """The whole-price face step admits 10 of 61 at P64 (test_shared_pole_face_price), where main ran
+    3; the stage programs (13.1 / 5.6 GB at 3, linear in the width) then run at the largest width
+    whose program fits beside each sector's stacks row, TT first: TT 5, CC 10."""
+    from gw.shared_pole_execution import decoupled_stage_bytes, decoupled_width
+    widths = {}
+    live = AMBIENT
+    for name in ("TT", "CC"):
+        side, carrier, rows, columns, program = SHAPES[name]
+        held, dw = _panels(rows, columns)
+        resident, _ = decoupled_stage_bytes(nq=NQ, ranks=RANKS, side=side, carrier=carrier, packed=rows,
+                                            held=held, dw_panels=dw, program=0)
+        widths[name] = w = decoupled_width(_Ledger(live), resident, program / 3, 10, concurrent_with=())
+        assert live + resident + w * program / 3 <= AVAILABLE < live + resident + (w + 1) * program / 3 or w == 10
+        live += _held_outputs(side, 2 * carrier, rows, columns)
+    assert widths == {"TT": 5, "CC": 10}, widths
