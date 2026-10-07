@@ -7,7 +7,7 @@ The recipes are their bank receipts' counts (production accuracy, four held supp
   63.9 GB, the decoupled stacks do not fit (it ran out of memory there with lever 1, fdebbbd63),
   and the face rounds hold 17 parents each (one before the whole-price step), warned; local at 72 GB.
 * CrI3 24x24 bispinor P64 (04_sectfast2_20261006): 61 parents, 16 sites, 72 GB, 7.44 GB upstream:
-  decoupled.
+  decoupled; its TT selection runs sub-batches of 10 with route-(c) eighs in its own 51 GiB room.
 * Fe 4^3 bispinor P4 (runs/DEV/782_sectfast_20261006 n1/m3): 13 parents, 28 sites: decoupled at
   40 GB, face rounds at 4 GB (the decoupled leg n1 peaked at 5.24 GB there).
 * CrI3 6x6 bispinor P4 (n2): 7 parents, 19 sites, 40 GB: decoupled.
@@ -61,6 +61,23 @@ for name, (lines, imag, n, cc, tt, nk, side, nq, budgets) in CASES.items():
             cap.constructor_eigenplan = lambda mesh_xy, side, execution, room=None: cap._local_eigenplan(mesh_xy, int(side))
             row['widths'] = [sector_batch_width(meta, linalg_resolution({'linalg': 'local'}), recipe, rows,
                                                 mesh=mesh, ledger=ledger, nq=q)[0] for q in (641, 18)]
+        if name == 'cri3_p64':
+            # The TT selection sub-batch at the face batch of 10: the widest whose n = 5184 eigh
+            # stacks run route (c) beside the selection row and every other parent's panels. A
+            # route-(c) matrix holds 7.03 n^2 complex128 on B11 (3 n^2 compiled + the 4.03 n^2
+            # vendor query; bench t1_eigh_stack_bench_b11); the local plan prices the workspace.
+            import gw.shared_pole_capacity as cap
+            from gw.gw_config import linalg_resolution
+            from gw.shared_pole_directions import port_extent
+            from gw.shared_pole_sectors import decoupled_selection_room, decoupled_selection_width, sector_recipe
+            cap.constructor_eigenplan = lambda mesh_xy, side, execution, room=None: cap._local_eigenplan(mesh_xy, int(side))
+            tt = cap.ConstructorCapacity(NS(n_rmu=3 * 1650, n_rmu_padded=5184), linalg_resolution({'linalg': 'local'}),
+                                         mesh_xy=mesh, ledger=ledger, upstream=(up,), execution='face')
+            room_at = decoupled_selection_room(tt, sector_recipe(recipe, 3 * 1650), n=3 * 1650, packed=5184, nq=nq,
+                                               mesh_xy=mesh, extent=port_extent(mesh))
+            fits = lambda w, room: -(-w // 64) * 7.03 * 5184 ** 2 * 16 <= room
+            row['selection'] = decoupled_selection_width(10, room_at, fits)
+            row['selection_room_gb'] = [round((room_at(w) or 0) / 2**30) for w in (1, 3, 10)]
         out[f'{name}/{budget}'] = row
 print('REPLAY' + json.dumps(out))
 """
@@ -85,6 +102,11 @@ def test_sector_route_replay():
     assert got['ni/72']['resolved'] == 'local'
     assert got['cri3_p64/72']['resolved'] == 'face' and got['cri3_p64/72']['decoupled']
     assert got['cri3_p64/72']['sides'][:2] == [20800, 32000]
+    # The TT selection keeps the face batch of 10 with route (c): its own room is 51 GiB, where
+    # main 56a24169c capped it by the face round's room and its eighs fell to the whole mesh.
+    width, room = got['cri3_p64/72']['selection']
+    assert width == 10 and room >= 7.03 * 5184 ** 2 * 16, (width, room / 2**30)
+    assert got['cri3_p64/72']['selection_room_gb'] == [52, 52, 51]
     assert got['fe/40']['decoupled'] and not got['fe/4']['decoupled']
     assert got['cri3_6/40']['decoupled']
     # Face rounds at nq >= P are warned with the q-local need, once each: Ni at 36 GB, Fe at 4 GB.
