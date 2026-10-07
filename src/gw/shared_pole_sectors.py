@@ -259,7 +259,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     # side; stacks over budget reduce in face rounds (construct_diagonal_sector_all warns).
     whole=None
     round_upstream=upstream
-    if resolved_execution=='face' and int(header['n_q_irr'])>batch_width:
+    from gw.shared_pole_execution import decoupled_route
+    if resolved_execution=='face' and decoupled_route(header['n_q_irr'],batch_width,mesh_xy.size):
         # TT first: its 2c stacks are the largest eighs, so they run beside no other
         # sector's held outputs. Each sector's held outputs (every parent's models, span
         # and (Q, O) panels, kept for CT) are one ledger row, live through the CT rounds.
@@ -1836,6 +1837,17 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')
+    if resolved_execution=='face' and int(nq)>=int(mesh_xy.size):
+        # At nq >= P the face rounds hold a few parents each (Ni 20^3 at 32 line sites,
+        # 36 GB: 641 rounds of one parent); say what the q-local route needs.
+        import warnings
+        need=max(r[k]['aggregate_bytes_per_rank'] for r in execution_rows if r['mode']=='face'
+                 for k in ('local_selection','local_reduction') if r.get(k))
+        names=','.join(r['sector'] for r in execution_rows if r['mode']=='face')
+        warnings.warn(f"shared-pole sectors: {names} local needs {need/1e9:.1f} GB/rank, over the "
+                      f"{ledger.device_budget_bytes_per_rank/1e9:.1f} GB budget; the {int(nq)} parents "
+                      f"run in face rounds on {int(mesh_xy.size)} ranks (slow). memory_per_device_gb >= "
+                      f"{-(-need//10**9)} (an 80 GB card) runs every sector q-local",RuntimeWarning)
     for row in execution_rows:
         row['joint']=dict(mode=joint_mode,**joint_route)
     return resolved_execution,execution_rows

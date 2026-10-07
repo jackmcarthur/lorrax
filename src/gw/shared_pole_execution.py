@@ -820,6 +820,14 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
                  for i, fn in enumerate((stage1, stage2, stage3, stage4))), passthrough
 
 
+def decoupled_route(nq, batch_width, ranks):
+    """The decoupled face route holds every parent's selection panels and stage stacks at
+    once, about one parent's pencil per rank below ``ranks`` parents. At ``nq >= ranks``
+    they grow as nq / ranks (Ni 20^3, 641 parents at P64: TT stacks 116.6 GB/rank), so
+    those parents take the face rounds."""
+    return int(batch_width) < int(nq) < int(ranks)
+
+
 def decoupled_stage_bytes(*, nq, ranks, side, carrier, packed, held, dw_panels, program):
     """Per-rank bytes of the decoupled reduction of ``nq`` parents (complex128).
 
