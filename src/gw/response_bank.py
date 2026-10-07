@@ -128,6 +128,190 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     return dyson, slope, moments, algebra
 
 
+def physical_charge_response_algebra(*, mesh_xy, packed_endpoints,
+                                     physical_k_count, linalg='distributed', ordered=False):
+    """Dyson/moments for already normalized finite charge endpoint operators.
+
+    The input χ and dχ/ds contain their physical spin/(Nk Ω). Bare expansion
+    coefficients likewise already contain that normalization. This seam adds
+    no second k, spin or volume factor: its prefactor is exactly one. The
+    caller retains the actual electronic mesh count independently of the
+    selected response parent. Uses the SAME programs as response_algebra.
+    No centroid Meta or canonical bank schema is invented.
+    """
+    from common.collectives import require_full_mesh
+    from .gw_config import linalg_resolution
+    mesh_xy = require_full_mesh(mesh_xy, origin='physical_charge_response_algebra')
+    if (any(isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, np.integer))
+            or v <= 0 for v in (packed_endpoints, physical_k_count)) or
+            int(mesh_xy.shape['x']) != int(mesh_xy.shape['y']) or
+            any(int(packed_endpoints) % int(mesh_xy.shape[a]) for a in ('x', 'y')) or
+            type(ordered) is not bool):
+        raise ValueError('Physical charge algebra needs typed positive endpoint/k counts and a square full mesh')
+    resolution = linalg_resolution({'linalg': linalg})
+    backend = 'off' if resolution.layout == 'local' else 'distributed'
+    dyson, slope, moments, lu = _response_programs(mesh_xy, int(packed_endpoints),
+        backend, resolution.batched_route, 1.0, ordered, None)
+    receipt = dict(representation='physical-charge-endpoints',
+        normalization='input spin/(Nk*Omega); no additional response prefactor',
+        prefactor=1.0, prefactor_q_count=int(physical_k_count),
+        packed_endpoints=int(packed_endpoints), linalg=resolution.layout,
+        batched_route=resolution.batched_route, solve=lu.describe(),
+        moment_convention='M_k=C_(k+1)/2; even M1=C2/2 and M3=C4/2',
+        units=dict(Wc='Ry', dWc_ds='Ry^-1', M1='Ry^3', M3='Ry^5'))
+    if ordered:
+        receipt['units'].update(M0='Ry^2', M2='Ry^4')
+    return dyson, slope, moments, receipt
+
+
+def physical_charge_coulomb_roots(value, *, mesh_xy, logical_endpoints,
+                                  endpoint_valid, linalg='distributed'):
+    """PSD charge roots and supported inverse from the incumbent owner.
+
+    ``endpoint_valid`` marks physical coordinates (head/null modes may be
+    physical). Virtual rows/columns must be exactly zero. Negative modes
+    beyond the existing logical_n*eps*scale law refuse, never get repaired.
+    Returned support rank includes no inverse on a head or other null mode.
+    """
+    from common.collectives import require_full_mesh, gather_to_host
+    mesh_xy = require_full_mesh(mesh_xy, origin='physical_charge_coulomb_roots')
+    valid = np.asarray(endpoint_valid)
+    if (value.ndim != 3 or value.shape[0] < 1 or value.shape[1] != value.shape[2]
+            or value.dtype != jnp.complex128 or
+            value.sharding != NamedSharding(mesh_xy, P(None, 'x', 'y')) or
+            int(mesh_xy.shape['x']) != int(mesh_xy.shape['y']) or
+            valid.dtype != np.bool_ or valid.shape != (value.shape[1],) or
+            isinstance(logical_endpoints, (bool, np.bool_)) or
+            not isinstance(logical_endpoints, (int, np.integer)) or logical_endpoints <= 0 or
+            int(valid.sum()) != logical_endpoints):
+        raise ValueError('Physical Coulomb requires all-P complex128 square faces and an exact physical endpoint mask')
+    flags = _physical_coulomb_input_guard(mesh_xy, value.shape)(value, jnp.asarray(valid))
+    if not np.all(np.asarray(gather_to_host(flags))):
+        raise ValueError('Physical Coulomb input is nonfinite or has nonzero virtual endpoints')
+    root, inverse, negative, ranks = _coulomb_algebra(mesh_xy, value.shape[1],
+        int(logical_endpoints), linalg)(value)
+    if np.any(np.asarray(gather_to_host(negative))):
+        raise ValueError('Physical Coulomb has a negative eigenvalue beyond the incumbent PSD threshold')
+    return root, inverse, ranks
+
+
+@lru_cache(maxsize=8)
+def _physical_coulomb_input_guard(mesh_xy, shape):
+    rep = NamedSharding(mesh_xy, P())
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    @partial(jax.jit, in_shardings=(face, rep), out_shardings=rep)
+    def flags(value, valid):
+        physical = valid[None, :, None] & valid[None, None, :]
+        return jnp.stack((jnp.all(jnp.isfinite(value)),
+                          jnp.all(jnp.where(physical, 0, value) == 0)))
+    return flags
+
+
+class PhysicalChargeRoundProvider:
+    """Authenticated selected-parent physical input boundary for one round.
+
+    The first reference route is Γ real charge. Callbacks perform their
+    canonical I/O/response/moment queries; this owner verifies physical
+    identity, requested rows, all-P layout, finite values and virtual zeros.
+    Dense fitted samples use the existing constructor direction selector;
+    no centroid sample producer or whole-bank metadata is fabricated.
+    """
+    def __init__(self, endpoint, identity, endpoint_valid, *, sample_reader,
+                 moment_reader, coulomb_reader, mesh_xy):
+        from common.collectives import require_full_mesh
+        from gw.shared_pole_round import PoleEndpointGeometry
+        import copy
+        if not isinstance(endpoint, PoleEndpointGeometry) or endpoint.kind != 'gamma-real-charge':
+            raise ValueError('Physical round provider requires declared Gamma real-charge endpoints')
+        self.mesh = require_full_mesh(mesh_xy, origin='PhysicalChargeRoundProvider')
+        valid = np.asarray(endpoint_valid)
+        if (valid.dtype != np.bool_ or valid.shape != (endpoint.carrier_size,) or
+                int(valid.sum()) != endpoint.logical_size or
+                any(endpoint.carrier_size % int(self.mesh.shape[a]) for a in ('x', 'y'))):
+            raise ValueError('Physical round provider endpoint validity/census differs')
+        required = dict(endpoint_kind=endpoint.kind, logical_endpoints=endpoint.logical_size,
+            packed_endpoints=endpoint.carrier_size, physical_k_count=endpoint.physical_k_count,
+            k_grid=list(endpoint.k_grid), source_parent_ids=[0],
+            normalization='physical spin/(Nk*Omega)', moment_convention='M_k=C_(k+1)/2')
+        if not isinstance(identity, dict) or any(identity.get(k) != v for k,v in required.items()):
+            raise ValueError('Physical round provider identity lacks exact endpoint/state/normalization scope')
+        for key in ('basis_sha256', 'native_state_sha256', 'recipe_hash', 'coulomb_sha256'):
+            value = identity.get(key)
+            if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+                raise ValueError('Physical round provider requires authenticated '+key)
+        if not all(callable(fn) for fn in (sample_reader, moment_reader, coulomb_reader)):
+            raise ValueError('Physical round provider requires canonical bounded read callbacks')
+        self.endpoint, self.valid = endpoint, valid.copy()
+        self.identity = copy.deepcopy(identity)
+        self._samples, self._moments, self._coulomb = sample_reader, moment_reader, coulomb_reader
+
+    def _rows(self, ids):
+        raw = np.asarray(ids)
+        if raw.ndim != 1 or not raw.size or raw.dtype.kind not in 'iu' or np.any(raw != 0):
+            raise ValueError('Physical Gamma provider accepts only explicit source parent zero slots')
+        return raw.tolist()
+
+    def _field(self, value, *, shape):
+        from common.collectives import gather_to_host
+        spec = P(*((None,)*(len(shape)-2)), 'x', 'y')
+        if (tuple(value.shape) != tuple(shape) or value.dtype != jnp.complex128 or
+                value.sharding != NamedSharding(self.mesh, spec)):
+            raise ValueError('Physical round provider requires requested complex128 all-P matrix faces')
+        flags = _physical_provider_input_guard(self.mesh, shape)(value, jnp.asarray(self.valid))
+        if not np.all(np.asarray(gather_to_host(flags))):
+            raise ValueError('Physical round provider field is nonfinite or has nonzero virtual endpoints')
+        return value
+
+    def moments(self, q_ids, *, fields):
+        ids = self._rows(q_ids)
+        if any(f not in ('M0','M1','M2','M3') for f in fields) or not fields:
+            raise ValueError('Physical round provider requires exact physical moment roles')
+        result = self._moments(ids, fields=fields)
+        shape = (len(ids), self.endpoint.carrier_size, self.endpoint.carrier_size)
+        return {f:self._field(result[f],shape=shape) for f in fields}
+
+    def _sample_rows(self, q_ids, sample_ids):
+        ids = self._rows(q_ids)
+        raw = np.asarray(sample_ids)
+        if raw.ndim != 1 or raw.dtype.kind not in 'iu' or np.any(raw < 0):
+            raise ValueError('Physical round provider requires typed nonnegative sample IDs')
+        result = self._samples(ids, sample_ids=raw.tolist())
+        shape = (len(ids), len(raw), self.endpoint.carrier_size, self.endpoint.carrier_size)
+        return {f:self._field(result[f],shape=shape) for f in ('Wc','dWc_ds')}
+
+    def selection(self, q_ids, *, sample_ids, line_span):
+        if tuple(line_span) != (0,0):
+            raise ValueError('Physical Gamma provider selects dense line supports through the shared direction owner')
+        return self._sample_rows(q_ids,sample_ids), {}
+
+    def samples(self, q_ids, *, sample_span):
+        a,b = sample_span
+        if any(type(v) is not int or v<0 for v in (a,b)) or b<a:
+            raise ValueError('Physical round provider requires an exact nonnegative sample span')
+        return self._sample_rows(q_ids,range(a,b))
+
+    def coulomb_inverse(self, q_span):
+        if tuple(q_span) != (0,1):
+            raise ValueError('Physical Gamma provider requires source-parent Coulomb span zero to one')
+        value, receipt = self._coulomb(q_span)
+        if (receipt.get('coulomb_identity',{}).get('sha256') != self.identity['coulomb_sha256'] or
+                len(receipt.get('support_ranks',[])) != 1):
+            raise ValueError('Physical round provider Coulomb identity/support census differs')
+        return self._field(value,shape=(1,self.endpoint.carrier_size,self.endpoint.carrier_size)), receipt
+
+
+@lru_cache(maxsize=8)
+def _physical_provider_input_guard(mesh_xy, shape):
+    rep = NamedSharding(mesh_xy, P())
+    face = NamedSharding(mesh_xy, P(*((None,)*(len(shape)-2)), 'x', 'y'))
+    @partial(jax.jit, in_shardings=(face, rep), out_shardings=rep)
+    def flags(value, valid):
+        physical = valid[:, None] & valid[None, :]
+        return jnp.stack((jnp.all(jnp.isfinite(value)),
+                          jnp.all(jnp.where(physical, 0, value) == 0)))
+    return flags
+
+
 @lru_cache(maxsize=None)
 def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     """Reuse compiled algebra across SC maps without retaining state arrays."""

@@ -41,11 +41,28 @@ def held_sector_bytes(n, side, kept):
     return 16 * (5 * n * side + side * retained_span_columns(side, kept))
 
 
+def _packed_endpoint_count(meta, mesh_xy, packed_endpoints):
+    """Use default Meta geometry or an explicit authenticated endpoint carrier.
+
+    This is geometry only; it supplies no centroid/state metadata or memory
+    policy. Explicit counts must be exact positive integers divisible over
+    both face axes. The default path keeps its historical Meta conversion.
+    """
+    if packed_endpoints is None:
+        return int(meta.n_rmu_padded)
+    if (isinstance(packed_endpoints, (bool, np.bool_)) or
+            not isinstance(packed_endpoints, (int, np.integer)) or
+            packed_endpoints <= 0 or any(int(mesh_xy.shape[a]) <= 0 or
+                int(packed_endpoints) % int(mesh_xy.shape[a]) for a in ('x', 'y'))):
+        raise ValueError('Shared-pole capacity needs positive integer mesh-compatible packed endpoints')
+    return int(packed_endpoints)
+
+
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            parent_batch, sample_batch, phase="reduction",
                            selection_faces=None, cross_original_sides=None,
                            padding_output_bytes_per_rank=0, ritz_budget=None,
-                           retain_span=False, program_bytes=None):
+                           retain_span=False, program_bytes=None, packed_endpoints=None):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
     Selection holds samples, current narrow actions and the n x n direction
@@ -65,7 +82,7 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     """
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
     # Constructor carriers are mu x mu charge operators on every admitted deck.
-    packed = int(meta.n_rmu_padded)
+    packed = _packed_endpoint_count(meta, mesh_xy, packed_endpoints)
     b, a, r = int(parent_batch), int(sample_batch), int(pencil_side)
     if min(packed, b, a) <= 0 or r < 0:
         raise ValueError("GATE shared_pole_capacity: got: invalid extents; want: positive basis/batches and nonnegative pencil; why: live-set pricing")
@@ -237,14 +254,16 @@ class ConstructorCapacity:
         the parent batch the next price is for.
     """
 
-    def __init__(self, meta, resolution, *, mesh_xy, ledger, upstream, execution="local"):
+    def __init__(self, meta, resolution, *, mesh_xy, ledger, upstream, execution="local",
+                 packed_endpoints=None):
         self.execution = execution
         self._meta = meta
         self._resolution = resolution
         self._mesh_xy = mesh_xy
         self._ledger = ledger
         self._upstream = tuple(upstream)
-        self._n = int(meta.n_rmu_padded)
+        self._n = _packed_endpoint_count(meta, mesh_xy, packed_endpoints)
+        self._packed_endpoints = packed_endpoints
         self.native_queries = {}
         self._native_maxima = {"eigh": 0}
         self._workspace = 0
@@ -360,7 +379,8 @@ class ConstructorCapacity:
             cross_original_sides=cross_original_sides,
             padding_output_bytes_per_rank=padding_output_bytes_per_rank,
             ritz_budget=self.ritz_budget, retain_span=self.retain_span,
-            program_bytes=self.program_bytes if phase in ("reduction", "cross_reduction") else None)
+            program_bytes=self.program_bytes if phase in ("reduction", "cross_reduction") else None,
+            packed_endpoints=self._packed_endpoints)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)

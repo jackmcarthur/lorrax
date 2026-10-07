@@ -625,3 +625,31 @@ family's rows (`line_selection_price`). On the local route that is
 $16\cdot 2\lceil N_q/P\rceil (d^2 + n^2)$ B per rank, the rank's parents in one
 batched eigh; on the face route $16\,(2N_q d^2 + 2N_q n^2)/P$, every parent
 of the stack at once. The eigh service's workspace comes on top.
+
+
+## Selected physical endpoints and the shared one-round owner
+
+`gw.shared_pole_round.construct_shared_pole_round` owns the bounded
+selection, infinity directions, Gram/Ritz reduction, supported Coulomb checks,
+held-site checks and gate receipts. The production constructor calls this
+owner through its canonical store adapter and retains the existing complete
+parent writer/schema. `PoleEndpointGeometry` records coordinates, physical
+Nk/k-grid and endpoint extents separately; a selected Γ result is a factor,
+poles/counts and per-parent receipts, never a finalized whole-q store.
+
+`response_bank.PhysicalChargeRoundProvider` binds Γ real-charge endpoints,
+basis/native-state/recipe/Coulomb identities and explicit source parent zero.
+Its callbacks supply bounded all-P physical Wc/dW/ds and exact moments
+`M_k=C_(k+1)/2`. The public `physical_charge_response_algebra` uses the same
+Dyson/moment programs with prefactor one: input χ is already normalized by
+spin/(Nk Ω). `physical_charge_coulomb_roots` reuses the existing supported
+PSD-root law, retains physical head/null modes, and refuses nonfinite inputs
+and nonzero virtual rows. These APIs do not supply a head convention,
+finite-q symmetry extension, exact Lehmann moment producer or fit accuracy.
+
+`ConstructorCapacity(..., packed_endpoints=...)` and
+`shared_pole_byte_terms(..., packed_endpoints=...)` can price that declared
+endpoint carrier without a centroid Meta. Their default None path and memory
+formulas are unchanged. The incumbent map ledger remains the capacity owner;
+a selected reference must record its actual concurrent cache/input lifetimes,
+resolved native workspace and any FAIL price, separately from numerical gates.

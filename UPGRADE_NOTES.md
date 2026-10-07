@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — shared one-round pole construction for explicit charge endpoints
+
+The production shared-pole constructor calls the new bounded one-round owner;
+its sample reads, selection/reduction/check equations, gates, default capacity
+geometry and complete-bank writer/schema remain unchanged. An opt-in physical
+Γ real-charge provider can use that same owner with explicit basis/state/recipe
+identities and the actual electronic Nk/k-grid. Its Dyson inputs are already
+normalized, its screened moments are M_k=C_(k+1)/2, and supported Coulomb null
+modes retain zero inverse. A selected-parent result is not an all-q model.
+The optional packed_endpoints capacity geometry avoids fabricated centroid
+metadata. No new deck dial or default policy is introduced. Focused runtime
+checks and native provider/fit pricing are pending for this extraction.
+
 ## 2026-10-07 — optional distributed Γ conditioning runs inside one cached program
 
 The opt-in Γ reference factor now compiles the existing spectral
