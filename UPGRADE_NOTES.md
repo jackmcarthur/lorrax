@@ -22,8 +22,22 @@ at the P64 sector shapes 12.0–13.4 TF/s per A100 against 3.1–5.4 for the
 cuBLASMp face (claim 3425). The metric corrections stay Newton–Schulz (the
 paired metric needs one iteration). The constructor receipt names the
 decoupled stacks, the eigh room and the largest ‖ZAZ−I‖/√R per sector.
-Results move at round-off (product order): Fe 4³ bispinor eqp within
-0.18 µeV of main over three SC maps (claim 3435). No deck change.
+CrI3 24×24 bispinor at P64 (16 × A100-80GB, claim 3545), seconds:
+
+| | map 0 cold, main → now | map 1 warm, main → now |
+|---|---|---|
+| map wall | 3083.6 → 2249.8 | 3328.3 → 1986.9 |
+| W response | 2576.9 → 1763.2 | 2746.1 → 1452.7 |
+| CC | 469.3 → 168.0 | 461.5 → 107.1 |
+| TT | 1038.5 → 673.3 | 1136.5 → 605.1 |
+| CT (21 rounds) | 621.9 → 495.8 | 586.4 → 440.3 |
+
+Against the 176.3 s charge map that is 12.8× cold and 11.3× warm (was
+18.9×). There the 61 × 18432 TT eigh does not fit one matrix per rank
+beside the stacks (43.3 GB against a 37.6 GB room) and runs as 61
+whole-mesh solves, about 376 s of each map. Results move at round-off
+(product order): Fe 4³ and CrI3 6×6 bispinor eqp within 0.16 µeV of main
+over three SC maps (claims 3477, 3470). No deck change.
 
 ## 2026-10-06 — the cuSOLVERMp eigh runs at a block of 128–256 and reads its info
 
