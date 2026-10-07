@@ -969,12 +969,13 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
                 for boundary in boundaries)
 
     from contextlib import contextmanager
+    from gw.shared_pole_execution import eigh_program_bytes
     @contextmanager
-    def eigh_row(k):
-        # The eigh of stack k runs beside its boundary and may use its whole room: one
-        # row for both while it runs, so the stage's price bounds its peak.
+    def eigh_row(k,plan,stack):
+        # The eigh of stack k runs beside its boundary: one row for both while it runs, its
+        # program priced from the service's decision (eigh_program_bytes).
         stage=ledger.reserve(f"sector.decoupled.{geometry['sector']}.eigh{k}.{len(ledger.entries)}",
-                             resident_bytes_per_rank=boundaries[k]+int(rooms[k] or 0),
+                             resident_bytes_per_rank=boundaries[k]+eigh_program_bytes(plan,stack,mesh=mesh_xy),
                              workspace_bytes_per_rank=0,concurrent_with=ambient)['stage']
         ledger.live_stages=(*ambient,stage)
         try:
@@ -1108,10 +1109,11 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
         rooms=tuple(face_eigh_room(ledger.preview(resident_bytes_per_rank=b,workspace_bytes_per_rank=0,
                                                   concurrent_with=upstream)) for b in boundaries)
 
+        from gw.shared_pole_execution import eigh_program_bytes
         @contextmanager
-        def eigh_row(k):
+        def eigh_row(k,plan,stack):
             row=ledger.reserve(f"sector.decoupled.CT.eigh{k}.{len(ledger.entries)}",
-                               resident_bytes_per_rank=boundaries[k]+int(rooms[k] or 0),
+                               resident_bytes_per_rank=boundaries[k]+eigh_program_bytes(plan,stack,mesh=mesh_xy),
                                workspace_bytes_per_rank=0,concurrent_with=upstream)['stage']
             ledger.live_stages=(*upstream,row)
             try:

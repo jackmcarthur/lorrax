@@ -865,28 +865,42 @@ def _device_free_bytes():
     return None if limit is None or used is None else int(limit) - int(used)
 
 
-def guarded_eigh(plan, stack, *, mesh, label):
-    """``plan``'s batched eigh of ``stack``, with a runtime guard on its route-(c) decision.
+def eigh_program_bytes(plan, stack, *, mesh):
+    """Per-rank bytes the batched eigh of ``stack`` adds beside it, from the service's decision
+    (``stack_route``): route (c)'s program (outputs, temporaries and the local solver's workspace;
+    the operand excluded), or on the whole mesh the vectors stack, the values and one solve's
+    vendor workspace (``distrib_la.workspace_bytes_per_rank``)."""
+    import distrib_la
+    route = plan.stack_route(stack.shape, stack.dtype, traced=False)
+    if route.route == 'batch_reshard' and route.program_bytes:
+        return int(route.program_bytes)
+    nq, n = int(stack.shape[0]), int(stack.shape[-1])
+    outputs = -(-nq * n * n * stack.dtype.itemsize // int(mesh.size)) + nq * n * 8
+    return outputs + int(distrib_la.workspace_bytes_per_rank(plan, 'eigh', ((n, n),), stack.dtype))
 
-    The ledger admits a stack one whole matrix per rank when its program fits the room;
-    the pool's measured free bytes, agreed (the minimum) over processes, must also cover
-    that program, or the stack runs on the whole mesh (the scan) with one warning. The
-    guard only narrows the ledger's decision; it never refuses and never widens it.
+
+def guarded_eigh(plan, stack, *, mesh, label):
+    """``plan``'s batched eigh of ``stack``, with a diagnostic on its route-(c) decision.
+
+    Where the ledger admits a stack one whole matrix per rank, the pool's measured free bytes,
+    the minimum over processes, are compared with that program; a shortfall gives one warning
+    naming it. The route never changes on it: a route read from free memory would move results
+    with allocator state (decisions.md, fixed-tile). Honest prices are the protection.
     """
     route = plan.stack_route(stack.shape, stack.dtype, traced=False)
-    if route.route != 'batch_reshard' or not route.program_bytes:
-        return plan.batched(stack)
-    import numpy as np
-    from common.collectives import all_gather_processes
-    free = _device_free_bytes()
-    agreed = int(np.min(all_gather_processes(np.asarray([-1 if free is None else free], np.int64))))
-    if agreed < 0 or agreed >= int(route.program_bytes):
-        return plan.batched(stack)
-    import warnings
-    warnings.warn(f"shared-pole decoupled {label}: the {int(stack.shape[0])} x {int(stack.shape[-1])}^2 eigh stack's "
-                  f"program needs {route.program_bytes / 1e9:.1f} GB/rank but the pool has {agreed / 1e9:.1f} GB "
-                  f"free on some rank; it runs on the whole mesh instead", RuntimeWarning)
-    return face_eigh(mesh, int(stack.shape[-1]), 0).batched(stack)
+    if route.route == 'batch_reshard' and route.program_bytes:
+        import numpy as np
+        from common.collectives import all_gather_processes
+        free = _device_free_bytes()
+        agreed = int(np.min(all_gather_processes(np.asarray([-1 if free is None else free], np.int64))))
+        if 0 <= agreed < int(route.program_bytes):
+            import warnings
+            warnings.warn(f"shared-pole decoupled {label}: the {int(stack.shape[0])} x {int(stack.shape[-1])}^2 eigh "
+                          f"stack's program needs {route.program_bytes / 1e9:.1f} GB/rank and the pool has "
+                          f"{agreed / 1e9:.1f} GB free on some rank (short by "
+                          f"{(route.program_bytes - agreed) / 1e9:.1f} GB); an out-of-memory is possible",
+                          RuntimeWarning)
+    return plan.batched(stack)
 
 
 def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, ordered, odd_moments,
@@ -897,8 +911,8 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     (``face_eigh``), so distrib_la runs each one whole matrix per rank where that fits.
     ``states`` is the caller's list: the derivative panels (dW Q) enter the pencil only,
     so after the first stage each entry keeps (node, Q, O) and they are released before
-    the eighs. ``eigh_rows(k)`` (optional) is the caller's context that prices eigh
-    stack k (its ledger row) while it runs. Returns what ``face_reduce_round`` returns,
+    the eighs. ``eigh_rows(k, plan, stack)`` (optional) is the caller's context that prices
+    eigh stack k (its ledger row) while it runs. Returns what ``face_reduce_round`` returns,
     for every parent."""
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
@@ -918,24 +932,27 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
         return {**{k: stage[k] for k in passthrough[name]}, **new}
     from common import timing
     from contextlib import nullcontext
-    priced = eigh_rows or (lambda k: nullcontext())
+    priced = eigh_rows or (lambda k, plan, stack: nullcontext())
     # One timing section per stage and eigh: the report gives each its wall and pool high-water.
     with timing.section('decoupled.members'):
         stage = run(stage1, *inputs)
     infinity = inputs[6]
     del inputs
     states[:] = [s[:3] for s in states]
-    with timing.section('decoupled.eigh_hvv'), priced(0):
-        gamma, u = hvv_eigh(_hermitian_stack(mesh)(stage['h_vv']))
+    with timing.section('decoupled.eigh_hvv'):
+        hermitian = _hermitian_stack(mesh)(stage['h_vv'])
+        with priced(0, eigh_plans[0], hermitian):
+            gamma, u = hvv_eigh(hermitian)
+        del hermitian
     with timing.section('decoupled.keep'):
         stage = advance('keep', stage2, stage, gamma, u)
     del gamma, u
-    with timing.section('decoupled.eigh_schur'), priced(1):
+    with timing.section('decoupled.eigh_schur'), priced(1, eigh_plans[1], stage['schur']):
         gamma_r, u_r = schur_eigh(stage['schur'])
     with timing.section('decoupled.paired'):
         stage = advance('paired', stage3, stage, gamma_r, u_r)
     del gamma_r, u_r
-    with timing.section('decoupled.eigh_reduced'), priced(2):
+    with timing.section('decoupled.eigh_reduced'), priced(2, eigh_plans[2], stage['reduced']):
         mu, rotation = reduced_eigh(stage['reduced'])
     with timing.section('decoupled.output'):
         result = run(stage4, stage, mu, rotation, infinity)
@@ -985,23 +1002,25 @@ def face_cross_decoupled(pencil, *, mesh, eigh_plans, width, eigh_rows=None):
     """Every parent's CT joint reduction from the stacked ``pencil`` (metric, value, O_C, O_T):
     the keep stage and the output stage over ``width`` parents at a time, the metric's and the
     Ritz step's eighs once over the stack (``guarded_eigh``). Returns what the round's
-    ``reduce_cross_round`` returns, for every parent. ``eigh_rows(k)`` prices eigh k."""
+    ``reduce_cross_round`` returns, for every parent. ``eigh_rows(k, plan, stack)`` prices eigh k."""
     from contextlib import nullcontext
     from common import timing
-    priced = eigh_rows or (lambda k: nullcontext())
+    priced = eigh_rows or (lambda k, plan, stack: nullcontext())
     nq = int(pencil[0].shape[0])
     keep, output = _cross_stage_programs(mesh)
     cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
 
     def run(program, *stacks):
         return _assemble(mesh, nq, ((i0, program(*_take(mesh, stacks, i0, i1))) for i0, i1 in cuts))
-    with timing.section('decoupled.eigh_metric'), priced(0):
+    with timing.section('decoupled.eigh_metric'), priced(0, eigh_plans[0], pencil[0]):
         gamma, u = guarded_eigh(eigh_plans[0], pencil[0], mesh=mesh, label='CT metric')
     with timing.section('decoupled.keep'):
         stage = run(keep, *pencil, gamma, u)
     del gamma, u
-    with timing.section('decoupled.eigh_ritz'), priced(1):
-        values, rotation = guarded_eigh(eigh_plans[1], stage.pop('reduced'), mesh=mesh, label='CT Ritz')
+    reduced = stage.pop('reduced')
+    with timing.section('decoupled.eigh_ritz'), priced(1, eigh_plans[1], reduced):
+        values, rotation = guarded_eigh(eigh_plans[1], reduced, mesh=mesh, label='CT Ritz')
+    del reduced
     with timing.section('decoupled.output'):
         return run(output, stage, pencil[2], pencil[3], values, rotation)
 
