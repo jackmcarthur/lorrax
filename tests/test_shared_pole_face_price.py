@@ -6,7 +6,8 @@ conservative sides, pole budgets, signed bounds), the three compiled program
 sizes per rank at the admitted width, and the reduction admission row
 (resident, native workspace, upstream live stages, budget, limit). The shape
 price must bound every compiled figure and the admission must land on the
-same batch, so the programs that run are the ones main ran.
+same batch, so the programs that run are the ones main ran; p64 now lands on
+10, where main's room step undershot to 3 (the step is by the whole price).
 
 Receipts (all 2x2 or 8x8 meshes, bispinor sectors, retained spans):
 * ``p64``: CrI3 24x24 P64 cold SC map 0, main 0a393dd72, 2026-10-05
@@ -33,7 +34,7 @@ RECEIPTS = {
     # name: (mesh x, y, nq, joint packed, routes, compiled GB per rank at the batch, batch, row)
     # row: aggregate, resident, workspace, available, limit (bytes per rank), upstream = aggregate - resident - workspace
     "p64": (8, 8, 61, 8512, [route("CC", 3328, 20800, 5940, 12288), route("TT", 5184, 32000, 8910, 18432)],
-            dict(CC=4.357360783, TT=10.243909135, CT=12.546433059), 3,
+            dict(CC=4.357360783, TT=10.243909135, CT=12.546433059), 10,
             dict(aggregate=27537436963, resident=14648882211, workspace=6918995200, available=71999000000, limit=75271680000.0)),
     "fe_774": (2, 2, 64, 864, [route("CC", 432, 3472, 778, 1664), route("TT", 432, 3472, 778, 1664)],
                dict(CC=0.350244219, TT=0.350244219, CT=0.747110991), 1,
@@ -64,11 +65,12 @@ class Ledger:
                     device_budget_status='PASS' if aggregate <= self.row['limit'] else 'FAIL')
 
 
-def replay(monkeypatch, name):
+def replay(monkeypatch, name, nq=None):
     import file_io  # noqa: F401  (service path bootstrap)
     import gw.shared_pole_capacity as cap
     import gw.shared_pole_execution as ex
-    px, py, nq, joint_packed, routes, compiled, batch, row = RECEIPTS[name]
+    px, py, parents, joint_packed, routes, compiled, batch, row = RECEIPTS[name]
+    nq = parents if nq is None else nq
     mesh = SimpleNamespace(shape={'x': px, 'y': py}, size=px * py)
 
     def quote(self, side, *, phase, sample_batch=1, selection_faces=None, eigen_side=None,
@@ -95,7 +97,7 @@ def test_price_bounds_every_compiled_program_and_lands_on_its_batch(monkeypatch,
 
 
 def test_p64_receipt_reproduces_the_non_program_resident(monkeypatch):
-    width, receipt, compiled, batch = replay(monkeypatch, "p64")
+    width, receipt, compiled, batch = replay(monkeypatch, "p64", nq=3)   # main's batch
     row = RECEIPTS["p64"][-1]
     nonprogram = (receipt['reduction']['aggregate_bytes_per_rank'] - (row['aggregate'] - row['resident'] - row['workspace'])
                   - row['workspace'] - receipt['program_bytes_per_rank'])

@@ -238,6 +238,7 @@ def route_summary(mode, receipt):
     decoupled = receipt.get("decoupled")
     if decoupled is not None:
         price += (f"; decoupled: {decoupled['parents']} parents in sub-batches of {decoupled['sub_batch']}, "
+                  f"stages of {decoupled.get('stage_batch', decoupled['sub_batch'])}, "
                   f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh rooms "
                   + "/".join("none" if r is None else f"{r / 1e9:.1f}" for r in decoupled['eigh_room_bytes_per_rank'])
                   + " GB/rank, "
@@ -551,7 +552,7 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
     cold map 0). Widths start at every parent, so a deck that fits runs one
     round and compiles each program once per shape (Fe 4^3 bispinor at P4:
     one round of 13 instead of four, whose differing sides recompiled every
-    program), and step down in proportion to the room. The constructor still
+    program), and step down in proportion to the whole price. The constructor still
     admits every phase at its actual side.
     """
     from gw.shared_pole_capacity import ConstructorCapacity
@@ -575,8 +576,10 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
         receipt = dict(parent_batch=width, program_bytes_per_rank=price, selection=picked, reduction=reduction)
         if reduction['device_budget_status'] == 'PASS' or width == 1:
             return width, receipt
-        room = reduction['available_device_bytes_per_rank'] - reduction['aggregate_bytes_per_rank'] + price
-        width = max(1, min(width - 1, width * max(room, 0) // price))
+        # Every term of the row grows about linearly in the width, so step by the whole
+        # price (the program alone left no room at Ni's 641 and jumped to 1; 16 fit).
+        width = max(1, min(width - 1, width * reduction['available_device_bytes_per_rank']
+                           // reduction['aggregate_bytes_per_rank']))
 
 
 def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
@@ -826,6 +829,16 @@ def decoupled_route(nq, batch_width, ranks):
     they grow as nq / ranks (Ni 20^3, 641 parents at P64: TT stacks 116.6 GB/rank), so
     those parents take the face rounds."""
     return int(batch_width) < int(nq) < int(ranks)
+
+
+def decoupled_width(ledger, resident, per_parent, width, *, concurrent_with):
+    """The largest stage width w <= ``width`` (the face batch) whose program, ``per_parent`` bytes
+    per parent (the face programs' price is linear in w), fits beside ``resident`` on the live set;
+    at least 1. CrI3 24x24 P64 at a face batch of 10: TT 4, CC 10."""
+    row = ledger.preview(resident_bytes_per_rank=int(resident), workspace_bytes_per_rank=0,
+                         concurrent_with=concurrent_with)
+    room = row['available_device_bytes_per_rank'] - row['aggregate_bytes_per_rank']
+    return int(max(1, min(int(width), room // max(1, int(per_parent)))))
 
 
 def decoupled_stage_bytes(*, nq, ranks, side, carrier, packed, held, dw_panels, program):

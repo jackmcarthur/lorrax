@@ -313,7 +313,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 line_cross=[read_line(io,family,cross=True,ids=ids,layout='face') for family in (0,1)]
             return (ct,tc),cm,line_cross
         with timing.section('spole.sector.CT.all', announce=True):
-            cross_all=construct_cross_sector_all(whole,list(rounds),read_cross,meta,config,mesh_xy=mesh_xy,
+            cross_all=construct_cross_sector_all(whole,read_cross,meta,config,mesh_xy=mesh_xy,
                 sample_ids=dense_fit,nq=int(header['n_q_irr']),width=batch_width,program_bytes=sizes.get('CT'),
                 upstream=round_upstream)
             execution_rows[0]['joint']['decoupled']=cross_all['decoupled']
@@ -953,12 +953,16 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     held=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:3])
     held+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
     dw_panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[3:])
-    # A stage program of ``width`` parents is bounded by the face round program's price
-    # at that width (its whole chain); its inputs and outputs are sub-batch slices.
-    from gw.shared_pole_execution import face_reduction_bytes,decoupled_stage_bytes
-    program=face_reduction_bytes(mesh_xy,int(width),rows=packed,side=side,carrier=carrier_columns,retain_span=True)
-    resident,boundaries=decoupled_stage_bytes(nq=nq,ranks=mesh_xy.size,side=side,carrier=carrier_columns,
+    # A stage program of w parents is bounded by the face round program's price at w (its
+    # whole chain, linear in w); its inputs and outputs are sub-batch slices. The stages run at
+    # the largest w <= the selection width whose program fits beside the stacks row.
+    from gw.shared_pole_execution import face_reduction_bytes,decoupled_stage_bytes,decoupled_width
+    price=lambda w:face_reduction_bytes(mesh_xy,int(w),rows=packed,side=side,carrier=carrier_columns,retain_span=True)
+    stage_bytes=lambda program:decoupled_stage_bytes(nq=nq,ranks=mesh_xy.size,side=side,carrier=carrier_columns,
         packed=packed,held=held,dw_panels=dw_panels,program=program)
+    stage_width=decoupled_width(ledger,stage_bytes(0)[0],price(1),width,concurrent_with=ledger.live_stages)
+    program=price(stage_width)
+    resident,boundaries=stage_bytes(program)
     stacks=resident-held-dw_panels-program
     panels=held+dw_panels
     row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=resident,
@@ -984,7 +988,7 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
         finally:
             ledger.live_stages=(*ambient,row['stage'])
     admitted=row['device_budget_status']=='PASS'
-    receipt=dict(parents=int(nq),sub_batch=int(width),pencil_side=int(side),stacks_bytes_per_rank=int(stacks),
+    receipt=dict(parents=int(nq),sub_batch=int(width),stage_batch=int(stage_width),pencil_side=int(side),stacks_bytes_per_rank=int(stacks),
                  panels_bytes_per_rank=int(panels),eigh_room_bytes_per_rank=rooms,admitted=bool(admitted))
     if not admitted:
         import warnings
@@ -1000,7 +1004,7 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
             budget.retained_panels=(*retained,*(a for s in states for a in s[1:3]),*infinity)
             reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,
                 eigh_plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms),
-                width=int(width),ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
+                width=int(stage_width),ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
                 gram_keep=gram_keep,carrier=carrier,eigh_rows=eigh_row)
         else:
             # The stacks do not fit beside the live set (warn, never refuse): the same
@@ -1060,7 +1064,7 @@ def slice_sector(sector, slots, mesh_xy):
     return out
 
 
-def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sample_ids, nq, width,
+def construct_cross_sector_all(whole, read, meta, config, *, mesh_xy, sample_ids, nq, width,
                                program_bytes, upstream):
     """CT for every parent at once beside the decoupled CC and TT (``whole``): each face round's
     joint pencil from its own samples (``read(ids, real)``) at one compacted span for every
@@ -1084,14 +1088,20 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
     rows=tuple(int(s['model'][0].shape[-2]) for s in whole)
     from gw.shared_pole_execution import decoupled_cross_bytes
     stacks,boundaries=decoupled_cross_bytes(nq=nq,ranks=mesh_xy.size,side=side,rows=rows)
-    # The pencil stack and the keep stage's (Y^H V Y, Y) beside it, plus one round's program.
+    # The pencil stack and the keep stage's (Y^H V Y, Y) beside it, plus one program: the pencil
+    # rounds and the stages run at the largest width <= the face batch whose program fits.
+    from gw.shared_pole_execution import decoupled_width
+    from gw.shared_pole_local import parent_rounds
+    per_parent=-(-int(program_bytes or 0)//int(width))
+    stage_width=decoupled_width(ledger,stacks,per_parent,width,concurrent_with=upstream)
+    program_bytes=per_parent*stage_width
     stack_row=ledger.reserve(f"sector.decoupled.CT.stacks",
-        resident_bytes_per_rank=stacks+int(program_bytes or 0),
+        resident_bytes_per_rank=stacks+program_bytes,
         workspace_bytes_per_rank=0,concurrent_with=upstream)
     ledger.live_stages=(*upstream,stack_row['stage'])
 
     def parts():
-        for ids,real,slots,execution in rounds:
+        for ids,real,slots in parent_rounds(int(nq),stage_width):
             sectors=[slice_sector(sec,ids,mesh_xy) for sec in whole]
             samples,cm,line_cross=read(ids,real)
             out=construct_cross_sector_round(sectors,samples,cm,meta,config,mesh_xy=mesh_xy,
@@ -1121,7 +1131,7 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
             finally:
                 ledger.live_stages=(*upstream,stack_row['stage'])
         signed,diagnostics=face_cross_decoupled(pencil,mesh=mesh_xy,
-            eigh_plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms),width=int(width),eigh_rows=eigh_row)
+            eigh_plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms),width=stage_width,eigh_rows=eigh_row)
         del pencil
     finally:
         ledger.live_stages=upstream
@@ -1143,7 +1153,7 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
     return dict(models=models,signed=signed,
                 diagnostics=jax.tree.map(lambda a:device_put_process_local(a,replicated),diagnostics),
                 zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget,
-                decoupled=dict(parents=int(nq),sub_batch=int(width),pencil_side=int(side),
+                decoupled=dict(parents=int(nq),sub_batch=int(width),stage_batch=int(stage_width),pencil_side=int(side),
                                stacks_bytes_per_rank=int(stacks),
                                eigh_room_bytes_per_rank=rooms,admitted=stack_row['device_budget_status']=='PASS',
                                keep_residual=float(np.max(np.asarray(diagnostics['metric_inverse_root_residual_relative'])[:nq])),

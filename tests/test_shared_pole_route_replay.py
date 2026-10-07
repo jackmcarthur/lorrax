@@ -6,7 +6,8 @@ supports, four held; CC 1194 x 1216 packed, TT 3 x 598 x 640 packed, 1.59 GB ups
 At its earlier 14 sites every sector is local at 36 GB (sides 9920 / 14880 / 24800, as
 that leg printed); at 32 sites TT's local reduction prices 63.9 GB and the constructor
 goes to the face at 36 GB, local again at 72 GB. The decoupled route never takes 641
-parents on 64 ranks (it ran out of memory there with lever 1, fdebbbd63).
+parents on 64 ranks (it ran out of memory there with lever 1, fdebbbd63); the face rounds
+hold 17 parents each (they held one before the whole-price step).
 """
 import json
 import os
@@ -43,6 +44,16 @@ for lines in (14, 32):
                                       641, mesh_xy=mesh, upstream=(up,))
         out[f'{lines}/{budget}'] = dict(resolved=mode, modes=[r['mode'] for r in rows] + [rows[0]['joint']['mode']],
                                         sides=[r['conservative_pencil_side'] for r in (*rows, rows[0]['joint'])])
+        if mode == 'face':
+            # The face batch from every parent (face_batch_width); the face eigh priced with the
+            # local plan (ponytail: the scalapack plan needs the native bundle, absent on CPU CI).
+            import gw.shared_pole_capacity as cap
+            from gw.shared_pole_execution import sector_batch_width
+            from gw.gw_config import linalg_resolution
+            cap.constructor_eigenplan = lambda mesh_xy, side, execution, room=None: cap._local_eigenplan(mesh_xy, int(side))
+            out[f'{lines}/{budget}']['widths'] = [sector_batch_width(
+                meta, linalg_resolution({'linalg': 'local'}), recipe, rows, mesh=mesh, ledger=ledger, nq=nq)[0]
+                for nq in (641, 18)]
 print('REPLAY' + json.dumps(out))
 """
 
@@ -67,6 +78,8 @@ def test_ni_route_replay():
     assert got['14/36'] == dict(resolved='local', modes=['local'] * 3, sides=[9920, 14880, 24800])
     assert got['32/36']['modes'][:2] == ['local', 'face'] and got['32/36']['resolved'] == 'face'
     assert got['32/36']['sides'] == [15680, 23520, 39200]
+    # 17 parents per round (35.1 GB of 36), not the one parent the room step jumped to.
+    assert got['32/36']['widths'] == [17, 17]
     assert got['32/72'] == dict(resolved='local', modes=['local'] * 3, sides=[15680, 23520, 39200])
     # The face rounds of 641 parents are warned with the q-local need, once (32 sites, 36 GB).
     warned = [l for l in run.stderr.splitlines() if 'RuntimeWarning: shared-pole sectors' in l]
