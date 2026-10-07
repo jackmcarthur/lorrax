@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — stable paired ordering of dense native eigenstates
+
+Dense reference output now stably orders energy metadata and its paired
+coefficient columns through the canonical permutation owner. A backend may
+return an ulp-scale inversion inside a nearly degenerate multiplet; strict
+native-reader ordering remains unchanged. The existing k-owner eigensolve,
+device checks, physical crop and archive transfer keep their original
+layouts and tolerances, with no new coefficient gather. Existing archives
+are untouched; an unordered historical reference requires a new variant.
+Eigenvalues, eigenvectors and the represented Hamiltonian are unchanged.
+
 ## 2026-10-07 — exact shared-model Γ correlation slope for reference controls
 
 `gw.shared_pole_head.realized_gamma_correlation_sampler` supplies all-P

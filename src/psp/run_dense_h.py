@@ -39,11 +39,13 @@ import time
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 import distrib_la
 from common.collectives import (process_count, process_rank, psum_replicate,
                                 single_device_mesh)
 from common.gpu_utils import device_budget_bytes, set_device_budget_gb
+from common.staged_reshard import permute_sharded_axis
 from file_io import CrystalData
 from file_io.qp_wfn import write_complete_wfn_h5, write_dense_spectrum_h5
 from psp.dft_operators import dense_matrix_k, setup_H_k_from_kvec
@@ -52,6 +54,23 @@ from psp.operator_checks import validate_dense_h_inputs
 from psp.pseudos import load_pseudopotentials
 from psp.scf_potential import build_dft_potentials
 from wfn_loader import WfnLoader
+
+
+def order_dense_eigenpairs(energies, vectors, *, mesh, spec):
+    """Stable energy metadata order with paired, layout-preserving columns.
+
+    The dense k-owner uses its existing process-local eigensolver mesh.
+    A distributed caller keeps its supplied all-P face through the same
+    canonical permutation owner. Only the small energy vector reaches host;
+    this function never gathers coefficients.
+    """
+    values = np.asarray(energies)
+    if (values.ndim != 1 or vectors.ndim != 2 or vectors.shape[1] != len(values)
+            or not np.isfinite(values).all()):
+        raise ValueError('dense eigenpair ordering needs finite matching energy/column extents')
+    order = np.argsort(values, kind='stable').astype(np.int32)
+    return values[order], permute_sharded_axis(vectors, 1, order, mesh, spec)
+
 
 def solve_k(H_k, gvecs_file, nspinor, eigh, nbands, *, full_spectrum=False):
     """ε and c for one k: the dense H on its (padded) sphere, one full eigh, source G order."""
@@ -83,6 +102,11 @@ def solve_k(H_k, gvecs_file, nspinor, eigh, nbands, *, full_spectrum=False):
     if not residual <= tol or not orthogonality <= tol:
         raise RuntimeError(f"dense eigenpairs failed: residual={residual:.2e}, "
                            f"orthogonality={orthogonality:.2e}, tolerance={tol:.2e}")
+    # Backend eigenvalues can invert a nearly degenerate pair by a few ulps.
+    # Keep the full padded carrier through checks and paired permutation;
+    # physical cropping still happens only after the synchronous host copy.
+    energies_host, selected = order_dense_eigenpairs(
+        energies[:keep], selected, mesh=single_device_mesh(), spec=P(None, None))
     psi = np.asarray(selected.T).reshape(keep, nspinor, ngkmax)
     if full_spectrum:
         psi = psi[:nphysical]
@@ -91,7 +115,6 @@ def solve_k(H_k, gvecs_file, nspinor, eigh, nbands, *, full_spectrum=False):
         raise RuntimeError(
             f"dense H_k: a physical eigenvector has weight {leak:.1e} on the "
             f"padded G block; the pad did not separate from the spectrum.")
-    energies_host = np.asarray(energies[:keep])
     if full_spectrum:
         energies_host = energies_host[:nphysical]
     return (energies_host, reorder_to_qe(psi, H_k, gvecs_file),
