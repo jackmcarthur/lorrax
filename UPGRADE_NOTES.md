@@ -15,8 +15,9 @@ declared sheet and crossing orientation. The exact crossing and physical
 band mask have the same owner as the value consumer. At an own-energy
 crossing the anchor and residue slopes must cancel their branch jumps.
 Default value formulas, drivers, decks, broadening and head policy are
-unchanged. These opt-in helpers await named analytic-pole/actual-query
-controls and physical P4 admission; no quasiparticle-root claim follows
+unchanged. Named compute-CPU controls passed94/94, including32 new
+analytic-pole/actual-shifted-query derivative controls; physical native
+P4 response admission remains pending. No quasiparticle-root claim follows
 from exposing a derivative.
 
 ## 2026-10-07 — optional Γ-only scalar reference fit keeps its factor and solve on matrix faces
