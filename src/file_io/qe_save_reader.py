@@ -122,6 +122,8 @@ class CrystalData:
     xc_extensions: tuple = ()       # which of <hybrid>, <vdW>, <dftU> the run carries
     domag: bool = False             # QE <do_magnetization>: a magnetic noncollinear run
     pseudo_files: tuple = ()        # ((species, pseudo_file), ...) from <atomic_species>
+    qe_creator_name: str | None = None
+    qe_creator_version: str | None = None
 
     # ── Private ──
     _save_dir: str = ""
@@ -161,7 +163,8 @@ class CrystalData:
         # ── symmetry operations ──
         # Lazy service import keeps importing this XML/HDF5 reader itself
         # device-stack-free; the conversion is used only when parsing.
-        from symmetry_maps import qe_xml_seitz_to_bgw
+        from symmetry_maps import qe_xml_seitz_to_bgw, read_qe_symmetry_receipt
+        creator = read_qe_symmetry_receipt(xml_path)
         sym_elems = _all(root, "symmetry")
         rotations, frac_trans, has_time_rev = [], [], []
         for sym_elem in sym_elems:
@@ -260,6 +263,8 @@ class CrystalData:
             assume_isolated=assume_isolated,
             functional=functional, xc_extensions=xc_extensions, domag=domag,
             pseudo_files=tuple(pseudo_files), _save_dir=save_dir,
+            qe_creator_name=creator.creator_name,
+            qe_creator_version=creator.creator_version,
         )
 
     # ------------------------------------------------------------------

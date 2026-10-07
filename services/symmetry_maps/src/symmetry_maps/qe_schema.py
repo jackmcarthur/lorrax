@@ -89,6 +89,8 @@ class QESymmetryReceipt:
     antiunitary: np.ndarray
     #: QE lspinorb (``band_structure/spinorbit``); None if the schema omits it.
     spinorbit: bool | None = None
+    creator_name: str | None = None
+    creator_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,8 @@ class QESymmetryBinding:
     scf_absolute_magnetization: float | None = None
     #: QE lspinorb, which ``noncolin`` does not imply; None if not recorded.
     spinorbit: bool | None = None
+    creator_name: str | None = None
+    creator_version: str | None = None
 
     @property
     def n_antiunitary(self) -> int:
@@ -160,6 +164,8 @@ def _read_qe_symmetry_receipt_cached(
     noncolin = False
     spinorbit: bool | None = None
     do_magnetization: bool | None = None
+    creator_name: str | None = None
+    creator_version: str | None = None
     calculation = ""
     absolute_magnetization: float | None = None
     current_info_anti = False
@@ -182,7 +188,13 @@ def _read_qe_symmetry_receipt_cached(
 
         parent = stack[-2] if len(stack) >= 2 else ""
         ancestry = tuple(stack)
-        if parent == "symmetry_flags" and tag in {
+        if parent == "general_info" and tag == "creator":
+            name, version = elem.attrib.get("NAME"), elem.attrib.get("VERSION")
+            if creator_name is not None or creator_version is not None:
+                raise ValueError("QE schema has multiple creator records")
+            creator_name = name.strip() if name else None
+            creator_version = version.strip() if version else None
+        elif parent == "symmetry_flags" and tag in {
                 "nosym", "noinv", "no_t_rev", "force_symmorphic"}:
             flags[tag] = _bool_text(elem.text)
         elif tag == "noncolin" and "band_structure" in ancestry:
@@ -315,6 +327,8 @@ def _read_qe_symmetry_receipt_cached(
         translations=tnp,
         antiunitary=typed,
         spinorbit=spinorbit,
+        creator_name=creator_name,
+        creator_version=creator_version,
     )
 
 
@@ -397,6 +411,8 @@ def bind_qe_symmetry_receipt(wfn, receipt: QESymmetryReceipt) -> QESymmetryBindi
         qe_permitted_pure_time_reversal=(
             not bool(receipt.noinv) and not magnetic_symmetry),
         spinorbit=receipt.spinorbit,
+        creator_name=receipt.creator_name,
+        creator_version=receipt.creator_version,
     )
 
 
@@ -482,6 +498,8 @@ def _binding_signature(binding: QESymmetryBinding) -> tuple:
         tuple(bool(value) for value in binding.antiunitary),
         bool(binding.qe_permitted_pure_time_reversal),
         binding.spinorbit,
+        binding.creator_name,
+        binding.creator_version,
     )
 
 
@@ -531,7 +549,7 @@ def resolve_qe_symmetry_binding(
         paths_text = ", ".join(binding.schema_path for binding in bindings)
         raise ValueError(
             "Multiple QE schemas authenticate the WFN but disagree on "
-            f"antiunitary operation typing or spinorbit: {paths_text}. Keep "
+            f"antiunitary operation typing, spinorbit or QE creator: {paths_text}. Keep "
             "only the WFN-generating NSCF *.save beside WFN.h5 (its directory and the "
             "two above it).")
 

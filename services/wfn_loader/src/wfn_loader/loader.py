@@ -755,6 +755,18 @@ class WfnLoader:
         binding = self.resolve_qe_symmetry()
         return None if binding is None else binding.spinorbit
 
+    @property
+    def qe_creator_name(self) -> str | None:
+        """Producer name from the same authenticated QE schema as spinorbit."""
+        binding = self.resolve_qe_symmetry()
+        return None if binding is None else binding.creator_name
+
+    @property
+    def qe_creator_version(self) -> str | None:
+        """Producer version from the same authenticated QE schema as spinorbit."""
+        binding = self.resolve_qe_symmetry()
+        return None if binding is None else binding.creator_version
+
     #: Compat alias.  Internal call sites and the sibling wave-1 branches
     #: still spell ``_ensure_sym``; one line keeps them working.
     _ensure_sym = symmetry

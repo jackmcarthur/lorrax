@@ -168,15 +168,20 @@ def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
                   f"{stats.get('peak_bytes_in_use', 0) / 1e9:.3f} GB, "
                   f"skew {skew:.1e}, e0={energies[ik, 0]:.8f} Ry", flush=True)
         energies = psum_replicate(energies, mesh)
+        operator_stamps = {
+            "dense_h_source_wfn": os.path.abspath(wfn_path),
+            "dense_h_qe_save": os.path.abspath(save_dir),
+            "dense_h_beta_quadrature_rule": vnl_setup.beta_quadrature_rule,
+            "dense_h_qe_creator_name": vnl_setup.qe_creator_name or "",
+            "dense_h_qe_creator_version": vnl_setup.qe_creator_version or "",
+        }
         write_complete_wfn_h5(
             output_path, wfn, energies, coefficients, mesh=mesh,
-            stamps={"dense_h_source_wfn": os.path.abspath(wfn_path),
-                    "dense_h_qe_save": os.path.abspath(save_dir)})
+            stamps=operator_stamps)
         if spectrum_output is not None:
             write_dense_spectrum_h5(
                 spectrum_output, wfn, spectra, mesh=mesh,
-                stamps={"dense_h_source_wfn": os.path.abspath(wfn_path),
-                        "dense_h_qe_save": os.path.abspath(save_dir)})
+                stamps=operator_stamps)
     if verbose:
         scope = "complete" if np.all(n_basis == nb) else "truncated on larger native spheres"
         print(f"wrote {output_path}: {nk} k x {nb} bands ({scope})", flush=True)

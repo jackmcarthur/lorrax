@@ -27,6 +27,7 @@ offsets (-0.08 meV rectangle constant, +0.068 meV FR full-mesh tail,
 from __future__ import annotations
 
 import numpy as np
+import re
 from scipy.special import spherical_jn, erf as scipy_erf
 
 from psp.species import SpeciesData
@@ -143,13 +144,14 @@ def _odd_double_factorial(n: int) -> float:
     return float(value)
 
 
-def projector_reduced_origin(sp: SpeciesData, ip: int) -> float:
+def projector_reduced_origin(sp: SpeciesData, ip: int, *, rule: str = "qe74") -> float:
     r"""Exact regular value ``lim_(q->0) F_l(q)/q^l`` as a radial moment."""
     l = int(sp.proj_l[ip])
-    weights = _simpson_weights(len(sp.r)) * sp.rab
+    kkb, weights = qe_beta_radial_scheme(sp.r, sp.rab, sp.kkbeta, rule=rule)
+    r = sp.r[:kkb]
     moment = np.sum(
-        np.asarray(sp.beta_r[ip], dtype=np.float64)
-        * sp.r ** (l + 2) * weights)
+        np.asarray(sp.beta_r[ip], dtype=np.float64)[:kkb]
+        * r ** (l + 2) * weights)
     return float(moment / _odd_double_factorial(2 * l + 1))
 
 
@@ -211,26 +213,59 @@ def _simpson_weights(n_r: int) -> np.ndarray:
     return sw
 
 
-def _qe_simpsn_weights(n: int) -> np.ndarray:
-    """QE's composite-Simpson weights, upflib/simpsn.f90 EXACTLY.
+def _qe_simpsn_weights(n: int, rule: str = "qe74") -> np.ndarray:
+    """QE's versioned composite-Simpson weights, upflib/simpsn.f90.
 
     Odd n: the standard 1/3, 4/3, 2/3, ..., 4/3, 1/3.  Even n: QE's
     even-mesh branch — the last point gets weight 0 and the one before it
     net 1/3 (interior 2/3 minus the closing 1/3), i.e. the standard odd
-    rule on the first n-1 points.  β integrals in QE run over exactly
+    rule on the first n-1 points for ``qe74``. QE7.5's ``qe75`` rule
+    instead includes the final three weights 15/12, 1, 5/12. β integrals run over exactly
     ``upf%kkbeta`` points (often even — 196 for the PseudoDojo Si UPFs),
     so matching QE's V_NL requires this branch, not a parity fix-up.
+    Historical direct radial helpers retain their explicit QE7.4 default;
+    production VNL setup resolves the rule from authenticated QE metadata.
     """
+    if rule not in ("qe74", "qe75", "common_odd"):
+        raise ValueError(f"unsupported beta Simpson rule {rule!r}")
+    if n < 1 or (rule == "qe75" and n % 2 == 0 and n < 4):
+        raise ValueError("beta Simpson mesh is too short")
     w = np.zeros(n, dtype=np.float64)
     i = np.arange(2, n)                      # 1-based interior 2..n-1
     w[1:n - 1] = np.abs((i % 2) - 2) * 2.0   # even i -> 4, odd i -> 2
     if n % 2 == 1:
         w[0] += 1.0
         w[n - 1] += 1.0
-    else:
+    elif rule == "qe74":
         w[0] += 1.0
         w[n - 2] -= 1.0
+    elif rule == "qe75":
+        w[0] += 1.0
+        w[n - 3] -= 0.25
+        w[n - 2] += 1.0
+        w[n - 1] += 1.25
+    else:
+        raise ValueError("common_odd Simpson rule cannot integrate an even mesh")
     return w / 3.0
+
+
+def resolve_beta_simpson_rule(mf, species: list[SpeciesData]) -> str:
+    """Resolve the native beta endpoint convention from QE producer metadata.
+
+    Only an even beta mesh needs a version: odd rules agree exactly.
+    The XML receipt/binding owns these creator fields. Missing or other
+    producer versions cannot identify an even-mesh native Hamiltonian.
+    """
+    if not any(int(sp.kkbeta or len(sp.r)) % 2 == 0 for sp in species if sp.n_proj):
+        return "common_odd"
+    name = getattr(mf, "qe_creator_name", None)
+    version = getattr(mf, "qe_creator_version", None)
+    match = re.fullmatch(r"(\d+)\.(\d+)(?:\.\d+)*", version or "")
+    if name != "PWSCF" or match is None or tuple(map(int, match.groups())) not in ((7, 4), (7, 5)):
+        raise ValueError(
+            "even-mesh beta projectors require authenticated PWSCF7.4 or7.5 "
+            f"creator metadata; got {name!r}, {version!r}. Bind the generating QE schema.")
+    return "qe74" if match.group(2) == "4" else "qe75"
 
 
 def qe_vloc_radial_scheme(
@@ -277,6 +312,8 @@ def qe_beta_radial_scheme(
     r: np.ndarray,
     rab: np.ndarray | None,
     kkbeta: int,
+    *,
+    rule: str = "qe74",
 ) -> tuple[int, np.ndarray]:
     """QE's radial quadrature for β-projector integrals.
 
@@ -295,7 +332,7 @@ def qe_beta_radial_scheme(
     n = len(r)
     kkb = int(kkbeta) if kkbeta else n
     kkb = min(max(kkb, 1), n)
-    w = _qe_simpsn_weights(kkb)
+    w = _qe_simpsn_weights(kkb, rule=rule)
     if rab is not None:
         w = w * np.asarray(rab, dtype=float)[:kkb]
     else:
@@ -310,6 +347,7 @@ def build_all_tables(
     *,
     projectors: bool = True,
     second_derivatives: bool = False,
+    beta_quadrature_rule: str = "qe74",
 ) -> dict:
     """Build Hankel tables for all species on a uniform q-grid.
 
@@ -325,6 +363,9 @@ def build_all_tables(
     a Bessel order are transformed together on the exact kkbeta mesh.
     Contact setup joins the opt-in l+2 rows. Output tables retain the
     original projector order.
+    ``beta_quadrature_rule`` is resolved by production VNL setup from
+    the authenticated QE producer; the low-level helper defaults to its
+    historical QE7.4 contract. All beta/derivative/origin rows share it.
     All Bessel evaluation
     + integrand reduction lives on GPU; only the (n_proj_s, n_q)
     result moves back to host.  Replaces a per-projector scipy.special
@@ -406,7 +447,7 @@ def build_all_tables(
         # index, where full-mesh generic weights disagree with QE —
         # measured as a +0.004 meV constant on every V_NL diagonal.
         kkb, wb_np = qe_beta_radial_scheme(
-            sp.r, sp.rab, int(getattr(sp, "kkbeta", 0)))
+            sp.r, sp.rab, int(getattr(sp, "kkbeta", 0)), rule=beta_quadrature_rule)
         rb_j = jnp.asarray(sp.r[:kkb], dtype=jnp.float64)
         wb_j = jnp.asarray(wb_np, dtype=jnp.float64)
 
@@ -453,7 +494,7 @@ def build_all_tables(
 
         proj_tables.append(F_table)
         reduced_origins.append(np.asarray([
-            projector_reduced_origin(sp, ip) for ip in range(n_proj)
+            projector_reduced_origin(sp, ip, rule=beta_quadrature_rule) for ip in range(n_proj)
         ], dtype=np.float64))
         deriv_tables.append(H_table)
         if second_derivatives:

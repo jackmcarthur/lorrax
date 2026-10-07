@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — native projector quadrature follows the authenticated QE creator
+
+VNL setup now resolves even-mesh beta integration from the generating QE
+schema: PWSCF7.4 uses its legacy first-n−1 endpoint, while PWSCF7.5 includes
+its final endpoint weights. Missing or unsupported creator metadata refuses
+an even mesh; odd beta meshes share the same rule. The public XML receipt
+owns creator fields, which CrystalData and WfnLoader expose through that
+binding. The resolved rule/version enters VNL provenance, uniform-gauge
+fingerprints and dense archives. Historical direct radial helper calls retain
+their documented7.4 default. Beta values, derivatives and reduced-origin
+moments use the same cutoff/rule; the origin formerly used a full-mesh rule.
+Regenerate affected kinetic/nonlocal, velocity and dense-spectrum artifacts
+before comparing them. On the fixed-density30Ry ferromagnetic SOC Fe control,
+the versioned endpoint removes the remaining1.25meV spectral disagreement
+after the density-sphere correction; all450Γ eigenvalues agree within8.1µeV.
+This is finite-operator fidelity, not physical SCF/grid convergence.
+
 ## 2026-10-07 — donated local rectangle insertion avoids general scatter
 
 `common.staged_reshard.shard_local_update` uses `dynamic_update_slice` when

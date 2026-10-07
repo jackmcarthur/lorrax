@@ -162,6 +162,9 @@ class VNLSetup:
     # device transfer.  Empty only on hand-built test fixtures; production
     # uniform gauge transactions refuse an empty value.
     uniform_gauge_fingerprint: str = ""
+    beta_quadrature_rule: str = ""
+    qe_creator_name: str | None = None
+    qe_creator_version: str | None = None
 
 
 @dataclass
@@ -349,7 +352,7 @@ def build_vnl_setup(
         uniform-gauge content-fingerprint pass.
     """
     from psp.species import extract_species, build_atom_species_map
-    from psp.radial_tables import build_all_tables
+    from psp.radial_tables import build_all_tables, resolve_beta_simpson_rule
 
     if nspinor is None:
         nspinor = int(meta.nspinor) if meta is not None else int(wfn.nspinor)
@@ -392,10 +395,15 @@ def build_vnl_setup(
 
     # Extract species data and projector tables
     species_list = extract_species(pseudos)
+    beta_quadrature_rule = resolve_beta_simpson_rule(wfn, species_list)
+    qe_creator_name = getattr(wfn, "qe_creator_name", None)
+    qe_creator_version = getattr(wfn, "qe_creator_version", None)
+    print_fn(f"  V_NL beta Simpson rule: {beta_quadrature_rule} "
+             f"(QE creator {qe_creator_name!r}, version {qe_creator_version!r})")
     compute_contact = bool(compute_contact)
     tables = build_all_tables(
         species_list, q_max, n_q,
-        second_derivatives=compute_contact)
+        second_derivatives=compute_contact, beta_quadrature_rule=beta_quadrature_rule)
     species_natoms, species_tau, _ = build_atom_species_map(wfn, species_list)
     q_grid = tables["q"]
     dq = tables["dq"]
@@ -545,6 +553,8 @@ def build_vnl_setup(
         coupled_row_blocks=tuple(coupled_row_blocks),
         Gpp_table=Gpp_table,
         uniform_gauge_fingerprint=uniform_gauge_fingerprint,
+        beta_quadrature_rule=beta_quadrature_rule,
+        qe_creator_name=qe_creator_name, qe_creator_version=qe_creator_version,
     )
 
     # ── say HOW the mode was decided (one line, report-block ready) ──
@@ -567,6 +577,8 @@ def build_vnl_setup(
 
         digest = hashlib.sha256()
         digest.update(b"lorrax.vnl_uniform_gauge/v1\0")
+        digest.update((beta_quadrature_rule + "\0" + str(qe_creator_name)
+                       + "\0" + str(qe_creator_version) + "\0").encode())
 
         for label, value in (
             ("B_cart", B),
