@@ -876,9 +876,10 @@ def guarded_eigh(plan, stack, *, mesh, label):
     route = plan.stack_route(stack.shape, stack.dtype, traced=False)
     if route.route != 'batch_reshard' or not route.program_bytes:
         return plan.batched(stack)
-    from distrib_la._collectives import agreed_minimum
+    import numpy as np
+    from common.collectives import all_gather_processes
     free = _device_free_bytes()
-    agreed, = agreed_minimum((-1 if free is None else free,), tag=f"decoupled eigh free {label}")
+    agreed = int(np.min(all_gather_processes(np.asarray([-1 if free is None else free], np.int64))))
     if agreed < 0 or agreed >= int(route.program_bytes):
         return plan.batched(stack)
     import warnings
