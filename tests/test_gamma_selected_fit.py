@@ -16,6 +16,7 @@ from isdf import cplus
 from isdf.zeta_mubatch import ZStore
 from runtime.padding import padded_axis
 from gw.isdf_fitting import _gamma_c_from_parent_faces, fit_zeta_to_h5
+from gw.wavefunction_bundle import parent_faces
 
 
 @pytest.fixture(scope='module')
@@ -103,8 +104,13 @@ def test_gamma_gram_bounded_children_against_literal_density_sum(mesh):
     plan=SimpleNamespace(nspinor=1,n_sym_spatial=1,n_centroid_packed=4,
         wavefunction_unfold_tables=lambda:tables,
         unfold_face=lambda a,**kw:jnp.take(a,kw['tables']['irr_idx'],axis=0))
-    y=jax.device_put(psi,NamedSharding(mesh,P(None,'x',None,'y')))
-    m=jax.device_put(psi.conj().transpose(0,2,3,1),NamedSharding(mesh,P(None,None,'x','y')))
+    # The canonical loader's second output is already conjugated.  Bind
+    # both consumer faces through their production owner, rather than
+    # assigning a second conjugation to the parent mun face.
+    y,m=parent_faces(
+        jax.device_put(psi,NamedSharding(mesh,P(None,'x',None,'y'))),
+        jax.device_put(psi.conj().transpose(0,3,1,2),
+            NamedSharding(mesh,P(None,'x','y',None))),mesh_xy=mesh)
     got=_gamma_c_from_parent_faces(m,y,plan,mesh,panel_k=2)
     want=np.zeros((4,4),np.complex128)
     for k in full:
