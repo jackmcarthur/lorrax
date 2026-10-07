@@ -107,7 +107,11 @@ def test_asymmetric_complex_map_full_dyson_slope_and_sigma_equivalence(mesh):
     # LU is separately priced on a genuine one-process-per-cell P4 mesh.
     dyson, _, _, _ = rb._response_programs(mesh, M, "off", "auto",
                                           _w_solve_pref_scalar(meta), True, None)
-    placed_root = dyson.place(face(H[None], mesh))
+    # Tiny literal fixture: declare the resident batch layout explicitly.
+    # The service's P1 placement/guard edge is registered separately; genuine
+    # P4 distributed parity exercises the production face route.
+    placed_root = jax.device_put(H[None].astype(complex),
+                                NamedSharding(mesh, P(("x", "y"), None, None)))
     solver = SphereScreening.__new__(SphereScreening)
     solver.mesh=mesh; solver.linalg="local"; solver.batched_route="auto"
     solver.axis=padded_axis(G, mesh, name="endpoint algebra plant")

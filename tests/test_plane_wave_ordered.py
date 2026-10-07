@@ -80,6 +80,29 @@ def test_squared_frequency_derivative_and_actual_reverse_tile(mesh):
     assert np.linalg.norm(expected-inferred)>1e-5
 
 
+def test_runtime_pair_mask_changes_at_the_same_vertex_shape(mesh):
+    rng=np.random.default_rng(710073)
+    values=rng.normal(size=(2,1,2,4))+1j*rng.normal(size=(2,1,2,4))
+    values[...,3]=0.
+    de=-np.linspace(.7,1.4,4).reshape(2,1,2);df=np.ones_like(de)
+    first=np.ones(de.shape,bool);first[0,0,0]=False
+    second=np.ones(de.shape,bool);second[0,0,1]=False
+    one=values.copy();one[~first]=0.
+    OrderedLehmannPair(tile(one,mesh),de,df,first,mesh=mesh,
+        cell_volume=11.,physical_g_count=3,panel_bytes=4096)
+    # A cached guard must read the current mask, not retain the first one.
+    with pytest.raises(ValueError,match="nonzero native-pair"):
+        OrderedLehmannPair(tile(one,mesh),de,df,second,mesh=mesh,
+            cell_volume=11.,physical_g_count=3,panel_bytes=4096)
+    two=values.copy();two[~second]=0.
+    bank=OrderedLehmannPair(tile(two,mesh),de,df,second,mesh=mesh,
+        cell_volume=11.,physical_g_count=3,panel_bytes=4096)
+    expected,slope=oracle(two,de,df,second,[.7+.25j],2./11.)
+    got,ds=bank.evaluate([.7+.25j],with_derivative=True)
+    np.testing.assert_allclose(got,expected,rtol=3e-12,atol=3e-12)
+    np.testing.assert_allclose(ds,slope,rtol=3e-12,atol=3e-12)
+
+
 def test_gamma_paired_owner_preserves_legacy_and_both_explicit_terms(mesh):
     rng=np.random.default_rng(710052)
     g=np.asarray([[0,0,0],[1,0,0],[-1,0,0]],np.int32)

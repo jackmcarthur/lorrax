@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — bounded ordered-reference setup reuses compiled callables
+
+The ordered native-pair reference constructor passes pair validity as
+replicated runtime metadata to its unchanged exact ghost/finite guard.
+The four existing volume-preserving transport callables are cached per
+mesh, so same-shape streaming tiles reuse setup instead of closing over
+new masks and creating new JIT identities. Shape specializations, guards,
+arithmetic, synchronization and all-processor output layouts are unchanged.
+No occupation, sampling, response or production-driver law changes.
+
 ## 2026-10-07 — explicit linear endpoint maps for contour references
 
 Reference contractions can project ordinary density endpoints and lift

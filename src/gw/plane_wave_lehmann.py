@@ -185,21 +185,45 @@ def _ordered_response_kernel(mesh, panel_bytes, with_derivative):
     return jax.jit(value, out_shardings=(face, face) if with_derivative else face)
 
 
+@lru_cache(maxsize=None)
+def _transition_face_programs(mesh):
+    """Reuse the same transport callables across bounded native tiles."""
+    from common.collectives import transpose_xy
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    def flatten(v):
+        B, K, A, M = map(int, v.shape)
+        return v.reshape(1, B * K * A, 1, M)
+    return (jax.jit(flatten, out_shardings=NamedSharding(
+                mesh, P(None, ("x", "y"), None, None))),
+            jax.jit(lambda v: v.reshape(1, v.shape[1], v.shape[-1]), out_shardings=face),
+            jax.jit(lambda v: transpose_xy(v, mesh), out_shardings=face),
+            jax.jit(lambda v: v.conj(), out_shardings=face))
+
+
 def _transition_faces(vertices, mesh):
     """The shared volume-preserving raw-band to two all-P face conversion."""
     from common.staged_reshard import band_to_product_r_reshard
-    from common.collectives import transpose_xy
-    B, K, A, M = map(int, vertices.shape)
-    T = B * K * A
-    face = NamedSharding(mesh, P(None, "x", "y"))
-    flat = jax.jit(lambda v: v.reshape(1, T, 1, M), out_shardings=NamedSharding(
-        mesh, P(None, ("x", "y"), None, None)))(vertices)
+    flatten, reshape, transpose, conjugate = _transition_face_programs(mesh)
+    flat = flatten(vertices)
     ordinary = band_to_product_r_reshard(mesh, face=True)(flat)
-    right = jax.jit(lambda v: v.reshape(1, T, M), out_shardings=face)(ordinary)
-    left = jax.jit(lambda v: transpose_xy(v, mesh), out_shardings=face)(right)
-    right = jax.jit(lambda v: v.conj(), out_shardings=face)(right)
+    right = reshape(ordinary)
+    left = transpose(right)
+    right = conjugate(right)
     left.block_until_ready(); right.block_until_ready()
     return left, right
+
+
+@lru_cache(maxsize=None)
+def _ordered_vertex_guard(mesh, physical_g_count):
+    """Exact ghost/finite guard with a dynamic replicated pair mask."""
+    def guard(v, valid):
+        ghost_mask = (~valid)[..., None] | (
+            jnp.arange(v.shape[-1]) >= physical_g_count)[None, None, None]
+        return jnp.stack((jnp.max(jnp.abs(jnp.where(ghost_mask, v, 0))),
+                          jnp.all(jnp.isfinite(v)).astype(jnp.float64)))
+    return jax.jit(guard, in_shardings=(NamedSharding(mesh,
+        P(("x", "y"), None, None, None)), NamedSharding(mesh, P())),
+        out_shardings=NamedSharding(mesh, P()))
 
 
 class OrderedLehmannPair:
@@ -244,12 +268,8 @@ class OrderedLehmannPair:
         from common.collectives import replicate_to_mesh
         self.de = replicate_to_mesh(np.where(valid, de, 0.).astype(np.float64).reshape(-1), mesh)
         self.df = replicate_to_mesh(np.where(valid, df, 0.).astype(np.float64).reshape(-1), mesh)
-        def vertex_guard(v):
-            ghost_mask = (~valid)[..., None] | (jnp.arange(M) >= int(Ng))[None, None, None]
-            return jnp.stack((jnp.max(jnp.abs(jnp.where(ghost_mask, v, 0))),
-                              jnp.all(jnp.isfinite(v)).astype(jnp.float64)))
-        ghost, finite = np.asarray(jax.device_get(jax.jit(vertex_guard,
-            out_shardings=NamedSharding(mesh, P()))(vertices)))
+        ghost, finite = np.asarray(jax.device_get(_ordered_vertex_guard(mesh, int(Ng))(
+            vertices, replicate_to_mesh(valid, mesh))))
         if float(ghost) != 0.:
             raise ValueError("ordered transition tile has a nonzero native-pair or retained-G ghost")
         if not bool(finite):
