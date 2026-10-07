@@ -77,6 +77,23 @@ def _vec(text: str) -> np.ndarray:
     return np.array([float(x) for x in text.split()])
 
 
+def _saved_geometry(root: ET.Element) -> tuple[ET.Element, ET.Element]:
+    """Bind direct/reciprocal geometry to one saved frame, never QE's input.
+
+    QE can write a restart's input ``alat`` differently from the saved
+    output normalization of ``b1/b2/b3``. Old single-frame schemas have no
+    output wrapper; their sole structure remains unambiguous.
+    """
+    outputs = _all(root, "output")
+    if len(outputs) > 1:
+        raise ValueError("QE saved geometry has ambiguous output frames")
+    frame = outputs[0] if outputs else root
+    structures = _all(frame, "atomic_structure")
+    if len(structures) != 1:
+        raise ValueError("QE saved atomic_structure is missing or ambiguous")
+    return frame, structures[0]
+
+
 # ---------------------------------------------------------------------------
 # CrystalData
 # ---------------------------------------------------------------------------
@@ -140,21 +157,21 @@ class CrystalData:
         root = ET.parse(xml_path).getroot()
 
         # ── lattice ──
-        a1, a2, a3 = _vec(_text(root, "a1")), _vec(_text(root, "a2")), _vec(_text(root, "a3"))
+        geometry, structure = _saved_geometry(root)
+        a1, a2, a3 = (_vec(_text(structure, f"a{i}")) for i in (1, 2, 3))
         avec_bohr = np.array([a1, a2, a3])
         # QE's lattice parameter (celldm(1)); |a1| only when the XML omits it
         # (they differ for e.g. bcc, where |a1| = alat·√3/2).
-        structure = _all(root, "atomic_structure")[0].attrib
-        alat = float(structure.get("alat", np.linalg.norm(a1)))
+        alat = float(structure.attrib.get("alat", np.linalg.norm(a1)))
         blat = 2.0 * np.pi / alat
         avec = avec_bohr / alat
-        bvec = np.array([_vec(_text(root, f"b{i}")) for i in (1, 2, 3)])
+        bvec = np.array([_vec(_text(geometry, f"b{i}")) for i in (1, 2, 3)])
         bdot = bvec @ bvec.T * blat ** 2
         cell_volume = abs(np.dot(a1, np.cross(a2, a3)))
 
         # ── atoms ──
-        nat = int(_all(root, "atomic_structure")[0].attrib["nat"])
-        atoms = _all(root, "atom")[:nat]
+        nat = int(structure.attrib["nat"])
+        atoms = _all(structure, "atom")[:nat]
         # Crystal coords: pos_bohr = avec_bohr.T @ τ_crys, so τ_crys = inv(avec_bohr.T) @ pos
         avec_inv_T = np.linalg.inv(avec_bohr.T)
         atom_crys = np.array([avec_inv_T @ _vec(a.text) for a in atoms])

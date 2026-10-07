@@ -128,6 +128,14 @@ between two plans that both exist, not between layouts of one stage.
 potrf/trsm handlers that need it (`src/ffi/cpp/slate/batched_{potrf,trsm}_ffi.cc`,
 registered but never called).
 
+## 2026-10-07 — saved QE geometry belongs to one output frame {#qe-saved-geometry}
+
+**Rule.** A saved-reference reader binds direct cell, atoms and lattice
+normalization to the same saved output frame as reciprocal vectors. It must
+not combine restart input geometry with saved output normalization. Missing or
+ambiguous saved frames refuse; an unwrapped legacy schema requires a sole
+structure. `CrystalData.from_qe_save` owns this boundary.
+
 ## 2026-10-01 — LORRAX uses every symmetry operation QE reports {#all-qe-symmetries}
 
 **Rule (owner).** The WFN keeps every operation QE found, including those

@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — QE saved geometry uses the output normalization
+
+`CrystalData.from_qe_save` now binds the saved output structure, lattice
+parameter, direct cell and atoms to the output reciprocal vectors. QE restart
+XML can carry a different input `alat`; mixing that input normalization with
+saved reciprocal vectors scaled Cartesian G incorrectly. Missing or ambiguous
+output geometry refuses; a sole legacy unwrapped structure remains supported.
+Equal input/output geometry is unchanged. No deck change is required.
+
 ## 2026-10-07 — complete target-block projections require the full run mesh
 
 The opt-in `project_interaction_block` now checks square X/Y membership
