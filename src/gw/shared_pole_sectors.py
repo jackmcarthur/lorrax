@@ -876,13 +876,15 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
             panel_elements=sum(int(np.prod(panels.shape[1:])) for panels,_ in line.values())
             selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
                              +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
+            # Earlier sub-batches' selected panels stay live beside this selection.
+            budget.retained_panels=(*retained,*jax.tree.leaves([(part[0],part[3]) for part in parts]))
             selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
                                   selection_faces=selection_faces)
             if budget.face_room is not None:
                 budget.face_room=min(budget.face_room,face_eigh_room(selection) or 0) or None
             sub=dict(geometry,ids=ids,real=real)
             states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,sub,local_meta,n,budget,
-                mesh_xy=mesh_xy,execution='face',retained=retained)
+                mesh_xy=mesh_xy,execution='face',retained=budget.retained_panels)
             # a short last sub-batch repeats its last parent: keep the real slots only
             keep=slice(0,int(real))
             parts.append((states,np.asarray(counts)[keep],roles,infinity,[v for v in values][keep],real))
