@@ -15,8 +15,9 @@ identities and the actual electronic Nk/k-grid. Its Dyson inputs are already
 normalized, its screened moments are M_k=C_(k+1)/2, and supported Coulomb null
 modes retain zero inverse. A selected-parent result is not an all-q model.
 The optional packed_endpoints capacity geometry avoids fabricated centroid
-metadata. No new deck dial or default policy is introduced. Focused runtime
-checks and native provider/fit pricing are pending for this extraction.
+metadata. No new deck dial or default policy is introduced. Focused compute checks passed34 CPU cases and31 cases on each MPI4 rank,
+plus a tiny2-pole all-P face-round literal control. Native cache/moment/fit,
+whole-model source-transition and optimized-HLO resource proofs remain pending.
 
 ## 2026-10-07 — optional distributed Γ conditioning runs inside one cached program
 
