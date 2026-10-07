@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 import jax
 from jax.sharding import Mesh,NamedSharding,PartitionSpec as P
+from common.collectives import gather_to_host
 from gw import contour_reference as cd
 
 
@@ -52,7 +53,7 @@ def test_full_block_retains_literal_complex_offdiagonals_and_diagonal_defaults(m
     assert block.sharding==NamedSharding(mesh,P())
     p0,diagonal=cd.project_interaction_diagonal(face(w,mesh),face(rows,mesh),mesh=mesh,
         prefactor=pref,scalar_replication_bound_bytes=3*16*16)
-    np.testing.assert_array_equal(product,p0)
+    np.testing.assert_array_equal(gather_to_host(product),gather_to_host(p0))
     np.testing.assert_allclose(np.diagonal(np.asarray(block),axis1=-2,axis2=-1).reshape(3,16),
         diagonal,atol=2e-15,rtol=3e-13)
     assert np.max(abs(expected[:,:,0,1]))>1e-5
