@@ -881,14 +881,20 @@ def write_restart_state_to_h5(
         nb_h = hartree_record['band_range'][1] - hartree_record['band_range'][0]
         if (hartree_parent_kij_ry.ndim != 3
                 or hartree_parent_kij_ry.shape[0] != len(hartree_record['parent_full_rows'])
+                or hartree_parent_kij_ry.shape[1] != hartree_parent_kij_ry.shape[2]
+                or hartree_parent_kij_ry.shape[1] < nb_h
                 or np.dtype(hartree_parent_kij_ry.dtype) != np.dtype('complex128')):
             raise ValueError('resident Hartree producer shape/dtype disagrees with provenance')
-        if not bool(jax.device_get(jnp.all(jnp.isfinite(
-                hartree_parent_kij_ry[:, :nb_h, :nb_h])))):
-            raise ValueError('resident Hartree producer is nonfinite')
         if parent_k_rows is not None and not np.array_equal(
                 parent_k_rows, hartree_record['parent_full_rows']):
             raise ValueError('resident Hartree FILE rows disagree with parent wavefunctions')
+        logical_hartree = hartree_parent_kij_ry[:, :nb_h, :nb_h]
+        if isinstance(hartree_parent_kij_ry, jax.Array):
+            finite_hartree = bool(jax.device_get(jnp.all(jnp.isfinite(logical_hartree))))
+        else:
+            finite_hartree = bool(np.all(np.isfinite(logical_hartree)))
+        if not finite_hartree:
+            raise ValueError('resident Hartree producer is nonfinite')
     if encoded_charge_zeta_identity is not None and mode != "w":
         raise ValueError(
             "charge_zeta_identity is immutable restart provenance and may "
