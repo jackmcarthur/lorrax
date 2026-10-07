@@ -235,6 +235,16 @@ def route_summary(mode, receipt):
                    (receipt.get("local_selection"), receipt.get("local_reduction")) if row), None)
     price = "" if budget is None else f"; local parent GB/rank: {rows} of {budget / 1e9:.1f}"
     batch = receipt.get("face_batch")
+    decoupled = receipt.get("decoupled")
+    if decoupled is not None:
+        price += (f"; decoupled: {decoupled['parents']} parents in sub-batches of {decoupled['sub_batch']}, "
+                  f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh room "
+                  + ("none, " if decoupled.get('eigh_room_bytes_per_rank') is None
+                     else f"{decoupled['eigh_room_bytes_per_rank'] / 1e9:.1f} GB/rank, ")
+                  + ("every eigh once over the stack" if decoupled['admitted']
+                     else "stacks over budget: face rounds over the stacked panels")
+                  + f", max |ZAZ-I|/sqrt(R) keep {decoupled['keep_residual']:.1e} paired {decoupled['paired_residual']:.1e}"
+                  + f" ({decoupled['paired_iterations']} Newton-Schulz iteration(s))")
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
@@ -249,6 +259,17 @@ def route_summary(mode, receipt):
 def is_face(array):
     spec = tuple(array.sharding.spec)
     return len(spec) == array.ndim and spec[-2:] == ('x', 'y')
+
+
+#: Face programs compile with XLA's latency-hiding scheduler, which runs the
+#: panel all-gathers of ``panel_matmul`` beside the local GEMMs (claims 2953,
+#: 3115: Sigma tau -4 to -10 % on the same option; +0.5 GB per rank, inside
+#: ``FACE_PROGRAM_COPIES``). Remat is off globally, so the hazard of claim 2961 is closed.
+FACE_COMPILER_OPTIONS = {"xla_gpu_enable_latency_hiding_scheduler": True}
+
+#: Local GEMM depth of one interleaved SUMMA panel: ``panel_matmul`` gathers
+#: ``p * FACE_PANEL_DEPTH`` contraction columns per step for the whole batch.
+FACE_PANEL_DEPTH = 256
 
 
 def face_program(fn, mesh, *, outputs='matrices'):
@@ -278,6 +299,9 @@ def face_program(fn, mesh, *, outputs='matrices'):
             model=lambda tree:(matrix(tree[0]),rep,rep)
             if outputs == 'matrices':
                 out=jax.tree.map(matrix,shapes)
+            elif outputs == 'mixed':
+                # a stage dict: matrices on the face, per-parent vectors and scalars replicated
+                out=jax.tree.map(lambda v:matrix(v) if v.ndim>=3 else rep,shapes)
             elif outputs == 'scalars':
                 out=scalar_tree(shapes)
             elif outputs == 'parent':
@@ -291,15 +315,32 @@ def face_program(fn, mesh, *, outputs='matrices'):
                 out=(matrix(shapes[0]),model(shapes[1]))
             else:
                 raise ValueError('unknown explicit constructor output contract '+outputs)
-            compiled[signature]=distrib_la.checked_program(fn,mesh,out)
+            compiled[signature]=distrib_la.checked_program(fn,mesh,out,compiler_options=FACE_COMPILER_OPTIONS)
         return compiled[signature]
     return lambda *args: program(*args)(*args)
 
 
 @lru_cache(maxsize=None)
 def face_matmul(mesh):
-    from distrib_la import matmul
-    return partial(matmul, mesh=mesh, backend='distributed', batched_route='auto')
+    """The whole-mesh constructor's product: ``distrib_la.panel_matmul``, the batched
+    2-D SUMMA of the Green builder (one all_gather per operand per panel for the whole
+    stack, a panel prefetched, transposed operands by one grid-transpose exchange), so
+    a face program holds no distributed-library GEMM and runs on any backend. The
+    panel holds ``p * FACE_PANEL_DEPTH`` contraction columns. A non-square mesh keeps
+    the provider product (the slow fallback)."""
+    from distrib_la import matmul, panel_matmul
+    p = int(mesh.shape['x'])
+    if p != int(mesh.shape['y']):
+        return partial(matmul, mesh=mesh, backend='distributed', batched_route='auto')
+
+    def product(a, b, *, transa='N', transb='N'):
+        q = int(a.shape[0])
+        m = int(a.shape[2] if transa != 'N' else a.shape[1])
+        n = int(b.shape[1] if transb != 'N' else b.shape[2])
+        per_column = a.dtype.itemsize * q * (m // p + n // p)
+        return panel_matmul(a, b, mesh=mesh, panel_bytes=per_column * 2 * p * FACE_PANEL_DEPTH,
+                            transa=transa, transb=transb)
+    return product
 
 
 @lru_cache(maxsize=None)
@@ -624,3 +665,190 @@ def compact_program(mesh,width):
     from gw.shared_pole_sectors import _compact_sector_equations
     return face_program(partial(_compact_sector_equations,width=width,
         matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),mesh,outputs='compact')
+
+
+# ---- the decoupled face route: every parent in flight, stage programs over sub-batches ----
+#
+# The paired reduction is GEMM stages with an eigh between them
+# (``shared_pole_reduction``). A face round of w parents runs them as one
+# program, so its eigh stacks hold w matrices and the round count sets the
+# eigh wall: 21 rounds of 3 at CrI3 24x24 P64 cost 21 serial local eighs
+# (SECTFAST). Here each GEMM stage runs as its own program over sub-batches
+# of ``width`` parents, its outputs stacked for every parent, and each eigh
+# runs once over the whole stack, one matrix per rank (route (c), flat to
+# b = P). Nothing between stages is held that the next stage does not read.
+# The metric corrections stay Newton-Schulz inside their stage: the paired metric
+# Y^H H_r Y is the identity to ~1e-8 by construction, so its bound asks one
+# iteration (CrI3 6x6), cheaper than a further eigh of the stack (P64 TT: one
+# iteration of 61 parents 10.7 s, the eigh root 25.2 s; claim 3425).
+
+
+@lru_cache(maxsize=None)
+def _stack_parents(mesh, ndim):
+    out = NamedSharding(mesh, P(None, 'x', 'y')) if ndim >= 3 else NamedSharding(mesh, P())
+    return jax.jit(lambda *parts: jnp.concatenate(parts, axis=0), out_shardings=out)
+
+
+def _stack(mesh, parts):
+    """Concatenate per-sub-batch outputs along the parent axis; matrices stay on the
+    face, a 0-d entry (a side, a count) is the same in every part and passes through."""
+    def join(*leaves):
+        return leaves[0] if jnp.ndim(leaves[0]) == 0 else _stack_parents(mesh, leaves[0].ndim)(*leaves)
+    return jax.tree.map(join, *parts)
+
+
+@lru_cache(maxsize=None)
+def _stack_slot(mesh, shape, dtype):
+    """The program writing one sub-batch into its rows of a parent stack, in place
+    (the stack donated), and the program allocating that stack."""
+    sharding = NamedSharding(mesh, P(None, 'x', 'y')) if len(shape) >= 3 else NamedSharding(mesh, P())
+    write = jax.jit(lambda full, part, i0: jax.lax.dynamic_update_slice_in_dim(full, part, i0, axis=0),
+                    donate_argnums=0, out_shardings=sharding)
+    return write, jax.jit(partial(jnp.zeros, shape, dtype), out_shardings=sharding)
+
+
+def _assemble(mesh, nq, parts):
+    """``_stack`` with the stack allocated once and each sub-batch written into it in
+    place as it arrives (``parts`` an iterator of (offset, tree)): one stack and one
+    sub-batch live, not the sub-batches and their concatenation."""
+    stack = None
+    for i0, part in parts:
+        if stack is None:
+            stack = jax.tree.map(lambda a: a if jnp.ndim(a) == 0 else
+                                 _stack_slot(mesh, (int(nq), *a.shape[1:]), a.dtype)[1](), part)
+        stack = jax.tree.map(lambda full, a: full if jnp.ndim(a) == 0 else
+                             _stack_slot(mesh, full.shape, full.dtype)[0](full, a, np.int32(i0)),
+                             stack, part)
+        del part
+    return stack
+
+
+@lru_cache(maxsize=None)
+def _rows_program(sharding):
+    """One program taking a parent index set's rows of a stack, in the stack's own
+    layout; the index is an operand, so every round and sub-batch of one width shares
+    one compile."""
+    return jax.jit(lambda x, index: x[index], out_shardings=sharding)
+
+
+def parent_rows(mesh, tree, index):
+    """The ``index`` rows (parents) of every stacked leaf of ``tree`` (matrices on the
+    face, other leaves in their own named layout or replicated); 0-d leaves pass through."""
+    index = np.asarray(index, np.int32)
+    def one(a):
+        if jnp.ndim(a) == 0:
+            return a
+        if isinstance(a, np.ndarray):
+            return a[index]
+        own = a.sharding if isinstance(a.sharding, NamedSharding) and a.sharding.mesh == mesh else None
+        layout = NamedSharding(mesh, P(None, 'x', 'y')) if a.ndim >= 3 else NamedSharding(mesh, P())
+        return _rows_program(own or layout)(a, index)
+    return jax.tree.map(one, tree)
+
+
+@lru_cache(maxsize=None)
+def _hermitian_stack(mesh):
+    """(A + A^H) / 2 of a face stack, on the face (the eigh input of H'_vv, as the round forms it)."""
+    from distrib_la import hermitian_part
+    return jax.jit(hermitian_part, out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
+
+
+def _take(mesh, tree, i0, i1):
+    return parent_rows(mesh, tree, np.arange(i0, i1))
+
+
+@lru_cache(maxsize=None)
+def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_keep, carrier):
+    """The four stage programs of the decoupled face reduction, each jitted on the face."""
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, _matrix_take_columns
+    from gw.shared_pole_reduction import paired_members, keep_stage, paired_stage, output_stage
+    from gw.shared_pole_gates import sort_shared_pole_columns, apply_shared_pole_zero_policy, ordered_moment_identity
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    if not (ordered and odd_moments):
+        raise ValueError('the decoupled face route is the ordered sector reduction')
+    mm = face_matmul(mesh)
+    ms = NamedSharding(mesh, P(None, 'x', 'y'))
+
+    # The stage dicts cross program boundaries, so they carry arrays only; a stage's
+    # static extents are read back from the shapes it holds (R = 2 hvv, half from the
+    # inverse nodes, the kept width from its mask) before the equations run. A stage
+    # returns only what it computes: the keys it passes through unchanged are named
+    # (at trace time, ``passthrough``) and the caller keeps its own stacks for them,
+    # so no program copies a held stack.
+    arrays = lambda d: {k: v for k, v in d.items() if not isinstance(v, int)}
+    passthrough = {}
+
+    def new_only(name, before, after):
+        same = tuple(sorted(k for k, v in after.items() if k in before and v is before[k]))
+        passthrough[name] = same
+        return arrays({k: v for k, v in after.items() if k not in same})
+
+    def extents(stage):
+        return dict(stage, side=2 * int(stage['scale'].shape[-1]), half=int(stage['inverse'].shape[-1]),
+                    **({'width': int(stage['kept'].shape[-1])} if 'kept' in stage else {}))
+
+    def stage1(points, order, active, qs, os_, ds, infinity):
+        def pack(parts):
+            panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape['y'])])), axis=-1)
+            return _matrix_take_columns(panels, order, ms)
+        q, o, d = pack(qs), pack(os_), pack(ds)
+        pencil = assemble_ordered_shared_pole_pencil([(points, q, o, d)], infinity, matmul=mm, matrix_sharding=ms)
+        stage = paired_members(pencil, active, gates=gates, matrix_sharding=ms)
+        stage['paired'] = jnp.broadcast_to(stage['paired'], (points.shape[0],))
+        return arrays(stage)
+
+    def stage2(stage, gamma, u):
+        return new_only('keep', stage, keep_stage(extents(stage), gamma, u, matmul=mm, gates=gates,
+            keep_budget=keep_budget, retain_span=retain_span, matrix_sharding=ms, gram_keep=gram_keep, carrier=carrier))
+
+    def stage3(stage, gamma_r, u_r):
+        return new_only('paired', stage, paired_stage(extents(stage), gamma_r, u_r, matmul=mm, gates=gates,
+                                                      matrix_sharding=ms, gram_keep=gram_keep))
+
+    def stage4(stage, mu, rotation, infinity):
+        reduced = output_stage(extents(stage), mu, rotation, matmul=mm, gates=gates, retain_span=retain_span,
+                               matrix_sharding=ms)
+        model, signed, reduction = reduced[:3]
+        retained = ordered_moment_identity(signed, infinity, matmul=mm)
+        model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+        zero['zero_policy'] = zero['zero_policy'] & reduction['infinite_weight_ok']
+        model, permutation = sort_shared_pole_columns(model, matrix_sharding=ms)
+        result = model, signed, (reduction, zero, retained, permutation)
+        return (*result, reduced[3]) if retain_span else result
+    return tuple(face_program(fn, mesh, outputs='mixed' if i < 3 else 'parent')
+                 for i, fn in enumerate((stage1, stage2, stage3, stage4))), passthrough
+
+
+def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plan, width, ordered, odd_moments,
+                          keep_budget, retain_span=False, gram_keep=None, carrier=None):
+    """All ``nq`` parents' ordered reduction: stage programs over ``width`` parents at a
+    time, each eigh over the whole stack (``eigh_plan.batched``, route (c) when its
+    room allows). Returns what ``face_reduce_round`` returns, for every parent."""
+    nq = int(tables['active'].shape[0])
+    programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
+                               bool(retain_span), gram_keep, None if carrier is None else int(carrier))
+    (stage1, stage2, stage3, stage4), passthrough = programs
+    eigh = eigh_plan.batched
+    cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
+    inputs = (tables['points'], tables['order'], tables['active'],
+              tuple(s[1] for s in states), tuple(s[2] for s in states), tuple(s[3] for s in states), tuple(infinity))
+
+    def run(program, *stacks):
+        return _assemble(mesh, nq, ((i0, program(*_take(mesh, stacks, i0, i1))) for i0, i1 in cuts))
+
+    def advance(name, program, stage, *operands):
+        new = run(program, stage, *operands)
+        return {**{k: stage[k] for k in passthrough[name]}, **new}
+    stage = run(stage1, *inputs)
+    gamma, u = eigh(_hermitian_stack(mesh)(stage['h_vv']))
+    stage = advance('keep', stage2, stage, gamma, u)
+    del gamma, u
+    gamma_r, u_r = eigh(stage['schur'])
+    stage = advance('paired', stage3, stage, gamma_r, u_r)
+    del gamma_r, u_r
+    mu, rotation = eigh(stage['reduced'])
+    result = run(stage4, stage, mu, rotation, inputs[6])
+    del stage, mu, rotation
+    model, signed, diagnostics = result[:3]
+    output = model, signed, model[1:], diagnostics
+    return (*output, result[3]) if retain_span else output

@@ -392,7 +392,7 @@ def checked_shapes(fn, *args):
     return jax.eval_shape(_in_phase(fn, "first"), *args)[0]
 
 
-def checked_program(fn, mesh, out_shardings, in_shardings=None):
+def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options=None):
     """A caller's jitted program over checked solves, run as an eager eigh is.
 
     The first program holds each checked solve's first attempt and check and
@@ -410,6 +410,9 @@ def checked_program(fn, mesh, out_shardings, in_shardings=None):
     rep = NamedSharding(mesh, P())
     phases = {phase: _in_phase(fn, phase) for phase in ("first", "all")}
     shardings = {} if in_shardings is None else dict(in_shardings=in_shardings)
+    if compiler_options is not None:
+        # Top-level jit only (the XLA option set, e.g. the latency-hiding scheduler).
+        shardings["compiler_options"] = dict(compiler_options)
     first, again = (jax.jit(phases[phase], out_shardings=(out_shardings, rep), **shardings)
                     for phase in ("first", "all"))
 

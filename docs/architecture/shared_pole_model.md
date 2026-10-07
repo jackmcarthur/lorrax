@@ -326,6 +326,28 @@ only route change inside a stage. A face program holds its eighs' first attempts
 reruns that round's whole-chain program on the whole mesh, the program its
 admission compiled (`distrib_la.checked_program`).
 
+**Face products.** Every face GEMM of the constructor is `distrib_la.panel_matmul`
+on a square mesh (the provider product on a rectangular one), every parent of
+a program in one exchange per panel, transposed operands by one
+grid-transpose exchange; face programs compile with XLA's latency-hiding
+scheduler. CrI3 24×24 at P64: 9.5–13.4 TF/s per A100 against 1.7–5.7 for the
+cuBLASMp face (SECTFAST2 bench).
+
+**Decoupled sectors.** When the face route has more parents than its batch,
+CC and TT reduce every parent at once (`construct_diagonal_sector_all`): the
+selection runs in sub-batches of the admitted width, the reduction's stage
+programs (`paired_members`, `keep_stage`, `paired_stage`, `paired_correct`,
+`output_stage`) run over sub-batches and write their rows of one stack per
+array in place, and each eigh runs once over the whole stack, one whole
+matrix per rank where its program fits the room. The metric corrections stay
+Newton–Schulz inside their stages (the paired metric is the identity to about
+$10^{-8}$ by construction, one iteration; an eigh root of the stack costs more,
+claim 3425); the receipt reports the largest residual
+$\|ZAZ-I\|_F/\sqrt R$ that `retained_metric_positive` gates. The stacks are
+reserved in the ledger (`sector.decoupled.<sector>.stacks`); when they do not
+fit, the same stacked panels reduce in face rounds (warn, never refuse). CT
+rounds read slices of the held outputs.
+
 **Reindexing.** Matrix selection, factor sorting and unequal CT block assembly
 use `common.staged_reshard`: exchange to slabs split over all ranks, select or
 concatenate locally, exchange back to the face. Constraining the result of a

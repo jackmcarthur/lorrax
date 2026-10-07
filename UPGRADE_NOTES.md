@@ -107,6 +107,73 @@ refuses by name. A finite-q `extra_chi` response now refuses analytic-sphere
 averaging until its matched radial/Lindhard owner exists; use explicit raw
 draw/refinement controls for that reference scope. No default deck changes.
 
+## 2026-10-06 — the bispinor sector constructor reduces every CC/TT parent at once; its face GEMMs are panel_matmul
+
+The face route of the sector constructor ran CC, TT and CT in rounds of a
+few parents (CrI3 24×24 at P64: 21 rounds of 3), one program per round with
+its eighs inside, so every round paid its eighs serially. When the face
+route has more parents than its batch, CC and TT now reduce every parent at
+once: the selection runs in sub-batches, the reduction's stage programs run
+over sub-batches and write one stack per array in place, and each eigh runs
+once over the stack, one whole matrix per rank where it fits the room.
+Stacks that do not fit beside the live set reduce in face rounds with a
+warning. CT still runs in rounds, on slices of the held outputs. Every
+constructor face GEMM is `distrib_la.panel_matmul` (transposed operands by
+one grid-transpose exchange, compiled with XLA's latency-hiding scheduler):
+at the P64 sector shapes 12.0–13.4 TF/s per A100 against 3.1–5.4 for the
+cuBLASMp face (claim 3425). The metric corrections stay Newton–Schulz (the
+paired metric needs one iteration). The constructor receipt names the
+decoupled stacks, the eigh room and the largest ‖ZAZ−I‖/√R per sector.
+CrI3 24×24 bispinor at P64 (16 × A100-80GB, claim 3545), seconds:
+
+| | map 0 cold, main → now | map 1 warm, main → now |
+|---|---|---|
+| map wall | 3083.6 → 2249.8 | 3328.3 → 1986.9 |
+| W response | 2576.9 → 1763.2 | 2746.1 → 1452.7 |
+| CC | 469.3 → 168.0 | 461.5 → 107.1 |
+| TT | 1038.5 → 673.3 | 1136.5 → 605.1 |
+| CT (21 rounds) | 621.9 → 495.8 | 586.4 → 440.3 |
+
+Against the 176.3 s charge map that is 12.8× cold and 11.3× warm (was
+18.9×). There the 61 × 18432 TT eigh does not fit one matrix per rank
+beside the stacks (43.3 GB against a 37.6 GB room) and runs as 61
+whole-mesh solves, about 376 s of each map. Results move at round-off
+(product order): Fe 4³ and CrI3 6×6 bispinor eqp within 0.16 µeV of main
+over three SC maps (claims 3477, 3470). No deck change.
+
+## 2026-10-06 — shared-pole W line sites cover every requested state; far-state energies change by design
+
+The shared-pole recipe (`shared_real_pole_v1_r4`, new recipe hash) places W's
+line sites over every requested state at E_in ± 5 eV
+(`gw.qp_support.requested_reads_ev`, `support_read_pad_ev`; the Σ plan pad
+stays 2 eV), so the line reaches every state the run asks for and never less
+far than the former fixed ±5 eV window did. Their count is closed form,
+⌈(Ω_R − h)·ln(4/ε)/(πh)⌉, held between 18 − n_imag and a 40-sample cap:
+Fe 4³ 22, CrI3 6×6 17, NiPS3 12×7 17, Si 4³ / Ni 20³ / Fe 20³ 32 (the cap),
+CrI3 24×24 16, CrSBr 20×15 15. A requested state beyond the old window read
+an extrapolated W (Si 0.5–0.7 eV, Ni 20³ up to 0.92 eV). The model header
+records `support_top_ev` and `support_reads_ev`; the Σ planner warns, never
+refuses, when a sample group reads outside them (the coarse semicore windows
+always do). `support_delivery_window_ev` is gone; ω_p + 3.5 eV still tops the
+imaginary ladder only. Against each deck's dense line ladder (max / RMS meV,
+main → this, cold P4; ±2 eV | 2–10 eV | far):
+Fe 4³ charge 2.56/1.72 → 0.95/0.54 | 43.1/7.66 → 15.6/3.22 | 274/56.4 → 61.0/9.96;
+Fe 4³ bispinor 8.03/4.26 → 2.87/1.44 | 39.3/7.89 → 31.1/6.45 | 850/143 → 82.5/18.4;
+CrI3 6×6 (eqp1) 1.67/0.53 → 1.83/0.67 | 10.4/1.81 → 10.3/1.45 | 209/34.5 → 68.2/11.8;
+Si 4³ (eqp0) 0.02/0.02 → 0.01/0.01 | 20.0/3.48 → 9.18/1.35 | 514/142 → 56.8/13.8.
+The hsuite fixtures, against the same kind of dense ladder: H2⁻ shared-pole
+one-shot (eqp0) 27.26/9.01 → 29.46/9.52 | RMS 12.45 → 12.92 (the same reach,
+9.99 against 9.93 eV, with the sites moved 0.02–0.5 eV on a 6-centroid toy);
+H2⁻ bispinor SC 21.59/5.62 → 21.42/6.06; bcc Na SC 0.57/0.36 → 0.31/0.18 |
+5.12 → 4.12 | 35.88/14.26 → 18.05/7.17 meV. The hsuite references of sp_export,
+bisp_sc, bse_bisp and na_sc are regenerated. Cold W response: Fe charge
+43.4 → 48.9 s, Fe bispinor 145.9 → 140.8 s, CrI3 6×6 140.4 → 155.0 s, Si
+37.6 → 58.7 s (14 → 32 line sites, with the response-rule fixes of e08a5c135
+and 4662eac7d). A deck that requests protected states to ~40 eV (Fe/Ni 20³)
+takes 32 line sites; projected, cold W rises about 7 % on Ni 20³ bispinor and
+10–30 % on Fe 20³ charge (map 0). A restart bundle written by the old recipe
+refuses by name (`recipe_hash` mismatch; rebuild).
+
 ## 2026-10-06 — a response sample near the top of its interval builds instead of refusing
 
 The shared-pole χ response rule refused a line sample high in its own
