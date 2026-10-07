@@ -5,6 +5,22 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — the decoupled sector route takes fewer parents than ranks; at nq >= P the face rounds are warned with the q-local need
+
+The decoupled CC/TT/CT route (37baf6124, fdebbbd63, 302a519fe) holds every parent's
+selection panels and stage stacks at once, so it now engages only when the parents
+are fewer than the ranks (CrI3 24×24 at P64: 61 < 64). At nq >= P the face rounds of
+main before 37baf6124 run, as they did. Ni 20³ bispinor at P64, 36 GB, 32 line sites
+(641 parents) had taken the decoupled route and run out of memory in
+`spole.sector.TT.all`: its TT stacks are 116.6 GB/rank at any sub-batch. The 32 line
+sites, not the decoupled code, put TT on the face: TT's local reduction prices
+63.9 GB at side 23520 (14 sites: 14880, local). When the sectors run face rounds at
+nq >= P, one RuntimeWarning now names the q-local need and the
+`memory_per_device_gb` that runs every sector local (Ni: 64, an 80 GB card). The warning
+comes from the bank-residence admission, before the bank is built. P4 decks with
+nq >= 4 (CrI3 6×6, Fe 4³) take face rounds again. No result moves on a deck whose
+route is unchanged. No deck change.
+
 ## 2026-10-07 — the CT sector reduces every parent at once; decoupled eigh rows carry their own programs; the free-memory check only warns
 
 Beside the decoupled CC and TT, CT now assembles each face round's joint

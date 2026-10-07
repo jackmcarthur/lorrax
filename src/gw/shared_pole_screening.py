@@ -235,6 +235,10 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
                                        photon_bases=None if photon is None else mu_bases)
     receipt = dict(residence="file", payload_bytes_per_rank=R,
                    payload_bytes_total=R * int(mesh_xy.size))
+    if photon is not None:
+        # The sector route, and its face-rounds warning, before the bank is built.
+        from .shared_pole_sectors import sector_execution
+        sector_execution(meta, config, mu_bases, nq, mesh_xy=mesh_xy, upstream=())
     if config.debug.write_w or linalg_resolution(
             {"linalg": config.backend.linalg}).layout != "local":
         receipt["reason"] = "write_w export or distributed layout"
