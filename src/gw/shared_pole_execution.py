@@ -999,7 +999,8 @@ def _cross_stage_programs(mesh):
 
 
 def face_cross_decoupled(pencil, *, mesh, eigh_plans, width, eigh_rows=None):
-    """Every parent's CT joint reduction from the stacked ``pencil`` (metric, value, O_C, O_T):
+    """Every parent's CT joint reduction from the stacked ``pencil`` (metric, value, O_C, O_T),
+    the caller's list: the metric and value members are released (set to None) after the keep stage:
     the keep stage and the output stage over ``width`` parents at a time, the metric's and the
     Ritz step's eighs once over the stack (``guarded_eigh``). Returns what the round's
     ``reduce_cross_round`` returns, for every parent. ``eigh_rows(k, plan, stack)`` prices eigh k."""
@@ -1017,6 +1018,7 @@ def face_cross_decoupled(pencil, *, mesh, eigh_plans, width, eigh_rows=None):
     with timing.section('decoupled.keep'):
         stage = run(keep, *pencil, gamma, u)
     del gamma, u
+    pencil[0] = pencil[1] = None
     reduced = stage.pop('reduced')
     with timing.section('decoupled.eigh_ritz'), priced(1, eigh_plans[1], reduced):
         values, rotation = guarded_eigh(eigh_plans[1], reduced, mesh=mesh, label='CT Ritz')

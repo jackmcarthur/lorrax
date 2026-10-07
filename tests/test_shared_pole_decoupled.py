@@ -199,7 +199,7 @@ def test_decoupled_cross_matches_the_joint_reduction():
                                     eigh=lambda m: tuple(jnp.asarray(v) for v in eig(m)), matmul=_mm, gates=gates)
     plan = _local_eigenplan(mesh, k)
     for width in (q, 2):
-        got, gd = face_cross_decoupled(tuple(jax.device_put(x, face) for x in (metric, value, oc, ot)),
+        got, gd = face_cross_decoupled([jax.device_put(x, face) for x in (metric, value, oc, ot)],
                                        mesh=mesh, eigh_plans=(plan, plan), width=width)
         assert np.array_equal(np.asarray(want[3]), np.asarray(got[3]))
         assert np.allclose(np.asarray(want[2]), np.asarray(got[2]), rtol=1e-10, atol=1e-12)

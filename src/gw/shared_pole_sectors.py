@@ -1088,7 +1088,6 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
         resident_bytes_per_rank=stacks+int(program_bytes or 0),
         workspace_bytes_per_rank=0,concurrent_with=upstream)
     ledger.live_stages=(*upstream,stack_row['stage'])
-    budgets=[]
 
     def parts():
         for ids,real,slots,execution in rounds:
@@ -1098,14 +1097,14 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
                 sample_ids=sample_ids,line_cross=line_cross,real=real,program_bytes=program_bytes,
                 widths=widths,pencil_only=True)
             del samples,cm,line_cross,sectors
-            budgets.append(out['budget'])
-            pencil=out['pencil']
+            pencil=out.pop('pencil')
+            del out
             yield int(ids[0]),(pencil if int(pencil[0].shape[0])==int(real)
                                else parent_rows(mesh_xy,pencil,np.arange(int(real))))
     try:
         from common import timing
         with timing.section('decoupled.pencils'):
-            pencil=_assemble(mesh_xy,int(nq),parts())
+            pencil=list(_assemble(mesh_xy,int(nq),parts()))
         rooms=tuple(face_eigh_room(ledger.preview(resident_bytes_per_rank=b,workspace_bytes_per_rank=0,
                                                   concurrent_with=upstream)) for b in boundaries)
 
