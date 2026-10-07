@@ -34,6 +34,104 @@ import numpy as np
 from common.units import RYD_TO_EV
 
 
+def _endpoint_face(value, mesh, label):
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    actual = getattr(value, "sharding", None)
+    if (not isinstance(actual, NamedSharding) or actual.mesh != mesh
+            or actual.spec != P(None, "x", "y") or value.ndim != 3
+            or value.dtype != jnp.complex128 or min(value.shape) < 1):
+        raise ValueError(f"CD endpoint {label} requires a nonempty complex128 all-P face")
+
+
+@lru_cache(maxsize=16)
+def _density_endpoint_program(mesh):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from distrib_la import matmul
+    face = NamedSharding(mesh, P(None, "x", "y"))
+
+    def project(pair, endpoint_map):
+        endpoint_map = jax.lax.with_sharding_constraint(jnp.broadcast_to(
+            endpoint_map, (pair.shape[0],) + endpoint_map.shape[-2:]), face)
+        return matmul(pair, endpoint_map, mesh=mesh, backend="distributed",
+                      batched_route="auto")
+
+    return jax.jit(project, in_shardings=(face, face), out_shardings=face)
+
+
+def project_density_endpoints(pair, endpoint_map, *, mesh):
+    """Change density endpoints by the explicit linear map ``pair @ map``.
+
+    Both operands and the result remain complex128 all-P faces. Pair rows
+    have ``[batch,T,mu]`` and the declared map ``[batch or 1,mu,G]``. A fitted
+    ISDF density uses the same saved ζ that builds its bare interaction,
+    packed at the canonical I/O seam. No normalization, conjugation, basis
+    completeness or relation between ordered partners is inferred here.
+    An asymmetric complex map requires mapping both actual densities;
+    mapping a conjugated density is not conjugating its mapped result.
+    """
+    _endpoint_face(pair, mesh, "pair")
+    _endpoint_face(endpoint_map, mesh, "map")
+    if (pair.shape[-1] != endpoint_map.shape[-2]
+            or endpoint_map.shape[0] not in (1, pair.shape[0])):
+        raise ValueError("CD density endpoint map has incompatible pair/map axes")
+    return _density_endpoint_program(mesh)(pair, endpoint_map)
+
+
+@lru_cache(maxsize=16)
+def _interaction_endpoint_program(mesh):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import transpose_xy
+    from distrib_la import matmul
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    replicated = NamedSharding(mesh, P())
+
+    def lift(interaction, endpoint_map, prefactor):
+        batch = max(interaction.shape[0], endpoint_map.shape[0])
+        interaction = jax.lax.with_sharding_constraint(jnp.broadcast_to(
+            interaction, (batch,) + interaction.shape[-2:]), face)
+        endpoint_map = jax.lax.with_sharding_constraint(jnp.broadcast_to(
+            endpoint_map, (batch,) + endpoint_map.shape[-2:]), face)
+        left = matmul(endpoint_map.conj(), interaction, mesh=mesh,
+                      backend="distributed", batched_route="auto")
+        right = transpose_xy(endpoint_map, mesh)
+        return matmul(left, right, mesh=mesh, backend="distributed",
+                      batched_route="auto") * prefactor
+
+    return jax.jit(lift, in_shardings=(face, face, replicated), out_shardings=face)
+
+
+def lift_interaction_endpoints(interaction, endpoint_map, *, mesh, prefactor):
+    """Lift a reduced operator as ``conj(map) @ interaction @ map.T * pref``.
+
+    ``interaction[batch,G,G]`` and ``map[batch or 1,mu,G]`` stay on all-P
+    faces, including both GEMM temporaries and the lifted ``[batch,mu,mu]``.
+    The right endpoint is a transpose, not an adjoint; the operator may be
+    non-Hermitian at a complex frequency. Broadcast is allowed when either
+    batch extent is one. The caller supplies the finite positive physical
+    prefactor. Saved charge ζ with a conventional PW interaction requires
+    ``1/Omega``; this function neither inserts a volume nor changes units.
+    It builds no response, inverse Coulomb root or ordered partner.
+    """
+    import jax.numpy as jnp
+    _endpoint_face(interaction, mesh, "interaction")
+    _endpoint_face(endpoint_map, mesh, "map")
+    if (interaction.shape[-1] != interaction.shape[-2]
+            or interaction.shape[-1] != endpoint_map.shape[-1]
+            or (interaction.shape[0] != endpoint_map.shape[0]
+                and min(interaction.shape[0], endpoint_map.shape[0]) != 1)):
+        raise ValueError("CD interaction endpoint lift has incompatible operator/map axes")
+    prefactor = float(prefactor)
+    if not np.isfinite(prefactor) or prefactor <= 0:
+        raise ValueError("CD interaction lift needs an explicit positive finite physical prefactor")
+    return _interaction_endpoint_program(mesh)(interaction, endpoint_map,
+                                               jnp.asarray(prefactor, jnp.float64))
+
+
 @lru_cache(maxsize=16)
 def _diagonal_projection_program(mesh):
     import jax

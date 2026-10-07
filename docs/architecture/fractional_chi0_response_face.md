@@ -93,6 +93,26 @@ The caller must relinquish a donated input. Its receipt prices the two
 final faces; actual peak memory and donation/layout parity require a
 compute-node resource control.
 
+### Retained-endpoint coordinates of the same fitted interaction
+
+`contour_reference.project_density_endpoints` applies an explicit linear
+endpoint map to ordinary pair rows. `lift_interaction_endpoints` restores
+the associated operator by `conj(map) @ W @ map.T`, with a caller-declared
+positive physical prefactor. Both maps, operators, products and results
+remain complete-mesh faces, using the distributed/auto backend. Neither
+helper forms a response, a Coulomb inverse or an ordered partner.
+
+For saved charge ζ, the bare factorization is owned by
+`gw.compute_vcoul`. A matched reference can contract the fitted densities
+on its retained G endpoints and use the existing physical PW response and
+Dyson owners. The endpoint change alters no fitted-density approximation.
+The caller must authenticate the same ζ, Coulomb cutoff, head policy,
+spin/full-k census and volume, prove the bare factorization and measure
+lifted W/dW and projected Σ parity before adopting the schedule. A complex
+asymmetric ζ requires projecting both actual density directions; no
+G-negation or reality closure is inferred for fitted coefficients. Packing
+ζ belongs only at its canonical centroid I/O seam.
+
 The Kubo weight (f_a − f_b)/(ε_a − ε_b + z) couples two band indices through
 its denominator, so no choice of u_a and v_b factors it as u_a v_b, and no
 GEMM over one band index produces it. Its time representation does factor:

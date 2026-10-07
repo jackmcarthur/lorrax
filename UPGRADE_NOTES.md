@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — explicit linear endpoint maps for contour references
+
+Reference contractions can project ordinary density endpoints and lift
+reduced interactions through an explicit complex map over all processors.
+The lift uses a transpose at its right endpoint and a caller-declared
+physical prefactor. These generic linear helpers permit a matched saved-ζ
+reference to use retained PW coordinates without changing its density fit;
+they infer no volume, head, ordered partner or basis completeness. Actual
+bare/W/slope/projected-Σ parity is a prerequisite for that run schedule.
+Existing contour, response, self-energy and driver defaults are unchanged.
+
 ## 2026-10-07 — explicit same-k density-face reference cache
 
 The opt-in Lehmann reference owner accepts an ordinary all-processor
