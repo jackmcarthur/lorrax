@@ -27,9 +27,76 @@ external energy and conjugates the occupied residue's complete derivative.
 """
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 
 from common.units import RYD_TO_EV
+
+
+@lru_cache(maxsize=16)
+def _diagonal_projection_program(mesh):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from distrib_la import matmul
+
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    replicated = NamedSharding(mesh, P())
+
+    def project(interaction, pair, prefactor):
+        operator = jax.lax.with_sharding_constraint(jnp.broadcast_to(
+            interaction, (pair.shape[0],) + interaction.shape[-2:]), face)
+        product = matmul(pair.conj(), operator, mesh=mesh,
+                         backend="distributed", batched_route="auto")
+        diagonal = jnp.sum(product * pair, axis=-1) * prefactor
+        return product, diagonal
+
+    return jax.jit(project, in_shardings=(face, face, replicated),
+                   out_shardings=(face, replicated))
+
+
+def project_interaction_diagonal(interaction, pair, *, mesh, prefactor,
+                                 scalar_replication_bound_bytes):
+    """Contract ordered pair rows against an all-P interaction.
+
+    ``pair[batch,T,G]`` and ``interaction[batch or 1,G,G]`` are complex128
+    faces at ``P(None,'x','y')``. The visible contraction is
+    ``conj(pair) @ interaction``, followed by ``sum(product*pair,G)``.
+    The product remains all-P. Only the caller-bounded scalar result
+    ``[batch,T]`` is replicated, to feed the scalar contour integrator.
+
+    The caller supplies the physical positive prefactor: conventional
+    plane-wave vertices need ``1/(Nk*Omega)``; the ISDF contraction needs
+    ``1/Nk``. Supply ``-W_c`` to the correlation integrator, removing its
+    exactly known instantaneous term with the interaction's own owner.
+    This routine neither builds a response nor infers normalization,
+    occupations, the ordered partner or a head correction.
+    """
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    expected = P(None, "x", "y")
+    for name, value in (("interaction", interaction), ("pair", pair)):
+        actual = getattr(value, "sharding", None)
+        if (not isinstance(actual, NamedSharding) or actual.mesh != mesh
+                or actual.spec != expected or value.ndim != 3
+                or value.dtype != jnp.complex128):
+            raise ValueError(f"CD projection {name} needs a complex128 all-P {expected} face")
+    if (interaction.shape[-2] != interaction.shape[-1]
+            or pair.shape[-1] != interaction.shape[-1]
+            or interaction.shape[0] not in (1, pair.shape[0])
+            or min(pair.shape) < 1):
+        raise ValueError("CD projection requires compatible nonempty pair/operator faces")
+    prefactor = float(prefactor)
+    bound = int(scalar_replication_bound_bytes)
+    scalar_bytes = pair.shape[0] * pair.shape[1] * pair.dtype.itemsize
+    if not np.isfinite(prefactor) or prefactor <= 0:
+        raise ValueError("CD projection needs an explicit positive finite physical prefactor")
+    if bound < scalar_bytes:
+        raise ValueError("CD projection scalar output exceeds its explicit replication bound")
+    return _diagonal_projection_program(mesh)(
+        interaction, pair, jnp.asarray(prefactor, dtype=jnp.float64))
 
 
 def imaginary_rule(n, eta, *, scale=None):

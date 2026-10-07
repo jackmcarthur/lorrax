@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — donated local rectangle insertion avoids general scatter
+
+`common.staged_reshard.shard_local_update` uses `dynamic_update_slice` when
+the local rectangle is nonnegative and wholly inside its destination.
+Under that bound the update cannot clamp; negative starts, dropped tails
+and oversized rectangles retain the original scatter behavior. No caller
+or numerical contract changes. On the native Si Γ transition cache
+`[768,512,4,764]` at P4, a warm insertion fell from about 6 s to 11 ms.
+All inserted complex128 bit patterns and untouched regions agree; thirteen
+independent boundary, wrapping and shape controls pass on compute.
+
 ## 2026-10-07 — analytic bulk heads use the same sphere split for v and W
 
 With `head_minibz_average=true`, direct interband screened heads now remove
