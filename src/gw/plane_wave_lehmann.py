@@ -27,6 +27,26 @@ def _require_spec(value, mesh, spec, label):
 
 
 @lru_cache(maxsize=None)
+def _density_face_guard(mesh):
+    """Validate a resident face using runtime one-dimensional masks.
+
+    Form the outer validity OR in JAX on the all-P density face. A NumPy
+    outer OR captured by a JIT would replicate T*M booleans on the host
+    and embed them in every rank's compile identity.
+    """
+    def guard(value, pair_valid, endpoint_valid):
+        mask = (~pair_valid)[None, :, None] | (~endpoint_valid)[None, None, :]
+        mask = jax.lax.with_sharding_constraint(mask, NamedSharding(mesh, P(None, "x", "y")))
+        return jnp.stack((jnp.max(jnp.abs(jnp.where(mask, value, 0))),
+                          jnp.all(jnp.isfinite(value)).astype(jnp.float64)))
+
+    return jax.jit(guard,
+                   in_shardings=(NamedSharding(mesh, P(None, "x", "y")),
+                                 NamedSharding(mesh, P()), NamedSharding(mesh, P())),
+                   out_shardings=NamedSharding(mesh, P()))
+
+
+@lru_cache(maxsize=None)
 def _transition_kernel(mesh, grid, n_occupied):
     from common.fft_helpers import make_sharded_fftn_3d
     from common.wfn_transforms import _sphere_gather
@@ -325,17 +345,13 @@ class OrderedLehmannPair:
         if not np.isfinite(scale) or scale <= 0:
             raise ValueError("density face physical prefactor must be finite and positive")
 
-        def guard(v):
-            mask = (~valid)[None, :, None] | (~endpoints)[None, None, :]
-            return jnp.stack((jnp.max(jnp.abs(jnp.where(mask, v, 0))),
-                              jnp.all(jnp.isfinite(v)).astype(jnp.float64)))
-        ghost, finite = np.asarray(jax.device_get(jax.jit(guard,
-            out_shardings=NamedSharding(mesh, P()))(density)))
+        from common.collectives import replicate_to_mesh, transpose_xy
+        ghost, finite = np.asarray(jax.device_get(_density_face_guard(mesh)(
+            density, replicate_to_mesh(valid, mesh), replicate_to_mesh(endpoints, mesh))))
         if ghost != 0.:
             raise ValueError("ordinary density face has a nonzero physical-pair or endpoint ghost")
         if not bool(finite):
             raise ValueError("ordinary density face has a nonfinite coefficient")
-        from common.collectives import replicate_to_mesh, transpose_xy
         face = NamedSharding(mesh, P(None, "x", "y"))
         out = object.__new__(cls)
         out.mesh, out.panel_bytes, out.scale = mesh, int(panel_bytes), scale

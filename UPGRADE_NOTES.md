@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — ordinary density-face validity stays as runtime metadata
+
+`OrderedLehmannPair.from_density_face` now sends its one-dimensional pair
+and endpoint masks into a cached JAX guard. The same outer OR is formed
+with the density face's all-P layout, rather than as a replicated NumPy
+matrix embedded in the compile identity. The complete Si8cube face had
+about1.20GB of mask literals; an owned setup stack located the compile
+identity normalization at that guard. Ghost coefficients must still be
+exactly zero and every coefficient finite. The spectral weights, density
+faces, donation choices and public constructor signature are unchanged;
+no deck or file-format change. Numerical and resource admission remain
+separate from this source-local guard correction.
+
 ## 2026-10-07 — typed retained-sphere response transport is explicit about frequency
 
 An opt-in scalar-charge action transports complex response matrices and
