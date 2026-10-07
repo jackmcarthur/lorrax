@@ -3548,7 +3548,7 @@ def _fractional_pair_scan_face(
         return logical
 
     def _pair_contribution(pa_x, pb_x, pa_y, pb_y, ea, eb, fa, fb, ga, gb):
-        from .lehmann_response import lehmann_pair_weights
+        from .lehmann_response import lehmann_pair_weights, centroid_pair_density
         de = ea[:, :, None] - eb[:, None, :]
         df = fa[:, :, None] - fb[:, None, :]
         logical = logical_pair(ga, gb)
@@ -3556,10 +3556,8 @@ def _fractional_pair_scan_face(
                                       with_derivative=with_derivative,
                                       pair_mask=logical)
         def contract(_):
-            density_x = jnp.einsum(
-                "ksma,ksmb->kmab", pa_x, jnp.conj(pb_x), optimize=True)
-            density_y = jnp.einsum(
-                "ksna,ksnb->knab", pa_y, jnp.conj(pb_y), optimize=True)
+            density_x = centroid_pair_density(pa_x, pb_x)
+            density_y = centroid_pair_density(pa_y, pb_y)
             if ordered:
                 # Physical orientation: rows at -q (b rolled to k+q by the
                 # caller) with the conjugation on mu; see docstring.
@@ -3610,7 +3608,8 @@ def _fractional_pair_scan_face(
         return acc + acc_inner, None
 
     chi, _ = jax.lax.scan(_outer, zero, jnp.arange(ntiles), unroll=1)
-    return chi / jnp.sqrt(jnp.asarray(nk, jnp.float64))
+    from .lehmann_response import centroid_response_denominator
+    return chi / centroid_response_denominator(nk)
 
 
 _PARENT_UNFOLD_OPERANDS = {}

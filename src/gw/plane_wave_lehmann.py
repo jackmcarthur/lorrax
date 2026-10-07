@@ -263,6 +263,80 @@ class OrderedLehmannPair:
             pair_faces_spec=[None, "x", "y"], resident_pair_faces_bytes_global=2*B*K*A*M*16,
             panel_bytes_per_rank=self.panel_bytes, derivative_variable="s=z^2")
 
+    @classmethod
+    def from_density_face(cls, density, energy_difference, occupation_difference,
+                          pair_valid, *, mesh, physical_prefactor, endpoint_valid,
+                          normalization, panel_bytes=64 << 20, donate_density=False):
+        """Reuse one ordinary all-P density face without a full raw bank.
+
+        ``density[1,T,M]`` is at ``P(None,'x','y')``. Flat de/df and explicit
+        boolean validity have T entries, in precisely that density order.
+        The endpoint mask has M entries; interleaved centroid pads are not
+        reinterpreted as a prefix. The caller supplies a finite positive
+        physical prefactor and its normalization label. Raw centroid χ
+        uses ``1/centroid_response_denominator(Nk)``; the existing Dyson
+        owner supplies its remaining spin/k normalization.
+
+        At an I/O seam the centroid owner must already have packed a
+        canonical logical file axis. This method does not read, repack or
+        infer a basis. It transposes the ordinary face over all processors,
+        waits for that output, then conjugates its original storage.
+        ``donate_density=True`` explicitly invalidates the caller's density
+        array and keeps only the two final faces, rather than three banks.
+        """
+        _require_spec(density, mesh, P(None, "x", "y"), "ordinary density face")
+        if (density.ndim != 3 or density.shape[0] != 1 or min(density.shape) < 1
+                or density.dtype != jnp.complex128):
+            raise ValueError("ordinary density face requires complex128 [1,T,M]")
+        T, M = map(int, density.shape[1:])
+        de, df, valid = (np.asarray(v) for v in (energy_difference, occupation_difference, pair_valid))
+        endpoints = np.asarray(endpoint_valid)
+        if (de.shape != (T,) or df.shape != (T,) or valid.shape != (T,)
+                or valid.dtype != np.bool_ or de.dtype.kind != "f" or df.dtype.kind != "f"
+                or not np.all(np.isfinite(de[valid])) or not np.all(np.isfinite(df[valid]))
+                or np.any(np.abs(df[valid]) > 1.) or endpoints.shape != (M,)
+                or endpoints.dtype != np.bool_ or not np.any(endpoints)):
+            raise ValueError("ordinary density face needs finite physical de/df and explicit pair/endpoint validity")
+        if (not isinstance(donate_density, (bool, np.bool_)) or not isinstance(normalization, str)
+                or not normalization.strip() or isinstance(panel_bytes, (bool, np.bool_))
+                or int(panel_bytes) < 1):
+            raise ValueError("density face requires an explicit normalization, panel bound and boolean donation choice")
+        scale = float(np.asarray(jax.device_get(physical_prefactor)))
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("density face physical prefactor must be finite and positive")
+
+        def guard(v):
+            mask = (~valid)[None, :, None] | (~endpoints)[None, None, :]
+            return jnp.stack((jnp.max(jnp.abs(jnp.where(mask, v, 0))),
+                              jnp.all(jnp.isfinite(v)).astype(jnp.float64)))
+        ghost, finite = np.asarray(jax.device_get(jax.jit(guard,
+            out_shardings=NamedSharding(mesh, P()))(density)))
+        if ghost != 0.:
+            raise ValueError("ordinary density face has a nonzero physical-pair or endpoint ghost")
+        if not bool(finite):
+            raise ValueError("ordinary density face has a nonfinite coefficient")
+        from common.collectives import replicate_to_mesh, transpose_xy
+        face = NamedSharding(mesh, P(None, "x", "y"))
+        out = object.__new__(cls)
+        out.mesh, out.panel_bytes, out.scale = mesh, int(panel_bytes), scale
+        out.de = replicate_to_mesh(np.where(valid, de, 0.).astype(np.float64), mesh)
+        out.df = replicate_to_mesh(np.where(valid, df, 0.).astype(np.float64), mesh)
+        out.left = jax.jit(lambda v: transpose_xy(v, mesh), out_shardings=face)(density)
+        out.left.block_until_ready()
+        conjugate = jax.jit(lambda v: v.conj(), out_shardings=face,
+                            donate_argnums=(0,) if donate_density else ())
+        out.right = conjugate(density)
+        out.right.block_until_ready()
+        out.physical_g_count = int(endpoints.sum())
+        out.endpoint_valid = endpoints.copy()
+        out.receipt = dict(scope="explicit_ordinary_density_face", density_face_shape=[1, T, M],
+            physical_pair_count=int(valid.sum()), nonzero_df_pair_count=int(np.count_nonzero(df[valid])),
+            physical_endpoint_count=int(endpoints.sum()), scale=scale, normalization=normalization,
+            pair_faces_spec=[None, "x", "y"], resident_pair_faces_bytes_global=2*T*M*16,
+            raw_density_donated=bool(donate_density), panel_bytes_per_rank=out.panel_bytes,
+            derivative_variable="s=z^2")
+        return out
+
     def _evaluate(self, z_values, with_derivative, gneg=None):
         z = np.asarray(z_values, np.complex128)
         if z.ndim != 1 or not len(z) or not np.all(np.isfinite(z)) or np.any(z.imag <= 0):
@@ -298,9 +372,32 @@ class OrderedLehmannPair:
         """
         if len(gvecs) != self.physical_g_count:
             raise ValueError("Γ paired tile G census differs from its physical-G mask")
+        if hasattr(self, "endpoint_valid") and not np.array_equal(
+                self.endpoint_valid, np.arange(len(self.endpoint_valid)) < self.physical_g_count):
+            raise ValueError("Γ G-negation cannot reinterpret an interleaved endpoint mask as a prefix")
         from common.collectives import replicate_to_mesh
         gneg = replicate_to_mesh(_g_negation(gvecs, int(self.left.shape[-2])), self.mesh)
         return self._evaluate(z_values, with_derivative, gneg)
+
+    def evaluate_same_k_pair(self, z_values, *, endpoint_negation=None, with_derivative=False):
+        """The two directions of an explicitly same-k unordered pair bank.
+
+        Real-space centroid endpoints use the identity permutation and the
+        conjugated density. PW endpoints require their authenticated G-negation
+        permutation. This operation supplies no finite-q or TR identity.
+        """
+        M = int(self.left.shape[-2])
+        permutation = np.arange(M, dtype=np.int32) if endpoint_negation is None else np.asarray(endpoint_negation)
+        if (permutation.shape != (M,) or permutation.dtype.kind not in "iu"
+                or not np.array_equal(np.sort(permutation), np.arange(M))
+                or not np.array_equal(permutation[permutation], np.arange(M))):
+            raise ValueError("same-k paired endpoints require an exact integer negation involution")
+        if hasattr(self, "endpoint_valid") and not np.array_equal(
+                self.endpoint_valid[permutation], self.endpoint_valid):
+            raise ValueError("same-k negation changes physical endpoint validity")
+        from common.collectives import replicate_to_mesh
+        return self._evaluate(z_values, with_derivative,
+                              replicate_to_mesh(permutation.astype(np.int32), self.mesh))
 
 
 class GammaLehmannResponse:

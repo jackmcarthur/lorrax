@@ -69,6 +69,30 @@ completeness. FD tails are retained unless an exact zero occupation
 difference makes the pair vanish. Metallic static/intraband heads and
 finite-q symmetry reconstruction remain separate owner contracts.
 
+### A same-k ordinary density face
+
+`OrderedLehmannPair.from_density_face` also accepts a preselected ordinary
+`[1,T,M]` density at `P(None,'x','y')`, flat replicated de/df and explicit
+pair/endpoint validity. The caller declares its physical prefactor and
+normalization; this entry does not infer a plane-wave volume or endpoint
+basis. Raw centroid response uses exactly
+`1/lehmann_response.centroid_response_denominator(Nk)`. Spin and the second
+k factor remain in the existing Dyson owner. The scanner and cache share
+`centroid_pair_density`, the local spin trace `ψ_a conj(ψ_b)`.
+
+`evaluate_same_k_pair` supplies both ordered directions of each declared
+unordered pair. Centroid endpoints use identity negation; plane-wave
+endpoints require their authenticated integer G-negation. A finite-q or
+time-reversal identity is never supplied by this entry.
+
+Centroid files retain canonical logical axes. Only the existing centroid
+basis packs/unpacks them at an I/O seam; interleaved packed pads remain
+explicitly invalid. The factory transposes one ordinary all-P face, waits
+for that output, then optionally donates the original into its conjugate.
+The caller must relinquish a donated input. Its receipt prices the two
+final faces; actual peak memory and donation/layout parity require a
+compute-node resource control.
+
 The Kubo weight (f_a − f_b)/(ε_a − ε_b + z) couples two band indices through
 its denominator, so no choice of u_a and v_b factors it as u_a v_b, and no
 GEMM over one band index produces it. Its time representation does factor:

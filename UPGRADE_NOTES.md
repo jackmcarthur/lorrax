@@ -5,6 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — explicit same-k density-face reference cache
+
+The opt-in Lehmann reference owner accepts an ordinary all-processor
+density face, explicit pair/endpoint validity and a declared physical
+normalization. Same-k paired evaluation supplies both ordered directions;
+centroids use identity negation and PW endpoints require exact G-negation.
+Raw centroid response keeps the direct scanner's exact `sqrt(Nk)`
+denominator and shared local spin trace; remaining spin/k factors stay in
+the existing Dyson owner. No default response or driver law changes.
+At the I/O seam centroid axes remain canonical and logical. Optional raw
+input donation builds two persistent faces without retaining a third raw
+bank; callers must relinquish that input. Actual all-P peak memory and
+response/self-energy parity remain separately priced reference controls.
+
 ## 2026-10-07 — stable paired ordering of dense native eigenstates
 
 Dense reference output now stably orders energy metadata and its paired

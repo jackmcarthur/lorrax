@@ -6,6 +6,33 @@ outer k/spin/volume normalization. Static ``z=0`` has a separate response
 owner; reference callers authenticate their nonzero complex sites first.
 """
 import jax.numpy as jnp
+import operator
+
+
+def centroid_pair_density(psi_left, psi_right):
+    """The direct scanner's local density ``ψ_a conj(ψ_b)``.
+
+    Inputs are ordinary, typed-unfolded ``[k,spin,mu,band]`` tiles on one
+    endpoint slab; the output is ``[k,mu,a,b]``. Physical ordered response
+    uses its conjugate on the row endpoint. This function owns only the
+    spin trace; transport, band selection and validity stay with callers.
+    """
+    return jnp.einsum("ksma,ksmb->kmab", psi_left, jnp.conj(psi_right), optimize=True)
+
+
+def centroid_response_denominator(n_k):
+    """The raw centroid pair sum's canonical ``sqrt(Nk)`` denominator.
+
+    Spin and the second k normalization enter the existing Dyson owner,
+    not this raw response. Kept as a JAX float64 square root to preserve
+    the direct scanner's original arithmetic.
+    """
+    if isinstance(n_k, bool):
+        raise ValueError("centroid response requires a positive integer full-k count")
+    count = operator.index(n_k)
+    if count < 1:
+        raise ValueError("centroid response requires a positive integer full-k count")
+    return jnp.sqrt(jnp.asarray(count, jnp.float64))
 
 
 def lehmann_pair_weights(energy_difference, occupation_difference, z_values, *,
