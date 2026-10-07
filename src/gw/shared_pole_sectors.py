@@ -853,44 +853,47 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     budget.face_room=geometry.get('face_room')
     budget.program_bytes=geometry.get('program_bytes')
     extent=port_extent(mesh_xy)
+    from common import timing
     parts=[]
-    for ids,real,slots in parent_rounds(nq,int(width)):
-        samples,moments,line=read(ids)
-        line={} if line is None else line
-        panel_elements=sum(int(np.prod(panels.shape[1:])) for panels,_ in line.values())
-        selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
-                         +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
-        selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
-                              selection_faces=selection_faces)
-        if budget.face_room is not None:
-            budget.face_room=min(budget.face_room,face_eigh_room(selection) or 0) or None
-        sub=dict(geometry,ids=ids,real=real)
-        states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,sub,local_meta,n,budget,
-            mesh_xy=mesh_xy,execution='face',retained=retained)
-        # a short last sub-batch repeats its last parent: keep the real slots only
-        keep=slice(0,int(real))
-        parts.append((states,np.asarray(counts)[keep],roles,infinity,[v for v in values][keep],real))
-        del samples,moments,line
-        budget.retained_panels=tuple(retained)
-    # One carrier per state over every sub-batch (the widest selection), then one stack.
-    widths=[max(ws) for ws in zip(*(recipe_panel_widths(part[2][0],part[0],recipe,column_extent=extent,logical_n=n)
-                                    for part in parts))]
-    infinity_width=max(recipe_infinity_width(part[3],recipe,column_extent=extent,logical_n=n) for part in parts)
-    padded=[pad_states(part[0],widths,part[3],infinity_width) for part in parts]
-    from gw.shared_pole_execution import parent_rows
-    take=lambda a,real:a if int(a.shape[0])==int(real) else parent_rows(mesh_xy,a,np.arange(int(real)))
-    def node(a):
-        z=padded[0][0][a][0]
-        if np.ndim(z)==0:
-            return z
-        return np.concatenate([np.asarray(sub[0][a][0])[:part[5]] for sub,part in zip(padded,parts)])
-    states=[(node(a),*_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[0][a][1:]) for sub,part in zip(padded,parts)]))
-            for a in range(len(padded[0][0]))]
-    infinity=_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[1]) for sub,part in zip(padded,parts)])
-    counts=np.concatenate([part[1] for part in parts])
-    values=[v for part in parts for v in part[4]]
-    roles=parts[0][2]
-    del padded,parts
+    with timing.section('decoupled.selection'):
+        for ids,real,slots in parent_rounds(nq,int(width)):
+            samples,moments,line=read(ids)
+            line={} if line is None else line
+            panel_elements=sum(int(np.prod(panels.shape[1:])) for panels,_ in line.values())
+            selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
+                             +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
+            selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
+                                  selection_faces=selection_faces)
+            if budget.face_room is not None:
+                budget.face_room=min(budget.face_room,face_eigh_room(selection) or 0) or None
+            sub=dict(geometry,ids=ids,real=real)
+            states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,sub,local_meta,n,budget,
+                mesh_xy=mesh_xy,execution='face',retained=retained)
+            # a short last sub-batch repeats its last parent: keep the real slots only
+            keep=slice(0,int(real))
+            parts.append((states,np.asarray(counts)[keep],roles,infinity,[v for v in values][keep],real))
+            del samples,moments,line
+            budget.retained_panels=tuple(retained)
+    with timing.section('decoupled.stack'):
+        # One carrier per state over every sub-batch (the widest selection), then one stack.
+        widths=[max(ws) for ws in zip(*(recipe_panel_widths(part[2][0],part[0],recipe,column_extent=extent,logical_n=n)
+                                        for part in parts))]
+        infinity_width=max(recipe_infinity_width(part[3],recipe,column_extent=extent,logical_n=n) for part in parts)
+        padded=[pad_states(part[0],widths,part[3],infinity_width) for part in parts]
+        from gw.shared_pole_execution import parent_rows
+        take=lambda a,real:a if int(a.shape[0])==int(real) else parent_rows(mesh_xy,a,np.arange(int(real)))
+        def node(a):
+            z=padded[0][0][a][0]
+            if np.ndim(z)==0:
+                return z
+            return np.concatenate([np.asarray(sub[0][a][0])[:part[5]] for sub,part in zip(padded,parts)])
+        states=[(node(a),*_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[0][a][1:]) for sub,part in zip(padded,parts)]))
+                for a in range(len(padded[0][0]))]
+        infinity=_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[1]) for sub,part in zip(padded,parts)])
+        counts=np.concatenate([part[1] for part in parts])
+        values=[v for part in parts for v in part[4]]
+        roles=parts[0][2]
+        del padded,parts
     history=carrier_history(meta)
     name=(('sector',geometry['sector'],n),'extent',2,len(states))
     tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],

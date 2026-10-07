@@ -843,18 +843,27 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     def advance(name, program, stage, *operands):
         new = run(program, stage, *operands)
         return {**{k: stage[k] for k in passthrough[name]}, **new}
-    stage = run(stage1, *inputs)
+    from common import timing
+    # One timing section per stage and eigh: the report gives each its wall and pool high-water.
+    with timing.section('decoupled.members'):
+        stage = run(stage1, *inputs)
     infinity = inputs[6]
     del inputs
     states[:] = [s[:3] for s in states]
-    gamma, u = hvv_eigh(_hermitian_stack(mesh)(stage['h_vv']))
-    stage = advance('keep', stage2, stage, gamma, u)
+    with timing.section('decoupled.eigh_hvv'):
+        gamma, u = hvv_eigh(_hermitian_stack(mesh)(stage['h_vv']))
+    with timing.section('decoupled.keep'):
+        stage = advance('keep', stage2, stage, gamma, u)
     del gamma, u
-    gamma_r, u_r = schur_eigh(stage['schur'])
-    stage = advance('paired', stage3, stage, gamma_r, u_r)
+    with timing.section('decoupled.eigh_schur'):
+        gamma_r, u_r = schur_eigh(stage['schur'])
+    with timing.section('decoupled.paired'):
+        stage = advance('paired', stage3, stage, gamma_r, u_r)
     del gamma_r, u_r
-    mu, rotation = reduced_eigh(stage['reduced'])
-    result = run(stage4, stage, mu, rotation, infinity)
+    with timing.section('decoupled.eigh_reduced'):
+        mu, rotation = reduced_eigh(stage['reduced'])
+    with timing.section('decoupled.output'):
+        result = run(stage4, stage, mu, rotation, infinity)
     del stage, mu, rotation
     model, signed, diagnostics = result[:3]
     output = model, signed, model[1:], diagnostics
