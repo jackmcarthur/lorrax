@@ -37,14 +37,14 @@ def literal(b,poles,s):
 @pytest.mark.parametrize("realize",[identity,transpose_projection])
 def test_value_slope_literal_poles_and_legacy_value(mesh,s,realize):
     b,p,c,db,dp,dc=data(mesh);face=NamedSharding(mesh,P(None,"x","y"))
-    evaluate=realized_gamma_correlation_sampler(mesh,realize,route=("off","auto"),representation="scalar-trs-even-s")
+    evaluate=realized_gamma_correlation_sampler(mesh,realize,route=("auto","auto"),representation="scalar-trs-even-s")
     value,slope=evaluate(jnp.asarray(s,jnp.complex128),db,dp,dc)
     expected,derivative=literal(b,p,s)
     if realize is transpose_projection:
         expected=.5*(expected+expected.swapaxes(-1,-2));derivative=.5*(derivative+derivative.swapaxes(-1,-2))
     np.testing.assert_allclose(value,expected,rtol=3e-13,atol=3e-13)
     np.testing.assert_allclose(slope,derivative,rtol=3e-13,atol=3e-13)
-    legacy=_realized_gamma_body(mesh,realize,("off","auto"))(jnp.asarray(s),db,dp,dc,jax.device_put(np.zeros((1,4,4),complex),face))
+    legacy=_realized_gamma_body(mesh,realize,("auto","auto"))(jnp.asarray(s),db,dp,dc,jax.device_put(np.zeros((1,4,4),complex),face))
     np.testing.assert_array_equal(value,legacy)
     assert value.sharding==face and slope.sharding==face
     if s.imag:
@@ -55,7 +55,7 @@ def test_value_slope_literal_poles_and_legacy_value(mesh,s,realize):
 
 def test_exact_slope_agrees_with_refined_finite_difference(mesh):
     _,_,_,b,p,c=data(mesh);s=.7+.2j
-    evaluate=realized_gamma_correlation_sampler(mesh,identity,route=("off","auto"),representation="scalar-trs-even-s")
+    evaluate=realized_gamma_correlation_sampler(mesh,identity,route=("auto","auto"),representation="scalar-trs-even-s")
     _,slope=evaluate(jnp.asarray(s),b,p,c);errors=[]
     for h in [1e-3,5e-4,1e-4]:
         plus,_=evaluate(jnp.asarray(s+h),b,p,c);minus,_=evaluate(jnp.asarray(s-h),b,p,c)
@@ -67,8 +67,8 @@ def test_exact_slope_agrees_with_refined_finite_difference(mesh):
 def test_equivalent_mesh_cache_and_changed_factor_operands(mesh):
     _,_,_,b,p,c=data(mesh)
     another=Mesh(np.asarray(mesh.devices),mesh.axis_names)
-    one=realized_gamma_correlation_sampler(mesh,identity,route=("off","auto"),representation="scalar-trs-even-s")
-    two=realized_gamma_correlation_sampler(another,identity,route=("off","auto"),representation="scalar-trs-even-s")
+    one=realized_gamma_correlation_sampler(mesh,identity,route=("auto","auto"),representation="scalar-trs-even-s")
+    two=realized_gamma_correlation_sampler(another,identity,route=("auto","auto"),representation="scalar-trs-even-s")
     assert one is two
     old=one(jnp.asarray(.7+.2j),b,p,c);new=two(jnp.asarray(.7+.2j),2*b,p,c)
     for a,z in zip(old,new):np.testing.assert_allclose(z,4*a,rtol=3e-13,atol=3e-13)
@@ -82,7 +82,7 @@ def test_signed_z_models_never_enter_squared_frequency_sampler(mesh,representati
 
 def test_multi_parent_or_real_frequency_request_refuses(mesh):
     _,_,_,b,p,c=data(mesh)
-    evaluate=realized_gamma_correlation_sampler(mesh,identity,route=("off","auto"),representation="scalar-trs-even-s")
+    evaluate=realized_gamma_correlation_sampler(mesh,identity,route=("auto","auto"),representation="scalar-trs-even-s")
     with pytest.raises(ValueError,match="scalar complex"):
         evaluate(jnp.asarray(.7),b,p,c)
     with pytest.raises(ValueError,match="one Γ"):
