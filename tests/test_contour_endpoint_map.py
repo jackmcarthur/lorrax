@@ -119,6 +119,9 @@ def test_asymmetric_complex_map_full_dyson_slope_and_sigma_equivalence(mesh):
     pair = rng.normal(size=(1, 2, M)) + 1j*rng.normal(size=(1, 2, M)); pair[..., 1]=0.
     for i in range(len(sites)):
         wc_mu, dw_mu = dyson.pair("face")(placed_root, chi[i], dchi[i])
+        # The tiny P1 native program returns resident-batch metadata. Re-place
+        # only this literal fixture on the declared contour endpoint face.
+        wc_mu, dw_mu = face(wc_mu, mesh), face(dw_mu, mesh)
         Wg, dw_g = solver.solve_pair(chi_g[i], ds_g[i])
         wc_g = Wg-face(v[None], mesh)
         lift = cd.lift_interaction_endpoints(wc_g, face(zeta, mesh), mesh=mesh, prefactor=1./volume)
