@@ -640,6 +640,19 @@ The retained rank is the smaller of
 Where the port-space spectrum is rich the budget binds; where it cuts first
 the natural rank does. $K/N_\mu$ alone does not say which.
 
+For a fixed-basis pole study, the declared body cap in the
+[input reference](../input_reference.md) replaces only this production
+retained-Gram budget. Its zero default retains the existing automatic policy
+and recipe identity. A positive cap enters the recipe version/hash, so bank
+and model restart membership cannot reuse another cap's authenticated recipe.
+It leaves the finite support sites, held sites, right-direction widths,
+infinity width/moments and all acceptance gates unchanged. It is admitted for
+scalar and two-component charge bodies, with four-current sector budgets
+remaining automatic. Report the actual K at each parent, tied underfill and
+any refused arm; the requested cap is not a measured rank. The head pole
+fit is separate. Holding only N_mu while changing accuracy tier or support
+geometry does not isolate this budget's error.
+
 ### 8.3 The heuristic, and why the cap is where it is
 
 On the decks measured, the pole count that brings the self-energy at each

@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — declared shared-body pole cap for fixed-basis studies
+
+`sigma_w_pole_budget=0` preserves the automatic production body cap and
+existing recipe identity. A positive integer sets only the production
+shared-body retained-Gram cap and enters its bank/model recipe identity;
+fresh matching construction stores are required. Support/held sites,
+direction/infinity widths, moments and all acceptance gates remain fixed.
+Realized pole counts can underfill the cap because of rank and complete tied
+multiplets. The control is admitted for scalar and two-component charge
+operators; four-current sectors remain automatic. No default result changes.
+It is independent of the head's `mpa_n_poles` setting.
+
 ## 2026-10-07 — native projector quadrature follows the authenticated QE creator
 
 VNL setup now resolves even-mesh beta integration from the generating QE

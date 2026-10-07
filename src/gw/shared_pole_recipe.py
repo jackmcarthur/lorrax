@@ -994,6 +994,32 @@ def _sector_treatment_ceiling(response_span_ry, session):
                 scope="numerical treatment; not a physical pole bound")
 
 
+def parse_pole_budget(value, *, model="shared_pole", accuracy="production"):
+    """Validate the optional body cap; zero retains the automatic recipe.
+
+    A positive cap is a production shared-body construction policy, not a
+    sample-count, direction-width, infinity-width or head-pole setting.
+    """
+    try:
+        if isinstance(value, (bool, np.bool_)):
+            raise TypeError
+        budget = operator.index(value)
+    except TypeError:
+        raise ValueError(
+            f"GATE shared_pole_budget: got: {value!r}; want: an integer >= 0; "
+            "why: zero selects the existing automatic body cap") from None
+    if budget < 0:
+        raise ValueError(
+            f"GATE shared_pole_budget: got: {budget}; want: an integer >= 0; "
+            "why: a negative retained-rank cap has no construction")
+    if budget and (model != "shared_pole" or accuracy != "production"):
+        raise ValueError(
+            f"GATE shared_pole_budget: got: {budget} with model={model!r}, "
+            f"accuracy={accuracy!r}; want: production shared_pole; "
+            "why: the fixed body cap changes only that construction policy")
+    return budget
+
+
 def parse_support_sites(text):
     """Parse ``sigma_w_support_sites_ev`` into the two explicit site ladders.
 
@@ -1184,10 +1210,17 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     from .gw_config import (uses_bare_transverse_shared_pole,
                             uses_full_bispinor_shared_pole)
 
+    pole_override = parse_pole_budget(
+        getattr(config.sigma, 'w_pole_budget', 0),
+        model=config.sigma.w_model, accuracy=config.sigma.w_accuracy)
     if config.sigma.w_model != "shared_pole":
         return None
     charge4 = uses_bare_transverse_shared_pole(config)
     photon = uses_full_bispinor_shared_pole(config)
+    if pole_override and int(meta.nspinor) not in (1, 2):
+        raise ValueError("GATE shared_pole_budget: a fixed body cap currently "
+                         "requires a scalar or two-component charge operator; "
+                         "four-current sector budgets remain automatic")
     if int(meta.nspinor) == 4 and not (charge4 or photon):
         raise ValueError("GATE shared_pole_representation: four-component shared-pole "
                          "response needs an explicit charge or full photon route")
@@ -1234,6 +1267,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
                census['logical_band_count'],
                '' if override is None else override['text'])
+        if pole_override:
+            key += ('fixed-body-pole-budget-v1', pole_override)
         support_receipt = _support_envelope(
             dict(imaginary_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
             support_session)
@@ -1333,6 +1368,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         version = RECIPE_VERSION + '+support_sites'
         table = hashlib.sha256(
             (RECIPE_HASH + '|' + override['text']).encode()).hexdigest()
+    if pole_override:
+        version += '+pole_budget'
+        table = hashlib.sha256(
+            (table + '|fixed-body-pole-budget-v1|' + str(pole_override)).encode()).hexdigest()
     if sector_treatment is not None:
         version += '+sector_treatment'
         treatment_identity = {key: sector_treatment[key] for key in (
@@ -1380,7 +1419,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'infinity_width': math.ceil(n * policy['infinity_width_fraction']),
         'line_direction_cap': (math.ceil(n * policy['line_direction_cap_fraction'])
                                if 'line_direction_cap_fraction' in policy else None),
-        'pole_budget': (math.ceil(n * policy['pole_budget_fraction'])
+        'pole_budget': (pole_override or math.ceil(n * policy['pole_budget_fraction'])
                         if 'pole_budget_fraction' in policy else None),
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
         'bank_rule_tolerance': policy['bank_rule_tolerance'],
@@ -1390,6 +1429,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     }
     if charge4:
         result['charge_operator'] = 'four-component-spin-traced-v1'
+    if pole_override:
+        result.update(pole_budget_policy='fixed-body-pole-budget-v1',
+                      pole_budget_override=pole_override,
+                      automatic_pole_budget=math.ceil(n * policy['pole_budget_fraction']))
     if support_receipt is not None:
         result['support_envelope'] = support_receipt
     if sector_treatment is not None:
@@ -1418,6 +1461,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
     }
+    if pole_override:
+        rules['pole_budget'] = ('declared sigma_w_pole_budget retained Gram directions per parent '
+                                '(largest first, whole multiplets); only the cap changes')
+        rules['automatic_pole_budget'] = 'unchanged production ceil(1.8 n), recorded for comparison'
     if support_receipt is not None:
         rules.update(imaginary_top='SC high-water envelope of omega_p+3.5 eV',
                      u_min='SC low-water envelope of max(h,logical gap)',
