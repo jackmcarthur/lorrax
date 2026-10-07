@@ -1,13 +1,15 @@
-"""The decoupled sector ledger against the measured CrI3 24x24 P64 peaks, and its runtime guard.
+"""The decoupled sector ledger against the measured CrI3 24x24 P64 peaks, and its runtime check.
 
 Replay of runs/CrI3/512_fm_24x24_750b_20261002/04_sectfast2_20261006/leg01 (claims 3545, 3555):
-rank-0 pool high-water per stage, GB: TT.all 64.91, CT 61.34, CC.all 35.77 (budget 72). That run
-priced TT.all at 47.07 and CT at 33.81: the held all-parent outputs had no row and the eighs
-ran in their rooms with no row. The decoupled stage now reserves its stacks row (stacks, panels,
-the stage program) and, while each eigh stack runs, a row of its boundary and its whole room.
-Shapes from the leg's compile log and receipts (P64 8x8, 61 parents, sub-batches of 3):
-TT pencil side 25856 (H'_vv 12928), kept span 2c 18432, 5184 rows, state panels 24576 columns;
-CC side 19264, 2c 12288, 3328 rows, 18432 columns; face round program at width 3 13.1 / 5.6 GB.
+rank-0 pool high-water per stage, GB: TT.all 64.91, CC.all 35.77 (budget 72). That leg priced
+TT.all at 47.07 (CC's held outputs, live through TT.all, had no row) and ran each decoupled eigh
+in its room with no row. Now the stacks row carries the stacks, the panels and the stage program,
+and each eigh runs under a row of its boundary and its own program (the service's route-(c)
+program, or on the whole mesh its vectors stack and workspace), so the replay asserts against
+priced rows, not the room. Shapes from the leg's compile log and receipts (P64 8x8, 61 parents,
+sub-batches of 3): TT pencil side 25856, 2c 18432, 5184 rows, panels 24576 columns; CC side 19264,
+2c 12288, 3328 rows, 18432 columns; face round program at width 3 13.1 / 5.6 GB. CT ran in rounds
+there; the decoupled CT has no P64 measurement yet, so it has no replay here.
 """
 import numpy as np
 import pytest
@@ -24,51 +26,58 @@ def _panels(rows, columns, infinity=640):
     return held, per_rank(rows * columns)
 
 
-def _room(boundary, ambient):
-    room = int(AVAILABLE - ambient - boundary)
-    return (room >> 30) << 30 if room >= 1 << 30 else 0
+def _held_outputs(side, two, rows, columns, infinity=640):
+    """A sector's held all-parent outputs per rank: coefficient span [side, 2c], signed and
+    positive factors [rows, 2c], (Q, O) panels and the infinity panels."""
+    held, _ = _panels(rows, columns, infinity)
+    return held + (side * two + 2 * rows * two) * 16 * NQ // RANKS
 
 
-def _price(side, carrier, rows, columns, program, ambient):
+# The leg's route-(c) eigh programs (receipts: compiled GB/rank per stack); TT's 61 x 18432
+# stack ran on the whole mesh there: its vectors stack (the solve's vendor workspace is not
+# queryable on CPU and is left out, which only makes the bound stricter).
+PROGRAMS = {"TT": (21.31 * GB, 10.84 * GB, 61 * 18432 ** 2 * 16 / RANKS),
+            "CC": (11.84 * GB, 4.82 * GB, 19.25 * GB)}
+SHAPES = {"TT": (25856, 9216, 5184, 24576, 13.1 * GB), "CC": (19264, 6144, 3328, 18432, 5.6 * GB)}
+
+
+def _price(name, ambient):
     from gw.shared_pole_execution import decoupled_stage_bytes
+    side, carrier, rows, columns, program = SHAPES[name]
     held, dw = _panels(rows, columns)
+    # That leg kept the dW Q panels to the end: price the boundaries with them.
     resident, boundaries = decoupled_stage_bytes(nq=NQ, ranks=RANKS, side=side, carrier=carrier, packed=rows,
-                                                 held=held, dw_panels=dw, program=program)
-    eighs = [ambient + b + _room(b, ambient) for b in boundaries]
-    return ambient + resident, max(eighs), boundaries
+                                                 held=held + dw, dw_panels=0, program=program)
+    eighs = [ambient + b + p for b, p in zip(boundaries, PROGRAMS[name])]
+    return ambient + resident, eighs
 
 
-@pytest.mark.parametrize("name,side,carrier,rows,columns,program,peak", [
-    ("TT.all", 25856, 9216, 5184, 24576, 13.1 * GB, 64.91 * GB),
-    ("CC.all", 19264, 6144, 3328, 18432, 5.6 * GB, 35.77 * GB),
-])
-def test_decoupled_price_bounds_the_measured_peak(name, side, carrier, rows, columns, program, peak):
-    stacks_row, eigh_row, boundaries = _price(side, carrier, rows, columns, program, AMBIENT)
-    assert stacks_row <= AVAILABLE, (name, stacks_row / GB)           # the stage is admitted
-    assert max(stacks_row, eigh_row) >= peak, (name, stacks_row / GB, eigh_row / GB)
+def test_decoupled_rows_bound_the_measured_peaks():
+    """Replay of the leg (CC reduced first, so CC's held outputs were live through TT.all): the
+    stacks rows and eigh rows, each with its own program bytes, against the measured peaks."""
+    cc_stacks, cc_eighs = _price("CC", AMBIENT)
+    assert cc_stacks <= AVAILABLE
+    assert max(cc_stacks, *cc_eighs) >= 35.77 * GB, (cc_stacks / GB, [e / GB for e in cc_eighs])
+    held_cc = _held_outputs(19264, 12288, 3328, 18432)
+    tt_stacks, tt_eighs = _price("TT", AMBIENT + held_cc)
+    assert tt_stacks <= AVAILABLE
+    assert max(tt_stacks, *tt_eighs) >= 64.91 * GB, (tt_stacks / GB, [e / GB for e in tt_eighs])
 
 
 def test_tt_reduced_stack_room_fits_route_c_when_tt_runs_first():
     """The 61 x 18432 Y^H G_r Y stack compiled to 43.29 GB on route (c) against a 37.58 GB room
     (one room beside the largest boundary, CC's outputs live). Its own boundary, the dW Q panels
     released and TT before CC give it the room."""
-    _, _, boundaries = _price(25856, 9216, 5184, 24576, 13.1 * GB, AMBIENT)
-    assert _room(boundaries[2], AMBIENT) >= 43.29 * GB, _room(boundaries[2], AMBIENT) / GB
-
-
-@pytest.mark.xfail(strict=True, reason="CT rounds still run their eighs in a room with no row: "
-                   "ambient + held TT/CC outputs + the CT round program price stay below the 61.34 GB "
-                   "peak until CT is decoupled (lever 2)")
-def test_ct_round_price_bounds_the_measured_peak():
     from gw.shared_pole_execution import decoupled_stage_bytes
-    held_tt, _ = _panels(5184, 24576)
-    held_cc, _ = _panels(3328, 18432)
-    span = lambda side, two, rows: (side * two + 2 * rows * two) * 16 * NQ // RANKS   # coefficients, models
-    outputs = held_tt + held_cc + span(25856, 18432, 5184) + span(19264, 12288, 3328)
-    assert AMBIENT + outputs + 15.4 * GB >= 61.34 * GB
+    side, carrier, rows, columns, program = SHAPES["TT"]
+    held, dw = _panels(rows, columns)
+    _, boundaries = decoupled_stage_bytes(nq=NQ, ranks=RANKS, side=side, carrier=carrier, packed=rows,
+                                          held=held, dw_panels=dw, program=program)
+    room = int(AVAILABLE - AMBIENT - boundaries[2])
+    assert ((room >> 30) << 30) >= 43.29 * GB, room / GB
 
 
-def test_guard_runs_a_stack_on_the_mesh_when_the_pool_is_short(monkeypatch):
+def test_guard_warns_and_never_changes_the_route(monkeypatch):
     import jax.numpy as jnp
     import gw.shared_pole_execution as ex
     from distrib_la.plan import StackRoute
@@ -86,18 +95,13 @@ def test_guard_runs_a_stack_on_the_mesh_when_the_pool_is_short(monkeypatch):
             return a
 
     stack = jnp.zeros((2, 4, 4))
-    monkeypatch.setattr(ex, "face_eigh", lambda mesh, n, room=None: Plan("mesh", StackRoute("scan")))
     route_c = StackRoute("batch_reshard", 1, 1, program_bytes=10 * GB, room=20 * GB)
-    for free, want in ((None, "c"), (30 * GB, "c"), (5 * GB, "mesh")):
+    for free, warns in ((None, False), (30 * GB, False), (5 * GB, True)):
         monkeypatch.setattr(ex, "_device_free_bytes", lambda free=free: free)
         calls.clear()
-        with pytest.warns(RuntimeWarning) if want == "mesh" else _nothing():
+        with pytest.warns(RuntimeWarning, match="short by 5.0 GB") if warns else _nothing():
             ex.guarded_eigh(Plan("c", route_c), stack, mesh=None, label="test")
-        assert calls == [want], (free, calls)
-    monkeypatch.setattr(ex, "_device_free_bytes", lambda: 0)
-    calls.clear()
-    ex.guarded_eigh(Plan("p", StackRoute("scan")), stack, mesh=None, label="test")   # never widens
-    assert calls == ["p"]
+        assert calls == ["c"], (free, calls)          # the ledger's route, whatever the pool holds
 
 
 class _nothing:
