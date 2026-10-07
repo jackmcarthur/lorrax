@@ -27,7 +27,8 @@ from .resolve import mesh_platform
 #   P16; 2953, 2958) but stays off: +0.5 GB/rank unpriced (2953), and before 676eeb9a2 remat
 #   reordered a loop-counter read under it (2961).
 # Decides it: at P16 the band-panel exchange is most of a build (all-gathers 1.2 of 1.85 ms; 2949).
-def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=False):
+def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=False,
+                 transa="N", transb="N", compiler_options=None):
     """Multiply face matrices by a batched 2-D SUMMA over bounded contraction panels.
 
     Parameters
@@ -60,6 +61,17 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         each gathered panel conjugated before its own local GEMM (no
         conjugated copy of a tile).  Returns the pair.
 
+    transa, transb : str
+        ``'N'``, ``'T'`` or ``'C'`` on the square-mesh route: ``a`` is then
+        given as ``op(a)``'s transpose ``[q, k, m]`` (``b`` as ``[q, n, k]``)
+        on the face, and its tile is moved to the transposed grid position
+        by one ``ppermute`` and transposed locally, which on a square mesh is
+        exactly the N-layout tile, so the panel loop runs unchanged. No
+        distributed transpose, no second tile copy.
+    compiler_options : dict, optional
+        Passed to the kernel's ``jax.jit`` (the latency-hiding scheduler,
+        which overlaps the prefetched panel gathers with the local GEMM).
+
     Returns
     -------
     jax.Array
@@ -83,10 +95,14 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     if a.ndim != 3 or b.ndim not in (3, 4) or a.dtype != b.dtype:
         raise ValueError('panel_matmul requires rank-3 A and rank-3/4 B of one dtype')
-    q, m, k = a.shape
-    if b.shape[0] != q or b.shape[-2] != k:
+    if transa not in ('N', 'T', 'C') or transb not in ('N', 'T', 'C'):
+        raise ValueError('panel_matmul: transa/transb must be N, T or C')
+    if (transa != 'N' or transb != 'N') and (px != py or b.ndim != 3 or partner or weights is not None):
+        raise ValueError('panel_matmul: transposed operands need a square mesh, 3-D b, no weights or partner')
+    q, m, k = (a.shape[0], a.shape[2], a.shape[1]) if transa != 'N' else a.shape
+    kb, n = (b.shape[-1], b.shape[-2]) if transb != 'N' else (b.shape[-2], b.shape[-1])
+    if b.shape[0] != q or kb != k:
         raise ValueError('panel_matmul batch/contraction extents disagree')
-    n = b.shape[-1]
     if m % px or k % px or k % py or n % py:
         raise ValueError('panel_matmul requires producer-padded face extents')
     per_column = a.dtype.itemsize * q * (m // px + n // py)
@@ -101,7 +117,8 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         # one narrower panel.
         width = _interleaved_width(k, px, limit)
         kernel = _interleaved_kernel(mesh, q, m, k, n, width, bounds is not None,
-                                     weights is not None, bool(partner))
+                                     weights is not None, bool(partner), transa, transb,
+                                     None if compiler_options is None else tuple(sorted(compiler_options.items())))
         args = (a, b)
         if bounds is not None:
             args += (jnp.asarray(bounds, jnp.int32).reshape(q, 2),)
@@ -230,7 +247,8 @@ def _kernel(mesh, q, m, k, n, width, sample_axis):
 
 
 @lru_cache(maxsize=64)
-def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, partner=False):
+def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, partner=False,
+                        transa="N", transb="N", compiler_options=None):
     """Batched SUMMA on a square mesh: K streamed in interleaved panels, one prefetched.
 
     Rank ``(x, y)`` holds the K block ``[y·K/p, (y+1)·K/p)`` of A and
@@ -263,7 +281,23 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     contract = _panel_contraction(mesh, active) if in_place else None
     owner = np.arange(p, dtype=np.int32)[None, :]
 
+    # A transposed operand arrives as op's transpose on the face: rank (x, y)
+    # holds S[k-block x, m-block y]. The N-layout tile A[m-block x, k-block y]
+    # is conj(S[k-block y, m-block x])^T, the tile of rank (y, x): one
+    # ppermute across the grid's diagonal, then a local (conjugate) transpose.
+    across = tuple((x * p + y, y * p + x) for x in range(p) for y in range(p))
+
+    def transposed(t, mode):
+        t = lax.ppermute(t, ('x', 'y'), perm=across)
+        t = jnp.swapaxes(t, -1, -2)
+        return jnp.conj(t) if mode == 'C' else t
+
     def body(a, b, bounds, weights):
+        if transa != 'N':
+            a = transposed(a, transa)
+        if transb != 'N':
+            b = transposed(b, transb)
+
         def gather(off, wd):
             left = lax.dynamic_slice_in_dim(a, off, wd, axis=2)
             if weighted and not partner:
@@ -332,5 +366,6 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     out = (P(None, 'x', 'y'),) * 2 if partner else P(None, 'x', 'y')
     kernel = shard_map(local, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 2 + (P(),) * len(extra),
                        out_specs=out, check_vma=False)
+    options = None if compiler_options is None else dict(compiler_options)
     return jax.jit(kernel, in_shardings=(face, face) + (rep,) * len(extra),
-                   out_shardings=(face,) * n_out if partner else face)
+                   out_shardings=(face,) * n_out if partner else face, compiler_options=options)
