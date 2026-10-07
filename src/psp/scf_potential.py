@@ -6,7 +6,7 @@ Two public entry points, one helper:
     Assemble (V_scf, V_loc, vnl_setup) from a duck-typed mean-field
     information object ``mf`` (either ``CrystalData`` or ``WFNReader`` —
     both expose ``bvec``, ``bdot``, ``blat``, ``fft_grid``, ``nspinor``,
-    ``ecutwfc``, ``atom_types``, ``atom_positions``, ``cell_volume``)
+    ``ecutwfc``, ``ecutrho``, ``atom_types``, ``atom_positions``, ``cell_volume``)
     plus an explicit real-space valence density.
 
     V_scf = V_loc + V_H[ρ_val + ρ_core] + V_xc[ρ_val + ρ_core]
@@ -56,7 +56,7 @@ def build_dft_potentials(
     ----------
     mf : WFNReader or CrystalData (duck-typed)
         Source of structural data: ``fft_grid``, ``nspinor``, ``bvec``,
-        ``bdot``, ``blat``, ``ecutwfc``, ``atom_types``, ``atom_positions``,
+        ``bdot``, ``blat``, ``ecutwfc``, ``ecutrho``, ``atom_types``, ``atom_positions``,
         ``cell_volume``.
     pseudos : dict
         ``{symbol: Pseudopotential}`` from ``psp.pseudos.load_pseudopotentials``.

@@ -156,6 +156,12 @@ def build_ionic_and_core(
 
     Returns (V_loc_r, rho_core_r, rho_core_G_scaled).
 
+    ``wfn.ecutrho`` is the authenticated density cutoff in Ry, carried
+    by both CrystalData and the mean-field header. Both analytic fields
+    use that G sphere before their inverse FFT, including G=0. The FFT
+    box alone is not the density basis: extra NLCC modes would enter the
+    nonlinear XC potential even when they do not couple H directly.
+
     n_q : int, optional — radial-table node count.  ``None`` (default)
         scales it with q_max so the grid spacing dq is ECUT-INDEPENDENT
         (target 5e-4 bohr⁻¹, floor 4000 nodes) — the same rule
@@ -173,6 +179,13 @@ def build_ionic_and_core(
     """
     from psp.species import extract_species, build_atom_species_map
     from psp.radial_tables import build_all_tables, alpha_z
+
+    try:
+        ecutrho = float(wfn.ecutrho)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("ionic/core fields require the mean-field ecutrho in Ry") from error
+    if not np.isfinite(ecutrho) or ecutrho <= 0:
+        raise ValueError("ionic/core ecutrho must be finite and positive")
 
     nx, ny, nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
     N = nx * ny * nz
@@ -235,6 +248,7 @@ def build_ionic_and_core(
         jnp.asarray(float(vol), dtype=jnp.float64),
         jnp.asarray(sqrtN, dtype=jnp.float64),
         jnp.asarray(float(N), dtype=jnp.float64),
+        jnp.asarray(ecutrho, dtype=jnp.float64),
         max_atoms=int(max_atoms),
         nx=nx, ny=ny, nz=nz,
         truncation_2d=bool(truncation_2d),
@@ -252,7 +266,7 @@ def build_ionic_and_core(
 def _ionic_gspace_jit(
     G_crys, G_norm, species_tau, species_natoms,
     tables_nlcc, tables_vloc, nlcc_pf, vloc_pf, z_vals,
-    B_cart, q0, dq, vol, sqrtN, N,
+    B_cart, q0, dq, vol, sqrtN, N, ecutrho,
     *, max_atoms, nx, ny, nz, truncation_2d,
 ):
     """One-shot G-space ionic + NLCC build: structure factors → species
@@ -261,10 +275,12 @@ def _ionic_gspace_jit(
     FFTs.  Single XLA compile in place of ~15 eager dispatches."""
     S_species = species_structure_factors(
         species_tau, species_natoms, G_crys, max_atoms)
+    density_sphere = G_norm ** 2 <= ecutrho
 
     # NLCC core density
     rho_core_G_flat = accumulate_species_on_G(
         tables_nlcc, nlcc_pf, S_species, G_norm, q0, dq)
+    rho_core_G_flat = jnp.where(density_sphere, rho_core_G_flat, 0.0)
     rho_core_G = rho_core_G_flat.reshape(nx, ny, nz)
     rho_core_r = jnp.real(local_ifftn3(rho_core_G)) * N
     rho_core_G_scaled = rho_core_G * N
@@ -288,7 +304,7 @@ def _ionic_gspace_jit(
         Vloc_lr_G_flat = Vloc_lr_G_flat * jnp.where(G2_flat == 0.0, 0.0, cutoff)
 
     Vloc_lr_G_flat = Vloc_lr_G_flat.at[0].set(0.0)
-    V_tot_G = (Vloc_sr_G_flat + Vloc_lr_G_flat).reshape(nx, ny, nz)
+    V_tot_G = jnp.where(density_sphere, Vloc_sr_G_flat + Vloc_lr_G_flat, 0.0).reshape(nx, ny, nz)
     V_loc_r = jnp.real(local_ifftn3(V_tot_G, norm="ortho"))
 
     return V_loc_r, rho_core_r, rho_core_G_scaled
