@@ -123,6 +123,21 @@ sphere, every dial live. `method="sobol"` without `scipy.stats.qmc` raises
 with one `warnings.warn` (the results are not bit-comparable with a Sobol
 run).
 
+For `analytic_sphere=True`, the direct interband `S_cart` response now uses
+the same sphere split for bare and screened averages: outside samples divide
+by the full draw count, and the exact radial sphere integral multiplies the
+converged angular mean of `1/(1−8π nᵀS n)`. Two angular refinements must agree;
+failure is named, and this is an observed convergence check rather than a
+bound near a dielectric pole. Null and isotropic responses obey `W0=V0` and
+`W0=V0/(1−8πs)` on each finite draw. The static Thomas–Fermi branch has its
+own exact radial sphere integral. Raw nonanalytic sampling is unchanged.
+
+An added finite-q `extra_chi` response refuses the analytic sphere until a
+matched radial/Lindhard sphere owner exists. Its raw-draw route remains
+available. The 3D `1/q²` singularity has an infinite-variance sampling tail:
+use explicit draw/refinement controls, rather than `std/sqrt(N)` alone as a
+head-convergence certificate.
+
 ## Backends and cost
 
 Host-side numpy plus one jitted jax helper (`wrap_points_to_voronoi`, CPU or

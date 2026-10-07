@@ -7,9 +7,11 @@ import numpy as np
 
 from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
+from vcoul.quadrature import gauss_legendre_interval
 from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
                           minibz_inscribed_sphere_r2,
-                          minibz_transverse_head_avg)
+                          minibz_transverse_head_avg,
+                          _analytic_sphere_bare_head)
 
 __all__ = ["Bulk3D"]
 
@@ -42,6 +44,48 @@ def _screened_rows(rq, S, extra):
 def _screened_sums(rq, S, extra, live):
     """The rows' sum over one process's share of a draw batch, ``live`` points only: [Z]."""
     return jnp.sum(jnp.where(live, _screened_terms(rq, S, extra), 0.0), axis=-1)
+
+
+def _interband_sphere_factor(S_carts):
+    """Solid-angle mean of 1/(1 - 8π n.S.n); radial integral is exact.
+
+    Polar Gauss--Legendre and periodic azimuth rules share the existing
+    quadrature backend. Two successive refinements must agree. This is an
+    observed angular convergence check, not an error bound for a singular
+    dielectric tensor. Isotropic tensors are exact at every rule order.
+    """
+    S = np.asarray(S_carts, dtype=np.complex128)
+    if S.ndim != 3 or S.shape[1:] != (3, 3) or not np.isfinite(S).all():
+        raise ValueError('GATE bulk_q0_sphere_tensor: finite (n,3,3) required')
+    previous, good = None, 0
+    for order in (16, 32, 64, 128, 256, 512):
+        u, w = gauss_legendre_interval(order, -1.0, 1.0)
+        phi = 2*np.pi*np.arange(2*order)/(2*order)
+        radius = np.sqrt(np.maximum(0.0, 1-u*u))
+        directions = np.stack(np.broadcast_arrays(
+            radius[:, None]*np.cos(phi), radius[:, None]*np.sin(phi),
+            u[:, None]), axis=-1).reshape(-1, 3)
+        weights = np.repeat(w/(4*order), 2*order)
+        denominator = 1-8*np.pi*np.einsum('qa,zab,qb->zq', directions, S, directions)
+        if not np.isfinite(denominator).all() or np.any(denominator == 0):
+            raise ValueError('GATE bulk_q0_sphere_singular: angular pole')
+        value = np.sum(weights[None, :]/denominator, axis=-1)
+        if previous is not None:
+            passed = np.all(np.abs(value-previous) <= 1e-12 + 1e-10*np.abs(value))
+            good = good+1 if passed else 0
+            if good >= 2:
+                return value
+        previous = value
+    raise ValueError('GATE bulk_q0_sphere_not_converged: angular refinement failed')
+
+
+def _thomas_fermi_sphere_factor(radius, kappa):
+    """Exact radial sphere integral divided by its bare counterpart."""
+    x = complex(radius)/complex(kappa)
+    if abs(x) < 1e-3:
+        x2 = x*x
+        return x2*(1/3-x2*(1/5-x2*(1/7-x2/9)))
+    return 1-np.arctan(x)/x
 
 
 class Bulk3D:
@@ -83,6 +127,11 @@ class Bulk3D:
         analytic_sphere: bool = False,
         extra_chi=None,
     ):
+        if analytic_sphere and extra_chi is not None:
+            raise NotImplementedError(
+                'GATE bulk_q0_sphere_extra_chi_unavailable: the finite-q '
+                'response needs a matched radial sphere integral; use the '
+                'raw draw with explicit refinement controls')
         # ``analytic_sphere`` (head_minibz_average): add the analytic
         # Baldereschi-Tosatti sphere term to the q→0 head so vc0_mean is
         # seed-independent (the pure-Sobol mean has a few tiny δq → 8π/|δq|²
@@ -109,13 +158,27 @@ class Bulk3D:
             wmeans = []
             for rq in batches:
                 q2 = jnp.einsum("qi,qi->q", rq, rq)
-                wmeans.append(jnp.mean(8.0 * jnp.pi / (q2 + kappa2)))
+                values = 8.0 * jnp.pi / (q2 + kappa2)
+                if analytic_sphere:
+                    r2 = minibz_inscribed_sphere_r2(geometry.bvec, (nkx, nky, nkz))
+                    values = jnp.where(q2 > r2, values, 0.0)
+                wmeans.append(jnp.mean(values))
             wcoul0 = jnp.mean(jnp.stack(wmeans))
+            if analytic_sphere:
+                sphere = _analytic_sphere_bare_head(r2, geometry.cell_volume, nkx*nky*nkz)
+                wcoul0 = wcoul0 + sphere*_thomas_fermi_sphere_factor(
+                    np.sqrt(r2), np.sqrt(complex(np.asarray(kappa2))))
             return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
 
         if S_cart is not None:
             rows = None if extra_chi is None else (lambda rq: extra_chi(rq)[None])
-            wcoul0 = self._screened_means(batches, [S_cart], rows)[0]
+            if analytic_sphere:
+                r2 = minibz_inscribed_sphere_r2(geometry.bvec, (nkx, nky, nkz))
+                wcoul0 = self._screened_means(batches, [S_cart], rows, outside_sphere=r2)[0]
+                sphere = _analytic_sphere_bare_head(r2, geometry.cell_volume, nkx*nky*nkz)
+                wcoul0 = wcoul0 + sphere*_interband_sphere_factor([S_cart])[0]
+            else:
+                wcoul0 = self._screened_means(batches, [S_cart], rows)[0]
             return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
 
         # Isotropic Ismail-Beigi gamma fallback (epshead-driven).  Kept for
@@ -127,6 +190,11 @@ class Bulk3D:
         vc_q0 = 8.0 * jnp.pi / q0sq
         eps_real = jnp.asarray(jnp.real(epshead), dtype=jnp.float64)
         gamma = (1.0 / eps_real - 1.0) / (q0sq * vc_q0)
+        if analytic_sphere:
+            # The incumbent epshead convention is a homogeneous scalar
+            # multiplier. Preserve it on the same corrected bare average.
+            wcoul0 = vc0_mean/(1.0 + 8.0*jnp.pi*gamma)
+            return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
         # Reuse the last batch's q-points for the screening-fallback estimator.
         rq_last = batches[-1]
         qsq = jnp.einsum("ij,ij->i", rq_last, rq_last)
@@ -152,7 +220,8 @@ class Bulk3D:
         means = [jnp.mean(self._vq_isotropic(rq)) for rq in batches]
         return jnp.mean(jnp.stack(means))
 
-    def _screened_means(self, batches, S_carts, extra_chi_rows, *, shared=False):
+    def _screened_means(self, batches, S_carts, extra_chi_rows, *, shared=False,
+                        outside_sphere=None):
         """Anisotropic screened ``w0 = <v / (1 - v (q.S.q + chi_extra(q)))>`` of every row, mean of batch means: [Z].
 
         ``extra_chi_rows(rq)`` returns every row's ``chi_extra`` [Z, n] on a
@@ -169,7 +238,12 @@ class Bulk3D:
             means = []
             for rq in batches:
                 rq = jnp.asarray(rq)
-                means.append(_screened_rows(rq, S, None if extra_chi_rows is None else extra_chi_rows(rq)))
+                extra = None if extra_chi_rows is None else extra_chi_rows(rq)
+                if outside_sphere is None:
+                    means.append(_screened_rows(rq, S, extra))
+                else:
+                    live = jnp.einsum('qi,qi->q', rq, rq) > outside_sphere
+                    means.append(_screened_sums(rq, S, extra, live)/rq.shape[0])
             return jnp.mean(jnp.stack(means), axis=0)
         from jax.experimental import multihost_utils
         rank, ranks = jax.process_index(), jax.process_count()
@@ -181,9 +255,12 @@ class Bulk3D:
             m = -(-n // ranks)
             idx = rank * m + np.arange(m)
             share = jnp.take(jnp.asarray(rq), jnp.asarray(np.minimum(idx, n - 1)), axis=0)
+            live = jnp.asarray(idx < n)
+            if outside_sphere is not None:
+                live = live & (jnp.einsum('qi,qi->q', share, share) > outside_sphere)
             sums.append(_screened_sums(
                 share, S, None if extra_chi_rows is None else extra_chi_rows(share),
-                jnp.asarray(idx < n)))
+                live))
             counts.append(n)
         total = np.asarray(multihost_utils.process_allgather(
             np.asarray(jnp.stack(sums), dtype=np.complex128), tiled=False)).sum(axis=0)
@@ -208,6 +285,11 @@ class Bulk3D:
         (``qmc_reps x nsamples x 3`` float64, 63 MB at the defaults) and one
         batch's [Z, n] complex rows live only for this call.
         """
+        if analytic_sphere and extra_chi_rows is not None:
+            raise NotImplementedError(
+                'GATE bulk_q0_sphere_extra_chi_unavailable: the finite-q '
+                'response needs a matched radial sphere integral; use the '
+                'raw draw with explicit refinement controls')
         nkx, nky, nkz = (int(s) for s in kgrid)
         batches = _sample_q0_minibz_qpoints(
             geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
@@ -215,7 +297,15 @@ class Bulk3D:
         )
         vc0_mean = self._vc0_mean(geometry, (nkx, nky, nkz), batches,
                                   analytic_sphere).astype(jnp.complex128)
-        wcoul0 = self._screened_means(batches, list(S_carts), extra_chi_rows, shared=True)
+        S_carts = list(S_carts)
+        if analytic_sphere:
+            r2 = minibz_inscribed_sphere_r2(geometry.bvec, (nkx, nky, nkz))
+            wcoul0 = self._screened_means(batches, S_carts, extra_chi_rows,
+                shared=True, outside_sphere=r2)
+            sphere = _analytic_sphere_bare_head(r2, geometry.cell_volume, nkx*nky*nkz)
+            wcoul0 = wcoul0 + sphere*_interband_sphere_factor(S_carts)
+        else:
+            wcoul0 = self._screened_means(batches, S_carts, extra_chi_rows, shared=True)
         return vc0_mean, list(np.asarray(wcoul0, dtype=np.complex128))
 
     def q0_average_transverse_tensor(

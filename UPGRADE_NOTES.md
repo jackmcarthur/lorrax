@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — analytic bulk heads use the same sphere split for v and W
+
+With `head_minibz_average=true`, direct interband screened heads now remove
+the same inscribed sphere from the draw as the bare head and add its exact
+radial integral times a converged dielectric angular average. Previously
+W stayed on the raw draw while v used the analytic sphere, creating a
+nonzero W−v even at zero response. The static Thomas–Fermi and legacy
+isotropic branches also use their matched sphere integrals. Opt-in head
+results change; raw nonanalytic sampling is unchanged. Angular failure
+refuses by name. A finite-q `extra_chi` response now refuses analytic-sphere
+averaging until its matched radial/Lindhard owner exists; use explicit raw
+draw/refinement controls for that reference scope. No default deck changes.
+
 ## 2026-10-06 — a response sample near the top of its interval builds instead of refusing
 
 The shared-pole χ response rule refused a line sample high in its own
