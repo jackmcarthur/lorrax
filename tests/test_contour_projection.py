@@ -7,6 +7,7 @@ from jax.sharding import Mesh,NamedSharding,PartitionSpec as P
 
 from common.units import RYD_TO_EV
 from gw.contour_reference import project_interaction_diagonal
+from gw import contour_reference as cd
 
 
 @pytest.fixture
@@ -90,6 +91,70 @@ def test_isdf_legacy_arithmetic_and_plane_wave_volume_unit_conversion(mesh):
     expected_ev=independent_projection(-operator,pair,1/(nk*volume))*RYD_TO_EV
     np.testing.assert_allclose(np.asarray(pw)*RYD_TO_EV,expected_ev,rtol=3e-13,atol=3e-14)
     np.testing.assert_allclose(np.asarray(isdf)/volume,pw,rtol=3e-13,atol=3e-14)
+
+
+@pytest.mark.parametrize('convention',['time_ordered_fractional','retarded'])
+def test_gamma_pw_full_pole_integral_uses_reciprocal_partner_not_plain_conjugation(mesh,convention):
+    """A physical ordered Lehmann field, independently integrated after projection.
+
+    In reciprocal coordinates the real-space transpose is P_-G W^T P_-G.
+    Its scalar contraction is W projected with conjugate(pair[-G]). Both
+    spectral residues are PSD/Hermitian, yet generally distinct at Γ when
+    time reversal is absent. No fitted response/model supplies the oracle.
+    """
+    rng=np.random.default_rng(1020226);negative=np.array([0,2,1,3])
+    vectors=rng.normal(size=(4,2))+1j*rng.normal(size=(4,2))
+    # Logical G=(0,+g,-g), fourth slot is a carrier ghost. The Γ charge
+    # body has a zero G0 row/column; no planted head is smuggled into Wc.
+    vectors[[0,3]]=0
+    positive=.002*vectors@vectors.conj().T
+    negative_residue=positive.T[np.ix_(negative,negative)]
+    pair=rng.normal(size=(1,2,4))+1j*rng.normal(size=(1,2,4))
+    pair[...,3]=0
+    reverse=pair[...,negative].conj()
+    eta=.25/RYD_TO_EV;omega=.4;prefactor=1/(512*137.)
+    queries=np.array([-.6,-.4,-.1,0.,.1,.4,.6])
+    x=np.broadcast_to(queries[None,None,:,None],(1,1,len(queries),2))
+    f=np.broadcast_to(np.array([1.,.25])[None,None,None,:],x.shape)
+    u,w=cd.imaginary_rule(192,eta,scale=omega)
+    crossing=np.unique(abs(x)[np.where(x<0,f,1-f)!=0])
+    z=np.concatenate(([1j*eta],1j*u,crossing+1j*eta))
+    field=(-positive[None]/(z-omega)[:,None,None]
+           +negative_residue[None]/(z+omega)[:,None,None])
+    repeated=np.broadcast_to(pair,(len(z),2,4))
+    _,sample=project_interaction_diagonal(face(field,mesh),face(repeated,mesh),mesh=mesh,
+        prefactor=prefactor,scalar_replication_bound_bytes=len(z)*2*16)
+    _,partner=project_interaction_diagonal(face(field,mesh),
+        face(np.broadcast_to(reverse,repeated.shape),mesh),mesh=mesh,
+        prefactor=prefactor,scalar_replication_bound_bytes=len(z)*2*16)
+    _,wrong=project_interaction_diagonal(face(field,mesh),face(repeated.conj(),mesh),mesh=mesh,
+        prefactor=prefactor,scalar_replication_bound_bytes=len(z)*2*16)
+    anchor_slope=(positive/(1j*eta-omega)**2-negative_residue/(1j*eta+omega)**2)/(2j*eta)
+    _,derivative=project_interaction_diagonal(face(anchor_slope[None],mesh),face(pair,mesh),
+        mesh=mesh,prefactor=prefactor,scalar_replication_bound_bytes=32)
+    sample=np.asarray(sample)[:,None,None,None,:]
+    partner=np.asarray(partner)[:,None,None,None,:]
+    wrong=np.asarray(wrong)[:,None,None,None,:]
+    derivative=np.asarray(derivative)[0][None,None,None,:]
+    kwargs=dict(eta=eta,analytic_convention=convention)
+    anchor,cp,cm,beta=cd.anchor_part(sample[0],derivative,x,f,**kwargs)
+    remainder=np.zeros_like(anchor)
+    for i,(ui,wi) in enumerate(zip(u,w),1):
+        remainder+=cd.imag_remainder_node(sample[i],ui,wi,x,f,cp,cm,beta,**kwargs)
+    total=anchor+remainder;bad=total.copy()
+    for i,node in enumerate(crossing,1+len(u)):
+        total+=cd.real_residue_node(sample[i],partner[i],x,f,node,**kwargs)
+        bad+=cd.real_residue_node(sample[i],wrong[i],x,f,node,**kwargs)
+    # Literal finite-G spectral projections are independent of matmul and CD.
+    rp=independent_projection(positive[None],pair,prefactor)[0].real
+    rm=independent_projection(negative_residue[None],pair,prefactor)[0].real
+    sheet=-1 if convention=='time_ordered_fractional' else 1
+    expected=np.sum(rp[None,None,None,:]*(1-f)/(x-omega+1j*eta)
+        +rm[None,None,None,:]*f/(x+omega+sheet*1j*eta),axis=-1)[:,:,None,:]
+    assert np.max(abs(total-expected))/np.max(abs(expected))<2e-7
+    assert np.max(abs(bad-expected))/np.max(abs(expected))>1e-3
+    assert np.max(abs(positive-positive.T))>.001
+    assert np.max(abs(positive-negative_residue))>.001
 
 
 @pytest.mark.parametrize('prefactor',[0.,-1.,np.nan,np.inf])
