@@ -294,12 +294,14 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     whole[family]=model
                     execution_rows[family]['decoupled']=model['decoupled']
                     used_room(execution_rows[family],model['budget'])
+                    # Every device array the sector holds; after the CT pencils, all but its
+                    # selection panels and span (release_selection_panels).
                     held_rows.append(ledger.reserve(f"sector.decoupled.held.{name}",
-                        resident_bytes_per_rank=row_bytes((model['model'],model['signed'],model['coefficients'],
-                            model['infinity'],tuple(s[1:] for s in model['states']))),
+                        resident_bytes_per_rank=row_bytes(model),
                         workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)['stage'])
                     kept_rows.append(ledger.reserve(f"sector.decoupled.kept.{name}",
-                        resident_bytes_per_rank=row_bytes((model['model'],model['signed'])),
+                        resident_bytes_per_rank=row_bytes({k:v for k,v in model.items()
+                                                           if k not in RELEASED_SELECTION}),
                         workspace_bytes_per_rank=0,concurrent_with=upstream)['stage'])
                     ledger.live_stages=(*upstream,*held_rows)
                     reduction,zero,_,_=model['diagnostics']
@@ -329,11 +331,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 release=lambda:release_selection_panels(whole))
         execution_rows[0]['joint']['decoupled' if cross_all is not None else 'decoupled_refused']=cross_receipt
         if cross_all is not None:
-            # CT's all-parent models and signed factors stay live through the rounds' writes.
-            ct_row=ledger.reserve("sector.decoupled.held.CT",
-                resident_bytes_per_rank=row_bytes((cross_all['models'],cross_all['signed'])),
-                workspace_bytes_per_rank=0,concurrent_with=(*upstream,*kept_rows))['stage']
-            round_upstream=ledger.live_stages=(*upstream,*kept_rows,ct_row)
+            # CT's all-parent outputs stay live through the rounds (construct_cross_sector_all's row).
+            round_upstream=ledger.live_stages=(*upstream,*kept_rows,cross_all['held_row'])
     while rounds:
         ids,real,slots,execution=rounds.pop(0)
         face=execution=='face'
@@ -433,7 +432,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         signed=(tuple((s['signed'][0],s['signed'][0],*s['signed'][1:]) for s in sectors)
                 +(cross['signed'],))
         budget=cross['budget']
-        budget.retained_panels=tuple(jax.tree.leaves((models,signed,treatment_masks)))
+        # Every array this round holds: its sector and CT slices (models, signed factors,
+        # vectors, diagnostics) and the treatment masks.
+        budget.retained_panels=tuple(a for a in jax.tree.leaves((sectors,cross,models,signed,treatment_masks))
+                                     if hasattr(a,'sharding'))
         budget.live(())
         # Each held tile is read, scored, and released before the next support.
         held_rows={name:[] for name in ('CC','TT','CT')}
@@ -1058,12 +1060,17 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
                 recipe=recipe,budget=budget,execution='face',decoupled=receipt)
 
 
+#: What ``release_selection_panels`` drops from a decoupled diagonal sector.
+RELEASED_SELECTION=('states','infinity','coefficients')
+
+
 def release_selection_panels(whole):
     """Drop the diagonal sectors' selection panels (node, Q, O, infinity) and spans once the
     decoupled CT pencils are built: the rounds read only the sectors' models and signed factors
     (treatment, held checks, writes), so their device bytes return before the CT eighs."""
     for sector in whole:
-        sector['states']=sector['infinity']=sector['coefficients']=None
+        for key in RELEASED_SELECTION:
+            sector[key]=None
 
 
 def slice_sector(sector, slots, mesh_xy):
@@ -1194,10 +1201,17 @@ def construct_cross_sector_all(whole, read, meta, config, *, mesh_xy, sample_ids
     models,zero=positive_cross_models(signed,mesh_xy=mesh_xy)
     if not bool(jnp.all(zero['zero_policy'][:nq])):
         raise ValueError('GATE shared_pole_sector_zero_ritz: sector=CT')
+    # Every parent's CT outputs stay live through the rounds' treatment, held checks and
+    # writes: one row, beside which each round's own arrays are priced (the budget's upstream).
+    from gw.shared_pole_capacity import _shard_bytes
+    unique={id(a):a for a in jax.tree.leaves((models,signed,diagnostics,zero)) if hasattr(a,'sharding')}
+    held_row=ledger.reserve("sector.decoupled.held.CT",
+        resident_bytes_per_rank=sum(_shard_bytes(a) for a in unique.values()),
+        workspace_bytes_per_rank=0,concurrent_with=released)['stage']
     local_meta=copy.copy(meta)
     local_meta.n_rmu_padded=sum(rows)
     budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
-        mesh_xy=mesh_xy,ledger=ledger,upstream=released,execution='face')
+        mesh_xy=mesh_xy,ledger=ledger,upstream=(*released,held_row),execution='face')
     budget.batch_width=int(width)
     replicated=NamedSharding(mesh_xy,P())
     receipt.update(admitted=stack_row['device_budget_status']=='PASS',
@@ -1206,7 +1220,7 @@ def construct_cross_sector_all(whole, read, meta, config, *, mesh_xy, sample_ids
     return dict(models=models,signed=signed,
                 diagnostics=jax.tree.map(lambda a:device_put_process_local(a,replicated),diagnostics),
                 zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget,
-                decoupled=receipt),receipt
+                held_row=held_row,decoupled=receipt),receipt
 
 
 def slice_cross(cross, slots, mesh_xy):
