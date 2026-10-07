@@ -316,6 +316,13 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 sample_ids=dense_fit,nq=int(header['n_q_irr']),width=batch_width,program_bytes=sizes.get('CT'),
                 upstream=round_upstream)
             execution_rows[0]['joint']['decoupled']=cross_all['decoupled']
+            # CT's all-parent models and signed factors stay live through the rounds' writes: a row.
+            from gw.shared_pole_capacity import _shard_bytes
+            unique={id(a):a for a in jax.tree.leaves((cross_all['models'],cross_all['signed'])) if hasattr(a,'sharding')}
+            round_upstream=(*round_upstream,ledger.reserve("sector.decoupled.held.CT",
+                resident_bytes_per_rank=sum(_shard_bytes(a) for a in unique.values()),
+                workspace_bytes_per_rank=0,concurrent_with=round_upstream)['stage'])
+            ledger.live_stages=round_upstream
     while rounds:
         ids,real,slots,execution=rounds.pop(0)
         face=execution=='face'
