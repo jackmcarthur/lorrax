@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — the sector W(τ) right operand is formed once per Σ call; one reduce-scatter for CC's band brackets
+
+On the axis route (replicated pole columns), the W(τ) synthesis transposed and conjugated
+the τ-invariant right factor at every τ node. That was a copy of 2.1 / 4.9 / 16.5 GB per node
+for CC / TT / CT at CrI3 24×24 P64. `sector_synthesis` now forms the GEMM's right operand
+once (`shared_pole_right_operand`). The mixed sector's partner conj(b_X) d b_Yᵀ is built as
+conj(b_X conj(d) b_Y†), from the same operands at conjugate weights, as the Green's partner
+already is (`right_formed=True`; memory-neutral, since it replaces the factor). The CC
+sector's band brackets now reduce in one reduce-scatter (`BandProjector.finish(stacked=True)`),
+not one per bracket. eqp is unchanged on CrI3 6×6 and Fe 4³ (claim 3755). No deck change.
+
 ## 2026-10-07 — the TT, CT and TC sector Greens contract only each window's live bands
 
 The CC sector's band brackets already built each Green through the active-range GEMM over

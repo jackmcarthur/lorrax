@@ -450,8 +450,13 @@ class BandProjector:
         rows = None if rows is None else tuple(int(v) for v in rows)
         return self._accumulate(faces, O, acc, rows=rows)
 
-    def finish(self, acc):
+    def finish(self, acc, *, stacked=False):
+        """Reduce the partial once.  ``stacked``: ``acc`` holds several single-channel
+        partials on its leading axis (a Σ call's band brackets); all of them come back
+        on that axis from the one reduce-scatter."""
         out = self._finish(acc)
+        if stacked:
+            return out
         return out[0] if self.channels == "none" else (out[0], out[1])
 
     def __call__(self, psi_left, O, psi_right):
