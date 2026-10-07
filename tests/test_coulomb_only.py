@@ -90,3 +90,27 @@ def test_coulomb_only_refuses_transverse_head_in_programmatic_config(tmp_path):
 def test_unknown_interaction_refuses(tmp_path):
     with pytest.raises(ValueError, match="not a known mode"):
         config(tmp_path, "bispinor = true\nbispinor_gw = coulomb_oly\n")
+
+
+@pytest.mark.parametrize("changes", [
+    {"bispinor": False},
+    {"bispinor_gw": BispinorGWMode.BARE_TRANSVERSE},
+    {"bispinor_gw": BispinorGWMode.FULL_SHARED_POLE},
+    {"sys_dim": 2},
+    {"sys_dim": 0},
+])
+@pytest.mark.parametrize("restart", [False, True])
+def test_augmentation_domain_checked_for_programmatic_configs(tmp_path, changes, restart):
+    cfg = config(tmp_path, "bispinor = true\nbispinor_gw = coulomb_only\n"
+                 "compute_mode = x_only\n")
+    cfg = replace(cfg, paths=replace(cfg.paths, atomic_reconstruction_dir="atomic-data"),
+                  restart=restart, **changes)
+    with pytest.raises(ValueError, match="GATE atomic_augmentation_domain"):
+        refuse_unsupported_bispinor_gw(cfg)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_augmentation_domain_keeps_coulomb_only_supported(tmp_path, restart):
+    cfg = config(tmp_path, "bispinor = true\nbispinor_gw = coulomb_only\n"
+                 "compute_mode = x_only\natomic_reconstruction_dir = atomic-data\n")
+    refuse_unsupported_bispinor_gw(replace(cfg, restart=restart))

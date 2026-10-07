@@ -2957,15 +2957,6 @@ def _apply_input_envelope(
     refuse_unsupported_bgw_metal_q0_treatment(resolved)
     refuse_unsupported_screening_diagrams(resolved)
     refuse_unsupported_bispinor_gw(resolved)
-    if resolved.paths.atomic_reconstruction_dir:
-        if (not resolved.bispinor
-                or resolved.bispinor_gw is not BispinorGWMode.COULOMB_ONLY
-                or int(resolved.sys_dim) != 3):
-            raise ValueError(
-                "GATE atomic_augmentation_domain: atomic_reconstruction_dir "
-                "requires bispinor=true, bispinor_gw=coulomb_only and sys_dim=3. "
-                "The local correction is certified for ordinary 3D Coulomb; "
-                "transverse and truncated kernels require their own compensation.")
     warn_headless_shared_pole_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
         _named_keys, resolved.compute_mode, resolved.qp_solver,
@@ -3795,6 +3786,18 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/dev/gw_config_contracts.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    # The parser and fresh/restart orchestration call this same preflight.
+    # A programmatically replaced config must not stamp atomic augmentation
+    # on the incumbent current producer, whose endpoints have another frame.
+    if getattr(getattr(config, "paths", None), "atomic_reconstruction_dir", None):
+        if (not config.bispinor
+                or mode is not BispinorGWMode.COULOMB_ONLY
+                or int(config.sys_dim) != 3):
+            raise ValueError(
+                "GATE atomic_augmentation_domain: atomic_reconstruction_dir "
+                "requires bispinor=true, bispinor_gw=coulomb_only and sys_dim=3. "
+                "The local correction is certified for ordinary 3D Coulomb; "
+                "transverse and truncated kernels require their own compensation.")
     if (config.compute_mode is ComputeMode.X_ONLY
             and uses_bare_tt_gamma_head(config) and bool(config.restart)):
         raise ValueError(

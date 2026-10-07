@@ -275,6 +275,9 @@ rulings override anything here.
 - **`refuse_unsupported_bispinor_gw`** validates the four-current modes and
   requires live direct fields for bispinor QSGW
   (`GATE bispinor_self_consistency_requires_live_four_current`).
+  It also enforces `GATE atomic_augmentation_domain` at parsing and
+  fresh/restart orchestration, including programmatically replaced configs:
+  atomic reconstruction requires four-component ordinary 3D Coulomb.
   `refuse_unsupported_bispinor_tt_head_correction` guards hand-built configs
   only: `bispinor_tt_head_correction` is not a deck key.
 - **`scalar_head_overrides_named`** formats the scalar-head overrides the deck
