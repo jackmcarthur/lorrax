@@ -5,6 +5,12 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — complete target-block projections require the full run mesh
+
+The opt-in `project_interaction_block` now checks square X/Y membership
+against the common canonical full-global mesh before projection. Proper
+subsets refuse; diagonal defaults and numerical contractions are unchanged.
+
 ## 2026-10-07 — bounded reference projections retain complete target blocks
 
 `gw.contour_reference.project_interaction_block` retains every target-pair

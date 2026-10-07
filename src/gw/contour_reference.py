@@ -240,7 +240,14 @@ def project_interaction_block(interaction, pair, *, mesh, n_targets,
     That transpose is distinct from an adjoint or a causal conjugation.
     """
     import jax.numpy as jnp
+    from common.collectives import resolve_mesh
 
+    # The common owner resolves the full square run mesh; caller-mesh
+    # validation alone permits a proper subset and cannot certify all-P.
+    if (mesh.device_set != resolve_mesh().device_set
+            or tuple(mesh.axis_names) != ("x", "y")
+            or int(mesh.shape["x"]) != int(mesh.shape["y"])):
+        raise ValueError("CD block projection mesh must cover every global JAX device on the square X/Y grid")
     if (not isinstance(n_targets, (int, np.integer))
             or isinstance(n_targets, (bool, np.bool_)) or n_targets < 1):
         raise ValueError("CD block projection needs an exact positive target count")
