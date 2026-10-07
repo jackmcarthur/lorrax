@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — Sigma broadening documentation states the occupied and empty sheets
+
+The input reference and denominator-box docstring now describe the existing
+time-ordered prescription: occupied pole denominators have `-i eta`, empty
+ones `+i eta`. The previous description called this retarded. The separate
+contour reference explicitly selects either this convention or retarded
+`+i eta` on both branches. Numerical formulas, defaults, decks and stores
+are unchanged; match the convention before comparing imaginary self-energies.
+
 ## 2026-10-07 — guarded native parent coefficients can feed the existing ζ fit
 
 `common.psi_G_store.load_parent_psi_G` has optional `band_reader` and

@@ -313,7 +313,11 @@ def make_sigma_box_spec(
     pole_sign
         ``+1`` for conduction denominators and ``-1`` for valence.
     eta_ry
-        Positive retarded broadening in Ry.
+        Positive denominator damping magnitude in Ry. The Sigma consumer
+        conjugates the valence rule: occupied pole denominators use
+        ``x + Omega - i eta`` and empty ones ``x - Omega + i eta``. This is
+        the time-ordered convention; the separately declared retarded
+        contour reference uses ``+i eta`` on both branches.
 
     Returns
     -------
