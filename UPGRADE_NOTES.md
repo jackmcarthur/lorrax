@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — stable analytic Fermi–Dirac surface weight for finite-H references
+
+The opt-in `gw.efermi.fd_negative_derivative` returns `-df/dE` in Ry^-1 at
+the same fixed chemical potential and kBT as the FD occupation owner. Both
+occupation and complement use its stable sigmoid independently; a deep
+occupied table entry can round to one while the analytic weight stays
+representable. It does not differentiate the rounded table, change any
+occupations or introduce a tail cut. Optional canonical native-band validity
+sets ghosts to exact zero before evaluation. No existing caller or default
+calculation changes; no deck key is added.
+
 ## 2026-10-07 — the CT sector reduces every parent at once; decoupled eigh rows carry their own programs; the free-memory check only warns
 
 Beside the decoupled CC and TT, CT now assembles each face round's joint

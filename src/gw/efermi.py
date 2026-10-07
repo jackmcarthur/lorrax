@@ -92,6 +92,7 @@ __all__ = [
     "occupation_clamp_tol", "occupation_digest", "occupation_floor_reach_ry",
     "occupied_band_count", "resolve_sigma_efermi_ry",
     "solve_mp1_occupations", "solve_smearing_occupations", "fd_occupations",
+    "fd_negative_derivative",
     "step_occupations",
 ]
 
@@ -426,6 +427,49 @@ def fd_occupations(E_kn, chemical_potential, broadening_ry):
         (jnp.asarray(chemical_potential, dtype=jnp.float64)
          - jnp.asarray(E_kn, dtype=jnp.float64))
         / jnp.asarray(broadening_ry, dtype=jnp.float64))
+
+
+@jax.jit
+def _fd_negative_derivative_kernel(E_kn, chemical_potential, broadening_ry,
+                                   valid_kn=None):
+    energy = jnp.asarray(E_kn, dtype=jnp.float64)
+    if valid_kn is not None:
+        energy = jnp.where(valid_kn, energy, chemical_potential)
+    occupied = fd_occupations(energy, chemical_potential, broadening_ry)
+    empty = fd_occupations(-energy, -chemical_potential, broadening_ry)
+    derivative = occupied * empty / broadening_ry
+    return derivative if valid_kn is None else jnp.where(valid_kn, derivative, 0.)
+
+
+def fd_negative_derivative(E_kn, chemical_potential, broadening_ry, *,
+                           valid_kn=None):
+    """Return the analytic FD surface weight ``-df/dE`` in Ry^-1.
+
+    Energies, the fixed chemical potential, and kBT are in Ry. Both tails
+    use the stable occupation owner: ``f(E) f(-E; -mu) / kBT``. In particular,
+    the complement is evaluated independently, rather than subtracting a
+    stored occupation from one. A deep occupied entry may round to exactly
+    one while its analytic surface weight remains representable. This is
+    the derivative of the continuous FD law, not a finite difference of its
+    rounded binary64 table; no occupation or tail cutoff is changed.
+
+    The optional boolean physical-band mask has the energy table's shape.
+    Invalid energies are not evaluated and receive an exact zero weight.
+    Scalar validation is at this host boundary; the device kernel reads no
+    energies back and preserves the table's layout.
+    """
+    shape = tuple(np.shape(E_kn))
+    if len(shape) != 2 or min(shape, default=0) < 1:
+        raise ValueError("fd_negative_derivative: E_kn must be nonempty (nk, nb)")
+    mu, width = float(chemical_potential), float(broadening_ry)
+    if not np.isfinite(mu):
+        raise ValueError("fd_negative_derivative: chemical potential must be finite (Ry)")
+    if not np.isfinite(width) or width <= 0.:
+        raise ValueError("fd_negative_derivative: kBT must be finite and positive (Ry)")
+    if valid_kn is not None:
+        from .wavefunction_bundle import _validate_valid_kn
+        _validate_valid_kn(E_kn, valid_kn)
+    return _fd_negative_derivative_kernel(E_kn, mu, width, valid_kn)
 
 
 def _mp1_negative_derivative_values(E, chemical_potential, broadening):
