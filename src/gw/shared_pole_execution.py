@@ -820,14 +820,16 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
 
 
 def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, ordered, odd_moments,
-                          keep_budget, retain_span=False, gram_keep=None, carrier=None):
+                          keep_budget, retain_span=False, gram_keep=None, carrier=None, eigh_rows=None):
     """All ``nq`` parents' ordered reduction: stage programs over ``width`` parents at a
     time, each eigh over the whole stack. ``eigh_plans`` are the three stacks' plans
     (H'_vv, Schur, reduced), each carrying the room beside its own boundary stack
     (``face_eigh``), so distrib_la runs each one whole matrix per rank where that fits.
     ``states`` is the caller's list: the derivative panels (dW Q) enter the pencil only,
     so after the first stage each entry keeps (node, Q, O) and they are released before
-    the eighs. Returns what ``face_reduce_round`` returns, for every parent."""
+    the eighs. ``eigh_rows(k)`` (optional) is the caller's context that prices eigh
+    stack k (its ledger row) while it runs. Returns what ``face_reduce_round`` returns,
+    for every parent."""
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
@@ -844,23 +846,25 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
         new = run(program, stage, *operands)
         return {**{k: stage[k] for k in passthrough[name]}, **new}
     from common import timing
+    from contextlib import nullcontext
+    priced = eigh_rows or (lambda k: nullcontext())
     # One timing section per stage and eigh: the report gives each its wall and pool high-water.
     with timing.section('decoupled.members'):
         stage = run(stage1, *inputs)
     infinity = inputs[6]
     del inputs
     states[:] = [s[:3] for s in states]
-    with timing.section('decoupled.eigh_hvv'):
+    with timing.section('decoupled.eigh_hvv'), priced(0):
         gamma, u = hvv_eigh(_hermitian_stack(mesh)(stage['h_vv']))
     with timing.section('decoupled.keep'):
         stage = advance('keep', stage2, stage, gamma, u)
     del gamma, u
-    with timing.section('decoupled.eigh_schur'):
+    with timing.section('decoupled.eigh_schur'), priced(1):
         gamma_r, u_r = schur_eigh(stage['schur'])
     with timing.section('decoupled.paired'):
         stage = advance('paired', stage3, stage, gamma_r, u_r)
     del gamma_r, u_r
-    with timing.section('decoupled.eigh_reduced'):
+    with timing.section('decoupled.eigh_reduced'), priced(2):
         mu, rotation = reduced_eigh(stage['reduced'])
     with timing.section('decoupled.output'):
         result = run(stage4, stage, mu, rotation, infinity)
