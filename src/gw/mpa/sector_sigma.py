@@ -257,8 +257,7 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     from common.fft_helpers import make_kconv_lorentz_unfold
     from common.gamma_matrices import gamma_perm_phase_host
     from gw.cohsex_sigma import lorentz_class_vertices
-    from gw.greens_function_kernel import (build_G_parents, build_G_tau, _weighted_tau_phases,
-                                           has_antiunitary_rows)
+    from gw.greens_function_kernel import build_G_tau, has_antiunitary_rows
     from gw.ppm_tau_kernel import bracket_selectors
     from symmetry_maps import device_load_tables
     from gw.subtile_stream import (orbit_cuts, plan_windows, scan_passes, window_green_rows,
@@ -300,10 +299,10 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     # One window shape for every pass: host tables give the shapes, each pass
     # reads the placed tables' cut (subtile_stream.window_load).
     cut = (lambda t, k: t) if whole else (lambda t, k: window_tables(t, R, px, k))
-    # A bracket's Green contracts only its own bands (the active-range GEMM).
+    # Every Green contracts only its window's live bands (the active-range GEMM): a
+    # bracket's own, else the window's (TT, CT, TC: 130-622 of 752 bands at CrI3 24x24).
     gemm = gemm_plan(mesh_xy, m=px * R * ns, k=nb, n=n * ns, nq=n_parent,
-                     dtype=jnp.complex128, layout='axis', warmup=False,
-                     **({} if selectors is None else dict(enable_active_range=True)))
+                     dtype=jnp.complex128, layout='axis', warmup=False, enable_active_range=True)
     kconv = tuple(make_kconv_lorentz_unfold(
         mesh_xy, kgrid, cut(g_tables, ns), left_vertices=vertices[0],
         right_vertices=vertices[1], store_rows=plans[0].parent_full_rows,
@@ -330,9 +329,7 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions, loads):
         # xn, xr: the left band-complete ψ rows and projection rows; yr, yn: the
         # right Green operand and projection operand; ``loads`` the placed tables.
-        if selectors is None:
-            phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference, band_weight=weight)
-        else:
+        if selectors is not None:
             bracketed = bracket_selectors(weight, selectors)
         hole = int(interactions.hole)
         g_load, w_load = loads[0], loads[1][hole]
@@ -348,8 +345,10 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
 
         def one_pass(acc, W, Wt, rows, left_p, g_pass, w_pass, rows_live=None):
             if selectors is None:
-                green = build_G_parents(rows, None, phases=phases, layout='axis', gemm=gemm,
-                                        k_unfold_plan=plans[0], real_weights=False, right=yr)
+                green = build_G_tau(rows, None, energies, 1j*time, e_ref=reference,
+                                    band_weight=weight, layout='axis', gemm=gemm,
+                                    k_unfold_plan=plans[0], trim_zero_bands=True, unfold=False,
+                                    real_weights=False, right=yr)
                 return contract(acc, green, W, Wt, left_p, g_pass, w_pass, rows_live)
             out = []
             for b, (sel, band_range, live) in enumerate(zip(*bracketed)):

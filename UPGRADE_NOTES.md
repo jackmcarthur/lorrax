@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — the TT, CT and TC sector Greens contract only each window's live bands
+
+The CC sector's band brackets already built each Green through the active-range GEMM over
+their own bands. TT, CT and TC built theirs densely over all bands in every window: 752 at
+CrI3 24×24, where a window holds 130–622 live ones. `sector_node` now builds every Green with
+`build_G_tau(trim_zero_bands=True)` through the active-range GEMM. On CrI3 6×6 P4 the Σ τ
+sweep fell from 34.6 / 45.1 / 42.0 s to 28.5 / 36.4 / 32.0 s; Fe 4³ moved +5 %. eqp moved at
+round-off (claim 3739). No deck change.
+
 ## 2026-10-07 — the decoupled selection gets its own eigh room and the widest sub-batch that keeps route (c)
 
 The decoupled CC/TT selection capped its eigh room by the face round's room. The
