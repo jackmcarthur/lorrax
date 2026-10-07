@@ -238,12 +238,13 @@ def route_summary(mode, receipt):
     decoupled = receipt.get("decoupled")
     if decoupled is not None:
         price += (f"; decoupled: {decoupled['parents']} parents in sub-batches of {decoupled['sub_batch']}, "
-                  f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh rooms (H'_vv, Schur, reduced) "
+                  f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh rooms "
                   + "/".join("none" if r is None else f"{r / 1e9:.1f}" for r in decoupled['eigh_room_bytes_per_rank'])
                   + " GB/rank, "
                   + ("every eigh once over the stack" if decoupled['admitted']
                      else "stacks over budget: face rounds over the stacked panels")
-                  + f", max |ZAZ-I|/sqrt(R) keep {decoupled['keep_residual']:.1e} paired {decoupled['paired_residual']:.1e}"
+                  + f", max |ZAZ-I|/sqrt(R) {decoupled['keep_residual']:.1e}"
+                  + (f" / {decoupled['paired_residual']:.1e}" if 'paired_residual' in decoupled else "")
                   + f" ({decoupled['paired_iterations']} Newton-Schulz iteration(s))")
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
@@ -846,6 +847,17 @@ def decoupled_stage_bytes(*, nq, ranks, side, carrier, packed, held, dw_panels, 
     return stacks + int(held) + int(dw_panels) + int(program), boundaries
 
 
+def decoupled_cross_bytes(*, nq, ranks, side, rows):
+    """Per-rank bytes of the decoupled CT of ``nq`` parents at joint ``side`` K with output
+    ``rows`` (n_C, n_T): ``(stacks, boundaries)``, the pencil stack (metric, value, O_C, O_T)
+    beside the keep stage's (Y^H V Y, Y), and the two eighs' boundaries (the metric beside the
+    pencil, the Ritz step beside (Y^H V Y, Y, O_C, O_T))."""
+    per_rank = lambda b: -(-int(b) * int(nq) // int(ranks))
+    side, rows = int(side), sum(int(r) for r in rows)
+    pencil, keep = 16 * (2 * side * side + rows * side), 16 * 2 * side * side
+    return per_rank(pencil + keep), (per_rank(pencil), per_rank(keep + 16 * rows * side))
+
+
 def _device_free_bytes():
     """This process's free device pool bytes (limit minus in use), or None off a pool (CPU)."""
     stats = jax.local_devices()[0].memory_stats() or {}
@@ -931,3 +943,65 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     model, signed, diagnostics = result[:3]
     output = model, signed, model[1:], diagnostics
     return (*output, result[3]) if retain_span else output
+
+
+# ---- the decoupled CT: every parent's joint pencil, each eigh once over the stack ----
+#
+# A CT round assembles the C-by-T pencil from that round's samples, which stay per round;
+# the joint [K, K] pencils (metric, value) and the two output panels are stacked for every
+# parent, and the joint reduction's two eighs (the metric's keep cut, the Ritz step) run once
+# over the stack, its two GEMM stages over sub-batches, as the diagonal sectors do.
+
+
+@lru_cache(maxsize=None)
+def cross_pencil_program(mesh):
+    """The CT joint pencil (metric, value, O_C, O_T) of a face round, no eigh."""
+    from gw.shared_pole_sectors import _cross_pencil_equations
+    return face_program(partial(_cross_pencil_equations, mm=face_matmul(mesh),
+                                matrix_sharding=NamedSharding(mesh, P(None, "x", "y"))), mesh)
+
+
+@lru_cache(maxsize=None)
+def _cross_stage_programs(mesh):
+    from gw.shared_pole_sectors import joint_keep_stage, joint_output_stage
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    mm = face_matmul(mesh)
+    ms = NamedSharding(mesh, P(None, 'x', 'y'))
+    flat = lambda d: {k: v for k, v in d.items() if k != 'diagnostics'} | {'d_' + k: v for k, v in d['diagnostics'].items()}
+
+    # The output panels pass through the keep stage untouched: they stay the caller's stacks.
+    def keep(metric, value, oc, ot, gamma, u):
+        stage = flat(joint_keep_stage((metric, value, oc, ot), gamma, u, matmul=mm, gates=gates, matrix_sharding=ms))
+        return {k: v for k, v in stage.items() if k not in ('oc', 'ot')}
+
+    def output(stage, oc, ot, values, rotation):
+        nested = {k: v for k, v in stage.items() if not k.startswith('d_')}
+        nested['diagnostics'] = {k[2:]: v for k, v in stage.items() if k.startswith('d_')}
+        return joint_output_stage(dict(nested, oc=oc, ot=ot), values, rotation, matmul=mm)
+    return face_program(keep, mesh, outputs='mixed'), face_program(output, mesh, outputs='cross')
+
+
+def face_cross_decoupled(pencil, *, mesh, eigh_plans, width, eigh_rows=None):
+    """Every parent's CT joint reduction from the stacked ``pencil`` (metric, value, O_C, O_T):
+    the keep stage and the output stage over ``width`` parents at a time, the metric's and the
+    Ritz step's eighs once over the stack (``guarded_eigh``). Returns what the round's
+    ``reduce_cross_round`` returns, for every parent. ``eigh_rows(k)`` prices eigh k."""
+    from contextlib import nullcontext
+    from common import timing
+    priced = eigh_rows or (lambda k: nullcontext())
+    nq = int(pencil[0].shape[0])
+    keep, output = _cross_stage_programs(mesh)
+    cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
+
+    def run(program, *stacks):
+        return _assemble(mesh, nq, ((i0, program(*_take(mesh, stacks, i0, i1))) for i0, i1 in cuts))
+    with timing.section('decoupled.eigh_metric'), priced(0):
+        gamma, u = guarded_eigh(eigh_plans[0], pencil[0], mesh=mesh, label='CT metric')
+    with timing.section('decoupled.keep'):
+        stage = run(keep, *pencil, gamma, u)
+    del gamma, u
+    with timing.section('decoupled.eigh_ritz'), priced(1):
+        values, rotation = guarded_eigh(eigh_plans[1], stage.pop('reduced'), mesh=mesh, label='CT Ritz')
+    with timing.section('decoupled.output'):
+        return run(output, stage, pencil[2], pencil[3], values, rotation)
+

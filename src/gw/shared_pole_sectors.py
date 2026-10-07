@@ -300,6 +300,22 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         finally:
             round_upstream=(*upstream,*held_rows)
             ledger.live_stages=round_upstream
+    cross_all=None
+    if whole is not None:
+        def read_cross(ids,real):
+            with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+                ct=read_samples(io,(0,1),(),ids=ids,layout='face')
+                tc=read_samples(io,(1,0),tuple(ct.values()),ids=ids,layout='face')
+                cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
+                                      retained=(*ct.values(),*tc.values()),execution='face')
+                refuse_nonfinite_moment('CT',cm['M1'],real,mesh_xy=mesh_xy)
+                line_cross=[read_line(io,family,cross=True,ids=ids,layout='face') for family in (0,1)]
+            return (ct,tc),cm,line_cross
+        with timing.section('spole.sector.CT.all', announce=True):
+            cross_all=construct_cross_sector_all(whole,list(rounds),read_cross,meta,config,mesh_xy=mesh_xy,
+                sample_ids=dense_fit,nq=int(header['n_q_irr']),width=batch_width,program_bytes=sizes.get('CT'),
+                upstream=round_upstream)
+            execution_rows[0]['joint']['decoupled']=cross_all['decoupled']
     while rounds:
         ids,real,slots,execution=rounds.pop(0)
         face=execution=='face'
@@ -339,21 +355,24 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 rank0_transaction(path,stage='sector.diagonal_receipt',
                     write=lambda:path.write_text(_json(dict(identity=bank['identity'],
                         status='DIAGONAL_SPANS_ONLY',rounds=receipts))+'\n'))
-        with timing.section('spole.sector.CT', announce=True):
-            with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
-                ct=read_samples(io,(0,1),retained)
-                tc=read_samples(io,(1,0),(*retained,*ct.values()))
-                cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
-                                      retained=(*retained,*ct.values(),*tc.values()),execution=execution)
-                refuse_nonfinite_moment('CT',cm['M1'],real,mesh_xy=mesh_xy)
-                line_cross=[read_line(io,family,cross=True) for family in (0,1)]
-            cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
-                sample_ids=dense_fit,line_cross=line_cross,real=real,
-                program_bytes=sizes.get('CT') if face else None)
-            del line_cross
-            del ct,tc,cm
-            if execution=='face':
-                used_room(execution_rows[0]['joint'],cross['budget'])
+        if cross_all is not None:
+            cross=slice_cross(cross_all,ids,mesh_xy)
+        else:
+            with timing.section('spole.sector.CT', announce=True):
+                with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+                    ct=read_samples(io,(0,1),retained)
+                    tc=read_samples(io,(1,0),(*retained,*ct.values()))
+                    cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
+                                          retained=(*retained,*ct.values(),*tc.values()),execution=execution)
+                    refuse_nonfinite_moment('CT',cm['M1'],real,mesh_xy=mesh_xy)
+                    line_cross=[read_line(io,family,cross=True) for family in (0,1)]
+                cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
+                    sample_ids=dense_fit,line_cross=line_cross,real=real,
+                    program_bytes=sizes.get('CT') if face else None)
+                del line_cross
+                del ct,tc,cm
+                if execution=='face':
+                    used_room(execution_rows[0]['joint'],cross['budget'])
         if cross is None:
             # The slow fallback (owner: warn, never refuse on budget): this
             # round's parents run again as face batches, CC and TT included.
@@ -1039,8 +1058,120 @@ def slice_sector(sector, slots, mesh_xy):
     return out
 
 
+def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sample_ids, nq, width,
+                               program_bytes, upstream):
+    """CT for every parent at once beside the decoupled CC and TT (``whole``): each face round's
+    joint pencil from its own samples (``read(ids, real)``) at one compacted span for every
+    parent, written in place into one stack, then the joint reduction with each eigh once over
+    the stack (``face_cross_decoupled``), the gates and the positive models for every parent.
+    Returns what ``construct_cross_sector_round`` returns, for every parent, and a receipt."""
+    import copy
+    import jax
+    import numpy as np
+    from contextlib import contextmanager
+    from common.collectives import device_put_process_local
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from gw.gw_config import linalg_resolution
+    from gw.shared_pole_capacity import ConstructorCapacity,face_eigh_room
+    from gw.shared_pole_execution import _assemble,face_cross_decoupled,face_eigh,parent_rows
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    ledger=meta.shared_pole_capacity
+    live,held=(_cross_carriers(w,mesh_xy,'face') for w in cross_span_widths(meta,whole))
+    widths=[max(a,b) for a,b in zip(live,held)]
+    side=sum(widths)
+    rows=tuple(int(s['model'][0].shape[-2]) for s in whole)
+    from gw.shared_pole_execution import decoupled_cross_bytes
+    stacks,boundaries=decoupled_cross_bytes(nq=nq,ranks=mesh_xy.size,side=side,rows=rows)
+    # The pencil stack and the keep stage's (Y^H V Y, Y) beside it, plus one round's program.
+    stack=ledger.reserve(f"sector.decoupled.CT.stacks",
+        resident_bytes_per_rank=stacks+int(program_bytes or 0),
+        workspace_bytes_per_rank=0,concurrent_with=upstream)
+    ledger.live_stages=(*upstream,stack['stage'])
+    budgets=[]
+
+    def parts():
+        for ids,real,slots,execution in rounds:
+            sectors=[slice_sector(sec,ids,mesh_xy) for sec in whole]
+            samples,cm,line_cross=read(ids,real)
+            out=construct_cross_sector_round(sectors,samples,cm,meta,config,mesh_xy=mesh_xy,
+                sample_ids=sample_ids,line_cross=line_cross,real=real,program_bytes=program_bytes,
+                widths=widths,pencil_only=True)
+            del samples,cm,line_cross,sectors
+            budgets.append(out['budget'])
+            pencil=out['pencil']
+            yield int(ids[0]),(pencil if int(pencil[0].shape[0])==int(real)
+                               else parent_rows(mesh_xy,pencil,np.arange(int(real))))
+    try:
+        from common import timing
+        with timing.section('decoupled.pencils'):
+            pencil=_assemble(mesh_xy,int(nq),parts())
+        rooms=tuple(face_eigh_room(ledger.preview(resident_bytes_per_rank=b,workspace_bytes_per_rank=0,
+                                                  concurrent_with=upstream)) for b in boundaries)
+
+        @contextmanager
+        def eigh_row(k):
+            row=ledger.reserve(f"sector.decoupled.CT.eigh{k}.{len(ledger.entries)}",
+                               resident_bytes_per_rank=boundaries[k]+int(rooms[k] or 0),
+                               workspace_bytes_per_rank=0,concurrent_with=upstream)['stage']
+            ledger.live_stages=(*upstream,row)
+            try:
+                yield
+            finally:
+                ledger.live_stages=(*upstream,stack['stage'])
+        signed,diagnostics=face_cross_decoupled(pencil,mesh=mesh_xy,
+            eigh_plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms),width=int(width),eigh_rows=eigh_row)
+        del pencil
+    finally:
+        ledger.live_stages=upstream
+    for name in ('gram_valid','retained_metric_positive'):
+        if not bool(jnp.all(diagnostics[name][:nq])):
+            bad=np.flatnonzero(~np.asarray(diagnostics[name][:nq])).tolist()
+            raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT, parents={bad}; '
+                f"Gram min/max={float(jnp.min(diagnostics['gram_min_relative'][:nq])):.9e}; "
+                f"threshold={gates['normalized_gram_validity']['threshold']}; no repair")
+    models,zero=positive_cross_models(signed,mesh_xy=mesh_xy)
+    if not bool(jnp.all(zero['zero_policy'][:nq])):
+        raise ValueError('GATE shared_pole_sector_zero_ritz: sector=CT')
+    local_meta=copy.copy(meta)
+    local_meta.n_rmu_padded=sum(rows)
+    budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
+        mesh_xy=mesh_xy,ledger=ledger,upstream=upstream,execution='face')
+    budget.batch_width=int(width)
+    replicated=NamedSharding(mesh_xy,P())
+    return dict(models=models,signed=signed,
+                diagnostics=jax.tree.map(lambda a:device_put_process_local(a,replicated),diagnostics),
+                zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget,
+                decoupled=dict(parents=int(nq),sub_batch=int(width),pencil_side=int(side),
+                               stacks_bytes_per_rank=int(stacks),
+                               eigh_room_bytes_per_rank=rooms,admitted=stack['device_budget_status']=='PASS',
+                               keep_residual=float(np.max(np.asarray(diagnostics['metric_inverse_root_residual_relative'])[:nq])),
+                               paired_iterations=int(np.max(np.asarray(diagnostics['metric_inverse_root_iterations'])[:nq]))))
+
+
+def slice_cross(cross, slots, mesh_xy):
+    """One round's view of the CT built for every parent: the ``slots`` rows of its models,
+    signed factors, diagnostics and zero receipts; the budget passes through."""
+    from gw.shared_pole_execution import parent_rows
+    import numpy as np
+    index=np.asarray(slots,np.int64)
+    rows=lambda tree:parent_rows(mesh_xy,tree,index)
+    return dict(models=rows(cross['models']),signed=rows(cross['signed']),
+                diagnostics=rows(cross['diagnostics']),zero=rows(cross['zero']),budget=cross['budget'])
+
+
+def _cross_carriers(widths, mesh_xy, execution):
+    """Each sector's compacted CT span carrier: its width, on the face padded to the port axis."""
+    if execution != 'face':
+        return list(widths)
+    from jax.sharding import PartitionSpec as P
+    from runtime.padding import padded_axis
+    return [padded_axis(width,mesh_xy,name='shared_pole_port',
+        specs=((P('x','y'),0),(P('x','y'),1))).carrier for width in widths]
+
+
 def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
-                                 mesh_xy, sample_ids, line_cross, real, program_bytes=None):
+                                 mesh_xy, sample_ids, line_cross, real, program_bytes=None,
+                                 widths=None, pencil_only=False):
     """Run CT on the two current-map diagonal spans, keeping both outputs.
 
     ``samples=(CT,TC)`` contains the native rectangular Wc/dWc_ds rounds at
@@ -1051,6 +1182,9 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     retained-H checks, not by the scalar positive-V upper passivity bound.
     A face round is priced at CT's ``program_bytes`` (``sector_batch_width``).
     Returns None for a local round whose CT does not fit at its actual spans.
+    ``widths`` fixes the compacted spans (the decoupled CT: one joint side for every
+    round); ``pencil_only`` returns the round's joint pencil (metric, value, O_C, O_T)
+    and its budget instead of reducing it.
     """
     import copy
     import jax
@@ -1082,12 +1216,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     original_sides = tuple(s['coefficients'].shape[-2] for s in sectors)
     # The compacted span of each sector: its held width in an SC run
     # (cross_span_widths), this round's own when the held one does not fit.
-    def carrier(widths):
-        if execution != 'face':
-            return list(widths)
-        from runtime.padding import padded_axis
-        return [padded_axis(width,mesh_xy,name='shared_pole_port',
-            specs=((P('x','y'),0),(P('x','y'),1))).carrier for width in widths]
+    carrier=lambda widths:_cross_carriers(widths,mesh_xy,execution)
 
     def fits(widths):
         try:
@@ -1095,8 +1224,11 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
                 cross_original_sides=original_sides)['device_budget_status']=='PASS'
         except (ValueError,MemoryError,RuntimeError):
             return False
-    live,held=(carrier(w) for w in cross_span_widths(meta,sectors))
-    widths=held if held==live or fits(held) else live
+    if widths is None:
+        live,held=(carrier(w) for w in cross_span_widths(meta,sectors))
+        widths=held if held==live or fits(held) else live
+    else:
+        live=widths=list(widths)
     side = sum(widths)
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
     actions=[]
@@ -1122,6 +1254,11 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         budget.retained_panels=tuple(retained)
         return None
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
+    if pencil_only:
+        from gw.shared_pole_execution import cross_pencil_program
+        pencil=cross_pencil_program(mesh_xy)(*packed,tuple(actions),tuple(moments[f'M{i}'] for i in range(4)))
+        budget.retained_panels=tuple(retained)
+        return dict(pencil=pencil,budget=budget)
     cross_eigh=budget.eigenplan(side)
     signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
         tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
@@ -1399,6 +1536,13 @@ def _local_cross_parent_program(mesh,native_eigh):
 
 
 def _cross_reduce_equations(charge,transverse,cross,moments,*,mm,eigh,gates,matrix_sharding=None):
+    return reduce_sector_pencil(_cross_pencil_equations(charge,transverse,cross,moments,mm=mm,
+                                                        matrix_sharding=matrix_sharding),
+                               eigh=eigh,matmul=mm,gates=gates,matrix_sharding=matrix_sharding)
+
+
+def _cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding=None):
+    """The CT joint pencil (metric, value, O_C, O_T) on the two retained spans (plan 12.2)."""
     join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
     def pack(panels,order):
         pad=1 if matrix_sharding is None else int(matrix_sharding.mesh.shape['y'])
@@ -1418,8 +1562,7 @@ def _cross_reduce_equations(charge,transverse,cross,moments,*,mm,eigh,gates,matr
         return _matrix_layout(join((own,2*infinity[1],2*infinity[2]),axis=-1), matrix_sharding)
     cc=(charge[4],charge[5][1],diagonal(charge),otc)
     tt=(transverse[4],transverse[5][1],diagonal(transverse),oct)
-    return reduce_sector_pencil(joint_sector_pencil(cc,tt,(h,g),matmul=mm,matrix_sharding=matrix_sharding),
-                               eigh=eigh,matmul=mm,gates=gates,matrix_sharding=matrix_sharding)
+    return joint_sector_pencil(cc,tt,(h,g),matmul=mm,matrix_sharding=matrix_sharding)
 
 
 def ordered_cross_pencil(charge, transverse, cross_actions, cross_moments, *, matmul, matrix_sharding=None):
@@ -1559,11 +1702,23 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):
     Existing normalized-Gram thresholds control rank revelation; no
     cross-sector passivity or PSD repair is applied.
     """
+    gamma, u = eigh(pencil[0])
+    stage = joint_keep_stage(pencil, gamma, u, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding)
+    values, rotation = eigh(stage["reduced"])
+    return joint_output_stage(stage, values, rotation, matmul=matmul)
+
+
+# The joint CT reduction's two GEMM stages around its two eighs (``reduce_sector_pencil``
+# composes them in one program; the decoupled CT runs each stage over a batch of parents
+# and each eigh over every parent, ``shared_pole_execution.face_cross_decoupled``).
+
+def joint_keep_stage(pencil, gamma, u, *, matmul, gates, matrix_sharding=None):
+    """The metric's keep cut and its corrected basis Y; ``reduced`` (Y^H V Y, the null block at
+    the sentinel) goes to the second eigh."""
     from distrib_la import hermitian_part
     from gw.shared_pole_reduction import _metric_inverse_root
 
     metric, value, oc, ot = pencil
-    gamma, u = eigh(metric)
     top = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(top > 0, top, 1)
     valid = ((top > 0) & jnp.all(jnp.isfinite(gamma), axis=-1)
@@ -1583,14 +1738,21 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):
     # eigh symmetrizes. Its Hermitian part is what both routes solve.
     reduced = _matrix_layout(hermitian_part(matmul(y, matmul(value, y), transa="C")), matrix_sharding)
     sentinel = -(jnp.linalg.norm(reduced, axis=(-2, -1)) + 1)
-    values, rotation = eigh(reduced + null * sentinel[:, None, None])
+    return dict(reduced=_matrix_layout(reduced + null * sentinel[:, None, None], matrix_sharding), y=y,
+                oc=oc, ot=ot, keep=keep, valid=valid, ratio=ratio, corrected=corrected, diagnostics=diagnostics)
+
+
+def joint_output_stage(stage, values, rotation, *, matmul):
+    """The CT endpoint factors c_C, c_T, inverse poles and active columns, and the diagnostics."""
+    y, keep = stage["y"], stage["keep"]
     count = jnp.sum(keep, axis=-1)
-    active = jnp.arange(metric.shape[-1])[None] >= metric.shape[-1] - count[:, None]
+    side = y.shape[-1]
+    active = jnp.arange(side)[None] >= side - count[:, None]
     coefficients = matmul(y, rotation) * active[:, None, :]
-    return (matmul(oc, coefficients), matmul(ot, coefficients),
+    return (matmul(stage["oc"], coefficients), matmul(stage["ot"], coefficients),
             jnp.where(active, values, 1), active), dict(
-                diagnostics, gram_valid=valid, gram_min_relative=ratio,
-                retained_metric_positive=corrected, retained_rank=count)
+                stage["diagnostics"], gram_valid=stage["valid"], gram_min_relative=stage["ratio"],
+                retained_metric_positive=stage["corrected"], retained_rank=count)
 
 
 def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):

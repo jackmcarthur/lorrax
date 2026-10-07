@@ -174,3 +174,38 @@ def test_paired_schur_cut_takes_the_sector_keep():
         out = paired_stage(dict(stage), jnp.asarray(gamma_r), jnp.asarray(eye), matmul=_mm, gates=gates, gram_keep=keep)
         assert int(np.asarray(out["count_r"])[0]) == want + c, (keep, np.asarray(out["count_r"]))
         assert float(np.asarray(out["paired_metric_residual_relative"])[0]) < 1e-12
+
+
+def test_decoupled_cross_matches_the_joint_reduction():
+    """face_cross_decoupled (stages over sub-batches, each eigh once over the stack) equals
+    reduce_sector_pencil (one program per round) on synthetic definite joint pencils."""
+    mesh = _mesh()
+    from gw.shared_pole_execution import face_cross_decoupled
+    from gw.shared_pole_local import _mm
+    from gw.shared_pole_sectors import reduce_sector_pencil
+    from gw.shared_pole_capacity import _local_eigenplan
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    rng = np.random.default_rng(5)
+    q, k, nc, nt = 5, 8, 6, 4
+    herm = lambda a: (a + np.conj(np.swapaxes(a, -1, -2))) / 2
+    a = rng.normal(size=(q, k, k)) + 1j * rng.normal(size=(q, k, k))
+    metric = herm(a @ np.conj(np.swapaxes(a, -1, -2))) / k + 0.1 * np.eye(k)
+    value = herm(rng.normal(size=(q, k, k)) + 1j * rng.normal(size=(q, k, k)))
+    oc = rng.normal(size=(q, nc, k)) + 1j * rng.normal(size=(q, nc, k))
+    ot = rng.normal(size=(q, nt, k)) + 1j * rng.normal(size=(q, nt, k))
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    eig = lambda m: tuple(np.linalg.eigh(np.asarray(m)))
+    want, wd = reduce_sector_pencil(tuple(jnp.asarray(x) for x in (metric, value, oc, ot)),
+                                    eigh=lambda m: tuple(jnp.asarray(v) for v in eig(m)), matmul=_mm, gates=gates)
+    plan = _local_eigenplan(mesh, k)
+    for width in (q, 2):
+        got, gd = face_cross_decoupled(tuple(jax.device_put(x, face) for x in (metric, value, oc, ot)),
+                                       mesh=mesh, eigh_plans=(plan, plan), width=width)
+        assert np.array_equal(np.asarray(want[3]), np.asarray(got[3]))
+        assert np.allclose(np.asarray(want[2]), np.asarray(got[2]), rtol=1e-10, atol=1e-12)
+        for p in range(q):            # factors up to a phase per column: compare c_C c_T^H
+            lw = np.asarray(want[0][p]) @ np.conj(np.asarray(want[1][p]).T)
+            lg = np.asarray(got[0][p]) @ np.conj(np.asarray(got[1][p]).T)
+            assert np.allclose(lw, lg, rtol=1e-8, atol=1e-10), (width, p)
+        for key in ("gram_valid", "retained_metric_positive", "retained_rank"):
+            assert np.array_equal(np.asarray(wd[key]), np.asarray(gd[key])), key
