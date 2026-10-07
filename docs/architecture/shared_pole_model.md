@@ -539,6 +539,21 @@ store carries `head_correction = no_local_fields`: the direct tensor $S(\omega)$
 finalized with no Γ body ([four-current heads](../theory/four-current-head-corrections.md)). Metal head routes are
 [self-consistency](../self_consistency.md#metals-direct-drude-head).
 
+**Independent Γ body references.**
+`shared_pole_head.realized_gamma_correlation_sampler` evaluates the even
+store at complex s=z² and returns Wc and dWc/ds.
+`realized_ordered_gamma_correlation_sampler` evaluates a
+`scalar-ordered-ph` store at complex z and returns Wc and dWc/dz.
+It keeps positive stored Ω² and reuses
+`shared_pole_gates.ordered_shared_pole_weights` for the two causal
+coefficients. At Γ the negative branch is the same parent's residue
+transpose with its own coefficient at the same z. Both samplers apply the
+authenticated little-group realization after contraction, keep matrix
+outputs on all processors, and differentiate scalar coefficients only.
+Callers own store/census authentication and capacity reservations. These
+body-only references supply no V or head/wing completion. At nonzero z,
+the ordered slope converts to dWc/ds as dWc/dz divided by 2z.
+
 ## 9 Gates and tests
 
 Every construction receipt row carries version, value, threshold and

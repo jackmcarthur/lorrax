@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — ordered Γ body references retain both causal pole branches
+
+An opt-in all-processor reference sampler returns ordered Γ Wc(z) and
+dWc/dz from the positive stored squared poles. It reuses the ordered value
+owner's particle/hole coefficients and the existing endpoint GEMM and
+magnetic realization owners. The hole endpoints transpose at the same z;
+the magnetic odd channel survives. Only scalar coefficients are
+differentiated. At nonzero z, callers may convert to dWc/ds by dividing by
+2z. This supplies no instantaneous V or ordered head/wing completion;
+production defaults and the existing full-head refusal are unchanged.
+
 ## 2026-10-07 — decoupled sector eighs priced beside their own stacks; the sector ledger bounds the peak
 
 Each decoupled CC/TT eigh stack now takes its room beside its own boundary

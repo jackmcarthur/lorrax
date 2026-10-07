@@ -182,6 +182,57 @@ def realized_gamma_correlation_sampler(mesh, realize, route=("auto", "auto"), *,
     return evaluate
 
 
+@lru_cache(maxsize=None)
+def realized_ordered_gamma_correlation_sampler(mesh, realize, route=("auto", "auto"), *, representation):
+    """Build an all-P ordered Γ Wc and exact dWc/dz reference sampler.
+
+    The scalar complex frequency is z in Ry, not z². Positive stored poles
+    remain ``poles2[1,K]`` in Ry², and factors/counts have the same carrier
+    as the even sampler. At Γ, q and minus-q use the same stored parent:
+    the hole branch transposes residue endpoints at the SAME z and is
+    subtracted with its separately owned causal coefficient. This retains
+    the time-reversal-odd antisymmetric channel of a magnetic charge model.
+
+    Values and slopes are complex128 all-P ``[1,mu_X,nu_Y]`` faces. Only
+    scalar coefficients from the existing ordered-value owner are
+    differentiated; GEMM and magnetic little-group realization are linear
+    value operations. The caller owns authenticated model membership,
+    physical Γ selection, finite sites, and capacity for outputs/workspace.
+    Convert a slope to d/ds as ``dWc_dz/(2*z)`` only at nonzero z. Neither
+    the instantaneous V nor a head/wing completion is supplied here.
+    """
+    if representation != "scalar-ordered-ph":
+        raise ValueError("GATE shared_pole_ordered_gamma_sampler: ordered Γ "
+                         "sampling requires scalar-ordered-ph, positive stored "
+                         "poles2 and a complex z frequency")
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import transpose_xy
+    from .shared_pole_gates import ordered_shared_pole_weights
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    product = _gamma_weighted_product(mesh, route)
+    project = _gamma_realization(mesh, realize)
+
+    def contract(weights, b):
+        particle, hole = weights
+        reverse = jax.lax.with_sharding_constraint(
+            transpose_xy(product(hole, b), mesh), face)
+        return product(particle, b) - reverse
+
+    @jax.jit(out_shardings=(face, face))
+    def evaluate(z, b, poles2, counts):
+        if (z.ndim != 0 or z.dtype != jnp.complex128 or b.ndim != 3
+                or b.shape[0] != 1 or b.dtype != jnp.complex128
+                or poles2.shape != (1, b.shape[-1]) or counts.shape != (1,)):
+            raise ValueError("GATE shared_pole_ordered_gamma_sampler: scalar complex z, "
+                             "one Γ factor face and matched poles2/counts required")
+        active = jnp.arange(poles2.shape[-1])[None, :] < counts[:, None]
+        weights, derivative = jax.jvp(
+            lambda site: ordered_shared_pole_weights(poles2, active, site),
+            (z,), (jnp.ones_like(z),))
+        return project(contract(weights, b)), project(contract(derivative, b))
+    return evaluate
+
+
 def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
     """Refuse, at input resolution, a full shared-pole head the Gamma body cannot evaluate.
 

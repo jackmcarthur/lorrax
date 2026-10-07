@@ -53,6 +53,23 @@ def ordered_pole_bound_ry(m1, inverse_coulomb_sqrt, *, energy_span_ry, gap_ry, m
     return float(energy_span_ry) + jnp.maximum(top, 0) / float(gap_ry)
 
 
+def ordered_shared_pole_weights(poles2, active, z):
+    """Both causal ordered-model coefficients from positive stored poles.
+
+    The stored poles are squared frequencies in Ry². The returned particle
+    and hole coefficients are ``1/(2W(z-W))`` and ``1/(2W(z+W))`` with
+    ``W=sqrt(poles2)`` in Ry. The value owner subtracts the hole contribution
+    after transporting its minus-q endpoints; its coefficient keeps the
+    same complex z. Masking precedes the square root, so carrier sentinels
+    never become physical poles. Only these scalar coefficients may be
+    differentiated when the contraction uses native GEMM.
+    """
+    w = jnp.sqrt(jnp.where(active, poles2, 1.0))
+    particle = jnp.where(active, 1 / (2 * w * (z - w)), 0)
+    hole = jnp.where(active, 1 / (2 * w * (z + w)), 0)
+    return particle, hole
+
+
 def ordered_shared_pole_value(model, partner, z, *, matmul):
     """Evaluate the ordered carrier Wc_p(z) from stored positive-pole factors.
 
@@ -64,10 +81,8 @@ def ordered_shared_pole_value(model, partner, z, *, matmul):
     """
     b, poles2, active = model
     bt, poles2t, activet = partner
-    w = jnp.sqrt(jnp.where(active, poles2, 1.0))
-    wt = jnp.sqrt(jnp.where(activet, poles2t, 1.0))
-    d = jnp.where(active, 1 / (2 * w * (z - w)), 0)
-    dt = jnp.where(activet, 1 / (2 * wt * (z + wt)), 0)
+    d, _ = ordered_shared_pole_weights(poles2, active, z)
+    _, dt = ordered_shared_pole_weights(poles2t, activet, z)
     return (matmul(b * d[:, None, :], b, transb="C")
             - matmul(bt.conj() * dt[:, None, :], bt.conj(), transb="C"))
 
