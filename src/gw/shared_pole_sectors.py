@@ -899,11 +899,17 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     ledger=meta.shared_pole_capacity
     budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
                                mesh_xy=mesh_xy,ledger=ledger,upstream=ledger.live_stages,execution='face')
-    budget.batch_width=int(width)
     budget.retained_panels=tuple(retained)
-    budget.face_room=geometry.get('face_room')
     budget.program_bytes=geometry.get('program_bytes')
     extent=port_extent(mesh_xy)
+    # The selection's eigh stacks get the room beside its own row at its last sub-batch, not
+    # the face round's; the sub-batch is the widest whose stacks run route (c) in that room.
+    packed=int(local_meta.n_rmu_padded)
+    fits=lambda w,room:face_eigh(mesh_xy,packed,room).stack_route((w,packed,packed),np.complex128).route=='batch_reshard'
+    face_width=int(width)
+    width,budget.face_room=decoupled_selection_width(face_width,decoupled_selection_room(
+        budget,recipe,n=n,packed=packed,nq=nq,mesh_xy=mesh_xy,extent=extent),fits)
+    budget.batch_width=int(width)
     from common import timing
     parts=[]
     with timing.section('decoupled.selection'):
@@ -972,12 +978,12 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     dw_panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[3:])
     # A stage program of w parents is bounded by the face round program's price at w (its
     # whole chain, linear in w); its inputs and outputs are sub-batch slices. The stages run at
-    # the largest w <= the selection width whose program fits beside the stacks row.
+    # the largest w <= the face batch whose program fits beside the stacks row.
     from gw.shared_pole_execution import face_reduction_bytes,decoupled_stage_bytes,decoupled_width
     price=lambda w:face_reduction_bytes(mesh_xy,int(w),rows=packed,side=side,carrier=carrier_columns,retain_span=True)
     stage_bytes=lambda program:decoupled_stage_bytes(nq=nq,ranks=mesh_xy.size,side=side,carrier=carrier_columns,
         packed=packed,held=held,dw_panels=dw_panels,program=program)
-    stage_width=decoupled_width(ledger,stage_bytes(0)[0],price(1),width,concurrent_with=ledger.live_stages)
+    stage_width=decoupled_width(ledger,stage_bytes(0)[0],price(1),face_width,concurrent_with=ledger.live_stages)
     program=price(stage_width)
     resident,boundaries=stage_bytes(program)
     stacks=resident-held-dw_panels-program
@@ -1810,6 +1816,43 @@ def joint_output_stage(stage, values, rotation, *, matmul):
                 retained_metric_positive=stage["corrected"], retained_rank=count)
 
 
+def decoupled_panel_bytes(side, packed, infinity):
+    """One parent's selected panels at pencil ``side`` (complex128): the (Q, O) state panels and
+    the infinity panels it keeps, and the dW Q panels the pencil releases."""
+    columns=int(side)-2*int(infinity)
+    return 16*(2*int(packed)*columns+5*int(packed)*int(infinity)),16*int(packed)*columns
+
+
+def decoupled_selection_width(width, room_at, fits):
+    """The largest selection sub-batch w <= ``width`` whose eigh stacks (w matrices) run one whole
+    matrix per rank in their room, ``fits(w, room_at(w))``, and that room; ``width`` and its room
+    when none does. On the whole mesh cuSOLVERMp's eigh fails its check silently and reruns
+    (CrI3 24x24 P64 at a face batch of 10: 37 n = 5184 selection eighs in one map)."""
+    for w in range(int(width),0,-1):
+        room=room_at(w)
+        if room is not None and fits(w,room):
+            return w,room
+    return int(width),room_at(int(width))
+
+
+def decoupled_selection_room(budget, recipe, *, n, packed, nq, mesh_xy, extent):
+    """``room_at(w)``: the eigh room beside a decoupled selection of w parents at its last
+    sub-batch, priced from the shapes: the selection row (``budget``, a face ConstructorCapacity)
+    beside every other parent's selected panels at the conservative side."""
+    from gw.shared_pole_capacity import face_eigh_room
+    from gw.shared_pole_execution import constructor_side_upper_bound,line_panel_count,selection_face_count
+    bound=constructor_side_upper_bound(recipe,ordered=True,odd_moments=True,logical_n=n,column_extent=extent)
+    others=sum(decoupled_panel_bytes(bound,packed,extent(max(1,int(recipe['infinity_width'])))))
+    faces=selection_face_count(recipe,n=packed,logical_n=n,states=4,rows=packed,dense_fields=2,
+                               moment_fields=4,column_extent=extent)
+    dense=len(recipe['fit_ids'])-line_panel_count(recipe)
+    def room_at(w):
+        budget.batch_width=w
+        return face_eigh_room(budget.preview(0,phase='selection',sample_batch=dense,selection_faces=faces,
+                                             beside=-(-others*(int(nq)-w)//int(mesh_xy.size))))
+    return room_at
+
+
 def decoupled_admission(execution_rows, nq, *, mesh_xy, ledger, upstream):
     """Whether CC and TT reduce every parent at once (the decoupled face route), priced from
     the shapes before any read, at each sector's conservative side: TT first, its stacks row
@@ -1824,10 +1867,7 @@ def decoupled_admission(execution_rows, nq, *, mesh_xy, ledger, upstream):
     for row in (execution_rows[1],execution_rows[0]):
         side,packed=int(row['conservative_pencil_side']),int(row['packed_extent'])
         carrier=face_ritz_carrier(mesh_xy,row['pole_budget'])
-        infinity=int(row['infinity_width'])
-        columns=side-2*infinity
-        held=per_rank(16*(2*packed*columns+5*packed*infinity))
-        dw=per_rank(16*packed*columns)
+        held,dw=(per_rank(b) for b in decoupled_panel_bytes(side,packed,int(row['infinity_width'])))
         program=face_reduction_bytes(mesh_xy,1,rows=packed,side=side,carrier=carrier,retain_span=True)
         resident,_=decoupled_stage_bytes(nq=nq,ranks=mesh_xy.size,side=side,carrier=carrier,packed=packed,
                                          held=held,dw_panels=dw,program=program)

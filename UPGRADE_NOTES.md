@@ -23,6 +23,20 @@ logical edges. Its G-slot carrier still uses the whole-mesh divisor; the
 face carrier uses the existing X/Y face specifications. Both virtual tails
 remain zero. The ordinary reader final extent remains unchanged.
 
+## 2026-10-07 — the decoupled selection gets its own eigh room and the widest sub-batch that keeps route (c)
+
+The decoupled CC/TT selection capped its eigh room by the face round's room. The
+whole-price face step (f6ae798cb) widened CrI3 24×24 P64 from 3 to 10 parents and
+left that room near zero, so on main 56a24169c every n = 5184 TT selection eigh ran
+on the whole mesh. cuSOLVERMp failed its check silently 37 times and each failure
+reran in its own program: TT.all took 1322.9 s against 308.7 s (claim 3706). The
+selection now gets the room beside its own row at its last sub-batch, priced from
+the shapes with every other parent's panels at the conservative side
+(`decoupled_selection_room`). Its sub-batch is the widest at or below the face batch
+whose stacks run one whole matrix per rank in that room (`decoupled_selection_width`).
+CrI3 P64 replay: 51 GiB room, 10 parents, route (c). The stage widths stay bounded
+by the face batch. P4 eqp is unchanged (CrI3 6×6 and Fe 4³). No deck change.
+
 ## 2026-10-07 — the decoupled sector route is admitted by its price; the decoupled CT needs route-(c) eighs and runs after the selection panels are released
 
 060697565's rule (decoupled only when parents < ranks) is replaced by a price, in this order:
