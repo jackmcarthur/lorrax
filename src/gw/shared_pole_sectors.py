@@ -1084,10 +1084,10 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
     from gw.shared_pole_execution import decoupled_cross_bytes
     stacks,boundaries=decoupled_cross_bytes(nq=nq,ranks=mesh_xy.size,side=side,rows=rows)
     # The pencil stack and the keep stage's (Y^H V Y, Y) beside it, plus one round's program.
-    stack=ledger.reserve(f"sector.decoupled.CT.stacks",
+    stack_row=ledger.reserve(f"sector.decoupled.CT.stacks",
         resident_bytes_per_rank=stacks+int(program_bytes or 0),
         workspace_bytes_per_rank=0,concurrent_with=upstream)
-    ledger.live_stages=(*upstream,stack['stage'])
+    ledger.live_stages=(*upstream,stack_row['stage'])
     budgets=[]
 
     def parts():
@@ -1119,7 +1119,7 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
             try:
                 yield
             finally:
-                ledger.live_stages=(*upstream,stack['stage'])
+                ledger.live_stages=(*upstream,stack_row['stage'])
         signed,diagnostics=face_cross_decoupled(pencil,mesh=mesh_xy,
             eigh_plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms),width=int(width),eigh_rows=eigh_row)
         del pencil
@@ -1145,7 +1145,7 @@ def construct_cross_sector_all(whole, rounds, read, meta, config, *, mesh_xy, sa
                 zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget,
                 decoupled=dict(parents=int(nq),sub_batch=int(width),pencil_side=int(side),
                                stacks_bytes_per_rank=int(stacks),
-                               eigh_room_bytes_per_rank=rooms,admitted=stack['device_budget_status']=='PASS',
+                               eigh_room_bytes_per_rank=rooms,admitted=stack_row['device_budget_status']=='PASS',
                                keep_residual=float(np.max(np.asarray(diagnostics['metric_inverse_root_residual_relative'])[:nq])),
                                paired_iterations=int(np.max(np.asarray(diagnostics['metric_inverse_root_iterations'])[:nq]))))
 
