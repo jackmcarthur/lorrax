@@ -244,7 +244,9 @@ def project_interaction_block(interaction, pair, *, mesh, n_targets,
 
     # The common owner resolves the full square run mesh; caller-mesh
     # validation alone permits a proper subset and cannot certify all-P.
-    if (mesh.device_set != resolve_mesh().device_set
+    canonical_mesh = resolve_mesh()
+    if (mesh.devices.size != canonical_mesh.devices.size
+            or set(mesh.devices.flat) != set(canonical_mesh.devices.flat)
             or tuple(mesh.axis_names) != ("x", "y")
             or int(mesh.shape["x"]) != int(mesh.shape["y"])):
         raise ValueError("CD block projection mesh must cover every global JAX device on the square X/Y grid")

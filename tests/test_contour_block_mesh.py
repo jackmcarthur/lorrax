@@ -49,3 +49,12 @@ def test_full_rectangular_grid_refuses_before_projection(monkeypatch):
     with pytest.raises(ValueError,match="square X/Y"):
         cd.project_interaction_block(w,p,mesh=mesh,n_targets=2,prefactor=.1,
             scalar_replication_bound_bytes=256)
+
+
+def test_full_membership_with_duplicate_devices_refuses_multiplicity():
+    assert len(jax.devices())==4
+    mesh=Mesh(np.tile(np.asarray(jax.devices()),4).reshape(4,4),("x","y"))
+    # Refusal must precede operand placement on this invalid repeated mesh.
+    with pytest.raises(ValueError,match="every global JAX device"):
+        cd.project_interaction_block(None,None,mesh=mesh,n_targets=2,prefactor=.1,
+            scalar_replication_bound_bytes=256)
