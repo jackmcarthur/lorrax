@@ -54,3 +54,51 @@ overlap. The fitting stage must form its own full-band Lowdin factor before
 cropping public bands. Original PS projection/dual semantics remain fixed;
 freshly recomputed C may differ at reduction roundoff and must be reported
 as numerical rather than byte equivalence when that occurs.
+
+## Prepared periodic compensation metrics
+
+`isdf.coulomb_fourier_cache.write_periodic_compensation_cache` and
+`load_periodic_compensation_cache` serve an explicitly prepared geometry
+metric through collective SlabIO/HDF. They do not build a Fourier metric
+or enable a different fitting policy. The existing local spline-cache
+APIs and numerical formulas are unchanged.
+
+The geometry bundle binds reciprocal rows in inverse bohr, cell volume in
+bohr cubed, ordered atom centres in bohr, the exact ordered fractional q
+rows, and support radius. The moment axes are atom-major complete complex
+harmonics in increasing `(l,m)` order. A different order refuses; the loader
+does not permute a global tensor or infer a q symmetry action. The closed
+model is the power6 compact compensation profile, bare periodic
+`8*pi/(Omega*|K|^2)` Ry kernel, excluded Gamma zero mode, and
+`exp(-i*K.center)` phase. Its metric has physical Ry units for unit harmonic
+multipoles and remains `P(None,'x','y')` at runtime.
+
+Preparation supplies a receipt path/hash, payload hash, producer-source
+hashes, finite cutoffs and measured per-q refinement. The writer checks the
+receipt file; the persisted evidence is self-contained and survives cache
+relocation or removal of that preparation path. The preparation producer
+owns the receipt-to-input numerical equality. Runtime authenticates the
+complete persisted payload through an externally pinned whole-file hash
+and collective commit, together with the consuming geometry/model/order.
+Fixed scalar-byte metadata is bounded before allocation. Finite-cutoff
+refinement is evidence at those cutoffs, not an infinite-tail bound.
+
+`isdf.atomic_coulomb.make_periodic_compensation_action` accepts this cache,
+the existing `PackedCentroidBasis`, and FFT point count. Its callable takes
+moment rows and the Gram as explicit operands. Both are distributed on the
+two-dimensional face; the coefficient rows retain their actual packed
+centroid order. The basis active mask removes interleaved ghosts before
+both products and on both output axes. Two public N,N GEMMs with
+`common.collectives.transpose_xy` evaluate `conj(M) G transpose(M)` and
+apply `(Nfft/Omega)^2` exactly once. This helper adds no local self term,
+periodic mean or head; those remain separate physical owners.
+
+The focused P4 test covers complex off-diagonal contractions, physical
+centroid6/carrier8 and moment9/carrier10, canonical and interleaved ghosts,
+NaN/large-value poison, relocation, and stale geometry/payload/commit
+refusals. Evidence is in
+`runs/DEV/780_augmented_isdf_20261006/positive_periodic_cache_action_v3` of
+the validation sandbox (claim3837). That planted IO/action proof does not
+admit an actual Fourier preparation, AgI fitting attachment or a physical
+screened-QP interpretation; actual geometry-cache and full action parity
+must be measured separately.

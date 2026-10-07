@@ -10,6 +10,103 @@ from __future__ import annotations
 import numpy as np
 
 
+def make_periodic_compensation_action(mesh, cache, *, centroid_basis, fft_points):
+    r"""Plan the global compensation action ``conj(M) G transpose(M)``.
+
+    Parameters
+    ----------
+    cache : dict
+        Authenticated periodic cache bundle. ``gram`` has physical Ry units
+        for unit multipoles; both canonical atom/lm axes remain P(None,x,y).
+    centroid_basis : common.centroid_basis.PackedCentroidBasis
+        Existing centroid solve-axis receipt and authoritative active mask.
+        Interleaved packed ghosts are not inferred from a physical prefix.
+    fft_points : int
+        Real-space FFT point count. The metric receives (Nfft/Omega)^2 once.
+
+    Returns
+    -------
+    action : callable
+        ``action(moment_rows, gram)`` returns the face-sharded Ry matrix.
+        Moment rows are (nq, mu_carrier, moment_carrier), P(None,x,y), in
+        grid-sum units and canonical atom-major complete complex-lm order.
+        The Gram is an explicit JIT operand, never a replicated closure.
+        Inactive centroid rows and harmonic tails are zeroed before either GEMM.
+    receipt : dict
+        Shapes, array ownership and the two public N,N GEMM plans. This
+        function introduces no local metric, periodic mean or head term.
+    """
+    import jax
+    import jax.numpy as jnp
+    import hashlib
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import transpose_xy
+    from distrib_la import gemm_plan, workspace_bytes_per_rank
+    from runtime.padding import (PaddedAxis, authenticate_padded_axis,
+                                 pad_to_axis, pad_square)
+    from isdf.coulomb_fourier_cache import PERIODIC_SCHEMA, _periodic_face
+
+    metadata = cache['metadata']
+    centroid_axis = centroid_basis.solve_axis
+    active = np.array(centroid_basis.active_mask, copy=True)
+    if (metadata.get('schema') != PERIODIC_SCHEMA or not isinstance(centroid_axis, PaddedAxis)
+            or active.dtype != np.dtype(bool) or active.shape != (centroid_axis.carrier,)
+            or np.count_nonzero(active) != int(centroid_basis.n_logical)
+            or int(centroid_basis.n_packed) != centroid_axis.carrier):
+        raise ValueError('global compensation requires authenticated cache and centroid axis')
+    face, moment_axis = _periodic_face(cache['gram'], mesh, metadata['logical_shape'])
+    if cache['moment_axis'] != moment_axis:
+        raise ValueError('global compensation moment axis receipt mismatch')
+    authenticate_padded_axis(centroid_axis.logical, centroid_axis.carrier,
+        centroid_axis, name='global compensation centroid')
+    if (centroid_axis.logical < 1 or centroid_axis.divisor % moment_axis.divisor
+            or int(fft_points) != fft_points or int(fft_points) < 1):
+        raise ValueError('global compensation centroid carrier or FFT count mismatch')
+    active.flags.writeable = False
+    nq = int(metadata['logical_shape'][0])
+    mu, na = centroid_axis.carrier, moment_axis.carrier
+    volume = float(metadata['geometry']['cell_volume_bohr3'])
+    scale = (int(fft_points)/volume)**2
+    left = gemm_plan(mesh, m=mu, n=na, k=na, nq=nq,
+        dtype=jnp.complex128, layout='face', warmup=False)
+    right = gemm_plan(mesh, m=mu, n=mu, k=na, nq=nq,
+        dtype=jnp.complex128, layout='face', warmup=False)
+
+    def contract(moment_rows, gram):
+        if (moment_rows.shape != (nq, mu, na) or gram.shape != (nq, na, na)
+                or moment_rows.dtype != jnp.complex128 or gram.dtype != jnp.complex128):
+            raise ValueError('global compensation operand shape or dtype mismatch')
+        moments = pad_to_axis(pad_to_axis(moment_rows, centroid_axis, axis=1),
+                              moment_axis, axis=2)
+        moments = jnp.where(jnp.asarray(active)[None, :, None], moments, 0.)
+        metric = pad_square(gram, moment_axis)*scale
+        value = right(left(moments.conj(), metric), transpose_xy(moments, mesh))
+        value = pad_square(value, centroid_axis)
+        return jnp.where((jnp.asarray(active)[:, None]&jnp.asarray(active)[None, :])[None], value, 0.)
+
+    action = jax.jit(contract, in_shardings=(face, face), out_shardings=face)
+    receipt = dict(cache_path=cache['path'], cache_file_sha256=cache['file_sha256'],
+        logical_centroids=int(centroid_basis.n_logical), carrier_centroids=mu,
+        active_centroid_mask_sha256=hashlib.sha256(active.tobytes()).hexdigest(),
+        centroid_mask_owner='existing PackedCentroidBasis.active_mask; includes interleaved ghosts',
+        logical_moments=moment_axis.logical, carrier_moments=na, q_count=nq,
+        fft_points=int(fft_points), cell_volume_bohr3=volume, metric_grid_scale=scale,
+        metric_scale_applied_once=True, input_and_output_sharding='P(None,x,y)',
+        complementary_face='common.collectives.transpose_xy; one partner tile exchange',
+        gram_is_explicit_operand=True, runtime_axis_permutation=False,
+        gemm_shapes=[dict(m=mu, n=na, k=na, nq=nq), dict(m=mu, n=mu, k=na, nq=nq)],
+        public_gemm_backends=[left.backend, right.backend],
+        vendor_gemm_workspace_bytes_per_rank=[
+            workspace_bytes_per_rank(left, 'gemm', ((nq, mu, na), (nq, na, na)), np.complex128),
+            workspace_bytes_per_rank(right, 'gemm', ((nq, mu, na), (nq, na, mu)), np.complex128)],
+        arrays_per_rank=dict(moment_rows_bytes=nq*mu*na*16//mesh.size,
+            gram_bytes=nq*na*na*16//mesh.size,
+            intermediate_bytes=nq*mu*na*16//mesh.size,
+            result_bytes=nq*mu*mu*16//mesh.size),
+        scope='Global periodic compensation Gram only; free local, both means and head are separate existing owners.')
+    return action, receipt
+
+
 def _angular_channels(lm):
     """Authenticate a complete integer harmonic space before using its metric."""
     channels = np.asarray(lm)

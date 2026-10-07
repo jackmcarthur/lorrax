@@ -181,3 +181,205 @@ def validate_coulomb_fourier_cache(cache, tables, maximum_wavevector, fourier_po
         errors.append(float(error.max())); comp_errors.append(float(comp_error))
     return dict(cache, max_density_validation_error=max(errors),
                 max_compensation_validation_error=max(comp_errors), validation_points=len(probes))
+
+
+PERIODIC_SCHEMA = 'lorrax.periodic_compensation_metric.v1'
+_PERIODIC_DATASET = 'periodic_compensation_gram_ry'
+_PERIODIC_MODEL = dict(compensation_power=6,
+    coulomb='bare_periodic_8pi_over_Omega_K2_Ry', gamma_zero='excluded',
+    phase='exp_minus_i_K_dot_center',
+    units='physical_Ry_unit_harmonic_multipoles')
+
+
+def _periodic_geometry_binding(geometry):
+    """Bind the ordered geometry; no orbital or centroid identity enters it."""
+    names = ('reciprocal_rows_bohr_inverse', 'cell_volume_bohr3',
+             'atom_centres_bohr', 'operator_q_fractional', 'support_radius_bohr')
+    if not isinstance(geometry, dict) or set(geometry) != set(names):
+        raise ValueError('periodic compensation geometry fields mismatch')
+    bvec, volume, atoms, q, radius = (np.asarray(geometry[name], float) for name in names)
+    if (bvec.shape != (3, 3) or volume.shape != () or radius.shape != ()
+            or atoms.ndim != 2 or atoms.shape[1:] != (3,) or len(atoms) == 0
+            or q.ndim != 2 or q.shape[1:] != (3,) or len(q) == 0
+            or any(not np.isfinite(value).all() for value in (bvec, volume, atoms, q, radius))
+            or volume <= 0 or radius <= 0 or abs(np.linalg.det(bvec)) == 0
+            or not np.isclose(volume, (2*np.pi)**3/abs(np.linalg.det(bvec)), rtol=2e-13, atol=0)
+            or len(np.unique(q, axis=0)) != len(q)):
+        raise ValueError('invalid periodic compensation geometry')
+    return {name: value.tolist() for name, value in zip(names, (bvec, volume, atoms, q, radius))}
+
+
+def _periodic_harmonics(lm):
+    """Require atom-major rows of the canonical complete complex Y_lm space."""
+    channels = np.asarray(lm)
+    if (channels.ndim != 2 or channels.shape[1:] != (2,) or len(channels) == 0
+            or not np.isfinite(channels).all() or not np.equal(channels, np.round(channels)).all()):
+        raise ValueError('invalid periodic compensation harmonic rows')
+    channels = channels.astype(np.int64)
+    wanted = np.asarray([(l, m) for l in range(int(channels[:, 0].max())+1)
+                         for m in range(-l, l+1)], np.int64)
+    if not np.array_equal(channels, wanted):
+        raise ValueError('periodic compensation requires canonical complete harmonic order')
+    return channels.tolist()
+
+
+def _periodic_sha(value):
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in '0123456789abcdef' for char in value))
+
+
+def _periodic_preparation_binding(preparation, nq, *, authenticate_receipt=False):
+    """Bind self-contained producer evidence; only preparation reads its receipt."""
+    names = {'receipt_sha256', 'payload_sha256', 'producer_sources_sha256',
+             'cutoffs', 'refinement_max'}
+    if authenticate_receipt:
+        names.add('receipt_path')
+    if not isinstance(preparation, dict) or set(preparation) != names:
+        raise ValueError('periodic compensation preparation fields mismatch')
+    sources = preparation['producer_sources_sha256']
+    if (not _periodic_sha(preparation['receipt_sha256'])
+            or not _periodic_sha(preparation['payload_sha256'])
+            or not isinstance(sources, dict) or not sources
+            or any(not isinstance(name, str) or not name or not _periodic_sha(digest)
+                   for name, digest in sources.items())
+            or (authenticate_receipt and
+                _file_digest(preparation['receipt_path']) != preparation['receipt_sha256'])):
+        raise ValueError('periodic compensation preparation identity mismatch')
+    cutoffs = np.asarray(preparation['cutoffs'], float)
+    refinement = np.asarray(preparation['refinement_max'], float)
+    if (cutoffs.ndim != 1 or len(cutoffs) < 2 or not np.isfinite(cutoffs).all()
+            or np.any(cutoffs <= 0) or np.any(np.diff(cutoffs) <= 0)
+            or refinement.shape != (nq, len(cutoffs)-1)
+            or not np.isfinite(refinement).all() or np.any(refinement < 0)):
+        raise ValueError('invalid periodic compensation finite-cutoff evidence')
+    return dict(receipt_sha256=preparation['receipt_sha256'],
+        payload_sha256=preparation['payload_sha256'], producer_sources_sha256=sources,
+        cutoffs=cutoffs.tolist(), refinement_max=refinement.tolist())
+
+
+def _periodic_face(gram, mesh, logical_shape):
+    """Authenticate bulk ownership without converting the tensor to NumPy."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from runtime.padding import padded_axis, authenticate_axis
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    if gram.dtype != np.dtype('complex128') or gram.ndim != 3 or gram.sharding != face:
+        raise ValueError('periodic compensation Gram must be complex128 P(None,x,y)')
+    if int(gram.shape[0]) != logical_shape[0]:
+        raise ValueError('periodic compensation q domain mismatch')
+    axis = padded_axis(logical_shape[-1], mesh, name='periodic moment',
+        specs=((face.spec, 1), (face.spec, 2)))
+    authenticate_axis(gram, axis, axis=1, where='periodic compensation rows')
+    authenticate_axis(gram, axis, axis=2, where='periodic compensation columns')
+    return face, axis
+
+
+def write_periodic_compensation_cache(path, gram, *, mesh, geometry, lm, preparation):
+    """Persist a prepared periodic multipole Gram using collective tile IO.
+
+    Parameters
+    ----------
+    gram : complex128 JAX array, (nq, moment_carrier, moment_carrier)
+        Physical Ry metric for unit harmonic multipoles, sharded P(None,x,y).
+        Atom-major canonical harmonic axes have logical size Nat * (L+1)^2.
+        SlabIO stores only those logical axes; padded values are not physical.
+    geometry, preparation : dict
+        Ordered cell/atoms/q/support and authenticated finite-cutoff evidence.
+        This function does not construct a Fourier metric or certify its tail.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import agree_io_error
+    from file_io.slab_io import SlabIO
+    from runtime.padding import pad_square
+
+    binding = _periodic_geometry_binding(geometry)
+    harmonics = _periodic_harmonics(lm)
+    nq = len(binding['operator_q_fractional'])
+    n = len(binding['atom_centres_bohr'])*len(harmonics)
+    evidence = _periodic_preparation_binding(preparation, nq, authenticate_receipt=True)
+    face, axis = _periodic_face(gram, mesh, (nq, n, n))
+    clean = jax.jit(lambda value: pad_square(value, axis),
+        in_shardings=face, out_shardings=face)(gram)
+    finite = jax.jit(lambda value: jnp.all(jnp.isfinite(value)),
+        in_shardings=face, out_shardings=NamedSharding(mesh, P()))(clean)
+    if not bool(np.asarray(finite.addressable_shards[0].data)):
+        raise ValueError('nonfinite physical periodic compensation Gram')
+    path = Path(path)
+    agree_io_error(FileExistsError('immutable periodic compensation cache exists')
+        if path.exists() else None, path=path, stage='periodic compensation fresh write')
+    metadata = dict(schema=PERIODIC_SCHEMA, model=_PERIODIC_MODEL,
+        geometry=binding, lm=harmonics, logical_shape=[nq, n, n],
+        row_order='atom_major_canonical_complex_lm', preparation=evidence,
+        source_binding=dict(physical_model=_PERIODIC_MODEL,
+            producer_sources_sha256=evidence['producer_sources_sha256']),
+        preparation_payload_scope='Producer asserts receipt/payload-to-input equality at preparation; loader authenticates persisted payload by the externally pinned whole-file digest.')
+    encoded = json.dumps(metadata, sort_keys=True).encode('utf-8')
+    if len(encoded) > 4*1024*1024:
+        raise ValueError('periodic compensation metadata exceeds its bounded domain')
+    with SlabIO(path, mode='w', mesh=mesh) as stream:
+        stream.create_dataset(_PERIODIC_DATASET, shape=(nq, n, n), dtype=np.complex128)
+        stream.write_slab(_PERIODIC_DATASET, clean)
+        stream.write_attr('periodic_compensation_metadata_json',
+                          np.asarray(encoded, dtype=f'S{len(encoded)}'))
+    return dict(path=str(path.resolve()), file_sha256=_file_digest(path), metadata=metadata)
+
+
+def load_periodic_compensation_cache(path, *, mesh, expected_file_sha256, geometry, lm):
+    """Read a pinned geometry metric directly onto the two-dimensional face.
+
+    Only bounded metadata is read through h5py. The metric is collectively
+    loaded through SlabIO, retaining P(None,x,y) with exact inert carrier tails.
+    The whole-file digest pins the full payload in addition to its upstream
+    preparation receipt; no replicated global tensor or axis permutation occurs.
+    """
+    import h5py
+    from jax.sharding import PartitionSpec as P
+    from file_io.commit_state import assert_committed, agree_io_refusal, COMMIT_STATE
+    from file_io.slab_io import SlabIO
+
+    path = Path(path)
+    error = None
+    try:
+        if not _periodic_sha(expected_file_sha256) or _file_digest(path) != expected_file_sha256:
+            raise ValueError('periodic compensation file identity mismatch')
+        binding, harmonics = _periodic_geometry_binding(geometry), _periodic_harmonics(lm)
+        nq = len(binding['operator_q_fractional'])
+        n = len(binding['atom_centres_bohr'])*len(harmonics)
+        with h5py.File(path, 'r') as stream:
+            assert_committed(stream, path=path)
+            if COMMIT_STATE not in stream:
+                raise ValueError('periodic compensation cache has no collective commit receipt')
+            record = stream['periodic_compensation_metadata_json']
+            if (record.shape != () or record.dtype.kind != 'S'
+                    or record.dtype.itemsize < 1 or record.dtype.itemsize > 4*1024*1024):
+                raise ValueError('periodic compensation metadata must be bounded fixed scalar bytes')
+            text = record[()]
+            if isinstance(text, bytes):
+                text = text.decode('utf-8')
+            if len(text) > 4*1024*1024:
+                raise ValueError('periodic compensation metadata exceeds its bounded domain')
+            metadata = json.loads(text)
+            if (metadata.get('schema') != PERIODIC_SCHEMA or metadata.get('model') != _PERIODIC_MODEL
+                    or metadata.get('geometry') != binding or metadata.get('lm') != harmonics
+                    or metadata.get('logical_shape') != [nq, n, n]
+                    or metadata.get('row_order') != 'atom_major_canonical_complex_lm'
+                    or stream[_PERIODIC_DATASET].shape != (nq, n, n)
+                    or stream[_PERIODIC_DATASET].dtype != np.dtype('complex128')):
+                raise ValueError('periodic compensation model, geometry or axis identity mismatch')
+            if _periodic_preparation_binding(metadata['preparation'], nq) != metadata['preparation']:
+                raise ValueError('periodic compensation preparation binding mismatch')
+            if metadata.get('source_binding') != dict(physical_model=_PERIODIC_MODEL,
+                    producer_sources_sha256=metadata['preparation']['producer_sources_sha256']):
+                raise ValueError('periodic compensation physical producer binding mismatch')
+    except Exception as exc:
+        error = exc
+    agree_io_refusal(error, path=path, stage='periodic compensation metadata authentication')
+    with SlabIO(path, mode='r', mesh=mesh) as stream:
+        gram = stream.read_slab(_PERIODIC_DATASET, partition_spec=P(None, 'x', 'y'))
+    _, axis = _periodic_face(gram, mesh, (nq, n, n))
+    agree_io_refusal(ValueError('periodic compensation file changed during collective read')
+        if _file_digest(path) != expected_file_sha256 else None,
+        path=path, stage='periodic compensation post-read file authentication')
+    return dict(gram=gram, moment_axis=axis, metadata=metadata,
+        path=str(path.resolve()), file_sha256=expected_file_sha256)
