@@ -258,44 +258,57 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     # rounds over slices of the held outputs. The stacks are reserved at their actual
     # side; stacks over budget reduce in face rounds (construct_diagonal_sector_all warns).
     whole=None
+    round_upstream=upstream
     if resolved_execution=='face' and int(header['n_q_irr'])>batch_width:
-        whole=[];held_leaves=[]
+        # TT first: its 2c stacks are the largest eighs, so they run beside no other
+        # sector's held outputs. Each sector's held outputs (every parent's models, span
+        # and (Q, O) panels, kept for CT) are one ledger row, live through the CT rounds.
+        from gw.shared_pole_capacity import _shard_bytes
+        whole={};held_rows=[]
         try:
-            for family,name in enumerate(('CC','TT')):
+            for family,name in ((1,'TT'),(0,'CC')):
                 with timing.section('spole.sector.'+name+'.all', announce=True):
                     def read(ids,family=family,name=name):
                         with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                             exact=read_sector_round(io,meta,bank,header,ids,(family,family),
-                                fields=('M0','M1','M2','M3'),retained=held_leaves,execution='face')
+                                fields=('M0','M1','M2','M3'),retained=(),execution='face')
                             refuse_nonfinite_moment(name,exact['M1'],len(ids),mesh_xy=mesh_xy)
-                            samples=read_samples(io,(family,family),(*held_leaves,*exact.values()),ids=ids,layout='face')
+                            samples=read_samples(io,(family,family),tuple(exact.values()),ids=ids,layout='face')
                             line=read_line(io,family,ids=ids,layout='face')
                         return samples,exact,line
                     geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
                         header=sector_headers[family],sample_ids=dense_fit,sector=name,
                         face_room=face_room,program_bytes=sizes.get(name))
                     model=construct_diagonal_sector_all(read,int(header['n_q_irr']),meta,config,geometry,
-                        mesh_xy=mesh_xy,retained=held_leaves,width=batch_width)
-                    whole.append(model)
+                        mesh_xy=mesh_xy,retained=(),width=batch_width)
+                    whole[family]=model
                     execution_rows[family]['decoupled']=model['decoupled']
                     used_room(execution_rows[family],model['budget'])
-                    held_leaves.extend(jax.tree.leaves((model['model'],model['signed'],
-                        model['coefficients'],model['infinity'],tuple(s[1:] for s in model['states']))))
+                    leaves=jax.tree.leaves((model['model'],model['signed'],
+                        model['coefficients'],model['infinity'],tuple(s[1:] for s in model['states'])))
+                    unique={id(a):a for a in leaves if hasattr(a,'sharding')}
+                    held_rows.append(ledger.reserve(f"sector.decoupled.held.{name}",
+                        resident_bytes_per_rank=sum(_shard_bytes(a) for a in unique.values()),
+                        workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)['stage'])
+                    ledger.live_stages=(*upstream,*held_rows)
                     reduction,zero,_,_=model['diagnostics']
                     counts=np.asarray(model['vectors'][1]).sum(axis=-1).tolist()
                     receipts.append(dict(sector=name,parents=list(range(int(header['n_q_irr']))),K=counts,
                         gram_min_relative=np.asarray(reduction['gram_min_relative']).tolist(),
                         zero_policy=np.asarray(zero['zero_policy']).tolist()))
+            whole=[whole[0],whole[1]]
         finally:
-            ledger.live_stages=upstream
+            round_upstream=(*upstream,*held_rows)
+            ledger.live_stages=round_upstream
     while rounds:
         ids,real,slots,execution=rounds.pop(0)
         face=execution=='face'
         sectors=[];retained=[];first_receipt=len(receipts)
         model=None
         if whole is not None and face:
+            # The held outputs are their ledger rows (round_upstream); only this
+            # round's slices are new arrays, priced where they are made.
             sectors=[slice_sector(sec,ids,mesh_xy) for sec in whole]
-            retained=list(held_leaves)
         for family,name in (() if sectors else enumerate(('CC','TT'))):
             with timing.section('spole.sector.'+name, announce=True):
                 with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
@@ -484,8 +497,9 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                         ledger.live_stages=ambient
         placed.extend(ids[:real])
         budget.retained_panels=()
-        ledger.live_stages=upstream
+        ledger.live_stages=round_upstream
         del sectors,cross,models,signed,retained,model
+    ledger.live_stages=upstream
     if sorted(placed)!=list(range(header['n_q_irr'])):
         raise ValueError('GATE shared_pole_sector_rounds: each parent must be written once')
     handle=write_shared_pole_sector_manifest(root/'sectors.json',models=stores,bank=bank,
@@ -853,44 +867,50 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     budget.face_room=geometry.get('face_room')
     budget.program_bytes=geometry.get('program_bytes')
     extent=port_extent(mesh_xy)
+    from common import timing
     parts=[]
-    for ids,real,slots in parent_rounds(nq,int(width)):
-        samples,moments,line=read(ids)
-        line={} if line is None else line
-        panel_elements=sum(int(np.prod(panels.shape[1:])) for panels,_ in line.values())
-        selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
-                         +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
-        selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
-                              selection_faces=selection_faces)
-        if budget.face_room is not None:
-            budget.face_room=min(budget.face_room,face_eigh_room(selection) or 0) or None
-        sub=dict(geometry,ids=ids,real=real)
-        states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,sub,local_meta,n,budget,
-            mesh_xy=mesh_xy,execution='face',retained=retained)
-        # a short last sub-batch repeats its last parent: keep the real slots only
-        keep=slice(0,int(real))
-        parts.append((states,np.asarray(counts)[keep],roles,infinity,[v for v in values][keep],real))
-        del samples,moments,line
-        budget.retained_panels=tuple(retained)
-    # One carrier per state over every sub-batch (the widest selection), then one stack.
-    widths=[max(ws) for ws in zip(*(recipe_panel_widths(part[2][0],part[0],recipe,column_extent=extent,logical_n=n)
-                                    for part in parts))]
-    infinity_width=max(recipe_infinity_width(part[3],recipe,column_extent=extent,logical_n=n) for part in parts)
-    padded=[pad_states(part[0],widths,part[3],infinity_width) for part in parts]
-    from gw.shared_pole_execution import parent_rows
-    take=lambda a,real:a if int(a.shape[0])==int(real) else parent_rows(mesh_xy,a,np.arange(int(real)))
-    def node(a):
-        z=padded[0][0][a][0]
-        if np.ndim(z)==0:
-            return z
-        return np.concatenate([np.asarray(sub[0][a][0])[:part[5]] for sub,part in zip(padded,parts)])
-    states=[(node(a),*_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[0][a][1:]) for sub,part in zip(padded,parts)]))
-            for a in range(len(padded[0][0]))]
-    infinity=_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[1]) for sub,part in zip(padded,parts)])
-    counts=np.concatenate([part[1] for part in parts])
-    values=[v for part in parts for v in part[4]]
-    roles=parts[0][2]
-    del padded,parts
+    with timing.section('decoupled.selection'):
+        for ids,real,slots in parent_rounds(nq,int(width)):
+            samples,moments,line=read(ids)
+            line={} if line is None else line
+            panel_elements=sum(int(np.prod(panels.shape[1:])) for panels,_ in line.values())
+            selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
+                             +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
+            # Earlier sub-batches' selected panels stay live beside this selection.
+            budget.retained_panels=(*retained,*(a for a in jax.tree.leaves([(part[0],part[3]) for part in parts])
+                                                if hasattr(a,'sharding')))
+            selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
+                                  selection_faces=selection_faces)
+            if budget.face_room is not None:
+                budget.face_room=min(budget.face_room,face_eigh_room(selection) or 0) or None
+            sub=dict(geometry,ids=ids,real=real)
+            states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,sub,local_meta,n,budget,
+                mesh_xy=mesh_xy,execution='face',retained=budget.retained_panels)
+            # a short last sub-batch repeats its last parent: keep the real slots only
+            keep=slice(0,int(real))
+            parts.append((states,np.asarray(counts)[keep],roles,infinity,[v for v in values][keep],real))
+            del samples,moments,line
+            budget.retained_panels=tuple(retained)
+    with timing.section('decoupled.stack'):
+        # One carrier per state over every sub-batch (the widest selection), then one stack.
+        widths=[max(ws) for ws in zip(*(recipe_panel_widths(part[2][0],part[0],recipe,column_extent=extent,logical_n=n)
+                                        for part in parts))]
+        infinity_width=max(recipe_infinity_width(part[3],recipe,column_extent=extent,logical_n=n) for part in parts)
+        padded=[pad_states(part[0],widths,part[3],infinity_width) for part in parts]
+        from gw.shared_pole_execution import parent_rows
+        take=lambda a,real:a if int(a.shape[0])==int(real) else parent_rows(mesh_xy,a,np.arange(int(real)))
+        def node(a):
+            z=padded[0][0][a][0]
+            if np.ndim(z)==0:
+                return z
+            return np.concatenate([np.asarray(sub[0][a][0])[:part[5]] for sub,part in zip(padded,parts)])
+        states=[(node(a),*_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[0][a][1:]) for sub,part in zip(padded,parts)]))
+                for a in range(len(padded[0][0]))]
+        infinity=_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[1]) for sub,part in zip(padded,parts)])
+        counts=np.concatenate([part[1] for part in parts])
+        values=[v for part in parts for v in part[4]]
+        roles=parts[0][2]
+        del padded,parts
     history=carrier_history(meta)
     name=(('sector',geometry['sector'],n),'extent',2,len(states))
     tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],
@@ -904,29 +924,47 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     # The stage stacks of every parent sit beside the eigh stacks. A stage's run holds
     # its input stack and the stack it writes in place (face_reduce_decoupled): the
     # keep stage the paired members and the restricted pencil, the paired stage the
-    # restricted pencil and (Y, Y^H G_r Y). The eighs run beside the state panels and
-    # one boundary stack, and take their room from the ledger beside the larger.
-    hvv=side//2
-    c=int(face_ritz_carrier(mesh_xy,recipe['pole_budget']) or hvv)
-    two=2*c
+    # restricted pencil and (Y, Y^H G_r Y). Each eigh runs beside the (node, Q, O) state
+    # panels (the dW Q panels are released after the pencil) and its own boundary stack:
+    # H'_vv beside the paired members and its Hermitian copy, the Schur complement beside
+    # the restricted pencil, Y^H G_r Y beside (Y, Y^H G_r Y, O_r, the paired span).
+    carrier_columns=face_ritz_carrier(mesh_xy,recipe['pole_budget'])
     packed=int(local_meta.n_rmu_padded)
-    members=16*(6*hvv*hvv+2*packed*hvv)
-    restricted=16*(2*two**2+2*c*c+hvv*c+packed*two)
-    per_rank=lambda bytes_per_parent:-(-int(bytes_per_parent)*int(nq)//int(mesh_xy.size))
-    panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:])
-    panels+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
-    stacks=per_rank(max(members+restricted,restricted+16*2*two**2))
-    row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=stacks+panels,
+    held=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:3])
+    held+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
+    dw_panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[3:])
+    # A stage program of ``width`` parents is bounded by the face round program's price
+    # at that width (its whole chain); its inputs and outputs are sub-batch slices.
+    from gw.shared_pole_execution import face_reduction_bytes,decoupled_stage_bytes
+    program=face_reduction_bytes(mesh_xy,int(width),rows=packed,side=side,carrier=carrier_columns,retain_span=True)
+    resident,boundaries=decoupled_stage_bytes(nq=nq,ranks=mesh_xy.size,side=side,carrier=carrier_columns,
+        packed=packed,held=held,dw_panels=dw_panels,program=program)
+    stacks=resident-held-dw_panels-program
+    panels=held+dw_panels
+    row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=resident,
                        workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)
     ambient=ledger.live_stages
     ledger.live_stages=(*ambient,row['stage'])
-    # (the H'_vv eigh reads its Hermitian part, one more [hvv, hvv] stack beside the members)
-    beside=ledger.preview(resident_bytes_per_rank=per_rank(max(members+16*hvv*hvv,restricted))+panels,
-                          workspace_bytes_per_rank=0,concurrent_with=ambient)
-    room=face_eigh_room(beside)
+    rooms=tuple(face_eigh_room(ledger.preview(resident_bytes_per_rank=boundary,
+                                              workspace_bytes_per_rank=0,concurrent_with=ambient))
+                for boundary in boundaries)
+
+    from contextlib import contextmanager
+    @contextmanager
+    def eigh_row(k):
+        # The eigh of stack k runs beside its boundary and may use its whole room: one
+        # row for both while it runs, so the stage's price bounds its peak.
+        stage=ledger.reserve(f"sector.decoupled.{geometry['sector']}.eigh{k}.{len(ledger.entries)}",
+                             resident_bytes_per_rank=boundaries[k]+int(rooms[k] or 0),
+                             workspace_bytes_per_rank=0,concurrent_with=ambient)['stage']
+        ledger.live_stages=(*ambient,stage)
+        try:
+            yield
+        finally:
+            ledger.live_stages=(*ambient,row['stage'])
     admitted=row['device_budget_status']=='PASS'
     receipt=dict(parents=int(nq),sub_batch=int(width),pencil_side=int(side),stacks_bytes_per_rank=int(stacks),
-                 panels_bytes_per_rank=int(panels),eigh_room_bytes_per_rank=room,admitted=bool(admitted))
+                 panels_bytes_per_rank=int(panels),eigh_room_bytes_per_rank=rooms,admitted=bool(admitted))
     if not admitted:
         import warnings
         warnings.warn(f"shared-pole {geometry['sector']}: the decoupled stacks of {int(nq)} parents "
@@ -937,9 +975,12 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget'])
     try:
         if admitted:
-            reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,eigh_plan=face_eigh(mesh_xy,side,room),
+            # Only the states list holds the dW Q panels now, so the reduction can release them.
+            budget.retained_panels=(*retained,*(a for s in states for a in s[1:3]),*infinity)
+            reduced=face_reduce_decoupled(states,infinity,tables,mesh=mesh_xy,
+                eigh_plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms),
                 width=int(width),ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-                gram_keep=gram_keep,carrier=carrier)
+                gram_keep=gram_keep,carrier=carrier,eigh_rows=eigh_row)
         else:
             # The stacks do not fit beside the live set (warn, never refuse): the same
             # stacked panels reduce in face rounds of the admitted width, the eighs per round.
