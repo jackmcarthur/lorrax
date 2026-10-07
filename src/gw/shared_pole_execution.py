@@ -819,6 +819,63 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
                  for i, fn in enumerate((stage1, stage2, stage3, stage4))), passthrough
 
 
+def decoupled_stage_bytes(*, nq, ranks, side, carrier, packed, held, dw_panels, program):
+    """Per-rank bytes of the decoupled reduction of ``nq`` parents (complex128).
+
+    ``side`` is the pencil side (2 hvv), ``carrier`` the kept-span columns c (None: hvv),
+    ``packed`` the rows, ``held`` the (node, Q, O) and infinity panels per rank,
+    ``dw_panels`` the dW Q panels per rank (released after the pencil), ``program`` the
+    stage program's bound at the sub-batch width. A stage's run holds its input stack and
+    the stack it writes in place: the keep stage the paired members and the restricted
+    pencil, the paired stage the restricted pencil and (Y, Y^H G_r Y), the output stage
+    (Y, Y^H G_r Y, O_r, span) and the model and coefficient outputs. Returns
+    ``(resident, boundaries)``: the stacks row and the three eigh stacks' boundaries
+    (H'_vv beside the members and its Hermitian copy, the Schur complement beside the
+    restricted pencil, Y^H G_r Y beside the output stage's input), each with ``held``.
+    """
+    hvv = int(side) // 2
+    c = int(carrier or hvv)
+    two, packed = 2 * c, int(packed)
+    per_rank = lambda b: -(-int(b) * int(nq) // int(ranks))
+    members = 16 * (6 * hvv * hvv + 2 * packed * hvv)
+    restricted = 16 * (2 * two ** 2 + 2 * c * c + hvv * c + packed * two)
+    ritz = 16 * (2 * two ** 2 + hvv * c + packed * two)
+    outputs = 16 * (int(side) * two + 2 * packed * two)
+    stacks = per_rank(max(members + restricted, restricted + 16 * 2 * two ** 2, ritz + outputs))
+    boundaries = tuple(per_rank(b) + int(held) for b in (members + 16 * hvv * hvv, restricted, ritz))
+    return stacks + int(held) + int(dw_panels) + int(program), boundaries
+
+
+def _device_free_bytes():
+    """This process's free device pool bytes (limit minus in use), or None off a pool (CPU)."""
+    stats = jax.local_devices()[0].memory_stats() or {}
+    limit, used = stats.get('bytes_limit'), stats.get('bytes_in_use')
+    return None if limit is None or used is None else int(limit) - int(used)
+
+
+def guarded_eigh(plan, stack, *, mesh, label):
+    """``plan``'s batched eigh of ``stack``, with a runtime guard on its route-(c) decision.
+
+    The ledger admits a stack one whole matrix per rank when its program fits the room;
+    the pool's measured free bytes, agreed (the minimum) over processes, must also cover
+    that program, or the stack runs on the whole mesh (the scan) with one warning. The
+    guard only narrows the ledger's decision; it never refuses and never widens it.
+    """
+    route = plan.stack_route(stack.shape, stack.dtype, traced=False)
+    if route.route != 'batch_reshard' or not route.program_bytes:
+        return plan.batched(stack)
+    from distrib_la._collectives import agreed_minimum
+    free = _device_free_bytes()
+    agreed, = agreed_minimum((-1 if free is None else free,), tag=f"decoupled eigh free {label}")
+    if agreed < 0 or agreed >= int(route.program_bytes):
+        return plan.batched(stack)
+    import warnings
+    warnings.warn(f"shared-pole decoupled {label}: the {int(stack.shape[0])} x {int(stack.shape[-1])}^2 eigh stack's "
+                  f"program needs {route.program_bytes / 1e9:.1f} GB/rank but the pool has {agreed / 1e9:.1f} GB "
+                  f"free on some rank; it runs on the whole mesh instead", RuntimeWarning)
+    return face_eigh(mesh, int(stack.shape[-1]), 0).batched(stack)
+
+
 def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, ordered, odd_moments,
                           keep_budget, retain_span=False, gram_keep=None, carrier=None, eigh_rows=None):
     """All ``nq`` parents' ordered reduction: stage programs over ``width`` parents at a
@@ -834,7 +891,8 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
     (stage1, stage2, stage3, stage4), passthrough = programs
-    hvv_eigh, schur_eigh, reduced_eigh = (plan.batched for plan in eigh_plans)
+    hvv_eigh, schur_eigh, reduced_eigh = (partial(guarded_eigh, plan, mesh=mesh, label=label)
+                                          for plan, label in zip(eigh_plans, ('H_vv', 'Schur', 'reduced')))
     cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
     inputs = (tables['points'], tables['order'], tables['active'],
               tuple(s[1] for s in states), tuple(s[2] for s in states), tuple(s[3] for s in states), tuple(infinity))

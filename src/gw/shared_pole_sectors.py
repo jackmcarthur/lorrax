@@ -925,29 +925,23 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
     # panels (the dW Q panels are released after the pencil) and its own boundary stack:
     # H'_vv beside the paired members and its Hermitian copy, the Schur complement beside
     # the restricted pencil, Y^H G_r Y beside (Y, Y^H G_r Y, O_r, the paired span).
-    hvv=side//2
     carrier_columns=face_ritz_carrier(mesh_xy,recipe['pole_budget'])
-    c=int(carrier_columns or hvv)
-    two=2*c
     packed=int(local_meta.n_rmu_padded)
-    members=16*(6*hvv*hvv+2*packed*hvv)
-    restricted=16*(2*two**2+2*c*c+hvv*c+packed*two)
-    per_rank=lambda bytes_per_parent:-(-int(bytes_per_parent)*int(nq)//int(mesh_xy.size))
     held=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[1:3])
     held+=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for a in infinity)
-    panels=held+sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[3:])
-    ritz=16*(2*two**2+hvv*c+packed*two)
-    outputs=16*(side*two+2*packed*two)
+    dw_panels=sum(a.size*a.dtype.itemsize//int(mesh_xy.size) for st in states for a in st[3:])
     # A stage program of ``width`` parents is bounded by the face round program's price
     # at that width (its whole chain); its inputs and outputs are sub-batch slices.
-    from gw.shared_pole_execution import face_reduction_bytes
+    from gw.shared_pole_execution import face_reduction_bytes,decoupled_stage_bytes
     program=face_reduction_bytes(mesh_xy,int(width),rows=packed,side=side,carrier=carrier_columns,retain_span=True)
-    stacks=per_rank(max(members+restricted,restricted+16*2*two**2,ritz+outputs))
-    row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=stacks+panels+program,
+    resident,boundaries=decoupled_stage_bytes(nq=nq,ranks=mesh_xy.size,side=side,carrier=carrier_columns,
+        packed=packed,held=held,dw_panels=dw_panels,program=program)
+    stacks=resident-held-dw_panels-program
+    panels=held+dw_panels
+    row=ledger.reserve(f"sector.decoupled.{geometry['sector']}.stacks",resident_bytes_per_rank=resident,
                        workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)
     ambient=ledger.live_stages
     ledger.live_stages=(*ambient,row['stage'])
-    boundaries=tuple(per_rank(b)+held for b in (members+16*hvv*hvv,restricted,ritz))
     rooms=tuple(face_eigh_room(ledger.preview(resident_bytes_per_rank=boundary,
                                               workspace_bytes_per_rank=0,concurrent_with=ambient))
                 for boundary in boundaries)
