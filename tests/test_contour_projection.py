@@ -107,6 +107,9 @@ def test_gamma_pw_full_pole_integral_uses_reciprocal_partner_not_plain_conjugati
     # Logical G=(0,+g,-g), fourth slot is a carrier ghost. The Γ charge
     # body has a zero G0 row/column; no planted head is smuggled into Wc.
     vectors[[0,3]]=0
+    # Keep the two directed residues well separated by construction;
+    # a chance near equality of their diagonal norms is a weak witness.
+    vectors[1]*=2
     positive=.002*vectors@vectors.conj().T
     negative_residue=positive.T[np.ix_(negative,negative)]
     pair=rng.normal(size=(1,2,4))+1j*rng.normal(size=(1,2,4))
