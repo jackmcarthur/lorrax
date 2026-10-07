@@ -43,5 +43,5 @@ def test_cached_mover_lowering_takes_maps_as_inputs(mesh):
     source = jax.ShapeDtypeStruct((2, 8), np.int32, sharding=replicated)
     for mover in _sphere_response_programs(mesh)[4:]:
         ir = str(mover.lower(value, source).compiler_ir(dialect='stablehlo'))
-        assert 'tensor<2x8xi32>' in ir.split('func.func public @main', 1)[1].split('{', 1)[0]
+        assert '%arg1: tensor<2x8xi32>' in ir
         assert len(ir) < 65536
