@@ -9,6 +9,8 @@
    only.
 5. With the recipe's 5 eV read pad the line top is never below the former rule's
    (states within +-5 eV of mu at +-5 eV offsets) when those states are requested.
+6. An SC map whose line count changes re-plans with a finite, hashable receipt; a smaller
+   count keeps the held one (the count only grows).
 """
 import numpy as np
 
@@ -66,3 +68,28 @@ def test_read_pad_keeps_the_former_reach():
     old_top = support_rule_line_sites(levels, 0.0, 0.25, 2.6, old_reads, 14)[-1]
     new_top = support_rule_line_sites(levels, 0.0, 0.25, 2.6, new_reads, 14)[-1]
     assert SUPPORT_READ_PAD_EV == 5.0 and new_top >= old_top - 1e-9
+
+
+def test_line_count_change_between_maps_keeps_a_finite_hashable_recipe():
+    # An SC map whose line count differs from the held one re-plans with a finite
+    # (or null) drift: the receipt is hashed with the recipe under allow_nan=False.
+    from gw.shared_pole_recipe import _held_line_sites, table_hash
+    session = {"epoch": 0}
+    sites = lambda n: np.linspace(2.6, 20.0, n)  # noqa: E731
+    rule = lambda n: {"reach_ev": 20.0, "strip": n, "floor": 14, "cap": 32, "count": n}  # noqa: E731
+    first = {"status": "initial"}
+    line, _ = _held_line_sites(sites, 14, rule(14), first, session)
+    assert line.size == 14 and session["line_count"] == 14
+    grow = {"status": "hit"}
+    line, _ = _held_line_sites(sites, 16, rule(16), grow, session)
+    assert line.size == 16 and grow["status"] == "expanded"
+    assert grow["line_site_drift_ev"] is None and grow["line_site_count"] == [14, 16]
+    table_hash(grow)
+    shrink = {"status": "hit"}
+    line, used = _held_line_sites(sites, 15, rule(15), shrink, session)
+    assert line.size == 16 and used["count"] == 16 and shrink["status"] == "hit"
+    assert shrink["line_site_drift_ev"] == 0.0
+    table_hash(shrink)
+    reference = {"status": "initial_reference"}
+    line, _ = _held_line_sites(sites, 15, rule(15), reference, session)
+    assert line.size == 15
