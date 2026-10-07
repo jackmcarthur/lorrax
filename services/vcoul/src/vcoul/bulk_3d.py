@@ -57,6 +57,16 @@ def _interband_sphere_factor(S_carts):
     S = np.asarray(S_carts, dtype=np.complex128)
     if S.ndim != 3 or S.shape[1:] != (3, 3) or not np.isfinite(S).all():
         raise ValueError('GATE bulk_q0_sphere_tensor: finite (n,3,3) required')
+    # A real symmetric dielectric with both signs (or a zero eigenvalue)
+    # has an angular pole, whether or not this rule samples its direction.
+    # Antisymmetric Hall components do not enter n.S.n. Complex tensors
+    # still need the observed refinement; this is not an exhaustive test.
+    epsilon = np.eye(3)[None] - 4*np.pi*(S+S.transpose(0, 2, 1))
+    for row in epsilon:
+        if np.all(row.imag == 0):
+            eig = np.linalg.eigvalsh(row.real)
+            if eig[0] <= 0 <= eig[-1]:
+                raise ValueError('GATE bulk_q0_sphere_singular: real angular pole')
     previous, good = None, 0
     for order in (16, 32, 64, 128, 256, 512):
         u, w = gauss_legendre_interval(order, -1.0, 1.0)

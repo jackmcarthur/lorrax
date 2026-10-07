@@ -72,3 +72,9 @@ def test_extra_finite_q_response_refuses_unmatched_sphere(monkeypatch):
 def test_bad_tensor_refuses_before_angular_quadrature():
     with pytest.raises(ValueError,match='sphere_tensor'):
         owner._interband_sphere_factor([np.full((3,3),np.nan)])
+
+
+@pytest.mark.parametrize('epsilon', [np.diag([-1.,2.,3.]), np.diag([0.,2.,3.])])
+def test_real_angular_pole_refuses_without_sampling_its_direction(epsilon):
+    with pytest.raises(ValueError,match='sphere_singular: real angular pole'):
+        owner._interband_sphere_factor([(np.eye(3)-epsilon)/(8*np.pi)])
