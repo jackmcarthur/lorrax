@@ -74,6 +74,7 @@ else.
 | `experimental/__init__.py` | Package for staged GW features not yet wired into `gw_jax`. |
 | `experimental/head_wing_schur.py` | Sharded head/wing/body Schur decomposition of W; the head-channel specs are live. |
 | `fermi_surface.py` | Builds finite-occupation Fermi-surface quadrature. |
+| `gamma_charge_basis.py` | Typed Γ ±G geometry and all-P cosine/sine charge endpoint maps; field transforms reuse the contour endpoint owners. |
 | `gflat_memory_model.py` | The route-G ζ-fit planner and the centroid-load tile rule. |
 | `greens_function_kernel.py` | Builds the parent Green operators (`build_G_parents`, `build_G_tau`, the `face_green_product` SUMMA) and moves them with symmetry actions. |
 | `gw_config.py` | Defines, parses, and validates GW runtime configuration. |

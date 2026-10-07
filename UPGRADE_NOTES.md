@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — explicit Γ charge endpoints can use a real Fourier basis
+
+`gw.gamma_charge_basis` binds a canonical `SphereSet` Γ row to cosine/sine
+endpoints with exact ±G pairing, G0 identity and zero virtual support. It
+constructs U and U† on all-P matrix tiles from small replicated metadata;
+the existing contour density/lift/projection owners apply the maps. This
+opt-in geometry utility changes no driver, deck, normalization or pole-fit
+default. Real charge functions do not imply time-reversal permission or
+symmetric/even-frequency magnetic screening. A native metal pole comparison
+must separately authenticate the new basis and both actual density directions.
+
 ## 2026-10-07 — Sigma broadening documentation states the occupied and empty sheets
 
 The input reference and denominator-box docstring now describe the existing
