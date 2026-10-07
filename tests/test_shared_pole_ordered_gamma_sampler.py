@@ -168,6 +168,31 @@ def test_empty_and_inactive_negative_poles_never_enter_sqrt(mesh):
     np.testing.assert_array_equal(np.asarray(negative)[:, 2:], 0)
 
 
+def test_existing_value_owner_keeps_distinct_parent_and_partner_poles():
+    rng = np.random.default_rng(7312026)
+    parent = rng.normal(size=(1, 4, 4)) + 1j*rng.normal(size=(1, 4, 4))
+    partner = rng.normal(size=(1, 4, 4)) + 1j*rng.normal(size=(1, 4, 4))
+    p = np.array([[.2, .8, -3., 0.]])
+    pt = np.array([[.3, 1.5, 2., -9.]])
+    active = np.array([[True, True, False, False]])
+    activet = np.array([[True, True, True, False]])
+    z = .7+.3j
+    expected = np.zeros((1, 4, 4), complex)
+    for k in range(2):
+        omega = np.sqrt(p[0, k])
+        expected[0] += np.outer(parent[0, :, k], parent[0, :, k].conj())/(2*omega*(z-omega))
+    for k in range(3):
+        omega = np.sqrt(pt[0, k])
+        expected[0] -= np.outer(partner[0, :, k].conj(), partner[0, :, k])/(2*omega*(z+omega))
+    def mm(a, b, transb):
+        assert transb == "C"
+        return a @ b.conj().swapaxes(-1, -2)
+    actual = ordered_shared_pole_value((jnp.asarray(parent), jnp.asarray(p), jnp.asarray(active)),
+                                      (jnp.asarray(partner), jnp.asarray(pt), jnp.asarray(activet)),
+                                      jnp.asarray(z), matmul=mm)
+    np.testing.assert_allclose(actual, expected, rtol=3e-13, atol=3e-13)
+
+
 @pytest.mark.parametrize("representation", ["scalar-trs-even-s", "charge-ordered-z", "unknown", None])
 def test_unbound_or_wrong_representation_refuses(mesh, representation):
     with pytest.raises(ValueError, match="requires scalar-ordered-ph"):
