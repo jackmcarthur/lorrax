@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — optional head cell draw refinement
+
+`gw.qsgw_head.head_samples_from_s` now forwards optional `nsamples`,
+`qmc_reps` and `method` to both existing Coulomb cell-average branches.
+Defaults are the incumbent `2**18`, `10`, `"auto"`; response tensors,
+intraband exchange and static/head policies are unchanged. The Coulomb
+service retains draw/cache and announce-or-refuse ownership. Focused tests
+separate literal forwarding from actual draw/cache/refusal controls;
+physical FD cell refinement requires its own numerical admission.
+
 ## 2026-10-07 — shared one-round pole construction for explicit charge endpoints
 
 The production shared-pole constructor calls the new bounded one-round owner;

@@ -3616,6 +3616,9 @@ def head_samples_from_s(
     response_kind="direct_irreducible",
     source_prefix: str = "qsgw_parallel_transport",
     intraband=None,
+    nsamples: int = 2**18,
+    qmc_reps: int = 10,
+    method: str = "auto",
 ) -> tuple[object, ...]:
     """Convert replicated 3x3 S tensors to mini-BZ averaged head samples.
 
@@ -3627,6 +3630,11 @@ def head_samples_from_s(
     (``docs/theory/metal-q0-head.md``).  ``static_kappa2_bohr2`` names the
     one exact-zero row whose Thomas-Fermi term is the full head's folded
     kappa^2; on a metal that row keeps its interband ``S(0)``.
+
+    ``nsamples``, ``qmc_reps`` and ``method`` forward unchanged to the
+    public Coulomb cell sampler for refinement controls. Their defaults
+    preserve the existing draw; the sampler owns generator validation,
+    announce-or-refuse behavior and draw-cache identity.
     """
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
@@ -3688,6 +3696,7 @@ def head_samples_from_s(
         vc0, wcoul0 = compute_q0_averages_screened(
             wfn, meta, [rows[i][2] for i in screened],
             extra_chi_rows=_extra_chi_rows([rows[i][3] for i in screened], intraband),
+            nsamples=nsamples, qmc_reps=qmc_reps, method=method,
             analytic_sphere=analytic_sphere)
         vc0 = complex(vc0)
         averages.update(zip(screened, ((vc0, w) for w in wcoul0)))
@@ -3697,6 +3706,7 @@ def head_samples_from_s(
                 wfn, jnp.asarray(0.0, dtype=jnp.float64), meta,
                 S_cart=None,
                 static_kappa2=jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64),
+                nsamples=nsamples, qmc_reps=qmc_reps, method=method,
                 analytic_sphere=analytic_sphere, extra_chi=None)
     # Pass 2: read back once per row, in the caller's order.
     out = []

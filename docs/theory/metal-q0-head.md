@@ -273,6 +273,13 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
 
 ## 6. Code owners
 
+The reference API `qsgw_head.head_samples_from_s` accepts `nsamples`,
+`qmc_reps` and `method` and forwards them to the Coulomb cell owner for both
+screened and Thomas–Fermi rows. Defaults preserve the incumbent draw.
+Generator refusal/demotion and cache identity remain owned by
+`vcoul.minibz`; these controls change cell quadrature, not the pair model,
+surface weights, body response or head policy.
+
 | object | owner |
 |---|---|
 | tetrahedron Fermi-surface table, multiplet weights | `gw.fermi_surface.metal_head_surface_weights` |
