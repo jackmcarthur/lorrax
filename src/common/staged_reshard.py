@@ -377,10 +377,9 @@ def shard_local_update(mesh: Mesh, *, spec: P) -> Callable:
     backward clamping.  The body is inside ``shard_map`` and donates ``dst``;
     it cannot communicate or allocate a second global face.
 
-    Nonnegative rectangles wholly inside the LOCAL destination have unique,
-    lexicographically sorted coordinates.  Only that case promises sorted,
-    unique scatter indices; negative-index wrapping and tail dropping retain
-    the general scatter semantics.
+    Nonnegative rectangles wholly inside the LOCAL destination use a direct
+    rectangle update.  Its starts cannot clamp under that bound;
+    negative-index wrapping and tail dropping retain the general scatter.
     """
     from common.shard_map import shard_map
 
@@ -389,29 +388,30 @@ def shard_local_update(mesh: Mesh, *, spec: P) -> Callable:
 
     def _body(dst, tile, starts):
         starts = jnp.asarray(starts, dtype=jnp.int32)
-        grids = jnp.ix_(*(
-            starts[d] + jnp.arange(tile.shape[d], dtype=jnp.int32)
-            for d in range(dst.ndim)
-        ))
+        def drop_scatter(_):
+            grids = jnp.ix_(*(
+                starts[d] + jnp.arange(tile.shape[d], dtype=jnp.int32)
+                for d in range(dst.ndim)
+            ))
+            return dst.at[grids].set(tile, mode="drop")
         # Preserve the legacy cast and negative-index normalization.  A
         # negative start can wrap, and a wide rectangle can then collide;
-        # neither is allowed to inherit the fast-path promises.  Subtract
+        # neither is allowed to enter the rectangle fast path.  Subtract
         # static extents instead of adding starts to avoid index overflow.
         extents_fit = all(
             0 <= tile.shape[d] <= dst.shape[d] <= 2**31 - 1
             for d in range(dst.ndim))
         if not extents_fit:
-            return dst.at[grids].set(tile, mode="drop")
+            return drop_scatter(None)
         last_start = jnp.asarray(
             [dst.shape[d] - tile.shape[d] for d in range(dst.ndim)],
             dtype=jnp.int32)
         in_bounds = jnp.all((starts >= 0) & (starts <= last_start))
         return jax.lax.cond(
             in_bounds,
-            lambda _: dst.at[grids].set(
-                tile, mode="drop", indices_are_sorted=True,
-                unique_indices=True),
-            lambda _: dst.at[grids].set(tile, mode="drop"),
+            lambda _: jax.lax.dynamic_update_slice(
+                dst, tile, tuple(starts[d] for d in range(dst.ndim))),
+            drop_scatter,
             operand=None)
 
     sm = shard_map(
