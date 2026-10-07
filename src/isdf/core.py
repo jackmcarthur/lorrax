@@ -1496,7 +1496,8 @@ def _close_the_cut(spectrum, keep, *, where: str):
             a=n_pre, b=n_post, ordered=False)
         if mode == "strict":
             jax.debug.callback(
-                lambda p, q: spectral_closure.note_device_snap(where, p.max(), q.max()),
+                lambda p, q: spectral_closure.note_device_snap(
+                    where, np.asarray(p).max(), np.asarray(q).max()),
                 n_pre, n_post)
         return 0
 
@@ -1550,6 +1551,9 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
             "Sigma_c MAE 54.4 eV at exit 0).  Mode=" + mode + ". ***",
             d=n_drop, k=kappa, w=dropped_w, ordered=False)
         jax.debug.callback(
+            # Callback operands can be CPU JAX arrays. Reduce on the host:
+            # a JAX reduction here compiles only on the q-owner process and
+            # can deadlock its peers before the intended policy refusal.
             lambda k, d, w: rank_criterion.note_device_finding(
                 where,
                 "the cut bound (max %d directions dropped on one q) at "
@@ -1557,7 +1561,8 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
                 "discarding up to %.3e of tr|C|.  Reduce the centroid "
                 "budget, or raise zeta_rcond back onto the certified "
                 "plateau (1e-8 .. 1e-4)."
-                % (int(d.max()), float(k.max()), _kcert, float(w.max()))),
+                % (int(np.asarray(d).max()), float(np.asarray(k).max()),
+                   _kcert, float(np.asarray(w).max()))),
             kappa, n_drop, dropped_w)
         return 0
 
