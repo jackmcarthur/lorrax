@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — decoupled sector eighs priced beside their own stacks; the sector ledger bounds the peak
+
+Each decoupled CC/TT eigh stack now takes its room beside its own boundary
+stack instead of the largest one, the derivative panels dW Q are released
+once the pencil is formed, and TT reduces before CC, so TT's largest stacks
+run beside no other sector's outputs. Each sector's held all-parent outputs
+are a ledger row through the CT rounds, each eigh runs under a row of its
+boundary and its whole room, and the stacks row carries the stage program and
+the output stage, so the constructor's section prices bound the measured pool
+peaks (replay of the CrI3 24×24 P64 leg, claims 3545 and 3555: TT.all 64.91,
+CC.all 35.77 GB, `tests/test_shared_pole_decoupled_price.py`). A runtime guard
+runs a stack the ledger admits one whole matrix per rank on the whole mesh,
+with one warning, when the measured free pool (the minimum over processes) is
+short of its program. At CrI3 24×24 P64 the 61 × 18432 Y^H G_r Y stack, which
+ran as 61 whole-mesh solves (about 376 s per map), gets a 46.2 GB room against
+its 43.3 GB route-(c) program (estimate from the shapes). The report now has a
+timing and memory row per decoupled sub-stage (`decoupled.selection`,
+`.eigh_hvv`, ...). Results are unchanged: CrI3 6×6 and Fe 4³ bispinor eqp
+equal to main within 0.05 µeV through map 1 (claim 3574). No deck change.
+
 ## 2026-10-07 — bounded ordered-reference setup reuses compiled callables
 
 The ordered native-pair reference constructor passes pair validity as

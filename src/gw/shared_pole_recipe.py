@@ -1114,6 +1114,61 @@ def support_line_count(reads_ev, height_ev, imaginary_count, held_count,
     return count, dict(reach_ev=reach, strip=int(strip), floor=floor, cap=cap, count=count)
 
 
+def _held_line_sites(sites_for, line_count, line_count_rule, support_receipt, support_session):
+    """This map's line sites, held across SC maps (pad-then-hold, owner 2026-09-25).
+
+    ``sites_for(n)`` places n sites by the support rule over this map's reads.  Map 0
+    (the unretained reference) and a one-shot use the rule's own count.  From the
+    first retained map the session holds the count and the sites:
+
+    * the count only grows: fewer reads keep the held count over the current reads,
+      so the sites stay comparable with the held ones;
+    * the held sites stay while the rule would place every site within
+      max(LINE_SITE_HOLD_EV, a tenth of the last SC residual) of them;
+    * a larger count (requested reads past the held reach) or a larger drift
+      re-plans, logged as ``line_site_replan``.
+
+    The receipt is hashed with the recipe (JSON, no NaN or inf): the drift is a
+    float, or null when the count changed, with ``line_site_count`` [held, now].
+    Returns (sites, line_count_rule).
+    """
+    retained = support_receipt is not None and support_receipt['status'] != 'initial_reference'
+    held_lines = support_session.get('line_count') if retained else None
+    if held_lines is not None and line_count <= held_lines:
+        line_count = int(held_lines)
+        line_count_rule = dict(line_count_rule, count=line_count, held_count=int(held_lines))
+    line = sites_for(line_count)
+    if not retained:
+        return line, line_count_rule
+    previous_line = support_session.get('line_ev')
+    if support_receipt['status'] == 'hit' and previous_line is not None:
+        held = np.asarray(previous_line, dtype=np.float64)
+        same = line.shape == held.shape
+        drift = float(np.max(np.abs(line - held))) if same else None
+        support_receipt['line_site_drift_ev'] = drift
+        support_receipt['line_site_count'] = [int(held.size), int(line.size)]
+        hold = max(LINE_SITE_HOLD_EV, 0.1 * float(support_session.get('sc_residual_ev', 0.0)))
+        if same and drift <= hold:
+            line = held
+        else:
+            support_session['epoch'] += 1
+            support_receipt.update(status='expanded', epoch=support_session['epoch'])
+            if same:
+                worst = int(np.argmax(np.abs(line - held)))
+                support_receipt['line_site_replan'] = (
+                    f"max site drift {drift:.4f} eV > {hold:.4f} eV "
+                    f"(site {worst}: {held[worst]:.4f} -> {line[worst]:.4f} eV); "
+                    f"epoch {support_session['epoch']}")
+            else:
+                support_receipt['line_site_replan'] = (
+                    f"line count {held.size} -> {line.size} (reads reach "
+                    f"{line_count_rule['reach_ev']:.3f} eV); epoch {support_session['epoch']}")
+    support_session['line_count'] = int(line.size)
+    # This is the existing SC sampling geometry, never W samples or a model.
+    support_session['line_ev'] = tuple(float(v) for v in line)
+    return line, line_count_rule
+
+
 def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, reads_ev, count,
                             recipe=shared_real_pole_v1_r3b, grid=4001, *, valid_kn=None):
     """Line sites from the band structure alone: the support rule (report section IV.B).
@@ -1287,32 +1342,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         held_count = len(recipe['held_line_fractions']) + np.unique(
             np.sqrt(imaginary[[0, -2]] * imaginary[[1, -1]])).size
         line_count, line_count_rule = support_line_count(reads, height, count, held_count, recipe, tier)
-        line = support_rule_line_sites(energies * RYD_TO_EV, census['mu_ry'] * RYD_TO_EV, eta, height,
-                                       reads, line_count, valid_kn=valid)
-        if support_receipt is not None and support_receipt['status'] != 'initial_reference':
-            previous_line = support_session.get('line_ev')
-            if support_receipt['status'] == 'hit' and previous_line is not None:
-                # The held sites stay valid while the support rule would place
-                # the same sites for the current bands (s(E_now) = s_held).
-                held = np.asarray(previous_line, dtype=np.float64)
-                drift = (float(np.max(np.abs(line - held))) if line.shape == held.shape
-                         else math.inf)
-                support_receipt['line_site_drift_ev'] = drift
-                hold = max(LINE_SITE_HOLD_EV, 0.1 * float(support_session.get('sc_residual_ev', 0.0)))
-                if drift <= hold:
-                    line = held
-                else:
-                    support_session['epoch'] += 1
-                    support_receipt.update(status='expanded', epoch=support_session['epoch'])
-                    worst = (int(np.argmax(np.abs(line - held)))
-                             if line.shape == held.shape else -1)
-                    support_receipt['line_site_replan'] = (
-                        f"max site drift {drift:.4f} eV > {hold:.4f} eV "
-                        f"(site {worst}: {held[worst] if worst >= 0 else float('nan'):.4f} -> "
-                        f"{line[worst] if worst >= 0 else float('nan'):.4f} eV); "
-                        f"epoch {support_session['epoch']}")
-            # This is the existing SC sampling geometry, never W samples or a model.
-            support_session['line_ev'] = tuple(float(v) for v in line)
+        line, line_count_rule = _held_line_sites(
+            lambda n: support_rule_line_sites(energies * RYD_TO_EV, census['mu_ry'] * RYD_TO_EV, eta,
+                                              height, reads, n, valid_kn=valid),
+            line_count, line_count_rule, support_receipt, support_session)
     if override is not None:
         # Both ladders are replaced together; height, held fractions, widths,
         # zero policy and every gate stay the resolver's own. u_min/u_max/kappa
