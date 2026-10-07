@@ -12,7 +12,9 @@ from gw.contour_reference import project_interaction_diagonal
 @pytest.fixture
 def mesh():
     devices=np.asarray(jax.devices())
-    if devices.size>=4:
+    # The native distributed matmul communicator has one process per cell;
+    # lx test's one-process/four-device mesh is not that execution geometry.
+    if jax.process_count()==4 and devices.size>=4:
         return Mesh(devices[:4].reshape(2,2),('x','y'))
     return Mesh(devices[:1].reshape(1,1),('x','y'))
 
