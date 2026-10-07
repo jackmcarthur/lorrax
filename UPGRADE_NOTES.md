@@ -18,6 +18,11 @@ a native fit: the reference caller must bind archive/source hashes, native
 validity and feature windows separately. No production recipe/default law
 or deck change.
 
+The native callback keeps a separate padded face-band carrier at odd
+logical edges. Its G-slot carrier still uses the whole-mesh divisor; the
+face carrier uses the existing X/Y face specifications. Both virtual tails
+remain zero. The ordinary reader final extent remains unchanged.
+
 ## 2026-10-07 — the decoupled sector route is admitted by its price; the decoupled CT needs route-(c) eighs and runs after the selection panels are released
 
 060697565's rule (decoupled only when parents < ranks) is replaced by a price, in this order:

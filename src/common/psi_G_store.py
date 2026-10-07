@@ -1281,8 +1281,12 @@ def load_parent_psi_G(
             return (jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128),
                     jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128))
         acc_y, acc_x = _zero_faces()
+        face_bands = (padded_axis(b1 - b0, mesh_xy,
+            name="native parent face carrier",
+            specs=((PSI_NMU_SPEC, 1), (PSI_MUNT_SPEC, 2))).carrier
+            if band_reader is not None else b1 - b0)
         _, finish = _centroid_face_kernels(
-            b0, meta, mu_active_mask, n_rmu, int(mu_pad), b1 - b0, out_X, out_Y,
+            b0, meta, mu_active_mask, n_rmu, int(mu_pad), face_bands, out_X, out_Y,
             stage_X, stage_Y)
     else:
         mu_pad, mu_t = P_, 1

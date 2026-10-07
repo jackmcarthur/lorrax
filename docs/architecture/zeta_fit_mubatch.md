@@ -59,6 +59,12 @@ energies or occupied states. The reference controller sets the declared
 logical band extent before sampling, so centroid faces and the G-slot store
 cover the same fit windows.
 
+For this optional route the centroid faces retain their face-band carrier
+from the existing padding owner, while the G-slot store retains its
+product-mesh carrier. Both logical tails are exact zeros; an odd native
+edge is not sliced to an indivisible face dimension. Ordinary reader
+requests keep their existing final extent.
+
 ## One μ batch
 
 conj ψ(G) of the n_p raw parents k̄ is resident, with G slots sharded

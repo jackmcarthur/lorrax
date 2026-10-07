@@ -144,3 +144,51 @@ def test_callback_census_required_and_bispinor_refused_before_read(mesh):
         load_parent_psi_G(**args,native_parent_band_counts=[6,4])
     with pytest.raises(ValueError,match='callable ordinary'):
         load_parent_psi_G(**args,band_reader=lambda **kw:None,native_parent_band_counts=[6,4],bispinor=True)
+
+
+def test_odd_native_extent_preserves_all_P_face_carrier_and_zero_tails():
+    """A genuine 2x2 addressable mesh exercises the incumbent face finish."""
+    if len(jax.devices()) < 4 or jax.process_count() != 1:
+        pytest.skip('requires one process with four CPU devices')
+    mesh4=Mesh(np.asarray(jax.devices()[:4]).reshape(2,2),('x','y'))
+
+    class ScalarLoader:
+        ngkmax=5;nkpts=1;nspinor=1
+        def ngk_valid(self,*,k):return np.asarray([5],np.int64)
+        def kvecs(self,*,k):return np.zeros((1,3),np.float64)
+        def box_index(self,*,k):return np.asarray([[0,16,48,4,12]],np.int32)
+
+    coefficients=np.zeros((1,8,1,5),np.complex128)
+    for b,g in np.ndindex(5,5):
+        coefficients[0,b,0,g]=(1+2*b+g)*(.07+.11j)
+    valid=np.arange(8)[None]<5
+    calls=[]
+    def read(*,band_range,pad_to,k_domain):
+        calls.append((band_range,pad_to,k_domain))
+        assert band_range==(0,5) and pad_to==8 and k_domain=='ibz'
+        return jax.device_put(coefficients,NamedSharding(mesh4,band_sphere_spec())),valid
+    points=np.asarray([[0,0,0],[1,2,0],[2,1,1],[3,0,2]],np.int32)
+    meta=SimpleNamespace(fft_grid=(4,4,4),nspinor=1,nk_tot=1,
+                         b_id_4_user=5,memory_per_device_gb=1.)
+    result=load_parent_psi_G(wfn=ScalarLoader(),mesh_xy=mesh4,meta=meta,
+        band_range=(0,5),band_chunk=8,centroid_indices=points,
+        band_reader=read,native_parent_band_counts=np.asarray([5]),
+        print_fn=lambda _:None)
+    assert calls==[((0,5),8,'ibz')]
+    assert result.psi_G.shape==(1,8,1,8)
+    expected_G=np.pad(coefficients,((0,0),(0,0),(0,0),(0,3)))
+    np.testing.assert_array_equal(np.asarray(result.psi_G),expected_G)
+    g=np.asarray([[0,0,0],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0]])
+    phase=np.exp(2j*np.pi*np.einsum('gd,md->gm',g/4.,points))/8.
+    expected=np.einsum('kbsg,gm->kbsm',coefficients,phase)
+    # Each persistent face shards bands over one size-2 mesh axis; the
+    # Gslot store shards over the product size4. These carriers differ.
+    assert result.faces[0].shape==(1,6,1,4)
+    assert result.faces[1].shape==(1,4,6,1)
+    np.testing.assert_allclose(np.asarray(result.faces[0]),expected[:,:6],rtol=3e-13,atol=3e-13)
+    np.testing.assert_allclose(np.asarray(result.faces[1]),expected[:,:6].conj().transpose(0,3,1,2),rtol=3e-13,atol=3e-13)
+    for face in result.faces:
+        assert len(face.sharding.device_set)==4
+        assert len(face.addressable_shards)==4
+    np.testing.assert_array_equal(np.asarray(result.faces[0])[:,5:],0.)
+    np.testing.assert_array_equal(np.asarray(result.faces[1])[:,:,5:],0.)
