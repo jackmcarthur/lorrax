@@ -96,22 +96,22 @@ also stamps the restart; no process-global file cache is used. Every restart
 invocation independently authenticates the requested manifest before accepting
 stored tensors and samples.
 
-The current augmentation reaches the fitted exchange and screening vertices.
-The live Hartree owner, `gw.hartree.direct_field_matrices`, independently
-reloads the original WFN and currently constructs its smooth occupied density.
-It does not consume these reconstructed fitting samples or local corrections.
-Unchanged Hartree matrices in fitting regression checks therefore certify
-existing-flow parity, not augmented Hartree. The current path alone cannot
-establish the total reconstructed Coulomb contribution to a band shift.
-Hartree uses its full FFT-grid Poisson operator with G=0 omitted, whereas the
-exchange fitting benchmark may use an explicit Fourier-body cutoff; these
+Exchange, screening and correlation receive the same reconstructed sample
+bundle and fitted Coulomb tensor. There is no separate smooth screening
+vertex. The optical q-to-zero derivative remains an independent consistency
+requirement; common finite-q samples alone do not certify that derivative.
+The reconstructed occupied Hartree source is captured during fitting, before
+donation. Its public receiving hook evaluates the same served states with
+the independent full-FFT Poisson owner. Hartree omits G=0, whereas exchange
+has its canonical finite-cell head and explicit Fourier-body cutoff. Their
 operator domains require separate comparisons.
 
 ## Charge Hartree through the same ISDF factor
 
-The developing numerical seam `isdf.atomic_hartree` contracts reconstructed
-occupied sources and receiving vertices. It does not activate a public GW
-consumer. Physical source occupations \(f_{nk}\) and normalized full-zone
+The numerical seam `isdf.atomic_hartree` contracts reconstructed occupied
+sources and receiving vertices; `gw.augmentation_hartree` and
+`gw.augmentation_hartree_receiving` own its public handoff. Physical source
+occupations \(f_{nk}\) and normalized full-zone
 weights define \(\rho=\sum_{nk}w_kf_{nk}\Psi_{nk}^\dagger\Psi_{nk}\);
 they are independent of the endpoint weights used in the fitting loss.
 Typed scalar point transport sums the occupation trace after spin and Bloch
@@ -269,6 +269,59 @@ RHS. The default policy retains its existing arithmetic. At finite body cutoff
 these policies define different operators and must be authenticated separately
 in an accuracy comparison. The finite-cutoff on-site difference is signed;
 positive semidefiniteness requires a physical-span check, not eigenvalue clipping.
+
+The explicit `charge_metric.body_metric=physical_low_local_high` policy
+instead completes the periodic correction before subtracting its low-G part:
+
+\[
+V_+=B_{\mathrm{low}}^{\mathrm{actual}}(s+\Delta,s+\Delta)
+    +B_{\mathrm{per}}^{\mathrm{bare}}(\Delta,\Delta)
+    -B_{\mathrm{low}}^{\mathrm{bare}}(\Delta,\Delta).
+\]
+
+For a positive low-G kernel this is its action on the physical density plus
+the positive bare high-G correction. Positivity belongs to the represented
+functional; small floating-point negative eigenvalues are retained and
+compared with backward error. No clipping is part of fitting or screening.
+The complete bare periodic correction is
+
+\[
+B_{\mathrm{per}}^{\mathrm{bare}}(\Delta,\Delta)
+=\sum_A[B_{\mathrm{free}}(\Delta_A,\Delta_A)
+        -B_{\mathrm{free}}(g_A,g_A)]
+ +B_{\mathrm{per}}^{\mathrm{bare}}(g,g)
+ -{2\over\Omega}(Q_\Delta^*\Phi+\Phi^*Q_\Delta).
+\]
+
+Here the bracket is the bilinear form in Ry, \(Q_\Delta\) is the correction
+charge, and \(\Phi\) is the integral of the neutral free potential. Both
+adjoints are necessary. The global compensation metric excludes Gamma G=0;
+the physical low-G density keeps the existing head convention. This policy
+requires the same exact served monopoles used by its local and Fourier
+pieces. Its normal equations solve only correction and exact-M0 columns;
+smooth cross terms are already in the physical low-G action, so no local PS
+RHS is assembled or solved.
+
+`isdf.positive_charge_metric` retains the global moment Gram on
+`P(None,'x','y')`. The solved moment rows move from their existing q owners
+to that face once, and two public N,N GEMMs complete the metric before the
+usual centroid unpack. The cache is an explicitly pinned geometry artifact;
+it has no orbital-frame dependence or imported runtime code. Its
+[cache contract](../reference/augmentation_cache.md) specifies finite-cutoff
+evidence and unit conversion. The same ordinary ISDF factor and plane-wave
+pass supply all these columns. Downstream charge screening and Sigma
+contractions consume the resulting tensor unchanged.
+
+This completion does not restore omitted high-G smooth self and cross terms.
+Their cutoff must converge separately. A smooth source cut at energy
+\(E_{\rm wfc}\) has pair-density support through \(4E_{\rm wfc}\). Covering
+that sphere also requires transfer-dependent physical Miller representatives
+at the Nyquist boundary of an even FFT grid. A fixed `fftfreq` table may fold
+an allowed boundary coefficient onto a reciprocal vector outside the sphere;
+cutoff convergence on that fixed table alone does not establish complete
+plane-wave support. Reconstruction, radial/angular
+representation, interpolation rank, normalization window and optical-head
+consistency retain separate error controls.
 
 An optional served-field monopole enrichment addresses radial sampling error
 without imposing an overlap identity. Let \(C\) be atomic reconstruction

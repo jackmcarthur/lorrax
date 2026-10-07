@@ -329,7 +329,10 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
         remains smooth+delta; V body uses smooth+compensation in this mode.
     monopole_rhs : (Q_pad,mu_packed,N_atom) complex128, optional
         Exact served-field radial Y00 moment RHS, in the same grid units.
-        Requires smooth_rhs. Its coefficients share the same charge solve;
+        With smooth_rhs it enriches the incumbent paired delta/PS action.
+        Without smooth_rhs the explicit delta/exactM0 action has nf+N_atom
+        columns and applies enriched free delta-delta minus compensation.
+        Its coefficients share the same charge solve;
         delta and compensation receive the identical analytic g0 enrichment.
         This is a physical-field integral, never a native-overlap charge pin.
     radius, weights_dr : (N_r,) float64
@@ -388,28 +391,30 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
         raise ValueError("radial Coulomb provider geometry or q-owner RHS disagrees with smooth fit")
     compensated_body = smooth_rhs is not None
     enriched_monopole = monopole_rhs is not None
-    if enriched_monopole and not compensated_body:
-        raise ValueError("served monopole enrichment requires the explicit onsite smooth-neutral policy")
-    if compensated_body:
+    delta_only_enrichment = enriched_monopole and not compensated_body
+    if compensated_body or delta_only_enrichment:
         from isdf.zeta_mubatch import _require_q_owned
         if interpolation_degree is None:
             raise ValueError("onsite smooth-neutral cross requires physical density interpolation")
         if zeta_g.solver_kind == 'lu':
             raise ValueError("onsite smooth-neutral provider requires the scalar charge factor")
         _require_q_owned(rhs, mesh, (Qp, mu, na*nh*nr), name='delta local RHS')
-        _require_q_owned(smooth_rhs, mesh, rhs.shape, name='smooth PS local RHS')
+        if compensated_body:
+            _require_q_owned(smooth_rhs, mesh, rhs.shape, name='smooth PS local RHS')
         if enriched_monopole:
             _require_q_owned(monopole_rhs, mesh, (Qp, mu, na), name='served monopole local RHS')
     tables = atomic_radial_metrics(r, w, harmonics[:, 0], support_radius=support_radius,
                                   fft_points=fft_points, cell_volume=cell_volume,
                                   interpolation_degree=interpolation_degree,
                                   quadrature_order=quadrature_order)
-    if compensated_body:
+    if compensated_body or delta_only_enrichment:
         cross_tables = _smooth_neutral_tables(tables, support_radius=support_radius,
                                              fft_points=fft_points, cell_volume=cell_volume)
-        inputs = (rhs, smooth_rhs, monopole_rhs) if enriched_monopole else (rhs, smooth_rhs)
+        inputs = ((rhs,monopole_rhs) if delta_only_enrichment else
+                  ((rhs, smooth_rhs, monopole_rhs) if enriched_monopole else (rhs, smooth_rhs)))
         provider_rhs = jnp.concatenate(inputs, axis=-1)
-        _require_q_owned(provider_rhs, mesh, (Qp, mu, 2*na*nh*nr+(na if enriched_monopole else 0)), name='paired local RHS')
+        nc = (na*nh*nr if delta_only_enrichment else 2*na*nh*nr)+(na if enriched_monopole else 0)
+        _require_q_owned(provider_rhs, mesh, (Qp, mu, nc), name='delta/exactM0 or paired local RHS')
     else:
         cross_tables, provider_rhs = None, rhs
     cache = None
@@ -444,7 +449,7 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
 
     def ft_local(coefficients, bessel, angular, g_radial, steps_, degree_rows, moment_rows):
         # Every operand is on this q owner. No all-gather in this body.
-        delta_coefficients = coefficients[..., :na*nh*nr] if compensated_body else coefficients
+        delta_coefficients = coefficients[..., :na*nh*nr] if compensated_body or delta_only_enrichment else coefficients
         coeff = delta_coefficients.reshape(coefficients.shape[0], mu, na, nh, nr)
         zero = jnp.zeros((coeff.shape[0], mu, gt), jnp.complex128)
         def add(acc, ah):
@@ -455,7 +460,8 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
             radial = jnp.einsum('qmr,qgr->qmg', values, bessel[:, lrow])
             moment = jnp.einsum('qmr,r->qm', values, moment_rows[lrow])
             if enriched_monopole:
-                exact = coefficients[..., 2*na*nh*nr+a]
+                offset = na*nh*nr if delta_only_enrichment else 2*na*nh*nr
+                exact = coefficients[..., offset+a]
                 epsilon = jnp.where(h == monopole_harmonic, exact-moment, 0.)
                 enriched = radial+epsilon[:, :, None]*g_radial[:, lrow, None, :]
                 # A zero enrichment retains the incumbent arithmetic exactly.
@@ -484,21 +490,26 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
     onsite_kernel = jax.jit(shard_map(onsite_local, mesh=mesh,
         in_specs=(qspec, P(), P(), P()), out_specs=qspec, check_vma=False))
 
-    if compensated_body:
+    if compensated_body or delta_only_enrichment:
         def onsite_cross_local(coefficients, metric, cross_metric, steps_, degree_rows, moment_row=None):
-            density = coefficients[..., :2*na*nh*nr] if enriched_monopole else coefficients
-            coeff = density.reshape(coefficients.shape[0], mu, 2, na, nh, nr)
+            panels = 1 if delta_only_enrichment else 2
+            density = coefficients[..., :panels*na*nh*nr] if enriched_monopole else coefficients
+            coeff = density.reshape(coefficients.shape[0], mu, panels, na, nh, nr)
             if enriched_monopole:
                 interpolated = jnp.einsum('qmar,r->qma', coeff[:, :, 0, :, monopole_harmonic], tables['moments'][0])
-                epsilon = coefficients[..., 2*na*nh*nr:]-interpolated
+                epsilon = coefficients[..., panels*na*nh*nr:]-interpolated
             zero = jnp.zeros((coeff.shape[0], mu, mu), jnp.complex128)
             def add(acc, ah):
                 a, h = ah
                 row = degree_rows[h]
-                delta, smooth = coeff[:, :, 0, a, h], coeff[:, :, 1, a, h]
+                delta = coeff[:, :, 0, a, h]
                 term = jnp.einsum('qmr,rt,qnt->qmn', jnp.conj(delta), metric[row], delta)
-                cross = jnp.einsum('qmr,rt,qnt->qmn', jnp.conj(smooth), cross_metric[row], delta)
-                result = acc + term + cross + jnp.conj(jnp.swapaxes(cross, -2, -1))
+                if delta_only_enrichment:
+                    result = acc + term
+                else:
+                    smooth = coeff[:, :, 1, a, h]
+                    cross = jnp.einsum('qmr,rt,qnt->qmn', jnp.conj(smooth), cross_metric[row], delta)
+                    result = acc + term + cross + jnp.conj(jnp.swapaxes(cross, -2, -1))
                 if enriched_monopole:
                     def enrich(value):
                         b_cross = jnp.einsum('qmr,r->qm', delta, moment_row)
@@ -542,7 +553,7 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
                               put(g_radial, P(XY, None, None)), scan_steps, dr, rows)
 
     def onsite(coefficients):
-        if compensated_body:
+        if compensated_body or delta_only_enrichment:
             if enriched_monopole:
                 return onsite_cross_kernel(coefficients, difference, neutral, scan_steps, dr, moment_cross)
             return onsite_cross_kernel(coefficients, difference, neutral, scan_steps, dr)
@@ -553,6 +564,8 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
                                    'max_density_validation_error',
                                    'max_compensation_validation_error', 'validation_points')}
     return dict(rhs=provider_rhs, fourier_tile=fourier_tile, onsite=onsite,
+                radial_tables=tables if delta_only_enrichment else None,
+                exact_monopole_offset=na*nh*nr if delta_only_enrichment else 2*na*nh*nr,
                 radial_fourier_diagnostics=diagnostics,
                 compensated_body=compensated_body,
                 moment_enrichment='served_monopole' if enriched_monopole else 'none',

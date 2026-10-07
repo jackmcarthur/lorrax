@@ -143,6 +143,28 @@ def make_occupied_density_projection(mesh, indices, weights, *, output_shape):
     return project
 
 
+def neutral_potential_mean_rows(tables, *, support_radius,
+                                fft_points=1, cell_volume=1):
+    """The existing interpolated monopole Q2 and neutral mean functionals.
+
+    ExactM0 enrichment adds the same epsilon*g0 to delta and compensation,
+    so the neutral mean uses the pre-enrichment interpolated moment. The
+    potential row is the free 1/r potential integral, not an energy half.
+    """
+    degrees=np.asarray(tables['degrees'])
+    row0=np.flatnonzero(degrees==0)
+    if (len(row0)!=1 or not np.isfinite(support_radius) or support_radius<=0
+            or not np.isfinite(cell_volume) or cell_volume<=0
+            or int(fft_points)!=fft_points or fft_points<1):
+        raise ValueError('Neutral mean requires physical interpolated monopole geometry')
+    row0=int(row0[0]);nodal=np.asarray(tables['interpolation_map']).copy()
+    nodal[:tables['origin_row_count'],0]=tables['origin_factors'][row0]
+    q2=(tables['quadrature_weights_dr']*tables['quadrature_radius']**4)@nodal
+    phi=-(2*np.pi/3)*np.sqrt(4*np.pi)*(float(fft_points)/float(cell_volume))*\
+        (q2-3*float(support_radius)**2/17*tables['moments'][row0])
+    return dict(q2_row=q2,potential_mean_row=phi,monopole_degree_row=row0)
+
+
 def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
                           local_delta_density, local_monopole, *, radius,
                           weights_dr, lm, centers_cart, support_radius,
@@ -218,9 +240,7 @@ def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
     source_moments=np.einsum('bahr,hr->bah',sd,moments)
     epsilon=exact-source_moments[:,:,mono]
     source_comp=source_moments.copy();source_comp[:,:,mono]=exact
-    nodal=np.asarray(tables['interpolation_map']).copy()
-    nodal[:tables['origin_row_count'],0]=tables['origin_factors'][row0]
-    q2=(tables['quadrature_weights_dr']*tables['quadrature_radius']**4)@nodal
+    q2=neutral_potential_mean_rows(tables,support_radius=R)['q2_row']
     source_phi=-(2*np.pi/3)*np.sqrt(4*np.pi)*np.sum(
         np.einsum('bar,r->ba',sd[:,:,mono],q2)
         -3*R**2/17*source_moments[:,:,mono],axis=-1)

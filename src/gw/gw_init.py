@@ -227,7 +227,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          carrier_bispinor=None, carrier_lift=None,
                          transverse_identity=None,
                          atomic_augmentation_identity=None,
-                         charge_fit_weights=None):
+                         charge_fit_weights=None, fft_sphere_convention=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
 	Every entry is an input that CHANGES ζ numerically.  Deliberately
@@ -291,6 +291,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	therefore authenticated independently.
 	"""
 	import json
+	if fft_sphere_convention not in (None, "q_aware_unique_fft_image_v1"):
+		raise ValueError("unknown physical FFT-sphere convention")
 	if uses_transverse_interaction(cfg) and not transverse_identity:
 		raise ValueError(
 			"_zeta_fit_provenance: transverse interaction is enabled but no "
@@ -469,6 +471,11 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		raise ValueError("charge endpoint weights cannot stamp a current-channel fit")
 	if int(vertex_mu_L) != 0 and meta.current_basis_rows is not None:
 		prov['current_fit_basis'] = 'circular'
+	# Only changed physical Miller tables acquire this non-legacy key.
+	# A small-cutoff fit therefore retains its exact historical JSON/identity;
+	# a fixed-box large-cutoff cache cannot supply the newly included columns.
+	if fft_sphere_convention is not None:
+		prov['fft_sphere_convention'] = fft_sphere_convention
 	return json.dumps(prov, sort_keys=True)
 
 
@@ -1516,6 +1523,26 @@ def _charge_fit_endpoint_weights(cfg, wfn, band_slices, *, print_fn=print):
 	return {'occupied_stop': occupied_stop, 'occupied_weight': occupied_weight}
 
 
+def _zeta_sphere_convention(wfn, sym, meta, centroid_indices, cutoff, *,
+                            write_ibz_only):
+	"""Authenticate the physical sphere on this channel's actual stored q rows."""
+	if int(meta.sys_dim) == 0:
+		return None
+	from common.coulomb_sphere import compute_per_q_bare_coulomb_components
+	from vcoul import CoulombGeometry
+	from .v_q_g_flat import _resolve_ibz_q_list
+	basis = getattr(meta, 'mu_basis', None)
+	q_sym = sym if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None else None
+	q_frac = _resolve_ibz_q_list(
+		sym=q_sym, centroid_indices=centroid_indices, kgrid=tuple(meta.kgrid),
+		fft_grid=meta.fft_grid, mu_basis=basis,
+		coordinate_kind=getattr(basis, 'coordinate_kind', 'fft_indices'),
+		context="zeta physical FFT-sphere provenance")[1]
+	return compute_per_q_bare_coulomb_components(
+		meta.fft_grid, CoulombGeometry.from_wfn(wfn).bvec, q_frac,
+		float(cutoff), sys_dim=int(meta.sys_dim))['sphere_convention']
+
+
 def _resolve_zeta_fit_contract(
 		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
 		*, print_fn=print, atomic_augmentation_identity=None):
@@ -1638,6 +1665,13 @@ def _resolve_zeta_fit_contract(
 			os.path.join(tmp_dir, f"zeta_q_mu{mu_L}.h5")
 			for mu_L in (1, 2, 3))
 
+	sphere_charge = _zeta_sphere_convention(
+		wfn, sym, meta, centroid_indices, zeta_cutoff,
+		write_ibz_only=write_ibz_only_charge)
+	sphere_transverse = (_zeta_sphere_convention(
+		wfn, sym, meta_transverse, centroids_transverse, zeta_cutoff,
+		write_ibz_only=write_ibz_only_transverse)
+		if meta_transverse is not None else None)
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
 	# Every zeta names its carrier, so a zeta fit on another lift refits.
@@ -1654,7 +1688,8 @@ def _resolve_zeta_fit_contract(
 		carrier_lift=representation.charge_lift,
 		vertex_mu_L=0, transverse_identity=transverse_identity,
 		atomic_augmentation_identity=atomic_augmentation_identity,
-		charge_fit_weights=charge_fit_weights)
+		charge_fit_weights=charge_fit_weights,
+		fft_sphere_convention=sphere_charge)
 	provenance_transverse = tuple(
 		_zeta_fit_provenance(
 			wfn=wfn, meta=meta_transverse, cfg=cfg,
@@ -1667,7 +1702,8 @@ def _resolve_zeta_fit_contract(
 			band_norms=band_norms, carrier_bispinor=True,
 			carrier_lift=representation.current_lift,
 			vertex_mu_L=mu_L, transverse_identity=transverse_identity,
-			atomic_augmentation_identity=atomic_augmentation_identity)
+			atomic_augmentation_identity=atomic_augmentation_identity,
+			fft_sphere_convention=sphere_transverse)
 		for mu_L in ((1, 2, 3) if uses_transverse_interaction(cfg) else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)
 	reuse_charge = _zeta_reuse_ok(
@@ -2031,7 +2067,13 @@ def _fit_charge_zeta_channel(
             zeta_g = _zetas[0]
             if 'augmentation' in chunks:
                 from .isdf_augmentation import attach_local_augmentation
-                attach_local_augmentation(zeta_g, chunks.pop('augmentation'))
+                augmentation = chunks.pop('augmentation')
+                if augmentation.get('body_metric') == 'physical_low_local_high':
+                    _, body_cutoff = _vcoul_bvec_and_cutoff(cfg, wfn)
+                    attach_local_augmentation(zeta_g, augmentation, body_contract={
+                        'sys_dim':int(meta.sys_dim), 'bare_coulomb_cutoff_ry':float(body_cutoff)})
+                else:
+                    attach_local_augmentation(zeta_g, augmentation)
                 if getattr(zeta_g, 'pending_zeta_write', False):
                     zeta_g.pending_fit_provenance = _provenance
     if not _reuse_charge:

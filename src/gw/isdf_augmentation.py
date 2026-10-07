@@ -75,7 +75,19 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
     if 'charge_metric' in manifest:
         accepted = ({'smooth_neutral_cross':'onsite'},
                     {'smooth_neutral_cross':'onsite','moment_enrichment':'served_monopole'})
-        if manifest['charge_metric'] not in accepted:
+        metric = manifest['charge_metric']
+        positive = isinstance(metric, dict) and metric.get('body_metric') == 'physical_low_local_high'
+        if positive:
+            control = metric.get('periodic_compensation_cache')
+            if (set(metric) != {'body_metric','moment_enrichment','periodic_compensation_cache'}
+                    or metric['moment_enrichment'] != 'served_monopole'
+                    or not isinstance(control, dict) or set(control) != {'file','file_sha256'}
+                    or not isinstance(control['file'], str) or not control['file']
+                    or not isinstance(control['file_sha256'], str)
+                    or len(control['file_sha256']) != 64
+                    or any(c not in '0123456789abcdef' for c in control['file_sha256'])):
+                raise ValueError('positive charge metric requires exactly delta/exact-M0 and a pinned periodic compensation file')
+        elif metric not in accepted:
             raise ValueError("explicit charge_metric must contain exactly smooth_neutral_cross=onsite and optional moment_enrichment=served_monopole")
         if 'interpolation_degree' not in manifest['radial']:
             raise ValueError("onsite smooth-neutral charge cross requires radial interpolation_degree")
@@ -1299,7 +1311,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     source_capture = _hartree_source_request(hartree_source_request, wfn=wfn, plan=plan,
                                              public_range=source_range)
     if source_capture is not None and (overlap_mode != 'full_wfn_lowdin'
-            or artifact.get('charge_metric', {}).get('smooth_neutral_cross') != 'onsite'
+            or (artifact.get('charge_metric', {}).get('smooth_neutral_cross') != 'onsite'
+                and artifact.get('charge_metric', {}).get('body_metric') != 'physical_low_local_high')
             or artifact.get('charge_metric', {}).get('moment_enrichment') != 'served_monopole'):
         raise ValueError('Hartree source capture requires SAME150 served overlap, onsite cross and exact served monopoles')
     if current is not None and overlap_mode != 'full_wfn_lowdin':
@@ -1351,6 +1364,24 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     qpad = ((len(q_indices)+Ptot-1)//Ptot)*Ptot
     mu = int(plan.n_centroid_packed)
     rhs_bytes = 16*qpad*mu*na*nh*nr/Ptot
+    reciprocal = float(wfn.blat)*np.asarray(wfn.bvec)
+    positive_body = artifact.get('charge_metric',{}).get('body_metric') == 'physical_low_local_high'
+    if positive_body and int(meta.sys_dim) != 3:
+        raise ValueError('positive local-high charge metric requires periodic bulk 3D')
+    periodic_plan = None
+    if positive_body:
+        from symmetry_maps import bgw_integer_q_to_fractional
+        from isdf.positive_charge_metric import plan_positive_periodic_action
+        qfull = np.indices(tuple(meta.kgrid)).reshape(3, -1).T
+        periodic_control = artifact['charge_metric']['periodic_compensation_cache']
+        periodic_path = (Path(artifact['directory'])/periodic_control['file']).resolve()
+        geometry = dict(reciprocal_rows_bohr_inverse=reciprocal,
+            cell_volume_bohr3=float(meta.cell_volume), atom_centres_bohr=centers@lattice,
+            operator_q_fractional=bgw_integer_q_to_fractional(qfull[q_indices], meta.kgrid),
+            support_radius_bohr=float(support))
+        periodic_plan = plan_positive_periodic_action(mesh_xy, geometry=geometry, lm=lm,
+            centroid_basis=meta.mu_basis, fft_points=int(meta.n_rtot),
+            cache_path=periodic_path, cache_file_sha256=periodic_control['file_sha256'])
     onsite_cross = artifact.get('charge_metric',{}).get('smooth_neutral_cross') == 'onsite'
     moment_enrichment = artifact.get('charge_metric',{}).get('moment_enrichment') == 'served_monopole'
     rhs_copies = 4 if onsite_cross else 2
@@ -1461,6 +1492,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     price = (source_bytes+4*face_bytes+rhs_copies*rhs_bytes+3*factor_v_bytes+4*point_faces
              +point_workspace['total']+dft_tile+phase_bytes+smooth_tile+overlap_bytes+moment_bytes
              +prepared_overlap_host_bytes+prepared_projection_host_bytes+angular_workspace['total']+current_price)
+    if periodic_plan is not None:
+        price += periodic_plan['resident_bound_bytes_per_rank']
     hartree_source_bytes = 0.
     if source_capture is not None:
         # Canonical local density scan: one additional band-owned G carrier,
@@ -1500,7 +1533,6 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     if gv.shape[0] != npar or gv.shape[-1] != 3 or gv.shape[1] > ng:
         raise ValueError("raw signed G vectors disagree with augmentation source")
     gv = np.pad(gv,((0,0),(0,ng-gv.shape[1]),(0,0)))
-    reciprocal = float(wfn.blat)*np.asarray(wfn.bvec)
     wavevectors = (gv+kfrac[:,None,:]) @ reciprocal
     counts = np.asarray(wfn.ngk_valid(k=sym.parent_k_domain),dtype=int)
     if counts.shape != (npar,) or np.any(counts < 1) or np.any(counts > ng):
@@ -1865,6 +1897,13 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         state['served_moment_local_workspace_bytes_per_rank'] = aux_workspace
     state['charge_factor_equilibration'] = artifact.get('charge_fit',{}).get('conditioning')
     state['charge_fit_weights'] = dict(weight_options) if weight_options else None
+    if positive_body:
+        state['body_metric'] = 'physical_low_local_high'
+        control = dict(artifact['charge_metric']['periodic_compensation_cache'])
+        control['file'] = str((Path(artifact['directory'])/control['file']).resolve())
+        state['periodic_compensation_cache'] = control
+        state['periodic_plan'] = periodic_plan
+        state['periodic_action_workspace'] = periodic_plan['receipt']
     state['prepared_atomic_projection_host_bytes_per_process'] = prepared_projection_host_bytes
     state['atomic_projection_source'] = ('prepared_full_window_v2' if cached_coefficients is not None
                                          else 'canonical_runtime_projection_v1')
@@ -1897,7 +1936,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     return corrected_faces,state
 
 
-def attach_local_augmentation(zeta_g, state):
+def attach_local_augmentation(zeta_g, state, *, body_contract=None):
     """Bind the saved local RHS to the smooth fit's factor and exact G sphere."""
     from isdf.atomic_coulomb import radial_coulomb_provider
     from symmetry_maps import bgw_integer_q_to_fractional
@@ -1911,6 +1950,38 @@ def attach_local_augmentation(zeta_g, state):
     gv = np.asarray(zeta_g.gvec_components).transpose(0,2,1)
     kg = (gv+qfrac[:,None,:]) @ state['reciprocal']
     radial_controls = {key:state[key] for key in ('interpolation_degree','quadrature_order','fourier_points') if key in state}
+    if state.get('body_metric') == 'physical_low_local_high':
+        from isdf.coulomb_fourier_cache import load_periodic_compensation_cache
+        from isdf.positive_charge_metric import positive_radial_coulomb_provider
+        if (not isinstance(body_contract, dict)
+                or set(body_contract) != {'sys_dim','bare_coulomb_cutoff_ry'}
+                or body_contract['sys_dim'] != 3
+                or not np.isfinite(body_contract['bare_coulomb_cutoff_ry'])
+                or body_contract['bare_coulomb_cutoff_ry'] <= 0
+                or state.get('moment_enrichment') != 'served_monopole'
+                or 'monopole_rhs' not in state or 'smooth_rhs' in state):
+            raise ValueError('positive charge requires the canonical bulk body contract and delta/exact-M0 operands')
+        control = state['periodic_compensation_cache']
+        geometry = dict(reciprocal_rows_bohr_inverse=state['reciprocal'],
+            cell_volume_bohr3=state['cell_volume'], atom_centres_bohr=state['centers_cart'],
+            operator_q_fractional=qfrac, support_radius_bohr=state['support_radius'])
+        cache = load_periodic_compensation_cache(control['file'], mesh=zeta_g.mesh,
+            expected_file_sha256=control['file_sha256'], geometry=geometry, lm=state['lm'])
+        if 'prepared_fourier_cache' in state:
+            radial_controls['prepared_cache'] = state['prepared_fourier_cache']
+        provider = positive_radial_coulomb_provider(zeta_g, state['rhs'],
+            monopole_rhs=state['monopole_rhs'], radius=state['radius'],
+            weights_dr=state['weights_dr'], lm=state['lm'], centers_cart=state['centers_cart'],
+            q_frac=qfrac, gvec_components=np.asarray(zeta_g.gvec_components), q_plus_G_cart=kg,
+            cell_volume=state['cell_volume'], fft_points=state['fft_points'],
+            support_radius=state['support_radius'], minimum_atom_image_distance=state['nearest_atom_image'],
+            body_cutoff_ry=body_contract['bare_coulomb_cutoff_ry'], periodic_cache=cache,
+            periodic_plan=state['periodic_plan'],
+            **radial_controls)
+        provider['identity'] = state['identity']
+        zeta_g.local_augmentation = provider
+        del state['rhs'], state['monopole_rhs']
+        return zeta_g
     if 'smooth_rhs' in state:
         if state.get('smooth_neutral_cross') != 'onsite' or state['smooth_rhs'].shape != state['rhs'].shape:
             raise ValueError("onsite smooth RHS must use the same selected q/packed-mu/local axes")

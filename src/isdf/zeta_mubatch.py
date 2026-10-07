@@ -1000,6 +1000,7 @@ class ZetaG:
         augmentation = (self.local_augmentation if local_augmentation is None
                         else local_augmentation)
         compensated_body = False
+        positive_body = False
         if augmentation is not None:
             if (not isinstance(augmentation, dict)
                     or not callable(augmentation.get('fourier_tile'))
@@ -1008,9 +1009,10 @@ class ZetaG:
                 raise ValueError("ZetaG.contract_v: local_augmentation requires "
                                  "rhs, fourier_tile and onsite")
             body_metric = augmentation.get('body_metric', 'mixed_reciprocal')
-            if body_metric not in ('mixed_reciprocal', 'compensated'):
+            if body_metric not in ('mixed_reciprocal', 'compensated', 'physical_low_local_high'):
                 raise ValueError('ZetaG.contract_v: unknown local Coulomb body metric')
             compensated_body = body_metric == 'compensated'
+            positive_body = body_metric == 'physical_low_local_high'
             rhs = augmentation['rhs']
             if (rhs.ndim != 3 or rhs.shape[:2] != (st.Q_pad, st.mu_pad)
                     or int(rhs.shape[-1]) < 1):
@@ -1034,6 +1036,15 @@ class ZetaG:
         from common.collectives import device_put_process_local
         v_dev = device_put_process_local(
             v, NamedSharding(self.mesh, P(_XY, None)))
+        bare_dev = None
+        if positive_body:
+            bare = np.asarray(augmentation['bare_v_table'])
+            if (bare.shape != (st.Q, st.g_axis.logical)
+                    or not np.isfinite(bare).all() or np.any(bare < 0)):
+                raise ValueError('positive charge body requires the canonical finite bare q/G table')
+            bare = np.asarray(pad_to_axis(pad_to_axis(
+                jnp.asarray(bare, dtype=jnp.complex128), qa, axis=0), ga, axis=1))
+            bare_dev = device_put_process_local(bare, NamedSharding(self.mesh, P(_XY, None)))
         ngk_dev = device_put_process_local(
             ngk, NamedSharding(self.mesh, P(_XY)))
         sl_dev = device_put_process_local(
@@ -1043,7 +1054,8 @@ class ZetaG:
         step = _v_tile_kernel(self.mesh, self.solver_kind,
                               self.n_rmu_solve, st.g_tile, debug_m=dbg, with_v=with_v,
                               use_local_augmentation=augmentation is not None,
-                              compensated_body=compensated_body)
+                              compensated_body=compensated_body,
+                              positive_body=positive_body)
         mu = int(st.mu_pad)
         V, M, shell = _zero_accumulators(self.mesh, st.Q_pad, mu,
                                          int(sl.shape[1]), debug_m=dbg, with_v=with_v)
@@ -1062,7 +1074,7 @@ class ZetaG:
                 for name, tile in zip(('delta', 'compensation'), tiles):
                     _require_q_owned(tile, self.mesh,
                                      (st.Q_pad, mu, st.g_tile), name=name)
-                local_tiles = (tiles,)
+                local_tiles = ((tiles[0], tiles[1], bare_dev),) if positive_body else (tiles,)
             V, M, shell, zt = step(L_arg, Zt, v_dev, ngk_dev, sl_dev,
                                    jnp.int32(t), V, M, shell, *local_tiles)
             if zeta_io is not None:
@@ -1087,6 +1099,16 @@ class ZetaG:
                             f"{st.t_read:.2f}s); zeta file written")
             return None
         V = _finish_v(self.mesh, st.Q)(V)
+        if positive_body:
+            moments = augmentation['periodic_moment_rows'](local_coefficients)
+            moment_axis = augmentation['periodic_cache']['moment_axis']
+            _require_q_owned(moments, self.mesh,
+                (st.Q_pad, mu, moment_axis.carrier), name='periodic moment rows')
+            moments = _to_mu_owner(self.mesh, st.Q, 'xy')(moments)
+            periodic = augmentation['periodic_action'](
+                moments, augmentation['periodic_cache']['gram'])
+            V = V+periodic
+            del moments, periodic
         shell = _finish_shell(self.mesh, st.Q)(shell)
         if self.mu_basis is not None:
             V = self.mu_basis.unpack_operator(V)
@@ -1227,7 +1249,8 @@ def _add_q_owned(mesh):
 
 
 def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
-                   use_local_augmentation=False, compensated_body=False):
+                   use_local_augmentation=False, compensated_body=False,
+                   positive_body=False):
     """One G tile: ζ = C⁻¹Z, V += conj(ζ) v ζᵀ, shell gather (and M in debug).
 
     F (Q_pad, μ, μ) and Z (Q_pad, μ, g) are q-local; V, shell and M
@@ -1239,9 +1262,11 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
                          "not describe the augmented Coulomb metric")
     if compensated_body and not use_local_augmentation:
         raise ValueError('_v_tile_kernel: compensated body requires a local provider')
+    if positive_body and (not use_local_augmentation or compensated_body):
+        raise ValueError('_v_tile_kernel: physical-low body requires its own local provider')
     key = ('v_tile', _mesh_id(mesh), solver_kind, int(n_log),
            int(g_tile), bool(debug_m), bool(with_v), bool(use_local_augmentation),
-           bool(compensated_body))
+           bool(compensated_body), bool(positive_body))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
@@ -1251,7 +1276,8 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
     in_specs = (f_spec, P(_XY, None, None), P(_XY, None),
                 P(_XY), P(_XY, None), P(), acc, acc, acc)
     z_spec = P(_XY, None, None)
-    local_specs = ((z_spec, z_spec),) if use_local_augmentation else ()
+    local_specs = ((z_spec, z_spec, P(_XY, None)),) if positive_body else (
+        ((z_spec, z_spec),) if use_local_augmentation else ())
 
     @partial(shard_map, mesh=mesh, in_specs=in_specs + local_specs,
              out_specs=(acc, acc, acc, z_spec), check_vma=False)
@@ -1262,7 +1288,7 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
         zeta = jnp.where(mask[:, None, :], jax.vmap(one)(F, Z), 0)
         physical = zeta
         if use_local_augmentation:
-            delta, compensation = local_tiles[0]
+            delta, compensation = local_tiles[0][:2]
             delta = jnp.where(mask[:, None, :], delta, 0)
             compensation = jnp.where(mask[:, None, :], compensation, 0)
             physical = zeta + delta
@@ -1271,7 +1297,13 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
         vt = jnp.where(mask, jnp.take(v, jnp.clip(g_idx, 0, v.shape[-1] - 1),
                                       axis=1), 0)
         if use_local_augmentation:
-            if compensated_body:
+            if positive_body:
+                bare = local_tiles[0][2]
+                vb = jnp.where(mask, jnp.take(bare, jnp.clip(g_idx, 0, bare.shape[-1]-1),
+                                            axis=1), 0)
+                dV = (jnp.einsum('qmg,qg,qng->qmn', jnp.conj(physical), vt, physical)
+                      -jnp.einsum('qmg,qg,qng->qmn', jnp.conj(delta), vb, delta))
+            elif compensated_body:
                 smooth_compensated = zeta + compensation
                 dV = jnp.einsum('qmg,qg,qng->qmn',
                     jnp.conj(smooth_compensated), vt, smooth_compensated)

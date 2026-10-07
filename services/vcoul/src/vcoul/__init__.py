@@ -141,6 +141,7 @@ from vcoul.slab_2d import (Q0_RULE_EXACT, Q0_RULE_SOBOL_DEBUG, Slab2D,
 from vcoul.sphere import (
     bare_coulomb_sphere_indices,
     bare_coulomb_sphere_mask,
+    bare_coulomb_sphere_rows,
     fft_box_miller,
 )
 
@@ -179,7 +180,7 @@ __all__ = [
     "build_miniBZ_dq_cart", "build_v_head_miniBZ_fn_3d",
     "minibz_frac_to_cart", "minibz_cell_affine",
     # the sphere predicate
-    "fft_box_miller", "bare_coulomb_sphere_mask",
+    "fft_box_miller", "bare_coulomb_sphere_mask", "bare_coulomb_sphere_rows",
     "bare_coulomb_sphere_indices",
     # 0-D cell box
     "compute_vcoul_box",

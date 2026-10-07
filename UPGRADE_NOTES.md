@@ -5,6 +5,35 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## Unreleased — periodic core-charge completion uses the existing ISDF solve
+
+An explicit atomic reconstruction policy,
+`charge_metric.body_metric = physical_low_local_high`, completes the bare
+periodic atomic correction and subtracts its represented low-G contribution
+from the physical smooth-plus-correction Coulomb action. Its global
+compensation Gram is an immutable, geometry-bound artifact loaded directly
+onto the distributed face. Correction and exact-monopole columns share the
+ordinary ISDF factor; this policy does not assemble independent pseudo-wave
+local right-hand sides. The augmented sample bundle and completed Coulomb
+tensor enter the existing exchange, screening and correlation contractions.
+
+The policy requires `moment_enrichment = served_monopole` and an explicitly
+pinned periodic compensation file. It defines a different finite Coulomb
+operator from the earlier on-site smooth-neutral policy, so the older
+operator's accuracy certificates cannot be reused. Reconstruction-window,
+radial/angular, reciprocal-cutoff and optical-head controls remain separate.
+The original DFT optical derivative is not reconstructed by changing the
+finite-q samples. See the [charge formalism](docs/theory/augmented-isdf.md)
+and [artifact contract](docs/reference/augmentation_cache.md).
+
+The shared sparse Coulomb-sphere owner now assigns transfer-dependent
+Nyquist Miller labels on even FFT grids. FFT slots are unchanged. Only a
+physical sphere table that changes gains a new zeta provenance marker;
+unchanged small-cutoff tables retain their prior identity. A changed table
+requires refitting older fixed-label zetas and dependent tensors. The owner
+refuses grids outside its sufficient unique-image support domain with the
+required extents. See the [sphere contract](docs/reference/coulomb_sphere.md).
+
 ## Unreleased — explicit atomic field targets create a new cache epoch
 
 The normalized atomic-cache owner admits an explicit AE-large-preserving

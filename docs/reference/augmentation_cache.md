@@ -102,3 +102,19 @@ the validation sandbox (claim3837). That planted IO/action proof does not
 admit an actual Fourier preparation, AgI fitting attachment or a physical
 screened-QP interpretation; actual geometry-cache and full action parity
 must be measured separately.
+
+The public local-high fitting policy binds this artifact through
+`charge_metric={body_metric: physical_low_local_high, moment_enrichment:
+served_monopole, periodic_compensation_cache: {file: PATH, file_sha256: SHA}}`.
+The file path is relative to the atomic manifest directory or absolute;
+the consuming cell, ordered atoms, actual q rows, support and canonical lm
+must match its metadata exactly. It is periodic bulk 3D only. Legacy metric
+manifests retain their existing policy.
+
+Before allocating the global metric, the positive provider plans its same
+two public GEMMs from a shape descriptor and prices the distributed Gram,
+moment rows, intermediate/output and queried native workspace. The retained
+action then consumes the authenticated loaded cache. A shape descriptor is
+memory planning, not physical payload admission. The focused P4 oracle
+checks that planned and loaded actions are bit identical, including an
+interleaved packed centroid mask.

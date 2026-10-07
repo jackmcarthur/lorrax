@@ -8,6 +8,13 @@ import pytest
     ({"smooth_neutral_cross": "automatic"}, {"interpolation_degree": 3}, "exactly"),
     ({"smooth_neutral_cross": "onsite", "extra": True}, {"interpolation_degree": 3}, "exactly"),
     ({"smooth_neutral_cross": "onsite"}, {}, "interpolation_degree"),
+    ({"body_metric": "physical_low_local_high"}, {"interpolation_degree": 5}, "pinned"),
+    ({"body_metric": "physical_low_local_high", "moment_enrichment": "served_monopole",
+      "periodic_compensation_cache": {"file": "periodic.h5", "file_sha256": "bad"}},
+      {"interpolation_degree": 5}, "pinned"),
+    ({"body_metric": "physical_low_local_high", "moment_enrichment": "served_monopole",
+      "periodic_compensation_cache": {"file": "periodic.h5", "file_sha256": "0"*64},
+      "smooth_neutral_cross": "onsite"}, {"interpolation_degree": 5}, "exactly"),
 ])
 def test_metric_admission_precedes_atomic_data_reads(tmp_path, metric, radial, diagnostic):
     from gw.isdf_augmentation import read_augmentation_manifest

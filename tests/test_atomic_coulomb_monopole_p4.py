@@ -55,6 +55,7 @@ def check_monopole_provider(runtime):
     # its cancellation is tested against the signed provider's linear update.
     scale=2*(nfft/volume)**2;gself=scale*tables['compensation_self'][0];u=cross['smooth_compensation_cross'][0]
     reference=np.zeros((Qp,mu,mu),complex)
+    delta_reference=np.zeros_like(reference)
     for atom in range(na):
         for h,(l,m) in enumerate(lm):
             row=int(l);d,s=density[:,:,0,atom,h],density[:,:,1,atom,h]
@@ -67,6 +68,7 @@ def check_monopole_provider(runtime):
                            +gself*e.conj()[:,:,None]*e[:,None,:])
                 moment=moment+e
             comp=tables['compensation_self'][row]*scale*moment.conj()[:,:,None]*moment[:,None,:]
+            delta_reference+=ordinary-comp
             s_b=np.einsum('qmr,rt,qnt->qmn',s.conj(),cross['smooth_neutral_metric'][row],d)
             reference+=ordinary-comp+s_b+s_b.swapaxes(-2,-1).conj()
     got=np.asarray(gather_to_host(enriched['onsite'](coefficients)))
@@ -110,9 +112,27 @@ def check_monopole_provider(runtime):
         for new,old in zip(enriched['fourier_tile'](t,zero_coeff),base['fourier_tile'](t,old_coeff)):
             zero_bitwise &= np.array_equal(np.asarray(gather_to_host(new)),np.asarray(gather_to_host(old)))
     assert zero_bitwise,'zero enrichment changed incumbent floating arithmetic'
-    try:radial_coulomb_provider(stub,put(rhs),monopole_rhs=put(mom),**opts)
-    except ValueError as exc:assert 'explicit onsite' in str(exc)
-    else:raise AssertionError('moment enrichment admitted without compensated policy')
+    # The positive local-high charge model solves only delta and exact M0.
+    # Its independent expanded free action must omit every PS cross term,
+    # while its physical delta and compensation Fourier fields stay equal
+    # to those of the paired provider at the same solved coefficients.
+    delta_only=radial_coulomb_provider(stub,put(rhs),monopole_rhs=put(mom),**opts)
+    delta_coefficients=solve(stub.factor,delta_only['rhs'])
+    expected_delta=np.concatenate((host[...,:nf],host[...,2*nf:]),axis=-1)
+    delta_solve_error=float(np.max(abs(np.asarray(gather_to_host(delta_coefficients))-expected_delta)))
+    assert delta_solve_error<2e-14
+    delta_free=np.asarray(gather_to_host(delta_only['onsite'](delta_coefficients)))
+    delta_onsite_error=float(np.max(abs(delta_free-delta_reference)))
+    assert delta_onsite_error<2e-13
+    delta_fourier_error=0.
+    for t in range(2):
+        for delta_field,paired_field in zip(delta_only['fourier_tile'](t,delta_coefficients),
+                                            enriched['fourier_tile'](t,coefficients)):
+            delta_fourier_error=max(delta_fourier_error,float(np.max(abs(
+                np.asarray(gather_to_host(delta_field))-np.asarray(gather_to_host(paired_field))))))
+    assert delta_fourier_error<2e-13
+    ps_cross_signal=float(np.max(abs(delta_free-got)))
+    assert ps_cross_signal>1e-8
     try:radial_coulomb_provider(stub,put(rhs),smooth_rhs=put(ps),monopole_rhs=put(mom[...,:1]),**opts)
     except ValueError as exc:assert 'served monopole local RHS' in str(exc)
     else:raise AssertionError('moment feature shape mismatch accepted')
@@ -120,7 +140,11 @@ def check_monopole_provider(runtime):
         same_C_solution_error=solve_error,independent_complex_expanded_onsite_error=onsite_error,
         identical_delta_and_g_enrichment_FT_error=ft_error,finite_q_translation_error=translation_error,
         nonzero_enrichment_onsite_signal=epsilon_signal,nonzero_enrichment_FT_signal=delta_enrichment_signal,
-        zero_epsilon_bitwise=True,q_padding_zero=True,legacy_policy_refused=True,wrong_moment_shape_refused=True)
+        zero_epsilon_bitwise=True,q_padding_zero=True,wrong_moment_shape_refused=True,
+        delta_only_same_C_solution_error=delta_solve_error,
+        delta_only_expanded_free_action_error=delta_onsite_error,
+        delta_only_same_physical_Fourier_error=delta_fourier_error,
+        omitted_PS_cross_negative_signal=ps_cross_signal)
     if jax.process_index()==0:
         print(json.dumps(result),flush=True)
         Path(os.environ['ATOMIC_MONOPOLE_PROVIDER_REPORT']).write_text(json.dumps(result,indent=2)+'\n')

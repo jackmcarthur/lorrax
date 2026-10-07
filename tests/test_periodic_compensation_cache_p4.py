@@ -15,6 +15,7 @@ def run_oracle(runtime, directory):
     from common.collectives import barrier, agree_io_error, device_put_process_local, gather_to_host
     from file_io.commit_state import COMMIT_STATE
     from isdf.atomic_coulomb import make_periodic_compensation_action
+    from isdf.positive_charge_metric import plan_positive_periodic_action
     from isdf.coulomb_fourier_cache import (write_periodic_compensation_cache,
         load_periodic_compensation_cache, _file_digest)
     from runtime.padding import padded_axis, PaddedAxis
@@ -89,6 +90,20 @@ def run_oracle(runtime, directory):
     hlo_path = directory/f'action.rank{jax.process_index()}.hlo.txt'
     hlo_path.write_text(hlo)
     actual = host(compiled(put(padded_rows), cache['gram']))
+    # The production stage prices the same native action from an abstract
+    # shape before loading a physical tensor. Its retained callable must
+    # consume the subsequently authenticated cache without a second scale,
+    # changed packed mask, tensor replication or different matrix action.
+    planned = plan_positive_periodic_action(mesh, geometry=geometry, lm=lm,
+        centroid_basis=basis, fft_points=125, cache_path=cache_path,
+        cache_file_sha256=written['file_sha256'])
+    planned_value = host(planned['action'](put(padded_rows), cache['gram']))
+    assert np.array_equal(planned_value, actual)
+    assert planned['receipt'] == ledger
+    planned_arrays = ledger['arrays_per_rank']
+    assert planned['resident_bound_bytes_per_rank'] == (
+        planned_arrays['gram_bytes']+3*planned_arrays['moment_rows_bytes']
+        +planned_arrays['result_bytes']+sum(ledger['vendor_gemm_workspace_bytes_per_rank']))
     scale = (125/geometry['cell_volume_bohr3'])**2
     expected = scale*(rows.conj() @ gram @ rows.swapaxes(-2, -1))
     physical = lambda value:value[:, active][:, :, active]
@@ -200,6 +215,8 @@ def run_oracle(runtime, directory):
         metric_bytes_exact=True, input_ghost_poison_inert=poison_errors,
         cache_relocation_without_upstream_path_passed=True,
         full_complex_action_max_error=error, missing_bra_negative_signal=bra_signal,
+        shape_only_plan_then_loaded_action_bitwise=True,
+        shape_only_plan_resident_bound_bytes_per_rank=planned['resident_bound_bytes_per_rank'],
         canonical_prefix_action_max_error=canonical_error,
         active_interleaved_slots=np.flatnonzero(active).tolist(),
         missing_grid_scale_negative_signal=scale_signal, zero_moments_exact=True,
