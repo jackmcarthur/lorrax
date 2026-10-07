@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — exact shared-model Γ correlation slope for reference controls
+
+`gw.shared_pole_head.realized_gamma_correlation_sampler` supplies all-P
+`Wc(s)` and its exact derivative with respect to `s=z_Ry²`, with no static
+V term. Value and slope share the existing residue-product and physical
+realization owners; differentiation acts only on scalar rational weights.
+Callers bind the store representation explicitly. Squared-frequency
+`scalar-trs-even-s` stores are admitted; signed ordered-z stores refuse.
+The caller retains authenticated model membership and reserves both outputs
+and native workspaces. This enables fixed-basis pole/reference controls;
+it changes no default head prescription or physical realization.
+
 ## 2026-10-07 — declared shared-body pole cap for fixed-basis studies
 
 `sigma_w_pole_budget=0` preserves the automatic production body cap and

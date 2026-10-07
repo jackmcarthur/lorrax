@@ -72,21 +72,49 @@ def _gamma_gemm_route(mesh, b_shape, budget_bytes):
 
 
 @lru_cache(maxsize=None)
-def _gamma_body(mesh, route):
-    """Raw latent body; current factors are operands of one retained callable.
-
-    ``route`` is the GEMM's ``(backend, batched_route)`` (:func:`_gamma_gemm_route`)."""
+def _gamma_weighted_product(mesh, route):
+    """One all-P residue-factor product for values and scalar derivatives."""
     from distrib_la import matmul
     from jax.sharding import NamedSharding, PartitionSpec as P
     face = NamedSharding(mesh, P(None, "x", "y"))
     backend, batched_route = route
 
     @jax.jit(out_shardings=face)
+    def evaluate(weights, b):
+        return matmul(b*weights[:, None, :], b, mesh=mesh, backend=backend,
+                      batched_route=batched_route, transb="C")
+    return evaluate
+
+
+def _gamma_weights(s, poles, counts):
+    active = jnp.arange(poles.shape[-1])[None, :] < counts[:, None]
+    return jnp.where(active, 1/(s-poles), 0)
+
+
+@lru_cache(maxsize=None)
+def _gamma_body(mesh, route):
+    """Raw latent body; factors and frequencies remain runtime operands."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    product = _gamma_weighted_product(mesh, route)
+
+    @jax.jit(out_shardings=face)
     def evaluate(s, b, poles, counts, v):
-        active = jnp.arange(b.shape[-1])[None, :] < counts[:, None]
-        weights = jnp.where(active, 1/(s-poles), 0)
-        return v+matmul(b*weights[:, None, :], b, mesh=mesh, backend=backend,
-                        batched_route=batched_route, transb="C")
+        return v + product(_gamma_weights(s, poles, counts), b)
+    return evaluate
+
+
+@lru_cache(maxsize=None)
+def _gamma_realization(mesh, realize):
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import transpose_xy
+    face = NamedSharding(mesh, P(None, "x", "y"))
+
+    @jax.jit(out_shardings=face)
+    def evaluate(wc):
+        partner = jax.lax.with_sharding_constraint(transpose_xy(wc, mesh), face)
+        result, _ = realize(wc, partner)
+        return result
     return evaluate
 
 
@@ -99,16 +127,58 @@ def _realized_gamma_body(mesh, realize, route):
     coefficient as well; its same-time transpose is the required partner.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.collectives import transpose_xy
     face = NamedSharding(mesh, P(None, "x", "y"))
     raw = _gamma_body(mesh, route)
+    project = _gamma_realization(mesh, realize)
 
     @jax.jit(out_shardings=face)
     def evaluate(s, b, poles, counts, v):
         wc = raw(s, b, poles, counts, jnp.zeros_like(v))
-        partner = jax.lax.with_sharding_constraint(transpose_xy(wc, mesh), face)
-        wc, _ = realize(wc, partner)
-        return v + wc
+        return v + project(wc)
+    return evaluate
+
+
+@lru_cache(maxsize=None)
+def realized_gamma_correlation_sampler(mesh, realize, route=("auto", "auto"), *, representation):
+    """Build an all-P shared-model Γ Wc and exact dWc/ds sampler.
+
+    The callable takes scalar complex ``s=z_Ry**2``, residue factors
+    ``b[1,mu_X,K_Y]``, squared poles ``[1,K]`` and physical counts ``[1]``.
+    Both returned operators are complex128 ``[1,mu_X,nu_Y]`` faces. The
+    caller owns authenticated store membership, the Γ realization callable,
+    site finiteness and capacity reservations for both outputs/workspace.
+
+    Only the scalar rational weights are differentiated. Native GEMM and
+    realization use their common value owners, so no FFI autodiff rule or
+    copied pole synthesis is needed. Pole factors are independent of s.
+    The caller must explicitly bind the squared-frequency representation;
+    an ordered particle-hole z model refuses rather than treating its signed
+    poles as squared poles. The known instantaneous V is absent from both outputs. Antiunitary
+    realization transposes endpoints at the same s; it never conjugates a
+    causal scalar coefficient or evaluates the derivative at conjugate(s).
+    """
+    if representation != "scalar-trs-even-s":
+        raise ValueError("GATE shared_pole_gamma_sampler: squared-frequency Γ "
+                         "sampling requires scalar-trs-even-s; ordered z models "
+                         "need their separately owned causal evaluator")
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    product = _gamma_weighted_product(mesh, route)
+    project = _gamma_realization(mesh, realize)
+
+    @jax.jit(out_shardings=(face, face))
+    def evaluate(s, b, poles, counts):
+        if (s.ndim != 0 or s.dtype != jnp.complex128 or b.ndim != 3
+                or b.shape[0] != 1 or b.dtype != jnp.complex128
+                or poles.shape != (1, b.shape[-1]) or counts.shape != (1,)):
+            raise ValueError("GATE shared_pole_gamma_sampler: scalar complex s, "
+                             "one Γ factor face and matched poles/counts required")
+        weights, derivative = jax.jvp(
+            lambda site: _gamma_weights(site, poles, counts),
+            (s,), (jnp.ones_like(s),))
+        wc = project(product(weights, b))
+        dwc_ds = project(product(derivative, b))
+        return wc, dwc_ds
     return evaluate
 
 
