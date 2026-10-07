@@ -3665,6 +3665,21 @@ def uses_bare_transverse_shared_pole(config) -> bool:
                 is BispinorGWMode.BARE_TRANSVERSE)
 
 
+def uses_charge_bispinor_shared_pole(config) -> bool:
+    """Select the spin-traced four-component charge shared-pole bank.
+
+    Coulomb-only and bare-transverse models share the same charge bank;
+    the latter's spatial-current contractions have their separate selector.
+    """
+    return (bool(config.bispinor)
+            and config.compute_mode is ComputeMode.MPA
+            and config.sigma.w_model == "shared_pole"
+            and config.screening.diagrams is ScreeningDiagrams.W_RPA
+            and coerce_bispinor_gw_mode(config.bispinor_gw)
+                in (BispinorGWMode.COULOMB_ONLY,
+                    BispinorGWMode.BARE_TRANSVERSE))
+
+
 def uses_bare_tt_gamma_head(config) -> bool:
     """Insert the bare transverse Gamma average into bare-TT V tiles."""
     hybrid = (uses_bare_transverse_shared_pole(config)

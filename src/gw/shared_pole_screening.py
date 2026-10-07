@@ -137,7 +137,22 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
     Array hashes here cover only replicated small energy/occupation tables.
     """
     from common.parallel_transport import fingerprint_from_binding, wfn_fingerprint
+    from file_io.wfn_basis import centroid_table_fingerprint_scheme, centroid_table_md5
     from .response_bank import response_weights
+    # The same canonical physical points own sampling, symmetry and restart
+    # identity. In particular, fractional points must never pass through the
+    # historical FFT-index cast: distinct sub-grid positions would collide.
+    basis = meta.mu_basis
+    coordinates = np.asarray(basis.canonical_indices)
+    if not np.array_equal(np.asarray(centroid_indices), coordinates):
+        raise ValueError("GATE shared_pole_centroids: supplied points differ from the canonical basis")
+    coordinate_kind = basis.coordinate_kind
+    scheme = centroid_table_fingerprint_scheme(coordinate_kind)
+    if coordinate_kind == "fft_indices":
+        # Preserve the exact legacy identity bytes and dictionary protocol.
+        centroid_identity = hashlib.sha256(np.asarray(coordinates, np.int64).tobytes()).hexdigest()
+    else:
+        centroid_identity = centroid_table_md5(coordinates, coordinate_kind=coordinate_kind)
     census = response_weights(wfns, meta)[-1]
     source = wfn_fingerprint(wfn) if binding is None else fingerprint_from_binding(binding, wfn)
     state = getattr(meta, "shared_pole_state_identity", None)
@@ -152,8 +167,11 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
     identity = dict(iteration_id=str(label), hamiltonian=state["hamiltonian"],
         wavefunctions=state["wavefunctions"], energies=census["energy_sha256"],
         occupations=census["occupation_sha256"],
-        centroids=hashlib.sha256(np.asarray(centroid_indices, np.int64).tobytes()).hexdigest(),
+        centroids=centroid_identity,
         recipe_hash=recipe["recipe_hash"], gate_hash=recipe["gate_hash"])
+    if coordinate_kind != "fft_indices":
+        identity.update(centroid_coordinate_kind=coordinate_kind,
+                        centroid_fingerprint_scheme=scheme)
     if str(label).startswith("sc_"):
         # The SC state labels do not name the WFN (bind_shared_pole_sc_identity),
         # so an SC map's bank, model and sector manifest bind the source WFN's
@@ -404,13 +422,15 @@ def retain_iteration_scratch(run_dir, label, *, print_fn=print):
     return tuple(sorted(removed))
 
 
-def _shared_pole_tables(meta, sym, centroid_indices):
-    """Build raw-parent tables through the canonical symmetry service."""
+def _shared_pole_tables(meta, sym, basis):
+    """Build raw-parent tables from the authenticated centroid coordinates."""
     from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
                                bgw_integer_q_to_fractional)
     perm, wraps = centroid_source_map_and_wrap(
-        np.asarray(centroid_indices), sym.sym_matrices, sym.translations,
-        np.asarray(meta.fft_grid), extend_trs=True)
+        basis.canonical_indices, sym.sym_matrices, sym.translations,
+        np.asarray(meta.fft_grid), extend_trs=True,
+        required_rows=np.asarray(sym.sym_idx_q),
+        coordinate_kind=basis.coordinate_kind)
     qt = QirrTables(irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
         q_irr_frac=bgw_integer_q_to_fractional(
             sym.q_irr_kgrid_int, (meta.nkx, meta.nky, meta.nkz)),
@@ -501,7 +521,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         export_shared_pole_outputs(handle, meta=meta, config=config,
                             mesh_xy=mesh_xy, source_wfn=source_wfn,
                             run_dir=run_dir, label=label, print_fn=print_fn,
-                            tables=_shared_pole_tables(meta, sym, centroid_indices))
+                            tables=_shared_pole_tables(meta, sym, meta.mu_basis))
                 return result
         root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
         # The bare V parents (a collective device digest, before the rank-0 resume
@@ -588,7 +608,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             agree_io_error(error, path=root / 'sectors.json', stage='shared_pole.published_handle')
             _mark_photon_head(handle, config)
             return dict(shared_pole=handle)
-        tables = _shared_pole_tables(meta, sym, centroid_indices)
+        tables = _shared_pole_tables(meta, sym, meta.mu_basis)
     if resume_constructor == "committed":
         coulomb = None
     with timing.section("spole.bank_setup"):
@@ -612,7 +632,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             bank.update(photon_layout=photon_layout, mu_bases=mu_bases,
                         bispinor_v_q_path=bispinor_v_q_path,
                         sector_tables=(tables, _shared_pole_tables(
-                            meta, sym, mu_bases[1].canonical_indices)))
+                            meta, sym, mu_bases[1])))
         if not resume_constructor:
             initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
                 recipe=recipe, identity=identity, mesh_xy=mesh_xy,
