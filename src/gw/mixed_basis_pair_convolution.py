@@ -377,8 +377,10 @@ def _sphere_response_programs(mesh):
         left[:, :, None] * value * right[:, None, :],
         in_shardings=(face, NamedSharding(mesh, P(None, "x")),
                       NamedSharding(mesh, P(None, "y"))), out_shardings=face)
+    place_phase = jax.jit(lambda left: (left, left.conj()), in_shardings=replicated,
+        out_shardings=(NamedSharding(mesh, P(None, "x")), NamedSharding(mesh, P(None, "y"))))
     return (jax.jit(guard, in_shardings=(face, replicated),
-                    out_shardings=replicated), select, phase)
+                    out_shardings=replicated), select, phase, place_phase)
 
 
 def transport_sphere_response(parent_values, transport: SphereTransport,
@@ -452,7 +454,7 @@ def transport_sphere_response(parent_values, transport: SphereTransport,
     if (not np.all(np.isfinite(phase[live]))
             or np.max(np.abs(np.abs(phase[live]) - 1.), initial=0.) > 1e-12):
         raise ValueError("sphere response physical endpoint phases must be finite and unit modulus")
-    guard, select, multiply = _sphere_response_programs(mesh)
+    guard, select, multiply, place_phase = _sphere_response_programs(mesh)
     ngk = replicate_to_mesh(np.asarray(transport.parent.ngk, np.int32), mesh)
     for value in (parent_values, transposed_parent_same_z):
         if value is None:
@@ -468,9 +470,8 @@ def transport_sphere_response(parent_values, transport: SphereTransport,
     # SphereTransport's scalar endpoint equation: anti rows conjugate only
     # endpoint phases, while the already-transposed causal operand is kept.
     left = np.where(live, np.where(anti[:, None], phase.conj(), phase), 0.)
-    return multiply(value,
-        jax.device_put(left, NamedSharding(mesh, P(None, "x"))),
-        jax.device_put(left.conj(), NamedSharding(mesh, P(None, "y"))))
+    left, right = place_phase(replicate_to_mesh(left, mesh))
+    return multiply(value, left, right)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
