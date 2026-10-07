@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — the decoupled sector route is admitted by its price; the decoupled CT needs route-(c) eighs and runs after the selection panels are released
+
+060697565's rule (decoupled only when parents < ranks) is replaced by a price, in this order:
+q-local when every sector is local; else decoupled CC and TT when their stacks rows fit beside
+the live set (`decoupled_admission`, priced from the shapes at the conservative sides before
+any read, TT first and CC beside TT's held outputs); else face rounds at the stepped width,
+warned at nq >= P. CT is priced after CC and TT, at its actual joint side, before its reads.
+It decouples only when its stacks row fits and both its metric and Ritz stacks run one whole
+matrix per rank (route (c)). Otherwise it runs lever 1's rounds. On main 060697565 the CrI3
+24×24 P64 CT stacks (61 × 17408²) ran the whole-mesh scan: CT.all took 1251.5 s at map 0 and
+831.4 s at map 1, against 440 s in rounds. After its pencils, the CC and TT selection panels
+and spans are released (`release_selection_panels`), since the rounds read only models and
+signed factors. The CT eighs then run beside the kept models, so route (c) fits more often
+(CrI3 6×6 P4: CT eigh peak 26.90 GB, against 30.29). P4 decks with nq >= 4 take the decoupled
+route again wherever it is priced to fit. eqp is unchanged on CrI3 6×6 and Fe 4³ (claim 3682).
+No deck change.
+
 ## 2026-10-07 — the face batch steps down by its whole price; decoupled stages run at the width that fits beside their stacks
 
 `face_batch_width` stepped down by the room left for the program, which is below

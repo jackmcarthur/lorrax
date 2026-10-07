@@ -247,6 +247,10 @@ def route_summary(mode, receipt):
                   + f", max |ZAZ-I|/sqrt(R) {decoupled['keep_residual']:.1e}"
                   + (f" / {decoupled['paired_residual']:.1e}" if 'paired_residual' in decoupled else "")
                   + f" ({decoupled['paired_iterations']} Newton-Schulz iteration(s))")
+    refused = receipt.get("decoupled_refused")
+    if refused is not None:
+        price += (f"; CT in rounds: the decoupled stacks {'fit' if refused['stacks_fit'] else 'do not fit'}, "
+                  f"eigh routes {'/'.join(refused['eigh_routes'])} (route (c) is batch_reshard)")
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
@@ -821,14 +825,6 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
         return (*result, reduced[3]) if retain_span else result
     return tuple(face_program(fn, mesh, outputs='mixed' if i < 3 else 'parent')
                  for i, fn in enumerate((stage1, stage2, stage3, stage4))), passthrough
-
-
-def decoupled_route(nq, batch_width, ranks):
-    """The decoupled face route holds every parent's selection panels and stage stacks at
-    once, about one parent's pencil per rank below ``ranks`` parents. At ``nq >= ranks``
-    they grow as nq / ranks (Ni 20^3, 641 parents at P64: TT stacks 116.6 GB/rank), so
-    those parents take the face rounds."""
-    return int(batch_width) < int(nq) < int(ranks)
 
 
 def decoupled_width(ledger, resident, per_parent, width, *, concurrent_with):

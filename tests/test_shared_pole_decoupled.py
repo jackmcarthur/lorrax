@@ -209,3 +209,28 @@ def test_decoupled_cross_matches_the_joint_reduction():
             assert np.allclose(lw, lg, rtol=1e-8, atol=1e-10), (width, p)
         for key in ("gram_valid", "retained_metric_positive", "retained_rank"):
             assert np.array_equal(np.asarray(wd[key]), np.asarray(gd[key])), key
+
+
+def test_release_selection_panels_frees_them_and_keeps_the_round_slices_bitwise():
+    """After the decoupled CT pencils, the sectors' (Q, O, infinity) panels and spans are dropped
+    (their bytes return before the CT eighs) and a round's slice of the models is unchanged."""
+    import gc
+    import weakref
+    from gw.shared_pole_sectors import release_selection_panels, slice_sector
+    mesh = _mesh()
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    rng = np.random.default_rng(3)
+    put = lambda shape: jax.device_put(jnp.asarray(rng.normal(size=shape)), face)
+    sector = dict(model=(put((4, 8, 8)), put((4, 8, 8))), signed=(put((4, 8, 8)),),
+                  coefficients=put((4, 8, 8)), states=[(0, put((4, 8, 8)), put((4, 8, 8)))],
+                  infinity=(put((4, 8, 8)),), tables={'t': np.arange(4)}, vectors=(put((4, 8, 8)),),
+                  diagnostics={'d': np.arange(4.0)})
+    before = slice_sector(sector, [1, 3], mesh)
+    panels = [weakref.ref(a) for a in (*sector['states'][0][1:], *sector['infinity'], sector['coefficients'])]
+    release_selection_panels([sector])
+    gc.collect()
+    assert all(ref() is None for ref in panels)
+    after = slice_sector(sector, [1, 3], mesh)
+    assert after['states'] is None and after['infinity'] is None and after['coefficients'] is None
+    for a, b in zip(jax.tree.leaves((before['model'], before['signed'])), jax.tree.leaves((after['model'], after['signed']))):
+        assert np.array_equal(np.asarray(a), np.asarray(b))

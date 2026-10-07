@@ -259,13 +259,22 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     # side; stacks over budget reduce in face rounds (construct_diagonal_sector_all warns).
     whole=None
     round_upstream=upstream
-    from gw.shared_pole_execution import decoupled_route
-    if resolved_execution=='face' and decoupled_route(header['n_q_irr'],batch_width,mesh_xy.size):
+    if resolved_execution=='face':
+        # Priced again beside the resident sector models, when they are live.
+        admission=decoupled_admission(execution_rows,int(header['n_q_irr']),mesh_xy=mesh_xy,
+                                      ledger=ledger,upstream=upstream)
+        for row in execution_rows:
+            row['decoupled_admission']=admission
+    if (resolved_execution=='face' and int(header['n_q_irr'])>batch_width
+            and execution_rows[0]['decoupled_admission']['admitted']):
         # TT first: its 2c stacks are the largest eighs, so they run beside no other
         # sector's held outputs. Each sector's held outputs (every parent's models, span
-        # and (Q, O) panels, kept for CT) are one ledger row, live through the CT rounds.
+        # and (Q, O) panels, kept for CT) are one ledger row, live through the CT pencils;
+        # its models alone (``kept``) are another, live after them.
         from gw.shared_pole_capacity import _shard_bytes
-        whole={};held_rows=[]
+        whole={};held_rows=[];kept_rows=[]
+        row_bytes=lambda tree:sum(_shard_bytes(a) for a in {id(a):a for a in jax.tree.leaves(tree)
+                                                             if hasattr(a,'sharding')}.values())
         try:
             for family,name in ((1,'TT'),(0,'CC')):
                 with timing.section('spole.sector.'+name+'.all', announce=True):
@@ -285,12 +294,13 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     whole[family]=model
                     execution_rows[family]['decoupled']=model['decoupled']
                     used_room(execution_rows[family],model['budget'])
-                    leaves=jax.tree.leaves((model['model'],model['signed'],
-                        model['coefficients'],model['infinity'],tuple(s[1:] for s in model['states'])))
-                    unique={id(a):a for a in leaves if hasattr(a,'sharding')}
                     held_rows.append(ledger.reserve(f"sector.decoupled.held.{name}",
-                        resident_bytes_per_rank=sum(_shard_bytes(a) for a in unique.values()),
+                        resident_bytes_per_rank=row_bytes((model['model'],model['signed'],model['coefficients'],
+                            model['infinity'],tuple(s[1:] for s in model['states']))),
                         workspace_bytes_per_rank=0,concurrent_with=ledger.live_stages)['stage'])
+                    kept_rows.append(ledger.reserve(f"sector.decoupled.kept.{name}",
+                        resident_bytes_per_rank=row_bytes((model['model'],model['signed'])),
+                        workspace_bytes_per_rank=0,concurrent_with=upstream)['stage'])
                     ledger.live_stages=(*upstream,*held_rows)
                     reduction,zero,_,_=model['diagnostics']
                     counts=np.asarray(model['vectors'][1]).sum(axis=-1).tolist()
@@ -313,10 +323,17 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 line_cross=[read_line(io,family,cross=True,ids=ids,layout='face') for family in (0,1)]
             return (ct,tc),cm,line_cross
         with timing.section('spole.sector.CT.all', announce=True):
-            cross_all=construct_cross_sector_all(whole,read_cross,meta,config,mesh_xy=mesh_xy,
+            cross_all,cross_receipt=construct_cross_sector_all(whole,read_cross,meta,config,mesh_xy=mesh_xy,
                 sample_ids=dense_fit,nq=int(header['n_q_irr']),width=batch_width,program_bytes=sizes.get('CT'),
-                upstream=round_upstream)
-            execution_rows[0]['joint']['decoupled']=cross_all['decoupled']
+                upstream=round_upstream,released=(*upstream,*kept_rows),
+                release=lambda:release_selection_panels(whole))
+        execution_rows[0]['joint']['decoupled' if cross_all is not None else 'decoupled_refused']=cross_receipt
+        if cross_all is not None:
+            # CT's all-parent models and signed factors stay live through the rounds' writes.
+            ct_row=ledger.reserve("sector.decoupled.held.CT",
+                resident_bytes_per_rank=row_bytes((cross_all['models'],cross_all['signed'])),
+                workspace_bytes_per_rank=0,concurrent_with=(*upstream,*kept_rows))['stage']
+            round_upstream=ledger.live_stages=(*upstream,*kept_rows,ct_row)
     while rounds:
         ids,real,slots,execution=rounds.pop(0)
         face=execution=='face'
@@ -1035,6 +1052,14 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
                 recipe=recipe,budget=budget,execution='face',decoupled=receipt)
 
 
+def release_selection_panels(whole):
+    """Drop the diagonal sectors' selection panels (node, Q, O, infinity) and spans once the
+    decoupled CT pencils are built: the rounds read only the sectors' models and signed factors
+    (treatment, held checks, writes), so their device bytes return before the CT eighs."""
+    for sector in whole:
+        sector['states']=sector['infinity']=sector['coefficients']=None
+
+
 def slice_sector(sector, slots, mesh_xy):
     """One CT round's view of a sector built for every parent: the ``slots`` rows of every
     per-parent array and table; shared records (roles, recipe, budget) pass through."""
@@ -1056,8 +1081,9 @@ def slice_sector(sector, slots, mesh_xy):
     out['model']=tuple(rows(a) for a in sector['model'])
     out['signed']=tuple(rows(a) for a in sector['signed'])
     out['coefficients']=rows(sector['coefficients'])
-    out['states']=[tuple(rows(a) for a in st) for st in sector['states']]
-    out['infinity']=tuple(rows(a) for a in sector['infinity'])
+    # The selection panels are None once the decoupled CT has read them (released).
+    out['states']=None if sector['states'] is None else [tuple(rows(a) for a in st) for st in sector['states']]
+    out['infinity']=None if sector['infinity'] is None else tuple(rows(a) for a in sector['infinity'])
     out['tables']={k:rows(np.asarray(v)) for k,v in sector['tables'].items()}
     out['vectors']=tuple(rows(a) for a in sector['vectors'])
     out['diagnostics']=jax.tree.map(rows,sector['diagnostics'])
@@ -1065,12 +1091,19 @@ def slice_sector(sector, slots, mesh_xy):
 
 
 def construct_cross_sector_all(whole, read, meta, config, *, mesh_xy, sample_ids, nq, width,
-                               program_bytes, upstream):
+                               program_bytes, upstream, released, release):
     """CT for every parent at once beside the decoupled CC and TT (``whole``): each face round's
     joint pencil from its own samples (``read(ids, real)``) at one compacted span for every
     parent, written in place into one stack, then the joint reduction with each eigh once over
     the stack (``face_cross_decoupled``), the gates and the positive models for every parent.
-    Returns what ``construct_cross_sector_round`` returns, for every parent, and a receipt."""
+
+    Priced at the actual joint side before any read. The pencils run beside ``upstream`` (the
+    sectors' held outputs); ``release()`` then drops the sectors' selection panels and spans,
+    and the eighs run beside ``released`` (their models only). CT decouples only when its
+    stacks row fits and both eigh stacks run one whole matrix per rank (route (c)) beside their
+    boundaries; otherwise it returns ``(None, receipt)`` and CT runs in the rounds (CrI3 24x24
+    P64: 61 x 17408^2 on the whole mesh took 1251 s against 440 s in rounds). Returns what
+    ``construct_cross_sector_round`` returns, for every parent, and a receipt."""
     import copy
     import jax
     import numpy as np
@@ -1095,6 +1128,17 @@ def construct_cross_sector_all(whole, read, meta, config, *, mesh_xy, sample_ids
     per_parent=-(-int(program_bytes or 0)//int(width))
     stage_width=decoupled_width(ledger,stacks,per_parent,width,concurrent_with=upstream)
     program_bytes=per_parent*stage_width
+    fits=ledger.preview(resident_bytes_per_rank=stacks+program_bytes,workspace_bytes_per_rank=0,
+                        concurrent_with=upstream)['device_budget_status']=='PASS'
+    rooms=tuple(face_eigh_room(ledger.preview(resident_bytes_per_rank=b,workspace_bytes_per_rank=0,
+                                              concurrent_with=released)) for b in boundaries)
+    plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms)
+    routes=tuple(plan.stack_route((int(nq),side,side),np.complex128,traced=False).route for plan in plans)
+    receipt=dict(parents=int(nq),sub_batch=int(width),stage_batch=int(stage_width),pencil_side=int(side),
+                 stacks_bytes_per_rank=int(stacks),eigh_room_bytes_per_rank=rooms,eigh_routes=routes,
+                 stacks_fit=bool(fits))
+    if not fits or any(route!='batch_reshard' for route in routes):
+        return None,receipt
     stack_row=ledger.reserve(f"sector.decoupled.CT.stacks",
         resident_bytes_per_rank=stacks+program_bytes,
         workspace_bytes_per_rank=0,concurrent_with=upstream)
@@ -1116,22 +1160,22 @@ def construct_cross_sector_all(whole, read, meta, config, *, mesh_xy, sample_ids
         from common import timing
         with timing.section('decoupled.pencils'):
             pencil=list(_assemble(mesh_xy,int(nq),parts()))
-        rooms=tuple(face_eigh_room(ledger.preview(resident_bytes_per_rank=b,workspace_bytes_per_rank=0,
-                                                  concurrent_with=upstream)) for b in boundaries)
+        release()
+        ledger.live_stages=(*released,stack_row['stage'])
 
         from gw.shared_pole_execution import eigh_program_bytes
         @contextmanager
         def eigh_row(k,plan,stack):
             row=ledger.reserve(f"sector.decoupled.CT.eigh{k}.{len(ledger.entries)}",
                                resident_bytes_per_rank=boundaries[k]+eigh_program_bytes(plan,stack,mesh=mesh_xy),
-                               workspace_bytes_per_rank=0,concurrent_with=upstream)['stage']
-            ledger.live_stages=(*upstream,row)
+                               workspace_bytes_per_rank=0,concurrent_with=released)['stage']
+            ledger.live_stages=(*released,row)
             try:
                 yield
             finally:
-                ledger.live_stages=(*upstream,stack_row['stage'])
-        signed,diagnostics=face_cross_decoupled(pencil,mesh=mesh_xy,
-            eigh_plans=tuple(face_eigh(mesh_xy,side,r) for r in rooms),width=stage_width,eigh_rows=eigh_row)
+                ledger.live_stages=(*released,stack_row['stage'])
+        signed,diagnostics=face_cross_decoupled(pencil,mesh=mesh_xy,eigh_plans=plans,width=stage_width,
+                                                eigh_rows=eigh_row)
         del pencil
     finally:
         ledger.live_stages=upstream
@@ -1147,17 +1191,16 @@ def construct_cross_sector_all(whole, read, meta, config, *, mesh_xy, sample_ids
     local_meta=copy.copy(meta)
     local_meta.n_rmu_padded=sum(rows)
     budget=ConstructorCapacity(local_meta,linalg_resolution({'linalg':config.backend.linalg}),
-        mesh_xy=mesh_xy,ledger=ledger,upstream=upstream,execution='face')
+        mesh_xy=mesh_xy,ledger=ledger,upstream=released,execution='face')
     budget.batch_width=int(width)
     replicated=NamedSharding(mesh_xy,P())
+    receipt.update(admitted=stack_row['device_budget_status']=='PASS',
+                   keep_residual=float(np.max(np.asarray(diagnostics['metric_inverse_root_residual_relative'])[:nq])),
+                   paired_iterations=int(np.max(np.asarray(diagnostics['metric_inverse_root_iterations'])[:nq])))
     return dict(models=models,signed=signed,
                 diagnostics=jax.tree.map(lambda a:device_put_process_local(a,replicated),diagnostics),
                 zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero),budget=budget,
-                decoupled=dict(parents=int(nq),sub_batch=int(width),stage_batch=int(stage_width),pencil_side=int(side),
-                               stacks_bytes_per_rank=int(stacks),
-                               eigh_room_bytes_per_rank=rooms,admitted=stack_row['device_budget_status']=='PASS',
-                               keep_residual=float(np.max(np.asarray(diagnostics['metric_inverse_root_residual_relative'])[:nq])),
-                               paired_iterations=int(np.max(np.asarray(diagnostics['metric_inverse_root_iterations'])[:nq]))))
+                decoupled=receipt),receipt
 
 
 def slice_cross(cross, slots, mesh_xy):
@@ -1767,6 +1810,35 @@ def joint_output_stage(stage, values, rotation, *, matmul):
                 retained_metric_positive=stage["corrected"], retained_rank=count)
 
 
+def decoupled_admission(execution_rows, nq, *, mesh_xy, ledger, upstream):
+    """Whether CC and TT reduce every parent at once (the decoupled face route), priced from
+    the shapes before any read, at each sector's conservative side: TT first, its stacks row
+    (``decoupled_stage_bytes``: the stage stacks, the selected (Q, O), dW Q and infinity panels,
+    one parent's stage program) beside the live set, then CC's beside TT's held outputs (the
+    panels, the span [side, 2c] and the factors [n, 2c]). CT is priced after both at its
+    actual joint side (``construct_cross_sector_all``). CrI3 24x24 P64 72 GB admits; Ni 20^3
+    P64 36 GB (641 parents) and Fe 4^3 P4 4 GB do not."""
+    from gw.shared_pole_execution import decoupled_stage_bytes,face_reduction_bytes,face_ritz_carrier
+    per_rank=lambda b:-(-int(b)*int(nq)//int(mesh_xy.size))
+    aggregate,held_out,admitted={},0,True
+    for row in (execution_rows[1],execution_rows[0]):
+        side,packed=int(row['conservative_pencil_side']),int(row['packed_extent'])
+        carrier=face_ritz_carrier(mesh_xy,row['pole_budget'])
+        infinity=int(row['infinity_width'])
+        columns=side-2*infinity
+        held=per_rank(16*(2*packed*columns+5*packed*infinity))
+        dw=per_rank(16*packed*columns)
+        program=face_reduction_bytes(mesh_xy,1,rows=packed,side=side,carrier=carrier,retain_span=True)
+        resident,_=decoupled_stage_bytes(nq=nq,ranks=mesh_xy.size,side=side,carrier=carrier,packed=packed,
+                                         held=held,dw_panels=dw,program=program)
+        preview=ledger.preview(resident_bytes_per_rank=resident+held_out,workspace_bytes_per_rank=0,
+                               concurrent_with=upstream)
+        aggregate[row['sector']]=int(preview['aggregate_bytes_per_rank'])
+        admitted=admitted and preview['device_budget_status']=='PASS'
+        held_out+=held+per_rank(16*(side*2*carrier+2*packed*2*carrier))
+    return dict(admitted=bool(admitted),aggregate_bytes_per_rank=aggregate)
+
+
 def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     """The CC/TT/CT constructor layout ('local' or 'face') and its per-sector rows.
 
@@ -1847,9 +1919,13 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')
-    if resolved_execution=='face' and int(nq)>=int(mesh_xy.size):
+    admission=(decoupled_admission(execution_rows,nq,mesh_xy=mesh_xy,ledger=ledger,upstream=upstream)
+               if resolved_execution=='face' else None)
+    for row in execution_rows:
+        row['decoupled_admission']=admission
+    if resolved_execution=='face' and not admission['admitted'] and int(nq)>=int(mesh_xy.size):
         # At nq >= P the face rounds hold a few parents each (Ni 20^3 at 32 line sites,
-        # 36 GB: 641 rounds of one parent); say what the q-local route needs.
+        # 36 GB: 38 rounds of 17); say what the q-local route needs.
         import warnings
         need=max(r[k]['aggregate_bytes_per_rank'] for r in execution_rows if r['mode']=='face'
                  for k in ('local_selection','local_reduction') if r.get(k))
@@ -1857,7 +1933,7 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
         warnings.warn(f"shared-pole sectors: {names} local needs {need/1e9:.1f} GB/rank, over the "
                       f"{ledger.device_budget_bytes_per_rank/1e9:.1f} GB budget; the {int(nq)} parents "
                       f"run in face rounds on {int(mesh_xy.size)} ranks (slow). memory_per_device_gb >= "
-                      f"{-(-need//10**9)} (an 80 GB card) runs every sector q-local",RuntimeWarning)
+                      f"{-(-need//10**9)} runs every sector q-local",RuntimeWarning)
     for row in execution_rows:
         row['joint']=dict(mode=joint_mode,**joint_route)
     return resolved_execution,execution_rows
