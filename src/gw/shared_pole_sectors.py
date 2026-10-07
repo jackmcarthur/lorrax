@@ -896,7 +896,8 @@ def construct_diagonal_sector_all(read, nq, meta, config, geometry, *, mesh_xy, 
             selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
                              +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
             # Earlier sub-batches' selected panels stay live beside this selection.
-            budget.retained_panels=(*retained,*jax.tree.leaves([(part[0],part[3]) for part in parts]))
+            budget.retained_panels=(*retained,*(a for a in jax.tree.leaves([(part[0],part[3]) for part in parts])
+                                                if hasattr(a,'sharding')))
             selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
                                   selection_faces=selection_faces)
             if budget.face_room is not None:
