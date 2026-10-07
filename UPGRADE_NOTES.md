@@ -5,6 +5,37 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-07 — the decoupled sector rounds price CT's outputs and every array the sectors and rounds hold
+
+The round loop's rows on the decoupled route (`constructor.live`, the held checks and the writes)
+ran beside the CC/TT kept rows and the resident models, but not beside CT's all-parent outputs.
+At CrI3 24×24 P64 that left 4.55 GB unpriced, and the held and write sections read γ 1.74 / 1.55.
+`construct_cross_sector_all` now reserves `sector.decoupled.held.CT` itself and puts it in the CT
+budget's upstream. The held and kept rows count every device array a sector holds, not only its
+models and signed factors. A round's live row counts all its sector and CT slices. CrI3 6×6 P4:
+held and write γ 1.31 / 1.26 → 1.14 / 1.10, eqp unchanged (claim 3764). The rest is the held
+section's own reads and error temporaries, about 1.2 GB at P4. No deck change.
+
+## 2026-10-07 — the sector W(τ) right operand is formed once per Σ call; one reduce-scatter for CC's band brackets
+
+On the axis route (replicated pole columns), the W(τ) synthesis transposed and conjugated
+the τ-invariant right factor at every τ node. That was a copy of 2.1 / 4.9 / 16.5 GB per node
+for CC / TT / CT at CrI3 24×24 P64. `sector_synthesis` now forms the GEMM's right operand
+once (`shared_pole_right_operand`). The mixed sector's partner conj(b_X) d b_Yᵀ is built as
+conj(b_X conj(d) b_Y†), from the same operands at conjugate weights, as the Green's partner
+already is (`right_formed=True`; memory-neutral, since it replaces the factor). The CC
+sector's band brackets now reduce in one reduce-scatter (`BandProjector.finish(stacked=True)`),
+not one per bracket. eqp is unchanged on CrI3 6×6 and Fe 4³ (claim 3755). No deck change.
+
+## 2026-10-07 — the TT, CT and TC sector Greens contract only each window's live bands
+
+The CC sector's band brackets already built each Green through the active-range GEMM over
+their own bands. TT, CT and TC built theirs densely over all bands in every window: 752 at
+CrI3 24×24, where a window holds 130–622 live ones. `sector_node` now builds every Green with
+`build_G_tau(trim_zero_bands=True)` through the active-range GEMM. On CrI3 6×6 P4 the Σ τ
+sweep fell from 34.6 / 45.1 / 42.0 s to 28.5 / 36.4 / 32.0 s; Fe 4³ moved +5 %. eqp moved at
+round-off (claim 3739). No deck change.
+
 ## 2026-10-07 — explicit Γ charge endpoints can use a real Fourier basis
 
 `gw.gamma_charge_basis` binds a canonical `SphereSet` Γ row to cosine/sine
