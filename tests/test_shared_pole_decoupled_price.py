@@ -56,16 +56,20 @@ def test_tt_reduced_stack_room_fits_route_c_when_tt_runs_first():
     assert _room(boundaries[2], AMBIENT) >= 43.29 * GB, _room(boundaries[2], AMBIENT) / GB
 
 
-@pytest.mark.xfail(strict=True, reason="CT rounds still run their eighs in a room with no row: "
-                   "ambient + held TT/CC outputs + the CT round program price stay below the 61.34 GB "
-                   "peak until CT is decoupled (lever 2)")
-def test_ct_round_price_bounds_the_measured_peak():
-    from gw.shared_pole_execution import decoupled_stage_bytes
+def test_ct_price_bounds_the_measured_peak():
+    """CT ran in rounds there; now it runs decoupled beside both sectors' held outputs (rows):
+    the pencil stack and keep stage, one round's program (15.4 GB/rank at width 3), and each eigh
+    under its boundary and whole room (K 13824 = K_C 5632 + K_T 8192)."""
+    from gw.shared_pole_execution import decoupled_cross_bytes
     held_tt, _ = _panels(5184, 24576)
     held_cc, _ = _panels(3328, 18432)
     span = lambda side, two, rows: (side * two + 2 * rows * two) * 16 * NQ // RANKS   # coefficients, models
-    outputs = held_tt + held_cc + span(25856, 18432, 5184) + span(19264, 12288, 3328)
-    assert AMBIENT + outputs + 15.4 * GB >= 61.34 * GB
+    ambient = AMBIENT + held_tt + held_cc + span(25856, 18432, 5184) + span(19264, 12288, 3328)
+    stacks, boundaries = decoupled_cross_bytes(nq=NQ, ranks=RANKS, side=13824, rows=(3328, 5184))
+    stacks_row = ambient + stacks + 15.4 * GB
+    eigh_rows = [ambient + b + _room(b, ambient) for b in boundaries]
+    assert stacks_row <= AVAILABLE, stacks_row / GB
+    assert max(stacks_row, *eigh_rows) >= 61.34 * GB, (stacks_row / GB, [e / GB for e in eigh_rows])
 
 
 def test_guard_runs_a_stack_on_the_mesh_when_the_pool_is_short(monkeypatch):
