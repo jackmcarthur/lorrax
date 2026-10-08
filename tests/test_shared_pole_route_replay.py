@@ -4,7 +4,8 @@ The recipes are their bank receipts' counts (production accuracy, four held supp
 * Ni 20^3 bispinor P64 (runs/Ni/09_prod120_c1200_t600_20261002/bispinor/sc_wsupport_20261007T0300Z):
   641 parents, 32 line sites, 1.59 GB upstream. At its earlier 14 sites every sector is local at
   36 GB (sides 9920 / 14880 / 24800, as that leg printed); at 32 sites TT's local round prices
-  63.9 GB, so 36 GB runs the staged face route in 11 rounds of 59; 72 GB stays q-local.
+  63.9 GB, so 36 GB runs the staged face route in 11 rounds of 59 (each round's selection at once,
+  route (c)); 72 GB stays q-local.
 * CrI3 24x24 bispinor P64 (08_sectfast2_sigma_20261007): 61 parents, 16 sites, 72 GB, 7.44 GB
   upstream: one staged round of 61. At that leg's sides (TT 25856, CC 19264, CT 17408) every eigh
   stack takes route (c), the TT reduced stack (61 x 18432^2) at 68.5 of 72 GB; at the recipe's
@@ -53,6 +54,12 @@ def round_decisions(mesh, ledger, up, rows, sides, cross_side, infinity):
     R, P = 61, 64
     per_rank = lambda e: -(-16 * int(e) * R // P)
     got, live = {}, (up,)
+    tiles = rows[0]['staged_route']
+    for row in (rows[1], rows[0]):
+        name, packed = row['sector'], int(row['packed_extent'])
+        stack = (R * max(1, tiles[name]['dense']), packed, packed)
+        plan = staged_eigh(mesh, stack, R * tiles[name]['unit'], ledger=ledger, live=live, label=name)
+        got[name + '.selection'] = 'c' if plan.batched_route == 'batch_reshard' else 'mesh'
     for row in (rows[1], rows[0]):
         name, packed = row['sector'], int(row['packed_extent'])
         side, iw, carrier = sides[name], infinity[name], face_ritz_carrier(mesh, row['pole_budget'])
@@ -99,7 +106,14 @@ for name, (lines, imag, n, cc, tt, nk, side, nq, budgets) in CASES.items():
         mode, rows, route = sector_route(meta, NS(backend=NS(linalg='local')), bases, nq, mesh_xy=mesh, upstream=(up,))
         row = dict(mode=mode, route=route, modes=[r['mode'] for r in rows] + [rows[0]['joint']['mode']],
                    sides=[r['conservative_pencil_side'] for r in (*rows, rows[0]['joint'])],
-                   tiles={k: v['selection'] for k, v in rows[0].get('staged_route', {}).items() if k != 'CT'})
+                   units={k: round(v['unit'] / GB, 3) for k, v in rows[0].get('staged_route', {}).items() if k != 'CT'})
+        if mode == 'face':
+            # The selection of the whole round at once: its eigh stacks [R x dense, n, n].
+            R, tiles = route['width'], rows[0]['staged_route']
+            row['selection'] = {r['sector']: 'c' if staged_eigh(
+                mesh, (R * max(1, tiles[r['sector']]['dense']), int(r['packed_extent']), int(r['packed_extent'])),
+                R * tiles[r['sector']]['unit'], ledger=ledger, live=(up,), label=r['sector']).batched_route == 'batch_reshard'
+                else 'mesh' for r in rows}
         if name == 'cri3_p64':
             row['actual'] = round_decisions(mesh, ledger, up, rows, dict(TT=25856, CC=19264), 17408, dict(TT=640, CC=416))
             row['conservative'] = round_decisions(mesh, ledger, up, rows, dict(TT=32000, CC=20800), 29700,
@@ -124,12 +138,14 @@ def test_sector_route_replay():
     ni = got['ni/36']
     assert ni['modes'][:2] == ['local', 'face'] and ni['mode'] == 'face'
     assert ni['sides'] == [15680, 23520, 39200]
-    assert ni['route'] == dict(width=59, rounds=11) and ni['tiles'] == dict(CC=52, TT=21)
+    assert ni['route'] == dict(width=59, rounds=11) and ni['selection'] == dict(CC='c', TT='c')
     assert got['ni/72']['mode'] == 'local' and got['ni/72']['route'] == dict(width=64, rounds=11)
     cri3 = got['cri3_p64/72']
     assert cri3['mode'] == 'face' and cri3['route'] == dict(width=61, rounds=1)
-    assert cri3['sides'][:2] == [20800, 32000] and cri3['tiles'] == dict(CC=9, TT=4)
+    assert cri3['sides'][:2] == [20800, 32000]
     actual = cri3['actual']
+    # The selection runs the round's 61 parents at once; its eigh stacks keep route (c).
+    assert actual['TT.selection'] == actual['CC.selection'] == 'c', actual
     # Every stack keeps route (c) at the leg's sides; the TT reduced stack is the tightest.
     assert all(r == 'c' for name in ('TT', 'CC') for r, _ in actual[name]['eighs']), actual
     assert actual['CT']['eighs'] == ['c', 'c'], actual
@@ -140,4 +156,5 @@ def test_sector_route_replay():
     assert conservative['TT']['eighs'][0][0] == 'mesh' and conservative['CT']['eighs'] == ['mesh', 'mesh']
     assert got['fe/40']['mode'] == 'local' and got['fe/40']['route'] == dict(width=4, rounds=4)
     assert got['fe/4']['mode'] == 'face' and got['fe/4']['route'] == dict(width=4, rounds=4)
+    assert got['fe/4']['selection'] == dict(CC='c', TT='c') and got['cri3_p64/72']['selection'] == dict(CC='c', TT='c')
     assert got['cri3_6/40']['mode'] == 'local' and got['cri3_6/40']['route'] == dict(width=4, rounds=2)

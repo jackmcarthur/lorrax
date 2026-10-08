@@ -61,7 +61,7 @@ def test_ct_only_face_runs_the_staged_route(monkeypatch, capsys):
     assert mode == 'face' and [r['mode'] for r in rows] == ['local', 'local'] and rows[0]['joint']['mode'] == 'face'
     assert route == dict(width=4, rounds=4)
     tiles = rows[0]['staged_route']
-    assert set(tiles) == {'CC', 'TT', 'CT'} and tiles['CC']['selection'] == 4 and tiles['TT']['selection'] == 4
+    assert set(tiles) == {'CC', 'TT', 'CT'} and tiles['CC']['unit'] > 0 and tiles['TT']['dense'] == 2
     line = [l for l in capsys.readouterr().out.splitlines() if l.startswith('Shared-pole sector constructor: route')]
-    assert line == ['Shared-pole sector constructor: route rounds of 4 of 13 parents (4 round(s)) on the face, staged; selection '
-                    'tiles CC 4, TT 4 parents; q-local needs GB/rank CC 1.0, TT 1.0, CT 11.0 of 4.0'], line
+    assert line == ['Shared-pole sector constructor: route rounds of 4 of 13 parents (4 round(s)) on the face, staged; '
+                    'q-local needs GB/rank CC 1.0, TT 1.0, CT 11.0 of 4.0'], line

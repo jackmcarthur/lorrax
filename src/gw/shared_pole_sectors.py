@@ -321,19 +321,16 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
         # Each held tile is read, scored, and released before the next support.
         held_rows={name:[] for name in ('CC','TT','CT')}
         with timing.section('spole.sector.held', announce=True):
-            held_ids=[int(i) for i in recipe['held_ids']]
             for name,endpoint_pair,model in zip(held_rows,((0,0),(1,1),(0,1)),signed):
-                # Every held sample of the sector in one read (one open, one transfer).
                 with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
-                    held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,sample_ids=held_ids,
-                                           execution="face" if is_face(model[0]) else "local")
-                for j,sample_id in enumerate(held_ids):
-                    one={k:v[:,j:j+1] for k,v in held.items()}
-                    errors=sector_held_errors(model,one,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
-                    held_rows[name].append(dict(sample_id=sample_id,
-                        Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
-                    del one
-                del held
+                    for sample_id in recipe['held_ids']:
+                        sample_id=int(sample_id)
+                        held=read_sector_round(io,meta,bank,header,ids,endpoint_pair,
+                                               sample_span=(sample_id,sample_id+1),execution="face" if is_face(model[0]) else "local")
+                        errors=sector_held_errors(model,held,_sample_point(recipe,sample_id),mesh_xy=mesh_xy)
+                        held_rows[name].append(dict(sample_id=sample_id,
+                            Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
+                        del held
         treatment_receipt=None
         if treatment is not None:
             treatment_receipt=dict(
@@ -738,9 +735,9 @@ def _sector_selection(samples, moments, line, recipe, geometry, n, eig, *, mesh_
 
 
 def staged_sector(read, ids, real, meta, config, geometry, *, mesh_xy, route):
-    """One round's CC or TT on the face: the selection in sub-batches of the fixed tile
-    (``read(ids, real)`` returns their samples, moments and line panels), one set of tables
-    for the round's ``len(ids)`` slots, and the staged reduction (``face_reduce_decoupled``):
+    """One round's CC or TT on the face: the selection of the round's ``len(ids)`` slots at once
+    (``read(ids, real)`` returns their samples, moments and line panels), their tables, and the
+    staged reduction (``face_reduce_decoupled``):
     GEMM stages over the widest halving of the round whose program fits beside its stacks
     (``stage_width``), each eigh once over the round's stack, on route (c) where its shape
     price fits beside its boundary (``staged_eigh``). Returns what the q-local round returns."""
@@ -753,9 +750,9 @@ def staged_sector(read, ids, real, meta, config, geometry, *, mesh_xy, route):
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_capacity import ConstructorCapacity,staged_sector_bytes,_shard_bytes,_local_eigenplan
     from gw.shared_pole_directions import port_extent
-    from gw.shared_pole_local import recipe_panel_widths,recipe_infinity_width,pad_states,parent_rounds
+    from gw.shared_pole_local import recipe_panel_widths,recipe_infinity_width,pad_states
     from gw.shared_pole_execution import (face_reduce_decoupled,face_ritz_carrier,face_reduction_bytes,
-                                          _stack,parent_rows,staged_eigh,stage_width)
+                                          staged_eigh,stage_width)
     components=int(geometry['components'])
     basis=geometry['basis']
     name=geometry['sector']
@@ -773,50 +770,26 @@ def staged_sector(read, ids, real, meta, config, geometry, *, mesh_xy, route):
     packed=int(local_meta.n_rmu_padded)
     width=len(ids)
     tile=route[name]
-    budget.batch_width=int(tile['selection'])
-    # The selection eighs: one [tile x dense samples] stack per kind, beside the tile's inputs and
-    # every selected panel of the round at the recipe bound.
-    stack=(int(tile['selection'])*max(1,int(tile['dense'])),packed,packed)
-    eig=staged_eigh(mesh_xy,stack,int(tile['selection'])*int(tile['unit'])+int(tile['panels']),
-                    ledger=ledger,live=ambient,label=f'{name} selection')
-    eigh_bytes=distrib_la.eigh_stack_bytes(eig,stack,np.complex128)
-    parts=[]
+    budget.batch_width=width
+    # The selection runs the round's parents at once: its eighs run one whole matrix per rank,
+    # so its unit is the layer of the round (decisions.md#fixed-tile), one [R x dense] stack per kind.
+    stack=(width*max(1,int(tile['dense'])),packed,packed)
+    eig=staged_eigh(mesh_xy,stack,width*int(tile['unit']),ledger=ledger,live=ambient,label=f'{name} selection')
     with timing.section('decoupled.selection'):
-        for sub,sub_real,_ in parent_rounds(ids,int(tile['selection'])):
-            samples,moments,line=read(sub,sub_real)
-            line={} if line is None else line
-            # Earlier sub-batches' selected panels stay live beside this selection.
-            budget.retained_panels=tuple(a for a in jax.tree.leaves([(part[0],part[3]) for part in parts])
-                                         if hasattr(a,'sharding'))
-            price=budget.resident_quote(0,phase='selection',sample_batch=samples['Wc'].shape[1],
-                selection_faces=_selection_faces(samples,moments,line,packed))['resident_bytes_per_rank']
-            ledger.reserve(f"sector.staged.{name}.selection.{len(ledger.entries)}",
-                resident_bytes_per_rank=price+eigh_bytes,workspace_bytes_per_rank=0,concurrent_with=ambient)
-            states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,
-                dict(geometry,ids=sub,real=sub_real),n,eig,mesh_xy=mesh_xy)
-            # A short last sub-batch repeats its last slot: keep the leading slots only.
-            parts.append((states,np.asarray(counts)[:int(sub_real)],roles,infinity,list(values)[:int(sub_real)],sub_real))
-            del samples,moments,line
-    budget.retained_panels=()
-    with timing.section('decoupled.stack'):
-        # One carrier per state over every sub-batch (the widest selection), then one stack.
-        widths=[max(ws) for ws in zip(*(recipe_panel_widths(part[2][0],part[0],recipe,column_extent=extent,logical_n=n)
-                                        for part in parts))]
-        infinity_width=max(recipe_infinity_width(part[3],recipe,column_extent=extent,logical_n=n) for part in parts)
-        padded=[pad_states(part[0],widths,part[3],infinity_width) for part in parts]
-        take=lambda a,keep:a if int(a.shape[0])==int(keep) else parent_rows(mesh_xy,a,np.arange(int(keep)))
-        def node(a):
-            z=padded[0][0][a][0]
-            if np.ndim(z)==0:
-                return z
-            return np.concatenate([np.asarray(sub[0][a][0])[:part[5]] for sub,part in zip(padded,parts)])
-        states=[(node(a),*_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[0][a][1:]) for sub,part in zip(padded,parts)]))
-                for a in range(len(padded[0][0]))]
-        infinity=_stack(mesh_xy,[tuple(take(x,part[5]) for x in sub[1]) for sub,part in zip(padded,parts)])
-        counts=np.concatenate([part[1] for part in parts])
-        values=[v for part in parts for v in part[4]]
-        roles=parts[0][2]
-        del padded,parts
+        samples,moments,line=read(ids,width)
+        line={} if line is None else line
+        price=budget.resident_quote(0,phase='selection',sample_batch=samples['Wc'].shape[1],
+            selection_faces=_selection_faces(samples,moments,line,packed))['resident_bytes_per_rank']
+        ledger.reserve(f"sector.staged.{name}.selection.{len(ledger.entries)}",
+            resident_bytes_per_rank=price+distrib_la.eigh_stack_bytes(eig,stack,np.complex128),
+            workspace_bytes_per_rank=0,concurrent_with=ambient)
+        states,counts,roles,infinity,values=_sector_selection(samples,moments,line,recipe,
+            dict(geometry,ids=ids,real=width),n,eig,mesh_xy=mesh_xy)
+        del samples,moments,line
+    # Every state panel is padded to its recipe carrier (round_tables holds the pencil extent).
+    widths=recipe_panel_widths(roles[0],states,recipe,column_extent=extent,logical_n=n)
+    infinity_width=recipe_infinity_width(infinity,recipe,column_extent=extent,logical_n=n)
+    states,infinity=pad_states(states,widths,infinity,infinity_width)
     tables=_sector_tables(meta,geometry,n,counts,widths,states,values,infinity_width,extent)
     side=int(tables['active'].shape[-1])
     carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget'])
@@ -855,7 +828,7 @@ def staged_sector(read, ids, real, meta, config, geometry, *, mesh_xy, route):
     model,signed,vectors,diagnostics,y=reduced
     _sector_gates(diagnostics,name,ids,int(real))
     residual=lambda key:float(np.max(np.asarray(diagnostics[0][key])[:int(real)]))
-    receipt=dict(parents=width,side=side,selection=int(tile['selection']),stage=int(stage),
+    receipt=dict(parents=width,side=side,stage=int(stage),
                  eigh_routes=['c' if p.batched_route==distrib_la.ROUTE_BATCH_RESHARD else 'mesh' for p in plans],
                  stacks_bytes_per_rank=int(stacks+held+dw),keep_residual=residual('metric_inverse_root_residual_relative'))
     return dict(model=model,signed=signed,coefficients=y,states=states,infinity=infinity,
@@ -1607,8 +1580,9 @@ def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=prin
     q-local, rounds of P parents with one whole parent per rank, when every sector's local
     round fits (``sector_execution``); otherwise rounds of R = min(nq, P) parents (balanced)
     on the face through the staged reduction (``staged_round``). R is set by P, never by the
-    budget. The selection runs in sub-batches of the fixed tile (``runtime.tiles``), priced per
-    parent from the recipe's selection inputs; stage widths and eigh routes are decided per
+    budget. The selection runs the round's parents at once (its eighs run one whole matrix per
+    rank, so its unit is the round's layer), priced per parent from the recipe's selection
+    inputs; stage widths and eigh routes are decided per
     round at the round's shapes (``stage_width``, ``staged_eigh``). Returns
     ``(execution, rows, route)``: ``route['width']`` parents per round; the staged route's
     tiles ride on ``rows[0]['staged_route']``.
@@ -1617,7 +1591,6 @@ def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=prin
     from types import SimpleNamespace
     from gw.shared_pole_capacity import shared_pole_byte_terms
     from gw.shared_pole_execution import line_panel_count
-    from runtime.tiles import tile_units
     execution,rows=sector_execution(meta,config,mu_bases,nq,mesh_xy=mesh_xy,upstream=upstream)
     nq,ranks=int(nq),int(mesh_xy.size)
     rounds=-(-nq//min(nq,ranks))
@@ -1632,18 +1605,14 @@ def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=prin
         dense=len(recipe['fit_ids'])-lines
         tiles={}
         for row in rows:
-            packed,side,iw=int(row['packed_extent']),int(row['conservative_pencil_side']),int(row['infinity_width'])
-            unit=shared_pole_byte_terms(SimpleNamespace(n_rmu_padded=packed),mesh_xy=mesh_xy,
+            unit=shared_pole_byte_terms(SimpleNamespace(n_rmu_padded=int(row['packed_extent'])),mesh_xy=mesh_xy,
                 resolution=SimpleNamespace(layout='distributed'),pencil_side=0,parent_batch=1,
                 sample_batch=max(1,dense),phase='selection',selection_faces=int(row['selection_faces']))['resident_bytes_per_rank']
-            # Every selected (Q, O) and infinity panel of the round at the recipe bound.
-            panels=-(-16*(2*packed*(side-2*iw)+5*packed*iw)*width//ranks)
-            tiles[row['sector']]=dict(selection=tile_units(unit,width),unit=int(unit),dense=dense,panels=panels)
+            tiles[row['sector']]=dict(unit=int(unit),dense=dense)
         tiles['CT']=lines*8*(int(rows[1]['packed_extent'])*int(rows[0]['line_width'])
                              +int(rows[0]['packed_extent'])*int(rows[1]['line_width']))
         rows[0]['staged_route']=tiles
         text=(f"rounds of {width} of {nq} parents ({-(-nq//width)} round(s)) on the face, staged; "
-              f"selection tiles CC {tiles['CC']['selection']}, TT {tiles['TT']['selection']} parents; "
               f"q-local needs GB/rank {local} of {budget/1e9:.1f}")
     else:
         text=f"q-local, {-(-nq//width)} round(s) of {width} parents (local GB/rank {local} of {budget/1e9:.1f})"

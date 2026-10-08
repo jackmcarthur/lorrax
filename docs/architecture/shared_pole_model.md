@@ -328,8 +328,9 @@ over the rounds, on the face through the staged reduction (`staged_round`). R
 is set by P, not by the budget. Each round reduces TT, then CC beside TT's held
 outputs, then CT from both:
 
-* the selection runs in sub-batches of the fixed tile (`runtime.tiles`), one
-  parent's selection inputs priced from the recipe;
+* the selection runs the round's parents at once: its eighs run one whole
+  matrix per rank, so its unit is the round's layer (decisions.md#fixed-tile),
+  and its eigh stacks follow the rule below;
 * the reduction's stage programs (`paired_members`, `keep_stage`,
   `paired_stage`, `output_stage`; for CT the pencil, `joint_keep_stage`,
   `joint_output_stage`) run over sub-batches of the widest halving of R whose

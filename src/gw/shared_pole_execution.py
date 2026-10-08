@@ -237,7 +237,6 @@ def route_summary(mode, receipt):
     staged = receipt.get("staged")
     if staged is not None:
         price += (f"; staged: rounds of {staged['parents']}, side {staged['side']}, "
-                  + (f"selection tiles of {staged['selection']}, " if 'selection' in staged else "")
                   + f"stages of {staged['stage']}, eighs " + "/".join(staged['eigh_routes'])
                   + f", stacks {staged['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank"
                   + (f", max |ZAZ-I|/sqrt(R) {staged['keep_residual']:.1e}" if 'keep_residual' in staged else ""))

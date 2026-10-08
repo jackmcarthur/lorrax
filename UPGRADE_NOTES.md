@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — the staged sector selection runs each round at once; held checks read one sample at a time again
+
+The staged route's CC/TT selection ran in sub-batches of the 1 GiB tile (3 parents for TT at
+CrI3 24×24 P64), each with its own reads and eigh stacks: TT.all took 251 s per warm map
+against 186 s before the staged route. The selection's eighs run one whole matrix per rank, so
+its unit is the round's layer of R ≤ P parents (decisions.md#fixed-tile), and it now runs the
+whole round at once; its eigh stacks take route (c) or the mesh by the same rule as every other
+stack. The held checks read one held sample at a time again: reading them all in one call kept
+the tiles of every sample live and raised the held section's peak from 25.8 to 40.5 GB at P64,
+which no row priced. Results move at round-off only. No deck change.
+
 ## 2026-10-08 — a k grid mathdx cannot hold runs on the XLA backend instead of refusing
 
 On CUDA the k-convolution factories now take the XLA backend (`jnp.fft` along the k axes),
