@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from distrib_la.loader import active_eigh_workspace, probe_target
+from lxkit import device_vendor
 
 
 def _spec(array):
@@ -247,7 +248,7 @@ def plan_local_subspace(*, capacity: int, n_eig: int, max_block_size: int | None
         raise ValueError('require 1 <= n_eig <= capacity < 2**31')
     if not jax.config.x64_enabled:
         raise ValueError('local active subspace requires JAX x64')
-    if jax.local_devices()[0].platform != 'gpu':
+    if device_vendor(jax.local_devices()[0]) != 'cuda':
         raise ValueError('local active subspace currently requires CUDA')
     for op in ('eigh', 'project', 'reconstruct', 'ortho', 'store', 'gram'):
         result = probe_target('lorrax_active_subspace_'+op, 'CUDA')

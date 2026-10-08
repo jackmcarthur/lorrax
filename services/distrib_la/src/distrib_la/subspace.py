@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
+from lxkit import device_vendor
 
 from distrib_la.active_subspace import LocalSubspacePlan, _orthogonalization_range, plan_local_subspace
 from distrib_la.loader import probe_target
@@ -292,7 +293,7 @@ def plan_subspace(*, capacity, n_eig, vector_sharding=None, max_block_size=None,
     """
     _validate_plan_geometry(capacity, n_eig, vector_sharding, max_block_size)
     local = (plan_local_subspace(capacity=capacity, n_eig=n_eig, max_block_size=max_block_size)
-             if jax.local_devices()[0].platform == 'gpu' else CpuSubspacePlan(capacity, n_eig, max_block_size))
+             if device_vendor(jax.local_devices()[0]) == 'cuda' else CpuSubspacePlan(capacity, n_eig, max_block_size))
     return _distribute(local, vector_sharding, native_collectives=native_collectives)
 
 
@@ -308,7 +309,7 @@ def plan_orthogonalization(*, capacity, max_block_size, vector_sharding=None,
     if not isinstance(max_block_size, int) or max_block_size < 1:
         raise ValueError('max_block_size must be a positive Python integer')
     _validate_plan_geometry(capacity, 1, vector_sharding, max_block_size)
-    if jax.local_devices()[0].platform == 'gpu':
+    if device_vendor(jax.local_devices()[0]) == 'cuda':
         result = probe_target('lorrax_active_subspace_ortho', 'CUDA')
         if not result.ok:
             raise RuntimeError(f'orthogonalization provider unavailable: {result}')

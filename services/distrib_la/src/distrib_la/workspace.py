@@ -6,6 +6,7 @@ import operator
 import numpy as np
 
 from distrib_la.resolve import mesh_platform
+from lxkit import device_vendor
 
 
 def _shapes(shapes):
@@ -223,7 +224,7 @@ def _local_kernel_workspace(mesh, op, shapes, dtype):
     if op == 'eigh':
         n = max(s[-1] for s in shapes)
         rows = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
-        if any(d.platform == 'gpu' for d in mesh.devices.flat):
+        if any(device_vendor(d) == 'cuda' for d in mesh.devices.flat):
             return rows * (_vendor_query(0, 'eigh', (n,), dtype.str)[0] + 4)
         if dtype.kind == 'c':
             return rows * (16 * (2*n + n*n) + 8 * (1 + 5*n + 2*n*n) + 4 * (3 + 5*n))
