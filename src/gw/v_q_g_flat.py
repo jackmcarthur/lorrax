@@ -691,6 +691,7 @@ def _compute_V_q_g_flat_tiles(
     specs, *, kgrid, fft_grid, mesh_xy, g_chunk: int | None, sym,
     centroid_indices, qgrid_policy=None, verbose: bool,
     budget_bytes: float | None = None,
+    zeta_ios=None,
 ) -> list:
     """Several V tiles over one set of ζ loaders, each loader read ONCE per q-tile.
 
@@ -721,6 +722,12 @@ def _compute_V_q_g_flat_tiles(
             raise ValueError(
                 f"_compute_V_q_g_flat_tiles[{label}]: ζ layout must be "
                 f"'G_flat'; got {getattr(ld, 'zeta_layout', None)!r}")
+    if zeta_ios is not None:
+        zeta_ios = tuple(zeta_ios)
+        if (len(loaders) != 3 or len(zeta_ios) != 3
+                or not all(hasattr(ld, 'contract_v') for ld in loaders)
+                or any(s['is_charge_cc'] for s in specs)):
+            raise ValueError("Physical current writers require the complete live three-current family")
 
     # ---- IBZ list (shared by every tile) --------------------------------
     (_q_int, q_irr_frac,
@@ -885,7 +892,7 @@ def _compute_V_q_g_flat_tiles(
             Vs = contract_v_group(
                 loaders, [(slot(s['L']), slot(s['L'] if s['same_zeta'] else s['R']))
                           for s in specs],
-                [s['v'] for s in specs], keep=keep)
+                [s['v'] for s in specs], keep=keep, zeta_ios=zeta_ios)
             for s, V in zip(specs, Vs):
                 s['V'] = V
             del Vs
