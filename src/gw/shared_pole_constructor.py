@@ -341,7 +341,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # first-reducer workspace is dead before mixed K/L assembly.
                 trim_terms = real_trim_projection_bytes(mesh_xy=mesh_xy, parents=len(ids), rows=n,
                     side=side, keep_budget=recipe['pole_budget'], retained_panels=budget.retained_panels)
-                trim_price = ledger.reserve('constructor.trim-real-projection',
+                trim_price = ledger.reserve(f'constructor.trim-real-projection.q{ids[0]}',
                     resident_bytes_per_rank=trim_terms['resident_bytes_per_rank'],
                     workspace_bytes_per_rank=int(workspace), concurrent_with=upstream)
                 trim_price['staged_terms'] = trim_terms
