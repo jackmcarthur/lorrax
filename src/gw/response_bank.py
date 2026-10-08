@@ -2847,7 +2847,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     also this map's ``qsgw_head.qp_velocity`` (DFT basis, head storage), and
     ``off`` the DFT bundle and its fixed-N state.
     """
-    from file_io.shared_pole_store import validate_shared_pole_bank
+    from file_io.shared_pole_store import validate_shared_pole_bank, check_photon_centroid_bases
 
     started = time.monotonic()
     # The photon bank's head, fenced so it is no longer an unnamed band of
@@ -2857,10 +2857,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
             expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
         if header.get("photon_layout", {}).get("packed_extent") != layout.packed_extent:
             raise ValueError("GATE photon_bank_layout: scratch has a different packed photon layout")
-        expected = [hashlib.sha256(np.asarray(b.canonical_indices, dtype="<i4").tobytes()).hexdigest()
-                    for b in mu_bases]
-        if expected != header["photon_centroid_digests"]:
-            raise ValueError("GATE photon_bank_centroids: scratch/current endpoint identity differs")
+        check_photon_centroid_bases(header, mu_bases)
         bank = dict(bank_io, photon_layout=layout)
         with timing.section("bank.coulomb_digest"):
             v_digest = resource_digest(bank["bispinor_v_q_path"])

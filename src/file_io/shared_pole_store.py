@@ -236,11 +236,57 @@ def _stamp_header(path, header, stage):
     rank0_transaction(path, stage=stage, write=publish)
 
 
+def _centroid_basis_metadata(basis):
+    """Bind ordered scientific coordinates without recording mesh padding.
+
+    FFT models retain their historical int32 SHA256 field and bytes.
+    Fractional models use the canonical coordinate owner and explicit typing;
+    a legacy integer-cast digest cannot authenticate an off-grid basis.
+    """
+    from file_io.wfn_basis import centroid_table_fingerprint_scheme, centroid_table_md5
+
+    kind = getattr(basis, "coordinate_kind", "fft_indices")
+    scheme = centroid_table_fingerprint_scheme(kind)
+    if kind == "fft_indices":
+        return {"centroid_digest": hashlib.sha256(np.asarray(
+            basis.canonical_indices, dtype="<i4").tobytes()).hexdigest()}
+    return {"centroid_digest": centroid_table_md5(
+                basis.canonical_indices, coordinate_kind=kind),
+            "centroid_coordinate_kind": kind,
+            "centroid_fingerprint_scheme": scheme}
+
+
+def _photon_centroid_metadata(mu_bases):
+    """The charge/current endpoint identities, preserving legacy FFT fields."""
+    if len(mu_bases) != 2:
+        _refuse("photon scratch needs both authenticated centroid bases")
+    identities = [_centroid_basis_metadata(basis) for basis in mu_bases]
+    fields = {"photon_centroid_digests": [row["centroid_digest"] for row in identities]}
+    if any("centroid_coordinate_kind" in row for row in identities):
+        fields["photon_centroid_identities"] = identities
+    return fields
+
+
+def check_photon_centroid_bases(header, mu_bases):
+    """Authenticate both supplied photon endpoints before tensor consumption.
+
+    Untyped legacy FFT pairs keep their original digest contract. A pair with
+    an off-grid endpoint requires the writer's precise typed records; an old
+    truncated endpoint digest is refused without changing the artifact.
+    """
+    expected = _photon_centroid_metadata(mu_bases)
+    if (header.get("photon_centroid_digests") != expected["photon_centroid_digests"]
+            or header.get("photon_centroid_identities") != expected.get("photon_centroid_identities")):
+        _refuse("photon scratch/current centroid endpoint identity changed")
+
+
 def _check_basis(meta, header, basis=None):
     """Authenticate scientific centroid order independently of mesh padding."""
     basis = meta.mu_basis if basis is None else basis
-    digest = hashlib.sha256(np.asarray(
-        basis.canonical_indices, dtype="<i4").tobytes()).hexdigest()
+    expected = _centroid_basis_metadata(basis)
+    kind = expected.get("centroid_coordinate_kind", "fft_indices")
+    if header.get("centroid_coordinate_kind", "fft_indices") != kind:
+        _refuse("reader/writer centroid coordinate kind changed")
     logical = (header["photon_layout"]["logical_extents"][0]
                if "photon_layout" in header else header["n_mu_logical"])
     if "photon_layout" in header:
@@ -249,7 +295,7 @@ def _check_basis(meta, header, basis=None):
             _refuse("photon scratch mesh differs from its recorded packed ordering")
     if (basis.n_logical != logical
             or int(meta.nspinor) != header["nspinor"]
-            or digest != header["centroid_digest"]):
+            or any(header.get(key) != value for key, value in expected.items())):
         _refuse("reader/writer logical centroid or spin identity changed")
     return basis
 
@@ -298,8 +344,7 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
         _refuse("QirrTables uses unauthorized operation rows")
     if not isinstance(recipe, dict) or not recipe:
         _refuse("missing resolved recipe and gate versions")
-    centroid_hash = hashlib.sha256(np.asarray(
-        basis.canonical_indices, dtype="<i4").tobytes()).hexdigest()
+    centroid_metadata = _centroid_basis_metadata(basis)
     if sector is not None:
         recipe = dict(recipe, operator_realization="raw-sector-endpoint-v1")
     header = {
@@ -317,7 +362,7 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
         "parent_convention": "raw-parent",
         "n_q_irr": qt.n_q_ibz, "n_q_full": qt.n_q_full,
         "n_mu_logical": basis.n_logical, "nspinor": int(meta.nspinor),
-        "centroid_digest": centroid_hash,
+        **centroid_metadata,
         "grid": [int(meta.nkx), int(meta.nky), int(meta.nkz)],
         "fft_grid": np.asarray(meta.fft_grid).tolist(),
         "q_order": "canonical-full-flat", "q_shift": [0.0, 0.0, 0.0],
@@ -2019,8 +2064,7 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
         header.update(photon_layout=dict(logical_extents=list(photon_layout.logical_extents),
             carrier_extents=list(photon_layout.carrier_extents), mesh_side=photon_layout.mesh_side,
             ordering=photon_layout.ordering, packed_extent=photon_layout.packed_extent),
-            photon_centroid_digests=[hashlib.sha256(np.asarray(b.canonical_indices, dtype="<i4").tobytes()).hexdigest()
-                                     for b in mu_bases],
+            **_photon_centroid_metadata(mu_bases),
             n_mu_logical=photon_layout.packed_extent,
             capacity_geometry=dict(_capacity(meta).geometry), representation="photon-ordered-z",
             normalization="Wc=W-W_infinity; constant=W_infinity-V; both current endpoints retained")

@@ -1778,7 +1778,8 @@ class BispinorVqReader:
                     sym_idx_q=sym.sym_idx_q, kgrid=self.kgrid,
                     n_sym_spatial=plan.n_sym_spatial, context="photon V reader")
                 closure = verify_centroid_orbit_closure(
-                    basis.canonical_indices / np.asarray(plan.fft_grid),
+                    (basis.canonical_indices if basis.coordinate_kind == 'fractional'
+                     else basis.canonical_indices / np.asarray(plan.fft_grid)),
                     plan.spatial_ops, tnp=plan.translations)
                 if self.q_headers[family].centroid_hash != closure.centroid_hash:
                     raise ValueError("Photon V centroid set differs from the run; rerun restart=false.")

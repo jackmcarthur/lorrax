@@ -37,7 +37,7 @@ def _synthetic_mf_source(path, facts):
         for name,value in data.items():mf.create_dataset(name,data=value)
 
 
-def publication_fixture(runtime, directory):
+def publication_fixture(runtime, directory, *, mu_basis=None):
     """Return plain callbacks consuming the admitted provider fixture arrays."""
     import numpy as np
     import jax
@@ -57,12 +57,16 @@ def publication_fixture(runtime, directory):
         source=directory/'source_header.h5'
         rank0_transaction(str(source),stage='fixture_mf_source',
             write=lambda:_synthetic_mf_source(source,facts))
-        # Identity μ order isolates the physical writer; q/G pads are already
-        # poisoned by the independent provider proof. Packed μ transport is
-        # covered by the existing centroid basis tests, not inferred here.
-        points=np.asarray([[i//4,(i//2)%2,i%2] for i in range(8)],np.int32)
-        meta=SimpleNamespace(fft_grid=(4,4,6),mu_basis=SimpleNamespace(
-            coordinate_kind='fft_indices',canonical_indices=points))
+        # The old identity proof remains the default. Layout cases provide a
+        # real packed basis with independent canonical reference labels.
+        if mu_basis is None:
+            points=np.asarray([[i//4,(i//2)%2,i%2] for i in range(8)],np.int32)
+            basis=SimpleNamespace(coordinate_kind='fft_indices',canonical_indices=points)
+        else:
+            assert facts['mu_basis'] is mu_basis
+            assert all(z.mu_basis is mu_basis for z in zetas)
+            basis=mu_basis
+        meta=SimpleNamespace(fft_grid=(4,4,6),mu_basis=basis)
         for mu,z in enumerate(zetas,start=1):z.path=str(directory/f'zeta_q_mu{mu}.h5')
         with ExitStack() as stack:
             writers=_open_current_physical_writers(stack,dict(enumerate(zetas,start=1)),
@@ -82,11 +86,17 @@ def publication_fixture(runtime, directory):
         rank0_transaction(zetas[0].path,stage='fixture_current_complete',write=complete)
 
     def verify(zetas,got,facts):
-        file_error=0.;compensation_signal=0.;shell_error=0.
+        file_error=0.;compensation_signal=0.;shell_error=0.;wrong_order_signal=0.;wrong_operator_signal=0.
         for z,physical,comp in zip(zetas,facts['physical'],facts['compensation']):
             with open_zeta(z.path,mesh=mesh) as loader:
-                assert loader.coordinate_kind=='fft_indices'
-                assert read_isdf_header(z.path).zeta_is_done
+                kind='fft_indices' if mu_basis is None else mu_basis.coordinate_kind
+                assert loader.coordinate_kind==kind
+                header=read_isdf_header(z.path)
+                assert header.zeta_is_done
+                if mu_basis is not None:
+                    coordinates=header.r_mu_crystal if kind=='fractional' else header.r_mu_fft_idx
+                    np.testing.assert_array_equal(coordinates,mu_basis.canonical_indices)
+                    if kind=='fractional':assert header.r_mu_fft_idx is None
                 data=loader.read_zeta_G_slab(q_offset=0,q_count=3,mu_offset=0,mu_count=8)
                 host=np.asarray(gather_to_host(data))
             file_error=max(file_error,float(np.max(abs(host-physical))))
@@ -94,6 +104,13 @@ def publication_fixture(runtime, directory):
             shell=np.take_along_axis(host,facts['keep'][:,None],axis=2)
             shell_error=max(shell_error,float(np.max(abs(shell-np.asarray(gather_to_host(z.shell))))))
             for q,n in enumerate(z.ngk_per_q):assert not host[q,:,n:].any()
+        if mu_basis is not None:
+            wrong_order_signal=max(float(np.max(abs(canonical-packed)))
+                for canonical,packed in zip(facts['physical'],facts['physical_packed']))
+            assert wrong_order_signal>1e-3,'layout witness did not expose wrong canonical order'
+            wrong_operator_signal=max(float(np.max(abs(canonical-packed)))
+                for canonical,packed in zip(facts['expected'],facts['expected_packed']))
+            assert wrong_operator_signal>1e-5,'layout witness did not expose wrong operator order'
         assert file_error<2e-11 and shell_error<2e-11
         assert compensation_signal>1e-6,'fixture did not distinguish physical delta from compensation'
         host_V=tuple(np.asarray(gather_to_host(v)) for v in got)
@@ -133,6 +150,10 @@ def publication_fixture(runtime, directory):
             physical_vs_compensation_signal=compensation_signal,
             saved_tensor_exact=True,nine_block_exchange_replay_exact=True,
             one_sided_gamma2_sign_signal=sign_signal,
+            nonidentity_mu=mu_basis is not None,
+            coordinate_kind='fft_indices' if mu_basis is None else mu_basis.coordinate_kind,
+            wrong_canonical_order_signal=wrong_order_signal,
+            wrong_canonical_operator_signal=wrong_operator_signal,
             scope='synthetic provider physical payload and complete saved-tensor action replay; not Qirr-stamped production GW restart')
     return dict(open=opened,verify=verify),result
 

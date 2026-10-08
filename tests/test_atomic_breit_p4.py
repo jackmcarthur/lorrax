@@ -20,7 +20,8 @@ def forbid_stored_zeta_reads(zetas):
 
 def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
                       angular_maximum=2,field_tile=3,centroid_tile=3,compensated=False,averaged_heads=False,
-                      embedded_gamma=False, publication_fixture=None):
+                      embedded_gamma=False, publication_fixture=None,
+                      mu_basis=None, canonical_to_packed_reference=None):
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -37,6 +38,17 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
 
     mesh=runtime.mesh;assert mesh.size==4
     Q,Qp,mu,ng,gpad,gt,na,nr,R=3,4,8,7,8,4,2,8,1.1
+    # Random arrays below define PACKED coordinates. The optional layout
+    # witness checks file-canonical output against a literal independent map.
+    reference_ids=np.arange(mu,dtype=np.int32)
+    if mu_basis is not None:
+        if canonical_to_packed_reference is None:
+            raise ValueError('layout witness requires an independent literal reference map')
+        reference_ids=np.asarray(canonical_to_packed_reference,np.int32)
+        assert mu_basis.n_logical==mu_basis.n_packed==mu
+        assert np.array_equal(np.sort(reference_ids),np.arange(mu))
+        assert np.array_equal(mu_basis.layout.axis.canonical_to_packed,reference_ids)
+        assert not mu_basis.is_identity
     volume,nfft=1000.,96;prefactor=prefactor_multiplier*np.pi/volume
     lm=np.asarray([(l,m) for l in range(angular_maximum+1) for m in range(-l,l+1)],np.int32)
     nh=len(lm);r=R*(np.arange(1,nr+1)/nr)**3
@@ -106,7 +118,7 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         zetas.append(ZetaG(store,mesh=mesh,L_q=put(lu),
             lu_piv=device_put_process_local(piv,NamedSharding(mesh,P(('x','y'),None))),
             solver_kind='lu',batched_route='batch_reshard',n_rmu_solve=mu,n_rmu=mu,
-            mu_basis=None,ngk_per_q=counts,gvec_components=gvec,
+            mu_basis=mu_basis,ngk_per_q=counts,gvec_components=gvec,
             path='synthetic static current',print_fn=lambda line:None))
     provider_args=dict(
         smooth_rhs=tuple(ps_rhs) if compensated else None,
@@ -169,20 +181,25 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
             expected.append(base+product(smooth[a],delta[b])+product(delta[a],smooth[b]))
         without_cross.append(base)
     for z,p in zip(zetas,providers):z.local_augmentation=p
+    expected_canonical=[e[:,reference_ids][:,:,reference_ids] for e in expected]
     keep=np.asarray([[0,2],[0,4],[0,5]],np.int32)
     if publication_fixture is None:
         got=contract_v_group(zetas,pairs,v_tables,keep=keep,print_fn=lambda line:None)
     else:
-        facts=dict(physical=tuple((s+d)[:Q,:,:ng] for s,d in zip(smooth,delta)),
-                   compensation=tuple((s+g0)[:Q,:,:ng] for s,g0 in zip(smooth,g)),
-                   expected=tuple(e[:Q] for e in expected),pairs=pairs,keep=keep,
+        facts=dict(physical=tuple((s+d)[:Q,reference_ids,:ng] for s,d in zip(smooth,delta)),
+                   compensation=tuple((s+g0)[:Q,reference_ids,:ng] for s,g0 in zip(smooth,g)),
+                   expected=tuple(e[:Q] for e in expected_canonical),pairs=pairs,keep=keep,
+                   expected_packed=tuple(e[:Q] for e in expected),
+                   physical_packed=tuple((s+d)[:Q,:,:ng] for s,d in zip(smooth,delta)),
+                   canonical_to_packed_reference=reference_ids.copy(),
+                   mu_basis=mu_basis,
                    current_basis_rows=B,head_fixture=head_fixture)
         with publication_fixture['open'](zetas,facts) as writers:
             got=contract_v_group(zetas,pairs,v_tables,keep=keep,
                                  print_fn=lambda line:None,zeta_ios=writers)
         publication_fixture['verify'](zetas,got,facts)
     host=tuple(np.asarray(gather_to_host(v)) for v in got)
-    error=max(float(np.max(np.abs(a-e[:Q]))) for a,e in zip(host,expected))
+    error=max(float(np.max(np.abs(a-e[:Q]))) for a,e in zip(host,expected_canonical))
     normref=max(float(np.max(np.abs(e[:Q]))) for e in expected)
     assert error<2e-11,(error,normref)
     gamma_signal=0.
@@ -193,7 +210,7 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         assert gamma_signal>1e-8,gamma_signal
     shell_error=0.
     for c,z in enumerate(zetas):
-        reference=np.take_along_axis((smooth[c]+delta[c])[:Q],keep[:,None],axis=2)
+        reference=np.take_along_axis((smooth[c]+delta[c])[:Q,reference_ids],keep[:,None],axis=2)
         shell_error=max(shell_error,float(np.max(np.abs(gather_to_host(z.shell)-reference))))
     assert shell_error<2e-11,shell_error
     cross_signal=max(float(np.max(np.abs(e-b))) for e,b in zip(expected,without_cross))
