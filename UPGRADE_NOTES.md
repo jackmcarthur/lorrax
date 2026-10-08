@@ -5,6 +5,38 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — feature branch scalar TRS shared-pole real Galerkin reference route
+
+On `codex/cdref-real-galerkin-20261008`, the bounded scalar face constructor
+uses phase-balanced real Galerkin columns at authenticated self-negative
+parents. Eligibility uses the public full-grid TRIM mask, explicit measured
+TRS and one-component input wavefunctions; generic q, ordered and spinor
+routes keep their existing construction. This uses the current full-Bloch
+charge chart, where conjugation maps `G` to `-G-2q` at a TRIM. It does not
+average input fields or change the Gram, zero, passivity or held thresholds.
+
+The first compression's original-infinity retained-moment checks remain.
+The new final Ritz span projects the SAME original infinity anchors afresh;
+internal augmented-coordinate identities are not physical-bank moment
+accuracy. Full physical M1/M3 and held W/dW checks retain their original
+inputs. Results may move because the retained response realization changes;
+write a new model generation rather than reusing an old model.
+
+Complete-native reference inputs retain explicit physical-band masks through
+the reader, parent Green carrier, census and Sigma branches. The optional
+`sigma_w_pole_budget` fixes only the production shared-body cap; zero keeps
+the automatic recipe. Authenticated complete sample/moment banks can be
+replayed into a fresh model with an independently authenticated original
+Coulomb resource, without rebuilding screening or fitting centroids. Old
+bank headers are immutable; the new source/method and resource bridge belong
+in the new model/controller receipts. No environment change is required.
+
+The Gamma source hook at commit `01c2a85b5` was qualified on P4 in compute
+step `59543833.1`, including two compact-cap ghosts, direct positive latent
+W/dW, unchanged source gates and fresh original anchors. The extension to
+all eligible TRIM parents and physical all-q model admission still require
+their own compute receipts; this note makes no energy or general-model claim.
+
 ## 2026-10-08 — the staged sector selection runs each round at once; held checks read one sample at a time again
 
 The staged route's CC/TT selection ran in sub-batches of the 1 GiB tile (3 parents for TT at
