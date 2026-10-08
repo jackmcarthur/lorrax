@@ -19,7 +19,7 @@ The GW driver's phase invariants and the per-function contracts of
 `B = (M − 1.2·O)/(1 + 1.2·φ)` with `φ = 0.19`, and the XLA pool reserves
 `M − 1.2·O_max` (`runtime.planner_budget_bytes`, `runtime.pool_fraction`).
 There is no node term: outside bytes measured 2.8 GB at P4 and 2.2 GB at
-P64. A positive `memory_per_device_gb` caps the budget and a larger one warns.
+P64. A positive `memory_per_device_gb` is used as given; above the rule it warns.
 A start-up reading of the bytes outside the pool may warn, never size or route
 ([memory model](memory-model.md#budget)).
 

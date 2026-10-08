@@ -122,8 +122,7 @@ $$
 f=\texttt{XLA\_CLIENT\_MEM\_FRACTION}=1-\frac{1.2\,O_\text{max}}{M}\ (\texttt{runtime.pool\_fraction}),
 $$
 
-with $M$ the card total and $O_\text{max}$ = 6 GB the bytes outside the pool
-under distributed linalg: 0.830 on A100-40GB, 0.915 on A100-80GB. CPU runs, GPU-less nodes and ROCm are left
+the memory rule's reservation ([memory model](../architecture/memory-model.md#budget)). CPU runs, GPU-less nodes and ROCm are left
 to jaxlib's defaults. No module, launcher or run script sets these variables.
 The rule is all or nothing:
 
@@ -145,10 +144,8 @@ to $R$, so idle memory stays mapped. With `PREALLOCATE=false` the threshold is
 0: the pool unmaps every idle byte at each stream synchronize and the next
 launch maps it again, a 25–110 ms device-idle stall per executable. The
 fraction is not a cap (`AllocateRaw` never checks it); it sizes $R$ and the
-reported `bytes_limit` $=R$. The planners budget
-$B = (M - 1.2\,O)/(1 + 1.2\,\varphi)$ from the card total, not from the
-client (`runtime.planner_budget_bytes`;
-[memory model](../architecture/memory-model.md#budget)).
+reported `bytes_limit` $=R$. The planners budget from the card total, not
+from the client ([memory model](../architecture/memory-model.md#budget)).
 
 **Memory outside the pool.** The CUDA context, NCCL communicators, the
 cuSOLVERMp context and its grow-only `cudaMalloc` workspace live outside

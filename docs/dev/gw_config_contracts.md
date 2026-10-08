@@ -209,10 +209,9 @@ rulings override anything here.
   `distrib_la_batched_route_choices` likewise reads distrib_la's batch-route
   vocabulary. `local` takes the `batch_reshard` route; `distributed` takes
   `auto`, the backend's own scan or stacked route.
-- **`MemoryConfig`**: `per_device_gb` is the headroom rule's budget on the
-  card, capped by a positive `memory_per_device_gb`, the minimum over
-  processes (`gpu_utils.resolve_device_budget_gb`), so every rank plans the
-  same tile shapes ([memory model](../architecture/memory-model.md#budget)).
+- **`MemoryConfig`**: `per_device_gb` is the run budget
+  (`gpu_utils.resolve_device_budget_gb`; the rule and the deck's
+  `memory_per_device_gb`: [memory model](../architecture/memory-model.md#budget)).
 
 ### Band counts
 

@@ -52,10 +52,12 @@ largest measured at P4 and P64 (sandbox claim 3978); 1.2 is the margin.
 The pool is reserved before the deck is read, so `R` leaves room for
 `O_max`; the reservation is not a cap, and the pool may grow past it. The
 rule reads only `M` and the deck's resolved `linalg`, so it is the same on
-every rank and every run. A positive `memory_per_device_gb` caps `B`; a deck
-value above `B` warns once, with both numbers, and `B` is used. The run
-budget is the minimum over processes
-(`common.gpu_utils.resolve_device_budget_gb`), because static tile shapes
+every rank and every run. A positive `memory_per_device_gb` is used as given,
+an informed choice: above `B` it warns once at start-up with both numbers and
+the measured overshoot (the pool grew 15 % past a 72 GB budget at P64 on
+CrI3 24×24 and left 4 MB free; route (c) for that deck's TT reduced eigh
+needs 68.5 GB), and below `B` it is used silently. The rule is the minimum
+over processes (`common.gpu_utils.resolve_device_budget_gb`), because static tile shapes
 must agree on every process. On CPU the same rule takes `M` as the node's
 `MemTotal` over the processes on the node, and a process's devices share
 its budget.
