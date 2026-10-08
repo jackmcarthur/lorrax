@@ -12,6 +12,28 @@ The GW driver's phase invariants and the per-function contracts of
 `gw.gw_config` are developer reference, not rulings:
 [GW driver and configuration contracts](../dev/gw_config_contracts.md).
 
+## 2026-10-08 — One headroom rule sets the device budget and the pool {#headroom}
+
+**Rule (owner).** From the card total `M` alone,
+`H = max(8 GB, 0.10·M)`: the XLA pool reserves `M − H` and the planner budget
+is that less `max(1 GB, 0.02·M)` (`runtime.device_headroom_bytes`,
+`runtime.pool_fraction`, `runtime.planner_budget_bytes`). A positive
+`memory_per_device_gb` caps the budget. A start-up reading of the bytes
+outside the pool may warn, never size or route
+([memory model](memory-model.md#budget)).
+
+**Why.** The frozen fraction (0.89 × 0.90 of the card), measured on one
+A100-40, left 4.66 GB outside the pool on a 40 GB card and 9.36 GB on an
+80 GB one, while the libraries hold the same bytes on both; the reserved pool
+fills at start-up, so later communicator and library contexts get only what
+is outside it. A rule of the card total alone is the same on every rank and
+every run.
+
+**Deletes.** `runtime.GPU_POOL_FRACTION`, the 0.90 × `bytes_limit`
+budget, the nvidia-smi free-memory fallback and the 4 GB defaults, the BFC
+fragmentation table, `runtime.aot_memory.RUNTIME_RESERVE_BYTES` and
+`ISDF_CHUNK_TARGET_UTILIZATION`.
+
 ## 2026-10-08 — XLA is the reference path; a vendor route stays only where it pays {#xla-reference}
 
 **Rule (owner).** XLA is the reference path for every operation on every
@@ -254,7 +276,9 @@ htransform Galerkin whole-state fit (`bandstructure.fh_interp`,
 
 **Not yet conforming.** These planners still size from
 `memory_per_device_gb` (the same value on every rank, so they do not
-deadlock): the ζ μ-batch planner (`gw.gflat_memory_model.plan_zeta_route_g`),
+deadlock): the ζ μ-batch planner's batch and G tile
+(`gw.gflat_memory_model.plan_zeta_route_g`; its parent chunk and plane-group
+width take the fixed tile),
 the scalar shared-pole W-synthesis panel schedule (`gw.mpa.sigma`, parent and
 pole-column capacities from the ledger), the pair-convolution chunks
 (`gw.mixed_basis_pair_convolution._budget_target`), the W-av stage

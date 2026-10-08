@@ -72,10 +72,8 @@ one accumulator and one Z store per channel. The charge fit is the same kernel w
 
 Each batch runs two collectives per parent chunk, the X_B psum and the
 pair-projector all-to-all; `LORRAX_DEBUG_PRINT=1` counts them per chunk
-from the compiled HLO. The chunk is the fewest parents whose psum and
-all-to-all each reach `comm_model.min_efficient_payload`, at most one tile
-of X_B (`runtime.tiles`), balanced over the parents (the planner's
-`p_chunk`; CrI3 24×24 bispinor: 1 parent, 61 chunks). Each chunk's all-to-all output
+from the compiled HLO. The chunk is the most parents whose X_B rows fit one
+tile (`runtime.tiles`), balanced over the parents (the planner's `p_chunk`). Each chunk's all-to-all output
 is written into the owner's D̃, which is allocated once with the empty
 sphere slot's zero column, so the all-to-all never holds a second copy of
 D̃ and X_B is one chunk's. Every
@@ -96,9 +94,8 @@ whole-orbit D̃ the all-to-all delivered. One row's all-plane cylinder can
 itself exceed the device (CrI3 16×16 bispinor: N_k·n_a'·ns²·2·n_col·16 =
 33 GB); the plane axis is then cut into n_blk blocks, each block's axis DFT a
 GEMM onto its own planes, and the unfold and cylinder gather are redone per
-block. Both counts are 1 when everything fits. They come from the ζ
-planner's device target (`memory_per_device_gb` times the fragmentation
-target; `gflat_memory_model.route_g_plane_chunk`, see
+block. Both counts are 1 when everything fits. They come from the run
+budget (`gflat_memory_model.route_g_plane_chunk`, see
 [Memory per rank and the planner](#memory-per-rank-and-the-planner)), not
 from the fixed tile; this planner is one of those the
 [fixed-tile ruling](decisions.md#fixed-tile) names as not yet conforming.
@@ -242,9 +239,10 @@ for the loop (charge in `gw_init._prepare_fresh_parent_faces`, currents in
 
 ## Memory per rank and the planner
 
-`plan_zeta_route_g` sizes everything from the one device budget,
-`memory_per_device_gb` times the fragmentation target. No deck key or
-environment variable sizes the fit. With `n_vertex` channels (3 for the
+`plan_zeta_route_g` sizes the batch and the G tile from the one run budget
+(the target below; [memory model](memory-model.md#budget)) and the parent
+chunk and plane-group width from the fixed tile. No deck key or environment
+variable sizes the fit. With `n_vertex` channels (3 for the
 currents) the Z rows, the ζ-cylinder accumulator, the Z/k-conv output rows,
 the factors and the store are priced n_vertex times; everything else once.
 
@@ -269,7 +267,7 @@ parents the kernel holds (n_p = 7 of N_k = 36 on CrI3 6×6).
 
 The planner decides in this order:
 
-1. **Resident ψ(G).** Let M_f be the device target minus the fixed terms.
+1. **Resident ψ(G).** Let M_f be the run budget minus the fixed terms.
    ψ(G) stays resident when M_f − Ψ holds the smallest batch (b = P,
    one plane per group and per block); otherwise that smallest configuration
    runs and one `memory over budget at zeta mu-batch` warning is printed
@@ -277,18 +275,19 @@ The planner decides in this order:
 2. **Batch width.** Every owner holds whole orbits, so the widest centroid
    orbit c_orb under the operations the k unfold applies
    (`centroid_k_unfold.widest_unfold_orbit`, the orbits the packing keeps
-   together) is the smallest owner bin and b ≥ P·c_orb. For each n_pg = 1, 2, 4, …, n_a, b is the largest
-   multiple of P whose working set, with the whole plane axis in one block,
-   fits M_f − Ψ, capped at ceil(μ/P)·P and balanced across batches; with no
+   together) is the smallest owner bin and b ≥ P·c_orb. At one plane per
+   group, b is the largest multiple of P whose working set, with the whole
+   plane axis in one block, fits M_f − Ψ, capped at ceil(μ/P)·P and balanced
+   across batches; with no
    such b, b = P·c_orb and its owner plane stage streams rows and plane
    blocks (`_plane_stage`, the rule `route_g_plane_chunk` applies below).
    The HWM is the working set of that configuration; over the target, the
    planner prints one warning line before anything is compiled, and the plan
    runs.
-3. **Plane-group width.** Each candidate's modelled time per batch is its
-   collectives (`gw.comm_model.comm_time`), plus 3 ms per plane group, plus
-   0.65 s·(c+1)/2 of owner work, times the batch count. The cheapest wins,
-   and the receipt names the runner-up.
+3. **Plane-group width.** n_pg is the most planes whose share of the owner
+   plane stage for one row (plane group, k-convolution and Z rows) fits one
+   tile, balanced over the plane axis; the rows per chunk c_out then fill
+   the budget at that width. No timing model picks it.
    X_B is replicated and b ≥ P·c_orb, so it grows with P; stage 1 holds
    one parent chunk's.
 4. **G tile.** G_tile is the largest multiple of P with

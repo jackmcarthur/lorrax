@@ -339,8 +339,7 @@ def inspect_deck(args) -> None:
     else:
         memory_value = "auto at GPU startup"
     print("MEMORY_DIALS "
-          f"per_device={memory_value}; chunk_utilization="
-          f"{memory.chunk_target_utilization:g}; "
+          f"per_device={memory_value}; "
           f"band={memory.band_chunk_size}; vq_g={memory.vq_g_chunk_size}")
     print(f"LINALG_DIALS {config.backend.summary()}")
 

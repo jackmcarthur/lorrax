@@ -228,6 +228,8 @@ def architecture_lines(runtime, *, mesh_role: str | None = None) -> list[str]:
             thread_fields.append(f"{key}={value}")
     role = f"  ({mesh_role})" if mesh_role else ""
     local_note = f", {nlocal} per rank" if nlocal else ""
+    from runtime import device_memory_summary
+    memory, memory_warning = device_memory_summary(facts.get("device_memory"))
     return [
         f"MPI ranks      : {p}",
         f"Accelerators   : {ndev} {str(facts.get('backend', 'unknown')).upper()} "
@@ -237,7 +239,8 @@ def architecture_lines(runtime, *, mesh_role: str | None = None) -> list[str]:
         "cores per rank",
         "Host threads   : " + (", ".join(thread_fields)
                                  if thread_fields else "runtime defaults"),
-    ]
+    ] + ([f"Device memory  : {memory}"] if memory else []) + (
+        [f"Memory WARNING : {memory_warning}"] if memory_warning else [])
 
 
 def numerical_environment_lines(runtime) -> list[str]:

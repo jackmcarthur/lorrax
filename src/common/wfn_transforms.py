@@ -2132,23 +2132,18 @@ def _centroid_fft_scan_chunk(
 
     ``cs`` is a static scan shape and cache-key component, so it comes from the
     shapes alone and is the same on every rank (INVARIANTS 21): the scan rows
-    whose transient fits the fixed tile (``runtime.tiles``).  The deck budget
-    (``memory_per_device_gb``) only guards the floor: this call's allocations
-    (``persistent_bytes``) and one scan row beside the measured reserve.
+    whose transient fits the fixed tile (``runtime.tiles``).  The run budget
+    only guards the floor: this call's allocations (``persistent_bytes``) and
+    one scan row.
     """
-    from runtime.aot_memory import runtime_reserve_bytes
     from runtime.tiles import tile_units
     min_scan_bytes = nspinor * n_rtot * 16 * peak_copies
-    existing_live_bytes = runtime_reserve_bytes()
-    scan_budget_bytes = (int(gpu_mem_bytes) - existing_live_bytes
-                         - persistent_bytes)
-    if scan_budget_bytes < min_scan_bytes:
-        # Runtime reserve + G-flat tile or input + X/Y centroid outputs + one
-        # FFT scan row: a smaller scan chunk cannot reduce this floor.
+    if int(gpu_mem_bytes) - persistent_bytes < min_scan_bytes:
+        # G-flat tile or input + X/Y centroid outputs + one FFT scan row: a
+        # smaller scan chunk cannot reduce this floor.
         from common.gpu_utils import warn_over_budget
         warn_over_budget("centroid load (one FFT scan row)",
-                         existing_live_bytes + persistent_bytes + min_scan_bytes,
-                         gpu_mem_bytes)
+                         persistent_bytes + min_scan_bytes, gpu_mem_bytes)
 
     # Translate legacy hints (band_chunk_size, k_chunk_size) into the new
     # flat-row count.  In either arm the tile bound applies last.

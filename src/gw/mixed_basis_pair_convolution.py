@@ -696,12 +696,6 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
                           bytes_rebuild=rebuild(nc, J))
 
 
-def _budget_target(ns: int) -> int:
-    """The run's per-device budget (the minimum over processes) times the BFC utilization for n_s."""
-    from common.gpu_utils import bfc_fragmentation_target_utilization, device_budget_bytes
-    return int(device_budget_bytes() * bfc_fragmentation_target_utilization(int(ns)))
-
-
 # ---------------------------------------------------------------------------
 # Device-side pieces (rank-local, inside the stage shard_maps)
 # ---------------------------------------------------------------------------
@@ -908,7 +902,8 @@ class MixedBasisPairConvolution:
         n_par = sum(op.transport.n_parent * (2 if np.any(op.transport.anti) else 1)
                     * ax.carrier * ax.carrier * op.transport.ns ** 2 // self.P
                     for op, ax in zip(self.ops, self.m_axis))
-        target = (int(budget_bytes) if budget_bytes is not None else _budget_target(ns))
+        from common.gpu_utils import device_budget_bytes
+        target = int(budget_bytes if budget_bytes is not None else device_budget_bytes())
         wt = self._wt
         self.chunks = plan_pair_convolution_chunks(
             n_ranks=self.P, n_k=self.nk, spins=self.spins, widths=self.width_carrier,

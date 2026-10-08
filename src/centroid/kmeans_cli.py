@@ -310,9 +310,8 @@ def _resolve_deck(args) -> tuple[int | None, str]:
     # in gwjax; 0 (the default) keeps the card's collective auto-detection.
     deck_gb = float(deck.get("memory_per_device_gb", 0.0) or 0.0)
     if deck_gb > 0:
-        from common.gpu_utils import (minimum_process_budget_gb,
-                                      set_device_budget_gb)
-        set_device_budget_gb(minimum_process_budget_gb(deck_gb))
+        from common.gpu_utils import resolve_device_budget_gb
+        resolve_device_budget_gb(deck_gb)
     return int(deck["ncond"]), resolve_input_path(
         os.path.dirname(os.path.abspath(args.input)), str(deck["wfn_file"]))
 

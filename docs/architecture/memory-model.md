@@ -32,17 +32,43 @@ All arrays are complex128 (16 B) unless stated.
 
 ## Budget
 
-`memory_per_device_gb > 0` is used as given (decimal GB). At `0` the budget
-is the minimum over processes of `common.gpu_utils.get_device_memory_gb()`:
-0.90 of the XLA pool limit on GPU (derived from the device total when the
-client reports no limit), and 0.90 of host RAM per device on CPU. The minimum
-is taken because static tile shapes must agree on every process.
+One headroom rule sets the budget on every vendor and card size. With `M`
+the card total (`cuDeviceTotalMem`),
 
-Every planner reads this one number, `common.gpu_utils.device_budget_bytes()`,
+```text
+H = max(8 GB, 0.10·M), at most M/2       runtime.device_headroom_bytes
+R = M − H                                the XLA pool's reservation (runtime.pool_fraction)
+B = R − max(1 GB, 0.02·M)                the planner budget (runtime.planner_budget_bytes)
+```
+
+| card | M | H | R | B |
+|---|---|---|---|---|
+| A100-40GB | 42.4 GB | 8.0 GB | 34.4 GB (0.811) | 33.4 GB |
+| A100-80GB | 85.1 GB | 8.5 GB | 76.6 GB (0.900) | 74.9 GB |
+
+`H` stays outside the pool for the CUDA context, the NCCL and library
+communicators, the cuSOLVERMp/cuBLASMp contexts, cuFFT plans and library
+workspaces. The reserved pool fills its limit at start-up, so an allocation
+made outside it later gets exactly `M − R`. The budget sits a small margin
+below the reservation, for XLA temporaries no planner prices. The rule reads
+only `M`, so it is the same on every rank and every run. A positive
+`memory_per_device_gb` caps `B`; a deck value above `B` warns and `B` is
+used. The run budget is the minimum over processes
+(`common.gpu_utils.resolve_device_budget_gb`), because static tile shapes
+must agree on every process. On CPU the same rule takes `M` as the node's
+`MemTotal` over the processes on the node, and a process's devices share
+its budget.
+
+At start-up every GPU run prints the rule and the bytes already outside the
+pool after the communicator warm-up, the maximum over ranks
+(`runtime.xla_memory.outside_pool_bytes`), with a warning when they exceed
+`0.75·H`. Nothing is sized from that reading.
+
+Every planner reads the one number `common.gpu_utils.device_budget_bytes()`,
 which the config sets when the deck resolves. kmeans, htransform, bse and
-exciton_bands have no deck key; their planners read the same owner, whose
-default is the collective auto-detection above, recorded on the first call.
-No planner reads `bytes_limit`, free memory or the card total.
+exciton_bands have no deck key; their planners read the same owner, which
+resolves the rule on its first call. No planner reads `bytes_limit`, free
+memory or a fragmentation factor.
 
 **Streamed loops take a fixed tile, not the budget.** A loop that streams over
 k, q, bands, centroids, samples or rows takes the most units whose per-rank
@@ -88,12 +114,6 @@ so this costs time: the Fe 20³ bispinor χ build at the P64-local shape is
 about 420 s per map in one streamed group, 1,300–1,400 s in four disk
 groups and about 5,700 s in device groups. Without the row-pass engine (the
 full-k Green route) the bank stays in device groups.
-
-A planner fills `target = budget × utilization`. Utilization defaults to
-0.90, 0.85 and 0.78 for `n_s` = 1, 2 and ≥4
-(`bfc_fragmentation_target_utilization`): a wider spinor axis makes one larger
-contiguous arena, which needs more headroom against allocator fragmentation.
-`ISDF_CHUNK_TARGET_UTILIZATION > 0` overrides it, clamped to `[0.85, 1.0]`.
 
 ## The unit: one Green's-function tile
 
@@ -259,16 +279,18 @@ work(b)  = max over the batch's three stages (GEMM + all-to-all;
 store    = n_v · 16·Q·μ·N_G/P                               host or disk, never the device
 ```
 
-The rule: with `M_f = target − fixed`, ψ(G) is resident and the batch is
+The rule: with `M_f = budget − fixed`, ψ(G) is resident and the batch is
 `b = (M_f − Ψ)/c_μ` in multiples of `P`, where `c_μ` is the per-centroid slope
-of `work`. Candidate plane-group widths are costed by their collectives
-(`gw.comm_model`) and per-group launches, and the cheapest wins. The Z store
-stays on host when it fits 0.8 of the node's `MemAvailable` over the processes
-on the node (minimum over processes); otherwise it is a slab_io scratch
-dataset. The finalize streams it in G tiles sized to a quarter of the target.
+of `work` at one plane per group. The stage-0 parent chunk and the
+plane-group width take the most units whose bytes fit the fixed tile: a
+parent's X_B rows, and a plane's share of the owner plane stage for one row;
+the rows per chunk then fill the budget. No timing model picks a shape. The Z store stays on host when
+it fits 0.8 of the node's `MemAvailable` over the processes on the node
+(minimum over processes); otherwise it is a slab_io scratch dataset. The
+finalize streams it in G tiles sized to a quarter of the budget.
 
-- **Over the target**: when the smallest configuration (ψ(G) resident,
-  `b = P`, one plane per group) exceeds the target, it runs with one warning
+- **Over the budget**: when the smallest configuration (ψ(G) resident,
+  `b = P`, one plane per group) exceeds the budget, it runs with one warning
   line. ψ(G) streaming is not implemented. Fix: more ranks or more memory
   per device.
 
@@ -347,10 +369,10 @@ temporaries is compiled once at map 0 and never runs (Fe 8³: 2.3 s cold,
 
 The direct stream's group is the one shared-pole size that follows the
 budget: it fits the capacity ledger, then the compiled check above. The ledger
-does not own the ψ carriers and other residents live when W is built, so leave
-headroom between `memory_per_device_gb` and the card. On a device the stream
-and the line selection are two phases, so a group costs its carry plus the
-larger phase.
+does not own the ψ carriers and other residents live when W is built; the
+margin between the budget and the pool ([§ Budget](#budget)) is all they have.
+On a device the stream and the line selection are two phases, so a group
+costs its carry plus the larger phase.
 
 ### A module larger than the device {#module-does-not-fit}
 
@@ -400,22 +422,12 @@ the group of 16 compiled 34.08 GB of new bytes against a 34.04 GB room, the
 slope was corrected, and the group of 15 ran once recompiled (priced 34.55,
 peak 34.55; main ran 16 and peaked 36.04, over the budget).
 
-Two reserves follow from this.
-
-* **In the pool** (`runtime.aot_memory.RUNTIME_RESERVE_BYTES`): what the pool
-  draws beyond every priced and compiled byte. The capacity ledger takes it
-  off its budget and the direct stream adds it to its price. At (gpu, P4) the
-  direct stream's peak was 0.51 MB above its price (the dispatch's small
-  arguments), so the table holds 1 MB. P16 and other meshes are not measured:
-  they use the largest measured entry of their platform, announced.
-* **Outside the pool**: the CUDA context, NCCL communicators, library handles
-  and the mathdx modules peaked at 2.65 GB per rank above the pool's
-  reservation (`nvidia-smi` 38 983 MiB against 0.89 × 40 960 MiB), and at
-  4.7 GB with a cuSOLVERMp context (`runtime.set_default_env`). The budget
-  does not include them. They live in the headroom between
-  `memory_per_device_gb` and the card, so leave at least 5 GB of it: on a
-  40 GB A100 (42.9 GB) a budget of 36 leaves 6.9 GB. Never set the budget to
-  the card size.
+The direct stream's peak was 0.51 MB above its price (the dispatch's small
+arguments). Outside the pool, the CUDA context, NCCL communicators, library
+handles and the mathdx modules held 2.65 GB per rank, and 4.7 GB with a
+cuSOLVERMp context. Neither has a reserve of its own: the first is in the
+margin below the pool, the second in the headroom `H` outside it
+([§ Budget](#budget)), which the start-up line checks.
 
 When a minimum or recompiled chunk is still over its room, `check_chunk` prints one
 warning line and the stage runs at that chunk; if the room is really
@@ -431,42 +443,18 @@ On CPU the host `gw_conv` handler keeps a reused host arena of
 
 ## Communication cost model
 
-At a fixed memory workspace a plan uses as few communication steps as it can.
 `gw/comm_model.py` prices one collective that moves `V` bytes per rank among
-`n_peers` other ranks as
-
-```text
-T = α₀ + α_peer · n_peers + V / β
-```
-
-with `V` the all-to-all input or the all-gather output. The model has no
-topology term and no intra-/inter-node distinction: LORRAX stays portable
-across machines (owner ruling). The constants are per-machine data in
-`gw.comm_model.MACHINES`, measured with `tools/comm_model_bench.py`. One
-constant set prices every collective kind; it over-prices all-gather.
-
-A planner uses the model through four rules:
-
-1. **Minimum efficient payload.** Every collective is at or above
-   `min_efficient_payload(n_peers) = 4·β·(α₀ + α_peer·n_peers)`, the payload
-   at which latency is 20 % of the call.
-2. **Few calls.** Moving `V` bytes through an `M_buf` buffer takes
-   `split_calls(V, M_buf, n_peers)` calls. If the per-call payload falls
-   below rule 1, the buffer is too small; do not add calls. Aim for at most
-   ~10–20 collectives per batch.
-3. **One executable per batch.** A batch's collectives are steps of one
-   `lax.scan` inside one jit; a Python-dispatched call costs a host round
-   trip per step.
-4. **Double buffering.** Overlap step `i+1`'s communication with step `i`'s
-   compute: `overlapped_time = max(T_comp, T_comm) + min(T_comp, T_comm)/n_steps`.
-
-`plan_zeta_route_g` prices its loop with `comm_time` and prints collectives
-per batch against rule 1. All planners stay single-stage and generic.
+`n_peers` other ranks as `T = α₀ + α_peer · n_peers + V / β`, with one
+machine's constants (`gw.comm_model.MACHINES`, measured with
+`tools/comm_model_bench.py`). It is a diagnostic: no planner picks a size or
+a route from it. The route-G receipt prints each batch's collectives against
+`min_efficient_payload(n_peers) = 4·β·(α₀ + α_peer·n_peers)`, the payload at
+which latency is 20 % of the call, and the all-to-all floor at `β`.
 
 ## Planning a run
 
-1. **Budget.** Leave `memory_per_device_gb = 0` to detect it, or set it
-   below the device (for example 56–72 on an 80 GB A100).
+1. **Budget.** Leave `memory_per_device_gb = 0` for the headroom rule, or
+   set it lower to cap the budget (a value above the rule warns).
 2. **Mesh.** Use a square mesh. Every chunked term and the default
    face-layout centroid copies fall as `1/P`.
 3. **Read the receipts** in `gwjax.out`: `ISDF μ-batch plan` for each ζ
@@ -493,7 +481,8 @@ is invisible in it. The CUDA pool behind XLA's `cuda_async` allocator keeps
 every section has its own peak on every rank. A planner records its price
 with `common.gpu_utils.record_stage_price(stage, bytes, section=...)`: the
 live bytes plus what it plans. What the pool cannot see: NCCL and library
-workspaces outside it (2–3 GB per rank on A100), and work dispatched but not
+workspaces outside it (2–3 GB per rank on A100; the start-up line prints the
+maximum over ranks after warm-up), and work dispatched but not
 yet allocated at a boundary, which counts in the next section.
 
 Host memory is read at the same boundaries from

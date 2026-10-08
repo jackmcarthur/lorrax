@@ -1724,8 +1724,6 @@ def _plan_route_g_for_channel(
 		meta=meta, mesh_xy=mesh_xy, n_q_selected=n_q_selected,
 		ngkmax=_ngkmax, psi_ngkmax=_psi_ng, fit_nb=_zeta_fit_nb,
 		budget_gb=float(mem.per_device_gb),
-		target_utilization=(mem.chunk_target_utilization
-		                    if mem.chunk_target_utilization > 0 else None),
 		psi_face_bytes=float(psi_face_bytes),
 		# the full-zone ψ spheres' actual cylinder when the caller has it
 		# (1257 columns on VI3 12x12, not the isotropic 2530)
