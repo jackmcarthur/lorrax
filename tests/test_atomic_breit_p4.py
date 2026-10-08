@@ -20,7 +20,7 @@ def forbid_stored_zeta_reads(zetas):
 
 def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
                       angular_maximum=2,field_tile=3,centroid_tile=3,compensated=False,averaged_heads=False,
-                      embedded_gamma=False):
+                      embedded_gamma=False, publication_fixture=None):
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -170,7 +170,17 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         without_cross.append(base)
     for z,p in zip(zetas,providers):z.local_augmentation=p
     keep=np.asarray([[0,2],[0,4],[0,5]],np.int32)
-    got=contract_v_group(zetas,pairs,v_tables,keep=keep,print_fn=lambda line:None)
+    if publication_fixture is None:
+        got=contract_v_group(zetas,pairs,v_tables,keep=keep,print_fn=lambda line:None)
+    else:
+        facts=dict(physical=tuple((s+d)[:Q,:,:ng] for s,d in zip(smooth,delta)),
+                   compensation=tuple((s+g0)[:Q,:,:ng] for s,g0 in zip(smooth,g)),
+                   expected=tuple(e[:Q] for e in expected),pairs=pairs,keep=keep,
+                   current_basis_rows=B,head_fixture=head_fixture)
+        with publication_fixture['open'](zetas,facts) as writers:
+            got=contract_v_group(zetas,pairs,v_tables,keep=keep,
+                                 print_fn=lambda line:None,zeta_ios=writers)
+        publication_fixture['verify'](zetas,got,facts)
     host=tuple(np.asarray(gather_to_host(v)) for v in got)
     error=max(float(np.max(np.abs(a-e[:Q]))) for a,e in zip(host,expected))
     normref=max(float(np.max(np.abs(e[:Q]))) for e in expected)

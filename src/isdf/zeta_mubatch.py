@@ -1327,7 +1327,7 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
 
 
 def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
-                      compensated_body=False):
+                      compensated_body=False, return_physical=False):
     """One G tile of several ζ's: ``V^{ab} += conj(ζ^a) v^{ab} ζ^bᵀ`` per pair,
     and each ζ's shell gather — the accumulation half of :func:`_v_tile_kernel`
     over ζ tiles it formed with ``with_v=False``."""
@@ -1335,7 +1335,7 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
     if compensated_body and not use_local_augmentation:
         raise ValueError('grouped compensated body requires a local provider')
     key = ('pair_tile', _mesh_id(mesh), int(g_tile), pairs,
-           bool(use_local_augmentation),bool(compensated_body))
+           bool(use_local_augmentation),bool(compensated_body),bool(return_physical))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
@@ -1348,8 +1348,11 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
     if use_local_augmentation:
         in_specs += (((z_spec,)*n_z,(z_spec,)*n_z),)
 
+    output_specs = ((acc,) * len(pairs), (acc,) * n_z)
+    if return_physical:
+        output_specs += ((z_spec,) * n_z,)
     @partial(shard_map, mesh=mesh, in_specs=in_specs,
-             out_specs=((acc,) * len(pairs), (acc,) * n_z), check_vma=False)
+             out_specs=output_specs, check_vma=False)
     def k(Z, v, ngk, sl, t, V, S, *local_tiles):
         n_g = Z[0].shape[-1]
         g_idx = t * g_tile + jnp.arange(n_g, dtype=jnp.int32)
@@ -1369,11 +1372,15 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
                            +product(compensation[a],compensation[b]))
             V_out.append(V[i] + dV)
         hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
-        S_out = []
+        S_out, physical_tiles = [], []
         for a in range(n_z):
             physical=Z[a]+local_tiles[0][0][a] if use_local_augmentation else Z[a]
             dS = jnp.einsum('qmg,qgs->qms', physical, hit)
             S_out.append(S[a] + dS)
+            if return_physical:
+                physical_tiles.append(jnp.where(mask[:, None, :], physical, 0))
+        if return_physical:
+            return tuple(V_out), tuple(S_out), tuple(physical_tiles)
         return tuple(V_out), tuple(S_out)
 
     fn = jax.jit(k, donate_argnums=(5, 6))
@@ -1381,7 +1388,8 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
     return fn
 
 
-def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
+def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
+                     zeta_ios=None):
     """Several V tiles over several ζ's in ONE pass over the G tiles.
 
     ``zetas`` are :class:`ZetaG` of one fit (one store geometry and centroid
@@ -1394,6 +1402,14 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     ``(Q, μ_pad, μ_pad)`` at ``P(None,'x','y')`` in canonical centroid order.
     This is what spares the four-current V_q the three ζ_T files: the file
     route wrote each ζ^a and read it back to form the same sums.
+
+    ``zeta_ios`` optionally supplies one already opened SlabIO per channel,
+    in the same order as ``zetas``. The caller creates the authenticated
+    headers and ``zeta_q_G`` datasets. The stream writes physical smooth+delta,
+    with the same OWN factors used by V; its compensated body stays smooth+g.
+    Every write is drained on all ranks before moving to the next channel,
+    bounding the collective lane to one pending physical tile. Completion
+    stamps remain caller-owned until all files and the group have closed.
     """
     t0 = time.perf_counter()
     augmentation=None
@@ -1403,6 +1419,17 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     z0 = zetas[0]
     print_fn = print_fn or z0.print_fn
     st0 = z0.store
+    if zeta_ios is not None:
+        from pathlib import Path
+        zeta_ios = tuple(zeta_ios)
+        if len(zeta_ios) != len(zetas):
+            raise ValueError('grouped physical writer requires one file per complete zeta family')
+        for z, writer in zip(zetas, zeta_ios):
+            if (getattr(writer, 'mesh', None) is not z.mesh
+                    or not callable(getattr(writer, 'write_slab', None))
+                    or not callable(getattr(writer, 'sync_writes', None))
+                    or Path(getattr(writer, 'path', '')).resolve() != Path(z.path).resolve()):
+                raise ValueError('grouped physical writer file, mesh or collective owner differs')
     for z in zetas[1:]:
         st = z.store
         if (st.Q, st.mu_pad, st.g_tile, st.n_Gt) != (st0.Q, st0.mu_pad, st0.g_tile, st0.n_Gt) \
@@ -1434,7 +1461,8 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
         raise ValueError('grouped static provider has no supported body metric')
     step = _pair_tile_kernel(mesh,st0.g_tile,pairs,
                             use_local_augmentation=augmentation is not None,
-                            compensated_body=body_metric=='compensated')
+                            compensated_body=body_metric=='compensated',
+                            return_physical=zeta_ios is not None)
     mu = int(st0.mu_pad)
     V = tuple(_zero_accumulators(mesh, st0.Q_pad, mu, 1,
                                  debug_m=False)[0] for _ in pairs)
@@ -1474,7 +1502,14 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
                 for tile in part:
                     _require_q_owned(tile,mesh,(st0.Q_pad,mu,st0.g_tile),name=f'grouped current {label}')
             local_tiles=(tiles,)
-        V, S = step(tuple(zt),v_dev,ngk_dev,sl_dev,jnp.int32(t),V,S,*local_tiles)
+        result = step(tuple(zt),v_dev,ngk_dev,sl_dev,jnp.int32(t),V,S,*local_tiles)
+        V, S = result[:2]
+        if zeta_ios is not None:
+            for z, writer, physical in zip(zetas, zeta_ios, result[2]):
+                z._write_tile(writer, physical, t * st0.g_tile)
+                writer.sync_writes()
+            del physical
+        del result
         del zt
     if augmentation is not None:
         correction=augmentation['onsite'](local_state,pairs)
@@ -1495,7 +1530,8 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, "
                f"{st0.n_Gt} G tiles, q-local, "
                f"{time.perf_counter() - t0:.2f}s (store read "
-               f"{sum(z.store.t_read for z in zetas):.2f}s); no ζ file")
+               f"{sum(z.store.t_read for z in zetas):.2f}s); "
+               f"{'physical ζ family written' if zeta_ios is not None else 'no ζ file'}")
     if jax.process_index() == 0:
         print_fn(receipt)
     return out
