@@ -9,10 +9,7 @@ No planner refuses on a price (owner 2026-10-01): a stage over its budget
 raises one `RuntimeWarning: memory over budget at <stage>` (needed, budget, by
 how much; `common.gpu_utils.warn_over_budget`; gwjax.out lists it under
 WARNINGS), runs at its smallest size, and OOMs if the device truly lacks the
-room. What still refuses is not a price: a kernel shape limit (a k-grid a
-mathdx mode cannot hold, `GATE response_vertex_grid` and the
-[k-convolution residency gates](kconv.md#refusals)),
-a workspace that cannot be measured (`GATE shared_pole_capacity: … FFT
+room. What still refuses is not a price: a workspace that cannot be measured (`GATE shared_pole_capacity: … FFT
 workspace unavailable`), a compiled module larger than the device
 ([`GATE xla_rematerialization`](#module-does-not-fit)), and the correctness
 gates.

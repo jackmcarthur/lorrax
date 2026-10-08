@@ -101,7 +101,7 @@ four-current stream (photon carriers) takes the same kconv call with channel
 vertices (`ffi.fft.make_kconv_chi_vertex`): per family pair, each Dirac-half
 quadrant's two parent Greens are built on the raw parents and mode 11 forms
 every channel pair's plane, so no full-k Green quadrant exists; a CUDA grid
-mode 11 cannot hold refuses (`GATE response_vertex_grid`).
+mode 11 cannot hold takes the XLA backend ([router](kconv.md#router)).
 
 **Cost per node** (P ranks, N_μ centroids, n_s spinor components):
 

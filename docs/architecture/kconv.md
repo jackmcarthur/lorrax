@@ -91,7 +91,24 @@ The factory picks the backend from the mesh's device vendor alone
 | cpu | the plan backend: the reference composition of each mode (the same unfolds, products and spin sums in XLA) with the FFTW3-ABI host handlers of `liblorrax_ffi_host.so` (`lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv`, [FFI layer §3c](ffi_layout.md#3c-which-fft-engine-the-host-library-binds)) |
 | any other (ROCm, …) | the XLA backend: the same composition with `jnp.fft` along the k axes; no LORRAX library |
 
-The backend follows from the vendor, so no deck key or environment variable
+**Where mathdx cannot serve.** On CUDA a factory takes the XLA backend, with
+one `RuntimeWarning` and a router line per grid, where `ffi.fft.mathdx_refusal`
+names a reason. It is decided from the k grid and the device's opt-in shared
+memory per block, so every rank decides alike:
+
+* an axis above `KCONV_AXIS_MAX` = 40, the fp64 cuFFTDx thread-FFT limit;
+* a split-arm plane tile of 16 columns, $16 \cdot 16 \cdot ((n_y (n_z|1))|1)$ B,
+  beyond the opt-in memory; this is every k-box mode's floor at $n_s \le 4$ (A100 to
+  25³, sm_86/89 to 19³);
+* for the k-minor modes 4 and 5, which have no split arm, one k-box column of
+  $16 \cdot ((n_x n_y (n_z|1))|1)$ B beyond it;
+* a probe compile that failed at startup on any process (`require_kconv`):
+  every factory then takes XLA.
+
+`tests/test_kconv_xla_gate.py` holds the fallback to mathdx on the same grid (CUDA, with
+the axis cap forced to 1) and to the XLA reference at a forced axis of 48 (cpu).
+
+The backend follows from the vendor and these limits, so no deck key or environment variable
 selects it; one environment dial changes only the engine inside the mathdx
 route, the A/B test `LORRAX_BSE_OUTER_KSUM` ([§11](#bse-outer)). The mathdx
 family is kept on CUDA because it is decisive on memory ([§1](#why-fused)), and
@@ -113,9 +130,10 @@ four host devices, and stage-time measurements use it to time the XLA arm.
 `ffi.fft.require_kconv(mesh)`. On CUDA it finds the wheel (`mathdx_root`),
 probes every target in `ffi.fft.KCONV_TARGETS` in the loaded library, and
 compiles and runs one probe kernel (mode 3 on a 2×1×1 grid). A device that
-the installed cuFFTDx cannot compile for therefore refuses at startup
-(`GATE mathdx-probe`, naming its compute capability and the wheel version)
-instead of at the first convolution. On cpu it requires the two host plan
+the installed cuFFTDx cannot compile for is therefore found at startup
+(`GATE mathdx-probe` text, naming its compute capability and the wheel version)
+instead of at the first convolution; a failed probe sends every factory to the XLA backend, with
+one warning. On cpu it requires the two host plan
 targets; the XLA backend needs nothing at startup. Each mathdx factory re-probes its own target when it is built, and
 every factory checks operand shapes and dtypes at trace time.
 
@@ -352,9 +370,9 @@ a pole field read from its q wedge, with the endpoint actions $\mathcal L_k$, $\
 which a real-frequency contour needs. Where mode 11 cannot hold the grid
 (`ffi.fft.chi_unfold_refusal`), the scalar streams keep the full-k Green
 route (mode 3 on unfolded Greens, the trace in XLA) and announce it once
-(`gw.w_isdf._chi_kconv_serves`). The four-current stream has no full-k
-fallback on the GPU, because it builds its Greens only on the raw parents: it
-refuses with `GATE response_vertex_grid`.
+(`gw.w_isdf._chi_kconv_serves`). The four-current stream builds its Greens only
+on the raw parents; a grid mode 11 cannot hold takes the XLA backend
+([router](#router)).
 
 ## 6. Row passes and the `live` operand {#live-rows}
 
@@ -579,13 +597,12 @@ not of the traffic.
 |---|---|---|---|
 | `GATE mathdx-headers` | startup (`mathdx_root`); kernel build | no importable `nvidia.mathdx` with `include/cufftdx.hpp` | install the wheel; the `cuda12`/`cuda13` extras of `pyproject.toml` pin `nvidia-mathdx==25.6.0` |
 | `GATE kconv-target` | startup, factory | the loaded library lacks the selected target | rebuild the CUDA leg from this tree |
-| `GATE mathdx-probe` | startup | the mode-3 probe kernel fails to compile or run on this device | a wheel whose cuFFTDx supports the device's compute capability |
+| `GATE mathdx-probe` | startup, as a warning | the mode-3 probe kernel fails to compile or run on this device; every factory takes the XLA backend | a wheel whose cuFFTDx supports the device's compute capability |
 | `GATE kconv-kgrid` | factory | the k grid is not three positive axes | pass the run's `(n_kx, n_ky, n_kz)` |
-| `GATE mathdx-kconv-axis` | factory; handler | on CUDA, a k-grid axis above 40 (`KCONV_AXIS_MAX`, the fp64 cuFFTDx thread-FFT limit); the plan and XLA backends have no cap | a smaller k grid |
+| `GATE mathdx-kconv-axis` | handler | a direct mathdx call with a k-grid axis above 40 (`KCONV_AXIS_MAX`); the factories send such grids to the XLA backend | call through the factories |
 | `GATE mathdx-kconv-residency` | kernel build | a direct call of mode 0, 1 or 6 whose row exceeds the opt-in memory; the router streams such grids instead ([§8](#resident-rows)) | call through the router |
-| `GATE mathdx-kconv-kbox-residency` | kernel build | the tile, plane or pencil the launch rule picked exceeds the opt-in memory (modes 2, 3, 8, 9); one whole column exceeds it (modes 4 and 5, which have no split arm); a split plane tile of one spin group exceeds it (mode 7: $n_s = 4$ at 26³ and larger on A100) | a smaller k grid |
+| `GATE mathdx-kconv-kbox-residency` | kernel build | the tile, plane or pencil the launch rule picked exceeds the opt-in memory (modes 2, 3, 8, 9); one whole column exceeds it (modes 4 and 5, which have no split arm); a split plane tile of one spin group exceeds it (mode 7: $n_s = 4$ at 26³ and larger on A100) | none at the factories, which send these grids to the XLA backend ([router](#router)); reaching it means `mathdx_refusal` and the handler disagree |
 | `GATE mathdx-kconv-chi-residency` | kernel build | mode 11 cannot hold the grid | none here: `gw.w_isdf` asks `chi_unfold_refusal` first, so this gate means that predicate and the handler's rule disagree, which is a bug |
-| `GATE response_vertex_grid` | four-current response setup (`gw.w_isdf`) | on CUDA, mode 11 cannot hold the grid at $n_s = 2$ (`chi_unfold_refusal`); the four-current stream has no full-k fallback | a smaller k grid (the scalar streams fall back to the full-k Green route instead) |
 | `GATE mathdx-kconv-unfold-scratch`, `-lorentz-scratch`, `-chi-scratch` | apply | XLA's scratch allocator refuses the split-arm intermediate of mode 7, 8 or 11 ([§7](#tiles)) | for mode 11, a smaller `scratch_bytes` |
 | `GATE mathdx-kconv-outer-tile`, `-outer-decode-tile`, `-outer-arch`, `-outer-rank` | kernel build | the BSE outer load's bank or accumulator does not fit, the device is older than sm_80, or K is not a multiple of 4 | call through the factories, which check `klead_outer_refusal` / `klead_outer_decode_refusal` and pad K |
 | `GATE mathdx-plane-split`, `mathdx-plane-residency` | kernel build | a direct mode-10 call on a plane with no split or too large | call through `make_plane_fft_gather` |

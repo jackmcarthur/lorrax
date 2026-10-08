@@ -42,8 +42,6 @@ an operation had no XLA path.
 
 **Not yet conforming.**
 
-* On CUDA a k-grid axis above 40 refuses (`GATE mathdx-kconv-axis`),
-  although the router's XLA backend could serve it.
 * The operations the [FFI layer](ffi_layout.md#kernel-operations) lists
   under *Gaps* have no plain-XLA route.
 
@@ -198,13 +196,10 @@ figure exceeds `memory_per_device_gb` or its tile. It prints one
 `memory over budget at <stage>: needs X GB/rank, budget Y GB/rank, over by
 Z GB; continuing (an OOM is possible)`), takes its smallest size and runs. The
 shared-pole capacity ledger records an over-budget row as `FAIL` and admits it
-(`gw.shared_pole_recipe.CapacityLedger.reserve`). Two classes still refuse:
-
-* **kernel shape limits**, where no size of the operation exists: a k grid
-  that mathdx mode 11 cannot hold (`GATE response_vertex_grid`,
-  `gw.w_isdf`), a k axis above `ffi.fft.KCONV_AXIS_MAX` = 40;
-* **correctness gates**, for example `GATE shared_pole_gram_valid`
-  (`gw.shared_pole_constructor`).
+(`gw.shared_pole_recipe.CapacityLedger.reserve`). Correctness gates still
+refuse, for example `GATE shared_pole_gram_valid` (`gw.shared_pole_constructor`);
+a k grid the mathdx family cannot hold takes the router's XLA backend with one
+warning ([router](kconv.md#router)).
 
 **Why.** A price is a model of the allocator and the budget is a user
 setting; neither proves that a stage does not fit, so a refusal on them

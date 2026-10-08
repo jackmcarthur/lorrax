@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — a k grid mathdx cannot hold runs on the XLA backend instead of refusing
+
+On CUDA the k-convolution factories now take the XLA backend (`jnp.fft` along the k axes),
+with one `RuntimeWarning` and one router line per grid, where `ffi.fft.mathdx_refusal` gives
+a reason: a k axis above 40, a k-box split-arm plane tile beyond the device's opt-in shared
+memory (A100 to 25³, sm_86/89 to 19³), a k-box column beyond it for the BSE k-minor modes, or
+a startup probe compile that failed on any process. These used to refuse
+(`GATE mathdx-kconv-axis`, the k-box residency gates at kernel build, `GATE mathdx-probe`,
+`GATE response_vertex_grid`). The decision uses only the grid and the device attribute, so
+every rank makes the same one. Grids mathdx holds keep it, and their results do not move.
+No deck change.
+
 ## 2026-10-08 — the screened packed photon Dyson solve follows `linalg`; `full_static_cohsex` runs under `linalg = local`
 
 `bispinor_gw = full_static_cohsex` no longer requires `linalg = distributed`. Its packed Dyson

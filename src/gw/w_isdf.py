@@ -258,7 +258,7 @@ def _chi_kconv_serves(mesh_xy, kgrid, ns) -> bool:
     """
     from common import fft_helpers as _F
     why = (_F.chi_unfold_refusal(kgrid, int(ns))
-           if _F.kconv_backend(mesh_xy) == "mathdx" else "")
+           if _F.kconv_backend(mesh_xy, kgrid) == "mathdx" else "")
     if why:
         from ffi.gate import announce_once
         announce_once(("chi_unfold", tuple(kgrid), int(ns)),
@@ -1083,20 +1083,11 @@ def _get_chi_fractional_contour_kernel_face(
                            warmup=False)
     # Four-current stream on raw-parent plans: each quadrant's parent Green pair
     # goes straight into mathdx mode 11 with the channel vertices (unfold on the
-    # load, the traces in its Mid); no full-k Green exists.  A CUDA grid the
-    # kconv call cannot hold refuses (no full-k fallback on the GPU); a non-CUDA
-    # backend takes the kconv call's reference arm.
+    # load, the traces in its Mid); no full-k Green exists.  A grid mathdx cannot
+    # hold takes the kconv call's XLA arm (ffi.fft.mathdx_refusal).
     from symmetry_maps import DeviceLoadTables
     photon_kconvs = None
     if photon is not None:
-        from common import fft_helpers as _F
-        why = _F.chi_unfold_refusal(grid, 2) if _F.kconv_backend(mesh_xy) == "mathdx" else ""
-        if why:
-            raise ValueError(
-                f"GATE response_vertex_grid: got k-grid {grid} for the four-current "
-                f"response; want a grid mathdx mode 11 holds at ns=2; why: {why}, and "
-                "the stream builds its Greens only on the raw parents (no full-k "
-                "Green quadrant on the GPU)")
         # Every four-current mode runs on the sub-tile engine: per family pair,
         # row passes, node chunk and channel blocks from runtime.tiles and the
         # shapes; each pass's quadrant Greens are local GEMMs on the pass's

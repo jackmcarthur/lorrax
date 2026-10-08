@@ -37,8 +37,10 @@ environment variable (``docs/architecture/decisions.md#xla-reference``):
     make_kfft_kminor / _local trailing       one transform
 
 Pick the factory whose k position matches the tile you already hold; a caller
-does not transpose to reach another.  On CUDA a k-grid axis above
-``KCONV_AXIS_MAX`` (40, the fp64 cuFFTDx thread-FFT limit) refuses by name.
+does not transpose to reach another.  On CUDA a grid the mathdx family cannot
+serve on this device (:func:`mathdx_refusal`: an axis above ``KCONV_AXIS_MAX``,
+a split-arm plane tile beyond the opt-in shared memory, a failed probe compile)
+takes the XLA backend, with one warning.
 Contract: ``docs/architecture/kconv.md``.
 """
 
@@ -46,7 +48,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from functools import partial
+from functools import lru_cache, partial
 from typing import Callable, NamedTuple
 
 import jax
@@ -153,7 +155,7 @@ def validate_flat_spec(spec: P, what: str) -> P:
 # platform -> the XLA backend.  All return the SAME callable contract, so a
 # consumer never branches on the backend.
 
-#: cuFFTDx fp64 thread-FFT limit: every k-grid axis must be at most this.
+#: cuFFTDx fp64 thread-FFT limit: a k-grid with a longer axis takes the XLA backend.
 KCONV_AXIS_MAX = 40
 
 
@@ -231,13 +233,62 @@ def xla_reference():
         _XLA_REFERENCE.pop()
 
 
-def kconv_backend(mesh: Mesh) -> str:
+#: Why the mathdx family cannot run on this job's devices: set once by
+#: :func:`require_kconv` when its probe compile fails on any process.
+_MATHDX_DOWN: list = []
+
+
+def mathdx_refusal(kgrid, *, kminor: bool = False, optin: int | None = None) -> str:
+    """Why the mathdx family cannot serve ``kgrid`` on this device ("" when it can).
+
+    Decided from the grid and the device's opt-in shared memory per block
+    (``optin``, default the attribute), so every rank of a job decides alike:
+    an axis above :data:`KCONV_AXIS_MAX`; a split-arm plane tile of 16
+    columns (every k-box mode's floor at ns <= 4) beyond the opt-in memory;
+    for the k-minor modes 4/5, which have no split arm, one k-box column
+    beyond it; or a failed probe compile at startup.
+    """
+    if _MATHDX_DOWN:
+        return _MATHDX_DOWN[0]
+    nx, ny, nz = (int(v) for v in kgrid)
+    if max(nx, ny, nz) > KCONV_AXIS_MAX:
+        return f"an axis above {KCONV_AXIS_MAX}, the fp64 cuFFTDx thread-FFT limit"
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    if have is None:
+        return ""
+    plane, column = 16 * 16 * ((ny * (nz | 1)) | 1), 16 * ((nx * ny * (nz | 1)) | 1)
+    # ponytail: one floor for every k-box mode; a single-pass mode-2/3 tile could still fit a
+    # grid with nx < 8 that this sends to XLA.
+    if kminor and column > have:
+        return (f"one k-box column needs {column} B > {have} B of opt-in shared memory "
+                "(the k-minor modes 4 and 5 have no split arm)")
+    if plane > have:
+        return f"a split-arm plane tile needs {plane} B > {have} B of opt-in shared memory"
+    return ""
+
+
+def kconv_backend(mesh: Mesh, kgrid=None, *, kminor: bool = False) -> str:
     """``'mathdx'`` on a CUDA mesh, ``'plan'`` on a cpu mesh, ``'xla'`` on every
-    other platform and inside :func:`xla_reference`."""
+    other platform and inside :func:`xla_reference`.  With ``kgrid`` (and
+    ``kminor`` for modes 4/5), a CUDA mesh takes ``'xla'`` where
+    :func:`mathdx_refusal` names a reason, announced once per grid as a warning."""
     from ffi.gate import mesh_ffi_platform
     if _XLA_REFERENCE:
         return "xla"
-    return {"CUDA": "mathdx", "cpu": "plan"}.get(mesh_ffi_platform(mesh), "xla")
+    backend = {"CUDA": "mathdx", "cpu": "plan"}.get(mesh_ffi_platform(mesh), "xla")
+    if backend != "mathdx" or (kgrid is None and not _MATHDX_DOWN):
+        return backend
+    why = _MATHDX_DOWN[0] if kgrid is None else mathdx_refusal(kgrid, kminor=kminor)
+    if not why:
+        return backend
+    from ffi.gate import announce_once
+    grid = "" if kgrid is None else f" for k-grid {tuple(int(v) for v in kgrid)}"
+    msg = (f"[kconv] k-convolution router: CUDA -> XLA (jnp.fft){grid}"
+           f"{' (k-minor)' if kminor else ''}, not nvidia-mathdx: {why}")
+    if announce_once(("kconv", "xla", None if kgrid is None else tuple(kgrid), kminor), msg):
+        import warnings
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    return "xla"
 
 
 def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
@@ -252,7 +303,16 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
         root = mathdx_root()
         for target in KCONV_TARGETS:
             _require_target(target, "CUDA")
-        _probe_kconv_compile(mesh)
+        try:
+            _probe_kconv_compile(mesh)
+            why = ""
+        except RuntimeError as e:
+            why = str(e)
+        # Every process takes the same route: one failed probe sends all to XLA.
+        from jax.experimental import multihost_utils
+        if int(np.max(multihost_utils.process_allgather(np.int32(bool(why))))):
+            _MATHDX_DOWN[:] = [why or "a peer process failed the mathdx probe compile"]
+            return kconv_backend(mesh)
         announce_once(("kconv", "backend", backend),
                       f"[kconv] k-convolution router: CUDA -> nvidia-mathdx ({root}); "
                       f"cubin cache {_cubin_cache_summary()}",
@@ -626,7 +686,7 @@ def make_fused_conv_kpair(
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     scale = conv_kpair_scale(norm, nk, mult)
-    backend = kconv_backend(mesh)
+    backend = kconv_backend(mesh, kgrid)
     if backend == "mathdx" and pair_resident_refusal(kgrid):
         fft, ifft = _staged_pair_ffts(mesh, kgrid)
 
@@ -671,7 +731,7 @@ def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     scale = conv_kpair_scale("forward", nk, 1.0)
-    backend = kconv_backend(mesh)
+    backend = kconv_backend(mesh, kgrid)
     if backend == "mathdx" and pair_resident_refusal(kgrid):
         return _staged_kparent(mesh, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
     if backend == "mathdx":
@@ -713,7 +773,8 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     scale = conv_kpair_scale("forward", nk, 1.0)
-    if kconv_backend(mesh) == "mathdx" and pair_resident_refusal(kgrid):
+    backend = kconv_backend(mesh, kgrid)
+    if backend == "mathdx" and pair_resident_refusal(kgrid):
         fft, ifft = _staged_pair_ffts(mesh, kgrid)
 
         def _staged(D, F):
@@ -735,7 +796,7 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
                 lambda a, b, m, mt, n, nt: component(a, b, c, m, mt, n, nt),
                 (nk, c, D.shape[1] * D.shape[5]), fft, ifft)
         return _staged
-    if kconv_backend(mesh) == "mathdx":
+    if backend == "mathdx":
         _require_target(KCONV_PLANE_TARGET, "CUDA")
         attrs = _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
 
@@ -754,7 +815,7 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
         X = jnp.moveaxis(D * F[:, :, None, None, None, :], 1, 4)    # (k, a, 2c, b, g, p)
         X = jnp.conj(jnp.moveaxis(X.reshape(nk, ns, 2 * c, ns, -1), 3, 4))
         return _pair_tail(X[:, :, :c], X[:, :, c:], kgrid, pl, phl, pr, phr, scale,
-                          kconv_backend(mesh))
+                          backend)
     return _xla
 
 
@@ -865,10 +926,10 @@ def make_local_kfft_klead(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> 
     """Rank-local ``fn(X) -> Y`` over the LEADING flat-k axis of ``X (nk, *trail)``."""
     if kind not in ("ifftn", "fftn"):
         raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale(kind, norm, nk)
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KFFT_KLEAD_TARGET, "CUDA")
 
         def _mathdx(x):
@@ -878,7 +939,7 @@ def make_local_kfft_klead(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> 
             return y.reshape(x.shape)
         return _mathdx
 
-    if kconv_backend(mesh) == "plan":
+    if kconv_backend(mesh, kgrid) == "plan":
         return lambda x: _host_flat_k(x, kg, kind, scale)
 
     def _xla(x):
@@ -891,10 +952,10 @@ def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) ->
     """Rank-local ``fn(X) -> Y`` over the three TRAILING k axes of ``X (..., nkx, nky, nkz)``."""
     if kind not in ("ifftn", "fftn"):
         raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid, kminor=True))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale(kind, norm, nk)
-    backend = kconv_backend(mesh)
+    backend = kconv_backend(mesh, kgrid, kminor=True)
     mathdx = backend == "mathdx"
     if mathdx:
         _require_target(KFFT_KMINOR_TARGET, "CUDA")
@@ -982,6 +1043,7 @@ def _plane_runs(pfc: np.ndarray, n_col: int) -> tuple:
                  for s, e in zip(brk, ends))
 
 
+@lru_cache(maxsize=None)
 def _optin_smem_bytes(ordinal: int = 0) -> int | None:
     """The device's opt-in shared memory per block (libcuda attribute 97); None without a driver."""
     try:
@@ -1111,7 +1173,7 @@ def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
     once per W) and ``apply`` the fused mathdx T·W pass, in place on T.  The XLA
     backend: the same split in XLA ops.
     """
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     t_flat = validate_flat_spec(t_spec, "T")
     w_flat = validate_flat_spec(w_spec, "W")
@@ -1147,10 +1209,10 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
     k-space W.  The BSE W term holds its T k-leading so that the encode and
     decode are batched ZGEMMs with no T-sized transpose, and calls this factory.
     """
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KCONV_KLEAD_TARGET, "CUDA")
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(scale))
@@ -1161,7 +1223,7 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
                 input_output_aliases={0: 0})(t, v_r, **attrs, **_mathdx_common())
         return _mathdx
 
-    backend = kconv_backend(mesh)
+    backend = kconv_backend(mesh, kgrid)
 
     def _xla(t, v_r):
         t_r = _kfft(t, kg, "ifftn", backend) * scale
@@ -1178,8 +1240,8 @@ def klead_outer_refusal(mesh: Mesh, kgrid, optin: int | None = None) -> str | No
     mesh is always served.  Callers that get a reason keep the unfused encode +
     :func:`make_local_kconv_klead` chain and say so.
     """
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
-    if kconv_backend(mesh) != "mathdx":
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    if kconv_backend(mesh, kgrid) != "mathdx":
         return None
     from ffi.common import ffi_loader
     ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
@@ -1210,10 +1272,10 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     to a multiple of 4 (the m8n8k4 chunk; exact).  The XLA backend: that composition in XLA.
     Check :func:`klead_outer_refusal` first.
     """
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid) == "mathdx":
         fma = _outer_ksum_fma()
         target = KCONV_KLEAD_OUTER_KSUM_TARGET if fma else KCONV_KLEAD_OUTER_TARGET
         _require_target(target, "CUDA")
@@ -1247,7 +1309,7 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
     An XLA-backend mesh is always served.  Callers that get a reason keep the outer conv + XLA decode.
     """
     why = klead_outer_refusal(mesh, kgrid, optin)
-    if why is not None or kconv_backend(mesh) != "mathdx":
+    if why is not None or kconv_backend(mesh, kgrid) != "mathdx":
         return why
     from ffi.common import ffi_loader
     ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
@@ -1312,9 +1374,9 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
     backend: the outer conv and the einsum in XLA.
     Check :func:`klead_outer_decode_refusal` first.
     """
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
-    if kconv_backend(mesh) != "mathdx":
+    if kconv_backend(mesh, kgrid) != "mathdx":
         outer = make_local_kconv_klead_outer(mesh, kg, norm=norm)
 
         def _prep_xla(pc):
@@ -1354,7 +1416,7 @@ def _klead_locals(mesh, kg, norm, mult):
     """Rank-local ``(prep, apply)`` of :func:`make_kconv_klead`: ``ifftn(W)`` into R
     space, then the T·W_R pass; on the plan backend the identity and the host
     gw_conv handler, which transforms W itself."""
-    if kconv_backend(mesh) == "plan":
+    if kconv_backend(mesh, kg) == "plan":
         return (lambda w: w), _host_gw_conv_local(kg, norm, mult)
     return (make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm),
             make_local_kconv_klead(mesh, kg, norm=norm, mult=mult))
@@ -1475,7 +1537,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     """
     from symmetry_maps import (DEVICE_LOAD_SPECS, DeviceLoadTables,
                                apply_unfold_load_tables_local, local_unfold_load_tables)
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading unfold conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
@@ -1489,7 +1551,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
         raise ValueError(f"k-leading unfold conv: tables were cut for a {tuple(tables.mesh_shape)} "
                          f"mesh; this mesh is {mesh_shape}")
     si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KCONV_KLEAD_UNFOLD_TARGET, "CUDA")
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(si * sf * float(mult)), **_mathdx_common())
@@ -1624,7 +1686,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
     """
     from symmetry_maps import (DEVICE_LOAD_SPECS, DeviceLoadTables,
                                apply_unfold_load_tables_local, local_unfold_load_tables)
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk or int(w_tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading lorentz conv: tables cover {tables.row.shape[0]} k and "
@@ -1658,7 +1720,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
             return local_unfold_load_tables(tables), local_unfold_load_tables(w_tables)
         return (tables._replace(**dict(zip(DeviceLoadTables._fields, loads[:n_fields]))),
                 w_tables._replace(**dict(zip(DeviceLoadTables._fields, loads[n_fields:]))))
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KCONV_KLEAD_LORENTZ_TARGET, "CUDA")
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale_g=np.float64(si), scale_f=np.float64(sf), mult=np.float64(mult),
@@ -1789,7 +1851,7 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
     to a scan's largest pass and ``[lo, hi)`` its live left centroid rows; the rest come back zero.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading unfold fft: tables cover {tables.row.shape[0]} k, grid has {nk}")
@@ -1798,7 +1860,7 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
     n_l, n_r = int(spin_l.shape[-1]), int(spin_r.shape[-1])
     conj = int(tables.conj_trs)
     needs_partner = bool(np.any(np.asarray(tables.trs))) and not conj
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KFFT_KLEAD_UNFOLD_TARGET, "CUDA")
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(ffi_fft_scale("ifftn", norm, nk)), conj_trs=np.int64(conj),
@@ -1811,7 +1873,7 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
                 *(() if live is None else (live,)), **attrs)
     else:
         # The plan backend's gw_conv apply transforms W itself, so its prep stays in k space.
-        prep_local = ((lambda o: o) if kconv_backend(mesh) == "plan"
+        prep_local = ((lambda o: o) if kconv_backend(mesh, kgrid) == "plan"
                       else make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm))
 
         def apply_tables(w, wt, t, live):
@@ -1951,7 +2013,7 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     """
     from symmetry_maps import (DEVICE_LOAD_SPECS, apply_unfold_load_tables_local,
                                local_unfold_load_tables)
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"k-leading chi unfold: tables cover {tables.row.shape[0]} k, grid has {nk}")
@@ -1967,7 +2029,7 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     n_out, complete = int(n_out), bool(complete)
     si = ffi_fft_scale("ifftn", norm, nk)
     flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KCONV_CHI_UNFOLD_TARGET, "CUDA")
 
         def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
@@ -2060,7 +2122,7 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     the service's reference composition.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
         raise ValueError(f"chi vertex: tables cover {tables.row.shape[0]} k, grid has {nk}")
@@ -2084,7 +2146,7 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
         raise ValueError("chi vertex: sign_c must be (nk,) of +-1")
     si = ffi_fft_scale("ifftn", norm, nk)
     flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KCONV_CHI_VERTEX_TARGET, "CUDA")
 
         def apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live):
@@ -2185,10 +2247,10 @@ def make_local_kconv_kminor(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
     inside a shard_map: ``X`` ``(d0, d1, d2, d3, d4, nk)``, ``K_R`` ``(d1, d2, nk)``."""
     if out_layout not in (0, 1):
         raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid, kminor=True))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
-    if kconv_backend(mesh) == "mathdx":
+    if kconv_backend(mesh, kgrid, kminor=True) == "mathdx":
         _require_target(KCONV_KMINOR_TARGET, "CUDA")
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(scale), out_layout=np.int64(out_layout))
@@ -2201,7 +2263,7 @@ def make_local_kconv_kminor(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
                 x, k_r, **attrs, **_mathdx_common())
         return _mathdx
 
-    backend = kconv_backend(mesh)
+    backend = kconv_backend(mesh, kgrid, kminor=True)
 
     def _xla(x, k_r):
         _check_complex(x, k_r)
@@ -2227,7 +2289,7 @@ def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,
     """
     if out_layout not in (0, 1):
         raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
-    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid, kminor=True))
     nk = kg[0] * kg[1] * kg[2]
     xax, kax = tuple(x_spec), tuple(k_spec)
     if len(xax) != 6 or xax[5] is not None or len(kax) != 3 or kax[2] is not None \

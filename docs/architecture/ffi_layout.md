@@ -45,11 +45,10 @@ LORRAX library (ROCm) has no engine for that operation.
 | **Parallel HDF5 slab I/O** | every sharded array read or written through `file_io.slab_io` | `phdf5_{read, read_kchunk_union, write, write_independent}`, staged through the CUDA runtime | the same handlers on the host leg | none: one transport, and a deployment that cannot serve it refuses at open | GATE 7, GATE 10 | `ffi.io` ← `file_io.slab_io` ([§5](#5-parallel-hdf5-the-ffi-side), [SlabIO](slab_io.md)) |
 
 **Every mathdx kernel** (the k-axis rows and mode 10) is NVRTC-built for the
-device's own `sm_<cc>`, and `require_kconv` probe-compiles one at startup. On
-CUDA every k-grid axis of a k-axis operation is at most 40
-(`GATE mathdx-kconv-axis`), and its resident k-row or k-box tile must fit the
-device's opt-in shared memory; the XLA backend has neither limit
-([refusals](kconv.md#refusals)). Operands are
+device's own `sm_<cc>`, and `require_kconv` probe-compiles one at startup. A
+grid the family cannot serve on the device (an axis above 40, a k-box plane
+tile beyond the opt-in shared memory, a failed probe; `ffi.fft.mathdx_refusal`)
+takes the XLA backend with one warning ([router](kconv.md#router)). Operands are
 complex128; modes 2–5 also take complex64 on CUDA.
 
 **Gaps.**

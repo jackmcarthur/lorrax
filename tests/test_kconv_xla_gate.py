@@ -17,7 +17,13 @@ chi0 node.  CUDA: four ranks, one GPU each,
 with four host devices, ``JAX_PLATFORMS=cpu
 XLA_FLAGS=--xla_force_host_platform_device_count=4 python3 tests/test_kconv_xla_gate.py``.
 Under pytest it skips.
+
+The router's fallback (``ffi.fft.mathdx_refusal``) is gated too.  CUDA: with
+``KCONV_AXIS_MAX`` forced to 1, every factory takes the XLA backend and must
+match mathdx on the same grid.  cpu: with the mesh reported as CUDA, a k axis of
+48 takes the XLA backend and must match the XLA reference exactly.
 """
+import contextlib
 import os
 import sys
 
@@ -51,8 +57,33 @@ def _tables(rng, nk, n_parent, m_l, m_r, ns, n_l, n_r, mesh_shape, trs_rule="pai
                             conj_trs=int(trs_rule == "conj"))
 
 
-def run_cases(mesh):
-    """Every case on ``mesh``; returns ``{name: rel_error}``."""
+@contextlib.contextmanager
+def _axis_max(n):
+    """``ffi.fft.KCONV_AXIS_MAX`` set to ``n`` inside the block (the fallback's trigger)."""
+    from ffi import fft as F
+    saved, F.KCONV_AXIS_MAX = F.KCONV_AXIS_MAX, n
+    try:
+        yield
+    finally:
+        F.KCONV_AXIS_MAX = saved
+
+
+@contextlib.contextmanager
+def _as_cuda():
+    """The mesh reported as an NVIDIA one, so the router's CUDA decision runs on host devices."""
+    import ffi.gate as G
+    saved, G.mesh_ffi_platform = G.mesh_ffi_platform, lambda mesh, *a, **k: "CUDA"
+    try:
+        yield
+    finally:
+        G.mesh_ffi_platform = saved
+
+
+def run_cases(mesh, kg=(3, 2, 2), arm=None, skip=()):
+    """Every case on ``mesh``; returns ``{name: rel_error}``.
+
+    Each factory is built twice: by default, then inside ``arm`` (default
+    :func:`ffi.fft.xla_reference`)."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -61,8 +92,8 @@ def run_cases(mesh):
     from ffi import fft as F
 
     rng = np.random.default_rng(20261008)
-    kg = (3, 2, 2)
-    nk = 12
+    nk = int(np.prod(kg))
+    arm = F.xla_reference if arm is None else arm
     ns = 2
     px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
     m = 6                                   # local centroids per shard
@@ -78,7 +109,7 @@ def run_cases(mesh):
     def both(build, call):
         """``call(build())`` by default and under the XLA reference; (mathdx, xla)."""
         a = _gather(jax.block_until_ready(call(build())))
-        with F.xla_reference():
+        with arm():
             fn = build()
         b = _gather(jax.block_until_ready(call(fn)))
         return a, b
@@ -124,17 +155,18 @@ def run_cases(mesh):
                                           check_vma=False)(A, B))
     out["mode0 kconv_pair"] = _rel(a, b)
 
-    # mode 10: the plane FFT read from its cylinder
+    # mode 10: the plane FFT read from its cylinder (no k grid: not a fallback case)
     nb, nc = 24, 30
     occ = rng.random(nb * nc) < 0.6
     n_col = int(occ.sum())
     pfc = np.full(nb * nc, n_col, np.int64)
     pfc[occ] = np.arange(n_col)
     Fc = put(rnd(4, 3, n_col), P(None, None, None))
-    a, b = both(lambda: F.make_plane_fft_gather(mesh, pfc, n_col, (nb, nc)),
-                lambda f: shard_map(f, mesh=mesh, in_specs=(P(),), out_specs=P(),
-                                    check_vma=False)(Fc))
-    out["mode10 plane_fft_gather"] = _rel(a, b)
+    if "mode10" not in skip:
+        a, b = both(lambda: F.make_plane_fft_gather(mesh, pfc, n_col, (nb, nc)),
+                    lambda f: shard_map(f, mesh=mesh, in_specs=(P(),), out_specs=P(),
+                                        check_vma=False)(Fc))
+        out["mode10 plane_fft_gather"] = _rel(a, b)
 
     # the unfold modes: random valid tables, n_parent parent rows, antiunitary partners
     n_parent = 5
@@ -173,6 +205,35 @@ def run_cases(mesh):
     return out
 
 
+def _fallback_cases(mesh, backend):
+    """The router's XLA fallback: ``({name: rel_error}, [decision failures])``."""
+    from ffi import fft as F
+    wrong = []
+    if backend == "mathdx":
+        if F.kconv_backend(mesh, (3, 2, 2)) != "mathdx":
+            wrong.append("(3,2,2) left mathdx")
+        with _axis_max(1):
+            if F.kconv_backend(mesh, (3, 2, 2)) != "xla":
+                wrong.append("forced axis cap kept mathdx")
+        out = run_cases(mesh, arm=lambda: _axis_max(1), skip=("mode10",))
+        saved = F._probe_kconv_compile
+        def failing(mesh):
+            raise RuntimeError("GATE mathdx-probe: forced by the gate")
+        F._probe_kconv_compile = failing
+        try:
+            if F.require_kconv(mesh, announce=False) != "xla" or F.kconv_backend(mesh, (3, 2, 2)) != "xla":
+                wrong.append("a failed probe kept mathdx")
+        finally:
+            F._probe_kconv_compile = saved
+            F._MATHDX_DOWN.clear()
+        return {f"fallback {k}": v for k, v in out.items()}, wrong
+    with _as_cuda():
+        if F.kconv_backend(mesh, (48, 1, 1)) != "xla":
+            wrong.append("axis 48 kept mathdx")
+        out = run_cases(mesh, kg=(48, 1, 1), skip=("mode10",))
+    return {f"axis48 {k}": v for k, v in out.items()}, wrong
+
+
 def main() -> int:
     import runtime
     stack = runtime.initialize_communicator_stack()
@@ -186,13 +247,18 @@ def main() -> int:
         runtime.finalize_process(0)
         return 0
     out = run_cases(mesh)
+    extra, wrong = _fallback_cases(mesh, backend)
+    out.update(extra)
     bad = {k: v for k, v in out.items() if not v <= TOL}
     if jax.process_index() == 0:
         for k, v in out.items():
-            print(f"{'ok  ' if v <= TOL else 'FAIL'} {k:28s} rel {v:.3e}", flush=True)
-        print(f"KCONV_XLA_GATE {'PASS' if not bad else 'FAIL'} ({backend} vs xla): "
-              f"{len(out) - len(bad)}/{len(out)} cases within {TOL:g}", flush=True)
-    rc = 1 if bad else 0
+            print(f"{'ok  ' if v <= TOL else 'FAIL'} {k:36s} rel {v:.3e}", flush=True)
+        for w in wrong:
+            print(f"FAIL decision: {w}", flush=True)
+        print(f"KCONV_XLA_GATE {'PASS' if not (bad or wrong) else 'FAIL'} ({backend} vs xla, "
+              f"and the XLA fallback): {len(out) - len(bad)}/{len(out)} cases within {TOL:g}, "
+              f"{len(wrong)} decision failures", flush=True)
+    rc = 1 if (bad or wrong) else 0
     runtime.finalize_process(rc)
     return rc
 
