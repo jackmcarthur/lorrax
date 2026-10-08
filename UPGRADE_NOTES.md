@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — opt-in local unequal-knot contour diagnostic
+
+`prepare_real_residue_hermite7_local` accepts a separate strictly increasing
+actual-knot roster and uses both bracketing knots plus their outer neighbors.
+Stencil changes occur at knots (C1, not guaranteed C2). Uniform H3/H7 entry
+points continue to refuse adaptive grids. The uniform H7 and local law now
+share one raw-d/ds-to-2z/ordered-partner field consumer; no default is changed.
+This prototype supports bounded projected-cache diagnostics only and supplies
+no response-error, passivity, quasiparticle or convergence certificate.
+
 ## 2026-10-08 — diagnostic four-knot contour residue interpolation
 
 The opt-in scalar reference owner exposes degree7 Hermite residues through

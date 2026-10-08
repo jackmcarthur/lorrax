@@ -664,6 +664,16 @@ def prepare_real_residue_hermite7_grid(x, occ, nodes, *, eta, n_active=None,
         square = lagrange*lagrange
         value_coeff.append(xp.asarray((1-2*(t-j)*diagonal)*square))
         slope_coeff.append(xp.asarray(h*(t-j)*square))
+    return _hermite_residue_weight_stream(xh, active, residue, nodes, start,
+        value_coeff, slope_coeff, interval, stride=stride, eta=eta,
+        analytic_convention=analytic_convention, xp=xp,
+        stencil_rule="clip(floor(abs(x)/h)-1,0,Ncoarse-4); nearest available consecutive four knots")
+
+
+def _hermite_residue_weight_stream(xh, active, residue, nodes, start,
+                                   value_coeff, slope_coeff, interval, *, stride,
+                                   eta, analytic_convention, xp, stencil_rule):
+    """Sole streamed H7 field/slopes/sheet application for either knot law."""
     start, sign = xp.asarray(start), xp.asarray(xh < 0)
     active, residue = xp.asarray(active), xp.asarray(residue)
     def terms(inode, value, derivative_s, value_t, derivative_t_s):
@@ -695,14 +705,61 @@ def prepare_real_residue_hermite7_grid(x, occ, nodes, *, eta, n_active=None,
         return tuple(out)
     terms.stride, terms.node_count = int(stride), len(nodes)
     terms.weight_parts = weight_parts
-    terms.interval_count = count-1
+    terms.interval_count = (len(nodes)-1)//stride
     terms.nodes_ry = nodes
     terms.eta = float(eta)
     terms.analytic_convention = analytic_convention
     terms.physical_interval = interval
     terms.stencil_start = np.asarray(start)
-    terms.stencil_rule = "clip(floor(abs(x)/h)-1,0,Ncoarse-4); nearest available consecutive four knots"
+    terms.stencil_rule = stencil_rule
     return terms
+
+
+
+def prepare_real_residue_hermite7_local(x, occ, nodes, *, eta, n_active=None,
+                                       band_valid=None,
+                                       analytic_convention="time_ordered_fractional", xp=np):
+    """Opt-in four ACTUAL-knot Hermite residues on a nonuniform real roster.
+
+    Select both bracketing actual knots and their nearest outer neighbors;
+    clip only at real endpoints. Changes occur at knots, preserving C1. No synthesized
+    endpoints or tolerance-merging is allowed. Raw d/ds slope conversion and
+    the occupied-retarded dagger are inherited from the same source stream
+    used by the uniform H7 law. This diagnostic is not an error certificate.
+    """
+    xh, fh = _inputs(x, occ, eta)
+    _kernels(xh, fh, eta, analytic_convention, np)
+    nodes = np.asarray(nodes, np.float64)
+    if (nodes.ndim != 1 or len(nodes) < 4 or nodes[0] != 0
+            or not np.isfinite(nodes).all() or np.any(np.diff(nodes) <= 0)):
+        raise ValueError("Local H7 needs four finite strictly increasing ACTUAL knots starting at zero")
+    active, residue = _residue_weights(xh, fh, n_active, band_valid)
+    query = abs(np.where(active & (residue != 0), xh, 0.))
+    if np.any(active & (residue != 0) & (query > nodes[-1])):
+        raise ValueError("Local H7 physical crossing exceeds actual outer endpoint")
+    interval = np.clip(np.searchsorted(nodes, query, side="right")-1, 0, len(nodes)-2)
+    # A knot-based bracketing stencil keeps both adjacent pieces exact in
+    # value and slope at their shared knot. Globally closest four knots can
+    # switch INSIDE a nonuniform interval and need not be continuous.
+    start = np.clip(interval-1, 0, len(nodes)-4)
+    origin, scale = nodes[start], nodes[start+3]-nodes[start]
+    t = (query-origin)/scale
+    knots = [(nodes[start+j]-origin)/scale for j in range(4)]
+    value_coeff, slope_coeff = [], []
+    for j in range(4):
+        lagrange, diagonal = np.ones_like(t), np.zeros_like(t)
+        for k in range(4):
+            if k != j:
+                gap = knots[j]-knots[k]
+                lagrange *= (t-knots[k])/gap
+                diagonal += 1/gap
+        square = lagrange*lagrange
+        value_coeff.append(xp.asarray((1-2*(t-knots[j])*diagonal)*square))
+        slope_coeff.append(xp.asarray(scale*(t-knots[j])*square))
+    return _hermite_residue_weight_stream(xh, active, residue, nodes, start,
+        value_coeff, slope_coeff, interval, stride=1, eta=eta,
+        analytic_convention=analytic_convention, xp=xp,
+        stencil_rule="both bracketing actual knots plus nearest outer neighbors; clip real edges; C1 knot changes")
 
 
 def real_residue_diagonal_interval_terms(plan, inode, value, derivative_s,
