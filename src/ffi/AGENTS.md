@@ -11,9 +11,8 @@ NVIDIA stack) and `liblorrax_ffi_host.so` (the CUDA-free host leg).
 - **Python:** `fft.py` (the k-convolution router: mathdx on CUDA, the XLA
   backend elsewhere; the plane factory and the Fourier-plan call), `io.py`
   (parallel HDF5), `gemm.py` (host CBLAS GEMM), `gate.py` (the binding of
-  `lxkit.gate`: env dials and the vendor platform key), `contour.py` (the
-  contour accumulator), `common/ffi_loader.py` (locate, attest and register
-  the libraries). Distributed linear algebra lives in `services/distrib_la`.
+  `lxkit.gate`: env dials and the vendor platform key), `common/ffi_loader.py`
+  (locate, attest and register the libraries). Distributed linear algebra lives in `services/distrib_la`.
 - **XLA is the reference path** ([decisions](../../docs/architecture/decisions.md#xla-reference)):
   a kernel here stays only while it is ≥ 2× faster on a production stage or
   decisive on memory, and it is gated against the XLA path on the same device.

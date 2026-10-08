@@ -44,9 +44,9 @@ an operation had no XLA path.
 
 * On CUDA a k-grid axis above 40 refuses (`GATE mathdx-kconv-axis`),
   although the router's XLA backend could serve it.
-* The contour accumulator, the spin-rotation kernel and the cuBLASMp GEMM
-  have no measured gain. The classic-cuBLAS local active-range GEMM and the
-  screened bispinor Dyson's cuSOLVERMp LU are not measured against XLA.
+* The cuBLASMp GEMM has no measured gain. The classic-cuBLAS local
+  active-range GEMM and the screened bispinor Dyson's cuSOLVERMp LU are not
+  measured against XLA.
 * The operations the [FFI layer](ffi_layout.md#kernel-operations) lists
   under *Gaps* have no plain-XLA route.
 

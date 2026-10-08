@@ -57,7 +57,7 @@ else.
 | `cohsex_sigma.py` | Orchestrates the static self-energy path. |
 | `comm_model.py` | O(1) collective cost model used by the planners. |
 | `compute_vcoul.py` | Dispatches Coulomb-matrix construction by dimensionality. |
-| `contour_accumulator.py` | Re-export of `ffi.contour` (the contour accumulator) for `gw.w_isdf`. |
+| `contour_accumulator.py` | The contour accumulator `A[o] += p[o]·c` of the response-bank streams, in XLA. |
 | `coulomb/__init__.py` | Compatibility package: dimension-aware adapters over the `vcoul` service. |
 | `coulomb/base.py` | Compatibility import of the `vcoul` Coulomb kernels. |
 | `coulomb/box_0d.py` | Compatibility import of the `vcoul` 0-D cell-box kernel. |

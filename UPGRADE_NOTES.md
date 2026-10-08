@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — the contour accumulator and the spin rotation run in XLA
+
+The two small CUDA kernels with no measured gain are deleted: the contour accumulator
+(`A[o] += p[o]·c` on the response-bank streams; `gw.contour_accumulator` now holds the XLA
+sum and its block form) and the spin rotation of `symmetry_maps.unfold_spin_centroid_operator`
+(the two JAX contractions it already had for other widths). Startup no longer checks their
+handlers (`ffi_loader.require_cuda_handlers` is gone). The B11 bundle keeps the handlers;
+the next bundle drops `response/contour_accumulate*` and `symmetry/spin_rotate*`. eqp is
+bitwise on the CrI3 6×6 charge shared-pole one-shot and bispinor SC maps 0-2 at P4. The XLA
+sum costs time on the χ₀ direct stream: dispatch 0.69 → 1.10 s and compile 0.79 → 1.64 s,
+and the one-shot run goes 106.6 → 114.3 s (+7 %); the kernel's 1.6× on its stage is under the
+ruling's 2× bar. No deck or environment change.
+
 ## 2026-10-08 — the k-convolution router has an XLA backend; LORRAX_FFT_FFI is gone
 
 `ffi.fft.kconv_backend` returns `mathdx` on CUDA, `plan` on cpu (the host FFTW3-ABI route,

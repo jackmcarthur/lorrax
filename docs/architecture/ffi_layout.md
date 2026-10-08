@@ -42,8 +42,6 @@ LORRAX library (ROCm) has no engine for that operation.
 | **Hermitian eigensolve**, batched local or distributed | the charge ζ factor (rank-truncating eigh of each C_q, dense and replicated under both `linalg` layouts), the QSGW `H_k` (`gw.sc_iteration.qp_eigh`) | local: `jnp.linalg.eigh` (cuSOLVER in jaxlib); `linalg = distributed`: cuSOLVERMp `syevd` | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?heevd`/`p?syevd`; host SLATE eigh always refuses at resolve (bug L-2) | `jnp.linalg.eigh` | nothing observes which vendor answered | `distrib_la.plan('eigh')`, `dispatch_batched_eigh`; the charge factor: `isdf.cplus.factor` ([`distrib_la`](../services/distrib_la/api.md), [deck dial](../services/distrib_la/backends.md)) |
 | **Dyson solve and dense factorizations**: `W_q = (1 − v_q χ₀_q)⁻¹ v_q` by LU; the transverse ζ LU; Cholesky on explicit request | gwjax screening (`gw.w_isdf.solve_w`), the response bank (`gw.response_bank`), the shared-pole head, the transverse ζ factor | local: per-q `jax.scipy.linalg.lu_factor`/`lu_solve` (cuSOLVER in jaxlib); distributed: cuSOLVERMp batched `solve_lu`/`getrf`/`getrs`, Cholesky `potrf`/`potrs`. `LORRAX_LU_NO_PIVOT` turns cuSOLVERMp pivoting off with no gate. The fused `cublasmp_batched_w_solve` has no production caller | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?getrf`/`p?getrs`; Cholesky: host SLATE `potrf`/`trsm` | the local LU; Cholesky `native2d` | nothing observes which vendor answered | `distrib_la.plan('solve_lu')`, `plan('cholesky')` ([targets](#dense-linear-algebra-targets)) |
 | **Active-subspace kernels**: store, projected eigh, project, reconstruct, Gram, CGS2 orthogonalization | Davidson (`psp.run_nscf`), Lanczos (`bse.bse_lanczos`, `bse.exciton_bands`) | `lorrax_active_subspace_*` (cuBLAS, cuSOLVER, NCCL) | `CpuSubspacePlan`: NumPy/LAPACK through `jax.pure_callback` | none | — | `distrib_la.plan_subspace`, `plan_orthogonalization` ([Davidson](iterative_eigensolvers.md)) |
-| **Contour accumulator**: `A[o,q,m,n] += p[o]·c[q,m,n]` | the response bank's Laplace/KMS streams (`gw.w_isdf` with selected q rows) | `lorrax_contour_accumulate`, complex128, at most `4·65535` outputs ([small kernels](#small-cuda-kernels)) | none: refuses (`GATE ffi-handler`) | none | — | `ffi.contour` |
-| **Spin rotation**: `G ← U_k G U_k†` per `(k, μ, ν)` spin block | the typed unfold of a parent operator to full k (`symmetry_maps.unfold_spin_centroid_operator` ← `gw.greens_function_kernel.build_G`, `gw.photon_sigma`) | `lorrax_symmetry_spin_rotate_centroid` for `ns ∈ {2, 4}`, complex128; otherwise the einsums | the einsums | JAX einsums (`_rotate_open_spin_centroid_operator`) | — | `symmetry_maps._spin_rotation` |
 | **Parallel HDF5 slab I/O** | every sharded array read or written through `file_io.slab_io` | `phdf5_{read, read_kchunk_union, write, write_independent}`, staged through the CUDA runtime | the same handlers on the host leg | none: one transport, and a deployment that cannot serve it refuses at open | GATE 7, GATE 10 | `ffi.io` ← `file_io.slab_io` ([§5](#5-parallel-hdf5-the-ffi-side), [SlabIO](slab_io.md)) |
 
 **Every mathdx kernel** (the k-axis rows and mode 10) is NVRTC-built for the
@@ -57,10 +55,10 @@ complex128; modes 2–5 also take complex64 on CUDA.
 **Gaps.**
 
 * No CPU engine: the face-layout band projection (gwjax builds its ψ
-  carriers in the face layout), the response bank's prepared active-range
-  Green GEMM, and the contour accumulator.
-* No plain-XLA route: the face-layout GEMMs, the active-subspace kernels, the
-  contour accumulator and slab I/O. A platform without a LORRAX native library
+  carriers in the face layout) and the response bank's prepared active-range
+  Green GEMM.
+* No plain-XLA route: the face-layout GEMMs, the active-subspace kernels and
+  slab I/O. A platform without a LORRAX native library
   has no engine for them.
 
 ## Kernel catalog
@@ -71,8 +69,7 @@ or a ctypes C entry point. From a target string:
 1. **Symbol.** Its row in `ffi_loader._CUDA_TARGET_SYMBOLS` /
    `_HOST_TARGET_SYMBOLS`, or in `distrib_la.loader`'s tables of the same
    names (the distributed linear algebra and the active subspace), gives the
-   handler symbol. The spin rotation is the one target its Python caller registers
-   itself (`symmetry_maps._spin_rotation`).
+   handler symbol.
 2. **File.** `git grep -n 'XLA_FFI_DEFINE_HANDLER_SYMBOL' -- src/ffi/cpp`
    lists every handler with its file; the phdf5 handlers are spelled
    `LRX_PHDF_HANDLER(<X>)` (`<X>Ffi` on CUDA, `<X>HostFfi` on host).
@@ -80,9 +77,8 @@ or a ctypes C entry point. From a target string:
    `ffi_call`.
 
 Startup refuses a provider without a target the run needs: the router's and
-the Fourier plan's targets (`require_kconv`, `require_fourier_plan`), the
-contour accumulator and spin rotation symbols (`ffi_loader.require_cuda_handlers`,
-`GATE ffi-handler`), the host FFT and GEMM (their `Gate`s).
+the Fourier plan's targets (`require_kconv`, `require_fourier_plan`) and the
+host GEMM (its `Gate`).
 
 The [operations table](#kernel-operations) owns what each family computes,
 where it is used, what selects it and its gate; this table maps each family to
@@ -100,8 +96,6 @@ its sources, its build and its target strings.
 | local active-range GEMM | `cublas/local_active_gemm_ffi.cc` | CUDA; C++ | `cublas_local_active_range_gemm` (C aliased, beta), `cublas_local_active_range_gemm_out` (no C, beta = 0: writes every row), `cublas_local_prepared_active_range_gemm` |
 | active subspace | `active_subspace/active_{eigh,ops}.cc` | CUDA; C++ (cuBLAS, cuSOLVER, NCCL) | `active_subspace_{store, eigh, project, reconstruct, gram, ortho, distributed_ortho, subtract, subtract_gram}` |
 | parallel HDF5 | `phdf5/` | both; C++ (HDF5, MPI; CUDA-runtime staging on the CUDA leg) | `phdf5_{read, read_kchunk_union, write, write_independent}`; `phdf5_read_kchunk` has no caller |
-| contour accumulator | `response/contour_accumulate{.cu,_ffi.cc}` | CUDA; nvcc | `contour_accumulate`, `contour_accumulate_block` |
-| spin rotation | `symmetry/spin_rotate{.cu,_ffi.cc}` | CUDA; nvcc | `symmetry_spin_rotate_centroid` |
 | fused W-solve | `cublasmp/batched_w_solve_ffi.cc`, `cublasmp/w_solve_kernels.cu` | CUDA; C++ and nvcc | `cublasmp_batched_w_solve`; no Python caller |
 
 **Architectures.** Every nvcc TU carries SASS for sm_80, 86, 89, 90, 100
@@ -154,24 +148,6 @@ in `_host` (`common/c_abi.h`).
 
 ### Small CUDA kernels
 
-* **Contour accumulator.** `A[o, q, m, n] += p[o]·c[q, m, n]`, complex128,
-  in place (operand 0 aliased), the accumulator at `P(None, None, 'x', 'y')`
-  and the correlation at `P(None, 'x', 'y')`. Each multiply and add is
-  rounded separately (`__dmul_rn`, `__dadd_rn`), so the result equals the
-  XLA stream it replaces byte for byte. 128 threads, four outputs per thread;
-  more than `4·65535` outputs refuse. The block form
-  (`lorrax_contour_accumulate_block`, `ffi.contour.contour_block_accumulate_local`,
-  inside the caller's `shard_map`) adds `Σ_s p[s,o]·c[s,q,m,n]` into the
-  block of the local tile at row and column offset `(m0, n0)`, touching only
-  the block's non-padding rows and columns, with the terms in order, so terms
-  `(a, b)` give the bytes of two full calls. `m0`, `n0` are attributes, or
-  traced values passed as the optional last operand `origin` (s32 `[2]`): a
-  scanned row pass adds its planes at its own offset. An entry that a traced
-  origin moves outside the accumulator is not touched (the host cannot
-  range-check a device value). On a host mesh the same sum runs in XLA.
-* **Spin rotation.** `G ← U_k G U_k†` on each `(k, μ, ν)` spin block,
-  `ns ∈ {2, 4}`, complex128, in place, 128 threads; any other spin width or
-  dtype takes the JAX einsums.
 * **Fused W-solve.** `W = X (I − X† pref·χ X)⁻¹ X†` with `X X† = V`, per q,
   in one handler: potrf, cuBLASMp GEMMs, the `I − T` kernel, potrf, two trsm
   and a GEMM (16×16-thread helper kernels, `gridDim.z = n_q ≤ 65535`).
@@ -206,8 +182,6 @@ each announces which entry it bound.
   binding of `lxkit.gate`) and `ffi/common/ffi_loader.py`. Distributed dense
   linear algebra and the active subspace are `services/distrib_la`, which
   opens the same two libraries through its own `distrib_la.loader`.
-* **Small CUDA kernels:** `ffi/contour.py` (the contour accumulator); the
-  spin rotation registers its own target from `symmetry_maps._spin_rotation`.
 
 ---
 
@@ -492,8 +466,8 @@ then raise ([`decisions.md`](decisions.md), 2026-08-04).
 
 1. **Registered FFI target names and C++ handler symbols do not change.** The
    sets are `_CUDA_TARGET_SYMBOLS` and `_HOST_TARGET_SYMBOLS` in
-   `ffi/common/ffi_loader.py`, `distrib_la.loader`'s tables and the spin
-   rotation's own registration. Refactors move files, never a target string;
+   `ffi/common/ffi_loader.py` and `distrib_la.loader`'s tables. Refactors move
+   files, never a target string;
    a changed operand contract is a new target, and the old one stays for
    older trees.
 2. **Env knob spellings do not change.** Add an alias instead.

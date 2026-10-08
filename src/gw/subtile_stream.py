@@ -16,7 +16,7 @@ rows go straight into the carry.  So
   (:func:`orbit_cuts`), so the kconv call's typed unfold reads only the pass's
   own rows;
 - the node-to-output weights act in chunks of nodes through the in-place
-  block accumulator (``ffi.contour.contour_block_accumulate_local``); its
+  block accumulator (``gw.contour_accumulator.contour_block_accumulate_local``); its
   terms add in order, so a chunk gives the bytes of one accumulate per node;
 - a node may return several planes, each landing in its own block of the
   carry (:class:`Block`): the four-current stream's channel planes of one
@@ -349,7 +349,7 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, prepare, only
     -1; the k-convolution also skips them), so adding a whole window adds the
     pass.
     """
-    from ffi.contour import contour_block_accumulate_local
+    from gw.contour_accumulator import contour_block_accumulate_local
     chunk, R = int(plan.chunk), int(plan.rows)
     n_sets, n_cap = int(weights.shape[0]), int(weights.shape[-1])
     n_chunks_cap = -(-n_cap // chunk)
@@ -379,7 +379,7 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, prepare, only
                         jnp.clip(la - jax.lax.axis_index("x") * wa - row0, 0, R),
                         jnp.clip(lb - jax.lax.axis_index("y") * wb, 0, wb))).astype(jnp.int32)
                 return contour_block_accumulate_local(a, r, w, valid, m0=block.m0 + s,
-                                                      n0=block.n0, mesh=mesh)
+                                                      n0=block.n0)
             return jax.shard_map(local, mesh=mesh, in_specs=(spec_c, spec_c, P()),
                                  out_specs=spec_c, check_vma=False)(acc, rows, projection)
 

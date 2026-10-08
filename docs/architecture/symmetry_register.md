@@ -225,10 +225,8 @@ Refusals:
 | `unfold_psi`, loader `k="full_bz"` | \((n_b,n_s,n_G)\), host | plane-wave rule | host | trivial-view parents; full-grid readers of the loader |
 | `gw_output.sigma_table_to_file_wedge(time_ordered_diagonal=True)` | star-wedge diagonal of the dynamic Σ_c, \((N_k^{\rm star},n_b)\) or \((n_\omega,N_k^{\rm star},n_b)\), host → file wedge | `pair_transpose`, which on a diagonal is a copy: the time-ordered Σ_c is symmetric, Σ(r,r′)=Σ(r′,r), so it does not commute with Θ and ⟨Θm|Σ|Θn⟩ = Σ_nm. `conj` flipped Im Σ_c on every time-reversed k | host | SC `sigma_diag` and eqp assembly |
 
-In `unfold_spin_centroid_operator` the spin action runs as a CUDA FFI kernel
-(`SpinRotateCentroidCudaFfi`: one thread per \((k,\mu,\nu)\) spin block, in
-place) for complex128 with \(n_s\in\{2,4\}\) on GPU, and as two JAX
-contractions otherwise. A provider without the handler refuses.
+In `unfold_spin_centroid_operator` the spin action runs as two JAX
+contractions over the resident spin axes on every platform.
 
 `unfold_isdf_operator`, and every kernel built on it, refuses:
 
