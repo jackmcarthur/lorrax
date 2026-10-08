@@ -716,6 +716,11 @@ def real_residue_diagonal_interval_terms(plan, inode, value, derivative_s,
     """
     if value.ndim != 4 or value.shape[1:3] != (1, 1):
         raise ValueError("CD interval attribution requires scalar diagonal query blocks")
+    if isinstance(inode, (bool, np.bool_)) or not isinstance(inode, (int, np.integer)):
+        raise ValueError("CD interval node index must be an integer")
+    inode = int(inode)
+    if not 0 <= inode < plan.node_count:
+        raise ValueError("CD interval node is outside the declared real grid")
     if inode % plan.stride:
         return np.zeros((value.shape[0], value.shape[-1]), np.complex128)
     z = plan.nodes_ry[inode]+1j*plan.eta
