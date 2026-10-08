@@ -2297,15 +2297,22 @@ def _fit_transverse_zeta_channels(
         parent_psi = _psi._replace(faces=None)
         wfn.release_read_staging()
         del _psi
+    # Augmentation retains a world-aligned reciprocal/OWN3 source. Its
+    # protected faces can therefore have extra zero transport bands beyond
+    # the persistent face extent. Bind only the typed Green-carrier extent;
+    # keep the original protected faces for the fit below.
+    green_faces = (faces if current_augmentation is None else
+                   (faces[0][:, :band_slices.nb_full],
+                    faces[1][..., :band_slices.nb_full]))
     transverse_wfn_data = _transverse_wfn_data(
         wfn, sym, _meta_T, _cent_T_idx, cfg, mesh_xy, band_slices,
         (_chunks_T['band_chunk'] if _chunks_T is not None
          else zeta_contract.loader_band_chunk),
         k_chunk_size=(_chunks_T['centroid_k_chunk'] if _chunks_T is not None
                       else zeta_contract.loader_k_chunk),
-        faces=faces,
+        faces=green_faces,
         plan=(_chunks_T['k_unfold_plan'] if _chunks_T is not None else None))
-    del faces
+    del faces, green_faces
     if not missing:
         return transverse_wfn_data, None
     parent_T = transverse_wfn_data['green_parent']
