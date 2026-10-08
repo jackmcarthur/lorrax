@@ -151,6 +151,7 @@ def compute_all_V_q(
     verbose: bool = True,
     sym=None,
     centroid_indices: np.ndarray | None = None,
+    return_qirr: bool = False,
     g_chunk_size: int = 0,              # 0 = auto v_q_g_flat._plan_vq_tiles
 ) -> tuple[jax.Array, jax.Array]:
     """Compute V_qmunu(q,μ,ν) and g0_μ(q) at q=0 from a sharded ζ HDF5.
@@ -185,7 +186,7 @@ def compute_all_V_q(
             mc_average_vcoul_body=mc_average_vcoul_body,
             g_chunk=(int(g_chunk_size) if g_chunk_size > 0 else None),
             verbose=verbose, sym=sym,
-            centroid_indices=centroid_indices,
+            centroid_indices=centroid_indices, return_qirr=return_qirr,
         )
 
     raise NotImplementedError(

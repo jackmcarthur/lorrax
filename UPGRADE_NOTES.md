@@ -7,12 +7,13 @@ The binding rulings behind breaking changes are in
 
 ## 2026-10-08 — reference Coulomb return can pack only representative q rows
 
-`compute_V_q(..., return_qirr=True)` keeps the existing full-raw finite,
-Gamma Hermiticity and all-q reciprocity checks, then selects representative
-rows before endpoint packing. Existing `q_wedge` metadata supplies the
-packed symmetry tables. This avoids the second full-q operator allocation
-at4560centroids/P4; default array callers retain their existing API.
-No Coulomb, head or fitting equations change. Four-GPU equivalence and
+`compute_V_q(..., return_qirr=True)` retains the already contracted canonical
+q parents instead of unfolding a full-zone operator. Finite and Gamma
+Hermiticity checks remain; the existing typed pair-reciprocity gate measures
+the same full-zone criterion without materializing every q. Endpoint packing
+acts only on representative rows, and existing `q_wedge` metadata supplies
+the packed symmetry tables. Default array callers retain their existing API.
+No Coulomb, head or fitting equations change. Four-rank equivalence and
 production exchange validation are pending on this feature branch.
 
 ## 2026-10-08 — fitting matrix completion and stored-row selection share one lifetime

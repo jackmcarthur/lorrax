@@ -2474,7 +2474,7 @@ def _compute_photon_vq(
 
 def _compute_scalar_vq(
         bgw_v_grid_fn, bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym,
-        vcoul_cutoff_ry, wfn, zeta_h5_path):
+        vcoul_cutoff_ry, wfn, zeta_h5_path, *, return_qirr=False):
     """Produce the scalar Coulomb operator and its live head views."""
     from .compute_vcoul import compute_all_V_q
     import contextlib
@@ -2503,6 +2503,7 @@ def _compute_scalar_vq(
                     sym=sym,
                     centroid_indices=_cent_idx_np,
                     g_chunk_size=int(cfg.memory.vq_g_chunk_size),
+                    return_qirr=return_qirr,
                 )
                 head_channel = _build_head_channel(
                     zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
@@ -2533,7 +2534,7 @@ def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
 
 def _finalize_vq_views(
         G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn,
-        *, return_qirr=False, sym=None, centroid_indices=None):
+        *, return_qirr=False, sym=None, centroid_indices=None, mesh_xy=None):
     """Produce the packed Coulomb operator and validate its physical invariants."""
     from common.collectives import gather_to_host as _gather_to_host
     G0_gathered = _gather_to_host(G0_all)
@@ -2541,30 +2542,49 @@ def _finalize_vq_views(
     while G0.ndim > 1:
         G0 = G0[0]
     print_fn(f"\n  V_q computed:")
-    _vq0_trace = float(jnp.trace(V_q_raw[0]).real)
-    print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
-    from common import sanity
-    sanity.check_finite("V_q", V_q_raw, print_fn=print_fn)
-    sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
-    sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
-    sanity.check_q_conjugate_reciprocity(
-        "V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
-        print_fn=print_fn)
-    sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
+    raw = None
     if return_qirr:
         from ffi import _services
         _services.ensure_on_path()
         from symmetry_maps import QirrOperator
+        raw = QirrOperator.of(V_q_raw)
+    raw_values = V_q_raw if raw is None else raw.values
+    raw_gamma = V_q_raw[0] if raw is None else raw.representative_row(0)
+    _vq0_trace = float(jnp.trace(raw_gamma).real)
+    print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
+    from common import sanity
+    sanity.check_finite("V_q", raw_values, print_fn=print_fn)
+    sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
+    sanity.check_hermitian("V_q[q=0]", raw_gamma, print_fn=print_fn)
+    if raw is not None and not raw.is_whole_zone():
+        # Existing pair-aware gate measures the same full-zone maximum under
+        # the typed unit-phase permutations, without materializing all q rows.
+        sanity.check_q_conjugate_pair(
+            "V_q[all q]", raw.values, raw.at_minus_q(meta.kgrid, mesh_xy),
+            rtol=1e-5, print_fn=print_fn)
+    else:
+        sanity.check_q_conjugate_reciprocity(
+            "V_q[all q]", raw_values, tuple(meta.kgrid), rtol=1e-5,
+            print_fn=print_fn)
+    sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
+    if return_qirr:
         from .v_q_g_flat import q_wedge
         wedge = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
                         context="bare V on the q wedge")
         template = (QirrOperator(values=None, **wedge[0])
                     if wedge is not None else None)
-        # Packing acts on endpoints independently of q. Restrict canonical
-        # full-zone rows before packing, avoiding two resident full operators.
+        if not raw.is_whole_zone():
+            if template is None or any(
+                    not np.array_equal(getattr(raw, key), getattr(template, key))
+                    for key in ('full_rows', 'irr_idx', 'sym_idx', 'q_irr_frac')):
+                raise ValueError("bare V: canonical and packed q domains differ")
+            if raw.n_sym_spatial != template.n_sym_spatial:
+                raise ValueError("bare V: canonical and packed spatial groups differ")
+        # Packing acts on endpoints independently of q. Keep canonical
+        # representative rows before packing, avoiding full-zone operators.
         # q_wedge owns the packed endpoint tables, including their load cache.
-        parents = (QirrOperator.of(V_q_raw).at_rows(template.full_rows)
-                   if template is not None else V_q_raw)
+        parents = (raw.at_rows(template.full_rows)
+                   if template is not None else raw.values)
         packed = (meta.mu_basis.pack_operator(parents)
                   if getattr(meta, 'mu_basis', None) is not None else parents)
         V_qmunu = (template.with_values(packed) if template is not None
@@ -2606,10 +2626,11 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	else:
 	    (V_q_raw, G0_all, head_channel) = _compute_scalar_vq(
 	        bgw_v_grid_fn, bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym,
-	        vcoul_cutoff_ry, wfn, zeta_h5_path)
+	        vcoul_cutoff_ry, wfn, zeta_h5_path, return_qirr=return_qirr)
 	return _finalize_vq_views(
 	    G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn,
-	    return_qirr=return_qirr, sym=sym, centroid_indices=centroid_indices)
+	    return_qirr=return_qirr, sym=sym, centroid_indices=centroid_indices,
+	    mesh_xy=mesh_xy)
 
 
 

@@ -1071,6 +1071,7 @@ def compute_all_V_q_g_flat(
     sym=None,
     centroid_indices: np.ndarray | None = None,
     budget_bytes: float | None = None,
+    return_qirr: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """V_q^{0,0} (charge-channel CC tile) on a G-flat-on-disk ζ file.
 
@@ -1162,6 +1163,15 @@ def compute_all_V_q_g_flat(
         policy = qgrid_trs_policy_for(
             sym=sym, irr_idx_q=irr, sym_idx_q=rows, kgrid=kgrid,
             n_sym_spatial=len(perm) // 2, context="scalar V consumer")
+        if return_qirr:
+            from symmetry_maps import QirrOperator
+            return QirrOperator(
+                values=V_q, irr_idx=np.asarray(irr),
+                sym_idx=np.asarray(policy.unfold_sym_idx),
+                sym_perm=np.asarray(perm), L_table=np.asarray(wraps),
+                q_irr_frac=np.asarray(q_frac),
+                n_sym_spatial=policy.n_sym_spatial,
+                full_rows=np.asarray(sym.q_irr_full_idx, np.int32)), g0
         V_q = unfold_isdf_operator(
             V_q, irr_idx=irr, sym_idx=policy.unfold_sym_idx,
             sym_perm=perm, L_table=wraps, q_irr_frac=q_frac,
