@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — the response streams' block accumulate no longer materializes its terms
+
+The XLA contour block accumulate (`gw.contour_accumulator.contour_block_accumulate_local`,
+which replaced the CUDA kernel on 2026-10-08) summed a chunk's terms as one unrolled chain,
+and XLA materialized every term's `[output, q, rows, cols]` product at once. On the Fe 4³
+forced-face bispinor SC deck at P4 (40 GB) the direct stream's peak went from 9.87 to
+45.23 GB and its compile from 11.1 to 66.8 s. It now adds one term per `fori_loop` step,
+in place on the accumulator. The peak is back to 9.87 GB (the CUDA kernel's); the direct
+dispatch is 13.8 s against the kernel's 9.0 s on Fe (0.97 against 0.69 s on CrI3 6×6), and
+W per map is 2-3 % slower. eqp is bitwise against both the chain and the kernel. No deck change.
+
 ## 2026-10-08 — the staged sector selection runs each round at once; held checks read one sample at a time again
 
 The staged route's CC/TT selection ran in sub-batches of the 1 GiB tile (3 parents for TT at
