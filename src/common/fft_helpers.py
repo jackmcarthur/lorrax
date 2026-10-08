@@ -168,7 +168,6 @@ def make_sharded_fftn_3d(
 # ============================================================================
 from ffi.fft import (  # noqa: E402,F401  (re-exported entry points)
     KConvStored,
-    chi_unfold_refusal,
     chi_unfold_scratch_bytes,
     kconv_backend,
     klead_outer_decode_refusal,

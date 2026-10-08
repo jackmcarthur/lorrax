@@ -1800,12 +1800,12 @@ def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordere
 
 def _direct_passes(wfns, meta, mesh_xy, q_count):
     """The charge direct stream's row passes (``w_isdf._direct_pass_plan``), or ``None``
-    when it does not run on mathdx mode 11 from raw parents."""
-    from .w_isdf import _chi_kconv_serves, _direct_pass_plan
+    without a raw-parent plan."""
+    from .w_isdf import _direct_pass_plan
     import minimax
     parent = wfns.green_parent
     kgrid, ns = (meta.nkx, meta.nky, meta.nkz), int(meta.nspinor)
-    if parent is None or not _chi_kconv_serves(mesh_xy, kgrid, ns):
+    if parent is None:
         return None
     return _direct_pass_plan(mesh_xy, kgrid, parent.plan, n_rmu=meta.mu_basis.n_packed, ns=ns,
                              n_band=int(wfns.slices.nb_full), q_count=q_count,
@@ -1873,10 +1873,7 @@ def _stream_scratch(wfns, meta, mesh_xy, vertex):
     parent = wfns.green_parent
     if parent is None:
         return 0
-    from .w_isdf import _chi_kconv_serves
     ns = int(meta.nspinor)
-    if not _chi_kconv_serves(mesh_xy, kgrid, ns):
-        return 0
     return int(chi0_kconv_scratch(kgrid=kgrid, n_parent=int(parent.plan.n_parent),
                                  n_rmu=meta.mu_basis.n_packed, ns=ns, mesh=mesh_xy))
 

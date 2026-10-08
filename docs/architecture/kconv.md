@@ -367,12 +367,9 @@ a pole field read from its q wedge, with the endpoint actions $\mathcal L_k$, $\
   sign, gives one quadrant's sign relative to the shared unfold tables.
 
 `make_kconv_chi_unfold`'s `complete` flag adds the complex-conjugate term,
-which a real-frequency contour needs. Where mode 11 cannot hold the grid
-(`ffi.fft.chi_unfold_refusal`), the scalar streams keep the full-k Green
-route (mode 3 on unfolded Greens, the trace in XLA) and announce it once
-(`gw.w_isdf._chi_kconv_serves`). The four-current stream builds its Greens only
-on the raw parents; a grid mode 11 cannot hold takes the XLA backend
-([router](#router)).
+which a real-frequency contour needs. A grid mode 11 cannot hold takes the
+XLA backend ([router](#router)): every grid whose split-arm plane tile fits
+holds mode 11 too.
 
 ## 6. Row passes and the `live` operand {#live-rows}
 
@@ -602,7 +599,7 @@ not of the traffic.
 | `GATE mathdx-kconv-axis` | handler | a direct mathdx call with a k-grid axis above 40 (`KCONV_AXIS_MAX`); the factories send such grids to the XLA backend | call through the factories |
 | `GATE mathdx-kconv-residency` | kernel build | a direct call of mode 0, 1 or 6 whose row exceeds the opt-in memory; the router streams such grids instead ([§8](#resident-rows)) | call through the router |
 | `GATE mathdx-kconv-kbox-residency` | kernel build | the tile, plane or pencil the launch rule picked exceeds the opt-in memory (modes 2, 3, 8, 9); one whole column exceeds it (modes 4 and 5, which have no split arm); a split plane tile of one spin group exceeds it (mode 7: $n_s = 4$ at 26³ and larger on A100) | none at the factories, which send these grids to the XLA backend ([router](#router)); reaching it means `mathdx_refusal` and the handler disagree |
-| `GATE mathdx-kconv-chi-residency` | kernel build | mode 11 cannot hold the grid | none here: `gw.w_isdf` asks `chi_unfold_refusal` first, so this gate means that predicate and the handler's rule disagree, which is a bug |
+| `GATE mathdx-kconv-chi-residency` | kernel build | mode 11 cannot hold the grid | none here: the router sends such grids to the XLA backend (`mathdx_refusal`), so this gate means that rule and the handler's disagree, which is a bug |
 | `GATE mathdx-kconv-unfold-scratch`, `-lorentz-scratch`, `-chi-scratch` | apply | XLA's scratch allocator refuses the split-arm intermediate of mode 7, 8 or 11 ([§7](#tiles)) | for mode 11, a smaller `scratch_bytes` |
 | `GATE mathdx-kconv-outer-tile`, `-outer-decode-tile`, `-outer-arch`, `-outer-rank` | kernel build | the BSE outer load's bank or accumulator does not fit, the device is older than sm_80, or K is not a multiple of 4 | call through the factories, which check `klead_outer_refusal` / `klead_outer_decode_refusal` and pad K |
 | `GATE mathdx-plane-split`, `mathdx-plane-residency` | kernel build | a direct mode-10 call on a plane with no split or too large | call through `make_plane_fft_gather` |

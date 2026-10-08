@@ -2462,8 +2462,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
            << ns << ", whose k-box " << (kplan.arm ? "split" : "single") << " arm needs " << chi_smem << " / "
            << chi_smem2 << " B; want <= " << smem_optin << " B of opt-in shared memory and plane tiles of whole "
               "spin groups; why: mode 11 forms each pair from its 2*ns^2 transformed columns; fix: none here -- "
-              "the chi0 route asks ffi.fft.chi_unfold_refusal first and keeps its face kernel for such a grid, "
-              "so reaching this gate means that predicate and this rule disagree";
+              "the router sends a grid whose split-arm plane tile does not fit to the XLA backend "
+              "(ffi.fft.mathdx_refusal), so reaching this gate means that rule and this one disagree";
         return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
     if (rb < 1) {

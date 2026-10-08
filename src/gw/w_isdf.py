@@ -116,8 +116,6 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     fused = (vertex_pairs is None and not fermi_dirac and face_shape is not None
              and right_face_shape is None and k_unfold_plan is not None
              and not isinstance(k_unfold_plan, tuple))
-    if fused:
-        fused = _chi_kconv_serves(mesh_xy, kgrid, int(face_shape[3]))
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
@@ -248,23 +246,6 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
     _PASS_PLANS[key] = plan_passes(plan.unfold_load_tables(), mesh_xy, ns=ns, row_bytes=row_bytes,
                                    chunk_bytes=2 * 16 * int(q_count) * mu * nu, n_nodes=n_nodes)
     return _PASS_PLANS[key]
-
-
-def _chi_kconv_serves(mesh_xy, kgrid, ns) -> bool:
-    """Whether mathdx mode 11 (``ffi.fft.make_kconv_chi_unfold``) holds this grid.
-
-    A grid it cannot hold (``ffi.fft.chi_unfold_refusal``) keeps the full-k
-    Green route; the refusal is announced once.
-    """
-    from common import fft_helpers as _F
-    why = (_F.chi_unfold_refusal(kgrid, int(ns))
-           if _F.kconv_backend(mesh_xy, kgrid) == "mathdx" else "")
-    if why:
-        from ffi.gate import announce_once
-        announce_once(("chi_unfold", tuple(kgrid), int(ns)),
-                      f"[chi0] k-grid {tuple(kgrid)} ns={int(ns)}: the full-k Green route, "
-                      f"not mathdx mode 11: {why}", scope="rank0")
-    return not why
 
 
 _PHOTON_PASS_PLANS: dict = {}
@@ -1138,8 +1119,7 @@ def _get_chi_fractional_contour_kernel_face(
     # band-complete ψ rows by one local GEMM, its kconv call on the pass only.
     chi_kconv = chi_tables = subtile = None
     kconv_serves = (selected_q is not None and photon is None and k_unfold_plan is not None
-                   and pair_mode in ("direct", "retarded", "kms_static")
-                   and _chi_kconv_serves(mesh_xy, grid, ns))
+                   and pair_mode in ("direct", "retarded", "kms_static"))
     if kconv_serves and pair_mode == "direct":
         import minimax
         px = int(mesh_xy.shape["x"])

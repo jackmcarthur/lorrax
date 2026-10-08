@@ -74,7 +74,7 @@ __all__ = [
     "klead_unfold_scratch_bytes",
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET", "live_row_mask",
-    "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET", "chi_unfold_refusal",
+    "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET",
     "chi_unfold_scratch_bytes", "make_kconv_chi_vertex", "KCONV_CHI_VERTEX_TARGET",
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
@@ -1920,37 +1920,11 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
     return fn
 
 
-def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
-    """Why mathdx mode 11 cannot serve this grid ("" when it can): the k-box residency rule.
-
-    The handler's build() refuses the same cases (GATE mathdx-kconv-chi-residency): the
-    single pass needs one pair's ``2 ns^2`` columns of ``16·((nx·ny·(nz|1))|1)`` B within
-    the opt-in shared memory per block; the split arm needs a 16-column plane tile of
-    ``16·((ny·(nz|1))|1)`` B each (its warp pencil stages nothing).  ``optin`` defaults to
-    the device's attribute.
-    """
-    nx, ny, nz = (int(v) for v in kgrid)
-    ns = int(ns)
-    have = _optin_smem_bytes() if optin is None else int(optin)
-    if have is None:
-        return "no CUDA driver to read the opt-in shared memory"
-    zp = nz | 1
-    rs, pr = (nx * ny * zp) | 1, (ny * zp) | 1
-    grp = 2 * ns * ns
-    if grp * rs * 16 <= have:
-        return ""
-    plane = 16 * pr * 16
-    if plane <= have:
-        return ""
-    return (f"a pair's {grp} columns need {grp * rs * 16} B resident, and the split arm's plane tile "
-            f"{plane} B; the device has {have} B of opt-in shared memory")
-
-
 def chi_unfold_scratch_bytes(kgrid, ns: int, tile_bytes: int, optin: int | None = None) -> int:
     """Per-rank bytes mode 11 draws from XLA's scratch allocator at run time.
 
-    The split arm (a pair's ``2 ns^2`` columns do not fit the opt-in shared memory, the
-    rule :func:`chi_unfold_refusal` reads) chunks its pairs through a ``(N_k, chunk·2ns²)``
+    The split arm (a pair's ``2 ns^2`` columns do not fit the opt-in shared memory)
+    chunks its pairs through a ``(N_k, chunk·2ns²)``
     intermediate bounded by ``scratch_bytes``. The default is at most 1 GiB
     or one local parent-Green tile, whichever is smaller, and at least one
     pair's full-k transform. Pair chunks own disjoint output entries; their
