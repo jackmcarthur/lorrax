@@ -89,6 +89,17 @@ def test_changed_canonical_geometry_refuses(monkeypatch):
             store.authenticate_bank_geometry(mutated, meta=None, tables=None)
 
 
+@pytest.mark.parametrize('field,value', [('iteration_id','sc_001'),
+    ('wavefunctions','qp_rotation_unreceipted'), ('authentication','NON-AUTHENTICATING'),
+    ('hamiltonian','sc_map_001')])
+def test_equal_unauthenticated_markers_in_both_states_refuse(field, value):
+    old, bank = resolved(5500)
+    new, model = resolved(8000)
+    bank[field] = model[field] = value
+    with pytest.raises(ValueError, match='shared_pole_sc_restart'):
+        authenticate_cap_only_replay(old, new, bank, model)
+
+
 def test_default_constructor_still_refuses_changed_cap_hash(monkeypatch):
     import file_io.shared_pole_store as store
     from gw.shared_pole_constructor import construct_shared_poles

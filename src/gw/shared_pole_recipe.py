@@ -739,12 +739,7 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
     """
     from pathlib import Path
 
-    if (str(expected_identity.get('iteration_id', '')).startswith('sc_')
-            or expected_identity.get('wavefunctions') == 'qp_rotation_unreceipted'
-            or expected_identity.get('authentication') == 'NON-AUTHENTICATING'
-            or str(expected_identity.get('hamiltonian', '')).startswith('sc_map_')):
-        raise ValueError("GATE shared_pole_sc_restart: SC models are scratch-only and "
-                         "NON-AUTHENTICATING; rebuild A/B/C on every map")
+    assert_oneshot_shared_pole_identity(expected_identity)
     from file_io.tagged_arrays import (
         read_shared_pole_restart_member, SharedPoleMemberMissing,
         SharedPoleMemberRefused,
@@ -1020,6 +1015,16 @@ def parse_pole_budget(value, *, model="shared_pole", accuracy="production"):
     return budget
 
 
+def assert_oneshot_shared_pole_identity(identity):
+    """The single restart/replay door excludes unauthenticated SC states."""
+    if (str(identity.get('iteration_id', '')).startswith('sc_')
+            or identity.get('wavefunctions') == 'qp_rotation_unreceipted'
+            or identity.get('authentication') == 'NON-AUTHENTICATING'
+            or str(identity.get('hamiltonian', '')).startswith('sc_map_')):
+        raise ValueError('GATE shared_pole_sc_restart: SC models are scratch-only and '
+                         'NON-AUTHENTICATING; rebuild A/B/C on every map')
+
+
 def _fixed_pole_budget_hash(table, budget):
     return hashlib.sha256(
         (table + '|fixed-body-pole-budget-v1|' + str(budget)).encode()).hexdigest()
@@ -1058,8 +1063,8 @@ def authenticate_cap_only_replay(stored, current, bank_identity, model_identity)
         expected = _fixed_pole_budget_hash(RECIPE_HASH, budget)
         if recipe.get('recipe_hash') != expected or identity.get('recipe_hash') != expected:
             refuse('noncanonical cap-dependent recipe or identity hash')
-        if (str(identity.get('iteration_id', '')).startswith('sc_')
-                or any(not isinstance(identity.get(k), str) or not identity[k]
+        assert_oneshot_shared_pole_identity(identity)
+        if (any(not isinstance(identity.get(k), str) or not identity[k]
                        for k in ('iteration_id', 'hamiltonian', 'energies',
                                  'occupations', 'wavefunctions', 'centroids', 'gate_hash'))
                 or identity['gate_hash'] != GATE_HASH):
