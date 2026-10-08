@@ -119,7 +119,8 @@ def _pencil(lo, hi, poles, tol, decay_rate):
     return eta, zps, geometry, size
 
 
-def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None):
+def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None,
+                  mass_seeds=None):
     """Complex times shared by every pole, or None.
 
     A stacked (multi-channel) Hankel shift pencil: each pole contributes the
@@ -175,11 +176,31 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
             if fits is not None:
                 return times, fits
             if mass_rejected:
+                if mass_seeds is not None:
+                    mass_seeds.append(times.copy())
                 break  # Try the next padding/flattening geometry, not more cancelling terms.
             if error < best/10:
                 best, best_n = error, n
             elif patience is not None and n - best_n >= patience:
                 break  # No decade of accuracy in this many more exponentials.
+    return None
+
+
+def _refine_mass_times(lo, hi, poles, seeds, tol, decay_rate):
+    """Refit less-damped proposals after the existing construction refuses.
+
+    Positive real times suppress basis columns near a resonance and can
+    force large cancelling coefficients. Shrinking only their real parts
+    proposes another bounded exponential basis; the physical domain,
+    reference, value/slope error and coefficient-mass gates are unchanged.
+    Each seed already fits the error gate, and retains its node capacity.
+    """
+    for times in seeds:
+        for shrink in (.975, .95, .9, .85, .75, .5, .25, 0.):
+            candidate = shrink*times.real + 1j*times.imag
+            fits, _, _ = _fits(lo, hi, poles, candidate, tol, decay_rate)
+            if fits is not None:
+                return candidate, fits
     return None
 
 
@@ -263,6 +284,9 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     (``_imaginary_times``) when that fits the pencil's capacity, else is split
     in halves, down to single samples; a group whose pencil is wider than both
     halves' is split without a try.
+    Only at a final single-pole refusal, mass-rejected pencil proposals are
+    refitted with less real decay under the same error and mass gates. The
+    preceding successful construction and splitting paths are unchanged.
     A successful shared rule can use more nodes than one member would need
     alone; its Green-pair evaluations serve all members of the group.
 
@@ -300,8 +324,13 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
             # samples reaching 22-42 eV; CHIRULE 2026-10-06), so the halves
             # are built directly, exactly as they were after that failure.
             return build(members[:half]) + build(members[half:])
-        got = _shared_times(lo, hi, poles, rel_tol/2, old.get(frozenset(members)), decay_rate,
-                            patience=None if len(members) == 1 else _STAGNATION_NODES)
+        shared_mass_seeds = []
+        if len(members) == 1:
+            got = _shared_times(lo, hi, poles, rel_tol/2, old.get(frozenset(members)),
+                                decay_rate, mass_seeds=shared_mass_seeds)
+        else:
+            got = _shared_times(lo, hi, poles, rel_tol/2, old.get(frozenset(members)), decay_rate,
+                                patience=_STAGNATION_NODES)
         if got is None:
             # Where the pencil fails, the closed-form imaginary-axis set serves
             # every pole when it fits the pencil's capacity (two pencils' for
@@ -317,7 +346,16 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
             sets = []
             for pole in poles:
                 one = np.asarray([pole])
-                got = _shared_times(lo, hi, one, rel_tol/2, None, decay_rate)
+                mass_seeds = []
+                got = _shared_times(lo, hi, one, rel_tol/2, None, decay_rate,
+                                    mass_seeds=mass_seeds)
+                if got is None:
+                    shared = _refine_mass_times(lo, hi, poles, shared_mass_seeds,
+                                                rel_tol/2, decay_rate)
+                    if shared is not None:
+                        rule = _rule(z[members], [(shared[0], poles, shared[1])])
+                        return [dict(rule, members=list(members), reference_ry=reference)]
+                    got = _refine_mass_times(lo, hi, one, mass_seeds, rel_tol/2, decay_rate)
                 if got is None:
                     raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
                                      f'sample={z[members[0]]}, pole={pole}, tolerance={rel_tol}')
