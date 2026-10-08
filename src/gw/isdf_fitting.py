@@ -2,6 +2,7 @@ import gc
 import os
 import subprocess
 import time
+from functools import lru_cache
 from typing import NamedTuple
 
 import numpy as np
@@ -48,6 +49,37 @@ _NVSMI_LAST_MB = 0
 
 
 
+
+
+
+@lru_cache(maxsize=32)
+def _get_c_q_finish_kernel(flat_shard, nq, nmu_padded, nmu_solve,
+                           nmu_logical, active_mask, q_neg_idx, q_stored_idx):
+    """Finish C and select stored rows in one compiled lifetime.
+
+    Host geometry is the cache key. Only the C array is donated; no output
+    or numerical buffer is retained. Fusion avoids an eager full-q identity
+    copy before the smaller IBZ result. Donation is not an alias guarantee
+    when the stored-row output has another shape.
+    """
+    mask = np.asarray(active_mask, dtype=bool)
+    neg = None if q_neg_idx is None else np.asarray(q_neg_idx, dtype=np.int32)
+    stored = None if q_stored_idx is None else np.asarray(q_stored_idx, dtype=np.int32)
+
+    def finish(C_q):
+        C = jax.lax.with_sharding_constraint(
+            C_q.reshape(nq, nmu_padded, nmu_padded), flat_shard)
+        if nmu_solve == nmu_padded and nmu_padded > nmu_logical:
+            C = add_pad_diagonal_sharded(C, mask, float(nmu_logical),
+                                        mesh_xy=flat_shard.mesh)
+        if neg is not None:
+            C = complete_ordered_pair_normal_equations(C, neg)
+        if stored is not None:
+            from symmetry_maps import slice_q_full_to_ibz
+            C = slice_q_full_to_ibz(C, stored, out_sharding=flat_shard)
+        return C
+
+    return jax.jit(finish, out_shardings=flat_shard, donate_argnums=(0,))
 
 
 def mem_probe(label, *, only_rank0=True):
@@ -859,27 +891,24 @@ def fit_zeta_to_h5(
                     part = w * part
                 C_q = part if C_q is None else C_q + part
                 del part
-            C_q_flat = jax.lax.with_sharding_constraint(
-                C_q.reshape(1 if selected_q is not None else nq, n_rmu_padded, n_rmu_padded), flat_shard)
+            # The equations and pad -> LR/RL -> stored-row order are
+            # unchanged. One compiled lifetime avoids the eager full-q
+            # sharding identity's input/output double residence.
+            _finish_neg = (_q_neg_idx if _q_neg_idx is not None
+                           and not _per_pair_completion else None)
+            _finish_stored = (sym.q_irr_full_idx if selected_q is None
+                              and write_ibz_only
+                              and getattr(sym, 'q_irr_full_idx', None) is not None
+                              else None)
+            _finish_c = _get_c_q_finish_kernel(
+                flat_shard, 1 if selected_q is not None else nq,
+                n_rmu_padded, n_rmu_solve, n_rmu,
+                tuple(bool(v) for v in (mu_basis.active_mask if mu_basis is not None
+                                        else np.ones(n_rmu_padded, dtype=bool))),
+                None if _finish_neg is None else tuple(map(int, _finish_neg)),
+                None if _finish_stored is None else tuple(map(int, _finish_stored)))
+            C_q_flat = _finish_c(C_q)
             del C_q
-            if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
-                # Interleaved pad slots (orbit-packed order): C_q's pad rows and
-                # columns are exact zeros.  Put C's own MEAN DIAGONAL (tr C/n per
-                # q) on the pad diagonal: the factor is nonsingular, Z's zero pad
-                # rows give zeta_pad = 0, and the pad eigenvalues sit inside the
-                # active spectrum (a unit pad would BE lambda_max when C's scale
-                # is small, and the cut would drop real modes: Si leg 20, 39 meV).
-                # Rank-local by construction (Fe3GeTe2 P36/P16 OOM, 2026-09-21).
-                C_q_flat = add_pad_diagonal_sharded(
-                    C_q_flat, mu_basis.active_mask, float(n_rmu), mesh_xy=mesh_xy)
-            if _q_neg_idx is not None and not _per_pair_completion:
-                C_q_flat = complete_ordered_pair_normal_equations(
-                    C_q_flat, _q_neg_idx)
-            # IBZ cascade: slice C_q to the stored rows before the per-q factor.
-            if selected_q is None and write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-                from symmetry_maps import slice_q_full_to_ibz
-                C_q_flat = slice_q_full_to_ibz(
-                    C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
             C_q_flat.block_until_ready()
 
         with timing.section("zeta_fit.cholesky"):

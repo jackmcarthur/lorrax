@@ -5,6 +5,14 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — fitting matrix completion and stored-row selection share one lifetime
+
+The fit now compiles its existing C reshape/sharding, pad diagonal, ordered
+pair completion and IBZ row selection together. This removes the eager
+full-q identity copy seen at4560centroids/P4. Physics, solve threshold,
+centroid selection, file schema and gates are unchanged. Numerical and
+buffer validation is pending on the feature branch; no main release claim.
+
 ## 2026-10-08 — bounded held-sample screening diagnostics
 
 The shared-pole round exposes its existing held W and dW/ds evaluation as
