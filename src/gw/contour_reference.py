@@ -636,7 +636,12 @@ def prepare_real_residue_hermite7_grid(x, occ, nodes, *, eta, n_active=None,
     d/ds, s=z_Ry²; convert through 2z before the occupied partner's dagger.
     No interpolated endpoint or sampled-response error bound is supplied.
     """
-    checked = prepare_real_residue_grid(x, occ, nodes, eta=eta, n_active=n_active,
+    xh, fh = _inputs(x, occ, eta)
+    active, residue = _residue_weights(xh, fh, n_active, band_valid)
+    # Inactive/native-ghost energies cannot define support or overflow the
+    # polynomial geometry. No physical nonzero residue is replaced.
+    safe_x = np.where(active & (residue != 0), xh, 0.)
+    checked = prepare_real_residue_grid(safe_x, fh, nodes, eta=eta, n_active=n_active,
         band_valid=band_valid, spacing=spacing, analytic_convention=analytic_convention, xp=xp)
     nodes = np.asarray(nodes, np.float64)
     stride = checked.stride
@@ -644,11 +649,10 @@ def prepare_real_residue_hermite7_grid(x, occ, nodes, *, eta, n_active=None,
     count = 1+(len(nodes)-1)//stride
     if count < 4:
         raise ValueError("H7 residue grid requires four actual available knots")
-    xh, fh = _inputs(x, occ, eta)
-    active, residue = _residue_weights(xh, fh, n_active, band_valid)
-    interval = np.minimum(np.floor(abs(xh)/h).astype(np.int64), count-2)
+    query = abs(safe_x)
+    interval = np.minimum(np.floor(query/h).astype(np.int64), count-2)
     start = np.clip(interval-1, 0, count-4)
-    t = abs(xh)/h-start
+    t = query/h-start
     value_coeff, slope_coeff = [], []
     for j in range(4):
         lagrange = np.ones_like(t)
