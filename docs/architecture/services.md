@@ -31,7 +31,7 @@ A capability is a service when it has all four of:
 |---|---|---|---|---|
 | **`file_io.slab_io`** | `SlabIO(path, *, mode, mesh)` → `create_dataset` / `write_slab` / `read_slab` / `read_slabs` | the phdf5 handler, its MPI and HDF5, Lustre striping, collective buffering | **no**, by design ([below](#choice)) | [SlabIO](slab_io.md) |
 | **`ffi.io`** | `open_file(path, *, mesh, mode)` → `write_sharded_slab` / `read_sharded_slab` / `read_kchunk_union_sharded` | CUDA or host library, from the mesh's devices | no | [FFI layer §5](ffi_layout.md); SlabIO is its only transport consumer |
-| **`ffi.fft`** (entered through `common.fft_helpers`) | the k-convolution router's factories (`make_fused_conv_kpair`, `make_kconv_klead`, `make_kfft_klead`, …) and `make_flat_k_fft` | nvidia-mathdx on CUDA; FFTW3-ABI plans on cpu | no: the mesh platform decides, and no variable or deck key selects a route | [k-convolution family](kconv.md#router) |
+| **`ffi.fft`** (entered through `common.fft_helpers`) | the k-convolution router's factories (`make_fused_conv_kpair`, `make_kconv_klead`, `make_kfft_klead`, …) and `make_flat_k_fft` | nvidia-mathdx on CUDA; FFTW3-ABI plans on cpu; the XLA backend (`jnp.fft`) elsewhere | no: the device vendor decides, and no variable or deck key selects a route | [k-convolution family](kconv.md#router) |
 | **`ffi.gemm`** | `gemm_batch(a3, b3)` inside the caller's own `shard_map` | the CBLAS provider, and whether it has a batched entry | no: `LORRAX_BANDS_GEMM_FFI` is on/off, cpu only | `src/ffi/gemm.py` |
 | **`distrib_la`** | `plan(op, mesh_xy, *, backend=…)` → `plan(A_tile)` / `plan.batched(A_stack)`, plus `matmul`, `gemm_plan` | ScaLAPACK, SLATE, cuSOLVERMp, cuBLASMp or native, per op, machine and mesh geometry | **yes**, by design, through the `linalg` deck key ([below](#choice)) | [`distrib_la`](../services/distrib_la/api.md) |
 | **`wfn_loader`** | `WfnLoader(path, *, mesh=None, backend='auto')` | `eager` (h5py) or `phdf5` (one collective read through `SlabIO.read_slabs`) | escape hatch only: `LORRAX_WFN_BACKEND` | [`wfn_loader`](../services/wfn_loader.md) |
@@ -78,9 +78,9 @@ or a plan; a `src/` import of one fails `tests/test_layering.py`.
 The distrib_la benches in `services/distrib_la/bench/` import
 `distrib_la._cusolvermp` directly.
 
-`ffi.gate` is the mechanism, not a service: the resolver behind the two
-environment dials, `LORRAX_FFT_FFI` (cpu flat-k FFT) and
-`LORRAX_BANDS_GEMM_FFI`. `distrib_la` does not use it, because its choice
+`ffi.gate` is the mechanism, not a service: `lxkit.gate`, the resolver behind
+the environment dial `LORRAX_BANDS_GEMM_FFI` and the owner of the vendor
+platform key. `distrib_la` does not use its dials, because its choice
 comes from the deck and it resolves once from arguments.
 
 Not services, although callers find them beside the services:
@@ -114,10 +114,9 @@ the cause. The vocabularies and the resolution policy are on the
 byte-identical: the choice cannot change an answer.
 
 **The FFT and GEMM paths expose no backend choice.** The k-convolution router
-picks its backend from the mesh platform alone. `LORRAX_FFT_FFI` and
-`LORRAX_BANDS_GEMM_FFI` are capability switches on cpu: `LORRAX_FFT_FFI=0`
-refuses, and `LORRAX_BANDS_GEMM_FFI=0` selects an announced debug fallback.
-A vendor route is kept only where it beats the XLA path
+picks its backend from the device vendor alone. `LORRAX_BANDS_GEMM_FFI` is a
+capability switch on cpu; `=0` selects an announced XLA fallback. A vendor
+route is kept only where it beats the XLA path
 ([XLA reference ruling](decisions.md#xla-reference)).
 
 **The rule.** Expose a choice only where the alternatives have different

@@ -389,7 +389,7 @@ class GWProductionReport:
     def environment(self, *, config, wfn) -> None:
         f = self.runtime.facts
         backend = str(f.get("backend", "unknown")).lower()
-        platform = "CUDA" if backend in ("gpu", "cuda") else backend
+        platform = f.get("ffi_platform", backend)       # the device vendor's FFI key
         self.heading("Numerical environment")
         for line in numerical_environment_lines(self.runtime):
             self.emit(line)
@@ -398,20 +398,12 @@ class GWProductionReport:
 
         # Report only controls with a caller in this calculation.  The
         # k-convolutions (Σ, ζ fit, ladder-W) have no dial: the router picks
-        # nvidia-mathdx on CUDA and the plan route on cpu (decisions.md
-        # 2026-09-24) and announces that choice at startup.
-        relevant = {"LORRAX_FFT_FFI", "LORRAX_BANDS_GEMM_FFI"}
+        # nvidia-mathdx on CUDA, the host plan route on cpu and the XLA backend
+        # elsewhere, and announces
+        # that choice at startup.
+        relevant = {"LORRAX_BANDS_GEMM_FFI"}
         descriptions = {
-            "LORRAX_FFT_FFI": "flat-k FFTs for ISDF and chi0",
             "LORRAX_BANDS_GEMM_FFI": "right-GEMM contraction forming G(tau)",
-        }
-        cuda_engines = {
-            "LORRAX_FFT_FFI": "cuFFT flat-k FFI",
-        }
-        host_engines = {
-            # The host FFT target resolves its linked FFTW3-ABI engine inside
-            # the library; RuntimeFacts intentionally does not guess a vendor.
-            "LORRAX_FFT_FFI": "host flat-k FFT FFI",
         }
         for dial in f.get("ffi_dials", ()):
             name = str(dial.get("env", ""))
@@ -423,19 +415,16 @@ class GWProductionReport:
                 implementation = str(dial.get("off_label") or "JAX/XLA lowering")
             elif dial.get("enabled"):
                 state = "ON"
-                engine_names = (cuda_engines if platform == "CUDA"
-                                else host_engines)
-                implementation = engine_names.get(
-                    name, str(dial.get("target") or "platform FFI kernel"))
+                implementation = str(dial.get("target") or "platform FFI kernel")
             else:
                 state = "OFF"
                 implementation = str(dial.get("off_label") or "default lowering")
             self.emit(f"{name:<26} = {state:<6} : "
                       f"{descriptions[name]} ({implementation})")
-        # The k-convolution router has no dial: it answers by platform
-        # (decisions.md 2026-09-24), so the report names the engine it picks.
+        # The k-convolution router has no dial: it answers by device vendor,
+        # so the report names the engine it picks.
         kconv = {"CUDA": "nvidia-mathdx fused cuFFTDx kernels",
-                 "cpu": "MKL flat-k plan route"}.get(platform, "no backend on this platform")
+                 "cpu": "FFTW3-ABI host plan route"}.get(platform, "XLA, jnp.fft k-axis transforms")
         self.emit(f"{'k-convolution router':<26} = {platform:<6} : "
                   f"k-axis convolutions of the zeta fit and Sigma ({kconv})")
 

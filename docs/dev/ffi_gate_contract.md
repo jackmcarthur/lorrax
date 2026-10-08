@@ -3,21 +3,20 @@
 One resolver for every env-gated, rank-local FFI capability: a handler called
 inside somebody else's `shard_map`, holding no communicator. Source:
 `services/lxkit/src/lxkit/gate.py`; `src/ffi/gate.py` re-exports it with the
-probe bound to `ffi_loader.probe_target`. Both gates default on, and a missing library refuses at
+probe bound to `ffi_loader.probe_target`. The one gate defaults on, and a missing library refuses at
 startup; XLA is the reference path a gated handler is checked against
 ([decisions](../architecture/decisions.md#xla-reference)).
 
 | gate | declared in | platforms | default | `=0` (`off_policy`) |
 |---|---|---|---|---|
 | `LORRAX_BANDS_GEMM_FFI` | `ffi/gemm.py` | cpu | `on` | `fallback`: announced, uncertified XLA einsum arm, retained because `extra="minor"` cannot ride a batched GEMM ([vendor GEMM](vendor_gemm_service.md)) |
-| `LORRAX_FFT_FFI` | `ffi/fft.py` | cpu | `on` | `refuse`: the XLA flat-k arm is deleted |
 
-On CUDA neither dial exists (`silent_platform_demote`): XLA's dot already
-calls cuBLAS, and the flat-k transform and k-convolutions belong to the
-k-convolution router. The router is not a `Gate`: `ffi.fft.kconv_backend(mesh)`
-returns `mathdx` on CUDA and `plan` on cpu and refuses any other platform, and
-`require_kconv(mesh)` checks the nvidia-mathdx wheel and its targets (CUDA) or
-the flat-k plan target (cpu) at startup ([FFI layout](../architecture/ffi_layout.md)).
+On CUDA the dial does not exist (`silent_platform_demote`): XLA's dot already
+calls cuBLAS. The k-convolution router is not a `Gate`:
+`ffi.fft.kconv_backend(mesh)` returns `mathdx` on CUDA, `plan` on cpu and
+`xla` elsewhere, and `require_kconv(mesh)` checks the nvidia-mathdx wheel and
+its targets (CUDA) or the host plan targets (cpu) at startup
+([k-convolution router](../architecture/kconv.md#router)).
 Every operation's engines, gate and code: the
 [kernel operations](../architecture/ffi_layout.md#kernel-operations) table;
 every target: the [kernel catalog](../architecture/ffi_layout.md#kernel-catalog).
@@ -85,8 +84,7 @@ serve this handler, which is also what a directly constructed wrapper asks.
 
 Refusal is two-phase. Platform and handler are checked at resolve time;
 operand dtype, rank and extent are trace-time facts and are refused in the
-wrapper body (`ffi.fft.make_flat_k_fft_ffi`'s traced wrapper,
-`contract_bands._ffi_dtypes_ok`).
+wrapper body (`contract_bands._ffi_dtypes_ok`).
 
 ### Who announces
 

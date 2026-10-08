@@ -43,7 +43,7 @@
 #   mklfft     Intel DFTI descriptor API NOT AVAILABLE.  DFTI is Intel-only
 #                                        and LibSci does not implement it, so
 #                                        the flat-k FFT handlers are SKIPPED
-#                                        here and LORRAX_FFT_FFI refuses at
+#                                        here and ffi.fft.require_kconv refuses at
 #                                        startup.  See the FFT note below.
 #   slate      slate:: C++ templates     ICL SLATE, gpu_backend=none, built
 #                                        against LibSci + cray-mpich.
@@ -76,12 +76,10 @@
 # ----------------------------------------------------------------------------
 # THE FFT GAP — read this before wondering why a CPU run refuses at startup
 # ----------------------------------------------------------------------------
-# src/ffi/fft.py declares LORRAX_FFT_FFI with default="on" and
-# off_policy="refuse" (the native XLA flat-k arm was DELETED under the
-# FFI-required ruling, decisions.md 2026-08-01), and
-# runtime._enforce_required_ffi() calls Gate.enforce() at startup step 6b.
-# With no DFTI provider the target lorrax_mklfft_flat_k does not exist, so a
-# CPU-mesh run REFUSES at startup and `LORRAX_FFT_FFI=0` refuses too.
+# The k-convolution router's cpu backend is these host FFT handlers, and
+# ffi.fft.require_kconv() checks them at startup step 6b.  With no FFT provider
+# the target lorrax_mklfft_flat_k does not exist, so a CPU-mesh run REFUSES at
+# startup.
 #
 # THE FIX IS NOT MKL.  It is a second, vendor-neutral FFT backend against the
 # standard FFTW3 advanced interface (fftw_plan_many_dft), which cray-fftw
@@ -95,7 +93,7 @@
 # DFTI source-lock is gone and lorrax_mklfft_flat_k is exported by this host
 # library.  The engine is found at RUN time — dlsym for the entry points,
 # dlopen for the library that defines them — so an absent FFTW3 costs the FFT
-# handlers and nothing else, and LORRAX_FFT_FFI refuses at startup naming both
+# handlers and nothing else, and ffi.fft.require_kconv refuses at startup naming both
 # the unresolved symbol and every candidate it tried.  It is NOT a link-time
 # dependency; GATE 5 (scripts/verify_ffi_build.sh) enforces that, and the
 # note at LORRAX_PM_FFTW
@@ -146,7 +144,7 @@ LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
 #
 # On an MKL site this module is unnecessary -- MKL exports the FFTW3 C
 # interface natively from libmkl_intel_lp64 and the ladder never reaches
-# dlopen.  With no engine reachable at all, LORRAX_FFT_FFI refuses at STARTUP
+# dlopen.  With no engine reachable at all, ffi.fft.require_kconv refuses at STARTUP
 # naming the unresolved symbol and every non-FFT handler still works.
 LORRAX_PM_FFTW="${LORRAX_PM_FFTW:-cray-fftw}"
 LORRAX_PM_CMAKE="${LORRAX_PM_CMAKE:-cmake}"
@@ -251,7 +249,7 @@ if [[ -z "$LORRAX_PM_FFTW_LIB" ]]; then
     echo "[build_ffi_host] NOTE: no libfftw3.so found via FFTW_DIR/FFTW_ROOT." >&2
     echo "[build_ffi_host]   The FFT handlers still build; the runtime dlopen" >&2
     echo "[build_ffi_host]   ladder will fall back to portable SONAMEs, and" >&2
-    echo "[build_ffi_host]   LORRAX_FFT_FFI refuses at startup if none loads." >&2
+    echo "[build_ffi_host]   ffi.fft.require_kconv refuses at startup if none loads." >&2
 else
     echo "[build_ffi_host] fftw3 runtime dlopen hint: $LORRAX_PM_FFTW_LIB"
 fi

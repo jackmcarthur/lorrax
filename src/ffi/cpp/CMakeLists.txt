@@ -1203,7 +1203,7 @@ endif()
 #  fftw in DT_NEEDED).  This leg only records a found FFTW3 as the
 #  compile-time absolute-path hint that heads the ladder.  A process with no
 #  engine refuses at its first host FFT, naming every candidate tried; the
-#  startup gate (LORRAX_FFT_FFI, Gate.enforce) checks only the exported
+#  startup gate (ffi.fft.require_kconv) checks only the exported
 #  handler symbol.  The TU is compiled -fopenmp for its chunk-loop threading.
 # ----------------------------------------------------------------------------
 option(LORRAX_HOST_HAVE_FFTW3
@@ -1256,7 +1256,7 @@ endif()
 # itself and resolves every entry point by dlsym, so it needs no vendor
 # header and no vendor library at COMPILE time.  Whether an engine is
 # actually present is a RUN-time question, answered by the dlsym table and
-# reported by LORRAX_FFT_FFI's announce-or-refuse.
+# reported by ffi.fft.require_kconv at startup.
 set(_mklfft_on 1)
 if(_fftw3_on)
     message(STATUS
@@ -1270,7 +1270,7 @@ else()
         "(fftw_plan_many_dft) resolved at runtime by dlsym.  No standalone "
         "FFTW3 linked; this is CORRECT on an MKL site (libmkl_intel_lp64 "
         "exports the FFTW3 C interface natively).  On a non-MKL site load "
-        "cray-fftw (or any FFTW3) and reconfigure, or LORRAX_FFT_FFI will "
+        "cray-fftw (or any FFTW3) and reconfigure, or ffi.fft.require_kconv will "
         "refuse at startup naming the unresolved symbol.")
 endif()
 

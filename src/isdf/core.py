@@ -155,7 +155,7 @@ def _conv_kpair_static_gamma(gamma, ns: int):
 
 def _conv_kpair_setup(mesh_xy, kgrid, ns, gamma_L, gamma_R):
 	"""The k-convolution router's post-pair callable for this mesh, and its cache key."""
-	from ffi.fft import make_fused_conv_kpair
+	from common.fft_helpers import make_fused_conv_kpair
 
 	p_l, ph_l = _conv_kpair_static_gamma(gamma_L, ns)
 	p_r, ph_r = _conv_kpair_static_gamma(gamma_R, ns)
@@ -1097,7 +1097,7 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 	"""
 	from common.gamma_matrices import gamma_perm_phase_host
 	from distrib_la import gemm_plan
-	from ffi.fft import make_fused_conv_kparent
+	from common.fft_helpers import make_fused_conv_kparent
 
 	half, parity = plan.dirac_halves()  # authenticates diag(U, parity*U)
 	np_, _, mu, nb = map(int, psi_mun.shape)
@@ -1206,7 +1206,7 @@ def c_q_from_psi_sm(
 	py = int(mesh_xy.shape['y'])
 	mu_loc = mu_pk // px
 	col_loc = mu_pk // py
-	from ffi.fft import make_fused_conv_kparent
+	from common.fft_helpers import make_fused_conv_kparent
 	p_l, ph_l = _conv_kpair_static_gamma(None, s_)
 	p_r, ph_r = _conv_kpair_static_gamma(None, s_)
 	pair_kernel = make_fused_conv_kparent(

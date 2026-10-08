@@ -3,7 +3,8 @@
 // (fftw_plan_many_dft), bound at RUN time by dlsym to whichever FFTW3 engine
 // the process has (MKL's FFTW3 export, cray-fftw, FFTW, AOCL; the ladder and
 // its refusal are docs/architecture/ffi_layout.md §3c).  Nothing FFT is
-// linked.  Required on cpu meshes (LORRAX_FFT_FFI, default on; =0 refuses).
+// linked.  The k-convolution router's cpu (plan) backend; required at startup
+// by ffi.fft.require_kconv on a cpu mesh.
 //
 // WHY: XLA:CPU's fft custom call needs the transformed axes minor-most, while
 // the Σ τ tiles live k-major in "dot layout" (nk, s, μ_X, s', μ_Y); XLA would
@@ -236,8 +237,8 @@ struct DescKey {
 //                                        retry.  Nothing is added to
 //                                        DT_NEEDED, so failure here costs the
 //                                        FFT handlers and NOTHING ELSE.
-//      stage 3  refuse, loudly         -- LORRAX_FFT_FFI's startup
-//                                        announce-or-refuse, naming the
+//      stage 3  refuse, loudly         -- the router's startup check
+//                                        (require_kconv), naming the
 //                                        symbol AND every candidate tried.
 //
 //  The candidate list is ordered most-specific-first.  LORRAX_FFTW3_SO_HINT is
@@ -246,9 +247,8 @@ struct DescKey {
 //  LORRAX_FFTW3_SO is deployment plumbing (GATES.md's "not gates" list), for a
 //  site whose SONAME nobody guessed; it is not a gate and selects nothing
 //  numerically -- every candidate implements the same FFTW3 advanced ABI.
-//   * NO NEW ENVIRONMENT VARIABLE.  Deliberate.  LORRAX_FFT_FFI still
-//     announces-or-refuses, and since the 2026-08-01 FFI-required ruling
-//     that refusal fires at STARTUP via Gate.enforce.
+//   * NO NEW ENVIRONMENT VARIABLE.  Deliberate.  A missing handler refuses
+//     at STARTUP via ffi.fft.require_kconv.
 //   * ABSENCE IS LOUD.  A missing engine is a refusal naming the symbol,
 //     never a silent demotion to a slower path and never a wrong number.
 // ---------------------------------------------------------------------------

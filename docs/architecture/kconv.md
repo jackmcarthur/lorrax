@@ -82,25 +82,32 @@ launch-bound 4³ grids (1.19×).
 
 ## 2. The router {#router}
 
-The factory picks the backend from the mesh platform alone
-(`ffi.fft.kconv_backend`):
+The factory picks the backend from the mesh's device vendor alone
+(`ffi.fft.kconv_backend`, the vendor from `lxkit.device_vendor`):
 
-| mesh platform | backend |
+| device vendor | backend |
 |---|---|
 | CUDA | the nvidia-mathdx kernel family in `liblorrax_ffi.so`: `src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`, and `kconv_outer_cuda_ffi.cc` for the BSE outer-product load |
-| cpu | the plan route: the FFTW3-ABI host handlers of `liblorrax_ffi_host.so` (`lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv`, [FFI layer §3c](ffi_layout.md#3c-which-fft-engine-the-host-library-binds)) composed with XLA elementwise work |
-| any other | refusal, `GATE kconv-platform` |
+| cpu | the plan backend: the reference composition of each mode (the same unfolds, products and spin sums in XLA) with the FFTW3-ABI host handlers of `liblorrax_ffi_host.so` (`lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv`, [FFI layer §3c](ffi_layout.md#3c-which-fft-engine-the-host-library-binds)) |
+| any other (ROCm, …) | the XLA backend: the same composition with `jnp.fft` along the k axes; no LORRAX library |
 
-The backend follows from the platform, so no deck key or environment
-variable selects it. Two environment dials change only the engine inside a
-route: the A/B test `LORRAX_BSE_OUTER_KSUM` ([§11](#bse-outer)) and the cpu
-test hook ([§14](#build-and-cache)). The mathdx family is kept on CUDA
-because it is decisive on memory ([§1](#why-fused);
-[XLA reference ruling](decisions.md#xla-reference)).
-Both backends return the same
-callable contract, so a consumer never branches on the backend. The cpu leg is
-the reference composition of each mode: the same unfolds and products in XLA,
-with host transforms.
+The backend follows from the vendor, so no deck key or environment variable
+selects it; one environment dial changes only the engine inside the mathdx
+route, the A/B test `LORRAX_BSE_OUTER_KSUM` ([§11](#bse-outer)). The mathdx
+family is kept on CUDA because it is decisive on memory ([§1](#why-fused)), and
+the host plan route on cpu because it is 3.8–7.4× faster than `jnp.fft` at one
+CrI3 6×6 P4 rank tile on 128 Milan cores (the Σ τ convolution 0.16 against
+1.20 s, the χ₀ transform pair 0.34 against 1.32 s; peak RSS 5.6 against
+4.2 GB; claim 3979) ([XLA reference ruling](decisions.md#xla-reference)). All three
+backends return the same callable contract, so a consumer never branches on
+the backend.
+
+**The XLA reference.** Factories built inside the context manager
+`ffi.fft.xla_reference()` take the XLA backend on any platform. It is a Python
+argument of the caller, not a dial: `tests/test_kconv_xla_gate.py` uses it to
+hold every mode it covers (0, 2, 3, 4, 5, 7, 9, 10, 11) to relative 1e-12 of
+the XLA backend on the same devices, mathdx on four GPUs and the plan route on
+four host devices, and stage-time measurements use it to time the XLA arm.
 
 **Startup.** `runtime.initialize_communicator_stack` calls
 `ffi.fft.require_kconv(mesh)`. On CUDA it finds the wheel (`mathdx_root`),
@@ -108,9 +115,9 @@ probes every target in `ffi.fft.KCONV_TARGETS` in the loaded library, and
 compiles and runs one probe kernel (mode 3 on a 2×1×1 grid). A device that
 the installed cuFFTDx cannot compile for therefore refuses at startup
 (`GATE mathdx-probe`, naming its compute capability and the wheel version)
-instead of at the first convolution. On cpu it requires the host flat-k
-target. Each factory re-probes its own target when it is built, and checks
-operand shapes and dtypes at trace time.
+instead of at the first convolution. On cpu it requires the two host plan
+targets; the XLA backend needs nothing at startup. Each mathdx factory re-probes its own target when it is built, and
+every factory checks operand shapes and dtypes at trace time.
 
 **Calling a factory.** Physics code imports the factories from
 `common.fft_helpers`, which re-exports them; the flat-k transform enters as
@@ -132,8 +139,8 @@ lists its call sites.
   `norm="forward"`, so $s = 1/N_k$, the factor in the equation above.
 - **`KConvStored`.** `make_kconv_klead` returns `(prep, apply)`. `prep(W)`
   does the work that depends on W alone, once per W; `apply(T, W_prep)` does
-  the rest, once per T. `W_prep` is in the backend's own form (R space on
-  CUDA, W unchanged on cpu, whose `gw_conv` handler transforms W itself), so
+  the rest, once per T. `W_prep` is in the backend's own form (R space, or W
+  unchanged on the plan backend, whose `gw_conv` handler transforms W itself);
   pass it only to the `apply` of the same pair.
 - **Vertices (modes 0, 1 and 6).** `perm_l`, `perm_r` are permutations of
   `range(n_s)`; `phase_l`, `phase_r` are exact monomials in $\{+1,+i,-1,-i\}$,
@@ -145,20 +152,20 @@ One handler file serves modes 0–11, each a value of the compile-time
 `LRX_MODE` of one embedded source. A target string is `lorrax_mathdx_<suffix>`;
 `ffi_loader._CUDA_TARGET_SYMBOLS` maps it to its C++ handler symbol.
 
-| mode, target suffix | factory (`ffi.fft`) | computes | operands → result | cpu leg |
+| mode, target suffix | factory (`ffi.fft`) | computes | operands → result | plan and XLA backends (host transforms on cpu, `jnp.fft` elsewhere) |
 |---|---|---|---|---|
-| 0 `kconv_pair` | `make_fused_conv_kpair` | $U = s\,F_k\sum_{ab}\phi_l[a]\phi_r[b]\,\overline{F^{-1}A_{a,b}}\cdot F^{-1}B_{\pi_l a,\pi_r b}$ | `A`, `B` `(n_kx, n_ky, n_kz, n_s, col, μ, n_s)` → `U` `(n_kx, n_ky, n_kz, col, μ)` | two host inverse transforms, the spin sum in XLA, one host forward transform |
+| 0 `kconv_pair` | `make_fused_conv_kpair` | $U = s\,F_k\sum_{ab}\phi_l[a]\phi_r[b]\,\overline{F^{-1}A_{a,b}}\cdot F^{-1}B_{\pi_l a,\pi_r b}$ | `A`, `B` `(n_kx, n_ky, n_kz, n_s, col, μ, n_s)` → `U` `(n_kx, n_ky, n_kz, col, μ)` | two inverse transforms, the spin sum, one forward transform |
 | 1 `kconv_parent` | `make_fused_conv_kparent` | mode 0 with both operands unfolded from raw parents on the load ([§9](#mode-1)) | `D_l`, `D_r` `(n_parent, n_s, μ, n_s, ν)` and ten tables → `U` `(N_k, μ, ν)` | the typed parent load in XLA (a full-k `(N_k, n_s, μ, ν, n_s)` copy per side), then mode 0's composition |
-| 2 `kconv_klead` | `make_kconv_klead` (`apply`), `make_local_kconv_klead` | $U = s\,F_k(F^{-1}T\cdot V_R)$, $V_R$ already in R space | `T`, `U` `(N_k, a, m_x, b, m_y)`, `V_R` `(N_k, m_x, m_y)` | `lorrax_mklfft_gw_conv` (`make_kconv_klead`), host transforms (`make_local_kconv_klead`) |
-| 3 `kfft_klead` | `make_kfft_klead`, `make_local_kfft_klead`; `prep` of `make_kconv_klead` | $Y = s\,F^{\pm}_k X$, k leading | `(N_k, rows)` | `lorrax_mklfft_flat_k` |
-| 4 `kconv_kminor` | `make_kconv_kminor`, `make_local_kconv_kminor` | $U = s\,F_k(F^{-1}X\cdot K_R)$, k trailing, $K_R$ made by mode 5 | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | XLA moves k to the front, host transforms, k moves back |
-| 5 `kfft_kminor` | `make_kfft_kminor`, `make_local_kfft_kminor` | $Y = s\,F^{\pm}_k X$, k trailing | `(rows, N_k)` | the same transpose around one host transform |
+| 2 `kconv_klead` | `make_kconv_klead` (`apply`), `make_local_kconv_klead` | $U = s\,F_k(F^{-1}T\cdot V_R)$, $V_R$ already in R space | `T`, `U` `(N_k, a, m_x, b, m_y)`, `V_R` `(N_k, m_x, m_y)` | `lorrax_mklfft_gw_conv` (`make_kconv_klead` on cpu); the inverse transform, the product, the forward transform |
+| 3 `kfft_klead` | `make_kfft_klead`, `make_local_kfft_klead`; `prep` of `make_kconv_klead` | $Y = s\,F^{\pm}_k X$, k leading | `(N_k, rows)` | `lorrax_mklfft_flat_k`; `jnp.fft` over the three k axes |
+| 4 `kconv_kminor` | `make_kconv_kminor`, `make_local_kconv_kminor` | $U = s\,F_k(F^{-1}X\cdot K_R)$, k trailing, $K_R$ made by mode 5 | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | k moved to the front, the transforms and the product, k moved back |
+| 5 `kfft_kminor` | `make_kfft_kminor`, `make_local_kfft_kminor` | $Y = s\,F^{\pm}_k X$, k trailing | `(rows, N_k)` | the same transpose around one transform |
 | 6 `kconv_plane` | `make_fused_conv_kplane` | mode 0 read from route G's plane-transform output (`g` planes of `p` points, `c` centroids per side): the Bloch phase `F[k,g,p]` applied and the `2c` axis split on the load into the left projector (slots `[0, c)`) and the right one (`[c, 2c)`) | `D` `(N_k, g, n_s, 2c, n_s, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | phase, split and transpose in XLA, then mode 0's composition |
 | 7 `kconv_klead_unfold_xblock` | `make_kconv_klead_unfold` | mode 2 on the typed unfold of the raw-parent Green ([§5](#unfold-on-load)) | `G`, `Gt` `(n_parent, μ, n_s, ν, n_s)`, `V_R` `(N_k, μ, ν)` → `U` `(n_out, n_s, μ or an x block, n_s, ν)` | `symmetry_maps.apply_unfold_load_tables_local` (a full-k copy), mode 2's composition, the row selection |
-| 8 `kconv_klead_lorentz_wparent` | `make_kconv_lorentz_unfold` | the four-current Σ: $U = s\,F_k\sum_{A,B}\gamma_A(F^{-1}\hat G)\gamma_B^\dagger\circ\hat W_R[k,\mu,A,\nu,B]$, $A$ ($B$) over the $n_A$ ($n_B$) Lorentz components of the left (right) endpoint (1 for charge, 3 for current), $\gamma_A$ channel $A$'s signed spin permutation, with $\hat G$ and $\hat W$ both unfolded from parents on the load | `G`, `Gt` as mode 7; `W`, `Wt` `(n_{q,parent}, μ, n_A, ν, n_B)`, $n_A, n_B \le 4$ → `U` `(n_out, n_s, μ, n_s, ν)` | both unfolds and the γ block sum in XLA, host transforms |
+| 8 `kconv_klead_lorentz_wparent` | `make_kconv_lorentz_unfold` | the four-current Σ: $U = s\,F_k\sum_{A,B}\gamma_A(F^{-1}\hat G)\gamma_B^\dagger\circ\hat W_R[k,\mu,A,\nu,B]$, $A$ ($B$) over the $n_A$ ($n_B$) Lorentz components of the left (right) endpoint (1 for charge, 3 for current), $\gamma_A$ channel $A$'s signed spin permutation, with $\hat G$ and $\hat W$ both unfolded from parents on the load | `G`, `Gt` as mode 7; `W`, `Wt` `(n_{q,parent}, μ, n_A, ν, n_B)`, $n_A, n_B \le 4$ → `U` `(n_out, n_s, μ, n_s, ν)` | both unfolds, the transforms and the γ block sum |
 | 9 `kfft_klead_unfold` | `make_kfft_klead_unfold` | $Y_k = s\,F^{-1}_k(\mathcal L_k\hat O_k \mathcal R_k^\dagger)$: the R-space operand of modes 2 and 7, read from an interaction's q wedge | `W`, `Wt` `(n_wedge, μ·n_l, ν·n_r)` → `Y` `(N_k, μ·n_l, ν·n_r)` | the unfold in XLA, then mode 2's `prep` |
 | 10 `plane_fft_gather` | `make_plane_fft_gather` (`LocalFourierPlan(in_gather=…)`) | the route-G plane FFT, gathered on load ([§10](#mode-10)) | `F` `(…, n_col)` → `Y` `(…, n_b, n_c)` | the XLA route: a static-run concatenate, then `jnp.fft.fftn` |
-| 11 `kconv_chi_unfold`, `kconv_chi_vertex` | `make_kconv_chi_unfold`, `make_kconv_chi_vertex` | one χ₀ τ node: $acc[o] \mathrel{+}= \alpha_o\sum_{ab}\overline{(F^{-1}\hat G^c)_{ab}}(F^{-1}\hat G^v)_{ab}$ (+ its conjugate when `complete`) | `Gv`, `Gc` and partners `(n_parent, μ, n_s, ν, n_s)`, `α` `(n_out,)` → `acc` `(n_out, N_k, μ, ν)`, in place | the unfold per Green in XLA, host inverse transforms, the trace in XLA |
+| 11 `kconv_chi_unfold`, `kconv_chi_vertex` | `make_kconv_chi_unfold`, `make_kconv_chi_vertex` | one χ₀ τ node: $acc[o] \mathrel{+}= \alpha_o\sum_{ab}\overline{(F^{-1}\hat G^c)_{ab}}(F^{-1}\hat G^v)_{ab}$ (+ its conjugate when `complete`) | `Gv`, `Gc` and partners `(n_parent, μ, n_s, ν, n_s)`, `α` `(n_out,)` → `acc` `(n_out, N_k, μ, ν)`, in place | the unfold per Green, the inverse transforms, the trace |
 | 2 + outer load, `kconv_klead_outer` | `make_local_kconv_klead_outer` | mode 2 with $T = \sum_K \Lambda_K\Xi_K$ formed in shared memory ([§11](#bse-outer)) | `L` = $\Lambda$ `(N_k, a, m_x, K)`, `R` = $\Xi$ `(N_k, K, b, m_y)`, `V_R` `(m_x, m_y, N_k)` → `U` `(N_k, a, m_x, b, m_y)` | the einsum for T, then mode 2's composition |
 | 2 + outer load + decode, `kconv_klead_outer_decode` | `make_local_kconv_klead_outer_decode` | the same, with $A = \sum_{a,x}\overline{P_c}\,U$ formed in the store | → `A` `(N_k, n_c, b, m_y)` | the outer composition and the decode einsum |
 
@@ -368,7 +375,7 @@ and transforms only the live columns; the pass that stores the output writes
 zeros on the other rows (modes 7, 8, 9), and mode 11 adds nothing to them. A
 call with `live` compiles its own program, so a call without it carries no
 bounds in its registers. `live = [0, rows)` is bitwise equal to the call
-without it. The cpu leg zeroes the dead rows with `ffi.fft.live_row_mask`.
+without it. The plan and XLA backends zero the dead rows with `ffi.fft.live_row_mask`.
 
 ## 7. Scratch and the tile-table load {#tiles}
 
@@ -566,19 +573,15 @@ would need is never written. Their gather still reads one source element per
 full-k element: parent tiles are $n_{\rm parent}/N_k$ of the full-k memory,
 not of the traffic.
 
-On the cpu leg, `gw_conv` stages $V_R = F^{-1}W$ once per call in a reused
-host arena of $16\,N_k\,m_x\,m_y$ bytes, invisible to XLA.
-
 ## 13. Refusals {#refusals}
 
 | refusal | raised at | condition | fix |
 |---|---|---|---|
-| `GATE kconv-platform` | startup, factory | the mesh platform is neither CUDA nor cpu | run on a CUDA or cpu mesh |
 | `GATE mathdx-headers` | startup (`mathdx_root`); kernel build | no importable `nvidia.mathdx` with `include/cufftdx.hpp` | install the wheel; the `cuda12`/`cuda13` extras of `pyproject.toml` pin `nvidia-mathdx==25.6.0` |
 | `GATE kconv-target` | startup, factory | the loaded library lacks the selected target | rebuild the CUDA leg from this tree |
 | `GATE mathdx-probe` | startup | the mode-3 probe kernel fails to compile or run on this device | a wheel whose cuFFTDx supports the device's compute capability |
 | `GATE kconv-kgrid` | factory | the k grid is not three positive axes | pass the run's `(n_kx, n_ky, n_kz)` |
-| `GATE mathdx-kconv-axis` | factory; handler | on CUDA, a k-grid axis above 40 (`KCONV_AXIS_MAX`, the fp64 cuFFTDx thread-FFT limit); the cpu leg has no cap | a smaller k grid |
+| `GATE mathdx-kconv-axis` | factory; handler | on CUDA, a k-grid axis above 40 (`KCONV_AXIS_MAX`, the fp64 cuFFTDx thread-FFT limit); the plan and XLA backends have no cap | a smaller k grid |
 | `GATE mathdx-kconv-residency` | kernel build | a direct call of mode 0, 1 or 6 whose row exceeds the opt-in memory; the router streams such grids instead ([§8](#resident-rows)) | call through the router |
 | `GATE mathdx-kconv-kbox-residency` | kernel build | the tile, plane or pencil the launch rule picked exceeds the opt-in memory (modes 2, 3, 8, 9); one whole column exceeds it (modes 4 and 5, which have no split arm); a split plane tile of one spin group exceeds it (mode 7: $n_s = 4$ at 26³ and larger on A100) | a smaller k grid |
 | `GATE mathdx-kconv-chi-residency` | kernel build | mode 11 cannot hold the grid | none here: `gw.w_isdf` asks `chi_unfold_refusal` first, so this gate means that predicate and the handler's rule disagree, which is a bug |
@@ -588,7 +591,6 @@ host arena of $16\,N_k\,m_x\,m_y$ bytes, invisible to XLA.
 | `GATE mathdx-plane-split`, `mathdx-plane-residency` | kernel build | a direct mode-10 call on a plane with no split or too large | call through `make_plane_fft_gather` |
 | `GATE plane-fft-dtype` | trace | mode 10's `F` is not complex128 | pass complex128 |
 | `k-leading unfold conv: …` (and `lorentz conv`, `chi unfold`, `unfold fft`) | factory; apply | tables cut for another mesh, operands whose parent count or endpoint widths differ from the tables, or a missing partner on a plan with antiunitary rows | build the tables from the same plan and mesh as the operands; pass the partner |
-| `LORRAX_FFT_FFI=0` | factory | the cpu leg refuses, and so does `make_flat_k_fft` on both platforms | unset `LORRAX_FFT_FFI` |
 
 A kernel-build failure (an NVRTC compile, missing toolkit headers, a module
 load, a residency gate) is sticky: the handler caches it per build key and
@@ -649,17 +651,13 @@ the cache pays once.
   `NVRTC built …` on rank 0, with the grid, rows per block, shared memory and
   whether the cubin was stored.
 
-**Test hook.** Under `LORRAX_KFFT_CPU_TEST_XLA=1` on a cpu mesh the cpu leg
-announces itself and uses `jnp.fft` for its k-axis transforms, for
-in-process CPU meshes that have no host library. It is never read on CUDA and
-is never a production route.
-
 ## 15. Numerical contract {#numerical-contract}
 
 - **Dtype.** Modes 2–5 take all-complex128 or all-complex64 operands (the
   complex64 image serves the fp32-GMRES BSE arm) and never cast; every other
-  mode is complex128 only. The cpu host handlers are complex128 only, so a
-  complex64 operand refuses at trace time on a cpu mesh.
+  mode is complex128 only. The host plan handlers are complex128 only, so a
+  complex64 operand refuses at trace time on a cpu mesh; the XLA backend takes
+  either precision.
 - **In place.** Modes 2, 3 and 5, and mode 4 with `out_layout=0`, alias
   operand 0 to the result; mode 11 aliases `acc`. This is safe because each
   block reads all $N_k$ values of its columns before it stores any of them.
@@ -685,8 +683,8 @@ is never a production route.
    changed operand contract gets a new target; changing an existing target's
    signature is an ABI bump ([FFI layer §8](ffi_layout.md#8-hard-invariants)).
 3. Add a router factory in `src/ffi/fft.py` that returns the mathdx call on
-   CUDA and the plan-route composition on cpu, and re-export it from
-   `common.fft_helpers`.
+   CUDA and the reference composition on the plan and XLA backends, re-export it from
+   `common.fft_helpers`, and add a case to `tests/test_kconv_xla_gate.py`.
 4. Put the kernel's measured record (its speedup over the plain-XLA route,
    what was tried and did not pay) in the comment block above its Python
    factory, not in the kernel source, whose text is part of the cubin key.

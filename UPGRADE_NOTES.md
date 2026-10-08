@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — the k-convolution router has an XLA backend; LORRAX_FFT_FFI is gone
+
+`ffi.fft.kconv_backend` returns `mathdx` on CUDA, `plan` on cpu (the host FFTW3-ABI route,
+kept because it is 3.8-7.4x faster than `jnp.fft` at a CrI3 6x6 rank tile, claim 3979) and
+`xla` on every other platform (ROCm). The XLA backend is the reference composition each
+mathdx mode replaced: the same unfolds, products and spin sums with `jnp.fft` along the k
+axes. `ffi.fft.xla_reference()` builds factories on it on any platform;
+`tests/test_kconv_xla_gate.py` holds modes 0, 2-5, 7, 9, 10 and 11 to 1e-12 of it on the same
+GPUs at P4. `LORRAX_FFT_FFI`, `make_flat_k_fft_ffi` and the `LORRAX_KFFT_CPU_TEST_XLA`
+hook are deleted (neither variable is read). Results do not move on CUDA or cpu. Drivers
+import their k-axis factories from `common.fft_helpers`.
+
 ## 2026-10-08 — distrib_la's budgeted eigh-stack decision is priced from the shapes
 
 A plan built with `budget_bytes` used to compile each eager route-(c) candidate to measure it

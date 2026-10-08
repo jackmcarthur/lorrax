@@ -896,7 +896,7 @@ class MixedBasisPairConvolution:
 
         # ---- backend ---------------------------------------------------------
         if backend is None:
-            from ffi.fft import kconv_backend
+            from common.fft_helpers import kconv_backend
             try:
                 kconv_backend(mesh)
                 backend = "router"
@@ -1165,7 +1165,7 @@ class MixedBasisPairConvolution:
         cols_chunk = self.cols_chunk
         backend = self.backend
         if backend == "router":
-            from ffi.fft import make_fused_conv_kplane
+            from common.fft_helpers import make_fused_conv_kplane
             ident = list(range(nsk))
             kconv = make_fused_conv_kplane(mesh, self.kgrid, nsk, perm_l=ident, phase_l=[1] * nsk,
                                            perm_r=ident, phase_r=[1] * nsk)

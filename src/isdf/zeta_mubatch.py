@@ -273,7 +273,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     """
     from isdf.core import _conv_kpair_static_gamma
     from isdf.pair_kernels import pair_projectors_lr
-    from ffi.fft import make_fused_conv_kplane
+    from common.fft_helpers import make_fused_conv_kplane
     from common.fourier_plan import LocalFourierPlan
     from common.gamma_matrices import gamma_perm_phase
     P_ = _mesh_size(mesh)

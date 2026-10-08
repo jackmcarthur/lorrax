@@ -1,7 +1,7 @@
 """``Gate`` — one env-gated, rank-local capability dial, and the platform key.
 
-The one resolver behind every service dial (``LORRAX_FFT_FFI``,
-``LORRAX_BANDS_GEMM_FFI``); LORRAX's ``ffi.gate`` binds it to its own probe.
+The one resolver behind every service dial (``LORRAX_BANDS_GEMM_FFI``);
+LORRAX's ``ffi.gate`` binds it to its own probe.
 It owns four things every dial has to get right:
 
 1. **Grammar.** One spelling table (:data:`MODE_SPELLINGS`), strict per
@@ -212,7 +212,7 @@ class Gate:
     """One env-gated capability.  Messages are fields (harnesses grep them;
     refusals must name the fix); the policy is here and identical for all."""
 
-    env: str                          #: e.g. "LORRAX_FFT_FFI"
+    env: str                          #: e.g. "LORRAX_BANDS_GEMM_FFI"
     target: str                       #: default FFI target to probe
     platforms: tuple[str, ...]        #: platform keys this dial exists on
     modes: tuple[str, ...]            #: this gate's vocabulary, in help order

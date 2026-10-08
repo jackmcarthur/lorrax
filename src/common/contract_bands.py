@@ -727,7 +727,7 @@ def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
 
     def accumulate_body(psi_l, psi_r, O, acc, *, rows):
         if rows is not None:                 # ψ_l(m, μ_x): the block's rows
-            from ffi.fft import x_block_rows
+            from common.fft_helpers import x_block_rows
             idx = x_block_rows(rows)
             keep = jnp.asarray(idx < mul)[None, None, None, :]
             psi_l = jnp.where(keep, jnp.take(

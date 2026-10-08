@@ -42,8 +42,8 @@ an operation had no XLA path.
 
 **Not yet conforming.**
 
-* The k-convolution router has no XLA backend: CUDA takes mathdx, cpu the
-  host plans, and any other platform refuses (`GATE kconv-platform`).
+* On CUDA a k-grid axis above 40 refuses (`GATE mathdx-kconv-axis`),
+  although the router's XLA backend could serve it.
 * The contour accumulator, the spin-rotation kernel and the cuBLASMp GEMM
   have no measured gain. The classic-cuBLAS local active-range GEMM and the
   screened bispinor Dyson's cuSOLVERMp LU are not measured against XLA.

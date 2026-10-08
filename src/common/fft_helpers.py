@@ -156,106 +156,49 @@ def make_sharded_fftn_3d(
 
 
 # ============================================================================
-# FFI backend for the flat-k helpers — REQUIRED (decisions.md 2026-08-01)
+# THE k-CONVOLUTION ROUTER at the factory seam
 # ============================================================================
-# The service itself lives in ``src/ffi/fft.py`` (Python) + ``src/ffi/cpp/
-# fftw`` and ``src/ffi/cpp/cufft`` (handlers).  THIS file used to carry a
-# second, drifting copy of the gate and both bodies (delegated 2026-07-30),
-# and then a gated XLA twin of the flat-k transform (DELETED 2026-08-01
-# under the FFI-required ruling: where a certified FFI path exists, the
-# native-JAX duplicate is not maintained).
-#
-# What the service is: the flat-k batched 3-D FFTs dispatched to the platform
-# FFI library through the ffi.fft router — the FFTW3 ABI on cpu meshes,
-# nvidia-mathdx (mode 3) on CUDA meshes — so the call sites are
-# platform-agnostic.
-# WHY: XLA's fft custom-call wants the transformed axes minor-most, so every
-# dot(k-major) <-> fft(k-minor) boundary in the Σ τ kernel pays a full
-# transpose of the ~398 MB/rank μ² tile — 65% of the STAGED τ DISPATCH at
-# nb=128/P=64, BEFORE this service existed (the line said "of sigma.exec"
-# until 2026-08-11; see the denominator note in ffi/fft.py).  Today the FFT's
-# share of that dispatch is 16.1% / 60.5% / 84.9% at 9 / 64 / 216 k-points
-# (P=4, BFC@0.85, 2026-08-11) — it is governed by nk, so there is no single
-# "today" number and the 9-k fixture's 0.07%-of-wall does not generalise.
-# Stride descriptors read the dot-layout tile where it lies, so the transposes
-# disappear instead of moving.  Contract: ``docs/architecture/services.md``
-# (``ffi.fft``); the k-convolution router: ``docs/architecture/kconv.md``.
-#
-# What stays here: the OWNER RULE that these helpers are the single FFT entry
-# point (``make_flat_k_fft`` below is still the only entry point), and the XLA
-# ``make_sharded_*fftn_3d`` / ``local_*fftn3`` layer above — those serve the
-# shard_map-INTERIOR call sites (isdf/core, wfn_transforms, BSE) that have
-# no FFI route, which the ruling explicitly keeps.
-# ============================================================================
-
-from ffi.fft import (  # noqa: E402  (re-export: see the block above)
-    GATE,
-    fft_ffi_enabled,
-)
-
-
-# ============================================================================
-# THE k-CONVOLUTION ROUTER at the factory seam (decisions.md 2026-09-24)
-# ============================================================================
-# The physics entry points for every k-axis convolution and every k-axis
-# transform of a k-MINOR tile.  Each is the ``ffi.fft`` router factory itself,
-# re-exported here so physics code imports its FFTs from one module; the
-# router picks nvidia-mathdx on CUDA and the plan route on cpu from the mesh,
-# so no caller branches on a backend and no environment variable picks one.
-#
-#     make_kconv_klead        Σ / COHSEX: KConvStored(prep(W), apply(T, W_prep))
-#     make_kconv_klead_unfold Σ from the raw-parent Green: fn(G, Gt, W_prep, load=None), same prep
-#     make_kfft_klead_unfold  that prep read from the q wedge: fn(W_wedge, Wt=None)
-#     make_kconv_chi_unfold   chi0 from the raw-parent Green pair: fn(acc, Gv, Gc, alpha)
-#     make_kconv_kminor       BSE rung:   fn(X, K_R), out_layout 0 | 1
-#     make_kfft_kminor        sharded transform over the three trailing k axes
-#     make_local_kconv_kminor / make_local_kfft_kminor  the same inside a shard_map
-#     make_local_kconv_klead  the k-leading conv inside a shard_map, V already R space (BSE W term)
-#     make_local_kconv_klead_outer  the same with T = sum_K L R formed on the load (BSE encode
-#                                   fused); klead_outer_refusal says when it cannot serve
-#     make_local_kconv_klead_outer_decode  (prep, apply): the same with the decode's (t, mu)
-#                                   contraction fused into the store (U never stored);
-#                                   klead_outer_decode_refusal says when it cannot serve
-#
-# The contracts live in ``ffi/fft.py``.
+# The physics entry points for every k-axis convolution and k-axis transform.
+# Each is the ``ffi.fft`` router factory itself, re-exported so physics code
+# imports its FFTs from one module; the router picks nvidia-mathdx on CUDA and
+# the host plan route on cpu and the XLA backend elsewhere, from the mesh's
+# device vendor, so no caller
+# branches on a backend and no environment variable picks one.  The contracts
+# live in ``ffi/fft.py`` and ``docs/architecture/kconv.md``.
 # ============================================================================
 from ffi.fft import (  # noqa: E402,F401  (re-exported entry points)
     KConvStored,
+    chi_unfold_refusal,
+    chi_unfold_scratch_bytes,
+    kconv_backend,
+    klead_outer_decode_refusal,
+    klead_outer_refusal,
+    klead_unfold_scratch_bytes,
+    make_fused_conv_kpair,
+    make_fused_conv_kparent,
+    make_fused_conv_kplane,
+    make_kconv_chi_unfold,
+    make_kconv_chi_vertex,
     make_kconv_klead,
     make_kconv_klead_unfold,
-    make_kconv_lorentz_unfold,
-    make_kfft_klead_unfold,
-    make_kconv_chi_unfold,
     make_kconv_kminor,
+    make_kconv_lorentz_unfold,
     make_kfft_klead,
+    make_kfft_klead_unfold,
     make_kfft_kminor,
     make_local_kconv_klead,
     make_local_kconv_klead_outer,
-    klead_outer_refusal,
     make_local_kconv_klead_outer_decode,
-    klead_outer_decode_refusal,
     make_local_kconv_kminor,
     make_local_kfft_klead,
     make_local_kfft_kminor,
+    x_block_rows,
+    xla_reference,
 )
 
 
-# ============================================================================
-# Flat-k FFT helpers — callers operate on (nk, *trail) arrays everywhere and
-# the k-grid 3D form only exists in the spec vocabulary, matching the
-# "flatten kx/ky/kz except inside the FFT" convention used across the GW
-# pipeline (w_isdf chi0, ppm_sigma, gw_jax static COHSEX, isdf_fitting
-# CCT/ZCT).
-#
-# Backend: the platform FFI handler, unconditionally (FFTW3 ABI on cpu,
-# nvidia-mathdx on CUDA — see the block above) — ``(nk, *trail) ->
-# (nk, *trail)``, k-major end to end, no 3-D reshape, no layout anchoring.
-# The gated XLA twin (reshape -> make_sharded_*fftn_3d -> reshape) was
-# DELETED 2026-08-01 (decisions.md: FFI backends are required, not
-# optional); LORRAX_FFT_FFI=0 therefore refuses here rather than silently
-# selecting a path that no longer exists.  Recover the XLA arm from git
-# history for a debugging build.
-# ============================================================================
+# Flat-k FFT helpers: callers operate on (nk, *trail) arrays everywhere and the
+# k-grid 3-D form exists only in the spec vocabulary.
 
 
 def make_flat_k_fft(
@@ -278,13 +221,9 @@ def make_flat_k_fft(
     follows ``jnp.fft.*`` ('ortho', 'forward', 'backward' / None).
 
     The k-convolution router's k-leading transform
-    (:func:`ffi.fft.make_kfft_klead`): nvidia-mathdx on CUDA (measured 1.8-7.4x
-    faster than the cuFFT advanced-layout plan it replaced at the χ0/Σ
-    production tiles, runs/runtime/kconv_stage2_20260924/bench_flatk_v2.log),
-    the FFTW3-ABI flat-k plan handler on cpu.  ``LORRAX_FFT_FFI=0`` refuses.
+    (:func:`ffi.fft.make_kfft_klead`): nvidia-mathdx on CUDA, the host plan
+    handler on cpu, the XLA backend elsewhere.
     """
-    if not fft_ffi_enabled():
-        raise RuntimeError(GATE.off_refuse_msg)
     if out_spec is not None and tuple(out_spec) != tuple(spec):
         raise ValueError(
             f"the flat-k transform implements no post-FFT reshard (out_spec "
@@ -331,6 +270,4 @@ def make_local_flat_k_fftn(
     wrapper.  It exists for bounded local trailing-axis slabs; callers must
     keep the complete k axis local.
     """
-    if not fft_ffi_enabled():
-        raise RuntimeError(GATE.off_refuse_msg)
     return make_local_kfft_klead(mesh, kgrid, kind='fftn', norm=norm)

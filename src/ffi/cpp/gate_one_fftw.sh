@@ -173,8 +173,8 @@ fi
 # The engine is bound by a function-local static inside the handler, so it
 # does not exist until a transform is planned.  Nothing short of running one
 # observes the real state; a script that re-implements the ladder observes
-# its own behaviour instead.  So: drive make_flat_k_fft_ffi exactly as
-# tests/test_fft_flat_k_numerics.py does, then read /proc/self/maps.
+# its own behaviour instead.  So: call the flat-k handler once through the
+# loader's registration (no Python route calls it), then read /proc/self/maps.
 GATE_STAGE_REAL="$STAGE_REAL" "$GPY" - "$@" <<'PY'
 import ctypes, os, subprocess, sys
 
@@ -221,8 +221,7 @@ try:
     import numpy as np
     import jax
     import jax.numpy as jnp
-    from jax.sharding import Mesh, PartitionSpec as P
-    from ffi.fft import make_flat_k_fft_ffi
+    from ffi.common import ffi_loader
 except Exception as e:                                    # noqa: BLE001
     die(["GATE CANNOT RUN (8c): the dynamic leg needs jax and the lorrax",
          "  tree importable, and they are not:",
@@ -236,11 +235,14 @@ except Exception as e:                                    # noqa: BLE001
 # gate is about WHICH engine, never about the numbers — those are
 # tests/test_fft_flat_k_numerics.py's job.
 try:
-    mesh = Mesh(np.array(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
-    fn = make_flat_k_fft_ffi(mesh, (4, 4, 4), P(None, None, None, None),
-                             kind="fftn", norm=None, out_spec=None)
-    x = np.zeros((64, 1), dtype=np.complex128)
-    np.asarray(jax.jit(fn)(jnp.asarray(x)))
+    ok, why = ffi_loader.probe_target("lorrax_mklfft_flat_k", "cpu")
+    if not ok:
+        raise RuntimeError(why)
+    x = jnp.zeros((64, 1), dtype=jnp.complex128)
+    call = jax.ffi.ffi_call("lorrax_mklfft_flat_k", jax.ShapeDtypeStruct(x.shape, x.dtype),
+                            input_output_aliases={0: 0})
+    np.asarray(jax.jit(lambda v: call(v, nkx=np.int64(4), nky=np.int64(4), nkz=np.int64(4),
+                                      forward=np.int64(1), scale=np.float64(1.0)))(x))
     say("8c: one flat-k FFT planned and executed — the engine is now bound")
 except Exception as e:                                    # noqa: BLE001
     die(["GATE FAILED (8c): the flat-k FFT handler did not run:",

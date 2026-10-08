@@ -1,83 +1,21 @@
-"""Batched flat-k 3-D FFT (the ``LORRAX_FFT_FFI`` service) and the k-convolution
-router (decisions.md 2026-09-24).
+"""The k-convolution router: one factory per k-axis operation, one backend per platform.
 
-The Python half of the flat-k FFT handlers:
-
-    cpu   liblorrax_ffi_host.so   the FFTW3 ABI (``fftw_plan_many_dft``, the
-                                  advanced-layout planner) in
-                                  (``src/ffi/cpp/fftw/fft_flat_k_ffi.cc``) —
-                                  a genuine O(N log N) FFT at any k-count.
-                                  The directory is still named ``mklfft`` for the
-                                  DFTI implementation it USED to hold; the
-                                  DFTI calls were deleted 2026-08-05 and the
-                                  library is now bound by ``dlsym`` over a
-                                  candidate ladder (``LORRAX_FFTW3_SO``).
-    CUDA  liblorrax_ffi.so        the k-convolution router's nvidia-mathdx
-                                  k-leading transform (mode 3 of
-                                  ``src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc``)
-                                  since 2026-09-24; the cuFFT advanced-layout
-                                  handler it replaced was measured 1.8-7.4x
-                                  slower at the production tiles and deleted.
-
-Contract: ``docs/architecture/services.md`` (``ffi.fft``); the k-convolution
-router: ``docs/architecture/kconv.md``.
-
-WHY the service exists: XLA:CPU's ``fft`` custom-call requires the
-transformed axes minor-most, so every ``dot`` (k-major flat) ↔ ``fft``
-(k-minor 3-D) boundary in the Σ τ kernel pays a full transpose copy of the
-~398 MB/rank μ² tile — measured 65% of the STAGED τ DISPATCH (191.9 s of
-295.0 s) at nb=128/P=64 and CLOSED as structural for any XLA-side arrangement
-(``wk_REL/sigma_perf_results.md``).  Stride descriptors read the dot-layout
-tile where it lies, so the transposes disappear instead of moving.
-
-MIND THE DENOMINATOR, and mind the tense.  These lines said "60-65% of
-``sigma.exec``" until 2026-08-11; 191.9 s is 65% of the staged τ dispatch and
-70.5% of ``sigma.exec`` (272.0 s), so the quoted range belonged to neither
-(``wk_REL/FFI_EVIDENCE_AUDIT.md`` F26).  More importantly it is the number
-from BEFORE this service existed, and reading it as current is how a lane
-concludes the τ kernel is still FFT-bound and proposes wiring in the FFI that
-is already wired.
-
-MIND THE DECK TOO.  There is no single "after" number, because the FFT's share
-is governed by K-POINT COUNT and every figure in the record was taken at small
-nk.  Measured 2026-08-11 at P=4 on A100s, BFC@0.85, HEAD dc766220, as a share
-of the staged τ dispatch: 16.1% on the 9-k gnppm_debug fixture, 60.5% at
-Si 4x4x4 (64 k), and 84.9% at Si 6x6x6 (216 k), where the FFT is about 28% of
-the whole driver wall.  The cpu nb=128/P=64 figures (15.1% decomposed / 7.6%
-fused, F25) are a 64-k-class shape.  Cost goes as
-n_tau * nk * mu_local * N_grid log N_grid.  Quote the rung or quote none —
-a lane that took the fixture's 0.07%-of-wall as general concluded there was no
-lever on the same day the correction landed
-(``tests/known_failures/2026-08-11-gnppm-sigma-performance-claims-adjudicated.md``).
-
-Two entry LAYERS, and the gate reaches only one — stated because it is
-structural, not a TODO.  ``make_flat_k_*`` wraps its own ``shard_map`` and
-is FFI-gated; ``fft_helpers.local_fftn3``/``local_ifftn3`` are bare
-``jnp.fft`` aliases for code ALREADY inside a ``shard_map`` (which cannot
-nest) and have no FFI route at all.  ``isdf/core.py`` and
-``common/wfn_transforms.py`` call the second layer, so ``LORRAX_FFT_FFI``
-structurally cannot reach them.
-
-ADOPTION STATE (2026-07-30; superseded 2026-07-31): this module IS the
-single implementation.  ``common/fft_helpers.py`` delegated — it imports
-the gate and both wrapper bodies from here (``fft_helpers.py:304``) and
-carries no copy of its own.  The equivalence pin ``wk_REL/gatecheck.py``
-(cells A2/E/E2) now guards the re-export seam rather than a second copy.
-
-================================================================================
-THE k-CONVOLUTION ROUTER — one factory per operation, one backend per platform
-================================================================================
 Every k-axis convolution and k-axis transform the physics needs is asked for
-through a factory here (or its ``common.fft_helpers`` alias), and the factory
-chooses the backend from the MESH PLATFORM only — never from an environment
-variable (decisions.md 2026-09-24, QUALITY #8):
+through a factory here (or its ``common.fft_helpers`` re-export).  The factory
+chooses the backend from the mesh's device vendor only, never from an
+environment variable (``docs/architecture/decisions.md#xla-reference``):
 
     CUDA   nvidia-mathdx: cuFFTDx thread FFTs inside one fused shared-memory
            pass per k-row, NVRTC-built per (mode, k-grid) and disk-cached
-           (``cpp/cufft/kconv_mathdx_cuda_ffi.cc``).  The ONLY NVIDIA backend.
-    cpu    the plan route: the FFTW3-ABI flat-k handler (and, for the Σ
-           convolution, the fused FFTW gw_conv handler).
-    other  refusal by name.
+           (``cpp/cufft/kconv_mathdx_cuda_ffi.cc``).  Kept because it is
+           decisive on memory (``docs/architecture/kconv.md#why-fused``).
+    cpu    the plan backend: the reference composition (the same unfolds,
+           products and spin sums in XLA) with the host FFTW3-ABI flat-k
+           transforms and fused Σ convolution (``cpp/fftw/``).  Kept because it
+           is 3.8-7.4x faster than ``jnp.fft`` at a CrI3 rank tile.
+    other  the XLA backend: the same composition with ``jnp.fft`` along the k
+           axes.  It is the reference every vendor route is gated against on
+           the same device (:func:`xla_reference`, ``tests/test_kconv_xla_gate.py``).
 
     factory                   layout         operation
     ------------------------  -------------  ----------------------------------------
@@ -91,29 +29,22 @@ variable (decisions.md 2026-09-24, QUALITY #8):
                                              stored at the caller's k rows only
     make_kconv_lorentz_unfold parent G + W   the four-current Σ: the same load for G and
                                              for W's irreducible-q parent tile, then the
-                                             γ_i Ĝ γ_j† · Ŵ_ij block sum in R space,
-                                             stored at the caller's k rows only
+                                             γ_i Ĝ γ_j† · Ŵ_ij block sum in R space
     make_kfft_klead_unfold    wedge interaction  make_kconv_klead's prep (ifftn into R
-                                             space) read from the q wedge with the
-                                             typed unfold on load
+                                             space) read from the q wedge
     make_kconv_kminor         trailing       BSE rung    fftn(ifftn(X)·K_R)
     make_kfft_klead / _local  flat leading   one transform
     make_kfft_kminor / _local trailing       one transform
 
-Pick the factory whose k position matches the tile you already hold; a caller does
-not transpose to reach another.  A k-grid axis above ``KCONV_AXIS_MAX`` (40,
-the fp64 cuFFTDx thread-FFT limit) is refused by name on CUDA. Pair modes0/1/6
-whose three-bank row exceeds shared memory stream spin/spatial tiles through
-this same service's staged native k-axis transform factory (no backend switch).
-
-The plain flat-k transform is the same router: ``common.fft_helpers.
-make_flat_k_fft`` calls :func:`make_kfft_klead` (mathdx mode 3 on CUDA,
-measured 1.8-7.4x faster than the cuFFT plan it replaced; the FFTW3-ABI host
-handler on cpu, whose sharded factory :func:`make_flat_k_fft_ffi` is cpu-only).
+Pick the factory whose k position matches the tile you already hold; a caller
+does not transpose to reach another.  On CUDA a k-grid axis above
+``KCONV_AXIS_MAX`` (40, the fp64 cuFFTDx thread-FFT limit) refuses by name.
+Contract: ``docs/architecture/kconv.md``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
 from functools import partial
 from typing import Callable, NamedTuple
@@ -123,38 +54,14 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P
 
-from ffi.gate import Gate
-
-# ``from common.shard_map import shard_map`` is DELIBERATELY NOT HERE.
-# Importing ANY ``common`` submodule runs ``common/__init__.py``, which
-# imports ``.wfn_transforms`` -> ``common.fft_helpers`` -> ``ffi.mklfft``
-# -> ``from ffi.fft import FLAT_K_TARGET``.  Entering that cycle at THIS
-# module means the re-entry finds ffi.fft half-executed and every name
-# below still unbound:
-#
-#     ImportError: cannot import name 'FLAT_K_TARGET' from partially
-#     initialized module 'ffi.fft' (most likely due to a circular import)
-#
-# so ``import ffi.fft`` was simply impossible as a process's first LORRAX
-# import.  pytest never saw it (conftest enters at ``common`` first, where
-# the cycle closes harmlessly), which is why it survived: the only thing
-# that entered at ffi.fft was src/ffi/cpp/gate_one_fftw.sh's dynamic leg,
-# and that gate has been unable to run since the cycle appeared.
-#
-# The import moves into the two factory bodies that use it (:277, :358) --
-# the function-local spelling twelve other sites in this tree already use
-# for common.shard_map, so this is the tree's own convention, not a
-# workaround.  ffi.fft is L3 substrate; the ``common`` package __init__ is
-# a physics-adjacent aggregator, and pulling all of it in to reach one
-# version shim was the actual defect.
+# ``common.shard_map`` and ``common.fft_helpers`` are imported inside the
+# function bodies that use them: importing any ``common`` submodule runs
+# ``common/__init__.py``, which imports ``common.fft_helpers``, which imports
+# this module, so a module-scope import here would close an import cycle.
 
 __all__ = [
-    "FLAT_K_TARGET", "GW_CONV_TARGET", "GATE",
-    "fft_ffi_enabled", "fft_ffi_mode",
-    "require_fft_ffi", "make_flat_k_fft_ffi", "make_local_flat_k_fft_ffi",
-    "ffi_fft_scale", "validate_flat_spec",
-    # The k-convolution router (decisions.md 2026-09-24): CUDA -> nvidia-mathdx,
-    # cpu -> the plan route.
+    "ffi_fft_scale", "validate_flat_spec", "xla_reference",
+    # The k-convolution router: CUDA -> nvidia-mathdx, cpu -> the plan backend, else XLA.
     "KCONV_PAIR_TARGET", "KCONV_PARENT_TARGET", "KCONV_KLEAD_TARGET",
     "KFFT_KLEAD_TARGET", "KCONV_KMINOR_TARGET", "KFFT_KMINOR_TARGET",
     "KCONV_TARGETS", "KCONV_AXIS_MAX",
@@ -176,12 +83,6 @@ __all__ = [
     "PLANE_FFT_GATHER_TARGET", "plane_fft_split", "plane_resident_bytes", "make_plane_fft_gather",
 ]
 
-FLAT_K_TARGET = "lorrax_mklfft_flat_k"
-#: The FFTW3-ABI fused Σ convolution, the cpu leg of :func:`make_kconv_klead`.
-#: HOST ONLY since 2026-09-24: its cuFFT strided CUDA twin was deleted when
-#: the router moved CUDA onto nvidia-mathdx.  The name is historical, coined
-#: by the CPU prototype.
-GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
 #: The NVIDIA k-convolution family on nvidia-mathdx (the router's CUDA leg).
 KCONV_PAIR_TARGET = "lorrax_mathdx_kconv_pair"
 KCONV_PARENT_TARGET = "lorrax_mathdx_kconv_parent"
@@ -217,94 +118,6 @@ KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCO
                  KFFT_KLEAD_TARGET, KFFT_KLEAD_UNFOLD_TARGET, KCONV_CHI_UNFOLD_TARGET,
                  KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
 
-#: The ``LORRAX_FFT_FFI`` dial.  Default ON — the FFI layer is REQUIRED
-#: (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01): the flat-k
-#: XLA duplicate inside ``fft_helpers.make_flat_k_fft`` was deleted under
-#: that ruling, so ``=0`` REFUSES (off_policy="refuse") instead of selecting
-#: a path that no longer exists, and a missing/unloadable library is a
-#: startup refusal naming the ``.so`` (``Gate.enforce``, wired into
-#: ``runtime.initialize_communicator_stack``).  No ``auto`` mode — there is
-#: nothing to auto-detect when the backend is mandatory.
-GATE = Gate(
-    env="LORRAX_FFT_FFI",
-    target=FLAT_K_TARGET,
-    # cpu ONLY since 2026-09-24: on CUDA the flat-k transform is the
-    # k-convolution router's nvidia-mathdx k-leading mode (make_kfft_klead),
-    # measured 1.8-7.4x faster than the cuFFT advanced-layout plan it replaced
-    # (runs/runtime/kconv_stage2_20260924/bench_flatk_v2.log).
-    platforms=("cpu",),
-    silent_platform_demote=(
-        "on CUDA the flat-k transform is the k-convolution router's "
-        "nvidia-mathdx family, checked at startup by require_kconv"),
-    modes=("off", "on"),
-    default="on",
-    off_label="(deleted) XLA flat-k FFT path",
-    off_policy="refuse",
-    off_refuse_msg=(
-        "LORRAX_FFT_FFI=0: there is nothing to opt out to.  The XLA flat-k "
-        "FFT path (the native-JAX duplicate inside "
-        "common.fft_helpers.make_flat_k_fft) was DELETED under the "
-        "FFI-required ruling (docs/architecture/decisions.md, 2026-08-01) — "
-        "the certified backend is the platform FFI handler (the FFTW3 ABI "
-        "on cpu, the nvidia-mathdx k-convolution router on CUDA).  Unset "
-        "LORRAX_FFT_FFI, or recover the XLA arm from git history for a "
-        "debugging build."),
-    # NOTE the platform names below are ABIs, not products.  The host handler
-    # calls the FFTW3 ABI (`fftw_plan_many_dft` ×4 in
-    # cpp/fftw/fft_flat_k_ffi.cc; zero `DftiCreateDescriptor` since
-    # 2026-08-05) and binds it by dlsym against whatever the process links —
-    # cray-fftw, a system FFTW3, or MKL's FFTW3 wrappers via `libmkl_rt.so`.
-    # These strings said "MKL FFT (DFTI API)" for the five days after the
-    # DFTI code was deleted, so every CPU startup block named an engine the
-    # translation unit no longer contained.  Name the ABI; let
-    # LORRAX_DEBUG_PRINT name the library.
-    label={"cpu": "FFTW3-ABI host"},
-    resolved_msg={
-        "cpu": ("[fft_ffi] flat-k 3-D FFTs -> FFTW3-ABI host FFI handler "
-                "({target}): O(N log N) FFT reading the dot-layout tile "
-                "in place via advanced-layout plans — no XLA layout "
-                "transposes.  WHICH library answers is resolved at run "
-                "time by dlsym over the candidate ladder (see "
-                "LORRAX_FFTW3_SO and docs/architecture/ffi_layout.md §3), "
-                "and is NOT stated by this line."),
-    },
-    refuse_platform_msg=(
-        "LORRAX_FFT_FFI: the required FFI flat-k FFT backend cannot serve "
-        "this mesh — its devices are '{platform}'; this gate serves cpu (the "
-        "FFTW3 ABI) only, and CUDA meshes take the k-convolution router "
-        "(nvidia-mathdx)."),
-    refuse_probe_msg=(
-        "The required {label} backend is unavailable: FFI target "
-        "'{target}' is unusable on platform '{platform}': {reason}  The "
-        "FFI layer is REQUIRED (docs/architecture/decisions.md, "
-        "2026-08-01); build/locate the library per "
-        "docs/environment/overview.md (host: build_host.sh -> "
-        "liblorrax_ffi_host.so, selected by LORRAX_FFI_HOST_SO)."),
-)
-
-def fft_ffi_mode() -> str:
-    """``"on"`` | ``"off"`` — the raw ``LORRAX_FFT_FFI`` grammar."""
-    return GATE.mode()
-
-
-def fft_ffi_enabled() -> bool:
-    """True when ``make_flat_k_*`` should return the FFI variant.
-
-    Read at helper-FACTORY time; kernel caches must key on it
-    (``gw.ppm_tau_kernel``).  Backend-init-free (gate contract tier 1)."""
-    return GATE.enabled()
-
-
-def require_fft_ffi(mesh: Mesh, target: str = FLAT_K_TARGET) -> str:
-    """Announce-or-refuse for the requested FFI backend; returns the FFI
-    platform key (``"cpu"`` / ``"CUDA"``).
-
-    Refuses (with the ``probe_target`` reason) ONLY if the mesh platform has
-    no backend, or the platform's library lacks the target — never silently
-    runs the XLA path (refusal doctrine #8)."""
-    return GATE.require(mesh, target=target)
-
-
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
     ifftn: backward/None -> 1/N, ortho -> 1/sqrt(N), forward -> 1;
@@ -333,151 +146,12 @@ def validate_flat_spec(spec: P, what: str) -> P:
     return P(None, *axes[3:])
 
 
-def make_local_flat_k_fft_ffi(
-    kgrid: tuple[int, int, int],
-    *,
-    kind: str,
-    norm: str | None,
-) -> Callable:
-    """Return the flat-k FFI call for use inside an existing ``shard_map``.
-
-    This is the local kernel owned by :func:`make_flat_k_fft_ffi`, exposed so
-    an already manually sharded caller can bound a trailing-axis workspace
-    without nesting another ``shard_map``.  Platform/target validation remains
-    the outer factory's responsibility.
-    """
-    if kind not in ('ifftn', 'fftn'):
-        raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-    nkx, nky, nkz = (int(v) for v in kgrid)
-    nk = nkx * nky * nkz
-    scale = ffi_fft_scale(kind, norm, nk)
-    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
-                 forward=np.int64(0 if kind == 'ifftn' else 1),
-                 scale=np.float64(scale))
-
-    def _local(x_local):
-        if x_local.dtype != jnp.complex128:
-            raise TypeError(
-                "FFI flat-k backend supports complex128 only, got "
-                f"{x_local.dtype}.")
-        if int(x_local.shape[0]) != nk:
-            raise ValueError(
-                f"flat-k local input leading extent {x_local.shape[0]} != "
-                f"nkx*nky*nkz = {nk}.")
-        out_t = jax.ShapeDtypeStruct(x_local.shape, x_local.dtype)
-        return jax.ffi.ffi_call(
-            FLAT_K_TARGET, out_t,
-            input_output_aliases={0: 0},
-        )(x_local, **attrs)
-
-    return _local
-
-
-def make_flat_k_fft_ffi(
-    mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    spec: P,
-    *,
-    kind: str,
-    norm: str | None,
-    out_spec: P | None,
-) -> Callable:
-    """FFI-backed flat-k FFT: ``(nk, *trail) -> (nk, *trail)``, same contract
-    as ``fft_helpers.make_flat_k_fft`` — one batched strided FFT per rank
-    over the local shard (the FFTW3-ABI host handler; this factory is cpu-only),
-    k-major layout end to end (never reshaped to the 3-D k-minor form, which
-    is the whole point).
-
-    FACTORY-time refusals: unsupported mesh platform, missing handler,
-    ``out_spec`` reshard.  TRACE-time refusals: non-c128 dtype, rank, and
-    leading extent — those are trace-time FACTS and cannot fire earlier
-    (the two-phase contract; ``docs/dev/ffi_gate_contract.md``).
-
-    ``input_output_aliases={0: 0}``: operand 0 is aliased to the result, so
-    when the buffer is dead XLA lets the handler transform it in place — the
-    terminal form of donation (zero extra big tiles).
-    """
-    if kind not in ('ifftn', 'fftn'):
-        raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
-    if out_spec is not None and tuple(out_spec) != tuple(spec):
-        raise ValueError(
-            "FFI flat-k backend does not implement a post-FFT reshard "
-            f"(out_spec {out_spec} != spec {spec}); unset LORRAX_FFT_FFI for "
-            "this call path or drop out_spec.")
-    require_fft_ffi(mesh, FLAT_K_TARGET)
-    nkx, nky, nkz = (int(v) for v in kgrid)
-    nk = nkx * nky * nkz
-    flat_spec = validate_flat_spec(spec, "the input")
-    _local = make_local_flat_k_fft_ffi(kgrid, kind=kind, norm=norm)
-
-    from common.shard_map import shard_map     # see the import-cycle note
-    _sm = shard_map(_local, mesh=mesh,
-                    in_specs=(flat_spec,), out_specs=flat_spec,
-                    check_vma=False)
-
-    def _flat_k_fft_ffi(x_flat):
-        if x_flat.dtype != jnp.complex128:
-            raise TypeError(
-                f"FFI flat-k backend supports complex128 only, got "
-                f"{x_flat.dtype} (the XLA path would accept it — unset "
-                f"LORRAX_FFT_FFI for this call path).")
-        if x_flat.ndim != len(tuple(flat_spec)):
-            raise ValueError(
-                f"flat-k input rank {x_flat.ndim} does not match the "
-                f"3-D-form spec {spec} (expect rank {len(tuple(flat_spec))} "
-                f"flat).")
-        if int(x_flat.shape[0]) != nk:
-            raise ValueError(
-                f"flat-k input leading extent {x_flat.shape[0]} != "
-                f"nkx*nky*nkz = {nk}.")
-        return _sm(x_flat)
-
-    return _flat_k_fft_ffi
-
-
 # ===========================================================================
-# The cpu leg of the k-leading convolution: the FFTW3-ABI gw_conv host handler
+# THE k-CONVOLUTION ROUTER — the ISDF pair convolution
 # ===========================================================================
-def _host_gw_conv_local(kgrid, norm: str | None, mult: float) -> Callable:
-    """Rank-local ``fn(G, W) -> sigma`` on the host gw_conv handler (the cpu plan route).
-
-    ``sigma = fftn(ifftn(G) * ifftn(W)[:, None, :, None, :] * mult)`` with all
-    three FFTW advanced-layout transforms and the broadcast multiply in one
-    call, chunked so the R-space G tile never materialises.  ``G``/``sigma``
-    ``(nk, a, mx, b, my)``, ``W`` ``(nk, mx, my)``.  Only
-    :func:`make_kconv_klead` builds it (its cpu leg); CUDA meshes take the
-    nvidia-mathdx family instead.
-    """
-    nkx, nky, nkz = (int(v) for v in kgrid)
-    nk = nkx * nky * nkz
-    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz),
-                 scale_i=np.float64(ffi_fft_scale('ifftn', norm, nk)),
-                 scale_f=np.float64(ffi_fft_scale('fftn', norm, nk) * float(mult)))
-
-    def _local(g_local, w_local):
-        out_t = jax.ShapeDtypeStruct(g_local.shape, g_local.dtype)
-        return jax.ffi.ffi_call(
-            GW_CONV_TARGET, out_t,
-            input_output_aliases={0: 0},  # sigma_k in G_k's buffer when dead
-        )(g_local, w_local, **attrs)
-
-    return _local
-
-
-# ===========================================================================
-# THE k-CONVOLUTION ROUTER — the ISDF pair convolution (decisions.md 2026-09-24)
-# ===========================================================================
-# Physics code asks for a pair convolution; the router answers by PLATFORM
-# only, never by an environment variable:
-#
-#     CUDA  -> the nvidia-mathdx family (cpp/cufft/kconv_mathdx_cuda_ffi.cc):
-#              cuFFTDx transforms, one fused pass, NVRTC-built per k-grid.
-#     cpu   -> the MKL flat-k plan route (``lorrax_mklfft_flat_k``) composed
-#              with XLA elementwise spin contraction.
-#     other -> refusal.
-#
-# Both backends return the SAME callable contract, so a consumer never
-# branches on the backend.  There is no plan route on NVIDIA.
+# CUDA -> the nvidia-mathdx family; cpu -> the plan backend; every other
+# platform -> the XLA backend.  All return the SAME callable contract, so a
+# consumer never branches on the backend.
 
 #: cuFFTDx fp64 thread-FFT limit: every k-grid axis must be at most this.
 KCONV_AXIS_MAX = 40
@@ -531,32 +205,48 @@ def mathdx_root() -> str:
     raise RuntimeError(
         "GATE mathdx-headers: got no importable nvidia.mathdx with "
         "include/cufftdx.hpp; want the nvidia-mathdx wheel, the only supported "
-        "k-convolution backend on NVIDIA GPUs (decisions.md 2026-09-24); why: "
+        "k-convolution backend on NVIDIA GPUs (docs/architecture/kconv.md#router); why: "
         "the fused k-convolution kernels are compiled at run time from its "
         "cuFFTDx headers; fix: pip install nvidia-mathdx.")
 
 
+#: Non-empty inside :func:`xla_reference`.
+_XLA_REFERENCE: list = []
+
+
+@contextlib.contextmanager
+def xla_reference():
+    """Build every factory inside this block on the XLA backend, on any platform.
+
+    The reference a kept vendor route is gated against on the same device
+    (``tests/test_kconv_xla_gate.py``) and timed against.  A factory decides
+    its backend when it is built, so the callables it returns keep it after
+    the block ends.  It is a Python argument of the caller, not an environment
+    variable, so no deployment can select it by accident.
+    """
+    _XLA_REFERENCE.append(True)
+    try:
+        yield
+    finally:
+        _XLA_REFERENCE.pop()
+
+
 def kconv_backend(mesh: Mesh) -> str:
-    """``'mathdx'`` on a CUDA mesh, ``'plan'`` on a cpu mesh; any other platform refuses."""
+    """``'mathdx'`` on a CUDA mesh, ``'plan'`` on a cpu mesh, ``'xla'`` on every
+    other platform and inside :func:`xla_reference`."""
     from ffi.gate import mesh_ffi_platform
-    plat = mesh_ffi_platform(mesh)
-    if plat == "CUDA":
-        return "mathdx"
-    if plat == "cpu":
-        return "plan"
-    raise RuntimeError(
-        f"GATE kconv-platform: got a {plat!r} mesh; want CUDA (nvidia-mathdx) "
-        "or cpu (MKL flat-k plans); why: the k-convolution router has no backend "
-        "for this platform; fix: run on a supported platform.")
+    if _XLA_REFERENCE:
+        return "xla"
+    return {"CUDA": "mathdx", "cpu": "plan"}.get(mesh_ffi_platform(mesh), "xla")
 
 
 def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
     """Startup check of the router's backend on this mesh; returns it or refuses.
 
-    CUDA: the nvidia-mathdx wheel and both family targets; cpu: the flat-k
-    plan target (already required by ``LORRAX_FFT_FFI``).
+    CUDA: the nvidia-mathdx wheel, every family target and one probe compile;
+    cpu: the two host plan targets.  The XLA backend needs no library.
     """
-    from ffi.gate import announce_once
+    from ffi.gate import announce_once, mesh_ffi_platform
     backend = kconv_backend(mesh)
     if backend == "mathdx":
         root = mathdx_root()
@@ -567,11 +257,16 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
                       f"[kconv] k-convolution router: CUDA -> nvidia-mathdx ({root}); "
                       f"cubin cache {_cubin_cache_summary()}",
                       scope="rank0", emit=announce)
-    else:
-        _require_plan_route()
+    elif backend == "plan":
+        for target in (FLAT_K_TARGET, GW_CONV_TARGET):
+            _require_target(target, "cpu")
         announce_once(("kconv", "backend", backend),
-                      "[kconv] k-convolution router: cpu -> MKL flat-k plan route",
+                      "[kconv] k-convolution router: cpu -> FFTW3-ABI host plan route",
                       scope="rank0", emit=announce)
+    else:
+        announce_once(("kconv", "backend", backend),
+                      f"[kconv] k-convolution router: {mesh_ffi_platform(mesh)} -> XLA "
+                      f"(jnp.fft k-axis transforms)", scope="rank0", emit=announce)
     return backend
 
 
@@ -639,8 +334,8 @@ def _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> dict:
 def _check_kgrid(kgrid, backend: str) -> tuple[int, int, int]:
     """Three positive k axes; on the ``mathdx`` leg also at most ``KCONV_AXIS_MAX``.
 
-    The cap is the fp64 cuFFTDx thread-FFT limit, a CUDA constraint: the cpu
-    plan route (FFTW) has none, so ``backend = "plan"`` does not apply it.
+    The cap is the fp64 cuFFTDx thread-FFT limit, a mathdx constraint: the XLA
+    backend has none.
     """
     kg = tuple(int(v) for v in kgrid)
     if len(kg) != 3 or min(kg) < 1:
@@ -678,44 +373,77 @@ def cubin_cache_dir() -> str:
     return str(user_cache_dir("kconv_mathdx"))
 
 
-# ---- the cpu leg: the MKL flat-k plan route ---------------------------------
+# ---- the plan (cpu) and XLA backends: one composition, two transform engines ----
 
-def _plan_kfft(x_flat, kgrid, kind: str):
-    """Unnormalised transform of the leading flat-k axis on the cpu plan route.
+#: The host FFTW3-ABI flat-k transform and fused Σ convolution of the plan backend.
+FLAT_K_TARGET = "lorrax_mklfft_flat_k"
+GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
 
-    TEST-ONLY exception: on the cpu backend with ``LORRAX_KFFT_CPU_TEST_XLA=1``
-    (set by ``tests/conftest.py`` for in-process cpu meshes, which have no host
-    FFI library on Perlmutter) this announces itself and uses ``jnp.fft``.
-    """
-    import os
+
+# Kernel lessons: the plan backend's host FFTW3-ABI handlers (numbers: sandbox claim ids).
+# Over plain JAX: one CrI3 6x6 P4 rank tile (6x6x1 k, 489 x 489 centroids, ns 2) on 128 Milan
+#   cores, the Sigma tau convolution 0.16 s against 1.20 s for jnp.fft and the chi0 transform
+#   pair 0.34 s against 1.32 s; peak RSS 5.6 against 4.2 GB (3979).
+def _host_flat_k(x_flat, kgrid, kind: str, scale: float = 1.0):
+    """``scale·FFT^±`` of the leading flat-k axis on the host FFTW3-ABI handler (complex128)."""
+    _require_target(FLAT_K_TARGET, "cpu")
+    kg = tuple(int(v) for v in kgrid)
+    if x_flat.dtype != jnp.complex128:
+        raise TypeError(f"the host flat-k transform is complex128 only, got {x_flat.dtype}")
+    if int(x_flat.shape[0]) != kg[0] * kg[1] * kg[2]:
+        raise ValueError(f"flat-k input leading extent {x_flat.shape[0]} != prod({kg})")
+    return jax.ffi.ffi_call(
+        FLAT_K_TARGET, jax.ShapeDtypeStruct(x_flat.shape, x_flat.dtype),
+        input_output_aliases={0: 0},
+    )(x_flat, nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+      forward=np.int64(0 if kind == "ifftn" else 1), scale=np.float64(scale))
+
+
+def _host_gw_conv_local(kgrid, norm: str | None, mult: float) -> Callable:
+    """Rank-local ``fn(G, W) -> sigma`` on the host gw_conv handler (the plan backend):
+    ``sigma = fftn(ifftn(G) * ifftn(W)[:, None, :, None, :] * mult)``, all three
+    transforms and the product in one chunked call, so the R-space G tile never
+    materialises.  ``W`` stays in k space (the plan backend's ``prep`` is the identity)."""
+    _require_target(GW_CONV_TARGET, "cpu")
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                 scale_i=np.float64(ffi_fft_scale('ifftn', norm, nk)),
+                 scale_f=np.float64(ffi_fft_scale('fftn', norm, nk) * float(mult)))
+
+    def _local(g_local, w_local):
+        return jax.ffi.ffi_call(GW_CONV_TARGET, jax.ShapeDtypeStruct(g_local.shape, g_local.dtype),
+                                input_output_aliases={0: 0})(g_local, w_local, **attrs)
+    return _local
+
+
+def _kfft(x_flat, kgrid, kind: str, backend: str):
+    """Unnormalised transform of the leading flat-k axis: the host handler on the
+    plan backend, ``jnp.fft`` on the XLA backend."""
+    if backend == "plan":
+        return _host_flat_k(x_flat, kgrid, kind)
+    from common.fft_helpers import local_fftn3, local_ifftn3   # see the import-cycle note
     kg = tuple(int(v) for v in kgrid)
     norm = "forward" if kind == "ifftn" else "backward"          # both unnormalised
-    if os.environ.get("LORRAX_KFFT_CPU_TEST_XLA") == "1" and jax.default_backend() == "cpu":
-        from ffi.gate import announce_once
-        announce_once(("kconv", "cpu-test-xla"),
-                      "[kconv] TEST-ONLY: LORRAX_KFFT_CPU_TEST_XLA=1 on cpu -> jnp.fft "
-                      "k-axis transforms (never a production path)")
-        from common.fft_helpers import local_fftn3, local_ifftn3   # see the import-cycle note
-        f = local_ifftn3 if kind == "ifftn" else local_fftn3
-        y = f(x_flat.reshape(kg + tuple(x_flat.shape[1:])), axes=(0, 1, 2), norm=norm)
-        return y.reshape(x_flat.shape)
-    return make_local_flat_k_fft_ffi(kg, kind=kind, norm=norm)(x_flat)
+    f = local_ifftn3 if kind == "ifftn" else local_fftn3
+    y = f(x_flat.reshape(kg + tuple(x_flat.shape[1:])), axes=(0, 1, 2), norm=norm)
+    return y.reshape(x_flat.shape)
 
 
-def _plan_pair_tail(P_l, P_r, kgrid, perm_l, phase_l, perm_r, phase_r, scale):
+def _pair_tail(P_l, P_r, kgrid, perm_l, phase_l, perm_r, phase_r, scale, backend):
     """``s·FFT_k Σ_ab phase_l[a]·phase_r[b]·conj(IFFT_k P_l[:,a,…,b])·IFFT_k P_r[:,π_l a,…,π_r b]``.
 
     ``P_l``/``P_r`` are flat-k open-spin ``(nk, ns, *rows, ns)``; returns ``(nk, *rows)``.
     """
     ns = int(P_l.shape[1])
-    I_l = jnp.conj(_plan_kfft(P_l, kgrid, "ifftn"))
-    I_r = _plan_kfft(P_r, kgrid, "ifftn")
+    I_l = jnp.conj(_kfft(P_l, kgrid, "ifftn", backend))
+    I_r = _kfft(P_r, kgrid, "ifftn", backend)
     Z = 0
     for a in range(ns):
         for b in range(ns):
             w = complex(phase_l[a]) * complex(phase_r[b])
             Z = Z + w * I_l[:, a, ..., b] * I_r[:, int(perm_l[a]), ..., int(perm_r[b])]
-    return _plan_kfft(Z, kgrid, "fftn") * scale
+    return _kfft(Z, kgrid, "fftn", backend) * scale
 
 
 def _parent_open_spin(D, tables, right: bool):
@@ -891,8 +619,8 @@ def make_fused_conv_kpair(
 
         U = s·FFT_k Σ_ab phase_l[a]·phase_r[b]·conj(IFFT_k A[…,a,…,b])·IFFT_k B[…,π_l a,…,π_r b]
 
-    CUDA: the nvidia-mathdx family; cpu: the MKL flat-k plan route; the two
-    return the same contract (decisions.md 2026-09-24).
+    CUDA: the nvidia-mathdx family; cpu: the plan backend; elsewhere the XLA
+    backend; all return the same contract.
     """
     ns = int(np.asarray(perm_l).size)
     nkx, nky, nkz = (int(v) for v in kgrid)
@@ -924,8 +652,7 @@ def make_fused_conv_kpair(
             return jax.ffi.ffi_call(KCONV_PAIR_TARGET, out)(A, B, **attrs)
         return _mathdx
 
-    _require_plan_route()
-    return _plan_kpair(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
+    return _kpair(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend)
 
 
 def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
@@ -937,7 +664,7 @@ def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
     ``U`` ``(nk, mu, nu)``.  ``centroid_major`` states the physical layout of
     the D operands (CCT) for the CUDA handler; the logical contract is
     unchanged.  ``trailing_shape`` is the caller's ``(mu, nu)`` tile, kept for
-    the seam's signature.  CUDA: nvidia-mathdx; cpu: the MKL plan route.
+    the seam's signature.  CUDA: nvidia-mathdx; cpu: the plan backend; elsewhere XLA.
     """
     del trailing_shape
     ns = int(ns)
@@ -962,8 +689,7 @@ def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
             )(D_l, D_r, *tables, **attrs)
         return _mathdx
 
-    _require_plan_route()
-    return _plan_kparent(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
+    return _kparent(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend)
 
 
 def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r) -> Callable:
@@ -980,7 +706,7 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
     — :func:`make_fused_conv_kparent` on the identity plan, without the
     transposed, phased and split copy of ``D`` that its operand layout needs.
     CUDA: nvidia-mathdx mode 6 (the phase and the split are applied on load);
-    cpu: the plan route on the same composition.  ``s`` is the forward-norm
+    the plan and XLA backends run the same composition.  ``s`` is the forward-norm
     pair scale of the parent factory.
     """
     ns = int(ns)
@@ -1019,17 +745,17 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
             return jax.ffi.ffi_call(KCONV_PLANE_TARGET, out)(D, F, **attrs)
         return _mathdx
 
-    _require_plan_route()
     pl, pr = _check_perm(perm_l, ns, "left"), _check_perm(perm_r, ns, "right")
     phl = np.asarray(phase_l, np.complex128).reshape(-1)
     phr = np.asarray(phase_r, np.complex128).reshape(-1)
 
-    def _plan(D, F):
+    def _xla(D, F):
         c = _check_plane_operands(D, F, nk, ns)
         X = jnp.moveaxis(D * F[:, :, None, None, None, :], 1, 4)    # (k, a, 2c, b, g, p)
         X = jnp.conj(jnp.moveaxis(X.reshape(nk, ns, 2 * c, ns, -1), 3, 4))
-        return _plan_pair_tail(X[:, :, :c], X[:, :, c:], kgrid, pl, phl, pr, phr, scale)
-    return _plan
+        return _pair_tail(X[:, :, :c], X[:, :, c:], kgrid, pl, phl, pr, phr, scale,
+                          kconv_backend(mesh))
+    return _xla
 
 
 def _check_plane_operands(D, F, nk: int, ns: int) -> int:
@@ -1043,44 +769,34 @@ def _check_plane_operands(D, F, nk: int, ns: int) -> int:
     return int(D.shape[3]) // 2
 
 
-def _plan_kpair(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> Callable:
-    """The plan-route ``fn(A, B) -> U`` of :func:`make_fused_conv_kpair` (the cpu leg)."""
+def _kpair(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend) -> Callable:
+    """The plan/XLA-backend ``fn(A, B) -> U`` of :func:`make_fused_conv_kpair`."""
     kg = tuple(int(v) for v in kgrid)
     nk = kg[0] * kg[1] * kg[2]
     pl, pr = _check_perm(perm_l, ns, "left"), _check_perm(perm_r, ns, "right")
     phl = np.asarray(phase_l, np.complex128).reshape(-1)
     phr = np.asarray(phase_r, np.complex128).reshape(-1)
 
-    def _plan(A, B):
+    def _xla(A, B):
         _check_pair_operands(A, B, kg, ns)
         flat = lambda X: X.reshape((nk,) + tuple(X.shape[3:]))
-        U = _plan_pair_tail(flat(A), flat(B), kg, pl, phl, pr, phr, scale)
+        U = _pair_tail(flat(A), flat(B), kg, pl, phl, pr, phr, scale, backend)
         return U.reshape(A.shape[:3] + A.shape[4:6])
-    return _plan
+    return _xla
 
 
-def _plan_kparent(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> Callable:
-    """The plan-route ``fn(D_l, D_r, tables) -> U`` of :func:`make_fused_conv_kparent`."""
+def _kparent(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend) -> Callable:
+    """The plan/XLA-backend ``fn(D_l, D_r, tables) -> U`` of :func:`make_fused_conv_kparent`."""
     pl, pr = _check_perm(perm_l, ns, "left"), _check_perm(perm_r, ns, "right")
     phl = np.asarray(phase_l, np.complex128).reshape(-1)
     phr = np.asarray(phase_r, np.complex128).reshape(-1)
 
-    def _plan(D_l, D_r, tables):
+    def _xla(D_l, D_r, tables):
         _check_parent_operands(D_l, D_r, ns)
-        return _plan_pair_tail(_parent_open_spin(D_l, tables, False),
-                               _parent_open_spin(D_r, tables, True),
-                               kgrid, pl, phl, pr, phr, scale)
-    return _plan
-
-
-def _require_plan_route() -> None:
-    """The cpu leg needs the host flat-k handler (or the announced test-only arm)."""
-    import os
-    if os.environ.get("LORRAX_KFFT_CPU_TEST_XLA") == "1":
-        return
-    if not fft_ffi_enabled():
-        raise RuntimeError(GATE.off_refuse_msg)
-    _require_target(FLAT_K_TARGET, "cpu")
+        return _pair_tail(_parent_open_spin(D_l, tables, False),
+                          _parent_open_spin(D_r, tables, True),
+                          kgrid, pl, phl, pr, phr, scale, backend)
+    return _xla
 
 
 def _check_pair_operands(A, B, kg, ns) -> None:
@@ -1103,8 +819,8 @@ def _check_parent_operands(D_l, D_r, ns) -> None:
 # THE k-CONVOLUTION ROUTER — stored-kernel convolutions and k-axis transforms
 # ===========================================================================
 # Same routing as the pair family above: CUDA -> nvidia-mathdx (modes 2-5 of
-# cpp/cufft/kconv_mathdx_cuda_ffi.cc), cpu -> the plan route, anything else ->
-# refusal.  The k axis is either LEADING (the Σ/COHSEX dot layout, flat k first)
+# cpp/cufft/kconv_mathdx_cuda_ffi.cc), cpu -> the plan backend, other -> XLA.
+# The k axis is either LEADING (the Σ/COHSEX dot layout, flat k first)
 # or MINOR (the BSE ring layout, the three k axes last); a caller asks for the
 # factory that matches the tile it holds, and never transposes to reach another.
 #
@@ -1121,18 +837,10 @@ class KConvStored(NamedTuple):
 
     ``prep(W) -> W_prep`` is everything that depends on W alone, paid once per
     W; ``apply(T, W_prep) -> U`` is the rest, paid per T.  ``W_prep`` is the
-    backend's own form (R space on CUDA, k space on the cpu handler, which
-    transforms W itself): pass it only to the ``apply`` of the same pair.
+    R-space form: pass it only to the ``apply`` of the same pair.
     """
     prep: Callable
     apply: Callable
-
-
-def _cpu_test_arm() -> bool:
-    """The announced TEST-ONLY jnp arm of the cpu leg (see :func:`_plan_kfft`)."""
-    import os
-    return (os.environ.get("LORRAX_KFFT_CPU_TEST_XLA") == "1"
-            and jax.default_backend() == "cpu")
 
 
 def _rows_kfft_call(target, x2, kg, *, forward: bool, scale: float):
@@ -1169,14 +877,14 @@ def make_local_kfft_klead(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> 
                                 forward=kind == "fftn", scale=scale)
             return y.reshape(x.shape)
         return _mathdx
-    _require_plan_route()
-    if not _cpu_test_arm():
-        return make_local_flat_k_fft_ffi(kg, kind=kind, norm=norm)   # the host plan handler
 
-    def _plan(x):
+    if kconv_backend(mesh) == "plan":
+        return lambda x: _host_flat_k(x, kg, kind, scale)
+
+    def _xla(x):
         _check_complex(x)
-        return _plan_kfft(x, kg, kind) * scale
-    return _plan
+        return _kfft(x, kg, kind, "xla") * scale
+    return _xla
 
 
 def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> Callable:
@@ -1186,13 +894,12 @@ def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) ->
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale(kind, norm, nk)
-    mathdx = kconv_backend(mesh) == "mathdx"
+    backend = kconv_backend(mesh)
+    mathdx = backend == "mathdx"
     if mathdx:
         _require_target(KFFT_KMINOR_TARGET, "CUDA")
-    else:
-        _require_plan_route()
 
-    def _kfft(x):
+    def _kminor(x):
         _check_complex(x)
         if tuple(int(v) for v in x.shape[-3:]) != kg:
             raise ValueError(f"k-minor transform expects trailing k axes {kg}; got {x.shape}")
@@ -1200,16 +907,16 @@ def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) ->
             y = _rows_kfft_call(KFFT_KMINOR_TARGET, x.reshape(-1, nk), kg,
                                 forward=kind == "fftn", scale=scale)
             return y.reshape(x.shape)
-        lead = x.reshape(-1, nk).T                        # the plan route is k-leading
-        return (_plan_kfft(lead, kg, kind) * scale).T.reshape(x.shape)
-    return _kfft
+        lead = x.reshape(-1, nk).T                        # the transform is k-leading
+        return (_kfft(lead, kg, kind, backend) * scale).T.reshape(x.shape)
+    return _kminor
 
 
 def live_row_mask(live, n_rows: int, per_row: int = 1):
     """The mask of a padded pass's live rows: ``live`` (int32 [2]) is ``[lo, hi)`` in rows of
     ``per_row`` entries; an axis of ``n_rows * per_row`` entries.  The mathdx kconv calls take ``live``
     as an optional last operand, skip the rest and store them as zeros (mode 11: add nothing);
-    the cpu compositions zero them with this."""
+    the XLA compositions zero them with this."""
     r = jnp.arange(n_rows * per_row) // per_row
     return (r >= live[0]) & (r < live[1])
 
@@ -1323,7 +1030,7 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
     serve (an axis with no thread-FFT split, :func:`plane_fft_split`, or a
     plane above the device's opt-in shared memory) takes the XLA route
     (static-run concatenate + cuFFT 2-D), decided here once and announced.
-    cpu: the XLA route.  The returned function's ``route`` attribute names
+    Elsewhere the XLA route.  The returned function's ``route`` attribute names
     the one taken (``'mathdx'`` or ``'xla'``).
     """
     nb, nc = (int(v) for v in plane_shape)
@@ -1401,9 +1108,8 @@ def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
     leading, specs in the 3-D form).  Returns :class:`KConvStored`.
 
     CUDA: ``prep`` is the mathdx k-leading transform (``ifftn(W)`` into R space,
-    once per W) and ``apply`` the fused mathdx T·W pass, in place on T.  cpu:
-    ``prep`` is the identity and ``apply`` the FFTW gw_conv host handler, which
-    transforms W itself.
+    once per W) and ``apply`` the fused mathdx T·W pass, in place on T.  The XLA
+    backend: the same split in XLA ops.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
@@ -1436,7 +1142,7 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
 
     ``U = mult · fftn(ifftn(T) · V_R[:, None, :, None, :])`` for ``T``/``U``
     ``(nk, a, mx, b, my)`` and ``V_R`` ``(nk, mx, my)``.  CUDA: mathdx mode 2, the
-    Σ τ pass of :func:`make_kconv_klead`, in place on T.  cpu: the plan route (as
+    Σ τ pass of :func:`make_kconv_klead`, in place on T.  Elsewhere the XLA backend (as
     :func:`make_local_kconv_kminor`), not the gw_conv host handler, which takes
     k-space W.  The BSE W term holds its T k-leading so that the encode and
     decode are batched ZGEMMs with no T-sized transpose, and calls this factory.
@@ -1454,12 +1160,13 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
                 KCONV_KLEAD_TARGET, jax.ShapeDtypeStruct(t.shape, t.dtype),
                 input_output_aliases={0: 0})(t, v_r, **attrs, **_mathdx_common())
         return _mathdx
-    _require_plan_route()
 
-    def _plan(t, v_r):
-        t_r = _plan_kfft(t, kg, "ifftn") * scale
-        return _plan_kfft(t_r * v_r[:, None, :, None, :], kg, "fftn")
-    return _plan
+    backend = kconv_backend(mesh)
+
+    def _xla(t, v_r):
+        t_r = _kfft(t, kg, "ifftn", backend) * scale
+        return _kfft(t_r * v_r[:, None, :, None, :], kg, "fftn", backend)
+    return _xla
 
 
 def klead_outer_refusal(mesh: Mesh, kgrid, optin: int | None = None) -> str | None:
@@ -1467,8 +1174,8 @@ def klead_outer_refusal(mesh: Mesh, kgrid, optin: int | None = None) -> str | No
 
     CUDA needs the handler in the loaded library and the load's 64-column k-box bank,
     ``64·16·((nx·ny·(nz|1))|1)`` B, within the opt-in shared memory per block (the handler's
-    GATE mathdx-kconv-outer-tile; ``optin`` defaults to the device's attribute).  A cpu mesh
-    is always served (the plan route).  Callers that get a reason keep the unfused encode +
+    GATE mathdx-kconv-outer-tile; ``optin`` defaults to the device's attribute).  An XLA-backend
+    mesh is always served.  Callers that get a reason keep the unfused encode +
     :func:`make_local_kconv_klead` chain and say so.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
@@ -1500,7 +1207,7 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), moveaxis(V_R, -1, 0))``.  ``conj_r`` (static)
     reads ``conj(R)`` instead (the BSE right leg is a conjugated wavefunction; reading it from
     the wavefunction avoids a conjugated copy, bit for bit the explicit ``conj``).  K is zero-padded
-    to a multiple of 4 (the m8n8k4 chunk; exact).  cpu: that composition on the plan route.
+    to a multiple of 4 (the m8n8k4 chunk; exact).  The XLA backend: that composition in XLA.
     Check :func:`klead_outer_refusal` first.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
@@ -1524,10 +1231,10 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
         return _mathdx
     apply = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
 
-    def _plan(l, r, v_r, conj_r=False):
+    def _xla(l, r, v_r, conj_r=False):
         return apply(jnp.einsum("kaxK,kKby->kaxby", l, jnp.conj(r) if conj_r else r),
                      jnp.moveaxis(v_r, -1, 0))
-    return _plan
+    return _xla
 
 
 def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = None) -> str | None:
@@ -1537,7 +1244,7 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
     banks, ``2·64·16·RS`` B, within the opt-in shared memory (the handler stages the V tile beside
     them when that fits too, else its Mid reads V from L2), and the per-lane accumulator
     ``ceil(nk/16)·ceil(n_c/8) <= 8`` m8n8 blocks (the handler's GATE mathdx-kconv-outer-decode-tile).
-    A cpu mesh is always served.  Callers that get a reason keep the outer conv + XLA decode.
+    An XLA-backend mesh is always served.  Callers that get a reason keep the outer conv + XLA decode.
     """
     why = klead_outer_refusal(mesh, kgrid, optin)
     if why is not None or kconv_backend(mesh) != "mathdx":
@@ -1601,8 +1308,8 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
     block per SM, two 8-warp groups ping-ponging on two banks; the (phase, item) tiles go round robin
     so a wave shares one x window in L2, and the tile completing an item sums its partials in phase
     order (deterministic).  ``L`` and ``R`` are
-    tiled into fragment order per call (K zero-padded to a multiple of 4, μ and ν to 8).  cpu: the
-    outer conv's plan route and the einsum.
+    tiled into fragment order per call (K zero-padded to a multiple of 4, μ and ν to 8).  The XLA
+    backend: the outer conv and the einsum in XLA.
     Check :func:`klead_outer_decode_refusal` first.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
@@ -1610,12 +1317,12 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
     if kconv_backend(mesh) != "mathdx":
         outer = make_local_kconv_klead_outer(mesh, kg, norm=norm)
 
-        def _prep_cpu(pc):
+        def _prep_xla(pc):
             return pc
 
-        def _apply_cpu(l, r, v_r, pc, conj_r=False):
+        def _apply_xla(l, r, v_r, pc, conj_r=False):
             return jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(pc), outer(l, r, v_r, conj_r=conj_r))
-        return _prep_cpu, _apply_cpu
+        return _prep_xla, _apply_xla
     _require_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
     _require_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
     scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk)
@@ -1644,18 +1351,13 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
 
 
 def _klead_locals(mesh, kg, norm, mult):
-    """Rank-local ``(prep, apply)`` of :func:`make_kconv_klead` for this mesh's backend."""
-    if kconv_backend(mesh) == "mathdx" or _cpu_test_arm():
-        prep_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
-        apply_local = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
-    else:
-        _require_plan_route()
-        _require_target(GW_CONV_TARGET, "cpu")
-
-        def prep_local(w):
-            return w
-        apply_local = _host_gw_conv_local(kg, norm, mult)
-    return prep_local, apply_local
+    """Rank-local ``(prep, apply)`` of :func:`make_kconv_klead`: ``ifftn(W)`` into R
+    space, then the T·W_R pass; on the plan backend the identity and the host
+    gw_conv handler, which transforms W itself."""
+    if kconv_backend(mesh) == "plan":
+        return (lambda w: w), _host_gw_conv_local(kg, norm, mult)
+    return (make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm),
+            make_local_kconv_klead(mesh, kg, norm=norm, mult=mult))
 
 
 def _store_row_map(store_rows, nk: int, label: str) -> tuple[np.ndarray, np.ndarray]:
@@ -1755,8 +1457,8 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     tables on the devices (``symmetry_maps.device_load_tables``, or a pass's
     cut of them, ``gw.subtile_stream.window_load``), read as operands so the
     consumer's program holds no table constants.  CUDA: nvidia-mathdx mode 7;
-    cpu: the service's reference composition, then the plan route and the row
-    selection.
+    elsewhere the service's reference composition, then the XLA convolution and
+    the row selection.
 
     ``apply(..., rows=(x0, bx, xs, xn))`` stores one x block with the whole spin group: block
     row ``r`` in ``[0, xn*bx)`` of every rank's ``mu`` tile is the local left centroid
@@ -1914,8 +1616,8 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
     the kernel's load.
 
     CUDA: nvidia-mathdx mode 8 with the second (W) load; it rounds as mode 9
-    on ``W`` then the V_R kconv call (bit for bit).  cpu: the service's reference
-    unfold of both operands and the plan route.  ``load``/``w_load``
+    on ``W`` then the V_R kconv call (bit for bit).  Elsewhere the service's
+    reference unfold of both operands and the XLA convolution.  ``load``/``w_load``
     (``symmetry_maps.DeviceLoadTables`` of ``tables``/``w_tables``, or of a
     row pass's cut of them): the tables enter as device operands, so the
     program holds no table constants; without them the host tables are baked.
@@ -2082,9 +1784,8 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
     ``make_kconv_klead(...).prep`` of the full-zone interaction
     (``unfold_isdf_operator``, then the endpoint actions): the unfold is the
     transform's load, so the full-zone interaction is never stored.  CUDA:
-    nvidia-mathdx mode 9; cpu: the service's reference composition, then the
-    prep of the plan route (``ifftn``; the identity on the host-conv arm,
-    whose apply transforms W itself).  ``live`` (int32 ``[2]``, replicated): the pass is padded
+    nvidia-mathdx mode 9; elsewhere the service's reference composition, then
+    ``ifftn``.  ``live`` (int32 ``[2]``, replicated): the pass is padded
     to a scan's largest pass and ``[lo, hi)`` its live left centroid rows; the rest come back zero.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
@@ -2109,9 +1810,9 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
                 w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r,
                 *(() if live is None else (live,)), **attrs)
     else:
-        _require_plan_route()
-        prep_local = (make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
-                      if _cpu_test_arm() else (lambda o: o))
+        # The plan backend's gw_conv apply transforms W itself, so its prep stays in k space.
+        prep_local = ((lambda o: o) if kconv_backend(mesh) == "plan"
+                      else make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm))
 
         def apply_tables(w, wt, t, live):
             O = apply_unfold_load_tables_local(w, wt, t, spin_l,
@@ -2245,8 +1946,8 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     (``symmetry_maps.device_load_tables``), read as operands so a consumer's jit holds no
     table constants (baked, they are ~0.57 GB of HLO literal at Fe 20^3 with 1792 centroids).
     CUDA: nvidia-mathdx mode 11 on the k-box stage (one pass; a chunked split pass on
-    large grids, its intermediate bounded by ``scratch_bytes``); cpu: the service's reference
-    composition, then the plan route.
+    large grids, its intermediate bounded by ``scratch_bytes``); elsewhere the service's reference
+    composition, then the XLA transforms.
     """
     from symmetry_maps import (DEVICE_LOAD_SPECS, apply_unfold_load_tables_local,
                                local_unfold_load_tables)
@@ -2281,7 +1982,6 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
                         complete=np.int64(complete), scratch_bytes=np.int64(budget),
                         **_mathdx_common())
     else:
-        _require_plan_route()
         ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
 
         def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
@@ -2356,7 +2056,7 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     ``(na*nb, nk, mu, nu)`` at ``P(None,None,'x','y')``, donated.  No full-k
     Green exists.  ``load``, when given, is the same tables on the devices
     (``symmetry_maps.device_load_tables``), read as operands so a consumer's
-    jit holds no table constants.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); cpu:
+    jit holds no table constants.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); elsewhere
     the service's reference composition.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
@@ -2401,7 +2101,6 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
                         perm_l=perm_l, phase_l=phase_l, perm_r=perm_r, phase_r=phase_r,
                         na=np.int64(na), nb=np.int64(nb), **_mathdx_common())
     else:
-        _require_plan_route()
         ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
         codes = np.asarray([1, 1j, -1, -1j])
         pl, hl = perm_l.reshape(na, ns), codes[phase_l.reshape(na, ns)]
@@ -2501,16 +2200,17 @@ def make_local_kconv_kminor(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
             return jax.ffi.ffi_call(KCONV_KMINOR_TARGET, out, **kw)(
                 x, k_r, **attrs, **_mathdx_common())
         return _mathdx
-    _require_plan_route()
 
-    def _plan(x, k_r):
+    backend = kconv_backend(mesh)
+
+    def _xla(x, k_r):
         _check_complex(x, k_r)
-        lead = jnp.moveaxis(x, -1, 0)                      # the plan route is k-leading
-        u = _plan_kfft(_plan_kfft(lead, kg, "ifftn")
-                       * jnp.moveaxis(k_r, -1, 0)[:, None, :, :, None, None], kg, "fftn")
+        lead = jnp.moveaxis(x, -1, 0)                      # the transform is k-leading
+        u = _kfft(_kfft(lead, kg, "ifftn", backend)
+                  * jnp.moveaxis(k_r, -1, 0)[:, None, :, :, None, None], kg, "fftn", backend)
         u = jnp.moveaxis(u * scale, 0, -1)
         return u if out_layout == 0 else jnp.transpose(u, (0, 5, 3, 1, 4, 2))
-    return _plan
+    return _xla
 
 
 def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,

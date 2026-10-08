@@ -2314,7 +2314,7 @@ def run_main_and_finalize(main, argv=None) -> None:
 #
 # THE RULE THE FORMATTER ENFORCES.  Every sentence ends in a period, and
 # every choice where more than one outcome was possible is stated even when
-# it resolved to the boring one.  "LORRAX_FFT_FFI is off" is not noise: the
+# it resolved to the boring one.  "LORRAX_BANDS_GEMM_FFI is off" is not noise: the
 # absence of that line is indistinguishable from the flag being on, and the
 # whole point of the block is that a performance question can be answered
 # from the log without re-running anything.
@@ -2498,10 +2498,8 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     run's mesh: a missing or unloadable FFI library REFUSES here, at
     startup, quoting ``probe_target``'s three-way reason (which names the
     ``.so`` and the LD_LIBRARY_PATH/build fix), instead of surfacing at the
-    first kernel factory mid-run; an explicit ``=0`` refuses (where the
-    native duplicate was deleted — LORRAX_FFT_FFI) or announces the
-    uncertified debug opt-out (where a native path is structurally
-    retained — LORRAX_BANDS_GEMM_FFI).  Out-of-scope platforms are skipped per each gate's
+    first kernel factory mid-run; an explicit ``LORRAX_BANDS_GEMM_FFI=0``
+    announces its XLA fallback.  Out-of-scope platforms are skipped per each gate's
     declared policy (the platform's native lowering IS the required path
     there, e.g. cuBLAS dot on CUDA for the GEMM dial).
 
@@ -2511,14 +2509,13 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     log.  An import failure of the gate modules themselves is a broken
     build and propagates for the same reason.
     """
-    from ffi.fft import GATE as _FFT_GATE, require_fourier_plan, require_kconv
+    from ffi.fft import require_fourier_plan, require_kconv
     from ffi.gemm import GATE as _GEMM_GATE
 
-    for gate in (_FFT_GATE, _GEMM_GATE):
-        gate.enforce(mesh, announce=announce)
-    # The k-convolution router has no dial: it resolves by platform and
-    # refuses here, at startup, when its backend cannot be served (on CUDA a
-    # missing nvidia-mathdx wheel; docs/architecture/kconv.md#router).
+    _GEMM_GATE.enforce(mesh, announce=announce)
+    # The k-convolution router has no dial: it resolves by device vendor and,
+    # on CUDA, refuses here at startup when mathdx cannot be served (a missing
+    # nvidia-mathdx wheel; docs/architecture/kconv.md#router).
     require_kconv(mesh, announce=announce)
     # LocalFourierPlan's CUDA leg is one custom call in the same library.
     require_fourier_plan(mesh, announce=announce)
@@ -2542,14 +2539,12 @@ def _ffi_dial_facts() -> list:
     out = []
     try:
         from ffi.gemm import GATE as _GEMM_GATE
-        from ffi.fft import GATE as _FFT_GATE
     except Exception as exc:                                  # noqa: BLE001
         return [{"env": "<ffi dials>", "mode": None, "enabled": None,
                  "detail": f"the FFI gate modules could not be imported "
                            f"({type(exc).__name__}: {exc})"}]
     for gate, what in ((_GEMM_GATE, "the contract_bands right-GEMM "
-                                    "contraction"),
-                       (_FFT_GATE, "the flat-k 3-D FFT helper path")):
+                                    "contraction"),):
         try:
             mode = gate.mode()
             enabled = gate.enabled()

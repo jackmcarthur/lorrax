@@ -81,10 +81,8 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     nkx, nky, nkz = kgrid
     nk = nkx * nky * nkz
     n_out = int(n_out)
-    # ffi_dial_key(): the make_flat_k_fftn factories below read
-    # LORRAX_FFT_FFI at FACTORY time, so the dials must be part of this
-    # cache key or a mid-process flag flip serves the stale backend
-    # (docs/architecture/services.md, ``ffi.ffi_dial_key``).
+    # ffi_dial_key(): the factories below read their FFI dials at FACTORY
+    # time, so the dials are part of this cache key (``ffi.ffi_dial_key``).
     from ffi import ffi_dial_key
     complex_contour = bool(complex_contour)
     if layout not in ("face", "axis"):
@@ -258,7 +256,7 @@ def _chi_kconv_serves(mesh_xy, kgrid, ns) -> bool:
     A grid it cannot hold (``ffi.fft.chi_unfold_refusal``) keeps the full-k
     Green route; the refusal is announced once.
     """
-    from ffi import fft as _F
+    from common import fft_helpers as _F
     why = (_F.chi_unfold_refusal(kgrid, int(ns))
            if _F.kconv_backend(mesh_xy) == "mathdx" else "")
     if why:
@@ -352,7 +350,7 @@ def _photon_chi_kconvs(mesh_xy, kgrid, half_plans, parity, rows):
     (:func:`_place_photon_kconv_tables` places each once).
     """
     from common.gamma_matrices import gamma_perm_phase_host
-    from ffi.fft import make_kconv_chi_vertex
+    from common.fft_helpers import make_kconv_chi_vertex
     from .photon_layout import FAMILY_PAIRS, family_channels
     from .subtile_stream import window_tables
     p = np.asarray(parity, dtype=np.float64)
@@ -1091,7 +1089,7 @@ def _get_chi_fractional_contour_kernel_face(
     from symmetry_maps import DeviceLoadTables
     photon_kconvs = None
     if photon is not None:
-        from ffi import fft as _F
+        from common import fft_helpers as _F
         why = _F.chi_unfold_refusal(grid, 2) if _F.kconv_backend(mesh_xy) == "mathdx" else ""
         if why:
             raise ValueError(

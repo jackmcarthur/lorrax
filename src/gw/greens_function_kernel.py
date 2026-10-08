@@ -568,7 +568,7 @@ def chi0_kconv_scratch(*, kgrid, n_parent, n_rmu, ns, mesh, n_right=None):
     """Per-rank run-time scratch of one mathdx mode-11 call: its split arm's intermediate,
     the bound owned by ``ffi.fft.chi_unfold_scratch_bytes``;
     0 on the single pass and off the mathdx backend."""
-    from ffi import fft as F
+    from common import fft_helpers as F
     if F.kconv_backend(mesh) != "mathdx":
         return 0
     tile, _ = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=0, mesh=mesh,
@@ -580,7 +580,7 @@ def sigma_kconv_scratch(*, kgrid, ns, rows, n_right, mesh):
     """Per-rank run-time scratch of one mathdx mode-7 Σ call storing ``rows`` local μ rows
     of ``n_right`` local ν: the bound owned by ``ffi.fft.klead_unfold_scratch_bytes``;
     0 on the single arm and off the mathdx backend."""
-    from ffi import fft as F
+    from common import fft_helpers as F
     if F.kconv_backend(mesh) != "mathdx":
         return 0
     return F.klead_unfold_scratch_bytes(kgrid, ns, int(rows) * int(n_right))

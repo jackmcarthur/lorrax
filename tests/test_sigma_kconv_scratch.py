@@ -31,7 +31,9 @@ def test_sigma_price_and_window_checks_carry_the_scratch(monkeypatch):
     from gw.greens_function_kernel import sigma_spin_block
     from gw.mpa.sigma import SynthesisTau
 
-    monkeypatch.setattr(F, "kconv_backend", lambda mesh: "mathdx")
+    from common import fft_helpers
+    # The Green kernel reaches the router through common.fft_helpers.
+    monkeypatch.setattr(fft_helpers, "kconv_backend", lambda mesh: "mathdx")
     monkeypatch.setattr(F, "_optin_smem_bytes", lambda ordinal=0: OPTIN)
     mesh = SimpleNamespace(shape={"x": 8, "y": 8})
     plan = {}
