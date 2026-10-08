@@ -2367,25 +2367,17 @@ def _parse_input_keys(section):
 
 def _resolve_input_memory(
         params, print_fn, resolve_hardware):
-    """Produce the runtime memory budget and chunk utilization."""
-    memory_per_device_gb = float(params.get("memory_per_device_gb", 0.0))
-    if memory_per_device_gb <= 0 and resolve_hardware:
-        from common.gpu_utils import get_device_memory_gb, minimum_process_budget_gb
-        # Hardware resolution is collective: heterogeneous HBM must not select
-        # different static ISDF/G/Sigma tile shapes on different processes.
-        memory_per_device_gb = minimum_process_budget_gb(get_device_memory_gb())
-        print_fn(
-            f"  Auto-detected memory budget: {memory_per_device_gb:.2f} GB/device"
-        )
-    if memory_per_device_gb > 0 and resolve_hardware:
-        # The one budget every planner reads (common.gpu_utils.device_budget_bytes).
-        from common.gpu_utils import set_device_budget_gb
-        set_device_budget_gb(memory_per_device_gb)
-    chunk_utilization = env_float("ISDF_CHUNK_TARGET_UTILIZATION", 0.0,
-                                  print_fn=print_fn)
-    if chunk_utilization > 0:
-        chunk_utilization = max(0.85, min(1.0, chunk_utilization))
-    return (memory_per_device_gb, chunk_utilization)
+    """Produce the runtime memory budget: the headroom rule on the card,
+    capped by a positive ``memory_per_device_gb`` (collective, the minimum
+    over processes; ``common.gpu_utils.resolve_device_budget_gb``)."""
+    deck_gb = float(params.get("memory_per_device_gb", 0.0))
+    if not resolve_hardware:
+        return deck_gb
+    from common.gpu_utils import resolve_device_budget_gb
+    budget_gb = resolve_device_budget_gb(deck_gb)
+    if deck_gb <= 0:
+        print_fn(f"  Auto-detected memory budget: {budget_gb:.2f} GB/device")
+    return budget_gb
 
 
 def _resolve_input_metal_policy(
@@ -2657,11 +2649,10 @@ def _input_iteration(
 
 
 def _input_memory_group(
-        chunk_utilization, memory_per_device_gb, params, print_fn):
+        memory_per_device_gb, params, print_fn):
     """Resolve the memory settings."""
     memory = MemoryConfig(
         per_device_gb=memory_per_device_gb,
-        chunk_target_utilization=chunk_utilization,
         band_chunk_size=AUTOMATIC_BAND_CHUNK_SIZE,
         vq_g_chunk_size=int(params["vq_g_chunk_size"]),
     )
@@ -4550,9 +4541,8 @@ class EQP2Config:
 
 @dataclass(frozen=True)
 class MemoryConfig:
-    """Per-device memory budget + chunk sizing + AOT chunk-chooser flag; see docs/dev/gw_config_contracts.md."""
+    """Per-device memory budget + chunk sizing; see docs/dev/gw_config_contracts.md."""
     per_device_gb: float
-    chunk_target_utilization: float
     band_chunk_size: int
     vq_g_chunk_size: int          # 0 = auto v_q_g_flat._plan_vq_tiles
 
@@ -5103,7 +5093,7 @@ class LorraxConfig:
         _linalg = params[_LINALG_RESOLUTION]
         input_dir = os.path.dirname(os.path.abspath(filename))
         resolve_input_paths(params, input_dir)
-        (memory_per_device_gb, chunk_utilization) = _resolve_input_memory(
+        memory_per_device_gb = _resolve_input_memory(
             params, print_fn, resolve_hardware)
         (_bgw_q0_mode, _bgw_q0_vector, _named_keys, _effective_named_keys, _mc_average_vcoul_body) = _resolve_input_metal_policy(
             params, print_fn)
@@ -5116,7 +5106,7 @@ class LorraxConfig:
         (sc, eqp2) = _input_iteration(
             _linalg, params, print_fn)
         (memory) = _input_memory_group(
-            chunk_utilization, memory_per_device_gb, params, print_fn)
+            memory_per_device_gb, params, print_fn)
         (backend) = _input_backend(
             _linalg, params, runtime_platform)
         (_restart_q_storage, _qp_rot_k_storage, debug, bse) = _input_storage(

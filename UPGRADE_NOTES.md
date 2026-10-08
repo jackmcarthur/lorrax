@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — one headroom rule sets the device budget and the pool; route G takes its chunk and plane groups from the fixed tile
+
+From the card total `M` alone, `H = max(8 GB, 0.10·M)`: the XLA pool reserves `M − H` and the
+planner budget is that less `max(1 GB, 0.02·M)` (`runtime.device_headroom_bytes`,
+`runtime.pool_fraction`, `runtime.planner_budget_bytes`). A100-40GB: pool fraction 0.89 → 0.811,
+budget 33.97 → 33.40 GB. A100-80GB: fraction 0.89 → 0.900, budget 68.16 → 74.88 GB. A positive `memory_per_device_gb` caps the budget; a value above the rule warns and the
+rule's budget is used. On CPU the rule takes the node's `MemTotal` over its processes, shared by a
+process's devices (it was host RAM over the global device count). Every GPU run prints the bytes outside the pool after warm-up (max over
+ranks) and warns above `0.75·H`. Deleted: `runtime.GPU_POOL_FRACTION`, the 0.90 × `bytes_limit`
+budget, the nvidia-smi fallback, the 4 GB defaults, the BFC fragmentation table (planners now fill
+the budget itself), `RUNTIME_RESERVE_BYTES`, `ISDF_CHUNK_TARGET_UTILIZATION` (unset it).
+The route-G ζ fit takes its stage-0 parent chunk and its plane-group width from the fixed tile,
+not from A100 timings; `gw.comm_model` is a receipt diagnostic only. Budget-sized stages may
+choose other sizes, which moves eqp at round-off: at most 0.006 µeV on CrI3 6×6 bispinor SC and
+CrI3 8×8 GN-PPM charge at P4 on both cards; the charge ζ fit 28.1 → 29.3 s (80 GB) and
+36.0 → 29.5 s (40 GB) (claim 3978). No deck change.
+
 ## 2026-10-08 — the response streams' block accumulate no longer materializes its terms
 
 The XLA contour block accumulate (`gw.contour_accumulator.contour_block_accumulate_local`,

@@ -180,26 +180,16 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             return basis
 
     # The whole-state ledger prices every allocation the fit makes, its
-    # resident selected rows included, so it plans against the deck budget
-    # (``memory_per_device_gb``) less the measured runtime reserve, not a
-    # fixed tile (``runtime.tiles`` names this exception): a number from the
-    # deck alone, the same on every rank.  Beside the fit the driver holds
-    # only WFN metadata and the symmetry service, no priced device array.
+    # resident selected rows included, so it plans against the run budget
+    # (the headroom rule, capped by ``memory_per_device_gb``), not a fixed
+    # tile (``runtime.tiles`` names this exception): the same on every rank.
+    # Beside the fit the driver holds only WFN metadata and the symmetry
+    # service, no priced device array.
     from common.gpu_utils import device_budget_bytes
-    from runtime.aot_memory import runtime_reserve_bytes
-    device_fit_budget = device_budget_bytes() - float(runtime_reserve_bytes())
-    if device_fit_budget <= 0:
-        # No room beside the runtime reserve: the fit plans its smallest
-        # passes (each warns) and runs.
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("htransform runtime reserve", runtime_reserve_bytes(),
-                         device_budget_bytes())
-        device_fit_budget = 1.0
+    device_fit_budget = device_budget_bytes()
     if log_fn is not None:
-        log_fn(
-            "  Whole-state fit budget: "
-            f"{device_fit_budget/2**30:.2f} GiB/device (the run budget "
-            f"{device_budget_bytes()/2**30:.2f} GiB less the runtime reserve)")
+        log_fn(f"  Whole-state fit budget: {device_fit_budget/2**30:.2f} GiB/device "
+               "(the run budget)")
     basis = fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
         log_fn=log_fn,

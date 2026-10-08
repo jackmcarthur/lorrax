@@ -26,7 +26,6 @@ import numpy as np
 from jax.scipy import linalg as jsp_linalg
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.gpu_utils import bfc_fragmentation_target_utilization
 from common.collectives import device_put_process_local
 from common.psi_G_store import build_psi_G_store
 from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
@@ -636,8 +635,7 @@ def _plan_rows_pass(geom: dict, *, rows: int, omega_rows: int,
                 resident=resident), capacity)
             break
         groups *= 2
-    fft = _largest_fit(per, lambda f: f * geom["row_cufft"] <= geom[
-        "reserve"] and _rows_pass_bytes(
+    fft = _largest_fit(per, lambda f: _rows_pass_bytes(
         geom, rows=-(-per // f) * f, fft_rows=f, local_cols=cols,
         omega_rows=omega_rows, resident=resident) <= capacity)
     fft = max(1, fft)
@@ -684,14 +682,11 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
             geom, rows=per, fft_rows=1, local_cols=1, omega_rows=0,
             resident=x_resident), capacity)
     cols = x_cols
-    bpd = int(band_carrier) // p
     k_tile = max(d for d in range(1, nk + 1) if nk % d == 0 and (
-        d == 1 or (d * bpd * geom["row_cufft"] <= geom["reserve"]
-                   and _projection_bytes(
-                       geom, band_carrier=band_carrier, rank=rank,
-                       local_cols=cols, k_tile=d) <= capacity)))
-    fft = max(1, _largest_fit(per, lambda f: f * geom["row_cufft"] <= geom[
-        "reserve"] and _rows_pass_bytes(
+        d == 1 or _projection_bytes(
+            geom, band_carrier=band_carrier, rank=rank,
+            local_cols=cols, k_tile=d) <= capacity))
+    fft = max(1, _largest_fit(per, lambda f: _rows_pass_bytes(
         geom, rows=-(-per // f) * f, fft_rows=f, local_cols=cols,
         omega_rows=0, resident=x_resident) <= capacity))
     live = {
@@ -740,9 +735,9 @@ def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
 
     The one-row price is the compiled canonical G-flat -> full-grid program
     (gather, ``ifftn(norm='ortho')``, Bloch phase, output) including its
-    cuFFT workspace, so every FFT batch below is priced by measurement; a
-    batch's cuFFT workspace (rows x the one-row workspace) must also fit the
-    contiguous reserve outside the stage target.
+    cuFFT workspace, so every FFT batch below is priced by measurement.  The
+    target is ``device_pool_limit`` itself; the run budget's headroom
+    (``runtime.device_headroom_bytes``) is the only margin.
     """
     n_rtot = int(meta.n_rtot)
     memory = gflat_to_rchunk_aot_memory(
@@ -754,19 +749,11 @@ def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
         p=int(mesh_xy.size), ns=int(nspinor), nk=int(nk),
         ngkmax=int(ngkmax), n_rtot=n_rtot,
         g_index=float(nk * ngkmax * np.dtype(np.int32).itemsize),  # sphere index
-        row_fft=float(memory.total), row_cufft=float(memory.cufft_scratch),
-        reserve=math.inf,
+        row_fft=float(memory.total),
         n_band_chunks=lambda carrier: -(-(b1 - b0) // int(carrier)))
     if device_pool_limit is None or device_pool_limit <= 0:
         return geom, math.inf, memory
-    capacity = (float(device_pool_limit)
-                * bfc_fragmentation_target_utilization(nspinor))
-    reserve = geom["reserve"] = float(device_pool_limit) - capacity
-    if float(memory.cufft_scratch) > reserve:
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("Galerkin one-row full-grid transform cuFFT workspace",
-                         memory.cufft_scratch, reserve)
-    return geom, capacity, memory
+    return geom, float(device_pool_limit), memory
 
 
 def fit_galerkin_basis(

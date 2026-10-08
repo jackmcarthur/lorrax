@@ -1020,50 +1020,21 @@ def test_mem_fraction_reads_the_current_var_not_only_the_deprecated_one():
 # ---------------------------------------------------------------------------
 
 def test_env_float_announces_a_bad_value():
-    """``ISDF_CHUNK_TARGET_UTILIZATION`` used a bare
-    ``except Exception: chunk_utilization = 0.0``.
-
-    A bad value must be announced rather than leaving the user believing a
-    utilization override is in force.
-    """
+    """A bad numeric value must be announced, not swallowed into the default."""
     assert hasattr(gw_config, "env_float")
     log = _Log()
     _reset_announce()
-    with _Env(ISDF_CHUNK_TARGET_UTILIZATION="0.97"):
-        assert gw_config.env_float(
-            "ISDF_CHUNK_TARGET_UTILIZATION", 0.0, print_fn=log) == 0.97
+    name = "LORRAX_FI_FSHOULDER_TOL"
+    with _Env(**{name: "0.97"}):
+        assert gw_config.env_float(name, 0.0, print_fn=log) == 0.97
     assert log.lines == []
-    with _Env(ISDF_CHUNK_TARGET_UTILIZATION=None):
-        assert gw_config.env_float(
-            "ISDF_CHUNK_TARGET_UTILIZATION", 0.0, print_fn=log) == 0.0
+    with _Env(**{name: None}):
+        assert gw_config.env_float(name, 0.0, print_fn=log) == 0.0
     assert log.lines == []
-    with _Env(ISDF_CHUNK_TARGET_UTILIZATION="high"):
-        assert gw_config.env_float(
-            "ISDF_CHUNK_TARGET_UTILIZATION", 0.0, print_fn=log) == 0.0
+    with _Env(**{name: "high"}):
+        assert gw_config.env_float(name, 0.0, print_fn=log) == 0.0
     assert "LORRAX SANITY" in log.text, log.text
     assert "high" in log.text and "0.0" in log.text, log.text
-
-
-def test_config_uses_the_announcing_numeric_helpers():
-    """Source-level: the swallowing parses must be gone."""
-    src = _read("gw/gw_config.py")
-    tree = ast.parse(src, "gw_config.py")
-    # No ``except Exception``/bare except may wrap an ISDF_* float parse.
-    bad = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try):
-            continue
-        body = ast.dump(ast.Module(body=node.body, type_ignores=[])
-                        if hasattr(ast, "type_ignores") else
-                        ast.Module(body=node.body))
-        if "ISDF_CHUNK_TARGET_UTILIZATION" not in body:
-            continue
-        for h in node.handlers:
-            if not any(isinstance(n, ast.Call) for n in ast.walk(h)):
-                bad.append(node.lineno)
-    assert not bad, (
-        "gw_config.py:%s still swallows a bad ISDF_CHUNK_TARGET_UTILIZATION "
-        "without telling anybody" % bad)
 
 
 # ---------------------------------------------------------------------------
