@@ -1,5 +1,16 @@
 # Upgrade notes
 
+## 2026-10-08 — authenticated relocation of complete-native source bindings
+
+`DenseSpectrumReader(..., source_aliases={original_path: actual_path, ...})`
+can read a preserved native reference after its reconstruction files have
+moved. The mapping must cover every original binding and no additional key;
+every actual file is re-hashed against its original digest. Archived source
+bindings, native signature, physical metadata and SlabIO arrays stay unchanged.
+Omitting aliases keeps original-path authentication. No existing result moves.
+Focused alias failure guards and actual relocated P4 input qualification are
+pending on feature `codex/cdref-band-source-aliases-20261008`; not on main.
+
 ## 2026-10-08 — cap-only replay refuses actual over-budget allocations
 
 The optional immutable-bank cap replay now hard-refuses a non-PASS hardware

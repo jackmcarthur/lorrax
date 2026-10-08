@@ -40,6 +40,33 @@ def _text(value):
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
 
 
+def verify_source_bindings(bindings, *, source_aliases=None):
+    """Authenticate original reconstruction bytes at explicit relocated paths.
+
+    The original mapping stays the archive's identity. An alias mapping is
+    complete and exact: no original binding may be omitted or added, and
+    each actual file must hash to that original binding's digest. Aliases
+    change addresses only, never the identity or an authentication gate.
+    """
+    if not isinstance(bindings, dict) or not bindings:
+        _refuse("source reconstruction bindings must be a nonempty mapping")
+    if source_aliases is None:
+        actual = {path: path for path in bindings}
+    else:
+        if (not isinstance(source_aliases, dict)
+                or set(source_aliases) != set(bindings)):
+            _refuse("source aliases must cover exactly the original reconstruction bindings")
+        actual = dict(source_aliases)
+        if any(not isinstance(path, str) or not Path(path).is_absolute()
+               for path in actual.values()):
+            _refuse("source aliases must name explicit absolute paths")
+    for original, digest in bindings.items():
+        if (not isinstance(digest, str) or len(digest) != 64
+                or _sha256(actual[original]) != digest):
+            _refuse(f"changed source reconstruction binding {original}")
+    return actual
+
+
 def _read_metadata(path):
     """Only metadata/eigenvalue vectors; never coefficient payloads."""
     with h5py.File(path, "r") as handle:
@@ -106,7 +133,7 @@ class DenseSpectrumReader:
     """
     def __init__(self, path, source_wfn, *, mesh, expected_source_sha256,
                  expected_archive_sha256,
-                 max_local_read_bytes=256 * 1024**2):
+                 max_local_read_bytes=256 * 1024**2, source_aliases=None):
         self.path = str(Path(path).resolve())
         self.source_wfn = source_wfn
         self.mesh = mesh
@@ -114,7 +141,8 @@ class DenseSpectrumReader:
         self._io = None
         error = None
         try:
-            self._authenticate(expected_source_sha256, expected_archive_sha256)
+            self._authenticate(expected_source_sha256, expected_archive_sha256,
+                               source_aliases=source_aliases)
         except Exception as exc:
             error = exc
         agree_io_refusal(error, path=self.path, stage="native spectrum reference open")
@@ -122,7 +150,8 @@ class DenseSpectrumReader:
             raise error
         self._io = SlabIO(self.path, mode="r", mesh=mesh)
 
-    def _authenticate(self, expected_source_sha256, expected_archive_sha256):
+    def _authenticate(self, expected_source_sha256, expected_archive_sha256,
+                      *, source_aliases=None):
         source_wfn = self.source_wfn
         archive_digest = str(expected_archive_sha256)
         if len(archive_digest) != 64 or _sha256(self.path) != archive_digest:
@@ -154,10 +183,8 @@ class DenseSpectrumReader:
             _refuse("archive misses the density/XML/UPF/producer bindings")
         # Bind the full DFT reconstruction (density, XML, UPFs and producer
         # files), not only a mutable path. These are exact, bounded paths.
-        for bound_path, digest in bindings.items():
-            if (not isinstance(digest, str) or len(digest) != 64
-                    or _sha256(bound_path) != digest):
-                _refuse(f"changed source reconstruction binding {bound_path}")
+        self.reconstruction_source_paths = verify_source_bindings(
+            bindings, source_aliases=source_aliases)
         ns = int(source_wfn.nspinor)
         ngk = np.asarray(source_wfn.ngk_valid(k="ibz"), dtype=np.int64)
         if int(attrs.get("nspinor", 0)) != ns:
