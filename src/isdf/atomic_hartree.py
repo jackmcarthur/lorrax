@@ -392,23 +392,36 @@ def charge_hartree_functional(operand):
             or not np.allclose(source_mean, source_mean.real, rtol=2e-11, atol=2e-12)):
         raise ValueError('Hartree functional requires the real occupied-source neutral mean')
 
-    delta = (jnp.einsum('uahr,hrt->uaht', sd.conj(), kd)
-             + jnp.einsum('uahr,hrt->uaht', sp.conj(), kn))
-    ps = jnp.einsum('uahr,htr->uaht', sd.conj(), kn)
+    # Keep the six receiving adjoints in the tile contractor's physical
+    # order. Their sum is the existing ISDF functional; the receiving
+    # one-body contraction can apply these same rows before forming pairs.
+    # No receiving-density conjugation belongs in any of these rows.
+    zero = jnp.zeros_like(sd)
+    zero_m0 = jnp.zeros_like(se)
     # Compensation's Y00 coefficient is the exact served M0, not the
     # radial-interpolant moment. Keep its receiving adjoint separate.
     multipole_response = response.at[:, :, mono].set(0.)
-    delta = delta + multipole_response[..., None] * moment[None, None]
+    compensation = multipole_response[..., None] * moment[None, None]
+    difference = jnp.einsum('uahr,hrt->uaht', sd.conj(), kd)
+    ps_delta = jnp.einsum('uahr,hrt->uaht', sp.conj(), kn)
+    delta_ps = jnp.einsum('uahr,htr->uaht', sd.conj(), kn)
     source_cross = jnp.einsum('uar,r->ua', sd[:, :, mono], ke)
-    delta = delta.at[:, :, mono].add(
+    enriched = zero.at[:, :, mono].set(
         se.conj()[..., None]*ke - source_cross.conj()[..., None]*moment[mono])
-    m0 = response[:, :, mono] + source_cross.conj()
 
     phi_row = ((2*np.pi/3)*np.sqrt(4*np.pi)
                * (operand['q2_row'] - 3*radius**2/17*moment[mono]))
-    delta = delta.at[:, :, mono].add(
+    neutral_mean = zero.at[:, :, mono].set(
         (2/volume)*sq.conj()[:, None, None]*phi_row)
-    m0 = m0 - (2/volume)*np.sqrt(4*np.pi)*sf.conj()[:, None]
+    component_delta = jnp.stack((compensation, difference, ps_delta,
+                                zero, enriched, neutral_mean))
+    component_ps = jnp.stack((zero, zero, zero, delta_ps, zero, zero))
+    component_m0 = jnp.stack((response[:, :, mono], zero_m0, zero_m0,
+                             zero_m0, source_cross.conj(),
+                             jnp.broadcast_to(-(2/volume)*np.sqrt(4*np.pi)
+                                 *sf.conj()[:, None], zero_m0.shape)))
+    delta, ps, m0 = (value.sum(axis=0) for value in
+                    (component_delta, component_ps, component_m0))
     # The source is real occupied charge; its Y00 neutral mean is real.
     # Apply that scalar to the smooth overlap here, and to the local exact
     # overlap in m0 above. There is no Hartree energy's factor one-half.
@@ -417,6 +430,10 @@ def charge_hartree_functional(operand):
     local = jnp.concatenate((delta.reshape(len(sd), -1),
                              ps.reshape(len(sd), -1), m0), axis=-1)
     return dict(smooth_potential=smooth, local_response=local_to_grid*local,
+                receiving_components=dict(delta=component_delta,
+                    PS=component_ps, exact_Y00=component_m0),
+                receiving_component_order=('compensation_body', 'difference',
+                    'PS_delta', 'delta_PS', 'enriched', 'periodic_mean'),
                 local_geometry=tuple(map(int, sd.shape[1:])),
                 local_to_grid=local_to_grid,
                 local_feature_order=('delta', 'PS', 'exact_Y00'),

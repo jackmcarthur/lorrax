@@ -2,12 +2,11 @@
 
 The orbital frame/atomic caches are inputs already authenticated by preparation.
 No WFN coefficient read, projector, Gram or inverse-root factory occurs here.
-Endpoint faces remain distributed; only bounded pair harmonics replicate.
+Endpoint faces remain distributed; fixed-source point responses precede pairs.
 """
 from __future__ import annotations
 import hashlib,json,time
 from pathlib import Path
-from types import SimpleNamespace
 import numpy as np
 
 def _digest(value):
@@ -16,22 +15,22 @@ def _digest(value):
     return hashlib.sha256(header + array.tobytes()).hexdigest()
 
 
-def _make_tile_project(mesh, *, radius, directions, angular_weights, lm, Y,
-                      atom_count, fft_points, cell_volume, band_tile=8,
-                      point_active=None):
-    """Return ``(tile_project, receipt)`` for grid-normalized four-spinors.
+def _make_point_contraction(mesh, *, functional, radius, directions,
+                            angular_weights, lm, Y, band_tile=8,
+                            point_active=None):
+    """Apply fixed-source Hartree adjoints to distributed receiving endpoints.
 
-    ``tile_project(ps, delta, rowstart, colstart)`` accepts SAME-frame
-    ``(1, band, 4, point)`` faces at ``P(None,'x',None,'y')``. Points have
-    direction fastest, then radius, then atom; only a suffix may be padding.
-    It returns physical PS and correction charge harmonics with shape
-    ``(1,tile,tile,atom,lm,radius)``. The correction includes BOTH mixed
-    adjoints and delta-delta. N_fft/Omega is applied exactly once here.
+    ``contract(ps, delta, exact)`` consumes SAME-frame grid-normalized
+    ``(1,band,4,point)`` faces at ``P(None,'x',None,'y')`` and physical exact
+    Y00 integrals at ``P(None,'x','y',None)``. Natural points have direction
+    fastest, then radius, then atom, with an optional inert suffix. The six
+    components retain the atomic owner's order and return at
+    ``P(None,None,'x','y')`` (component,source,bra,ket).
 
-    Only two bounded eight-band endpoint pairs gather over X, at fixed Y.
-    Bucket gathers retain only radial rows owned by that Y shard. The
-    resulting small harmonic tile reduces over Y, without an X reduction.
-    The caller's full receiving endpoint storage stays distributed.
+    The radial/angular projection adjoint is applied once to the fixed
+    source. A scan gathers only one bounded ket band tile over X and reduces
+    band actions over Y. It never forms pair densities or pair harmonics,
+    gathers complete endpoint faces, or conjugates a receiving response.
     """
     import jax
     import jax.numpy as jnp
@@ -39,156 +38,128 @@ def _make_tile_project(mesh, *, radius, directions, angular_weights, lm, Y,
     from common.shard_map import shard_map
     from gw import isdf_augmentation as stage
 
-    r = np.asarray(radius, dtype=np.float64).copy()
-    dirs = np.asarray(directions, dtype=np.float64).copy()
-    aw = np.asarray(angular_weights, dtype=np.float64).copy()
-    labels = np.asarray(lm).copy()
-    harmonics = np.asarray(Y, dtype=np.complex128).copy()
-    na, tile = int(atom_count), int(band_tile)
-    nfft, volume = int(fft_points), float(cell_volume)
+    r, dirs, aw, labels, harmonics = map(np.asarray,
+        (radius, directions, angular_weights, lm, Y))
+    na, nh, nr = map(int, functional['local_geometry'])
+    tile = int(band_tile)
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    if (isinstance(atom_count, (bool, np.bool_)) or atom_count != na or na < 1
-            or isinstance(band_tile, (bool, np.bool_)) or band_tile != tile
-            or tile < 1 or tile % px or isinstance(fft_points, (bool, np.bool_))
-            or fft_points != nfft or nfft < 1 or not np.isfinite(volume) or volume <= 0
-            or r.ndim != 1 or not len(r) or not np.isfinite(r).all()
+    expected = ('compensation_body', 'difference', 'PS_delta', 'delta_PS',
+                'enriched', 'periodic_mean')
+    scale = float(functional['local_to_grid'])
+    if (functional.get('operator') != 'ordinary_3D_periodic_full_FFT_G0_zero'
+            or functional.get('neutral_mean_policy') != 'subtract_free_space_neutral_cell_mean'
+            or functional.get('receiving_component_order') != expected
+            or not np.isfinite(scale) or scale <= 0 or na < 1 or nr < 1 or nh < 1
+            or tile != band_tile or isinstance(band_tile, (bool, np.bool_))
+            or tile < 1 or tile % px or r.shape != (nr,)
             or np.any(r < 0) or np.any(np.diff(r) <= 0)
             or dirs.ndim != 2 or dirs.shape[1:] != (3,) or not len(dirs)
-            or not np.isfinite(dirs).all()
             or not np.allclose(np.linalg.norm(dirs, axis=1), 1., rtol=0, atol=2e-12)
-            or aw.shape != (len(dirs),) or not np.isfinite(aw).all() or np.any(aw <= 0)
-            or labels.ndim != 2 or labels.shape[1:] != (2,) or not len(labels)
+            or aw.shape != (len(dirs),) or np.any(aw <= 0) or labels.shape != (nh, 2)
             or not np.issubdtype(labels.dtype, np.integer)
             or len(set(map(tuple, labels))) != len(labels)
             or np.any(labels[:, 0] < 0) or np.any(abs(labels[:, 1]) > labels[:, 0])
-            or harmonics.shape != (len(labels), len(dirs))
-            or not np.isfinite(harmonics).all()):
-        raise ValueError('Receiving harmonics require the finite canonical atomic geometry and tile extent')
-    logical = na * len(r) * len(dirs)
-    live = (np.ones(logical, bool) if point_active is None
-            else np.asarray(point_active).copy())
-    if (live.ndim != 1 or live.dtype != np.dtype(bool) or len(live) % py
-            or len(live) < logical or not np.all(live[:logical]) or np.any(live[logical:])):
-        raise ValueError('Receiving point axis must be the natural physical order with inert suffix padding')
-    npoint = len(live)
-    # These metadata describe the existing natural sample axis. They do not
-    # create a centroid geometry or invent a symmetry transport plan.
-    natural_axis = SimpleNamespace(packed_to_canonical=np.arange(npoint),
-        active_mask=live, n_logical=logical)
-    natural = SimpleNamespace(layout=SimpleNamespace(axis=natural_axis))
-    columns, weights = stage._angular_bucket_tables(
-        natural, na, len(r), harmonics.conj() * aw[None], py)
-    rows = na * len(r)
-    row_lists = [np.flatnonzero(np.any(weights[y] != 0, axis=(0, 2)))
-                 for y in range(py)]
-    local_rows = max(1, max(map(len, row_lists)))
-    width = columns.shape[-1]
-    local_columns = np.zeros((py, local_rows, width), np.int32)
-    local_weights = np.zeros((py, len(labels), local_rows, width), np.complex128)
-    row_ids = np.zeros((py, local_rows), np.int32)
-    for y, selected in enumerate(row_lists):
-        row_ids[y, :len(selected)] = selected
-        local_columns[y, :len(selected)] = columns[y, selected]
-        local_weights[y, :, :len(selected)] = weights[y][:, selected]
-    ids = stage._put(row_ids, mesh, P('y', None))
-    cols = stage._put(local_columns, mesh, P('y', None, None))
-    angle = stage._put(local_weights, mesh, P('y', None, None, None))
-    active = stage._put(live, mesh, P('y'))
+            or harmonics.shape != (nh, len(dirs))
+            or not all(np.isfinite(a).all() for a in (r, dirs, aw, harmonics))):
+        raise ValueError('Receiving adjoints require the canonical atomic geometry and tile extent')
+    logical = na*nr*len(dirs)
+    active = (np.ones(logical, bool) if point_active is None
+              else np.asarray(point_active).copy())
+    if (active.ndim != 1 or active.dtype != np.dtype(bool)
+            or len(active) % py or len(active) < logical
+            or not np.all(active[:logical]) or np.any(active[logical:])):
+        raise ValueError('Receiving points require natural physical order and inert suffix padding')
+    response = functional['receiving_components']
+    delta, ps, m0 = (np.asarray(response[k]) for k in ('delta', 'PS', 'exact_Y00'))
+    nu = delta.shape[1]
+    if (delta.shape != (6, nu, na, nh, nr) or ps.shape != delta.shape
+            or m0.shape != (6, nu, na)
+            or not all(np.isfinite(a).all() for a in (delta, ps, m0))
+            or np.any(ps[[0, 1, 2, 4, 5]] != 0)):
+        raise ValueError('Receiving component responses differ from the atomic Hartree owner')
+    # Density harmonics are sum_d rho(r,d) Y_h*(d) w_d. Transpose that
+    # map, without complex conjugating its response. Only grid-normalized
+    # point products need Nfft/Omega; exact Y00 remains physical.
+    def point_response(radial):
+        value = scale*np.einsum(
+            'uahr,hd,d->uard', radial, harmonics.conj(), aw, optimize=True)
+        return np.pad(value.reshape(len(radial), logical),
+                      ((0, 0), (0, len(active)-logical)))
+    wd = point_response(delta.reshape(6*nu, na, nh, nr))
+    wp = point_response(ps[3])
+    weights_delta = stage._put(wd, mesh, P(None, 'y'))
+    weights_ps = stage._put(wp, mesh, P(None, 'y'))
+    weights_m0 = stage._put(m0, mesh, P())
+    point_live = stage._put(active, mesh, P('y'))
     fs = P(None, 'x', None, 'y')
-    face = stage._tile_kernels(mesh, 1, tile)['face']
-    scale = nfft / volume
 
-    def project_local(pr, pc, dr, dc, columns, weights, row_ids, live):
-        # Mask before multiplication so arbitrarily poisoned dead samples
-        # cannot create NaNs or overflow in a charge product.
-        endpoints = [jnp.where(live[None, None, None], value, 0.)
-                     for value in (pr, pc, dr, dc)]
-        pr, pc, dr, dc = [jax.lax.all_gather(value, 'x', axis=1, tiled=True)[0]
-                          for value in endpoints]
-        ps = jnp.einsum('ism,jsm->ijm', pr.conj(), pc)
-        delta = (jnp.einsum('ism,jsm->ijm', pr.conj(), dc)
-                 + jnp.einsum('ism,jsm->ijm', dr.conj(), pc)
-                 + jnp.einsum('ism,jsm->ijm', dr.conj(), dc))
-        weighted_live = jnp.any(weights[0] != 0, axis=0)
+    def apply_local(ps, delta, exact, wd, wp, m0, point_live):
+        nrow, npoint = ps.shape[1], ps.shape[-1]
+        nb = nrow*px
+        pr = jnp.where(point_live[None, None, None], ps, 0.)[0]
+        dr = jnp.where(point_live[None, None, None], delta, 0.)[0]
+        initial = jnp.zeros((6*nu, nrow, nb), jnp.complex128)
 
-        def angular_project(pair):
-            values = jnp.take(pair, columns[0], axis=-1)
-            values = jnp.where(weighted_live[None, None], values, 0.)
-            partial = jnp.einsum('ijrb,hrb->ijrh', values, weights[0])
-            out = jnp.zeros((tile, tile, rows, len(labels)), jnp.complex128)
-            out = out.at[:, :, row_ids[0], :].add(partial)
-            out = jax.lax.psum(out, 'y')
-            return (scale * out.reshape(tile, tile, na, len(r), len(labels))
-                    .transpose(0, 1, 2, 4, 3))[None]
-        return angular_project(ps), angular_project(delta)
+        def weighted_overlap(bra, ket, weight):
+            return jnp.einsum('ism,cjsm->cij', bra.conj(),
+                              weight[:, None, None, :]*ket[None])
 
-    kernel = jax.jit(shard_map(project_local, mesh=mesh,
-        in_specs=(fs, fs, fs, fs, P('y', None, None),
-                  P('y', None, None, None), P('y', None), P('y')),
-        out_specs=(P(), P()), check_vma=False))
+        def add_columns(matrix, step):
+            ids = step*tile+jnp.arange(tile)-jax.lax.axis_index('x')*nrow
+            live = (ids >= 0) & (ids < nrow)
+            ids = jnp.clip(ids, 0, nrow-1)
+            pc, dc = [jax.lax.psum(jnp.where(live[:, None, None],
+                jnp.take(value, ids, axis=0), 0.), 'x') for value in (pr, dr)]
+            # Retain both mixed adjoints and delta-delta explicitly.
+            value = (weighted_overlap(pr, dc, wd)
+                     + weighted_overlap(dr, pc, wd)
+                     + weighted_overlap(dr, dc, wd)).reshape(6, nu, nrow, tile)
+            value = value.at[3].add(weighted_overlap(pr, pc, wp))
+            value = jax.lax.psum(value.reshape(6*nu, nrow, tile), 'y')
+            return jax.lax.dynamic_update_slice(matrix, value,
+                (jnp.int32(0), jnp.int32(0), step*tile)), None
 
-    def tile_project(ps, delta, rowstart, colstart):
+        matrix = jax.lax.scan(add_columns, initial,
+            jnp.arange(nb//tile, dtype=jnp.int32), unroll=1)[0]
+        matrix = jax.lax.dynamic_slice(matrix,
+            (jnp.int32(0), jnp.int32(0), jax.lax.axis_index('y')*(nb//py)),
+            (6*nu, nrow, nb//py))
+        matrix = matrix.reshape(6, nu, nrow, nb//py)
+        return matrix+jnp.einsum('cua,ija->cuij', m0, exact[0])
+
+    kernel = jax.jit(shard_map(apply_local, mesh=mesh,
+        in_specs=(fs, fs, P(None, 'x', 'y', None), P(None, 'y'),
+                  P(None, 'y'), P(), P('y')),
+        out_specs=P(None, None, 'x', 'y'), check_vma=False))
+
+    def contract(ps, delta, exact):
         if (ps.shape != delta.shape or ps.ndim != 4 or ps.shape[0] != 1
-                or ps.shape[2:] != (4, npoint) or ps.shape[1] % px
+                or ps.shape[2:] != (4, len(active)) or ps.shape[1] % tile
+                or ps.shape[1] % py or exact.shape != (1, ps.shape[1], ps.shape[1], na)
                 or ps.sharding != NamedSharding(mesh, fs)
                 or delta.sharding != NamedSharding(mesh, fs)
-                or np.dtype(ps.dtype) != np.dtype(np.complex128)
-                or np.dtype(delta.dtype) != np.dtype(np.complex128)
-                or any(isinstance(v, (bool, np.bool_)) or int(v) != v
-                       or not 0 <= int(v) <= ps.shape[1] - tile
-                       for v in (rowstart, colstart))):
-            raise ValueError('Receiving endpoints or selected bands differ from the distributed natural face')
-        zero = jnp.int32(0)
-        i, j = jnp.int32(rowstart), jnp.int32(colstart)
-        return kernel(face(ps, zero, i), face(ps, zero, j),
-                      face(delta, zero, i), face(delta, zero, j),
-                      cols, angle, ids, active)
+                or exact.sharding != NamedSharding(mesh, P(None, 'x', 'y', None))
+                or any(np.dtype(a.dtype) != np.dtype(np.complex128)
+                       for a in (ps, delta, exact))):
+            raise ValueError('Receiving endpoints or exact Y00 differ from their distributed domain')
+        return kernel(ps, delta, exact, weights_delta, weights_ps, weights_m0, point_live)
 
-    receipt = dict(schema='lorrax.sharded_receiving_harmonics.v1',
+    receipt = dict(schema='lorrax.sharded_receiving_point_hartree.v1',
         helper_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        stage_owner_sha256=hashlib.sha256(Path(stage.__file__).read_bytes()).hexdigest(),
         endpoint_layout="P(None,'x',None,'y')", parent_extent=1,
-        point_order='atom_radius_direction', point_axis='natural_with_suffix_padding',
-        logical_points=logical, carrier_points=npoint, atoms=na, radii=len(r),
-        directions=len(dirs), harmonics=len(labels), band_tile=tile,
-        x_gather_bands=tile, y_reduction='psum_of_canonical_angular_buckets',
-        local_bucket_rows=local_rows, bucket_width=width,
+        point_order='atom_radius_direction', logical_points=logical,
+        carrier_points=len(active), atoms=na, radii=nr, directions=len(dirs),
+        harmonics=nh, band_tile=tile, source_count=nu,
+        component_order=list(expected), x_gather_bands=tile,
+        y_reduction='psum_of_weighted_band_actions', pair_density_materialized=False,
+        pair_harmonics_materialized=False, complete_parent_endpoint_replication=False,
+        point_response_bytes_per_rank=(6*nu+nu)*(len(active)//py)*16,
+        bounded_ket_gather_bytes_per_rank=2*tile*4*(len(active)//py)*16,
+        exact_response_units='physical_Y00', point_pair_conversion=functional['local_to_grid'],
         radius_sha256=_digest(r), directions_sha256=_digest(dirs),
-        angular_weights_sha256=_digest(aw), lm_sha256=_digest(labels), Y_sha256=_digest(harmonics),
-        point_active_sha256=_digest(live), fft_points=nfft, cell_volume=volume,
-        output_units='physical_density_harmonics', grid_pair_conversion=scale,
-        correction_terms=['PS_bra_delta_ket', 'delta_bra_PS_ket', 'delta_bra_delta_ket'],
-        complete_parent_endpoint_replication=False,
-        bounded_endpoint_gather_bytes_per_rank=4*tile*4*(npoint//py)*16,
-        bucket_pair_bytes_per_rank=2*tile*tile*local_rows*width*16,
-        replicated_output_tile_bytes=2*tile*tile*na*len(r)*len(labels)*16)
-    return tile_project, receipt
-
-
-def _make_matrix_tiles(mesh,band_tile=8):
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
-    tile=int(band_tile)
-    def read(m,p,i,j):
-        ri=i+jnp.arange(tile)-jax.lax.axis_index('x')*m.shape[-2]
-        cj=j+jnp.arange(tile)-jax.lax.axis_index('y')*m.shape[-1]
-        valid=(ri[:,None]>=0)&(ri[:,None]<m.shape[-2])&(cj[None]>=0)&(cj[None]<m.shape[-1])
-        value=m[p,jnp.clip(ri,0,m.shape[-2]-1)[:,None],jnp.clip(cj,0,m.shape[-1]-1)[None]]
-        return jax.lax.psum(jnp.where(valid,value,0.),('x','y'))
-    def store(m,value,p,i,j):
-        ri=i+jnp.arange(tile)-jax.lax.axis_index('x')*m.shape[-2]
-        cj=j+jnp.arange(tile)-jax.lax.axis_index('y')*m.shape[-1]
-        ri=jnp.where((ri>=0)&(ri<m.shape[-2]),ri,m.shape[-2])
-        cj=jnp.where((cj>=0)&(cj<m.shape[-1]),cj,m.shape[-1])
-        return m.at[...,p,ri[:,None],cj[None]].set(value,mode='drop')
-    read=jax.jit(shard_map(read,mesh=mesh,in_specs=(P(None,'x','y'),P(),P(),P()),out_specs=P(),check_vma=False))
-    write=jax.jit(shard_map(store,mesh=mesh,in_specs=(P(None,'x','y'),P(),P(),P(),P()),
-        out_specs=P(None,'x','y'),check_vma=False))
-    write4=jax.jit(shard_map(store,mesh=mesh,in_specs=(P(None,None,'x','y'),P(),P(),P(),P()),
-        out_specs=P(None,None,'x','y'),check_vma=False))
-    return read,write,write4
+        angular_weights_sha256=_digest(aw), lm_sha256=_digest(labels),
+        Y_sha256=_digest(harmonics), point_active_sha256=_digest(active))
+    return contract, receipt
 
 
 def _make_delta_face(mesh):
@@ -219,7 +190,7 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
     from gw import isdf_augmentation as stage
     from psp.reconstruction_overlap import rotate_band_rows
     from isdf.atomic_moments import exact_pair_moments
-    from isdf.atomic_hartree import prepare_charge_hartree,make_charge_hartree_tile
+    from isdf.atomic_hartree import prepare_charge_hartree,charge_hartree_functional
 
     started=time.perf_counter()
     memory_before=[d.memory_stats() for d in jax.local_devices()]
@@ -331,16 +302,10 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
     if Q_error>2e-11:raise ValueError('Measured resident smooth overlap differs from SAME-A source Gram')
     smooth_done=time.perf_counter()
 
-    # Zero boxes are literals inside this jit: existing tile algebra supplies
-    # all atomic terms, and the canonical smooth sweep is rejoined below.
-    # XLA can eliminate the identically zero grid contractions, retaining no
-    # receiving FFT boxes or alternate local Coulomb implementation.
-    contract=make_charge_hartree_tile(operand)
-    @jax.jit
-    def local_only(tp,td,exact):
-        z=jnp.zeros((1,tile,4,*grid),jnp.complex128)
-        return contract(z,z,tp,td,exact)
-    geometry=(len(types),len(radius),len(directions))
+    # Apply the SAME source's receiving adjoint before forming band pairs.
+    # Smooth PSbody/Q above retain the original potential, so its source
+    # neutral mean is rejoined once below, not via smooth_potential here.
+    functional=charge_hartree_functional(operand)
     points=(centers[:,None,None]+radius[None,:,None,None]*
         directions[None,None]@np.linalg.inv(lattice)).reshape(-1,3)
     active=np.ones(len(points),bool)
@@ -351,10 +316,10 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
         int(artifact['factory']['g_block']) if 'factory' in artifact and 'g_block' in artifact['factory'] else 256,N)
     phase_kernel=stage._point_phase_kernel(mesh)
     cart=stage._put(points@lattice,mesh,P());live=stage._put(active.astype(float),mesh,P())
-    tile_project,projection_receipt=_make_tile_project(mesh,radius=radius,directions=directions,
-        angular_weights=aw,lm=lm,Y=Y,atom_count=len(types),fft_points=N,
-        cell_volume=volume,band_tile=tile,point_active=active)
-    read,store,store4=_make_matrix_tiles(mesh,tile);delta_face=_make_delta_face(mesh)
+    contract,projection_receipt=_make_point_contraction(mesh,functional=functional,
+        radius=radius,directions=directions,angular_weights=aw,lm=lm,Y=Y,
+        band_tile=tile,point_active=active)
+    delta_face=_make_delta_face(mesh)
     # Only the receiving sample view may require extra suffix zeros. The
     # original public reciprocal source/Poisson/sweep remain unchanged.
     extra=max(0,int(indices[0])+nt-int(smooth.shape[1]))
@@ -364,10 +329,32 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
     mask_faces=jax.jit(lambda f,band_mask:jnp.where(band_mask[None,:,None,None],f,0.),
         out_shardings=NamedSharding(mesh,P(None,'x',None,'y')))
     shape=(len(rows),nt,nt);ms=NamedSharding(mesh,P(None,'x','y'))
-    total=jnp.zeros(shape,jnp.complex128,device=ms)
-    body=jnp.zeros(shape,jnp.complex128,device=ms);mean=jnp.zeros(shape,jnp.complex128,device=ms)
-    local=jnp.zeros((4,*shape),jnp.complex128,device=NamedSharding(mesh,P(None,None,'x','y')))
-    charge=jnp.zeros(shape,jnp.complex128,device=ms)
+    parts=jnp.zeros((6,*shape),jnp.complex128,device=NamedSharding(mesh,P(None,None,'x','y')))
+    delta_charge=jnp.zeros(shape,jnp.complex128,device=ms)
+    # Atomic point fields are k-independent. The same image-geometry owner
+    # supplies all parent-dependent Bloch phases in one bounded evaluation.
+    delta_geometry=[(stage._put(field,mesh,P(None,None,'y')),
+        stage._put(phase,mesh,P(None,'y'))) for field,phase in stage._sample_geometry(
+        points,active,centers,lattice,artifact['normalized_caches'],types,
+        rawk,state['support_radius'],np.sqrt(volume/N))]
+    coefficients=[stage._put(np.asarray(c),mesh,P(None,'x',None)) for c in C]
+    take_coefficient=jax.jit(lambda a,p:jax.lax.dynamic_slice(a,
+        (p,jnp.int32(0),jnp.int32(0)),(1,a.shape[1],a.shape[2])),out_shardings=NamedSharding(mesh,P(None,'x',None)))
+    take_phase=jax.jit(lambda a,p:jax.lax.dynamic_slice(a,
+        (p,jnp.int32(0)),(1,a.shape[1])),out_shardings=NamedSharding(mesh,P(None,'y')))
+    def exact_matrix(c,d):
+        return jnp.stack([exact_pair_moments(ci,di,ci,di,jnp.asarray(b),array_api=jnp)
+            for ci,di,b in zip(c,d,B)],axis=-1)[None]/np.sqrt(4*np.pi)
+    exact_matrix=jax.jit(exact_matrix,
+        out_shardings=NamedSharding(mesh,P(None,'x','y',None)))
+    def store_parent(parts,charge,value,exact,p):
+        zero=jnp.int32(0)
+        parts=jax.lax.dynamic_update_slice(parts,value[:,0,None],(zero,p,zero,zero))
+        charge=jax.lax.dynamic_update_slice(charge,
+            np.sqrt(4*np.pi)*jnp.sum(exact,axis=-1),(p,zero,zero))
+        return parts,charge
+    store_parent=jax.jit(store_parent,out_shardings=(
+        NamedSharding(mesh,P(None,None,'x','y')),ms))
     fs=NamedSharding(mesh,P(None,'x',None,'y'));peak_endpoint=0
     for outrow,parent_index in enumerate(rows):
         print(f'Resident distributed J parent {int(parent_index)}: native band/point shards',flush=True)
@@ -376,39 +363,28 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
         ps=sampler(kernels['source'](endpoint_source,jnp.int32(parent_index),jnp.int32(indices[0])),phase,live)
         ps=mask_faces(ps,band_live)
         delta=jnp.zeros((1,nt,4,len(points)),jnp.complex128,device=fs)
-        for atom,(field,image_phase) in enumerate(stage._sample_geometry(points,active,
-                centers,lattice,artifact['normalized_caches'],types,
-                rawk[parent_index:parent_index+1],state['support_radius'],np.sqrt(volume/N))):
-            coeff=stage._put(np.asarray(C[atom][parent_index:parent_index+1]),mesh,P(None,'x',None))
-            delta=delta+delta_face(coeff,stage._put(field,mesh,P(None,None,'y')),
-                stage._put(image_phase,mesh,P(None,'y')))
+        for atom,(field,image_phase) in enumerate(delta_geometry):
+            coeff=take_coefficient(coefficients[atom],jnp.int32(parent_index))
+            delta=delta+delta_face(coeff,field,take_phase(image_phase,jnp.int32(parent_index)))
         jax.block_until_ready((ps,delta));del phase,k
         peak_endpoint=max(peak_endpoint,int(ps.size+delta.size)*16//int(mesh.size))
-        for i in range(0,nt,tile):
-            for j in range(0,nt,tile):
-                ri,cj=slice(i,i+tile),slice(j,j+tile)
-                tp,td=tile_project(ps,delta,i,j)
-                exact=jnp.stack([exact_pair_moments(c[parent_index,ri],d[parent_index,ri],
-                    c[parent_index,cj],d[parent_index,cj],jnp.asarray(b),array_api=jnp)
-                    for c,d,b in zip(C,D,B)],axis=-1)[None]/np.sqrt(4*np.pi)
-                m,p,l,z,q=local_only(tp,td,exact)
-                ids=(jnp.int32(parent_index),jnp.int32(i),jnp.int32(j))
-                pt,qt=read(PS,*ids),read(Q,*ids)
-                sm=-2/volume*operand['source_phi'][0].conj()*qt
-                outids=(jnp.int32(outrow),jnp.int32(i),jnp.int32(j))
-                total=store(total,m[0,0]+pt+sm,*outids)
-                body=store(body,p[0,0]+pt,*outids)
-                local=store4(local,l[:,0,0],*outids)
-                mean=store(mean,z[0,0]+sm,*outids)
-                charge=store(charge,q[0]+qt,*outids)
-        jax.block_until_ready((total,body,local,mean,charge));del ps,delta
+        exact=exact_matrix(tuple(c[parent_index] for c in C),tuple(d[parent_index] for d in D))
+        parts,delta_charge=store_parent(parts,delta_charge,contract(ps,delta,exact),
+            exact,jnp.int32(outrow))
+        jax.block_until_ready((parts,delta_charge));del ps,delta
+    source_mean=-2/volume*operand['source_phi'][0].conj()*Q[rows]
+    def assemble(parts,delta_charge,PS,Q,source_mean):
+        body=PS+parts[0];local=parts[1:5];mean=parts[5]+source_mean
+        return body+jnp.sum(local,axis=0)+mean,body,local,mean,Q+delta_charge
+    assemble=jax.jit(assemble,out_shardings=(ms,ms,
+        NamedSharding(mesh,P(None,None,'x','y')),ms,ms))
+    total,body,local,mean,charge=assemble(parts,delta_charge,PS[rows],Q[rows],source_mean)
     # Only scalar diagnostics reduce; production does not gather native J.
     scalar=jax.jit(lambda a:jnp.max(abs(a)),out_shardings=NamedSharding(mesh,P()))
     finite=jax.jit(lambda a:jnp.all(jnp.isfinite(a)),out_shardings=NamedSharding(mesh,P()))
     closure=float(np.asarray(scalar(total-body-local.sum(axis=0)-mean)))
     if closure>2e-11 or any(not bool(np.asarray(finite(a))) for a in (total,body,local,mean,charge)):
         raise ValueError('Resident Hartree tile closure or finite matrix failed')
-    source_mean=-2/volume*complex(np.asarray(operand['source_phi'])[0].conjugate())*Q[rows]
     arrays=dict(hartree_ry=total,body_ry=body,local_terms_ry=local,
         periodic_mean_ry=mean,receiving_charge=charge,PSbody_ry=PS[rows],Q_PS=Q[rows],
         raw_smooth_truth_ry=PS[rows]+source_mean,
@@ -425,7 +401,7 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
         device_memory_before=memory_before,device_memory_after=memory_after,
         all_process_peak_bytes_in_use=process_peaks[...,0].tolist(),
         all_process_resident_bytes_before=process_peaks[...,1].tolist(),
-        literal_zero_box_elimination_not_assumed=True,
+        receiving_pair_density_materialized=False,receiving_pair_harmonics_materialized=False,
         source_identity=captured['source_identity'],source_binding=captured['source_binding'],
         raw_parent_rows=rows.tolist(),parent_full_rows=np.asarray(sym.kirr_fullids)[rows].tolist(),
         raw_parent_k=rawk[rows].tolist(),receiving_band_labels=(np.arange(lo,hi)+1).tolist(),

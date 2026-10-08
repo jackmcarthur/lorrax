@@ -54,6 +54,32 @@ endpoint samples remain distributed over both mesh axes; bounded band
 tiles construct the native FILE-wedge operator at `P(None,'x','y')` before
 the fitting stage releases its orbital store.
 
+For a fixed occupied source the local Hartree expression is linear in the
+receiving density. `isdf.atomic_hartree.charge_hartree_functional` therefore
+supplies its radial adjoints once, including compensation, both smooth/local
+cross terms, exact monopole enrichment and both periodic mean terms. Applying
+the angular projection's transpose gives point weights $u_\delta$ and
+$u_{\rm PS}$, so its atomic receiving matrix is
+
+$$
+J^{\rm local}_{mn}=
+\sum_p u_\delta(p)\left[
+\psi^{\rm PS\dagger}_m(p)\delta\psi_n(p)
++\delta\psi_m^\dagger(p)\psi^{\rm PS}_n(p)
++\delta\psi_m^\dagger(p)\delta\psi_n(p)\right]
++\sum_p u_{\rm PS}(p)\psi^{\rm PS\dagger}_m(p)\psi^{\rm PS}_n(p)
++\sum_a b_a M^a_{00,mn}.
+$$
+
+Here $p$ runs over atom, radius and angular sample, all four spinor components
+are contracted, and $M_{00}$ is the independently evaluated physical correction
+monopole. The point weights include the single $N_{\rm FFT}/\Omega$ conversion
+from grid-normalized orbital products; the exact monopole covector $b$ has no
+such factor. The response is transposed without conjugation because it acts
+linearly on the receiving density. Bounded ket tiles contract these weights
+with the distributed orbital samples directly, avoiding band-pair radial
+clouds while retaining the original decomposition into physical terms.
+
 `gw.augmentation_hartree` authenticates the density, frame, geometry and
 operator recipe, serves the saved native matrix with the canonical FILE/TR
 map, and lets the existing Sigma assembly apply a requested basis rotation

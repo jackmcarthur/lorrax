@@ -525,32 +525,52 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
 
     def fourier_tile(t, coefficients):
         start = int(t)*gt
-        vectors = np.zeros((Qp, gt, 3), dtype=np.float64)
-        n = max(0, min(gt, kg.shape[1]-start))
-        vectors[:st.Q, :n] = kg[:, start:start+n]
-        lengths = np.linalg.norm(vectors, axis=-1)
-        cos_theta = np.divide(vectors[..., 2], lengths, out=np.ones_like(lengths), where=lengths > 0)
-        theta = np.arccos(np.clip(cos_theta, -1, 1))
-        phi = np.arctan2(vectors[..., 1], vectors[..., 0])
-        if cache is None:
-            bessel = np.stack([spherical_jn(l, lengths[..., None]*r)*(w*r*r)
-                               for l in degrees], axis=1)
-            g_radial = np.einsum('qlgr,lr->qlg', bessel, tables['compensation_shapes'])
-        else:
-            bessel = np.moveaxis(cache['density'](lengths), 0, 1)
-            g_radial = np.moveaxis(cache['compensation'](lengths), 0, 1)
-        angle = np.stack([4*np.pi*(-1j)**l*sph_harm_y(l, m, theta, phi)
-                          for l, m in harmonics], axis=1)
-        phase = np.exp(-1j*np.einsum('qgi,ai->qag', vectors, centers))
-        angular = angle[:, None]*phase[:, :, None]*(float(fft_points)/float(cell_volume))
-        # Mask every nonphysical G slot, including real q rows' sphere pads.
-        index = start+np.arange(gt)
-        valid = np.zeros((Qp, gt), bool)
-        valid[:st.Q] = index[None, :] < zeta_g.ngk_per_q[:, None]
-        angular *= valid[:, None, None, :]
-        return fourier_kernel(coefficients, put(bessel, P(XY, None, None, None)),
-                              put(angular, P(XY, None, None, None)),
-                              put(g_radial, P(XY, None, None)), scan_steps, dr, rows)
+        # Callback indices name only this process's addressed q rows. Keep
+        # their shared host tables just for the three placements in this tile;
+        # no peer's Q*G*radial table is constructed or retained on this rank.
+        local_rows = {}
+        def local_tables(qslice):
+            key = (qslice.start, qslice.stop, qslice.step)
+            if key in local_rows:
+                return local_rows[key]
+            qidx = np.arange(Qp)[qslice]
+            vectors = np.zeros((len(qidx), gt, 3), dtype=np.float64)
+            n = max(0, min(gt, kg.shape[1]-start))
+            real = qidx < st.Q
+            vectors[real, :n] = kg[qidx[real], start:start+n]
+            lengths = np.linalg.norm(vectors, axis=-1)
+            cos_theta = np.divide(vectors[..., 2], lengths, out=np.ones_like(lengths), where=lengths > 0)
+            theta = np.arccos(np.clip(cos_theta, -1, 1))
+            phi = np.arctan2(vectors[..., 1], vectors[..., 0])
+            if cache is None:
+                bessel = np.stack([spherical_jn(l, lengths[..., None]*r)*(w*r*r)
+                                   for l in degrees], axis=1)
+                g_radial = np.einsum('qlgr,lr->qlg', bessel, tables['compensation_shapes'])
+            else:
+                bessel = np.moveaxis(cache['density'](lengths), 0, 1)
+                g_radial = np.moveaxis(cache['compensation'](lengths), 0, 1)
+            angle = np.stack([4*np.pi*(-1j)**l*sph_harm_y(l, m, theta, phi)
+                              for l, m in harmonics], axis=1)
+            phase = np.exp(-1j*np.einsum('qgi,ai->qag', vectors, centers))
+            angular = angle[:, None]*phase[:, :, None]*(float(fft_points)/float(cell_volume))
+            # Mask every nonphysical G slot, including real q rows' sphere pads.
+            index = start+np.arange(gt)
+            valid = np.zeros((len(qidx), gt), bool)
+            valid[real] = index[None, :] < zeta_g.ngk_per_q[qidx[real], None]
+            angular *= valid[:, None, None, :]
+            local_rows[key] = (bessel, angular, g_radial)
+            return local_rows[key]
+
+        def put_q_rows(component, tail):
+            shape = (Qp, *tail)
+            sharding = NamedSharding(mesh, P(XY, *([None]*len(tail))))
+            return jax.make_array_from_callback(
+                shape, sharding, lambda index: local_tables(index[0])[component])
+
+        return fourier_kernel(coefficients,
+                              put_q_rows(0, (len(degrees), gt, nr)),
+                              put_q_rows(1, (na, nh, gt)),
+                              put_q_rows(2, (len(degrees), gt)), scan_steps, dr, rows)
 
     def onsite(coefficients):
         if compensated_body or delta_only_enrichment:
