@@ -1878,6 +1878,10 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
     re-applies the same predicate to the same weights, so the two agree by
     construction instead of by review.
     """
+    valid = None
+    if getattr(wfns, "valid_kn", None) is not None:
+        from gw.wavefunction_bundle import physical_band_mask
+        valid = jnp.asarray(physical_band_mask(wfns, occupations=(None if occupation_state is None else occupation_state.f_kn)))[:, wfns.slices.sigma_sum]
     if occupation_state is None:
         energy = wfns.enk[:, wfns.slices.sigma_sum] - float(efermi_ry)
         occupied = wfns.occ[:, wfns.slices.sigma_sum] > 0.5
@@ -1888,7 +1892,8 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
         # by the planner's excursion-deepened edge (sigma_windows._geometry).
         return branches_for_omega_grid(
             omega, E_cond=energy, H_val=-energy,
-            cond_mask=~occupied, val_mask=occupied)
+            cond_mask=(~occupied if valid is None else ~occupied & valid),
+            val_mask=(occupied if valid is None else occupied & valid))
     mu = float(occupation_state.mu_ry)
     if abs(float(efermi_ry) - mu) > 1.0e-12:
         raise ValueError(
@@ -1899,6 +1904,11 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
     f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
                     wfns.enk.shape)[:, wfns.slices.sigma_sum]
     energy = wfns.enk[:, wfns.slices.sigma_sum] - mu
+    if valid is not None:
+        return branches_for_omega_grid(
+            omega, E_cond=energy, H_val=-energy,
+            cond_mask=(f != 1.0) & valid, val_mask=(f != 0.0) & valid,
+            cond_weight=jnp.where(valid, 1.0 - f, 0.), val_weight=jnp.where(valid, f, 0.))
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
         cond_mask=(f != 1.0), val_mask=(f != 0.0),

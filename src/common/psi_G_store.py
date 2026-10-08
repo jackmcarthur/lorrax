@@ -31,6 +31,7 @@ right path.
 from __future__ import annotations
 
 from functools import lru_cache, partial
+from operator import index as _integer_index
 from typing import NamedTuple
 import numpy as np
 import jax
@@ -1070,6 +1071,94 @@ def _gslot_insert_kernel(mesh: Mesh):
     return insert
 
 
+def _native_reader_integer(value):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError("GATE native_parent_reader: integer counts exclude booleans")
+    try:
+        return _integer_index(value)
+    except TypeError as error:
+        raise ValueError("GATE native_parent_reader: exact integer counts required") from error
+
+
+def native_parent_reader_counts(counts, n_parent):
+    """Require physical per-parent band counts for an optional coefficient reader."""
+    values = np.asarray(counts)
+    if (values.shape != (_native_reader_integer(n_parent),) or values.dtype.kind not in "iu"
+            or np.any(values <= 0) or np.any(values > np.iinfo(np.int64).max)):
+        raise ValueError("GATE native_parent_reader: positive integer per-parent counts required")
+    return values.astype(np.int64, copy=False)
+
+
+@lru_cache(maxsize=None)
+def _native_parent_reader_check(mesh_xy):
+    """Check dynamic valid masks and coefficient tails over the full mesh."""
+    coefficients = NamedSharding(mesh_xy, band_sphere_spec())
+    bands = NamedSharding(mesh_xy, P(None, ('x', 'y')))
+    replicated = NamedSharding(mesh_xy, P())
+
+    @partial(jax.jit, in_shardings=(coefficients, bands, replicated, replicated),
+             out_shardings=replicated)
+    def check(psi, valid, expected, expected_g):
+        return jnp.stack((jnp.all(jnp.isfinite(psi)),
+                          jnp.all(valid == expected),
+                          jnp.all(jnp.where(expected[:, :, None, None]
+                                            & expected_g[:, None, None, :],
+                                            0, psi) == 0)))
+
+    return check
+
+
+def validate_native_parent_band_tile(psi, valid, *, mesh_xy, n_parent,
+                                     band_range, pad_to, nspinor, ngkmax,
+                                     physical_band_counts, physical_g_counts):
+    """Refuse an incomplete, replicated, nonfinite or nonzero-tail native tile.
+
+    This is a coefficient-input seam. The original G-slot exchange and
+    centroid DFT remain the only sampling implementation. Counts and masks
+    are small metadata; the coefficient payload must use every XY rank.
+    """
+    from common.collectives import device_put_process_local, gather_to_host
+
+    b0, b1 = (_native_reader_integer(v) for v in band_range)
+    n_parent, pad_to, nspinor, ngkmax = (_native_reader_integer(v)
+        for v in (n_parent, pad_to, nspinor, ngkmax))
+    if min(n_parent, pad_to, nspinor, ngkmax) <= 0:
+        raise ValueError("GATE native_parent_reader: positive coefficient extents required")
+    counts = native_parent_reader_counts(physical_band_counts, n_parent)
+    g_counts = native_parent_reader_counts(physical_g_counts, n_parent)
+    if np.any(g_counts > ngkmax) or not np.array_equal(counts, nspinor * g_counts):
+        raise ValueError("GATE native_parent_reader: complete native dimensions must equal spinor times physical G counts")
+    if (not hasattr(psi, "sharding") or psi.dtype != jnp.complex128
+            or tuple(psi.shape[:3]) != (int(n_parent), int(pad_to), int(nspinor))
+            or psi.ndim != 4 or int(psi.shape[-1]) != int(ngkmax)
+            or psi.sharding != NamedSharding(mesh_xy, band_sphere_spec())):
+        raise ValueError("GATE native_parent_reader: complex128 all-P band tile shape/layout required")
+    if (not 0 <= b0 < b1 <= b0 + int(pad_to)
+            or tuple(valid.shape) != (int(n_parent), int(pad_to))
+            or np.dtype(valid.dtype) != np.dtype(bool)):
+        raise ValueError("GATE native_parent_reader: exact requested interval and boolean native mask required")
+    if not hasattr(valid, "sharding"):
+        valid = device_put_process_local(np.asarray(valid), NamedSharding(
+            mesh_xy, P(None, ('x', 'y'))))
+    elif valid.sharding != NamedSharding(mesh_xy, P(None, ('x', 'y'))):
+        valid = jax.jit(lambda a: a, out_shardings=NamedSharding(
+            mesh_xy, P(None, ('x', 'y'))))(valid)
+    indices = b0 + np.arange(int(pad_to), dtype=np.int64)
+    expected = (indices[None, :] < counts[:, None]) & (indices[None, :] < b1)
+    expected = device_put_process_local(expected, NamedSharding(mesh_xy, P()))
+    expected_g = np.arange(ngkmax)[None, :] < g_counts[:, None]
+    expected_g = device_put_process_local(expected_g, NamedSharding(mesh_xy, P()))
+    finite, mask_equal, zero_tail = np.asarray(gather_to_host(
+        _native_parent_reader_check(mesh_xy)(psi, valid, expected, expected_g)))
+    if not finite:
+        raise ValueError("GATE native_parent_reader: nonfinite coefficient payload")
+    if not mask_equal:
+        raise ValueError("GATE native_parent_reader: callback mask differs from physical/requested counts")
+    if not zero_tail:
+        raise ValueError("GATE native_parent_reader: invalid native band/G coefficient tail is nonzero")
+    return psi
+
+
 def load_parent_psi_G(
     *,
     wfn,
@@ -1083,6 +1172,8 @@ def load_parent_psi_G(
     bispinor_lift: str = "raw",
     k_domain: str = "ibz",
     mu_tile_bytes: int = 256 * 2**20,
+    band_reader=None,
+    native_parent_band_counts=None,
     print_fn=print,
 ) -> ParentPsiG:
     """Read ψ(G) of the raw parents ONCE; return the G-slot store and the faces.
@@ -1104,6 +1195,15 @@ def load_parent_psi_G(
     (read + all-to-all), one ``band_chunk·ns·μ`` per-k partial before its
     reduce-scatter, the replicated sphere index ``n_k·ngk_c·4`` and one
     ``ngk_c/P × μ_tile`` phase tile (``mu_tile_bytes``).
+
+    An optional ``band_reader(band_range=(lo, hi), pad_to=wc,
+    k_domain=k_domain)`` returns ``(coefficients, valid)`` for all requested
+    raw parents on the canonical band-XY layout. Explicit physical counts
+    are mandatory for this route. Every physical coefficient must be
+    present and every invalid native or transport slot must be zero. The
+    caller authenticates the archive/source identity and records its native
+    feature scope in fit provenance; this seam does not invent a WFN schema
+    or make a native archive eligible for ordinary restart reuse.
     """
     from common import timing
     from common.collectives import device_put_process_local
@@ -1121,11 +1221,26 @@ def load_parent_psi_G(
     fft_grid = tuple(int(v) for v in meta.fft_grid)
     n_rtot = int(np.prod(fft_grid))
     b0, b1 = (int(v) for v in band_range)
+    if band_reader is not None:
+        if tuple(_native_reader_integer(v) for v in band_range) != (b0, b1):
+            raise ValueError("GATE native_parent_reader: exact logical band interval required")
+        logical_stop = _native_reader_integer(
+            getattr(meta, 'b_id_4_user', 0) or b1)
+        if not 0 <= b0 < b1 <= logical_stop:
+            raise ValueError("GATE native_parent_reader: interval exceeds the declared logical band extent")
+        _native_reader_integer(band_chunk)
     w = padded_axis(int(band_chunk), P_, name="ψ(G) band chunk").carrier
     nb_c = padded_axis(b1 - b0, P_, name="ψ(G) band carrier").carrier
     ngk_c = padded_axis(int(loader.ngkmax), P_, name="ψ(G) G-slot carrier").carrier
     k_spec = "ibz" if k_domain == "ibz" else "full_bz"
     nk = int(loader.nkpts) if k_spec == "ibz" else int(meta.nk_tot)
+    if band_reader is not None:
+        if not callable(band_reader) or bispinor:
+            raise ValueError("GATE native_parent_reader: callable ordinary scalar/spinor reader required")
+        native_parent_band_counts = native_parent_reader_counts(
+            native_parent_band_counts, nk)
+    elif native_parent_band_counts is not None:
+        raise ValueError("GATE native_parent_reader: native counts require the optional band reader")
 
     sidx_np = _pad_sphere_index(loader.box_index(k=k_spec), ngk_c, n_rtot)
     kvecs = loader.kvecs(k=k_spec)
@@ -1166,8 +1281,12 @@ def load_parent_psi_G(
             return (jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128),
                     jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128))
         acc_y, acc_x = _zero_faces()
+        face_bands = (padded_axis(b1 - b0, mesh_xy,
+            name="native parent face carrier",
+            specs=((PSI_NMU_SPEC, 1), (PSI_MUNT_SPEC, 2))).carrier
+            if band_reader is not None else b1 - b0)
         _, finish = _centroid_face_kernels(
-            b0, meta, mu_active_mask, n_rmu, int(mu_pad), b1 - b0, out_X, out_Y,
+            b0, meta, mu_active_mask, n_rmu, int(mu_pad), face_bands, out_X, out_Y,
             stage_X, stage_Y)
     else:
         mu_pad, mu_t = P_, 1
@@ -1197,10 +1316,22 @@ def load_parent_psi_G(
         wc = min(w, b0 + nb_c - lo)     # the tail chunk: a P multiple, ≤ w
         t0 = _time.perf_counter()
         with timing.section("psi_G_store.gslot.read"):
-            chunk = load_psi_gflat_padded(
-                loader, (lo, min(lo + wc, b1)), mesh_xy=mesh_xy,
-                bispinor=bispinor, pad_to=wc, k=k_spec,
-                sharding=band_sphere_spec(), bispinor_lift=bispinor_lift)
+            if band_reader is None:
+                chunk = load_psi_gflat_padded(
+                    loader, (lo, min(lo + wc, b1)), mesh_xy=mesh_xy,
+                    bispinor=bispinor, pad_to=wc, k=k_spec,
+                    sharding=band_sphere_spec(), bispinor_lift=bispinor_lift)
+            else:
+                read = band_reader(band_range=(lo, min(lo + wc, b1)),
+                                   pad_to=wc, k_domain=k_domain)
+                if not isinstance(read, (tuple, list)) or len(read) != 2:
+                    raise ValueError("GATE native_parent_reader: coefficient/mask pair required")
+                chunk = validate_native_parent_band_tile(
+                    read[0], read[1], mesh_xy=mesh_xy, n_parent=nk,
+                    band_range=(lo, min(lo + wc, b1)), pad_to=wc,
+                    nspinor=ns, ngkmax=int(loader.ngkmax),
+                    physical_band_counts=native_parent_band_counts,
+                    physical_g_counts=loader.ngk_valid(k=k_spec))
             if chunk is None:          # wholly past the file's bands: zeros
                 continue
             if int(chunk.shape[-1]) < ngk_c:

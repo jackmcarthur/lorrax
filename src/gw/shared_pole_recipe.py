@@ -37,7 +37,7 @@ shared_real_pole_v1_r3b = {
     # Production line sites (report section IV.B, the support rule): quantiles of the
     # consumer's crossing-pair density to the power alpha on [omega_lo, omega_reach].
     # The reads are the requested states' Sigma frequencies (gw.qp_support
-    # .requested_reads_ev: E_in +/- the plan pad on the Sigma step), so the line reaches
+    # .requested_reads_ev: E_in +/- this recipe's support_read_pad_ev), so the line reaches
     # every state the run asks for (WSUPPORT, claims 3282/3284; was a fixed +/-5 eV
     # window). Si Sigma optimum flat over alpha 0.25-0.75.
     "support_density_power": 0.5,
@@ -782,7 +782,7 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
                 digest=member['digest'], K=list(header['K']))
 
 
-def active_band_mask(energies_kn_ry, mu_ry, recipe=None):
+def active_band_mask(energies_kn_ry, mu_ry, recipe=None, *, valid_kn=None):
     """Bands the W model treats as dynamically active: ``max_k E_nk >= mu -
     active_depth_ev``.  Deeper bands (semicore) carry no plasma charge.
 
@@ -792,8 +792,12 @@ def active_band_mask(energies_kn_ry, mu_ry, recipe=None):
     """
     from common.units import RYD_TO_EV
     recipe = shared_real_pole_v1_r3b if recipe is None else recipe
-    depth = (float(mu_ry) - np.max(np.asarray(energies_kn_ry, dtype=np.float64),
-                                   axis=0)) * RYD_TO_EV
+    energies = np.asarray(energies_kn_ry, dtype=np.float64)
+    if valid_kn is not None:
+        from .wavefunction_bundle import _validate_valid_kn
+        _validate_valid_kn(energies, valid_kn)
+        energies = np.where(np.asarray(valid_kn, bool), energies, -np.inf)
+    depth = (float(mu_ry) - np.max(energies, axis=0)) * RYD_TO_EV
     return depth <= recipe['active_depth_ev']
 
 
@@ -831,6 +835,10 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     energies = np.asarray(wfns.enk, dtype=np.float64)[:, :stop]
     occupations = np.asarray(wfns.occ if occupation_state is None else
                              occupation_state.f_kn, dtype=np.float64)[:, :stop]
+    valid = None
+    if getattr(wfns, "valid_kn", None) is not None:
+        from .wavefunction_bundle import physical_band_mask
+        valid = physical_band_mask(wfns, occupations=(None if occupation_state is None else occupation_state.f_kn))[:, :stop]
     if (energies.shape != occupations.shape or energies.ndim != 2
             or energies.shape[0] != meta.nk_tot or not energies.size
             or not np.all(np.isfinite(energies))
@@ -849,6 +857,10 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     val = energies[:, wfns.slices.val]
     cond = energies[:, wfns.slices.cond_all_logical]
     response_cond = energies[:, wfns.slices.cond]
+    if valid is not None:
+        val = val[valid[:, wfns.slices.val]]
+        cond = cond[valid[:, wfns.slices.cond_all_logical]]
+        response_cond = response_cond[valid[:, wfns.slices.cond]]
     if not val.size or not cond.size or not response_cond.size:
         raise ValueError("GATE shared_pole_gap: got: empty logical valence/conduction window; want: both nonempty; why: support geometry needs a physical gap")
     vbm, cbm = float(np.max(val)), float(np.min(cond))
@@ -856,6 +868,8 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
           else float(occupation_state.mu_ry))
     gap_ev = max(0.0, (cbm - vbm) * RYD_TO_EV)
     partial = (occupations > 0.0) & (occupations < 1.0)
+    if valid is not None:
+        partial &= valid
     weights = np.asarray(kweights, dtype=np.float64)
     if (weights.shape != (meta.nk_tot,) or not np.all(np.isfinite(weights))
             or np.any(weights < 0) or not np.isclose(weights.sum(), 1.0, rtol=0, atol=1e-12)):
@@ -863,10 +877,15 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     # A partially occupied BAND must cross mu across the k census; smearing
     # tails in a gapped band do not authorize metallic line spacing.
     crossing = (np.min(energies, axis=0) <= mu) & (np.max(energies, axis=0) >= mu)
+    top = np.max(energies, axis=0)
+    if valid is not None:
+        top = np.where(valid, energies, -np.inf).max(axis=0)
+        bottom = np.where(valid, energies, np.inf).min(axis=0)
+        crossing = (bottom <= mu) & (top >= mu)
     partial_at_mu = bool(np.any(np.any(partial, axis=0) & crossing))
-    depth = (mu - np.max(energies, axis=0)) * RYD_TO_EV
+    depth = (mu - top) * RYD_TO_EV
     recipe = shared_real_pole_v1_r3b
-    active = active_band_mask(energies, mu)
+    active = active_band_mask(energies, mu, valid_kn=valid)
     borderline = ((depth > recipe['active_depth_ev'])
                   & (depth <= recipe['borderline_depth_ev']))
     electrons = float(capacity * np.sum(weights[:, None] * np.where(active, occupations, 0.0)))
@@ -876,7 +895,7 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
         raise ValueError("GATE shared_pole_plasma: got: nonpositive/nonfinite active charge or cell volume; want: positive finite electrons and bohr^3; why: omega_p requires positive density")
     meta.shared_pole_census = {
         "mu_ry": mu, "gap_ev": gap_ev, "partial_at_mu": partial_at_mu,
-        "energy_span_ry": float(energies.max()-energies.min()),
+        "energy_span_ry": float(energies.max()-energies.min()) if valid is None else float(energies[valid].max()-energies[valid].min()),
         "response_transition_span_ry": float(response_cond.max()-val.min()),
         "active_electrons": electrons, "cell_volume_bohr3": volume,
         "state_capacity": capacity, "k_weights": weights.tolist(),
@@ -889,6 +908,10 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
         "occupation_sha256": hashlib.sha256(occupations.tobytes()).hexdigest(),
         "trs_allowed": bool(trs_allowed), "logical_band_count": stop,
     }
+    if valid is not None:
+        meta.shared_pole_census.update(
+            valid_kn_sha256=hashlib.sha256(np.asarray(wfns.valid_kn, bool).tobytes()).hexdigest(),
+            physical_bands_by_k=valid.sum(axis=1).tolist())
 
 
 def _support_envelope(required, key, session):
@@ -969,6 +992,32 @@ def _sector_treatment_ceiling(response_span_ry, session):
                 current_response_span_ry=float(response_span_ry),
                 current_candidate_ceiling_ry=required,
                 scope="numerical treatment; not a physical pole bound")
+
+
+def parse_pole_budget(value, *, model="shared_pole", accuracy="production"):
+    """Validate the optional body cap; zero retains the automatic recipe.
+
+    A positive cap is a production shared-body construction policy, not a
+    sample-count, direction-width, infinity-width or head-pole setting.
+    """
+    try:
+        if isinstance(value, (bool, np.bool_)):
+            raise TypeError
+        budget = operator.index(value)
+    except TypeError:
+        raise ValueError(
+            f"GATE shared_pole_budget: got: {value!r}; want: an integer >= 0; "
+            "why: zero selects the existing automatic body cap") from None
+    if budget < 0:
+        raise ValueError(
+            f"GATE shared_pole_budget: got: {budget}; want: an integer >= 0; "
+            "why: a negative retained-rank cap has no construction")
+    if budget and (model != "shared_pole" or accuracy != "production"):
+        raise ValueError(
+            f"GATE shared_pole_budget: got: {budget} with model={model!r}, "
+            f"accuracy={accuracy!r}; want: production shared_pole; "
+            "why: the fixed body cap changes only that construction policy")
+    return budget
 
 
 def parse_support_sites(text):
@@ -1121,7 +1170,7 @@ def _held_line_sites(sites_for, line_count, line_count_rule, support_receipt, su
 
 
 def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, reads_ev, count,
-                            recipe=shared_real_pole_v1_r3b, grid=4001):
+                            recipe=shared_real_pole_v1_r3b, grid=4001, *, valid_kn=None):
     """Line sites from the band structure alone: the support rule (report section IV.B).
 
     Sigma evaluates W on the line at the crossings |E - eps|: E a read, the energy (eV,
@@ -1135,7 +1184,12 @@ def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, reads_ev, cou
     mu are binned at 0.01 eV (far below eta) and paired by one correlation per side of
     mu; sites land on a grid of ``grid`` points. Returns strictly increasing sites in eV.
     """
-    levels = np.asarray(energies_ev, dtype=np.float64).ravel() - mu_ev
+    energies = np.asarray(energies_ev, dtype=np.float64)
+    if valid_kn is not None:
+        from .wavefunction_bundle import _validate_valid_kn
+        _validate_valid_kn(energies, valid_kn)
+        energies = energies[np.asarray(valid_kn, bool)]
+    levels = energies.ravel() - mu_ev
     evaluation, delta = np.asarray(reads_ev, dtype=np.float64).ravel(), 0.01
     pairs = np.zeros(1)
     for side in (1.0, -1.0):
@@ -1211,10 +1265,17 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     from .gw_config import (uses_bare_transverse_shared_pole,
                             uses_full_bispinor_shared_pole)
 
+    pole_override = parse_pole_budget(
+        getattr(config.sigma, 'w_pole_budget', 0),
+        model=config.sigma.w_model, accuracy=config.sigma.w_accuracy)
     if config.sigma.w_model != "shared_pole":
         return None
     charge4 = uses_bare_transverse_shared_pole(config)
     photon = uses_full_bispinor_shared_pole(config)
+    if pole_override and int(meta.nspinor) not in (1, 2):
+        raise ValueError("GATE shared_pole_budget: a fixed body cap currently "
+                         "requires a scalar or two-component charge operator; "
+                         "four-current sector budgets remain automatic")
     if int(meta.nspinor) == 4 and not (charge4 or photon):
         raise ValueError("GATE shared_pole_representation: four-component shared-pole "
                          "response needs an explicit charge or full photon route")
@@ -1223,6 +1284,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         raise ValueError("GATE shared_pole_census: got: absent current census; want: bind_shared_pole_census after current occupations; why: no guessed plasma charge or frozen recipe")
     stop = wfns.slices.b4_logical - wfns.slices.b0
     energies = np.asarray(wfns.enk, dtype=np.float64)[:, :stop]
+    valid = None
+    if getattr(wfns, "valid_kn", None) is not None:
+        from .wavefunction_bundle import physical_band_mask
+        valid = physical_band_mask(wfns)[:, :stop]
+        valid_hash = hashlib.sha256(np.asarray(wfns.valid_kn, bool).tobytes()).hexdigest()
+        if valid_hash != census.get('valid_kn_sha256'):
+            raise ValueError("GATE shared_pole_census: stale physical-band validity; rebind the current census")
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
         raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
     # The run's budget in decimal GB (was per_device_gb * 2**30: GiB, 7.4% over the deck).
@@ -1254,6 +1322,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
                census['logical_band_count'],
                '' if override is None else override['text'])
+        if pole_override:
+            key += ('fixed-body-pole-budget-v1', pole_override)
         support_receipt = _support_envelope(
             dict(imaginary_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
             support_session)
@@ -1274,7 +1344,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         line_count, line_count_rule = support_line_count(reads, height, count, held_count, recipe, tier)
         line, line_count_rule = _held_line_sites(
             lambda n: support_rule_line_sites(energies * RYD_TO_EV, census['mu_ry'] * RYD_TO_EV, eta,
-                                              height, reads, n),
+                                              height, reads, n, valid_kn=valid),
             line_count, line_count_rule, support_receipt, support_session)
     if override is not None:
         # Both ladders are replaced together; height, held fractions, widths,
@@ -1331,6 +1401,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         version = RECIPE_VERSION + '+support_sites'
         table = hashlib.sha256(
             (RECIPE_HASH + '|' + override['text']).encode()).hexdigest()
+    if pole_override:
+        version += '+pole_budget'
+        table = hashlib.sha256(
+            (table + '|fixed-body-pole-budget-v1|' + str(pole_override)).encode()).hexdigest()
     if sector_treatment is not None:
         version += '+sector_treatment'
         treatment_identity = {key: sector_treatment[key] for key in (
@@ -1378,7 +1452,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'infinity_width': math.ceil(n * policy['infinity_width_fraction']),
         'line_direction_cap': (math.ceil(n * policy['line_direction_cap_fraction'])
                                if 'line_direction_cap_fraction' in policy else None),
-        'pole_budget': (math.ceil(n * policy['pole_budget_fraction'])
+        'pole_budget': (pole_override or math.ceil(n * policy['pole_budget_fraction'])
                         if 'pole_budget_fraction' in policy else None),
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
         'bank_rule_tolerance': policy['bank_rule_tolerance'],
@@ -1388,6 +1462,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     }
     if charge4:
         result['charge_operator'] = 'four-component-spin-traced-v1'
+    if pole_override:
+        result.update(pole_budget_policy='fixed-body-pole-budget-v1',
+                      pole_budget_override=pole_override,
+                      automatic_pole_budget=math.ceil(n * policy['pole_budget_fraction']))
     if support_receipt is not None:
         result['support_envelope'] = support_receipt
     if sector_treatment is not None:
@@ -1416,6 +1494,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
     }
+    if pole_override:
+        rules['pole_budget'] = ('declared sigma_w_pole_budget retained Gram directions per parent '
+                                '(largest first, whole multiplets); only the cap changes')
+        rules['automatic_pole_budget'] = 'unchanged production ceil(1.8 n), recorded for comparison'
     if support_receipt is not None:
         rules.update(imaginary_top='SC high-water envelope of omega_p+3.5 eV',
                      u_min='SC low-water envelope of max(h,logical gap)',

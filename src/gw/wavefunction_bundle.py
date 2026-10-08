@@ -225,6 +225,44 @@ CHI_R_SPEC = P(None, 'x', 'y')
 _LAYOUTS = ('face', 'axis')
 
 
+def _validate_valid_kn(energy, valid_kn):
+    """Validate optional replicated physical-band metadata without reading psi."""
+    if valid_kn is None:
+        return
+    if tuple(valid_kn.shape) != tuple(np.shape(energy)) or np.dtype(valid_kn.dtype) != np.dtype(bool):
+        raise ValueError("GATE physical_band_validity: want bool validity matching the energy carrier")
+    sharding = getattr(valid_kn, 'sharding', None)
+    if sharding is not None and not sharding.is_fully_replicated:
+        raise ValueError("GATE physical_band_validity: physical-band metadata must be replicated")
+
+
+def physical_band_mask(wfns, *, band_stop=None, occupations=None):
+    """Host metadata mask for logical bands and optional per-k native validity.
+
+    ``valid_kn=None`` retains uniform logical-band semantics. A supplied mask
+    is the canonical numerical carrier's mask, not an occupation threshold.
+    Ghost occupations must be exactly zero before either particle weight is
+    formed. Ghost coefficients are separately guarded by the input owner.
+    """
+    shape = tuple(wfns.enk.shape)
+    stop = int(wfns.slices.b4_logical - wfns.slices.b0)
+    stop = stop if band_stop is None else min(stop, int(band_stop))
+    if len(shape) != 2 or not 0 < stop <= shape[1]:
+        raise ValueError("GATE physical_band_validity: want a nonempty logical band table")
+    physical = np.broadcast_to(np.arange(shape[1])[None, :] < stop, shape).copy()
+    valid = getattr(wfns, 'valid_kn', None)
+    if valid is not None:
+        _validate_valid_kn(wfns.enk, valid)
+        valid = np.asarray(jax.device_get(valid), dtype=bool)
+        occupied = np.asarray(jax.device_get(wfns.occ if occupations is None else occupations))
+        if occupied.shape != shape or np.any(occupied[~valid] != 0.):
+            raise ValueError("GATE physical_band_validity: ghost occupations must be exact zero")
+        physical &= valid
+    if np.any(~np.any(physical, axis=1)):
+        raise ValueError("GATE physical_band_validity: every k row needs a physical band")
+    return physical
+
+
 @dataclass
 class ParentGreenCarrier:
     """Raw-parent operands for Green contractions and band projections.
@@ -242,10 +280,13 @@ class ParentGreenCarrier:
     occ: jax.Array
     plan: object
     layout: str = 'face'
+    #: Derived from the full-k bundle by the canonical parent-row plan.
+    valid_kn: jax.Array | None = None
 
     def __post_init__(self):
         """Validate the static layout independently of the spinor extent."""
         psi_specs(self.layout)
+        _validate_valid_kn(self.enk, self.valid_kn)
 
     def projection_faces(self):
         """Orient the existing copies along the operator's contracted centroid axes."""
@@ -260,12 +301,13 @@ class ParentGreenCarrier:
         lo = int(bands.start or 0)
         hi = int(bands.stop if bands.stop is not None else nb)
         row = (jnp.arange(nb) >= lo) & (jnp.arange(nb) < hi)
-        return jnp.broadcast_to(row[None, :], self.enk.shape)
+        mask = jnp.broadcast_to(row[None, :], self.enk.shape)
+        return mask if self.valid_kn is None else mask & self.valid_kn
 
 
 jax.tree_util.register_dataclass(
     ParentGreenCarrier,
-    data_fields=['psi_nmu', 'psi_mun', 'enk', 'occ'],
+    data_fields=['psi_nmu', 'psi_mun', 'enk', 'occ', 'valid_kn'],
     meta_fields=['plan', 'layout'],
 )
 
@@ -285,10 +327,13 @@ class Wavefunctions:
     green_parent: ParentGreenCarrier | None = None
     #: The canonical face layout is static pytree metadata.
     layout: str = "face"
+    #: Optional replicated bool[full_k, carrier] physical-state validity.
+    valid_kn: jax.Array | None = None
     def __post_init__(self) -> None:
         if self.layout not in _LAYOUTS:
             raise ValueError(
                 f"Wavefunctions: layout={self.layout!r} not in {_LAYOUTS}.")
+        _validate_valid_kn(self.enk, self.valid_kn)
 
 
     @functools.partial(jax.jit, static_argnames=('bands',))
@@ -299,7 +344,8 @@ class Wavefunctions:
         hi = int(bands.stop if bands.stop is not None else nb_full)
         idx = jnp.arange(nb_full)
         row = (idx >= lo) & (idx < hi)
-        return jnp.broadcast_to(row[None, :], self.enk.shape)
+        mask = jnp.broadcast_to(row[None, :], self.enk.shape)
+        return mask if self.valid_kn is None else mask & self.valid_kn
 
 
 # Register as JAX pytree so Wavefunctions can be passed to @jax.jit functions.
@@ -309,7 +355,7 @@ class Wavefunctions:
 # treedef, and a compiled carrier round-trip cannot silently discard one.
 jax.tree_util.register_dataclass(
     Wavefunctions,
-    data_fields=['psi_nmu', 'psi_mun', 'green_parent', 'enk', 'occ'],
+    data_fields=['psi_nmu', 'psi_mun', 'green_parent', 'enk', 'occ', 'valid_kn'],
     meta_fields=['slices', 'layout'],
 )
 
@@ -470,6 +516,8 @@ def build_packed_parent_green_carrier(
     mesh_xy: Mesh,
 ) -> ParentGreenCarrier:
     """Bind raw-parent faces to the full-k bundle's scalar tables."""
+    if wfns.valid_kn is not None:
+        physical_band_mask(wfns)
     nmu_spec, mun_spec = psi_specs(wfns.layout)
     expected_nmu = (
         int(plan.n_parent), int(wfns.slices.nb_full), int(plan.nspinor),
@@ -495,9 +543,17 @@ def build_packed_parent_green_carrier(
         rep2 = NamedSharding(mesh_xy, P(None, None))
         enk = jax.lax.with_sharding_constraint(enk, rep2)
         occ = jax.lax.with_sharding_constraint(occ, rep2)
+        valid = (None if wfns.valid_kn is None else
+                 jax.lax.with_sharding_constraint(plan.parent_rows(wfns.valid_kn), rep2))
+        if valid is not None:
+            ghost_nmu = jnp.max(jnp.where(valid[:, :, None, None], 0., jnp.abs(psi_nmu)))
+            ghost_mun = jnp.max(jnp.where(valid[:, None, None, :], 0., jnp.abs(psi_mun)))
+            error = float(jnp.maximum(ghost_nmu, ghost_mun))
+            if not np.isfinite(error) or error != 0.:
+                raise ValueError("GATE physical_band_validity: invalid parent-band coefficients must be exact zero")
     return ParentGreenCarrier(
         psi_nmu=psi_nmu, psi_mun=psi_mun, enk=enk, occ=occ, plan=plan,
-        layout=wfns.layout)
+        layout=wfns.layout, valid_kn=valid)
 
 
 def attach_packed_parent_green_carrier(
@@ -798,6 +854,8 @@ def rotate_wavefunctions(
             f"outside the σ-window [{s_lo}, {s_hi}); we have no QP basis "
             f"information for bands beyond the protected window.")
     nb_active = a_hi - a_lo
+    if wfns_dft.valid_kn is not None and not np.all(physical_band_mask(wfns_dft)[:, a_lo:a_hi]):
+        raise ValueError("GATE rotate_physical_bands: active rotations cannot mix physical states with ghosts")
     if U_dft_to_qp_active.shape[-2:] != (nb_active, nb_active):
         raise ValueError(
             f"rotate_wavefunctions: U shape {U_dft_to_qp_active.shape} "
@@ -867,6 +925,7 @@ def rotate_wavefunctions(
     rotated = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
         enk=enk_full, occ=occ_full, slices=wfns_dft.slices, layout=wfns_dft.layout,
+        valid_kn=wfns_dft.valid_kn,
     )
     if carrier_rotated is None:
         return rotated

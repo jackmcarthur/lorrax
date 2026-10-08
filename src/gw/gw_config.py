@@ -1684,6 +1684,8 @@ _DEFAULTS = {
     # fractions, widths and gates are unchanged, and the sites enter
     # recipe_version/recipe_hash so no store crosses ladders on restart.
     "sigma_w_support_sites_ev": "",
+    # A fixed body-only retained-rank study; zero keeps the versioned auto cap.
+    "sigma_w_pole_budget": 0,
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -2280,6 +2282,20 @@ def _resolve_shared_pole_inputs(params):
             f"{params['sigma_w_support_sites_ev']!r} with sigma_w_model={model!r}; "
             "want: sigma_w_model=shared_pole; why: only the shared-pole "
             "resolver has support ladders to replace")
+    if "sigma_w_pole_budget" in named and (mode != "mpa" or model != "shared_pole"):
+        raise ValueError(
+            "GATE shared_pole_applicability: sigma_w_pole_budget requires "
+            "compute_mode=mpa and sigma_w_model=shared_pole; "
+            "why: only that body constructor consumes this cap")
+    from .shared_pole_recipe import parse_pole_budget
+    params["sigma_w_pole_budget"] = parse_pole_budget(
+        params["sigma_w_pole_budget"], model=model,
+        accuracy=params["sigma_w_accuracy"])
+    if params["sigma_w_pole_budget"] and params["bispinor"]:
+        raise ValueError(
+            "GATE shared_pole_budget: a fixed body cap currently requires "
+            "a scalar or two-component charge operator; four-current sector "
+            "budgets remain automatic")
     eta = float(params["sigma_regularization_ev"])
     if not (np.isfinite(eta) and eta > 0.0):
         raise ValueError(
@@ -2577,6 +2593,7 @@ def _input_response(
         w_model=str(params["sigma_w_model"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
+        w_pole_budget=params["sigma_w_pole_budget"],
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
@@ -4115,6 +4132,10 @@ class DynamicSigmaConfig:
     #: an explicit support geometry for support-rule studies.  Parsed and
     #: gated by ``gw.shared_pole_recipe.parse_support_sites``.
     w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
+    #: Optional fixed production shared-body retained-Gram cap; zero keeps
+    #: the automatic cap. Positive values enter recipe/store identity only;
+    #: physical support, direction widths, moments and gate thresholds stay fixed.
+    w_pole_budget: int = _DEFAULTS["sigma_w_pole_budget"]
     quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
@@ -4153,6 +4174,9 @@ class DynamicSigmaConfig:
     band_extrapolation_bracket_scheme_explicit: bool = False
 
     def __post_init__(self):
+        from .shared_pole_recipe import parse_pole_budget
+        parse_pole_budget(self.w_pole_budget, model=self.w_model,
+                          accuracy=self.w_accuracy)
         if self.omega_step_ev <= 0.0:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         lo, hi = self.requested_edges_ev()
