@@ -55,8 +55,13 @@ by the route predicate and by the screened mode's refusal:
 | `qp_solver = one_shot_dft` | both |
 | `screening_diagrams = w_rpa` | both |
 | `head_correction ∈ {full, off}` | both |
-| `linalg = distributed` | screened (the bare route solves no packed Dyson equation, so `linalg` never selects it) |
 | no scalar-head override named (`scalar_head_overrides_named`) | screened |
+
+The screened packed Dyson solve follows `linalg`. Under `local` it is route
+(c), whole matrices per rank; a rank whose whole matrices (V, χ and W for its
+⌈n_q/P⌉ parents plus one LU pair) exceed the device budget takes the
+distributed plan, with one warning. The bare route solves no packed Dyson
+equation, so `linalg` never selects it.
 
 `sys_dim` is outside the table. P-bare treats `sys_dim = 2` as a routing
 condition. P-screened refuses `sys_dim ≠ 2` only under

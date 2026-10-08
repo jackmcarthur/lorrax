@@ -2866,11 +2866,6 @@ def _resolve_static_photon_policy(
         BispinorGWMode, HeadCorrection,
         coerce_bispinor_gw_mode, packed_bare_transverse_route,
         packed_photon_screens_current)
-    if screen_current and str(dyson_solver).strip().lower() != "distributed":
-        raise ValueError(
-            "the screened packed static photon response requires "
-            "dyson_solver='distributed' (its packed Dyson solve has only "
-            "the distributed plan); the bare route solves no packed Dyson")
     if config is None:
         raise ValueError(
             "packed static photon response requires the run config: the "
@@ -3011,10 +3006,31 @@ def _report_static_photon_body(
             flush=True)
 
 
+def _packed_dyson_solver(dyson_solver, nq, n, mesh_xy, print_fn):
+    """The deck's W plan for the packed Dyson solve, with cuSOLVERMp as the capacity route.
+
+    ``local`` (route (c): whole matrices per rank, 3.2-6.2x faster than
+    cuSOLVERMp at P4, sandbox claim 3987) unless one rank's whole matrices --
+    V, chi and W for its ceil(nq/P) parents plus one LU working pair -- exceed
+    the device budget; then the distributed plan, with one warning.
+    """
+    # ponytail: priced from the shapes against the fixed device budget, not the live ledger.
+    from common.gpu_utils import device_budget_bytes
+    dyson = str(dyson_solver).strip().lower()
+    whole = 16 * n * n * (3 * -(-int(nq) // int(mesh_xy.size)) + 2)
+    if dyson == "local" and whole > device_budget_bytes():
+        print_fn(f"  WARNING: [photon response] the packed Dyson solve's whole matrices "
+                 f"({whole / 1e9:.2f} GB/rank, n={n}, nq={nq}) exceed the device budget "
+                 f"({device_budget_bytes() / 1e9:.2f} GB): solving on the distributed plan",
+                 flush=True)
+        return "distributed"
+    return dyson
+
+
 def _screen_static_photon_body(
         screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
         current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
-        sym, nq):
+        sym, nq, dyson_solver, print_fn):
     """Produce the screened packed operator on the existing photon basis."""
     from .photon_layout import (
         PhotonBasisLayout, pack_photon_channel_vectors, photon_block_view,
@@ -3029,7 +3045,8 @@ def _screen_static_photon_body(
 
         W_packed = solve_w(
             V_packed, chi_packed, meta, mesh_xy,
-            dyson_solver="distributed",
+            dyson_solver=_packed_dyson_solver(
+                dyson_solver, nq, int(layout.packed_extent), mesh_xy, print_fn),
             # Direct sum of already-padded C/T channel blocks: unlike the
             # scalar carrier, this space has no one logical prefix to mask.
             n_rmu_logical=int(layout.packed_extent),
@@ -3178,7 +3195,7 @@ def compute_static_photon_response(
     wfn_fingerprint_binding=None,
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
-    dyson_solver: str = "distributed",
+    dyson_solver: str = "local",
     distrib_la_batched_route: str = "batch_reshard",
     print_fn=print,
 ) -> StaticPhotonResponse:
@@ -3194,7 +3211,7 @@ def compute_static_photon_response(
     (W_packed) = _screen_static_photon_body(
         screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
         current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
-        sym, nq)
+        sym, nq, dyson_solver, print_fn)
     (V_packed, W_packed, head_completion) = _complete_static_photon_head(
         coupled_head, V_packed, W_packed, wfns_charge, config, mesh_xy, wfn, meta, layout,
         hall, wfn_fingerprint_binding, photon_g0_vectors, plans, print_fn)

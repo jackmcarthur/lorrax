@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — the screened packed photon Dyson solve follows `linalg`; `full_static_cohsex` runs under `linalg = local`
+
+`bispinor_gw = full_static_cohsex` no longer requires `linalg = distributed`. Its packed Dyson
+solve takes the deck's W plan: under `local` it is route (c), whole matrices per rank, unless
+one rank's V, χ and W for its ⌈n_q/P⌉ parents plus one LU pair exceed the device budget,
+when it solves on the distributed plan with one warning. CrI3 6×6 40 Ry COHSEX at P4: the
+two plans give eqp equal to the printed digit (1288/1288 rows), and the screening stage takes
+11.7 s on route (c) against 15.3 s on cuSOLVERMp. `compute_static_photon_response` defaults to
+`dyson_solver = 'local'`. No deck change; a deck that set `linalg = distributed` only to pass
+the old refusal can drop it.
+
 ## 2026-10-08 — the cuBLASMp GEMM is gone; every distributed GEMM is panel_matmul
 
 `distrib_la.matmul(batched_route='auto')` and `gemm_plan(layout='face')` run

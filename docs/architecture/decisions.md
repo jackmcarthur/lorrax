@@ -44,8 +44,6 @@ an operation had no XLA path.
 
 * On CUDA a k-grid axis above 40 refuses (`GATE mathdx-kconv-axis`),
   although the router's XLA backend could serve it.
-* The screened bispinor Dyson solves on cuSOLVERMp although route (c) is
-  3.2–6.2× faster at P4 (sandbox claim 3987).
 * The operations the [FFI layer](ffi_layout.md#kernel-operations) lists
   under *Gaps* have no plain-XLA route.
 
