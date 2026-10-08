@@ -754,6 +754,7 @@ def compute_screening_model(
                 wfns, V_q, meta, config, mesh_xy=mesh_xy, sym=sym,
                 centroid_indices=centroid_indices, run_dir=run_dir, label=label,
                 wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+                charge_zeta_identity=charge_zeta_identity,
                 tensors_filename=tensors_filename, occupation_state=occupation_state,
                 print_fn=print_fn, head_resolver=head_resolver, mpa_plan=mpa_plan,
                 iteration_head_response=iteration_head_response,

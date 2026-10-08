@@ -129,8 +129,9 @@ def _mark_photon_head(handle, config):
     handle["direct_photon_head"] = "first_order_cc_ct_tc_tt"
 
 
-def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
-    """Bind logical current energies/occupations and their wavefunction source.
+def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices,
+                         charge_zeta_identity=None):
+    """Bind current bands and the authenticated physical charge fit.
 
     SC supplies the current Hamiltonian/rotation identity from its owner;
     a DFT fingerprint alone cannot authenticate rotated wavefunctions.
@@ -178,6 +179,13 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
         # fingerprint here (the dipole provenance's): a rerun reuses them only
         # on the same WFN, never on energies alone.
         identity["wfn"] = source
+    if charge_zeta_identity is not None:
+        # gw_init owns all fit semantics (including augmentation and endpoint
+        # weights). Transport its opaque receipt, never rederive them here.
+        from file_io.tagged_arrays import _encode_charge_zeta_identity
+        _encode_charge_zeta_identity(charge_zeta_identity)
+        identity.update(charge_zeta_identity_scheme=charge_zeta_identity["scheme"],
+                        charge_zeta_identity=charge_zeta_identity["digest"])
     return identity
 
 
@@ -445,12 +453,17 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         material_class=None, wfns_transverse=None,
                         bispinor_v_q_path=None, mu_bases=None,
                         photon_g0_vectors=None, photon_head_cache=None,
-                        photon_head_state=None):
+                        photon_head_state=None, charge_zeta_identity=None):
     """Build current W; only one-shot models may use ISDF restart membership.
 
     SC labels own separate map scratch. ``restart`` may restore the invariant
     ISDF basis, but never skips the current response or W construction.
+    The fitting catalogue supplies its path-independent two-string receipt;
+    a model cannot authenticate different physical vertices from the same WFN.
     """
+    if charge_zeta_identity is None:
+        raise ValueError("GATE shared_pole_charge_fit: authenticated charge-zeta "
+                         "identity missing; regenerate the ISDF fit in a fresh run variant")
     source_wfn = None
     from .gw_config import uses_full_bispinor_shared_pole
     photon = uses_full_bispinor_shared_pole(config)
@@ -497,7 +510,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if photon:
                 wfns_transverse = dataclasses.replace(wfns_transverse, occ=wfns.occ)
         identity = shared_pole_identity(wfns, meta, label=label, wfn=wfn,
-            binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
+            binding=wfn_fingerprint_binding, centroid_indices=centroid_indices,
+            charge_zeta_identity=charge_zeta_identity)
         sc_scratch = str(label).startswith("sc_")
         if config.restart and tensors_filename is not None and not sc_scratch and not photon:
             handle = shared_pole_restart_handle(tensors_filename,
