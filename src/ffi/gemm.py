@@ -124,7 +124,7 @@ def gemm_batch(a3, b3):
     No ``shard_map`` here: this is a rank-LOCAL handler with no
     communicator, called from inside the caller's own ``shard_map`` body
     (``shard_map`` cannot nest).  That is the structural difference from the
-    ``ffi/{slate,scalapack,cusolvermp,cublasmp}`` families, whose wrappers
+    ``ffi/{slate,scalapack,cusolvermp}`` families, whose wrappers
     own their ``shard_map`` because their handlers hold an MPI/NCCL context.
     """
     ba, m, k = (int(d) for d in a3.shape)

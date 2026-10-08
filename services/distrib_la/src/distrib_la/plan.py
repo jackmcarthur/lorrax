@@ -837,7 +837,7 @@ class Plan:
             # on every attempt. A failed check solves again: shifted (a near-zero
             # cluster moved off the origin, the vectors re-orthonormalized), then
             # gathered.
-            # The provider SUMMA (cuBLASMp): a single matrix never batch-reshards onto one device.
+            # The face SUMMA (panel_matmul): a single matrix never batch-reshards onto one device.
             gemm = partial(matmul, mesh=mesh, backend="distributed", batched_route="auto")
             pin = eigh_layout(mesh, A.ndim)
             deflate = partial(deflate_zero_rows, constrain=pin)

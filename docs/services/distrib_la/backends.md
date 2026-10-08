@@ -157,22 +157,19 @@ route; the request is still honoured.
 | eigh, distributed | cuSOLVERMp `syevd` | ScaLAPACK `pzheevd` / `pdsyevd` |
 | LU solve, distributed | cuSOLVERMp batched `getrf` / `getrs` | ScaLAPACK `pXgetrf` / `pXgetrs` |
 | Cholesky, explicit request | cuSOLVERMp batched `potrf` / `potrs` | SLATE `potrf` / `trsm`; `native2d` |
-| GEMM, distributed | cuBLASMp | XLA's dot on gathered faces |
+| GEMM, distributed | `panel_matmul` (XLA SUMMA; local products on cuBLAS) | `panel_matmul` (XLA SUMMA; local products on JAX dot panels) |
 | SLATE, any op | only when the CUDA leg was built against a `gpu_backend=cuda` SLATE | `potrf`, `trsm`; `eigh` refused (guard 3) |
 
 The Perlmutter CUDA leg is built without SLATE
 (`config/perlmutter/build_ffi_cuda.sh` points `LORRAX_SLATE_INSTALL_DIR` at an
 empty prefix, and the sealed bundle's CUDA leg has no `libslate` dependency),
 so an explicit `slate` on a CUDA mesh refuses at guard 4, naming the missing
-handler. Device-side distributed algebra on NVIDIA is cuSOLVERMp and
-cuBLASMp, which communicate through NCCL.
+handler. Device-side distributed algebra on NVIDIA is cuSOLVERMp, which
+communicates through NCCL.
 
 **Handler inventory.** There is no ScaLAPACK Cholesky and no SLATE LU
-handler. The loader also declares `lorrax_scalapack_batched_gemm` and
-`lorrax_slate_batched_gemm`, and `lorrax_slate_batched_potrf` /
-`_batched_trsm` exist on both legs, but no C++ defines the two GEMM targets
-and no Python wrapper calls them or the batched SLATE pair: an explicit
-`scalapack` or `slate` GEMM refuses at the capability probe.
+handler. `lorrax_slate_batched_potrf` / `_batched_trsm` exist on both legs,
+but no Python wrapper calls them. No native GEMM handler is called.
 
 ## Distributed is a capacity route {#capacity-route}
 
@@ -282,47 +279,27 @@ cpu` on Perlmutter ([Building the FFI libraries](../../installation/ffi-build.md
 
 ## GEMM providers and active-range kernels
 
-| `matmul` request | CUDA mesh | CPU mesh |
-|---|---|---|
-| `auto`, `distributed` | cuBLASMp | XLA's dot on gathered faces |
-| `cublasmp`, `cusolvermp` (an alias) | cuBLASMp | refuse |
-| `scalapack`, `slate` | refuse (no handler is built) | refuse (no handler is built) |
-| `off` | staged route only | staged route only |
-
-On the declared ROCm platform key `auto` names SLATE, whose GEMM handler is
-not built either.
-
-Provider calls need `float64` or `complex128`, an exact `('x','y')` mesh with
-y-minor process order, one process per cell and exact face tiling; cuBLASMp
-also needs a square mesh. The provider aliases `C` to the output. cuBLASMp's
-multi-rank transpose descriptors are never used, because transpose-A returns
-wrong results and transpose-B can deadlock: a `T` or `C` operand is moved by
-a distributed face transpose (one extra operand-sized distributed buffer) and
-then multiplied N,N. On a CPU mesh the face plan gathers the contraction axis
-inside its `shard_map` (A over `'y'`, B over `'x'`), so each rank holds the
-`(nq, m/P_x, k)` and `(nq, k, n/P_y)` panels for the duration of one call.
+Every `matmul` request except `off` runs `distrib_la.panel_matmul`, the
+batched 2-D SUMMA in XLA, on every platform. The retired names `cublasmp`,
+`cusolvermp`, `scalapack` and `slate` are still accepted and run it too;
+`off` is the staged route only. The face GEMM needs `float64` or
+`complex128`, a square `('x','y')` mesh and exact face tiling, and takes
+`transa`/`transb` itself. It replaced cuBLASMp, which it beat 1.4-1.5x on
+the ζ-projector and SC-rotation shapes at P4 (sandbox claim 3987).
 
 [Active ranges](api.md#active-ranges) are implemented per route:
 
 | route | operands | kernel |
 |---|---|---|
-| CUDA face | both at `P(None,'x','y')` | `lorrax_cublasmp_active_range_gemm`: cuBLASMp descriptor views of each owner intersection |
+| CUDA face | both at `P(None,'x','y')` | `panel_matmul`'s local panel products on `lorrax_cublas_local_active_range_gemm` (host-known intervals: `…_prepared_active_range_gemm`) |
 | CUDA axis | A `P(None,'x',None)`, B `P(None,None,'y')` | `lorrax_cublas_local_active_range_gemm`: local cuBLAS pointer views, no collective |
-| CPU face | both at `P(None,'x','y')` | the CPU axis kernel on the gathered panels |
-| CPU axis | as CUDA axis | `_active_local.active_local_matmul`: JAX dot panels |
+| other face | both at `P(None,'x','y')` | `panel_matmul`'s local panel products on the axis kernel below |
+| other axis | as CUDA axis | `_active_local.active_local_matmul`: JAX dot panels |
 
-- **cuBLASMp descriptor views.** The handler reads the small bound table to
-  the host, intersects each interval with the original contraction-owner
-  slabs, and for every nonempty intersection builds a descriptor view whose
-  base pointer advances inside the original storage, with unchanged leading
-  dimensions and batch strides: A's block belongs to that owner's process
-  column, B's to its process row. Each GEMM contracts the exact intersection
-  and accumulates into the same distributed output; no band panel is packed.
-  Arbitrary submatrix origins on the original descriptors are not an
-  alternative, because cuBLASMp requires origins aligned to descriptor
-  blocks. The prepared target (`…_prepared_active_range_gemm`) receives the
-  intervals as FFI metadata and skips the bounds copy and stream
-  synchronization.
+The cuBLAS kernel stays the CUDA arm: on windowed bounds it is 3.7-5.0x
+faster than the JAX panels at P4, and equal on a full window (sandbox claim
+3987).
+
 - **Local cuBLAS views.** `_active_local_cuda.active_local_cuda` views
   row-major tiles as column-major transposes, $C^T = B^T A^T$, and moves the
   base pointers by the interval while keeping leading dimensions and strides;
@@ -330,7 +307,7 @@ inside its `shard_map` (A over `'y'`, B over `'x'`), so each rank holds the
   handler binds a dedicated cuBLAS handle to the call's stream with a 4 MiB
   workspace that XLA owns (an explicit scratch output), reset on every call so
   no state leaks between invocations. Weighting forms one weighted-A tile.
-- **CPU panels.** A `lax.while_loop` walks the interval in disjoint slices of
+- **JAX panels.** A `lax.while_loop` walks the interval in disjoint slices of
   power-of-two widths up to 256 columns, chosen by `lax.switch`, so at most
   nine statically shaped dots compile regardless of `K`, and changing the
   bounds recompiles nothing. Weights are applied inside each slice. Rows with

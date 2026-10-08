@@ -516,13 +516,6 @@ set(LORRAX_FFI_SOURCES
     cusolvermp/batched_potrs_ffi.cc
     cusolvermp/batched_solve_lu_ffi.cc
 )
-if(LORRAX_FFI_HAVE_CUBLASMP)
-    list(APPEND LORRAX_FFI_SOURCES
-        cublasmp/batched_gemm_ffi.cc
-        cublasmp/batched_w_solve_ffi.cc
-        cublasmp/w_solve_kernels.cu
-    )
-endif()
 if(LORRAX_CUFFT_ON)
     # Isolated compile target for the NVIDIA k-convolution family on
     # nvidia-mathdx (decisions.md 2026-09-24).  Its kernels are NVRTC-built at

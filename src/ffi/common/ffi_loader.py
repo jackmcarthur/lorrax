@@ -11,7 +11,7 @@ its cpu (lapack) vs CUDA (cusolver) kernels, so ``jax.ffi.ffi_call``
 sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
-    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLASMp/phdf5/slate/mathdx k-conv
+    CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLAS/phdf5/slate/mathdx k-conv
     cpu   liblorrax_ffi_host.so  phdf5 read+write / slate (Target::HostTask)
                                  / ScaLAPACK / FFTW3-ABI flat-k / MKL GEMM
 
@@ -105,10 +105,6 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
     "lorrax_cublas_local_active_range_gemm_out": "CublasLocalActiveRangeGemmOutFfi",
     "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
-    "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
-    "lorrax_cublasmp_active_range_gemm":  "CublasMpActiveRangeGemmFfi",
-    "lorrax_cublasmp_prepared_active_range_gemm": "CublasMpPreparedActiveRangeGemmFfi",
-    "lorrax_cublasmp_batched_w_solve":    "CublasMpBatchedWSolveFfi",
     # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
     # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
     # (mode, grid, ns, context) and disk-cached.  CUDA-only; the ffi.fft router
@@ -150,7 +146,6 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionFfi",
     "lorrax_slate_eigh":              "SlateEighFfi",
     "lorrax_slate_potrf":             "SlatePotrfFfi",
-    "lorrax_slate_trsm":              "SlateTrsmFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmFfi",
 }
@@ -180,7 +175,6 @@ _CUDA_TARGET_SYMBOLS = {
 _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":              "SlateEighHostFfi",
     "lorrax_slate_potrf":             "SlatePotrfHostFfi",
-    "lorrax_slate_trsm":              "SlateTrsmHostFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
     "lorrax_scalapack_batched_solve_lu": "ScalapackBatchedSolveLuHostFfi",

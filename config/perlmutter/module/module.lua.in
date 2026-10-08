@@ -51,7 +51,7 @@ setenv("JAX_ENABLE_X64", "1")
 -- argv prefix that re-applies this environment inside each rank.
 setenv("LORRAX_MPI_TYPE", "cray_shasta")
 setenv("LORRAX_MPICH_GPU_SUPPORT", "0")
-setenv("LORRAX_FFI_EXPECT_BACKENDS", "cusolvermp,cublasmp,cufft,phdf5")
+setenv("LORRAX_FFI_EXPECT_BACKENDS", "cusolvermp,cufft,phdf5")
 setenv("LORRAX_SHIFTER", table.concat({
     "env",
     "PATH=" .. venv .. "/bin:" .. cuda .. "/bin:/usr/bin:/bin",

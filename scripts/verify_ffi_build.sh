@@ -59,7 +59,7 @@
 #                                  so.  That default is the entire lesson of
 #                                  the Aug-7 library.
 #                                    host: scalapack,gemm,slate,phdf5,fft
-#                                    cuda: cusolvermp,cublasmp,cufft,slate,phdf5
+#                                    cuda: cusolvermp,cufft,slate,phdf5
 #   LORRAX_FFI_EXPECT_HDF5_SOVERSION
 #                                  the HDF5 SOVERSION THE RUNTIME WILL MOUNT
 #                                  (e.g. 200).  Stated, not inferred: on
@@ -176,7 +176,7 @@ esac
 if [[ "$LEG" == host ]]; then
     DEFAULT_BACKENDS="scalapack,gemm,slate,phdf5,fft"
 else
-    DEFAULT_BACKENDS="cusolvermp,cublasmp,cufft,slate,phdf5"
+    DEFAULT_BACKENDS="cusolvermp,cufft,slate,phdf5"
 fi
 BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-$DEFAULT_BACKENDS}"
 
@@ -308,7 +308,6 @@ backend_stamp_key() {
         # legitimately 0 on an MKL site: reported below, never asserted.
         host:fft)        echo - ;;
         cuda:cusolvermp) echo cusolvermp ;;
-        cuda:cublasmp)   echo cublasmp ;;
         cuda:cufft)      echo cufft ;;
         cuda:slate)      echo slate ;;
         cuda:phdf5)      echo phdf5 ;;
@@ -323,7 +322,6 @@ backend_symbol_re() {
         host:phdf5)      echo '^Phdf[A-Za-z0-9]*HostFfi$' ;;
         host:fft)        echo '^MklFft[A-Za-z0-9]*HostFfi$' ;;
         cuda:cusolvermp) echo '^(EighMpFfi|CusolverMp[A-Za-z0-9]*Ffi)$' ;;
-        cuda:cublasmp)   echo '^CublasMp[A-Za-z0-9]*Ffi$' ;;
         cuda:cufft)      echo '^(Cufft|KConvMathdx|KFftMathdx)[A-Za-z0-9]*CudaFfi$' ;;
         cuda:slate)      echo '^Slate[A-Za-z0-9]*Ffi$' ;;
         cuda:phdf5)      echo '^Phdf[A-Za-z0-9]*Ffi$' ;;
@@ -339,7 +337,7 @@ for b in "${_want[@]}"; do
     if [[ -z "$re" ]]; then
         fail 0b "'$b' is not a backend of the $LEG leg.  Known:
       host = scalapack gemm slate phdf5 fft
-      cuda = cusolvermp cublasmp cufft slate phdf5"
+      cuda = cusolvermp cufft slate phdf5"
         continue
     fi
     # On the device leg the host handlers are absent, but keep the two name

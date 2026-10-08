@@ -33,7 +33,7 @@ capacity route for matrices that do not fit one device.
 any other platform: no ROCm GPU runs gwjax, and a CPU mesh without the host
 library runs nothing. A vendor route with no XLA twin on its own device has
 no reference to be wrong against. Several CUDA routes do not pay for
-themselves: the cuBLASMp GEMM is 1.6–4.2× slower than
+themselves: the cuBLASMp GEMM was 1.4–4.2× slower than
 `distrib_la.panel_matmul` at production shapes.
 
 **Licenses deleting** every vendor kernel, library call and environment
@@ -44,9 +44,8 @@ an operation had no XLA path.
 
 * On CUDA a k-grid axis above 40 refuses (`GATE mathdx-kconv-axis`),
   although the router's XLA backend could serve it.
-* The cuBLASMp GEMM has no measured gain. The classic-cuBLAS local
-  active-range GEMM and the screened bispinor Dyson's cuSOLVERMp LU are not
-  measured against XLA.
+* The screened bispinor Dyson solves on cuSOLVERMp although route (c) is
+  3.2–6.2× faster at P4 (sandbox claim 3987).
 * The operations the [FFI layer](ffi_layout.md#kernel-operations) lists
   under *Gaps* have no plain-XLA route.
 

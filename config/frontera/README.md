@@ -117,9 +117,7 @@ contract and its numbers: [`docs/environment/machines/frontera.md` §3](../../do
   `liblorrax_ffi_host.so`; ScaLAPACK `pzheevd`
   (`ScalapackEighHostFfi`) is the permanent CPU distributed eigh behind
   the `ffi/linalg` facade.
-* Still open: cuBLASMp fused kernels beyond the linked lib (consumer-less
-  package, owner-ledgered for deletion pending one rtx gate), and
-  cross-node **GPU** phdf5 bring-up on the rtx mlx4 fabric
+* Still open: cross-node **GPU** phdf5 bring-up on the rtx mlx4 fabric
   (HANDOFF_2026-07-28 open ledger).
 
 ## Transport — do NOT seed `FI_PROVIDER` (post-AU doctrine)

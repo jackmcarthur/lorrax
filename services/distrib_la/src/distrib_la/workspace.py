@@ -22,7 +22,7 @@ def _shapes(shapes):
 def _vendor_query(ctx, op, sizes, dtype):
     from distrib_la.loader import get_lib
     lib = get_lib('CUDA')
-    name = 'lrx_eigh_workspace_bytes' if op == 'eigh' else 'lrx_gemm_workspace_bytes'
+    name = 'lrx_eigh_workspace_bytes'
     if op == 'eigh' and len(sizes) == 2:
         # (side, block): the descriptor the distributed solve runs at. A
         # library without the block query prices one tile per rank at that side.
@@ -158,7 +158,6 @@ def _workspace_details(plan, op, shapes, dtype):
 def _gemm_workspace_details(mesh, shapes, dtype, *, local, backend, ctx_handle=None):
     """Shared query implementation for planned and eager GEMM routes."""
     import jax
-    from distrib_la._cusolvermp import get_or_init_context
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     m, k, n = shapes[0][-2], shapes[0][-1], shapes[1][-1]
     batch = shapes[0][0] if len(shapes[0]) == 3 else 1
@@ -170,14 +169,11 @@ def _gemm_workspace_details(mesh, shapes, dtype, *, local, backend, ctx_handle=N
                     dynamic_xla_scratch_bytes=0, local=True,
                     formula='compiled local batched matmul temp_size_in_bytes (workspace upper bound)',
                     provider='XLA local GEMM')
-    if backend not in ('cusolvermp', 'cublasmp'):
-        raise ValueError('distributed GEMM workspace query supports cublasmp only')
-    ctx = ctx_handle if ctx_handle is not None else get_or_init_context(mesh, col_major=False)
-    device, host = _vendor_query(ctx, 'gemm', (m,n,k), dtype.str)
-    return dict(device_bytes=device, host_bytes=host, vendor_device_bytes=device,
+    # Every distributed GEMM is distrib_la.panel_matmul: XLA-managed, no vendor workspace.
+    return dict(device_bytes=0, host_bytes=0, vendor_device_bytes=0,
                 dynamic_xla_scratch_bytes=0, local=False,
-                formula='one vendor workspace shared by all batch slices; retained by native context',
-                provider='cublasMp')
+                formula='panel_matmul: XLA-managed panels, no vendor workspace',
+                provider='panel_matmul')
 
 
 def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',

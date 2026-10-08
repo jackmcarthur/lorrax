@@ -72,7 +72,7 @@ LORRAX_ROOT="$LORRAX_CLOUD_ROOT" \
 # full acceptance contract, closure gates included.
 LD_LIBRARY_PATH="$(lorrax_cloud_runtime_ld_library_path)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 LORRAX_ROOT="$LORRAX_CLOUD_ROOT" \
-LORRAX_FFI_EXPECT_BACKENDS=cusolvermp,cublasmp,cufft,phdf5 \
+LORRAX_FFI_EXPECT_BACKENDS=cusolvermp,cufft,phdf5 \
 LORRAX_FFI_EXPECT_MPI="libmpi.so.40" \
 LORRAX_FFI_VERIFY_ENV=runtime \
 LORRAX_GATE_FFTW_PY="$LORRAX_CLOUD_ENV/bin/python" \

@@ -47,7 +47,7 @@ python -m pip install -e ../lxkit -e .
 
 Import top-level names only. `from distrib_la.<submodule> import …` from
 outside the package fails `tests/test_layering.py`, because the package is its
-own facade: ScaLAPACK, SLATE, cuSOLVERMp and cuBLASMp are reached through one
+own facade: ScaLAPACK, SLATE and cuSOLVERMp are reached through one
 module, `distrib_la.loader`, and nowhere else. Native JAX routes, the
 vocabularies and the capability report work with no native library present;
 the FFI routes need the LORRAX native pair ([Backends § where the libraries
@@ -329,7 +329,7 @@ the call sits:
 
 | entry | for | phases |
 |---|---|---|
-| `matmul` | an eager product of any shape | resolves and probes on every call |
+| `matmul` | an eager product of any shape | resolves on every call |
 | `gemm_plan` / `local_gemm_plan` | one fixed shape called many times inside a `jit` or `lax.scan` (Green build, Σ projection) | eager plan, trace-safe call |
 | `panel_matmul`, `batch_gram`, `contract_faces` | face products whose contraction axis must never be gathered whole on a rank | trace-safe, no provider |
 
@@ -349,10 +349,10 @@ and the output face must tile the mesh.
   the inverse exchanges for D. A rank-2 call is lifted to batch 1 and padded
   to `P`. Each device holds `⌈B/P⌉` whole A, B and D matrices plus exchange
   buffers, so use it only when those fit.
-- **Provider route** (`batched_route='auto'`): the distributed GEMM of the
-  platform ([Backends § GEMM](backends.md#gemm-providers-and-active-range-kernels)).
+- **Face route** (`batched_route='auto'`): `panel_matmul` on every platform,
+  for every backend name but `off` ([Backends § GEMM](backends.md#gemm-providers-and-active-range-kernels)).
   With a shared `budget_bytes`, the staged route runs when one rank's whole
-  matrices fit and the provider otherwise.
+  matrices fit and the face route otherwise.
 
 ### `gemm_plan`
 
@@ -362,28 +362,25 @@ warmup=True) -> GemmPlan` fixes one N,N shape, $D_q = \alpha A_q B_q + \beta
 C_q$ for `q < nq`, with `A (nq, m, k)`, `B (nq, k, n)`, `C`, `D (nq, m, n)`.
 `nq` holds k-points; a spinor axis is flattened into `m`, `k` or `n`, or the
 plan is called once per spin. `GemmPlan(A, B, C=None, *, out=None)` is
-trace-safe: no library load, no probe and no new `jit` inside the caller's
-trace.
+trace-safe: no new `jit` inside the caller's trace.
 
 - **N,N only.** There is no transpose argument; a caller with a transposed
   operand stores it once in the complementary face layout.
-- **`alpha`, `beta` are compile-time** FFI attributes. With `beta = 0` the plan
+- **`alpha`, `beta` are compile-time** constants. With `beta = 0` the plan
   also compiles a variant that creates the zero addend inside the same
   program; `out=` donates an existing buffer instead (legal only with
   `beta = 0`, since a `beta ≠ 0` plan would scale stale content). Pass `C` or
   `out`, not both.
-- **`warmup=True`** compiles and runs the plan once on dummy operands, so the
-  first real call inside a timed loop pays nothing; `warmup=False` keeps the
-  eager validation and probe but defers compilation to the first call, for a
-  one-shot outer `jit` that compiles the GEMM with its neighbours.
-- **`GemmPlan.local_call`** runs the same GEMM from inside the caller's own
-  `shard_map` over the plan's mesh, on bare local tiles.
+- **`warmup=True`** compiles and runs an axis plan once on dummy operands, so
+  the first real call inside a timed loop pays nothing; `warmup=False` defers
+  that to the first call, for a one-shot outer `jit` that compiles the GEMM
+  with its neighbours. A face plan always compiles at its first call.
 - **`backend='off'` refuses**, because the staged route would materialize
   whole operands on every device, which a planned GEMM exists to avoid.
 
 | `layout` | operands | contraction |
 |---|---|---|
-| `face` | all at `P(None,'x','y')`; `m % P_x`, `k % P_x`, `k % P_y`, `n % P_y` | the platform's distributed GEMM ([Backends](backends.md#gemm-providers-and-active-range-kernels)) |
+| `face` | all at `P(None,'x','y')`; `m % P_x`, `k % P_x`, `k % P_y`, `n % P_y` | `panel_matmul` ([Backends](backends.md#gemm-providers-and-active-range-kernels)) |
 | `axis` | `A (q, m_X, k)`, `B (q, k, n_Y)`, `D (q, m_X, n_Y)`; complete local `k` | a local product, no collective (`local_gemm_plan`) |
 
 For `layout='axis'`, `out_spec=P(None,'x',None)` or `P(None,None,'y')` keeps
@@ -405,8 +402,8 @@ computes $D_q = \alpha\,(A_q \,\mathrm{diag}(w_q))_{:,lo:hi}\, B_{q,lo:hi,:} +
 \beta C_q$ without allocating anything of the interval's size. `lo`, `hi` are
 integer scalars or `(nq,)` arrays, replicated; `weights` is `(nq, K)` and needs
 a complex plan when complex. `0 ≤ lo ≤ hi ≤ K` is required: invalid Python
-integers raise eagerly, invalid traced bounds raise in the distributed
-provider, and the local kernels return an all-NaN output rather than clamp. An
+integers raise eagerly, and for invalid traced bounds the local kernels
+return an all-NaN output rather than clamp. An
 empty interval applies the `beta` semantics without reading A or B; a full
 interval calls the dense GEMM, so its evaluation order is unchanged. Interior
 holes in an interval still cost arithmetic.
@@ -417,8 +414,8 @@ compile-time metadata, so no bounds operand exists and no device-to-host copy
 or stream synchronization happens per call. The caller owns each prepared
 callable; each distinct interval compiles its own executable on first use, so
 keep one per recurring interval and use `active_range` for intervals that
-change. Preparation probes the provider eagerly even for a full interval, so a
-missing handler cannot hide behind the dense path. Local active plans need
+change. On CUDA, preparing an axis plan probes the cuBLAS handler eagerly even
+for a full interval, so a missing handler cannot hide behind the dense path. Local active plans need
 replicated `K` and a two-axis output; reduction-axis and single-axis-output
 plans refuse the option. How each route implements the interval is in
 [Backends](backends.md#gemm-providers-and-active-range-kernels).
@@ -476,11 +473,8 @@ Measured cost (A100-40GB, warm, ms per Green-sized complex product; CrI3 8×8
 | full-k gather (band-complete on every rank; forbidden by the layout rule) | 2.68 | 6.59 | 1.86 | 5.14 |
 | batched SUMMA, panels ≤ k/p (this route) | 3.22 | 6.79 | 2.57 | 7.37 |
 | two k/2 panels (every band live on a rank; forbidden) | 3.22 | 6.79 | 1.85 | 5.95 |
-| cuBLASMp SUMMA, one call per q | 6.68 | 10.95 | 6.88 | 5.11 |
 
-cuBLASMp runs one SUMMA per q and joins the XLA stream by events at entry and
-exit, so it cannot overlap neighbouring work; this route exchanges every q in
-one collective per panel. Under XLA's default scheduler the prefetched gather
+This route exchanges every q in one collective per panel. Under XLA's default scheduler the prefetched gather
 still runs on the compute stream, so it does not overlap the GEMM; at P16 the
 exchange is most of a build (1.2 of 1.85 ms on CrI3).
 
@@ -590,9 +584,8 @@ nothing and accept `float64` or `complex128` only.
   it is the cuSOLVERMp workspace rounded to 256 bytes plus one private operand
   tile `(n/P_x)(n/P_y)·itemsize`, which keeps eigh non-donating despite the
   destructive tridiagonalization; do not add that tile again. A local eigh
-  returns the cuSolverDn workspace plus a 4-byte info word. For `gemm`, one
-  vendor workspace per context persists across calls, so budget
-  `max(GEMM workspace) + max(concurrent eigh scratch)`. Query collectively on
+  returns the cuSolverDn workspace plus a 4-byte info word. A distributed
+  `gemm` has none: `panel_matmul`'s panels are XLA's. Query collectively on
   the real mesh; off CUDA it returns 0.
 - `matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend,
   batched_route)`: the same query for a `matmul` route.
@@ -627,7 +620,7 @@ such as a missing conjugate or an unsymmetrized product, and never round-off.
 | `BACKEND_CHOICES`, `EIGH_BACKENDS`, `CHOLESKY_BACKENDS`, `LU_BACKENDS`, `OPS`, `NATIVE`, `MATMUL_BACKEND_CHOICES`, `BATCHED_ROUTES`, `BATCHED_ROUTE_CHOICES`, `BATCHED_ROUTE_DEFAULT` | the vocabularies, importable with no native library so a deck parser needs no FFI |
 | `resolve_backend(op, requested, mesh, *, n=None, compute_evecs=True)` | the raising probe |
 | `list_backends(op, mesh)` | the never-raising report, for startup banners |
-| `resolve_matmul_backend(requested, mesh, *, batched_route)` | the GEMM probe |
+| `resolve_matmul_backend(requested, mesh, *, batched_route)` | the GEMM route a request names (`panel_matmul` or `off`) |
 | `mesh_key(mesh)`, `mesh_platform(mesh)`, `mesh_is_cpu(mesh)` | a hashable mesh identity (axes, extents, platform, device ids) and its predicates; key any cache whose value does not retain the mesh on `mesh_key`, because two same-shaped meshes over different devices lower to different handlers |
 | `dial_key()`, `probe_target`, `has_target`, `backend_module` | the factory cache key and the capability probes (absent vs broken) |
 

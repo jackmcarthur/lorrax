@@ -22,7 +22,7 @@ deliberately *not* the deployment target, which is the point: nothing
 site-specific survives in the closure.
 
 * `setup_env.sh` + `build_ffi.sh` produce `liblorrax_ffi.so` with backends
-  `cusolvermp,cublasmp,cufft,phdf5`, `cal=0`.
+  `cusolvermp,cufft,phdf5`, `cal=0`.
 * `scripts/verify_ffi_build.sh --leg cuda` under `LORRAX_FFI_VERIFY_ENV=runtime`:
   **every gate ran and passed** (one-MPI, closure resolution, one-HDF5, ABI).
 * `launch.sh -n 1 python services/distrib_la/bench/cusolvermp_eigh_test.py -n 128 --grid 1 1`:
@@ -94,7 +94,7 @@ documented deliberate `os._exit`; judge by artifacts.
 * **cuBLASMp pin.** Perlmutter's lane names 0.10.0.3695; that wheel is on
   neither pypi.org nor pypi.nvidia.com (checked 2026-08-26; newest published
   cu13 wheel is 0.9.1.3056, which this lane pins). If 0.10 reappears, bump
-  `LORRAX_CLOUD_CUBLASMP_VERSION` — `compat.h` carries the API delta.
+  `LORRAX_CLOUD_CUBLASMP_VERSION`.
 * **NVTX** is a separate unsuffixed wheel (`nvidia-nvtx`); the jax closure
   does not pull it. `setup_env.sh` installs it explicitly.
 * **NCCL/cuDNN/NVSHMEM** version independently of the toolkit and keep their

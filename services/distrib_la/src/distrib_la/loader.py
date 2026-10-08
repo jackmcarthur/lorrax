@@ -3,15 +3,15 @@
 Ported from LORRAX ``src/ffi/common/ffi_loader.py`` at 96a6399, carrying
 only what the distributed-linalg backends need: the two platform library
 specs, the linalg target→C++-symbol tables, the ctypes declarations for
-the cuSOLVERMp/SLATE contexts, and the probe. Distributed GEMM is part of
-this service as well: cuBLASMp, PBLAS, and SLATE multiply handlers are in
-the same two provider libraries. Only unrelated FFT, private fused W-solve,
-host bands-GEMM, and phdf5 surfaces remain in LORRAX's loader.
+the cuSOLVERMp/SLATE contexts, and the probe.  The one native GEMM here is
+the CUDA local active-range cuBLAS product; the distributed GEMM is
+:func:`distrib_la.panel_matmul` in XLA.  Only unrelated FFT, host
+bands-GEMM and phdf5 surfaces remain in LORRAX's loader.
 
 THIS IS THE QUARANTINE BOUNDARY.  Everything in this package that knows a
 vendor library exists knows it through this module: one ``dlopen``, one
 symbol table, one probe.  ``pyproject.toml`` declares no ScaLAPACK, no
-SLATE, cuSOLVERMp, or cuBLASMp because none is linked here — they are inside
+SLATE or cuSOLVERMp because none is linked here — they are inside
 a ``.so`` that this file opens by path.
 
 The tables are the SERVICE's, the policy is lxkit's
@@ -113,9 +113,6 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
     "lorrax_cublas_local_active_range_gemm_out": "CublasLocalActiveRangeGemmOutFfi",
     "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
-    "lorrax_cublasmp_batched_gemm":       "CublasMpBatchedGemmFfi",
-    "lorrax_cublasmp_active_range_gemm":  "CublasMpActiveRangeGemmFfi",
-    "lorrax_cublasmp_prepared_active_range_gemm": "CublasMpPreparedActiveRangeGemmFfi",
     "lorrax_cusolvermp_eigh":             "EighMpFfi",
     "lorrax_cusolvermp_batched_potrf":    "CusolverMpBatchedPotrfFfi",
     "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
@@ -124,10 +121,8 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_batched_getrs":    "CusolverMpBatchedGetrsFfi",
     "lorrax_slate_eigh":                  "SlateEighFfi",
     "lorrax_slate_potrf":                 "SlatePotrfFfi",
-    "lorrax_slate_trsm":                  "SlateTrsmFfi",
     "lorrax_slate_batched_potrf":         "SlateBatchedPotrfFfi",
     "lorrax_slate_batched_trsm":          "SlateBatchedTrsmFfi",
-    "lorrax_slate_batched_gemm":          "SlateBatchedGemmFfi",
 }
 
 # The host variants: the SAME target names registered under platform="cpu"
@@ -140,15 +135,12 @@ _CUDA_TARGET_SYMBOLS = {
 _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":                    "SlateEighHostFfi",
     "lorrax_slate_potrf":                   "SlatePotrfHostFfi",
-    "lorrax_slate_trsm":                    "SlateTrsmHostFfi",
     "lorrax_slate_batched_potrf":           "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":            "SlateBatchedTrsmHostFfi",
-    "lorrax_slate_batched_gemm":            "SlateBatchedGemmHostFfi",
     "lorrax_scalapack_eigh":                "ScalapackEighHostFfi",
     "lorrax_scalapack_batched_solve_lu":    "ScalapackBatchedSolveLuHostFfi",
     "lorrax_scalapack_batched_getrf":       "ScalapackBatchedGetrfHostFfi",
     "lorrax_scalapack_batched_getrs":       "ScalapackBatchedGetrsHostFfi",
-    "lorrax_scalapack_batched_gemm":        "ScalapackBatchedGemmHostFfi",
 }
 
 #: Per-platform library spec.  ``build_subdir`` is relative to

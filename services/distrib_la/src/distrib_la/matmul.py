@@ -1,20 +1,16 @@
-"""Top-level distributed GEMM across the :mod:`distrib_la` providers.
+"""Top-level distributed GEMM.
 
-The explicit ``batched_route='auto'`` route calls an actual 2-D provider
-operation: cuBLASMp next to
-cuSOLVERMp, PBLAS ``pdgemm``/``pzgemm`` next to ScaLAPACK, or
-``slate::multiply`` next to SLATE.  Unlike :func:`distrib_la.plan`,
-``backend='auto'`` here selects that platform provider; it does not select a
-native JAX floor.  On a CPU mesh that provider is XLA's dot on gathered
-faces (:func:`distrib_la.gemm_plan`'s CPU face plan); no ScaLAPACK GEMM
-handler is built.
+The explicit ``batched_route='auto'`` route runs the face GEMM,
+:func:`distrib_la.panel_matmul`'s batched SUMMA, on every platform
+for every backend name except ``'off'`` (the retired provider names
+``'cublasmp'``, ``'cusolvermp'``, ``'scalapack'`` and ``'slate'`` included:
+no native batched GEMM is called).
 
 The default ``batched_route='batch_reshard'`` route moves A, B and C from
 faces to whole matrices in one all_to_all over (x, y) each, runs local
 ``jnp.matmul``, then applies the literal inverse exchange to D.  Use ``backend='off'``
-with that route for a provider-free call.  A non-``off`` request is still
-resolved and capability-probed even though the selected route does not call
-the provider.
+with that route for a provider-free call; any other name still needs the
+square mesh the face GEMM needs.
 """
 from __future__ import annotations
 
@@ -25,11 +21,10 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la import loader
 from distrib_la._shard_map import shard_map
 from distrib_la.plan import (BATCHED_ROUTE_CHOICES, BATCHED_ROUTE_DEFAULT,
                              ROUTE_BATCH_RESHARD, ensure_sharding)
-from distrib_la.resolve import mesh_key, mesh_platform
+from distrib_la.resolve import mesh_key
 
 __all__ = ["MATMUL_BACKEND_CHOICES", "matmul", "resolve_matmul_backend",
            "contract_faces"]
@@ -40,18 +35,10 @@ MATMUL_BACKEND_CHOICES = (
 )
 """Public provider vocabulary accepted by :func:`matmul` and its resolver."""
 
-_TARGETS = {
-    "cublasmp": "lorrax_cublasmp_batched_gemm",
-    "scalapack": "lorrax_scalapack_batched_gemm",
-    "slate": "lorrax_slate_batched_gemm",
-}
 _OP_CODE = {"N": 0, "T": 1, "C": 2}
-_CUBLASMP_CACHE: dict = {}
 _RESHARD_CACHE: dict = {}
-_XLA_CACHE: dict = {}
-#: The provider ``auto``/``distributed`` resolve to on a CPU mesh: XLA's dot
-#: on gathered faces, no handler.
-CPU_XLA = "xla"
+#: The face GEMM every platform resolves to: :func:`distrib_la.panel_matmul`.
+PANEL = "panel_matmul"
 
 
 def contract_faces(b_X, b_Y, weights, start, stop, *, mesh: Mesh,
@@ -144,65 +131,14 @@ def _mesh_shape(mesh: Mesh) -> tuple[int, int]:
     return int(mesh.shape["x"]), int(mesh.shape["y"])
 
 
-def _provider_platform(provider: str, mesh: Mesh) -> str:
-    platform = mesh_platform(mesh)
-    if provider == "cublasmp" and platform != "CUDA":
-        raise RuntimeError(
-            f"matmul backend 'cublasmp' is CUDA-only; mesh is {platform!r}")
-    if provider == "scalapack" and platform != "cpu":
-        raise RuntimeError(
-            f"matmul backend 'scalapack' is host-only; mesh is {platform!r}")
-    if provider == "slate" and platform not in ("CUDA", "cpu", "rocm"):
-        raise RuntimeError(
-            f"matmul backend 'slate' has no provider on {platform!r}")
-    return platform
-
-
-def _require_provider(provider: str, mesh: Mesh) -> None:
-    px, py = _mesh_shape(mesh)
-    if provider in ("cublasmp", "slate") and px != py:
-        raise ValueError(
-            f"matmul backend {provider!r} needs a square mesh: its "
-            f"one-face GEMM layout is invalid on a {px}x{py} grid")
-    if px * py != int(jax.process_count()):
-        raise RuntimeError(
-            f"matmul backend {provider!r} needs one JAX process per mesh "
-            f"cell; mesh={px}x{py}, process_count={jax.process_count()}")
-    bad = []
-    for ix in range(px):
-        for iy in range(py):
-            got = int(mesh.devices[ix, iy].process_index)
-            want = ix * py + iy
-            if got != want:
-                bad.append(f"({ix},{iy})->process {got}, expected {want}")
-    if bad:
-        raise RuntimeError(
-            f"matmul backend {provider!r} requires a y-minor process grid; "
-            + "; ".join(bad[:4]))
-    platform = _provider_platform(provider, mesh)
-    probe = loader.probe_target(_TARGETS[provider], platform)
-    if not probe.ok:
-        raise RuntimeError(
-            f"matmul backend {provider!r} is unavailable: {probe.reason}")
-
-
 def resolve_matmul_backend(requested: str, mesh: Mesh, *,
                            batched_route: str = BATCHED_ROUTE_DEFAULT) -> str:
     """Resolve a public request to an actual GEMM provider.
 
-    ``cusolvermp`` maps to its matrix-multiply sibling ``cublasmp``.
-    ``auto`` and ``distributed`` select cuBLASMp on CUDA, XLA's dot on
-    gathered faces (:data:`CPU_XLA`, no handler to probe) on CPU, and SLATE
-    on ROCm.  Explicit requests never demote.  ``off`` is
-    legal only with the local ``batch_reshard`` route, where no provider call
-    is made. Every other result has already passed platform,
-    provider-specific mesh geometry (including cuBLASMp/SLATE square grids),
-    one-process-per-cell, shared-library, and handler-symbol guards.
-
-    Route selection is orthogonal to provider selection: an explicit or
-    automatic non-``off`` provider is still probed when
-    ``batched_route='batch_reshard'``.  This matches :class:`distrib_la.Plan`
-    semantics and makes a requested capability a promise rather than a hint.
+    Every name except ``off`` selects the face GEMM,
+    :func:`distrib_la.panel_matmul` (:data:`PANEL`), on every platform; it
+    needs a square mesh.  ``off`` is legal only with the local
+    ``batch_reshard`` route, where no provider call is made.
     """
     requested = str(requested).strip().lower()
     route = str(batched_route).strip().lower()
@@ -220,25 +156,12 @@ def resolve_matmul_backend(requested: str, mesh: Mesh, *,
                 "matmul backend 'off' has no distributed provider; select "
                 "batched_route='batch_reshard' for all-to-all/local GEMM")
         return "off"
-    if requested in ("auto", "distributed"):
-        platform = mesh_platform(mesh)
-        if platform == "CUDA":
-            provider = "cublasmp"
-        elif platform == "cpu":
-            return CPU_XLA
-        elif platform == "rocm":
-            provider = "slate"
-        else:
-            raise RuntimeError(
-                f"matmul has no distributed provider for platform {platform!r}")
-    elif requested == "cusolvermp":
-        provider = "cublasmp"
-    else:
-        provider = requested
-    # Match Plan semantics: even the local route honours an explicit provider
-    # request and proves its capability at construction/call entry.
-    _require_provider(provider, mesh)
-    return provider
+    px, py = _mesh_shape(mesh)
+    if px != py:
+        raise ValueError(
+            f"matmul: the face GEMM (distrib_la.panel_matmul) needs a square mesh; "
+            f"got {px}x{py}")
+    return PANEL
 
 
 def _op_shape(shape: tuple[int, int], op: str) -> tuple[int, int]:
@@ -280,108 +203,18 @@ def _zeros(shape, dtype, sharding):
         jnp.zeros(shape, dtype=dtype), sharding)
 
 
-@lru_cache(maxsize=None)
-def _transpose_kernel(op, tile):
-    """Reuse a distributed endpoint transpose for one operation and layout."""
-    @jax.jit(out_shardings=tile)
-    def move(x):
-        t = jnp.swapaxes(x, -1, -2)
-        return jnp.conj(t) if op == 'C' else t
-    return move
-
-
-def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
-              transa: str, transb: str):
-    from distrib_la._cusolvermp import context_key
-
+def _panel(mesh, A, B, C, *, alpha, beta, transa, transb):
+    """The face GEMM: :func:`distrib_la.panel_matmul`, ``alpha·op(A)·op(B) + beta·C``.
+    Transposed operands ride the square-mesh panel route (one ``ppermute`` per
+    operand); the panel budget is one output tile per rank."""
+    from distrib_la._panel_matmul import panel_matmul
     px, py = _mesh_shape(mesh)
-    if transa != "N" or transb != "N":
-        # cuBLASMp's multi-rank native transpose descriptors have produced
-        # wrong answers / deadlock. Move endpoint tiles on device, then use
-        # the certified N,N provider. This is a distributed transpose, not
-        # a local tile transpose and not a host/full-matrix gather.
-        tile = NamedSharding(mesh, P(None, 'x', 'y'))
-        if transa != 'N':
-            A = _transpose_kernel(transa, tile)(A)
-        if transb != 'N':
-            B = _transpose_kernel(transb, tile)(B)
-        transa, transb = 'N', 'N'
-    if A.dtype not in (jnp.dtype("float64"), jnp.dtype("complex128")):
-        raise ValueError(
-            f"cuBLASMp matmul supports float64/complex128; got {A.dtype}")
-    nq = int(A.shape[0])
-    ar, ac = int(A.shape[1]), int(A.shape[2])
-    br, bc = int(B.shape[1]), int(B.shape[2])
-    m, k = _op_shape((ar, ac), transa)
-    _, n = _op_shape((br, bc), transb)
-    ctx = context_key(mesh, col_major=False)
-    attrs = dict(
-        nq=nq, m=m, n=n, k=k,
-        mb_a=ar // px, nb_a=ac // py, mb_b=br // px, nb_b=bc // py,
-        mb_c=m // px, nb_c=n // py,
-        lld_a=ar // px, lld_b=br // px, lld_c=m // px,
-        transa=_OP_CODE[transa], transb=_OP_CODE[transb],
-        alpha_re=float(alpha.real), alpha_im=float(alpha.imag),
-        beta_re=float(beta.real), beta_im=float(beta.imag),
-        ctx_key=int(ctx),
-    )
-    key = (mesh_key(mesh), tuple(A.shape), tuple(B.shape), tuple(C.shape),
-           str(A.dtype), transa, transb, alpha, beta, int(ctx))
-    fn = _CUBLASMP_CACHE.get(key)
-    if fn is None:
-        out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), C.dtype)
-
-        @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
-                 out_specs=P(None, "x", "y"), check_vma=False)
-        def _local(a, b, c):
-            at = jnp.transpose(a, (0, 2, 1))
-            bt = jnp.transpose(b, (0, 2, 1))
-            ct = jnp.transpose(c, (0, 2, 1))
-            dt = jax.ffi.ffi_call(
-                _TARGETS["cublasmp"], out_t,
-                input_output_aliases={2: 0})(at, bt, ct, **attrs)
-            return jnp.transpose(dt, (0, 2, 1))
-
-        fn = jax.jit(_local, donate_argnums=(2,))
-        _CUBLASMP_CACHE[key] = fn
-    return fn(A, B, C)
-
-
-def _xla_gathered(mesh, A, B, C, *, alpha, beta, transa, transb):
-    """The CPU provider: XLA's dot on gathered faces, gemm_plan's CPU face plan.
-
-    Transposes move as on cuBLASMp (a distributed endpoint transpose), then
-    each rank gathers A over 'y' and B over 'x' and contracts its D tile."""
-    from distrib_la.matmul_plan import _axis_matmul, _face_gathered
-    tile = NamedSharding(mesh, P(None, 'x', 'y'))
-    if transa != 'N':
-        A = _transpose_kernel(transa, tile)(A)
-    if transb != 'N':
-        B = _transpose_kernel(transb, tile)(B)
-    key = (mesh_key(mesh), alpha, beta)
-    fn = _XLA_CACHE.get(key)
-    if fn is None:
-        body = _face_gathered(partial(_axis_matmul, alpha=complex(alpha), beta=complex(beta)))
-        fn = _XLA_CACHE[key] = jax.jit(shard_map(
-            body, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 3,
-            out_specs=P(None, 'x', 'y'), check_vma=False))
-    return fn(A, B, C)
-
-
-def _provider_matmul(provider, mesh, A, B, C, *, alpha, beta,
-                     transa, transb):
-    if provider == CPU_XLA:
-        return _xla_gathered(
-            mesh, A, B, C, alpha=alpha, beta=beta,
-            transa=transa, transb=transb)
-    if provider == "cublasmp":
-        return _cublasmp(
-            mesh, A, B, C, alpha=alpha, beta=beta,
-            transa=transa, transb=transb)
-    module = (__import__(f"distrib_la._{provider}", fromlist=["x"]))
-    return module.batched_distributed_matmul(
-        A, B, C, mesh=mesh, alpha=alpha, beta=beta,
-        transa=transa, transb=transb)
+    nq, m, n = (int(v) for v in C.shape)
+    tile = int(A.dtype.itemsize) * nq * (m // px) * (n // py)
+    d = panel_matmul(A, B, mesh=mesh, panel_bytes=tile, transa=transa, transb=transb)
+    if alpha != 1:
+        d = jnp.asarray(alpha, A.dtype) * d
+    return d if beta == 0 else d + jnp.asarray(beta, A.dtype) * C
 
 
 def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
@@ -488,10 +321,9 @@ def matmul(
         ``'N'`` (unchanged), ``'T'`` (transpose), or ``'C'`` (conjugate
         transpose).
     backend
-        A name in :data:`MATMUL_BACKEND_CHOICES`. ``'auto'`` and
-        ``'distributed'`` choose cuBLASMp on CUDA, XLA's dot on gathered
-        faces on CPU, and SLATE on ROCm. ``'cusolvermp'`` is an alias for its cuBLASMp
-        sibling. ``'off'`` is provider-free and requires the staged route.
+        A name in :data:`MATMUL_BACKEND_CHOICES`. Every name but ``'off'``
+        runs the face GEMM (:func:`distrib_la.panel_matmul`) on every platform.
+        ``'off'`` is provider-free and requires the staged route.
     batched_route
         ``'batch_reshard'`` (the default) pads a ragged leading batch with
         zero matrices, exchanges each face into whole per-device matrices in
@@ -513,14 +345,9 @@ def matmul(
 
     Notes
     -----
-    Provider routes require float64 or complex128, one JAX process per mesh
-    cell in y-minor order, exact face tiling, and an available handler.
-    cuBLASMp and SLATE additionally require a square mesh; multi-rank
-    cuBLASMp implements transpose/adjoint modes by a device face transpose
-    followed by its N,N provider call. Its native transpose descriptors are
-    never used: transpose-A returned wrong answers and transpose-B could
-    deadlock. These explicit endpoint moves carry collective communication
-    and one additional operand-sized distributed buffer per moved operand.
+    The face GEMM requires a square mesh, one JAX process per mesh cell in
+    y-minor order and exact face tiling; a transposed operand moves its tile
+    to the transposed grid position by one ``ppermute``.
 
     The staged route does not require a provider or square mesh when selected
     with ``backend='off'``, but every physical input face and the output face
@@ -569,7 +396,7 @@ def matmul(
         if int(x.shape[-2]) % px or int(x.shape[-1]) % py:
             raise ValueError(
                 f"matmul {name} face must tile {px}x{py}; got {x.shape[-2:]}")
-    if route == ROUTE_BATCH_RESHARD or provider == CPU_XLA:
+    if route == ROUTE_BATCH_RESHARD or provider == PANEL:
         # CPU/MPI may only create first-use collective communicators from
         # MPI's main thread, never from the XLA worker that runs shard_map.
         from distrib_la._collectives import warm_mesh_cliques
@@ -591,7 +418,6 @@ def matmul(
     else:
         if C is None:
             C = _zeros(out_shape, A.dtype, sharding)
-        out = _provider_matmul(
-            provider, mesh, A, B, C, alpha=alpha_arg, beta=beta_arg,
-            transa=transa, transb=transb)
+        out = _panel(mesh, A, B, C, alpha=alpha_arg, beta=beta_arg,
+                     transa=transa, transb=transb)
     return out[0] if single else out

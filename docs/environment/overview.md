@@ -137,7 +137,7 @@ The rule is all or nothing:
 
 **What XLA builds (jaxlib 0.9.1).** PJRT's `cuda_async` allocator draws from
 the device's **default** mempool (`create_new_pool=false`), the pool every FFI
-`cudaMallocAsync` (cuBLASMp W-solve, cuSOLVERMp LU) also uses. With $M$ the
+`cudaMallocAsync` (cuSOLVERMp LU) also uses. With $M$ the
 device total, it reserves $R = f M$ once and sets the pool's release threshold
 to $R$, so idle memory stays mapped. With `PREALLOCATE=false` the threshold is
 0: the pool unmaps every idle byte at each stream synchronize and the next

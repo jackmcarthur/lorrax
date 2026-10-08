@@ -120,10 +120,4 @@
        instantiated on our types, our function-local statics (`_ZZ...`) and
        their guard variables (`_ZGVZ...`). */
     *lorrax_ffi*;
-    /* the extern "C" CUDA kernel launchers in cublasmp/w_solve_kernels.cu.
-       Cross-TU WITHIN this library (batched_w_solve_ffi.cc calls them) and
-       reachable from nowhere else, so C linkage is an implementation detail
-       here, not an interface. */
-    lorrax_zero_upper_tri_*;
-    lorrax_identity_minus_T_*;
 };

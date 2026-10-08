@@ -142,7 +142,7 @@ SO="$BUILD/liblorrax_ffi.so"
 
 # --- post-link gates (scripts/verify_ffi_build.sh) --------------------------
 LD_LIBRARY_PATH="$STAGE/lib:$CUDA/lib64:$MATH/lib64:$COMM/nccl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-LORRAX_FFI_EXPECT_BACKENDS=cusolvermp,cublasmp,cufft,phdf5 \
+LORRAX_FFI_EXPECT_BACKENDS=cusolvermp,cufft,phdf5 \
 LORRAX_FFI_EXPECT_MPI="$LORRAX_PM_MPI_SONAME" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION=310 \
 LORRAX_PHDF5_STAGE="$PHDF5_ROOT" \

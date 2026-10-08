@@ -4,7 +4,7 @@ One public API for ``polar_factor``, ``eigh``, ``cholesky``, ``solve_lu`` and
 ``matmul`` on an ``('x','y')`` device mesh, over four backend families:
 **scalapack/PBLAS** (CPU preferred),
 **slate** (CPU fallback where it is not broken; ROCm always,
-declared-untested), **cusolvermp/cuBLASMp** (CUDA preferred) and **native**
+declared-untested), **cusolvermp** (CUDA preferred) and **native**
 (pure JAX, everywhere).  A caller says what it wants computed and on which mesh;
 which library runs is a resolved fact it can read but never has to
 branch on.
@@ -14,7 +14,7 @@ a consumer needs is a top-level name here, and importing
 ``distrib_la.<submodule>`` from outside is a layering violation the
 monorepo's ``tests/test_layering.py`` fails on.  That is what makes
 "only distrib_la sees the provider families" checkable rather than
-aspirational — ScaLAPACK/PBLAS, SLATE, and cuSOLVERMp/cuBLASMp appear in
+aspirational — ScaLAPACK, SLATE and cuSOLVERMp appear in
 exactly one dependency edge in this package (:mod:`distrib_la.loader`, which
 dlopens a ``.so`` by path) and in zero of its declared dependencies.
 
@@ -46,11 +46,12 @@ polar_factor(A, mesh, ...) -> (L, s)
 backend='auto', batched_route='batch_reshard')``
     Distributed rank-2 or batched rank-3 GEMM in the same face layout as a
     plan. The default performs x/y face-to-batch exchanges, local GEMM, then
-    y/x inverse exchanges; explicit ``auto`` dispatches to cuBLASMp, XLA's
-    dot on gathered faces (CPU) or SLATE. ``backend='off'`` makes the staged route provider-free.
+    y/x inverse exchanges; ``batched_route='auto'`` runs :func:`panel_matmul`
+    for every backend name but ``'off'``, which makes the staged route
+    provider-free.
 ``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0,
 layout='face', enable_active_range=False) -> GemmPlan``
-    Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE, for a caller
+    Resolve one N,N GEMM shape ONCE, for a caller
     that will call it many times from inside its own ``jax.jit``/
     ``lax.scan`` (G construction, per-tau Sigma projection).  ``GemmPlan(A,
     B, C=None, *, out=None)`` is trace-safe. With active ranges enabled,
@@ -59,8 +60,9 @@ layout='face', enable_active_range=False) -> GemmPlan``
     ``weights`` has shape ``(nq, k)``. When bounds are known before tracing,
     ``GemmPlan.prepare_active_range(lo, hi)`` returns a callable with the same
     operand, weighting and accumulation contract but no runtime bounds
-    operands. The face layout uses cuBLASMp descriptor views; the axis layout
-    uses local cuBLAS pointer views on CUDA and bounded JAX dot panels on CPU.
+    operands. The face layout runs :func:`panel_matmul`; the local panel
+    products, like the axis layout's, use cuBLAS pointer views on CUDA and
+    bounded JAX dot panels elsewhere.
     See ``docs/services/distrib_la/api.md`` § Active ranges.
 ``hermitian_part(a)``, ``hermitian_block(block, off, corner)``, ``join_columns(a, b)``, ``diagonal_like(values, like)``, ``on_face(fn, out, *operands, **static)``
     Block glue for stacked ``[b, R, R]`` operators and ``[b, n, R]`` panels

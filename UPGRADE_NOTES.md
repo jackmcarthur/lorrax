@@ -5,6 +5,29 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — the cuBLASMp GEMM is gone; every distributed GEMM is panel_matmul
+
+`distrib_la.matmul(batched_route='auto')` and `gemm_plan(layout='face')` run
+`distrib_la.panel_matmul`, the batched 2-D SUMMA in XLA, on every platform and for every
+backend name except `off`; `cublasmp`, `cusolvermp`, `scalapack` and `slate` are still
+accepted and run it too (the last two used to refuse). At P4 on A100-80 it is 1.4-1.5x
+faster than the cuBLASMp face on the ζ-projector and SC-rotation shapes, to 2e-15. The face
+plan needs no native context and no process-per-cell layout, so it also runs on a one-process
+CPU mesh; it compiles at its first call (`warmup` reaches only axis plans), and
+`GemmPlan.local_call` is gone (no caller). The GEMM workspace query returns 0 for a
+distributed GEMM. Deleted: `src/ffi/cpp/cublasmp/` (the batched GEMM, its active-range
+variants, the uncalled fused W-solve and its kernels) and their loader rows, with the
+loader rows of `lorrax_slate_trsm` and the SLATE/ScaLAPACK batched GEMMs; the B11 bundle
+keeps the handlers. `LORRAX_FFI_EXPECT_BACKENDS` no longer lists `cublasmp`. Results move at
+round-off: at P4, eqp within 0.002 µeV on the CrI3 6×6 charge one-shot, the CrI3 bispinor SC
+maps 0-2 and the Na SC deck (`linalg = distributed`). Na's Σ_c(ω) moves by up to 6 meV at the
+frequency points where |Σ_c| is 130-435 eV (relative 1.4e-5). No deck change.
+
+The distributed LU's result check (`distrib_la.plan('solve_lu').batched` inside a jitted
+program) could report a correct solve as failed and return NaN: the cuSOLVERMp handler writes
+its factors into A without declaring the alias, and XLA could read A for the check after the
+call. The check's sketch is now fenced before the call.
+
 ## 2026-10-08 — the contour accumulator and the spin rotation run in XLA
 
 The two small CUDA kernels with no measured gain are deleted: the contour accumulator

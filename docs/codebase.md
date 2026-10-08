@@ -393,7 +393,7 @@ The design, every native target and the build: [the FFI layer](architecture/ffi_
 | `contour.py` | The contour accumulator, $A[o,q,m,n] \mathrel{+}= p[o]\,c[q,m,n]$. |
 | `io.py` | Parallel-HDF5 (MPI-IO) transport, behind SlabIO. |
 | `common/` | Locating, loading and registering the shared libraries (`ffi_loader`); dtype helpers; a byte-exact broadcast through the JAX distributed store. |
-| `cpp/` | The C++ sources by target (`cufft`, `fftw`, `cublas`, `cblas`, `cublasmp`, `cusolvermp`, `scalapack`, `slate`, `phdf5`, `response`, `symmetry`, `active_subspace`), the build scripts, the build gates, and `stage/seal_bundle.py`, which seals a two-library bundle. |
+| `cpp/` | The C++ sources by target (`cufft`, `fftw`, `cublas`, `cblas`, `cusolvermp`, `scalapack`, `slate`, `phdf5`, `active_subspace`), the build scripts, the build gates, and `stage/seal_bundle.py`, which seals a two-library bundle. |
 | `phdf5/` | `ARCHITECTURE.md` of the parallel-HDF5 backend. |
 
 ## `services/`
