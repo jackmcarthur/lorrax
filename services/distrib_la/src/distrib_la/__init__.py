@@ -127,7 +127,6 @@ from distrib_la.plan import (
     ROUTE_SCAN,
     Plan,
     StackRoute,
-    _SIZING_FAILED as SIZING_FAILED,
     ensure_sharding,
     new_stack_routes,
     plan,
@@ -162,7 +161,7 @@ __all__ = [
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
     # plan
-    "Plan", "plan", "StackRoute", "SIZING_FAILED", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes",
+    "Plan", "plan", "StackRoute", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes",
     # native dense workspace queries (no allocation)
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local", "eigh_stack_bytes",
     # polar / SVD

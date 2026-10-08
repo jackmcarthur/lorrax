@@ -258,44 +258,27 @@ its own live set, `plan('eigh', mesh, n=n, backend='distributed',
 budget_bytes=room)`, and the service decides each stack (`Plan.stack_route`,
 a `StackRoute`):
 
-- **Route (c)** when the compiled program that runs the stack fits the room:
-  its slices' exchanges, local eighs, inverse exchanges and result check
-  (outputs and temporaries; the caller's operand is already in its live set)
-  plus cuSOLVER's reported workspace per whole matrix. An eager call's
+- **Route (c)** when the program that runs the stack, priced from the shapes
+  (`_stack_price`: `BATCH_EIGH_TILES` = 8 n² per whole matrix a rank holds,
+  plus the checked chain's temporaries), fits the room. An eager call's
   program, and a traced one inside `checked_program`'s first program, holds
   its first attempt, and the retries run as a second program only when that
-  check fails (`checked_program`'s retry runs on the whole mesh); any other traced caller, and a
-  solve inside a scan, cond or shard_map of that program, holds the whole
-  chain. Each is sized on what it reserves. The most whole matrices per
-  rank that fit win, and the stack runs in that many slices, one `lax.scan`
-  over slice starts writing the face outputs in place.
+  check fails (`checked_program`'s retry runs on the whole mesh); any other
+  traced caller, and a solve inside a scan, cond or shard_map of that program,
+  holds the whole chain. The most whole matrices per rank that fit win, and
+  the stack runs in that many slices, one `lax.scan` over slice starts writing
+  the face outputs in place.
 - **The whole-mesh provider** otherwise, including room 0.
-- **Only a compiled figure accepts.** A shape bound (one whole matrix and its
-  vectors, 2 n² per rank) may only reject, without a compile.
-- **Lockstep over ranks.** The candidates follow from the shape, the room and
-  agreed sizes only; for each, every rank compiles the same program and the
-  compiled size is agreed (the largest any rank measured, through the
-  runtime's KV store) before the comparison. Every rank runs the same route,
-  rounds and collectives.
-- **One compile per eager call.** An eager call runs the executable its
-  decision compiled. Inside a caller's trace the program is compiled again as
-  part of the caller's module, and the decision line reports the sizing
-  compile's wall (`sized in … s`).
-- **A failed sizing rejects.** A rank whose sizing compile fails posts a
-  failure sentinel (`distrib_la.SIZING_FAILED`, larger than any room) instead
-  of raising, so every rank reaches the exchange and every rank rejects that
-  candidate. A caller that sizes its own programs posts the same sentinel.
+- **Every rank decides alike.** The candidates and their prices follow from
+  the shape and the room only: nothing is compiled to be measured and no size
+  is exchanged between ranks.
 - **One plan per room.** A plan carries one room; a caller that keys
-  programs on the plan (the face constructors floor their rooms to whole
+  programs on the plan (the scalar face constructor floors its rooms to whole
   GiB) compiles again when its room changes.
 - **Reporting.** Each decision is printed once per (op, B, n, dtype, room,
   phase: first attempt or whole chain) by `new_stack_routes()`, which a driver prints through its
   reporter, and listed by `describe()`. `known_route` is the pure query for
   pricing: the decided route, or the provider when none was made.
-- **Sizes.** Per whole matrix at complex128 a rank needs 7 n² × 16 B for the
-  first attempt: 3 n² compiled (input, vectors, one copy) and 4 n² of
-  cuSOLVER syevd workspace (one A100, n = 3328–18304), so n = 9152 needs
-  9.4 GB and n = 18304 needs 37.6 GB. The traced chain about doubles it.
 - There are no sub-meshes or rank groups: whole mesh or whole matrices per
   rank. `_route=` on `batched` is the test-only override.
 - **A caller may decide the route itself, from the shapes.**

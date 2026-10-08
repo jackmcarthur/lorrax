@@ -2,8 +2,8 @@
 
 Row 1: the persistent-cache namespace names what JAX's key cannot see (jax,
 jaxlib, the FFI bundle, this file's key schema) and never the LORRAX source.
-Row 4: a traced route-(c) decision prices its candidates from the shapes and
-compiles nothing; an eager call compiles its first-attempt program once.
+Row 4: a route-(c) decision, eager or traced, prices its candidates from the
+shapes: nothing is compiled to be measured and no size is exchanged.
 """
 import importlib
 import re
@@ -42,33 +42,18 @@ def _plan(mesh):
                 requested_batched_route="auto", budget_bytes=1 << 30)
 
 
-def test_traced_stack_route_prices_without_a_compile(monkeypatch):
+def test_stack_route_is_priced_from_the_shapes():
+    """Eager and traced decisions take the same shape price: no sizing compile, no exchange."""
     plan_mod = importlib.import_module("distrib_la.plan")
-    monkeypatch.setattr(plan_mod, "_sized_or_failed",
-                        lambda *a, **k: pytest.fail("a traced decision compiled a sizing program"))
-    plan_mod._STACK_ROUTES.clear()
-    route = _plan(_mesh()).stack_route((4, 8, 8), np.complex128, traced=True)
-    assert route.route == plan_mod.ROUTE_BATCH_RESHARD
-    assert route.program_bytes == plan_mod._stack_price("eigh", _mesh(), 4, 8, "complex128", 1)
-    assert route.sizing_seconds == 0.0 and route.per_rank == 4 and route.rounds == 1
-    assert "priced from the shapes" in plan_mod._describe_stack(route)
-
-
-def test_eager_stack_route_compiles_once(monkeypatch):
-    plan_mod = importlib.import_module("distrib_la.plan")
-    calls = []
-
-    def sized(op, mesh, nb, n, dtype, rounds, phase):
-        calls.append((nb, rounds, phase))
-        return 1 << 20, 0.5
-    monkeypatch.setattr(plan_mod, "_sized_or_failed", sized)
     plan_mod._STACK_ROUTES.clear()
     p = _plan(_mesh())
-    first = p.stack_route((4, 8, 8), np.complex128, traced=False)
-    again = p.stack_route((4, 8, 8), np.complex128, traced=False)
-    assert first is again and calls == [(4, 1, "first")]
-    assert first.program_bytes == 1 << 20 and first.sizing_seconds == 0.5
-    assert "sized in 0.5 s" in plan_mod._describe_stack(first)
+    traced = p.stack_route((4, 8, 8), np.complex128, traced=True)
+    eager = p.stack_route((4, 8, 8), np.complex128, traced=False)
+    price = plan_mod._stack_price("eigh", _mesh(), 4, 8, "complex128", 1)
+    assert traced.route == eager.route == plan_mod.ROUTE_BATCH_RESHARD
+    assert traced.program_bytes == eager.program_bytes == price
+    assert price >= 4 * plan_mod.BATCH_EIGH_TILES * 8 * 8 * 16 and eager.per_rank == 4 and eager.rounds == 1
+    assert "priced from the shapes" in plan_mod._describe_stack(eager)
 
 
 def test_face_plans_differ_by_room_share_programs(monkeypatch):
@@ -86,6 +71,6 @@ def test_face_plans_differ_by_room_share_programs(monkeypatch):
 def test_program_keys_hold_no_site_or_budget():
     import inspect
     plan_mod = importlib.import_module("distrib_la.plan")
-    for fn in (plan_mod._program_key, plan_mod._stack_bytes, plan_mod._reshard_stack_program):
+    for fn in (plan_mod._stack_price, plan_mod._reshard_stack_program):
         names = inspect.signature(getattr(fn, "__wrapped__", fn)).parameters
         assert not {"site", "budget_bytes", "room"} & set(names), (fn.__name__, list(names))

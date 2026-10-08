@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — distrib_la's budgeted eigh-stack decision is priced from the shapes
+
+A plan built with `budget_bytes` used to compile each eager route-(c) candidate to measure it
+and to agree the size over ranks through the KV store. It now prices every candidate from the
+shapes (`BATCH_EIGH_TILES` = 8 n² per whole matrix a rank holds, the measured first attempt,
+plus the checked chain's temporaries), eager and traced alike: no sizing compile and no
+exchange. `distrib_la.SIZING_FAILED` and `StackRoute.sizing_seconds` are removed. The scalar
+face constructor, the remaining budgeted caller, admits route (c) at that price where the
+traced price was about 6 n². No result moves; a stack near its room's edge may run on the
+whole mesh instead of route (c). No deck change.
+
 ## 2026-10-08 — dead distrib_la surfaces removed: factor/solve, dispatch_batched_eigh, SLATE trsm, two GEMM wrappers
 
 `distrib_la.factor`, `distrib_la.solve` and `FactorToken` had no caller and are gone; so is
