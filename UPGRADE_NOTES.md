@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — XLA is the reference path; vendor routes must earn their place
+
+One owner ruling replaces two (`docs/architecture/decisions.md#xla-reference`): the
+2026-08-01 "FFI backends are required" ruling and the 2026-09-24 "mathdx is the only
+NVIDIA k-convolution route" ruling are deleted. XLA is the reference path for every
+operation on every platform. A vendor kernel or library stays only when it is ≥ 2×
+faster on a production stage or decisive on memory, behind one service, gated against
+XLA on the same device; cuSOLVERMp stays the capacity route. The entry lists what does
+not conform yet. Docs only: no result moves, no deck or environment change.
+
 ## 2026-10-07 — the decoupled sector rounds price CT's outputs and every array the sectors and rounds hold
 
 The round loop's rows on the decoupled route (`constructor.live`, the held checks and the writes)

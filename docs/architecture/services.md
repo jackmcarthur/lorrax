@@ -33,9 +33,9 @@ A capability is a service when it has all four of:
 | **`ffi.io`** | `open_file(path, *, mesh, mode)` → `write_sharded_slab` / `read_sharded_slab` / `read_kchunk_union_sharded` | CUDA or host library, from the mesh's devices | no | [FFI layer §5](ffi_layout.md); SlabIO is its only transport consumer |
 | **`ffi.fft`** (entered through `common.fft_helpers`) | the k-convolution router's factories (`make_fused_conv_kpair`, `make_kconv_klead`, `make_kfft_klead`, …) and `make_flat_k_fft` | nvidia-mathdx on CUDA; FFTW3-ABI plans on cpu | no: the mesh platform decides, and no variable or deck key selects a route | [k-convolution family](kconv.md#router) |
 | **`ffi.gemm`** | `gemm_batch(a3, b3)` inside the caller's own `shard_map` | the CBLAS provider, and whether it has a batched entry | no: `LORRAX_BANDS_GEMM_FFI` is on/off, cpu only | `src/ffi/gemm.py` |
-| **`distrib_la`** | `plan(op, mesh_xy, *, backend=…)` → `plan(A_tile)` / `plan.batched(A_stack)`, plus `matmul`, `gemm_plan` | ScaLAPACK, SLATE, cuSOLVERMp, cuBLASMp or native, per op, machine and mesh geometry | **yes**, by design, through deck keys ([below](#choice)) | [`distrib_la`](../services/distrib_la/api.md) |
+| **`distrib_la`** | `plan(op, mesh_xy, *, backend=…)` → `plan(A_tile)` / `plan.batched(A_stack)`, plus `matmul`, `gemm_plan` | ScaLAPACK, SLATE, cuSOLVERMp, cuBLASMp or native, per op, machine and mesh geometry | **yes**, by design, through the `linalg` deck key ([below](#choice)) | [`distrib_la`](../services/distrib_la/api.md) |
 | **`wfn_loader`** | `WfnLoader(path, *, mesh=None, backend='auto')` | `eager` (h5py) or `phdf5` (one collective read through `SlabIO.read_slabs`) | escape hatch only: `LORRAX_WFN_BACKEND` | [`wfn_loader`](../services/wfn_loader.md) |
-| **`ffi.common.ffi_loader`** over `lxkit.native_provider` | `get_lib(platform)`, `probe_target(target, platform)` | which library pair: a sealed bundle or a build tree | no: `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO` pin a path, and a pin that is not a file refuses | [FFI layer §2c–§2d](ffi_layout.md) |
+| **`ffi.common.ffi_loader`** over `lxkit.native_provider` | `get_lib(platform)`, `probe_target(target, platform)` | which library pair: a sealed bundle or a build tree | no: `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO` pin a path, and a pin that is not a file refuses | [how a run selects the pair](../installation/ffi-build.md#loader) |
 | **`common.collectives`** | `prepare_mesh()`, `gather_k_blocks()` | NCCL on CUDA; MPI on CPU | no: the CPU transport is a deployment fact | [transports](../environment/transports.md) |
 | **`runtime`** | `initialize_communicator_stack()` | allocator, plugin discovery, CPU or GPU backend, network transport | no | [below](#runtime) |
 | **`common.jax_compile_cache`** | called once by `runtime` | filesystem, world size, jaxlib generation | no | — |
@@ -98,16 +98,16 @@ equal or worse cost: a rank-0 gather is an out-of-memory at the design size,
 not a slow tier ([`decisions.md`](decisions.md), 2026-08-05). A deployment that
 cannot serve the tile path refuses at open.
 
-**`distrib_la` exposes the choice.** The deck keys `eigh_backend`,
-`distributed_cholesky` and `distributed_lu` choose the backend per operation;
-the package reads no environment. The environment grants capability (which
-`.so`); the deck makes the choice. The backends have different costs for
+**`distrib_la` exposes the choice.** The one deck key `linalg = local |
+distributed` chooses the layout of every dense stage, and the package reads
+no environment. The environment grants capability (which `.so`); the deck
+makes the choice. The backends have different costs for
 different shapes: the native q-batched path solves many small matrices at
 once, the distributed backends spread one large matrix over the mesh, and
 only the caller knows which it holds. An explicit request never demotes; only
 `auto` demotes, with a rank-0 announcement naming geometry or capability as
 the cause. The vocabularies and the resolution policy are on the
-[`distrib_la` backends](../services/distrib_la/backends.md) page.
+[`distrib_la` backends](../services/distrib_la/backends.md#the-deck-dial) page.
 
 **`wfn_loader` exposes an escape hatch.** `LORRAX_WFN_BACKEND` (`eager` or
 `phdf5`) is defensible only because a parity test holds the two backends
@@ -115,9 +115,10 @@ byte-identical: the choice cannot change an answer.
 
 **The FFT and GEMM paths expose no backend choice.** The k-convolution router
 picks its backend from the mesh platform alone. `LORRAX_FFT_FFI` and
-`LORRAX_BANDS_GEMM_FFI` are capability switches: the FFI layer is required
-([`decisions.md`](decisions.md), 2026-08-01), so `LORRAX_FFT_FFI=0` refuses,
-and `LORRAX_BANDS_GEMM_FFI=0` selects an announced debug fallback.
+`LORRAX_BANDS_GEMM_FFI` are capability switches on cpu: `LORRAX_FFT_FFI=0`
+refuses, and `LORRAX_BANDS_GEMM_FFI=0` selects an announced debug fallback.
+A vendor route is kept only where it beats the XLA path
+([XLA reference ruling](decisions.md#xla-reference)).
 
 **The rule.** Expose a choice only where the alternatives have different
 costs that the call site, not the deployment, can judge, and then either hold

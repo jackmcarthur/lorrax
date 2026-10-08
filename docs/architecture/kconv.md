@@ -92,11 +92,11 @@ The factory picks the backend from the mesh platform alone
 | any other | refusal, `GATE kconv-platform` |
 
 The backend follows from the platform, so no deck key or environment
-variable selects it; a second route would be an untested path. Two
-environment dials change only the engine inside a route: the A/B test
-`LORRAX_BSE_OUTER_KSUM` ([§11](#bse-outer)) and the cpu test hook
-([§14](#build-and-cache)). See
-[decisions](decisions.md#2026-09-24-nvidia-k-convolutions-run-on-nvidia-mathdx-behind-one-platform-router).
+variable selects it. Two environment dials change only the engine inside a
+route: the A/B test `LORRAX_BSE_OUTER_KSUM` ([§11](#bse-outer)) and the cpu
+test hook ([§14](#build-and-cache)). The mathdx family is kept on CUDA
+because it is decisive on memory ([§1](#why-fused);
+[XLA reference ruling](decisions.md#xla-reference)).
 Both backends return the same
 callable contract, so a consumer never branches on the backend. The cpu leg is
 the reference composition of each mode: the same unfolds and products in XLA,
