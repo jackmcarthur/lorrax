@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — diagnostic four-knot contour residue interpolation
+
+The opt-in scalar reference owner exposes degree7 Hermite residues through
+four nearest available real-line knots, with exact sampled d/d(z_Ry²)
+slopes and unchanged2z/occupied-sheet ordering. Existing degree3/default
+consumers are unchanged. Interval attribution exposes interpolation contrasts;
+it supplies no response-error bound or physical convergence admission.
+This diagnostic prototype is unmerged; source scalar and cached physical
+qualification are separate from production drivers and defaults.
+
 ## 2026-10-08 — the response streams' block accumulate no longer materializes its terms
 
 The XLA contour block accumulate (`gw.contour_accumulator.contour_block_accumulate_local`,
