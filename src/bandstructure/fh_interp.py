@@ -181,7 +181,7 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
 
     # The whole-state ledger prices every allocation the fit makes, its
     # resident selected rows included, so it plans against the run budget
-    # (the headroom rule, capped by ``memory_per_device_gb``), not a fixed
+    # (the memory rule, capped by ``memory_per_device_gb``), not a fixed
     # tile (``runtime.tiles`` names this exception): the same on every rank.
     # Beside the fit the driver holds only WFN metadata and the symmetry
     # service, no priced device array.

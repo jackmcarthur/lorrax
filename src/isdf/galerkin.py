@@ -737,7 +737,7 @@ def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
     (gather, ``ifftn(norm='ortho')``, Bloch phase, output) including its
     cuFFT workspace, so every FFT batch below is priced by measurement.  The
     target is ``device_pool_limit`` itself; the run budget's headroom
-    (``runtime.device_headroom_bytes``) is the only margin.
+    (``runtime.planner_budget_bytes``) is the only margin.
     """
     n_rtot = int(meta.n_rtot)
     memory = gflat_to_rchunk_aot_memory(

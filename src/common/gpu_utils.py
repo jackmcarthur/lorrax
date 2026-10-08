@@ -1,6 +1,6 @@
 """The run's device budget, and the planners' prices against it.
 
-The budget is the one headroom rule (``runtime.planner_budget_bytes``) on
+The budget is the one memory rule (``runtime.planner_budget_bytes``) on
 the card total, so it is the same on every rank and every run; a positive
 deck ``memory_per_device_gb`` caps it.  No planner reads free memory, the
 pool limit or a fragmentation factor (docs/architecture/memory-model.md,
@@ -42,24 +42,26 @@ def set_device_budget_gb(gb: float) -> None:
     _RUN_DEVICE_BUDGET_GB = value
 
 
-def resolve_device_budget_gb(deck_gb: float = 0.0) -> float:
+def resolve_device_budget_gb(deck_gb: float = 0.0, linalg: str = "local") -> float:
     """THE run budget in decimal GB per device, recorded once.
 
-    The headroom rule's budget on this device (:func:`get_device_memory_gb`),
-    the minimum over processes, so static tile shapes agree on every process;
-    a positive deck ``memory_per_device_gb`` caps it.  A deck value above the
-    rule warns and the rule's budget is used.  Every process must enter.
+    The memory rule's budget on this device for the deck's resolved
+    ``linalg`` (:func:`get_device_memory_gb`), the minimum over processes, so
+    static tile shapes agree on every process; a positive deck
+    ``memory_per_device_gb`` caps it.  A deck value above the rule warns once,
+    with both numbers, and the rule's budget is used.  Every process must enter.
     """
-    rule = minimum_process_budget_gb(get_device_memory_gb())
+    rule = minimum_process_budget_gb(get_device_memory_gb(linalg))
     deck = float(deck_gb or 0.0)
     if deck > rule:
         import warnings
         from runtime import _resolve_proc_id
         if _resolve_proc_id() == 0:
             warnings.warn(
-                f"memory_per_device_gb = {deck:g} is above the headroom rule's "
-                f"{rule:.2f} GB per device; the budget is {rule:.2f} GB "
-                "(docs/architecture/memory-model.md#budget)", RuntimeWarning, stacklevel=2)
+                f"memory_per_device_gb = {deck:g} is above the memory rule's "
+                f"{rule:.2f} GB per device at linalg = {linalg}; the budget is "
+                f"{rule:.2f} GB (docs/architecture/memory-model.md#budget)",
+                RuntimeWarning, stacklevel=2)
     budget = min(deck, rule) if deck > 0 else rule
     set_device_budget_gb(budget)
     return budget
@@ -207,10 +209,10 @@ def host_bytes_per_process(fraction: float = 0.9) -> float:
     return minimum_process_budget_gb(min(local_gb, 1e12)) * 1e9
 
 
-def get_device_memory_gb() -> float:
-    """This device's budget under the headroom rule, decimal GB.
+def get_device_memory_gb(linalg: str = "local") -> float:
+    """This device's budget under the memory rule, decimal GB.
 
-    ``runtime.planner_budget_bytes(T)``.  GPU: ``T`` is the card total
+    ``runtime.planner_budget_bytes(T, linalg)``.  GPU: ``T`` is the card total
     (``cuDeviceTotalMem``).  CPU: ``T`` is the node's
     ``MemTotal`` over the processes on the node, and the budget is shared by
     the process's devices; collective, so every process must enter.
@@ -221,7 +223,7 @@ def get_device_memory_gb() -> float:
     from runtime import planner_budget_bytes
     if jax.default_backend() == 'cpu':
         total = (_meminfo_gb('MemTotal') or 0.0) * 1e9 / _processes_on_this_node()
-        return planner_budget_bytes(total) / max(1, jax.local_device_count()) / 1e9
+        return planner_budget_bytes(total, linalg) / max(1, jax.local_device_count()) / 1e9
     from lxkit import device_vendor
     from runtime.xla_memory import cuda_device_total_bytes
     device = jax.local_devices()[0]
@@ -234,7 +236,7 @@ def get_device_memory_gb() -> float:
         announce_once("gpu-budget-pool-limit",
                       f"device total unreadable (not a CUDA device); the XLA pool "
                       f"limit {total / 1e9:.2f} GB stands in for the card")
-    return planner_budget_bytes(total) / 1e9
+    return planner_budget_bytes(total, linalg) / 1e9
 
 
 __all__ = ["device_budget_bytes", "get_device_memory_gb", "get_host_memory_available_gb",

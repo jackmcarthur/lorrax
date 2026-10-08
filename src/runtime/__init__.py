@@ -705,7 +705,7 @@ def set_default_env(*, platform: str = "gpu") -> None:
     ----------------------------------------------------------
     On CUDA every run gets ONE allocator configuration: ``cuda_async``
     (cudaMallocAsync), its pool RESERVED up front at :func:`pool_fraction`
-    of the card (the headroom rule, :func:`device_headroom_bytes`).  A
+    of the card (the memory rule, :func:`pool_reservation_bytes`).  A
     caller's explicit export still wins (``setdefault``), and the startup
     report names any pair that is not this one.
 
@@ -754,45 +754,59 @@ def set_default_env(*, platform: str = "gpu") -> None:
     configure_gpu_network(platform=xla_platform, say=rank0_print)
 
 
-#: The one device-memory headroom rule (owner 2026-10-08), the same for every
-#: vendor and card size.  From the card total ``M`` alone:
+#: The one device-memory rule (owner 2026-10-08), the same for every vendor and
+#: card size, fitted with a 1.2 margin to the largest P4 and P64 sampler
+#: readings (sandbox claim 3978).  With ``M`` the card total and ``O`` the bytes
+#: outside the XLA pool:
 #:
-#:     H = max(HEADROOM_MIN_BYTES, HEADROOM_FRACTION * M), at most M / 2
-#:     pool reservation  R = M - H                (pool_fraction)
-#:     planner budget    B = R - max(1 GB, 0.02 * M)   (planner_budget_bytes)
+#:     planner budget    B = (M - 1.2 O) / (1 + 1.2 phi)     (planner_budget_bytes)
+#:     pool reservation  R = M - 1.2 O_max                  (pool_fraction)
 #:
-#: ``H`` stays outside the pool for the CUDA context, NCCL and library
-#: communicators, cuFFT plans and library workspaces: the reserved pool fills
-#: its limit at start-up, so an allocation made outside it later gets exactly
-#: ``M - R`` (the start-up line measures what is already there,
-#: ``runtime.xla_memory.outside_pool_bytes``).  The budget sits a small margin
-#: below the reservation for XLA temporaries no planner prices.  Both read
-#: only ``M``, so they are the same on every rank and every run.
-HEADROOM_MIN_BYTES = 8e9
-HEADROOM_FRACTION = 0.10
-XLA_MARGIN_MIN_BYTES = 1e9
-XLA_MARGIN_FRACTION = 0.02
+#: ``O`` is 3 GB (the CUDA context and modules, XLA's NCCL communicators, cuFFT
+#: plans), plus :data:`DISTRIBUTED_LINALG_OUTSIDE_BYTES` under ``linalg =
+#: distributed``.  ``phi`` = 0.19 is how far the pool grows past the budget it
+#: was planned to: allocator slack (reserved but unused bytes) and peaks the
+#: planners under-price.  The pool is reserved before the deck is read, so
+#: ``R`` leaves room for the larger ``O``; the reservation is not a cap.  Both
+#: read only ``M`` and the deck's resolved ``linalg``: the same on every rank
+#: and every run.
+OUTSIDE_POOL_BYTES = 3e9
+#: The cuSOLVERMp/cuBLASMp contexts, their NCCL communicators and workspace
+#: under ``linalg = distributed`` (5.9 GB outside at P4 against 2.9).  Owner:
+#: ``distrib_la``; the constant lives here because the pool is reserved before
+#: any service is imported.
+DISTRIBUTED_LINALG_OUTSIDE_BYTES = 3e9
+POOL_OVERSHOOT = 0.19
+MEMORY_MARGIN = 1.2
 
 
-def device_headroom_bytes(total_bytes: float) -> float:
-    """``H = max(HEADROOM_MIN_BYTES, HEADROOM_FRACTION * M)``, at most ``M / 2``."""
+def outside_pool_allowance_bytes(linalg: str = "local") -> float:
+    """``O`` for the deck's resolved ``linalg`` (``local`` or ``distributed``)."""
+    return OUTSIDE_POOL_BYTES + (DISTRIBUTED_LINALG_OUTSIDE_BYTES
+                                 if linalg == "distributed" else 0.0)
+
+
+def planner_budget_bytes(total_bytes: float, linalg: str = "local") -> float:
+    """``B = (M - 1.2 O) / (1 + 1.2 phi)``, at most the reservation and at least ``M / 4``."""
     total = float(total_bytes)
-    return min(max(HEADROOM_MIN_BYTES, HEADROOM_FRACTION * total), 0.5 * total)
+    budget = ((total - MEMORY_MARGIN * outside_pool_allowance_bytes(linalg))
+              / (1.0 + MEMORY_MARGIN * POOL_OVERSHOOT))
+    return max(min(budget, pool_reservation_bytes(total)), 0.25 * total)
 
 
-def planner_budget_bytes(total_bytes: float) -> float:
-    """``B = M - H - max(XLA_MARGIN_MIN_BYTES, XLA_MARGIN_FRACTION * M)``, at least ``M / 4``."""
+def pool_reservation_bytes(total_bytes: float) -> float:
+    """``R = M - 1.2 O`` at the larger ``O`` (distributed linalg), at least ``M / 2``."""
     total = float(total_bytes)
-    margin = max(XLA_MARGIN_MIN_BYTES, XLA_MARGIN_FRACTION * total)
-    return max(total - device_headroom_bytes(total) - margin, 0.25 * total)
+    return max(total - MEMORY_MARGIN * outside_pool_allowance_bytes("distributed"),
+               0.5 * total)
 
 
 def pool_fraction(total_bytes: float | None) -> str:
-    """``XLA_CLIENT_MEM_FRACTION`` for a card of ``total_bytes``: ``R / M = 1 - H / M``
-    (``1 - HEADROOM_FRACTION`` when the total is unknown)."""
+    """``XLA_CLIENT_MEM_FRACTION`` for a card of ``total_bytes``: ``R / M``
+    (0.85 when the total is unknown)."""
     if not total_bytes:
-        return f"{1.0 - HEADROOM_FRACTION:.4f}"
-    return f"{1.0 - device_headroom_bytes(total_bytes) / float(total_bytes):.4f}"
+        return "0.8500"
+    return f"{pool_reservation_bytes(total_bytes) / float(total_bytes):.4f}"
 
 
 _PREALLOCATE_ENV = "XLA_PYTHON_CLIENT_PREALLOCATE"
@@ -828,7 +842,7 @@ def set_default_gpu_pool() -> None:
     never checks it.  It sets the reservation, the pool's release threshold,
     so memory up to it stays mapped.  The reservation fills at start-up, so
     an allocation outside the pool afterwards (NCCL communicators, the
-    cuSOLVERMp/cuBLASMp contexts) gets ``M - R = H``.  The policy needs one
+    cuSOLVERMp/cuBLASMp contexts) gets ``M - R``.  The policy needs one
     process per GPU.  The planners budget from the card total
     (:func:`planner_budget_bytes`), not from the client's ``bytes_limit``.
     """
@@ -2777,7 +2791,7 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
 
 
 def _device_memory_facts(device, total) -> dict:
-    """The headroom rule on this card and the bytes outside the pool after the
+    """The memory rule on this card and the bytes outside the pool after the
     communicator warm-up, the maximum over processes (every process enters).
     A diagnostic only: nothing is sized from it."""
     import numpy as np
@@ -2786,15 +2800,15 @@ def _device_memory_facts(device, total) -> dict:
     outside = outside_pool_bytes(getattr(device, "local_hardware_id", 0) or 0)
     worst = int(np.max(np.asarray(all_gather_processes(
         np.asarray(-1 if outside is None else outside, dtype=np.int64)))))
-    head = device_headroom_bytes(total) if total else None
-    return {"total": total, "headroom": head,
-            "budget": None if head is None else planner_budget_bytes(total),
-            "reservation": None if head is None else total - head,
+    reservation = pool_reservation_bytes(total) if total else None
+    return {"total": total, "headroom": None if not total else total - reservation,
+            "budget": None if not total else planner_budget_bytes(total),
+            "reservation": reservation,
             "outside_max": None if worst < 0 else worst}
 
 
 def device_memory_summary(d: dict | None) -> tuple[str | None, str | None]:
-    """``(line, warning)`` for the headroom rule's start-up facts: the card,
+    """``(line, warning)`` for the memory rule's start-up facts: the card,
     pool, headroom and budget, and the bytes outside the pool after warm-up;
     the warning when those exceed 0.75 of the headroom kept outside it."""
     if not d or not d.get("total"):
@@ -2802,11 +2816,11 @@ def device_memory_summary(d: dict | None) -> tuple[str | None, str | None]:
     out = d.get("outside_max")
     seen = "unread" if out is None else f"{out / 1e9:.2f} GB (max over ranks)"
     line = (f"card {d['total'] / 1e9:.2f} GB | pool {d['reservation'] / 1e9:.2f} GB "
-            f"(headroom {d['headroom'] / 1e9:.2f} GB outside it) | budget "
-            f"{d['budget'] / 1e9:.2f} GB | outside the pool after warm-up {seen}")
+            f"({d['headroom'] / 1e9:.2f} GB outside it) | budget "
+            f"{d['budget'] / 1e9:.2f} GB at linalg local | outside the pool after warm-up {seen}")
     warn = (f"{out / 1e9:.2f} GB is already outside the pool after warm-up, above "
-            f"0.75 of the {d['headroom'] / 1e9:.2f} GB headroom "
-            "(runtime.device_headroom_bytes)"
+            f"0.75 of the {d['headroom'] / 1e9:.2f} GB outside the reservation "
+            "(runtime.pool_reservation_bytes)"
             if out is not None and out > 0.75 * d["headroom"] else None)
     return line, warn
 
