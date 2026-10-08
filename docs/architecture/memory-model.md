@@ -29,37 +29,41 @@ All arrays are complex128 (16 B) unless stated.
 
 ## Budget
 
-One headroom rule sets the budget on every vendor and card size. With `M`
-the card total (`cuDeviceTotalMem`),
+One memory rule sets the budget on every vendor and card size. With `M` the
+card total (`cuDeviceTotalMem`) and `O` the bytes outside the XLA pool,
 
 ```text
-H = max(8 GB, 0.10·M), at most M/2       runtime.device_headroom_bytes
-R = M − H                                the XLA pool's reservation (runtime.pool_fraction)
-B = R − max(1 GB, 0.02·M)                the planner budget (runtime.planner_budget_bytes)
+B = (M − 1.2·O) / (1 + 1.2·φ)     the planner budget (runtime.planner_budget_bytes)
+R = M − 1.2·O_max                 the XLA pool's reservation (runtime.pool_fraction)
 ```
 
-| card | M | H | R | B |
-|---|---|---|---|---|
-| A100-40GB | 42.4 GB | 8.0 GB | 34.4 GB (0.811) | 33.4 GB |
-| A100-80GB | 85.1 GB | 8.5 GB | 76.6 GB (0.900) | 74.9 GB |
+`O` is 3 GB (the CUDA context and modules, XLA's NCCL communicators, cuFFT
+plans), plus 3 GB under `linalg = distributed` for the cuSOLVERMp/cuBLASMp
+contexts, their communicators and workspace (`O_max` = 6 GB). `φ` = 0.19 is
+how far the pool grows past the budget it was planned to: allocator slack
+(reserved but unused bytes) and peaks the planners under-price. Both are the
+largest measured at P4 and P64 (sandbox claim 3978); 1.2 is the margin.
 
-`H` stays outside the pool for the CUDA context, the NCCL and library
-communicators, the cuSOLVERMp/cuBLASMp contexts, cuFFT plans and library
-workspaces. The reserved pool fills its limit at start-up, so an allocation
-made outside it later gets exactly `M − R`. The budget sits a small margin
-below the reservation, for XLA temporaries no planner prices. The rule reads
-only `M`, so it is the same on every rank and every run. A positive
-`memory_per_device_gb` caps `B`; a deck value above `B` warns and `B` is
-used. The run budget is the minimum over processes
+| card | M | R | B, linalg local | B, linalg distributed |
+|---|---|---|---|---|
+| A100-40GB | 42.4 GB | 35.2 GB (0.830) | 31.6 GB | 28.7 GB |
+| A100-80GB | 85.1 GB | 77.9 GB (0.915) | 66.4 GB | 63.4 GB |
+
+The pool is reserved before the deck is read, so `R` leaves room for
+`O_max`; the reservation is not a cap, and the pool may grow past it. The
+rule reads only `M` and the deck's resolved `linalg`, so it is the same on
+every rank and every run. A positive `memory_per_device_gb` caps `B`; a deck
+value above `B` warns once, with both numbers, and `B` is used. The run
+budget is the minimum over processes
 (`common.gpu_utils.resolve_device_budget_gb`), because static tile shapes
 must agree on every process. On CPU the same rule takes `M` as the node's
 `MemTotal` over the processes on the node, and a process's devices share
 its budget.
 
-At start-up every GPU run prints the rule and the bytes already outside the
-pool after the communicator warm-up, the maximum over ranks
+Every driver's architecture section prints the rule and the bytes already
+outside the pool after the communicator warm-up, the maximum over ranks
 (`runtime.xla_memory.outside_pool_bytes`), with a warning when they exceed
-`0.75·H`. Nothing is sized from that reading.
+0.75 of `M − R`. Nothing is sized from that reading.
 
 Every planner reads the one number `common.gpu_utils.device_budget_bytes()`,
 which the config sets when the deck resolves. kmeans, htransform, bse and
@@ -367,7 +371,7 @@ temporaries is compiled once at map 0 and never runs (Fe 8³: 2.3 s cold,
 The direct stream's group is the one shared-pole size that follows the
 budget: it fits the capacity ledger, then the compiled check above. The ledger
 does not own the ψ carriers and other residents live when W is built; the
-margin between the budget and the pool ([§ Budget](#budget)) is all they have.
+rule's `φ` ([§ Budget](#budget)) is all they have.
 On a device the stream and the line selection are two phases, so a group
 costs its carry plus the larger phase.
 
@@ -422,9 +426,8 @@ peak 34.55; main ran 16 and peaked 36.04, over the budget).
 The direct stream's peak was 0.51 MB above its price (the dispatch's small
 arguments). Outside the pool, the CUDA context, NCCL communicators, library
 handles and the mathdx modules held 2.65 GB per rank, and 4.7 GB with a
-cuSOLVERMp context. Neither has a reserve of its own: the first is in the
-margin below the pool, the second in the headroom `H` outside it
-([§ Budget](#budget)), which the start-up line checks.
+cuSOLVERMp context. Neither has a reserve of its own: both are in `φ` and `O`
+of the rule ([§ Budget](#budget)).
 
 When a minimum or recompiled chunk is still over its room, `check_chunk` prints one
 warning line and the stage runs at that chunk; if the room is really
@@ -450,7 +453,7 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
 
 ## Planning a run
 
-1. **Budget.** Leave `memory_per_device_gb = 0` for the headroom rule, or
+1. **Budget.** Leave `memory_per_device_gb = 0` for the memory rule, or
    set it lower to cap the budget (a value above the rule warns).
 2. **Mesh.** Use a square mesh. Every chunked term and the default
    face-layout centroid copies fall as `1/P`.

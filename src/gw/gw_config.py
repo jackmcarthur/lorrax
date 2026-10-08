@@ -2367,14 +2367,15 @@ def _parse_input_keys(section):
 
 def _resolve_input_memory(
         params, print_fn, resolve_hardware):
-    """Produce the runtime memory budget: the headroom rule on the card,
-    capped by a positive ``memory_per_device_gb`` (collective, the minimum
-    over processes; ``common.gpu_utils.resolve_device_budget_gb``)."""
+    """Produce the runtime memory budget: the memory rule on the card at the
+    deck's resolved ``linalg``, capped by a positive ``memory_per_device_gb``
+    (collective, the minimum over processes;
+    ``common.gpu_utils.resolve_device_budget_gb``)."""
     deck_gb = float(params.get("memory_per_device_gb", 0.0))
     if not resolve_hardware:
         return deck_gb
     from common.gpu_utils import resolve_device_budget_gb
-    budget_gb = resolve_device_budget_gb(deck_gb)
+    budget_gb = resolve_device_budget_gb(deck_gb, linalg_resolution(params).layout)
     if deck_gb <= 0:
         print_fn(f"  Auto-detected memory budget: {budget_gb:.2f} GB/device")
     return budget_gb

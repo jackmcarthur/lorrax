@@ -69,9 +69,9 @@ default, the block is what ran. Rank 0 of a P=4 Perlmutter run:
   The run's device mesh is 2x2 over axes ('x', 'y'), and its communicator cliques were warmed before the first physics jit.
   Cross-process collectives run on NCCL because this is a GPU platform, so JAX_CPU_COLLECTIVES_IMPLEMENTATION does not apply.
   The XLA memory pool, read from jax.local_devices()[0].memory_stats() and not from os.environ, reports a limit of 37.74 GB with 0.00 GB in use and a peak of 0.00 GB so far.
-  XLA_PYTHON_CLIENT_PREALLOCATE resolved to true (raw 'true') and XLA_PYTHON_CLIENT_ALLOCATOR resolved to 'cuda_async' (raw 'cuda_async') — LORRAX's GPU pool policy: cudaMallocAsync with its pool reserved at 0.8113 (runtime.set_default_gpu_pool).
-  The live client holds the reserved pool: bytes_limit 34.40 GB = 0.8113 x 42.40 GB.
-  Device memory  | card 42.40 GB | pool 34.40 GB (headroom 8.00 GB outside it) | budget 33.40 GB | outside the pool after warm-up 1.37 GB (max over ranks)
+  XLA_PYTHON_CLIENT_PREALLOCATE resolved to true (raw 'true') and XLA_PYTHON_CLIENT_ALLOCATOR resolved to 'cuda_async' (raw 'cuda_async') — LORRAX's GPU pool policy: cudaMallocAsync with its pool reserved at 0.8302 (runtime.set_default_gpu_pool).
+  The live client holds the reserved pool: bytes_limit 35.20 GB = 0.8302 x 42.40 GB.
+  Device memory  | card 42.40 GB | pool 35.20 GB (7.20 GB outside it) | budget 31.60 GB at linalg local | outside the pool after warm-up 1.37 GB (max over ranks)
   FFI build provenance: …/releases/c52b2c42-bundle-8e3c3650ea2a/lib/liblorrax_ffi.so | sealed bundle 8e3c3650ea2ab71a | rev c52b2c42565d | sha cb25804baded2322
   The distributed backends available for eigh on this mesh are cusolvermp, distributed, native; which one runs is the input-file key, not an environment variable.
   The JAX persistent compile cache is OFF, so every rank compiles every module in this run; set ISDF_JAX_CACHE_DIR …
@@ -119,11 +119,11 @@ any client exists) sets
 $$
 \texttt{ALLOCATOR}=\texttt{cuda\_async},\qquad
 \texttt{PREALLOCATE}=\texttt{true},\qquad
-f=\texttt{XLA\_CLIENT\_MEM\_FRACTION}=1-\frac{H}{M}\ (\texttt{runtime.pool\_fraction}),
+f=\texttt{XLA\_CLIENT\_MEM\_FRACTION}=1-\frac{1.2\,O_\text{max}}{M}\ (\texttt{runtime.pool\_fraction}),
 $$
 
-with $M$ the card total and $H=\max(8\,\text{GB},\,0.10M)$ the headroom
-(`runtime.device_headroom_bytes`): 0.811 on A100-40GB, 0.900 on A100-80GB. CPU runs, GPU-less nodes and ROCm are left
+with $M$ the card total and $O_\text{max}$ = 6 GB the bytes outside the pool
+under distributed linalg: 0.830 on A100-40GB, 0.915 on A100-80GB. CPU runs, GPU-less nodes and ROCm are left
 to jaxlib's defaults. No module, launcher or run script sets these variables.
 The rule is all or nothing:
 
@@ -146,7 +146,7 @@ to $R$, so idle memory stays mapped. With `PREALLOCATE=false` the threshold is
 launch maps it again, a 25–110 ms device-idle stall per executable. The
 fraction is not a cap (`AllocateRaw` never checks it); it sizes $R$ and the
 reported `bytes_limit` $=R$. The planners budget
-$B = R - \max(1\,\text{GB}, 0.02M)$ from the card total, not from the
+$B = (M - 1.2\,O)/(1 + 1.2\,\varphi)$ from the card total, not from the
 client (`runtime.planner_budget_bytes`;
 [memory model](../architecture/memory-model.md#budget)).
 
@@ -162,7 +162,7 @@ $R$. Measured per rank at P=4 on A100-40GB:
 | + cuSOLVERMp potrf $n=8192$ (context workspace) | 4.71 GB |
 | + jaxlib local eigh $n=10^4$ (workspace is XLA's) | 4.72 GB |
 
-On 40 GB, $M - R = H = 8.0$ GB holds the 4.72 GB. Beyond it these
+On 40 GB, $M - R = 7.2$ GB holds the 4.72 GB. Beyond it these
 bytes fit only where the driver releases **idle** reserved memory, on
 demand, to an unrelated allocation in the same process: raw `cudaMalloc`,
 `cuMemCreate`, NCCL communicator init, module loads and launch-time
