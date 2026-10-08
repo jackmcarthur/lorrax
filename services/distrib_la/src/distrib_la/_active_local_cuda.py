@@ -1,9 +1,13 @@
 """Exact active-range local GEMM through classic cuBLAS.
 
-This module is imported only for the CUDA axis-layout plan.  Each invocation
-operates on one process-local tile and issues no communication.  Runtime
-bounds remain device operands; the FFI reads only their small metadata array
-to the host and views the original row-major buffers without packing slices.
+Its callers import it only for a mesh whose device vendor is NVIDIA
+(``distrib_la.mesh_platform(mesh) == "CUDA"``), so it never loads a CUDA
+library elsewhere.  Each invocation operates on one process-local tile and
+issues no communication.  Runtime bounds remain device operands; the FFI reads
+only their small metadata array to the host and views the original row-major
+buffers without packing slices.  It stays the CUDA arm because it is 3.7-5.0x
+faster than the JAX panels (``_active_local``) on windowed bounds at P4, and
+equal on a full window (sandbox claim 3987).
 """
 from __future__ import annotations
 
@@ -24,8 +28,6 @@ _WORKSPACE_BYTES = 4 * 1024 * 1024
 
 def require_active_local_cuda() -> None:
     """Load and capability-probe the CUDA handler before tracing a plan."""
-    if jax.default_backend() != "gpu":
-        raise ValueError("local active cuBLAS GEMM requires a CUDA backend")
     for target in (_TARGET, _OUT_TARGET):
         usable, reason = probe_target(target, "CUDA")
         if not usable:
@@ -35,8 +37,6 @@ def require_active_local_cuda() -> None:
 
 def require_prepared_active_local_cuda() -> None:
     """Load and capability-probe the prepared CUDA handler before tracing."""
-    if jax.default_backend() != "gpu":
-        raise ValueError("local prepared active cuBLAS GEMM requires a CUDA backend")
     usable, reason = probe_target(_PREPARED_TARGET, "CUDA")
     if not usable:
         raise RuntimeError(
