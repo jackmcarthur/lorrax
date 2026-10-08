@@ -2367,9 +2367,9 @@ def _parse_input_keys(section):
 
 def _resolve_input_memory(
         params, print_fn, resolve_hardware):
-    """Produce the runtime memory budget: the memory rule on the card at the
-    deck's resolved ``linalg``, capped by a positive ``memory_per_device_gb``
-    (collective, the minimum over processes;
+    """Produce the runtime memory budget: a positive ``memory_per_device_gb``
+    as given (warned above the rule), else the memory rule on the card at the
+    deck's resolved ``linalg`` (collective, the minimum over processes;
     ``common.gpu_utils.resolve_device_budget_gb``)."""
     deck_gb = float(params.get("memory_per_device_gb", 0.0))
     if not resolve_hardware:

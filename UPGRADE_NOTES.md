@@ -11,8 +11,8 @@ With `M` the card total and `O` the bytes outside the XLA pool (3 GB, plus 3 GB 
 `linalg = distributed`), the planner budget is `B = (M − 1.2·O)/(1 + 1.2·φ)` with `φ = 0.19`
 and the pool reserves `M − 1.2·O_max` (`runtime.planner_budget_bytes`, `runtime.pool_fraction`).
 A100-40GB: pool fraction 0.89 → 0.830, budget 33.97 → 31.60 GB (28.66 distributed). A100-80GB:
-fraction 0.89 → 0.915, budget 68.16 → 66.36 GB (63.43 distributed). A positive `memory_per_device_gb` caps the budget; a value above the rule warns and the
-rule's budget is used. On CPU the rule takes the node's `MemTotal` over its processes, shared by a
+fraction 0.89 → 0.915, budget 68.16 → 66.36 GB (63.43 distributed). A positive `memory_per_device_gb` is used as given; above the rule it warns at start-up
+with both numbers. On CPU the rule takes the node's `MemTotal` over its processes, shared by a
 process's devices (it was host RAM over the global device count). Every GPU run prints the bytes outside the pool after warm-up (max over
 ranks) and warns above 0.75 of `M − R`. Deleted: `runtime.GPU_POOL_FRACTION`, the 0.90 × `bytes_limit`
 budget, the nvidia-smi fallback, the 4 GB defaults, the BFC fragmentation table (planners now fill

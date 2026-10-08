@@ -2,7 +2,7 @@
 
 The budget is the one memory rule (``runtime.planner_budget_bytes``) on
 the card total, so it is the same on every rank and every run; a positive
-deck ``memory_per_device_gb`` caps it.  No planner reads free memory, the
+deck ``memory_per_device_gb`` is used as given.  No planner reads free memory, the
 pool limit or a fragmentation factor (docs/architecture/memory-model.md,
 "Budget").
 """
@@ -45,24 +45,25 @@ def set_device_budget_gb(gb: float) -> None:
 def resolve_device_budget_gb(deck_gb: float = 0.0, linalg: str = "local") -> float:
     """THE run budget in decimal GB per device, recorded once.
 
-    The memory rule's budget on this device for the deck's resolved
-    ``linalg`` (:func:`get_device_memory_gb`), the minimum over processes, so
-    static tile shapes agree on every process; a positive deck
-    ``memory_per_device_gb`` caps it.  A deck value above the rule warns once,
-    with both numbers, and the rule's budget is used.  Every process must enter.
+    A positive deck ``memory_per_device_gb`` is used as given; above the
+    memory rule's budget for the deck's resolved ``linalg``
+    (:func:`get_device_memory_gb`) it warns once, with both numbers.  Without
+    one, the rule's budget.  The rule is the minimum over processes, so static
+    tile shapes agree on every process.  Every process must enter.
     """
     rule = minimum_process_budget_gb(get_device_memory_gb(linalg))
     deck = float(deck_gb or 0.0)
     if deck > rule:
         import warnings
-        from runtime import _resolve_proc_id
+        from runtime import POOL_OVERSHOOT, _resolve_proc_id
         if _resolve_proc_id() == 0:
             warnings.warn(
-                f"memory_per_device_gb = {deck:g} is above the memory rule's "
-                f"{rule:.2f} GB per device at linalg = {linalg}; the budget is "
-                f"{rule:.2f} GB (docs/architecture/memory-model.md#budget)",
-                RuntimeWarning, stacklevel=2)
-    budget = min(deck, rule) if deck > 0 else rule
+                f"memory_per_device_gb = {deck:g} exceeds the memory rule's "
+                f"{rule:.2f} GB on this card (linalg = {linalg}); the XLA pool has "
+                f"overshot its budget by up to {100 * POOL_OVERSHOOT:.0f} % (P4) and "
+                f"15 % (P64 CrI3 24x24); continuing at {deck:g} "
+                "(docs/architecture/memory-model.md#budget)", RuntimeWarning, stacklevel=2)
+    budget = deck if deck > 0 else rule
     set_device_budget_gb(budget)
     return budget
 
