@@ -520,36 +520,39 @@ def _leading_row_program(sharding):
                    out_shardings=sharding)
 
 
-def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
-                           *, matmul, eigh, gates, ordered):
-    """Shared scalar gate equations for local-parent and whole-mesh adapters."""
+def evaluate_round_held_samples(model, signed, held, *, nodes, matmul, gates,
+                                ordered, return_values=False):
+    """One parent's held W/dW and unchanged reciprocity, without passivity.
+
+    Optional values have shape [1,2,S,n,n], W then dW/ds, on device faces.
+    The caller owns full-mesh placement and the service GEMM.
+    """
     import jax
     import jax.numpy as jnp
-    from gw.shared_pole_directions import _model_diagnostics
-    from gw.shared_pole_gates import (shared_pole_passivity,
-                                      shared_pole_reciprocity,
-                                      signed_shared_pole_passivity)
+    from gw.shared_pole_gates import shared_pole_reciprocity
 
     factor, poles, active = model
+    wc, dw = held
+    z = jnp.asarray(nodes, dtype=jnp.complex128)
+    if (z.ndim != 1 or z.shape[0] == 0
+            or factor.ndim != 3 or factor.shape[0] != 1
+            or poles.shape != active.shape
+            or poles.shape != (1, factor.shape[-1])
+            or wc.ndim != 4 or dw.shape != wc.shape
+            or wc.shape != (1, z.shape[0], factor.shape[1], factor.shape[1])):
+        raise ValueError('held round evaluator requires one parent and matching W/dW sample faces')
     if ordered:
         factor, mu, kept = signed
-        passive = signed_shared_pole_passivity(
-            signed, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
         node = z[:, None]
         weights = jnp.where(kept, 1 / (node * mu - 1), 0)
         slopes = jnp.where(kept, -mu / (node * mu - 1) ** 2 / (2 * node), 0)
-        scale = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu), 1), 0)
-        moment_model = (factor * scale[:, None, :], scale ** 2, kept)
     else:
-        passive = shared_pole_passivity(
-            model, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
         weights = jnp.where(active, 1 / ((z ** 2)[:, None] - poles), 0)
         slopes = -weights ** 2
-        moment_model = model
 
     def sample(args):
         weight, slope, w, d = args
-        errors, reciprocity = [], []
+        errors, reciprocity, values = [], [], []
         for coefficient, exact in ((weight, w), (slope, d)):
             value = matmul(factor * coefficient[None, None, :],
                            factor, transb='C')[0]
@@ -558,12 +561,45 @@ def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
                                         jnp.finfo(jnp.float64).tiny))
             reciprocity.append({} if ordered else
                 shared_pole_reciprocity(value, exact, gates=gates))
-        return jnp.stack(errors), jax.tree.map(lambda *v: jnp.stack(v), *reciprocity)
-    errors, reciprocity = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
+            if return_values:
+                values.append(value)
+        row = (jnp.stack(errors),
+               jax.tree.map(lambda *v: jnp.stack(v), *reciprocity))
+        return (*row, jnp.stack(values)) if return_values else row
+
+    result = jax.lax.map(sample, (weights, slopes, wc[0], dw[0]))
     rows = lambda a: jnp.swapaxes(a, 0, 1)[None]
+    errors, reciprocity = result[:2]
+    output = rows(errors), jax.tree.map(rows, reciprocity)
+    return (*output, rows(result[2])) if return_values else output
+
+
+def _round_check_equations(model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
+                           *, matmul, eigh, gates, ordered):
+    """Shared scalar gate equations for local-parent and whole-mesh adapters."""
+    import jax.numpy as jnp
+    from gw.shared_pole_directions import _model_diagnostics
+    from gw.shared_pole_gates import (shared_pole_passivity,
+                                      signed_shared_pole_passivity)
+
+    factor, poles, active = model
+    if ordered:
+        factor, mu, kept = signed
+        passive = signed_shared_pole_passivity(
+            signed, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
+        scale = jnp.where(kept, 1 / jnp.where(kept, jnp.abs(mu), 1), 0)
+        moment_model = (factor * scale[:, None, :], scale ** 2, kept)
+    else:
+        passive = shared_pole_passivity(
+            model, inverse, eta_ry=eta, matmul=matmul, eigh=eigh, gates=gates)
+        moment_model = model
+
+    held_errors, reciprocity = evaluate_round_held_samples(
+        model, signed, (wc, dw), nodes=z, matmul=matmul, gates=gates,
+        ordered=ordered)
     defects = _model_diagnostics(moment_model, {'M1': m1, 'M3': m3}, qi,
                                  matmul=matmul)
-    return passive, rows(errors), jax.tree.map(rows, reciprocity), defects
+    return passive, held_errors, reciprocity, defects
 
 
 @lru_cache(maxsize=None)

@@ -5,6 +5,14 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — bounded held-sample screening diagnostics
+
+The shared-pole round exposes its existing held W and dW/ds evaluation as
+`evaluate_round_held_samples`. Production calls the same equations; the
+optional evaluated faces permit a cached single-parent diagnostic without
+a Coulomb inverse or a new screening calculation. Such a diagnostic does
+not establish passivity or admit a complete model. Cuts and gates are unchanged.
+
 ## 2026-10-07 — reference-only native-band centroid metric input
 
 The charge centroid metric accepts an optional bounded raw-parent coefficient
