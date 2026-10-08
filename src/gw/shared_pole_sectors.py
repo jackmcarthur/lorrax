@@ -1889,7 +1889,9 @@ def decoupled_admission(execution_rows, nq, *, mesh_xy, ledger, upstream):
                                concurrent_with=upstream)
         aggregate[row['sector']]=int(preview['aggregate_bytes_per_rank'])
         admitted=admitted and preview['device_budget_status']=='PASS'
-        held_out+=held+per_rank(16*(side*2*carrier+2*packed*2*carrier))
+        # No pole budget (the relaxed tier): the kept span is the whole H'_vv side.
+        two=2*(carrier or side//2)
+        held_out+=held+per_rank(16*(side*two+2*packed*two))
     return dict(admitted=bool(admitted),aggregate_bytes_per_rank=aggregate)
 
 
@@ -1981,9 +1983,10 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
         # At nq >= P the face rounds hold a few parents each (Ni 20^3 at 32 line sites,
         # 36 GB: 38 rounds of 17); say what the q-local route needs.
         import warnings
-        need=max(r[k]['aggregate_bytes_per_rank'] for r in execution_rows if r['mode']=='face'
+        face=[r for r in (*execution_rows,dict(joint_route,sector='CT',mode=joint_mode)) if r['mode']=='face']
+        need=max(r[k]['aggregate_bytes_per_rank'] for r in face
                  for k in ('local_selection','local_reduction') if r.get(k))
-        names=','.join(r['sector'] for r in execution_rows if r['mode']=='face')
+        names=','.join(r['sector'] for r in face)
         warnings.warn(f"shared-pole sectors: {names} local needs {need/1e9:.1f} GB/rank, over the "
                       f"{ledger.device_budget_bytes_per_rank/1e9:.1f} GB budget; the {int(nq)} parents "
                       f"run in face rounds on {int(mesh_xy.size)} ranks (slow). memory_per_device_gb >= "

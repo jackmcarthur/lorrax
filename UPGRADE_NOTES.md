@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — two sector route crashes fixed (relaxed tier on the face route; CT alone on the face)
+
+`sigma_w_accuracy = relaxed` with `bispinor_gw = full_shared_pole` stopped at bank build with a
+`TypeError` whenever a sector took the face route: the relaxed tier has no pole budget, so the
+face Ritz carrier is None, and the decoupled admission multiplied by it. It now prices the whole
+H'_vv side, as the stage price does. A deck with CC and TT q-local, CT on the face, nq ≥ P and
+decoupling refused stopped with `ValueError: max() iterable argument is empty` in the face-rounds
+warning; the warning now names CT and its q-local need. No result moves. No deck change.
+
 ## 2026-10-08 — XLA is the reference path; vendor routes must earn their place
 
 One owner ruling replaces two (`docs/architecture/decisions.md#xla-reference`): the
