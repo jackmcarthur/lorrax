@@ -326,8 +326,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             local_eigh = budget.eigenplan(side)
             reduction_row = budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
                 round_states, infinity, widths, infinity_width))
-            if execution == 'face' and reduction_row['device_budget_status'] != 'PASS':
-                raise MemoryError('Actual face reduction exceeds explicit full-mesh device capacity')
             if real_trim:
                 import distrib_la
                 from gw.shared_pole_execution import face_eigh
