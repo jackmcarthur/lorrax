@@ -69,6 +69,8 @@ ATOL = {
     # <= 1 meV rule-set reproducibility.  Measured P1 vs P4 on na_sc map 1:
     # 0.66 meV (main 8e33b82d3 and GRAMRP alike).  eqp files keep eqp_ev.
     "sc_sigma_ev": 1.0e-3,
+    # ... per point at least this fraction of |Sigma(omega)| (SC_SIGMA_H5 frequency grids).
+    "sc_sigma_pole_rel": 1.0e-4,
 }
 # The SC stages' sigma h5 files, compared at ATOL["sc_sigma_ev"], and the
 # GN-PPM one: its output window holds the deep occupied bands 1-2 of the
@@ -677,6 +679,32 @@ def _tol(label):
     return ATOL["bse_ev"], False
 
 
+def _gauge_free(m, energies, degenerate_ev=1e-5):
+    """A band matrix ``[..., k, i, j]`` as numbers a band gauge keeps.
+
+    With the file's band energies ``[k, i]``: each nondegenerate band's
+    diagonal entry, each multiplet's diagonal-block singular values, and the
+    Frobenius norm of every off-diagonal block between two groups.  Without
+    them, the diagonal and the element moduli (a phase per band only).
+    """
+    if energies is None or energies.shape != m.shape[-3:-1]:
+        return np.concatenate([np.einsum("...ii->...i", m).ravel(), np.abs(m).ravel()])
+    out = []
+    for k, e in enumerate(np.asarray(energies).real):
+        order = np.argsort(e)
+        groups = np.split(order, np.flatnonzero(np.diff(e[order]) > degenerate_ev) + 1)
+        for ga in groups:
+            for gb in groups:
+                block = m[..., k, :, :][..., ga[:, None], gb[None, :]]
+                if gb is not ga:
+                    out.append(np.linalg.norm(block, axis=(-2, -1)).ravel())
+                elif len(ga) == 1:
+                    out.append(block.ravel())
+                else:
+                    out.append(np.linalg.svd(block, compute_uv=False).ravel())
+    return np.concatenate(out)
+
+
 def compare(name, got, ref):
     problems = []
     for label, want in ref.items():
@@ -695,17 +723,23 @@ def compare(name, got, ref):
         tol, relative = _tol(label)
         scale = max(1.0, float(np.max(np.abs(want)))) if (
             relative and want.size) else 1.0
+        bound = tol * scale
         if label.endswith("_kij_ev"):
-            # Band-basis matrices carry the wavefunction phases, which the
-            # eigensolver may choose differently (P1 vs P4): compare the
-            # diagonal and the element moduli, which a phase change keeps.
-            have = np.concatenate([np.einsum("...ii->...i", have).ravel(),
-                                   np.abs(have).ravel()])
-            want = np.concatenate([np.einsum("...ii->...i", want).ravel(),
-                                   np.abs(want).ravel()])
-        err = float(np.max(np.abs(have - want))) if want.size else 0.0
-        if err > tol * scale:
-            problems.append(f"{name}: {label} max|diff| {err:.3e} > {tol * scale:.1e}")
+            # Band-basis matrices carry the eigensolver's gauge, a phase per
+            # band and a rotation inside each degenerate multiplet: compare
+            # what that gauge keeps (_gauge_free).
+            per_point = want.ndim == 4 and label.startswith(SC_SIGMA_H5)
+            energies = ref.get(label.split(":")[0] + ":sigma_eval_rel_ev")
+            have, want = (_gauge_free(m, energies) for m in (have, want))
+            if per_point:
+                # Sigma(omega) is compared relatively near its poles, where it reaches
+                # hundreds of eV and any change of summation order moves it by meV.
+                bound = np.maximum(bound, ATOL["sc_sigma_pole_rel"] * np.abs(want))
+        excess = np.abs(have - want) - bound
+        if want.size and np.max(excess) > 0:
+            at = int(np.argmax(excess))
+            problems.append(f"{name}: {label} |diff| {abs(have - want).ravel()[at]:.3e} > "
+                            f"{np.broadcast_to(bound, want.shape).ravel()[at]:.1e}")
     for label in got:
         if label not in ref:
             problems.append(f"{name}: {label} not in the reference")
