@@ -170,7 +170,12 @@ class DenseSpectrumReader:
             _refuse("archive units or coefficient convention differ")
         try:
             bindings = json.loads(_text(attrs["source_sha256_bindings"]))
-            seed = str(Path(_text(attrs["dense_h_source_wfn"])).resolve())
+            seed_path = Path(_text(attrs["dense_h_source_wfn"]))
+            # An explicitly relocated archive authenticates the recorded
+            # absolute address as metadata; resolving its old filesystem
+            # address would still touch the filesystem being replaced.
+            seed = (str(seed_path) if source_aliases is not None
+                    else str(seed_path.resolve()))
         except (KeyError, TypeError, ValueError) as error:
             _refuse(f"missing or malformed source binding: {error}")
         expected = str(expected_source_sha256)
