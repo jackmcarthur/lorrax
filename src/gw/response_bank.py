@@ -238,19 +238,38 @@ def response_weights(wfns, meta):
                          "want current finite screening bands; "
                          "why: exact response uses both occupation sectors")
     physical = np.arange(energy.shape[1])[None, :] < count
+    valid = getattr(wfns, "valid_kn", None)
+    if valid is not None:
+        from .wavefunction_bundle import physical_band_mask
+        physical = physical_band_mask(wfns, band_stop=count)
     f = np.where(physical, occupied, 0.0)
     u = np.where(physical, 1.0 - occupied, 0.0)
-    reference = float(np.mean(energy[:, :count]))
-    return energy, f, u, reference, {
+    selected = energy[:, :count] if valid is None else energy[physical]
+    reference = float(np.mean(selected))
+    census = {
         "band_start": first, "band_stop": stop,
         "band_carrier": energy.shape[1],
         "energy_sha256": hashlib.sha256(energy[:, :logical_count].tobytes()).hexdigest(),
         "occupation_sha256": hashlib.sha256(occupied[:, :logical_count].tobytes()).hexdigest(),
-        "energy_min_ry": float(energy[:, :count].min()),
-        "energy_max_ry": float(energy[:, :count].max()),
+        "energy_min_ry": float(selected.min()),
+        "energy_max_ry": float(selected.max()),
         "occupation_activity_floor": 0.0,
         "discarded_occupation_mass": 0.0,
     }
+    if valid is not None:
+        census.update(valid_kn_sha256=hashlib.sha256(np.asarray(valid, bool).tobytes()).hexdigest(),
+                      physical_bands_by_k=np.sum(physical, axis=1).tolist())
+    return energy, f, u, reference, census
+
+
+def _moment_relative_energies(wfns, energy, reference, census):
+    """Exclude inactive carrier cells before taking energy powers."""
+    erel = energy - reference
+    if getattr(wfns, "valid_kn", None) is None:
+        return erel
+    from .wavefunction_bundle import physical_band_mask
+    physical = physical_band_mask(wfns, band_stop=census["band_stop"]-census["band_start"])
+    return np.where(physical, erel, 0.)
 
 
 @dataclass(frozen=True, eq=False)
