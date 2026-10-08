@@ -2575,7 +2575,7 @@ def _bispinor_charge_tile(zeta_g, *, cfg, meta, wfn, sym, centroid_indices,
                          if cfg.memory.vq_g_chunk_size > 0 else None),
                 sym=sym,
                 centroid_C_idx=(np.asarray(jax.device_get(centroid_indices),
-                                           dtype=np.int32)
+                                           dtype=np.float64 if meta.mu_basis.coordinate_kind == 'fractional' else np.int32)
                                 if centroid_indices is not None else None),
                 mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
                 print_fn=print_fn)

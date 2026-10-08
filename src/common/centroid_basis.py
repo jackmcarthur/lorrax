@@ -284,13 +284,22 @@ class PackedCentroidBasis:
         return self._axis_kernel(axis, spec, True)(arr)
 
     def pack_operator(self, op, *, spec=None):
-        """Both centroid axes (the last two) of a ``(..., mu, nu)`` operator."""
+        """Canonical suffix-padded operator → packed on both trailing axes."""
+        if op.ndim < 2 or tuple(op.shape[-2:]) != (self.n_canonical,) * 2:
+            raise ValueError(
+                f"centroid basis: pack_operator expects the canonical carrier "
+                f"{self.n_canonical} on both trailing axes; got {op.shape}.")
         if self.is_identity:
             return op
         spec = self._spec(op, spec)
         return self._operator_kernel(spec, False)(op)
 
     def unpack_operator(self, op, *, spec=None):
+        """Packed operator → canonical suffix-padded on both trailing axes."""
+        if op.ndim < 2 or tuple(op.shape[-2:]) != (self.n_packed,) * 2:
+            raise ValueError(
+                f"centroid basis: unpack_operator expects the packed carrier "
+                f"{self.n_packed} on both trailing axes; got {op.shape}.")
         if self.is_identity:
             return op
         spec = self._spec(op, spec)
