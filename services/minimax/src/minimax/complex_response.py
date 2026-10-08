@@ -15,6 +15,9 @@ RESPONSE_RULE_CAPACITY = 192
 # Node slots of one rule: a shared set uses at most one pencil's capacity; a
 # single sample whose forward and reverse poles need separate sets uses two.
 RESPONSE_NODE_CAPACITY = 2*RESPONSE_RULE_CAPACITY
+# Host-only fallback weights. Consumers stream these through the unchanged
+# RESPONSE_NODE_CAPACITY device carrier rather than retaining all node Greens.
+RESPONSE_HOST_NODE_LIMIT = 4096
 _RESPONSE_MAX_KAPPA = 5000.
 # A group's pencil geometry is abandoned after this many more exponentials
 # without a decade of accuracy; the next geometry, then a smaller group, is
@@ -22,7 +25,11 @@ _RESPONSE_MAX_KAPPA = 5000.
 _STAGNATION_NODES = 24
 
 
-def _project(lo, hi, pole, times, decay_rate=0.):
+class _ResponseFitRefusal(ValueError):
+    """Only a numerical response fit refusal, not an invalid-input error."""
+
+
+def _project(lo, hi, pole, times, decay_rate=0., coefficients=None):
     eta = abs(pole.imag)
     span, zp = (hi-lo)/eta, (pole-lo)/eta
     x = np.unique(np.r_[0., span,
@@ -41,13 +48,18 @@ def _project(lo, hi, pole, times, decay_rate=0.):
             a[i:j] = np.exp(damp[i:j, None] - (d[i:j, None]-origin)*times)
         _map_rows(fill, d.size, times.size)
         return a, np.exp(damp)
-    a, weight = basis(x)
-    a = a/abs(f[:, None])
-    scale = la.norm(a, axis=0)
-    if np.any(scale == 0) or not np.isfinite(scale).all():
-        return None
-    coeff = la.lstsq(a/scale, weight[:, None]*np.column_stack((f, f*f))/abs(f[:, None]),
-                    cond=1e-14, lapack_driver='gelsd', check_finite=False)[0]/scale[:, None]
+    if coefficients is None:
+        a, weight = basis(x)
+        a = a/abs(f[:, None])
+        scale = la.norm(a, axis=0)
+        if np.any(scale == 0) or not np.isfinite(scale).all():
+            return None
+        coeff = la.lstsq(a/scale, weight[:, None]*np.column_stack((f, f*f))/abs(f[:, None]),
+                        cond=1e-14, lapack_driver='gelsd', check_finite=False)[0]/scale[:, None]
+    else:
+        coeff = np.asarray(coefficients)*np.array([eta, eta*eta])
+        if coeff.shape != (len(times), 2) or not np.isfinite(coeff).all():
+            return None
     probe = np.unique(np.r_[x, np.linspace(0, span, 2501)])
     error = np.zeros(2)
     # One row-blocked basis for the whole probe; the products stay on the
@@ -79,7 +91,7 @@ def _poles(z):
     return np.asarray(poles)
 
 
-def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
+def _fits(lo, hi, poles, times, tol, decay_rate, order=None, coefficients=None):
     """Project every pole on shared times; stop at the first rejected pole.
 
     ``order`` is a caller-owned list of pole indices; a rejected pole moves to
@@ -90,7 +102,8 @@ def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
     worst = 0.
     for position, index in enumerate(list(order)):
         pole = poles[index]
-        fit = _project(lo, hi, pole, times, decay_rate)
+        fit = (_project(lo, hi, pole, times, decay_rate) if coefficients is None else
+               _project(lo, hi, pole, times, decay_rate, coefficients=coefficients[index]))
         error = np.inf if fit is None else float(np.max(fit[1]*[1., pole.imag/(2*abs(pole))]))
         mass_rejected = fit is not None and error <= tol and fit[2][0] > _RESPONSE_MAX_KAPPA
         if fit is None or not error <= tol or not np.isfinite(fit[2]).all() or mass_rejected:
@@ -130,7 +143,7 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
     sampled-error and coefficient-mass acceptance.
     """
     order = list(range(len(poles)))
-    if previous is not None and len(previous):
+    if previous is not None and 0 < len(previous) <= RESPONSE_NODE_CAPACITY:
         fits, _, _ = _fits(lo, hi, poles, previous, tol, decay_rate, order)
         if fits is not None:
             return previous, fits
@@ -230,6 +243,32 @@ def _imaginary_times(lo, hi, poles, tol, decay_rate, capacity):
     return None if fits is None else (times, fits)
 
 
+def _analytic_imaginary_times(lo, hi, poles, tol, decay_rate):
+    """One bounded-coefficient integral rule shared by all supplied poles.
+
+    1/(d-p)=i integral exp[-i(d-p)s] ds; its square has weight -s.
+    The finite horizon and Gauss count propose coefficients only: the same
+    physical value/slope clouds and coefficient-mass gates must accept them.
+    Reverse poles enter the phase reach as well as forward poles.
+    """
+    eta = float(poles.imag.min())
+    horizon = -np.log(tol) + np.log(-np.log(tol)) + 6.
+    reach = float(np.max(abs(np.asarray([lo, hi])[:, None]-poles.real)))
+    count = max(8, int(np.ceil(1.05*reach/eta*horizon/4)))
+    if count > RESPONSE_HOST_NODE_LIMIT:
+        return None
+    nodes, weights = np.polynomial.legendre.leggauss(count)
+    nodes = (nodes+1)*horizon/(2*eta)
+    weights = weights*horizon/(2*eta)
+    times = 1j*nodes
+    reference = 0. if decay_rate else lo
+    coefficients = [np.column_stack((1j*weights, -nodes*weights))
+                    * np.exp(1j*(pole-reference)*nodes)[:, None] for pole in poles]
+    fits, _, _ = _fits(lo, hi, poles, times, tol, decay_rate,
+                       coefficients=coefficients)
+    return None if fits is None else (times, fits)
+
+
 def _rule(z, sets):
     """Scatter pole fits on node sets into forward and reverse sample rows.
 
@@ -240,9 +279,12 @@ def _rule(z, sets):
     """
     times = np.concatenate([t for t, _, _ in sets])
     count = len(times)
-    t = np.zeros(RESPONSE_NODE_CAPACITY, complex)
+    if count > RESPONSE_HOST_NODE_LIMIT:
+        raise _ResponseFitRefusal('response host node limit exceeded')
+    capacity = max(RESPONSE_NODE_CAPACITY, count)
+    t = np.zeros(capacity, complex)
     t[:count] = times
-    shape = (len(z), 2, RESPONSE_NODE_CAPACITY)
+    shape = (len(z), 2, capacity)
     value, derivative = np.zeros(shape, complex), np.zeros(shape, complex)
     errors, mass = np.zeros((len(z), 2, 2)), np.zeros((len(z), 2, 2))
     for j, point in enumerate(z):
@@ -291,14 +333,17 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     alone; its Green-pair evaluations serve all members of the group.
 
     Returns a list of rules. Each has ``members`` (indices into ``z_ry``),
-    ``t[RESPONSE_NODE_CAPACITY]``, ``value``/``derivative`` of shape
-    ``[members, 2 (forward, reverse), RESPONSE_NODE_CAPACITY]`` (value and
+    ``t[node_capacity]``, ``value``/``derivative`` of shape
+    ``[members, 2 (forward, reverse), node_capacity]`` (value and
     d/d(z^2)), ``count``, ``sampled_error`` and ``coefficient_mass``
     ``[members, 2, 2]``, and ``reference_ry``. ``previous`` is a list of
     earlier rules; one with the same member set (any order) is tried first. A positive
     decay_rate bounds occupation products by min(1,exp(decay_rate*d)); errors
     then use that envelope and 0<=Re(t)<=decay_rate. Bounds are sampled, not
-    proven.
+    proven. A final numerical refusal tries one analytic imaginary-time rule
+    shared by the line samples. Its host node capacity may exceed the usual
+    RESPONSE_NODE_CAPACITY, up to RESPONSE_HOST_NODE_LIMIT; callers must
+    stream its nodes through their priced device carrier.
     """
     lo, hi = float(lo_ry), float(hi_ry)
     z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
@@ -357,7 +402,7 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
                         return [dict(rule, members=list(members), reference_ry=reference)]
                     got = _refine_mass_times(lo, hi, one, mass_seeds, rel_tol/2, decay_rate)
                 if got is None:
-                    raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
+                    raise _ResponseFitRefusal(f'response exponential fit failed: interval={lo, hi}, '
                                      f'sample={z[members[0]]}, pole={pole}, tolerance={rel_tol}')
                 sets.append((got[0], one, got[1]))
             rule = _rule(z[members], sets)
@@ -365,4 +410,20 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
         return build(members[:half]) + build(members[half:])
 
     with _pinned_blas_threads():
-        return build(list(range(len(z))))
+        try:
+            return build(list(range(len(z))))
+        except _ResponseFitRefusal:
+            # Imaginary samples already have stable pencil rules. Line poles
+            # share one analytic node set, avoiding one large rule per sample.
+            line = np.flatnonzero(z.real != 0).tolist()
+            imaginary = np.flatnonzero(z.real == 0).tolist()
+            if not line:
+                raise
+            poles = _poles(z[line])
+            got = _analytic_imaginary_times(lo, hi, poles, rel_tol/2, decay_rate)
+            if got is None:
+                raise
+            other = build(imaginary) if imaginary else []
+            rule = _rule(z[line], [(got[0], poles, got[1])])
+            return other + [dict(rule, members=line, reference_ry=reference,
+                                 provider='analytic imaginary-time integral')]

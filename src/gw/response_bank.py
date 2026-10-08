@@ -1989,6 +1989,18 @@ def _group_zeros(mesh_xy, shape):
                    out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
+def _response_node_chunks(times, weights):
+    """Small host rules on the already priced device node carrier, in order."""
+    from minimax.complex_response import RESPONSE_NODE_CAPACITY
+    for first in range(0, len(times), RESPONSE_NODE_CAPACITY):
+        stop = min(first+RESPONSE_NODE_CAPACITY, len(times))
+        t = np.zeros(RESPONSE_NODE_CAPACITY, np.complex128)
+        w = np.zeros(weights.shape[:-1]+(RESPONSE_NODE_CAPACITY,), np.complex128)
+        t[:stop-first] = times[first:stop]
+        w[..., :stop-first] = weights[..., first:stop]
+        yield jnp.asarray(t), jnp.asarray(w)
+
+
 def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
                              execute, receipt, ordered=False, vertex=None, bank=None, outputs=()):
     """Donated [value/ds per member, q, mu_X, nu_Y]; one Green/FFT scan per group.
@@ -2000,7 +2012,6 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
     """
     times, weights = _group_stream_arguments(rules, group)
     n = meta.mu_basis.n_packed if vertex is None else vertex.n
-    common = (jnp.asarray(times), jnp.asarray(weights))
     tail = (stream_weights(wfns, rules["f"], mesh_xy), stream_weights(wfns, rules["u"], mesh_xy),
             jnp.asarray(rules["refs"]))
     scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
@@ -2012,8 +2023,9 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
                 n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True, ordered=ordered,
                 vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=p)
             raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * rows, py * cols))()
-            raw = execute(kernel, common + tuple(fixed) + tail + (raw, jnp.int32(p)),
-                          "direct", runtime_bytes=scratch)
+            for common in _response_node_chunks(times, weights):
+                raw = execute(kernel, common + tuple(fixed) + tail + (raw, jnp.int32(p)),
+                              "direct", runtime_bytes=scratch)
             bank.put(p, raw, outputs)
             del raw
         return None
@@ -2021,7 +2033,9 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
         q_ids=q_ids, n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True,
         ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
     raw = _group_zeros(mesh_xy, (weights.shape[1],len(q_ids),n,n))()
-    return execute(kernel, common + tuple(fixed) + tail + (raw,), "direct", runtime_bytes=scratch)
+    for common in _response_node_chunks(times, weights):
+        raw = execute(kernel, common + tuple(fixed) + tail + (raw,), "direct", runtime_bytes=scratch)
+    return raw
 
 
 def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):

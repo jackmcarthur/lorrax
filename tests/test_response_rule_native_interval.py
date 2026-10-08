@@ -1,17 +1,19 @@
 """Native Si scalar-rule regression; independent final value/slope replay."""
 import numpy as np
+import pytest
 
 
-def test_native_interval_mass_refinement_on_independent_spectrum():
+@pytest.mark.parametrize('real_z', [4.607368602009248,5.302195293309384,7.15729538670741])
+def test_native_interval_mass_refinement_on_independent_spectrum(real_z):
     import minimax
 
     lo, hi = .04499315372020445, 30.208688943498455
-    z = 4.607368602009248 + .19109640588867596j
+    z = real_z + .19109640588867596j
     rules = minimax.response_group_rules(lo, hi, np.array([z]), rel_tol=1e-8)
     assert len(rules) == 1 and rules[0]['members'] == [0]
     rule = rules[0]
     count = rule['count']
-    assert 0 < count <= len(rule['t']) == 384
+    assert 0 < count <= len(rule['t']) <= 4096
     assert rule['reference_ry'] == lo
     assert np.all(np.isfinite(rule['t'])) and np.all(rule['t'].real >= 0)
     assert np.all(rule['t'][count:] == 0)
