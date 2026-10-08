@@ -96,10 +96,10 @@ also stamps the restart; no process-global file cache is used. Every restart
 invocation independently authenticates the requested manifest before accepting
 stored tensors and samples.
 
-Exchange, screening and correlation receive the same reconstructed sample
-bundle and fitted Coulomb tensor. There is no separate smooth screening
-vertex. The optical q-to-zero derivative remains an independent consistency
-requirement; common finite-q samples alone do not certify that derivative.
+For Coulomb-only GW, exchange, screening and correlation receive the same
+reconstructed sample bundle and fitted Coulomb tensor. There is no separate
+smooth screening vertex. The optical q-to-zero derivative remains an
+independent consistency requirement; common finite-q samples alone do not certify that derivative.
 The reconstructed occupied Hartree source is captured during fitting, before
 donation. Its public receiving hook evaluates the same served states with
 the independent full-FFT Poisson owner. Hartree omits G=0, whereas exchange
@@ -166,8 +166,9 @@ resident Fourier rows at those positions. In full-WFN mode the complete factor
 A acts on the reciprocal rows and atomic coefficients first, so only the
 public band columns need the sample DFT. All available bands still enter the
 overlap and rotation. A rounded FFT gather would consume a different orbital map.
-The current admission is augmented charge fitting; an unsupported FFT-only
-refitting consumer refuses this basis explicitly.
+Fractional charge fitting is admitted. The static-current extension
+below uses the same typed geometry; an unsupported FFT-only refitting consumer
+refuses this basis explicitly.
 
 The normal equations of the [existing conjugation-closed pair
 set](isdf-zeta-vq.md) are
@@ -379,12 +380,81 @@ integral \(F_\Delta=\int\Delta\zeta(r)e^{-i(q+G)r}d^3r\) enters it with
 on-site radial metric receives \(2(N_r/\Omega)^2\), once.
 
 The compensation identity above assumes ordinary 3D Coulomb and disjoint
-supports. Dimensional truncation requires a separate boundary proof. Transverse
-Breit electrostatics also contains the inverse bi-Laplacian: ordinary charge
-multipole cancellation is insufficient. A Cartesian current construction needs
-both its ordinary and second radial moments, or an explicitly transverse
-vector-harmonic construction. The grouped-current contraction refuses a scalar
-local provider rather than applying this charge identity to it.
+supports. Dimensional truncation requires a separate boundary proof. The static
+transverse construction below also cancels the inverse bi-Laplacian exterior
+field; its grouped-current contraction refuses a scalar local provider.
+
+## Static reconstructed current
+
+The public extension of `atomic_reconstruction_dir` admits
+`bispinor_gw=bare_transverse` only for `compute_mode=x_only`,
+`qp_solver=one_shot_dft`, fixed DFT density, three-dimensional periodic Coulomb,
+`head_correction=off` and no transverse head overlay. Occupation smearing is
+unset, response occupation broadening is zero, and the actual WFN occupations
+must describe an insulator before either fresh or restart I/O. Ordinary public fresh/file/restart reuses the same complete tensors and
+samples. This extension supplies bare
+static transverse exchange; it does not admit reconstructed screened/dynamic
+photon models. Coulomb-only GW retains its existing charge screening and
+correlation contractions.
+
+Charge and current use one reconstructed four-spinor and one full-WFN factor
+A. In the AgI validation this is the full physical 152-band factor before the
+public 120-band crop. The physical pair vertices are
+
+\[
+\Gamma^0=I_4,\qquad
+\Gamma^i=\alpha_i=\begin{bmatrix}0&\sigma_i\\\sigma_i&0\end{bmatrix},
+\qquad
+j^i_{mn}=\Psi_m^\dagger\alpha_i\Psi_n
+=L_m^\dagger\sigma_iS_n+S_m^\dagger\sigma_iL_n.
+\]
+
+The served lower field is still \(S=X L\), including the derivative of the
+served large-field taper. Each current component uses its own existing Gram
+factor for both smooth and local RHSs, with unit endpoint loss; the charge
+factor and any charge loss weights are separate. Both families may use distinct
+symmetry-closed fractional point sets. The same current matrices and conjugate
+endpoints enter the Gram, RHS, Coulomb tensor and self-energy contraction.
+The small components already contain \(1/(2c)\); multiplying the transverse
+kernel by another \(c^{-2}\) would count the relativistic suppression twice.
+
+For \(K=q+G\ne0\), the static kernel in Rydberg units is
+
+\[
+v^{TT}_{ij}(K)=-\frac{8\pi}{\Omega |K|^2}
+ \left(\delta_{ij}-\frac{K_iK_j}{|K|^2}\right).
+\]
+
+The real-space Breit factor one-half is accounted for by the transverse
+projector under Fourier transformation; no additional one-half multiplies
+this Fourier tensor. This headless static model has no transverse \(\Gamma\)-cell head
+at \(K=0\). The declared physical body mask
+and mini-cell averaging policy remain part of the operator comparison.
+
+For each Cartesian local correction and spherical harmonic, compensation
+matches both radial moments
+
+\[
+Q^{(s)}_{A,LM,i}=\int_0^R r^{L+2+s}
+ \Delta\zeta^i_{A,LM}(r)\,dr,\qquad s=0,2.
+\]
+
+Matching \(Q^{(0)}\) cancels the Poisson exterior field, while matching
+\(Q^{(2)}\) also cancels the exterior field from the inverse bi-Laplacian.
+The provider retains the local correction-minus-compensation bilinear forms
+and the smooth–neutral adjoints. Physical Fourier publication contains
+\(s+\Delta\), while compensation \(g\) belongs to the electrostatic
+completion. Writing \(s+g\) as the physical current would change the vertex.
+
+Ordinary restart stores the charge tensor and six independent transverse
+blocks, with the lower off-diagonal blocks supplied by Hermitian symmetry.
+These seven complete V tensors, both sample families and their typed
+coordinate/source receipts feed the existing self-energy contraction. A
+complete restart reuses them without atomic reconstruction, local-provider
+attachment or another fit. Fresh/restart equality validates the handoff;
+independent full \(\Sigma_X\) matrix comparisons validate fitting accuracy.
+Neither establishes atomic transferability, continuum convergence, screened
+frequency accuracy or calibrated quasiparticle band splittings.
 
 ## Implementation and accuracy
 

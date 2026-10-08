@@ -1624,9 +1624,10 @@ def _resolve_zeta_fit_contract(
 			load_centroids as _load_cent_pf, read_centroid_coordinate_kind)
 		kind_T = read_centroid_coordinate_kind(cfg.paths.centroids_file_current)
 		if kind_T != 'fft_indices':
-			raise NotImplementedError(
-				"Fractional current centroids require the augmented current fitting stage; "
-				"only charge augmentation is admitted.")
+			if kind_T != 'fractional' or not getattr(cfg.paths, 'atomic_reconstruction_dir', None):
+				raise NotImplementedError(
+					"Fractional current centroids require the atomic reconstructed current fitting stage.")
+			refuse_unsupported_bispinor_gw(cfg)
 		from runtime.padding import padded_mu_extent
 		_, cent_T_np, n_rmu_T = _load_cent_pf(
 			cfg.paths.centroids_file_current, meta.fft_grid)
@@ -3801,9 +3802,11 @@ def prepare_isdf_and_wavefunctions(
 	refuse_unsupported_bispinor_gw(cfg)
 	refuse_unsupported_bispinor_tt_head_correction(cfg)
 	if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
-	    from .gw_config import QPSolver
+	    from .gw_config import QPSolver, infer_material_class
 	    if cfg.qp_solver is not QPSolver.ONE_SHOT_DFT:
 	        raise ValueError('GATE resident_hartree_fixed_source: augmented density self-consistency requires a reconstructed source rebuild')
+	    if uses_transverse_interaction(cfg) and infer_material_class(wfn.occs) != 'insulator':
+	        raise ValueError('GATE atomic_transverse_fixed_occupations: reconstructed static currents require insulating WFN occupations')
 	from file_io.wfn_basis import WavefunctionBasisReceipt
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)

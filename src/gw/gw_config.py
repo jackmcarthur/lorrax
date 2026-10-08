@@ -3802,17 +3802,29 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     # The parser and fresh/restart orchestration call this same preflight.
-    # A programmatically replaced config must not stamp atomic augmentation
-    # on the incumbent current producer, whose endpoints have another frame.
+    # Atomic currents use the same reconstructed full-WFN frame as charge.
+    # The admitted transverse comparison is the static, headless bare matrix;
+    # screened/dynamic photon and Gamma-head models retain their own gates.
     if getattr(getattr(config, "paths", None), "atomic_reconstruction_dir", None):
+        static_current = (
+            mode is BispinorGWMode.BARE_TRANSVERSE
+            and config.compute_mode is ComputeMode.X_ONLY
+            and not bool(config.density_self_consistent)
+            and config.qp_solver is QPSolver.ONE_SHOT_DFT
+            and config.head.correction is HeadCorrection.OFF
+            and not bool(config.head.bispinor_tt_head_correction)
+            and config.occ_smearing_width_ry is None
+            and float(config.screening.occ_broadening_ev) == 0.)
         if (not config.bispinor
-                or mode is not BispinorGWMode.COULOMB_ONLY
+                or (mode is not BispinorGWMode.COULOMB_ONLY and not static_current)
                 or int(config.sys_dim) != 3):
             raise ValueError(
                 "GATE atomic_augmentation_domain: atomic_reconstruction_dir "
-                "requires bispinor=true, bispinor_gw=coulomb_only and sys_dim=3. "
-                "The local correction is certified for ordinary 3D Coulomb; "
-                "transverse and truncated kernels require their own compensation.")
+                "requires bispinor=true and sys_dim=3 with bispinor_gw=coulomb_only, "
+                "or bare_transverse with compute_mode=x_only, qp_solver=one_shot_dft, "
+                "head_correction=off and unsmeared insulating occupations. "
+                "Reconstructed screened/dynamic photon, transverse Gamma-head "
+                "and truncated-kernel models are outside this static-current domain.")
     if (config.compute_mode is ComputeMode.X_ONLY
             and uses_bare_tt_gamma_head(config) and bool(config.restart)):
         raise ValueError(
