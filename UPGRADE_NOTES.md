@@ -5,13 +5,25 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — reference Coulomb return can pack only representative q rows
+
+`compute_V_q(..., return_qirr=True)` keeps the existing full-raw finite,
+Gamma Hermiticity and all-q reciprocity checks, then selects representative
+rows before endpoint packing. Existing `q_wedge` metadata supplies the
+packed symmetry tables. This avoids the second full-q operator allocation
+at4560centroids/P4; default array callers retain their existing API.
+No Coulomb, head or fitting equations change. Four-GPU equivalence and
+production exchange validation are pending on this feature branch.
+
 ## 2026-10-08 — fitting matrix completion and stored-row selection share one lifetime
 
 The fit now compiles its existing C reshape/sharding, pad diagonal, ordered
 pair completion and IBZ row selection together. This removes the eager
 full-q identity copy seen at4560centroids/P4. Physics, solve threshold,
 centroid selection, file schema and gates are unchanged. Numerical and
-buffer validation is pending on the feature branch; no main release claim.
+buffer validation passed on four GPUs: complex source-density fixtures agree
+within1.12e-16, compiled4560/P4 finish uses44.998GB per rank and the native
+fit completes. This is scoped to fitting; no main release or GW accuracy claim.
 
 ## 2026-10-08 — bounded held-sample screening diagnostics
 

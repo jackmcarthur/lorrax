@@ -2532,32 +2532,59 @@ def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
 
 
 def _finalize_vq_views(
-        G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn):
+        G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn,
+        *, return_qirr=False, sym=None, centroid_indices=None):
     """Produce the packed Coulomb operator and validate its physical invariants."""
     from common.collectives import gather_to_host as _gather_to_host
     G0_gathered = _gather_to_host(G0_all)
-    V_qmunu = (meta.mu_basis.pack_operator(V_q_raw)
-               if getattr(meta, 'mu_basis', None) is not None else V_q_raw)
     G0 = G0_gathered
     while G0.ndim > 1:
         G0 = G0[0]
     print_fn(f"\n  V_q computed:")
-    print_fn(f"    Shape: {V_qmunu.shape}")
     _vq0_trace = float(jnp.trace(V_q_raw[0]).real)
     print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
     from common import sanity
-    sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
+    sanity.check_finite("V_q", V_q_raw, print_fn=print_fn)
     sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
     sanity.check_hermitian("V_q[q=0]", V_q_raw[0], print_fn=print_fn)
     sanity.check_q_conjugate_reciprocity(
         "V_q[all q]", V_q_raw, tuple(meta.kgrid), rtol=1e-5,
         print_fn=print_fn)
     sanity.check_finite("V_q G0 (ζ_μ(G=0) at q=0)", G0, print_fn=print_fn)
+    if return_qirr:
+        from ffi import _services
+        _services.ensure_on_path()
+        from symmetry_maps import QirrOperator
+        from .v_q_g_flat import q_wedge
+        wedge = q_wedge(sym=sym, centroid_indices=centroid_indices, meta=meta,
+                        context="bare V on the q wedge")
+        template = (QirrOperator(values=None, **wedge[0])
+                    if wedge is not None else None)
+        # Packing acts on endpoints independently of q. Restrict canonical
+        # full-zone rows before packing, avoiding two resident full operators.
+        # q_wedge owns the packed endpoint tables, including their load cache.
+        parents = (QirrOperator.of(V_q_raw).at_rows(template.full_rows)
+                   if template is not None else V_q_raw)
+        packed = (meta.mu_basis.pack_operator(parents)
+                  if getattr(meta, 'mu_basis', None) is not None else parents)
+        V_qmunu = (template.with_values(packed) if template is not None
+                   else QirrOperator.whole_zone(packed))
+        shape = V_qmunu.values.shape
+    else:
+        V_qmunu = (meta.mu_basis.pack_operator(V_q_raw)
+                   if getattr(meta, 'mu_basis', None) is not None else V_q_raw)
+        shape = V_qmunu.shape
+    print_fn(f"    Shape: {shape}")
     return V_qmunu, G0, head_channel, photon_g0_vectors
 
 
-def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
-	"""Produce bare Coulomb and head views; see docs/theory/bispinor-gw.md#dyson."""
+def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None, *, return_qirr=False):
+	"""Produce bare Coulomb and head views.
+
+	``return_qirr`` selects the run's packed q wedge before endpoint packing;
+	default callers receive the existing full-zone array.
+	See docs/theory/bispinor-gw.md#dyson.
+	"""
 	from .compute_vcoul import compute_all_V_q
 	photon_g0_vectors = None
 
@@ -2581,7 +2608,8 @@ def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=pr
 	        bgw_v_grid_fn, bvec, centroid_indices, cfg, mesh_xy, meta, print_fn, sym,
 	        vcoul_cutoff_ry, wfn, zeta_h5_path)
 	return _finalize_vq_views(
-	    G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn)
+	    G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn,
+	    return_qirr=return_qirr, sym=sym, centroid_indices=centroid_indices)
 
 
 
