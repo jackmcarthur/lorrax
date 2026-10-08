@@ -30,7 +30,9 @@ library is built and selected).
 | Frontera CPU (CLX) | apptainer image + staged runtime bundle + Intel MPI (layers below) | `config/frontera/templates/gw_dev.sbatch` |
 | another SLURM cluster | `config/<cluster>/` | [`config/README.md`](../../config/README.md) §Porting |
 
-The FFI layer is required on every platform ([Installation](../installation/index.md)).
+On CUDA and cpu the FFI libraries serve the vendor routes and are checked at
+startup ([Installation](../installation/index.md)); XLA is the reference
+path ([decisions](../architecture/decisions.md#xla-reference)).
 
 ### The Frontera CPU layer stack {#layer-stack}
 

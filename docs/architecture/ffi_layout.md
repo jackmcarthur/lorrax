@@ -190,13 +190,13 @@ Five, outermost first. Each one can refuse; none silently substitutes.
 | 4 | **XLA FFI custom call** | `src/ffi/common/ffi_loader.py`, `distrib_la.loader`, both over `lxkit.native_provider` | locates and attests the `.so`, registers its handler symbols |
 | 5 | **C++ handler + vendor library** | `src/ffi/cpp/<vendor>/` | the MPI-IO / BLAS / FFT / solver call |
 
-**A vendor dependency enters only through a facade with run-time resolution
-and an announced refusal.** The FFI is required
-([`decisions.md`](decisions.md), 2026-08-01): a missing library is a startup
-refusal naming the `.so`, never a demotion to a Python path. Portability
-fallbacks *inside* a handler (the FFTW3 `dlsym` ladder, batched versus plain
-CBLAS) are how the required layer stays buildable everywhere; each announces
-which entry it bound.
+**A vendor dependency enters only through one facade, with run-time
+resolution and an announced refusal, and is gated against the XLA path on the
+same device** ([XLA reference ruling](decisions.md#xla-reference)). Where a
+route selects a native target, a missing library is a startup refusal naming
+the `.so`. Portability fallbacks *inside* a handler (the FFTW3 `dlsym`
+ladder, batched versus plain CBLAS) keep the library buildable everywhere;
+each announces which entry it bound.
 
 ### Python-side module map
 

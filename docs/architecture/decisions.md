@@ -12,6 +12,46 @@ The GW driver's phase invariants and the per-function contracts of
 `gw.gw_config` are developer reference, not rulings:
 [GW driver and configuration contracts](../dev/gw_config_contracts.md).
 
+## 2026-10-08 — XLA is the reference path; a vendor route stays only where it pays {#xla-reference}
+
+**Rule (owner).** XLA is the reference path for every operation on every
+platform. A vendor kernel or library stays only when it is ≥ 2× faster on a
+production stage or decisive on memory; it sits behind one service; it is
+gated against the XLA path on the same device. cuSOLVERMp remains the
+capacity route for matrices that do not fit one device.
+
+* The platform is the device vendor, read from the JAX client, never the
+  string `gpu`. A platform without a vendor route runs the XLA path.
+* A kept vendor route is the default on its platform, and its measured gain
+  sits at its Python owner ([kernel lessons](ffi_layout.md#kernel-catalog)).
+  The mathdx k-convolutions stay the CUDA default because they are decisive
+  on memory: one Σ τ row pass at Ni 20³ P64 holds ≤ 1 GiB of scratch against
+  2.5–3.2 GB live on the staged XLA route, and runs 1.7–2.1× faster
+  ([why one fused pass](kconv.md#why-fused)).
+
+**Why.** An operation whose only engine is a vendor kernel has no engine on
+any other platform: no ROCm GPU runs gwjax, and a CPU mesh without the host
+library runs nothing. A vendor route with no XLA twin on its own device has
+no reference to be wrong against. Several CUDA routes do not pay for
+themselves: the cuBLASMp GEMM is 1.6–4.2× slower than
+`distrib_la.panel_matmul` at production shapes.
+
+**Licenses deleting** every vendor kernel, library call and environment
+gate that does not meet the bar, and every refusal that exists only because
+an operation had no XLA path.
+
+**Not yet conforming.**
+
+* `ffi.gate.mesh_ffi_platform` and `distrib_la.resolve` map `gpu` to CUDA,
+  and `runtime._gpu_is_present` reads `/dev/nvidia*`.
+* The k-convolution router has no XLA backend: CUDA takes mathdx, cpu the
+  host plans, and any other platform refuses (`GATE kconv-platform`).
+* The contour accumulator, the spin-rotation kernel and the cuBLASMp GEMM
+  have no measured gain. The classic-cuBLAS local active-range GEMM and the
+  screened bispinor Dyson's cuSOLVERMp LU are not measured against XLA.
+* The operations the [FFI layer](ffi_layout.md#kernel-operations) lists
+  under *Gaps* have no plain-XLA route.
+
 ## 2026-10-05 — A per-round program's shape is decided before the first round {#fixed-round-shapes}
 
 **Rule (owner).** Every argument of a program that runs once per round or
@@ -337,7 +377,7 @@ is a deterministic function of the device kind, so every rank builds the same
 plan, and there is no runtime autotune. Local transforms enter through
 `LocalFourierPlan` (service page [`../dev/fourier_plan.md`](../dev/fourier_plan.md));
 the route-G plane transform is its `in_gather` form, served by mathdx mode 10
-under the 2026-09-24 platform router.
+on CUDA ([k-convolution router](kconv.md#router)).
 
 **Why.** A GEMM axis costs `O(N·K)` per line against the FFT's `O(N log N)`,
 but on a supported axis it fuses the embedding, the transform and the
@@ -376,43 +416,6 @@ with the first and which only the decks that select it ever test.
 * **The ζ back-solve is q-local.** Each whole-tile factor stays on its q
   owners (`16·⌈Q/P⌉·μ²` bytes per rank) and only the right-hand side moves;
   with `Q < P` the ranks past `Q` idle in the solve.
-
-## 2026-09-24 — NVIDIA k-convolutions run on nvidia-mathdx, behind one platform router
-
-**Rule.** Physics code calls one backend-agnostic entry per k-axis operation:
-the ζ-fit pair and parent-pair convolutions (behind the unchanged
-`parent_projector_kconv` seam), the k-leading T·W convolution of Σ and COHSEX,
-the k-minor convolution of the BSE ladder rung, and the k-leading and k-minor
-transforms (the flat-k transform included). Drivers never name a backend, a
-kernel or an environment variable. The router lives in the `ffi/fft.py`
-facade (layer 2 of [`ffi_layout.md`](ffi_layout.md) §1) and chooses by
-platform only:
-
-* CUDA → one fused nvidia-mathdx (cuFFTDx) kernel family, compiled by NVRTC
-  per (mode, grid, n_s, arch), cached in process and on disk
-  (content-hashed, atomic, re-verified on load). It is the only NVIDIA route.
-* cpu → the FFTW3-ABI plan handlers of the host library.
-* Any other platform → a named refusal.
-
-No environment variable selects a route (QUALITY #8). A k-grid axis above
-`KCONV_AXIS_MAX = 40` (the fp64 cuFFTDx thread-FFT limit) or a k-row that does
-not fit shared memory refuses by name. A missing `nvidia-mathdx` wheel on CUDA
-refuses at startup naming `pip install nvidia-mathdx`; the wheel is pinned in
-the `cuda12`/`cuda13` extras and the Perlmutter runtime recipe, and both
-Perlmutter FFI legs link the one MPI pinned in `config/perlmutter/ffi_mpi.sh`.
-
-**Why.** Library thread FFTs inside one fused shared-memory pass replace a
-multi-pass transform/transpose/product chain, so each k-convolution is one
-kernel launch; it measured 1.7× (8³) and 4.4× (12×12×1) over the
-direct DFT on A100. The wheel ships the headers, so making it
-the only NVIDIA route costs no build complexity.
-
-**Consequence for BSE.** Every TDA solve uses the stack matvec. The scalar
-singlet exchange weight (kernel D + 2V − W for `nspinor = 1`) has one owner,
-`bse_preconditioner.exchange_spin_weight`, applied at every encode.
-
-**Licenses deleting** every other k-convolution engine, its env gate and its
-route selection, on both platforms.
 
 ## 2026-09-18 — Headless shared-pole SC is allowed for brute-grid development
 
@@ -718,19 +721,6 @@ caller). Applying one without the other replaces ψ(r) by ψ*(−r), which passe
 every norm, orthogonality and ⟨T⟩ check while being wrong by O(100 eV) in
 V_loc/V_NL. Every TRS unfold goes through the symmetry service for that
 reason.
-
-## 2026-08-01 — FFI backends are required, not optional
-
-The FFI layer (FFT, GEMM, distributed linear algebra, parallel HDF5) is part of
-the build. A missing or unloadable FFI library refuses at startup, naming the
-library; it never demotes to a slower path. Where a certified FFI path exists,
-no duplicate JAX compute path is kept. The required libraries must build and
-load at P = 1.
-
-**Licenses deleting** the XLA duplicates of certified FFI paths and every
-"if FFI enabled … else jnp" fork. It does not license deleting the
-vendor-portability fallbacks inside the handlers (plain-loop CBLAS, FFTW-vs-MKL
-resolution); those keep the required layer buildable everywhere.
 
 ## 2026-08-01 — Square process meshes only; nonsquare P refuses
 

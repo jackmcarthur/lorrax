@@ -2,9 +2,9 @@
 
 One resolver for every env-gated, rank-local FFI capability: a handler called
 inside somebody else's `shard_map`, holding no communicator. Source:
-`src/ffi/gate.py`. The FFI layer is required
-([decisions](../architecture/decisions.md)): required-layer gates default on,
-and a missing library refuses at startup.
+`src/ffi/gate.py`. Both gates default on, and a missing library refuses at
+startup; XLA is the reference path a gated handler is checked against
+([decisions](../architecture/decisions.md#xla-reference)).
 
 | gate | declared in | platforms | default | `=0` (`off_policy`) |
 |---|---|---|---|---|
