@@ -31,11 +31,19 @@ Coulomb resource, without rebuilding screening or fitting centroids. Old
 bank headers are immutable; the new source/method and resource bridge belong
 in the new model/controller receipts. No environment change is required.
 
-The Gamma source hook at commit `01c2a85b5` was qualified on P4 in compute
-step `59543833.1`, including two compact-cap ghosts, direct positive latent
-W/dW, unchanged source gates and fresh original anchors. The extension to
-all eligible TRIM parents and physical all-q model admission still require
-their own compute receipts; this note makes no energy or general-model claim.
+The source hook at numeric commit `440dfd822` was qualified on P4 in compute
+step `59544441.2`, including two compact-cap ghosts, direct positive latent
+W/dW, unchanged source gates, fresh original anchors, full-Bloch finite-TRIM
+sewing and an excluded generic-q control. Step `59544441.3` finalized the
+eight-parent complete-native Si4³ model and finite all-P SigmaC using the
+original bank, moments and exact Coulomb bridge. Applicable TRIM reciprocity
+defects are below4.1e-16 and all parent passivity checks pass. Physical-bank
+moment WARN and held-fit defects remain; two retained-Ritz eigensolves
+required independently checked service retries. Successful retry metrics,
+per-attempt routes and failed matrices were not captured. This is bounded
+source/model evidence, not CD-energy, pole/ISDF convergence, QP or scissor
+accuracy certification. This documentation-only closure preserves the
+numeric440 evidence generation.
 
 ## 2026-10-08 — the staged sector selection runs each round at once; held checks read one sample at a time again
 
