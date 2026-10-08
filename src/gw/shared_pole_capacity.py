@@ -30,8 +30,8 @@ def retained_span_columns(side, kept):
     return min(int(side), int(kept))
 
 
-def real_gamma_projection_bytes(*, mesh_xy, parents, rows, side, keep_budget, retained_panels=()):
-    """The second Gamma stage, after the ordinary Ritz workspace is dead.
+def real_trim_projection_bytes(*, mesh_xy, parents, rows, side, keep_budget, retained_panels=()):
+    """The second TRIM stage, after the ordinary Ritz workspace is dead.
 
     The source hook retains G/H/O, Y and its action inputs across the first
     reduction. Raw mixed K/L, normalized contractions and the real reduction

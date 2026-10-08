@@ -213,7 +213,7 @@ def assemble_mixed_shared_pole_pencil(finite, infinity, *, matmul, matrix_shardi
 
     ``finite=(s,Q,O,D)`` is already packed by the round owner. This is an
     ordinary bilinear pencil, not a Hermitian one; no block is averaged.
-    Its real-latent interpretation requires separately authenticated Gamma
+    Its real-latent interpretation requires separately authenticated TRIM
     charge time reversal. Generic q and ordered banks do not acquire it.
     """
     s, q, output, derivative = finite

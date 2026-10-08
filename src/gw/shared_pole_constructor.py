@@ -227,22 +227,28 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             eig = budget.eigenplan(n)
         from gw.shared_pole_local import parent_rounds
         # One fixed width per route; a short last round repeats its last real parent.
-        gamma_parents = set()
+        trim_parents = set()
         if (execution == 'face' and not ordered and not charge4 and int(meta.nspinor) == 1
+                and int(meta.nspinor_wfnfile) == 1
                 and bool(bank['tables']['sym'].trs_allowed) and recipe.get('pole_budget') is not None):
-            from symmetry_maps import bgw_integer_q_to_fractional
+            from symmetry_maps import bgw_integer_q_to_fractional, self_negative_q_mask
             qfrac = np.asarray(bgw_integer_q_to_fractional(bank['tables']['sym'].q_irr_kgrid_int,
                 (int(meta.nkx), int(meta.nky), int(meta.nkz))))
             if qfrac.shape != (nq, 3):
-                raise ValueError('GATE shared_pole_real_gamma: typed actual q coordinates differ from bank parents')
-            gamma_parents = set(np.flatnonzero(np.all(qfrac == 0, axis=-1)).tolist())
-        # The new coordinate span belongs to one authenticated Gamma parent;
-        # isolate that face round. Other parent equations remain unchanged.
+                raise ValueError('GATE shared_pole_real_trim: typed actual q coordinates differ from bank parents')
+            full_rows = np.asarray(bank['tables']['q_irr_full_idx'])
+            if full_rows.shape != (nq,):
+                raise ValueError('GATE shared_pole_real_trim: actual canonical parent rows differ from bank')
+            trim_parents = set(np.flatnonzero(self_negative_q_mask(full_rows,
+                kgrid=(int(meta.nkx),int(meta.nky),int(meta.nkz)))).tolist())
+        # In this source's full-Bloch charge chart ordinary conjugation acts
+        # within each self-negative parent (response_bank reciprocity owner).
+        # Generic q belongs to its minus-q partner and remains unchanged.
         width = mesh_xy.size if execution == 'local' else face_batch
-        rounds = (parent_rounds(sorted(gamma_parents), 1)
-                  + parent_rounds([q for q in range(nq) if q not in gamma_parents], width)
-                  if gamma_parents else parent_rounds(nq, width))
-        execution_receipt['real_gamma_parents'] = sorted(gamma_parents)
+        rounds = (parent_rounds(sorted(trim_parents), 1)
+                  + parent_rounds([q for q in range(nq) if q not in trim_parents], width)
+                  if trim_parents else parent_rounds(nq, width))
+        execution_receipt['real_trim_parents'] = sorted(trim_parents)
         batch_spec = P(("x", "y"))
         read_spec = batch_spec if execution == 'local' else None
         kernels = _round_kernels(mesh_xy, 'batch' if execution == 'local' else 'face')
@@ -309,24 +315,25 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 column_extent=column_extent, ordered=ordered, odd_moments=odd_moments,
                 key=("scalar", logical_n, ordered, odd_moments), history=carrier_history(meta))
             side = int(tables["active"].shape[-1])
-            real_gamma = real == 1 and ids[0] in gamma_parents
+            real_trim = real == 1 and ids[0] in trim_parents
             if execution == 'face':
-                # The isolated Gamma round has one parent at this actual
-                # side. Ordinary rounds keep their admitted batch price.
-                budget.program_bytes = (face_reduction_bytes(mesh_xy, len(ids), rows=n, side=side,
-                    carrier=sizing['carrier']) if real_gamma else
-                    execution_receipt['face_batch']['program_bytes_per_rank'])
+                # The selected side and this round's actual parent count
+                # are now known, so price their public executable geometry.
+                budget.program_bytes = face_reduction_bytes(mesh_xy, len(ids), rows=n, side=side,
+                    carrier=sizing['carrier'])
             # Resolve before either reduction program is traced; the ledger
             # warns when the route price is over the budget.
             local_eigh = budget.eigenplan(side)
             reduction_row = budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
                 round_states, infinity, widths, infinity_width))
-            if real_gamma:
+            if execution == 'face' and reduction_row['device_budget_status'] != 'PASS':
+                raise MemoryError('Actual face reduction exceeds explicit full-mesh device capacity')
+            if real_trim:
                 import distrib_la
                 from gw.shared_pole_execution import face_eigh
-                from gw.shared_pole_capacity import real_gamma_projection_bytes
+                from gw.shared_pole_capacity import real_trim_projection_bytes
                 if reduction_row['device_budget_status'] != 'PASS':
-                    raise MemoryError('First ordinary Gamma reduction exceeds explicit full-mesh device capacity')
+                    raise MemoryError('First ordinary TRIM reduction exceeds explicit full-mesh device capacity')
                 span = min(int(recipe['pole_budget']), side)
                 aug = 2 * span
                 real_plan = face_eigh(mesh_xy, aug, room=0)
@@ -334,14 +341,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # These are successive stages of the same source program.
                 # The new stage retains the original matrices/Y/actions;
                 # first-reducer workspace is dead before mixed K/L assembly.
-                gamma_terms = real_gamma_projection_bytes(mesh_xy=mesh_xy, parents=len(ids), rows=n,
+                trim_terms = real_trim_projection_bytes(mesh_xy=mesh_xy, parents=len(ids), rows=n,
                     side=side, keep_budget=recipe['pole_budget'], retained_panels=budget.retained_panels)
-                gamma_price = ledger.reserve('constructor.gamma-real-projection',
-                    resident_bytes_per_rank=gamma_terms['resident_bytes_per_rank'],
+                trim_price = ledger.reserve('constructor.trim-real-projection',
+                    resident_bytes_per_rank=trim_terms['resident_bytes_per_rank'],
                     workspace_bytes_per_rank=int(workspace), concurrent_with=upstream)
-                gamma_price['staged_terms'] = gamma_terms
-                if gamma_price['device_budget_status'] != 'PASS':
-                    raise MemoryError('Gamma real projection exceeds explicit full-mesh device capacity')
+                trim_price['staged_terms'] = trim_terms
+                if trim_price['device_budget_status'] != 'PASS':
+                    raise MemoryError('TRIM real projection exceeds explicit full-mesh device capacity')
             round_states, infinity = pad_states(round_states, widths, infinity, infinity_width)
         with phase("gram_reduction"):
             if execution == 'face':
@@ -358,7 +365,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     round_states, infinity, tables, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
                     keep_budget=keep_budget, admit=False, room=room,
-                    carrier=sizing['carrier'], real_gamma=real_gamma)
+                    carrier=sizing['carrier'], real_trim=real_trim)
             else:
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
@@ -368,7 +375,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             del round_states, infinity
             host_diagnostics = jax.tree.map(np.asarray, round_diagnostics)
             real_method = None
-            if real_gamma:
+            if real_trim:
                 round_reduction, round_zero, round_retained, real_method, round_permutation = host_diagnostics
             else:
                 round_reduction, round_zero, round_retained, round_permutation = host_diagnostics
@@ -392,9 +399,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 if real_method is not None:
                     for name in ("gram_diagonal_positive", "gram_valid", "retained_metric_positive"):
                         if not real_method['reduction'][name][slot]:
-                            raise ValueError(f"GATE shared_pole_real_gamma_{name}: failed at q={q}; unchanged Gram/metric gate")
+                            raise ValueError(f"GATE shared_pole_real_trim_{name}: failed at q={q}; unchanged Gram/metric gate")
                     if not real_method['zero']['zero_policy'][slot]:
-                        raise ValueError(f"GATE shared_pole_real_gamma_zero: failed at q={q}; unchanged dropped-weight budget")
+                        raise ValueError(f"GATE shared_pole_real_trim_zero: failed at q={q}; unchanged dropped-weight budget")
                     if not all(value[slot] <= gates['retained_subspace_moments']['threshold']
                                for value in real_method['first_retained'].values()):
                         raise ValueError(f"GATE shared_pole_first_retained_moments: failed at q={q}; first compression unchanged")
@@ -493,16 +500,22 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     charge4=charge4)
                 receipt.update(identity=identity, constructor=row)
                 if real_method is not None:
-                    receipt['real_gamma_projection'] = dict(
+                    receipt['real_trim_projection'] = dict(
                         method='phase-balanced real Galerkin input columns', original_pencil_side=side,
                         augmented_side=2*min(int(recipe['pole_budget']), side), keep_budget=int(recipe['pole_budget']),
-                        q_fractional=[0.,0.,0.], coordinate_scope='new real input columns; no original-pencil Y returned',
+                        q_parent=int(q), q_full=int(bank['tables']['q_irr_full_idx'][q]),
+                        q_fractional=qfrac[q].tolist(),
+                        eligibility=dict(route='face',nspinor=int(meta.nspinor),nspinor_wfnfile=int(meta.nspinor_wfnfile),
+                            trs_allowed=bool(bank['tables']['sym'].trs_allowed),ordered=ordered,charge4=charge4,
+                            predicate='public self_negative_q_mask on authenticated full-parent rows',
+                            chart='source full-Bloch charge; G maps to -G-2q at TRIM'),
+                        coordinate_scope='new real input columns; no original-pencil Y returned',
                         moment_scope='fresh original Qi anchor projection into new final Ritz span; first compression preserved separately',
                         first_retained={k:v[slot:slot+1].tolist() for k,v in real_method['first_retained'].items()},
                         reduction={k:v[slot:slot+1].tolist() for k,v in real_method['reduction'].items()},
                         zero={k:v[slot:slot+1].tolist() for k,v in real_method['zero'].items()},
                         fresh_retained={k:v[slot:slot+1].tolist() for k,v in real_method['fresh_retained'].items()},
-                        capacity=gamma_price)
+                        capacity=trim_price)
                 receipts[q] = receipt
             receipt_entry_start = len(ledger.entries)
         with phase("export_prepare"):

@@ -345,7 +345,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     of at least ``keep_budget`` that tiles the mesh. The second cut acts on
     the eigenvalues of S relative to max(top(S), 1), the top of diag(S, I)
     (the kept v directions stay), and Y = L^-H on the kept
-    span is P diag(U_S Gamma_S^-1/2, I) with P = [[I, 0], [-B^H, I]], corrected
+    span is P diag(U_S TRIM_S^-1/2, I) with P = [[I, 0], [-B^H, I]], corrected
     by Newton–Schulz against the computed H_r.
 
     Returns (b [b,n,R], poles2 [b,R], active [b,R]), the signed model
@@ -601,7 +601,7 @@ def output_stage(stage, mu, rotation, *, matmul, gates, retain_span=False, matri
 
 
 def real_galerkin_pencil(pencil, mixed, coefficients, original_active, *, matmul, matrix_sharding=None):
-    """Phase-balanced real input columns from an authenticated Gamma Ritz span.
+    """Phase-balanced real input columns from an authenticated TRIM Ritz span.
 
     Coefficients contain ONLY final active columns of the first compression,
     in matching model order. G/H/K/L retain the original packed input order.
@@ -635,7 +635,7 @@ def real_galerkin_pencil(pencil, mixed, coefficients, original_active, *, matmul
 
 
 def reduce_real_galerkin_pencil(pencil, original_qi, *, eigh, matmul, gates, keep_budget, matrix_sharding=None, active_columns=None):
-    """Reduce real Gamma columns and check the original physical infinity anchors.
+    """Reduce real TRIM columns and check the original physical infinity anchors.
 
     Original x_inf=B0.T Q_inf; with real O=B0 X_real, their cross Gram is
     O.T Q_inf. E=Y Y.H (O.T Q_inf) represents their projection into the NEW

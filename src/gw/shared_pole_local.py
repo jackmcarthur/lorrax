@@ -332,7 +332,7 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
                         gates, ordered, odd_moments, keep_budget, retain_span=False, matrix_sharding=None,
-                        gram_keep=None, carrier=None, real_gamma=False, real_eigh=None):
+                        gram_keep=None, carrier=None, real_trim=False, real_eigh=None):
     """One equation owner for local and whole-mesh parent execution.
 
     Inputs carry one or more independent parents. Execution adapters supply
@@ -373,9 +373,9 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
         retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
                                             matmul=matmul)
         signed = ()
-    if real_gamma:
+    if real_trim:
         if ordered or retain_span or keep_budget is None or real_eigh is None:
-            raise ValueError("GATE shared_pole_real_gamma: requires even bounded-cap Gamma and its real all-mesh plan; augmented coordinates are not an original-pencil Y")
+            raise ValueError("GATE shared_pole_real_trim: requires even bounded-cap TRIM and its real all-mesh plan; augmented coordinates are not an original-pencil Y")
         from gw.shared_pole_gates import sort_shared_pole_columns
         from gw.shared_pole_pencil import assemble_mixed_shared_pole_pencil, _matrix_take_columns
         from gw.shared_pole_reduction import real_galerkin_pencil, reduce_real_galerkin_pencil
