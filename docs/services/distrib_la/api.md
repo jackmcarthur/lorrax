@@ -178,8 +178,8 @@ non-orthogonal eigenpairs. They are a projection, so one eigenvalue wrong by
 errors, which a stable solver keeps near n·eps whatever the condition number.
 `services/distrib_la/bench/eigh_zero_block_check.py` and
 `eigh_conformance_check.py` (n/p ∈ {216, 257, 389, 1144, 4576}, P4 and P16)
-are the regression checks. The cuSOLVERMp handlers do not yet read `info`;
-that is a native fix for the next bundle.
+are the regression checks. The cuSOLVERMp eigh handler zeroes and reads
+`info` around every solve (bundle B11), so a STEDC failure reaches the check.
 
 **Donation is declared per operation** (`DONATES`), because a caller must know
 whether its buffers survive before it knows which library runs: `eigh` donates
@@ -311,6 +311,15 @@ a `StackRoute`):
   9.4 GB and n = 18304 needs 37.6 GB. The traced chain about doubles it.
 - There are no sub-meshes or rank groups: whole mesh or whole matrices per
   rank. `_route=` on `batched` is the test-only override.
+- **A caller may decide the route itself, from the shapes.**
+  `eigh_stack_bytes(plan, shape, dtype)` is what a batched eigh of a face
+  stack adds per rank beside its operand: on route (c) `BATCH_EIGH_TILES`
+  (8) n² elements per whole matrix a rank holds (compiled size plus the
+  vendor query, B11: 7.96–7.98 at P64, 7.9–8.0 at P4); on the whole mesh the
+  vectors stack, the values and one solve's workspace. The bispinor sector
+  constructor prices each stack so and passes an explicit route-(c) or
+  whole-mesh plan (`gw.shared_pole_execution.staged_eigh`): no room, no
+  sizing compile and no exchange.
 - **`checked_program(fn, mesh, out_shardings)`** jits a caller's program
   over checked solves in two phases: the first holds every solve's first
   attempt and returns their mesh-reduced failure flag; a failed first attempt

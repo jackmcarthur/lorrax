@@ -117,7 +117,7 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
 #   transpose, 5.1 vs 1.5 ms per node at P16, ~7% of a node (2958).
 def synthesize_shared_pole_parents(
     b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy, gemm, layout="face",
-    weights_fn=_shared_pole_weights, active_range=False, same_factor=True, right_formed=False,
+    weights_fn=_shared_pole_weights, active_range=False, same_factor=True,
 ):
     """Synthesize both raw-parent orientations through the configured G service.
 
@@ -155,10 +155,6 @@ def synthesize_shared_pole_parents(
     active_range : bool
         ``gemm`` was planned with ``enable_active_range=True``: contract only
         each parent's ``intervals`` columns, each scaled by its weight.
-    right_formed : bool
-        ``layout='axis'``: ``b_Y`` is already the GEMM's right operand
-        (:func:`shared_pole_right_operand`, formed once per Σ call), not the
-        factor, so no τ node transposes or conjugates it.
 
     Returns
     -------
@@ -179,14 +175,14 @@ def synthesize_shared_pole_parents(
                                            n_parent=n_parent, right=b_Y,
                                            partner=not same_factor)
     else:
-        if b_X.ndim != 4 or b_Y.ndim != (3 if right_formed else 4):
+        if b_X.ndim != 4 or b_Y.ndim != 4:
             raise ValueError("shared-pole faces require [parent,mu,spin,column]")
-        if b_X.shape[2] not in (1, 3) or (not right_formed and b_Y.shape[2] not in (1, 3)):
+        if b_X.shape[2] not in (1, 3) or b_Y.shape[2] not in (1, 3):
             raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
         weights = weights_fn(poles2, intervals, E_ref_B, t_node)
         plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
                                      intervals=intervals if active_range else None,
-                                     partner=not same_factor, right_formed=right_formed)
+                                     partner=not same_factor)
     if not same_factor:
         return plus
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
@@ -204,18 +200,8 @@ def _shared_pole_factor_specs(layout):
             (P(None, "x", None, None), P(None, "y", None, None)))
 
 
-def shared_pole_right_operand(b_Y):
-    """The axis route's right GEMM operand ``conj(b_Y)ᵀ``, merged ``(q, K, ν·c)``, from the
-    factor ``[q, ν, c, K]`` (``P(None, 'y', None, None)``): τ-invariant, so a caller forms it
-    once per Σ call (``gw.mpa.sector_sigma.sector_synthesis``) and passes it with
-    ``right_formed=True``."""
-    from gw.greens_function_kernel import green_right_operand
-    y = b_Y.reshape(b_Y.shape[0], b_Y.shape[1] * b_Y.shape[2], 1, b_Y.shape[3])
-    return green_right_operand(jnp.transpose(y, (0, 3, 2, 1)))
-
-
 def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=None,
-                          partner=False, right_formed=False):
+                          partner=False):
     """W(τ) = b d b† through G's configured face or axis contraction.
 
     Factors [q,mu,spin,K] use G's face placement under ``layout='face'``;
@@ -241,16 +227,8 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=N
     # Merge them with their own centroid axis before entering build_G;
     # CT then has different row extents but the same unit spin axis.
     b_X = b_X.reshape(b_X.shape[0], b_X.shape[1] * b_X.shape[2], 1, b_X.shape[3])
-    band_range = None if intervals is None else (intervals[:, 0], intervals[:, 1])
-    if right_formed:
-        # b_Y is conj(b_Y)ᵀ already (shared_pole_right_operand); the partner
-        # conj(b_X) d b_Yᵀ = conj(b_X conj(d) b_Y†) reads the same operands.
-        x = jnp.transpose(b_X, (0, 2, 1, 3))
-        build = lambda w: _build_G_face(x, None, gemm=gemm, phases=w, band_range=band_range,
-                                        right=b_Y)[:, :, 0, :, 0]
-        value = build(weights)
-        return (value, jnp.conj(build(jnp.conj(weights)))) if partner else value
     b_Y = b_Y.reshape(b_Y.shape[0], b_Y.shape[1] * b_Y.shape[2], 1, b_Y.shape[3])
+    band_range = None if intervals is None else (intervals[:, 0], intervals[:, 1])
 
     def operands(conj):
         x, y = (jnp.conj(b_X), jnp.conj(b_Y)) if conj else (b_X, b_Y)

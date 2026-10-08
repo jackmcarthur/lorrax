@@ -1,15 +1,12 @@
 """Shared-pole route and resume guards on toy inputs (CPU only, seconds).
 
-1. The relaxed accuracy tier (no pole budget) sizes the bispinor sector face
-   batch with no Ritz carrier instead of crashing on ``int(None)``.
-2. A complete bank built against another bare-V digest (another P, older code)
+1. A complete bank built against another bare-V digest (another P, older code)
    is not resumable: the map rebuilds instead of refusing.
-3. The pole-budget keep cut never splits a degenerate multiplet at its edge:
+2. The pole-budget keep cut never splits a degenerate multiplet at its edge:
    the tied member leaves with its partner, so K <= budget and the kept span
    does not depend on the eigenbasis inside the multiplet.
-4. A local CT round whose actual spans do not fit is handed back (None) for
-   the face rerun instead of running one whole parent per rank over budget;
-   the rerun takes the round's real parents, never its padded slots.
+3. A local CT round runs at its held spans whatever its price (warn, never
+   refuse: the route was decided from the recipe shapes, and there is no rerun).
 """
 import json
 from types import SimpleNamespace
@@ -19,35 +16,6 @@ import jax.numpy as jnp
 import numpy as np
 
 jax.config.update("jax_enable_x64", True)
-
-
-def test_relaxed_sector_face_batch_has_no_carrier(monkeypatch):
-    import file_io  # noqa: F401  (service path bootstrap)
-    import gw.shared_pole_execution as ex
-    from jax.sharding import Mesh
-    from gw.shared_pole_sectors import sector_recipe
-
-    carriers = []
-
-    def reduction_bytes(mesh, width, *, carrier, **shape):
-        carriers.append(carrier)
-        return 0
-    # The face batch search calls program_bytes once at its first width.
-    monkeypatch.setattr(ex, "face_batch_width",
-                        lambda *a, program_bytes, **k: (1, dict(compiled=program_bytes(1))))
-    monkeypatch.setattr(ex, "face_reduction_bytes", reduction_bytes)
-    monkeypatch.setattr(ex, "face_cross_bytes", lambda *a, **k: 0)
-    monkeypatch.setattr(ex, "line_panel_count", lambda recipe: 1)
-    mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
-    for tier, carried in (("production", True), ("relaxed", False)):
-        carriers.clear()
-        rows = [dict(packed_extent=n, conservative_pencil_side=4 * n, signed_side_bound=2 * n,
-                     line_width=2, infinity_width=2,
-                     pole_budget=sector_recipe({"accuracy": tier}, n)["pole_budget"]) for n in (8, 24)]
-        ex.sector_batch_width(SimpleNamespace(n_rmu_padded=8), None, {"fit_ids": [0, 1, 2]}, rows,
-                              mesh=mesh, ledger=SimpleNamespace(live_stages=()), nq=1)
-        assert len(carriers) == 2
-        assert all((carrier is not None) == carried for carrier in carriers)
 
 
 def test_constructor_resume_rebuilds_a_bank_of_another_bare_v(tmp_path, monkeypatch):
@@ -81,7 +49,7 @@ def test_budget_cut_never_splits_the_edge_multiplet():
     assert kept([1.0] * 4, 2) == [1.0, 1.0]                  # no edge in one tied run: index cut
 
 
-def test_local_ct_over_budget_takes_the_face_fallback(monkeypatch):
+def test_local_ct_over_budget_still_runs(monkeypatch):
     import file_io  # noqa: F401  (service path bootstrap)
     import gw.gw_config as cfg
     import gw.shared_pole_capacity as cap
@@ -123,19 +91,11 @@ def test_local_ct_over_budget_takes_the_face_fallback(monkeypatch):
     panels = dict(Wc=None, dWc_ds=None)
     args = ((sector, sector), (panels, panels), {f"M{i}": None for i in range(4)}, meta, config)
     kwargs = dict(mesh_xy=None, sample_ids=(), line_cross=({}, {}), real=1)
-    assert sectors.construct_cross_sector_round(*args, **kwargs) is None
-    Capacity.status = "PASS"
-    try:
-        sectors.construct_cross_sector_round(*args, **kwargs)
-    except Ran:
-        pass
-    else:
-        raise AssertionError("a local CT round that fits did not run")
-    # The rerun takes the round's real parents only, never its padded slots,
-    # in fixed-width face rounds (parent_rounds): a short last round repeats
-    # its last real parent.
-    rounds = sectors.face_rerun_rounds([12, 12, 12, 12], 1, 4)
-    assert [(r[0], r[1], r[3]) for r in rounds] == [([12, 12, 12, 12], 1, "face")]
-    rounds = sectors.face_rerun_rounds([4, 5, 6, 7], 4, 3)
-    assert [(r[0], r[1]) for r in rounds] == [([4, 5, 6], 3), ([7, 7, 7], 1)]
-
+    for status in ("FAIL", "PASS"):
+        Capacity.status = status
+        try:
+            sectors.construct_cross_sector_round(*args, **kwargs)
+        except Ran:
+            pass
+        else:
+            raise AssertionError(f"a local CT round priced {status} did not run")

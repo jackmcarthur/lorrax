@@ -111,7 +111,7 @@ from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
                                hermitian_part, join_columns, on_face)
 from distrib_la.subspace import plan_orthogonalization, plan_subspace
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
-from distrib_la.workspace import fits_local, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
+from distrib_la.workspace import eigh_stack_bytes, fits_local, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
 from distrib_la.dispatch import dispatch_batched_eigh
 from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
@@ -171,7 +171,7 @@ __all__ = [
     # plan
     "Plan", "plan", "StackRoute", "SIZING_FAILED", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes",
     # native dense workspace queries (no allocation)
-    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local",
+    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local", "eigh_stack_bytes",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
     "right_singular_vectors", "leading_eigenvectors",

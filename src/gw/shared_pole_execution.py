@@ -234,23 +234,14 @@ def route_summary(mode, receipt):
     budget = next((row['device_budget_bytes_per_rank'] for row in
                    (receipt.get("local_selection"), receipt.get("local_reduction")) if row), None)
     price = "" if budget is None else f"; local parent GB/rank: {rows} of {budget / 1e9:.1f}"
+    staged = receipt.get("staged")
+    if staged is not None:
+        price += (f"; staged: rounds of {staged['parents']}, side {staged['side']}, "
+                  + (f"selection tiles of {staged['selection']}, " if 'selection' in staged else "")
+                  + f"stages of {staged['stage']}, eighs " + "/".join(staged['eigh_routes'])
+                  + f", stacks {staged['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank"
+                  + (f", max |ZAZ-I|/sqrt(R) {staged['keep_residual']:.1e}" if 'keep_residual' in staged else ""))
     batch = receipt.get("face_batch")
-    decoupled = receipt.get("decoupled")
-    if decoupled is not None:
-        price += (f"; decoupled: {decoupled['parents']} parents in sub-batches of {decoupled['sub_batch']}, "
-                  f"stages of {decoupled.get('stage_batch', decoupled['sub_batch'])}, "
-                  f"stacks {decoupled['stacks_bytes_per_rank'] / 1e9:.1f} GB/rank, eigh rooms "
-                  + "/".join("none" if r is None else f"{r / 1e9:.1f}" for r in decoupled['eigh_room_bytes_per_rank'])
-                  + " GB/rank, "
-                  + ("every eigh once over the stack" if decoupled['admitted']
-                     else "stacks over budget: face rounds over the stacked panels")
-                  + f", max |ZAZ-I|/sqrt(R) {decoupled['keep_residual']:.1e}"
-                  + (f" / {decoupled['paired_residual']:.1e}" if 'paired_residual' in decoupled else "")
-                  + f" ({decoupled['paired_iterations']} Newton-Schulz iteration(s))")
-    refused = receipt.get("decoupled_refused")
-    if refused is not None:
-        price += (f"; CT in rounds: the decoupled stacks {'fit' if refused['stacks_fit'] else 'do not fit'}, "
-                  f"eigh routes {'/'.join(refused['eigh_routes'])} (route (c) is batch_reshard)")
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
@@ -332,12 +323,9 @@ def face_matmul(mesh):
     2-D SUMMA of the Green builder (one all_gather per operand per panel for the whole
     stack, a panel prefetched, transposed operands by one grid-transpose exchange), so
     a face program holds no distributed-library GEMM and runs on any backend. The
-    panel holds ``p * FACE_PANEL_DEPTH`` contraction columns. A non-square mesh keeps
-    the provider product (the slow fallback)."""
-    from distrib_la import matmul, panel_matmul
+    panel holds ``p * FACE_PANEL_DEPTH`` contraction columns (the mesh is square)."""
+    from distrib_la import panel_matmul
     p = int(mesh.shape['x'])
-    if p != int(mesh.shape['y']):
-        return partial(matmul, mesh=mesh, backend='distributed', batched_route='auto')
 
     def product(a, b, *, transa='N', transb='N'):
         q = int(a.shape[0])
@@ -467,24 +455,6 @@ def face_round_check_program(mesh, ordered, eigh_plan):
                         mesh, outputs='scalars')
 
 
-def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_width=1):
-    """Schedule local parent rounds or bounded batches on the whole mesh.
-
-    One schedule for both routes (``parent_rounds``): every round has one
-    width, P local slots or ``batch_width`` face parents, and a short last
-    round repeats its last real parent, so no round program compiles for a
-    ragged tail (CrI3 24x24: 61 parents at width 3 recompiled every CC, TT
-    and CT program for the width-1 tail, about 120 s cold per leg)."""
-    from gw.shared_pole_local import parent_rounds
-    from gw.gw_config import linalg_resolution
-    resolution=linalg_resolution({'linalg':config.backend.linalg})
-    execution = resolution.layout if execution is None else execution
-    if execution not in ('local', 'distributed', 'face'):
-        raise ValueError('unsupported resolved constructor linalg layout')
-    label, width = ('local', mesh.size) if execution == 'local' else ('face', batch_width)
-    return [(*row, label) for row in parent_rounds(header['n_q_irr'], width)]
-
-
 #: A face program holds each dense operand twice at its peak: the tile the
 #: byte model counts ([w, r/Px, r/Py] per rank) and the collective's staged
 #: copy of it, in the layout the exchange needs. The optimized HLO of the face
@@ -529,9 +499,10 @@ def face_reduction_bytes(mesh, width, *, rows, side, carrier, retain_span=False)
 
 
 def face_cross_bytes(mesh, width, rows, sides, spans):
-    """Price of ``cross_parent_program`` for ``width`` parents: the C-by-T pencil at the
-    sectors' ``sides`` projected on their retained ``spans`` (the joint side is their
-    sum) on the joint basis of ``rows``."""
+    """Price of a CT face program for ``width`` parents, the whole joint reduction (an upper
+    bound of the staged pencil and stage programs): the C-by-T pencil at the sectors'
+    ``sides`` projected on their retained ``spans`` (the joint side is their sum) on the
+    joint basis of ``rows``."""
     return _face_price(mesh, rows, width, sum(map(int, spans)), 'cross_reduction',
                        cross_original_sides=tuple(int(s) for s in sides))
 
@@ -586,67 +557,6 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
                            // reduction['aggregate_bytes_per_rank']))
 
 
-def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
-    """The common CC/TT/CT face batch, before reading any sample matrix (``face_batch_width``).
-
-    The joint extent covers both retained diagonal spans and the rectangular
-    cross pencil; the dense CT/TC stacks (W and dW/ds at the dense fitted
-    samples), the moments and the cross panels that the caller still holds
-    during the cross reduction are priced beside it. A width is admitted by
-    the largest price of the round's three programs at the conservative
-    shapes, CC's and TT's ``face_parent_program`` and CT's
-    ``cross_parent_program`` (``sector_program_bytes_per_rank``,
-    ``face_reduction_bytes`` and ``face_cross_bytes``). Sizing at the sides
-    held after map 0 was measured and declined (CrI3 24x24 P64: batch 3 -> 5,
-    a round's cost scales with its parents, -9 % per parent at best).
-    """
-    import copy
-
-    joint = copy.copy(meta)
-    joint.n_rmu_padded = sum(row['packed_extent'] for row in routes)
-    side = sum(row['conservative_pencil_side'] for row in routes)
-    # CT diagonalizes the retained joint span, never the unreduced
-    # rectangular C/T pencil. Diagonal sectors still solve their own side.
-    spans = [min(row['signed_side_bound'], row['conservative_pencil_side']) for row in routes]
-    eigen_side = max(max(row['conservative_pencil_side'] for row in routes), sum(spans))
-    lines = line_panel_count(recipe)
-    dense = len(recipe['fit_ids']) - lines
-    # Each family's cross panels: 8 [rows of the other family, line width]
-    # blocks per line sample (the four ordered states, output and action).
-    charge, current = routes
-    cross = lines * 8 * (current['packed_extent'] * charge['line_width']
-                         + charge['packed_extent'] * current['line_width'])
-    sizes = {}
-
-    def program_bytes(width):
-        for name, row in zip(('CC', 'TT'), routes):
-            sizes[name] = face_reduction_bytes(mesh, width, rows=row['packed_extent'],
-                                               side=row['conservative_pencil_side'],
-                                               carrier=face_ritz_carrier(mesh, row['pole_budget']), retain_span=True)
-        sizes['CT'] = face_cross_bytes(mesh, width, joint.n_rmu_padded,
-                                       [row['conservative_pencil_side'] for row in routes], spans)
-        return max(sizes.values())
-    width, receipt = face_batch_width(
-        joint, resolution, mesh=mesh, ledger=ledger, upstream=ledger.live_stages, side=side, nq=nq,
-        program_bytes=program_bytes, eigen_side=eigen_side,
-        extra=lambda width: int(np.ceil(16 * width * ((4 * dense + 8) * joint.n_rmu_padded**2 + cross)
-                                        / mesh.size)))
-    return width, dict(receipt, sector_program_bytes_per_rank=sizes)
-
-
-@lru_cache(maxsize=None)
-def cross_parent_program(mesh, eigh_plan):
-    """The CT joint reduction on the whole mesh, keyed on its eigh plan (``face_eigh``)."""
-    from gw.shared_pole_sectors import _cross_reduce_equations
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    # The joint CT metric carries exact-zero rows (inactive retained columns,
-    # held span widths); the service eigh deflates them and checks its result.
-    eigh = eigh_plan.batched
-    return face_program(partial(_cross_reduce_equations,mm=face_matmul(mesh),eigh=eigh,gates=gates,
-                                matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),
-                        mesh,outputs='cross')
-
-
 @lru_cache(maxsize=None)
 def cross_action_program(mesh,mirror,imaginary,conjugate):
     from gw.shared_pole_sectors import _cross_products
@@ -675,16 +585,16 @@ def compact_program(mesh,width):
         matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),mesh,outputs='compact')
 
 
-# ---- the decoupled face route: every parent in flight, stage programs over sub-batches ----
+# ---- the staged face route: a round of parents in flight, stage programs over sub-batches ----
 #
 # The paired reduction is GEMM stages with an eigh between them
-# (``shared_pole_reduction``). A face round of w parents runs them as one
-# program, so its eigh stacks hold w matrices and the round count sets the
-# eigh wall: 21 rounds of 3 at CrI3 24x24 P64 cost 21 serial local eighs
-# (SECTFAST). Here each GEMM stage runs as its own program over sub-batches
-# of ``width`` parents, its outputs stacked for every parent, and each eigh
-# runs once over the whole stack, one matrix per rank (route (c), flat to
-# b = P). Nothing between stages is held that the next stage does not read.
+# (``shared_pole_reduction``). A face round of w parents run as one program
+# holds eigh stacks of w matrices, so the round count sets the eigh wall: 21
+# rounds of 3 at CrI3 24x24 P64 cost 21 serial local eighs (SECTFAST). Here
+# each GEMM stage runs as its own program over sub-batches of ``width``
+# parents, its outputs stacked for the round's R = min(nq, P) parents, and each
+# eigh runs once over the round's stack, one matrix per rank on route (c).
+# Nothing between stages is held that the next stage does not read.
 # The metric corrections stay Newton-Schulz inside their stage: the paired metric
 # Y^H H_r Y is the identity to ~1e-8 by construction, so its bound asks one
 # iteration (CrI3 6x6), cheaper than a further eigh of the stack (P64 TT: one
@@ -761,19 +671,66 @@ def _hermitian_stack(mesh):
     return jax.jit(hermitian_part, out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))
 
 
-def _take(mesh, tree, i0, i1):
-    return parent_rows(mesh, tree, np.arange(i0, i1))
+@lru_cache(maxsize=None)
+def _mesh_eigh(mesh, n):
+    import distrib_la
+    return distrib_la.plan('eigh', mesh, n=int(n), backend='distributed', batched_route='auto')
+
+
+def staged_eigh(mesh, stack, beside, *, ledger, live, label):
+    """The plan of one staged eigh stack ``stack`` (nb, n, n): route (c), whole matrices per rank,
+    when its shape price (``distrib_la.eigh_stack_bytes``) beside ``beside`` bytes per rank and
+    the ``live`` ledger stages fits the budget; otherwise the whole mesh, with one warning.
+    Shapes and the deck budget only, so every rank decides alike."""
+    import distrib_la
+    from gw.shared_pole_capacity import _local_eigenplan
+    n = int(stack[-1])
+    local = _local_eigenplan(mesh, n)
+    need = int(beside) + distrib_la.eigh_stack_bytes(local, stack, np.complex128)
+    row = ledger.preview(resident_bytes_per_rank=need, workspace_bytes_per_rank=0, concurrent_with=live)
+    if row['device_budget_status'] == 'PASS':
+        return local
+    import warnings
+    warnings.warn(f"shared-pole {label}: the {int(stack[0])} x {n}^2 eigh stack needs "
+                  f"{row['aggregate_bytes_per_rank'] / 1e9:.1f} GB/rank on route (c), over the "
+                  f"{row['available_device_bytes_per_rank'] / 1e9:.1f} GB budget; it runs on the "
+                  f"whole mesh (slow)", RuntimeWarning, stacklevel=2)
+    return _mesh_eigh(mesh, n)
+
+
+def stage_width(ledger, resident, program, width, *, live):
+    """The widest of ``width``, ceil(width/2), ... whose stage program (``program(w)`` bytes per
+    rank, priced from the shapes) fits beside ``resident`` and the ``live`` stages; at least 1.
+    The stage programs batch their parents' face GEMMs, so a wider stage runs the SUMMA panels
+    at a higher fraction of peak; the width moves no number."""
+    w = int(width)
+    while w > 1 and ledger.preview(resident_bytes_per_rank=int(resident) + int(program(w)),
+                                   workspace_bytes_per_rank=0,
+                                   concurrent_with=live)['device_budget_status'] != 'PASS':
+        w = -(-w // 2)
+    return w
+
+
+def _run_stages(mesh, nq, width, program, *stacks):
+    """``program`` over every ``width`` parents of the stacks, its outputs written into one stack
+    for every parent; a short last cut repeats its last parent, so one shape compiles."""
+    def parts():
+        for i0 in range(0, int(nq), int(width)):
+            real = min(int(width), int(nq) - i0)
+            part = program(*parent_rows(mesh, stacks, np.minimum(np.arange(i0, i0 + int(width)), int(nq) - 1)))
+            yield i0, part if real == int(width) else parent_rows(mesh, part, np.arange(real))
+    return _assemble(mesh, nq, parts())
 
 
 @lru_cache(maxsize=None)
 def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_keep, carrier):
-    """The four stage programs of the decoupled face reduction, each jitted on the face."""
+    """The four stage programs of the staged face reduction, each jitted on the face."""
     from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, _matrix_take_columns
     from gw.shared_pole_reduction import paired_members, keep_stage, paired_stage, output_stage
     from gw.shared_pole_gates import sort_shared_pole_columns, apply_shared_pole_zero_policy, ordered_moment_identity
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     if not (ordered and odd_moments):
-        raise ValueError('the decoupled face route is the ordered sector reduction')
+        raise ValueError('the staged face route is the ordered sector reduction')
     mm = face_matmul(mesh)
     ms = NamedSharding(mesh, P(None, 'x', 'y'))
 
@@ -827,122 +784,24 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
                  for i, fn in enumerate((stage1, stage2, stage3, stage4))), passthrough
 
 
-def decoupled_width(ledger, resident, per_parent, width, *, concurrent_with):
-    """The largest stage width w <= ``width`` (the face batch) whose program, ``per_parent`` bytes
-    per parent (the face programs' price is linear in w), fits beside ``resident`` on the live set;
-    at least 1. CrI3 24x24 P64 at a face batch of 10: TT 4, CC 10."""
-    row = ledger.preview(resident_bytes_per_rank=int(resident), workspace_bytes_per_rank=0,
-                         concurrent_with=concurrent_with)
-    room = row['available_device_bytes_per_rank'] - row['aggregate_bytes_per_rank']
-    return int(max(1, min(int(width), room // max(1, int(per_parent)))))
-
-
-def decoupled_stage_bytes(*, nq, ranks, side, carrier, packed, held, dw_panels, program):
-    """Per-rank bytes of the decoupled reduction of ``nq`` parents (complex128).
-
-    ``side`` is the pencil side (2 hvv), ``carrier`` the kept-span columns c (None: hvv),
-    ``packed`` the rows, ``held`` the (node, Q, O) and infinity panels per rank,
-    ``dw_panels`` the dW Q panels per rank (released after the pencil), ``program`` the
-    stage program's bound at the sub-batch width. A stage's run holds its input stack and
-    the stack it writes in place: the keep stage the paired members and the restricted
-    pencil, the paired stage the restricted pencil and (Y, Y^H G_r Y), the output stage
-    (Y, Y^H G_r Y, O_r, span) and the model and coefficient outputs. Returns
-    ``(resident, boundaries)``: the stacks row and the three eigh stacks' boundaries
-    (H'_vv beside the members and its Hermitian copy, the Schur complement beside the
-    restricted pencil, Y^H G_r Y beside the output stage's input), each with ``held``.
-    """
-    hvv = int(side) // 2
-    c = int(carrier or hvv)
-    two, packed = 2 * c, int(packed)
-    per_rank = lambda b: -(-int(b) * int(nq) // int(ranks))
-    members = 16 * (6 * hvv * hvv + 2 * packed * hvv)
-    restricted = 16 * (2 * two ** 2 + 2 * c * c + hvv * c + packed * two)
-    ritz = 16 * (2 * two ** 2 + hvv * c + packed * two)
-    outputs = 16 * (int(side) * two + 2 * packed * two)
-    stacks = per_rank(max(members + restricted, restricted + 16 * 2 * two ** 2, ritz + outputs))
-    boundaries = tuple(per_rank(b) + int(held) for b in (members + 16 * hvv * hvv, restricted, ritz))
-    return stacks + int(held) + int(dw_panels) + int(program), boundaries
-
-
-def decoupled_cross_bytes(*, nq, ranks, side, rows):
-    """Per-rank bytes of the decoupled CT of ``nq`` parents at joint ``side`` K with output
-    ``rows`` (n_C, n_T): ``(stacks, boundaries)``, the pencil stack (metric, value, O_C, O_T)
-    beside the keep stage's (Y^H V Y, Y), and the two eighs' boundaries (the metric beside the
-    pencil, the Ritz step beside (Y^H V Y, Y, O_C, O_T))."""
-    per_rank = lambda b: -(-int(b) * int(nq) // int(ranks))
-    side, rows = int(side), sum(int(r) for r in rows)
-    pencil, keep = 16 * (2 * side * side + rows * side), 16 * 2 * side * side
-    return per_rank(pencil + keep), (per_rank(pencil), per_rank(keep + 16 * rows * side))
-
-
-def _device_free_bytes():
-    """This process's free device pool bytes (limit minus in use), or None off a pool (CPU)."""
-    stats = jax.local_devices()[0].memory_stats() or {}
-    limit, used = stats.get('bytes_limit'), stats.get('bytes_in_use')
-    return None if limit is None or used is None else int(limit) - int(used)
-
-
-def eigh_program_bytes(plan, stack, *, mesh):
-    """Per-rank bytes the batched eigh of ``stack`` adds beside it, from the service's decision
-    (``stack_route``): route (c)'s program (outputs, temporaries and the local solver's workspace;
-    the operand excluded), or on the whole mesh the vectors stack, the values and one solve's
-    vendor workspace (``distrib_la.workspace_bytes_per_rank``)."""
-    import distrib_la
-    route = plan.stack_route(stack.shape, stack.dtype, traced=False)
-    if route.route == 'batch_reshard' and route.program_bytes:
-        return int(route.program_bytes)
-    nq, n = int(stack.shape[0]), int(stack.shape[-1])
-    outputs = -(-nq * n * n * stack.dtype.itemsize // int(mesh.size)) + nq * n * 8
-    return outputs + int(distrib_la.workspace_bytes_per_rank(plan, 'eigh', ((n, n),), stack.dtype))
-
-
-def guarded_eigh(plan, stack, *, mesh, label):
-    """``plan``'s batched eigh of ``stack``, with a diagnostic on its route-(c) decision.
-
-    Where the ledger admits a stack one whole matrix per rank, the pool's measured free bytes,
-    the minimum over processes, are compared with that program; a shortfall gives one warning
-    naming it. The route never changes on it: a route read from free memory would move results
-    with allocator state (decisions.md, fixed-tile). Honest prices are the protection.
-    """
-    route = plan.stack_route(stack.shape, stack.dtype, traced=False)
-    if route.route == 'batch_reshard' and route.program_bytes:
-        import numpy as np
-        from common.collectives import all_gather_processes
-        free = _device_free_bytes()
-        agreed = int(np.min(all_gather_processes(np.asarray([-1 if free is None else free], np.int64))))
-        if 0 <= agreed < int(route.program_bytes):
-            import warnings
-            warnings.warn(f"shared-pole decoupled {label}: the {int(stack.shape[0])} x {int(stack.shape[-1])}^2 eigh "
-                          f"stack's program needs {route.program_bytes / 1e9:.1f} GB/rank and the pool has "
-                          f"{agreed / 1e9:.1f} GB free on some rank (short by "
-                          f"{(route.program_bytes - agreed) / 1e9:.1f} GB); an out-of-memory is possible",
-                          RuntimeWarning)
-    return plan.batched(stack)
-
-
 def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, ordered, odd_moments,
                           keep_budget, retain_span=False, gram_keep=None, carrier=None, eigh_rows=None):
-    """All ``nq`` parents' ordered reduction: stage programs over ``width`` parents at a
-    time, each eigh over the whole stack. ``eigh_plans`` are the three stacks' plans
-    (H'_vv, Schur, reduced), each carrying the room beside its own boundary stack
-    (``face_eigh``), so distrib_la runs each one whole matrix per rank where that fits.
+    """One round's ordered reduction: stage programs over ``width`` parents at a time, each
+    eigh once over the round's stack. ``eigh_plans`` are the three stacks' plans (H'_vv, Schur,
+    reduced: route (c) or the whole mesh, ``staged_eigh``).
     ``states`` is the caller's list: the derivative panels (dW Q) enter the pencil only,
     so after the first stage each entry keeps (node, Q, O) and they are released before
     the eighs. ``eigh_rows(k, plan, stack)`` (optional) is the caller's context that prices
     eigh stack k (its ledger row) while it runs. Returns what ``face_reduce_round`` returns,
-    for every parent."""
+    for every parent of the round."""
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
     (stage1, stage2, stage3, stage4), passthrough = programs
-    hvv_eigh, schur_eigh, reduced_eigh = (partial(guarded_eigh, plan, mesh=mesh, label=label)
-                                          for plan, label in zip(eigh_plans, ('H_vv', 'Schur', 'reduced')))
-    cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
+    hvv_eigh, schur_eigh, reduced_eigh = (plan.batched for plan in eigh_plans)
     inputs = (tables['points'], tables['order'], tables['active'],
               tuple(s[1] for s in states), tuple(s[2] for s in states), tuple(s[3] for s in states), tuple(infinity))
-
-    def run(program, *stacks):
-        return _assemble(mesh, nq, ((i0, program(*_take(mesh, stacks, i0, i1))) for i0, i1 in cuts))
+    run = partial(_run_stages, mesh, nq, width)
 
     def advance(name, program, stage, *operands):
         new = run(program, stage, *operands)
@@ -979,12 +838,12 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     return (*output, result[3]) if retain_span else output
 
 
-# ---- the decoupled CT: every parent's joint pencil, each eigh once over the stack ----
+# ---- the staged CT: a round's joint pencils, each eigh once over the round's stack ----
 #
-# A CT round assembles the C-by-T pencil from that round's samples, which stay per round;
-# the joint [K, K] pencils (metric, value) and the two output panels are stacked for every
-# parent, and the joint reduction's two eighs (the metric's keep cut, the Ritz step) run once
-# over the stack, its two GEMM stages over sub-batches, as the diagonal sectors do.
+# Each CT sub-batch assembles the C-by-T pencil from its own samples; the joint [K, K]
+# pencils (metric, value) and the two output panels are stacked for the round, and the
+# joint reduction's two eighs (the metric's keep cut, the Ritz step) run once over the
+# stack, its two GEMM stages over sub-batches, as the diagonal sectors do.
 
 
 @lru_cache(maxsize=None)
@@ -1016,29 +875,26 @@ def _cross_stage_programs(mesh):
 
 
 def face_cross_decoupled(pencil, *, mesh, eigh_plans, width, eigh_rows=None):
-    """Every parent's CT joint reduction from the stacked ``pencil`` (metric, value, O_C, O_T),
+    """One round's CT joint reduction from the stacked ``pencil`` (metric, value, O_C, O_T),
     the caller's list: the metric and value members are released (set to None) after the keep stage:
     the keep stage and the output stage over ``width`` parents at a time, the metric's and the
-    Ritz step's eighs once over the stack (``guarded_eigh``). Returns what the round's
+    Ritz step's eighs once over the stack (``staged_eigh`` plans). Returns what the local
     ``reduce_cross_round`` returns, for every parent. ``eigh_rows(k, plan, stack)`` prices eigh k."""
     from contextlib import nullcontext
     from common import timing
     priced = eigh_rows or (lambda k, plan, stack: nullcontext())
     nq = int(pencil[0].shape[0])
     keep, output = _cross_stage_programs(mesh)
-    cuts = [(i, min(i + int(width), nq)) for i in range(0, nq, int(width))]
-
-    def run(program, *stacks):
-        return _assemble(mesh, nq, ((i0, program(*_take(mesh, stacks, i0, i1))) for i0, i1 in cuts))
+    run = partial(_run_stages, mesh, nq, width)
     with timing.section('decoupled.eigh_metric'), priced(0, eigh_plans[0], pencil[0]):
-        gamma, u = guarded_eigh(eigh_plans[0], pencil[0], mesh=mesh, label='CT metric')
+        gamma, u = eigh_plans[0].batched(pencil[0])
     with timing.section('decoupled.keep'):
         stage = run(keep, *pencil, gamma, u)
     del gamma, u
     pencil[0] = pencil[1] = None
     reduced = stage.pop('reduced')
     with timing.section('decoupled.eigh_ritz'), priced(1, eigh_plans[1], reduced):
-        values, rotation = guarded_eigh(eigh_plans[1], reduced, mesh=mesh, label='CT Ritz')
+        values, rotation = eigh_plans[1].batched(reduced)
     del reduced
     with timing.section('decoupled.output'):
         return run(output, stage, pencil[2], pencil[3], values, rotation)

@@ -5,6 +5,31 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — the bispinor sector route is decided from the shapes: q-local, or staged rounds of min(nq, P) parents
+
+The sector constructor's priced route tree is replaced. The route is decided once per map from
+the recipe shapes and printed on one line (`Shared-pole sector constructor: route`): q-local rounds of P parents
+when every sector's local round fits, as before; otherwise rounds of R = min(nq, P) parents on
+the face, for every deck. In each round TT, CC and then CT reduce through the staged programs:
+the selection in sub-batches of the 1 GiB tile; the GEMM stages over the widest halving of R
+whose shape-priced program fits beside the round's stacks; each eigh once over the round's
+stack, on route (c) when its shape price fits the budget (`distrib_la.eigh_stack_bytes`,
+8 n² per matrix per rank), else on the whole mesh with one warning. A second line per round
+(`Shared-pole sector constructor: round of parents a..b:`) names its sides, stage widths and eigh routes.
+Deleted: the sector face batch and its step-down, the decoupled admission and its face-round
+fallback, the selection room and width, the eigh rooms and sizing compiles of the sector path,
+the local CT rerun on the face, the held-versus-live width fallbacks of the CT spans and the
+writer carrier, the free-memory warning beside the eighs, and the cuBLASMp workspace quote of
+the face constructor. The stage rows now price the eigenvector stacks the stages read (2.6 GB
+per rank for TT and 4.6 GB for CT at CrI3 24×24 P64), and a face CT price no longer counts its
+program twice. The held checks read every held sample of a sector in one call. The sector
+W(τ) right operand is again formed at each node (forming it once moved nothing at P4); CC's one
+reduce-scatter stays. Results move at round-off only: P4, maps 0–2, CrI3 6×6 forced onto the face
+max |ΔE_qp| 0.001 µeV against main (W per map 214.7 / 123.5 / 65.3 s against 248.8 / 189.0 / 66.4,
+peak 25.8 against 26.9 GB); Fe 4³ forced onto the face 0.041 µeV (four rounds of 4 where main ran
+one face round of 13: W 180.0 / 92.2 / 124.7 s against 141.2 / 88.6 / 99.5, peak 9.9 against 15.1 GB);
+Fe 4³ at 4 GB, q-local on both, bitwise. No deck change.
+
 ## 2026-10-08 — the platform key is the device vendor; one gate implementation
 
 `lxkit.device_vendor` reads the vendor from the device client (`client.platform`,

@@ -307,46 +307,59 @@ Ritz carrier: the Schur and final eighs run at the carrier and twice it
 (infinity, directions, partners, passivity, the Gram reduction, CT and the
 Cauchy check) go to `distrib_la` with the room beside the admitted batch
 (`face_eigh_room` of the selection admission row; a scalar reduction round
-and a face model check beside its own whole-chain program compiled on the
-arrays it runs, which is also its retry; CC, TT and CT beside the sector batch
-row, which holds the largest of their whole-chain programs and the resident
-sector models); the service runs a stack one or more whole matrices
-per rank when one slice's compiled program fits that room, else on the whole
-mesh ([eigh stacks](../services/distrib_la/api.md#eigh-stack)). The sectors
-take one route together (`sector_execution`, against the same ledger): CC, TT
-and CT all run on the face when the CT joint pencil or any sector prices face,
-else all local. With at least as many parents as ranks the joint pencil's
-conservative price (both spans at twice their pole budgets) does not send the
-sectors to the face: each rank builds whole q-local models, and the round
-admits the CT pencil at its actual retained spans. A local round whose CT does
-not fit there warns and reruns its parents, CC and TT included, as face
-batches (the slow fallback). The route is fixed before any read and the report
-line `Shared-pole constructor:` names it and its prices; that fallback is the
-only route change inside a stage. A face program holds its eighs' first attempts; a failed check
-reruns that round's whole-chain program on the whole mesh, the program its
-admission compiled (`distrib_la.checked_program`).
+and a face model check beside its own whole-chain program, which is also its
+retry); the service runs a stack one or more whole matrices per rank when its
+shape price fits that room, else on the whole mesh
+([eigh stacks](../services/distrib_la/api.md#eigh-stack)). The route is fixed
+before any read and the report line `Shared-pole constructor:` names it and
+its prices. A face program holds its eighs' first attempts; a failed check
+reruns that round's whole-chain program on the whole mesh
+(`distrib_la.checked_program`).
+
+**Sectors.** The bispinor sectors take one route per map, decided from the
+recipe shapes before any read and printed on one line (`sector_route`,
+`Shared-pole sector constructor: route`). They run q-local, rounds of P parents, when CC, TT
+and the CT joint pencil each fit one whole parent per rank
+(`sector_execution`); with at least as many parents as ranks the joint
+pencil's conservative price (both spans at twice their pole budgets) does not
+send them to the face, and the round runs CT at its held spans, over budget
+with a warning. Otherwise they run in rounds of R = min(nq, P) parents, balanced
+over the rounds, on the face through the staged reduction (`staged_round`). R
+is set by P, not by the budget. Each round reduces TT, then CC beside TT's held
+outputs, then CT from both:
+
+* the selection runs in sub-batches of the fixed tile (`runtime.tiles`), one
+  parent's selection inputs priced from the recipe;
+* the reduction's stage programs (`paired_members`, `keep_stage`,
+  `paired_stage`, `output_stage`; for CT the pencil, `joint_keep_stage`,
+  `joint_output_stage`) run over sub-batches of the widest halving of R whose
+  shape-priced program fits beside the round's stacks (`stage_width`). Each
+  writes its rows of one stack per array in place; a short last sub-batch
+  repeats its last parent, so one shape compiles;
+* each eigh runs once over the round's stack. It runs on route (c), every
+  matrix whole on one rank, when its shape price (`distrib_la.eigh_stack_bytes`)
+  beside its boundary, the round's held outputs and the upstream fits the
+  budget; otherwise on the whole mesh, with one warning (`staged_eigh`).
+
+Stage widths and eigh routes are decided per round at the round's shapes (the
+held pencil extent, the actual CT span), so every rank decides alike; at the
+recipe's conservative sides the CrI3 24×24 P64 H'_vv and CT stacks would
+leave route (c). The line `Shared-pole sector constructor: round of parents a..b:` names a
+round's sides, stage widths and eigh routes whenever they change. The stage
+stacks are priced with the eigenvector stacks the stages read
+(`staged_sector_bytes`, `staged_cross_bytes`). The metric corrections stay
+Newton–Schulz inside their stages (the paired metric is the identity to about
+$10^{-8}$ by construction, one iteration; an eigh root of the stack costs more,
+claim 3425); the receipt reports the largest residual $\|ZAZ-I\|_F/\sqrt R$
+that `retained_metric_positive` gates. An eigh whose check fails reruns only
+that stack; the stage programs hold no eigh.
 
 **Face products.** Every face GEMM of the constructor is `distrib_la.panel_matmul`
-on a square mesh (the provider product on a rectangular one), every parent of
+on the square mesh, every parent of
 a program in one exchange per panel, transposed operands by one
 grid-transpose exchange; face programs compile with XLA's latency-hiding
 scheduler. CrI3 24×24 at P64: 9.5–13.4 TF/s per A100 against 1.7–5.7 for the
 cuBLASMp face (SECTFAST2 bench).
-
-**Decoupled sectors.** When the face route has more parents than its batch,
-CC and TT reduce every parent at once (`construct_diagonal_sector_all`): the
-selection runs in sub-batches of the admitted width, the reduction's stage
-programs (`paired_members`, `keep_stage`, `paired_stage`, `paired_correct`,
-`output_stage`) run over sub-batches and write their rows of one stack per
-array in place, and each eigh runs once over the whole stack, one whole
-matrix per rank where its program fits the room. The metric corrections stay
-Newton–Schulz inside their stages (the paired metric is the identity to about
-$10^{-8}$ by construction, one iteration; an eigh root of the stack costs more,
-claim 3425); the receipt reports the largest residual
-$\|ZAZ-I\|_F/\sqrt R$ that `retained_metric_positive` gates. The stacks are
-reserved in the ledger (`sector.decoupled.<sector>.stacks`); when they do not
-fit, the same stacked panels reduce in face rounds (warn, never refuse). CT
-rounds read slices of the held outputs.
 
 **Reindexing.** Matrix selection, factor sorting and unequal CT block assembly
 use `common.staged_reshard`: exchange to slabs split over all ranks, select or
@@ -582,9 +595,9 @@ with $c_b=\lceil b/P\rceil$ on local rounds ($b/P$ on the face route) and, by
 phase: selection $D=24n^2$, $s_f=2a$ over the $a$ dense fitted samples plus the
 moment faces and the line panels in face units,
 $N_{\rm line}(1+2S)\,n\,r_{\rm cap}/n^2$ (`selection_face_count`);
-reduction $D=14R^2+12nR$, $s_f=0$ (on the face route $16\,c_b D$ at the conservative side, an ordered round's kept span on `face_ritz_carrier`, admits a batch, priced from these terms and never compiled to be measured: `face_batch_width` starts at every parent and steps down in proportion to the room; the CC/TT/CT batch takes the largest of CC's, TT's and CT's program prices, `sector_batch_width`; a local paired, ordered round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
+reduction $D=14R^2+12nR$, $s_f=0$ (on the face route $16\,c_b D$ at the conservative side, an ordered round's kept span on `face_ritz_carrier`, admits a batch, priced from these terms and never compiled to be measured: `face_batch_width` starts at every parent and steps down in proportion to the room; the staged sector route bounds its stage programs by the same price, `stage_width`; a local paired, ordered round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
 checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction (local) $D=CT+8R^2+4nR+\max(C,T)R$,
-on the face its compiled program. A local round has $b=P$. The native cuSOLVERMp `eigh`
+on the face the program price alone (no dense term beside it). A local round has $b=P$. The native cuSOLVERMp `eigh`
 adds a private $n^2/P$ operand tile beside its workspace, which
 `distrib_la.workspace_bytes_per_rank` includes. The ledger
 (`CapacityLedger`) owns admission: when a stage's aggregate with the named

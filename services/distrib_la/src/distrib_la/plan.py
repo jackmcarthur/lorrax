@@ -462,6 +462,12 @@ GATHERED_EIGH_FACTOR = 2
 #: n^2 / P elements (deflation, probes, retries; measured 7.0-7.1 at n 3328
 #: and 9152, P16, against 1-2 for a bare deflated eigh).
 CHECKED_EIGH_TILES = 7
+#: What route (c) adds per rank for each whole n x n matrix the rank holds, in
+#: n^2 elements: the staged exchanges, the local solve with its workspace, the
+#: vectors and the first attempt's check, the operand excluded. Compiled size
+#: plus the vendor query on A100 (bundle B11, one or two matrices per rank):
+#: 7.96-7.98 at P64 for n 6144-18432, 7.9-8.0 at P4 for n 984-7936.
+BATCH_EIGH_TILES = 8
 
 
 def _gathered_eigh(A, *, mesh):

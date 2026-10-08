@@ -304,3 +304,19 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
         the query allocates no matrix, result or queried workspace buffer.
     """
     return int(_workspace_details(plan, op, shapes, dtype)['device_bytes'])
+
+
+def eigh_stack_bytes(plan, shape, dtype) -> int:
+    """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
+    its operand, from the shapes alone: on route (c) ``BATCH_EIGH_TILES`` n^2 elements per whole
+    matrix a rank holds; on the whole mesh the vectors stack, the values and one solve's
+    workspace (:func:`workspace_bytes_per_rank`, 0 off CUDA). Every rank computes the same figure.
+    """
+    from distrib_la.plan import BATCH_EIGH_TILES, ROUTE_BATCH_RESHARD
+    nb, n = int(shape[0]), int(shape[-1])
+    ranks = int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
+    item = np.dtype(dtype).itemsize
+    if plan.batched_route == ROUTE_BATCH_RESHARD:
+        return -(-nb // ranks) * BATCH_EIGH_TILES * n * n * item
+    return (-(-nb * n * n * item // ranks) + nb * n * 8
+            + workspace_bytes_per_rank(plan, 'eigh', ((n, n),), dtype))

@@ -60,7 +60,8 @@ interaction operand is laid out `(N_k, μ, n_A, ν, n_B)`.
 ## Evaluation
 
 `compute_sector_sigma` is called once per Σ evaluation (`gw.sigma_dispatch`).
-It integrates the four classes in the fixed order CC, TT, CT, TC, one at a
+It integrates three windows in the fixed order CC, TT and the mixed pair
+CT + TC (one fused window: the TC partner rides on the CT window), one at a
 time, each through the common frequency-quadrature executor
 `gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`. Sectors therefore add no new
 integration algorithm: the frequency planner, the τ rules and the ω

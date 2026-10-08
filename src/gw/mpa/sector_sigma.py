@@ -197,8 +197,7 @@ def _w_program(mesh_xy, route, same, m, nc, n, nt, nq, kcarrier, weights_fn):
     def kernel(b_x, b_y, poles, intervals, ref, time):
         pair = synthesize_shared_pole_parents(
             b_x, b_y, poles, jnp.clip(intervals, 0, kcarrier), ref, time, mesh_xy=mesh_xy,
-            gemm=gemm, layout=route, weights_fn=weights_fn, active_range=True, same_factor=same,
-            right_formed=route == 'axis')
+            gemm=gemm, layout=route, weights_fn=weights_fn, active_range=True, same_factor=same)
         return tuple(jax.lax.with_sharding_constraint(w.reshape(shape), spec) for w in pair)
     _W_PROGRAMS[key] = kernel
     return kernel
@@ -594,11 +593,8 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
             b_y=None if b_y is None else batch_layout(merge(b_y),mesh_xy)
             poles=batch_layout(poles,mesh_xy)
         elif route=='axis':
-            from .sigma import shared_pole_right_operand
             b_x=_placer(mesh_xy,P(None,'x',None,None))(b_x)
-            # The right GEMM operand, formed once per Σ call: no τ node copies it.
-            b_y=jax.jit(shared_pole_right_operand,out_shardings=NamedSharding(mesh_xy,P(None,None,'y')))(
-                _placer(mesh_xy,P(None,'y',None,None))(b_y))
+            b_y=_placer(mesh_xy,P(None,'y',None,None))(b_y)
         jax.block_until_ready((b_x,b_y,poles))
         kernel=_w_program(mesh_xy,route,same,m,nc,n,nt,nq,kcarrier,weights_fn or _shared_pole_weights)
     except BaseException:

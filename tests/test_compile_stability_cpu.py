@@ -224,12 +224,9 @@ def test_partner_directions_keep_one_carrier():
 
 
 def test_face_rounds_share_one_width():
-    from types import SimpleNamespace
-    from gw.shared_pole_execution import sector_round_schedule
-    config = SimpleNamespace(backend=SimpleNamespace(linalg="distributed"))
-    rounds = sector_round_schedule(None, {"n_q_irr": 7}, None, config, _mesh(),
-                                   execution="face", batch_width=3)
-    assert [real for _, real, _, _ in rounds] == [3, 3, 1]
-    assert {len(ids) for ids, _, _, _ in rounds} == {3}
-    assert all(np.array_equal(slots, np.arange(3)) for _, _, slots, _ in rounds)
-    assert sorted({q for ids, real, _, _ in rounds for q in ids[:real]}) == list(range(7))
+    from gw.shared_pole_local import parent_rounds
+    rounds = parent_rounds(7, 3)
+    assert [real for _, real, _ in rounds] == [3, 3, 1]
+    assert {len(ids) for ids, _, _ in rounds} == {3}
+    assert all(np.array_equal(slots, np.arange(3)) for _, _, slots in rounds)
+    assert sorted({q for ids, real, _ in rounds for q in ids[:real]}) == list(range(7))

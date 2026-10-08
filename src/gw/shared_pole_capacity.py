@@ -59,9 +59,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     reduction, whose kept span is solved on at most that many columns;
     ``retain_span`` adds its coefficient map output (a bispinor sector round).
     ``program_bytes`` is a face reduction's or CT cross reduction's price per
-    rank at the conservative side (``face_batch_width``,
-    ``sector_batch_width``: these terms tiled over the mesh), which replaces
-    its dense temporaries at the actual side.
+    rank at the conservative side (``face_batch_width``: these terms tiled over
+    the mesh), which replaces its dense temporaries at the actual side.
     """
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
     # Constructor carriers are mu x mu charge operators on every admitted deck.
@@ -102,7 +101,7 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
         # at 2c, XLA rematerialization on and off: temp + output 0.73-0.82 of
         # this term; with the arguments, 0.80-0.87 of this term plus the
         # narrow actions.
-        dense = c*t + 8 * r*r + 4 * packed * r + max(c, t) * r
+        dense = 0 if program_bytes is not None else c*t + 8 * r*r + 4 * packed * r + max(c, t) * r
         sample_faces = 0
     elif phase == "reduction":
         if selection_faces is not None:
@@ -175,13 +174,49 @@ def _local_eigenplan(mesh_xy, side):
     return distrib_la.plan("eigh", mesh_xy, n=side, backend="off", batched_route="batch_reshard")
 
 
+def staged_sector_bytes(*, parents, ranks, side, carrier, packed):
+    """Per-rank bytes of one sector's staged reduction of ``parents`` parents (complex128).
+
+    ``side`` is the pencil side R (H'_vv is R/2), ``carrier`` the kept-span columns c (None,
+    the relaxed tier: R/2), ``packed`` the rows n. The selected panels are the caller's arrays
+    and are not counted here. Returns ``(stacks, boundaries)``: the largest stage run (its
+    input stacks, the eigenvectors it reads and the stack it writes: the members; the members,
+    U of H'_vv and the restricted pencil; the restricted pencil, U of the Schur complement and
+    (Y, Y^H G_r Y); (Y, Y^H G_r Y, O_r, span), the Ritz rotation and the outputs), and for each
+    eigh, H'_vv, the Schur complement and Y^H G_r Y, ``(extent, stacks live beside it)``.
+    """
+    hvv = int(side) // 2
+    c = int(carrier or hvv)
+    two, n = 2 * c, int(packed)
+    per_rank = lambda elements: -(-16 * int(elements) * int(parents) // int(ranks))
+    members = 6 * hvv * hvv + 2 * n * hvv
+    restricted = 2 * two * two + 2 * c * c + hvv * c + n * two
+    ritz = 2 * two * two + hvv * c + n * two
+    outputs = int(side) * two + 2 * n * two
+    stacks = max(members + hvv * hvv + restricted, restricted + c * c + 2 * two * two,
+                 ritz + two * two + outputs)
+    return per_rank(stacks), ((hvv, per_rank(members + hvv * hvv)), (c, per_rank(restricted)),
+                              (two, per_rank(ritz)))
+
+
+def staged_cross_bytes(*, parents, ranks, side, rows):
+    """Per-rank bytes of one round's staged CT at joint ``side`` K with output ``rows``
+    (n_C, n_T), complex128: ``(stacks, boundaries)``. The stacks are the pencil (metric, value,
+    O_C, O_T) beside U of the metric and the keep stage's (Y^H V Y, Y); the boundaries are the
+    two eighs' live stacks, the metric beside the pencil and the Ritz step beside
+    (Y^H V Y, Y, O_C, O_T)."""
+    k, n = int(side), sum(int(r) for r in rows)
+    per_rank = lambda elements: -(-16 * int(elements) * int(parents) // int(ranks))
+    pencil, keep = 2 * k * k + n * k, 2 * k * k
+    return per_rank(pencil + k * k + keep), ((k, per_rank(pencil)), (k, per_rank(keep + n * k)))
+
+
 def face_eigh_room(admission, held=0):
     """Room per rank for a face constructor's eigh stacks, or None.
 
-    ``admission`` is a face batch admission row (``face_batch_width``,
-    ``sector_batch_width``) and ``held`` what is live beside it that the row
-    does not hold: the receipt's upper bound on the factors every parent keeps,
-    or the sector models reserved after the admission. Both are shape prices,
+    ``admission`` is a face batch admission row (``face_batch_width``) and
+    ``held`` what is live beside it that the row does not hold: the receipt's
+    upper bound on the factors every parent keeps. Both are shape prices,
     so every rank agrees on the room. It is floored to a whole GiB.
     """
     # ponytail: the face programs are keyed on the plan, and so on this
@@ -324,17 +359,6 @@ class ConstructorCapacity:
             "eigh", ((self.batch_width, extent, extent),),
             constructor_eigenplan(self._mesh_xy, int(extent), self.execution))
             for extent in sorted(extents))
-        if self.execution == 'face':
-            extent=max(n,side,*extents)
-            import distrib_la
-            shapes=((self.batch_width,extent,extent),(self.batch_width,extent,extent))
-            # Receipts use the public workspace operation name, matching
-            # the capacity maximum and the distrib_la service vocabulary.
-            key=('gemm',shapes)
-            if key not in self.native_queries:
-                self.native_queries[key]=distrib_la.matmul_workspace_bytes_per_rank(
-                    self._mesh_xy,shapes,np.complex128,backend='distributed',batched_route='auto')
-            self._native_maxima['gemm']=self.native_queries[key]
         self._workspace = sum(self._native_maxima.values())
 
         return price, dict(self._native_maxima)

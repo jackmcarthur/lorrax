@@ -1,13 +1,11 @@
-"""The face batch admission replayed from production receipts (CPU only, seconds).
+"""The face program prices replayed from production receipts (CPU only, seconds).
 
 Each receipt is a constructor_receipt.json written by main while it still
 compiled every face program to size it: the route rows (packed extents,
-conservative sides, pole budgets, signed bounds), the three compiled program
-sizes per rank at the admitted width, and the reduction admission row
-(resident, native workspace, upstream live stages, budget, limit). The shape
-price must bound every compiled figure and the admission must land on the
-same batch, so the programs that run are the ones main ran; p64 now lands on
-10, where main's room step undershot to 3 (the step is by the whole price).
+conservative sides, pole budgets, signed bounds) and the three compiled
+program sizes per rank at the admitted width. The shape price
+(``face_reduction_bytes``, ``face_cross_bytes``), which bounds the staged
+route's stage programs (``stage_width``), must bound every compiled figure.
 
 Receipts (all 2x2 or 8x8 meshes, bispinor sectors, retained spans):
 * ``p64``: CrI3 24x24 P64 cold SC map 0, main 0a393dd72, 2026-10-05
@@ -51,57 +49,19 @@ RECEIPTS = {
 }
 
 
-class Ledger:
-    """The map ledger's preview on a receipt's budget: aggregate = resident + workspace + upstream."""
-    live_stages = ('upstream',)
-
-    def __init__(self, row):
-        self.upstream = row['aggregate'] - row['resident'] - row['workspace']
-        self.row = row
-
-    def preview(self, *, resident_bytes_per_rank, workspace_bytes_per_rank, concurrent_with):
-        aggregate = resident_bytes_per_rank + workspace_bytes_per_rank + self.upstream
-        return dict(aggregate_bytes_per_rank=aggregate, available_device_bytes_per_rank=self.row['available'],
-                    device_budget_status='PASS' if aggregate <= self.row['limit'] else 'FAIL')
-
-
-def replay(monkeypatch, name, nq=None):
+@pytest.mark.parametrize("name", sorted(RECEIPTS))
+def test_price_bounds_every_compiled_program(name):
     import file_io  # noqa: F401  (service path bootstrap)
-    import gw.shared_pole_capacity as cap
     import gw.shared_pole_execution as ex
     px, py, parents, joint_packed, routes, compiled, batch, row = RECEIPTS[name]
-    nq = parents if nq is None else nq
     mesh = SimpleNamespace(shape={'x': px, 'y': py}, size=px * py)
-
-    def quote(self, side, *, phase, sample_batch=1, selection_faces=None, eigen_side=None,
-              cross_original_sides=None, padding_output_bytes_per_rank=0):
-        # The native eigh and matmul workspace is a vendor query (0 off CUDA): the receipt's figure stands in.
-        price = self.resident_quote(side, phase=phase, sample_batch=sample_batch, selection_faces=selection_faces,
-                                    cross_original_sides=cross_original_sides,
-                                    padding_output_bytes_per_rank=padding_output_bytes_per_rank)
-        return price, {'eigh': row['workspace']}
-    monkeypatch.setattr(cap.ConstructorCapacity, 'quote', quote)
-    monkeypatch.setattr(ex, 'line_panel_count', lambda recipe: 2)
-    width, receipt = ex.sector_batch_width(SimpleNamespace(n_rmu_padded=joint_packed), None, {'fit_ids': [0, 1, 2, 3, 4]},
-                                           routes, mesh=mesh, ledger=Ledger(row), nq=nq)
-    return width, receipt, compiled, batch
-
-
-@pytest.mark.parametrize("name", sorted(RECEIPTS))
-def test_price_bounds_every_compiled_program_and_lands_on_its_batch(monkeypatch, name):
-    width, receipt, compiled, batch = replay(monkeypatch, name)
-    prices = receipt['sector_program_bytes_per_rank']
+    prices = {r['sector']: ex.face_reduction_bytes(mesh, batch, rows=r['packed_extent'], side=r['conservative_pencil_side'],
+                                                   carrier=ex.face_ritz_carrier(mesh, r['pole_budget']), retain_span=True)
+              for r in routes}
+    spans = [min(r['signed_side_bound'], r['conservative_pencil_side']) for r in routes]
+    prices['CT'] = ex.face_cross_bytes(mesh, batch, joint_packed, [r['conservative_pencil_side'] for r in routes], spans)
     for sector, gb in compiled.items():
         assert prices[sector] >= gb * 1e9, (name, sector, prices[sector] / 1e9, gb)
-    assert width == batch, (name, width, batch)
-
-
-def test_p64_receipt_reproduces_the_non_program_resident(monkeypatch):
-    width, receipt, compiled, batch = replay(monkeypatch, "p64", nq=3)   # main's batch
-    row = RECEIPTS["p64"][-1]
-    nonprogram = (receipt['reduction']['aggregate_bytes_per_rank'] - (row['aggregate'] - row['resident'] - row['workspace'])
-                  - row['workspace'] - receipt['program_bytes_per_rank'])
-    assert abs(nonprogram - (row['resident'] - compiled['CT'] * 1e9)) < 0.15e9
 
 
 def test_price_is_linear_in_the_batch_and_zero_free():

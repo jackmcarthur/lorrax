@@ -2,8 +2,8 @@
 
 Rows 2 and 3 of the 2026-10-05 compile audit: a ragged face tail recompiled every
 round program, and a selection-sized extent recompiled them on every growth in
-every map. One schedule (``parent_rounds``) serves the local, face, scalar and
-rerun routes; ``round_tables`` grows the extent in map 0 and holds it from map 1.
+every map. One schedule (``parent_rounds``) serves the local, staged and scalar
+routes; ``round_tables`` grows the extent in map 0 and holds it from map 1.
 """
 from types import SimpleNamespace
 
@@ -12,28 +12,12 @@ import jax
 import jax.numpy as jnp
 
 
-def _schedule(execution, batch_width, nq=7):
-    from gw.shared_pole_execution import sector_round_schedule
-    config = SimpleNamespace(backend=SimpleNamespace(linalg="local"))
-    return sector_round_schedule(None, {"n_q_irr": nq}, None, config, SimpleNamespace(size=4),
-                                 execution=execution, batch_width=batch_width)
-
-
 def test_ragged_tail_traces_once():
     from gw.shared_pole_local import parent_rounds
-    from gw.shared_pole_sectors import face_rerun_rounds
     rounds = parent_rounds(7, 3)
     assert [(r[0], r[1]) for r in rounds] == [([0, 1, 2], 3), ([3, 4, 5], 3), ([6, 6, 6], 1)]
     assert all(r[2].tolist() == [0, 1, 2] for r in rounds)
     assert [(r[0], r[1]) for r in parent_rounds([4, 5, 6, 7], 3)] == [([4, 5, 6], 3), ([7, 7, 7], 1)]
-    # The face, local and rerun routes all take fixed-width rounds.
-    for execution, width in (("face", 3), ("local", 4)):
-        sched = _schedule(execution, 3)
-        assert {len(r[0]) for r in sched} == {width}
-        assert [r[3] for r in sched] == [execution] * len(sched)
-        assert [q for r in sched for q in r[0][:r[1]]] == list(range(7))
-    assert [(r[0], r[1], r[3]) for r in face_rerun_rounds([4, 5, 6, 7], 4, 3)] == [
-        ([4, 5, 6], 3, "face"), ([7, 7, 7], 1, "face")]
     # A round program keyed on the batch's leading axis traces once over the schedule.
     traces = []
 
@@ -42,7 +26,7 @@ def test_ragged_tail_traces_once():
         traces.append(batch.shape)
         return jnp.linalg.eigh(batch)[0].sum()
 
-    for ids, real, slots, _ in _schedule("face", 3):
+    for ids, real, slots in parent_rounds(7, 3):
         round_program(jnp.stack([jnp.eye(4) * (q + 1) for q in ids]))
     assert len(traces) == 1
 

@@ -225,9 +225,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             budget.face_room = face_eigh_room(execution_receipt['face_batch']['selection'], retained_bound)
             execution_receipt['face_eigh_room_bytes_per_rank'] = dict(selection=budget.face_room)
             eig = budget.eigenplan(n)
-        from gw.shared_pole_execution import sector_round_schedule
-        rounds = [row[:3] for row in sector_round_schedule(
-            bank, header, meta, config, mesh_xy, execution=execution, batch_width=face_batch)]
+        from gw.shared_pole_local import parent_rounds
+        # One fixed width per route; a short last round repeats its last real parent.
+        rounds = parent_rounds(header['n_q_irr'], mesh_xy.size if execution == 'local' else face_batch)
         batch_spec = P(("x", "y"))
         read_spec = batch_spec if execution == 'local' else None
         kernels = _round_kernels(mesh_xy, 'batch' if execution == 'local' else 'face')

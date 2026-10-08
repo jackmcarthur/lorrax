@@ -1,4 +1,4 @@
-"""The decoupled face route and its face products against the local round (CPU 2x2 mesh).
+"""The staged face route and its face products against the local round (CPU 2x2 mesh).
 
 Run with ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4``.
 A synthetic ordered pencil: four parents, each a full-rank positive real-pole model
@@ -211,9 +211,9 @@ def test_decoupled_cross_matches_the_joint_reduction():
             assert np.array_equal(np.asarray(wd[key]), np.asarray(gd[key])), key
 
 
-def test_release_selection_panels_frees_them_and_keeps_the_round_slices_bitwise():
-    """After the decoupled CT pencils, the sectors' (Q, O, infinity) panels and spans are dropped
-    (their bytes return before the CT eighs) and a round's slice of the models is unchanged."""
+def test_release_selection_panels_frees_them_and_keeps_the_models():
+    """After a round's CT pencils, the sectors' (Q, O, infinity) panels and spans are dropped
+    (their bytes return before the CT eighs); the models a sub-batch slice reads are unchanged."""
     import gc
     import weakref
     from gw.shared_pole_sectors import release_selection_panels, slice_sector
@@ -230,7 +230,7 @@ def test_release_selection_panels_frees_them_and_keeps_the_round_slices_bitwise(
     release_selection_panels([sector])
     gc.collect()
     assert all(ref() is None for ref in panels)
-    after = slice_sector(sector, [1, 3], mesh)
-    assert after['states'] is None and after['infinity'] is None and after['coefficients'] is None
-    for a, b in zip(jax.tree.leaves((before['model'], before['signed'])), jax.tree.leaves((after['model'], after['signed']))):
-        assert np.array_equal(np.asarray(a), np.asarray(b))
+    assert sector['states'] is None and sector['infinity'] is None and sector['coefficients'] is None
+    after = [np.asarray(a)[[1, 3]] for a in jax.tree.leaves((sector['model'], sector['signed']))]
+    for a, b in zip(jax.tree.leaves((before['model'], before['signed'])), after):
+        assert np.array_equal(np.asarray(a), b)

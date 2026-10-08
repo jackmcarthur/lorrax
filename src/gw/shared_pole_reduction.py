@@ -383,8 +383,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
 
 # The four GEMM stages of the paired reduction, with the three eighs between them.
 # ``reduce_ordered_shared_pole_pencil`` composes them inside one program (the local
-# round, the face round); the decoupled face route runs each stage over a batch of
-# parents and each eigh over every parent in flight (``shared_pole_execution``).
+# round, the face round); the staged face route runs each stage over a batch of
+# parents and each eigh over the round's stack (``shared_pole_execution``).
 # A stage takes and returns a dict of arrays; no array crosses a stage boundary
 # that the next stage does not read.
 
