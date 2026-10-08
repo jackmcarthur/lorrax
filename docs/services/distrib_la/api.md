@@ -593,7 +593,7 @@ nothing and accept `float64` or `complex128` only.
   returns the cuSolverDn workspace plus a 4-byte info word. For `gemm`, one
   vendor workspace per context persists across calls, so budget
   `max(GEMM workspace) + max(concurrent eigh scratch)`. Query collectively on
-  the real mesh; non-CUDA meshes refuse.
+  the real mesh; off CUDA it returns 0.
 - `matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend,
   batched_route)`: the same query for a `matmul` route.
 - `fits_local(plan, op, shapes, dtype, budget_bytes)`: whether
