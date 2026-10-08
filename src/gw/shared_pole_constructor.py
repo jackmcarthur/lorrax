@@ -23,6 +23,19 @@ from gw.shared_pole_directions import (_round_kernels, _sample_point, line_panel
 from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 
+def _cap_replay_admit(row, enabled, phase):
+    """A cap replay must stop on hardware refusal before its next allocation.
+
+    Scaling WARNs within the device budget remain admissible. The default
+    constructor's policy is unchanged; this door authorizes only a guarded
+    cap contrast against an immutable bank.
+    """
+    if enabled and row.get('device_budget_status') != 'PASS':
+        raise MemoryError(f'GATE shared_pole_cap_replay_capacity: {phase} exceeds '
+                          f'current device capacity before allocation: {row}')
+    return row
+
+
 def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordered,
                       odd_moments, nq):
     """Resolve local or whole-mesh parent execution for one map's bank.
@@ -288,9 +301,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         with phase("batch_admission"):
             budget.batch_width = len(ids)
             budget.retained_panels = tuple(factors)
-            budget.plan(
+            _cap_replay_admit(budget.plan(
                 conservative_side, phase="selection",
-                sample_batch=len(dense_fit), selection_faces=selection_faces)
+                sample_batch=len(dense_fit), selection_faces=selection_faces),
+                cap_only_replay, 'selection')
             budget.live(())
         with phase("scratch_read"):
             with open_shared_pole_bank(moments["path"], mesh_xy=mesh_xy) as moment_io:
@@ -357,6 +371,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             local_eigh = budget.eigenplan(side)
             reduction_row = budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
                 round_states, infinity, widths, infinity_width))
+            _cap_replay_admit(reduction_row, cap_only_replay, 'actual pencil plus padding')
             if real_trim:
                 import distrib_la
                 from gw.shared_pole_execution import face_eigh
@@ -447,6 +462,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         with phase("coulomb"):
             budget.batch_width = len(ids)
             model_row = budget.plan(side, phase="model", sample_batch=len(held_ids))
+            _cap_replay_admit(model_row, cap_only_replay, 'model/held/passivity')
             budget.live((*round_model, *round_signed, qi))
             # V^-1/2 of the round's parents: one owner call per contiguous run of ids, rows in slot order.
             runs = []
@@ -563,6 +579,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             raise ValueError(f"GATE shared_pole_rounds: got: parents {sorted(placed)}; want: each of {nq} parents once; why: one canonical store")
         order = np.argsort(placed)
         width = max(block.shape[-1] for block in factors)
+        if cap_only_replay:
+            budget.batch_width = nq
+            budget.retained_panels = tuple(factors)
+            _cap_replay_admit(budget.plan(width, phase='model'), True, 'writer stack')
         public_b = canonical_factors(mesh_xy, tuple(int(i) for i in order))(*factors)
         store_poles = np.concatenate([np.pad(block, ((0, 0), (0, width - block.shape[-1])), constant_values=1.0)
                                       for block in store_poles])[order]

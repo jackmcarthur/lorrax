@@ -1,5 +1,16 @@
 # Upgrade notes
 
+## 2026-10-08 — cap-only replay refuses actual over-budget allocations
+
+The optional immutable-bank cap replay now hard-refuses a non-PASS hardware
+admission before selection, actual pencil padding/reduction, held/passivity
+and writer stacking. Scaling WARNs with hardware room remain admitted.
+Ordinary default construction is unchanged. Its actual over-budget warning
+without refusal is tracked by the sandbox issue register. The cap policy
+metadata suite at fde1 passed24CPU cases; these four added refusal cases and
+new source-current P4 qualification are pending. No physical gate, reducer,
+pole threshold, sample plan or bank header changes.
+
 User-visible changes, newest first. Each entry says what changed, which
 results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in

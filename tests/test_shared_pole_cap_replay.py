@@ -114,3 +114,18 @@ def test_default_constructor_still_refuses_changed_cap_hash(monkeypatch):
               tables={'sym':SimpleNamespace(trs_allowed=True)})
     with pytest.raises(ValueError, match='stale recipe_hash'):
         construct_shared_poles(bank, bank, meta, config, mesh_xy=None, output='unused')
+
+
+def test_cap_replay_capacity_allows_scaling_warning_with_hardware_room():
+    from gw.shared_pole_constructor import _cap_replay_admit
+    row=dict(status='WARN',device_budget_status='PASS')
+    assert _cap_replay_admit(row,True,'actual pencil plus padding') is row
+
+
+@pytest.mark.parametrize('status',['FAIL','WARN',None])
+def test_cap_replay_capacity_refuses_hardware_or_missing_admission(status):
+    from gw.shared_pole_constructor import _cap_replay_admit
+    row=dict(device_budget_status=status)
+    with pytest.raises(MemoryError,match='before allocation'):
+        _cap_replay_admit(row,True,'actual pencil plus padding')
+    assert _cap_replay_admit(row,False,'default legacy policy') is row
