@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — dead distrib_la surfaces removed: factor/solve, dispatch_batched_eigh, SLATE trsm, two GEMM wrappers
+
+`distrib_la.factor`, `distrib_la.solve` and `FactorToken` had no caller and are gone; so is
+`distrib_la.dispatch_batched_eigh` (its one caller, the QSGW density eigh, calls
+`distrib_la.plan('eigh', ...).batched` directly, the same plan and route). The SLATE
+`distributed_trsm` wrapper and the SLATE and ScaLAPACK batched GEMM wrappers (whose handlers are
+not built, so a request refused at the probe) are removed, and `panel_matmul` refuses a 4-D
+operand or a non-square mesh by name instead of falling back to its masked-psum kernel. No
+result moves. Out-of-tree code that called the removed functions calls `distrib_la.plan`.
+
 ## 2026-10-08 — the bispinor sector route is decided from the shapes: q-local, or staged rounds of min(nq, P) parents
 
 The sector constructor's priced route tree is replaced. The route is decided once per map from

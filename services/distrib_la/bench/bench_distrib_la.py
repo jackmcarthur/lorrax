@@ -196,32 +196,6 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                     return (_put(_A, mesh, (None, "x", "y")),
                             _put(_B, mesh, (None, "x", "y")))
                 fn, args = D.plan(op, mesh, backend=backend, n=n).batched, build()
-            elif op == "cholesky" and resolved in ("slate", "cusolvermp"):
-                # MEASURED (cpu1x1 baseline, 2026-08-07): plan.batched does
-                # not give these a timeable array -- their factor is a
-                # library HANDLE.  SLATE's single-tile potrf is declared
-                # ``one_handle`` in plan._IMPL and plan.batched REFUSES it
-                # by name; cuSOLVERMp's stacked potrf returns a handle of
-                # its own.  Timing the refusal would have left the two
-                # distributed cholesky backends with no row at all, which
-                # is the shape of a baseline table that quietly measures
-                # only the easy half.  factor()+solve() is the route those
-                # backends actually have, so it is the route timed.
-                # factor() DONATES A and solve() DONATES B, so this
-                # route needs fresh operands per call for the same reason
-                # solve_lu does.  MEASURED (gpu2x2, 2026-08-07): without
-                # it, cholesky/cusolvermp came back as four
-                # XlaRuntimeError rows.  On the CPU 2x2 the slate rows
-                # happened to survive, which is exactly why the fix is
-                # keyed on the ROUTE and not on which one failed today.
-                def build(_A=A_np, _B=B_np):
-                    return (_put(_A, mesh, (None, "x", "y")),
-                            _put(_B, mesh, (None, "x", "y")))
-
-                def fn(a, b, _op=op, _bk=backend, _n=n):
-                    return D.solve(
-                        D.factor(_op, a, mesh, backend=_bk, n=_n), b)
-                args = build()
             else:
                 fn, args = D.plan(op, mesh, backend=backend, n=n).batched, (A,)
             try:
@@ -234,10 +208,7 @@ def run(mesh, *, dtype="complex128", warmup=2, reps=5, only=""):
                 if jax.process_index() == 0:
                     print(f"ERROR {tag}: {type(exc).__name__}", flush=True)
                 continue
-            route = ("factor+solve"
-                     if op == "cholesky" and resolved in ("slate",
-                                                          "cusolvermp")
-                     else "plan.batched")
+            route = "plan.batched"
             row = dict(op=op, backend=backend, resolved=resolved,
                        route=route,
                        operands=("fresh per call (donated)" if build

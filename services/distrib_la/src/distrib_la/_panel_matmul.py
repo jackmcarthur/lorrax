@@ -1,6 +1,5 @@
-"""Native 2-D face GEMM: batched SUMMA over bounded band panels, and a shared-left sample axis."""
+"""Native 2-D face GEMM: batched SUMMA over bounded band panels on the square mesh."""
 from functools import lru_cache, partial
-from math import gcd
 
 import jax
 import jax.numpy as jnp
@@ -36,25 +35,23 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
     a : jax.Array
         Complex/real [q,m,k], sharded P(None,'x','y').
     b : jax.Array
-        [q,k,n] with the same face layout, or [q,s,k,n] at
-        P(None,None,'x','y'). In the latter case a is shared across s;
-        its panel is broadcast once outside the sample loop.
+        [q,k,n] with the same face layout.
     mesh : jax.sharding.Mesh
-        Named x/y processor axes. Matrix extents are already mesh-padded.
+        Named x/y processor axes, a square mesh (decisions.md, square meshes).
+        Matrix extents are already mesh-padded.
     panel_bytes : int
         Caller-admitted bytes per rank for the two live operand panels.
         Output and input faces are accounted for separately by the caller.
     bounds : jax.Array, optional
         Integer (q,2), replicated: per batch row, the half-open contraction
         interval [lo, hi) outside which the caller has already zeroed a (or
-        b).  On a square mesh each panel's local product runs only over the
-        interval's columns in that panel (the local active-range GEMM), so
-        the dropped columns cost no flops; the result is the same product.
-        The other streams contract every column (the zeros make that exact).
+        b).  Each panel's local product runs only over the interval's columns
+        in that panel (the local active-range GEMM), so the dropped columns
+        cost no flops; the result is the same product.
     weights : jax.Array, optional
-        (q,k) replicated contraction weights, ``a·diag(w)·b``.  On a square
-        mesh each panel's slice of ``a`` is scaled on its way into the
-        all-gather, so no weighted copy of ``a`` is made.
+        (q,k) replicated contraction weights, ``a·diag(w)·b``.  Each panel's
+        slice of ``a`` is scaled on its way into the all-gather, so no
+        weighted copy of ``a`` is made.
     partner : bool
         Square mesh and 3-D ``b`` only: also return the conjugate-face
         product ``conj(a)·diag(w)·conj(b)`` from the SAME panel exchange,
@@ -107,8 +104,7 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         raise ValueError('panel_matmul requires producer-padded face extents')
     per_column = a.dtype.itemsize * q * (m // px + n // py)
     limit = max(1, int(panel_bytes) // per_column)   # at least one column per panel
-    sample_axis = b.ndim == 4
-    if not sample_axis and px == py:
+    if b.ndim == 3 and px == py:
         # SUMMA on interleaved panels: every rank contributes `width` of its
         # own K columns to each panel, so a panel is ONE all-gather per operand
         # over the mesh axis, p·width <= K/p columns (one owner block): two
@@ -125,15 +121,7 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         if weights is not None:
             args += (jnp.asarray(weights, a.dtype).reshape(q, k),)
         return kernel(*args)
-    if partner:
-        raise ValueError('panel_matmul: partner needs a square mesh and 3-D b')
-    if weights is not None:
-        a = a * jnp.asarray(weights, a.dtype)[:, None, :]
-    common = gcd(k // px, k // py)
-    width = min(common, limit)
-    while common % width:
-        width -= 1
-    return _kernel(mesh, q, m, k, n, width, sample_axis)(a, b)
+    raise ValueError('panel_matmul requires a square mesh and a 3-D b')
 
 
 def _interleaved_width(k, p, limit):
@@ -206,45 +194,6 @@ def batch_gram(b, weights, bounds, *, mesh, nbatch, right=None, partner=False):
         return local_batch(lambda b, w, limits: gram(b, b, w, limits), mesh, resident=(0, 1, 2),
                            nbatch=nbatch)(b, weights, bounds)
     return local_batch(gram, mesh, resident=(0, 1, 2, 3), nbatch=nbatch)(b, right, weights, bounds)
-
-@lru_cache(maxsize=64)
-def _kernel(mesh, q, m, k, n, width, sample_axis):
-    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    mx, ny, kx, ky = m // px, n // py, k // px, k // py
-    spec = P(None, None, 'x', 'y') if sample_axis else P(None, 'x', 'y')
-    face_a = NamedSharding(mesh, P(None, 'x', 'y'))
-    @partial(shard_map, mesh=mesh,
-             in_specs=(P(None, 'x', 'y'), spec), out_specs=spec,
-             check_vma=False)
-    def product(a, b):
-        if not sample_axis:
-            b = b[:, None]
-        ns = b.shape[1]
-        x, y = lax.axis_index('x'), lax.axis_index('y')
-
-        def panel(c, ip):
-            start = ip * width
-            left = lax.dynamic_slice(a, (0, 0, start % ky), (q, mx, width))
-            left = lax.psum(jnp.where(y == start // ky, left, 0), 'y')
-
-            def sample(c, isample):
-                right = lax.dynamic_slice(b, (0, isample, start % kx, 0),
-                                          (q, 1, width, ny))[:, 0]
-                right = lax.psum(jnp.where(x == start // kx, right, 0), 'x')
-                old = lax.dynamic_slice(c, (0, isample, 0, 0), (q, 1, mx, ny))
-                value = old + (left @ right)[:, None]
-                return lax.dynamic_update_slice(c, value, (0, isample, 0, 0)), None
-
-            c, _ = lax.scan(sample, c, jnp.arange(ns), unroll=1)
-            return c, None
-
-        c = jnp.zeros((q, ns, mx, ny), a.dtype)
-        c, _ = lax.scan(panel, c, jnp.arange(k // width), unroll=1)
-        return c if sample_axis else c[:, 0]
-
-    face_b = NamedSharding(mesh, spec)
-    return jax.jit(product, in_shardings=(face_a, face_b), out_shardings=face_b)
-
 
 @lru_cache(maxsize=64)
 def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, partner=False,

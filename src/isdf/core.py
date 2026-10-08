@@ -32,15 +32,14 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-# The distributed-linalg PUBLIC API: the factor-token type, the q-local batch
-# layout, mesh probing and the STABLE mesh cache key.
+# The distributed-linalg PUBLIC API: the q-local batch layout, mesh probing
+# and the STABLE mesh cache key.
 #
 # ``mesh_key`` rather than ``id(mesh)`` for the two ANNOUNCEMENT sets below:
 # id() is only safe where the cached value retains the mesh (every kernel
 # cache in this file does; a set of strings does not), and the failure mode
 # when it does not is a stale HIT on a recycled id.
 from distrib_la import (                                            # noqa: E402
-    FactorToken,
     batch_layout as linalg_batch_layout,
     is_batch_layout as linalg_is_batch_layout,
     mesh_key as _mesh_key,

@@ -1074,15 +1074,14 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     with the distributed route; callers do not grow a second eigensolver.
 
     Batching asymmetry (only ScaLAPACK has a batched entry; cuSOLVERMp
-    and SLATE do not) is handled by ``distrib_la.dispatch_batched_eigh``,
-    not here — it is a backend-capability question, not a physics one.
+    and SLATE do not) is the eigh plan's ``batched_route``, not here — it is
+    a backend-capability question, not a physics one.
 
     ``pXheevd`` is the permanent CPU distributed eigh; the batched entry
     costs one collective-serialisation round for the whole k stack rather
     than one per k.  Chosen against the usual cost argument on purpose:
-    ``distrib_la.dispatch`` records that the native path solves ndev
-    matrices at once and wins by roughly ndev whenever a tile fits on one
-    device, which at nb=640 (6.5 MB) it does.  At nb=10⁴ a tile is 1.6 GB
+    the native path solves ndev matrices at once and wins by roughly ndev
+    whenever a tile fits on one device, which at nb=640 (6.5 MB) it does.  At nb=10⁴ a tile is 1.6 GB
     and at 2·10⁴ it is 6.4 GB, on ONE device on top of ψ and the FFT
     boxes — the owner's ruling is robustness there over speed here
     (2026-08-04).
@@ -1097,7 +1096,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
     """
     from ffi import _services
     _services.ensure_on_path()
-    from distrib_la import dispatch_batched_eigh
+    import distrib_la
 
     H_j = jnp.asarray(H)
     nb = int(H_j.shape[1])
@@ -1141,9 +1140,11 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
         j = jnp.arange(nb_pad)[None, :]
         on_pad_diag = ((i == j) & (i >= nb))[None]
         H_j = jnp.where(on_pad_diag, sentinel[:, None, None], H_j)
-    E, U = dispatch_batched_eigh(
-        H_j, mesh, distrib_la_backend,
-        batched_route=distrib_la_batched_route)
+    plan = distrib_la.plan("eigh", mesh, backend=distrib_la_backend, n=nb_pad,
+                           batched_route=distrib_la_batched_route)
+    E, U = plan.batched(H_j)
+    if plan.batch_in_sharding is not None:
+        U = distrib_la.ensure_sharding(U, plan.batch_in_sharding)
     if nb_pad != nb:
         # THE SEAM. Drop by COUNT, never by value — same shape contract the
         # rCROP carry restores at sc_iteration.py:1509-1514. Callers get the

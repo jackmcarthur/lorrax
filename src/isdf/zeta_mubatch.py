@@ -748,12 +748,6 @@ class ZetaG:
     def __init__(self, store, *, mesh, L_q, lu_piv, solver_kind,
                  batched_route, n_rmu_solve, n_rmu, mu_basis,
                  ngk_per_q, gvec_components, path, print_fn=print):
-        from isdf.core import FactorToken
-        if isinstance(L_q, FactorToken):
-            raise ValueError(
-                "ZetaG: route G applies a whole-tile factor on each G tile; got a "
-                "block-cyclic FactorToken (factor the channel with "
-                "distrib_la_batched_route='batch_reshard').")
         self.store = store
         self.print_fn = print_fn        # the fit's report sink (V_q receipt)
         self.mesh = mesh

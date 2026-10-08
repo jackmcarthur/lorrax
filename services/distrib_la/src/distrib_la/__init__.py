@@ -69,11 +69,6 @@ layout='face', enable_active_range=False) -> GemmPlan``
     these run the same elementwise program with face output shardings, so
     values are bitwise equal. Traced or unsharded operands take the plain
     function.
-``factor(op, A, mesh, ...) -> FactorToken`` / ``solve(token, B)``
-    Factor once, back-solve many.  The token is opaque and carries the
-    handle (scalapack's ``ipiv``, cuSOLVERMp's raw buffer, SLATE's
-    ``SlateLowerL``), so "never reshard, feed it back verbatim" is the
-    type rather than a comment.
 ``resolve_backend(op, requested, mesh, *, n=None) -> str``
     The raising probe.  ``n`` is decoupled from the operands on purpose:
     a caller that will pad can ask before it has built anything.
@@ -112,8 +107,6 @@ from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
 from distrib_la.subspace import plan_orthogonalization, plan_subspace
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
 from distrib_la.workspace import eigh_stack_bytes, fits_local, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
-from distrib_la.dispatch import dispatch_batched_eigh
-from distrib_la.factor import FactorToken, factor, solve
 from distrib_la.loader import dial_key, has_target, probe_target
 from distrib_la.matmul import (
     MATMUL_BACKEND_CHOICES,
@@ -184,16 +177,12 @@ __all__ = [
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
     "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_ROUTE_DEFAULT",
     "BATCHED_SCAN_UNROLL",
-    # factor / solve
-    "FactorToken", "factor", "solve",
     # resolution
     "resolve_backend", "list_backends", "backend_module",
     "BACKEND_CHOICES", "EIGH_BACKENDS", "CHOLESKY_BACKENDS", "LU_BACKENDS",
     "OPS", "NATIVE", "mesh_platform", "mesh_is_cpu", "mesh_key",
     # capability
     "probe_target", "has_target", "dial_key",
-    # dispatch
-    "dispatch_batched_eigh",
     # round-off tolerance of every linear-algebra check
     "roundoff_tol", "ROUNDOFF_MARGIN",
 ]

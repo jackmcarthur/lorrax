@@ -186,15 +186,7 @@ whether its buffers survive before it knows which library runs: `eigh` donates
 nothing, `cholesky` operand 0, `solve_lu` operands 0 and 1. A donated operand
 must be a fresh value at the call site.
 
-**Factor once, solve many.** `factor(op, A, mesh, *, backend, …) ->
-FactorToken` and `solve(token, B)` split an LU or Cholesky so one factor serves
-many right-hand sides (getrf once, getrs per call). The token exposes `op`,
-`backend`, `mesh`, `n` and `nbatch` and hides the factor (ScaLAPACK's `ipiv`,
-cuSOLVERMp's raw buffer, SLATE's lower factor), because that factor is
-block-cyclic on that mesh and only its own library can read it. A token is not
-a pytree, so passing it through `jit` refuses by name; `solve` checks `B`
-against `n` and `nbatch`. `plan('solve_lu').batched(A, B)` is one complete
-factor and solve per call.
+`plan('solve_lu').batched(A, B)` is one complete factor and solve per call.
 
 **Native Cholesky and LU belong to the caller.** Under `backend='native'`,
 `Plan(A)` implements `eigh` only; `cholesky` and `solve_lu` raise
@@ -218,8 +210,7 @@ matrices runs:
   distributed-library call.
 
 The caller selects `batched_route ∈ {'batch_reshard', 'auto'}`;
-`'batch_reshard'` is the default for `plan`, `dispatch_batched_eigh` and
-`matmul`. `'auto'` takes (b) when the backend has a stacked entry and (a)
+`'batch_reshard'` is the default for `plan` and `matmul`. `'auto'` takes (b) when the backend has a stacked entry and (a)
 otherwise. Route (c) is the default because for every matrix that fits one
 device a distributed library's cost is its fixed per-call charge, which the
 local kernel does not pay ([Backends § performance](backends.md#distributed-is-a-capacity-route)).
@@ -259,10 +250,6 @@ Nothing crosses the host.
   from the main thread ([collective transports](../../environment/transports.md)).
 - **Keywords.** `block_size` and `compute_evecs` are dropped at the route
   boundary; any other keyword raises `TypeError`.
-
-`dispatch_batched_eigh(A, mesh, backend='distributed', *,
-batched_route='batch_reshard')` is `plan('eigh', …).batched(A)` for
-`gw.qsgw_density`.
 
 ### The eigh-stack API {#eigh-stack}
 

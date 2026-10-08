@@ -33,8 +33,8 @@ __all__ = [
     "ensure_registered", "get_or_init_context", "context_key",
     "validate_mesh", "validate_tile_layout",
     # single-matrix ops
-    "SlateLowerL", "distributed_cholesky", "distributed_trsm",
-    "distributed_eigh", "batched_distributed_matmul",
+    "SlateLowerL", "distributed_cholesky",
+    "distributed_eigh",
 ]
 
 # =========================================================================
@@ -65,7 +65,7 @@ Restrictions
   doesn't support sub-mesh selection yet.
 * For 4 GPUs total, ``p * q == jax.process_count()``.  Sub-mesh
   partial-world support is a planned extension.
-* ``heev`` further requires ``p == q``; ``potrf`` and ``trsm`` don't.
+* ``heev`` further requires ``p == q``; ``potrf`` doesn't.
 """
 
 MeshKey = Tuple[int, int]  # (p, q)
@@ -282,12 +282,8 @@ inter-rank comm) so the bytes SLATE reads are correctly col-major.
 Combined with the C++-side MPI rank remap (``cpp/context.cc``), SLATE
 sees the user's matrix correctly assembled on **any p × q mesh**.
 
-Returns a :class:`SlateLowerL` opaque handle.  Two ways to consume it:
-
-  * Pass the handle to :func:`distributed_trsm` — trsm knows the handle's
-    layout and feeds it straight back to SLATE.
-  * Call :meth:`SlateLowerL.to_jax_lower` for a conventional row-major
-    lower-triangular L.
+Returns a :class:`SlateLowerL` opaque handle; :meth:`SlateLowerL.to_jax_lower`
+gives a conventional row-major lower-triangular L.
 
 Only ``Uplo::Lower`` (SLATE's potrf), dtypes F64 / C128.
 """
@@ -373,153 +369,6 @@ def distributed_cholesky(
 
     L_raw_T = _potrf(A)
     return SlateLowerL(raw=L_raw_T, mesh=mesh, n=n, nb=nb)
-
-
-# =========================================================================
-#  trsm  (merged from slate/trsm.py)
-# =========================================================================
-"""``distributed_trsm`` — JAX FFI wrapper around ``slate::trsm``.
-
-Solves one of:
-    op(A) @ X = alpha * B   (side='L')
-    X @ op(A) = alpha * B   (side='R')
-
-Layout: same scheme as ``distributed_cholesky`` (per-rank local
-transpose + C++ side rank remap).
-
-For the :class:`SlateLowerL` handle path the underlying buffer is
-already in SLATE-tile col-major (``P('y','x')``-sharded), so A skips
-the local transpose; ``side``/``uplo`` are pinned by the handle and
-``op`` selects forward (``'N'``: ``L X = B``) vs adjoint (``'C'``:
-``L^H X = B``).
-"""
-
-_TRSM_FFI_TARGET = "lorrax_slate_trsm"
-
-_SIDE = {"L": 0, "R": 1}
-_UPLO = {"L": 0, "U": 1}
-_OP = {"N": 0, "T": 1, "C": 2}
-_DIAG = {"N": 0, "U": 1}
-
-
-def distributed_trsm(
-    A,
-    B: jax.Array,
-    *,
-    mesh: Mesh,
-    side: Literal["L", "R"] = "L",
-    uplo: Literal["L", "U"] = "L",
-    op: Literal["N", "T", "C"] = "N",
-    diag: Literal["N", "U"] = "N",
-    alpha: complex | float = 1.0,
-    block_size: int | None = None,
-) -> jax.Array:
-    """Distributed triangular solve.
-
-    A : SlateLowerL or square 2-D jax.Array sharded ``P('x','y')``.
-    B : 2-D jax.Array sharded ``P('x','y')``.
-
-    For the SlateLowerL handle path, side/uplo are pinned to the
-    standard cholesky-factor convention: op='N' is forward solve
-    (L @ X = B); op='C' is adjoint (L^H @ X = B).
-    """
-    p, q = validate_mesh(mesh)
-
-    if isinstance(A, SlateLowerL):
-        # Handle.raw is already in SLATE-tile col-major (P('y','x') sharded).
-        if op not in ("N", "C"):
-            raise ValueError(f"distributed_trsm(SlateLowerL, ...): "
-                             f"op must be 'N' or 'C'; got {op!r}")
-        side, uplo = "L", "L"
-        n = A.n
-        if block_size is None:
-            block_size = A.nb
-        if mesh.axis_names != A.mesh.axis_names:
-            raise ValueError(
-                "trsm mesh axis names don't match the handle's mesh.")
-        A_is_handle = True
-        A_arg = A.raw
-    else:
-        if A.ndim != 2 or A.shape[0] != A.shape[1]:
-            raise ValueError(
-                f"distributed_trsm: expected square A; got {A.shape}")
-        n = int(A.shape[0])
-        A_is_handle = False
-        A_arg = A
-
-    if B.ndim != 2:
-        raise ValueError(f"distributed_trsm: expected 2D B; got {B.shape}")
-    if A_arg.dtype != B.dtype:
-        raise ValueError(
-            f"distributed_trsm: A.dtype {A_arg.dtype} != B.dtype {B.dtype}")
-
-    if side == "L":
-        if B.shape[0] != n:
-            raise ValueError(
-                f"side='L' requires B.shape[0]==n={n}; got B.shape={B.shape}")
-        m = int(B.shape[1])
-    else:
-        if B.shape[1] != n:
-            raise ValueError(
-                f"side='R' requires B.shape[1]==n={n}; got B.shape={B.shape}")
-        m = int(B.shape[0])
-    # B is sharded P('x','y'): axis 0 over p, axis 1 over q — for BOTH
-    # sides (the old per-side (n % p, m % q) check validated the wrong
-    # axes for side='R').
-    if int(B.shape[0]) % p != 0 or int(B.shape[1]) % q != 0:
-        raise ValueError(
-            f"B.shape={tuple(B.shape)} must be divisible by the mesh axes "
-            f"({p},{q}) along (rows, cols)")
-
-    ensure_registered(mesh)
-    ctx_key = context_key(mesh)
-    nb = n // max(p, q) if block_size is None else int(block_size)
-    validate_tile_layout(n, nb, p, q, what="distributed_trsm")
-
-    # Local transpose of B: each rank flips its (B0/p, B1/q) row-major
-    # shard to (B1/q, B0/p) row-major (= original block in col-major
-    # layout).  Local op only; no inter-rank comm.
-    bshape_local_T = (B.shape[1] // q, B.shape[0] // p)
-    X_local_T = jax.ShapeDtypeStruct(bshape_local_T, B.dtype)
-
-    alpha_c = complex(alpha)
-    attrs = dict(
-        n=n, m=m, nb=nb,
-        side=_SIDE[side], uplo=_UPLO[uplo], op=_OP[op], diag=_DIAG[diag],
-        alpha_re=float(alpha_c.real),
-        alpha_im=float(alpha_c.imag),
-        ctx_key=int(ctx_key),
-    )
-
-    # When A is a handle, A_arg is already P('y','x') sharded with
-    # col-major bytes; just feed it through.  Otherwise, local-transpose.
-    if A_is_handle:
-        @partial(shard_map, mesh=mesh,
-                 in_specs=(P("y", "x"), P("x", "y")),
-                 out_specs=P("y", "x"), check_vma=False)
-        def _trsm(local_A_handle, local_B):
-            local_B_T = jnp.transpose(local_B, (1, 0))
-            return jax.ffi.ffi_call(_TRSM_FFI_TARGET, X_local_T)(
-                local_A_handle, local_B_T, **attrs)
-        X_T = _trsm(A_arg, B)
-    else:
-        @partial(shard_map, mesh=mesh,
-                 in_specs=(P("x", "y"), P("x", "y")),
-                 out_specs=P("y", "x"), check_vma=False)
-        def _trsm(local_A, local_B):
-            local_A_T = jnp.transpose(local_A, (1, 0))
-            local_B_T = jnp.transpose(local_B, (1, 0))
-            return jax.ffi.ffi_call(_TRSM_FFI_TARGET, X_local_T)(
-                local_A_T, local_B_T, **attrs)
-        X_T = _trsm(A_arg, B)
-
-    # Local-transpose X back to user's P('x','y') row-major.
-    @partial(shard_map, mesh=mesh,
-             in_specs=P("y", "x"), out_specs=P("x", "y"),
-             check_vma=False)
-    def _untranspose(local_X_T):
-        return jnp.transpose(local_X_T, (1, 0))
-    return _untranspose(X_T)
 
 
 # =========================================================================
@@ -635,106 +484,3 @@ def distributed_eigh(
         return jnp.transpose(local_Q_T, (1, 0))
 
     return W, _untranspose(Q_T)
-
-
-# =========================================================================
-#  batched ops  (merged from slate/batched.py)
-# =========================================================================
-"""``batched_distributed_matmul`` — ``slate::multiply`` over a face-sharded stack.
-
-The library also exports ``lorrax_slate_batched_{potrf,trsm}``; no Python
-wrapper calls them.
-"""
-
-_GEMM_TARGET = "lorrax_slate_batched_gemm"
-
-# jit(shard_map(...)) cache per signature.  shard_map in eager mode
-# re-traces per call; wrapping in jax.jit once and reusing eliminates
-# that cost when the user loops the same-shape op.
-_JIT_CACHE: dict = {}
-
-
-#: The package's ONE mesh cache key (:func:`distrib_la.mesh_key`).  This
-#: module's private spelling is kept because ``_scalapack`` and eight call
-#: sites in this file import it by that name; it is an alias, not a copy.
-_mesh_key = mesh_key
-
-
-def batched_distributed_matmul(
-    A: jax.Array, B: jax.Array, C: jax.Array, *, mesh: Mesh,
-    alpha=1.0, beta=0.0, transa: str = "N", transb: str = "N",
-) -> jax.Array:
-    """``slate::multiply`` over a face-sharded matrix stack.
-
-    A, B, and C are rank-3 ``P(None,'x','y')`` arrays; the result has C's
-    shape and returns at the same sharding.  The public
-    :func:`distrib_la.matmul` entry point supplies rank-2 lifting, placement,
-    provider resolution, and the optional zero C.  This backend requires a
-    process grid, float64 or complex128, N/T/C operation codes, exact
-    one-face-per-rank tiling, and one JAX process per mesh cell. CUDA uses
-    ``slate::Target::Devices``; CPU uses ``Target::HostTask``.
-    """
-    if A.ndim != 3 or B.ndim != 3 or C.ndim != 3:
-        raise ValueError("slate matmul expects three rank-3 operands")
-    if A.dtype != B.dtype or A.dtype != C.dtype:
-        raise ValueError("slate matmul operands must share dtype")
-    if A.dtype not in (jnp.dtype("float64"), jnp.dtype("complex128")):
-        raise ValueError(f"slate matmul supports float64/complex128; got {A.dtype}")
-    transa, transb = transa.upper(), transb.upper()
-    if transa not in "NTC" or transb not in "NTC":
-        raise ValueError("slate matmul transa/transb must be N/T/C")
-    px, py = validate_mesh(mesh, require_square=True)
-    nq, ar, ac = map(int, A.shape)
-    br, bc = int(B.shape[1]), int(B.shape[2])
-    m, ka = ((ar, ac) if transa == "N" else (ac, ar))
-    kb, n = ((br, bc) if transb == "N" else (bc, br))
-    if ka != kb or tuple(C.shape) != (nq, m, n):
-        raise ValueError(
-            f"slate matmul shapes disagree: A={A.shape}, B={B.shape}, "
-            f"C={C.shape}, trans={transa}/{transb}")
-    for dim, divisor, name in (
-            (ar, px, "A rows"), (ac, py, "A cols"),
-            (br, px, "B rows"), (bc, py, "B cols"),
-            (m, px, "C rows"), (n, py, "C cols")):
-        if dim % divisor:
-            raise ValueError(
-                f"slate matmul {name}={dim} not divisible by {divisor}")
-    ensure_registered(mesh)
-    ctx_key = context_key(mesh)
-    alpha, beta = complex(alpha), complex(beta)
-    attrs = dict(
-        nq=nq, m=m, n=n, k=ka,
-        a_rows=ar, a_cols=ac, b_rows=br, b_cols=bc,
-        mb_a=ar // px, nb_a=ac // py,
-        mb_b=br // px, nb_b=bc // py,
-        mb_c=m // px, nb_c=n // py,
-        transa={"N": 0, "T": 1, "C": 2}[transa],
-        transb={"N": 0, "T": 1, "C": 2}[transb],
-        alpha_re=float(alpha.real), alpha_im=float(alpha.imag),
-        beta_re=float(beta.real), beta_im=float(beta.imag),
-        ctx_key=int(ctx_key))
-    key = ("slate_gemm", _mesh_key(mesh), A.dtype, A.shape, B.shape,
-           C.shape, transa, transb, alpha, beta, int(ctx_key))
-    fn = _JIT_CACHE.get(key)
-    if fn is None:
-        local_out_t = jax.ShapeDtypeStruct((nq, n // py, m // px), C.dtype)
-
-        @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),) * 3,
-                 out_specs=P(None, "y", "x"), check_vma=False)
-        def _call(a, b, c):
-            return jax.ffi.ffi_call(
-                _GEMM_TARGET, local_out_t,
-                input_output_aliases={2: 0})(
-                    jnp.transpose(a, (0, 2, 1)),
-                    jnp.transpose(b, (0, 2, 1)),
-                    jnp.transpose(c, (0, 2, 1)), **attrs)
-
-        @partial(shard_map, mesh=mesh, in_specs=P(None, "y", "x"),
-                 out_specs=P(None, "x", "y"), check_vma=False)
-        def _untranspose(d):
-            return jnp.transpose(d, (0, 2, 1))
-
-        fn = jax.jit(lambda a, b, c: _untranspose(_call(a, b, c)),
-                     donate_argnums=(2,))
-        _JIT_CACHE[key] = fn
-    return fn(A, B, C)

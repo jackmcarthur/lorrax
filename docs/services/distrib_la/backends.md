@@ -171,9 +171,8 @@ cuBLASMp, which communicate through NCCL.
 handler. The loader also declares `lorrax_scalapack_batched_gemm` and
 `lorrax_slate_batched_gemm`, and `lorrax_slate_batched_potrf` /
 `_batched_trsm` exist on both legs, but no C++ defines the two GEMM targets
-and no Python wrapper calls the batched SLATE pair: an explicit `scalapack`
-or `slate` GEMM refuses at the capability probe, and batched SLATE Cholesky
-is `distrib_la.factor`'s scan of `slate::potrf`.
+and no Python wrapper calls them or the batched SLATE pair: an explicit
+`scalapack` or `slate` GEMM refuses at the capability probe.
 
 ## Distributed is a capacity route {#capacity-route}
 
@@ -246,10 +245,9 @@ environmental.
 SLATE serves explicit Cholesky on CPU meshes, and is the declared ROCm
 backend. Its Python wrappers are in `distrib_la._slate` (reached through
 `distrib_la.backend_module('slate')`, never imported directly):
-`distributed_cholesky` (`slate::potrf`, returning an opaque lower factor),
-`distributed_trsm` (`slate::trsm`), `distributed_eigh` (`slate::heev`, refused
-on CPU and above `n = 2048` on multi-rank CUDA) and `batched_distributed_matmul`
-(whose handler is not built). Three pieces make SLATE read JAX-sharded data:
+`distributed_cholesky` (`slate::potrf`, returning an opaque lower factor) and
+`distributed_eigh` (`slate::heev`, refused on CPU and above `n = 2048` on
+multi-rank CUDA). Three pieces make SLATE read JAX-sharded data:
 
 1. **Local transpose.** JAX tiles are row-major and SLATE tiles column-major.
    Each rank transposes its own `(n/p, n/q)` shard to `(n/q, n/p)` inside a
@@ -359,12 +357,10 @@ the LORRAX loader also reaches the handler.
    by `lax.scan` over the single one; a single-matrix entry that returns a
    library handle sets `one_handle=True`. Normalize conventions here, never at
    call sites.
-5. An opaque factor gets a branch in `distrib_la/factor.py`, so it leaves only
-   as a `FactorToken` and returns through `solve()`.
-6. The eigh vocabulary reaches the deck parser through
+5. The eigh vocabulary reaches the deck parser through
    `gw_config.eigh_backend_choices()`, which reads `BACKEND_CHOICES`; nothing
    else changes.
-7. Add a check beside the existing ones in `services/distrib_la/bench/`
-   (`cusolvermp_eigh_test.py`, `slate_cholesky_trsm_test.py`) that asserts the
+6. Add a check beside the existing one in `services/distrib_la/bench/`
+   (`cusolvermp_eigh_test.py`) that asserts the
    residual ($AZ - Z\,\mathrm{diag}(w)$, or the factor's reconstruction) on a
    real mesh, and update the tables on this page.
