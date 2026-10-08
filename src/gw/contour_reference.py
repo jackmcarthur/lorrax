@@ -481,19 +481,15 @@ def real_residue_derivative_node(derivative_s, derivative_t_s, x, occ, node, *,
             - _apply(partner, xp.where(sign, selected, 0.), xp))
 
 
-def real_part(values, derivatives_s, values_t, derivatives_t_s, x, occ, nodes,
-              *, eta, n_active=None, band_valid=None, spacing=None,
-              analytic_convention="time_ordered_fractional", xp=np):
-    """Cubic Hermite residues on an authenticated uniform positive real grid.
+def prepare_real_residue_grid(x, occ, nodes, *, eta, n_active=None,
+                              band_valid=None, spacing=None,
+                              analytic_convention="time_ordered_fractional", xp=np):
+    """Prepare the existing Hermite residue algebra for bounded node streaming.
 
-    Values are sampled at ``nodes+i eta``; the partner samples are already
-    transposed and contracted with the current pair density. Both derivative
-    arrays use the derivative of that same positive real coordinate. Every
-    nonzero physical residue must have two bracketing nodes. ``n_active``
-    excludes explicitly zero carrier bands, never a physical band tail.
-    ``band_valid`` optionally masks per-k ragged spectrum padding explicitly;
-    padded wavefunction coefficients must already be exact zero at the caller.
-    ``spacing`` can select an integer coarsening of the same node grid.
+    The returned callable yields four contributions per node in the exact
+    order used by :func:`real_part`. It stores only scalar crossing geometry;
+    it owns neither interaction fields nor projection histories. Its stride
+    and node_count identify the authenticated uniform/coarsened node roster.
     """
     xh, fh = _inputs(x, occ, eta)
     _kernels(xh, fh, eta, analytic_convention, np)
@@ -512,9 +508,6 @@ def real_part(values, derivatives_s, values_t, derivatives_t_s, x, occ, nodes,
     last = nodes[((nodes.size - 1) // stride) * stride]
     if np.any(active & (residue != 0) & (query > last)):
         raise ValueError("CD residue coverage: an active crossing exceeds the last coarse-grid node")
-    for samples in (values, derivatives_s, values_t, derivatives_t_s):
-        if len(samples) != len(nodes):
-            raise ValueError("CD values/derivatives must cover every declared real node")
     index = np.floor(query / spacing).astype(np.int64)
     index = np.minimum(index, max(0, (nodes.size - 1) // stride - 1))
     t = query / spacing - index
@@ -525,23 +518,61 @@ def real_part(values, derivatives_s, values_t, derivatives_t_s, x, occ, nodes,
     index = xp.asarray(index)
     residue = xp.asarray(residue)
     coeff = tuple(xp.asarray(c) for c in coeff)
-    total = 0
-    for inode in range(0, len(nodes), stride):
+
+    def terms(inode, value, derivative_s, value_t, derivative_t_s):
+        if isinstance(inode, (bool, np.bool_)) or not isinstance(inode, (int, np.integer)):
+            raise ValueError("CD real-grid node index must be an integer")
+        inode = int(inode)
+        if not 0 <= inode < len(nodes) or inode % stride:
+            raise ValueError("CD real-grid node is outside the declared coarsening")
         node = inode // stride
         z = nodes[inode] + 1j * eta
-        partner_value = values_t[inode]
-        partner_slope = 2*z*derivatives_t_s[inode]
+        partner_value = value_t
+        partner_slope = 2*z*derivative_t_s
         if analytic_convention == "retarded":
             partner_value = _dagger(partner_value, xp)
             partner_slope = _dagger(partner_slope, xp)
-        for deriv, value, partner in ((False, values[inode], partner_value),
-                                      (True, 2*z*derivatives_s[inode], partner_slope)):
+        out = []
+        for deriv, field, partner in ((False, value, partner_value),
+                                      (True, 2*z*derivative_s, partner_slope)):
             left, right = coeff[2:] if deriv else coeff[:2]
             selected = xp.where(active, residue * (xp.where(index == node, left, 0.)
                                                    + xp.where(index + 1 == node, right, 0.)), 0.)
-            total = total + _apply(value, xp.where(sign, 0., selected), xp)
-            total = total + _apply(partner, xp.where(sign, selected, 0.), xp)
+            out.append(_apply(field, xp.where(sign, 0., selected), xp))
+            out.append(_apply(partner, xp.where(sign, selected, 0.), xp))
+        return tuple(out)
+    terms.stride = int(stride)
+    terms.node_count = len(nodes)
+    return terms
+
+
+def real_part(values, derivatives_s, values_t, derivatives_t_s, x, occ, nodes,
+              *, eta, n_active=None, band_valid=None, spacing=None,
+              analytic_convention="time_ordered_fractional", xp=np):
+    """Cubic Hermite residues on an authenticated uniform positive real grid.
+
+    Values are sampled at ``nodes+i eta``; the partner samples are already
+    transposed and contracted with the current pair density. Both derivative
+    arrays use the derivative of that same positive real coordinate. Every
+    nonzero physical residue must have two bracketing nodes. ``n_active``
+    excludes explicitly zero carrier bands, never a physical band tail.
+    ``band_valid`` optionally masks per-k ragged spectrum padding explicitly;
+    padded wavefunction coefficients must already be exact zero at the caller.
+    ``spacing`` can select an integer coarsening of the same node grid.
+    """
+    terms = prepare_real_residue_grid(x, occ, nodes, eta=eta, n_active=n_active,
+        band_valid=band_valid, spacing=spacing,
+        analytic_convention=analytic_convention, xp=xp)
+    for samples in (values, derivatives_s, values_t, derivatives_t_s):
+        if len(samples) != terms.node_count:
+            raise ValueError("CD values/derivatives must cover every declared real node")
+    total = 0
+    for inode in range(0, terms.node_count, terms.stride):
+        for term in terms(inode, values[inode], derivatives_s[inode],
+                          values_t[inode], derivatives_t_s[inode]):
+            total = total + term
     return total
+
 
 
 def integrate_ordered(values, derivatives_s, values_t, derivatives_t_s, x, occ,
