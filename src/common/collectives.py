@@ -102,6 +102,7 @@ __all__ = [
     "collective_atomic_file_transaction",
     # mesh construction (and the warm-up that must accompany it)
     "resolve_mesh",
+    "require_full_mesh",
     "single_device_mesh",
     "mesh_is_emulated",
     "prepare_mesh",
@@ -258,6 +259,20 @@ def _require_addressable(mesh, *, origin: str):
 #: run's mesh must get THE mesh back, not an equal-but-distinct twin
 #: (``centroid.distribution.build_mesh`` and the BSE factory both re-resolve).
 _CANONICAL_MESHES: dict = {}
+
+
+def require_full_mesh(mesh, *, origin='all-P operation'):
+    """Require a caller mesh to include every canonical participating device.
+
+    ``resolve_mesh(mesh)`` owns caller-addressability and ``resolve_mesh()``
+    owns the global roster. Mesh device membership uses its public devices
+    array, including on JAX versions without a ``device_set`` attribute.
+    """
+    caller=resolve_mesh(mesh)
+    canonical=resolve_mesh()
+    if set(caller.devices.flat) != set(canonical.devices.flat):
+        raise ValueError(f'{origin}: complete global processor mesh required')
+    return caller
 
 
 def resolve_mesh(mesh=None, *, axis_names=("x", "y")):

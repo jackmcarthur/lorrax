@@ -30,6 +30,37 @@ def retained_span_columns(side, kept):
     return min(int(side), int(kept))
 
 
+def real_gamma_projection_bytes(*, mesh_xy, parents, rows, side, keep_budget, retained_panels=()):
+    """The second Gamma stage, after the ordinary Ritz workspace is dead.
+
+    The source hook retains G/H/O, Y and its action inputs across the first
+    reduction. Raw mixed K/L, normalized contractions and the real reduction
+    follow that dependency. Price that carry explicitly; the first reducer's
+    eigenworkspace and dense temporaries do not coexist with this stage.
+    Every large matrix remains tiled over every XY rank. Real and complex
+    chains are both bounded here; no compiler memory measurement is assumed.
+    """
+    p = int(mesh_xy.size)
+    b, n, r = int(parents), int(rows), int(side)
+    c = min(int(keep_budget), r)
+    a = 2*c
+    terms = dict(
+        original_G_H_and_Y=3*r*r*16,
+        original_O_and_Q_O_D=4*n*r*16,
+        mixed_K_L=2*r*r*16,
+        normalized_matrices_and_products=6*r*r*16,
+        compact_coefficient_products=4*r*c*16,
+        real_reduction_chain=14*a*a*8,
+        complex_original_anchor_checks=8*a*a*16,
+        augmented_factors_and_anchor_panels=8*n*a*16)
+    terms = {name: math.ceil(b*value/p) for name, value in terms.items()}
+    terms['previous_parent_factors'] = sum(math.ceil(array.size*np.dtype(array.dtype).itemsize/p)
+        for array in {id(array): array for array in retained_panels}.values())
+    return dict(resident_bytes_per_rank=sum(terms.values()), terms_bytes_per_rank=terms,
+                original_side=r, compact_side=c, augmented_side=a,
+                lifetime_scope='after first ordinary reduction; original pencil/actions/Y retained, first eigensolver workspace released')
+
+
 def held_sector_bytes(n, side, kept):
     """Bytes per parent a finished diagonal sector round keeps for the CT round.
 

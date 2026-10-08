@@ -309,24 +309,37 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 column_extent=column_extent, ordered=ordered, odd_moments=odd_moments,
                 key=("scalar", logical_n, ordered, odd_moments), history=carrier_history(meta))
             side = int(tables["active"].shape[-1])
+            real_gamma = real == 1 and ids[0] in gamma_parents
+            if execution == 'face':
+                # The isolated Gamma round has one parent at this actual
+                # side. Ordinary rounds keep their admitted batch price.
+                budget.program_bytes = (face_reduction_bytes(mesh_xy, len(ids), rows=n, side=side,
+                    carrier=sizing['carrier']) if real_gamma else
+                    execution_receipt['face_batch']['program_bytes_per_rank'])
             # Resolve before either reduction program is traced; the ledger
             # warns when the route price is over the budget.
             local_eigh = budget.eigenplan(side)
             reduction_row = budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
                 round_states, infinity, widths, infinity_width))
-            real_gamma = real == 1 and ids[0] in gamma_parents
             if real_gamma:
                 import distrib_la
                 from gw.shared_pole_execution import face_eigh
+                from gw.shared_pole_capacity import real_gamma_projection_bytes
+                if reduction_row['device_budget_status'] != 'PASS':
+                    raise MemoryError('First ordinary Gamma reduction exceeds explicit full-mesh device capacity')
                 span = min(int(recipe['pole_budget']), side)
                 aug = 2 * span
                 real_plan = face_eigh(mesh_xy, aug, room=0)
                 workspace = distrib_la.workspace_bytes_per_rank(real_plan, 'eigh', ((aug, aug),), np.float64)
-                # K/L, the original/compacted Y maps and normalized contractions;
-                # the real pencil/solver plus complex physical-anchor consumers.
-                extra = len(ids) * (8*side*side + 4*side*span + 12*aug*aug + 4*n*aug)*16//mesh_xy.size
-                gamma_price = ledger.reserve('constructor.gamma-real-projection', resident_bytes_per_rank=extra,
-                    workspace_bytes_per_rank=int(workspace), concurrent_with=(reduction_row['stage'],))
+                # These are successive stages of the same source program.
+                # The new stage retains the original matrices/Y/actions;
+                # first-reducer workspace is dead before mixed K/L assembly.
+                gamma_terms = real_gamma_projection_bytes(mesh_xy=mesh_xy, parents=len(ids), rows=n,
+                    side=side, keep_budget=recipe['pole_budget'], retained_panels=budget.retained_panels)
+                gamma_price = ledger.reserve('constructor.gamma-real-projection',
+                    resident_bytes_per_rank=gamma_terms['resident_bytes_per_rank'],
+                    workspace_bytes_per_rank=int(workspace), concurrent_with=upstream)
+                gamma_price['staged_terms'] = gamma_terms
                 if gamma_price['device_budget_status'] != 'PASS':
                     raise MemoryError('Gamma real projection exceeds explicit full-mesh device capacity')
             round_states, infinity = pad_states(round_states, widths, infinity, infinity_width)
