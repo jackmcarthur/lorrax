@@ -206,3 +206,28 @@ def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul, matrix_shar
         output = join_columns(output, oi)
     return (*(_matrix_layout(a, matrix_sharding) for a in
               (hermitian_part(g), hermitian_part(h), output)), z)
+
+
+def assemble_mixed_shared_pole_pencil(finite, infinity, *, matmul, matrix_sharding=None):
+    """Ordinary K=X.T X and L=X.T T X in the identical even input columns.
+
+    ``finite=(s,Q,O,D)`` is already packed by the round owner. This is an
+    ordinary bilinear pencil, not a Hermitian one; no block is averaged.
+    Its real-latent interpretation requires separately authenticated Gamma
+    charge time reversal. Generic q and ordered banks do not acquire it.
+    """
+    s, q, output, derivative = finite
+    kff, lff = finite_pencil_column((jnp.conj(s), jnp.conj(q), jnp.conj(output)),
+        finite, matmul=matmul, matrix_sharding=matrix_sharding)
+    qi, m1qi, m3qi = infinity
+    kif = matmul(qi, output, transa="T")
+    kfi = matmul(output, qi, transa="T")
+    kii = 2 * matmul(qi, m1qi, transa="T")
+    nodes = jnp.broadcast_to(s, (q.shape[0], q.shape[-1]))
+    lif = _matrix_layout(nodes[:, None, :] * kif - 2 * matmul(m1qi, q, transa="T"), matrix_sharding)
+    lfi = _matrix_layout(nodes[:, :, None] * kfi - 2 * matmul(q, m1qi, transa="T"), matrix_sharding)
+    lii = 2 * matmul(qi, m3qi, transa="T")
+    def blocks(ff, fi, if_, ii):
+        return _matrix_concat((_matrix_concat((ff, fi), -1, matrix_sharding),
+                               _matrix_concat((if_, ii), -1, matrix_sharding)), -2, matrix_sharding)
+    return blocks(kff, kfi, kif, kii), blocks(lff, lfi, lif, lii)

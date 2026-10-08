@@ -332,7 +332,7 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
                         gates, ordered, odd_moments, keep_budget, retain_span=False, matrix_sharding=None,
-                        gram_keep=None, carrier=None):
+                        gram_keep=None, carrier=None, real_gamma=False, real_eigh=None):
     """One equation owner for local and whole-mesh parent execution.
 
     Inputs carry one or more independent parents. Execution adapters supply
@@ -373,6 +373,31 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
         retained = retained_moment_identity(pencil, coefficients, model, selector.astype(jnp.complex128),
                                             matmul=matmul)
         signed = ()
+    if real_gamma:
+        if ordered or retain_span or keep_budget is None or real_eigh is None:
+            raise ValueError("GATE shared_pole_real_gamma: requires even bounded-cap Gamma and its real all-mesh plan; augmented coordinates are not an original-pencil Y")
+        from gw.shared_pole_gates import sort_shared_pole_columns
+        from gw.shared_pole_pencil import assemble_mixed_shared_pole_pencil, _matrix_take_columns
+        from gw.shared_pole_reduction import real_galerkin_pencil, reduce_real_galerkin_pencil
+        first_retained = retained
+        first_model, permutation = sort_shared_pole_columns(model, matrix_sharding=matrix_sharding)
+        span = min(int(keep_budget), int(coefficients.shape[-1]))
+        compact_order = jnp.broadcast_to(jnp.arange(span)[None], (q.shape[0], span))
+        coefficients = _matrix_take_columns(coefficients, permutation, matrix_sharding)
+        coefficients = _matrix_take_columns(coefficients, compact_order, matrix_sharding)
+        compact_active = first_model[2][:, :span]
+        coefficients = coefficients * compact_active[:, None, :]
+        mixed = assemble_mixed_shared_pole_pencil((points, q, o, d), infinity,
+            matmul=matmul, matrix_sharding=matrix_sharding)
+        real_pencil = real_galerkin_pencil(pencil, mixed, coefficients, active,
+            matmul=matmul, matrix_sharding=matrix_sharding)
+        model, real_diagnostics, _ = reduce_real_galerkin_pencil(real_pencil, infinity[0],
+            eigh=real_eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
+            matrix_sharding=matrix_sharding, active_columns=jnp.concatenate((compact_active, compact_active), axis=-1))
+        real_reduction, real_zero, retained = real_diagnostics
+        method = dict(reduction=real_reduction, zero=real_zero, first_retained=first_retained,
+                      fresh_retained=retained)
+        return model, signed, (reduction, zero, retained, method)
     result = model, signed, (reduction, zero, retained)
     if retain_span:
         return (*result, coefficients)

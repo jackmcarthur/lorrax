@@ -598,3 +598,65 @@ def output_stage(stage, mu, rotation, *, matmul, gates, retain_span=False, matri
     if retain_span:
         return (*result, coefficients)
     return result
+
+
+def real_galerkin_pencil(pencil, mixed, coefficients, original_active, *, matmul, matrix_sharding=None):
+    """Phase-balanced real input columns from an authenticated Gamma Ritz span.
+
+    Coefficients contain ONLY final active columns of the first compression,
+    in matching model order. G/H/K/L retain the original packed input order.
+    Normalizing input columns before these contractions avoids amplifying
+    their dynamic range. This changes the Galerkin space, not a model field.
+    """
+    from gw.shared_pole_pencil import _matrix_concat
+    g, h, output = pencil
+    k, l = mixed
+    diagonal = jnp.real(jnp.diagonal(g, axis1=-2, axis2=-1))
+    scale = jnp.where(original_active, 1 / jnp.sqrt(jnp.where(diagonal > 0, diagonal, 1)), 0)
+    ye = _matrix_layout(coefficients / jnp.where(scale > 0, scale, 1)[:, :, None], matrix_sharding)
+    normalize = lambda a: _matrix_layout(scale[:, :, None] * a * scale[:, None, :], matrix_sharding)
+    m = matmul(ye, matmul(normalize(g), ye), transa="C")
+    s = matmul(ye, matmul(normalize(k), ye), transa="T")
+    a = matmul(ye, matmul(normalize(h), ye), transa="C")
+    lr = matmul(ye, matmul(normalize(l), ye), transa="T")
+    b = matmul(output, coefficients)
+    sd = jnp.diagonal(s, axis1=-2, axis2=-1)
+    phase = jnp.where(jnp.abs(sd) > 0, jnp.exp(.5j * (jnp.pi / 2 - jnp.angle(sd))), 1 + 0j)
+    hermitian_gauge = lambda x: _matrix_layout(jnp.conj(phase)[:, :, None] * x * phase[:, None, :], matrix_sharding)
+    ordinary_gauge = lambda x: _matrix_layout(phase[:, :, None] * x * phase[:, None, :], matrix_sharding)
+    m, a, s, lr = hermitian_gauge(m), hermitian_gauge(a), ordinary_gauge(s), ordinary_gauge(lr)
+    b = _matrix_layout(b * phase[:, None, :], matrix_sharding)
+    def augment(h_, k_):
+        rr, ri = .5 * jnp.real(h_ + k_), .5 * jnp.imag(k_ + h_)
+        ir, ii = .5 * jnp.imag(k_ - h_), .5 * jnp.real(h_ - k_)
+        return _matrix_concat((_matrix_concat((rr, ri), -1, matrix_sharding),
+                               _matrix_concat((ir, ii), -1, matrix_sharding)), -2, matrix_sharding)
+    return augment(m, s), augment(a, lr), _matrix_concat((jnp.real(b), jnp.imag(b)), -1, matrix_sharding)
+
+
+def reduce_real_galerkin_pencil(pencil, original_qi, *, eigh, matmul, gates, keep_budget, matrix_sharding=None, active_columns=None):
+    """Reduce real Gamma columns and check the original physical infinity anchors.
+
+    Original x_inf=B0.T Q_inf; with real O=B0 X_real, their cross Gram is
+    O.T Q_inf. E=Y Y.H (O.T Q_inf) represents their projection into the NEW
+    final Ritz span. The source moment owner checks that fresh projected
+    anchor. This does not reuse the old input selector or an identity test.
+    Physical full-bank moments/passivity/held checks remain caller duties.
+    """
+    from gw.shared_pole_gates import apply_shared_pole_zero_policy, retained_moment_identity
+    g, h, output = pencil
+    if any(a.dtype != jnp.float64 for a in pencil):
+        raise TypeError("real Galerkin reduction requires float64 input columns")
+    active = jnp.ones(g.shape[:1] + g.shape[-1:], dtype=bool) if active_columns is None else active_columns
+    model, reduction, y = reduce_shared_pole_pencil(pencil, active, eigh=eigh, matmul=matmul,
+        gates=gates, keep_budget=keep_budget)
+    model, zero = apply_shared_pole_zero_policy(model, gates=gates)
+    y = _matrix_layout(y * model[2][:, None, :], matrix_sharding)
+    # The physical-anchor consumer has complex Q_inf even when its response
+    # and the preceding eigensolves are real. Cast at this boundary only.
+    gc, hc, oc, yc = (_matrix_layout(a.astype(jnp.complex128), matrix_sharding) for a in (g, h, output, y))
+    cross = matmul(oc, original_qi, transa="T")
+    projection = matmul(yc, matmul(yc, cross, transa="C"))
+    physical_model = (model[0].astype(jnp.complex128), model[1], model[2])
+    retained = retained_moment_identity((gc, hc, oc), yc, physical_model, projection, matmul=matmul)
+    return physical_model, (reduction, zero, retained), yc

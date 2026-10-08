@@ -381,7 +381,7 @@ def face_ritz_carrier(mesh, keep_budget):
 
 @lru_cache(maxsize=None)
 def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None,eigh_plan=None,
-                        carrier=None):
+                        carrier=None,real_gamma=False):
     """Retained static-layout executable builder; all state values are operands.
 
     ``eigh_plan`` (``face_eigh`` at the reduction's room) decides the pencil's
@@ -395,6 +395,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
     eigh=(face_eigh(mesh,side) if eigh_plan is None else eigh_plan).batched
+    real_eigh=face_eigh(mesh,2*min(int(keep_budget),int(side)),room=0).batched if real_gamma else None
     def body(points,order,active,qs,os,ds,infinity):
         def pack(parts):
             panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape["y"])])), axis=-1)
@@ -403,7 +404,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
         reduced=solve_parent_pencil(points,pack(qs),pack(os),pack(ds),infinity,active,
             eigh=eigh,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
             keep_budget=keep_budget,retain_span=retain_span,gram_keep=gram_keep,
-            matrix_sharding=NamedSharding(mesh,P(None,"x","y")),carrier=carrier)
+            matrix_sharding=NamedSharding(mesh,P(None,"x","y")),carrier=carrier,real_gamma=real_gamma,real_eigh=real_eigh)
         model,signed,diagnostics=reduced[:3]
         model,permutation=sort_shared_pole_columns(model, matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
         result=model,signed,(*diagnostics,permutation)
@@ -412,7 +413,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
 
 
 def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
-                      keep_budget,retain_span=False,admit=True,gram_keep=None,room=None,carrier=None):
+                      keep_budget,retain_span=False,admit=True,gram_keep=None,room=None,carrier=None,real_gamma=False):
     """A fixed-width batch of parents with every matrix tiled over all ranks.
 
     ``room`` is the room the pencil's eigh stacks are decided against
@@ -425,7 +426,7 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     if admit:
         budget.plan(side,phase='reduction')
     program=lambda room: face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
-                                             face_eigh(mesh,side,room),None if carrier is None else int(carrier))
+                                             face_eigh(mesh,side,0 if real_gamma else room),None if carrier is None else int(carrier),real_gamma=real_gamma)
     args=(tables['points'],tables['order'],tables['active'],tuple(s[1] for s in states),
           tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
     if callable(room):
