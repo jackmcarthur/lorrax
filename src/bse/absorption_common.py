@@ -157,7 +157,7 @@ def exciton_dipoles_distributed(eigenvectors, d_block, n_states: int):
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from common.collectives import gather_to_host
-    from common.gpu_utils import get_device_memory_info
+    from common.gpu_utils import device_budget_bytes
 
     tda_axis = eigenvectors.ndim == 5
     if tda_axis and int(eigenvectors.shape[1]) != 1:
@@ -168,8 +168,7 @@ def exciton_dipoles_distributed(eigenvectors, d_block, n_states: int):
     sharding = eigenvectors.sharding
     local = sharding.shard_shape(eigenvectors.shape)
     per_state = 16 * int(np.prod(local[1:]))
-    budget = (float(get_device_memory_info().get("total_gb") or 8.0) * 1e9
-              * _DIPOLE_BLOCK_BUDGET_FRAC)
+    budget = device_budget_bytes() * _DIPOLE_BLOCK_BUDGET_FRAC
     block = int(min(max(n_states, 1), max(1, budget // per_state)))
     if isinstance(sharding, NamedSharding):
         # The dipole takes the eigenvectors' transition layout, so each rank

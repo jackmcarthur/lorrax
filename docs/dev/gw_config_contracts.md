@@ -209,15 +209,10 @@ rulings override anything here.
   `distrib_la_batched_route_choices` likewise reads distrib_la's batch-route
   vocabulary. `local` takes the `batch_reshard` route; `distributed` takes
   `auto`, the backend's own scan or stacked route.
-- **`MemoryConfig`**: `memory_per_device_gb = 0` auto-detects the device memory
-  and takes the minimum over processes (`gpu_utils.minimum_process_budget_gb`),
-  so every rank plans the same tile shapes. `chunk_target_utilization = 0` is
-  the auto sentinel; a positive `ISDF_CHUNK_TARGET_UTILIZATION` overrides the
-  planner's default after clamping to [0.85, 1.0]. Its only reader is the
-  ζ μ-batch planner (`gflat_memory_model.plan_zeta_route_g`, called from
-  `gw_init`), one of the budget-sized planners the
-  [fixed-tile ruling](../architecture/decisions.md#fixed-tile) lists as not
-  yet conforming.
+- **`MemoryConfig`**: `per_device_gb` is the headroom rule's budget on the
+  card, capped by a positive `memory_per_device_gb`, the minimum over
+  processes (`gpu_utils.resolve_device_budget_gb`), so every rank plans the
+  same tile shapes ([memory model](../architecture/memory-model.md#budget)).
 
 ### Band counts
 

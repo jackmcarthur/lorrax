@@ -704,10 +704,10 @@ def set_default_env(*, platform: str = "gpu") -> None:
     THE GPU MEMORY POOL (:func:`set_default_gpu_pool` owns it)
     ----------------------------------------------------------
     On CUDA every run gets ONE allocator configuration: ``cuda_async``
-    (cudaMallocAsync), its pool RESERVED up front, and the budget fraction
-    :data:`GPU_POOL_FRACTION`.  The measured reasons are in that function's
-    docstring.  A caller's explicit export still wins (``setdefault``), and
-    the startup report names any pair that is not this one.
+    (cudaMallocAsync), its pool RESERVED up front at :func:`pool_fraction`
+    of the card (the headroom rule, :func:`device_headroom_bytes`).  A
+    caller's explicit export still wins (``setdefault``), and the startup
+    report names any pair that is not this one.
 
     A caller-supplied ``XLA_PYTHON_CLIENT_ALLOCATOR`` is VALIDATED here —
     see :func:`_check_allocator_env`.
@@ -754,89 +754,83 @@ def set_default_env(*, platform: str = "gpu") -> None:
     configure_gpu_network(platform=xla_platform, say=rank0_print)
 
 
-#: The ONE memory fraction on every CUDA node (owner ruling 2026-09-24; no
-#: per-card-size branch): the reserved pool, the ``bytes_limit`` the client
-#: reports, and therefore every memory planner's budget
-#: (``common.gpu_utils.get_device_memory_gb`` budgets 0.9 x bytes_limit).
-#: Derived from the measured bytes outside the pool: 1 - 4.72 GB / 42.4 GB
-#: on A100-40GB (sandbox runs/runtime/gpu_pool_policy_20260924, JID
-#: 58826377); the same value is kept on 80 GB cards rather than the 0.94
-#: the byte rule would give there.  It is a PLANNER budget, not a pool cap:
-#: under cuda_async XLA never refuses an allocation above it.
-GPU_POOL_FRACTION = "0.89"
+#: The one device-memory headroom rule (owner 2026-10-08), the same for every
+#: vendor and card size.  From the card total ``M`` alone:
+#:
+#:     H = max(HEADROOM_MIN_BYTES, HEADROOM_FRACTION * M), at most M / 2
+#:     pool reservation  R = M - H                (pool_fraction)
+#:     planner budget    B = R - max(1 GB, 0.02 * M)   (planner_budget_bytes)
+#:
+#: ``H`` stays outside the pool for the CUDA context, NCCL and library
+#: communicators, cuFFT plans and library workspaces: the reserved pool fills
+#: its limit at start-up, so an allocation made outside it later gets exactly
+#: ``M - R`` (the start-up line measures what is already there,
+#: ``runtime.xla_memory.outside_pool_bytes``).  The budget sits a small margin
+#: below the reservation for XLA temporaries no planner prices.  Both read
+#: only ``M``, so they are the same on every rank and every run.
+HEADROOM_MIN_BYTES = 8e9
+HEADROOM_FRACTION = 0.10
+XLA_MARGIN_MIN_BYTES = 1e9
+XLA_MARGIN_FRACTION = 0.02
+
+
+def device_headroom_bytes(total_bytes: float) -> float:
+    """``H = max(HEADROOM_MIN_BYTES, HEADROOM_FRACTION * M)``, at most ``M / 2``."""
+    total = float(total_bytes)
+    return min(max(HEADROOM_MIN_BYTES, HEADROOM_FRACTION * total), 0.5 * total)
+
+
+def planner_budget_bytes(total_bytes: float) -> float:
+    """``B = M - H - max(XLA_MARGIN_MIN_BYTES, XLA_MARGIN_FRACTION * M)``, at least ``M / 4``."""
+    total = float(total_bytes)
+    margin = max(XLA_MARGIN_MIN_BYTES, XLA_MARGIN_FRACTION * total)
+    return max(total - device_headroom_bytes(total) - margin, 0.25 * total)
+
+
+def pool_fraction(total_bytes: float | None) -> str:
+    """``XLA_CLIENT_MEM_FRACTION`` for a card of ``total_bytes``: ``R / M = 1 - H / M``
+    (``1 - HEADROOM_FRACTION`` when the total is unknown)."""
+    if not total_bytes:
+        return f"{1.0 - HEADROOM_FRACTION:.4f}"
+    return f"{1.0 - device_headroom_bytes(total_bytes) / float(total_bytes):.4f}"
+
 
 _PREALLOCATE_ENV = "XLA_PYTHON_CLIENT_PREALLOCATE"
 _FRACTION_ENVS = ("XLA_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_MEM_FRACTION")
 
 
 def set_default_gpu_pool() -> None:
-    """The one GPU memory-pool policy: cudaMallocAsync, reserved, 0.89.
+    """The one GPU memory-pool policy: cudaMallocAsync, reserved at :func:`pool_fraction`.
 
     Must run before the CUDA client exists (jaxlib reads these variables
     once, in ``generate_pjrt_gpu_plugin_options()``).  ALL OR NOTHING:
 
     * neither ``XLA_PYTHON_CLIENT_ALLOCATOR`` nor ``..._PREALLOCATE`` set
       -> all three are set (``cuda_async``, ``true``, and
-      ``XLA_CLIENT_MEM_FRACTION`` = :data:`GPU_POOL_FRACTION` unless a
-      fraction is already exported);
+      ``XLA_CLIENT_MEM_FRACTION`` = :func:`pool_fraction` of the card
+      unless a fraction is already exported);
     * either one exported -> the caller owns the allocator and nothing is
       added (the startup report names the pair as not the policy), EXCEPT
-    * ``PREALLOCATE`` on with no allocator REFUSES: that half of the policy
-      is BFC with the fraction of the card pre-grabbed, never released to
-      NCCL or cuSOLVERMp;
-    * an async pool with preallocation off REFUSES: that is the measured-worst
-      configuration (below), and the owner's rule is "always preallocate".
-      Half of the policy can therefore never arise from one stray export
-      (audit H1: the deployed module's ``PREALLOCATE=false`` plus a
-      setdefault ``cuda_async`` would have produced exactly that pair).
+    * ``PREALLOCATE`` on with no allocator REFUSES: that is BFC with the
+      fraction of the card pre-grabbed, never released to NCCL or cuSOLVERMp;
+    * ``cuda_async`` with preallocation off REFUSES: an unreserved pool has
+      release threshold 0, so it unmaps and re-maps idle memory at every
+      synchronize (25-110 ms device idle per executable, measured).
 
-    Both fraction spellings at once also REFUSE here: jaxlib raises on the
-    pair inside plugin discovery, where it surfaces as "Unable to initialize
-    backend 'cuda'" (audit M7).  Nothing is set unless this is a CUDA run on
-    a node with a GPU device (:func:`_gpu_is_present`): a CPU run, a
-    GPU-less node and ROCm (no LORRAX deployment to measure a pool on) keep
+    Both fraction spellings at once also REFUSE (jaxlib raises on the pair
+    inside plugin discovery, as "Unable to initialize backend 'cuda'").
+    Nothing is set unless this is a CUDA run on a node with a GPU device
+    (:func:`_gpu_is_present`): a CPU run, a GPU-less node and ROCm keep
     jaxlib's own defaults.
 
-    WHAT ``cuda_async`` + ``PREALLOCATE=true`` IS (XLA source, jaxlib 0.9.1).
-    PJRT builds ``GpuCudaMallocAsyncAllocator`` with ``create_new_pool=
-    false``: XLA allocates from the device's DEFAULT mempool, the same pool
-    every ``cudaMallocAsync`` in our FFI (cuBLASMp W-solve, cuSOLVERMp LU)
-    uses.  The pool's release threshold is the reservation size: ``true``
-    reserves ``fraction x total`` once and keeps it mapped; ``false`` sets
-    the threshold to 0, so the pool unmaps every idle byte at every stream
-    or event synchronize and the next launch maps it again.  That re-map
-    was measured at ~30 ms of buffer allocation plus a 25-110 ms stall per
-    executable, device idle (CrI3 8x8 GN-PPM P4, A100-40GB, sandbox
-    ``runs/runtime/sigma_tau_sweep_20260924``): reserving took the whole run
-    204.3 -> 175.0 s and the Sigma tau sweep 15.6 -> 4.8 s.  The fraction is
-    NOT a cap under this allocator (``AllocateRaw`` never checks it); it
-    sizes the reservation and the reported ``bytes_limit`` that the memory
-    planners budget from.
-
-    WHY THE RESERVATION TAKES NOTHING FROM C++ LIBRARIES.  Memory outside
-    the pool (the CUDA context, NCCL buffers, the cuSOLVERMp context's
-    grow-only ``cudaMalloc`` workspace, CAL scratch) can still use reserved
-    memory XLA is not using at that moment: the driver releases idle pool
-    memory to an unrelated allocation in the same process (NVIDIA, "Using
-    the CUDA stream-ordered memory allocator", part 1).  What such an
-    allocation can never have is XLA's LIVE bytes, reserved or not.
-    Measured on A100-40GB at P4 (sandbox ``runs/runtime/
-    gpu_pool_policy_20260924``, JID 58826377): pool reserved at 0.85 with
-    5.0 GB free, a raw cuMemAlloc of 23.0 GB succeeded in 0.85 s (the idle
-    pool was trimmed 36.0 -> 4.0 GB), as did cuMemCreate; the bytes outside
-    the pool peaked at 4.7 GB (context, NCCL, the cuSOLVERMp context and its
-    workspace).  The trim does NOT cross processes, so this policy needs
-    one process per GPU; the test suite's workers, which share GPUs with the
-    mesh-cell child, take the stated BFC exception in ``tests/conftest.py``.
-
-    The old BFC default (preallocation off, allocator unset) existed for a
-    grow-only cuFFT ``cudaMalloc`` arena that no longer exists (the CUDA
-    k-convolution is nvidia-mathdx on XLA-owned buffers since 2026-09-24).
-    ``cuda_async`` also keeps ``memory_stats()`` populated
-    (``runtime.xla_memory``), and reports ``bytes_limit`` once reserved.
-    On sm_75 (Frontera rtx, not a supported GPU target) cudaMallocAsync
-    additionally needs ``config/frontera/gpu_env.sh``'s command-buffer
-    ``XLA_FLAGS``.
+    The fraction is not a cap: ``cuda_async`` (``create_new_pool=false``,
+    the device's default mempool, which every FFI ``cudaMallocAsync`` shares)
+    never checks it.  It sets the reservation, the pool's release threshold,
+    so memory up to it stays mapped.  The reservation fills at start-up, so
+    an allocation outside the pool afterwards (NCCL communicators, the
+    cuSOLVERMp/cuBLASMp contexts) gets ``M - R = H``.  The policy needs one
+    process per GPU.  The planners budget from the card total
+    (:func:`planner_budget_bytes`), not from the client's ``bytes_limit``.
     """
     plats = [p.strip().lower()
              for p in os.environ.get("JAX_PLATFORMS", "").split(",") if p.strip()]
@@ -850,15 +844,16 @@ def set_default_gpu_pool() -> None:
             f"{_FRACTION_ENVS[0]} and the deprecated {_FRACTION_ENVS[1]} are "
             f"BOTH set.  jaxlib refuses the pair inside CUDA plugin discovery, "
             f"where it surfaces as \"Unable to initialize backend 'cuda'\".  "
-            f"Unset one (LORRAX's pool policy sets {_FRACTION_ENVS[0]}="
-            f"{GPU_POOL_FRACTION} itself).")
+            f"Unset one (LORRAX's pool policy sets {_FRACTION_ENVS[0]} itself, "
+            f"runtime.pool_fraction).")
     allocator = os.environ.get(_ALLOCATOR_ENV)
     prealloc = os.environ.get(_PREALLOCATE_ENV) or None     # blank = unset
     if allocator is None and prealloc is None:
         os.environ[_ALLOCATOR_ENV] = "cuda_async"
         os.environ[_PREALLOCATE_ENV] = "true"
         if not any(os.environ.get(k) for k in _FRACTION_ENVS):
-            os.environ[_FRACTION_ENVS[0]] = GPU_POOL_FRACTION
+            from runtime.xla_memory import cuda_device_total_bytes
+            os.environ[_FRACTION_ENVS[0]] = pool_fraction(cuda_device_total_bytes(0))
         return
     if allocator is None and prealloc not in ("false", "False", "0"):
         raise ValueError(
@@ -867,7 +862,7 @@ def set_default_gpu_pool() -> None:
             f"(0.75 unless exported) of the card pre-grabbed, an arena the "
             f"driver never releases to NCCL or cuSOLVERMp.  Unset it and "
             f"runtime.set_default_gpu_pool() applies the policy (cuda_async, "
-            f"reserved, fraction {GPU_POOL_FRACTION}).")
+            f"reserved at runtime.pool_fraction).")
     # jaxlib: an unset allocator is 'default' (BFC); PREALLOCATE is off only
     # for these exact strings (case-sensitive), and unset means on.
     if ((allocator or "default").lower() == "cuda_async"
@@ -878,7 +873,7 @@ def set_default_gpu_pool() -> None:
             f"unmaps and re-maps device memory at every synchronize (25-110 "
             f"ms idle per launch, measured).  LORRAX always preallocates: "
             f"unset both variables and runtime.set_default_gpu_pool() applies "
-            f"the policy (cuda_async, reserved, fraction {GPU_POOL_FRACTION}).  "
+            f"the policy (cuda_async, reserved at runtime.pool_fraction).  "
             f"A module or launcher exporting {_PREALLOCATE_ENV}=false is the "
             f"usual source.")
 
@@ -2749,6 +2744,9 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
             f"({type(exc).__name__}: {exc}); the figures above are the "
             f"client's, uncorroborated")
     f["pool"] = pool
+    if f["ffi_platform"] == "CUDA" and local:
+        f["device_memory"] = _device_memory_facts(
+            local[0], pool.get("device_total_bytes"))
 
     # -- FFI ---------------------------------------------------------------
     plat_key = f["ffi_platform"]
@@ -2776,6 +2774,48 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     f["failfast"] = bool(getattr(_sys, "_lorrax_failfast_installed", False))
     f["failfast_env"] = os.environ.get("LORRAX_FAILFAST")
     return f
+
+
+def _device_memory_facts(device, total) -> dict:
+    """The headroom rule on this card and the bytes outside the pool after the
+    communicator warm-up, the maximum over processes (every process enters).
+    A diagnostic only: nothing is sized from it."""
+    import numpy as np
+    from common.collectives import all_gather_processes
+    from .xla_memory import outside_pool_bytes
+    outside = outside_pool_bytes(getattr(device, "local_hardware_id", 0) or 0)
+    worst = int(np.max(np.asarray(all_gather_processes(
+        np.asarray(-1 if outside is None else outside, dtype=np.int64)))))
+    head = device_headroom_bytes(total) if total else None
+    return {"total": total, "headroom": head,
+            "budget": None if head is None else planner_budget_bytes(total),
+            "reservation": None if head is None else total - head,
+            "outside_max": None if worst < 0 else worst}
+
+
+def device_memory_summary(d: dict | None) -> tuple[str | None, str | None]:
+    """``(line, warning)`` for the headroom rule's start-up facts: the card,
+    pool, headroom and budget, and the bytes outside the pool after warm-up;
+    the warning when those exceed 0.75 of the headroom kept outside it."""
+    if not d or not d.get("total"):
+        return None, None
+    out = d.get("outside_max")
+    seen = "unread" if out is None else f"{out / 1e9:.2f} GB (max over ranks)"
+    line = (f"card {d['total'] / 1e9:.2f} GB | pool {d['reservation'] / 1e9:.2f} GB "
+            f"(headroom {d['headroom'] / 1e9:.2f} GB outside it) | budget "
+            f"{d['budget'] / 1e9:.2f} GB | outside the pool after warm-up {seen}")
+    warn = (f"{out / 1e9:.2f} GB is already outside the pool after warm-up, above "
+            f"0.75 of the {d['headroom'] / 1e9:.2f} GB headroom "
+            "(runtime.device_headroom_bytes)"
+            if out is not None and out > 0.75 * d["headroom"] else None)
+    return line, warn
+
+
+def _device_memory_lines(d: dict) -> list:
+    """The production preamble's rendering of :func:`device_memory_summary`."""
+    line, warn = device_memory_summary(d)
+    return ([f"Device memory  | {line}"] if line else []) + (
+        [f"WARNING         | {warn}"] if warn else [])
 
 
 _RULE = "=" * 78
@@ -2930,13 +2970,15 @@ def format_startup_report(f: dict) -> list:
             f"{f.get('backend')} backend, and that backend keeps no arena "
             f"accounting, so no allocator figure is reported.")
     if env is not None and is_gpu:
+        total = pool.get("device_total_bytes") or 0
+        policy = pool_fraction(total)
         canonical = (env["preallocate"] and env["allocator"] == "cuda_async"
-                     and env.get("mem_fraction") == GPU_POOL_FRACTION)
+                     and env.get("mem_fraction") == policy)
         why = (" — LORRAX's GPU pool policy: cudaMallocAsync with its pool "
-               f"reserved at {GPU_POOL_FRACTION} (runtime.set_default_gpu_pool)"
+               f"reserved at {policy} (runtime.set_default_gpu_pool)"
                if canonical else
                " — NOT LORRAX's GPU pool policy (cuda_async, preallocation on, "
-               f"fraction {GPU_POOL_FRACTION}); a caller exported its own")
+               f"fraction {policy}); a caller exported its own")
         add(f"  XLA_PYTHON_CLIENT_PREALLOCATE resolved to "
             f"{'true' if env['preallocate'] else 'false'} (raw "
             f"{env['preallocate_raw']!r}) and XLA_PYTHON_CLIENT_ALLOCATOR "
@@ -2946,19 +2988,18 @@ def format_startup_report(f: dict) -> list:
             add(f"  The XLA client memory fraction is "
                 f"{env['mem_fraction']} from {env['mem_fraction_var']}.")
         limit = (pool.get("stats") or {}).get("bytes_limit") or 0
-        total = pool.get("device_total_bytes") or 0
         if canonical and total:
-            want = float(GPU_POOL_FRACTION) * total
+            want = float(policy) * total
             if abs(limit - want) > 0.01 * want:
                 add(f"  WARNING: the live client does NOT hold LORRAX's pool: "
-                    f"bytes_limit {limit/1e9:.2f} GB against {GPU_POOL_FRACTION}"
+                    f"bytes_limit {limit/1e9:.2f} GB against {policy}"
                     f" x {total/1e9:.2f} GB = {want/1e9:.2f} GB.  The CUDA "
                     f"client was built before runtime.set_default_gpu_pool() "
                     f"ran (something initialised jax first), so the "
                     f"environment above is not what the client uses.")
             else:
                 add(f"  The live client holds the reserved pool: bytes_limit "
-                    f"{limit/1e9:.2f} GB = {GPU_POOL_FRACTION} x "
+                    f"{limit/1e9:.2f} GB = {policy} x "
                     f"{total/1e9:.2f} GB.")
         if not env.get("allocator_is_valid"):
             add(f"  WARNING: XLA_PYTHON_CLIENT_ALLOCATOR="
@@ -2970,6 +3011,8 @@ def format_startup_report(f: dict) -> list:
                 f"jax's test is case-sensitive, so preallocation is ON.")
     if pool.get("disagreement"):
         add(f"  WARNING: {pool['disagreement']}")
+    for line in _device_memory_lines(f.get("device_memory")):
+        add("  " + line)
 
     # -- FFI ---------------------------------------------------------------
     lib = f.get("ffi_library", {})
@@ -3193,6 +3236,7 @@ def format_production_startup_report(f: dict) -> list:
          f"{collective} collectives | {x64} | {autotune_text} | "
          f"{compile_agreement_text}"),
     ]
+    lines += _device_memory_lines(f.get("device_memory"))
     if elapsed is not None:
         lines.append(f"Runtime startup | {float(elapsed):.1f} s")
     for demotion in f.get("demotions", ()):

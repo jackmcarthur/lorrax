@@ -26,8 +26,7 @@ planner's closed form chooses the chunk, the chosen executable is compiled
 anyway, and its figure corrects the per-unit slope, re-solves the chunk and
 recompiles once only when it exceeds the room; :func:`agreed_chunk` makes
 the chunk every rank runs the same (the response direct stream, the ζ μ batch; the Σ τ window reads
-:func:`compiled_new_bytes`).  :func:`runtime_reserve_bytes` is the measured
-per-platform, per-P reserve the capacity ledger takes off the budget.
+:func:`compiled_new_bytes`).
 
 Works on CPU and GPU.  On a non-CUDA platform there are no cuFFT plans, so
 the scratch term is an exact 0 — NOT a demotion.  That has to be decided
@@ -359,13 +358,15 @@ def _is_cuda_platform(platform: str | None) -> bool:
     """Is the executable's platform one where cuFFT plans exist?
 
     ``platform`` is the caller's declaration (``mesh.devices[0].platform``);
-    ``None`` means "work it out from this process's default devices".
+    a GPU is CUDA when this process's device vendor is
+    (:func:`lxkit.device_vendor`).
     """
-    if platform is not None:
-        return platform in ("gpu", "cuda")
+    if platform is not None and platform not in ("gpu", "cuda"):
+        return False
     try:
         import jax
-        return any(d.platform in ("gpu", "cuda") for d in jax.devices())
+        from lxkit import device_vendor
+        return device_vendor(jax.local_devices()[0]) == "cuda"
     except Exception:
         return False
 
@@ -489,40 +490,6 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
 # ---------------------------------------------------------------------------
 # One compiled check of an analytic chunk -- every stage planner calls this
 # ---------------------------------------------------------------------------
-
-#: Per-rank bytes a stage draws from XLA's pool at run time that neither its
-#: planner's closed form nor ``memory_analysis()`` shows, by (platform, P):
-#: allocator rounding and the runtime scratch of library calls that the planner
-#: does not price by name.  Measured once (docs/architecture/memory-model.md,
-#: "What compiled statistics miss"); a (platform, P) not in the table uses the
-#: largest measured entry of its platform, announced.  NCCL buffers, the CUDA
-#: context and cuSOLVERMp's grow-only workspace are outside the pool: they are
-#: the headroom between the budget and the device, not part of this reserve.
-RUNTIME_RESERVE_BYTES = {
-    # Fe 8^3 charge map 0, A100-40GB: the direct stream peaked 511 120 B above
-    # its price (the dispatch's small arguments), rounded up to 1 MB.
-    ("gpu", 4): 1_000_000,
-}
-
-
-def runtime_reserve_bytes(platform: str | None = None, n_ranks: int | None = None) -> int:
-    """The measured in-pool reserve for ``platform`` at ``n_ranks`` (see the table)."""
-    import jax
-    if platform is None:
-        platform = jax.devices()[0].platform
-    platform = "gpu" if platform in ("gpu", "cuda") else str(platform)
-    if n_ranks is None:
-        n_ranks = jax.device_count()
-    key = (platform, int(n_ranks))
-    if key in RUNTIME_RESERVE_BYTES:
-        return int(RUNTIME_RESERVE_BYTES[key])
-    same = [v for (p, _), v in RUNTIME_RESERVE_BYTES.items() if p == platform]
-    value = int(max(same, default=0))
-    announce_once(f"runtime-reserve:{key}",
-                  f"runtime reserve not measured for {platform} at P={n_ranks}; "
-                  f"using the largest measured {platform} entry, {value / 1e9:.2f} GB")
-    return value
-
 
 @dataclass(frozen=True)
 class ChunkCheck:

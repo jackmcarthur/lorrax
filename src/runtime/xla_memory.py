@@ -92,7 +92,7 @@ from . import _FALSY_TOKENS as _ENV_FALSE
 #
 # This function READS ONLY.  It never sets an allocator variable: which
 # values LORRAX ships is decided in ``runtime.set_default_gpu_pool``
-# (cuda_async, PREALLOCATE=true, fraction runtime.GPU_POOL_FRACTION on CUDA).  Everything here
+# (cuda_async, PREALLOCATE=true, fraction runtime.pool_fraction on CUDA).  Everything here
 # must stay correct under every one of them, including unset.
 
 _XLA_ALLOCATORS = ("default", "platform", "bfc", "cuda_async")
@@ -114,6 +114,57 @@ def cuda_device_total_bytes(ordinal: int = 0) -> int | None:
         return int(total.value)
     except Exception:                                         # noqa: BLE001
         return None
+
+
+def outside_pool_bytes(ordinal: int = 0) -> int | None:
+    """Device bytes this process holds outside the default mempool:
+    ``total - free - reserved`` (the CUDA context and modules, NCCL and
+    library communicators, cuFFT plans, raw ``cudaMalloc`` workspaces).
+
+    XLA's ``cuda_async`` and every FFI ``cudaMallocAsync`` draw from the
+    default pool, so they are in ``reserved``.  Read on a short thread that
+    retains the primary context jax already created (none is made) and
+    releases it.  None where there is no CUDA driver or no live context.
+    """
+    import ctypes
+    import threading
+    out: list = []
+
+    def read():
+        try:
+            cu = ctypes.CDLL("libcuda.so.1")
+            dev, ctx, pool = ctypes.c_int(), ctypes.c_void_p(), ctypes.c_void_p()
+            flags, active = ctypes.c_uint(), ctypes.c_int()
+            if (cu.cuInit(0) or cu.cuDeviceGet(ctypes.byref(dev), int(ordinal))
+                    or cu.cuDevicePrimaryCtxGetState(dev, ctypes.byref(flags),
+                                                     ctypes.byref(active))
+                    or not active.value
+                    or cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev)):
+                return
+            try:
+                # Reserved bytes (CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT) before and
+                # after the free-memory read: a pool that moves between them would
+                # show its own growth as outside bytes, so the larger one is used.
+                free, total = ctypes.c_size_t(), ctypes.c_size_t()
+                before, after = ctypes.c_uint64(), ctypes.c_uint64()
+                if not (cu.cuCtxSetCurrent(ctx)
+                        or cu.cuDeviceGetDefaultMemPool(ctypes.byref(pool), dev)
+                        or cu.cuMemPoolGetAttribute(pool, 5, ctypes.byref(before))
+                        or cu.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total))
+                        or cu.cuMemPoolGetAttribute(pool, 5, ctypes.byref(after))):
+                    reserved = max(int(before.value), int(after.value))
+                    out.append(int(total.value) - int(free.value) - reserved)
+            finally:
+                cu.cuDevicePrimaryCtxRelease_v2(dev)
+        except Exception:                                     # noqa: BLE001
+            return
+
+    thread = threading.Thread(target=read, name="lorrax-outside-pool")
+    thread.start()
+    thread.join()
+    return out[0] if out else None
+
+
 #: allocator -> whether the PJRT client keeps arena accounting, i.e.
 #: whether ``memory_stats()['peak_bytes_in_use']`` means anything.
 _XLA_PEAK_ACCOUNTING = {
@@ -349,7 +400,8 @@ def _find_pool():
         return None
     import ctypes
     import jax
-    if jax.local_devices()[0].platform != "gpu":
+    from lxkit import device_vendor
+    if device_vendor(jax.local_devices()[0]) != "cuda":
         _POOL["source"] = "none"
         return None
     pointer = None
