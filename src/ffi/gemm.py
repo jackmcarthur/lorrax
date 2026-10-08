@@ -37,12 +37,8 @@ __all__ = ["GEMM_TARGET", "GATE", "gemm_ffi_mode", "gemm_ffi_enabled",
 
 GEMM_TARGET = "lorrax_mklblas_gemm_batch"
 
-#: The ``LORRAX_BANDS_GEMM_FFI`` dial.  Default ON — the FFI layer is
-#: REQUIRED (owner ruling, ``docs/architecture/decisions.md`` 2026-08-01):
-#: on a CPU mesh a missing handler is a startup refusal naming the ``.so``
-#: (``Gate.enforce``), never a demotion.  The pre-ruling ``auto`` mode
-#: (capability detection, owner order 2026-07-29) was deleted with the
-#: ruling — auto-demotion to the XLA duplicate is exactly what it forbids.
+#: The ``LORRAX_BANDS_GEMM_FFI`` dial.  Default ON: on a CPU mesh a missing
+#: handler is a startup refusal naming the ``.so`` (``Gate.enforce``).
 #:
 #: ``=0`` is a real, announced debug opt-out (off_policy="fallback"): the
 #: XLA einsum arm in ``common.contract_bands`` is RETAINED — not as a
@@ -66,8 +62,7 @@ GATE = Gate(
         "[bands_gemm] LORRAX_BANDS_GEMM_FFI=0: explicit debug opt-out — "
         "contract_bands right-GEMMs run the native XLA dot lowering "
         "(1.6-1.9x below vendor-BLAS rate at full threads, jobs "
-        "7879008/7879010).  UNCERTIFIED for production: the FFI layer is "
-        "required (decisions.md 2026-08-01)."),
+        "7879008/7879010)."),
     label={"cpu": "MKL batched-GEMM host"},
     resolved_msg={"cpu": (
         "[bands_gemm] contract_bands right-GEMMs -> vendor-BLAS "
@@ -86,9 +81,8 @@ GATE = Gate(
         "untouched."),
     refuse_probe_msg=(
         "The required MKL batched-GEMM host backend is unavailable: FFI "
-        "target '{target}' is unusable: {reason}  The FFI layer is "
-        "REQUIRED (docs/architecture/decisions.md, 2026-08-01); "
-        "build/locate liblorrax_ffi_host.so per "
+        "target '{target}' is unusable: {reason}  Build/locate "
+        "liblorrax_ffi_host.so per "
         "docs/environment/overview.md (selected by LORRAX_FFI_HOST_SO), "
         "or set LORRAX_BANDS_GEMM_FFI=0 for an announced, uncertified "
         "debug run on the XLA lowering."),

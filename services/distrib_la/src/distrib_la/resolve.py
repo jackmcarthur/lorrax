@@ -61,9 +61,8 @@ Backend choice is a deck key; the environment grants a CAPABILITY (which
 """
 from __future__ import annotations
 
-from types import MappingProxyType
 
-from lxkit.gate import announce_once, mesh_ffi_platform
+from lxkit import FFI_PLATFORM_MAP, announce_once, mesh_ffi_platform
 
 from distrib_la import loader
 
@@ -119,25 +118,11 @@ EIGH_BACKENDS = BACKEND_CHOICES["eigh"]
 CHOLESKY_BACKENDS = BACKEND_CHOICES["cholesky"]
 LU_BACKENDS = BACKEND_CHOICES["solve_lu"]
 
-#: jax device platform → the FFI platform key this package speaks.
-#:
-#: ``rocm`` is present and passes through UNMAPPED, deliberately.  It is a
-#: DECLARED-UNTESTED tier: LORRAX builds no ROCm ``.so``, nobody has run one,
-#: and the preference rows below exist so the routing question has an answer
-#: rather than a nonsense one.  MEASUREMENT GAP, named so nobody has to
-#: rediscover it: on the jaxes this tree runs, ``Device.platform`` is
-#: ``'gpu'`` for BOTH vendors, so a real ROCm mesh would land on the
-#: ``'gpu' -> CUDA`` row above and never reach the rocm tier.  Disambiguating
-#: them needs a machine to measure on; this map is where that edit goes, and
-#: it is ONE row.  Guessing from ``device_kind`` strings without a ROCm
-#: machine would be a compatibility path nobody can see failing, which is
-#: the defect class this package exists to remove.
-FFI_PLATFORMS = MappingProxyType({
-    "cpu": "cpu",
-    "gpu": "CUDA",
-    "cuda": "CUDA",
-    "rocm": "rocm",
-})
+#: Device vendor → the FFI platform key this package speaks: lxkit's one
+#: map (``cuda`` → ``CUDA``, ``cpu``), with ``rocm`` passing through unmapped.
+#: The vendor is read from the device client (:func:`lxkit.device_vendor`).
+#: ROCm is a declared-untested tier: LORRAX builds no ROCm ``.so``.
+FFI_PLATFORMS = FFI_PLATFORM_MAP
 
 #: ``distributed`` → the platform's permanent default distributed backend.
 #:
@@ -147,7 +132,7 @@ FFI_PLATFORMS = MappingProxyType({
 #: there is no configuration in which slate is the right CPU eigh.  On
 #: **CUDA** it is cuSOLVERMp, the only library there with a distributed
 #: syevd.  On **rocm** it is SLATE, which is the only one of the three that
-#: builds for ROCm at all — declared-untested (see :data:`FFI_PLATFORMS`).
+#: builds for ROCm at all — declared-untested.
 #:
 #: There is deliberately NO ``('solve_lu', 'rocm')`` row: SLATE ships no
 #: getrf/getrs handler in this tree, so a row would promise a backend that
@@ -198,7 +183,7 @@ _SPEC = {
 def mesh_platform(mesh_xy) -> str:
     """The FFI platform key for the mesh's devices.
 
-    ``"cpu"`` / ``"CUDA"`` / ``"rocm"`` per :data:`FFI_PLATFORMS`; anything
+    ``"cpu"`` / ``"CUDA"`` / ``"rocm"`` from the device vendor; anything
     else passes through UNMAPPED so a refusal can name what it actually saw
     (``'tpu'`` reads better than ``'unknown'``).
     """

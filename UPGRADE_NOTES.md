@@ -5,6 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — the platform key is the device vendor; one gate implementation
+
+`lxkit.device_vendor` reads the vendor from the device client (`client.platform`,
+`platform_version`, `device_kind`); `device.platform` is `gpu` for every GPU vendor and
+is no longer read as CUDA. `mesh_ffi_platform` maps `cuda` to `CUDA` and `cpu` to `cpu`;
+`rocm` passes through, so no gate, loader or startup report opens `liblorrax_ffi.so` on
+a ROCm mesh. `ffi.gate` is now a binding of `lxkit.gate` (one announcement set; the unused
+`auto` mode is gone). Before the backend exists, `runtime._gpu_is_present` also sees AMD
+devices (`/dev/kfd`, masked by an empty `ROCR_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES`),
+the default `JAX_PLATFORMS` names the installed jaxlib plugin's platform (`cuda,cpu` or
+`rocm,cpu`), and `local_device_ids` come from the first visibility variable set. No
+result moves on CUDA or cpu; no deck or environment change. ROCm still refuses at the
+k-convolution router until it has an XLA backend.
+
 ## 2026-10-08 — two sector route crashes fixed (relaxed tier on the face route; CT alone on the face)
 
 `sigma_w_accuracy = relaxed` with `bispinor_gw = full_shared_pole` stopped at bank build with a

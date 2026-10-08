@@ -53,8 +53,10 @@ except ImportError:                   # plain ``python3`` on the login node
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
+# ``ffi/gate.py`` binds ``lxkit.gate`` (stdlib-only at import).
+for _p in (_SRC, os.path.join(_REPO, "services", "lxkit", "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 # ---------------------------------------------------------------------------
@@ -542,9 +544,8 @@ def test_defect3_vocabulary_has_not_drifted():
         ``file_io/_slab_io_ffi.py::_TRUE/_FALSE`` are now RE-EXPORTS of
         it, so the drift they used to be able to have is gone by
         construction rather than by this assertion;
-      * ``ffi/gate.py::MODE_SPELLINGS``.  Optional accelerators may now name
-        the exact ``auto`` spelling when they also provide a capability
-        probe; only its on/off token sets share the boolean vocabulary.
+      * ``lxkit/gate.py::MODE_SPELLINGS`` (re-exported by ``ffi/gate.py``),
+        two-valued: no gate declares ``auto``.
 
     ``isdf/core.py::_ENV_TRUE`` — a copy this test used to pin — was
     RETIRED by P1.3: the module imports ``gw_config.env_bool`` instead.
@@ -561,12 +562,11 @@ def test_defect3_vocabulary_has_not_drifted():
     assert gw_config._ENV_TRUE is env_flags.ENV_TRUE
     assert gw_config._ENV_FALSE is env_flags.ENV_FALSE
     assert _runtime._FALSY_TOKENS is env_flags.ENV_FALSE
-    # ``auto`` must stay out of the two-valued sets.
+    # ``auto`` must stay out of the two-valued sets, and out of the gate's.
     assert "auto" not in set(gw_config._ENV_TRUE) | set(gw_config._ENV_FALSE)
-    # Optional gates have a real auto branch, spelled only one way; it must
-    # not silently acquire the boolean spellings.
-    assert gate.MODE_SPELLINGS["auto"] == ("auto",)
-    assert "auto" in gate.MODE_HELP
+    assert set(gate.MODE_SPELLINGS) == {"on", "off"}
+    import lxkit
+    assert gate.MODE_SPELLINGS is lxkit.MODE_SPELLINGS
 
 
 def test_the_substrate_parsers_import_the_grammar_rather_than_copying_it():

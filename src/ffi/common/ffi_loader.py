@@ -83,7 +83,8 @@ _services.ensure_on_path()
 
 import jax
 import jax.ffi
-from lxkit import native_provider as _native
+from lxkit import FFI_PLATFORM_MAP, device_vendor, native_provider as _native
+from lxkit import platform_from_env  # noqa: F401  (re-exported: the pre-backend platform key)
 
 __all__ = ["get_lib", "has_target", "probe_target", "require_cuda_handlers", "has_phdf5_read",
            "has_phdf5_write", "loaded_lib_path",
@@ -229,28 +230,16 @@ _ERR_CAP = 512
 
 
 def _default_platform() -> str:
-    # NOTE: jax.default_backend() INITIALIZES the XLA backend.  Code that
-    # runs before jax.distributed.initialize (multi-rank CLI drivers) must
-    # not call get_lib(None) — use get_lib(platform_from_env()) instead.
-    backend = jax.default_backend()
-    if backend in ("gpu", "cuda"):
-        return "CUDA"
-    if backend == "cpu":
-        return "cpu"
+    # NOTE: this INITIALIZES the XLA backend.  Code that runs before
+    # jax.distributed.initialize (multi-rank CLI drivers) must not call
+    # get_lib(None) — use get_lib(platform_from_env()) instead.
+    vendor = device_vendor(jax.devices()[0])
+    if vendor in FFI_PLATFORM_MAP:
+        return FFI_PLATFORM_MAP[vendor]
     raise RuntimeError(
-        f"lorrax_ffi: no FFI library for JAX backend {backend!r} "
-        f"(supported: cuda, cpu).")
-
-
-def platform_from_env(default: str = "CUDA") -> str:
-    """Resolve the FFI platform from ``JAX_PLATFORMS`` WITHOUT touching the
-    JAX backend — safe before ``jax.distributed.initialize``.  The first
-    entry wins, mirroring how JAX picks its default backend from the list.
-    """
-    first = os.environ.get("JAX_PLATFORMS", "").split(",")[0].strip().lower()
-    if not first:
-        return default
-    return "CUDA" if first in ("cuda", "gpu") else "cpu"
+        f"lorrax_ffi: no FFI library for the {vendor!r} devices of this "
+        f"process (libraries exist for cuda and cpu); its operations run "
+        f"the XLA path.")
 
 
 def _candidate_paths(platform: str) -> list[Path]:

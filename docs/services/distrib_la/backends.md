@@ -103,9 +103,11 @@ debugging controls.
   platform. It is a different algorithm with a different memory profile: at
   `n = 10⁴` on `P = 128` the replicated route costs 1.6 GB per device and
   `native2d` 5 MB. Its tile decomposition is checked at resolve time.
-- **ROCm is declared, not tested.** LORRAX builds no ROCm library, and JAX
-  reports `Device.platform == 'gpu'` for both GPU vendors, so a ROCm mesh
-  resolves as CUDA (`resolve.FFI_PLATFORMS`).
+- **ROCm is declared, not tested.** The platform key comes from the device
+  vendor (`lxkit.device_vendor`: the client's platform and version strings and
+  the device kind), so a ROCm mesh resolves as `rocm`, never as CUDA. LORRAX
+  builds no ROCm library, so `linalg = local` (the XLA plan) runs there and a
+  distributed request refuses.
 
 ### The guard ladder {#guard-ladder}
 

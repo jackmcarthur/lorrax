@@ -602,7 +602,7 @@ class GemmPlan:
                                     self.out_sharding.spec)
 
         if self.backend == "local":
-            if self.mesh.devices.flat[0].platform == "gpu":
+            if mesh_platform(self.mesh) == "CUDA":
                 from distrib_la._active_local_cuda import (
                     prepared_active_local_cuda,
                     require_prepared_active_local_cuda,
@@ -854,7 +854,7 @@ def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
         raise ValueError("local_gemm_plan active_range storage K exceeds int32 bounds")
     active_impl = None
     if enable_active_range:
-        if mesh.devices.flat[0].platform == "gpu":
+        if mesh_platform(mesh) == "CUDA":
             from distrib_la._active_local_cuda import (active_local_cuda,
                                                        require_active_local_cuda)
             require_active_local_cuda()

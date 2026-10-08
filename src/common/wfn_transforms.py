@@ -725,7 +725,8 @@ def gflat_to_rchunk_aot_memory(
             "gflat_to_rchunk_aot_memory: norm must be 'backward', "
             f"'ortho', or 'forward'; got {norm!r}")
 
-    platform = mesh.devices.flat[0].platform
+    from lxkit import device_vendor
+    platform = device_vendor(mesh.devices.flat[0])        # "cuda" | "rocm" | "cpu" | ...
     key = (
         id(mesh), nk, band_carrier, nspinor, ngkmax, fft_grid_t,
         r_carrier, norm, jnp.dtype(dtype).str, platform,
@@ -771,15 +772,15 @@ def gflat_to_rchunk_aot_memory(
     lowered = kernel.lower(*specs)
     compiled = lowered.compile(
         compiler_options={"xla_gpu_memory_limit_slop_factor": 10000}
-    ) if platform in ("gpu", "cuda") else lowered.compile()
+    ) if platform in ("cuda", "rocm") else lowered.compile()
     from runtime.aot_memory import aot_kernel_peak_bytes
     memory = aot_kernel_peak_bytes(compiled, platform=platform)
-    if platform in ("gpu", "cuda") and not memory.fft_specs:
+    if platform == "cuda" and not memory.fft_specs:
         raise RuntimeError(
             "gflat_to_rchunk_aot_memory: the compiled canonical WFN "
             "r-slab program exposes no FFT operation, so its cuFFT workspace "
             "cannot be certified")
-    if platform in ("gpu", "cuda") and not memory.cufft_measured:
+    if platform == "cuda" and not memory.cufft_measured:
         raise RuntimeError(
             "gflat_to_rchunk_aot_memory: the canonical WFN r-slab program's "
             "cuFFT workspace query is unavailable on CUDA; refusing a "

@@ -286,8 +286,8 @@ the same `lxkit.native_provider` policy) chooses one library per platform:
   (`HANDLER ABI MISMATCH`). An unstamped one is announced once as
   `LEGACY-UNSEALED` and loads, unless `LORRAX_FFI_ABI_STRICT=1`; an unstamped
   library inside a sealed bundle always refuses.
-- **Load order.** In a process that can use CUDA (`JAX_PLATFORMS` does not
-  put `cpu` first, and an NVIDIA device is visible), opening the host library
+- **Load order.** In a process that can use CUDA (`JAX_PLATFORMS` unset or
+  naming `cuda` or `gpu` first, and an NVIDIA device is visible), opening the host library
   opens the CUDA library first, so a CUDA-built SLATE and BLAS++, when
   present, win the shared SONAMEs: a host-built BLAS++ reports zero devices
   to a CUDA SLATE. After each `dlopen` the loader refuses a process with more

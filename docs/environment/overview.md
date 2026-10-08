@@ -188,8 +188,8 @@ On a run that resolves to CPU, jax 0.9.1 still dlopens the CUDA library stack
 during plugin discovery (its cost on a cold Frontera node:
 [frontera.md §3](machines/frontera.md#3-cold-start)).
 `runtime.skip_gpu_plugin_discovery()`, armed by `bootstrap()` /
-`set_default_env()` when `JAX_PLATFORMS=cpu` or no NVIDIA device node is
-visible, answers the discovery with a stub module; the same venv still runs
+`set_default_env()` when `JAX_PLATFORMS=cpu` or no GPU device node of any
+vendor is visible, answers the discovery with a stub module; the same venv still runs
 GPU jobs. `LORRAX_CPU_SKIP_GPU_PLUGINS=0` disables it, announced.
 
 ### 2.3 Device selection and multi-host
@@ -202,7 +202,8 @@ export XLA_FLAGS="--xla_force_host_platform_device_count=4"  # CPU mock mesh
 `runtime.initialize_communicator_stack()` owns multi-process bring-up
 ([services](../architecture/services.md#runtime)); every rank calls it. Under
 SLURM with `SLURM_NTASKS > 1` it calls `jax.distributed.initialize()` with
-`local_device_ids` derived from `CUDA_VISIBLE_DEVICES`; off SLURM set
+`local_device_ids` derived from the first visibility variable set
+(`CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`); off SLURM set
 `JAX_COORDINATOR_ADDRESS`, `JAX_NUM_PROCESSES` and `JAX_PROCESS_INDEX`. One GPU
 per rank is pinned by `src/ffi/cpp/select_gpu.sh` through
 `CUDA_VISIBLE_DEVICES`, not by `--gpus-per-task=1`

@@ -2,7 +2,8 @@
 
 One resolver for every env-gated, rank-local FFI capability: a handler called
 inside somebody else's `shard_map`, holding no communicator. Source:
-`src/ffi/gate.py`. Both gates default on, and a missing library refuses at
+`services/lxkit/src/lxkit/gate.py`; `src/ffi/gate.py` re-exports it with the
+probe bound to `ffi_loader.probe_target`. Both gates default on, and a missing library refuses at
 startup; XLA is the reference path a gated handler is checked against
 ([decisions](../architecture/decisions.md#xla-reference)).
 
@@ -24,7 +25,7 @@ every target: the [kernel catalog](../architecture/ffi_layout.md#kernel-catalog)
 ## API
 
 ```python
-GATE.mode()          -> "on" | "off" | "auto"   tier 0: grammar
+GATE.mode()          -> "on" | "off"            tier 0: grammar
 GATE.enabled()       -> bool                    tier 1: lexical, no backend init
 GATE.platform_ok(m)  -> bool                    does this mesh's platform have a backend
 GATE.require(m)      -> platform                tier 2: announce or refuse
@@ -38,16 +39,23 @@ GATE.enforce(m)      -> platform | None         tier 2, startup
 |---|---|
 | `off` | `0` `off` `false` `no` |
 | `on` | `1` `on` `true` `yes` |
-| `auto` | `auto` |
 
-Unset or empty maps to the gate's `default`. Each gate declares its own
-vocabulary; both current gates accept only `off`/`on`, so `=auto` is a grammar
-error there. A value outside the vocabulary is announced once, on the rank
+Unset or empty maps to the gate's `default`. The vocabulary is two-valued, so
+`=auto` is a grammar error. A value outside it is announced once, on the rank
 that read it, and resolves to the **default**: with `off` able to refuse, a
 typo resolving to `off` would kill a run. `Gate.__post_init__` refuses a
-declared mode with no resolver branch, and refuses `auto` without an
-`auto_capability` string naming the capability test. `auto` is admitted only
-for an optional accelerator whose off path is a certified reference.
+declared mode with no resolver branch.
+
+### The platform key
+
+`lxkit.mesh_ffi_platform(mesh)` reads the vendor from the first device's
+client (`lxkit.device_vendor`: `client.platform`, `client.platform_version`,
+`device_kind`), never from `device.platform`, which is `gpu` for every GPU
+vendor. `cuda` maps to `CUDA` and `cpu` to `cpu`, the two platforms with a
+LORRAX library; `rocm` and an unrecognised GPU pass through unmapped, so no
+gate or loader selects a native target there.
+Before the backend exists, `lxkit.platform_from_env()` reads the same key from
+`JAX_PLATFORMS`. Tests: `tests/test_platform_vendor.py`.
 
 ### Two tiers
 

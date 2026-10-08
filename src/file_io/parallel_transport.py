@@ -1082,7 +1082,8 @@ def _write_w_av_stage(
     from common.gpu_utils import device_budget_bytes
     from runtime.xla_memory import resolve_xla_gpu_memory_env
     xla_memory = resolve_xla_gpu_memory_env()
-    if (jax.default_backend() == "gpu"
+    from lxkit import device_vendor
+    if (device_vendor(jax.devices()[0]) == "cuda"
             and xla_memory.allocator != "platform"):
         raise RuntimeError(
             "W_AV-QSTREAM-ALLOCATOR refusal: got "

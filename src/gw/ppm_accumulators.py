@@ -163,7 +163,8 @@ class DeviceOmegaAccumulator:
         self._sharding = sharding
         self._reduce = reduce
         self._replicated = NamedSharding(sharding.mesh, P())
-        self._gpu = sharding.mesh.devices.flat[0].platform in ("gpu", "cuda")
+        from lxkit import device_vendor
+        self._gpu = device_vendor(sharding.mesh.devices.flat[0]) in ("cuda", "rocm")
         self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
         self._omega_axis = int(omega_axis)
         shapes = ((shape,) if reduce is None else (*shape[0], *shape[1]))

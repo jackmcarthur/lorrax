@@ -922,6 +922,14 @@ def _probe_mpi_bootstrap(platform: str) -> tuple[bool, str]:
                                 argv_extra=(so,))
 
 
+def _default_ffi_platform() -> str:
+    """The FFI library key of this process's devices, from their vendor
+    (``lxkit.device_vendor``); a vendor without a library passes through."""
+    from lxkit import FFI_PLATFORM_MAP, device_vendor
+    vendor = device_vendor(jax.devices()[0])
+    return FFI_PLATFORM_MAP.get(vendor, vendor)
+
+
 def probe_availability(platform: str | None = None) -> tuple[bool, str, str]:
     """``(ok, stage, reason)`` — can this process write one tile per rank?
 
@@ -951,7 +959,7 @@ def probe_availability(platform: str | None = None) -> tuple[bool, str, str]:
     if _AVAILABILITY is not None:
         return _AVAILABILITY
     if platform is None:
-        platform = "cpu" if jax.default_backend() == "cpu" else "CUDA"
+        platform = _default_ffi_platform()
     stage, reason = "probe", "ffi.common.ffi_loader import failed"
     try:
         from ffi.common.ffi_loader import probe_target
@@ -997,7 +1005,7 @@ def probe_read_availability(platform: str | None = None) -> tuple[bool, str]:
     because the caller is choosing between transports.
     """
     if platform is None:
-        platform = "cpu" if jax.default_backend() == "cpu" else "CUDA"
+        platform = _default_ffi_platform()
     try:
         from ffi.common.ffi_loader import probe_target
         return probe_target("lorrax_phdf5_read_kchunk_union", platform)

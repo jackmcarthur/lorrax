@@ -42,8 +42,6 @@ an operation had no XLA path.
 
 **Not yet conforming.**
 
-* `ffi.gate.mesh_ffi_platform` and `distrib_la.resolve` map `gpu` to CUDA,
-  and `runtime._gpu_is_present` reads `/dev/nvidia*`.
 * The k-convolution router has no XLA backend: CUDA takes mathdx, cpu the
   host plans, and any other platform refuses (`GATE kconv-platform`).
 * The contour accumulator, the spin-rotation kernel and the cuBLASMp GEMM

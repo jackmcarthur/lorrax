@@ -39,6 +39,7 @@ from lxkit.gate import (
     MODE_HELP,
     MODE_SPELLINGS,
     announce_once,
+    device_vendor,
     dial_key,
     mesh_ffi_platform,
     platform_from_env,
@@ -70,7 +71,7 @@ __all__ = [
     # gate
     "Gate", "MODE_SPELLINGS", "MODE_HELP", "FFI_PLATFORM_MAP",
     "rank_id", "rank0", "announce_once", "reset_gate_state",
-    "mesh_ffi_platform", "platform_from_env", "dial_key",
+    "device_vendor", "mesh_ffi_platform", "platform_from_env", "dial_key",
     # probe
     "ProbeResult", "AVAILABLE", "LibraryNotBuilt", "LibraryUnusable",
     "unknown_target", "not_loadable", "missing_symbol",

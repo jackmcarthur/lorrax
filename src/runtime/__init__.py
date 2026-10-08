@@ -696,8 +696,10 @@ def set_default_env(*, platform: str = "gpu") -> None:
     (:func:`enforce_x64`), because that override does not make the run
     cheaper, it makes it a different calculation.
 
-    ``platform="gpu"`` (default) sets ``JAX_PLATFORMS="cuda,cpu"`` so
-    JAX tries CUDA and falls back to CPU.  ``platform="cpu"`` forces CPU.
+    ``platform="gpu"`` (default) sets ``JAX_PLATFORMS="<gpu>,cpu"``, where
+    ``<gpu>`` is the platform of the installed jaxlib GPU plugin
+    (:func:`_gpu_plugin_platform`: ``cuda`` or ``rocm``), so JAX tries the GPU
+    and falls back to CPU.  ``platform="cpu"`` forces CPU.
 
     THE GPU MEMORY POOL (:func:`set_default_gpu_pool` owns it)
     ----------------------------------------------------------
@@ -733,7 +735,7 @@ def set_default_env(*, platform: str = "gpu") -> None:
     # rather than at some module's import is what makes it order-independent.
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
     if platform == "gpu":
-        os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+        os.environ.setdefault("JAX_PLATFORMS", f"{_gpu_plugin_platform()},cpu")
     elif platform == "cpu":
         os.environ["JAX_PLATFORMS"] = "cpu"
     else:
@@ -791,7 +793,7 @@ def set_default_gpu_pool() -> None:
     Both fraction spellings at once also REFUSE here: jaxlib raises on the
     pair inside plugin discovery, where it surfaces as "Unable to initialize
     backend 'cuda'" (audit M7).  Nothing is set unless this is a CUDA run on
-    a node with an NVIDIA device (:func:`_gpu_is_present`): a CPU run, a
+    a node with a GPU device (:func:`_gpu_is_present`): a CPU run, a
     GPU-less node and ROCm (no LORRAX deployment to measure a pool on) keep
     jaxlib's own defaults.
 
@@ -1027,8 +1029,8 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
     1. ``JAX_PLATFORMS`` resolves to exactly ``cpu``.  A GPU backend is
        forbidden outright, so the plugin can only be dead weight.
 
-    2. ``JAX_PLATFORMS`` asks for a GPU but this node has no visible NVIDIA
-       device (:func:`_gpu_is_present`).  jax's own ``backends()`` does
+    2. ``JAX_PLATFORMS`` asks for a GPU but this node has no visible GPU
+       device of any vendor (:func:`_gpu_is_present`).  jax's own ``backends()`` does
        ``if platform == "cuda" and not has_visible_nvidia_gpu(): continue``
        (jax 0.9.1 ``xla_bridge.py:829``) -- it skips CUDA on exactly this
        test, but only AFTER discovery has dlopened the libraries.  This arm
@@ -1067,7 +1069,7 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
     if plats == ["cpu"]:
         arm = "JAX_PLATFORMS=cpu"
     elif wants_gpu and not _gpu_is_present():
-        arm = f"JAX_PLATFORMS={plat!r} but no NVIDIA device on this node"
+        arm = f"JAX_PLATFORMS={plat!r} but no GPU device on this node"
     else:
         # No platform stated at all, or a GPU is stated and present: leave
         # jax's discovery exactly as it is.  Guessing here would be the one
@@ -1091,7 +1093,7 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
 
     import sys
 
-    if "jax_plugins.xla_cuda12" in sys.modules:
+    if any(n.startswith("jax_plugins.xla_") for n in sys.modules):
         # Too late: something already imported and initialised the plugin, so
         # the libraries are loaded and stubbing now would only hide it.  The
         # STARTUP SAVING is lost, but the arm-2 demotion is not: reaching
@@ -1107,7 +1109,7 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
             os.environ["JAX_PLATFORMS"] = "cpu"
             _record_demotion(
                 f"JAX_PLATFORMS was requested as {plat!r} and was pinned to "
-                f"'cpu' (no NVIDIA device on this node); the CUDA plugin was "
+                f"'cpu' (no GPU device on this node); the GPU plugin was "
                 f"already imported, so only the demotion — not the startup "
                 f"saving — is in force.")
         if announce:
@@ -1160,7 +1162,7 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
         os.environ["JAX_PLATFORMS"] = "cpu"
         _record_demotion(
             f"JAX_PLATFORMS was requested as {plat!r} and was pinned to 'cpu' "
-            f"before backend init because this node exposes no NVIDIA device "
+            f"before backend init because this node exposes no GPU device "
             f"node; this run has no GPU.")
         announce_cpu_collectives()
     return True
@@ -1454,7 +1456,9 @@ def init_jax_distributed() -> None:
     process.  ``jax.distributed.initialize()`` with no args then hangs
     in the topology exchange because it assumes each process owns
     *all* local GPUs.  We pass ``local_device_ids`` explicitly,
-    derived from CUDA_VISIBLE_DEVICES.  First try that; on failure
+    one per device the launcher made visible (:func:`_visible_device_count`:
+    ``CUDA_VISIBLE_DEVICES``, ``ROCR_VISIBLE_DEVICES`` or
+    ``HIP_VISIBLE_DEVICES``).  First try that; on failure
     fall back to the explicit ``(coordinator_address, num_processes,
     process_id)`` form.
 
@@ -1484,8 +1488,7 @@ def init_jax_distributed() -> None:
 
     jax = _import_jax()
 
-    cv = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    n_local = len([x for x in cv.split(",") if x.strip()]) if cv else 0
+    n_local = _visible_device_count()
     init_kwargs = {"local_device_ids": list(range(n_local))} if n_local else {}
     explicit_step = bool(os.environ.get("SLURM_STEP_NODELIST"))
     if not os.environ.get("JAX_COORDINATOR_ADDRESS") and not explicit_step:
@@ -1585,33 +1588,64 @@ def nccl_warmup(mesh_xy) -> None:
 
 
 def _gpu_is_present() -> bool:
-    """True if an NVIDIA GPU is actually visible to this process.
+    """True if a GPU of any vendor is visible to this process.
 
-    Used to decide whether a JAX GPU-backend init failure is a benign
-    "no GPU here, run on CPU" (login/CPU node) or a genuine GPU-init
-    failure that must NOT be masked (GPU node with a driver/library
-    problem).  Signals, cheapest first:
-
-      * ``CUDA_VISIBLE_DEVICES=""`` → explicitly masked, no GPU.
-      * any ``/dev/nvidia[0-9]*`` device node (or ``/dev/nvidiactl``) →
-        a GPU is physically present on this node.
-      * ``/usr/lib/wsl/lib/libcuda.so.1`` → WSL2 with the Windows NVIDIA
-        driver mapped in.  WSL2 exposes NO ``/dev/nvidia*`` (its GPU rides
-        ``/dev/dxg``), so the device-node probe alone silently demoted GPU
-        runs to CPU there (measured 2026-08-26: a gw_jax run on an RTX 5070
-        box printed ``DEMOTION ... no NVIDIA device node`` and ran XLA:CPU).
-        ``/dev/dxg`` itself is deliberately NOT the signal — it exists on
-        any WSL2 with graphics virtualization, NVIDIA or not, and a
-        yes-here answer on a non-NVIDIA box would unmask benign GPU-init
-        failures.  The mapped libcuda is NVIDIA-exact.
+    Answered before the device client exists, so from the device nodes:
+    NVIDIA ``/dev/nvidia[0-9]*`` or ``/dev/nvidiactl`` (or WSL2's mapped
+    ``/usr/lib/wsl/lib/libcuda.so.1``, since WSL2 has no ``/dev/nvidia*``),
+    AMD ``/dev/kfd``.  A vendor's visibility variable set empty
+    (``CUDA_VISIBLE_DEVICES=""``, ``ROCR_VISIBLE_DEVICES=""``,
+    ``HIP_VISIBLE_DEVICES=""``) masks that vendor's devices.  Decides whether
+    a GPU-backend init failure is benign (no GPU here: run on CPU) or genuine
+    (a GPU node with a driver problem, which is re-raised).  The vendor of the
+    devices the run uses is read later, from the client
+    (:func:`lxkit.device_vendor`).
     """
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cvd is not None and cvd.strip() == "":
-        return False
+    def masked(*names):
+        return any((os.environ.get(n) is not None
+                    and os.environ.get(n).strip() == "") for n in names)
     import glob
-    return (bool(glob.glob("/dev/nvidia[0-9]*"))
-            or os.path.exists("/dev/nvidiactl")
-            or os.path.exists("/usr/lib/wsl/lib/libcuda.so.1"))
+    nvidia = not masked("CUDA_VISIBLE_DEVICES") and (
+        bool(glob.glob("/dev/nvidia[0-9]*"))
+        or os.path.exists("/dev/nvidiactl")
+        or os.path.exists("/usr/lib/wsl/lib/libcuda.so.1"))
+    amd = (not masked("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
+           and os.path.exists("/dev/kfd"))
+    return nvidia or amd
+
+
+def _gpu_plugin_platform() -> str:
+    """``"rocm"`` when the installed jaxlib GPU plugin is a ROCm build, else ``"cuda"``.
+
+    Read from the ``jax_plugins`` namespace directories on ``sys.path``
+    (``xla_cuda13``, ``xla_rocm7``, ...): no plugin is imported and no device
+    is touched, because it decides ``JAX_PLATFORMS`` before the backend exists.
+    """
+    import sys
+    for root in sys.path:
+        try:
+            names = os.listdir(os.path.join(root or ".", "jax_plugins"))
+        except OSError:
+            continue
+        if any(n.startswith("xla_rocm") for n in names):
+            return "rocm"
+    return "cuda"
+
+
+#: The launcher's per-vendor device-visibility variables, in lookup order.
+_VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
+                        "HIP_VISIBLE_DEVICES")
+
+
+def _visible_device_count() -> int:
+    """How many GPUs the launcher made visible to this process; 0 when no
+    visibility variable restricts them.  Read from the environment because
+    ``jax.distributed.initialize`` must run before the client exists."""
+    for var in _VISIBLE_DEVICE_ENVS:
+        raw = os.environ.get(var, "")
+        if raw.strip():
+            return len([x for x in raw.split(",") if x.strip()])
+    return 0
 
 
 def fallback_to_cpu_if_no_gpu_backend() -> None:
@@ -1666,7 +1700,7 @@ def fallback_to_cpu_if_no_gpu_backend() -> None:
     os.environ.pop("JAX_PLATFORM_NAME", None)
     os.environ["JAX_PLATFORMS"] = "cpu"
     _record_demotion(
-        f"The GPU backend failed to initialise and no NVIDIA device is "
+        f"The GPU backend failed to initialise and no GPU device is "
         f"present, so JAX_PLATFORMS was forced to 'cpu' after backend init "
         f"({str(msg).splitlines()[0][:160]}).")
     try:                       # drop the half-initialised cuda backend cache
@@ -1895,8 +1929,7 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
-    6b. :func:`_enforce_required_ffi` -- the FFI layer is REQUIRED
-       (decisions.md 2026-08-01): each gate's :meth:`ffi.gate.Gate.enforce`
+    6b. :func:`_enforce_required_ffi` -- each gate's :meth:`ffi.gate.Gate.enforce`
        runs against the fresh mesh, so a missing or unloadable FFI library
        refuses AT STARTUP, naming the ``.so`` and the fix, instead of at
        the first kernel factory mid-run; an explicit ``=0`` either refuses
@@ -2458,8 +2491,8 @@ def _enforce_cpu_mpi_thread_multiple(say) -> None:
 
 
 def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
-    """Startup enforcement of the REQUIRED FFI layer (decisions.md
-    2026-08-01) — step 6b of :func:`initialize_communicator_stack`.
+    """Startup enforcement of the FFI routes this platform selects — step 6b
+    of :func:`initialize_communicator_stack`.
 
     Runs each capability gate's :meth:`ffi.gate.Gate.enforce` against the
     run's mesh: a missing or unloadable FFI library REFUSES here, at
@@ -2485,7 +2518,7 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
         gate.enforce(mesh, announce=announce)
     # The k-convolution router has no dial: it resolves by platform and
     # refuses here, at startup, when its backend cannot be served (on CUDA a
-    # missing nvidia-mathdx wheel; decisions.md 2026-09-24).
+    # missing nvidia-mathdx wheel; docs/architecture/kconv.md#router).
     require_kconv(mesh, announce=announce)
     # LocalFourierPlan's CUDA leg is one custom call in the same library.
     require_fourier_plan(mesh, announce=announce)
@@ -2501,8 +2534,8 @@ def _ffi_dial_facts() -> list:
     variables here: the gate owns the strict grammar (``=Y`` is a grammar
     error, not a silent no-op), so asking it HERE both reports the answer
     and pins the answer every later consumer will key its kernel cache on.
-    Since the FFI-required ruling (decisions.md 2026-08-01) the vocabulary
-    is two-valued -- ``on``/``off`` answer from the env alone, no probe --
+    The vocabulary is two-valued -- ``on``/``off`` answer from the env
+    alone, no probe --
     and the hard availability check is :func:`_enforce_required_ffi`
     (step 6b), which has already run by the time this collector reports.
     """
@@ -2529,9 +2562,6 @@ def _ffi_dial_facts() -> list:
                     "platforms": tuple(gate.platforms), "detail": detail,
                     "off_label": gate.off_label,
                     "off_policy": gate.off_policy,
-                    # Declared capability test, for the `auto` sentence above.
-                    # Empty for every gate that does not offer the mode.
-                    "auto_capability": getattr(gate, "auto_capability", ""),
                     # Captured HERE, not re-read in the formatter: the
                     # formatter is pure, and a report that re-read os.environ
                     # could print a value the gate never saw.
@@ -2642,6 +2672,10 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     f["jaxlib_version"] = getattr(jaxlib, "__version__", "unknown")
 
     f["backend"] = jax.default_backend()
+    from lxkit import mesh_ffi_platform
+    # The FFI library key from the device vendor ("CUDA", "cpu", or an
+    # unmapped vendor such as "rocm", which has no LORRAX library).
+    f["ffi_platform"] = mesh_ffi_platform(mesh)
     f["process_index"] = int(jax.process_index())
     f["process_count"] = int(jax.process_count())
     devices = jax.devices()
@@ -2712,7 +2746,7 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         pool["corroboration"] = reading.peak_source
         pool["disagreement"] = reading.disagreement
         pool["accounting_present"] = reading.accounting_present
-        if f["backend"] in ("gpu", "cuda") and local:
+        if f["ffi_platform"] == "CUDA" and local:
             from .xla_memory import cuda_device_total_bytes
             pool["device_total_bytes"] = cuda_device_total_bytes(
                 getattr(local[0], "local_hardware_id", 0) or 0)
@@ -2725,8 +2759,11 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
     f["pool"] = pool
 
     # -- FFI ---------------------------------------------------------------
-    plat_key = "CUDA" if f["backend"] in ("gpu", "cuda") else f["backend"]
-    f["ffi_library"] = _ffi_library_facts(plat_key)
+    plat_key = f["ffi_platform"]
+    f["ffi_library"] = (_ffi_library_facts(plat_key) if plat_key in ("CUDA", "cpu")
+                        else {"platform": plat_key, "path": None, "loaded": False,
+                              "no_library": True,
+                              "reason": "LORRAX builds no library for this platform"})
     f["ffi_dials"] = _ffi_dial_facts()
     f["linalg"] = _linalg_facts(mesh)
 
@@ -2955,10 +2992,12 @@ def format_startup_report(f: dict) -> list:
         # harness can echo one path and export another.  State the BYTES.
         if lib.get("provenance"):
             add(f"  FFI build provenance: {lib.get('provenance')}")
+    elif lib.get("no_library"):
+        add(f"  No FFI library exists for {lib.get('platform')!r} devices; "
+            f"their operations run the XLA path.")
     else:
         add(f"  No {lib.get('platform')} FFI library could be loaded "
-            f"({lib.get('reason')}).  The FFI layer is REQUIRED "
-            f"(decisions.md 2026-08-01): startup enforcement refuses this "
+            f"({lib.get('reason')}).  Startup enforcement refuses this "
             f"state, so a run printing this line bypassed "
             f"initialize_communicator_stack — see "
             f"docs/environment/overview.md for the library build.")
@@ -2969,8 +3008,7 @@ def format_startup_report(f: dict) -> list:
     # by the P1.2 GPU certification (job 7885151): on a CUDA mesh the block
     # claimed the LORRAX_BANDS_GEMM_FFI contraction rode the FFI handler
     # while the actual GEMMs ride XLA:GPU's native cuBLAS lowering.
-    _plat_key = ("CUDA" if f.get("backend") in ("gpu", "cuda")
-                 else f.get("backend"))
+    _plat_key = f.get("ffi_platform", f.get("backend"))
     for d in f.get("ffi_dials", ()):
         if d.get("mode") is None:
             add(f"  The {d['env']} dial could not be resolved: {d['detail']}.")
@@ -2985,22 +3023,12 @@ def format_startup_report(f: dict) -> list:
                      f"enforcement skips it by the gate's declared platform "
                      f"policy (the native lowering IS the required path "
                      f"there)")
-        elif d["mode"] == "auto":
-            # An OPT-IN ACCELERATOR, not a required layer: `auto` uses the
-            # handler where the capability is present and takes the caller's
-            # own certified path where it is not.  The startup block is the
-            # ONE place that says which happened, so it must not borrow the
-            # required-layer sentence, which would claim a route this run may
-            # not have taken.
-            route = (f"is routed through the FFI handler WHERE AVAILABLE and "
-                     f"through {d.get('off_label', 'the native path')} "
-                     f"otherwise (capability: {d.get('auto_capability', '')})")
         elif d["enabled"]:
             route = "is routed through the FFI handler (the required layer)"
         elif d.get("off_policy") == "refuse":
-            route = ("has NOTHING to run — the native duplicate was "
-                     "deleted (decisions.md 2026-08-01) and startup "
-                     "enforcement refuses this setting")
+            route = ("has NOTHING to run — the path has no other "
+                     "implementation and startup enforcement refuses this "
+                     "setting")
         elif d.get("default") == "off":
             # An OPT-IN dial, where `off` is the CERTIFIED state.  The
             # sentence below assumes the required-layer shape (dial defaults
