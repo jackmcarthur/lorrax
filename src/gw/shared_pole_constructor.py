@@ -54,7 +54,8 @@ def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordere
     return execution, receipt, column_extent, faces, moment_fields
 
 
-def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, residence=None):
+def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, residence=None,
+                           cap_only_replay=False, model_identity=None):
     """Construct and write a current-state, bounded-batch real-pole model.
 
     Parameters
@@ -82,6 +83,13 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         column width is known and before it is written. A resident target
         replaces ``output`` and its stage stays reserved for the caller; the
         receipt is returned as ``model_residence``.
+    cap_only_replay : bool, optional
+        Explicit production scalar one-shot cap-only replay. Authenticate
+        unchanged bank state, supports and geometry before using a different
+        source-resolved cap. The bank and its headers remain immutable.
+    model_identity : mapping, optional
+        Current source-resolved identity, required only for cap-only replay;
+        the bank descriptor retains its original identity for every read.
 
     Returns
     -------
@@ -141,6 +149,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             raise ValueError("GATE shared_pole_representation: recipe gate table differs from charge carrier")
         resolution = linalg_resolution({"linalg": config.backend.linalg})
         identity = bank["identity"]
+        if type(cap_only_replay) is not bool or (not cap_only_replay and model_identity is not None):
+            raise ValueError('GATE shared_pole_cap_replay: explicit bool and separate model identity required')
+        cap_replay = None
         ledger = meta.shared_pole_capacity
         upstream = ledger.live_stages
         n = int(meta.n_rmu_padded)
@@ -150,11 +161,31 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         header = validate_shared_pole_bank(bank["path"], expected_identity=identity,
                                            mesh_xy=mesh_xy, require_complete=True)
         moment_header = validate_shared_pole_bank(moments["path"], expected_identity=identity,
-                                                  mesh_xy=mesh_xy)
+                                                  mesh_xy=mesh_xy, require_complete=cap_only_replay)
         # The stored plan must bind the current physical points and role census.
         stored_recipe = header["recipe"]
+        if cap_only_replay:
+            from gw.shared_pole_recipe import authenticate_cap_only_replay
+            from file_io.shared_pole_store import authenticate_bank_geometry, _json
+            if ordered or charge4 or int(meta.nspinor) != 1 or int(meta.nspinor_wfnfile) != 1:
+                raise ValueError('GATE shared_pole_cap_replay: only one-component scalar TRS input supported')
+            cap_replay = authenticate_cap_only_replay(stored_recipe, recipe, identity, model_identity)
+            if (_json(moment_header['recipe']) != _json(stored_recipe)
+                    or moment_header['bank_plan_digest'] != header['bank_plan_digest']):
+                raise ValueError('GATE shared_pole_cap_replay: bank and moments sampled plans differ')
+            for preserved in (header, moment_header):
+                authenticate_bank_geometry(preserved, meta=meta, tables=bank['tables'])
+                if not preserved.get('final_commit'):
+                    raise ValueError('GATE shared_pole_cap_replay: missing preserved final commit')
+            cap_replay.update(bank_final_commit=header['final_commit'],
+                              moments_final_commit=moment_header['final_commit'],
+                              bank_plan_digest=header['bank_plan_digest'],
+                              bank_header_recipe_sha256=header['recipe_hash'])
+            identity = dict(model_identity)
         for name in ("recipe_hash", "gate_hash", "fit_ids", "held_ids", "role", "role_codes",
                      "distinct_id", "held", "support_pair", "census"):
+            if cap_only_replay and name == 'recipe_hash':
+                continue  # canonical cap hashes and every other field authenticated above
             current = recipe[name]
             previous = stored_recipe[name]
             if isinstance(current, np.ndarray):
@@ -550,7 +581,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         store_header = write_shared_pole_model(
             target, public_b, jax.device_put(store_poles, NamedSharding(mesh_xy, P())),
             np.concatenate(store_counts)[order], q_span=(0, nq), meta=meta, tables=bank["tables"], recipe=recipe,
-            receipts={"identity": identity, "q_receipts": [receipts[q] for q in range(nq)]}, ordered=ordered)
+            receipts={"identity": identity, "q_receipts": [receipts[q] for q in range(nq)],
+                      **({"cap_only_replay": cap_replay} if cap_replay is not None else {})}, ordered=ordered)
         ledger.live_stages = upstream
         del public_b
     with phase("return"):
@@ -563,4 +595,5 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 "model_residence": model_residence,
                 "capacity": ledger.receipt(),
                 "identity": identity, "status": "CONSTRUCTED", "seconds": seconds,
-                "execution": dict(mode=execution, **execution_receipt)}
+                "execution": dict(mode=execution, **execution_receipt),
+                **({"cap_only_replay": cap_replay} if cap_replay is not None else {})}

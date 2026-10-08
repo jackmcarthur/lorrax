@@ -1020,6 +1020,66 @@ def parse_pole_budget(value, *, model="shared_pole", accuracy="production"):
     return budget
 
 
+def _fixed_pole_budget_hash(table, budget):
+    return hashlib.sha256(
+        (table + '|fixed-body-pole-budget-v1|' + str(budget)).encode()).hexdigest()
+
+
+def authenticate_cap_only_replay(stored, current, bank_identity, model_identity):
+    """Authenticate one production scalar cap change without changing sampled W.
+
+    Both recipes must come from this source's unmodified support resolver.
+    The immutable bank keeps its own identity; only the new model receives
+    the current resolved identity. Every other recipe/identity field is
+    compared, including native masks/census and the full typed sample plan.
+    This deliberately excludes SC, support overrides and ordered/charge4
+    recipes; ordinary strict bank matching remains the default.
+    """
+    from file_io.shared_pole_store import _json
+
+    def refuse(reason):
+        raise ValueError('GATE shared_pole_cap_replay: ' + reason)
+
+    allowed = {'recipe_hash', 'pole_budget', 'pole_budget_override'}
+    budgets = []
+    for recipe, identity in ((stored, bank_identity), (current, model_identity)):
+        if not isinstance(recipe, dict) or not isinstance(identity, dict):
+            refuse('missing resolved recipe or state identity')
+        budget = parse_pole_budget(recipe.get('pole_budget'),
+                                  model='shared_pole', accuracy=recipe.get('accuracy'))
+        if (not budget or recipe.get('pole_budget_override') != budget
+                or recipe.get('pole_budget_policy') != 'fixed-body-pole-budget-v1'
+                or recipe.get('recipe_version') != RECIPE_VERSION + '+pole_budget'
+                or recipe.get('support_sites_override') != ''
+                or recipe.get('gate_hash') != GATE_HASH
+                or recipe.get('gate_version') != GATE_VERSION
+                or not recipe.get('census', {}).get('trs_allowed', False)):
+            refuse('requires source-resolved production scalar-TRS fixed-cap recipe')
+        expected = _fixed_pole_budget_hash(RECIPE_HASH, budget)
+        if recipe.get('recipe_hash') != expected or identity.get('recipe_hash') != expected:
+            refuse('noncanonical cap-dependent recipe or identity hash')
+        if (str(identity.get('iteration_id', '')).startswith('sc_')
+                or any(not isinstance(identity.get(k), str) or not identity[k]
+                       for k in ('iteration_id', 'hamiltonian', 'energies',
+                                 'occupations', 'wavefunctions', 'centroids', 'gate_hash'))
+                or identity['gate_hash'] != GATE_HASH):
+            refuse('requires authenticated unchanged one-shot physical state')
+        budgets.append(budget)
+    physical = lambda r: {k: v for k, v in r.items() if k not in allowed}
+    if _json(physical(stored)) != _json(physical(current)):
+        refuse('physical recipe, sample plan, widths, masks or gates changed')
+    state = lambda r: {k: v for k, v in r.items() if k != 'recipe_hash'}
+    if _json(state(bank_identity)) != _json(state(model_identity)):
+        refuse('physical state identity changed')
+    return dict(policy='fixed-body-cap-only-bank-replay-v1',
+                original_pole_budget=budgets[0], model_pole_budget=budgets[1],
+                original_recipe_hash=stored['recipe_hash'], model_recipe_hash=current['recipe_hash'],
+                original_recipe_sha256=hashlib.sha256(_json(stored).encode()).hexdigest(),
+                model_recipe_sha256=hashlib.sha256(_json(current).encode()).hexdigest(),
+                physical_recipe_sha256=hashlib.sha256(_json(physical(stored)).encode()).hexdigest(),
+                bank_identity=dict(bank_identity), model_identity=dict(model_identity))
+
+
 def parse_support_sites(text):
     """Parse ``sigma_w_support_sites_ev`` into the two explicit site ladders.
 
@@ -1403,8 +1463,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
             (RECIPE_HASH + '|' + override['text']).encode()).hexdigest()
     if pole_override:
         version += '+pole_budget'
-        table = hashlib.sha256(
-            (table + '|fixed-body-pole-budget-v1|' + str(pole_override)).encode()).hexdigest()
+        table = _fixed_pole_budget_hash(table, pole_override)
     if sector_treatment is not None:
         version += '+sector_treatment'
         treatment_identity = {key: sector_treatment[key] for key in (

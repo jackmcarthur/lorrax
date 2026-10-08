@@ -342,6 +342,21 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
     return header
 
 
+def authenticate_bank_geometry(header, *, meta, tables):
+    """Bind a preserved bank's scientific chart to the current reader/writer.
+
+    Uses the same metadata constructor as the store writer. Only small
+    typed tables are compared; no response tensor is read or gathered.
+    """
+    expected = _metadata(meta, tables, header['recipe'], header['identity'])
+    keys = ('representation', 'parent_convention', 'n_q_irr', 'n_q_full',
+            'n_mu_logical', 'nspinor', 'centroid_digest', 'grid', 'fft_grid',
+            'q_order', 'q_shift', 'q_irr_full_idx', 'qirr', 'operations')
+    for key in keys:
+        if _json(header.get(key)) != _json(expected[key]):
+            _refuse('preserved bank geometry differs: ' + key)
+
+
 def _write_metadata(io, header):
     """Persist typed small tables, with the JSON header authenticating them."""
     io.write_attr("q_irr_full_idx", np.asarray(header["q_irr_full_idx"], np.int64))

@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-08 — opt-in fixed-cap replay of an immutable scalar response bank
+
+`construct_shared_poles(cap_only_replay=True, model_identity=...)` permits a
+production scalar one-shot bank to construct a new source-resolved fixed-cap
+model. Canonical cap hashes, every other recipe/state field, sample plan and
+typed geometry must match. Bank/moment identities and final commits remain
+original; the new model and Sigma handle receive the new identity. No field,
+header, support, direction width or numerical gate is changed. Default strict
+matching is unchanged. Policy tests and production capacity/energy evidence
+are pending; this feature is not a convergence certificate.
+
 ## 2026-10-08 — feature branch scalar TRS shared-pole real Galerkin reference route
 
 On `codex/cdref-real-galerkin-20261008`, the bounded scalar face constructor
