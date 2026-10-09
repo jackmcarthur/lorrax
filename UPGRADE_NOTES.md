@@ -19,9 +19,11 @@ budget, the nvidia-smi fallback, the 4 GB defaults, the BFC fragmentation table 
 the budget itself), `RUNTIME_RESERVE_BYTES`, `ISDF_CHUNK_TARGET_UTILIZATION` (unset it).
 The route-G ζ fit takes its stage-0 parent chunk and its plane-group width from the fixed tile,
 not from A100 timings; `gw.comm_model` is a receipt diagnostic only. Budget-sized stages may
-choose other sizes, which moves eqp at round-off: at most 0.006 µeV on CrI3 6×6 bispinor SC and
-CrI3 8×8 GN-PPM charge at P4 on both cards; the charge ζ fit 28.1 → 29.3 s (80 GB) and
-36.0 → 29.5 s (40 GB) (claim 3978). No deck change.
+choose other sizes, which moves eqp at round-off. At P4 on A100-40GB against main 92cb1fe0e:
+CrI3 6×6 bispinor SC maps 0–2 within 0.001 µeV. CrI3 8×8 GN-PPM charge within 1.1 µeV on every
+state above −15 eV; the semicore states near −17 eV, which that deck's QP solve moves by more
+than 10 eV, differ by up to 20 meV in map 1. ζ fit: 56.4 → 49.8 s (charge) and 40.9 → 40.1 s
+(bispinor). The final rule was not re-gated on A100-80GB (claim 3978). No deck change.
 
 ## 2026-10-08 — the response streams' block accumulate no longer materializes its terms
 
