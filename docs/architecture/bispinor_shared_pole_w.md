@@ -11,7 +11,7 @@ the scalar bank, directions, pencils and store schema, which the sectors
 reuse, are [the shared-pole implementation page](shared_pole_model.md); the
 four-current physics and the $1/c$ counting are
 [bispinor GW](../theory/bispinor-gw.md). Code is cited as `file:line` at
-main `92cb1fe0e`; read the file rather than the number.
+`0b1cca7b2`; read the file rather than the number.
 
 ## Symbols
 
@@ -147,11 +147,11 @@ schema is the scalar bank's with `C`/`T` line families
 ## 4 The route {#sector-route}
 
 The route is decided once per map, before any bank read, from the recipe shapes
-and the deck budget (`sector_route`, `src/gw/shared_pole_sectors.py:1576`). Every
+and the deck budget (`sector_route`, `src/gw/shared_pole_sectors.py:1584`). Every
 rank prices the same shapes, so every rank decides alike. The report prints one
 line, `Shared-pole sector constructor: route …`.
 
-**q-local.** `sector_execution` (`src/gw/shared_pole_sectors.py:1623`) prices one
+**q-local.** `sector_execution` (`src/gw/shared_pole_sectors.py:1631`) prices one
 whole parent per rank for each sector at its conservative pencil side
 (`constructor_side_upper_bound`). CC is priced first, TT beside CC's held
 outputs, CT beside both (`held_sector_bytes`,
@@ -171,7 +171,7 @@ N = \Big\lceil \frac{n_q}{N_{\rm rounds}} \Big\rceil
 $$
 
 parents, balanced over the rounds (`staged_round`,
-`src/gw/shared_pole_sectors.py:1528`). $N$ is set by $P$, never by the budget.
+`src/gw/shared_pole_sectors.py:1536`). $N$ is set by $P$, never by the budget.
 At $n_q \le P$ the whole map is one round.
 
 ## 5 Construction
@@ -182,8 +182,10 @@ At $n_q \le P$ the whole map is one round.
 then TT, in the batch layout `P(('x','y'))`, one whole parent per rank. Each is the
 scalar ordered round of `gw.shared_pole_local` (`reduce_round`) on the sector's
 rows, with the sector recipe (`sector_recipe`, `:574`: widths, line cap and
-$K_S$ resized to $n_S$) and the sector keep cut $10^{-5}$.
-`construct_cross_sector_round` (`:997`) then reduces CT on the two diagonal spans
+$K_S$ resized to $n_S$) and the sector keep cut $10^{-5}$. The round program
+takes the round's packed columns ($\S$5.2, *Packed columns*), placed in the
+batch layout before it runs (`reduce_round`, `src/gw/shared_pole_local.py:450`).
+`construct_cross_sector_round` (`src/gw/shared_pole_sectors.py:997`) then reduces CT on the two diagonal spans
 and keeps both endpoint outputs. Every eigh is a local dense solve.
 
 ### 5.2 A staged round
@@ -198,13 +200,16 @@ A staged round runs TT, then CC beside TT's held outputs, then CT from both
    scalar route ([shared-pole model §3](shared_pole_model.md#3-directions)). Their
    eighs run one whole $n_S \times n_S$ matrix per rank, so the selection's unit is
    the round.
-2. **Tables.** Each state panel is padded to its recipe carrier, and the pencil
-   side $R_S$ is grow-only over the sector's rounds and SC maps
-   (`round_tables`). The derivative panels $W'Q$ are released after the first
-   stage.
+2. **Tables and packed columns.** Each state panel is padded to its recipe
+   carrier. `round_tables` (`src/gw/shared_pole_local.py:203`) lays every slot's
+   selected columns into the round's finite extent $F$ (the pencil side
+   $R_S = F + 2\,i_S$ with $i_S$ the infinity carrier), and the panels are placed
+   into those columns before the first stage (*Packed columns*, below). $F$ is
+   grow-only over the sector's rounds and SC maps. The derivative panels $W'Q$
+   are released after the first stage.
 3. **Reduction.** The ordered reduction of theory §6.3 is cut at its three eighs
    into four GEMM stages (`face_reduce_decoupled`,
-   `src/gw/shared_pole_execution.py:786`; stages in
+   `src/gw/shared_pole_execution.py:781`; stages in
    `src/gw/shared_pole_reduction.py:391,431,498,537`):
 
    | stage | computes | then eigh of |
@@ -222,11 +227,60 @@ A staged round runs TT, then CC beside TT's held outputs, then CT from both
 CT (`staged_cross`, `src/gw/shared_pole_sectors.py:881`) assembles its joint
 pencil (metric, value, $O_C$, $O_T$) per sub-batch from its own CT and TC samples
 and both families' cross panels, at one compacted span for the round, written in
-place into one stack (`_assemble`, `src/gw/shared_pole_execution.py:627`). The
+place into one stack (`_assemble`, `src/gw/shared_pole_execution.py:626`). The
 diagonal sectors' selection panels are then released
-(`release_selection_panels`, `:843`), and the joint reduction runs its keep and
+(`release_selection_panels`, `src/gw/shared_pole_sectors.py:843`), and the joint reduction runs its keep and
 output stages around two eighs, the metric and the Ritz step, both at the joint
-side $K_{CT}$ (`face_cross_decoupled`, `src/gw/shared_pole_execution.py:876`).
+side $K_{CT}$ (`face_cross_decoupled`, `src/gw/shared_pole_execution.py:879`).
+
+**Packed columns.** A round's $S$ state panels $X_s \in \mathbb C^{n_S \times r_s}$
+(one of $Q$, $WQ$, $W'Q$ per field) sit at offsets $o_s = \sum_{t<s} r_t$ of
+their joined columns. `round_tables` gives each slot $b$ the map $\pi_b$ from
+pencil column $f < F$ to a joined column, $o_S$ standing for a zero column.
+The packed field is
+
+$$
+\hat X_b[:, f] =
+\begin{cases}
+X_{s,b}[:, j] & \pi_b(f) = o_s + j,\ 0 \le j < r_s,\\
+0 & \pi_b(f) = o_S .
+\end{cases}
+\tag{S 4a}
+$$
+
+`pack_panels` (`src/gw/shared_pole_local.py:285`) forms it one panel at a time.
+The host inverts $\pi_b$ for panel $s$: $d_{s,b}(j)$ is the column $f$ with
+$\pi_b(f) = o_s + j$, or $F$ when the round does not take column $j$. A source
+column appears at most once in a slot's table, so each packed column has one
+writer. One program per (layout, $r_s$, $F$) scatters a panel into one
+accumulator per field, $[\text{slots}, n_S, F]$ for the round's slots (a stage
+sub-batch on the face) (`_pack_place`, `:350`). In the batch layout the
+scatter is local. On the face the accumulators live in the slab layout
+([dense linear algebra §2](dense_linear_algebra.md#2-layouts-and-the-moves-between-them)),
+each rank holding whole rows; one `all_to_all` over `y` moves a panel's tile
+to its slab, the same bytes as the tile, and one `all_to_all` per field
+returns the packed columns to the face (`_pack_finish`, `:392`). Every byte
+of a panel crosses once, and so does the packed result.
+
+The point of the pack is that no round program takes the panels. The panel
+count follows the line sites, which change from map to map (Fe $4^3$ bispinor at
+P4: 104, 116 and 128 panels in maps 0–2, claim 4095). A program that joins the
+panels inside itself has a new input structure for every count and recompiles.
+The packed columns have the shape $[\text{slots}, n_S, F]$ only. $F$ is held by the sector
+alone, not by its panel count, so it carries across maps. A held $F$ past a
+round's own capacity is more inert zero columns. The extra panels of a later
+map are extra calls of the same place programs. On the CPU census at CrI3
+24×24 P64 shapes (TT side 25856, stage width 4; [dense linear algebra
+§2](dense_linear_algebra.md#what-gspmd-emits)), twelve more line panels grow
+main's stage 1 from 31394 to 33662 optimized operations at 8×8. On the pack
+branch, stage 1 is 16512 operations at every panel count, and the place
+program is 36 StableHLO operations (claim FACEMAP-1).
+
+CT takes packed columns too (`_pack_cross_spans`,
+`src/gw/shared_pole_sectors.py:1094`). The sectors' $Q$ and $WQ$, the TC-on-C
+output and the CT-on-T output and derivative are each placed at their own
+sector's extent, so the CT pencil program (`_cross_pencil_equations`, `:1326`)
+is fixed by the two extents and spans.
 
 **GEMM stages.** Every face GEMM is `distrib_la.panel_matmul` (`face_matmul`,
 `src/gw/shared_pole_execution.py:320`): a batched 2-D SUMMA with one exchange per
@@ -241,7 +295,7 @@ w = \max\{\,N, \lceil N/2\rceil, \lceil N/4\rceil, \ldots, 1 :\
 \tag{S 5}
 $$
 
-(`stage_width`, `src/gw/shared_pole_execution.py:700`). The program price is the
+(`stage_width`, `src/gw/shared_pole_execution.py:699`). The program price is the
 scalar byte model tiled over the mesh, times two for the collective's staged copy
 (`FACE_PROGRAM_COPIES`, `face_reduction_bytes`, `face_cross_bytes`). A short last
 sub-batch repeats its last parent, so one shape compiles. The width moves no
@@ -257,7 +311,7 @@ $$
 $$
 
 with $\text{held}_S$ the diagonal sector's selected panels (zero for CT), and on the whole mesh otherwise, with one `RuntimeWarning` (`staged_eigh`,
-`src/gw/shared_pole_execution.py:679`). The $8m^2$ elements per matrix are
+`src/gw/shared_pole_execution.py:678`). The $8m^2$ elements per matrix are
 `BATCH_EIGH_TILES` (`services/distrib_la/src/distrib_la/plan.py:395`), priced by
 `distrib_la.eigh_stack_bytes` (`services/distrib_la/src/distrib_la/workspace.py:306`).
 The boundary is the stack live beside that eigh (`staged_sector_bytes`,
