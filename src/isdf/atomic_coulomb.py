@@ -579,11 +579,26 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
             return onsite_cross_kernel(coefficients, difference, neutral, scan_steps, dr)
         return onsite_kernel(coefficients, difference, scan_steps, dr)
 
+    # Metadata references to the existing kernels and operands. Consumers
+    # can price their explicit calls without JIT-wrapping distributed closures.
+    aot_metadata = dict(
+        schema='lorrax.radial_coulomb_provider_aot.v1',
+        free_onsite=dict(
+            kernel=onsite_cross_kernel if compensated_body or delta_only_enrichment else onsite_kernel,
+            table_operands=((difference, neutral, scan_steps, dr, moment_cross)
+                if enriched_monopole else (difference, neutral, scan_steps, dr))
+                if compensated_body or delta_only_enrichment else (difference, scan_steps, dr)),
+        fourier=dict(kernel=fourier_kernel, table_operands=(scan_steps, dr, rows),
+            table_shapes=((Qp, len(degrees), gt, nr), (Qp, na, nh, gt), (Qp, len(degrees), gt)),
+            table_specs=(P(XY, None, None, None), P(XY, None, None, None), P(XY, None, None)),
+            table_dtypes=('float64', 'complex128', 'float64')))
+
     diagnostics = {} if cache is None else {
         key: cache[key] for key in ('points', 'maximum_wavevector', 'table_bytes', 'retained_spline_bytes',
                                    'max_density_validation_error',
                                    'max_compensation_validation_error', 'validation_points')}
     return dict(rhs=provider_rhs, fourier_tile=fourier_tile, onsite=onsite,
+                aot_metadata=aot_metadata,
                 radial_tables=tables if delta_only_enrichment else None,
                 exact_monopole_offset=na*nh*nr if delta_only_enrichment else 2*na*nh*nr,
                 radial_fourier_diagnostics=diagnostics,

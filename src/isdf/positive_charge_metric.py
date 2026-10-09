@@ -158,7 +158,14 @@ def positive_radial_coulomb_provider(zeta_g, rhs, *, monopole_rhs, radius,
                 or periodic_plan['receipt']['cache_file_sha256'] != periodic_cache['file_sha256']):
             raise ValueError('prepared periodic action differs from the admitted physical cache')
         action, receipt = periodic_plan['action'], periodic_plan['receipt']
+    # Preserve the radial handles and expose the already-compiled positive
+    # completion stages with their original explicit table operands.
+    aot_metadata = dict(provider['aot_metadata'])
+    aot_metadata.update(
+        mean_completion=dict(kernel=complete_mean, table_operands=(mean_row, gamma_device)),
+        periodic_moments=dict(kernel=rows_kernel, table_operands=(moments,)))
     provider.update(onsite=onsite, body_metric=BODY_METRIC, bare_v_table=bare,
+        aot_metadata=aot_metadata,
         periodic_moment_rows=lambda coefficients: rows_kernel(coefficients, moments),
         periodic_action=action, periodic_cache=periodic_cache,
         periodic_action_receipt=receipt, raw_columns=nf+na, PS_solved_columns=0,

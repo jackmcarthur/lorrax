@@ -3437,7 +3437,7 @@ def _read_authenticated_restart(
 def _restart_charge_basis(
         WavefunctionBasisReceipt, _basis_band_interval, _restart_wfn_provenance_complete,
         basis_wfn_fingerprint_binding, centroid_indices, charge_basis_receipt, meta, print0,
-        tensors_filename, wfn):
+        tensors_filename, wfn, *, bispinor_gw):
     """Produce the restart centroid stamps and authenticated charge basis receipt."""
     _stamped = {}
     try:
@@ -3452,7 +3452,11 @@ def _restart_charge_basis(
     	print0(f"  [restart guard] could not read centroid hash "
     	       f"attrs from {tensors_filename} "
     	       f"({type(exc).__name__}: {exc}).")
-    _charge = resolve_four_current_representation(int(meta.nspinor) == 4, None)
+    # Resolve the installed carrier at invocation time with its real model.
+    # DEV Pauli operands are explicitly charge-only and must retain that tag.
+    from common.four_current_model import (
+        resolve_four_current_representation as _resolve_restart_charge)
+    _charge = _resolve_restart_charge(int(meta.nspinor) == 4, bispinor_gw)
     if (int(meta.nspinor) == 4 and _stamped.get('charge_representation')
             != _charge.charge_representation):
     	raise ValueError(
@@ -3753,7 +3757,7 @@ def _prepare_restart_isdf(
         (_stamped, charge_basis_receipt) = _restart_charge_basis(
             WavefunctionBasisReceipt, _basis_band_interval, _restart_wfn_provenance_complete,
             basis_wfn_fingerprint_binding, centroid_indices, charge_basis_receipt, meta, print0,
-            tensors_filename, wfn)
+            tensors_filename, wfn, bispinor_gw=cfg.bispinor_gw)
         stored_mode = _stamped.get("bispinor_gw")
         requested_mode = cfg.bispinor_gw.value
         # Historical four-current bundles predate this interaction stamp.  Their
