@@ -2076,9 +2076,10 @@ struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile
                int trw = 0, threads3 = 0, smem3 = 0;
                // Mode 7, split arm: the mid (fn2 at threads2) and pass (fn3 at threads3 / smem3) entries.
                CUfunction fn2 = nullptr, fn3 = nullptr; };
-// A split arm's plane tile of whole groups of ss columns.  Mode 8: enough groups for a unit of the
-// gathered load per thread (256 per plane) within two blocks per SM.  Modes 7 and 9 (wide): the
-// most whole groups the opt-in memory holds, one block per SM; the tile's pairs share their per-k
+// A split arm's plane tile of whole groups of ss columns.  Every caller (modes 7, 8, 9 and mode 8's
+// W_R chunk) passes wide: the most whole groups the opt-in memory holds, one block per SM.  The
+// non-wide branch (two blocks per SM) is unused; at CrI3 24x24 it measured 1.09-1.12x per mode-8
+// call, below the bar for keeping a second rule (KCONV 2026-10-09).  The tile's pairs share their per-k
 // unfold tables (20^3 ns 2: 24 columns, the mode-7 gather 3.88 -> 3.65 ms against 16; one column per
 // plane wrote 16-byte runs and ran mode 9 no faster than its single arm, KCOLRES).
 static int split_plane_tile(int nky, int nkz, long long pr, int ss, long long smem_optin, bool wide = false) {
