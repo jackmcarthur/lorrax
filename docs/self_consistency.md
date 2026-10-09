@@ -203,8 +203,9 @@ around the DFT energies, planned at map 0 and held; a coarse state whose read
 support leaves it extends it, and it never shrinks. `sigma_omega_patches_ev`
 `lo:hi:eta` triples (eV about $E_F$) are user windows: coarse states inside
 one read it at its own η. `GATE sigma_coarse_window` refuses a malformed,
-overlapping or sub-deck-η triple, and any triple in a run without a coarse
-class. The Σ rules certify coarse windows at
+overlapping or sub-deck-η triple, and any triple on an SC run without a coarse
+class; a one-shot without a coarse state outside its requested set warns and
+ignores the triples. The Σ rules certify coarse windows at
 max(`sigma_quadrature_eps`, 3e-3) (`qp_support.SEMICORE_EPS`): the crossing
 node count falls with $\ln(1/\epsilon)$, and the Fe 4³ coarse window takes
 188 nodes at 3e-3 against 253 at 1e-4. Adjacent automatic windows of one η
