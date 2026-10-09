@@ -53,13 +53,13 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         slice of ``a`` is scaled on its way into the all-gather, so no
         weighted copy of ``a`` is made.
     partner : bool
-        Square mesh and 3-D ``b`` only: also return the conjugate-face
+        Also return the conjugate-face
         product ``conj(a)·diag(w)·conj(b)`` from the SAME panel exchange,
         each gathered panel conjugated before its own local GEMM (no
         conjugated copy of a tile).  Returns the pair.
 
     transa, transb : str
-        ``'N'``, ``'T'`` or ``'C'`` on the square-mesh route: ``a`` is then
+        ``'N'``, ``'T'`` or ``'C'``: ``a`` is then
         given as ``op(a)``'s transpose ``[q, k, m]`` (``b`` as ``[q, n, k]``)
         on the face, and its tile is moved to the transposed grid position
         by one ``ppermute`` and transposed locally, which on a square mesh is
@@ -72,7 +72,7 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
     Returns
     -------
     jax.Array
-        a @ b, with b's batch/sample axes and an x/y output face. Units
+        ``a @ b`` ``[q, m, n]`` on the x/y output face. Units
         multiply without any normalization. The output always stays x/y
         tiled; no rank ever holds a band-complete panel (on a p x p mesh a
         panel spans at most K/p contraction columns), and exchanged panels
@@ -90,42 +90,40 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
     band column live on a rank: refused), cuBLASMp 6.88 / 5.11.
     """
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    if a.ndim != 3 or b.ndim not in (3, 4) or a.dtype != b.dtype:
-        raise ValueError('panel_matmul requires rank-3 A and rank-3/4 B of one dtype')
+    if a.ndim != 3 or b.ndim != 3 or a.dtype != b.dtype:
+        raise ValueError('panel_matmul requires rank-3 A and B of one dtype')
+    if px != py:
+        raise ValueError('panel_matmul requires a square mesh')
     if transa not in ('N', 'T', 'C') or transb not in ('N', 'T', 'C'):
         raise ValueError('panel_matmul: transa/transb must be N, T or C')
-    if (transa != 'N' or transb != 'N') and (px != py or b.ndim != 3 or partner or weights is not None):
-        raise ValueError('panel_matmul: transposed operands need a square mesh, 3-D b, no weights or partner')
+    if (transa != 'N' or transb != 'N') and (partner or weights is not None):
+        raise ValueError('panel_matmul: transposed operands take no weights or partner')
     q, m, k = (a.shape[0], a.shape[2], a.shape[1]) if transa != 'N' else a.shape
     kb, n = (b.shape[-1], b.shape[-2]) if transb != 'N' else (b.shape[-2], b.shape[-1])
     if b.shape[0] != q or kb != k:
         raise ValueError('panel_matmul batch/contraction extents disagree')
-    if m % px or k % px or k % py or n % py:
+    if m % px or k % px or n % px:
         raise ValueError('panel_matmul requires producer-padded face extents')
     per_column = a.dtype.itemsize * q * (m // px + n // py)
     limit = max(1, int(panel_bytes) // per_column)   # at least one column per panel
-    if b.ndim == 3 and px == py:
-        # SUMMA on interleaved panels: every rank contributes `width` of its
-        # own K columns to each panel, so a panel is ONE all-gather per operand
-        # over the mesh axis, p·width <= K/p columns (one owner block): two
-        # live panels (the one multiplied and the one prefetched) never hold
-        # a band-complete row or column.  A kl with no such divisor ends in
-        # one narrower panel.
-        width = _interleaved_width(k, px, limit)
-        kernel = _interleaved_kernel(mesh, q, m, k, n, width, bounds is not None,
-                                     weights is not None, bool(partner), transa, transb,
-                                     None if compiler_options is None else tuple(sorted(compiler_options.items())))
-        args = (a, b)
-        if bounds is not None:
-            args += (jnp.asarray(bounds, jnp.int32).reshape(q, 2),)
-        if weights is not None:
-            args += (jnp.asarray(weights, a.dtype).reshape(q, k),)
-        return kernel(*args)
-    raise ValueError('panel_matmul requires a square mesh and a 3-D b')
+    width = _interleaved_width(k, px, limit)
+    kernel = _interleaved_kernel(mesh, q, m, k, n, width, bounds is not None,
+                                 weights is not None, bool(partner), transa, transb,
+                                 None if compiler_options is None else tuple(sorted(compiler_options.items())))
+    args = (a, b)
+    if bounds is not None:
+        args += (jnp.asarray(bounds, jnp.int32).reshape(q, 2),)
+    if weights is not None:
+        args += (jnp.asarray(weights, a.dtype).reshape(q, k),)
+    return kernel(*args)
 
 
 def _interleaved_width(k, p, limit):
-    """Local columns per interleaved panel: p·width <= K/p, and two live panels within ``limit`` columns."""
+    """Local columns ``w`` per panel: ``p·w <= K/p`` and two live panels within ``limit`` columns.
+
+    The width is balanced over the ``ceil(kl/cap)`` panels the cap forces (``kl = K/p``), so
+    the last panel's zero-padded columns number ``ceil(kl/w)·w - kl < min(w, n_panel)``.
+    """
     kl = k // p
     cap = max(1, min(limit // (2 * p), kl // p if p > 1 else kl))
     n_panel = -(-kl // cap)
@@ -198,18 +196,19 @@ def batch_gram(b, weights, bounds, *, mesh, nbatch, right=None, partner=False):
 @lru_cache(maxsize=64)
 def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, partner=False,
                         transa="N", transb="N", compiler_options=None):
-    """Batched SUMMA on a square mesh: K streamed in interleaved panels, one prefetched.
+    """Batched SUMMA on a square mesh: K streamed in equal interleaved panels, one prefetched.
 
     Rank ``(x, y)`` holds the K block ``[y·K/p, (y+1)·K/p)`` of A and
     ``[x·K/p, (x+1)·K/p)`` of B.  Panel ``j`` takes local columns
-    ``[j·w, (j+1)·w)`` of every block (the last panel may be narrower): the
-    all-gather of A over ``y`` and of B over ``x`` then both hold the SAME
-    global K set ``{i·K/p + j·w + t}``, in the same order, so the local
-    product of the two gathered panels is that panel's exact contribution to
-    the rank's own output tile.  No reduction follows.  Panel ``j+1`` is
-    gathered before panel ``j`` is multiplied; XLA's default scheduler still
-    runs the gather on the compute stream, so it does not overlap the GEMM
-    (see the lessons above ``panel_matmul``).  ``active``: each row's
+    ``[j·w, (j+1)·w)`` of every block: the all-gather of A over ``y`` and of
+    B over ``x`` then both hold the SAME global K set ``{i·K/p + j·w + t}``,
+    in the same order, so the local product of the two gathered panels is
+    that panel's exact contribution to the rank's own output tile.  No
+    reduction follows.  Every panel has the one width ``w``: the block is
+    read as ``n_panel·w`` columns, the ones past ``K/p`` zero.  Panel ``j+1``
+    is gathered before panel ``j`` is multiplied; XLA's default scheduler
+    still runs the gather on the compute stream, so it does not overlap the
+    GEMM (see the lessons above ``panel_matmul``).  ``active``: each row's
     interval ``[lo, hi)`` meets a panel in ONE run of panel positions (a
     suffix of the first live owner's segment, whole segments, a prefix of the
     last), so the local active-range GEMM contracts only that run.
@@ -220,15 +219,16 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     """
     p = int(mesh.shape['x'])
     kl = k // p
-    n_full, rest = divmod(kl, width)
+    n_panel = -(-kl // width)
     # Three or more panels: every panel after the first accumulates in place through the
     # beta = 1 GEMM.  XLA folds one straight-line ``c + a @ b`` into its GEMM, but of two
-    # adjacent ones (a one-trip scan is inlined; a tail follows the last full panel) it
-    # leaves one as an add that holds the product and the new sum beside the running sum,
-    # two output tiles (runs/DEV/701_scanacc_20260930/aot).  Two panels stay on XLA.
-    in_place = active or n_full + bool(rest) >= 3
+    # adjacent ones (a one-trip scan is inlined) it leaves one as an add that holds the
+    # product and the new sum beside the running sum, two output tiles
+    # (runs/DEV/701_scanacc_20260930/aot).  Two panels stay on XLA.
+    in_place = active or n_panel >= 3
     contract = _panel_contraction(mesh, active) if in_place else None
     owner = np.arange(p, dtype=np.int32)[None, :]
+    position = np.arange(width, dtype=np.int32)
 
     # A transposed operand arrives as op's transpose on the face: rank (x, y)
     # holds S[k-block x, m-block y]. The N-layout tile A[m-block x, k-block y]
@@ -241,34 +241,46 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
         t = jnp.swapaxes(t, -1, -2)
         return jnp.conj(t) if mode == 'C' else t
 
+    def first(j):
+        """Panel ``j``'s first local column in the tile: ``j·w``, held at ``kl - w`` for a last
+        panel that would run past the block (the window ``dynamic_slice`` takes anyway)."""
+        return jnp.minimum(j * width, kl - width)
+
     def body(a, b, bounds, weights):
         if transa != 'N':
             a = transposed(a, transa)
         if transb != 'N':
             b = transposed(b, transb)
 
-        def gather(off, wd):
-            left = lax.dynamic_slice_in_dim(a, off, wd, axis=2)
+        def gather(j):
+            off = first(j)
+            left = lax.dynamic_slice_in_dim(a, off, width, axis=2)
+            # K is padded to n_panel·w columns per block by inert zeros, with no padded copy of
+            # the tile: the last panel's window ends at kl, and its columns before j·w (panel
+            # j-1's) are zeroed in A, so they add exact zeros.  Every panel then has one
+            # shape, and the loop below is one scan whatever kl mod w is.
+            fresh = lax.broadcasted_iota(jnp.int32, left.shape, 2) >= j * width - off
+            left = jnp.where(fresh, left, jnp.zeros((), left.dtype))
             if weighted and not partner:
                 start = lax.axis_index('y') * kl + off
-                left = left * lax.dynamic_slice_in_dim(weights, start, wd, axis=1)[:, None, :]
-            right = lax.dynamic_slice_in_dim(b, off, wd, axis=1)
+                left = left * lax.dynamic_slice_in_dim(weights, start, width, axis=1)[:, None, :]
+            right = lax.dynamic_slice_in_dim(b, off, width, axis=1)
             return (lax.all_gather(left, 'y', axis=2, tiled=True),
                     lax.all_gather(right, 'x', axis=1, tiled=True))
 
-        def interval(off, wd):
-            base = owner * kl + off
-            start = owner * wd + jnp.clip(bounds[:, :1] - base, 0, wd)
-            stop = owner * wd + jnp.clip(bounds[:, 1:] - base, 0, wd)
+        def interval(j):
+            base = owner * kl + first(j)
+            start = owner * width + jnp.clip(bounds[:, :1] - base, 0, width)
+            stop = owner * width + jnp.clip(bounds[:, 1:] - base, 0, width)
             live = stop > start
             hi = jnp.max(jnp.where(live, stop, 0), axis=1)
-            lo = jnp.minimum(jnp.min(jnp.where(live, start, p * wd), axis=1), hi)
+            lo = jnp.minimum(jnp.min(jnp.where(live, start, p * width), axis=1), hi)
             return jnp.stack([lo, hi], axis=1).astype(jnp.int32)
 
-        def product(cs, panel, off, wd):
+        def product(cs, panel, j):
             left, right = panel
             if partner:
-                cols = (owner.T * kl + off + jnp.arange(wd)[None, :]).reshape(-1)
+                cols = (owner.T * kl + first(j) + position[None, :]).reshape(-1)
                 wc = (jnp.take(weights, cols, axis=1)[:, None, :] if weighted
                       else jnp.ones((), left.dtype))
                 pairs = ((left * wc, right), (jnp.conj(left) * wc, jnp.conj(right)))
@@ -278,29 +290,30 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
             for i, (lhs, rhs) in enumerate(pairs):
                 c = None if cs is None else cs[i]
                 if active:
-                    outs.append(contract(lhs, rhs, interval(off, wd), c))
+                    outs.append(contract(lhs, rhs, interval(j), c))
                 elif c is None:
                     outs.append(lhs @ rhs)
                 else:
                     outs.append(c + lhs @ rhs if contract is None else contract(lhs, rhs, None, c))
             return tuple(outs)
 
-        cur = gather(0, width)
-        cs = None
-        if n_full >= 2:
-            nxt = gather(width, width)
-            cs = product(None, cur, 0, width)
+        # One scan over the middle panels, every step the same program: gather panel j+1,
+        # multiply panel j.  The first panel writes a fresh output (no zero fill) and the last
+        # has nothing left to prefetch, so both sit outside the scan.  The program is then
+        # the same for every n_panel >= 4 (n_panel >= p, so every mesh from 4x4 up), and the
+        # mesh enters only as the trip count, the shapes and the replica groups.
+        panel, cs = gather(0), None
+        if n_panel > 1:
+            ahead = gather(1)
+            cs = product(None, panel, 0)
 
             def step(carry, j):
                 cs, panel = carry
-                ahead = gather((j + 1) * width, width)
-                return (product(cs, panel, j * width, width), ahead), None
+                ahead = gather(j + 1)
+                return (product(cs, panel, j), ahead), None
 
-            (cs, cur), _ = lax.scan(step, (cs, nxt), jnp.arange(1, n_full - 1), unroll=1)
-        tail = gather(n_full * width, rest) if rest else None
-        cs = product(cs, cur, (n_full - 1) * width, width)
-        if tail is not None:
-            cs = product(cs, tail, n_full * width, rest)
+            (cs, panel), _ = lax.scan(step, (cs, ahead), jnp.arange(1, n_panel - 1, dtype=jnp.int32))
+        cs = product(cs, panel, n_panel - 1)
         return cs if partner else cs[0]
 
     face = NamedSharding(mesh, P(None, 'x', 'y'))
