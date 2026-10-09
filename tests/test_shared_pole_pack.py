@@ -1,11 +1,10 @@
-"""The round's packed pencil columns (``pack_panels``) on the CPU 2x2 mesh.
+"""The q-local round's packed pencil columns (``pack_panels``) on the CPU 2x2 mesh.
 
 Run with ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4``.
 The pack must equal the joined panels taken at ``order`` (the zero column past
-the panels gives zeros), in the batch layout and on the face, for a held
-extent past the panels' capacity too; and a round with more panels of the same
-widths must reuse every pack program and give the round programs the same
-shapes, so a new line-site count never recompiles them.
+the panels gives zeros), for a held extent past the panels' capacity too; and a
+round with more panels of the same widths must reuse every pack program and give
+the round program the same shapes, so a new line-site count never recompiles it.
 """
 import numpy as np
 import pytest
@@ -34,7 +33,7 @@ def _reference(panels, order):
     return np.take_along_axis(joined, order[:, None, :], axis=-1)
 
 
-def test_pack_equals_the_joined_take_in_both_layouts():
+def test_pack_equals_the_joined_take():
     from gw.shared_pole_local import BATCH, pack_panels, round_tables
     mesh = _mesh()
     rng = np.random.default_rng(7)
@@ -47,22 +46,20 @@ def test_pack_equals_the_joined_take_in_both_layouts():
                           ordered=True, odd_moments=False, key=("sector", "CC", 12), history=history)
     order = tables["order"]
     assert order.shape[-1] == 28 > sum(widths[:2]) + sum(widths[2:])
-    want = [_reference(field, order) for field in panels]
-    for layout, spec in (("batch", P(BATCH)), ("face", P(None, "x", "y"))):
-        put = lambda a: jax.device_put(a, NamedSharding(mesh, spec))
-        got = pack_panels(tuple([put(a) for a in field] for field in panels), order, widths,
-                          mesh_xy=mesh, layout=layout)
-        for g, w in zip(got, want):
-            assert g.sharding.spec == spec, layout
-            assert np.array_equal(np.asarray(g), w), layout
+    batch = NamedSharding(mesh, P(BATCH))
+    got = pack_panels(tuple([jax.device_put(a, batch) for a in field] for field in panels), order, widths,
+                      mesh_xy=mesh)
+    for g, field in zip(got, panels):
+        assert g.sharding.spec == P(BATCH)
+        assert np.array_equal(np.asarray(g), _reference(field, order))
 
 
 def test_more_panels_reuse_every_program():
     """Map 1 adds line panels of the same widths: no new pack program, the same packed shape."""
-    from gw.shared_pole_local import _pack_place, pack_panels, round_tables
+    from gw.shared_pole_local import BATCH, _pack_place, pack_panels, round_tables
     mesh = _mesh()
     rng = np.random.default_rng(3)
-    face = NamedSharding(mesh, P(None, "x", "y"))
+    batch = NamedSharding(mesh, P(BATCH))
     history, shapes = {}, []
     for states in (4, 6, 8):
         widths = [4, 8] * (states // 2)
@@ -72,8 +69,8 @@ def test_more_panels_reuse_every_program():
         tables = round_tables(counts, widths, [0j] * states, [0] * 4, 0, column_extent=extent,
                               ordered=True, odd_moments=False, key=("sector", "TT", 12), history=history)
         before = _pack_place.cache_info().currsize
-        got = pack_panels(tuple([jax.device_put(a, face) for a in field] for field in panels), tables["order"],
-                          widths, mesh_xy=mesh, layout="face")
+        got = pack_panels(tuple([jax.device_put(a, batch) for a in field] for field in panels), tables["order"],
+                          widths, mesh_xy=mesh)
         if states > 4:
             assert _pack_place.cache_info().currsize == before, states
         shapes.append(tuple(g.shape for g in got))
