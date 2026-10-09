@@ -131,6 +131,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <map>
 #include <optional>
 #include <mutex>
@@ -1207,6 +1209,12 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(M7
 #include "kbox_stage.cuh"
 static_assert(NR == NS, "mode 8 loads Greens: one spin width");
 constexpr int TRC = LRX_TR;                    // tile columns (whole spin groups)
+#ifndef LRX_M8MINB
+#define LRX_M8MINB 1
+#endif
+#ifndef LRX_M8MINB2
+#define LRX_M8MINB2 1
+#endif
 
 struct LorArgs {
     const lrx_c2 *gp, *gt, *kern;              // parent Green, partner, V (nk, mx, na, my, nb)
@@ -1373,7 +1381,7 @@ struct LorScaledStore {
     __device__ void put(int k, long long col, lrx_c2 z) const { st.put(k, col, fin(k, col, z)); }
 };
 
-extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
+extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_M8MINB) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
                                                                   UnfoldTab tw) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
@@ -1520,11 +1528,11 @@ __device__ __forceinline__ void lor_split_pass(const LorArgs& a, const UnfoldTab
         }
     }
 }
-extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
+extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_M8MINB) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
                                                                   UnfoldTab tw) {
     lor_split_pass<false, LRX_THREADS>(a, t, v, phase, tw);
 }
-extern "C" __global__ void __launch_bounds__(LRX_THREADS2) lrx_kconv_heavy(LorArgs a, UnfoldTab t, LorentzTab v,
+extern "C" __global__ void __launch_bounds__(LRX_THREADS2, LRX_M8MINB2) lrx_kconv_heavy(LorArgs a, UnfoldTab t, LorentzTab v,
                                                                          int phase, UnfoldTab tw) {
     lor_split_pass<true, LRX_THREADS2>(a, t, v, phase, tw);
 }
@@ -2104,8 +2112,31 @@ static std::string split_tile_refusal(int mode, int nkx, int nky, int nkz, int n
 }
 // ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion; mode 7: its output spin
 // block; mode 8: wa*8 + wb, the interaction's Lorentz widths when it is read from its parents, 0 = V_R)
-using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
+using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int, uint64_t>;
 constexpr int kLiveBit = 1 << 16;                  // build(variant | kLiveBit): the kconv call's live program
+// TEST ONLY (KCONV occupancy probe, never landed): LRX_TEST_M8="st=384,pt=512,pb=1,td=1,ht=256,hb=1,wd=1,fs=0"
+// overrides mode 8's launch shape.  st: single-arm threads; pt: split plane/pencil threads; pb/hb: min
+// blocks per SM in __launch_bounds__ (register cap) of the split and heavy entries, sb of the single;
+// td/wd: divide the split plane / W plane tile groups; ht: heavy (W_R plane) threads; fs: force split.
+struct M8Test { int st = 0, sb = 1, pt = 0, pb = 1, td = 1, ht = 0, hb = 1, wd = 1, fs = 0; std::string raw; };
+static M8Test m8_test() {
+    M8Test t;
+    const char* e = std::getenv("LRX_TEST_M8");
+    if (!e || !*e) return t;
+    t.raw = e;
+    std::istringstream is(t.raw);
+    std::string kv;
+    while (std::getline(is, kv, ',')) {
+        const auto p = kv.find('=');
+        if (p == std::string::npos) continue;
+        const std::string k = kv.substr(0, p);
+        const int v = std::atoi(kv.c_str() + p + 1);
+        if (k == "st") t.st = v; else if (k == "sb") t.sb = v; else if (k == "pt") t.pt = v;
+        else if (k == "pb") t.pb = v; else if (k == "td") t.td = v; else if (k == "ht") t.ht = v;
+        else if (k == "hb") t.hb = v; else if (k == "wd") t.wd = v; else if (k == "fs") t.fs = v;
+    }
+    return t;
+}
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
@@ -2164,7 +2195,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         cr = api.CtxGetCurrent(&ctx);
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
-    const Key key{ctx, mode, nkx, nky, nkz, ns, nsr, f32 ? 1 : 0, variant};
+    const M8Test T = mode == 8 ? m8_test() : M8Test{};
+    const Key key{ctx, mode, nkx, nky, nkz, ns, nsr, f32 ? 1 : 0, variant, T.raw.empty() ? 0 : nvrtc::fnv1a(T.raw)};
     // kLiveBit: a padded pass's program (the kconv call's live operand present), built apart so the plain
     // program keeps no live bounds in registers (kbox_stage.cuh Live, LRX_LIVE).
     const int live_prog = (variant & kLiveBit) ? 1 : 0;
@@ -2202,7 +2234,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const int lor_ws = lor_wa * lor_wb;
     const lrx_kbox::Plan lor_plan = mode == 8
         ? lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns + lor_ws, 1, 16, smem_optin, 2, 1) : lrx_kbox::Plan{};
-    const bool lor_split = mode == 8 && lor_plan.arm == 1;
+    const bool lor_split = mode == 8 && (lor_plan.arm == 1 || T.fs);
     // Mode 11 runs on the k-box stage: its launch rule (kbox_plan) decides the arm, the tile and
     // the shared memory from the grid and this device's opt-in budget; RB is unused.
     const int chi_grp = 2 * ns * ns;
@@ -2314,7 +2346,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         } else if (!lor_split) {
             kb_arm = 0;
             kb_tr = lor_plan.tr * ns * ns;             // the plan counts whole spin groups
-            kb_threads = kThreads;
+            kb_threads = T.st ? T.st : kThreads;
             kb_smem = lor_plan.smem;
         } else {
             const int ss = ns * ns;
@@ -2326,15 +2358,17 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             // elements refused the two-spinor Dirac-quarter kconv calls at 16^3-20^3 and held 2-4 warps
             // per SM where it fit).
             kb_tr = split_plane_tile(nky, nkz, g.pr(), ss, smem_optin, true);
-            kb_threads = 2 * kThreads;
+            kb_tr = std::max(1, kb_tr / ss / std::max(1, T.td)) * ss;          // TEST ONLY: td
+            kb_threads = T.pt ? T.pt : 2 * kThreads;
             kb_threads2 = kb_threads;                  // the vertex pencil, on the same entry
             kb_ty = kb_threads2 / ss;                  // pairs per pencil block
             kb_smem = static_cast<long long>(kb_tr) * g.pr() * 16;
             kb_smem2 = 0;
             if (lor_ws > 0) {                          // the W_R chunk: plane tiles of whole Lorentz groups
                 lor_trw = split_plane_tile(nky, nkz, g.pr(), lor_ws, smem_optin, true);
+                lor_trw = std::max(1, lor_trw / lor_ws / std::max(1, T.wd)) * lor_ws;   // TEST ONLY: wd
                 kb_smem3 = static_cast<long long>(lor_trw) * g.pr() * 16;
-                kb_threads3 = kThreads;
+                kb_threads3 = T.ht ? T.ht : kThreads;
             }
         }
         if (kb_smem > smem_optin || kb_smem2 > smem_optin || kb_smem3 > smem_optin ||
@@ -2517,7 +2551,11 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TR=" + std::to_string(kb_tr));
         defs.push_back("-DLRX_TY=" + std::to_string(kb_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(kb_threads));
-        if (mode == 8 && kb_arm == 1) defs.push_back("-DLRX_THREADS2=" + std::to_string(kThreads));   // W_R's plane
+        if (mode == 8 && kb_arm == 1)                  // W_R's plane
+            defs.push_back("-DLRX_THREADS2=" + std::to_string(kb_threads3 ? kb_threads3 : kThreads));
+        if (mode == 8 && (kb_arm == 0 ? T.sb : T.pb) > 1)          // TEST ONLY: register cap by min blocks
+            defs.push_back("-DLRX_M8MINB=" + std::to_string(kb_arm == 0 ? T.sb : T.pb));
+        if (mode == 8 && kb_arm == 1 && T.hb > 1) defs.push_back("-DLRX_M8MINB2=" + std::to_string(T.hb));
         if (mode == 8 && lor_ws > 0) {
             defs.push_back("-DLRX_WA=" + std::to_string(lor_wa));
             defs.push_back("-DLRX_WB=" + std::to_string(lor_wb));
@@ -2681,6 +2719,22 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                      cc_major, cc_minor, ms, b.rb, b.smem,
                      path.empty() ? "not cached (no cubin_dir)"
                                   : (from_disk ? path.c_str() : (stored ? "stored" : "store FAILED")));
+    }
+    if (mode == 8 && std::getenv("LRX_TEST_M8_REPORT")) {   // TEST ONLY: registers, spill, residency
+        using GetAttr = CUresult (*)(int*, int, CUfunction);
+        using Occ = CUresult (*)(int*, CUfunction, int, size_t);
+        static auto get_attr = reinterpret_cast<GetAttr>(dlsym(RTLD_DEFAULT, "cuFuncGetAttribute"));
+        static auto occ = reinterpret_cast<Occ>(dlsym(RTLD_DEFAULT, "cuOccupancyMaxActiveBlocksPerMultiprocessor"));
+        auto one = [&](const char* name, CUfunction f, int threads, int smem) {
+            int regs = -1, local = -1, nb = -1;
+            if (get_attr && f) { get_attr(&regs, CU_FUNC_ATTRIBUTE_NUM_REGS, f); get_attr(&local, CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, f); }
+            if (occ && f && threads > 0) occ(&nb, f, threads, static_cast<size_t>(smem));
+            std::fprintf(stderr, "[m8test] cfg='%s' variant=%d arm=%d tr=%d trw=%d entry=%s threads=%d smem=%d regs=%d "
+                         "local=%d blocks/SM=%d warps/SM=%d\n", T.raw.c_str(), variant, b.arm, b.tr, b.trw, name,
+                         threads, smem, regs, local, nb, nb > 0 ? nb * threads / 32 : -1);
+        };
+        one("lrx_kconv", b.fn, b.threads, b.smem);
+        if (b.arm == 1 && b.fn2) one("lrx_kconv_heavy", b.fn2, b.threads3, b.smem3);
     }
     *out = &(g_cache[key] = b);
     return ffi::Error::Success();
@@ -3226,6 +3280,8 @@ static ffi::Error KleadLorentzImpl(
                   0, pairs, ml / ns, nl / ns, W ? W->Wp.untyped_data() : nullptr,
                   W ? W->Wt.untyped_data() : nullptr, nullptr, W ? W->scale : 0.0,
                   live ? live->untyped_data() : nullptr};
+    const bool tph = std::getenv("LRX_TEST_M8_PHASES") != nullptr;   // TEST ONLY
+    std::vector<std::pair<int, cudaEvent_t>> evs;
     auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
         blocks = std::max(1LL, std::min(blocks, 2147483647LL));
         void* args[] = {(void*)&a, (void*)&t, (void*)&v, (void*)&phase, (void*)&tw};
@@ -3235,10 +3291,40 @@ static ffi::Error KleadLorentzImpl(
                                                 static_cast<unsigned>(smem),
                                                 reinterpret_cast<CUstream>(stream), args, nullptr);
         if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+        if (tph) {                                     // TEST ONLY: an event after each launch
+            cudaEvent_t ev;
+            cudaEventCreate(&ev);
+            cudaEventRecord(ev, stream);
+            evs.push_back({phase, ev});
+        }
         return ffi::Error::Success();
     };
-    if (k->arm == 0)                                   // the single arm: one block per tile of whole spin groups
-        return launch(0, (pairs * ss + k->tr - 1) / k->tr, k->threads, k->smem);
+    if (tph) {
+        cudaEvent_t ev;
+        cudaEventCreate(&ev);
+        cudaEventRecord(ev, stream);
+        evs.push_back({-1, ev});
+    }
+    // TEST ONLY: per-phase milliseconds of this call (host-synchronising; LRX_TEST_M8_PHASES set).
+    auto phase_report = [&]() {
+        if (!tph || evs.size() < 2) return;
+        cudaEventSynchronize(evs.back().second);
+        double ms[6] = {0, 0, 0, 0, 0, 0}, tot = 0;
+        for (size_t i = 1; i < evs.size(); ++i) {
+            float d = 0.f;
+            cudaEventElapsedTime(&d, evs[i - 1].second, evs[i].second);
+            ms[evs[i].first] += d;
+            tot += d;
+        }
+        for (auto& pe : evs) cudaEventDestroy(pe.second);
+        std::fprintf(stderr, "[m8phase] arm=%d launches=%zu total=%.3f ms p0=%.3f p1=%.3f p2=%.3f p3=%.3f p4=%.3f p5=%.3f\n",
+                     k->arm, evs.size() - 1, tot, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5]);
+    };
+    if (k->arm == 0) {                                 // the single arm: one block per tile of whole spin groups
+        auto e = launch(0, (pairs * ss + k->tr - 1) / k->tr, k->threads, k->smem);
+        phase_report();
+        return e;
+    }
     // The k-box split arm, chunked over pairs through a (nk, chunk * ns^2) intermediate no
     // larger than U itself (the budget: the output this call writes, n_out >= 1 rows of nk).
     // From W parents the chunk's W_R rides beside it: (nk, chunk * nA*nB), the same bound over ns^2.
@@ -3277,6 +3363,7 @@ static ffi::Error KleadLorentzImpl(
         if (auto e = launch(2, std::min(plane, cap), k->threads, k->smem); !e.success()) return e;
         if (auto e = launch(3, std::min(pencil, cap), k->threads, 0); !e.success()) return e;
     }
+    phase_report();
     return ffi::Error::Success();
 }
 
