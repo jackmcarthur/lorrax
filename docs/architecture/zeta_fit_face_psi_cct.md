@@ -31,9 +31,38 @@ The fit keeps the band-distributed mesh-face copies (bands on one mesh
 axis, centroids on the other) and distributes the band contraction.
 
 Canonical ζ files do not encode the layout. The left and right band windows
-are 0/1 weights over the loaded, mesh-padded band extent, so a window edge
-need not divide the mesh. C_q and Z_q use the same weights. Pseudobands are
+are masks over the loaded, mesh-padded band extent, so a window edge need
+not divide the mesh. By default their weights are 0/1. An opt-in charge
+`zeta_occupied_weight` multiplies each occupied endpoint inside its window;
+every original empty endpoint keeps weight1. C_q and every Z_q right-hand
+side, including local augmentation and monopole features, use these same
+weights. Current channels retain their original loss. Pseudobands are
 refused (`NotImplementedError`).
+
+The nondefault charge loss requires a fixed contiguous occupied boundary
+with integer, unsmeared source-WFN occupations at every parent and spin.
+It changes the fitting objective, not the physical GW occupations or the
+orbital frame. `_charge_fit_endpoint_weights` resolves this policy for both
+fresh fits and complete tensor restarts. Charge provenance records the
+schema, boundary, occupied weight and empty weight.
+
+An unwindowed isometric free-RKB reconstruction can obtain its overlap
+from raw Pauli blocks. A compact served field instead requires B and D
+from that actual four-spinor field, including the taper derivative. The
+shared reconstruction-metric contraction uses the declared consistent
+source, cross and atomic blocks; raw Pauli blocks do not describe the
+compact field. Atomic caches authenticate their complete owner files,
+including source documentation, so even a docstring edit invalidates the
+existing cache binding.
+
+Fresh restart bundles store that exact provenance beside its WFN-bound
+charge-zeta identity. Before any large tensor read, GW reauthenticates the
+stored JSON and compares the requested loss. It preserves the original
+training-window provenance when the supported Sigma-only output window
+changes. An older identified bundle needs its completed, hash-matching
+`zeta_q.h5` header if embedded provenance is absent; missing or mismatched
+proof refuses. A genuinely legacy bundle without a charge identity can
+serve only the default loss.
 
 ## C_q on the parents
 

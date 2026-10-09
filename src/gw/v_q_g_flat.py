@@ -241,7 +241,7 @@ def _make_q_tile_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
 
 def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
                         context="V_q / W q-grid reduction",
-                        return_resolution=False, mu_basis=None):
+                        return_resolution=False, mu_basis=None, coordinate_kind=None):
     """Pick IBZ q's via centroid orbit closure, fall back to full BZ.
 
     Returns ``(q_irr_kgrid_int, q_irr_frac, q_full_to_irr_idx,
@@ -280,7 +280,8 @@ def _resolve_ibz_q_list(*, sym, centroid_indices, kgrid, fft_grid,
         from .qgrid_symmetry import resolve_qgrid_symmetry_tables
         res = resolve_qgrid_symmetry_tables(
             sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
-            context=context)
+            context=context, coordinate_kind=(coordinate_kind if coordinate_kind is not None
+                else getattr(mu_basis, 'coordinate_kind', 'fft_indices')))
         if res.use_ibz:
             sym_perm, L_table = res.tables()
         if sym_perm is not None and mu_basis is not None:
@@ -653,10 +654,44 @@ def _compute_V_q_g_flat_one_tile(
         verbose=verbose, budget_bytes=budget_bytes)[0]
 
 
+def _contract_live_charge(zeta, v, *, keep, mesh):
+    """Consume a live charge fit, publishing any deferred physical payload.
+
+    The header remains incomplete until the collective stream closes. Serial
+    completion/provenance writes use the shared all-rank I/O verdict, so an
+    error cannot strand other ranks at a completion barrier.
+    """
+    if not getattr(zeta, 'pending_zeta_write', False):
+        return zeta.contract_v(v, keep=keep)
+    if getattr(zeta, 'local_augmentation', None) is None:
+        raise ValueError('deferred physical charge payload requires its local provider')
+    provenance = getattr(zeta, 'pending_fit_provenance', None)
+    if not isinstance(provenance, str) or not provenance:
+        raise ValueError('deferred physical charge payload requires fit provenance')
+    from common.collectives import rank0_transaction
+    from file_io.isdf_header import mark_zeta_done, stamp_fit_provenance
+    from file_io.slab_io import SlabIO
+
+    with SlabIO(zeta.path, mode='a', mesh=mesh) as writer:
+        writer.create_dataset('zeta_q_G',
+            shape=(zeta.store.Q, zeta.n_rmu, zeta.ngkmax), dtype=np.complex128)
+        result = zeta.contract_v(v, keep=keep, zeta_io=writer)
+
+    def complete():
+        mark_zeta_done(zeta.path)
+        stamp_fit_provenance(zeta.path, provenance)
+
+    rank0_transaction(zeta.path, stage='augmented_zeta_payload_complete', write=complete)
+    zeta.pending_zeta_write = False
+    zeta.pending_fit_provenance = None
+    return result
+
+
 def _compute_V_q_g_flat_tiles(
     specs, *, kgrid, fft_grid, mesh_xy, g_chunk: int | None, sym,
     centroid_indices, qgrid_policy=None, verbose: bool,
     budget_bytes: float | None = None,
+    zeta_ios=None,
 ) -> list:
     """Several V tiles over one set of ζ loaders, each loader read ONCE per q-tile.
 
@@ -687,6 +722,12 @@ def _compute_V_q_g_flat_tiles(
             raise ValueError(
                 f"_compute_V_q_g_flat_tiles[{label}]: ζ layout must be "
                 f"'G_flat'; got {getattr(ld, 'zeta_layout', None)!r}")
+    if zeta_ios is not None:
+        zeta_ios = tuple(zeta_ios)
+        if (len(loaders) != 3 or len(zeta_ios) != 3
+                or not all(hasattr(ld, 'contract_v') for ld in loaders)
+                or any(s['is_charge_cc'] for s in specs)):
+            raise ValueError("Physical current writers require the complete live three-current family")
 
     # ---- IBZ list (shared by every tile) --------------------------------
     (_q_int, q_irr_frac,
@@ -694,7 +735,9 @@ def _compute_V_q_g_flat_tiles(
      sym_perm, L_table, use_ibz) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
         kgrid=kgrid, fft_grid=fft_grid,
-        context=f"V_q g-flat tile [{label}]")
+        context=f"V_q g-flat tile [{label}]", coordinate_kind=getattr(
+            getattr(loaders[0], 'mu_basis', None), 'coordinate_kind',
+            getattr(loaders[0], 'coordinate_kind', 'fft_indices')))
     n_q_ibz = int(q_irr_frac.shape[0])
 
     policy = qgrid_policy
@@ -779,7 +822,15 @@ def _compute_V_q_g_flat_tiles(
               n_sub=n_sub if s['one_leg'] else 0) for s in specs],
         rows=mu_pad, n_q=n_q_ibz, ngkmax=ngkmax, mesh_xy=mesh_xy,
         g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
-    record_stage_price(f"V_q, vq_tile_bytes q_tile={q_tile}", priced['priced'])
+    live_augmented = (len(loaders) == 1
+                      and hasattr(loaders[0], 'contract_v')
+                      and getattr(loaders[0], 'local_augmentation', None) is not None)
+    # vq_tile_bytes prices the file-read panels. The augmented live pass owns
+    # an additional local RHS/solve and uses the route-G store's tile geometry;
+    # this file price is not a bound for that pass. Its complete preparation
+    # ledger is checked upstream; do not report a false per-section ratio.
+    if not live_augmented:
+        record_stage_price(f"V_q, vq_tile_bytes q_tile={q_tile}", priced['priced'])
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:
@@ -789,7 +840,7 @@ def _compute_V_q_g_flat_tiles(
               f"{len(specs)} V tile(s), "
               f"storage={'q-IBZ' if use_ibz else 'full-BZ'}",
               flush=True)
-        print(f"  V_q plan [{label}]: q_tile={q_tile} "
+        print(f"  V_q {'file layout (live augmentation has no separate V planner)' if live_augmented else 'plan'} [{label}]: q_tile={q_tile} "
               f"({n_tiles} tile(s)), priced {priced['priced'] / 1e9:.2f} GB/rank "
               f"= resident {priced['resident'] / 1e9:.2f} + "
               f"{q_tile}×{priced['per_q'] / 1e9:.3f} ζ/q + faces/panels "
@@ -834,13 +885,14 @@ def _compute_V_q_g_flat_tiles(
         keep = _head_shell(n_q_ibz, one_leg_cols if one_leg_any else None,
                            *head_sel)
         if len(loaders) == 1 and len(specs) == 1:
-            specs[0]['V'] = loaders[0].contract_v(specs[0]['v'], keep=keep)
+            specs[0]['V'] = _contract_live_charge(
+                loaders[0], specs[0]['v'], keep=keep, mesh=mesh_xy)
         else:
             from isdf.zeta_mubatch import contract_v_group
             Vs = contract_v_group(
                 loaders, [(slot(s['L']), slot(s['L'] if s['same_zeta'] else s['R']))
                           for s in specs],
-                [s['v'] for s in specs], keep=keep)
+                [s['v'] for s in specs], keep=keep, zeta_ios=zeta_ios)
             for s, V in zip(specs, Vs):
                 s['V'] = V
             del Vs
@@ -1157,7 +1209,9 @@ def compute_all_V_q_g_flat(
     from .qgrid_symmetry import qgrid_trs_policy_for
     _, q_frac, irr, rows, perm, wraps, reduced = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
-        kgrid=kgrid, fft_grid=fft_grid)
+        kgrid=kgrid, fft_grid=fft_grid, coordinate_kind=getattr(
+            getattr(zeta_loader, 'mu_basis', None), 'coordinate_kind',
+            getattr(zeta_loader, 'coordinate_kind', 'fft_indices')))
     if reduced:
         policy = qgrid_trs_policy_for(
             sym=sym, irr_idx_q=irr, sym_idx_q=rows, kgrid=kgrid,
@@ -1225,7 +1279,9 @@ def compute_head_channel_zeta(
      sym_perm, L_table, use_ibz) = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_indices,
         kgrid=kgrid, fft_grid=fft_grid,
-        context="head-channel zeta")
+        context="head-channel zeta", coordinate_kind=getattr(
+            getattr(zeta_loader, 'mu_basis', None), 'coordinate_kind',
+            getattr(zeta_loader, 'coordinate_kind', 'fft_indices')))
     n_q_ibz = int(q_irr_frac.shape[0])
     gvec_components = np.asarray(zeta_loader.gvec_components, dtype=np.int32)
 

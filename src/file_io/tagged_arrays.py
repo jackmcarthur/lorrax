@@ -5,6 +5,7 @@ This module reads/writes HDF5 restart files in the v2 format used by gw_jax.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 import os
 from pathlib import Path
@@ -38,6 +39,12 @@ BAND_WINDOW_SCHEMA_VERSION = 2
 BAND_WINDOW_CARRIER_DATASET = "band_window_carrier"
 ZETA_FIT_WINDOWS_DATASET = "zeta_fit_windows"
 CHARGE_ZETA_IDENTITY_DATASET = "charge_zeta_identity"
+CHARGE_ZETA_PROVENANCE_DATASET = "charge_zeta_provenance"
+CHARGE_ZETA_PROVENANCE_MAX_BYTES = 65536
+HARTREE_PARENT_DATASET = "hartree_parent_kij_ry"
+HARTREE_PROVENANCE_DATASET = "hartree_provenance"
+HARTREE_PROVENANCE_MAX_BYTES = 262144
+HARTREE_PROVENANCE_SCHEMA = "lorrax.resident_charge_hartree.v1"
 # Copy of the paired v_q_bispinor.h5 generation receipt (bispinor runs only).
 BISPINOR_V_RECEIPT_DATASET = "bispinor_v_receipt"
 SHARED_POLE_MEMBER_DATASET = "shared_pole_member"
@@ -271,6 +278,157 @@ def _decode_charge_zeta_identity(value, *, where):
                 f"{where}: charge-zeta receipt fields must be nonempty strings")
         out.append(item)
     return {"scheme": out[0], "digest": out[1]}
+
+
+def _encode_charge_zeta_provenance(provenance, *, identity):
+    """Keep the exact bounded JSON text; its physical identity belongs to GW."""
+    if provenance is None:
+        return None
+    if identity is None:
+        raise ValueError("charge_zeta_provenance requires charge_zeta_identity")
+    if not isinstance(provenance, str) or not provenance:
+        raise ValueError("charge_zeta_provenance must be a nonempty JSON string")
+    encoded = provenance.encode("utf-8")
+    if len(encoded) > CHARGE_ZETA_PROVENANCE_MAX_BYTES:
+        raise ValueError("charge_zeta_provenance exceeds its bounded metadata size")
+    def refuse_constant(value):
+        raise ValueError(f"nonfinite JSON constant {value}")
+    try:
+        record = json.loads(provenance, parse_constant=refuse_constant)
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("charge_zeta_provenance must be finite JSON") from exc
+    if not isinstance(record, dict):
+        raise ValueError("charge_zeta_provenance must describe a JSON object")
+    return np.bytes_(encoded)
+
+
+def normalize_resident_hartree_provenance(value, *, persisted=False):
+    """Validate the closed native charge-operator record, without a payload.
+
+    Source and operator bindings are finite JSON objects owned by their
+    numerical producers. Their canonical digests authenticate the transported
+    bytes; the GW consumer compares the actual requested physical bindings.
+    """
+    fields = {'schema', 'source_identity', 'source_binding',
+              'operator_identity', 'operator_binding', 'band_range',
+              'parent_full_rows', 'parent_k_frac', 'units', 'k_domain', 'trs_rule'}
+    if persisted:
+        fields.add('payload_sha256')
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError('resident Hartree provenance has unknown or missing fields')
+    try:
+        text = json.dumps(value, sort_keys=True, separators=(',', ':'),
+                          allow_nan=False)
+        if len(text.encode('utf-8')) > HARTREE_PROVENANCE_MAX_BYTES:
+            raise ValueError('resident Hartree provenance exceeds bounded size')
+        record = json.loads(text)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError('resident Hartree provenance must be bounded finite JSON') from exc
+    if (record['schema'] != HARTREE_PROVENANCE_SCHEMA
+            or record['units'] != 'Ry' or record['k_domain'] != 'file_wedge'
+            or record['trs_rule'] != 'conj'):
+        raise ValueError('resident Hartree schema/units/FILE domain/TR rule refused')
+    for name in ('source', 'operator'):
+        binding = record[name + '_binding']
+        if not isinstance(binding, dict) or not binding:
+            raise ValueError('resident Hartree requires nonempty physical bindings')
+        digest = hashlib.sha256(json.dumps(
+            binding, sort_keys=True, separators=(',', ':'),
+            allow_nan=False).encode('utf-8')).hexdigest()
+        if record[name + '_identity'] != digest:
+            raise ValueError(f'resident Hartree {name} identity does not bind provenance')
+    bands = record['band_range']
+    if (not isinstance(bands, list) or len(bands) != 2
+            or any(type(n) is not int for n in bands)
+            or not 0 <= bands[0] < bands[1]):
+        raise ValueError('resident Hartree requires an increasing logical band range')
+    rows = record['parent_full_rows']
+    if (not isinstance(rows, list) or not rows
+            or any(type(n) is not int or n < 0 for n in rows)
+            or len(set(rows)) != len(rows)):
+        raise ValueError('resident Hartree requires distinct physical FILE parent rows')
+    coords = np.asarray(record['parent_k_frac'])
+    if (coords.shape != (len(rows), 3) or coords.dtype.kind not in 'iuf'
+            or not np.isfinite(coords).all()):
+        raise ValueError('resident Hartree requires finite FILE parent coordinates')
+    if persisted:
+        digest = record['payload_sha256']
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in '0123456789abcdef' for c in digest)):
+            raise ValueError('resident Hartree payload digest is invalid')
+    return record
+
+
+def _hartree_band_axis(logical, mesh_or_divisor):
+    """Independent two-band receipt for native J, not psi or centroid axes."""
+    shape = getattr(mesh_or_divisor, 'shape', {})
+    if 'x' in shape and 'y' in shape:
+        return padded_axis(int(logical), mesh_or_divisor,
+                           name='resident Hartree band carrier',
+                           specs=((P(None, 'x', 'y'), 1),
+                                  (P(None, 'x', 'y'), 2)))
+    return padded_axis(int(logical), mesh_divisor(mesh_or_divisor),
+                       name='resident Hartree band carrier')
+
+
+def _hartree_payload_sha256(dataset):
+    """Hash finite logical J in canonical row order with at most 2 MiB scratch."""
+    shape = tuple(int(n) for n in dataset.shape)
+    if (len(shape) != 3 or shape[0] < 1 or shape[1] < 1
+            or shape[1] != shape[2] or dataset.dtype != np.dtype('complex128')):
+        raise ValueError('resident Hartree payload must be a complex128 square band matrix')
+    digest = hashlib.sha256(b'LORRAX resident charge Hartree payload v1\0')
+    digest.update(np.asarray(shape, dtype='<i8').tobytes())
+    # Split both band axes so even a single very wide row stays bounded.
+    for parent in range(shape[0]):
+        for bra in range(shape[1]):
+            for ket in range(0, shape[2], 131072):
+                block = np.asarray(dataset[parent, bra, ket:ket + 131072],
+                                   dtype='<c16')
+                if not np.isfinite(block).all():
+                    raise ValueError('resident Hartree payload is nonfinite')
+                digest.update(block.tobytes())
+    return digest.hexdigest()
+
+
+def _read_hartree_provenance(h5, *, expected=None, required=False):
+    """Admit metadata and bounded payload bytes before unrelated restart arrays."""
+    present = HARTREE_PARENT_DATASET in h5
+    if present != (HARTREE_PROVENANCE_DATASET in h5):
+        raise ValueError('resident Hartree has a torn payload/provenance pair')
+    if not present:
+        if required:
+            raise ValueError('required resident Hartree member is missing; rebuild')
+        return None
+    ds = h5[HARTREE_PROVENANCE_DATASET]
+    if (ds.shape != () or ds.dtype.kind != 'S'
+            or ds.dtype.itemsize > HARTREE_PROVENANCE_MAX_BYTES):
+        raise ValueError('resident Hartree provenance is not bounded fixed UTF-8 metadata')
+    try:
+        def refuse_constant(value):
+            raise ValueError(f'nonfinite JSON constant {value}')
+        record = normalize_resident_hartree_provenance(json.loads(
+            bytes(ds[()]).decode('utf-8'), parse_constant=refuse_constant), persisted=True)
+    except (UnicodeError, ValueError, TypeError, RecursionError) as exc:
+        raise ValueError('resident Hartree provenance is malformed') from exc
+    if expected is not None:
+        if not isinstance(expected, dict) or not set(expected) <= set(record):
+            raise ValueError('resident Hartree expected binding has unknown fields')
+        for key, value in expected.items():
+            if json.dumps(value, sort_keys=True, allow_nan=False) != json.dumps(
+                    record[key], sort_keys=True, allow_nan=False):
+                raise ValueError(f'resident Hartree requested {key} changed; rebuild')
+    matrix = h5[HARTREE_PARENT_DATASET]
+    nb = record['band_range'][1] - record['band_range'][0]
+    if matrix.shape != (len(record['parent_full_rows']), nb, nb):
+        raise ValueError('resident Hartree logical shape disagrees with provenance')
+    _validate_shape_receipt(HARTREE_PARENT_DATASET, matrix)
+    if 'psi_parent_k_rows' in h5 and not np.array_equal(
+            np.asarray(h5['psi_parent_k_rows']), record['parent_full_rows']):
+        raise ValueError('resident Hartree FILE rows disagree with parent wavefunctions')
+    if _hartree_payload_sha256(matrix) != record['payload_sha256']:
+        raise ValueError('resident Hartree payload checksum changed')
+    return record
 
 
 def _logical_storage_shape(shape, logical_axes, logical_extent, *, where):
@@ -656,6 +814,9 @@ def write_restart_state_to_h5(
     coulomb_policy=None,
     qp_state_source_record: dict | None = None,
     charge_zeta_identity: dict | None = None,
+    charge_zeta_provenance: str | None = None,
+    hartree_parent_kij_ry=None,
+    hartree_provenance: dict | None = None,
     zeta_fit_windows=None,
     bispinor_v_receipt: str | None = None,
 ):
@@ -706,9 +867,41 @@ def write_restart_state_to_h5(
 
     encoded_charge_zeta_identity = _encode_charge_zeta_identity(
         charge_zeta_identity)
+    encoded_charge_zeta_provenance = _encode_charge_zeta_provenance(
+        charge_zeta_provenance, identity=encoded_charge_zeta_identity)
+    if (hartree_parent_kij_ry is None) != (hartree_provenance is None):
+        raise ValueError('resident Hartree payload and provenance travel together')
+    hartree_record = None
+    if hartree_provenance is not None:
+        if mode != 'w':
+            raise ValueError('resident Hartree provenance is immutable; requires mode=w')
+        hartree_record = normalize_resident_hartree_provenance(hartree_provenance)
+        normalize_resident_hartree_provenance(
+            dict(hartree_record, payload_sha256='0' * 64), persisted=True)
+        nb_h = hartree_record['band_range'][1] - hartree_record['band_range'][0]
+        if (hartree_parent_kij_ry.ndim != 3
+                or hartree_parent_kij_ry.shape[0] != len(hartree_record['parent_full_rows'])
+                or hartree_parent_kij_ry.shape[1] != hartree_parent_kij_ry.shape[2]
+                or hartree_parent_kij_ry.shape[1] < nb_h
+                or np.dtype(hartree_parent_kij_ry.dtype) != np.dtype('complex128')):
+            raise ValueError('resident Hartree producer shape/dtype disagrees with provenance')
+        if parent_k_rows is not None and not np.array_equal(
+                parent_k_rows, hartree_record['parent_full_rows']):
+            raise ValueError('resident Hartree FILE rows disagree with parent wavefunctions')
+        logical_hartree = hartree_parent_kij_ry[:, :nb_h, :nb_h]
+        if isinstance(hartree_parent_kij_ry, jax.Array):
+            finite_hartree = bool(jax.device_get(jnp.all(jnp.isfinite(logical_hartree))))
+        else:
+            finite_hartree = bool(np.all(np.isfinite(logical_hartree)))
+        if not finite_hartree:
+            raise ValueError('resident Hartree producer is nonfinite')
     if encoded_charge_zeta_identity is not None and mode != "w":
         raise ValueError(
             "charge_zeta_identity is immutable restart provenance and may "
+            "only be stamped by the mode='w' transaction")
+    if encoded_charge_zeta_provenance is not None and mode != "w":
+        raise ValueError(
+            "charge_zeta_provenance is immutable restart provenance and may "
             "only be stamped by the mode='w' transaction")
 
     # ---- THE ONE RESOLUTION, APPLIED ONCE, BEFORE ANY WRITE -----------
@@ -763,6 +956,11 @@ def write_restart_state_to_h5(
         # historical full-carrier storage path.
         barrier("restart_band_receipt_before_read")
         with h5py.File(filename, "r") as f:
+            if parent_k_rows is not None and (
+                    HARTREE_PARENT_DATASET in f or HARTREE_PROVENANCE_DATASET in f):
+                stored_hartree = _read_hartree_provenance(f)
+                if not np.array_equal(parent_k_rows, stored_hartree['parent_full_rows']):
+                    raise ValueError('resident Hartree FILE rows disagree with appended wavefunctions')
             schema = (int(np.asarray(f[BAND_WINDOW_SCHEMA_DATASET])[()])
                       if BAND_WINDOW_SCHEMA_DATASET in f else None)
             if schema == BAND_WINDOW_SCHEMA_VERSION and "band_window" in f:
@@ -850,6 +1048,27 @@ def write_restart_state_to_h5(
           mu_axes=(-2,), n_logical=n_T, band_axes=(-1,))
     _plan("enk_full", enk_full, band_axes=(-1,))
     _plan("W0_qmunu", W0_qmunu, mu_axes=(-2, -1))
+    if hartree_record is not None:
+        hartree_axis = _hartree_band_axis(
+            nb_h, mesh if mesh is not None else carrier_divisor)
+        for axis in (1, 2):
+            authenticate_axis(hartree_parent_kij_ry, hartree_axis, axis=axis,
+                              where='resident Hartree producer')
+        hshape = _logical_storage_shape(
+            hartree_parent_kij_ry.shape, (1, 2), nb_h,
+            where='resident Hartree producer')
+        write_plan[HARTREE_PARENT_DATASET] = (
+            hshape, _shape_receipt_attrs(
+                hartree_parent_kij_ry.shape, hshape,
+                axis_receipts=((1, hartree_axis), (2, hartree_axis))))
+    elif mode != 'w' and parent_k_rows is not None and band_slices is not None:
+        # The parent faces arrive in the existing later append transaction.
+        # Cross-check their FILE rows before that transaction can mutate them.
+        with h5py.File(filename, 'r') as f:
+            if HARTREE_PROVENANCE_DATASET in f or HARTREE_PARENT_DATASET in f:
+                stored_hartree = _read_hartree_provenance(f)
+                if not np.array_equal(parent_k_rows, stored_hartree['parent_full_rows']):
+                    raise ValueError('resident Hartree FILE rows disagree with appended wavefunctions')
 
     if init_W0 and W0_qmunu is None:
         if V_qmunu is None:
@@ -866,6 +1085,10 @@ def write_restart_state_to_h5(
                           np.asarray(parent_k_rows, dtype=np.int64))
         if mode == "w":
             io.write_attr("restart_format_version", np.int64(2))
+            if hartree_record is not None:
+                io.write_attr(HARTREE_PROVENANCE_DATASET, np.bytes_(json.dumps(
+                    dict(hartree_record, payload_sha256='0' * 64),
+                    sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')))
             if qp_state_source_record is not None:
                 from .qp_wfn import (
                     QP_STATE_SOURCE_DATASET,
@@ -879,6 +1102,10 @@ def write_restart_state_to_h5(
                 io.write_attr(
                     CHARGE_ZETA_IDENTITY_DATASET,
                     encoded_charge_zeta_identity)
+            if encoded_charge_zeta_provenance is not None:
+                io.write_attr(
+                    CHARGE_ZETA_PROVENANCE_DATASET,
+                    encoded_charge_zeta_provenance)
             if bispinor_v_receipt is not None:
                 io.write_attr(
                     BISPINOR_V_RECEIPT_DATASET,
@@ -981,6 +1208,7 @@ def write_restart_state_to_h5(
         _write("psi_parent_y", psi_parent_y)
         _write("psi_parent_y_mun", psi_parent_y_mun)
         _write("enk_full", enk_full)
+        _write(HARTREE_PARENT_DATASET, hartree_parent_kij_ry)
 
         # Bispinor per-channel ψ: μ axis clipped to the TRANSVERSE
         # logical extent (its own centroid count, not n_rmu_logical).
@@ -1051,10 +1279,16 @@ def write_restart_state_to_h5(
     # written before this attr existed keeps loading byte-for-byte.
     v_touched = V_qmunu is not None
     def _publish_readiness():
-        if not (w0_touched or v_touched):
+        if not (w0_touched or v_touched or hartree_record is not None):
             return
         with h5py.File(filename, "a") as f:
             set_commit_state(f, False)
+            if hartree_record is not None:
+                complete = dict(hartree_record, payload_sha256=
+                                _hartree_payload_sha256(f[HARTREE_PARENT_DATASET]))
+                f[HARTREE_PROVENANCE_DATASET][()] = np.bytes_(json.dumps(
+                    complete, sort_keys=True, separators=(',', ':'),
+                    allow_nan=False).encode('utf-8'))
             if qirr is not None and qirr.store_wedge:
                 _stamp_qirr(f, qirr, n_rmu_logical,
                             v_touched=v_touched,

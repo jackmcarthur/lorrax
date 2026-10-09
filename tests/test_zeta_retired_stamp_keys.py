@@ -25,7 +25,8 @@ def _current_stamp():
     from gw.gw_init import _zeta_fit_provenance
     wfn = SimpleNamespace(_filename="", ecutwfc=20.0, ecutrho=80.0)
     meta = SimpleNamespace(n_rmu=2, nspinor_wfnfile=2, fft_grid=(4, 4, 4))
-    cfg = SimpleNamespace(bispinor=False, backend=SimpleNamespace(
+    cfg = SimpleNamespace(bispinor=False,
+        paths=SimpleNamespace(atomic_reconstruction_dir=None), backend=SimpleNamespace(
         zeta_ridge=0.0, zeta_rcond=1e-8, charge_zeta_solve="pinv",
         gamma_contract_mode="auto"))
     return _zeta_fit_provenance(
@@ -40,11 +41,13 @@ def _stamp_with(stamp, **extra):
 
 def _reuse(tmp_path, monkeypatch, on_disk, now):
     import file_io.restart_bundle as rb
+    from file_io.isdf_header import IsdfHeader
     from gw.gw_init import _zeta_reuse_ok
     path = tmp_path / "zeta_q.h5"
     path.touch()
-    header = SimpleNamespace(zeta_is_done=True, fit_provenance=on_disk,
-                             r_mu_fft_idx=CENTROIDS)
+    header = IsdfHeader(density="scalar", vertex_mu_L=0,
+                        r_mu_fft_idx=CENTROIDS, r_mu_crystal=CENTROIDS/4,
+                        zeta_is_done=True, fit_provenance=on_disk)
     monkeypatch.setattr(rb, "read_isdf_header", lambda p: header)
     lines = []
     ok = _zeta_reuse_ok(str(path), now, CENTROIDS, print_fn=lines.append)

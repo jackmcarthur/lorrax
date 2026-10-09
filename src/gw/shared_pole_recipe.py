@@ -1200,12 +1200,12 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
     from common.units import RYD_TO_EV
-    from .gw_config import (uses_bare_transverse_shared_pole,
+    from .gw_config import (uses_charge_bispinor_shared_pole,
                             uses_full_bispinor_shared_pole)
 
     if config.sigma.w_model != "shared_pole":
         return None
-    charge4 = uses_bare_transverse_shared_pole(config)
+    charge4 = uses_charge_bispinor_shared_pole(config)
     photon = uses_full_bispinor_shared_pole(config)
     if int(meta.nspinor) == 4 and not (charge4 or photon):
         raise ValueError("GATE shared_pole_representation: four-component shared-pole "

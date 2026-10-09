@@ -29,7 +29,7 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = ["fft_box_miller", "bare_coulomb_sphere_mask",
-           "bare_coulomb_sphere_indices"]
+           "bare_coulomb_sphere_indices", "bare_coulomb_sphere_rows"]
 
 
 def fft_box_miller(fft_grid):
@@ -49,6 +49,12 @@ def fft_box_miller(fft_grid):
                       axis=-1).reshape(-1, 3)                 # (n_rtot, 3)
     G_int = np.rint(G_frac).astype(np.int32)                  # Miller ints
     return G_frac, G_int
+
+
+def _sphere_mask(G_frac, bvec, q_frac, cutoff):
+    """The shared Cartesian radius predicate for an explicitly labelled box."""
+    qG_cart = (q_frac[:, None, :] + G_frac[None, :, :]) @ bvec
+    return np.sum(qG_cart * qG_cart, axis=-1) <= float(cutoff)
 
 
 def bare_coulomb_sphere_mask(fft_grid, bvec, q_irr_frac, vcoul_cutoff_ry):
@@ -81,11 +87,83 @@ def bare_coulomb_sphere_mask(fft_grid, bvec, q_irr_frac, vcoul_cutoff_ry):
 
     # Per-q |q + G|² in Cartesian.  Broadcast over the n_rtot G's.
     # qG_cart[q, r, :] = (q + G[r]) @ bvec_f
-    qG_frac = q_irr_frac[:, None, :] + G_frac[None, :, :]      # (n_q, n_rtot, 3)
-    qG_cart = qG_frac @ bvec_f                                  # (n_q, n_rtot, 3)
-    qG_norm2 = np.sum(qG_cart * qG_cart, axis=-1)               # (n_q, n_rtot)
-    mask = qG_norm2 <= float(vcoul_cutoff_ry)                   # (n_q, n_rtot)
+    mask = _sphere_mask(G_frac, bvec_f, q_irr_frac, vcoul_cutoff_ry)
     return mask, G_int
+
+
+def bare_coulomb_sphere_rows(fft_grid, bvec, q_irr_frac, vcoul_cutoff_ry):
+    """Physical per-q Miller rows and their ascending FFT slots.
+
+    The historical mask/indices API labels every Nyquist slot ``-N/2``.
+    An even-grid slot instead carries ``+N/2`` when canonical ``q_i < 0``.
+    Both labels sample the same FFT cell. This producer proves that at most
+    one label can enter the requested sphere, before making that choice.
+
+    For reciprocal rows B, ``h_i = sqrt(cutoff) ||B^-1[:, i]||`` bounds
+    ``|G_i + q_i|``. With ``h_i < N_i/2`` and ``|q_i| <= 1/2``, all physical
+    integer frequencies lie in the q-dependent box, and its modulo-FFT map
+    is injective. This proof also covers skew lattices and odd extents.
+    Outside this sufficient domain the producer refuses; it does not claim
+    every refused discrete sphere has an alias. Enlarge the FFT grid.
+
+    Returns ``gvecs_per_q`` (ragged int32 Miller rows), ``idx_per_q``
+    (ascending flat FFT slots), ``ngk_per_q``, ``ngkmax``, and
+    ``sphere_convention``. The latter is None when the physical tables are
+    byte-identical to the historical fixed box, otherwise
+    ``q_aware_unique_fft_image_v1``. Only one full Miller box is held per q;
+    no q-by-FFT-by-three object is materialized. Padding belongs to callers.
+    """
+    grid = np.asarray(fft_grid, dtype=np.int64)
+    B = np.asarray(bvec, dtype=np.float64)
+    q = np.asarray(q_irr_frac, dtype=np.float64).reshape(-1, 3)
+    cutoff = float(vcoul_cutoff_ry)
+    if (grid.shape != (3,) or np.any(grid < 1) or B.shape != (3, 3)
+            or not np.isfinite(B).all() or not np.isfinite(q).all()
+            or not np.isfinite(cutoff) or cutoff <= 0.0 or not len(q)
+            or np.any(np.abs(q) > 0.5)):
+        raise ValueError(
+            "bare_coulomb_sphere_rows requires positive FFT extents and "
+            "cutoff, finite reciprocal rows, and nonempty canonical |q_i| <= 1/2")
+    try:
+        support = np.sqrt(cutoff) * np.linalg.norm(np.linalg.inv(B), axis=0)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("bare_coulomb_sphere_rows requires invertible reciprocal rows") from exc
+    if np.any(support >= grid / 2.0):
+        minimum = np.floor(2.0 * support).astype(np.int64) + 1
+        raise ValueError(
+            "GATE coulomb-sphere-unique-fft-image: got coordinate sphere "
+            f"support {support.tolist()} on FFT grid {grid.tolist()}; want "
+            "sqrt(cutoff)*||B^-1[:,i]|| < N_i/2 on each axis; why: outside "
+            "this conservative implementation domain distinct physical "
+            "frequencies can share one FFT coefficient; fix: enlarge the "
+            f"FFT grid to at least {np.maximum(grid, minimum).tolist()} "
+            "or lower the cutoff")
+    fixed_frac, fixed = fft_box_miller(tuple(grid))
+    rows, indices, changed = [], [], False
+    for qi in q:
+        G = fixed.copy()
+        G_frac = fixed_frac.copy()
+        for axis, extent in enumerate(grid):
+            if extent % 2 == 0 and qi[axis] < 0.0:
+                face = G[:, axis] == -extent // 2
+                G[face, axis] = extent // 2
+                G_frac[face, axis] = extent // 2
+        mask = _sphere_mask(G_frac, B, qi[None, :], cutoff)[0]
+        if not bool(mask[0]):
+            raise RuntimeError(
+                "bare_coulomb_sphere_rows: G=(0,0,0) outside the sphere; "
+                "increase vcoul_cutoff_ry above |q|^2")
+        idx = np.nonzero(mask)[0].astype(np.int32)
+        physical = G[idx]
+        changed |= not np.array_equal(physical, fixed[idx])
+        rows.append(physical)
+        indices.append(idx)
+    ngk = np.asarray([len(row) for row in rows], dtype=np.int32)
+    return {
+        "gvecs_per_q": rows, "idx_per_q": indices,
+        "ngk_per_q": ngk, "ngkmax": int(ngk.max()),
+        "sphere_convention": "q_aware_unique_fft_image_v1" if changed else None,
+    }
 
 
 def bare_coulomb_sphere_indices(fft_grid, bvec, q_irr_frac, vcoul_cutoff_ry):

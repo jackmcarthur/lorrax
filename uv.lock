@@ -2808,6 +2808,7 @@ dependencies = [
     { name = "jax" },
     { name = "lxkit" },
     { name = "numpy" },
+    { name = "scipy" },
 ]
 
 [package.optional-dependencies]
@@ -2827,6 +2828,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "numpy", marker = "extra == 'test'" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
+    { name = "scipy" },
 ]
 provides-extras = ["test", "store"]
 

@@ -55,8 +55,8 @@ def _mesh_id(mesh: Mesh) -> tuple:
 class OwnerOrbitBatches(NamedTuple):
     """μ batches whose every owner (``c`` slots per rank) holds whole orbits."""
     mu: np.ndarray            # (n_batch, P·c) packed centroid per slot, −1 pad
-    left_perm: np.ndarray     # (n_batch, P, n_rows, c) owner-local source slot
-    left_L: np.ndarray        # (n_batch, P, n_rows, c, 3) lattice wrap
+    left_perm: np.ndarray | None  # (n_batch, P, n_rows, c) source slot
+    left_L: np.ndarray | None     # (n_batch, P, n_rows, c, 3) lattice wrap
     c: int
     n_batch: int
     slot_of_packed: np.ndarray  # (μ_pad,) store slot β·P·c + p·c + j, −1 pad
@@ -65,8 +65,15 @@ class OwnerOrbitBatches(NamedTuple):
     def b(self) -> int:
         return int(self.mu.shape[1])
 
+    def transport(self, beta):
+        """Return executable endpoint tables; planning previews cannot unfold."""
+        if self.left_perm is None or self.left_L is None:
+            raise ValueError('a centroid-batch transport preview cannot serve the GPU kernel')
+        return self.left_perm[beta],self.left_L[beta]
 
-def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int):
+
+def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int, build_tables=True,
+                        _orbit_groups=None):
     """Whole-orbit bins of about ``c_target`` (one per owner), ``P`` bins a batch.
 
     The owner unfolds the left endpoint of its pair projectors inside its own
@@ -76,25 +83,27 @@ def owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_target: int):
     """
     from gw.centroid_k_unfold import orbit_mu_batches
     P_ = int(n_ranks)
-    bins = orbit_mu_batches(plan, int(mu_pad), 1, b_target=max(1, int(c_target)))
+    bins = orbit_mu_batches(plan,int(mu_pad),1,b_target=max(1,int(c_target)),
+        build_tables=build_tables,_orbit_groups=_orbit_groups)
     c = int(bins.b)
     n_bins = int(bins.n_batch)
     n_batch = -(-n_bins // P_)
     pad = n_batch * P_ - n_bins
-    n_rows = int(bins.left_perm.shape[1])
     mu = np.concatenate([bins.mu, np.full((pad, c), -1, bins.mu.dtype)])
-    lp = np.concatenate([bins.left_perm, np.broadcast_to(
-        np.arange(c, dtype=bins.left_perm.dtype), (pad, n_rows, c))])
-    lL = np.concatenate([bins.left_L, np.zeros((pad, n_rows, c, 3), bins.left_L.dtype)])
+    lp = lL = None
+    if build_tables:
+        n_rows = int(bins.left_perm.shape[1])
+        lp = np.concatenate([bins.left_perm,np.broadcast_to(
+            np.arange(c,dtype=bins.left_perm.dtype),(pad,n_rows,c))]).reshape(n_batch,P_,n_rows,c).astype(np.int32)
+        lL = np.concatenate([bins.left_L,np.zeros((pad,n_rows,c,3),bins.left_L.dtype)]).reshape(n_batch,P_,n_rows,c,3).astype(np.int32)
     return OwnerOrbitBatches(
         mu=mu.reshape(n_batch, P_ * c),
-        left_perm=lp.reshape(n_batch, P_, n_rows, c).astype(np.int32),
-        left_L=lL.reshape(n_batch, P_, n_rows, c, 3).astype(np.int32),
+        left_perm=lp,left_L=lL,
         c=c, n_batch=n_batch,
         slot_of_packed=np.asarray(bins.packed_to_slot(int(mu_pad)), dtype=np.int32))
 
 
-def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
+def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int, build_tables=True):
     """The whole-orbit batching with the least padded work, bins of at most ``c_max``.
 
     Bins hold whole orbits, so the planned ``c = b/P`` can pack badly (CrI3
@@ -107,17 +116,23 @@ def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
     every bin fits ``c_max`` and the plan prices the widest batch that runs
     (CrI3 24x24 P36: 12-member orbits make the batch 432, not the 36 of
     c_max = 1).
+    Candidates preview the same canonical packing without transport tables;
+    only the winning executable batch materializes those tables. The optional
+    host-only preview return refuses kernel transport through its accessor.
     ponytail: a linear scan over c and a fixed-cost guess of one centroid.
     """
     best = None
+    from gw.centroid_k_unfold import unfold_orbits
+    groups = unfold_orbits(plan)
     for c in range(max(1, int(c_max)), 0, -1):
-        mb = owner_orbit_batches(plan, mu_pad, n_ranks, c_target=c)
+        mb = owner_orbit_batches(plan,mu_pad,n_ranks,c_target=c,build_tables=False,_orbit_groups=groups)
         if best is not None and mb.c > c_max:
             continue                      # an orbit wider than c: no gain
         cost = mb.n_batch * (mb.c + 1)
         if best is None or cost < best[0]:
             best = (cost, mb)
-    return best[1]
+    return (owner_orbit_batches(plan,mu_pad,n_ranks,c_target=best[1].c,_orbit_groups=groups)
+            if build_tables else best[1])
 
 
 def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
@@ -212,6 +227,8 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         plane_from_col, n_pg: int, axis: int, n_src: int, vertices=(0,),
                         c_out: int | None = None, n_blk: int = 1, n_pc: int | None = None,
                         vertex_terms=None,
+                        use_augmented_samples: bool = False,
+                        q0_response: bool = False,
                         stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
 
@@ -270,6 +287,23 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
 
     ``stop_at`` (debug split timers only: ``'source'`` (steps 1-3),
     ``'planes'``, ``'kconv'``) truncates after that stage with a checksum.
+
+    With ``use_augmented_samples=True`` the callable takes one additional
+    final operand ``augmented_samples (n_src, nb, ns, b)`` at
+    ``P(None, None, None, ('x','y'))``. These are the corrected raw-parent
+    wavefunction values at the batch centroids, in the same gauge, band
+    order and representation as ``psi_bar``. Step 1 gathers only the current
+    ``n_pc`` parent chunk over its centroid axis and uses those values in
+    both pair projectors. The smooth column operand ``psi_bar`` and all
+    subsequent transforms remain unchanged. The default callable retains
+    its original signature and direct-DFT sampling operation.
+
+    ``q0_response=True`` is an internal charge-only functional. A final
+    replicated real operand ``(source, *fft_grid)`` supplies physical Ry
+    potentials. The result is ``(rows, raw_response)``; the latter has shape
+    ``(b, source)`` at ``P(('x','y'),None)``. It contracts the completed,
+    weighted real-space normal-equation RHS at physical Gamma before its
+    FFT, with no 1/N conversion. The default return and arithmetic are unchanged.
     """
     from isdf.core import _conv_kpair_static_gamma
     from isdf.pair_kernels import pair_projectors_lr
@@ -318,6 +352,14 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                          for t in vertex_terms)
     if len(vertex_terms) != len(vertices):
         raise ValueError("make_route_g_kernel: one vertex_terms entry per channel")
+    q0_slot = None
+    if q0_response:
+        gamma = np.flatnonzero(np.all(qv == 0., axis=1))
+        if (vertices != (0,) or vertex_terms != (((1.+0j, 0, 0),),)
+                or stop_at is not None or gamma.size != 1
+                or int(q_sel[gamma[0]]) != 0):
+            raise ValueError("route-G q0 response requires the completed charge route and unique physical Gamma")
+        q0_slot = int(gamma[0])
     pairs = sorted({(i, j) for t in vertex_terms for _, i, j in t})
     pair_kernels = {}
     for i, j in pairs:
@@ -337,19 +379,43 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
            int(n_col), int(n_s), hash(pfc.tobytes()), int(n_pg), int(axis), int(n_src),
-           vertices, vertex_terms, c_out, n_blk, n_pc, stop_at)
+           vertices, vertex_terms, c_out, n_blk, n_pc, bool(use_augmented_samples), stop_at)
+    if q0_response:
+        key += ('q0_response',)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
 
     G_ = P(None, None, None, _XY)
     R_ = P(_XY)
+    sample_specs = (G_,) if use_augmented_samples else ()
+    potential_specs = (P(),) if q0_response else ()
+    rows_spec = (P(None, _XY, None),) * n_v
 
     @partial(shard_map, mesh=mesh,
              in_specs=(G_, P(), P(), P(), P(None, _XY, None), P(), P(), P(), P(),
-                       P(), (R_, R_)),
-             out_specs=(P(None, _XY, None),) * n_v, check_vma=False)
-    def _local(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt):
+                       P(), (R_, R_)) + sample_specs + potential_specs,
+             out_specs=(rows_spec, P(_XY, None)) if q0_response else rows_spec,
+             check_vma=False)
+    def _local(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt,
+               *optional_operands):
+        augmented_samples = optional_operands[:1] if use_augmented_samples else ()
+        if len(optional_operands) != int(use_augmented_samples) + int(q0_response):
+            raise ValueError("route-G optional sample/potential operands differ from its compiled contract")
+        if use_augmented_samples:
+            expected = (n_src, int(psi_bar.shape[1]), ns, c)
+            if len(augmented_samples) != 1 or augmented_samples[0].shape != expected:
+                got = tuple(a.shape for a in augmented_samples)
+                raise ValueError(
+                    "make_route_g_kernel: augmented_samples must have local "
+                    f"shape {expected} (global centroid batch {b}); got {got}")
+        if q0_response:
+            potential = optional_operands[-1]
+            if (potential.ndim != 4 or tuple(potential.shape[1:]) != tuple(fft_grid)
+                    or potential.shape[0] < 1 or potential.dtype != jnp.float64):
+                raise ValueError("route-G q0 potential must be real float64 (source,*fft_grid)")
+            potential_planes = potential.transpose(0, axis+1, b_ax+1, c_ax+1).reshape(
+                potential.shape[0], n_a, ps)
         ci, cax = cyl
         zc, za, zflat = zt
         irr, sym, anti, U, pslot, phase, kch = unf
@@ -361,11 +427,18 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
             """Steps 1-3 for the n_pc parents from p0, written into the owner's D̃."""
             sl = lambda a: jax.lax.dynamic_slice_in_dim(a, p0, n_pc, axis=0)
             psi = sl(psi_bar)
-            # 1. X_B = ψ_{nks}(r_μ) = Σ_G c e^{2πi(k+G)·x_μ}/√N, one psum
-            kg = sl(kvecs)[:, None, :] + sl(g3).astype(jnp.float64)     # (k, Gp, 3)
-            ph = jnp.exp(2j * jnp.pi * jnp.einsum('kgd,md->kgm', kg, xmu))
-            X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi), ph) / np.sqrt(N)
-            X = jax.lax.psum(X, _XY) * live[None, None, None, :]
+            # 1. The sample endpoint is shared with C_q. Augmentation changes
+            # only it here; the smooth column endpoint remains ψ(G).
+            if use_augmented_samples:
+                X = jax.lax.all_gather(sl(augmented_samples[0]), _XY,
+                                       axis=3, tiled=True)
+                X = X * live[None, None, None, :]
+            else:
+                # ψ_{nks}(r_μ) = Σ_G c e^{2πi(k+G)·x_μ}/√N, one psum
+                kg = sl(kvecs)[:, None, :] + sl(g3).astype(jnp.float64)
+                ph = jnp.exp(2j * jnp.pi * jnp.einsum('kgd,md->kgm', kg, xmu))
+                X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi), ph) / np.sqrt(N)
+                X = jax.lax.psum(X, _XY) * live[None, None, None, :]
             # 2. pair GEMM in G space on this rank's slice
             D_l, D_r = pair_projectors_lr(X, psi, w_l, w_r)            # (k, s, b, s, Gp)
             # 3. one all-to-all: G split -> μ owners, [L | R] owner-major
@@ -415,6 +488,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                     return tuple(a + jnp.sum(jnp.abs(Fa)) for a in acc), None
 
                 def group(acc, gi):
+                    acc_rows, acc_response = acc if q0_response else (acc, None)
                     a0 = (bi * n_gb + gi) * n_pg + jnp.arange(n_pg)
                     on = (a0 < n_a).astype(jnp.float64)
                     # The group's planes of the cylinder, read in place, to the 2D
@@ -442,7 +516,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         if stop_at != 'kconv' and q_neg is not None:
                             Zij = Zij + jnp.conj(jnp.take(Zij, jnp.asarray(q_neg), axis=0))
                         zp[ij] = Zij
-                    for terms, acc_v in zip(vertex_terms, acc):
+                    for terms, acc_v in zip(vertex_terms, acc_rows):
                         if len(terms) == 1 and terms[0][0] == 1.0:
                             Z = zp[terms[0][1:]]
                         else:
@@ -451,22 +525,31 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                             out.append(acc_v + jnp.sum(jnp.abs(Z)))
                             continue
                         Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c_out, n_pg, ps)
+                        if q0_response:
+                            vp = jnp.take(potential_planes, jnp.minimum(a0, n_a-1), axis=1)
+                            acc_response = acc_response + jnp.einsum(
+                                'cpj,upj,p->cu', Z[q0_slot], vp, on)
                         Z = (Z * qin[:, None, None, :]).reshape(Q, c_out, n_pg, n_b, n_c)
                         Fz = local_fftn3(Z, axes=(-2, -1), norm='backward').reshape(Q, c_out, n_pg, ps)
                         out.append(acc_v + jnp.einsum('qcpj,qpg->qcjg', jnp.take(Fz, zc, axis=-1), E))
-                    return tuple(out), None
+                    return (tuple(out), acc_response) if q0_response else tuple(out), None
 
                 acc, _ = jax.lax.scan(group, acc, jnp.arange(n_gb, dtype=jnp.int32), unroll=1)
                 return acc, None
 
+            initial = (jnp.zeros((Q, c_out, n_zc, n_za), jnp.complex128),) * n_v
+            if q0_response:
+                initial = (initial, jnp.zeros((c_out, potential.shape[0]), jnp.complex128))
             acc, _ = jax.lax.scan(
-                block, (jnp.zeros((Q, c_out, n_zc, n_za), jnp.complex128),) * n_v,
+                block, initial,
                 jnp.arange(n_blk, dtype=jnp.int32), unroll=1)
+            acc, response = acc if q0_response else (acc, None)
             if stop_at in ('planes', 'kconv'):
                 return tuple(jnp.zeros((Q, c_out, n_g), jnp.complex128) + jnp.sum(jnp.abs(a))
                              for a in acc)
-            return tuple(jnp.take_along_axis(a.reshape(Q, c_out, n_zc * n_za),
+            rows = tuple(jnp.take_along_axis(a.reshape(Q, c_out, n_zc * n_za),
                                              zflat[:, None, :], axis=-1) for a in acc)
+            return (rows, response) if q0_response else rows
 
         if n_ch == 1:
             return owner_rows(lperm, lL)
@@ -475,7 +558,11 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
         lp = jnp.pad(lperm, ((0, 0), (0, pad))).reshape(-1, n_ch, c_out).swapaxes(0, 1)
         ll = jnp.pad(lL, ((0, 0), (0, pad), (0, 0))).reshape(-1, n_ch, c_out, 3).swapaxes(0, 1)
         _, rows = jax.lax.scan(lambda _, t: (None, owner_rows(*t)), None, (lp, ll), unroll=1)
-        return tuple(r.swapaxes(0, 1).reshape(Q, n_ch * c_out, n_g)[:, :c] for r in rows)
+        rows, response = rows if q0_response else (rows, None)
+        rows = tuple(r.swapaxes(0, 1).reshape(Q, n_ch * c_out, n_g)[:, :c] for r in rows)
+        if q0_response:
+            return rows, response.reshape(n_ch*c_out, potential.shape[0])[:c]
+        return rows
 
     fn = jax.jit(_local)
     _kernel_cache[key] = fn
@@ -690,6 +777,100 @@ def _rows_to_q_local(mesh, P_, n_batch, c, mu_pad, q_axis):
     return fn
 
 
+def q0_response_from_batches(mesh, batches, *, q_axis, q0_slot,
+                             packed_from_slot):
+    """Small owner-batch responses -> the charge factor's packed q-owner RHS.
+
+    ``batches`` is ``(batch,b,source)`` at ``P(None,('x','y'),None)``.
+    The same slot map used by ZStore authenticates its final packed order;
+    negative carrier slots and every non-Gamma/padded q row are exact zero.
+    """
+    slots = np.asarray(packed_from_slot, dtype=np.int32)
+    nranks = _mesh_size(mesh)
+    if (batches.ndim != 3 or batches.shape[1] % nranks
+            or slots.ndim != 1 or not 0 <= int(q0_slot) < int(q_axis.logical)
+            or np.any(slots >= batches.shape[0]*batches.shape[1])):
+        raise ValueError('q0 response batches differ from their stored q/batch/packed layout')
+    spec = NamedSharding(mesh, P(None, _XY, None))
+    if not batches.sharding.is_equivalent_to(spec, ndim=3):
+        raise ValueError('q0 response batches require the route-G owner layout')
+    n_batch, _, n_source = map(int, batches.shape)
+    c = int(batches.shape[1])//nranks
+
+    @partial(shard_map, mesh=mesh, in_specs=P(None, _XY, None),
+             out_specs=P(_XY, None, None), check_vma=False)
+    def finish(local):
+        rank_major = jax.lax.all_gather(local.reshape(n_batch*c, n_source),
+                                       _XY, axis=0, tiled=True)
+        by_slot = _reorder_rank_major(rank_major, nranks, n_batch, c,
+                                     n_batch*nranks*c, axis=0)
+        packed = jnp.take(by_slot, jnp.maximum(jnp.asarray(slots), 0), axis=0)
+        packed = jnp.where(jnp.asarray(slots)[:, None] >= 0, packed, 0)
+        q = (jax.lax.axis_index(_XY)*(int(q_axis.carrier)//nranks)
+             + jnp.arange(int(q_axis.carrier)//nranks))
+        return jnp.where((q == int(q0_slot))[:, None, None], packed[None], 0)
+    return jax.jit(finish)(batches)
+
+
+def finalize_charge_q0_response(zeta, local_rhs=None):
+    """Combine raw smooth/local Hartree functionals and apply SAME charge C once.
+
+    Local scalar RHSs already carry the provider's grid-unit conversion.
+    The returned ``(canonical_mu, source)`` coefficients are separate from V.
+    No conjugation, N/Omega conversion, or additional factor is applied here.
+    """
+    import hashlib
+
+    rhs = getattr(zeta, 'q0_response_rhs', None)
+    metadata = getattr(zeta, 'q0_response_metadata', None)
+    if (rhs is None or not isinstance(metadata, dict)
+            or metadata.get('schema') != 'lorrax.charge_q0_response.v1'
+            or metadata.get('complete') is not True
+            or getattr(zeta, 'fit_vertex_mu_L', None) != 0
+            or not isinstance(metadata.get('source_identity'), str)
+            or not metadata['source_identity']
+            or getattr(zeta, 'q0_response_source_identity', None) != metadata.get('source_identity')):
+        raise ValueError('charge q0 response requires its complete charge fit and authenticated placement')
+    st = zeta.store
+    q_full = np.asarray(getattr(zeta, 'fit_q_full_indices', None))
+    if zeta.mu_basis is not None:
+        axis = zeta.mu_basis.layout.axis
+        active = np.asarray(axis.active_mask, bool)
+        packed = np.asarray(axis.packed_to_canonical, np.int64)
+        coordinates = np.asarray(zeta.mu_basis.canonical_indices,np.float64)
+        geometry = dict(coordinate_kind=zeta.mu_basis.coordinate_kind,
+            canonical_shape=list(coordinates.shape),
+            canonical_coordinates_sha256=hashlib.sha256(coordinates.tobytes()).hexdigest())
+    else:
+        active = np.arange(st.mu_pad) < zeta.n_rmu
+        packed = np.where(active, np.arange(st.mu_pad), -1).astype(np.int64)
+        geometry = getattr(zeta,'fit_centroid_geometry',None)
+    slot = metadata.get('q0_slot')
+    if (q_full.shape != (st.Q,)
+            or not np.array_equal(q_full, metadata.get('q_full_indices'))
+            or isinstance(slot, bool) or not isinstance(slot, (int, np.integer))
+            or not 0 <= slot < st.Q or q_full[slot] != 0
+            or np.count_nonzero(q_full == 0) != 1
+            or metadata.get('q0_full_index') != 0
+            or metadata.get('source_count') != rhs.shape[-1]
+            or metadata.get('units') != 'physical_Ry_potential_times_grid_density_sum'
+            or geometry is None or metadata.get('centroid_geometry') != geometry
+            or metadata.get('packed_to_canonical_sha256') != hashlib.sha256(packed.tobytes()).hexdigest()
+            or metadata.get('active_mu_sha256') != hashlib.sha256(active.tobytes()).hexdigest()):
+        raise ValueError('charge q0 response provenance differs from the actual charge q/basis placement')
+    _require_q_owned(rhs, zeta.mesh,
+                     (st.Q_pad, st.mu_pad, rhs.shape[-1]), name='q0 smooth response')
+    if local_rhs is not None:
+        _require_q_owned(local_rhs, zeta.mesh, rhs.shape, name='q0 local response')
+        rhs = rhs + local_rhs
+    solved = _local_coefficient_solve(zeta.mesh, zeta.solver_kind,
+                                     zeta.n_rmu_solve, st.Q)(zeta.factor, rhs)
+    canonical = (zeta.mu_basis.unpack_axis(solved, 1)
+                 if zeta.mu_basis is not None else solved[:, :zeta.n_rmu])
+    zeta.q0_response = canonical[int(metadata['q0_slot'])]
+    return zeta.q0_response
+
+
 def _disk_tile(mesh, mu_pad):
     key = ('disk_tile', _mesh_id(mesh), mu_pad)
     fn = _kernel_cache.get(key)
@@ -764,6 +945,10 @@ class ZetaG:
         self.ngkmax = int(self.gvec_components.shape[-1])
         self.path = str(path)
         self.shell_slots = self.shell = None
+        self.local_augmentation = None
+        self.q0_response_rhs = self.q0_response_metadata = self.q0_response = None
+        self.q0_response_source_identity = None
+        self.fit_centroid_geometry = None
         self.receipt = ""
 
     @property
@@ -780,7 +965,8 @@ class ZetaG:
 
 
     # -- the one pass ---------------------------------------------------
-    def contract_v(self, v_table, *, keep, zeta_io=None, print_fn=None, with_v=True):
+    def contract_v(self, v_table, *, keep, zeta_io=None, print_fn=None, with_v=True,
+                   local_augmentation=None):
         """Stream every G tile once; return V (Q, μ_pad, μ_pad) at ``P(None,'x','y')``.
 
         ``v_table`` is ``(Q, ngkmax)`` v(q+G) on the stored sphere.  ``keep``
@@ -789,10 +975,47 @@ class ZetaG:
         the shell are in the canonical (file) centroid order.  With
         ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``;
         ``with_v=False`` (:meth:`write_file`) forms and writes ζ only.
+
+        ``local_augmentation`` overrides ``self.local_augmentation`` when
+        supplied. The provider is a plain dictionary with ``rhs``
+        ``(Q_pad,mu_pad,n_local)`` at ``P(('x','y'),None,None)``, and two
+        callables. ``fourier_tile(t,coefficients)`` returns the fitted
+        ``(delta,compensation)`` Fourier tiles, each ``(Q_pad,mu_pad,g_tile)``
+        on the same q owners; ``onsite(coefficients)`` returns the complete
+        atom-local Coulomb correction ``(Q_pad,mu_pad,mu_pad)`` there. The
+        local RHS is solved once with this ζ's canonical C factor. Head
+        columns and written G tiles contain the physical ``smooth+delta``.
+        The G file alone does not contain the local correction outside the
+        stored sphere or its onsite metric; reuse needs the provider data.
         """
         t0 = time.perf_counter()
         print_fn = print_fn or self.print_fn
         st = self.store
+        augmentation = (self.local_augmentation if local_augmentation is None
+                        else local_augmentation)
+        compensated_body = False
+        positive_body = False
+        if augmentation is not None:
+            if (not isinstance(augmentation, dict)
+                    or not callable(augmentation.get('fourier_tile'))
+                    or not callable(augmentation.get('onsite'))
+                    or 'rhs' not in augmentation):
+                raise ValueError("ZetaG.contract_v: local_augmentation requires "
+                                 "rhs, fourier_tile and onsite")
+            body_metric = augmentation.get('body_metric', 'mixed_reciprocal')
+            if body_metric not in ('mixed_reciprocal', 'compensated', 'physical_low_local_high'):
+                raise ValueError('ZetaG.contract_v: unknown local Coulomb body metric')
+            compensated_body = body_metric == 'compensated'
+            positive_body = body_metric == 'physical_low_local_high'
+            rhs = augmentation['rhs']
+            if (rhs.ndim != 3 or rhs.shape[:2] != (st.Q_pad, st.mu_pad)
+                    or int(rhs.shape[-1]) < 1):
+                raise ValueError("ZetaG.contract_v: local RHS must be "
+                                 "(Q_pad,mu_pad,n_local), n_local>=1")
+            _require_q_owned(rhs, self.mesh, rhs.shape, name='local RHS')
+            local_coefficients = _local_coefficient_solve(
+                self.mesh, self.solver_kind, self.n_rmu_solve,
+                st.Q)(self.factor, rhs)
         # Pad q rows and G-tile slots carry v = 0, ngk = 0: inert in V.
         qa, ga = st.q_axis, st.g_axis
         v = np.asarray(pad_to_axis(pad_to_axis(
@@ -807,13 +1030,26 @@ class ZetaG:
         from common.collectives import device_put_process_local
         v_dev = device_put_process_local(
             v, NamedSharding(self.mesh, P(_XY, None)))
+        bare_dev = None
+        if positive_body:
+            bare = np.asarray(augmentation['bare_v_table'])
+            if (bare.shape != (st.Q, st.g_axis.logical)
+                    or not np.isfinite(bare).all() or np.any(bare < 0)):
+                raise ValueError('positive charge body requires the canonical finite bare q/G table')
+            bare = np.asarray(pad_to_axis(pad_to_axis(
+                jnp.asarray(bare, dtype=jnp.complex128), qa, axis=0), ga, axis=1))
+            bare_dev = device_put_process_local(bare, NamedSharding(self.mesh, P(_XY, None)))
         ngk_dev = device_put_process_local(
             ngk, NamedSharding(self.mesh, P(_XY)))
         sl_dev = device_put_process_local(
             sl, NamedSharding(self.mesh, P(_XY, None)))
-        dbg = _debug_enabled() and with_v
+        # The smooth-only C+ M C+ diagnostic is not the mixed local metric.
+        dbg = _debug_enabled() and with_v and augmentation is None
         step = _v_tile_kernel(self.mesh, self.solver_kind,
-                              self.n_rmu_solve, st.g_tile, debug_m=dbg, with_v=with_v)
+                              self.n_rmu_solve, st.g_tile, debug_m=dbg, with_v=with_v,
+                              use_local_augmentation=augmentation is not None,
+                              compensated_body=compensated_body,
+                              positive_body=positive_body)
         mu = int(st.mu_pad)
         V, M, shell = _zero_accumulators(self.mesh, st.Q_pad, mu,
                                          int(sl.shape[1]), debug_m=dbg, with_v=with_v)
@@ -823,8 +1059,18 @@ class ZetaG:
             # Tile t+1 is read while tile t is contracted.
             Zt = nxt
             nxt = st.read_tile(t + 1) if t + 1 < st.n_Gt else None
+            local_tiles = ()
+            if augmentation is not None:
+                tiles = augmentation['fourier_tile'](t, local_coefficients)
+                if not isinstance(tiles, tuple) or len(tiles) != 2:
+                    raise ValueError("ZetaG.contract_v: fourier_tile must return "
+                                     "(delta,compensation)")
+                for name, tile in zip(('delta', 'compensation'), tiles):
+                    _require_q_owned(tile, self.mesh,
+                                     (st.Q_pad, mu, st.g_tile), name=name)
+                local_tiles = ((tiles[0], tiles[1], bare_dev),) if positive_body else (tiles,)
             V, M, shell, zt = step(L_arg, Zt, v_dev, ngk_dev, sl_dev,
-                                   jnp.int32(t), V, M, shell)
+                                   jnp.int32(t), V, M, shell, *local_tiles)
             if zeta_io is not None:
                 self._write_tile(zeta_io, zt, t * st.g_tile)
                 if st.placement == 'disk':
@@ -833,6 +1079,11 @@ class ZetaG:
                     # rank (SlabIO.sync_writes).
                     zeta_io.sync_writes()
             del Zt, zt
+        if augmentation is not None and with_v:
+            correction = augmentation['onsite'](local_coefficients)
+            _require_q_owned(correction, self.mesh,
+                             (st.Q_pad, mu, mu), name='onsite correction')
+            V = _add_q_owned(self.mesh)(V, correction)
         if not dbg:
             M = None
         if not with_v:
@@ -842,6 +1093,16 @@ class ZetaG:
                             f"{st.t_read:.2f}s); zeta file written")
             return None
         V = _finish_v(self.mesh, st.Q)(V)
+        if positive_body:
+            moments = augmentation['periodic_moment_rows'](local_coefficients)
+            moment_axis = augmentation['periodic_cache']['moment_axis']
+            _require_q_owned(moments, self.mesh,
+                (st.Q_pad, mu, moment_axis.carrier), name='periodic moment rows')
+            moments = _to_mu_owner(self.mesh, st.Q, 'xy')(moments)
+            periodic = augmentation['periodic_action'](
+                moments, augmentation['periodic_cache']['gram'])
+            V = V+periodic
+            del moments, periodic
         shell = _finish_shell(self.mesh, st.Q)(shell)
         if self.mu_basis is not None:
             V = self.mu_basis.unpack_operator(V)
@@ -881,6 +1142,10 @@ class ZetaG:
     def close(self):
         self.store.close()
         self.L_q = self.lu_piv = self.shell = None
+        self.local_augmentation = None
+        self.q0_response_rhs = self.q0_response_metadata = self.q0_response = None
+        self.q0_response_source_identity = None
+        self.fit_centroid_geometry = None
 
 
 def _debug_enabled() -> bool:
@@ -922,15 +1187,80 @@ def _factor_specs(solver_kind: str):
 _ACC_SPEC = P(_XY, None, None)
 
 
-def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True):
+def _require_q_owned(array, mesh, shape, *, name):
+    """Authenticate a provider's packed q-owner operand without resharding it."""
+    sharding = getattr(array, 'sharding', None)
+    wanted = NamedSharding(mesh,P(_XY,None,None))
+    if (tuple(array.shape) != tuple(shape) or str(array.dtype) != 'complex128'
+            or not isinstance(sharding, NamedSharding)
+            or not sharding.is_equivalent_to(wanted,ndim=3)):
+        raise ValueError(f"ZetaG.contract_v: {name} must be complex128 {tuple(shape)} "
+                         "at P(('x','y'),None,None) on the fit mesh; "
+                         f"got shape {getattr(array,'shape',None)}, dtype {getattr(array,'dtype',None)}, "
+                         f"sharding {getattr(array,'sharding',None)}")
+
+
+def _local_coefficient_solve(mesh, solver_kind, n_log, q_logical):
+    """Canonical C solve of local RHS coefficients once, on the q owners."""
+    key = ('local_coefficient_solve', _mesh_id(mesh), solver_kind,
+           int(n_log), int(q_logical))
+    fn = _kernel_cache.get(key)
+    if fn is not None:
+        return fn
+    one = _logical_solve(solver_kind, n_log)
+    spec = P(_XY, None, None)
+
+    @partial(shard_map, mesh=mesh,
+             in_specs=(_factor_specs(solver_kind), spec), out_specs=spec,
+             check_vma=False)
+    def solve(F, rhs):
+        result = jax.vmap(one)(F, rhs)
+        rank = jax.lax.axis_index('x') * int(mesh.shape['y']) + jax.lax.axis_index('y')
+        live = rank * int(rhs.shape[0]) + jnp.arange(rhs.shape[0]) < int(q_logical)
+        return jnp.where(live[:, None, None], result, 0)
+
+    fn = jax.jit(solve)
+    _kernel_cache[key] = fn
+    return fn
+
+
+def _add_q_owned(mesh):
+    """Add the onsite correction into the donated q-owner V accumulator."""
+    key = ('add_q_owned', _mesh_id(mesh))
+    fn = _kernel_cache.get(key)
+    if fn is not None:
+        return fn
+    spec = P(_XY, None, None)
+
+    @partial(shard_map, mesh=mesh, in_specs=(spec, spec), out_specs=spec,
+             check_vma=False)
+    def add(V, correction):
+        return V + correction
+
+    fn = jax.jit(add, donate_argnums=(0,))
+    _kernel_cache[key] = fn
+    return fn
+
+
+def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
+                   use_local_augmentation=False, compensated_body=False,
+                   positive_body=False):
     """One G tile: ζ = C⁻¹Z, V += conj(ζ) v ζᵀ, shell gather (and M in debug).
 
     F (Q_pad, μ, μ) and Z (Q_pad, μ, g) are q-local; V, shell and M
     accumulate on the q owner.  ``with_v=False`` forms ζ only (the
     accumulators pass through untouched).
     """
+    if use_local_augmentation and debug_m:
+        raise ValueError("_v_tile_kernel: the smooth C+ M C+ diagnostic does "
+                         "not describe the augmented Coulomb metric")
+    if compensated_body and not use_local_augmentation:
+        raise ValueError('_v_tile_kernel: compensated body requires a local provider')
+    if positive_body and (not use_local_augmentation or compensated_body):
+        raise ValueError('_v_tile_kernel: physical-low body requires its own local provider')
     key = ('v_tile', _mesh_id(mesh), solver_kind, int(n_log),
-           int(g_tile), bool(debug_m), bool(with_v))
+           int(g_tile), bool(debug_m), bool(with_v), bool(use_local_augmentation),
+           bool(compensated_body), bool(positive_body))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
@@ -940,39 +1270,66 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True):
     in_specs = (f_spec, P(_XY, None, None), P(_XY, None),
                 P(_XY), P(_XY, None), P(), acc, acc, acc)
     z_spec = P(_XY, None, None)
+    local_specs = ((z_spec, z_spec, P(_XY, None)),) if positive_body else (
+        ((z_spec, z_spec),) if use_local_augmentation else ())
 
-    @partial(shard_map, mesh=mesh, in_specs=in_specs,
+    @partial(shard_map, mesh=mesh, in_specs=in_specs + local_specs,
              out_specs=(acc, acc, acc, z_spec), check_vma=False)
-    def k(F, Z, v, ngk, sl, t, V, M, S):
+    def k(F, Z, v, ngk, sl, t, V, M, S, *local_tiles):
         n_g = Z.shape[-1]
         g_idx = t * g_tile + jnp.arange(n_g, dtype=jnp.int32)
         mask = g_idx[None, :] < ngk[:, None]                    # (q, g)
         zeta = jnp.where(mask[:, None, :], jax.vmap(one)(F, Z), 0)
+        physical = zeta
+        if use_local_augmentation:
+            delta, compensation = local_tiles[0][:2]
+            delta = jnp.where(mask[:, None, :], delta, 0)
+            compensation = jnp.where(mask[:, None, :], compensation, 0)
+            physical = zeta + delta
         if not with_v:
-            return V, M, S, zeta
+            return V, M, S, physical
         vt = jnp.where(mask, jnp.take(v, jnp.clip(g_idx, 0, v.shape[-1] - 1),
                                       axis=1), 0)
-        dV = jnp.einsum('qmg,qg,qng->qmn', jnp.conj(zeta), vt, zeta)
+        if use_local_augmentation:
+            if positive_body:
+                bare = local_tiles[0][2]
+                vb = jnp.where(mask, jnp.take(bare, jnp.clip(g_idx, 0, bare.shape[-1]-1),
+                                            axis=1), 0)
+                dV = (jnp.einsum('qmg,qg,qng->qmn', jnp.conj(physical), vt, physical)
+                      -jnp.einsum('qmg,qg,qng->qmn', jnp.conj(delta), vb, delta))
+            elif compensated_body:
+                smooth_compensated = zeta + compensation
+                dV = jnp.einsum('qmg,qg,qng->qmn',
+                    jnp.conj(smooth_compensated), vt, smooth_compensated)
+            else:
+                from isdf.augmentation import mixed_coulomb_tile
+                dV = mixed_coulomb_tile(zeta, delta, compensation, vt)
+        else:
+            dV = jnp.einsum('qmg,qg,qng->qmn', jnp.conj(zeta), vt, zeta)
         hit = (sl[:, None, :] == g_idx[None, :, None]).astype(zeta.dtype)
-        dS = jnp.einsum('qmg,qgs->qms', zeta, hit)
+        dS = jnp.einsum('qmg,qgs->qms', physical, hit)
         V = V + dV
         S = S + dS
         if debug_m:
             dM = jnp.einsum('qmg,qg,qng->qmn', jnp.conj(Z), vt, Z)
             M = M + dM
-        return V, M, S, zeta
+        return V, M, S, physical
 
     fn = jax.jit(k, donate_argnums=(6, 7, 8))
     _kernel_cache[key] = fn
     return fn
 
 
-def _pair_tile_kernel(mesh, g_tile, pairs):
+def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
+                      compensated_body=False, return_physical=False):
     """One G tile of several ζ's: ``V^{ab} += conj(ζ^a) v^{ab} ζ^bᵀ`` per pair,
     and each ζ's shell gather — the accumulation half of :func:`_v_tile_kernel`
     over ζ tiles it formed with ``with_v=False``."""
     pairs = tuple((int(a), int(b)) for a, b in pairs)
-    key = ('pair_tile', _mesh_id(mesh), int(g_tile), pairs)
+    if compensated_body and not use_local_augmentation:
+        raise ValueError('grouped compensated body requires a local provider')
+    key = ('pair_tile', _mesh_id(mesh), int(g_tile), pairs,
+           bool(use_local_augmentation),bool(compensated_body),bool(return_physical))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
@@ -982,10 +1339,15 @@ def _pair_tile_kernel(mesh, g_tile, pairs):
                                       P(_XY), P(_XY, None))
     in_specs = ((z_spec,) * n_z, v_spec, n_spec, s_spec, P(),
                 (acc,) * len(pairs), (acc,) * n_z)
+    if use_local_augmentation:
+        in_specs += (((z_spec,)*n_z,(z_spec,)*n_z),)
 
+    output_specs = ((acc,) * len(pairs), (acc,) * n_z)
+    if return_physical:
+        output_specs += ((z_spec,) * n_z,)
     @partial(shard_map, mesh=mesh, in_specs=in_specs,
-             out_specs=((acc,) * len(pairs), (acc,) * n_z), check_vma=False)
-    def k(Z, v, ngk, sl, t, V, S):
+             out_specs=output_specs, check_vma=False)
+    def k(Z, v, ngk, sl, t, V, S, *local_tiles):
         n_g = Z[0].shape[-1]
         g_idx = t * g_tile + jnp.arange(n_g, dtype=jnp.int32)
         mask = g_idx[None, :] < ngk[:, None]                    # (q, g)
@@ -993,13 +1355,26 @@ def _pair_tile_kernel(mesh, g_tile, pairs):
         V_out = []
         for i, (a, b) in enumerate(pairs):
             vt = jnp.where(mask, jnp.take(v[i], cols, axis=1), 0)
-            dV = jnp.einsum('qmg,qg,qng->qmn', jnp.conj(Z[a]), vt, Z[b])
+            product=lambda left,right:jnp.einsum('qmg,qg,qng->qmn',jnp.conj(left),vt,right)
+            dV = product(Z[a],Z[b])
+            if use_local_augmentation:
+                delta,compensation=local_tiles[0]
+                if compensated_body:
+                    dV=product(Z[a]+compensation[a],Z[b]+compensation[b])
+                else:
+                    dV += (product(Z[a],delta[b])+product(delta[a],Z[b])
+                           +product(compensation[a],compensation[b]))
             V_out.append(V[i] + dV)
         hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
-        S_out = []
+        S_out, physical_tiles = [], []
         for a in range(n_z):
-            dS = jnp.einsum('qmg,qgs->qms', Z[a], hit)
+            physical=Z[a]+local_tiles[0][0][a] if use_local_augmentation else Z[a]
+            dS = jnp.einsum('qmg,qgs->qms', physical, hit)
             S_out.append(S[a] + dS)
+            if return_physical:
+                physical_tiles.append(jnp.where(mask[:, None, :], physical, 0))
+        if return_physical:
+            return tuple(V_out), tuple(S_out), tuple(physical_tiles)
         return tuple(V_out), tuple(S_out)
 
     fn = jax.jit(k, donate_argnums=(5, 6))
@@ -1007,7 +1382,8 @@ def _pair_tile_kernel(mesh, g_tile, pairs):
     return fn
 
 
-def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
+def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
+                     zeta_ios=None):
     """Several V tiles over several ζ's in ONE pass over the G tiles.
 
     ``zetas`` are :class:`ZetaG` of one fit (one store geometry and centroid
@@ -1020,11 +1396,34 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     ``(Q, μ_pad, μ_pad)`` at ``P(None,'x','y')`` in canonical centroid order.
     This is what spares the four-current V_q the three ζ_T files: the file
     route wrote each ζ^a and read it back to form the same sums.
+
+    ``zeta_ios`` optionally supplies one already opened SlabIO per channel,
+    in the same order as ``zetas``. The caller creates the authenticated
+    headers and ``zeta_q_G`` datasets. The stream writes physical smooth+delta,
+    with the same OWN factors used by V; its compensated body stays smooth+g.
+    Every write is drained on all ranks before moving to the next channel,
+    bounding the collective lane to one pending physical tile. Completion
+    stamps remain caller-owned until all files and the group have closed.
     """
     t0 = time.perf_counter()
+    augmentation=None
+    if any(getattr(z,'local_augmentation',None) is not None for z in zetas):
+        from isdf.atomic_breit import authenticate_group
+        augmentation=authenticate_group(zetas,pairs,v_tables)
     z0 = zetas[0]
     print_fn = print_fn or z0.print_fn
     st0 = z0.store
+    if zeta_ios is not None:
+        from pathlib import Path
+        zeta_ios = tuple(zeta_ios)
+        if len(zeta_ios) != len(zetas):
+            raise ValueError('grouped physical writer requires one file per complete zeta family')
+        for z, writer in zip(zetas, zeta_ios):
+            if (getattr(writer, 'mesh', None) is not z.mesh
+                    or not callable(getattr(writer, 'write_slab', None))
+                    or not callable(getattr(writer, 'sync_writes', None))
+                    or Path(getattr(writer, 'path', '')).resolve() != Path(z.path).resolve()):
+                raise ValueError('grouped physical writer file, mesh or collective owner differs')
     for z in zetas[1:]:
         st = z.store
         if (st.Q, st.mu_pad, st.g_tile, st.n_Gt) != (st0.Q, st0.mu_pad, st0.g_tile, st0.n_Gt) \
@@ -1051,13 +1450,29 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
                            debug_m=False, with_v=False) for z in zetas]
     stub = [_zero_accumulators(mesh, st0.Q_pad, int(st0.mu_pad), 1,
                                debug_m=False, with_v=False) for _ in zetas]
-    step = _pair_tile_kernel(mesh, st0.g_tile, pairs)
+    body_metric='mixed_reciprocal' if augmentation is None else augmentation.get('body_metric')
+    if body_metric not in ('mixed_reciprocal','compensated'):
+        raise ValueError('grouped static provider has no supported body metric')
+    step = _pair_tile_kernel(mesh,st0.g_tile,pairs,
+                            use_local_augmentation=augmentation is not None,
+                            compensated_body=body_metric=='compensated',
+                            return_physical=zeta_ios is not None)
     mu = int(st0.mu_pad)
     V = tuple(_zero_accumulators(mesh, st0.Q_pad, mu, 1,
                                  debug_m=False)[0] for _ in pairs)
     S = tuple(_zero_accumulators(mesh, st0.Q_pad, mu,
                                  int(sl.shape[1]), debug_m=False)[2] for _ in zetas)
     factors = [z.factor for z in zetas]
+    local_state=None
+    if augmentation is not None:
+        coefficients=[]
+        for z in zetas:
+            rhs=z.local_augmentation['rhs']
+            _require_q_owned(rhs,mesh,rhs.shape,name='grouped static current RHS')
+            coefficients.append(_local_coefficient_solve(mesh,z.solver_kind,
+                z.n_rmu_solve,st0.Q)(z.factor,rhs))
+        local_state=augmentation['prepare'](tuple(coefficients))
+        del coefficients
     v_form = v_dev[0]                  # unread by the ζ-forming half
     # No look-ahead: each Z tile is read just before its ζ is formed and
     # dropped after, so a G tile holds one Z tile and the ζ tiles — the six
@@ -1071,8 +1486,33 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
             stub[i] = (a, m, sh)
             zt.append(zi)
             del Zt
-        V, S = step(tuple(zt), v_dev, ngk_dev, sl_dev, jnp.int32(t), V, S)
+        local_tiles=()
+        if augmentation is not None:
+            tiles=augmentation['fourier_tile'](t,local_state)
+            if (not isinstance(tiles,tuple) or len(tiles)!=2
+                    or any(not isinstance(part,tuple) or len(part)!=3 for part in tiles)):
+                raise ValueError("grouped static provider must return three delta and compensation tiles")
+            for part,label in zip(tiles,('delta','compensation')):
+                for tile in part:
+                    _require_q_owned(tile,mesh,(st0.Q_pad,mu,st0.g_tile),name=f'grouped current {label}')
+            local_tiles=(tiles,)
+        result = step(tuple(zt),v_dev,ngk_dev,sl_dev,jnp.int32(t),V,S,*local_tiles)
+        V, S = result[:2]
+        if zeta_ios is not None:
+            for z, writer, physical in zip(zetas, zeta_ios, result[2]):
+                z._write_tile(writer, physical, t * st0.g_tile)
+                writer.sync_writes()
+            del physical
+        del result
         del zt
+    if augmentation is not None:
+        correction=augmentation['onsite'](local_state,pairs)
+        if not isinstance(correction,tuple) or len(correction)!=len(pairs):
+            raise ValueError("grouped static provider must return one onsite operator per current pair")
+        add=_add_q_owned(mesh)
+        for tile in correction:
+            _require_q_owned(tile,mesh,(st0.Q_pad,mu,mu),name='grouped current onsite correction')
+        V=tuple(add(value,tile) for value,tile in zip(V,correction))
     out = []
     for Vp in V:
         Vp = _finish_v(mesh, st0.Q)(Vp)
@@ -1084,7 +1524,8 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, "
                f"{st0.n_Gt} G tiles, q-local, "
                f"{time.perf_counter() - t0:.2f}s (store read "
-               f"{sum(z.store.t_read for z in zetas):.2f}s); no ζ file")
+               f"{sum(z.store.t_read for z in zetas):.2f}s); "
+               f"{'physical ζ family written' if zeta_ios is not None else 'no ζ file'}")
     if jax.process_index() == 0:
         print_fn(receipt)
     return out

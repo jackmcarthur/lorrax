@@ -800,6 +800,7 @@ def centroid_source_map_and_wrap(
     validate: bool = True,
     extend_trs: bool = False,
     required_rows=None,
+    coordinate_kind: str = "fft_indices",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build (α_s, L_s) for the BGW-convention r-action ``r' = inv(mtrx)·r + τ``.
 
@@ -833,7 +834,11 @@ def centroid_source_map_and_wrap(
     ----------
     r_mu_fft_idx
         (n_rmu, 3) int32 — centroid positions as integer FFT-grid
-        indices ``[0, FFTgrid[a])``.
+        indices ``[0, FFTgrid[a])``.  With ``coordinate_kind='fractional'``
+        this argument instead contains finite float64 fractional positions,
+        possibly unwrapped, for atom-local quadrature or augmented samples.
+        Lookup is periodic, while lattice wraps refer to the supplied physical
+        positions. Fractional points are never snapped to an FFT grid.
     sym_matrices
         (n_sym, 3, 3) int — BGW ``mtrx``.  These act on G-vectors
         (column convention); for r-space we use the inverse.  We
@@ -847,6 +852,13 @@ def centroid_source_map_and_wrap(
         commensurate with this grid AND with the τ × fft_grid product
         (otherwise the rounded image won't land on a grid point —
         that's the orbit-closure failure mode).
+        Ignored for fractional coordinates.
+    coordinate_kind
+        ``'fft_indices'`` (incumbent exact grid lookup) or ``'fractional'``
+        (periodic lookup authenticated within 2e-12 in fractional distance).
+        Both use the same source action, required-row checks and TRS tables.
+        A missing or ambiguous fractional image refuses; no nearest-image
+        extrapolation is permitted.
     validate
         If True, asserts every row of the result is a permutation
         ``[0, n_rmu)``.  Set False only for offline diagnostics where
@@ -899,12 +911,17 @@ def centroid_source_map_and_wrap(
         table.  Caller should regenerate the centroid set with
         ``kmeans_cli`` in orbit-aware mode, or pass identity-only sym.
     """
-    fft_grid_np = np.asarray(fft_grid, dtype=np.int64).reshape(3)
-    idx = np.asarray(r_mu_fft_idx, dtype=np.int64)
+    fractional = coordinate_kind == "fractional"
+    if coordinate_kind not in ("fft_indices", "fractional"):
+        raise ValueError("coordinate_kind must be 'fft_indices' or 'fractional'")
+    fft_grid_np = None if fractional else np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    idx = np.asarray(r_mu_fft_idx, dtype=np.float64 if fractional else np.int64)
     if idx.ndim != 2 or idx.shape[1] != 3:
         raise ValueError(
             f"r_mu_fft_idx must be (n_rmu, 3); got {idx.shape}")
     n_rmu = int(idx.shape[0])
+    if fractional and not np.all(np.isfinite(idx)):
+        raise ValueError("fractional point coordinates must be finite")
 
     S = np.asarray(sym_matrices, dtype=np.int64)
     if S.ndim != 3 or S.shape[1:] != (3, 3):
@@ -917,7 +934,7 @@ def centroid_source_map_and_wrap(
 
     # Convert centroid FFT indices to fractional coords for the
     # transformation, then back to FFT indices after wrap.
-    r_frac = idx.astype(np.float64) / fft_grid_np[None, :]    # (n_rmu, 3)
+    r_frac = idx if fractional else idx.astype(np.float64) / fft_grid_np[None, :]
 
     # User-spec source-centroid + lattice-wrap decomposition:
     #   y_μ = mtrx · (x_μ − τ) = x_{α(μ)} + L_μ, with L_μ ∈ ℤ³.
@@ -934,23 +951,44 @@ def centroid_source_map_and_wrap(
     # lattice vector the image crossed, and it drives the umklapp phase
     # ``exp(2πi q·L_μ)`` on ζ.  The reason the snap must precede the floor —
     # and the 14/64 q at rel err ~0.8 that measured it — is written there.
-    img_idx, L_wrap_i = snap_to_grid_and_split_wrap(
-        images_raw, fft_grid_np)
-    L_wrap = L_wrap_i.astype(np.int8)
+    if fractional:
+        from scipy.spatial import cKDTree
+        tol = 2e-12
+        img_idx = images_raw % 1.0
+        lookup = r_frac % 1.0
+        # A tiny negative float can round modulo 1 to exactly 1.0.
+        # Periodic KD lookup requires [0,1); physical wraps still use r_frac.
+        lookup[lookup == 1.0] = 0.0
+        img_idx[img_idx == 1.0] = 0.0
+        tree = cKDTree(lookup, boxsize=1.0)
+        distances, sources = tree.query(img_idx.reshape(-1, 3), k=[1, 2])
+        if np.any(distances[:, 1] <= tol):
+            raise ValueError(
+                "fractional source map is ambiguous: distinct points are "
+                "within its 2e-12 authentication tolerance")
+        good = distances[:, 0] <= tol
+        sym_perm = np.where(good, sources[:, 0], -1).reshape(n_sym, n_rmu)
+        # Use the matched point to split the lattice wrap, avoiding floor
+        # discontinuities at 0 and 1.  The lookup already authenticated the
+        # difference as an integer lattice vector to tol.
+        source_pos = r_frac[np.maximum(sym_perm, 0)]
+        L_wrap = np.where(good.reshape(n_sym, n_rmu, 1),
+                          np.rint(images_raw - source_pos), 0).astype(np.int64)
+    else:
+        img_idx, L_wrap_i = snap_to_grid_and_split_wrap(images_raw, fft_grid_np)
+        L_wrap = L_wrap_i.astype(np.int8)
 
-    # Build a fast lookup from FFT-grid triple → centroid index.
-    radix1 = fft_grid_np[1] * fft_grid_np[2]
-    radix2 = fft_grid_np[2]
-    def _flat(idx_arr):
-        return idx_arr[..., 0] * radix1 + idx_arr[..., 1] * radix2 \
-               + idx_arr[..., 2]
-    cent_flat = _flat(idx)                                       # (n_rmu,)
-    img_flat = _flat(img_idx)                                    # (n_sym, n_rmu)
-
-    flat_to_mu = -np.ones(int(fft_grid_np.prod()), dtype=np.int64)
-    flat_to_mu[cent_flat] = np.arange(n_rmu, dtype=np.int64)
-
-    sym_perm = flat_to_mu[img_flat]                              # (n_sym, n_rmu)
+        # Incumbent exact lookup from FFT-grid triple to centroid index.
+        radix1 = fft_grid_np[1] * fft_grid_np[2]
+        radix2 = fft_grid_np[2]
+        def _flat(idx_arr):
+            return idx_arr[..., 0] * radix1 + idx_arr[..., 1] * radix2 \
+                   + idx_arr[..., 2]
+        cent_flat = _flat(idx)
+        img_flat = _flat(img_idx)
+        flat_to_mu = -np.ones(int(fft_grid_np.prod()), dtype=np.int64)
+        flat_to_mu[cent_flat] = np.arange(n_rmu, dtype=np.int64)
+        sym_perm = flat_to_mu[img_flat]
 
     required = np.arange(n_sym, dtype=np.int32)
     if required_rows is not None:
@@ -971,7 +1009,7 @@ def centroid_source_map_and_wrap(
             raise RuntimeError(
                 f"centroid_source_map_and_wrap: centroid orbit closure "
                 f"failed.  sym {ex_s} maps centroid μ={ex_mu} "
-                f"(at fft_idx {idx[ex_mu].tolist()}) to fft_idx "
+                f"(at {coordinate_kind} {idx[ex_mu].tolist()}) to {coordinate_kind} "
                 f"{ex_idx}, which is NOT in the centroid table.  "
                 f"Total failures: {int(bad.sum())} / {n_sym * n_rmu}.  "
                 f"Regenerate centroids with orbit-aware kmeans or fall "
@@ -1084,15 +1122,9 @@ def permutation_orbit_labels(permutations) -> np.ndarray:
 #: real failures, so no plausible file lands in the gap.
 CLOSURE_TOL_DEFAULT = 1.0e-5
 
-#: Decimals used to build the exact-match lookup key.  Matches the
-#: precision the centroid files are written at; images that hit a key are
-#: scored against that one centroid instead of against all of them.
+#: Decimals used by the diagnostic fractional centroid hash. Actual nearest
+#: distances and source maps always use the full coordinates.
 _CLOSURE_KEY_DECIMALS = 6
-
-#: Image rows scored per pairwise block.  Bounds the temporary at
-#: ``_CLOSURE_BLOCK · n_centroids · 3 · 8`` bytes (~70 MB at 3000
-#: centroids) instead of letting the (n_sym, n_mu, n_mu, 3) tensor exist.
-_CLOSURE_BLOCK = 1024
 
 #: How far off a grid point a coordinate may sit, IN GRID STEPS, before
 #: ``fft_grid`` is called a mismatch rather than rounding.  The committed
@@ -1243,39 +1275,19 @@ def _centroid_hash(frac: np.ndarray, fft_grid: np.ndarray | None) -> str:
 def _min_image_residual(images: np.ndarray, cent: np.ndarray) -> np.ndarray:
     """Per-image distance to the NEAREST centroid, minimum-image, in frac.
 
-    Exact-key fast path first (a closed set hits every key and never pays
-    for a distance matrix), chunked pairwise for the misses only.
+    A rounded coordinate key cannot identify the nearest point: distinct
+    fractional samples can share a bucket, or straddle adjacent buckets.
+    Periodic nearest-neighbor lookup avoids both errors and an N_mu^2 array.
     """
-    n_img = int(images.shape[0])
-    out = np.zeros(n_img, dtype=np.float64)
-    if n_img == 0:
-        return out
-
-    def _key(a):
-        k = np.rint((np.asarray(a) % 1.0) * 10 ** _CLOSURE_KEY_DECIMALS)
-        return k.astype(np.int64) % (10 ** _CLOSURE_KEY_DECIMALS)
-
-    ckey = _key(cent)
-    lut = {}
-    for i in range(int(cent.shape[0])):
-        lut.setdefault(tuple(ckey[i].tolist()), i)
-    ikey = _key(images)
-    hit_to = np.full(n_img, -1, dtype=np.int64)
-    for i in range(n_img):
-        j = lut.get(tuple(ikey[i].tolist()), -1)
-        hit_to[i] = j
-    hit = hit_to >= 0
-    if hit.any():
-        d = images[hit] - cent[hit_to[hit]]
-        d -= np.rint(d)
-        out[hit] = np.sqrt((d * d).sum(axis=-1))
-    miss = np.flatnonzero(~hit)
-    for beg in range(0, miss.size, _CLOSURE_BLOCK):
-        blk = miss[beg:beg + _CLOSURE_BLOCK]
-        d = images[blk][:, None, :] - cent[None, :, :]
-        d -= np.rint(d)
-        out[blk] = np.sqrt((d * d).sum(axis=-1)).min(axis=1)
-    return out
+    if not len(images):
+        return np.empty(0, dtype=np.float64)
+    from scipy.spatial import cKDTree
+    lookup = np.asarray(cent, dtype=np.float64) % 1.0
+    query = np.asarray(images, dtype=np.float64) % 1.0
+    lookup[lookup == 1.0] = 0.0
+    query[query == 1.0] = 0.0
+    distances, _ = cKDTree(lookup, boxsize=1.0).query(query, k=1)
+    return distances
 
 
 def verify_centroid_orbit_closure(
@@ -1619,6 +1631,7 @@ def resolve_qgrid_symmetry(
     tol: float = CLOSURE_TOL_DEFAULT,
     context: str = "",
     required_rows=None,
+    coordinate_kind: str = "fft_indices",
 ) -> QgridSymmetryResolution:
     """Resolve the q-grid reduction ONCE: verdict → mode → tables.
 
@@ -1692,6 +1705,8 @@ def resolve_qgrid_symmetry(
     QgridSymmetryResolution
     """
     idx = np.asarray(r_mu_fft_idx)
+    if coordinate_kind not in ("fft_indices", "fractional"):
+        raise ValueError("coordinate_kind must be fft_indices or fractional")
     if idx.ndim != 2 or idx.shape[1] != 3:
         raise ValueError(
             f"resolve_qgrid_symmetry: r_mu_fft_idx must be (n_rmu, 3); "
@@ -1713,7 +1728,8 @@ def resolve_qgrid_symmetry(
     # without it (the function says so), and the grid question is asked —
     # and answered with a message about the grid — by the table builder
     # below, which is the code that actually needs commensurability.
-    cent_frac = idx.astype(np.float64) / grid[None, :].astype(np.float64)
+    cent_frac = (idx.astype(np.float64) if coordinate_kind == "fractional" else
+                 idx.astype(np.float64) / grid[None, :].astype(np.float64))
     verdict = verify_centroid_orbit_closure(
         cent_frac, S, tnp=tnp, tau=tau, tol=tol)
 
@@ -1742,7 +1758,7 @@ def resolve_qgrid_symmetry(
     # the verdict — see arm 2 in the docstring.
     try:
         sym_perm, L_table = centroid_source_map_and_wrap(
-            idx.astype(np.int32),
+            idx.astype(np.float64 if coordinate_kind == "fractional" else np.int32),
             sym_matrices=S,
             translations=(np.asarray(tnp) if tnp is not None
                           else np.asarray(tau) * (2.0 * np.pi)),
@@ -1750,6 +1766,7 @@ def resolve_qgrid_symmetry(
             validate=True,
             extend_trs=extend_trs,
             required_rows=required_rows,
+            coordinate_kind=coordinate_kind,
         )
     except RuntimeError as exc:
         first = (str(exc.args[0]).splitlines()[0] if exc.args else str(exc))

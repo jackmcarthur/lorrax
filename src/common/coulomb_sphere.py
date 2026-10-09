@@ -1,7 +1,7 @@
 """Bare-Coulomb G-sphere in the WFN.h5 PADDED layout.
 
 The radius condition ``|q + G|² ≤ bare_coulomb_cutoff`` moved to the
-``vcoul`` service on 2026-08-07 (:func:`vcoul.bare_coulomb_sphere_mask`).
+``vcoul`` service on 2026-08-07 (:func:`vcoul.bare_coulomb_sphere_rows`).
 What stays here is the LAYOUT, and the split is the point:
 
 * the PREDICATE — which G are in q's sphere — is Coulomb arithmetic
@@ -43,7 +43,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-from vcoul import bare_coulomb_sphere_mask                  # noqa: E402
+from vcoul import bare_coulomb_sphere_rows                  # noqa: E402
 
 
 def compute_per_q_bare_coulomb_components(
@@ -84,7 +84,7 @@ def compute_per_q_bare_coulomb_components(
         NEVER READ, and kept anyway: this parameter has no effect on the
         returned tables and never did (the docstring above describes a
         0-D contract the body does not implement).  The service-side
-        predicate :func:`vcoul.bare_coulomb_sphere_mask` does NOT have
+        predicate :func:`vcoul.bare_coulomb_sphere_rows` does NOT have
         it — a parameter that changes nothing forces every caller to
         decide what to pass.  It survives HERE because two in-tree call
         sites pass it by keyword and this is a compatibility surface,
@@ -112,37 +112,18 @@ def compute_per_q_bare_coulomb_components(
         ``max_q ngk[q]``.
     ``vcoul_cutoff_ry`` : float
         Echoed cutoff (for the writer to stash in the on-disk header).
+    ``sphere_convention`` : str or None
+        Non-legacy provenance marker only when physical Nyquist labels change.
     """
     del sys_dim                       # never read; see the parameter note
     nx, ny, nz = (int(s) for s in fft_grid)
 
-    # THE PREDICATE, from the service.  ``mask[q, r]`` is
-    # ``|q + G_r|² ≤ vcoul_cutoff_ry``; ``G_int[r]`` is the Miller index at
-    # flat-FFT index ``r`` (fftfreq order, C-order meshgrid).
-    mask, G_int = bare_coulomb_sphere_mask(
+    # The service owns the radius predicate and physical Nyquist label at
+    # each q. Both +/-N/2 sample the same FFT slot; sparse physical rows
+    # retain the correct label without a q-by-FFT-by-three carrier.
+    sphere = bare_coulomb_sphere_rows(
         (nx, ny, nz), bvec, q_irr_frac, vcoul_cutoff_ry)
-    n_q_ibz = int(mask.shape[0])
-
-    # G=(0,0,0) is flat-index 0 and is always inside: |q+0|² = |q|² ≤ |q_max|²
-    # which is ≤ vcoul_cutoff_ry for any sane cutoff (≥ ecutwfc ≫ |q_max|²).
-    if not bool(np.all(mask[:, 0])):
-        bad = np.nonzero(~mask[:, 0])[0]
-        raise RuntimeError(
-            f"compute_per_q_bare_coulomb_components: G=(0,0,0) not in "
-            f"the per-q sphere at q-rows {bad.tolist()}.  Check "
-            f"vcoul_cutoff_ry ({vcoul_cutoff_ry} Ry) vs |q_max|².")
-
-    # Per-q sphere sizes; ngkmax = max for the padded array dim.
-    ngk_per_q = mask.sum(axis=1).astype(np.int32)               # (n_q,)
-    ngkmax = int(ngk_per_q.max())
-
-    # Per-q G-lists, ascending in flat-FFT index.  Ascending order is why
-    # ``sphere_idx_padded[q, 0] == 0`` (G=(0,0,0) is flat index 0 and is
-    # always inside, checked above) — the only ordering property any
-    # downstream consumer relies on.  ``np.nonzero`` already returns
-    # ascending indices, so no sort is needed.
-    idx_per_q = [np.nonzero(mask[q])[0].astype(np.int32)
-                 for q in range(n_q_ibz)]
+    ngkmax = int(sphere["ngkmax"])
 
     # THE shared padded-layout step — identical call to the one
     # ``WfnLoader.gvecs`` makes on the ragged on-disk ψ G-lists.  It fills
@@ -150,7 +131,7 @@ def compute_per_q_bare_coulomb_components(
     # reaches the box's Nyquist corner (which would make "sentinel row"
     # stop meaning "pad row" for every consumer of this table).
     gvecs_padded, ngk_per_q = pad_gvecs_to_sentinel(
-        [G_int[i] for i in idx_per_q], (nx, ny, nz), ngkmax=ngkmax)
+        sphere["gvecs_per_q"], (nx, ny, nz), ngkmax=ngkmax)
 
     # On-disk components layout is (n_q, 3, ngkmax) — WFN.h5's
     # ``(3, ng)`` with a leading q axis.
@@ -175,6 +156,7 @@ def compute_per_q_bare_coulomb_components(
         "ngk_per_q": ngk_per_q,
         "ngkmax": ngkmax,
         "vcoul_cutoff_ry": float(vcoul_cutoff_ry),
+        "sphere_convention": sphere["sphere_convention"],
     }
 
 

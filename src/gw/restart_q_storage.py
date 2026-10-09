@@ -407,7 +407,7 @@ def assert_capture_matches(capture, resolution, *, context: str) -> None:
 
 def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
                                       fft_grid, print_fn=print,
-                                      context="V_q / W0 restart tensors"):
+                                      context="V_q / W0 restart tensors", coordinate_kind="fft_indices"):
     """The driver's one call: resolve the deck key against THIS run, announce.
 
     Rank-invariant by construction — a deck key and a centroid file every
@@ -432,7 +432,7 @@ def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
         from .qgrid_symmetry import resolve_qgrid_symmetry_tables
         res = resolve_qgrid_symmetry_tables(
             sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
-            context=context)
+            context=context, coordinate_kind=coordinate_kind)
     decision = resolve_restart_q_storage(requested, res, context=context)
     # ANNOUNCED, ONCE, ON RANK 0 — same discipline as the suppress key.
     # A run whose restart file changed SHAPE and said nothing is a run

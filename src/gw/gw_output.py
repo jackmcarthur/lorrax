@@ -597,7 +597,9 @@ def persist_w0_and_head(
         # it unconditionally would make a caller that asked for nothing
         # new fail on an attribute it never needed.
             fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
-            context="W0 restart tensor")
+            context="W0 restart tensor",
+            coordinate_kind=getattr(
+                getattr(meta, "mu_basis", None), "coordinate_kind", "fft_indices"))
     with _tmg.section("persist_w0.write_w0"):
         # W is held on its q parents (screening's wedge, the shared-pole
         # evaluation at V's parents, the packed photon's parents).  On the

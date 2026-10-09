@@ -183,6 +183,7 @@ __all__ = [
     "split_spin_centroid",
     "bands_to_contraction_slabs",
     "reduce_scatter_to_band_block",
+    "make_diagonal_sample_projector",
 ]
 
 
@@ -251,6 +252,118 @@ def reduce_scatter_to_band_block(part, *, px: int, py: int,
     r = jnp.moveaxis(part.reshape(shape), (ra, ca + 1), (0, 1))
     r = r.reshape(px * py, *r.shape[2:])
     return jax.lax.psum_scatter(r, axes, scatter_dimension=0, tiled=False)
+
+
+def make_diagonal_sample_projector(mesh_xy: Mesh, face_shape, *,
+                                   band_mask=None, sample_mask=None,
+                                   axes=("x", "y")):
+    """Project a diagonal sample-space functional without a sample-pair array.
+
+    Computes ``J[e,k,m,n] = sum_(s,mu) conj(psi[k,m,s,mu]) *
+    values[e,mu] * psi[k,n,s,mu]``. The functional already carries its
+    physical units; this projection applies neither a quadrature factor nor
+    a conjugation to ``values``. Its caller owns the sample order, source
+    frame, occupations, and any subsequent one-body symmetry broadcast.
+
+    Parameters
+    ----------
+    mesh_xy : Mesh
+        Two-dimensional mesh with the named band and sample axes.
+    face_shape : tuple of int
+        Global ``(nk, nb, ns, nmu)`` endpoint shape. Bands divide ``p_x``;
+        samples divide ``p_x * p_y``.
+    band_mask, sample_mask : ndarray of bool, optional
+        Exact active masks in the supplied global band and sample orders.
+        Inactive endpoint and functional entries are set to zero before
+        arithmetic, so poisoned carrier slots are inert.
+    axes : tuple of str
+        Band axis and sample axis, respectively; default ``('x', 'y')``.
+
+    Returns
+    -------
+    callable
+        Takes complex128 endpoints at ``P(None,'x',None,'y')`` and float64
+        or complex128 ``values`` of shape ``(ne, nmu)`` at ``P(None,'y')``.
+        Returns ``(ne, nk, nb, nb)`` at ``P(None,None,'x','y')``.
+
+    Notes
+    -----
+    The existing slab primitive redistributes bands over ``x`` into sample
+    slabs. One local dot and one band-block reduce-scatter then finish each
+    k row. Channels share both collectives. A scan keeps the replicated
+    partial at ``ne * nb**2`` elements per rank, independent of ``nk``;
+    endpoints remain distributed throughout. No ``nmu**2`` operator or
+    band-pair density cloud is formed.
+    """
+    from common.shard_map import shard_map
+
+    axes = tuple(axes)
+    if len(axes) != 2 or tuple(mesh_xy.axis_names) != axes:
+        raise ValueError("diagonal sample projection requires its two-axis mesh")
+    shape = tuple(int(n) for n in face_shape)
+    if len(shape) != 4 or any(n < 1 for n in shape):
+        raise ValueError("diagonal sample projection requires (nk,nb,ns,nmu)")
+    nk, nb, ns, nmu = shape
+    ax_x, ax_y = axes
+    px, py = (int(mesh_xy.shape[a]) for a in axes)
+    if nb % px or nmu % (px * py):
+        raise ValueError("diagonal sample projection requires bands divisible by "
+                         "p_x and samples divisible by p_x*p_y")
+
+    def active_mask(value, size, name):
+        if value is None:
+            return np.ones(size, dtype=bool)
+        value = np.asarray(value)
+        if value.dtype != np.dtype(bool) or value.shape != (size,):
+            raise ValueError(f"diagonal sample projection {name} must be bool({size},)")
+        return value.copy()
+
+    bands = jnp.asarray(active_mask(band_mask, nb, "band mask"))
+    samples = jnp.asarray(active_mask(sample_mask, nmu, "sample mask"))
+    face_spec, values_spec = P(None, ax_x, None, ax_y), P(None, ax_y)
+    out_spec = P(None, None, ax_x, ax_y)
+    nby, muy, muxy = nb // px, nmu // py, nmu // (px * py)
+    warm_mesh_cliques(mesh_xy)
+
+    def body(psi, values):
+        ix, iy = jax.lax.axis_index(ax_x), jax.lax.axis_index(ax_y)
+        bm = jax.lax.dynamic_slice_in_dim(bands, ix * nby, nby)
+        sm = jax.lax.dynamic_slice_in_dim(samples, iy * muy, muy)
+        psi = jnp.where(bm[None, :, None, None] & sm[None, None, None, :], psi, 0)
+        values = jnp.where(sm[None, :], values, 0)
+        # After x's all-to-all, each y slab is subdivided by x. Slice the
+        # same y-local functional in that order rather than redistributing it.
+        fv = jax.lax.dynamic_slice_in_dim(values, ix * muxy, muxy, axis=1)
+
+        def one_k(carry, face):
+            slab = bands_to_contraction_slabs(
+                face, band_axis=0, slab_axis=2, carrier=muy, axes=(ax_x,))
+            part = jnp.einsum("msu,eu,nsu->emn", slab.conj(), fv, slab,
+                              optimize=True)
+            result = reduce_scatter_to_band_block(part, px=px, py=py, axes=axes)
+            return carry, result
+
+        _, result = jax.lax.scan(one_k, None, psi, unroll=1)
+        return jnp.swapaxes(result, 0, 1)
+
+    kernel = jax.jit(shard_map(body, mesh=mesh_xy,
+                             in_specs=(face_spec, values_spec),
+                             out_specs=out_spec, check_vma=False))
+
+    def project(psi, values):
+        if (tuple(psi.shape) != shape or np.dtype(psi.dtype) != np.dtype(np.complex128)
+                or values.ndim != 2 or values.shape[0] < 1 or values.shape[1] != nmu
+                or np.dtype(values.dtype) not in (np.dtype(np.float64), np.dtype(np.complex128))):
+            raise ValueError("diagonal sample projection operands differ from their endpoint/functional shape or dtype")
+        for value, spec, name in ((psi, face_spec, "endpoints"),
+                                  (values, values_spec, "functional")):
+            if (not isinstance(value, jax.Array)
+                    or not value.sharding.is_equivalent_to(
+                        NamedSharding(mesh_xy, spec), ndim=value.ndim)):
+                raise ValueError(f"diagonal sample projection {name} require their declared mesh layout")
+        return kernel(psi, values)
+
+    return project
 
 
 # ---------------------------------------------------------------------------

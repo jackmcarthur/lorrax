@@ -19,25 +19,47 @@ import numpy as np
 #: ``gw.gw_init._centroid_table_md5`` contract: int64, C order, bare MD5
 #: hexadecimal digest.
 CENTROID_TABLE_FINGERPRINT_SCHEME = "int64-c-order-md5-v1"
+FRACTIONAL_CENTROID_TABLE_FINGERPRINT_SCHEME = "fractional-f64le-c-order-md5-v1"
+_FRACTIONAL_CENTROID_DOMAIN = (
+    b"LORRAX centroid coordinates\0fractional-f64le-c-order-md5-v1\0")
 
 
-def centroid_table_md5(centroid_fft_idx) -> str:
+def centroid_table_fingerprint_scheme(coordinate_kind="fft_indices") -> str:
+    """Return the explicit scheme for one consumed coordinate type."""
+    if coordinate_kind == "fft_indices":
+        return CENTROID_TABLE_FINGERPRINT_SCHEME
+    if coordinate_kind == "fractional":
+        return FRACTIONAL_CENTROID_TABLE_FINGERPRINT_SCHEME
+    raise ValueError(
+        "centroid coordinate_kind must be 'fft_indices' or 'fractional'; "
+        f"got {coordinate_kind!r}")
+
+
+def centroid_table_md5(centroid_fft_idx, *, coordinate_kind="fft_indices") -> str:
     """Return the canonical restart centroid-table content digest.
 
-    FFT-grid indices, rather than fractional-coordinate text, define the
-    sampled basis: distinct text representations that snap to the same grid
-    points therefore have one identity.
+    Legacy FFT indices retain their historical bare int64 MD5.  Explicit
+    fractional positions use little-endian float64 bytes and a distinct
+    domain, so sub-grid displacements and coordinate types cannot collide
+    through an integer cast.  The ordered consumed positions define identity.
     """
     try:
         import jax
         values = jax.device_get(centroid_fft_idx)
     except ImportError:  # pragma: no cover - h5py-only inspection installs
         values = centroid_fft_idx
-    table = np.ascontiguousarray(np.asarray(values, dtype=np.int64))
+    centroid_table_fingerprint_scheme(coordinate_kind)
+    dtype = "<f8" if coordinate_kind == "fractional" else np.int64
+    table = np.ascontiguousarray(np.asarray(values, dtype=dtype))
     if table.ndim != 2 or table.shape[1] != 3:
         raise ValueError(
-            "centroid_table_md5 requires FFT-grid indices with shape "
+            "centroid_table_md5 requires centroid coordinates with shape "
             f"(n_rmu, 3); got {table.shape}")
+    if coordinate_kind == "fractional":
+        if not np.isfinite(table).all():
+            raise ValueError("fractional centroid coordinates must be finite")
+        return hashlib.md5(
+            _FRACTIONAL_CENTROID_DOMAIN + table.tobytes()).hexdigest()
     return hashlib.md5(table.tobytes()).hexdigest()
 
 
@@ -67,6 +89,7 @@ class WavefunctionBasisReceipt:
     source_identity: str
     nspinor_sampled: int
     bispinor_lift_provenance: str | None
+    coordinate_kind: str = "fft_indices"
 
     def __post_init__(self) -> None:
         from common.bispinor_init import LIFT_PROVENANCE
@@ -99,11 +122,13 @@ class WavefunctionBasisReceipt:
             raise ValueError(
                 "WavefunctionBasisReceipt.fft_grid must contain three "
                 f"positive integers; got {self.fft_grid!r}")
-        if (str(self.centroid_fingerprint_scheme)
-                != CENTROID_TABLE_FINGERPRINT_SCHEME):
+        coordinate_kind = str(self.coordinate_kind)
+        expected_scheme = centroid_table_fingerprint_scheme(coordinate_kind)
+        if str(self.centroid_fingerprint_scheme) != expected_scheme:
             raise ValueError(
                 "WavefunctionBasisReceipt requires the canonical centroid "
-                f"fingerprint scheme {CENTROID_TABLE_FINGERPRINT_SCHEME!r}; "
+                f"fingerprint scheme {expected_scheme!r} for "
+                f"coordinate_kind={coordinate_kind!r}; "
                 f"got {self.centroid_fingerprint_scheme!r}")
         centroid_md5 = str(self.centroid_table_md5)
         if (len(centroid_md5) != 32
@@ -151,6 +176,7 @@ class WavefunctionBasisReceipt:
         object.__setattr__(self, "source_identity", str(self.source_identity))
         object.__setattr__(self, "nspinor_sampled", nspinor)
         object.__setattr__(self, "bispinor_lift_provenance", lift)
+        object.__setattr__(self, "coordinate_kind", coordinate_kind)
 
     @classmethod
     def from_source(
@@ -165,6 +191,7 @@ class WavefunctionBasisReceipt:
         centroid_fft_idx,
         n_rmu_logical: int,
         n_rmu_padded: int,
+        coordinate_kind: str = "fft_indices",
     ) -> "WavefunctionBasisReceipt":
         """Build the receipt from the canonical WFN/transform/hash owners."""
         return cls._from_source(
@@ -172,7 +199,8 @@ class WavefunctionBasisReceipt:
             role=role, bispinor=bispinor, band_interval=band_interval,
             bispinor_lift=bispinor_lift,
             fft_grid=fft_grid, centroid_fft_idx=centroid_fft_idx,
-            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)
+            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded,
+            coordinate_kind=coordinate_kind)
 
     @classmethod
     def from_bound_source(
@@ -188,6 +216,7 @@ class WavefunctionBasisReceipt:
         centroid_fft_idx,
         n_rmu_logical: int,
         n_rmu_padded: int,
+        coordinate_kind: str = "fft_indices",
     ) -> "WavefunctionBasisReceipt":
         """Build from a canonical digest bound to this exact loaded WFN."""
         return cls._from_source(
@@ -195,7 +224,8 @@ class WavefunctionBasisReceipt:
             role=role, bispinor=bispinor, band_interval=band_interval,
             bispinor_lift=bispinor_lift,
             fft_grid=fft_grid, centroid_fft_idx=centroid_fft_idx,
-            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)
+            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded,
+            coordinate_kind=coordinate_kind)
 
     @classmethod
     def _from_source(
@@ -211,6 +241,7 @@ class WavefunctionBasisReceipt:
         centroid_fft_idx,
         n_rmu_logical: int,
         n_rmu_padded: int,
+        coordinate_kind: str = "fft_indices",
     ) -> "WavefunctionBasisReceipt":
         """Shared receipt construction after canonical source identity."""
         from common.bispinor_init import kinetic_balance_lift_provenance
@@ -239,8 +270,10 @@ class WavefunctionBasisReceipt:
                 f"extent; WFN.nspinor={source_nspinor}")
         grid = tuple(int(v) for v in np.asarray(fft_grid).reshape(3))
         import jax
+        scheme = centroid_table_fingerprint_scheme(coordinate_kind)
         centroids = np.ascontiguousarray(np.asarray(
-            jax.device_get(centroid_fft_idx), dtype=np.int64))
+            jax.device_get(centroid_fft_idx),
+            dtype=np.float64 if coordinate_kind == "fractional" else np.int64))
         if centroids.ndim != 2 or centroids.shape[1] != 3:
             raise ValueError(
                 "WavefunctionBasisReceipt centroid table must have shape "
@@ -251,7 +284,11 @@ class WavefunctionBasisReceipt:
                 "WavefunctionBasisReceipt logical centroid extent differs "
                 f"from the exact table: {logical} vs {centroids.shape[0]}")
         grid_array = np.asarray(grid, dtype=np.int64)
-        if (np.any(centroids < 0)
+        if coordinate_kind == "fractional":
+            if not np.isfinite(centroids).all():
+                raise ValueError(
+                    "WavefunctionBasisReceipt fractional centroids must be finite")
+        elif (np.any(centroids < 0)
                 or np.any(centroids >= grid_array[None, :])):
             raise ValueError(
                 "WavefunctionBasisReceipt centroid indices must lie inside "
@@ -266,8 +303,9 @@ class WavefunctionBasisReceipt:
             wfn_fingerprint=fingerprint,
             band_interval=(start, stop),
             fft_grid=grid,
-            centroid_fingerprint_scheme=CENTROID_TABLE_FINGERPRINT_SCHEME,
-            centroid_table_md5=centroid_table_md5(centroids),
+            centroid_fingerprint_scheme=scheme,
+            centroid_table_md5=centroid_table_md5(
+                centroids, coordinate_kind=coordinate_kind),
             n_rmu_logical=logical,
             n_rmu_padded=int(n_rmu_padded),
             source_identity=FULL_BLOCH_TRANSFORM_SCHEME,
@@ -275,6 +313,7 @@ class WavefunctionBasisReceipt:
             bispinor_lift_provenance=(
                 kinetic_balance_lift_provenance(bispinor_lift)
                 if use_bispinor else None),
+            coordinate_kind=coordinate_kind,
         )
 
     def assert_matches_source(
@@ -290,6 +329,7 @@ class WavefunctionBasisReceipt:
         n_rmu_logical: int,
         n_rmu_padded: int,
         where: str,
+        coordinate_kind: str = "fft_indices",
     ) -> None:
         """Refuse unless current source inputs reproduce this receipt."""
         expected = type(self).from_source(
@@ -297,7 +337,8 @@ class WavefunctionBasisReceipt:
             bispinor_lift=bispinor_lift,
             band_interval=band_interval, fft_grid=fft_grid,
             centroid_fft_idx=centroid_fft_idx,
-            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded)
+            n_rmu_logical=n_rmu_logical, n_rmu_padded=n_rmu_padded,
+            coordinate_kind=coordinate_kind)
         differing = [
             item.name for item in fields(self)
             if getattr(self, item.name) != getattr(expected, item.name)]
@@ -380,6 +421,8 @@ class WavefunctionBasisReceipt:
 
 __all__ = [
     "CENTROID_TABLE_FINGERPRINT_SCHEME",
+    "FRACTIONAL_CENTROID_TABLE_FINGERPRINT_SCHEME",
     "WavefunctionBasisReceipt",
     "centroid_table_md5",
+    "centroid_table_fingerprint_scheme",
 ]

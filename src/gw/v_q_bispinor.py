@@ -639,13 +639,15 @@ class BispinorFitV:
         self.n_rmu_T: int | None = None
 
 
-def _bispinor_ibz(sym, centroid_idx, kgrid, fft_grid, context):
+def _bispinor_ibz(sym, centroid_idx, kgrid, fft_grid, context, *,
+                  mu_basis=None, coordinate_kind=None):
     from .v_q_g_flat import _resolve_ibz_q_list
     if sym is None:
         raise ValueError("Bispinor V requires q-IBZ storage; rerun with symmetry enabled.")
     use_ibz = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_idx, kgrid=kgrid, fft_grid=fft_grid,
-        context=context, return_resolution=True)[6]
+        context=context, return_resolution=True,
+        mu_basis=mu_basis, coordinate_kind=coordinate_kind)[6]
     if not use_ibz:
         raise ValueError("Bispinor V requires two orbit-closed centroid families.")
     return use_ibz
@@ -664,7 +666,7 @@ def compute_bispinor_cc_tile(
     charge fit's in-memory ζ (``zeta_C``: a ``ZetaG``), parked on host."""
     from .v_q_g_flat import _compute_V_q_g_flat_tiles, v_head_fn_in_V
     use_ibz_C = _bispinor_ibz(sym, centroid_C_idx, kgrid, fft_grid,
-                              "bispinor charge V")
+                              "bispinor charge V", mu_basis=zeta_C.mu_basis)
     spec = _bispinor_tile_spec(
         0, 0, zeta_C=zeta_C, zeta_T=(None, None, None),
         use_ibz_C=use_ibz_C, use_ibz_T=False, bvec=bvec,
@@ -695,13 +697,14 @@ def compute_bispinor_tt_tiles(
     current_basis_rows=None,
     mc_average_vcoul_body: bool,
     print_fn=print, verbose: bool = True,
+    zeta_ios=None,
 ) -> ParkedVTiles:
     """The six TT tiles of :func:`compute_V_q_bispinor_g_flat_to_h5`, from the
     current fit's three in-memory ζ (``ZetaG``) in ONE pass over the G tiles
     (``isdf.zeta_mubatch.contract_v_group``), parked on host."""
     from .v_q_g_flat import _compute_V_q_g_flat_tiles, v_head_fn_in_V
     use_ibz_T = _bispinor_ibz(sym, centroid_T_idx, kgrid, fft_grid,
-                              "bispinor current V")
+                              "bispinor current V", mu_basis=zeta_T[0].mu_basis)
     tt_head_tensor = (_tt_head_tensor(
         bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
         if tt_head_correction else None)
@@ -721,7 +724,7 @@ def compute_bispinor_tt_tiles(
         specs, kgrid=kgrid, fft_grid=fft_grid, mesh_xy=mesh_xy,
         g_chunk=g_chunk, sym=sym, centroid_indices=centroid_T_idx,
         qgrid_policy=_bispinor_qgrid_policy(sym=sym, kgrid=kgrid),
-        verbose=verbose)
+        verbose=verbose, zeta_ios=zeta_ios)
     results = _cartesian_tt_results(results, current_basis_rows)
     return ParkedVTiles(results, what="the six TT tiles", print_fn=print_fn)
 
@@ -749,6 +752,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
     sym=None,
     centroid_C_idx: np.ndarray | None = None,
     centroid_T_idx: np.ndarray | None = None,
+    coordinate_kind_C: str | None = None,
+    coordinate_kind_T: str | None = None,
     use_ibz: bool = False,
     # Bispinor TT (transverse-transverse) q=Γ, G=0 mini-BZ head correction
     # (default off — every existing deck's TT tiles are byte-identical).
@@ -798,12 +803,22 @@ def compute_V_q_bispinor_g_flat_to_h5(
 
     if not use_ibz or sym is None:
         raise ValueError("Bispinor V requires q-IBZ storage; rerun with symmetry enabled.")
+    for loader, explicit_kind in ((zeta_C_loader, coordinate_kind_C),
+                                  *((ld, coordinate_kind_T) for ld in zeta_T_loaders)):
+        if (loader is not None and explicit_kind is not None
+                and explicit_kind != getattr(loader, 'coordinate_kind', 'fft_indices')):
+            raise ValueError("Bispinor V centroid coordinate kind disagrees with its zeta header")
     _ibz_C = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_C_idx, kgrid=kgrid, fft_grid=fft_grid,
-        context="bispinor charge V", return_resolution=True)
+        context="bispinor charge V", return_resolution=True,
+        coordinate_kind=(coordinate_kind_C if coordinate_kind_C is not None else
+                         getattr(zeta_C_loader, 'coordinate_kind', 'fft_indices')))
     _ibz_T = _resolve_ibz_q_list(
         sym=sym, centroid_indices=centroid_T_idx, kgrid=kgrid, fft_grid=fft_grid,
-        context="bispinor current V", return_resolution=True)
+        context="bispinor current V", return_resolution=True,
+        coordinate_kind=(coordinate_kind_T if coordinate_kind_T is not None else
+                         getattr(zeta_T_loaders[0] if zeta_T_loaders else None,
+                                 'coordinate_kind', 'fft_indices')))
     _use_ibz_C, _use_ibz_T = _ibz_C[6], _ibz_T[6]
     if not (_use_ibz_C and _use_ibz_T):
         raise ValueError("Bispinor V requires two orbit-closed centroid families.")

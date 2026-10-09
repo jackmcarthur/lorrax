@@ -83,7 +83,8 @@ def build_static_w_from_restart(filename, input_file, mesh_xy, *, print_fn=print
     if not input_file:
         raise ValueError("GATE bse_static_w_inputs: missing input_file; supply the WFN/centroid deck")
     config = LorraxConfig.from_input_file(input_file, print_fn=print_fn)
-    if config.bispinor:
+    from .gw_config import uses_transverse_interaction
+    if uses_transverse_interaction(config):
         raise ValueError(
             "GATE bse_static_w_bispinor_sectors: missing screened W0 on a "
             "four-current restart; the BSE direct kernel has no packed "

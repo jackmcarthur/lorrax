@@ -299,7 +299,20 @@ The planner decides in this order:
    ([memory model](memory-model.md#the-compiled-check)).
 
 The fit then packs whole orbits into bins of at most the planned b/P with
-the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). The
+the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). Packing
+previews call `orbit_mu_batches(..., build_tables=False)`, using the exact
+same LPT placement, active rows and padding as the default materialized
+packing. The search computes the canonical unfold-orbit partition once and
+does not build permutation or lattice-wrap tables for discarded candidates.
+Only the selected executable batch materializes those transport tables.
+An `OwnerOrbitBatches` preview has no transport, and `transport(beta)`
+refuses its use by a GPU kernel. The default helper still returns the same
+μ, permutation and wrap arrays; previews do not change their byte layout.
+The planner's analytic and compiled/AOT checks remain in force on the
+materialized winner. Claim3375 records a P4 larger-source direct-Z bitwise
+oracle and complete216-k matrix parity for the actual augmented AgI run;
+its numerical accuracy and whole-stage time gates are recorded separately.
+The
 planner's floor keeps every bin within the plan (CrI3 24×24 P36: 12-member
 orbits make the batch 432, which the plan prices, not 36).
 `route_g_plane_chunk` prices the packed batch: the source rows (X_B, pair

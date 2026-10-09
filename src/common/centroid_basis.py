@@ -46,13 +46,19 @@ class PackedCentroidBasis:
     layout: SquareGroupedShardLayout
     canonical_indices: np.ndarray
     n_canonical: int
+    coordinate_kind: str = "fft_indices"
 
     @classmethod
     def build(cls, centroid_indices, sym, fft_grid, mesh_xy: Mesh, *,
-              identity: bool = False) -> "PackedCentroidBasis":
+              identity: bool = False, coordinate_kind: str = "fft_indices") -> "PackedCentroidBasis":
         """Pack orbits of available centroid actions without changing the physical group."""
-        idx = np.array(jax.device_get(centroid_indices), dtype=np.int32,
+        if coordinate_kind not in ("fft_indices", "fractional"):
+            raise ValueError("centroid coordinate_kind must be fft_indices or fractional")
+        idx = np.array(jax.device_get(centroid_indices),
+                       dtype=(np.float64 if coordinate_kind == "fractional" else np.int32),
                        order="C", copy=True)
+        if idx.ndim != 2 or idx.shape[1] != 3 or not np.isfinite(idx).all():
+            raise ValueError("centroid coordinates must be a finite (n,3) table")
         idx.setflags(write=False)
         shape = tuple(int(mesh_xy.shape[a]) for a in ('x', 'y'))
         groups = None
@@ -64,7 +70,8 @@ class PackedCentroidBasis:
                 perm, _ = centroid_source_map_and_wrap(
                     idx, np.asarray(sym.sym_matrices)[:n_spatial],
                     np.asarray(sym.translations)[:n_spatial],
-                    np.asarray(fft_grid, dtype=np.int32), extend_trs=True, validate=False)
+                    np.asarray(fft_grid, dtype=np.int32), extend_trs=True, validate=False,
+                    coordinate_kind=coordinate_kind)
                 available = np.all(np.sort(perm, axis=1) == np.arange(idx.shape[0]), axis=1)
                 if np.any(available):
                     groups = permutation_orbit_labels(perm[available])
@@ -80,7 +87,7 @@ class PackedCentroidBasis:
             if groups is None
             else build_square_grouped_shard_layout(groups, shape))
         return cls(mesh_xy=mesh_xy, layout=layout, canonical_indices=idx,
-                   n_canonical=n_canonical)
+                   n_canonical=n_canonical, coordinate_kind=coordinate_kind)
 
     # ---- extents and tables ------------------------------------------------
     @property
@@ -277,13 +284,22 @@ class PackedCentroidBasis:
         return self._axis_kernel(axis, spec, True)(arr)
 
     def pack_operator(self, op, *, spec=None):
-        """Both centroid axes (the last two) of a ``(..., mu, nu)`` operator."""
+        """Canonical suffix-padded operator → packed on both trailing axes."""
+        if op.ndim < 2 or tuple(op.shape[-2:]) != (self.n_canonical,) * 2:
+            raise ValueError(
+                f"centroid basis: pack_operator expects the canonical carrier "
+                f"{self.n_canonical} on both trailing axes; got {op.shape}.")
         if self.is_identity:
             return op
         spec = self._spec(op, spec)
         return self._operator_kernel(spec, False)(op)
 
     def unpack_operator(self, op, *, spec=None):
+        """Packed operator → canonical suffix-padded on both trailing axes."""
+        if op.ndim < 2 or tuple(op.shape[-2:]) != (self.n_packed,) * 2:
+            raise ValueError(
+                f"centroid basis: unpack_operator expects the packed carrier "
+                f"{self.n_packed} on both trailing axes; got {op.shape}.")
         if self.is_identity:
             return op
         spec = self._spec(op, spec)

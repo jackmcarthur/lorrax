@@ -29,8 +29,11 @@ from runtime.padding import (authenticate_axis, authenticate_padded_axis,
     pad_axis)
 from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSION,
     BAND_WINDOW_CARRIER_DATASET, CHARGE_ZETA_IDENTITY_DATASET,
+    CHARGE_ZETA_PROVENANCE_DATASET, CHARGE_ZETA_PROVENANCE_MAX_BYTES,
     COULOMB_POLICY_DATASET, DOWNFOLD_PROVENANCE_GROUP,
-    _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
+    _decode_charge_zeta_identity, _encode_charge_zeta_provenance,
+    _loaded_band_axis, _validate_shape_receipt,
+    HARTREE_PARENT_DATASET, _read_hartree_provenance, _hartree_band_axis,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
 
@@ -42,6 +45,52 @@ if TYPE_CHECKING:
 _REGENERATE = (
     "this bundle predates the raw-parent format; "
     "regenerate it with gwjax at main >= 891047f4")
+
+
+def read_resident_hartree_metadata(filename, *, expected=None, required=False):
+    """Authenticate optional native J with bounded host reads.
+
+    Returns None for an absent optional member, otherwise the closed persisted
+    provenance. Shape, FILE rows, completion and logical payload checksum are
+    admitted before unrelated restart arrays are loaded. GW owns the requested
+    source/operator comparison through the supplied named expected fields.
+    """
+    from .commit_state import assert_committed
+    with h5py.File(filename, 'r') as stream:
+        assert_committed(stream)
+        return _read_hartree_provenance(
+            stream, expected=expected, required=required)
+
+
+def read_resident_hartree_from_h5(filename, mesh_xy, *, expected=None, required=False):
+    """Read authenticated native J with two band axes on P(None,x,y).
+
+    The logical receiving range determines its own padding, independently of
+    the parent wavefunction and centroid extents. The returned plain record
+    contains parent_kij_ry and the immutable persisted provenance.
+    """
+    from .slab_io import SlabIO
+    record = read_resident_hartree_metadata(
+        filename, expected=expected, required=required)
+    if record is None:
+        return None
+    with SlabIO(filename, mode='r', mesh=mesh_xy) as io:
+        return _read_resident_hartree_slab(io, record, mesh_xy)
+
+
+def _read_resident_hartree_slab(io, record, mesh_xy):
+    """The single band-tile read shared by dedicated and whole-bundle readers."""
+    nb = record['band_range'][1] - record['band_range'][0]
+    axis = _hartree_band_axis(nb, mesh_xy)
+    shape = (len(record['parent_full_rows']), axis.carrier, axis.carrier)
+    array = io.read_slab(
+        HARTREE_PARENT_DATASET, shape=shape, dtype=np.complex128,
+        offset=(0, 0, 0), mesh=mesh_xy, partition_spec=P(None, 'x', 'y'))
+    jax.block_until_ready(array)
+    for band_axis in (1, 2):
+        authenticate_axis(array, axis, axis=band_axis,
+                          where='resident Hartree restart')
+    return dict(parent_kij_ry=array, provenance=record)
 
 
 def _require_current(f):
@@ -332,6 +381,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *,
     # ---- pass 1: geometry + the small replicated arrays, serial h5py ----
     with h5py.File(filename, "r") as f:
         _require_current(f)
+        hartree_record = _read_hartree_provenance(f)
         parent_T = "psi_parent_y_transverse" in f
         if parent_T != ("psi_parent_y_transverse_mun" in f):
             raise ValueError("Restart has torn transverse parent faces")
@@ -476,6 +526,8 @@ def read_restart_state_from_h5(filename, mesh_xy, *,
         psi_mun_parent = _read_psi(io, "psi_parent_y_mun", n_rmu_disk,
                                     spec=psi_mun_spec, mu_axis=-2,
                                     spinor_axis=1, band_axis=-1)
+        resident_hartree = (None if hartree_record is None else
+                            _read_resident_hartree_slab(io, hartree_record, mesh_xy))
         if n_rmu_T_disk is not None:
             psi_nmu_parent_T = _read_psi(io, transverse_name, n_rmu_T_disk,
                                         spec=psi_nmu_spec)
@@ -526,6 +578,7 @@ def read_restart_state_from_h5(filename, mesh_xy, *,
         V0_noG0_munu=V0_noG0_munu, G0_mu_nu=G0_mu_nu,
         n_rmu_transverse_disk=n_rmu_T_disk,
         charge_zeta_identity=charge_zeta_identity,
+        resident_hartree=resident_hartree,
         psi_nmu_parent=psi_nmu_parent, psi_mun_parent=psi_mun_parent,
         parent_k_rows=parent_k_rows,
         psi_nmu_parent_transverse=psi_nmu_parent_T,
@@ -639,20 +692,23 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
             "current": cfg.paths.centroids_file_current}[family]
     centroids = load_centroid_basis(path, wfn.fft_grid, sym=sym)
     idx = centroids.centroid_indices
-    if digest != centroid_table_md5(idx):
+    if digest != centroid_table_md5(idx, coordinate_kind=centroids.coordinate_kind):
         raise ValueError("BSE parent restart centroid content does not match its deck")
     if not centroids.orbit_closed or (
             np.array_equal(rows, np.arange(sym.nk_tot)) and sym.nk_red != sym.nk_tot):
         sym = sym.trivial_view()
     from gw.gw_init import prepare_band_metadata
     _, bands, _ = prepare_band_metadata(
-        idx, cfg, mesh_xy, centroids.n_rmu, lambda *args: None, sym, wfn)
+        idx, cfg, mesh_xy, centroids.n_rmu, lambda *args: None, sym, wfn,
+        coordinate_kind=centroids.coordinate_kind)
     assert_restart_window_matches(
         restart_file, band_slices=bands, n_rmu_logical=centroids.n_rmu)
-    basis = PackedCentroidBasis.build(idx, sym, wfn.fft_grid, mesh_xy)
+    basis = PackedCentroidBasis.build(idx, sym, wfn.fft_grid, mesh_xy,
+                                     coordinate_kind=centroids.coordinate_kind)
     plan = build_centroid_k_unfold_plan(
         sym, idx, wfn.fft_grid, mesh_xy, nspinor=faces[0].shape[2],
-        parent_k_frac=wfn.kvecs(k=sym.parent_k_domain), layout=basis.layout)
+        parent_k_frac=wfn.kvecs(k=sym.parent_k_domain), layout=basis.layout,
+        coordinate_kind=centroids.coordinate_kind)
     if not np.array_equal(rows, plan.parent_full_rows):
         raise ValueError("BSE parent restart rows do not match the authenticated file wedge")
     spec = P(None, None, None, "x")
@@ -661,6 +717,42 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
         mesh=mesh_xy, in_specs=spec, out_specs=spec, check_vma=False))
     return tuple(basis.unpack_axis(unfold(basis.pack_axis(a, 3, spec=spec)),
                                    3, spec=spec) for a in faces)
+
+
+def read_charge_zeta_provenance(filename):
+    """Read only the two bounded charge-fit metadata datasets.
+
+    No tensor or wavefunction bytes move. Missing legacy records remain
+    explicit ``None`` values; the GW owner decides whether that legacy state
+    may serve the requested fitting policy and authenticates the JSON against
+    the authoritative WFN-bound identity.
+    """
+    from .commit_state import assert_committed
+    with h5py.File(filename, "r") as f:
+        assert_committed(f)
+        def bounded(name, shape):
+            if name not in f:
+                return None
+            dataset = f[name]
+            if (dataset.shape != shape or dataset.dtype.kind != "S"
+                    or dataset.dtype.itemsize > CHARGE_ZETA_PROVENANCE_MAX_BYTES):
+                raise ValueError(
+                    f"{filename}: {name} must be bounded fixed UTF-8 metadata "
+                    f"with shape={shape}")
+            return dataset[()]
+        encoded_identity = bounded(CHARGE_ZETA_IDENTITY_DATASET, (2,))
+        identity = (None if encoded_identity is None else
+                    _decode_charge_zeta_identity(encoded_identity, where=filename))
+        encoded_provenance = bounded(CHARGE_ZETA_PROVENANCE_DATASET, ())
+        provenance = None
+        if encoded_provenance is not None:
+            try:
+                provenance = bytes(encoded_provenance).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"{filename}: charge_zeta_provenance is not UTF-8") from exc
+            _encode_charge_zeta_provenance(provenance, identity=identity)
+        return dict(charge_zeta_provenance=provenance,
+                    charge_zeta_identity=identity)
 
 
 def read_metadata(filename):
@@ -692,9 +784,25 @@ def read_metadata(filename):
                 (("charge", "psi_parent_y"), ("current", "psi_parent_y_transverse")) if name in f},
             centroid_hashes={family: f.attrs.get(name) for family, name in
                 (("charge", "centroids_charge_md5"), ("current", "centroids_transverse_md5"))},
+            bispinor_gw=(None if "bispinor_gw" not in f.attrs
+                         else str(np.asarray(f.attrs["bispinor_gw"]).astype(str))),
             charge_representation=(None if "charge_representation" not in f.attrs
                                    else str(np.asarray(f.attrs["charge_representation"]).astype(str))),
+            atomic_augmentation=(None if "atomic_augmentation" not in f.attrs
+                                 else str(np.asarray(f.attrs["atomic_augmentation"]).astype(str))),
         )
+
+
+def require_atomic_augmentation_match(filename, identity):
+    """Reject corrected faces/V paired with a different atomic reconstruction."""
+    with h5py.File(filename, "r") as f:
+        stored = f.attrs.get("atomic_augmentation")
+        stored = None if stored is None else str(np.asarray(stored).astype(str))
+    if stored != identity:
+        raise ValueError(
+            f"GATE restart_atomic_augmentation: {filename} carries "
+            f"atomic_augmentation={stored!r}; want {identity!r}. "
+            "Regenerate with restart=false under the requested matched atomic data.")
 
 
 def read_interaction(filename, kind, mesh_xy, *, nohead=False):
@@ -1670,7 +1778,8 @@ class BispinorVqReader:
                     sym_idx_q=sym.sym_idx_q, kgrid=self.kgrid,
                     n_sym_spatial=plan.n_sym_spatial, context="photon V reader")
                 closure = verify_centroid_orbit_closure(
-                    basis.canonical_indices / np.asarray(plan.fft_grid),
+                    (basis.canonical_indices if basis.coordinate_kind == 'fractional'
+                     else basis.canonical_indices / np.asarray(plan.fft_grid)),
                     plan.spatial_ops, tnp=plan.translations)
                 if self.q_headers[family].centroid_hash != closure.centroid_hash:
                     raise ValueError("Photon V centroid set differs from the run; rerun restart=false.")
@@ -3789,6 +3898,11 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     zx.update(read_coarse_interactions(restart_file, input_file, mesh))
     _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
     zl = open_zeta(zeta_file, mesh=_mesh_for_loader)
+    if zl.coordinate_kind != 'fft_indices':
+        zl.close()
+        raise NotImplementedError(
+            "vq_interp refitting requires FFT centroid samples; fractional "
+            "augmented centroids are supported by the GW fitting/restart path.")
     zx["_zeta_loader"] = zl
     zx["zeta_distributed"] = _distributed
     zx["ZG"] = _ZetaGTiles(zl, path=zeta_file, distributed=_distributed)
@@ -4418,17 +4532,25 @@ def _read_isdf_group(f: h5py.File) -> IsdfHeader:
               if 'zeta_cutoff_ry' in g else None)
     prov = (_decode_isdf_str(g['fit_provenance'][()])
             if 'fit_provenance' in g else None)
+    kind = (_decode_isdf_str(g['centroids/coordinate_kind'][()])
+            if 'centroids/coordinate_kind' in g else 'fft_indices')
+    idx = (np.asarray(g['centroids/r_mu_fft_idx'][:])
+           if 'centroids/r_mu_fft_idx' in g else None)
+    crystal = g['centroids/r_mu_crystal']
+    if kind == 'fractional' and (crystal.dtype.kind != 'f' or crystal.dtype.itemsize != 8):
+        raise ValueError('fractional r_mu_crystal must be a float64 table')
     return IsdfHeader(
         density=_decode_isdf_str(g['density'][()]),
         vertex_mu_L=int(g['vertex_mu_L'][()]),
-        r_mu_fft_idx=np.asarray(g['centroids/r_mu_fft_idx'][:], dtype=np.int32),
-        r_mu_crystal=np.asarray(g['centroids/r_mu_crystal'][:], dtype=np.float64),
+        r_mu_fft_idx=idx,
+        r_mu_crystal=np.asarray(crystal[:], dtype=np.float64),
         zeta_is_done=zeta_done,
         zeta_layout=zeta_layout,
         gvec_components=gv,
         ngk_per_q=nk,
         zeta_cutoff_ry=cutoff,
         fit_provenance=prov,
+        coordinate_kind=kind,
     )
 
 

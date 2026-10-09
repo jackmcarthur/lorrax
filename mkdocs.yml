@@ -67,6 +67,7 @@ nav:
       - Drivers: drivers.md
       - Input reference: input_reference.md
       - Environment variables: reference/env_vars.md
+      - Atomic field targets and caches: reference/augmentation_cache.md
       - "How-to: production QSGW": how-to/production-qsgw.md
       - "How-to: metals": how-to/metals.md
       - "How-to: complete-basis WFN": how-to/complete-basis-wfn.md

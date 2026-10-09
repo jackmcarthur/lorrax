@@ -129,15 +129,31 @@ def _mark_photon_head(handle, config):
     handle["direct_photon_head"] = "first_order_cc_ct_tc_tt"
 
 
-def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
-    """Bind logical current energies/occupations and their wavefunction source.
+def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices,
+                         charge_zeta_identity=None):
+    """Bind current bands and the authenticated physical charge fit.
 
     SC supplies the current Hamiltonian/rotation identity from its owner;
     a DFT fingerprint alone cannot authenticate rotated wavefunctions.
     Array hashes here cover only replicated small energy/occupation tables.
     """
     from common.parallel_transport import fingerprint_from_binding, wfn_fingerprint
+    from file_io.wfn_basis import centroid_table_fingerprint_scheme, centroid_table_md5
     from .response_bank import response_weights
+    # The same canonical physical points own sampling, symmetry and restart
+    # identity. In particular, fractional points must never pass through the
+    # historical FFT-index cast: distinct sub-grid positions would collide.
+    basis = meta.mu_basis
+    coordinates = np.asarray(basis.canonical_indices)
+    if not np.array_equal(np.asarray(centroid_indices), coordinates):
+        raise ValueError("GATE shared_pole_centroids: supplied points differ from the canonical basis")
+    coordinate_kind = basis.coordinate_kind
+    scheme = centroid_table_fingerprint_scheme(coordinate_kind)
+    if coordinate_kind == "fft_indices":
+        # Preserve the exact legacy identity bytes and dictionary protocol.
+        centroid_identity = hashlib.sha256(np.asarray(coordinates, np.int64).tobytes()).hexdigest()
+    else:
+        centroid_identity = centroid_table_md5(coordinates, coordinate_kind=coordinate_kind)
     census = response_weights(wfns, meta)[-1]
     source = wfn_fingerprint(wfn) if binding is None else fingerprint_from_binding(binding, wfn)
     state = getattr(meta, "shared_pole_state_identity", None)
@@ -152,14 +168,24 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
     identity = dict(iteration_id=str(label), hamiltonian=state["hamiltonian"],
         wavefunctions=state["wavefunctions"], energies=census["energy_sha256"],
         occupations=census["occupation_sha256"],
-        centroids=hashlib.sha256(np.asarray(centroid_indices, np.int64).tobytes()).hexdigest(),
+        centroids=centroid_identity,
         recipe_hash=recipe["recipe_hash"], gate_hash=recipe["gate_hash"])
+    if coordinate_kind != "fft_indices":
+        identity.update(centroid_coordinate_kind=coordinate_kind,
+                        centroid_fingerprint_scheme=scheme)
     if str(label).startswith("sc_"):
         # The SC state labels do not name the WFN (bind_shared_pole_sc_identity),
         # so an SC map's bank, model and sector manifest bind the source WFN's
         # fingerprint here (the dipole provenance's): a rerun reuses them only
         # on the same WFN, never on energies alone.
         identity["wfn"] = source
+    if charge_zeta_identity is not None:
+        # gw_init owns all fit semantics (including augmentation and endpoint
+        # weights). Transport its opaque receipt, never rederive them here.
+        from file_io.tagged_arrays import _encode_charge_zeta_identity
+        _encode_charge_zeta_identity(charge_zeta_identity)
+        identity.update(charge_zeta_identity_scheme=charge_zeta_identity["scheme"],
+                        charge_zeta_identity=charge_zeta_identity["digest"])
     return identity
 
 
@@ -404,13 +430,15 @@ def retain_iteration_scratch(run_dir, label, *, print_fn=print):
     return tuple(sorted(removed))
 
 
-def _shared_pole_tables(meta, sym, centroid_indices):
-    """Build raw-parent tables through the canonical symmetry service."""
+def _shared_pole_tables(meta, sym, basis):
+    """Build raw-parent tables from the authenticated centroid coordinates."""
     from symmetry_maps import (QirrTables, centroid_source_map_and_wrap,
                                bgw_integer_q_to_fractional)
     perm, wraps = centroid_source_map_and_wrap(
-        np.asarray(centroid_indices), sym.sym_matrices, sym.translations,
-        np.asarray(meta.fft_grid), extend_trs=True)
+        basis.canonical_indices, sym.sym_matrices, sym.translations,
+        np.asarray(meta.fft_grid), extend_trs=True,
+        required_rows=np.asarray(sym.sym_idx_q),
+        coordinate_kind=basis.coordinate_kind)
     qt = QirrTables(irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
         q_irr_frac=bgw_integer_q_to_fractional(
             sym.q_irr_kgrid_int, (meta.nkx, meta.nky, meta.nkz)),
@@ -425,12 +453,17 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         material_class=None, wfns_transverse=None,
                         bispinor_v_q_path=None, mu_bases=None,
                         photon_g0_vectors=None, photon_head_cache=None,
-                        photon_head_state=None):
+                        photon_head_state=None, charge_zeta_identity=None):
     """Build current W; only one-shot models may use ISDF restart membership.
 
     SC labels own separate map scratch. ``restart`` may restore the invariant
     ISDF basis, but never skips the current response or W construction.
+    The fitting catalogue supplies its path-independent two-string receipt;
+    a model cannot authenticate different physical vertices from the same WFN.
     """
+    if charge_zeta_identity is None:
+        raise ValueError("GATE shared_pole_charge_fit: authenticated charge-zeta "
+                         "identity missing; regenerate the ISDF fit in a fresh run variant")
     source_wfn = None
     from .gw_config import uses_full_bispinor_shared_pole
     photon = uses_full_bispinor_shared_pole(config)
@@ -477,7 +510,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if photon:
                 wfns_transverse = dataclasses.replace(wfns_transverse, occ=wfns.occ)
         identity = shared_pole_identity(wfns, meta, label=label, wfn=wfn,
-            binding=wfn_fingerprint_binding, centroid_indices=centroid_indices)
+            binding=wfn_fingerprint_binding, centroid_indices=centroid_indices,
+            charge_zeta_identity=charge_zeta_identity)
         sc_scratch = str(label).startswith("sc_")
         if config.restart and tensors_filename is not None and not sc_scratch and not photon:
             handle = shared_pole_restart_handle(tensors_filename,
@@ -501,7 +535,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         export_shared_pole_outputs(handle, meta=meta, config=config,
                             mesh_xy=mesh_xy, source_wfn=source_wfn,
                             run_dir=run_dir, label=label, print_fn=print_fn,
-                            tables=_shared_pole_tables(meta, sym, centroid_indices))
+                            tables=_shared_pole_tables(meta, sym, meta.mu_basis))
                 return result
         root = Path(run_dir).resolve() / (str(label) + "_shared_pole")
         # The bare V parents (a collective device digest, before the rank-0 resume
@@ -588,7 +622,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             agree_io_error(error, path=root / 'sectors.json', stage='shared_pole.published_handle')
             _mark_photon_head(handle, config)
             return dict(shared_pole=handle)
-        tables = _shared_pole_tables(meta, sym, centroid_indices)
+        tables = _shared_pole_tables(meta, sym, meta.mu_basis)
     if resume_constructor == "committed":
         coulomb = None
     with timing.section("spole.bank_setup"):
@@ -612,7 +646,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             bank.update(photon_layout=photon_layout, mu_bases=mu_bases,
                         bispinor_v_q_path=bispinor_v_q_path,
                         sector_tables=(tables, _shared_pole_tables(
-                            meta, sym, mu_bases[1].canonical_indices)))
+                            meta, sym, mu_bases[1])))
         if not resume_constructor:
             initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
                 recipe=recipe, identity=identity, mesh_xy=mesh_xy,

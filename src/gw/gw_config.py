@@ -192,6 +192,7 @@ class ComputeMode(str, enum.Enum):
 class BispinorGWMode(str, enum.Enum):
     """How the four-current photon channels enter the GW self-energy; see docs/dev/gw_config_contracts.md."""
 
+    COULOMB_ONLY = "coulomb_only"
     BARE_TRANSVERSE = "bare_transverse"
     FULL_SHARED_POLE = "full_shared_pole"
     FULL_STATIC_COHSEX = "full_static_cohsex"
@@ -266,6 +267,19 @@ def uses_four_spinor_finite_q_charge(bispinor: bool, bispinor_gw) -> bool:
     return resolve_four_current_representation(
         bool(bispinor), coerce_bispinor_gw_mode(bispinor_gw)
     ).charge_bispinor
+
+
+def uses_transverse_interaction(config) -> bool:
+    """Select spatial-current interactions independently of the RKB carrier.
+
+    ``bispinor`` chooses the normalized four-component representation;
+    ``bispinor_gw = coulomb_only`` keeps its charge vertices and scalar
+    screening while omitting every transverse construction and contraction.
+    """
+    return (bool(config.bispinor)
+            and coerce_bispinor_gw_mode(getattr(
+                config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+                is not BispinorGWMode.COULOMB_ONLY)
 
 
 #: The LEGACY spellings of the self-energy axis, and the canonical key that
@@ -1087,6 +1101,8 @@ _DEFAULTS = {
     # charge feature metric used by ``centroids_file``.
     # Empty string == "not set" (cfg.centroids_file_current is None then).
     "centroids_file_current": "",
+    # Optional authenticated matched AE/PS data and local fitting controls.
+    "atomic_reconstruction_dir": "",
     "kin_ion_file": "kin_ion.h5",
     # Three human-readable text outputs (always written), plus one opt-in
     # fixed-Sigma eigenvalue-self-consistent QP ladder:
@@ -1418,6 +1434,12 @@ _DEFAULTS = {
     # ZETA_RCOND_DEFAULT (defined above _DEFAULTS) — one copy, no mirrors.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
     "zeta_rcond":           ZETA_RCOND_DEFAULT,
+    # Positive endpoint weights in the charge-fit least-squares objective.
+    # Every in-window empty state keeps weight one; each occupied endpoint
+    # receives this weight. This does not change occupations in GW. The
+    # default preserves the existing fit and provenance exactly. Nondefault
+    # values require a common integer-filled boundary at every source k.
+    "zeta_occupied_weight": 1.0,
     # γ̃-double-contract kernel variant inside the monolithic pair
     # pipeline (see ``common.gamma_matrices.gamma_double_contract``).
     # Math identical across all three; differ in HLO structure.
@@ -2144,7 +2166,7 @@ def mpa_sigma_runs_scalar_executor(config) -> bool:
     Green band sum.  A bispinor MPA fit is unmeasured and keeps the full-band
     sum.
     """
-    return (not bool(getattr(config, "bispinor", False))
+    return (not uses_transverse_interaction(config)
             or uses_bare_transverse_shared_pole(config)
             or uses_full_bispinor_shared_pole(config))
 
@@ -2400,6 +2422,8 @@ def _input_paths(
         wfn_file=str(params["wfn_file"]),
         centroids_file=str(params["centroids_file"]),
         centroids_file_current=cents_curr_resolved,
+        atomic_reconstruction_dir=(str(params["atomic_reconstruction_dir"])
+                                   if params["atomic_reconstruction_dir"] else None),
         kin_ion_file=str(params["kin_ion_file"]),
         parallel_transport_file=str(params["parallel_transport_file"]),
         static_gauge_hall_file=str(params["static_gauge_hall_file"]),
@@ -2634,6 +2658,15 @@ def _input_backend(
             raise ValueError(
                 "runtime_platform must be cpu or gpu/cuda, got "
                 f"{runtime_platform!r}")
+    _weight_raw = params["zeta_occupied_weight"]
+    if isinstance(_weight_raw, (bool, np.bool_)):
+        raise ValueError("zeta_occupied_weight must be a finite number >= 1, not a boolean")
+    try:
+        _occupied_weight = float(_weight_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("zeta_occupied_weight must be a finite number >= 1") from exc
+    if not (np.isfinite(_occupied_weight) and _occupied_weight >= 1.0):
+        raise ValueError("zeta_occupied_weight must be finite and >= 1")
     backend = BackendConfig(
         linalg=_linalg.layout,
         linalg_provenance=_linalg.provenance,
@@ -2643,6 +2676,7 @@ def _input_backend(
         zeta_ridge=float(params["zeta_ridge"]),
         charge_zeta_solve=_linalg.charge_zeta_solve,
         zeta_rcond=float(params["zeta_rcond"]),
+        zeta_occupied_weight=_occupied_weight,
         gamma_contract_mode=str(params["gamma_contract_mode"]).strip().lower(),
     )
     return (backend)
@@ -2804,7 +2838,7 @@ def _apply_input_envelope(
         print_fn(
             "  [config provenance] qp_solver=self_consistent: "
             "density_self_consistent was not named; enabling the live "
-            + ("(rho, J)" if bool(resolved.bispinor) else "rho")
+            + ("(rho, J)" if uses_transverse_interaction(resolved) else "rho")
             + " Hartree rebuild")
     elif (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(resolved.density_self_consistent)):
@@ -2822,7 +2856,7 @@ def _apply_input_envelope(
     if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and "sc_head_update" not in _named_keys
             and resolved.sc.head_update == "off"
-            and (not bool(resolved.bispinor)
+            and (not uses_transverse_interaction(resolved)
                  or uses_full_bispinor_shared_pole(resolved))
             and bool(resolved.do_G0)
             and resolved.sigma.w_model == "shared_pole"
@@ -3324,6 +3358,7 @@ class FilePaths:
     eqp2_file: str
     report_file: str
     sigma_omega_h5_file: str
+    atomic_reconstruction_dir: str | None = None
 
 
 def _normalize_placement(value):
@@ -3568,6 +3603,21 @@ def uses_bare_transverse_shared_pole(config) -> bool:
                 is BispinorGWMode.BARE_TRANSVERSE)
 
 
+def uses_charge_bispinor_shared_pole(config) -> bool:
+    """Select the spin-traced four-component charge shared-pole bank.
+
+    Coulomb-only and bare-transverse models share the same charge bank;
+    the latter's spatial-current contractions have their separate selector.
+    """
+    return (bool(config.bispinor)
+            and config.compute_mode is ComputeMode.MPA
+            and config.sigma.w_model == "shared_pole"
+            and config.screening.diagrams is ScreeningDiagrams.W_RPA
+            and coerce_bispinor_gw_mode(config.bispinor_gw)
+                in (BispinorGWMode.COULOMB_ONLY,
+                    BispinorGWMode.BARE_TRANSVERSE))
+
+
 def uses_bare_tt_gamma_head(config) -> bool:
     """Insert the bare transverse Gamma average into bare-TT V tiles."""
     hybrid = (uses_bare_transverse_shared_pole(config)
@@ -3596,6 +3646,13 @@ def uses_direct_bispinor_shared_pole_head(config) -> bool:
 
 def incumbent_bispinor_head_record(config) -> tuple[str, str]:
     """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route; see docs/dev/gw_config_contracts.md."""
+    if not uses_transverse_interaction(config):
+        return "", (
+            "Coulomb-only normalized RKB charge: "
+            + {HeadCorrection.FULL: "scalar Gamma-cell charge head",
+               HeadCorrection.NO_LOCAL_FIELDS: "direct scalar Gamma charge head",
+               HeadCorrection.OFF: "DEBUG: Gamma-cell charge head disabled"}[
+                   config.head.correction])
     if config.head.correction is HeadCorrection.OFF:
         return (
             "\n  ==========================================================\n"
@@ -3682,6 +3739,29 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/dev/gw_config_contracts.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
+    # The parser and fresh/restart orchestration call this same preflight.
+    # Atomic currents use the same reconstructed full-WFN frame as charge.
+    # The admitted transverse comparison is the static, headless bare matrix;
+    # screened/dynamic photon and Gamma-head models retain their own gates.
+    if getattr(getattr(config, "paths", None), "atomic_reconstruction_dir", None):
+        static_current = (
+            mode is BispinorGWMode.BARE_TRANSVERSE
+            and config.compute_mode is ComputeMode.X_ONLY
+            and not bool(config.density_self_consistent)
+            and config.qp_solver is QPSolver.ONE_SHOT_DFT
+            and config.head.correction is HeadCorrection.OFF
+            and config.occ_smearing_width_ry is None
+            and float(config.screening.occ_broadening_ev) == 0.)
+        if (not config.bispinor
+                or (mode is not BispinorGWMode.COULOMB_ONLY and not static_current)
+                or int(config.sys_dim) != 3):
+            raise ValueError(
+                "GATE atomic_augmentation_domain: atomic_reconstruction_dir "
+                "requires bispinor=true and sys_dim=3 with bispinor_gw=coulomb_only, "
+                "or bare_transverse with compute_mode=x_only, qp_solver=one_shot_dft, "
+                "head_correction=off and unsmeared insulating occupations. "
+                "Reconstructed screened/dynamic photon, transverse Gamma-head "
+                "and truncated-kernel models are outside this static-current domain.")
     if (config.compute_mode is ComputeMode.X_ONLY
             and uses_bare_tt_gamma_head(config) and bool(config.restart)):
         raise ValueError(
@@ -3697,7 +3777,7 @@ def refuse_unsupported_bispinor_gw(config) -> None:
     shared_pole_direct = (uses_direct_bispinor_shared_pole_head(config)
                           or (uses_bare_transverse_shared_pole(config)
                               and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS))
-    if (bool(config.bispinor)
+    if (uses_transverse_interaction(config)
             and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
             and not shared_pole_direct):
         raise ValueError(
@@ -3729,6 +3809,13 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "charge and signed Dirac current must be rebuilt on every map; "
             "freezing the DFT direct field mixes two orbital states\n"
             "  doc:  docs/input_reference.md, density_self_consistent.")
+    if mode is BispinorGWMode.COULOMB_ONLY:
+        if not bool(config.bispinor):
+            raise ValueError(
+                "GATE coulomb_only_requires_bispinor: bispinor_gw=coulomb_only "
+                "requires bispinor=true; bispinor selects the normalized RKB "
+                "four-component charge carrier.")
+        return
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if mode is BispinorGWMode.FULL_SHARED_POLE:
@@ -4314,13 +4401,16 @@ def uses_metal_direct_drude_head(config) -> bool:
             and config.sigma.w_model == "shared_pole"):
         return False
     if config.sc.head_update == "parallel_transport":
-        return ((not config.bispinor or uses_direct_bispinor_shared_pole_head(config))
+        return ((not uses_transverse_interaction(config)
+                 or uses_direct_bispinor_shared_pole_head(config))
                 and config.head.correction in (
                     HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL))
     if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
-        return (not config.bispinor or uses_bare_transverse_shared_pole(config)
+        return (not uses_transverse_interaction(config)
+                or uses_bare_transverse_shared_pole(config)
                 or uses_full_bispinor_shared_pole(config))
-    return config.head.correction is HeadCorrection.FULL and not config.bispinor
+    return (config.head.correction is HeadCorrection.FULL
+            and not uses_transverse_interaction(config))
 
 
 @dataclass(frozen=True)
@@ -4439,6 +4529,7 @@ class BackendConfig:
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)
     charge_zeta_solve: str     # "rank_truncate" | "cholesky"
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
+    zeta_occupied_weight: float  # charge-fit endpoint priority; occupations unchanged
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
 
     def summary(self) -> str:

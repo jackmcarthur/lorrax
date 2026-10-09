@@ -48,6 +48,18 @@ rulings override anything here.
   skips the one-shot Σ (`_run_oneshot_sigma`); the SC loop's first map computes
   it, with $U = I$, so it equals the one-shot bit for bit when no W-active
   state is semicore ([self-consistency §2](../self_consistency.md#2-band-treatment)).
+- **Reconstructed Hartree uses the fitting frame.** Atomic augmentation
+  finishes the fixed-source charge Hartree receiving matrix before the
+  shared orbital store is donated to the fit. Only its small FILE-wedge band
+  matrix and authenticated source/operator metadata survive. Fresh and
+  restart paths serve that matrix through the existing Sigma assembly and
+  apply the QP basis rotation once; they refuse a missing or changed source
+  instead of reconstructing a field from the original pseudo wavefunctions.
+  This route currently requires four-component ordinary 3D Coulomb and
+  `qp_solver = one_shot_dft`. Density self-consistency needs a reconstructed
+  source update and is refused. The original DFT energy and ionic/XC
+  references remain an effective model for the reconstructed interaction; this does not
+  establish an all-electron one-body reference.
 - **Σ_x sign check.** Every Σ_x diagonal entry must be negative, because Σ_x is
   a negative-definite quadratic form. On the one-shot path `sanity.check_sign`
   prints a sanity failure line for a positive entry (a sign, conjugation or
@@ -234,9 +246,16 @@ rulings override anything here.
 ### Four-current (bispinor) envelope
 
 - **`BispinorGWMode`** is orthogonal to `ComputeMode`: it selects which Lorentz
-  blocks are screened and contracted. Values: `bare_transverse` (the default),
+  blocks are screened and contracted. Values: `coulomb_only` (charge interaction
+  on the normalized RKB carrier), `bare_transverse` (the default),
   `full_shared_pole`, `full_static_cohsex`. Retired spellings refuse by name
   in `coerce_bispinor_gw_mode`, never aliased.
+- **`uses_transverse_interaction`** is the interaction resolver: false on
+  scalar and `coulomb_only` decks, true on the existing four-current modes.
+  Charge representation/lift and scalar-head provenance still come from
+  `common.four_current_model`; no interaction choice changes that carrier.
+  Fresh restart bundles stamp `bispinor_gw`; a four-component restart refuses
+  a mismatched stamped policy, and Coulomb-only refuses an unstamped policy.
 - **`packed_static_envelope`** is the one table of the packed static photon
   operator's conditions. It yields `(accepted, got, want, klass, why,
   derived_key)` rows; the refusals and `packed_bare_transverse_route` read the
@@ -262,6 +281,9 @@ rulings override anything here.
 - **`refuse_unsupported_bispinor_gw`** validates the four-current modes and
   requires live direct fields for bispinor QSGW
   (`GATE bispinor_self_consistency_requires_live_four_current`).
+  It also enforces `GATE atomic_augmentation_domain` at parsing and
+  fresh/restart orchestration, including programmatically replaced configs:
+  atomic reconstruction requires four-component ordinary 3D Coulomb.
 - **`scalar_head_overrides_named`** formats the scalar-head overrides the deck
   named, for envelope messages.
 
