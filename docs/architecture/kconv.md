@@ -631,40 +631,88 @@ translation unit links `libnvrtc` and resolves the driver API by `dlsym`. The
 CUDA leg always compiles this family; a missing `cufft.h`, `libcufft`,
 `nvrtc.h` or `libnvrtc` fails the configure.
 
-**Disk cubin cache.** Images are kept in `ffi.fft.cubin_cache_dir()`:
+**Terms.** An *image* is one compiled cubin. The *cache* is the per-user,
+writable directory `ffi.fft.cubin_cache_dir()` (`src/ffi/fft.py:422`):
 `$SCRATCH/.cache/lorrax/kconv_mathdx`, or `~/.cache/lorrax/kconv_mathdx`
-where the site defines no `SCRATCH`. The cache is always on, has no knob, and
-is separate from the XLA compile cache (`ISDF_JAX_CACHE_DIR`). One directory
-serves every world size, because an image depends on the device and the
-wheel, not on P. A cold build costs about 6 s per image per process, which
-the cache pays once.
+where the site defines no `SCRATCH`. The *store* is the release's read-only
+directory `ffi.fft.CUBIN_STORE` (`src/ffi/fft.py:444`), `cubin_store/` at the
+root of the source tree, built once per GPU architecture at install. A
+checkout has no store unless one is built into it.
+
+**Cache.** The cache is always on, has no knob, and is separate from the XLA
+compile cache (`ISDF_JAX_CACHE_DIR`). Every mathdx handler receives its path
+as the string attribute `cubin_dir` (`src/ffi/fft.py:416`), so the path is
+part of the HLO and of the JAX compile key of every program that holds a
+k-convolution; it must be the same on every rank. One directory serves every
+world size: no image depends on P.
 
 - **Key.** `src/ffi/cpp/common/nvrtc_build.h` owns the rule for every
-  NVRTC-built kernel (this family and the Fourier plan's fused pair): FNV-1a
-  over the embedded source, the text of each embedded header, the NVRTC
-  options that decide the image (C++ standard, architecture, mode, grid,
-  $n_s$, rows per block, precision, SM), and the whole toolchain that can
-  change an image (`nvrtc::mathdx_toolchain`: the cuFFTDx or cuBLASDx,
-  commonDx, CUTLASS and CCCL version headers, the wheel's dist-info name, and
-  the NVRTC version with the loaded `libnvrtc`'s real path). A version header
-  that reads empty disables the disk cache for that build rather than
-  dropping out of the key. Editing an embedded source or header invalidates
-  its images, comments included, so measurement notes live at the Python
-  owners, not in the kernel text. File names, include paths and the host code
-  are not keyed.
-- **File.** `kconv_m<mode>[w<variant>]_<nkx>x<nky>x<nkz>_ns<ns>[x<n_r>][_c64]_sm<XY>_<key>.cubin`
-  (and `plan_pair_…` for the Fourier plan), each framed by a `LRXKCONV1`
-  header carrying the key and a hash of the payload.
+  NVRTC-built kernel (this family, the BSE outer kernels and the Fourier
+  plan's fused pair): FNV-1a over the embedded source, the text of each
+  embedded header, the NVRTC options that decide the image, and the whole
+  toolchain that can change an image (`nvrtc::mathdx_toolchain`: the cuFFTDx
+  or cuBLASDx, commonDx, CUTLASS and CCCL version headers, the wheel's
+  dist-info name, and the NVRTC version with the loaded `libnvrtc`'s real
+  path). A version header that reads empty disables the disk cache for that
+  build rather than dropping out of the key. Editing an embedded source or
+  header invalidates its images, comments included, so measurement notes
+  live at the Python owners, not in the kernel text. File names, include
+  paths and the host code are not keyed.
+- **What decides an image.** Modes 0–9 and 11: the mode, the k-grid, $n_s$,
+  the right width (mode 9), the precision, the variant (mode 7: the output
+  spin block; mode 8: the vertex widths $8n_a + n_b$; mode 11: completion and
+  vertices) and the `live` bit of a windowed pass, plus the device's compute
+  capability and shared-memory limits (`kconv_mathdx_cuda_ffi.cc:2155`,
+  options at `:2492`). Never $N_\mu$, the band counts or P. Three images
+  depend on the system instead of the k-grid: mode 10 on the FFT plane
+  $(n_b, n_c)$ and its occupied rows (`:3678`); the Fourier pair on the FFT
+  extents and supports (`fourier_plan_cuda_ffi.cc:250`); the BSE outer
+  kernels on the band rank $K = \min(n_c, n_v)$ padded to 4 and, for decode,
+  $\lceil n_c/8 \rceil$ c-blocks (`kconv_outer_cuda_ffi.cc:283,835`).
+- **File.** `kconv_m<mode>[w<variant>]_<nkx>x<nky>x<nkz>_ns<ns>[x<n_r>][_c64]_sm<XY>_<key>.cubin`,
+  `kconv_outer[_dec]_…` and `plan_pair_…`, each framed by a `LRXKCONV1`
+  header carrying the key and a hash of the payload. An image is about
+  8.5 MB on sm_80, 6.1 MB of it the `.nv_debug_ptx_txt` section that
+  `--generate-line-info` adds (`readelf -S`, mode 3 at 5×5×1).
 - **Writes and reads.** A write goes to a unique temporary and is renamed
-  into place, which is atomic on one filesystem, so concurrent ranks each
-  publish a whole file. A read re-hashes the payload and checks for an ELF
-  image; a torn, foreign or non-ELF file, or one the driver refuses to load,
-  is deleted, recompiled once and replaced.
+  into place (`nvrtc_build.cc:180`), which is atomic on one filesystem, so
+  concurrent ranks each publish a whole file. A read re-hashes the payload
+  and checks for an ELF image (`:168`); a torn, foreign or non-ELF file is
+  recompiled once and renamed over the entry, and one the driver refuses to
+  load is unlinked first (`:251`). Either acts on the cache entry itself.
+- **Cost.** A cold build is about 7 s per image per process; the cache pays
+  it once per user. The P4 hsuite builds 25 images cold, about 177 s of its
+  565 s cold wall (A100-80; the HSUITE lane's base_cold arm).
 - **Receipts.** Under `LORRAX_DEBUG_PRINT=1` the startup `[kconv]` line names
-  the backend, the wheel root and the cache directory with its image count
-  and size. Every kernel build prints `[kconv_mathdx] disk-cache hit` or
-  `NVRTC built …` on rank 0, with the grid, rows per block, shared memory and
-  whether the cubin was stored.
+  the backend, the wheel root and the cache directory with its image count,
+  size and the images linked from the store. Every kernel build prints
+  `[kconv_mathdx] disk-cache hit` or `NVRTC built …` on rank 0, with the
+  grid, rows per block, shared memory and whether the cubin was stored.
+
+**Store.** The first `cubin_cache_dir()` call of a process seeds the cache
+from the store (`ffi.fft.seed_cubin_cache`, `src/ffi/fft.py:448`): every
+store image the cache lacks is linked in, by a symbolic link made under a
+temporary name and renamed into place; an entry already present is kept, and
+a dangling link (a retired release's store) is replaced. The cache path, and
+so every JAX compile key, is the same with or without a store. The native
+reader treats a linked image like any cached file, so a bad store image is
+rebuilt into the cache, replacing the link, and the store file is never
+written (the rename and the unlink act on the link). The startup `[kconv]`
+line counts the images linked. A grid outside the store compiles once into
+the cache, as without one.
+
+- **Build.** `scripts/build_cubin_store.py` runs as one four-rank
+  `lx run` on a node of the target architecture with a fresh `SCRATCH`. Each
+  process takes every fourth (grid, image) task on its own GPU and calls the
+  router factory on operands of two centroids, which leaves the image in the
+  cache; its `GRIDS` table lists the hsuite fixtures, the release smoke decks
+  and the production grids, each with the spin widths its drivers request.
+  The system-keyed images (mode 10, the Fourier pair, the BSE outer kernels)
+  come from running the release smoke decks against the same cache. The
+  release then copies the cache's regular files into `cubin_store/`; a
+  release starts from the previous store (hard links), so only missing images
+  compile.
+- **Gate.** STORE_GATE_NUMBERS
 
 ## 15. Numerical contract {#numerical-contract}
 
