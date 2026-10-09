@@ -119,7 +119,9 @@ $(H, F(H) - H)$ is valid secant data for the mixer.
 **Map 0 is the one-shot.** The initial carry is $\mathrm{diag}(E^{\rm DFT})$.
 Map 0 takes $E = E^{\rm DFT}$ and $U = I$ exactly instead of diagonalizing,
 so it reproduces the one-shot calculation (`qp_solver = one_shot_dft`) bit for
-bit, and an SC run computes no separate one-shot. Diagonalizing would return
+bit when no W-active state is semicore, and an SC run computes no separate
+one-shot. An active semicore state is read on the near grid by the one-shot
+and on its coarse window by map 0 (§2). Diagonalizing would return
 the eigenvalues to about one ulp, re-sort them and pick an arbitrary gauge
 inside degenerate multiplets; the GN-PPM fit amplifies ulp noise in the
 energies (MoS2 3×3, +1 ulp on every energy: max $|\Delta\Sigma_c|$ = 1.28 eV).
@@ -217,6 +219,70 @@ the controllable errors: converged $E_F \pm 1$ eV std/max 3.6/15.9 meV on
 Fe 4³ (against a comparison build with `qp_support.SEMICORE_ETA_EV` set to
 1 eV) and 2.9/20.0 meV on MoS2 3×3 (against the semicore read at the deck
 η).
+
+**What a coarse window reads.** On the occupied branch every term of
+$\Sigma_{ss}$ is $r_j/(\omega - x_j - i\eta)$, with $x_j = \varepsilon_A - \mu - \Omega_p$
+for an occupied state A and a W pole p
+([Σ quadrature §1](theory/sigma-quadrature-problem.md#1-what-is-computed)). So
+
+$$
+\Sigma^{\eta}_{ss}(\omega) = f_s(\omega - i\eta), \qquad
+f_s(z) = \sum_j \frac{r_j}{z - x_j},
+$$
+
+and $f_s$ is analytic below the real axis (a damped pole has $\mathrm{Im}\,x_j \ge 0$).
+A window at $\eta_{\rm semi}$ reads $f_s$ at depth $\eta_{\rm semi}$, which is the
+deck-η function smoothed by a Lorentzian of width $\eta_{\rm semi} - \eta$. Its
+bias at the state's own energy is
+$B_s = \mathrm{Re}\,f_s(E_s - i\eta_{\rm semi}) - \mathrm{Re}\,f_s(E_s - i\eta)$.
+By Cauchy–Riemann, $\partial_\eta \mathrm{Re}\,\Sigma^\eta_{ss} = \mathrm{Im}\,\partial_\omega \Sigma^\eta_{ss}$,
+so to first order $B_s \approx (\eta_{\rm semi} - \eta)\,\mathrm{Im}\,\partial_\omega\Sigma_{ss}(E_s)$.
+A deep hole that can decay into a shallower hole plus a plasmon or a pair
+sits on the slope of such a continuum ($\mathrm{Im}\,\Sigma_{ss} \neq 0$), and its
+bias grows linearly in $\eta_{\rm semi}$. An isolated level is biased only at
+second order, through the curvature of $\mathrm{Re}\,\Sigma_{ss}$.
+
+The measured biases on AgI 6³ (FR PBE, `number_bands_protected = 64`,
+shared-pole W, P4; [[CLAIM-SEMICORE-REF]]) are below: Re $\Sigma_c(E^{\rm DFT}_s)$ minus a
+reference, in eV, as the mean over the 16 irreducible k. The reference is the
+near grid stretched to −95 eV, so every state is read at the deck η = 0.25 eV.
+It is converged: ε = 10⁻⁴, 10⁻⁵ and 10⁻⁶ agree to 0.15 meV, and η = 0.125 eV
+moves the deep levels by at most 0.07 eV.
+
+| state | $E_s - \mu$ (eV) | Im $\Sigma_c$, $Z$ (reference) | $\Sigma(\omega=0)$ | window at 5 eV | 2 eV | 1 eV | 0.25 eV |
+|---|---|---|---|---|---|---|---|
+| Ag 4s | −91.3 | 3.83, 0.42 | −10.17 | −2.19 | −0.67 | −0.13 | −0.005 |
+| Ag 4p | −58.4, −53.3 | 0.66, 0.57 | −5.62 | −0.66 | −0.17 | −0.06 | −0.020 |
+| I 4d | −46.6, −44.9 | 0.45, 0.74 | −4.64 | −0.51 | −0.05 | +0.02 | −0.007 |
+| I 5s | −13.6 | 0.98, 0.70 | — (near grid: < 0.1 meV) | −1.25 | −0.41 | −0.16 | +0.002 |
+
+The bias grows between linearly and quadratically in $\eta_{\rm semi}$, and it is
+largest for the broadest levels. The first-order law, fed with the slope
+between the 2 and 5 eV windows, predicts the 5 eV bias to within 6–41 % and
+always from above. At the deck η the coarse windows agree with the reference to
+within their 3e-3 certificate (21 meV at most), so the 5 eV error is the
+broadening and nothing else. A coarse window pays the whole crossing width of
+its box: three windows at the deck η cost 1306 τ nodes, more than stretching
+the near grid over every state (1368 pairs in all against 485 on the deck
+grid). A 5 eV window costs 45.
+
+**Which states read a coarse window.** Every SC map reads every coarse state
+on its window. The one-shot reads on a window only the coarse states outside
+its requested set (the QP-matrix states the W model treats as active, §4;
+`qp_support.oneshot_support_ev`): these are the states deeper than the active
+depth, which would otherwise read
+$\Sigma(\omega = 0)$, 4.6–10.2 eV from the reference on AgI against 0.5–2.2 eV on
+the 5 eV window. On AgI these reads cost 98 τ pairs (485 → 583, a 35 → 40 s
+sweep, cold at P4). The 5 eV window takes 50 of them. The other 55 widen the
+near occupied crossing window from 180 to 235 nodes, because the coarse
+samples set the pole edge $\Lambda_h$ of their ω half
+([Σ quadrature §4](theory/sigma-quadrature-problem.md#4-product-windows)). A requested coarse state keeps the near grid. The near grid
+reads AgI's I 5s exactly and costs 41 more τ nodes than a grid that stops
+above it, while the 5 eV window reads it 1.25 eV low. SC map 0 therefore
+differs from the one-shot by the requested coarse states: their read, and
+the lower edge of the near grid, which they no longer set (AgI: −7.5 against
+−15.75 eV). That edge moves the states above the coarse floor by at most
+0.34 meV (claim 3274).
 
 **Semicore pin** (`sc_semicore = dft`, the default). The pseudopotentials are
 fitted to DFT, so the semicore levels stay at their DFT energies while their
@@ -380,7 +446,8 @@ once and holds it (`gw/qp_support.py`).
 semicore states, that the W model treats as active
 ($\max_k E^{\rm DFT}_{nk} \ge E_F - 15$ eV,
 `shared_pole_recipe.active_band_mask`, evaluated once on the DFT ladder) and
-that had a quasiparticle at the previous map, $Z \in (0, 1]$. A state with
+that had a quasiparticle at the previous map, $Z \in (0, 1]$. The one-shot's
+set keeps its active semicore states (§2). A state with
 $Z \notin (0, 1]$ sits within about η of a pole cluster of its $\Sigma_{nn}$
 and has no quasiparticle. Its energy never moves the grid, and off the grid
 it reads the out-of-grid rule below and is named in an
@@ -392,8 +459,10 @@ grid.
 (`sigma_omega_min_ev` / `sigma_omega_max_ev` or the patch list; an unset edge
 gives the sample next to $E_F$) joined with
 $[\min_R E - P,\ \max_R E + P]$, where $P$ = 2 eV
-(`qp_support.SUPPORT_PAD_EV`) and E is the DFT energy. Because the one-shot
-uses the same rule, SC map 0 has the one-shot's grid, rules and off-grid set.
+(`qp_support.SUPPORT_PAD_EV`) and E is the DFT energy. The one-shot uses the
+same rule, so SC map 0 has the one-shot's grid, rules and off-grid set when no
+active state is semicore; an active semicore state sets the one-shot's lower
+edge and not map 0's (§2).
 
 **Hold.** Every later map keeps the grid while each requested state's read
 support $[E - 0.5, E + 0.5]$ eV lies inside it. E is the map's input energy,
@@ -424,10 +493,13 @@ on the grid; the Σ build, the grid growth and the tail mask all read it.
 The errors compare against the sampled Σ 2–6 eV beyond a truncated edge.
 `clamp` is continuous at the edge, but an edge on a GN-PPM pole gives errors
 of order $10^3$ eV; `static` has two fixed points near an edge (§5). States
-deeper than the active depth keep $\Sigma(0)$ because the W model carries no
-plasma charge for them: covering Fe 4³'s 3s/3p stretched the grid to −98 eV,
-ran 5× slower and moved those states 16 eV. The active depth is evaluated
-once, so a state never switches between $\Sigma(E)$ and $\Sigma(0)$. No tail
+deeper than the active depth are never requested, so they never stretch the
+near grid; covering them there at the deck η is the reference of §2 and
+costs its depth (Fe 4³ 3s/3p: −98 eV and 5× slower; AgI Ag 4s: 1368 τ pairs
+against 485). A semicore one reads its coarse window (§2) in the one-shot and
+on every SC map. Only a W-inactive state above the coarse floor, or a
+frozen-core band, reads $\Sigma(0)$. The active depth is evaluated once, so a
+state never switches between its own $\Sigma(E)$ and $\Sigma(0)$. No tail
 $C_n/(\omega - \bar\omega_n)$ matched at the edge is offered: Σ at a grid edge
 is far from its $1/\omega$ asymptote (Fe: −5 to −7 eV at +28 eV), so the
 matched pole falls inside the extrapolated range for 10–92 % of the states.

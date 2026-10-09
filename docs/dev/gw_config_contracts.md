@@ -46,8 +46,8 @@ rulings override anything here.
   head.
 - **SC map 0 is the one-shot.** Under `qp_solver = self_consistent` the driver
   skips the one-shot Σ (`_run_oneshot_sigma`); the SC loop's first map computes
-  it, with $U = I$, so it equals the one-shot bit for bit
-  ([self-consistency](../self_consistency.md)).
+  it, with $U = I$, so it equals the one-shot bit for bit when no W-active
+  state is semicore ([self-consistency §2](../self_consistency.md#2-band-treatment)).
 - **Σ_x sign check.** Every Σ_x diagonal entry must be negative, because Σ_x is
   a negative-definite quadratic form. On the one-shot path `sanity.check_sign`
   prints a sanity failure line for a positive entry (a sign, conjugation or
