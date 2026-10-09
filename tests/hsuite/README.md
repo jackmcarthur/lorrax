@@ -119,6 +119,51 @@ the scalar restarted steps read.
 invocation (`lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite`) and the
 regenerate command.
 
+## Wall time and caches
+
+On one node at P4 the fixtures' arithmetic takes seconds; most of a run's wall
+is the compile path. Each rank's process asks JAX for about 4000 programs, and
+for every one it traces the Python function, lowers it to MLIR and computes
+its cache key before it can read or compile an executable. Two caches make a
+second run cheaper. Both live under `$SCRATCH/.cache/lorrax/`, at the same path
+on every rank:
+
+- **JAX's persistent compile cache.** With `HSUITE_CACHE_DIR` unset, the suite
+  uses the runtime's cache: `ISDF_JAX_CACHE_DIR` if exported, else
+  `jax_compile/<jax, jaxlib, FFI bundle, key schema>/np4`, pruned after a week
+  unused ([env_vars §2e](../../docs/reference/env_vars.md#2e-compile-cache)).
+  A warm run still traces and lowers every program. Only programs that carry
+  a host callback compile again, because JAX never stores them (`uncacheable`
+  below).
+- **The mathdx cubin store** (`kconv_mathdx/`, `ffi.fft.cubin_cache_dir`).
+  NVRTC builds each k-convolution kernel the first time a process meets its
+  (mode, k-grid, components) shape, at about 7 s per kernel. The two fixtures
+  need 25 kernels. The store's path is a string attribute of every mathdx
+  custom call, so it is part of those programs' JAX cache keys. A run is
+  therefore warm only under the `SCRATCH` of the run that filled the JAX
+  cache.
+
+`HSUITE_CACHE_DIR=<empty dir>` gives a cold JAX cache with warm cubins, the
+state a release's first run meets. A fresh `SCRATCH` as well makes both
+caches cold.
+
+`summary.json` `compile_s` splits each stage's wall, as seen from rank 0:
+
+- `trace`, `lower` and `compile` are the union of JAX's own compile-path spans
+  (`jax._src.dispatch` events). `compile` covers `compile_or_get_cached`: a
+  cache read, or an XLA compile. `compile_path` is the union of all three.
+- `cache_lookups`, `read_s`, `fingerprint_s` and `agreement_s` come from
+  `common.jax_compile_cache`. The last two are the cross-rank compile
+  agreement: the module hash, and the exchange.
+- `xla_compiles`, `xla_s`, `cache_hits` and `uncacheable` are the sums of the
+  compile receipts in the stage log. Each stage ends with its own receipt,
+  which also closes the receipt window, so an SC driver's map-0 receipt counts
+  that driver only.
+- `nvrtc_builds` and `nvrtc_s` count the cubins the stage built.
+
+What remains of the wall, `wall - compile_path - nvrtc_s`, is execution, host
+work and I/O.
+
 ## Steady compiles (`bisp_sc3`)
 
 The opt-in stage `bisp_sc3` runs the `bisp_sc` deck on the face route for
