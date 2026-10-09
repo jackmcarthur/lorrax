@@ -319,7 +319,7 @@ On the CPU census of the staged programs at CrI3 24×24 P64 shapes (TT side
 25856, stage width 4; [dense linear algebra §2](dense_linear_algebra.md#what-gspmd-emits)),
 the order and the packed columns hold TT stage 1 at 1989 optimized operations and
 the CT pencil at 3583 on every mesh from 2×2 to 8×8, and stage 3 at 1964
-(claims 4121 and FACEMAP-5).
+(claims 4121 and 4133).
 
 **GEMM stages.** Every face GEMM is `distrib_la.panel_matmul` (`face_matmul`,
 `src/gw/shared_pole_execution.py:320`): a batched 2-D SUMMA with one exchange per
