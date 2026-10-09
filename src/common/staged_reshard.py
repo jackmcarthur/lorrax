@@ -652,7 +652,9 @@ def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
 
     This is the centroid permutation's two-all-to-all algorithm. Joining
     blocks in its temporary slab layout also avoids GSPMD's one-axis
-    gathers when unequal face blocks are concatenated.
+    gathers when unequal face blocks are concatenated. The blocks' local
+    tiles are joined before the first exchange, so a call makes two
+    ``all_to_all``s whatever its block count.
     """
     from jax import shard_map
     arrays = tuple(jnp.asarray(a) for a in arrays)
@@ -667,10 +669,13 @@ def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
            for i in range(ndim) if i != axis) for a in arrays):
         raise ValueError("sharded join requires matching non-joined dimensions")
 
-    def reindex(xs, indices):
-        x = xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=axis)
+    def reindex(x, indices, order=None):
+        """Select ``indices`` of the joined axis; ``order`` (static) first maps joined
+        positions to where the exchange put them."""
         if source_map is None:
-            return x
+            return x if order is None else jnp.take(x, order, axis=axis, unique_indices=True)
+        if order is not None:
+            indices = jnp.asarray(order)[indices]
         if not per_parent:
             return jnp.take(x, indices, axis=axis)
         indices = indices[:, None, :] if axis == 2 else indices[:, :, None]
@@ -684,7 +689,7 @@ def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
     names = spec[axis] if axis < len(spec) else None
     if names is None:
         xs = tuple(_pad(a, axis, pad_to) for a in arrays) if pad_to is not None else arrays
-        x = reindex(xs, source)
+        x = reindex(xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=axis), source)
         return x if crop_to is None else jax.lax.slice_in_dim(
             x, 0, int(crop_to), axis=axis)
     names = (names,) if isinstance(names, str) else tuple(names)
@@ -703,14 +708,20 @@ def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
                 n_shards, pad_to=pad_to, crop_to=crop_to)
         n_split = int(xs[0].shape[split])
         n_split_pad = -(-n_split // n_shards) * n_shards
-        def exchange(x):
-            if pad_to is not None:
-                x = _pad(x, axis, pad_to)
-            if n_split_pad != n_split:
-                x = _pad(x, split, n_split_pad)
-            return jax.lax.all_to_all(x, axis_name, split_axis=split,
-                                     concat_axis=axis, tiled=True)
-        x = reindex(tuple(exchange(a) for a in xs), indices)
+        if pad_to is not None:
+            xs = tuple(_pad(x, axis, pad_to) for x in xs)
+        # One exchange for every block: XLA lowers each all_to_all as n_shards
+        # per-peer slices, so one exchange per block would grow the program by
+        # blocks x n_shards.  The local tiles are joined first (one buffer, the
+        # joined tile's size); peer s then delivers its columns of block 0,
+        # block 1, ... in turn, and `order` reads the joined axis block-major.
+        x = xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=axis)
+        if n_split_pad != n_split:
+            x = _pad(x, split, n_split_pad)
+        x = jax.lax.all_to_all(x, axis_name, split_axis=split,
+                               concat_axis=axis, tiled=True)
+        x = reindex(x, indices, _block_major_order(
+            [int(a.shape[axis]) for a in xs], n_shards))
         x = jax.lax.all_to_all(x, axis_name, split_axis=axis,
                                concat_axis=split, tiled=True)
         if n_split_pad != n_split:
@@ -721,3 +732,20 @@ def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
 
     return shard_map(body, mesh=mesh, in_specs=((spec,) * len(arrays), P()),
                      out_specs=spec, check_vma=False)(arrays, source)
+
+
+def _block_major_order(widths, n_shards):
+    """Joined-axis positions after one exchange of side-by-side local tiles, or None.
+
+    Each of the ``n_shards`` peers holds ``widths[b]`` local columns of block
+    ``b``, joined block after block; the exchange stacks the peers' joined
+    tiles. Block ``b``'s global column ``s*widths[b] + t`` therefore sits at
+    ``s*sum(widths) + sum(widths[:b]) + t``. One block needs no reordering.
+    """
+    if len(widths) == 1:
+        return None
+    total = sum(widths)
+    starts = np.cumsum([0] + list(widths[:-1]))
+    return np.concatenate([s * total + start + np.arange(w, dtype=np.int32)
+                           for start, w in zip(starts, widths)
+                           for s in range(n_shards)]).astype(np.int32)
