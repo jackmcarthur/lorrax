@@ -219,10 +219,12 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     session) it is grow-only across the model's rounds and SC maps: the partner
     (TRS-odd) counts have no bound below the capacity, and the capacity costs
     the pencil eigh (capacity / high water)^3 on every round of every map (CrI3
-    24x24 at P64: CC 20800 against 17472, TT 32000 against 24832, +616 s per
-    map), so the extent is discovered in map 0, each growth recompiling the
-    round programs once (about 8 growths, about 250 s per chain), and held from
-    map 1 on.
+    24x24 at P64: CC 20800 against 17472, TT 32000 against 24832), so the extent
+    is discovered in map 0 and held from then on. The hold is keyed by the model
+    alone, not by its panel count: the line sites, and so the panels, change
+    from map to map, while the round programs take the packed columns
+    (``pack_panels``), whose shape is this extent only. A held extent past this
+    round's capacity is more inert zero columns.
 
     Returns a dict: ``order`` int32 [P, F] (index sum(widths) is the zero
     column), ``points`` complex128 [P, F], ``active`` bool [P, side] (finite
@@ -253,8 +255,8 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     if key is not None:
         if history is None:
             raise ValueError("round_tables: a grow-only extent needs the model's carrier history")
-        name = (key, "extent", len(halves), len(widths))
-        extent = min(capacity, max(extent, int(history.get(name, (0,))[0])))
+        name = (key, "extent", len(halves))
+        extent = max(extent, int(history.get(name, (0,))[0]))
         history[name] = (extent,)
     order = np.full((ranks, extent * len(halves)), offsets[-1], np.int32)
     points = np.zeros(order.shape, np.complex128)
@@ -274,6 +276,137 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     infinity = np.asarray([column_extent(int(c)) if blocks else 0 for c in infinity_counts], np.int64)
     return dict(order=order, points=points, active=np.concatenate((live,) + (tail,) * blocks, axis=1),
                 own=finite + infinity, extents=np.column_stack((finite, infinity)))
+
+
+def pack_panels(fields, order, widths, *, mesh_xy, layout):
+    """Each slot's pencil columns, placed from the round's state panels one panel at a time.
+
+    ``fields`` are K lists of the round's S state panels ``[B, n_k, r_s]`` (Q,
+    WQ, dWQ, or a cross action), ``order`` the host ``[B, F]`` table of
+    ``round_tables`` (column ``order[b, f]`` of the joined panels;
+    ``sum(widths)`` is the zero column) and ``widths`` the S panel widths.
+    Returns K arrays ``[B, n_k, F]`` with ``out[b, :, f] = panel_s[b, :, j]``
+    where ``order[b, f] = offset_s + j`` and zero where it names the zero
+    column, in the panels' ``layout``: ``'batch'`` (whole parents per rank,
+    ``P(BATCH)``) or ``'face'`` (``P(None, 'x', 'y')``).
+
+    One program per (layout, panel width, F) places one panel, and the panel
+    count is only the number of calls: the line sites change it from map to
+    map, and no program's shape follows it. The host inverts ``order`` per
+    panel, ``dest[b, j]`` the packed column of panel column j or F where the
+    round does not take it (the scatter drops it); a source column appears at
+    most once in a slot's table, so the scatter has one writer per column.
+    """
+    import numpy as np
+    order = np.asarray(order)
+    offsets = np.concatenate(([0], np.cumsum(widths))).astype(np.int64)
+    shapes = tuple((int(panels[0].shape[1]), np.dtype(panels[0].dtype).name) for panels in fields)
+    key = (mesh_xy, layout, int(order.shape[0]), int(order.shape[1]), shapes)
+    accs = _pack_start(*key)()
+    for s, width in enumerate(int(w) for w in widths):
+        # dest[b, j]: where column j of panel s lands in slot b's pencil, F (dropped) if nowhere.
+        taken = (order >= offsets[s]) & (order < offsets[s] + width)
+        dest = np.full((order.shape[0], width), order.shape[1], np.int32)
+        b, f = np.nonzero(taken)
+        dest[b, order[b, f] - offsets[s]] = f
+        dest = _batch_put(mesh_xy, dest) if layout == 'batch' else dest
+        accs = _pack_place(*key, width)(accs, tuple(panels[s] for panels in fields), dest)
+    return _pack_finish(*key)(accs)
+
+
+def _slab_rows(mesh_xy, rows):
+    """Rows per rank of a face matrix's slab: its x-tile's rows, padded to Py, split over y."""
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    return -(-(int(rows) // px) // py)
+
+
+@lru_cache(maxsize=None)
+def _pack_start(mesh_xy, layout, slots, extent, shapes):
+    """The K zero accumulators of ``pack_panels`` in their placement layout.
+
+    Batch: ``[B, n_k, F]`` at ``P(BATCH)``. Face: the slab ``[B, P * s_k, F]`` at
+    ``P(None, ('x', 'y'), None)``, rank x*Py+y holding s_k = ``_slab_rows`` whole
+    pencil rows (its x-tile's rows, padded to a multiple of Py, block y of them),
+    so a panel's columns land in any packed column without a second exchange.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    ranks = int(mesh_xy.size)
+    if layout == 'batch':
+        spec, rows = P(BATCH), [n for n, _ in shapes]
+    else:
+        spec, rows = P(None, BATCH, None), [ranks * _slab_rows(mesh_xy, n) for n, _ in shapes]
+    sharding = NamedSharding(mesh_xy, spec)
+    return jax.jit(lambda: tuple(jnp.zeros((slots, r, extent), dt) for r, (_, dt) in zip(rows, shapes)),
+                   out_shardings=(sharding,) * len(shapes))
+
+
+@lru_cache(maxsize=None)
+def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
+    """``accs[k][b, :, dest[b, j]] = panel_k[b, :, j]`` for one panel width, accumulators donated.
+
+    Face: one all_to_all over y moves the panel's tile ``[B, m, r/Py]`` to its
+    slab ``[B, s, r]`` (row block y of the x-tile, every column of the panel in
+    global order), the same bytes as the tile; the scatter is then local.
+    Batch: whole parents per rank, no exchange.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from jax import shard_map
+    py = int(mesh_xy.shape['y'])
+
+    def scatter(acc, panel, dest):
+        return jax.vmap(lambda a, p, d: a.at[:, d].set(p, mode='drop'))(acc, panel, dest)
+
+    if layout == 'batch':
+        def body(accs, panels, dest):
+            return tuple(scatter(a, p, dest) for a, p in zip(accs, panels))
+        specs = ((P(BATCH),) * len(shapes), (P(BATCH),) * len(shapes), P(BATCH))
+        out = (P(BATCH),) * len(shapes)
+    else:
+        def body(accs, panels, dest):
+            moved = []
+            for acc, panel in zip(accs, panels):
+                pad = py * int(acc.shape[1]) - int(panel.shape[1])
+                if pad:
+                    panel = jnp.pad(panel, ((0, 0), (0, pad), (0, 0)))
+                # Face tile -> slab: split the rows over y, join the column blocks in y order.
+                if py > 1:
+                    panel = jax.lax.all_to_all(panel, 'y', split_axis=1, concat_axis=2, tiled=True)
+                moved.append(scatter(acc, panel, dest))
+            return tuple(moved)
+        slab = P(None, BATCH, None)
+        specs = ((slab,) * len(shapes), (P(None, 'x', 'y'),) * len(shapes), P())
+        out = (slab,) * len(shapes)
+    return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=specs, out_specs=out, check_vma=False),
+                   donate_argnums=0)
+
+
+@lru_cache(maxsize=None)
+def _pack_finish(mesh_xy, layout, slots, extent, shapes):
+    """The packed accumulators in the panels' layout: batch as placed; face by the inverse
+    all_to_all (slab -> tile, one per field), its row padding dropped."""
+    import jax
+    from jax.sharding import PartitionSpec as P
+    from jax import shard_map
+    if layout == 'batch':
+        return lambda accs: accs
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    if extent % py:
+        raise ValueError(f"pack_panels: the extent {extent} must tile the {py} y ranks of the face")
+
+    def body(accs):
+        out = []
+        for acc, (rows, _) in zip(accs, shapes):
+            if py > 1:
+                acc = jax.lax.all_to_all(acc, 'y', split_axis=2, concat_axis=1, tiled=True)
+            out.append(acc[:, :rows // px])
+        return tuple(out)
+    slab = P(None, BATCH, None)
+    return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=((slab,) * len(shapes),),
+                             out_specs=(P(None, 'x', 'y'),) * len(shapes), check_vma=False))
 
 
 def own_extent_receipts(reduction, own):
@@ -322,9 +455,9 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
 
     put = lambda a: _batch_put(mesh_xy, np.asarray(a))
     live = np.arange(len(tables["own"])) < int(real)
-    args = (put(live), put(tables["points"]), put(tables["order"]), put(tables["active"]),
-            tuple(st[1] for st in states), tuple(st[2] for st in states),
-            tuple(st[3] for st in states), tuple(infinity))
+    q, o, d = pack_panels(tuple([st[k] for st in states] for k in (1, 2, 3)), tables["order"],
+                          [int(st[1].shape[-1]) for st in states], mesh_xy=mesh_xy, layout='batch')
+    args = (put(live), put(tables["points"]), put(tables["active"]), q, o, d, tuple(infinity))
     budget = None if keep_budget is None else int(keep_budget)
     return round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
                          bool(retain_span), gram_keep, budget)(*args)
@@ -382,10 +515,11 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
 @lru_cache(maxsize=None)
 def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retain_span=False,
                   gram_keep=None, carrier=None):
-    """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
+    """Assemble, reduce, gate and sort a round of parents, each on its own rank.
 
-    One program over batch layout: rank r packs slot r's Q, WQ, dWQ panels by
-    ``round_tables``, assembles the even or ordered pencil, reduces it with the
+    One program over batch layout: rank r takes slot r's packed Q, WQ, dWQ
+    columns (``pack_panels``, at the round's extent; no panel count enters the
+    program), assembles the even or ordered pencil, reduces it with the
     local eigensolver ``native_eigh`` (zero-row safe in the service), applies the zero
     policy, forms the retained (even) or original-infinity (ordered, odd
     moments) moment identity and sorts the poles. Every slot solves at the
@@ -395,7 +529,7 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
     ``lax.cond``. No array crosses ranks: the models stay in batch layout for
     ``round_checks``; only vectors are gathered.
 
-    Arguments ``(live [P], points, order, active, Qs, WQs, dWQs, infinity)``, all
+    Arguments ``(live [P], points, active, Q, WQ, dWQ [P, n, F], infinity)``, all
     in batch layout. Returns ``(model, signed, vectors, (reduction, zero,
     retained, permutation))`` in round order: model (b [P, n, side], poles2,
     active) and signed (c, mu, retained; ordered route, else ``()``) in batch
@@ -419,10 +553,8 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
             odd_moments=odd_moments, keep_budget=keep_budget, retain_span=retain_span, gram_keep=gram_keep,
             carrier=carrier)
 
-    def body(live, points, order, active, qs, os, ds, infinity):
-        def pack(panels):
-            return jnp.take(jnp.concatenate(panels, axis=-1), order[0], axis=-1, mode='fill', fill_value=0)
-        args = (points, pack(qs), pack(os), pack(ds), infinity, active)
+    def body(live, points, active, q, o, d, infinity):
+        args = (points, q, o, d, infinity, active)
 
         def work(args):
             return solve(*args)
@@ -434,11 +566,11 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
         result = model, signed, (*diagnostics, permutation)
         return (*result,reduced[3]) if retain_span else result
 
-    mapped = shard_map(body, mesh=mesh_xy, in_specs=(batch,) * 8, out_specs=batch, check_vma=False)
+    mapped = shard_map(body, mesh=mesh_xy, in_specs=(batch,) * 7, out_specs=batch, check_vma=False)
 
     @jax.jit
-    def execute(live, points, order, active, qs, os, ds, infinity):
-        reduced = mapped(live, points, order, active, qs, os, ds, infinity)
+    def execute(live, points, active, q, o, d, infinity):
+        reduced = mapped(live, points, active, q, o, d, infinity)
         model, signed, diagnostics = reduced[:3]
         result = model, signed, _gather(replicated, model[1:]), _gather(replicated, diagnostics)
         if retain_span:
