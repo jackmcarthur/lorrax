@@ -27,7 +27,7 @@ main `92cb1fe0e`; read the file rather than the number.
 | $R_S$ | ordered pencil side of sector $S$ for one round (the `side` of the report line) |
 | $c_S$ | kept-span carrier of a face reduction, `face_ritz_carrier` of $K_S$ |
 | $N$ | parents per construction round |
-| $\mathcal B$ | device budget per rank (`memory_per_device_gb` less the runtime reserve) |
+| $\mathcal B$ | planner budget per rank, the [memory rule](memory-model.md#budget) or a deck's `memory_per_device_gb` |
 
 ## 1 The model
 
@@ -382,8 +382,8 @@ it refuses only when that scratch cannot be measured (`GATE shared_pole_capacity
 
 ## 8 Worked byte budget: CrI3 24×24 at P64 {#sector-byte-budget}
 
-The deck of claim 3997: CrI3 ferromagnet, 24×24 k grid, P = 64 on
-8×8, $\mathcal B = 72.0$ GB per rank, $n_q = 61$, $n_C = 3328$, $n_T = 1728$, so
+The deck of claim 4083: CrI3 ferromagnet, 24×24 k grid, bispinor, P = 64 on
+8×8 (16 nodes of A100-80GB), `memory_per_device_gb = 72`, so $\mathcal B = 72.0$ GB per rank, $n_q = 61$, $n_C = 3328$, $n_T = 1728$, so
 $n_{CC} = 3328$, $n_{TT} = 5184$, $K_{CC} = 5991$, $K_{TT} = 9332$. The figures
 below are the shape prices of §4–5 at this deck; the sides are those the map-0
 selection produced.
