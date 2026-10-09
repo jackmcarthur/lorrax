@@ -369,8 +369,12 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
         # panel [b, rows, r] -> rows [b * r, rows] at b * F + dest; a dropped column (dest F)
         # goes past the accumulator, never onto the next slot's first column.
         b, rows, r = panel.shape
-        index = jnp.where(dest < extent, jnp.arange(b)[:, None] * extent + dest, b * extent)
-        return acc.at[index.reshape(-1)].set(jnp.swapaxes(panel, 1, 2).reshape(b * r, rows), mode='drop')
+        # Every index distinct: a dropped column goes to its own row past the accumulator,
+        # so the scatter is declared unique (a plain parallel store, no combiner).
+        past = int(acc.shape[0]) + jnp.arange(b * r).reshape(b, r)
+        index = jnp.where(dest < extent, jnp.arange(b)[:, None] * extent + dest, past)
+        return acc.at[index.reshape(-1)].set(jnp.swapaxes(panel, 1, 2).reshape(b * r, rows), mode='drop',
+                                             unique_indices=True)
 
     if layout == 'batch':
         def body(accs, panels, dest):
