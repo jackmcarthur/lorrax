@@ -244,7 +244,7 @@ bias grows linearly in $\eta_{\rm semi}$. An isolated level is biased only at
 second order, through the curvature of $\mathrm{Re}\,\Sigma_{ss}$.
 
 The measured biases on AgI 6³ (FR PBE, `number_bands_protected = 64`,
-shared-pole W, P4; [[CLAIM-SEMICORE-REF]]) are below: Re $\Sigma_c(E^{\rm DFT}_s)$ minus a
+shared-pole W, P4; claim 4088) are below: Re $\Sigma_c(E^{\rm DFT}_s)$ minus a
 reference, in eV, as the mean over the 16 irreducible k. The reference is the
 near grid stretched to −95 eV, so every state is read at the deck η = 0.25 eV.
 It is converged: ε = 10⁻⁴, 10⁻⁵ and 10⁻⁶ agree to 0.15 meV, and η = 0.125 eV
@@ -275,7 +275,7 @@ depth, which would otherwise read
 $\Sigma(\omega = 0)$, 4.6–10.2 eV from the reference on AgI against 0.5–2.2 eV on
 the 5 eV window. On AgI these reads cost 98 τ pairs (485 → 583, a 35 → 40 s
 sweep, cold at P4), and eqp within 10 eV of midgap moves by at most 0.28 meV
-([[CLAIM-SEMICORE-FIX]]). The 5 eV window takes 50 of them. The other 55 widen the
+(claim 4089). The 5 eV window takes 50 of them. The other 55 widen the
 near occupied crossing window from 180 to 235 nodes, because the coarse
 samples set the pole edge $\Lambda_h$ of their ω half
 ([Σ quadrature §4](theory/sigma-quadrature-problem.md#4-product-windows)).
