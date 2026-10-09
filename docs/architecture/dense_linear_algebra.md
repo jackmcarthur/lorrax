@@ -11,7 +11,7 @@ engine serves each platform, and which stage takes which plan. It ends with
 CrI3 24×24 at P64. The caller contract of every function named here is
 [`distrib_la`'s API](../services/distrib_la/api.md); which library serves which
 request is [its backends page](../services/distrib_la/backends.md). Code is cited
-as `file:line` at main `ef4a58db4`; read the file rather than the number.
+as `file:line` at `5ca246d5b`; read the file rather than the number.
 
 ## Symbols
 
@@ -48,30 +48,84 @@ the block-cyclic eigensolver's square-grid requirement always holds.
 
 ## 2 Layouts and the moves between them
 
-A matrix stack lives in one of three layouts
+A matrix stack lives in one of four layouts
 ([API: the mesh and the layouts](../services/distrib_la/api.md#the-mesh-and-the-layouts)):
 
 | layout | `PartitionSpec` | per device | used for |
 |---|---|---|---|
 | face | `P(None,'x','y')` | $(B, n/p, n/p)$ | every large object at rest; distributed GEMM and eigh |
+| slab | `P(None,('x','y'),None)` | $(B, n/P, n)$: whole rows | column selections and joins, between two exchanges |
 | batch | `P(('x','y'),None,None)` | $B_p/P$ whole matrices | rank-local solves (route (c)); resident factors |
 | local | replicated, or whole per-q tiles on their q owner | whole matrices | the `linalg = local` plan of a small solve |
 
-**Face to batch.** Route (c)'s move is two single-axis `all_to_all`s, $x$ then
-$y$, and back $y$ then $x$
+The face, slab and batch layouts hold the same $s\,B n^2/P$ bytes per device.
+The moves between them are explicit `shard_map` exchanges, so every byte
+crosses the network once and GSPMD never sees a move it could lower as
+replicate-then-partition.
+
+**Face to batch.** Route (c)'s move is one `all_to_all` over both axes
+`('x','y')`. It splits the stack and joins the $(n/p)^2$ tiles of every rank
+into whole matrices. The way back is its literal inverse
 (`_face_to_batch`, `_batch_to_face`,
 `services/distrib_la/src/distrib_la/_batch_reshard.py:122,138`; the step table is
 [API § batched routes](../services/distrib_la/api.md#batched-routes)). Each device
-sends and receives about $s\,B_p n^2/P$ bytes per direction. The move is written
-as an explicit `shard_map` because the one-step face-to-batch move is not a tile
-permutation, and GSPMD would lower it as replicate-then-partition. Ragged stacks
-are zero-padded to $B_p$; a zero pad matrix returns zeros.
+sends and receives about $s\,B_p n^2/P$ bytes per direction. The move is not a
+tile permutation, which is why it is written by hand. Ragged stacks are
+zero-padded to $B_p$; a zero pad matrix returns zeros.
+
+**Face to slab.** One `all_to_all` over `y` splits a face tile's $n/p$ rows
+into $p$ blocks and joins the $p$ column blocks of its mesh row in global
+order. Rank $(x, y)$ then holds rows $[x\,n/p + y\,n/P,\ x\,n/p + (y+1)\,n/P)$
+with every column. Rows are zero-padded to a multiple of $p$ inside the tile
+first. The inverse exchange returns the face.
 
 **Selections and concatenations.** Taking rows or columns of a face operand
-(selecting directions, sorting poles, assembling unequal blocks) exchanges to
-slabs over all ranks, selects locally and exchanges back
-(`common.staged_reshard`), because a sharding constraint on a global `take`
-can let GSPMD gather the operand onto one mesh axis.
+(selecting directions, sorting poles, assembling unequal blocks) goes through
+the slab: exchange, select or join locally, exchange back
+(`common.staged_reshard`). A sharding constraint on a global `take` can let
+GSPMD gather the operand onto one mesh axis.
+
+**Placing panels.** The q-local shared-pole round joins $S$ state panels
+$[B, n, r_s]$ and takes each slot's pencil columns from them
+([bispinor sectors §5.2](bispinor_shared_pole_w.md#5-construction), equation S 4a).
+`pack_panels` (`src/gw/shared_pole_local.py:286`) does this one panel at a time
+on the batch layout, before the round program: each rank scatters its own
+slots' panel columns as contiguous rows of a row-major accumulator and turns
+them back into columns once. No byte moves between ranks. The programs are fixed
+by the panel width and $F$, never by $S$, so a later SC map with more line
+panels makes more calls and no new program. The face programs join and take
+the panels themselves through the slab exchange.
+
+### What GSPMD emits {#what-gspmd-emits}
+
+A face program written in global view (slices, concatenations, `a + a^\dagger`,
+masks on face operands) is partitioned by GSPMD. Its collectives can be read off
+the optimized HLO and split by origin. Those whose `op_name` ends in a JAX
+collective primitive come from `shard_map` regions: `panel_matmul`'s SUMMA, the
+slab exchanges and route (c). The rest GSPMD inserted. The census below covers
+the staged sector programs at CrI3 24×24 P64 shapes: TT side 25856, $n_{TT}$ 4992,
+stage width 4; CT joint side 17408, stage width 4. They were compiled on CPU
+host meshes. Bytes are received per device per execution, with in-loop
+collectives weighted by their trip counts (claim FACEMAP-1).
+
+| program | optimized ops (2×2 → 8×8) | GSPMD collectives at 8×8 | GB/device at 8×8, GSPMD vs explicit |
+|---|---|---|---|
+| TT stage 1 (members) | 9328 → 31394 | 299 all-to-all, 154 collective-permute (45 at 2×2), 8 other | 19.0 vs 6.7 |
+| TT stages 2–4 | 4017 → 5034, 2208 → 2964, 3973 → 5855 | 43, 17, 56 | 3.5, 1.7, 2.3 vs 34.2, 49.0, 13.8 |
+| CT pencil | 15495 → 37743 | 3 | 0.15 vs 37.3 |
+
+What the attribution of stage 1 shows:
+- Every state panel joined inside the program costs its own small all-to-all
+  (219 of them, 0.7 GB), and the program depends on the panel count: twelve
+  more line panels grow stage 1 to 33662 operations and the CT pencil to 41775
+  at 8×8.
+- Most of the bytes GSPMD moves in stage 1 are the pencil's block joins
+  (`hermitian_block`, `join_columns` at the $F$ and $2 i_S$ offsets: 76
+  all-to-alls, 7.2 GB) and the paired-basis slices at the half-extent
+  offsets, which are not tile-aligned (138 collective-permutes, 8.1 GB).
+- The CT pencil's collectives are all explicit. Its growth with the mesh is its
+  per-panel joins (607 all-to-alls) and `panel_matmul`'s own panel structure:
+  the panel count and the narrower tail panel follow $n/p$.
 
 ## 3 The distributed product: SUMMA and `batch_gram`
 
@@ -153,7 +207,7 @@ $$
 
 the boundary being the arrays live beside that eigh; otherwise the whole mesh,
 with one warning. The shared-pole sectors decide each stack so
-(`staged_eigh`, `src/gw/shared_pole_execution.py:679`); a caller that passes a
+(`staged_eigh`, `src/gw/shared_pole_execution.py:678`); a caller that passes a
 room instead lets `distrib_la` decide each stack by the same price
 ([API § eigh-stack](../services/distrib_la/api.md#eigh-stack)). Nothing is
 compiled to be measured and no size is exchanged, so every rank decides alike
