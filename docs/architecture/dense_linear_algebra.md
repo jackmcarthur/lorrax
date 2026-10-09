@@ -11,7 +11,7 @@ engine serves each platform, and which stage takes which plan. It ends with
 CrI3 24×24 at P64. The caller contract of every function named here is
 [`distrib_la`'s API](../services/distrib_la/api.md); which library serves which
 request is [its backends page](../services/distrib_la/backends.md). Code is cited
-as `file:line` at `2be3ceaa9`; read the file rather than the number.
+as `file:line` at `5ca246d5b`; read the file rather than the number.
 
 ## Symbols
 
@@ -54,7 +54,7 @@ A matrix stack lives in one of four layouts
 | layout | `PartitionSpec` | per device | used for |
 |---|---|---|---|
 | face | `P(None,'x','y')` | $(B, n/p, n/p)$ | every large object at rest; distributed GEMM and eigh |
-| slab | `P(None,('x','y'),None)` | $(B, n/P, n)$: whole rows | column selections, joins and the shared-pole pack, between two exchanges |
+| slab | `P(None,('x','y'),None)` | $(B, n/P, n)$: whole rows | column selections and joins, between two exchanges |
 | batch | `P(('x','y'),None,None)` | $B_p/P$ whole matrices | rank-local solves (route (c)); resident factors |
 | local | replicated, or whole per-q tiles on their q owner | whole matrices | the `linalg = local` plan of a small solve |
 
@@ -85,17 +85,16 @@ the slab: exchange, select or join locally, exchange back
 (`common.staged_reshard`). A sharding constraint on a global `take` can let
 GSPMD gather the operand onto one mesh axis.
 
-**Placing panels.** The shared-pole round joins $S$ state panels
+**Placing panels.** The q-local shared-pole round joins $S$ state panels
 $[B, n, r_s]$ and takes each slot's pencil columns from them
 ([bispinor sectors §5.2](bispinor_shared_pole_w.md#5-construction), equation S 4a).
-`pack_panels` (`src/gw/shared_pole_local.py:285`) does this one panel at a time
-into accumulators held in the slab layout, row-major in the packed column
-($[B F, n/P]$ per rank, row $bF + f$). Each panel moves face to slab, the same
-bytes as its tile, and its columns are scattered locally as contiguous rows at
-host-computed destinations. Each finished field is transposed back to columns
-on its rank and moves slab to face once. The
-programs are fixed by the layout, the panel width and $F$, never by $S$, so a
-later SC map with more line panels makes more calls and no new program.
+`pack_panels` (`src/gw/shared_pole_local.py:286`) does this one panel at a time
+on the batch layout, before the round program: each rank scatters its own
+slots' panel columns as contiguous rows of a row-major accumulator and turns
+them back into columns once. No byte moves between ranks. The programs are fixed
+by the panel width and $F$, never by $S$, so a later SC map with more line
+panels makes more calls and no new program. The face programs join and take
+the panels themselves through the slab exchange.
 
 ### What GSPMD emits {#what-gspmd-emits}
 
@@ -109,24 +108,24 @@ stage width 4; CT joint side 17408, stage width 4. They were compiled on CPU
 host meshes. Bytes are received per device per execution, with in-loop
 collectives weighted by their trip counts (claim FACEMAP-1).
 
-| program, 8×8 | optimized ops (2×2 → 8×8) | GSPMD collectives | GB/device, GSPMD vs explicit |
+| program | optimized ops (2×2 → 8×8) | GSPMD collectives at 8×8 | GB/device at 8×8, GSPMD vs explicit |
 |---|---|---|---|
-| TT stage 1, main | 9328 → 31394 | 299 all-to-all, 154 collective-permute (45 at 2×2), 8 other | 19.0 vs 6.7 |
-| TT stage 1, packed columns | 4808 → 16512 | 80 all-to-all, 154 collective-permute (45 at 2×2), 8 other | 18.3 vs 6.1 |
+| TT stage 1 (members) | 9328 → 31394 | 299 all-to-all, 154 collective-permute (45 at 2×2), 8 other | 19.0 vs 6.7 |
 | TT stages 2–4 | 4017 → 5034, 2208 → 2964, 3973 → 5855 | 43, 17, 56 | 3.5, 1.7, 2.3 vs 34.2, 49.0, 13.8 |
-| CT pencil, main | 15495 → 37743 | 3 | 0.15 vs 37.3 |
-| CT pencil, packed columns | 5511 → 10557 | 3 | 0.15 vs 35.1 |
+| CT pencil | 15495 → 37743 | 3 | 0.15 vs 37.3 |
 
 What the attribution of stage 1 shows:
-- On main, every state panel joined inside the program cost its own small
-  all-to-all (219 of them), and the program depended on the panel count.
-  The pack removes both.
-- The bytes GSPMD still moves in stage 1 are the pencil's block joins
+- Every state panel joined inside the program costs its own small all-to-all
+  (219 of them, 0.7 GB), and the program depends on the panel count: twelve
+  more line panels grow stage 1 to 33662 operations and the CT pencil to 41775
+  at 8×8.
+- Most of the bytes GSPMD moves in stage 1 are the pencil's block joins
   (`hermitian_block`, `join_columns` at the $F$ and $2 i_S$ offsets: 76
   all-to-alls, 7.2 GB) and the paired-basis slices at the half-extent
   offsets, which are not tile-aligned (138 collective-permutes, 8.1 GB).
-- The CT pencil's remaining growth with the mesh is `panel_matmul`'s own panel
-  structure. The panel count and the narrower tail panel follow $n/p$.
+- The CT pencil's collectives are all explicit. Its growth with the mesh is its
+  per-panel joins (607 all-to-alls) and `panel_matmul`'s own panel structure:
+  the panel count and the narrower tail panel follow $n/p$.
 
 ## 3 The distributed product: SUMMA and `batch_gram`
 
