@@ -39,7 +39,7 @@ def _run(args):
     jax.config.update("jax_enable_x64", True)
 
     from common import Meta, RYD_TO_EV
-    from common.shard_map import shard_map
+    from jax import shard_map
     from file_io import load_centroids
     from file_io.paths import resolve_input_path
     from file_io.slab_io import SlabIO

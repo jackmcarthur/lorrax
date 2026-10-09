@@ -526,7 +526,7 @@ def _projector_shapes(mesh_xy, face_shape, axes, channels, right_face_shape,
 
 def _band_block_finish(mesh_xy, axes, px, py, nch):
     """``acc`` ``(nch, P·nk, nb, nb)`` partials → ``(nch, nk, m_X, n_Y)``."""
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     ax_x, ax_y = axes
     return jax.jit(shard_map(
@@ -573,7 +573,7 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
     projector to round-off, not bitwise.  ``μ_x`` pieces are zero-padded to
     ``p·⌈μ/P⌉``.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     ax_x, ax_y = axes
     nk, nb, ns, rb, mu_l, mu_r, p, _ = _projector_shapes(
@@ -710,7 +710,7 @@ def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
     x blocks.  ``channels='split_reim'`` projects ``Re O`` and ``Im O``
     into the same partial stack.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     ax_x, ax_y = axes
     nk, nb, ns, _, mu_l, mu_r, px, py = _projector_shapes(
@@ -884,7 +884,7 @@ def contract_bands_block_reshard(
                      right_face_shape=right_face_shape,
                      band_extent=face_band_extent, row_block=row_block)
 
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     if channels not in ("none", "split_reim"):
         raise ValueError(

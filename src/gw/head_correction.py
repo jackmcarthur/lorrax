@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
-from common.shard_map import shard_map
+from jax import shard_map
 from common.units import RYD_TO_EV
 
 
@@ -1055,7 +1055,7 @@ def _require_static_photon_numerical_certificate(
 @functools.partial(jax.jit, static_argnames=('layout', 'plans', 'mesh_xy'))
 def _photon_q0_factor_orbit(left, right, *, layout, plans, mesh_xy):
     """Transport both rank-four Γ factors through every typed little-group row before averaging their products."""
-    from common.shard_map import shard_map
+    from jax import shard_map
     from symmetry_maps import apply_band_matrix_symmetry
     from .photon_layout import _q0_local_factor_piece
     if not plans:

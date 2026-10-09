@@ -106,7 +106,7 @@ def _drude_contract(mesh_xy):
     Replicate only the band axis of these O(k*n*mu) carriers. Every
     quadratic output remains tiled over BOTH mesh axes throughout.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     return jax.jit(shard_map(
         lambda l, r, w: jnp.einsum("kmn,kn,knv->mv", l, w, r.conj()),
         mesh=mesh_xy, in_specs=(P(None, "x", None), P(None, None, "y"), P()),
@@ -169,7 +169,7 @@ def _current_density_program(mesh_xy, mun_spec, nmu_spec, n_tables, n_sym_spatia
     """
     from functools import partial
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
-    from common.shard_map import shard_map
+    from jax import shard_map
     from gw.photon_layout import TRANSVERSE
     from symmetry_maps import unfold_wavefunction_local
 

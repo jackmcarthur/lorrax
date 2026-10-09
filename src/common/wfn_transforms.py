@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from runtime.padding import pad_axis, spec_divisor
-from common.shard_map import shard_map
+from jax import shard_map
 from common.staged_reshard import band_to_product_r_reshard
 from common.wfn_layout import band_sphere_spec
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P

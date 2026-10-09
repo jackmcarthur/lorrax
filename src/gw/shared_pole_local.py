@@ -47,7 +47,7 @@ def batch_to_face(mesh_xy):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from runtime.padding import padded_axis
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 
@@ -75,7 +75,7 @@ def batch_stack_to_face(mesh_xy, nq):
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from runtime.padding import padded_axis
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 
@@ -404,7 +404,7 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
@@ -584,7 +584,7 @@ def round_checks(mesh_xy, native_eigh, ordered):
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b

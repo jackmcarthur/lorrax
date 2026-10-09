@@ -24,7 +24,7 @@ from typing import Callable, Dict, Optional, Sequence, Tuple
 import numpy as np
 import jax
 import jax.numpy as jnp
-from common.shard_map import shard_map
+from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from runtime.padding import authenticate_padded_axis
 

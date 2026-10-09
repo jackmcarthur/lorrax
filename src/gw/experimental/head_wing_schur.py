@@ -66,7 +66,7 @@ from typing import Tuple
 
 import jax
 import jax.numpy as jnp
-from common.shard_map import shard_map
+from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 

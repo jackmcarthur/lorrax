@@ -207,7 +207,7 @@ def band_to_product_r_reshard(
     hit = _PRODUCT_R_RESHARD.get((mesh, tuple(axes)))
     if hit is not None and hit[0] is mesh:
         return hit[1]
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     ax_x, ax_y = axes
     names = tuple(mesh.axis_names)
@@ -309,7 +309,7 @@ def shard_local_slice_pad(
     The same compiled executable therefore serves every tile offset, including
     the padded tail, without a global reshard or a second padding convention.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     size = int(local_size)
     if size <= 0:
@@ -372,7 +372,7 @@ def shard_local_update(mesh: Mesh, *, spec: P) -> Callable:
     backward clamping.  The body is inside ``shard_map`` and donates ``dst``;
     it cannot communicate or allocate a second global face.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     sh = NamedSharding(mesh, spec)
     rep = NamedSharding(mesh, P())
@@ -479,7 +479,7 @@ def face_to_batch_reshard(mesh: Mesh, *,
     created from an intra-op pool worker dies on jaxlib's
     ``MPI_Is_thread_main`` guard.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     ax_x, ax_y = axes
     names = tuple(mesh.axis_names)
@@ -604,7 +604,7 @@ def permute_sharded_operator(arr, conversions, mesh, spec, *,
     Each conversion is (axis, source_map, local_pad, local_crop).
     All collectives and the loop remain in one manual-axis region.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.experimental.layout import Layout, with_layout_constraint
     local = tuple(int(n) // int(spec_divisor(mesh, spec, i))
                   for i, n in enumerate(arr.shape))
@@ -654,7 +654,7 @@ def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
     blocks in its temporary slab layout also avoids GSPMD's one-axis
     gathers when unequal face blocks are concatenated.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     arrays = tuple(jnp.asarray(a) for a in arrays)
     arr = arrays[0]
     ndim = int(arr.ndim)

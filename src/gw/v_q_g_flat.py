@@ -105,8 +105,8 @@ def _make_q_tile_kernel(mesh_xy: Mesh, n_rmu_L: int, n_rmu_R: int,
     if hit is not None:
         return hit
 
-    from common.shard_map import shard_map
-    from common.vma import mark_varying
+    from jax import shard_map
+    from lxkit import mark_varying
 
     face_sh = NamedSharding(mesh_xy, P(('x', 'y'), None))
     # The R face in ('y','x') block order: then each 'y' block of μ_R is the

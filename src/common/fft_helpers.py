@@ -3,7 +3,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
-from common.shard_map import shard_map
+from jax import shard_map
 
 
 # Value-level parity contract for the canonical flat-k service.  This is the

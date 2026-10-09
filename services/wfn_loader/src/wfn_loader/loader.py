@@ -88,7 +88,7 @@ import h5py as h5
 import jax
 import jax.numpy as jnp
 import numpy as np
-from ._shard_map import shard_map
+from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ._collectives import device_put_process_local

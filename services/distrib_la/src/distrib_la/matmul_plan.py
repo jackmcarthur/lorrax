@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la._shard_map import shard_map
+from jax import shard_map
 from distrib_la.matmul import MATMUL_BACKEND_CHOICES, _mesh_shape, _zeros
 from distrib_la.resolve import mesh_platform
 

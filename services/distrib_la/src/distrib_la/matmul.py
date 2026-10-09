@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la._shard_map import shard_map
+from jax import shard_map
 from distrib_la.plan import (BATCHED_ROUTE_CHOICES, BATCHED_ROUTE_DEFAULT,
                              ROUTE_BATCH_RESHARD, ensure_sharding)
 from distrib_la.resolve import mesh_key

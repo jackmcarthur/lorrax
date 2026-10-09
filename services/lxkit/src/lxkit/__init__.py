@@ -3,8 +3,8 @@
 Six things that standalone services need and must not own private copies of:
 the env-dial :class:`~lxkit.gate.Gate` (grammar, rank discipline,
 announce-or-refuse), the ABSENT-vs-BROKEN probe vocabulary
-(:mod:`lxkit.probe`), the jax-version-boundary shims
-(:mod:`lxkit.jax_compat`), process-local array placement
+(:mod:`lxkit.probe`), the loop-carry marking
+(:func:`mark_varying`), process-local array placement
 (:mod:`lxkit.placement`), native-provider selection/attestation policy
 (:mod:`lxkit.native_provider`), and the per-user persistent-cache root
 (:mod:`lxkit.cache`).  :mod:`lxkit.testing` ships the pytest harness
@@ -47,13 +47,6 @@ from lxkit.gate import (
     rank_id,
     reset_gate_state,
 )
-from lxkit.jax_compat import (
-    VMA_TRACKING_SINCE,
-    VmaSupportError,
-    mark_varying,
-    select_mode,
-    vma_mode,
-)
 from lxkit import native_provider
 from lxkit.cache import user_cache_dir
 from lxkit.placement import device_put_process_local, device_put_process_tiles
@@ -67,6 +60,15 @@ from lxkit.probe import (
     unknown_target,
 )
 
+
+def mark_varying(x, axes):
+    """Declare ``x`` device-varying over the mesh ``axes`` inside ``shard_map``
+    (a loop carry built from zeros); no communication.  Mark only the axes the
+    body introduces: a marked carry that leaves through a replicated
+    ``out_specs`` is an error."""
+    from jax import lax
+    return lax.pcast(x, axes, to="varying")
+
 __all__ = [
     # gate
     "Gate", "MODE_SPELLINGS", "MODE_HELP", "FFI_PLATFORM_MAP",
@@ -76,8 +78,7 @@ __all__ = [
     "ProbeResult", "AVAILABLE", "LibraryNotBuilt", "LibraryUnusable",
     "unknown_target", "not_loadable", "missing_symbol",
     # JAX utilities
-    "device_put_process_local", "device_put_process_tiles", "mark_varying", "vma_mode", "select_mode",
-    "VMA_TRACKING_SINCE", "VmaSupportError",
+    "device_put_process_local", "device_put_process_tiles", "mark_varying",
     # native-provider policy (the tables remain with each caller)
     "native_provider",
     # the per-user persistent-cache root

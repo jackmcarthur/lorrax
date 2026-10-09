@@ -56,7 +56,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P
 
-# ``common.shard_map`` and ``common.fft_helpers`` are imported inside the
+# ``common.fft_helpers`` is imported inside the
 # function bodies that use them: importing any ``common`` submodule runs
 # ``common/__init__.py``, which imports ``common.fft_helpers``, which imports
 # this module, so a module-scope import here would close an import cycle.
@@ -983,7 +983,7 @@ def live_row_mask(live, n_rows: int, per_row: int = 1):
 
 
 def _sharded(local, mesh, in_specs, out_spec):
-    from common.shard_map import shard_map     # see the import-cycle note
+    from jax import shard_map
     return shard_map(local, mesh=mesh, in_specs=in_specs, out_specs=out_spec,
                      check_vma=False)
 

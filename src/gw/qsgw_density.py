@@ -748,7 +748,7 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     impossible; pass ``sym_perm`` whenever the k-set is reduced, uniform
     weights or not.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     grid = tuple(int(s) for s in fft_grid)
     ngrid = int(np.prod(grid))

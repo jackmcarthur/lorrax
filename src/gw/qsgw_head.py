@@ -13,7 +13,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
-from common.shard_map import shard_map
+from jax import shard_map
 from gw.degen_average import TOL_DEGENERACY_RY
 
 

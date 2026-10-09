@@ -186,13 +186,11 @@ else.
 | `rank_criterion.py` | Applies the shared numerical-rank criterion. |
 | `sanity.py` | Runs scientific sanity checks and diagnostics. |
 | `scientific_output.py` | Formats shared scientific output records. |
-| `shard_map.py` | Supplies common shard-map wrappers and checks. |
 | `sharding_fit.py` | A `PartitionSpec` that divides the extents in hand. |
 | `spectral_closure.py` | Closes truncation cuts over spectral degeneracies. |
 | `staged_reshard.py` | Implements staged collective reshards. |
 | `timing.py` | Records scoped timing measurements. |
 | `units.py` | Defines unit conversions. |
-| `vma.py` | `mark_varying`: marks a loop carry as device-varying across JAX versions. |
 | `wfn_layout.py` | Describes wavefunction shardings and layout conversions. |
 | `wfn_transforms.py` | Loads and transforms wavefunctions in band chunks. |
 | `zeta_projection.py` | Projects zeta data between basis layouts. |
@@ -405,7 +403,7 @@ caller contracts ([substrate services](architecture/services.md)).
 | service | level | owns | extras |
 |---|---|---|---|
 | `distrib_la` | L3 | distributed dense linear algebra on the `('x','y')` mesh: plans, GEMM and SUMMA panels, eigh, Cholesky, LU, polar factor, with cuSOLVERMp/cuBLASMp, SLATE, ScaLAPACK and pure-JAX backends ([contract](services/distrib_la/api.md)) | `bench/`, `docs/` |
-| `lxkit` | L3 (`deck_doctor` L1) | the foundation the services share: capability gates, the absent-versus-broken probe vocabulary, JAX version shims, process-local placement, native-provider attestation, the cache root; `python -m lxkit.deck_doctor` preflights a deck | |
+| `lxkit` | L3 (`deck_doctor` L1) | the foundation the services share: capability gates, the absent-versus-broken probe vocabulary, loop-carry marking (`mark_varying`), process-local placement, native-provider attestation, the cache root; `python -m lxkit.deck_doctor` preflights a deck | |
 | `minimax` | L1 | runtime quadrature rules: screening, Σ box rules, response-bank rules, their certificates ([contract](services/minimax.md)) | |
 | `symmetry_maps` | L1 | the space group of a deck: k-grid reduction, IBZ ⇄ full-BZ tables, unfolds, q-grid time-reversal policy, the QE-schema binding ([contract](services/symmetry_maps.md)) | `bench/` |
 | `vcoul` | L1 | the bare and truncated Coulomb interaction, mini-BZ averages, the Coulomb sphere, BerkeleyGW `vcoul` parsing ([contract](services/vcoul.md)) | `bench/` |

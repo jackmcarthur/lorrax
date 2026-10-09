@@ -336,7 +336,7 @@ def _extract_diag_sharded_kernel(mesh_xy: Mesh):
     fn = _EXTRACT_DIAG_SHARDED_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
-        from common.shard_map import shard_map
+        from jax import shard_map
 
         p_x = int(mesh_xy.shape['x'])
 
@@ -395,7 +395,7 @@ def sigma_diag_at_omega_slots(sigma_w_kij, mesh_xy: Mesh, slots_s_kn, *,
     fn = _EXTRACT_DIAG_SLOTS_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
-        from common.shard_map import shard_map
+        from jax import shard_map
 
         p_x = int(mesh_xy.shape['x'])
 
@@ -462,7 +462,7 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn, *,
     fn = _ADD_BAND_DIAG_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
-        from common.shard_map import shard_map
+        from jax import shard_map
 
         @partial(jax.jit, donate_argnums=(0,) if donate else ())
         @partial(shard_map, mesh=mesh_xy,
@@ -511,7 +511,7 @@ def add_band_diag_rows_sharded(sigma_w_kij: jax.Array, band_rows, *,
     fn = _ADD_BAND_DIAG_ROWS_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
-        from common.shard_map import shard_map
+        from jax import shard_map
 
         @partial(jax.jit, donate_argnums=(0,) if donate else ())
         @partial(shard_map, mesh=mesh_xy,
@@ -570,7 +570,7 @@ def set_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
     fn = _SET_BAND_DIAG_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
-        from common.shard_map import shard_map
+        from jax import shard_map
 
         @jax.jit
         @partial(shard_map, mesh=mesh_xy,

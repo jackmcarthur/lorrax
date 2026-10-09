@@ -133,8 +133,8 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.shard_map import shard_map as _shard_map_fn
-from common.vma import mark_varying
+from jax import shard_map as _shard_map_fn
+from lxkit import mark_varying
 
 from common.contract_bands import reduce_scatter_to_band_block
 from common.fft_helpers import (klead_outer_decode_refusal, klead_outer_refusal,

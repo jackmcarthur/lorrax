@@ -613,7 +613,7 @@ def load_restart_state_from_h5(filename, mesh_xy, band_slices=None,
 def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="charge"):
     """Authenticate canonical parent faces and unfold only the selected BSE bands."""
     from common.centroid_basis import PackedCentroidBasis
-    from common.shard_map import shard_map
+    from jax import shard_map
     from file_io.centroids import load_centroid_basis
     from file_io.qp_wfn import authenticate_restart_qp_state_source_for_wfn
     from file_io.wfn_basis import centroid_table_md5

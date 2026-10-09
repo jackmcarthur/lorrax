@@ -42,7 +42,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._result_check import native_eigh
-from distrib_la._shard_map import shard_map
+from jax import shard_map
 from distrib_la.resolve import mesh_key
 
 __all__ = ["batch_layout", "batch_layout_eigh_call", "batch_reshard_call",

@@ -32,7 +32,7 @@ def _contiguous_q_spans(ids, real):
 @lru_cache(maxsize=None)
 def _sector_read_programs(mesh,indices,masks,execution):
     import jax
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_execution import face_program
     def select(a):
@@ -84,7 +84,7 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     """
     import jax
     import numpy as np
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.sharding import PartitionSpec as P
     from file_io.shared_pole_store import read_shared_pole_bank
 
@@ -551,7 +551,7 @@ def sector_held_errors(signed, samples, z, *, mesh_xy):
 def _local_held_program(mesh):
     from functools import partial
     import jax
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_local import _mm
     spec=P(('x','y'))
@@ -1119,7 +1119,7 @@ def _pack_cross_spans(sectors, widths, *, mesh_xy, execution):
 def _local_compact_program(mesh,width):
     from functools import partial
     import jax
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.sharding import PartitionSpec as P
     spec=P(('x','y'))
     return jax.jit(shard_map(partial(_compact_sector_equations,width=width),mesh=mesh,
@@ -1153,7 +1153,7 @@ def positive_cross_models(signed, *, mesh_xy):
 def _local_positive_cross_program(mesh):
     from functools import partial
     import jax
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     spec=P(('x','y'))
@@ -1264,7 +1264,7 @@ def cross_round_actions(samples, states, roles, recipe, *, sample_ids, mesh_xy, 
 @lru_cache(maxsize=None)
 def _local_cross_action_program(mesh,mirror,imaginary,conjugate):
     import jax
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_local import _mm
     def apply(panels,q,node,sample):
@@ -1295,7 +1295,7 @@ def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan
 def _local_cross_parent_program(mesh,native_eigh):
     from functools import partial
     import jax
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.sharding import PartitionSpec as P
     from gw.shared_pole_local import _mm
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates

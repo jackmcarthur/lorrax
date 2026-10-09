@@ -160,7 +160,7 @@ def least_squares_transfer(
     property of (‡) survives truncation with "representable" read as
     "representable in the retained span".
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     if rcond is None:
         chol = jnp.linalg.cholesky(gram_S)

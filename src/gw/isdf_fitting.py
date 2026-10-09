@@ -157,7 +157,7 @@ def add_pad_diagonal_sharded(C, active_mask, n_logical, *, mesh_xy):
     outside the rank's tile.
     """
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     nq, n, n2 = (int(v) for v in C.shape)
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
     if n != n2 or n % px or n % py:

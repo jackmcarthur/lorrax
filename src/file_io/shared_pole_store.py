@@ -2467,7 +2467,7 @@ def _bank_face_to_batch(mesh, ndim):
     The literal schedule of ``common.staged_reshard.face_to_batch_reshard`` with the
     face axes last: no arithmetic, bit-exact, no rank ever holds another's whole row.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
 
     def body(a):
@@ -2497,7 +2497,7 @@ def _bank_concat_columns(mesh, spec):
 @lru_cache(maxsize=None)
 def _resident_sector_select(mesh, ndim, starts, widths):
     """Local C/T rectangle of each rank's photon face tile, still face tiled."""
-    from common.shard_map import shard_map
+    from jax import shard_map
     spec = P(*((None,) * (ndim - 2)), "x", "y")
 
     def local(tile):

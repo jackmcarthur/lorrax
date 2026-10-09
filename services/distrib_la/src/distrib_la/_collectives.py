@@ -108,7 +108,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     from jax import lax
     from jax.sharding import PartitionSpec as P
 
-    from distrib_la._shard_map import shard_map
+    from jax import shard_map
 
     if jax.process_count() <= 1:
         return 0.0

@@ -37,8 +37,7 @@ is the one that has to mark its loop carry.  It used to carry a private
 at jax 0.7.0 and 0.7.x has no ``lax.pcast`` at all, so the except-branch
 installed a NO-OP on exactly the generation that enforces the marking,
 including the container the file's own docstring named.
-:func:`lxkit.jax_compat.mark_varying` owns the decision now, with the
-measured version table and a refusal instead of a silent identity.
+jax is pinned to 0.9, and :func:`lxkit.mark_varying` is ``lax.pcast``.
 """
 from __future__ import annotations
 
@@ -50,9 +49,9 @@ import jax.numpy as jnp
 from jax import lax
 from jax.scipy.linalg import solve_triangular
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from lxkit.jax_compat import mark_varying
+from lxkit import mark_varying
 
-from distrib_la._shard_map import shard_map
+from jax import shard_map
 from distrib_la.resolve import mesh_key
 
 __all__ = ["cholesky", "block_size_for", "dense_to_tiles", "tiles_to_dense"]
@@ -189,7 +188,7 @@ def _chol_2d_single(mesh: Mesh, J: int, b: int):
             # loop with "the varying manual axes do not match".  Mark the
             # axes the BODY introduces, not every mesh axis: over-marking a
             # carry that leaves through a replicated out_specs is itself an
-            # error (measured; see lxkit.jax_compat).
+            # error (measured; see lxkit.mark_varying).
             panel_init = mark_varying(jnp.zeros((J, b, b), dtype), ("x", "y"))
 
             def fill_panel(i_loc, panel):

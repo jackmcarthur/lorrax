@@ -7,7 +7,7 @@ import numpy as np
 from jax import lax
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from ._shard_map import shard_map
+from jax import shard_map
 from .resolve import mesh_platform
 
 

@@ -133,9 +133,9 @@ k-convolution router's factories re-exported from `ffi.fft`
 the `shard_map`-interior `local_*fftn3` aliases.
 
 **jax glue and instrumentation**: `common/{jax_compile_cache, jax_profile,
-timing, progress, gpu_utils, async_io, sanity}.py`, and the two version
-shims `common/shard_map.py` (which symbol, which kwarg spelling) and
-`common/vma.py` (which spelling marks a loop carry device-varying).
+timing, progress, gpu_utils, async_io, sanity}.py`. `shard_map` is
+`jax.shard_map` and loop-carry marking `lxkit.mark_varying` (jax is
+pinned to 0.9; no version shim).
 
 **Native libraries**: the whole `ffi` package, meaning location, probing,
 gating and dispatch. `ffi/gate.py` owns grammar, platform, probe and
@@ -184,11 +184,7 @@ readers above it (`epsreader`, `mf_header`, `sigma_output`, `tagged_arrays`,
    because a mesh axis has to divide an extent. It owns logical-to-carrier
    receipts, exact-zero producer padding, consumer masks and spec-derived
    divisors ([Mesh-padded axes](padding.md)).
-10. **`common/vma.py`: L3, not L2.** It contains no arithmetic. Its subject is
-    mesh axes and whether a value may differ per device, which is L3's
-    vocabulary. Between two levels that both fit, L3 is the tighter
-    assignment, since L3 may import nothing above itself.
-11. **Minimax: a service plus two L1 modules.** The physics-free quadrature
+10. **Minimax: a service plus two L1 modules.** The physics-free quadrature
     solver is the `minimax` service (reached through its public API).
     `gw/minimax_config.py`, which picks a target error for a screening
     integral, and `gw/minimax_screening.py`, which extracts PPM poles, are L1.

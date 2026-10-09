@@ -29,7 +29,7 @@ from __future__ import annotations
 import jax
 from jax import lax, config
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
-from common.shard_map import shard_map
+from jax import shard_map
 
 from common.collectives import (
     device_put_process_local,
