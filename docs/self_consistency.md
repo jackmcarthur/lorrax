@@ -273,7 +273,8 @@ its requested set (the QP-matrix states the W model treats as active, §4;
 depth, which would otherwise read
 $\Sigma(\omega = 0)$, 4.6–10.2 eV from the reference on AgI against 0.5–2.2 eV on
 the 5 eV window. On AgI these reads cost 98 τ pairs (485 → 583, a 35 → 40 s
-sweep, cold at P4). The 5 eV window takes 50 of them. The other 55 widen the
+sweep, cold at P4), and eqp within 10 eV of midgap moves by at most 0.28 meV
+([[CLAIM-SEMICORE-FIX]]). The 5 eV window takes 50 of them. The other 55 widen the
 near occupied crossing window from 180 to 235 nodes, because the coarse
 samples set the pole edge $\Lambda_h$ of their ω half
 ([Σ quadrature §4](theory/sigma-quadrature-problem.md#4-product-windows)). A requested coarse state keeps the near grid. The near grid
