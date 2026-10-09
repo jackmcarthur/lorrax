@@ -67,9 +67,11 @@ srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
 
 pytest captures the per-stage walls; add `-s` to see them. The suite writes
 nothing in the source tree, so it also runs from a read-only install. Its run
-directories (about 25 MB each, kept) and its compile cache are under
-`$SCRATCH/.cache/lorrax/hsuite`, or `~/.cache/lorrax/hsuite` where the site
-defines no `SCRATCH`; `HSUITE_CACHE_DIR` moves the compile cache.
+directories (about 25 MB each, kept) are under `$SCRATCH/.cache/lorrax/hsuite`,
+or `~/.cache/lorrax/hsuite` where the site defines no `SCRATCH`. Its compile
+cache is the runtime's own, and `HSUITE_CACHE_DIR` moves it. The suite's
+[README](../tests/hsuite/README.md#wall-time-and-caches) says what a warm run
+needs and how `summary.json` splits each stage's wall.
 
 The P4 verdict is the four-rank `srun` line above. A one-rank launch
 (`srun -n 1 --gpus-per-node=1`) runs the same cell at P1, which is a smoke

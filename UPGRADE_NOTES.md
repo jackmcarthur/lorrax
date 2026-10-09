@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-09 — `tests/hsuite` uses the runtime's compile cache and reports a per-stage compile census
+
+With `HSUITE_CACHE_DIR` unset, the suite no longer points `ISDF_JAX_CACHE_DIR`
+at `$SCRATCH/.cache/lorrax/hsuite/jax-cache`, a directory that was never
+namespaced by FFI bundle or pruned. It uses the runtime's cache instead: an
+exported `ISDF_JAX_CACHE_DIR`, else the default namespace. The first run after
+this change is therefore JAX-cold once. The old `hsuite/jax-cache` directory is
+no longer read and may be deleted. `HSUITE_CACHE_DIR` still moves the cache,
+and `python -m tests.hsuite.chain` still defaults to a cold `<out>/jax-cache`.
+
+`summary.json` gains `compile_s`, which splits each stage's wall into trace,
+lowering, cache reads and XLA compiles, the compile agreement, and NVRTC
+cubin builds (`tests/hsuite/README.md`, "Wall time and caches"). Each stage
+log now ends with a compile receipt. An SC driver's map-0 receipt therefore
+counts that driver only, not every stage since the process started. No result
+moves and no deck changes.
+
 ## 2026-10-09 — the four-current χ₀ stream applies the Dirac parity on k rows on the XLA and cpu routes
 
 `ffi.fft.make_kconv_chi_vertex` (mode 11 with channel vertices) on the XLA backend and on the
