@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-09 — the four-current χ₀ stream applies the Dirac parity on k rows on the XLA and cpu routes
+
+`ffi.fft.make_kconv_chi_vertex` (mode 11 with channel vertices) on the XLA backend and on the
+cpu plan backend multiplied the inverse-transformed (R-space) Gc operand by `sign_c`, the
+per-k Dirac parity of the four-current stream's mixed quadrants
+(`gw.w_isdf._photon_chi_kconvs`). It now multiplies Gc's unfolded k rows before the transform,
+as the mathdx kernel does on its load. Results move on those two routes for every bispinor
+four-current response (`bispinor_gw = full_shared_pole`, and the photon χ₀ streams generally)
+whose symmetry group has an operation with parity −1. On those routes the bare moments were
+not Hermitian (CrI3 6×6 bispinor SC at P4: `GATE response_moment_hermiticity`, 1.8e-6 against
+3.3e-11), so such runs refused in map 0. The mathdx route does not move. No deck change.
+
 ## 2026-10-09 — `linalg` is the only dense-layout dial; the ζ stamp drops `distributed_lu`
 
 `exciton_bands` and `htransform` no longer take `--eigh-backend` or
