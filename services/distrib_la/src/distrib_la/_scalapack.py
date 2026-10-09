@@ -3,7 +3,7 @@
 Ported verbatim from LORRAX ``src/ffi/linalg/_scalapack.py`` at 96a6399
 (itself the wave-2 merge of the former ``ffi.scalapack`` package:
 ``eigh.py`` — ``pXheevd``, the permanent CPU backend for distributed eigh —
-and ``solve_lu.py`` — ``pXgetrf``/``pXgetrs``, the ``distributed_lu`` axis).
+and ``solve_lu.py`` — ``pXgetrf``/``pXgetrs``, the distributed LU).
 Nothing is renamed; the only edits are the import lines.
 
 **ScaLAPACK is a published API, not a product.**  Which implementation is

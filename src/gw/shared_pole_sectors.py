@@ -168,7 +168,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
     parents' models before the next round reads.
 
     Signed stability is the positive retained H of the ordered pencil; see
-    docs/architecture/shared_pole_model.md. Scalar positive-V upper passivity
+    docs/architecture/bispinor_shared_pole_w.md. Scalar positive-V upper passivity
     is inapplicable. Held W and moment residuals are diagnostics; physical
     accuracy is measured independently on the integrated sector Sigma.
     """

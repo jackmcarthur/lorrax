@@ -515,8 +515,9 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
                      selection=None, extra=lambda width: 0, eigen_side=None):
     """Largest whole-mesh parent batch whose selection and reduction fit.
 
-    A face route runs a batch of physical parents per round, every matrix
-    tiled over all ranks (``face_reduce_round``, the sector rounds). Before
+    The scalar face route runs a batch of physical parents per round, every
+    matrix tiled over all ranks (``face_reduce_round``); the bispinor sectors
+    size their rounds by P instead (``shared_pole_sectors.sector_route``). Before
     any bank read, at the conservative recipe side, the ``selection`` price
     (its ``quote`` arguments) may reject a width; the reduction program's
     price at that width (``program_bytes(width)``: ``shared_pole_byte_terms``

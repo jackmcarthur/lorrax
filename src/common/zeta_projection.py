@@ -152,8 +152,8 @@ def least_squares_transfer(
     ``-4.5e-05 … 6.9e+11`` — numerically singular, the negative end being
     round-off on a positive-semidefinite matrix.  A real ISDF basis is
     strongly linearly dependent on its own sphere; the ISDF FIT already
-    fights exactly this with ``charge_zeta_solve=rank_truncate`` and the
-    RCOND dials.  The synthetic study could never have shown it
+    fights exactly this with its rank-truncated charge solve
+    (``charge_zeta_solve = rank_truncate`` on either ``linalg`` layout).  The synthetic study could never have shown it
     (cond ≈ 20 there), which is why it had to be run on real ζ.
 
     ``T`` is exact on the retained subspace, so the representability

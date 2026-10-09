@@ -901,7 +901,7 @@ def compute_wc_qwedge(
       materialising the ``N_mu x N_mu`` tile per rank is the replication the
       scaling doctrine forbids.  ``allow_replicated_dyson=True`` takes
       ``"lift"`` anyway and accepts exactly the per-rank memory class the RPA
-      Dyson's own default (``w_dyson_solver = local``, ``gw.w_isdf.solve_w``)
+      Dyson's own default (``linalg = local``, ``gw.w_isdf.solve_w``)
       already has; routing the close through ``distrib_la`` — the twin of that
       solver's ``distributed`` plan — is the registered follow-on, named here
       rather than half-built.

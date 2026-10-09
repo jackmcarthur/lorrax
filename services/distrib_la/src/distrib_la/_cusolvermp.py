@@ -923,8 +923,8 @@ def batched_distributed_solve_lu(
     order that selects between the two stages is load-bearing.
 
     Used by the ζ-fit transverse channels (indefinite CCT^μ) and — via the
-    plan facade on CUDA meshes — by the W Dyson ``w_dyson_solver =
-    distributed`` plan for the general (non-Hermitian) ``I - V χ`` system.
+    plan facade on CUDA meshes — by the W Dyson's distributed plan
+    (``linalg = distributed``) for the general (non-Hermitian) ``I - V χ`` system.
     This fused entry remains for one-shot callers.  Repeated-RHS consumers
     use :func:`batched_distributed_getrf` plus
     :func:`batched_distributed_getrs` through the opaque top-level

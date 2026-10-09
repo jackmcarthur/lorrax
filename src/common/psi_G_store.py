@@ -123,8 +123,8 @@ def assert_band_chunks_divisible(band_chunk_ranges, world_size: int) -> None:
     lives in ONE producer.  This function is on the object that performs
     the division, which is the only place every caller must pass through.
 
-    ``ValueError`` and not ``assert``: the fix is a user input key
-    (``band_chunk_size``), and an assert vanishes under ``python -O``,
+    ``ValueError`` and not ``assert``: the fix is an input change
+    (``memory_per_device_gb`` sizes the band chunks), and an assert vanishes under ``python -O``,
     re-arming exactly the silent band-dropping it guards.
     """
     p = int(world_size)

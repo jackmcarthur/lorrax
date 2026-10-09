@@ -1382,20 +1382,11 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     rather than failing inside the eigh.  An explicit request is not
     probed — it must raise.
 
-    DIVISIBILITY IS NO LONGER A CONDITION (2026-08-06).  It used to be a
-    third clause here, and an explicit ``sc_eigh = distributed`` used to
-    raise on an indivisible ``nb``, because ``distributed_eigh_bands``
-    padded both band axes to the divisor and did **not** undo the pad —
-    returning ``(nk, nb_pad)`` / ``(nk, nb_pad, nb_pad)``, a silent shape
-    change the carry and every band-indexed operand beside it would not
-    match.  That callee now pads with a large diagonal sentinel and slices
-    back BY COUNT, so it returns the LOGICAL extent at any ``nb``.  The
-    refusal had nothing left to protect.  Note what actually changed: the
-    old objection was a SHAPE objection, not a spectral one — a sentinel
-    alone would not have answered it, and zero-padding without the slice
-    would still be wrong (pad eigenvalues at exactly 0.0 sort into the
-    middle of a Ry spectrum and move band order, ``_midgap_efermi`` and
-    the occupations).  It took both halves.
+    Divisibility is not a condition. ``distributed_eigh_bands`` pads both
+    band axes with a large diagonal sentinel and slices back by count, so it
+    returns the logical extent at any ``nb``. Zero padding would not do: pad
+    eigenvalues at 0.0 sort into the middle of a Ry spectrum and move band
+    order, ``_midgap_efermi`` and the occupations.
 
     The backend probe is asked about ``round_up(nb, pad_div)`` — the
     extent the eigh actually runs at — not about ``nb``.  Probing ``nb``
