@@ -1143,14 +1143,6 @@ def build_parser():
     """The driver's argparse parser, built where a test can reach it — so a
     flag's default is observable without running a full solve."""
     import argparse
-    # The two debug flags take distrib_la's own vocabularies, so they cannot
-    # drift from the resolver.  Function-local because gw_config parses
-    # decks and this module is imported by things that do not.
-    from gw.gw_config import (
-        distrib_la_batched_route_choices,
-        eigh_backend_choices,
-    )
-
     ap = argparse.ArgumentParser(allow_abbrev=False,
         description="Exciton bandstructure E_S(Q) along a K_POINTS crystal_b path")
     ap.add_argument("-i", "--input", required=True,
@@ -1297,27 +1289,6 @@ def build_parser():
                          "dipole.h5 beside the input file.  The head's "
                          "q-linear coefficient IS this dipole, which is why "
                          "the cell-averaged head needs no d(zeta)/dq.")
-    ap.add_argument("--eigh-backend", default=None,
-                    choices=eigh_backend_choices(),
-                    help="A debugging override of the eigensolver the deck's "
-                         "``linalg`` dial resolves (default: the resolved "
-                         "backend), for both eigh sites: the coarse exchange "
-                         "tiles C_q (vq_interp) and the htransform fH_q "
-                         "(bse_setup).  auto|off = the q-batched native path "
-                         "(every device solves its own q-shard); "
-                         "distributed|cusolvermp|slate|scalapack spread one "
-                         "matrix over the mesh, for a matrix that does not "
-                         "fit one device, at the cost of nq sequential "
-                         "solves.  Needs a square mesh and one JAX process "
-                         "per device.")
-    ap.add_argument(
-        "--distrib-la-batched-route", default=None,
-        choices=distrib_la_batched_route_choices(),
-        help="A debugging override of the batch schedule the deck's "
-             "``linalg`` dial resolves, for both htransform and coarse-V "
-             "batched linalg. auto preserves the backend's distributed "
-             "route; batch_reshard moves q onto the mesh and runs local "
-             "whole-matrix JAX linalg.")
     ap.add_argument("--px", type=int, default=None,
                     help="mesh rows; default = the run's square startup mesh")
     ap.add_argument("--py", type=int, default=None,
@@ -1425,8 +1396,7 @@ def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print):
 
 
 def main(argv=None):
-    # ``resolve_eigh_backend`` stays a function-local import for the reason
-    # given in ``build_parser``: gw_config parses decks, and this module is
+    # A function-local import: gw_config parses decks, and this module is
     # imported by things that do not.
     from gw.gw_config import (
         resolve_distrib_la_batched_route,
@@ -1527,12 +1497,9 @@ def main(argv=None):
                                              resolve_conduction_window)
 
         params = read_lorrax_input(args.input)
-        # CLI backend flags remain debug overrides of the implementation selected
-        # by the parser-cached public layout profile.
-        args.eigh_backend = resolve_eigh_backend(
-            params, override=args.eigh_backend)
-        args.distrib_la_batched_route = resolve_distrib_la_batched_route(
-            params, override=args.distrib_la_batched_route)
+        # The deck's linalg dial selects the eigensolver and the batch route.
+        args.eigh_backend = resolve_eigh_backend(params)
+        args.distrib_la_batched_route = resolve_distrib_la_batched_route(params)
         _use_low_mem_eigh = linalg_resolution(params).layout == "distributed"
         if not params.get("kpoints_crystal_b"):
             raise ValueError(f"{args.input} has no K_POINTS crystal_b block — "

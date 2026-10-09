@@ -147,10 +147,8 @@ flowchart TD
 | `linalg` | `local` | the parser-cached `LinalgResolution` | Dyson plan, transverse ζ solver |
 
 `bispinor_tt_head_correction` is a removed deck key. `read_lorrax_input`
-refuses it at any value. The field `config.head.bispinor_tt_head_correction`
-is wired `False`, and `GATE packed_bare_transverse_tt_head_double_count`
-guards a hand-built `True` on a packed route. The overlay is decided by
-`uses_bare_tt_gamma_head` alone.
+refuses it at any value. The TT overlay is decided by
+`uses_bare_tt_gamma_head` and the direct shared-pole head alone.
 
 **The carrier resolver.**
 `common.four_current_model.resolve_four_current_representation(bispinor, model)`
@@ -422,8 +420,6 @@ driver entry.
 | `bispinor_gw_*_retired` (three) | `coerce_bispinor_gw_mode` | a retired mode spelling; names the replacement |
 | (deck key) `bispinor_tt_head_correction` | `read_lorrax_input` | the removed key appears at any value |
 | `full_shared_pole_trs` | `screening.refuse_full_shared_pole_with_trs` (driver entry, on the measured symmetry) | `full_shared_pole` on a WFN with time reversal; use `bare_transverse` |
-| `packed_bare_transverse_tt_head_double_count` | `refuse_unsupported_bispinor_gw` | a hand-built `head.bispinor_tt_head_correction = True` on a packed route |
-| `bispinor_tt_head_unsupported` | `refuse_unsupported_bispinor_tt_head_correction` | a hand-built overlay without bispinor or with `sys_dim ∉ {2,3}` |
 | `bispinor_head_correction_no_local_fields_unavailable` | `refuse_unsupported_bispinor_gw` | `no_local_fields` on any bispinor route except SP-hybrid and SP-full |
 | `bispinor_self_consistency_requires_live_four_current` | same | bispinor QSGW with `density_self_consistent = false` |
 | `bare_tt_gamma_restart_unstamped` | same | `restart = true` where the bare TT overlay is on (`x_only`, B with GN/HL): restart $V$ does not stamp it |

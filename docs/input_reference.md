@@ -132,12 +132,7 @@ the QE-schema receipt and the occupied two-component DFT states
 | `sigma_w_support_sites_ev` | str | `""` | Shared-pole ladder override: `"<line eV list> \| <imaginary eV list>"`, each strictly increasing. Empty keeps the resolver's line rule and the Zolotarev imaginary ladder. The sites enter the recipe hash, so a model built on another ladder refuses. It requires `sigma_w_model = shared_pole`. |
 
 `bispinor_tt_head_correction` is not a deck key: the transverse Γ head comes
-with `head_correction`, and a deck that names the key refuses at parse. A
-hand-built config with `head.bispinor_tt_head_correction = true` refuses with
-`GATE bispinor_tt_head_unsupported` (`bispinor = false`, or `sys_dim` not 2
-or 3) or `GATE packed_bare_transverse_tt_head_double_count` (a packed
-static-photon route, which already inserts the head). Fix: leave the field
-at its default, `false`.
+with `head_correction`, and a deck that names the key refuses at parse.
 
 ## Sigma
 

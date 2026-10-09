@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-09 — `linalg` is the only dense-layout dial; the ζ stamp drops `distributed_lu`
+
+`exciton_bands` and `htransform` no longer take `--eigh-backend` or
+`--distrib-la-batched-route`: the deck's `linalg = local | distributed`
+selects the eigensolver and the batch route, and a command line that passes
+either flag fails at argument parsing. Remove the flag.
+
+The ζ fit provenance no longer records `distributed_lu`; no stage read it, and
+the transverse factor is the whole-tile local LU on every layout
+(`transverse_solver_kind` records it). A ζ file stamped by an earlier build
+still reuses, because the retired key is dropped before the stamps are
+compared. The charge-ζ identity digest drops it too, so a restart bundle or
+MPA store that bound the identity before this change no longer matches it and
+is treated as stale by its consumer. The resolved backend config has no
+`distributed_lu` or `distributed_cholesky` field, and the hand-built-config
+gates of `head.bispinor_tt_head_correction` (a field no deck could set) are
+gone with the field. No result moves.
+
 ## 2026-10-09 — log and error text names the `linalg` dial, not retired deck keys
 
 Messages that named a retired deck key now name `linalg`. The W solve line

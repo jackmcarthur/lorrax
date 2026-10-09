@@ -52,7 +52,6 @@ re-interpreting the dial:
 | `LinalgResolution` field | consumer | `local` | `distributed` |
 |---|---|---|---|
 | `w_dyson_solver` | the W Dyson solve (`gw.w_isdf`) | per-q local LU | `plan('solve_lu', backend='distributed').batched` |
-| `distributed_lu` | recorded in the ζ provenance stamp only; the transverse ζ LU is the whole-tile local LU on every layout | `auto` | `distributed` |
 | `batched_route` | every `distrib_la` stack | `batch_reshard` | `auto` |
 | `eigh_backend` | the `fH_q` eigensolve of htransform and exciton bands, `bse.vq_interp`'s `C_q` | `auto` (native, q-batched) | `distributed`: ScaLAPACK on CPU, cuSOLVERMp on CUDA |
 | `sc_eigh` | the QSGW `H_k` eigensolve (`SCConfig.eigh`) | `auto` | `distributed` |
@@ -75,8 +74,8 @@ A deck that names a field directly (`distributed_zeta_solve`,
 `distrib_la_batched_route`, `charge_zeta_solve`, `transverse_zeta_solve`,
 `eigh_backend`, `sc_eigh`, `use_low_mem_eigh`) refuses by name with "use
 `linalg = local | distributed`", so one key decides the layout of every
-stage. CLI overrides such as `--eigh-backend` are
-debugging controls.
+stage. No driver flag overrides it. The transverse ζ LU is the whole-tile
+local LU on every layout, so it has no field.
 
 ## From a request to a library
 
@@ -337,7 +336,7 @@ the LORRAX loader also reaches the handler.
    by `lax.scan` over the single one; a single-matrix entry that returns a
    library handle sets `one_handle=True`. Normalize conventions here, never at
    call sites.
-5. The eigh vocabulary reaches the deck parser through
+5. The eigh vocabulary reaches the resolver's validation through
    `gw_config.eigh_backend_choices()`, which reads `BACKEND_CHOICES`; nothing
    else changes.
 6. Add a check beside the existing one in `services/distrib_la/bench/`

@@ -270,8 +270,8 @@ def _compute_tt_head_tensor(
             f"sys_dim in (2, 3) (slab / bulk); got sys_dim={sys_dim}.  Box "
             f"truncation (sys_dim=0) never zeros its q=Γ, G=0 slot, so it "
             f"needs no head substitute (vcoul.box_0d.Box0D._v_bare_per_q's "
-            f"own docstring) — this should have been refused upstream by "
-            f"gw_config's bispinor_tt_head_correction validation.")
+            f"own docstring), so no route that requests the TT head may run "
+            f"at sys_dim={sys_dim}.")
     geometry = vcoul.CoulombGeometry(
         bvec=np.asarray(bvec, dtype=np.float64), cell_volume=float(cell_volume))
     kernel = vcoul.get_kernel(sys_dim)

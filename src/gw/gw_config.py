@@ -760,23 +760,6 @@ _W_DYSON_PLANS = ("local", "distributed")
 def normalize_w_dyson_solver(value) -> str:
     """Normalise a ``solve_w`` Dyson plan name to one of the TWO plans; see docs/dev/gw_config_contracts.md."""
     s = ("auto" if value is None else str(value)).strip().lower()
-    if s == "lu":
-        import warnings
-        warnings.warn(
-            "solve_w dyson_solver 'lu' is spelled 'local' (the per-q "
-            "pivoted LU, the linalg = local plan).",
-            DeprecationWarning, stacklevel=2)
-        s = "local"
-    if s == "lstsq":
-        raise ValueError(
-            "solve_w dyson_solver 'lstsq' does not exist.  The two plans "
-            "are 'local' (per-q pivoted LU, linalg = local) and "
-            "'distributed' (2-D-sharded ScaLAPACK/cuSOLVERMp backsolve, "
-            "linalg = distributed).  A "
-            "rank-deficient A = 1 - V·chi0 means the centroid basis has "
-            "over-completed the pair-density rank — reduce n_mu (fewer "
-            "centroids) or raise zeta_rcond instead of masking it with a "
-            "min-norm solve.")
     if s == "auto":
         return "local"
     if s not in _W_DYSON_PLANS:
@@ -796,7 +779,7 @@ EIGH_CHOICES_SOURCE = "not called"
 
 
 def eigh_backend_choices() -> tuple:
-    """The eigh backend names distrib_la accepts (the ``--eigh-backend`` debug flag's vocabulary); see docs/dev/gw_config_contracts.md."""
+    """The eigh backend names distrib_la accepts, which a resolved backend must be one of; see docs/dev/gw_config_contracts.md."""
     global EIGH_CHOICES_SOURCE
     try:
         from ffi import _services
@@ -837,8 +820,6 @@ class LinalgResolution:
     layout: str
     provenance: str
     w_dyson_solver: str
-    distributed_cholesky: str
-    distributed_lu: str
     batched_route: str
     eigh_backend: str
     sc_eigh: str
@@ -862,8 +843,6 @@ def resolve_linalg(params) -> LinalgResolution:
             layout=layout,
             provenance=provenance,
             w_dyson_solver="local",
-            distributed_cholesky="auto",
-            distributed_lu="auto",
             batched_route=DISTRIB_LA_BATCHED_ROUTE_DEFAULT,
             eigh_backend="auto",
             sc_eigh="auto",
@@ -873,11 +852,6 @@ def resolve_linalg(params) -> LinalgResolution:
         layout=layout,
         provenance=provenance,
         w_dyson_solver="distributed",
-        # Charge keeps the distributed rank-truncation factor owner.  A
-        # simultaneous explicit Cholesky provider would contradict that
-        # tier; leave the inactive Cholesky arm at its incumbent policy.
-        distributed_cholesky="auto",
-        distributed_lu="distributed",
         batched_route="auto",
         eigh_backend="distributed",
         sc_eigh="distributed",
@@ -925,12 +899,9 @@ def resolve_distrib_la_batched_route(
     return route
 
 
-def resolve_eigh_backend(params, *, override: str | None = None) -> str:
-    """Return the eigensolver backend from the resolved layout or CLI debug."""
-    if override is not None:
-        raw = override
-    else:
-        raw = linalg_resolution(params).eigh_backend
+def resolve_eigh_backend(params) -> str:
+    """Return the eigensolver backend the resolved ``linalg`` layout names."""
+    raw = linalg_resolution(params).eigh_backend
     backend = str("auto" if raw is None else raw).strip().lower()
     choices = eigh_backend_choices()
     if backend not in choices:
@@ -2495,7 +2466,6 @@ def _input_head(
         mc_average_placement_vcoul=(
             str(params["mc_average_placement_vcoul"] or "") or None),
         head_minibz_average=bool(params["head_minibz_average"]),
-        bispinor_tt_head_correction=False,
         w_av_first_neighbors=bool(params["w_av_first_neighbors"]),
         w_av_second_neighbors=bool(params["w_av_second_neighbors"]),
         bare_coulomb_cutoff=params["bare_coulomb_cutoff"],
@@ -2664,25 +2634,10 @@ def _input_backend(
             raise ValueError(
                 "runtime_platform must be cpu or gpu/cuda, got "
                 f"{runtime_platform!r}")
-        _is_cpu_backend = platform == "cpu"
-    else:
-        try:
-            import jax as _jax
-            _is_cpu_backend = _jax.default_backend() == "cpu"
-        except Exception:
-            _is_cpu_backend = False
-    _dist_lu = _linalg.distributed_lu
-    _dist_chol = _linalg.distributed_cholesky
-    if _dist_lu == "distributed":
-        _dist_lu = "scalapack" if _is_cpu_backend else "cusolvermp"
-    elif _dist_lu == "auto" and _is_cpu_backend:
-        _dist_lu = "off"
     backend = BackendConfig(
         linalg=_linalg.layout,
         linalg_provenance=_linalg.provenance,
         w_dyson_solver=_linalg.w_dyson_solver,
-        distributed_cholesky=_dist_chol,
-        distributed_lu=_dist_lu,
         distrib_la_batched_route=_linalg.batched_route,
         eigh_backend=_linalg.eigh_backend,
         zeta_ridge=float(params["zeta_ridge"]),
@@ -3774,39 +3729,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "charge and signed Dirac current must be rebuilt on every map; "
             "freezing the DFT direct field mixes two orbital states\n"
             "  doc:  docs/input_reference.md, density_self_consistent.")
-    # EITHER packed static mode inserts the bare <D_TT> q=Gamma head through
-    # the Gamma-cell completion that carries the charge head, so the hand
-    # overlay that rewrites the TT V tiles' q=Gamma, G=0 slot
-    # (gw.v_q_bispinor._tt_head_tensor) would be counted twice.  ONE gate for
-    # both, no longer a row of the envelope table: the deck key is gone, so
-    # this is the hand-built-config guard, and a route must never be moved by
-    # a head dial.  (The gate id keeps its bare-route name so the docs, the
-    # tests and this message stay one string; lane N deletes it with the
-    # overlay.)
-    if (uses_static_photon_response(config)
-            and bool(config.head.bispinor_tt_head_correction)):
-        raise ValueError(
-                "GATE packed_bare_transverse_tt_head_double_count: "
-                f"bispinor_gw = {mode.value} is refused with "
-                "bispinor_tt_head_correction = true inside the packed "
-                "static-photon envelope.\n"
-                "  got:  bispinor_tt_head_correction = true, "
-                f"bispinor = true, compute_mode = "
-                f"{config.compute_mode.value}, sys_dim = {config.sys_dim}, "
-                f"head_correction = {config.head.correction.value}, "
-                f"qp_solver = {config.qp_solver.value}\n"
-                "  want: bispinor_tt_head_correction = false\n"
-                "  why:  this deck routes through the packed static photon "
-                "operator, whose Gamma-cell completion already inserts the "
-                "bare <D_TT> = -<v P^T> head into the TT blocks of V (and, "
-                "unscreened, of W).  The overlay writes the same quantity "
-                "into the q=Gamma, G=0 slot of the TT V tiles, so keeping "
-                "both would double count it.\n"
-                "  fix:  leave head.bispinor_tt_head_correction at its "
-                "default (False) -- it is not a deck key any more; the TT "
-                "head is on by default with the charge head\n"
-                "  doc:  docs/input_reference.md '## Screening', "
-                "head_correction.")
     if mode is BispinorGWMode.BARE_TRANSVERSE:
         return
     if mode is BispinorGWMode.FULL_SHARED_POLE:
@@ -3884,43 +3806,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "  doc:  docs/input_reference.md, bispinor_gw.")
 
 
-def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
-    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope; see docs/dev/gw_config_contracts.md."""
-    if not bool(config.head.bispinor_tt_head_correction):
-        return
-    if not bool(config.bispinor):
-        raise ValueError(
-            "GATE bispinor_tt_head_unsupported: "
-            "bispinor_tt_head_correction = true is refused with "
-            "bispinor = false.\n"
-            "  got:  bispinor_tt_head_correction = true, bispinor = false\n"
-            "  want: bispinor = true\n"
-            "  fix:  set bispinor = true, or leave the field at its "
-            "default (False) -- it has not been a deck key since "
-            "2026-09-01\n"
-            "  why:  the correction replaces the q=Γ, G=0 slot of the "
-            "bare bispinor TT (transverse-transverse) V-tiles, which a "
-            "non-bispinor run never builds\n"
-            "  doc:  docs/input_reference.md '## Screening', "
-            "head_correction.")
-    sys_dim = int(config.sys_dim)
-    if sys_dim not in (2, 3):
-        raise ValueError(
-            "GATE bispinor_tt_head_unsupported: "
-            f"bispinor_tt_head_correction = true is refused with "
-            f"sys_dim = {sys_dim}.\n"
-            f"  got:  bispinor_tt_head_correction = true, sys_dim = {sys_dim}\n"
-            "  want: sys_dim in {2, 3} (slab / bulk)\n"
-            "  fix:  set sys_dim to 2 or 3, or leave the field at its "
-            "default (False) -- it has not been a deck key since "
-            "2026-09-01\n"
-            "  why:  box truncation (sys_dim=0) never zeros its q=Γ, G=0 "
-            "slot (vcoul.box_0d.Box0D._v_bare_per_q's own docstring), so "
-            "there is no missing slot for this correction to fill\n"
-            "  doc:  docs/input_reference.md '## Screening', "
-            "head_correction.")
-
-
 def refuse_explicit_gij(Gij) -> None:
     """Require diagonal occupation data for the parent Green contraction."""
     if Gij is None:
@@ -3975,7 +3860,6 @@ class HeadConfig:
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
-    bispinor_tt_head_correction: bool  # bare TT q=Γ,G=0 mini-BZ head (default off)
     w_av_first_neighbors: bool
     w_av_second_neighbors: bool
     bare_coulomb_cutoff: float | None
@@ -4550,8 +4434,6 @@ class BackendConfig:
     linalg: str              # one public layout dial: local | distributed
     linalg_provenance: str   # deck | default
     w_dyson_solver: str  # "local" | "distributed" (normalized; W Dyson plan)
-    distributed_cholesky: str  # "auto" | "off" | "cusolvermp" | "slate"
-    distributed_lu: str        # "auto" | "off" | "cusolvermp" | "scalapack"
     distrib_la_batched_route: str  # "auto" | "batch_reshard"
     eigh_backend: str          # resolved internal distrib_la backend
     zeta_ridge: float          # charge-CCT Tikhonov ridge ε (rel. to tr/n)

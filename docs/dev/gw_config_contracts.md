@@ -262,8 +262,6 @@ rulings override anything here.
 - **`refuse_unsupported_bispinor_gw`** validates the four-current modes and
   requires live direct fields for bispinor QSGW
   (`GATE bispinor_self_consistency_requires_live_four_current`).
-  `refuse_unsupported_bispinor_tt_head_correction` guards hand-built configs
-  only: `bispinor_tt_head_correction` is not a deck key.
 - **`scalar_head_overrides_named`** formats the scalar-head overrides the deck
   named, for envelope messages.
 

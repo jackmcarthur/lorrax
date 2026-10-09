@@ -38,7 +38,6 @@ from runtime.env_flags import env_bool
 from runtime.xla_memory import classify_xla_pool, resolve_xla_gpu_memory_env
 from .gw_config import (
 	active_zeta_truncating_knobs,
-	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_bispinor_gw,
 	uses_bare_tt_gamma_head,
 	uses_coupled_photon_head,
@@ -175,6 +174,12 @@ _ZETA_PROVENANCE_SCHEMA = 2
 CHARGE_ZETA_IDENTITY_SCHEME = (
 	"charge-zeta-v1:canonical-provenance+bound-wfn")
 _ZETA_PROVENANCE_LOCATOR_FIELDS = frozenset(("wfn_file", "wfn_bytes"))
+#: Keys an older build stamped that carry no information about the fit.
+#: ``distributed_lu`` named a transverse LU backend; the transverse factor is
+#: the whole-tile local LU on every layout, and ``transverse_solver_kind``
+#: records the factor the fit ran.  A stamp's retired keys are dropped
+#: before reuse is judged and before the identity digest is formed.
+_RETIRED_STAMP_KEYS = frozenset(("distributed_lu",))
 
 
 def charge_zeta_identity(provenance_json, *, wfn,
@@ -198,7 +203,7 @@ def charge_zeta_identity(provenance_json, *, wfn,
 		raise ValueError(
 			"charge_zeta_identity requires current zeta provenance schema "
 			f"{_ZETA_PROVENANCE_SCHEMA}; got {semantic.get('schema')!r}")
-	for key in _ZETA_PROVENANCE_LOCATOR_FIELDS:
+	for key in _ZETA_PROVENANCE_LOCATOR_FIELDS | _RETIRED_STAMP_KEYS:
 		semantic.pop(key, None)
 	from common.parallel_transport import (
 		WFN_FINGERPRINT_SCHEME, fingerprint_from_binding, wfn_fingerprint)
@@ -384,24 +389,17 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		#       regenerated centroids_file_current with the SAME count
 		#       but different points is pattern #10 and passes a
 		#       count-only check.
-		#   distributed_lu           — the transverse LU backend.  A ζ_T
-		#       fit under `scalapack` (block-cyclic gauge) must not be
-		#       reused by an `off` rerun (per-q jnp.linalg.solve) and
-		#       vice versa.  This is the RESOLVED deck value: gw_config
-		#       already demotes `auto`→`off` on a CPU backend, so the
-		#       recorded string is what the fit ran.
 		#   transverse_solver_kind   — the factor the fit ran.  Route G
 		#       (2026-09-24) applies a whole-tile factor per G tile, so it
 		#       is always 'lu'; a stamp from the r-tile era that recorded a
 		#       provider LU ('scalapack_lu' | 'cusolvermp_lu', a different
 		#       gauge) therefore refits.
-		# All four collapse to None on a non-bispinor deck (no transverse
+		# All three collapse to None on a non-bispinor deck (no transverse
 		# channel ⇒ inert), so a charge-only rerun over a pre-2026-08-04
 		# stamp reuses under the legacy-missing-key rule below.
 		'n_rmu_transverse':     (int(_ti['n_rmu']) if _ti else None),
 		'centroids_transverse_md5': (
 			str(_ti['centroids_md5']) if _ti else None),
-		'distributed_lu':       (str(_ti['distributed_lu']) if _ti else None),
 		'transverse_solver_kind': (
 			str(_ti['solver_kind']) if _ti else None),
 		'gamma_contract_mode':  str(cfg.backend.gamma_contract_mode),
@@ -597,6 +595,11 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		try:
 			old = json.loads(hdr.fit_provenance)
 			new = json.loads(provenance_json)
+			# Keys an older build stamped and this build no longer writes,
+			# because they say nothing about the fit (_RETIRED_STAMP_KEYS):
+			# drop them from the on-disk stamp before comparing.
+			for _k in _RETIRED_STAMP_KEYS:
+				old.pop(_k, None)
 			if old.get('schema') != new.get('schema'):
 				print_fn(
 					f"    [zeta reuse] {zeta_h5_path}: provenance schema "
@@ -696,11 +699,11 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		#   transverse_zeta_rcond   None          (unused under ridge)
 		#   n_rmu_transverse         None  ┐ 2026-08-04: ζ reuse was
 		#   centroids_transverse_md5 None  │ charge-channel-only before,
-		#   distributed_lu           None  │ so a stamp lacking these
-		#   transverse_solver_kind   None  ┘ four was written by a run
+		#   transverse_solver_kind   None  ┘ so a stamp lacking these
+		#       three was written by a run
 		#       whose reuse decision never consulted a transverse
 		#       channel.  A non-bispinor rerun requests None for all
-		#       four and reuses (they are inert without a transverse
+		#       three and reuses (they are inert without a transverse
 		#       channel); a BISPINOR rerun requests real values and
 		#       refits — the only safe reading, because such a stamp
 		#       carries no evidence about the ζ_T files beside it and
@@ -716,7 +719,6 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			'transverse_zeta_rcond': None,
 			'n_rmu_transverse': None,
 			'centroids_transverse_md5': None,
-			'distributed_lu': None,
 			'transverse_solver_kind': None,
 			'nspinor': 2,
 		}
@@ -1559,7 +1561,6 @@ def _resolve_zeta_fit_contract(
 		transverse_identity = {
 			"n_rmu": int(n_rmu_T),
 			"centroids_md5": _centroid_table_md5(cent_T_np),
-			"distributed_lu": str(cfg.backend.distributed_lu).strip().lower(),
 			"solver_kind": str(solver_kind_T),
 		}
 		write_ibz_only_transverse = write_ibz_only_charge
@@ -2294,7 +2295,6 @@ def _bispinor_charge_tile(zeta_g, *, cfg, meta, wfn, sym, centroid_indices,
 def _bispinor_tt_head(cfg):
     """Whether the four-current V's TT tiles carry the Γ mini-BZ head."""
     return (uses_bare_tt_gamma_head(cfg)
-            or bool(cfg.head.bispinor_tt_head_correction)
             or uses_direct_bispinor_shared_pole_head(cfg))
 
 
@@ -3284,7 +3284,6 @@ def prepare_isdf_and_wavefunctions(
 	from .restart_q_storage import (resolve_restart_q_storage_for_run,
 	                                take_pre_unfold)
 	refuse_unsupported_bispinor_gw(cfg)
-	refuse_unsupported_bispinor_tt_head_correction(cfg)
 	from file_io.wfn_basis import WavefunctionBasisReceipt
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)

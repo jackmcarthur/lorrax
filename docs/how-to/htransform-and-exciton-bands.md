@@ -392,7 +392,7 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | `htransform_qr_eps` / `htransform_rank_multiplier` / `htransform_qrcp_seed` | 1e-3 / 20 / 0 | Galerkin basis rank tolerance, search cap, seed (§2) |
 | `-wfn` / `--wfn-file` | the deck's `wfn_file` | another WFN, for example `WFN_qp.h5` |
 | `-o` / `--output-file`, `--report-file` | `bandstructure.dat`, `htransform.out` | outputs |
-| `linalg`, `--eigh-backend` | `local` | layout of the $f(H)_q$ eigensolve; the flag is a debug override |
+| `linalg` | `local` | layout of the $f(H)_q$ eigensolve |
 | `get_centroids_fi`, `kgrid_fi`, `wfn_fi_min`/`wfn_fi_max`, `wfn_fi_q_chunk` | off | BSE handoff: fine-grid ψ at the coarse centroids (`bse_setup.compute_wfns_fi`); keep at least 4 bands between `wfn_fi_max` and the top of the window |
 | `--plot` | off | show the band plot |
 

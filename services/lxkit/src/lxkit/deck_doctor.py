@@ -249,9 +249,10 @@ def _backend_lines(
 
     devices = jax.local_devices()
     mesh = Mesh(np.asarray(devices[:1]).reshape(1, 1), ("x", "y"))
-    requests = (
-        ("cholesky", config.backend.distributed_cholesky),
-        ("solve_lu", config.backend.distributed_lu),
+    # What the run will request: the W Dyson LU on the mesh under
+    # linalg = distributed (the local plan is a per-q JAX LU), and the eigh.
+    requests = ((("solve_lu", "distributed"),)
+                if config.backend.w_dyson_solver == "distributed" else ()) + (
         ("eigh", config.backend.eigh_backend),
     )
     lines = []

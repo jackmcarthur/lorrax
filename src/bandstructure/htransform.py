@@ -32,8 +32,6 @@ from common.collectives import gather_to_host
 # This driver reads a raw params dict rather than ``LorraxConfig``; use the
 # parser-cached linalg profile rather than interpreting its public dial here.
 from gw.gw_config import (
-    distrib_la_batched_route_choices,
-    eigh_backend_choices,
     linalg_resolution,
     read_cohsex_input,
     resolve_distrib_la_batched_route,
@@ -432,27 +430,6 @@ def main(argv=None):
              "window, so standalone output requires interior returned bands. "
              "Default: 4 (the measured shoulder depth). Zero is retained only "
              "as a red/reproduction arm and will normally refuse.")
-    parser.add_argument("--eigh-backend", default=None,
-                        choices=eigh_backend_choices(),
-                        help="Eigensolver for the fH_q eigendecomposition of "
-                             "the get_centroids_fi handoff.  auto|off = the "
-                             "q-batched native path; distributed|cusolvermp|"
-                             "slate|scalapack spread ONE (rank, rank) tile "
-                             "over the mesh through the distrib_la public API (wide "
-                             "band windows).  ``distributed`` is the portable "
-                             "spelling and the ONLY one that exists on a host "
-                             "mesh, where it means ScaLAPACK pzheevd.  "
-                             "A debugging override of the backend the deck's "
-                             "``linalg`` dial resolves (default: the resolved "
-                             "backend).")
-    parser.add_argument(
-        "--distrib-la-batched-route", default=None,
-        choices=distrib_la_batched_route_choices(),
-        help="A debugging override of the batch schedule the deck's "
-             "``linalg`` dial resolves, for every Plan.batched call in this "
-             "driver. auto preserves the backend's robust distributed route; "
-             "batch_reshard moves q onto the mesh and runs whole-matrix local "
-             "JAX linalg.")
     args = parser.parse_args(argv)
     input_dir = os.path.dirname(os.path.abspath(args.input))
 
@@ -480,11 +457,9 @@ def main(argv=None):
         report.architecture()
 
         params = read_cohsex_input(args.input)
-        # Input file is the source of truth; CLI backend flags remain debug
-        # overrides of the implementation selected by the resolved layout.
-        eigh_backend = resolve_eigh_backend(params, override=args.eigh_backend)
-        distrib_la_batched_route = resolve_distrib_la_batched_route(
-            params, override=args.distrib_la_batched_route)
+        # The deck's linalg dial selects the eigensolver and the batch route.
+        eigh_backend = resolve_eigh_backend(params)
+        distrib_la_batched_route = resolve_distrib_la_batched_route(params)
         use_low_mem_eigh = linalg_resolution(params).layout == "distributed"
         n_return_bands = int(params["nval"]) + int(params["ncond"])
     
