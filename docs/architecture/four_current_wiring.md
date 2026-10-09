@@ -30,7 +30,7 @@ refusal names its replacement.
 | **P-bare** | `packed_bare_transverse_route(config)[0]` | zero by declaration; CC from the scalar owner, $W={\rm diag}(W_{00},D_{TT})$ | `gw.photon_sigma` |
 | **B** (incumbent) | `bare_transverse`, none of the others | none; bare TT tiles contracted directly | `gw.sigma_x_bispinor` |
 | **SP-hybrid** | `uses_bare_transverse_shared_pole` | none; CC is a shared-pole bank | `gw.sigma_x_bispinor` |
-| **SP-full** | `uses_full_bispinor_shared_pole` | ordered CC/CT/TC/TT sector bank | `gw.sigma_x_bispinor` for bare exchange; the dynamic sectors by the [sector Σ consumer](sector_sigma_consumer.md) ([shared-pole model](shared_pole_model.md)) |
+| **SP-full** | `uses_full_bispinor_shared_pole` | ordered CC/CT/TC/TT sector bank | `gw.sigma_x_bispinor` for bare exchange; the dynamic sectors by the [sector Σ consumer](bispinor_shared_pole_w.md#sector-sigma) |
 
 "P" rows below apply to both packed modes. `uses_static_photon_response`
 is true on P-screened and P-bare.
@@ -321,8 +321,8 @@ carrier. SP-full builds the ordered CC/CT/TC/TT sector bank, and under
 `no_local_fields` it adds the direct first-order bulk Γ head
 (`gw.photon_direct_head.build_direct_photon_head`; physics in
 [theory §5](../theory/four-current-head-corrections.md#direct-bulk-head)).
-Bank construction, storage and byte models are owned by
-[Shared-pole model](shared_pole_model.md).
+Bank construction, sector reduction, storage and byte models are owned by
+[shared-pole W for bispinor sectors](bispinor_shared_pole_w.md).
 
 ## Stage 4: self-energy
 

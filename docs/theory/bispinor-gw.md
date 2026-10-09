@@ -249,7 +249,7 @@ on time reversal:
 Ward-subtracted, $\Pi(q)-\Pi(0)$) and one packed Dyson solve.
 `full_shared_pole` solves the four-current Dyson equation at each bank
 frequency and fits CC, CT/TC and TT poles separately
-([shared-pole model](../architecture/shared_pole_model.md)).
+([shared-pole W for bispinor sectors](../architecture/bispinor_shared_pole_w.md)).
 `bare_transverse` runs as exchange only (`x_only`), incumbent (any compute
 mode), packed bare (`sys_dim = 2` one-shot COHSEX/GN/HL, contracted as
 $\mathrm{diag}(W_C,t)$) or shared-pole hybrid (`mpa`, `sigma_w_model =

@@ -119,7 +119,7 @@ nav:
       - Face-psi zeta fitting: architecture/zeta_fit_face_psi_cct.md
       - Fractional chi0 response face: architecture/fractional_chi0_response_face.md
       - Shared-pole W (implementation): architecture/shared_pole_model.md
-      - Four-current sector Sigma consumer: architecture/sector_sigma_consumer.md
+      - Shared-pole W for bispinor sectors: architecture/bispinor_shared_pole_w.md
       - Four-current wiring: architecture/four_current_wiring.md
       - Iterative eigensolvers: architecture/iterative_eigensolvers.md
       - The NSCF Hamiltonian: architecture/nscf_hamiltonian.md

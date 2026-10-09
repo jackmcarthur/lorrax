@@ -29,7 +29,7 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
 | constructor chain, route admission | `gw.shared_pole_constructor` |
 | §6 parent rounds | `gw.shared_pole_local` |
 | §6 whole-mesh (face) execution adapters | `gw.shared_pole_execution` |
-| §5 photon CC/TT/CT sectors | `gw.shared_pole_sectors` |
+| photon CC/TT/CT sectors ([bispinor sectors](bispinor_shared_pole_w.md)) | `gw.shared_pole_sectors` |
 | §10 byte model | `gw.shared_pole_capacity` |
 | §7 store | `file_io.shared_pole_store` |
 | §8 Σ consumer | `gw.mpa.sigma` |
@@ -261,31 +261,9 @@ infinity and their output weight is reported (`infinite_weight_ok`). Dedupe
 
 ## 5 Photon sectors
 
-`bispinor_gw = full_shared_pole` builds CC, TT and CT stores from one photon
-bank (`compute_photon_bank`) holding $W-W_\infty$, its ordered moments and the
-constant $W_\infty-V$. CC uses $n_C$ rows, TT $3n_T$ rows (Cartesian component
-minor), each with its own directions, reduction and $\lceil1.8n\rceil$ budget;
-CT_C and CT_T share one retained mask and pole ordering on the joint span, each
-endpoint passing its own lost-weight check. CC/TT spans retained for CT use the
-ordered `sector_threshold` $10^{-5}$ in both paired Gram cuts. The stability
-gate is positive retained $\mathcal H$; the scalar passivity bound does not
-apply to the signed photon $V$ (theory §9). Stores stamp
-`raw-sector-endpoint-v1`; a manifest (`lorrax.shared-real-pole-sectors.v1`,
-`sector-ordered-ph`) binds the four stores and the constant.
-
-**Treatment ceiling.** Bispinor sector models deactivate poles above
-
-$$
-\Omega_{\rm treat}=2\Big[\max E_{{\rm cond},\chi}-\min E_{\rm val}\Big],
-\tag{SP 3}
-$$
-
-a numerical treatment, not a bound on collective modes. An SC run holds the
-first map's value while the current span stays inside it and re-plans it at
-twice the current span when the span exceeds it. Inactive modes have zero factors and the inert pole sentinel; CC and
-TT have independent masks, CT one common mask. Refusals:
-`GATE shared_pole_sector_treatment_{census,order,empty}`. Held rows score the
-untreated fit; accuracy of the treatment is a projected-Σ comparison.
+`bispinor_gw = full_shared_pole` builds CC, TT and CT models from one photon
+bank. Their model, carrier, route, staged construction, store and Σ consumer
+are [shared-pole W for bispinor sectors](bispinor_shared_pole_w.md).
 
 ## 6 Execution
 
@@ -316,51 +294,14 @@ its prices. A face program holds its eighs' first attempts; a failed check
 reruns that round's whole-chain program on the whole mesh
 (`distrib_la.checked_program`).
 
-**Sectors.** The bispinor sectors take one route per map, decided from the
-recipe shapes before any read and printed on one line (`sector_route`,
-`Shared-pole sector constructor: route`). They run q-local, rounds of P parents, when CC, TT
-and the CT joint pencil each fit one whole parent per rank
-(`sector_execution`); with at least as many parents as ranks the joint
-pencil's conservative price (both spans at twice their pole budgets) does not
-send them to the face, and the round runs CT at its held spans, over budget
-with a warning. Otherwise they run in rounds of R = min(nq, P) parents, balanced
-over the rounds, on the face through the staged reduction (`staged_round`). R
-is set by P, not by the budget. Each round reduces TT, then CC beside TT's held
-outputs, then CT from both:
-
-* the selection runs the round's parents at once: its eighs run one whole
-  matrix per rank, so its unit is the round's layer (decisions.md#fixed-tile),
-  and its eigh stacks follow the rule below;
-* the reduction's stage programs (`paired_members`, `keep_stage`,
-  `paired_stage`, `output_stage`; for CT the pencil, `joint_keep_stage`,
-  `joint_output_stage`) run over sub-batches of the widest halving of R whose
-  shape-priced program fits beside the round's stacks (`stage_width`). Each
-  writes its rows of one stack per array in place; a short last sub-batch
-  repeats its last parent, so one shape compiles;
-* each eigh runs once over the round's stack. It runs on route (c), every
-  matrix whole on one rank, when its shape price (`distrib_la.eigh_stack_bytes`)
-  beside its boundary, the round's held outputs and the upstream fits the
-  budget; otherwise on the whole mesh, with one warning (`staged_eigh`).
-
-Stage widths and eigh routes are decided per round at the round's shapes (the
-held pencil extent, the actual CT span), so every rank decides alike; at the
-recipe's conservative sides the CrI3 24×24 P64 H'_vv and CT stacks would
-leave route (c). The line `Shared-pole sector constructor: round of parents a..b:` names a
-round's sides, stage widths and eigh routes whenever they change. The stage
-stacks are priced with the eigenvector stacks the stages read
-(`staged_sector_bytes`, `staged_cross_bytes`). The metric corrections stay
-Newton–Schulz inside their stages (the paired metric is the identity to about
-$10^{-8}$ by construction, one iteration; an eigh root of the stack costs more,
-claim 3425); the receipt reports the largest residual $\|ZAZ-I\|_F/\sqrt R$
-that `retained_metric_positive` gates. An eigh whose check fails reruns only
-that stack; the stage programs hold no eigh.
+**Sectors.** The bispinor sectors take their own route, decided once per map
+from the recipe shapes ([bispinor sectors §4–5](bispinor_shared_pole_w.md#sector-route)).
 
 **Face products.** Every face GEMM of the constructor is `distrib_la.panel_matmul`
 on the square mesh, every parent of
 a program in one exchange per panel, transposed operands by one
 grid-transpose exchange; face programs compile with XLA's latency-hiding
-scheduler. CrI3 24×24 at P64: 9.5–13.4 TF/s per A100 against 1.7–5.7 for the
-cuBLASMp face (SECTFAST2 bench).
+scheduler (`FACE_COMPILER_OPTIONS`).
 
 **Reindexing.** Matrix selection, factor sorting and unequal CT block assembly
 use `common.staged_reshard`: exchange to slabs split over all ranks, select or
@@ -413,9 +354,9 @@ $W_+(-q,0)^{\mathsf T}$ (ordered) or $W_+$ (TRS), i.e. $-b\Lambda^{-1}b^\dagger$
 on a TRS store. A one-shot stores the resolver's $\omega=0$ head; a
 self-consistent run evaluates the accepted final map's model once, after the
 loop, from the devices (step 4) or that map's retained scratch generation, and
-stores the map's iteration head at $\omega=0$. The four-current sector bank
-stores $V+W_{c,CC}(0)$ of its CC sector (`sector_sigma.sector_static_wc`,
-both branches of the parent pair through the W tables). Both evaluators run at
+stores the map's iteration head at $\omega=0$. The four-current route stores
+its CC sector's $V+W_{c,CC}(0)$ ([bispinor sectors §6](bispinor_shared_pole_w.md#sector-store)).
+Both evaluators run at
 the q parents of the run's V wedge, and the restart stores those parents with
 their unfold tables: no full-q W is formed for the file, and BSE unfolds on
 load ([BSE](bse.md)). Plain-MPA and metal restarts carry no `W0_qmunu`
@@ -485,12 +426,8 @@ parent panels are a static loop inside the executable, chunks of one static
 width a device loop, one of each when everything fits. A store whose resident
 factors do not fit runs at one parent and one column multiple, with one
 `memory over budget` warning line. The synthesized $W$ always uses both mesh axes.
-The photon sectors (`mpa.sector_sigma.sector_synthesis`) synthesize through the
-same owner (`mpa.sigma.synthesize_shared_pole_parents`) and placement rule, at
-their tile extents $(m n_A, n n_B)$ and in one panel of every parent and pole
-column. On a diagonal sector (CC, TT) the partner is $W^{\mathsf T}$; a mixed
-sector's partner $\bar B_A d B_B^{\mathsf T}$ comes from the same operands (two
-factors in `distrib_la.batch_gram`, the face route's one panel exchange).
+The photon sectors synthesize through the same owner and placement rule
+([bispinor sectors §7](bispinor_shared_pole_w.md#sector-sigma)).
 
 **Two τ nodes per loop trip.** On GPU the scalar Σ τ window evaluates two τ
 nodes per trip of its device loop, so one node's W(τ) synthesis and
@@ -509,8 +446,7 @@ line in gwjax.out's memory table says "two nodes per trip". Every
 counter-indexed read in its loops sits behind an optimization barrier and
 rematerialization is off for every program, so the R82 hazard (a rematerialized slice
 read after the loop counter's in-place increment) cannot arise there.
-At the Ni 20³ P64 tile a node takes 0.549 → 0.492 s (claim 3115). The
-photon sectors run one node per trip.
+At the Ni 20³ P64 tile a node takes 0.549 → 0.492 s (claim 3115).
 
 **Hole routing.** Conduction windows take $W_+(q)$. An ordered store routes
 valence windows to the particle–hole partner,
@@ -538,9 +474,8 @@ unfolds the parent pair only at V's q parents and at their $-q$ rows
 **Band brackets.** With `use_band_extrapolation` (on by default) the scalar
 consumer splits the Green band sum into the three brackets of
 [band extrapolation](../theory/band-extrapolation.md) inside the same window
-executable and applies the pooled fit. A sector (bispinor) consumer splits
-the CC class's Green band sum the same way and adds TT, CT and TC to every
-count ([four-current Σ](../theory/band-extrapolation.md#four-current)).
+executable and applies the pooled fit. The sector consumer brackets the CC
+class only ([four-current Σ](../theory/band-extrapolation.md#four-current)).
 
 **Γ head** (`gw.shared_pole_head`). `head_correction = full` evaluates the
 current TRS body at Γ one frequency at a time, folds the common head wings

@@ -13,7 +13,8 @@ target.
 
 This page owns the model and its derivation. How the samples are streamed,
 reduced, sharded, stored and consumed, the gate rows and the byte model are
-[the shared-pole implementation page](../architecture/shared_pole_model.md);
+[the shared-pole implementation page](../architecture/shared_pole_model.md),
+and for the bispinor sectors [their implementation page](../architecture/bispinor_shared_pole_w.md);
 deck keys are in the [input reference](../input_reference.md); the $\Sigma$
 frequency quadrature is [the Sigma quadrature problem](sigma-quadrature-problem.md);
 rebuilding the model inside a QSGW loop, and the magnetic little-group
@@ -693,7 +694,9 @@ model of $W-U$. Because CC, TT and CT are reduced independently, positive
 retained $\mathcal H$ certifies each projected sector, not positive residues of
 the assembled photon matrix; the assembled model is judged by its integrated
 $\Sigma$. Which channel carries which frequency model is
-[four-current heads and frequency](four-current-head-corrections.md).
+[four-current heads and frequency](four-current-head-corrections.md); how the
+sectors are built and consumed is
+[shared-pole W for bispinor sectors](../architecture/bispinor_shared_pole_w.md).
 
 ## Appendix A. The resolvent identity
 
