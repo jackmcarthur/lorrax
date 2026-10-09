@@ -316,6 +316,17 @@ _COMPILE_EVENTS = {"/jax/core/compile/jaxpr_trace_duration": "trace",
                    "/jax/core/compile/jaxpr_to_mlir_module_duration": "lower",
                    "/jax/core/compile/backend_compile_duration": "compile"}
 _SPANS = []
+_LISTENING = False
+
+
+def _listen():
+    """Record compile-path spans from here on (once; after the first driver's
+    import has brought the runtime up, which sets its env before jax loads)."""
+    global _LISTENING
+    if not _LISTENING:
+        import jax.monitoring
+        jax.monitoring.register_event_time_span_listener(_record_span)
+        _LISTENING = True
 
 
 def _record_span(event, start, end, **_):
@@ -334,17 +345,41 @@ def _union(spans):
     return total
 
 
-def compile_census(spans, receipt, log_text):
-    """Where a stage's wall went on the compile path, from rank 0's view."""
+def _census_start():
+    """A stage's census origin: (first span, compile_cache_stats()).
+
+    Taken after the driver's import, which brings the runtime up: ``common``
+    imports jax, and jax must load after the runtime has set its env.
+    """
+    from common.jax_compile_cache import compile_cache_stats
+    _listen()
+    return len(_SPANS), compile_cache_stats()
+
+
+def compile_census(log_text, first_span, before):
+    """Where a stage's wall went on the compile path, from rank 0's view.
+
+    ``before`` is ``compile_cache_stats()`` at the stage's start: the
+    persistent-cache lookups and their read seconds, and the seconds of the
+    cross-rank compile agreement (module fingerprint and key exchange).
+    """
+    from common.jax_compile_cache import compile_cache_stats
+    after, spans = compile_cache_stats(), _SPANS[first_span:]
     out = {kind: round(_union([(s, e) for k, s, e in spans if k == kind]), 2)
            for kind in ("trace", "lower", "compile")}
     out["compile_path"] = round(_union([(s, e) for _, s, e in spans]), 2)
-    m = _STAGE_RECEIPT.search(receipt)
-    if m:
-        out.update(xla_compiles=int(m[1]), xla_s=float(m[2]), cache_hits=int(m[3]),
-                   uncacheable=int(m[4]))
+    # The receipts in the stage log (the SC maps', then the stage's own) tile
+    # the stage's receipt windows, so their sum is the stage's count.
+    rows = [[float(v) for v in m] for m in _STAGE_RECEIPT.findall(log_text)]
+    real, secs, hits, uncacheable = (sum(col) for col in zip(*rows)) if rows else (0,) * 4
+    out.update(xla_compiles=int(real), xla_s=round(secs, 1), cache_hits=int(hits),
+               uncacheable=int(uncacheable))
     nvrtc = [float(ms) / 1e3 for ms in _NVRTC.findall(log_text)]
     out.update(nvrtc_builds=len(nvrtc), nvrtc_s=round(sum(nvrtc), 1))
+    for key, field in (("cache_lookups", "probes"), ("read_s", "read_secs"),
+                       ("fingerprint_s", "compile_fingerprint_secs"),
+                       ("agreement_s", "compile_agreement_secs")):
+        out[key] = round(after[field] - before[field], 2)
     return out
 
 
@@ -472,7 +507,12 @@ REQUIRED_LINES = {
 
 
 def _env(cache_dir):
-    """The drivers' environment, set in this process before any driver import."""
+    """The drivers' environment, set in this process before any driver import.
+
+    ``cache_dir`` None leaves the compile cache to the runtime: an exported
+    ``ISDF_JAX_CACHE_DIR``, else its default namespace (one per jax, jaxlib
+    and FFI bundle, pruned after a week unused).
+    """
     env = os.environ
     env.pop("JAX_COMPILATION_CACHE_DIR", None)
     if rank_session._resolve_proc_count() == 1:
@@ -480,7 +520,8 @@ def _env(cache_dir):
         # holding four devices is the in-process mesh the flat-k FFT refuses.
         visible = env.get("CUDA_VISIBLE_DEVICES", "0").split(",")
         env["CUDA_VISIBLE_DEVICES"] = visible[0]
-    env["ISDF_JAX_CACHE_DIR"] = str(cache_dir)
+    if cache_dir is not None:
+        env["ISDF_JAX_CACHE_DIR"] = str(cache_dir)
     env["JAX_ENABLE_X64"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
     return env
@@ -514,6 +555,12 @@ def write_decks(run):
     for fname, deck in RESTART_DECKS.items():
         (run / fname).write_text(deck.format(centroids=centroids))
     return centroids
+
+
+def _cache_dir():
+    """The persistent compile cache this process used."""
+    from common.jax_compile_cache import compile_cache_stats
+    return compile_cache_stats()["dir"]
 
 
 def _release_devices():
@@ -566,12 +613,12 @@ def run_stage(run, name, module, argv, env, timeout):
     sys.stdout = sys.stderr = stream
     cwd, saved_argv = os.getcwd(), sys.argv
     rc = 0
-    first_span = len(_SPANS)
-    receipt = ""
+    start = None
     try:
         os.chdir(run)
         sys.argv = [module, *argv]
         main = importlib.import_module(module).main
+        start = _census_start()
         try:
             _injected(name, rank, "before")
             ret = main(argv) if inspect.signature(main).parameters else main()
@@ -583,7 +630,7 @@ def run_stage(run, name, module, argv, env, timeout):
             traceback.print_exc()
             rc = 1
         from common.jax_compile_cache import compile_receipt
-        receipt = compile_receipt(f"hsuite {name}")
+        compile_receipt(f"hsuite {name}")
     finally:
         stream.flush()
         sys.stdout, sys.stderr = saved_py
@@ -595,8 +642,7 @@ def run_stage(run, name, module, argv, env, timeout):
         os.chdir(cwd)
         sys.argv = saved_argv
     record = rank_record(log, name, rank, rc)
-    record["compile"] = compile_census(_SPANS[first_span:], receipt,
-                                       log.read_text(errors="replace"))
+    record["compile"] = compile_census(log.read_text(errors="replace"), *start) if start else {}
     failed = bool(rc or record["hits"])
     if failed:
         # pytest's capture holds this until the report, which prints it.
@@ -816,14 +862,13 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
     out = Path(out).resolve()
     run = out / "run"
     lead = rank_session._resolve_proc_id() == 0
-    cache_dir = Path(cache_dir) if cache_dir else out / "jax-cache"
+    cache_dir = Path(cache_dir) if cache_dir else None
     if lead:
         stage_fixture(run)
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
     rank_session.exchange("staged")
     env = _env(cache_dir)
-    import jax.monitoring
-    jax.monitoring.register_event_time_span_listener(_record_span)
     walls, problems, ranks, census = {}, [], {}, {}
     t_all = time.monotonic()
     for name, module, argv in STAGES:
@@ -888,7 +933,8 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
     walls["total"] = time.monotonic() - t_all
     summary = {"walls_s": walls, "problems": problems, "regenerate": regenerate,
                "ranks": rank_session._resolve_proc_count(),
-               "rank_records": ranks, "compile_s": census, "cache_dir": str(cache_dir)}
+               "rank_records": ranks, "compile_s": census,
+               "cache_dir": _cache_dir()}
     if LONE_FAILURE:
         # The others are blocked in a collective: no final join.
         rank = rank_session._resolve_proc_id()
@@ -913,7 +959,8 @@ def main(argv=None):
     parser.add_argument("--only", nargs="*", default=None)
     args = parser.parse_args(argv)
     walls, problems = run_chain(args.out, regenerate=args.regenerate,
-                                cache_dir=args.cache_dir, only=args.only)
+                                cache_dir=args.cache_dir or Path(args.out) / "jax-cache",
+                                only=args.only)
     if rank_session._resolve_proc_id() != 0 and not LONE_FAILURE:
         return 0 if not problems else 1
     for name, wall in walls.items():
