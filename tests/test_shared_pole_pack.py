@@ -94,3 +94,20 @@ def test_the_extent_tiles_the_mesh():
     tables = round_tables(counts, [8, 5, 8, 5], [0j] * 4, [0, 0], 0, column_extent=ladder,
                           ordered=True, odd_moments=False)
     assert tables["order"].shape[-1] == 2 * 16 and tables["active"].sum(axis=1).tolist() == [24, 24]
+
+
+def test_the_place_scatter_moves_reals():
+    """XLA:GPU expands a scatter of elements wider than 64 bits into a loop of one iteration
+    per scattered row, so a complex pack must scatter (re, im) reals in both layouts."""
+    from gw.shared_pole_local import BATCH, _pack_place, _pack_start
+    mesh = _mesh()
+    for layout, spec in (("batch", P(BATCH)), ("face", P(None, "x", "y"))):
+        key = (mesh, layout, 4, 8, ((12, "complex128"),))
+        accs = _pack_start(*key)()
+        assert accs[0].dtype == np.float64, layout
+        panel = jax.device_put(np.ones((4, 12, 4), np.complex128), NamedSharding(mesh, spec))
+        dest = np.zeros((4, 4), np.int32)
+        dest = jax.device_put(dest, NamedSharding(mesh, P(BATCH))) if layout == "batch" else dest
+        hlo = _pack_place(*key, 4).lower(accs, (panel,), dest).as_text(dialect="hlo")
+        scatters = [line for line in hlo.splitlines() if " scatter(" in line]
+        assert scatters and not any("c128" in line for line in scatters), (layout, scatters)

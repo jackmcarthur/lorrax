@@ -324,6 +324,18 @@ def _slab_rows(mesh_xy, rows):
     return -(-(int(rows) // px) // py)
 
 
+def _held(dtype):
+    """``(element, pairs)`` of a field's accumulator: a complex field is held as (re, im) reals.
+
+    XLA:GPU has no scatter of elements wider than 64 bits; it expands one into a
+    while loop with one iteration per scattered row. A complex128 accumulator row
+    is therefore held as 2 s float64 values, and the place scatter moves reals.
+    """
+    import numpy as np
+    dtype = np.dtype(dtype)
+    return (np.finfo(dtype).dtype, 2) if np.issubdtype(dtype, np.complexfloating) else (dtype, 1)
+
+
 @lru_cache(maxsize=None)
 def _pack_start(mesh_xy, layout, slots, extent, shapes):
     """The K zero accumulators of ``pack_panels``, row-major in the packed column.
@@ -335,7 +347,8 @@ def _pack_start(mesh_xy, layout, slots, extent, shapes):
     ``[B * F, P * s_k]`` at ``P(None, ('x', 'y'))``, rank x*Py+y holding s_k =
     ``_slab_rows`` whole pencil rows (its x-tile's rows, padded to a multiple of
     Py, block y of them) of every slot, so a panel's columns land in any packed
-    column without a second exchange.
+    column without a second exchange. A complex field's row is held as (re, im)
+    reals, twice as many (``_held``).
     """
     import jax
     import jax.numpy as jnp
@@ -346,7 +359,8 @@ def _pack_start(mesh_xy, layout, slots, extent, shapes):
     else:
         spec, rows = P(None, BATCH), [ranks * _slab_rows(mesh_xy, n) for n, _ in shapes]
     sharding = NamedSharding(mesh_xy, spec)
-    return jax.jit(lambda: tuple(jnp.zeros((slots * extent, r), dt) for r, (_, dt) in zip(rows, shapes)),
+    held = [_held(dt) for _, dt in shapes]
+    return jax.jit(lambda: tuple(jnp.zeros((slots * extent, r * pairs), dt) for r, (dt, pairs) in zip(rows, held)),
                    out_shardings=(sharding,) * len(shapes))
 
 
@@ -370,7 +384,10 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
         # goes past the accumulator, never onto the next slot's first column.
         b, rows, r = panel.shape
         index = jnp.where(dest < extent, jnp.arange(b)[:, None] * extent + dest, b * extent)
-        return acc.at[index.reshape(-1)].set(jnp.swapaxes(panel, 1, 2).reshape(b * r, rows), mode='drop')
+        update = jnp.swapaxes(panel, 1, 2).reshape(b * r, rows)
+        if _held(update.dtype)[1] == 2:
+            update = jnp.stack((update.real, update.imag), axis=-1).reshape(b * r, 2 * rows)
+        return acc.at[index.reshape(-1)].set(update, mode='drop')
 
     if layout == 'batch':
         def body(accs, panels, dest):
@@ -381,7 +398,7 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
         def body(accs, panels, dest):
             moved = []
             for acc, panel in zip(accs, panels):
-                pad = py * int(acc.shape[1]) - int(panel.shape[1])
+                pad = py * (int(acc.shape[1]) // _held(panel.dtype)[1]) - int(panel.shape[1])
                 if pad:
                     panel = jnp.pad(panel, ((0, 0), (0, pad), (0, 0)))
                 # Face tile -> slab: split the rows over y, join the column blocks in y order.
@@ -411,20 +428,23 @@ def _pack_finish(mesh_xy, layout, slots, extent, shapes):
         raise ValueError(f"pack_panels: the extent {extent} must tile the {py} y ranks of the face; "
                          "build the tables with the face's column_extent (round_tables)")
 
-    def columns(acc):
+    def columns(acc, dtype):
+        if _held(dtype)[1] == 2:
+            pair = acc.reshape(acc.shape[0], -1, 2)
+            acc = jax.lax.complex(pair[..., 0], pair[..., 1])
         return jnp.swapaxes(acc.reshape(-1, extent, acc.shape[-1]), 1, 2)
 
     # The accumulators are donated: each field's rows are freed once turned to columns, so the
     # finish holds one field's accumulator, its transpose and its exchange output at a time.
     if layout == 'batch':
-        return jax.jit(shard_map(lambda accs: tuple(columns(a) for a in accs), mesh=mesh_xy,
+        return jax.jit(shard_map(lambda accs: tuple(columns(a, dt) for a, (_, dt) in zip(accs, shapes)), mesh=mesh_xy,
                                  in_specs=((P(BATCH),) * len(shapes),),
                                  out_specs=(P(BATCH),) * len(shapes), check_vma=False), donate_argnums=0)
 
     def body(accs):
         out = []
-        for acc, (rows, _) in zip(accs, shapes):
-            acc = columns(acc)
+        for acc, (rows, dt) in zip(accs, shapes):
+            acc = columns(acc, dt)
             if py > 1:
                 acc = jax.lax.all_to_all(acc, 'y', split_axis=2, concat_axis=1, tiled=True)
             out.append(acc[:, :rows // px])
