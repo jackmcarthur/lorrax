@@ -11,7 +11,7 @@ engine serves each platform, and which stage takes which plan. It ends with
 CrI3 24×24 at P64. The caller contract of every function named here is
 [`distrib_la`'s API](../services/distrib_la/api.md); which library serves which
 request is [its backends page](../services/distrib_la/backends.md). Code is cited
-as `file:line` at `0b1cca7b2`; read the file rather than the number.
+as `file:line` at `2be3ceaa9`; read the file rather than the number.
 
 ## Symbols
 
@@ -89,9 +89,11 @@ GSPMD gather the operand onto one mesh axis.
 $[B, n, r_s]$ and takes each slot's pencil columns from them
 ([bispinor sectors §5.2](bispinor_shared_pole_w.md#5-construction), equation S 4a).
 `pack_panels` (`src/gw/shared_pole_local.py:285`) does this one panel at a time
-into $[B, n, F]$ accumulators held in the slab layout. Each panel moves face
-to slab, the same bytes as its tile, and is scattered locally at host-computed
-destination columns. Each finished field moves slab to face once. The
+into accumulators held in the slab layout, row-major in the packed column
+($[B F, n/P]$ per rank, row $bF + f$). Each panel moves face to slab, the same
+bytes as its tile, and its columns are scattered locally as contiguous rows at
+host-computed destinations. Each finished field is transposed back to columns
+on its rank and moves slab to face once. The
 programs are fixed by the layout, the panel width and $F$, never by $S$, so a
 later SC map with more line panels makes more calls and no new program.
 

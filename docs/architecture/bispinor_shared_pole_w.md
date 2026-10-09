@@ -11,7 +11,7 @@ the scalar bank, directions, pencils and store schema, which the sectors
 reuse, are [the shared-pole implementation page](shared_pole_model.md); the
 four-current physics and the $1/c$ counting are
 [bispinor GW](../theory/bispinor-gw.md). Code is cited as `file:line` at
-`0b1cca7b2`; read the file rather than the number.
+`2be3ceaa9`; read the file rather than the number.
 
 ## Symbols
 
@@ -184,7 +184,7 @@ scalar ordered round of `gw.shared_pole_local` (`reduce_round`) on the sector's
 rows, with the sector recipe (`sector_recipe`, `:574`: widths, line cap and
 $K_S$ resized to $n_S$) and the sector keep cut $10^{-5}$. The round program
 takes the round's packed columns ($\S$5.2, *Packed columns*), placed in the
-batch layout before it runs (`reduce_round`, `src/gw/shared_pole_local.py:450`).
+batch layout before it runs (`reduce_round`, `src/gw/shared_pole_local.py:468`).
 `construct_cross_sector_round` (`src/gw/shared_pole_sectors.py:997`) then reduces CT on the two diagonal spans
 and keeps both endpoint outputs. Every eigh is a local dense solve.
 
@@ -253,14 +253,23 @@ The host inverts $\pi_b$ for panel $s$: $d_{s,b}(j)$ is the column $f$ with
 $\pi_b(f) = o_s + j$, or $F$ when the round does not take column $j$. A source
 column appears at most once in a slot's table, so each packed column has one
 writer. One program per (layout, $r_s$, $F$) scatters a panel into one
-accumulator per field, $[\text{slots}, n_S, F]$ for the round's slots (a stage
-sub-batch on the face) (`_pack_place`, `:350`). In the batch layout the
-scatter is local. On the face the accumulators live in the slab layout
+accumulator per field (`_pack_place`, `:354`). The accumulator holds packed
+column $f$ of slot $b$ as row $bF + f$, $[\text{slots}\cdot F, n_S]$ for the
+round's slots (a stage sub-batch on the face) (`_pack_start`, `:328`), so each
+panel column lands as one contiguous row. A dropped column is sent past the
+accumulator, never onto the next slot's first column. Scattered along the minor
+axis of $[\text{slots}, n_S, F]$ instead, every column is a strided write:
+on CrI3 $6\times6$ bispinor forced onto the face at P4 that pack took 9.7 s of
+each warm map (claim FACEMAP-2). In the batch layout the scatter is local. On
+the face the accumulators live in the slab layout
 ([dense linear algebra §2](dense_linear_algebra.md#2-layouts-and-the-moves-between-them)),
 each rank holding whole rows; one `all_to_all` over `y` moves a panel's tile
-to its slab, the same bytes as the tile, and one `all_to_all` per field
-returns the packed columns to the face (`_pack_finish`, `:392`). Every byte
-of a panel crosses once, and so does the packed result.
+to its slab, the same bytes as the tile. The finish turns each rank's rows
+back into columns, one transpose of its donated accumulator, and one
+`all_to_all` per field returns the packed columns to the face (`_pack_finish`,
+`:400`). Every byte of a panel crosses once, and so does the packed result;
+the finish holds two copies of the packed fields, inside the reduction row's
+$12\,n_S R_S$ term.
 
 The point of the pack is that no round program takes the panels. The panel
 count follows the line sites, which change from map to map (Fe $4^3$ bispinor at
