@@ -713,7 +713,7 @@ the cache, as without one.
   release starts from the previous store (hard links), so only missing images
   compile.
 - **Measured.** P4 hsuite, one A100-80 node, node-local caches, B11 bundle
-  (claim CUBIN-1). Cold, without a store (main 79bcc1788): 25 `NVRTC built`
+  (claim 4126). Cold, without a store (main 79bcc1788): 25 `NVRTC built`
   lines, 575.7 s. Cold with the 25-image store: no `NVRTC built` line, 25
   disk-cache hits through links, 389.7 s. The JAX compile cache built by the
   cold arm (2571 entries) stays warm with the store hidden (161.3 s) and
