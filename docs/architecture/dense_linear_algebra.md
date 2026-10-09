@@ -81,9 +81,13 @@ first. The inverse exchange returns the face.
 
 **Selections and concatenations.** Taking rows or columns of a face operand
 (selecting directions, sorting poles, assembling unequal blocks) goes through
-the slab: exchange, select or join locally, exchange back
-(`common.staged_reshard`). A sharding constraint on a global `take` can let
-GSPMD gather the operand onto one mesh axis.
+the slab (`_reindex_sharded_axis`, `src/common/staged_reshard.py:649`). The
+blocks' local tiles are joined on the rank. One `all_to_all` moves the join to
+the slab. A static local take (`_block_major_order`, `:737`) puts the joined
+axis in block order and makes any selection. One `all_to_all` returns the face.
+A call therefore makes two exchanges whatever its block count, and joins its
+blocks into one buffer the size of the joined output. A sharding constraint
+on a global `take` can let GSPMD gather the operand onto one mesh axis.
 
 **Placing panels.** The q-local shared-pole round joins $S$ state panels
 $[B, n, r_s]$ and takes each slot's pencil columns from them
@@ -125,7 +129,7 @@ in-loop collectives weighted by their trip counts (claim 4121).
 | TT stage 2 | 3612 / 3612 / 3537 | 16 | 0.29 vs 35.2 |
 | TT stage 3 | 1964 / 1964 / 1964 | 6 | 0.0 vs 49.7 |
 | TT stage 4 | 3621 / 3783 / 4199 | 31 | 0.38 vs 13.8 |
-| CT pencil | 13610 / 19208 / 30568 | 1 | 0.0 vs 31.7 |
+| CT pencil (claim 4124) | 5147 / 5903 / 7419 | 1 | 0.0 vs 32.3 |
 
 What remains outside the tile algebra:
 - **Stage 1's panel join.** It joins every state panel inside the program, at one
@@ -135,11 +139,14 @@ What remains outside the tile algebra:
 - **Stage 2's eigenvector slice** `u[..., -width:]`: 9 collective-permutes, 0.29 GB.
 - **Stage 4's pad** of the model columns to the pencil side: 15
   collective-permutes, 0.37 GB.
-- **The CT pencil's collectives are all explicit.** Its growth with the mesh is in
-  its per-panel joins: `_reindex_sharded_axis` (`src/common/staged_reshard.py:711,714`)
-  runs one `all_to_all` per joined panel, and XLA lowers each as $p$ per-peer slices
-  with their producers fused into every slice; `panel_matmul`'s own program is flat in
-  the mesh (§3, claim 4110).
+- **The CT pencil's collectives are all explicit.** Each of its joins is two
+  exchanges (`src/common/staged_reshard.py:721,725`), 28 `all_to_all`s in the
+  pencil at 8×8. On the CPU host mesh XLA lowers each `all_to_all` as $p$
+  per-peer slices, with the producers fused into every slice. So the pencil
+  still grows with the mesh, by 2272 operations from 2×2 to 8×8. Of these, 1722
+  sit at the return exchange (`:725`), whose producer is the block-order take.
+  A GPU compile of one ten-panel join at 2×2 holds no per-peer slices
+  (claim 4124). `panel_matmul`'s own program is flat in the mesh (§3, claim 4110).
 
 ## 3 The distributed product: SUMMA and `batch_gram`
 
