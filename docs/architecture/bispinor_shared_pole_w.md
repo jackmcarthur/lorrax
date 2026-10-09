@@ -316,7 +316,7 @@ On the CPU census of the staged programs at CrI3 24×24 P64 shapes (TT side
 25856, stage width 4; [dense linear algebra §2](dense_linear_algebra.md#what-gspmd-emits)),
 the order takes TT stage 1 at 8×8 from 19.0 to 1.3 GB per device moved by GSPMD
 and from 31394 to 16739 optimized operations, and leaves stage 3 at 1964
-operations on every mesh (claim FACEMAP-4).
+operations on every mesh (claim 4121).
 
 **GEMM stages.** Every face GEMM is `distrib_la.panel_matmul` (`face_matmul`,
 `src/gw/shared_pole_execution.py:320`): a batched 2-D SUMMA with one exchange per
