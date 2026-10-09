@@ -11,8 +11,11 @@ tile, -1 sources, unit phases, a random spin unitary per k).
 
 Modes: 0 pair, 2 + 3 the Sigma k-leading convolution (prep + apply), 3 and 5
 the k-leading and k-minor transforms, 4 the BSE k-minor convolution, 7 the
-raw-parent Sigma convolution, 9 the wedge transform, 10 the plane FFT, 11 the
-chi0 node.  CUDA: four ranks, one GPU each,
+raw-parent Sigma convolution, 8 the four-current Sigma convolution (W from its
+parents; plain, and on placed tables with live rows), 9 the wedge transform, 10
+the plane FFT, 11 the chi0 node (partner tiles, conj(G) partners, and the
+four-current channel vertices with a Dirac-parity sign_c that is -1 on some k
+rows, on placed tables with live rows).  CUDA: four ranks, one GPU each,
 ``lx run ... -n 4 -- python3 tests/test_kconv_xla_gate.py``.  cpu: one process
 with four host devices, ``JAX_PLATFORMS=cpu
 XLA_FLAGS=--xla_force_host_platform_device_count=4 python3 tests/test_kconv_xla_gate.py``.
@@ -202,6 +205,47 @@ def run_cases(mesh, kg=(3, 2, 2), arm=None, skip=()):
                                                 norm="ortho"),
                 lambda f: f(put(acc0, P(None, None, "x", "y")), G, Gc, alpha, Gt, Gct))
     out["mode11 kconv_chi_unfold"] = _rel(a, b)
+    # the same node with conj(G) partners (a Green of real weights) and no completion
+    a, b = both(lambda: F.make_kconv_chi_unfold(mesh, kg, tg, n_out=n_out, complete=False,
+                                                norm="ortho"),
+                lambda f: f(put(acc0, P(None, None, "x", "y")), G, Gc, alpha))
+    out["mode11 kconv_chi_unfold conj partner"] = _rel(a, b)
+
+    # The production calls read placed tables and a padded pass's live rows.
+    from symmetry_maps import device_load_tables
+    gl = device_load_tables(tg, mesh)
+    live = put(np.asarray([1, m - 1], np.int32), P())
+
+    # mode 11 with channel vertices (the four-current stream): the Dirac parity sign_c is -1 on
+    # some k rows and acts on Gc's k rows before the transform (gw.w_isdf._photon_chi_kconvs)
+    vl = (((0, 1), (1, 1j)), ((1, 0), (-1, 1j)))
+    vr = (((1, 0), (1j, -1)), ((0, 1), (1, -1j)))
+    sign = np.where(rng.random(nk) < 0.5, -1.0, 1.0)
+    sign[:2] = (1.0, -1.0)
+    acc_v = rnd(len(vl) * len(vr), nk, mu, mu)
+
+    def vertex():
+        return F.make_kconv_chi_vertex(mesh, kg, tg, left_vertices=vl, right_vertices=vr,
+                                       sign_c=sign, norm="ortho")
+    a, b = both(vertex, lambda f: f(put(acc_v, P(None, None, "x", "y")), G, Gc, Gt, Gct))
+    out["mode11 kconv_chi_vertex sign_c"] = _rel(a, b)
+    a, b = both(vertex, lambda f: f(put(acc_v, P(None, None, "x", "y")), G, Gc, load=gl, live=live))
+    out["mode11 kconv_chi_vertex conj partner, placed, live"] = _rel(a, b)
+
+    # mode 8: the four-current Sigma convolution, W read from its parents through its own tables
+    # (Lorentz endpoint actions of the vertices' widths)
+    tw8 = _tables(rng, nk, n_parent, m, m, len(vl), len(vl), len(vr), (px, py))
+    W8 = put(rnd(n_parent, mu, len(vl), mu, len(vr)), P(None, "x", None, "y", None))
+    W8t = put(rnd(n_parent, mu, len(vl), mu, len(vr)), P(None, "x", None, "y", None))
+    wl8 = device_load_tables(tw8, mesh)
+
+    def lorentz():
+        return F.make_kconv_lorentz_unfold(mesh, kg, tg, w_tables=tw8, left_vertices=vl,
+                                           right_vertices=vr, store_rows=rows, norm="ortho", mult=0.7)
+    a, b = both(lorentz, lambda f: f(G, Gt, W8, W8t))
+    out["mode8 kconv_lorentz_unfold"] = _rel(a, b)
+    a, b = both(lorentz, lambda f: f(G, Gt, W8, W8t, load=gl, w_load=wl8, live=live))
+    out["mode8 kconv_lorentz_unfold placed, live"] = _rel(a, b)
     return out
 
 

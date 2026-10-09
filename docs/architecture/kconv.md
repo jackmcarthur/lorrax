@@ -122,7 +122,8 @@ the backend.
 **The XLA reference.** Factories built inside the context manager
 `ffi.fft.xla_reference()` take the XLA backend on any platform. It is a Python
 argument of the caller, not a dial: `tests/test_kconv_xla_gate.py` uses it to
-hold every mode it covers (0, 2, 3, 4, 5, 7, 9, 10, 11) to relative 1e-12 of
+hold every mode it covers (0, 2, 3, 4, 5, 7, 8, 9, 10, 11, with mode 11's channel
+vertices) to relative 1e-12 of
 the XLA backend on the same devices, mathdx on four GPUs and the plan route on
 four host devices, and stage-time measurements use it to time the XLA arm.
 

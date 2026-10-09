@@ -2147,11 +2147,15 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
                 gvt, gct = jnp.conj(gv), jnp.conj(gc)
             n_par, mx, _, my, _ = (int(v) for v in gv.shape)
 
-            def unfolded(g, gt):
+            def unfolded(g, gt, sign=None):
                 O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+                if sign is not None:
+                    # sign_c is per full-k row, so it acts on the unfolded k rows before the
+                    # transform to R (mode 11 applies it on its Gc load, at the same point).
+                    O = O * jnp.asarray(sign)[:, None, None, None, None]
                 return ifft_local(O.reshape(nk, mx * ns, my * ns)).reshape(nk, mx, ns, my, ns)
             lower = unfolded(gv, gvt)
-            upper = unfolded(gc, gct) * jnp.asarray(sign_host)[:, None, None, None, None]
+            upper = unfolded(gc, gct, sign_host if signed else None)
             planes = []
             for i in range(na):
                 for j in range(nb):
