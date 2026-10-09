@@ -11,7 +11,7 @@ the scalar bank, directions, pencils and store schema, which the sectors
 reuse, are [the shared-pole implementation page](shared_pole_model.md); the
 four-current physics and the $1/c$ counting are
 [bispinor GW](../theory/bispinor-gw.md). Code is cited as `file:line` at
-`5ca246d5b`; read the file rather than the number.
+`d9665201b`; read the file rather than the number.
 
 ## Symbols
 
@@ -296,7 +296,7 @@ $$
 
 Four things follow. Joining or splitting logical blocks along an axis is every
 rank's own concatenation or slice of its tiles, so no byte moves (`tile_join`,
-`tile_split`, `tile_block`, `src/gw/shared_pole_pencil.py:81,89,120`). A state's
+`tile_split`, `tile_block`, `src/gw/shared_pole_pencil.py:82,90,120`). A state's
 original and mirror columns sit on the same rank, so the paired-basis congruence
 of stage 1 (theory §6.3, $w = (X(z) + X(-z))/2$, $v = (X(z) - X(-z))/2z$) runs
 on each tile with that tile's pieces of the halves (`_paired_member`,
@@ -305,7 +305,7 @@ adjoint is the tile at the mirrored grid position: one `ppermute` across the
 grid's diagonal (`tile_adjoint`, `src/gw/shared_pole_pencil.py:102`). With whole matrices ($p = 1$) S 4b is
 the plain concatenation, so the q-local round runs the same equations. The
 round's host tables enter the order once at the face entry points
-(`interleave_tables`, `src/gw/shared_pole_pencil.py:144`, called by `face_reduce_round`, `face_reduce_decoupled`
+(`interleave_tables`, `src/gw/shared_pole_pencil.py:143`, called by `face_reduce_round`, `face_reduce_decoupled`
 and the face side of `_pack_cross_spans`); the replicated per-column vectors
 (nodes, masks, inverse nodes) follow it (`join_vectors`, `split_vectors`). The
 face span $Y$ therefore carries its rows in the face order, as the face CT takes

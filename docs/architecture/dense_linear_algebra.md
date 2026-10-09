@@ -11,7 +11,7 @@ engine serves each platform, and which stage takes which plan. It ends with
 CrI3 24×24 at P64. The caller contract of every function named here is
 [`distrib_la`'s API](../services/distrib_la/api.md); which library serves which
 request is [its backends page](../services/distrib_la/backends.md). Code is cited
-as `file:line` at `5ca246d5b`; read the file rather than the number.
+as `file:line` at `d9665201b`; read the file rather than the number.
 
 ## Symbols
 
@@ -96,36 +96,48 @@ by the panel width and $F$, never by $S$, so a later SC map with more line
 panels makes more calls and no new program. The face programs join and take
 the panels themselves through the slab exchange.
 
+**Tile-interleaved blocks.** When a face matrix's axis is a run of logical
+blocks, each a multiple of $p$, the shared-pole face pencils hold it in the
+tile-interleaved order: rank row (column) $b$ holds the $b$-th $1/p$ of every
+block, in block order ([bispinor sectors §5.2](bispinor_shared_pole_w.md#5-construction),
+equation S 4b). Joining or splitting blocks is then every rank's own
+concatenation or slice of its tiles. The adjoint is the tile at the mirrored
+grid position, one `ppermute` across the grid's diagonal, because rows and
+columns share the order. An eigensolve sees a symmetric permutation $PAP^\mathsf T$
+of the whole-order matrix, so either route returns the same spectrum with
+eigenvectors $Pu$. The tile algebra lives in `src/gw/shared_pole_pencil.py:47`.
+
 ### What GSPMD emits {#what-gspmd-emits}
 
 A face program written in global view (slices, concatenations, `a + a^\dagger`,
 masks on face operands) is partitioned by GSPMD. Its collectives can be read off
 the optimized HLO and split by origin. Those whose `op_name` ends in a JAX
 collective primitive come from `shard_map` regions: `panel_matmul`'s SUMMA, the
-slab exchanges and route (c). The rest GSPMD inserted. The census below covers
-the staged sector programs at CrI3 24×24 P64 shapes: TT side 25856, $n_{TT}$ 4992,
-stage width 4; CT joint side 17408, stage width 4. They were compiled on CPU
-host meshes. Bytes are received per device per execution, with in-loop
-collectives weighted by their trip counts (claim 4104).
+slab exchanges, the tile algebra and route (c). The rest GSPMD inserted. The
+census below covers the staged sector programs at CrI3 24×24 P64 shapes: TT side
+25856, $n_{TT}$ 4992, stage width 4; CT joint side 17408, stage width 4. They were
+compiled on CPU host meshes. Bytes are received per device per execution, with
+in-loop collectives weighted by their trip counts (claim FACEMAP-4).
 
-| program | optimized ops (2×2 → 8×8) | GSPMD collectives at 8×8 | GB/device at 8×8, GSPMD vs explicit |
+| program | optimized ops (2×2 / 4×4 / 8×8) | GSPMD collectives at 8×8 | GB/device at 8×8, GSPMD vs explicit |
 |---|---|---|---|
-| TT stage 1 (members) | 9328 → 31394 | 299 all-to-all, 154 collective-permute (45 at 2×2), 8 other | 19.0 vs 6.7 |
-| TT stages 2–4 | 4017 → 5034, 2208 → 2964, 3973 → 5855 | 43, 17, 56 | 3.5, 1.7, 2.3 vs 34.2, 49.0, 13.8 |
-| CT pencil | 15495 → 37743 | 3 | 0.15 vs 37.3 |
+| TT stage 1 (members) | 6523 / 9391 / 16739 | 235 (the same on every mesh) | 1.3 vs 8.1 |
+| TT stage 2 | 3612 / 3612 / 3537 | 16 | 0.29 vs 35.2 |
+| TT stage 3 | 1964 / 1964 / 1964 | 6 | 0.0 vs 49.7 |
+| TT stage 4 | 3621 / 3783 / 4199 | 31 | 0.38 vs 13.8 |
+| CT pencil | 13610 / 19208 / 30568 | 1 | 0.0 vs 31.7 |
 
-What the attribution of stage 1 shows:
-- Every state panel joined inside the program costs its own small all-to-all
-  (219 of them, 0.7 GB), and the program depends on the panel count: twelve
-  more line panels grow stage 1 to 33662 operations and the CT pencil to 41775
-  at 8×8.
-- Most of the bytes GSPMD moves in stage 1 are the pencil's block joins
-  (`hermitian_block`, `join_columns` at the $F$ and $2 i_S$ offsets: 76
-  all-to-alls, 7.2 GB) and the paired-basis slices at the half-extent
-  offsets, which are not tile-aligned (138 collective-permutes, 8.1 GB).
-- The CT pencil's collectives are all explicit. Its growth with the mesh is its
-  per-panel joins (607 all-to-alls) and `panel_matmul`'s own panel structure:
-  the panel count and the narrower tail panel follow $n/p$.
+What remains outside the tile algebra:
+- **Stage 1's panel join.** It joins every state panel inside the program, at one
+  small all-to-all each (219 of them, 0.7 GB), so the program follows the panel
+  count and its operation count follows the mesh. The CT pencil's 527 explicit
+  all-to-alls are the same per-panel joins through the slab exchange.
+- **The finite block's transpose:** one collective-permute, 0.6 GB in stage 1.
+- **Stage 2's eigenvector slice** `u[..., -width:]`: 9 collective-permutes, 0.29 GB.
+- **Stage 4's pad** of the model columns to the pencil side: 15
+  collective-permutes, 0.37 GB.
+- **The CT pencil's remaining growth with the mesh** is also `panel_matmul`'s own
+  panel structure: its panel count and narrower tail panel follow $n/p$.
 
 ## 3 The distributed product: SUMMA and `batch_gram`
 
@@ -207,7 +219,7 @@ $$
 
 the boundary being the arrays live beside that eigh; otherwise the whole mesh,
 with one warning. The shared-pole sectors decide each stack so
-(`staged_eigh`, `src/gw/shared_pole_execution.py:678`); a caller that passes a
+(`staged_eigh`, `src/gw/shared_pole_execution.py:682`); a caller that passes a
 room instead lets `distrib_la` decide each stack by the same price
 ([API § eigh-stack](../services/distrib_la/api.md#eigh-stack)). Nothing is
 compiled to be measured and no size is exchanged, so every rank decides alike
@@ -237,7 +249,7 @@ with $d_{\rm next} \le d^2(3+d)/4$. Each step is three batched GEMMs, so it runs
 `panel_matmul` in the face layout with no eigensolve. The iteration count is
 fixed from the initial bound, $\lceil \log_2(\ln \varepsilon_t / \ln d)\rceil$,
 never from an on-device residual, so every rank runs the same program
-(`_metric_inverse_root`, `src/gw/shared_pole_reduction.py:18`). For the paired
+(`_metric_inverse_root`, `src/gw/shared_pole_reduction.py:20`). For the paired
 sector metric, which is the identity to about $10^{-8}$ by construction, that is
 one iteration; an eigh-based root of the same stack costs more (claim 3425).
 The receipt reports $\max\|ZAZ - I\|_F/\sqrt R$. The checked eigh chain
