@@ -11,7 +11,7 @@ engine serves each platform, and which stage takes which plan. It ends with
 CrI3 24×24 at P64. The caller contract of every function named here is
 [`distrib_la`'s API](../services/distrib_la/api.md); which library serves which
 request is [its backends page](../services/distrib_la/backends.md). Code is cited
-as `file:line` at `d9665201b`; read the file rather than the number.
+as `file:line` at `957446462`; read the file rather than the number.
 
 ## Symbols
 
@@ -130,14 +130,16 @@ in-loop collectives weighted by their trip counts (claim FACEMAP-4).
 What remains outside the tile algebra:
 - **Stage 1's panel join.** It joins every state panel inside the program, at one
   small all-to-all each (219 of them, 0.7 GB), so the program follows the panel
-  count and its operation count follows the mesh. The CT pencil's 527 explicit
-  all-to-alls are the same per-panel joins through the slab exchange.
+  count and its operation count follows the mesh.
 - **The finite block's transpose:** one collective-permute, 0.6 GB in stage 1.
 - **Stage 2's eigenvector slice** `u[..., -width:]`: 9 collective-permutes, 0.29 GB.
 - **Stage 4's pad** of the model columns to the pencil side: 15
   collective-permutes, 0.37 GB.
-- **The CT pencil's remaining growth with the mesh** is also `panel_matmul`'s own
-  panel structure: its panel count and narrower tail panel follow $n/p$.
+- **The CT pencil's collectives are all explicit.** Its growth with the mesh is in
+  its per-panel joins: `_reindex_sharded_axis` (`src/common/staged_reshard.py:711,714`)
+  runs one `all_to_all` per joined panel, and XLA lowers each as $p$ per-peer slices
+  with their producers fused into every slice; `panel_matmul`'s own program is flat in
+  the mesh (§3, claim 4110).
 
 ## 3 The distributed product: SUMMA and `batch_gram`
 
