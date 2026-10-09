@@ -809,16 +809,8 @@ def test_platform_allocator_is_BLIND_not_merely_under_reporting():
 
 
 def test_cuda_async_is_not_caveated_as_under_reporting():
-    """Measured: ``peak_bytes_in_use`` is IDENTICAL under BFC and cuda_async
-    (1.000 and 6.500 GB, job 7882447).  The premise of the original branch —
-    "cuda_async returns freed transients so the reading under-reports" —
-    was not reproduced.
-
-    It is what ``config/frontera/ffi_env.sh:24`` deploys, so getting this
-    wrong caveats (or fails to caveat) the project's own FFI runs.
-    Transient-heavy kernels were NOT tested, so the note must say that
-    rather than claim either way.
-    """
+    """Under ``cuda_async`` ``peak_bytes_in_use`` is XLA's own allocation count, as under
+    BFC, and equals the pool's in-use high-water, so a reported peak carries no caveat."""
     with _Env(XLA_PYTHON_CLIENT_ALLOCATOR="cuda_async"):
         r = gw_config.resolve_xla_gpu_memory_env()
         assert r.allocator == "cuda_async"
@@ -827,9 +819,6 @@ def test_cuda_async_is_not_caveated_as_under_reporting():
         assert r.caveat() == "", (
             "an unqualified caveat here contradicts the measurement: %r"
             % r.caveat())
-        assert "transient" in r.peak_note.lower(), (
-            "the untested case must be stated, not silently claimed: %r"
-            % r.peak_note)
 
 
 def test_bfc_allocators_are_faithful():

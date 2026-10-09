@@ -55,14 +55,15 @@ def resolve_device_budget_gb(deck_gb: float = 0.0, linalg: str = "local") -> flo
     deck = float(deck_gb or 0.0)
     if deck > rule:
         import warnings
-        from runtime import POOL_OVERSHOOT, _resolve_proc_id
+        from runtime import MEMORY_MARGIN, POOL_OVERSHOOT, _resolve_proc_id
         if _resolve_proc_id() == 0:
             warnings.warn(
                 f"memory_per_device_gb = {deck:g} exceeds the memory rule's "
-                f"{rule:.2f} GB on this card (linalg = {linalg}); the XLA pool has "
-                f"overshot its budget by up to {100 * POOL_OVERSHOOT:.0f} % (P4) and "
-                f"15 % (P64 CrI3 24x24); continuing at {deck:g} "
-                "(docs/architecture/memory-model.md#budget)", RuntimeWarning, stacklevel=2)
+                f"{rule:.2f} GB on this card (linalg = {linalg}); the rule leaves "
+                f"{100 * MEMORY_MARGIN * POOL_OVERSHOOT:.0f} % above its budget for peaks the "
+                f"planners under-price and free space trapped between live buffers; "
+                f"continuing at {deck:g} (docs/architecture/memory-model.md#what-phi-covers)",
+                RuntimeWarning, stacklevel=2)
     budget = deck if deck > 0 else rule
     set_device_budget_gb(budget)
     return budget

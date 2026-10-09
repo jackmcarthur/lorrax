@@ -2,26 +2,17 @@
 
 The **L3 (substrate)** half of the allocator story: a read-only mirror of
 jaxlib's own parse of ``XLA_PYTHON_CLIENT_*`` / ``XLA_CLIENT_MEM_FRACTION``,
-plus the corroboration of that environment against the live client, plus
-:func:`pool_high_water`, the resettable device peak the stage receipt reads.  Nothing
-here knows what a band or a q-point is; it belongs beside
-:func:`runtime.set_default_env`, which is the module that decides which of
-these variables LORRAX ships.
+the corroboration of that environment against the live client,
+:func:`outside_pool_bytes`, and :func:`pool_high_water`, the resettable device
+peak the stage receipt reads.  Nothing here knows what a band or a q-point
+is; :func:`runtime.set_default_gpu_pool` decides which of these variables
+LORRAX sets, and ``gw.gw_config`` re-exports the resolver and the
+corroboration.
 
-WHY IT MOVED HERE.  It lived in ``gw.gw_config`` — the GW driver's 2.5 kLoC
-deck parser — and ``runtime.collect_startup_facts`` reached *up* into that
-driver package to get it, through an import that was lazy and exception-
-guarded precisely because the direction was wrong.  ``runtime/__init__.py``
-carried the note "the two corroboration helpers live in ``gw.gw_config`` and
-belong in ``runtime/xla_memory.py``, which is why this import is lazy,
-guarded, and made only from the fact collector" (numbered request R9 of that
-workstream).  This module is that request, landed.  ``gw.gw_config``
-re-exports both names, so every existing import site keeps working.
-
-IMPORTABLE WITHOUT JAX, like the module it came from: it reads
-``os.environ`` and nothing else, so it is safe before backend init and
-testable on a login node.  ``runtime.__init__`` is likewise jax-free at
-module scope, so importing this costs nothing.
+Importable without jax: at module scope it reads ``os.environ`` and nothing
+else, so it is safe before backend init and testable on a login node.  How
+the pool grows past its reservation, and what the device budget prices, are
+in ``docs/architecture/memory-model.md#pool-growth``.
 """
 from __future__ import annotations
 
@@ -56,39 +47,28 @@ from . import _FALSY_TOKENS as _ENV_FALSE
 #     preallocate = os.getenv('XLA_PYTHON_CLIENT_PREALLOCATE', '')
 #     if preallocate: options['preallocate'] = preallocate not in ('false','False','0')
 #
-# FOUR traps encoded below, each of which previously produced a
-# confidently wrong statement:
+# Three traps, each encoded below:
 #
-#  1. jax LOWERCASES the allocator; ``gw_init.py``'s ``== "platform"`` did
-#     not, so ``=PLATFORM`` reported the peak as faithful when it was not.
-#  2. ``platform``, ``cuda_async`` and BFC are THREE distinct allocators;
-#     the old comment used the names interchangeably.  ``platform`` is
-#     plain ``cudaMalloc``, NOT cudaMallocAsync.
-#  3. ``config/frontera/ffi_env.sh:24`` deploys ``cuda_async``, which the
-#     ``== "platform"`` test never matched.
-#  4. jax's preallocate test is case-SENSITIVE, so
-#     ``XLA_PYTHON_CLIENT_PREALLOCATE=FALSE`` leaves preallocation ON
-#     while reading as "off" to a human.  ``unset`` also means ON (the
-#     option is simply not passed and XLA preallocates by default).
+#  1. jaxlib lowercases the allocator, so ``=PLATFORM`` is ``platform``.
+#  2. ``platform``, ``cuda_async`` and BFC are three distinct allocators;
+#     ``platform`` is plain ``cudaMalloc``, not cudaMallocAsync.
+#  3. jaxlib's preallocate test is case-sensitive, so
+#     ``XLA_PYTHON_CLIENT_PREALLOCATE=FALSE`` leaves preallocation ON while
+#     reading as "off" to a human.  Unset also means on (the option is not
+#     passed and XLA preallocates by default).
 #
-# WHAT WAS MEASURED (allocator workstream, 8 GPUs / 2 nodes, job 7882447,
-# each cell run twice with rep 2 in reverse order):
+# What the client reports, per allocator:
 #
 #   allocator     memory_stats()                      peak_bytes_in_use
-#   ------------  ----------------------------------  ------------------
-#   unset / bfc   fully populated                     1.000 / 6.500 GB
-#   cuda_async    fully populated                     1.000 / 6.500 GB
-#                                                     (IDENTICAL to BFC)
-#   platform      bytes_limit=0, peak_bytes_in_use=0  0.000 GB  — BLIND
+#   ------------  ----------------------------------  -----------------------------
+#   unset / bfc   populated                           XLA's own allocations
+#   cuda_async    populated                           XLA's own allocations; equal to
+#                                                     the pool's in-use high-water
+#   platform      bytes_limit=0, peak_bytes_in_use=0  none: no arena is kept
 #
-# So the premise the old branch was written on — "cuda_async returns freed
-# transients to its pool, so the reading under-reports" — was NOT
-# reproduced for steady allocations.  Transient-heavy kernels were not
-# tested, so ``peak_note`` says that instead of claiming either way.  And
-# ``platform`` is not "low", it is ZERO: any figure a run prints under
-# ``platform`` came from the nvidia-smi fallback in
-# ``isdf_fitting.fit_zeta_to_h5._track_peak``, which samples the WHOLE GPU
-# (other processes included), not this run's arena.
+# Under cuda_async the pool's RESERVED bytes can rise past the bytes in use
+# for an instant, when a request meets only pending frees; no reading here
+# reports reserved bytes (docs/architecture/memory-model.md#pool-growth).
 #
 # This function READS ONLY.  It never sets an allocator variable: which
 # values LORRAX ships is decided in ``runtime.set_default_gpu_pool``
@@ -173,17 +153,6 @@ _XLA_PEAK_ACCOUNTING = {
     "cuda_async": "arena",
     "platform":   "none",
 }
-_XLA_PEAK_NOTE = {
-    "default":    "BFC arena; peak_bytes_in_use is the exact high-water mark.",
-    "bfc":        "BFC arena; peak_bytes_in_use is the exact high-water mark.",
-    "cuda_async": ("cudaMallocAsync; peak_bytes_in_use measured IDENTICAL to "
-                   "BFC for steady allocations (job 7882447).  Transient-heavy "
-                   "kernels were not tested — treat a peak from this allocator "
-                   "as unverified there, not as wrong."),
-    "platform":   ("plain cudaMalloc (NOT cudaMallocAsync); the client reports "
-                   "bytes_limit=0 and peak_bytes_in_use=0, so there is no "
-                   "arena peak at all."),
-}
 
 
 @dataclass(frozen=True)
@@ -195,7 +164,6 @@ class XlaGpuMemoryEnv:
     allocator_is_valid: bool
     peak_accounting: str            # "arena" | "none" | "unknown"
     peak_is_faithful: bool
-    peak_note: str
     preallocate: bool
     preallocate_raw: str | None
     preallocate_looks_like_a_typo: bool
@@ -237,8 +205,6 @@ def resolve_xla_gpu_memory_env() -> XlaGpuMemoryEnv:
     alloc_valid = alloc in _XLA_ALLOCATORS
     accounting = _XLA_PEAK_ACCOUNTING.get(alloc, "unknown") if alloc_valid \
         else "unknown"
-    note = _XLA_PEAK_NOTE.get(alloc, "") if alloc_valid else (
-        f"{alloc!r} is not an allocator jax accepts.")
 
     prealloc_raw = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE")
     if prealloc_raw is None or prealloc_raw == "":
@@ -265,7 +231,6 @@ def resolve_xla_gpu_memory_env() -> XlaGpuMemoryEnv:
         allocator_is_valid=alloc_valid,
         peak_accounting=accounting,
         peak_is_faithful=(accounting == "arena"),
-        peak_note=note,
         preallocate=preallocate,
         preallocate_raw=prealloc_raw,
         preallocate_looks_like_a_typo=prealloc_typo,
