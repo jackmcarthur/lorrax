@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from distrib_la import (face_sharding, hermitian_block, hermitian_part,
                         join_columns, on_face)
 
@@ -88,7 +89,6 @@ def tile_join(arrays, axis, matrix_sharding):
 
 def tile_split(a, sizes, axis, matrix_sharding):
     """The inverse of ``tile_join``: ``a``'s logical blocks of ``sizes`` along ``axis``."""
-    import numpy as np
     p = tile_count(matrix_sharding)
     edges = np.concatenate(([0], np.cumsum([int(s) // p for s in sizes])))
 
@@ -124,7 +124,7 @@ def tile_block(rows, matrix_sharding):
 
 def join_vectors(vectors, p):
     """Replicated per-column vectors [..., s_i] joined in the tile-interleaved order of ``p``."""
-    xp = jnp if any(isinstance(v, jax.Array) or isinstance(v, jax.core.Tracer) for v in vectors) else __import__('numpy')
+    xp = np if all(isinstance(v, np.ndarray) for v in vectors) else jnp
     if p == 1:
         return xp.concatenate(vectors, axis=-1)
     lead = vectors[0].shape[:-1]
@@ -134,7 +134,6 @@ def join_vectors(vectors, p):
 
 def split_vectors(v, sizes, p):
     """The inverse of ``join_vectors``: ``v``'s logical blocks of ``sizes``."""
-    import numpy as np
     edges = np.concatenate(([0], np.cumsum([int(s) // p for s in sizes])))
     lead = v.shape[:-1]
     pieces = v.reshape(*lead, p, v.shape[-1] // p)
