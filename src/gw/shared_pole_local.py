@@ -282,8 +282,13 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
                 own=finite + infinity, extents=np.column_stack((finite, infinity)))
 
 
+#: Panels placed per call of ``pack_panels``: a call's dispatch and exchange are its fixed cost
+#: (about 10 ms at P4), so the calls, never the programs, follow the panel count, as S / 8.
+PACK_GROUP = 8
+
+
 def pack_panels(fields, order, widths, *, mesh_xy, layout):
-    """Each slot's pencil columns, placed from the round's state panels one panel at a time.
+    """Each slot's pencil columns, placed from the round's state panels a group at a time.
 
     ``fields`` are K lists of the round's S state panels ``[B, n_k, r_s]`` (Q,
     WQ, dWQ, or a cross action), ``order`` the host ``[B, F]`` table of
@@ -294,27 +299,35 @@ def pack_panels(fields, order, widths, *, mesh_xy, layout):
     column, in the panels' ``layout``: ``'batch'`` (whole parents per rank,
     ``P(BATCH)``) or ``'face'`` (``P(None, 'x', 'y')``).
 
-    One program per (layout, panel width, F) places one panel, and the panel
-    count is only the number of calls: the line sites change it from map to
-    map, and no program's shape follows it. The host inverts ``order`` per
-    panel, ``dest[b, j]`` the packed column of panel column j or F where the
-    round does not take it (the scatter drops it); a source column appears at
-    most once in a slot's table, so the scatter has one writer per column.
+    One program per (layout, panel width, F) places a group of ``PACK_GROUP``
+    panels of that width, and the panel count is only the number of calls: the
+    line sites change it from map to map, and no program's shape follows it. A
+    short group repeats its last panel with every column dropped. The host
+    inverts ``order`` per panel, ``dest[b, i, j]`` the packed column of column j
+    of the group's panel i, or F where the round does not take it (the scatter
+    drops it); a source column appears at most once in a slot's table, so the
+    scatter has one writer per column.
     """
     import numpy as np
     order = np.asarray(order)
+    slots, extent = (int(v) for v in order.shape)
     offsets = np.concatenate(([0], np.cumsum(widths))).astype(np.int64)
     shapes = tuple((int(panels[0].shape[1]), np.dtype(panels[0].dtype).name) for panels in fields)
-    key = (mesh_xy, layout, int(order.shape[0]), int(order.shape[1]), shapes)
-    accs = _pack_start(*key)()
+    key = (mesh_xy, layout, slots, extent, shapes)
+    by_width = {}
     for s, width in enumerate(int(w) for w in widths):
-        # dest[b, j]: where column j of panel s lands in slot b's pencil, F (dropped) if nowhere.
-        taken = (order >= offsets[s]) & (order < offsets[s] + width)
-        dest = np.full((order.shape[0], width), order.shape[1], np.int32)
-        b, f = np.nonzero(taken)
-        dest[b, order[b, f] - offsets[s]] = f
-        dest = _batch_put(mesh_xy, dest) if layout == 'batch' else dest
-        accs = _pack_place(*key, width)(accs, tuple(panels[s] for panels in fields), dest)
+        by_width.setdefault(width, []).append(s)
+    accs = _pack_start(*key)()
+    for width, members in by_width.items():
+        for g0 in range(0, len(members), PACK_GROUP):
+            group = members[g0:g0 + PACK_GROUP]
+            dest = np.full((slots, PACK_GROUP, width), extent, np.int32)
+            for i, s in enumerate(group):
+                b, f = np.nonzero((order >= offsets[s]) & (order < offsets[s] + width))
+                dest[b, i, order[b, f] - offsets[s]] = f
+            group = group + [group[-1]] * (PACK_GROUP - len(group))   # their dest rows stay F
+            dest = _batch_put(mesh_xy, dest) if layout == 'batch' else dest
+            accs = _pack_place(*key, width)(accs, tuple(tuple(panels[s] for s in group) for panels in fields), dest)
     return _pack_finish(*key)(accs)
 
 
@@ -348,12 +361,13 @@ def _pack_start(mesh_xy, layout, slots, extent, shapes):
 
 @lru_cache(maxsize=None)
 def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
-    """``accs[k][b, :, dest[b, j]] = panel_k[b, :, j]`` for one panel width, accumulators donated.
+    """``accs[k][b, :, dest[b, i, j]] = panel_{k,i}[b, :, j]`` for a group of ``PACK_GROUP``
+    panels of one width, accumulators donated.
 
-    Face: one all_to_all over y moves the panel's tile ``[B, m, r/Py]`` to its
-    slab ``[B, s, r]`` (row block y of the x-tile, every column of the panel in
-    global order), the same bytes as the tile; the scatter is then local.
-    Batch: whole parents per rank, no exchange.
+    Face: one all_to_all over y per field moves the group's tiles
+    ``[G, B, m, r/Py]`` to their slabs ``[G, B, s, r]`` (row block y of the
+    x-tile, every column of each panel in global order), the same bytes as the
+    tiles; the scatters are then local. Batch: whole parents per rank, no exchange.
     """
     import jax
     import jax.numpy as jnp
@@ -364,25 +378,34 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
     def scatter(acc, panel, dest):
         return jax.vmap(lambda a, p, d: a.at[:, d].set(p, mode='drop'))(acc, panel, dest)
 
+    group = range(PACK_GROUP)
     if layout == 'batch':
         def body(accs, panels, dest):
-            return tuple(scatter(a, p, dest) for a, p in zip(accs, panels))
-        specs = ((P(BATCH),) * len(shapes), (P(BATCH),) * len(shapes), P(BATCH))
+            out = []
+            for acc, members in zip(accs, panels):
+                for i in group:
+                    acc = scatter(acc, members[i], dest[:, i])
+                out.append(acc)
+            return tuple(out)
+        specs = ((P(BATCH),) * len(shapes), ((P(BATCH),) * PACK_GROUP,) * len(shapes), P(BATCH))
         out = (P(BATCH),) * len(shapes)
     else:
         def body(accs, panels, dest):
-            moved = []
-            for acc, panel in zip(accs, panels):
-                pad = py * int(acc.shape[1]) - int(panel.shape[1])
+            out = []
+            for acc, members in zip(accs, panels):
+                tiles = jnp.stack(members)
+                pad = py * int(acc.shape[1]) - int(tiles.shape[2])
                 if pad:
-                    panel = jnp.pad(panel, ((0, 0), (0, pad), (0, 0)))
-                # Face tile -> slab: split the rows over y, join the column blocks in y order.
+                    tiles = jnp.pad(tiles, ((0, 0), (0, 0), (0, pad), (0, 0)))
+                # Face tiles -> slabs: split the rows over y, join the column blocks in y order.
                 if py > 1:
-                    panel = jax.lax.all_to_all(panel, 'y', split_axis=1, concat_axis=2, tiled=True)
-                moved.append(scatter(acc, panel, dest))
-            return tuple(moved)
+                    tiles = jax.lax.all_to_all(tiles, 'y', split_axis=2, concat_axis=3, tiled=True)
+                for i in group:
+                    acc = scatter(acc, tiles[i], dest[:, i])
+                out.append(acc)
+            return tuple(out)
         slab = P(None, BATCH, None)
-        specs = ((slab,) * len(shapes), (P(None, 'x', 'y'),) * len(shapes), P())
+        specs = ((slab,) * len(shapes), ((P(None, 'x', 'y'),) * PACK_GROUP,) * len(shapes), P())
         out = (slab,) * len(shapes)
     return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=specs, out_specs=out, check_vma=False),
                    donate_argnums=0)
