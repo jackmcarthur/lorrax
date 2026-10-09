@@ -388,6 +388,63 @@ def window_labels(omega_ev, windows, eta_ev):
     return eta, group
 
 
+def coarse_identities(coarse_class, e_dft_ry, compute_mode):
+    """Coarse (semicore) identities: DFT energy below ``meta.coarse_class``'s floor
+    on a route that reads the patch (:func:`semicore_patch_route`), a bool mask."""
+    from common.units import RYD_TO_EV
+    e_ev = np.asarray(e_dft_ry, dtype=np.float64) * RYD_TO_EV
+    if (coarse_class is None or not coarse_class.n_coarse
+            or not semicore_patch_route(compute_mode)):
+        return np.zeros(e_ev.shape, dtype=bool)
+    return e_ev < float(coarse_class.coarse_floor_ev)
+
+
+def coarse_windows_plan(sigma, energy_rel_ev, semicore_kn, near_lo_ev, held=None):
+    """The coarse windows of a map: ``(patch, event, windows)``; one rule for the
+    one-shot and every SC map.
+
+    ``held=None`` plans (the one-shot and SC map 0); a held patch is kept, or
+    extended when a coarse read support leaves it.  The deck's ``lo:hi:eta``
+    windows serve only the coarse class and refuse without one.
+    """
+    users = getattr(sigma, "coarse_windows_ev", tuple)()
+    semicore = np.asarray(semicore_kn, dtype=bool)
+    if not semicore.any():
+        if users:
+            raise ValueError(
+                "GATE sigma_coarse_window: sigma_omega_patches_ev lo:hi:eta windows serve "
+                "the coarse (semicore) states of the MPA/shared-pole Sigma (scalar or "
+                "sector) that read coarse windows, and this run has none: no occupied "
+                "state lies below the coarse floor (a one-shot: outside the requested "
+                "set), or its Sigma is PPM/static.")
+        return None, "", ()
+    auto = semicore & ~_inside_any(energy_rel_ev, users)
+    if held is None:
+        patch, event = semicore_patches_ev(energy_rel_ev, auto, near_lo_ev), "plan"
+    elif semicore_patch_escapes(energy_rel_ev, semicore, near_lo_ev, held, users).any():
+        patch, event = semicore_patches_ev(
+            energy_rel_ev, auto, near_lo_ev, previous=held), "extend"
+    else:
+        patch, event = held, "hold"
+    return patch, event, coarse_windows_ev(near_lo_ev, patch, users)
+
+
+def oneshot_support_ev(sigma, deck_grid_ev, energy_rel_ev, requested_kn, coarse_kn):
+    """The one-shot's sampled support: ``(grid, coarse windows)``.
+
+    The near grid is the plan over the requested set (:func:`plan_support_ev`),
+    the near grid SC map 0 plans.  A coarse window reads Sigma broadened by its
+    own eta, so only the coarse states the near grid never reads use one: those
+    outside the requested set, which would otherwise take Sigma(omega = 0)
+    (``qsgw_utils.sigma_eval_omega``), tens of eV from their own energy.  A
+    requested coarse state keeps its read at the deck eta.
+    """
+    near, _ = plan_support_ev(sigma, deck_grid_ev, energy_rel_ev, requested_kn)
+    off = np.asarray(coarse_kn, dtype=bool) & ~np.asarray(requested_kn, dtype=bool)
+    _, _, windows = coarse_windows_plan(sigma, energy_rel_ev, off, float(near[0]))
+    return joined_grid_ev(near, windows), windows
+
+
 def semicore_patch_route(compute_mode):
     """THE one predicate for a Sigma route that reads the semicore patch.
 

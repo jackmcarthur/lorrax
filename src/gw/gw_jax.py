@@ -808,30 +808,36 @@ def _oneshot_requested(config, enk_dft, wfn, occupation_state, material_class):
     return energy, states, mu_ev
 
 
-def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
+def _oneshot_sampled_support(config, enk_dft, wfn, meta, occupation_state,
                              material_class, print_fn):
     """The one-shot's sampled Sigma(omega) support: the first plan of
     ``gw.qp_support`` (the deck request joined with every requested state's
-    E_DFT +/- 2 eV), the plan SC map 0 makes, so SC map 0 is this calculation.
+    E_DFT +/- 2 eV), the near grid SC map 0 plans, plus the coarse windows of
+    the coarse states the requested set leaves out.
 
     The requested states are the Sigma window's identities the W model treats
     as active, judged in the frame the Sigma build measures from
     (``efermi.sigma_frame_mu_ev``).  Under ``cover`` an active state outside
-    the requested grid reads its own Sigma(E).
+    the requested grid reads its own Sigma(E), and a coarse state outside the
+    requested set reads its own Sigma(E) on SC map 0's coarse windows
+    (``qp_support.oneshot_support_ev``).
     """
     from dataclasses import replace
 
-    from .qp_support import plan_support_ev
+    from .qp_support import coarse_identities, oneshot_support_ev
     requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
     energy, states, _ = _oneshot_requested(
         config, enk_dft, wfn, occupation_state, material_class)
-    grown, _ = plan_support_ev(config.sigma, requested, energy, states)
-    if grown.size == requested.size:
+    coarse = coarse_identities(
+        getattr(meta, "coarse_class", None), enk_dft, config.compute_mode)
+    grid, windows = oneshot_support_ev(config.sigma, requested, energy, states, coarse)
+    if grid.size == requested.size and not windows:
         return config
     print_fn(f"  Sigma sampled support ({config.sigma.out_of_grid}, plan 0): "
              f"[{requested[0]:+.6f}, {requested[-1]:+.6f}] -> "
-             f"[{grown[0]:+.6f}, {grown[-1]:+.6f}] eV")
-    return replace(config, sc_omega_grid_ev=tuple(float(x) for x in grown))
+             f"[{grid[0]:+.6f}, {grid[-1]:+.6f}] eV, {len(windows)} coarse window(s)")
+    return replace(config, sc_omega_grid_ev=tuple(float(x) for x in grid),
+                   sc_coarse_windows_ev=tuple(windows) or None)
 
 
 def _run_oneshot_sigma(
@@ -845,7 +851,7 @@ def _run_oneshot_sigma(
     if qp_solver is not QPSolver.SELF_CONSISTENT:
         if mode.is_dynamic:
             config = _oneshot_sampled_support(
-                config, enk_dft, wfn, oneshot_occupation_state,
+                config, enk_dft, wfn, meta, oneshot_occupation_state,
                 material_class, print0)
         with timing.section("gw_jax.sigma"):
             sigma_result = compute_sigma_xc(
