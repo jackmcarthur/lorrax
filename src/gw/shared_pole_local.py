@@ -324,14 +324,28 @@ def _pack_start(mesh_xy, slots, extent, shapes):
     Each holds packed column f of slot b as row ``b * F + f``, ``[B * F, n_k]``
     at ``P(BATCH)`` (rank r holding its own slots' rows), so a panel's columns
     land as contiguous rows; along the minor axis every update would be a
-    strided column.
+    strided column. A complex field's row is held as its n_k (re, im) pairs,
+    2 n_k reals (``_held``).
     """
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     sharding = NamedSharding(mesh_xy, P(BATCH))
-    return jax.jit(lambda: tuple(jnp.zeros((slots * extent, n), dt) for n, dt in shapes),
+    held = [(n, *_held(dt)) for n, dt in shapes]
+    return jax.jit(lambda: tuple(jnp.zeros((slots * extent, n * pairs), dt) for n, dt, pairs in held),
                    out_shardings=(sharding,) * len(shapes))
+
+
+def _held(dtype):
+    """``(element, pairs)`` of a field's accumulator: a complex field is held as (re, im) reals.
+
+    XLA:GPU has no scatter of elements wider than 64 bits; it expands one into a
+    while loop with one iteration per scattered row. A complex128 accumulator row
+    is therefore held as 2 n_k float64 values, and the place scatter moves reals.
+    """
+    import numpy as np
+    dtype = np.dtype(dtype)
+    return (np.finfo(dtype).dtype, 2) if np.issubdtype(dtype, np.complexfloating) else (dtype, 1)
 
 
 @lru_cache(maxsize=None)
@@ -348,7 +362,10 @@ def _pack_place(mesh_xy, slots, extent, shapes, width):
         # goes past the accumulator, never onto the next slot's first column.
         b, rows, r = panel.shape
         index = jnp.where(dest < extent, jnp.arange(b)[:, None] * extent + dest, b * extent)
-        return acc.at[index.reshape(-1)].set(jnp.swapaxes(panel, 1, 2).reshape(b * r, rows), mode='drop')
+        update = jnp.swapaxes(panel, 1, 2).reshape(b * r, rows)
+        if _held(update.dtype)[1] == 2:
+            update = jnp.stack((update.real, update.imag), axis=-1).reshape(b * r, 2 * rows)
+        return acc.at[index.reshape(-1)].set(update, mode='drop')
 
     def body(accs, panels, dest):
         return tuple(scatter(a, p, dest) for a, p in zip(accs, panels))
@@ -366,9 +383,12 @@ def _pack_finish(mesh_xy, slots, extent, shapes):
     from jax.sharding import PartitionSpec as P
     from jax import shard_map
 
-    def columns(acc):
+    def columns(acc, dtype):
+        if _held(dtype)[1] == 2:
+            pair = acc.reshape(acc.shape[0], -1, 2)
+            acc = jax.lax.complex(pair[..., 0], pair[..., 1])
         return jnp.swapaxes(acc.reshape(-1, extent, acc.shape[-1]), 1, 2)
-    return jax.jit(shard_map(lambda accs: tuple(columns(a) for a in accs), mesh=mesh_xy,
+    return jax.jit(shard_map(lambda accs: tuple(columns(a, dt) for a, (_, dt) in zip(accs, shapes)), mesh=mesh_xy,
                              in_specs=((P(BATCH),) * len(shapes),), out_specs=(P(BATCH),) * len(shapes),
                              check_vma=False), donate_argnums=0)
 
