@@ -522,13 +522,11 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
     (its ``quote`` arguments) may reject a width; the reduction program's
     price at that width (``program_bytes(width)``: ``shared_pole_byte_terms``
     tiled over the mesh, the same on every rank), beside ``extra(width)``
-    resident bytes, admits it. Nothing is compiled to be measured (CrI3 24x24
-    at P64 compiled six whole-chain programs that never ran, 187 s of every
-    cold map 0). Widths start at every parent, so a deck that fits runs one
-    round and compiles each program once per shape (Fe 4^3 bispinor at P4:
-    one round of 13 instead of four, whose differing sides recompiled every
-    program), and step down in proportion to the whole price. The constructor still
-    admits every phase at its actual side.
+    resident bytes, admits it. Nothing is compiled to be measured, so every
+    rank prices the same shapes. Widths start at every parent, so a deck that
+    fits runs one round and compiles each program once per shape, and step
+    down in proportion to the whole price. The constructor still admits every
+    phase at its actual side.
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 

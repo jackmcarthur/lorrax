@@ -1792,13 +1792,9 @@ def _factor_c_q_replicated_qparallel(
 #
 # The transverse CCT is s × a PSD least-squares Gram (s = −1 for Cartesian
 # α², common.gamma_matrices.current_fit_terms) — sign-aware LU, no Cholesky,
-# no eigh-based rank truncation.  Historically factor_c_q passed the (identity-padded)
-# CCT through unfactored and the r-tile solve re-ran the pivoted LU on EVERY
-# r-chunk (on every rank on the local path; on the mesh but still per
-# r-chunk under distributed_lu=scalapack): nq·mu_T³·n_rchunks redundant
-# work, and the q-parallel charge fold could not apply because there was
-# no factor stage to schedule.  The functions below hoist the factor so
-# the transverse channels have the SAME two plans as the charge family:
+# no eigh-based rank truncation.  The functions below factor it once per
+# channel, before the r-tile solve, so no r-chunk repeats the pivoted LU and
+# the q-parallel charge fold applies:
 #
 # * LOCAL plan ('lu') — per-q pivoted LU on the whole ridged LOGICAL
 #   tile, computed ONCE per channel (q-parallel over devices at P>1 under

@@ -21,74 +21,47 @@ tile; the only collectives are two psums of a (n_trials, μ) vector
 signature for a uniform calling convention with the ring matvecs (they feed
 only the coupling block's encode here).
 
-Why a stack matvec.  The four legacy TDA matvecs (ring/gather/simple/serial)
-carry the trial axis ``b`` on the direct-term tensor ``T[b, μ, ν, t, s, k]`` —
-per device ``n_trials · μ_loc · ν_loc · ns² · nk`` complex128, LINEAR in
-``n_trials`` (the memory hog).  Here the W-term body is a ``lax.scan`` over the
-trial axis, so XLA reuses the body's scratch across iterations: exactly ONE
-``T``-family is alive regardless of ``n_trials``.  A Python-unrolled or
-``fori_loop``-over-trials-inside-``jit`` would pile up ``n_trials`` live ``T``
-slots (the known slot-pile-up failure mode,
-``feedback_path_d_scaffolding_pattern``); the scan avoids it.
+Why a stack matvec.  A matvec that carries the trial axis ``b`` on the
+direct-term tensor ``T[b, μ, ν, t, s, k]`` holds ``n_trials · μ_loc · ν_loc ·
+ns² · nk`` complex128 per device, linear in ``n_trials``.  Here the W-term body
+is a ``lax.scan`` over the trial axis, so XLA reuses the body's scratch across
+iterations and exactly ONE ``T``-family is alive regardless of ``n_trials``.  A
+Python-unrolled loop or a ``fori_loop`` over trials inside ``jit`` would keep
+``n_trials`` live ``T`` slots; the scan does not.
 
-THE ``lax.scan`` IS WHAT BOUNDS ``T``, NOT THE ``shard_map`` — this paragraph
-used to credit the wrong one.  Measured 2026-08-08 (SHARDMAP_AUDIT.md §4.4,
-§6.1): the GSPMD twin below runs the same scan with NO ``shard_map`` at all and
-holds 450.01 MiB at ``n_trials=1`` against 450.10 MiB at ``n_trials=8`` — flat
-in the trial axis, exactly like the manual route.  Dropping the ``shard_map``
-does not bring the memory hog back.
-
-Why the manual ``shard_map`` is kept anyway, which is the justification that
-actually survives measurement:
+The ``lax.scan`` bounds ``T``, not the ``shard_map``: the GSPMD twin below runs
+the same scan with no ``shard_map`` and holds 450.01 MiB at ``n_trials=1``
+against 450.10 MiB at ``n_trials=8`` (measured 2026-08-08).  The manual
+``shard_map`` is kept for two reasons:
 
   1. BACKEND PORTABILITY of the decode collectives.  On a CPU mesh the SPMD
      partitioner emits ``all-reduce`` where the manual body issues
      ``psum_scatter`` — 2x the wire bytes on BOTH decode legs, with no flag in
      this build that fixes it.
-  2. A GUARANTEE RATHER THAN A COINCIDENCE.  On GPU today the partitioner
-     reproduces the manual plan exactly (same 6 collectives, same bytes), but
-     that is a property of this XLA build, not a contract it owes us.  The
-     manual spelling cannot silently regress.
-
-A site that outlives its stated reason is how habit becomes doctrine, so the
-stated reason is now the one the measurement supports.
+  2. A GUARANTEE RATHER THAN A COINCIDENCE.  On GPU the partitioner reproduces
+     the manual plan exactly (same 6 collectives, same bytes), but that is a
+     property of this XLA build, not a contract it owes us.  The manual
+     spelling cannot silently regress.
 
 Exchange (V) is the B1 dense form (VERDICT.md): DENSE in (k,k'), encode k-SUMMED
 into a k-free ζ-space density, decode broadcast at every k.  ``S,U`` are k-free
 (tiny, ``n_trials × ν``) so the V term stays outside the scan, batched.
 
-Shardings (``make_bse_shardings``) are unchanged; ``n_trials`` occupies the
-leading axis of ``sh.X = P(None,'x','y',None)`` that block ``b`` used to.
+Shardings come from ``make_bse_shardings``; ``n_trials`` occupies the leading
+axis of ``sh.X = P(None,'x','y',None)``.
 
 The W-tile seam is the single line ``U = fft_k(W_R * ifft_k(T))``: ``W_R`` is a
 shape-stable ``(μ_pad, ν_pad, nkx, nky, nkz)`` argument built ONCE outside the
 matvec, so W(ω) / ladder buildouts pass a different ``W_R`` with no change to
 encode/decode/scan.
 
-Retirement plan (PARTIALLY EXECUTED, 2026-08-08) — the ring/gather/simple TDA
-matvecs existed only to bound ``T``'s peak; this scan bounds it strictly better,
-so they are superseded.  Consumers repointed here: ``bse_lanczos.solve_bse_sharded``
-(block-Lanczos + Davidson) and ``bse_feast`` (TDA GMRES contour solves +
-``_rayleigh_ritz`` subspace application).  What the plan asked for, and where it
-now stands:
-  * DONE — ``bse_ring_comm.build_bse_ring_matvec_full`` (non-TDA
-    S=[[A,B],[-B†,-A†]]): the B-encode is PORTED HERE
-    (``build_bse_stack_pair_matvec``, 2026-08-08), which is what that retirement
-    note asked for -- the coupling block reuses this module's encode/decode
-    rather than its own.  The ring full matvec stays live BY DESIGN, not by
-    inertia: it is the ``_materialize_A_B`` oracle and the equality gate's twin,
-    and a fused identity that gates itself against nothing is not gated.
-  * DONE — the ``krep`` matvec option and the bare-``shard_map`` sites are
-    deleted, and the ``yhoist`` collective hoist is unconditional (``3a7704bb``,
-    ``8349b65c``, ``ac67fd3c``).  ``LORRAX_BSE_MATVEC_OPT`` and its last
-    token, the ``gspmd`` audit route, went on 2026-09-25.
-  * DONE 2026-09-24 — ``bse_simple``, ``bse_serial``, ``--matvec-kind`` and the
-    TDA ``build_bse_ring_matvec`` are deleted.  Its three consumers (FEAST
-    spectral bounds, KPM, pseudopoles) now use this builder, and the dense
-    references in the tests are the TDA oracle.  The audit that retired it: the
-    ring's 1.02 disagreement with the dense reference was the scalar-singlet
-    exchange weight, which the ring applied and this module did not
-    (``bse_preconditioner.exchange_spin_weight`` now owns it for both).
+Consumers: ``bse_lanczos.solve_bse_sharded`` (block Lanczos and Davidson),
+``bse_feast`` (TDA GMRES contour solves, ``_rayleigh_ritz``, the spectral
+bounds), ``bse_kpm`` and the pseudopole and Haydock paths.  The non-TDA
+coupling block's encode is :func:`build_bse_stack_pair_matvec` below.
+``bse_ring_comm.build_bse_ring_matvec_full`` stays as the ``_materialize_A_B``
+oracle and the equality gate's twin.  ``bse_preconditioner.exchange_spin_weight``
+owns the scalar-singlet exchange weight for both.
 
 THE COUPLING BLOCK, AND THE FUSION THAT PAYS FOR IT
 ---------------------------------------------------
