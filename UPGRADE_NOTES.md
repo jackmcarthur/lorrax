@@ -18,9 +18,9 @@ unchanged (`qp_support.oneshot_support_ev`). On AgI 6³ with
 4.6–10.2 eV from it), and eqp within 10 eV of midgap moves by at most
 0.28 meV. The Σ sweep takes 98 more τ pairs there (485 → 583). The one-shot no
 longer warns that those states use Σ(ω = 0). A `sigma_omega_patches_ev`
-`lo:hi:eta` triple now also serves a one-shot, and it refuses
-(`GATE sigma_coarse_window`) when no coarse state lies outside the requested
-set. No deck change. The physics is in
+`lo:hi:eta` triple now serves a one-shot's coarse states outside the requested
+set; a one-shot with none warns once that the triples have no state to serve
+and ignores them, as it ignored them before. No deck change. The physics is in
 [self-consistency §2](docs/self_consistency.md#2-band-treatment).
 
 ## 2026-10-09 — `linalg` is the only dense-layout dial; the ζ stamp drops `distributed_lu`

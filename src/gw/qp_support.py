@@ -413,10 +413,9 @@ def coarse_windows_plan(sigma, energy_rel_ev, semicore_kn, near_lo_ev, held=None
         if users:
             raise ValueError(
                 "GATE sigma_coarse_window: sigma_omega_patches_ev lo:hi:eta windows serve "
-                "the coarse (semicore) states of the MPA/shared-pole Sigma (scalar or "
-                "sector) that read coarse windows, and this run has none: no occupied "
-                "state lies below the coarse floor (a one-shot: outside the requested "
-                "set), or its Sigma is PPM/static.")
+                "the coarse (semicore) class of the MPA/shared-pole Sigma (scalar or "
+                "sector), and no occupied state of this run lies below the coarse floor "
+                "(or its Sigma is PPM/static).")
         return None, "", ()
     auto = semicore & ~_inside_any(energy_rel_ev, users)
     if held is None:
@@ -441,6 +440,15 @@ def oneshot_support_ev(sigma, deck_grid_ev, energy_rel_ev, requested_kn, coarse_
     """
     near, _ = plan_support_ev(sigma, deck_grid_ev, energy_rel_ev, requested_kn)
     off = np.asarray(coarse_kn, dtype=bool) & ~np.asarray(requested_kn, dtype=bool)
+    if not off.any() and getattr(sigma, "coarse_windows_ev", tuple)():
+        # The deck's lo:hi:eta windows serve coarse reads; a one-shot whose
+        # coarse states are all requested reads none, so they are ignored
+        # (an SC map still refuses them: sc_iteration._sc_sampled_support).
+        import warnings
+        warnings.warn("sigma_omega_patches_ev coarse windows have no state to serve in this "
+                      "one-shot (every coarse state is requested); ignored",
+                      RuntimeWarning, stacklevel=2)
+        return near, ()
     _, _, windows = coarse_windows_plan(sigma, energy_rel_ev, off, float(near[0]))
     return joined_grid_ev(near, windows), windows
 
