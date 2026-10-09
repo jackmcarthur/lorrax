@@ -283,37 +283,39 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
                 own=finite + infinity, extents=np.column_stack((finite, infinity)))
 
 
-def pack_panels(fields, order, widths, *, mesh_xy):
+def pack_panels(fields, order, widths, *, mesh_xy, layout='batch'):
     """Each slot's pencil columns, placed from the round's state panels one panel at a time.
 
     ``fields`` are K lists of the round's S state panels ``[B, n_k, r_s]`` (Q,
-    WQ, dWQ, or a cross action) in the batch layout ``P(BATCH)``, ``order`` the
-    host ``[B, F]`` table of ``round_tables`` (column ``order[b, f]`` of the
-    joined panels; ``sum(widths)`` is the zero column) and ``widths`` the S
-    panel widths. Returns K arrays ``[B, n_k, F]`` in the batch layout with
-    ``out[b, :, f] = panel_s[b, :, j]`` where ``order[b, f] = offset_s + j`` and
-    zero where it names the zero column.
+    WQ, dWQ, or a cross action), ``order`` the host ``[B, F]`` table of
+    ``round_tables`` (column ``order[b, f]`` of the joined panels;
+    ``sum(widths)`` is the zero column) and ``widths`` the S panel widths.
+    Returns K arrays ``[B, n_k, F]`` with ``out[b, :, f] = panel_s[b, :, j]``
+    where ``order[b, f] = offset_s + j`` and zero where it names the zero
+    column, in the panels' ``layout``: ``'batch'`` (whole parents per rank,
+    ``P(BATCH)``) or ``'face'`` (``P(None, 'x', 'y')``).
 
-    One program per (panel width, F) places one panel, and the panel count is
-    only the number of calls: the line sites change it from map to map, and no
-    program's shape follows it. The host inverts ``order`` per panel,
-    ``dest[b, j]`` the packed column of panel column j or F where the round does
-    not take it (the scatter drops it); a source column appears at most once in
-    a slot's table, so the scatter has one writer per column.
+    One program per (layout, panel width, F) places one panel, and the panel
+    count is only the number of calls: the line sites change it from map to
+    map, and no program's shape follows it. The host inverts ``order`` per
+    panel, ``dest[b, j]`` the packed column of panel column j or F where the
+    round does not take it (the scatter drops it); a source column appears at
+    most once in a slot's table, so the scatter has one writer per column.
     """
     import numpy as np
     order = np.asarray(order)
     slots, extent = (int(v) for v in order.shape)
     offsets = np.concatenate(([0], np.cumsum(widths))).astype(np.int64)
     shapes = tuple((int(panels[0].shape[1]), np.dtype(panels[0].dtype).name) for panels in fields)
-    key = (mesh_xy, slots, extent, shapes)
+    key = (mesh_xy, layout, slots, extent, shapes)
     accs = _pack_start(*key)()
     for s, width in enumerate(int(w) for w in widths):
         # dest[b, j]: where column j of panel s lands in slot b's pencil, F (dropped) if nowhere.
         b, f = np.nonzero((order >= offsets[s]) & (order < offsets[s] + width))
         dest = np.full((slots, width), extent, np.int32)
         dest[b, order[b, f] - offsets[s]] = f
-        accs = _pack_place(*key, width)(accs, tuple(panels[s] for panels in fields), _batch_put(mesh_xy, dest))
+        dest = _batch_put(mesh_xy, dest) if layout == 'batch' else dest
+        accs = _pack_place(*key, width)(accs, tuple(panels[s] for panels in fields), dest)
     return _pack_finish(*key)(accs)
 
 
@@ -325,72 +327,132 @@ def _held(dtype):
     return (np.finfo(dtype).dtype, 2) if np.issubdtype(dtype, np.complexfloating) else (dtype, 1)
 
 
+def _slab_rows(mesh_xy, rows):
+    """Rows per rank of a face matrix's slab: its x-tile's rows, padded to Py, split over y."""
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    return -(-(int(rows) // px) // py)
+
+
+def _place_rows(acc, panel, dest, extent):
+    """``acc[b * F + dest[b, j]] = panel[b, :, j]`` on one rank's accumulator rows (both layouts):
+    panel [b, rows, r] -> rows [b * r, rows], a complex row as its held (re, im) reals."""
+    import jax.numpy as jnp
+    b, rows, r = panel.shape
+    # A dropped column (dest F) goes past the accumulator, never onto the next slot's first column.
+    index = jnp.where(dest < extent, jnp.arange(b)[:, None] * extent + dest, b * extent)
+    update = jnp.swapaxes(panel, 1, 2).reshape(b * r, rows)
+    if _held(update.dtype)[1] == 2:
+        # Each complex row as its held (re, im) reals, so the scatter moves float64.
+        update = jnp.stack((update.real, update.imag), axis=-1).reshape(b * r, 2 * rows)
+    return acc.at[index.reshape(-1)].set(update, mode='drop')
+
+
+def _held_columns(acc, dtype, extent):
+    """One rank's accumulator rows back to ``[slots, rows, F]`` columns of ``dtype``."""
+    import jax
+    import jax.numpy as jnp
+    if _held(dtype)[1] == 2:
+        # The held (re, im) reals back to complex values, before the transpose.
+        pair = acc.reshape(acc.shape[0], -1, 2)
+        acc = jax.lax.complex(pair[..., 0], pair[..., 1])
+    return jnp.swapaxes(acc.reshape(-1, extent, acc.shape[-1]), 1, 2)
+
+
 @lru_cache(maxsize=None)
-def _pack_start(mesh_xy, slots, extent, shapes):
+def _pack_start(mesh_xy, layout, slots, extent, shapes):
     """The K zero accumulators of ``pack_panels``, row-major in the packed column.
 
-    Each holds packed column f of slot b as row ``b * F + f``, ``[B * F, n_k]``
-    at ``P(BATCH)`` (rank r holding its own slots' rows), so a panel's columns
-    land as contiguous rows; along the minor axis every update would be a
-    strided column. A complex field's row is held as its n_k (re, im) pairs,
-    2 n_k reals (``_held``).
+    Each holds packed column f of slot b as row ``b * F + f``, so a panel's
+    columns land as contiguous rows; along the minor axis every update would
+    be a strided column. A complex field's row is held as its (re, im) pairs
+    (``_held``). Batch: ``[B * F, n_k]`` at ``P(BATCH)``, rank r holding its
+    own slots' rows. Face: ``[B * F, P * s_k]`` at ``P(None, ('x', 'y'))``,
+    rank x*Py+y holding s_k = ``_slab_rows`` whole pencil rows (its x-tile's
+    rows, padded to a multiple of Py, block y of them) of every slot, so a
+    panel's columns land in any packed column without a second exchange.
     """
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    sharding = NamedSharding(mesh_xy, P(BATCH))
+    if layout == 'batch':
+        spec, rows = P(BATCH), [n for n, _ in shapes]
+    else:
+        spec, rows = P(None, BATCH), [int(mesh_xy.size) * _slab_rows(mesh_xy, n) for n, _ in shapes]
+    sharding = NamedSharding(mesh_xy, spec)
     # A complex accumulator is held as float64 (re, im) pairs: XLA:GPU expands a complex128
     # scatter into a while loop of one iteration (several kernel launches) per scattered row.
-    held = [(n, *_held(dt)) for n, dt in shapes]
-    return jax.jit(lambda: tuple(jnp.zeros((slots * extent, n * pairs), dt) for n, dt, pairs in held),
+    held = [(r, *_held(dt)) for r, (_, dt) in zip(rows, shapes)]
+    return jax.jit(lambda: tuple(jnp.zeros((slots * extent, r * pairs), dt) for r, dt, pairs in held),
                    out_shardings=(sharding,) * len(shapes))
 
 
 @lru_cache(maxsize=None)
-def _pack_place(mesh_xy, slots, extent, shapes, width):
-    """``acc[k][b * F + dest[b, j]] = panel_k[b, :, j]`` for one panel width, accumulators
-    donated; whole parents per rank, so no exchange."""
+def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
+    """``acc[k][b * F + dest[b, j]] = panel_k[b, :, j]`` for one panel width, accumulators donated.
+
+    Batch: whole parents per rank, no exchange. Face: one all_to_all over y
+    moves the panel's tile ``[B, m, r/Py]`` to its slab ``[B, s, r]`` (row
+    block y of the x-tile, every column of the panel in global order), the
+    same bytes as the tile; the scatter is then local.
+    """
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from jax import shard_map
-
-    def scatter(acc, panel, dest):
-        # panel [b, rows, r] -> rows [b * r, rows] at b * F + dest; a dropped column (dest F)
-        # goes past the accumulator, never onto the next slot's first column.
-        b, rows, r = panel.shape
-        index = jnp.where(dest < extent, jnp.arange(b)[:, None] * extent + dest, b * extent)
-        update = jnp.swapaxes(panel, 1, 2).reshape(b * r, rows)
-        if _held(update.dtype)[1] == 2:
-            # Each complex row as its held (re, im) reals, so the scatter moves float64.
-            update = jnp.stack((update.real, update.imag), axis=-1).reshape(b * r, 2 * rows)
-        return acc.at[index.reshape(-1)].set(update, mode='drop')
-
-    def body(accs, panels, dest):
-        return tuple(scatter(a, p, dest) for a, p in zip(accs, panels))
-    specs = ((P(BATCH),) * len(shapes), (P(BATCH),) * len(shapes), P(BATCH))
-    return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=specs, out_specs=(P(BATCH),) * len(shapes),
-                             check_vma=False), donate_argnums=0)
+    py = int(mesh_xy.shape['y'])
+    if layout == 'batch':
+        def body(accs, panels, dest):
+            return tuple(_place_rows(a, p, dest, extent) for a, p in zip(accs, panels))
+        specs = ((P(BATCH),) * len(shapes), (P(BATCH),) * len(shapes), P(BATCH))
+        out = (P(BATCH),) * len(shapes)
+    else:
+        def body(accs, panels, dest):
+            placed = []
+            for acc, panel, (n, dt) in zip(accs, panels, shapes):
+                rows = int(acc.shape[1]) // _held(dt)[1]
+                pad = py * rows - int(panel.shape[1])
+                if pad:
+                    panel = jnp.pad(panel, ((0, 0), (0, pad), (0, 0)))
+                # Face tile -> slab: split the rows over y, join the column blocks in y order.
+                if py > 1:
+                    panel = jax.lax.all_to_all(panel, 'y', split_axis=1, concat_axis=2, tiled=True)
+                placed.append(_place_rows(acc, panel, dest, extent))
+            return tuple(placed)
+        slab = P(None, BATCH)
+        specs = ((slab,) * len(shapes), (P(None, 'x', 'y'),) * len(shapes), P())
+        out = (slab,) * len(shapes)
+    return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=specs, out_specs=out, check_vma=False),
+                   donate_argnums=0)
 
 
 @lru_cache(maxsize=None)
-def _pack_finish(mesh_xy, slots, extent, shapes):
-    """The packed accumulators as ``[B, n_k, F]``: each rank turns its rows back to columns
-    (one local transpose per field), the accumulators donated."""
+def _pack_finish(mesh_xy, layout, slots, extent, shapes):
+    """The packed accumulators as ``[B, n_k, F]`` in the panels' layout: each rank turns its rows
+    back to columns (one local transpose per field), the accumulators donated; the face then
+    takes the inverse all_to_all (slab -> tile) and drops its row padding."""
     import jax
-    import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
     from jax import shard_map
+    if layout == 'batch':
+        return jax.jit(shard_map(lambda accs: tuple(_held_columns(a, dt, extent) for a, (_, dt) in zip(accs, shapes)),
+                                 mesh=mesh_xy, in_specs=((P(BATCH),) * len(shapes),),
+                                 out_specs=(P(BATCH),) * len(shapes), check_vma=False), donate_argnums=0)
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    if extent % py:
+        # round_tables rounds every extent to the smallest carrier, which tiles the mesh.
+        raise ValueError(f"pack_panels: the extent {extent} must tile the {py} y ranks of the face; "
+                         "build the tables with the face's column_extent (round_tables)")
 
-    def columns(acc, dtype):
-        if _held(dtype)[1] == 2:
-            # The held (re, im) reals back to complex values, before the transpose.
-            pair = acc.reshape(acc.shape[0], -1, 2)
-            acc = jax.lax.complex(pair[..., 0], pair[..., 1])
-        return jnp.swapaxes(acc.reshape(-1, extent, acc.shape[-1]), 1, 2)
-    return jax.jit(shard_map(lambda accs: tuple(columns(a, dt) for a, (_, dt) in zip(accs, shapes)), mesh=mesh_xy,
-                             in_specs=((P(BATCH),) * len(shapes),), out_specs=(P(BATCH),) * len(shapes),
-                             check_vma=False), donate_argnums=0)
+    def body(accs):
+        out = []
+        for acc, (rows, dt) in zip(accs, shapes):
+            columns = _held_columns(acc, dt, extent)
+            if py > 1:
+                columns = jax.lax.all_to_all(columns, 'y', split_axis=2, concat_axis=1, tiled=True)
+            out.append(columns[:, :rows // px])
+        return tuple(out)
+    return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=((P(None, BATCH),) * len(shapes),),
+                             out_specs=(P(None, 'x', 'y'),) * len(shapes), check_vma=False), donate_argnums=0)
 
 
 def own_extent_receipts(reduction, own):

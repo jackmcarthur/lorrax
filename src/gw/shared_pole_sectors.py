@@ -10,7 +10,7 @@ neither move an operator to the host nor prescribe a processor mesh.
 from functools import lru_cache
 
 import jax.numpy as jnp
-from gw.shared_pole_pencil import (_matrix_layout, _matrix_take_columns, _matrix_concat, tile_adjoint,
+from gw.shared_pole_pencil import (_matrix_layout, _matrix_take_columns, tile_adjoint,
                                    tile_block, tile_join)
 
 
@@ -1095,46 +1095,38 @@ def cross_span_widths(meta, sectors):
 def _pack_cross_spans(sectors, widths, actions, *, mesh_xy, execution):
     """Each diagonal sector's CT operands with its retained span compacted to ``widths``.
 
-    Returns ``(spans, cross)``. On the local route each sector is ``(points, Q, WQ,
-    infinity, Y, signed)`` with Q and WQ packed at the sector's round extent, and
-    ``cross`` the packed TC-on-C output and CT-on-T (output, derivative) columns
-    (``shared_pole_local.pack_panels``), so the local CT program never follows the
-    panel count. On the face each sector is ``(points, order, (Qs, WQs), infinity, Y,
-    signed)`` with the round's panel tuples and ``cross`` the per-state actions; the
-    face CT program joins and takes them itself (``_face_cross_pencil_equations``).
+    Returns ``(packed, cross)``: per sector ``(points, Q, WQ, infinity, Y, signed)`` with
+    Q and WQ packed at the sector's round extent, and ``cross`` the packed TC-on-C output
+    and CT-on-T (output, derivative) columns (``shared_pole_local.pack_panels``), so the
+    CT pencil program's shape never follows the panel count. On the face the columns are
+    in the face's tile-interleaved order (``interleave_tables``), as the face span Y's
+    rows are (``face_reduce_decoupled``).
     """
     import jax
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.shared_pole_local import _batch_put,pack_panels
     from gw.shared_pole_pencil import interleave_tables
-    spans=[]
-    for sector,width in zip(sectors,widths):
+    face=execution=='face'
+    packed,cross=[],[]
+    for sector,width,(outputs,fields) in zip(sectors,widths,((actions[0],1),(actions[1],2))):
         # Drop only exactly inactive carrier columns. This is a storage
         # compaction of the retained span, not a second physical rank cut.
-        if execution=='face':
+        if face:
             from gw.shared_pole_execution import compact_program
             compact=compact_program(mesh_xy,width)
         else:
             compact=_local_compact_program(mesh_xy,width)
         y,signed=compact(sector['coefficients'],sector['signed'])
-        # Host role coordinates/order are replicated metadata, not matrices.
+        # Host role coordinates are replicated metadata, not matrices.
         put=(lambda a:jax.make_array_from_callback(a.shape,NamedSharding(mesh_xy,P()),
-                                                   lambda index:a[index])) if execution=='face' else (lambda a:_batch_put(mesh_xy,a))
-        states=(tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states']))
-        # The face span Y has its rows in the face's tile-interleaved order (face_reduce_decoupled),
-        # so the face CT takes the sector's columns in that order too.
-        tables=interleave_tables(sector['tables'],int(mesh_xy.shape['y'])) if execution=='face' else sector['tables']
-        order=put(tables['order']) if execution=='face' else None
-        spans.append((put(tables['points']),order,states,sector['infinity'],y,signed))
-    if execution=='face':
-        return spans,actions
-    packed,cross=[],[]
-    for (points,_,states,infinity,y,signed),sector,(outputs,fields) in zip(
-            spans,sectors,((actions[0],1),(actions[1],2))):
+                                                   lambda index:a[index])) if face else (lambda a:_batch_put(mesh_xy,a))
+        tables=interleave_tables(sector['tables'],int(mesh_xy.shape['y'])) if face else sector['tables']
         # TC acts on C's columns through its output only; CT on T's through output and derivative.
-        columns=pack_panels((list(states[0]),list(states[1]),*([a[k] for a in outputs] for k in range(fields))),
-                            sector['tables']['order'],[int(s[1].shape[-1]) for s in sector['states']],mesh_xy=mesh_xy)
-        packed.append((points,columns[0],columns[1],infinity,y,signed))
+        panels=([s[1] for s in sector['states']],[s[2] for s in sector['states']],
+                *([a[k] for a in outputs] for k in range(fields)))
+        columns=pack_panels(panels,tables['order'],[int(s[1].shape[-1]) for s in sector['states']],
+                            mesh_xy=mesh_xy,layout='face' if face else 'batch')
+        packed.append((put(tables['points']),columns[0],columns[1],sector['infinity'],y,signed))
         cross.append(columns[2:])
     return packed,tuple(cross)
 
@@ -1333,24 +1325,6 @@ def _cross_reduce_equations(charge,transverse,cross,moments,*,mm,eigh,gates,matr
     return reduce_sector_pencil(_cross_pencil_equations(charge,transverse,cross,moments,mm=mm,
                                                         matrix_sharding=matrix_sharding),
                                eigh=eigh,matmul=mm,gates=gates,matrix_sharding=matrix_sharding)
-
-
-def _face_cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding):
-    """The face CT pencil from the round's panel tuples (``_pack_cross_spans`` on the face): each
-    sector's Q and WQ and the actions joined and taken at the sector's table order inside the
-    program, then ``_cross_pencil_equations``."""
-    join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
-    pad = int(matrix_sharding.mesh.shape['y'])
-    def pack(panels, order):
-        values = join((*panels, jnp.zeros_like(panels[0][..., :pad])), axis=-1)
-        return _matrix_take_columns(values, order, matrix_sharding)
-    def columns(sector):
-        points, order, states, infinity, y, signed = sector
-        return points, pack(states[0], order), pack(states[1], order), infinity, y, signed
-    actions = ((pack(tuple(a[0] for a in cross[0]), charge[1]),),
-               tuple(pack(tuple(a[k] for a in cross[1]), transverse[1]) for k in (0, 1)))
-    return _cross_pencil_equations(columns(charge), columns(transverse), actions, moments, mm=mm,
-                                   matrix_sharding=matrix_sharding)
 
 
 def _cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding=None):

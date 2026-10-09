@@ -387,7 +387,9 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
     ``eigh_plan`` (``face_eigh`` at the reduction's room) decides the pencil's
     eigh stacks, and the program is keyed on it. ``carrier``
     (``face_ritz_carrier``) solves an ordered pencil's kept span on that many
-    columns, None keeping the whole H'_vv side.
+    columns, None keeping the whole H'_vv side. The state columns arrive packed
+    (``shared_pole_local.pack_panels``), so the program's shape is the round's
+    extent and never its panel count.
     """
     from gw.shared_pole_local import solve_parent_pencil
     from gw.shared_pole_gates import sort_shared_pole_columns
@@ -395,12 +397,8 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
     eigh=(face_eigh(mesh,side) if eigh_plan is None else eigh_plan).batched
-    def body(points,order,active,qs,os,ds,infinity):
-        def pack(parts):
-            panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape["y"])])), axis=-1)
-            from gw.shared_pole_pencil import _matrix_take_columns
-            return _matrix_take_columns(panels, order, NamedSharding(mesh,P(None,"x","y")))
-        reduced=solve_parent_pencil(points,pack(qs),pack(os),pack(ds),infinity,active,
+    def body(points,active,q,o,d,infinity):
+        reduced=solve_parent_pencil(points,q,o,d,infinity,active,
             eigh=eigh,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
             keep_budget=keep_budget,retain_span=retain_span,gram_keep=gram_keep,
             matrix_sharding=NamedSharding(mesh,P(None,"x","y")),carrier=carrier)
@@ -430,8 +428,10 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
         budget.plan(side,phase='reduction')
     program=lambda room: face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
                                              face_eigh(mesh,side,room),None if carrier is None else int(carrier))
-    args=(tables['points'],tables['order'],tables['active'],tuple(s[1] for s in states),
-          tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
+    from gw.shared_pole_local import pack_panels
+    packed=pack_panels(tuple([s[k] for s in states] for k in (1,2,3)),tables['order'],
+                       [int(s[1].shape[-1]) for s in states],mesh_xy=mesh,layout='face')
+    args=(tables['points'],tables['active'],*packed,tuple(infinity))
     if callable(room):
         room=room(face_reduction_bytes(mesh,int(tables['active'].shape[0]),rows=int(states[0][1].shape[-2]),
                                        side=side,carrier=carrier,retain_span=retain_span))
@@ -727,7 +727,7 @@ def _run_stages(mesh, nq, width, program, *stacks):
 @lru_cache(maxsize=None)
 def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_keep, carrier):
     """The four stage programs of the staged face reduction, each jitted on the face."""
-    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, _matrix_take_columns
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
     from gw.shared_pole_reduction import paired_members, keep_stage, paired_stage, output_stage
     from gw.shared_pole_gates import sort_shared_pole_columns, apply_shared_pole_zero_policy, ordered_moment_identity
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
@@ -754,11 +754,7 @@ def _stage_programs(mesh, ordered, odd_moments, keep_budget, retain_span, gram_k
         return dict(stage, side=2 * int(stage['scale'].shape[-1]), half=int(stage['inverse'].shape[-1]),
                     **({'width': int(stage['kept'].shape[-1])} if 'kept' in stage else {}))
 
-    def stage1(points, order, active, qs, os_, ds, infinity):
-        def pack(parts):
-            panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape['y'])])), axis=-1)
-            return _matrix_take_columns(panels, order, ms)
-        q, o, d = pack(qs), pack(os_), pack(ds)
+    def stage1(points, active, q, o, d, infinity):
         pencil = assemble_ordered_shared_pole_pencil([(points, q, o, d)], infinity, matmul=mm, matrix_sharding=ms)
         stage = paired_members(pencil, active, gates=gates, matrix_sharding=ms)
         stage['paired'] = jnp.broadcast_to(stage['paired'], (points.shape[0],))
@@ -804,6 +800,14 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
     (stage1, stage2, stage3, stage4), passthrough = programs
     hvv_eigh, schur_eigh, reduced_eigh = (plan.batched for plan in eigh_plans)
+    from gw.shared_pole_local import pack_panels
+    widths = [int(s[1].shape[-1]) for s in states]
+
+    def members(points, order, active, qs, os_, ds, infinity):
+        # A sub-batch's packed columns, then stage 1: the pack's shapes are the sub-batch's
+        # extent and panel widths only, so a new panel count adds calls, not programs.
+        q, o, d = pack_panels((qs, os_, ds), order, widths, mesh_xy=mesh, layout='face')
+        return stage1(points, active, q, o, d, infinity)
     inputs = (tables['points'], tables['order'], tables['active'],
               tuple(s[1] for s in states), tuple(s[2] for s in states), tuple(s[3] for s in states), tuple(infinity))
     run = partial(_run_stages, mesh, nq, width)
@@ -816,7 +820,7 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     priced = eigh_rows or (lambda k, plan, stack: nullcontext())
     # One timing section per stage and eigh: the report gives each its wall and pool high-water.
     with timing.section('decoupled.members'):
-        stage = run(stage1, *inputs)
+        stage = run(members, *inputs)
     infinity = inputs[6]
     del inputs
     states[:] = [s[:3] for s in states]
@@ -854,8 +858,8 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
 @lru_cache(maxsize=None)
 def cross_pencil_program(mesh):
     """The CT joint pencil (metric, value, O_C, O_T) of a face round, no eigh."""
-    from gw.shared_pole_sectors import _face_cross_pencil_equations
-    return face_program(partial(_face_cross_pencil_equations, mm=face_matmul(mesh),
+    from gw.shared_pole_sectors import _cross_pencil_equations
+    return face_program(partial(_cross_pencil_equations, mm=face_matmul(mesh),
                                 matrix_sharding=NamedSharding(mesh, P(None, "x", "y"))), mesh)
 
 

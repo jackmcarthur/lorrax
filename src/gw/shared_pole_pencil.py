@@ -24,14 +24,6 @@ def _matrix_layout(a, matrix_sharding):
     return a if matrix_sharding is None else jax.lax.with_sharding_constraint(a, matrix_sharding)
 
 
-def _matrix_concat(arrays, axis, matrix_sharding):
-    """Join matrix blocks through the common bounded face redistribution."""
-    if matrix_sharding is None:
-        return jnp.concatenate(arrays, axis=axis)
-    from common.staged_reshard import concatenate_sharded_axis
-    return concatenate_sharded_axis(arrays, axis, matrix_sharding.mesh, matrix_sharding.spec)
-
-
 def _matrix_take_columns(a, order, matrix_sharding):
     """Per-parent columns, using the shared bounded permutation on a face."""
     if matrix_sharding is None:
