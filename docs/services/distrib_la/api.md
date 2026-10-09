@@ -80,7 +80,7 @@ Refusals are `ValueError` or `RuntimeError` (`TypeError` /
 such as `src/bandstructure/bse_setup.py` re-raise `type(exc)(why)` with added
 context, which a service-specific exception class would break.
 
-## Dense factorizations: `plan`, `factor`, `solve`
+## Dense factorizations: `plan` {#dense-factorizations}
 
 ```python
 import distrib_la as dla
@@ -155,7 +155,7 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   `leading_eigenvectors` is refused before either route ("requires finite
   Hermitian W"), never retried as a solver failure.
 - Every distributed LU solve (`plan('solve_lu').batched`) and every
-  Cholesky or LU `factor`/`solve` is checked on its actual solution through
+  distributed Cholesky is checked on its actual solution through
   sketches taken before the library consumes A and B:
   ‖Wᴴ(AX − B)‖/(√k (‖A‖‖X‖ + ‖B‖)) within `roundoff_tol(n)`. Its operands are
   gone, so there is no retry.

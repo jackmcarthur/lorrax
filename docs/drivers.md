@@ -216,7 +216,7 @@ grid, cutoffs, WFN identity). Mesh and P are excluded: a fit at P=4 is reusable
 at P=80. `LORRAX_FORCE_REFIT=1` forces a refit.
 
 Operating at thousands of centroids (the distributed plan, per-rank scalings):
-[large-μ operation](how-to/large-nmu-operation.md). Environment variables:
+[dense solves on P devices](architecture/dense_linear_algebra.md#stage-plans). Environment variables:
 [registry](reference/env_vars.md).
 
 ## downfold — `gw.downfold_cli`

@@ -70,7 +70,6 @@ nav:
       - "How-to: production QSGW": how-to/production-qsgw.md
       - "How-to: metals": how-to/metals.md
       - "How-to: complete-basis WFN": how-to/complete-basis-wfn.md
-      - "How-to: large-N_mu operation": how-to/large-nmu-operation.md
       - "How-to: BerkeleyGW users": how-to/berkeleygw-users.md
       - "How-to: band and exciton interpolation": how-to/htransform-and-exciton-bands.md
       - Self-consistency: self_consistency.md
@@ -113,6 +112,7 @@ nav:
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Mesh-padded axes: architecture/padding.md
       - Memory model: architecture/memory-model.md
+      - Dense solves and GEMMs on P devices: architecture/dense_linear_algebra.md
       - Rank truncation: architecture/rank_truncation_policy.md
       - Symmetry register: architecture/symmetry_register.md
       - Charge zeta fit (route G): architecture/zeta_fit_mubatch.md

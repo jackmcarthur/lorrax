@@ -449,7 +449,7 @@ driver entry.
 
 There must always exist a path that materializes no $N_\mu^2$-class object
 on one rank ([decisions](decisions.md); plan table in
-[large-N_μ operation](../how-to/large-nmu-operation.md)). On this layer:
+[dense solves on P devices](dense_linear_algebra.md#stage-plans)). On this layer:
 
 * **Packed Dyson**, by construction: every operand stays `P(None,'x','y')`.
 * **Packed Σ**, by assertion: `photon_sigma._require_packed_operator`

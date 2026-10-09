@@ -52,7 +52,7 @@ re-interpreting the dial:
 | `LinalgResolution` field | consumer | `local` | `distributed` |
 |---|---|---|---|
 | `w_dyson_solver` | the W Dyson solve (`gw.w_isdf`) | per-q local LU | `plan('solve_lu', backend='distributed').batched` |
-| `distributed_lu` | the transverse ζ LU | `auto` (`off` on a CPU mesh) | `distributed`: ScaLAPACK on CPU, cuSOLVERMp on CUDA |
+| `distributed_lu` | recorded in the ζ provenance stamp only; the transverse ζ LU is the whole-tile local LU on every layout | `auto` | `distributed` |
 | `batched_route` | every `distrib_la` stack | `batch_reshard` | `auto` |
 | `eigh_backend` | the `fH_q` eigensolve of htransform and exciton bands, `bse.vq_interp`'s `C_q` | `auto` (native, q-batched) | `distributed`: ScaLAPACK on CPU, cuSOLVERMp on CUDA |
 | `sc_eigh` | the QSGW `H_k` eigensolve (`SCConfig.eigh`) | `auto` | `distributed` |
@@ -67,8 +67,8 @@ amplifies. It therefore runs replicated, one q-batch at a time. When one batch
 `isdf.core._rank_truncate_capacity_error` refuses and names the cap that would
 clear it. Raising the cap lets the route resolve but does not shrink the work:
 each rank still solves `⌈n_q/P⌉` dense `n_μ × n_μ` eigenproblems. Per-stage
-plans and per-rank memory at large `N_μ` are in
-[large-N_μ operation](../../how-to/large-nmu-operation.md).
+plans and per-rank memory are in
+[dense solves and GEMMs on P devices](../../architecture/dense_linear_algebra.md#stage-plans).
 
 A deck that names a field directly (`distributed_zeta_solve`,
 `distributed_cholesky`, `distributed_lu`, `w_dyson_solver`,

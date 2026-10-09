@@ -223,9 +223,9 @@ table-cut owner); and the k-convolutions see only its live rows `[lo, hi)`
 (the `live` operand, [k-convolution family](kconv.md#live-rows)),
 so a padded window costs only its local Green GEMM rows. One program serves
 every pass, so compile time does not grow with the pass count: the static
-Σ program at 223 passes compiles in 0.8 s instead of 25.7 s; the streamed χ bank compiles one segment program on
-the charge stream and at most four on the four-current stream, against one
-per pass before (33 and 203; claims 3114, 3122). A rank whose rows fit one
+Σ program at 223 passes compiles in 0.8 s, and the streamed χ bank compiles one
+segment program on the charge stream and at most four on the four-current
+stream (claims 3114, 3122). A rank whose rows fit one
 tile runs one whole pass.
 `price_chi0_node` only prices the χ₀ node: a band chunk of Gv would still
 be a whole `(μ, ν)` tile. On the packed bispinor route the static photon
@@ -382,10 +382,9 @@ costs its carry plus the larger phase.
 XLA's HLO rematerialization pass is off for every LORRAX program
 (owner 2026-10-02). `runtime.set_default_env` adds
 `--xla_disable_hlo_passes=rematerialization` to `XLA_FLAGS`, merged into any
-pass list the caller already gives. The pass ran only when a module's peak
-was above XLA's limit; it could take hours of compile and, on the decks that
-printed its give-up line, freed nothing. On a module that fits it changes
-nothing, so results are bitwise.
+pass list the caller already gives. The pass runs only when a module's peak
+is above XLA's limit, where it can take hours to compile and frees little; on a
+module that fits it changes nothing, so results are bitwise.
 
 With the pass off, every compiled module is checked once, when jax builds
 its executor for the module's first execution and before any of its buffers
@@ -401,7 +400,7 @@ need 137.04 GB per device (temp 125.49 + arguments 11.55 + outputs 0.22
 ```
 
 This is a hard device limit, not the budget: such a module cannot run on
-this card, and before this gate it failed at its first allocation. A module
+this card. A module
 between the budget and the card is not refused; the budget only warns. The
 check is CUDA only. It does not run at compile, because planners compile
 larger candidates on purpose to read their figures and then shrink
@@ -411,7 +410,7 @@ candidate that never runs is never refused.
 ### What compiled statistics miss
 
 Measured on Fe 8³ charge, map 0, P4, A100-40GB, `memory_per_device_gb = 36`
-(sandbox `runs/DEV/624_memprice_20260929`). Peaks are the pool high-water of
+(claim 2970). Peaks are the pool high-water of
 the stage's section; prices are what the stage-memory table prints.
 
 | stage | closed form | compiled | measured peak |
@@ -420,10 +419,10 @@ the stage's section; prices are what the stage-memory table prints.
 | Σ τ sweep (`d = 2`) | 13.30 | 14.02 | 13.96 |
 | ζ μ batch (320 centroids) | 29.38 new, 29.97 total | 22.68 new | 23.73 total |
 
-With the latency-hiding scheduler flag the direct stream's temporaries grow:
-the group of 16 compiled 34.08 GB of new bytes against a 34.04 GB room, the
-slope was corrected, and the group of 15 ran once recompiled (priced 34.55,
-peak 34.55; main ran 16 and peaked 36.04, over the budget).
+The latency-hiding scheduler grows the direct stream's temporaries. The check
+then works as designed: the group of 16 compiles 34.08 GB of new bytes against
+a 34.04 GB room, the slope is corrected, and the group of 15 runs, recompiled
+once, priced and peaking at 34.55 GB.
 
 The direct stream's peak was 0.51 MB above its price (the dispatch's small
 arguments). Outside the pool, the CUDA context, NCCL communicators, library

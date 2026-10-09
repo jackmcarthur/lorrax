@@ -89,7 +89,7 @@ Two-plan obligation (INVARIANTS 6): ONE code path serves both plans.  The ring
 matvec at ``P = 1`` IS the local plan — the ring/ppermute reduces to a
 no-op loop over a single rank and the shard_map bodies become the local
 einsums — so there is no second implementation to keep in step, and
-``docs/how-to/large-nmu-operation.md`` cites this module for both rows.
+``docs/architecture/dense_linear_algebra.md`` cites this module for both plans.
 
 The derivation
 --------------
