@@ -301,6 +301,51 @@ _UNCONVERGED = "RuntimeError: GATE sc_fixed_point_not_converged"
 # Each SC map's compile receipt (common.jax_compile_cache.compile_receipt).
 _RECEIPT = re.compile(r"SC map (\d+) compile: real (\d+) \(([0-9.]+) s\), "
                       r"cache hits \d+, uncacheable (\d+)(.*)")
+# The stage's own receipt, printed at its end: it also closes the receipt
+# window, so a driver's first SC receipt counts that driver only, not every
+# stage since the process started.
+_STAGE_RECEIPT = re.compile(r"compile: real (\d+) \(([0-9.]+) s\), cache hits (\d+), "
+                            r"uncacheable (\d+)")
+# The mathdx k-convolution kernels NVRTC builds when their cubin is not in
+# ffi.fft.cubin_cache_dir (about 7 s each, every rank).
+_NVRTC = re.compile(r"NVRTC built .*? in ([0-9.]+) ms")
+# JAX's compile-path events (jax._src.dispatch): tracing, lowering to MLIR,
+# and compile_or_get_cached (a persistent-cache read or an XLA compile).  A
+# trace nests inside another, so a stage's seconds are the union of its spans.
+_COMPILE_EVENTS = {"/jax/core/compile/jaxpr_trace_duration": "trace",
+                   "/jax/core/compile/jaxpr_to_mlir_module_duration": "lower",
+                   "/jax/core/compile/backend_compile_duration": "compile"}
+_SPANS = []
+
+
+def _record_span(event, start, end, **_):
+    kind = _COMPILE_EVENTS.get(event)
+    if kind:
+        _SPANS.append((kind, start, end))
+
+
+def _union(spans):
+    """Seconds covered by a set of (start, end) intervals."""
+    total, edge = 0.0, float("-inf")
+    for start, end in sorted(spans):
+        if end > edge:
+            total += end - max(start, edge)
+            edge = end
+    return total
+
+
+def compile_census(spans, receipt, log_text):
+    """Where a stage's wall went on the compile path, from rank 0's view."""
+    out = {kind: round(_union([(s, e) for k, s, e in spans if k == kind]), 2)
+           for kind in ("trace", "lower", "compile")}
+    out["compile_path"] = round(_union([(s, e) for _, s, e in spans]), 2)
+    m = _STAGE_RECEIPT.search(receipt)
+    if m:
+        out.update(xla_compiles=int(m[1]), xla_s=float(m[2]), cache_hits=int(m[3]),
+                   uncacheable=int(m[4]))
+    nvrtc = [float(ms) / 1e3 for ms in _NVRTC.findall(log_text)]
+    out.update(nvrtc_builds=len(nvrtc), nvrtc_s=round(sum(nvrtc), 1))
+    return out
 
 
 def steady_compile_problems(run, name):
@@ -521,6 +566,8 @@ def run_stage(run, name, module, argv, env, timeout):
     sys.stdout = sys.stderr = stream
     cwd, saved_argv = os.getcwd(), sys.argv
     rc = 0
+    first_span = len(_SPANS)
+    receipt = ""
     try:
         os.chdir(run)
         sys.argv = [module, *argv]
@@ -535,6 +582,8 @@ def run_stage(run, name, module, argv, env, timeout):
         except BaseException:                                  # noqa: BLE001
             traceback.print_exc()
             rc = 1
+        from common.jax_compile_cache import compile_receipt
+        receipt = compile_receipt(f"hsuite {name}")
     finally:
         stream.flush()
         sys.stdout, sys.stderr = saved_py
@@ -546,6 +595,8 @@ def run_stage(run, name, module, argv, env, timeout):
         os.chdir(cwd)
         sys.argv = saved_argv
     record = rank_record(log, name, rank, rc)
+    record["compile"] = compile_census(_SPANS[first_span:], receipt,
+                                       log.read_text(errors="replace"))
     failed = bool(rc or record["hits"])
     if failed:
         # pytest's capture holds this until the report, which prints it.
@@ -771,7 +822,9 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         cache_dir.mkdir(parents=True, exist_ok=True)
     rank_session.exchange("staged")
     env = _env(cache_dir)
-    walls, problems, ranks = {}, [], {}
+    import jax.monitoring
+    jax.monitoring.register_event_time_span_listener(_record_span)
+    walls, problems, ranks, census = {}, [], {}, {}
     t_all = time.monotonic()
     for name, module, argv in STAGES:
         if name not in only if only else name in OPT_IN:
@@ -788,6 +841,7 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         records, walls[name] = run_stage(where, name, module, argv, env, timeout)
         ranks[name] = [{k: rec[k] for k in ("rank", "rc", "hits", "gates")}
                        for rec in records]
+        census[name] = next((rec["compile"] for rec in records if rec["rank"] == 0), {})
         if name in OPT_IN:
             for rec in records:      # its expected end: same on every rank
                 if _UNCONVERGED in rec["hits"]:
@@ -834,7 +888,7 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
     walls["total"] = time.monotonic() - t_all
     summary = {"walls_s": walls, "problems": problems, "regenerate": regenerate,
                "ranks": rank_session._resolve_proc_count(),
-               "rank_records": ranks, "cache_dir": str(cache_dir)}
+               "rank_records": ranks, "compile_s": census, "cache_dir": str(cache_dir)}
     if LONE_FAILURE:
         # The others are blocked in a collective: no final join.
         rank = rank_session._resolve_proc_id()
