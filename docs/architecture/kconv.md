@@ -712,7 +712,19 @@ the cache, as without one.
   release then copies the cache's regular files into `cubin_store/`; a
   release starts from the previous store (hard links), so only missing images
   compile.
-- **Gate.** STORE_GATE_NUMBERS
+- **Measured.** P4 hsuite, one A100-80 node, node-local caches, B11 bundle
+  (claim CUBIN-1). Cold, without a store (main 79bcc1788): 25 `NVRTC built`
+  lines, 575.7 s. Cold with the 25-image store: no `NVRTC built` line, 25
+  disk-cache hits through links, 389.7 s. The JAX compile cache built by the
+  cold arm (2571 entries) stays warm with the store hidden (161.3 s) and
+  present (158.6 s): no new entry in either, no NVRTC build.
+  On the fixture grids (3³, 5×5×1, the 2×1×1 probe) the builder makes 59
+  images, among them all 22 k-grid-keyed images the hsuite builds, key for
+  key; the other three hsuite images are the system-keyed ones (two mode-10
+  planes, one BSE decode). The full `GRIDS` list is 395 calls, 389 images,
+  3.3 GB with the fixture images, about 12 min per architecture at four
+  processes. A store image that fails its hash is rebuilt into the cache
+  as a regular file and the store file is left as it was.
 
 ## 15. Numerical contract {#numerical-contract}
 
