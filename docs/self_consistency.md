@@ -262,9 +262,9 @@ between the 2 and 5 eV windows, predicts the 5 eV bias to within 6–41 % and
 always from above. At the deck η the coarse windows agree with the reference to
 within their 3e-3 certificate (21 meV at most), so the 5 eV error is the
 broadening and nothing else. A coarse window pays the whole crossing width of
-its box: three windows at the deck η cost 1306 τ nodes, more than stretching
-the near grid over every state (1368 pairs in all against 485 on the deck
-grid). A 5 eV window costs 45.
+its box: three coarse windows at the deck η cost 1306 τ nodes (1743 pairs in
+all), more than stretching the near grid over every state (1368 pairs,
+against 485 on the deck grid). One 5 eV window over the three manifolds costs 45.
 
 **Which states read a coarse window.** Every SC map reads every coarse state
 on its window. The one-shot reads on a window only the coarse states outside
@@ -277,9 +277,10 @@ sweep, cold at P4), and eqp within 10 eV of midgap moves by at most 0.28 meV
 ([[CLAIM-SEMICORE-FIX]]). The 5 eV window takes 50 of them. The other 55 widen the
 near occupied crossing window from 180 to 235 nodes, because the coarse
 samples set the pole edge $\Lambda_h$ of their ω half
-([Σ quadrature §4](theory/sigma-quadrature-problem.md#4-product-windows)). A requested coarse state keeps the near grid. The near grid
-reads AgI's I 5s exactly and costs 41 more τ nodes than a grid that stops
-above it, while the 5 eV window reads it 1.25 eV low. SC map 0 therefore
+([Σ quadrature §4](theory/sigma-quadrature-problem.md#4-product-windows)).
+A requested coarse state keeps the near grid, which reads AgI's I 5s exactly,
+while the 5 eV window reads it 1.25 eV low. That costs 101 τ pairs on AgI:
+SC map 0's plan, with I 5s on its window, takes 482. SC map 0 therefore
 differs from the one-shot by the requested coarse states: their read, and
 the lower edge of the near grid, which they no longer set (AgI: −7.5 against
 −15.75 eV). That edge moves the states above the coarse floor by at most
