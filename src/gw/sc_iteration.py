@@ -3314,7 +3314,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             inputs.print_fn(
                 f"    SC eigh: {eigh_kind} (nb={nb_carry}, one (nb, nb) tile "
                 f"= {nb_carry * nb_carry * 16 / 2**20:.2f} MiB, "
-                f"sc_eigh="
+                f"route from linalg: "
                 f"{getattr(getattr(inputs.config, 'sc', None), 'eigh', 'auto')})")
         E_qp_ry, U_qp = _sc_eigh_bands(
             state.H_qp_dft, kind=eigh_kind, mesh_xy=inputs.mesh_xy,

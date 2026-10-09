@@ -752,28 +752,27 @@ def qp_solver_semantics(solver) -> QPSolverSemantics:
 
 
 
-#: The two W Dyson plans (``gw/w_isdf.py``) — the ONLY legal resolved
-#: values of the ``w_dyson_solver`` input key.
+#: The two W Dyson plans (``gw/w_isdf.py``), resolved from ``linalg``
+#: (``LinalgResolution.w_dyson_solver``).
 _W_DYSON_PLANS = ("local", "distributed")
 
 
 def normalize_w_dyson_solver(value) -> str:
-    """Normalise a ``w_dyson_solver`` spelling to one of the TWO plans; see docs/dev/gw_config_contracts.md."""
+    """Normalise a ``solve_w`` Dyson plan name to one of the TWO plans; see docs/dev/gw_config_contracts.md."""
     s = ("auto" if value is None else str(value)).strip().lower()
     if s == "lu":
         import warnings
         warnings.warn(
-            "w_dyson_solver = lu is deprecated: the per-q pivoted LU is "
-            "now spelled 'local' (and is the default).  Update the deck "
-            "to w_dyson_solver = local.",
+            "solve_w dyson_solver 'lu' is spelled 'local' (the per-q "
+            "pivoted LU, the linalg = local plan).",
             DeprecationWarning, stacklevel=2)
         s = "local"
     if s == "lstsq":
         raise ValueError(
-            "w_dyson_solver = lstsq was REMOVED (two-plan W cleanup, "
-            "2026-07-27).  The two plans are 'local' (per-q pivoted LU, "
-            "default) and 'distributed' (2-D-sharded ScaLAPACK/cuSOLVERMp "
-            "backsolve).  lstsq existed as a rank-deficiency fallback; a "
+            "solve_w dyson_solver 'lstsq' does not exist.  The two plans "
+            "are 'local' (per-q pivoted LU, linalg = local) and "
+            "'distributed' (2-D-sharded ScaLAPACK/cuSOLVERMp backsolve, "
+            "linalg = distributed).  A "
             "rank-deficient A = 1 - V·chi0 means the centroid basis has "
             "over-completed the pair-density rank — reduce n_mu (fewer "
             "centroids) or raise zeta_rcond instead of masking it with a "
@@ -782,8 +781,9 @@ def normalize_w_dyson_solver(value) -> str:
         return "local"
     if s not in _W_DYSON_PLANS:
         raise ValueError(
-            f"w_dyson_solver={value!r} invalid; expected "
-            f"local (default; auto is an alias) or distributed.")
+            f"W Dyson plan {value!r} invalid; expected local "
+            f"(default; auto is an alias) or distributed, as linalg "
+            f"resolves them.")
     return s
 
 
@@ -796,7 +796,7 @@ EIGH_CHOICES_SOURCE = "not called"
 
 
 def eigh_backend_choices() -> tuple:
-    """The legal ``eigh_backend`` spellings — the RESOLVER's own list; see docs/dev/gw_config_contracts.md."""
+    """The eigh backend names distrib_la accepts (the ``--eigh-backend`` debug flag's vocabulary); see docs/dev/gw_config_contracts.md."""
     global EIGH_CHOICES_SOURCE
     try:
         from ffi import _services
@@ -920,7 +920,7 @@ def resolve_distrib_la_batched_route(
     choices = distrib_la_batched_route_choices()
     if route not in choices:
         raise ValueError(
-            f"distrib_la_batched_route={route!r} invalid; expected "
+            f"batched route {route!r} invalid; expected "
             f"{' / '.join(choices)}.")
     return route
 
@@ -935,7 +935,7 @@ def resolve_eigh_backend(params, *, override: str | None = None) -> str:
     choices = eigh_backend_choices()
     if backend not in choices:
         raise ValueError(
-            f"eigh_backend={backend!r} invalid; expected "
+            f"eigh backend {backend!r} invalid; expected "
             f"{' / '.join(choices)}.")
     return backend
 
@@ -1123,9 +1123,6 @@ _DEFAULTS = {
     #   eqp0.dat       — BGW-format zeroth-order QP energies.
     #   eqp1.dat       — BGW-format Z-linearized QP energies (Z=1 in
     #                    static COHSEX, central-difference Z in PPM).
-    # The legacy ``output_file`` key (LORRAX-native eqp0.dat) and
-    # ``eqp_output_file`` (unused) were dropped 2026-05-04; setting
-    # them in cohsex.in now logs a deprecation warning and is ignored.
     "sigma_diag_file": "sigma_diag.dat",
     "eqp0_file": "eqp0.dat",
     "eqp1_file": "eqp1.dat",
@@ -1399,9 +1396,7 @@ _DEFAULTS = {
     # ``degen_avg_tol_ry`` matches BGW's ``TOL_Degeneracy = 1e-6 Ry``.
     "no_degen_averaging": False,
     "degen_avg_tol_ry": 1.0e-6,
-    # NOTE: ``slab_io`` and ``use_ffi_io`` were REMOVED as deck keys on
-    # 2026-08-06 — see ``_LEGACY_DECK_KEYS``.  There is one sharded-slab
-    # transport and the deck does not choose it.
+    # There is one sharded-slab transport; the deck does not choose it.
     # ``accumulate_rchunk_to_gflat`` flat-axis chunker.  Bounds the
     # V_q G-panel width: the columns gathered per step of the V_q kernel's
     # G scan.  Any positive value (a G tail it does not divide is masked).
@@ -4508,7 +4503,8 @@ class SCConfig:
                 f"sc_semicore must be 'qp' or 'dft'; got {self.semicore!r}.")
         if self.eigh not in ("auto", "native", "distributed"):
             raise ValueError(
-                f"sc_eigh must be 'auto', 'native' or 'distributed'; "
+                f"the SC eigh route (from linalg) must be 'auto', 'native' "
+                f"or 'distributed'; "
                 f"got {self.eigh!r}.")
         if self.head_update not in ("off",) + HEAD_UPDATES:
             raise ValueError(

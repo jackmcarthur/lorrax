@@ -1143,13 +1143,9 @@ def build_parser():
     """The driver's argparse parser, built where a test can reach it — so a
     flag's default is observable without running a full solve."""
     import argparse
-    # ``eigh_backend`` + ``use_low_mem_eigh`` are ONE axis with ONE
-    # resolver, and the CLI vocabulary is the resolver's own list rather
-    # than a hand-copied tuple that drifts (it had: this flag accepted
-    # auto|off|cusolvermp|slate while distrib_la had grown ``distributed``
-    # and ``scalapack``, so the CPU distributed eigh was unreachable from
-    # here).  Function-local because gw_config parses decks and this
-    # module is imported by things that do not.
+    # The two debug flags take distrib_la's own vocabularies, so they cannot
+    # drift from the resolver.  Function-local because gw_config parses
+    # decks and this module is imported by things that do not.
     from gw.gw_config import (
         distrib_la_batched_route_choices,
         eigh_backend_choices,
@@ -1303,25 +1299,25 @@ def build_parser():
                          "the cell-averaged head needs no d(zeta)/dq.")
     ap.add_argument("--eigh-backend", default=None,
                     choices=eigh_backend_choices(),
-                    help="OVERRIDES the input-file ``eigh_backend`` key "
-                         "(default: use the key, which defaults to auto).  "
-                         "Hermitian eigensolver for BOTH distributed-eigh "
-                         "sites: the coarse exchange tiles C_q (vq_interp) and "
-                         "the htransform fH_q (bse_setup).  auto|off = the "
-                         "q-BATCHED native path (every device solves its own "
-                         "q-shard).  cusolvermp|slate route ONE tile at a time "
-                         "through the distributed-linalg FFI — the regime "
-                         "where a single matrix no longer fits on one device "
-                         "(a WIDE fH band window), at the cost of nq "
-                         "sequential solves.  Needs a square mesh and one JAX "
-                         "process per device.")
+                    help="A debugging override of the eigensolver the deck's "
+                         "``linalg`` dial resolves (default: the resolved "
+                         "backend), for both eigh sites: the coarse exchange "
+                         "tiles C_q (vq_interp) and the htransform fH_q "
+                         "(bse_setup).  auto|off = the q-batched native path "
+                         "(every device solves its own q-shard); "
+                         "distributed|cusolvermp|slate|scalapack spread one "
+                         "matrix over the mesh, for a matrix that does not "
+                         "fit one device, at the cost of nq sequential "
+                         "solves.  Needs a square mesh and one JAX process "
+                         "per device.")
     ap.add_argument(
         "--distrib-la-batched-route", default=None,
         choices=distrib_la_batched_route_choices(),
-        help="OVERRIDES the input-file distrib_la_batched_route key for "
-             "both htransform and coarse-V batched linalg. auto preserves "
-             "the backend's distributed route; batch_reshard moves q onto "
-             "the mesh and runs local whole-matrix JAX linalg.")
+        help="A debugging override of the batch schedule the deck's "
+             "``linalg`` dial resolves, for both htransform and coarse-V "
+             "batched linalg. auto preserves the backend's distributed "
+             "route; batch_reshard moves q onto the mesh and runs local "
+             "whole-matrix JAX linalg.")
     ap.add_argument("--px", type=int, default=None,
                     help="mesh rows; default = the run's square startup mesh")
     ap.add_argument("--py", type=int, default=None,

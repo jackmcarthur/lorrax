@@ -611,8 +611,8 @@ def compute_wfns_fi(
             # an honest "this deck needs a distributed eigh" into an OOM or,
             # worse, a run that silently replicates and finishes.
             raise type(exc)(
-                f"use_low_mem_eigh=True could not be honoured on this mesh: "
-                f"{_why}  (resolved request: eigh_backend="
+                f"the low-memory eigh (linalg = distributed) could not be "
+                f"honoured on this mesh: {_why}  (resolved eigh backend "
                 f"{_eigh_requested!r}; process {jax.process_index()}).  "
                 f"No fallback: the native q-batched eigh needs a whole "
                 f"({rank}, {rank}) matrix per device, which is what this "
@@ -934,7 +934,7 @@ def compute_wfns_fi(
             f"chunk(s) of {bs_ffi} "
             f"[{'wfn_fi_q_chunk' if _bs_explicit else 'default ndev//2'}], "
             f"Plan.batched route={eigh_plan.batched_route}"
-            + ("  [use_low_mem_eigh]" if use_low_mem_eigh else ""))
+            + ("  [low-memory eigh, linalg = distributed]" if use_low_mem_eigh else ""))
 
         # ── The FFI arm's TWO jits, CHUNK-shaped ─────────────────────────
         # Each is a ``lax.map`` — a scan with an empty carry, which is the

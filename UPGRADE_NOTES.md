@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-09 — log and error text names the `linalg` dial, not retired deck keys
+
+Messages that named a retired deck key now name `linalg`. The W solve line
+reads `[W solve] linalg = distributed -> …` (was `w_dyson_solver=distributed`);
+the SC eigh line ends `route from linalg: …` (was `sc_eigh=…`); the ScaLAPACK
+host-only refusals say that `linalg = distributed` resolves to cuSOLVERMp on a
+CUDA mesh; the fH_q eigh log tags `[low-memory eigh, linalg = distributed]`.
+`exciton_bands --eigh-backend` and `--distrib-la-batched-route` are debug
+overrides of what `linalg` resolves, as htransform's are; their help says so.
+Scripts that grep the old strings must read the new ones. No result moves.
+
 ## 2026-10-08 — one memory rule sets the device budget and the pool; route G takes its chunk and plane groups from the fixed tile
 
 With `M` the card total and `O` the bytes outside the XLA pool (3 GB, plus 3 GB under

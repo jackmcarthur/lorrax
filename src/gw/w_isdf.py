@@ -1862,7 +1862,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     if jax.process_index() == 0:
-        print(f"  [W solve] w_dyson_solver=distributed -> {p.describe()}",
+        print(f"  [W solve] linalg = distributed -> {p.describe()}",
               flush=True)
 
     def _logical_tile(A_loc):

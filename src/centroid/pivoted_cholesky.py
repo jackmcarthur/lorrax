@@ -1607,7 +1607,7 @@ def _build_gram_q0_kbatch(
               f"norms={'on' if band_norms is not None else 'off'}, "
               f"backend=WfnLoader(auto), "
               f"budget={meta.memory_per_device_gb:g} GB/device, "
-              f"band_chunk_size={band_chunk_size}, "
+              f"band chunk={band_chunk_size}, "
               f"transfer_k_tile={prune_k_tile}")
 
     # ---- Left window (the right window when the left is inside it) ----

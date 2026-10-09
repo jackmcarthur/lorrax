@@ -234,7 +234,8 @@ def _validate_lu_geometry(A, mesh: Mesh, *, what: str):
     if plat != "cpu":
         raise ValueError(
             f"scalapack {what} is host-only but the mesh devices are "
-            f"{plat!r}; use distributed_lu = cusolvermp on GPU meshes.")
+            f"{plat!r}; on a CUDA mesh linalg = distributed resolves to "
+            f"cuSOLVERMp.")
     Px, Py = validate_mesh(mesh)
     if Px > 1 and Py > 1 and Px != Py:
         raise ValueError(
@@ -408,7 +409,8 @@ def batched_distributed_solve_lu(
     if plat != "cpu":
         raise ValueError(
             f"scalapack solve_lu is host-only but the mesh devices are "
-            f"{plat!r}; use distributed_lu = cusolvermp on GPU meshes.")
+            f"{plat!r}; on a CUDA mesh linalg = distributed resolves to "
+            f"cuSOLVERMp.")
 
     Px, Py = validate_mesh(mesh)
     if Px > 1 and Py > 1 and Px != Py:
