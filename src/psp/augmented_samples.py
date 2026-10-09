@@ -134,7 +134,7 @@ def make_atomic_projection(mesh_xy):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     def local(source, table):
         if (source.ndim != 4 or table.ndim != 4 or source.shape[0] != table.shape[0]

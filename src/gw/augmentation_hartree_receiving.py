@@ -17,7 +17,7 @@ def _digest(value):
 
 def _make_point_contraction(mesh, *, functional, radius, directions,
                             angular_weights, lm, Y, band_tile=8,
-                            point_active=None):
+                            point_active=None, operator_contract=None):
     """Apply fixed-source Hartree adjoints to distributed receiving endpoints.
 
     ``contract(ps, delta, exact)`` consumes SAME-frame grid-normalized
@@ -35,8 +35,9 @@ def _make_point_contraction(mesh, *, functional, radius, directions,
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from gw import isdf_augmentation as stage
+    from isdf.atomic_hartree import charge_hartree_operator_contract
 
     r, dirs, aw, labels, harmonics = map(np.asarray,
         (radius, directions, angular_weights, lm, Y))
@@ -46,8 +47,13 @@ def _make_point_contraction(mesh, *, functional, radius, directions,
     expected = ('compensation_body', 'difference', 'PS_delta', 'delta_PS',
                 'enriched', 'periodic_mean')
     scale = float(functional['local_to_grid'])
-    if (functional.get('operator') != 'ordinary_3D_periodic_full_FFT_G0_zero'
-            or functional.get('neutral_mean_policy') != 'subtract_free_space_neutral_cell_mean'
+    contract = (charge_hartree_operator_contract(None) if operator_contract is None
+                else operator_contract)
+    if (not isinstance(contract, dict)
+            or set(contract) not in ({'operator', 'neutral_mean_policy'},
+                                    {'operator', 'neutral_mean_policy', 'kernel'})
+            or int(functional.get('sys_dim', 3)) != int(contract.get('kernel', {}).get('sys_dim', 3))
+            or any(functional.get(key) != value for key, value in contract.items())
             or functional.get('receiving_component_order') != expected
             or not np.isfinite(scale) or scale <= 0 or na < 1 or nr < 1 or nh < 1
             or tile != band_tile or isinstance(band_tile, (bool, np.bool_))
@@ -77,6 +83,8 @@ def _make_point_contraction(mesh, *, functional, radius, directions,
             or not all(np.isfinite(a).all() for a in (delta, ps, m0))
             or np.any(ps[[0, 1, 2, 4, 5]] != 0)):
         raise ValueError('Receiving component responses differ from the atomic Hartree owner')
+    if 'kernel' in contract and (np.any(ps != 0) or np.any(delta[5] != 0) or np.any(m0[5] != 0)):
+        raise ValueError('Receiving slab adjoints must omit local delta_PS and bulk periodic means')
     # Density harmonics are sum_d rho(r,d) Y_h*(d) w_d. Transpose that
     # map, without complex conjugating its response. Only grid-normalized
     # point products need Nfft/Omega; exact Y00 remains physical.
@@ -166,7 +174,7 @@ def _make_delta_face(mesh):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     def build(C,field,phase):
         return jnp.einsum('pnf,fsm->pnsm',C,field)*phase[:,None,None]
     return jax.jit(shard_map(build,mesh=mesh,
@@ -190,12 +198,20 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
     from gw import isdf_augmentation as stage
     from psp.reconstruction_overlap import rotate_band_rows
     from isdf.atomic_moments import exact_pair_moments
-    from isdf.atomic_hartree import prepare_charge_hartree,charge_hartree_functional
+    from isdf.atomic_hartree import (prepare_charge_hartree, charge_hartree_functional,
+                                    charge_hartree_operator_contract)
 
     started=time.perf_counter()
     memory_before=[d.memory_stats() for d in jax.local_devices()]
     parent=state['parent_psi'];overlap=state['overlap_receipt']
     source=state['hartree_source'] if source_capture is None else source_capture
+    dimension = state.get('sys_dim', 3)
+    operator_contract = charge_hartree_operator_contract(wfn, sys_dim=dimension)
+    if (source['source_binding'].get('sys_dim', 3) != dimension
+            or ('kernel' in operator_contract
+                and source['source_binding'].get('hartree_kernel') != operator_contract['kernel'])
+            or ('kernel' not in operator_contract and 'hartree_kernel' in source['source_binding'])):
+        raise ValueError('Occupied source and receiving Coulomb kernel differ')
     if hashlib.sha256(json.dumps(source['source_binding'],sort_keys=True,
             separators=(',',':'),allow_nan=False).encode()).hexdigest()!=source['source_identity']:
         raise ValueError('Occupied source identity/binding changed')
@@ -256,7 +272,8 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
         centers_cart=state['centers_cart'],support_radius=state['support_radius'],
         minimum_atom_image_distance=state['nearest_atom_image'],
         electron_count=captured['electron_count'],
-        interpolation_degree=state['interpolation_degree'],quadrature_order=state['quadrature_order'])
+        interpolation_degree=state['interpolation_degree'],quadrature_order=state['quadrature_order'],
+        sys_dim=dimension,fourier_points=state.get('fourier_points',4097))
     source_done=time.perf_counter()
 
     # Small tables receive the SAME factor before public selection. The
@@ -318,7 +335,7 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
     cart=stage._put(points@lattice,mesh,P());live=stage._put(active.astype(float),mesh,P())
     contract,projection_receipt=_make_point_contraction(mesh,functional=functional,
         radius=radius,directions=directions,angular_weights=aw,lm=lm,Y=Y,
-        band_tile=tile,point_active=active)
+        band_tile=tile,point_active=active,operator_contract=operator_contract)
     delta_face=_make_delta_face(mesh)
     # Only the receiving sample view may require extra suffix zeros. The
     # original public reciprocal source/Poisson/sweep remain unchanged.
@@ -372,7 +389,8 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
         parts,delta_charge=store_parent(parts,delta_charge,contract(ps,delta,exact),
             exact,jnp.int32(outrow))
         jax.block_until_ready((parts,delta_charge));del ps,delta
-    source_mean=-2/volume*operand['source_phi'][0].conj()*Q[rows]
+    source_mean=(-2/volume*operand['source_phi'][0].conj()*Q[rows]
+        if dimension == 3 else jnp.zeros_like(Q[rows]))
     def assemble(parts,delta_charge,PS,Q,source_mean):
         body=PS+parts[0];local=parts[1:5];mean=parts[5]+source_mean
         return body+jnp.sum(local,axis=0)+mean,body,local,mean,Q+delta_charge

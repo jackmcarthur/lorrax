@@ -374,7 +374,7 @@ def make_auxiliary_monopole_compressor(mesh, point_plan, canonical_atom_weights)
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import device_put_process_local
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     weights = np.asarray(canonical_atom_weights, np.float64)
     axis = point_plan.layout.axis

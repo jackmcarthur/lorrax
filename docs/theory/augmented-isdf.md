@@ -85,7 +85,7 @@ exactly zero. Native ideal-Pauli overlap is not substituted for this changed
 field. The raw mode `none` remains diagnostic.
 
 This convention retains the original DFT energy labels in the existing GW
-contractions. It therefore defines an effective reconstructed-vertex model;
+contractions. It therefore defines an effective reconstructed-field model;
 it does not claim that the mixed orbitals are exact AE eigenstates. Changing
 the available WFN window changes A and requires an observable convergence
 control. Frozen-core orbitals are not added to the occupied GW manifold.
@@ -98,7 +98,7 @@ stored tensors and samples.
 
 For Coulomb-only GW, exchange, screening and correlation receive the same
 reconstructed sample bundle and fitted Coulomb tensor. There is no separate
-smooth screening vertex. The optical q-to-zero derivative remains an
+smooth screening density. The optical q-to-zero derivative remains an
 independent consistency requirement; common finite-q samples alone do not certify that derivative.
 The reconstructed occupied Hartree source is captured during fitting, before
 donation. Its public receiving hook evaluates the same served states with
@@ -109,7 +109,7 @@ operator domains require separate comparisons.
 ## Charge Hartree through the same ISDF factor
 
 The numerical seam `isdf.atomic_hartree` contracts reconstructed occupied
-sources and receiving vertices; `gw.augmentation_hartree` and
+sources and receiving pair densities; `gw.augmentation_hartree` and
 `gw.augmentation_hartree_receiving` own its public handoff. Physical source
 occupations \(f_{nk}\) and normalized full-zone
 weights define \(\rho=\sum_{nk}w_kf_{nk}\Psi_{nk}^\dagger\Psi_{nk}\);
@@ -137,7 +137,7 @@ local scalar RHSs are added before applying the existing charge factor,
 including its actual conditioning transformation. No new Gram or full-grid
 zeta artifact is needed.
 
-The compensated source uses ordinary periodic 3D Poisson on the full FFT
+For the bulk operator, the compensated source uses ordinary periodic 3D Poisson on the full FFT
 grid with G=0 zero. Its local dual retains delta--delta minus
 compensation--compensation, both PS--neutral adjoints, coherent exact-M0
 enrichment and both periodic neutral-potential means. The source neutral
@@ -148,6 +148,41 @@ Hartree ISDF accuracy: physical-source capture and matrix convergence must
 also be measured. An augmented direct field is not a complete AE
 Hamiltonian or quasiparticle prediction without consistent ionic, frozen-core
 and exchange-correlation reference treatment.
+
+For the aligned slab operator, the smooth and neutral cross terms use the
+public two-dimensional truncated Coulomb kernel on the full FFT grid. Write
+\(\delta=D+\epsilon g_0\),
+\(C=C(M_{\rm rad}[D])+\epsilon g_0\), and
+\(N=D-C(M_{\rm rad}[D])\). The exact-M0 enrichment cancels in \(N\).
+With \(S\) the smooth density, the source and receiving bilinear form is
+
+\[
+J_{ut}=(S_u+C_u|v_{2D}|S_t+C_t)
+       +(S_u|v_{2D}|N_t)+(N_u|v_{2D}|S_t)
+       +\sum_A[(\delta_{uA}|v_{\rm free}|\delta_{tA})
+               -(C_{uA}|v_{\rm free}|C_{tA})].
+\]
+
+The unchanged free on-site difference requires the compact-pair support
+bound stated below. The source-neutral Fourier field contributes only to
+the smooth potential; the receiving-neutral radial adjoint contracts only
+the smooth source. In the existing local-response layout the latter occupies
+`PS_delta`, while `delta_PS` is zero because that contribution is already in
+the smooth potential. Exact-M0 compensation and local enrichment remain
+coherent. No bulk Gamma neutral-mean term is added. The slab operator excludes
+only total \(G=0\), using the same actual kernel for all remaining modes.
+Its radial Fourier tables cover the full FFT corner and use the prepared
+`fourier_points` convergence control, defaulting to 4097.
+
+This private operator is labelled
+`ordinary_2D_truncated_full_FFT_G0_zero`, with
+`neutral_mean_policy=none_direct_smooth_neutral_fft` and an authenticated
+slab-kernel binding. Independent compact-source/smooth-receiving and
+smooth-source/compact-receiving CPU controls check both mixed adjoints,
+complex conjugations and exact-M0 cancellation. Public slab GW and the
+private full reconstructed-slab preparation path remain guarded pending
+native action and actual source/artifact validation; these mathematical
+controls do not certify a CrI3 Hartree or quasiparticle result.
 
 At interpolation points define
 
@@ -313,6 +348,36 @@ evidence and unit conversion. The same ordinary ISDF factor and plane-wave
 pass supply all these columns. Downstream charge screening and Sigma
 contractions consume the resulting tensor unchanged.
 
+For the public aligned slab kernel, the positive completion uses the same
+kernel in the physical low-G action, its correction-only subtraction and
+the global compensation Gram. Let \(z_c=L_z/2\) be the public truncation
+half-height. If the unwrapped atomic layer satisfies
+\(\max_{AB}|z_A-z_B|+2R<z_c\), all compact density pairs and their in-plane
+images see the ordinary \(1/r\) kernel; every nonzero out-of-plane image is
+completely excluded. The existing disjoint-sphere condition still applies.
+The free on-site difference consequently remains unchanged, and
+
+\[
+B_{\mathrm{slab}}(\Delta,\Delta)
+=\sum_A[B_{\mathrm{free}}(\Delta_A,\Delta_A)
+        -B_{\mathrm{free}}(g_A,g_A)]
+ +B_{\mathrm{slab}}(g,g).
+\]
+
+The bulk Gamma neutral-mean adjoints are absent here. Truncation produces
+boundary strips whose potential integral cancels the free neutral mean;
+compact layer densities do not sample those strips. At Gamma only total
+\(K=0\) is excluded. The \(K_\parallel=0, G_z\ne0\) modes remain under the
+public slab kernel, including its nonzero odd vertical harmonics.
+
+This compact-support identity does not certify the separate occupied
+Hartree source: its smooth plane-wave density can sample the boundary
+strips. The kernel-aware full-FFT Hartree construction above evaluates both
+smooth-neutral cross terms with the actual slab kernel, without a bulk
+neutral-mean correction. Public slab GW and its full preparation path remain
+guarded until native action and actual source/artifact checks close. The
+slab correction owner alone does not enable a slab head correction.
+
 This completion does not restore omitted high-G smooth self and cross terms.
 Their cutoff must converge separately. A smooth source cut at energy
 \(E_{\rm wfc}\) has pair-density support through \(4E_{\rm wfc}\). Covering
@@ -379,8 +444,9 @@ integral \(F_\Delta=\int\Delta\zeta(r)e^{-i(q+G)r}d^3r\) enters it with
 \(8\pi/(\Omega|q+G|^2)\) in Rydberg. Consequently a physical Hartree-unit
 on-site radial metric receives \(2(N_r/\Omega)^2\), once.
 
-The compensation identity above assumes ordinary 3D Coulomb and disjoint
-supports. Dimensional truncation requires a separate boundary proof. The static
+The bulk compensation identity assumes ordinary 3D Coulomb and disjoint
+supports. The aligned-slab completion additionally requires the compact-pair
+support bound above and its own kernel-bound cache. The static
 transverse construction below also cancels the inverse bi-Laplacian exterior
 field; its grouped-current contraction refuses a scalar local provider.
 
@@ -399,7 +465,7 @@ correlation contractions.
 
 Charge and current use one reconstructed four-spinor and one full-WFN factor
 A. In the AgI validation this is the full physical 152-band factor before the
-public 120-band crop. The physical pair vertices are
+public 120-band crop. The physical pair densities are
 
 \[
 \Gamma^0=I_4,\qquad
@@ -444,7 +510,7 @@ Matching \(Q^{(0)}\) cancels the Poisson exterior field, while matching
 The provider retains the local correction-minus-compensation bilinear forms
 and the smooth–neutral adjoints. Physical Fourier publication contains
 \(s+\Delta\), while compensation \(g\) belongs to the electrostatic
-completion. Writing \(s+g\) as the physical current would change the vertex.
+completion. Writing \(s+g\) as the physical current would change the current matrix element.
 
 Ordinary restart stores the charge tensor and six independent transverse
 blocks, with the lower off-diagonal blocks supplied by Hermitian symmetry.

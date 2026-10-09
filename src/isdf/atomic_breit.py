@@ -235,7 +235,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
     import jax.numpy as jnp
     from jax.sharding import NamedSharding,PartitionSpec as P
     from scipy.special import sph_harm_y
-    from common.shard_map import shard_map
+    from jax import shard_map
     from common.collectives import device_put_process_local
     from isdf.zeta_mubatch import _require_q_owned
     from isdf.atomic_coulomb import _radial_fourier_cache

@@ -233,32 +233,23 @@ def normalized_delta_fourier(delta_R, radius, weights_dr, ell, kappa,
     return _lift_cartesian(pauli, vectors)
 
 
-def build_normalized_radial_cache(delta_R, radius, weights_dr, ell, kappa,
-                                  momentum, weights_dK, evaluation_radius):
-    r"""Hankel-transform R delta_phi and X R delta_phi into a radial cache.
-
-    All radial blocks have shape (n_evaluation_radius,n_OPF).  The input
-    momenta and dK weights are supplied explicitly; no accuracy is inferred
-    from a heuristic cutoff.  The lower angular channel has kappa -> -kappa
-    and ell_small=2|kappa|-1-ell.  Radial derivatives are analytic derivatives
-    of spherical Bessel functions, never differences of reconstructed data.
-    """
-    from scipy.special import spherical_jn
-
-    l, k = _labels(ell, kappa)
+def _radial_cache_queries(momentum, weights_dK, evaluation_radius):
+    """Resolve the shared finite-K quadrature and radial evaluation chart."""
     K, wk = _quadrature(momentum, weights_dK, "momentum quadrature")
     x = np.asarray(evaluation_radius, dtype=np.float64)
     if (x.ndim != 1 or len(x) < 2 or not np.all(np.isfinite(x))
             or np.any(x < 0) or np.any(np.diff(x) <= 0)):
         raise ValueError("cache radii must be finite, increasing and nonnegative")
-    radial = radial_fourier_bessel(delta_R, radius, weights_dr, l, K)
-    # A spin-up radial amplitude on +z obtains r(K) A and h K r(K) A
-    # from the existing lift without duplicating its normalization formula.
-    pauli = np.zeros((len(l), 2, len(K)), dtype=np.complex128)
-    pauli[:, 0] = radial.T
-    lifted = _lift_cartesian(pauli, np.column_stack((0*K, 0*K, K)))
-    large_spectrum = lifted[:, 0].T
-    small_spectrum = lifted[:, 2].T
+    return K, wk, x
+
+
+def _inverse_radial_spectra(large_spectrum, small_spectrum, ell, kappa,
+                            momentum, weights_dK, evaluation_radius):
+    """One inverse-Hankel owner for Pauli and normalized-RKB radial tables."""
+    from scipy.special import spherical_jn
+
+    l, k = ell, kappa
+    K, wk, x = momentum, weights_dK, evaluation_radius
     upper = np.empty((len(x), len(l)), dtype=np.complex128)
     dupper = np.empty_like(upper)
     lower = np.empty_like(upper)
@@ -277,6 +268,79 @@ def build_normalized_radial_cache(delta_R, radius, weights_dr, ell, kappa,
         dlower[:, columns] = spherical_jn(lb, kr, derivative=True) @ (K[:, None]*b)
     return dict(radius=x, ell=l, kappa=k, large_R=upper, dlarge_R_dr=dupper,
                 small_R=lower, dsmall_R_dr=dlower)
+
+
+def build_normalized_radial_cache(delta_R, radius, weights_dr, ell, kappa,
+                                  momentum, weights_dK, evaluation_radius):
+    r"""Hankel-transform R delta_phi and X R delta_phi into a radial cache.
+
+    All radial blocks have shape (n_evaluation_radius,n_OPF).  The input
+    momenta and dK weights are supplied explicitly; no accuracy is inferred
+    from a heuristic cutoff.  The lower angular channel has kappa -> -kappa
+    and ell_small=2|kappa|-1-ell.  Radial derivatives are analytic derivatives
+    of spherical Bessel functions, never differences of reconstructed data.
+    """
+    l, k = _labels(ell, kappa)
+    K, wk, x = _radial_cache_queries(momentum, weights_dK, evaluation_radius)
+    radial = radial_fourier_bessel(delta_R, radius, weights_dr, l, K)
+    # A spin-up radial amplitude on +z obtains r(K) A and h K r(K) A
+    # from the existing lift without duplicating its normalization formula.
+    pauli = np.zeros((len(l), 2, len(K)), dtype=np.complex128)
+    pauli[:, 0] = radial.T
+    lifted = _lift_cartesian(pauli, np.column_stack((0*K, 0*K, K)))
+    return _inverse_radial_spectra(lifted[:, 0].T, lifted[:, 2].T,
+        l, k, K, wk, x)
+
+
+def build_paired_radial_cache(delta_R, radius, weights_dr, ell, kappa,
+                              momentum, weights_dK, evaluation_radius):
+    r"""Construct chi_Lambda and U chi_Lambda from one Pauli spectrum.
+
+    This explicitly defines a finite-K inverse-Hankel approximation to the
+    native Pauli correction. Its finite value at the origin is the spectral
+    model's regularization, not an imposed atomic cusp value. The two Pauli
+    slots and normalized four slots share one spectrum, source amplitude,
+    angular convention and radial inversion owner. Neither output is
+    compacted after U. Their finite-sphere and Hermite errors remain to be
+    measured before any shared band metric or normalization is admitted.
+
+    Parameters
+    ----------
+    delta_R : array_like, shape (n_source_radius, n_opf)
+        Pauli radial correction R_AE-R_PS, in bohr**(-3/2), real or complex.
+    radius, weights_dr : array_like, shape (n_source_radius,)
+        Positive increasing source radii and positive dr weights, in bohr.
+    ell, kappa : array_like, shape (n_opf,)
+        Integer upper angular labels; kappa is ell or -(ell+1), never zero.
+    momentum, weights_dK : array_like, shape (n_K,)
+        Positive increasing K nodes and positive dK weights, in bohr**(-1).
+    evaluation_radius : array_like, shape (n_evaluation_radius,)
+        Increasing nonnegative cache radii, in bohr; zero is permitted.
+
+    Returns
+    -------
+    dict
+        ``pauli`` and ``normalized_rkb`` contain radial arrays of shape
+        (n_evaluation_radius, n_opf). R fields are in bohr**(-3/2), and
+        dR/dr fields in bohr**(-5/2). The Pauli lower fields are exactly zero.
+        ``pauli_radial_spectrum`` and the normalized large/small spectra
+        have shape (n_K, n_opf), in bohr**(3/2); they exclude the angular
+        4*pi*(-i)**ell factor. ``momentum`` and ``weights_dK`` retain the
+        common quadrature. Raw utility caches have no compact descriptor.
+        Finite spectral, Hermite and sphere errors remain separate.
+    """
+    l, k = _labels(ell, kappa)
+    K, wk, x = _radial_cache_queries(momentum, weights_dK, evaluation_radius)
+    radial = radial_fourier_bessel(delta_R, radius, weights_dr, l, K)
+    pauli = np.zeros((len(l), 2, len(K)), dtype=np.complex128)
+    pauli[:, 0] = radial.T
+    lifted = _lift_cartesian(pauli, np.column_stack((0*K, 0*K, K)))
+    chi = _inverse_radial_spectra(radial, np.zeros_like(radial), l, k, K, wk, x)
+    four = _inverse_radial_spectra(lifted[:, 0].T, lifted[:, 2].T, l, k, K, wk, x)
+    return dict(pauli=chi, normalized_rkb=four,
+        momentum=K.copy(), weights_dK=wk.copy(), pauli_radial_spectrum=radial,
+        normalized_large_spectrum=lifted[:, 0].T,
+        normalized_small_spectrum=lifted[:, 2].T)
 
 
 COMPACT_GRAPH_FIELD_MODEL = "compact_upper_hermite_sigma_gradient"

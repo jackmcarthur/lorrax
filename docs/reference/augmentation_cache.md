@@ -73,6 +73,18 @@ model is the power6 compact compensation profile, bare periodic
 `exp(-i*K.center)` phase. Its metric has physical Ry units for unit harmonic
 multipoles and remains `P(None,'x','y')` at runtime.
 
+The bulk `lorrax.periodic_compensation_metric.v1` schema and its geometry
+remain unchanged. The separate slab schema,
+`lorrax.periodic_compensation_metric.slab.v1`, binds the public `vcoul.Slab2D`
+kernel, Cartesian `+z` normal, truncation half-height and excluded total
+Gamma zero mode. Obtain its geometry with
+`periodic_compensation_geometry(geometry, sys_dim=2)` before preparation.
+The public kernel validates the reciprocal orientation; the cache owner
+requires in-plane q rows and a compact atomic layer whose full pair extent
+is strictly below the half-height. A bulk cache cannot be relabelled as a
+slab cache. Both retain the same collective dataset/layout and exact
+power6 compensation profiles.
+
 Preparation supplies a receipt path/hash, payload hash, producer-source
 hashes, finite cutoffs and measured per-q refinement. The writer checks the
 receipt file; the persisted evidence is self-contained and survives cache
@@ -108,8 +120,15 @@ The public local-high fitting policy binds this artifact through
 served_monopole, periodic_compensation_cache: {file: PATH, file_sha256: SHA}}`.
 The file path is relative to the atomic manifest directory or absolute;
 the consuming cell, ordered atoms, actual q rows, support and canonical lm
-must match its metadata exactly. It is periodic bulk 3D only. Legacy metric
-manifests retain their existing policy.
+must match its metadata exactly. The positive correction metric supports
+bulk3D or the explicitly bound compact-layer slab2D kernel. The separate
+private slab Hartree owner evaluates both smooth-neutral cross terms with
+the public truncated kernel on the full FFT grid and adds no bulk Gamma
+neutral-mean correction. Its operator and kernel identities are separate
+from this geometry cache. Public augmented slab GW and full reconstructed
+preparation remain guarded pending native action and actual source/artifact
+validation; CPU mathematical controls do not supply that admission. Legacy
+metric manifests retain their existing policy.
 
 Before allocating the global metric, the positive provider plans its same
 two public GEMMs from a shape descriptor and prices the distributed Gram,

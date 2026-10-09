@@ -44,12 +44,14 @@ def make_periodic_compensation_action(mesh, cache, *, centroid_basis, fft_points
     from distrib_la import gemm_plan, workspace_bytes_per_rank
     from runtime.padding import (PaddedAxis, authenticate_padded_axis,
                                  pad_to_axis, pad_square)
-    from isdf.coulomb_fourier_cache import PERIODIC_SCHEMA, _periodic_face
+    from isdf.coulomb_fourier_cache import (PERIODIC_SCHEMA,
+                                          PERIODIC_SLAB_SCHEMA, _periodic_face)
 
     metadata = cache['metadata']
     centroid_axis = centroid_basis.solve_axis
     active = np.array(centroid_basis.active_mask, copy=True)
-    if (metadata.get('schema') != PERIODIC_SCHEMA or not isinstance(centroid_axis, PaddedAxis)
+    if (metadata.get('schema') not in (PERIODIC_SCHEMA, PERIODIC_SLAB_SCHEMA)
+            or not isinstance(centroid_axis, PaddedAxis)
             or active.dtype != np.dtype(bool) or active.shape != (centroid_axis.carrier,)
             or np.count_nonzero(active) != int(centroid_basis.n_logical)
             or int(centroid_basis.n_packed) != centroid_axis.carrier):
@@ -368,7 +370,7 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from common.collectives import device_put_process_local
     from scipy.special import spherical_jn, sph_harm_y
 

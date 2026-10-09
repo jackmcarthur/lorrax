@@ -184,18 +184,58 @@ def validate_coulomb_fourier_cache(cache, tables, maximum_wavevector, fourier_po
 
 
 PERIODIC_SCHEMA = 'lorrax.periodic_compensation_metric.v1'
+PERIODIC_SLAB_SCHEMA = 'lorrax.periodic_compensation_metric.slab.v1'
 _PERIODIC_DATASET = 'periodic_compensation_gram_ry'
 _PERIODIC_MODEL = dict(compensation_power=6,
     coulomb='bare_periodic_8pi_over_Omega_K2_Ry', gamma_zero='excluded',
     phase='exp_minus_i_K_dot_center',
     units='physical_Ry_unit_harmonic_multipoles')
+_PERIODIC_SLAB_MODEL = dict(compensation_power=6,
+    coulomb='public_vcoul_Slab2D_Ry', gamma_zero='excluded',
+    phase='exp_minus_i_K_dot_center',
+    units='physical_Ry_unit_harmonic_multipoles',
+    neutral_mean='none_compact_support_layer')
+
+
+def _slab_kernel_binding(reciprocal, volume):
+    """Bind the public aligned-slab kernel, without reproducing its formula."""
+    from vcoul import CoulombGeometry, get_kernel
+
+    half_height = get_kernel(2).truncation_half_height(
+        CoulombGeometry(np.asarray(reciprocal, float), float(volume)))
+    return dict(sys_dim=2, owner='vcoul.Slab2D',
+        normal_cartesian=[0., 0., 1.],
+        truncation_half_height_bohr=float(half_height), gamma_zero='excluded')
+
+
+def periodic_compensation_geometry(geometry, *, sys_dim=3):
+    """Bind the kernel to an ordered compensation geometry.
+
+    The bulk default retains the five-field v1 geometry exactly. A slab
+    adds its public kernel and half-height; every compact pair and nonzero
+    out-of-plane image must lie wholly inside or wholly outside truncation.
+    This certifies compact correction/compensation supports, not PW tails.
+    """
+    if isinstance(sys_dim, (bool, np.bool_)) or sys_dim not in (2, 3):
+        raise ValueError('periodic compensation requires sys_dim=2 or 3')
+    bound = dict(geometry)
+    if int(sys_dim) == 2:
+        expected = _slab_kernel_binding(bound['reciprocal_rows_bohr_inverse'],
+                                      bound['cell_volume_bohr3'])
+        if 'kernel' in bound and bound['kernel'] != expected:
+            raise ValueError('periodic compensation slab kernel binding changed')
+        bound['kernel'] = expected
+    elif 'kernel' in bound:
+        raise ValueError('bulk compensation cannot consume slab kernel geometry')
+    return _periodic_geometry_binding(bound)
 
 
 def _periodic_geometry_binding(geometry):
     """Bind the ordered geometry; no orbital or centroid identity enters it."""
     names = ('reciprocal_rows_bohr_inverse', 'cell_volume_bohr3',
              'atom_centres_bohr', 'operator_q_fractional', 'support_radius_bohr')
-    if not isinstance(geometry, dict) or set(geometry) != set(names):
+    if (not isinstance(geometry, dict)
+            or set(geometry) not in (set(names), set(names)|{'kernel'})):
         raise ValueError('periodic compensation geometry fields mismatch')
     bvec, volume, atoms, q, radius = (np.asarray(geometry[name], float) for name in names)
     if (bvec.shape != (3, 3) or volume.shape != () or radius.shape != ()
@@ -206,7 +246,37 @@ def _periodic_geometry_binding(geometry):
             or not np.isclose(volume, (2*np.pi)**3/abs(np.linalg.det(bvec)), rtol=2e-13, atol=0)
             or len(np.unique(q, axis=0)) != len(q)):
         raise ValueError('invalid periodic compensation geometry')
-    return {name: value.tolist() for name, value in zip(names, (bvec, volume, atoms, q, radius))}
+    binding = {name: value.tolist() for name, value in zip(names, (bvec, volume, atoms, q, radius))}
+    if 'kernel' in geometry:
+        expected = _slab_kernel_binding(bvec, volume)
+        if geometry['kernel'] != expected:
+            raise ValueError('periodic compensation slab kernel identity mismatch')
+        if np.any(q[:, 2] != 0.):
+            raise ValueError('slab compensation requires in-plane operator q rows')
+        # Find the shortest unwrapped layer even when atoms straddle the cell
+        # boundary. All in-plane images preserve z differences. With a layer
+        # extent below zc, every nonzero z image is completely excluded.
+        height = 2*expected['truncation_half_height_bohr']
+        z = np.sort(np.mod(atoms[:, 2], height))
+        gaps = np.diff(np.r_[z, z[0]+height])
+        pair_extent = float(height-np.max(gaps)+2*radius)
+        if pair_extent >= expected['truncation_half_height_bohr']:
+            raise ValueError(
+                'GATE slab_compact_support: compact atomic pair z extent '
+                f'got:{pair_extent} bohr; want:< '
+                f'{expected["truncation_half_height_bohr"]} bohr. '
+                'Cutoff would intersect local supports; use a larger vacuum '
+                'cell or a separately derived local truncated metric.')
+        binding['kernel'] = expected
+    return binding
+
+
+def periodic_compensation_contract(geometry):
+    """Return the authenticated geometry and its unique cache model."""
+    binding = _periodic_geometry_binding(geometry)
+    slab = 'kernel' in binding
+    return binding, (PERIODIC_SLAB_SCHEMA if slab else PERIODIC_SCHEMA), (
+        _PERIODIC_SLAB_MODEL if slab else _PERIODIC_MODEL)
 
 
 def _periodic_harmonics(lm):
@@ -273,6 +343,27 @@ def _periodic_face(gram, mesh, logical_shape):
     return face, axis
 
 
+def _require_periodic_compensation_metadata(metadata, *, geometry, lm,
+                                          stored_shape, stored_dtype):
+    """Authenticate the actual kernel, geometry and prepared payload scope."""
+    binding, schema, model = periodic_compensation_contract(geometry)
+    harmonics = _periodic_harmonics(lm)
+    nq = len(binding['operator_q_fractional'])
+    n = len(binding['atom_centres_bohr'])*len(harmonics)
+    if (metadata.get('schema') != schema or metadata.get('model') != model
+            or metadata.get('geometry') != binding or metadata.get('lm') != harmonics
+            or metadata.get('logical_shape') != [nq, n, n]
+            or metadata.get('row_order') != 'atom_major_canonical_complex_lm'
+            or tuple(stored_shape) != (nq, n, n)
+            or np.dtype(stored_dtype) != np.dtype('complex128')):
+        raise ValueError('periodic compensation model, geometry or axis identity mismatch')
+    if _periodic_preparation_binding(metadata['preparation'], nq) != metadata['preparation']:
+        raise ValueError('periodic compensation preparation binding mismatch')
+    if metadata.get('source_binding') != dict(physical_model=model,
+            producer_sources_sha256=metadata['preparation']['producer_sources_sha256']):
+        raise ValueError('periodic compensation physical producer binding mismatch')
+
+
 def write_periodic_compensation_cache(path, gram, *, mesh, geometry, lm, preparation):
     """Persist a prepared periodic multipole Gram using collective tile IO.
 
@@ -293,7 +384,7 @@ def write_periodic_compensation_cache(path, gram, *, mesh, geometry, lm, prepara
     from file_io.slab_io import SlabIO
     from runtime.padding import pad_square
 
-    binding = _periodic_geometry_binding(geometry)
+    binding, schema, model = periodic_compensation_contract(geometry)
     harmonics = _periodic_harmonics(lm)
     nq = len(binding['operator_q_fractional'])
     n = len(binding['atom_centres_bohr'])*len(harmonics)
@@ -308,10 +399,10 @@ def write_periodic_compensation_cache(path, gram, *, mesh, geometry, lm, prepara
     path = Path(path)
     agree_io_error(FileExistsError('immutable periodic compensation cache exists')
         if path.exists() else None, path=path, stage='periodic compensation fresh write')
-    metadata = dict(schema=PERIODIC_SCHEMA, model=_PERIODIC_MODEL,
+    metadata = dict(schema=schema, model=model,
         geometry=binding, lm=harmonics, logical_shape=[nq, n, n],
         row_order='atom_major_canonical_complex_lm', preparation=evidence,
-        source_binding=dict(physical_model=_PERIODIC_MODEL,
+        source_binding=dict(physical_model=model,
             producer_sources_sha256=evidence['producer_sources_sha256']),
         preparation_payload_scope='Producer asserts receipt/payload-to-input equality at preparation; loader authenticates persisted payload by the externally pinned whole-file digest.')
     encoded = json.dumps(metadata, sort_keys=True).encode('utf-8')
@@ -360,18 +451,9 @@ def load_periodic_compensation_cache(path, *, mesh, expected_file_sha256, geomet
             if len(text) > 4*1024*1024:
                 raise ValueError('periodic compensation metadata exceeds its bounded domain')
             metadata = json.loads(text)
-            if (metadata.get('schema') != PERIODIC_SCHEMA or metadata.get('model') != _PERIODIC_MODEL
-                    or metadata.get('geometry') != binding or metadata.get('lm') != harmonics
-                    or metadata.get('logical_shape') != [nq, n, n]
-                    or metadata.get('row_order') != 'atom_major_canonical_complex_lm'
-                    or stream[_PERIODIC_DATASET].shape != (nq, n, n)
-                    or stream[_PERIODIC_DATASET].dtype != np.dtype('complex128')):
-                raise ValueError('periodic compensation model, geometry or axis identity mismatch')
-            if _periodic_preparation_binding(metadata['preparation'], nq) != metadata['preparation']:
-                raise ValueError('periodic compensation preparation binding mismatch')
-            if metadata.get('source_binding') != dict(physical_model=_PERIODIC_MODEL,
-                    producer_sources_sha256=metadata['preparation']['producer_sources_sha256']):
-                raise ValueError('periodic compensation physical producer binding mismatch')
+            _require_periodic_compensation_metadata(metadata, geometry=binding, lm=harmonics,
+                stored_shape=stream[_PERIODIC_DATASET].shape,
+                stored_dtype=stream[_PERIODIC_DATASET].dtype)
     except Exception as exc:
         error = exc
     agree_io_refusal(error, path=path, stage='periodic compensation metadata authentication')

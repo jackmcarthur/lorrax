@@ -24,7 +24,8 @@ def plan_positive_periodic_action(mesh, *, geometry, lm, centroid_basis,
     from jax.sharding import NamedSharding, PartitionSpec as P
     from runtime.padding import padded_axis
     from isdf.atomic_coulomb import make_periodic_compensation_action
-    from isdf.coulomb_fourier_cache import PERIODIC_SCHEMA
+    from isdf.coulomb_fourier_cache import periodic_compensation_contract
+    geometry, schema, model = periodic_compensation_contract(geometry)
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     nq = len(geometry['operator_q_fractional'])
     nm = len(geometry['atom_centres_bohr'])*len(lm)
@@ -32,7 +33,7 @@ def plan_positive_periodic_action(mesh, *, geometry, lm, centroid_basis,
         specs=((face.spec, 1), (face.spec, 2)))
     descriptor = dict(gram=jax.ShapeDtypeStruct((nq, axis.carrier, axis.carrier),
         np.complex128, sharding=face), moment_axis=axis,
-        metadata=dict(schema=PERIODIC_SCHEMA, geometry=geometry, logical_shape=[nq, nm, nm]),
+        metadata=dict(schema=schema, model=model, geometry=geometry, logical_shape=[nq, nm, nm]),
         path=str(cache_path), file_sha256=cache_file_sha256)
     action, receipt = make_periodic_compensation_action(mesh, descriptor,
         centroid_basis=centroid_basis, fft_points=fft_points)
@@ -47,10 +48,11 @@ def positive_radial_coulomb_provider(zeta_g, rhs, *, monopole_rhs, radius,
         weights_dr, lm, centers_cart, q_frac, gvec_components, q_plus_G_cart,
         cell_volume, fft_points, support_radius, minimum_atom_image_distance,
         body_cutoff_ry, periodic_cache, interpolation_degree, quadrature_order,
-        fourier_points=4097, prepared_cache=None, periodic_plan=None):
+        fourier_points=4097, prepared_cache=None, periodic_plan=None, sys_dim=3):
     """Bind the local-high completion to the existing charge solve.
 
-    ``onsite`` returns the q-owned free-local and periodic-mean action.
+    ``onsite`` returns the q-owned free-local action. Bulk includes both
+    periodic neutral-mean adjoints; the compact-layer slab does not.
     ``periodic_moment_rows`` returns grid-sum multipoles on the same q owners,
     with canonical atom/lm carrier tails zero. ZetaG moves those rows to its
     existing face before ``periodic_action``; no global Gram is replicated
@@ -59,19 +61,26 @@ def positive_radial_coulomb_provider(zeta_g, rhs, *, monopole_rhs, radius,
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from common.collectives import device_put_process_local
     from runtime.padding import pad_to_axis
     from isdf.atomic_coulomb import (_angular_channels,
         make_periodic_compensation_action, radial_coulomb_provider)
     from isdf.atomic_hartree import neutral_potential_mean_rows
     from vcoul import CoulombGeometry, get_kernel, v_qG_table
+    from isdf.coulomb_fourier_cache import (periodic_compensation_geometry,
+                                          periodic_compensation_contract)
 
     store, mesh = zeta_g.store, zeta_g.mesh
     harmonics = _angular_channels(lm)
     centers, q = np.asarray(centers_cart, float), np.asarray(q_frac, float)
     g, kg = np.asarray(gvec_components, float), np.asarray(q_plus_G_cart, float)
     geometry = periodic_cache['metadata']['geometry']
+    geometry = periodic_compensation_geometry(geometry, sys_dim=sys_dim)
+    _, schema, model = periodic_compensation_contract(geometry)
+    if (periodic_cache['metadata'].get('schema') != schema
+            or periodic_cache['metadata'].get('model') != model):
+        raise ValueError('positive charge compensation uses a different Coulomb kernel')
     reciprocal = np.asarray(geometry['reciprocal_rows_bohr_inverse'], float)
     nr, nh, na = len(radius), len(harmonics), len(centers)
     nf, qpad, mu = na*nh*nr, int(store.Q_pad), int(store.mu_pad)
@@ -91,7 +100,7 @@ def positive_radial_coulomb_provider(zeta_g, rhs, *, monopole_rhs, radius,
             or not np.array_equal(harmonics, periodic_cache['metadata']['lm'])
             or zeta_g.mu_basis is None):
         raise ValueError('positive charge requires the authenticated periodic q/G/atom/centroid geometry')
-    bare = v_qG_table(get_kernel(3), q, g,
+    bare = v_qG_table(get_kernel(sys_dim), q, g,
         geometry=CoulombGeometry(reciprocal, float(cell_volume)),
         vcoul_cutoff_ry=float(body_cutoff_ry), v_head_fn=None)
     provider = radial_coulomb_provider(zeta_g, rhs, monopole_rhs=monopole_rhs,
@@ -122,6 +131,10 @@ def positive_radial_coulomb_provider(zeta_g, rhs, *, monopole_rhs, radius,
     moment_axis = periodic_cache['moment_axis']
 
     def local_mean(free, coefficients, phi_row, qzero):
+        if int(sys_dim) == 2:
+            # The truncated neutral potential's boundary strips cancel its
+            # free-sphere mean. Compact density pairs do not sample the strips.
+            return free
         density = coefficients[..., :nf].reshape(coefficients.shape[0], mu, na, nh, nr)
         exact = coefficients[..., nf:]
         charge = charge_scale*jnp.sum(exact, axis=-1)
@@ -153,8 +166,7 @@ def positive_radial_coulomb_provider(zeta_g, rhs, *, monopole_rhs, radius,
             centroid_basis=zeta_g.mu_basis, fft_points=fft_points)
     else:
         if (periodic_plan['moment_axis'] != moment_axis
-                or any(not np.array_equal(periodic_plan['geometry'][key], value)
-                       for key, value in geometry.items())
+                or periodic_compensation_contract(periodic_plan['geometry'])[0] != geometry
                 or periodic_plan['receipt']['cache_file_sha256'] != periodic_cache['file_sha256']):
             raise ValueError('prepared periodic action differs from the admitted physical cache')
         action, receipt = periodic_plan['action'], periodic_plan['receipt']
@@ -165,6 +177,8 @@ def positive_radial_coulomb_provider(zeta_g, rhs, *, monopole_rhs, radius,
         mean_completion=dict(kernel=complete_mean, table_operands=(mean_row, gamma_device)),
         periodic_moments=dict(kernel=rows_kernel, table_operands=(moments,)))
     provider.update(onsite=onsite, body_metric=BODY_METRIC, bare_v_table=bare,
+        sys_dim=int(sys_dim), neutral_mean_policy=(
+            'none_compact_support_layer' if int(sys_dim) == 2 else 'bulk_both_adjoints'),
         aot_metadata=aot_metadata,
         periodic_moment_rows=lambda coefficients: rows_kernel(coefficients, moments),
         periodic_action=action, periodic_cache=periodic_cache,

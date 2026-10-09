@@ -295,7 +295,7 @@ def make_diagonal_sample_projector(mesh_xy: Mesh, face_shape, *,
     endpoints remain distributed throughout. No ``nmu**2`` operator or
     band-pair density cloud is formed.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     axes = tuple(axes)
     if len(axes) != 2 or tuple(mesh_xy.axis_names) != axes:

@@ -435,7 +435,7 @@ def _tile_kernels(mesh, pc, bc):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     XY = ('x', 'y')
@@ -487,7 +487,7 @@ def _point_phase_kernel(mesh):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     return jax.jit(shard_map(
         lambda K,points:jnp.exp(1j*jnp.einsum('pgi,mi->pgm',K,points)),mesh=mesh,
@@ -500,7 +500,7 @@ def _point_samples_kernel(mesh, pc, bc, npoint, g_block, fft_points):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     gs, fs = P(None, None, None, ('x', 'y')), P(None, 'x', None, 'y')
@@ -643,7 +643,7 @@ def _compress_rhs_kernel(mesh, point_plan, na, nh, rp, weights_y):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     py = int(mesh.shape['y'])
     indices,angular = _angular_bucket_tables(point_plan,na,rp,weights_y,py)
@@ -671,7 +671,7 @@ def _orbital_norm_kernels(mesh):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     def smooth(a):
         return jax.lax.psum(jnp.sum(abs(a)**2,axis=(2,3)),('x','y'))
@@ -699,7 +699,7 @@ def _band_rotation_kernel(mesh, pc, layout, output_bands, public_start, physical
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from psp.reconstruction_overlap import rotate_band_rows
 
     axes = dict(source=None, face='x', coefficients=('x','y'))
@@ -747,7 +747,7 @@ def _full_wfn_rotation(smooth, nmu, coefficients, geometry, mesh):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from common.collectives import gather_to_host
     from psp.reconstruction_overlap import reconstruction_gram,lowdin_factor
 
@@ -809,7 +809,7 @@ def _rhs_storage_kernels(mesh, q_indices, qpad, na, nh, nr, rp, feature_count):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     fs, qs = P(None,'x','y'), P(('x','y'),None,None)
     z0 = jnp.int32(0)
@@ -878,7 +878,7 @@ def _auxiliary_field_kernel(mesh, geometry, packed_tables, scale):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from isdf.atomic_moments import evaluate_auxiliary_charge
 
     table = _put(packed_tables,mesh,P(None,None,None,'y'))
@@ -1048,11 +1048,16 @@ def charge_hartree_response_metadata(state, functional):
     import hashlib
     import json
     import jax
+    from isdf.atomic_hartree import charge_hartree_operator_contract
 
     source = state.get('hartree_source')
-    if (source is None or 'exact_monopole' not in source
-            or functional.get('operator') != 'ordinary_3D_periodic_full_FFT_G0_zero'
-            or functional.get('neutral_mean_policy') != 'subtract_free_space_neutral_cell_mean'
+    contract = state.get('hartree_operator_contract', charge_hartree_operator_contract(None))
+    expected_keys = ({'operator', 'neutral_mean_policy', 'kernel'}
+                     if int(state.get('sys_dim', 3)) == 2 else {'operator', 'neutral_mean_policy'})
+    if (not isinstance(contract, dict) or set(contract) != expected_keys
+            or source is None or 'exact_monopole' not in source
+            or any(functional.get(key) != value for key, value in contract.items())
+            or int(functional.get('sys_dim', 3)) != int(state.get('sys_dim', 3))
             or functional.get('local_feature_order') != ('delta','PS','exact_Y00')):
         raise ValueError('Hartree response requires this actual physical source and exact local operator')
     binding = source['source_binding']
@@ -1072,6 +1077,10 @@ def charge_hartree_response_metadata(state, functional):
         potential_payload_sha256=hashlib.sha256(potential.tobytes()).hexdigest(),
         local_response_sha256=hashlib.sha256(np.asarray(local,np.complex128).tobytes()).hexdigest(),
         atomic_feature_binding=atomic)
+    if 'kernel' in contract:
+        if binding.get('sys_dim') != 2 or binding.get('hartree_kernel') != contract['kernel']:
+            raise ValueError('Hartree response slab kernel differs from its captured source')
+        potential_binding['kernel'] = contract['kernel']
     return dict(source_identity=source['source_identity'],source_binding=binding,
         potential_identity=digest(potential_binding),potential_binding=potential_binding)
 
@@ -1085,6 +1094,13 @@ def _bind_charge_q0_source(zeta, state):
     if metadata is None:
         return
     source = state.get('hartree_source')
+    if int(state.get('sys_dim', 3)) == 2:
+        contract = state.get('hartree_operator_contract')
+        if (not isinstance(contract, dict)
+                or set(contract) != {'operator', 'neutral_mean_policy', 'kernel'}
+                or any(metadata.get('potential_binding', {}).get(key) != value
+                       for key, value in contract.items())):
+            raise ValueError('Hartree q0 response slab operator differs from its source kernel')
     digest = lambda value: hashlib.sha256(json.dumps(value,sort_keys=True,
         separators=(',',':'),allow_nan=False).encode()).hexdigest()
     if (source is None or metadata.get('source_identity') != source['source_identity']
@@ -1264,6 +1280,11 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         raise ValueError("atomic ISDF reconstruction currently requires the normalized four-component charge carrier")
     if parent_psi is None or parent_psi.psi_G is None:
         raise ValueError("atomic augmentation requires the resident raw-parent reciprocal carrier")
+    if hartree_source_request is not None and int(meta.sys_dim) == 2:
+        raise ValueError(
+            'GATE slab_augmented_hartree_source_unavailable: a slab correction '
+            'metric does not certify the occupied smooth-neutral Hartree '
+            'boundary terms. The public source owner remains bulk3D only.')
     smooth = parent_psi.psi_G
     npar, nb, ns, ng = map(int, smooth.shape)
     coordinate_kind = getattr(plan,'coordinate_kind','fft_indices')
@@ -1366,12 +1387,19 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     rhs_bytes = 16*qpad*mu*na*nh*nr/Ptot
     reciprocal = float(wfn.blat)*np.asarray(wfn.bvec)
     positive_body = artifact.get('charge_metric',{}).get('body_metric') == 'physical_low_local_high'
-    if positive_body and int(meta.sys_dim) != 3:
-        raise ValueError('positive local-high charge metric requires periodic bulk 3D')
+    if int(meta.sys_dim) == 2 and not positive_body:
+        raise ValueError(
+            'GATE slab_atomic_metric: sys_dim=2 requires '
+            'charge_metric.body_metric=physical_low_local_high and its '
+            'kernel-bound slab compensation cache; legacy local metrics '
+            'have no truncated-kernel completion.')
+    if positive_body and int(meta.sys_dim) not in (2, 3):
+        raise ValueError('positive local-high charge metric requires periodic bulk3D or aligned slab2D')
     periodic_plan = None
     if positive_body:
         from symmetry_maps import bgw_integer_q_to_fractional
         from isdf.positive_charge_metric import plan_positive_periodic_action
+        from isdf.coulomb_fourier_cache import periodic_compensation_geometry
         qfull = np.indices(tuple(meta.kgrid)).reshape(3, -1).T
         periodic_control = artifact['charge_metric']['periodic_compensation_cache']
         periodic_path = (Path(artifact['directory'])/periodic_control['file']).resolve()
@@ -1379,6 +1407,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             cell_volume_bohr3=float(meta.cell_volume), atom_centres_bohr=centers@lattice,
             operator_q_fractional=bgw_integer_q_to_fractional(qfull[q_indices], meta.kgrid),
             support_radius_bohr=float(support))
+        geometry = periodic_compensation_geometry(geometry, sys_dim=int(meta.sys_dim))
         periodic_plan = plan_positive_periodic_action(mesh_xy, geometry=geometry, lm=lm,
             centroid_basis=meta.mu_basis, fft_points=int(meta.n_rtot),
             cache_path=periodic_path, cache_file_sha256=periodic_control['file_sha256'])
@@ -1691,6 +1720,10 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             full_kweights_sha256=source_capture['full_kweights_sha256'],
             spin_degeneracy=1.,fft_grid=list(map(int,meta.fft_grid)),
             cell_volume=float(meta.cell_volume),source_frame_policy='same_actual_served_four_spinor_full_WFN_Lowdin')
+        if int(meta.sys_dim) == 2:
+            from isdf.atomic_hartree import charge_hartree_operator_contract
+            slab_contract = charge_hartree_operator_contract(wfn, sys_dim=2)
+            binding.update(sys_dim=2, hartree_kernel=slab_contract['kernel'])
         source_capture['source_binding'] = binding
         source_capture['source_identity'] = hashlib.sha256(
             json.dumps(binding,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
@@ -1859,6 +1892,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         fft_points=int(meta.n_rtot),support_radius=support,kgrid=tuple(meta.kgrid),sym=sym,
         identity=artifact['identity'],tail_relative_norm=tails,angular_gram_error=angular_error,
         nearest_atom_image=nearest,raw_rhs_bytes_per_rank=rhs_bytes,resident_estimate_bytes_per_rank=price)
+    if int(meta.sys_dim) == 2:
+        from isdf.atomic_hartree import charge_hartree_operator_contract
+        state.update(sys_dim=2, hartree_operator_contract=charge_hartree_operator_contract(wfn, sys_dim=2))
     if current is not None:
         for key in ('selector','store_rhs','weight_l','weight_r'):
             del current[key]
@@ -1941,6 +1977,10 @@ def attach_local_augmentation(zeta_g, state, *, body_contract=None):
     from isdf.atomic_coulomb import radial_coulomb_provider
     from symmetry_maps import bgw_integer_q_to_fractional
 
+    if (isinstance(body_contract, dict) and body_contract.get('sys_dim') == 2
+            and state.get('body_metric') != 'physical_low_local_high'):
+        raise ValueError('GATE slab_atomic_metric: legacy local correction has no slab kernel completion')
+
     if state['rhs'].shape[:2] != (zeta_g.store.Q_pad,zeta_g.store.mu_pad):
         raise ValueError("augmentation selected q/packed-mu carrier disagrees with fitted smooth ZetaG")
     _bind_charge_q0_source(zeta_g,state)
@@ -1951,20 +1991,22 @@ def attach_local_augmentation(zeta_g, state, *, body_contract=None):
     kg = (gv+qfrac[:,None,:]) @ state['reciprocal']
     radial_controls = {key:state[key] for key in ('interpolation_degree','quadrature_order','fourier_points') if key in state}
     if state.get('body_metric') == 'physical_low_local_high':
-        from isdf.coulomb_fourier_cache import load_periodic_compensation_cache
+        from isdf.coulomb_fourier_cache import (load_periodic_compensation_cache,
+                                              periodic_compensation_geometry)
         from isdf.positive_charge_metric import positive_radial_coulomb_provider
         if (not isinstance(body_contract, dict)
                 or set(body_contract) != {'sys_dim','bare_coulomb_cutoff_ry'}
-                or body_contract['sys_dim'] != 3
+                or body_contract['sys_dim'] not in (2, 3)
                 or not np.isfinite(body_contract['bare_coulomb_cutoff_ry'])
                 or body_contract['bare_coulomb_cutoff_ry'] <= 0
                 or state.get('moment_enrichment') != 'served_monopole'
                 or 'monopole_rhs' not in state or 'smooth_rhs' in state):
-            raise ValueError('positive charge requires the canonical bulk body contract and delta/exact-M0 operands')
+            raise ValueError('positive charge requires the canonical periodic body contract and delta/exact-M0 operands')
         control = state['periodic_compensation_cache']
         geometry = dict(reciprocal_rows_bohr_inverse=state['reciprocal'],
             cell_volume_bohr3=state['cell_volume'], atom_centres_bohr=state['centers_cart'],
             operator_q_fractional=qfrac, support_radius_bohr=state['support_radius'])
+        geometry = periodic_compensation_geometry(geometry, sys_dim=body_contract['sys_dim'])
         cache = load_periodic_compensation_cache(control['file'], mesh=zeta_g.mesh,
             expected_file_sha256=control['file_sha256'], geometry=geometry, lm=state['lm'])
         if 'prepared_fourier_cache' in state:
@@ -1976,7 +2018,7 @@ def attach_local_augmentation(zeta_g, state, *, body_contract=None):
             cell_volume=state['cell_volume'], fft_points=state['fft_points'],
             support_radius=state['support_radius'], minimum_atom_image_distance=state['nearest_atom_image'],
             body_cutoff_ry=body_contract['bare_coulomb_cutoff_ry'], periodic_cache=cache,
-            periodic_plan=state['periodic_plan'],
+            periodic_plan=state['periodic_plan'], sys_dim=body_contract['sys_dim'],
             **radial_controls)
         provider['identity'] = state['identity']
         zeta_g.local_augmentation = provider

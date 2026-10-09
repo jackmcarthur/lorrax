@@ -10,6 +10,67 @@ from __future__ import annotations
 import numpy as np
 
 
+def _charge_hartree_labels(sys_dim):
+    if isinstance(sys_dim, (bool, np.bool_)) or sys_dim not in (2, 3):
+        raise ValueError('Charge Hartree requires sys_dim=2 or 3')
+    if int(sys_dim) == 2:
+        return ('ordinary_2D_truncated_full_FFT_G0_zero',
+                'none_direct_smooth_neutral_fft')
+    return ('ordinary_3D_periodic_full_FFT_G0_zero',
+            'subtract_free_space_neutral_cell_mean')
+
+
+def charge_hartree_operator_contract(wfn, *, sys_dim=3):
+    """Bind the direct scalar kernel without changing bulk v1 identities.
+
+    Parameters
+    ----------
+    wfn : wavefunction geometry
+        Supplies Cartesian reciprocal rows and the cell volume for a slab.
+        Bulk label selection does not access this object.
+    sys_dim : {2, 3}, optional
+        Slab truncation or the ordinary three-dimensional periodic operator.
+
+    Returns
+    -------
+    dict
+        Operator and smooth-neutral policy labels. A slab additionally binds
+        the public kernel, its normal and its cutoff half-height in bohr.
+
+    Raises
+    ------
+    ValueError
+        The dimension or the slab orientation is unsupported.
+    """
+    operator, mean = _charge_hartree_labels(sys_dim)
+    result = dict(operator=operator, neutral_mean_policy=mean)
+    if int(sys_dim) == 2:
+        from isdf.coulomb_fourier_cache import _slab_kernel_binding
+        result['kernel'] = _slab_kernel_binding(
+            float(wfn.blat)*np.asarray(wfn.bvec, float), float(wfn.cell_volume))
+    return result
+
+
+def _require_charge_hartree_operand(operand):
+    dimension = operand.get('sys_dim', 3)
+    operator, mean = _charge_hartree_labels(dimension)
+    if (operand.get('operator') != operator
+            or operand.get('neutral_mean_policy') != mean):
+        raise ValueError('Hartree requires its own full-FFT/G0-zero scalar kernel and smooth-neutral policy')
+    if int(dimension) == 2:
+        kernel = operand.get('kernel')
+        if (not isinstance(kernel, dict)
+                or set(kernel) != {'sys_dim', 'owner', 'normal_cartesian',
+                                  'truncation_half_height_bohr', 'gamma_zero'}
+                or kernel.get('sys_dim') != 2 or kernel.get('owner') != 'vcoul.Slab2D'
+                or kernel.get('normal_cartesian') != [0., 0., 1.]
+                or kernel.get('gamma_zero') != 'excluded'
+                or not np.isfinite(kernel.get('truncation_half_height_bohr', np.nan))
+                or kernel['truncation_half_height_bohr'] <= 0):
+            raise ValueError('Slab Hartree requires its authenticated kernel binding')
+    return int(dimension)
+
+
 def make_occupied_point_trace(plan, occupations, full_kweights, *,
                               cell_volume, spin_degeneracy):
     """Physical occupied charge on a typed radial packet, never ISDF loss.
@@ -24,7 +85,7 @@ def make_occupied_point_trace(plan, occupations, full_kweights, *,
     import jax.numpy as jnp
     from jax.sharding import NamedSharding,PartitionSpec as P
     from common.collectives import device_put_process_local
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     occ=np.asarray(occupations);weights=np.asarray(full_kweights)
     volume=float(cell_volume);fspin=float(spin_degeneracy)
@@ -106,7 +167,7 @@ def make_occupied_density_projection(mesh, indices, weights, *, output_shape):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import device_put_process_local
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     columns, table = np.asarray(indices), np.asarray(weights)
     shape = tuple(output_shape)
@@ -169,8 +230,9 @@ def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
                           local_delta_density, local_monopole, *, radius,
                           weights_dr, lm, centers_cart, support_radius,
                           minimum_atom_image_distance, electron_count,
-                          interpolation_degree=5, quadrature_order=16):
-    """Prepare full periodic 3D/G0-zero potentials for occupation traces.
+                          interpolation_degree=5, quadrature_order=16,
+                          sys_dim=3, fourier_points=4097):
+    """Prepare full FFT/G0-zero potentials for occupation traces.
 
     ``smooth_density`` is physical charge per volume, ``(source,nx,ny,nz)``.
     Local PS/delta densities are physical spherical coefficients with shape
@@ -181,6 +243,8 @@ def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
 
     The small source fields and FFT potential are replicated by design,
     as in the canonical charge-Hartree owner. No band-pair FFT is created.
+    Slab smooth-neutral crosses use the actual FFT smooth density and the
+    public slab kernel. Compact correction pairs retain their free matrices.
     """
     import jax
     import jax.numpy as jnp
@@ -190,9 +254,12 @@ def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
     from psp.dft_operators import (poisson_potential_from_rhoG,
                                    _poisson_reciprocal_geometry)
     from isdf.atomic_coulomb import (atomic_radial_metrics,
-                                    _angular_channels, _smooth_neutral_tables)
+                                    _angular_channels, _smooth_neutral_tables,
+                                    _radial_fourier_cache)
     from isdf.augmentation_breit import _sonine_profile_transform
 
+    contract=charge_hartree_operator_contract(wfn,sys_dim=sys_dim)
+    slab=int(sys_dim)==2
     grid=tuple(map(int,wfn.fft_grid));N=int(np.prod(grid))
     volume=float(wfn.cell_volume);R=float(support_radius)
     reciprocal=float(wfn.blat)*np.asarray(wfn.bvec,dtype=float)
@@ -215,6 +282,12 @@ def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
             or any(not np.isfinite(v).all() for v in (rho,sp,sd,exact,centers))
             or np.max(abs(rho.imag))>1e-12):
         raise ValueError('Hartree occupation trace has invalid physical density/local geometry')
+    if slab:
+        from isdf.coulomb_fourier_cache import periodic_compensation_geometry
+        periodic_compensation_geometry(dict(
+            reciprocal_rows_bohr_inverse=reciprocal.tolist(),
+            cell_volume_bohr3=volume,atom_centres_bohr=centers.tolist(),
+            operator_q_fractional=[[0.,0.,0.]],support_radius_bohr=R),sys_dim=2)
     lm_rows={tuple(row):i for i,row in enumerate(channels)}
     for h,(l,m) in enumerate(channels):
         partner=lm_rows[(int(l),-int(m))]
@@ -251,15 +324,32 @@ def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
         jnp.asarray(wfn.bvec),float(wfn.blat),False,need_g_cart=True)
     vectors=np.asarray(Gcart).reshape(3,N).T;length=np.linalg.norm(vectors,axis=1)
     v=jnp.where(zero,0.,8*np.pi/(volume*G2)).reshape(N)
+    radial_cache=None
+    if slab:
+        from vcoul import CoulombGeometry,get_kernel,v_qG_table
+        miller=np.rint(vectors@np.linalg.inv(reciprocal))
+        if not np.allclose(miller@reciprocal,vectors,rtol=2e-13,atol=2e-13):
+            raise ValueError('Hartree FFT Miller indices and Cartesian momenta differ')
+        v=jnp.asarray(v_qG_table(get_kernel(2),np.zeros((1,3)),
+            miller.T[None],geometry=CoulombGeometry(reciprocal,volume))[0])
+        # Cover the FFT corner, not just the fitting's low-G body sphere.
+        radial_cache=_radial_fourier_cache(tables,float(np.max(length)),fourier_points)
     degrees=np.asarray(tables['degrees']);scale=2/beta(degrees+1.5,7.)
     comp_source=jnp.zeros((len(rho),N),jnp.complex128)
     response=jnp.zeros((len(rho),len(centers),nh),jnp.complex128)
+    neutral_response=jnp.zeros_like(jnp.asarray(sd)) if slab else None
     tile=2048
 
     @jax.jit
     def response_tile(sf,sm,angle,vf):
         full=sf+jnp.einsum('bah,ahg->bg',sm,angle)
         return full,jnp.einsum('bg,g,ahg->bah',full.conj(),vf,angle)
+
+    @jax.jit
+    def neutral_tile(sf,source_delta,angle,radial,vf):
+        neutral_source=jnp.einsum('bahr,hgr,ahg->bg',source_delta,radial,angle)
+        receiving=jnp.einsum('bg,g,ahg,hgr->bahr',sf.conj(),vf,angle,radial)
+        return neutral_source,receiving
 
     for first in range(0,N,tile):
         last=min(first+tile,N);n=last-first
@@ -269,18 +359,36 @@ def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
         radial=np.stack([_sonine_profile_transform(int(l),6,R,ka)*s
                          for l,s in zip(degrees,scale)])[rows]
         angular=np.stack([4*np.pi*(-1j)**int(l)*sph_harm_y(int(l),int(m),theta,phi)
-                          for l,m in channels])*radial
-        angle=np.exp(-1j*(vec@centers.T)).T[:,None]*angular[None]
+                          for l,m in channels])
+        phase=np.exp(-1j*(vec@centers.T)).T[:,None]
+        bare_angle=phase*angular[None]
+        # Preserve the incumbent bulk multiplication order exactly.
+        angle=phase*(angular*radial)[None]
         full,part=response_tile(jnp.pad(source_F[:,first:last],((0,0),(0,tile-n))),
             jnp.asarray(source_comp),jnp.asarray(np.pad(angle,((0,0),(0,0),(0,tile-n)))),
             jnp.pad(v[first:last],((0,tile-n),)))
-        comp_source=comp_source.at[:,first:last].set(full[:,:n]);response=response+part
+        response=response+part
+        if slab:
+            # Equal epsilon*g0 enrichments in physical delta and compensation
+            # cancel. N depends only on D and its interpolated moments.
+            density=np.asarray(radial_cache['density'](ka))[rows]
+            neutral=density-radial[...,None]*moments[:,None,:]
+            neutral[:,ka==0,:]=0.
+            neutral_F,neutral_part=neutral_tile(
+                jnp.pad(source_F[:,first:last],((0,0),(0,tile-n))),
+                jnp.asarray(sd),
+                jnp.asarray(np.pad(bare_angle,((0,0),(0,0),(0,tile-n)))),
+                jnp.asarray(np.pad(neutral,((0,0),(0,tile-n),(0,0)))),
+                jnp.pad(v[first:last],((0,tile-n),)))
+            full=full+neutral_F
+            neutral_response=neutral_response+neutral_part
+        comp_source=comp_source.at[:,first:last].set(full[:,:n])
     charges=np.asarray(comp_source[:,0])
     if np.max(abs(charges-expected))>2e-10:
         raise ValueError('Hartree reconstructed occupation trace differs from its physical electron count')
     potential=poisson_potential_from_rhoG(
         (comp_source*np.sqrt(N)/volume).reshape((len(rho),)+grid),
-        jnp.asarray(wfn.bdot),jnp.asarray(wfn.bvec),float(wfn.blat),False)
+        jnp.asarray(wfn.bdot),jnp.asarray(wfn.bvec),float(wfn.blat),slab)
     return dict(potential=potential,compensation_response=response,
         source_delta=jnp.asarray(sd),source_ps=jnp.asarray(sp),
         source_epsilon=jnp.asarray(epsilon),source_phi=jnp.asarray(source_phi),
@@ -290,8 +398,7 @@ def prepare_charge_hartree(wfn, smooth_density, local_ps_density,
         m0_cross=jnp.asarray(cross['smooth_compensation_cross'][row0]
             -2*tables['compensation_self'][row0]*tables['moments'][row0]),
         mono=mono,support_radius=R,volume=volume,fft_grid=grid,
-        operator='ordinary_3D_periodic_full_FFT_G0_zero',
-        neutral_mean_policy='subtract_free_space_neutral_cell_mean')
+        sys_dim=int(sys_dim),smooth_neutral_response=neutral_response,**contract)
 
 
 def make_charge_hartree_tile(operand):
@@ -307,9 +414,7 @@ def make_charge_hartree_tile(operand):
     import jax
     import jax.numpy as jnp
 
-    if (operand.get('operator')!='ordinary_3D_periodic_full_FFT_G0_zero'
-            or operand.get('neutral_mean_policy')!='subtract_free_space_neutral_cell_mean'):
-        raise ValueError('Hartree requires its own full-FFT/G0-zero and periodic-mean operator')
+    slab=_require_charge_hartree_operand(operand)==2
     mono=int(operand['mono']);volume=float(operand['volume']);R=float(operand['support_radius'])
     potential=operand['potential'];response=operand['compensation_response']
     sd,sp=operand['source_delta'],operand['source_ps']
@@ -335,8 +440,9 @@ def make_charge_hartree_tile(operand):
         compbody=jnp.einsum('uah,bijah->ubij',response,comp)
         body=psbody+compbody
         diff=jnp.einsum('uahr,hrt,vijaht->uvij',sd.conj(),kd,td)
-        c1=jnp.einsum('uahr,hrt,vijaht->uvij',sp.conj(),kn,td)
-        c2=jnp.einsum('uahr,htr,vijaht->uvij',sd.conj(),kn,tp)
+        c1=(jnp.einsum('uahr,vijahr->uvij',operand['smooth_neutral_response'],td)
+            if slab else jnp.einsum('uahr,hrt,vijaht->uvij',sp.conj(),kn,td))
+        c2=jnp.zeros_like(c1) if slab else jnp.einsum('uahr,htr,vijaht->uvij',sd.conj(),kn,tp)
         sc=jnp.einsum('uar,r->ua',sd[:,:,mono],ke)
         tc=jnp.einsum('vijar,r->vija',td[:,:,:,:,mono],ke)
         enriched=jnp.einsum('ua,vija->uvij',se.conj(),tc)+jnp.einsum('ua,vija->uvij',sc.conj(),epsilon)
@@ -347,6 +453,7 @@ def make_charge_hartree_tile(operand):
         charge=charge+np.sqrt(4*np.pi)*jnp.sum(exact,axis=-1)
         mean=-2/volume*(sq.conj()[:,None,None,None]*phi[None]
                          +sf.conj()[:,None,None,None]*charge[None])
+        if slab:mean=jnp.zeros_like(mean)
         local=jnp.stack((diff,c1,c2,enriched))
         return body+jnp.sum(local,axis=0)+mean,body,local,mean,charge
     return contract
@@ -374,9 +481,7 @@ def charge_hartree_functional(operand):
     """
     import jax.numpy as jnp
 
-    if (operand.get('operator') != 'ordinary_3D_periodic_full_FFT_G0_zero'
-            or operand.get('neutral_mean_policy') != 'subtract_free_space_neutral_cell_mean'):
-        raise ValueError('Hartree functional requires its full-FFT/G0-zero and periodic-mean operator')
+    slab=_require_charge_hartree_operand(operand)==2
     mono = int(operand['mono'])
     volume = float(operand['volume'])
     radius = float(operand['support_radius'])
@@ -403,8 +508,9 @@ def charge_hartree_functional(operand):
     multipole_response = response.at[:, :, mono].set(0.)
     compensation = multipole_response[..., None] * moment[None, None]
     difference = jnp.einsum('uahr,hrt->uaht', sd.conj(), kd)
-    ps_delta = jnp.einsum('uahr,hrt->uaht', sp.conj(), kn)
-    delta_ps = jnp.einsum('uahr,htr->uaht', sd.conj(), kn)
+    ps_delta = (operand['smooth_neutral_response'] if slab
+                else jnp.einsum('uahr,hrt->uaht', sp.conj(), kn))
+    delta_ps = zero if slab else jnp.einsum('uahr,htr->uaht', sd.conj(), kn)
     source_cross = jnp.einsum('uar,r->ua', sd[:, :, mono], ke)
     enriched = zero.at[:, :, mono].set(
         se.conj()[..., None]*ke - source_cross.conj()[..., None]*moment[mono])
@@ -413,19 +519,21 @@ def charge_hartree_functional(operand):
                * (operand['q2_row'] - 3*radius**2/17*moment[mono]))
     neutral_mean = zero.at[:, :, mono].set(
         (2/volume)*sq.conj()[:, None, None]*phi_row)
+    if slab:neutral_mean=zero
     component_delta = jnp.stack((compensation, difference, ps_delta,
                                 zero, enriched, neutral_mean))
     component_ps = jnp.stack((zero, zero, zero, delta_ps, zero, zero))
     component_m0 = jnp.stack((response[:, :, mono], zero_m0, zero_m0,
                              zero_m0, source_cross.conj(),
-                             jnp.broadcast_to(-(2/volume)*np.sqrt(4*np.pi)
-                                 *sf.conj()[:, None], zero_m0.shape)))
+                             zero_m0 if slab else jnp.broadcast_to(
+                                 -(2/volume)*np.sqrt(4*np.pi)*sf.conj()[:, None], zero_m0.shape)))
     delta, ps, m0 = (value.sum(axis=0) for value in
                     (component_delta, component_ps, component_m0))
     # The source is real occupied charge; its Y00 neutral mean is real.
     # Apply that scalar to the smooth overlap here, and to the local exact
     # overlap in m0 above. There is no Hartree energy's factor one-half.
-    smooth = operand['potential'] - (2/volume)*sf.real[:, None, None, None]
+    smooth = (operand['potential'] if slab else
+              operand['potential'] - (2/volume)*sf.real[:, None, None, None])
     local_to_grid = float(np.prod(operand['fft_grid']))/volume
     local = jnp.concatenate((delta.reshape(len(sd), -1),
                              ps.reshape(len(sd), -1), m0), axis=-1)
@@ -438,7 +546,8 @@ def charge_hartree_functional(operand):
                 local_to_grid=local_to_grid,
                 local_feature_order=('delta', 'PS', 'exact_Y00'),
                 operator=operand['operator'],
-                neutral_mean_policy=operand['neutral_mean_policy'])
+                neutral_mean_policy=operand['neutral_mean_policy'],
+                **({key:operand[key] for key in ('sys_dim','kernel')} if slab else {}))
 
 
 def make_charge_hartree_rhs_contractor(functional, mesh, *, q0_slot):
@@ -454,11 +563,10 @@ def make_charge_hartree_rhs_contractor(functional, mesh, *, q0_slot):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import device_put_process_local
-    from common.shard_map import shard_map
+    from jax import shard_map
 
-    if (functional.get('operator') != 'ordinary_3D_periodic_full_FFT_G0_zero'
-            or functional.get('local_feature_order') != ('delta', 'PS', 'exact_Y00')
-            or functional.get('neutral_mean_policy') != 'subtract_free_space_neutral_cell_mean'
+    _require_charge_hartree_operand(functional)
+    if (functional.get('local_feature_order') != ('delta', 'PS', 'exact_Y00')
             or isinstance(q0_slot, (bool, np.bool_))
             or not isinstance(q0_slot, (int, np.integer)) or q0_slot < 0):
         raise ValueError('Hartree local RHS requires its exact operator, feature order and physical Gamma slot')

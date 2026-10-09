@@ -18,9 +18,10 @@ def _identity(binding):
         separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
-def _operator_binding(*, wfn, sym, artifact, source_identity, band_range):
+def _operator_binding(*, wfn, sym, artifact, source_identity, band_range, sys_dim=3):
     from . import augmentation_hartree_receiving as receiving
     from . import isdf_augmentation as stage
+    from isdf.atomic_hartree import charge_hartree_operator_contract
 
     array_hash = lambda value: hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
     directions, weights, lm, Y, _ = stage._orbit_angular_quadrature(
@@ -33,8 +34,7 @@ def _operator_binding(*, wfn, sym, artifact, source_identity, band_range):
 
     return dict(schema='lorrax.resident_charge_hartree_operator.v1',
         source_identity=source_identity, augmentation_identity=artifact['identity'],
-        operator='ordinary_3D_periodic_full_FFT_G0_zero',
-        neutral_mean_policy='subtract_free_space_neutral_cell_mean',
+        **charge_hartree_operator_contract(wfn, sys_dim=sys_dim),
         band_range=list(map(int, band_range)),
         parent_full_rows=np.asarray(sym.kirr_fullids, int).tolist(),
         parent_k_frac=np.asarray(wfn.kvecs(k=sym.parent_k_domain), float).tolist(),
@@ -63,6 +63,12 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
     record = normalize_resident_hartree_provenance(
         provenance, persisted='payload_sha256' in provenance)
     source = record['source_binding']
+    from isdf.atomic_hartree import charge_hartree_operator_contract
+    dimension = source.get('sys_dim', 3)
+    contract = charge_hartree_operator_contract(wfn, sys_dim=dimension)
+    if (('kernel' in contract and source.get('hartree_kernel') != contract['kernel'])
+            or ('kernel' not in contract and 'hartree_kernel' in source)):
+        raise ValueError('GATE resident_hartree_source: physical Coulomb kernel changed')
     raw = source.get('prepared_raw_binding', {})
     prepared_raw = (artifact.get('raw_parent_binding') or
         (artifact.get('raw_parent_moments') or {}).get('metadata', {}).get('binding'))
@@ -103,7 +109,8 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
            ('occupations_sha256', 'full_kweights_sha256', 'spin_degeneracy')):
         raise ValueError('GATE resident_hartree_source: physical occupations or quadrature changed')
     expected = _operator_binding(wfn=wfn, sym=sym, artifact=artifact,
-        source_identity=record['source_identity'], band_range=record['band_range'])
+        source_identity=record['source_identity'], band_range=record['band_range'],
+        sys_dim=dimension)
     if record['operator_binding'] != expected or record['operator_identity'] != _identity(expected):
         raise ValueError('GATE resident_hartree_operator: geometry, field recipe or numerical owner changed')
     return record
@@ -136,7 +143,8 @@ def prepare_resident_hartree(*, wfn, sym, mesh, plan, state, artifact,
     # The numerical owner serves the charge matrix at its distributed boundary.
     source = state['hartree_source']
     binding = _operator_binding(wfn=wfn, sym=sym, artifact=artifact,
-        source_identity=source['source_identity'], band_range=band_range)
+        source_identity=source['source_identity'], band_range=band_range,
+        sys_dim=state.get('sys_dim', 3))
     provenance = normalize_resident_hartree_provenance(dict(
         schema='lorrax.resident_charge_hartree.v1',
         source_identity=source['source_identity'], source_binding=source['source_binding'],
@@ -170,6 +178,8 @@ def serve_resident_hartree(record, *, config, wfn, sym, mesh, band_range,
     context = record['source_context']
     provenance = require_resident_hartree_source(record['provenance'],
         wfn=wfn, sym=sym, band_range=band_range, **context)
+    if int(getattr(config, 'sys_dim', 3)) != int(provenance['source_binding'].get('sys_dim', 3)):
+        raise ValueError('GATE resident_hartree_fixed_source: requested Coulomb kernel differs from its bound source')
     matrix = record['parent_kij_ry']
     lo, hi = map(int, band_range)
     start, stop = provenance['band_range']

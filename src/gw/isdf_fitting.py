@@ -318,7 +318,7 @@ def equilibrate_charge_gram(C, active_mask, *, mesh_xy):
     pads have D=1 and receive their inert diagonal only after this step.
     Only row-local diagonals and per-q validation scalars are reduced.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     from common.collectives import gather_to_host
 
     nq,n,n2 = map(int,C.shape)
