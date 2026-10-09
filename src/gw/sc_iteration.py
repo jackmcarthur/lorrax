@@ -2783,16 +2783,15 @@ def _sc_coarse_identities(inputs, shape):
     Fixed for the run.  The MPA/shared-pole Sigma reads the patch on every
     route, scalar or sector (``qp_support.semicore_patch_route``).
     """
-    from .qp_support import semicore_patch_route
+    from .qp_support import coarse_identities
     cut = getattr(getattr(inputs, "meta", None), "coarse_class", None)
-    if (cut is None or not cut.n_coarse
-            or not semicore_patch_route(inputs.config.compute_mode)):
+    if cut is None or not cut.n_coarse:
         return np.zeros(shape, dtype=bool)
     ks = _kstar(inputs)
     e_ry = (inputs.e_dft_active_kn_ry if ks.is_identity
             else ks.select(inputs.e_dft_active_kn_ry))
-    e_ev = np.asarray(e_ry, dtype=np.float64) * RYD_TO_EV
-    return np.broadcast_to(e_ev < float(cut.coarse_floor_ev), shape)
+    return np.broadcast_to(
+        coarse_identities(cut, e_ry, inputs.config.compute_mode), shape)
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
@@ -2830,7 +2829,6 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     # THE COARSE (SEMICORE) CLASS reads its own patch (gw.qp_support); every
     # other QP-matrix identity is protected at the deck eta, on the near grid.
     semicore = _sc_coarse_identities(inputs, energies_loop.shape)
-    n_semi = int(np.count_nonzero(semicore))
     # Owner 2026-09-24: the requested states are the protected identities the
     # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
     # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
@@ -2850,28 +2848,11 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         grid, envelope, event = hold_support_ev(
             sigma, requested, sampled_grid, session.get("support_envelope_ev"),
             energy_relative_ev, states)
-    patch, patch_event, windows = None, "", ()
-    users = getattr(sigma, "coarse_windows_ev", tuple)()
-    if users and not n_semi:
-        raise ValueError(
-            "GATE sigma_coarse_window: sigma_omega_patches_ev lo:hi:eta windows serve the "
-            "SC coarse (semicore) class of the MPA/shared-pole Sigma (scalar or sector), "
-            "and no occupied state of this run lies below the coarse floor (or its Sigma "
-            "is PPM/static).")
-    if n_semi:
-        from .qp_support import (_inside_any, coarse_windows_ev, semicore_patch_escapes,
-                                 semicore_patches_ev)
-        near_lo = float(grid[0])
-        auto = semicore & ~_inside_any(energy_relative_ev, users)
-        held = None if session is None else session.get("semicore_patches_ev")
-        if plan is None or held is None:
-            patch, patch_event = semicore_patches_ev(energy_relative_ev, auto, near_lo), "plan"
-        elif semicore_patch_escapes(energy_relative_ev, semicore, near_lo, held, users).any():
-            patch, patch_event = semicore_patches_ev(
-                energy_relative_ev, auto, near_lo, previous=held), "extend"
-        else:
-            patch, patch_event = held, "hold"
-        windows = coarse_windows_ev(near_lo, patch, users)
+    from .qp_support import coarse_windows_plan
+    held = (None if plan is None or session is None
+            else session.get("semicore_patches_ev"))
+    patch, patch_event, windows = coarse_windows_plan(
+        sigma, energy_relative_ev, semicore, float(grid[0]), held)
     from .qp_support import joined_grid_ev
     return SCSupport(sampled_grid, grid, energy_relative_ev, states, event,
                      envelope, no_qp, semicore, patch, patch_event,
