@@ -210,6 +210,10 @@ a narrower last panel also left one accumulation unfused beside the running
 sum. The uniform loop removes it: the CT keep stage's compiled temporaries at
 8×8 go from 8.37 to 6.23 GB, and the CT pencil's at 2×2 from 88.5 to 67.8 GB
 (claim 4110).
+On CUDA the in-place GEMM already absorbed that accumulation. On the CrI3 6×6
+bispinor SC deck at P4 (forced face route, maps 0–2), the uniform loop moves
+$E_{\rm QP}$ by at most 0.001 µeV against main. The warm map-2 sector walls
+and the run peak (25.21 GB) are unchanged (claim 4111).
 
 **Accumulation.** With `bounds`, or with three or more panels, every panel
 after the first adds into the output tile in place through the local
