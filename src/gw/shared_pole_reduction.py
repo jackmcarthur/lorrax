@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from distrib_la import (diagonal_like, face_sharding, hermitian_part,
-                        join_columns, on_face)
-from gw.shared_pole_pencil import _adjoint, _matrix_layout
+from functools import partial
+
+from distrib_la import diagonal_like, face_sharding, hermitian_part, on_face
+from gw.shared_pole_pencil import (_matrix_layout, join_vectors, on_tiles, split_vectors, tile_adjoint,
+                                   tile_block, tile_count, tile_hermitian, tile_join, tile_split)
 
 
 def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None):
@@ -275,17 +277,22 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
 ORIENTATION_PAIR_REFUSAL = ("GATE shared_pole_orientation_pair: got: finite columns not in mirrored halves; want: [X(z); X(-z)] on one direction set and paired k0/k1 columns; why: the ordered cut acts in the paired basis")
 
 
-def _paired_member(a, inverse, *, half, finite, n_inf):
-    """One pencil member [b,R,R] in the paired basis: its (ww, wv, vv) blocks."""
+def _paired_member(a, row_inverse, column_inverse, *, half, finite, n_inf):
+    """One pencil member [b,R,R] in the paired basis: its (ww, wv, vv) blocks.
+
+    On the face ``a`` is one rank's tile and ``half``, ``finite``, ``n_inf`` its own
+    pieces of the logical blocks (the tile-interleaved order puts a state's original and
+    mirror columns on the same rank), with the inverse nodes of its rows and columns.
+    """
     def columns(x):
         w = jnp.concatenate(((x[..., :half] + x[..., half:finite]) / 2, x[..., finite + n_inf:]), axis=-1)
-        v = jnp.concatenate(((x[..., :half] - x[..., half:finite]) * inverse[:, None, :],
+        v = jnp.concatenate(((x[..., :half] - x[..., half:finite]) * column_inverse[:, None, :],
                              x[..., finite:finite + n_inf]), axis=-1)
         return w, v
 
     def rows(x):
         w = jnp.concatenate(((x[:, :half] + x[:, half:finite]) / 2, x[:, finite + n_inf:]), axis=1)
-        v = jnp.concatenate((jnp.conj(inverse)[:, :, None] * (x[:, :half] - x[:, half:finite]),
+        v = jnp.concatenate((jnp.conj(row_inverse)[:, :, None] * (x[:, :half] - x[:, half:finite]),
                              x[:, finite:finite + n_inf]), axis=1)
         return w, v
 
@@ -295,25 +302,54 @@ def _paired_member(a, inverse, *, half, finite, n_inf):
     return ww, wv, vv
 
 
-def _paired_output(a, inverse, *, half, finite, n_inf):
-    """Output columns O [b,n,R] in the paired basis: (w, v)."""
+def _paired_output(a, column_inverse, *, half, finite, n_inf):
+    """Output columns O [b,n,R] (a tile of them on the face) in the paired basis: (w, v)."""
     w = jnp.concatenate(((a[..., :half] + a[..., half:finite]) / 2, a[..., finite + n_inf:]), axis=-1)
-    v = jnp.concatenate(((a[..., :half] - a[..., half:finite]) * inverse[:, None, :],
+    v = jnp.concatenate(((a[..., :half] - a[..., half:finite]) * column_inverse[:, None, :],
                          a[..., finite:finite + n_inf]), axis=-1)
     return w, v
 
 
-def _schur_basis(y_s, bh_y_s, kept):
+def _paired_blocks(a, inverse, statics, matrix_sharding):
+    """``_paired_member`` of a whole member, or of every face tile (the congruence pairs
+    columns on the same rank, so no byte moves)."""
+    if matrix_sharding is None:
+        face = face_sharding(a)
+        return on_face(_paired_member, None if face is None else (face,) * 3, a, inverse, inverse, **statics)
+    return on_tiles(partial(_paired_member, **statics), matrix_sharding, (a,), rows=(inverse,),
+                    cols=(inverse,), outputs=3)
+
+
+def _paired_columns(a, inverse, statics, matrix_sharding):
+    """``_paired_output`` of whole output columns, or of every face tile."""
+    if matrix_sharding is None:
+        face = face_sharding(a)
+        return on_face(_paired_output, None if face is None else (face,) * 2, a, inverse, **statics)
+    return on_tiles(partial(_paired_output, **statics), matrix_sharding, (a,), cols=(inverse,), outputs=2)
+
+
+def _pairing(points, active_columns, p):
+    """``(paired, nodes, live, live_infinity)`` of an ordered pencil's tables in the tile-interleaved
+    order of ``p``: the mirror half carries -z of the original half, the halves' masks agree and
+    so do the k0 and k1 masks; the originals' nodes and mask and the k0 mask."""
+    side, finite = int(active_columns.shape[-1]), int(points.shape[-1])
+    half, n_inf = finite // 2, (side - finite) // 2
+    nodes, mirror = split_vectors(points, (half, half), p)
+    live, live_mirror, live_inf, live_inf1 = split_vectors(active_columns, (half, half, n_inf, n_inf), p)
+    paired = jnp.all(mirror == -nodes) & jnp.all(live_mirror == live) & jnp.all(live_inf1 == live_inf)
+    return paired, nodes, live, live_inf
+
+
+def _schur_basis(y_s, bh_y_s, kept, matrix_sharding=None):
     """[[Y_S, 0], [-B^H Y_S, diag(kept)]] [b, 2R, 2R]: P diag(Y_S, I_kept) with P = [[I, 0], [-B^H, I]]."""
     eye = jnp.eye(y_s.shape[-1], dtype=y_s.dtype)[None] * kept[:, None, :].astype(y_s.dtype)
-    return jnp.concatenate((jnp.concatenate((y_s, jnp.zeros_like(y_s)), axis=-1),
-                            jnp.concatenate((-bh_y_s, eye), axis=-1)), axis=-2)
+    return tile_block(((y_s, jnp.zeros_like(y_s)), (-bh_y_s, eye)), matrix_sharding)
 
 
-def _restricted_block(ww, wv, vv):
+def _restricted_block(ww, wv, vv, matrix_sharding=None):
     """Hermitian [[ww, wv], [wv^H, vv]] of the restricted paired pencil."""
-    return hermitian_part(jnp.concatenate(
-        (jnp.concatenate((ww, wv), axis=-1), jnp.concatenate((_adjoint(wv), vv), axis=-1)), axis=-2))
+    return tile_hermitian(tile_block(((ww, wv), (tile_adjoint(wv, matrix_sharding), vv)), matrix_sharding),
+                          matrix_sharding)
 
 
 def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
@@ -357,19 +393,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     signed model's columns past K are zero padding, so Y carries none.
     This map stays inside the parent-local round.
     """
-    g, h, output, points = pencil
-    side, finite = int(g.shape[-1]), int(points.shape[-1])
-    half, n_inf = finite // 2, (side - finite) // 2
-    if finite % 2 or (side - finite) % 2:
-        raise ValueError(f"GATE shared_pole_orientation_pair: got: {finite} finite and {side - finite} infinity columns; want: even counts; why: the ordered cut acts in the paired basis")
-    paired = (jnp.all(points[:, half:] == -points[:, :half])
-              & jnp.all(active_columns[:, half:finite] == active_columns[:, :half])
-              & jnp.all(active_columns[:, finite + n_inf:] == active_columns[:, finite:finite + n_inf]))
-    # Traced (a round program): the caller refuses on diagnostics["orientation_paired"].
-    if not isinstance(paired, jax.core.Tracer) and not bool(paired):
-        raise ValueError(ORIENTATION_PAIR_REFUSAL)
     stage = paired_members(pencil, active_columns, gates=gates, matrix_sharding=matrix_sharding)
-    gamma, u = eigh(hermitian_part(stage["h_vv"]))
+    gamma, u = eigh(tile_hermitian(stage["h_vv"], matrix_sharding))
     stage = keep_stage(stage, gamma, u, matmul=matmul, gates=gates, keep_budget=keep_budget,
                        retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep,
                        carrier=carrier)
@@ -395,29 +420,22 @@ def paired_members(pencil, active_columns, *, gates, matrix_sharding=None):
     half, n_inf = finite // 2, (side - finite) // 2
     if finite % 2 or (side - finite) % 2:
         raise ValueError(f"GATE shared_pole_orientation_pair: got: {finite} finite and {side - finite} infinity columns; want: even counts; why: the ordered cut acts in the paired basis")
-    paired = (jnp.all(points[:, half:] == -points[:, :half])
-              & jnp.all(active_columns[:, half:finite] == active_columns[:, :half])
-              & jnp.all(active_columns[:, finite + n_inf:] == active_columns[:, finite:finite + n_inf]))
+    p = tile_count(matrix_sharding)
+    paired, nodes, live_f, live_inf = _pairing(points, active_columns, p)
     # Traced (a round program): the caller refuses on diagnostics["orientation_paired"].
     if not isinstance(paired, jax.core.Tracer) and not bool(paired):
         raise ValueError(ORIENTATION_PAIR_REFUSAL)
-    face = face_sharding(g)
-    output_face = face if face_sharding(output) is None else face_sharding(output)
-    statics = dict(half=half, finite=finite, n_inf=n_inf)
-
-    live_f = active_columns[:, :half]
-    inverse = jnp.where(live_f, 1 / jnp.where(live_f, 2 * points[:, :half], 1), 0)
-    # Every large result below stays on the x/y face; eager slicing, concatenation
-    # and a + a^H come out replicated ([b,R,R] per rank), which is what ran CrI3 out of memory.
-    members = None if face is None else (face,) * 3
-    g_ww, g_wv, g_vv = on_face(_paired_member, members, g, inverse, **statics)
-    h_ww, h_wv, h_vv = on_face(_paired_member, members, h, inverse, **statics)
-    o_w, o_v = on_face(_paired_output, None if output_face is None else (output_face,) * 2,
-                       output, inverse, **statics)
+    statics = dict(half=half // p, finite=finite // p, n_inf=n_inf // p)
+    inverse = jnp.where(live_f, 1 / jnp.where(live_f, 2 * nodes, 1), 0)
+    # The congruence takes each tile's own pieces of the halves (the tile-interleaved order
+    # keeps a state's original and mirror columns on one rank), so it moves no byte.
+    g_ww, g_wv, g_vv = _paired_blocks(g, inverse, statics, matrix_sharding)
+    h_ww, h_wv, h_vv = _paired_blocks(h, inverse, statics, matrix_sharding)
+    o_w, o_v = _paired_columns(output, inverse, statics, matrix_sharding)
     g_ww, g_wv, g_vv, h_ww, h_wv, h_vv, o_w, o_v = (
         _matrix_layout(a, matrix_sharding) for a in
         (g_ww, g_wv, g_vv, h_ww, h_wv, h_vv, o_w, o_v))
-    active = jnp.concatenate((live_f, active_columns[:, finite:finite + n_inf]), axis=-1)
+    active = join_vectors((live_f, live_inf), p)
     diagonal = jnp.real(jnp.diagonal(h_vv, axis1=-2, axis2=-1))
     diagonal_ok = jnp.all(jnp.where(active, jnp.isfinite(diagonal) & (diagonal > 0), diagonal == 0), axis=-1)
     scale = jnp.where(active, 1 / jnp.sqrt(jnp.where(diagonal > 0, diagonal, 1)), 0)
@@ -433,7 +451,6 @@ def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=
     """Stage 2: the H'_vv keep cut, its metric correction and the restricted pencil; ``schur`` goes to the second eigh."""
     scale = stage["scale"]
     h_vv, h_ww, h_wv = stage["h_vv"], stage["h_ww"], stage["h_wv"]
-    face = None
     validity = gates["normalized_gram_validity"]["threshold"]
     keep_cut = gates["normalized_gram_keep"]["threshold"] if gram_keep is None else gram_keep
     largest = gamma[:, -1]
@@ -447,8 +464,7 @@ def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=
     # ``keep_budget``); a face pencil keeps them only when its caller gives a
     # carrier that tiles the mesh (``shared_pole_execution.face_ritz_carrier``).
     width = gamma.shape[-1]
-    if (keep_budget is not None and face is None
-            and (matrix_sharding is None or carrier is not None)):
+    if keep_budget is not None and (matrix_sharding is None or carrier is not None):
         width = min(width, max(1, int(keep_budget if carrier is None else carrier)))
     kept, values = keep[:, -width:], gamma[:, -width:]
     z = _matrix_layout(u[..., -width:] * (kept / jnp.sqrt(jnp.where(kept, values, 1)))[:, None, :],
@@ -457,7 +473,7 @@ def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=
     metric = matmul(z, matmul(h_vv, z), transa="C")
     null_identity = diagonal_like(~kept, metric)
     correction, metric_ok, metric_diagnostics = _metric_inverse_root(
-        hermitian_part(metric) + null_identity, matmul=matmul,
+        tile_hermitian(metric, matrix_sharding) + null_identity, matmul=matmul,
         tolerance=gates["retained_subspace_moments"]["threshold"], matrix_sharding=matrix_sharding)
     del null_identity
     z = matmul(z, correction) * kept[:, None, :]
@@ -479,12 +495,13 @@ def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=
     # half of H_r never enters the eigensolver (whole-H_r eigh: backward error
     # 8e-4 top on Fe 4^3 complete-basis parents, claim of the PAIREDHR lane).
     a_r, b_r = project(z, h_ww), project(z, h_wv)
-    h_r = _matrix_layout(on_face(_restricted_block, face, a_r, b_r, metric), matrix_sharding)
-    schur = _matrix_layout(hermitian_part(a_r - matmul(b_r, b_r, transb="C")), matrix_sharding)
+    h_r = _matrix_layout(_restricted_block(a_r, b_r, metric, matrix_sharding), matrix_sharding)
+    schur = _matrix_layout(tile_hermitian(a_r - matmul(b_r, b_r, transb="C"), matrix_sharding), matrix_sharding)
     del h_ww, h_wv, metric, a_r
-    g_r = _matrix_layout(on_face(_restricted_block, face, project(z, stage["g_ww"]), project(z, stage["g_wv"]),
-                                 project(z, stage["g_vv"])), matrix_sharding)
-    o_r = _matrix_layout(join_columns(matmul(stage["o_w"], z), matmul(stage["o_v"], z)), matrix_sharding)
+    g_r = _matrix_layout(_restricted_block(project(z, stage["g_ww"]), project(z, stage["g_wv"]),
+                                           project(z, stage["g_vv"]), matrix_sharding), matrix_sharding)
+    o_r = _matrix_layout(tile_join((matmul(stage["o_w"], z), matmul(stage["o_v"], z)), -1, matrix_sharding),
+                         matrix_sharding)
     out = dict(schur=schur, h_r=h_r, g_r=g_r, o_r=o_r, b_r=b_r, kept=kept, keep=keep, gamma=gamma, largest=largest,
                ratio=ratio, floor=floor, count=count, width=width, metric_ok=metric_ok,
                metric_relative=metric_relative, metric_diagnostics=metric_diagnostics,
@@ -497,7 +514,6 @@ def keep_stage(stage, gamma, u, *, matmul, gates, keep_budget=None, retain_span=
 
 def paired_stage(stage, gamma_r, u_r, *, matmul, gates, matrix_sharding=None, gram_keep=None):
     """Stage 3: the Schur cut, Y = L^-H on the kept span and its metric correction; ``reduced`` goes to the last eigh."""
-    face = None
     # The Schur cut uses the same relative keep as the H'_vv cut (the sector threshold).
     keep_cut = gates["normalized_gram_keep"]["threshold"] if gram_keep is None else gram_keep
     kept, b_r, h_r, g_r = stage["kept"], stage["b_r"], stage["h_r"], stage["g_r"]
@@ -512,12 +528,12 @@ def paired_stage(stage, gamma_r, u_r, *, matmul, gates, matrix_sharding=None, gr
     y_s = u_r * (keep_s / jnp.sqrt(jnp.where(keep_s, gamma_r, 1)))[:, None, :]
     del u_r
     # Y = P diag(Y_S, I_kept): Schur modes, then the kept v directions.
-    y = _matrix_layout(on_face(_schur_basis, face, y_s, matmul(b_r, y_s, transa="C"), kept), matrix_sharding)
+    y = _matrix_layout(_schur_basis(y_s, matmul(b_r, y_s, transa="C"), kept, matrix_sharding), matrix_sharding)
     del y_s, b_r
-    keep_r = jnp.concatenate((keep_s, kept), axis=-1)
+    keep_r = join_vectors((keep_s, kept), tile_count(matrix_sharding))
     count_r = jnp.sum(keep_r, axis=-1, dtype=jnp.int64)
     null_r = diagonal_like(~keep_r, h_r)
-    metric_r = hermitian_part(matmul(y, matmul(h_r, y), transa="C")) + null_r
+    metric_r = tile_hermitian(matmul(y, matmul(h_r, y), transa="C"), matrix_sharding) + null_r
     # The restricted sources are released before the second metric correction.
     del null_r, h_r
     correction_r, metric_r_ok, paired_metric_diagnostics = _metric_inverse_root(
@@ -525,7 +541,7 @@ def paired_stage(stage, gamma_r, u_r, *, matmul, gates, matrix_sharding=None, gr
     del metric_r
     y = matmul(y, correction_r) * keep_r[:, None, :]
     del correction_r
-    reduced = hermitian_part(matmul(y, matmul(g_r, y), transa="C"))
+    reduced = tile_hermitian(matmul(y, matmul(g_r, y), transa="C"), matrix_sharding)
     out = {k: v for k, v in stage.items() if k not in ("schur", "h_r", "b_r", "g_r")}
     out.update(reduced=reduced, y=y, keep_r=keep_r, count_r=count_r, gamma_r=gamma_r, ratio_r=ratio_r,
                metric_r_ok=metric_r_ok,
@@ -544,15 +560,15 @@ def output_stage(stage, mu, rotation, *, matmul, gates, retain_span=False, matri
     c = matmul(o_r, matmul(y, rotation))
     if retain_span:
         paired_span = stage["paired_span"]
-        ritz = matmul(y, rotation)
-        span_w = matmul(paired_span, ritz[:, :width])
-        span_v = matmul(paired_span, ritz[:, width:])
+        ms = matrix_sharding
+        ritz_w, ritz_v = tile_split(matmul(y, rotation), (width, width), -2, ms)
+        span_w, span_v = matmul(paired_span, ritz_w), matmul(paired_span, ritz_v)
+        rest = int(paired_span.shape[-2]) - half
+        (w_f, w_i), (v_f, v_i) = (tile_split(a, (half, rest), -2, ms) for a in (span_w, span_v))
         # Undo w=(X(z)+X(-z))/2, v=(X(z)-X(-z))/(2z),
-        # w_inf=k1 and v_inf=k0 (report equation 5.6).
-        coefficients = jnp.concatenate((
-            .5 * span_w[:, :half] + inverse[:, :, None] * span_v[:, :half],
-            .5 * span_w[:, :half] - inverse[:, :, None] * span_v[:, :half],
-            span_v[:, half:], span_w[:, half:]), axis=-2)
+        # w_inf=k1 and v_inf=k0 (report equation 5.6): rows back to originals, mirrors, k0, k1.
+        coefficients = tile_join((.5 * w_f + inverse[:, :, None] * v_f, .5 * w_f - inverse[:, :, None] * v_f,
+                                  v_i, w_i), -2, ms)
         coefficients = _matrix_layout(coefficients, matrix_sharding)
     del o_r, y, rotation
     cut = gates["normalized_gram_keep"]["threshold"] * jnp.max(jnp.abs(mu), axis=-1)
