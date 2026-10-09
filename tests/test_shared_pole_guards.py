@@ -81,8 +81,8 @@ def test_local_ct_over_budget_still_runs(monkeypatch):
     monkeypatch.setattr(cfg, "linalg_resolution", lambda deck: None)
     monkeypatch.setattr(sectors, "cross_span_widths", lambda meta, s: ([2, 2], [2, 2]))
     monkeypatch.setattr(sectors, "cross_round_actions", lambda *a, **k: ())
-    monkeypatch.setattr(sectors, "_pack_cross_spans", lambda s, widths, **k: [
-        (None, None, None, None, np.zeros((1, 3, w))) for w in widths])
+    monkeypatch.setattr(sectors, "_pack_cross_spans", lambda s, widths, actions, **k: (
+        [(None, None, None, None, np.zeros((1, 3, w))) for w in widths], ((), ())))
     monkeypatch.setattr(sectors, "reduce_cross_round", reduce)
     sector = dict(model=(np.zeros((1, 3, 2)),), signed=(), coefficients=np.zeros((1, 3, 2)),
                   infinity=(), states=(), roles=((),), recipe={}, budget=SimpleNamespace(face_room=None))

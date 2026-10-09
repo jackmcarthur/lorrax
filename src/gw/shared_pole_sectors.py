@@ -675,7 +675,7 @@ def _sector_tables(meta, geometry, n, counts, widths, states, values, infinity_w
     SC map past 0 that still grows it says so in its log."""
     from gw.shared_pole_local import round_tables,carrier_history
     history=carrier_history(meta)
-    name=(('sector',geometry['sector'],n),'extent',2,len(states))
+    name=(('sector',geometry['sector'],n),'extent',2)
     before=int(history.get(name,(0,))[0])
     tables=round_tables(counts,widths,[s[0] for s in states],[v.shape[-1] for v in values],
         infinity_width,column_extent=extent,ordered=True,odd_moments=True,key=name[0],history=history)
@@ -990,8 +990,8 @@ def _cross_pencil(sectors, samples, moments, *, mesh_xy, sample_ids, line_cross,
     """One face sub-batch's CT joint pencil (metric, value, O_C, O_T) at the round's spans."""
     from gw.shared_pole_execution import cross_pencil_program
     actions=_cross_actions(sectors,samples,mesh_xy=mesh_xy,sample_ids=sample_ids,line_cross=line_cross)
-    packed=_pack_cross_spans(sectors,widths,mesh_xy=mesh_xy,execution='face')
-    return cross_pencil_program(mesh_xy)(*packed,actions,tuple(moments[f'M{i}'] for i in range(4)))
+    packed,cross=_pack_cross_spans(sectors,widths,actions,mesh_xy=mesh_xy,execution='face')
+    return cross_pencil_program(mesh_xy)(*packed,cross,tuple(moments[f'M{i}'] for i in range(4)))
 
 
 def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
@@ -1028,12 +1028,13 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     original_sides = tuple(s['coefficients'].shape[-2] for s in sectors)
     _,widths=cross_span_widths(meta,sectors)
     actions=_cross_actions(sectors,samples,mesh_xy=mesh_xy,sample_ids=sample_ids,line_cross=line_cross)
-    packed=_pack_cross_spans(sectors,widths,mesh_xy=mesh_xy,execution='local')
+    packed,cross=_pack_cross_spans(sectors,widths,actions,mesh_xy=mesh_xy,execution='local')
     budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values(),
-        *(panels for stored in line_cross for panels,_ in stored.values()),*jax.tree.leaves((actions,packed)))
+        *(panels for stored in line_cross for panels,_ in stored.values()),*jax.tree.leaves((packed,cross)))
+    del actions   # its columns are packed into ``cross``
     side=sum(s[4].shape[-1] for s in packed)
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
-    signed,diagnostics=reduce_cross_round(*packed,actions,
+    signed,diagnostics=reduce_cross_round(*packed,cross,
         tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
         eigh_plan=budget.eigenplan(side))
     for name in ('gram_valid','retained_metric_positive'):
@@ -1090,12 +1091,21 @@ def cross_span_widths(meta, sectors):
     return live,held
 
 
-def _pack_cross_spans(sectors, widths, *, mesh_xy, execution):
-    """Each diagonal sector's CT operands with its retained span compacted to ``widths``."""
+def _pack_cross_spans(sectors, widths, actions, *, mesh_xy, execution):
+    """Each diagonal sector's CT operands with its retained span compacted to ``widths``.
+
+    Returns ``(spans, cross)``. On the local route each sector is ``(points, Q, WQ,
+    infinity, Y, signed)`` with Q and WQ packed at the sector's round extent, and
+    ``cross`` the packed TC-on-C output and CT-on-T (output, derivative) columns
+    (``shared_pole_local.pack_panels``), so the local CT program never follows the
+    panel count. On the face each sector is ``(points, order, (Qs, WQs), infinity, Y,
+    signed)`` with the round's panel tuples and ``cross`` the per-state actions; the
+    face CT program joins and takes them itself (``_face_cross_pencil_equations``).
+    """
     import jax
     from jax.sharding import NamedSharding,PartitionSpec as P
-    from gw.shared_pole_local import _batch_put
-    packed=[]
+    from gw.shared_pole_local import _batch_put,pack_panels
+    spans=[]
     for sector,width in zip(sectors,widths):
         # Drop only exactly inactive carrier columns. This is a storage
         # compaction of the retained span, not a second physical rank cut.
@@ -1108,11 +1118,20 @@ def _pack_cross_spans(sectors, widths, *, mesh_xy, execution):
         # Host role coordinates/order are replicated metadata, not matrices.
         put=(lambda a:jax.make_array_from_callback(a.shape,NamedSharding(mesh_xy,P()),
                                                    lambda index:a[index])) if execution=='face' else (lambda a:_batch_put(mesh_xy,a))
-        packed.append((put(sector['tables']['points']),
-            put(sector['tables']['order']),
-            (tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states'])),
-            sector['infinity'],y,signed))
-    return packed
+        states=(tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states']))
+        order=put(sector['tables']['order']) if execution=='face' else None
+        spans.append((put(sector['tables']['points']),order,states,sector['infinity'],y,signed))
+    if execution=='face':
+        return spans,actions
+    packed,cross=[],[]
+    for (points,_,states,infinity,y,signed),sector,(outputs,fields) in zip(
+            spans,sectors,((actions[0],1),(actions[1],2))):
+        # TC acts on C's columns through its output only; CT on T's through output and derivative.
+        columns=pack_panels((list(states[0]),list(states[1]),*([a[k] for a in outputs] for k in range(fields))),
+                            sector['tables']['order'],[int(s[1].shape[-1]) for s in sector['states']],mesh_xy=mesh_xy)
+        packed.append((points,columns[0],columns[1],infinity,y,signed))
+        cross.append(columns[2:])
+    return packed,tuple(cross)
 
 
 @lru_cache(maxsize=None)
@@ -1311,24 +1330,38 @@ def _cross_reduce_equations(charge,transverse,cross,moments,*,mm,eigh,gates,matr
                                eigh=eigh,matmul=mm,gates=gates,matrix_sharding=matrix_sharding)
 
 
-def _cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding=None):
-    """The CT joint pencil (metric, value, O_C, O_T) on the two retained spans (plan 12.2)."""
+def _face_cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding):
+    """The face CT pencil from the round's panel tuples (``_pack_cross_spans`` on the face): each
+    sector's Q and WQ and the actions joined and taken at the sector's table order inside the
+    program, then ``_cross_pencil_equations``."""
     join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
-    def pack(panels,order):
-        pad=1 if matrix_sharding is None else int(matrix_sharding.mesh.shape['y'])
-        values=join((*panels,jnp.zeros_like(panels[0][...,:pad])),axis=-1)
-        return _matrix_take_columns(values,order,matrix_sharding)
-    def unpack(sector,actions):
-        points,order,states,infinity,y,signed=sector
-        return points,pack(states[0],order),infinity[0],pack(tuple(a[0] for a in actions),order),pack(tuple(a[1] for a in actions),order)
-    zc,qc,ic,tc,dtc=unpack(charge,cross[0])
-    zt,qt,it,ct,dct=unpack(transverse,cross[1])
-    g,h,otc,oct=ordered_cross_pencil((zc,qc,ic),(zt,qt,it),(tc,ct,dct),moments,matmul=mm,matrix_sharding=matrix_sharding)
+    pad = int(matrix_sharding.mesh.shape['y'])
+    def pack(panels, order):
+        values = join((*panels, jnp.zeros_like(panels[0][..., :pad])), axis=-1)
+        return _matrix_take_columns(values, order, matrix_sharding)
+    def columns(sector):
+        points, order, states, infinity, y, signed = sector
+        return points, pack(states[0], order), pack(states[1], order), infinity, y, signed
+    actions = ((pack(tuple(a[0] for a in cross[0]), charge[1]),),
+               tuple(pack(tuple(a[k] for a in cross[1]), transverse[1]) for k in (0, 1)))
+    return _cross_pencil_equations(columns(charge), columns(transverse), actions, moments, mm=mm,
+                                   matrix_sharding=matrix_sharding)
+
+
+def _cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding=None):
+    """The CT joint pencil (metric, value, O_C, O_T) on the two retained spans (plan 12.2).
+
+    Each sector is ``(points, Q, WQ, infinity, Y, signed)`` with Q and WQ at its round
+    extent, and ``cross`` the TC-on-C output and the CT-on-T output and derivative at the
+    same columns (``_pack_cross_spans``)."""
+    join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
+    (tc,),(ct,dct)=cross
+    g,h,otc,oct=ordered_cross_pencil((charge[0],charge[1],charge[3][0]),(transverse[0],transverse[1],transverse[3][0]),
+                                     (tc,ct,dct),moments,matmul=mm,matrix_sharding=matrix_sharding)
     # The diagonal output panels are O_original. Reconstruct their
     # infinity columns from the same physical moments already in hand.
     def diagonal(sector):
-        _,order,states,infinity,y,signed=sector
-        own=pack(states[1],order)
+        _,_,own,infinity,y,signed=sector
         return _matrix_layout(join((own,2*infinity[1],2*infinity[2]),axis=-1), matrix_sharding)
     cc=(charge[4],charge[5][1],diagonal(charge),otc)
     tt=(transverse[4],transverse[5][1],diagonal(transverse),oct)

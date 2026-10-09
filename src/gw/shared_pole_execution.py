@@ -847,8 +847,8 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
 @lru_cache(maxsize=None)
 def cross_pencil_program(mesh):
     """The CT joint pencil (metric, value, O_C, O_T) of a face round, no eigh."""
-    from gw.shared_pole_sectors import _cross_pencil_equations
-    return face_program(partial(_cross_pencil_equations, mm=face_matmul(mesh),
+    from gw.shared_pole_sectors import _face_cross_pencil_equations
+    return face_program(partial(_face_cross_pencil_equations, mm=face_matmul(mesh),
                                 matrix_sharding=NamedSharding(mesh, P(None, "x", "y"))), mesh)
 
 
