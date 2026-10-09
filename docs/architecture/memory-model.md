@@ -205,14 +205,17 @@ under `cuda_async` and the arena's under BFC.
 |---|---|---|---|---|---|
 | A100-40GB | `cuda_async`, reserved at `R` = 35.20 GB | 25.21 GB | 40.40 GB, the card full for an instant | 199.3 / 112.3 / 63.2 | 670.3 |
 | A100-40GB | BFC, preallocated at `R` | 25.22 GB | 35.20 GB, 5.12 GB always free | 200.3 / 112.5 / 63.2 | 670.8 |
+| A100-40GB | `platform` (`cudaMalloc` per buffer, no pool) | not reported | none; the card's own high-water 27.29 GB | 209.7 / 122.6 / 72.8 | 712.9 |
 | A100-80GB | `cuda_async`, reserved at `R` = 77.89 GB | 44.76 GB | 83.01 GB, the card full for an instant | 197.7 / 124.1 / 60.4 | 688.8 |
 | A100-80GB | BFC, preallocated at `R` | 44.77 GB | 77.89 GB, 5.12 GB always free | 204.7 / 110.6 / 64.5 | 672.1 |
 | A100-80GB | BFC, growing (no preallocation) | 44.78 GB | 63.82 GB in map 0 | 195.4 (map 0) | — |
 
-eqp is identical under BFC and `cuda_async` (1288 of 1288 rows, maps 0–2,
-both cards). BFC preallocated at `R` never grows past `R`, so it removes the
-transient at no measured cost in time. It still loses three things the
-policy keeps:
+eqp is identical under every allocator (1288 of 1288 rows, maps 0–2).
+`platform` holds nothing beyond what is in use (27.29 GB is the bytes in use
+plus `O`), but it costs 6 % of the run and up to 10 % of a warm map, and XLA
+reports no memory under it, so no receipt has a figure. BFC preallocated at
+`R` never grows past `R`, so it removes the transient at no measured cost in
+time. It still loses three things the policy keeps:
 
 - the [per-stage receipt](#the-per-stage-receipt): BFC keeps no resettable
   in-use mark, so every stage reads the run's high-water (25.22 GB at every
