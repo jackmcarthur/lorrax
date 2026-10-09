@@ -130,7 +130,7 @@ than every extent of either kind maps new memory, and `V` rises past `R`:
 
 Either way the excess lasts until the next synchronize. A driver-level test
 of the default pool on one A100-80GB shows each rule (reservation
-`T` = 38.29 GB filled and freed once, as XLA does; `⟨claim MEM40-a⟩`):
+`T` = 38.29 GB filled and freed once, as XLA does; claim 4090):
 
 | case | frees before the request | request | `V` after | outcome |
 |---|---|---|---|---|
@@ -149,7 +149,7 @@ The production traces show the same signature (sampler readings every
 0.25–0.5 s; `CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH` catches what happens between
 readings):
 
-- CrI3 6×6 bispinor SC, P4, A100-40GB, budget 31.6 GB (`⟨claim MEM40-b⟩`): at
+- CrI3 6×6 bispinor SC, P4, A100-40GB, budget 31.6 GB (claim 4091): at
   the end of the ζ stage, `U` = 24.99 GB in `V` = 35.20 GB. Before the next
   reading, the reserved high-water rose by 5.13 GB, which was all the free
   memory on the card (`F` = 5.14 GB). `U` fell to 1.92 GB as the next
@@ -179,10 +179,10 @@ covers them:
 
 - **in-use bytes above the budget**, `U_peak / B − 1`: peaks the planners
   under-price. Measured: Ni 20³ bispinor P64, A100-80GB, deck 72 GB:
-  76.15 GB in the Σ τ sweep (+5.8 %, `⟨claim MEM40-b⟩`); CrI3 24×24 bispinor
+  76.15 GB in the Σ τ sweep (+5.8 %, claim 4091); CrI3 24×24 bispinor
   P64, deck 72 GB: 69.33 GB (−3.7 %, claim 4084); CrI3 6×6 bispinor SC P4:
   25.21 GB of 31.6 GB on A100-40GB and 44.76 GB of 66.4 GB on A100-80GB
-  (`⟨claim MEM40-b⟩`).
+  (claim 4091).
 - **free space between live buffers** that no request can use even after a
   synchronize. One case is measured. A CrI3 6×6 bispinor one-shot with 2634
   current points (P4, A100-80GB, deck budget 68.16 GB) was refused a 1.82 GB
@@ -197,7 +197,7 @@ and 15.1 GB on A100-80GB for these two terms.
 `cuda_async` with its pool reserved is the one allocator configuration
 ([environment § GPU pool](../environment/overview.md#gpu-pool)). The
 alternatives jaxlib offers were measured on CrI3 6×6 bispinor SC maps 0–2
-at P4, cold, at the rule's budget (`⟨claim MEM40-c⟩`). "Peak in use" is
+at P4, cold, at the rule's budget (claim 4092). "Peak in use" is
 XLA's `peak_bytes_in_use`; "high-water" is the pool's reserved high-water
 under `cuda_async` and the arena's under BFC.
 
