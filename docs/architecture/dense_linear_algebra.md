@@ -129,34 +129,107 @@ What the attribution of stage 1 shows:
 
 ## 3 The distributed product: SUMMA and `batch_gram`
 
-A face product $C_q = A_q B_q$, with $A_q$ of shape $(m,k)$ and $B_q$ of shape
-$(k,n)$ for every $q$ of a stack, is the sum over contraction panels $K_j$,
+A face product forms $C_q = A_q B_q$ for every $q$ of a stack of $B$ matrices,
+with $A_q$ of shape $(m,k)$, $B_q$ of shape $(k,n)$, and all three on the face.
+On the $p \times p$ mesh write $k_\ell = k/p$ for the contraction columns of
+one owner block, and $M_x$, $K_y$, $N_y$ for the $x$-th or $y$-th block of the
+row, contraction and column ranges ($m/p$, $k_\ell$ and $n/p$ indices). Rank
+$(x,y)$ holds $A_q[M_x,K_y]$ and $B_q[K_x,N_y]$, and its output tile
+$C_q[M_x,N_y]$ needs the $A$ blocks of its mesh row and the $B$ blocks of its
+mesh column. `distrib_la.panel_matmul`
+(`services/distrib_la/src/distrib_la/_panel_matmul.py:29`) delivers them as a
+batched 2-D SUMMA inside one `shard_map`.
+
+**Interleaved panels.** Panel $j$ takes the same $w$ local columns
+$[jw,(j+1)w)$ of every owner block, the global set
+$K^{(j)} = \{\,i k_\ell + jw + t : 0 \le i < p,\ 0 \le t < w\,\}$. One
+`all_gather` of $A$'s slice over `y` and one of $B$'s over `x` give rank
+$(x,y)$ both $A_q[M_x,K^{(j)}]$ and $B_q[K^{(j)},N_y]$ in the same column
+order, so the tile is a sum of local GEMMs with no reduction after it:
 
 $$
-C_q = \sum_j A_q[:,K_j]\; B_q[K_j,:] ,
+C_q[M_x,N_y] = \sum_{j=0}^{n_p-1} A_q[M_x,K^{(j)}]\; B_q[K^{(j)},N_y] .
 \tag{D 1}
 $$
 
-`distrib_la.panel_matmul` (`services/distrib_la/src/distrib_la/_panel_matmul.py:29`)
-evaluates (D 1) as a batched 2-D SUMMA inside one `shard_map`. Each panel
-takes $w$ local columns of every owner block, so one `all_gather` per operand
-carries $pw \le k/p$ columns for every $q$ of the stack at once, and the local
-GEMM multiplies the whole stack. The next panel is gathered while the current
-one is multiplied, so two panels are live:
+Every $q$ of the stack rides in each exchange and in each local GEMM: one
+collective per panel, not per $q$. The next panel is gathered while the
+current one is multiplied, so two panels are live:
 
 $$
 \text{panel bytes per device} = s\,B\,2pw\,\Big(\frac{m}{p} + \frac{n}{p}\Big)
-\le \texttt{panel\_bytes},
+\le \texttt{panel\_bytes} .
 \tag{D 2}
 $$
 
-and no device ever holds a contraction-complete row or column. Flops per
-device are $8Bmnk/P$; the exchanges are $O(sB(m+n)k/p)$ per device. With
-`bounds`, each panel's local GEMM runs only over the row's live contraction
-interval, so dead bands cost no flops; `weights` scale each $A$ panel on its
-way into the gather; `partner=True` returns $\bar A\,\mathrm{diag}(w)\,\bar B$
-from the same exchange. Compiled with XLA's latency-hiding scheduler, the panel
-gathers run beside the local GEMMs.
+The width also obeys $pw \le k_\ell$, so a gathered panel never exceeds one
+owner block and no device holds a contraction-complete row or column. With
+$w_{\max}$ the largest width that meets both bounds, the panel count is
+$n_p = \lceil k_\ell / w_{\max} \rceil$ and the width is the even split
+$w = \lceil k_\ell / n_p \rceil$ (`_interleaved_width`, `_panel_matmul.py:121`).
+Since $pw \le k_\ell$, $n_p \ge p$. Flops per device are $8Bmnk/P$; the
+exchanges are $O(sB(m+n)k/p)$ per device.
+
+### The panel loop {#the-panel-loop}
+
+**Zero-padded K.** The split leaves $d = n_p w - k_\ell$ columns,
+$0 \le d < \min(w, n_p)$, by which the last panel would run past its block.
+Its window is held at $[k_\ell - w, k_\ell)$ instead. The first $d$ columns of
+that window were panel $n_p - 2$'s, and they are zeroed in $A$'s slice before
+the gather (`gather`, `_panel_matmul.py:255`). Each block is therefore read as
+$n_p w$ columns, $d$ of them inert zeros: $k$ is padded to a whole number of
+panels without a padded copy of any tile, and the padding is less than one
+panel. A zero column adds an exact zero, so (D 1) changes only in summation
+order. On CPU host meshes (2×2 and 4×4, 1 to 9 panels, every operand option),
+105 of 144 products equal main's bit for bit, and the rest agree to
+$2.7\cdot10^{-16}$ relative (claim 4110).
+
+**One scan.** A prologue gathers panels 0 and 1 and multiplies panel 0 into a
+fresh output tile, so no zero fill runs. One `lax.scan` then gathers panel
+$j+1$ and multiplies panel $j$ at each step. An epilogue multiplies the last
+panel, which has nothing left to prefetch (`_panel_matmul.py:300`). Every step
+has the same shapes, so the compiled per-device program is the same for every
+$n_p \ge 4$, and so for every mesh from 4×4 up. The mesh enters only through
+the trip count, the tile shapes and the replica groups. A loop whose last panel
+had another width would carry a fourth product site, with its own slices and
+GEMM, whenever $w \nmid k_\ell$. That depends on the mesh, since
+$k_\ell = k/p$. Optimized HLO instructions, CPU host meshes, compile only,
+CrI3 24×24 P64 sector shapes (claim 4110):
+
+| program | 2×2 / 4×4 / 8×8, last panel narrower | 2×2 / 4×4 / 8×8, one scan |
+|---|---|---|
+| one product, the CT pencil's $(W_{TC}Q_C)^\dagger Q_T$: $q = 4$, $k = 4992$, $m = 18432$, $n = 24576$ | 151 / 151 / 131 | 143 / 143 / 143 |
+| one product, $(4, 17408, 17408) \cdot (4, 17408, 4992)$ | 113 / 113 / 128 | 125 / 125 / 125 |
+| CT keep stage (face GEMMs and their glue) | 2014 / 2014 / 2308 | 2134 / 2134 / 2134 |
+| CT output stage | 488 / 488 / 560 | 524 / 524 / 524 |
+
+The scan's fixed cost is about 12 instructions per product: the zero mask and
+the held offset. A face program that still grows with the mesh grows outside
+its products ([what GSPMD emits](#what-gspmd-emits)). On the XLA route (CPU),
+a narrower last panel also left one accumulation unfused beside the running
+sum. The uniform loop removes it: the CT keep stage's compiled temporaries at
+8×8 go from 8.37 to 6.23 GB, and the CT pencil's at 2×2 from 88.5 to 67.8 GB
+(claim 4110).
+
+**Accumulation.** With `bounds`, or with three or more panels, every panel
+after the first adds into the output tile in place through the local
+`beta = 1` GEMM (on CUDA `lorrax_cublas_local_active_range_gemm`, or its
+prepared target over every column when there are no bounds;
+`_panel_contraction`, `_panel_matmul.py:133`). A two-panel product without
+bounds stays on XLA. XLA folds one straight-line `c + a @ b` into its GEMM, but
+of two adjacent ones it leaves one as a separate add that holds two more output
+tiles. The 3-panel scan has one trip and is inlined, which makes two adjacent
+ones; this is why three panels already take the in-place GEMM.
+
+**Options.** With `bounds`, each panel's local GEMM runs only over the row's
+live contraction interval, so dead bands cost no flops. `weights` scale each
+$A$ slice on its way into the gather. `partner=True` returns
+$\bar A\,\mathrm{diag}(w)\,\bar B$ from the same exchange. A transposed operand
+crosses the grid diagonal in one `ppermute` and is transposed locally
+([API](../services/distrib_la/api.md#bounded-face-products)). Face programs
+compile with XLA's latency-hiding scheduler (`FACE_COMPILER_OPTIONS`,
+`src/gw/shared_pole_execution.py:264`), which runs the prefetched gather beside
+the local GEMM.
 
 `panel_matmul` is the only distributed GEMM: every `matmul` request runs it on
 every platform. On the CrI3 24×24 sector shapes at P64 it runs 2.3–4.2× faster
@@ -166,9 +239,11 @@ equal peak memory to the band gather it replaced (claim 2949).
 
 **Whole rows per device.** When the factors of $W_q = b_q\,\mathrm{diag}(w_q)\,c_q^\dagger$
 already sit in the batch layout, `batch_gram`
-(`services/distrib_la/src/distrib_la/_panel_matmul.py:169`) contracts each device's
-own rows locally, and only $W$ moves, batch to face. The shared-pole Σ uses it
-when the replicated pole columns do not fit and whole parents do
+(`services/distrib_la/src/distrib_la/_panel_matmul.py:167`) contracts each
+device's own rows with the same local active-range GEMM (`_panel_contraction`),
+and only $W$ moves, batch to face. It has no panel loop: the contraction axis is
+whole on each device. The shared-pole Σ uses it when the replicated pole
+columns do not fit and whole parents do
 ([shared-pole model §8](shared_pole_model.md)).
 
 ## 4 The eigh routes {#eigh-routes}
