@@ -233,7 +233,8 @@ the window executables. The session lives in
 the rule of [self-consistency §4](../self_consistency.md#sigma-grid-and-quadrature).
 
 **Map 0** is served by the ordinary one-shot rules, so SC map 0 equals the
-one-shot calculation bit for bit. In the same parallel planning pass (§10)
+one-shot calculation bit for bit when no W-active state is semicore
+([self-consistency §2](../self_consistency.md#2-band-treatment)). In the same parallel planning pass (§10)
 the planner certifies one held rule per product window on a padded box over
 the map-0 grid (`sigma_box_plan._sc_padded_box_spec`):
 

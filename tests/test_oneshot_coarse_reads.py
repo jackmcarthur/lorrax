@@ -9,7 +9,8 @@ under the valence (the 4 eV gap rule), so every level below -5.3 is coarse.
    it, so the requested coarse state (-13.6) keeps its deck-eta read.
 2. Every coarse state outside the requested set has its Z stencil inside a coarse
    window below the near grid; the requested coarse state is in no window.
-3. Without a coarse state outside the requested set the support is the plain plan.
+3. Without a coarse state outside the requested set the support is the plain plan,
+   and a deck lo:hi:eta window refuses (GATE sigma_coarse_window).
 """
 from types import SimpleNamespace
 
@@ -44,3 +45,13 @@ def test_no_off_request_coarse_state_keeps_the_plain_plan():
     near, _ = plan_support_ev(SIGMA, DECK, energy, requested)
     assert windows == ()
     np.testing.assert_array_equal(grid, near)
+
+
+def test_a_user_coarse_window_without_off_request_coarse_states_refuses():
+    import pytest
+    from gw.qp_support import oneshot_support_ev
+    sigma = SimpleNamespace(omega_step_ev=0.25, coarse_windows_ev=lambda: ((-16.0, -11.0, 1.0),))
+    energy = np.array([[-13.6, -5.3, -2.0, -0.6, 0.6, 3.0]])
+    requested = np.ones(energy.shape, dtype=bool)
+    with pytest.raises(ValueError, match="GATE sigma_coarse_window"):
+        oneshot_support_ev(sigma, DECK, energy, requested, energy < -5.35)

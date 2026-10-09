@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-09 — the one-shot reads deep semicore states on the coarse windows, not at Σ(ω = 0)
+
+A dynamic one-shot now builds the coarse (semicore) class as an SC run does
+(`gw_init.coarse_class_for_deck`). A coarse state outside the requested set,
+that is deeper than the W model's 15 eV active depth, reads its own Σ(E) on
+SC map 0's coarse windows (η_semi = 5 eV) instead of Σ(ω = 0). Requested
+states, including a requested coarse state, keep the near grid, which is
+unchanged (`qp_support.oneshot_support_ev`). On AgI 6³ with
+`number_bands_protected = 64` (P4) the Ag 4s, Ag 4p and I 4d eqp0 move by
++4.1 to +8.0 eV, to within 0.5–2.2 eV of a converged deck-η read (Σ(0) was
+4.6–10.2 eV from it), and eqp within 10 eV of midgap moves by at most
+0.28 meV. The Σ sweep takes 98 more τ pairs there (485 → 583). The one-shot no
+longer warns that those states use Σ(ω = 0). A `sigma_omega_patches_ev`
+`lo:hi:eta` triple now also serves a one-shot, and it refuses
+(`GATE sigma_coarse_window`) when no coarse state lies outside the requested
+set. No deck change. The physics is in
+[self-consistency §2](docs/self_consistency.md#2-band-treatment).
+
 ## 2026-10-09 — `linalg` is the only dense-layout dial; the ζ stamp drops `distributed_lu`
 
 `exciton_bands` and `htransform` no longer take `--eigh-backend` or
