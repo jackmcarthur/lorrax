@@ -43,6 +43,122 @@ def _adjoint(a):
     return jnp.conj(jnp.swapaxes(a, -1, -2))
 
 
+# ---- the tile-interleaved block order of a face pencil ----
+#
+# A pencil axis is a run of logical blocks: the originals and mirrors of the finite
+# states, then the k0 and k1 infinity directions; or the w and v halves of the paired
+# basis. On a p x p face a matrix holds each axis in the tile-interleaved order: the
+# axis block of rank row (or column) b is [piece b of block 1 | piece b of block 2 | ...],
+# piece b being the block's b-th 1/p. Joining or splitting logical blocks along an axis
+# is then every rank's own concatenation or slice of its tiles, and no byte moves; the
+# paired-basis congruence pairs columns that sit on the same rank. With whole matrices
+# (p = 1) the order is the plain concatenation, so one set of equations serves the
+# q-local and the face routes. Every logical block is a multiple of p (round_tables
+# rounds the extent to the carrier grain; the infinity width is a port carrier).
+# Replicated per-column vectors (nodes, masks, inverse nodes) follow the same order
+# (``join_vectors``, ``split_vectors``); a round's host tables enter it once
+# (``interleave_tables``).
+
+
+def tile_count(matrix_sharding):
+    """p of the tile-interleaved order: 1 for whole matrices, the face's mesh side otherwise."""
+    return 1 if matrix_sharding is None else int(matrix_sharding.mesh.shape['y'])
+
+
+def on_tiles(fn, matrix_sharding, arrays, *, rows=(), cols=(), outputs=1):
+    """``fn(*tiles, *row_pieces, *column_pieces)`` on every rank's tiles of face matrices
+    [b, R, C]; ``rows``/``cols`` are replicated per-row/per-column vectors [b, R] / [b, C],
+    each rank receiving its own pieces. Returns ``outputs`` face matrices."""
+    from jax import shard_map
+    from jax.sharding import PartitionSpec as P
+    face, row, col = P(None, 'x', 'y'), P(None, 'x'), P(None, 'y')
+    specs = (face,) * len(arrays) + (row,) * len(rows) + (col,) * len(cols)
+    out = face if outputs == 1 else (face,) * outputs
+    return shard_map(fn, mesh=matrix_sharding.mesh, in_specs=specs, out_specs=out,
+                     check_vma=False)(*arrays, *rows, *cols)
+
+
+def tile_join(arrays, axis, matrix_sharding):
+    """Join matrix blocks along ``axis`` (-1 columns, -2 rows) in the tile-interleaved order:
+    each rank concatenates its own tiles. Whole matrices: the plain concatenation."""
+    if matrix_sharding is None:
+        return jnp.concatenate(arrays, axis=axis)
+    return on_tiles(lambda *t: jnp.concatenate(t, axis=axis), matrix_sharding, arrays)
+
+
+def tile_split(a, sizes, axis, matrix_sharding):
+    """The inverse of ``tile_join``: ``a``'s logical blocks of ``sizes`` along ``axis``."""
+    import numpy as np
+    p = tile_count(matrix_sharding)
+    edges = np.concatenate(([0], np.cumsum([int(s) // p for s in sizes])))
+
+    def pieces(t):
+        return tuple(jax.lax.slice_in_dim(t, int(lo), int(hi), axis=axis) for lo, hi in zip(edges[:-1], edges[1:]))
+    if matrix_sharding is None:
+        return pieces(a)
+    return on_tiles(pieces, matrix_sharding, (a,), outputs=len(sizes))
+
+
+def tile_adjoint(a, matrix_sharding):
+    """``a^H`` of a face matrix: the tile at the mirrored grid position, conjugate-transposed.
+    On the square mesh that is one ``ppermute`` across the grid's diagonal (the tiles keep the
+    tile-interleaved order, which rows and columns share)."""
+    if matrix_sharding is None:
+        return _adjoint(a)
+    p = tile_count(matrix_sharding)
+    across = tuple((x * p + y, y * p + x) for x in range(p) for y in range(p))
+    return on_tiles(lambda t: _adjoint(jax.lax.ppermute(t, ('x', 'y'), perm=across)), matrix_sharding, (a,))
+
+
+def tile_hermitian(a, matrix_sharding):
+    """``(a + a^H) / 2`` on the face (``distrib_la.hermitian_part``'s arithmetic)."""
+    if matrix_sharding is None:
+        return hermitian_part(a)
+    return (a + tile_adjoint(a, matrix_sharding)) * 0.5
+
+
+def tile_block(rows, matrix_sharding):
+    """The block matrix ``[[A, B, ...], [C, D, ...], ...]`` in the tile-interleaved order."""
+    return tile_join([tile_join(row, -1, matrix_sharding) for row in rows], -2, matrix_sharding)
+
+
+def join_vectors(vectors, p):
+    """Replicated per-column vectors [..., s_i] joined in the tile-interleaved order of ``p``."""
+    xp = jnp if any(isinstance(v, jax.Array) or isinstance(v, jax.core.Tracer) for v in vectors) else __import__('numpy')
+    if p == 1:
+        return xp.concatenate(vectors, axis=-1)
+    lead = vectors[0].shape[:-1]
+    parts = [v.reshape(*lead, p, v.shape[-1] // p) for v in vectors]
+    return xp.concatenate(parts, axis=-1).reshape(*lead, -1)
+
+
+def split_vectors(v, sizes, p):
+    """The inverse of ``join_vectors``: ``v``'s logical blocks of ``sizes``."""
+    import numpy as np
+    edges = np.concatenate(([0], np.cumsum([int(s) // p for s in sizes])))
+    lead = v.shape[:-1]
+    pieces = v.reshape(*lead, p, v.shape[-1] // p)
+    return tuple(pieces[..., int(lo):int(hi)].reshape(*lead, -1) for lo, hi in zip(edges[:-1], edges[1:]))
+
+
+def interleave_tables(tables, p):
+    """A round's ordered column tables (``round_tables``) in the face's tile-interleaved
+    pencil order: ``order`` and ``points`` [P, F] are the originals and mirrors of the finite
+    states (F/2 each), ``active`` [P, side] those and then the k0 and k1 infinity blocks."""
+    if p == 1:
+        return tables
+    order, active = tables['order'], tables['active']
+    half, n_inf = order.shape[-1] // 2, (active.shape[-1] - order.shape[-1]) // 2
+    if half % p or n_inf % p:
+        raise ValueError(f"GATE shared_pole_tile_order: got: finite half {half} and infinity width {n_inf}; "
+                         f"want: multiples of the mesh side {p}; why: each rank's tile holds 1/p of every block")
+    out = dict(tables)
+    for key in ('order', 'points'):
+        out[key] = join_vectors(split_vectors(tables[key], (half, half), 1), p)
+    out['active'] = join_vectors(split_vectors(active, (half, half, n_inf, n_inf), 1), p)
+    return out
+
+
 def _scale_rows(s, g):
     return s[:, None, :] * g
 
@@ -156,7 +272,8 @@ def ordered_infinity_pencil_column(finite, infinity, *, matmul, matrix_sharding=
     with physical z-moments Wc(z) = sum_n 2 M_n z^-(n+1); M0 and M2 are odd
     under time reversal. States are k0 = s3 C^H Q and k1 = s3 M s3 C^H Q.
     Returns G/H infinity-finite rows [b,2r,R], the [b,2r,2r] infinity
-    blocks and the outputs C k [b,n,2r]. No full moment matrix is retained.
+    blocks and the outputs C k [b,n,2r], the k0 and k1 blocks joined in the
+    tile-interleaved order of ``matrix_sharding``. No full moment matrix is retained.
     """
     z, q, output = finite
     qi, m0qi, m1qi, m2qi, m3qi = infinity
@@ -164,15 +281,13 @@ def ordered_infinity_pencil_column(finite, infinity, *, matmul, matrix_sharding=
     fi = matmul(qi, output, transa="C")
     q0 = 2 * matmul(m0qi, q, transa="C")
     q1 = 2 * matmul(m1qi, q, transa="C")
-    g = jnp.concatenate((fi, fi * z - q0), axis=-2)
-    h = jnp.concatenate((fi * z - q0, fi * z * z - q0 * z - q1), axis=-2)
+    ms = matrix_sharding
+    g = tile_join((fi, fi * z - q0), -2, ms)
+    h = tile_join((fi * z - q0, fi * z * z - q0 * z - q1), -2, ms)
     p0, p1, p2, p3 = (2 * matmul(qi, m, transa="C") for m in (m0qi, m1qi, m2qi, m3qi))
-    gii = jnp.concatenate((jnp.concatenate((p0, p1), axis=-1),
-                           jnp.concatenate((p1, p2), axis=-1)), axis=-2)
-    hii = jnp.concatenate((jnp.concatenate((p1, p2), axis=-1),
-                           jnp.concatenate((p2, p3), axis=-1)), axis=-2)
-    return tuple(_matrix_layout(a, matrix_sharding) for a in
-                 (g, h, gii, hii, 2 * jnp.concatenate((m0qi, m1qi), axis=-1)))
+    gii = tile_block(((p0, p1), (p1, p2)), ms)
+    hii = tile_block(((p1, p2), (p2, p3)), ms)
+    return tuple(_matrix_layout(a, ms) for a in (g, h, gii, hii, 2 * tile_join((m0qi, m1qi), -1, ms)))
 
 
 def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul, matrix_sharding=None):
@@ -185,7 +300,9 @@ def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul, matrix_shar
     exact for the linear pencil (z s3 - M) as written. ``infinity`` is None for
     a finite-state bank, else the five panels of
     ``ordered_infinity_pencil_column``. Returns Hermitian G, H, O and the
-    finite nodes z [b,R_finite] that the paired reduction needs.
+    finite nodes z [b,R_finite] that the paired reduction needs, in the
+    tile-interleaved order of ``matrix_sharding`` (whole matrices: finite columns,
+    then k0, then k1).
     """
     q = jnp.concatenate([state[1] for state in states], axis=-1)
     output = jnp.concatenate([state[2] for state in states], axis=-1)
@@ -197,12 +314,13 @@ def assemble_ordered_shared_pole_pencil(states, infinity, *, matmul, matrix_shar
     finite = (z, q, output)
     g, h = finite_pencil_column(finite, (z, q, output, derivative), matmul=matmul, matrix_sharding=matrix_sharding)
     del derivative
-    # Pinned to the face: eager concatenation with the adjoint (y/x) infinity rows and
-    # eager a + a^H return a replicated [b,side,side] G and H resident on every rank.
+    # The finite and infinity blocks join on every rank's own tiles (the infinity rows'
+    # adjoint is one exchange across the grid's diagonal), so no rank holds more than its tile.
+    ms = matrix_sharding
     if infinity is not None:
-        gi, hi, gii, hii, oi = ordered_infinity_pencil_column(finite, infinity, matmul=matmul, matrix_sharding=matrix_sharding)
-        g, h = hermitian_block(g, gi, gii), hermitian_block(h, hi, hii)
+        gi, hi, gii, hii, oi = ordered_infinity_pencil_column(finite, infinity, matmul=matmul, matrix_sharding=ms)
+        g = tile_block(((g, tile_adjoint(gi, ms)), (gi, gii)), ms)
+        h = tile_block(((h, tile_adjoint(hi, ms)), (hi, hii)), ms)
         del gi, hi, gii, hii
-        output = join_columns(output, oi)
-    return (*(_matrix_layout(a, matrix_sharding) for a in
-              (hermitian_part(g), hermitian_part(h), output)), z)
+        output = tile_join((output, oi), -1, ms)
+    return (*(_matrix_layout(a, ms) for a in (tile_hermitian(g, ms), tile_hermitian(h, ms), output)), z)
