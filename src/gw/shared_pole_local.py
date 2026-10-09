@@ -378,15 +378,15 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
     def scatter(acc, panel, dest):
         return jax.vmap(lambda a, p, d: a.at[:, d].set(p, mode='drop'))(acc, panel, dest)
 
-    group = range(PACK_GROUP)
+    def joined(tiles, dest):
+        # The group's columns side by side, [B, rows, G r], and their destinations [B, G r]:
+        # one scatter per field and call.
+        g, b, rows, r = tiles.shape
+        return jnp.moveaxis(tiles, 0, 2).reshape(b, rows, g * r), dest.reshape(b, g * r)
+
     if layout == 'batch':
         def body(accs, panels, dest):
-            out = []
-            for acc, members in zip(accs, panels):
-                for i in group:
-                    acc = scatter(acc, members[i], dest[:, i])
-                out.append(acc)
-            return tuple(out)
+            return tuple(scatter(acc, *joined(jnp.stack(members), dest)) for acc, members in zip(accs, panels))
         specs = ((P(BATCH),) * len(shapes), ((P(BATCH),) * PACK_GROUP,) * len(shapes), P(BATCH))
         out = (P(BATCH),) * len(shapes)
     else:
@@ -400,9 +400,7 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
                 # Face tiles -> slabs: split the rows over y, join the column blocks in y order.
                 if py > 1:
                     tiles = jax.lax.all_to_all(tiles, 'y', split_axis=2, concat_axis=3, tiled=True)
-                for i in group:
-                    acc = scatter(acc, tiles[i], dest[:, i])
-                out.append(acc)
+                out.append(scatter(acc, *joined(tiles, dest)))
             return tuple(out)
         slab = P(None, BATCH, None)
         specs = ((slab,) * len(shapes), ((P(None, 'x', 'y'),) * PACK_GROUP,) * len(shapes), P())
