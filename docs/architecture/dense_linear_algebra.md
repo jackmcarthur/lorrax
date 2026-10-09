@@ -106,7 +106,7 @@ slab exchanges and route (c). The rest GSPMD inserted. The census below covers
 the staged sector programs at CrI3 24×24 P64 shapes: TT side 25856, $n_{TT}$ 4992,
 stage width 4; CT joint side 17408, stage width 4. They were compiled on CPU
 host meshes. Bytes are received per device per execution, with in-loop
-collectives weighted by their trip counts (claim FACEMAP-1).
+collectives weighted by their trip counts (claim 4104).
 
 | program | optimized ops (2×2 → 8×8) | GSPMD collectives at 8×8 | GB/device at 8×8, GSPMD vs explicit |
 |---|---|---|---|
