@@ -5,6 +5,18 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-09 — the memory rule's φ is stated as what it covers; `XlaGpuMemoryEnv.peak_note` goes
+
+`φ` (`runtime.POOL_OVERSHOOT`, 0.19) is the fraction by which the pool's in-use
+bytes may run above the planner budget: peaks the planners under-price, and free
+space trapped between live buffers. The pool's reserved bytes can also rise past its
+reservation for an instant, when a request meets only frees still pending on XLA's
+stream; that excess takes the card's free memory until the next stream synchronize
+and is not in `φ` (`docs/architecture/memory-model.md#pool-growth`). The start-up
+warning for a `memory_per_device_gb` above the rule now says what the margin covers
+instead of quoting reserved high-water marks. `runtime.xla_memory.XlaGpuMemoryEnv`
+loses its `peak_note` field, which nothing read. No result moves; no deck change.
+
 ## 2026-10-09 — `linalg` is the only dense-layout dial; the ζ stamp drops `distributed_lu`
 
 `exciton_bands` and `htransform` no longer take `--eigh-backend` or

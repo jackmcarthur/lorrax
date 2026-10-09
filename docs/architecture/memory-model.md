@@ -29,20 +29,53 @@ All arrays are complex128 (16 B) unless stated.
 
 ## Budget
 
-One memory rule sets the budget on every vendor and card size. With `M` the
-card total (`cuDeviceTotalMem`) and `O` the bytes outside the XLA pool,
+Every planner prices its stage against one number per device, the budget `B`
+(`common.gpu_utils.device_budget_bytes`, `src/common/gpu_utils.py:71`). One
+rule sets `B` from two quantities known before the deck is read: `M`, the
+card total (`cuDeviceTotalMem`, `runtime.xla_memory.cuda_device_total_bytes`,
+`src/runtime/xla_memory.py:101`), and `O`, the bytes the process holds
+outside XLA's memory pool. This section defines the pool, states the rule,
+explains why the pool's reserved bytes can run past its reservation, and
+says which part of that the rule has to price.
+
+### The pool {#pool}
+
+On CUDA, XLA takes every device buffer of every program from the CUDA
+driver's default memory pool, through the stream-ordered allocator
+(`cuda_async`): the arrays a program returns, and one buffer per executable
+that holds all its temporaries. FFI handlers that call `cudaMallocAsync`
+draw from the same pool. The variables that select this allocator, and what
+jaxlib builds from them, are in
+[environment § GPU pool](../environment/overview.md#gpu-pool). Two counts
+describe the pool at a time `t`:
 
 ```text
-B = (M − 1.2·O) / (1 + 1.2·φ)     the planner budget (runtime.planner_budget_bytes)
-R = M − 1.2·O_max                 the XLA pool's reservation (runtime.pool_fraction)
+U(t)   bytes in use: allocated and not yet freed        (CU_MEMPOOL_ATTR_USED_MEM_CURRENT)
+V(t)   bytes reserved: device memory the pool maps      (CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)
 ```
 
-`O` is 3 GB (the CUDA context and modules, XLA's NCCL communicators, cuFFT
-plans), plus 3 GB under `linalg = distributed` for the cuSOLVERMp/cuBLASMp
-contexts, their communicators and workspace (`O_max` = 6 GB). `φ` = 0.19 is
-how far the pool grows past the budget it was planned to: allocator slack
-(reserved but unused bytes) and peaks the planners under-price. Both are the
-largest measured at P4 and P64 (sandbox claim 3978); 1.2 is the margin.
+`V − U` is free space inside the pool. At start-up XLA allocates and frees
+one block of `R` bytes, so `V = R` before the first program runs. It also sets
+the pool's release threshold to `R`: at a stream synchronize the driver
+unmaps free pool memory only above `R`. Everything else the process holds
+is outside the pool, `O(t)`: the CUDA context and modules, the NCCL
+communicators, cuFFT plans, and the cuSOLVERMp contexts and their workspace.
+The card's free bytes are `F(t) = M − O(t) − V(t)`.
+
+### The rule {#rule}
+
+```text
+B = (M − 1.2·O) / (1 + 1.2·φ)     the planner budget   (runtime.planner_budget_bytes, src/runtime/__init__.py:789)
+R = M − 1.2·O_max                 the pool's reservation (runtime.pool_reservation_bytes, :797; runtime.pool_fraction = R/M)
+```
+
+`O` is 3 GB (`OUTSIDE_POOL_BYTES`), plus 3 GB under `linalg = distributed`
+for the cuSOLVERMp/cuBLASMp contexts, their communicators and workspace
+(`DISTRIBUTED_LINALG_OUTSIDE_BYTES`; `O_max` = 6 GB). `φ` = 0.19
+(`POOL_OVERSHOOT`, `:779`) is the fraction by which the pool's in-use bytes
+`U` may run above the budget the planners priced: peaks they under-price,
+and free space trapped between live buffers ([§ what φ covers](#what-phi-covers)).
+1.2 is the margin (`MEMORY_MARGIN`). `B` is at most `R` and at least `M/4`.
 
 | card | M | R | B, linalg local | B, linalg distributed |
 |---|---|---|---|---|
@@ -50,28 +83,151 @@ largest measured at P4 and P64 (sandbox claim 3978); 1.2 is the margin.
 | A100-80GB | 85.1 GB | 77.9 GB (0.915) | 66.4 GB | 63.4 GB |
 
 The pool is reserved before the deck is read, so `R` leaves room for
-`O_max`; the reservation is not a cap, and the pool may grow past it. The
-rule reads only `M` and the deck's resolved `linalg`, so it is the same on
-every rank and every run. A positive `memory_per_device_gb` is used as given,
-an informed choice: above `B` it warns once at start-up with both numbers and
-the measured overshoot (the pool grew 15 % past a 72 GB budget at P64 on
-CrI3 24×24 and left 4 MB free; route (c) for that deck's TT reduced eigh
-needs 68.5 GB), and below `B` it is used silently. The rule is the minimum
-over processes (`common.gpu_utils.resolve_device_budget_gb`), because static tile shapes
-must agree on every process. On CPU the same rule takes `M` as the node's
-`MemTotal` over the processes on the node, and a process's devices share
-its budget.
+`O_max` whatever the deck's `linalg`. The reservation is not a cap: the pool
+may map more than `R` ([§ growth](#pool-growth)). The rule reads only `M`
+and the deck's resolved `linalg`, so it is the same on every rank and every
+run. A positive `memory_per_device_gb` is used as given: above `B` it warns
+once at start-up with both numbers; below `B` it is used silently. The rule
+is the minimum over processes (`common.gpu_utils.resolve_device_budget_gb`,
+`src/common/gpu_utils.py:45`), because static tile shapes must agree on every
+process. On CPU the same rule takes `M` as the node's `MemTotal` over the
+processes on the node, and a process's devices share its budget.
 
 Every driver's architecture section prints the rule and the bytes already
 outside the pool after the communicator warm-up, the maximum over ranks
-(`runtime.xla_memory.outside_pool_bytes`), with a warning when they exceed
-0.75 of `M − R`. Nothing is sized from that reading.
+(`runtime.xla_memory.outside_pool_bytes`, `src/runtime/xla_memory.py:119`),
+with a warning when they exceed 0.75 of `M − R`. Nothing is sized from that
+reading.
 
 Every planner reads the one number `common.gpu_utils.device_budget_bytes()`,
 which the config sets when the deck resolves. kmeans, htransform, bse and
 exciton_bands have no deck key; their planners read the same owner, which
 resolves the rule on its first call. No planner reads `bytes_limit`, free
 memory or a fragmentation factor.
+
+### Why the pool's reserved bytes run past R {#pool-growth}
+
+XLA's allocator issues `cuMemAllocFromPoolAsync` and `cuMemFreeAsync` on one
+compute stream, so a free takes effect when the device reaches it in stream
+order. JAX dispatches asynchronously: the host enqueues program `k+1`, and
+with it `k+1`'s allocations, while the device still runs program `k`, so
+`k`'s frees are still pending when `k+1` allocates. Without mapping memory,
+the driver serves a request from
+
+1. free space whose frees have completed, coalesced across adjacent blocks; or
+2. a block, or adjacent blocks, whose frees are pending on the same stream.
+
+It does not join a pending block to completed free space. A request larger
+than every extent of either kind maps new memory, and `V` rises past `R`:
+
+- if the card has room, `V` stays above `R` until the next synchronize trims
+  the pool back to its threshold;
+- if not, the attempt maps what is free, so `F` falls to zero, and then fails.
+  XLA's allocator synchronizes its stream and retries once
+  (`xla/stream_executor/gpu/gpu_cudamallocasync_allocator.cc`, `AllocateRaw`).
+  By then the frees have completed and coalesced, and the retry is served
+  inside `R`.
+
+Either way the excess lasts until the next synchronize. A driver-level test
+of the default pool on one A100-80GB shows each rule (reservation
+`T` = 38.29 GB filled and freed once, as XLA does; `⟨claim MEM40-a⟩`):
+
+| case | frees before the request | request | `V` after | outcome |
+|---|---|---|---|---|
+| A | one 0.6·T block, completed | 0.5·T | T | served from the freed block |
+| B | two adjacent 0.3·T blocks, pending | 0.58·T | T | served from the two pending blocks |
+| C | one 0.6·T block pending, beside the never-used 0.4·T | 0.8·T | 1.4·T (53.62 GB) | the pool grows by 0.4·T |
+| C, synchronized first | the same, completed | 0.8·T | T | served from the coalesced 1.0·T |
+| D | C with 2 GB free on the card | 0.8·T | high-water T + 1.98 GB, then T | fails; served inside T after a synchronize and retry |
+| E | 12 programs, each one kept 0.04·T output and one 0.5·T temporary, host ahead | — | high-water T + 1.54 GB | live set at most 0.62·T |
+| E, synchronized each step | the same | — | T | no growth |
+
+An A100-40GB gives the same cases at `T` = 19.08 GB on every rank (C grows
+by 0.4·T; D reaches T + 1.98 GB, fails, and is served inside T on the retry).
+
+The production traces show the same signature (sampler readings every
+0.25–0.5 s; `CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH` catches what happens between
+readings):
+
+- CrI3 6×6 bispinor SC, P4, A100-40GB, budget 31.6 GB (`⟨claim MEM40-b⟩`): at
+  the end of the ζ stage, `U` = 24.99 GB in `V` = 35.20 GB. Before the next
+  reading, the reserved high-water rose by 5.13 GB, which was all the free
+  memory on the card (`F` = 5.14 GB). `U` fell to 1.92 GB as the next
+  stage began, and `V` read 35.20 GB again at the next sample.
+- The same deck on A100-80GB, budget 66.4 GB: the high-water rose by 5.10 GB,
+  again all the card's free memory, with 44.55 GB in use and 33 GB free
+  inside the pool.
+- CrI3 24×24 bispinor, P64, A100-80GB, deck 72 GB (claim 4084): the reserved
+  high-water reached 82.88 GB against 63.46 GB in use, with 4 MB free on the
+  card, 7.1–7.25 GB past `R` on every rank.
+
+So the reserved high-water minus the bytes in use is not a property of the
+program. Whenever one such request occurs it reads "the card was full", at any
+budget.
+
+### What φ covers {#what-phi-covers}
+
+The transient growth needs no room in the budget for XLA's own allocations:
+the request that triggers it is served inside `R` after the synchronize, or
+from the card's free memory until the next one. An allocation outside the
+pool made while the pool is grown can find the card full. The driver gives
+such an allocation idle pool memory on demand, but not a block whose free
+has not completed ([environment § GPU pool](../environment/overview.md#gpu-pool)),
+which is why a library workspace belongs inside the pool rather than in a
+`cudaMalloc` of its own. Two things do need room in the budget, and `φ`
+covers them:
+
+- **in-use bytes above the budget**, `U_peak / B − 1`: peaks the planners
+  under-price. Measured: Ni 20³ bispinor P64, A100-80GB, deck 72 GB:
+  76.15 GB in the Σ τ sweep (+5.8 %, `⟨claim MEM40-b⟩`); CrI3 24×24 bispinor
+  P64, deck 72 GB: 69.33 GB (−3.7 %, claim 4084); CrI3 6×6 bispinor SC P4:
+  25.21 GB of 31.6 GB on A100-40GB and 44.76 GB of 66.4 GB on A100-80GB
+  (`⟨claim MEM40-b⟩`).
+- **free space between live buffers** that no request can use even after a
+  synchronize. One case is measured. A CrI3 6×6 bispinor one-shot with 2634
+  current points (P4, A100-80GB, deck budget 68.16 GB) was refused a 1.82 GB
+  eigh scratch request while 4.65 GiB of its 70.53 GiB pool was free and
+  18.5 MB was free on the card (claim 3315): 6.6 % of the pool.
+
+With φ = 0.19 the rule leaves `1.2·φ·B` = 7.2 GB above the budget on A100-40GB
+and 15.1 GB on A100-80GB for these two terms.
+
+### The allocator {#allocator}
+
+`cuda_async` with its pool reserved is the one allocator configuration
+([environment § GPU pool](../environment/overview.md#gpu-pool)). The
+alternatives jaxlib offers were measured on CrI3 6×6 bispinor SC maps 0–2
+at P4, cold, at the rule's budget (`⟨claim MEM40-c⟩`). "Peak in use" is
+XLA's `peak_bytes_in_use`; "high-water" is the pool's reserved high-water
+under `cuda_async` and the arena's under BFC.
+
+| card | allocator | peak in use | high-water | W per map (s) | run (s) |
+|---|---|---|---|---|---|
+| A100-40GB | `cuda_async`, reserved at `R` = 35.20 GB | 25.21 GB | 40.40 GB, the card full for an instant | 199.3 / 112.3 / 63.2 | 670.3 |
+| A100-40GB | BFC, preallocated at `R` | 25.22 GB | 35.20 GB, 5.12 GB always free | 200.3 / 112.5 / 63.2 | 670.8 |
+| A100-80GB | `cuda_async`, reserved at `R` = 77.89 GB | 44.76 GB | 83.01 GB, the card full for an instant | 197.7 / 124.1 / 60.4 | 688.8 |
+| A100-80GB | BFC, preallocated at `R` | 44.77 GB | 77.89 GB, 5.12 GB always free | 204.7 / 110.6 / 64.5 | 672.1 |
+| A100-80GB | BFC, growing (no preallocation) | 44.78 GB | 63.82 GB in map 0 | 195.4 (map 0) | — |
+
+eqp is identical under BFC and `cuda_async` (1288 of 1288 rows, maps 0–2,
+both cards). BFC preallocated at `R` never grows past `R`, so it removes the
+transient at no measured cost in time. It still loses three things the
+policy keeps:
+
+- the [per-stage receipt](#the-per-stage-receipt): BFC keeps no resettable
+  in-use mark, so every stage reads the run's high-water (25.22 GB at every
+  stage of the A100-40GB run, against stage peaks of 0.22–25.21 GB under
+  `cuda_async`);
+- one pool for XLA and the FFI: an FFI `cudaMallocAsync` draws from the CUDA
+  pool outside BFC's arena, so it adds to `O`;
+- room for a request that does not fit: a fixed arena refuses it, where the
+  CUDA pool borrows free card memory until the next synchronize.
+
+A growing BFC arena holds 19.0 GB (42 %) more than its peak in use, and an
+unreserved `cuda_async` pool stalls 25–110 ms at every launch
+([environment § GPU pool](../environment/overview.md#gpu-pool)).
+
+### Streamed loops take a fixed tile {#fixed-tile}
 
 **Streamed loops take a fixed tile, not the budget.** A loop that streams over
 k, q, bands, centroids, samples or rows takes the most units whose per-rank

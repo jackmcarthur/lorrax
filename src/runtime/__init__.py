@@ -764,9 +764,13 @@ def set_default_env(*, platform: str = "gpu") -> None:
 #:
 #: ``O`` is 3 GB (the CUDA context and modules, XLA's NCCL communicators, cuFFT
 #: plans), plus :data:`DISTRIBUTED_LINALG_OUTSIDE_BYTES` under ``linalg =
-#: distributed``.  ``phi`` = 0.19 is how far the pool grows past the budget it
-#: was planned to: allocator slack (reserved but unused bytes) and peaks the
-#: planners under-price.  The pool is reserved before the deck is read, so
+#: distributed``.  ``phi`` = 0.19 is how far the pool's in-use bytes may run
+#: above the budget: peaks the planners under-price, and free space trapped
+#: between live buffers.  The pool's reserved bytes can also rise past ``R``
+#: for an instant, when a request meets only frees still pending on the
+#: stream; that borrows the card's free memory until XLA's next stream
+#: synchronize and is not in ``phi`` (docs/architecture/memory-model.md
+#: #pool-growth).  The pool is reserved before the deck is read, so
 #: ``R`` leaves room for the larger ``O``; the reservation is not a cap.  Both
 #: read only ``M`` and the deck's resolved ``linalg``: the same on every rank
 #: and every run.
