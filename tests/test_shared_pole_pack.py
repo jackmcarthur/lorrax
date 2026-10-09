@@ -81,3 +81,16 @@ def test_more_panels_reuse_every_program():
             assert np.array_equal(np.asarray(g), _reference(field, tables["order"]))
     # The extent is held by the sector alone, so the round programs see one shape.
     assert len(set(shapes)) == 1, shapes
+
+
+def test_the_extent_tiles_the_mesh():
+    """A capacity off the carrier grain (a panel wider than its carrier, here 5 columns) with a
+    selection whose carrier passes it still gives an extent on the grain, so the face's
+    column blocks tile every y rank."""
+    import math
+    from gw.shared_pole_local import round_tables
+    ladder = lambda w: 0 if int(w) == 0 else 4 * 2 ** max(0, math.ceil(math.log2(int(w) / 4)))
+    counts = np.array([[8, 4, 8, 4]] * 2)                 # carriers 8 + 4 = 12 -> 16 > capacity 13
+    tables = round_tables(counts, [8, 5, 8, 5], [0j] * 4, [0, 0], 0, column_extent=ladder,
+                          ordered=True, odd_moments=False)
+    assert tables["order"].shape[-1] == 2 * 16 and tables["active"].sum(axis=1).tolist() == [24, 24]

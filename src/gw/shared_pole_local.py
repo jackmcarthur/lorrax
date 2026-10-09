@@ -252,6 +252,10 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     selected = max(int(carriers[:, list(half)].sum(axis=1).max()) for half in halves)
     # Never below the selection: an extent function may saturate on a sum.
     extent = min(capacity, max(selected, column_extent(selected)))
+    # The extent tiles the mesh as every carrier does (a face column block per y rank):
+    # rounded up to the smallest carrier, a no-op whenever the panels sit on carriers.
+    grain = max(1, int(column_extent(1)))
+    extent = -(-extent // grain) * grain
     if key is not None:
         if history is None:
             raise ValueError("round_tables: a grow-only extent needs the model's carrier history")
@@ -395,7 +399,9 @@ def _pack_finish(mesh_xy, layout, slots, extent, shapes):
         return lambda accs: accs
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
     if extent % py:
-        raise ValueError(f"pack_panels: the extent {extent} must tile the {py} y ranks of the face")
+        # round_tables rounds every extent to the smallest carrier, which tiles the mesh.
+        raise ValueError(f"pack_panels: the extent {extent} must tile the {py} y ranks of the face; "
+                         "build the tables with the face's column_extent (round_tables)")
 
     def body(accs):
         out = []
