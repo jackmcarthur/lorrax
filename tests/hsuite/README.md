@@ -135,10 +135,12 @@ on every rank:
   A warm run still traces and lowers every program. Only programs that carry
   a host callback compile again, because JAX never stores them (`uncacheable`
   below).
-- **The mathdx cubin store** (`kconv_mathdx/`, `ffi.fft.cubin_cache_dir`).
-  NVRTC builds each k-convolution kernel the first time a process meets its
+- **The mathdx cubin cache** (`kconv_mathdx/`, `ffi.fft.cubin_cache_dir`).
+  A release links its prebuilt kernels into it from `<source root>/cubin_store`
+  ([kconv §14](../../docs/architecture/kconv.md#build-and-cache)). NVRTC builds
+  any other k-convolution kernel the first time a process meets its
   (mode, k-grid, components) shape, at about 7 s per kernel. The two fixtures
-  need 25 kernels. The store's path is a string attribute of every mathdx
+  need 25 kernels. The cache's path is a string attribute of every mathdx
   custom call, so it is part of those programs' JAX cache keys. A run is
   therefore warm only under the `SCRATCH` of the run that filled the JAX
   cache.
