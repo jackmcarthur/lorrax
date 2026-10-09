@@ -88,7 +88,7 @@ def run_cases(mesh, kg=(3, 2, 2), arm=None, skip=()):
     import jax.numpy as jnp
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     from ffi import fft as F
 
     rng = np.random.default_rng(20261008)

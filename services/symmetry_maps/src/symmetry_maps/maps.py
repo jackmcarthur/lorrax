@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from lxkit import device_put_process_local
 from ._compat import deprecated_alias
 from .directed_edges import apply_band_matrix_symmetry
-from ._shard_map import shard_map
+from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 

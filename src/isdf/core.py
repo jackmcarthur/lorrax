@@ -7,7 +7,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from common.shard_map import shard_map
+from jax import shard_map
 
 from common import rank_criterion
 from common import spectral_closure

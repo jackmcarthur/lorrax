@@ -64,7 +64,7 @@ def _round_kernels(mesh, layout="batch"):
     are replicated.
     """
     from types import SimpleNamespace
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     from gw.shared_pole_execution import face_program, face_matmul
     from gw.shared_pole_local import _mm as _local_product

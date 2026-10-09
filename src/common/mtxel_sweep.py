@@ -1637,7 +1637,7 @@ def sweep_matrix_elements(
     _dft_psi_sphere`` has the evidence).  The loader shards a window as it
     reads it, at exactly this sweep's carrier.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     mesh = geom.mesh
     nk = geom.nk

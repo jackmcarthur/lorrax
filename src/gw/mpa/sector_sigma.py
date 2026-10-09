@@ -863,7 +863,7 @@ def _unfold_w_rows(W, Wt, tables, rows, mesh_xy):
     at the full-q rows ``rows`` only (the service's reference unfold, on each rank's
     tiles).  Every per-q table is cut to those rows, so no full-q tile is formed."""
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
-    from common.shard_map import shard_map
+    from jax import shard_map
     rows = np.asarray(rows, np.int64)
     tables = tables._replace(
         row=tables.row[rows], trs=tables.trs[rows], lsrc=tables.lsrc[rows],

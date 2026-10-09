@@ -29,7 +29,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from distrib_la import loader
 from distrib_la._collectives import broadcast_bytes
 from distrib_la._shape import ipiv_local_len
-from distrib_la._shard_map import shard_map
+from jax import shard_map
 from distrib_la.resolve import mesh_key
 
 __all__ = [

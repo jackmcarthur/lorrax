@@ -515,7 +515,7 @@ def project_little_group_operator(
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from ._shard_map import shard_map
+    from jax import shard_map
     from .maps import (_apply_unfold_phase_and_trs_local,
                        _permute_isdf_operator_axes_local,
                        certify_endpoint_locality)

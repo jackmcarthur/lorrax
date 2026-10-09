@@ -152,7 +152,7 @@ def _sharded_fit_kernel(mesh_xy, n_p, rcond, solve, ordered=False):
     from jax import lax
     from jax.sharding import PartitionSpec as P
 
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     row_axes = ("x", "y")
     block_spec = P(None, None, row_axes, None)

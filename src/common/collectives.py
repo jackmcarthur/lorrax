@@ -658,7 +658,7 @@ def transpose_xy(x, mesh):
         return jnp.swapaxes(x, -1, -2)
     if x.dtype == jnp.bool_:          # collectives move bytes, not predicates
         return transpose_xy(x.astype(jnp.uint8), mesh).astype(jnp.bool_)
-    from common.shard_map import shard_map
+    from jax import shard_map
     p = int(mesh.shape["x"])
     if int(mesh.shape["y"]) != p:
         raise ValueError(f"transpose_xy: mesh {dict(mesh.shape)} is not square")
@@ -771,7 +771,7 @@ def _psum_kernel(ndim: int, mesh):
     from functools import partial
 
     import jax
-    from common.shard_map import shard_map
+    from jax import shard_map
     from jax.sharding import PartitionSpec as P
 
     key = (int(ndim), id(mesh))
@@ -1400,7 +1400,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     import jax.numpy as jnp
     from jax import lax
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
     if jax.process_count() <= 1:
         return 0.0
     key = (tuple(int(d.id) for d in mesh.devices.ravel()),

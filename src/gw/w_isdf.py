@@ -1683,7 +1683,7 @@ def _get_chi_fractional_contour_kernel_face(
 def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
                           n_rmu_logical: int | None = None):
     """W = (I - V χ)⁻¹ V via q-parallel shard_map; see docs/theory/bispinor-gw.md#dyson."""
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
     if n_log > int(n_rmu):
@@ -1829,7 +1829,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
-    from common.shard_map import shard_map
+    from jax import shard_map
     from ffi import _services
     _services.ensure_on_path()
     from distrib_la import plan as linalg_plan
@@ -3579,7 +3579,7 @@ def _get_chi_fractional_q_kernel_face(
     caller then passes the ``-q`` row's ``k-q`` map (the ``k+q`` map) as
     ``kminq_idx`` (:func:`_fractional_pair_scan_face`).
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     from common.wfn_layout import psi_specs
     PSI_NMU_SPEC, PSI_MUN_SPEC = psi_specs(layout)
 

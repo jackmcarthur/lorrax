@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.shard_map import shard_map
+from jax import shard_map
 from common.fft_helpers import local_fftn3
 from common.wfn_transforms import _plane_geometry
 from runtime.padding import axis_mask, pad_to_axis, padded_axis

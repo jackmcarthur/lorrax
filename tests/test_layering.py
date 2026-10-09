@@ -128,24 +128,7 @@ _L3_MODULES = frozenset({
     # movement primitives.  Named, owned patterns — NOT generic ``shard_map``
     # wrappers, which is a refusal recorded in docs/architecture/layers.md.
     "common.contract_bands", "common.staged_reshard", "common.sharding_fit",
-    # jax glue and instrumentation.  ``common.shard_map`` is a VERSION SHIM,
-    # not the generic wrapper layers.md rule 2 forbids -- it selects a symbol
-    # and a kwarg spelling and forwards in_specs/out_specs untouched; see its
-    # docstring.  It is L3 because L3 kernels (fft_helpers, ffi.*, file_io)
-    # import it.
-    #
-    # ``common.vma`` is its twin and was left unclassified when it landed
-    # (``agent/vma-pvary-marking``), so the default put a jax version shim at
-    # **L1 -- physics**, the most permissive level there is.  Its own
-    # docstring names the relation: ``common.shard_map`` "owns the
-    # symbol-and-kwarg decision the way this module owns the marking
-    # decision".  Its whole subject is MESH AXES and per-device variation --
-    # L3's declared vocabulary -- and it contains no mathematics at all,
-    # which is what separates L3 from L2.  Naming it here is a TIGHTENING:
-    # at L1 it could import anything in the tree; at L3 it may import
-    # nothing above the substrate, and today it imports nothing from
-    # ``src/`` at all.
-    "common.shard_map", "common.vma",
+    # jax glue and instrumentation.
     "common.jax_compile_cache", "common.jax_profile", "common.timing",
     "common.progress", "common.gpu_utils", "common.async_io", "common.sanity",
     # FFT kernels

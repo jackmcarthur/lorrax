@@ -46,7 +46,7 @@ from common.fft_helpers import (
     make_flat_k_ifftn,
     make_local_flat_k_fftn,
 )
-from common.shard_map import shard_map
+from jax import shard_map
 from common.staged_reshard import concatenate_sharded_axis, face_to_batch_reshard
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact

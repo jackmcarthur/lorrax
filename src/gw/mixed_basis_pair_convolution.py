@@ -125,7 +125,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import local_fftn3, local_ifftn3
 from common.fourier_plan import LocalFourierPlan
-from common.shard_map import shard_map
+from jax import shard_map
 from runtime.padding import padded_axis
 
 __all__ = ["SphereSet", "SphereTransport", "PairOperand", "ColumnWedge", "MixedBasisPairConvolution",

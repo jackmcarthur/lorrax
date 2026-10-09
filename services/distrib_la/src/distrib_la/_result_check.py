@@ -205,7 +205,7 @@ def _all_ranks(flag, mesh):
     """
     if mesh is None:
         return flag
-    from distrib_la._shard_map import shard_map
+    from jax import shard_map
     axes = tuple(mesh.axis_names)
     reduce = shard_map(lambda f: jax.lax.pmin(f.astype(jnp.int32), axes), mesh=mesh,
                        in_specs=P(), out_specs=P(), check_vma=False)

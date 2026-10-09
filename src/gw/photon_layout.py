@@ -190,7 +190,7 @@ def _insert_program(layout, mesh_xy, nq, p_left, p_right, add=False):
            int(p_left), int(p_right), bool(add))
     if key in _insert_cache:
         return _insert_cache[key]
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     side = layout.mesh_side
     spec = P(None, 'x', 'y')
@@ -293,7 +293,7 @@ def pack_photon_faces(faces, layout, mesh_xy, *, orientation, wfn_layout="face")
 @lru_cache(maxsize=None)
 def _face_packer(layout, mesh_xy, orientation, wfn_layout):
     """The jitted four-channel face pack of :func:`pack_photon_faces`, once per configuration."""
-    from common.shard_map import shard_map
+    from jax import shard_map
     from common.wfn_layout import psi_specs
 
     nmu_spec, mun_spec = psi_specs(wfn_layout)
@@ -326,7 +326,7 @@ def _view_program(layout, mesh_xy, nq, p_left, p_right):
            int(p_left), int(p_right))
     if key in _view_cache:
         return _view_cache[key]
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     side = layout.mesh_side
     spec = P(None, 'x', 'y')
@@ -441,7 +441,7 @@ def _vector_pack_program(layout, mesh_xy, nq, dtype, axis_name):
     key = (_mesh_key(mesh_xy), padded, int(nq), np.dtype(dtype).str, axis_name)
     if key in _vector_pack_cache:
         return _vector_pack_cache[key]
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     side = layout.mesh_side
     vector_spec = P(None, axis_name)
@@ -585,7 +585,7 @@ def _q0_update_program(layout, mesh_xy, nq, dtype, factor_ndim=2):
            np.dtype(dtype).str, factor_ndim)
     if key in _q0_update_cache:
         return _q0_update_cache[key]
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     packed_spec = P(None, 'x', 'y')
     left_spec = P(*((None,) * (factor_ndim - 1)), 'x')
@@ -702,7 +702,7 @@ def _q0_block_program(mesh_xy, p_left, p_right, dtype, n_pairs):
            int(n_pairs))
     if key in _q0_block_cache:
         return _q0_block_cache[key]
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     side = int(mesh_xy.shape["x"])
     left_spec = P(None, "x")

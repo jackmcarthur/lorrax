@@ -32,7 +32,7 @@ from jax import lax
 from jax.experimental import io_callback
 from jax.sharding import Mesh, PartitionSpec
 
-from common.shard_map import shard_map
+from jax import shard_map
 
 
 __all__ = [

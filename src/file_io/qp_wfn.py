@@ -1049,7 +1049,7 @@ def _qp_rotation_kernel(mesh, band_start: int, band_stop: int):
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     spec = P(None, None, tuple(mesh.axis_names), None)
 

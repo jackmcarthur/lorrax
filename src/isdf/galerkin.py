@@ -29,7 +29,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local
 from common.psi_G_store import build_psi_G_store
 from common.pivoted_cholesky import make_sharded_pivoted_cholesky_select
-from common.shard_map import shard_map
+from jax import shard_map
 from common.sharding_fit import fit_sharding as _fit
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import (

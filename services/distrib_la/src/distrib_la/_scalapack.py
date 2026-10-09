@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 
-from distrib_la._shard_map import shard_map
+from jax import shard_map
 from distrib_la._shape import ipiv_local_len
 from distrib_la._slate import (_mesh_key, ensure_registered,
                                context_key, validate_mesh)

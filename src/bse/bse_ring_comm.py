@@ -11,12 +11,12 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from common.shard_map import shard_map as _shard_map_fn
+from jax import shard_map as _shard_map_fn
 
 from common.collectives import prepare_mesh, resolve_mesh
 from common.contract_bands import contract_bands_block_reshard
 from common.fft_helpers import make_kconv_kminor
-from common.vma import mark_varying
+from lxkit import mark_varying
 
 from .bse_preconditioner import exchange_spin_weight
 
@@ -352,8 +352,7 @@ def _ring_perm(axis_size: int) -> tuple[tuple[int, int], ...]:
 # (fori_loop with static bounds lowers to scan, which is why the message says
 # "scan body".)  These shard_maps go through ``jax.shard_map`` with checking
 # ON, so the marking is required; the ``check_vma=False`` shard_maps elsewhere
-# in the tree are exempt.  ``mark_varying`` is the identity on jax 0.5.3, so
-# the production leg is bit-unchanged.  See ``common/vma.py``.
+# in the tree are exempt.  See ``lxkit.mark_varying``.
 #
 # ('x','y') is what jax itself names in the error, and it is what the bodies
 # introduce: the ring buffers come from X (in_spec P(None,'x','y',None)) and

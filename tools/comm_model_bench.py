@@ -26,7 +26,7 @@ def bench():
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from common.shard_map import shard_map
+    from jax import shard_map
 
     mesh = rt.mesh
     px, py = (int(mesh.shape[a]) for a in ("x", "y"))

@@ -320,7 +320,7 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
 @lru_cache(maxsize=8)
 def _tt_only(mesh_xy, width):
     """Zero the charge rows/columns [:width] of each rank's face tile: one program per mesh and width."""
-    from common.shard_map import shard_map
+    from jax import shard_map
     return jax.jit(shard_map(lambda x: x.at[:, :width, :].set(0).at[:, :, :width].set(0),
         mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"), check_vma=False))
 
@@ -766,7 +766,7 @@ def _operator_token(values):
 @lru_cache(maxsize=4)
 def _operator_digest_program(mesh_xy, shape):
     """Σ bits·(2g+1) mod 2^64 over the real and imaginary words at global flat index g."""
-    from common.shard_map import shard_map
+    from jax import shard_map
     nq, n, m = shape
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
 

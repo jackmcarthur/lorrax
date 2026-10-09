@@ -309,7 +309,7 @@ def _shared_pole_panel_realizer(meta, header, q_span, *, mesh_xy, tables=None):
     ``Wt`` on the antiunitary rows.  Endpoint maps that cross a shard refuse
     (the fused load reads only this rank's parent tile).
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     from gw.qgrid_symmetry import shared_pole_operator_realizer
 
     if tables is None:
@@ -394,7 +394,7 @@ def _shared_pole_at_rows(meta, header, rows, *, mesh_xy):
     (:func:`shared_pole_static_wc`); the unfold tables are cut to ``rows``,
     so no full-q W is formed.  The Σ route never calls this.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     from symmetry_maps import unfold_operator_local
 
     nq = int(header["n_q_irr"])

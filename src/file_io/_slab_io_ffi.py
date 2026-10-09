@@ -41,7 +41,7 @@ from typing import Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from common.shard_map import shard_map
+from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import (barrier as _barrier, device_put_process_local,

@@ -224,9 +224,8 @@ in an outer `jit`.
 
 ## Backends
 
-Pure jax and numpy: no vendor library and no `.so`. Mesh-touching paths go
-through the package's private `_shard_map`, which picks `jax.shard_map` or
-`jax.experimental.shard_map` and refuses on a jax with neither. Host operands
+Pure jax and numpy: no vendor library and no `.so`. Mesh-touching paths use
+`jax.shard_map`. Host operands
 take numpy paths; device operands take cached jits with explicit output
 shardings, and a sharded `jax.Array` is never pulled to the host to be
 indexed. The star index tables are `n_k` host integers; the operand

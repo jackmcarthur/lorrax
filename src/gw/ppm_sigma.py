@@ -90,7 +90,7 @@ def band_diagonal_slots(mesh_xy, ndim: int):
     exact zero, so the sum over the last axis is the diagonal bit for bit and
     nothing moves between ranks.  Needs a square processor mesh.
     """
-    from common.shard_map import shard_map
+    from jax import shard_map
     if int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
         raise ValueError("band-diagonal slots need a square processor mesh")
     spec = P(*((None,) * (ndim - 2)), "x", "y")

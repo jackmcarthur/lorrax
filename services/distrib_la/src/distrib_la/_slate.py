@@ -4,7 +4,7 @@ Ported verbatim from LORRAX ``src/ffi/linalg/_slate.py`` at 96a6399 (itself
 the wave-2 merge of the former ``ffi.slate`` package: ``context.py``,
 ``cholesky.py``, ``trsm.py``, ``eigh.py``, ``batched.py``).  Nothing is
 renamed; the only edits are the import lines — ``shard_map`` now comes from
-:mod:`distrib_la._shard_map` and the loader from :mod:`distrib_la.loader`.
+``jax`` and the loader from :mod:`distrib_la.loader`.
 
 Reached only through the facade (:mod:`distrib_la.resolve` /
 :mod:`distrib_la.plan`), which owns the guard table — including bug L-2:
@@ -25,7 +25,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P
 
 from distrib_la import loader
-from distrib_la._shard_map import shard_map
+from jax import shard_map
 from distrib_la.resolve import mesh_key
 
 __all__ = [

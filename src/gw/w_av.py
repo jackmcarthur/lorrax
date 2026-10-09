@@ -17,7 +17,7 @@ import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P
 
 from common.parallel_transport import make_distributed_band_matmul
-from common.shard_map import shard_map
+from jax import shard_map
 
 
 __all__ = [
