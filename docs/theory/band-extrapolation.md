@@ -144,7 +144,7 @@ A β solved per state from the ratio of the two top shell increments reads
 band texture on narrow top shells and amplifies it. Pooling fixes the shape from every requested state
 and leaves each state one amplitude, which the widest shell determines.
 
-## Why β is fixed
+## Why β is fixed {#why-beta-is-fixed}
 
 Until 2026-09-30, β was also searched, on [2, 8] in steps of 0.25. With W
 converged in its own bands the free fit landed on β = 3. With W truncated at
@@ -203,7 +203,7 @@ The pooled form's std moves by at most
 bands.
 
 The measurements in this section used the free (β, Ω) fit. The fixed-β
-numbers at 78 bands are in [Why β is fixed](#why-β-is-fixed). The gap error
+numbers at 78 bands are in [Why β is fixed](#why-beta-is-fixed). The gap error
 (−19 to +19 meV at 78 bands, case a) is not controlled by the fit. One material: Si. At 34 and 50
 bands the default cuts fall inside multiplets on this spectrum and were not
 among the stored samples.

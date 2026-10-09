@@ -213,7 +213,7 @@ The caller selects `batched_route ∈ {'batch_reshard', 'auto'}`;
 `'batch_reshard'` is the default for `plan` and `matmul`. `'auto'` takes (b) when the backend has a stacked entry and (a)
 otherwise. Route (c) is the default because for every matrix that fits one
 device a distributed library's cost is its fixed per-call charge, which the
-local kernel does not pay ([Backends § performance](backends.md#distributed-is-a-capacity-route)).
+local kernel does not pay ([Backends § performance](backends.md#capacity-route)).
 Route and backend are orthogonal: an explicit backend is still resolved and
 probed before (c) runs; `backend='off'` is the provider-free spelling.
 

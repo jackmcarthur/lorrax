@@ -105,9 +105,12 @@ debugging controls.
   `native2d` 5 MB. Its tile decomposition is checked at resolve time.
 - **ROCm is declared, not tested.** The platform key comes from the device
   vendor (`lxkit.device_vendor`: the client's platform and version strings and
-  the device kind), so a ROCm mesh resolves as `rocm`, never as CUDA. LORRAX
-  builds no ROCm library, so `linalg = local` (the XLA plan) runs there and a
-  distributed request refuses.
+  the device kind), so a ROCm mesh resolves as `rocm`, never as CUDA. The
+  table's ROCm entries are the resolution only: `distributed` eigh names
+  SLATE, the one library of the three with a ROCm build, and `distributed` LU
+  has no ROCm library and refuses at guard 1. LORRAX builds no ROCm `.so`, so
+  a SLATE request on ROCm refuses at the capability probe (guard 4). Only
+  `linalg = local` (the XLA plan) runs on ROCm.
 
 ### The guard ladder {#guard-ladder}
 
@@ -239,8 +242,8 @@ environmental.
 
 ## SLATE {#slate}
 
-SLATE serves explicit Cholesky on CPU meshes, and is the declared ROCm
-backend. Its Python wrappers are in `distrib_la._slate` (reached through
+SLATE serves explicit Cholesky on CPU meshes. It is also the library a ROCm
+`distributed` eigh resolves to, which no LORRAX build serves (guard 4). Its Python wrappers are in `distrib_la._slate` (reached through
 `distrib_la.backend_module('slate')`, never imported directly):
 `distributed_cholesky` (`slate::potrf`, returning an opaque lower factor) and
 `distributed_eigh` (`slate::heev`, refused on CPU and above `n = 2048` on
