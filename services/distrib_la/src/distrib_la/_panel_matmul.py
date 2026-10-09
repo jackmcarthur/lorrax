@@ -312,7 +312,8 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
                 ahead = gather(j + 1)
                 return (product(cs, panel, j), ahead), None
 
-            (cs, panel), _ = lax.scan(step, (cs, ahead), jnp.arange(1, n_panel - 1, dtype=jnp.int32))
+            (cs, panel), _ = lax.scan(step, (cs, ahead), jnp.arange(1, n_panel - 1, dtype=jnp.int32),
+                                      unroll=1)
         cs = product(cs, panel, n_panel - 1)
         return cs if partner else cs[0]
 
