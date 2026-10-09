@@ -420,7 +420,11 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     actual side (``face_reduction_bytes``). ``carrier`` is the kept-span width of an
     ordered reduction (``face_ritz_carrier``), None solving the whole H'_vv
     side. A short last round's synthetic slots repeat its last parent
-    (``parent_rounds``); callers read only the leading real slots."""
+    (``parent_rounds``); callers read only the leading real slots. An ordered round's
+    columns enter the tile-interleaved order of the face (``interleave_tables``)."""
+    from gw.shared_pole_pencil import interleave_tables
+    if ordered:
+        tables=interleave_tables(tables,int(mesh.shape['y']))
     side=tables['active'].shape[-1]
     if admit:
         budget.plan(side,phase='reduction')
@@ -791,7 +795,10 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     so after the first stage each entry keeps (node, Q, O) and they are released before
     the eighs. ``eigh_rows(k, plan, stack)`` (optional) is the caller's context that prices
     eigh stack k (its ledger row) while it runs. Returns what ``face_reduce_round`` returns,
-    for every parent of the round."""
+    for every parent of the round, its original-pencil span (``retain_span``) with its rows in
+    the face's tile-interleaved order, as the round's columns enter it (``interleave_tables``)."""
+    from gw.shared_pole_pencil import interleave_tables
+    tables = interleave_tables(tables, int(mesh.shape['y']))
     nq = int(tables['active'].shape[0])
     programs = _stage_programs(mesh, bool(ordered), bool(odd_moments), None if keep_budget is None else int(keep_budget),
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))

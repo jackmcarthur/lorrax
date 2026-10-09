@@ -104,3 +104,4 @@ src/ffi/cpp/build_host_cloud/
 # user builds (config/perlmutter/build_ffi_{cuda,host}.sh, SLATE stage)
 .build/
 src/ffi/cpp/build_host/
+/cubin_store/

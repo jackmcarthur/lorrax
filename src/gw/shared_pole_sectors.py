@@ -10,7 +10,8 @@ neither move an operator to the host nor prescribe a processor mesh.
 from functools import lru_cache
 
 import jax.numpy as jnp
-from gw.shared_pole_pencil import _matrix_layout, _matrix_take_columns, _matrix_concat
+from gw.shared_pole_pencil import (_matrix_layout, _matrix_take_columns, _matrix_concat, tile_adjoint,
+                                   tile_block, tile_join)
 
 
 def _contiguous_q_spans(ids, real):
@@ -1105,6 +1106,7 @@ def _pack_cross_spans(sectors, widths, actions, *, mesh_xy, execution):
     import jax
     from jax.sharding import NamedSharding,PartitionSpec as P
     from gw.shared_pole_local import _batch_put,pack_panels
+    from gw.shared_pole_pencil import interleave_tables
     spans=[]
     for sector,width in zip(sectors,widths):
         # Drop only exactly inactive carrier columns. This is a storage
@@ -1119,8 +1121,11 @@ def _pack_cross_spans(sectors, widths, actions, *, mesh_xy, execution):
         put=(lambda a:jax.make_array_from_callback(a.shape,NamedSharding(mesh_xy,P()),
                                                    lambda index:a[index])) if execution=='face' else (lambda a:_batch_put(mesh_xy,a))
         states=(tuple(s[1] for s in sector['states']),tuple(s[2] for s in sector['states']))
-        order=put(sector['tables']['order']) if execution=='face' else None
-        spans.append((put(sector['tables']['points']),order,states,sector['infinity'],y,signed))
+        # The face span Y has its rows in the face's tile-interleaved order (face_reduce_decoupled),
+        # so the face CT takes the sector's columns in that order too.
+        tables=interleave_tables(sector['tables'],int(mesh_xy.shape['y'])) if execution=='face' else sector['tables']
+        order=put(tables['order']) if execution=='face' else None
+        spans.append((put(tables['points']),order,states,sector['infinity'],y,signed))
     if execution=='face':
         return spans,actions
     packed,cross=[],[]
@@ -1353,8 +1358,8 @@ def _cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding
 
     Each sector is ``(points, Q, WQ, infinity, Y, signed)`` with Q and WQ at its round
     extent, and ``cross`` the TC-on-C output and the CT-on-T output and derivative at the
-    same columns (``_pack_cross_spans``)."""
-    join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
+    same columns (``_pack_cross_spans``). Every block joins in the tile-interleaved order of
+    ``matrix_sharding`` (``shared_pole_pencil.tile_join``), the sectors' own pencil order."""
     (tc,),(ct,dct)=cross
     g,h,otc,oct=ordered_cross_pencil((charge[0],charge[1],charge[3][0]),(transverse[0],transverse[1],transverse[3][0]),
                                      (tc,ct,dct),moments,matmul=mm,matrix_sharding=matrix_sharding)
@@ -1362,7 +1367,7 @@ def _cross_pencil_equations(charge,transverse,cross,moments,*,mm,matrix_sharding
     # infinity columns from the same physical moments already in hand.
     def diagonal(sector):
         _,_,own,infinity,y,signed=sector
-        return _matrix_layout(join((own,2*infinity[1],2*infinity[2]),axis=-1), matrix_sharding)
+        return _matrix_layout(tile_join((own,2*infinity[1],2*infinity[2]),-1,matrix_sharding), matrix_sharding)
     cc=(charge[4],charge[5][1],diagonal(charge),otc)
     tt=(transverse[4],transverse[5][1],diagonal(transverse),oct)
     return joint_sector_pencil(cc,tt,(h,g),matmul=mm,matrix_sharding=matrix_sharding)
@@ -1380,11 +1385,13 @@ def ordered_cross_pencil(charge, transverse, cross_actions, cross_moments, *, ma
     Arrays remain parent-local inside an admitted batched linalg program.
 
     Returns G_CT, H_CT [b,R_C+2r_C,R_T+2r_T] and the full cross output
-    panels O_TC, O_CT. No adjoint symmetry is imposed on a cross tile.
+    panels O_TC, O_CT, each side's finite and infinity blocks joined in the
+    tile-interleaved order of ``matrix_sharding``, the sectors' own pencil
+    order. No adjoint symmetry is imposed on a cross tile.
     """
     from gw.shared_pole_pencil import _finite_column_g
 
-    join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
+    join = lambda arrays, axis: tile_join(arrays, axis, matrix_sharding)
     zc, qc, ic = charge
     zt, qt, it = transverse
     tc, ct, derivative = cross_actions
@@ -1403,8 +1410,7 @@ def ordered_cross_pencil(charge, transverse, cross_actions, cross_moments, *, ma
     top1 = jnp.conj(zc)[:, :, None] * top0 - matmul(qc, mt[0], transa="C")
     top2 = jnp.conj(zc)[:, :, None] * top1 - matmul(qc, mt[1], transa="C")
     p = tuple(matmul(ic, m, transa="C") for m in mt)
-    block = lambda a, b, c, d: join((
-        join((a, b), axis=-1), join((c, d), axis=-1)), axis=-2)
+    block = lambda a, b, c, d: tile_block(((a, b), (c, d)), matrix_sharding)
     g = block(g, join((top0, top1), axis=-1),
               join((bottom0, bottom1), axis=-2), block(p[0], p[1], p[1], p[2]))
     h = block(h, join((top1, top2), axis=-1),
@@ -1473,15 +1479,14 @@ def joint_sector_pencil(charge, transverse, cross, *, matmul, matrix_sharding=No
         Joint definite member, value member, and the two full output
         panels. No Hermitization, clipping or Gram repair is performed.
     """
-    join = lambda arrays, axis: _matrix_concat(arrays, axis, matrix_sharding)
+    ms = matrix_sharding
+    join = lambda arrays, axis: tile_join(arrays, axis, ms)
     yc, vc, oc, tc = charge
     yt, vt, ot, ct = transverse
     project = lambda a: matmul(yc, matmul(a, yt), transa="C")
     metric, value = map(project, cross)
-    adj = lambda a: jnp.conj(jnp.swapaxes(a, -1, -2))
-    block = lambda a, b, d: join((
-        join((a, b), axis=-1),
-        join((adj(b), d), axis=-1)), axis=-2)
+    # The joint basis is the C span, then the T span, in the tile-interleaved order of ``ms``.
+    block = lambda a, b, d: tile_block(((a, b), (tile_adjoint(b, ms), d)), ms)
     # Inactive columns of a batched retained span are exactly zero. Their
     # metric is zero too; assigning them an identity invents latent states.
     ic = jnp.eye(vc.shape[-1], dtype=metric.dtype)[None] * jnp.any(yc != 0, axis=-2)[:, None, :]

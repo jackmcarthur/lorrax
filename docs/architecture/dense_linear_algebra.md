@@ -11,7 +11,7 @@ engine serves each platform, and which stage takes which plan. It ends with
 CrI3 24×24 at P64. The caller contract of every function named here is
 [`distrib_la`'s API](../services/distrib_la/api.md); which library serves which
 request is [its backends page](../services/distrib_la/backends.md). Code is cited
-as `file:line` at `5ca246d5b`; read the file rather than the number.
+as `file:line` at `957446462`; read the file rather than the number.
 
 ## Symbols
 
@@ -81,9 +81,13 @@ first. The inverse exchange returns the face.
 
 **Selections and concatenations.** Taking rows or columns of a face operand
 (selecting directions, sorting poles, assembling unequal blocks) goes through
-the slab: exchange, select or join locally, exchange back
-(`common.staged_reshard`). A sharding constraint on a global `take` can let
-GSPMD gather the operand onto one mesh axis.
+the slab (`_reindex_sharded_axis`, `src/common/staged_reshard.py:649`). The
+blocks' local tiles are joined on the rank. One `all_to_all` moves the join to
+the slab. A static local take (`_block_major_order`, `:737`) puts the joined
+axis in block order and makes any selection. One `all_to_all` returns the face.
+A call therefore makes two exchanges whatever its block count, and joins its
+blocks into one buffer the size of the joined output. A sharding constraint
+on a global `take` can let GSPMD gather the operand onto one mesh axis.
 
 **Placing panels.** The q-local shared-pole round joins $S$ state panels
 $[B, n, r_s]$ and takes each slot's pencil columns from them
@@ -96,67 +100,161 @@ by the panel width and $F$, never by $S$, so a later SC map with more line
 panels makes more calls and no new program. The face programs join and take
 the panels themselves through the slab exchange.
 
+**Tile-interleaved blocks.** When a face matrix's axis is a run of logical
+blocks, each a multiple of $p$, the shared-pole face pencils hold it in the
+tile-interleaved order: rank row (column) $b$ holds the $b$-th $1/p$ of every
+block, in block order ([bispinor sectors §5.2](bispinor_shared_pole_w.md#5-construction),
+equation S 4b). Joining or splitting blocks is then every rank's own
+concatenation or slice of its tiles. The adjoint is the tile at the mirrored
+grid position, one `ppermute` across the grid's diagonal, because rows and
+columns share the order. An eigensolve sees a symmetric permutation $PAP^\mathsf T$
+of the whole-order matrix, so either route returns the same spectrum with
+eigenvectors $Pu$. The tile algebra lives in `src/gw/shared_pole_pencil.py:47`.
+
 ### What GSPMD emits {#what-gspmd-emits}
 
 A face program written in global view (slices, concatenations, `a + a^\dagger`,
 masks on face operands) is partitioned by GSPMD. Its collectives can be read off
 the optimized HLO and split by origin. Those whose `op_name` ends in a JAX
 collective primitive come from `shard_map` regions: `panel_matmul`'s SUMMA, the
-slab exchanges and route (c). The rest GSPMD inserted. The census below covers
-the staged sector programs at CrI3 24×24 P64 shapes: TT side 25856, $n_{TT}$ 4992,
-stage width 4; CT joint side 17408, stage width 4. They were compiled on CPU
-host meshes. Bytes are received per device per execution, with in-loop
-collectives weighted by their trip counts (claim 4104).
+slab exchanges, the tile algebra and route (c). The rest GSPMD inserted. The
+census below covers the staged sector programs at CrI3 24×24 P64 shapes: TT side
+25856, $n_{TT}$ 4992, stage width 4; CT joint side 17408, stage width 4. They were
+compiled on CPU host meshes. Bytes are received per device per execution, with
+in-loop collectives weighted by their trip counts (claim 4121).
 
-| program | optimized ops (2×2 → 8×8) | GSPMD collectives at 8×8 | GB/device at 8×8, GSPMD vs explicit |
+| program | optimized ops (2×2 / 4×4 / 8×8) | GSPMD collectives at 8×8 | GB/device at 8×8, GSPMD vs explicit |
 |---|---|---|---|
-| TT stage 1 (members) | 9328 → 31394 | 299 all-to-all, 154 collective-permute (45 at 2×2), 8 other | 19.0 vs 6.7 |
-| TT stages 2–4 | 4017 → 5034, 2208 → 2964, 3973 → 5855 | 43, 17, 56 | 3.5, 1.7, 2.3 vs 34.2, 49.0, 13.8 |
-| CT pencil | 15495 → 37743 | 3 | 0.15 vs 37.3 |
+| TT stage 1 (members) | 6523 / 9391 / 16739 | 235 (the same on every mesh) | 1.3 vs 8.1 |
+| TT stage 2 | 3612 / 3612 / 3537 | 16 | 0.29 vs 35.2 |
+| TT stage 3 | 1964 / 1964 / 1964 | 6 | 0.0 vs 49.7 |
+| TT stage 4 | 3621 / 3783 / 4199 | 31 | 0.38 vs 13.8 |
+| CT pencil (claim 4124) | 5147 / 5903 / 7419 | 1 | 0.0 vs 32.3 |
 
-What the attribution of stage 1 shows:
-- Every state panel joined inside the program costs its own small all-to-all
-  (219 of them, 0.7 GB), and the program depends on the panel count: twelve
-  more line panels grow stage 1 to 33662 operations and the CT pencil to 41775
-  at 8×8.
-- Most of the bytes GSPMD moves in stage 1 are the pencil's block joins
-  (`hermitian_block`, `join_columns` at the $F$ and $2 i_S$ offsets: 76
-  all-to-alls, 7.2 GB) and the paired-basis slices at the half-extent
-  offsets, which are not tile-aligned (138 collective-permutes, 8.1 GB).
-- The CT pencil's collectives are all explicit. Its growth with the mesh is its
-  per-panel joins (607 all-to-alls) and `panel_matmul`'s own panel structure:
-  the panel count and the narrower tail panel follow $n/p$.
+What remains outside the tile algebra:
+- **Stage 1's panel join.** It joins every state panel inside the program, at one
+  small all-to-all each (219 of them, 0.7 GB), so the program follows the panel
+  count and its operation count follows the mesh.
+- **The finite block's transpose:** one collective-permute, 0.6 GB in stage 1.
+- **Stage 2's eigenvector slice** `u[..., -width:]`: 9 collective-permutes, 0.29 GB.
+- **Stage 4's pad** of the model columns to the pencil side: 15
+  collective-permutes, 0.37 GB.
+- **The CT pencil's collectives are all explicit.** Each of its joins is two
+  exchanges (`src/common/staged_reshard.py:721,725`), 28 `all_to_all`s in the
+  pencil at 8×8. On the CPU host mesh XLA lowers each `all_to_all` as $p$
+  per-peer slices, with the producers fused into every slice. So the pencil
+  still grows with the mesh, by 2272 operations from 2×2 to 8×8. Of these, 1722
+  sit at the return exchange (`:725`), whose producer is the block-order take.
+  A GPU compile of one ten-panel join at 2×2 holds no per-peer slices
+  (claim 4124). `panel_matmul`'s own program is flat in the mesh (§3, claim 4110).
 
 ## 3 The distributed product: SUMMA and `batch_gram`
 
-A face product $C_q = A_q B_q$, with $A_q$ of shape $(m,k)$ and $B_q$ of shape
-$(k,n)$ for every $q$ of a stack, is the sum over contraction panels $K_j$,
+A face product forms $C_q = A_q B_q$ for every $q$ of a stack of $B$ matrices,
+with $A_q$ of shape $(m,k)$, $B_q$ of shape $(k,n)$, and all three on the face.
+On the $p \times p$ mesh write $k_\ell = k/p$ for the contraction columns of
+one owner block, and $M_x$, $K_y$, $N_y$ for the $x$-th or $y$-th block of the
+row, contraction and column ranges ($m/p$, $k_\ell$ and $n/p$ indices). Rank
+$(x,y)$ holds $A_q[M_x,K_y]$ and $B_q[K_x,N_y]$, and its output tile
+$C_q[M_x,N_y]$ needs the $A$ blocks of its mesh row and the $B$ blocks of its
+mesh column. `distrib_la.panel_matmul`
+(`services/distrib_la/src/distrib_la/_panel_matmul.py:29`) delivers them as a
+batched 2-D SUMMA inside one `shard_map`.
+
+**Interleaved panels.** Panel $j$ takes the same $w$ local columns
+$[jw,(j+1)w)$ of every owner block, the global set
+$K^{(j)} = \{\,i k_\ell + jw + t : 0 \le i < p,\ 0 \le t < w\,\}$. One
+`all_gather` of $A$'s slice over `y` and one of $B$'s over `x` give rank
+$(x,y)$ both $A_q[M_x,K^{(j)}]$ and $B_q[K^{(j)},N_y]$ in the same column
+order, so the tile is a sum of local GEMMs with no reduction after it:
 
 $$
-C_q = \sum_j A_q[:,K_j]\; B_q[K_j,:] ,
+C_q[M_x,N_y] = \sum_{j=0}^{n_p-1} A_q[M_x,K^{(j)}]\; B_q[K^{(j)},N_y] .
 \tag{D 1}
 $$
 
-`distrib_la.panel_matmul` (`services/distrib_la/src/distrib_la/_panel_matmul.py:29`)
-evaluates (D 1) as a batched 2-D SUMMA inside one `shard_map`. Each panel
-takes $w$ local columns of every owner block, so one `all_gather` per operand
-carries $pw \le k/p$ columns for every $q$ of the stack at once, and the local
-GEMM multiplies the whole stack. The next panel is gathered while the current
-one is multiplied, so two panels are live:
+Every $q$ of the stack rides in each exchange and in each local GEMM: one
+collective per panel, not per $q$. The next panel is gathered while the
+current one is multiplied, so two panels are live:
 
 $$
 \text{panel bytes per device} = s\,B\,2pw\,\Big(\frac{m}{p} + \frac{n}{p}\Big)
-\le \texttt{panel\_bytes},
+\le \texttt{panel\_bytes} .
 \tag{D 2}
 $$
 
-and no device ever holds a contraction-complete row or column. Flops per
-device are $8Bmnk/P$; the exchanges are $O(sB(m+n)k/p)$ per device. With
-`bounds`, each panel's local GEMM runs only over the row's live contraction
-interval, so dead bands cost no flops; `weights` scale each $A$ panel on its
-way into the gather; `partner=True` returns $\bar A\,\mathrm{diag}(w)\,\bar B$
-from the same exchange. Compiled with XLA's latency-hiding scheduler, the panel
-gathers run beside the local GEMMs.
+The width also obeys $pw \le k_\ell$, so a gathered panel never exceeds one
+owner block and no device holds a contraction-complete row or column. With
+$w_{\max}$ the largest width that meets both bounds, the panel count is
+$n_p = \lceil k_\ell / w_{\max} \rceil$ and the width is the even split
+$w = \lceil k_\ell / n_p \rceil$ (`_interleaved_width`, `_panel_matmul.py:121`).
+Since $pw \le k_\ell$, $n_p \ge p$. Flops per device are $8Bmnk/P$; the
+exchanges are $O(sB(m+n)k/p)$ per device.
+
+### The panel loop {#the-panel-loop}
+
+**Zero-padded K.** The split leaves $d = n_p w - k_\ell$ columns,
+$0 \le d < \min(w, n_p)$, by which the last panel would run past its block.
+Its window is held at $[k_\ell - w, k_\ell)$ instead. The first $d$ columns of
+that window were panel $n_p - 2$'s, and they are zeroed in $A$'s slice before
+the gather (`gather`, `_panel_matmul.py:255`). Each block is therefore read as
+$n_p w$ columns, $d$ of them inert zeros: $k$ is padded to a whole number of
+panels without a padded copy of any tile, and the padding is less than one
+panel. A zero column adds an exact zero, so (D 1) changes only in summation
+order. On CPU host meshes (2×2 and 4×4, 1 to 9 panels, every operand option),
+105 of 144 products equal main's bit for bit, and the rest agree to
+$2.7\cdot10^{-16}$ relative (claim 4110).
+
+**One scan.** A prologue gathers panels 0 and 1 and multiplies panel 0 into a
+fresh output tile, so no zero fill runs. One `lax.scan` then gathers panel
+$j+1$ and multiplies panel $j$ at each step. An epilogue multiplies the last
+panel, which has nothing left to prefetch (`_panel_matmul.py:300`). Every step
+has the same shapes, so the compiled per-device program is the same for every
+$n_p \ge 4$, and so for every mesh from 4×4 up. The mesh enters only through
+the trip count, the tile shapes and the replica groups. A loop whose last panel
+had another width would carry a fourth product site, with its own slices and
+GEMM, whenever $w \nmid k_\ell$. That depends on the mesh, since
+$k_\ell = k/p$. Optimized HLO instructions, CPU host meshes, compile only,
+CrI3 24×24 P64 sector shapes (claim 4110):
+
+| program | 2×2 / 4×4 / 8×8, last panel narrower | 2×2 / 4×4 / 8×8, one scan |
+|---|---|---|
+| one product, the CT pencil's $(W_{TC}Q_C)^\dagger Q_T$: $q = 4$, $k = 4992$, $m = 18432$, $n = 24576$ | 151 / 151 / 131 | 143 / 143 / 143 |
+| one product, $(4, 17408, 17408) \cdot (4, 17408, 4992)$ | 113 / 113 / 128 | 125 / 125 / 125 |
+| CT keep stage (face GEMMs and their glue) | 2014 / 2014 / 2308 | 2134 / 2134 / 2134 |
+| CT output stage | 488 / 488 / 560 | 524 / 524 / 524 |
+
+The scan's fixed cost is about 12 instructions per product: the zero mask and
+the held offset. A face program that still grows with the mesh grows outside
+its products ([what GSPMD emits](#what-gspmd-emits)). On the XLA route (CPU),
+a narrower last panel also left one accumulation unfused beside the running
+sum. The uniform loop removes it: the CT keep stage's compiled temporaries at
+8×8 go from 8.37 to 6.23 GB, and the CT pencil's at 2×2 from 88.5 to 67.8 GB
+(claim 4110).
+On CUDA the in-place GEMM already absorbed that accumulation. On the CrI3 6×6
+bispinor SC deck at P4 (forced face route, maps 0–2), the uniform loop moves
+$E_{\rm QP}$ by at most 0.001 µeV against main. The warm map-2 sector walls
+and the run peak (25.21 GB) are unchanged (claim 4111).
+
+**Accumulation.** With `bounds`, or with three or more panels, every panel
+after the first adds into the output tile in place through the local
+`beta = 1` GEMM (on CUDA `lorrax_cublas_local_active_range_gemm`, or its
+prepared target over every column when there are no bounds;
+`_panel_contraction`, `_panel_matmul.py:133`). A two-panel product without
+bounds stays on XLA. XLA folds one straight-line `c + a @ b` into its GEMM, but
+of two adjacent ones it leaves one as a separate add that holds two more output
+tiles. The 3-panel scan has one trip and is inlined, which makes two adjacent
+ones; this is why three panels already take the in-place GEMM.
+
+**Options.** With `bounds`, each panel's local GEMM runs only over the row's
+live contraction interval, so dead bands cost no flops. `weights` scale each
+$A$ slice on its way into the gather. `partner=True` returns
+$\bar A\,\mathrm{diag}(w)\,\bar B$ from the same exchange. A transposed operand
+crosses the grid diagonal in one `ppermute` and is transposed locally
+([API](../services/distrib_la/api.md#bounded-face-products)). Face programs
+compile with XLA's latency-hiding scheduler (`FACE_COMPILER_OPTIONS`,
+`src/gw/shared_pole_execution.py:264`), which runs the prefetched gather beside
+the local GEMM.
 
 `panel_matmul` is the only distributed GEMM: every `matmul` request runs it on
 every platform. On the CrI3 24×24 sector shapes at P64 it runs 2.3–4.2× faster
@@ -166,9 +264,11 @@ equal peak memory to the band gather it replaced (claim 2949).
 
 **Whole rows per device.** When the factors of $W_q = b_q\,\mathrm{diag}(w_q)\,c_q^\dagger$
 already sit in the batch layout, `batch_gram`
-(`services/distrib_la/src/distrib_la/_panel_matmul.py:169`) contracts each device's
-own rows locally, and only $W$ moves, batch to face. The shared-pole Σ uses it
-when the replicated pole columns do not fit and whole parents do
+(`services/distrib_la/src/distrib_la/_panel_matmul.py:167`) contracts each
+device's own rows with the same local active-range GEMM (`_panel_contraction`),
+and only $W$ moves, batch to face. It has no panel loop: the contraction axis is
+whole on each device. The shared-pole Σ uses it when the replicated pole
+columns do not fit and whole parents do
 ([shared-pole model §8](shared_pole_model.md)).
 
 ## 4 The eigh routes {#eigh-routes}
@@ -207,7 +307,7 @@ $$
 
 the boundary being the arrays live beside that eigh; otherwise the whole mesh,
 with one warning. The shared-pole sectors decide each stack so
-(`staged_eigh`, `src/gw/shared_pole_execution.py:678`); a caller that passes a
+(`staged_eigh`, `src/gw/shared_pole_execution.py:682`); a caller that passes a
 room instead lets `distrib_la` decide each stack by the same price
 ([API § eigh-stack](../services/distrib_la/api.md#eigh-stack)). Nothing is
 compiled to be measured and no size is exchanged, so every rank decides alike
@@ -237,7 +337,7 @@ with $d_{\rm next} \le d^2(3+d)/4$. Each step is three batched GEMMs, so it runs
 `panel_matmul` in the face layout with no eigensolve. The iteration count is
 fixed from the initial bound, $\lceil \log_2(\ln \varepsilon_t / \ln d)\rceil$,
 never from an on-device residual, so every rank runs the same program
-(`_metric_inverse_root`, `src/gw/shared_pole_reduction.py:18`). For the paired
+(`_metric_inverse_root`, `src/gw/shared_pole_reduction.py:20`). For the paired
 sector metric, which is the identity to about $10^{-8}$ by construction, that is
 one iteration; an eigh-based root of the same stack costs more (claim 3425).
 The receipt reports $\max\|ZAZ - I\|_F/\sqrt R$. The checked eigh chain

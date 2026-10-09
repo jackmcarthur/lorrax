@@ -123,7 +123,14 @@ def test_decoupled_face_matches_local():
         assert np.allclose(np.where(la, lp, 0), np.where(da, dp, 0), rtol=1e-8, atol=1e-10), sub
         for p in range(q):
             assert np.allclose(lb[p] @ np.conj(lb[p].T), db[p] @ np.conj(db[p].T), rtol=1e-7, atol=1e-9), (sub, p)
-        ly, dy = np.asarray(local[4]), np.asarray(dec[4])
+        # The face span's rows are in the face's tile-interleaved pencil order: position k of
+        # the face holds row standard[k] of the whole-matrix order.
+        from gw.shared_pole_pencil import join_vectors, split_vectors
+        f = int(tables["order"].shape[-1])
+        standard = join_vectors(split_vectors(np.arange(side)[None], (f // 2, f // 2, (side - f) // 2, (side - f) // 2), 1),
+                                int(mesh.shape["y"]))[0]
+        ly, dy = np.asarray(local[4]), np.zeros_like(np.asarray(dec[4]))
+        dy[:, standard] = np.asarray(dec[4])
         for p in range(q):
             assert np.allclose(ly[p] @ np.conj(ly[p].T), dy[p] @ np.conj(dy[p].T), rtol=1e-7, atol=1e-9), (sub, p)
 
@@ -234,3 +241,39 @@ def test_release_selection_panels_frees_them_and_keeps_the_models():
     after = [np.asarray(a)[[1, 3]] for a in jax.tree.leaves((sector['model'], sector['signed']))]
     for a, b in zip(jax.tree.leaves((before['model'], before['signed'])), after):
         assert np.array_equal(np.asarray(a), b)
+
+
+def test_scalar_face_round_matches_local(monkeypatch):
+    """The scalar route's face round (one program, ``face_reduce_round``), whose pencil columns
+    enter the face's tile-interleaved order, against the local round on the synthetic pencil."""
+    mesh = _mesh()
+    import gw.shared_pole_execution as ex
+    from gw.shared_pole_directions import port_extent
+    from gw.shared_pole_local import BATCH, reduce_round
+    from gw.shared_pole_capacity import _local_eigenplan
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
+    # The face round's eigh stacks on route (c), as the staged route's run on CPU.
+    monkeypatch.setattr(ex, "face_eigh", lambda mesh_, n, room=None: _local_eigenplan(mesh_, int(n)))
+    extent = port_extent(mesh)
+    states, infinity, tables, models = _pencil(mesh, seed=2)
+    q = len(models)
+    width, iw = extent(4), extent(2)
+    gram_keep = shared_real_pole_gates_ordered_v1["normalized_gram_keep"]["sector_threshold"]
+    side = int(tables["active"].shape[-1])
+
+    def place(sharding):
+        put = lambda a: jax.device_put(np.asarray(a), sharding)
+        return ([(s[0], put(_pad(s[1], width)), put(_pad(s[2], width)), put(_pad(s[3], width))) for s in states],
+                tuple(put(_pad(a, iw)) for a in infinity))
+    ls, li = place(NamedSharding(mesh, P(BATCH)))
+    local = reduce_round(ls, li, tables, real=q, mesh_xy=mesh, native_eigh=_local_eigenplan(mesh, side).native_fn,
+                         ordered=True, odd_moments=True, keep_budget=8, gram_keep=gram_keep)
+    fs, fi = place(NamedSharding(mesh, P(None, "x", "y")))
+    face = ex.face_reduce_round(fs, fi, tables, mesh=mesh, budget=None, ordered=True, odd_moments=True,
+                                keep_budget=8, admit=False, gram_keep=gram_keep,
+                                carrier=ex.face_ritz_carrier(mesh, 8))
+    (lb, lp, la), (fb, fp, fa) = ([np.asarray(a) for a in r[0]] for r in (local, face))
+    assert np.array_equal(la, fa)
+    assert np.allclose(np.where(la, lp, 0), np.where(fa, fp, 0), rtol=1e-8, atol=1e-10)
+    for p in range(q):
+        assert np.allclose(lb[p] @ np.conj(lb[p].T), fb[p] @ np.conj(fb[p].T), rtol=1e-7, atol=1e-9), p

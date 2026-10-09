@@ -49,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import math
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import Callable, NamedTuple
 
 import jax
@@ -366,7 +367,9 @@ def _cubin_cache_summary() -> str:
                  if e.is_file() and e.name.endswith(".cubin")]
     except FileNotFoundError:
         sizes = []
-    return f"{d}: {len(sizes)} images, {sum(sizes) / 1e6:.1f} MB"
+    linked = seed_cubin_cache(str(CUBIN_STORE), d)
+    return (f"{d}: {len(sizes)} images, {sum(sizes) / 1e6:.1f} MB"
+            + (f" ({linked} linked from the store {CUBIN_STORE})" if CUBIN_STORE.is_dir() else ""))
 
 
 def _require_target(target: str, platform: str) -> None:
@@ -427,10 +430,52 @@ def cubin_cache_dir() -> str:
     re-hashed on read — so reusing it can never change a result, while
     rebuilding it costs about 6 s per (mode, k-grid) per process.  One
     directory for every world size: an image depends on the device and the
-    wheel, not on P.  No knob.
+    wheel, not on P.  No knob.  The first call of a process seeds it from the
+    release's read-only store (:func:`seed_cubin_cache`).
     """
     from lxkit import user_cache_dir
-    return str(user_cache_dir("kconv_mathdx"))
+    d = str(user_cache_dir("kconv_mathdx"))
+    seed_cubin_cache(str(CUBIN_STORE), d)
+    return d
+
+
+#: The release's read-only image store: ``<source root>/cubin_store``, built once per
+#: architecture at install (``scripts/build_cubin_store.py``); absent in a checkout.
+CUBIN_STORE = Path(__file__).resolve().parents[2] / "cubin_store"
+
+
+@lru_cache(maxsize=None)
+def seed_cubin_cache(store: str, cache: str) -> int:
+    """Link every store image the per-user cache lacks into it, once per process; the count.
+
+    The cache path, which every mathdx call carries as its ``cubin_dir`` attribute (and so
+    in its JAX compile key), never changes: the store only feeds it.  Each link is made
+    under a temporary name and renamed into place, so concurrent ranks cannot tear one; a
+    file already present is kept, and a dangling link (a retired release) is replaced.  The
+    native reader checks each image's key and hash as for any cached file
+    (``common/nvrtc_build.h``), so a torn or foreign store file is rebuilt into the cache.
+    """
+    import os
+    import warnings
+    try:
+        names = [e.name for e in os.scandir(store) if e.name.endswith(".cubin")]
+        os.makedirs(cache, exist_ok=True)
+    except OSError:
+        return 0
+    n = 0
+    for name in names:
+        dst = os.path.join(cache, name)
+        if os.path.exists(dst):
+            continue
+        tmp = f"{dst}.link.{os.getpid()}"
+        try:
+            os.symlink(os.path.join(store, name), tmp)
+            os.replace(tmp, dst)
+            n += 1
+        except OSError as e:
+            warnings.warn(f"[kconv] cubin store image {name} not linked into {cache}: {e}; "
+                          "it compiles once into the cache instead", RuntimeWarning, stacklevel=2)
+    return n
 
 
 # ---- the plan (cpu) and XLA backends: one composition, two transform engines ----

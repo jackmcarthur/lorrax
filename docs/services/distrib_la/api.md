@@ -428,17 +428,21 @@ column panel. `panel_matmul(A, B, *, mesh, panel_bytes, bounds=None,
 weights=None, partner=False, transa='N', transb='N', compiler_options=None)` forms $A B$ as a batched 2-D SUMMA inside one
 `shard_map`:
 
-- `A` is `(q, m, k)` at `P(None,'x','y')`; `B` is `(q, k, n)` in the same
-  layout, or `(q, s, k, n)` at `P(None,None,'x','y')`, a sample axis over
-  which each A panel is broadcast once.
-- **Panels.** On a square `p × p` mesh each panel takes `w` local columns of
-  every owner block: one `all_gather` per operand carries `p·w ≤ k/p`
-  columns, with every batch row in the same exchange and the same local GEMM.
-  The next panel is gathered before the current one is multiplied, so two
-  panels of at most one owner block are live. `w` is the even split of `k/p`
-  into the fewest panels with
-  `itemsize·q·2·p·w·(m/P_x + n/P_y) ≤ panel_bytes`, at most `k/p²` local
-  columns each; a remainder ends in one narrower panel.
+- `A` is `(q, m, k)` and `B` is `(q, k, n)`, both at `P(None,'x','y')` on a
+  square `p × p` mesh, with `m`, `k` and `n` multiples of `p`.
+- **Panels.** Each panel takes `w` local columns of every owner block: one
+  `all_gather` per operand carries `p·w ≤ k/p` columns, with every batch row
+  in the same exchange and the same local GEMM. The next panel is gathered
+  before the current one is multiplied, so two panels of at most one owner
+  block are live. `w` is the even split of `k/p` into the fewest panels with
+  `itemsize·q·2·p·w·(m/p + n/p) ≤ panel_bytes`, at most `k/p²` local columns
+  each. Every panel has width `w`: the `k/p` local columns are read as
+  `⌈(k/p)/w⌉·w`, fewer than `w` of them zeros. The last panel's window is held
+  inside the tile and its columns already taken by the panel before are zeroed
+  in `A`, so no padded copy of a tile is made. The panels run as one
+  `lax.scan`, and the compiled program is the same for every panel count of
+  four or more, so for every mesh from 4×4 up
+  ([dense linear algebra §3](../../architecture/dense_linear_algebra.md#the-panel-loop)).
 - **`bounds`** `(q, 2)`, replicated, names each row's live contraction
   interval (the caller has zeroed the rest); each panel's local product runs
   over that interval's columns only, so dead bands cost no flops.
@@ -448,9 +452,8 @@ weights=None, partner=False, transa='N', transb='N', compiler_options=None)` for
   column). XLA folds one `c + a @ b` into its GEMM but leaves one of two
   adjacent ones as a separate add that holds two extra output tiles; a
   two-panel product without bounds stays on XLA.
-- **`transa`, `transb`** (`'N'`, `'T'`, `'C'`; square mesh, 3-D `B`, no
-  `weights` or `partner`): the operand is given as `op`'s transpose on the
-  face; its tile crosses the grid diagonal in one `ppermute` and is
+- **`transa`, `transb`** (`'N'`, `'T'`, `'C'`; no `weights` or `partner`):
+  the operand is given as `op`'s transpose on the face; its tile crosses the grid diagonal in one `ppermute` and is
   transposed locally, which is the `'N'` tile, so the panel loop is unchanged
   and no distributed transpose runs. **`compiler_options`** go to the
   kernel's `jax.jit` (a caller's jit takes its own: options are top-level
@@ -460,8 +463,6 @@ weights=None, partner=False, transa='N', transb='N', compiler_options=None)` for
   $\bar A\,\mathrm{diag}(w)\,\bar B$ from the same exchange (the Green's
   function and its antiunitary partner), each gathered panel conjugated before
   its own GEMM.
-- Rectangular meshes and the sample axis stream owner panels by a masked
-  `psum` and contract every column.
 - `panel_bytes` bounds the two live operand panels only; the caller admits
   the input and output faces, compiled temporaries and provider workspace.
 
