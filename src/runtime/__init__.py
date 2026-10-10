@@ -257,6 +257,9 @@ def bootstrap(*, platform: str = "gpu") -> None:
     fallback_to_cpu_if_no_gpu_backend()
     install_failfast_excepthook()
     pin_matmul_precision()
+    # Every sharding is explicit, so a legacy ``with mesh:`` would only add its
+    # mesh to every program's key and re-trace held programs: JAX refuses one.
+    _import_jax().config.update("jax_disallow_mesh_context_manager", True)
 
 
 #: The f32 dot precisions that really are fp32 on XLA:GPU.  ``"high"`` is

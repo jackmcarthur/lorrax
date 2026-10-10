@@ -409,6 +409,8 @@ def _prepare_isdf_carriers(
         band_slices, bgw_v_grid_fn, centroid_indices, config, material_class, mesh_xy, meta,
         mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn, enk_dft):
     """Produce the fitted ISDF operators and wavefunction views."""
+    from .shared_pole_screening import compile_w_model_ahead
+    compile_w_model_ahead(config, meta, sym, mesh_xy)
     with timing.section("gw_jax.isdf", announce=True,
                         label="ISDF basis + wavefunctions"):
         isdf = prepare_isdf_and_wavefunctions(

@@ -121,3 +121,63 @@ def test_repeated_ahead_calls_take_one_compile_and_one_number_each():
     assert _compiles() == before + 1
     # One number per ahead call, finished or not, the same on every rank.
     assert jcc._STATE._compile_sequence == numbers + 3
+
+
+def test_scalar_head_fit_compiled_ahead_is_the_live_fit():
+    """Site: the MPA scalar head fit submitted from the deck's n_p
+    (``fit_driver.compile_scalar_fit_ahead``) is the program
+    ``fit_scalar_samples`` runs: its live call compiles nothing."""
+    from common import jax_compile_cache as jcc
+    from gw.mpa import fit_driver
+    jcc.install_compile_agreement()
+    n_p = 3
+    fit_driver.compile_scalar_fit_ahead(n_p, "loewner").result()
+    before, numbers = _compiles(), jcc._STATE._compile_sequence
+    z = 1j * np.linspace(0.0, 2.0, 2 * n_p)
+    omega, b = np.array([0.7 - 0.05j, 1.4 - 0.1j, 2.3 - 0.2j]), np.array([-0.3, -0.2, -0.1])
+    wc = (2.0 * omega[None, :] * b[None, :] / (z[:, None] ** 2 - omega[None, :] ** 2)).sum(1)
+    try:
+        fit_driver.fit_scalar_samples(wc, z, n_p, solve="loewner")
+    except ValueError:
+        pass                                  # the fit's own gates; only its compile is tested
+    assert _compiles() == before, "the live fit compiled the kernel again"
+    assert jcc._STATE._compile_sequence == numbers
+
+
+def test_coulomb_root_operand_keys_like_the_live_v():
+    """Site: H = V^(1/2) submitted from the W-model setup keys in the bank's
+    ``_compiled`` exactly like the packed V ``_coulomb_roots`` hands it, so the
+    bank takes the ahead executable (one compile, one Future)."""
+    from common import jax_compile_cache as jcc
+    from gw import response_bank as rb
+    jcc.install_compile_agreement()
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    kernel = jax.jit(lambda v: (v @ v, jnp.trace(v, axis1=1, axis2=2)),
+                     in_shardings=(face,), out_shardings=(face, NamedSharding(mesh, P())))
+    future = rb._compiled(kernel, (rb._packed_v(mesh, 3, 8),), ahead=True)
+    future.result()
+    live = jax.jit(lambda a: a * 1.0, out_shardings=face)(jnp.ones((3, 8, 8), jnp.complex128))
+    before = _compiles()
+    assert rb._compiled(kernel, (live,)) is future.result()
+    assert _compiles() == before
+
+
+def test_stream_pass_carry_keys_like_the_live_carry():
+    """Site: a streamed bank's row passes are compiled ahead with the abstract
+    carry (``_group_carry``); the pass's live call with the placed carry
+    (``_group_zeros``) takes that executable."""
+    from common import jax_compile_cache as jcc
+    from gw import response_bank as rb
+    jcc.install_compile_agreement()
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    group = NamedSharding(mesh, P(None, None, "x", "y"))
+    kernel = jax.jit(lambda c, p: c * 2.0 + p, in_shardings=(group, None), out_shardings=group,
+                     donate_argnums=(0,))
+    shape = (2, 3, 4, 4)
+    future = rb._compiled(kernel, (rb._group_carry(mesh, shape), jnp.int32(1)), ahead=True)
+    future.result()
+    live = (rb._group_zeros(mesh, shape), jnp.int32(1))
+    before = _compiles()
+    assert rb._compiled(kernel, live) is future.result()
+    assert _compiles() == before

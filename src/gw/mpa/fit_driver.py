@@ -55,6 +55,7 @@ from file_io import mpa_store
 from gw.mpa import pade_fit, tiling
 
 __all__ = [
+    "compile_scalar_fit_ahead",
     "fit_scalar_samples",
     "fit_one_block",
     "format_cost_report",
@@ -96,6 +97,26 @@ def _scalar_fit_kernel(n_p, guard_items, rcond, solve):
     return _kernel
 
 
+def _scalar_kernel(n_p, guards, rcond, solve):
+    resolved = pade_fit._resolve_guards(guards)
+    pade_fit._check_solve_mode(solve)
+    return _scalar_fit_kernel(int(n_p), tuple(sorted(resolved.items())), float(rcond), solve)
+
+
+def compile_scalar_fit_ahead(n_p, solve, *, guards=None, rcond=1.0e-13):
+    """Submit :func:`fit_scalar_samples`' fit for ``n_p`` poles to a helper thread's compile.
+
+    Its operands are the ``2 n_p`` samples and points, fixed by the deck, so a
+    caller that knows the deck can have it compiled long before the head's
+    samples exist; the fit's live call then finds it compiled.
+    """
+    import jax
+    import jax.numpy as jnp
+    from common.jax_compile_cache import compile_ahead
+    sample = jax.ShapeDtypeStruct((2 * int(n_p),), jnp.complex128)
+    return compile_ahead(_scalar_kernel(n_p, guards, rcond, solve), sample, sample)
+
+
 def fit_scalar_samples(
     Wc, z_samples, n_p, *, guards=None, rcond=1.0e-13,
     solve="loewner",
@@ -111,10 +132,7 @@ def fit_scalar_samples(
         raise ValueError(
             "scalar MPA head requires Wc and z with shape (2*n_p,); "
             f"got Wc={wc.shape}, z={z.shape}, n_p={n}")
-    resolved = pade_fit._resolve_guards(guards)
-    pade_fit._check_solve_mode(solve)
-    kernel = _scalar_fit_kernel(
-        n, tuple(sorted(resolved.items())), float(rcond), solve)
+    kernel = _scalar_kernel(n, guards, rcond, solve)
     Omega, B, diagnostics = kernel(
         jnp.asarray(wc), jnp.asarray(z))
     Omega, B, diagnostics = jax.device_get((Omega, B, diagnostics))

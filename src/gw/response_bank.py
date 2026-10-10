@@ -1009,6 +1009,29 @@ def _coulomb_canonical_pack(basis, mesh_xy, q0, q1):
                                                  spec=P(None, "x", "y")), out_shardings=face)
 
 
+def _packed_v(mesh_xy, n_q, n_packed):
+    """The abstract packed V of ``n_q`` parents, as ``_coulomb_roots`` hands it to H = V^(1/2)."""
+    return jax.ShapeDtypeStruct((int(n_q), int(n_packed), int(n_packed)), jnp.complex128,
+                                sharding=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
+def compile_coulomb_roots_ahead(meta, config, mesh_xy, n_q):
+    """Submit H = V^(1/2) of the parents (0, n_q) to a helper thread's compile.
+
+    Its shape is the centroid basis's and the q wedge's, known before the
+    zeta fit, and it is the bank's largest compile; the bank's
+    ``_coulomb_roots`` then finds it compiled. A deck whose ``linalg`` is
+    local is skipped: there the bank's ledger picks the layout.
+    """
+    from .gw_config import linalg_resolution
+    basis = meta.mu_basis
+    if linalg_resolution({"linalg": config.backend.linalg}).layout == "local":
+        return
+    layout = dense_layout(meta, config, mesh_xy, basis.n_packed)
+    _compiled(_coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout),
+              (_packed_v(mesh_xy, n_q, basis.n_packed),), ahead=True)
+
+
 def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     """The PSD roots of the q span of V through the service plan.
 
@@ -1018,13 +1041,10 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     from file_io.slab_io import SlabIO
     shape = (q_span[1]-q_span[0], basis.n_canonical, basis.n_canonical)
     spec = P(None, "x", "y")
-    # H = V^(1/2) is the bank's largest compile (sandbox claim 4180); its operand
-    # is the packed V of this span, known here, so it compiles beside the read
-    # and the pack below instead of after them.
+    # A span the W-model setup did not submit (compile_coulomb_roots_ahead)
+    # compiles beside the read and the pack below instead of after them.
     kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
-    _compiled(kernel, (jax.ShapeDtypeStruct((shape[0], basis.n_packed, basis.n_packed),
-                                            jnp.complex128, sharding=NamedSharding(mesh_xy, spec)),),
-              ahead=True)
+    _compiled(kernel, (_packed_v(mesh_xy, shape[0], basis.n_packed),), ahead=True)
     if resource.get("path") is None:
         values = _COULOMB_OPERATORS[resource["operator"]]
         program = _coulomb_canonical_pack(basis, mesh_xy, int(q_span[0]), int(q_span[1]))
@@ -1247,7 +1267,6 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
             columns.append(column)
     n_out, nq, n_nodes = len(totals), len(qids), len(columns)
     n_batch = -(-nq // int(width))
-    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
     nbytes = n_batch * n_out * 16 * int(width) * sum(r * c for r, c, _ in segments[0])
     bank = StreamedBank(mesh_xy, root=root, label="moments",
                         kind="host" if nbytes <= host_bytes_per_process() // 2 else "file",
@@ -1267,11 +1286,11 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     carries, _ = _reserve(meta, "moment_pass_carry", 0, bank.in_flight * 2 * n_batch * int(width) * n_out
                           * 16 * max(r * c for r, c, _ in segments[0]))
     ledger.live_stages = live + (carries,)
-    for p, (rows, cols) in enumerate(bank.shapes):
-        kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids),
-            n_outputs=n_out, pair_mode="direct", bank_carry=True, ordered=ordered,
-            vertex=vertex, stream_pass=p)
-        carry = _group_zeros(mesh_xy, (n_out, nq, px * rows, py * cols))
+    passes = _passes_ahead(bank.shapes, (n_out, nq), mesh_xy, common, tail, lambda p: response_stream(
+        wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids), n_outputs=n_out, pair_mode="direct",
+        bank_carry=True, ordered=ordered, vertex=vertex, stream_pass=p))
+    for p, (kernel, fixed, shape) in enumerate(passes):
+        carry = _group_zeros(mesh_xy, shape)
         carry = execute(kernel, common + tuple(fixed) + tail + (carry, jnp.int32(p)),
                         "moment_correlation", runtime_bytes=scratch)
         bank.put(p, order(carry), outputs)
@@ -1741,6 +1760,30 @@ def _group_zeros(mesh_xy, shape):
     return jnp.zeros(shape, jnp.complex128, device=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
+def _group_carry(mesh_xy, shape):
+    """:func:`_group_zeros`' carry as its abstract value: what a compile needs, no allocation."""
+    return jax.ShapeDtypeStruct(shape, jnp.complex128,
+                                sharding=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+
+
+def _passes_ahead(shapes, lead, mesh_xy, common, tail, stream):
+    """``(kernel, fixed, carry shape)`` of every row pass of a streamed bank, each
+    pass's program already handed to a helper thread's compile.
+
+    The passes' programs differ by segment shape and run one after another, so
+    they compile side by side here instead of one at each pass's first run.
+    ``stream(p)`` is pass ``p``'s ``response_stream``; its fixed operands are
+    the stream's resident tables, so building every pass up front allocates
+    nothing.
+    """
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    passes = [(*stream(p), (*lead, px * rows, py * cols)) for p, (rows, cols) in enumerate(shapes)]
+    for p, (kernel, fixed, shape) in enumerate(passes):
+        _compiled(kernel, common + tuple(fixed) + tail + (_group_carry(mesh_xy, shape), jnp.int32(p)),
+                  ahead=True)
+    return passes
+
+
 def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
                              execute, receipt, ordered=False, vertex=None, bank=None, outputs=()):
     """Donated [value/ds per member, q, mu_X, nu_Y]; one Green/FFT scan per group.
@@ -1758,12 +1801,12 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
     scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
     receipt["correlation_count"] += int(group["count"])
     if bank is not None:
-        px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
-        for p, (rows, cols) in enumerate(bank.shapes):
-            kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
+        passes = _passes_ahead(bank.shapes, (weights.shape[1], len(q_ids)), mesh_xy, common, tail,
+            lambda p: response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
                 n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True, ordered=ordered,
-                vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=p)
-            raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * rows, py * cols))
+                vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=p))
+        for p, (kernel, fixed, shape) in enumerate(passes):
+            raw = _group_zeros(mesh_xy, shape)
             raw = execute(kernel, common + tuple(fixed) + tail + (raw, jnp.int32(p)),
                           "direct", runtime_bytes=scratch)
             bank.put(p, raw, outputs)
@@ -1793,8 +1836,7 @@ def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordere
             *fixed, stream_weights(wfns, support["f"], mesh_xy),
             stream_weights(wfns, support["u"], mesh_xy),
             jnp.asarray(np.zeros_like(support["refs"])),
-            jax.ShapeDtypeStruct((n_outputs, len(q_ids), n, n), jnp.complex128,
-                sharding=NamedSharding(mesh_xy, P(None, None, "x", "y"))))
+            _group_carry(mesh_xy, (n_outputs, len(q_ids), n, n)))
     with timing.section('bank.compile.direct', announce=True):
         compiled = _compiled(kernel, args)
     if compiled.memory_analysis() is None:

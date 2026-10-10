@@ -418,6 +418,25 @@ def _shared_pole_tables(meta, sym, centroid_indices):
     return dict(qirr=qt, q_irr_full_idx=np.asarray(sym.q_irr_full_idx, np.int64), sym=sym)
 
 
+def compile_w_model_ahead(config, meta, sym, mesh_xy):
+    """Submit the scalar shared-pole W model's shape-fixed compiles before the zeta fit.
+
+    H = V^(1/2) of the bare V's parents takes its shape from the centroid
+    basis and the q wedge, and the scalar head's pole fit from the deck's
+    ``n_poles``; both compile on helper threads
+    (``common.jax_compile_cache.compile_ahead``) while the zeta fit and V run,
+    instead of when the bank and the head first need them.
+    """
+    from .gw_config import HeadCorrection, uses_full_bispinor_shared_pole
+    if config.sigma.w_model != "shared_pole" or uses_full_bispinor_shared_pole(config):
+        return
+    from .response_bank import compile_coulomb_roots_ahead
+    compile_coulomb_roots_ahead(meta, config, mesh_xy, len(sym.q_irr_full_idx))
+    if config.head.correction is not HeadCorrection.OFF:
+        from .mpa.fit_driver import compile_scalar_fit_ahead
+        compile_scalar_fit_ahead(config.mpa.n_poles, config.mpa.pole_solver)
+
+
 def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         centroid_indices, run_dir, label, wfn,
                         wfn_fingerprint_binding, tensors_filename, occupation_state, print_fn,
