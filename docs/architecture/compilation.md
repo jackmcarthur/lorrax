@@ -77,7 +77,8 @@ serves every world size.
   on the target architecture with a fresh `SCRATCH`, builds its `GRIDS` table
   (the hsuite fixtures, the smoke decks and the production grids); running the
   smoke decks against the same cache adds the system-keyed images, and the
-  release copies the cache into `cubin_store/`: 392 images, 3.33 GB (claim 4127).
+  release copies the images it ships into `cubin_store/`. The full table is
+  392 images, 3.33 GB (claim 4127).
 - **Another architecture.** The `sm<XY>` in each name makes a store
   per-architecture: an A100 store gives an H100 run nothing, so build one on
   the new architecture. A device the installed cuFFTDx cannot target fails the
@@ -196,8 +197,8 @@ fit the device refuses before it runs
 | warm | 140.2 s | 3037 requests per rank | 4198 |
 | fully cold | release cold plus the NVRTC builds | 25 NVRTC images, 180.8 s | 4129 |
 
-**The warm wall is half compile path.** Of a 160–164 s warm wall, 76.3 s was
-the compile path: trace 18.7 s, lower 34.3 s, cache key and read 23.5 s
+**A warm run still pays the compile path.** The census run spent 76.3 s of
+its warm wall on it: trace 18.7 s, lower 34.3 s, cache key and read 23.5 s
 (claim 4129). Fewer lowerings, not a different cache, move it. The census
 (claim 4155) finds three classes: a later driver re-lowering an earlier one's
 program (957; the hsuite clears JAX's in-process caches between stages, as

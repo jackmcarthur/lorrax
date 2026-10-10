@@ -9,7 +9,7 @@ the source tree's store, so only missing images compile).  The image key holds t
 k-grid, ``n_s``, right width, precision and variant (``kconv_mathdx_cuda_ffi.cc`` ``build``),
 never ``N_mu``, bands or P, so the operands are as small as the factories accept.  The
 regular files the cache then holds are the new images; the release copies them into its
-``cubin_store/`` (``docs/architecture/kconv.md#build-and-cache``).
+``cubin_store/`` (``docs/architecture/compilation.md``, §2).
 
 Images keyed by the system rather than the k-grid are not built here: mode 10 and the
 Fourier pair (FFT plane and G-sphere rows) and the BSE outer kernels (band rank K).  They
