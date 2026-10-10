@@ -1438,52 +1438,78 @@ def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
 _replicated_chol_cache = {}  # replicated dense charge-factor kernel (keyed by shape)
 
 
-def _close_the_cut(spectrum, keep, *, where: str):
-    """Move a ζ rank cut off any degenerate block it slices, by DROPPING the block; see docs/architecture/zeta_fit_face_psi_cct.md."""
+def _closure_mode():
     # The DRIVER reads the dial and passes it: ``common.spectral_closure`` is
     # L2 mathematics and ``tests/test_layering.py`` requires it to be a
     # function of its arguments.  The variable's NAME is still declared once,
     # in the guard module, so nothing is duplicated but the lookup itself.
-    mode = spectral_closure.resolve_mode(
-        os.environ.get(spectral_closure.MODE_ENV))
+    return spectral_closure.resolve_mode(os.environ.get(spectral_closure.MODE_ENV))
+
+
+def _policy_mode():
+    # The DRIVER reads the dial and passes it — same rule as _closure_mode.
+    return rank_criterion.resolve_policy_mode(os.environ.get(rank_criterion.POLICY_MODE_ENV))
+
+
+def _close_the_cut(spectrum, keep, *, where: str):
+    """Move a ζ rank cut off any degenerate block it slices, by DROPPING the block; ``(keep, figures)``, the figures for :func:`_report_the_cut`; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    mode = _closure_mode()
     if mode == "off":
-        return keep
+        return keep, {}
     keep_new, n_pre, n_post = spectral_closure.close_keep_mask(
         spectrum, keep, rtol=spectral_closure.DEFAULT_RTOL)
-    # ``!=``, not ``>``: the default direction moves the rank DOWN.  A ``>``
-    # here would have read every firing as silence after the flip, which is
-    # the shape of a guard that reports a clean bill for the wrong reason.
-    fired = jnp.any(n_post != n_pre)
-
-    def _say(_):
-        jax.debug.print(
-            "*** [spectral-closure] " + where + ": the rank cut falls INSIDE "
-            "a degenerate block of the ISDF Gram on at least one q of this "
-            "batch — retained rank/q {a} closes at {b} (the whole straddled "
-            "block is DROPPED, owner ruling 2026-08-10).  A cut through a "
-            "degenerate block retains a symmetry-ARBITRARY slice of an "
-            "eigenspace, so zeta's span differs between q and Sq and the "
-            "k-star identity fails for W and Sigma_x alike.  Mode=" + mode
-            + ". ***",
-            a=n_pre, b=n_post, ordered=False)
-        if mode == "strict":
-            jax.debug.callback(
-                lambda p, q: spectral_closure.note_device_snap(where, p.max(), q.max()),
-                n_pre, n_post)
-        return 0
-
-    jax.lax.cond(fired, _say, lambda _: 0, 0)
-    return keep_new if mode == "snap" else keep
+    return (keep_new if mode == "snap" else keep), {"closure": (n_pre, n_post)}
 
 
-def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
-                     rcond: float, exclude=None) -> None:
-    """GATE the ζ rank cut against the certified regime; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    # The DRIVER reads the dial and passes it — same rule as _close_the_cut.
-    mode = rank_criterion.resolve_policy_mode(
-        os.environ.get(rank_criterion.POLICY_MODE_ENV))
-    if mode == "off":
-        return
+def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> None:
+    """The host half of :func:`_close_the_cut` and :func:`_certify_the_cut`: their notices and findings.
+
+    The figures leave the factor program as outputs, so it holds no host
+    callback and JAX's persistent cache stores it (claim 3255).
+    """
+    if "closure" in figures:
+        n_pre, n_post = figures["closure"]
+        mode = _closure_mode()
+        # ``!=``, not ``>``: the default direction moves the rank DOWN.  A ``>``
+        # here would have read every firing as silence after the flip, which is
+        # the shape of a guard that reports a clean bill for the wrong reason.
+        if np.any(n_post != n_pre):
+            print(f"*** [spectral-closure] {where}: the rank cut falls INSIDE "
+                  "a degenerate block of the ISDF Gram on at least one q of this "
+                  f"batch — retained rank/q {n_pre} closes at {n_post} (the whole straddled "
+                  "block is DROPPED, owner ruling 2026-08-10).  A cut through a "
+                  "degenerate block retains a symmetry-ARBITRARY slice of an "
+                  "eigenspace, so zeta's span differs between q and Sq and the "
+                  f"k-star identity fails for W and Sigma_x alike.  Mode={mode}. ***", flush=True)
+            if mode == "strict":
+                spectral_closure.note_device_snap(where, n_pre.max(), n_post.max())
+    if "certify" in figures:
+        kappa, n_drop, dropped_w, over = figures["certify"]
+        if np.any(over):
+            kcert = ("uncertified" if kappa_certified is None
+                     else f"{float(kappa_certified):.3e}")
+            print(f"*** [rank-policy] {where}: the rank cut BOUND and left "
+                  f"the certified regime on at least one q.  rcond={float(rcond):.1e} "
+                  f"(cap 1/rcond={1.0 / float(rcond):.3e}), certified kappa ceiling "
+                  f"{kcert}.  n_drop/q={n_drop} kappa/q={kappa} discarded_weight/q={dropped_w} "
+                  f"(ceiling {rank_criterion.DISCARDED_WEIGHT_MAX:.1e}). "
+                  "A cut that binds at kappa >= ~1e10 is measured wrong by "
+                  "electron-volts (R19 rcond ladder; Si 4x4x4 1776 centroids -> "
+                  f"Sigma_c MAE 54.4 eV at exit 0).  Mode={_policy_mode()}. ***", flush=True)
+            rank_criterion.note_device_finding(
+                where,
+                "the cut bound (max %d directions dropped on one q) at "
+                "kappa_eff up to %.3e against a certified ceiling of %s, "
+                "discarding up to %.3e of tr|C|.  Reduce the centroid "
+                "budget, or raise zeta_rcond back onto the certified "
+                "plateau (1e-8 .. 1e-4)."
+                % (int(n_drop.max()), float(kappa.max()), kcert, float(dropped_w.max())))
+
+
+def _certify_the_cut(spectrum, keep, *, kappa_certified, exclude=None):
+    """GATE the ζ rank cut against the certified regime: the figures for :func:`_report_the_cut`; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    if _policy_mode() == "off":
+        return {}
     mag = jnp.abs(spectrum)
     # ``exclude`` marks positions that are not physics at all — the
     # distributed tier's identity pad.  They are removed from EVERY
@@ -1505,46 +1531,29 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
         over_k = jnp.zeros_like(bound)
     else:
         over_k = bound & (kappa > float(kappa_certified))
-    fired = jnp.any(over_k | over_w)
-    _kcert = ("uncertified" if kappa_certified is None
-              else f"{float(kappa_certified):.3e}")
-
-    def _say(_):
-        jax.debug.print(
-            "*** [rank-policy] " + where + ": the rank cut BOUND and left "
-            "the certified regime on at least one q.  rcond="
-            + f"{float(rcond):.1e}" + " (cap 1/rcond="
-            + f"{1.0 / float(rcond):.3e}" + "), certified kappa ceiling "
-            + _kcert + ".  n_drop/q={d} kappa/q={k} discarded_weight/q={w} "
-            "(ceiling " + f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}" + "). "
-            "A cut that binds at kappa >= ~1e10 is measured wrong by "
-            "electron-volts (R19 rcond ladder; Si 4x4x4 1776 centroids -> "
-            "Sigma_c MAE 54.4 eV at exit 0).  Mode=" + mode + ". ***",
-            d=n_drop, k=kappa, w=dropped_w, ordered=False)
-        jax.debug.callback(
-            lambda k, d, w: rank_criterion.note_device_finding(
-                where,
-                "the cut bound (max %d directions dropped on one q) at "
-                "kappa_eff up to %.3e against a certified ceiling of %s, "
-                "discarding up to %.3e of tr|C|.  Reduce the centroid "
-                "budget, or raise zeta_rcond back onto the certified "
-                "plateau (1e-8 .. 1e-4)."
-                % (int(d.max()), float(k.max()), _kcert, float(w.max()))),
-            kappa, n_drop, dropped_w)
-        return 0
-
-    jax.lax.cond(fired, _say, lambda _: 0, 0)
+    return {"certify": (kappa, n_drop, dropped_w, over_k | over_w)}
 
 
 def _charge_factor_math(C_log, *, n_log: int, rcond: float, rank_log: bool):
-    """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit by the all-ranks (replicated) and q-parallel executions of the replicated plan (:func:`_factor_c_q_replicated`, :func:`_factor_c_q_replicated_qparallel`); see docs/architecture/zeta_fit_face_psi_cct.md."""
+    """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit by the all-ranks (replicated) and q-parallel executions of the replicated plan (:func:`_factor_c_q_replicated`, :func:`_factor_c_q_replicated_qparallel`): ``(F, figures)`` (``isdf.cplus.factor``); see docs/architecture/zeta_fit_face_psi_cct.md."""
     from isdf import cplus
     return cplus.factor(C_log, rcond=rcond, rank_log=rank_log, n_log=n_log)
 
 
+def _factor_at_logical(C, n_log, rcond, constrain=lambda c: c):
+    """:func:`_charge_factor_math` at the logical extent, zero-embedded: ``(F, figures)``."""
+    figures = []
+
+    def _factor_log(C_log):
+        F, got = _charge_factor_math(constrain(C_log), n_log=n_log, rcond=rcond, rank_log=True)
+        figures.append(got)
+        return F
+    return solve_at_logical(_factor_log, n_log, (C,), pad_axes=(-2, -1)), figures[0]
+
+
 def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
                             zeta_rcond: float, rank_log: bool = True):
-    """THE producer's charge-ζ solve on ONE whole, unpadded (n_μ, n_μ) tile; see docs/architecture/zeta_fit_face_psi_cct.md."""
+    """THE producer's charge-ζ solve on ONE whole, unpadded (n_μ, n_μ) tile: ``(ζ, figures)``, the figures for ``isdf.cplus.report`` after the program; see docs/architecture/zeta_fit_face_psi_cct.md."""
     mode = str(charge_zeta_solve).strip().lower()
     if mode == 'cholesky':
         raise ValueError("solve_zeta_charge_dense: charge_zeta_solve='cholesky' is retired (2026-09-25); the charge solve is 'rank_truncate' — refit this ζ.")
@@ -1555,11 +1564,11 @@ def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
             f"transverse ridge family solves an INDEFINITE CCT and does not "
             f"belong on this entry point.")
     n_log = int(C.shape[-1])
-    F = _charge_factor_math(
+    F, figures = _charge_factor_math(
         C[None, ...], n_log=n_log, rcond=float(zeta_rcond),
-        rank_log=bool(rank_log))[0]
+        rank_log=bool(rank_log))
     from isdf import cplus
-    return cplus.apply(F, Z)
+    return cplus.apply(F[0], Z), figures
 
 
 def _factor_c_q_replicated(
@@ -1576,30 +1585,27 @@ def _factor_c_q_replicated(
     key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond))
     if key not in _replicated_chol_cache:
         _rc = rcond
-        @partial(jax.jit, out_shardings=out_sh)
+        @partial(jax.jit, out_shardings=(out_sh, rep_sh))
         def _fn(C):
-            def _factor_log(C_log):
-                # Replicate the logical block so every device factors the
-                # WHOLE matrix — this is what makes the factor grid-agnostic
-                # (a block-cyclic accumulation would not be).
-                # The arithmetic itself lives in ``_charge_factor_math`` —
-                # ONE traced kernel shared with the q-parallel execution so
-                # the two schedules cannot drift (bit-identity contract).
-                C_log = jax.lax.with_sharding_constraint(C_log, rep_sh)
-                F = _charge_factor_math(
-                    C_log, n_log=n_log, rcond=_rc, rank_log=True)
-                return F
-
-            F_log = solve_at_logical(
-                _factor_log, n_log, (C,), pad_axes=(-2, -1))
+            # Replicate the logical block so every device factors the
+            # WHOLE matrix — this is what makes the factor grid-agnostic
+            # (a block-cyclic accumulation would not be).
+            # The arithmetic itself lives in ``_charge_factor_math`` —
+            # ONE traced kernel shared with the q-parallel execution so
+            # the two schedules cannot drift (bit-identity contract).
+            F_log, figures = _factor_at_logical(
+                C, n_log, _rc, lambda c: jax.lax.with_sharding_constraint(c, rep_sh))
             # Pad-block factor = identity (√1 = 1 for L; for B the pad block
             # is sliced off in the back-solve, so identity is just a
             # non-singular filler): re-embed via the shared helper (no-op
             # when n_log == n_rmu).
             return _identity_pad_block_diagonal(
-                F_log, n_rmu_logical=n_log, mesh_xy=mesh_xy)
+                F_log, n_rmu_logical=n_log, mesh_xy=mesh_xy), figures
         _replicated_chol_cache[key] = _fn
-    return _replicated_chol_cache[key](C_q)
+    from isdf import cplus
+    F, figures = _replicated_chol_cache[key](C_q)
+    cplus.report(figures, rcond=rcond, n_log=n_log)
+    return F
 
 
 # Largest REPLICATED q-batch handed to one dense factor call.  The factor is
@@ -1746,25 +1752,30 @@ def _factor_c_q_replicated_qparallel(
             dev = jax.lax.axis_index('x') * py + jax.lax.axis_index('y')
 
             def _fact(C1):
-                return solve_at_logical(
-                    lambda Cl: _charge_factor_math(
-                        Cl, n_log=n_log, rcond=_rc, rank_log=True),
-                    n_log, (C1,), pad_axes=(-2, -1))
+                return _factor_at_logical(C1, n_log, _rc)
 
-            def _one(i, F_acc):
+            # A q-pad slot factors nothing: zeros of the factor's and the
+            # figures' shapes, sliced off below.
+            shapes = jax.eval_shape(_fact, C_loc[:1])
+
+            def _skip(C1):
+                return jax.tree.map(lambda s: jnp.zeros(s.shape, s.dtype), shapes)
+
+            def _one(i, acc):
                 C1 = jax.lax.dynamic_slice_in_dim(C_loc, i, 1, axis=0)
-                F1 = jax.lax.cond(dev * blk + i < nq, _fact,
-                                  jnp.zeros_like, C1)
-                return jax.lax.dynamic_update_slice(F_acc, F1, (i, 0, 0))
+                got = jax.lax.cond(dev * blk + i < nq, _fact, _skip, C1)
+                return jax.tree.map(
+                    lambda a, g: jax.lax.dynamic_update_slice_in_dim(a, g, i, axis=0), acc, got)
 
-            return jax.lax.fori_loop(0, blk, _one, jnp.zeros_like(C_loc))
+            return jax.lax.fori_loop(0, blk, _one, jax.tree.map(
+                lambda s: jnp.zeros((blk,) + s.shape[1:], s.dtype), shapes))
 
         _sm = shard_map(_local_factor, mesh=mesh_xy,
                         in_specs=P(('x', 'y'), None, None),
-                        out_specs=P(('x', 'y'), None, None),
+                        out_specs=(P(('x', 'y'), None, None), P(('x', 'y'))),
                         check_vma=False)
 
-        @partial(jax.jit, out_shardings=out_sh)
+        @partial(jax.jit, out_shardings=(out_sh, NamedSharding(mesh_xy, P())))
         def _fn(C):
             if nq_pad > nq:
                 C = jnp.pad(C, ((0, nq_pad - nq), (0, 0), (0, 0)))
@@ -1773,17 +1784,20 @@ def _factor_c_q_replicated_qparallel(
             # measurement); each stage moves ONE mesh axis.
             C = jax.lax.with_sharding_constraint(C, mid_sh)
             C = jax.lax.with_sharding_constraint(C, q_sh)
-            F = _sm(C)
+            F, figures = _sm(C)
             F = F[:nq]
             F = jax.lax.with_sharding_constraint(F, mid_sh)
             # Pad-block factor = identity — same re-embed (and same final
             # P(None,'x','y') constraint) as the all-ranks execution;
             # no-op when n_log == n_rmu.
             return _identity_pad_block_diagonal(
-                F, n_rmu_logical=n_log, mesh_xy=mesh_xy)
+                F, n_rmu_logical=n_log, mesh_xy=mesh_xy), jax.tree.map(lambda a: a[:nq], figures)
 
         _qparallel_factor_cache[key] = _fn
-    return _qparallel_factor_cache[key](C_q)
+    from isdf import cplus
+    F, figures = _qparallel_factor_cache[key](C_q)
+    cplus.report(figures, rcond=rcond, n_log=n_log)
+    return F
 
 
 # =============================================================================

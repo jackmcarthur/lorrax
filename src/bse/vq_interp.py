@@ -2761,6 +2761,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
             "file's isdf_header/fit_provenance.")
     cq_and_x, solve_zeta = _refit_kernels(
         nk, nb, ns, n_mu, rst["zeta_solve"])
+    from isdf.cplus import report as report_zeta_cut
     if m_leg not in ("htransform", "stored"):
         raise ValueError(
             f"refit_vq: m_leg={m_leg!r}; expected 'htransform' or 'stored'")
@@ -2834,7 +2835,9 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
         if Z is None:
             raise RuntimeError("refit_vq: empty ζ-window WFN slab")
         logical_r = int(r1) - int(r0)
-        zeta_chunk = solve_zeta(C, Z)[:, :logical_r]
+        zeta_chunk, figures = solve_zeta(C, Z)
+        report_zeta_cut(figures, rcond=float(rst["zeta_solve"][1]), n_log=int(C.shape[-1]))
+        zeta_chunk = zeta_chunk[:, :logical_r]
         zeta_chunk = _pad_refit_zeta_for_gflat(
             zeta_chunk, n_mu_padded=n_mu_padded, mesh_xy=mesh_xy)
         gflat_acc = accumulate_rchunk_to_gflat(

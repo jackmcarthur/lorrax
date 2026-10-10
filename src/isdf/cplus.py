@@ -2,8 +2,9 @@
 
 ``factor`` turns the logical, Hermitian-PSD C_q stack ``(nq, n, n)`` into B
 with ``B Bᴴ = C⁺`` (keep ``λ > rcond·λ_max``, the cut closed over degenerate
-multiplets and certified against the Gram ceiling); ``apply`` is
-``ζ = C⁺Z = B(BᴴZ)``.  Every charge producer calls these two -- the μ-batch
+multiplets and certified against the Gram ceiling), with the cut's per-q
+figures, which ``report`` prints on the host after the program; ``apply`` is
+``ζ = C⁺Z = B(BᴴZ)``.  Every charge producer calls these -- the μ-batch
 fit (``isdf.zeta_mubatch``), the dense refit (``solve_zeta_charge_dense``) and
 the per-q factor stacks of ``isdf.core`` -- so a different conditioning
 procedure replaces this file and nothing else.  Callers own the logical
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from common import rank_criterion
 
@@ -23,7 +25,9 @@ def apply(B, Z):
 
 
 def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
-    """B with B Bᴴ = C⁺ for a logical C_q stack; see the module docstring."""
+    """``(B, figures)``: B with B Bᴴ = C⁺ for a logical C_q stack, and the
+    cut's per-q figures, which the caller hands to :func:`report` on the host
+    after the program; see the module docstring."""
     from isdf.core import _certify_the_cut, _close_the_cut
     # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
     # n_μ over-completes the pair-density rank (κ~1e13); plain
@@ -47,7 +51,7 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
     # That deck turned out to be covariant by luck — 0 of 16 q-stars
     # carried a non-constant n_keep, MEASURED after the fact, enforced by
     # nothing.  This is the enforcement.
-    keep = _close_the_cut(lam, keep, where="zeta rank_truncate")
+    keep, figures = _close_the_cut(lam, keep, where="zeta rank_truncate")
     # …and a cut that lands in a gap can still be a cut nobody has
     # certified.  THE GATE: when the criterion BINDS, the achieved
     # amplification must not exceed the ceiling any measurement supports
@@ -55,9 +59,8 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
     # 1776-centroid run, both in ``common/rank_criterion``).  Until
     # 2026-08-22 the ``rank_log`` block below announced exactly these
     # numbers and gated on neither.
-    _certify_the_cut(lam, keep, where="zeta rank_truncate",
-                     kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM,
-                     rcond=rcond)
+    figures.update(_certify_the_cut(
+        lam, keep, kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM))
     # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
     # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
     inv_sqrt = jnp.where(
@@ -65,7 +68,7 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
     # OBSERVABILITY: the retained-mode count IS the conditioning
     # signal for this route — it is what tells you whether n_μ has
     # over-completed the pair-density rank (κ blow-up) and by how
-    # much.  It lives inside the jit, so print it from there.
+    # much.  It leaves the program as figures; :func:`report` prints it.
     # ``n_keep`` per q + the spectral span λ_max/λ_min(kept).
     # Mandatory conditioning receipt; there is no silence knob.
     #
@@ -97,16 +100,27 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
             jnp.where(keep, -jnp.inf, lam), axis=-1)
         n_loose = jnp.sum(lam > (rcond * 1e-4 * lam_max), axis=-1)
         margin = (n_loose - n_keep) / jnp.maximum(n_keep, 1)
-        jax.debug.print(
-            "[zeta rank_truncate] n_log={n} rcond={rc:.1e} "
-            "n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
-            "kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
-            "margin/q={mg}",
-            n=n_log, rc=rcond,
-            k=n_keep,
-            mx=lam_max[..., 0], mn=lam_keep_min,
-            kp=lam_max[..., 0] / lam_keep_min,
-            dh=lam_drop_hi, lo=jnp.min(lam, axis=-1),
-            mg=margin,
-            ordered=False)
-    return V * inv_sqrt[..., None, :].astype(V.dtype)
+        figures["rank"] = (n_keep, lam_max[..., 0], lam_keep_min, lam_max[..., 0] / lam_keep_min,
+                           lam_drop_hi, jnp.min(lam, axis=-1), margin)
+    return V * inv_sqrt[..., None, :].astype(V.dtype), figures
+
+
+def report(figures, *, rcond: float, n_log: int) -> None:
+    """Print a :func:`factor` program's notices and conditioning receipt on the host, and record its findings."""
+    from isdf.core import _report_the_cut
+    figures = jax.tree.map(_host, figures)
+    _report_the_cut(figures, where="zeta rank_truncate",
+                    kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM, rcond=rcond)
+    if "rank" in figures:
+        k, mx, mn, kp, dh, lo, mg = figures["rank"]
+        print(f"[zeta rank_truncate] n_log={n_log} rcond={rcond:.1e} "
+              f"n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
+              f"kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
+              f"margin/q={mg}", flush=True)
+
+
+def _host(a):
+    """A program output as NumPy; a replicated one is read from this process's own copy."""
+    if getattr(a, "is_fully_replicated", False):
+        return np.asarray(a.addressable_data(0))
+    return np.asarray(jax.device_get(a))
