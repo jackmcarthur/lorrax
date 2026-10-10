@@ -10,9 +10,9 @@ helper and holds the values (and the sharding) to the op-by-op spelling:
 3. ``symmetry_maps.little_group_covariance_residual``: one program for all
    sampled (parent, op) pairs.
 4. ``gw.mpa.sector_sigma._unfold_w_rows``: one program for both branches.
-   Against the eager shard_map it replaces the values agree to rounding, not
-   bit for bit: inside one program XLA contracts the spin rotation's
-   multiply-adds, which op-by-op dispatch never fuses.
+   On the CPU it agrees with the eager shard_map it replaces to 4 ulp, not bit
+   for bit, because the fused spin rotation's complex multiply-adds are
+   code-generated differently from op-by-op dispatch.
 """
 import jax
 import jax.numpy as jnp
