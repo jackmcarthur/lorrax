@@ -163,9 +163,10 @@ The hsuite has three such programs (claim 4139).
 **The cross-rank compile agreement.** At $P > 1$ with a coordination client,
 each request fingerprints its module (SHA-256 of the MLIR without debug
 locations, process-local `…handle` literals canonicalised) and publishes it
-under the rank's request number (`_requested`). One process lock orders the
-requests, so the numbers agree across ranks that request the same programs in
-the same order. Only a real compile checks (`_check_compile_record`): rank 0
+under the rank's request number (`_requested`). Numbers are taken in program
+order on the calling thread, under one lock that covers only the numbering and
+the publish, so they agree across ranks that request the same programs in the
+same order. Only a real compile checks (`_check_compile_record`): rank 0
 reads every rank's record, a peer reads rank 0's, and a mismatch refuses
 before the compile, naming every rank's key, instead of hanging in the next
 collective. A cache hit checks and waits for nothing. At the default timeout,
@@ -174,7 +175,7 @@ The agreement costs 6.2 s on the warm hsuite (161.9 against 155.7 s, claim
 4130). It stays on.
 
 **The runtime's XLA flags.** On GPU, `runtime.set_default_xla_gpu_autotune`
-(`src/runtime/__init__.py:494`) appends two flags to `XLA_FLAGS`; a caller's
+(`src/runtime/__init__.py:497`) appends two flags to `XLA_FLAGS`; a caller's
 value wins, flag by flag. A CPU run gets neither.
 
 | flag | effect | claim |
@@ -182,7 +183,7 @@ value wins, flag by flag. A CPU run gets neither.
 | `--xla_gpu_autotune_level=0` | cold compile −12.9 % (Na) and −16.3 % (Si) at P4, execution within noise | 683 |
 | `--xla_gpu_enable_llvm_module_compilation_parallelism=true` | XLA splits each module's LLVM IR into parts compiled in parallel; hsuite release-cold XLA compile 219.5 → 195.2 s, programs of 0.5 s or more −22 %, programs under 50 ms +10 %; results bitwise, device peak unchanged | 4179 |
 
-`runtime.disable_xla_rematerialization` (`:558`) adds `rematerialization` to
+`runtime.disable_xla_rematerialization` (`:561`) adds `rematerialization` to
 `--xla_disable_hlo_passes` on GPU and CPU. On CUDA, a module that then does not
 fit the device refuses before it runs
 ([memory model](memory-model.md#module-does-not-fit)); on CPU nothing checks.
@@ -193,8 +194,8 @@ fit the device refuses before it runs
 
 | state | wall | compile | claim |
 |---|---|---|---|
-| release cold | 336.6 s | every XLA compile, 195.2 s of it with the LLVM flag | 4198, 4179 |
-| warm | 140.2 s | 3037 requests per rank | 4198 |
+| release cold | 326.3 s | 2261 real XLA compiles | 4210 |
+| warm | 139.9 s | 3037 requests per rank | 4210 |
 | fully cold | release cold plus the NVRTC builds | 25 NVRTC images, 180.8 s | 4129 |
 
 **A warm run still pays the compile path.** The census run spent 76.3 s of
@@ -222,11 +223,9 @@ No leg builds an NVRTC image. Device peaks are unchanged (44.76 and
 
 ## 5 What threads can and cannot do
 
-Each process compiles on the thread that makes the first call, one program at
-a time: a jitted function traces, lowers and compiles before it runs, and the
-agreement's lock holds across the whole request. Claim 4178 measures the
-hsuite's 75 largest programs, recompiled with all four ranks at once and 16
-cores per rank.
+A jitted function traces, lowers and compiles on the thread that makes its
+first call, before it runs. Claim 4178 measures the hsuite's 75 largest
+programs, recompiled with all four ranks at once and 16 cores per rank.
 
 - **XLA's backend compile releases the GIL.** The 75 programs take 104.0 s
   serial, 55.8 s on 2 threads, 29.1 s on 4, 16.4 s on 8 and 12.4 s on 16; each
@@ -238,7 +237,22 @@ cores per rank.
   45.5 s. Each compiles at its first call, so no thread can take it; only
   fewer programs, or a cheaper pipeline per module, moves them.
 
-<!-- COMPAHEAD -->
+**`compile_ahead` takes the large programs whose shapes are known.**
+`common.jax_compile_cache.compile_ahead(program, *args)` lowers on the calling
+thread in program order and reserves the agreement's request number there.
+XLA then compiles on one of min(8, physical cores) helper threads. Whichever of
+the helper and the live call reaches the compile first compiles under that
+number, and the other waits. A program therefore compiles once and takes one
+number on every rank, whatever the timing. Two owners submit:
+
+- the W-model setup, before the ζ fit: V^(1/2) of the bare V's parents
+  (scalar shared pole, distributed `linalg`) and the MPA scalar head fit
+  (from `n_poles`);
+- a streamed bank: all its row passes at once.
+
+On the P4 hsuite this takes release cold from 336.7 to 326.3 s, with requests
+and compiles unchanged and eqp byte-identical. The CrI3 6×6 bispinor deck
+moves by less than 1 s (claim 4210).
 
 The LLVM flag (claim 4179) shortens each large compile from inside; threads
 overlap whole compiles. The two are complements.
@@ -249,8 +263,7 @@ overlap whole compiles. The two are complements.
 |---|---|---|---|
 | the three uncacheable programs | compile in every process | removing their host callbacks | 4139 |
 | the largest families | distinct by physics: χ integrate's 11 programs (the four-current family blocks and node sets), the MPA window runner's bisp_sc programs (the sectors' pole-panel widths), the shared-pole rounds (one per sector). Merging their shapes adds masked work | none | 4155 |
-
-<!-- COMPAHEAD -->
+| more `compile_ahead` sites | the static and direct bank streams wait on the frequency rule, which the moments build; the distrib_la stacks take the call's batch; the ζ kernels compile inside the memory check's loop | none without reordering their owners | 4210 |
 
 Release cold cannot reach two minutes on the hsuite while its XLA compile
 alone is 195.2 s (claim 4179).
