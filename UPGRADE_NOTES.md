@@ -5,6 +5,27 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-10 — programs whose shapes are known ahead compile on helper threads
+
+`common.jax_compile_cache.compile_ahead(program, *args)` lowers a program on
+the calling thread, takes its cross-rank compile-agreement number there, and
+hands XLA's backend compile to one of min(8, physical cores) helper threads.
+The live call finds the executable or waits for it. If the live call reaches
+the compile before the helper does, it compiles under the reserved number and
+the helper takes its executable, so every rank numbers its requests alike.
+Three owners use it. The W-model setup submits H = V^(1/2) of the bare V's
+parents (decks with a distributed `linalg`) and the MPA scalar head fit (from
+the deck's `n_poles`) before the zeta fit. A streamed bank submits all its row
+passes at once. On the P4 hsuite, release cold goes from 336.7 to 326.3 s and
+warm stays at 140 s. Program requests (3037 per rank) and XLA compiles (2261)
+do not change, and eqp is byte-identical in 10/10 files. The runtime now sets
+`jax_disallow_mesh_context_manager`, so a new `with mesh:` raises. When the
+persistent cache is off (`ISDF_JAX_CACHE_DIR=""`,
+`JAX_COMPILATION_CACHE_MAX_SIZE=0`, or a directory that cannot be armed), the
+runtime now also clears `jax_compilation_cache_dir`. Before this, an exported
+`JAX_COMPILATION_CACHE_DIR` stayed live behind the OFF line. No deck or
+environment change, and no opt-out: results are bitwise.
+
 ## 2026-10-10 — `src/` enters no legacy mesh context; both W branches share one window program
 
 Nothing in `src/` or the services opens `with mesh:` any more. Every sharding
