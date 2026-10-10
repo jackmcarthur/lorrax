@@ -109,6 +109,7 @@ nav:
       - Codebase: codebase.md
       - The FFI layer: architecture/ffi_layout.md
       - k-convolution: architecture/kconv.md
+      - Compilation: architecture/compilation.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Mesh-padded axes: architecture/padding.md
       - Memory model: architecture/memory-model.md

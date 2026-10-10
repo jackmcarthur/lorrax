@@ -11,7 +11,7 @@ engine serves each platform, and which stage takes which plan. It ends with
 CrI3 24×24 at P64. The caller contract of every function named here is
 [`distrib_la`'s API](../services/distrib_la/api.md); which library serves which
 request is [its backends page](../services/distrib_la/backends.md). Code is cited
-as `file:line` at `7cb41088e`; read the file rather than the number.
+as `file:line` at `b3147d82c`; read the file rather than the number.
 
 ## Symbols
 
@@ -402,7 +402,7 @@ and no ROCm run has been made.
 ## 9 Which stage takes which plan {#stage-plans}
 
 `linalg = local | distributed` is the one deck key for the layout of every
-dense solve (`resolve_linalg`, `src/gw/gw_config.py:851`). `local` keeps whole
+dense solve (`resolve_linalg`, `src/gw/gw_config.py:832`). `local` keeps whole
 per-q matrices, scheduled q-parallel over the devices; it is mesh-invariant and
 is the numerical control. `distributed` factors one matrix over the whole mesh;
 it is the only plan whose factorization memory divides by $P$. The resolved

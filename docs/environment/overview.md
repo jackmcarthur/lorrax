@@ -74,7 +74,7 @@ default, the block is what ran. Rank 0 of a P=4 Perlmutter run:
   Device memory  | card 42.40 GB | pool 35.20 GB (7.20 GB outside it) | budget 31.60 GB at linalg local | outside the pool after warm-up 1.37 GB (max over ranks)
   FFI build provenance: …/releases/c52b2c42-bundle-8e3c3650ea2a/lib/liblorrax_ffi.so | sealed bundle 8e3c3650ea2ab71a | rev c52b2c42565d | sha cb25804baded2322
   The distributed backends available for eigh on this mesh are cusolvermp, distributed, native; which one runs is the input-file key, not an environment variable.
-  The JAX persistent compile cache is OFF, so every rank compiles every module in this run; set ISDF_JAX_CACHE_DIR …
+  The JAX persistent compile cache is enabled at …/.cache/lorrax/jax_compile/jax0.9.1-jaxlib0.9.1_bundle-8e3c3650ea2a_k1/np4, shared by all 4 ranks (process 0 writes, every rank reads; …).
   The fail-fast excepthook is installed, so an uncaught exception on any rank exits the step non-zero …
 ```
 
@@ -106,9 +106,10 @@ overrides it and refuses anything but `highest` or `float32` (`high` is a
 3-pass TF32 decomposition on XLA:GPU). complex128, the GW/BSE production
 dtype, is unaffected.
 
-**Compile cache.** One owner, `common.jax_compile_cache`; the directory
-resolution and controls are in [`env_vars.md` §2e](../reference/env_vars.md#2e-compile-cache). The
-persistent key includes every array shape, so a new system size misses.
+**Compilation.** What a run compiles, the persistent cache and its key, the
+cross-rank compile agreement and the runtime's XLA flags are
+[Compilation](../architecture/compilation.md); the cache's variables are
+[`env_vars.md` §2e](../reference/env_vars.md#2e-compile-cache).
 
 ### 2.1 The GPU memory pool {#gpu-pool}
 
@@ -142,14 +143,14 @@ the device's **default** mempool (`create_new_pool=false`), the pool every FFI
 device total, it reserves $R = f M$ once and sets the pool's release threshold
 to $R$, so idle memory stays mapped. With `PREALLOCATE=false` the threshold is
 0: the pool unmaps every idle byte at each stream synchronize and the next
-launch maps it again, a 25–110 ms device-idle stall per executable. The
+launch maps it again, a 25–110 ms device-idle stall per executable (claim 2689). The
 fraction is not a cap (`AllocateRaw` never checks it); it sizes $R$ and the
 reported `bytes_limit` $=R$. The planners budget from the card total, not
 from the client ([memory model](../architecture/memory-model.md#budget)).
 
 **Memory outside the pool.** The CUDA context, NCCL communicators, the
 cuSOLVERMp context and its grow-only `cudaMalloc` workspace live outside
-$R$. Measured per rank at P=4 on A100-40GB:
+$R$. Measured per rank at P=4 on A100-40GB (claim 2697):
 
 | cumulative | bytes outside the pool |
 |---|---|

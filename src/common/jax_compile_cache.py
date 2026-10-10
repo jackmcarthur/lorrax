@@ -866,8 +866,8 @@ def compile_cache_stats() -> dict:
 # ---------------------------------------------------------------------------
 #: Retention.  Nothing used in the last five days is removed: the longest job
 #: wall on either machine is 120 h (Frontera's long queue; Perlmutter's is
-#: 48 h), and a live job's agreed entries must stay readable until it exits
-#: (an agreed entry that vanishes aborts the run, :func:`_fatal`).  Rank 0
+#: 48 h), so a live job's entries stay in place until the job exits and
+#: its peers can still read them.  Rank 0
 #: touches what it uses, so an mtime is a last use.  An entry goes after a week
 #: unused; another namespace too, or earlier, least recently used first, while
 #: the tree exceeds either cap.  Measured (P4, 3697ea6e): MoS2 bispinor 606

@@ -33,7 +33,7 @@ Every planner prices its stage against one number per device, the budget `B`
 (`common.gpu_utils.device_budget_bytes`, `src/common/gpu_utils.py:71`). One
 rule sets `B` from two quantities known before the deck is read: `M`, the
 card total (`cuDeviceTotalMem`, `runtime.xla_memory.cuda_device_total_bytes`,
-`src/runtime/xla_memory.py:101`), and `O`, the bytes the process holds
+`src/runtime/xla_memory.py:81`), and `O`, the bytes the process holds
 outside XLA's memory pool. This section defines the pool, states the rule,
 explains why the pool's reserved bytes can run past its reservation, and
 says which part of that the rule has to price.
@@ -65,14 +65,14 @@ The card's free bytes are `F(t) = M − O(t) − V(t)`.
 ### The rule {#rule}
 
 ```text
-B = (M − 1.2·O) / (1 + 1.2·φ)     the planner budget   (runtime.planner_budget_bytes, src/runtime/__init__.py:789)
+B = (M − 1.2·O) / (1 + 1.2·φ)     the planner budget   (runtime.planner_budget_bytes, src/runtime/__init__.py:812)
 R = M − 1.2·O_max                 the pool's reservation (runtime.pool_reservation_bytes, :797; runtime.pool_fraction = R/M)
 ```
 
 `O` is 3 GB (`OUTSIDE_POOL_BYTES`), plus 3 GB under `linalg = distributed`
 for the cuSOLVERMp/cuBLASMp contexts, their communicators and workspace
 (`DISTRIBUTED_LINALG_OUTSIDE_BYTES`; `O_max` = 6 GB). `φ` = 0.19
-(`POOL_OVERSHOOT`, `:779`) is the fraction by which the pool's in-use bytes
+(`POOL_OVERSHOOT`, `:802`) is the fraction by which the pool's in-use bytes
 `U` may run above the budget the planners priced: peaks they under-price,
 and free space trapped between live buffers ([§ what φ covers](#what-phi-covers)).
 1.2 is the margin (`MEMORY_MARGIN`). `B` is at most `R` and at least `M/4`.
@@ -95,7 +95,7 @@ processes on the node, and a process's devices share its budget.
 
 Every driver's architecture section prints the rule and the bytes already
 outside the pool after the communicator warm-up, the maximum over ranks
-(`runtime.xla_memory.outside_pool_bytes`, `src/runtime/xla_memory.py:119`),
+(`runtime.xla_memory.outside_pool_bytes`, `src/runtime/xla_memory.py:99`),
 with a warning when they exceed 0.75 of `M − R`. Nothing is sized from that
 reading.
 

@@ -640,11 +640,12 @@ root of the source tree, built once per GPU architecture at install. A
 checkout has no store unless one is built into it.
 
 **Cache.** The cache is always on, has no knob, and is separate from the XLA
-compile cache (`ISDF_JAX_CACHE_DIR`). Every mathdx handler receives its path
-as the string attribute `cubin_dir` (`src/ffi/fft.py:416`), so the path is
-part of the HLO and of the JAX compile key of every program that holds a
-k-convolution; it must be the same on every rank. One directory serves every
-world size: no image depends on P.
+compile cache. Every mathdx handler receives its path as the string attribute
+`cubin_dir` (`_mathdx_common`, `src/ffi/fft.py:416`), so the path is part of
+the HLO and of the JAX compile key of every program that holds a
+k-convolution ([compilation §2](compilation.md#2-native-kernels-and-nvrtc-images));
+it must be the same on every rank. One directory serves every world size: no
+image depends on P.
 
 - **Key.** `src/ffi/cpp/common/nvrtc_build.h` owns the rule for every
   NVRTC-built kernel (this family, the BSE outer kernels and the Fourier
@@ -666,23 +667,23 @@ world size: no image depends on P.
   options at `:2492`). Never $N_\mu$, the band counts or P. Three images
   depend on the system instead of the k-grid: mode 10 on the FFT plane
   $(n_b, n_c)$ and its occupied rows (`:3678`); the Fourier pair on the FFT
-  extents and supports (`fourier_plan_cuda_ffi.cc:250`); the BSE outer
+  extents and supports (`fourier_plan_cuda_ffi.cc:249`); the BSE outer
   kernels on the band rank $K = \min(n_c, n_v)$ padded to 4 and, for decode,
   $\lceil n_c/8 \rceil$ c-blocks (`kconv_outer_cuda_ffi.cc:283,835`).
 - **File.** `kconv_m<mode>[w<variant>]_<nkx>x<nky>x<nkz>_ns<ns>[x<n_r>][_c64]_sm<XY>_<key>.cubin`,
   `kconv_outer[_dec]_…` and `plan_pair_…`, each framed by a `LRXKCONV1`
   header carrying the key and a hash of the payload. An image is about
   8.5 MB on sm_80, 6.1 MB of it the `.nv_debug_ptx_txt` section that
-  `--generate-line-info` adds (`readelf -S`, mode 3 at 5×5×1).
+  `--generate-line-info` adds (claim 4127).
 - **Writes and reads.** A write goes to a unique temporary and is renamed
   into place (`nvrtc_build.cc:180`), which is atomic on one filesystem, so
   concurrent ranks each publish a whole file. A read re-hashes the payload
   and checks for an ELF image (`:168`); a torn, foreign or non-ELF file is
   recompiled once and renamed over the entry, and one the driver refuses to
   load is unlinked first (`:251`). Either acts on the cache entry itself.
-- **Cost.** A cold build is about 7 s per image per process; the cache pays
-  it once per user. The P4 hsuite builds 25 images cold, about 177 s of its
-  565 s cold wall (A100-80; the HSUITE lane's base_cold arm).
+- **Cost.** A cold build is about 7 s per image; the cache pays it once per
+  user. The fully cold P4 hsuite builds 25 images in 180.8 s of its 583.9 s
+  wall (one A100-80 node, claim 4129).
 - **Receipts.** Under `LORRAX_DEBUG_PRINT=1` the startup `[kconv]` line names
   the backend, the wheel root and the cache directory with its image count,
   size and the images linked from the store. Every kernel build prints
@@ -717,14 +718,14 @@ the cache, as without one.
   lines, 575.7 s. Cold with the 25-image store: no `NVRTC built` line, 25
   disk-cache hits through links, 389.7 s. The JAX compile cache built by the
   cold arm (2571 entries) stays warm with the store hidden (161.3 s) and
-  present (158.6 s): no new entry in either, no NVRTC build.
-  On the fixture grids (3³, 5×5×1, the 2×1×1 probe) the builder makes 59
-  images, among them all 22 k-grid-keyed images the hsuite builds, key for
-  key; the other three hsuite images are the system-keyed ones (two mode-10
-  planes, one BSE decode). The full `GRIDS` list is 395 calls, 389 images,
-  3.3 GB with the fixture images, about 12 min per architecture at four
-  processes. A store image that fails its hash is rebuilt into the cache
-  as a regular file and the store file is left as it was.
+  present (158.6 s): no new entry in either, no NVRTC build. A store image
+  that fails its hash is rebuilt into the cache as a regular file and the
+  store file is left as it was.
+  The builder reproduces all 22 k-grid-keyed images the hsuite builds, key
+  for key; the other three hsuite images are the system-keyed ones (two
+  mode-10 planes, one BSE decode). The full `GRIDS` list builds 330 images in
+  617 s at four processes; with the smoke decks' images the store is 392
+  images, 3.33 GB (claim 4127).
 
 ## 15. Numerical contract {#numerical-contract}
 

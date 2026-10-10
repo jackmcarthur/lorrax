@@ -11,7 +11,7 @@ the scalar bank, directions, pencils and store schema, which the sectors
 reuse, are [the shared-pole implementation page](shared_pole_model.md); the
 four-current physics and the $1/c$ counting are
 [bispinor GW](../theory/bispinor-gw.md). Code is cited as `file:line` at
-`7cb41088e`; read the file rather than the number.
+`b3147d82c`; read the file rather than the number.
 
 ## Symbols
 
@@ -114,7 +114,7 @@ keyed on it, repeats across rounds and SC maps.
 
 ## 3 The bank
 
-`compute_photon_bank` (`src/gw/response_bank.py:2825`) samples the photon $W$ once
+`compute_photon_bank` (`src/gw/response_bank.py:2824`) samples the photon $W$ once
 per map through the scalar producer: the same shared-node response rules,
 sample/derivative stream, Dyson solve, transaction masks and reader
 ([shared-pole model §2](shared_pole_model.md#2-the-response-bank)). It writes, per
@@ -380,7 +380,7 @@ A map writes four ordered models, `CC`, `TT`, `CT_C` and `CT_T`
 components for `TT` and `CT_T` and 1 otherwise. `CT_C` and `CT_T` share one pole
 census. A manifest `sectors.json` (`lorrax.shared-real-pole-sectors.v1`,
 representation `sector-ordered-ph`; `write_shared_pole_sector_manifest`,
-`src/file_io/shared_pole_store.py:956`) binds the four models and the bank's
+`src/file_io/shared_pole_store.py:973`) binds the four models and the bank's
 constant. Reuse of a published manifest on an interrupted SC map is
 [shared-pole model §1](shared_pole_model.md#1-one-map), step 4.
 
@@ -388,12 +388,12 @@ constant. Reuse of a published manifest on an interrupted SC map is
 when their bytes $M$ at the retained-pole bound, plus one copy, fit half the
 device budget beside the upstream stages, and the constructor's route is unchanged
 with $M$ live (`_sector_model_residence`, `src/gw/shared_pole_sectors.py:448`;
-`admit_resident_model`, `src/file_io/shared_pole_store.py:1633`). Otherwise they
+`admit_resident_model`, `src/file_io/shared_pole_store.py:1658`). Otherwise they
 go to files. Residence saves 5–8 % of a map on CrI3 6×6 at P4 (claim 3988).
 
 **Static W for BSE.** `write_restart_tensors = true` stores
 $W_0 = V + W_{c,CC}(0)$ from the CC model alone (`sector_static_wc`,
-`src/gw/mpa/sector_sigma.py:886`), both branches of the parent pair at V's q
+`src/gw/mpa/sector_sigma.py:898`), both branches of the parent pair at V's q
 parents, unfolded on load by BSE ([BSE](bse.md)).
 
 ## 7 The Σ consumer {#sector-sigma}

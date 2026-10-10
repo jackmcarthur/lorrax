@@ -451,7 +451,7 @@ _XLA_GPU_AUTOTUNE_DEFAULT = "0"
 #: the same rule as the autotune level (a caller's value wins), results bitwise
 #: and the device peak unchanged (sandbox claim 4179).  Not
 #: ``--xla_gpu_force_compilation_parallelism``, which forces a thread count
-#: and raised device memory (claim 683).
+#: and slowed cold compile 3.0 % (claim 684).
 _XLA_GPU_LLVM_PARALLEL_FLAG = "--xla_gpu_enable_llvm_module_compilation_parallelism"
 _XLA_GPU_LLVM_PARALLEL_DEFAULT = "true"
 
@@ -498,7 +498,7 @@ def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
     shorter, execution inside run-to-run noise) and
     ``--xla_gpu_enable_llvm_module_compilation_parallelism=true`` (claim
     4179: each module's LLVM IR compiles in parallel parts, results bitwise,
-    device peak unchanged; ``docs/reference/env_vars.md`` holds the numbers).
+    device peak unchanged; ``docs/architecture/compilation.md`` holds them).
     Both are GPU-only XLA flags: a forced CPU startup leaves ``XLA_FLAGS``
     byte-for-byte unchanged so the host/FFTW chain never depends on a GPU
     parser accepting them.

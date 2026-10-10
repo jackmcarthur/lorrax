@@ -71,7 +71,8 @@ directories (about 25 MB each, kept) are under `$SCRATCH/.cache/lorrax/hsuite`,
 or `~/.cache/lorrax/hsuite` where the site defines no `SCRATCH`. Its compile
 cache is the runtime's own, and `HSUITE_CACHE_DIR` moves it. The suite's
 [README](../tests/hsuite/README.md#wall-time-and-caches) says what a warm run
-needs and how `summary.json` splits each stage's wall.
+needs and how `summary.json` splits each stage's wall; where that wall goes is
+[compilation §4](architecture/compilation.md#4-where-the-time-goes).
 
 The P4 verdict is the four-rank `srun` line above. A one-rank launch
 (`srun -n 1 --gpus-per-node=1`) runs the same cell at P1, which is a smoke
