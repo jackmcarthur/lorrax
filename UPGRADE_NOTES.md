@@ -5,6 +5,21 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-10 — XLA compiles can run on helper threads: `common.jax_compile_cache.compile_ahead`
+
+A stage owner that knows a program's shapes before its first call hands it to
+`compile_ahead(program, *args)`: the lowering runs on the calling thread in
+program order, the compile agreement's request number is taken there, and
+XLA's backend compile runs on one of at most eight helper threads
+(`COMPILE_THREADS_MAX`, from the measured scaling: the P4 hsuite's 75 largest
+programs compile in 104 s serially, 29 s at four threads, 16 s at eight) while
+the driver goes on. The live call finds the executable or waits for the
+compile in flight; a module is compiled once per process whichever thread
+asks first. The agreement's lock no longer spans the backend compile. The
+response bank's `_compiled` holds these futures, and V^(1/2) compiles beside
+its slab read. No result moves (P4 hsuite eqp bitwise, cold and warm), no deck
+or environment change; `compile_cache_stats()` gains `compile_threads`.
+
 ## 2026-10-09 — `tests/hsuite` uses the runtime's compile cache and reports a per-stage compile census
 
 With `HSUITE_CACHE_DIR` unset, the suite no longer points `ISDF_JAX_CACHE_DIR`
