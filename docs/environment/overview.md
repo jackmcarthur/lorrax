@@ -226,7 +226,6 @@ slow "distributed init" is the CUDA plugin load inside the first
 | a CPU/MPI run exits rc=1 after succeeding | the driver did not end through `runtime.run_main_and_finalize()` ([transports](transports.md)) |
 | HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` (runtime default) |
 | wrong data from `psum_scatter` on CPU, rc=0 | the gloo transport; CPU collectives must run `impl=mpi` ([transports](transports.md)) |
-| compile-cache `KeyError` warnings | clear the directory `common.jax_compile_cache` names at startup |
 
 Debug flags: `JAX_DEBUG_NANS=1`, `JAX_DISABLE_JIT=1`, `JAX_LOG_COMPILES=1`,
 `TF_CPP_MIN_LOG_LEVEL=0`; profiling through `common.jax_profile`.
@@ -242,4 +241,4 @@ dependencies; groups `dev`, `jax`, `build`, `profile`; extras `cuda12`,
 **NVIDIA GPUs require `nvidia-mathdx`** (header-only cuFFTDx, pinned in the
 CUDA extras): every k-axis convolution runs kernels NVRTC compiles from its
 headers at run time, and a CUDA run without it refuses with
-`GATE mathdx-headers` ([k-convolution build and cache](../architecture/kconv.md#build-and-cache)).
+`GATE mathdx-headers` ([k-convolution refusals](../architecture/kconv.md#refusals)).

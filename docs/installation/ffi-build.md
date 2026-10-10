@@ -122,8 +122,7 @@ cmake -S src/ffi/cpp -B build_cuda \
     -DLORRAX_FFI_HAVE_CAL=OFF \
     -DHDF5_ROOT=<parallel HDF5 prefix> \
     -DLORRAX_MPI_INCLUDE_DIR=<dir with mpi.h> \
-    -DLORRAX_MPICH_LIB_DIR=<dir with libmpi> \
-    -DCMAKE_CUDA_ARCHITECTURES=<sm of the target GPU>
+    -DLORRAX_MPICH_LIB_DIR=<dir with libmpi>
 cmake --build build_cuda -j
 scripts/verify_ffi_build.sh --leg cuda build_cuda/liblorrax_ffi.so
 ```
@@ -136,8 +135,9 @@ the CUDA leg SLATE handlers. The CUDA leg reads the XLA FFI headers from
 `-DLORRAX_XLA_FFI_INCLUDE_DIR` or probes the same way.
 
 - `CMAKE_CUDA_ARCHITECTURES` defaults to SASS for sm_80, 86, 89, 90, 100 and
-  120 plus compute_80 and compute_120 PTX. It governs only the nvcc
-  translation units; NVRTC kernels compile for the running device.
+  120 plus compute_80 and compute_120 PTX, so the example leaves it unset. It
+  governs only the nvcc translation units; NVRTC kernels compile for the
+  running device.
 - Without `LORRAX_MPICH_LIB_DIR`, CMake warns and falls back to
   `/opt/hpcx/ompi/lib`, and the library requests `libmpi.so.40`.
   `src/ffi/cpp/build.sh` refuses to run without `LORRAX_MPI_INCLUDE_DIR` and

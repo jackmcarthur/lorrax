@@ -122,11 +122,11 @@ regenerate command.
 ## Wall time and caches
 
 On one node at P4 the fixtures' arithmetic takes seconds; most of a run's wall
-is the compile path. Each rank makes 3167 compile requests (claim 4168), and a
-warm run still traces and lowers every program
+is the compile path, and a warm run still traces and lowers every program
 ([compilation §4](../../docs/architecture/compilation.md#4-where-the-time-goes)
-has the cold and warm splits). Two caches make a second run cheaper. Both live
-under `$SCRATCH/.cache/lorrax/`, at the same path on every rank:
+has the request count and the cold and warm splits). Two caches make a second
+run cheaper. Both live under `$SCRATCH/.cache/lorrax/`, at the same path on
+every rank:
 
 - **JAX's persistent compile cache.** With `HSUITE_CACHE_DIR` unset, the suite
   uses the runtime's cache: `ISDF_JAX_CACHE_DIR` if exported, else the
@@ -134,17 +134,18 @@ under `$SCRATCH/.cache/lorrax/`, at the same path on every rank:
   ([env_vars §2e](../../docs/reference/env_vars.md#2e-compile-cache)).
   Programs that carry a host callback compile again in every run, because JAX
   never stores them (`uncacheable` below).
-- **The mathdx cubin cache** (`kconv_mathdx/`). A release links its prebuilt
+- **The NVRTC cubin cache** (`kconv_mathdx/`). A release links its prebuilt
   images into it from `<source root>/cubin_store`; NVRTC builds any other
-  image the first time a process meets its key, at about 7 s each. The two
-  fixtures need 25 images (claim 4126;
-  [kconv §14](../../docs/architecture/kconv.md#build-and-cache)). The cache's
-  path is part of every k-convolution program's JAX key, so a run is warm only
-  under the `SCRATCH` of the run that filled the JAX cache.
+  image the first time a process meets its key
+  ([compilation §2](../../docs/architecture/compilation.md#2-native-kernels-and-nvrtc-images)).
+  The cache's path is part of every k-convolution program's JAX key, so a run
+  is warm only under the `SCRATCH` of the run that filled the JAX cache.
 
 `HSUITE_CACHE_DIR=<empty dir>` gives a cold JAX cache with warm cubins, the
 state a release's first run meets. A fresh `SCRATCH` as well makes both
-caches cold.
+caches cold. `python -m tests.hsuite.chain` run directly takes its JAX cache
+from `--cache-dir`, which defaults to a new `<out>/jax-cache`, so without it
+every run is JAX-cold.
 
 `summary.json` `compile_s` splits each stage's wall, as seen from rank 0:
 
@@ -158,7 +159,7 @@ caches cold.
   compile receipts in the stage log. Each stage ends with its own receipt,
   which also closes the receipt window, so an SC driver's map-0 receipt counts
   that driver only.
-- `nvrtc_builds` and `nvrtc_s` count the cubins the stage built.
+- `nvrtc_builds` and `nvrtc_s` count the cubins the stage built or rebuilt.
 
 What remains of the wall, `wall - compile_path - nvrtc_s`, is execution, host
 work and I/O.

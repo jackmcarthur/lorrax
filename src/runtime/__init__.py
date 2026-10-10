@@ -3176,12 +3176,16 @@ def format_startup_report(f: dict) -> list:
         add(f"  The JAX persistent compile cache is enabled at "
             f"{cc.get('dir')}, {_share}.")
     else:
-        add("  The JAX persistent compile cache is OFF, so every rank "
-            "compiles every module in this run; set ISDF_JAX_CACHE_DIR to a "
-            "rank-visible directory to turn it on, or leave it unset and let "
-            "the resolution order pick one — LORRAX_RUN_DIR/.lorrax_jax_cache "
-            "first, then $SCRATCH/lorrax_jax_cache, then the home cache "
-            "(docs/reference/env_vars.md).")
+        # Names the one resolution _resolve_cache_base_dir applies: no other
+        # variable picks a location, so the advice must not suggest one.
+        add("  The JAX persistent compile cache is OFF (ISDF_JAX_CACHE_DIR "
+            "blank, JAX_COMPILATION_CACHE_MAX_SIZE=0, or a directory that "
+            "could not be armed; the [compile-cache] line on stderr says "
+            "which), so every rank compiles every module in this run. Unset "
+            "ISDF_JAX_CACHE_DIR for the runtime default, "
+            "$SCRATCH/.cache/lorrax/jax_compile/<namespace>/np{P}, or set it "
+            "to a directory every rank can read, under which np{P} is "
+            "appended (docs/reference/env_vars.md#2e-compile-cache).")
     add("  The cache key includes every array shape, so a system size this "
         "machine has not run before misses every entry no matter how warm "
         "the cache looks.")

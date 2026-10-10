@@ -132,15 +132,15 @@ kept by hand.
 
 Read in `common/jax_compile_cache.py`, which arms JAX's own persistent cache
 and adds only the namespace, the compile agreement and the receipt. What the
-cache keys, what it never stores and what it costs:
+cache keys, what makes it cold, how it is pruned and what it costs:
 [compilation §3](../architecture/compilation.md#3-xla-programs).
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
-| `ISDF_JAX_CACHE_DIR` | unset: the runtime default, `$SCRATCH/.cache/lorrax/jax_compile/<jax/jaxlib>_<ffi bundle>_<key schema>/np{P}` | machine | Unset, `common.jax_compile_cache` arms the cache in one namespace per jax/jaxlib, FFI bundle and key schema (never per source commit), and rank 0 prunes entries and namespaces it has not used for 7 days (never one used in the last 5 days; other namespaces also LRU past 2 GiB or 200k files). A non-empty value is used as-is, never namespaced or pruned; blank or whitespace opts out. Launchers and modules do not set it. |
-| `JAX_COMPILATION_CACHE_MAX_SIZE` | `-1` (unlimited) | external | JAX's own control; `0` disables the cache. A positive cap (JAX's LRU eviction) is supported only at P=1 and refuses at P>1, where LORRAX freezes an agreed all-rank entry set at startup. |
+| `ISDF_JAX_CACHE_DIR` | unset: the runtime default, `$SCRATCH/.cache/lorrax/jax_compile/<jax/jaxlib>_<ffi bundle>_<key schema>/np{P}` | machine | The only location control. Unset, the default namespace, pruned by rank 0. A non-empty value is the base directory, never namespaced or pruned; `np{P}` is still appended. Blank or whitespace opts out and clears JAX's `jax_compilation_cache_dir`, so an exported `JAX_COMPILATION_CACHE_DIR` does not apply either. Launchers and modules do not set it. |
+| `JAX_COMPILATION_CACHE_MAX_SIZE` | `-1` (unlimited) | external | JAX's own control: an integer of at least `-1`; `0` turns the cache off, as the blank opt-out does. A positive cap (JAX's LRU eviction) runs at P=1 and refuses at P>1 with `UnsafeCachePolicy`, because the eviction rewrites an access-time file under a lock on every hit on every rank. |
 | `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS` | unset: LORRAX sets `0` whenever the cache is on | external | JAX's write threshold. JAX's own `1.0` default persisted 2 of 666 MoS2 bispinor executables; an exported value wins. |
-| `LORRAX_JAX_COMPILE_AGREEMENT` | `1` (P>1 with a coordination client) | machine | *bool*. The cross-rank compile agreement ([compilation §3](../architecture/compilation.md#3-xla-programs)): a rank whose module differs from its peers' at the same request number, or a missing rank, refuses before the backend compile, naming every rank's key. Process-local handle literals are canonicalised. `0` is an unsafe bisect-only opt-out. |
+| `LORRAX_JAX_COMPILE_AGREEMENT` | `1` (P>1 with a coordination client) | machine | *bool*. The cross-rank compile agreement ([compilation §3](../architecture/compilation.md#3-xla-programs)): a rank whose module differs from its peers' at the same request number refuses before the backend compile, naming every rank's key; a missing rank refuses only under a finite `LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S`. `0` is an unsafe bisect-only opt-out. |
 | `LORRAX_JAX_COMPILE_AGREE_TIMEOUT_S` | `0` | machine | Seconds; `0` waits without bound and prints a heartbeat every 60 s naming the missing rank. A late rank is skew, not disagreement, so set a finite value only in tests. |
 
 ### 2f. HDF5 and slab I/O
@@ -319,7 +319,7 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `SLATE_SCALAPACK_TARGET` | SLATE's own dial, read by `blacs_grid.h` to announce the demotion it controls: unset means `HostTask`, so a CUDA-built SLATE runs on the CPU unless it is `devices`. Relevant only with `LORRAX_SCALAPACK_ALLOW_SLATE_API`. |
 | `OPENBLAS_THREAD_TIMEOUT` | `setdefault` `1` by `LORRAX_BLAS_TUNE` (§2a) at import of `runtime`; read once by OpenBLAS at the first `import numpy`, which is why every entry point imports `runtime` first. |
 | `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` | Read for the startup report's thread table and oversubscription warning; LORRAX sets none of them. On Frontera the XLA:CPU thread pool ignores OMP; `taskset` is the pinning mechanism. |
-| `SCRATCH` | Base of the k-convolution cubin cache ([kconv §14](../architecture/kconv.md#build-and-cache)), of the JAX compile cache (§2e) and of the `tests/hsuite` run tree (`.cache/lorrax/hsuite`); `~` where it is unset. Read, never set. No quadrature rule is stored there or anywhere else. |
+| `SCRATCH` | Base of the NVRTC cubin cache ([compilation §2](../architecture/compilation.md#2-native-kernels-and-nvrtc-images)), of the JAX compile cache (§2e) and of the `tests/hsuite` run tree (`.cache/lorrax/hsuite`); `~` where it is unset. Read, never set. No quadrature rule is stored there or anywhere else. |
 | `HDF5_USE_FILE_LOCKING` | `runtime.set_default_env` `setdefault`s `FALSE` before any store opens, and `file_io/hdf5_owner` reports the value. It governs only the serial h5py paths (the MPI-IO VFD takes no POSIX locks); Frontera `/work2` mounts node-local `localflock`, where cross-node locking is incoherent. |
 | `MPLBACKEND` | `setdefault` `Agg` for headless plotting. |
 | `FI_PROVIDER` | Not read by LORRAX. On Frontera CLX leave it unset (`LORRAX_MPI_PROVIDER=auto`) so Intel MPI picks `mlx` (provider costs: [transports §3](../environment/transports.md#intel-mpi-provider)). `fi_info` falsely reports `mlx` unavailable; trust the `libfabric provider:` line instead. In apptainer never `--bind /dev`. |

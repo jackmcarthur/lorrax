@@ -23,7 +23,10 @@ Two measured facts make the version string untrustworthy as the sole evidence:
    reading is ``jax.version.__version_info__ == (0, 5, 3)`` with
    ``_release_version is None``, i.e. a dev build off the 0.5.3 line.
 2. **What actually breaks is arity, not the number.**
-   ``common/jax_compile_cache.py`` wraps three ``jax._src`` privates (the cache lookup, the backend compile entry and ``ExecuteReplicated``).
+   ``common/jax_compile_cache.py`` wraps four ``jax._src`` entry points (the
+   cache lookup, the compile request, the backend compile and
+   ``ExecuteReplicated.__init__``) and, at P > 1, rebinds
+   ``ArrayImpl._multi_slice``.
    Two of them changed shape between the two generations, so the patched
    function is called with the wrong number of arguments and the run dies on
    its FIRST ``jit`` compile (measured; see :data:`REQUIRED_PRIVATE_ARITY`).

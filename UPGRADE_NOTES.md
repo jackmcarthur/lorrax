@@ -26,6 +26,20 @@ runtime now also clears `jax_compilation_cache_dir`. Before this, an exported
 `JAX_COMPILATION_CACHE_DIR` stayed live behind the OFF line. No deck or
 environment change, and no opt-out: results are bitwise.
 
+## 2026-10-10 — a release carries a cubin store that seeds the per-user cubin cache
+
+A release now carries `cubin_store/` at its source root: the NVRTC images of
+its target architecture, built once at install by `scripts/build_cubin_store.py`.
+A process's first `ffi.fft.cubin_cache_dir()` call links every store image the
+per-user cubin cache lacks into it; an image already in the cache is kept, and
+a bad store image is rebuilt into the cache while the store is left as it was.
+The cache path, and so every JAX compile key, is the same with or without a
+store, so a warm JAX cache stays warm. A release-cold P4 hsuite builds no NVRTC
+image and takes 389.7 s against 575.7 s without the store (sandbox claim 4126).
+A checkout has no store and builds each image once per user, as before.
+Results are unchanged. No deck or environment change
+([Compilation §2](docs/architecture/compilation.md#2-native-kernels-and-nvrtc-images)).
+
 ## 2026-10-10 — `src/` enters no legacy mesh context; both W branches share one window program
 
 Nothing in `src/` or the services opens `with mesh:` any more. Every sharding

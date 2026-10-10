@@ -306,9 +306,12 @@ _RECEIPT = re.compile(r"SC map (\d+) compile: real (\d+) \(([0-9.]+) s\), "
 # stage since the process started.
 _STAGE_RECEIPT = re.compile(r"compile: real (\d+) \(([0-9.]+) s\), cache hits (\d+), "
                             r"uncacheable (\d+)")
-# The mathdx k-convolution kernels NVRTC builds when their cubin is not in
-# ffi.fft.cubin_cache_dir (about 7 s each, every rank).
-_NVRTC = re.compile(r"NVRTC built .*? in ([0-9.]+) ms")
+# The NVRTC images (k-convolution, BSE outer, Fourier pair) built when their
+# cubin is not in ffi.fft.cubin_cache_dir, about 7 s each on every rank that
+# misses. "NVRTC rebuilt" is a cached image the driver refused, compiled again:
+# it costs the same, so it counts. \b, not a space: the Fourier pair's line has
+# nothing between "built" and "in".
+_NVRTC = re.compile(r"NVRTC (?:re)?built\b.*? in ([0-9.]+) ms")
 # JAX's compile-path events (jax._src.dispatch): tracing, lowering to MLIR,
 # and compile_or_get_cached (a persistent-cache read or an XLA compile).  A
 # trace nests inside another, so a stage's seconds are the union of its spans.

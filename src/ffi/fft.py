@@ -334,8 +334,10 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
 def _probe_kconv_compile(mesh: Mesh) -> None:
     """Compile and run one tiny mathdx kernel (mode 3, k-grid 2x1x1) on this
     process's first mesh device (else its first local device), so a device the installed cuFFTDx cannot
-    compile for refuses at startup, naming its compute capability, rather than
-    at the first k-convolution.  The cubin is disk-cached like every other."""
+    compile for is found at startup, not at the first k-convolution.  A failure
+    raises ``GATE mathdx-probe`` naming the compute capability; :func:`require_kconv`
+    catches it and every process demotes to the XLA backend with one warning.
+    The cubin is disk-cached like every other."""
     local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
     dev = local[0] if local else jax.local_devices()[0]
     try:
@@ -425,10 +427,11 @@ def cubin_cache_dir() -> str:
 
     Always on, and separate from the XLA compile cache
     (``common.jax_compile_cache``, one namespace per release): this store is small
-    and content-addressed — each image is keyed by the full hash of its source,
-    NVRTC options, wheel version and NVRTC version, written by tmp+rename and
-    re-hashed on read — so reusing it can never change a result, while
-    rebuilding it costs about 6 s per (mode, k-grid) per process.  One
+    and content-addressed — each image is keyed by the hash of its source,
+    headers, deciding NVRTC options and toolchain (``common/nvrtc_build.h``),
+    written by tmp+rename and re-hashed on read — so reusing it can never
+    change a result, while rebuilding one image costs about 7 s, once per user
+    (``docs/architecture/compilation.md``, §2).  One
     directory for every world size: an image depends on the device and the
     wheel, not on P.  No knob.  The first call of a process seeds it from the
     release's read-only store (:func:`seed_cubin_cache`).
