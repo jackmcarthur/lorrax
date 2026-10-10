@@ -159,6 +159,21 @@ def test_polar_stack_has_no_host_callback():
     np.testing.assert_allclose(np.asarray(link), u @ vh, atol=1e-12)
 
 
+def test_zeta_factor_has_no_host_callback(capsys):
+    """The charge ζ factor, replicated and q-parallel, holds no host callback; its
+    rank receipt prints on the host, and the two schedules agree bit for bit."""
+    from isdf import core
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    c = jax.device_put(_hermitian(8, b=4, seed=5), NamedSharding(mesh, P(None, "x", "y")))
+    f = core._factor_c_q_replicated(c, mesh, 8, zeta_rcond=1e-8)
+    g = core._factor_c_q_replicated_qparallel(c, mesh, 8, zeta_rcond=1e-8)
+    programs = [cache[next(k for k in cache if k[1:] == (4, 8, 8, 1e-8))]
+                for cache in (core._replicated_chol_cache, core._qparallel_factor_cache)]
+    assert [_host_callbacks(p.lower(c)) for p in programs] == [0, 0]
+    assert np.array_equal(np.asarray(f), np.asarray(g))
+    assert capsys.readouterr().out.count("[zeta rank_truncate] n_log=8 rcond=1.0e-08 n_keep/q=[8 8 8 8]") == 2
+
+
 _REUSE = textwrap.dedent("""
     import sys
     import jax, jax.numpy as jnp, numpy as np
