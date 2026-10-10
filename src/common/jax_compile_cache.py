@@ -21,7 +21,17 @@ is only what that cannot see or say:
   before the backend compile instead of hanging in its next collective
   (INVARIANTS 21), with the compile counter the receipt reads;
 * GATE xla_rematerialization (:func:`_install_device_fit_gate`): a module
-  larger than the device is refused before its first execution.
+  larger than the device is refused before its first execution;
+* :func:`compile_ahead`: a program whose avals a stage owner knows before its
+  first call is lowered on the calling thread (program order, so every rank
+  lowers the same module at the same request number) and compiled on a
+  helper thread, while the main thread goes on tracing, lowering and running.
+  XLA's backend compile releases the GIL and scales (P4 hsuite, A100 node,
+  16 cores per rank, 2026-10-10: the 75 largest programs 104 s serial, 29.1 s
+  at 4 threads, 16.4 s at 8, 12.4 s at 16); the agreement slot is taken on the
+  calling thread, so INVARIANTS 25's race (helper compiles reordering the
+  requests across ranks) cannot arise; a live call for a module in flight
+  waits for that compile instead of starting a second one.
 
 What this file no longer does, and why. Until 2026-10-05 it froze an
 all-rank agreed entry set at startup and vetoed every other lookup, made
@@ -50,6 +60,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 _COMPILATION_CACHE_READY = False
@@ -113,7 +124,12 @@ class _CacheState:
 
     def __init__(self) -> None:
         self._compile_event_lock = threading.RLock()
-        self._compile_current = None   # (module, key, request number) under the lock
+        # Per thread: ``current`` = (module, key, request number) of the request
+        # this thread is compiling; ``slot`` = the request number compile_ahead
+        # reserved for the program this helper thread compiles.
+        self._compile_local = threading.local()
+        self._inflight: dict = {}      # stable MLIR key -> Future of its executable
+        self._pool = None              # compile_ahead's helper threads
         self.enabled = False
         self.dir = ""
         self.n_proc = 1
@@ -724,9 +740,14 @@ def _install_compile_counter() -> None:
     both are module attributes of ``jax._src.compiler`` on the supported
     0.9.1 wheel. A request publishes this rank's fingerprint under its
     global request number; a real compile checks the other ranks' records
-    (:func:`_check_compile_record`). One lock keeps a process's requests in
-    one order, so request numbers agree across ranks that request the same
-    programs in the same order (INVARIANTS 21).
+    (:func:`_check_compile_record`). The request number is taken under one
+    lock in request order on the main thread, or is the slot
+    :func:`compile_ahead` reserved there for a helper thread, so request
+    numbers agree across ranks that request the same programs in the same
+    order (INVARIANTS 21, 25). The lock does not cover the backend compile:
+    helper threads compile beside the main thread. A request for a module
+    another thread is compiling waits for that executable (one compile per
+    module per process).
 
     Raises :class:`_JaxSurfaceUnsupported` when an entry point is absent, so
     the caller reports the storm telemetry OFF instead of a confident 0.
@@ -746,20 +767,38 @@ def _install_compile_counter() -> None:
     _orig_request = getattr(_compiler, _COMPILE_REQUEST_POINT)
 
     def _requested(*args, **kwargs):
-        if not _STATE.compile_agreement_enabled:
+        s = _STATE
+        if not (s.compile_agreement_enabled or s._pool is not None):
             return _orig_request(*args, **kwargs)
         module = args[1] if len(args) > 1 else kwargs.get("computation")
         module_name, key, fingerprint_secs = _compile_module_identity(module)
-        _STATE.compile_fingerprint_secs += fingerprint_secs
-        with _STATE._compile_event_lock:
-            occurrence = _STATE._compile_sequence
-            _STATE._compile_sequence += 1
-            _publish_compile_record(module_name, key, occurrence)
-            _STATE._compile_current = (module_name, key, occurrence)
-            try:
-                return _orig_request(*args, **kwargs)
-            finally:
-                _STATE._compile_current = None
+        local = s._compile_local
+        with s._compile_event_lock:
+            s.compile_fingerprint_secs += fingerprint_secs
+            occurrence = getattr(local, "slot", None)
+            if occurrence is None:
+                occurrence = s._compile_sequence
+                s._compile_sequence += 1
+            if s.compile_agreement_enabled:
+                _publish_compile_record(module_name, key, occurrence)
+            future = s._inflight.get(key)
+            owner = future is None
+            if owner:
+                future = s._inflight[key] = Future()
+        if not owner:
+            return future.result()
+        local.current = (module_name, key, occurrence)
+        try:
+            executable = _orig_request(*args, **kwargs)
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            local.current = None
+            with s._compile_event_lock:
+                s._inflight.pop(key, None)
+        future.set_result(executable)
+        return executable
 
     def _uncacheable(module, host_callbacks, seconds):
         # backend_compile_and_load(backend, module, devices, options, host_callbacks)
@@ -779,21 +818,85 @@ def _install_compile_counter() -> None:
                  f"compiles again in every process")
 
     def _counting(*args, **kwargs):
-        if _STATE.compile_agreement_enabled and _STATE._compile_current is not None:
-            _check_compile_record(*_STATE._compile_current)
+        current = getattr(_STATE._compile_local, "current", None)
+        if _STATE.compile_agreement_enabled and current is not None:
+            _check_compile_record(*current)
         module = args[1] if len(args) > 1 else kwargs.get("module")
         callbacks = args[4] if len(args) > 4 else kwargs.get("host_callbacks")
         t0 = time.monotonic()
         try:
             return _orig(*args, **kwargs)
         finally:
-            _STATE.compiles += 1
-            _STATE.compile_secs += time.monotonic() - t0
-            _uncacheable(module, callbacks, time.monotonic() - t0)
+            with _STATE._compile_event_lock:
+                _STATE.compiles += 1
+                _STATE.compile_secs += time.monotonic() - t0
+                _uncacheable(module, callbacks, time.monotonic() - t0)
 
     setattr(_compiler, _COMPILE_REQUEST_POINT, _requested)
     setattr(_compiler, _COMPILE_ENTRY_POINT, _counting)
     _compiler._lorrax_compile_counter_installed = True
+
+
+#: Helper threads per process for :func:`compile_ahead`, at most. Measured on
+#: the P4 hsuite's 75 largest programs (A100 node, 4 ranks, 16 cores per rank,
+#: every rank compiling at once; runs/DEV/813_compile2_20261010/parcomp): 104 s
+#: serial; 2 threads x1.86, 4 x3.58, 8 x6.32, 16 x8.42. Past 8 the per-program
+#: compile stretches (x1.23 at 8, x1.69 at 16: the node's 64 cores are full),
+#: and a live call waiting for ITS program pays that stretch; 8 keeps the gain
+#: and half the host memory of 16 concurrent XLA compiles.
+COMPILE_THREADS_MAX = 8
+
+
+def _pool() -> ThreadPoolExecutor:
+    s = _STATE
+    if s._pool is None:
+        try:
+            from runtime import _physical_cores_in_affinity
+            cores = _physical_cores_in_affinity() or 1
+        except Exception:                                  # noqa: BLE001
+            cores = max(1, len(os.sched_getaffinity(0)) // 2)
+        s._pool = ThreadPoolExecutor(max_workers=max(1, min(COMPILE_THREADS_MAX, cores)),
+                                     thread_name_prefix="lorrax-compile")
+    return s._pool
+
+
+def _compile_in_slot(lowered, slot):
+    local = _STATE._compile_local
+    local.slot = slot
+    try:
+        return lowered.compile()
+    finally:
+        local.slot = None
+
+
+def compile_ahead(program, *args) -> Future:
+    """Compile ``program.lower(*args)`` on a helper thread; return the Future of its ``Compiled``.
+
+    For a stage owner that knows a program's avals before its first call
+    (``program`` a ``jax.jit``, ``args`` arrays or ``jax.ShapeDtypeStruct``
+    with the live call's shardings). The lowering runs HERE, on the calling
+    thread in program order, so every rank lowers the same module at the same
+    request number, and that number is reserved now for the helper (INVARIANTS
+    21, 25); only XLA's backend compile, which releases the GIL, leaves the
+    thread. The live call then finds the executable on its lowering
+    (``MeshComputation.compile`` memoizes it) or waits for the compile in
+    flight (:func:`_install_compile_counter`); it never compiles twice. A
+    refusal raised by the compile (the agreement, a module over the device)
+    surfaces at ``.result()`` or at the live call, on the calling thread.
+    Helper threads never dispatch an executable.
+    """
+    lowered = program.lower(*args)
+    s = _STATE
+    with s._compile_event_lock:
+        slot = s._compile_sequence
+        s._compile_sequence += 1
+    return _pool().submit(_compile_in_slot, lowered, slot)
+
+
+def compile_threads() -> int:
+    """Helper threads :func:`compile_ahead` uses in this process (0 until its first call)."""
+    pool = _STATE._pool
+    return 0 if pool is None else int(pool._max_workers)
 
 
 
@@ -855,6 +958,7 @@ def compile_cache_stats() -> dict:
         "compile_agreement_checks": s.compile_agreement_checks,
         "compile_fingerprint_secs": s.compile_fingerprint_secs,
         "compile_agreement_secs": s.compile_agreement_secs,
+        "compile_threads": compile_threads(),
         "read_secs": s.read_secs, "namespace": s.namespace,
         "is_cache_writer": s.proc_idx == 0,
         "write_scope": "process-local; JAX writes on process 0 only",
