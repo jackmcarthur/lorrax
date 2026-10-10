@@ -5,6 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-10 — `src/` enters no legacy mesh context; both W branches share one window program
+
+Nothing in `src/` or the services opens `with mesh:` any more. Every sharding
+there is explicit, so the context was never read; it only put the mesh stack
+into every jit's trace and lowering key, and a nested block re-traced and
+re-lowered programs identical to earlier ones. `tests/test_glue3_program_counts.py`
+fails on a new one. In `gw.mpa`, `WSynthesis` takes no `ordered` and its
+`w_kernel` no `hole`: `window_operands(space, ...)` passes the branch's tables,
+`SynthesisTau.window_kernel()` takes no argument, `kconv_tables` may be a
+function of the window's `space`, `sector_sigma.ParentW` is `(W, partner)` and a
+sector node's `loads(space)` picks the branch. Host (k, band) head tables stay
+NumPy. Results are bitwise; the P4 hsuite's warm program lookups per rank go
+from 3167 to 3037. No deck or environment change.
+
 ## 2026-10-10 — `--xla_gpu_enable_llvm_module_compilation_parallelism=true` is a runtime default
 
 `runtime.set_default_xla_gpu_autotune` now appends a second GPU compile flag
