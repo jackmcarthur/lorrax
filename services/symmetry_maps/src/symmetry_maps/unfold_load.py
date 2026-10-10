@@ -255,8 +255,8 @@ def apply_unfold_load_tables_local(G, Gt, t: UnfoldLoadTables, spin_host, spin_r
 
 def _rotate_endpoints(spatial, L, R, spin_l, spin_r):
     """``L O R^dagger`` on centroid-major ``(k, mu, a, nu, b)``, skipping the entries that are
-    zero in the host ``spin_l`` / ``spin_r``: :func:`maps._rotate_open_spin_centroid_operator`'s
-    sum order and zero skips, with two widths."""
+    zero in the host ``spin_l`` / ``spin_r``; the one spelling of the typed spin action
+    (:func:`maps._rotate_open_spin_centroid_operator` is its one-width call)."""
     L, R = jnp.asarray(L), jnp.asarray(R)
     nl_s, nr_s = int(spatial.shape[2]), int(spatial.shape[4])
     left = jnp.stack([sum(L[:, a, c, None, None, None] * spatial[:, :, c]
