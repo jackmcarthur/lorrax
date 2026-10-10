@@ -69,3 +69,55 @@ def test_compile_ahead_surfaces_a_failing_compile():
     with pytest.raises(TypeError):
         # Lowering runs on the calling thread: a bad argument refuses here, not in the pool.
         jcc.compile_ahead(g, object())
+
+
+def test_live_call_during_the_ahead_compile_takes_no_number(monkeypatch):
+    """The live jit call of a program whose helper has not finished waits for
+    that compile and takes no request number: whether a rank's live call waits
+    or finds the executable on the lowering depends on timing, so a number
+    taken here would differ across ranks and the agreement would refuse."""
+    import threading
+    from common import jax_compile_cache as jcc
+    jcc.install_compile_agreement()
+    release = threading.Event()
+    original = jcc._compile_in_slot
+
+    def held(*args):
+        release.wait(10.0)                 # the helper starts only after the live call
+        return original(*args)
+
+    monkeypatch.setattr(jcc, "_compile_in_slot", held)
+
+    @jax.jit
+    def h(a):
+        return jnp.cos(a) @ jnp.sin(a).T + 2.0
+
+    x = jnp.asarray(np.linspace(0.0, 1.0, 36).reshape(6, 6))
+    before, numbers = _compiles(), jcc._STATE._compile_sequence
+    future = jcc.compile_ahead(h, x)
+    timer = threading.Timer(0.3, release.set)
+    timer.start()
+    live = h(x)                            # reaches the request hook while the helper waits
+    timer.join()
+    future.result()
+    assert jcc._STATE._compile_sequence == numbers + 1, "the live call took a number"
+    assert _compiles() == before + 1, "the live call compiled the program again"
+    np.testing.assert_array_equal(np.asarray(live), np.asarray(future.result()(x)))
+
+
+def test_repeated_ahead_calls_take_one_compile_and_one_number_each():
+    from common import jax_compile_cache as jcc
+    jcc.install_compile_agreement()
+
+    @jax.jit
+    def k(a):
+        return jnp.tanh(a).sum(axis=0)
+
+    x = jnp.asarray(np.linspace(-1.0, 1.0, 64).reshape(8, 8))
+    before, numbers = _compiles(), jcc._STATE._compile_sequence
+    futures = [jcc.compile_ahead(k, x) for _ in range(3)]
+    [f.result() for f in futures]
+    np.asarray(k(x))
+    assert _compiles() == before + 1
+    # One number per ahead call, finished or not, the same on every rank.
+    assert jcc._STATE._compile_sequence == numbers + 3

@@ -67,22 +67,17 @@ _COMPILATION_CACHE_READY = False
 # jax/_src/lru_cache.py
 _CACHE_SUFFIX = "-cache"
 
-_KV_NS = "lorrax/compile_cache/v1"
-
-# Per-module compile fingerprints use a separate protocol.  Unlike the
-# startup cache snapshot above, this one executes before EVERY backend
-# compile and refuses a rank-divergent module before XLA can enter collective
-# GPU autotuning and wait forever.
+# The compile agreement's control-plane namespace: every compile request
+# publishes this rank's module fingerprint under its request number there, and
+# a real compile reads the other ranks' records before XLA starts, so a
+# rank-divergent module is refused before it can wait in a collective.
 _COMPILE_KV_NS = "lorrax/compile_agreement/v2"
-# Production Si MPA legitimately reaches the post-planning host-materialize
-# compile slot 122 s apart across P4 ranks (JID 57909046.129).  Five minutes
-# keeps that measured skew inside the contract while remaining a finite
-# fail-fast bound; tests and bisect probes use their own short deadline.
-# Default 0: wait without bound.  A late rank is skew, not disagreement.  The
-# Sigma rule planner fits its windows round-robin across ranks, and on Si
-# b80/c504 one rank's share ran past the former 300-second deadline (JID
-# 57927048.48): rank 0 refused, tore down, and hung in a collective H5Fclose
-# while its peers were still fitting.  A deadline turned skew into a hang.
+# Default 0: wait for the other ranks' records without bound, naming a missing
+# rank every 60 s.  A late rank is skew, not disagreement: ranks reach the
+# same compile request minutes apart (Si MPA P4, 122 s; the Sigma rule planner
+# fits its windows round-robin across ranks), and a finite deadline turned
+# that skew into a refusal and a hang in a collective H5Fclose.  Tests and
+# bisect probes set their own short deadline.
 _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 0.0
 
 
@@ -111,12 +106,6 @@ def _timeout_ms(timeout_s: float) -> int:
     """A deadline in seconds as the control plane's milliseconds (0 = none)."""
     return max(1, int(round(timeout_s * 1000))) if timeout_s > 0 else 0
 
-# Parallel page-cache prefetch of the agreed entries (see _prefetch_agreed).
-# ON: at 606 centroids / P=16 the SERIAL reads of 169 entries cost 29 s on one
-# rank and 8.8 s on another, against the ~4.5 s of XLA compile they replace —
-# i.e. without this the cache is a net LOSS on a cold-read CPU run.  876 kB of
-# payload, so it is pure per-file Lustre latency under 16-way concurrency.
-
 
 class _CacheState:
     """Per-process counters: the receipt (:func:`compile_cache_stats`)."""
@@ -124,10 +113,9 @@ class _CacheState:
     def __init__(self) -> None:
         self._compile_event_lock = threading.RLock()
         # Per thread: ``current`` = (module, key, request number) of the request
-        # this thread is compiling; ``slot`` = the request number compile_ahead
-        # reserved for the program this helper thread compiles.
+        # this thread is compiling.
         self._compile_local = threading.local()
-        self._inflight: dict = {}      # stable MLIR key -> Future of its executable
+        self._ahead: dict = {}         # id(module) -> _Ahead, until its Compiled exists
         self._pool = None              # compile_ahead's helper threads
         self.enabled = False
         self.dir = ""
@@ -744,9 +732,12 @@ def _install_compile_counter() -> None:
     :func:`compile_ahead` reserved there for a helper thread, so request
     numbers agree across ranks that request the same programs in the same
     order (INVARIANTS 21, 25). The lock does not cover the backend compile:
-    helper threads compile beside the main thread. A request for a module
-    another thread is compiling waits for that executable (one compile per
-    module per process).
+    helper threads compile beside the main thread. A :func:`compile_ahead`
+    program is compiled by whichever thread requests it first, its helper or
+    its live call, under the number reserved at the ahead call; JAX's compile
+    memo (``pxla._cached_compilation``) holds the other until it is done.
+    Which thread wins depends on timing, but the count of numbers does not,
+    so the numbers stay rank-symmetric.
 
     Raises :class:`_JaxSurfaceUnsupported` when an entry point is absent, so
     the caller reports the storm telemetry OFF instead of a confident 0.
@@ -770,33 +761,44 @@ def _install_compile_counter() -> None:
         if not (s.compile_agreement_enabled or s._pool is not None):
             return _orig_request(*args, **kwargs)
         module = args[1] if len(args) > 1 else kwargs.get("computation")
+        with s._compile_event_lock:
+            ahead = s._ahead.get(id(module))
+            if ahead is not None and ahead.module is not module:
+                ahead = None
+            taken = ahead is not None and ahead.claimed
+            if ahead is not None:
+                ahead.claimed = True
+        if taken:
+            # Another thread is compiling this compile_ahead program under its
+            # reserved number; JAX's compile memo normally holds this caller
+            # before it gets here.
+            return ahead.executable.result()
         module_name, key, fingerprint_secs = _compile_module_identity(module)
-        local = s._compile_local
         with s._compile_event_lock:
             s.compile_fingerprint_secs += fingerprint_secs
-            occurrence = getattr(local, "slot", None)
-            if occurrence is None:
+            if ahead is None:
                 occurrence = s._compile_sequence
                 s._compile_sequence += 1
+            else:
+                # A compile_ahead program, compiled by its helper or by its live
+                # call if that came first: either way the number reserved at
+                # the ahead call on every rank, never a new one, so the count
+                # does not depend on which thread won.
+                occurrence = ahead.slot
             if s.compile_agreement_enabled:
                 _publish_compile_record(module_name, key, occurrence)
-            future = s._inflight.get(key)
-            owner = future is None
-            if owner:
-                future = s._inflight[key] = Future()
-        if not owner:
-            return future.result()
+        local = s._compile_local
         local.current = (module_name, key, occurrence)
         try:
             executable = _orig_request(*args, **kwargs)
         except BaseException as exc:
-            future.set_exception(exc)
+            if ahead is not None:
+                ahead.executable.set_exception(exc)
             raise
         finally:
             local.current = None
-            with s._compile_event_lock:
-                s._inflight.pop(key, None)
-        future.set_result(executable)
+        if ahead is not None:
+            ahead.executable.set_result(executable)
         return executable
 
     def _uncacheable(module, host_callbacks, seconds):
@@ -857,13 +859,30 @@ def _pool() -> ThreadPoolExecutor:
     return s._pool
 
 
-def _compile_in_slot(lowered, slot):
-    local = _STATE._compile_local
-    local.slot = slot
+class _Ahead:
+    """One :func:`compile_ahead` program: its module, the request number
+    reserved for it, whether a thread has claimed its compile, and the Future
+    of the executable that compile returns."""
+
+    __slots__ = ("module", "slot", "claimed", "executable")
+
+    def __init__(self, module, slot):
+        self.module, self.slot, self.claimed, self.executable = module, slot, False, Future()
+
+
+def _compile_in_slot(lowered, entry):
+    s = _STATE
     try:
         return lowered.compile()
     finally:
-        local.slot = None
+        # The lowering now holds the executable for every later live call.
+        with s._compile_event_lock:
+            if s._ahead.get(id(entry.module)) is entry:
+                del s._ahead[id(entry.module)]
+        if not entry.executable.done():
+            # Nobody claimed it: the lowering already held an executable (on
+            # every rank alike), so no request was made and nobody waits.
+            entry.executable.set_exception(RuntimeError("compiled before its ahead call"))
 
 
 def compile_ahead(program, *args) -> Future:
@@ -875,19 +894,29 @@ def compile_ahead(program, *args) -> Future:
     thread in program order, so every rank lowers the same module at the same
     request number, and that number is reserved now for the helper (INVARIANTS
     21, 25); only XLA's backend compile, which releases the GIL, leaves the
-    thread. The live call then finds the executable on its lowering
-    (``MeshComputation.compile`` memoizes it) or waits for the compile in
-    flight (:func:`_install_compile_counter`); it never compiles twice. A
+    thread. The live call, through the Future or through the jit, finds the
+    executable on its lowering (``MeshComputation.compile`` memoizes it) or
+    waits in JAX's compile memo for the helper's compile; if it reaches the
+    compile first it compiles under the reserved number and the helper takes
+    its executable (:func:`_install_compile_counter`). Either way the program
+    compiles once and takes one request number on every rank. If the
+    lowered module differs from the live call's, the live call compiles it
+    again: an ahead call must pass the live call's avals and shardings. A
     refusal raised by the compile (the agreement, a module over the device)
     surfaces at ``.result()`` or at the live call, on the calling thread.
     Helper threads never dispatch an executable.
     """
     lowered = program.lower(*args)
+    module = lowered.compiler_ir("stablehlo")       # the object JAX compiles
     s = _STATE
     with s._compile_event_lock:
-        slot = s._compile_sequence
+        # A number is reserved on every call, so the count does not depend on
+        # whether an earlier ahead compile of this module has finished.
+        entry = _Ahead(module, s._compile_sequence)
         s._compile_sequence += 1
-    return _pool().submit(_compile_in_slot, lowered, slot)
+        if s._ahead.get(id(module)) is None:
+            s._ahead[id(module)] = entry
+    return _pool().submit(_compile_in_slot, lowered, entry)
 
 
 def compile_threads() -> int:
@@ -980,9 +1009,9 @@ _NS_MAX_FILES = 200_000
 _NS_PRUNE_EVERY_S = 6 * 3600
 _NS_STAMP = ".last_used"
 _NS_PRUNE_STAMP = ".last_prune"
-#: Bump when this file changes how a key is hashed (the invariant-key and
-#: shard-slice patches) or how an entry is stored (the atomic writer): those
-#: change what an entry means without changing jax, jaxlib or the FFI bundle.
+#: Bump when an entry's meaning changes without jax, jaxlib or the FFI bundle
+#: changing (a LORRAX patch to how JAX keys or stores an entry). There is none
+#: today: JAX's own key and writer are used unchanged, so ``k1`` stays.
 _KEY_SCHEMA = "k1"
 
 
@@ -1171,6 +1200,23 @@ def _resolve_cache_base_dir() -> tuple[str, str]:
     return str(default_cache_dir()), "runtime default"
 
 
+def _disarm_persistent_cache(_jax) -> None:
+    """Leave JAX with no persistent cache on an OFF path.
+
+    JAX reads ``JAX_COMPILATION_CACHE_DIR`` into ``jax_compilation_cache_dir``
+    itself, and binds its cache object at the first compile that consults it
+    (the mesh warm-up, before this step), so a caller's exported directory
+    would stay live while the log says OFF; the reset unbinds it.
+    """
+    try:
+        _jax.config.update("jax_compilation_cache_dir", None)
+        from jax._src import compilation_cache as _cc
+        _cc.reset_cache()
+    except Exception as exc:                               # noqa: BLE001
+        _say(f"could not clear jax_compilation_cache_dir ({type(exc).__name__}: "
+             f"{exc}); a caller's JAX_COMPILATION_CACHE_DIR may stay live.")
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1219,6 +1265,7 @@ def ensure_jax_compile_cache() -> None:
         # process 0 and READ on its peers, with no real base directory.
         _jax.config.update("jax_persistent_cache_enable_xla_caches", "")
     if not cache_dir:
+        _disarm_persistent_cache(_jax)
         if proc_idx == 0:
             reason = ("ISDF_JAX_CACHE_DIR=\"\" opt-out"
                       if cache_source == "explicit" else cache_source)
@@ -1228,6 +1275,7 @@ def ensure_jax_compile_cache() -> None:
 
     from jax._src import config as _jax_config
     if not _cache_size_policy(n_proc, int(_jax_config.compilation_cache_max_size.value)):
+        _disarm_persistent_cache(_jax)
         if proc_idx == 0:
             _say("persistent compile cache OFF (JAX_COMPILATION_CACHE_MAX_SIZE=0).")
         return
@@ -1247,6 +1295,7 @@ def ensure_jax_compile_cache() -> None:
         from jax._src import compilation_cache as _cc
         _cc.reset_cache()
     except Exception as exc:                               # noqa: BLE001
+        _disarm_persistent_cache(_jax)
         if proc_idx == 0:
             _say(f"DISABLED: cannot arm {cache_path} ({exc}). Every rank "
                  f"compiles from scratch.")

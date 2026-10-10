@@ -74,3 +74,31 @@ def test_program_keys_hold_no_site_or_budget():
     for fn in (plan_mod._stack_price, plan_mod._reshard_stack_program):
         names = inspect.signature(getattr(fn, "__wrapped__", fn)).parameters
         assert not {"site", "budget_bytes", "room"} & set(names), (fn.__name__, list(names))
+
+
+@pytest.mark.parametrize("off", ["opt_out", "max_size_zero"])
+def test_cache_off_leaves_no_jax_cache_dir(off, monkeypatch, tmp_path):
+    """Every OFF path clears ``jax_compilation_cache_dir``: JAX reads a caller's
+    ``JAX_COMPILATION_CACHE_DIR`` into it itself, and the log says OFF."""
+    from jax._src import compilation_cache as cc
+    from common import jax_compile_cache as jcc
+    exported = tmp_path / "exported"
+    exported.mkdir()
+    saved = (jax.config.jax_compilation_cache_dir, jax.config.jax_compilation_cache_max_size)
+    try:
+        jax.config.update("jax_compilation_cache_dir", str(exported))
+        cc.reset_cache()
+        if off == "opt_out":
+            monkeypatch.setenv("ISDF_JAX_CACHE_DIR", "")
+        else:
+            monkeypatch.setenv("ISDF_JAX_CACHE_DIR", str(tmp_path / "lorrax"))
+            jax.config.update("jax_compilation_cache_max_size", 0)
+        monkeypatch.setattr(jcc, "_COMPILATION_CACHE_READY", False)
+        jcc.ensure_jax_compile_cache()
+        assert jax.config.jax_compilation_cache_dir is None
+        jax.jit(lambda a: jnp.exp(a) * 3.0 + 0.25)(jnp.arange(5.0)).block_until_ready()
+        assert list(exported.iterdir()) == [], "the exported cache dir stayed live"
+    finally:
+        jax.config.update("jax_compilation_cache_dir", saved[0])
+        jax.config.update("jax_compilation_cache_max_size", saved[1])
+        cc.reset_cache()
