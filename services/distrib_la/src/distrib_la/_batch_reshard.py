@@ -459,19 +459,21 @@ def batch_layout_eigh_call(op: str, mesh: Mesh, A, *, real_rows: int | None = No
     nreal = nb if real_rows is None else int(real_rows)
     if not 1 <= nreal <= nb:
         raise ValueError(f"batch layout {op}: real_rows={real_rows} outside [1, {nb}]")
-    key = ("batch_layout", op, mesh_key(mesh), nb, n, str(A.dtype), nreal)
+    # The real-row count is an operand: one program per (op, stack shape, dtype)
+    # serves every count, and the row mask it builds is the same select either way.
+    key = ("batch_layout", op, mesh_key(mesh), nb, n, str(A.dtype))
     fn = _JIT_CACHE.get(key)
     if fn is None:
         spec = P(("x", "y"), None, None)
 
-        def _body(local):
-            W, Z = _local_stack_eigh(op, local, nbatch=nreal, py=py)
+        def _body(local, nbatch):
+            W, Z = _local_stack_eigh(op, local, nbatch=nbatch, py=py)
             return _replicate_batch_vector(W, px=px, py=py), Z
 
-        fn = jax.jit(shard_map(_body, mesh=mesh, in_specs=(spec,),
+        fn = jax.jit(shard_map(_body, mesh=mesh, in_specs=(spec, P()),
                                out_specs=(P(), spec), check_vma=False))
         _JIT_CACHE[key] = fn
-    return fn(A)
+    return fn(A, np.int32(nreal))
 
 
 def batch_reshard_call(

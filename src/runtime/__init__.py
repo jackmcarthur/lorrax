@@ -1596,7 +1596,9 @@ def nccl_warmup(mesh_xy) -> None:
         warm_specs.append(((n_ax,), P(ax)))                # per-axis psum
     for shape, spec in warm_specs:
         sharding = NamedSharding(mesh_xy, spec)
-        x = jax.device_put(jnp.ones(shape, dtype=jnp.float64), sharding)
+        # Born sharded: a single-device ``ones`` resharded onto the mesh would
+        # lower JAX's shard slicer once per shape (common.jax_compile_cache).
+        x = jnp.ones(shape, dtype=jnp.float64, device=sharding)
         _ = jax.jit(jnp.sum)(x).block_until_ready()
 
 

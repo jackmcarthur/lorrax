@@ -1136,8 +1136,10 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
         # scale with an unphysical norm.  The row-sum bound is above this
         # k block's entire physical spectrum, with a 1 Ry margin.
         sentinel = _eigh_pad_sentinel(H_j)
-        i = jnp.arange(nb_pad)[:, None]
-        j = jnp.arange(nb_pad)[None, :]
+        # A host mask: built with jnp it was five eager programs per band
+        # count plus the shard slicer that reshards it onto H's mesh.
+        i = np.arange(nb_pad)[:, None]
+        j = np.arange(nb_pad)[None, :]
         on_pad_diag = ((i == j) & (i >= nb))[None]
         H_j = jnp.where(on_pad_diag, sentinel[:, None, None], H_j)
     plan = distrib_la.plan("eigh", mesh, backend=distrib_la_backend, n=nb_pad,

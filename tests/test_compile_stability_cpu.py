@@ -14,6 +14,8 @@ shape, not on a timing:
 3. One plan on one stack from two call sites compiles once.
 4. Partner directions keep one carrier whatever their count (e2200b174).
 5. Face constructor rounds share one width, the ragged tail included.
+6. The batch-layout eigh takes its real-row count as an operand: one program
+   per stack serves every count.
 """
 import os
 import subprocess
@@ -47,6 +49,18 @@ def _backend_compiles():
     monitoring.register_event_duration_secs_listener(
         lambda event, secs, **kw: names.append(kw.get("fun_name", "?"))
         if event == dispatch.BACKEND_COMPILE_EVENT else None)
+    return names
+
+
+def _lowerings():
+    """A list that grows by one name per jaxpr-to-MLIR lowering from now on (a
+    program traced and lowered again is paid for even when JAX's in-memory
+    executable cache then serves the compile)."""
+    from jax._src import dispatch, monitoring
+    names = []
+    monitoring.register_event_duration_secs_listener(
+        lambda event, secs, **kw: names.append(kw.get("fun_name", "?"))
+        if event == dispatch.JAXPR_TO_MLIR_MODULE_EVENT else None)
     return names
 
 
@@ -272,3 +286,25 @@ def test_face_rounds_share_one_width():
     assert {len(ids) for ids, _, _ in rounds} == {3}
     assert all(np.array_equal(slots, np.arange(3)) for _, _, slots in rounds)
     assert sorted({q for ids, real, _ in rounds for q in ids[:real]}) == list(range(7))
+
+def test_batch_eigh_real_row_count_is_an_operand():
+    """One batch-layout eigh program per stack serves every real-row count; the
+    real rows' spectra are the stack's own ``native_eigh`` on the zeroed stack,
+    bit for bit."""
+    from distrib_la._batch_reshard import batch_layout_eigh_call
+    from distrib_la._result_check import native_eigh
+    mesh = _mesh()
+    stack = np.asarray(_hermitian(8, b=4))
+    a = jax.device_put(jnp.asarray(stack), NamedSharding(mesh, P(("x", "y"), None, None)))
+    w3, z3 = jax.block_until_ready(batch_layout_eigh_call("eigh", mesh, a, real_rows=3))
+    names = _lowerings()
+    w2, z2 = jax.block_until_ready(batch_layout_eigh_call("eigh", mesh, a, real_rows=2))
+    assert names == [], names
+    for real, (w, z) in ((3, (w3, z3)), (2, (w2, z2))):
+        masked = stack.copy()
+        masked[real:] = 0
+        w_ref, z_ref = jax.block_until_ready(native_eigh(jnp.asarray(masked)))
+        assert np.array_equal(np.asarray(w)[:real], np.asarray(w_ref)[:real])
+        assert np.array_equal(np.asarray(z)[:real], np.asarray(z_ref)[:real])
+        assert not np.any(np.asarray(w)[real:]) and not np.any(np.asarray(z)[real:])
+
