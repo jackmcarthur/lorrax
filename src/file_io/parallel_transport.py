@@ -1970,7 +1970,7 @@ def _velocity_error_metrics(
     scale = jnp.maximum(jnp.abs(exact), float(atol))
     relative = error / scale
     nband = exact.shape[-1]
-    diagonal = jnp.eye(nband, dtype=bool)[None, None, :, :]
+    diagonal = np.eye(nband, dtype=bool)[None, None, :, :]
     off_diagonal = ~diagonal
     max_abs = float(jax.device_get(jnp.max(error)))
     max_rel = float(jax.device_get(jnp.max(relative)))
