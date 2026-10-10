@@ -227,6 +227,12 @@ COMPACT_PAULI_FRAME_SCHEMA = 'lorrax.dev.compact_pauli_common_frame.v1'
 COMPACT_PAULI_SUPPORT_POLICY = (
     'B and D use the SAME authenticated native positive Hermite-cell interval; '
     'zero contribution outside that interval; no analytic nucleus extrapolation')
+AE_LARGE_SUPPORT_POLICY = (
+    'B uses compact construction large and its free sigma-gradient; '
+    'D uses chi=R_inverse L; finite-K served sphere/tail/cross are diagnostics')
+AE_LARGE_TARGET_WITNESS = dict(
+    schema='lorrax.dev.ae_large_free_graph_target_witness.v1',
+    kind='compact_construction_large_sobolev')
 
 
 def native_hermite_delta_gram(data, *, quadrature_order=4):
@@ -252,9 +258,159 @@ def native_hermite_delta_gram(data, *, quadrature_order=4):
         delta_u=query[:, None]*radial, l=data['l'], kappa=data['kappa']))
 
 
+def _ae_large_target_gram_witness(entry, data, pins, *, support_radius):
+    """Remeasure the construction L/free-small target, not served bank norms."""
+    import importlib.util
+    import json
+    from pathlib import Path
+    from psp.augmentation_cache import _payload_hash, _target_inputs
+    from psp.augmentation_spinors import free_graph_small_from_large
+
+    path, expected = entry.get('target_witness_file'), entry.get('target_witness_sha256')
+    if (not isinstance(path, str) or not Path(path).is_absolute()
+            or pins.get(path) != expected
+            or hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected):
+        raise ValueError('AE-large target requires the independently pinned construction witness')
+    with np.load(path, allow_pickle=False) as archive:
+        metadata = json.loads(str(archive['metadata_json']))
+        arrays = {k:archive[k].copy() for k in archive.files if k != 'metadata_json'}
+    required = {'source_radius', 'source_weights_dr', 'source_large_R',
+        'source_dlarge_R_dr', 'source_lower_free_graph_R', 'ell', 'kappa',
+        'labels', 'target_B', 'momentum', 'weights_dK', 'pauli_radial_spectrum',
+        'normalized_large_spectrum', 'normalized_small_spectrum', 'target_large_spectrum',
+        'native_small_diagnostic_spectrum', 'source_native_small_R', 'represented_spectral_B'}
+    if (set(arrays) != required
+            or any(metadata.get(k) != v for k,v in AE_LARGE_TARGET_WITNESS.items())
+            or metadata.get('payload_sha256') != _payload_hash(arrays)):
+        raise ValueError('AE-large construction witness schema/kind/payload mismatch')
+    control = metadata.get('construction_controls')
+    if not isinstance(control, dict):
+        raise ValueError('AE-large construction witness requires exact construction controls')
+    inputs = _target_inputs(data, control, support_radius)
+    if (inputs is None or metadata.get('target_binding') != inputs[3]
+            or entry.get('target_binding') != inputs[3]
+            or entry.get('construction_controls') != control):
+        raise ValueError('AE-large witness/frame and primitive constructor targets differ')
+    descriptor = inputs[3]['descriptor']
+    if (metadata.get('construction_window') !=
+            [descriptor['dirac_window_start'], descriptor['dirac_window_stop']]
+            or metadata.get('target_radial_domain') != [0.,descriptor['dirac_window_stop']]):
+        raise ValueError('AE-large exact construction support differs from its input window')
+    owners = metadata.get('source_owners_sha256')
+    if not isinstance(owners, dict) or not owners:
+        raise ValueError('AE-large construction witness requires numerical owner pins')
+    for module in ('psp.augmentation_cache', 'psp.augmentation_spinors', 'common.bispinor_init'):
+        origin = importlib.util.find_spec(module).origin
+        actual = hashlib.sha256(Path(origin).read_bytes()).hexdigest()
+        if {pin for name,pin in owners.items() if Path(name).name == Path(origin).name} != {actual}:
+            raise ValueError('AE-large construction witness numerical owner changed')
+    r, w = arrays['source_radius'], arrays['source_weights_dr']
+    ell, kappa = arrays['ell'], arrays['kappa']
+    if (r.dtype != np.float64 or w.dtype != np.float64 or w.shape != r.shape
+            or r.ndim != 1 or len(r) < 2 or np.any(r <= 0)
+            or np.any(np.diff(r) <= 0) or np.any(w <= 0)
+            or not np.isfinite(r).all() or not np.isfinite(w).all()
+            or np.any(r >= descriptor['dirac_window_stop'])
+            or not np.array_equal(ell, data['l']) or not np.array_equal(kappa, data['kappa'])
+            or not np.array_equal(arrays['labels'], spinor_function_labels(ell, kappa))):
+        raise ValueError('AE-large construction witness radial/angular support mismatch')
+    for key in ('source_large_R', 'source_dlarge_R_dr', 'source_lower_free_graph_R'):
+        value = arrays[key]
+        if (value.dtype != np.complex128 or value.shape != (len(r),len(ell))
+                or not np.isfinite(value).all()):
+            raise ValueError('AE-large construction witness fields must be finite complex128')
+    lower = free_graph_small_from_large(r, arrays['source_large_R'],
+        arrays['source_dlarge_R_dr'], kappa)
+    if not np.array_equal(lower, arrays['source_lower_free_graph_R']):
+        raise ValueError('AE-large target lower is not the same free sigma-gradient including window derivative')
+    common = dict(r=r, weights_dr=w)
+    upper_B = atomic_delta_gram(dict(common, delta_u=r[:,None]*arrays['source_large_R'], l=ell, kappa=kappa))
+    lower_B = atomic_delta_gram(dict(common, delta_u=r[:,None]*lower,
+        l=2*np.abs(kappa)-1-ell, kappa=-kappa))
+    B = upper_B+lower_B
+    saved = arrays['target_B']
+    if (saved.shape != B.shape or saved.dtype != np.complex128
+            or not np.isfinite(saved).all()
+            or np.max(abs(saved-B)) > 2e-10*max(1.,float(np.max(abs(B))))):
+        raise ValueError('AE-large target B is not its construction large/free-small Sobolev Gram')
+    return B
+
+
+def _authenticate_ae_large_frame_witness(metadata, arrays, pins, *, wfn_sha256):
+    """Join an independently contracted full-source witness to actual arrays."""
+    import json
+    from pathlib import Path
+
+    bound = metadata.get('independent_target_witness')
+    required = {'schema', 'program_file', 'program_sha256', 'spec_file', 'spec_sha256',
+        'receipt_file', 'receipt_sha256', 'arrays_file', 'arrays_sha256',
+        'target_binding_sha256_by_species'}
+    if (not isinstance(bound, dict) or set(bound) != required
+            or bound['schema'] != 'lorrax.dev.ae_large_target_witness.v1'):
+        raise ValueError('AE-large frame requires its independent full-source target witness')
+    for stem in ('program', 'spec', 'receipt', 'arrays'):
+        name, expected = bound[stem+'_file'], bound[stem+'_sha256']
+        if (not isinstance(name, str) or not Path(name).is_absolute()
+                or pins.get(name) != expected
+                or hashlib.sha256(Path(name).read_bytes()).hexdigest() != expected):
+            raise ValueError('Independent AE-large witness file identity differs: '+stem)
+    receipt = json.loads(Path(bound['receipt_file']).read_text())
+    if (receipt.get('schema') != bound['schema']
+            or receipt.get('status') != 'PASS_INDEPENDENT_CONTINUUM_AE_LARGE_TARGET_FULL_SOURCE'
+            or receipt.get('program_sha256') != bound['program_sha256']
+            or receipt.get('spec_sha256') != bound['spec_sha256']
+            or receipt.get('arrays_sha256') != bound['arrays_sha256']
+            or receipt.get('wfn_sha256') != wfn_sha256
+            or receipt.get('physical_bands') != metadata['physical_bands']
+            or receipt.get('complete_all_FILE_parents') is not True):
+        raise ValueError('Independent AE-large target witness receipt/domain differs')
+    for key in ('source_files_sha256', 'source_input_files_sha256'):
+        recorded = receipt.get(key)
+        if (not isinstance(recorded, dict) or not recorded
+                or any(pins.get(name) != expected for name,expected in recorded.items())):
+            raise ValueError('Independent AE-large witness and frame have different source/input pins')
+    spec = json.loads(Path(bound['spec_file']).read_text())
+    math_file, math_sha = spec.get('math_owner_file'), spec.get('math_owner_sha256')
+    if (not isinstance(math_file, str) or not Path(math_file).is_absolute()
+            or receipt.get('math_owner_sha256') != math_sha
+            or receipt['source_files_sha256'].get(math_file) != math_sha):
+        raise ValueError('Independent AE-large witness literal math owner differs')
+    species = metadata['atomic_species_inputs']
+    descriptors = {z:entry['target_binding'] for z,entry in species.items()}
+    descriptor_hashes = {z:hashlib.sha256(json.dumps(value, sort_keys=True,
+        separators=(',',':'), allow_nan=False).encode()).hexdigest() for z,value in descriptors.items()}
+    if (receipt.get('target_binding_by_species') != descriptors
+            or bound['target_binding_sha256_by_species'] != descriptor_hashes
+            or receipt.get('common_spectrum_sha256_by_species') !=
+                {z:entry['spectral_witness_sha256'] for z,entry in species.items()}):
+        raise ValueError('Independent AE-large witness primitive targets differ')
+    with np.load(bound['arrays_file'], allow_pickle=False) as archive:
+        witness = {k:archive[k].copy() for k in archive.files}
+    controls = {f'species_B_gradient_control_{z}' for z in species}
+    if set(witness) != set(arrays)|controls:
+        raise ValueError('Independent AE-large witness must cover every physical frame array')
+    for key,value in arrays.items():
+        other = witness[key]
+        if other.shape != value.shape or other.dtype != value.dtype:
+            raise ValueError('Independent AE-large witness array shape/dtype differs: '+key)
+        if value.dtype.kind in 'fc':
+            if (not np.isfinite(other).all()
+                    or np.max(abs(other-value)) > 2e-10*max(1.,float(np.max(abs(other))))):
+                raise ValueError('Independent AE-large witness physical array differs: '+key)
+        elif not np.array_equal(other, value):
+            raise ValueError('Independent AE-large witness geometry/source chart differs: '+key)
+    for z in species:
+        B, control = witness[f'species_B_{z}'], witness[f'species_B_gradient_control_{z}']
+        if (control.shape != B.shape or control.dtype != B.dtype
+                or not np.isfinite(control).all()
+                or np.max(abs(B-control)) > 2e-10*max(1.,float(np.max(abs(B))))):
+            raise ValueError('Independent AE-large graph/Sobolev quadrature control differs')
+
+
 def load_compact_pauli_frame(path, *, expected_file_sha256, expected_wfn_sha256,
                              tables, parent_k_frac, gvecs, ngk_valid,
-                             atom_types, centers_cart, physical_bands):
+                             atom_types, centers_cart, physical_bands,
+                             field_policy='unwindowed_U_of_compact_native_pauli'):
     """Authenticate a complete fixed-frame endpoint bundle, never WFN arrays.
 
     The file contains only physical FILE-parent C/D/Gram arrays and one A.
@@ -266,6 +422,10 @@ def load_compact_pauli_frame(path, *, expected_file_sha256, expected_wfn_sha256,
     from pathlib import Path
     from psp.atomic_reconstruction import load_atomic_reconstruction
     from psp.augmentation_cache import _payload_hash
+    from psp.augmentation_cache import paired_field_policy_contract, PAIRED_AE_LARGE_FIELD_POLICY
+
+    contract = paired_field_policy_contract(field_policy)
+    ae_large = field_policy == PAIRED_AE_LARGE_FIELD_POLICY
 
     def file_hash(name):
         return hashlib.sha256(Path(name).read_bytes()).hexdigest()
@@ -281,15 +441,18 @@ def load_compact_pauli_frame(path, *, expected_file_sha256, expected_wfn_sha256,
     with np.load(path, allow_pickle=False) as archive:
         metadata = json.loads(str(archive['metadata_json']))
         arrays = {key: archive[key].copy() for key in archive.files if key != 'metadata_json'}
-    if (metadata.get('schema') != COMPACT_PAULI_FRAME_SCHEMA
-            or metadata.get('model') != COMPACT_PAULI_FRAME_MODEL
+    if (metadata.get('schema') != contract['frame_schema']
+            or metadata.get('model') != contract['frame_model']
             or metadata.get('source_frame') != 'original WFN Pauli band labels'
             or metadata.get('complete_all_FILE_parents') is not True
             or metadata.get('physical_bands') != physical_bands
             or metadata.get('wfn_sha256') != expected_wfn_sha256
-            or metadata.get('target_support_policy') != COMPACT_PAULI_SUPPORT_POLICY
+            or metadata.get('target_support_policy') !=
+                (AE_LARGE_SUPPORT_POLICY if ae_large else COMPACT_PAULI_SUPPORT_POLICY)
             or metadata.get('payload_sha256') != _payload_hash(arrays)):
         raise ValueError('compact target model/source/full-FILE/payload policy mismatch')
+    if ae_large and metadata.get('target_witness') != AE_LARGE_TARGET_WITNESS:
+        raise ValueError('AE-large frame requires its distinct construction-target witness')
     pins, species = metadata.get('source_input_files_sha256'), metadata.get('atomic_species_inputs')
     if (not isinstance(pins, dict) or not pins or not isinstance(species, dict)
             or set(species) != set(map(str, tables))):
@@ -302,7 +465,8 @@ def load_compact_pauli_frame(path, *, expected_file_sha256, expected_wfn_sha256,
         if not Path(name).is_absolute() or not digest_ok(expected) or file_hash(name) != expected:
             raise ValueError('compact target source/input identity mismatch: '+str(name))
     nk, nb, na = len(parent_k_frac), int(physical_bands), len(atom_types)
-    required = {'source_gram', 'target_gram', 'target_gram_GL8_control', 'inverse_sqrt',
+    control_gram = 'target_gram_quadrature_control' if ae_large else 'target_gram_GL8_control'
+    required = {'source_gram', 'target_gram', control_gram, 'inverse_sqrt',
         'parent_FILE_rows', 'parent_k_frac', 'ngk_valid_parent', 'atom_types', 'centers_cart',
         'source_pauli_sha256_by_parent'}
     required |= {f'atom_{kind}_{a:03d}' for kind in ('C', 'D') for a in range(na)}
@@ -328,7 +492,7 @@ def load_compact_pauli_frame(path, *, expected_file_sha256, expected_wfn_sha256,
         if (arrays[f'gvec_parent_{p:03d}'].dtype.kind not in 'iu'
                 or not np.array_equal(arrays[f'gvec_parent_{p:03d}'], np.asarray(gvecs)[p, :count])):
             raise ValueError('compact frame physical ordered G rows mismatch')
-    for key in ('source_gram', 'target_gram', 'target_gram_GL8_control', 'inverse_sqrt'):
+    for key in ('source_gram', 'target_gram', control_gram, 'inverse_sqrt'):
         value = arrays[key]
         if value.shape != (nk, nb, nb) or value.dtype != np.complex128:
             raise ValueError('compact frame matrices require physical complex128 bands')
@@ -343,7 +507,7 @@ def load_compact_pauli_frame(path, *, expected_file_sha256, expected_wfn_sha256,
         if native['metadata']['payload_sha256'] != data['metadata']['payload_sha256']:
             raise ValueError('compact target native amplitudes/PCA differ from the fitting table')
         interval = metadata.get('native_target_radial_interval_by_species_bohr', {}).get(str(z))
-        if interval != [float(data['r'][0]), float(data['r'][-1])]:
+        if not ae_large and interval != [float(data['r'][0]), float(data['r'][-1])]:
             raise ValueError('compact target native Hermite interval mismatch')
         labels = spinor_function_labels(data['l'], data['kappa'])
         B = arrays[f'species_B_{z}']
@@ -352,7 +516,9 @@ def load_compact_pauli_frame(path, *, expected_file_sha256, expected_wfn_sha256,
                 or B.shape != (len(labels), len(labels)) or B.dtype != np.complex128):
             raise ValueError('compact target function labels/B do not cover the native channel inventory')
         _hermitian(B, 'compact target B')
-        target_B = native_hermite_delta_gram(data)
+        target_B = (_ae_large_target_gram_witness(entry, data, pins,
+            support_radius=float(metadata['represented_sphere_radius_bohr']))
+            if ae_large else native_hermite_delta_gram(data))
         if np.max(abs(B-target_B)) > 2e-10*max(1., float(np.max(abs(target_B)))):
             raise ValueError('compact target B is not the declared native Hermite GL4 Gram')
     for a, z in enumerate(atom_types):
@@ -361,6 +527,9 @@ def load_compact_pauli_frame(path, *, expected_file_sha256, expected_wfn_sha256,
             if (value.shape != (nk, nb, len(arrays[f'species_labels_{z}']))
                     or value.dtype != np.complex128 or not np.isfinite(value).all()):
                 raise ValueError('compact target C/D physical bands or function labels mismatch')
+    if ae_large:
+        _authenticate_ae_large_frame_witness(metadata, arrays, pins,
+            wfn_sha256=expected_wfn_sha256)
     return dict(arrays=arrays, metadata=metadata, file_sha256=expected_file_sha256)
 
 

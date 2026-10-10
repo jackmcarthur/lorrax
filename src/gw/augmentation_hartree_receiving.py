@@ -331,11 +331,14 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
     if source['source_binding']['physical_bands']!=physical:
         raise ValueError('Occupied source and receiving full-WFN windows differ')
     compact = artifact.get('compact_target')
+    if compact is not None:
+        from psp.augmentation_cache import paired_field_policy_contract
+        contract = paired_field_policy_contract(compact['binding']['field_policy'])
     if compact is not None and (state.get('compact_target_binding') != compact['binding']
             or overlap.get('compact_target_binding') != compact['binding']
             or source['source_binding'].get('compact_target_binding') != compact['binding']
-            or overlap.get('overlap_operator') != 'compact_native_pauli_target'
-            or source['source_binding'].get('source_frame_policy') != 'compact_native_pauli_common_A_before_U'):
+            or overlap.get('overlap_operator') != contract['overlap_operator']
+            or source['source_binding'].get('source_frame_policy') != contract['source_frame_policy']):
         raise ValueError('Receiving J must use the SAME compact target C/D/B/A and paired field policy')
     rows=np.arange(nk) if parent_rows is None else np.asarray(parent_rows,int)
     if rows.ndim!=1 or len(set(rows.tolist()))!=len(rows) or np.any((rows<0)|(rows>=nk)):

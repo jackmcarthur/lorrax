@@ -60,9 +60,12 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
     raw = path.read_bytes()
     manifest = json.loads(raw)
     request = manifest.get('compact_target_request')
+    from psp.augmentation_cache import (PAIRED_COMPACT_PAULI_FIELD_POLICY,
+        PAIRED_AE_LARGE_FIELD_POLICY, paired_field_policy_contract)
     pauli_control = (manifest.get('carrier') == 'pauli2embed4'
         and isinstance(request, dict) and request.get('carrier') == 'pauli2embed4'
-        and manifest.get('field_policy') == 'unwindowed_U_of_compact_native_pauli')
+        and manifest.get('field_policy') in
+            (PAIRED_COMPACT_PAULI_FIELD_POLICY, PAIRED_AE_LARGE_FIELD_POLICY))
     if (manifest.get("schema") != SCHEMA
             or (manifest.get("carrier") != "normalized_rkb" and not pauli_control)
             or manifest.get("frozen_core_policy") != "reconstruct_valence_only"):
@@ -72,9 +75,11 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
             or not isinstance(manifest['compact_target_request'], dict)):
         raise ValueError('compact_target_request requires the explicit paired native field policy')
     if paired_policy is not None:
-        from psp.augmentation_cache import PAIRED_COMPACT_PAULI_FIELD_POLICY
-        if (paired_policy != PAIRED_COMPACT_PAULI_FIELD_POLICY
-                or manifest.get('overlap',{}).get('mode') != 'full_wfn_lowdin'
+        try:
+            paired_field_policy_contract(paired_policy)
+        except ValueError as error:
+            raise ValueError('raw paired policy requires an unbound native full-WFN target and forbids legacy compact-after-U caches') from error
+        if (manifest.get('overlap',{}).get('mode') != 'full_wfn_lowdin'
                 or manifest.get('charge_metric',{}).get('moment_enrichment') != 'served_monopole'
                 or 'served_moments' in manifest
                 or any(key in manifest.get('cache',{}) for key in ('species_files','target','taper_start'))):
@@ -947,9 +952,11 @@ def _full_wfn_rotation(smooth, nmu, coefficients, geometry, mesh):
         delta_overlaps=tuple(np.concatenate(d) for d in raw_delta_overlaps),
         atomic_delta_grams=tuple(atomic_grams))
     if compact is not None:
-        receipt.update(overlap_operator='compact_native_pauli_target',
+        from psp.augmentation_cache import paired_field_policy_contract
+        contract = paired_field_policy_contract(compact['binding']['field_policy'])
+        receipt.update(overlap_operator=contract['overlap_operator'],
             compact_target_binding=compact['binding'],
-            source_frame_policy='compact_native_pauli_common_A_before_U')
+            source_frame_policy=contract['source_frame_policy'])
     return smooth,nmu,coefficients,receipt
 
 
@@ -1422,6 +1429,30 @@ def _current_contract_workspace_bytes(*, qpad, mu, atoms, harmonics, radial_poin
                    onsite_scratch,factor_tables,fourier_tables,fourier_and_pair_scratch)))
 
 
+def _represented_target_metric_diagnostic(species, target_B, *, field_policy, carrier):
+    """Name a represented-bank diagnostic without changing the target metric.
+
+    Native banks retain their carrier-specific served-sphere measurement.
+    AE-large banks instead provide the global finite-K Pauli spectral Gram;
+    exact U preserves that spectrum's Gram, but finite sphere serving does
+    not. Neither diagnostic enters the common factor or a density endpoint.
+    """
+    from psp.augmentation_cache import PAIRED_AE_LARGE_FIELD_POLICY
+
+    ae_large = field_policy == PAIRED_AE_LARGE_FIELD_POLICY
+    witness_key = 'target_witness_file' if ae_large else 'metric_witness'
+    if ae_large and hashlib.sha256(Path(species[witness_key]).read_bytes()).hexdigest() != species.get('target_witness_sha256'):
+        raise ValueError('AE-large represented spectral B source identity mismatch')
+    with np.load(species[witness_key], allow_pickle=False) as archive:
+        represented = archive['represented_spectral_B' if ae_large else carrier+'_sphere_B']
+    if ae_large and (represented.shape != target_B.shape
+            or represented.dtype != np.complex128 or not np.isfinite(represented).all()):
+        raise ValueError('AE-large represented spectral B requires the complete finite complex128 target chart')
+    name = ('represented_species_spectral_B_error' if ae_large
+            else 'represented_species_B_error')
+    return name, float(np.max(abs(represented-target_B)))
+
+
 def bind_compact_target_artifact(artifact, request, *, wfn, sym):
     """Bind a common-target preparation to one unchanged ISDF stage.
 
@@ -1434,12 +1465,14 @@ def bind_compact_target_artifact(artifact, request, *, wfn, sym):
     ``_full_wfn_rotation``.
     """
     from psp.reconstruction_overlap import load_compact_pauli_frame
-    from psp.augmentation_cache import load_paired_native_cache, PAIRED_COMPACT_PAULI_FIELD_POLICY
+    from psp.augmentation_cache import (load_paired_field_cache,
+        paired_field_policy_contract, PAIRED_AE_LARGE_FIELD_POLICY)
+
+    contract = paired_field_policy_contract(artifact.get('field_policy'))
 
     required = {'frame_file','frame_sha256','wfn_sha256','carrier','species_fields'}
     if (not isinstance(request,dict) or set(request) != required
             or request['carrier'] not in ('pauli2embed4','normalized_rkb')
-            or artifact.get('field_policy') != PAIRED_COMPACT_PAULI_FIELD_POLICY
             or artifact.get('compact_target') is not None
             or artifact.get('overlap',{}).get('mode') != 'full_wfn_lowdin'
             or artifact.get('charge_metric',{}).get('moment_enrichment') != 'served_monopole'
@@ -1465,10 +1498,15 @@ def bind_compact_target_artifact(artifact, request, *, wfn, sym):
         gvecs=np.asarray(wfn.gvecs(k=sym.parent_k_domain)),
         ngk_valid=np.asarray(wfn.ngk_valid(k=sym.parent_k_domain)),
         atom_types=np.asarray(wfn.atom_types),centers_cart=(np.asarray(wfn.atom_crys)%1.)@lattice,
-        physical_bands=int(wfn.nbands))
+        physical_bands=int(wfn.nbands), field_policy=contract['field_policy'])
     support = float(artifact['radial']['support_radius'])
     if frame['metadata'].get('represented_sphere_radius_bohr') != support:
         raise ValueError('compact target/paired field and density support radii differ')
+    if contract['field_policy'] == PAIRED_AE_LARGE_FIELD_POLICY:
+        # The exact construction L/free-small norm is local even though
+        # chi=R_inverse L is not compact. The represented serving spheres
+        # enclose every construction window and must be disjoint here.
+        _certify_spheres(np.asarray(wfn.atom_crys)%1., lattice, support)
     caches, field_bindings, target_caches, represented_B_errors = {}, {}, {}, {}
     for z,data in artifact['tables'].items():
         control = fields[str(z)]
@@ -1477,26 +1515,36 @@ def bind_compact_target_artifact(artifact, request, *, wfn, sym):
         species = frame['metadata']['atomic_species_inputs'][str(z)]
         if control['common_spectrum_sha256'] != species['spectral_witness_sha256']:
             raise ValueError('paired fields and compact target use different shared Pauli spectra')
-        cache, binding = load_paired_native_cache(control['file'],data,
+        cache, binding = load_paired_field_cache(control['file'],data,
             expected_file_sha256=control['file_sha256'],common_spectrum_sha256=control['common_spectrum_sha256'],
-            carrier=request['carrier'],support_radius=support)
+            carrier=request['carrier'],support_radius=support,field_policy=contract['field_policy'])
         if binding['native_reconstruction_sha256'] != species['native_sha256']:
             raise ValueError('paired fields and compact target use different native radial/PCA inputs')
+        if (contract['field_policy'] == PAIRED_AE_LARGE_FIELD_POLICY
+                and (binding['target_binding'] != species.get('target_binding')
+                    or binding['construction_controls'] != species.get('construction_controls')
+                    or binding['target_witness_file'] != species.get('target_witness_file')
+                    or binding['target_witness_sha256'] != species.get('target_witness_sha256'))):
+            raise ValueError('AE-large fields and target frame have different constructor targets')
         caches[z], field_bindings[str(z)] = cache,binding
         target_caches[z] = dict(upper=dict(ell=data['l'],kappa=data['kappa']),
             labels=frame['arrays'][f'species_labels_{z}'],B=frame['arrays'][f'species_B_{z}'])
         # These species-only errors are diagnostics, never a target Gram.
-        with np.load(species['metric_witness'],allow_pickle=False) as archive:
-            served_B = archive[request['carrier']+'_sphere_B']
-            represented_B_errors[str(z)] = float(np.max(abs(served_B-target_caches[z]['B'])))
+        diagnostic_name, represented_B_errors[str(z)] = _represented_target_metric_diagnostic(
+            species, target_caches[z]['B'], field_policy=contract['field_policy'],
+            carrier=request['carrier'])
     binding = dict(model=frame['metadata']['model'],frame_file_sha256=frame['file_sha256'],
         frame_payload_sha256=frame['metadata']['payload_sha256'],wfn_sha256=request['wfn_sha256'],
         physical_bands=int(wfn.nbands),complete_all_FILE_parents=True,
-        carrier=request['carrier'],field_policy=PAIRED_COMPACT_PAULI_FIELD_POLICY,
-        paired_species=field_bindings,represented_species_B_error=represented_B_errors,
-        source_frame_policy='compact_native_pauli_common_A_before_U',
+        carrier=request['carrier'],field_policy=contract['field_policy'],
+        paired_species=field_bindings,**{diagnostic_name:represented_B_errors},
+        source_frame_policy=contract['source_frame_policy'],
         normalization='one compact target A; no represented-field renormalization',
         source_row_hash_scope='original physical Pauli bytes, not inverse-R roundtrip bytes')
+    if contract['field_policy'] == PAIRED_AE_LARGE_FIELD_POLICY:
+        binding.update(overlap_operator=contract['overlap_operator'],
+            target_witness=frame['metadata']['target_witness'],
+            represented_metric_diagnostic_scope='global finite-K common Pauli spectrum; not served sphere B or target normalization')
     identity = hashlib.sha256(json.dumps(dict(base_augmentation_identity=artifact['identity'],
         compact_target=binding),sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
     arrays = frame['arrays']; na = len(arrays['atom_types'])
@@ -1571,11 +1619,12 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                 'metric does not certify the occupied smooth-neutral Hartree '
                 'boundary terms. The public source owner remains bulk3D only.')
         binding = compact.get('binding', {})
-        if (binding.get('model') != 'compact_native_pauli_common_frame_v1'
-                or binding.get('source_frame_policy') != 'compact_native_pauli_common_A_before_U'
+        from psp.augmentation_cache import paired_field_policy_contract
+        contract = paired_field_policy_contract(binding.get('field_policy'))
+        if (binding.get('model') != contract['frame_model']
+                or binding.get('source_frame_policy') != contract['source_frame_policy']
                 or not binding.get('complete_all_FILE_parents')
                 or binding.get('physical_bands') != int(wfn.nbands)
-                or binding.get('field_policy') != 'unwindowed_U_of_compact_native_pauli'
                 or binding.get('normalization') != 'one compact target A; no represented-field renormalization'):
             raise ValueError('Slab occupied source requires the strictly bound complete compact target')
         from isdf.atomic_hartree import charge_hartree_operator_contract
@@ -2048,7 +2097,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             spin_degeneracy=1.,fft_grid=list(map(int,meta.fft_grid)),
             cell_volume=float(meta.cell_volume),source_frame_policy='same_actual_served_four_spinor_full_WFN_Lowdin')
         if compact is not None:
-            binding.update(source_frame_policy='compact_native_pauli_common_A_before_U',
+            from psp.augmentation_cache import paired_field_policy_contract
+            contract = paired_field_policy_contract(compact['binding']['field_policy'])
+            binding.update(source_frame_policy=contract['source_frame_policy'],
                 compact_target_binding=compact['binding'])
             if artifact.get('public_source_identity') is not None:
                 binding.update(artifact['public_source_identity'])

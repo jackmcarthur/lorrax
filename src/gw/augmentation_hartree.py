@@ -93,18 +93,19 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
             and raw.get('band_range') == [0, count]
             and np.array_equal(raw.get('k_parent_frac'), coords))
     else:
+        from psp.augmentation_cache import paired_field_policy_contract
+        contract = paired_field_policy_contract(compact_binding.get('field_policy'))
         saved_frame = (artifact.get('compact_frame_sha256') if compact is None else
             _physical_full_wfn_frame_binding(compact['frame']['arrays']['inverse_sqrt'], count)
             ['full150_frame_sha256'])
         public_identity = artifact.get('public_source_identity', {})
         source_policy_matches = (
-            compact_binding.get('model') == 'compact_native_pauli_common_frame_v1'
+            compact_binding.get('model') == contract['frame_model']
             and compact_binding.get('carrier') in ('normalized_rkb', 'pauli2embed4')
             and compact_binding.get('physical_bands') == count
             and compact_binding.get('complete_all_FILE_parents') is True
-            and compact_binding.get('field_policy') == 'unwindowed_U_of_compact_native_pauli'
             and compact_binding.get('normalization') == 'one compact target A; no represented-field renormalization'
-            and source.get('source_frame_policy') == 'compact_native_pauli_common_A_before_U'
+            and source.get('source_frame_policy') == contract['source_frame_policy']
             and compact_binding.get('source_frame_policy') == source['source_frame_policy']
             and source.get('compact_target_binding') == compact_binding
             and raw == compact_binding and frame == saved_frame

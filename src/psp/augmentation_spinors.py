@@ -332,6 +332,24 @@ def build_paired_radial_cache(delta_R, radius, weights_dr, ell, kappa,
     l, k = _labels(ell, kappa)
     K, wk, x = _radial_cache_queries(momentum, weights_dK, evaluation_radius)
     radial = radial_fourier_bessel(delta_R, radius, weights_dr, l, K)
+    return build_paired_radial_cache_from_spectrum(radial, l, k, K, wk, x)
+
+
+def build_paired_radial_cache_from_spectrum(pauli_radial_spectrum, ell, kappa,
+                                           momentum, weights_dK, evaluation_radius):
+    r"""Invert one explicit Pauli spectrum as chi and its single canonical U lift.
+
+    The caller owns the physical target and forward-transform quadrature.
+    This utility changes no normalization or serving support. It shares
+    the same angular, radial-inversion and lift owners as the native paired
+    constructor. In particular an AE-large target supplies AL/R here,
+    rather than treating an ONCV Dirac large correction as Pauli chi.
+    """
+    l, k = _labels(ell, kappa)
+    K, wk, x = _radial_cache_queries(momentum, weights_dK, evaluation_radius)
+    radial = np.asarray(pauli_radial_spectrum, dtype=np.complex128)
+    if radial.shape != (len(K), len(l)) or not np.isfinite(radial).all():
+        raise ValueError('paired Pauli spectrum must be finite on the momentum/OPF axes')
     pauli = np.zeros((len(l), 2, len(K)), dtype=np.complex128)
     pauli[:, 0] = radial.T
     lifted = _lift_cartesian(pauli, np.column_stack((0*K, 0*K, K)))
@@ -359,6 +377,34 @@ def compact_graph_taper(radius, taper_start, support_radius):
     window = np.where(radius <= start, 1., np.where(radius >= stop, 0., window))
     derivative = np.where((radius > start) & (radius < stop), derivative, 0.)
     return window, derivative
+
+
+def free_graph_small_from_large(radius, large_R, dlarge_R_dr, kappa):
+    r"""Apply the canonical radial sigma.p/(2c) graph to one upper field.
+
+    Radial spin-angular convention is S=i h[L'+(kappa+1)L/r].
+    At a regular origin only the kappa=+1 upper p channel has the finite
+    lower s limit 3 i h L'(0). Singular atomic targets use positive-radius
+    quadrature; this helper does not invent a point-nuclear value at zero.
+    """
+    from common.bispinor_init import HALFALPHA
+
+    r = np.asarray(radius,dtype=np.float64)
+    large = np.asarray(large_R,dtype=np.complex128)
+    derivative = np.asarray(dlarge_R_dr,dtype=np.complex128)
+    k = np.asarray(kappa)
+    if (r.ndim != 1 or large.shape != (len(r),len(k)) or derivative.shape != large.shape
+            or k.ndim != 1 or k.dtype.kind not in 'iu' or np.any(k == 0)
+            or np.any(r < 0) or not np.isfinite(r).all()
+            or not np.isfinite(large).all() or not np.isfinite(derivative).all()):
+        raise ValueError('free radial graph requires finite paired upper/derivative fields and kappa')
+    ratio = np.divide(large,r[:,None],out=np.zeros_like(large),where=r[:,None]>0)
+    lower = 1j*float(HALFALPHA)*(derivative+(k[None]+1)*ratio)
+    origin = r == 0
+    lower[origin] = 0
+    p = np.flatnonzero(k == 1)
+    lower[np.ix_(origin,p)] = 3j*float(HALFALPHA)*derivative[np.ix_(origin,p)]
+    return lower
 
 
 def evaluate_normalized_radials(cache: dict, radius):
@@ -397,14 +443,7 @@ def evaluate_normalized_radials(cache: dict, radius):
     f, df = spline(rr), spline(rr, 1)
     w, dw = compact_graph_taper(rr, start, stop)
     large[live] = w[:, None]*f
-    ratio = np.divide(f, rr[:, None], out=np.zeros_like(f), where=rr[:, None] > 0)
-    lower = 1j*h*(w[:, None]*df+dw[:, None]*f+(cache['kappa'][None]+1)*w[:, None]*ratio)
-    origin = rr == 0
-    lower[origin] = 0
-    # For regular upper p,kappa=+1 the lower s limit is 3 i h f'(0).
-    # Every other retained angular channel has a vanishing lower at r=0.
-    p = np.flatnonzero(cache['kappa'] == 1)
-    lower[np.ix_(origin, p)] = 3j*h*df[np.ix_(origin, p)]
+    lower = free_graph_small_from_large(rr,large[live],w[:,None]*df+dw[:,None]*f,cache['kappa'])
     small[live] = lower
     return large, small
 

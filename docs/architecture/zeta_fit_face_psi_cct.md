@@ -32,7 +32,8 @@ axis, centroids on the other) and distributes the band contraction.
 
 Canonical ζ files do not encode the layout. The left and right band windows
 are masks over the loaded, mesh-padded band extent, so a window edge need
-not divide the mesh. By default their weights are 0/1. An opt-in charge
+not divide the mesh. By default their weights are 0/1.
+
 Smooth fractional samples use the same one-read parent loader and bounded
 G-slot DFT as the FFT-index route. Their phase uses signed physical Miller
 vectors and the full Bloch factor at the exact fractional coordinate;
@@ -47,7 +48,7 @@ once before fitting. The existing factor is mapped back through its row
 scales and serves both plane-wave and local RHSs. Its canonical provenance
 separates this metric from the default; changing it requires a matching fit.
 
-`zeta_occupied_weight` multiplies each occupied endpoint inside its window;
+The opt-in charge `zeta_occupied_weight` multiplies each occupied endpoint inside its window;
 every original empty endpoint keeps weight1. C_q and every Z_q right-hand
 side, including local augmentation and monopole features, use these same
 weights. Current channels retain their original loss. Pseudobands are
@@ -59,6 +60,24 @@ It changes the fitting objective, not the physical GW occupations or the
 orbital frame. `_charge_fit_endpoint_weights` resolves this policy for both
 fresh fits and complete tensor restarts. Charge provenance records the
 schema, boundary, occupied weight and empty weight.
+
+The paired atomic field policy is a closed manifest discriminator. The
+native compact-Pauli policy and `paired_ae_large_preserved_free_graph` have
+distinct field and frame certificates. For the latter, the matched ONCV
+large component supplies a construction correction L, its Pauli precursor
+is χ=R⁻¹L, and the normalized U lift acts once. A2 uses that same χ with
+zero lower slots; both arms use the same complete-source Löwdin factor.
+Native Dirac Q remains a diagnostic.
+
+The continuum target norm follows from
+⟨χa|χb⟩=⟨La|Lb⟩+⟨XLa|XLb⟩, so disjoint compact construction supports
+have zero target cross terms. The construction window derivative belongs
+in XL. The reader remeasures this Sobolev B and joins independently
+contracted full-source D/B/Gram/A arrays. Finite-K fields, finite-sphere
+norms, represented cross terms and tails remain separate approximation
+evidence. They do not replace the continuum target norm or permit a second
+field normalization. Policy, spectrum, target and source changes enter the
+same fitting/restart identity; χ/W/Σ contractions keep their equations.
 
 An unwindowed isometric free-RKB reconstruction can obtain its overlap
 from raw Pauli blocks. A compact served field instead requires B and D

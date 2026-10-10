@@ -19,11 +19,38 @@ ARRAY_KEYS = frozenset(("radius", "ell", "kappa", "large_R", "dlarge_R_dr",
                         "support_radius", "half_alpha"))
 RADIAL_KEYS = ("large_R", "dlarge_R_dr", "small_R", "dsmall_R_dr")
 PAIRED_COMPACT_PAULI_FIELD_POLICY = 'unwindowed_U_of_compact_native_pauli'
+PAIRED_AE_LARGE_FIELD_POLICY = 'paired_ae_large_preserved_free_graph'
 NATIVE_PAULI_TARGET = "native_large_as_pauli"
 AE_LARGE_TARGET = "ae_large_preserved_free_graph"
 _TARGET_KEYS = frozenset(("nuclear_charge", "matched_dirac_file", "matched_dirac_sha256",
     "pseudo_exterior_file", "pseudo_exterior_sha256", "source_upf_file", "source_upf_sha256",
     "dirac_window_start", "dirac_window_stop", "completion_start", "completion_stop"))
+
+
+def paired_field_policy_contract(policy):
+    """Resolve one closed paired-field/frame contract, never infer its target.
+
+    Native fields retain their original compact-Pauli target. The distinct
+    AE-large target uses the compact construction large/free-small norm;
+    finite-K represented fields and their tails are separate evidence.
+    """
+    if policy == PAIRED_COMPACT_PAULI_FIELD_POLICY:
+        return dict(field_policy=policy,
+            field_schema='lorrax.dev.common_chi_species_fields.v1',
+            field_source_model='compact_native_Pauli_target_with_finiteK_paired_approximation',
+            frame_schema='lorrax.dev.compact_pauli_common_frame.v1',
+            frame_model='compact_native_pauli_common_frame_v1',
+            overlap_operator='compact_native_pauli_target',
+            source_frame_policy='compact_native_pauli_common_A_before_U')
+    if policy == PAIRED_AE_LARGE_FIELD_POLICY:
+        return dict(field_policy=policy,
+            field_schema='lorrax.dev.paired_ae_large_species_fields.v1',
+            field_source_model='ae_large_preserved_free_graph_with_finiteK_paired_approximation',
+            frame_schema='lorrax.dev.ae_large_paired_common_frame.v1',
+            frame_model='ae_large_preserved_free_graph_common_frame_v1',
+            overlap_operator='ae_large_preserved_free_graph_target',
+            source_frame_policy='ae_large_preserved_free_graph_common_A_before_U')
+    raise ValueError('Unknown paired field/target/frame policy')
 
 
 def _sha256_file(path):
@@ -341,6 +368,24 @@ def _radial_u(radius, u, du, query, exponent):
     return value/query[:,None]
 
 
+def _radial_R_derivative(radius, u, du, query, exponent):
+    """Differentiate the SAME u-Hermite/nuclear continuation as _radial_u."""
+    from scipy.interpolate import CubicHermiteSpline
+    r = np.asarray(radius)
+    inside = query < r[0]
+    value = np.empty((len(query), u.shape[1]), complex)
+    derivative = np.empty_like(value)
+    spline = CubicHermiteSpline(r,u,du,axis=0,extrapolate=False)
+    value[~inside] = spline(query[~inside])
+    derivative[~inside] = spline(query[~inside],1)
+    value[inside] = u[0][None]*(query[inside,None]/r[0])**exponent[None]
+    derivative[inside] = value[inside]*exponent[None]/query[inside,None]
+    result = derivative/query[:,None]-value/query[:,None]**2
+    if not np.isfinite(result).all():
+        raise ValueError('target derivative queries exceed the declared source continuation')
+    return result
+
+
 def _momentum(control):
     from scipy.special import roots_legendre
     maximum,count=float(control['momentum_max']),int(control['momentum_points'])
@@ -376,8 +421,8 @@ def _inverse_pauli_spectrum(spectrum, ell, kappa, K, weights, radius):
     return cache
 
 
-def _build_ae_large_cache(data, pseudo_exterior, entry, control, support_radius):
-    """Preserve finite-K W(P_AE-L_PS,free) as large and derive free small.
+def _ae_large_spectral_target(data, pseudo_exterior, entry, control, support_radius):
+    """Return the existing AE-large construction and its single Pauli precursor.
 
     Implicit Pauli correction is R_inverse DeltaL. Canonical U is applied
     exactly once and its R cancels R_inverse; no pointwise normalization.
@@ -387,9 +432,8 @@ def _build_ae_large_cache(data, pseudo_exterior, entry, control, support_radius)
     OPF order and amplitude. Its interior rows must be byte-identical. The
     input bank's ONCV large-only matching convention is retained throughout.
     """
-    from common.bispinor_init import HALFALPHA
     from psp.augmentation_spinors import (build_normalized_radial_cache,
-        compact_graph_taper,radial_fourier_bessel,_lift_cartesian,COMPACT_GRAPH_FIELD_MODEL)
+        compact_graph_taper,radial_fourier_bessel,_lift_cartesian,free_graph_small_from_large)
     nuclear_charge = entry['nuclear_charge']
     dirac_window_start, dirac_window_stop = entry['dirac_window_start'], entry['dirac_window_stop']
     completion_start, completion_stop = entry['completion_start'], entry['completion_stop']
@@ -417,10 +461,13 @@ def _build_ae_large_cache(data, pseudo_exterior, entry, control, support_radius)
     ps4=build_normalized_radial_cache(pseudo,qr,qw,l,k,K,wK,dr)
     gamma=np.sqrt(k*k-(float(nuclear_charge)/137.036)**2)
     AE=_radial_u(r,data['ae_u'],data['ae_du_dr'],dr,gamma)
+    dAE=_radial_R_derivative(r,data['ae_u'],data['ae_du_dr'],dr,gamma)
     Q=_radial_u(r,data['ae_small_u'],data['ae_small_du_dr'],dr,gamma)
-    window=compact_graph_taper(dr,dirac_window_start,dirac_window_stop)[0]
+    window,dwindow=compact_graph_taper(dr,dirac_window_start,dirac_window_stop)
     raw_large=AE-ps4['large_R'];raw_small=1j*Q-ps4['small_R']
     delta_large=window[:,None]*raw_large
+    ddelta_large=dwindow[:,None]*raw_large+window[:,None]*(dAE-ps4['dlarge_R_dr'])
+    lower_free_graph=free_graph_small_from_large(dr,delta_large,ddelta_large,k)
     delta_small=window[:,None]*raw_small
     AL=radial_fourier_bessel(delta_large,dr,dw,l,K)
     AQ=radial_fourier_bessel(-1j*delta_small,dr,dw,2*abs(k)-1-l,K)
@@ -429,11 +476,56 @@ def _build_ae_large_cache(data, pseudo_exterior, entry, control, support_radius)
     # Preserve large AL: canonical U(R_inverse AL) has large AL and
     # lower sigma.p AL/(2c). AQ remains a native-Dirac diagnostic only.
     pauli=AL/R[:,None]
-    cache=_inverse_pauli_spectrum(pauli,l,k,K,wK,_radius_grid(control))
+    return dict(momentum=K, weights_dK=wK, pauli_radial_spectrum=pauli,
+        target_large_spectrum=AL, native_small_diagnostic_spectrum=AQ,
+        source_radius=dr, source_weights_dr=dw, source_large_R=delta_large,
+        source_dlarge_R_dr=ddelta_large, source_lower_free_graph_R=lower_free_graph,
+        source_native_small_R=delta_small, ell=l.copy(), kappa=k.copy())
+
+
+def _build_ae_large_cache(data, pseudo_exterior, entry, control, support_radius):
+    """Preserve the existing AE-large cache via its shared spectral target owner."""
+    from common.bispinor_init import HALFALPHA
+    from psp.augmentation_spinors import COMPACT_GRAPH_FIELD_MODEL
+    target = _ae_large_spectral_target(data,pseudo_exterior,entry,control,support_radius)
+    cache=_inverse_pauli_spectrum(target['pauli_radial_spectrum'],target['ell'],target['kappa'],
+        target['momentum'],target['weights_dK'],_radius_grid(control))
     cache.update(field_model=np.asarray(COMPACT_GRAPH_FIELD_MODEL),
         taper_start=np.asarray(float(control['taper_start'])),support_radius=np.asarray(float(support_radius)),
         half_alpha=np.asarray(float(HALFALPHA)))
     return cache
+
+
+def build_ae_large_paired_cache(data, control, *, support_radius):
+    """Prepare unwindowed chi and U chi from the authenticated AE-large target.
+
+    The construction window remains owned by ``_ae_large_spectral_target``.
+    Neither paired inverse is tapered after U. The returned explicit target
+    binding and spectral witnesses distinguish construction from a caller's
+    finite serving domain; this utility makes no sphere/tail accuracy claim.
+    Native Dirac small waves remain diagnostics, never a second lower field.
+    """
+    from psp.augmentation_spinors import build_paired_radial_cache_from_spectrum
+
+    controls = _controls(control, support_radius)
+    inputs = _target_inputs(data, controls, support_radius)
+    if inputs is None:
+        raise ValueError('AE-large paired preparation requires its explicit authenticated target')
+    gamma = np.sqrt(np.asarray(data['kappa'])**2-(inputs[2]['nuclear_charge']/137.036)**2)
+    if np.any(gamma <= .5):
+        raise ValueError('Point-nuclear AE-large Sobolev target requires gamma > 1/2; finite-nucleus data are not implied')
+    target = _ae_large_spectral_target(*inputs[:3], controls, support_radius)
+    pair = build_paired_radial_cache_from_spectrum(target['pauli_radial_spectrum'],
+        target['ell'], target['kappa'], target['momentum'], target['weights_dK'],
+        _radius_grid(controls))
+    return dict(pair, target_binding=inputs[3], construction_controls=controls,
+        target_large_spectrum=target['target_large_spectrum'],
+        native_small_diagnostic_spectrum=target['native_small_diagnostic_spectrum'],
+        source_radius=target['source_radius'], source_weights_dr=target['source_weights_dr'],
+        source_large_R=target['source_large_R'],
+        source_dlarge_R_dr=target['source_dlarge_R_dr'],
+        source_lower_free_graph_R=target['source_lower_free_graph_R'],
+        source_native_small_R=target['source_native_small_R'])
 
 
 def normalized_cache_tail_diagnostics(cache, *, support_radius):
@@ -494,10 +586,27 @@ def load_paired_native_cache(path, data, *, expected_file_sha256,
     evaluator retains independent large/small derivatives and tail
     diagnostics. No field rescaling occurs here.
     """
+    return load_paired_field_cache(path, data,
+        expected_file_sha256=expected_file_sha256,
+        common_spectrum_sha256=common_spectrum_sha256, carrier=carrier,
+        support_radius=support_radius, field_policy=PAIRED_COMPACT_PAULI_FIELD_POLICY)
+
+
+def load_paired_field_cache(path, data, *, expected_file_sha256,
+                            common_spectrum_sha256, carrier, support_radius,
+                            field_policy):
+    """Authenticate raw paired fields under their explicit closed target.
+
+    The AE-large schema cannot reuse the native target certificate. Its
+    primitive target binding is re-read by the same constructor input owner;
+    no post-U serving window or normalization is added by this loader.
+    """
     import inspect
     from psp.augmentation_spinors import evaluate_normalized_radials
     from common.bispinor_init import lift_to_4spinor
     from common import gamma_matrices
+
+    contract = paired_field_policy_contract(field_policy)
 
     if carrier not in ('pauli2embed4', 'normalized_rkb'):
         raise ValueError('paired native cache requires an explicit Pauli or canonical-U carrier')
@@ -513,8 +622,8 @@ def load_paired_native_cache(path, data, *, expected_file_sha256,
         cache = {key: archive[key].copy() for key in archive.files if key != 'metadata_json'}
     raw_keys = frozenset(('radius', 'ell', 'kappa', *RADIAL_KEYS))
     if (set(cache) != raw_keys
-            or metadata.get('schema') != 'lorrax.dev.common_chi_species_fields.v1'
-            or metadata.get('source_model') != 'compact_native_Pauli_target_with_finiteK_paired_approximation'
+            or metadata.get('schema') != contract['field_schema']
+            or metadata.get('source_model') != contract['field_source_model']
             or metadata.get('no_post_U_taper') is not True
             or metadata.get('carrier') != carrier
             or metadata.get('source_upf_sha256') != data['metadata']['source_sha256']
@@ -523,6 +632,24 @@ def load_paired_native_cache(path, data, *, expected_file_sha256,
             or metadata.get('payload_sha256') != _payload_hash(cache)):
         raise ValueError('paired native field policy/source/spectrum/payload mismatch')
     controls = metadata.get('controls', {})
+    if field_policy == PAIRED_AE_LARGE_FIELD_POLICY:
+        construction = metadata.get('construction_controls')
+        target = metadata.get('target_binding')
+        if (metadata.get('target_kind') != AE_LARGE_TARGET
+                or not isinstance(construction, dict) or not isinstance(target, dict)):
+            raise ValueError('AE-large paired fields require the closed constructor controls and target binding')
+        inputs = _target_inputs(data, construction, support_radius)
+        if inputs is None or inputs[3] != target:
+            raise ValueError('AE-large paired field primitive target binding mismatch')
+        gamma = np.sqrt(np.asarray(data['kappa'])**2-(inputs[2]['nuclear_charge']/137.036)**2)
+        if np.any(gamma <= .5):
+            raise ValueError('Point-nuclear AE-large Sobolev target requires gamma > 1/2')
+        witness, witness_sha = metadata.get('target_witness_file'), metadata.get('target_witness_sha256')
+        if (not isinstance(witness, str) or not Path(witness).is_absolute()
+                or not isinstance(witness_sha, str) or len(witness_sha) != 64
+                or any(c not in '0123456789abcdef' for c in witness_sha)
+                or _sha256_file(witness) != witness_sha):
+            raise ValueError('AE-large paired fields require their pinned construction-target witness')
     r = np.asarray(cache['radius'])
     if (controls.get('support_radius') != support_radius or r.dtype != np.float64
             or r.ndim != 1 or len(r) < 2 or not np.isfinite(r).all()
@@ -546,10 +673,14 @@ def load_paired_native_cache(path, data, *, expected_file_sha256,
         recorded = {sha for source, sha in owners.items() if Path(source).name == Path(name).name}
         if recorded != {actual}:
             raise ValueError('paired native field or canonical-U source owner changed')
-    binding = dict(policy=PAIRED_COMPACT_PAULI_FIELD_POLICY, carrier=carrier,
+    binding = dict(policy=field_policy, carrier=carrier,
         file_sha256=expected_file_sha256, common_spectrum_sha256=common_spectrum_sha256,
         native_reconstruction_sha256=metadata['native_reconstruction_sha256'],
         native_payload_sha256=metadata['native_payload_sha256'], source_upf_sha256=metadata['source_upf_sha256'],
         controls=controls, no_post_U_taper=True, represented_domain_bohr=[float(r[0]), float(r[-1])],
         tail_diagnostics=normalized_cache_tail_diagnostics(cache, support_radius=support_radius))
+    if field_policy == PAIRED_AE_LARGE_FIELD_POLICY:
+        binding.update(target_kind=AE_LARGE_TARGET, target_binding=target,
+            construction_controls=construction, field_schema=contract['field_schema'],
+            target_witness_file=witness, target_witness_sha256=witness_sha)
     return cache, binding
