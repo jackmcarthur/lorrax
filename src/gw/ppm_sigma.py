@@ -746,9 +746,8 @@ def _compute_invalid_static_sigma(
     Gij = build_Gij(meta, mesh_xy, occupation_state)
     sigma_sx, sigma_coh, W_static = _invalid_static_kernels(
         wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge)
-    with mesh_xy:
-        sx = _band_sigma_host(sigma_sx(wfns, Gij, W_static), wfns)
-        coh = _band_sigma_host(sigma_coh(wfns, W_static, None), wfns)
+    sx = _band_sigma_host(sigma_sx(wfns, Gij, W_static), wfns)
+    coh = _band_sigma_host(sigma_coh(wfns, W_static, None), wfns)
     return sx + coh
 
 
@@ -759,12 +758,11 @@ def _invalid_static_kernels(wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge):
     from .cohsex_sigma import _face_kwargs, _make_cohsex_kernels
     sigma_sx, sigma_coh = _make_cohsex_kernels(
         mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
-    with mesh_xy:
-        W_static = jnp.where(
-            jnp.asarray(invalid_mask, dtype=bool),
-            jnp.asarray(Wc0_q, dtype=jnp.complex128),
-            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
-        )
+    W_static = jnp.where(
+        jnp.asarray(invalid_mask, dtype=bool),
+        jnp.asarray(Wc0_q, dtype=jnp.complex128),
+        jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+    )
     if q_wedge is not None:
         W_static = _dc.replace(q_wedge, values=W_static, trs_rule="conj")
     return sigma_sx, sigma_coh, W_static
@@ -824,10 +822,9 @@ def _invalid_static_coh_by_bracket(
     """
     _, sigma_coh, W_static = _invalid_static_kernels(
         wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge)
-    with mesh_xy:
-        out = [_band_sigma_host(sigma_coh(wfns, W_static, None,
-                                          ri_bands=(int(lo), int(hi))), wfns)
-               for lo, hi in brackets]
+    out = [_band_sigma_host(sigma_coh(wfns, W_static, None,
+                                      ri_bands=(int(lo), int(hi))), wfns)
+           for lo, hi in brackets]
     return np.stack(out, axis=0)
 
 

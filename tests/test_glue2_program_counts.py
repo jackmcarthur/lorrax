@@ -71,29 +71,31 @@ def test_dirac_cct_gamma_pairs_share_one_program():
     assert len({v.tobytes() for v in out.values()}) == len(out)
 
 
-@pytest.mark.parametrize("ordered", [False, True])
-def test_window_runner_branches_share_one_program(ordered):
-    """A synthesis that passes the branch's tables as operands runs both branches in one
-    window program; one that takes the branch as a static (``ordered``) lowers twice."""
+@pytest.mark.parametrize("route", ["synthesis", "kconv_tables"])
+def test_window_runner_branches_share_one_program(route):
+    """Both W branches run one window program: the branch's tables arrive as operands, from
+    the synthesis's window operands (scalar route) or from ``kconv_tables(space)`` (sectors)."""
     from gw.mpa.sigma import SynthesisTau, WSynthesis
     from gw.ppm_accumulators import DeviceOmegaAccumulator
     mesh = _mesh()
     face = NamedSharding(mesh, P(None, "x", "y"))
     rep = NamedSharding(mesh, P())
-    tables = {s: jax.device_put(np.full(3, v + 10 * ordered), rep) for s, v in (("cond", 1.0), ("val", 2.0))}
-    synthesis = WSynthesis(lambda load, _ref, _t, _hole: load,
-                           lambda space, _i, _b: (tables[space],), lambda: (), lambda _r=None: None,
-                           0, ("glue2-toy", ordered), ordered=ordered)
-    spatial = lambda xn, yr, xr, yn, energies, weight, e_ref, t, w: xn * (w[0] * t)
+    tables = {s: jax.device_put(np.full(3, v), rep) for s, v in (("cond", 1.0), ("val", 2.0))}
+    by_synthesis = route == "synthesis"
+    synthesis = WSynthesis(lambda load, _ref, _t: load,
+                           lambda space, _i, _b: (tables[space] if by_synthesis else tables["cond"],),
+                           lambda: (), lambda _r=None: None, 0, ("glue2-toy", route))
+    spatial = lambda xn, yr, xr, yn, energies, weight, e_ref, t, w, *k: xn * ((k[0] if k else w)[0] * t)
     xn = jax.device_put(np.ones((2, 4, 4), np.complex128), face)
-    tau = SynthesisTau(spatial, synthesis, None, None, 0, "glue2", None, ("glue2-toy", ordered), ())
+    tau = SynthesisTau(spatial, synthesis, None, None, 0, "glue2", None, ("glue2-toy", route), (),
+                       kconv_tables=None if by_synthesis else tables.__getitem__)
     acc = DeviceOmegaAccumulator(np.arange(3.0), shape=(3, 2, 4, 4),
                                  sharding=NamedSharding(mesh, P(None, None, "x", "y")), omega_axis=0)
     count, zero = jax.device_put((np.int32(1), np.float64(0.0)), rep)
 
     def window(space, **kw):
         args = tau.window_arguments(xn, xn, None, None, zero, zero, space, None, None)
-        return acc.integrate_window(tau.window_kernel(space), args, np.ones(2), np.ones(2),
+        return acc.integrate_window(tau.window_kernel(), args, np.ones(2), np.ones(2),
                                     n_active=2, active_count=count, capacity=2, omega_sign=1.0,
                                     prefactor=1.0, **kw)
 
@@ -101,11 +103,11 @@ def test_window_runner_branches_share_one_program(ordered):
     before = _lowerings()
     for space in ("cond", "val", "cond", "val"):
         window(space)
-    assert _lowerings() - before == int(ordered)
+    assert _lowerings() == before
     # Two nodes per window, two windows per branch, each node's sigma(t) = the branch table.
     total = np.asarray(acc.finalize())
     coeff = np.exp(1j * np.arange(3.0))[:, None, None, None]
-    expect = 4 * coeff * ((1.0 + 2.0) + 20 * ordered) * np.ones((3, 2, 4, 4))
+    expect = 4 * coeff * (1.0 + 2.0) * np.ones((3, 2, 4, 4))
     assert np.allclose(total, expect, rtol=1e-12)
 
 

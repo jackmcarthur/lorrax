@@ -456,12 +456,11 @@ def parent_faces(
     packed centroid order, so nothing is permuted here.
     """
     nmu_spec, mun_spec = psi_specs(layout)
-    with mesh_xy:
-        psi_nmu = jax.lax.with_sharding_constraint(
-            psi_rmu_Y_parent, NamedSharding(mesh_xy, nmu_spec))
-        psi_mun = jax.lax.with_sharding_constraint(
-            jnp.conj(psi_rmuT_X_parent).transpose(0, 3, 1, 2),
-            NamedSharding(mesh_xy, mun_spec))
+    psi_nmu = jax.lax.with_sharding_constraint(
+        psi_rmu_Y_parent, NamedSharding(mesh_xy, nmu_spec))
+    psi_mun = jax.lax.with_sharding_constraint(
+        jnp.conj(psi_rmuT_X_parent).transpose(0, 3, 1, 2),
+        NamedSharding(mesh_xy, mun_spec))
     return psi_nmu, psi_mun
 
 
@@ -485,16 +484,15 @@ def build_packed_parent_green_carrier(
         raise ValueError(
             "build_packed_parent_green_carrier: psi_mun shape "
             f"{psi_mun_parent.shape} != {expected_mun}.")
-    with mesh_xy:
-        psi_nmu = jax.lax.with_sharding_constraint(
-            psi_nmu_parent, NamedSharding(mesh_xy, nmu_spec))
-        psi_mun = jax.lax.with_sharding_constraint(
-            psi_mun_parent, NamedSharding(mesh_xy, mun_spec))
-        enk = plan.parent_rows(wfns.enk)
-        occ = plan.parent_rows(wfns.occ)
-        rep2 = NamedSharding(mesh_xy, P(None, None))
-        enk = jax.lax.with_sharding_constraint(enk, rep2)
-        occ = jax.lax.with_sharding_constraint(occ, rep2)
+    psi_nmu = jax.lax.with_sharding_constraint(
+        psi_nmu_parent, NamedSharding(mesh_xy, nmu_spec))
+    psi_mun = jax.lax.with_sharding_constraint(
+        psi_mun_parent, NamedSharding(mesh_xy, mun_spec))
+    enk = plan.parent_rows(wfns.enk)
+    occ = plan.parent_rows(wfns.occ)
+    rep2 = NamedSharding(mesh_xy, P(None, None))
+    enk = jax.lax.with_sharding_constraint(enk, rep2)
+    occ = jax.lax.with_sharding_constraint(occ, rep2)
     return ParentGreenCarrier(
         psi_nmu=psi_nmu, psi_mun=psi_mun, enk=enk, occ=occ, plan=plan,
         layout=wfns.layout)
@@ -586,17 +584,16 @@ def build_wavefunctions_face(
 ) -> Wavefunctions:
     """Assemble canonical faces from direct Y samples and conjugated X samples."""
     nmu_spec, mun_spec = psi_specs(layout)
-    with mesh_xy:
-        psi_nmu = jax.lax.with_sharding_constraint(
-            psi_rmu_Y, NamedSharding(mesh_xy, nmu_spec))
-        psi_mun = jax.lax.with_sharding_constraint(
-            jnp.conj(psi_rmuT_X).transpose(0, 3, 1, 2),  # (nk, s, μ_X, n)
-            NamedSharding(mesh_xy, mun_spec))
+    psi_nmu = jax.lax.with_sharding_constraint(
+        psi_rmu_Y, NamedSharding(mesh_xy, nmu_spec))
+    psi_mun = jax.lax.with_sharding_constraint(
+        jnp.conj(psi_rmuT_X).transpose(0, 3, 1, 2),  # (nk, s, μ_X, n)
+        NamedSharding(mesh_xy, mun_spec))
 
-        occ_full = _build_occ(enk_full, slices, efermi)
-        rep2 = NamedSharding(mesh_xy, P(None, None))
-        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
-        occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
+    occ_full = _build_occ(enk_full, slices, efermi)
+    rep2 = NamedSharding(mesh_xy, P(None, None))
+    enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
+    occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
 
     wfns = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
@@ -619,11 +616,10 @@ def wavefunctions_face_from_restart(
     bundle and a fresh-fit bundle agree on occupation for the same
     ``efermi``.
     """
-    with mesh_xy:
-        occ_full = _build_occ(enk_full, slices, efermi)
-        rep2 = NamedSharding(mesh_xy, P(None, None))
-        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
-        occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
+    occ_full = _build_occ(enk_full, slices, efermi)
+    rep2 = NamedSharding(mesh_xy, P(None, None))
+    enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
+    occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
 
     wfns = Wavefunctions(
         psi_nmu=psi_nmu, psi_mun=psi_mun,
@@ -803,65 +799,64 @@ def rotate_wavefunctions(
             f"rotate_wavefunctions: U shape {U_dft_to_qp_active.shape} "
             f"inconsistent with active block size {nb_active}.")
 
-    with mesh_xy:
-        fk = face_kernel_kwargs(wfns_dft)
-        nk_face, nb_full, n_rmu, ns = fk['face_shape']
-        U = _place_U_face(U_dft_to_qp_active, mesh_xy)
-        psi_nmu = psi_mun = None
-        carrier_rotated = None
-        if wfns_dft.psi_nmu is not None:
-            rotate = _face_rotate_kernel(
-                mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face, layout=wfns_dft.layout)
-            psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
-            if wfns_dft.green_parent is not None:
-                # A carrier beside full-k faces (the self-consistent map
-                # keeps both) rotates with them, so every iteration's
-                # screening and Sigma take the same route as iteration 0.
-                carrier_rotated = _rotate_parent_carrier(
-                    wfns_dft.green_parent, U, a_lo=a_lo, nb_active=nb_active,
-                    nb_full=nb_full, ns=ns, mesh_xy=mesh_xy)
-        else:
-            # Parents-only storage: the carrier is the run's only ψ.  Rotate
-            # its faces with U on the parents' OWN full-k rows -- the
-            # transported child basis is the parent basis, so the map's
-            # rotation at a child row is the parent's (conjugated on
-            # antiunitary rows, which the carrier never materializes).
+    fk = face_kernel_kwargs(wfns_dft)
+    nk_face, nb_full, n_rmu, ns = fk['face_shape']
+    U = _place_U_face(U_dft_to_qp_active, mesh_xy)
+    psi_nmu = psi_mun = None
+    carrier_rotated = None
+    if wfns_dft.psi_nmu is not None:
+        rotate = _face_rotate_kernel(
+            mesh_xy, a_lo, nb_active, nb_full, n_rmu, ns, nk_face, layout=wfns_dft.layout)
+        psi_nmu, psi_mun = rotate(wfns_dft.psi_nmu, wfns_dft.psi_mun, U)
+        if wfns_dft.green_parent is not None:
+            # A carrier beside full-k faces (the self-consistent map
+            # keeps both) rotates with them, so every iteration's
+            # screening and Sigma take the same route as iteration 0.
             carrier_rotated = _rotate_parent_carrier(
                 wfns_dft.green_parent, U, a_lo=a_lo, nb_active=nb_active,
                 nb_full=nb_full, ns=ns, mesh_xy=mesh_xy)
+    else:
+        # Parents-only storage: the carrier is the run's only ψ.  Rotate
+        # its faces with U on the parents' OWN full-k rows -- the
+        # transported child basis is the parent basis, so the map's
+        # rotation at a child row is the parent's (conjugated on
+        # antiunitary rows, which the carrier never materializes).
+        carrier_rotated = _rotate_parent_carrier(
+            wfns_dft.green_parent, U, a_lo=a_lo, nb_active=nb_active,
+            nb_full=nb_full, ns=ns, mesh_xy=mesh_xy)
 
-        if enk_base is None:
-            enk_full = wfns_dft.enk.at[:, active_slice].set(
+    if enk_base is None:
+        enk_full = wfns_dft.enk.at[:, active_slice].set(
+            jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
+    else:
+        if tuple(enk_base.shape) != tuple(wfns_dft.enk.shape):
+            raise ValueError(
+                f"rotate_wavefunctions: enk_base shape {enk_base.shape} "
+                f"does not match full DFT energies "
+                f"{wfns_dft.enk.shape}.")
+        enk_full = jnp.asarray(
+            enk_base, dtype=wfns_dft.enk.dtype).at[:, active_slice].set(
                 jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
-        else:
-            if tuple(enk_base.shape) != tuple(wfns_dft.enk.shape):
-                raise ValueError(
-                    f"rotate_wavefunctions: enk_base shape {enk_base.shape} "
-                    f"does not match full DFT energies "
-                    f"{wfns_dft.enk.shape}.")
-            enk_full = jnp.asarray(
-                enk_base, dtype=wfns_dft.enk.dtype).at[:, active_slice].set(
-                    jnp.asarray(enk_active_new, dtype=wfns_dft.enk.dtype))
-        rep2 = NamedSharding(mesh_xy, P(None, None))
-        enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
-        if occupations is None:
-            occ_full = _build_occ(enk_full, wfns_dft.slices, efermi)
-        else:
-            if efermi is not None:
-                raise ValueError(
-                    "GATE rotate_occupation_owner: got both efermi and an "
-                    "occupation state; want exactly one; why: a step rebuilt "
-                    "from efermi beside a supplied state is two owners of "
-                    "the same table.")
-            occ_full = jnp.asarray(occupations, dtype=wfns_dft.occ.dtype)
-            if tuple(occ_full.shape) != tuple(enk_full.shape):
-                raise ValueError(
-                    "GATE rotate_occupation_owner: got occupation table "
-                    f"{tuple(occ_full.shape)} for energies "
-                    f"{tuple(enk_full.shape)}; want the carrier's (nk, nb); "
-                    "why: the bundle and its parent carrier index the same "
-                    "bands.")
-        occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
+    rep2 = NamedSharding(mesh_xy, P(None, None))
+    enk_full = jax.lax.with_sharding_constraint(enk_full, rep2)
+    if occupations is None:
+        occ_full = _build_occ(enk_full, wfns_dft.slices, efermi)
+    else:
+        if efermi is not None:
+            raise ValueError(
+                "GATE rotate_occupation_owner: got both efermi and an "
+                "occupation state; want exactly one; why: a step rebuilt "
+                "from efermi beside a supplied state is two owners of "
+                "the same table.")
+        occ_full = jnp.asarray(occupations, dtype=wfns_dft.occ.dtype)
+        if tuple(occ_full.shape) != tuple(enk_full.shape):
+            raise ValueError(
+                "GATE rotate_occupation_owner: got occupation table "
+                f"{tuple(occ_full.shape)} for energies "
+                f"{tuple(enk_full.shape)}; want the carrier's (nk, nb); "
+                "why: the bundle and its parent carrier index the same "
+                "bands.")
+    occ_full = jax.lax.with_sharding_constraint(occ_full, rep2)
 
     # As above, the host DFT binding cannot follow a QP-rotated carrier.
     rotated = Wavefunctions(

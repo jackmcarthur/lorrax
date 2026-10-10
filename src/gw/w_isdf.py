@@ -3059,10 +3059,9 @@ def _screen_static_photon_body(
                 f"W on the CC block: expected {expected_cc} from the photon "
                 f"layout, got {tuple(W_cc.shape)}.  The charge centroid "
                 "padding of the scalar and packed paths must agree.")
-        with mesh_xy:
-            W_cc = jax.lax.with_sharding_constraint(
-                W_cc.astype(V_packed.dtype),
-                NamedSharding(mesh_xy, P(None, "x", "y")))
+        W_cc = jax.lax.with_sharding_constraint(
+            W_cc.astype(V_packed.dtype),
+            NamedSharding(mesh_xy, P(None, "x", "y")))
 
         def _bare_W_block(A, B):
             if (int(A), int(B)) == (0, 0):

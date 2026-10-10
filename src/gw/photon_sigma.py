@@ -132,7 +132,7 @@ def _photon_class_kernel(node):
             weights = plan.parent_rows(weights)
             zero = jnp.zeros((), jnp.float64)
             return factor * spatial(xn, yr, xr, yn, jnp.zeros(weights.shape, jnp.float64),
-                                    weights, zero, zero, ParentW(*interaction, hole=False), loads)
+                                    weights, zero, zero, ParentW(*interaction), loads)
         # The node rides along so its key (ids of plans and tables) cannot be reused.
         hit = _photon_sigma_kernel_cache[node.key] = (node, contract_class)
     return hit[1]
@@ -321,7 +321,7 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
         pair = _class_parents(mesh_xy, response.layout, lefts, rights)(packed)
         node = sector_node(left, right, keys, meta, mesh_xy, (tables,), band_axis, static=True)
         kernel = _photon_class_kernel(node)
-        arguments = (*operands[a][0], *operands[b][1], weights, pair, factor, node.loads)
+        arguments = (*operands[a][0], *operands[b][1], weights, pair, factor, node.loads())
         if admit_kernel is not None:
             admit_kernel(kernel, arguments, keys[0])
         result = kernel(*arguments)

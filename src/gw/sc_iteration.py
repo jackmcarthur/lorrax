@@ -3373,12 +3373,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # constrains it to ``P(None, None)`` right after the same update), so
     # the host-side MP1 solve cannot meet an array that spans
     # non-addressable devices.
-    with inputs.mesh_xy:
-        enk_entry = jax.lax.with_sharding_constraint(
-            jnp.asarray(inputs.wfns_dft.enk).at[
-                :, inputs.band_slices.sigma].set(
-                    jnp.asarray(E_full, dtype=inputs.wfns_dft.enk.dtype)),
-            NamedSharding(inputs.mesh_xy, P(None, None)))
+    enk_entry = jax.lax.with_sharding_constraint(
+        jnp.asarray(inputs.wfns_dft.enk).at[
+            :, inputs.band_slices.sigma].set(
+                jnp.asarray(E_full, dtype=inputs.wfns_dft.enk.dtype)),
+        NamedSharding(inputs.mesh_xy, P(None, None)))
     entry_occ_state, entry_surface_weight_kn = _solve_head_occupations(
         inputs, enk_entry)
     if inputs.material_class == "metal" and entry_occ_state is not None:

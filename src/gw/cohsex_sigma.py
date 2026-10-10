@@ -664,26 +664,24 @@ def compute_cohsex_sigma(
     sigma_sx_k, sigma_coh_k = _make_cohsex_kernels(
         mesh_xy, kgrid, nk_tot, **_face_kwargs(wfns))
 
-    with mesh_xy:
-        sig_sx  = sigma_sx_k(wfns, Gij, W_q)
-        sig_coh = sigma_coh_k(wfns, W_q, V_q)
-        nb_sigma = wfns.slices.nb_sigma
-        sig_sx  = _replicate_band_sigma(sig_sx, mesh_xy)
-        sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
-        sig_sx  = sig_sx[:, :nb_sigma, :nb_sigma]
-        sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
-        sig_sx, sig_coh = _add_static_head(
-            sig_sx, sig_coh,
-            static_head_terms=static_head_terms,
-            meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
-        sig_sx.block_until_ready()
-        sig_coh.block_until_ready()
+    sig_sx  = sigma_sx_k(wfns, Gij, W_q)
+    sig_coh = sigma_coh_k(wfns, W_q, V_q)
+    nb_sigma = wfns.slices.nb_sigma
+    sig_sx  = _replicate_band_sigma(sig_sx, mesh_xy)
+    sig_coh = _replicate_band_sigma(sig_coh, mesh_xy)
+    sig_sx  = sig_sx[:, :nb_sigma, :nb_sigma]
+    sig_coh = sig_coh[:, :nb_sigma, :nb_sigma]
+    sig_sx, sig_coh = _add_static_head(
+        sig_sx, sig_coh,
+        static_head_terms=static_head_terms,
+        meta=meta, mesh_xy=mesh_xy, do_screened=do_screened)
+    sig_sx.block_until_ready()
+    sig_coh.block_until_ready()
 
     sig_x = None
     sig_x_b = None
     if compute_bare_x:
-        with mesh_xy:
-            sig_x = sigma_sx_k(wfns, Gij, V_q)
+        sig_x = sigma_sx_k(wfns, Gij, V_q)
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
         sig_x = sig_x[:, : wfns.slices.nb_sigma, : wfns.slices.nb_sigma]
         if static_head_terms is not None:
@@ -715,13 +713,12 @@ def compute_cohsex_sigma(
             # row that made this branch unreachable for face is now
             # lifted — this call is the real, gated path, not dead code.
             from .sigma_x_bispinor import compute_sigma_x_bispinor
-            with mesh_xy:
-                sig_x_b = compute_sigma_x_bispinor(
-                    wfns_transverse=wfns_transverse,
-                    Gij=Gij,
-                    bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
-                    meta=meta, mesh_xy=mesh_xy,
-                )
+            sig_x_b = compute_sigma_x_bispinor(
+                wfns_transverse=wfns_transverse,
+                Gij=Gij,
+                bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
+                meta=meta, mesh_xy=mesh_xy,
+            )
             sig_x_b.block_until_ready()
             sig_x = sig_x + sig_x_b
             sig_sx = sig_sx + sig_x_b
@@ -771,12 +768,11 @@ def compute_sigma_x(
     Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
     sigma_sx_k, _ = _make_cohsex_kernels(
         mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
-    with mesh_xy:
-        sig_x = sigma_sx_k(wfns, Gij, V_q)
-        sig_x = _replicate_band_sigma(sig_x, mesh_xy)
-        nb_sigma = wfns.slices.nb_sigma
-        sig_x = sig_x[:, :nb_sigma, :nb_sigma]
-        sig_x.block_until_ready()
+    sig_x = sigma_sx_k(wfns, Gij, V_q)
+    sig_x = _replicate_band_sigma(sig_x, mesh_xy)
+    nb_sigma = wfns.slices.nb_sigma
+    sig_x = sig_x[:, :nb_sigma, :nb_sigma]
+    sig_x.block_until_ready()
 
     if static_head_terms is not None:
         x_head, _ = static_head_terms_to_kij(
@@ -793,13 +789,12 @@ def compute_sigma_x(
         # face-layout defensive backstop REMOVED 2026-08-23 — see
         # compute_cohsex_sigma's identical removal, same session/reason.
         from .sigma_x_bispinor import compute_sigma_x_bispinor
-        with mesh_xy:
-            sig_x_b = compute_sigma_x_bispinor(
-                wfns_transverse=wfns_transverse,
-                Gij=Gij,
-                bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
-                meta=meta, mesh_xy=mesh_xy,
-            )
+        sig_x_b = compute_sigma_x_bispinor(
+            wfns_transverse=wfns_transverse,
+            Gij=Gij,
+            bispinor_v_q_path=bispinor_v_q_path, mu_bases=mu_bases,
+            meta=meta, mesh_xy=mesh_xy,
+        )
         sig_x_b.block_until_ready()
         sig_x = sig_x + sig_x_b
 

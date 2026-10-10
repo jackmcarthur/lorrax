@@ -1267,14 +1267,13 @@ def complete_static_slab_photon_q0(
     sh_x = NamedSharding(mesh_xy, P(None, "x"))
     sh_y = NamedSharding(mesh_xy, P(None, "y"))
     volume = jnp.asarray(float(cell_volume), dtype=jnp.float64)
-    with mesh_xy:
-        left_bare = jax.lax.with_sharding_constraint(
-            jnp.conj(g0_X).astype(dtype), sh_x)
-        right_bare = jax.lax.with_sharding_constraint(
-            jnp.einsum(
-                "AB,Bj->Aj", jnp.asarray(D_mean, dtype=dtype), g0_Y,
-                optimize=True) / volume,
-            sh_y)
+    left_bare = jax.lax.with_sharding_constraint(
+        jnp.conj(g0_X).astype(dtype), sh_x)
+    right_bare = jax.lax.with_sharding_constraint(
+        jnp.einsum(
+            "AB,Bj->Aj", jnp.asarray(D_mean, dtype=dtype), g0_Y,
+            optimize=True) / volume,
+        sh_y)
     images = _photon_q0_factor_orbit(
         left_bare, right_bare, layout=layout, plans=family_plans, mesh_xy=mesh_xy)
     V_packed = add_photon_q0_low_rank(
@@ -1290,13 +1289,12 @@ def complete_static_slab_photon_q0(
     screened_pairs = []
     for u in range(3):
         for v in range(3):
-            with mesh_xy:
-                right_rows = jax.lax.with_sharding_constraint(
-                    jnp.einsum(
-                        "AB,Bj->Aj",
-                        jnp.asarray(moments_mean[u, v], dtype=dtype),
-                        right_basis[v], optimize=True) / volume,
-                    sh_y)
+            right_rows = jax.lax.with_sharding_constraint(
+                jnp.einsum(
+                    "AB,Bj->Aj",
+                    jnp.asarray(moments_mean[u, v], dtype=dtype),
+                    right_basis[v], optimize=True) / volume,
+                sh_y)
             images = _photon_q0_factor_orbit(left_basis[u], right_rows,
                 layout=layout, plans=family_plans, mesh_xy=mesh_xy)
             W_packed = add_photon_q0_low_rank(

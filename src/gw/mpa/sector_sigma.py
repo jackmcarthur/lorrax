@@ -73,13 +73,13 @@ class ParentW:
     ``W`` ``(nq_irr, m, nA, n, nB)`` centroid-major at ``P(None,'x',None,'y',None)``
     is ``B_A d(t) B_B^dagger`` and ``partner`` ``conj(B_A) d(t) B_B^T`` (the
     antiunitary rows' tile), both from ``gw.greens_function_kernel.build_G_parents``.
-    ``hole`` (static) selects the valence branch, W_-(q) = partner(-q): the
-    same pair read through the q-negated tables.  The Sigma kconv call unfolds W on
-    its load; no full-q W or full-grid W_R exists.
+    The valence branch, W_-(q) = partner(-q), is the same pair read through the
+    q-negated tables (the window's load, :func:`sector_node`).  The Sigma kconv
+    call unfolds W on its load; no full-q W or full-grid W_R exists.
     """
 
-    def __init__(self, W, partner, hole):
-        self.W, self.partner, self.hole = W, partner, bool(hole)
+    def __init__(self, W, partner):
+        self.W, self.partner = W, partner
 
 
 _W_TABLES = {}
@@ -234,15 +234,17 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     :data:`runtime.tiles.TILE_BYTES` and the shapes
     (``subtile_stream.plan_windows``), the rule the scalar Σ τ engine uses.
 
-    ``w_tables`` are W's q tables, one per branch ``ParentW.hole`` selects: the
-    particle and hole tables of an ordered W(t) (:func:`sector_tau_factory`),
-    or the one table of a static class (``static``: the photon static classes,
+    ``w_tables`` are W's q tables, one per branch: the particle and hole
+    tables of an ordered W(t) (:func:`sector_tau_factory`), or the one table
+    of a static class (``static``: the photon static classes,
     ``gw.photon_sigma.contract_lorentz_blocks``, the τ = 0 node).  Built once
     per configuration; returns ``SimpleNamespace(spatial, loads, key, plans)``
     with ``spatial(xn, yr, xr, yn, energies, weight, reference, time,
     interactions, loads)``: the left operands placed by
     :func:`sector_left_operands`, the right by :func:`sector_right_operands`,
-    ``interactions`` a :class:`ParentW` and ``loads`` the node's placed tables.
+    ``interactions`` a :class:`ParentW` and ``loads`` the placed tables of one
+    branch, ``loads(space)`` (the valence windows read the hole tables), so
+    both branches run one program.
 
     ``brackets`` (the band-extrapolation plan's disjoint band brackets,
     ``gw.ppm_pipeline.plan_sigma_band_brackets``): the Green band sum is split
@@ -303,16 +305,20 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     # bracket's own, else the window's (TT, CT, TC: 130-622 of 752 bands at CrI3 24x24).
     gemm = gemm_plan(mesh_xy, m=px * R * ns, k=nb, n=n * ns, nq=n_parent,
                      dtype=jnp.complex128, layout='axis', warmup=False, enable_active_range=True)
-    kconv = tuple(make_kconv_lorentz_unfold(
+    # One convolution for every branch: the hole tables are the particle
+    # tables read at -q (hole_tables), with the same shapes and structural
+    # zeros, and the values come from the placed load.
+    kconv = make_kconv_lorentz_unfold(
         mesh_xy, kgrid, cut(g_tables, ns), left_vertices=vertices[0],
         right_vertices=vertices[1], store_rows=plans[0].parent_full_rows,
-        norm='ortho', mult=mult, w_tables=cut(w, n_a)) for w in w_tables)
+        norm='ortho', mult=mult, w_tables=cut(w_tables[0], n_a))
     project = contract_bands_block_reshard(
         mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * R, ns),
         right_face_shape=(n_parent, nb, n, ns), face_band_extent=nb_sig)
     finish = project.finish
-    loads = (device_load_tables(g_tables, mesh_xy),
-             tuple(device_load_tables(t, mesh_xy) for t in w_tables))
+    g_load = device_load_tables(g_tables, mesh_xy)
+    w_loads = tuple(device_load_tables(t, mesh_xy) for t in w_tables)
+    loads = lambda space=None: (g_load, w_loads[space == 'val'])
     psi_bytes = 16 * n_parent * ns * (nb + nb_sig) * (local_rows + nu)
     price = dict(d=ns, ns=ns, passes=len(windows), new=float(R * row_bytes + psi_bytes))
     from common.gpu_utils import record_stage_price
@@ -331,16 +337,15 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
         # right Green operand and projection operand; ``loads`` the placed tables.
         if selectors is not None:
             bracketed = bracket_selectors(weight, selectors)
-        hole = int(interactions.hole)
-        g_load, w_load = loads[0], loads[1][hole]
+        g_load, w_load = loads
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((1, px * py * n_parent, nb_sig, nb_sig), jnp.complex128), partial_spec)
 
         def contract(acc, green, W, Wt, left_p, g_pass, w_pass, rows_live):
             # ``rows_live``: a padded window's live rows [lo, hi), skipped outside.
-            sigma = kconv[hole](green.G, green.transpose, W, Wt,
-                                conj_partner=green.conj_partner, load=g_pass, w_load=w_pass,
-                                live=rows_live)
+            sigma = kconv(green.G, green.transpose, W, Wt,
+                          conj_partner=green.conj_partner, load=g_pass, w_load=w_pass,
+                          live=rows_live)
             return project.accumulate((jnp.conj(left_p), yn), sigma, acc=acc)
 
         def one_pass(acc, W, Wt, rows, left_p, g_pass, w_pass, rows_live=None):
@@ -489,7 +494,7 @@ def fused_mixed_tau_factory(families, headers, bases, meta, mesh_xy):
             sigma = node_ct.spatial(xn, yr_t, xr, yn_t, energies, weight, reference, time,
                                     interactions, loads[0])
             flip = lambda w: jax.lax.with_sharding_constraint(jnp.transpose(w, perm), spec)
-            mirrored = ParentW(flip(interactions.partner), flip(interactions.W), interactions.hole)
+            mirrored = ParentW(flip(interactions.partner), flip(interactions.W))
             return sigma + node_tc.spatial(xn_t, yr_c, xr_t, yn_c, energies, weight, reference, time,
                                            mirrored, loads[1])
         p1, p2 = node_ct.spatial.price, node_tc.spatial.price
@@ -498,7 +503,7 @@ def fused_mixed_tau_factory(families, headers, bases, meta, mesh_xy):
         return SynthesisTau(spatial, synthesis, (yr_t, xn_t, yr_c), (yn_t, xr_t, yn_c), synthesis.native,
                             'sigma.sector.tau.(0, 1)+(1, 0)', meta, (node_ct.key, node_tc.key, 'fused'),
                             (*node_ct.plans, *node_tc.plans, *tables_ct, *tables_tc),
-                            kconv_tables=(node_ct.loads, node_tc.loads))
+                            kconv_tables=lambda space: (node_ct.loads(space), node_tc.loads(space)))
     return factory
 
 
@@ -543,9 +548,9 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     tile=16*nq*m*nc*n*nt//mesh_xy.size
     if not kmax:
         zero=_zeros(mesh_xy,shape,P(None,'x',None,'y',None))
-        synthesis=WSynthesis(lambda _ref,_time,hole:ParentW(zero(),zero(),hole),
+        synthesis=WSynthesis(lambda _ref,_time:ParentW(zero(),zero()),
                           lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0,
-                          ('zero',mesh_xy,shape),ordered=True,tile_bytes=tile)
+                          ('zero',mesh_xy,shape),tile_bytes=tile)
         synthesis.w_tables=tuple(w_tables)
         return synthesis
     # The store reader pads physical Kmax for both endpoint face shardings.
@@ -602,9 +607,8 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
         raise
     replicated=NamedSharding(mesh_xy,P())
 
-    def w_kernel(x,y,omega,interval,ref,time,hole):
-        W,partner=kernel(x,y,omega,interval,ref,time)
-        return ParentW(W,partner,hole)
+    def w_kernel(x,y,omega,interval,ref,time):
+        return ParentW(*kernel(x,y,omega,interval,ref,time))
 
     def window_operands(space,indices,bounds):
         # Host intervals once per window, on the parent q rows; every tau node reuses them.
@@ -624,7 +628,7 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
             closed=True
     synthesis=WSynthesis(w_kernel,window_operands,lambda:(b_x,b_y,poles),
                       close,0,('w-parent',mesh_xy,tuple(left['grid']),nq,m,nc,n,nt,kcarrier,id(w_plan),
-                               route,same),ordered=True,tile_bytes=tile)
+                               route,same),tile_bytes=tile)
     synthesis.w_tables=tuple(w_tables)
     synthesis.route=route
     return synthesis
@@ -959,7 +963,7 @@ def sector_static_wc(handle, meta, *, mesh_xy, rows):
                 # Both branches at the stored rows only: W_+ through the particle
                 # tables and W_-(q) = partner(-q) through the hole tables.
                 x,y,poles=synthesis.resident_operands()
-                pair=synthesis.w_kernel(x,y,poles,intervals,0.0,0.0,False)
+                pair=synthesis.w_kernel(x,y,poles,intervals,0.0,0.0)
                 wc=sum(_unfold_w_rows(pair.W,pair.partner,tables,rows,mesh_xy)
                        for tables in synthesis.w_tables)
             finally:

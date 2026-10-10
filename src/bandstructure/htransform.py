@@ -228,10 +228,9 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         deps_tol = 1.4e-3 / RYD_TO_EV    # psp.orbital_magnetization's default
         parents, E_par, label = stored_velocity(
             velocity, wfn=wfn, wfn_path=wfn_path, sym=sym, mesh=mesh)
-    with mesh:
-        ops, names = band_operators(
-            wfn, (band_start, band_start + nb_fit), mesh, sym,
-            pseudos=pseudos, channels=channels)
+    ops, names = band_operators(
+        wfn, (band_start, band_start + nb_fit), mesh, sym,
+        pseudos=pseudos, channels=channels)
     axis, axis_source = magnetization_axis(wfn)
     log(f"  [band operators] {len(names)} on {nk} coarse k x {nb_fit} "
         f"bands: {', '.join(names)}")
@@ -282,20 +281,18 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         if kpath_frac is None:
             raise ValueError("--color needs a K_POINTS {crystal_b} path")
         nq = int(kpath_frac.shape[0])
-        with mesh:
-            path_ops = gather_to_host(interpolate_band_operator(
-                ops, wfn_ctilde, result["coeffs_on_path"],
-                np.asarray(kpath_frac), kgrid, mesh))[:nq]
+        path_ops = gather_to_host(interpolate_band_operator(
+            ops, wfn_ctilde, result["coeffs_on_path"],
+            np.asarray(kpath_frac), kgrid, mesh))[:nq]
         expect = np.einsum('qaii->qai', path_ops).real
         extra = {}
         if "orbital" in colors:
             E_path = (np.asarray(gather_to_host(result["energies_sorted"]))
                       + result["energy_reference_ry"])[:nq]
-            with mesh:
-                m_path = path_orbital_moments(
-                    parents, sym, slice(band_start, band_start + nb_fit),
-                    wfn_ctilde, result["coeffs_on_path"], kpath_frac, kgrid,
-                    mesh, E_path, deps_tol)
+            m_path = path_orbital_moments(
+                parents, sym, slice(band_start, band_start + nb_fit),
+                wfn_ctilde, result["coeffs_on_path"], kpath_frac, kgrid,
+                mesh, E_path, deps_tol)
             m_n = average_within_degenerate_sets(
                 np.einsum('a,qai->qi', axis, m_path), E_path, deps_tol)
             clip = float(np.percentile(np.abs(m_n), 95))
@@ -334,13 +331,12 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
 
     if moments_grid:
         grid = tuple(int(v) for v in moments_grid)
-        with mesh:
-            fH_R, f_params, _, _ = build_fH_R(
-                ctilde, enk_sigma, kgrid, mesh, a_band_index=a_band)
-            builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde,
-                                kgrid, mesh) for i in range(3)]
-            E, D, residual = grid_moments(
-                fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
+        fH_R, f_params, _, _ = build_fH_R(
+            ctilde, enk_sigma, kgrid, mesh, a_band_index=a_band)
+        builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde,
+                            kgrid, mesh) for i in range(3)]
+        E, D, residual = grid_moments(
+            fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
             np.asarray(gather_to_host(E)), np.asarray(gather_to_host(D)),
@@ -577,7 +573,7 @@ def main(argv=None):
             1, report.progress, title="fH construction and path solution",
             item_name="stage", max_updates=1).start()
         _quality_records = []
-        with mesh_xy, timing.section("h_transform"):
+        with timing.section("h_transform"):
             result = h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
                                  a_band_index=args.a_band,
                                  band_start=int(wfn.nelec) - int(params["nval"]),
@@ -633,7 +629,7 @@ def main(argv=None):
                     f"you are asking BACK may be an arbitrary direction out of "
                     f"fH's null space.  Raise nband/ncond so the window extends "
                     f"above wfn_fi_max; the f-shoulder gate decides.")
-            with mesh_xy, timing.section("wfns_fi"):
+            with timing.section("wfns_fi"):
                 wfns_fi = compute_wfns_fi(
                     ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
                     kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),

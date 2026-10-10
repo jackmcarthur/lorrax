@@ -511,8 +511,7 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
                 {k: jax.lax.with_sharding_constraint(v, rep)
                  for k, v in dg.items()})
 
-    with mesh_xy:
-        omega, X, Y, dg = _go(*args)
+    omega, X, Y, dg = _go(*args)
     omega = np.asarray(jax.device_get(omega))
     X = np.asarray(jax.device_get(X)).reshape(n_eig, -1)
     Y = np.asarray(jax.device_get(Y)).reshape(n_eig, -1)
@@ -617,9 +616,8 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
                           Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
         return jnp.asarray(omega), jnp.asarray(evecs), jnp.int32(0)
-    with mesh_xy:
-        A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk,
-                                mesh_xy=mesh_xy, log=_log0, halves=halves)
+    A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk,
+                            mesh_xy=mesh_xy, log=_log0, halves=halves)
     b_herm = np.linalg.norm(B - B.conj().T) / max(np.linalg.norm(B), 1e-300)
     if b_herm < 1e-6:
         omega, Z = solve_nontda_product(A, B, n_eig)           # real / RPA

@@ -1293,18 +1293,17 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
     basis_path = _resolve(basis_path) if basis_path else None
-    with mesh_xy:
-        basis = streaming_galerkin_solve(
-            wfn, sym, meta, centroid_indices, mesh_xy, band_range,
-            log_fn=log_fn, bispinor=bispinor,
-            rank_multiplier=params.get("htransform_rank_multiplier", 20.0),
-            qr_eps=params.get("htransform_qr_eps", 1.0e-3),
-            qrcp_seed=params.get("htransform_qrcp_seed", 0),
-            progress_fn=progress_fn,
-            rank_record_fn=rank_record_fn,
-            basis_path=basis_path,
-            distrib_la_batched_route=distrib_la_batched_route,
-        )
+    basis = streaming_galerkin_solve(
+        wfn, sym, meta, centroid_indices, mesh_xy, band_range,
+        log_fn=log_fn, bispinor=bispinor,
+        rank_multiplier=params.get("htransform_rank_multiplier", 20.0),
+        qr_eps=params.get("htransform_qr_eps", 1.0e-3),
+        qrcp_seed=params.get("htransform_qrcp_seed", 0),
+        progress_fn=progress_fn,
+        rank_record_fn=rank_record_fn,
+        basis_path=basis_path,
+        distrib_la_batched_route=distrib_la_batched_route,
+    )
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, "
            f"nb={band_range[1]-band_range[0]}, rank={basis.rank_carrier}")
     return wfn, sym, meta, mesh_xy, basis, enk_sigma

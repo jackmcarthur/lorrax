@@ -2417,32 +2417,31 @@ def _compute_photon_vq(
              opened(zeta_T_paths[0], tt_tiles is not None) as zt1, \
              opened(zeta_T_paths[1], tt_tiles is not None) as zt2, \
              opened(zeta_T_paths[2], tt_tiles is not None) as zt3:
-            with mesh_xy:
-                _, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
-                    zeta_C_loader=zc,
-                    zeta_T_loaders=(zt1, zt2, zt3),
-                    output_h5_path=bispinor_h5_path,
-                    mesh_xy=mesh_xy, kgrid=meta.kgrid,
-                    fft_grid=meta.fft_grid, bvec=bvec,
-                    cell_volume=meta.cell_volume,
-                    sys_dim=meta.sys_dim,
-                    n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
-                    bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
-                    bdot=(np.asarray(wfn.bdot, dtype=np.float64)
-                           if meta.sys_dim == 0 else None),
-                    g_chunk=(int(cfg.memory.vq_g_chunk_size)
-                             if cfg.memory.vq_g_chunk_size > 0 else None),
-                    print_fn=print_fn,
-                    sym=sym,
-                    centroid_C_idx=_cent_C_idx_for_orchestrator,
-                    centroid_T_idx=_cent_T_idx_for_orchestrator,
-                    use_ibz=True,
-                    tt_head_correction=_bispinor_tt_head(cfg),
-                    policy=_bispinor_v_policy(cfg, meta),
-                    cc_tile=cc_tile, tt_tiles=tt_tiles,
-                    current_basis_rows=meta.current_basis_rows,
-                    mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
-                )
+            _, photon_g0_vectors = compute_V_q_bispinor_g_flat_to_h5(
+                zeta_C_loader=zc,
+                zeta_T_loaders=(zt1, zt2, zt3),
+                output_h5_path=bispinor_h5_path,
+                mesh_xy=mesh_xy, kgrid=meta.kgrid,
+                fft_grid=meta.fft_grid, bvec=bvec,
+                cell_volume=meta.cell_volume,
+                sys_dim=meta.sys_dim,
+                n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,
+                bare_coulomb_cutoff_ry=vcoul_cutoff_ry,
+                bdot=(np.asarray(wfn.bdot, dtype=np.float64)
+                       if meta.sys_dim == 0 else None),
+                g_chunk=(int(cfg.memory.vq_g_chunk_size)
+                         if cfg.memory.vq_g_chunk_size > 0 else None),
+                print_fn=print_fn,
+                sym=sym,
+                centroid_C_idx=_cent_C_idx_for_orchestrator,
+                centroid_T_idx=_cent_T_idx_for_orchestrator,
+                use_ibz=True,
+                tt_head_correction=_bispinor_tt_head(cfg),
+                policy=_bispinor_v_policy(cfg, meta),
+                cc_tile=cc_tile, tt_tiles=tt_tiles,
+                current_basis_rows=meta.current_basis_rows,
+                mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+            )
     from file_io.restart_bundle import read_photon_charge
     V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)
     # Both views stay on the canonical file carrier, as on the scalar route:
@@ -2460,13 +2459,12 @@ def _compute_photon_vq(
             "with bispinor = false, or leave mc_average_placement = off.")
     if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
         with ZetaLoader(zeta_h5_path, mesh=mesh_xy) as zeta_io:
-            with mesh_xy:
-                head_channel = _build_head_channel(
-                    zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
-                    mesh_xy=mesh_xy, sym=sym,
-                    centroid_indices=_cent_C_idx_for_orchestrator,
-                    vcoul_cutoff_ry=vcoul_cutoff_ry,
-                    print_fn=print_fn)
+            head_channel = _build_head_channel(
+                zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
+                mesh_xy=mesh_xy, sym=sym,
+                centroid_indices=_cent_C_idx_for_orchestrator,
+                vcoul_cutoff_ry=vcoul_cutoff_ry,
+                print_fn=print_fn)
     return V_q_raw, G0_all, head_channel, photon_g0_vectors
 
 
@@ -2486,28 +2484,27 @@ def _compute_scalar_vq(
                 np.asarray(jax.device_get(centroid_indices),
                            dtype=np.int32)
                 if centroid_indices is not None else None)
-            with mesh_xy:
-                V_q_raw, G0_all = compute_all_V_q(
-                    zeta_io,
-                    kgrid=meta.kgrid, fft_grid=meta.fft_grid,
-                    bvec=bvec, cell_volume=meta.cell_volume,
-                    mesh_xy=mesh_xy,
-                    sys_dim=meta.sys_dim,
-                    bdot=np.asarray(wfn.bdot, dtype=np.float64)
-                        if meta.sys_dim == 0 else None,
-                    mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
-                    bare_coulomb_cutoff=vcoul_cutoff_ry,
-                    bgw_v_grid_fn=bgw_v_grid_fn,
-                    sym=sym,
-                    centroid_indices=_cent_idx_np,
-                    g_chunk_size=int(cfg.memory.vq_g_chunk_size),
-                )
-                head_channel = _build_head_channel(
-                    zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
-                    mesh_xy=mesh_xy, sym=sym,
-                    centroid_indices=_cent_idx_np,
-                    vcoul_cutoff_ry=vcoul_cutoff_ry,
-                    print_fn=print_fn)
+            V_q_raw, G0_all = compute_all_V_q(
+                zeta_io,
+                kgrid=meta.kgrid, fft_grid=meta.fft_grid,
+                bvec=bvec, cell_volume=meta.cell_volume,
+                mesh_xy=mesh_xy,
+                sys_dim=meta.sys_dim,
+                bdot=np.asarray(wfn.bdot, dtype=np.float64)
+                    if meta.sys_dim == 0 else None,
+                mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+                bare_coulomb_cutoff=vcoul_cutoff_ry,
+                bgw_v_grid_fn=bgw_v_grid_fn,
+                sym=sym,
+                centroid_indices=_cent_idx_np,
+                g_chunk_size=int(cfg.memory.vq_g_chunk_size),
+            )
+            head_channel = _build_head_channel(
+                zeta_io, cfg=cfg, meta=meta, wfn=wfn, bvec=bvec,
+                mesh_xy=mesh_xy, sym=sym,
+                centroid_indices=_cent_idx_np,
+                vcoul_cutoff_ry=vcoul_cutoff_ry,
+                print_fn=print_fn)
     if hasattr(zeta_h5_path, 'contract_v'):
         zeta_h5_path.close()
     return V_q_raw, G0_all, head_channel
@@ -2907,37 +2904,36 @@ def _prepare_fresh_isdf(
     	n_rmu_logical=int(meta.n_rmu),
     	n_rmu_padded=int(meta.n_rmu_padded))
     from common.wfn_transforms import get_enk_bandrange
-    with mesh_xy:
-        (zeta_contract, charge_zeta_identity_receipt, _candidate_plan, _parent_green_plan, chunks, _parent_zeta_plan, _parent_green_faces) = _prepare_fresh_parent_faces(
-            band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg,
-            load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir, wfn)
-        (zeta_path, mem_est, transverse_wfn_data, transverse_basis_receipt) = _prepare_fitted_zeta(
-            WavefunctionBasisReceipt, _basis_band_interval, _parent_green_faces, _parent_zeta_plan,
-            band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg, chunks, mesh_xy,
-            meta, print0, representation, sym, tmp_dir, wfn, zeta_contract)
-        (wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T) = _prepare_fresh_carriers(
-            _parent_green_faces,
-            _candidate_plan, _parent_green_plan, band_slices, cfg, charge_basis_receipt, mesh_xy, meta,
-            print0, sym, transverse_basis_receipt, transverse_wfn_data, wfn)
-        del _parent_green_faces
-        (V_qmunu, G0, head_channel, photon_g0_vectors) = _prepare_fresh_coulomb(
-            basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym, wfn,
-            zeta_path)
-        _write_fresh_restart(
-            G0, V_qmunu, _candidate_plan, _to_file_order, band_slices,
-            basis_wfn_fingerprint_binding, centroid_indices, cfg, charge_zeta_identity_receipt,
-            get_enk_bandrange, mesh_xy, meta, print0, resolve_restart_q_storage_for_run,
-            restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
-            tensors_filename, transverse_wfn_data, wfn, wfns_transverse, write_restart_state_to_h5)
-        if ((hasattr(zeta_path, 'contract_v') or cfg.bispinor)
-                and jax.process_index() == 0):
-            # Route G's stage split through V_q (read, faces, C, fit, V_q),
-            # a receipt kept by the production report.  A bispinor run hands
-            # V_q the ζ files (its Z stores are closed after the fits).
-            V_qmunu.block_until_ready()
-            _rows = []
-            timing.report(print_fn=_rows.append, title="", max_depth=3)
-            print0("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
+    (zeta_contract, charge_zeta_identity_receipt, _candidate_plan, _parent_green_plan, chunks, _parent_zeta_plan, _parent_green_faces) = _prepare_fresh_parent_faces(
+        band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg,
+        load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir, wfn)
+    (zeta_path, mem_est, transverse_wfn_data, transverse_basis_receipt) = _prepare_fitted_zeta(
+        WavefunctionBasisReceipt, _basis_band_interval, _parent_green_faces, _parent_zeta_plan,
+        band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg, chunks, mesh_xy,
+        meta, print0, representation, sym, tmp_dir, wfn, zeta_contract)
+    (wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T) = _prepare_fresh_carriers(
+        _parent_green_faces,
+        _candidate_plan, _parent_green_plan, band_slices, cfg, charge_basis_receipt, mesh_xy, meta,
+        print0, sym, transverse_basis_receipt, transverse_wfn_data, wfn)
+    del _parent_green_faces
+    (V_qmunu, G0, head_channel, photon_g0_vectors) = _prepare_fresh_coulomb(
+        basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym, wfn,
+        zeta_path)
+    _write_fresh_restart(
+        G0, V_qmunu, _candidate_plan, _to_file_order, band_slices,
+        basis_wfn_fingerprint_binding, centroid_indices, cfg, charge_zeta_identity_receipt,
+        get_enk_bandrange, mesh_xy, meta, print0, resolve_restart_q_storage_for_run,
+        restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
+        tensors_filename, transverse_wfn_data, wfn, wfns_transverse, write_restart_state_to_h5)
+    if ((hasattr(zeta_path, 'contract_v') or cfg.bispinor)
+            and jax.process_index() == 0):
+        # Route G's stage split through V_q (read, faces, C, fit, V_q),
+        # a receipt kept by the production report.  A bispinor run hands
+        # V_q the ζ files (its Z stores are closed after the fits).
+        V_qmunu.block_until_ready()
+        _rows = []
+        timing.report(print_fn=_rows.append, title="", max_depth=3)
+        print0("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
     V_qmunu.block_until_ready()
     print0("  Chunked ISDF path complete")
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
@@ -3085,13 +3081,12 @@ def _restart_charge_carrier(
     	cent_idx_np = np.asarray(
     		jax.device_get(centroid_indices), dtype=np.int32)
     	with ZetaLoader(zeta_path, mesh=mesh_xy) as zeta_io:
-    		with mesh_xy:
-    			head_channel = _build_head_channel(
-    				zeta_io, cfg=cfg, meta=meta, wfn=wfn,
-    				bvec=bvec, mesh_xy=mesh_xy, sym=sym,
-    				centroid_indices=cent_idx_np,
-    				vcoul_cutoff_ry=vcoul_cutoff_ry,
-    				print_fn=print0)
+    		head_channel = _build_head_channel(
+    			zeta_io, cfg=cfg, meta=meta, wfn=wfn,
+    			bvec=bvec, mesh_xy=mesh_xy, sym=sym,
+    			centroid_indices=cent_idx_np,
+    			vcoul_cutoff_ry=vcoul_cutoff_ry,
+    			print_fn=print0)
     	print0(
     		"  [bgw q0 provenance] restart reused V_q and ζ fit; "
     		"loaded only the finite-q0 head channel from tmp/zeta_q.h5.")

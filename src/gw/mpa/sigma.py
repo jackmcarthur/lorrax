@@ -493,12 +493,16 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         # Ordered stores: conduction windows use W_+(q), valence windows W_+(-q)^T.
         ordered = header.get("representation") == "scalar-ordered-ph"
         q_wedge, loads = _shared_pole_q_wedge(meta, header, mesh_xy=mesh_xy)
+        # The valence branch of an ordered store reads W_+(-q)^T through the
+        # q-negated tables: the same parent pair, another load, chosen per
+        # window so both branches run one window program.
+        branch_load = lambda space: loads[1] if ordered and space == 'val' else loads[0]
         if kmax == 0:
             zero = _zeros(mesh_xy, (nq, m, m))
             synthesis = WSynthesis(
-                lambda _f, _p, _i, load, _ref, _time, _hole: (zero(), zero(), load),
-                lambda _space, _indices, _bounds: ((), (), None, loads), lambda: (),
-                lambda _result=None: None, 0, ("zero", mesh_xy, nq, m), ordered=ordered)
+                lambda _f, _p, _i, load, _ref, _time: (zero(), zero(), load),
+                lambda space, _indices, _bounds: ((), (), None, branch_load(space)), lambda: (),
+                lambda _result=None: None, 0, ("zero", mesh_xy, nq, m))
             synthesis.q_wedge = q_wedge
             return synthesis
         local = layout == "local"
@@ -592,7 +596,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
 
     spans = tuple((p["span"], p["kernel"]) for p in panels)
 
-    def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node, _hole):
+    def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node):
         pair = None
         for ((lo, hi), kernel), factors, poles2 in zip(spans, factors_by_panel, poles_by_panel):
             ranges = intervals[lo:hi]
@@ -634,12 +638,9 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     def window_operands(space, indices, bounds):
         # Host intervals once per window; every τ node of the window reuses them.
         intervals = shared_pole_intervals(frequencies, np.asarray(indices), np.asarray(bounds))
-        # The valence branch of an ordered store reads W_+(-q)^T through the
-        # q-negated tables: the same parent pair, another load, chosen here so
-        # both branches run one window program.
-        load = loads[1] if ordered and space == 'val' else loads[0]
         return (panel_factors, panel_poles,
-                device_put_process_local(intervals, NamedSharding(mesh_xy, P())), load)
+                device_put_process_local(intervals, NamedSharding(mesh_xy, P())),
+                branch_load(space))
 
     closed = False
 
@@ -661,8 +662,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     if weights_fn is not _shared_pole_weights:
         key += (weights_fn.__name__,)
     synthesis = WSynthesis(w_kernel, window_operands, lambda: (panel_factors, panel_poles),
-                           close, native_workspace, key, ordered=False,
-                           tile_bytes=16 * nq * m * m // int(mesh_xy.size))
+                           close, native_workspace, key, tile_bytes=16 * nq * m * m // int(mesh_xy.size))
     synthesis.q_wedge = q_wedge
     return synthesis
 
@@ -739,8 +739,7 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, rows, layout="face"):
 
         @partial(jax.jit, out_shardings=face)
         def static(factors, poles, intervals):
-            W, Wt, _ = synthesis.w_kernel(factors, poles, intervals, (None, None),
-                                          0.0, 0.0, False)
+            W, Wt, _ = synthesis.w_kernel(factors, poles, intervals, (None, None), 0.0, 0.0)
             plus = plus_at(W, Wt)
             return plus + (transpose_xy(minus_at(W, Wt), mesh_xy) if ordered else plus)
         wc = None
@@ -1152,20 +1151,19 @@ def _static_key(value):
 class WSynthesis:
     """A shared-pole model's bound W(τ) synthesis: kernel, per-window operands, lifetime.
 
-    ``w_kernel(*window_operands(space, indices, bounds), ref, time, hole)`` is
+    ``w_kernel(*window_operands(space, indices, bounds), ref, time)`` is
     W(τ) in its consumer's operand layout and is traceable: it runs inside the
     window executable.  ``window_operands`` does the host work once per window
-    (the pole intervals).  ``resident_operands()`` are the device factors its
+    (the pole intervals) and passes the window's branch tables (the valence
+    branch of an ordered model reads -q), so both branches share one program.
+    ``resident_operands()`` are the device factors its
     stage already charged, ``native`` its GEMM's native workspace, ``close``
     releases them, ``key`` is the static configuration ``w_kernel`` closes
-    over, and ``ordered`` says whether ``w_kernel`` takes the valence branch
-    (``hole``, which reads -q) as a static; False when ``window_operands``
-    already passes the branch's tables, so both branches share one program.
-    ``tile_bytes`` is one W(τ) parent tile's bytes per rank.
+    over.  ``tile_bytes`` is one W(τ) parent tile's bytes per rank.
     """
 
     def __init__(self, w_kernel, window_operands, resident_operands, close, native, key,
-                 *, ordered, tile_bytes=0):
+                 *, tile_bytes=0):
         self.key = key
         self.tile_bytes = int(tile_bytes)
         self.w_kernel = w_kernel
@@ -1173,7 +1171,6 @@ class WSynthesis:
         self.resident_operands = resident_operands
         self.close = close
         self.native = int(native)
-        self.ordered = bool(ordered)
 
 
 _SYNTHESIS_TAU = {}
@@ -1183,12 +1180,13 @@ class SynthesisTau:
     """One τ body for the window executable: W(τ) synthesis and Σ(τ) in one program.
 
     Serves the scalar shared-pole route and every photon sector.
-    ``window_kernel(space)`` is the traceable ``fn(*arguments, t, active_count)``
-    of :meth:`DeviceOmegaAccumulator.integrate_window`, one per branch hole on
-    an ordered model; ``window_arguments`` swaps in the right endpoint's
-    operands and the synthesis's per-window operands.  Neither closes over a
-    device buffer, so the accumulator's runner cache retains no factors.
-    ``kconv_tables`` (the Σ kconv call's placed load tables, ``ppm_tau_kernel.sigma_kconv_tables``)
+    ``window_kernel()`` is the traceable ``fn(*arguments, t, active_count)``
+    of :meth:`DeviceOmegaAccumulator.integrate_window`, one for both W
+    branches; ``window_arguments`` swaps in the right endpoint's operands and
+    the synthesis's per-window operands.  Neither closes over a device
+    buffer, so the accumulator's runner cache retains no factors.
+    ``kconv_tables`` (the Σ kconv call's placed load tables, ``ppm_tau_kernel.sigma_kconv_tables``,
+    or a function of the window's ``space`` returning its branch's tables)
     rides the window arguments too and reaches ``spatial`` as its last
     argument, so no window program holds table constants.  ``overlap``: the
     window runs two nodes per loop trip (``gw.ppm_accumulators.WINDOW_OVERLAP``).
@@ -1208,22 +1206,21 @@ class SynthesisTau:
         self._kconv_tables = kconv_tables
         self._admitted = False
 
-    def window_kernel(self, space):
-        """The τ body for ``space``, one function object per static configuration.
+    def window_kernel(self):
+        """The τ body, one function object per static configuration.
 
         The window runner is cached on this object, so returning the first
         map's body for an equal configuration (same shapes, mesh, layout,
         parent plans and W synthesis) lets every later SC map dispatch the
         compiled window executable instead of recompiling it.
         """
-        hole = space == 'val' and self._synthesis.ordered
-        key = (self._key, self._synthesis.key, hole)
+        key = (self._key, self._synthesis.key)
         if key not in _SYNTHESIS_TAU:
             spatial, w_kernel = self._spatial, self._synthesis.w_kernel
 
             def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, kconv_tables, t,
                     _active):
-                interactions = w_kernel(*w_operands, e_ref_b, t, hole)
+                interactions = w_kernel(*w_operands, e_ref_b, t)
                 if kconv_tables is None:
                     return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
                 return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions, kconv_tables)
@@ -1233,8 +1230,9 @@ class SynthesisTau:
 
     def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, indices, bounds):
         w_operands = self._synthesis.window_operands(space, indices, bounds)
+        tables = self._kconv_tables
         return (xn, self._right[0], xr, self._right[1], energies, weight, w_operands,
-                e_ref_a, e_ref_b, self._kconv_tables)
+                e_ref_a, e_ref_b, tables(space) if callable(tables) else tables)
 
     def fits(self, compiled):
         """Whether ``compiled`` fits the budget beside the live stages.
@@ -1492,7 +1490,7 @@ def _integrate_sigma_batches(
                 if synthesis:
                     # The synthesis reads the right endpoint's faces and its
                     # window operands (host intervals, once per window).
-                    row_kernel = tau_kernel.window_kernel(row.space)
+                    row_kernel = tau_kernel.window_kernel()
                     tau_arguments = tau_kernel.window_arguments(
                         psi_coh_xn, psi_proj_xr, E_A_call, selector,
                         jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B),

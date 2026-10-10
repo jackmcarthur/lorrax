@@ -17,7 +17,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from jax import shard_map
 from common.bispinor_init import HALFALPHA
-from gw.qsgw_head import _pad_head_band_manifold, _mesh_xy
+from gw.qsgw_head import _host_or_device, _pad_head_band_manifold, _mesh_xy
 
 
 def cartesian_gamma_rows(photon_g0_vectors, current_basis_rows):
@@ -243,9 +243,8 @@ def direct_photon_interband_tensors(velocity_cart, energies_kn_ry,
     at all (their content is the Fermi-surface atoms').
     """
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
-    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
-    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
-    w = jnp.asarray(surface_kn, dtype=jnp.float64)
+    e, f, w = (_host_or_device(a).asarray(a, dtype=np.float64)
+               for a in (energies_kn_ry, occupations_kn, surface_kn))
     z = jnp.atleast_1d(jnp.asarray(frequencies_ry, dtype=jnp.complex128))
     if (v.ndim != 4 or tuple(v.shape[:2]) != (3, nk_tot)
             or v.shape[-1] != v.shape[-2] or e.shape != f.shape
@@ -258,11 +257,6 @@ def direct_photon_interband_tensors(velocity_cart, energies_kn_ry,
     if np.any((np.imag(points) < 0) |
               ((np.imag(points) == 0) & (np.real(points) != 0))):
         raise ValueError("direct photon head samples must be causal or exactly static")
-    if v.shape[-1] > nb_logical:
-        pad = int(v.shape[-1]) - int(nb_logical)
-        e = jnp.pad(e, ((0, 0), (0, pad)))
-        f = jnp.pad(f, ((0, 0), (0, pad)))
-        w = jnp.pad(w, ((0, 0), (0, pad)))
     v, e, f, w = _pad_head_band_manifold(v, e, f, w, mesh=mesh)
     d_x, d_y, moment = pair_split.operands(v)
     # Match the incumbent S_ab normalization for its charge-charge block.

@@ -189,8 +189,9 @@ class StaticGaugeHallTransaction:
 def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
     """Zero-pad a logical head manifold for both processor-grid axes.
 
-    ``nb_logical`` remains the authoritative transition mask in every
-    consumer kernel. Padding here is storage only: it makes the two band
+    The (k, band) tables may be narrower than ``v``'s band axis (the logical
+    manifold); each is padded to the carrier.  ``nb_logical`` remains the
+    authoritative transition mask in every consumer kernel. Padding here is storage only: it makes the two band
     axes legal for ``P('x', 'y')`` without inventing physical states. A
     common multiple is intentional because the wing ring uses one band
     storage extent on both processor axes.
@@ -231,11 +232,19 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
         v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
     v = device_put_process_local(
         v, NamedSharding(mesh, P(None, None, "x", "y")))
-    # A host (k, band) table stays on the host: a kernel places it without a
-    # program, while a single-device copy beside ``v`` costs a reshard.
-    e, f, surface = ((np if isinstance(a, np.ndarray) else jnp).pad(a, ((0, 0), (0, pad)))
+    e, f, surface = (_host_or_device(a).pad(a, ((0, 0), (0, band_axis.carrier - a.shape[-1])))
                      for a in (e, f, surface))
     return v, e, f, surface
+
+
+def _host_or_device(a):
+    """``np`` for a host table, else ``jnp``: a host (k, band) table stays on the host.
+
+    A kernel places a host operand without a program, while a single-device
+    copy beside a sharded operand costs a reshard program per shape.  Only a
+    host-born array qualifies: a mesh-sharded one stays on the devices.
+    """
+    return np if isinstance(a, np.ndarray) else jnp
 
 
 @dataclass(frozen=True)
@@ -2688,7 +2697,7 @@ def metal_pair_split(velocity_cart, *, mesh: Mesh, bvec_cart, kgrid,
     from common.collectives import gather_to_host
 
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
-    e = jnp.zeros(v.shape[1:3], dtype=jnp.float64)
+    e = np.zeros(v.shape[1:3])
     v, _e, _f, _s = _pad_head_band_manifold(v, e, e, e, mesh=mesh)
     diag = np.asarray(gather_to_host(_velocity_diagonal_kernel(mesh)(v)))
     moment = minibz_coulomb_moment(np.asarray(bvec_cart, dtype=np.float64),
@@ -2740,8 +2749,8 @@ def head_s_tensor_sharded(
     executable shapes.
     """
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
-    e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
-    f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    e, f = (_host_or_device(a).asarray(a, dtype=np.float64)
+            for a in (energies_kn_ry, occupations_kn))
     omega = jnp.atleast_1d(jnp.asarray(omegas_ry, dtype=jnp.complex128))
     if v.ndim != 4 or int(v.shape[0]) not in _HEAD_VERTEX_WIDTHS:
         raise ValueError(
@@ -2761,8 +2770,8 @@ def head_s_tensor_sharded(
         )
     include_surface = surface_weight_kn is not None
     surface = (
-        jnp.asarray(surface_weight_kn, dtype=jnp.float64)
-        if include_surface else jnp.zeros_like(e))
+        _host_or_device(surface_weight_kn).asarray(surface_weight_kn, dtype=np.float64)
+        if include_surface else _host_or_device(e).zeros_like(e))
     if surface.shape != e.shape:
         raise ValueError(
             f"surface_weight_kn shape {surface.shape} does not match {e.shape}.")

@@ -1142,8 +1142,9 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
     b = basis.pack_axis(b, 1, spec=spec)
     poles = io.read_slab("poles2_ry2", shape=(hi-lo, width), offset=(lo, 0),
                          partition_spec=P())
-    counts = jnp.asarray(header["K"][lo:hi], jnp.int64)
-    active = jnp.arange(width)[None, :] < counts[:, None]
+    # Host tables: a kernel places them without a program, beside the sharded b.
+    counts = np.asarray(header["K"][lo:hi], np.int64)
+    active = np.arange(width)[None, :] < counts[:, None]
     return (jnp.where(active[:, None, :], b[:, :, 0, :], 0),
             jnp.where(active, poles, 1.0), counts)
 
