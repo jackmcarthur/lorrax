@@ -368,22 +368,21 @@ def _fixed_q_anti_trs_residual(operator, fixed_mask):
     exact group average and not a repair, but the size of what it removes
     is evidence and is reported rather than discarded.
     """
-    import jax.numpy as jnp
-
-    mask = jnp.asarray(fixed_mask).reshape(
+    mask = np.asarray(fixed_mask).reshape(
         (int(fixed_mask.size),) + (1,) * (operator.ndim - 1))
     return _anti_trs_stats_fn()(operator, mask)
 
 
 def _covariance_residual_fn():
-    """``(V, p, alpha, phase, antiunitary) -> scalar`` — unfold arithmetic.
+    """``(V, p, alpha, qL, antiunitary) -> (max|V|, residual per pair)`` — unfold arithmetic.
 
-    ONE compiled module for every (parent, op): the double gather, the
-    umklapp phase and the reduction to a single scalar are fused, so no
-    (μ,μ) intermediate is ever materialised outside the sharded graph.
-    Eager operator-by-operator arithmetic here would resolve the
-    gather/transpose shardings by all-gathering the tile onto every rank —
-    the trap ``common.sanity._herm_stats`` documents.
+    ONE compiled module for every sampled (parent, op) pair at a given shape:
+    a ``lax.map`` over the pairs, each a fused double gather, umklapp phase and
+    reduction to one scalar, so one (μ,μ) image is live at a time and none is
+    materialised outside the sharded graph.  Eager operator-by-operator
+    arithmetic here would resolve the gather/transpose shardings by
+    all-gathering the tile onto every rank — the trap
+    ``common.sanity._herm_stats`` documents.
     """
     fn = _JIT_CACHE.get("covariance")
     if fn is None:
@@ -391,12 +390,17 @@ def _covariance_residual_fn():
         import jax.numpy as jnp
 
         @jax.jit
-        def fn(V, p, alpha, phase, antiunitary):
-            row = jnp.take(V, p, axis=0)
-            image = jnp.take(jnp.take(row, alpha, axis=0), alpha, axis=1)
-            image = image * (phase[:, None] * jnp.conj(phase)[None, :])
-            image = jnp.where(antiunitary, jnp.conj(image), image)
-            return jnp.max(jnp.abs(image - row)).astype(jnp.float64)
+        def fn(V, p, alpha, qL, antiunitary):
+            def one(pair):
+                p, alpha, qL, antiunitary = pair
+                phase = jnp.exp(1j * qL)
+                row = jnp.take(V, p, axis=0)
+                image = jnp.take(jnp.take(row, alpha, axis=0), alpha, axis=1)
+                image = image * (phase[:, None] * jnp.conj(phase)[None, :])
+                image = jnp.where(antiunitary, jnp.conj(image), image)
+                return jnp.max(jnp.abs(image - row)).astype(jnp.float64)
+            return (jnp.max(jnp.abs(V)).astype(jnp.float64),
+                    jax.lax.map(one, (p, alpha, qL, antiunitary)))
 
         _JIT_CACHE["covariance"] = fn
     return fn
@@ -749,7 +753,6 @@ def little_group_covariance_residual(
         returned as unanswerable rather than as a pass.
     """
     import jax
-    import jax.numpy as jnp
 
     if parents not in ("self_negative", "all"):
         raise ValueError(
@@ -832,15 +835,14 @@ def little_group_covariance_residual(
         stride = int(np.ceil(n_available / budget))
         pairs = pairs[::stride][:budget]
 
-    _residual = _covariance_residual_fn()
-    scale = float(jax.device_get(jnp.max(jnp.abs(V_ibz))))
+    # Host tables in, one program and one transfer out for all pairs.
+    ps, ss = (np.asarray(v) for v in zip(*pairs))
+    qL = np.stack([2.0 * np.pi * (L_arr[s] @ q_frac[p]) for p, s in pairs])
+    scale, devs = jax.device_get(_covariance_residual_fn()(
+        V_ibz, ps.astype(np.int32), perm[ss], qL, ss >= n_spatial))
+    scale = float(scale)
     worst_abs, worst_parent, worst_sym = -1.0, -1, -1
-    for p, s in pairs:
-        qL = 2.0 * np.pi * (L_arr[s] @ q_frac[p])          # (n_rmu,)
-        dev = float(jax.device_get(_residual(
-            V_ibz, jnp.int32(p), jnp.asarray(perm[s]),
-            jnp.exp(1j * jnp.asarray(qL)),
-            jnp.asarray(s >= n_spatial))))
+    for (p, s), dev in zip(pairs, devs.tolist()):
         if dev > worst_abs:
             worst_abs, worst_parent, worst_sym = dev, p, s
     return {
