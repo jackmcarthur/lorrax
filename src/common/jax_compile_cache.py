@@ -26,12 +26,11 @@ is only what that cannot see or say:
   first call is lowered on the calling thread (program order, so every rank
   lowers the same module at the same request number) and compiled on a
   helper thread, while the main thread goes on tracing, lowering and running.
-  XLA's backend compile releases the GIL and scales (P4 hsuite, A100 node,
-  16 cores per rank, 2026-10-10: the 75 largest programs 104 s serial, 29.1 s
-  at 4 threads, 16.4 s at 8, 12.4 s at 16); the agreement slot is taken on the
-  calling thread, so INVARIANTS 25's race (helper compiles reordering the
-  requests across ranks) cannot arise; a live call for a module in flight
-  waits for that compile instead of starting a second one.
+  XLA's backend compile releases the GIL and scales with threads (sandbox
+  claims 4178, 4180); the agreement slot is taken on the calling thread, so
+  INVARIANTS 25's race (helper compiles reordering the requests across
+  ranks) cannot arise; a live call for a module in flight waits for that
+  compile instead of starting a second one.
 
 What this file no longer does, and why. Until 2026-10-05 it froze an
 all-rank agreed entry set at startup and vetoed every other lookup, made
@@ -837,13 +836,11 @@ def _install_compile_counter() -> None:
     _compiler._lorrax_compile_counter_installed = True
 
 
-#: Helper threads per process for :func:`compile_ahead`, at most. Measured on
-#: the P4 hsuite's 75 largest programs (A100 node, 4 ranks, 16 cores per rank,
-#: every rank compiling at once; runs/DEV/813_compile2_20261010/parcomp): 104 s
-#: serial; 2 threads x1.86, 4 x3.58, 8 x6.32, 16 x8.42. Past 8 the per-program
-#: compile stretches (x1.23 at 8, x1.69 at 16: the node's 64 cores are full),
-#: and a live call waiting for ITS program pays that stretch; 8 keeps the gain
-#: and half the host memory of 16 concurrent XLA compiles.
+#: Helper threads per process for :func:`compile_ahead`, at most.  Past eight
+#: the node's cores are full with four ranks compiling, each compile stretches
+#: and a live call waiting for ITS program pays that stretch; eight keeps the
+#: scaling and half the host memory of sixteen concurrent XLA compiles
+#: (sandbox claim 4178).
 COMPILE_THREADS_MAX = 8
 
 

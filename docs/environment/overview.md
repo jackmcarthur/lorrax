@@ -118,7 +118,7 @@ executable or waits for the compile in flight, never compiling twice. The
 agreement slot is taken on the calling thread, so ranks keep one request
 order. Measured on the P4 hsuite's 75 largest programs (one A100 node,
 four ranks compiling at once): 104 s serially, 29 s at four threads, 16 s
-at eight.
+at eight (sandbox claims 4178, 4180).
 
 ### 2.1 The GPU memory pool {#gpu-pool}
 

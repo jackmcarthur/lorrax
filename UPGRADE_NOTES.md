@@ -18,7 +18,8 @@ compile in flight; a module is compiled once per process whichever thread
 asks first. The agreement's lock no longer spans the backend compile. The
 response bank's `_compiled` holds these futures, and V^(1/2) compiles beside
 its slab read. No result moves (P4 hsuite eqp bitwise, cold and warm), no deck
-or environment change; `compile_cache_stats()` gains `compile_threads`.
+or environment change; `compile_cache_stats()` gains `compile_threads`
+(sandbox claims 4178, 4180).
 
 ## 2026-10-09 — `tests/hsuite` uses the runtime's compile cache and reports a per-stage compile census
 
