@@ -2919,7 +2919,7 @@ def _route_g_cylinder(wfn, meta):
 def _prepare_fresh_parent_faces(
         band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg,
         load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir,
-        wfn):
+        wfn, *, operator_only=False):
     """Produce the authenticated fit contract and loaded raw-parent faces."""
     # One strict read supplies this fresh invocation's fields and provenance.
     # Restart loading authenticates independently on every invocation; there
@@ -3059,19 +3059,21 @@ def _prepare_fresh_parent_faces(
                 public_band_range=band_slices.full_range,
                 charge_fit_weights=zeta_contract.charge_fit_weights,
                 current_request=current_request,
-                hartree_source_request={'occupations': None, 'full_kweights': None,
-                                        'spin_degeneracy': 1.},
+                hartree_source_request=(None if operator_only else {
+                    'occupations': None, 'full_kweights': None,
+                    'spin_degeneracy': 1.}),
                 print_fn=print0, artifact=augmentation_artifact)
         from .isdf_augmentation import require_public_compact_wfn_source
         require_public_compact_wfn_source(augmentation_artifact, wfn)
-        from .augmentation_hartree import prepare_resident_hartree
-        with timing.section('gw_jax.augmented_hartree_receiving'):
-            chunks['resident_hartree'], _hartree_diagnostics = prepare_resident_hartree(
-                wfn=wfn, sym=sym, mesh=mesh_xy, plan=_candidate_plan,
-                state=chunks['augmentation'], artifact=augmentation_artifact,
-                wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
-                band_range=(int(band_slices.b0), int(band_slices.b3)))
-        chunks['augmentation'].pop('hartree_source')
+        if not operator_only:
+            from .augmentation_hartree import prepare_resident_hartree
+            with timing.section('gw_jax.augmented_hartree_receiving'):
+                chunks['resident_hartree'], _hartree_diagnostics = prepare_resident_hartree(
+                    wfn=wfn, sym=sym, mesh=mesh_xy, plan=_candidate_plan,
+                    state=chunks['augmentation'], artifact=augmentation_artifact,
+                    wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+                    band_range=(int(band_slices.b0), int(band_slices.b3)))
+            chunks['augmentation'].pop('hartree_source')
         if 'parent_psi' in chunks['augmentation']:
             chunks['parent_psi'] = chunks['augmentation'].pop('parent_psi')
     print0("  ψ storage: parents only -- "
@@ -3209,7 +3211,7 @@ def _write_fresh_restart(
         tensors_filename, transverse_wfn_data, wfn, wfns_transverse,
         write_restart_state_to_h5, *, charge_zeta_provenance,
         atomic_augmentation_identity=None, resident_hartree=None,
-        charge_representation=None):
+        charge_representation=None, operator_only=False):
     """Write the existing authenticated Coulomb and parent-face restart bundle."""
     enk_full, _ = get_enk_bandrange(
         wfn, sym, band_slices.full_range,
@@ -3288,6 +3290,8 @@ def _write_fresh_restart(
                                         charge_representation if charge_representation is not None
                                         else resolve_four_current_representation(
                                                 cfg.bispinor, cfg.bispinor_gw).charge_representation)
+                                if operator_only:
+                                        _f.attrs['isdf_preparation_scope'] = 'coulomb_operators_only'
                                 if transverse_wfn_data is not None:
                                         _f.attrs['centroids_transverse_md5'] = (
                                                 _centroid_table_md5(
@@ -3308,7 +3312,7 @@ def _prepare_fresh_isdf(
         bgw_v_grid_fn, centroid_indices, cfg, load_centroids_band_chunked, mesh_xy, meta,
         print0, representation, resolve_restart_q_storage_for_run,
         restart_tensor_writes_enabled, sym, take_pre_unfold, tensors_filename, tmp_dir, wfn,
-        write_restart_state_to_h5):
+        write_restart_state_to_h5, *, operator_only=False):
     """Produce the fitted Coulomb and wavefunction state with restart provenance."""
     from common.parallel_transport import bind_wfn_fingerprint
     basis_wfn_fingerprint_binding = bind_wfn_fingerprint(wfn)
@@ -3316,7 +3320,8 @@ def _prepare_fresh_isdf(
     with mesh_xy:
         (zeta_contract, charge_zeta_identity_receipt, _candidate_plan, _parent_green_plan, chunks, _parent_zeta_plan, _parent_green_faces) = _prepare_fresh_parent_faces(
             band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg,
-            load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir, wfn)
+            load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir, wfn,
+            operator_only=operator_only)
         representation = zeta_contract.representation
         charge_basis_receipt = WavefunctionBasisReceipt.from_bound_source(
             wfn=wfn, wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
@@ -3349,7 +3354,8 @@ def _prepare_fresh_isdf(
             atomic_augmentation_identity=json.loads(
                 zeta_contract.provenance).get('atomic_augmentation'),
             resident_hartree=resident_hartree,
-            charge_representation=representation.charge_representation)
+            charge_representation=representation.charge_representation,
+            operator_only=operator_only)
         if ((hasattr(zeta_path, 'contract_v') or cfg.bispinor)
                 and jax.process_index() == 0):
             # Route G's stage split through V_q (read, faces, C, fit, V_q),
@@ -3822,11 +3828,44 @@ def _prepare_restart_isdf(
         _to_run_order, basis_T, cfg, mesh_xy, meta, photon_g0_vectors, tmp_dir)
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt, resident_hartree)
 
+def _validate_operator_only_preparation(cfg, operator_only):
+    """Admit the explicitly requested scalar Coulomb preparation scope.
+
+    This scope supplies samples and V for existing screening and Sigma owners.
+    It does not supply a Hartree operator or a QP Hamiltonian. Fresh preparation
+    preserves the full-WFN reconstruction and the strict fit-window checks.
+    """
+    if not isinstance(operator_only, bool):
+        raise TypeError('operator_only must be an explicit boolean')
+    if not operator_only:
+        return
+    from .gw_config import HeadCorrection, QPSolver
+    if (cfg.restart or cfg.qp_solver is not QPSolver.ONE_SHOT_DFT
+            or bool(getattr(cfg, 'density_self_consistent', False))
+            or uses_transverse_interaction(cfg)
+            or cfg.head.correction is not HeadCorrection.OFF
+            or getattr(cfg, 'occ_smearing_width_ry', None) not in (None, 0.)
+            or float(getattr(cfg.screening, 'occ_broadening_ev', 0.)) != 0.):
+        raise ValueError(
+            'GATE operator_only_preparation: requires fresh scalar headOff '
+            'one-shot fixed-source unsmeared charge fitting; it supplies no '
+            'Hartree or Hamiltonian and cannot promote a restart')
+
+
 def prepare_isdf_and_wavefunctions(
 	*, cfg, wfn, sym, meta, centroid_indices, band_slices,
 	mesh_xy, tmp_dir, tensors_filename, print0, bgw_v_grid_fn=None,
+	operator_only=False,
 ):
-	"""Produce authenticated ISDF state; see docs/architecture/zeta_fit_face_psi_cct.md."""
+	"""Produce authenticated ISDF state; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+	``operator_only=True`` produces the same charge samples and Coulomb tensor
+	without capturing or evaluating Hartree. The caller must use the existing
+	Sigma consumer's ``omit_v_h=True`` and must not construct a QP Hamiltonian
+	from this preparation. This fresh scope is marked on its restart bundle;
+	an augmented full-GW restart still requires its authenticated Hartree data.
+	"""
+	_validate_operator_only_preparation(cfg, operator_only)
 	from file_io import write_restart_state_to_h5
 	from common.wfn_transforms import load_centroids_band_chunked
 	from .gw_output import restart_tensor_writes_enabled
@@ -3871,7 +3910,7 @@ def prepare_isdf_and_wavefunctions(
 	        bgw_v_grid_fn, centroid_indices, cfg, load_centroids_band_chunked, mesh_xy, meta,
 	        print0, representation, resolve_restart_q_storage_for_run,
 	        restart_tensor_writes_enabled, sym, take_pre_unfold, tensors_filename, tmp_dir, wfn,
-	        write_restart_state_to_h5)
+	        write_restart_state_to_h5, operator_only=operator_only)
 	else:
 	    (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt, resident_hartree) = _prepare_restart_isdf(
 	        WavefunctionBasisReceipt, _basis_band_interval, _to_run_order, band_slices, basis_T,
@@ -3902,6 +3941,7 @@ def prepare_isdf_and_wavefunctions(
 		AuthenticatedWavefunctions(
 			wfns_transverse, transverse_basis_receipt))
 	return SimpleNamespace(
+		preparation_scope=('coulomb_operators_only' if operator_only else 'full_gw'),
 		V_qmunu=V_qmunu,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
