@@ -844,7 +844,7 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
 _COMPILED = {}
 
 
-def _compiled(kernel, args):
+def _compiled(kernel, args, *, ahead=False):
     """``kernel.lower(*args).compile()`` once per kernel and argument signature, per process.
 
     AOT lowering bypasses jit's executable cache, so an admission repeated at
@@ -852,14 +852,19 @@ def _compiled(kernel, args):
     kernels are module-cached builders, so their identity is stable; the
     caller still admits the executable's memory on every call.  An abstract
     leaf keys by its shape, dtype and sharding, as the array it stands for.
+    The compile runs on a helper thread (``jax_compile_cache.compile_ahead``):
+    ``ahead=True`` returns at once, from abstract ``args`` at the point the
+    shapes become known, and the later call with the live arrays finds the
+    executable or waits for it.
     """
+    from common.jax_compile_cache import compile_ahead
     key = (kernel, jax.tree.structure(args), tuple(
         (tuple(x.shape), str(x.dtype), getattr(x, "sharding", None))
         if hasattr(x, "shape") else x for x in jax.tree.leaves(args)))
-    executable = _COMPILED.get(key)
-    if executable is None:
-        executable = _COMPILED[key] = kernel.lower(*args).compile()
-    return executable
+    future = _COMPILED.get(key)
+    if future is None:
+        future = _COMPILED[key] = compile_ahead(kernel, *args)
+    return future if ahead else future.result()
 
 
 def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
@@ -1013,6 +1018,13 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     from file_io.slab_io import SlabIO
     shape = (q_span[1]-q_span[0], basis.n_canonical, basis.n_canonical)
     spec = P(None, "x", "y")
+    # H = V^(1/2) is the bank's largest compile (P4 hsuite: 6.6 s on Na, 4.4 s on
+    # H2-); its operand is the packed V of this span, known here, so it compiles
+    # beside the read and the pack below instead of after them.
+    kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
+    _compiled(kernel, (jax.ShapeDtypeStruct((shape[0], basis.n_packed, basis.n_packed),
+                                            jnp.complex128, sharding=NamedSharding(mesh_xy, spec)),),
+              ahead=True)
     if resource.get("path") is None:
         values = _COULOMB_OPERATORS[resource["operator"]]
         program = _coulomb_canonical_pack(basis, mesh_xy, int(q_span[0]), int(q_span[1]))
@@ -1032,7 +1044,6 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
                 offset=(q_span[0], 0, 0), partition_spec=spec)
             v = compiled(canonical)
         del canonical
-    kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
     h, hi, negative, ranks = execute(kernel, (v,), "coulomb_sqrt")
     if bool(negative):
         raise ValueError("GATE response_coulomb_psd: resolved negative eigenvalue")
