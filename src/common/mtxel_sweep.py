@@ -1574,7 +1574,8 @@ def sweep_matrix_elements(
         See above.  ``operator`` may also be a TUPLE of operators: one
         sweep then returns one block per operator, sharing the ψ read, the
         ψ all-to-all and the G slabs (e.g. ⟨m|T+V_loc+V_NL|n⟩ and ⟨m|v|n⟩
-        from one pass), each block computed exactly as its own sweep would.
+        from one pass), each block equal to its own sweep's to rounding (the
+        shared program may order a block's sums differently, by an ulp).
     gvecs : (nk, ngkmax, 3) i32
         The loader's own fixed-shape table (D10) — ``PaddedGVectors.gvecs``.
     gmask : (nk, ngkmax) f64
