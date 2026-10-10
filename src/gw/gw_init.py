@@ -232,7 +232,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          carrier_bispinor=None, carrier_lift=None,
                          transverse_identity=None,
                          atomic_augmentation_identity=None,
-                         charge_fit_weights=None, fft_sphere_convention=None):
+                         charge_fit_weights=None, fft_sphere_convention=None,
+                         charge_fit_conditioning=None):
 	"""Canonical JSON description of everything the ζ fit consumed.
 
 	Every entry is an input that CHANGES ζ numerically.  Deliberately
@@ -451,6 +452,12 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 			and tuple(band_range_left) != tuple(band_range_right)):
 		prov['current_pair_training_domain'] = 'ordered_lr_plus_rl'
 	if int(vertex_mu_L) == 0:
+		conditioning = (getattr(cfg.backend, 'charge_fit_conditioning', None)
+		                if charge_fit_conditioning is None else charge_fit_conditioning)
+		if conditioning not in (None, 'unit_diagonal'):
+			raise ValueError('unknown resolved charge fitting metric')
+		if conditioning is not None:
+			prov['charge_fit_conditioning'] = conditioning
 		occupied_weight = float(getattr(cfg.backend, 'zeta_occupied_weight', 1.0))
 		if occupied_weight != 1.0:
 			if (charge_fit_weights is None
@@ -1460,6 +1467,7 @@ class _ZetaFitContract:
 	reuse_charge: bool
 	representation: object = None
 	charge_fit_weights: object = None
+	charge_fit_conditioning: str | None = None
 	meta_transverse: object = None
 	centroids_transverse: object = None
 	transverse_identity: object = None
@@ -1545,9 +1553,27 @@ def _zeta_sphere_convention(wfn, sym, meta, centroid_indices, cutoff, *,
 		float(cutoff), sys_dim=int(meta.sys_dim))['sphere_convention']
 
 
+def _resolve_charge_fit_conditioning(cfg, augmentation_artifact=None):
+    """Resolve one declared scalar fitting metric before any source is read."""
+    requested = getattr(cfg.backend, 'charge_fit_conditioning', None)
+    declared = ((augmentation_artifact or {}).get('charge_fit') or {}).get('conditioning')
+    if requested not in (None, 'unit_diagonal') or declared not in (None, 'unit_diagonal'):
+        raise ValueError('charge_fit_conditioning must be None or unit_diagonal')
+    if requested is not None and declared is not None and requested != declared:
+        raise ValueError('GATE charge_fit_conditioning: input and reconstruction manifest disagree')
+    resolved = requested if requested is not None else declared
+    if resolved is not None and uses_transverse_interaction(cfg):
+        raise ValueError('GATE charge_fit_conditioning: only scalar charge fitting is admitted')
+    return resolved
+
+
+_UNRESOLVED_CHARGE_FIT_CONDITIONING = object()
+
+
 def _resolve_zeta_fit_contract(
 		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
-		*, print_fn=print, atomic_augmentation_identity=None, representation=None):
+		*, print_fn=print, atomic_augmentation_identity=None, representation=None,
+		charge_fit_conditioning=_UNRESOLVED_CHARGE_FIT_CONDITIONING):
 	"""Resolve all zeta identities and reuse verdicts before fit planning.
 
 	Only host metadata and the canonical :func:`_zeta_reuse_ok` owner are used.
@@ -1567,6 +1593,8 @@ def _resolve_zeta_fit_contract(
 	# physical occupations, the orbital frame, or atomic cache identities.
 	charge_fit_weights = _charge_fit_endpoint_weights(
 		cfg, wfn, band_slices, print_fn=print_fn)
+	if charge_fit_conditioning is _UNRESOLVED_CHARGE_FIT_CONDITIONING:
+		charge_fit_conditioning = _resolve_charge_fit_conditioning(cfg)
 	_check_centroid_selection_windows(
 		cfg, band_slices, band_range_left, band_range_right)
 	logical_band_stop = (
@@ -1694,6 +1722,7 @@ def _resolve_zeta_fit_contract(
 		vertex_mu_L=0, transverse_identity=transverse_identity,
 		atomic_augmentation_identity=atomic_augmentation_identity,
 		charge_fit_weights=charge_fit_weights,
+		charge_fit_conditioning=charge_fit_conditioning,
 		fft_sphere_convention=sphere_charge)
 	provenance_transverse = tuple(
 		_zeta_fit_provenance(
@@ -1722,6 +1751,9 @@ def _resolve_zeta_fit_contract(
 		# fresh runs build both pieces together until local-fit persistence exists.
 		reuse_charge = False
 		print_fn("  Atomic augmentation: fitting smooth and local ζ together.")
+	elif meta.mu_basis.coordinate_kind == 'fractional':
+		reuse_charge = False
+		print_fn('  Exact fractional charge samples require a fresh protected fit.')
 	reuse_transverse = tuple(
 		bool(_zeta_reuse_ok(
 			path_T, provenance_T, centroids_transverse,
@@ -1775,6 +1807,7 @@ def _resolve_zeta_fit_contract(
 		reuse_charge=bool(reuse_charge),
 		representation=representation,
 		charge_fit_weights=charge_fit_weights,
+		charge_fit_conditioning=charge_fit_conditioning,
 		meta_transverse=meta_transverse,
 		centroids_transverse=centroids_transverse,
 		transverse_identity=transverse_identity,
@@ -2024,7 +2057,7 @@ def _fit_charge_zeta_channel(
         _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
         band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
         mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
-        zeta_h5_path, charge_fit_weights=None):
+        zeta_h5_path, charge_fit_weights=None, charge_fit_conditioning=None):
     """Produce the charge fit peak and truncation verdict after its reuse stamp."""
     from gw.isdf_fitting import fit_zeta_to_h5
     if not _reuse_charge and chunks is None:
@@ -2067,8 +2100,8 @@ def _fit_charge_zeta_channel(
                 psi_mun_parent=psi_mun_parent,
                 mubatch_plan=chunks.get('mubatch'),
                 parent_psi=chunks.pop('parent_psi', None),
-                use_augmented_samples=('augmentation' in chunks),
-                charge_factor_equilibration=chunks.get('augmentation', {}).get('charge_factor_equilibration'),
+                use_augmented_samples=('augmentation' in chunks or chunks.get('protected_charge_samples', False)),
+                charge_factor_equilibration=charge_fit_conditioning,
                 charge_fit_weights=charge_fit_weights,
                 write_zeta_file=_write_zeta_file,
                 defer_zeta_write=_defer_zeta_write,
@@ -2455,7 +2488,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	    _band_norms, _provenance, _reuse_charge, _write_ibz_only_charge, _zeta_cutoff,
 	    band_range_left, band_range_right, centroid_indices, cfg, chunks, k_unfold_plan,
 	    mesh_xy, meta, print_fn, psi_mun_parent, psi_nmu_parent, representation, sym, wfn,
-	    zeta_h5_path, charge_fit_weights=zeta_contract.charge_fit_weights)
+	    zeta_h5_path, charge_fit_weights=zeta_contract.charge_fit_weights,
+	    charge_fit_conditioning=zeta_contract.charge_fit_conditioning)
 	_report_zeta_fit_peak(
 	    cfg, mem_est, peak_bytes, print_fn)
 	fit_v = None
@@ -2944,7 +2978,8 @@ def _prepare_fresh_parent_faces(
         tmp_dir, print_fn=print0,
         atomic_augmentation_identity=(None if augmentation_artifact is None
                                       else augmentation_artifact['identity']),
-        representation=representation)
+        representation=representation,
+        charge_fit_conditioning=_resolve_charge_fit_conditioning(cfg, augmentation_artifact))
     charge_zeta_identity_receipt = charge_zeta_identity(
         zeta_contract.provenance, wfn=wfn,
         wfn_fingerprint_binding=basis_wfn_fingerprint_binding)
@@ -2969,8 +3004,14 @@ def _prepare_fresh_parent_faces(
                        else zeta_contract.loader_band_chunk)
     _mb_plan = None if chunks is None else chunks.get('mubatch')
     _fractional_mu = meta.mu_basis.coordinate_kind == 'fractional'
-    if _fractional_mu and (_mb_plan is None or not getattr(cfg.paths, 'atomic_reconstruction_dir', None)):
-        raise ValueError("fractional centroids require the resident atomic augmentation fitting stage")
+    _atomic_sampling = bool(getattr(cfg.paths, 'atomic_reconstruction_dir', None))
+    if _fractional_mu and _mb_plan is None:
+        raise ValueError('fractional charge samples require the resident route-G fitting plan')
+    if _fractional_mu and not _atomic_sampling:
+        _validate_smooth_fractional_charge(cfg)
+    if chunks is not None:
+        chunks['protected_charge_samples'] = (_fractional_mu
+            or zeta_contract.charge_fit_conditioning is not None)
     _load_meta, _load_range = meta, band_slices.full_range
     if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
         _overlap = augmentation_artifact.get('overlap', {})
@@ -2998,11 +3039,13 @@ def _prepare_fresh_parent_faces(
                         wfn=wfn, mesh_xy=mesh_xy, meta=_load_meta,
                         band_range=_load_range,
                         band_chunk=int(_mb_plan.band_chunk),
-                        centroid_indices=(None if _fractional_mu else centroid_indices), placement="device",
+                        centroid_indices=(None if _fractional_mu and _atomic_sampling
+                                          else centroid_indices), placement="device",
                         bispinor=bool(int(meta.nspinor) == 4),
                         bispinor_lift=(representation.charge_lift or "raw"),
                         k_domain=sym.parent_k_domain, print_fn=print0)
-                parent_y, parent_x = ((None, None) if _fractional_mu else _parent_psi.faces)
+                parent_y, parent_x = ((None, None) if _fractional_mu and _atomic_sampling
+                                     else _parent_psi.faces)
                 chunks['parent_psi'] = _parent_psi._replace(faces=None)
                 # The read phase is over: free the union reader's host staging
                 # (ctx->pinned_buf, ~ψ(G)/P per rank; the context's own retirement
@@ -3021,7 +3064,7 @@ def _prepare_fresh_parent_faces(
                         bispinor_lift=(representation.charge_lift or "raw"),
                         k_domain=sym.parent_k_domain)
     from .wavefunction_bundle import parent_faces
-    _parent_green_faces = (None if _fractional_mu else
+    _parent_green_faces = (None if _fractional_mu and _atomic_sampling else
                           parent_faces(parent_y, parent_x, mesh_xy=mesh_xy, layout="face"))
     del parent_y, parent_x
     if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
@@ -3063,6 +3106,7 @@ def _prepare_fresh_parent_faces(
                     'occupations': None, 'full_kweights': None,
                     'spin_degeneracy': 1.}),
                 print_fn=print0, artifact=augmentation_artifact)
+        chunks['augmentation']['charge_factor_equilibration'] = zeta_contract.charge_fit_conditioning
         from .isdf_augmentation import require_public_compact_wfn_source
         require_public_compact_wfn_source(augmentation_artifact, wfn)
         if not operator_only:
@@ -3370,7 +3414,7 @@ def _prepare_fresh_isdf(
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt, resident_hartree)
 
 def _require_restart_charge_fit_weights(tensors_filename, expected_policy, *,
-        wfn, wfn_fingerprint_binding, tmp_dir):
+        wfn, wfn_fingerprint_binding, tmp_dir, expected_conditioning=None):
     """Authenticate the stored charge loss before loading large restart arrays.
 
     The stored provenance owns the original training window. Only the loss
@@ -3384,7 +3428,7 @@ def _require_restart_charge_fit_weights(tensors_filename, expected_policy, *,
     identity = stored['charge_zeta_identity']
     provenance = stored['charge_zeta_provenance']
     if identity is None:
-        if expected_policy is None:
+        if expected_policy is None and expected_conditioning is None:
             return
         raise ValueError(
             "GATE restart_charge_fit_weights: legacy restart has no "
@@ -3419,6 +3463,8 @@ def _require_restart_charge_fit_weights(tensors_filename, expected_policy, *,
             "GATE restart_charge_fit_weights: charge_fit_endpoint_weights "
             f"changed from {observed!r} to {requested!r}; rebuild with "
             "restart=false.")
+    if json.loads(provenance).get('charge_fit_conditioning') != expected_conditioning:
+        raise ValueError('GATE restart_charge_fit_conditioning: declared scalar fitting metric changed; rebuild with restart=false')
 
 
 def _read_authenticated_restart(
@@ -3435,7 +3481,8 @@ def _read_authenticated_restart(
     expected_policy = _charge_fit_endpoint_weights(
         cfg, charge_fit_context['wfn'], band_slices, print_fn=print0)
     _require_restart_charge_fit_weights(
-        tensors_filename, expected_policy, **charge_fit_context)
+        tensors_filename, expected_policy, **charge_fit_context,
+        expected_conditioning=_resolve_charge_fit_conditioning(cfg, augmentation_artifact))
     rs = load_restart_state_from_h5(
     	tensors_filename, mesh_xy, band_slices=band_slices,
     	n_rmu_logical=int(meta.n_rmu))
@@ -4016,6 +4063,18 @@ def coarse_class_for_deck(config, wfn, print0):
     return coarse
 
 
+def _validate_smooth_fractional_charge(cfg):
+    """Keep the new exact smooth sampling route inside its proved charge scope."""
+    from .gw_config import HeadCorrection, QPSolver
+    if (cfg.restart or cfg.qp_solver is not QPSolver.ONE_SHOT_DFT
+            or bool(getattr(cfg, 'density_self_consistent', False))
+            or uses_transverse_interaction(cfg)
+            or cfg.head.correction is not HeadCorrection.OFF
+            or getattr(cfg, 'occ_smearing_width_ry', None) not in (None, 0.)
+            or float(getattr(cfg.screening, 'occ_broadening_ev', 0.)) != 0.):
+        raise ValueError('GATE smooth_fractional_charge: requires fresh scalar headOff one-shot fixed-source unsmeared sampling')
+
+
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn,
                           *, coordinate_kind="fft_indices"):
     """Produce the physical and padded band windows on the packed centroid basis."""
@@ -4026,7 +4085,7 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
         config.bispinor, config.bispinor_gw)
     from common.centroid_basis import PackedCentroidBasis
     if coordinate_kind == "fractional" and not getattr(config.paths, 'atomic_reconstruction_dir', None):
-        raise ValueError("fractional centroid sampling requires the atomic reconstruction fitting stage")
+        _validate_smooth_fractional_charge(config)
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy, coordinate_kind=coordinate_kind)
     print0(f"  {mu_basis.describe()}")

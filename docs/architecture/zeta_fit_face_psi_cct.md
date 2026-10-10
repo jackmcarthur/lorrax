@@ -33,6 +33,20 @@ axis, centroids on the other) and distributes the band contraction.
 Canonical ζ files do not encode the layout. The left and right band windows
 are masks over the loaded, mesh-padded band extent, so a window edge need
 not divide the mesh. By default their weights are 0/1. An opt-in charge
+Smooth fractional samples use the same one-read parent loader and bounded
+G-slot DFT as the FFT-index route. Their phase uses signed physical Miller
+vectors and the full Bloch factor at the exact fractional coordinate;
+FFT-box aliases and snapping are not valid off the grid. The typed basis
+retains its packed order and inactive masks. The initial public scope is
+fresh scalar, headOff, fixed-source one-shot sampling; current, SC and smooth
+fractional restart admission retain explicit guards. No atomic manifest is
+needed for a smooth field.
+
+`charge_fit_conditioning = unit_diagonal` declares the scalar Gram metric
+once before fitting. The existing factor is mapped back through its row
+scales and serves both plane-wave and local RHSs. Its canonical provenance
+separates this metric from the default; changing it requires a matching fit.
+
 `zeta_occupied_weight` multiplies each occupied endpoint inside its window;
 every original empty endpoint keeps weight1. C_q and every Z_q right-hand
 side, including local augmentation and monopole features, use these same

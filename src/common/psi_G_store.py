@@ -954,7 +954,8 @@ def _pad_sphere_index(sphere_index: np.ndarray, width: int, n_rtot: int) -> np.n
 
 @lru_cache(maxsize=None)
 def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
-                       ngk_c: int, mu_pad: int, mu_t: int, with_faces: bool):
+                       ngk_c: int, mu_pad: int, mu_t: int, with_faces: bool,
+                       coordinate_kind: str = 'fft_indices'):
     """Band-sharded ψ chunk → G-slot chunk (+ centroid DFT into the faces).
 
     Per rank: ONE all-to-all moves the chunk from ``bands_XY`` to
@@ -970,6 +971,8 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
     ``(G_a r_a mod n_a)/n_a``, the twiddles the FFT itself uses.
     """
     nx, ny, nz = fft_grid
+    if coordinate_kind not in ('fft_indices', 'fractional'):
+        raise ValueError('unknown typed centroid coordinates')
     n_rtot = nx * ny * nz
     XY = ('x', 'y')
     P_ = int(mesh.size)
@@ -988,9 +991,16 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
             return g, acc_y, acc_x
         p = jax.lax.axis_index('x') * py + jax.lax.axis_index('y')
         idx = jax.lax.dynamic_slice_in_dim(sidx, p * ngk_l, ngk_l, axis=1)
-        valid = idx < n_rtot
-        c = jnp.where(valid, idx, 0)
-        G = jnp.stack([c // (ny * nz), (c // nz) % ny, c % nz], axis=-1)  # (nk, ngk_l, 3)
+        if coordinate_kind == 'fractional':
+            # The typed fractional chart carries SIGNED physical Miller
+            # vectors and a validity column. FFT-box aliases would agree
+            # on grid points but give a different field off the grid.
+            valid = idx[...,3].astype(bool)
+            G = idx[...,:3]
+        else:
+            valid = idx < n_rtot
+            c = jnp.where(valid, idx, 0)
+            G = jnp.stack([c // (ny * nz), (c // nz) % ny, c % nz], axis=-1)  # (nk, ngk_l, 3)
         grid = jnp.asarray((nx, ny, nz), dtype=jnp.int32)
         r_t = r_mu.reshape(n_t, mu_t, 3)
         w_t = w_mu.reshape(n_t, mu_t)
@@ -1005,13 +1015,19 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
             # chunks or built separably from 1-D tables: one direct formula.
             def one_tile(args):
                 r, w = args                                   # (mu_t, 3), (mu_t,)
-                frac = jnp.sum(
-                    (jnp.mod(Gk[:, None, :] * r[None, :, :], grid)
-                     ).astype(jnp.float64) / grid.astype(jnp.float64), axis=-1)
-                E = jnp.where(vk[:, None], jnp.exp(2j * jnp.pi * frac), 0)
-                bloch = jnp.exp(2j * jnp.pi * jnp.sum(
-                    kv[None, :] * r.astype(jnp.float64)
-                    / grid.astype(jnp.float64), axis=-1)) * w * inv_sqrt_n
+                if coordinate_kind == 'fractional':
+                    frac = jnp.einsum('gi,mi->gm', Gk.astype(jnp.float64), r)
+                    E = jnp.where(vk[:, None], jnp.exp(2j * jnp.pi * frac), 0)
+                    bloch = jnp.exp(2j * jnp.pi * jnp.sum(
+                        kv[None, :] * r, axis=-1)) * w * inv_sqrt_n
+                else:
+                    frac = jnp.sum(
+                        (jnp.mod(Gk[:, None, :] * r[None, :, :], grid)
+                         ).astype(jnp.float64) / grid.astype(jnp.float64), axis=-1)
+                    E = jnp.where(vk[:, None], jnp.exp(2j * jnp.pi * frac), 0)
+                    bloch = jnp.exp(2j * jnp.pi * jnp.sum(
+                        kv[None, :] * r.astype(jnp.float64)
+                        / grid.astype(jnp.float64), axis=-1)) * w * inv_sqrt_n
                 return (a @ E) * bloch[None, :]                # (bc_w·ns, mu_t)
 
             X = jax.lax.map(one_tile, (r_t, w_t))              # (n_t, bc_w·ns, mu_t)
@@ -1134,12 +1150,39 @@ def load_parent_psi_G(
     kvecs_dev = device_put_process_local(kvecs, NamedSharding(mesh_xy, P(None, None)))
 
     with_faces = centroid_indices is not None
+    coordinate_kind = (getattr(getattr(meta, 'mu_basis', None), 'coordinate_kind',
+                              'fft_indices') if with_faces else 'fft_indices')
+    if coordinate_kind not in ('fft_indices', 'fractional'):
+        raise ValueError('unknown typed centroid coordinates')
+    phase_geometry = sidx
     finish = None
     if with_faces:
-        (_, _, _, _, _, _, _, mu_basis, mu_active_mask, n_rmu, cidx_np, _) = (
-            _centroid_sampling_geometry(
-                (b0, b0 + nb_c), centroid_indices, k_spec, meta, None, False,
-                None, loader))
+        if coordinate_kind == 'fractional':
+            mu_basis = meta.mu_basis
+            if not np.array_equal(np.asarray(centroid_indices, np.float64),
+                                  mu_basis.canonical_indices):
+                raise ValueError('fractional sample table differs from its typed basis')
+            cidx_np = np.asarray(mu_basis.packed_indices, np.float64)
+            mu_active_mask = np.asarray(mu_basis.active_mask, bool)
+            n_rmu = len(cidx_np)
+            if (not np.isfinite(cidx_np).all()
+                    or np.any(cidx_np[mu_active_mask] < 0)
+                    or np.any(cidx_np[mu_active_mask] >= 1)):
+                raise ValueError('fractional sample coordinates require a finite unit-cell chart')
+            raw_G = np.asarray(loader.gvecs(k=k_spec))
+            if (raw_G.shape != (nk, int(loader.ngkmax), 3)
+                    or not np.isfinite(raw_G).all()
+                    or not np.array_equal(raw_G, np.rint(raw_G))):
+                raise ValueError('fractional sampling requires canonical signed physical Miller vectors')
+            geometry = np.zeros((nk, ngk_c, 4), np.int32)
+            geometry[:, :raw_G.shape[1], :3] = raw_G
+            geometry[..., 3] = sidx_np < n_rtot
+            phase_geometry = device_put_process_local(geometry, rep)
+        else:
+            (_, _, _, _, _, _, _, mu_basis, mu_active_mask, n_rmu, cidx_np, _) = (
+                _centroid_sampling_geometry(
+                    (b0, b0 + nb_c), centroid_indices, k_spec, meta, None, False,
+                    None, loader))
         (_, _, _, _, _, _, stage_Y, stage_X, mu_pad, _) = (
             _centroid_sampling_shardings(mesh_xy, meta, mu_basis, n_rmu, loader))
         if int(mu_pad) % P_:
@@ -1154,7 +1197,8 @@ def load_parent_psi_G(
         mu_t = max(1, min(int(mu_pad), int(mu_tile_bytes) // (16 * max(ngk_l, 1))))
         while mu_pad % mu_t:
             mu_t -= 1
-        r_mu = np.zeros((int(mu_pad), 3), dtype=np.int32)
+        r_mu = np.zeros((int(mu_pad), 3), dtype=(np.float64
+            if coordinate_kind == 'fractional' else np.int32))
         r_mu[:n_rmu] = cidx_np
         w_mu = np.zeros((int(mu_pad),), dtype=np.float64)
         w_mu[:n_rmu] = 1.0 if mu_active_mask is None else mu_active_mask
@@ -1210,10 +1254,14 @@ def load_parent_psi_G(
                     out_shardings=NamedSharding(mesh_xy, band_sphere_spec()))(chunk)
             jax.block_until_ready(chunk)
         t1 = _time.perf_counter()
-        kern = _gslot_face_kernel(mesh_xy, fft_grid, nk, wc, ns, ngk_c,
-                                  int(mu_pad), int(mu_t), with_faces)
+        kern = (_gslot_face_kernel(mesh_xy, fft_grid, nk, wc, ns, ngk_c,
+                                  int(mu_pad), int(mu_t), with_faces,
+                                  coordinate_kind='fractional')
+                if coordinate_kind == 'fractional' else
+                _gslot_face_kernel(mesh_xy, fft_grid, nk, wc, ns, ngk_c,
+                                  int(mu_pad), int(mu_t), with_faces))
         with timing.section("psi_G_store.gslot.a2a_faces"):
-            g_chunk, acc_y, acc_x = kern(chunk, sidx, kvecs_dev, r_mu_dev,
+            g_chunk, acc_y, acc_x = kern(chunk, phase_geometry, kvecs_dev, r_mu_dev,
                                          w_mu_dev, acc_y, acc_x,
                                          jnp.int32(lo - b0))
             del chunk

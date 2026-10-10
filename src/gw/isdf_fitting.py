@@ -832,6 +832,11 @@ def fit_zeta_to_h5(
     (docs/architecture/zeta_fit_mubatch.md).  Each channel owns its C_q, its
     factor and its file.  Returns ``(peak_bytes, {μ_L: ZetaG})``.
 
+    ``use_augmented_samples`` is the protected externally supplied sample
+    hook. Besides atomic corrections it accepts exact smooth fractional
+    samples produced by the typed one-read loader. The hook changes neither
+    the spinor carrier nor the atomic identity; no atomic artifact is implied.
+
     An augmented charge fit may defer its payload until its local provider
     exists. Its header stays incomplete and the returned ZetaG carries
     ``pending_zeta_write``; the V owner writes physical s+delta in the same
@@ -899,11 +904,11 @@ def fit_zeta_to_h5(
     if coordinate_kind not in ('fft_indices','fractional'):
         raise ValueError("unknown centroid coordinate kind in typed fitting plan")
     if coordinate_kind == 'fractional' and (not use_augmented_samples or transverse and current_augmentation is None):
-        raise ValueError("fractional fitting currently requires augmented charge samples")
+        raise ValueError("fractional fitting requires protected externally supplied charge samples")
     if charge_factor_equilibration not in (None,'unit_diagonal'):
         raise ValueError("unknown charge factor equilibration convention")
     if charge_factor_equilibration is not None and (not use_augmented_samples or transverse):
-        raise ValueError("explicit unit-diagonal charge fitting requires augmented charge samples")
+        raise ValueError("explicit unit-diagonal charge fitting requires protected externally supplied charge samples")
     mem_probe("zeta_fit_start")
 
     # Two μ extents (common/meta.py): ``n_rmu`` is the LOGICAL centroid count

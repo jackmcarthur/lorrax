@@ -1434,6 +1434,7 @@ _DEFAULTS = {
     # ZETA_RCOND_DEFAULT (defined above _DEFAULTS) — one copy, no mirrors.
     # reports/gw_rank_truncation_2026-07-20 + gw_bandrange_centroids_2026-07-21.
     "zeta_rcond":           ZETA_RCOND_DEFAULT,
+    "charge_fit_conditioning": None,
     # Positive endpoint weights in the charge-fit least-squares objective.
     # Every in-window empty state keeps weight one; each occupied endpoint
     # receives this weight. This does not change occupations in GW. The
@@ -1865,6 +1866,7 @@ _LEGACY_DECK_KEYS = frozenset({
 
 # Keys whose string values should be lowercased and stripped
 _NORMALIZE_STR = {
+    "charge_fit_conditioning",
     "compute_mode",
     "bispinor_gw",
     "qp_solver",
@@ -2197,6 +2199,8 @@ def _print_deck_report(msg: str) -> None:
 
 def _input_key_type(key, default):
     """Produce the existing INI conversion type for one declared key."""
+    if key == 'charge_fit_conditioning':
+        return str
     if key in _NULLABLE_BOOL:
         return bool
     if key in _NULLABLE_INT:
@@ -2667,6 +2671,14 @@ def _input_backend(
         raise ValueError("zeta_occupied_weight must be a finite number >= 1") from exc
     if not (np.isfinite(_occupied_weight) and _occupied_weight >= 1.0):
         raise ValueError("zeta_occupied_weight must be finite and >= 1")
+    _conditioning_raw = params['charge_fit_conditioning']
+    if _conditioning_raw is None:
+        _conditioning = None
+    elif isinstance(_conditioning_raw, str) and _conditioning_raw.strip().lower() in ('none', 'unit_diagonal'):
+        _conditioning = (None if _conditioning_raw.strip().lower() == 'none'
+                         else 'unit_diagonal')
+    else:
+        raise ValueError('charge_fit_conditioning must be None or unit_diagonal')
     backend = BackendConfig(
         linalg=_linalg.layout,
         linalg_provenance=_linalg.provenance,
@@ -2678,6 +2690,7 @@ def _input_backend(
         zeta_rcond=float(params["zeta_rcond"]),
         zeta_occupied_weight=_occupied_weight,
         gamma_contract_mode=str(params["gamma_contract_mode"]).strip().lower(),
+        charge_fit_conditioning=_conditioning,
     )
     return (backend)
 
@@ -4565,6 +4578,7 @@ class BackendConfig:
     zeta_rcond: float          # rank-truncation cutoff (·λ_max)
     zeta_occupied_weight: float  # charge-fit endpoint priority; occupations unchanged
     gamma_contract_mode: str  # "take" | "einsum" | "scan"
+    charge_fit_conditioning: str | None = None  # declared scalar fitting metric
 
     def summary(self) -> str:
         """One-line "what's active" for the run banner."""
