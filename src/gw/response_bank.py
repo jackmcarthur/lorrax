@@ -1018,9 +1018,9 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     from file_io.slab_io import SlabIO
     shape = (q_span[1]-q_span[0], basis.n_canonical, basis.n_canonical)
     spec = P(None, "x", "y")
-    # H = V^(1/2) is the bank's largest compile (P4 hsuite: 6.6 s on Na, 4.4 s on
-    # H2-); its operand is the packed V of this span, known here, so it compiles
-    # beside the read and the pack below instead of after them.
+    # H = V^(1/2) is the bank's largest compile (sandbox claim 4180); its operand
+    # is the packed V of this span, known here, so it compiles beside the read
+    # and the pack below instead of after them.
     kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
     _compiled(kernel, (jax.ShapeDtypeStruct((shape[0], basis.n_packed, basis.n_packed),
                                             jnp.complex128, sharding=NamedSharding(mesh_xy, spec)),),
