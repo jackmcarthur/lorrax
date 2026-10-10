@@ -29,8 +29,8 @@ is only what that cannot see or say:
   XLA's backend compile releases the GIL and scales with threads (sandbox
   claims 4178, 4180); the agreement slot is taken on the calling thread, so
   INVARIANTS 25's race (helper compiles reordering the requests across
-  ranks) cannot arise; a live call for a module in flight waits for that
-  compile instead of starting a second one.
+  ranks) cannot arise; whichever of the helper and the live call reaches
+  the compile first compiles under that slot, and the other waits for it.
 
 What this file no longer does, and why. Until 2026-10-05 it froze an
 all-rank agreed entry set at startup and vetoed every other lookup, made
