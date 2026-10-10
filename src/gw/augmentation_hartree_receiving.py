@@ -245,6 +245,13 @@ def _build_receiving_parts(*, wfn, mesh, state, artifact,
         raise ValueError('Resident source/receiving physical domain, geometry or state identity changed')
     if source['source_binding']['physical_bands']!=physical:
         raise ValueError('Occupied source and receiving full-WFN windows differ')
+    compact = artifact.get('compact_target')
+    if compact is not None and (state.get('compact_target_binding') != compact['binding']
+            or overlap.get('compact_target_binding') != compact['binding']
+            or source['source_binding'].get('compact_target_binding') != compact['binding']
+            or overlap.get('overlap_operator') != 'compact_native_pauli_target'
+            or source['source_binding'].get('source_frame_policy') != 'compact_native_pauli_common_A_before_U'):
+        raise ValueError('Receiving J must use the SAME compact target C/D/B/A and paired field policy')
     rows=np.arange(nk) if parent_rows is None else np.asarray(parent_rows,int)
     if rows.ndim!=1 or len(set(rows.tolist()))!=len(rows) or np.any((rows<0)|(rows>=nk)):
         raise ValueError('Receiving raw parent rows must be distinct and in domain')

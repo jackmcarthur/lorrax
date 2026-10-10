@@ -18,6 +18,7 @@ ARRAY_KEYS = frozenset(("radius", "ell", "kappa", "large_R", "dlarge_R_dr",
                         "small_R", "dsmall_R_dr", "field_model", "taper_start",
                         "support_radius", "half_alpha"))
 RADIAL_KEYS = ("large_R", "dlarge_R_dr", "small_R", "dsmall_R_dr")
+PAIRED_COMPACT_PAULI_FIELD_POLICY = 'unwindowed_U_of_compact_native_pauli'
 NATIVE_PAULI_TARGET = "native_large_as_pauli"
 AE_LARGE_TARGET = "ae_large_preserved_free_graph"
 _TARGET_KEYS = frozenset(("nuclear_charge", "matched_dirac_file", "matched_dirac_sha256",
@@ -481,3 +482,74 @@ def load_normalized_cache(path, data, control, *, support_radius):
     if metadata.get("payload_sha256") != _payload_hash(cache):
         raise ValueError("normalized cache array payload checksum mismatch")
     return cache
+
+
+def load_paired_native_cache(path, data, *, expected_file_sha256,
+                             common_spectrum_sha256, carrier, support_radius):
+    """Admit raw paired Hermite fields as approximations to one compact chi.
+
+    This explicit field policy differs from the legacy compact-after-U
+    graph. It neither windows the fields after U nor substitutes their
+    spectral or finite-sphere Gram for the compact target Gram. The raw
+    evaluator retains independent large/small derivatives and tail
+    diagnostics. No field rescaling occurs here.
+    """
+    import inspect
+    from psp.augmentation_spinors import evaluate_normalized_radials
+    from common.bispinor_init import lift_to_4spinor
+    from common import gamma_matrices
+
+    if carrier not in ('pauli2embed4', 'normalized_rkb'):
+        raise ValueError('paired native cache requires an explicit Pauli or canonical-U carrier')
+    if (not np.isfinite(support_radius) or support_radius <= 0
+            or any(not isinstance(sha,str) or len(sha)!=64
+                or any(c not in '0123456789abcdef' for c in sha)
+                for sha in (expected_file_sha256,common_spectrum_sha256))):
+        raise ValueError('paired native cache requires a positive support and explicit SHA256 bindings')
+    if _sha256_file(path) != expected_file_sha256:
+        raise ValueError('paired native field file identity mismatch')
+    with np.load(path, allow_pickle=False) as archive:
+        metadata = json.loads(str(archive['metadata_json']))
+        cache = {key: archive[key].copy() for key in archive.files if key != 'metadata_json'}
+    raw_keys = frozenset(('radius', 'ell', 'kappa', *RADIAL_KEYS))
+    if (set(cache) != raw_keys
+            or metadata.get('schema') != 'lorrax.dev.common_chi_species_fields.v1'
+            or metadata.get('source_model') != 'compact_native_Pauli_target_with_finiteK_paired_approximation'
+            or metadata.get('no_post_U_taper') is not True
+            or metadata.get('carrier') != carrier
+            or metadata.get('source_upf_sha256') != data['metadata']['source_sha256']
+            or metadata.get('native_payload_sha256') != data['metadata']['payload_sha256']
+            or metadata.get('common_spectrum_sha256') != common_spectrum_sha256
+            or metadata.get('payload_sha256') != _payload_hash(cache)):
+        raise ValueError('paired native field policy/source/spectrum/payload mismatch')
+    controls = metadata.get('controls', {})
+    r = np.asarray(cache['radius'])
+    if (controls.get('support_radius') != support_radius or r.dtype != np.float64
+            or r.ndim != 1 or len(r) < 2 or not np.isfinite(r).all()
+            or r[0] != 0 or np.any(np.diff(r) <= 0) or r[-1] <= support_radius
+            or not np.array_equal(cache['ell'], data['l'])
+            or not np.array_equal(cache['kappa'], data['kappa'])):
+        raise ValueError('paired native field radius/support/native channel inventory mismatch')
+    for key in RADIAL_KEYS:
+        value = cache[key]
+        if (value.dtype != np.complex128 or value.shape != (len(r), len(data['l']))
+                or not np.isfinite(value).all()):
+            raise ValueError('paired native Hermite values/derivatives must be finite complex128')
+    if carrier == 'pauli2embed4' and (np.any(cache['small_R']) or np.any(cache['dsmall_R_dr'])):
+        raise ValueError('paired Pauli embedding must have exactly zero lower field and derivative')
+    owners = metadata.get('source_owners_sha256')
+    if not isinstance(owners, dict) or not owners:
+        raise ValueError('paired native cache requires declared physical field/lift source owners')
+    for owner in (evaluate_normalized_radials, lift_to_4spinor, gamma_matrices):
+        name = inspect.getsourcefile(owner)
+        actual = _sha256_file(name)
+        recorded = {sha for source, sha in owners.items() if Path(source).name == Path(name).name}
+        if recorded != {actual}:
+            raise ValueError('paired native field or canonical-U source owner changed')
+    binding = dict(policy=PAIRED_COMPACT_PAULI_FIELD_POLICY, carrier=carrier,
+        file_sha256=expected_file_sha256, common_spectrum_sha256=common_spectrum_sha256,
+        native_reconstruction_sha256=metadata['native_reconstruction_sha256'],
+        native_payload_sha256=metadata['native_payload_sha256'], source_upf_sha256=metadata['source_upf_sha256'],
+        controls=controls, no_post_U_taper=True, represented_domain_bohr=[float(r[0]), float(r[-1])],
+        tail_diagnostics=normalized_cache_tail_diagnostics(cache, support_radius=support_radius))
+    return cache, binding

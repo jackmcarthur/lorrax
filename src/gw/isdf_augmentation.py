@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from math import gcd
 from pathlib import Path
 
@@ -62,6 +63,15 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
             or manifest.get("carrier") != "normalized_rkb"
             or manifest.get("frozen_core_policy") != "reconstruct_valence_only"):
         raise ValueError("augmentation manifest must declare normalized_rkb and reconstruct_valence_only")
+    paired_policy = manifest.get('field_policy')
+    if paired_policy is not None:
+        from psp.augmentation_cache import PAIRED_COMPACT_PAULI_FIELD_POLICY
+        if (paired_policy != PAIRED_COMPACT_PAULI_FIELD_POLICY
+                or manifest.get('overlap',{}).get('mode') != 'full_wfn_lowdin'
+                or manifest.get('charge_metric',{}).get('moment_enrichment') != 'served_monopole'
+                or 'served_moments' in manifest
+                or any(key in manifest.get('cache',{}) for key in ('species_files','target','taper_start'))):
+            raise ValueError('raw paired policy requires an unbound native full-WFN target and forbids legacy compact-after-U caches')
     required = ("species", "radial", "angular", "cache", "runtime")
     if any(not isinstance(manifest.get(key), dict) for key in required):
         raise ValueError("augmentation manifest requires species/radial/angular/cache/runtime dictionaries")
@@ -94,7 +104,7 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
     enrich = manifest.get('charge_metric',{}).get('moment_enrichment') == 'served_monopole'
     served = manifest.get('served_moments')
     served_overlap = manifest.get('overlap',{}).get('mode') == 'full_wfn_lowdin'
-    if (enrich or served_overlap) and served is None:
+    if (enrich or served_overlap) and served is None and paired_policy is None:
         raise ValueError("full-WFN served overlap or monopole enrichment requires an explicit served_moments artifact table")
     if served is not None:
         species_keys = {'species_files','species_sha256'}
@@ -111,7 +121,13 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
     digest = hashlib.sha256(raw)
     tables = {}
     channel_control = manifest.get('partial_wave_channels')
-    if channel_control is not None and (not isinstance(channel_control,dict)
+    species_channels = (channel_control.get('species')
+                        if isinstance(channel_control,dict) else None)
+    if species_channels is not None and (set(channel_control) != {'species'}
+            or not isinstance(species_channels,dict)
+            or set(species_channels) != set(manifest['species'])):
+        raise ValueError('per-species partial_wave_channels must cover every species exactly')
+    if channel_control is not None and species_channels is None and (not isinstance(channel_control,dict)
             or channel_control.get('mode') != 'native_oncv_reference_channels'
             or not isinstance(channel_control.get('lmax'),int)
             or isinstance(channel_control['lmax'],bool) or channel_control['lmax'] < 0):
@@ -136,9 +152,39 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
         if int(source['atomic_number']) != z:
             raise ValueError("augmentation manifest species differs from source atomic reference")
         selected = data['metadata'].get('radial_channel_selection')
-        if channel_control is None and selected is not None:
+        control = species_channels[label] if species_channels is not None else channel_control
+        complete_channels = (isinstance(control,dict)
+                             and control.get('mode') == 'complete_unselected_sidecar')
+        if complete_channels:
+            actual = set(zip(map(int,data['l']),map(int,data['kappa'])))
+            declared = control.get('channels')
+            native = set()
+            for row in source['spin_channels']:
+                if 'lll' not in row or 'jjj' not in row:
+                    continue
+                l,j2 = int(row['lll']),int(round(2*float(row['jjj'])))
+                if j2 == 2*l+1:
+                    native.add((l,-l-1))
+                elif l > 0 and j2 == 2*l-1:
+                    native.add((l,l))
+                else:
+                    raise ValueError('source UPF has an invalid native relativistic projector channel')
+            if (set(control) != {'mode','channels'} or selected is not None
+                    or not isinstance(declared,list) or not actual or not native
+                    or any(not isinstance(row,list) or len(row) != 2
+                           or any(not isinstance(v,int) or isinstance(v,bool) for v in row)
+                           for row in declared)
+                    or len(declared) != len(set(map(tuple,declared)))
+                    or set(map(tuple,declared)) != actual or not native.issubset(actual)):
+                raise ValueError(f'species {z} complete sidecar inventory differs from explicit channels or native UPF')
+        elif control is not None and (not isinstance(control,dict)
+                or control.get('mode') != 'native_oncv_reference_channels'
+                or not isinstance(control.get('lmax'),int)
+                or isinstance(control['lmax'],bool) or control['lmax'] < 0):
+            raise ValueError('partial_wave_channels must name an authenticated complete inventory or native selector')
+        if control is None and selected is not None:
             raise ValueError("a channel-selected sidecar requires explicit manifest partial_wave_channels")
-        if channel_control is not None:
+        if control is not None and not complete_channels:
             # Only PP_RELBETA records define the native operator inventory;
             # independent scattering channels and diagnostic core waves do
             # not create an NC reference absent from the supplied UPF.
@@ -153,14 +199,14 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
                     kappa = l
                 else:
                     raise ValueError("source UPF has an invalid native relativistic projector channel")
-                if l <= channel_control['lmax']:
+                if l <= control['lmax']:
                     native.add((l,kappa))
             actual = set(zip(map(int,data['l']),map(int,data['kappa'])))
             declared = (set((int(row['l']),int(row['kappa'])) for row in selected.get('retained_channels',[]))
                         if isinstance(selected,dict) else set())
             if (not isinstance(selected,dict) or not native or actual != native or declared != actual
-                    or selected.get('mode') != channel_control['mode']
-                    or selected.get('lmax') != channel_control['lmax']
+                    or selected.get('mode') != control['mode']
+                    or selected.get('lmax') != control['lmax']
                     or any(len(str(selected.get(key,''))) != 64
                            for key in ('parent_payload_sha256','parent_metadata_sha256'))):
                 raise ValueError(f"species {z} selected sidecar does not match explicit native UPF partial-wave channels")
@@ -370,7 +416,8 @@ def _put(array, mesh, spec):
 
 
 def _atomic_fourier_table(data, wavevectors, geometry, mesh, *,
-                          radial_cache=None, delta_overlap=False):
+                          radial_cache=None, delta_overlap=False,
+                          normalized_rkb_source=True):
     """Build only addressable G shards through the canonical placement owner.
 
     Atomic transform/dual definitions remain with their existing owners.
@@ -393,7 +440,7 @@ def _atomic_fourier_table(data, wavevectors, geometry, mesh, *,
     def tile(index):
         parents,functions,spin,gslots = index
         values = np.asarray([factory(data,momenta,center_cart=geometry['center_cart'],
-            cell_volume=geometry['cell_volume'],normalized_rkb_source=True,
+            cell_volume=geometry['cell_volume'],normalized_rkb_source=normalized_rkb_source,
             radial_cache=radial_cache) for momenta in K[parents,gslots]])
         return values[:,functions,spin,:]
     return device_put_process_tiles(shape,NamedSharding(mesh,P(None,None,None,('x','y'))),tile)
@@ -758,6 +805,9 @@ def _full_wfn_rotation(smooth, nmu, coefficients, geometry, mesh):
         return jax.lax.psum(jnp.einsum('pnsg,pmsg->pnm',a.conj(),a),('x','y'))
     gram_kernel = jax.jit(shard_map(source_gram,mesh=mesh,
         in_specs=P(None,None,None,('x','y')),out_specs=P(),check_vma=False))
+    compact = geometry.get('compact_target')
+    if compact is not None:
+        compact_gram_kernel = _compact_pauli_gram_kernel(mesh, compact['carrier'])
     atomic_grams = [geometry['served_caches'][int(z)]['B'] for z in geometry['atom_types']]
     raw_D = geometry['raw_served_D']
     physical_bands = int(geometry['physical_bands'])
@@ -771,20 +821,43 @@ def _full_wfn_rotation(smooth, nmu, coefficients, geometry, mesh):
     raw_delta_overlaps = [[] for _ in coefficients]
     for p0 in range(0,npar,pc):
         source = kernels['source'](smooth,jnp.int32(p0),jnp.int32(0))
-        gram = gather_to_host(gram_kernel(source))
+        if compact is None:
+            gram = gather_to_host(gram_kernel(source))
+        else:
+            K = _put(geometry['wavevectors'][p0:p0+pc],mesh,P(None,('x','y'),None))
+            gram, graph_error, graph_scale = compact_gram_kernel(source,K)
+            gram = gather_to_host(gram)
+            graph_error, graph_scale = map(float,(np.asarray(graph_error),np.asarray(graph_scale)))
+            if not np.isfinite((graph_error,graph_scale)).all() or graph_error > 2e-12*max(1.,graph_scale):
+                raise ValueError('live four-slot source differs from its declared Pauli/canonical-U graph')
         source_grams.append(gram)
+        measured_coefficients = []
         for atom in range(len(coefficients)):
             coeff = kernels['read_coeff'](coefficients[atom],jnp.int32(p0),jnp.int32(0))
             c_host = gather_to_host(coeff)
+            measured_coefficients.append(c_host)
             d_host = np.pad(raw_D[atom][p0:p0+pc],((0,0),(0,nb-physical_bands),(0,0)))
-            raw_coefficients[atom].append(c_host)
+            raw_coefficients[atom].append(c_host if compact is None else np.pad(
+                compact['frame']['arrays'][f'atom_C_{atom:03d}'][p0:p0+pc],
+                ((0,0),(0,nb-physical_bands),(0,0))))
             raw_delta_overlaps[atom].append(d_host)
-            gram = reconstruction_gram(gram,c_host,d_host,atomic_grams[atom])
-        receipt = lowdin_factor(gram,physical_bands=int(geometry['physical_bands']))
+            if compact is None:
+                gram = reconstruction_gram(gram,c_host,d_host,atomic_grams[atom])
+        if compact is None:
+            receipt = lowdin_factor(gram,physical_bands=int(geometry['physical_bands']))
+        else:
+            from psp.reconstruction_overlap import compact_frame_factor
+            receipt = compact_frame_factor(gram,measured_coefficients,compact['frame'],
+                parent_start=p0,physical_bands=physical_bands)
+            receipt['compact_source_graph_error'] = np.full(pc,graph_error)
         factors.append(receipt.pop('inverse_sqrt'))
         receipts.append(receipt)
     factor_host = np.concatenate(factors,axis=0)
     factor = _put(factor_host,mesh,P())
+    if compact is not None:
+        # Both arms use the admitted common C after checking live projections.
+        # No per-arm field normalization or extra full WFN carrier occurs.
+        coefficients = [_put(np.concatenate(c),mesh,P(None,('x','y'),None)) for c in raw_coefficients]
     args = (mesh,pc,geometry['output_bands'],geometry['public_start'],geometry['physical_stop'])
     source_rotation = _band_rotation_kernel(args[0],args[1],'source',*args[2:])
     coefficient_rotation = _band_rotation_kernel(args[0],args[1],'coefficients',*args[2:])
@@ -802,7 +875,45 @@ def _full_wfn_rotation(smooth, nmu, coefficients, geometry, mesh):
         atomic_coefficients=tuple(np.concatenate(c) for c in raw_coefficients),
         delta_overlaps=tuple(np.concatenate(d) for d in raw_delta_overlaps),
         atomic_delta_grams=tuple(atomic_grams))
+    if compact is not None:
+        receipt.update(overlap_operator='compact_native_pauli_target',
+            compact_target_binding=compact['binding'],
+            source_frame_policy='compact_native_pauli_common_A_before_U')
     return smooth,nmu,coefficients,receipt
+
+
+@lru_cache(maxsize=None)
+def _compact_pauli_gram_kernel(mesh, carrier):
+    """Measure Pauli G0 in a bounded G-sharded packet, checking its graph.
+
+    A canonical-U input is inverted only within this packet. Its CPU source
+    hashes remain provenance, not a byte gate on an inverse-R roundtrip.
+    The reciprocal WFN is never gathered or cloned into a resident Pauli bank.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import shard_map
+    from jax.sharding import PartitionSpec as P
+    from common.bispinor_init import _normalized_rkb_factor, lift_to_4spinor
+
+    if carrier not in ('pauli2embed4','normalized_rkb'):
+        raise ValueError('compact target requires an explicit four-slot carrier')
+    def measure(source,K):
+        upper = source[:,:,:2]
+        if carrier == 'normalized_rkb':
+            pauli = upper/_normalized_rkb_factor(K)[:,None,None,:]
+            expected = lift_to_4spinor(pauli,K,jnp.zeros((len(K),3)),jnp.eye(3),
+                representation='normalized_rkb')
+        else:
+            pauli = upper
+            expected = jnp.concatenate((pauli,jnp.zeros_like(pauli)),axis=2)
+        error = jax.lax.pmax(jnp.max(abs(source-expected)),('x','y'))
+        scale = jax.lax.pmax(jnp.max(abs(source)),('x','y'))
+        gram = jax.lax.psum(jnp.einsum('pnsg,pmsg->pnm',pauli.conj(),pauli),('x','y'))
+        return gram,error,scale
+    return jax.jit(shard_map(measure,mesh=mesh,
+        in_specs=(P(None,None,None,('x','y')),P(None,('x','y'),None)),
+        out_specs=(P(),P(),P()),check_vma=False))
 
 
 def _rhs_storage_kernels(mesh, q_indices, qpad, na, nh, nr, rp, feature_count):
@@ -1228,6 +1339,89 @@ def _current_contract_workspace_bytes(*, qpad, mu, atoms, harmonics, radial_poin
                    onsite_scratch,factor_tables,fourier_tables,fourier_and_pair_scratch)))
 
 
+def bind_compact_target_artifact(artifact, request, *, wfn, sym):
+    """Bind a private common-target preparation to one unchanged ISDF stage.
+
+    ``request`` pins the full-FILE compact C/D/B/G0/A file, the authoritative
+    whole-WFN SHA256, one four-slot carrier and exact species field files.
+    This returns a new plain artifact; the caller must pass that SAME
+    artifact to preparation and receiving J. Public GW/slab admission guards
+    remain in force. No saved factor is accepted without the live checks in
+    ``_full_wfn_rotation``.
+    """
+    from psp.reconstruction_overlap import load_compact_pauli_frame
+    from psp.augmentation_cache import load_paired_native_cache, PAIRED_COMPACT_PAULI_FIELD_POLICY
+
+    required = {'frame_file','frame_sha256','wfn_sha256','carrier','species_fields'}
+    if (not isinstance(request,dict) or set(request) != required
+            or request['carrier'] not in ('pauli2embed4','normalized_rkb')
+            or artifact.get('field_policy') != PAIRED_COMPACT_PAULI_FIELD_POLICY
+            or artifact.get('compact_target') is not None
+            or artifact.get('overlap',{}).get('mode') != 'full_wfn_lowdin'
+            or artifact.get('charge_metric',{}).get('moment_enrichment') != 'served_monopole'
+            or sym.parent_k_domain != 'ibz'):
+        raise ValueError('compact target requires an explicit new full-FILE full-WFN preparation')
+    fields = request['species_fields']
+    if not isinstance(fields,dict) or set(fields) != set(map(str,artifact['tables'])):
+        raise ValueError('paired field files must cover every native species exactly')
+    file_k = np.asarray(wfn.kvecs(k=sym.parent_k_domain))
+    file_rows = np.asarray(sym.kirr_fullids)
+    if (file_rows.shape != (len(file_k),) or file_rows.dtype.kind not in 'iu'
+            or sym.nk_red != len(file_k) or not np.isfinite(file_k).all()
+            or np.any(file_rows < 0) or np.any(file_rows >= sym.nk_tot)
+            or len(np.unique(file_rows)) != len(file_rows)):
+        raise ValueError('compact target requires the canonical complete stored FILE wedge')
+    file_delta = np.asarray(sym.unfolded_kpts)[file_rows]-file_k
+    if np.max(abs(file_delta-np.rint(file_delta))) > 2e-12:
+        raise ValueError('compact target stored FILE rows differ from the physical symmetry map')
+    lattice = float(wfn.alat)*np.asarray(wfn.avec)
+    frame = load_compact_pauli_frame(request['frame_file'],
+        expected_file_sha256=request['frame_sha256'],expected_wfn_sha256=request['wfn_sha256'],
+        tables=artifact['tables'],parent_k_frac=file_k,
+        gvecs=np.asarray(wfn.gvecs(k=sym.parent_k_domain)),
+        ngk_valid=np.asarray(wfn.ngk_valid(k=sym.parent_k_domain)),
+        atom_types=np.asarray(wfn.atom_types),centers_cart=(np.asarray(wfn.atom_crys)%1.)@lattice,
+        physical_bands=int(wfn.nbands))
+    support = float(artifact['radial']['support_radius'])
+    if frame['metadata'].get('represented_sphere_radius_bohr') != support:
+        raise ValueError('compact target/paired field and density support radii differ')
+    caches, field_bindings, target_caches, represented_B_errors = {}, {}, {}, {}
+    for z,data in artifact['tables'].items():
+        control = fields[str(z)]
+        if not isinstance(control,dict) or set(control) != {'file','file_sha256','common_spectrum_sha256'}:
+            raise ValueError('paired species field requires exact file/SHA/shared-spectrum binding')
+        species = frame['metadata']['atomic_species_inputs'][str(z)]
+        if control['common_spectrum_sha256'] != species['spectral_witness_sha256']:
+            raise ValueError('paired fields and compact target use different shared Pauli spectra')
+        cache, binding = load_paired_native_cache(control['file'],data,
+            expected_file_sha256=control['file_sha256'],common_spectrum_sha256=control['common_spectrum_sha256'],
+            carrier=request['carrier'],support_radius=support)
+        if binding['native_reconstruction_sha256'] != species['native_sha256']:
+            raise ValueError('paired fields and compact target use different native radial/PCA inputs')
+        caches[z], field_bindings[str(z)] = cache,binding
+        target_caches[z] = dict(upper=dict(ell=data['l'],kappa=data['kappa']),
+            labels=frame['arrays'][f'species_labels_{z}'],B=frame['arrays'][f'species_B_{z}'])
+        # These species-only errors are diagnostics, never a target Gram.
+        with np.load(species['metric_witness'],allow_pickle=False) as archive:
+            served_B = archive[request['carrier']+'_sphere_B']
+            represented_B_errors[str(z)] = float(np.max(abs(served_B-target_caches[z]['B'])))
+    binding = dict(model=frame['metadata']['model'],frame_file_sha256=frame['file_sha256'],
+        frame_payload_sha256=frame['metadata']['payload_sha256'],wfn_sha256=request['wfn_sha256'],
+        physical_bands=int(wfn.nbands),complete_all_FILE_parents=True,
+        carrier=request['carrier'],field_policy=PAIRED_COMPACT_PAULI_FIELD_POLICY,
+        paired_species=field_bindings,represented_species_B_error=represented_B_errors,
+        source_frame_policy='compact_native_pauli_common_A_before_U',
+        normalization='one compact target A; no represented-field renormalization',
+        source_row_hash_scope='original physical Pauli bytes, not inverse-R roundtrip bytes')
+    identity = hashlib.sha256(json.dumps(dict(base_augmentation_identity=artifact['identity'],
+        compact_target=binding),sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
+    arrays = frame['arrays']; na = len(arrays['atom_types'])
+    return dict(artifact,identity=identity,normalized_caches=caches,served_moment_caches=target_caches,
+        raw_parent_moments=dict(atom_C=tuple(arrays[f'atom_C_{a:03d}'] for a in range(na)),
+            atom_D=tuple(arrays[f'atom_D_{a:03d}'] for a in range(na)),metadata=dict(binding=binding)),
+        compact_target=dict(frame=frame,carrier=request['carrier'],binding=binding))
+
+
 def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                          centroid_indices, parent_psi, parent_faces,
                          band_range_left, band_range_right, print_fn=print,
@@ -1258,6 +1452,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     donation, using the same packets and full-WFN factor. Its occupations
     come from the WFN, independently of the normal-equation loss weights.
     """
+    if (artifact is not None and artifact.get('field_policy') is not None
+            and artifact.get('compact_target') is None):
+        raise ValueError('unbound paired artifact: bind the complete compact target and physical field files before preparation')
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -1274,6 +1471,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         if artifact is None:
             artifact = read_augmentation_manifest(cfg.paths.atomic_reconstruction_dir)
     overlap_mode = artifact.get('overlap',{}).get('mode','none')
+    compact = artifact.get('compact_target')
+    if artifact.get('field_policy') is not None and compact is None:
+        raise ValueError('unbound paired artifact: bind the complete compact target and physical field files before preparation')
     if overlap_mode not in ('none','full_wfn_lowdin'):
         raise ValueError(f"unsupported explicit reconstruction overlap mode {overlap_mode!r}")
     if int(meta.nspinor) != 4 or plan.nspinor != 4:
@@ -1338,9 +1538,14 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         raise ValueError('Hartree source capture requires SAME150 served overlap, onsite cross and exact served monopoles')
     if current is not None and overlap_mode != 'full_wfn_lowdin':
         raise ValueError('current augmentation requires the actual served full150 physical overlap')
+    if compact is not None and current is not None:
+        raise ValueError('compact common-frame preparation currently admits charge operands only')
     if current is not None and 'interpolation_degree' not in artifact['radial']:
         raise ValueError('current augmentation requires the explicit physical density interpolant')
     cached_coefficients = (artifact.get('raw_parent_moments') or {}).get('atom_C')
+    if compact is not None:
+        # Check live public-dual projections before using prepared common C.
+        cached_coefficients = None
     if cached_coefficients is not None and overlap_mode != 'full_wfn_lowdin':
         raise ValueError("prepared full-window atomic coefficients require the actual full-WFN overlap stage")
     lattice = float(wfn.alat)*np.asarray(wfn.avec, dtype=np.float64)
@@ -1467,6 +1672,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                                    if overlap_mode == 'full_wfn_lowdin' else 0.)
     prepared_projection_host_bytes = (sum(c.nbytes for c in cached_coefficients)
                                      if cached_coefficients is not None else 0.)
+    compact_host_bytes = (sum(a.nbytes for a in compact['frame']['arrays'].values())
+        +sum(a.nbytes for cache in artifact['normalized_caches'].values() for a in cache.values())
+        if compact is not None else 0.)
     moment_bytes = 0.
     if moment_enrichment:
         # Cached full-band D_R and both its rotated carrier and signed field
@@ -1520,7 +1728,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                        price=current_price,angular_workspace=ca)
     price = (source_bytes+4*face_bytes+rhs_copies*rhs_bytes+3*factor_v_bytes+4*point_faces
              +point_workspace['total']+dft_tile+phase_bytes+smooth_tile+overlap_bytes+moment_bytes
-             +prepared_overlap_host_bytes+prepared_projection_host_bytes+angular_workspace['total']+current_price)
+             +prepared_overlap_host_bytes+prepared_projection_host_bytes+angular_workspace['total']+current_price
+             +compact_host_bytes)
     if periodic_plan is not None:
         price += periodic_plan['resident_bound_bytes_per_rank']
     hartree_source_bytes = 0.
@@ -1569,13 +1778,16 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     wavevectors[np.arange(ng)[None,:] >= counts[:,None]] = 0.
     raw_served_D = None
     if overlap_mode == 'full_wfn_lowdin':
-        from isdf.atomic_moments import raw_parent_moment_binding
-        expected = raw_parent_moment_binding(wfn,k_parent_frac=kfrac,gvecs=gv,ngk_valid=counts,
-            centers_cart=centers @ lattice,atom_types=atom_types,cell_volume=float(meta.cell_volume),
-            physical_bands=int(wfn.nbands),
-            served_cache_sha256_by_species=artifact['served_moments']['species_sha256'],
-            projection_binding=(artifact['raw_parent_projection_binding']
-                                if cached_coefficients is not None else None))
+        if compact is None:
+            from isdf.atomic_moments import raw_parent_moment_binding
+            expected = raw_parent_moment_binding(wfn,k_parent_frac=kfrac,gvecs=gv,ngk_valid=counts,
+                centers_cart=centers @ lattice,atom_types=atom_types,cell_volume=float(meta.cell_volume),
+                physical_bands=int(wfn.nbands),
+                served_cache_sha256_by_species=artifact['served_moments']['species_sha256'],
+                projection_binding=(artifact['raw_parent_projection_binding']
+                                    if cached_coefficients is not None else None))
+        else:
+            expected = compact['binding']
         raw = artifact['raw_parent_moments']
         if raw['metadata']['binding'] != expected:
             raise ValueError("raw served-moment cache disagrees with the actual WFN, parent/G geometry or full band window")
@@ -1585,7 +1797,16 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     with timing.section('augmentation.projection_cache'):
         projection_caches = {}
         Kmax = float(np.max(np.linalg.norm(wavevectors,axis=-1)))*(1+1e-12)
-        if artifact.get('fourier_caches') is not None:
+        if compact is not None:
+            # Remeasure C with exactly the declared source-frame dual chart.
+            # The public species constructor runs once, never per parent.
+            projection_controls = compact['frame']['metadata']['fourier_controls']
+            if float(projection_controls['momentum_max']) < Kmax:
+                raise ValueError('compact frame dual chart does not cover the actual WFN momenta')
+            for z in set(atom_types):
+                projection_caches[int(z)] = build_projection_radial_cache(
+                    artifact['tables'][int(z)],**projection_controls)
+        elif artifact.get('fourier_caches') is not None:
             for z,pair in artifact['fourier_caches'].items():
                 if any(float(table['momentum'][-1]) < Kmax for table in pair.values()):
                     raise ValueError("explicit atomic Fourier cache does not cover the WFN momenta")
@@ -1634,7 +1855,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             for p0 in range(0,npar,pc):
                 table = _atomic_fourier_table(data,wavevectors[p0:p0+pc],
                     dict(center_cart=centers[atom] @ lattice,cell_volume=meta.cell_volume),
-                    mesh_xy,radial_cache=projection_caches.get(z))
+                    mesh_xy,radial_cache=projection_caches.get(z),
+                    normalized_rkb_source=(compact is None or compact['carrier']=='normalized_rkb'))
                 phase_device = _put(phase[p0:p0+pc],mesh_xy,P(None,'y'))
                 for b0 in range(0,nb,bc):
                     source = kernels['source'](smooth,jnp.int32(p0),jnp.int32(b0))[:,:,:2]
@@ -1655,6 +1877,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                 physical_bands=physical_bands,output_bands=output_bands,public_start=public_start,
                 physical_stop=physical_stop,served_caches=artifact['served_moment_caches'],
                 raw_served_D=artifact['raw_parent_moments']['atom_D'])
+            if compact is not None:
+                geometry['compact_target'] = compact
             smooth,nmu,coefficients,overlap_receipt = _full_wfn_rotation(
                 smooth,nmu,coefficients,geometry,mesh_xy)
             if raw_served_D is not None:
@@ -1720,6 +1944,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             full_kweights_sha256=source_capture['full_kweights_sha256'],
             spin_degeneracy=1.,fft_grid=list(map(int,meta.fft_grid)),
             cell_volume=float(meta.cell_volume),source_frame_policy='same_actual_served_four_spinor_full_WFN_Lowdin')
+        if compact is not None:
+            binding.update(source_frame_policy='compact_native_pauli_common_A_before_U',
+                compact_target_binding=compact['binding'])
         if int(meta.sys_dim) == 2:
             from isdf.atomic_hartree import charge_hartree_operator_contract
             slab_contract = charge_hartree_operator_contract(wfn, sys_dim=2)
@@ -1941,6 +2168,11 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         state['periodic_plan'] = periodic_plan
         state['periodic_action_workspace'] = periodic_plan['receipt']
     state['prepared_atomic_projection_host_bytes_per_process'] = prepared_projection_host_bytes
+    if compact is not None:
+        state.update(compact_target_binding=compact['binding'],
+            compact_target_host_bytes_per_process=compact_host_bytes,
+            exact_monopole_policy='compact_target_C_D_B_with_served_radial_epsilon',
+            represented_field_normalization='none; common compact-target A only')
     state['atomic_projection_source'] = ('prepared_full_window_v2' if cached_coefficients is not None
                                          else 'canonical_runtime_projection_v1')
     state['orbital_norm_change_estimate'] = charge_delta
