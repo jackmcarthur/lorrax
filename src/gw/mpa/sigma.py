@@ -592,7 +592,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
 
     spans = tuple((p["span"], p["kernel"]) for p in panels)
 
-    def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node, hole):
+    def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node, _hole):
         pair = None
         for ((lo, hi), kernel), factors, poles2 in zip(spans, factors_by_panel, poles_by_panel):
             ranges = intervals[lo:hi]
@@ -629,15 +629,17 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             pair = jax.lax.fori_loop(
                 0, n_chunks, chunk,
                 (_zeros(mesh_xy, (nq, m, m))(),) * 2 if pair is None else pair)
-        # The valence branch of an ordered store reads W_+(-q)^T through the
-        # q-negated tables: the same parent pair, another load.
-        return (*pair, load[1] if hole else load[0])
+        return (*pair, load)
 
-    def window_operands(_space, indices, bounds):
+    def window_operands(space, indices, bounds):
         # Host intervals once per window; every τ node of the window reuses them.
         intervals = shared_pole_intervals(frequencies, np.asarray(indices), np.asarray(bounds))
+        # The valence branch of an ordered store reads W_+(-q)^T through the
+        # q-negated tables: the same parent pair, another load, chosen here so
+        # both branches run one window program.
+        load = loads[1] if ordered and space == 'val' else loads[0]
         return (panel_factors, panel_poles,
-                device_put_process_local(intervals, NamedSharding(mesh_xy, P())), loads)
+                device_put_process_local(intervals, NamedSharding(mesh_xy, P())), load)
 
     closed = False
 
@@ -659,7 +661,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     if weights_fn is not _shared_pole_weights:
         key += (weights_fn.__name__,)
     synthesis = WSynthesis(w_kernel, window_operands, lambda: (panel_factors, panel_poles),
-                           close, native_workspace, key, ordered=ordered,
+                           close, native_workspace, key, ordered=False,
                            tile_bytes=16 * nq * m * m // int(mesh_xy.size))
     synthesis.q_wedge = q_wedge
     return synthesis
@@ -1156,7 +1158,9 @@ class WSynthesis:
     (the pole intervals).  ``resident_operands()`` are the device factors its
     stage already charged, ``native`` its GEMM's native workspace, ``close``
     releases them, ``key`` is the static configuration ``w_kernel`` closes
-    over, and ``ordered`` says whether the valence branch reads -q (``hole``).
+    over, and ``ordered`` says whether ``w_kernel`` takes the valence branch
+    (``hole``, which reads -q) as a static; False when ``window_operands``
+    already passes the branch's tables, so both branches share one program.
     ``tile_bytes`` is one W(τ) parent tile's bytes per rank.
     """
 

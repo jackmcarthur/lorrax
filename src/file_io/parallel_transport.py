@@ -1525,7 +1525,7 @@ def head_velocity_set(occupations_kn, tol: float = 1.0e-10):
     """
     f = jnp.asarray(occupations_kn)
     nb = f.shape[-1]
-    diagonal = jnp.eye(nb, dtype=bool)[None]
+    diagonal = np.eye(nb, dtype=bool)[None]
     transition = (jnp.abs(f[:, :, None] - f[:, None, :]) > tol) & ~diagonal
     partial = (f > tol) & (f < 1.0 - tol)
     return transition | (diagonal & partial[:, :, None])
@@ -1633,7 +1633,7 @@ def complete_velocity_validation(
         # The head block only: rows and columns past the head are zeroed in
         # both operands, so every metric below (entrywise, transition
         # overlap, head response) is the head's.
-        keep = jnp.arange(nb) < judged
+        keep = np.arange(nb) < judged
         block = (keep[:, None] & keep[None, :])[None, None]
         reconstructed = jnp.where(block, reconstructed, 0.0)
         exact = jnp.where(block, exact, 0.0)
@@ -1857,7 +1857,7 @@ def load_full_bz_links(
         pad = np.zeros((nb_storage, nb_storage), dtype=np.complex128)
         rows = np.arange(nb, nb_storage)
         pad[rows, rows] = 1.0
-        links = links + jnp.asarray(pad)[None, None]
+        links = links + pad[None, None]
     return links
 
 

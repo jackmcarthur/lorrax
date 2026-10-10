@@ -418,7 +418,7 @@ def fit_gn_ppm_from_wc_pair(
     # The real centroid slots as a traced operand: the run's packed order
     # interleaves its pad slots per shard, so a prefix cannot name them.
     _mask = (None if mu_active_mask is None
-             else jnp.asarray(np.asarray(mu_active_mask, dtype=bool)))
+             else np.asarray(mu_active_mask, dtype=bool))
     _W0 = jnp.asarray(Wc0_qmunu)
     ordered = bool(ordered_orientations)
     if ordered:

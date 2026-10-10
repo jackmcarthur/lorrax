@@ -806,10 +806,8 @@ def _compute_V_q_g_flat_tiles(
     # kernel still needs the buffer; the contents are simply unread.
     g0_sh = NamedSharding(mesh_xy, P(None, 'x'))
     for s in specs:
-        s['V'] = jax.jit(lambda nL=s['nL'], nR=s['nR']: jnp.zeros(
-            (n_q_ibz, nL, nR), dtype=jnp.complex128), out_shardings=V_sh)()
-        s['g0'] = jax.jit(lambda nL=s['nL']: jnp.zeros(
-            (n_q_ibz, nL), dtype=jnp.complex128), out_shardings=g0_sh)()
+        s['V'] = jnp.zeros((n_q_ibz, s['nL'], s['nR']), jnp.complex128, device=V_sh)
+        s['g0'] = jnp.zeros((n_q_ibz, s['nL']), jnp.complex128, device=g0_sh)
         s['parts'] = []
     # Process-local placement, NOT plain ``jax.device_put``: the latter
     # fires JAX's hidden ``assert_equal`` all-gather on a multi-process

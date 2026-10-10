@@ -1101,12 +1101,10 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 
 	half, parity = plan.dirac_halves()  # authenticates diag(U, parity*U)
 	np_, _, mu, nb = map(int, psi_mun.shape)
-	pl, fl = gamma_perm_phase_host(gamma_L)
-	pr, fr = gamma_perm_phase_host(gamma_R)
 	px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
 	mu_loc, col_loc = mu // px, mu // py
 	key = ('c_q_dirac_quarters', mesh_xy, plan, gemm, tuple(kgrid),
-	       tuple(psi_mun.shape), str(psi_mun.dtype), gamma_L, gamma_R)
+	       tuple(psi_mun.shape), str(psi_mun.dtype))
 	if key not in _isdf_pipeline_cache:
 		layout = 'face' if gemm.in_sharding_a.spec == P(None, 'x', 'y') else 'axis'
 		quarter_gemm = gemm_plan(mesh_xy, m=2*mu, n=2*mu, k=nb, nq=np_,
@@ -1125,23 +1123,25 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 		       perm_r=np.arange(2), phase_r=np.ones(2), centroid_major=True)
 
 		@partial(shard_map, mesh=mesh_xy,
-		         in_specs=(pair_spec, pair_spec, P(), P()),
+		         in_specs=(pair_spec, pair_spec, P(), P(), P()),
 		         out_specs=P(None, 'x', 'y'), check_vma=False)
-		def tail(dl, dr, h, g):
+		def tail(dl, dr, h, g, gamma):
+			perm, phase, flip = gamma
 			tables = _parent_conv_tables(half, half.centroid_local_perm,
 			                              half.L_table, mu_loc, col_loc)
-			uh, ug = h ^ int(gamma_L != 0), g ^ int(gamma_R != 0)
+			uh, ug = h ^ flip[0], g ^ flip[1]
 			# A quarter's parity belongs to its typed unfold, before vertices.
 			left_sign = jnp.where(h == g, 1., jnp.asarray(parity))
 			right_sign = jnp.where(uh == ug, 1., jnp.asarray(parity))
 			tables = (*tables[:-2], tables[-2]*left_sign[:, None, None],
 			          tables[-1]*right_sign[:, None, None])
-			vl = (jnp.asarray(pl[:2] % 2), jax.lax.dynamic_slice_in_dim(jnp.asarray(fl), 2*h, 2))
-			vr = (jnp.asarray(pr[:2] % 2), jax.lax.dynamic_slice_in_dim(jnp.asarray(fr), 2*g, 2))
+			vl = (perm[0], jax.lax.dynamic_slice_in_dim(phase[0], 2*h, 2))
+			vr = (perm[1], jax.lax.dynamic_slice_in_dim(phase[1], 2*g, 2))
 			return pair(dl, dr, _parent_conv_vertices(tables, vl, vr))
 
-		@partial(jax.jit, in_shardings=(mun, nmu, rep, rep), out_shardings=out)
-		def run(pm, pn, wl, wr):
+		# The gamma pair is data, so the six vertex pairs share one program.
+		@partial(jax.jit, in_shardings=(mun, nmu, rep, rep, rep), out_shardings=out)
+		def run(pm, pn, wl, wr, gamma):
 			def projector(w, h, g):
 				l = jax.lax.dynamic_slice_in_dim(pm, 2*h, 2, axis=1)
 				r = jax.lax.dynamic_slice_in_dim(pn, 2*g, 2, axis=2)
@@ -1154,14 +1154,19 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 				h, g = hg
 				dl = projector(wl_, h, g)
 				dl, wr_ = jax.lax.optimization_barrier((dl, wr))
-				dr = projector(wr_, h ^ int(gamma_L != 0), g ^ int(gamma_R != 0))
-				return total + tail(dl, dr, h, g), None
+				dr = projector(wr_, h ^ gamma[2][0], g ^ gamma[2][1])
+				return total + tail(dl, dr, h, g, gamma), None
 			nk = math.prod(kgrid)
 			zero = jax.lax.with_sharding_constraint(jnp.zeros((nk, mu, mu), pm.dtype), out)
 			return jax.lax.scan(add, zero, jnp.asarray(((0,0),(0,1),(1,0),(1,1)), jnp.int32), unroll=1)[0]
 		_isdf_pipeline_cache[key] = run
+	# Each vertex's in-block permutation, its four phases, and whether it
+	# swaps the upper and lower halves (every gamma but the identity does).
+	(pl, fl), (pr, fr) = map(gamma_perm_phase_host, (gamma_L, gamma_R))
+	gamma = (np.stack([pl[:2] % 2, pr[:2] % 2]), np.stack([fl, fr]),
+	         np.asarray([gamma_L != 0, gamma_R != 0], np.int32))
 	return _isdf_pipeline_cache[key](psi_mun, psi_nmu,
-	       jnp.asarray(weight_l, jnp.float64), jnp.asarray(weight_r, jnp.float64))
+	       jnp.asarray(weight_l, jnp.float64), jnp.asarray(weight_r, jnp.float64), gamma)
 
 
 def c_q_from_psi_sm(

@@ -2589,7 +2589,6 @@ def _sphere_millers(zx, qw):
 _REFIT_KERNELS: dict = {}
 _REFIT_CHUNK_KERNELS: dict = {}
 _REFIT_MU_PAD_KERNELS: dict = {}
-_REFIT_GFLAT_ZERO_KERNELS: dict = {}
 
 
 def _refit_kernels(nk, nb, ns, n_mu, zeta_solve):
@@ -2692,22 +2691,6 @@ def _pad_refit_zeta_for_gflat(zeta, *, n_mu_padded: int, mesh_xy: Mesh):
     return fn(zeta)
 
 
-def _refit_gflat_zeros(*, n_mu_padded: int, ngk: int, mesh_xy: Mesh):
-    """Allocate the persistent sphere carrier once per distinct shape."""
-    key = (id(mesh_xy), int(n_mu_padded), int(ngk))
-    fn = _REFIT_GFLAT_ZERO_KERNELS.get(key)
-    if fn is None:
-        out = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
-
-        @partial(jax.jit, out_shardings=out)
-        def _zeros():
-            return jnp.zeros(
-                (1, int(n_mu_padded), int(ngk)), dtype=jnp.complex128)
-
-        fn = _REFIT_GFLAT_ZERO_KERNELS[key] = _zeros
-    return fn()
-
-
 def close_refit_state(rst: dict) -> None:
     """Collectively-safe explicit release of a streamed refit's resources."""
     source = rst.pop("psi_source", None)
@@ -2807,8 +2790,8 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     GS = _sphere_millers(zx, qw)
     sphere_idx = flat_idx(zx, GS)[None, :]
     n_mu_padded = padded_mu_extent(n_mu, mesh_xy)
-    gflat_acc = _refit_gflat_zeros(
-        n_mu_padded=n_mu_padded, ngk=GS.shape[1], mesh_xy=mesh_xy)
+    gflat_acc = jnp.zeros((1, n_mu_padded, GS.shape[1]), jnp.complex128,
+                          device=NamedSharding(mesh_xy, P(None, ('x', 'y'), None)))
     zeta_b0 = int(rst["window_abs"][0])
     for r0, r1, basis_chunk, psi_parts in iter_galerkin_rchunks(
             rst["psi_source"], rst["basis"], rst["meta"], mesh_xy,

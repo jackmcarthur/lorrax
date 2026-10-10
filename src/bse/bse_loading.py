@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from common.collectives import device_put_process_local
 from runtime.padding import pad_axis, padded_mu_extent
 from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
                                     resolve_band_window)
@@ -212,6 +213,10 @@ def load_bse_data_from_restart_sharded(
     else:
         n_val_pad = int(psi_v_X.shape[1])
         n_cond_pad = int(psi_c_X.shape[1])
+    # Replicated on the mesh: a single-device ε meeting the sharded solver
+    # operands would compile a reshard program per shape.
+    eps_v, eps_c = (device_put_process_local(e, NamedSharding(mesh_xy, P()))
+                    for e in (eps_v, eps_c))
     psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
     psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 

@@ -5043,7 +5043,7 @@ def _protected_residual_norms(H_out, H_in, mask_kn, eigvalsh_kshard):
     Computed on device; only the two scalars reach the host.
     ``eigvalsh_kshard`` Hermitises ``P f P`` before it solves.
     """
-    fp = _masked_residual_mev(H_out, H_in, jnp.asarray(mask_kn, dtype=bool))
+    fp = _masked_residual_mev(H_out, H_in, np.asarray(mask_kn, dtype=bool))
     spec = float(np.abs(np.asarray(eigvalsh_kshard(fp))).max())
     frob = float(jnp.sqrt(jnp.sum(jnp.abs(fp) ** 2)))
     return spec, frob

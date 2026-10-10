@@ -1122,7 +1122,6 @@ def fit_galerkin_basis(
 
 
 _SELECTED_FILL_KERNELS: dict = {}
-_SELECTED_ZERO_KERNELS: dict = {}
 _SKETCH_RANDOM_KERNELS: dict = {}
 _SKETCH_ACCUM_KERNELS: dict = {}
 _SELECTED_PLACE_KERNELS: dict = {}
@@ -1178,26 +1177,6 @@ def _make_selected_fill_kernel(
 
     _SELECTED_FILL_KERNELS[key] = _fill
     return _fill
-
-
-def _make_selected_zero_kernel(
-        *, mesh: Mesh, row_count: int, nspinor: int, r_carrier: int,
-        row_layout):
-    """Cached allocation for one selected-state row carrier."""
-    key = (id(mesh), int(row_count), int(nspinor), int(r_carrier),
-           tuple(row_layout.spec))
-    fn = _SELECTED_ZERO_KERNELS.get(key)
-    if fn is not None:
-        return fn
-
-    @partial(jax.jit, out_shardings=row_layout)
-    def _zeros():
-        return jnp.zeros(
-            (int(row_count), int(nspinor), int(r_carrier)),
-            dtype=jnp.complex128)
-
-    _SELECTED_ZERO_KERNELS[key] = _zeros
-    return _zeros
 
 
 def _make_sketch_random_kernel(
@@ -1333,12 +1312,8 @@ def _build_randomized_state_sketch(
     position = {int(s): i for i, s in enumerate(candidates)}
     r_divisor = spec_divisor(mesh_xy, random_layout.spec, axis=2)
 
-    @partial(jax.jit, out_shardings=NamedSharding(mesh_xy, P(('x', 'y'), None)))
-    def _zeros():
-        return jnp.zeros((p * int(sketch_rows), int(candidate_carrier)),
-                         dtype=jnp.complex128)
-
-    acc = _zeros()
+    acc = jnp.zeros((p * int(sketch_rows), int(candidate_carrier)), jnp.complex128,
+                    device=NamedSharding(mesh_xy, P(('x', 'y'), None)))
     t0 = time.time()
     for group in _state_groups(owner, groups):
         rows, row_k, row_state = source.gather_state_rows(
@@ -1444,9 +1419,8 @@ def _build_selected_rows(
     carriers = [padded_axis(r1 - r0, r_divisor,
                             name="Galerkin selected-row carrier").carrier
                 for r0, r1 in stream.r_chunk_ranges]
-    x_chunks = [_make_selected_zero_kernel(
-        mesh=mesh_xy, row_count=rank_carrier, nspinor=nspinor,
-        r_carrier=c, row_layout=row_layout)() for c in carriers]
+    x_chunks = [jnp.zeros((rank_carrier, nspinor, c), jnp.complex128, device=row_layout)
+                for c in carriers]
     t0 = time.time()
     for group in _state_groups(owner, groups):
         rows, row_k, row_state = source.gather_state_rows(
@@ -1604,9 +1578,8 @@ def iter_galerkin_rchunks(
         r_carrier = padded_axis(
             r1 - r0, r_divisor,
             name="Galerkin iteration real-space carrier").carrier
-        selected_rows = _make_selected_zero_kernel(
-            mesh=mesh_xy, row_count=rank, nspinor=nspinor,
-            r_carrier=r_carrier, row_layout=row_layout)()
+        selected_rows = jnp.zeros((rank, nspinor, r_carrier), jnp.complex128,
+                                  device=row_layout)
         retained = []
         fill = _make_selected_fill_kernel(
             mesh=mesh_xy, row_count=rank, nk=int(meta.nk_tot),
@@ -1760,11 +1733,6 @@ def _build_physical_projection(
     band_carrier = int(source.band_chunk_carrier)
     acc_layout = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
 
-    @partial(jax.jit, out_shardings=acc_layout)
-    def _zeros_partial():
-        return jnp.zeros((p * nk, band_carrier, int(rank_carrier)),
-                         dtype=jnp.complex128)
-
     chunks, acc, current = [], None, None
     t0 = time.time()
     for bc_range, r_idx, psi in source.iter_bandchunks_rchunks(
@@ -1773,7 +1741,9 @@ def _build_physical_projection(
         if bc_range != current:
             if acc is not None:
                 chunks.append(_reduce_projection_partials(acc, mesh_xy))
-            acc, current = _zeros_partial(), bc_range
+            acc = jnp.zeros((p * nk, band_carrier, int(rank_carrier)), jnp.complex128,
+                            device=acc_layout)
+            current = bc_range
         acc = _make_projection_accum_kernel(
             mesh=mesh_xy, nk=nk, band_carrier=band_carrier,
             rank=rank_carrier, nspinor=nspinor,
@@ -1832,16 +1802,12 @@ def _basis_at_nodes_from_selected_chunks(
 
     sample = jax.jit(_sample, in_shardings=(r_layout, rep, rep), out_shardings=rep)
 
-    @partial(jax.jit, out_shardings=rows_layout)
-    def _zeros():
-        return jnp.zeros((rank_carrier, nspinor, n_nodes), dtype=jnp.complex128)
-
     @partial(jax.jit, donate_argnums=(0,),
              in_shardings=(rows_layout, rep, rep), out_shardings=rows_layout)
     def _place(rows, values, destination):
         return rows.at[..., destination].add(values)
 
-    rows = _zeros()
+    rows = jnp.zeros((rank_carrier, nspinor, n_nodes), jnp.complex128, device=rows_layout)
     for chunk, (r0, r1) in zip(x_chunks, stream.r_chunk_ranges):
         for start in range(0, n_nodes, panel):
             count = min(panel, n_nodes - start)

@@ -226,15 +226,14 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
         nb, mesh, name="QSGW head band carrier",
         specs=((P(None, None, "x", None), 2),
                (P(None, None, None, "y"), 3)))
-    nb_padded = band_axis.carrier
-    if nb_padded != nb:
-        pad = nb_padded - nb
+    pad = band_axis.carrier - nb
+    if pad:
         v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
-        e = jnp.pad(e, ((0, 0), (0, pad)))
-        f = jnp.pad(f, ((0, 0), (0, pad)))
-        surface = jnp.pad(surface, ((0, 0), (0, pad)))
     v = device_put_process_local(
         v, NamedSharding(mesh, P(None, None, "x", "y")))
+    # The (k, band) tables stay on the host: a kernel places host operands
+    # without a program, a single-device array beside ``v`` costs a reshard.
+    e, f, surface = (np.pad(np.asarray(a), ((0, 0), (0, pad))) for a in (e, f, surface))
     return v, e, f, surface
 
 

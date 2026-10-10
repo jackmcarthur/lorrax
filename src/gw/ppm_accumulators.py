@@ -30,13 +30,6 @@ def _omega_coefficient(xp, omega, t, alpha, sign, prefactor, e_ref=0.0):
             * xp.exp(-1j * (e_ref - sign * omega) * t))
 
 
-@lru_cache(maxsize=8)
-def _device_output_zeros(shape, sharding):
-    return jax.jit(
-        lambda: jnp.zeros(shape, dtype=jnp.complex128),
-        out_shardings=sharding)
-
-
 def _omega_fold(acc, sigma, coeff, omega_axis):
     """Add one time-domain Sigma matrix to every represented frequency."""
     coeff_shape = ((1,) * omega_axis + (coeff.shape[0],)
@@ -179,7 +172,7 @@ class DeviceOmegaAccumulator:
                     "n_omega")
         # Each rank stores every output frequency and parent-k point for its
         # assigned block of the two band axes.
-        totals = tuple(_device_output_zeros(one, sharding)() for one in shapes)
+        totals = tuple(jnp.zeros(one, jnp.complex128, device=sharding) for one in shapes)
         n_matrix = 1 if reduce is None else len(shape[0])
         self._total = (totals[0] if reduce is None else
                        (totals[:n_matrix], totals[n_matrix:]))

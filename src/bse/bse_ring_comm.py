@@ -219,9 +219,7 @@ def _warm_process_allgather(mesh: Mesh) -> None:
     try:
         from common.collectives import gather_to_host
         n = int(mesh.devices.size)
-        probe = jax.device_put(
-            jnp.zeros(n, dtype=jnp.float64),
-            NamedSharding(mesh, P(tuple(mesh.axis_names))))
+        probe = jnp.zeros(n, jnp.float64, device=NamedSharding(mesh, P(tuple(mesh.axis_names))))
         out = gather_to_host(probe)
         assert out.shape == (n,), out.shape
     except Exception as exc:                      # noqa: BLE001
