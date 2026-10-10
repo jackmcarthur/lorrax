@@ -37,6 +37,7 @@ round-up; do not unify the two.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 from typing import NamedTuple
 
@@ -256,6 +257,39 @@ def jax_slice_axis(A, stop: int, *, axis: int):
     return A[tuple(index)]
 
 
+def _pad_body(A, fill, diagonal, *, logical, carrier, axes):
+    import jax.numpy as jnp
+
+    for ax in axes:
+        source = int(A.shape[ax])
+        if source > carrier:
+            A = jax_slice_axis(A, carrier, axis=ax)
+        elif source < carrier:
+            widths = [(0, 0)] * A.ndim
+            widths[ax] = (0, carrier - source)
+            A = jnp.pad(A, widths, mode="constant", constant_values=fill)
+        shape = [1] * A.ndim
+        shape[ax] = carrier
+        mask = (jnp.arange(carrier) < logical).reshape(shape)
+        A = jnp.where(mask, A, jnp.asarray(fill, dtype=A.dtype))
+    if diagonal is None:
+        return A
+    i = jnp.arange(carrier)
+    diag = jnp.where(i < logical, jnp.diagonal(A, axis1=axes[0], axis2=axes[1]),
+                     jnp.asarray(diagonal, dtype=A.dtype))
+    return A.at[..., i, i].set(diag)
+
+
+@lru_cache(maxsize=None)
+def _pad_program():
+    """One jit for every pad: an eager caller dispatches one program per shapes,
+    shardings and extents instead of one per op, and ``inline=True`` leaves a traced
+    caller's jaxpr as if the ops were written there.  Fill values are arguments."""
+    import jax
+
+    return jax.jit(_pad_body, static_argnames=("logical", "carrier", "axes"), inline=True)
+
+
 def pad_to_axis(A, tag: PaddedAxis, *, axis: int = -1, fill: float = 0.0):
     """Normalize ``A`` to ``tag.carrier`` along ``axis``.
 
@@ -265,26 +299,16 @@ def pad_to_axis(A, tag: PaddedAxis, *, axis: int = -1, fill: float = 0.0):
     This ordering never publishes a non-mesh-divisible logical-width
     intermediate when the source and destination are both legal carriers.
     """
-    import jax.numpy as jnp
-
     ax = int(axis) % int(A.ndim)
     source = int(A.shape[ax])
     if source < tag.logical:
         raise ValueError(
             f"{tag.name}: logical extent {tag.logical} exceeds source carrier "
             f"extent {source} on axis {ax}")
-    if source > tag.carrier:
-        A = jax_slice_axis(A, tag.carrier, axis=ax)
-    elif source < tag.carrier:
-        widths = [(0, 0)] * A.ndim
-        widths[ax] = (0, tag.carrier - source)
-        A = jnp.pad(A, widths, mode="constant", constant_values=fill)
     if not tag.pad:
-        return A
-    shape = [1] * A.ndim
-    shape[ax] = tag.carrier
-    mask = axis_mask(tag).reshape(shape)
-    return jnp.where(mask, A, jnp.asarray(fill, dtype=A.dtype))
+        return A if source == tag.carrier else jax_slice_axis(A, tag.carrier, axis=ax)
+    return _pad_program()(A, fill, None, logical=tag.logical, carrier=tag.carrier,
+                          axes=(ax,))
 
 
 def pad_square(
@@ -302,29 +326,22 @@ def pad_square(
     eigensolver sentinels; off-diagonal coupling to the logical block remains
     exactly zero.
     """
-    import jax.numpy as jnp
-
     left, right = (int(a) % int(A.ndim) for a in axes)
     if int(A.shape[left]) < tag.logical or int(A.shape[right]) < tag.logical:
         raise ValueError(
             f"{tag.name}: logical square extent {tag.logical} exceeds source "
             f"carrier shape {tuple(int(n) for n in A.shape)} on axes "
             f"{(left, right)}")
-    out = pad_to_axis(A, tag, axis=left, fill=fill)
-    out = pad_to_axis(out, tag, axis=right, fill=fill)
-    if pad_diagonal is not None and tag.pad:
-        i = jnp.arange(tag.carrier)
-        diag = jnp.where(i < tag.logical, jnp.diagonal(
-            out, axis1=left, axis2=right), jnp.asarray(
-                pad_diagonal, dtype=out.dtype))
-        # Matrix axes are trailing at every current consumer.  Refuse a future
-        # non-trailing spelling rather than inventing a second scatter rule.
-        if (left, right) != (out.ndim - 2, out.ndim - 1):
-            raise ValueError(
-                f"{tag.name}: pad_diagonal requires trailing matrix axes; "
-                f"got {(left, right)} for rank {out.ndim}")
-        out = out.at[..., i, i].set(diag)
-    return out
+    if not tag.pad:
+        return pad_to_axis(pad_to_axis(A, tag, axis=left), tag, axis=right)
+    # Matrix axes are trailing at every current consumer.  Refuse a future
+    # non-trailing spelling rather than inventing a second scatter rule.
+    if pad_diagonal is not None and (left, right) != (A.ndim - 2, A.ndim - 1):
+        raise ValueError(
+            f"{tag.name}: pad_diagonal requires trailing matrix axes; "
+            f"got {(left, right)} for rank {A.ndim}")
+    return _pad_program()(A, fill, pad_diagonal, logical=tag.logical, carrier=tag.carrier,
+                          axes=(left, right))
 
 
 def strip_axis(A, tag: PaddedAxis, *, axis: int = -1):

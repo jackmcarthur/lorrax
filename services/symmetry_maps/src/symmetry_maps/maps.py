@@ -328,13 +328,17 @@ def build_spatial_operator_tables(wfn) -> SpatialOperatorTables:
     )
 
 
-def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
-    """Slice a ``(n_q_full, ...)`` array to its IBZ rows; see docs/architecture/symmetry_register.md."""
-    idx = jnp.asarray(np.asarray(q_irr_full_idx, dtype=np.int32))
+@partial(jax.jit, static_argnames=("out_sharding",), inline=True)
+def _ibz_rows(arr_full, idx, out_sharding):
     out = arr_full[idx]
-    if out_sharding is not None:
-        out = jax.lax.with_sharding_constraint(out, out_sharding)
-    return out
+    return out if out_sharding is None else jax.lax.with_sharding_constraint(out, out_sharding)
+
+
+def slice_q_full_to_ibz(arr_full, q_irr_full_idx, *, out_sharding=None):
+    """Slice a ``(n_q_full, ...)`` array to its IBZ rows; see docs/architecture/symmetry_register.md.
+
+    One program per shapes and shardings: the rows enter as a host argument."""
+    return _ibz_rows(arr_full, np.asarray(q_irr_full_idx, dtype=np.int32), out_sharding)
 
 
 def unfold_isdf_operator(

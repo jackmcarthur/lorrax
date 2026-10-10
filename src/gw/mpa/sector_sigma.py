@@ -18,7 +18,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
-from runtime.padding import pad_to_axis
+from runtime.padding import pad_square, pad_to_axis
 from gw.wavefunction_bundle import parent_sigma_operands
 from .sigma import SynthesisTau, WSynthesis, _admit, _static_key
 
@@ -850,7 +850,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
             currents[channel]=currents[channel]+hermitian
     # Static band axes use the same carrier as dynamic Sigma; pad only through
     # the existing semantic band-axis owner before broadcasting in omega.
-    constant=pad_to_axis(pad_to_axis(constant,total.band_axis,axis=1),total.band_axis,axis=2)
+    constant=pad_square(constant,total.band_axis,axes=(1,2))
     result=replace(total,sigma_c_kij=total.sigma_c_kij+constant[None])
     if counts is not None:
         # TT, CT, TC and W∞ − V enter every CC count alike.
@@ -858,29 +858,41 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     return (result, tuple(currents)) if on_shell is not None else result
 
 
+@lru_cache(maxsize=None)
+def _unfold_rows_program(mesh_xy, na, nb, conj_trs, spin_l, spin_r):
+    """The parent pair through placed load tables (arguments, so no table constants), keyed
+    on the endpoint widths, the TRS arm and the spin actions' structural zeros."""
+    from symmetry_maps import DEVICE_LOAD_SPECS, UnfoldLoadTables, apply_unfold_load_tables_local
+    from jax import shard_map
+    spin_l, spin_r = np.asarray(spin_l)[None], np.asarray(spin_r)[None]
+
+    def local(w, wt, *load):
+        t = UnfoldLoadTables(*load[:7], n_parent=int(w.shape[0]), mesh_shape=None,
+                             conj_trs=conj_trs, spin_r=load[7])
+        flat = lambda a: a.reshape(a.shape[0], a.shape[1] * na, a.shape[3] * nb)
+        O = apply_unfold_load_tables_local(flat(w), flat(wt), t, spin_l, spin_r)
+        return O.reshape(O.shape[0], O.shape[1] * na, O.shape[3] * nb)
+    spec = P(None, 'x', None, 'y', None)
+    return jax.jit(shard_map(local, mesh=mesh_xy, in_specs=(spec, spec, *DEVICE_LOAD_SPECS),
+                             out_specs=P(None, 'x', 'y'), check_vma=False))
+
+
 def _unfold_w_rows(W, Wt, tables, rows, mesh_xy):
     """``(len(rows), m*nA, n*nB)`` at ``P(None,'x','y')``: the parent pair through ``tables``
     at the full-q rows ``rows`` only (the service's reference unfold, on each rank's
     tiles).  Every per-q table is cut to those rows, so no full-q tile is formed."""
-    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
-    from jax import shard_map
+    from symmetry_maps import device_load_tables
     rows = np.asarray(rows, np.int64)
     tables = tables._replace(
         row=tables.row[rows], trs=tables.trs[rows], lsrc=tables.lsrc[rows],
         rsrc=tables.rsrc[rows], mph=tables.mph[rows], nph=tables.nph[rows],
         spin=tables.spin[rows], spin_r=None if tables.spin_r is None else tables.spin_r[rows])
-    na, nb = int(W.shape[2]), int(W.shape[4])
-    spin_l = np.asarray(tables.spin)
-    spin_r = None if tables.spin_r is None else np.asarray(tables.spin_r)
-
-    def local(w, wt):
-        t = local_unfold_load_tables(tables)
-        flat = lambda a: a.reshape(a.shape[0], a.shape[1] * na, a.shape[3] * nb)
-        O = apply_unfold_load_tables_local(flat(w), flat(wt), t, spin_l, spin_r)
-        return O.reshape(O.shape[0], O.shape[1] * na, O.shape[3] * nb)
-    spec = P(None, 'x', None, 'y', None)
-    return shard_map(local, mesh=mesh_xy, in_specs=(spec, spec), out_specs=P(None, 'x', 'y'),
-                     check_vma=False)(W, Wt)
+    nonzero = lambda s: tuple(tuple(bool(v) for v in r)
+                              for r in np.any(np.asarray(s) != 0, axis=0))
+    program = _unfold_rows_program(
+        mesh_xy, int(W.shape[2]), int(W.shape[4]), int(tables.conj_trs), nonzero(tables.spin),
+        nonzero(tables.spin if tables.spin_r is None else tables.spin_r))
+    return program(W, Wt, *device_load_tables(tables, mesh_xy))
 
 
 def sector_static_wc(handle, meta, *, mesh_xy, rows):

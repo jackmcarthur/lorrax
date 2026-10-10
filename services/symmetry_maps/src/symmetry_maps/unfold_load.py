@@ -225,15 +225,17 @@ def apply_unfold_load_tables_local(G, Gt, t: UnfoldLoadTables, spin_host, spin_r
 
     ``G``/``Gt`` ``(n_parent, mx*ns, my*nr)`` are this rank's parent tiles
     (``Gt`` unread on the conj arm) and ``t`` holds this rank's slices
-    (inside a ``shard_map``); ``spin_host`` / ``spin_r_host`` are the left /
-    right actions on the host (the rotation skips their structural zeros;
-    ``None`` right = the left).  The reference composition of the fused
-    kernels, and their cpu leg.
+    (inside a ``shard_map``), the spin actions ``t.spin`` / ``t.spin_r``
+    included; ``spin_host`` / ``spin_r_host`` give only the left / right
+    widths and structural zeros, which the rotation skips (``None`` right =
+    the left).  Values come from ``t``, so placed tables leave no constants
+    in the program.  The reference composition of the fused kernels, and
+    their cpu leg.
     """
-    from symmetry_maps.maps import _rotate_open_spin_centroid_operator
     n_par, ml, nl = (int(v) for v in G.shape)
-    ns = int(np.asarray(spin_host).shape[-1])
-    nr = ns if spin_r_host is None else int(np.asarray(spin_r_host).shape[-1])
+    spin_l = np.asarray(spin_host)
+    spin_r = spin_l if spin_r_host is None else np.asarray(spin_r_host)
+    ns, nr = int(spin_l.shape[-1]), int(spin_r.shape[-1])
     if t.conj_trs:
         src = G[t.row]
     else:
@@ -247,15 +249,15 @@ def apply_unfold_load_tables_local(G, Gt, t: UnfoldLoadTables, spin_host, spin_r
         V = jnp.where((t.trs != 0)[:, None, None], jnp.conj(V), V)
     V = jnp.where((t.lsrc >= 0)[:, :, None] & (t.rsrc >= 0)[:, None, :], V, 0)
     spatial = V.reshape(V.shape[0], ml // ns, ns, nl // nr, nr)
-    if spin_r_host is None:
-        return _rotate_open_spin_centroid_operator(spatial, np.asarray(spin_host))
-    return _rotate_endpoints(spatial, np.asarray(spin_host), np.asarray(spin_r_host))
+    return _rotate_endpoints(spatial, t.spin, t.spin if spin_r_host is None else t.spin_r,
+                             spin_l, spin_r)
 
 
-def _rotate_endpoints(spatial, spin_l, spin_r):
-    """``L O R^dagger`` on centroid-major ``(k, mu, a, nu, b)``: the two-width form of
-    :func:`maps._rotate_open_spin_centroid_operator` (same sum order, same zero skips)."""
-    L, R = jnp.asarray(spin_l), jnp.asarray(spin_r)
+def _rotate_endpoints(spatial, L, R, spin_l, spin_r):
+    """``L O R^dagger`` on centroid-major ``(k, mu, a, nu, b)``, skipping the entries that are
+    zero in the host ``spin_l`` / ``spin_r``: :func:`maps._rotate_open_spin_centroid_operator`'s
+    sum order and zero skips, with two widths."""
+    L, R = jnp.asarray(L), jnp.asarray(R)
     nl_s, nr_s = int(spatial.shape[2]), int(spatial.shape[4])
     left = jnp.stack([sum(L[:, a, c, None, None, None] * spatial[:, :, c]
                          for c in range(nl_s) if np.any(spin_l[:, a, c] != 0))
