@@ -447,17 +447,11 @@ X64_OVERRIDE_ENV = "LORRAX_ALLOW_X64_OFF"
 _XLA_FLAGS_ENV = "XLA_FLAGS"
 _XLA_GPU_AUTOTUNE_FLAG = "--xla_gpu_autotune_level"
 _XLA_GPU_AUTOTUNE_DEFAULT = "0"
-#: XLA splits each module's LLVM IR and compiles the parts in parallel.  The
-#: same site, the same rule (a caller's value wins), measured 2026-10-10 on
-#: main fe3ac4cad, every result bitwise and the device peak unchanged:
-#: P4 hsuite release-cold 366.8 -> 343.8 s (XLA compile 219.5 -> 195.2 s;
-#: programs >= 0.5 s -22 %, under 50 ms +10 %); CrI3 6x6 bispinor SC forced
-#: face map 0 compile 156.6 -> 134.3 s, map 1 52.7 -> 43.1 s, device peak
-#: 44.76 GB both; Fe 4^3 map 0 154.5 -> 133.6 s, map 2 53.0 -> 42.4 s, device
-#: peak 21.70 GB both; host peak +0.3-0.4 GB.  It is the flag JAX itself sets
-#: beside its kernel cache (jax/_src/compiler.py), not
+#: XLA compiles each module's LLVM IR in parallel parts; the same merge and
+#: the same rule as the autotune level (a caller's value wins), results bitwise
+#: and the device peak unchanged (sandbox claim 4179).  Not
 #: ``--xla_gpu_force_compilation_parallelism``, which forces a thread count
-#: and raised Si device memory 4.4 -> 25.5 GB (sandbox claim 683).
+#: and raised device memory (claim 683).
 _XLA_GPU_LLVM_PARALLEL_FLAG = "--xla_gpu_enable_llvm_module_compilation_parallelism"
 _XLA_GPU_LLVM_PARALLEL_DEFAULT = "true"
 
@@ -500,14 +494,12 @@ def _xla_flag_value(raw: str, flag: str) -> str | None:
 def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
     """Merge LORRAX's two measured GPU compile flags into ``XLA_FLAGS``.
 
-    ``--xla_gpu_autotune_level=0``: the cold P=4 compile matrix measured
-    level 0 12.9% faster for kmeans and 16.3% faster for the Si MPA Sigma
-    one-shot, with execution inside run-to-run noise (sandbox claims
-    683--684).  ``--xla_gpu_enable_llvm_module_compilation_parallelism=true``:
-    the module's LLVM IR compiles in parallel parts, -11 % XLA compile on the
-    P4 hsuite and -14 to -20 % per SC map on CrI3 6x6 and Fe 4^3, bitwise,
-    device peak unchanged (:data:`_XLA_GPU_LLVM_PARALLEL_FLAG`).  Both are
-    GPU-only XLA flags: a forced CPU startup leaves ``XLA_FLAGS``
+    ``--xla_gpu_autotune_level=0`` (sandbox claims 683--684: cold compile
+    shorter, execution inside run-to-run noise) and
+    ``--xla_gpu_enable_llvm_module_compilation_parallelism=true`` (claim
+    4179: each module's LLVM IR compiles in parallel parts, results bitwise,
+    device peak unchanged; ``docs/reference/env_vars.md`` holds the numbers).
+    Both are GPU-only XLA flags: a forced CPU startup leaves ``XLA_FLAGS``
     byte-for-byte unchanged so the host/FFTW chain never depends on a GPU
     parser accepting them.
 

@@ -14,7 +14,7 @@ by flag; a CPU startup is untouched. Measured on main fe3ac4cad with every
 result bitwise and the device peak unchanged: the P4 hsuite's release-cold
 wall 366.8 → 343.8 s (XLA compile 219.5 → 195.2 s), CrI3 6×6 bispinor SC
 forced face map 0 compile 156.6 → 134.3 s, Fe 4³ map 0 154.5 → 133.6 s; host
-peak +0.3–0.4 GB. The startup report names both flags and their provenance.
+peak +0.3–0.4 GB (sandbox claim 4179). The startup report names both flags and their provenance.
 To opt out: export `XLA_FLAGS=--xla_gpu_enable_llvm_module_compilation_parallelism=false`.
 No deck change.
 
