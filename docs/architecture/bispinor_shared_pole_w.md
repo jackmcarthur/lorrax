@@ -393,12 +393,12 @@ go to files. Residence saves 5–8 % of a map on CrI3 6×6 at P4 (claim 3988).
 
 **Static W for BSE.** `write_restart_tensors = true` stores
 $W_0 = V + W_{c,CC}(0)$ from the CC model alone (`sector_static_wc`,
-`src/gw/mpa/sector_sigma.py:898`), both branches of the parent pair at V's q
+`src/gw/mpa/sector_sigma.py:902`), both branches of the parent pair at V's q
 parents, unfolded on load by BSE ([BSE](bse.md)).
 
 ## 7 The Σ consumer {#sector-sigma}
 
-`compute_sector_sigma` (`src/gw/mpa/sector_sigma.py:727`) is called once per Σ
+`compute_sector_sigma` (`src/gw/mpa/sector_sigma.py:731`) is called once per Σ
 evaluation. For one endpoint class the band-basis self-energy is
 
 $$
@@ -418,13 +418,13 @@ convolution. The class's vertices form one product $A\text{-set}\times B\text{-s
 that order, each through the scalar frequency-quadrature executor
 (`gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`). The Σ rule set is planned once per
 map on the union of the CC, TT and CT pole sets. The mixed pair is one fused window
-(`fused_mixed_tau_factory`, `:456`): CT's W pair is synthesized once per τ node, TC's
+(`fused_mixed_tau_factory`, `:461`): CT's W pair is synthesized once per τ node, TC's
 is its transposed pair (one X↔Y exchange), and both contractions run in the same
 loop trip (claim 3289). Each sector window runs one τ node per loop trip.
 
 **Per τ node:**
 
-1. **W(τ) on the irreducible q.** `sector_synthesis` (`:505`) reads the class's
+1. **W(τ) on the irreducible q.** `sector_synthesis` (`:510`) reads the class's
    factors once per Σ call on the store's parent rows and never unfolds them. Each
    τ forms (S 1) and its partner through the scalar W(τ) owner
    (`synthesize_shared_pole_parents`, via `_w_program`, `:169`), in one panel of
@@ -432,7 +432,8 @@ loop trip (claim 3289). Each sector window runs one τ node per loop trip.
    $W^{\mathsf T}$; on the mixed sector it is the same contraction on the
    conjugate factors. The hole branch
    (S 2) reads the same pair through q-negated load tables (`hole_tables`, `:149`),
-   so no $-q$ gather and no conjugated weight is formed. No full-q W exists.
+   so no $-q$ gather and no conjugated weight is formed. The window passes its
+   branch's tables as operands, so both branches run one window program. No full-q W exists.
 2. **Row passes.** `sector_node` (`:211`) runs each rank's $(\mu_X, \nu_Y)$ tile in
    passes of whole centroid orbits. The pass size comes from the fixed tile
    `runtime.tiles.TILE_BYTES` and the shapes (`gw.subtile_stream.plan_windows`), so
@@ -448,7 +449,7 @@ loop trip (claim 3289). Each sector window runs one τ node per loop trip.
 
 **The constant.** $U - V$ is read and packed on its irreducible q, in parent-q
 panels when the raw and packed copies exceed one tile, and contracted once with
-the equal-time occupied projector (`instantaneous_sector_sigma`, `:648`). The bare
+the equal-time occupied projector (`instantaneous_sector_sigma`, `:652`). The bare
 exchange Σ_x is its own owner's ([four-current wiring](four_current_wiring.md)).
 
 **The Γ head.**

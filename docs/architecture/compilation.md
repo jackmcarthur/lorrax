@@ -217,7 +217,6 @@ compile from inside, and threads overlap whole compiles.
 | lever | state | expected | claim |
 |---|---|---|---|
 | `compile_ahead`: lower on the calling thread in program order, take the agreement slot there, compile on a pool of min(8, physical cores) threads | branch `perf/parcomp-20261010` `0478adf95`, owner decision. Bitwise; one site (the bank's $V^{1/2}$): 368.2 / 146.0 s against 370.8 / 146.1 s, cold / warm | seven more sites, about −25 to −35 s cold, 120–150 lines | 4180 |
-| nested `with mesh:` blocks | 138 of the 729 same-stage re-lowerings differ only in the mesh stack, from 30 sites; they re-trace 1412 calls | one `with mesh` per driver removes them | 4169 |
 | the three uncacheable programs | compile in every process | removing their host callbacks | 4139 |
 | the largest families | distinct by physics: χ integrate's 11 programs (the four-current family blocks and node sets), the MPA window runner's 4 bisp_sc programs (the sectors' pole-panel widths), the shared-pole rounds (one per sector). Merging their shapes adds masked work | none | 4155 |
 
