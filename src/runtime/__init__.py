@@ -447,6 +447,19 @@ X64_OVERRIDE_ENV = "LORRAX_ALLOW_X64_OFF"
 _XLA_FLAGS_ENV = "XLA_FLAGS"
 _XLA_GPU_AUTOTUNE_FLAG = "--xla_gpu_autotune_level"
 _XLA_GPU_AUTOTUNE_DEFAULT = "0"
+#: XLA splits each module's LLVM IR and compiles the parts in parallel.  The
+#: same site, the same rule (a caller's value wins), measured 2026-10-10 on
+#: main fe3ac4cad, every result bitwise and the device peak unchanged:
+#: P4 hsuite release-cold 366.8 -> 343.8 s (XLA compile 219.5 -> 195.2 s;
+#: programs >= 0.5 s -22 %, under 50 ms +10 %); CrI3 6x6 bispinor SC forced
+#: face map 0 compile 156.6 -> 134.3 s, map 1 52.7 -> 43.1 s, device peak
+#: 44.76 GB both; Fe 4^3 map 0 154.5 -> 133.6 s, map 2 53.0 -> 42.4 s, device
+#: peak 21.70 GB both; host peak +0.3-0.4 GB.  It is the flag JAX itself sets
+#: beside its kernel cache (jax/_src/compiler.py), not
+#: ``--xla_gpu_force_compilation_parallelism``, which forces a thread count
+#: and raised Si device memory 4.4 -> 25.5 GB (sandbox claim 683).
+_XLA_GPU_LLVM_PARALLEL_FLAG = "--xla_gpu_enable_llvm_module_compilation_parallelism"
+_XLA_GPU_LLVM_PARALLEL_DEFAULT = "true"
 
 #: Receipt captured at the ONE interpretation site below.  Startup reporting
 #: consumes this record; it must not re-parse ``XLA_FLAGS`` and risk printing
@@ -454,6 +467,8 @@ _XLA_GPU_AUTOTUNE_DEFAULT = "0"
 _XLA_GPU_AUTOTUNE = {
     "value": None,
     "provenance": "runtime.set_default_env has not run",
+    "llvm_parallel": None,
+    "llvm_parallel_provenance": "runtime.set_default_env has not run",
     "applicable": None,
     "xla_flags": None,
 }
@@ -483,49 +498,61 @@ def _xla_flag_value(raw: str, flag: str) -> str | None:
 
 
 def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
-    """Merge LORRAX's measured GPU autotune level into ``XLA_FLAGS``.
+    """Merge LORRAX's two measured GPU compile flags into ``XLA_FLAGS``.
 
-    The cold P=4 compile matrix measured ``level=0`` 12.9% faster for kmeans
-    and 16.3% faster for the Si MPA Sigma one-shot, with execution inside
-    run-to-run noise (sandbox claims 683--684).  This is a GPU-only XLA flag:
-    a forced CPU startup leaves ``XLA_FLAGS`` byte-for-byte unchanged so the
-    host/FFTW chain never depends on a GPU parser accepting it.
+    ``--xla_gpu_autotune_level=0``: the cold P=4 compile matrix measured
+    level 0 12.9% faster for kmeans and 16.3% faster for the Si MPA Sigma
+    one-shot, with execution inside run-to-run noise (sandbox claims
+    683--684).  ``--xla_gpu_enable_llvm_module_compilation_parallelism=true``:
+    the module's LLVM IR compiles in parallel parts, -11 % XLA compile on the
+    P4 hsuite and -14 to -20 % per SC map on CrI3 6x6 and Fe 4^3, bitwise,
+    device peak unchanged (:data:`_XLA_GPU_LLVM_PARALLEL_FLAG`).  Both are
+    GPU-only XLA flags: a forced CPU startup leaves ``XLA_FLAGS``
+    byte-for-byte unchanged so the host/FFTW chain never depends on a GPU
+    parser accepting them.
 
-    Caller policy always wins.  If either accepted spelling is already
-    present, this function neither rewrites nor appends anything and records
-    the last value as caller provenance.  Otherwise it appends exactly one
-    ``--xla_gpu_autotune_level=0`` token, preserving every unrelated flag.
-    The returned dict is a copy of the receipt the startup report consumes.
+    Caller policy always wins, flag by flag.  A flag already present in
+    either accepted spelling is neither rewritten nor appended, and its last
+    value is recorded as caller provenance; a missing one is appended as
+    exactly one token, preserving every unrelated flag.  The returned dict is
+    a copy of the receipt the startup report consumes.
     """
     if platform not in ("gpu", "cpu"):
         raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
 
     raw = os.environ.get(_XLA_FLAGS_ENV, "")
     supplied = _xla_flag_value(raw, _XLA_GPU_AUTOTUNE_FLAG)
+    supplied_llvm = _xla_flag_value(raw, _XLA_GPU_LLVM_PARALLEL_FLAG)
     if platform == "cpu":
+        def _inactive(given):
+            return ("caller-supplied XLA_FLAGS; GPU-only and inactive on this "
+                    "forced CPU startup" if given is not None else
+                    "not applied: forced CPU startup")
         _XLA_GPU_AUTOTUNE.update({
             "value": supplied,
-            "provenance": (
-                "caller-supplied XLA_FLAGS; GPU-only and inactive on this "
-                "forced CPU startup" if supplied is not None else
-                "not applied: forced CPU startup"),
+            "provenance": _inactive(supplied),
+            "llvm_parallel": supplied_llvm,
+            "llvm_parallel_provenance": _inactive(supplied_llvm),
             "applicable": False,
             "xla_flags": os.environ.get(_XLA_FLAGS_ENV),
         })
         return dict(_XLA_GPU_AUTOTUNE)
 
+    default = "LORRAX default (runtime.set_default_env)"
+    caller = "caller-supplied XLA_FLAGS"
+    additions = []
     if supplied is None:
-        addition = f"{_XLA_GPU_AUTOTUNE_FLAG}={_XLA_GPU_AUTOTUNE_DEFAULT}"
-        merged = f"{raw} {addition}".strip() if raw else addition
-        os.environ[_XLA_FLAGS_ENV] = merged
-        value = _XLA_GPU_AUTOTUNE_DEFAULT
-        provenance = "LORRAX default (runtime.set_default_env)"
-    else:
-        value = supplied
-        provenance = "caller-supplied XLA_FLAGS"
+        additions.append(f"{_XLA_GPU_AUTOTUNE_FLAG}={_XLA_GPU_AUTOTUNE_DEFAULT}")
+    if supplied_llvm is None:
+        additions.append(f"{_XLA_GPU_LLVM_PARALLEL_FLAG}={_XLA_GPU_LLVM_PARALLEL_DEFAULT}")
+    if additions:
+        os.environ[_XLA_FLAGS_ENV] = " ".join(([raw] if raw else []) + additions)
     _XLA_GPU_AUTOTUNE.update({
-        "value": value,
-        "provenance": provenance,
+        "value": _XLA_GPU_AUTOTUNE_DEFAULT if supplied is None else supplied,
+        "provenance": default if supplied is None else caller,
+        "llvm_parallel": (_XLA_GPU_LLVM_PARALLEL_DEFAULT if supplied_llvm is None
+                          else supplied_llvm),
+        "llvm_parallel_provenance": default if supplied_llvm is None else caller,
         "applicable": True,
         "xla_flags": os.environ.get(_XLA_FLAGS_ENV),
     })
@@ -2890,8 +2917,10 @@ def format_startup_report(f: dict) -> list:
     _at = f.get("xla_gpu_autotune") or {}
     if _at.get("applicable"):
         add(f"  XLA GPU autotuning resolved to level {_at.get('value')!r} "
-            f"from {_at.get('provenance')}; the complete resolved XLA_FLAGS "
-            f"value is {_at.get('xla_flags')!r}.")
+            f"from {_at.get('provenance')}; LLVM module compilation "
+            f"parallelism resolved to {_at.get('llvm_parallel')!r} from "
+            f"{_at.get('llvm_parallel_provenance')}; the complete resolved "
+            f"XLA_FLAGS value is {_at.get('xla_flags')!r}.")
     else:
         add(f"  The XLA GPU autotune level is not active: "
             f"{_at.get('provenance', 'runtime.set_default_env has not run')}; "
@@ -3235,7 +3264,9 @@ def format_production_startup_report(f: dict) -> list:
     if autotune.get("applicable"):
         autotune_text = (
             f"XLA GPU autotune={autotune.get('value')} "
-            f"({autotune.get('provenance')})")
+            f"({autotune.get('provenance')}) | LLVM module parallelism="
+            f"{autotune.get('llvm_parallel')} "
+            f"({autotune.get('llvm_parallel_provenance')})")
     else:
         autotune_text = "XLA GPU autotune inactive"
     compile_cache = f.get("compile_cache") or {}

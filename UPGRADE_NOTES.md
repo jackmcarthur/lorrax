@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-10 — `--xla_gpu_enable_llvm_module_compilation_parallelism=true` is a runtime default
+
+`runtime.set_default_xla_gpu_autotune` now merges a second GPU compile flag
+into `XLA_FLAGS` beside `--xla_gpu_autotune_level=0`: XLA compiles each
+module's LLVM IR in parallel parts. A caller's value of either flag wins, flag
+by flag; a CPU startup is untouched. Measured on main fe3ac4cad with every
+result bitwise and the device peak unchanged: the P4 hsuite's release-cold
+wall 366.8 → 343.8 s (XLA compile 219.5 → 195.2 s), CrI3 6×6 bispinor SC
+forced face map 0 compile 156.6 → 134.3 s, Fe 4³ map 0 154.5 → 133.6 s; host
+peak +0.3–0.4 GB. The startup report names both flags and their provenance.
+To opt out: export `XLA_FLAGS=--xla_gpu_enable_llvm_module_compilation_parallelism=false`.
+No deck change.
+
 ## 2026-10-09 — `tests/hsuite` uses the runtime's compile cache and reports a per-stage compile census
 
 With `HSUITE_CACHE_DIR` unset, the suite no longer points `ISDF_JAX_CACHE_DIR`
