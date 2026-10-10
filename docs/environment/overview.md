@@ -109,6 +109,16 @@ dtype, is unaffected.
 **Compile cache.** One owner, `common.jax_compile_cache`; the directory
 resolution and controls are in [`env_vars.md` §2e](../reference/env_vars.md#2e-compile-cache). The
 persistent key includes every array shape, so a new system size misses.
+The same module owns `compile_ahead(program, *args)`: a stage owner that
+knows a program's shapes before its first call (the response bank's
+V^(1/2) from the packed V's aval, for example) lowers it there, on the
+calling thread in program order, and XLA compiles it on one of at most
+eight helper threads while the driver goes on; the live call finds the
+executable or waits for the compile in flight, never compiling twice. The
+agreement slot is taken on the calling thread, so ranks keep one request
+order. Measured on the P4 hsuite's 75 largest programs (one A100 node,
+four ranks compiling at once): 104 s serially, 29 s at four threads, 16 s
+at eight.
 
 ### 2.1 The GPU memory pool {#gpu-pool}
 
