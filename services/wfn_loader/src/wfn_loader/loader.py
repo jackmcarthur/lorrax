@@ -1377,26 +1377,24 @@ class WfnLoader:
 
         Steps (the slab-io process-local idiom, written once):
 
-          1. Materialise a cheap sharded zero proto via the lru-cached
-             :func:`_sharded_zero_proto_fn` (each device makes only its
-             own zero shard; compiles ONCE per (shape, dtype, sharding)
-             signature — no per-call lambda re-lowering).
-          2. ``_local_shard_and_global_offset`` reports the local slab's
-             shape + global offset.
-          3. Validate that ONLY ``sharded_axis`` is sharded — a stray
+          1. The sharding gives this rank's slab (one addressable device
+             per process): its global offset and shape, with no array.
+          2. Validate that ONLY ``sharded_axis`` is sharded — a stray
              non-band spec fails loud rather than silently wrong.
-          4. ``fill_local(axis_offset, local_shape) -> np.ndarray``
+          3. ``fill_local(axis_offset, local_shape) -> np.ndarray``
              builds the rank's host block (caller owns zero-fill of pad
              rows / past-EOF rows).
-          5. ``jax.make_array_from_single_device_arrays`` assembles the
+          4. ``jax.make_array_from_single_device_arrays`` assembles the
              global array — no rank materialises the full host slab.
         """
-        from ._collectives import _local_shard_and_global_offset
         global_shape = tuple(int(s) for s in global_shape)
-        proto = _sharded_zero_proto_fn(global_shape, dtype, sharding)()
-        local_zero, offset = _local_shard_and_global_offset(proto)
-        local_shape = tuple(int(x) for x in local_zero.shape)
-        del proto, local_zero
+        indices = list(sharding.addressable_devices_indices_map(global_shape).values())
+        if len(indices) != 1:
+            raise RuntimeError(
+                f"process-local load expects 1 addressable device per process; "
+                f"got {len(indices)} for global {global_shape}.")
+        offset = tuple(0 if s.start is None else int(s.start) for s in indices[0])
+        local_shape = tuple(int(x) for x in sharding.shard_shape(global_shape))
         if any(
             ax != sharded_axis
             and (int(offset[ax]) != 0 or local_shape[ax] != global_shape[ax])
@@ -1993,9 +1991,9 @@ class WfnLoader:
     ) -> jax.Array:
         """(§5b) Process-local eager load: each rank builds only its band shard.
 
-        Runs on the shared :meth:`_assemble_process_local` scaffold (cached
-        sharded-zero proto → ``_local_shard_and_global_offset`` → per-rank
-        host build → ``jax.make_array_from_single_device_arrays``) so no rank
+        Runs on the shared :meth:`_assemble_process_local` scaffold (the
+        sharding's own slab → per-rank host build →
+        ``jax.make_array_from_single_device_arrays``) so no rank
         allocates the full (n_k, nb_padded, ns, ngkmax) host array.  The only
         WFN-specific part is the symmetry unfold, which stays in ``_eager_build``.
 
@@ -2208,25 +2206,6 @@ def _bispinor_lift_kernel(
     """
     return _get_bispinor_lift_jit(sharding, str(representation).strip().lower())(
         psi_2, gvecs, kvecs, bvec_cart_bohr)
-
-
-# ---------------------------------------------------------------------------
-# Sharded-zero proto factory (module-level so the JIT cache survives
-# across ``load()`` calls; used by the host union read to learn which
-# band block THIS rank owns without re-lowering a fresh lambda per call)
-# ---------------------------------------------------------------------------
-@functools.lru_cache(maxsize=None)
-def _sharded_zero_proto_fn(global_shape: tuple, dtype, sharding):
-    """A cached jitted ``() -> zeros(global_shape) @ sharding``.
-
-    Keyed by (shape, dtype, sharding) so it compiles exactly once per
-    signature.  Each device materialises only its own zero shard — no
-    full host/device allocation — and JAX's ``.addressable_shards`` then
-    reports the local slab's global offset, which is how the host read
-    discovers its band block for ``make_array_from_single_device_arrays``.
-    """
-    return jax.jit(lambda: jnp.zeros(global_shape, dtype=dtype),
-                   out_shardings=sharding)
 
 
 # ---------------------------------------------------------------------------

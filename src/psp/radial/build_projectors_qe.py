@@ -23,6 +23,7 @@ import os
 import numpy as np
 from typing import Dict, Tuple, List, Sequence, Mapping
 
+import jax
 import jax.numpy as jnp
 
 from common.fft_helpers import local_fftn3, local_ifftn3  # 3-D fields: all three axes
@@ -559,8 +560,13 @@ def build_local_ionic_potential_on_G_total(
 
     # Total to real
     V_tot = Vloc_G_sr + Vloc_G_lr
-    V_r = jnp.real(local_ifftn3(jnp.asarray(V_tot), norm='ortho'))
-    return jnp.asarray(V_r, dtype=jnp.float64)
+    return _real_ifftn(V_tot)
+
+
+@jax.jit
+def _real_ifftn(v):
+    """The real part of the orthonormal 3-D inverse FFT: one program per grid."""
+    return jnp.real(local_ifftn3(v, norm='ortho'))
 
 # --------------------------
 # α^{σ,ℓ,j} (Clebsch–Gordan) and U^{σ,ℓ,j}

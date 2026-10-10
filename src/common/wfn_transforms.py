@@ -500,31 +500,29 @@ def psi_cylinder_tables(g_index, fft_grid, axis: int, *, ngkmax: int):
 
     ``g_index`` is the ``(nk, ngkmax)`` per-k sphere index
     (:func:`common.gvec_fft_box.build_sphere_box_index`; ``≥ n_rtot`` =
-    pad).  Returns ``(cyl_index (nk, n_col, n_s) int32, cyl_axis (n_s,)
+    pad).  Returns host ``(cyl_index (nk, n_col, n_s) int32, cyl_axis (n_s,)
     int32, plane_from_col (n_b·n_c,) int32)``: sphere slot of column
     ``col``, axis coordinate ``cyl_axis[s]`` (``ngkmax`` where the sphere of
     that k has no point), and the column of each in-plane cell (``n_col`` =
     none).  Columns and coordinates are the union over k, so one static
-    shape serves every k row.  Built once per fit, from the sphere list
-    alone: the only box-plane-sized tables are the ``(n_b·n_c,)`` and
+    shape serves every k row.  Built once per fit, on the host from the host
+    sphere list: the only box-plane-sized tables are the ``(n_b·n_c,)`` and
     ``(n_a,)`` occupancy masks.
     """
     n_a, (n_b, n_c), _ = _plane_geometry(fft_grid, axis)
     n_rtot = int(np.prod(fft_grid))
-    idx = jnp.asarray(g_index, dtype=jnp.int32)               # (nk, ngk)
+    idx = np.asarray(g_index, dtype=np.int32)                 # (nk, ngk)
     nk, ngk = (int(v) for v in idx.shape)
     if ngk != int(ngkmax):
         raise ValueError(
             f"psi_cylinder_tables: sphere index width {ngk} != ngkmax "
             f"{int(ngkmax)}")
     valid = idx < n_rtot
-    a, inp = plane_split(jnp.where(valid, idx, 0), fft_grid, axis)
-    col_mask = np.asarray(jax.device_get(
-        jnp.zeros((n_b * n_c,), jnp.bool_).at[
-            jnp.where(valid, inp, n_b * n_c)].set(True, mode='drop')))
-    s_mask = np.asarray(jax.device_get(
-        jnp.zeros((n_a,), jnp.bool_).at[
-            jnp.where(valid, a, n_a)].set(True, mode='drop')))
+    a, inp = plane_split(np.where(valid, idx, 0), fft_grid, axis)
+    col_mask = np.zeros(n_b * n_c, bool)
+    col_mask[inp[valid]] = True
+    s_mask = np.zeros(n_a, bool)
+    s_mask[a[valid]] = True
     cols = np.flatnonzero(col_mask).astype(np.int32)              # (n_col,)
     cyl_axis = np.flatnonzero(s_mask).astype(np.int32)            # (n_s,)
     n_col, n_s = int(cols.size), int(cyl_axis.size)
@@ -532,18 +530,11 @@ def psi_cylinder_tables(g_index, fft_grid, axis: int, *, ngkmax: int):
     plane_from_col[cols] = np.arange(n_col, dtype=np.int32)
     s_from_axis = np.full((n_a,), n_s, dtype=np.int32)
     s_from_axis[cyl_axis] = np.arange(n_s, dtype=np.int32)
-    # Scatter each sphere slot into its (col, s) cell; pads go to distinct
-    # out-of-range cells, so every index stays unique.
-    cell = (jnp.take(jnp.asarray(plane_from_col), inp) * n_s
-            + jnp.take(jnp.asarray(s_from_axis), a))
-    cell = jnp.where(valid, cell,
-                     n_col * n_s + jnp.arange(ngk, dtype=jnp.int32)[None, :])
-    slots = jnp.broadcast_to(jnp.arange(ngk, dtype=jnp.int32), (nk, ngk))
-    cyl_index = jax.vmap(
-        lambda c, v: jnp.full((n_col * n_s,), int(ngkmax), jnp.int32).at[c].set(
-            v, mode='drop', unique_indices=True))(cell, slots)
-    return (cyl_index.reshape(nk, n_col, n_s), jnp.asarray(cyl_axis),
-            jnp.asarray(plane_from_col))
+    # Each valid sphere slot lands in its own (col, s) cell of its k row.
+    k, slot = np.nonzero(valid)
+    cyl_index = np.full((nk, n_col * n_s), int(ngkmax), np.int32)
+    cyl_index[k, plane_from_col[inp[k, slot]] * n_s + s_from_axis[a[k, slot]]] = slot
+    return cyl_index.reshape(nk, n_col, n_s), cyl_axis, plane_from_col
 
 
 def to_rchunk_inner(
@@ -1796,19 +1787,6 @@ def iter_psi_rchunk_bandwise(
             for i in range(num_band_chunks)
         ]
 
-    # JIT'd zero-allocator used by the k-chunked path (memoised by
-    # shape).  Keeps the top-level ``jnp.zeros`` from being
-    # rematerialised replicated on every device.
-    _zeros_out_cache: dict = {}
-    def _zeros_out(shape):
-        fn = _zeros_out_cache.get(shape)
-        if fn is None:
-            fn = jax.jit(
-                lambda: jnp.zeros(shape, dtype=jnp.complex128),
-                out_shardings=out_r)
-            _zeros_out_cache[shape] = fn
-        return fn()
-
     sharding_load = band_sphere_spec()
 
     loader = wfn  # reuse top-level WfnLoader
@@ -1848,8 +1826,8 @@ def iter_psi_rchunk_bandwise(
         else:
             nb_chunk = bc_range[1] - bc_range[0]
             nspinor = meta.nspinor
-            psi_bc_r_full = _zeros_out(
-                (nk_tot, nb_chunk, nspinor, n_rchunk_carrier))
+            psi_bc_r_full = jnp.zeros((nk_tot, nb_chunk, nspinor, n_rchunk_carrier),
+                                      jnp.complex128, device=out_r)
             for k0 in range(0, nk_tot, nk_batch):
                 k1 = min(k0 + nk_batch, nk_tot)
                 k_ids = list(range(k0, k1))

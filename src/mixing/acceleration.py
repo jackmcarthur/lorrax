@@ -212,10 +212,7 @@ def rcrop_nojit(
         return _pin_entry(v, entry_sharding)
 
     def _zeros_hist():
-        if stack_sharding is None:
-            return jnp.zeros((m,) + shape, dtype=dtype)
-        return jax.jit(lambda: jnp.zeros((m,) + shape, dtype=dtype),
-                       out_shardings=stack_sharding)()
+        return jnp.zeros((m,) + shape, dtype=dtype, device=stack_sharding)
 
     x = _entry(x0)
     f = _entry(residual_fn(x))
@@ -428,10 +425,7 @@ def anderson_nojit(
         return _pin_entry(v, entry_sharding)
 
     def _zeros_hist():
-        if stack_sharding is None:
-            return jnp.zeros((m,) + shape, dtype=dtype)
-        return jax.jit(lambda: jnp.zeros((m,) + shape, dtype=dtype),
-                       out_shardings=stack_sharding)()
+        return jnp.zeros((m,) + shape, dtype=dtype, device=stack_sharding)
 
     def _weighted(v):
         return v if metric is None else v * metric

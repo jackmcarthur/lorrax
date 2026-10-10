@@ -78,6 +78,7 @@ second chi0/W implementation or a disk round-trip.
 """
 from __future__ import annotations
 
+import itertools
 import threading
 from typing import Any, Callable, NamedTuple
 
@@ -805,6 +806,11 @@ def all_gather_processes(x, *, tiled: bool = False):
 
     ``tiled=False`` stacks (leading axis = process index); ``tiled=True``
     concatenates along axis 0, as in the underlying call.
+
+    A host record whose gathered bytes fit :data:`_HOST_GATHER_BYTES` (budgets,
+    host names, receipts, plan digests) goes through the distributed host
+    control store, byte-exact and without a device program; larger host
+    arrays and every ``jax.Array`` take the device all-gather.
     """
     import numpy as np
 
@@ -815,8 +821,29 @@ def all_gather_processes(x, *, tiled: bool = False):
     from jax.experimental import multihost_utils as _mh
 
     if not isinstance(x, jax.Array):
-        x = jax.device_put(np.asarray(x), jax.local_devices()[0])
+        arr = np.asarray(x)
+        if arr.nbytes * process_count() <= _HOST_GATHER_BYTES:
+            return _host_gather(arr, tiled)
+        x = jax.device_put(arr, jax.local_devices()[0])
     return np.asarray(_mh.process_allgather(x, tiled=tiled))
+
+
+#: Gathered bytes (all ranks together) a host record may send through the
+#: control store; it carries receipts, never payloads.
+_HOST_GATHER_BYTES = 1 << 16
+_HOST_GATHER_OCCURRENCE = itertools.count()
+
+
+def _host_gather(arr, tiled):
+    """Every rank's equal-shape host ``arr`` through the host control store."""
+    import numpy as np
+    from ffi.common.broadcast import reduce_bytes_to_all
+
+    key = f"lorrax/host-gather/v1/{next(_HOST_GATHER_OCCURRENCE)}"
+    raw = reduce_bytes_to_all(np.frombuffer(arr.tobytes(), np.uint8), key=key,
+                              reduce=np.concatenate, max_bytes=_HOST_GATHER_BYTES)
+    out = raw.view(arr.dtype).reshape((process_count(),) + arr.shape)
+    return out.reshape((-1,) + arr.shape[1:]) if tiled else out
 
 
 def gather_to_host(x):

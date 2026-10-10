@@ -1104,27 +1104,6 @@ def mesh_divisible_shape(shape, mesh, partition_spec) -> tuple[int, ...]:
     return tuple(out)
 
 
-# ``_local_shard_and_global_offset`` — "one addressable shard per process,
-# and here is its global offset" — was deleted on 2026-08-27, for the same
-# reason as ``_shard_read_plan`` below and with the same evidence.  A
-# repo-wide grep at a28b9daa over src/ services/ tests/ tools/ config/
-# docs/ found the definition here and no call site: the only live copy is
-# ``wfn_loader._collectives._local_shard_and_global_offset``, whose own
-# docstring records that it was ported from this file verbatim, and which
-# ``wfn_loader.loader`` does call.
-#
-# It had to go now rather than later because it was actively misleading
-# about this module.  Its refusal read "SlabIO expects 1 addressable shard
-# per process; got N ... Did you set
-# --xla_force_host_platform_device_count > 1 on a multi-process run?",
-# sitting in the transport that ``file_io._slab_io_serial`` extends —
-# where four addressable shards in one process is now the supported
-# geometry and is exactly what the serial tier iterates.  A dead helper
-# stating a constraint the live code does not have is worse than no
-# helper: the next reader has to prove it is dead before trusting the
-# tier beside it.
-
-
 # ``_shard_read_plan`` — the per-device (local_shape, dst, disk) hyperslab
 # arithmetic — was DELETED on 2026-08-11.  It was written in the 2026-07-28
 # audit as the single source of truth for a clip that TWO backends had
@@ -1537,11 +1516,6 @@ def _file_order_read_insert(mesh, shape, dtype, spec, k, compact_shape,
                                  NamedSharding(mesh, P())),
                    out_shardings=NamedSharding(mesh, spec))
 
-
-@functools.lru_cache(maxsize=None)
-def _read_zeros(mesh, shape, dtype, spec):
-    return jax.jit(lambda: jnp.zeros(shape, dtype),
-                   out_shardings=NamedSharding(mesh, spec))
 
 def _normalize_slab_request(
     *,
@@ -2203,16 +2177,15 @@ class _CollectiveLane:
     def pending(self, slot) -> int:
         return self._worker().pending if self._owner is slot else 0
 
-    def track_read(self, slot, result) -> None:
+    def track_read(self, slot, done) -> None:
         """Remember an async union read until the next HDF5 entry point waits.
 
-        What is kept is one element per local shard, sliced from the result:
-        it becomes ready only when the read has landed, and it does not keep
-        the result's buffer alive (a psi read is ~psi/P per rank).
+        ``done`` is the reader's own completion token (``ffi.io``): ready
+        only when the read has landed, and it does not keep the result's
+        buffer alive (a psi read is ~psi/P per rank).
         """
         live = [m for m in self._reads.get(id(slot), []) if not m.is_ready()]
-        live.extend(s.data.ravel()[:1] for s in result.addressable_shards)
-        self._reads[id(slot)] = live
+        self._reads[id(slot)] = live + [done]
 
     def release(self, slot) -> None:
         """At close: nothing of ``slot`` is left in the lane."""
@@ -3110,7 +3083,7 @@ class _FfiBackend(_DatasetGeometry):
         counts, flat = _sharding_to_axis_info(sh, n)
         mesh_shape = tuple(mesh.shape[a] for a in mesh.axis_names)
         handle = _replicated_i64_vector((self.fh, self._ds_id(name, readonly=True)), mesh)
-        result = _read_zeros(mesh, shape, jnp.dtype(dtype), spec)()
+        result = jnp.zeros(shape, dtype, device=NamedSharding(mesh, spec))
         with _large_read_progress(self.path, name,
                 global_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize,
                 local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p):
@@ -3229,10 +3202,10 @@ class _FfiBackend(_DatasetGeometry):
         # returns an async ``ffi::Future`` and the caller's next op is what
         # sequences it (measured ~1% end-to-end, read_ffi.cc:819-829).
         # Blocking would be a behaviour change dressed as symmetry.
-        result = reader(offsets_dev, counts_dev)
+        result, done = reader(offsets_dev, counts_dev)
         # The read runs on this file's native worker thread; another
         # handle's next HDF5 call waits for it (_CollectiveLane).
-        _LANE.track_read(self._dispatcher, result)
+        _LANE.track_read(self._dispatcher, done)
         return result
 
     # ------------------------------------------------------------------

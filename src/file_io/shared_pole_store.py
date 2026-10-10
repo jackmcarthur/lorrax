@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from runtime.padding import combined_divisor, padded_axis
+from runtime.padding import combined_divisor, padded_axis, spec_divisor
 from common import timing
 from common.collectives import (agree_io_error, device_put_process_local, process_rank, psum_replicate,
                                 rank0_transaction)
@@ -93,28 +93,47 @@ def _local_bytes(shape, dtype, mesh, spec):
     return count * np.dtype(dtype).itemsize
 
 
-def _conversion_bytes(basis, shape, spec, *, unpack, operator=False, axis=1):
-    """Compile the existing basis conversion without allocating its operand.
+#: Bytes per converted axis for a conversion's index tables and scalars (at most
+#: 352 B measured on CPU, P4 and P16).
+_INDEX_SLACK = 4096
 
-    Return argument, output and compiler temporary bytes per rank. These are
-    the actual pack/unpack kernel's split-padded collective buffers, not a
-    second permutation implementation. Inputs supplied by a writer belong to
-    its caller's live reservation; a reader owns its canonical input too.
+
+def _conversion_bytes(basis, shape, spec, *, unpack, operator=False, axis=1):
+    """Argument, output and temporary bytes per rank of one centroid conversion, from shapes.
+
+    Each converted axis pads the rank's tile to the common carrier (and its
+    exchange axis to the shard count), exchanges it twice around a local gather
+    and crops, so two padded tiles are live at once. The operator form converts
+    a bounded q tile at a time, both axes in turn, and also holds the first
+    axis's result. Index tables and scalars add at most a few hundred bytes
+    (``_INDEX_SLACK``). Shapes alone decide the figure, so every rank prices the
+    same bytes. Inputs supplied by a writer belong to its caller's live
+    reservation; a reader owns its canonical input too.
     """
-    argument = _local_bytes(shape, np.complex128, basis.mesh_xy, spec)
+    mesh = basis.mesh_xy
+    argument = _local_bytes(shape, np.complex128, mesh, spec)
     if basis.is_identity:
         return argument, argument, 0
-    kernel = (basis._operator_kernel(spec, unpack) if operator
-              else basis._axis_kernel(axis, spec, unpack))
-    operand = jax.ShapeDtypeStruct(shape, jnp.complex128,
-                                  sharding=NamedSharding(basis.mesh_xy, spec))
-    stats = kernel.lower(operand).compile().memory_analysis()
-    if stats is None:
-        _refuse("compiler did not supply centroid conversion memory statistics")
-    if int(stats.argument_size_in_bytes) < argument:
-        _refuse("compiler memory statistics are smaller than the rank-local argument")
-    return (int(stats.argument_size_in_bytes), int(stats.output_size_in_bytes),
-            max(0, int(stats.temp_size_in_bytes)-int(stats.alias_size_in_bytes)))
+    ndim = len(shape)
+    axes = (ndim - 2, ndim - 1) if operator else (int(axis) % ndim,)
+    common = max(basis.n_canonical, basis.n_packed)
+    target = basis.n_canonical if unpack else basis.n_packed
+    shards = [int(spec_divisor(mesh, spec, i)) for i in range(ndim)]
+    local = [int(n) // d for n, d in zip(shape, shards)]
+    if operator:
+        local[0] = min(local[0], max(1, (256 << 20) // (16 * int(np.prod(local[1:])))))
+    tile, out, held = list(local), list(local), 0
+    for n, i in enumerate(axes):
+        split = max((j for j in range(ndim) if j != i), key=lambda j: local[j])
+        tile[i] = common // shards[i]
+        tile[split] = -(-tile[split] // shards[i]) * shards[i]
+        out[i] = target // shards[i]
+        if n < len(axes) - 1:
+            held = int(np.prod(out))
+    temporary = 16 * (2 * int(np.prod(tile)) + held) + _INDEX_SLACK * len(axes)
+    output = _local_bytes([target if i in axes else n for i, n in enumerate(shape)],
+                          np.complex128, mesh, spec)
+    return argument, output, temporary
 
 
 def _admit(ledger, stage, resident, workspace=0, *, host_payload=0,
@@ -580,7 +599,7 @@ def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent
         io.write_slab("factor", canonical, offset=(lo, 0, 0, 0), global_shape=shape)
     if extent > written:
         pad = mesh_divisible_shape((b, basis.n_canonical, components, extent-written), mesh, spec)
-        io.write_slab("factor", _zeros_program(mesh, spec, tuple(pad))(), offset=(lo, 0, 0, written),
+        io.write_slab("factor", _zeros(mesh, spec, tuple(pad)), offset=(lo, 0, 0, written),
                       global_shape=shape)
     active = jnp.arange(extent)[None, :] < jnp.asarray(K)[:, None]
     poles = jnp.pad(poles2[:, :extent], ((0, 0), (0, max(extent-int(poles2.shape[-1]), 0))),
@@ -654,10 +673,8 @@ def model_column_bound(meta, width):
                int(np.ceil(int(width) * (1.0 + _K_HEADROOM))))
 
 
-@lru_cache(maxsize=None)
-def _zeros_program(mesh, spec, shape):
-    """A complex zero array of ``shape`` sharded ``spec``: one program per mesh, spec and shape."""
-    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=NamedSharding(mesh, spec))
+def _zeros(mesh, spec, shape):
+    return jnp.zeros(shape, jnp.complex128, device=NamedSharding(mesh, spec))
 
 
 @timing.timed("shared_pole_store.finalize")
@@ -718,7 +735,7 @@ def _finalize_model(path, *, meta, header, basis=None):
                     poles = io.read_slab(batch["name"] + "/poles2",
                         shape=(hi-lo, kmax), offset=(at, 0), partition_spec=P())
                 else:
-                    factor = _zeros_program(mesh, spec, tuple(read_shape))()
+                    factor = _zeros(mesh, spec, tuple(read_shape))
                     poles = jnp.ones((hi-lo, kmax), jnp.float64)
                 active = jnp.arange(kmax)[None, :] < jnp.asarray(header["K"][lo:hi])[:, None]
                 poles = jnp.where(active, poles, 1.0)
@@ -1111,10 +1128,8 @@ def read_shared_pole_matrix(io, q_span, *, meta, header):
         # read_slab for a >= 1 wide slab of a dataset just validated as
         # empty is not a read this reader may make.
         _admit(ledger, "empty_matrix", 8*(hi-lo))
-        zeros = jax.jit(
-            lambda: jnp.zeros((hi-lo, basis.n_packed, 0), jnp.complex128),
-            out_shardings=NamedSharding(io.mesh, P(None, "x", "y")))
-        return (zeros(), jnp.ones((hi-lo, 0), jnp.float64),
+        return (_zeros(io.mesh, P(None, "x", "y"), (hi-lo, basis.n_packed, 0)),
+                jnp.ones((hi-lo, 0), jnp.float64),
                 jnp.zeros(hi-lo, jnp.int64))
     width = padded_axis(header["Kmax"], io.mesh, name="shared_pole_K",
                         specs=((spec, 3),)).carrier
@@ -1177,7 +1192,7 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=
     if header["Kmax"] == 0 and column_span is None:
         _admit(ledger,"empty_faces",8*(hi-lo))
         shape = (hi-lo,basis.n_packed,components,0)
-        faces = {axis: _zeros_program(io.mesh, P(None,axis,None,"y" if axis == "x" else "x"), shape)()
+        faces = {axis: _zeros(io.mesh, P(None,axis,None,"y" if axis == "x" else "x"), shape)
                  for axis in orientations}
         return (faces.get("x"), faces.get("y"), jnp.ones((hi-lo,0),jnp.float64),
                 jnp.zeros(hi-lo,jnp.int64))
@@ -1200,20 +1215,30 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=
     _admit(ledger,"read_faces",resident+metadata,max(0,peak-resident),
            device_panel=max(*(totals[axis][0] for axis in orientations),
                             8*(hi-lo)*width),native_host=True,io=io)
-    counts = jnp.asarray(np.clip(np.asarray(header["K"][lo:hi])-c0,0,c1-c0), dtype=jnp.int64)
-    active = jnp.arange(width)[None,:] < counts[:,None]
+    counts = np.clip(np.asarray(header["K"][lo:hi])-c0,0,c1-c0).astype(np.int64)
     faces = {}
     for axis in orientations:
         spec = P(None,axis,None,"y" if axis == "x" else "x")
         b = io.read_slab("factor", shape=(hi-lo,basis.n_canonical,components,width),
                          offset=(lo,0,0,c0), valid_shape=(hi-lo,basis.n_logical,components,c1-c0),
                          partition_spec=spec)
-        b = basis.pack_axis(b, 1, spec=spec)
-        faces[axis] = jnp.where(active[:,None,None,:] & jnp.asarray(
-            basis.active_mask)[None,:,None,None], b, 0.0)
+        faces[axis] = _live_face(basis.pack_axis(b, 1, spec=spec), counts, basis.active_mask)
         del b
     poles = io.read_slab("poles2_ry2", shape=(hi-lo,width), offset=(lo,c0), valid_shape=(hi-lo,c1-c0), partition_spec=P())
-    return (faces.get("x"), faces.get("y"), jnp.where(active,poles,1.0), counts)
+    return (faces.get("x"), faces.get("y"), _live_poles(poles, counts), jnp.asarray(counts))
+
+
+@jax.jit
+def _live_face(b, counts, mask):
+    """Zero a face's pad centroid slots and its columns past each parent's count."""
+    live = (jnp.arange(b.shape[-1]) < counts[:, None])[:, None, None, :] & mask[None, :, None, None]
+    return jnp.where(live, b, 0.0)
+
+
+@jax.jit
+def _live_poles(poles, counts):
+    """Pole columns past each parent's count hold the sentinel 1."""
+    return jnp.where(jnp.arange(poles.shape[-1])[None, :] < counts[:, None], poles, 1.0)
 
 
 def read_shared_pole_cross_faces(readers, q_span, *, meta, headers, bases,
@@ -1461,7 +1486,7 @@ class ResidentBankPayload:
         # Host and file tiers: SlabIO's per-rank streamed store, one record per
         # (lead index, q) tile, q-major within each lead index so a q span of
         # one sample is one contiguous run; an unwritten tile reads as zeros.
-        store = (_resident_zeros(self.mesh, stored)()
+        store = (_resident_zeros(self.mesh, stored)
                  if self.memory_kind == "device" else self._tier_store(name, stored, self.memory_kind))
         if self.memory_kind != "device" and not store.fits:
             if self.header_json is None:
@@ -1583,7 +1608,7 @@ def _tier_lead(mesh, ndim, n):
 
 
 def _resident_zeros(mesh, shape):
-    return _zeros_program(mesh, P(*((None,) * (len(shape) - 2)), "x", "y"), tuple(shape))
+    return _zeros(mesh, P(*((None,) * (len(shape) - 2)), "x", "y"), tuple(shape))
 
 
 def _logical_mask(value, logical):
@@ -2950,7 +2975,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                 try:
                     canonical = (io.read_slab("factor", shape=shape,
                         offset=(q, 0, 0, 0), partition_spec=spec) if model["Kmax"] else
-                        _zeros_program(mesh_xy, spec, tuple(shape))())
+                        _zeros(mesh_xy, spec, tuple(shape)))
                     b = basis.pack_axis(canonical, 1, spec=spec)
                     poles = (io.read_slab("poles2_ry2", shape=(1, shape[-1]),
                         offset=(q, 0), partition_spec=P()) if model["Kmax"] else

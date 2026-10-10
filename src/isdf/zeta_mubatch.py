@@ -1093,8 +1093,7 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
 def _zero_accumulators(mesh, Q_pad, mu, n_sh, *, debug_m, with_v=True):
     sh = NamedSharding(mesh, _ACC_SPEC)
     vs, ss = (Q_pad, mu, mu), (Q_pad, mu, n_sh)
-    z = lambda shape: jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                              out_shardings=sh)()
+    z = lambda shape: jnp.zeros(shape, jnp.complex128, device=sh)
     stub = lambda shape: z(shape[:1] + (1,) * (len(shape) - 1))
     if not with_v:                   # ζ only: no V, M or shell is formed
         return stub(vs), stub(vs), stub(ss)

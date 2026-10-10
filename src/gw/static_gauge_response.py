@@ -150,7 +150,7 @@ def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face")
     def zero(face, axis, spec):
         # The charge channel carries no current: an exact-zero face.
         shape = face.shape[:axis] + (1, layout.carrier_extent(0)) + face.shape[axis+2:]
-        return _zero_face(mesh_xy, spec, tuple(shape), np.dtype(face.dtype))()
+        return jnp.zeros(shape, face.dtype, device=NamedSharding(mesh_xy, spec))
     faces_mun = (zero(left, 1, mun_spec),) + tuple(left[:, A:A+1] for A in range(3))
     faces_nmu = (zero(right, 2, nmu_spec),) + tuple(right[:, :, A:A+1] for A in range(3))
     left = pack_photon_faces(faces_mun, layout, mesh_xy, orientation="mun",
@@ -195,12 +195,6 @@ def _current_density_program(mesh_xy, mun_spec, nmu_spec, n_tables, n_sym_spatia
         return (to_full_k(density(mun, 1), 1, 2, "x", *tables),
                 to_full_k(density(nmu, 2), 2, 3, "y", *tables))
     return jax.jit(currents)
-
-
-@lru_cache(maxsize=16)
-def _zero_face(mesh_xy, spec, shape, dtype):
-    """An exact-zero face of ``shape`` sharded ``spec``: one program per shape."""
-    return jax.jit(lambda: jnp.zeros(shape, dtype), out_shardings=NamedSharding(mesh_xy, spec))
 
 
 def _canonical_wfn_sha256(value) -> str:

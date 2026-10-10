@@ -573,9 +573,7 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
     # Allocate the accumulator ALREADY SHARDED.  ``device_put(jnp.zeros(...))``
     # would materialise the whole 53.6 GB on one device first and only then
     # reshard — the allocation that OOMs an 80 GB card at n_μ = 2412.
-    P_R = jax.jit(lambda: jnp.zeros((nR, ns, n_mu, n_mu, ns),
-                                    dtype=jnp.complex128),
-                  out_shardings=face5)()
+    P_R = jnp.zeros((nR, ns, n_mu, n_mu, ns), jnp.complex128, device=face5)
     # Process-local placement of the host chunks (scorecard AA.1): every
     # rank reads the same file / computes the same phases, so plain
     # ``device_put``'s hidden assert_equal all-gather (P × chunk bytes,

@@ -63,7 +63,6 @@ from wfn_loader.loader import (
     _bispinor_lift_kernel,
     _get_bispinor_lift_jit,
     _phdf5_unfold_kernel,
-    _sharded_zero_proto_fn,
     read_wfn_provenance,
     uniform_band_windows,
 )
@@ -74,6 +73,6 @@ __all__ = [
     "KSpec", "IBZRows", "uniform_band_windows",
     # module-level helpers the in-tree tests pin by name (see above)
     "_phdf5_unfold_kernel",
-    "_sharded_zero_proto_fn", "_get_bispinor_lift_jit",
+    "_get_bispinor_lift_jit",
     "_bispinor_lift_kernel",
 ]

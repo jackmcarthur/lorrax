@@ -298,8 +298,8 @@ class PlaneWaveGW:
         e = self.s.enk - self.mu
         cond = np.arange(self.nb) >= self.nval
         Mc = int(self.screen.M)
-        acc = jax.jit(lambda: jnp.zeros((alpha_rows.shape[0], self.w_par.n, Mc, Mc), jnp.complex128),
-                      out_shardings=NamedSharding(self.mesh, P(None, None, "x", "y")))()
+        acc = jnp.zeros((alpha_rows.shape[0], self.w_par.n, Mc, Mc), jnp.complex128,
+                        device=NamedSharding(self.mesh, P(None, None, "x", "y")))
         real = lambda w: w.real if not np.any(np.imag(tau)) else w
         for l, t in enumerate(tau):
             Gc = self._timed("green", self.green, real(np.where(cond, np.exp(-e * t), 0.0)))
@@ -366,8 +366,8 @@ class PlaneWaveGW:
         plan = make_mpa_plan(config, quad, material_class="insulator")
         z = sample_plan.plan_z(plan)
         Mc = int(self.screen.M)
-        out = jax.jit(lambda: jnp.zeros((z.size, self.w_par.n, Mc, Mc), jnp.complex128),
-                      out_shardings=NamedSharding(self.mesh, P(None, None, "x", "y")))()
+        out = jnp.zeros((z.size, self.w_par.n, Mc, Mc), jnp.complex128,
+                        device=NamedSharding(self.mesh, P(None, None, "x", "y")))
         put = jax.jit(lambda a, x, i: a.at[i].set(x), donate_argnums=(0,),
                       out_shardings=NamedSharding(self.mesh, P(None, None, "x", "y")))
         box = [out]

@@ -1173,18 +1173,16 @@ def load_parent_psi_G(
         mu_pad, mu_t = P_, 1
         r_mu_dev = device_put_process_local(np.zeros((P_, 3), np.int32), rep)
         w_mu_dev = device_put_process_local(np.zeros((P_,), np.float64), rep)
-        acc_y, acc_x = jax.jit(
-            lambda: (jnp.zeros((1, 1, 1, P_), jnp.complex128),
-                     jnp.zeros((1, 1, 1, P_), jnp.complex128)),
-            out_shardings=(NamedSharding(mesh_xy, PSI_NMU_ACC_SPEC),
-                           NamedSharding(mesh_xy, PSI_MUNT_ACC_SPEC)))()
+        acc_y = jnp.zeros((1, 1, 1, P_), jnp.complex128,
+                          device=NamedSharding(mesh_xy, PSI_NMU_ACC_SPEC))
+        acc_x = jnp.zeros((1, 1, 1, P_), jnp.complex128,
+                          device=NamedSharding(mesh_xy, PSI_MUNT_ACC_SPEC))
 
     ns = int(meta.nspinor) if bispinor else int(loader.nspinor)
     store = host_tile = None
     gspec = NamedSharding(mesh_xy, P(None, None, None, ('x', 'y')))
     if placement == "device":
-        store = jax.jit(lambda: jnp.zeros((nk, nb_c, ns, ngk_c), jnp.complex128),
-                        out_shardings=gspec)()
+        store = jnp.zeros((nk, nb_c, ns, ngk_c), jnp.complex128, device=gspec)
     elif placement == "host":
         if len(mesh_xy.local_devices) != 1:
             raise ValueError("load_parent_psi_G(placement='host') wants one "

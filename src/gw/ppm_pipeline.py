@@ -337,19 +337,13 @@ def _streamed_combination(cube, live, w):
     step = -(-n_omega // _COMBINE_SLABS)
     shape = (n_omega, int(cube.nk), *members[0].shape[2:])
     sharding = NamedSharding(cube.mesh_xy, P(None, None, "x", "y"))
-    out = _zeros_cube_fn(shape, sharding)()
+    out = jnp.zeros(shape, jnp.complex128, device=sharding)
     run = _combination_slab_fn(cube.unfold, step,
                                0 if cube.term is None else cube.term.ndim, sharding)
     for lo in range(0, n_omega, step):
         out = run(out, members, cube.term, w, jnp.asarray(
             min(lo, n_omega - step), dtype=jnp.int32))
     return out
-
-
-@lru_cache(maxsize=8)
-def _zeros_cube_fn(shape, sharding):
-    return jax.jit(lambda: jnp.zeros(shape, dtype=jnp.complex128),
-                   out_shardings=sharding)
 
 
 @lru_cache(maxsize=16)

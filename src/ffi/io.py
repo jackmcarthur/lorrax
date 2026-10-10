@@ -580,7 +580,7 @@ def read_kchunk_union_sharded(
     mesh: Mesh,
     file_partition_spec: P,
     count_partition_spec: P | None = None,
-) -> Callable[[jax.Array, jax.Array], jax.Array]:
+) -> Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
     """See ``_read_kchunk_union_sharded_cached`` for impl; this wrapper
     normalises Sequence args to tuples for lru_cache hashability.
 
@@ -616,7 +616,7 @@ def read_kchunk_union_sharded(
 
     # The handle is HIDDEN: callers keep the two-argument
     # ``reader(offset_base, count_base)`` shape they already have.
-    def _reader(offset_base: jax.Array, count_base: jax.Array) -> jax.Array:
+    def _reader(offset_base: jax.Array, count_base: jax.Array):
         return inner(handle, offset_base, count_base)
 
     return _reader
@@ -700,8 +700,8 @@ def _read_kchunk_union_sharded_cached(
     mesh: Mesh,
     file_partition_spec: P,
     count_partition_spec: P = P(),
-) -> Callable[[jax.Array, jax.Array], jax.Array]:
-    """Build a jitted ``f(handle, offset_base, count_base) → array`` callable
+) -> Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
+    """Build a jitted ``f(handle, offset_base, count_base) → (array, done)`` callable
     that issues **ONE** ``H5Dread`` for ``n_kchunk`` per-k windows via
     ``H5S_SELECT_OR``.  Correctness preconditions — see below.
 
@@ -745,7 +745,10 @@ def _read_kchunk_union_sharded_cached(
         handle and preserves the two-argument call shape.
         Output shape is ``per_rank_file_shape`` with ``n_kchunk`` inserted
         at ``kchunk_axis``; partition spec gets ``None`` inserted at the
-        same position.
+        same position.  ``done`` holds at most one element per rank, sliced
+        from the rank's own result in the same program: it is ready exactly
+        when the rank's asynchronous read has landed, and holding it keeps
+        none of the result's bytes alive.
     """
     ndim_file = len(per_rank_file_shape)
     if len(file_global_shape) != ndim_file:
@@ -768,7 +771,7 @@ def _read_kchunk_union_sharded_cached(
         list(file_partition_spec), kchunk_axis, None))
 
     def _per_rank(handle_local, offset_base_local, count_base_local):
-        return ffi_read_kchunk_union_call(
+        out = ffi_read_kchunk_union_call(
             out_struct,
             handle_local,
             offset_base_local, count_base_local,
@@ -778,11 +781,12 @@ def _read_kchunk_union_sharded_cached(
             n_kchunk=int(n_kchunk),
             kchunk_axis=int(kchunk_axis),
         )
+        return out, out.reshape(-1)[:1]
 
     return jax.jit(shard_map(
         _per_rank, mesh=mesh,
         in_specs=(P(), P(), count_partition_spec),
-        out_specs=out_partition_spec,
+        out_specs=(out_partition_spec, P(tuple(mesh.axis_names))),
         check_vma=False,
     ))
 

@@ -325,12 +325,6 @@ def _tt_only(mesh_xy, width):
         mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"), check_vma=False))
 
 
-@lru_cache(maxsize=8)
-def _face_zeros(mesh_xy, shape):
-    """A zero face-tiled complex operator [.., N, N]: one program per mesh and shape."""
-    return jax.jit(lambda: jnp.zeros(shape, complex), out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
-
-
 def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
                           occupation_state, sample_plan, execute, receipt):
     r"""Build the TT Ward contact ``Pi_FD(0,0)``, with ``Pi_grid`` and centroid D, once per bank.
@@ -397,7 +391,8 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
             stream_weights(wfns, np.stack((u, np.zeros_like(u))), mesh_xy),
             jnp.asarray([lo, hi])), "static_reference",
             runtime_bytes=_stream_scratch(wfns, meta, mesh_xy, vertex))
-        drude = _face_zeros(mesh_xy, (1, layout.packed_extent, layout.packed_extent))()
+        drude = jnp.zeros((1, layout.packed_extent, layout.packed_extent), complex,
+                          device=NamedSharding(mesh_xy, P(None, "x", "y")))
         receipt["static_rule"] = dict(provenance=quad.provenance, max_error=quad.max_error)
         count = len(quad.tau)
     # Remove charge rows/columns locally; only TT has a body contact.
@@ -1265,7 +1260,7 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids),
             n_outputs=n_out, pair_mode="direct", bank_carry=True, ordered=ordered,
             vertex=vertex, stream_pass=p)
-        carry = _group_zeros(mesh_xy, (n_out, nq, px * rows, py * cols))()
+        carry = _group_zeros(mesh_xy, (n_out, nq, px * rows, py * cols))
         carry = execute(kernel, common + tuple(fixed) + tail + (carry, jnp.int32(p)),
                         "moment_correlation", runtime_bytes=scratch)
         bank.put(p, order(carry), outputs)
@@ -1730,11 +1725,9 @@ def _group_stream_arguments(rules, group):
     return times, weights
 
 
-@lru_cache(maxsize=64)
 def _group_zeros(mesh_xy, shape):
-    """The donated group carry [member, q, mu_X, nu_Y], one program per shape."""
-    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+    """The donated group carry [member, q, mu_X, nu_Y]."""
+    return jnp.zeros(shape, jnp.complex128, device=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
 def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
@@ -1759,7 +1752,7 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
             kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
                 n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True, ordered=ordered,
                 vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=p)
-            raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * rows, py * cols))()
+            raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * rows, py * cols))
             raw = execute(kernel, common + tuple(fixed) + tail + (raw, jnp.int32(p)),
                           "direct", runtime_bytes=scratch)
             bank.put(p, raw, outputs)
@@ -1768,7 +1761,7 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
         q_ids=q_ids, n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True,
         ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
-    raw = _group_zeros(mesh_xy, (weights.shape[1],len(q_ids),n,n))()
+    raw = _group_zeros(mesh_xy, (weights.shape[1],len(q_ids),n,n))
     return execute(kernel, common + tuple(fixed) + tail + (raw,), "direct", runtime_bytes=scratch)
 
 
@@ -2064,7 +2057,13 @@ class _MemberRows:
 
     def __getitem__(self, key):
         i, rows = key
-        return self.carry[self.first + int(i), rows]
+        return _member_rows(self.carry, self.first + int(i), np.asarray(rows))
+
+
+@jax.jit
+def _member_rows(carry, i, rows):
+    """One program per carry shape and row count; eager indexing is several."""
+    return carry[i, rows]
 
 
 #: Face-sized arrays one parent's partner unfold holds at once per field (the
