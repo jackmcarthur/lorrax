@@ -416,16 +416,27 @@ def write_periodic_compensation_cache(path, gram, *, mesh, geometry, lm, prepara
     return dict(path=str(path.resolve()), file_sha256=_file_digest(path), metadata=metadata)
 
 
-def load_periodic_compensation_cache(path, *, mesh, expected_file_sha256, geometry, lm):
+def load_periodic_compensation_cache(path, *, mesh, expected_file_sha256, geometry, lm,
+                                     select_q_rows=False):
     """Read a pinned geometry metric directly onto the two-dimensional face.
 
     Only bounded metadata is read through h5py. The metric is collectively
     loaded through SlabIO, retaining P(None,x,y) with exact inert carrier tails.
     The whole-file digest pins the full payload in addition to its upstream
-    preparation receipt; no replicated global tensor or axis permutation occurs.
+    preparation receipt; no replicated global tensor occurs. By default the
+    requested ordered q domain must equal the stored domain. Explicit
+    ``select_q_rows=True`` obtains row indices from unique EXACT coordinate
+    matches after authenticating the COMPLETE stored metadata and every
+    requested non-q field. An already-matching domain uses the unchanged
+    whole-domain read. The returned metadata describes the runtime view;
+    ``source_metadata`` retains the unchanged stored evidence. No cache
+    artifact is rewritten and no global full-grid row numbering is assumed.
     """
     import h5py
-    from jax.sharding import PartitionSpec as P
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from runtime.padding import padded_axis
     from file_io.commit_state import assert_committed, agree_io_refusal, COMMIT_STATE
     from file_io.slab_io import SlabIO
 
@@ -434,6 +445,8 @@ def load_periodic_compensation_cache(path, *, mesh, expected_file_sha256, geomet
     try:
         if not _periodic_sha(expected_file_sha256) or _file_digest(path) != expected_file_sha256:
             raise ValueError('periodic compensation file identity mismatch')
+        if not isinstance(select_q_rows, bool):
+            raise ValueError('periodic compensation q selection must be explicit bool')
         binding, harmonics = _periodic_geometry_binding(geometry), _periodic_harmonics(lm)
         nq = len(binding['operator_q_fractional'])
         n = len(binding['atom_centres_bohr'])*len(harmonics)
@@ -451,17 +464,73 @@ def load_periodic_compensation_cache(path, *, mesh, expected_file_sha256, geomet
             if len(text) > 4*1024*1024:
                 raise ValueError('periodic compensation metadata exceeds its bounded domain')
             metadata = json.loads(text)
-            _require_periodic_compensation_metadata(metadata, geometry=binding, lm=harmonics,
+            source_geometry = metadata['geometry'] if select_q_rows else binding
+            _require_periodic_compensation_metadata(metadata, geometry=source_geometry, lm=harmonics,
                 stored_shape=stream[_PERIODIC_DATASET].shape,
                 stored_dtype=stream[_PERIODIC_DATASET].dtype)
+            source_metadata = metadata
+            selected = None
+            q_indices = None
+            if select_q_rows and source_geometry != binding:
+                source_q = np.asarray(source_geometry['operator_q_fractional'], float)
+                selected_rows = []
+                for row in np.asarray(binding['operator_q_fractional'], float):
+                    matches = np.flatnonzero(np.all(source_q == row, axis=1))
+                    if len(matches) != 1:
+                        raise ValueError('periodic compensation requested q has no unique exact stored row')
+                    selected_rows.append(int(matches[0]))
+                q_indices = np.asarray(selected_rows, np.int64)
+            if q_indices is not None:
+                selected = np.asarray(q_indices)
+                source_q = np.asarray(source_geometry['operator_q_fractional'], float)
+                if (selected.ndim != 1 or selected.dtype.kind not in 'iu'
+                        or len(selected) != nq or len(np.unique(selected)) != nq
+                        or np.any(selected < 0) or np.any(selected >= len(source_q))):
+                    raise ValueError('periodic compensation q selection must name distinct stored rows')
+                selected = selected.astype(np.int64)
+                requested_non_q = dict(binding)
+                stored_non_q = dict(source_geometry)
+                requested_q = requested_non_q.pop('operator_q_fractional')
+                stored_non_q.pop('operator_q_fractional')
+                if (requested_non_q != stored_non_q
+                        or not np.array_equal(np.asarray(requested_q), source_q[selected])):
+                    raise ValueError('periodic compensation selected q/geometry identity mismatch')
+                selection = dict(source_q_count=len(source_q), source_q_indices=selected.tolist(),
+                    requested_q_fractional=requested_q,
+                    policy='exact ordered subset of fully authenticated stored q domain')
+                preparation = dict(source_metadata['preparation'],
+                    refinement_max=np.asarray(source_metadata['preparation']['refinement_max'])[selected].tolist())
+                metadata = dict(source_metadata, geometry=binding, logical_shape=[nq, n, n],
+                    preparation=preparation, q_selection=selection)
     except Exception as exc:
         error = exc
     agree_io_refusal(error, path=path, stage='periodic compensation metadata authentication')
     with SlabIO(path, mode='r', mesh=mesh) as stream:
-        gram = stream.read_slab(_PERIODIC_DATASET, partition_spec=P(None, 'x', 'y'))
+        if selected is None:
+            gram = stream.read_slab(_PERIODIC_DATASET, partition_spec=P(None, 'x', 'y'))
+        else:
+            face = NamedSharding(mesh, P(None, 'x', 'y'))
+            axis = padded_axis(n, mesh, name='periodic moment',
+                specs=((face.spec, 1), (face.spec, 2)))
+            order = np.argsort(selected)
+            offsets = np.zeros((nq, 3), np.int64)
+            offsets[:, 0] = selected[order]
+            blocks = stream.read_slabs(_PERIODIC_DATASET,
+                shape=(1, axis.carrier, axis.carrier), offsets=offsets,
+                valid_shapes=np.tile((1, n, n), (nq, 1)),
+                partition_spec=P(None, 'x', 'y'), window_axis=0)
+            inverse = np.argsort(order)
+            reshape = lambda values: jnp.reshape(values, (nq, axis.carrier, axis.carrier))
+            transform = (reshape if np.array_equal(inverse, np.arange(nq))
+                else lambda values: reshape(values)[inverse])
+            gram = jax.jit(transform, in_shardings=blocks.sharding,
+                out_shardings=face, donate_argnums=(0,))(blocks)
     _, axis = _periodic_face(gram, mesh, (nq, n, n))
     agree_io_refusal(ValueError('periodic compensation file changed during collective read')
         if _file_digest(path) != expected_file_sha256 else None,
         path=path, stage='periodic compensation post-read file authentication')
-    return dict(gram=gram, moment_axis=axis, metadata=metadata,
+    result = dict(gram=gram, moment_axis=axis, metadata=metadata,
         path=str(path.resolve()), file_sha256=expected_file_sha256)
+    if selected is not None:
+        result.update(source_metadata=source_metadata, q_selection=selection)
+    return result

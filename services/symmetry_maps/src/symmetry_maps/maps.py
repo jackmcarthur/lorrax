@@ -1922,7 +1922,17 @@ def spinor_rotation_for_sym_row(U_spinor_spatial, sym_idx, n_tran, *,
     if nspinor == 4:
         if R_cart is None:
             raise ValueError("spinor_rotation_for_sym_row: nspinor=4 requires R_cart for spatial parity.")
-        parity = np.linalg.det(np.asarray(R_cart)[spatial])
+        rotations = np.asarray(R_cart)[spatial]
+        if (np.iscomplexobj(rotations) or rotations.shape != (idx1.size, 3, 3)
+                or not np.isfinite(rotations).all()
+                or np.max(np.abs(rotations @ rotations.transpose(0,2,1)-np.eye(3))) > 2e-10):
+            raise ValueError("Dirac parity requires finite orthogonal Cartesian spatial rows")
+        determinants = np.linalg.det(rotations)
+        if np.max(np.abs(np.abs(determinants)-1.)) > 2e-10:
+            raise ValueError("Dirac parity requires Cartesian determinants near plus or minus one")
+        # Pin parity is categorical. Rounded Cartesian input may perturb
+        # |det(R)|, but it must never dilate the Dirac lower spinor block.
+        parity = np.sign(determinants)
         four = np.zeros((idx1.size, 4, 4), dtype=out.dtype)
         four[:, :2, :2] = out
         four[:, 2:, 2:] = parity[:, None, None] * out

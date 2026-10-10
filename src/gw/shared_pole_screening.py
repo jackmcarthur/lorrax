@@ -438,7 +438,8 @@ def _shared_pole_tables(meta, sym, basis):
         basis.canonical_indices, sym.sym_matrices, sym.translations,
         np.asarray(meta.fft_grid), extend_trs=True,
         required_rows=np.asarray(sym.sym_idx_q),
-        coordinate_kind=basis.coordinate_kind)
+        coordinate_kind=basis.coordinate_kind,
+        fractional_action=("served_fft" if basis.coordinate_kind == "fractional" else "raw"))
     qt = QirrTables(irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
         q_irr_frac=bgw_integer_q_to_fractional(
             sym.q_irr_kgrid_int, (meta.nkx, meta.nky, meta.nkz)),

@@ -791,6 +791,187 @@ def snap_to_grid_and_split_wrap(images_frac, fft_grid):
     return images_int - L * g, L
 
 
+def served_fft_source_offsets(sym_matrices, translations, fft_grid):
+    """Canonical affine offsets of the served FFT wavefunction action.
+
+    Computes ``t_s = round(N * S_s * tau_s) / N`` in
+    ``psi_child(r) = U T[psi_parent(S_s r - t_s)]``.  This is the
+    continuous extension of the existing FFT-grid pullback, not a change to
+    the WFN's raw physical translations.  Complete lattice translations
+    are retained because ``t`` also enters the reciprocal Bloch phase.
+
+    Parameters
+    ----------
+    sym_matrices : (n_sym, 3, 3) integer array
+        BGW reciprocal matrices ``S``, in canonical spatial-row order.
+    translations : (n_sym, 3) float64 array
+        Raw BGW ``tnp = 2*pi*tau``; fractional translations are dimensionless.
+    fft_grid : (3,) integer array
+        Positive FFT extents.  The raw translation must be commensurate
+        within the incumbent FFT pullback limit of 1e-8 of a grid step.
+
+    Returns
+    -------
+    offsets : (n_sym, 3) float64 array
+        Dimensionless source offsets ``t`` without modulo reduction.
+        The equivalent forward action is ``inv(S) r + inv(S) t``.
+        No physical sampling coordinate is snapped by this helper.
+    """
+    S = np.asarray(sym_matrices, dtype=np.int64)
+    if S.ndim != 3 or S.shape[1:] != (3, 3):
+        raise ValueError(f"sym_matrices must be (n_sym, 3, 3); got {S.shape}")
+    fg = np.asarray(fft_grid, dtype=np.int64).reshape(3)
+    if np.any(fg <= 0):
+        raise ValueError("served FFT action requires positive fft_grid extents")
+    raw = np.asarray(translations, dtype=np.float64)
+    if (raw.ndim != 2 or raw.shape[1] != 3 or raw.shape[0] < len(S)
+            or not np.isfinite(raw).all()):
+        raise ValueError("translations must be finite (n_sym, 3) BGW tnp rows")
+    tau = raw[:len(S)] / (2.0 * np.pi)
+    tau_grid = tau * fg[None, :]
+    residual = np.abs(tau_grid - np.rint(tau_grid))
+    bad = np.argwhere(residual > 1.0e-8)
+    if bad.size:
+        s, axis = (int(v) for v in bad[0])
+        raise RuntimeError(
+            "served FFT action: fractional translation is not commensurate "
+            f"with the FFT grid for sym {s}, axis {axis}: "
+            f"tau_frac={tau[s].tolist()}, tau*fft_grid={tau_grid[s].tolist()}, "
+            f"residual={residual[s, axis]:.6e}. Off-grid translations cannot "
+            "be represented by an FFT-grid permutation.")
+    return np.asarray([np.rint(fg * (op @ shift)) / fg
+                       for op, shift in zip(S, tau)], dtype=np.float64)
+
+
+def atomic_point_lookup_budget(atom_centres_frac, atom_types, sym_matrices,
+                               translations, fft_grid, *, quadrature_geometry=None):
+    """Derive the bounded input-roundoff budget for internal atom quadrature.
+
+    Physical atom positions are unchanged.  This measures the nearest
+    species-matched centre under the served FFT action, then adds a float64
+    arithmetic margin for coordinates bounded by two cells.  The fixed
+    ceiling is 2e-11 in fractional distance; a larger physical asymmetry
+    refuses.  This is not a configurable fractional-centroid tolerance.
+
+    Parameters
+    ----------
+    atom_centres_frac : (n_atom, 3) float64 array
+        Original physical fractional centres, wrapped in [0, 1).
+    atom_types : (n_atom,) integer array
+        Species identity for centre matching.
+    sym_matrices, translations, fft_grid
+        Canonical BGW/FFT metadata accepted by
+        :func:`served_fft_source_offsets`.
+    quadrature_geometry : dict, optional
+        Closed internal descriptor with ``lattice_rows_bohr`` (3,3),
+        unchanged ``angular_directions`` (n_direction,3) and positive
+        ``maximum_radius_bohr``. It measures the Cartesian-input rounding
+        defect against the exact fractional action. For fixed unique centre
+        and direction matches, displacement is affine in radius; the norms
+        at zero and maximum radius bound every intermediate packet.
+
+    Returns
+    -------
+    budget : dict
+        Closed, JSON-compatible receipt binding the actual centres, species,
+        operation/FFT bytes, centre census, arithmetic margin and derived
+        lookup limit.  The point mapper rederives this receipt before use.
+    """
+    centres = np.asarray(atom_centres_frac, dtype=np.float64)
+    types = np.asarray(atom_types)
+    S = np.asarray(sym_matrices, dtype=np.int64)
+    if (centres.ndim != 2 or centres.shape[1] != 3 or not len(centres)
+            or not np.isfinite(centres).all() or np.any(centres < 0.)
+            or np.any(centres >= 1.) or types.shape != (len(centres),)
+            or types.dtype.kind not in 'iu'):
+        raise ValueError('atomic lookup budget requires physical centres and integer species rows')
+    types = types.astype(np.int64)
+    offsets = served_fft_source_offsets(S, translations, fft_grid)
+    residuals, permutations, centre_displacements = [], [], []
+    for op, offset in zip(S, offsets):
+        images = centres @ op.T - offset
+        row, maximum = [], 0.
+        for atom, image in enumerate(images):
+            candidates = np.flatnonzero(types == types[atom])
+            delta = image-centres[candidates]
+            delta -= np.rint(delta)
+            distance = np.linalg.norm(delta, axis=1)
+            order = np.argsort(distance)
+            if len(order) > 1 and distance[order[1]] <= 2.0e-11:
+                raise ValueError('ambiguous species-matched atomic centres')
+            row.append(int(candidates[order[0]]))
+            maximum = max(maximum, float(distance[order[0]]))
+        if len(set(row)) != len(centres):
+            raise ValueError('atomic centre action is not a bijection')
+        residuals.append(maximum)
+        permutations.append(row)
+        delta = images-centres[row]
+        centre_displacements.append(delta-np.rint(delta))
+    coordinate_bound = 2.
+    margin = float(512*np.finfo(np.float64).eps*coordinate_bound
+                   *max(1, int(np.sum(np.abs(S), axis=2).max())))
+    maximum = max(residuals)
+    point_bound = maximum
+    geometry_receipt = {}
+    if quadrature_geometry is not None:
+        from scipy.spatial import cKDTree
+        if (not isinstance(quadrature_geometry, dict)
+                or set(quadrature_geometry) != {'lattice_rows_bohr',
+                    'angular_directions', 'maximum_radius_bohr'}):
+            raise ValueError('atomic roundoff requires the closed quadrature descriptor')
+        lattice = np.asarray(quadrature_geometry['lattice_rows_bohr'], np.float64)
+        directions = np.asarray(quadrature_geometry['angular_directions'], np.float64)
+        radius = float(quadrature_geometry['maximum_radius_bohr'])
+        if (lattice.shape != (3,3) or not np.isfinite(lattice).all()
+                or abs(np.linalg.det(lattice)) <= np.finfo(float).tiny
+                or directions.ndim != 2 or directions.shape[1] != 3 or len(directions) < 2
+                or not np.isfinite(directions).all()
+                or np.max(abs(np.linalg.norm(directions, axis=1)-1.)) > 2e-10
+                or not np.isfinite(radius) or radius <= 0):
+            raise ValueError('invalid internal atomic lattice/direction/radius descriptor')
+        relative = directions @ np.linalg.inv(lattice)
+        tree = cKDTree(relative)
+        angular_errors, point_errors, nearest_gaps = [], [], []
+        for op, dc in zip(S, centre_displacements):
+            images = relative @ op.T
+            distances, sources = tree.query(images, k=[1,2])
+            if (np.any(distances[:,1]-distances[:,0] <= 2e-12)
+                    or not np.array_equal(np.sort(sources[:,0]), np.arange(len(relative)))):
+                raise ValueError('atomic angular action is ambiguous or not a bijection')
+            dd = images-relative[sources[:,0]]
+            angular_errors.append(float(np.linalg.norm(dd, axis=1).max()))
+            # Convexity of ||dc+r*dd|| bounds the entire radial interval,
+            # including merged representatives of rounded Cartesian ops.
+            point_errors.append(max(float(np.linalg.norm(dc, axis=1).max()),
+                float(np.linalg.norm(dc[:,None]+radius*dd[None], axis=2).max())))
+            nearest_gaps.append(float((distances[:,1]-distances[:,0]).min()))
+        point_bound = max(point_errors)
+        descriptor = dict(lattice_rows_bohr=lattice.tolist(),
+            angular_directions=directions.tolist(), maximum_radius_bohr=radius)
+        geometry_receipt = dict(quadrature_geometry=descriptor,
+            angular_residual_per_bohr_by_op=angular_errors,
+            angular_nearest_gap_by_op=nearest_gaps,
+            radius_endpoint_bound_by_op=point_errors)
+    tolerance = max(2.0e-12, point_bound+margin)
+    if tolerance > 2.0e-11:
+        raise RuntimeError('atomic input roundoff exceeds the fixed 2e-11 fractional ceiling')
+    centre_hash = hashlib.sha256()
+    centre_hash.update(np.asarray(centres.shape, dtype='<i8').tobytes())
+    centre_hash.update(np.ascontiguousarray(centres, dtype='<f8').tobytes())
+    centre_hash.update(np.ascontiguousarray(types, dtype='<i8').tobytes())
+    action_hash = hashlib.sha256()
+    for value, dtype in ((S, '<i8'), (np.asarray(translations)[:len(S)], '<f8'),
+                         (np.asarray(fft_grid).reshape(3), '<i8')):
+        action_hash.update(np.ascontiguousarray(value, dtype=dtype).tobytes())
+    return dict(schema='lorrax.atomic_point_roundoff.v1',
+        atom_centres_frac=centres.tolist(), atom_types=types.tolist(),
+        source_centres_sha256=centre_hash.hexdigest(), action_sha256=action_hash.hexdigest(),
+        centre_residual_by_op=residuals, centre_permutation=permutations,
+        centre_max_residual=maximum, floating_margin=margin,
+        coordinate_abs_bound=coordinate_bound, lookup_tolerance=tolerance,
+        lookup_ceiling=2.0e-11, **geometry_receipt)
+
+
 def centroid_source_map_and_wrap(
     r_mu_fft_idx: np.ndarray,
     sym_matrices: np.ndarray,
@@ -801,6 +982,9 @@ def centroid_source_map_and_wrap(
     extend_trs: bool = False,
     required_rows=None,
     coordinate_kind: str = "fft_indices",
+    fractional_action: str = "raw",
+    fractional_lookup_budget=None,
+    lookup_diagnostics=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build (α_s, L_s) for the BGW-convention r-action ``r' = inv(mtrx)·r + τ``.
 
@@ -859,6 +1043,21 @@ def centroid_source_map_and_wrap(
         Both use the same source action, required-row checks and TRS tables.
         A missing or ambiguous fractional image refuses; no nearest-image
         extrapolation is permitted.
+    fractional_action
+        ``'raw'`` (default) keeps the physical WFN action ``S(r-tau)``.
+        ``'served_fft'`` uses ``S r - t`` with the offsets from
+        :func:`served_fft_source_offsets` for fractional sampling of served
+        FFT wavefunctions.  It requires ``fft_grid`` and leaves the points,
+        strict lookup tolerance, canonical operation rows and wraps intact.
+        The incumbent integer-grid branch is unchanged.
+    fractional_lookup_budget
+        Optional receipt from :func:`atomic_point_lookup_budget`, exclusively
+        for internal atom quadrature under ``'served_fft'``.  The centre and
+        action census is rederived and authenticated, never a free tolerance.
+        Omitted, the generic fractional lookup remains exactly 2e-12.
+    lookup_diagnostics
+        Optional dict filled with achieved match residual and second-neighbor
+        separation.  Permutations and lattice wraps retain the same return API.
     validate
         If True, asserts every row of the result is a permutation
         ``[0, n_rmu)``.  Set False only for offline diagnostics where
@@ -914,6 +1113,10 @@ def centroid_source_map_and_wrap(
     fractional = coordinate_kind == "fractional"
     if coordinate_kind not in ("fft_indices", "fractional"):
         raise ValueError("coordinate_kind must be 'fft_indices' or 'fractional'")
+    if fractional_action not in ("raw", "served_fft"):
+        raise ValueError("fractional_action must be 'raw' or 'served_fft'")
+    if fractional_lookup_budget is not None and (not fractional or fractional_action != 'served_fft'):
+        raise ValueError('atomic lookup budget requires the fractional served FFT action')
     fft_grid_np = None if fractional else np.asarray(fft_grid, dtype=np.int64).reshape(3)
     idx = np.asarray(r_mu_fft_idx, dtype=np.float64 if fractional else np.int64)
     if idx.ndim != 2 or idx.shape[1] != 3:
@@ -946,6 +1149,10 @@ def centroid_source_map_and_wrap(
     r_shifted = r_frac[None, :, :] - tau_frac[:, None, :]            # (n_sym, n_rmu, 3)
     # images_raw[s, μ, i] = (mtrx[s] · r_shifted[s, μ])_i = sum_j S[s,i,j] r_shifted[s,μ,j]
     images_raw = np.einsum('sij,srj->sri', S.astype(np.float64), r_shifted)
+    if fractional and fractional_action == "served_fft":
+        offsets = served_fft_source_offsets(S, translations, fft_grid)
+        images_raw = (np.einsum('sij,srj->sri', S.astype(np.float64), r_frac[None])
+                      - offsets[:, None, :])
     # THE SNAP AND THE WRAP, through the one implementation
     # (:func:`snap_to_grid_and_split_wrap`).  THIS map KEEPS ``L``: it is the
     # lattice vector the image crossed, and it drives the umklapp phase
@@ -954,6 +1161,19 @@ def centroid_source_map_and_wrap(
     if fractional:
         from scipy.spatial import cKDTree
         tol = 2e-12
+        if fractional_lookup_budget is not None:
+            budget = fractional_lookup_budget
+            if not isinstance(budget, dict):
+                raise ValueError('atomic lookup budget must be the canonical receipt')
+            expected = atomic_point_lookup_budget(
+                budget.get('atom_centres_frac'), budget.get('atom_types'),
+                S, translations, fft_grid,
+                quadrature_geometry=budget.get('quadrature_geometry'))
+            if budget != expected:
+                raise ValueError('atomic lookup budget differs from its derived centre/action receipt')
+            if np.max(np.abs(r_frac), initial=0.) > budget['coordinate_abs_bound']:
+                raise ValueError('atomic quadrature exceeds the roundoff coordinate bound')
+            tol = budget['lookup_tolerance']
         img_idx = images_raw % 1.0
         lookup = r_frac % 1.0
         # A tiny negative float can round modulo 1 to exactly 1.0.
@@ -965,8 +1185,18 @@ def centroid_source_map_and_wrap(
         if np.any(distances[:, 1] <= tol):
             raise ValueError(
                 "fractional source map is ambiguous: distinct points are "
-                "within its 2e-12 authentication tolerance")
+                f"within its {tol:.3e} authentication tolerance")
         good = distances[:, 0] <= tol
+        if lookup_diagnostics is not None:
+            lookup_diagnostics.update(fractional_action=fractional_action,
+                lookup_tolerance=tol, maximum_match_residual=float(distances[:, 0].max(initial=0.)),
+                nearest_second_distance_min=float(distances[:, 1].min(initial=np.inf)),
+                nearest_gap_min=float((distances[:, 1]-distances[:, 0]).min(initial=np.inf)),
+                missing_images=int(np.sum(~good)),
+                maximum_match_residual_by_spatial_operation=distances[:, 0].reshape(n_sym, n_rmu).max(axis=1).tolist(),
+                missing_images_by_spatial_operation=(~good).reshape(n_sym, n_rmu).sum(axis=1).tolist(),
+                source_centres_sha256=(None if fractional_lookup_budget is None
+                                      else fractional_lookup_budget['source_centres_sha256']))
         sym_perm = np.where(good, sources[:, 0], -1).reshape(n_sym, n_rmu)
         # Use the matched point to split the lattice wrap, avoiding floor
         # discontinuities at 0 and 1.  The lookup already authenticated the
@@ -998,6 +1228,20 @@ def centroid_source_map_and_wrap(
                 or np.any(rows < 0) or np.any(rows >= n_rows)):
             raise ValueError("required_rows must name canonical centroid action rows")
         required = np.unique(rows % n_sym)
+
+    if (fractional_lookup_budget is not None and required_rows is not None
+            and lookup_diagnostics is not None):
+        # Preserve the complete census while reporting achieved admission
+        # residuals for the exact rows the internal endpoint actually uses.
+        for key in ('maximum_match_residual', 'nearest_second_distance_min',
+                    'nearest_gap_min', 'missing_images'):
+            lookup_diagnostics['all_operation_'+key] = lookup_diagnostics[key]
+        selected = distances.reshape(n_sym, n_rmu, 2)[required]
+        lookup_diagnostics.update(
+            maximum_match_residual=float(selected[..., 0].max(initial=0.)),
+            nearest_second_distance_min=float(selected[..., 1].min(initial=np.inf)),
+            nearest_gap_min=float((selected[..., 1]-selected[..., 0]).min(initial=np.inf)),
+            missing_images=int(np.sum(selected[..., 0] > tol)))
 
     if validate or required_rows is not None:
         bad = (sym_perm < 0)
@@ -1632,6 +1876,7 @@ def resolve_qgrid_symmetry(
     context: str = "",
     required_rows=None,
     coordinate_kind: str = "fft_indices",
+    fractional_action: str = "raw",
 ) -> QgridSymmetryResolution:
     """Resolve the q-grid reduction ONCE: verdict → mode → tables.
 
@@ -1699,6 +1944,10 @@ def resolve_qgrid_symmetry(
         If full closure fails, measure their spatial subset; verdict op
         indices refer to the explicit spatial_rows list in its metric.
         Returned tables always retain the original canonical row IDs.
+    fractional_action
+        Explicit fractional point action, forwarded to the permutation
+        owner.  ``'served_fft'`` measures the same canonical FFT action and
+        records it in the verdict; the default raw physical audit is unchanged.
 
     Returns
     -------
@@ -1707,6 +1956,8 @@ def resolve_qgrid_symmetry(
     idx = np.asarray(r_mu_fft_idx)
     if coordinate_kind not in ("fft_indices", "fractional"):
         raise ValueError("coordinate_kind must be fft_indices or fractional")
+    if fractional_action not in ("raw", "served_fft"):
+        raise ValueError("fractional_action must be 'raw' or 'served_fft'")
     if idx.ndim != 2 or idx.shape[1] != 3:
         raise ValueError(
             f"resolve_qgrid_symmetry: r_mu_fft_idx must be (n_rmu, 3); "
@@ -1730,8 +1981,19 @@ def resolve_qgrid_symmetry(
     # below, which is the code that actually needs commensurability.
     cent_frac = (idx.astype(np.float64) if coordinate_kind == "fractional" else
                  idx.astype(np.float64) / grid[None, :].astype(np.float64))
+    action_tnp, action_tau = tnp, tau
+    served = coordinate_kind == "fractional" and fractional_action == "served_fft"
+    if served:
+        if (tnp is None) == (tau is None):
+            raise ValueError("resolve_qgrid_symmetry: pass exactly one of tnp= or tau=")
+        if tau is not None and np.asarray(tau).size and np.max(np.abs(tau)) > 1.0 + 1e-9:
+            raise ValueError("resolve_qgrid_symmetry: tau= must be fractional; pass BGW tnp as tnp=")
+        raw_tnp = np.asarray(tnp) if tnp is not None else np.asarray(tau) * (2.0 * np.pi)
+        offsets = served_fft_source_offsets(S, raw_tnp, grid)
+        action_tnp = np.linalg.solve(S, offsets[..., None])[..., 0] * (2.0 * np.pi)
+        action_tau = None
     verdict = verify_centroid_orbit_closure(
-        cent_frac, S, tnp=tnp, tau=tau, tol=tol)
+        cent_frac, S, tnp=action_tnp, tau=action_tau, tol=tol)
 
     if required_rows is not None:
         rows = np.asarray(required_rows)
@@ -1743,10 +2005,12 @@ def resolve_qgrid_symmetry(
         if not verdict.closed:
             verdict = verify_centroid_orbit_closure(
                 cent_frac, S[spatial_rows],
-                tnp=None if tnp is None else np.asarray(tnp)[spatial_rows],
-                tau=None if tau is None else np.asarray(tau)[spatial_rows], tol=tol)
+                tnp=None if action_tnp is None else np.asarray(action_tnp)[spatial_rows],
+                tau=None if action_tau is None else np.asarray(action_tau)[spatial_rows], tol=tol)
             verdict = dataclasses.replace(
                 verdict, metric=verdict.metric + ";spatial_rows=" + str(spatial_rows.tolist()))
+    if served:
+        verdict = dataclasses.replace(verdict, metric=verdict.metric + ";action=served_fft")
 
     if not verdict.closed:
         head = verdict.describe().splitlines()[0]
@@ -1767,6 +2031,7 @@ def resolve_qgrid_symmetry(
             extend_trs=extend_trs,
             required_rows=required_rows,
             coordinate_kind=coordinate_kind,
+            fractional_action=fractional_action,
         )
     except RuntimeError as exc:
         first = (str(exc.args[0]).splitlines()[0] if exc.args else str(exc))
@@ -2119,17 +2384,7 @@ def fft_grid_pullback_perm(
     tau_frac = (np.asarray(translations, dtype=np.float64)[:n_sym]
                 / (2.0 * np.pi))                                # (n_sym, 3)
     tau_grid = tau_frac * fg[None, :]
-    tau_grid_residual = np.abs(tau_grid - np.rint(tau_grid))
-    bad_tau = np.argwhere(tau_grid_residual > 1.0e-8)
-    if bad_tau.size:
-        bad_sym, bad_axis = (int(v) for v in bad_tau[0])
-        raise RuntimeError(
-            "fft_grid_pullback_perm: fractional translation is not "
-            f"commensurate with the FFT grid for sym {bad_sym}, axis "
-            f"{bad_axis}: tau_frac={tau_frac[bad_sym].tolist()}, "
-            f"tau*fft_grid={tau_grid[bad_sym].tolist()}, residual="
-            f"{tau_grid_residual[bad_sym, bad_axis]:.6e}. Off-grid "
-            "translations cannot be represented by an FFT-grid permutation.")
+    served_fft_source_offsets(S, translations, fg)  # incumbent commensurability guard
 
     # Real-space transform uses Rinv = inv(S).
     Rinv = np.rint(np.linalg.inv(S)).astype(np.int64)            # (n_sym, 3, 3)

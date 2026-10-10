@@ -25,12 +25,11 @@ the two carrier-comparison spellings were retired, ``gw_config``'s
 ``coulomb_only`` omits spatial-current interactions but retains the same
 normalized four-component charge carrier and scalar-head artifact.
 
-They resolve to the SAME carrier -- ``bispinor_gw`` selects which Lorentz
-blocks are screened, never which four-spinor represents them -- so this
-resolver has exactly two outcomes, bispinor and not.  It stays a resolver
-rather than collapsing into ``bool(bispinor)`` because the artifact
-provenance stamps below are what the zeta and restart-bundle
-authenticators compare against, and those need ONE producer.
+The model names resolve to the same normalized RKB carrier. A bound compact
+charge reconstruction may additionally declare ``pauli2embed4`` for a paired
+two-component control: its four slots contain ``[psi_Pauli; 0]`` and it admits
+only scalar Coulomb fitting with head corrections disabled. This source
+transform is stamped separately from RKB in zeta and restart artifacts.
 
 The representation strings are the provenance stamps written into and
 authenticated from the zeta and restart artifacts.  This
@@ -43,6 +42,17 @@ from dataclasses import dataclass
 NORMALIZED_RKB_FOUR_CURRENT_REPRESENTATION = (
     "normalized_rkb_four_current_v1")
 SOURCE_WFN_CHARGE_REPRESENTATION = "source_wfn_normalized_charge_v1"
+PAULI_ZERO_SMALL_CARRIER = "pauli2embed4"
+PAULI_ZERO_SMALL_PROVENANCE = "Psi=[psi_Pauli;0]; zero-small charge carrier without kinetic-balance lift"
+PAULI_ZERO_SMALL_CHARGE_REPRESENTATION = "pauli_zero_small_charge_v1"
+
+
+def charge_carrier_lift_provenance(carrier):
+    """Name one source transform without conflating zero-small with RKB."""
+    if carrier == PAULI_ZERO_SMALL_CARRIER:
+        return PAULI_ZERO_SMALL_PROVENANCE
+    from common.bispinor_init import kinetic_balance_lift_provenance
+    return kinetic_balance_lift_provenance(carrier)
 
 
 @dataclass(frozen=True)
@@ -50,7 +60,8 @@ class FourCurrentRepresentation:
     """Resolved carrier choices for one GW model.
 
     Charge and current body carriers are named separately so each consumer
-    reads the one it contracts; today both are the normalized RKB lift.
+    reads the one it contracts. An explicit zero-small charge control has no
+    admitted current or scalar-head carrier.
     ``scalar_head_bispinor`` separately governs the canonical scalar
     dipole/head producer.  Keeping those decisions together is what stops
     preprocessing, ISDF, Hartree, and Sigma from inventing local model maps.
@@ -67,15 +78,25 @@ class FourCurrentRepresentation:
 def resolve_four_current_representation(
     bispinor: bool,
     model,
+    *, charge_carrier=None,
 ) -> FourCurrentRepresentation:
     """Resolve all carrier decisions without importing the GW driver.
 
-    ``model`` is accepted and ignored: all shipped ``bispinor_gw`` values
-    ride the same carrier.  The parameter stays so the call
-    sites keep naming the mode they resolved -- when a phase-3 mode needs a
-    different carrier, this is the one function that has to learn about it.
+    All ordinary model names retain their existing RKB decisions. Only a
+    bound charge reconstruction passes ``charge_carrier`` explicitly; its
+    zero-small Pauli control requires the scalar Coulomb-only model.
     """
     from common.bispinor_init import NORMALIZED_RKB_LIFT
+
+    if charge_carrier == PAULI_ZERO_SMALL_CARRIER:
+        if not bool(bispinor) or str(getattr(model, 'value', model)) != 'coulomb_only':
+            raise ValueError('The declared Pauli zero-small carrier requires four-slot scalar Coulomb-only charge fitting')
+        return FourCurrentRepresentation(charge_bispinor=True,
+            charge_lift=PAULI_ZERO_SMALL_CARRIER,current_bispinor=False,
+            current_lift=None,scalar_head_bispinor=False,
+            charge_representation=PAULI_ZERO_SMALL_CHARGE_REPRESENTATION)
+    if charge_carrier not in (None, NORMALIZED_RKB_LIFT):
+        raise ValueError('Unknown explicit scalar charge carrier')
 
     if not bool(bispinor):
         return FourCurrentRepresentation(

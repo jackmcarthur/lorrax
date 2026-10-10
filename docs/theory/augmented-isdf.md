@@ -374,9 +374,17 @@ This compact-support identity does not certify the separate occupied
 Hartree source: its smooth plane-wave density can sample the boundary
 strips. The kernel-aware full-FFT Hartree construction above evaluates both
 smooth-neutral cross terms with the actual slab kernel, without a bulk
-neutral-mean correction. Public slab GW and its full preparation path remain
-guarded until native action and actual source/artifact checks close. The
-slab correction owner alone does not enable a slab head correction.
+neutral-mean correction. Public scalar slab preparation binds a complete
+common compact target and its paired fields through one manifest request;
+the request declares either the normalized RKB charge carrier or the explicit
+zero-small Pauli control on the same common frame. Carrier resolution precedes
+source sampling and basis receipts, and restart admission retains that choice.
+The same bound artifact enters fitting, occupied-source preparation and
+restart identity checks. The live source Gram, C projections, common A and
+physical WFN identity must still pass their existing owners. The first
+public envelope is fixed one-shot, unsmeared and headless. The slab
+correction owner alone does not enable a slab head correction, current
+screening, self-consistency or a physical fitting-accuracy certificate.
 
 This completion does not restore omitted high-G smooth self and cross terms.
 Their cutoff must converge separately. A smooth source cut at energy

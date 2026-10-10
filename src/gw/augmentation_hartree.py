@@ -26,9 +26,9 @@ def _operator_binding(*, wfn, sym, artifact, source_identity, band_range, sys_di
     array_hash = lambda value: hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
     directions, weights, lm, Y, _ = stage._orbit_angular_quadrature(
         artifact['angular'], np.asarray(sym.R_cart))
-    radial = dict(radius_sha256=array_hash(np.asarray(artifact['radial']['radius'], np.float64)),
-        weights_dr_sha256=array_hash(np.asarray(artifact['radial']['weights_dr'], np.float64)),
-        support_radius=float(artifact['radial']['support_radius']))
+    radius, weights_dr, support_radius = stage._radial_grid(artifact['radial'])
+    radial = dict(radius_sha256=array_hash(radius),
+        weights_dr_sha256=array_hash(weights_dr), support_radius=support_radius)
     radial.update({key: artifact['radial'][key] for key in
         ('interpolation_degree', 'quadrature_order', 'fourier_points') if key in artifact['radial']})
 
@@ -58,7 +58,8 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
     """
     from common.parallel_transport import fingerprint_from_binding, WFN_FINGERPRINT_SCHEME
     from file_io.tagged_arrays import normalize_resident_hartree_provenance
-    from .isdf_augmentation import _hartree_source_request
+    from .isdf_augmentation import (_hartree_source_request,
+        _physical_full_wfn_frame_binding)
 
     record = normalize_resident_hartree_provenance(
         provenance, persisted='payload_sha256' in provenance)
@@ -79,6 +80,40 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
     rows = np.asarray(sym.kirr_fullids, int)
     coords = np.asarray(wfn.kvecs(k=sym.parent_k_domain), float)
     expected_fingerprint = fingerprint_from_binding(wfn_fingerprint_binding, wfn)
+    compact = artifact.get('compact_target')
+    compact_binding = (compact['binding'] if compact is not None
+                       else artifact.get('compact_target_binding'))
+    if compact_binding is None:
+        source_policy_matches = (
+            source.get('source_frame_policy') == 'same_actual_served_four_spinor_full_WFN_Lowdin'
+            and prepared_raw is not None and raw == prepared_raw
+            and raw.get('carrier') == 'normalized_rkb'
+            and raw.get('wfn_fingerprint_scheme') == WFN_FINGERPRINT_SCHEME
+            and raw.get('wfn_fingerprint') == expected_fingerprint
+            and raw.get('band_range') == [0, count]
+            and np.array_equal(raw.get('k_parent_frac'), coords))
+    else:
+        saved_frame = (artifact.get('compact_frame_sha256') if compact is None else
+            _physical_full_wfn_frame_binding(compact['frame']['arrays']['inverse_sqrt'], count)
+            ['full150_frame_sha256'])
+        public_identity = artifact.get('public_source_identity', {})
+        source_policy_matches = (
+            compact_binding.get('model') == 'compact_native_pauli_common_frame_v1'
+            and compact_binding.get('carrier') in ('normalized_rkb', 'pauli2embed4')
+            and compact_binding.get('physical_bands') == count
+            and compact_binding.get('complete_all_FILE_parents') is True
+            and compact_binding.get('field_policy') == 'unwindowed_U_of_compact_native_pauli'
+            and compact_binding.get('normalization') == 'one compact target A; no represented-field renormalization'
+            and source.get('source_frame_policy') == 'compact_native_pauli_common_A_before_U'
+            and compact_binding.get('source_frame_policy') == source['source_frame_policy']
+            and source.get('compact_target_binding') == compact_binding
+            and raw == compact_binding and frame == saved_frame
+            and public_identity.get('wfn_sha256') == compact_binding.get('wfn_sha256')
+            and source.get('wfn_sha256') == compact_binding.get('wfn_sha256')
+            and public_identity.get('wfn_fingerprint_scheme') == WFN_FINGERPRINT_SCHEME
+            and public_identity.get('wfn_fingerprint') == expected_fingerprint
+            and source.get('wfn_fingerprint_scheme') == WFN_FINGERPRINT_SCHEME
+            and source.get('wfn_fingerprint') == expected_fingerprint)
     if (plan.sym is not sym or plan.nspinor != 4 or plan.n_parent != int(sym.nk_red)
             or not np.array_equal(plan.parent_full_rows, rows)
             or not np.array_equal(plan.k_parent_frac, coords)
@@ -92,13 +127,7 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
             or source.get('physical_frame_convention') != 'same full-WFN inverse_sqrt columns on reciprocal and atomic band rows'
             or not isinstance(frame, str) or len(frame) != 64
             or any(c not in '0123456789abcdef' for c in frame)
-            or source.get('source_frame_policy') != 'same_actual_served_four_spinor_full_WFN_Lowdin'
-            or prepared_raw is None or raw != prepared_raw
-            or raw.get('carrier') != 'normalized_rkb'
-            or raw.get('wfn_fingerprint_scheme') != WFN_FINGERPRINT_SCHEME
-            or raw.get('wfn_fingerprint') != expected_fingerprint
-            or raw.get('band_range') != [0, count]
-            or not np.array_equal(raw.get('k_parent_frac'), coords)
+            or not source_policy_matches
             or source.get('fft_grid') != list(map(int, wfn.fft_grid))
             or source.get('cell_volume') != float(wfn.cell_volume)):
         raise ValueError('GATE resident_hartree_source: reconstructed source, frame or FILE receiving domain changed')
@@ -124,11 +153,20 @@ def bind_resident_hartree(record, *, wfn, sym, plan, artifact,
     provenance = require_resident_hartree_source(record['provenance'],
         wfn=wfn, sym=sym, plan=plan, artifact=artifact,
         wfn_fingerprint_binding=wfn_fingerprint_binding, band_range=band_range)
+    thin_artifact = {key:artifact[key] for key in ('identity', 'radial', 'angular')}
+    compact = artifact.get('compact_target')
+    if compact is None:
+        thin_artifact['raw_parent_binding'] = (artifact.get('raw_parent_binding') or
+            artifact['raw_parent_moments']['metadata']['binding'])
+    else:
+        from .isdf_augmentation import _physical_full_wfn_frame_binding
+        thin_artifact.update(compact_target_binding=compact['binding'],
+            compact_frame_sha256=_physical_full_wfn_frame_binding(
+                compact['frame']['arrays']['inverse_sqrt'], int(wfn.nbands))['full150_frame_sha256'],
+            public_source_identity=artifact['public_source_identity'])
     return dict(parent_kij_ry=record['parent_kij_ry'], provenance=provenance,
         source_context=dict(wfn_fingerprint_binding=wfn_fingerprint_binding,
-            artifact={**{key: artifact[key] for key in ('identity', 'radial', 'angular')},
-                'raw_parent_binding': (artifact.get('raw_parent_binding') or
-                    artifact['raw_parent_moments']['metadata']['binding'])}, plan=plan))
+            artifact=thin_artifact, plan=plan))
 
 
 def prepare_resident_hartree(*, wfn, sym, mesh, plan, state, artifact,

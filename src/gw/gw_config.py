@@ -3735,6 +3735,28 @@ def warn_headless_shared_pole_self_consistency(config, print_fn=print) -> None:
         "docs/architecture/decisions.md (2026-09-18).")
 
 
+def refuse_unsupported_compact_charge(config, artifact) -> None:
+    """Keep paired common-frame fields inside their proved scalar envelope.
+
+    Compact atomic data are bound after the ordinary deck preflight. This
+    seam prevents those data from inheriting legacy bulk-current or head
+    admission before any wavefunction coefficients are loaded.
+    """
+    if artifact.get('compact_target') is None:
+        return
+    if (not bool(config.bispinor)
+            or coerce_bispinor_gw_mode(config.bispinor_gw) is not BispinorGWMode.COULOMB_ONLY
+            or int(config.sys_dim) not in (2, 3)
+            or config.qp_solver is not QPSolver.ONE_SHOT_DFT
+            or bool(config.density_self_consistent)
+            or config.head.correction is not HeadCorrection.OFF
+            or config.occ_smearing_width_ry is not None
+            or float(config.screening.occ_broadening_ev) != 0.):
+        raise ValueError('GATE public_compact_charge_domain: paired compact fields require '
+            'fixed one-shot unsmeared scalar Coulomb-only GW with head_correction=off; '
+            'current, self-consistent and Gamma-head paths need their own validation')
+
+
 def refuse_unsupported_bispinor_gw(config) -> None:
     """Validate four-current modes and require live direct fields for QSGW; see docs/dev/gw_config_contracts.md."""
     mode = coerce_bispinor_gw_mode(
@@ -3752,16 +3774,28 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             and config.head.correction is HeadCorrection.OFF
             and config.occ_smearing_width_ry is None
             and float(config.screening.occ_broadening_ev) == 0.)
+        slab_charge = (
+            mode is BispinorGWMode.COULOMB_ONLY
+            and int(config.sys_dim) == 2
+            and not bool(config.density_self_consistent)
+            and config.qp_solver is QPSolver.ONE_SHOT_DFT
+            and config.head.correction is HeadCorrection.OFF
+            and config.occ_smearing_width_ry is None
+            and float(config.screening.occ_broadening_ev) == 0.)
         if (not config.bispinor
                 or (mode is not BispinorGWMode.COULOMB_ONLY and not static_current)
-                or int(config.sys_dim) != 3):
+                or (int(config.sys_dim) != 3 and not slab_charge)):
             raise ValueError(
                 "GATE atomic_augmentation_domain: atomic_reconstruction_dir "
                 "requires bispinor=true and sys_dim=3 with bispinor_gw=coulomb_only, "
                 "or bare_transverse with compute_mode=x_only, qp_solver=one_shot_dft, "
                 "head_correction=off and unsmeared insulating occupations. "
+                "The sys_dim=2 scalar completion requires coulomb_only, "
+                "qp_solver=one_shot_dft, density_self_consistent=false, "
+                "head_correction=off and unsmeared occupations, with one "
+                "complete compact target/paired-field manifest binding. "
                 "Reconstructed screened/dynamic photon, transverse Gamma-head "
-                "and truncated-kernel models are outside this static-current domain.")
+                "and truncated current kernels remain outside this domain.")
     if (config.compute_mode is ComputeMode.X_ONLY
             and uses_bare_tt_gamma_head(config) and bool(config.restart)):
         raise ValueError(

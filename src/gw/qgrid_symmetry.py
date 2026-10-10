@@ -237,6 +237,7 @@ def resolve_qgrid_symmetry_tables(
         required_rows=np.asarray(sym.sym_idx_q),
         context=context,
         coordinate_kind=coordinate_kind,
+        fractional_action=("served_fft" if coordinate_kind == "fractional" else "raw"),
     )
     msg = res.announcement() if announce_fallback else None
     if msg is not None:

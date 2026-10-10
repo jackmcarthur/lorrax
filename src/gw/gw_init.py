@@ -1458,6 +1458,7 @@ class _ZetaFitContract:
 	loader_k_chunk: int
 	provenance: str
 	reuse_charge: bool
+	representation: object = None
 	charge_fit_weights: object = None
 	meta_transverse: object = None
 	centroids_transverse: object = None
@@ -1546,7 +1547,7 @@ def _zeta_sphere_convention(wfn, sym, meta, centroid_indices, cutoff, *,
 
 def _resolve_zeta_fit_contract(
 		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
-		*, print_fn=print, atomic_augmentation_identity=None):
+		*, print_fn=print, atomic_augmentation_identity=None, representation=None):
 	"""Resolve all zeta identities and reuse verdicts before fit planning.
 
 	Only host metadata and the canonical :func:`_zeta_reuse_ok` owner are used.
@@ -1675,8 +1676,9 @@ def _resolve_zeta_fit_contract(
 		wfn, sym, meta_transverse, centroids_transverse, zeta_cutoff,
 		write_ibz_only=write_ibz_only_transverse)
 		if meta_transverse is not None else None)
-	representation = resolve_four_current_representation(
-		cfg.bispinor, cfg.bispinor_gw)
+	if representation is None:
+		representation = resolve_four_current_representation(
+			cfg.bispinor, cfg.bispinor_gw)
 	# Every zeta names its carrier, so a zeta fit on another lift refits.
 	provenance = _zeta_fit_provenance(
 		wfn=wfn, meta=meta, cfg=cfg,
@@ -1771,6 +1773,7 @@ def _resolve_zeta_fit_contract(
 		loader_k_chunk=loader_k_chunk,
 		provenance=provenance,
 		reuse_charge=bool(reuse_charge),
+		representation=representation,
 		charge_fit_weights=charge_fit_weights,
 		meta_transverse=meta_transverse,
 		centroids_transverse=centroids_transverse,
@@ -2410,6 +2413,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 		zeta_contract = _resolve_zeta_fit_contract(
 			wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices,
 			tmp_dir, print_fn=print_fn)
+	if getattr(zeta_contract, 'representation', None) is not None:
+		representation = zeta_contract.representation
 	band_range_left = zeta_contract.band_range_left
 	band_range_right = zeta_contract.band_range_right
 	zeta_h5_path = zeta_contract.zeta_h5_path
@@ -2921,15 +2926,25 @@ def _prepare_fresh_parent_faces(
     # is no process-global memoization of files that could later be replaced.
     augmentation_artifact = None
     if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
-        from .isdf_augmentation import read_augmentation_manifest
+        from .isdf_augmentation import read_bound_augmentation_manifest
+        from .gw_config import refuse_unsupported_compact_charge
         with timing.section('augmentation.manifest_and_cache_read'):
-            augmentation_artifact = read_augmentation_manifest(
-                cfg.paths.atomic_reconstruction_dir)
+            augmentation_artifact = read_bound_augmentation_manifest(
+                cfg.paths.atomic_reconstruction_dir, wfn=wfn, sym=sym,
+                wfn_fingerprint_binding=basis_wfn_fingerprint_binding)
+        refuse_unsupported_compact_charge(cfg, augmentation_artifact)
+        if int(cfg.sys_dim) == 2 and augmentation_artifact.get('compact_target') is None:
+            raise ValueError('GATE public_scalar_slab_compact: sys_dim=2 requires the complete compact target/paired-field manifest binding')
+        if augmentation_artifact.get('compact_target') is not None:
+            representation = resolve_four_current_representation(
+                cfg.bispinor, cfg.bispinor_gw,
+                charge_carrier=augmentation_artifact['compact_target']['carrier'])
     zeta_contract = _resolve_zeta_fit_contract(
         wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices,
         tmp_dir, print_fn=print0,
         atomic_augmentation_identity=(None if augmentation_artifact is None
-                                      else augmentation_artifact['identity']))
+                                      else augmentation_artifact['identity']),
+        representation=representation)
     charge_zeta_identity_receipt = charge_zeta_identity(
         zeta_contract.provenance, wfn=wfn,
         wfn_fingerprint_binding=basis_wfn_fingerprint_binding)
@@ -2970,7 +2985,7 @@ def _prepare_fresh_parent_faces(
                                  b_id_4_user=_all_bands)
             _load_range = (0, int(_face_stop))
             print0(f"  Augmentation overlap convention: full-WFN Löwdin on {_all_bands} bands; "
-                   "DFT energy labels retained as an effective vertex model.")
+                   "DFT energy labels retained in the reconstructed fitting-band model.")
     with timing.section("gw_jax.load_centroid_wfns"):
         if _mb_plan is not None:
                 # ONE ψ(G) pass (loader tables 2026-09-23): each band chunk is read
@@ -3047,6 +3062,8 @@ def _prepare_fresh_parent_faces(
                 hartree_source_request={'occupations': None, 'full_kweights': None,
                                         'spin_degeneracy': 1.},
                 print_fn=print0, artifact=augmentation_artifact)
+        from .isdf_augmentation import require_public_compact_wfn_source
+        require_public_compact_wfn_source(augmentation_artifact, wfn)
         from .augmentation_hartree import prepare_resident_hartree
         with timing.section('gw_jax.augmented_hartree_receiving'):
             chunks['resident_hartree'], _hartree_diagnostics = prepare_resident_hartree(
@@ -3191,7 +3208,8 @@ def _write_fresh_restart(
         restart_tensor_writes_enabled, sigma_parent_carrier, sym, take_pre_unfold,
         tensors_filename, transverse_wfn_data, wfn, wfns_transverse,
         write_restart_state_to_h5, *, charge_zeta_provenance,
-        atomic_augmentation_identity=None, resident_hartree=None):
+        atomic_augmentation_identity=None, resident_hartree=None,
+        charge_representation=None):
     """Write the existing authenticated Coulomb and parent-face restart bundle."""
     enk_full, _ = get_enk_bandrange(
         wfn, sym, band_slices.full_range,
@@ -3267,7 +3285,8 @@ def _write_fresh_restart(
                                 _f.attrs['centroids_charge_coordinate_kind'] = meta.mu_basis.coordinate_kind
                                 _f.attrs['bispinor_gw'] = cfg.bispinor_gw.value
                                 _f.attrs['charge_representation'] = (
-                                        resolve_four_current_representation(
+                                        charge_representation if charge_representation is not None
+                                        else resolve_four_current_representation(
                                                 cfg.bispinor, cfg.bispinor_gw).charge_representation)
                                 if transverse_wfn_data is not None:
                                         _f.attrs['centroids_transverse_md5'] = (
@@ -3293,21 +3312,19 @@ def _prepare_fresh_isdf(
     """Produce the fitted Coulomb and wavefunction state with restart provenance."""
     from common.parallel_transport import bind_wfn_fingerprint
     basis_wfn_fingerprint_binding = bind_wfn_fingerprint(wfn)
-    charge_basis_receipt = WavefunctionBasisReceipt.from_bound_source(
-    	wfn=wfn,
-    	wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
-    	role='charge', bispinor=bool(int(meta.nspinor) == 4),
-    	bispinor_lift=(representation.charge_lift or "raw"),
-    	band_interval=_basis_band_interval,
-    	fft_grid=meta.fft_grid, centroid_fft_idx=centroid_indices,
-        coordinate_kind=meta.mu_basis.coordinate_kind,
-    	n_rmu_logical=int(meta.n_rmu),
-    	n_rmu_padded=int(meta.n_rmu_padded))
     from common.wfn_transforms import get_enk_bandrange
     with mesh_xy:
         (zeta_contract, charge_zeta_identity_receipt, _candidate_plan, _parent_green_plan, chunks, _parent_zeta_plan, _parent_green_faces) = _prepare_fresh_parent_faces(
             band_slices, basis_wfn_fingerprint_binding, centroid_indices, cfg,
             load_centroids_band_chunked, mesh_xy, meta, print0, representation, sym, tmp_dir, wfn)
+        representation = zeta_contract.representation
+        charge_basis_receipt = WavefunctionBasisReceipt.from_bound_source(
+            wfn=wfn, wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+            role='charge', bispinor=bool(int(meta.nspinor) == 4),
+            bispinor_lift=(representation.charge_lift or "raw"),
+            band_interval=_basis_band_interval, fft_grid=meta.fft_grid,
+            centroid_fft_idx=centroid_indices, coordinate_kind=meta.mu_basis.coordinate_kind,
+            n_rmu_logical=int(meta.n_rmu), n_rmu_padded=int(meta.n_rmu_padded))
         resident_hartree = None if chunks is None else chunks.pop('resident_hartree', None)
         (zeta_path, mem_est, transverse_wfn_data, transverse_basis_receipt) = _prepare_fitted_zeta(
             WavefunctionBasisReceipt, _basis_band_interval, _parent_green_faces, _parent_zeta_plan,
@@ -3331,7 +3348,8 @@ def _prepare_fresh_isdf(
             charge_zeta_provenance=zeta_contract.provenance,
             atomic_augmentation_identity=json.loads(
                 zeta_contract.provenance).get('atomic_augmentation'),
-            resident_hartree=resident_hartree)
+            resident_hartree=resident_hartree,
+            charge_representation=representation.charge_representation)
         if ((hasattr(zeta_path, 'contract_v') or cfg.bispinor)
                 and jax.process_index() == 0):
             # Route G's stage split through V_q (read, faces, C, fit, V_q),
@@ -3399,13 +3417,14 @@ def _require_restart_charge_fit_weights(tensors_filename, expected_policy, *,
 
 def _read_authenticated_restart(
         _to_run_order, band_slices, cfg, load_restart_state_from_h5, mesh_xy, meta, print0,
-        tensors_filename, *, charge_fit_context):
+        tensors_filename, *, charge_fit_context, augmentation_artifact=None):
     """Produce the validated stored tensors and their charge zeta identity."""
     from file_io.restart_bundle import require_atomic_augmentation_match
     identity = None
     if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
-        from .isdf_augmentation import augmentation_identity
-        identity = augmentation_identity(cfg.paths.atomic_reconstruction_dir)
+        if augmentation_artifact is None:
+            raise AssertionError('Augmented restart requires its SAME authenticated bound artifact')
+        identity = augmentation_artifact['identity']
     require_atomic_augmentation_match(tensors_filename, identity)
     expected_policy = _charge_fit_endpoint_weights(
         cfg, charge_fit_context['wfn'], band_slices, print_fn=print0)
@@ -3434,7 +3453,7 @@ def _read_authenticated_restart(
 def _restart_charge_basis(
         WavefunctionBasisReceipt, _basis_band_interval, _restart_wfn_provenance_complete,
         basis_wfn_fingerprint_binding, centroid_indices, charge_basis_receipt, meta, print0,
-        tensors_filename, wfn, *, bispinor_gw):
+        tensors_filename, wfn, *, bispinor_gw, representation=None):
     """Produce the restart centroid stamps and authenticated charge basis receipt."""
     _stamped = {}
     try:
@@ -3453,7 +3472,8 @@ def _restart_charge_basis(
     # DEV Pauli operands are explicitly charge-only and must retain that tag.
     from common.four_current_model import (
         resolve_four_current_representation as _resolve_restart_charge)
-    _charge = _resolve_restart_charge(int(meta.nspinor) == 4, bispinor_gw)
+    _charge = (representation if representation is not None else
+               _resolve_restart_charge(int(meta.nspinor) == 4, bispinor_gw))
     if (int(meta.nspinor) == 4 and _stamped.get('charge_representation')
             != _charge.charge_representation):
     	raise ValueError(
@@ -3729,11 +3749,22 @@ def _prepare_restart_isdf(
     	_restart_source_record is not None)
     resident_hartree = None
     _hartree_artifact = None
+    representation = resolve_four_current_representation(cfg.bispinor, cfg.bispinor_gw)
     if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
-        from .isdf_augmentation import read_augmentation_manifest
+        from .isdf_augmentation import read_bound_augmentation_manifest
+        from .gw_config import refuse_unsupported_compact_charge
         from .augmentation_hartree import require_resident_hartree_source
         from file_io.restart_bundle import read_resident_hartree_metadata
-        _hartree_artifact = read_augmentation_manifest(cfg.paths.atomic_reconstruction_dir)
+        _hartree_artifact = read_bound_augmentation_manifest(
+            cfg.paths.atomic_reconstruction_dir, wfn=wfn, sym=sym,
+            wfn_fingerprint_binding=basis_wfn_fingerprint_binding)
+        refuse_unsupported_compact_charge(cfg, _hartree_artifact)
+        if int(cfg.sys_dim) == 2 and _hartree_artifact.get('compact_target') is None:
+            raise ValueError('GATE public_scalar_slab_compact: sys_dim=2 requires the complete compact target/paired-field manifest binding')
+        if _hartree_artifact.get('compact_target') is not None:
+            representation = resolve_four_current_representation(
+                cfg.bispinor, cfg.bispinor_gw,
+                charge_carrier=_hartree_artifact['compact_target']['carrier'])
         _hartree_plan, _, _ = _prepare_parent_wavefunction_plan(
             cfg, meta, wfn, band_slices, sym=sym, centroid_indices=centroid_indices,
             mesh_xy=mesh_xy, print_fn=print0)
@@ -3750,11 +3781,12 @@ def _prepare_restart_isdf(
             tensors_filename, charge_fit_context={
                 'wfn': wfn,
                 'wfn_fingerprint_binding': basis_wfn_fingerprint_binding,
-                'tmp_dir': tmp_dir})
+                'tmp_dir': tmp_dir}, augmentation_artifact=_hartree_artifact)
         (_stamped, charge_basis_receipt) = _restart_charge_basis(
             WavefunctionBasisReceipt, _basis_band_interval, _restart_wfn_provenance_complete,
             basis_wfn_fingerprint_binding, centroid_indices, charge_basis_receipt, meta, print0,
-            tensors_filename, wfn, bispinor_gw=cfg.bispinor_gw)
+            tensors_filename, wfn, bispinor_gw=cfg.bispinor_gw,
+            representation=representation)
         stored_mode = _stamped.get("bispinor_gw")
         requested_mode = cfg.bispinor_gw.value
         # Historical four-current bundles predate this interaction stamp.  Their

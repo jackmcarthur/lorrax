@@ -134,6 +134,7 @@ class CentroidKUnfoldPlan:
     parent_full_rows: np.ndarray | None = None
     sym: object = None
     coordinate_kind: str = "fft_indices"
+    fractional_lookup_receipt: dict | None = None
 
     @property
     def n_parent(self) -> int:
@@ -372,6 +373,7 @@ def build_centroid_k_unfold_plan(
     parent_k_frac=None,
     layout=None,
     coordinate_kind: str = "fft_indices",
+    fractional_lookup_budget=None,
 ) -> CentroidKUnfoldPlan:
     """Bind canonical symmetry tables to one orbit-packed centroid basis.
 
@@ -386,8 +388,11 @@ def build_centroid_k_unfold_plan(
     for Bloch phases here, never as a source of parent wavefunctions.
 
     ``coordinate_kind='fractional'`` binds exact off-grid fractional points
-    through the same symmetry service.  This is the atom-quadrature RHS
-    endpoint; it never changes or invents FFT-grid indices.
+    through the served FFT affine action of the same symmetry service.
+    This is the atom-quadrature RHS endpoint; it never changes or invents
+    FFT-grid indices or alters the raw WFN translations kept in the plan.
+    An explicit ``fractional_lookup_budget`` is restricted to the internal
+    atomic-centre roundoff receipt; generic centroid lookup stays strict.
     """
     shape = tuple(int(mesh_xy.shape[a]) for a in ('x', 'y'))
     if shape[0] != shape[1]:
@@ -400,6 +405,7 @@ def build_centroid_k_unfold_plan(
             f"build_centroid_k_unfold_plan: nspinor must be 1, 2 or 4; got {ns}.")
 
     n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
+    lookup = {} if fractional_lookup_budget is not None else None
     sym_perm, wraps = centroid_source_map_and_wrap(
         np.asarray(centroid_fft_idx, dtype=(np.float64 if coordinate_kind == "fractional"
                                           else np.int32)),
@@ -408,7 +414,19 @@ def build_centroid_k_unfold_plan(
         np.asarray(fft_grid, dtype=np.int32),
         extend_trs=True, required_rows=np.asarray(sym.sym_idx_k),
         coordinate_kind=coordinate_kind,
+        fractional_action=("served_fft" if coordinate_kind == "fractional" else "raw"),
+        fractional_lookup_budget=fractional_lookup_budget,
+        lookup_diagnostics=lookup,
     )
+    if fractional_lookup_budget is not None:
+        # Internal atomic endpoints only consume the authenticated k-action
+        # rows. Optional unused rows can lose closure as a radial packet
+        # changes; they must not alter the orbit packing or reusable tables.
+        required = np.unique(np.asarray(sym.sym_idx_k, dtype=np.int32))
+        unused = np.setdiff1d(np.arange(sym_perm.shape[0]), required)
+        sym_perm[unused] = -1
+        wraps[unused] = 0
+        lookup['required_action_rows'] = required.tolist()
     available = np.all(sym_perm >= 0, axis=1)
     groups = permutation_orbit_labels(sym_perm[available])
     if layout is None:
@@ -464,6 +482,7 @@ def build_centroid_k_unfold_plan(
             else None),
         sym=sym,
         coordinate_kind=coordinate_kind,
+        fractional_lookup_receipt=lookup,
     )
 
 

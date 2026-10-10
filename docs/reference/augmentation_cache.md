@@ -49,6 +49,51 @@ Preserve old artifacts with their immutable source snapshots. Numerical
 equivalence to an older target is a separate measured proof, not an alias
 of its cache identity or fitting-accuracy certificate.
 
+## Common compact target in scalar GW
+
+The public manifest may contain one `compact_target_request` for the existing
+full-FILE common-frame and paired-field loader. The request contains exactly
+`frame_file`, `frame_sha256`, `wfn_sha256`, `carrier`, and `species_fields`.
+Each species entry contains exactly `file`, `file_sha256`, and
+`common_spectrum_sha256`; species keys are atomic numbers as strings.
+Paths resolve relative to the manifest directory, or may be absolute.
+The manifest and request must name the same carrier: `normalized_rkb` or
+`pauli2embed4`. The latter loads the two physical Pauli components once and
+embeds them as `[psi_Pauli; 0]` in the existing four-slot fitting source.
+It uses the same common A and paired atomic spectrum, without a second
+normalization or kinetic-balance lift. Its distinct charge basis stamp is
+preserved through fitting and restart; it cannot serve spatial currents or
+scalar head corrections.
+
+This request requires `field_policy = unwindowed_U_of_compact_native_pauli`,
+the full-WFN overlap policy, and served-monopole enrichment. It authenticates
+the existing complete physical C/D/B/G0/A target and the paired atomic fields.
+The public loader streams the currently loaded WFN file on rank zero and
+broadcasts its whole-file SHA256 through the existing collective control
+owner. That digest must match the declared target source; paths may differ
+for byte-identical copies. The driver also joins its existing opaque WFN
+fingerprint to the occupied source. Neither fitting nor
+serving recalculates a second factor or normalizes the fields after U.
+The source digest is checked again after coefficient preparation and before
+the first fit publication; ordinary Sigma contractions do not rehash files.
+
+Fresh preparation, resident Hartree and restart authentication consume the
+same bound artifact identity. Both explicit radial arrays and log-Simpson
+controls decode through the fitting stage's radial owner. The resident
+Hartree record retains only its band matrix and small source/geometry
+bindings; complete C/D/B/A arrays do not survive in its serving context.
+A receiving matrix for an edge-only diagnostic cannot cover a wider GW
+band window, even when its transport carrier is padded to that window.
+
+The admitted public compact envelope is fixed one-shot, unsmeared,
+`bispinor_gw = coulomb_only`, with `head_correction = off`. A slab uses
+`sys_dim = 2` and the already implemented scalar `vcoul.Slab2D` completion.
+Static and frequency-dependent scalar screening use the same corrected
+samples and Coulomb tensor through their existing downstream contractions.
+Current, self-consistent and Gamma-head routes retain explicit refusals.
+This API admission supplies no numerical convergence certificate; actual
+source/action, Coulomb-fitting and Sigma convergence remain separate tests.
+
 The target changes reconstructed wavefunctions and their measured full-WFN
 overlap. The fitting stage must form its own full-band Lowdin factor before
 cropping public bands. Original PS projection/dual semantics remain fixed;
@@ -122,13 +167,14 @@ The file path is relative to the atomic manifest directory or absolute;
 the consuming cell, ordered atoms, actual q rows, support and canonical lm
 must match its metadata exactly. The positive correction metric supports
 bulk3D or the explicitly bound compact-layer slab2D kernel. The separate
-private slab Hartree owner evaluates both smooth-neutral cross terms with
+slab Hartree owner evaluates both smooth-neutral cross terms with
 the public truncated kernel on the full FFT grid and adds no bulk Gamma
 neutral-mean correction. Its operator and kernel identities are separate
-from this geometry cache. Public augmented slab GW and full reconstructed
-preparation remain guarded pending native action and actual source/artifact
-validation; CPU mathematical controls do not supply that admission. Legacy
-metric manifests retain their existing policy.
+from this geometry cache. Public augmented slab preparation requires the
+complete common compact target binding above, together with the actual
+live source/action checks. CPU mathematical controls alone do not certify
+the physical reconstruction or its convergence. Legacy metric manifests
+retain their existing policy.
 
 Before allocating the global metric, the positive provider plans its same
 two public GEMMs from a shape descriptor and prices the distributed Gram,

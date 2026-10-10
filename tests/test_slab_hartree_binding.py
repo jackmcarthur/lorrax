@@ -81,7 +81,7 @@ def test_slab_source_response_kernel_mismatch_refuses(changed):
 
 def test_resident_operator_binding_distinguishes_bulk_and_slab():
     artifact = dict(identity='test physical atom',
-        radial=dict(radius=[.1, .2], weights_dr=[.05, .1], support_radius=1.5),
+        radial=dict(radius=[.1, .2, .3, .4], weights_dr=[.05, .1, .1, .05], support_radius=1.5),
         angular=dict(lebedev_order=3, lmax=0, orthogonality_tolerance=1e-10))
     sym = SimpleNamespace(R_cart=np.eye(3)[None], kirr_fullids=np.array([0]),
                           parent_k_domain='file')

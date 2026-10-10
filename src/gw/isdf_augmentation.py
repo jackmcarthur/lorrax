@@ -59,11 +59,18 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
     path = root / "manifest.json"
     raw = path.read_bytes()
     manifest = json.loads(raw)
+    request = manifest.get('compact_target_request')
+    pauli_control = (manifest.get('carrier') == 'pauli2embed4'
+        and isinstance(request, dict) and request.get('carrier') == 'pauli2embed4'
+        and manifest.get('field_policy') == 'unwindowed_U_of_compact_native_pauli')
     if (manifest.get("schema") != SCHEMA
-            or manifest.get("carrier") != "normalized_rkb"
+            or (manifest.get("carrier") != "normalized_rkb" and not pauli_control)
             or manifest.get("frozen_core_policy") != "reconstruct_valence_only"):
-        raise ValueError("augmentation manifest must declare normalized_rkb and reconstruct_valence_only")
+        raise ValueError("augmentation manifest must declare its normalized_rkb or explicit paired Pauli charge carrier and reconstruct_valence_only")
     paired_policy = manifest.get('field_policy')
+    if 'compact_target_request' in manifest and (paired_policy is None
+            or not isinstance(manifest['compact_target_request'], dict)):
+        raise ValueError('compact_target_request requires the explicit paired native field policy')
     if paired_policy is not None:
         from psp.augmentation_cache import PAIRED_COMPACT_PAULI_FIELD_POLICY
         if (paired_policy != PAIRED_COMPACT_PAULI_FIELD_POLICY
@@ -295,9 +302,86 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
                 identity=digest.hexdigest(),directory=str(root))
 
 
+def _whole_wfn_source_sha256(wfn):
+    """Stream one loaded source file on rank zero and broadcast its digest."""
+    from common.collectives import rank0_transaction
+
+    source_path = getattr(wfn, 'path', None)
+    if source_path is None:
+        raise ValueError('Public compact reconstruction requires the loaded WFN source path')
+    source_path = Path(source_path).resolve()
+    def source_digest():
+        digest = hashlib.sha256()
+        with source_path.open('rb') as stream:
+            for block in iter(lambda: stream.read(4*1024**2), b''):
+                digest.update(block)
+        return digest.hexdigest()
+    return rank0_transaction(str(source_path), stage='compact_target_WFN_identity',
+        write=source_digest, return_value=True)
+
+
+def require_public_compact_wfn_source(artifact, wfn):
+    """Recheck source bytes after coefficient preparation, before fit publication."""
+    if artifact.get('compact_target') is not None:
+        if (_whole_wfn_source_sha256(wfn)
+                != artifact['public_source_identity']['wfn_sha256']):
+            raise ValueError('Public compact WFN file changed during coefficient preparation')
+
+
+def read_bound_augmentation_manifest(directory, *, wfn, sym,
+                                     wfn_fingerprint_binding=None):
+    """Read and bind the public charge reconstruction once per invocation.
+
+    One optional manifest ``compact_target_request`` contains the existing
+    compact frame/paired-field request. Its file paths are relative to the
+    manifest directory. The existing numerical owners authenticate every
+    target and field before the SAME artifact enters fitting and restart.
+    The manifest and request name the same carrier: normalized RKB or the
+    explicit zero-small Pauli charge control. The public source receipt and
+    restart identity retain this choice throughout fitting.
+    """
+    from common.parallel_transport import (WFN_FINGERPRINT_SCHEME,
+        fingerprint_from_binding, wfn_fingerprint)
+
+    artifact = read_augmentation_manifest(directory)
+    request = artifact.get('compact_target_request')
+    if request is None:
+        return artifact
+    if (request.get('carrier') not in ('normalized_rkb', 'pauli2embed4')
+            or request.get('carrier') != artifact.get('carrier')):
+        raise ValueError('GATE public_compact_charge_carrier: manifest and complete compact request must declare the SAME charge carrier')
+    root = Path(artifact['directory'])
+    request = dict(request)
+    if (not isinstance(request.get('frame_file'), str)
+            or not isinstance(request.get('species_fields'), dict)
+            or any(not isinstance(control, dict) or not isinstance(control.get('file'), str)
+                   for control in request['species_fields'].values())):
+        raise ValueError('compact target request requires explicit frame and species file paths')
+    request['frame_file'] = str((root/request['frame_file']).resolve())
+    request['species_fields'] = {z:dict(control,
+        file=str((root/control['file']).resolve()))
+        for z,control in request['species_fields'].items()}
+    # The prepared target carries a separate whole-WFN digest. Its ordinary
+    # input-file map need not contain the WFN, so authenticate the currently
+    # loaded file explicitly. Only rank zero streams bytes; the collective
+    # owner broadcasts this small control value, never a wavefunction array.
+    actual_sha = _whole_wfn_source_sha256(wfn)
+    if actual_sha != request['wfn_sha256']:
+        raise ValueError('Public compact frame does not authenticate the currently loaded WFN file')
+    artifact = bind_compact_target_artifact(artifact, request, wfn=wfn, sym=sym)
+    fingerprint = (wfn_fingerprint(wfn) if wfn_fingerprint_binding is None
+                   else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
+    return dict(artifact, public_source_identity=dict(
+        wfn_sha256=actual_sha, wfn_fingerprint_scheme=WFN_FINGERPRINT_SCHEME,
+        wfn_fingerprint=fingerprint))
+
+
 def augmentation_identity(directory):
-    """Content identity for fitting and restart provenance, after authentication."""
-    return read_augmentation_manifest(directory)["identity"]
+    """Legacy content identity; a compact request requires its live bound artifact."""
+    artifact = read_augmentation_manifest(directory)
+    if artifact.get('compact_target_request') is not None:
+        raise ValueError('Compact augmentation identity requires the SAME live bound artifact')
+    return artifact['identity']
 
 
 def _radial_grid(control):
@@ -322,37 +406,14 @@ def _radial_grid(control):
 
 def _orbit_angular_quadrature(control, cartesian_rotations):
     """Average a Lebedev rule over actual crystal rotations, then merge duplicates."""
-    from scipy.integrate import lebedev_rule
-    from scipy.spatial import cKDTree
     from scipy.special import sph_harm_y
+    from isdf.atomic_moments import orbit_averaged_spherical_rule
 
     order = int(control["lebedev_order"])
     lmax = int(control["lmax"])
     if lmax < 0 or order < 2*lmax:
         raise ValueError("Lebedev polynomial order must cover twice the retained density lmax")
-    xyz, weights = lebedev_rule(order)
-    directions = np.asarray(xyz, dtype=np.float64).T
-    weights = np.asarray(weights, dtype=np.float64)
-    matrices = np.asarray(cartesian_rotations,dtype=np.float64)
-    if matrices.ndim != 3 or matrices.shape[1:] != (3,3) or not len(matrices):
-        raise ValueError("angular orbit closure requires the symmetry owner's Cartesian operation rows")
-    if np.max(np.abs(matrices @ matrices.transpose(0, 2, 1)-np.eye(3))) > 2e-10:
-        raise ValueError("crystal Cartesian rotations are inconsistent with augmentation lattice rows")
-    full = np.concatenate([directions @ op for op in matrices])
-    full_weights = np.tile(weights/len(matrices), len(matrices))
-    tree = cKDTree(full)
-    used = np.zeros(len(full), dtype=bool)
-    rows, totals = [], []
-    for i in range(len(full)):
-        if used[i]:
-            continue
-        same = np.asarray(tree.query_ball_point(full[i], 2e-12), dtype=int)
-        if np.max(np.linalg.norm(full[same]-full[i], axis=1)) > 2e-12:
-            raise ValueError("ambiguous angular orbit merge")
-        used[same] = True
-        rows.append(full[i])
-        totals.append(np.sum(full_weights[same]))
-    directions, weights = np.asarray(rows), np.asarray(totals)
+    directions, weights = orbit_averaged_spherical_rule(order, cartesian_rotations)
     lm = np.asarray([(l, m) for l in range(lmax+1) for m in range(-l, l+1)], dtype=np.int32)
     theta = np.arccos(np.clip(directions[:, 2], -1, 1))
     phi = np.arctan2(directions[:, 1], directions[:, 0])
@@ -618,17 +679,27 @@ def _sample_geometry(points, active, centers, lattice, caches, atom_types, kfrac
         yield delta, phase
 
 
-def _packet_plan(plan, points, first=None):
+def _packet_plan(plan, points, first=None, *, fractional_lookup_budget=None):
     from .centroid_k_unfold import build_centroid_k_unfold_plan
 
     right = build_centroid_k_unfold_plan(plan.sym, points, plan.fft_grid, plan.mesh_xy,
         nspinor=4, parent_k_frac=plan.k_parent_frac, coordinate_kind='fractional',
+        fractional_lookup_budget=fractional_lookup_budget,
         layout=None if first is None else first.layout)
     if first is None:
         return right
     for name in ('sym_perm', 'L_table'):
         if not np.array_equal(getattr(first, name), getattr(right, name)):
             raise ValueError(f"atomic radial packets change canonical {name}; choose sphere/packet geometry with one authenticated transport table")
+    if first.fractional_lookup_receipt is not None:
+        current = right.fractional_lookup_receipt
+        if (current is None or current['source_centres_sha256'] != first.fractional_lookup_receipt['source_centres_sha256']
+                or current['lookup_tolerance'] != first.fractional_lookup_receipt['lookup_tolerance']):
+            raise ValueError('atomic radial packets change their authenticated lookup budget')
+        first.fractional_lookup_receipt['maximum_match_residual'] = max(
+            first.fractional_lookup_receipt['maximum_match_residual'], current['maximum_match_residual'])
+        for key in ('nearest_second_distance_min', 'nearest_gap_min'):
+            first.fractional_lookup_receipt[key] = min(first.fractional_lookup_receipt[key], current[key])
     return first
 
 
@@ -1016,13 +1087,22 @@ def _served_monopole_rhs(plan, faces, coefficients, overlaps, geometry, mesh,
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.staged_reshard import face_to_batch_reshard
-    from isdf.atomic_moments import auxiliary_charge_geometry, make_auxiliary_monopole_compressor
+    from isdf.atomic_moments import (auxiliary_charge_geometry, make_auxiliary_monopole_compressor,
+                                     orbit_averaged_spherical_rule)
     from isdf.local_rhs import local_density_rhs
 
-    atoms = [auxiliary_charge_geometry(geometry['caches'][int(z)]) for z in geometry['atom_types']]
+    rotations = np.asarray(plan.sym.R_cart)[:len(plan.spatial_ops)]
+    atoms = [auxiliary_charge_geometry(geometry['caches'][int(z)],
+        cartesian_rotations=rotations) for z in geometry['atom_types']]
     points = np.concatenate([center+atom['relative_points'] @ np.linalg.inv(geometry['lattice'])
                              for center,atom in zip(geometry['centers'],atoms)])
-    right = _packet_plan(plan,points)
+    from symmetry_maps import atomic_point_lookup_budget
+    auxiliary_directions, _ = orbit_averaged_spherical_rule(7, rotations)
+    auxiliary_lookup = atomic_point_lookup_budget(geometry['centers'], geometry['atom_types'],
+        plan.spatial_ops, plan.translations, plan.fft_grid, quadrature_geometry=dict(
+            lattice_rows_bohr=np.asarray(geometry['lattice']).tolist(),
+            angular_directions=auxiliary_directions.tolist(), maximum_radius_bohr=.7))
+    right = _packet_plan(plan,points, fractional_lookup_budget=auxiliary_lookup)
     axis = right.layout.axis
     weights = np.zeros((len(atoms),len(points)),np.float64)
     npar,nb = coefficients[0].shape[:2]
@@ -1070,7 +1150,10 @@ def _served_monopole_rhs(plan, faces, coefficients, overlaps, geometry, mesh,
                   out_shardings=NamedSharding(mesh,P(('x','y'),None,None)))(rhs)
     return rhs,dict(carrier=atoms[0]['carrier'],radial_points=8,angular_order=7,
                     auxiliary_radius=.7,points_per_atom=[len(a['relative_points']) for a in atoms],
-                    signed_factor_receipts=[a['factor_receipts'] for a in atoms])
+                    angular_points=len(atoms[0]['relative_points'])//8,
+                    angular_rule='spatial_rotation_average',
+                    signed_factor_receipts=[a['factor_receipts'] for a in atoms],
+                    atomic_point_lookup=right.fractional_lookup_receipt)
 
 
 def _hartree_source_request(request, *, wfn, plan, public_range):
@@ -1340,13 +1423,14 @@ def _current_contract_workspace_bytes(*, qpad, mu, atoms, harmonics, radial_poin
 
 
 def bind_compact_target_artifact(artifact, request, *, wfn, sym):
-    """Bind a private common-target preparation to one unchanged ISDF stage.
+    """Bind a common-target preparation to one unchanged ISDF stage.
 
     ``request`` pins the full-FILE compact C/D/B/G0/A file, the authoritative
     whole-WFN SHA256, one four-slot carrier and exact species field files.
     This returns a new plain artifact; the caller must pass that SAME
-    artifact to preparation and receiving J. Public GW/slab admission guards
-    remain in force. No saved factor is accepted without the live checks in
+    artifact to preparation and receiving J. Public admission also joins the
+    currently loaded WFN through ``read_bound_augmentation_manifest``.
+    No saved factor is accepted without the live checks in
     ``_full_wfn_rotation``.
     """
     from psp.reconstruction_overlap import load_compact_pauli_frame
@@ -1477,14 +1561,25 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     if overlap_mode not in ('none','full_wfn_lowdin'):
         raise ValueError(f"unsupported explicit reconstruction overlap mode {overlap_mode!r}")
     if int(meta.nspinor) != 4 or plan.nspinor != 4:
-        raise ValueError("atomic ISDF reconstruction currently requires the normalized four-component charge carrier")
+        raise ValueError("atomic ISDF reconstruction requires its declared four-slot charge carrier")
     if parent_psi is None or parent_psi.psi_G is None:
         raise ValueError("atomic augmentation requires the resident raw-parent reciprocal carrier")
     if hartree_source_request is not None and int(meta.sys_dim) == 2:
-        raise ValueError(
-            'GATE slab_augmented_hartree_source_unavailable: a slab correction '
-            'metric does not certify the occupied smooth-neutral Hartree '
-            'boundary terms. The public source owner remains bulk3D only.')
+        if compact is None:
+            raise ValueError(
+                'GATE slab_augmented_hartree_source_unavailable: a slab correction '
+                'metric does not certify the occupied smooth-neutral Hartree '
+                'boundary terms. The public source owner remains bulk3D only.')
+        binding = compact.get('binding', {})
+        if (binding.get('model') != 'compact_native_pauli_common_frame_v1'
+                or binding.get('source_frame_policy') != 'compact_native_pauli_common_A_before_U'
+                or not binding.get('complete_all_FILE_parents')
+                or binding.get('physical_bands') != int(wfn.nbands)
+                or binding.get('field_policy') != 'unwindowed_U_of_compact_native_pauli'
+                or binding.get('normalization') != 'one compact target A; no represented-field renormalization'):
+            raise ValueError('Slab occupied source requires the strictly bound complete compact target')
+        from isdf.atomic_hartree import charge_hartree_operator_contract
+        charge_hartree_operator_contract(wfn, sys_dim=2)
     smooth = parent_psi.psi_G
     npar, nb, ns, ng = map(int, smooth.shape)
     coordinate_kind = getattr(plan,'coordinate_kind','fft_indices')
@@ -1551,6 +1646,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     lattice = float(wfn.alat)*np.asarray(wfn.avec, dtype=np.float64)
     centers = np.asarray(wfn.atom_crys, dtype=np.float64)%1.
     atom_types = np.asarray(wfn.atom_types, dtype=int)
+    from symmetry_maps import atomic_point_lookup_budget
     if centers.shape != (len(atom_types),3) or not set(atom_types).issubset(artifact['tables']):
         raise ValueError("augmentation manifest does not authenticate every WFN atomic species")
     radius, weights, support = _radial_grid(artifact['radial'])
@@ -1566,6 +1662,10 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                                           validated_caches=artifact.get('normalized_caches'))
     directions, angles_w, lm, Y, angular_error = _orbit_angular_quadrature(
         artifact['angular'],np.asarray(sym.R_cart)[:int(plan.n_sym_spatial)])
+    atomic_lookup = atomic_point_lookup_budget(centers, atom_types, plan.spatial_ops,
+        plan.translations, meta.fft_grid, quadrature_geometry=dict(
+            lattice_rows_bohr=lattice.tolist(), angular_directions=directions.tolist(),
+            maximum_radius_bohr=float(support)))
     na, nh, nr = len(centers), len(lm), len(radius)
     control, Ptot = artifact['runtime'], int(mesh_xy.size)
     pc, bc = gcd(npar,int(control['parent_chunk'])), gcd(nb,int(control['band_chunk']))
@@ -1681,7 +1781,10 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         # tables are small. The functional is assembled after the physical
         # radial packets; price its distinct full native output and union
         # panels conservatively even when their lifetimes cannot overlap.
-        aux_points = na*208+Ptot*len(plan.spatial_ops)
+        from isdf.atomic_moments import orbit_averaged_spherical_rule
+        auxiliary_directions, _ = orbit_averaged_spherical_rule(
+            7, np.asarray(plan.sym.R_cart)[:len(plan.spatial_ops)])
+        aux_points = na*8*len(auxiliary_directions)+Ptot*len(plan.spatial_ops)
         aux_workspace = _local_rhs_workspace_bytes(npar,meta.nk_tot,mu,aux_points,Ptot,
             nq_accumulator=None if q_union is None else len(q_union))
         aux_scratch = 0.
@@ -1947,6 +2050,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         if compact is not None:
             binding.update(source_frame_policy='compact_native_pauli_common_A_before_U',
                 compact_target_binding=compact['binding'])
+            if artifact.get('public_source_identity') is not None:
+                binding.update(artifact['public_source_identity'])
         if int(meta.sys_dim) == 2:
             from isdf.atomic_hartree import charge_hartree_operator_contract
             slab_contract = charge_hartree_operator_contract(wfn, sys_dim=2)
@@ -2013,7 +2118,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             # The canonical service authenticates periodic membership and
             # computes wraps against the original unwrapped source positions.
             points = (centers[:,None,None,:]+relative[None,:,:,:] @ np.linalg.inv(lattice)).reshape(-1,3)
-            right_plan = _packet_plan(plan,points,right_plan)
+            right_plan = _packet_plan(plan,points,right_plan, fractional_lookup_budget=atomic_lookup)
             points = right_plan.layout.axis.pack_host(points,axis=0,fill_value=0.)
             live = np.asarray(right_plan.layout.axis.active_mask)
             npoint = int(right_plan.n_centroid_packed)
@@ -2111,7 +2216,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             monopole_rhs,moment_receipt = _served_monopole_rhs(plan,corrected_faces,coefficients,raw_served_D,
                 dict(caches=artifact['served_moment_caches'],atom_types=atom_types,centers=centers,
                      lattice=lattice,scale=scale,weight_l=weight_l,weight_r=weight_r,kgrid=meta.kgrid,
-                     qneg=qneg,indexed_q=indexed_q,q_indices=q_indices,qpad=qpad),mesh_xy,
+                     qneg=qneg,indexed_q=indexed_q,q_indices=q_indices,qpad=qpad,
+                     atomic_point_lookup_budget=atomic_lookup),mesh_xy,
                      source_capture=source_capture)
             monopole_rhs.block_until_ready()
     state = dict(rhs=rhs,radius=radius,weights_dr=weights,lm=lm,centers_cart=centers @ lattice,
@@ -2138,6 +2244,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             current['overlap_receipt']=overlap_receipt
         state['current']=current
     state['local_rhs_workspace_bytes_per_rank'] = point_workspace
+    state['atomic_point_lookup'] = dict(budget=atomic_lookup,
+        quadrature=right_plan.fractional_lookup_receipt, radial_packets=nr//rp,
+        repeated_permutation_and_wrap_tables='exact')
     if source_capture is not None:
         for key in ('public_occupations','occupations','full_kweights','parent_kweights'):
             del source_capture[key]
@@ -2240,7 +2349,8 @@ def attach_local_augmentation(zeta_g, state, *, body_contract=None):
             operator_q_fractional=qfrac, support_radius_bohr=state['support_radius'])
         geometry = periodic_compensation_geometry(geometry, sys_dim=body_contract['sys_dim'])
         cache = load_periodic_compensation_cache(control['file'], mesh=zeta_g.mesh,
-            expected_file_sha256=control['file_sha256'], geometry=geometry, lm=state['lm'])
+            expected_file_sha256=control['file_sha256'], geometry=geometry, lm=state['lm'],
+            select_q_rows=True)
         if 'prepared_fourier_cache' in state:
             radial_controls['prepared_cache'] = state['prepared_fourier_cache']
         provider = positive_radial_coulomb_provider(zeta_g, state['rhs'],

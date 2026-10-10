@@ -291,6 +291,8 @@ from symmetry_maps.orbit_syms import (
     r_action_forward,
     r_action_forward_one,
     snap_to_grid_and_split_wrap,
+    served_fft_source_offsets,
+    atomic_point_lookup_budget,
     recover_atomic_space_group,
     recover_symmorphic_density_point_group,
     resolve_qgrid_symmetry,
@@ -366,6 +368,8 @@ __all__ = [
     # real-space orbits
     "real_space_action_tables", "orbit_images", "canonicalize_orbit",
     "unfold_orbit_unique_with_id", "centroid_source_map_and_wrap",
+    "served_fft_source_offsets",
+    "atomic_point_lookup_budget",
     "permutation_orbit_labels",
     "fft_grid_pullback_perm", "grid_point_image_perm",
     "PolarFFTFieldProjection", "project_polar_fft_field",

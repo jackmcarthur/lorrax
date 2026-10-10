@@ -150,9 +150,11 @@ def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
     (nk, ngk_c) int32`` parent slot of each child slot (``ngk_par`` for pad
     slots), ``phase (nk, ngk_c)`` ``e^{-2πi (k̄+G)·t}``, ``anti (nk,) bool)``.
     """
+    from symmetry_maps import served_fft_source_offsets
+
     fg = np.asarray(fft_grid, dtype=np.int64)
     S_all = np.asarray(plan.spatial_ops, dtype=np.int64)
-    tau = np.asarray(plan.translations, dtype=np.float64) / (2.0 * np.pi)
+    offsets = served_fft_source_offsets(S_all, plan.translations, fg)
     n_sym = int(plan.n_sym_spatial)
     kp = np.asarray(plan.k_parent_frac, dtype=np.float64)
     kc = np.asarray(k_child, dtype=np.float64)
@@ -172,7 +174,7 @@ def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
         p, s = int(plan.irr_idx[k]), int(plan.sym_idx[k])
         S = S_all[s % n_sym]
         anti[k] = s >= n_sym
-        t = np.rint(fg * (S @ tau[s % n_sym])) / fg
+        t = offsets[s % n_sym]
         live = np.arange(ngk_c) < int(ngk_child[k])
         K = (kc[k][None, :] + gvc[k]) * (-1.0 if anti[k] else 1.0)   # = S^T (k̄+G)
         kg = np.linalg.solve(S.T.astype(np.float64), K.T).T            # k̄ + G

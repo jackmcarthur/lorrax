@@ -271,14 +271,74 @@ def exact_pair_moments(C_left, D_left, C_right, D_right, B, *, array_api=np):
     return d.conj() @ cc.T + c.conj() @ dd.T + c.conj() @ b @ cc.T
 
 
-def auxiliary_charge_geometry(cache, *, radial_points=8, angular_order=7, auxiliary_radius=.7):
+def orbit_averaged_spherical_rule(angular_order, cartesian_rotations=None):
+    """Average one spherical rule over spatial rotations, merging duplicates.
+
+    Every rotated rule has the same polynomial exactness as the original.
+    Averaging retains that exactness and supplies a crystal-closed point
+    cloud; it changes neither atom centres nor radial integration weights.
+
+    Parameters
+    ----------
+    angular_order : int
+        Polynomial degree of the SciPy Lebedev rule, dimensionless.
+    cartesian_rotations : (n_operation, 3, 3) float64 array, optional
+        Orthogonal Cartesian spatial matrices, dimensionless. ``None``
+        returns the incumbent rule without averaging or node merging.
+
+    Returns
+    -------
+    directions : (n_direction, 3) float64 array
+        Cartesian unit vectors, dimensionless. Rotations act on row vectors
+        as ``directions @ operation``, matching the canonical GW rule.
+    weights : (n_direction,) float64 array
+        Solid-angle integration weights in steradians, summing to 4*pi.
+        Coincident nodes carry the sum of their averaged weights.
+    """
+    from scipy.integrate import lebedev_rule
+    from scipy.spatial import cKDTree
+
+    order = int(angular_order)
+    if order != angular_order:
+        raise ValueError("spherical angular quadrature requires an integer polynomial degree")
+    xyz, weights = lebedev_rule(order)
+    directions = np.asarray(xyz, dtype=np.float64).T
+    weights = np.asarray(weights, dtype=np.float64)
+    if cartesian_rotations is None:
+        return directions, weights
+    matrices = np.asarray(cartesian_rotations,dtype=np.float64)
+    if matrices.ndim != 3 or matrices.shape[1:] != (3,3) or not len(matrices):
+        raise ValueError("angular orbit closure requires the symmetry owner's Cartesian operation rows")
+    if np.max(np.abs(matrices @ matrices.transpose(0, 2, 1)-np.eye(3))) > 2e-10:
+        raise ValueError("crystal Cartesian rotations are inconsistent with augmentation lattice rows")
+    full = np.concatenate([directions @ op for op in matrices])
+    full_weights = np.tile(weights/len(matrices), len(matrices))
+    tree = cKDTree(full)
+    used = np.zeros(len(full), dtype=bool)
+    rows, totals = [], []
+    for i in range(len(full)):
+        if used[i]:
+            continue
+        same = np.asarray(tree.query_ball_point(full[i], 2e-12), dtype=int)
+        if np.max(np.linalg.norm(full[same]-full[i], axis=1)) > 2e-12:
+            raise ValueError("ambiguous angular orbit merge")
+        used[same] = True
+        rows.append(full[i])
+        totals.append(np.sum(full_weights[same]))
+    directions, weights = np.asarray(rows), np.asarray(totals)
+    return directions, weights
+
+
+def auxiliary_charge_geometry(cache, *, radial_points=8, angular_order=7, auxiliary_radius=.7,
+                              cartesian_rotations=None):
     """Signed H functionals on true points with exact κ/magnetic covariance.
 
     H=[[B,I],[I,0]] is factored per κ and repeated for every magnetic label.
     No inverse of B, fitted rank threshold, or eigenvalue truncation occurs.
     GL8 × Lebedev26 is exact for native SPD radial rank at most five.
+    Optional spatial averaging preserves polynomial exactness while closing
+    the auxiliary point cloud under the declared Cartesian operations.
     """
-    from scipy.integrate import lebedev_rule
     from scipy.special import eval_jacobi
     from psp.augmentation_spinors import spinor_spherical_harmonic
 
@@ -290,8 +350,7 @@ def auxiliary_charge_geometry(cache, *, radial_points=8, angular_order=7, auxili
     opf, mj = labels.T
     x, w = np.polynomial.legendre.leggauss(nrad)
     r, wr = R*(x+1)/2, R*w/2
-    directions, wa = lebedev_rule(int(angular_order))
-    directions = directions.T
+    directions, wa = orbit_averaged_spherical_rule(angular_order, cartesian_rotations)
     # The declared Lebedev degree must integrate every retained orbital product.
     if int(angular_order) != angular_order or int(angular_order) < 2*int(np.max(ell)):
         raise ValueError('auxiliary angular quadrature does not integrate retained κ products')

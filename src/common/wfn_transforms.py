@@ -1680,9 +1680,21 @@ def load_psi_gflat_padded(
     b_hi_in_file = min(b_hi, file_nbands)
     if b_lo >= b_hi_in_file:
         return None
+    from common.four_current_model import PAULI_ZERO_SMALL_CARRIER
+    zero_small = bool(bispinor) and bispinor_lift == PAULI_ZERO_SMALL_CARRIER
     psi = loader.load(
         bands=(b_lo, b_hi_in_file), k=k, sharding=sharding,
-        bispinor=bool(bispinor), bispinor_lift=bispinor_lift)
+        bispinor=bool(bispinor) and not zero_small,
+        bispinor_lift='raw' if zero_small else bispinor_lift)
+    if zero_small:
+        if int(loader.nspinor) != 2 or int(psi.shape[2]) != 2:
+            raise ValueError('Declared Pauli zero-small fitting input requires exactly two physical source components')
+        # Embed once at the existing bounded source-loading seam. Resizing
+        # preserves the source sharding and replaces its local reference;
+        # no RKB operation or second resident Pauli store is created.
+        psi = jax.jit(lambda value: jnp.pad(value,
+            ((0, 0), (0, 0), (0, 2), (0, 0))),
+            out_shardings=psi.sharding)(psi)
     nb_loaded = int(psi.shape[1])
     if nb_loaded < target:
         psi = jnp.concatenate(

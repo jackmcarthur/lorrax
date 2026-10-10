@@ -93,6 +93,7 @@ class WavefunctionBasisReceipt:
 
     def __post_init__(self) -> None:
         from common.bispinor_init import LIFT_PROVENANCE
+        from common.four_current_model import PAULI_ZERO_SMALL_PROVENANCE
         from common.parallel_transport import WFN_FINGERPRINT_SCHEME
         from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
 
@@ -150,7 +151,8 @@ class WavefunctionBasisReceipt:
         lift = self.bispinor_lift_provenance
         if lift is not None:
             lift = str(lift)
-        if lift is not None and lift not in LIFT_PROVENANCE.values():
+        if (lift is not None and lift not in LIFT_PROVENANCE.values()
+                and (lift != PAULI_ZERO_SMALL_PROVENANCE or role != 'charge')):
             raise ValueError(
                 "WavefunctionBasisReceipt has an unknown sampled-spinor "
                 f"transform {lift!r}")
@@ -244,7 +246,7 @@ class WavefunctionBasisReceipt:
         coordinate_kind: str = "fft_indices",
     ) -> "WavefunctionBasisReceipt":
         """Shared receipt construction after canonical source identity."""
-        from common.bispinor_init import kinetic_balance_lift_provenance
+        from common.four_current_model import charge_carrier_lift_provenance
         from common.parallel_transport import (
             WFN_FINGERPRINT_SCHEME,
             fingerprint_from_binding,
@@ -311,7 +313,7 @@ class WavefunctionBasisReceipt:
             source_identity=FULL_BLOCH_TRANSFORM_SCHEME,
             nspinor_sampled=4 if use_bispinor else source_nspinor,
             bispinor_lift_provenance=(
-                kinetic_balance_lift_provenance(bispinor_lift)
+                charge_carrier_lift_provenance(bispinor_lift)
                 if use_bispinor else None),
             coordinate_kind=coordinate_kind,
         )

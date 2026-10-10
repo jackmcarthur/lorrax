@@ -71,7 +71,9 @@ class PackedCentroidBasis:
                     idx, np.asarray(sym.sym_matrices)[:n_spatial],
                     np.asarray(sym.translations)[:n_spatial],
                     np.asarray(fft_grid, dtype=np.int32), extend_trs=True, validate=False,
-                    coordinate_kind=coordinate_kind)
+                    coordinate_kind=coordinate_kind,
+                    fractional_action=("served_fft" if coordinate_kind == "fractional"
+                                       else "raw"))
                 available = np.all(np.sort(perm, axis=1) == np.arange(idx.shape[0]), axis=1)
                 if np.any(available):
                     groups = permutation_orbit_labels(perm[available])

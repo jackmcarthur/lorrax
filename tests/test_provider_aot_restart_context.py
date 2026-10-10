@@ -181,7 +181,9 @@ def test_positive_aot_completion_and_exact_moments_keep_public_actions():
         specs=((P(None, 'x', 'y'), 1), (P(None, 'x', 'y'), 2)))
     # Periodic V is outside this local-completion unit. This inert admitted
     # plan prevents an unrelated vendor GEMM allocation; it is never called.
-    cache = dict(metadata=dict(geometry=geometry, lm=lm), moment_axis=axis,
+    from isdf.coulomb_fourier_cache import periodic_compensation_contract
+    _,schema,model=periodic_compensation_contract(geometry)
+    cache = dict(metadata=dict(geometry=geometry, lm=lm,schema=schema,model=model), moment_axis=axis,
                  file_sha256='0'*64)
     plan = dict(geometry=geometry, moment_axis=axis,
         action=lambda _: pytest.fail('periodic action is outside this test'),
