@@ -1301,17 +1301,11 @@ def _rotate_open_spin_centroid_operator(spatial, spin):
     ``spatial`` is centroid-major ``(k, mu, s, nu, s')``: the spin axes are
     2 and 4, each minor to its centroid axis, exactly as the GEMM merges them.
     """
-    U = jnp.asarray(spin)
+    from symmetry_maps.unfold_load import _rotate_endpoints
     ns = int(spatial.shape[2])
-    if spatial.shape[4] != ns or U.shape[1:] != (ns, ns):
+    if spatial.shape[4] != ns or tuple(np.shape(spin)[1:]) != (ns, ns):
         raise ValueError("Operator spin axes and typed spin action disagree.")
-    left = jnp.stack([sum(U[:, a, c, None, None, None] * spatial[:, :, c]
-                         for c in range(ns) if np.any(spin[:, a, c] != 0))
-                      for a in range(ns)], axis=2)
-    return jnp.stack([sum(left[..., d] *
-                         jnp.conj(U[:, b, d])[:, None, None, None]
-                         for d in range(ns) if np.any(spin[:, b, d] != 0))
-                      for b in range(ns)], axis=4)
+    return _rotate_endpoints(spatial, spin, spin, spin, spin)
 
 
 def unfold_spin_centroid_operator(
