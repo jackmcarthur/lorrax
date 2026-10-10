@@ -577,21 +577,6 @@ def stamp_dipole_provenance(h5, **kwargs) -> None:
         h5.attrs[key] = value
 
 
-def _kinetic_velocity(psi_G, *, geom, gtab_file, wfn, sym):
-    """``p`` alone on the same sweep (no V_NL, no V_U): the head's p/V_NL split.
-
-    Written beside the full velocity in the parallel-transport artifact, so
-    the SC head can print the p, V_NL and Sigma shares of its velocity
-    (``gw.qsgw_head.velocity_term_shares``).
-    """
-    op = dipole_operator(geom, bvec=wfn.bvec, blat=wfn.blat, vnl_setup=None,
-                         hubbard=None)
-    return unfold_file_wedge_polar_matrix(sym, sweep_matrix_elements(
-        psi_G, operator=op, geom=geom, gvecs=gtab_file.gvecs,
-        gmask=gtab_file.mask, box_index=wfn.box_index(k="ibz"),
-        kvecs=np.asarray(gtab_file.kvecs)))
-
-
 def _publish_dft_velocity(args, H_v, psi_G, **kwargs):
     """The artifact's velocity stage; returns its path, or None when dropped.
 
@@ -1531,19 +1516,22 @@ def main(argv=None):
 			                     ngkmax=int(psi_G.shape[3]), nb=nb,
 			                     ns=int(psi_G.shape[2]), nk=nk_file,
 			                     cell_volume=float(wfn.cell_volume))
-			op = dipole_operator(
+			ops = (dipole_operator(
 				geom, bvec=wfn.bvec, blat=wfn.blat,
 				vnl_setup=None if args.skip_vnl else vnl_setup,
 				vnl_velocity_sign=vnl_velocity_sign,
-				hubbard=hubbard_setup)
+				hubbard=hubbard_setup),)
+			if args.parallel_transport_out is not None:
+				# ``p`` alone (no V_NL, no V_U) rides the same sweep: the head's
+				# p/V_NL split (``gw.qsgw_head.velocity_term_shares``).
+				ops += (dipole_operator(geom, bvec=wfn.bvec, blat=wfn.blat,
+				                        vnl_setup=None, hubbard=None),)
 			with timing.section("dipole_sweep") as sweep:
-				H_v_file = sweep_matrix_elements(
-					psi_G, operator=op, geom=geom,
+				H_v, *H_p = (unfold_file_wedge_polar_matrix(sym, H) for H in sweep_matrix_elements(
+					psi_G, operator=ops, geom=geom,
 					gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
 					box_index=wfn.box_index(k="ibz"),
-					kvecs=np.asarray(gtab_file.kvecs))
-				H_v = unfold_file_wedge_polar_matrix(sym, H_v_file)
-				del H_v_file
+					kvecs=np.asarray(gtab_file.kvecs)))
 				if args.parallel_transport_out is not None:
 					pt_path = _publish_dft_velocity(
 						args, H_v, psi_G, wfn=wfn, sym=sym, geom=geom,
@@ -1554,9 +1542,8 @@ def main(argv=None):
 						vnl_included=not args.skip_vnl,
 						rcond=float(args.parallel_transport_rcond),
 						emit=report.emit,
-						velocity_kinetic=_kinetic_velocity(
-							psi_G, geom=geom, gtab_file=gtab_file, wfn=wfn,
-							sym=sym))
+						velocity_kinetic=H_p[0])
+					del H_p
 				# The velocity stays sharded, 1/P of (nk, 3, nb, nb) per rank,
 				# until SlabIO writes it from those shards below.
 				velocity = H_v
