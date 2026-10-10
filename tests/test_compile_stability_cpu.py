@@ -7,8 +7,9 @@ shape, not on a timing:
 
 0. ``RANK_FINGERPRINT_ENV`` mirrors ``ffi.FFI_DIAL_ENV``.
 1. Checked solves leave no host callback in the programs that hold them
-   (``compiler._cache_write`` never stores a program with one), and the
-   traced fallback outside ``checked_program`` warns once.
+   (``compiler._cache_write`` never stores a program with one), the polar
+   link stack included, and the traced fallback outside ``checked_program``
+   warns once.
 2. A second process reuses a checked program from the persistent cache.
 3. One plan on one stack from two call sites compiles once.
 4. Partner directions keep one carrier whatever their count (e2200b174).
@@ -130,6 +131,32 @@ def test_response_programs_have_no_host_callback(checked_service):
               "moments": _host_callbacks(moments.lower(face, face, face)),
               "sqrt_v": _host_callbacks(sqrt_v.lower(face))}
     assert counts == dict.fromkeys(counts, 0)
+
+
+def test_polar_stack_has_no_host_callback():
+    """The parallel-transport link stack (``PolarPlan.batched``, distributed route) is
+    cacheable, and each link is that matrix's own polar factor, bit for bit."""
+    from distrib_la import polar
+
+    class _CheckedEigh(_CheckedPlan):
+        backend, batched_route, __call__ = "test", "scan", _CheckedPlan.batched
+    mesh, n = _mesh(), 4
+    tile = NamedSharding(mesh, P("x", "y"))
+    plan = polar.PolarPlan(mesh=mesh, n=n, requested="test", rcond=None, eigh_plan=_CheckedEigh("eigh"),
+                           in_sharding=tile, singular_value_sharding=NamedSharding(mesh, P()))
+    rng = np.random.default_rng(3)
+    a = jax.device_put(jnp.asarray(rng.standard_normal((2, n, n)) + 1j * rng.standard_normal((2, n, n))),
+                       NamedSharding(mesh, P(None, "x", "y")))
+    before = set(polar._KERNEL_CACHE)
+    link, s = plan.batched(a)
+    call, = [fn for key, fn in polar._KERNEL_CACHE.items() if key not in before and a.shape in key]
+    assert _host_callbacks(call.lower(a)) == 0
+    for i in range(2):
+        one_link, one_s = plan(jax.device_put(a[i], tile))
+        assert np.array_equal(np.asarray(link[i]), np.asarray(one_link))
+        assert np.array_equal(np.asarray(s[i]), np.asarray(one_s))
+    u, _, vh = np.linalg.svd(np.asarray(a))
+    np.testing.assert_allclose(np.asarray(link), u @ vh, atol=1e-12)
 
 
 _REUSE = textwrap.dedent("""

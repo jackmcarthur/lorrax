@@ -699,9 +699,11 @@ class PolarPlan:
         Route batch_reshard exchanges independent matrices across all ranks,
         runs the SAME dilation/cutoff locally, then returns face-sharded L.
         Only the O(B*n) singular values are replicated. Ragged batches skip
-        synthetic rows. The distributed route retains the single-tile solve.
+        synthetic rows. The distributed route solves the stack's dilations
+        through the eigh plan's own stack surface, single-tile solves for a
+        library without a stacked entry, and holds the stack at O(B*n^2/P).
         Local work is O(B*n^3/P), with O(ceil(B/P)*n^2) matrices per rank
-        and one solver workspace; the distributed capacity path is O(n^2/P).
+        and one solver workspace.
         """
         if A.ndim != 3 or A.shape[-2:] != (self.n, self.n) or A.shape[0] < 1:
             raise ValueError("polar batched requires a nonempty (B,n,n) stack")
@@ -709,24 +711,27 @@ class PolarPlan:
         face = NamedSharding(self.mesh, P(None, 'x', 'y'))
         if not isinstance(A, jax.core.Tracer) and not _same_layout(getattr(A,'sharding',None), face):
             raise ValueError("polar batched requires A already at P(None,'x','y')")
+        rcond = self.rcond
+        if rcond is None:
+            rcond = self.n * float(jnp.finfo(A.real.dtype).eps)
         if self.batched_route == ROUTE_BATCH_RESHARD:
             from distrib_la._batch_reshard import batch_reshard_call
-            rcond = self.rcond
-            if rcond is None:
-                rcond = self.n * float(jnp.finfo(A.real.dtype).eps)
             s, link = batch_reshard_call('polar', self.mesh, (A,), rcond=rcond)
             return link, s
-        key = ('polar_batch_scan', mesh_key(self.mesh), self.n, self.backend,
+
+        def stack(a):
+            return _polar_from_matrix(a, self.eigh_plan.batched, rcond)
+        if isinstance(A, jax.core.Tracer):
+            return stack(A)
+        key = ('polar_batch', mesh_key(self.mesh), self.n, self.backend,
                self.rcond, tuple(A.shape), str(A.dtype))
         fn = _KERNEL_CACHE.get(key)
         if fn is None:
-            def solve(_carry, a):
-                link, s = self(a)
-                return None, (link, s)
-            fn = jax.jit(lambda a: jax.lax.scan(solve, None, a, unroll=1)[1],
-                         in_shardings=face,
-                         out_shardings=(face, NamedSharding(self.mesh, P())))
-            _KERNEL_CACHE[key] = fn
+            from distrib_la._result_check import checked_program
+            # The stack surface returns the checked eigh's status to this
+            # program: no host callback, so the persistent cache stores it.
+            fn = _KERNEL_CACHE[key] = checked_program(
+                stack, self.mesh, (face, NamedSharding(self.mesh, P())), in_shardings=face)
         return fn(A)
 
 
