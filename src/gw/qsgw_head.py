@@ -231,9 +231,10 @@ def _pad_head_band_manifold(v, e, f, surface, *, mesh: Mesh):
         v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, pad)))
     v = device_put_process_local(
         v, NamedSharding(mesh, P(None, None, "x", "y")))
-    # The (k, band) tables stay on the host: a kernel places host operands
-    # without a program, a single-device array beside ``v`` costs a reshard.
-    e, f, surface = (np.pad(np.asarray(a), ((0, 0), (0, pad))) for a in (e, f, surface))
+    # A host (k, band) table stays on the host: a kernel places it without a
+    # program, while a single-device copy beside ``v`` costs a reshard.
+    e, f, surface = ((np if isinstance(a, np.ndarray) else jnp).pad(a, ((0, 0), (0, pad)))
+                     for a in (e, f, surface))
     return v, e, f, surface
 
 
@@ -2590,8 +2591,8 @@ def head_drude_tensor_sharded(
     if with_spread and pair_split is None:
         raise ValueError("the intraband velocity spread needs a metal pair split")
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
-    surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
-    energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
+    surface = np.asarray(surface_weight_kn, dtype=np.float64)
+    energies = np.asarray(energies_kn_ry, dtype=np.float64)
     if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
         raise ValueError(
             f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
