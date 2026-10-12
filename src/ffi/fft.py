@@ -426,11 +426,12 @@ def cubin_cache_dir() -> str:
     or ``~/.cache/lorrax/kconv_mathdx`` where the site defines no ``SCRATCH``.
 
     Always on, and separate from the XLA compile cache
-    (``common.jax_compile_cache``, one namespace per release): this store is small
-    and content-addressed — each image is keyed by the hash of its source,
-    headers, deciding NVRTC options and toolchain (``common/nvrtc_build.h``),
-    written by tmp+rename and re-hashed on read — so reusing it can never
-    change a result, while rebuilding one image costs about 7 s, once per user
+    (``common.jax_compile_cache``, one namespace per jax, jaxlib, FFI bundle
+    and key schema): this store is small and content-addressed — each image
+    is keyed by the hash of its source, headers, deciding NVRTC options and
+    toolchain (``common/nvrtc_build.h``), written by tmp+rename and re-hashed
+    on read — so reusing it can never change a result, while rebuilding one
+    image costs about 7 s on every rank that misses
     (``docs/architecture/compilation.md``, §2).  One
     directory for every world size: an image depends on the device and the
     wheel, not on P.  No knob.  The first call of a process seeds it from the

@@ -1081,12 +1081,11 @@ def default_cache_dir() -> Path:
     return default_cache_root() / cache_namespace()
 
 
-def _prune_namespaces(root: Path, current: str, *, keep=frozenset(),
+def _prune_namespaces(root: Path, current: str, *,
                       now: float | None = None) -> list[str]:
     """Retire stale entries and namespaces under ``root``; return what went.
 
-    In ``current``, an entry untouched for :data:`_NS_TTL_S` and not in ``keep``
-    goes.  Another namespace is kept, newest-used first, while used within
+    In ``current``, an entry untouched for :data:`_NS_TTL_S` goes.  Another namespace is kept, newest-used first, while used within
     :data:`_NS_LIVE_S`, or both younger than :data:`_NS_TTL_S` and inside the
     caps counted so far.  Removal is a rename into ``root/.trash`` (atomic, so
     no run lists a half-deleted one) and then a best-effort delete.
@@ -1113,8 +1112,7 @@ def _prune_namespaces(root: Path, current: str, *, keep=frozenset(),
                     continue
                 nbytes += st.st_size
                 if (entry.name == current and name.endswith(_CACHE_SUFFIX)
-                        and now - st.st_mtime > _NS_TTL_S
-                        and name[: -len(_CACHE_SUFFIX)] not in keep):
+                        and now - st.st_mtime > _NS_TTL_S):
                     stale.append(os.path.join(dirpath, name))
         usage.append((used, entry.name, nbytes, nfiles))
     usage.sort(reverse=True)
@@ -1159,22 +1157,19 @@ def _touch(keys) -> None:
             pass
 
 
-def _start_namespace_prune(root: Path, current: str, keep=frozenset()) -> None:
-    """Rank 0, in a daemon thread: touch ``keep`` (the agreed set), then prune.
-
-    The touch runs every time, the prune at most every :data:`_NS_PRUNE_EVERY_S`,
+def _start_namespace_prune(root: Path, current: str) -> None:
+    """Rank 0, in a daemon thread: prune at most every :data:`_NS_PRUNE_EVERY_S`,
     off the startup path (the walk stats every file).  A process that exits
     mid-walk leaves only atomic renames; the next prune finishes the delete.
     """
     def _run() -> None:
         try:
-            _touch(keep)
             stamp = root / _NS_PRUNE_STAMP
             if (stamp.exists() and time.time() - stamp.stat().st_mtime
                     < _NS_PRUNE_EVERY_S):
                 return
             stamp.touch()
-            removed = _prune_namespaces(root, current, keep=keep)
+            removed = _prune_namespaces(root, current)
             if removed:
                 _debug_say(f"pruned under {root}: {', '.join(removed)}")
         except Exception as exc:                           # noqa: BLE001
