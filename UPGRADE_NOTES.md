@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-12 — SC final diagnostics with sigma_freq_debug_output on a symmetry-reduced grid
+
+A self-consistent run with `sigma_freq_debug_output = true` on a
+symmetry-reduced k-grid no longer dies in its final diagnostics (`ValueError:
+Size of label 'k'`, the head rotation). It died at any `sc_max_iter` once it
+reached them; a run that ends in `GATE sc_fixed_point_not_converged` never
+did. The map's retained static head terms are now on the loop k-set, like Σ
+and U beside them. Σ, H and eqp are unchanged: on the P4 hsuite eqp is
+byte-identical in 15/15 files, and each SC stage compiles one more small
+program (the row gather). No deck or environment change.
+
 ## 2026-10-10 — programs whose shapes are known ahead compile on helper threads
 
 `common.jax_compile_cache.compile_ahead(program, *args)` lowers a program on
