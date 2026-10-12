@@ -668,19 +668,21 @@ def _sc_output_tables_on_loop_kset(
     delta_h_qp_unextrap_full,
     sigma_basis_U_full,
     exact_hartree_full: SCExactHartree | None,
+    static_head_full,
     kstar,
 ) -> tuple[
         SigmaResult, jax.Array, SCExactHartree | None, jax.Array,
-        jax.Array | None]:
+        jax.Array | None, object | None]:
     """Assemble retained SC outputs at the map's sole k-set seam.
 
     ``compute_sigma_xc`` and density-SC Hartree construction necessarily run
     on the full BZ.  Nothing beyond this function may select an individual
     retained Sigma table: the complete :class:`SigmaResult`, its defining
-    DFT→QP rotation and the paired exact-Hartree components move to the loop
-    k-set together.  The two Hamiltonian updates are formed before this call
-    and selected first: that preserves the incumbent arithmetic order (form
-    the full-BZ sum, then take its loop rows) bit for bit.
+    DFT→QP rotation, the paired exact-Hartree components and the static head
+    terms Sigma was built with move to the loop k-set together.  The two
+    Hamiltonian updates are formed before this call and selected first: that
+    preserves the incumbent arithmetic order (form the full-BZ sum, then take
+    its loop rows) bit for bit.
     """
     if kstar.is_identity:
         delta_h_qp = delta_h_qp_full
@@ -689,6 +691,7 @@ def _sc_output_tables_on_loop_kset(
             sigma_result, kset=SIGMA_KSET_FULL_BZ, nk=kstar.nk_full)
         U_loop = sigma_basis_U_full
         exact_loop = exact_hartree_full
+        static_head_loop = static_head_full
     else:
         # Keep these two takes ahead of the retained-table takes.  The update
         # is the numerical product of the map; selecting its already-formed
@@ -712,6 +715,13 @@ def _sc_output_tables_on_loop_kset(
                     else None),
             )
         )
+        # A (nb,) head diagonal holds for every k; (nk, nb) ones are selected.
+        static_head_loop = None if static_head_full is None else replace(
+            static_head_full, **{
+                name: kstar.select(getattr(static_head_full, name))
+                for name in ("sigma_x_diag", "sigma_sx_diag",
+                             "sigma_sx_minus_x_diag", "sigma_coh_diag")
+                if np.ndim(getattr(static_head_full, name)) == 2})
 
     if int(np.shape(U_loop)[0]) != int(kstar.nk_irr):
         raise ValueError(
@@ -735,7 +745,7 @@ def _sc_output_tables_on_loop_kset(
                     f"{expected_bands}")
     return (
         sigma_loop, U_loop, exact_loop, delta_h_qp,
-        delta_h_qp_unextrap)
+        delta_h_qp_unextrap, static_head_loop)
 
 
 # ---------------------------------------------------------------------------
@@ -4222,10 +4232,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # map, every diagnostic and every SC output record sees only the loop's
     # k-set; no consumer selects one table independently.
     (sigma_result, sigma_basis_U, exact_hartree_dft, delta_h_qp,
-     delta_h_qp_unextrap) = (
+     delta_h_qp_unextrap, iteration_static_head_terms) = (
         _sc_output_tables_on_loop_kset(
             sigma_result, delta_h_qp_full, delta_h_qp_unextrap_full,
-            U_full, exact_hartree_dft, ks))
+            U_full, exact_hartree_dft, iteration_static_head_terms, ks))
 
     # Rotate (V_H + Σ_xc) back to DFT basis and form the *full* QSGW H
     # (as if every band were protected); the partition step below masks
