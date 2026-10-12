@@ -132,8 +132,9 @@ kept by hand.
 
 Read in `common/jax_compile_cache.py`, which arms JAX's own persistent cache
 and adds only the namespace, the compile agreement and the receipt. What the
-cache keys, what makes it cold, how it is pruned and what it costs:
-[compilation §3](../architecture/compilation.md#3-xla-programs).
+cache keys, what makes it cold and how it is pruned:
+[compilation §3](../architecture/compilation.md#3-xla-programs); what it costs:
+[§4](../architecture/compilation.md#4-where-the-time-goes).
 
 | var | default | class | grammar and effect |
 |---|---|---|---|

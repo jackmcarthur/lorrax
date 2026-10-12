@@ -637,15 +637,16 @@ vertices) and the `live` bit of a windowed pass, plus the device's compute
 capability and shared-memory limits (`kconv_mathdx_cuda_ffi.cc:2155`, options
 at `:2492`). Never $N_\mu$, the band counts or P. Two kinds depend on the
 system instead of the k-grid: mode 10 on the FFT plane $(n_b, n_c)$ and its
-occupied rows (`:3678`), and the BSE outer kernels on the band rank
+occupied rows (`:3680`), and the BSE outer kernels on the band rank
 $K = \min(n_c, n_v)$ padded to 4 and, for decode, $\lceil n_c/8 \rceil$
-c-blocks (`kconv_outer_cuda_ffi.cc:283,835`). Editing an embedded source or
-header invalidates its images, comments included, so measurement notes live
-at the Python owners, not in the kernel text.
+c-blocks (`kconv_outer_cuda_ffi.cc:283,835`). The image key hashes the
+kernel text, comments included, so measurement notes live at the Python
+owners, not in the kernel text.
 
-The NVRTC build service, its key rule, the cubin cache, the release store,
-the build cost and the build log lines are owned by
-[compilation §2](compilation.md#2-native-kernels-and-nvrtc-images).
+The NVRTC build service, its key rule, the cubin cache, the release store and
+the build cost are owned by
+[compilation §2](compilation.md#2-native-kernels-and-nvrtc-images), and the
+build log lines by its §7.
 
 ## 15. Numerical contract {#numerical-contract}
 

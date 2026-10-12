@@ -138,8 +138,8 @@ every rank:
   images into it from `<source root>/cubin_store`; NVRTC builds any other
   image the first time a process meets its key
   ([compilation §2](../../docs/architecture/compilation.md#2-native-kernels-and-nvrtc-images)).
-  The cache's path is part of every k-convolution program's JAX key, so a run
-  is warm only under the `SCRATCH` of the run that filled the JAX cache.
+  Its path is in every mathdx program's JAX key, so a run is warm only under
+  the `SCRATCH` that filled the JAX cache.
 
 `HSUITE_CACHE_DIR=<empty dir>` gives a cold JAX cache with warm cubins, the
 state a release's first run meets. A fresh `SCRATCH` as well makes both

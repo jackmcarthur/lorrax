@@ -96,9 +96,9 @@ its sources, its build and its target strings.
 | active subspace | `active_subspace/active_{eigh,ops}.cc` | CUDA; C++ (cuBLAS, cuSOLVER, NCCL) | `active_subspace_{store, eigh, project, reconstruct, gram, ortho, distributed_ortho, subtract, subtract_gram}` |
 | parallel HDF5 | `phdf5/` | both; C++ (HDF5, MPI; CUDA-runtime staging on the CUDA leg) | `phdf5_{read, read_kchunk_union, write, write_independent}`; `phdf5_read_kchunk` has no caller |
 
-**Architectures.** Every nvcc TU carries SASS for sm_80, 86, 89, 90, 100
-and 120 and compute_80/compute_120 PTX (§2); every NVRTC kernel compiles for
-the device's own `sm_<cc>`. Launch sizes (rows and planes per block, k-box
+**Architectures.** Every nvcc TU carries the SASS and PTX of
+`CMAKE_CUDA_ARCHITECTURES` (§2); every NVRTC kernel compiles for the device's
+own `sm_<cc>` ([compilation §2](compilation.md#2-native-kernels-and-nvrtc-images)). Launch sizes (rows and planes per block, k-box
 tiles, the pair's threads) come from the device's opt-in shared memory, its
 shared memory per SM and its SM count, except the fixed budgets named in the
 router section. `cp.async` (sm_80+) is the only architecture-specific
@@ -505,7 +505,7 @@ leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
   GEMM output has < 128 elements, else 128 threads. NVRTC-built per
   `(N1', K1, N2', K2)` through `common/nvrtc_build` (the mathdx key rule with
   `cublasdx_version.hpp`), disk-cached with the k-convolution images; 8–13 s
-  per shape cold. A100, whole plan against the cuBLAS chain: Fe 25³, K = 13,
+  per shape cold (claim 2764). A100, whole plan against the cuBLAS chain: Fe 25³, K = 13,
   sphere→box 0.80–0.82, box→sphere 0.64–0.66; 16³–48³ 0.8–0.9; shapes that do
   not fit (64³, 72³, 96²) are unchanged. Boxes whose long axis is an FFT axis
   (CrI3 80×80×250) never pair. No production caller builds a separable plan on

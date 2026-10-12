@@ -89,9 +89,10 @@ None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
   FFTW3 ABI ([which engine binds](../architecture/ffi_layout.md#3c-which-fft-engine-the-host-library-binds)).
   The FFTW prefix may reach CMake only as a `dlopen` hint, never as a
   `DT_NEEDED` entry, so that an MKL site's already-loaded FFTW3 export wins.
-- **nvidia-mathdx.** Header-only; the `cuda12`/`cuda13` extras pin it. The
-  k-convolution kernels are compiled from its headers per k-grid by NVRTC at
-  run time ([k-convolution](../architecture/kconv.md)), so nothing is linked.
+- **nvidia-mathdx.** Header-only; the `cuda12`/`cuda13` extras pin it. NVRTC
+  compiles the k-convolution and Fourier-pair kernels from its headers at run
+  time ([compilation §2](../architecture/compilation.md#2-native-kernels-and-nvrtc-images)),
+  so nothing is linked.
 
 ## Building a leg
 

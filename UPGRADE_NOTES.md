@@ -13,9 +13,10 @@ hands XLA's backend compile to one of min(8, physical cores) helper threads.
 The live call finds the executable or waits for it. If the live call reaches
 the compile before the helper does, it compiles under the reserved number and
 the helper takes its executable, so every rank numbers its requests alike.
-Three owners use it. The W-model setup submits H = V^(1/2) of the bare V's
-parents (decks with a distributed `linalg`) and the MPA scalar head fit (from
-the deck's `n_poles`) before the zeta fit. A streamed bank submits all its row
+Two owners use it. The scalar shared-pole W-model setup submits H = V^(1/2)
+of the bare V's parents (decks with a distributed `linalg`) and, with a head
+correction, the MPA scalar head fit (from the deck's `n_poles`) before the
+zeta fit. A streamed bank submits all its row
 passes at once. On the P4 hsuite, release cold goes from 336.7 to 326.3 s and
 warm stays at 140 s. Program requests (3037 per rank) and XLA compiles (2261)
 do not change, and eqp is byte-identical in 10/10 files. The runtime now sets
