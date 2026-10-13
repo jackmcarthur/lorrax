@@ -45,6 +45,7 @@ HARTREE_PARENT_DATASET = "hartree_parent_kij_ry"
 HARTREE_PROVENANCE_DATASET = "hartree_provenance"
 HARTREE_PROVENANCE_MAX_BYTES = 262144
 HARTREE_PROVENANCE_SCHEMA = "lorrax.resident_charge_hartree.v1"
+HARTREE_PAIRED_PROVENANCE_SCHEMA = "lorrax.resident_direct_hartree.v2"
 # Copy of the paired v_q_bispinor.h5 generation receipt (bispinor runs only).
 BISPINOR_V_RECEIPT_DATASET = "bispinor_v_receipt"
 SHARED_POLE_MEMBER_DATASET = "shared_pole_member"
@@ -303,7 +304,7 @@ def _encode_charge_zeta_provenance(provenance, *, identity):
 
 
 def normalize_resident_hartree_provenance(value, *, persisted=False):
-    """Validate the closed native charge-operator record, without a payload.
+    """Validate closed native direct fields, without reading their payload.
 
     Source and operator bindings are finite JSON objects owned by their
     numerical producers. Their canonical digests authenticate the transported
@@ -324,7 +325,8 @@ def normalize_resident_hartree_provenance(value, *, persisted=False):
         record = json.loads(text)
     except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError('resident Hartree provenance must be bounded finite JSON') from exc
-    if (record['schema'] != HARTREE_PROVENANCE_SCHEMA
+    if (record['schema'] not in (HARTREE_PROVENANCE_SCHEMA,
+                                HARTREE_PAIRED_PROVENANCE_SCHEMA)
             or record['units'] != 'Ry' or record['k_domain'] != 'file_wedge'
             or record['trs_rule'] != 'conj'):
         raise ValueError('resident Hartree schema/units/FILE domain/TR rule refused')
@@ -356,7 +358,49 @@ def normalize_resident_hartree_provenance(value, *, persisted=False):
         if (not isinstance(digest, str) or len(digest) != 64
                 or any(c not in '0123456789abcdef' for c in digest)):
             raise ValueError('resident Hartree payload digest is invalid')
+    if record['schema'] == HARTREE_PAIRED_PROVENANCE_SCHEMA:
+        binding = record['operator_binding']
+        if (set(binding) != {'schema', 'source_identity', 'components'}
+                or binding['schema'] != 'lorrax.resident_paired_direct_operator.v1'
+                or binding['source_identity'] != record['source_identity']
+                or not isinstance(binding['components'], dict)
+                or set(binding['components']) != {'charge', 'transverse'}):
+            raise ValueError('paired direct Hartree requires named charge/transverse bindings')
+        for name, schema in (
+                ('charge', 'lorrax.resident_charge_hartree_operator.v1'),
+                ('transverse', 'lorrax.resident_current_hartree_operator.v1')):
+            member = binding['components'][name]
+            if (not isinstance(member, dict)
+                    or set(member) != {'operator_identity', 'operator_binding'}
+                    or not isinstance(member['operator_binding'], dict)):
+                raise ValueError('paired direct Hartree component binding is malformed')
+            operator = member['operator_binding']
+            digest = hashlib.sha256(json.dumps(operator, sort_keys=True,
+                separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+            if (member['operator_identity'] != digest or operator.get('schema') != schema
+                    or operator.get('source_identity') != record['source_identity']
+                    or any(operator.get(key) != record[key] for key in
+                        ('band_range', 'parent_full_rows', 'parent_k_frac',
+                         'units', 'k_domain', 'trs_rule'))):
+                raise ValueError('paired direct Hartree component source/domain identity changed')
+        transverse = binding['components']['transverse']['operator_binding']
+        if transverse.get('variational_convention') != 'hermitian_density_current_energy_derivative_v1':
+            raise ValueError('paired current Hartree requires its defined Hermitian-density derivative')
     return record
+
+
+def resident_hartree_component_names(record):
+    """Name the fixed on-disk field order before it reaches a consumer.
+
+    V1 retains its three-dimensional charge payload. V2 adds only a final
+    unsharded axis in the explicit order charge, transverse; band axes stay
+    one and two. Physical operator admission belongs to the GW owner.
+    """
+    if record['schema'] == HARTREE_PROVENANCE_SCHEMA:
+        return ('charge',)
+    if record['schema'] == HARTREE_PAIRED_PROVENANCE_SCHEMA:
+        return ('charge', 'transverse')
+    raise ValueError('Unknown resident direct Hartree schema')
 
 
 def _hartree_band_axis(logical, mesh_or_divisor):
@@ -374,16 +418,21 @@ def _hartree_band_axis(logical, mesh_or_divisor):
 def _hartree_payload_sha256(dataset):
     """Hash finite logical J in canonical row order with at most 2 MiB scratch."""
     shape = tuple(int(n) for n in dataset.shape)
-    if (len(shape) != 3 or shape[0] < 1 or shape[1] < 1
+    if (len(shape) not in (3, 4) or shape[0] < 1 or shape[1] < 1
             or shape[1] != shape[2] or dataset.dtype != np.dtype('complex128')):
         raise ValueError('resident Hartree payload must be a complex128 square band matrix')
-    digest = hashlib.sha256(b'LORRAX resident charge Hartree payload v1\0')
+    if len(shape) == 4 and shape[3] != 2:
+        raise ValueError('paired Hartree payload requires exactly charge/transverse fields')
+    magic = (b'LORRAX resident charge Hartree payload v1\0' if len(shape) == 3
+             else b'LORRAX resident paired direct Hartree payload v2\0')
+    digest = hashlib.sha256(magic)
     digest.update(np.asarray(shape, dtype='<i8').tobytes())
     # Split both band axes so even a single very wide row stays bounded.
     for parent in range(shape[0]):
         for bra in range(shape[1]):
-            for ket in range(0, shape[2], 131072):
-                block = np.asarray(dataset[parent, bra, ket:ket + 131072],
+            step = 131072 if len(shape) == 3 else 65536
+            for ket in range(0, shape[2], step):
+                block = np.asarray(dataset[parent, bra, ket:ket + step],
                                    dtype='<c16')
                 if not np.isfinite(block).all():
                     raise ValueError('resident Hartree payload is nonfinite')
@@ -420,7 +469,11 @@ def _read_hartree_provenance(h5, *, expected=None, required=False):
                 raise ValueError(f'resident Hartree requested {key} changed; rebuild')
     matrix = h5[HARTREE_PARENT_DATASET]
     nb = record['band_range'][1] - record['band_range'][0]
-    if matrix.shape != (len(record['parent_full_rows']), nb, nb):
+    names = resident_hartree_component_names(record)
+    expected_shape = (len(record['parent_full_rows']), nb, nb)
+    if len(names) == 2:
+        expected_shape += (2,)
+    if matrix.shape != expected_shape:
         raise ValueError('resident Hartree logical shape disagrees with provenance')
     _validate_shape_receipt(HARTREE_PARENT_DATASET, matrix)
     if 'psi_parent_k_rows' in h5 and not np.array_equal(
@@ -879,7 +932,9 @@ def write_restart_state_to_h5(
         normalize_resident_hartree_provenance(
             dict(hartree_record, payload_sha256='0' * 64), persisted=True)
         nb_h = hartree_record['band_range'][1] - hartree_record['band_range'][0]
-        if (hartree_parent_kij_ry.ndim != 3
+        hnames = resident_hartree_component_names(hartree_record)
+        if (hartree_parent_kij_ry.ndim != (3 if len(hnames) == 1 else 4)
+                or (len(hnames) == 2 and hartree_parent_kij_ry.shape[-1] != 2)
                 or hartree_parent_kij_ry.shape[0] != len(hartree_record['parent_full_rows'])
                 or hartree_parent_kij_ry.shape[1] != hartree_parent_kij_ry.shape[2]
                 or hartree_parent_kij_ry.shape[1] < nb_h

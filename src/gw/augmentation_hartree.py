@@ -18,6 +18,76 @@ def _identity(binding):
         separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
 
+def _current_operator_binding(provenance, current_operator_record):
+    """Bind the current owner's live generation to the same occupied source.
+
+    ``current_operator_record`` comes only from the canonical V-generation
+    reader or that producer's identical fresh record. It is not an admission
+    flag: absent, torn or changed contracts refuse. Its physical owner must
+    authenticate the source frame and current fit before publishing it.
+    """
+    if (not isinstance(current_operator_record, dict)
+            or set(current_operator_record) != {
+                'operator_contract', 'operator_identity', 'generation_identity'}
+            or not isinstance(current_operator_record['operator_contract'], dict)
+            or not current_operator_record['operator_contract']
+            or current_operator_record['operator_identity'] !=
+                _identity(current_operator_record['operator_contract'])
+            or not isinstance(current_operator_record['generation_identity'], str)
+            or len(current_operator_record['generation_identity']) != 64
+            or any(c not in '0123456789abcdef' for c in
+                   current_operator_record['generation_identity'])):
+        raise ValueError('GATE resident_current_operator: requires the canonical physical current generation')
+    source = provenance['source_binding']
+    source_keys = ('augmentation_identity', 'physical_bands', 'source_frame_policy',
+        'physical_frame_shape', 'physical_frame_band_domain', 'physical_frame_convention',
+        'full150_frame_sha256', 'fft_grid', 'cell_volume', 'wfn_fingerprint_scheme',
+        'wfn_fingerprint', 'wfn_sha256')
+    if any(key not in source for key in source_keys):
+        raise ValueError('GATE resident_current_source: paired current requires a complete physical source/frame binding')
+    expected_source = {key:source[key] for key in source_keys}
+    expected_source.update(FILE_parent_rows=provenance['parent_full_rows'],
+                           FILE_parent_k_fractional=provenance['parent_k_frac'])
+    contract = current_operator_record['operator_contract']
+    if (contract.get('schema') != 'lorrax.current.physical_Slab_mixed_operator.v1'
+            or contract.get('operator') != 'mixed_reciprocal_point_Slab_plus_bulk_local_infinite_remainder'
+            or int(source.get('sys_dim', 3)) != 2):
+        raise ValueError('GATE resident_current_operator: requires the physical mixed Slab current owner')
+    if contract.get('endpoint_source_binding') != expected_source:
+        raise ValueError('GATE resident_current_source: current endpoints differ from the charge WFN/full-source frame/FILE chart')
+    geometry = contract.get('current_geometry_binding')
+    if (not isinstance(geometry, dict) or not {
+            'logical_mu', 'centroid_hash', 'q_full_indices', 'q_fractional', 'kgrid'} <= set(geometry)):
+        raise ValueError('GATE resident_current_operator: current centroid/q geometry contract is missing')
+    return dict(schema='lorrax.resident_current_hartree_operator.v1',
+        **{key: provenance[key] for key in (
+            'source_identity', 'band_range', 'parent_full_rows', 'parent_k_frac',
+            'units', 'k_domain', 'trs_rule')},
+        physical_current_operator_contract=current_operator_record['operator_contract'],
+        physical_current_operator_identity=current_operator_record['operator_identity'],
+        current_generation_identity=current_operator_record['generation_identity'],
+        variational_convention='hermitian_density_current_energy_derivative_v1')
+
+
+def resident_hartree_for_io(record):
+    """Transport named direct fields on the existing versioned band axes."""
+    if 'parent_kij_ry' in record:
+        return dict(hartree_parent_kij_ry=record['parent_kij_ry'],
+                    hartree_provenance=record['provenance'])
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    charge, transverse = (record[name+'_parent_kij_ry'] for name in ('charge', 'transverse'))
+    if (charge.shape != transverse.shape or charge.sharding != transverse.sharding
+            or charge.ndim != 3 or charge.dtype != jnp.complex128
+            or transverse.dtype != jnp.complex128):
+        raise ValueError('Paired resident direct fields require identical native band carriers')
+    spec = NamedSharding(charge.sharding.mesh, P(None, 'x', 'y', None))
+    payload = jax.jit(lambda a, b: jnp.stack((a, b), axis=-1),
+                      out_shardings=spec)(charge, transverse)
+    return dict(hartree_parent_kij_ry=payload, hartree_provenance=record['provenance'])
+
+
 def _operator_binding(*, wfn, sym, artifact, source_identity, band_range, sys_dim=3):
     from . import augmentation_hartree_receiving as receiving
     from . import isdf_augmentation as stage
@@ -49,7 +119,8 @@ def _operator_binding(*, wfn, sym, artifact, source_identity, band_range, sys_di
 
 
 def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
-                                   wfn_fingerprint_binding, band_range):
+                                   wfn_fingerprint_binding, band_range,
+                                   current_operator_record=None):
     """Authenticate physical primitives before reading or serving a matrix.
 
     A restart authenticates the producer's full-WFN factor chain; it does not
@@ -63,6 +134,7 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
 
     record = normalize_resident_hartree_provenance(
         provenance, persisted='payload_sha256' in provenance)
+    paired = record['schema'] == 'lorrax.resident_direct_hartree.v2'
     source = record['source_binding']
     from isdf.atomic_hartree import charge_hartree_operator_contract
     dimension = source.get('sys_dim', 3)
@@ -141,19 +213,33 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
     expected = _operator_binding(wfn=wfn, sym=sym, artifact=artifact,
         source_identity=record['source_identity'], band_range=record['band_range'],
         sys_dim=dimension)
-    if record['operator_binding'] != expected or record['operator_identity'] != _identity(expected):
+    charge_member = (record['operator_binding']['components']['charge'] if paired else record)
+    if (charge_member['operator_binding'] != expected
+            or charge_member['operator_identity'] != _identity(expected)):
         raise ValueError('GATE resident_hartree_operator: geometry, field recipe or numerical owner changed')
+    if paired:
+        expected_current = _current_operator_binding(record, current_operator_record)
+        actual = record['operator_binding']['components']['transverse']
+        if (actual['operator_binding'] != expected_current
+                or actual['operator_identity'] != _identity(expected_current)):
+            raise ValueError('GATE resident_current_operator: current fit, source/frame or generation changed')
     return record
 
 
 def bind_resident_hartree(record, *, wfn, sym, plan, artifact,
-                         wfn_fingerprint_binding, band_range):
+                         wfn_fingerprint_binding, band_range,
+                         current_operator_record=None):
     """Bind the two-member IO carrier to this invocation's actual source."""
-    if not isinstance(record, dict) or set(record) != {'parent_kij_ry', 'provenance'}:
+    paired_keys = {'charge_parent_kij_ry', 'transverse_parent_kij_ry', 'provenance'}
+    if (not isinstance(record, dict)
+            or set(record) not in ({'parent_kij_ry', 'provenance'}, paired_keys)):
         raise ValueError('resident Hartree requires one paired native matrix and provenance')
     provenance = require_resident_hartree_source(record['provenance'],
         wfn=wfn, sym=sym, plan=plan, artifact=artifact,
-        wfn_fingerprint_binding=wfn_fingerprint_binding, band_range=band_range)
+        wfn_fingerprint_binding=wfn_fingerprint_binding, band_range=band_range,
+        current_operator_record=current_operator_record)
+    if (set(record) == paired_keys) != (provenance['schema'] == 'lorrax.resident_direct_hartree.v2'):
+        raise ValueError('Resident direct field names disagree with their versioned schema')
     thin_artifact = {key:artifact[key] for key in ('identity', 'radial', 'angular')}
     compact = artifact.get('compact_target')
     if compact is None:
@@ -165,9 +251,39 @@ def bind_resident_hartree(record, *, wfn, sym, plan, artifact,
             compact_frame_sha256=_physical_full_wfn_frame_binding(
                 compact['frame']['arrays']['inverse_sqrt'], int(wfn.nbands))['full150_frame_sha256'],
             public_source_identity=artifact['public_source_identity'])
-    return dict(parent_kij_ry=record['parent_kij_ry'], provenance=provenance,
-        source_context=dict(wfn_fingerprint_binding=wfn_fingerprint_binding,
-            artifact=thin_artifact, plan=plan))
+    result = {key: value for key, value in record.items() if key != 'provenance'}
+    context = dict(wfn_fingerprint_binding=wfn_fingerprint_binding,
+                   artifact=thin_artifact, plan=plan)
+    if provenance['schema'] == 'lorrax.resident_direct_hartree.v2':
+        context['current_operator_record'] = current_operator_record
+    return dict(result, provenance=provenance, source_context=context)
+
+
+def pair_resident_hartree(charge_record, transverse, current_operator_record):
+    """Pair a completed current derivative with the independently bound charge.
+
+    The caller supplies the canonical current producer's live operator record
+    and its source-bound sampled derivative. This never constructs a source,
+    changes charge bytes, or supplies a synthetic current for a missing owner.
+    Final bind/serve re-authenticate both actual operators.
+    """
+    from file_io.tagged_arrays import normalize_resident_hartree_provenance
+    if (set(charge_record) != {'parent_kij_ry', 'provenance', 'source_context'}
+            or charge_record['provenance']['schema'] != 'lorrax.resident_charge_hartree.v1'):
+        raise ValueError('Paired direct fields require an independently bound native charge field')
+    charge = charge_record['provenance']
+    current = _current_operator_binding(charge, current_operator_record)
+    operator = dict(schema='lorrax.resident_paired_direct_operator.v1',
+        source_identity=charge['source_identity'], components={
+            'charge': {key:charge[key] for key in ('operator_identity', 'operator_binding')},
+            'transverse': dict(operator_binding=current, operator_identity=_identity(current))})
+    provenance = {key:value for key,value in charge.items() if key != 'payload_sha256'}
+    provenance.update(schema='lorrax.resident_direct_hartree.v2',
+                      operator_binding=operator, operator_identity=_identity(operator))
+    provenance = normalize_resident_hartree_provenance(provenance)
+    context = dict(charge_record['source_context'], current_operator_record=current_operator_record)
+    return dict(charge_parent_kij_ry=charge_record['parent_kij_ry'],
+        transverse_parent_kij_ry=transverse, provenance=provenance, source_context=context)
 
 
 def prepare_resident_hartree(*, wfn, sym, mesh, plan, state, artifact,
@@ -205,31 +321,40 @@ def serve_resident_hartree(record, *, config, wfn, sym, mesh, band_range,
     from jax.sharding import NamedSharding, PartitionSpec as P
     from runtime.padding import pad_square
     from .ppm_sigma import sigma_band_axis
-    from .gw_config import BispinorGWMode, QPSolver, coerce_bispinor_gw_mode
+    from .gw_config import (BispinorGWMode, QPSolver, coerce_bispinor_gw_mode,
+                            uses_transverse_interaction)
     from symmetry_maps import unfold_file_wedge_band_operator
 
-    if (not isinstance(record, dict)
-            or set(record) != {'parent_kij_ry', 'provenance', 'source_context'}
-            or not config.bispinor
-            or coerce_bispinor_gw_mode(config.bispinor_gw) is not BispinorGWMode.COULOMB_ONLY
+    paired = (isinstance(record, dict) and isinstance(record.get('provenance'), dict)
+              and record['provenance'].get('schema') == 'lorrax.resident_direct_hartree.v2')
+    keys = ({'charge_parent_kij_ry', 'transverse_parent_kij_ry', 'provenance', 'source_context'}
+            if paired else {'parent_kij_ry', 'provenance', 'source_context'})
+    requested_current = uses_transverse_interaction(config)
+    if (not isinstance(record, dict) or set(record) != keys
+            or not config.bispinor or paired != requested_current
+            or (not paired and coerce_bispinor_gw_mode(config.bispinor_gw)
+                is not BispinorGWMode.COULOMB_ONLY)
             or config.qp_solver is not QPSolver.ONE_SHOT_DFT):
-        raise ValueError('GATE resident_hartree_fixed_source: the reconstructed field requires fixed-source Coulomb-only GW')
+        raise ValueError('GATE resident_hartree_fixed_source: requires fixed-source Coulomb-only charge or authenticated paired current fields')
     context = record['source_context']
     provenance = require_resident_hartree_source(record['provenance'],
         wfn=wfn, sym=sym, band_range=band_range, **context)
     if int(getattr(config, 'sys_dim', 3)) != int(provenance['source_binding'].get('sys_dim', 3)):
         raise ValueError('GATE resident_hartree_fixed_source: requested Coulomb kernel differs from its bound source')
-    matrix = record['parent_kij_ry']
+    matrices = ({name:record[name+'_parent_kij_ry'] for name in ('charge', 'transverse')}
+                if paired else {'charge':record['parent_kij_ry']})
     lo, hi = map(int, band_range)
     start, stop = provenance['band_range']
     bands = stop-start
     sharding = NamedSharding(mesh, P(None, 'x', 'y'))
-    if (not isinstance(matrix, jax.Array) or matrix.dtype != jnp.complex128
-            or matrix.shape[0] != len(provenance['parent_full_rows'])
-            or matrix.shape[1] < bands or matrix.shape[2] < bands
-            or matrix.shape[1] != matrix.shape[2]
-            or matrix.sharding != sharding):
-        raise ValueError('GATE resident_hartree_payload: native band carrier differs from its logical source')
+    for matrix in matrices.values():
+        if (not isinstance(matrix, jax.Array) or matrix.dtype != jnp.complex128
+                or matrix.ndim != 3
+                or matrix.shape[0] != len(provenance['parent_full_rows'])
+                or matrix.shape[1] < bands or matrix.shape[2] < bands
+                or matrix.shape[1] != matrix.shape[2]
+                or matrix.sharding != sharding):
+            raise ValueError('GATE resident_hartree_payload: native band carrier differs from its logical source')
     if occupation_state is not None:
         from .isdf_augmentation import _hartree_source_request
         physical = _hartree_source_request(
@@ -244,16 +369,19 @@ def serve_resident_hartree(record, *, config, wfn, sym, mesh, band_range,
             raise ValueError('GATE resident_hartree_fixed_source: one-shot occupations changed the reconstructed density')
     # Normalize ghosts without publishing an indivisible logical matrix.
     native_axis = sigma_band_axis(bands, mesh, ansatz='static')
-    native = jax.jit(lambda value: pad_square(value, native_axis),
-                     out_shardings=sharding)(matrix)
-    if not bool(jax.device_get(jnp.all(jnp.isfinite(native)))):
-        raise ValueError('GATE resident_hartree_payload: nonfinite physical matrix')
-    full = unfold_file_wedge_band_operator(sym, native, trs_rule='conj')
     output_axis = sigma_band_axis(hi-lo, mesh, ansatz='static')
     def select(value):
         selected = value[:, lo-start:hi-start, lo-start:hi-start]
         return pad_square(selected, output_axis)
-    return jax.jit(select, out_shardings=sharding)(full)
+    fields = {}
+    for name, matrix in matrices.items():
+        native = jax.jit(lambda value: pad_square(value, native_axis),
+                         out_shardings=sharding)(matrix)
+        if not bool(jax.device_get(jnp.all(jnp.isfinite(native)))):
+            raise ValueError('GATE resident_hartree_payload: nonfinite physical matrix')
+        full = unfold_file_wedge_band_operator(sym, native, trs_rule='conj')
+        fields[name] = jax.jit(select, out_shardings=sharding)(full)
+    return fields if paired else fields['charge']
 
 
 def place_resident_hartree_rotation(rotation, *, mesh, logical_bands, dtype):

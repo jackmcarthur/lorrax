@@ -3172,7 +3172,7 @@ def _prepare_fresh_parent_faces(
                     wfn=wfn, sym=sym, mesh=mesh_xy, plan=_candidate_plan,
                     state=chunks['augmentation'], artifact=augmentation_artifact,
                     wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
-                    band_range=(int(band_slices.b0), int(band_slices.b3)))
+                    band_range=(0, int(meta.b_id_4_user)))
             chunks['augmentation'].pop('hartree_source')
         if 'parent_psi' in chunks['augmentation']:
             chunks['parent_psi'] = chunks['augmentation'].pop('parent_psi')
@@ -3331,6 +3331,7 @@ def _write_fresh_restart(
         from file_io.qp_wfn import (
                 qp_state_source_provenance_from_binding)
         from file_io.restart_bundle import read_bispinor_v_receipt
+        from .augmentation_hartree import resident_hartree_for_io
         write_restart_state_to_h5(
                 tensors_filename,
                 n_rmu_logical=int(meta.n_rmu),
@@ -3356,9 +3357,8 @@ def _write_fresh_restart(
                         log=lambda _message: None),
                 qirr=_qirr.with_capture(
                         take_pre_unfold("V_qmunu")),
-                **({} if resident_hartree is None else dict(
-                    hartree_parent_kij_ry=resident_hartree['parent_kij_ry'],
-                    hartree_provenance=resident_hartree['provenance'])),
+                **({} if resident_hartree is None else
+                    resident_hartree_for_io(resident_hartree)),
         )
     if _write_restart:
         parent_T = None if wfns_transverse is None else wfns_transverse.green_parent
@@ -3443,6 +3443,31 @@ def _prepare_fresh_isdf(
         (V_qmunu, G0, head_channel, photon_g0_vectors) = _prepare_fresh_coulomb(
             basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym, wfn,
             zeta_path)
+        if resident_hartree is not None and uses_transverse_interaction(cfg):
+            if wfns_transverse is None or wfns_transverse.green_parent is None:
+                raise ValueError('GATE resident_current_source: fresh preparation lacks its current parent carrier')
+            from common.collectives import all_gather_processes
+            from .augmentation_current import live_device_bytes
+            from .augmentation_current_hartree import prepare_paired_current_hartree
+            from file_io.restart_bundle import BispinorVqReader
+            # Price all still-live device arrays, including charge/V/carrier
+            # operands retained by this preparation. Deleted donated arrays
+            # are excluded by the existing lifetime owner. Every process
+            # uses the same conservative largest process live set.
+            resident_bytes = float(np.max(all_gather_processes(np.asarray(
+                live_device_bytes(*jax.live_arrays()), dtype=np.float64))))
+            parent_T = wfns_transverse.green_parent
+            with BispinorVqReader(os.path.join(tmp_dir, 'v_q_bispinor.h5'), mesh_xy,
+                    mu_bases=(meta.mu_basis, basis_T),
+                    family_plans=(green_parent_carrier.plan, parent_T.plan)) as reader:
+                resident_hartree, _current_hartree_diagnostics = prepare_paired_current_hartree(
+                    resident_hartree, parent_T, reader, wfn=wfn, mesh=mesh_xy,
+                    resident_bytes=resident_bytes)
+            print0('  Paired charge/current native Hartree ready on the independent public receiving window.')
+            print0('  Current Hartree reality diagnostics: '
+                f"occupied Im max={_current_hartree_diagnostics['reality_diagnostics']['occupied_current_imaginary_max']:.3e}, "
+                f"raw Cartesian field Im max={_current_hartree_diagnostics['reality_diagnostics']['raw_potential_imaginary_max']:.3e} Ry; "
+                'Hermitian-density energy derivative uses Re after Cartesian conversion.')
         _write_fresh_restart(
             G0, V_qmunu, _candidate_plan, _to_file_order, band_slices,
             basis_wfn_fingerprint_binding, centroid_indices, cfg, charge_zeta_identity_receipt,
@@ -3883,10 +3908,16 @@ def _prepare_restart_isdf(
             cfg, meta, wfn, band_slices, sym=sym, centroid_indices=centroid_indices,
             mesh_xy=mesh_xy, print_fn=print0)
         _hartree_metadata = read_resident_hartree_metadata(tensors_filename, required=True)
+        _current_operator_record = None
+        if _hartree_metadata['schema'] == 'lorrax.resident_direct_hartree.v2':
+            from file_io.restart_bundle import read_physical_current_operator_contract
+            _current_operator_record = read_physical_current_operator_contract(
+                os.path.join(tmp_dir, 'v_q_bispinor.h5'), required=True)
         require_resident_hartree_source(_hartree_metadata,
             wfn=wfn, sym=sym, plan=_hartree_plan, artifact=_hartree_artifact,
             wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
-            band_range=(int(band_slices.b0), int(band_slices.b3)))
+            band_range=(int(band_slices.b0), int(band_slices.b3)),
+            current_operator_record=_current_operator_record)
     with timing.section(
     		"gw_jax.restart_load", announce=True,
     		label="restart load (metadata, SlabIO tensors, wedge, reshard)"):
@@ -3915,14 +3946,6 @@ def _prepare_restart_isdf(
         (wfns, sigma_parent_carrier, green_parent_carrier, head_channel) = _restart_charge_carrier(
             _to_run_order, band_slices, centroid_indices, cfg, charge_basis_receipt, head_channel,
             mesh_xy, meta, print0, rs, sym, tensors_filename, tmp_dir, wfn)
-        if _hartree_artifact is not None:
-            from .augmentation_hartree import bind_resident_hartree
-            if green_parent_carrier is None or rs.resident_hartree is None:
-                raise ValueError('GATE resident_hartree_required: restart lacks a paired reconstructed native field')
-            resident_hartree = bind_resident_hartree(rs.resident_hartree,
-                wfn=wfn, sym=sym, plan=green_parent_carrier.plan, artifact=_hartree_artifact,
-                wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
-                band_range=(int(band_slices.b0), int(band_slices.b3)))
         (wfns_transverse, transverse_basis_receipt, basis_T) = _restart_current_carrier(
             WavefunctionBasisReceipt, _basis_band_interval, _restart_wfn_provenance_complete,
             _stamped, _to_run_order, band_slices, basis_T, basis_wfn_fingerprint_binding, cfg,
@@ -3932,6 +3955,24 @@ def _prepare_restart_isdf(
         from file_io.restart_bundle import require_bispinor_v_pairing
         require_bispinor_v_pairing(tensors_filename, _v_path,
                                    _bispinor_v_policy(cfg, meta))
+    if _hartree_artifact is not None:
+        from .augmentation_hartree import bind_resident_hartree
+        if green_parent_carrier is None or rs.resident_hartree is None:
+            raise ValueError('GATE resident_hartree_required: restart lacks a paired reconstructed native field')
+        _current_operator_record = None
+        if rs.resident_hartree['provenance']['schema'] == 'lorrax.resident_direct_hartree.v2':
+            if wfns_transverse is None or wfns_transverse.green_parent is None:
+                raise ValueError('GATE resident_current_source: paired restart lacks its current parent carrier')
+            from file_io.restart_bundle import BispinorVqReader
+            with BispinorVqReader(_v_path, mesh_xy,
+                    mu_bases=(meta.mu_basis, basis_T),
+                    family_plans=(green_parent_carrier.plan, wfns_transverse.green_parent.plan)) as reader:
+                _current_operator_record = reader.physical_current_operator_record()
+        resident_hartree = bind_resident_hartree(rs.resident_hartree,
+            wfn=wfn, sym=sym, plan=green_parent_carrier.plan, artifact=_hartree_artifact,
+            wfn_fingerprint_binding=basis_wfn_fingerprint_binding,
+            band_range=(int(band_slices.b0), int(band_slices.b3)),
+            current_operator_record=_current_operator_record)
     (photon_g0_vectors) = _restart_gamma_vectors(
         _to_run_order, basis_T, cfg, mesh_xy, meta, photon_g0_vectors, tmp_dir)
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt, resident_hartree)

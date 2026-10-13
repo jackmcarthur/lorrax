@@ -34,6 +34,7 @@ from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSI
     _decode_charge_zeta_identity, _encode_charge_zeta_provenance,
     _loaded_band_axis, _validate_shape_receipt,
     HARTREE_PARENT_DATASET, _read_hartree_provenance, _hartree_band_axis,
+    resident_hartree_component_names,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
 
@@ -82,15 +83,24 @@ def _read_resident_hartree_slab(io, record, mesh_xy):
     """The single band-tile read shared by dedicated and whole-bundle readers."""
     nb = record['band_range'][1] - record['band_range'][0]
     axis = _hartree_band_axis(nb, mesh_xy)
+    names = resident_hartree_component_names(record)
     shape = (len(record['parent_full_rows']), axis.carrier, axis.carrier)
+    spec = P(None, 'x', 'y')
+    if len(names) == 2:
+        shape += (2,)
+        spec = P(None, 'x', 'y', None)
     array = io.read_slab(
         HARTREE_PARENT_DATASET, shape=shape, dtype=np.complex128,
-        offset=(0, 0, 0), mesh=mesh_xy, partition_spec=P(None, 'x', 'y'))
+        offset=(0,) * len(shape), mesh=mesh_xy, partition_spec=spec)
     jax.block_until_ready(array)
     for band_axis in (1, 2):
         authenticate_axis(array, axis, axis=band_axis,
                           where='resident Hartree restart')
-    return dict(parent_kij_ry=array, provenance=record)
+    if len(names) == 1:
+        return dict(parent_kij_ry=array, provenance=record)
+    # Storage order is versioned; downstream code receives named fields.
+    return dict(charge_parent_kij_ry=array[..., 0],
+                transverse_parent_kij_ry=array[..., 1], provenance=record)
 
 
 def _require_current(f):
@@ -1677,6 +1687,10 @@ class BispinorVqReader:
         self._filename = Path(filename)
         self._mesh = mesh_xy
         self._mu_bases = mu_bases
+        self._family_plans = family_plans
+        self._current_family_authenticated = (
+            family_plans is not None and len(family_plans) > 1
+            and family_plans[1] is not None and mu_bases is not None)
         self.q_tables = {}
         self.q_headers = {}
 
@@ -1802,13 +1816,14 @@ class BispinorVqReader:
     def __exit__(self, *exc):
         self._io.__exit__(*exc)
 
-    def _zero_tile(self, mu_L: int, nu_L: int) -> jax.Array:
+    def _zero_tile(self, mu_L: int, nu_L: int, *, q_count=None) -> jax.Array:
         n_L = self.n_rmu_C if mu_L == 0 else self.n_rmu_T
         n_R = self.n_rmu_C if nu_L == 0 else self.n_rmu_T
         sharding = NamedSharding(self._mesh, P(None, 'x', 'y'))
         n_L_p, n_R_p = self._padded_shape_LR(n_L, n_R)
         return jax.lax.with_sharding_constraint(
-            jnp.zeros((self.n_q_total, n_L_p, n_R_p), dtype=jnp.complex128),
+            jnp.zeros((self.n_q_total if q_count is None else q_count,
+                       n_L_p, n_R_p), dtype=jnp.complex128),
             sharding,
         )
 
@@ -1839,11 +1854,60 @@ class BispinorVqReader:
 
     def get_tile(self, mu_L: int, nu_L: int) -> jax.Array:
         """Read one q-IBZ tile and pack its two centroid families at the file boundary."""
+        return self._read_tile_rows(mu_L, nu_L, 0, self.n_q_total)
+
+    def physical_current_operator_record(self):
+        """Authenticate the current owner's geometry against this live reader.
+
+        Family plans already compare actual centroid actions and q charts at
+        construction. This adds the persisted physical producer descriptor;
+        a legacy current file can still serve its original consumers but
+        cannot admit a paired reconstructed direct field.
+        """
+        if not self._current_family_authenticated:
+            raise ValueError('Physical current operator requires the authenticated current family')
+        record = read_physical_current_operator_contract(self._filename, required=True)
+        plan = self._family_plans[1]
+        expected = dict(logical_mu=self.n_rmu_T,
+            centroid_hash=self.q_headers[1].centroid_hash,
+            q_full_indices=np.asarray(plan.sym.q_irr_full_idx, int).tolist(),
+            q_fractional=np.asarray(self.q_tables[1].q_irr_frac, float).tolist(),
+            kgrid=list(self.kgrid))
+        actual = record['operator_contract'].get('current_geometry_binding')
+        if (not isinstance(actual, dict)
+                or any(actual.get(key) != value for key, value in expected.items())
+                or ('q_tables_sha256' in actual
+                    and actual['q_tables_sha256'] != self.q_tables[1].digest())):
+            raise ValueError('GATE resident_current_operator: current centroid/q geometry changed')
+        return record
+
+    def get_current_gamma_tile(self, mu_L: int, nu_L: int) -> jax.Array:
+        """Read only the authenticated Gamma spatial-current block.
+
+        The current-V writer already rotates its fitted component basis to
+        Cartesian. This two-dimensional tile therefore contracts Cartesian
+        sample currents, not a second copy of ``current_basis_rows``.
+        The full-zone coordinate is selected from the same current-family
+        q table verified at construction; no first-row assumption is made.
+        Both sample axes use the actual packed current centroid basis.
+        """
+        if (not self._current_family_authenticated
+                or mu_L not in (1, 2, 3) or nu_L not in (1, 2, 3)):
+            raise ValueError('Gamma current Hartree requires the authenticated current family and spatial blocks')
+        q = np.asarray(self.q_tables[1].q_irr_frac)
+        delta = q - np.rint(q)
+        rows = np.flatnonzero(np.max(np.abs(delta), axis=1) <= 2e-12)
+        if q.shape != (self.n_q_total, 3) or len(rows) != 1:
+            raise ValueError('Current interaction must contain exactly one physical Gamma row')
+        return self._read_tile_rows(mu_L, nu_L, int(rows[0]), 1)[0]
+
+    def _read_tile_rows(self, mu_L, nu_L, first, count):
+        """One canonical read/adjoint/centroid-pack path, also for Gamma."""
         from gw.v_q_bispinor import (HERMITIAN_PAIRS, ZERO_TILES, tile_dataset_name)
         if not (0 <= mu_L <= 3 and 0 <= nu_L <= 3):
             raise ValueError(f"Lorentz indices must be in 0..3; got {(mu_L, nu_L)}.")
         if (mu_L, nu_L) in ZERO_TILES:
-            tile = self._zero_tile(mu_L, nu_L)
+            tile = self._zero_tile(mu_L, nu_L, q_count=count)
         else:
             transpose = (mu_L, nu_L) in HERMITIAN_PAIRS
             source = HERMITIAN_PAIRS.get((mu_L, nu_L), (mu_L, nu_L))
@@ -1851,7 +1915,7 @@ class BispinorVqReader:
             n_L_p, n_R_p = self._padded_shape_LR(n_L, n_R)
             tile = self._io.read_slab(
                 tile_dataset_name(*source),
-                shape=(self.n_q_total, n_L_p, n_R_p), mesh=self._mesh,
+                shape=(count, n_L_p, n_R_p), offset=(first, 0, 0), mesh=self._mesh,
                 partition_spec=P(None, 'y', 'x') if transpose else P(None, 'x', 'y'),
                 dtype=jnp.complex128)
             if transpose:
@@ -1900,6 +1964,43 @@ def read_bispinor_v_receipt(path):
             return None
         raw = f[V_QMUNU_RECEIPT_DATASET][()]
     return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+
+
+def read_physical_current_operator_contract(path, *, required=False):
+    """Read the source-bound current owner's member of the V generation.
+
+    This validates bounded JSON and its canonical identity. The canonical V
+    producer owns the physical descriptor; GW compares that live descriptor
+    to the resident transverse component. Old generation receipts remain
+    readable, but cannot admit a paired current Hartree field without this
+    member. No interaction payload is read here.
+    """
+    import hashlib
+    text = read_bispinor_v_receipt(path)
+    if text is None:
+        if required:
+            raise ValueError('GATE resident_current_operator: no canonical V generation receipt')
+        return None
+    if len(text.encode()) > 262144:
+        raise ValueError('Current V generation receipt exceeds bounded size')
+    def refuse_constant(value):
+        raise ValueError('Nonfinite current generation JSON')
+    generation = json.loads(text, parse_constant=refuse_constant)
+    if not isinstance(generation, dict):
+        raise ValueError('Current generation receipt must describe a JSON object')
+    contract = generation.get('physical_current_operator_contract')
+    identity = generation.get('physical_current_operator_identity')
+    if contract is None and identity is None:
+        if required:
+            raise ValueError('GATE resident_current_operator: canonical V lacks its physical current owner contract')
+        return None
+    if not isinstance(contract, dict) or not contract:
+        raise ValueError('Current operator contract must be a nonempty canonical JSON object')
+    encoded = json.dumps(contract, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    if hashlib.sha256(encoded).hexdigest() != identity:
+        raise ValueError('Current operator contract digest differs from its canonical V generation')
+    return dict(operator_contract=contract, operator_identity=identity,
+                generation_identity=hashlib.sha256(text.encode()).hexdigest())
 
 
 def require_bispinor_v_pairing(tensors_filename, v_path, running_policy):

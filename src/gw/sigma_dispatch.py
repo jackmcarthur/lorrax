@@ -1252,11 +1252,15 @@ def _sigma_hartree_fields(
                     wfn=wfn, sym=sym, print_fn=print_fn)
             else:
                 from .augmentation_hartree import serve_resident_hartree
-                sig_h = serve_resident_hartree(resident_hartree,
+                direct_fields = serve_resident_hartree(resident_hartree,
                     config=config, wfn=wfn, sym=sym, mesh=mesh_xy,
                     band_range=(int(band_slices.b0), int(band_slices.b3)),
                     occupation_state=occupation_state)
-                h_transverse = None
+                if isinstance(direct_fields, dict):
+                    sig_h = direct_fields['charge']
+                    h_transverse = direct_fields['transverse']
+                else:
+                    sig_h, h_transverse = direct_fields, None
             sec.watch(sig_h, h_transverse)
         sig_h = jnp.asarray(sig_h, dtype=sig_x.dtype)
         if hartree_basis_rotation is not None:
