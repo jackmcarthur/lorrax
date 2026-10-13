@@ -20,7 +20,7 @@ def _synthetic_mf_source(path, facts):
         'versionnumber':1,'flavor':2,
         'kpoints/nspin':1,'kpoints/nspinor':4,'kpoints/nrk':Q,
         'kpoints/mnband':8,'kpoints/ngkmax':7,'kpoints/ecutwfc':2.,
-        'kpoints/kgrid':np.asarray([6,6,6],np.int32),'kpoints/shift':np.zeros(3),
+        'kpoints/kgrid':np.asarray(facts.get('kgrid',(6,6,6)),np.int32),'kpoints/shift':np.zeros(3),
         'kpoints/ngk':fixture['counts'],'kpoints/ifmin':np.ones((1,Q),np.int32),
         'kpoints/ifmax':np.full((1,Q),4,np.int32),'kpoints/w':np.full(Q,1/Q),
         'kpoints/rk':q,'kpoints/el':np.zeros((1,Q,8)),'kpoints/occ':np.zeros((1,Q,8)),
@@ -37,7 +37,7 @@ def _synthetic_mf_source(path, facts):
         for name,value in data.items():mf.create_dataset(name,data=value)
 
 
-def publication_fixture(runtime, directory, *, mu_basis=None):
+def publication_fixture(runtime, directory, *, mu_basis=None, operator_layout=None):
     """Return plain callbacks consuming the admitted provider fixture arrays."""
     import numpy as np
     import jax
@@ -55,8 +55,10 @@ def publication_fixture(runtime, directory, *, mu_basis=None):
             raise ValueError('publication fixture requires the canonical body/head geometry')
         directory.mkdir(parents=True,exist_ok=True)
         source=directory/'source_header.h5'
+        header_facts=(facts if operator_layout is None else
+                      dict(facts,kgrid=operator_layout['kgrid']))
         rank0_transaction(str(source),stage='fixture_mf_source',
-            write=lambda:_synthetic_mf_source(source,facts))
+            write=lambda:_synthetic_mf_source(source,header_facts))
         # The old identity proof remains the default. Layout cases provide a
         # real packed basis with independent canonical reference labels.
         if mu_basis is None:
@@ -115,18 +117,61 @@ def publication_fixture(runtime, directory, *, mu_basis=None):
         assert compensation_signal>1e-6,'fixture did not distinguish physical delta from compensation'
         host_V=tuple(np.asarray(gather_to_host(v)) for v in got)
         path=directory/'saved_current_tensors.h5'
+        restored=[]
+        internal_ghost=0.
         # Persist the COMPLETE local-augmented tensors, not a finite-G
         # contraction reconstructed from the physical zeta files.
-        with SlabIO(path,mode='w',mesh=mesh) as writer:
-            for (a,b),v in zip(facts['pairs'],got):
-                name=f'V_{a}{b}';writer.create_dataset(name,shape=v.shape,dtype=np.complex128)
-                writer.write_slab(name,v);writer.sync_writes()
-        restored=[]
-        with SlabIO(path,mode='r',mesh=mesh) as reader:
-            for a,b in facts['pairs']:
-                v=reader.read_slab(f'V_{a}{b}',shape=got[0].shape,dtype=np.complex128,
-                    offset=(0,0,0),partition_spec=P(None,'x','y'))
-                restored.append(np.asarray(gather_to_host(v)))
+        if operator_layout is None:
+            with SlabIO(path,mode='w',mesh=mesh) as writer:
+                for (a,b),v in zip(facts['pairs'],got):
+                    name=f'V_{a}{b}';writer.create_dataset(name,shape=v.shape,dtype=np.complex128)
+                    writer.write_slab(name,v);writer.sync_writes()
+            with SlabIO(path,mode='r',mesh=mesh) as reader:
+                for a,b in facts['pairs']:
+                    v=reader.read_slab(f'V_{a}{b}',shape=got[0].shape,dtype=np.complex128,
+                        offset=(0,0,0),partition_spec=P(None,'x','y'))
+                    restored.append(np.asarray(gather_to_host(v)))
+        else:
+            import h5py
+            import jax.numpy as jnp
+            from file_io.restart_bundle import BispinorVqReader
+            from gw.v_q_bispinor import (UNIQUE_TILES,tile_dataset_name,
+                _publish_unique_tile_inventory)
+            from symmetry_maps import stamp_qirr_tensor
+            assert mu_basis is not None
+            n=mu_basis.n_logical;Q=len(facts['head_fixture']['q'])
+            with SlabIO(path,mode='w',mesh=mesh) as writer:
+                face=NamedSharding(mesh,P(None,'x','y'))
+                zero=jax.jit(lambda:jnp.zeros(got[0].shape,jnp.complex128),out_shardings=face)()
+                writer.create_dataset(tile_dataset_name(0,0),shape=(Q,n,n),dtype=np.complex128)
+                writer.write_slab(tile_dataset_name(0,0),zero);writer.sync_writes()
+                for (a,b),v in zip(facts['pairs'],got):
+                    name=tile_dataset_name(a+1,b+1)
+                    writer.create_dataset(name,shape=(Q,n,n),dtype=np.complex128)
+                    writer.write_slab(name,v);writer.sync_writes()
+            def publish():
+                for pair in UNIQUE_TILES:
+                    stamp_qirr_tensor(path,tile_dataset_name(*pair),tables=operator_layout['tables'],
+                        closure_verdict=operator_layout['closure'],n_rmu_logical=n)
+                with h5py.File(path,'a') as f:
+                    for name,value in {'kgrid':np.asarray(operator_layout['kgrid'],np.int32),
+                        'n_rmu_C':n,'n_rmu_T':n,'n_q_total':Q}.items():
+                        f.create_dataset(name,data=value)
+                    _publish_unique_tile_inventory(f,filename=path,n_q_total=Q,n_rmu_C=n,n_rmu_T=n)
+            rank0_transaction(str(path),stage='fixture_canonical_current_metadata',write=publish)
+            plan=operator_layout['plan']
+            with BispinorVqReader(path,mesh,mu_bases=(mu_basis,mu_basis),
+                                 family_plans=(plan,plan)) as reader:
+                for a,b in facts['pairs']:
+                    value=reader.get_tile(a+1,b+1)
+                    packed=np.asarray(gather_to_host(value))
+                    internal_ghost=max(internal_ghost,float(np.max(abs(packed[:,~mu_basis.active_mask]))),
+                        float(np.max(abs(packed[:,:,~mu_basis.active_mask]))))
+                    if a!=b:
+                        lower=np.asarray(gather_to_host(reader.get_tile(b+1,a+1)))
+                        np.testing.assert_array_equal(lower,packed.conj().transpose(0,2,1))
+                    restored.append(np.asarray(gather_to_host(mu_basis.unpack_operator(value))))
+            assert internal_ghost==0.,'canonical reader retained internal packed ghosts'
         for old,new,expected in zip(host_V,restored,facts['expected']):
             np.testing.assert_array_equal(new,old)
             np.testing.assert_allclose(new,expected,rtol=0,atol=2e-11)
@@ -154,7 +199,9 @@ def publication_fixture(runtime, directory, *, mu_basis=None):
             coordinate_kind='fft_indices' if mu_basis is None else mu_basis.coordinate_kind,
             wrong_canonical_order_signal=wrong_order_signal,
             wrong_canonical_operator_signal=wrong_operator_signal,
-            scope='synthetic provider physical payload and complete saved-tensor action replay; not Qirr-stamped production GW restart')
+            canonical_reader=operator_layout is not None,
+            internal_packed_ghost_max_abs=internal_ghost,
+            scope='synthetic provider physical payload and complete saved-tensor action replay; no material or GW accuracy certificate')
     return dict(open=opened,verify=verify),result
 
 

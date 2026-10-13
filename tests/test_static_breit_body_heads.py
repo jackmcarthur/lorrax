@@ -3,14 +3,19 @@ import copy
 import numpy as np
 import pytest
 
-def physical_head_fixture(*,near_ties=False,embedded_gamma=False,sys_dim=3):
+def physical_head_fixture(*,near_ties=False,embedded_gamma=False,sys_dim=3,
+                          q_rows=None,kgrid=None):
     from vcoul import CoulombGeometry,get_kernel,head_slot_table,v_qG_table
     from vcoul.minibz import build_v_head_miniBZ_fn_3d
     from isdf.atomic_breit import static_breit_body_head_slots
     volume=1000.;bvec=(2*np.pi/10)*np.eye(3)
     if near_ties:bvec[0,1]=1e-10*bvec[1,1]
     geometry=CoulombGeometry(bvec=bvec,cell_volume=volume)
-    q=np.asarray([[0,0,0],[.5,0,0],[.5,.5,0]],float)
+    q=np.asarray([[0,0,0],[.5,0,0],[.5,.5,0]] if q_rows is None else q_rows,float)
+    if q.shape!=(3,3):
+        raise ValueError('The bounded head fixture requires exactly three q rows')
+    if kgrid is None:kgrid=(6,6,6) if sys_dim==3 else (6,6,1)
+    kgrid=tuple(kgrid)
     base=np.asarray([[0,0,0],[-1,0,0],[0,-1,0],[-1,-1,0],[1,0,0],[0,1,0],[0,0,1]],np.int32)
     if sys_dim==2:base[-1]=[0,0,4]  # Resolved neutral remainder, not only small-K Taylor terms.
     G=np.broadcast_to(base.T,(3,3,7)).copy();counts=np.asarray([7,5,6],np.int32)
@@ -18,7 +23,7 @@ def physical_head_fixture(*,near_ties=False,embedded_gamma=False,sys_dim=3):
     K=(G.transpose(0,2,1)+q[:,None])@bvec
     active=np.arange(7)[None]<counts[:,None];cutoff=8. if sys_dim==2 else 2.
     body=active&(np.einsum('qgi,qgi->qg',K,K)<=cutoff)
-    callback=(build_v_head_miniBZ_fn_3d((6,6,6),bvec,volume,nmc=512,seed=42)
+    callback=(build_v_head_miniBZ_fn_3d(kgrid,bvec,volume,nmc=512,seed=42)
               if sys_dim==3 else None)
     gamma=None
     if embedded_gamma:
@@ -27,8 +32,8 @@ def physical_head_fixture(*,near_ties=False,embedded_gamma=False,sys_dim=3):
         import gw.v_q_bispinor as owner
         from vcoul import COULOMB_GAUGE_TT_SIGN
         tensor=COULOMB_GAUGE_TT_SIGN*owner._tt_head_tensor(
-            bvec=bvec,cell_volume=volume,sys_dim=sys_dim,kgrid=(6,6,6) if sys_dim==3 else (6,6,1))/volume
-        gamma=dict(cartesian_ry=tensor,kgrid=np.asarray([6,6,6] if sys_dim==3 else [6,6,1],np.int32),
+            bvec=bvec,cell_volume=volume,sys_dim=sys_dim,kgrid=kgrid)/volume
+        gamma=dict(cartesian_ry=tensor,kgrid=np.asarray(kgrid,np.int32),
             source_receipt=json.dumps(dict(owner='gw.v_q_bispinor._tt_head_tensor',
                 owner_sha256=hashlib.sha256(Path(owner.__file__).read_bytes()).hexdigest(),
                 head_rule=owner.V_QMUNU_HEAD_RULE,analytic_sphere=True,

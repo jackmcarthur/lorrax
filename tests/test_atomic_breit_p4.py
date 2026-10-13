@@ -22,7 +22,7 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
                       angular_maximum=2,field_tile=3,centroid_tile=3,compensated=False,averaged_heads=False,
                       embedded_gamma=False, publication_fixture=None,
                       mu_basis=None, canonical_to_packed_reference=None,sys_dim=3,
-                      streamed_coefficients=False):
+                      streamed_coefficients=False, price_observer=None, head_fixture_factory=None):
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -48,10 +48,17 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         if canonical_to_packed_reference is None:
             raise ValueError('layout witness requires an independent literal reference map')
         reference_ids=np.asarray(canonical_to_packed_reference,np.int32)
-        assert mu_basis.n_logical==mu_basis.n_packed==mu
-        assert np.array_equal(np.sort(reference_ids),np.arange(mu))
+        assert mu_basis.n_packed==mu_basis.n_canonical==mu
+        assert reference_ids.shape==(mu_basis.n_logical,)
         assert np.array_equal(mu_basis.layout.axis.canonical_to_packed,reference_ids)
+        assert np.array_equal(np.sort(reference_ids),np.flatnonzero(mu_basis.active_mask))
         assert not mu_basis.is_identity
+        reference_ids=np.pad(reference_ids,(0,mu-mu_basis.n_logical))
+    active_mu=np.ones(mu,bool) if mu_basis is None else np.asarray(mu_basis.active_mask)
+    canonical_mu=np.ones(mu,bool) if mu_basis is None else np.arange(mu)<mu_basis.n_logical
+    def canonical(value):
+        return np.where(canonical_mu[None,:,None]&canonical_mu[None,None,:],
+                        value[:,reference_ids][:,:,reference_ids],0.)
     volume,nfft=1000.,96;prefactor=prefactor_multiplier*np.pi/volume
     lm=np.asarray([(l,m) for l in range(angular_maximum+1) for m in range(-l,l+1)],np.int32)
     nh=len(lm);r=R*(np.arange(1,nr+1)/nr)**3
@@ -68,8 +75,10 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
     if embedded_gamma and not averaged_heads:
         raise ValueError('embedded current Gamma test requires the canonical body-head fixture')
     if averaged_heads:
-        from tests.test_static_breit_body_heads import physical_head_fixture
-        head_fixture=physical_head_fixture(embedded_gamma=embedded_gamma,sys_dim=sys_dim)
+        if head_fixture_factory is None:
+            from tests.test_static_breit_body_heads import physical_head_fixture
+            head_fixture_factory=physical_head_fixture
+        head_fixture=head_fixture_factory(embedded_gamma=embedded_gamma,sys_dim=sys_dim)
         K=head_fixture['K'];body=head_fixture['body'];head=head_fixture['policy']['gamma_head_cartesian']
         assert np.array_equal(counts,head_fixture['counts'])
     gvec=(head_fixture['G'] if averaged_heads else np.zeros((Q,3,ng),np.int32))
@@ -94,17 +103,21 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         C=np.empty((Qp,mu,mu),complex)
         for q in range(Qp):
             F=random((mu,mu));C[q]=F.conj().T@F+(1+c)*np.eye(mu)
+        C[:,~active_mu]=0.;C[:,:,~active_mu]=0.
+        for index in np.flatnonzero(~active_mu):C[:,index,index]=1.
         if not circular and c==1:C=-C  # Cartesian alpha² signed LU seam.
         lu=np.stack([lu_factor(v)[0] for v in C]);piv=np.stack([lu_factor(v)[1] for v in C]).astype(np.int32)
         target=random((Qp,mu,gpad))*.04
-        target[Q:]=0.;target[...,ng:]=0.
+        target[Q:]=0.;target[...,ng:]=0.;target[:,~active_mu]=0.
         Z=np.einsum('qmn,qng->qmg',C,target)
         coeff=random((Qp,mu,na,nh,nr))*(40. if sys_dim==2 else .2)
         coeff*=r[None,None,None,None]**lm[None,None,None,:,0,None]*(1-(r/R)**2)**2
+        coeff[:,~active_mu]=0.
         coeff[Q:]=1e8-2e8j
         rhs=np.einsum('qmn,qnf->qmf',C,coeff.reshape(Qp,mu,-1))
         ps=random(coeff.shape)*.11
         ps*=r[None,None,None,None]**lm[None,None,None,:,0,None]*(1-(r/R)**2)**2
+        ps[:,~active_mu]=0.
         ps[Q:]=-3e8+1e8j
         ps_raw=np.einsum('qmn,qnf->qmf',C,ps.reshape(Qp,mu,-1))
         ps_coefficients.append(ps);ps_rhs.append(put(ps_raw));ps_rhs_host.append(ps_raw)
@@ -120,7 +133,7 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
             store.write_batch(beta,rows)
         zetas.append(ZetaG(store,mesh=mesh,L_q=put(lu),
             lu_piv=device_put_process_local(piv,NamedSharding(mesh,P(('x','y'),None))),
-            solver_kind='lu',batched_route='batch_reshard',n_rmu_solve=mu,n_rmu=mu,
+            solver_kind='lu',batched_route='batch_reshard',n_rmu_solve=mu,n_rmu=(mu_basis.n_logical if mu_basis is not None else mu),
             mu_basis=mu_basis,ngk_per_q=counts,gvec_components=gvec,
             path='synthetic static current',print_fn=lambda line:None))
     provider_args=dict(
@@ -203,13 +216,14 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
             expected.append(base+product(smooth[a],delta[b])+product(delta[a],smooth[b]))
         without_cross.append(base)
     for z,p in zip(zetas,providers):z.local_augmentation=p
-    expected_canonical=[e[:,reference_ids][:,:,reference_ids] for e in expected]
+    if price_observer is not None:price_observer(zetas,bundle,provider_args,K)
+    expected_canonical=[canonical(e) for e in expected]
     keep=np.asarray([[0,2],[0,4],[0,5]],np.int32)
     if publication_fixture is None:
         got=contract_v_group(zetas,pairs,v_tables,keep=keep,print_fn=lambda line:None)
     else:
-        facts=dict(physical=tuple((s+d)[:Q,reference_ids,:ng] for s,d in zip(smooth,delta)),
-                   compensation=tuple((s+g0)[:Q,reference_ids,:ng] for s,g0 in zip(smooth,g)),
+        facts=dict(physical=tuple(np.where(canonical_mu[None,:,None],(s+d)[:Q,reference_ids,:ng],0.) for s,d in zip(smooth,delta)),
+                   compensation=tuple(np.where(canonical_mu[None,:,None],(s+g0)[:Q,reference_ids,:ng],0.) for s,g0 in zip(smooth,g)),
                    expected=tuple(e[:Q] for e in expected_canonical),pairs=pairs,keep=keep,
                    expected_packed=tuple(e[:Q] for e in expected),
                    physical_packed=tuple((s+d)[:Q,:,:ng] for s,d in zip(smooth,delta)),
@@ -232,7 +246,7 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         assert gamma_signal>1e-8,gamma_signal
     shell_error=0.
     for c,z in enumerate(zetas):
-        reference=np.take_along_axis((smooth[c]+delta[c])[:Q,reference_ids],keep[:,None],axis=2)
+        reference=np.where(canonical_mu[None,:,None],np.take_along_axis((smooth[c]+delta[c])[:Q,reference_ids],keep[:,None],axis=2),0.)
         shell_error=max(shell_error,float(np.max(np.abs(gather_to_host(z.shell)-reference))))
     assert shell_error<2e-11,shell_error
     cross_signal=max(float(np.max(np.abs(e-b))) for e,b in zip(expected,without_cross))
