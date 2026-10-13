@@ -19,9 +19,31 @@ def check_mu_Fourier(runtime):
     from isdf.augmentation import local_basis_fourier
     from isdf.zeta_mubatch import ZetaG, ZStore, _local_coefficient_solve
     from runtime.padding import padded_axis
+    from common.centroid_basis import PackedCentroidBasis
+    from types import SimpleNamespace
 
     mesh = runtime.mesh
     assert mesh.size == 4 and runtime.process_count == 4
+    # Physical canonical rows interleave three inversion orbits. This is
+    # the actual public nonidentity basis, including its two ghost slots,
+    # rather than a mocked writer permutation or the former mu_basis=None.
+    first = np.asarray([[.11, .17, .23], [.19, .31, .43], [.27, .41, .59]])
+    points = np.concatenate((first, 1.-first))
+    sym = SimpleNamespace(sym_matrices=np.asarray([np.eye(3), -np.eye(3)], np.int32),
+                          translations=np.zeros((2, 3)))
+    basis = PackedCentroidBasis.build(points, sym, (4, 4, 6), mesh,
+                                     coordinate_kind='fractional')
+    literal = np.asarray([0, 3, 2, 5, 1, 4, -1, -1])
+    assert basis.n_logical == 6 and basis.n_canonical == basis.n_packed == 8
+    assert not basis.is_identity
+    np.testing.assert_array_equal(basis.layout.axis.packed_to_canonical, literal)
+    inverse = np.argsort(literal[:basis.n_logical])
+    def canonical(array, axis):
+        # Literal host reference independent of the tested device unpack.
+        result = np.take(array, inverse, axis=axis)
+        pads = [(0, 0)]*result.ndim
+        pads[axis] = (0, basis.n_canonical-basis.n_logical)
+        return np.pad(result, pads)
     put = lambda a, spec: device_put_process_local(np.asarray(a), NamedSharding(mesh, spec))
     host = lambda a: np.asarray(gather_to_host(a))
     qs = P(('x', 'y'), None, None)
@@ -47,7 +69,7 @@ def check_mu_Fourier(runtime):
             mu_pad=mu, g_axis=padded_axis(ng, gt, name='mu FT G'), b=mu, placement='host')
         zeta = ZetaG(store, mesh=mesh, L_q=put(B, qs), lu_piv=None,
             solver_kind='rank_truncate', batched_route='batch_reshard',
-            n_rmu_solve=mu, n_rmu=mu, mu_basis=None, ngk_per_q=counts,
+            n_rmu_solve=mu, n_rmu=basis.n_logical, mu_basis=basis, ngk_per_q=counts,
             gvec_components=np.zeros((Q, 3, ng), np.int32), path='physical charge fixture')
         provider = radial_coulomb_provider(zeta, put(rhs, qs), monopole_rhs=put(exact, qs),
             radius=r, weights_dr=w, lm=lm, centers_cart=centers, q_plus_G_cart=K,
@@ -128,6 +150,12 @@ def check_mu_Fourier(runtime):
         product = lambda a, b: np.einsum('qmg,qg,qng->qmn', a.conj(), v, b)
         reference = (product(smooth, smooth)+product(smooth, expected_d)
             +product(expected_d, smooth)+product(expected_g, expected_g)+onsite[:Q])
+        reference = canonical(canonical(reference, 1), 2)
+        physical_reference = canonical(smooth+expected_d, 1)
+        # A payload left in packed order must fail the same equality. This
+        # proves the nonidentity writer check distinguishes the old seam.
+        packed_writer_mismatch = float(np.max(abs(physical_reference-smooth-expected_d)))
+        assert packed_writer_mismatch > 1e-7
 
         class PhysicalWriter:
             def __init__(self): self.payload = np.zeros((Q, mu, ng), complex)
@@ -140,8 +168,11 @@ def check_mu_Fourier(runtime):
         writer = PhysicalWriter(); zeta.local_augmentation = provider
         V = host(zeta.contract_v(v, keep=np.zeros((Q, 1), np.int32), zeta_io=writer))
         matrix_error = float(np.max(abs(V-reference)))
-        physical_error = float(np.max(abs(writer.payload-smooth-expected_d)))
+        physical_error = float(np.max(abs(writer.payload-physical_reference)))
         assert matrix_error < 2e-11 and physical_error < 4e-11
+        assert not np.any(V[:, basis.n_logical:])
+        assert not np.any(V[:, :, basis.n_logical:])
+        assert not np.any(writer.payload[:, basis.n_logical:])
         assert np.max(abs(V-V.conj().swapaxes(-1, -2))) < 2e-13
         assert np.max(abs(host(zeta.shell)[..., 0]-writer.payload[..., 0])) < 2e-13
         receipt = dict(provider['fourier_distribution_receipt'])
@@ -155,6 +186,10 @@ def check_mu_Fourier(runtime):
                 gpu_utils.set_device_budget_gb(saved)
         results.append(dict(Q=Q, layout_max_abs=layout_error, physical_quadrature_max_abs=quadrature_error,
             complete_mixed_V_max_abs=matrix_error, physical_writer_layout_max_abs=physical_error,
+            nonidentity_centroid_basis=True, logical_mu=basis.n_logical,
+            canonical_mu=basis.n_canonical, packed_mu=basis.n_packed,
+            literal_packed_to_canonical=literal.tolist(),
+            omitted_unpack_same_criterion_error=packed_writer_mismatch,
             capacity=receipt, poisoned_pads_zero=True, capacity_decline_keeps_same_q_arithmetic=True))
         zeta.close()
     result = dict(status='PASS_P4_NUMERICAL_OWNER_AND_MIXED_FUNCTIONAL_ONLY', cases=results,
