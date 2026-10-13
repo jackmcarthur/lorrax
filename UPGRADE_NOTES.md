@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-13 — dipole: the kinetic velocity rides the velocity sweep
+
+With `parallel_transport_out` set, the dipole stage now computes the p-only
+kinetic velocity as the second operator of the velocity sweep, not in a
+second sweep over the same ψ: one program fewer per dipole stage (P4 hsuite
+lookups 3039 → 3036, cold compiles 2263 → 2260). `dipole.h5` is identical in
+every dataset; `parallel_transport.h5` `velocity_kinetic_cart` moves by at
+most one ulp (2.2e-16). eqp is byte-identical in 10/10 files. No deck or
+environment change.
+
 ## 2026-10-13 — SC final diagnostics with sigma_freq_debug_output on a static Sigma
 
 A self-consistent COHSEX or exchange-only run with `sigma_freq_debug_output =
