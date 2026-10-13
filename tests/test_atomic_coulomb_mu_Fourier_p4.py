@@ -165,6 +165,13 @@ def check_mu_Fourier(runtime):
                 first = offset[2]; n = min(gt, ng-first)
                 self.payload[..., first:first+n] = host(value)[..., :n]
 
+        completion_inputs = []
+        onsite_owner = provider['onsite']
+        def record_onsite(values):
+            assert not values.is_deleted()
+            completion_inputs.append(values)
+            return onsite_owner(values)
+        provider['onsite'] = record_onsite
         writer = PhysicalWriter(); zeta.local_augmentation = provider
         V = host(zeta.contract_v(v, keep=np.zeros((Q, 1), np.int32), zeta_io=writer))
         matrix_error = float(np.max(abs(V-reference)))
@@ -176,6 +183,23 @@ def check_mu_Fourier(runtime):
         assert np.max(abs(V-V.conj().swapaxes(-1, -2))) < 2e-13
         assert np.max(abs(host(zeta.shell)[..., 0]-writer.payload[..., 0])) < 2e-13
         receipt = dict(provider['fourier_distribution_receipt'])
+        assert len(completion_inputs) == 1
+        assert completion_inputs[0].is_deleted() == (Q < 4)
+        assert not provider['rhs'].is_deleted(), 'raw provider RHS was consumed'
+        if Q < 4:
+            assert receipt['solved_q_bank_released'] and receipt['raw_rhs_retained']
+            assert receipt['post_release_Fourier_peak'] <= gpu_utils.device_budget_bytes()
+            assert provider['local_completion_capacity_receipt']['actual_AOT']
+            assert zeta.local_stage_seconds['onsite_and_moments'] >= 0.
+            assert zeta.local_stage_seconds['G_loop_and_body_finish'] >= 0.
+            for quote in receipt['actual_AOT']:
+                assert quote['collective_counts']['all-gather'] == 0
+            try:
+                provider['prepare_fourier_coefficients'](provider['rhs'], consume_q_coefficients=True)
+            except ValueError as exc:
+                assert 'distinct from the raw RHS' in str(exc)
+            else:
+                raise AssertionError('raw RHS was accepted as a consumable solve result')
         if Q < 4:
             saved = gpu_utils._RUN_DEVICE_BUDGET_GB
             try:
@@ -184,6 +208,87 @@ def check_mu_Fourier(runtime):
                 assert declined is coefficients and provider['fourier_distribution_receipt']['mode'] == 'q'
             finally:
                 gpu_utils.set_device_budget_gb(saved)
+        if Q == 1:
+            # A write-only pass requires no onsite or periodic result. Its
+            # successful consuming transport must still preserve raw RHS.
+            completion_inputs.clear()
+            writer = PhysicalWriter()
+            assert zeta.contract_v(v, keep=np.zeros((Q, 1), np.int32),
+                                   zeta_io=writer, with_v=False) is None
+            assert not completion_inputs and not provider['rhs'].is_deleted()
+            assert provider['fourier_distribution_receipt']['solved_q_bank_released']
+            assert np.max(abs(writer.payload-physical_reference)) < 4e-11
+        fallback_error = None
+        positive_lifecycle_error = None
+        if Q == 3:
+            # Refuse only the optional redistribution after actual completion
+            # pricing. The already prepared onsite result is reused once.
+            prepare_owner = provider['prepare_fourier_coefficients']
+            def decline_layout(values, **options):
+                saved = gpu_utils._RUN_DEVICE_BUDGET_GB
+                try:
+                    gpu_utils.set_device_budget_gb(1e-7)
+                    return prepare_owner(values, **options)
+                finally:
+                    gpu_utils.set_device_budget_gb(saved)
+            provider['prepare_fourier_coefficients'] = decline_layout
+            completion_inputs.clear()
+            writer = PhysicalWriter()
+            fallback = host(zeta.contract_v(v, keep=np.zeros((Q, 1), np.int32), zeta_io=writer))
+            fallback_error = float(np.max(abs(fallback-reference)))
+            assert fallback_error < 2e-11 and len(completion_inputs) == 1
+            assert not completion_inputs[0].is_deleted() and not provider['rhs'].is_deleted()
+            assert provider['fourier_distribution_receipt']['mode'] == 'q'
+            provider['prepare_fourier_coefficients'] = prepare_owner
+            # Exercise retained exact-M0 rows and the actual public distributed
+            # periodic action. The finite complex Gram is deliberately planted;
+            # this proves lifecycle/order, not a physical Slab completion.
+            import jax.numpy as jnp
+            from jax import shard_map
+            from runtime.padding import pad_to_axis
+            from isdf.atomic_coulomb import make_periodic_compensation_action
+            from isdf.coulomb_fourier_cache import PERIODIC_SCHEMA
+            face = NamedSharding(mesh, P(None, 'x', 'y'))
+            moment_axis = padded_axis(na*nh, mesh, name='periodic moment',
+                                     specs=((face.spec, 1), (face.spec, 2)))
+            radial_rows = put(tables['moments'][lm[:, 0]], P())
+            def moment_rows(values, rows):
+                density = values[..., :nf].reshape(values.shape[0], mu, na, nh, nr)
+                result = jnp.einsum('qmahr,hr->qmah', density, rows)
+                result = result.at[:, :, :, 0].set(values[..., nf:])
+                return pad_to_axis(result.reshape(values.shape[0], mu, na*nh), moment_axis, axis=2)
+            moment_kernel = jax.jit(shard_map(moment_rows, mesh=mesh,
+                in_specs=(qs, P()), out_specs=qs, check_vma=False))
+            gram0 = random((Q, na*nh, na*nh))*.03
+            gram0 = gram0.conj().swapaxes(-1, -2)@gram0
+            gram = np.zeros((Q, moment_axis.carrier, moment_axis.carrier), complex)
+            gram[:, :na*nh, :na*nh] = gram0
+            cache = dict(gram=put(gram, face.spec), moment_axis=moment_axis,
+                path='planted finite lifecycle fixture', file_sha256='0'*64,
+                metadata=dict(schema=PERIODIC_SCHEMA, logical_shape=[Q, na*nh, na*nh],
+                              geometry=dict(cell_volume_bohr3=volume)))
+            action, _ = make_periodic_compensation_action(mesh, cache,
+                centroid_basis=basis, fft_points=N)
+            provider.update(body_metric='physical_low_local_high', bare_v_table=v,
+                periodic_cache=cache, periodic_action=action,
+                periodic_moment_rows=lambda values: moment_kernel(values, radial_rows))
+            provider['aot_metadata']['periodic_moments'] = dict(kernel=moment_kernel,
+                                                               table_operands=(radial_rows,))
+            mrows = np.einsum('qmahr,hr->qmah', d, tables['moments'][lm[:, 0]])
+            mrows[:, :, :, 0] = e
+            mrows = mrows[:Q].reshape(Q, mu, na*nh)
+            periodic = (N/volume)**2*(mrows.conj()@gram0@mrows.swapaxes(-1, -2))
+            physical = smooth+expected_d
+            positive_reference = (product(physical, physical)-product(expected_d, expected_d)
+                                  +onsite[:Q]+periodic)
+            positive_reference = canonical(canonical(positive_reference, 1), 2)
+            completion_inputs.clear()
+            positive = host(zeta.contract_v(v, keep=np.zeros((Q, 1), np.int32)))
+            positive_lifecycle_error = float(np.max(abs(positive-positive_reference)))
+            assert positive_lifecycle_error < 2e-11 and len(completion_inputs) == 1
+            assert completion_inputs[0].is_deleted() and not provider['rhs'].is_deleted()
+            assert {'periodic_moments', 'moments_to_face'} <= {
+                row['owner'] for row in provider['local_completion_capacity_receipt']['actual_AOT']}
         results.append(dict(Q=Q, layout_max_abs=layout_error, physical_quadrature_max_abs=quadrature_error,
             complete_mixed_V_max_abs=matrix_error, physical_writer_layout_max_abs=physical_error,
             nonidentity_centroid_basis=True, logical_mu=basis.n_logical,
@@ -191,6 +296,9 @@ def check_mu_Fourier(runtime):
             literal_packed_to_canonical=literal.tolist(),
             omitted_unpack_same_criterion_error=packed_writer_mismatch,
             capacity=receipt, poisoned_pads_zero=True, capacity_decline_keeps_same_q_arithmetic=True))
+        results[-1].update(consuming_solved_bank_only=Q < 4,
+                           complete_optional_layout_fallback_error=fallback_error,
+                           planted_positive_periodic_lifecycle_error=positive_lifecycle_error)
         zeta.close()
     result = dict(status='PASS_P4_NUMERICAL_OWNER_AND_MIXED_FUNCTIONAL_ONLY', cases=results,
         scope='Exact Fourier distribution, coherent M0 and physical writer transport. No material, Slab periodic completion, full4262 capacity or <=2x timing admission.')
