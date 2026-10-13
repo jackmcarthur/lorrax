@@ -89,7 +89,7 @@ untreated fit.
 
 ## 2 The carrier
 
-Every vertex of the four-current route acts on the normalized RKB lift of the
+The charge and current operators act on the normalized RKB lift of the
 two-component wavefunction ([bispinor GW](../theory/bispinor-gw.md)). The charge
 and current densities are fitted on two separate centroid bases, $n_C$ and
 $n_T$ packed centroids. They are never merged.
@@ -128,6 +128,24 @@ parent,
   directions and state panels (theory (SP 7)) and its cross panels, the CT/TC
   actions on that family's directions.
 
+The dynamic sample is evaluated without subtracting large static operators.
+With paramagnetic response $\chi_p(s)$, contact $D$, and
+$A(s)=I+VD-V\chi_p(s)$, the bank retains
+$U=(I+VD)^{-1}V$ from the actual static solve and computes
+
+$$
+F(s)=W(s)-U=A(s)^{-1}V\chi_p(s)U,\qquad
+\partial_s F=(F+U)\,\partial_s\chi_p\,(F+U).
+$$
+
+Indeed $A(s)U=V-V\chi_p(s)U$; the multiplication order remains valid for
+noncommuting charge/current blocks. Reconstructing $U$ from the stored
+constant $U-V$ would reintroduce cancellation. The constant and the ordered
+moment definitions are unchanged. The retained $U$ costs
+$16 n_q(n_C+3n_T)^2/P$ additional bytes per rank in complex128; the static
+solve and the sample solves enter the same compiled-memory admission owner.
+The value and derivative kernels operate on the distributed centroid face.
+
 The line panels are selected by the producer while the line sample is in hand
 (`sector_line_selection`, `src/gw/shared_pole_sectors.py:127`). Each family's
 endpoint block is cut exactly as a sector read cuts it, so the producer selects
@@ -135,7 +153,8 @@ on the bits the constructor reads.
 
 Every map builds its own static contact $\Pi_{\rm FD}(0,0)$. Under
 `head_correction = no_local_fields` the bank adds the direct Γ head field
-$W_h - V_h$ to every sample through the packed $\zeta(G=0)$ vectors, so the fitted
+$W_h-W_{h,\infty}$ to each dynamic sample through the packed
+$\zeta(G=0)$ vectors and stores $W_{h,\infty}-V_h$ with the constant, so the fitted
 CC, CT, TC and TT poles carry the head
 ([four-current heads §5](../theory/four-current-head-corrections.md#direct-bulk-head)).
 

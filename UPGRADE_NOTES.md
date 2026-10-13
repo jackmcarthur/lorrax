@@ -1,5 +1,16 @@
 # Upgrade notes
 
+## Unreleased — stable dynamic four-current screening
+
+The full shared-pole photon bank evaluates the dynamic interaction directly
+from the Dyson equation and retains the actual high-frequency screened
+operator. This avoids subtracting two large static operators when the
+dynamic response is small. The physical contact, ordered moments, validity
+checks and downstream self-energy equations are unchanged. A fresh response
+bank uses the stable evaluation; an existing stored bank retains its original
+samples. No input change is required. See the
+[photon bank equations](docs/architecture/bispinor_shared_pole_w.md#3-the-bank).
+
 ## Unreleased — smooth currents accept exact fractional sampling points
 
 Headless, fixed-source one-shot current fits now use the existing signed-G
