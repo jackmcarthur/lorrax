@@ -511,24 +511,39 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                   P(XY,None,None,None),P(XY,None,None,None),P()),
         out_specs=((qspec,)*3,(qspec,)*3),check_vma=False))
 
+    def coupled_field(values,c,atom,m0,modes_,radial_width,hrows_,spin_weights_,feature_offset=0):
+        # Same sparse Cartesian/VSH projection for both onsite layouts.
+        wanted=m0+jnp.arange(mt);sample=jnp.minimum(wanted,mu-1)
+        feature=feature_offset+(atom*nh+hrows_[modes_])[:,:,None]*radial_width+jnp.arange(radial_width)
+        panel=values[:,sample[:,None],feature.reshape(-1)[None]]
+        panel=panel.reshape(values.shape[0],mt,modes_.shape[0],3,radial_width)
+        panel=jnp.sum(panel*spin_weights_[c,modes_][None,None,:,:,None],axis=3)
+        qlive=live(values.shape[0])
+        panel=jnp.where(qlive[:,None,None,None]&(wanted<mu)[None,:,None,None],panel,0)
+        return panel.reshape(values.shape[0],mt,-1)
+
+    def field_panels(coefficients,moment_coefficients,hrows_,spin_weights_,df,gf,atom,modes_,m0):
+        d=[];g=[];ps=[]
+        for c in range(3):
+            delta_values=coefficients[c][0] if separate_halves else coefficients[c]
+            source=coupled_field(delta_values,c,atom,m0,modes_,nr,hrows_,spin_weights_)
+            moment=coupled_field(moment_coefficients[c],c,atom,m0,modes_,2,hrows_,spin_weights_)
+            d.append(jnp.einsum('fr,bmr->bmf',df,source))
+            g.append(jnp.einsum('fr,bmr->bmf',gf,moment))
+            if compensated:
+                smooth_values=coefficients[c][1] if separate_halves else coefficients[c]
+                smooth=coupled_field(smooth_values,c,atom,m0,modes_,nr,hrows_,spin_weights_,
+                                     0 if separate_halves else nf)
+                ps.append(jnp.einsum('fr,bmr->bmf',df,smooth))
+        return tuple(d),tuple(g),tuple(ps)
+
     onsite_kernels={}
     def make_onsite(pairs):
         pairs=tuple((int(a),int(b)) for a,b in pairs)
         if pairs in onsite_kernels:return onsite_kernels[pairs]
         def onsite_local(coefficients,moment_coefficients,hrows_,spin_weights_,buckets_):
             first_values = coefficients[0][0] if separate_halves else coefficients[0]
-            qlive=live(first_values.shape[0])
             zero=jnp.zeros((first_values.shape[0],len(pairs),mup,mup),jnp.complex128)
-            def coupled(values,c,atom,m0,modes_,radial_width,feature_offset=0):
-                # Advanced sample/feature indexing bounds the temporary to
-                # qlocal*centroid_tile*(1 or 2)*3*radial_width. No full-mu pad.
-                wanted=m0+jnp.arange(mt);sample=jnp.minimum(wanted,mu-1)
-                feature=feature_offset+(atom*nh+hrows_[modes_])[:,:,None]*radial_width+jnp.arange(radial_width)
-                panel=values[:,sample[:,None],feature.reshape(-1)[None]]
-                panel=panel.reshape(values.shape[0],mt,modes_.shape[0],3,radial_width)
-                panel=jnp.sum(panel*spin_weights_[c,modes_][None,None,:,:,None],axis=3)
-                panel=jnp.where(qlive[:,None,None,None]&(wanted<mu)[None,:,None,None],panel,0)
-                return panel.reshape(values.shape[0],mt,-1)
             result=zero
             for (width,tile,nfields,nsteps),(delta_factor,comp_factor,steps) in zip(bucket_meta,buckets_):
                 def sector_field(acc,step):
@@ -537,18 +552,8 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                     df=jax.lax.dynamic_slice_in_dim(delta_factor[sector],r0,tile,axis=0)
                     gf=jax.lax.dynamic_slice_in_dim(comp_factor[sector],r0,tile,axis=0)
                     def fields(m0):
-                        d=[];g=[];ps=[]
-                        for c in range(3):
-                            delta_values = coefficients[c][0] if separate_halves else coefficients[c]
-                            source=coupled(delta_values,c,atom,m0,modes_,nr)
-                            moment=coupled(moment_coefficients[c],c,atom,m0,modes_,2)
-                            d.append(jnp.einsum('fr,bmr->bmf',df,source))
-                            g.append(jnp.einsum('fr,bmr->bmf',gf,moment))
-                            if compensated:
-                                smooth_values = coefficients[c][1] if separate_halves else coefficients[c]
-                                smooth=coupled(smooth_values,c,atom,m0,modes_,nr,0 if separate_halves else nf)
-                                ps.append(jnp.einsum('fr,bmr->bmf',df,smooth))
-                        return tuple(d),tuple(g),tuple(ps)
+                        return field_panels(coefficients,moment_coefficients,hrows_,spin_weights_,
+                                            df,gf,atom,modes_,m0)
                     def left_block(acc,lblock):
                         m0=lblock*mt;dleft,gleft,psleft=fields(m0)
                         def right_block(acc,rblock):
@@ -573,6 +578,96 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             in_specs=(coefficient_specs,(qspec,)*3,P(),P(),tuple((P(),P(),P()) for _ in bucket_arrays)),
             out_specs=(qspec,)*len(pairs),check_vma=False))
         onsite_kernels[pairs]=kernel;return kernel
+
+    # Concatenated independent field coordinates add their bilinears exactly.
+    # Keep 32 existing bounded field blocks per packet: no full field bank and
+    # no collective for every magnetic/Cartesian/radial micro-iteration.
+    from common.collectives import transpose_xy
+    from distrib_la import gemm_plan
+    from runtime.padding import padded_axis,pad_to_axis
+    from isdf.zeta_mubatch import _to_mu_owner
+    face_spec=P(None,'x','y');face_sharding=NamedSharding(mesh,face_spec)
+    to_face=_to_mu_owner(mesh,Q,'xy')
+    field_blocks_per_packet=32
+    face_onsite_kernels={}
+    face_packet_owners=[]
+    for width,tile,nfields,nsteps in bucket_meta:
+        count=na*nsteps*nfields
+        coordinate_axis=padded_axis(field_blocks_per_packet*tile,mesh,
+            name='current onsite packet field coordinates',
+            specs=((face_spec,1),(face_spec,2)))
+        kfield=coordinate_axis.carrier
+        positive=gemm_plan(mesh,m=mu,n=mu,k=kfield,nq=Q,dtype=jnp.complex128,
+            layout='face',alpha=onsite_scale,beta=1.,warmup=False)
+        negative=gemm_plan(mesh,m=mu,n=mu,k=kfield,nq=Q,dtype=jnp.complex128,
+            layout='face',alpha=-onsite_scale,beta=1.,warmup=False)
+
+        def packet_owner(tile,nfields,nsteps,count,coordinate_axis):
+            def project(coefficients,moment_coefficients,hrows_,spin_weights_,
+                        delta_factor,comp_factor,steps,packet):
+                first_values=coefficients[0][0] if separate_halves else coefficients[0]
+                shape=(first_values.shape[0],mup,coordinate_axis.carrier)
+                fields=tuple(jnp.zeros(shape,jnp.complex128) for _ in range(9 if compensated else 6))
+                def field_block(acc,slot):
+                    wanted=packet*field_blocks_per_packet+slot
+                    step=jnp.minimum(wanted,count-1)
+                    atom=step//(nsteps*nfields);entry=(step//nfields)%nsteps;fblock=step%nfields
+                    sector=steps[entry,0];modes_=steps[entry,1:];r0=fblock*tile
+                    df=jax.lax.dynamic_slice_in_dim(delta_factor[sector],r0,tile,axis=0)
+                    gf=jax.lax.dynamic_slice_in_dim(comp_factor[sector],r0,tile,axis=0)
+                    def centroid_block(current,block):
+                        m0=block*mt
+                        d,g,ps=field_panels(coefficients,moment_coefficients,hrows_,spin_weights_,
+                                            df,gf,atom,modes_,m0)
+                        values=d+g+ps
+                        values=tuple(jnp.where(wanted<count,v,0.) for v in values)
+                        return tuple(jax.lax.dynamic_update_slice(a,v,(0,m0,slot*tile))
+                                     for a,v in zip(current,values)),None
+                    return jax.lax.scan(centroid_block,acc,jnp.arange(nmu),unroll=1)[0],None
+                fields=jax.lax.scan(field_block,fields,
+                    jnp.arange(field_blocks_per_packet),unroll=1)[0]
+                return tuple(pad_to_axis(value[:,:mu],coordinate_axis,axis=2) for value in fields)
+            return jax.jit(shard_map(project,mesh=mesh,
+                in_specs=(coefficient_specs,(qspec,)*3,P(),P(),P(),P(),P(),P()),
+                out_specs=(qspec,)*(9 if compensated else 6),check_vma=False))
+
+        face_packet_owners.append((packet_owner(tile,nfields,nsteps,count,coordinate_axis),
+            positive,negative,(count+field_blocks_per_packet-1)//field_blocks_per_packet,
+            coordinate_axis))
+
+    def make_onsite_face(pairs):
+        pairs=tuple((int(a),int(b)) for a,b in pairs)
+        if pairs in face_onsite_kernels:return face_onsite_kernels[pairs]
+        def contract(coefficients,moment_coefficients,hrows_,spin_weights_,buckets_):
+            result=tuple(jax.lax.with_sharding_constraint(
+                jnp.zeros((Q,mu,mu),jnp.complex128),face_sharding) for _ in pairs)
+            for (project,positive,negative,npackets,_),bucket in zip(face_packet_owners,buckets_):
+                def packet(acc,index):
+                    panels=project(coefficients,moment_coefficients,hrows_,spin_weights_,*bucket,index)
+                    panels=tuple(to_face(value) for value in panels)
+                    d,g=panels[:3],panels[3:6]
+                    ps=panels[6:]
+                    dt=tuple(transpose_xy(value,mesh) for value in d)
+                    gt=tuple(transpose_xy(value,mesh) for value in g)
+                    pt=tuple(transpose_xy(value,mesh) for value in ps)
+                    values=[]
+                    for previous,(a,b) in zip(acc,pairs):
+                        value=positive(d[a].conj(),dt[b],previous)
+                        value=negative(g[a].conj(),gt[b],value)
+                        if compensated:
+                            value=positive(ps[a].conj(),dt[b]-gt[b],value)
+                            value=positive((d[a]-g[a]).conj(),pt[b],value)
+                        values.append(value)
+                    return tuple(values),None
+                result=jax.lax.scan(packet,result,jnp.arange(npackets),unroll=1)[0]
+            return result
+        kernel=jax.jit(contract,
+            in_shardings=(tuple((qsh,qsh) if separate_halves else qsh for _ in range(3)),(qsh,)*3,
+                          NamedSharding(mesh,P()),NamedSharding(mesh,P()),
+                          tuple((NamedSharding(mesh,P()),)*3 for _ in bucket_arrays)),
+            out_shardings=(face_sharding,)*len(pairs))
+        face_onsite_kernels[pairs]=kernel
+        return kernel
 
     tail_observer = None
     if physical_mixed:
@@ -685,6 +780,10 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         return make_onsite(pairs)(state['coefficients'],state['moments'],
                                   sparse_rows,sparse_weights,bucket_arrays)
 
+    def onsite_face(state,pairs):
+        return make_onsite_face(pairs)(state['coefficients'],state['moments'],
+                                     sparse_rows,sparse_weights,bucket_arrays)
+
     def authenticate_kernel(pairs,v_tables):
         if (bundle.get('kernel')!=(SLAB_STATIC_KERNEL if slab else STATIC_KERNEL)
                 or bundle.get('body_metric')!=body_metric
@@ -762,6 +861,15 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         field_tile=ft,centroid_tile=mt,geometry=geometry,compensation=compensation,
         prepare_kernel=prepare_kernel,fourier_kernel=fourier_kernel,
         onsite_kernel=make_onsite,
+        onsite_face=onsite_face,onsite_face_kernel=make_onsite_face,
+        onsite_face_packet_diagnostics=dict(
+            field_blocks_per_packet=field_blocks_per_packet,
+            packet_field_carriers=[axis.carrier for *_,axis in face_packet_owners],
+            packets=sum(owner[3] for owner in face_packet_owners),
+            q_count=Q,output_layout='P(None,x,y)',
+            field_projection='same exact sparse Cartesian/VSH and radial delta/compensation factors',
+            contract='D_a.conj() @ transpose_xy(D_b) - G_a.conj() @ transpose_xy(G_b)',
+            coordinate_padding='runtime PaddedAxis; only zero added field coordinates'),
         onsite_kernel_arguments=(sparse_rows,sparse_weights,bucket_arrays),
         onsite_block_diagnostics={key:blocks[key] for key in ('angular_forbidden_error',
             'angular_M_covariance_error','retained_columns','retained_compensation_columns',

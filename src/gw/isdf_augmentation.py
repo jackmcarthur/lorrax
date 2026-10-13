@@ -2690,7 +2690,9 @@ def _price_current_contraction_aot(channels, state, kg, controls):
         shape((Qp,na,nh,gt),jnp.complex128,P(('x','y'),None,None,None)),
         shape((Qp,degree,2,gt),jnp.float64,P(('x','y'),None,None,None)),
         shape((nh,),jnp.int32,P())))
-    quote('onsite',group['onsite_kernel'](pairs),(clouds,moments,*group['onsite_kernel_arguments']))
+    onsite_owner=('onsite_face' if st.Q<mesh.size else 'onsite')
+    quote(onsite_owner,group[onsite_owner+'_kernel'](pairs),
+          (clouds,moments,*group['onsite_kernel_arguments']))
     from isdf.current_tail import laplacian3_positive_map,make_sobolev_norm_kernel
     tail_map = laplacian3_positive_map(group['compensation'])
     tail_kernel,L,A = make_sobolev_norm_kernel(mesh,mu=mu,atoms=na,lm=state['lm'],
@@ -2717,7 +2719,7 @@ def _price_current_contraction_aot(channels, state, kg, controls):
     peaks = {}
     for q in quotes:
         covered = (3*bank if q['owner']=='moments' else 3*bank+moment
-                   if q['owner'] in ('Fourier','onsite') else moment
+                   if q['owner'] in ('Fourier','onsite','onsite_face') else moment
                    if q['owner']=='compensation_tail_observer' else 6*matrix)
         peaks[q['owner']] = resident+max(0,q['total_addressed_bytes']-covered)
     budget = float(device_budget_bytes())
