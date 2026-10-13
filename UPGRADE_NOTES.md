@@ -1,5 +1,13 @@
 # Upgrade notes
 
+## Unreleased — reuse admitted Coulomb roots in shared-pole construction
+
+The face constructor uses the response owner's memory-budgeted dense policy
+for Coulomb square roots, allowing reuse of the already authenticated bank
+roots. Whole-parent solves still fall back to the distributed mesh when they
+do not fit. This removes an unnecessary second distributed eigensolve; the
+Coulomb matrix, spectral support criterion, and GW equations are unchanged.
+
 ## Unreleased — reuse authenticated exact-point charge fits
 
 Smooth fractional-centroid Coulomb runs can restart in the same head-off,

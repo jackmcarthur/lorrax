@@ -185,10 +185,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                                      ledger=ledger, upstream=upstream,
                                      execution=execution)
         budget.ritz_budget = recipe.get("pole_budget") if ordered and execution == 'local' else None
-        # A face constructor keeps the Coulomb eigensolve on the same complete
-        # mesh even when the deck's default dense policy is local.
-        coulomb_config = ({'linalg': 'distributed'}
-                          if execution == 'face' else config)
+        # The response owner admits each Coulomb solve against the live ledger
+        # and falls back to the full mesh when whole parents do not fit. Keep
+        # that policy here so already authenticated bank roots can be reused;
+        # the constructor's larger pencil need not dictate this smaller solve.
+        coulomb_config = config
         conservative_side = constructor_side_upper_bound(
             recipe, ordered=ordered, odd_moments=odd_moments,
             logical_n=logical_n, column_extent=column_extent)
