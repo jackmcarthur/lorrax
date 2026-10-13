@@ -134,6 +134,8 @@ def require_resident_hartree_source(provenance, *, wfn, sym, plan, artifact,
 
     record = normalize_resident_hartree_provenance(
         provenance, persisted='payload_sha256' in provenance)
+    if wfn is None or sym is None or plan is None or not isinstance(artifact, dict):
+        raise ValueError('GATE resident_hartree_source: physical source context is missing')
     paired = record['schema'] == 'lorrax.resident_direct_hartree.v2'
     source = record['source_binding']
     from isdf.atomic_hartree import charge_hartree_operator_contract
