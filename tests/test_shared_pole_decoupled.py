@@ -1,6 +1,7 @@
-"""The staged face route and its face products against the local round (CPU 2x2 mesh).
+"""The staged face route and its face products against the local round (2x2 mesh).
 
 Run with ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4``.
+The staged/local regression also supports the canonical four-rank GPU runtime.
 A synthetic ordered pencil: four parents, each a full-rank positive real-pole model
 W(z) = C diag(1/(z mu - 1)) C^H (k = n poles, so the half-pencil Gram is nonsingular)
 with its exact moments M_k = sum_j c_j c_j^H mu_j^-(k+1), sampled at two imaginary
@@ -81,6 +82,7 @@ def test_decoupled_face_matches_local(budget):
     """The decoupled face route (stage programs over sub-batches, eighs over every parent)
     against the local round on the synthetic pencil; the face products are panel_matmul."""
     mesh = _mesh()
+    from common.collectives import gather_to_host
     from gw.shared_pole_directions import port_extent
     from gw.shared_pole_execution import face_reduce_decoupled, face_ritz_carrier
     from gw.shared_pole_local import BATCH, reduce_round
@@ -119,7 +121,7 @@ def test_decoupled_face_matches_local(budget):
                                     ordered=True, odd_moments=True, keep_budget=budget, retain_span=True,
                                     gram_keep=gram_keep, carrier=carrier, eigh_rows=check_eigh_shape)
         assert all(len(s) == 3 for s in held)          # the dW Q panels were released
-        ld, dd = (jax.tree.map(np.asarray, r[3][0]) for r in (local, dec))
+        ld, dd = (jax.tree.map(gather_to_host, r[3][0]) for r in (local, dec))
         assert np.all(dd["paired_metric_inverse_root_residual_relative"] < 1e-12), sub
         assert np.array_equal(ld["paired_metric_inverse_root_iterations"],
                               dd["paired_metric_inverse_root_iterations"]), sub
@@ -127,8 +129,8 @@ def test_decoupled_face_matches_local(budget):
             assert np.allclose(ld[key], dd[key], rtol=1e-8, atol=1e-12), (sub, key)
         for key in ("retained_rank", "paired_rank", "positive_count", "gram_valid", "orientation_paired"):
             assert np.array_equal(ld[key], dd[key]), (sub, key)
-        lb, lp, la = (np.asarray(a) for a in local[0])
-        db, dp, da = (np.asarray(a) for a in dec[0])
+        lb, lp, la = (gather_to_host(a) for a in local[0])
+        db, dp, da = (gather_to_host(a) for a in dec[0])
         assert dec[0][0].sharding.spec == P(None, "x", "y")
         assert np.array_equal(la, da)
         assert np.allclose(np.where(la, lp, 0), np.where(da, dp, 0), rtol=1e-8, atol=1e-10), sub
@@ -140,8 +142,9 @@ def test_decoupled_face_matches_local(budget):
         f = int(tables["order"].shape[-1])
         standard = join_vectors(split_vectors(np.arange(side)[None], (f // 2, f // 2, (side - f) // 2, (side - f) // 2), 1),
                                 int(mesh.shape["y"]))[0]
-        ly, dy = np.asarray(local[4]), np.zeros_like(np.asarray(dec[4]))
-        dy[:, standard] = np.asarray(dec[4])
+        ly, face_span = gather_to_host(local[4]), gather_to_host(dec[4])
+        dy = np.zeros_like(face_span)
+        dy[:, standard] = face_span
         for p in range(q):
             assert np.allclose(ly[p] @ np.conj(ly[p].T), dy[p] @ np.conj(dy[p].T), rtol=1e-7, atol=1e-9), (sub, p)
 
