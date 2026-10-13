@@ -995,6 +995,8 @@ class ZetaG:
         st = self.store
         augmentation = (self.local_augmentation if local_augmentation is None
                         else local_augmentation)
+        local_stage_seconds = {}
+        held_onsite = held_moments = None
         compensated_body = False
         positive_body = False
         if augmentation is not None:
@@ -1015,6 +1017,7 @@ class ZetaG:
                 raise ValueError("ZetaG.contract_v: local RHS must be "
                                  "(Q_pad,mu_pad,n_local), n_local>=1")
             _require_q_owned(rhs, self.mesh, rhs.shape, name='local RHS')
+            solve_started = time.perf_counter()
             local_coefficients = _local_coefficient_solve(
                 self.mesh, self.solver_kind, self.n_rmu_solve,
                 st.Q)(self.factor, rhs)
@@ -1059,6 +1062,29 @@ class ZetaG:
         fourier_coefficients = None
         prepare_fourier = None if augmentation is None else augmentation.get('prepare_fourier_coefficients')
         if callable(prepare_fourier) and st.Q < self.mesh.size and mu % self.mesh.size == 0:
+            local_coefficients.block_until_ready()
+            local_stage_seconds['coefficient_solve_and_setup'] = time.perf_counter()-solve_started
+            if with_v:
+                _admit_charge_local_completion(self.mesh, st, augmentation, local_coefficients)
+                completion_started = time.perf_counter()
+                correction = augmentation['onsite'](local_coefficients)
+                _require_q_owned(correction, self.mesh,
+                                 (st.Q_pad, mu, mu), name='onsite correction')
+                # Retain only the distributed result, not a whole-q correction
+                # beside the later Fourier bank. The original final addition
+                # order remains body, onsite, then periodic completion.
+                held_onsite = _finish_v(self.mesh, st.Q)(correction)
+                held_onsite.block_until_ready()
+                del correction
+                if positive_body:
+                    moments = augmentation['periodic_moment_rows'](local_coefficients)
+                    moment_axis = augmentation['periodic_cache']['moment_axis']
+                    _require_q_owned(moments, self.mesh,
+                        (st.Q_pad, mu, moment_axis.carrier), name='periodic moment rows')
+                    held_moments = _to_mu_owner(self.mesh, st.Q, 'xy')(moments)
+                    held_moments.block_until_ready()
+                    del moments
+                local_stage_seconds['onsite_and_moments'] = time.perf_counter()-completion_started
             # The extra Fourier layout is admitted beside this actual V live
             # set, before its coefficient bank or geometry packets exist.
             # Current/grouped providers keep their existing prepare owner.
@@ -1084,10 +1110,13 @@ class ZetaG:
                     caller_workspace += compiled_new_bytes(unpack.lower(mu_tile).compile())
             jax.block_until_ready((local_coefficients, V, M, shell, v_dev, ngk_dev, sl_dev))
             fourier_coefficients = prepare_fourier(local_coefficients,
-                caller_workspace_bytes=float(caller_workspace))
+                caller_workspace_bytes=float(caller_workspace), consume_q_coefficients=True)
+            if local_coefficients.is_deleted():
+                del local_coefficients
             if jax.process_index() == 0:
                 print_fn('  charge Fourier distribution: '+str(augmentation['fourier_distribution_receipt']))
         nxt = st.read_tile(0)
+        loop_started = time.perf_counter()
         for t in range(st.n_Gt):
             # Tile t+1 is read while tile t is contracted.
             Zt = nxt
@@ -1114,7 +1143,7 @@ class ZetaG:
                     zeta_io.sync_writes()
             del Zt, zt
         del fourier_coefficients
-        if augmentation is not None and with_v:
+        if augmentation is not None and with_v and held_onsite is None:
             correction = augmentation['onsite'](local_coefficients)
             _require_q_owned(correction, self.mesh,
                              (st.Q_pad, mu, mu), name='onsite correction')
@@ -1123,17 +1152,32 @@ class ZetaG:
             M = None
         if not with_v:
             V = None
+            self.local_stage_seconds = local_stage_seconds
             self.receipt = (f"  μ-batch ζ pass: {st.n_Gt} G tiles, q-local, "
                             f"{time.perf_counter() - t0:.2f}s (store read "
                             f"{st.t_read:.2f}s); zeta file written")
             return None
         V = _finish_v(self.mesh, st.Q)(V)
+        if held_onsite is not None:
+            face = NamedSharding(self.mesh, P(None, 'x', 'y'))
+            V = jax.jit(lambda value, correction: value+correction,
+                in_shardings=(face, face), out_shardings=face,
+                donate_argnums=(0,))(V, held_onsite)
+            del held_onsite
+        if local_stage_seconds:
+            # One boundary fence, never a fence for each G tile. This records
+            # the complete FT/solve/body/writer loop separately from onsite.
+            jax.block_until_ready((V, shell))
+            local_stage_seconds['G_loop_and_body_finish'] = time.perf_counter()-loop_started
         if positive_body:
-            moments = augmentation['periodic_moment_rows'](local_coefficients)
-            moment_axis = augmentation['periodic_cache']['moment_axis']
-            _require_q_owned(moments, self.mesh,
-                (st.Q_pad, mu, moment_axis.carrier), name='periodic moment rows')
-            moments = _to_mu_owner(self.mesh, st.Q, 'xy')(moments)
+            if held_moments is None:
+                moments = augmentation['periodic_moment_rows'](local_coefficients)
+                moment_axis = augmentation['periodic_cache']['moment_axis']
+                _require_q_owned(moments, self.mesh,
+                    (st.Q_pad, mu, moment_axis.carrier), name='periodic moment rows')
+                moments = _to_mu_owner(self.mesh, st.Q, 'xy')(moments)
+            else:
+                moments, held_moments = held_moments, None
             periodic = augmentation['periodic_action'](
                 moments, augmentation['periodic_cache']['gram'])
             V = V+periodic
@@ -1143,6 +1187,9 @@ class ZetaG:
             V = self.mu_basis.unpack_operator(V)
             shell = self.mu_basis.unpack_axis(shell, 1)
         self.shell, self.shell_slots = shell, keep
+        self.local_stage_seconds = local_stage_seconds
+        if local_stage_seconds and jax.process_index() == 0:
+            print_fn('  charge local stages (seconds): '+str(local_stage_seconds))
         if M is not None:
             V_cmc = _v_from_m(self.mesh, self.solver_kind,
                               self.n_rmu_solve)(L_arg, M)
@@ -1281,6 +1328,57 @@ def _add_q_owned(mesh):
     fn = jax.jit(add, donate_argnums=(0,))
     _kernel_cache[key] = fn
     return fn
+
+
+def _admit_charge_local_completion(mesh, store, provider, coefficients):
+    """Price the existing sequential onsite/moment owners before dispatch.
+
+    The actual live baseline contains raw RHS, solved q coefficients, factor
+    and V. Only each stage's new workspace/output and already completed
+    temporary result are added. Retained outputs use the distributed face.
+    """
+    from common.collectives import all_gather_processes
+    from common.gpu_utils import device_budget_bytes, record_stage_price
+    from runtime.aot_memory import aot_kernel_peak_bytes
+
+    mu, qp, q = int(store.mu_pad), int(store.Q_pad), int(store.Q)
+    sharding = NamedSharding(mesh, P(_XY, None, None))
+    matrix = jax.ShapeDtypeStruct((qp, mu, mu), jnp.complex128, sharding=sharding)
+    q_matrix_bytes, face_matrix_bytes = (16*qp*mu*mu/mesh.size, 16*q*mu*mu/mesh.size)
+    metadata = provider['aot_metadata']
+    free = metadata['free_onsite']
+    stages = [('free_onsite', free['kernel'],
+               (coefficients, *free['table_operands']), 0.)]
+    if 'mean_completion' in metadata:
+        mean = metadata['mean_completion']
+        stages.append(('mean_completion', mean['kernel'],
+                       (matrix, coefficients, *mean['table_operands']), q_matrix_bytes))
+    stages.append(('onsite_to_face', _finish_v(mesh, q), (matrix,), q_matrix_bytes))
+    if 'periodic_moments' in metadata:
+        moments = metadata['periodic_moments']
+        width = int(provider['periodic_cache']['moment_axis'].carrier)
+        rows = jax.ShapeDtypeStruct((qp, mu, width), jnp.complex128, sharding=sharding)
+        stages.append(('periodic_moments', moments['kernel'],
+                       (coefficients, *moments['table_operands']), face_matrix_bytes))
+        stages.append(('moments_to_face', _to_mu_owner(mesh, q, 'xy'), (rows,),
+                       face_matrix_bytes+16*qp*mu*width/mesh.size))
+    quotes = []
+    for name, kernel, args, held in stages:
+        peak = aot_kernel_peak_bytes(kernel.lower(*args).compile())
+        quotes.append(dict(owner=name, resident_increment=peak.resident_increment,
+                           held_result_bytes=held, future_bytes=held+peak.resident_increment))
+    stats = [device.memory_stats() or {} for device in mesh.local_devices]
+    measured = all('bytes_in_use' in value for value in stats)
+    live = max((value.get('bytes_in_use', 0) for value in stats), default=0)
+    planned = live+max(value['future_bytes'] for value in quotes)
+    admission = np.asarray(all_gather_processes(np.asarray(
+        [int(measured), live, planned, device_budget_bytes()], np.float64)))
+    provider['local_completion_capacity_receipt'] = dict(actual_AOT=quotes,
+        actual_live_baseline=float(np.max(admission[:, 1])),
+        planned_bytes_per_rank=float(np.max(admission[:, 2])), raw_rhs_retained=True)
+    if not np.all(admission[:, 0] == 1) or np.any(admission[:, 2] > admission[:, 3]):
+        raise MemoryError('charge early local completion exceeds its actual device budget')
+    record_stage_price('isdf.charge_local_completion', float(np.max(admission[:, 2])))
 
 
 def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,

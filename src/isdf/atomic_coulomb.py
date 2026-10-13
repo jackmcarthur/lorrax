@@ -489,13 +489,17 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
         out_specs=(mu_spec, mu_spec), check_vma=False))
     distribution_receipt = dict(mode='q', reason='direct q-owned Fourier input')
 
-    def prepare_fourier_coefficients(coefficients, *, caller_workspace_bytes=0.):
+    def prepare_fourier_coefficients(coefficients, *, caller_workspace_bytes=0.,
+                                     consume_q_coefficients=False):
         """Balance small-q Fourier work once, retaining the canonical q solve.
 
-        The q bank still serves the unchanged onsite/moment owners. Only the
-        independent mu rows of the Fourier transform move. Capacity is agreed
-        before the extra bank or a replicated geometry packet is allocated;
-        a declined layout keeps the incumbent q-owned arithmetic.
+        Only the independent mu rows of the Fourier transform move. With
+        ``consume_q_coefficients=True``, the caller has already fenced and
+        retained every onsite/moment result. The solved q bank is deleted only
+        after the transpose completes; the raw provider RHS remains live.
+        Transpose and Fourier workspaces have disjoint lifetimes. Capacity is
+        agreed before allocation, then checked against the actual post-release
+        baseline. A declined layout preserves the input and q arithmetic.
         """
         from common.collectives import all_gather_processes
         from common.gpu_utils import device_budget_bytes, host_bytes_per_process, record_stage_price
@@ -503,6 +507,8 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
         from isdf.zeta_mubatch import _require_q_owned, _to_mu_owner, _rows_to_q_local
 
         _require_q_owned(coefficients, mesh, provider_rhs.shape, name='Fourier coefficient source')
+        if consume_q_coefficients and coefficients is provider_rhs:
+            raise ValueError('consuming Fourier transport requires a solved bank distinct from the raw RHS')
         if not np.isfinite(caller_workspace_bytes) or caller_workspace_bytes < 0:
             raise ValueError('Fourier caller workspace must be finite and nonnegative')
         if st.Q >= mesh.size or mu % mesh.size:
@@ -529,11 +535,14 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
                 resident_increment=peak.resident_increment,
                 collective_counts={name:hlo.count(name+'(') for name in
                                    ('all-gather', 'all-to-all', 'all-reduce')}))
-        # Coefficients remain live for onsite. The standalone FT price also
-        # counts its explicit geometry and mu input: conservative double
-        # counting here avoids an unpriced table/communication lifetime.
-        future = (quotes[0]['resident_increment'] + quotes[1]['total']
-                  + 2*quotes[2]['resident_increment'] + caller_workspace_bytes)
+        q_bank_bytes = coefficients.size*coefficients.dtype.itemsize/mesh.size
+        mu_bank_bytes = st.Q*mu*coefficients.shape[-1]*coefficients.dtype.itemsize/mesh.size
+        # The transpose is fenced before Fourier. Its temporary workspace is
+        # never added to a later Fourier peak. The Fourier total includes its
+        # explicit mu input and geometry; the measured baseline below includes
+        # the raw RHS and, until a successful consuming transpose, the q bank.
+        fourier_future = (quotes[1]['total'] + 2*quotes[2]['resident_increment']
+                          + caller_workspace_bytes)
         bessel_bytes = st.Q*len(degrees)*gt*nr*8
         angular_bytes = st.Q*na*nh*gt*16
         # Spline evaluation selects four coefficients beside its result;
@@ -542,24 +551,50 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
         stats = [device.memory_stats() or {} for device in mesh.local_devices]
         measured = all('bytes_in_use' in value for value in stats)
         live = max((value.get('bytes_in_use', 0) for value in stats), default=0)
+        conversion_peak = live+quotes[0]['resident_increment']
+        fourier_peak = live+fourier_future-(q_bank_bytes if consume_q_coefficients else 0.)
+        planned_peak = max(conversion_peak, fourier_peak)
         admission = np.asarray(all_gather_processes(np.asarray(
-            [int(measured), live+future, device_budget_bytes(),
+            [int(measured), planned_peak, device_budget_bytes(),
              host_future, host_bytes_per_process(fraction=.7)], np.float64)))
         accepted = (np.all(admission[:, 0] == 1)
                     and np.all(admission[:, 1] <= admission[:, 2])
                     and np.all(admission[:, 3] <= admission[:, 4]))
         distribution_receipt.update(mode='mu' if accepted else 'q',
             reason='small q domain' if accepted else 'extra layout capacity not admitted',
-            actual_live_baseline=live, future_device_bytes=future,
+            actual_live_baseline=live, future_device_bytes=planned_peak-live,
             planned_bytes_per_rank=float(np.max(admission[:, 1])),
             future_host_bytes=host_future, actual_AOT=quotes,
             measured_live_baseline=measured, logical_q=int(st.Q), packed_mu=mu,
+            phase_peaks=dict(q_to_mu=conversion_peak, Fourier_after_q_release=fourier_peak),
+            consume_q_coefficients=bool(consume_q_coefficients),
+            solved_q_bank_bytes_per_rank=q_bank_bytes, mu_bank_bytes_per_rank=mu_bank_bytes,
+            raw_rhs_retained=True, solved_q_bank_released=False,
             scope='Fourier layout only; same factor, radial fields and Coulomb operator')
         if not accepted:
             return coefficients
         record_stage_price('isdf.charge_mu_Fourier', float(np.max(admission[:, 1])))
         prepared = to_mu(coefficients)
         prepared.block_until_ready()
+        if consume_q_coefficients:
+            # This array is the solve result, not provider_rhs. No numerical
+            # owner retains it; all uses preceding the transpose are fenced.
+            coefficients.delete()
+            stats = [device.memory_stats() or {} for device in mesh.local_devices]
+            measured = all('bytes_in_use' in value for value in stats)
+            remaining = max((value.get('bytes_in_use', 0) for value in stats), default=0)
+            # The mu bank is now resident, so remove its argument bytes from
+            # the full Fourier quote exactly once. Geometry, returns, writer
+            # and next-Z work remain charged in their original owners.
+            post_release_peak = remaining+fourier_future-mu_bank_bytes
+            post = np.asarray(all_gather_processes(np.asarray(
+                [int(measured), remaining, post_release_peak, device_budget_bytes()], np.float64)))
+            distribution_receipt.update(solved_q_bank_released=True,
+                post_release_live_baseline=float(np.max(post[:, 1])),
+                post_release_Fourier_peak=float(np.max(post[:, 2])))
+            if (not np.all(post[:, 0] == 1) or np.any(post[:, 2] > post[:, 3])):
+                raise MemoryError('charge mu Fourier actual post-release phase exceeds the device budget')
+            record_stage_price('isdf.charge_mu_Fourier_after_release', float(np.max(post[:, 2])))
         return prepared
 
     def onsite_local(coefficients, metric, steps_, degree_rows):
