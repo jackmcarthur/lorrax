@@ -2691,6 +2691,12 @@ def _price_current_contraction_aot(channels, state, kg, controls):
         shape((Qp,degree,2,gt),jnp.float64,P(('x','y'),None,None,None)),
         shape((nh,),jnp.int32,P())))
     quote('onsite',group['onsite_kernel'](pairs),(clouds,moments,*group['onsite_kernel_arguments']))
+    from isdf.current_tail import laplacian3_positive_map,make_sobolev_norm_kernel
+    tail_map = laplacian3_positive_map(group['compensation'])
+    tail_kernel,L,A = make_sobolev_norm_kernel(mesh,mu=mu,atoms=na,lm=state['lm'],
+        positive_map=tail_map,fft_points=state['fft_points'],volume=state['cell_volume'])
+    quote('compensation_tail_observer',tail_kernel,(moments,
+        shape(L.shape,jnp.float64,P()),shape(A.shape,jnp.float64,P())))
     tiles = tuple(shape((Qp,mu,gt)) for _ in range(3))
     Vs = tuple(shape((Qp,mu,mu)) for _ in pairs)
     shell = tuple(shape((Qp,mu,1)) for _ in range(3))
@@ -2711,7 +2717,8 @@ def _price_current_contraction_aot(channels, state, kg, controls):
     peaks = {}
     for q in quotes:
         covered = (3*bank if q['owner']=='moments' else 3*bank+moment
-                   if q['owner'] in ('Fourier','onsite') else 6*matrix)
+                   if q['owner'] in ('Fourier','onsite') else moment
+                   if q['owner']=='compensation_tail_observer' else 6*matrix)
         peaks[q['owner']] = resident+max(0,q['total_addressed_bytes']-covered)
     budget = float(device_budget_bytes())
     result = dict(scope='Actual local and physical-writer AOT plus live leaves; before final coefficient allocation',
@@ -2750,9 +2757,50 @@ def _physical_current_operator_contract(channels, state, body_contract, witness)
         current_angular_support_contract=state['angular_support_contract'],
         current_angular_support_identity=state['angular_support_identity'],
         current_factor_convention='three exact canonical OWN signed LU factors; unit endpoint loss',
+        factor_fit_band_ranges=dict(left=list(state['band_range_left']),right=list(state['band_range_right'])),
+        OWN_factor_metadata=[dict(current_channel=c,solver_kind=z.solver_kind,
+            n_rmu_solve=int(z.n_rmu_solve),factor_leaves=[dict(shape=list(v.shape),dtype=str(v.dtype))
+                for v in (z.factor if isinstance(z.factor,tuple) else (z.factor,))])
+                for c,z in enumerate(channels,1)],
         physical_support=witness.descriptor,
         operator='mixed_reciprocal_point_Slab_plus_bulk_local_infinite_remainder',
         compensation_tail_qualification='Global compensation high-G tail requires an occupied-block stopping bound; no continuum or Sigma convergence claim')
+
+
+def publish_current_tail_diagnostics(state, channels):
+    """Publish the actual small moment-bound observer before current closes."""
+    import hashlib,json
+    from pathlib import Path
+    from common.collectives import gather_to_host,rank0_transaction
+    sink = state.get('current_compensation_tail_diagnostics')
+    if sink is None:
+        return None
+    values = sink.pop('weighted_fourier_K12_norm_upper',None)
+    if not isinstance(values,tuple) or len(values)!=3:
+        raise ValueError('physical current tail observer did not consume its actual solved moments')
+    nq = len(state['q_full_indices'])
+    norms = np.stack([gather_to_host(v)[:nq] for v in values])
+    if not np.isfinite(norms).all() or np.any(norms<0):
+        raise ValueError('actual compensation Sobolev bounds must be finite nonnegative')
+    basis=state['meta'].mu_basis
+    arrays=dict(weighted_fourier_K12_norm_upper=norms,
+        active_packed_mu=np.asarray(basis.layout.axis.active_mask,bool),
+        canonical_to_packed=np.asarray(basis.layout.axis.canonical_to_packed,int),
+        q_full_indices=np.asarray(state['q_full_indices'],np.int32),
+        q_fractional=np.asarray(state['physical_current_operator_contract']['current_geometry_binding']['q_fractional']))
+    output=Path(channels[0].path).parent/'current_compensation_tail_bounds.npz'
+    def write():
+        with output.open('xb') as handle:
+            np.savez(handle,**arrays)
+        metadata=dict(sink,array_file=str(output),array_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
+            actual_current_factor_metadata=state['physical_current_operator_contract']['OWN_factor_metadata'],
+            fit_band_ranges=state['physical_current_operator_contract']['factor_fit_band_ranges'],
+            shape=list(norms.shape),maximum_weighted_fourier_K12_norm_upper=float(norms.max()),
+            occupied_Sigma_X_bound_status='NOT_EVALUATED; actual endpoint covectors and occupations required')
+        output.with_suffix('.json').write_text(json.dumps(metadata,sort_keys=True,indent=2)+'\n')
+    rank0_transaction(output,stage='current_compensation_tail_bounds',write=write)
+    sink['array_file']=str(output)
+    return str(output)
 
 
 def attach_current_augmentation(zetas, state, *, body_contract):
@@ -2835,6 +2883,17 @@ def attach_current_augmentation(zetas, state, *, body_contract):
     if physical:
         contract = _physical_current_operator_contract(channels,state,body_contract,witness)
         state['physical_current_operator_contract'] = contract
+        import hashlib,json
+        current_identity = hashlib.sha256(json.dumps(contract,sort_keys=True,
+            separators=(',',':'),allow_nan=False).encode()).hexdigest()
+        state['current_compensation_tail_diagnostics'] = dict(
+            schema='lorrax.current.fitted_compensation_sobolev_tail.v1',
+            physical_current_operator_identity=current_identity,
+            endpoint_source_binding=contract['endpoint_source_binding'],
+            current_geometry_binding=contract['current_geometry_binding'],
+            norm_units='sum_K |K|^12 |g_FT|^2; FT owner N/Omega times face integral',
+            current_channel_order=[1,2,3],no_raw_moments_retained=True)
+        providers[0]['group_provider']['compensation_tail_diagnostics'] = state['current_compensation_tail_diagnostics']
         for provider in providers:
             provider['physical_current_operator_contract'] = contract
     # Concatenation must finish before the six raw operands are released.

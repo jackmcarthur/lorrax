@@ -574,6 +574,14 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             out_specs=(qspec,)*len(pairs),check_vma=False))
         onsite_kernels[pairs]=kernel;return kernel
 
+    tail_observer = None
+    if physical_mixed:
+        from isdf.current_tail import laplacian3_positive_map,make_sobolev_norm_kernel
+        tail_map = laplacian3_positive_map(compensation)
+        tail_kernel,tail_positive,tail_absolute = make_sobolev_norm_kernel(mesh,mu=mu,atoms=na,
+            lm=labels,positive_map=tail_map,fft_points=N,volume=volume)
+        tail_observer = (tail_kernel,put(tail_positive),put(tail_absolute))
+
     def prepare(coefficients):
         if owned_banks:
             if coefficients is not None:
@@ -586,7 +594,20 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                 _require_q_owned(half,mesh,(Qp,mu,nf if separate_halves else (2 if compensated else 1)*nf),
                                  name='static current coefficients')
         coefficients=tuple(coefficients)
-        return dict(coefficients=coefficients,moments=prepare_kernel(coefficients,M))
+        moments = prepare_kernel(coefficients,M)
+        if tail_observer is not None:
+            kernel,L,A = tail_observer
+            norms = kernel(moments,L,A)
+            sink = bundle.get('compensation_tail_diagnostics')
+            if not isinstance(sink,dict):
+                raise ValueError('physical current tail observer requires its actual diagnostic sink')
+            sink['weighted_fourier_K12_norm_upper'] = norms
+            sink['body_cutoff_Ry'] = float(body_head_slots['cutoff_ry'])
+            sink['norm_tail_divisor'] = float(body_head_slots['cutoff_ry'])**6
+            sink['bare_Sigma_energy_prefactor'] = 2*abs(k0)/float(body_head_slots['cutoff_ry'])**7
+            sink['rounding_relative_envelope'] = tail_map['rounding_relative_envelope']
+            sink['qualification'] = 'Actual fitted analytic compensation moments; occupied-current Sigma covectors/weights still required; no screened response bound'
+        return dict(coefficients=coefficients,moments=moments)
 
     def put_q_rows(builder,tail):
         # Build only this process's addressed q rows, never a Q*G*radial

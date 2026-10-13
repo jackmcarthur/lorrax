@@ -2413,6 +2413,9 @@ def _fit_transverse_zeta_channels(
                     [zetas[mu] for mu in (1, 2, 3)], cfg=cfg, meta_T=_meta_T,
                     wfn=wfn, sym=sym, centroid_T_idx=_cent_T_idx, mesh_xy=mesh_xy,
                     print_fn=print_fn, zeta_ios=writers)
+                if current_augmentation is not None:
+                    from .isdf_augmentation import publish_current_tail_diagnostics
+                    publish_current_tail_diagnostics(current_augmentation,[zetas[c] for c in (1,2,3)])
     finally:
         for zeta_g in zetas.values():
             zeta_g.close()
