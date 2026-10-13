@@ -177,8 +177,9 @@ def _local_eigenplan(mesh_xy, side):
 def staged_sector_bytes(*, parents, ranks, side, carrier, packed):
     """Per-rank bytes of one sector's staged reduction of ``parents`` parents (complex128).
 
-    ``side`` is the pencil side R (H'_vv is R/2), ``carrier`` the kept-span columns c (None,
-    the relaxed tier: R/2), ``packed`` the rows n. The selected panels are the caller's arrays
+    ``side`` is the pencil side R (H'_vv is R/2), ``carrier`` bounds the kept-span columns c
+    (None, the relaxed tier: R/2). As in ``keep_stage``, c cannot exceed R/2.
+    ``packed`` is the rows n. The selected panels are the caller's arrays
     and are not counted here. Returns ``(stacks, boundaries)``: the largest stage run (its
     input stacks, the eigenvectors it reads and the stack it writes: the members; the members,
     U of H'_vv and the restricted pencil; the restricted pencil, U of the Schur complement and
@@ -186,7 +187,7 @@ def staged_sector_bytes(*, parents, ranks, side, carrier, packed):
     eigh, H'_vv, the Schur complement and Y^H G_r Y, ``(extent, stacks live beside it)``.
     """
     hvv = int(side) // 2
-    c = int(carrier or hvv)
+    c = min(hvv, int(carrier or hvv))
     two, n = 2 * c, int(packed)
     per_rank = lambda elements: -(-16 * int(elements) * int(parents) // int(ranks))
     members = 6 * hvv * hvv + 2 * n * hvv

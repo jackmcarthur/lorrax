@@ -76,22 +76,34 @@ def _pad(a, w):
     return np.pad(a, ((0, 0), (0, 0), (0, w - a.shape[-1])))
 
 
-def test_decoupled_face_matches_local():
+@pytest.mark.parametrize('budget', (8, 64))
+def test_decoupled_face_matches_local(budget):
     """The decoupled face route (stage programs over sub-batches, eighs over every parent)
     against the local round on the synthetic pencil; the face products are panel_matmul."""
     mesh = _mesh()
     from gw.shared_pole_directions import port_extent
     from gw.shared_pole_execution import face_reduce_decoupled, face_ritz_carrier
     from gw.shared_pole_local import BATCH, reduce_round
-    from gw.shared_pole_capacity import _local_eigenplan
+    from gw.shared_pole_capacity import _local_eigenplan, staged_sector_bytes
+    from contextlib import contextmanager
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     extent = port_extent(mesh)
     states, infinity, tables, models = _pencil(mesh)
     q = len(models)
     width, iw = extent(4), extent(2)
     gram_keep = shared_real_pole_gates_ordered_v1["normalized_gram_keep"]["sector_threshold"]
-    budget = 8
     side = int(tables["active"].shape[-1])
+    carrier = face_ritz_carrier(mesh, budget)
+    _, boundaries = staged_sector_bytes(parents=q, ranks=mesh.size, side=side,
+                                        carrier=carrier, packed=24)
+    plans = tuple(_local_eigenplan(mesh, m) for m, _ in boundaries)
+
+    @contextmanager
+    def check_eigh_shape(k, plan, stack):
+        # Check against the actual numerical stage, not a second copy of
+        # the price formula. A budget wider than H_vv must not grow Schur.
+        assert stack.shape == (q, plan.n, plan.n), (k, stack.shape, plan.n)
+        yield
 
     def place(sharding):
         put = lambda a: jax.device_put(np.asarray(a), sharding)
@@ -102,11 +114,10 @@ def test_decoupled_face_matches_local():
                          ordered=True, odd_moments=True, keep_budget=budget, retain_span=True, gram_keep=gram_keep)
     fs, fi = place(NamedSharding(mesh, P(None, "x", "y")))
     for sub in (q, 2, 1):
-        plan = _local_eigenplan(mesh, side)
         held = list(fs)
-        dec = face_reduce_decoupled(held, fi, tables, mesh=mesh, eigh_plans=(plan, plan, plan), width=sub,
+        dec = face_reduce_decoupled(held, fi, tables, mesh=mesh, eigh_plans=plans, width=sub,
                                     ordered=True, odd_moments=True, keep_budget=budget, retain_span=True,
-                                    gram_keep=gram_keep, carrier=face_ritz_carrier(mesh, budget))
+                                    gram_keep=gram_keep, carrier=carrier, eigh_rows=check_eigh_shape)
         assert all(len(s) == 3 for s in held)          # the dW Q panels were released
         ld, dd = (jax.tree.map(np.asarray, r[3][0]) for r in (local, dec))
         assert np.all(dd["paired_metric_inverse_root_residual_relative"] < 1e-12), sub
