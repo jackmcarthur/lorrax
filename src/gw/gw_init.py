@@ -1572,10 +1572,9 @@ def _resolve_charge_fit_conditioning(cfg, augmentation_artifact=None):
         raise ValueError('charge_fit_conditioning must be None or unit_diagonal')
     if requested is not None and declared is not None and requested != declared:
         raise ValueError('GATE charge_fit_conditioning: input and reconstruction manifest disagree')
-    resolved = requested if requested is not None else declared
-    if resolved is not None and uses_transverse_interaction(cfg):
-        raise ValueError('GATE charge_fit_conditioning: only scalar charge fitting is admitted')
-    return resolved
+    # This policy is passed only to the charge family. A concurrent current
+    # fit retains its own unconditioned, unit-endpoint normal equations.
+    return requested if requested is not None else declared
 
 
 _UNRESOLVED_CHARGE_FIT_CONDITIONING = object()

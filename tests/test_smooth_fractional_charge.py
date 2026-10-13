@@ -52,7 +52,7 @@ def test_invalid_metric_input_refuses(tmp_path, value):
         _config(tmp_path, 'charge_fit_conditioning='+value+'\n')
 
 
-def test_metric_resolves_manifest_once_and_refuses_invalid_or_current(tmp_path):
+def test_charge_metric_resolves_manifest_once_independently_of_current_mode(tmp_path):
     from gw.gw_init import _resolve_charge_fit_conditioning
     from gw.gw_config import BispinorGWMode
     cfg = _config(tmp_path)
@@ -66,8 +66,7 @@ def test_metric_resolves_manifest_once_and_refuses_invalid_or_current(tmp_path):
     current = SimpleNamespace(**cfg.__dict__)
     current.bispinor_gw = BispinorGWMode.BARE_TRANSVERSE
     current.backend = explicit.backend
-    with pytest.raises(ValueError, match='only scalar charge'):
-        _resolve_charge_fit_conditioning(current, manifest)
+    assert _resolve_charge_fit_conditioning(current, manifest) == 'unit_diagonal'
 
 
 @pytest.mark.parametrize('stored,requested,accepted', [
