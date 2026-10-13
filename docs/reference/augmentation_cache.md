@@ -67,7 +67,7 @@ Preserve old artifacts with their immutable source snapshots. Numerical
 equivalence to an older target is a separate measured proof, not an alias
 of its cache identity or fitting-accuracy certificate.
 
-## Common compact target in scalar GW
+## Common compact target in charge and current GW
 
 The public manifest may contain one `compact_target_request` for the existing
 full-FILE common-frame and paired-field loader. The request contains exactly
@@ -83,8 +83,13 @@ normalization or kinetic-balance lift. Its distinct charge basis stamp is
 preserved through fitting and restart; it cannot serve spatial currents or
 scalar head corrections.
 
-This request requires `field_policy = unwindowed_U_of_compact_native_pauli`,
-the full-WFN overlap policy, and served-monopole enrichment. It authenticates
+This request requires a declared paired-field policy, the full-WFN overlap
+policy, and served-monopole enrichment.
+`unwindowed_U_of_compact_native_pauli` serves the original common Pauli
+target; `paired_ae_large_preserved_free_graph` serves the prescribed
+AE-large kinetic-balance target. Spatial currents require the latter
+policy and `carrier = normalized_rkb`; the two-component embedded carrier
+remains charge-only. It authenticates
 the existing complete physical C/D/B/G0/A target and the paired atomic fields.
 The public loader streams the currently loaded WFN file on rank zero and
 broadcasts its whole-file SHA256 through the existing collective control
@@ -103,12 +108,20 @@ bindings; complete C/D/B/A arrays do not survive in its serving context.
 A receiving matrix for an edge-only diagnostic cannot cover a wider GW
 band window, even when its transport carrier is padded to that window.
 
-The admitted public compact envelope is fixed one-shot, unsmeared,
+The scalar public compact envelope is fixed one-shot, unsmeared,
 `bispinor_gw = coulomb_only`, with `head_correction = off`. A slab uses
 `sys_dim = 2` and the already implemented scalar `vcoul.Slab2D` completion.
 Static and frequency-dependent scalar screening use the same corrected
 samples and Coulomb tensor through their existing downstream contractions.
-Current, self-consistent and Gamma-head routes retain explicit refusals.
+For spatial currents, the authenticated physical mixed slab representation
+also admits `bare_transverse` and `full_shared_pole` under `sys_dim = 2`,
+with the same fixed-source, unsmeared, head-off one-shot constraints.
+`full_shared_pole` additionally requires `compute_mode = mpa`,
+`sigma_w_model = shared_pole` and `screening_diagrams = w_rpa`.
+The completed charge/current tensors and sample products enter the existing
+screening and self-energy contractions. Self-consistent and reconstructed
+Gamma-head routes remain outside this compact-field admission; see
+[reconstructed currents](../theory/augmented-isdf.md#reconstructed-current-and-its-bare-interaction).
 This API admission supplies no numerical convergence certificate; actual
 source/action, Coulomb-fitting and Sigma convergence remain separate tests.
 

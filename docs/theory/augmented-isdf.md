@@ -179,10 +179,12 @@ This private operator is labelled
 `neutral_mean_policy=none_direct_smooth_neutral_fft` and an authenticated
 slab-kernel binding. Independent compact-source/smooth-receiving and
 smooth-source/compact-receiving CPU controls check both mixed adjoints,
-complex conjugations and exact-M0 cancellation. Public slab GW and the
-private full reconstructed-slab preparation path remain guarded pending
-native action and actual source/artifact validation; these mathematical
-controls do not certify a CrI3 Hartree or quasiparticle result.
+complex conjugations and exact-M0 cancellation. Public slab GW admits the authenticated common compact source and paired
+fields in the fixed-source, unsmeared, head-off one-shot domain. The source,
+field policy, frame and slab geometry are authenticated before fitting or
+restart consumption. The mixed-adjoint mathematical controls alone do not
+certify a material Hartree or quasiparticle result; source-specific action
+and fitting errors remain separate checks.
 
 At interpolation points define
 
@@ -201,7 +203,7 @@ resident Fourier rows at those positions. In full-WFN mode the complete factor
 A acts on the reciprocal rows and atomic coefficients first, so only the
 public band columns need the sample DFT. All available bands still enter the
 overlap and rotation. A rounded FFT gather would consume a different orbital map.
-Fractional charge fitting is admitted. The static-current extension
+Fractional charge fitting is admitted. The reconstructed-current extension
 below uses the same typed geometry; an unsupported FFT-only refitting consumer
 refuses this basis explicitly.
 
@@ -472,7 +474,32 @@ photon models. The separate authenticated physical mixed Slab representation
 also admits `full_shared_pole` in the fixed-source, unsmeared insulating,
 head-off one-shot domain. Its bare current tensor and sample products feed
 the existing frequency-dependent four-current response and self-energy
-owners. This admission is not a convergence certificate for reconstructed
+owners. For this slab comparison the interaction settings are:
+
+```text
+bispinor = true
+bispinor_gw = full_shared_pole
+compute_mode = mpa
+sigma_w_model = shared_pole
+screening_diagrams = w_rpa
+sys_dim = 2
+qp_solver = one_shot_dft
+density_self_consistent = false
+head_correction = off
+occ_broadening = 0
+```
+
+The deck also supplies `atomic_reconstruction_dir`, charge/current centroid
+files and the ordinary WFN/band settings. The manifest binds the complete
+source-band frame and paired AE-large fields with `carrier=normalized_rkb`
+and `field_policy=paired_ae_large_preserved_free_graph`; these immutable
+artifacts are prepared before the run. Leave `occ_smearing_width_ry` unset.
+Switching `bispinor_gw` to `coulomb_only` removes current fitting, transverse
+interaction assembly and the photon response while retaining the same
+normalized four-component charge carrier. A two-component comparison uses
+the separate `pauli2embed4` compact target, not that mode switch alone.
+
+This admission is not a convergence certificate for reconstructed
 fields, interpolation, compensation tails, or screening. Coulomb-only GW
 retains its existing charge screening and correlation contractions.
 

@@ -283,7 +283,15 @@ rulings override anything here.
   (`GATE bispinor_self_consistency_requires_live_four_current`).
   It also enforces `GATE atomic_augmentation_domain` at parsing and
   fresh/restart orchestration, including programmatically replaced configs:
-  atomic reconstruction requires four-component ordinary 3D Coulomb.
+  bulk reconstruction admits normalized four-component Coulomb charge and
+  the restricted bare-exchange current route. `_fixed_point_current_domain`
+  additionally admits slab `bare_transverse`/`full_shared_pole` with fixed
+  unsmeared occupations, `one_shot_dft`, `density_self_consistent=false` and
+  `head_correction=off`. `refuse_unsupported_compact_charge` then authenticates
+  the compact-field scope: spatial currents require `normalized_rkb` and
+  `paired_ae_large_preserved_free_graph`. The physical body/layer geometry
+  is checked after the manifest is bound; parser admission alone is not a
+  geometry or accuracy certificate.
 - **`scalar_head_overrides_named`** formats the scalar-head overrides the deck
   named, for envelope messages.
 
