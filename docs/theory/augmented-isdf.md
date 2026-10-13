@@ -38,7 +38,7 @@ Every atomic difference therefore receives the same Fourier multiplier
 as the smooth orbital. An unnormalized small-component derivative added after
 the smooth lift is a different operator. The normalized atomic differences have
 short noncompact tails, so any buffered sphere needs a measured tail bound.
-The production field uses a compact normalized graph. If H denotes the served
+The compact-upper field policy uses a compact normalized graph. If H denotes the served
 large-component Hermite interpolant, it defines
 
 \[
@@ -458,9 +458,9 @@ support bound above and its own kernel-bound cache. The static
 transverse construction below also cancels the inverse bi-Laplacian exterior
 field; its grouped-current contraction refuses a scalar local provider.
 
-## Static reconstructed current
+## Reconstructed current and its bare interaction
 
-The public extension of `atomic_reconstruction_dir` admits
+The bulk static extension of `atomic_reconstruction_dir` admits
 `bispinor_gw=bare_transverse` only for `compute_mode=x_only`,
 `qp_solver=one_shot_dft`, fixed DFT density, three-dimensional periodic Coulomb,
 `head_correction=off` and no transverse head overlay. Occupation smearing is
@@ -468,8 +468,13 @@ unset, response occupation broadening is zero, and the actual WFN occupations
 must describe an insulator before either fresh or restart I/O. Ordinary public fresh/file/restart reuses the same complete tensors and
 samples. This extension supplies bare
 static transverse exchange; it does not admit reconstructed screened/dynamic
-photon models. Coulomb-only GW retains its existing charge screening and
-correlation contractions.
+photon models. The separate authenticated physical mixed Slab representation
+also admits `full_shared_pole` in the fixed-source, unsmeared insulating,
+head-off one-shot domain. Its bare current tensor and sample products feed
+the existing frequency-dependent four-current response and self-energy
+owners. This admission is not a convergence certificate for reconstructed
+fields, interpolation, compensation tails, or screening. Coulomb-only GW
+retains its existing charge screening and correlation contractions.
 
 Charge and current use one reconstructed four-spinor and one full-WFN factor
 A. In the AgI validation this is the full physical 152-band factor before the
@@ -483,8 +488,13 @@ j^i_{mn}=\Psi_m^\dagger\alpha_i\Psi_n
 =L_m^\dagger\sigma_iS_n+S_m^\dagger\sigma_iL_n.
 \]
 
-The served lower field is still \(S=X L\), including the derivative of the
-served large-field taper. Each current component uses its own existing Gram
+For the compact-upper field policy, the served lower field is \(S=X L\),
+including the derivative of the served large-field taper. The paired
+`no_post_U_taper` finite-momentum policy instead interpolates its two stored
+slots independently and masks them at the serving radius. Nodal graph
+agreement does not remove an interior Hermite interpolation defect or a
+nonzero boundary trace. Such fields require their own derivative and boundary
+error assessment; the current fit does not repair them. Each current component uses its own existing Gram
 factor for both smooth and local RHSs, with unit endpoint loss; the charge
 factor and any charge loss weights are separate. Both families may use distinct
 symmetry-closed fractional point sets. The same current matrices and conjugate
@@ -529,6 +539,45 @@ attachment or another fit. Fresh/restart equality validates the handoff;
 independent full \(\Sigma_X\) matrix comparisons validate fitting accuracy.
 Neither establishes atomic transferability, continuum convergence, screened
 frequency accuracy or calibrated quasiparticle band splittings.
+
+### Physical mixed Slab completion
+
+Write each fitted current as \(j=s+\delta\), with smooth reciprocal part
+\(s\), atomic correction \(\delta\), and two-moment compensation \(g\).
+The physical mixed implementation contracts
+
+\[
+ V^{ij}_{\mu\nu}=
+ \bigl[\langle s^i_\mu|\mathcal T_{2D}^{ij}|s^j_\nu\rangle
+ +\langle s^i_\mu|\mathcal T_{2D}^{ij}|\delta^j_\nu\rangle
+ +\langle\delta^i_\mu|\mathcal T_{2D}^{ij}|s^j_\nu\rangle
+ +\langle g^i_\mu|\mathcal T_{2D}^{ij}|g^j_\nu\rangle\bigr]_{K\leq K_c}
+ +\sum_A\bigl[\langle\delta^i_{A\mu}|\mathcal T_{3D}^{ij}|\delta^j_{A\nu}\rangle
+ -\langle g^i_{A\mu}|\mathcal T_{3D}^{ij}|g^j_{A\nu}\rangle\bigr]_{\infty}.
+\]
+
+The support owner checks the actual fitted smooth-current support, derived
+from the WFN momentum differences and unchanged fitting factors, against the
+retained reciprocal domain. The admitted geometry has \(q_z=0\), an aligned
+half-cell Slab cutoff, and the authenticated point kernel with its head off.
+It also checks disjoint atomic supports and their separation from the
+shifted Slab planes. Together with both matched
+moments, these conditions justify the bulk on-site remainder and retain both
+ordered smooth--local terms. The omitted global compensation contribution
+above \(K_c\) remains a numerical error to bound. Actual fitted compensation
+moments supply a small Sobolev-norm diagnostic; an occupied-exchange bound
+additionally needs the physical sample covectors and occupations. Such a
+bound does not certify the nonlinear screened response.
+
+Smooth and local right-hand sides use the same factor for each current
+channel. The admitted signed-PSD policy derives the sign from the actual
+current matrix: if the stored normal equations are \(C=sQ\), \(Z=sB\),
+it factors the Hermitian positive Gram \(Q\) and applies its retained
+pseudoinverse consistently to both right-hand sides. Materially negative,
+non-Hermitian, or zero input is invalid, independently of rank-tuning policy.
+The retained spectrum and discarded feature weight are diagnostics;
+independent current-action and occupied self-energy comparisons determine
+the physical fitting error.
 
 ## Implementation and accuracy
 
