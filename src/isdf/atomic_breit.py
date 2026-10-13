@@ -5,6 +5,9 @@ three consistently reconstructed current RHS, their separate canonical C
 factors, complete geometry and an explicit reciprocal kernel identity.
 The static Poisson/biharmonic locality certificate requires matched Q0/Q2,
 ordinary three-dimensional geometry and disjoint compact spheres.
+The optional Slab body completes the finite reciprocal nn/tn/nt terms;
+the analytic local remainder remains the same bulk infinite-space reference.
+This hybrid operator is not by itself a transverse-convergence certificate.
 """
 from __future__ import annotations
 
@@ -13,11 +16,14 @@ import numpy as np
 
 STATIC_KERNEL = 'ordinary_3d_static_transverse_P_over_K2'
 BODY_HEAD_SCHEMA = 'vcoul_static_current_body_heads_v2'
+SLAB_STATIC_KERNEL = 'slab_2d_static_transverse_bulk_local_completion'
+SLAB_BODY_HEAD_SCHEMA = 'vcoul_static_current_body_heads_slab_v1'
 CURRENT_GAMMA_K2_EPS = 1e-30
 
 
 def _body_head_digest(policy):
-    digest=hashlib.sha256(BODY_HEAD_SCHEMA.encode('ascii'))
+    schema=policy.get('schema',BODY_HEAD_SCHEMA)
+    digest=hashlib.sha256(schema.encode('ascii'))
     for key in ('q_frac','gvec_components','bvec','q_plus_G_cart','ngk_per_q',
                 'sel','mask','mult','len2','v_bare','v_avg',
                 'gamma_head_cartesian','gamma_kgrid'):
@@ -30,12 +36,14 @@ def _body_head_digest(policy):
                               policy['tie_rtol']],dtype=np.float64).tobytes())
     digest.update(policy['gamma_placement'].encode('ascii'))
     digest.update(policy['gamma_source_receipt'].encode('utf8'))
+    if schema==SLAB_BODY_HEAD_SCHEMA:
+        digest.update(np.asarray([policy['sys_dim'],policy['slab_half_height']],np.float64).tobytes())
     return digest.hexdigest()
 
 
 def static_breit_body_head_slots(*,q_frac,gvec_components,ngk_per_q,geometry,
                                 vcoul_cutoff_ry,v_head_fn=None,head_tie_rtol=1e-9,
-                                gamma_head=None):
+                                gamma_head=None,sys_dim=3):
     """Bind the public scalar body-head owner to actual current q/G slots.
 
     The caller passes the same canonical head callback used to construct V.
@@ -46,6 +54,8 @@ def static_breit_body_head_slots(*,q_frac,gvec_components,ngk_per_q,geometry,
     signed physical Cartesian tensor in Ry, its integer kgrid and opaque
     source receipt. It is embedded once at the unique physical Gamma slot.
     Otherwise Gamma remains separate; scalar charge heads never supply it.
+    ``sys_dim=2`` authenticates the public Slab2D orientation/half-height;
+    the default bulk schema and its payload bytes remain unchanged.
     """
     from vcoul import get_kernel,head_slot_table
     q=np.asarray(q_frac,dtype=np.float64)
@@ -53,6 +63,9 @@ def static_breit_body_head_slots(*,q_frac,gvec_components,ngk_per_q,geometry,
     counts=np.asarray(ngk_per_q)
     cutoff,tie=float(vcoul_cutoff_ry),float(head_tie_rtol)
     bvec=np.asarray(geometry.bvec,dtype=np.float64);volume=float(geometry.cell_volume)
+    if isinstance(sys_dim,bool) or not isinstance(sys_dim,(int,np.integer)) or sys_dim not in (2,3):
+        raise ValueError('static current body requires explicit bulk3D or Slab2D dimensionality')
+    kernel=get_kernel(sys_dim)
     if (q.ndim!=2 or q.shape[1]!=3 or not len(q) or not np.isfinite(q).all()
             or G.ndim!=3 or G.shape[:2]!=(len(q),3) or not np.isfinite(G).all()
             or np.any(G!=np.rint(G)) or counts.shape!=(len(q),) or counts.dtype.kind not in 'iu'
@@ -61,7 +74,7 @@ def static_breit_body_head_slots(*,q_frac,gvec_components,ngk_per_q,geometry,
             or not np.isfinite(volume) or volume<=0
             or not np.isfinite(cutoff) or cutoff<=0 or not np.isfinite(tie) or tie<0):
         raise ValueError('invalid canonical static current body-head geometry')
-    tables=[head_slot_table(get_kernel(3),q[i:i+1],G[i:i+1,:,:int(n)],
+    tables=[head_slot_table(kernel,q[i:i+1],G[i:i+1,:,:int(n)],
                            geometry=geometry,vcoul_cutoff_ry=cutoff,
                            v_head_fn=v_head_fn,head_tie_rtol=tie)
             for i,n in enumerate(counts)]
@@ -78,6 +91,9 @@ def static_breit_body_head_slots(*,q_frac,gvec_components,ngk_per_q,geometry,
         gamma_placement='separate_measured_current',
         gamma_head_cartesian=np.zeros((len(q),3,3),np.complex128),
         gamma_kgrid=np.zeros(3,np.int32),gamma_source_receipt='')
+    if sys_dim==2:
+        policy.update(schema=SLAB_BODY_HEAD_SCHEMA,sys_dim=2,
+                      slab_half_height=kernel.truncation_half_height(geometry))
     if gamma_head is not None:
         if not isinstance(gamma_head,dict) or set(gamma_head)!={'cartesian_ry','kgrid','source_receipt'}:
             raise ValueError('canonical Gamma current head requires its tensor, kgrid and source receipt')
@@ -112,7 +128,9 @@ def _authenticate_body_head_slots(policy,K,counts,volume,body_mask):
               'gamma_head_cartesian','gamma_kgrid','gamma_source_receipt','gamma_placement'}
     if not isinstance(policy,dict) or not required.issubset(policy):
         raise ValueError('static Breit canonical body-head payload is incomplete')
-    if (not isinstance(policy,dict) or policy.get('schema')!=BODY_HEAD_SCHEMA
+    if policy.get('schema')==SLAB_BODY_HEAD_SCHEMA and not {'sys_dim','slab_half_height'}.issubset(policy):
+        raise ValueError('static current Slab body requires its dimensionality and truncation geometry')
+    if (not isinstance(policy,dict) or policy.get('schema') not in (BODY_HEAD_SCHEMA,SLAB_BODY_HEAD_SCHEMA)
             or policy.get('gamma_placement') not in ('separate_measured_current','canonical_embedded_physical_current')
             or not isinstance(policy['gamma_source_receipt'],str)
             or policy.get('payload_sha256')!=_body_head_digest(policy)):
@@ -162,11 +180,16 @@ def _authenticate_body_head_slots(policy,K,counts,volume,body_mask):
             raise ValueError('static Breit canonical Gamma placement/source/grid mismatch')
     selected=np.zeros((Q,ng),bool)
     geometry=CoulombGeometry(bvec=bvec,cell_volume=volume)
+    dimension=2 if policy['schema']==SLAB_BODY_HEAD_SCHEMA else 3
+    kernel=get_kernel(dimension)
+    if dimension==2 and (policy.get('sys_dim')!=2
+            or policy.get('slab_half_height')!=kernel.truncation_half_height(geometry)):
+        raise ValueError('static current Slab dimensionality or truncation geometry changed')
     for row,n in enumerate(counts):
         # Reuse the same owner as the producer. Relative-tolerance ties
         # need not have identical lengths; their bare value is the public
         # tied-set mean, not the value at the shortest individual vector.
-        expected=head_slot_table(get_kernel(3),q[row:row+1],G[row:row+1,:,:int(n)],
+        expected=head_slot_table(kernel,q[row:row+1],G[row:row+1,:,:int(n)],
             geometry=geometry,vcoul_cutoff_ry=policy['cutoff_ry'],
             head_tie_rtol=policy['tie_rtol'])
         wanted=expected.sel[0,expected.mask[0]==1]
@@ -182,6 +205,34 @@ def _authenticate_body_head_slots(policy,K,counts,volume,body_mask):
     return selected
 
 
+def _current_point_body_tile(policy, q_indices, first, width, pairs, B, prefactor, *, sys_dim):
+    """Public point-body scalar times B P(K) B† on bounded physical q/G rows.
+
+    Returns (local_q, pair, G_tile) complex128 on the host. No averaged
+    scalar head or physical Gamma tensor enters the bulk reference. The
+    public scalar owner already supplies 8*pi/Omega and the cutoff mask.
+    """
+    from vcoul import CoulombGeometry,get_kernel,v_qG_table
+    rows=np.asarray(q_indices,dtype=int)
+    geometry=CoulombGeometry(bvec=policy['bvec'],cell_volume=policy['cell_volume'])
+    scale=float(prefactor)/(8*np.pi/float(policy['cell_volume']))
+    output=np.zeros((len(rows),len(pairs),int(width)),complex)
+    for slot,q in enumerate(rows):
+        if q>=len(policy['ngk_per_q']):continue
+        stop=min(first+width,int(policy['ngk_per_q'][q]))
+        if stop<=first:continue
+        vectors=np.asarray(policy['q_plus_G_cart'])[q,first:stop]
+        length=np.linalg.norm(vectors,axis=-1)
+        unit=np.divide(vectors,length[:,None],out=np.zeros_like(vectors),where=length[:,None]>0)
+        scalar=v_qG_table(get_kernel(sys_dim),np.asarray(policy['q_frac'])[q:q+1],
+            np.asarray(policy['gvec_components'])[q:q+1,:,first:stop],
+            geometry=geometry,vcoul_cutoff_ry=policy['cutoff_ry'])[0]*scale
+        for index,(a,b) in enumerate(pairs):
+            ua=np.einsum('i,gi->g',B[a],unit);ub=np.einsum('i,gi->g',B[b],unit)
+            output[slot,index,:stop-first]=scalar*(float(a==b)-ua*ub.conj())
+    return output
+
+
 def authenticate_group(zetas,pairs,v_tables):
     """Return one complete shared static provider or refuse partial admission."""
     local=tuple(getattr(z,'local_augmentation',None) for z in zetas)
@@ -190,7 +241,7 @@ def authenticate_group(zetas,pairs,v_tables):
     if len(zetas)!=3 or any(not isinstance(p,dict) for p in local):
         raise ValueError("GATE augmented_current_coulomb: augmented currents require all three local providers together")
     shared=local[0].get('group_provider')
-    if (not isinstance(shared,dict) or shared.get('kernel')!=STATIC_KERNEL
+    if (not isinstance(shared,dict) or shared.get('kernel') not in (STATIC_KERNEL,SLAB_STATIC_KERNEL)
             or any(p.get('group_provider') is not shared for p in local)
             or any('rhs' not in p for p in local)
             or tuple(p.get('channel') for p in local)!=(0,1,2)
@@ -252,6 +303,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         raise ValueError("compensated static Breit requires the smooth local RHS for all three channels")
     if smooth_rhs is not None and (not isinstance(smooth_rhs,(tuple,list)) or len(smooth_rhs)!=3):
         raise ValueError("static Breit smooth local RHS requires all three current channels")
+    slab=isinstance(body_head_slots,dict) and body_head_slots.get('schema')==SLAB_BODY_HEAD_SCHEMA
+    if slab and not compensated:
+        raise ValueError('Slab current completion requires the complete compensated delta/PS family')
     z0=zetas[0];st,mesh=z0.store,z0.mesh
     Q,Qp,mu,gt=int(st.Q),int(st.Q_pad),int(st.mu_pad),int(st.g_tile)
     ng=int(st.g_axis.logical);XY=('x','y');qspec=P(XY,None,None)
@@ -315,6 +369,8 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                                       stored_G.transpose(0,2,1)[active])):
             raise ValueError('static Breit body-head G slot order disagrees with its current zeta store')
         body_head_identity=body_head_slots['payload_sha256']
+    if slab and not 2*R<float(body_head_slots['slab_half_height']):
+        raise ValueError('Slab current local remainder requires sphere diameter below the truncation half-height')
     norm=np.linalg.norm(K,axis=-1);maximum=float(np.max(np.where(active,norm,0)))
     compensation=build_two_moment_compensation(labels[:,0],support_radius=R)
     # Reuse the existing source-cardinal Fourier algorithm unchanged. Its
@@ -324,7 +380,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             compensation,radial['quadrature_radius'])[:,0])
     cache=_radial_fourier_cache(cache_tables,maximum,fourier_points)
     gamma_origin_error=None
-    if body_head_slots is not None and body_head_slots['gamma_placement']=='canonical_embedded_physical_current':
+    if slab or (body_head_slots is not None and body_head_slots['gamma_placement']=='canonical_embedded_physical_current'):
         source0=np.asarray(cache['density'](np.zeros(1)))[:,0,:]
         g0=two_moment_compensation_radial_fourier(compensation,np.zeros(1))[...,0]
         maps=np.stack((radial['moments0'],radial['moments2']),axis=1)
@@ -518,20 +574,62 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             Y=np.stack([4*np.pi*(-1j)**int(l)*sph_harm_y(l,m,theta,phi) for l,m in labels],axis=1)
             phase=np.exp(-1j*np.einsum('bgi,ai->bag',vec,centers))
             return phase[:,:,None]*Y[:,None]*valid[:,None,None]*fourier_scale
-        return fourier_kernel(state['coefficients'],state['moments'],
+        result=fourier_kernel(state['coefficients'],state['moments'],
             put_q_rows(source_rows,(len(radial['degrees']),gt,nr)),
             put_q_rows(angle_rows,(na,nh,gt)),
             put_q_rows(comp_rows,(len(radial['degrees']),2,gt)),rows)
+        if slab and np.any(active[:,first:first+gt]&(norm[:,first:first+gt]**2<=CURRENT_GAMMA_K2_EPS)):
+            from common.collectives import gather_to_host
+            def head_rows(qslice):
+                vec,valid=vectors(qslice)
+                return valid&(np.einsum('qgi,qgi->qg',vec,vec)<=CURRENT_GAMMA_K2_EPS)
+            marker=put_q_rows(head_rows,(gt,))
+            error,scale=neutral_head_kernel(*result,marker)
+            error,scale=float(gather_to_host(error)),float(gather_to_host(scale))
+            if error>2e-12+256*np.finfo(float).eps*scale:
+                raise ValueError('Slab current completion requires actual delta(0)=g(0) in its represented Fourier tiles')
+            bundle['gamma_neutral_representation_error']=max(
+                bundle.get('gamma_neutral_representation_error',0.),error)
+        return result
+
+    if slab:
+        def neutral_head_local(delta,g,marker):
+            error=jnp.max(jnp.stack([jnp.max(jnp.where(marker[:,None],abs(a-b),0))
+                                   for a,b in zip(delta,g)]))
+            scale=jnp.max(jnp.stack([jnp.max(jnp.where(marker[:,None],jnp.maximum(abs(a),abs(b)),0))
+                                   for a,b in zip(delta,g)]))
+            return jax.lax.pmax(error,XY),jax.lax.pmax(scale,XY)
+        neutral_head_kernel=jax.jit(shard_map(neutral_head_local,mesh=mesh,
+            in_specs=((qspec,)*3,(qspec,)*3,P(XY,None)),out_specs=(P(),P()),check_vma=False))
+
+    def kernel_difference_tile(t,pairs,v_tables):
+        """D_target - D_bulk-point, keeping only the addressed q/G packet."""
+        first=int(t)*gt
+        def build(qslice):
+            qids=np.arange(Qp)[qslice]
+            difference=-_current_point_body_tile(body_head_slots,qids,first,gt,pairs,B,k0,sys_dim=3)
+            n=max(0,min(gt,ng-first))
+            for slot,q in enumerate(qids):
+                if q>=Q:continue
+                for index,table in enumerate(v_tables):
+                    difference[slot,index,:n]+=np.asarray(table)[q,first:first+n]
+            return difference
+        return put_q_rows(build,(len(pairs),gt))
 
     def onsite(state,pairs):
         return make_onsite(pairs)(state['coefficients'],state['moments'],
                                   sparse_rows,sparse_weights,bucket_arrays)
 
     def authenticate_kernel(pairs,v_tables):
-        if (bundle.get('body_metric')!=body_metric
+        if (bundle.get('kernel')!=(SLAB_STATIC_KERNEL if slab else STATIC_KERNEL)
+                or bundle.get('body_metric')!=body_metric
                 or bundle.get('local_cross_policy')!=('onsite_smooth_neutral' if compensated
                                                      else 'mixed_reciprocal')):
             raise ValueError("static Breit provider body/cross policy was changed after construction")
+        if slab and (bundle.get('completion')!='nn_tn_nt_slab_minus_bulk_point_body'
+                or bundle.get('bulk_reference')!='public_Bulk3D_point_body_no_head'
+                or bundle.get('kernel_difference_tile') is not kernel_difference_tile):
+            raise ValueError('Slab current completion or point-body reference was changed after construction')
         if body_head_slots is not None:
             if (body_head_slots.get('payload_sha256')!=body_head_identity
                     or bundle.get('body_head_slots_sha256')!=body_head_identity):
@@ -552,6 +650,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                 ua=np.einsum('i,qgi->qg',B[a],unit);ub=np.einsum('i,qgi->qg',B[b],unit)
                 projection=float(a==b)-ua*ub.conj()
                 expected=np.divide(k0*projection,length*length,out=np.zeros_like(projection),where=length>0)
+                if slab:
+                    expected=_current_point_body_tile(body_head_slots,np.arange(Q),first,last-first,
+                        ((a,b),),B,k0,sys_dim=2)[:,0]
                 if head_selected is not None:
                     scalar=np.asarray(body_head_slots['v_avg'])*k0/(8*np.pi/volume)
                     expected=np.where(head_selected[:,first:last],scalar[:,None]*projection,expected)
@@ -571,7 +672,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
               np.asarray([volume,N,R,k0,minimum_atom_image_distance,
                           interpolation_degree,quadrature_order,ft,mt])):
         digest.update(np.ascontiguousarray(v).tobytes())
-    bundle=dict(kernel=STATIC_KERNEL,geometry_sha256=digest.hexdigest(),
+    bundle=dict(kernel=SLAB_STATIC_KERNEL if slab else STATIC_KERNEL,geometry_sha256=digest.hexdigest(),
         zeta_identity=tuple(id(z) for z in zetas),prepare=prepare,
         fourier_tile=fourier_tile,onsite=onsite,authenticate_kernel=authenticate_kernel,
         reciprocal_prefactor=k0,local_geometry_scale=onsite_scale,current_basis_rows=B,
@@ -589,6 +690,12 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         onsite_block_diagnostics={key:blocks[key] for key in ('angular_forbidden_error',
             'angular_M_covariance_error','retained_columns','retained_compensation_columns',
             'factor_bytes','no_cutoff')},onsite_sparse_max_orbitals=3,coefficient_cloud_padding=False)
+    if slab:
+        bundle.update(kernel_difference_tile=kernel_difference_tile,
+            completion='nn_tn_nt_slab_minus_bulk_point_body',
+            bulk_reference='public_Bulk3D_point_body_no_head',
+            gamma_neutral_representation_error=0.,
+            completion_workspace_bytes_per_rank=16.*Qp/int(mesh.size)*(9*gt+2*mu*gt+2*mu*mu))
     # All geometry/head/source contracts have refused invalid inputs before
     # allocating the paired clouds. The consuming stage blocks these arrays
     # and releases its raw six-cloud operands before grouped solves begin.

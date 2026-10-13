@@ -201,3 +201,27 @@ action then consumes the authenticated loaded cache. A shape descriptor is
 memory planning, not physical payload admission. The focused P4 oracle
 checks that planned and loaded actions are bit identical, including an
 interleaved packed centroid mask.
+
+## Guarded Slab three-current provider
+
+The low-level `isdf.atomic_breit` provider accepts an explicit `sys_dim=2`
+body-head policy. Its separate schema binds the public Slab2D orientation,
+truncation half-height, physical q/G slots, cutoff, tie policy and actual
+current Gamma tensor. The default bulk policy and bare local reference stay
+unchanged. A Slab provider requires all three compensated current channels;
+this internal capability does not admit compact transverse GW.
+
+Let `t = Z + g` and `n = delta - g`. The grouped contraction uses the public
+Slab target body for `t`, then adds `n† DeltaD n`, `t† DeltaD n` and
+`n† DeltaD t`, where `DeltaD` is that target minus the public **bulk point
+body** on the same finite reciprocal set. The reference has no averaged
+bulk head. The result is exactly the finite physical-current Slab body plus
+the existing infinite bulk local term minus its finite bulk `nn/tn/nt`
+part. Physical current zeta output remains `Z + delta`. The represented
+`delta(0) = g(0)` equality is measured before using the Gamma completion.
+
+This is a defined finite-body/infinite-local hybrid, not a certificate for
+the continuum Slab current kernel. Full-radial actual-current energy,
+angular extent, reciprocal-tail and fitting errors must still be checked.
+The callback's workspace estimate is not an AOT peak-memory admission.
+Existing compact-current, screened-current and vector-Hartree guards remain.

@@ -1323,15 +1323,19 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
 
 
 def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
-                      compensated_body=False, return_physical=False):
+                      compensated_body=False, return_physical=False,
+                      transverse_completion=False):
     """One G tile of several ζ's: ``V^{ab} += conj(ζ^a) v^{ab} ζ^bᵀ`` per pair,
     and each ζ's shell gather — the accumulation half of :func:`_v_tile_kernel`
     over ζ tiles it formed with ``with_v=False``."""
     pairs = tuple((int(a), int(b)) for a, b in pairs)
     if compensated_body and not use_local_augmentation:
         raise ValueError('grouped compensated body requires a local provider')
+    if transverse_completion and not compensated_body:
+        raise ValueError('Slab transverse completion requires the compensated three-current family')
     key = ('pair_tile', _mesh_id(mesh), int(g_tile), pairs,
-           bool(use_local_augmentation),bool(compensated_body),bool(return_physical))
+           bool(use_local_augmentation),bool(compensated_body),bool(return_physical),
+           bool(transverse_completion))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
@@ -1343,6 +1347,8 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
                 (acc,) * len(pairs), (acc,) * n_z)
     if use_local_augmentation:
         in_specs += (((z_spec,)*n_z,(z_spec,)*n_z),)
+    if transverse_completion:
+        in_specs += (P(_XY,None,None),)
 
     output_specs = ((acc,) * len(pairs), (acc,) * n_z)
     if return_physical:
@@ -1363,6 +1369,12 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
                 delta,compensation=local_tiles[0]
                 if compensated_body:
                     dV=product(Z[a]+compensation[a],Z[b]+compensation[b])
+                    if transverse_completion:
+                        dt=jnp.where(mask,local_tiles[1][:,i,:],0)
+                        inner=lambda left,right:jnp.einsum('qmg,qg,qng->qmn',left.conj(),dt,right)
+                        ta,tb=Z[a]+compensation[a],Z[b]+compensation[b]
+                        na,nb=delta[a]-compensation[a],delta[b]-compensation[b]
+                        dV+=(inner(na,nb)+inner(ta,nb)+inner(na,tb))
                 else:
                     dV += (product(Z[a],delta[b])+product(delta[a],Z[b])
                            +product(compensation[a],compensation[b]))
@@ -1455,10 +1467,16 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     body_metric='mixed_reciprocal' if augmentation is None else augmentation.get('body_metric')
     if body_metric not in ('mixed_reciprocal','compensated'):
         raise ValueError('grouped static provider has no supported body metric')
+    completion=None if augmentation is None else augmentation.get('completion')
+    if completion is not None and completion!='nn_tn_nt_slab_minus_bulk_point_body':
+        raise ValueError('grouped current provider has an unsupported transverse completion')
+    if completion is not None and not callable(augmentation.get('kernel_difference_tile')):
+        raise ValueError('Slab current completion requires its authenticated packet kernel owner')
     step = _pair_tile_kernel(mesh,st0.g_tile,pairs,
                             use_local_augmentation=augmentation is not None,
                             compensated_body=body_metric=='compensated',
-                            return_physical=zeta_ios is not None)
+                            return_physical=zeta_ios is not None,
+                            transverse_completion=completion is not None)
     mu = int(st0.mu_pad)
     V = tuple(_zero_accumulators(mesh, st0.Q_pad, mu, 1,
                                  debug_m=False)[0] for _ in pairs)
@@ -1498,6 +1516,11 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
                 for tile in part:
                     _require_q_owned(tile,mesh,(st0.Q_pad,mu,st0.g_tile),name=f'grouped current {label}')
             local_tiles=(tiles,)
+            if completion is not None:
+                difference=augmentation['kernel_difference_tile'](t,pairs,tuple(v))
+                _require_q_owned(difference,mesh,(st0.Q_pad,len(pairs),st0.g_tile),
+                                 name='grouped current Slab-minus-bulk kernel packet')
+                local_tiles+=(difference,)
         result = step(tuple(zt),v_dev,ngk_dev,sl_dev,jnp.int32(t),V,S,*local_tiles)
         V, S = result[:2]
         if zeta_ios is not None:

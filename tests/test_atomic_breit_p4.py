@@ -21,7 +21,7 @@ def forbid_stored_zeta_reads(zetas):
 def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
                       angular_maximum=2,field_tile=3,centroid_tile=3,compensated=False,averaged_heads=False,
                       embedded_gamma=False, publication_fixture=None,
-                      mu_basis=None, canonical_to_packed_reference=None):
+                      mu_basis=None, canonical_to_packed_reference=None,sys_dim=3):
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -37,6 +37,8 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         static_compensation_bilinear,curl_poisson_field_tile,compensation_curl_field_tile)
 
     mesh=runtime.mesh;assert mesh.size==4
+    if sys_dim==2 and not (compensated and averaged_heads):
+        raise ValueError('Slab witness requires compensated physical body policy')
     Q,Qp,mu,ng,gpad,gt,na,nr,R=3,4,8,7,8,4,2,8,1.1
     # Random arrays below define PACKED coordinates. The optional layout
     # witness checks file-canonical output against a literal independent map.
@@ -66,7 +68,7 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         raise ValueError('embedded current Gamma test requires the canonical body-head fixture')
     if averaged_heads:
         from tests.test_static_breit_body_heads import physical_head_fixture
-        head_fixture=physical_head_fixture(embedded_gamma=embedded_gamma)
+        head_fixture=physical_head_fixture(embedded_gamma=embedded_gamma,sys_dim=sys_dim)
         K=head_fixture['K'];body=head_fixture['body'];head=head_fixture['policy']['gamma_head_cartesian']
         assert np.array_equal(counts,head_fixture['counts'])
     gvec=(head_fixture['G'] if averaged_heads else np.zeros((Q,3,ng),np.int32))
@@ -96,7 +98,7 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         target=random((Qp,mu,gpad))*.04
         target[Q:]=0.;target[...,ng:]=0.
         Z=np.einsum('qmn,qng->qmg',C,target)
-        coeff=random((Qp,mu,na,nh,nr))*.2
+        coeff=random((Qp,mu,na,nh,nr))*(40. if sys_dim==2 else .2)
         coeff*=r[None,None,None,None]**lm[None,None,None,:,0,None]*(1-(r/R)**2)**2
         coeff[Q:]=1e8-2e8j
         rhs=np.einsum('qmn,qnf->qmf',C,coeff.reshape(Qp,mu,-1))
@@ -169,13 +171,32 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
                     Pc=[curl_poisson_field_tile(B[c].conj()[None,:,None,None]*ps_coefficients[c][q,:,atom,None],geometry,quadrature_slice=whole) for c in range(3)]
                     form=lambda l,r:np.einsum('mqpo,q,nqpo->mn',l.conj(),qw*qr*qr,r)
                     cross_local[index,q]+=prefactor*nfft*nfft/volume*(form(Pc[a],D[b]-Gc[b])+form(D[a]-Gc[a],Pc[b]))
-    expected=[];without_cross=[]
+    expected=[];without_cross=[];completion_terms=[]
+    # Independent bulk point reference: no callback/head enters the local
+    # subtraction. D_s is the actual public target body, including its head.
+    bulk=np.divide(prefactor*Pfit,length[:,:,None,None]**2,
+        out=np.zeros_like(Pfit),where=length[:,:,None,None]>0)*body[:,:,None,None]
+    bulk*=active[:,:,None,None]
     for index,(a,b) in enumerate(pairs):
         vt=np.pad(v_tables[index],((0,1),(0,gpad-ng)))
         product=lambda left,right:np.einsum('qmg,qg,qng->qmn',left.conj(),vt,right)
         if compensated:
             base=product(smooth[a]+g[a],smooth[b]+g[b])+onsite[index]
-            expected.append(base+cross_local[index])
+            if sys_dim==2:
+                bt=np.pad(bulk[:,:,a,b],((0,1),(0,gpad-ng)))
+                bproduct=lambda left,right:np.einsum('qmg,qg,qng->qmn',left.conj(),bt,right)
+                ta,tb=smooth[a]+g[a],smooth[b]+g[b]
+                na0,nb0=delta[a]-g[a],delta[b]-g[b]
+                subtraction=bproduct(na0,nb0)+bproduct(ta,nb0)+bproduct(na0,tb)
+                # Form the hybrid via physical total samples, independently
+                # of the production expansion in t/n and DeltaD.
+                expected.append(product(smooth[a]+delta[a],smooth[b]+delta[b])
+                                +onsite[index]+cross_local[index]-subtraction)
+                dt=vt-bt
+                dp=lambda left,right:np.einsum('qmg,qg,qng->qmn',left.conj(),dt,right)
+                completion_terms.append((dp(na0,nb0),dp(ta,nb0),dp(na0,tb)))
+            else:
+                expected.append(base+cross_local[index])
         else:
             base=product(smooth[a],smooth[b])+product(g[a],g[b])+onsite[index]
             expected.append(base+product(smooth[a],delta[b])+product(delta[a],smooth[b]))
@@ -233,6 +254,23 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
             if embedded_gamma and tile==0:
                 gamma_delta_g_error=max(gamma_delta_g_error,float(np.max(abs(d[0,:,0]-cg[0,:,0]))))
                 np.testing.assert_allclose(d[0,:,0],cg[0,:,0],rtol=3e-13,atol=1e-15)
+    omission_errors=[]
+    if sys_dim==2:
+        assert bundle['completion']=='nn_tn_nt_slab_minus_bulk_point_body'
+        assert bundle['bulk_reference']=='public_Bulk3D_point_body_no_head'
+        assert bundle['gamma_neutral_representation_error']<2e-12
+        for term in range(3):
+            signal=max(float(np.max(abs(v[term]))) for v in completion_terms)
+            # The exact SAME final 2e-11 absolute equality tolerance must
+            # reject each independently omitted production term.
+            omitted=[(e-v[term])[:,reference_ids][:,:,reference_ids] for e,v in zip(expected,completion_terms)]
+            omission=max(float(np.max(abs(actual-ref[:Q]))) for actual,ref in zip(host,omitted))
+            omission_errors.append(omission)
+            assert omission>8*2e-11,(term,signal,omission,normref)
+        changed_state=dict(direct_state,moments=tuple(1.01*m for m in direct_state['moments']))
+        try:bundle['fourier_tile'](0,changed_state)
+        except ValueError as exc:assert 'actual delta(0)=g(0)' in str(exc)
+        else:raise AssertionError('nonneutral represented Gamma current was admitted')
     onsite_actual=bundle['onsite'](direct_state,pairs)
     onsite_error=max(float(np.max(np.abs(gather_to_host(v)-ref))) for v,ref in zip(onsite_actual,onsite+cross_local))
     assert onsite_error<2e-11,onsite_error
@@ -311,7 +349,10 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
     zero=tuple(np.asarray(gather_to_host(v)) for v in contract_v_group(zetas,pairs,v_tables,keep=keep))
     assert all(np.array_equal(a,b) for a,b in zip(zero,baseline))
     for z in zetas:z.close()
-    return dict(circular=circular,compensated=compensated,averaged_heads=averaged_heads,embedded_gamma=embedded_gamma,
+    return dict(sys_dim=sys_dim,circular=circular,compensated=compensated,averaged_heads=averaged_heads,embedded_gamma=embedded_gamma,
+        completion_term_signals=([max(float(np.max(abs(v[t]))) for v in completion_terms) for t in range(3)] if sys_dim==2 else None),
+        individually_omitted_completion_final_errors=omission_errors,
+        gamma_neutral_representation_error=bundle.get('gamma_neutral_representation_error'),
         gamma_omission_signal=gamma_signal,gamma_delta_g0_error=gamma_delta_g_error,
         gamma_radial_operator_error=bundle['gamma_zero_moment_operator_error'],
         canonical_body_tie_multiplicities=head_fixture['policy']['mult'].tolist() if averaged_heads else None,prefactor=prefactor,local_scale=bundle['local_geometry_scale'],
@@ -342,6 +383,8 @@ if __name__=='__main__':
                      averaged_compensated_cartesian=check_breit_group(runtime,circular=False,compensated=True,averaged_heads=True),
                      embedded_compensated_circular=check_breit_group(runtime,compensated=True,averaged_heads=True,embedded_gamma=True),
                      embedded_compensated_cartesian=check_breit_group(runtime,circular=False,compensated=True,averaged_heads=True,embedded_gamma=True),
+                     slab_compensated_circular=check_breit_group(runtime,compensated=True,averaged_heads=True,embedded_gamma=True,sys_dim=2),
+                     slab_compensated_cartesian=check_breit_group(runtime,circular=False,compensated=True,averaged_heads=True,embedded_gamma=True,sys_dim=2),
                      scope='Synthetic provider/group/kernel/units/layout proof with independent Cartesian smooth-neutral onsite crosses; no reconstructed-current stage or Breit GW admission.')
         if jax.process_index()==0:
             print(json.dumps(results),flush=True)

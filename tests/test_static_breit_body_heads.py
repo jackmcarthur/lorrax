@@ -3,7 +3,7 @@ import copy
 import numpy as np
 import pytest
 
-def physical_head_fixture(*,near_ties=False,embedded_gamma=False):
+def physical_head_fixture(*,near_ties=False,embedded_gamma=False,sys_dim=3):
     from vcoul import CoulombGeometry,get_kernel,head_slot_table,v_qG_table
     from vcoul.minibz import build_v_head_miniBZ_fn_3d
     from isdf.atomic_breit import static_breit_body_head_slots
@@ -12,12 +12,14 @@ def physical_head_fixture(*,near_ties=False,embedded_gamma=False):
     geometry=CoulombGeometry(bvec=bvec,cell_volume=volume)
     q=np.asarray([[0,0,0],[.5,0,0],[.5,.5,0]],float)
     base=np.asarray([[0,0,0],[-1,0,0],[0,-1,0],[-1,-1,0],[1,0,0],[0,1,0],[0,0,1]],np.int32)
+    if sys_dim==2:base[-1]=[0,0,4]  # Resolved neutral remainder, not only small-K Taylor terms.
     G=np.broadcast_to(base.T,(3,3,7)).copy();counts=np.asarray([7,5,6],np.int32)
     for i,n in enumerate(counts):G[i,:,n:]=0  # Inert padding deliberately mimics a head tie.
     K=(G.transpose(0,2,1)+q[:,None])@bvec
-    active=np.arange(7)[None]<counts[:,None];cutoff=2.
+    active=np.arange(7)[None]<counts[:,None];cutoff=8. if sys_dim==2 else 2.
     body=active&(np.einsum('qgi,qgi->qg',K,K)<=cutoff)
-    callback=build_v_head_miniBZ_fn_3d((6,6,6),bvec,volume,nmc=512,seed=42)
+    callback=(build_v_head_miniBZ_fn_3d((6,6,6),bvec,volume,nmc=512,seed=42)
+              if sys_dim==3 else None)
     gamma=None
     if embedded_gamma:
         import hashlib,json
@@ -25,20 +27,20 @@ def physical_head_fixture(*,near_ties=False,embedded_gamma=False):
         import gw.v_q_bispinor as owner
         from vcoul import COULOMB_GAUGE_TT_SIGN
         tensor=COULOMB_GAUGE_TT_SIGN*owner._tt_head_tensor(
-            bvec=bvec,cell_volume=volume,sys_dim=3,kgrid=(6,6,6))/volume
-        gamma=dict(cartesian_ry=tensor,kgrid=np.asarray([6,6,6],np.int32),
+            bvec=bvec,cell_volume=volume,sys_dim=sys_dim,kgrid=(6,6,6) if sys_dim==3 else (6,6,1))/volume
+        gamma=dict(cartesian_ry=tensor,kgrid=np.asarray([6,6,6] if sys_dim==3 else [6,6,1],np.int32),
             source_receipt=json.dumps(dict(owner='gw.v_q_bispinor._tt_head_tensor',
                 owner_sha256=hashlib.sha256(Path(owner.__file__).read_bytes()).hexdigest(),
                 head_rule=owner.V_QMUNU_HEAD_RULE,analytic_sphere=True,
                 units='signed_physical_cartesian_Ry'),sort_keys=True))
     policy=static_breit_body_head_slots(q_frac=q,gvec_components=G,ngk_per_q=counts,
-        geometry=geometry,vcoul_cutoff_ry=cutoff,v_head_fn=callback,gamma_head=gamma)
+        geometry=geometry,vcoul_cutoff_ry=cutoff,v_head_fn=callback,gamma_head=gamma,sys_dim=sys_dim)
     averaged=np.zeros((3,7));bare=np.zeros_like(averaged);tables=[]
     for i,n in enumerate(counts):
         args=dict(geometry=geometry,vcoul_cutoff_ry=cutoff)
-        averaged[i,:n]=v_qG_table(get_kernel(3),q[i:i+1],G[i:i+1,:,:n],v_head_fn=callback,**args)[0]
-        bare[i,:n]=v_qG_table(get_kernel(3),q[i:i+1],G[i:i+1,:,:n],**args)[0]
-        tables.append(head_slot_table(get_kernel(3),q[i:i+1],G[i:i+1,:,:n],v_head_fn=callback,**args))
+        averaged[i,:n]=v_qG_table(get_kernel(sys_dim),q[i:i+1],G[i:i+1,:,:n],v_head_fn=callback,**args)[0]
+        bare[i,:n]=v_qG_table(get_kernel(sys_dim),q[i:i+1],G[i:i+1,:,:n],**args)[0]
+        tables.append(head_slot_table(get_kernel(sys_dim),q[i:i+1],G[i:i+1,:,:n],v_head_fn=callback,**args))
     return dict(policy=policy,q=q,G=G,K=K,counts=counts,volume=volume,
         geometry=geometry,active=active,body=body,averaged=averaged,bare=bare,tables=tables,callback=callback,
         gamma=gamma)
