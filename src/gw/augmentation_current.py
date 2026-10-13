@@ -17,6 +17,23 @@ class DeferredCurrentRequest:
     request: dict
 
 
+def physical_current_writer_workspace(*, q_logical, q_carrier, mu_packed,
+                                      mu_canonical, g_tile, shards):
+    """Physical output plus canonical-axis transport, priced before stores.
+
+    Three emitted current tiles coexist, but the canonical writer transports
+    only one channel at a time. The same shape price is used by planning and
+    by the live writer; it excludes the current contraction's other leaves.
+    """
+    from runtime.padding import padded_axis
+    emitted = 16 * q_carrier * mu_packed * g_tile / shards
+    split = padded_axis(max(q_logical, g_tile), shards,
+                        name='current writer transport split').carrier
+    canonical = 16 * split * min(q_logical, g_tile) * max(mu_packed, mu_canonical) / shards
+    return dict(emitted_tile=emitted, canonical_transport_tile=canonical,
+                device_extra=3 * emitted + 5 * canonical, host_pending=canonical)
+
+
 def live_device_bytes(*objects):
     """Count unique addressable device leaves, excluding donated buffers."""
     import jax

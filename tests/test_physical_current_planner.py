@@ -78,6 +78,29 @@ def test_actual_retained_extra_can_refuse_before_any_quote_or_store(monkeypatch)
     assert called == []
 
 
+def test_actual_writer_transport_cannot_exceed_the_selected_contraction_tile(monkeypatch):
+    from gw.isdf_augmentation import _current_contract_workspace_bytes
+    from gw.augmentation_current import physical_current_writer_workspace
+    model, args = case(monkeypatch)
+    def contraction(tile):
+        return _current_contract_workspace_bytes(qpad=16,mu=4272,atoms=8,
+            harmonics=64,radial_points=256,g_tile=tile,shards=16,
+            solved_half_banks=True,physical_three_banks=True)
+    def complete(tile):
+        terms = contraction(tile)
+        writer = physical_current_writer_workspace(q_logical=9,q_carrier=16,
+            mu_packed=4272,mu_canonical=4264,g_tile=tile,shards=16)
+        terms['writer'] = writer['device_extra']
+        terms['total'] += terms['writer']
+        return terms
+    old = model.plan_zeta_route_g(**args, **account(contraction, extra=1e9))
+    new = model.plan_zeta_route_g(**args, **account(complete, extra=1e9))
+    shared = old.hwm_bytes - contraction(old.g_tile)['total']
+    assert shared + complete(old.g_tile)['total'] > old.target_bytes
+    assert shared + complete(new.g_tile)['total'] <= new.target_bytes
+    assert new.g_tile < old.g_tile
+
+
 def test_minimum_contraction_can_refuse_before_store(monkeypatch):
     model, args = case(monkeypatch)
     with pytest.raises(ValueError, match='minimum contraction residency'):

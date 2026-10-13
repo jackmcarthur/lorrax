@@ -2240,28 +2240,19 @@ def _price_current_physical_writer(zeta, state):
     This bounds array payload, not allocator peaks or the HDF5 library's RSS.
     """
     from common.gpu_utils import device_budget_bytes, host_bytes_per_process, warn_over_budget
+    from .augmentation_current import physical_current_writer_workspace
     st = zeta.store
-    shards = int(zeta.mesh.size)
-    emitted = 16*st.Q_pad*st.mu_pad*st.g_tile/shards
-    canonical_mu = max(st.mu_pad, getattr(zeta.mu_basis, 'n_canonical', st.mu_pad))
-    # The existing canonical-axis permutation temporarily pads its largest
-    # non-mu axis to the mesh product and performs two all-to-all exchanges.
-    split = max(st.Q, st.g_tile)
-    padded_split = ((split+shards-1)//shards)*shards
-    canonical = 16*padded_split*min(st.Q, st.g_tile)*canonical_mu/shards
-    # Mu-owner output plus conservative pad/exchange/gather/exchange scratch;
-    # only one channel enters this transport while all three outputs live.
-    device_extra = 3*emitted+5*canonical
-    device_price = state['phase_prices']['contraction']+device_extra
+    workspace = physical_current_writer_workspace(q_logical=st.Q, q_carrier=st.Q_pad,
+        mu_packed=st.mu_pad, mu_canonical=getattr(zeta.mu_basis, 'n_canonical', st.mu_pad),
+        g_tile=st.g_tile, shards=int(zeta.mesh.size))
+    device_price = state['phase_prices']['contraction']+workspace['device_extra']
     budget = float(device_budget_bytes())
     if device_price > budget:
         warn_over_budget('current physical writer', device_price, budget)
         raise ValueError('physical current writer exceeds its device budget')
-    if canonical > host_bytes_per_process():
+    if workspace['host_pending'] > host_bytes_per_process():
         raise ValueError('physical current writer exceeds available host staging budget')
-    state['physical_writer_bytes_per_rank'] = dict(
-        emitted_tile=emitted, canonical_transport_tile=canonical,
-        device_extra=device_extra, host_pending=canonical, total_device=device_price)
+    state['physical_writer_bytes_per_rank'] = dict(workspace, total_device=device_price)
 
 
 def _open_current_physical_writers(stack, zetas, *, wfn, meta, zeta_cutoff, mesh):
@@ -2530,9 +2521,21 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	    from .isdf_augmentation import _current_contract_workspace_bytes
 	    cs = _current_augmentation
 	    if cs.get('early_physical_support') is not None:
+	        from .augmentation_current import physical_current_writer_workspace
 	        qpad = int(cs['qpad'])
 	        mu = int(cs['plan'].n_centroid_packed)
 	        geometry = (len(cs['centers_cart']),len(cs['lm']),len(cs['radius']))
+	        def current_workspace(gt):
+	            terms = _current_contract_workspace_bytes(qpad=qpad,mu=mu,
+	                atoms=geometry[0],harmonics=geometry[1],radial_points=geometry[2],
+	                g_tile=gt,shards=mesh_xy.size,solved_half_banks=True,physical_three_banks=True)
+	            writer = physical_current_writer_workspace(q_logical=len(cs['q_full_indices']),
+	                q_carrier=qpad,mu_packed=mu,
+	                mu_canonical=getattr(_meta_T.mu_basis,'n_canonical',mu),
+	                g_tile=gt,shards=mesh_xy.size)
+	            terms['physical_writer_transport'] = writer['device_extra']
+	            terms['total'] += writer['device_extra']
+	            return terms
 	        old = _chunks_T
 	        _chunks_T = _plan_route_g_for_channel(meta=_meta_T,cfg=cfg,
 	            band_slices=band_slices,mesh_xy=mesh_xy,n_q_selected=len(cs['q_full_indices']),
@@ -2540,9 +2543,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	            psi_ngkmax=int(wfn.ngkmax),psi_cylinder=_route_g_cylinder(wfn,_meta_T),
 	            n_vertex=3,print_fn=print_fn,current_local_geometry=geometry,
 	            current_local_resident_bytes=float(cs['fit_resident_extra_bytes_per_rank']),
-	            current_local_workspace=lambda gt: _current_contract_workspace_bytes(
-	                qpad=qpad,mu=mu,atoms=geometry[0],harmonics=geometry[1],radial_points=geometry[2],
-	                g_tile=gt,shards=mesh_xy.size,solved_half_banks=True,physical_three_banks=True))
+	            current_local_workspace=current_workspace)
 	        _chunks_T['k_unfold_plan'] = old['k_unfold_plan']
 	transverse_wfn_data = None
 	if uses_transverse_interaction(cfg) and getattr(cfg.paths, "centroids_file_current", None):
