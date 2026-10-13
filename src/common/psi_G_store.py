@@ -1016,7 +1016,12 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
             def one_tile(args):
                 r, w = args                                   # (mu_t, 3), (mu_t,)
                 if coordinate_kind == 'fractional':
-                    frac = jnp.einsum('gi,mi->gm', Gk.astype(jnp.float64), r)
+                    # The typed points retain their lattice images. Signed
+                    # integer G is periodic, but the Bloch factor below must
+                    # use the original r, including its lattice translation.
+                    periodic_r = r - jnp.floor(r)
+                    periodic_r = jnp.where(periodic_r == 1., 0., periodic_r)
+                    frac = jnp.einsum('gi,mi->gm', Gk.astype(jnp.float64), periodic_r)
                     E = jnp.where(vk[:, None], jnp.exp(2j * jnp.pi * frac), 0)
                     bloch = jnp.exp(2j * jnp.pi * jnp.sum(
                         kv[None, :] * r, axis=-1)) * w * inv_sqrt_n
@@ -1165,9 +1170,16 @@ def load_parent_psi_G(
             cidx_np = np.asarray(mu_basis.packed_indices, np.float64)
             mu_active_mask = np.asarray(mu_basis.active_mask, bool)
             n_rmu = len(cidx_np)
-            if (not np.isfinite(cidx_np).all()
-                    or np.any(cidx_np[mu_active_mask] < 0)
-                    or np.any(cidx_np[mu_active_mask] >= 1)):
+            if not np.isfinite(cidx_np).all():
+                raise ValueError('fractional sample coordinates require finite lattice images')
+            # load_centroids deliberately preserves lattice images and typed
+            # centroid identities. Validate the internal periodic Fourier
+            # chart without changing either those points or their Bloch phase.
+            periodic_cidx = cidx_np - np.floor(cidx_np)
+            periodic_cidx[periodic_cidx == 1.] = 0.
+            if (not np.isfinite(periodic_cidx).all()
+                    or np.any(periodic_cidx[mu_active_mask] < 0)
+                    or np.any(periodic_cidx[mu_active_mask] >= 1)):
                 raise ValueError('fractional sample coordinates require a finite unit-cell chart')
             raw_G = np.asarray(loader.gvecs(k=k_spec))
             if (raw_G.shape != (nk, int(loader.ngkmax), 3)
