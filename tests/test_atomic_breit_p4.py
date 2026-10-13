@@ -21,7 +21,8 @@ def forbid_stored_zeta_reads(zetas):
 def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
                       angular_maximum=2,field_tile=3,centroid_tile=3,compensated=False,averaged_heads=False,
                       embedded_gamma=False, publication_fixture=None,
-                      mu_basis=None, canonical_to_packed_reference=None,sys_dim=3):
+                      mu_basis=None, canonical_to_packed_reference=None,sys_dim=3,
+                      streamed_coefficients=False):
     import numpy as np
     import jax
     import jax.numpy as jnp
@@ -348,8 +349,41 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         z.local_augmentation=dict(p,rhs=put(zero_rhs))
     zero=tuple(np.asarray(gather_to_host(v)) for v in contract_v_group(zetas,pairs,v_tables,keep=keep))
     assert all(np.array_equal(a,b) for a,b in zip(zero,baseline))
-    for z in zetas:z.close()
+    if not streamed_coefficients:
+        for z in zetas:z.close()
+    streamed_error = None
+    streamed_aot = None
+    if streamed_coefficients:
+        if not compensated:
+            raise ValueError('streamed fixture requires delta and PS together')
+        from isdf.current_coefficients import CurrentCoefficientStream
+        for c,z in enumerate(zetas,1):
+            z.fit_vertex_mu_L=c
+            z.fit_augmentation_identity='matched_static_current_fixture'
+            z.fit_current_angular_support_identity=f'complete_L{angular_maximum}_fixture'
+            z.fit_q_full_indices=np.arange(Q,dtype=np.int32)
+        stream=CurrentCoefficientStream(zetas,atoms=na,harmonics=nh,
+            radial_points=nr,radial_packet=4,identity='matched_static_current_fixture',
+            angular_identity=f'complete_L{angular_maximum}_fixture')
+        for r0 in range(0,nr,4):
+            for c in range(3):
+                for kind,physical in enumerate((coefficients[c],ps_coefficients[c])):
+                    packet=physical[...,r0:r0+4].reshape(Qp,mu,-1)
+                    rhs=np.einsum('qmn,qnf->qmf',factors[c],packet)
+                    stream.append(c,kind,put(rhs),r0)
+        banks=stream.finish()
+        arguments=dict(provider_args);arguments.pop('smooth_rhs')
+        supplied=radial_breit_providers(zetas,banks,**arguments)
+        for z,p in zip(zetas,supplied):z.local_augmentation=p
+        result=contract_v_group(zetas,pairs,v_tables,keep=keep)
+        streamed_error=max(float(np.max(abs(gather_to_host(value)-reference)))
+            for value,reference in zip(result,host))
+        assert streamed_error<2e-11,streamed_error
+        streamed_aot=dict(memory=stream.memory_receipt,quotes=stream.aot_quotes)
+        for z in zetas:z.close()
+        assert banks._banks is None
     return dict(sys_dim=sys_dim,circular=circular,compensated=compensated,averaged_heads=averaged_heads,embedded_gamma=embedded_gamma,
+        streamed_vs_incumbent_max_abs=streamed_error,streamed_solve_store_AOT=streamed_aot,
         completion_term_signals=([max(float(np.max(abs(v[t]))) for v in completion_terms) for t in range(3)] if sys_dim==2 else None),
         individually_omitted_completion_final_errors=omission_errors,
         gamma_neutral_representation_error=bundle.get('gamma_neutral_representation_error'),

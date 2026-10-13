@@ -202,26 +202,61 @@ memory planning, not physical payload admission. The focused P4 oracle
 checks that planned and loaded actions are bit identical, including an
 interleaved packed centroid mask.
 
-## Guarded Slab three-current provider
+## Physical Slab three-current completion
 
-The low-level `isdf.atomic_breit` provider accepts an explicit `sys_dim=2`
-body-head policy. Its separate schema binds the public Slab2D orientation,
-truncation half-height, physical q/G slots, cutoff, tie policy and actual
-current Gamma tensor. The default bulk policy and bare local reference stay
-unchanged. A Slab provider requires all three compensated current channels;
-this internal capability does not admit compact transverse GW.
+The current source is the same authenticated full-WFN reconstruction and
+band rotation as charge. Its three normal equations use the actual current
+bilinears and their own factors, with unit endpoint loss; scalar charge
+conditioning and occupied-band loss weights do not alter these factors.
+The scalar Coulomb-only flow does not prepare current samples or local banks.
 
-Let `t = Z + g` and `n = delta - g`. The grouped contraction uses the public
-Slab target body for `t`, then adds `n† DeltaD n`, `t† DeltaD n` and
-`n† DeltaD t`, where `DeltaD` is that target minus the public **bulk point
-body** on the same finite reciprocal set. The reference has no averaged
-bulk head. The result is exactly the finite physical-current Slab body plus
-the existing infinite bulk local term minus its finite bulk `nn/tn/nt`
-part. Physical current zeta output remains `Z + delta`. The represented
-`delta(0) = g(0)` equality is measured before using the Gamma completion.
+The physical Slab route automatically checks the complete smooth-current
+reciprocal support against the actual q-aware body cutoff and FFT extent.
+It also certifies every atom pair and periodic half-cell shifted plane,
+using the actual centers, per-atom support and public Slab orientation.
+For neutral two-moment `n = delta - g`, these layer conditions identify the
+infinite local Slab remainder with the existing bulk local remainder.
+The passed current tables must equal the public **point Slab** kernel on
+all addressed slots, including finite-q heads, masks and Gamma. Averaged
+heads are refused by this specialization; a head flag alone is not proof.
+Provider disjoint-sphere and measured `delta(0) = g(0)` guards still apply.
 
-This is a defined finite-body/infinite-local hybrid, not a certificate for
-the continuum Slab current kernel. Full-radial actual-current energy,
-angular extent, reciprocal-tail and fitting errors must still be checked.
-The callback's workspace estimate is not an AOT peak-memory admission.
-Existing compact-current, screened-current and vector-Hartree guards remain.
+The reciprocal mixed body uses the physical current `Z + delta`. Its local
+bulk addition is `delta† B delta - g† B g` over the infinite local reference.
+There are no additional NN/GN/NG packets in this physical specialization.
+The global compensation energy above the reciprocal body cutoff remains
+an explicit tail requiring an occupied-block stopping bound. The layer
+certificate alone does not certify that tail, current angular convergence,
+fitting error, the continuum Slab limit, or a meV-accurate self-energy.
+Physical current zeta output remains `Z + delta`, and downstream GW uses
+the existing current samples and Coulomb tensor interfaces.
+
+## Charge-first current coefficient storage
+
+Atomic current normal sources are deferred until the charge RHS is consumed
+and the actual charge zeta closes. The protected corrected pseudo source and
+rotated atomic coefficients retain the same physical source and frame.
+The ordinary current fits create their canonical OWN3 factors first; each
+subsequent radial packet uses those exact leaves and donates its result into
+three final delta banks. No full raw current cloud or paired concatenation
+coexists with the final banks. The separate six-bank delta/pseudo route
+remains available for the established low-level comparison and bulk policy.
+
+`CurrentCoefficientBanks` authenticates the actual fit objects, factor
+leaves, source/angular identities, ordered q rows and centroid basis.
+It requires complete nonoverlapping radial coverage and explicitly releases
+its arrays when the current fit closes. The point/layer/kernel preflight runs
+before reconstruction or fitting. The internal planner reserves actual
+protected state during the PW fit and final banks during contraction, then
+chooses a bounded G tile before creating the store. No input overrides it.
+Sampler, solve/store and actual moment/Fourier/onsite/physical-writer AOT
+checks precede final-bank allocation; the store must alias its complete
+bank and accept only the quoted packet width. A compiler/lifetime estimate
+is separate from a measured production peak.
+
+The generated Coulomb tensor receipt stores the live current operator
+contract and its canonical digest, binding the source WFN, full physical
+frame, current point chart, q/body/basis and angular policy. This identity
+contains no Hartree occupation or GW approximation. The paired Hartree
+consumer authenticates its own physical occupied source against it.
+Scalar charge mean conventions and default bulk kernel policies are unchanged.

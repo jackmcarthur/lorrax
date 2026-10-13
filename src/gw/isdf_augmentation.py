@@ -1105,19 +1105,13 @@ def _rhs_storage_kernels(mesh, q_indices, qpad, na, nh, nr, rp, feature_count):
     from jax import shard_map
 
     fs, qs = P(None,'x','y'), P(('x','y'),None,None)
-    z0 = jnp.int32(0)
     index = _put(np.asarray(q_indices, np.int32), mesh, P())
     def select(z, ids):
         z = jnp.take(z, ids, axis=0)
         return jnp.pad(z, ((0,qpad-len(q_indices)),(0,0),(0,0)))
     select = jax.jit(shard_map(select, mesh=mesh, in_specs=(fs,P()), out_specs=fs, check_vma=False))
-    def store(out, packet, r0):
-        values = packet[...,:feature_count].reshape(packet.shape[0],packet.shape[1],na,nh,rp)
-        view = out.reshape(out.shape[0],out.shape[1],na,nh,nr)
-        view = jax.lax.dynamic_update_slice(view, values, (z0,z0,z0,z0,r0))
-        return view.reshape(out.shape)
-    store = jax.jit(shard_map(store, mesh=mesh, in_specs=(qs,qs,P()), out_specs=qs,
-                             check_vma=False), donate_argnums=(0,))
+    from isdf.current_coefficients import radial_packet_store
+    store = radial_packet_store(mesh, na, nh, nr, rp, feature_count)
     return lambda z: select(z,index), store
 
 
@@ -1428,6 +1422,10 @@ def _current_augmentation_request(request, *, wfn, meta, plan, sym, public_range
     from symmetry_maps import select_current_basis
     if request is None:
         return None
+    from .augmentation_current import DeferredCurrentRequest
+    deferred = isinstance(request, DeferredCurrentRequest)
+    if deferred:
+        request = request.request
     required = {'meta','plan','centroid_indices','band_range_left','band_range_right',
                 'current_basis_rows','q_full_indices'}
     if not isinstance(request,dict) or set(request) != required:
@@ -1479,13 +1477,54 @@ def _current_augmentation_request(request, *, wfn, meta, plan, sym, public_range
             or len(np.unique(qrows)) != len(qrows)
             or np.any(qrows < 0) or np.any(qrows >= int(meta.nk_tot))):
         raise ValueError('current augmentation requires unique canonical full-q rows')
-    return dict(meta=mt,plan=pt,points=points,coordinate_kind=kind,band_range_left=left,
+    result = dict(meta=mt,plan=pt,points=points,coordinate_kind=kind,band_range_left=left,
                 band_range_right=right,current_basis_rows=rows,vertex_terms=terms,
                 q_full_indices=np.asarray(qrows,dtype=np.int32))
+    if deferred:
+        result['deferred_request'] = True
+    return result
+
+
+def _preflight_compact_current_body(wfn, cfg, state, *, centers_cart, support_radius):
+    """Actual point/body/source/layer checks before radial RHS or fit allocation."""
+    from common.coulomb_sphere import compute_per_q_bare_coulomb_components
+    from vcoul import CoulombGeometry, COULOMB_GAUGE_TT_SIGN
+    from symmetry_maps import bgw_integer_q_to_fractional
+    from gw.gw_init import _vcoul_bvec_and_cutoff
+    from gw.v_q_g_flat import v_head_fn_in_V
+    from gw.v_q_bispinor import _make_per_q_v_builder_for_tile
+    from isdf.atomic_breit import static_breit_body_head_slots
+    from isdf.current_support import preflight_physical_current_support
+    if int(state['meta'].sys_dim) != 2:
+        raise ValueError('paired compact current physical completion requires Slab2D')
+    bvec,cutoff=_vcoul_bvec_and_cutoff(cfg,wfn)
+    geometry=CoulombGeometry.from_wfn(wfn)
+    qfrac=bgw_integer_q_to_fractional(np.asarray(state['plan'].sym.kvecs_asints)[state['q_full_indices']],wfn.kgrid)
+    sphere=compute_per_q_bare_coulomb_components(tuple(wfn.fft_grid),bvec,qfrac,cutoff,sys_dim=2)
+    G=np.asarray(sphere['gvec_components_padded']);counts=np.asarray(sphere['ngk_per_q'])
+    head=v_head_fn_in_V(mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
+        sys_dim=2,kgrid=wfn.kgrid,bvec=bvec,cell_volume=wfn.cell_volume)
+    policy=static_breit_body_head_slots(q_frac=qfrac,gvec_components=G,ngk_per_q=counts,
+        geometry=geometry,vcoul_cutoff_ry=cutoff,v_head_fn=head,gamma_head=None,sys_dim=2)
+    rows=state['current_basis_rows'];basis=np.eye(3,dtype=complex) if rows is None else np.asarray(rows)
+    pairs=tuple((a,b) for a in range(3) for b in range(a,3));tables=[]
+    for a,b in pairs:
+        build=_make_per_q_v_builder_for_tile(bvec=bvec,cell_volume=wfn.cell_volume,sys_dim=2,
+            vcoul_cutoff_ry=cutoff,bdot=None,v_head_fn=head,mu_L=a+1,nu_L=b+1,
+            tt_head_correction=False,current_U=rows)
+        table=np.zeros((len(qfrac),G.shape[-1]),complex)
+        for qi,n in enumerate(counts):
+            for first in range(0,int(n),512):
+                last=min(first+512,int(n));table[qi,first:last]=build(qfrac[qi:qi+1],G[qi:qi+1,:,first:last])[0]
+        tables.append(table)
+    proof=preflight_physical_current_support(wfn,state['plan'],state['q_full_indices'],policy,
+        centers_cart=centers_cart,support_radius=support_radius,pairs=pairs,v_tables=tuple(tables),
+        current_basis_rows=basis,prefactor=float(COULOMB_GAUGE_TT_SIGN)*8*np.pi/wfn.cell_volume)
+    return proof
 
 
 def _current_contract_workspace_bytes(*, qpad, mu, atoms, harmonics, radial_points,
-                                      g_tile, shards):
+                                      g_tile, shards, solved_half_banks=False, physical_three_banks=False):
     """Bound the separate q-owned current contraction phase, not point work.
 
     The paired raw and solved operands remain resident. One channel's LU
@@ -1504,10 +1543,10 @@ def _current_contract_workspace_bytes(*, qpad, mu, atoms, harmonics, radial_poin
     degree = int(np.sqrt(nh))
     # Three q-owned input pairs plus three solved pairs; one paired solve
     # transient is separate. Bounded field gathers never retain half-clouds.
-    paired_operands = 12*cloud
+    paired_operands = (3 if physical_three_banks else (6 if solved_half_banks else 12))*cloud
     # The canonical signed LU solve owns two paired working RHS banks and
     # its factor/layout workspace in addition to input and solved outputs.
-    solve_scratch = 4*cloud+2*matrix
+    solve_scratch = 0. if solved_half_banks else 4*cloud+2*matrix
     moments = 3*moment
     moment_scratch = 2*moments+2*radial_row
     # Six existing V accumulators, six logical correction outputs and the
@@ -1787,7 +1826,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     if current is not None and overlap_mode != 'full_wfn_lowdin':
         raise ValueError('current augmentation requires the actual served full150 physical overlap')
     if compact is not None and current is not None:
-        raise ValueError('compact common-frame preparation currently admits charge operands only')
+        if (compact['carrier'] != 'normalized_rkb' or not current.get('deferred_request')
+                or compact['binding']['field_policy'] != 'paired_ae_large_preserved_free_graph'):
+            raise ValueError('compact current requires the same AE-large normalized RKB frame and deferred OWN3 source')
     if current is not None and 'interpolation_degree' not in artifact['radial']:
         raise ValueError('current augmentation requires the explicit physical density interpolant')
     cached_coefficients = (artifact.get('raw_parent_moments') or {}).get('atom_C')
@@ -1799,6 +1840,12 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     lattice = float(wfn.alat)*np.asarray(wfn.avec, dtype=np.float64)
     centers = np.asarray(wfn.atom_crys, dtype=np.float64)%1.
     atom_types = np.asarray(wfn.atom_types, dtype=int)
+    if compact is not None and current is not None:
+        current['early_physical_support'] = _preflight_compact_current_body(wfn,cfg,current,
+            centers_cart=centers@lattice,support_radius=float(artifact['radial']['support_radius']))
+        current['physical_source_wfn_identity'] = dict(artifact['public_source_identity'])
+        current['compact_target_binding'] = compact['binding']
+        current['wfn'] = wfn
     from symmetry_maps import atomic_point_lookup_budget
     if centers.shape != (len(atom_types),3) or not set(atom_types).issubset(artifact['tables']):
         raise ValueError("augmentation manifest does not authenticate every WFN atomic species")
@@ -1993,7 +2040,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         # current source/faces. Factor/paired solves and V/Fourier scratch
         # run only after point/quarter/angular workspaces have been released.
         # Their separately authenticated phases are priced before fit/attach.
-        current_price = (6*craw+4*16*npar*nb*4*cmu/Ptot+source_bytes
+        current_price = ((source_bytes if current.get('deferred_request') else 6*craw)
+            +4*16*npar*nb*4*cmu/Ptot+source_bytes
             +max(0.,cw['total']-point_workspace['total'])+current_angular_extra
             +max(0.,32*pc*phase_g*cmu-phase_bytes)+max(0.,16*pc*bc*4*cmu-dft_tile))
         current.update(qpad=cpad,qneg=cqneg,indexed_q=cindexed,workspace=cw,raw_rhs_bytes=craw,
@@ -2027,7 +2075,8 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             shared_charge_persistent=shared_persistent,
             protected_current_operands=current_persistent,
             released_packet_workspaces=packet_transients),
-            fit_resident_extra_bytes_per_rank=shared_persistent+current_persistent+6*craw)
+            fit_resident_extra_bytes_per_rank=shared_persistent+current_persistent
+                +(source_bytes if current.get('deferred_request') else 6*craw))
     budget = float(device_budget_bytes())
     if price > budget:
         warn_over_budget('isdf.augmentation',price,budget)
@@ -2266,8 +2315,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         current['same_point_faces_preserved'] = same_points
         current['weight_l'],current['weight_r']=fitting_band_weights(nb,current['band_range_left'],current['band_range_right'])
         cshape=(current['qpad'],int(cpplan.n_centroid_packed),na*len(current['lm'])*nr)
-        current['rhs']=[jnp.zeros(cshape,jnp.complex128,device=NamedSharding(mesh_xy,qs)) for _ in range(3)]
-        current['smooth_rhs']=[jnp.zeros(cshape,jnp.complex128,device=NamedSharding(mesh_xy,qs)) for _ in range(3)]
+        if not current.get('deferred_request'):
+            current['rhs']=[jnp.zeros(cshape,jnp.complex128,device=NamedSharding(mesh_xy,qs)) for _ in range(3)]
+            current['smooth_rhs']=[jnp.zeros(cshape,jnp.complex128,device=NamedSharding(mesh_xy,qs)) for _ in range(3)]
         current['selector']=current['store_rhs']=current['compressor']=None
     norm_source,norm_local = _orbital_norm_kernels(mesh_xy)
     smooth_norm = norm_source(smooth)
@@ -2364,7 +2414,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             # Only compressed charge operands survive into the current
             # scans. The exact same AE/PS right faces serve every channel.
             del local, packet
-            if current is not None:
+            if current is not None and not current.get('deferred_request'):
                 if current['selector'] is None:
                     cids=current['q_full_indices'] if current['indexed_q'] is None else np.arange(len(current['q_full_indices']))
                     current_nh = len(current['lm'])
@@ -2408,6 +2458,13 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         from isdf.atomic_hartree import charge_hartree_operator_contract
         state.update(sys_dim=2, hartree_operator_contract=charge_hartree_operator_contract(wfn, sys_dim=2))
     if current is not None:
+        if current.get('deferred_request'):
+            from .augmentation_current import DeferredCurrentDensity
+            parameters = dict(centers=centers,lattice=lattice,caches=caches,atom_types=atom_types,
+                kfrac=kfrac,scale=scale,wavevectors=wavevectors,directions=directions,
+                angular_projection=current_Y.conj()*angles_w,atomic_lookup=atomic_lookup,
+                parent_chunk=pc,band_chunk=bc,radial_packet=rp,g_block=gblock,
+                weight_l=current['weight_l'],weight_r=current['weight_r'])
         for key in ('selector','store_rhs','compressor','weight_l','weight_r'):
             del current[key]
         current.update(radius=radius,weights_dr=weights,centers_cart=centers@lattice,
@@ -2421,6 +2478,19 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                        if key in artifact['radial']})
         if overlap_receipt is not None:
             current['overlap_receipt']=overlap_receipt
+        if compact is not None:
+            current['endpoint_source_binding'] = dict(
+                augmentation_identity=artifact['identity'],physical_bands=int(wfn.nbands),
+                source_frame_policy=compact['binding']['source_frame_policy'],
+                fft_grid=list(map(int,meta.fft_grid)),cell_volume=float(meta.cell_volume),
+                FILE_parent_rows=np.asarray(plan.parent_full_rows,int).tolist(),
+                FILE_parent_k_fractional=np.asarray(plan.k_parent_frac,float).tolist(),
+                **artifact['public_source_identity'],
+                **_physical_full_wfn_frame_binding(overlap_receipt['inverse_sqrt'],int(wfn.nbands)))
+        if current.pop('deferred_request',False):
+            current['deferred_rhs'] = DeferredCurrentDensity(current,state,
+                source=_preserve_for_donating_fit(smooth),coefficients=coefficients,
+                parameters=parameters)
         state['current']=current
     state['local_rhs_workspace_bytes_per_rank'] = point_workspace
     state['atomic_point_lookup'] = dict(budget=atomic_lookup,
@@ -2570,6 +2640,121 @@ def attach_local_augmentation(zeta_g, state, *, body_contract=None):
     return zeta_g
 
 
+def _price_current_contraction_aot(channels, state, kg, controls):
+    """Quote the actual local/mixed owners before any final bank allocation.
+
+    Only shape descriptors enter the current coefficient operands. The
+    bounded geometric factors are the same provider's factors; no solve,
+    Fourier tile or tensor contraction is dispatched by this preflight.
+    """
+    import gc
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.gpu_utils import device_budget_bytes, record_stage_price
+    from isdf.atomic_breit import radial_breit_providers
+    from isdf.zeta_mubatch import _pair_tile_kernel
+    from .augmentation_current import live_device_bytes
+
+    z = channels[0]
+    st, mesh = z.store, z.mesh
+    Qp, mu, gt = int(st.Q_pad), int(st.mu_pad), int(st.g_tile)
+    na, nh, nr = len(state['centers_cart']), len(state['lm']), len(state['radius'])
+    nf = na*nh*nr
+    shape = lambda dims,dtype=jnp.complex128,spec=P(('x','y'),None,None): jax.ShapeDtypeStruct(
+        dims,dtype,sharding=NamedSharding(mesh,spec))
+    clouds = tuple(shape((Qp,mu,nf)) for _ in range(3))
+    # Head/layer/source admission has already run through the actual typed
+    # witness. These computational kernels use the bulk onsite factors and
+    # mixed body in both domains; head geometry changes operands, not HLO.
+    providers = radial_breit_providers(channels,clouds,body_metric='mixed_reciprocal',
+        radius=state['radius'],lm=state['lm'],centers_cart=state['centers_cart'],
+        q_plus_G_cart=kg,cell_volume=state['cell_volume'],fft_points=state['fft_points'],
+        support_radius=state['support_radius'],minimum_atom_image_distance=state['minimum_atom_image_distance'],
+        reciprocal_prefactor=-8*np.pi/state['cell_volume'],current_basis_rows=state['current_basis_rows'],
+        **controls)
+    group = providers[0]['group_provider']
+    pairs = tuple((a,b) for a in range(3) for b in range(a,3))
+    moments = tuple(shape((Qp,mu,na*nh*2)) for _ in range(3))
+    quotes = []
+    def quote(name,fn,args):
+        m = fn.lower(*args).compile().memory_analysis()
+        q = dict(owner=name,arguments=int(m.argument_size_in_bytes),outputs=int(m.output_size_in_bytes),
+                 temporary=int(m.temp_size_in_bytes),aliases=int(m.alias_size_in_bytes))
+        q['total_addressed_bytes'] = q['arguments']+q['outputs']+q['temporary']-q['aliases']
+        quotes.append(q)
+    quote('moments',group['prepare_kernel'],(clouds,shape((nh,2,nr),jnp.float64,P())))
+    degree = int(np.sqrt(nh))
+    quote('Fourier',group['fourier_kernel'],(clouds,moments,
+        shape((Qp,degree,gt,nr),jnp.float64,P(('x','y'),None,None,None)),
+        shape((Qp,na,nh,gt),jnp.complex128,P(('x','y'),None,None,None)),
+        shape((Qp,degree,2,gt),jnp.float64,P(('x','y'),None,None,None)),
+        shape((nh,),jnp.int32,P())))
+    quote('onsite',group['onsite_kernel'](pairs),(clouds,moments,*group['onsite_kernel_arguments']))
+    tiles = tuple(shape((Qp,mu,gt)) for _ in range(3))
+    Vs = tuple(shape((Qp,mu,mu)) for _ in pairs)
+    shell = tuple(shape((Qp,mu,1)) for _ in range(3))
+    gpad = ((int(st.g_axis.logical)+gt-1)//gt)*gt
+    quote('mixed_pair_physical_writer',_pair_tile_kernel(mesh,gt,pairs,
+        use_local_augmentation=True,return_physical=True),
+        (tiles,shape((6,Qp,gpad),jnp.complex128,P(None,('x','y'),None)),
+         shape((Qp,),jnp.int32,P(('x','y'))),shape((Qp,1),jnp.int32,P(('x','y'),None)),
+         shape((),jnp.int32,P()),Vs,shell,(tiles,tiles)))
+    deferred = state['deferred_rhs']
+    external = live_device_bytes(state,deferred.source,deferred.coefficients,
+                                 tuple(v.factor for v in channels))
+    bank = 16*Qp*mu*nf/mesh.size
+    moment = 3*16*Qp*mu*na*nh*2/mesh.size
+    matrix = 16*Qp*mu*mu/mesh.size
+    geometry = live_device_bytes(group)
+    resident = external+3*bank+moment+7*matrix+geometry
+    peaks = {}
+    for q in quotes:
+        covered = (3*bank if q['owner']=='moments' else 3*bank+moment
+                   if q['owner'] in ('Fourier','onsite') else 6*matrix)
+        peaks[q['owner']] = resident+max(0,q['total_addressed_bytes']-covered)
+    budget = float(device_budget_bytes())
+    result = dict(scope='Actual local and physical-writer AOT plus live leaves; before final coefficient allocation',
+        quotes=quotes,three_final_banks_bytes=3*bank,actual_extra_leaves_bytes=external,
+        geometric_leaves_bytes=geometry,phase_peaks_bytes=peaks,budget_bytes=budget,
+        planned_peak_bytes=max(peaks.values()))
+    del providers,group
+    gc.collect()
+    if result['planned_peak_bytes']>budget:
+        raise MemoryError('current local/onsite/pair AOT exceeds the device budget before bank allocation')
+    record_stage_price('isdf.current_local_actual_AOT',result['planned_peak_bytes'])
+    return result
+
+
+def _physical_current_operator_contract(channels, state, body_contract, witness):
+    """Describe this live fitted operator without occupation or GW semantics."""
+    from symmetry_maps import verify_centroid_orbit_closure
+    q = body_contract['body_head_slots']
+    plan = state['plan']
+    mu_basis = state['meta'].mu_basis
+    points = np.asarray(mu_basis.canonical_indices)
+    if mu_basis.coordinate_kind != 'fractional':
+        points = points/np.asarray(plan.fft_grid)
+    closure = verify_centroid_orbit_closure(points,plan.spatial_ops,tnp=plan.translations)
+    if not closure.closed:
+        raise ValueError('physical current descriptor requires the actual closed centroid chart')
+    basis = state['current_basis_rows']
+    basis = np.eye(3,dtype=complex) if basis is None else np.asarray(basis)
+    return dict(schema='lorrax.current.physical_Slab_mixed_operator.v1',
+        endpoint_source_binding=state['endpoint_source_binding'],
+        current_geometry_binding=dict(logical_mu=int(state['meta'].n_rmu),centroid_hash=closure.centroid_hash,
+            q_full_indices=np.asarray(state['q_full_indices'],int).tolist(),
+            q_fractional=np.asarray(q['q_frac'],float).tolist(),kgrid=list(state['kgrid']),
+            current_basis_rows_real=basis.real.tolist(),current_basis_rows_imag=basis.imag.tolist(),
+            body_head_identity=q['payload_sha256']),
+        current_angular_support_contract=state['angular_support_contract'],
+        current_angular_support_identity=state['angular_support_identity'],
+        current_factor_convention='three exact canonical OWN signed LU factors; unit endpoint loss',
+        physical_support=witness.descriptor,
+        operator='mixed_reciprocal_point_Slab_plus_bulk_local_infinite_remainder',
+        compensation_tail_qualification='Global compensation high-G tail requires an occupied-block stopping bound; no continuum or Sigma convergence claim')
+
+
 def attach_current_augmentation(zetas, state, *, body_contract):
     """Consume a complete current operand into its OWN three fitted factors.
 
@@ -2586,11 +2771,16 @@ def attach_current_augmentation(zetas, state, *, body_contract):
     if (not isinstance(zetas,dict) or set(zetas)!={1,2,3} or not isinstance(body_contract,dict)
             or set(body_contract)!=required or body_contract['body_head_slots'] is None):
         raise ValueError('current augmentation requires complete OWN3 fits and the canonical body/head contract')
+    from .augmentation_current import DeferredCurrentDensity, live_device_bytes
+    deferred = state.get('deferred_rhs') if isinstance(state,dict) else None
+    raw_operands = (isinstance(state,dict)
+        and isinstance(state.get('rhs'),list) and len(state['rhs'])==3
+        and isinstance(state.get('smooth_rhs'),list) and len(state['smooth_rhs'])==3)
     if (not isinstance(state,dict)
             or state.get('source_frame_policy')!='same_actual_served_four_spinor_full_WFN_Lowdin'
             or state.get('unit_endpoint_loss') is not True
-            or not isinstance(state.get('rhs'),list) or len(state['rhs'])!=3
-            or not isinstance(state.get('smooth_rhs'),list) or len(state['smooth_rhs'])!=3):
+            or not (raw_operands or isinstance(deferred,DeferredCurrentDensity))
+            or raw_operands and deferred is not None):
         raise ValueError('current augmentation requires three prepared unit-loss delta/PS operands')
     angular_identity = _authenticate_current_angular_support(state)
     channels = tuple(zetas[v] for v in (1,2,3))
@@ -2604,11 +2794,23 @@ def attach_current_augmentation(zetas, state, *, body_contract):
                 or z.store.Q!=len(state['q_full_indices'])):
             raise ValueError('current augmentation q/basis/OWN-factor/source binding differs from its fit')
     from common.gpu_utils import device_budget_bytes,warn_over_budget
+    physical = state.get('early_physical_support') is not None
+    witness = None
+    if physical:
+        if deferred is None:
+            raise ValueError('physical current requires charge-first packet replay')
+        from isdf.current_support import certify_smooth_current_support
+        witness = certify_smooth_current_support(state['wfn'],state['plan'],channels,
+            body_contract['body_head_slots'],centers_cart=state['centers_cart'],
+            support_radius=state['support_radius'])
     workspace=_current_contract_workspace_bytes(qpad=channels[0].store.Q_pad,
         mu=channels[0].store.mu_pad,atoms=len(state['centers_cart']),harmonics=len(state['lm']),
-        radial_points=len(state['radius']),g_tile=channels[0].store.g_tile,shards=channels[0].mesh.size)
+        radial_points=len(state['radius']),g_tile=channels[0].store.g_tile,shards=channels[0].mesh.size,
+        solved_half_banks=deferred is not None,physical_three_banks=physical)
     phase=state['phase_prices']
-    contraction_price=(phase['shared_charge_persistent']+phase['protected_current_operands']+workspace['total'])
+    contraction_price = (live_device_bytes(state,tuple(z.factor for z in channels))+workspace['total']
+        if deferred is not None else
+        phase['shared_charge_persistent']+phase['protected_current_operands']+workspace['total'])
     budget=float(device_budget_bytes())
     if contraction_price>budget:
         warn_over_budget('isdf.current_augmentation_contract',contraction_price,budget)
@@ -2620,17 +2822,29 @@ def attach_current_augmentation(zetas, state, *, body_contract):
     gv = np.asarray(channels[0].gvec_components).transpose(0,2,1)
     kg = (gv+qfrac[:,None])@state['reciprocal']
     controls={key:state[key] for key in ('interpolation_degree','quadrature_order','fourier_points') if key in state}
-    providers=radial_breit_providers(channels,state['rhs'],smooth_rhs=state['smooth_rhs'],
-        body_metric='compensated',radius=state['radius'],lm=state['lm'],centers_cart=state['centers_cart'],
+    if physical:
+        state['contraction_actual_AOT'] = _price_current_contraction_aot(channels,state,kg,controls)
+    coefficients = deferred.replay(channels,smooth_support=witness) if deferred is not None else None
+    providers=radial_breit_providers(channels,coefficients if coefficients is not None else state['rhs'],
+        smooth_rhs=None if coefficients is not None else state['smooth_rhs'],
+        body_metric='mixed_reciprocal' if physical else 'compensated',smooth_support=witness,
+        radius=state['radius'],lm=state['lm'],centers_cart=state['centers_cart'],
         q_plus_G_cart=kg,cell_volume=state['cell_volume'],fft_points=state['fft_points'],
         support_radius=state['support_radius'],minimum_atom_image_distance=state['minimum_atom_image_distance'],
         current_basis_rows=state['current_basis_rows'],**body_contract,**controls)
+    if physical:
+        contract = _physical_current_operator_contract(channels,state,body_contract,witness)
+        state['physical_current_operator_contract'] = contract
+        for provider in providers:
+            provider['physical_current_operator_contract'] = contract
     # Concatenation must finish before the six raw operands are released.
     # The subsequent OWN3 solve coexists with six paired clouds, not eighteen.
-    for provider in providers:
-        provider['rhs'].block_until_ready()
+    if coefficients is None:
+        for provider in providers:
+            provider['rhs'].block_until_ready()
     for z,provider in zip(channels,providers):
         provider['identity']=state['identity']
         z.local_augmentation=provider
-    del state['rhs'],state['smooth_rhs']
+    if coefficients is None:
+        del state['rhs'],state['smooth_rhs']
     return zetas

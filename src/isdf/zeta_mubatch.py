@@ -1176,6 +1176,11 @@ class ZetaG:
     def close(self):
         self.store.close()
         self.L_q = self.lu_piv = self.shell = None
+        if isinstance(self.local_augmentation, dict):
+            from isdf.current_coefficients import CurrentCoefficientBanks
+            owner = self.local_augmentation.get('coefficient_owner')
+            if isinstance(owner, CurrentCoefficientBanks):
+                owner.close()
         self.local_augmentation = None
         self.q0_response_rhs = self.q0_response_metadata = self.q0_response = None
         self.q0_response_source_identity = None
@@ -1234,10 +1239,10 @@ def _require_q_owned(array, mesh, shape, *, name):
                          f"sharding {getattr(array,'sharding',None)}")
 
 
-def _local_coefficient_solve(mesh, solver_kind, n_log, q_logical):
+def _local_coefficient_solve(mesh, solver_kind, n_log, q_logical, *, donate_rhs=False):
     """Canonical C solve of local RHS coefficients once, on the q owners."""
     key = ('local_coefficient_solve', _mesh_id(mesh), solver_kind,
-           int(n_log), int(q_logical))
+           int(n_log), int(q_logical), bool(donate_rhs))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
@@ -1253,7 +1258,7 @@ def _local_coefficient_solve(mesh, solver_kind, n_log, q_logical):
         live = rank * int(rhs.shape[0]) + jnp.arange(rhs.shape[0]) < int(q_logical)
         return jnp.where(live[:, None, None], result, 0)
 
-    fn = jax.jit(solve)
+    fn = jax.jit(solve, donate_argnums=(1,) if donate_rhs else ())
     _kernel_cache[key] = fn
     return fn
 
@@ -1500,7 +1505,7 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     if body_metric not in ('mixed_reciprocal','compensated'):
         raise ValueError('grouped static provider has no supported body metric')
     completion=None if augmentation is None else augmentation.get('completion')
-    if completion is not None and completion!='nn_tn_nt_slab_minus_bulk_point_body':
+    if completion is not None and completion != 'nn_tn_nt_slab_minus_bulk_point_body':
         raise ValueError('grouped current provider has an unsupported transverse completion')
     if completion is not None and not callable(augmentation.get('kernel_difference_tile')):
         raise ValueError('Slab current completion requires its authenticated packet kernel owner')
@@ -1517,14 +1522,17 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     factors = [z.factor for z in zetas]
     local_state=None
     if augmentation is not None:
-        coefficients=[]
-        for z in zetas:
-            rhs=z.local_augmentation['rhs']
-            _require_q_owned(rhs,mesh,rhs.shape,name='grouped static current RHS')
-            coefficients.append(_local_coefficient_solve(mesh,z.solver_kind,
-                z.n_rmu_solve,st0.Q)(z.factor,rhs))
-        local_state=augmentation['prepare'](tuple(coefficients))
-        del coefficients
+        if augmentation.get('coefficient_owner') is not None:
+            local_state=augmentation['prepare'](None)
+        else:
+            coefficients=[]
+            for z in zetas:
+                rhs=z.local_augmentation['rhs']
+                _require_q_owned(rhs,mesh,rhs.shape,name='grouped static current RHS')
+                coefficients.append(_local_coefficient_solve(mesh,z.solver_kind,
+                    z.n_rmu_solve,st0.Q)(z.factor,rhs))
+            local_state=augmentation['prepare'](tuple(coefficients))
+            del coefficients
     v_form = v_dev[0]                  # unread by the ζ-forming half
     # No look-ahead: each Z tile is read just before its ζ is formed and
     # dropped after, so a G tile holds one Z tile and the ζ tiles — the six

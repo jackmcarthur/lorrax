@@ -243,10 +243,17 @@ def authenticate_group(zetas,pairs,v_tables):
     shared=local[0].get('group_provider')
     if (not isinstance(shared,dict) or shared.get('kernel') not in (STATIC_KERNEL,SLAB_STATIC_KERNEL)
             or any(p.get('group_provider') is not shared for p in local)
-            or any('rhs' not in p for p in local)
+            or any(('rhs' not in p) != (shared.get('coefficient_owner') is not None) for p in local)
             or tuple(p.get('channel') for p in local)!=(0,1,2)
             or tuple(id(z) for z in zetas)!=shared.get('zeta_identity')):
         raise ValueError("GATE augmented_current_coulomb: missing or mismatched shared current geometry/basis references")
+    owned = shared.get('coefficient_owner')
+    if owned is not None:
+        from isdf.current_coefficients import CurrentCoefficientBanks
+        if (not isinstance(owned, CurrentCoefficientBanks)
+                or any(p.get('coefficient_owner') is not owned for p in local)):
+            raise ValueError('GATE augmented_current_coulomb: solved current banks require their stream owner')
+        owned.authenticate(zetas)
     for key in ('prepare','fourier_tile','onsite','authenticate_kernel'):
         if not callable(shared.get(key)):
             raise ValueError(f"GATE augmented_current_coulomb: missing group provider {key}")
@@ -255,6 +262,7 @@ def authenticate_group(zetas,pairs,v_tables):
 
 
 def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_reciprocal',
+                          smooth_support=None,
                           radius,lm,centers_cart,q_plus_G_cart,
                           cell_volume,fft_points,support_radius,
                           minimum_atom_image_distance,reciprocal_prefactor,
@@ -294,6 +302,28 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         build_two_moment_compensation,evaluate_two_moment_compensation,
         two_moment_compensation_radial_fourier,static_transverse_block_factors)
 
+    from isdf.current_coefficients import CurrentCoefficientBanks
+    coefficient_owner = rhs if isinstance(rhs, CurrentCoefficientBanks) else None
+    owned_banks = coefficient_owner is not None
+    separate_halves = owned_banks and coefficient_owner.operand_kind == 'delta_and_ps'
+    physical_mixed = False
+    if smooth_support is not None:
+        from isdf.current_support import SmoothCurrentSupport
+        if not isinstance(smooth_support, SmoothCurrentSupport) or not smooth_support.physical_mixed:
+            raise ValueError('physical mixed current requires the actual Slab layer/support witness')
+        smooth_support.authenticate(zetas, body_head_slots, centers_cart=centers_cart,
+                                    support_radius=support_radius)
+        if body_metric != 'mixed_reciprocal':
+            raise ValueError('physical mixed current support cannot alter another body policy')
+        physical_mixed = True
+    if owned_banks:
+        expected_metric = 'compensated' if separate_halves else 'mixed_reciprocal'
+        if (smooth_rhs is not None or body_metric != expected_metric
+                or not separate_halves and (not physical_mixed or coefficient_owner.smooth_support is not smooth_support)):
+            raise ValueError('streamed current banks require one complete compensated owner')
+        owned = coefficient_owner.authenticate(zetas)
+        rhs = tuple(v[0] for v in owned)
+        smooth_rhs = tuple(v[1] for v in owned) if separate_halves else None
     if len(zetas)!=3 or len(rhs)!=3:
         raise ValueError("static Breit provider requires exactly three current channels and RHS")
     if body_metric not in ('mixed_reciprocal','compensated'):
@@ -304,8 +334,8 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
     if smooth_rhs is not None and (not isinstance(smooth_rhs,(tuple,list)) or len(smooth_rhs)!=3):
         raise ValueError("static Breit smooth local RHS requires all three current channels")
     slab=isinstance(body_head_slots,dict) and body_head_slots.get('schema')==SLAB_BODY_HEAD_SCHEMA
-    if slab and not compensated:
-        raise ValueError('Slab current completion requires the complete compensated delta/PS family')
+    if slab and not (compensated or physical_mixed):
+        raise ValueError('Slab current requires compensated operands or authenticated physical mixed support')
     z0=zetas[0];st,mesh=z0.store,z0.mesh
     Q,Qp,mu,gt=int(st.Q),int(st.Q_pad),int(st.mu_pad),int(st.g_tile)
     ng=int(st.g_axis.logical);XY=('x','y');qspec=P(XY,None,None)
@@ -334,6 +364,8 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         interpolation_degree=interpolation_degree,quadrature_order=quadrature_order)
     angular,radial=geometry['angular'],geometry['radial'];labels=angular['lm']
     nh,nr,na=len(labels),len(r),len(centers);nf=na*nh*nr
+    if owned_banks and coefficient_owner.radial_shape[:3] != (na, nh, nr):
+        raise ValueError('streamed current coefficient radial geometry disagrees with provider')
     for value in rhs:
         _require_q_owned(value,mesh,(Qp,mu,nf),name='static current RHS')
     if compensated:
@@ -425,6 +457,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         bucket_meta.append((width,tile,padded//tile,len(steps)))
     bucket_arrays=tuple(bucket_arrays);bucket_meta=tuple(bucket_meta)
     onsite_scale=k0*N*N/volume;fourier_scale=N/volume
+    coefficient_specs = ((qspec, qspec),)*3 if separate_halves else (qspec,)*3
 
     def live(local_q):
         rank=jax.lax.axis_index('x')*int(mesh.shape['y'])+jax.lax.axis_index('y')
@@ -432,7 +465,8 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
 
     def prepare_local(coefficients,moment_rows):
         out=[]
-        for values in coefficients:
+        for pair in coefficients:
+            values = pair[0] if separate_halves else pair
             if compensated:
                 # Gather one radial row directly from the paired operand.
                 # Even an in-jit full-half slice needs a contiguous cloud
@@ -453,12 +487,12 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             out.append(q)
         return tuple(out)
     prepare_kernel=jax.jit(shard_map(prepare_local,mesh=mesh,
-        in_specs=((qspec,)*3,P()),out_specs=(qspec,)*3,check_vma=False))
+        in_specs=(coefficient_specs,P()),out_specs=(qspec,)*3,check_vma=False))
 
     def fourier_local(coefficients,moment_coefficients,bessel,angle,g_radial,degree_rows):
         outputs=[];compensations=[]
         for c in range(3):
-            values=coefficients[c]
+            values=coefficients[c][0] if separate_halves else coefficients[c]
             shaped=None if compensated else values.reshape(values.shape[0],mu,na,nh,nr)
             qm=moment_coefficients[c].reshape(values.shape[0],mu,na,nh,2)
             zero=jnp.zeros((values.shape[0],mu,gt),jnp.complex128)
@@ -473,7 +507,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             outputs.append(d);compensations.append(g)
         return tuple(outputs),tuple(compensations)
     fourier_kernel=jax.jit(shard_map(fourier_local,mesh=mesh,
-        in_specs=((qspec,)*3,(qspec,)*3,P(XY,None,None,None),
+        in_specs=(coefficient_specs,(qspec,)*3,P(XY,None,None,None),
                   P(XY,None,None,None),P(XY,None,None,None),P()),
         out_specs=((qspec,)*3,(qspec,)*3),check_vma=False))
 
@@ -482,8 +516,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         pairs=tuple((int(a),int(b)) for a,b in pairs)
         if pairs in onsite_kernels:return onsite_kernels[pairs]
         def onsite_local(coefficients,moment_coefficients,hrows_,spin_weights_,buckets_):
-            qlive=live(coefficients[0].shape[0])
-            zero=jnp.zeros((coefficients[0].shape[0],len(pairs),mup,mup),jnp.complex128)
+            first_values = coefficients[0][0] if separate_halves else coefficients[0]
+            qlive=live(first_values.shape[0])
+            zero=jnp.zeros((first_values.shape[0],len(pairs),mup,mup),jnp.complex128)
             def coupled(values,c,atom,m0,modes_,radial_width,feature_offset=0):
                 # Advanced sample/feature indexing bounds the temporary to
                 # qlocal*centroid_tile*(1 or 2)*3*radial_width. No full-mu pad.
@@ -504,12 +539,14 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                     def fields(m0):
                         d=[];g=[];ps=[]
                         for c in range(3):
-                            source=coupled(coefficients[c],c,atom,m0,modes_,nr)
+                            delta_values = coefficients[c][0] if separate_halves else coefficients[c]
+                            source=coupled(delta_values,c,atom,m0,modes_,nr)
                             moment=coupled(moment_coefficients[c],c,atom,m0,modes_,2)
                             d.append(jnp.einsum('fr,bmr->bmf',df,source))
                             g.append(jnp.einsum('fr,bmr->bmf',gf,moment))
                             if compensated:
-                                smooth=coupled(coefficients[c],c,atom,m0,modes_,nr,nf)
+                                smooth_values = coefficients[c][1] if separate_halves else coefficients[c]
+                                smooth=coupled(smooth_values,c,atom,m0,modes_,nr,0 if separate_halves else nf)
                                 ps.append(jnp.einsum('fr,bmr->bmf',df,smooth))
                         return tuple(d),tuple(g),tuple(ps)
                     def left_block(acc,lblock):
@@ -533,14 +570,21 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                 result=jax.lax.scan(sector_field,result,jnp.arange(na*nsteps*nfields),unroll=1)[0]
             return tuple(result[:,i,:mu,:mu] for i in range(len(pairs)))
         kernel=jax.jit(shard_map(onsite_local,mesh=mesh,
-            in_specs=((qspec,)*3,(qspec,)*3,P(),P(),tuple((P(),P(),P()) for _ in bucket_arrays)),
+            in_specs=(coefficient_specs,(qspec,)*3,P(),P(),tuple((P(),P(),P()) for _ in bucket_arrays)),
             out_specs=(qspec,)*len(pairs),check_vma=False))
         onsite_kernels[pairs]=kernel;return kernel
 
     def prepare(coefficients):
+        if owned_banks:
+            if coefficients is not None:
+                raise ValueError('streamed current provider consumes only its authenticated half-bank owner')
+            owned = coefficient_owner.authenticate(zetas)
+            coefficients = owned if separate_halves else tuple(v[0] for v in owned)
         if len(coefficients)!=3:raise ValueError("static current coefficients require all three channels")
         for v in coefficients:
-            _require_q_owned(v,mesh,(Qp,mu,(2 if compensated else 1)*nf),name='static current coefficients')
+            for half in v if separate_halves else (v,):
+                _require_q_owned(half,mesh,(Qp,mu,nf if separate_halves else (2 if compensated else 1)*nf),
+                                 name='static current coefficients')
         coefficients=tuple(coefficients)
         return dict(coefficients=coefficients,moments=prepare_kernel(coefficients,M))
 
@@ -626,7 +670,12 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                 or bundle.get('local_cross_policy')!=('onsite_smooth_neutral' if compensated
                                                      else 'mixed_reciprocal')):
             raise ValueError("static Breit provider body/cross policy was changed after construction")
-        if slab and (bundle.get('completion')!='nn_tn_nt_slab_minus_bulk_point_body'
+        if physical_mixed:
+            if bundle.get('smooth_support') is not smooth_support:
+                raise ValueError('physical mixed support owner changed')
+            smooth_support.authenticate(zetas, body_head_slots, centers_cart=centers, support_radius=R)
+        completion_kind = 'nn_tn_nt_slab_minus_bulk_point_body'
+        if slab and not physical_mixed and (bundle.get('completion')!=completion_kind
                 or bundle.get('bulk_reference')!='public_Bulk3D_point_body_no_head'
                 or bundle.get('kernel_difference_tile') is not kernel_difference_tile):
             raise ValueError('Slab current completion or point-body reference was changed after construction')
@@ -639,6 +688,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         if (not pairs or len(pairs)!=len(v_tables) or any(a<0 or b<0 or a>=3 or b>=3 for a,b in pairs)
                 or len(set(pairs))!=len(pairs) or {i for p in pairs for i in p}!={0,1,2}):
             raise ValueError("static Breit requires valid distinct current-kernel pairs")
+        if physical_mixed:
+            smooth_support.authenticate_point_kernel(pairs, v_tables, B, k0)
+            return
         hfit=np.einsum('ai,qij,bj->qab',B,head,B.conj())
         for (a,b),passed in zip(pairs,v_tables):
             value=np.asarray(passed,dtype=complex)
@@ -666,6 +718,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
 
     digest=hashlib.sha256()
     digest.update(body_metric.encode('ascii'))
+    if physical_mixed:
+        import json
+        digest.update(json.dumps(smooth_support.descriptor,sort_keys=True).encode('utf8'))
     if body_head_slots is not None:
         digest.update(body_head_slots['payload_sha256'].encode('ascii'))
     for v in (r,labels,centers,K,B,head,mask,
@@ -690,7 +745,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         onsite_block_diagnostics={key:blocks[key] for key in ('angular_forbidden_error',
             'angular_M_covariance_error','retained_columns','retained_compensation_columns',
             'factor_bytes','no_cutoff')},onsite_sparse_max_orbitals=3,coefficient_cloud_padding=False)
-    if slab:
+    if slab and not physical_mixed:
         bundle.update(kernel_difference_tile=kernel_difference_tile,
             completion='nn_tn_nt_slab_minus_bulk_point_body',
             bulk_reference='public_Bulk3D_point_body_no_head',
@@ -699,6 +754,14 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
     # All geometry/head/source contracts have refused invalid inputs before
     # allocating the paired clouds. The consuming stage blocks these arrays
     # and releases its raw six-cloud operands before grouped solves begin.
+    if physical_mixed:
+        bundle['smooth_support'] = smooth_support
+        bundle['physical_mixed_support'] = smooth_support.descriptor
+        bundle['physical_tail_qualification'] = 'Slab high-G local remainder proved by layer geometry; global compensation tail needs full fitted/occupied stopping bound'
+    if owned_banks:
+        bundle['coefficient_owner'] = coefficient_owner
+        return tuple(dict(coefficient_owner=coefficient_owner, group_provider=bundle,
+                          channel=c) for c in range(3))
     provider_rhs=(tuple(jnp.concatenate((delta,smooth),axis=-1)
                         for delta,smooth in zip(rhs,smooth_rhs)) if compensated else tuple(rhs))
     return tuple(dict(rhs=provider_rhs[c],group_provider=bundle,channel=c) for c in range(3))

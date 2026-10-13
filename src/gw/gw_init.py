@@ -1859,7 +1859,8 @@ def zeta_sphere_ngkmax(wfn, sym, meta, zeta_cutoff_ry) -> int:
 def _plan_route_g_for_channel(
 		*, meta, cfg, band_slices, mesh_xy, n_q_selected, k_unfold_plan,
 		print_fn=print, zeta_ngkmax=None, psi_ngkmax=None, psi_cylinder=None,
-		n_vertex=1):
+		n_vertex=1, current_local_geometry=None, current_local_resident_bytes=0.,
+		current_local_workspace=None):
 	"""Plan ONE ζ family (charge, or the current channels together) on route G.
 
 	Resolves the planner's inputs once for both families: the fit-window
@@ -1906,7 +1907,10 @@ def _plan_route_g_for_channel(
 		n_s=(int(psi_cylinder[1]) if psi_cylinder else int(min(
 			_n_a, math.ceil(2.4 * _r) + 1))),
 		n_vertex=int(n_vertex), n_parent=n_parent,
-		orbit_width=widest_unfold_orbit(k_unfold_plan))
+		orbit_width=widest_unfold_orbit(k_unfold_plan),
+		current_local_geometry=current_local_geometry,
+		current_local_resident_bytes=current_local_resident_bytes,
+		current_local_workspace=current_local_workspace)
 	from common.gpu_utils import record_stage_price
 	record_stage_price("zeta fit, plan_zeta_route_g HWM", mubatch_plan.hwm_bytes,
 	                   section=("gw_jax.zeta_fit_chunked" if int(n_vertex) == 1
@@ -2220,7 +2224,7 @@ def _current_body_contract(zeta, state, *, cfg, meta, wfn):
         ngk_per_q=zeta.ngk_per_q, geometry=geometry, vcoul_cutoff_ry=cutoff,
         v_head_fn=v_head_fn_in_V(mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
             sys_dim=meta.sys_dim, kgrid=meta.kgrid, bvec=bvec, cell_volume=meta.cell_volume),
-        gamma_head=gamma)
+        gamma_head=gamma,sys_dim=int(meta.sys_dim))
     active = np.arange(zeta.ngkmax)[None] < zeta.ngk_per_q[:, None]
     K = policy['q_plus_G_cart']
     return dict(reciprocal_prefactor=sign*8*np.pi/float(meta.cell_volume),
@@ -2512,11 +2516,34 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	    # fills its own, and the tile waits on host (v_q_bispinor.ParkedVTiles).
 	    from .v_q_bispinor import BispinorFitV
 	    fit_v = BispinorFitV(zeta_g.path)
+	    _deferred_current = ((_current_augmentation or {}).get('deferred_rhs'))
+	    if _deferred_current is not None:
+	        _deferred_current.bind_charge_zeta(zeta_g)
 	    fit_v.cc = _bispinor_charge_tile(
 	        zeta_g, cfg=cfg, meta=meta, wfn=wfn, sym=sym,
 	        centroid_indices=centroid_indices, mesh_xy=mesh_xy,
 	        print_fn=print_fn)
 	    zeta_g = None
+	    if _deferred_current is not None:
+	        _deferred_current.after_charge_close()
+	if _current_augmentation is not None and _chunks_T is not None:
+	    from .isdf_augmentation import _current_contract_workspace_bytes
+	    cs = _current_augmentation
+	    if cs.get('early_physical_support') is not None:
+	        qpad = ((len(cs['q_full_indices'])+mesh_xy.size-1)//mesh_xy.size)*mesh_xy.size
+	        mu = int(cs['plan'].n_centroid_packed)
+	        geometry = (len(cs['centers_cart']),len(cs['lm']),len(cs['radius']))
+	        old = _chunks_T
+	        _chunks_T = _plan_route_g_for_channel(meta=_meta_T,cfg=cfg,
+	            band_slices=band_slices,mesh_xy=mesh_xy,n_q_selected=len(cs['q_full_indices']),
+	            k_unfold_plan=cs['plan'],zeta_ngkmax=zeta_sphere_ngkmax(wfn,sym,_meta_T,_zeta_cutoff),
+	            psi_ngkmax=int(wfn.ngkmax),psi_cylinder=_route_g_cylinder(wfn,_meta_T),
+	            n_vertex=3,print_fn=print_fn,current_local_geometry=geometry,
+	            current_local_resident_bytes=float(cs['fit_resident_extra_bytes_per_rank']),
+	            current_local_workspace=lambda gt: _current_contract_workspace_bytes(
+	                qpad=qpad,mu=mu,atoms=geometry[0],harmonics=geometry[1],radial_points=geometry[2],
+	                g_tile=gt,shards=mesh_xy.size,solved_half_banks=True,physical_three_banks=True))
+	        _chunks_T['k_unfold_plan'] = old['k_unfold_plan']
 	transverse_wfn_data = None
 	if uses_transverse_interaction(cfg) and getattr(cfg.paths, "centroids_file_current", None):
 	    transverse_wfn_data, tt_tiles = _fit_transverse_zeta_channels(
@@ -2530,6 +2557,8 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	        fit_v = fit_v or BispinorFitV(zeta_h5_path)
 	        fit_v.tt = tt_tiles
 	        fit_v.n_rmu_T = int(_meta_T.n_rmu)
+	        if _current_augmentation is not None:
+	            fit_v.physical_current_operator_contract = _current_augmentation.get('physical_current_operator_contract')
 	# The μ-batch fit hands V_q its ζ as (Z store, C⁺), a four-current V_q
 	# the tiles its fits formed; a file path otherwise.
 	if fit_v is not None:
@@ -2645,6 +2674,18 @@ def _bispinor_tt_head(cfg):
     """Whether the four-current V's TT tiles carry the Γ mini-BZ head."""
     return (uses_bare_tt_gamma_head(cfg)
             or uses_direct_bispinor_shared_pole_head(cfg))
+
+
+def _bispinor_policy_with_current_contract(cfg, meta, fit_v):
+    """Persist the actual fitted current descriptor in the generation receipt."""
+    import hashlib
+    policy = _bispinor_v_policy(cfg,meta)
+    contract = getattr(fit_v,'physical_current_operator_contract',None)
+    if contract is not None:
+        raw = json.dumps(contract,sort_keys=True,separators=(',',':'),allow_nan=False)
+        policy = dict(policy,physical_current_operator_contract=contract,
+                      physical_current_operator_identity=hashlib.sha256(raw.encode()).hexdigest())
+    return policy
 
 
 def _bispinor_v_policy(cfg, meta):
@@ -2790,7 +2831,7 @@ def _compute_photon_vq(
                     coordinate_kind_T=read_centroid_coordinate_kind(_cents_curr_path),
                     use_ibz=True,
                     tt_head_correction=_bispinor_tt_head(cfg),
-                    policy=_bispinor_v_policy(cfg, meta),
+                    policy=_bispinor_policy_with_current_contract(cfg,meta,fit_v),
                     cc_tile=cc_tile, tt_tiles=tt_tiles,
                     current_basis_rows=meta.current_basis_rows,
                     mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
@@ -3103,6 +3144,8 @@ def _prepare_fresh_parent_faces(
                 current_basis_rows=meta_T.current_basis_rows,
                 q_full_indices=(np.asarray(sym.q_irr_full_idx, np.int32) if write_ibz_T
                                 else np.arange(meta_T.nk_tot, dtype=np.int32)))
+            from .augmentation_current import DeferredCurrentRequest
+            current_request = DeferredCurrentRequest(current_request)
         from .isdf_augmentation import prepare_augmentation
         with timing.section("gw_jax.atomic_augmentation"):
             _parent_green_faces, chunks['augmentation'] = prepare_augmentation(

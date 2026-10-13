@@ -173,7 +173,10 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                       psi_ngkmax: int, fit_nb: int, n_col: int, n_s: int,
                       budget_gb: float,
                       psi_face_bytes: float = 0.0, n_vertex: int = 1,
-                      n_parent: int | None = None, orbit_width: int = 1) -> MuBatchPlan:
+                      n_parent: int | None = None, orbit_width: int = 1,
+                      current_local_geometry=None,
+                      current_local_resident_bytes: float = 0.0,
+                      current_local_workspace=None) -> MuBatchPlan:
     """Size the route-G μ-batch fit (docs/architecture/zeta_fit_mubatch.md).
 
     Per rank: conj ψ(G) on its G slice (full zone), the owner's pair
@@ -201,6 +204,16 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     the fit).  The HWM is that configuration's working set; over the target,
     one warning line is printed here, before anything is compiled, and the
     plan runs.
+
+    The certified physical-mixed current caller supplies its actual local
+    geometry and the sole current-contraction pricing owner. Its radial RHS
+    packets replay after the OWN3 fit, so no full raw banks exist during the
+    PW fit. The callback prices the three solved contraction banks. Additional
+    protected state/source/charge leaves exclude the ordinary base below.
+    The internal G-store tile is bounded
+    before allocation by that owner's coupled contraction price, with the
+    final compiler/lifetime admission still required. No input knob selects
+    this accounting, and the default route is unchanged.
     """
     from runtime.padding import mesh_divisor
     P_ = int(mesh_divisor(mesh_xy))
@@ -226,6 +239,18 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         "conj ψ(G) slice": _c128(n_p, nb, ns, Gp),
         "sphere tables": 12.0 * nk * Gp + 4.0 * nk * n_col * n_s + 8.0 * Q * N_G,
     }
+    if current_local_geometry is None:
+        if current_local_workspace is not None or current_local_resident_bytes != 0:
+            raise ValueError('local current accounting requires its actual prepared geometry')
+    else:
+        geometry = tuple(current_local_geometry)
+        extra = float(current_local_resident_bytes)
+        if (len(geometry) != 3 or any(isinstance(v, bool) or int(v) != v or int(v) <= 0
+                                     for v in geometry)
+                or n_v != 3 or not callable(current_local_workspace)
+                or not math.isfinite(extra) or extra < 0):
+            raise ValueError('invalid certified three-bank current residency accounting')
+        base['protected current source/state'] = extra
     base_total = sum(base.values())
 
     r_zeta = (3.0 * N_G / (4.0 * math.pi)) ** (1.0 / 3.0)
@@ -297,6 +322,9 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     # band-chunk buffers is not implemented), one widest orbit per owner, one
     # plane per block.
     need_min = working_set(b_min, 1, 1, n_a)
+    if current_local_geometry is not None and need_min > target:
+        raise ValueError(f'physical current minimum PW-fit residency {need_min:.0f} '
+                         f'exceeds budget {target:.0f} before Z-store allocation')
     b_top = math.ceil(mu / P_) * P_
     # The batch, at one plane per group (the smallest plane stage): every byte
     # the fixed terms and ψ(G) leave buys centroids at c_μ bytes each, with
@@ -324,6 +352,48 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     per_g = 6.0 * _c128(Q_pad, mu, 1, shard=P_)
     g_tile = int(max(P_, (0.25 * target // max(per_g, 1.0)) // P_ * P_))
     g_tile = min(g_tile, math.ceil(N_G / P_) * P_)
+    contraction_breakdown = None
+    if current_local_geometry is not None:
+        # Deferred replay allocates the final solved banks only after OWN3;
+        # their full residence belongs to the contraction callback, not PW.
+        contraction_shared = base_total + psi_bytes
+        quoted = {}
+
+        def contraction_bytes(tile):
+            if tile not in quoted:
+                terms = dict(current_local_workspace(int(tile)))
+                if ('total' not in terms
+                        or any(not math.isfinite(float(v)) or float(v) < 0 for v in terms.values())
+                        or not math.isclose(float(terms['total']),
+                            sum(float(v) for k, v in terms.items() if k != 'total'),
+                            rel_tol=1e-12, abs_tol=1e-6)):
+                    raise ValueError('current contraction owner returned invalid live-byte bounds')
+                total = contraction_shared + float(terms['total'])
+                for other, (value, _) in quoted.items():
+                    envelope = 1e-12 * max(total, value, 1.)
+                    if (other < tile and value > total + envelope
+                            or other > tile and value < total - envelope):
+                        raise ValueError('current contraction owner is not monotone in the G tile')
+                quoted[tile] = (total, terms)
+            return quoted[tile][0]
+
+        minimum = contraction_bytes(P_)
+        if minimum > target:
+            raise ValueError(f'physical current minimum contraction residency {minimum:.0f} '
+                             f'exceeds budget {target:.0f} before Z-store allocation')
+        if contraction_bytes(g_tile) > target:
+            low, high = 1, g_tile // P_
+            while low < high:
+                middle = (low + high + 1) // 2
+                if contraction_bytes(middle * P_) <= target:
+                    low = middle
+                else:
+                    high = middle - 1
+            g_tile = low * P_
+        _, terms = quoted[g_tile]
+        contraction_breakdown = {'protected current/C/source': contraction_shared}
+        contraction_breakdown.update({f'current contraction {k}': float(v)
+                                      for k, v in terms.items() if k != 'total'})
     n_Gt = math.ceil(N_G / g_tile)
     store = n_v * _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
     from common.gpu_utils import host_bytes_per_process
@@ -336,6 +406,9 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         from common.gpu_utils import warn_over_budget
         warn_over_budget(f"zeta mu-batch ({b // P_} centroids per owner, whole orbits of up "
                          f"to {c_orb}, {c_out} row(s) x {n_blk} plane block(s))", hwm, target)
+    if contraction_breakdown is not None and sum(contraction_breakdown.values()) > hwm:
+        br = contraction_breakdown
+        hwm = sum(br.values())
     store_total = n_v * Q * mu * N_G * 16.0
     transfer = {
         f"pair-projector all-to-all (floor {t_a2a_floor:.0f} s)":
