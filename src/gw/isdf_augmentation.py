@@ -2756,7 +2756,7 @@ def _physical_current_operator_contract(channels, state, body_contract, witness)
             body_head_identity=q['payload_sha256']),
         current_angular_support_contract=state['angular_support_contract'],
         current_angular_support_identity=state['angular_support_identity'],
-        current_factor_convention='three exact canonical OWN signed LU factors; unit endpoint loss',
+        current_factor_convention='three canonical OWN current factors; unit endpoint loss; signed solve specified by OWN_factor_metadata',
         factor_fit_band_ranges=dict(left=list(state['band_range_left']),right=list(state['band_range_right'])),
         OWN_factor_metadata=[dict(current_channel=c,solver_kind=z.solver_kind,
             n_rmu_solve=int(z.n_rmu_solve),factor_leaves=[dict(shape=list(v.shape),dtype=str(v.dtype))
