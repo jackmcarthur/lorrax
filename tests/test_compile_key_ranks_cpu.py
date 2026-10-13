@@ -24,7 +24,8 @@ def patched(monkeypatch):
 
 
 def _key(device):
-    module = jax.jit(lambda x: 2 * x + 1).lower(jnp.ones(8)).compiler_ir("stablehlo")
+    module = jax.jit(lambda x: 2 * x + 1).lower(
+        jax.ShapeDtypeStruct((8,), jnp.float32)).compiler_ir("stablehlo")
     backend = xla_bridge.get_backend("cpu")
     options = compiler.get_compile_options(
         1, 1, device_assignment=np.array([[device]]), backend=backend)

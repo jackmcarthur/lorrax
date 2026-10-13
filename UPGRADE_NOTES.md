@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-13 — CPU ranks at P > 1 hit the persistent compile cache
+
+On CPU at P > 1, ranks 1..P-1 now find the entries rank 0 writes. JAX's CPU
+key carried each process's device assignment and the head of its serialized
+topology, which lists the process's own devices. No peer key matched rank
+0's, so the peers compiled every program on every run. At P > 1
+`common.jax_compile_cache` now strips both, as JAX already strips the device
+assignment on GPU. The key keeps the CPU target machine (triple, CPU name,
+features). On a warm CPU P4 run of six hsuite stages each rank makes 633
+requests. Before, ranks 1–3 hit 0 and compiled 642 programs each; now every
+rank hits 630 and compiles 12, and the wall goes from 46.7 to 23.9 s. eqp is
+byte-identical. Every CPU key at P > 1 changes, so such a cache is cold once;
+P = 1 keys are unchanged. GPU keys are unchanged: on the P4 hsuite all 2250
+GPU programs keep their key. The CPU-device programs inside a GPU run (4 on
+the hsuite) take the new CPU key and compile once. No deck or environment
+change.
+
 ## 2026-10-12 — SC final diagnostics with sigma_freq_debug_output on a symmetry-reduced grid
 
 A self-consistent run with `sigma_freq_debug_output = true` on a
