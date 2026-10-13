@@ -12,7 +12,7 @@ def exercise_fractional_lattice_images(mesh):
     grid=(8,10,12); nk=2; nb=8; ng=8; nm=8
     G=np.array([[0,0,0],[-1,2,-3],[2,-3,1],[-3,1,4],
                 [3,-4,-5],[-2,-1,3],[71,82,93],[91,81,71]],np.int32)
-    geometry=np.broadcast_to(np.c_[G,[1,1,1,1,1,1,0,0]],(nk,ng,4)).copy()
+    geometry=np.broadcast_to(np.c_[G,[1,1,1,1,1,1,0,0]],(nk,ng,4)).astype(np.int32)
     k=np.array([[0,0,0],[1/3,-1/3,1/3]])
     base=np.array([[.123,.317,.731],[.019,.815,.415],[-1e-18,.2,.3],[.5,.4,.3]])
     L=np.array([[1,-2,3],[-3,2,1],[1,0,-1],[2,2,2]])
