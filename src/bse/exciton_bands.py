@@ -1227,7 +1227,7 @@ def build_parser():
                          "carries ABOVE the window zeta' is fitted on "
                          f"(default {vq_interp.REFIT_N_GUARD_DEFAULT}).  THE "
                          "TWO-WINDOW CONTRACT: f(eps) is identically zero for "
-                         "eps >= max_k eps of fH's OWN top band, so pinning "
+                         "eps >= the maximum over fH's included bands and k points, so pinning "
                          "the two windows together asks compute_wfns_fi for "
                          "exactly the bands fH cannot represent -- the top "
                          "band vanishes at the k that defines the shift and a "

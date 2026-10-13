@@ -172,8 +172,8 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
 
     THE MECHANISM, in one sentence: ``f`` is identically zero for ε ≥
     ``shift`` and ``htransform._f_params_from_energies`` sets ``shift =
-    max_k ε[nb−1]``, so the top band of the htransform's own window
-    contributes EXACTLY NOTHING to ``fH = Σ_n f(ε_n) c_n c_nᴴ`` at the k that
+    max_{n,k} ε[n,k]`` over the included window, so a state attaining
+    that maximum contributes EXACTLY NOTHING to ``fH = Σ_n f(ε_n) c_n c_nᴴ`` at the k that
     attains that maximum, and ``f`` vanishes to second order approaching it
     — which puts a whole SHOULDER of bands below the top at a per-cent or
     less of fH's weight.  Those eigenvector slots are degenerate with fH's
@@ -237,7 +237,7 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
             f"min_k |f(ε_{worst_b})|/max|f| = {worst:.6e} at or below the "
             f"{tol:.1e} floor, with {n_zero_k} exactly-zero (band, k) slot(s) "
             f"in the window.  f(ε) ≡ 0 for ε ≥ shift = {shift:.8f} Ry "
-            f"(= max_k ε of the TOP band of ctilde's own window), so this "
+            f"(= max ε over ctilde's included bands and k points), so this "
             f"band contributes nothing to fH = Σ_n f(ε_n) c_n c_nᴴ at those "
             f"k; its eigenvector slot is degenerate with fH's "
             + (f"{int(rank) - int(fa.shape[0])}-dimensional "
