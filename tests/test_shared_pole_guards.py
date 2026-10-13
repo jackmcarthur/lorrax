@@ -48,6 +48,7 @@ def test_four_component_charge_bank_routing(model, charge, transverse, photon):
     with pytest.raises(ValueError, match=expected):
         resolve_shared_pole_recipe(
             config, None, SimpleNamespace(nspinor=4), mesh_xy=None,
+            support_reads_ev=(),
             print_fn=lambda *a, **k: None)
     config.bispinor = False
     assert not uses_charge_bispinor_shared_pole(config)
