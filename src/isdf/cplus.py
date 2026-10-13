@@ -22,7 +22,8 @@ def apply(B, Z):
     return B @ (jnp.conj(jnp.swapaxes(B, -1, -2)) @ Z)
 
 
-def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
+def factor(C_log, *, rcond: float, rank_log: bool, n_log: int,
+           require_psd: bool = False):
     """B with B Bᴴ = C⁺ for a logical C_q stack; see the module docstring."""
     from isdf.core import _certify_the_cut, _close_the_cut
     # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
@@ -32,6 +33,25 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
     # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
     # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
     lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
+    if require_psd:
+        # The current matrix sign is known analytically before this owner.
+        # Material negative modes or a non-Hermitian source cannot become a
+        # valid Gram merely by dropping them. Bound only floating roundoff.
+        eps = 128 * n_log * jnp.finfo(jnp.float64).eps
+        scale = jnp.max(jnp.abs(lam), axis=-1)
+        skew = jnp.linalg.norm(C_log-jnp.conj(jnp.swapaxes(C_log,-1,-2)),
+                               axis=(-2,-1))
+        norm = jnp.linalg.norm(C_log, axis=(-2,-1))
+        invalid = ((scale <= 0) | ~jnp.isfinite(scale)
+                   | (lam[...,0] < -eps*scale) | (skew > eps*norm))
+        def refuse(_):
+            jax.debug.callback(lambda _: rank_criterion.note_device_finding(
+                'signed current PSD Gram',
+                'the analytically sign-normalized current Gram is nonzero, '
+                'Hermitian PSD only within its floating backward envelope; '
+                'the actual input violates that condition'), invalid)
+            return 0
+        jax.lax.cond(jnp.any(invalid), refuse, lambda _: 0, 0)
     lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
     keep = lam > (rcond * lam_max)       # near-null cut
     # …and the near-null cut is not allowed to stop mid-multiplet.  THIS

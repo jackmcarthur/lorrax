@@ -1199,10 +1199,9 @@ def _logical_solve(solver_kind: str, n_log: int):
     (:mod:`isdf.cplus`).  A current channel's Gram is s × a least-squares
     Gram (s = −1 for Cartesian α², whose whole spectrum that cut would
     drop; :func:`common.gamma_matrices.current_fit_terms`), so the
-    currents keep their own seam from :mod:`isdf.core`, the same arithmetic
-    as every transverse fit: the sign-aware ridged pivoted LU factored once
-    per channel (``'lu'``, operand ``(LU, pivots)``, κ_lb certified at
-    factor time).
+    current factor identity selects either the analytically signed PSD
+    pseudo-inverse or an explicitly requested sign-aware ridge LU. Both
+    PW tiles and local packets use this same apply owner.
     """
     from isdf import cplus
     from isdf.core import _zeta_logical_solvers
@@ -1211,6 +1210,8 @@ def _logical_solve(solver_kind: str, n_log: int):
     if solver_kind == 'lu':
         lu_apply = _zeta_logical_solvers(n_log)[1]
         return lambda F, Z: lu_apply(F[0], F[1], Z)
+    if solver_kind == 'negative_rank_truncate':
+        return lambda B, Z: -solve_at_logical(cplus.apply, n_log, (B,), Z)
     return lambda B, Z: solve_at_logical(cplus.apply, n_log, (B,), Z)
 
 

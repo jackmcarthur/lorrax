@@ -1335,12 +1335,14 @@ def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
                                      _REPLICATED_FACTOR_MAX_BATCH_BYTES)
 
 
-#: Per-channel tail of :func:`_rank_truncate_capacity_error`.  Only the
-#: charge channel runs a rank-truncating factor.
+#: Per-channel explanation for the shared whole-tile spectral capacity bound.
 _RANK_TRUNCATE_CHANNEL_ADVICE = {
     'charge': (
         "The charge channel's ζ is route G's, which needs this whole-tile "
         "factor; there is no distributed charge factor."),
+    'current': (
+        "The signed-PSD current factor uses the same whole-tile spectral "
+        "owner and capacity bound; an explicit LU is a different fit."),
 }
 
 
@@ -1359,7 +1361,8 @@ def _rank_truncate_capacity_error(nq, n_rmu, *, channel: str) -> ValueError:
     cap = max(_REPLICATED_CHOL_MAX_STACK_BYTES,
               _REPLICATED_FACTOR_MAX_BATCH_BYTES)
     mu_max = int(math.isqrt(cap // 16))
-    key, mu_name = 'charge_zeta_solve', 'n_mu'
+    key, mu_name = (('charge_zeta_solve', 'n_mu') if channel == 'charge'
+                    else ('signed-PSD current factor', 'n_mu_current'))
     try:
         advice = _RANK_TRUNCATE_CHANNEL_ADVICE[channel]
     except KeyError:  # pragma: no cover - programming error
@@ -1388,8 +1391,9 @@ def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, *,
                          nq: int | None = None) -> str:
     """Resolve ``auto`` to the one factor each ζ channel runs; see docs/architecture/zeta_fit_face_psi_cct.md.
 
-    A current channel (``vertex_mu_L != 0``) runs the hoisted pivoted LU
-    (``'lu'``).  The charge channel runs the replicated rank-truncated
+    Low-level current ``auto`` retains the historical pivoted LU. The
+    public current fit resolves its actual matrix's signed-PSD kind first.
+    The charge channel runs the replicated rank-truncated
     pseudo-inverse (``'replicated_rank_truncate'``), and refuses when one
     q-batch of it cannot be held replicated (:func:`_rank_truncate_capacity_error`).
     """
@@ -1568,10 +1572,12 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
     jax.lax.cond(fired, _say, lambda _: 0, 0)
 
 
-def _charge_factor_math(C_log, *, n_log: int, rcond: float, rank_log: bool):
+def _charge_factor_math(C_log, *, n_log: int, rcond: float, rank_log: bool,
+                        require_psd: bool = False):
     """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit by the all-ranks (replicated) and q-parallel executions of the replicated plan (:func:`_factor_c_q_replicated`, :func:`_factor_c_q_replicated_qparallel`); see docs/architecture/zeta_fit_face_psi_cct.md."""
     from isdf import cplus
-    return cplus.factor(C_log, rcond=rcond, rank_log=rank_log, n_log=n_log)
+    return cplus.factor(C_log, rcond=rcond, rank_log=rank_log, n_log=n_log,
+                        require_psd=require_psd)
 
 
 def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
@@ -1596,7 +1602,7 @@ def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
 
 def _factor_c_q_replicated(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-    zeta_rcond: float = ZETA_RCOND_DEFAULT,
+    zeta_rcond: float = ZETA_RCOND_DEFAULT, require_psd: bool = False,
 ) -> jax.Array:
     """Dense, fully REPLICATED rank-truncated factor of the identity-padded charge CCT; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
@@ -1605,7 +1611,7 @@ def _factor_c_q_replicated(
     rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
     out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep_sh = NamedSharding(mesh_xy, P())
-    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond))
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond), bool(require_psd))
     if key not in _replicated_chol_cache:
         _rc = rcond
         @partial(jax.jit, out_shardings=out_sh)
@@ -1619,7 +1625,8 @@ def _factor_c_q_replicated(
                 # the two schedules cannot drift (bit-identity contract).
                 C_log = jax.lax.with_sharding_constraint(C_log, rep_sh)
                 F = _charge_factor_math(
-                    C_log, n_log=n_log, rcond=_rc, rank_log=True)
+                    C_log, n_log=n_log, rcond=_rc, rank_log=True,
+                    require_psd=require_psd)
                 return F
 
             F_log = solve_at_logical(
@@ -1749,7 +1756,7 @@ def _qparallel_announce(nq: int, n_rmu: int, n_log: int,
 
 def _factor_c_q_replicated_qparallel(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-    zeta_rcond: float = ZETA_RCOND_DEFAULT,
+    zeta_rcond: float = ZETA_RCOND_DEFAULT, require_psd: bool = False,
 ) -> jax.Array:
     """The replicated charge factor, EXECUTED q-parallel; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
@@ -1766,7 +1773,7 @@ def _factor_c_q_replicated_qparallel(
     q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
     mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
 
-    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond))
+    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond), bool(require_psd))
     if key not in _qparallel_factor_cache:
         _rc = rcond
         blk = nq_pad // ndev
@@ -1780,7 +1787,8 @@ def _factor_c_q_replicated_qparallel(
             def _fact(C1):
                 return solve_at_logical(
                     lambda Cl: _charge_factor_math(
-                        Cl, n_log=n_log, rcond=_rc, rank_log=True),
+                        Cl, n_log=n_log, rcond=_rc, rank_log=True,
+                        require_psd=require_psd),
                     n_log, (C1,), pad_axes=(-2, -1))
 
             def _one(i, F_acc):
@@ -1823,9 +1831,10 @@ def _factor_c_q_replicated_qparallel(
 # =============================================================================
 #
 # The transverse CCT is s × a PSD least-squares Gram (s = −1 for Cartesian
-# α², common.gamma_matrices.current_fit_terms) — sign-aware LU, no Cholesky,
-# no eigh-based rank truncation.  The functions below factor it once per
-# channel, before the r-tile solve, so no r-chunk repeats the pivoted LU and
+# α², common.gamma_matrices.current_fit_terms). The public fit uses the
+# sign-normalized PSD spectral owner; an explicit LU retains the historical
+# sign-aware ridge. The LU functions below factor it once per channel so no
+# r-chunk repeats the pivoted LU and
 # the q-parallel charge fold applies:
 #
 # * LOCAL plan ('lu') — per-q pivoted LU on the whole ridged LOGICAL
@@ -1839,8 +1848,8 @@ def _factor_c_q_replicated_qparallel(
 #   exactly those two ops with the factor cached between r-chunks.
 #   Gate: tests/test_transverse_factor_hoist.py (exact equality).
 # Route G applies a whole-tile factor on each G tile, so this LOCAL plan is
-# the only transverse factor: a block-cyclic provider LU token cannot be
-# applied per tile, and ``factor_c_q`` refuses any other kind.
+# supported LU factor: a block-cyclic provider LU token cannot be applied
+# per tile. The signed-PSD factors use the same whole-tile residency.
 
 # Equal-current C and Z carry the same signed-Gram convention; the shared
 # ridge owner preserves that sign in every hoisted and fused LU preparation.
@@ -2263,13 +2272,24 @@ def factor_c_q(
     C_q = _identity_pad_block_diagonal(
         C_q, n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
 
-    # Indefinite-CCT path: no Cholesky.  A current channel runs route G,
-    # which applies a whole-tile factor on each G tile, so its factor is the
-    # local per-q pivoted LU with the 1e-12 ridge, factored ONCE per channel
-    # and returned as jax's own ``(LU, perm)`` pair.
+    # Current route G applies its OWN whole-tile factor to every PW/local
+    # RHS: a sign-normalized PSD B, or the explicitly requested historical
+    # ridged (LU, perm). No physical modes are silently replaced by a ridge.
     if int(vertex_mu_L) != 0:
         t_kind = _resolve_solver_kind(
             int(vertex_mu_L), solver_kind, n_rmu=n_rmu_logical)
+        if t_kind in ('positive_rank_truncate', 'negative_rank_truncate'):
+            if not _replicate_rank_truncate_ok(int(nq), n_rmu_logical):
+                raise _rank_truncate_capacity_error(int(nq), n_rmu_logical,
+                                                   channel='current')
+            sign = -1 if t_kind == 'negative_rank_truncate' else 1
+            # Normalize only the physical signed Gram. Identity carrier pads
+            # are inert and re-embedded by the existing factor owner.
+            positive = sign * C_q
+            positive = _identity_pad_block_diagonal(positive,
+                n_rmu_logical=n_rmu_logical, mesh_xy=mesh_xy)
+            return factor_c_q_replicated_batched(positive, mesh_xy,
+                n_rmu_logical, zeta_rcond=zeta_rcond, require_psd=True)
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
@@ -2328,7 +2348,8 @@ def _zeta_logical_solvers(
 
 
 #: Solver kinds whose factor is a whole-tile ARRAY applied per q.
-_WHOLE_TILE_KINDS = frozenset({'replicated_rank_truncate', 'lu'})
+_WHOLE_TILE_KINDS = frozenset({'replicated_rank_truncate', 'lu',
+    'positive_rank_truncate', 'negative_rank_truncate'})
 
 
 def _whole_tile_solve_kind(solver_kind):

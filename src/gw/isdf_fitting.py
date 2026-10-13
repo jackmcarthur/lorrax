@@ -12,7 +12,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import Meta
 from common import timing
-from common.gamma_matrices import current_fit_terms
+from common.gamma_matrices import current_fit_terms, current_fit_solver_kind
 from common.collectives import (
     device_put_process_local as _device_put_process_local,
 )
@@ -1172,17 +1172,18 @@ def fit_zeta_to_h5(
 
         with timing.section("zeta_fit.cholesky"):
             # Route G applies a WHOLE-TILE factor on each G tile: the charge
-            # channel's rank-truncated pseudo-inverse, or a current channel's
-            # local pivoted LU.
-            _kind = 'lu' if v != 0 else _resolve_solver_kind(
-                0, solver_kind,
-                n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]))
+            # channel's rank-truncated pseudo-inverse or its current signed-PSD
+            # counterpart; an explicitly requested LU retains its old solve.
+            _kind = (current_fit_solver_kind(v, current_basis_rows)
+                     if v != 0 and solver_kind == 'auto' else
+                     _resolve_solver_kind(v, solver_kind,
+                         n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0])))
             _factor = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=v,
                 n_rmu_logical=n_rmu_solve, solver_kind=_kind,
                 zeta_rcond=zeta_rcond)
             # The charge factor is one array; a current factor is (factor, piv).
-            L_q, lu_piv = _factor if v != 0 else (_factor, None)
+            L_q, lu_piv = _factor if _kind == 'lu' else (_factor, None)
             if diagonal_scale is not None:
                 L_q = scale_charge_factor_rows(L_q,diagonal_scale,mesh_xy=mesh_xy)
             jax.block_until_ready(L_q)

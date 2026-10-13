@@ -376,12 +376,13 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		# distributed tier (block-cyclic pzheevd, a different gauge)
 		# therefore refits.  A stamp MISSING this key is whole-tile.
 		'distributed_zeta_solve': 'replicated',
-		# TRANSVERSE solve family + cut: the ridge LU family is the only one,
-		# so a fresh fit stamps ('ridge', None); a stamp from the deleted
-		# rank_truncate family (a different gauge) therefore refits.  A stamp
-		# MISSING these keys is a ridge-family fit.
-		'transverse_zeta_solve': 'ridge',
-		'transverse_zeta_rcond': None,
+		# Current sign-normalized PSD cuts are a distinct fit identity. Missing
+		# keys retain the historical ridge/LU meaning in the reuse owner below.
+		'transverse_zeta_solve': ('signed_psd_rank_truncate'
+			if _ti.get('current_solver_family') == 'signed_psd_rank_truncate' and int(vertex_mu_L) != 0 else 'ridge'),
+		'transverse_zeta_rcond': (_dep_env_record(
+			'LORRAX_ZETA_RCOND', cfg.backend.zeta_rcond)
+			if _ti.get('current_solver_family') == 'signed_psd_rank_truncate' and int(vertex_mu_L) != 0 else None),
 		# TRANSVERSE CHANNEL identity (2026-08-04, same reader-matrix
 		# idiom as the two key generations above).  ζ reuse used to be
 		# switched off for the whole bispinor run, so none of this had
@@ -474,6 +475,10 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 				raise ValueError("charge endpoint policy disagrees with zeta_occupied_weight")
 	elif charge_fit_weights is not None:
 		raise ValueError("charge endpoint weights cannot stamp a current-channel fit")
+	if int(vertex_mu_L) != 0 and _ti.get('current_solver_family') == 'signed_psd_rank_truncate':
+		from common.gamma_matrices import current_fit_solver_kind
+		prov['transverse_solver_kind'] = current_fit_solver_kind(
+			int(vertex_mu_L), meta.current_basis_rows)
 	if int(vertex_mu_L) != 0 and meta.current_basis_rows is not None:
 		prov['current_fit_basis'] = 'circular'
 	# Only changed physical Miller tables acquire this non-legacy key.
@@ -1693,9 +1698,8 @@ def _resolve_zeta_fit_contract(
 		meta_transverse = replace(
 			meta, n_rmu=int(n_rmu_T), nspinor=4, npol=4, mu_basis=basis_T,
 			n_rmu_padded=basis_T.n_packed)
-		# Route G factors every current channel with the whole-tile local
-		# pivoted LU (gw.isdf_fitting.fit_zeta_to_h5): that is the kind the
-		# stamp records, whatever provider LU the mesh would resolve.
+		# Keep the charge stamp's inert historical coupled field unchanged.
+		# Actual current stamps carry the new family and per-channel sign.
 		solver_kind_T = 'lu'
 		meta_transverse.sys_dim = meta.sys_dim
 		meta_transverse.bispinor = True
@@ -1703,6 +1707,7 @@ def _resolve_zeta_fit_contract(
 			"n_rmu": int(n_rmu_T),
 			"centroids_md5": _centroid_table_md5(cent_T_np, coordinate_kind=kind_T),
 			"solver_kind": str(solver_kind_T),
+			"current_solver_family": "signed_psd_rank_truncate",
 		}
 		write_ibz_only_transverse = write_ibz_only_charge
 		transverse_paths = tuple(
@@ -1974,10 +1979,12 @@ def _gate_fresh_zeta_rank_findings(
 		         f"[rank-policy] lines.")
 	elif transverse:
 		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
-		         f"transverse κ is UNCERTIFIED, discarded-weight ceiling "
+		         f"signed-PSD current Gram κ ceiling "
+		         f"{rank_criterion.KAPPA_CERTIFIED_GRAM:.1e}, discarded-weight ceiling "
 		         f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}) and SILENT — "
 		         f"either the cut bound nothing, or its discarded weight "
-		         f"remained inside the certified regime.")
+		         f"remained inside the common Gram policy. Explicit LU has its "
+		         f"separate conditioning gate.")
 	else:
 		# Preserve the established charge-channel message verbatim.
 		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
@@ -2391,6 +2398,7 @@ def _fit_transverse_zeta_channels(
                 getattr(getattr(_meta_T, 'mu_basis', None), 'coordinate_kind', 'fft_indices') == 'fractional'),
             current_augmentation=current_augmentation,
             current_basis_rows=_meta_T.current_basis_rows,
+            zeta_rcond=cfg.backend.zeta_rcond,
             print_fn=print_fn)
     del parent_psi
     tt_tiles = None
