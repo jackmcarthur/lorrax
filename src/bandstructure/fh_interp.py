@@ -225,7 +225,8 @@ def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
     Parameters
     ----------
     top_band_index : int
-        Index of the highest band (sets epsilon0 = max eigenvalue of this band).
+        Last included band index. Sets epsilon0 to the spectral maximum of
+        the included rows; a corrected QP block can cross outer DFT guards.
     a_band_index : int or None
         Index of the band whose bandwidth sets `a = 4 * bandwidth`.
         If None, defaults to top_band_index (original behavior).
@@ -240,8 +241,9 @@ def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
     # at 6 of this driver's 137 (job 7884866).  The band indices are static,
     # so the whole thing folds into one module per (shape, index pair).
     #
-    # Bit-identical: the ops and their order are unchanged, ``max``/``min``
-    # are order-independent reductions, and ``(max - min) + 1e-14`` is a
+    # For energy-ordered rows the spectral maximum equals the old last-row
+    # maximum. ``max``/``min`` are order-independent reductions, and
+    # ``(max - min) + 1e-14`` is a
     # subtract feeding an add with no multiply for a fusion to contract into
     # an FMA.  ``* 4.0`` stays on the host exactly where it was.
     stats = np.asarray(jax.device_get(
@@ -255,10 +257,10 @@ def _f_params_from_energies(enk_nb_nk: jax.Array, top_band_index: int,
 @partial(jax.jit, static_argnames=('top_band_index', 'a_band_index'))
 def _f_params_jit(enk_nb_nk: jax.Array, top_band_index: int,
                   a_band_index: int) -> jax.Array:
-    """``[max ε_top, max ε_a - min ε_a + 1e-14]`` — see the caller."""
-    E_top_k = enk_nb_nk[top_band_index]
+    """Spectral endpoint and accuracy-band width of the included energy bank."""
+    E_included = enk_nb_nk[:top_band_index + 1]
     E_a_k = enk_nb_nk[a_band_index]
-    return jnp.stack([jnp.max(E_top_k),
+    return jnp.stack([jnp.max(E_included),
                       jnp.max(E_a_k) - jnp.min(E_a_k) + 1e-14])
 
 

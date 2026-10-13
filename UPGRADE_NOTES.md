@@ -1,5 +1,14 @@
 # Upgrade notes
 
+## Unreleased — f(H) endpoint includes corrected states crossing DFT guards
+
+Band interpolation now sets its transform endpoint from the largest energy
+in the included spectrum. A partial QP correction can raise a corrected
+state above the last uncorrected DFT row; using only that row previously
+made valid returned states invisible to f(H). Sorted spectra are unchanged.
+The returned-state shoulder check and corrected-state projector remain in
+force. This changes transform parameters, not physical energy alignment.
+
 ## Unreleased — reuse admitted Coulomb roots in shared-pole construction
 
 The face constructor uses the response owner's memory-budgeted dense policy
