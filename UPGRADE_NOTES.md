@@ -5,6 +5,16 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-13 — SC final diagnostics with sigma_freq_debug_output on a static Sigma
+
+A self-consistent COHSEX or exchange-only run with `sigma_freq_debug_output =
+true` no longer dies in its final diagnostics (`ValueError: Size of label
+'n'`, the head rotation) when the mesh does not divide the SC band count (5
+bands at 2×2). A static Σ has no band carrier, so the final rotation pads U to
+the mesh; the head diagonals now rotate with U's logical block. Σ, H and eqp
+are unchanged: on the P4 hsuite eqp is byte-identical in 15/15 files. No deck
+or environment change.
+
 ## 2026-10-13 — CPU ranks at P > 1 hit the persistent compile cache
 
 On CPU at P > 1, ranks 1..P-1 now find the entries rank 0 writes. JAX's CPU
