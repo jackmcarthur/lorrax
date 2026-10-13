@@ -250,7 +250,7 @@ def sampled_transverse_hartree(reader, samples, source, *, resident_bytes):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from file_io.restart_bundle import BispinorVqReader
     from common.gpu_utils import device_budget_bytes, record_stage_price
-    from common.collectives import gather_to_host
+    from common.collectives import device_put_process_local, gather_to_host, transpose_xy
 
     if (not isinstance(reader, BispinorVqReader)
             or not reader._current_family_authenticated
@@ -270,12 +270,24 @@ def sampled_transverse_hartree(reader, samples, source, *, resident_bytes):
                                 sharding=NamedSharding(mesh, P('x', 'y')))
     potential = jax.ShapeDtypeStruct((3, len(points)), jnp.complex128,
                                     sharding=NamedSharding(mesh, P()))
-    hermitian = jax.jit(lambda T: (jnp.max(jnp.abs(T - T.conj().T)),
+    block_sharding = NamedSharding(mesh, P('x', 'y'))
+    adjoint = jax.jit(lambda T: transpose_xy(T.conj(), mesh),
+                     in_shardings=block_sharding, out_shardings=block_sharding)
+    hermitian = jax.jit(lambda T: (jnp.max(jnp.abs(T - adjoint(T))),
                                     jnp.max(jnp.abs(T))))
+    current_rows = jax.jit(
+        lambda current: tuple(jnp.real(current[j]).astype(jnp.complex128)
+                              for j in range(3)),
+        in_shardings=NamedSharding(mesh, P(None, 'y')),
+        out_shardings=(NamedSharding(mesh, P('y')),) * 3)
+    current_shape = jax.ShapeDtypeStruct((3, len(points)), jnp.complex128,
+        sharding=NamedSharding(mesh, P(None, 'y')))
     quotes = []
     for name, lowered in (
             ('occupied_full_BZ_current', trace.lower(samples['source_full'])),
             ('Gamma_current_block_matvec', action.lower(block, vector)),
+            ('Cartesian_current_row_projection', current_rows.lower(current_shape)),
+            ('Gamma_current_block_adjoint', adjoint.lower(block)),
             ('Gamma_diagonal_Hermiticity', hermitian.lower(block)),
             ('sampled_alpha_A_matrix', contract.lower(samples['receiving'], potential))):
         stats = lowered.compile().memory_analysis()
@@ -303,9 +315,9 @@ def sampled_transverse_hartree(reader, samples, source, *, resident_bytes):
         raise ValueError('Occupied Cartesian current is not real for its Hermitian physical density')
     # The source is a physical Hermitian occupation trace. Retain its
     # roundoff diagnostic; the actual constrained energy uses real d.
-    d_real = jnp.real(d).astype(jnp.complex128)
-    source_rows = tuple(jax.device_put(d_real[j], NamedSharding(mesh, P('y'))) for j in range(3))
-    a = jax.device_put(jnp.zeros((3, len(points)), jnp.complex128), NamedSharding(mesh, P()))
+    source_rows = current_rows(d)
+    a = device_put_process_local(np.zeros((3, len(points)), np.complex128),
+                                NamedSharding(mesh, P()))
     for i in range(3):
         for j in range(i, 3):
             T = reader.get_current_gamma_tile(i + 1, j + 1)
@@ -316,10 +328,10 @@ def sampled_transverse_hartree(reader, samples, source, *, resident_bytes):
                     raise ValueError('Gamma current energy requires Hermitian diagonal interaction blocks')
             a = a.at[i].add(action(T, source_rows[j]))
             if i != j:
-                adjoint = jax.device_put(T.conj().T, NamedSharding(mesh, P('x', 'y')))
-                a = a.at[j].add(action(adjoint, source_rows[i]))
+                T_adjoint = adjoint(T)
+                a = a.at[j].add(action(T_adjoint, source_rows[i]))
                 a.block_until_ready()
-                del adjoint
+                del T_adjoint
             a.block_until_ready()
             del T
     matrix = contract(samples['receiving'], a)
