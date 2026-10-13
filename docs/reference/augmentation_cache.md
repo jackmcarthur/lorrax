@@ -6,6 +6,24 @@ consumes these APIs from an augmentation manifest; `--served-moments`
 also prepares the corresponding served overlap/Fourier tables. Prepare
 raw-parent C/D afterward with `tools/generate_raw_parent_moments.py`.
 
+The internal reconstructed current family may declare
+`current_angular = {"lmax": 7}` in its augmentation manifest. This changes
+only its retained harmonics and storage; the charge `angular` controls and
+the shared endpoint directions, weights, radial fields and sampling scan
+remain unchanged. The shared Lebedev order must cover twice the current
+extent. A current preparation authenticates the sufficient atomic-channel LS/SL bound
+`max(ell_large) + max(ell_small)`, with
+`ell_small = ell_large - sign(kappa)`, from every represented native
+channel. An insufficient inherited or explicit extent refuses. In
+particular the represented Cr `ell=3, kappa=-4` channel requires `L=7`.
+Smooth plane-wave times local-correction terms have unbounded angular
+expansions; this channel-support requirement is not an angular or energy
+convergence certificate for the total current. Native kappa must be
+`ell` or `-ell-1` with the usual positive-ell restriction for the first case.
+The contract and its identity survive the OWN3 fit-to-provider handoff.
+This declaration does not admit compact transverse GW, slab completion,
+screened currents or augmented vector Hartree; their existing guards remain.
+
 Without `cache.target`, the target is `native_large_as_pauli`: the matched
 ONCV large-component correction is treated as a Pauli precursor and lifted
 with the normalized RKB graph. The existing numerical branch is unchanged.

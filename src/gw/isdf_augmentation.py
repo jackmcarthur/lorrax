@@ -87,6 +87,8 @@ def read_augmentation_manifest(directory, *, load_raw_parent=True):
     required = ("species", "radial", "angular", "cache", "runtime")
     if any(not isinstance(manifest.get(key), dict) for key in required):
         raise ValueError("augmentation manifest requires species/radial/angular/cache/runtime dictionaries")
+    if 'current_angular' in manifest:
+        _current_angular_control(manifest)
     local_keys = {'local_coulomb_fourier_file','local_coulomb_fourier_sha256'}
     present = local_keys.intersection(manifest['cache'])
     if present and present != local_keys:
@@ -409,16 +411,108 @@ def _radial_grid(control):
     return r, w, support
 
 
-def _orbit_angular_quadrature(control, cartesian_rotations):
-    """Average a Lebedev rule over actual crystal rotations, then merge duplicates."""
-    from scipy.special import sph_harm_y
-    from isdf.atomic_moments import orbit_averaged_spherical_rule
+def _current_angular_control(artifact):
+    """Current extent may change; its physical sampling rule remains shared."""
+    control = dict(artifact['angular'])
+    current = artifact.get('current_angular')
+    if current is not None:
+        if (not isinstance(current,dict) or set(current) != {'lmax'}
+                or isinstance(current['lmax'],bool)
+                or not isinstance(current['lmax'],int) or current['lmax'] < 0):
+            raise ValueError('current_angular requires exactly a nonnegative integer lmax')
+        control['lmax'] = current['lmax']
+    if int(control['lebedev_order']) < 2*int(control['lmax']):
+        raise ValueError('current harmonic extent exceeds the shared angular sampling rule')
+    return control
 
+
+def _current_angular_support(artifact):
+    """Authenticate LS/SL angular coverage from the represented native channels.
+
+    A normalized kinetic-balance channel has small ell=ell-sign(kappa).
+    Every Cartesian current is LS+SL, so max(ell_L)+max(ell_S) is sufficient
+    for atomic-channel products, including cross channels. Smooth plane-wave
+    times local corrections have unbounded angular expansions; this lower
+    support requirement does not certify their angular convergence.
+    Charge retains its independently declared basis and default controls.
+    """
+    control = _current_angular_control(artifact)
+    census = {}
+    minimum = 0
+    if not isinstance(artifact.get('tables'),dict) or not artifact['tables']:
+        raise ValueError('current angular support requires authenticated native species tables')
+    for species,data in sorted(artifact['tables'].items()):
+        ell, kappa = np.asarray(data['l']), np.asarray(data['kappa'])
+        if (ell.ndim != 1 or kappa.shape != ell.shape or not len(ell)
+                or not np.all(np.isfinite(ell)) or not np.all(np.isfinite(kappa))
+                or np.any(ell < 0) or np.any(ell != np.round(ell))
+                or np.any(kappa == 0) or np.any(kappa != np.round(kappa))):
+            raise ValueError('current angular support requires authenticated native ell/kappa channels')
+        small = ell-np.sign(kappa)
+        if (np.any(small < 0)
+                or np.any((kappa != -ell-1) & ((ell == 0) | (kappa != ell)))):
+            raise ValueError('current angular support has an invalid relativistic kappa channel')
+        channels = sorted(set(zip(ell.astype(int).tolist(),kappa.astype(int).tolist())))
+        census[str(species)] = [list(row) for row in channels]
+        minimum = max(minimum,int(np.max(ell)+np.max(small)))
+    if int(control['lmax']) < minimum:
+        raise ValueError(f'GATE current_angular_support: retained lmax={control["lmax"]} '
+                         f'is below LS/SL channel bound {minimum}; declare current_angular.lmax')
+    contract = dict(schema='lorrax.current_angular_support.v1',
+        charge_lmax=int(artifact['angular']['lmax']),current_lmax=int(control['lmax']),
+        minimum_current_lmax=minimum,native_channels=census,
+        lebedev_order=int(control['lebedev_order']),
+        orthogonality_tolerance=float(control['orthogonality_tolerance']),
+        shared_endpoint_rule=True,current_bilinear='large_small_plus_small_large',
+        support_scope='atomic_channel_products_only',smooth_cross_convergence='not_certified')
+    identity = hashlib.sha256(json.dumps(contract,sort_keys=True,
+        separators=(',',':'),allow_nan=False).encode()).hexdigest()
+    return control,contract,identity
+
+
+def _authenticate_current_angular_support(state):
+    """Refuse altered extent/support metadata before the current local solve."""
+    contract = state.get('angular_support_contract')
+    required = {'schema','charge_lmax','current_lmax','minimum_current_lmax',
+        'native_channels','lebedev_order','orthogonality_tolerance',
+        'shared_endpoint_rule','current_bilinear','support_scope','smooth_cross_convergence'}
+    if (not isinstance(contract,dict)
+            or set(contract) != required
+            or contract.get('schema') != 'lorrax.current_angular_support.v1'):
+        raise ValueError('current augmentation requires its authenticated angular support contract')
+    channels = contract['native_channels']
+    if not isinstance(channels,dict) or not channels:
+        raise ValueError('current angular support has no represented native channels')
+    tables = {}
+    for species,rows in channels.items():
+        data = np.asarray(rows)
+        if data.ndim != 2 or data.shape[1] != 2:
+            raise ValueError('current angular support has invalid native channel rows')
+        tables[species] = dict(l=data[:,0],kappa=data[:,1])
+    _,expected_contract,_ = _current_angular_support(dict(tables=tables,
+        angular=dict(lmax=contract['charge_lmax'],lebedev_order=contract['lebedev_order'],
+            orthogonality_tolerance=contract['orthogonality_tolerance']),
+        current_angular=dict(lmax=contract['current_lmax'])))
+    identity = hashlib.sha256(json.dumps(contract,sort_keys=True,
+        separators=(',',':'),allow_nan=False).encode()).hexdigest()
+    maximum = int(contract['current_lmax'])
+    expected = np.asarray([(l,m) for l in range(maximum+1)
+        for m in range(-l,l+1)],np.int32)
+    if (contract != expected_contract or identity != state.get('angular_support_identity')
+            or maximum < int(contract['minimum_current_lmax'])
+            or int(contract['lebedev_order']) < 2*maximum
+            or not np.array_equal(np.asarray(state.get('lm')),expected)):
+        raise ValueError('current angular support identity or retained harmonic rows changed')
+    return identity
+
+
+def _angular_harmonics(control, directions, weights):
+    """Project a declared harmonic basis on an already certified shared rule."""
+    from scipy.special import sph_harm_y
     order = int(control["lebedev_order"])
     lmax = int(control["lmax"])
     if lmax < 0 or order < 2*lmax:
         raise ValueError("Lebedev polynomial order must cover twice the retained density lmax")
-    directions, weights = orbit_averaged_spherical_rule(order, cartesian_rotations)
     lm = np.asarray([(l, m) for l in range(lmax+1) for m in range(-l, l+1)], dtype=np.int32)
     theta = np.arccos(np.clip(directions[:, 2], -1, 1))
     phi = np.arctan2(directions[:, 1], directions[:, 0])
@@ -427,6 +521,16 @@ def _orbit_angular_quadrature(control, cartesian_rotations):
     tolerance = float(control["orthogonality_tolerance"])
     if error > tolerance or abs(np.sum(weights)-4*np.pi) > tolerance:
         raise ValueError(f"angular quadrature harmonic Gram residual {error:.3e} exceeds {tolerance:.3e}")
+    return lm, harmonics, error
+
+
+def _orbit_angular_quadrature(control, cartesian_rotations):
+    """Average a Lebedev rule over actual crystal rotations, then merge duplicates."""
+    from isdf.atomic_moments import orbit_averaged_spherical_rule
+    if int(control['lmax']) < 0 or int(control['lebedev_order']) < 2*int(control['lmax']):
+        raise ValueError("Lebedev polynomial order must cover twice the retained density lmax")
+    directions, weights = orbit_averaged_spherical_rule(int(control['lebedev_order']),cartesian_rotations)
+    lm,harmonics,error = _angular_harmonics(control,directions,weights)
     return directions, weights, lm, harmonics, error
 
 
@@ -1711,6 +1815,13 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                                           validated_caches=artifact.get('normalized_caches'))
     directions, angles_w, lm, Y, angular_error = _orbit_angular_quadrature(
         artifact['angular'],np.asarray(sym.R_cart)[:int(plan.n_sym_spatial)])
+    if current is not None:
+        current_control,current_contract,current_identity = _current_angular_support(artifact)
+        current_lm,current_Y,current_angular_error = _angular_harmonics(
+            current_control,directions,angles_w)
+        current.update(lm=current_lm,angular_support_contract=current_contract,
+            angular_support_identity=current_identity,angular_gram_error=current_angular_error,
+            shared_charge_compressor=np.array_equal(current_lm,lm))
     atomic_lookup = atomic_point_lookup_budget(centers, atom_types, plan.spatial_ops,
         plan.translations, meta.fft_grid, quadrature_geometry=dict(
             lattice_rows_bohr=lattice.tolist(), angular_directions=directions.tolist(),
@@ -1867,17 +1978,27 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         else:
             cscratch = 24.*cw['full_q_scalar']
         cw['convolution_transform_scratch']=cscratch;cw['total']+=cscratch
-        ca = _angular_compression_workspace_bytes(len(cq),cmu,na,nh,rp,len(directions),int(mesh_xy.shape['x']))
-        craw = 16*cpad*cmu*na*nh*nr/Ptot
+        current_nh = len(current['lm'])
+        ca = _angular_compression_workspace_bytes(len(cq),cmu,na,current_nh,rp,len(directions),int(mesh_xy.shape['x']))
+        craw = 16*cpad*cmu*na*current_nh*nr/Ptot
+        # Charge's projector tables remain live during the current scan.
+        # Reuse them for an equal basis; an extended current basis owns an
+        # additional table, while gather/partial workspaces run sequentially.
+        current_angular_extra = max(0.,
+            ca['total']-ca['index_and_angular_tables']
+            -angular_workspace['total']+angular_workspace['index_and_angular_tables'])
+        if not current['shared_charge_compressor']:
+            current_angular_extra += ca['index_and_angular_tables']
         # Preparation retains six raw delta/PS operands and the protected
         # current source/faces. Factor/paired solves and V/Fourier scratch
         # run only after point/quarter/angular workspaces have been released.
         # Their separately authenticated phases are priced before fit/attach.
         current_price = (6*craw+4*16*npar*nb*4*cmu/Ptot+source_bytes
-            +max(0.,cw['total']-point_workspace['total'])+max(0.,ca['total']-angular_workspace['total'])
+            +max(0.,cw['total']-point_workspace['total'])+current_angular_extra
             +max(0.,32*pc*phase_g*cmu-phase_bytes)+max(0.,16*pc*bc*4*cmu-dft_tile))
         current.update(qpad=cpad,qneg=cqneg,indexed_q=cindexed,workspace=cw,raw_rhs_bytes=craw,
-                       price=current_price,angular_workspace=ca)
+                       price=current_price,angular_workspace=ca,
+                       angular_extra_bytes_per_rank=current_angular_extra)
     price = (source_bytes+4*face_bytes+rhs_copies*rhs_bytes+3*factor_v_bytes+4*point_faces
              +point_workspace['total']+dft_tile+phase_bytes+smooth_tile+overlap_bytes+moment_bytes
              +prepared_overlap_host_bytes+prepared_projection_host_bytes+angular_workspace['total']+current_price
@@ -2144,10 +2265,10 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         current['preserved_source_bytes_per_rank'] = source_bytes
         current['same_point_faces_preserved'] = same_points
         current['weight_l'],current['weight_r']=fitting_band_weights(nb,current['band_range_left'],current['band_range_right'])
-        cshape=(current['qpad'],int(cpplan.n_centroid_packed),na*nh*nr)
+        cshape=(current['qpad'],int(cpplan.n_centroid_packed),na*len(current['lm'])*nr)
         current['rhs']=[jnp.zeros(cshape,jnp.complex128,device=NamedSharding(mesh_xy,qs)) for _ in range(3)]
         current['smooth_rhs']=[jnp.zeros(cshape,jnp.complex128,device=NamedSharding(mesh_xy,qs)) for _ in range(3)]
-        current['selector']=current['store_rhs']=None
+        current['selector']=current['store_rhs']=current['compressor']=None
     norm_source,norm_local = _orbital_norm_kernels(mesh_xy)
     smooth_norm = norm_source(smooth)
     charge_delta = jnp.zeros((npar,nb),jnp.float64,device=NamedSharding(mesh_xy,P(None,'x')))
@@ -2246,7 +2367,14 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             if current is not None:
                 if current['selector'] is None:
                     cids=current['q_full_indices'] if current['indexed_q'] is None else np.arange(len(current['q_full_indices']))
-                    current['selector'],current['store_rhs']=_rhs_storage_kernels(mesh_xy,cids,current['qpad'],na,nh,nr,rp,nf)
+                    current_nh = len(current['lm'])
+                    if current['shared_charge_compressor']:
+                        current['compressor'],current_nf = compressor,nf
+                    else:
+                        current['compressor'],current_nf,_ = _compress_rhs_kernel(
+                            mesh_xy,right_plan,na,current_nh,rp,current_Y.conj()*angles_w)
+                    current['selector'],current['store_rhs']=_rhs_storage_kernels(
+                        mesh_xy,cids,current['qpad'],na,current_nh,nr,rp,current_nf)
                 for channel,terms in enumerate(current['vertex_terms']):
                     cd,csmooth=local_density_rhs(centroid_faces=current['parent_faces'],
                         atom_ae_faces=ae_faces,atom_ps_faces=ps_faces,
@@ -2254,7 +2382,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                         kgrid=meta.kgrid,mesh_xy=mesh_xy,q_neg_idx=current['qneg'],q_indices=current['indexed_q'],
                         vertex_terms=terms,return_smooth=True)
                     for key,value in (('rhs',cd),('smooth_rhs',csmooth)):
-                        cpacket=to_q(compressor(current['selector'](value)))
+                        cpacket=to_q(current['compressor'](current['selector'](value)))
                         current[key][channel]=current['store_rhs'](current[key][channel],cpacket,jnp.int32(r0))
                         current[key][channel].block_until_ready()
                     del cd,csmooth,cpacket,value
@@ -2280,9 +2408,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         from isdf.atomic_hartree import charge_hartree_operator_contract
         state.update(sys_dim=2, hartree_operator_contract=charge_hartree_operator_contract(wfn, sys_dim=2))
     if current is not None:
-        for key in ('selector','store_rhs','weight_l','weight_r'):
+        for key in ('selector','store_rhs','compressor','weight_l','weight_r'):
             del current[key]
-        current.update(radius=radius,weights_dr=weights,lm=lm,centers_cart=centers@lattice,
+        current.update(radius=radius,weights_dr=weights,centers_cart=centers@lattice,
             reciprocal=reciprocal,cell_volume=float(meta.cell_volume),fft_points=int(meta.n_rtot),
             support_radius=support,minimum_atom_image_distance=nearest,identity=artifact['identity'],
             sym=sym,kgrid=tuple(meta.kgrid),
@@ -2464,11 +2592,13 @@ def attach_current_augmentation(zetas, state, *, body_contract):
             or not isinstance(state.get('rhs'),list) or len(state['rhs'])!=3
             or not isinstance(state.get('smooth_rhs'),list) or len(state['smooth_rhs'])!=3):
         raise ValueError('current augmentation requires three prepared unit-loss delta/PS operands')
+    angular_identity = _authenticate_current_angular_support(state)
     channels = tuple(zetas[v] for v in (1,2,3))
     for v,z in zip((1,2,3),channels):
         if (z.mesh is not state['plan'].mesh_xy or z.mu_basis is not state['meta'].mu_basis
                 or getattr(z,'fit_vertex_mu_L',None)!=v
                 or getattr(z,'fit_augmentation_identity',None)!=state['identity']
+                or getattr(z,'fit_current_angular_support_identity',None)!=angular_identity
                 or not np.array_equal(getattr(z,'fit_q_full_indices',None),state['q_full_indices'])
                 or z.store.mu_pad!=state['plan'].n_centroid_packed
                 or z.store.Q!=len(state['q_full_indices'])):

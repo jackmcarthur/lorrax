@@ -17,6 +17,12 @@ def operands():
         unit_endpoint_loss=True,current_basis_rows=None,band_range_left=(0,2),band_range_right=(1,4),
         source_frame_policy='same_actual_served_four_spinor_full_WFN_Lowdin',shared_physical_bands=150,
         q_full_indices=np.arange(3))
+    from gw.isdf_augmentation import _current_angular_support
+    _,contract,identity=_current_angular_support(dict(
+        angular=dict(lebedev_order=23,lmax=6,orthogonality_tolerance=1e-12),
+        tables={1:dict(l=np.asarray([0]),kappa=np.asarray([-1]))}))
+    state.update(angular_support_contract=contract,angular_support_identity=identity,
+        lm=np.asarray([(l,m) for l in range(7) for m in range(-l,l+1)],np.int32))
     args=dict(wfn=SimpleNamespace(nbands=150),sym=SimpleNamespace(kvecs_asints=np.asarray([[0,0,0],[1,0,0],[2,0,0]])),
         meta=meta,centroid_indices=np.zeros((2,3),np.int32),mesh_xy=mesh,
         output_files={1:'unused1',2:'unused2',3:'unused3'},k_unfold_plan=plan,
@@ -47,6 +53,13 @@ def test_current_fit_refuses_charge_donated_source():
     from gw.isdf_fitting import fit_zeta_to_h5
     state,args=operands();args['parent_psi'].psi_G.is_deleted=lambda:True
     with pytest.raises(ValueError,match='donated by the preceding charge fit'):
+        fit_zeta_to_h5(**args)
+
+
+def test_current_fit_refuses_missing_angular_contract_before_geometry():
+    from gw.isdf_fitting import fit_zeta_to_h5
+    state,args=operands();state.pop('angular_support_contract')
+    with pytest.raises(ValueError,match='authenticated angular support'):
         fit_zeta_to_h5(**args)
 
 

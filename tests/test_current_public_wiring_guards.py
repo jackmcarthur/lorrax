@@ -47,7 +47,9 @@ def test_group_writer_refuses_scalar_and_file_only_families_before_geometry(file
 def test_augmented_current_fit_consumes_protected_faces_without_raw_reload(monkeypatch):
     from gw import gw_init,isdf_fitting,isdf_augmentation
     from common import psi_G_store
-    protected=(object(),object());source=object();plan=object()
+    protected=(np.arange(32,dtype=float).reshape(1,4,4,2).astype(complex),
+               np.arange(32,dtype=float).reshape(1,4,2,4).astype(complex))
+    source=object();plan=object()
     meta=SimpleNamespace(current_basis_rows=None)
     state=dict(parent_faces=protected,parent_psi=source,plan=plan,meta=meta)
     seen={};channels={v:SimpleNamespace(close=lambda:None) for v in (1,2,3)}
@@ -55,7 +57,10 @@ def test_augmented_current_fit_consumes_protected_faces_without_raw_reload(monke
     monkeypatch.setattr(psi_G_store,'load_parent_psi_G',forbidden)
     carrier=SimpleNamespace(plan=plan,psi_nmu=object(),psi_mun=object())
     def sample(*args,**kwargs):
-        assert kwargs['faces'] is protected and kwargs['plan'] is plan
+        assert kwargs['plan'] is plan
+        for actual,original in zip(kwargs['faces'],protected):
+            assert np.shares_memory(actual,original)
+            np.testing.assert_array_equal(actual,original)
         return dict(green_parent=carrier)
     monkeypatch.setattr(gw_init,'_transverse_wfn_data',sample)
     def fit(**kwargs):
@@ -85,9 +90,12 @@ def test_augmented_current_fit_consumes_protected_faces_without_raw_reload(monke
     chunk=dict(mubatch=SimpleNamespace(band_chunk=4),band_chunk=4,centroid_k_chunk=1,k_unfold_plan=plan)
     result,tiles=gw_init._fit_transverse_zeta_channels(
         None,object(),chunk,meta,lambda mu:'unused',(False,)*3,(),True,
-        {mu:f'unused{mu}' for mu in (1,2,3)},2.,(0,4),(0,8),object(),cfg,
-        object(),lambda line:None,SimpleNamespace(current_lift='normalized_rkb'),
-        object(),object(),object(),current_augmentation=state)
+        {mu:f'unused{mu}' for mu in (1,2,3)},2.,
+        band_range_left=(0,4),band_range_right=(0,8),
+        band_slices=SimpleNamespace(nb_full=4),cfg=cfg,mesh_xy=object(),
+        print_fn=lambda line:None,
+        representation=SimpleNamespace(current_lift='normalized_rkb'),
+        sym=object(),wfn=object(),zeta_contract=object(),current_augmentation=state)
     assert seen==dict(fit=True,attach=True) and result['green_parent'] is carrier
     assert tiles=='parked complete current metric'
 

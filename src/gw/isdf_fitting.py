@@ -889,6 +889,8 @@ def fit_zeta_to_h5(
                 or current_augmentation.get('source_frame_policy')!='same_actual_served_four_spinor_full_WFN_Lowdin'
                 or current_augmentation.get('shared_physical_bands')!=int(wfn.nbands)):
             raise ValueError('current augmentation requires complete no-file OWN3 fits on its protected typed source/faces')
+        from .isdf_augmentation import _authenticate_current_angular_support
+        _authenticate_current_angular_support(current_augmentation)
         if parent_psi.psi_G.is_deleted():
             raise ValueError('current augmentation source was donated by the preceding charge fit')
         rows=current_augmentation['current_basis_rows']
@@ -1252,6 +1254,7 @@ def fit_zeta_to_h5(
         for v,zeta in zetas.items():
             zeta.fit_vertex_mu_L=v
             zeta.fit_augmentation_identity=current_augmentation['identity']
+            zeta.fit_current_angular_support_identity=current_augmentation['angular_support_identity']
             zeta.fit_q_full_indices=np.asarray(actual_q,dtype=np.int32)
     _track_peak_mb = 0
     try:
