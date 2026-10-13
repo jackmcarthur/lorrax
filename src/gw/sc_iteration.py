@@ -6852,6 +6852,30 @@ def _rotate_static_head_terms_to_dft(
     )
 
 
+def _final_head_diagonals_to_dft(
+    head_terms, head_sigma_diag_w_kn_ry, U_dft_to_qp, *, mesh, pad_axis,
+):
+    """The debug tables' head diagonals in the DFT basis, from one |U|^2.
+
+    The head diagonals are logical-width.  ``pad_axis`` is the band pad the
+    final rotation put on ``U`` (identity-embedded, so its logical block is
+    the logical U); the weight is built from that block.
+    """
+    from runtime.padding import strip_axis
+    U = U_dft_to_qp
+    if pad_axis is not None:
+        U = strip_axis(strip_axis(U, pad_axis, axis=-1), pad_axis, axis=-2)
+    weight = jnp.real(U * jnp.conj(U))
+    head_terms_dft = _rotate_static_head_terms_to_dft(
+        head_terms, U, mesh=mesh, weight_dft_qp=weight)
+    head_sigma_diag_dft = (
+        _rotate_head_diagonal_to_dft(
+            np.asarray(head_sigma_diag_w_kn_ry), U, mesh=mesh,
+            weight_dft_qp=weight)
+        if head_sigma_diag_w_kn_ry is not None else None)
+    return head_terms_dft, head_sigma_diag_dft
+
+
 def run_sc_driver(
     wfns,
     V_q: jax.Array,
@@ -7327,17 +7351,12 @@ def run_sc_driver(
     # These are diagnostics only.  Avoid an extra U-sized |U|^2 temporary and
     # five distributed contractions on the default path where no debug table
     # consumes them; when enabled, build the weight once and share it.
-    static_head_terms_dft = None
-    head_sigma_diag_dft = None
+    static_head_terms_dft = head_sigma_diag_dft = None
     if bool(config.debug.sigma_freq_debug_output):
-        head_weight_dft_qp = jnp.real(U * jnp.conj(U))
-        static_head_terms_dft = _rotate_static_head_terms_to_dft(
-            state_final.outputs.screening.static_head_terms, U, mesh=mesh_xy,
-            weight_dft_qp=head_weight_dft_qp)
-        if sigma_result.head_sigma_diag_w_kn_ry is not None:
-            head_sigma_diag_dft = _rotate_head_diagonal_to_dft(
-                np.asarray(sigma_result.head_sigma_diag_w_kn_ry), U, mesh=mesh_xy,
-                weight_dft_qp=head_weight_dft_qp)
+        static_head_terms_dft, head_sigma_diag_dft = _final_head_diagonals_to_dft(
+            state_final.outputs.screening.static_head_terms,
+            sigma_result.head_sigma_diag_w_kn_ry, U, mesh=mesh_xy,
+            pad_axis=static_axis)
     exact_hartree_dft = state_final.outputs.exact_hartree_dft
     if exact_hartree_dft is None:
         sig_h = _rotate_final(sigma_result.v_h_kij_ry)
