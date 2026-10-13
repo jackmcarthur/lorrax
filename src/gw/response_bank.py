@@ -44,16 +44,17 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         Jitted functions accepting complex128 ``[b,n,n]`` operators at
         ``P(None,'x','y')``, and the resolved backend/prefactor description.
         ``dyson.value(H, chi_raw)`` returns Wc (Ry); ``slope(H, Wc, dchi_raw)``
-        returns its s derivative (Ry^-1), restoring the bare operator internally (photon input is W-V). ``moments(H, A0, A1)`` takes already scaled
+        returns its s derivative (Ry^-1), restoring the bare operator internally (photon slope input is full W). ``moments(H, A0, A1)`` takes already scaled
         bare-response expansion coefficients and returns M1/M3 (Ry^3/Ry^5).
         ``dyson.pair(layout)(dyson.place(H), chi_raw, dchi_raw)`` returns
         (Wc, dWc/ds) of one sample in one program, the same equations and bits
         as value then slope; ``place`` lays the charge roots out once for every
         sample, and ``layout='batch'`` (charge) leaves both outputs in the batch
         layout (local linalg) for a consumer of whole matrices per rank.  The
-        photon pair takes ``(V, chi_raw, dchi_raw, contact, W_inf - V)`` on the
-        face and returns (W - W_inf, its slope), the contact and the constant in
-        the split routines' order; V is not held a second time (its batch copy
+        photon pair takes ``(V, chi_raw, dchi_raw, contact, W_inf)`` on the
+        face and returns (W - W_inf, its slope) without subtracting large
+        static operators. ``dyson.infinity(V, contact)`` retains the actual
+        solved W_inf; V is not held a second time (its batch copy
         would double the largest resident of the photon bank).
         Neither routine Hermitizes its inputs or outputs.
     """
@@ -83,6 +84,8 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     if photon:
         algebra["representation"] = "signed packed photon"
         algebra["constant"] = "W_infinity-V, retained separately from M0..M3"
+        algebra["dynamic_value"] = "solve(I-V*(pref*chi_raw-volume*contact), V*(pref*chi_raw)*W_infinity)"
+        algebra["static_reference"] = "actual solve(I+V*volume*contact,V), never reconstructed as constant+V"
         algebra["moment_convention"] = "M_k=C_(k+1)/2 about W_infinity"
         algebra["units"].update(M0="Ry^2", M2="Ry^4", constant="Ry")
     return dyson, slope, moments, algebra
@@ -179,23 +182,25 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
             return solve(identity + mm(v, jnp.broadcast_to(volume * contact, v.shape)), v.copy())
 
-        def w_minus_v(v, chi_raw, contact):
-            chi = pref * chi_raw - volume * contact
-            identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), chi.shape)
-            return solve(identity - mm(v, chi), v.copy()) - v
+        def photon_value(v, chi_raw, contact, winf):
+            # A=I+VC-VP and A W_inf=V-VP W_inf. Hence
+            # W-W_inf=A^-1 VP W_inf, without subtracting two large solves.
+            # Multiplication order is essential; V, P and C need not commute.
+            identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), chi_raw.shape)
+            lhs = identity - mm(v, pref * chi_raw - volume * contact)
+            return solve(lhs, mm(mm(v, pref * chi_raw), winf))
 
-        def photon_pair(v, chi_raw, dchi_raw, contact, constant):
-            # The split routines' order: Wc = (W - V) - (W_inf - V), and the
-            # slope reads W = (Wc + (W_inf - V)) + V.
-            value = w_minus_v(v, chi_raw, contact) - constant
-            return value, derivative((value + constant) + v, dchi_raw)
-        dyson = SimpleNamespace(value=program(3)(w_minus_v),
+        def photon_pair(v, chi_raw, dchi_raw, contact, winf):
+            value = photon_value(v, chi_raw, contact, winf)
+            return value, derivative(value + winf, dchi_raw)
+        dyson = SimpleNamespace(value=program(4)(photon_value),
+                                infinity=program(2)(infinity),
                                 pair={"face": program(5, 2)(photon_pair)}.get,
                                 place=lambda v: v)
 
-        @program(3)
-        def slope(v, wc, dchi_raw):
-            return derivative(wc + v, dchi_raw)
+        @program(2)
+        def slope(full_w, dchi_raw):
+            return derivative(full_w, dchi_raw)
 
         @program(6, 5)
         def moments(v, a0, a1, o0, o1, contact):
@@ -2081,10 +2086,10 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
     Counted as :func:`_bank_execution` admits them: the compiled arguments
     resident, the outputs, temporaries and native solver workspace on top.
     One ``sample_dyson`` pair ``(H held, chi, dchi) -> (Wc, dWc/ds)``; the
-    photon pair also takes ``extra`` (the contact) and W_inf - V on the face.
+    photon pair also takes ``extra`` (the contact) and actual W_inf on the face.
     A deck without a pair: ``sample_dyson`` takes ``(H, chi)``; ``sample_slope``
-    takes ``(H, Wc, dchi)`` while the value's chi rows are still held (one more
-    face stack).  Both at the full parent span ``nq``, the largest a sample solves.  ``mirrored``:
+    takes ``(H, Wc, dchi)`` for charge or ``(fullW, dchi)`` for photon, while
+    the value's chi rows are still held (one more face stack).  Both at the full parent span ``nq``, the largest a sample solves.  ``mirrored``:
     a partner's χ and dχ/ds rows are collected from unfolded tiles before they
     are concatenated (two more stacks, plus one tile's unfold).
     """
@@ -2105,8 +2110,8 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
     stages = (((pair, (jax.ShapeDtypeStruct(held_roots.shape, held_roots.dtype, sharding=held_roots.sharding),
                        face, face) + tuple(extra) + ((face,) if extra else ()), extra_bytes),)
               if pair is not None else
-              ((dyson.value, (h, face) + tuple(extra), extra_bytes),
-               (solve_slope, (h, face, face), held + extra_bytes)))
+              ((dyson.value, (h, face) + tuple(extra) + ((face,) if extra else ()), extra_bytes),
+               (solve_slope, (face, face) if extra else (h, face, face), held + extra_bytes)))
     for kernel, args, kept in stages:
         memory = _compiled(kernel, args).memory_analysis()
         if memory is None:
@@ -2479,14 +2484,17 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 jnp.concatenate(column, axis=0) for column in zip(*parts))
         span = (int(q0), int(q1))
         h = roots[q0:q1]
+        winf = None if vertex is None else bank_io["photon_winf"][q0:q1]
         if constant is None:
             constant = read_constant(span, bank_handle)
         head_update = None
         if direct_head is not None and q0 == 0:
             from .photon_direct_head import add_direct_gamma_field
-            head_update = direct_head["constant"] + (
-                direct_head["Wc_minus_q"][sample] if partner
-                else direct_head["Wc"][sample])
+            # The stable base is already W-W_inf. The direct head's Wc is
+            # also dynamic-only; its separate static constant belongs only
+            # to the committed moment/constant fields, not this sample.
+            head_update = (direct_head["Wc_minus_q"][sample] if partner
+                           else direct_head["Wc"][sample])
             def gamma_add(packed, coefficient):
                 return add_direct_gamma_field(packed, coefficient,
                     gamma_vectors=direct_head["gamma_vectors"],
@@ -2500,14 +2508,16 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 chi_value = jnp.conj(chi_value)
         if need_value and dyson.pair(layout) is not None:
             # Wc and dWc/ds in one program: on the held roots (charge), or
-            # with the contact and W_inf - V (photon).
+            # with the contact and actual solved W_inf (photon).
             value, slope = execute(dyson.pair(layout), (held if span == (0, len(qids))
                                    else dyson.place(h), chi_value, chi)
-                                   + (() if vertex is None else (contact, constant)), "sample_dyson")
+                                   + (() if vertex is None else (contact, winf)), "sample_dyson")
         else:
             if need_value:
-                value = execute(dyson.value, (h,chi_value)+(() if vertex is None else (contact,)),
-                                "sample_dyson") - constant
+                if vertex is None:
+                    value = execute(dyson.value, (h,chi_value), "sample_dyson") - constant
+                else:
+                    value = execute(dyson.value, (h,chi_value,contact,winf), "sample_dyson")
             else:
                 io_started = time.monotonic()
                 saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
@@ -2517,9 +2527,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 del saved
                 if head_update is not None:
                     value = gamma_add(value, -head_update)
-            w = value if vertex is None else value+constant
-            slope = execute(solve_slope, (h, w, chi), "sample_slope")
-            del w
+            if vertex is None:
+                slope = execute(solve_slope, (h, value, chi), "sample_slope")
+            else:
+                slope = execute(solve_slope, (value + winf, chi), "sample_slope")
         del chi
         if head_update is not None:
             coefficient = (direct_head["dWc_minus_q_ds"][sample]
@@ -2868,7 +2879,9 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     nq, n = len(sym.q_irr_full_idx), layout.packed_extent
     # Packed V, contact/reference/D, all XY tiled.  The stream reads the two
     # families' resident raw-parent carriers; it prepares no endpoint copy.
-    vbytes = 16*(nq+4)*n*n//mesh_xy.size
+    # Retain the actual solved W_inf beside V for every sample; the bank
+    # constant remains W_inf-V and is not a numerically safe reconstruction.
+    vbytes = 16*(2*nq+4)*n*n//mesh_xy.size
     name, row = _reserve(meta, "photon_endpoints_and_V", vbytes)
     ledger.live_stages = ambient+(name,)
     receipt["memory"].append(row)
@@ -2918,6 +2931,10 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                            mesh_xy=mesh_xy)
     receipt["seconds"]["static_contact"] = time.monotonic()-before
     del grid, drude
+    dyson, _, _, _ = response_algebra(meta, config, mesh_xy=mesh_xy,
+        n=n, ordered=True, photon=True)
+    bank["photon_winf"] = execute(dyson.infinity,
+        (bank["photon_v"], contact), "photon_infinity")
     direct_head = None
     with timing.section("bank.direct_head"):
         if uses_direct_bispinor_shared_pole_head(config):
