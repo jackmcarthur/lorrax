@@ -141,6 +141,49 @@ def test_current_component_basis_refuses_nonunitary_rows():
             point_active=np.ones(4, bool), current_basis_rows=2*np.eye(3))
 
 
+def test_reader_contraction_uses_distributed_complex_adjoint(monkeypatch):
+    """Numerical reader seam only: independent full combined-T contraction."""
+    from file_io.restart_bundle import BispinorVqReader
+    from gw.augmentation_current_hartree import sampled_transverse_hartree
+    import common.gpu_utils as gpu_utils
+    mesh = _mesh(); rng = np.random.default_rng(54621)
+    nk, nb, mu = 3, 4, 8
+    points = np.arange(mu) < 6
+    bands = np.arange(nb) < 3
+    source = (rng.normal(size=(nk, nb, 4, mu))
+              + 1j*rng.normal(size=(nk, nb, 4, mu))) * .1
+    receiver = (rng.normal(size=(2, nb, 4, mu))
+                + 1j*rng.normal(size=(2, nb, 4, mu))) * .1
+    occ = np.zeros((nk, nb)); occ[:, :2] = 1.
+    weights = np.full(nk, 1/nk)
+    raw = rng.normal(size=(3*mu, 3*mu)) + 1j*rng.normal(size=(3*mu, 3*mu))
+    T = ((raw + raw.conj().T) / 2).reshape(3, mu, 3, mu).transpose(0, 2, 1, 3)
+    clean_source = source * points[None, None, None]
+    clean_receiver = receiver * points[None, None, None] * bands[None, :, None, None]
+    current = np.einsum('knsm,ist,kntm,kn,k->im', clean_source.conj(), _alpha(),
+                        clean_source, occ, weights).real
+    T *= points[None, None, :, None] * points[None, None, None, :]
+    potential = np.einsum('ijmn,jn->im', T, current)
+    literal = np.einsum('kmsr,ist,kntr,ir->kmn', clean_receiver.conj(), _alpha(),
+                        clean_receiver, potential.real)
+    # This synthetic reader checks numerical execution, not artifact admission.
+    reader = object.__new__(BispinorVqReader)
+    reader._mesh = mesh; reader._current_family_authenticated = True
+    reader.kgrid = (3, 1, 1)
+    reader.get_current_gamma_tile = lambda i, j: _put(mesh, T[i-1, j-1], ('x', 'y'))
+    monkeypatch.setattr(gpu_utils, 'device_budget_bytes', lambda: 10**10)
+    monkeypatch.setattr(gpu_utils, 'record_stage_price', lambda *args: None)
+    got = sampled_transverse_hartree(reader, dict(
+        source_full=_put(mesh, source, (None, 'x', None, 'y')),
+        receiving=_put(mesh, receiver, (None, 'x', None, 'y')),
+        point_active=points, receiving_band_active=bands),
+        dict(occupations=occ, full_kweights=weights), resident_bytes=0.)
+    np.testing.assert_allclose(np.asarray(got['parent_kij_ry']), literal, rtol=4e-13, atol=2e-14)
+    assert got['reality_diagnostics']['raw_potential_imaginary_max'] > 1e-3
+    owners = {q['owner'] for q in got['memory_receipt']['quotes']}
+    assert {'Cartesian_current_row_projection', 'Gamma_current_block_adjoint'} <= owners
+
+
 @pytest.mark.parametrize('helical', [False, True])
 def test_complex_hermitian_energy_derivative_projects_after_cartesian_conversion(helical):
     from gw.augmentation_current_hartree import make_sampled_current_potential_matrix
