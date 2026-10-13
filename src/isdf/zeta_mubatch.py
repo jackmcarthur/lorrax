@@ -1572,7 +1572,29 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
             del physical
         del result
         del zt
-    if augmentation is not None:
+    face_onsite=(augmentation is not None and st0.Q<mesh.size
+                 and callable(augmentation.get('onsite_face')))
+    if face_onsite:
+        # Only thin field panels cross from q ownership to the distributed
+        # face. The local provider never forms a whole-q onsite matrix here.
+        pending=list(V)
+        V=[]
+        for index in range(len(pending)):
+            value=_finish_v(mesh,st0.Q)(pending[index])
+            jax.block_until_ready(value)
+            pending[index]=None
+            V.append(value)
+        V=tuple(V)
+        del pending
+        correction=augmentation['onsite_face'](local_state,pairs)
+        expected=NamedSharding(mesh,P(None,'x','y'))
+        if (not isinstance(correction,tuple) or len(correction)!=len(pairs)
+                or any(tile.shape!=(st0.Q,mu,mu) or tile.sharding!=expected for tile in correction)):
+            raise ValueError('grouped onsite correction requires the actual distributed centroid face')
+        add=jax.jit(lambda value,tile:value+tile,
+            in_shardings=(expected,expected),out_shardings=expected,donate_argnums=(0,))
+        V=tuple(add(value,tile) for value,tile in zip(V,correction))
+    elif augmentation is not None:
         correction=augmentation['onsite'](local_state,pairs)
         if not isinstance(correction,tuple) or len(correction)!=len(pairs):
             raise ValueError("grouped static provider must return one onsite operator per current pair")
@@ -1582,7 +1604,8 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
         V=tuple(add(value,tile) for value,tile in zip(V,correction))
     out = []
     for Vp in V:
-        Vp = _finish_v(mesh, st0.Q)(Vp)
+        if not face_onsite:
+            Vp = _finish_v(mesh, st0.Q)(Vp)
         out.append(z0.mu_basis.unpack_operator(Vp) if z0.mu_basis is not None else Vp)
     for z, Sa in zip(zetas, S):
         Sa = _finish_shell(mesh, st0.Q)(Sa)
