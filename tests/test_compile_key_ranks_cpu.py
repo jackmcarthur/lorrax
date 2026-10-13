@@ -45,6 +45,8 @@ def test_cpu_topology_keeps_the_target_machine_only():
     for records in (b"", b"\n\x00", b"\n\x02\x10\x01", b"\n\x00\n\x03\x08\x80\x10",
                     b"\n\x81\x01" + b"d" * 129):
         assert jcc._cpu_target_machine(records + target) == target
+    for malformed in (b"\n\x81", b"\n\x05ab", b"\n\x02\x10\x01\n\xff\xff"):
+        assert jcc._cpu_target_machine(malformed) == malformed
     blob = xla_client.get_topology_for_devices(jax.devices("cpu")).serialize()
     machine = jcc._cpu_target_machine(blob)
     assert 0 < len(machine) < len(blob) and blob.endswith(machine)

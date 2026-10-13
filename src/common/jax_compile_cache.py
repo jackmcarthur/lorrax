@@ -447,17 +447,24 @@ def _install_rank_invariant_cpu_key() -> None:
 
 
 def _cpu_target_machine(topology: bytes) -> bytes:
-    """A serialized XLA:CPU topology without its leading device records (field 1)."""
+    """A serialized XLA:CPU topology without its leading device records (field 1).
+
+    Bytes that do not parse as such records come back whole: the key is then
+    JAX's own, process-local again, and no compile fails over it.
+    """
     i = 0
-    while i < len(topology) and topology[i] == 0x0A:
-        size, shift, i = 0, 0, i + 1
-        while True:
-            size |= (topology[i] & 0x7F) << shift
-            shift, i = shift + 7, i + 1
-            if topology[i - 1] < 0x80:
-                break
-        i += size
-    return topology[i:]
+    try:
+        while i < len(topology) and topology[i] == 0x0A:
+            size, shift, i = 0, 0, i + 1
+            while True:
+                size |= (topology[i] & 0x7F) << shift
+                shift, i = shift + 7, i + 1
+                if topology[i - 1] < 0x80:
+                    break
+            i += size
+    except IndexError:
+        return topology
+    return topology[i:] if i <= len(topology) else topology
 
 
 _COMPILE_ENTRY_POINT = "backend_compile_and_load"

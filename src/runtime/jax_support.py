@@ -26,7 +26,9 @@ Two measured facts make the version string untrustworthy as the sole evidence:
    ``common/jax_compile_cache.py`` wraps four ``jax._src`` entry points (the
    cache lookup, the compile request, the backend compile and
    ``ExecuteReplicated.__init__``) and, at P > 1, rebinds
-   ``ArrayImpl._multi_slice``.
+   ``ArrayImpl._multi_slice`` and replaces two cache-key hashes
+   (``cache_key._hash_serialized_compile_options`` and
+   ``cache_key._hash_accelerator_config``).
    Two of them changed shape between the two generations, so the patched
    function is called with the wrong number of arguments and the run dies on
    its FIRST ``jit`` compile (measured; see :data:`REQUIRED_PRIVATE_ARITY`).
