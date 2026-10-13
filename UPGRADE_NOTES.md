@@ -2209,4 +2209,3 @@ q owner. Actual compiled memory and live capacity are checked before the
 extra bank; a declined layout retains the existing q distribution. No input
 change is needed. This changes execution placement, with no performance or
 material accuracy claim before matched verification.
-
