@@ -269,7 +269,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                           current_basis_rows=None,head_cartesian=None,body_mask=None,
                           body_head_slots=None,
                           interpolation_degree=3,quadrature_order=16,
-                          fourier_points=4097,field_tile=128,centroid_tile=64):
+                          fourier_points=4097,field_tile=128,centroid_tile=512):
     r"""Procedural per-current references to a coherent static group provider.
 
     Every RHS is (Q_pad,mu,atom*LM*radius) complex128, whole-q owned.
