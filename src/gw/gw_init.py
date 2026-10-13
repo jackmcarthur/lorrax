@@ -476,7 +476,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	elif charge_fit_weights is not None:
 		raise ValueError("charge endpoint weights cannot stamp a current-channel fit")
 	if int(vertex_mu_L) != 0 and _ti.get('current_solver_family') == 'signed_psd_rank_truncate':
-		from common.gamma_matrices import current_fit_solver_kind
+		from isdf.core import current_fit_solver_kind
 		prov['transverse_solver_kind'] = current_fit_solver_kind(
 			int(vertex_mu_L), meta.current_basis_rows)
 	if int(vertex_mu_L) != 0 and meta.current_basis_rows is not None:

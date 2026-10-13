@@ -190,29 +190,6 @@ def current_fit_terms(channel: int, basis_rows) -> tuple:
                  for i in range(3) for j in range(3) if abs(u[i] * u[j]) > 0)
 
 
-def current_fit_solver_kind(channel: int, basis_rows) -> str:
-    """Signed-PSD solve for the actual admitted current matrix.
-
-    The existing two-endpoint contraction gives C=sQ and Z=sB, where Q
-    is the sesquilinear least-squares Gram and conjugate(Gamma)=s Gamma.
-    Only s=+1 or -1 is admitted here; derive it from the physical matrix,
-    never from a noisy Gram trace or eigenvalue signs.
-    """
-    c = int(channel)
-    if c not in (1, 2, 3):
-        raise ValueError('signed current fitting requires channel 1, 2 or 3')
-    current_fit_terms(c, basis_rows)
-    matrix = (_gamma_tables[c] if basis_rows is None else
-              sum(_np.asarray(basis_rows)[c-1, i] * _gamma_tables[i+1]
-                  for i in range(3)))
-    scale = _np.max(_np.abs(matrix))
-    for sign, kind in ((1, 'positive_rank_truncate'),
-                       (-1, 'negative_rank_truncate')):
-        if scale > 0 and _np.max(_np.abs(matrix.conj()-sign*matrix)) <= 1e-12*scale:
-            return kind
-    raise ValueError('signed current fitting requires a real or imaginary current matrix')
-
-
 def gamma_apply(X: jax.Array, perm: jax.Array, phase: jax.Array,
                 axis: int, is_identity: bool = False) -> jax.Array:
     """Apply a monomial γ̃ matrix on ``axis`` of X via gather + phase mul.

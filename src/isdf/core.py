@@ -1386,6 +1386,38 @@ def _rank_truncate_capacity_error(nq, n_rmu, *, channel: str) -> ValueError:
         f"cap makes this RESOLVE, not finish.  {advice}")
 
 
+def current_fit_solver_kind(channel: int, basis_rows) -> str:
+    """Choose the signed-PSD policy from the actual public current matrix.
+
+    The existing two-endpoint contraction gives C=sQ and Z=sB, where Q
+    is the sesquilinear least-squares Gram and conjugate(Gamma)=s Gamma.
+    This is solve policy, not an atomic Gamma/source owner change. Rebuild
+    the small matrix through the public permutation/phase API.
+    """
+    from common.gamma_matrices import current_fit_terms, gamma_perm_phase_host
+
+    c = int(channel)
+    if c not in (1, 2, 3):
+        raise ValueError('signed current fitting requires channel 1, 2 or 3')
+    current_fit_terms(c, basis_rows)
+
+    def matrix_of(component):
+        perm, phase = gamma_perm_phase_host(component)
+        matrix = np.zeros((len(perm), len(perm)), dtype=np.complex128)
+        matrix[np.arange(len(perm)), perm] = phase
+        return matrix
+
+    matrix = (matrix_of(c) if basis_rows is None else
+              sum(np.asarray(basis_rows)[c - 1, i] * matrix_of(i + 1)
+                  for i in range(3)))
+    scale = np.max(np.abs(matrix))
+    for sign, kind in ((1, 'positive_rank_truncate'),
+                       (-1, 'negative_rank_truncate')):
+        if scale > 0 and np.max(np.abs(matrix.conj() - sign * matrix)) <= 1e-12 * scale:
+            return kind
+    raise ValueError('signed current fitting requires a real or imaginary current matrix')
+
+
 def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, *,
                          n_rmu: int | None = None,
                          nq: int | None = None) -> str:

@@ -5,7 +5,7 @@ import pytest
 
 
 def test_current_sign_comes_from_actual_cartesian_and_circular_matrices():
-    from common.gamma_matrices import current_fit_solver_kind
+    from isdf.core import current_fit_solver_kind
     from symmetry_maps import CIRCULAR_CURRENT_ROWS
     assert [current_fit_solver_kind(c,None) for c in (1,2,3)] == [
         'positive_rank_truncate','negative_rank_truncate','positive_rank_truncate']

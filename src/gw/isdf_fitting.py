@@ -12,7 +12,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import Meta
 from common import timing
-from common.gamma_matrices import current_fit_terms, current_fit_solver_kind
+from common.gamma_matrices import current_fit_terms
 from common.collectives import (
     device_put_process_local as _device_put_process_local,
 )
@@ -27,6 +27,7 @@ from .gw_config import (ZETA_RCOND_DEFAULT,
                         active_zeta_truncating_knobs)
 
 from isdf.core import (
+    current_fit_solver_kind,
     c_q_from_psi_sm,
     complete_ordered_pair_normal_equations,
     factor_c_q,
