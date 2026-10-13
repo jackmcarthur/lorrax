@@ -102,14 +102,13 @@ def test_legacy_restart_cannot_inherit_an_unmarked_metric(tmp_path, monkeypatch)
             expected_conditioning='unit_diagonal', **kwargs)
 
 
-@pytest.mark.parametrize('change', ['restart', 'SC', 'density', 'head', 'current', 'smearing', 'broadening'])
+@pytest.mark.parametrize('change', ['SC', 'density', 'head', 'current', 'smearing', 'broadening'])
 def test_fractional_scope_guard_precedes_source_access(tmp_path, change):
     from gw.gw_config import BispinorGWMode, HeadCorrection, QPSolver
     from gw.gw_init import prepare_band_metadata
     cfg = SimpleNamespace(**_config(tmp_path).__dict__)
     cfg.qp_solver = QPSolver.ONE_SHOT_DFT
-    if change == 'restart': cfg.restart = True
-    elif change == 'SC': cfg.qp_solver = QPSolver.SELF_CONSISTENT
+    if change == 'SC': cfg.qp_solver = QPSolver.SELF_CONSISTENT
     elif change == 'density': cfg.density_self_consistent = True
     elif change == 'head': cfg.head = SimpleNamespace(correction=HeadCorrection.FULL)
     elif change == 'current': cfg.bispinor_gw = BispinorGWMode.BARE_TRANSVERSE
@@ -123,11 +122,31 @@ def test_fractional_scope_guard_precedes_source_access(tmp_path, change):
             ForbiddenSource(), coordinate_kind='fractional')
 
 
-def test_admitted_smooth_fractional_scope_needs_no_atomic_manifest(tmp_path):
+@pytest.mark.parametrize('restart', [False, True])
+def test_admitted_smooth_fractional_scope_needs_no_atomic_manifest(tmp_path, restart):
+    from dataclasses import replace
     from gw.gw_init import _validate_smooth_fractional_charge
     cfg = _config(tmp_path)
+    cfg = replace(cfg, restart=restart)
     assert cfg.paths.atomic_reconstruction_dir is None
     _validate_smooth_fractional_charge(cfg)
+
+
+@pytest.mark.parametrize('missing', ['centroids', 'source'])
+def test_fractional_restart_requires_both_content_identities(monkeypatch, missing):
+    from file_io import restart_bundle
+    from gw.gw_config import BispinorGWMode
+    from gw.gw_init import _restart_charge_basis
+    monkeypatch.setattr(restart_bundle, 'read_metadata', lambda _: dict(
+        centroid_hashes={'charge': None if missing == 'centroids' else 'digest',
+                         'current': None}, charge_representation='unused',
+        bispinor_gw='coulomb_only'))
+    meta = SimpleNamespace(nspinor=2,
+        mu_basis=SimpleNamespace(coordinate_kind='fractional'))
+    with pytest.raises(ValueError, match='fractional_restart_identity'):
+        _restart_charge_basis(None, (0, 7), missing != 'source', None,
+            None, None, meta, lambda *_: None, 'unused', None,
+            bispinor_gw=BispinorGWMode.COULOMB_ONLY)
 
 
 @pytest.mark.parametrize('ns', [2,4])

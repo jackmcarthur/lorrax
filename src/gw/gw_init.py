@@ -3535,6 +3535,11 @@ def _restart_charge_basis(
     		f"want {_charge.charge_representation!r} "
     		f"(docs/theory/bispinor-gw.md#lift); fix: restart = false.")
     _have_c = _stamped.get('centroids_charge_md5')
+    if (meta.mu_basis.coordinate_kind == 'fractional'
+            and (_have_c is None or not _restart_wfn_provenance_complete)):
+        raise ValueError(
+            'GATE fractional_restart_identity: exact-point restart requires '
+            'the centroid-content stamp and authenticated WFN source')
     if _have_c is None:
     	print0(
     		f"  *** LORRAX SANITY: {tensors_filename} carries no "
@@ -4066,13 +4071,13 @@ def coarse_class_for_deck(config, wfn, print0):
 def _validate_smooth_fractional_charge(cfg):
     """Keep the new exact smooth sampling route inside its proved charge scope."""
     from .gw_config import HeadCorrection, QPSolver
-    if (cfg.restart or cfg.qp_solver is not QPSolver.ONE_SHOT_DFT
+    if (cfg.qp_solver is not QPSolver.ONE_SHOT_DFT
             or bool(getattr(cfg, 'density_self_consistent', False))
             or uses_transverse_interaction(cfg)
             or cfg.head.correction is not HeadCorrection.OFF
             or getattr(cfg, 'occ_smearing_width_ry', None) not in (None, 0.)
             or float(getattr(cfg.screening, 'occ_broadening_ev', 0.)) != 0.):
-        raise ValueError('GATE smooth_fractional_charge: requires fresh scalar headOff one-shot fixed-source unsmeared sampling')
+        raise ValueError('GATE smooth_fractional_charge: requires scalar headOff one-shot fixed-source unsmeared sampling')
 
 
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn,

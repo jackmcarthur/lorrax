@@ -1,5 +1,14 @@
 # Upgrade notes
 
+## Unreleased — reuse authenticated exact-point charge fits
+
+Smooth fractional-centroid Coulomb runs can restart in the same head-off,
+one-shot, fixed-source scope as fresh runs. Exact-point restarts now require
+both a centroid-content stamp and authenticated WFN provenance; legacy
+unstamped fractional bundles refuse. Screening and self-energy equations
+are unchanged. This permits a completed fit to supply multiple GW models
+without fitting again.
+
 User-visible changes, newest first. Each entry says what changed, which
 results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
