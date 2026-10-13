@@ -943,16 +943,21 @@ def probe_is_independent(norm_after, norm_before, scale=0.0, *,
 # another whispers" failure ``band_degeneracy`` names.
 
 _PENDING: list[str] = []
+_PENDING_REQUIRED: list[str] = []
 
 
-def note_device_finding(where, detail) -> None:
+def note_device_finding(where, detail, *, required=False) -> None:
     """Record a device-site policy finding for the next host seam.
 
     Called from ``jax.debug.callback``.  It records; it does not raise,
     because raising out of a host callback inside XLA is not a contract this
     tree relies on.  :func:`raise_if_pending` is the refusal.
+    ``required`` marks operator-input validity, which rank policy cannot waive.
     """
-    _PENDING.append(f"{where}: {detail}")
+    message = f"{where}: {detail}"
+    _PENDING.append(message)
+    if required:
+        _PENDING_REQUIRED.append(message)
 
 
 def pending() -> list[str]:
@@ -968,6 +973,13 @@ def raise_if_pending(where="rank truncation", *, mode=None, log=None) -> None:
     """
     m = resolve_policy_mode(mode)
     found, _PENDING[:] = list(_PENDING), []
+    required, _PENDING_REQUIRED[:] = list(_PENDING_REQUIRED), []
+    # A rank-tuning dial cannot waive validity of the operator being solved.
+    # The same deferred status seam carries these mandatory input checks.
+    if required:
+        body = "\n".join("  - " + f for f in required)
+        raise RankPolicyError(
+            f"[rank-policy] {where}: nonoptional input validity failure.\n{body}")
     if not found or m == "off":
         return
     body = "\n".join("  - " + f for f in found)

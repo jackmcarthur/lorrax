@@ -33,6 +33,7 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int,
     # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
     # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
     lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
+    invalid = None
     if require_psd:
         # The current matrix sign is known analytically before this owner.
         # Material negative modes or a non-Hermitian source cannot become a
@@ -44,14 +45,6 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int,
         norm = jnp.linalg.norm(C_log, axis=(-2,-1))
         invalid = ((scale <= 0) | ~jnp.isfinite(scale)
                    | (lam[...,0] < -eps*scale) | (skew > eps*norm))
-        def refuse(_):
-            jax.debug.callback(lambda _: rank_criterion.note_device_finding(
-                'signed current PSD Gram',
-                'the analytically sign-normalized current Gram is nonzero, '
-                'Hermitian PSD only within its floating backward envelope; '
-                'the actual input violates that condition'), invalid)
-            return 0
-        jax.lax.cond(jnp.any(invalid), refuse, lambda _: 0, 0)
     lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
     keep = lam > (rcond * lam_max)       # near-null cut
     # …and the near-null cut is not allowed to stop mid-multiplet.  THIS
@@ -77,7 +70,7 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int,
     # numbers and gated on neither.
     _certify_the_cut(lam, keep, where="zeta rank_truncate",
                      kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM,
-                     rcond=rcond)
+                     rcond=rcond, invalid_psd=invalid)
     # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
     # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
     inv_sqrt = jnp.where(

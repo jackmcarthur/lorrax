@@ -1541,12 +1541,12 @@ def _close_the_cut(spectrum, keep, *, where: str):
 
 
 def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
-                     rcond: float, exclude=None) -> None:
+                     rcond: float, exclude=None, invalid_psd=None) -> None:
     """GATE the ζ rank cut against the certified regime; see docs/architecture/zeta_fit_face_psi_cct.md."""
     # The DRIVER reads the dial and passes it — same rule as _close_the_cut.
     mode = rank_criterion.resolve_policy_mode(
         os.environ.get(rank_criterion.POLICY_MODE_ENV))
-    if mode == "off":
+    if mode == "off" and invalid_psd is None:
         return
     mag = jnp.abs(spectrum)
     # ``exclude`` marks positions that are not physics at all — the
@@ -1569,7 +1569,10 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
         over_k = jnp.zeros_like(bound)
     else:
         over_k = bound & (kappa > float(kappa_certified))
-    fired = jnp.any(over_k | over_w)
+    if mode == "off":
+        over_k, over_w = jnp.zeros_like(bound), jnp.zeros_like(bound)
+    invalid = (jnp.zeros_like(bound) if invalid_psd is None else invalid_psd)
+    fired = jnp.any(over_k | over_w | invalid)
     _kcert = ("uncertified" if kappa_certified is None
               else f"{float(kappa_certified):.3e}")
 
@@ -1581,24 +1584,31 @@ def _certify_the_cut(spectrum, keep, *, where: str, kappa_certified,
             + f"{1.0 / float(rcond):.3e}" + "), certified kappa ceiling "
             + _kcert + ".  n_drop/q={d} kappa/q={k} discarded_weight/q={w} "
             "(ceiling " + f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}" + "). "
-            "A cut that binds at kappa >= ~1e10 is measured wrong by "
+            "signed_PSD_invalid/q={p}. A cut that binds at kappa >= ~1e10 is measured wrong by "
             "electron-volts (R19 rcond ladder; Si 4x4x4 1776 centroids -> "
             "Sigma_c MAE 54.4 eV at exit 0).  Mode=" + mode + ". ***",
-            d=n_drop, k=kappa, w=dropped_w, ordered=False)
-        jax.debug.callback(
+            d=n_drop, k=kappa, w=dropped_w, p=invalid, ordered=False)
+        def report(k, d, w, invalid_input, invalid_cut):
             # Callback operands can be CPU JAX arrays. Reduce on the host:
             # a JAX reduction here compiles only on the q-owner process and
             # can deadlock its peers before the intended policy refusal.
-            lambda k, d, w: rank_criterion.note_device_finding(
-                where,
-                "the cut bound (max %d directions dropped on one q) at "
-                "kappa_eff up to %.3e against a certified ceiling of %s, "
-                "discarding up to %.3e of tr|C|.  Reduce the centroid "
-                "budget, or raise zeta_rcond back onto the certified "
-                "plateau (1e-8 .. 1e-4)."
-                % (int(np.asarray(d).max()), float(np.asarray(k).max()),
-                   _kcert, float(np.asarray(w).max()))),
-            kappa, n_drop, dropped_w)
+            if np.any(np.asarray(invalid_input)):
+                rank_criterion.note_device_finding(
+                    'signed current PSD Gram',
+                    'the analytically sign-normalized current Gram is nonzero, '
+                    'Hermitian PSD only within its floating backward envelope; '
+                    'the actual input violates that condition', required=True)
+            if np.any(np.asarray(invalid_cut)):
+                rank_criterion.note_device_finding(
+                    where,
+                    "the cut bound (max %d directions dropped on one q) at "
+                    "kappa_eff up to %.3e against a certified ceiling of %s, "
+                    "discarding up to %.3e of tr|C|.  Reduce the centroid "
+                    "budget, or raise zeta_rcond back onto the certified "
+                    "plateau (1e-8 .. 1e-4)."
+                    % (int(np.asarray(d).max()), float(np.asarray(k).max()),
+                       _kcert, float(np.asarray(w).max())))
+        jax.debug.callback(report, kappa, n_drop, dropped_w, invalid, over_k | over_w)
         return 0
 
     jax.lax.cond(fired, _say, lambda _: 0, 0)

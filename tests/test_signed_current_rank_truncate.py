@@ -65,6 +65,28 @@ def test_signed_current_rejects_non_PSD_source_instead_of_dropping_it(defect):
         rank_criterion.raise_if_pending()
 
 
+@pytest.mark.parametrize('defect', ['negative', 'skew', 'zero'])
+def test_signed_input_validity_cannot_be_disabled_by_rank_policy(monkeypatch, defect):
+    import jax
+    import jax.numpy as jnp
+    from common import rank_criterion
+    from isdf import cplus
+    monkeypatch.setenv(rank_criterion.POLICY_MODE_ENV, 'off')
+    C = np.diag([1., .2, .03, .004]).astype(complex)
+    if defect == 'negative':
+        C[3, 3] = -.1
+    elif defect == 'skew':
+        C[0, 1] = .01j
+    else:
+        C[:] = 0
+    factor = jax.jit(lambda c: cplus.factor(
+        c, rcond=1e-8, rank_log=False, n_log=4, require_psd=True))(jnp.asarray(C[None]))
+    factor.block_until_ready()
+    jax.effects_barrier()
+    with pytest.raises(rank_criterion.RankPolicyError, match='nonoptional.*|signed current PSD'):
+        rank_criterion.raise_if_pending(mode='off')
+
+
 def test_explicit_LU_keeps_its_original_factor_and_signed_ridge():
     import jax
     from jax.sharding import Mesh,NamedSharding,PartitionSpec as P
