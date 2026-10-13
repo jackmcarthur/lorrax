@@ -6,6 +6,9 @@ backend version, process 0 is the only writer, and on GPU the key is the
 same on every rank (the device assignment is stripped). What this file adds
 is only what that cannot see or say:
 
+* the same rank-invariant key on CPU at P > 1
+  (:func:`_install_rank_invariant_cpu_key`), without which ranks 1..P-1
+  never hit;
 * the location: ``$SCRATCH/.cache/lorrax/jax_compile/<namespace>/np{P}``
   (:func:`default_cache_dir`), where the namespace names jax, jaxlib, the
   native FFI bundle and this file's key schema, never the LORRAX source (a
@@ -33,14 +36,14 @@ is only what that cannot see or say:
   the compile first compiles under that slot, and the other waits for it.
 
 What this file no longer does, and why. Until 2026-10-05 it froze an
-all-rank agreed entry set at startup and vetoed every other lookup, made
-the key process-invariant on CPU, canonicalized ``jit__multi_slice``, wrote
-entries atomically and prefetched them: all against XLA:GPU's collective
-autotuner, which hung when one rank hit the cache and skipped the exchange
-(7648fd417, jax 0.7.0). The runtime has run at ``xla_gpu_autotune_level=0``
-since 969d56431, so a divergent hit/miss pattern now costs the missing rank
-one compile and nothing waits. Measured at P4 (runs/DEV/771, agreement
-off on a warm namespace): completes, eqp bitwise, hits on every rank.
+all-rank agreed entry set at startup and vetoed every other lookup,
+canonicalized ``jit__multi_slice``, wrote entries atomically and prefetched
+them: all against XLA:GPU's collective autotuner, which hung when one rank
+hit the cache and skipped the exchange (7648fd417, jax 0.7.0). The runtime
+has run at ``xla_gpu_autotune_level=0`` since 969d56431, so a divergent
+hit/miss pattern now costs the missing rank one compile and nothing waits.
+Measured at P4 (runs/DEV/771, agreement off on a warm namespace):
+completes, eqp bitwise, hits on every rank.
 
 DRIVERS MUST NOT CALL :func:`ensure_jax_compile_cache`: ``runtime.
 initialize_communicator_stack`` step 7 owns it, above every jit in the
@@ -406,6 +409,55 @@ def _install_observation_patch() -> None:
 
     _cc.get_executable_and_time = _observed_get
     _cc._lorrax_observer_installed = True
+
+
+def _install_rank_invariant_cpu_key() -> None:
+    """Give an XLA:CPU program the rank-invariant cache key JAX gives a GPU one.
+
+    ``jax._src.cache_key`` hashes two process-local things into a CPU key: the
+    device assignment, which it strips on GPU only, and the client's serialized
+    topology, which on CPU starts with this process's own devices. At P4 no key
+    of ranks 1-3 matched rank 0's, the only writer, so the peers compiled every
+    program on every run. The patch strips the assignment on every platform (a
+    no-op on GPU) and hashes the CPU topology from its target machine on, the
+    triple, CPU and features that decide whether an executable loads here. A
+    peer binds an entry to its own devices (``get_executable_and_time``'s
+    ``executable_devices``), as on GPU. A GPU topology is hashed as before.
+    """
+    from jax._src import cache_key as _ck
+    from jax._src.lib import xla_client
+
+    if getattr(_ck, "_lorrax_cpu_key_installed", False):
+        return
+    hash_options = _ck._hash_serialized_compile_options
+    hash_accelerators = _ck._hash_accelerator_config
+
+    def _options(hash_obj, compile_options, strip_device_assignment=False):
+        return hash_options(hash_obj, compile_options, strip_device_assignment=True)
+
+    def _accelerators(hash_obj, devices):
+        if devices.flat[0].platform != "cpu":
+            return hash_accelerators(hash_obj, devices)
+        hash_obj.update(_cpu_target_machine(
+            xla_client.get_topology_for_devices(list(devices.flat)).serialize()))
+
+    _ck._hash_serialized_compile_options = _options
+    _ck._hash_accelerator_config = _accelerators
+    _ck._lorrax_cpu_key_installed = True
+
+
+def _cpu_target_machine(topology: bytes) -> bytes:
+    """A serialized XLA:CPU topology without its leading device records (field 1)."""
+    i = 0
+    while i < len(topology) and topology[i] == 0x0A:
+        size, shift, i = 0, 0, i + 1
+        while True:
+            size |= (topology[i] & 0x7F) << shift
+            shift, i = shift + 7, i + 1
+            if topology[i - 1] < 0x80:
+                break
+        i += size
+    return topology[i:]
 
 
 _COMPILE_ENTRY_POINT = "backend_compile_and_load"
@@ -1296,6 +1348,8 @@ def ensure_jax_compile_cache() -> None:
                  f"compiles from scratch.")
         return
     _install_observation_patch()
+    if n_proc > 1:
+        _install_rank_invariant_cpu_key()
     _STATE.enabled = True
     if cache_source != "explicit":
         _STATE.namespace = Path(cache_dir).name
