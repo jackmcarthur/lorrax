@@ -363,6 +363,9 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
     -------
     dict
         ``rhs``, ``fourier_tile(t,coefficients)`` and ``onsite(coefficients)``.
+        ``prepare_fourier_coefficients`` optionally distributes independent
+        centroid rows once before the G stream; Fourier packets still return
+        on the canonical q owner, and onsite retains the original q bank.
         These kernels use the existing whole-q-owner layout, stream degrees
         and atoms through scans, and do not replicate a Coulomb matrix.
         The representation has no transverse/Breit locality certificate.
@@ -450,10 +453,11 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
             - scale*tables['compensation_self'][zero_row]*tables['moments'][zero_row])
 
     def ft_local(coefficients, bessel, angular, g_radial, steps_, degree_rows, moment_rows):
-        # Every operand is on this q owner. No all-gather in this body.
+        # Every Fourier row is local to its q or mu owner. No gather here.
+        local_mu = coefficients.shape[1]
         delta_coefficients = coefficients[..., :na*nh*nr] if compensated_body or delta_only_enrichment else coefficients
-        coeff = delta_coefficients.reshape(coefficients.shape[0], mu, na, nh, nr)
-        zero = jnp.zeros((coeff.shape[0], mu, gt), jnp.complex128)
+        coeff = delta_coefficients.reshape(coefficients.shape[0], local_mu, na, nh, nr)
+        zero = jnp.zeros((coeff.shape[0], local_mu, gt), jnp.complex128)
         def add(acc, ah):
             delta, comp = acc
             a, h = ah
@@ -478,6 +482,85 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
         in_specs=(qspec, P(XY, None, None, None), P(XY, None, None, None),
                   P(XY, None, None), P(), P(), P()),
         out_specs=(qspec, qspec), check_vma=False))
+    mu_spec = P(None, XY, None)
+    mu_sharding = NamedSharding(mesh, mu_spec)
+    mu_fourier_kernel = jax.jit(shard_map(ft_local, mesh=mesh,
+        in_specs=(mu_spec, P(), P(), P(), P(), P(), P()),
+        out_specs=(mu_spec, mu_spec), check_vma=False))
+    distribution_receipt = dict(mode='q', reason='direct q-owned Fourier input')
+
+    def prepare_fourier_coefficients(coefficients, *, caller_workspace_bytes=0.):
+        """Balance small-q Fourier work once, retaining the canonical q solve.
+
+        The q bank still serves the unchanged onsite/moment owners. Only the
+        independent mu rows of the Fourier transform move. Capacity is agreed
+        before the extra bank or a replicated geometry packet is allocated;
+        a declined layout keeps the incumbent q-owned arithmetic.
+        """
+        from common.collectives import all_gather_processes
+        from common.gpu_utils import device_budget_bytes, host_bytes_per_process, record_stage_price
+        from runtime.aot_memory import aot_kernel_peak_bytes
+        from isdf.zeta_mubatch import _require_q_owned, _to_mu_owner, _rows_to_q_local
+
+        _require_q_owned(coefficients, mesh, provider_rhs.shape, name='Fourier coefficient source')
+        if not np.isfinite(caller_workspace_bytes) or caller_workspace_bytes < 0:
+            raise ValueError('Fourier caller workspace must be finite and nonnegative')
+        if st.Q >= mesh.size or mu % mesh.size:
+            distribution_receipt.update(mode='q', reason='q ownership covers the mesh')
+            return coefficients
+        mtile = jax.ShapeDtypeStruct((st.Q, mu, gt), jnp.complex128, sharding=mu_sharding)
+        mcoeff = jax.ShapeDtypeStruct((st.Q, mu, coefficients.shape[-1]),
+                                    jnp.complex128, sharding=mu_sharding)
+        replicated = lambda shape, dtype: jax.ShapeDtypeStruct(shape, dtype, sharding=rep)
+        to_mu = _to_mu_owner(mesh, st.Q, 'mu')
+        to_q = _rows_to_q_local(mesh, mesh.size, 1, mu//mesh.size, mu, st.q_axis)
+        quotes = []
+        for owner, fn, args in (
+                ('coefficient_q_to_mu', to_mu, (coefficients,)),
+                ('mu_Fourier', mu_fourier_kernel, (mcoeff,
+                    replicated((st.Q, len(degrees), gt, nr), jnp.float64),
+                    replicated((st.Q, na, nh, gt), jnp.complex128),
+                    replicated((st.Q, len(degrees), gt), jnp.float64), scan_steps, dr, rows)),
+                ('Fourier_mu_to_q', to_q, (mtile,))):
+            compiled = fn.lower(*args).compile()
+            peak = aot_kernel_peak_bytes(compiled)
+            hlo = compiled.as_text().lower()
+            quotes.append(dict(owner=owner, total=peak.total,
+                resident_increment=peak.resident_increment,
+                collective_counts={name:hlo.count(name+'(') for name in
+                                   ('all-gather', 'all-to-all', 'all-reduce')}))
+        # Coefficients remain live for onsite. The standalone FT price also
+        # counts its explicit geometry and mu input: conservative double
+        # counting here avoids an unpriced table/communication lifetime.
+        future = (quotes[0]['resident_increment'] + quotes[1]['total']
+                  + 2*quotes[2]['resident_increment'] + caller_workspace_bytes)
+        bessel_bytes = st.Q*len(degrees)*gt*nr*8
+        angular_bytes = st.Q*na*nh*gt*16
+        # Spline evaluation selects four coefficients beside its result;
+        # angular construction holds raw, phase-weighted and placement rows.
+        host_future = 5*bessel_bytes+4*angular_bytes+st.Q*gt*(3*8+len(degrees)*8+8*8)
+        stats = [device.memory_stats() or {} for device in mesh.local_devices]
+        measured = all('bytes_in_use' in value for value in stats)
+        live = max((value.get('bytes_in_use', 0) for value in stats), default=0)
+        admission = np.asarray(all_gather_processes(np.asarray(
+            [int(measured), live+future, device_budget_bytes(),
+             host_future, host_bytes_per_process(fraction=.7)], np.float64)))
+        accepted = (np.all(admission[:, 0] == 1)
+                    and np.all(admission[:, 1] <= admission[:, 2])
+                    and np.all(admission[:, 3] <= admission[:, 4]))
+        distribution_receipt.update(mode='mu' if accepted else 'q',
+            reason='small q domain' if accepted else 'extra layout capacity not admitted',
+            actual_live_baseline=live, future_device_bytes=future,
+            planned_bytes_per_rank=float(np.max(admission[:, 1])),
+            future_host_bytes=host_future, actual_AOT=quotes,
+            measured_live_baseline=measured, logical_q=int(st.Q), packed_mu=mu,
+            scope='Fourier layout only; same factor, radial fields and Coulomb operator')
+        if not accepted:
+            return coefficients
+        record_stage_price('isdf.charge_mu_Fourier', float(np.max(admission[:, 1])))
+        prepared = to_mu(coefficients)
+        prepared.block_until_ready()
+        return prepared
 
     def onsite_local(coefficients, metric, steps_, degree_rows):
         coeff = coefficients.reshape(coefficients.shape[0], mu, na, nh, nr)
@@ -527,6 +610,10 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
 
     def fourier_tile(t, coefficients):
         start = int(t)*gt
+        mu_owned = (mesh.size > 1 and st.Q < mesh.size
+                    and coefficients.shape[0] == st.Q
+                    and coefficients.sharding.is_equivalent_to(mu_sharding, ndim=3))
+        q_extent = st.Q if mu_owned else Qp
         # Callback indices name only this process's addressed q rows. Keep
         # their shared host tables just for the three placements in this tile;
         # no peer's Q*G*radial table is constructed or retained on this rank.
@@ -535,7 +622,7 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
             key = (qslice.start, qslice.stop, qslice.step)
             if key in local_rows:
                 return local_rows[key]
-            qidx = np.arange(Qp)[qslice]
+            qidx = np.arange(q_extent)[qslice]
             vectors = np.zeros((len(qidx), gt, 3), dtype=np.float64)
             n = max(0, min(gt, kg.shape[1]-start))
             real = qidx < st.Q
@@ -564,15 +651,24 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
             return local_rows[key]
 
         def put_q_rows(component, tail):
-            shape = (Qp, *tail)
-            sharding = NamedSharding(mesh, P(XY, *([None]*len(tail))))
+            shape = (q_extent, *tail)
+            sharding = rep if mu_owned else NamedSharding(mesh, P(XY, *([None]*len(tail))))
             return jax.make_array_from_callback(
                 shape, sharding, lambda index: local_tables(index[0])[component])
 
-        return fourier_kernel(coefficients,
+        kernel = mu_fourier_kernel if mu_owned else fourier_kernel
+        result = kernel(coefficients,
                               put_q_rows(0, (len(degrees), gt, nr)),
                               put_q_rows(1, (na, nh, gt)),
                               put_q_rows(2, (len(degrees), gt)), scan_steps, dr, rows)
+        if not mu_owned:
+            return result
+        # One geometry packet is live at a time, even without a zeta writer.
+        # The return owner then restores the existing V/head/writer layout.
+        jax.block_until_ready(result)
+        from isdf.zeta_mubatch import _rows_to_q_local
+        to_q = _rows_to_q_local(mesh, mesh.size, 1, mu//mesh.size, mu, st.q_axis)
+        return tuple(to_q(value) for value in result)
 
     def onsite(coefficients):
         if compensated_body or delta_only_enrichment:
@@ -593,13 +689,18 @@ def radial_coulomb_provider(zeta_g, rhs, *, smooth_rhs=None, monopole_rhs=None, 
         fourier=dict(kernel=fourier_kernel, table_operands=(scan_steps, dr, rows),
             table_shapes=((Qp, len(degrees), gt, nr), (Qp, na, nh, gt), (Qp, len(degrees), gt)),
             table_specs=(P(XY, None, None, None), P(XY, None, None, None), P(XY, None, None)),
-            table_dtypes=('float64', 'complex128', 'float64')))
+            table_dtypes=('float64', 'complex128', 'float64')),
+        mu_fourier=dict(kernel=mu_fourier_kernel, table_operands=(scan_steps, dr, rows),
+            table_shapes=((st.Q, len(degrees), gt, nr), (st.Q, na, nh, gt), (st.Q, len(degrees), gt)),
+            table_specs=(P(), P(), P()), table_dtypes=('float64', 'complex128', 'float64')))
 
     diagnostics = {} if cache is None else {
         key: cache[key] for key in ('points', 'maximum_wavevector', 'table_bytes', 'retained_spline_bytes',
                                    'max_density_validation_error',
                                    'max_compensation_validation_error', 'validation_points')}
     return dict(rhs=provider_rhs, fourier_tile=fourier_tile, onsite=onsite,
+                prepare_fourier_coefficients=prepare_fourier_coefficients,
+                fourier_distribution_receipt=distribution_receipt,
                 aot_metadata=aot_metadata,
                 radial_tables=tables if delta_only_enrichment else None,
                 exact_monopole_offset=na*nh*nr if delta_only_enrichment else 2*na*nh*nr,

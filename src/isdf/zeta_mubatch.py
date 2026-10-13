@@ -1056,6 +1056,36 @@ class ZetaG:
         V, M, shell = _zero_accumulators(self.mesh, st.Q_pad, mu,
                                          int(sl.shape[1]), debug_m=dbg, with_v=with_v)
         L_arg = self.factor
+        fourier_coefficients = None
+        prepare_fourier = None if augmentation is None else augmentation.get('prepare_fourier_coefficients')
+        if callable(prepare_fourier) and st.Q < self.mesh.size and mu % self.mesh.size == 0:
+            # The extra Fourier layout is admitted beside this actual V live
+            # set, before its coefficient bank or geometry packets exist.
+            # Current/grouped providers keep their existing prepare owner.
+            from runtime.aot_memory import compiled_new_bytes
+            shape = (st.Q_pad, mu, st.g_tile)
+            abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
+                sharding=NamedSharding(self.mesh, P(_XY, None, None)))
+            local_args = ((abstract, abstract, bare_dev),) if positive_body else ((abstract, abstract),)
+            module = step.lower(L_arg, abstract, v_dev, ngk_dev, sl_dev,
+                                jnp.int32(0), V, M, shell, *local_args).compile()
+            # Two Z reads (look-ahead), and the previous delta/compensation
+            # outputs can coexist with the next Fourier packet. New packet
+            # fields and transport outputs are priced by its prepare owner.
+            caller_workspace = 4*np.prod(shape)*16/_mesh_size(self.mesh)+compiled_new_bytes(module)
+            if zeta_io is not None:
+                writer = _to_mu_owner(self.mesh, st.Q, 'mu')
+                caller_workspace += compiled_new_bytes(writer.lower(abstract).compile())
+                if self.mu_basis is not None:
+                    mu_tile = jax.ShapeDtypeStruct((st.Q, mu, st.g_tile), jnp.complex128,
+                        sharding=NamedSharding(self.mesh, P(None, _XY, None)))
+                    unpack = jax.jit(lambda tile: self.mu_basis.unpack_axis(tile, 1))
+                    caller_workspace += compiled_new_bytes(unpack.lower(mu_tile).compile())
+            jax.block_until_ready((local_coefficients, V, M, shell, v_dev, ngk_dev, sl_dev))
+            fourier_coefficients = prepare_fourier(local_coefficients,
+                caller_workspace_bytes=float(caller_workspace))
+            if jax.process_index() == 0:
+                print_fn('  charge Fourier distribution: '+str(augmentation['fourier_distribution_receipt']))
         nxt = st.read_tile(0)
         for t in range(st.n_Gt):
             # Tile t+1 is read while tile t is contracted.
@@ -1063,7 +1093,8 @@ class ZetaG:
             nxt = st.read_tile(t + 1) if t + 1 < st.n_Gt else None
             local_tiles = ()
             if augmentation is not None:
-                tiles = augmentation['fourier_tile'](t, local_coefficients)
+                tiles = augmentation['fourier_tile'](t, local_coefficients if fourier_coefficients is None
+                                                      else fourier_coefficients)
                 if not isinstance(tiles, tuple) or len(tiles) != 2:
                     raise ValueError("ZetaG.contract_v: fourier_tile must return "
                                      "(delta,compensation)")
@@ -1081,6 +1112,7 @@ class ZetaG:
                     # rank (SlabIO.sync_writes).
                     zeta_io.sync_writes()
             del Zt, zt
+        del fourier_coefficients
         if augmentation is not None and with_v:
             correction = augmentation['onsite'](local_coefficients)
             _require_q_owned(correction, self.mesh,
