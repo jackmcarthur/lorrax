@@ -1035,8 +1035,11 @@ def fit_zeta_to_h5(
         if not np.array_equal(actual_q,current_augmentation['q_full_indices']):
             raise ValueError('current augmentation canonical q rows differ from the current fit')
         from common.gpu_utils import device_budget_bytes,warn_over_budget
-        price=(float(mubatch_plan.hwm_bytes)
-               +float(current_augmentation['fit_resident_extra_bytes_per_rank']))
+        # The physical-current planner already includes the protected live
+        # sources in its fit and contraction peaks. Legacy plans do not.
+        price = float(mubatch_plan.hwm_bytes)
+        if current_augmentation.get('early_physical_support') is None:
+            price += float(current_augmentation['fit_resident_extra_bytes_per_rank'])
         budget=float(device_budget_bytes())
         if price>budget:
             warn_over_budget('isdf.current_augmentation_fit',price,budget)

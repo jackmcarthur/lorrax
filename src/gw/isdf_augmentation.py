@@ -2694,7 +2694,7 @@ def _price_current_contraction_aot(channels, state, kg, controls):
     tiles = tuple(shape((Qp,mu,gt)) for _ in range(3))
     Vs = tuple(shape((Qp,mu,mu)) for _ in pairs)
     shell = tuple(shape((Qp,mu,1)) for _ in range(3))
-    gpad = ((int(st.g_axis.logical)+gt-1)//gt)*gt
+    gpad = int(st.g_axis.carrier)
     quote('mixed_pair_physical_writer',_pair_tile_kernel(mesh,gt,pairs,
         use_local_augmentation=True,return_physical=True),
         (tiles,shape((6,Qp,gpad),jnp.complex128,P(None,('x','y'),None)),

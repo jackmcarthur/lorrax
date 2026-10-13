@@ -2530,7 +2530,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	    from .isdf_augmentation import _current_contract_workspace_bytes
 	    cs = _current_augmentation
 	    if cs.get('early_physical_support') is not None:
-	        qpad = ((len(cs['q_full_indices'])+mesh_xy.size-1)//mesh_xy.size)*mesh_xy.size
+	        qpad = int(cs['qpad'])
 	        mu = int(cs['plan'].n_centroid_packed)
 	        geometry = (len(cs['centers_cart']),len(cs['lm']),len(cs['radius']))
 	        old = _chunks_T
