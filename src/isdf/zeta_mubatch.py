@@ -1079,7 +1079,8 @@ class ZetaG:
                 if self.mu_basis is not None:
                     mu_tile = jax.ShapeDtypeStruct((st.Q, mu, st.g_tile), jnp.complex128,
                         sharding=NamedSharding(self.mesh, P(None, _XY, None)))
-                    unpack = jax.jit(lambda tile: self.mu_basis.unpack_axis(tile, 1))
+                    unpack = jax.jit(lambda tile: self.mu_basis.unpack_axis(
+                        tile, 1, spec=P(None, _XY, None)))
                     caller_workspace += compiled_new_bytes(unpack.lower(mu_tile).compile())
             jax.block_until_ready((local_coefficients, V, M, shell, v_dev, ngk_dev, sl_dev))
             fourier_coefficients = prepare_fourier(local_coefficients,
