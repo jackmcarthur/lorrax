@@ -1,5 +1,14 @@
 # Upgrade notes
 
+## Unreleased — smooth currents accept exact fractional sampling points
+
+Headless, fixed-source one-shot current fits now use the existing signed-G
+Fourier sampler at fractional centroids. Their Gram and right-hand sides
+consume the same samples; reusing a current fit resamples those exact
+positions with the same loader. No atomic reconstruction manifest is needed
+for this smooth-wavefunction path. FFT-grid inputs and downstream screening
+and self-energy equations are unchanged.
+
 ## Unreleased — f(H) endpoint includes corrected states crossing DFT guards
 
 Band interpolation now sets its transform endpoint from the largest energy

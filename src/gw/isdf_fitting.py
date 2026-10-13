@@ -869,6 +869,9 @@ def fit_zeta_to_h5(
             f"fit_zeta_to_h5: channels {vertices} must be (0,) (charge) or a "
             "subset of the current channels (1, 2, 3).")
     transverse = vertices != (0,)
+    coordinate_kind = getattr(k_unfold_plan, 'coordinate_kind', 'fft_indices')
+    if coordinate_kind not in ('fft_indices', 'fractional'):
+        raise ValueError('unknown centroid coordinate kind in typed fitting plan')
     if q0_potential is not None:
         if (transverse or active_zeta_truncating_knobs() or not use_augmented_samples
                 or not isinstance(q0_potential_metadata,dict)
@@ -897,16 +900,13 @@ def fit_zeta_to_h5(
         if ((rows is None)!=(current_basis_rows is None)
                 or rows is not None and not np.array_equal(rows,current_basis_rows)):
             raise ValueError('current augmentation basis differs from the canonical fitting basis')
-    elif transverse and use_augmented_samples:
+    elif transverse and use_augmented_samples and coordinate_kind != 'fractional':
         raise ValueError('augmented current fitting requires its complete prepared current operand')
     _validate_deferred_zeta_write(
         defer=defer_zeta_write, write_file=write_zeta_file,
         augmented=use_augmented_samples, vertices=vertices)
-    coordinate_kind = getattr(k_unfold_plan,'coordinate_kind','fft_indices')
-    if coordinate_kind not in ('fft_indices','fractional'):
-        raise ValueError("unknown centroid coordinate kind in typed fitting plan")
-    if coordinate_kind == 'fractional' and (not use_augmented_samples or transverse and current_augmentation is None):
-        raise ValueError("fractional fitting requires protected externally supplied charge samples")
+    if coordinate_kind == 'fractional' and not use_augmented_samples:
+        raise ValueError('fractional fitting requires protected externally supplied samples')
     if charge_factor_equilibration not in (None,'unit_diagonal'):
         raise ValueError("unknown charge factor equilibration convention")
     if charge_factor_equilibration is not None and (not use_augmented_samples or transverse):

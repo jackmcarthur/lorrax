@@ -128,3 +128,36 @@ def test_augmented_current_refuses_partial_family_before_loading():
             (False,True,False),(),True,{1:'unused',2:'unused',3:'unused'},
             2.,(0,4),(0,8),None,cfg,None,lambda line:None,None,None,None,None,
             current_augmentation={})
+
+
+def test_reused_fractional_current_resamples_signed_G_without_fft_lookup(monkeypatch):
+    from gw import gw_init, wavefunction_bundle
+    from common import wfn_transforms, psi_G_store
+    faces = (object(), object())
+    plan = object()
+    points = np.array([[.123, .271, .309]])
+    meta = SimpleNamespace(mu_basis=SimpleNamespace(coordinate_kind='fractional'))
+    seen = {}
+    def forbidden(*args, **kwargs):
+        raise AssertionError('exact current samples reached the integer FFT loader')
+    monkeypatch.setattr(wfn_transforms, 'load_centroids_band_chunked', forbidden)
+    def load(**kwargs):
+        assert kwargs['centroid_indices'] is points and kwargs['meta'] is meta
+        assert kwargs['placement'] == 'none' and kwargs['bispinor']
+        assert kwargs['bispinor_lift'] == 'normalized_rkb'
+        seen['sampled'] = True
+        return SimpleNamespace(faces=faces)
+    monkeypatch.setattr(psi_G_store, 'load_parent_psi_G', load)
+    monkeypatch.setattr(wavefunction_bundle, 'parent_faces', lambda *a, **kw: a)
+    monkeypatch.setattr(wfn_transforms, 'get_enk_bandrange', lambda *a, **kw: (object(), None))
+    monkeypatch.setattr(wavefunction_bundle, 'wavefunctions_face_from_restart', lambda *a, **kw: object())
+    def carrier(wfns, nmu, mun, **kwargs):
+        assert (nmu, mun) == faces and kwargs['plan'] is plan
+        return 'exact current samples'
+    monkeypatch.setattr(wavefunction_bundle, 'build_packed_parent_green_carrier', carrier)
+    wfn = SimpleNamespace(release_read_staging=lambda: seen.update(released=True))
+    result = gw_init._transverse_wfn_data(wfn, SimpleNamespace(parent_k_domain='full_bz'),
+        meta, points, SimpleNamespace(bispinor=True, bispinor_gw=None), object(),
+        SimpleNamespace(full_range=(0,8), b1=4, b3=8), 4, plan=plan)
+    assert result['green_parent'] == 'exact current samples'
+    assert seen == dict(sampled=True, released=True)

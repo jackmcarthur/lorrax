@@ -9,7 +9,7 @@ import json
 import os
 import time
 
-def check_samples(runtime):
+def check_samples(runtime, *, fractional_current=False):
     import numpy as np
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -26,15 +26,19 @@ def check_samples(runtime):
     N = int(np.prod(grid))
     xyz = np.indices(grid).reshape(3, -1).T
     x = xyz / np.asarray(grid)
+    physical_g = np.where(xyz >= np.asarray(grid)//2, xyz-np.asarray(grid), xyz)
+    wave_g = physical_g if fractional_current else xyz
     k = np.array([[0., 0., 0.], [.5, 0., 0.]])
     xmu = x[[0, 1, 5, 9, 17, 29, 42, 63]]
+    if fractional_current:
+        xmu = (xmu + np.array([.031, .079, .113])) % 1
     rng = np.random.default_rng(9371)
     psi = (rng.normal(size=(nk, nb, ns, N))
            + 1j * rng.normal(size=(nk, nb, ns, N))) / np.sqrt(N * ns)
     # Independent full reciprocal sum, including physical Bloch phases.
-    E = np.exp(2j * np.pi * np.einsum('kgd,rd->kgr', k[:, None] + xyz, x))
+    E = np.exp(2j * np.pi * np.einsum('kgd,rd->kgr', k[:, None] + wave_g, x))
     psi_r = np.einsum('knsg,kgr->knsr', psi, E) / np.sqrt(N)
-    Emu = np.exp(2j * np.pi * np.einsum('kgd,md->kgm', k[:, None] + xyz, xmu))
+    Emu = np.exp(2j * np.pi * np.einsum('kgd,md->kgm', k[:, None] + wave_g, xmu))
     samples = np.einsum('knsg,kgm->knsm', psi, Emu) / np.sqrt(N)
     changed = samples.copy()
     changed[0, 0, 3, 2] += 0.47 - 0.23j
@@ -47,6 +51,34 @@ def check_samples(runtime):
 
     def explicit(sample):
         sample = sample * live
+        if fractional_current:
+            # Literal Dirac alpha matrices; independent of the fitted
+            # monomial contractions and their shared implementation.
+            pauli = (np.array([[0,1],[1,0]]), np.array([[0,-1j],[1j,0]]),
+                     np.diag([1.,-1.]))
+            alpha = [np.block([[np.zeros((2,2)),s],[s,np.zeros((2,2))]]) for s in pauli]
+            fields = []
+            for operator in alpha:
+                z = []
+                for q in range(nk):
+                    total = np.zeros((b,N),complex)
+                    for i in range(nk):
+                        j=(i+q)%nk
+                        # The incumbent raw normal equations use alpha
+                        # bilinearly. Thus raw C and Z both carry a minus
+                        # sign for imaginary alpha_y; it cancels in C^-1 Z.
+                        # Apply that convention explicitly, independently
+                        # of current_fit_terms, at the conjugated endpoint.
+                        at_mu=np.einsum('nam,ab,lbm->nlm',sample[i].conj(),operator.conj(),sample[j])
+                        at_r=np.einsum('nar,ab,lbr->nlr',psi_r[i].conj(),operator,psi_r[j])
+                        total += np.einsum('n,l,nlm,nlr->mr',wl,wr,at_mu.conj(),at_r)
+                    z.append(total)
+                z=np.asarray(z)
+                z=z+z[qneg].conj()
+                demod=np.exp(-2j*np.pi*(k@x.T))
+                fields.append(np.fft.fftn((z*demod[:,None]).reshape(nk,b,*grid),
+                    axes=(-3,-2,-1)).reshape(nk,b,N))
+            return np.asarray(fields)
         dl = np.einsum('n,knam,knbr->kabmr', wl, sample, psi_r.conj())
         dr = np.einsum('n,knam,knbr->kabmr', wr, sample, psi_r.conj())
         z = np.stack([sum(np.einsum('abmr,abmr->mr', dl[i], dr[(i+q)%nk].conj())
@@ -69,6 +101,9 @@ def check_samples(runtime):
                    n_col=int(ci.shape[1]), n_s=int(ci.shape[2]),
                    plane_from_col=np.asarray(jax.device_get(pfc)), n_pg=2,
                    axis=0, n_src=nk, n_pc=1, c_out=1, n_blk=2)
+    if fractional_current:
+        from common.gamma_matrices import current_fit_terms
+        factory.update(vertices=(1,2,3), vertex_terms=tuple(current_fit_terms(v,None) for v in (1,2,3)))
     unf = tuple(put(a) for a in (
         np.arange(nk, dtype=np.int32), np.zeros(nk, np.int32), np.zeros(nk, bool),
         np.broadcast_to(np.eye(ns), (nk, ns, ns)).astype(np.complex128),
@@ -77,7 +112,7 @@ def check_samples(runtime):
     lp = np.broadcast_to(np.arange(c, dtype=np.int32), (nranks, 1, c))
     ll = np.zeros((nranks, 1, c, 3), np.int32)
     args = (put(psi.conj(), P(None, None, None, ('x', 'y'))), put(wl), put(wr),
-            put(k), put(np.broadcast_to(xyz, (nk, N, 3)), P(None, ('x', 'y'), None)),
+            put(k), put(np.broadcast_to(wave_g, (nk, N, 3)), P(None, ('x', 'y'), None)),
             put(xmu), put(live), (put(np.asarray(ci)), put(np.asarray(ca))),
             tuple(put(a) for a in zt), unf,
             (put(lp, P(('x', 'y'))), put(ll, P(('x', 'y')))))
@@ -85,9 +120,13 @@ def check_samples(runtime):
     augmented_kernel = make_route_g_kernel(**factory, use_augmented_samples=True)
     sample_put = lambda a: put(a, P(None, None, None, ('x', 'y')))
     t0 = time.monotonic()
-    smooth = np.asarray(gather_to_host(smooth_kernel(*args)[0]))
-    zero = np.asarray(gather_to_host(augmented_kernel(*args, sample_put(samples))[0]))
-    altered = np.asarray(gather_to_host(augmented_kernel(*args, sample_put(changed))[0]))
+    def collect(result):
+        arrays = result if fractional_current else result[:1]
+        values = np.asarray([gather_to_host(a) for a in arrays])
+        return values if fractional_current else values[0]
+    smooth = collect(smooth_kernel(*args))
+    zero = collect(augmented_kernel(*args, sample_put(samples)))
+    altered = collect(augmented_kernel(*args, sample_put(changed)))
     # A larger source batch retains the same streamed one-row plane stage.
     # This is the fallback planner's independent axis: all logical rows must
     # agree, while additional source slots remain exact zero padding.
@@ -101,7 +140,7 @@ def check_samples(runtime):
     expanded_args[-1] = (put(expanded_lp,P(('x','y'))),put(expanded_ll,P(('x','y'))))
     expanded_sample = np.pad(changed,((0,0),(0,0),(0,0),(0,b)))
     expanded_kernel = make_route_g_kernel(**dict(factory,b=expanded_b),use_augmented_samples=True)
-    expanded = np.asarray(gather_to_host(expanded_kernel(*expanded_args,sample_put(expanded_sample))[0]))
+    expanded = collect(expanded_kernel(*expanded_args,sample_put(expanded_sample)))
     reference, expected_changed = explicit(samples), explicit(changed)
     rel = lambda a, e: float(np.linalg.norm(a-e) / np.linalg.norm(e))
     results = dict(P=nranks, ns=ns, parents=nk, parent_chunk=1, batch=b,
@@ -109,11 +148,14 @@ def check_samples(runtime):
                    zero_augmentation_relative_error=rel(zero, smooth),
                    smooth_direct_relative_error=rel(smooth, reference),
                    altered_direct_relative_error=rel(altered, expected_changed),
-                   expanded_source_stream_relative_error=rel(expanded[:,:b],altered),
-                   expanded_source_padding_max=float(np.max(abs(expanded[:,b:]))),
+                   fractional_current=fractional_current,
+                   expanded_source_stream_relative_error=rel(expanded[...,:b,:],altered),
+                   expanded_source_padding_max=float(np.max(abs(expanded[...,b:,:]))),
                    planted_signal_relative_norm=rel(altered, smooth),
-                   pad_max_abs=float(np.max(np.abs(altered[:, -1]))),
+                   pad_max_abs=float(np.max(np.abs(altered[..., -1,:]))),
                    wall_s=time.monotonic()-t0)
+    if fractional_current:
+        results['current_component_relative_errors'] = [rel(a,e) for a,e in zip(zero,reference)]
     assert results['zero_augmentation_relative_error'] < 2e-13, results
     assert results['smooth_direct_relative_error'] < 2e-13, results
     assert results['altered_direct_relative_error'] < 2e-13, results

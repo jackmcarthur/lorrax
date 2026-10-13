@@ -102,7 +102,7 @@ def test_legacy_restart_cannot_inherit_an_unmarked_metric(tmp_path, monkeypatch)
             expected_conditioning='unit_diagonal', **kwargs)
 
 
-@pytest.mark.parametrize('change', ['SC', 'density', 'head', 'current', 'smearing', 'broadening'])
+@pytest.mark.parametrize('change', ['SC', 'density', 'head', 'smearing', 'broadening'])
 def test_fractional_scope_guard_precedes_source_access(tmp_path, change):
     from gw.gw_config import BispinorGWMode, HeadCorrection, QPSolver
     from gw.gw_init import prepare_band_metadata
@@ -111,7 +111,6 @@ def test_fractional_scope_guard_precedes_source_access(tmp_path, change):
     if change == 'SC': cfg.qp_solver = QPSolver.SELF_CONSISTENT
     elif change == 'density': cfg.density_self_consistent = True
     elif change == 'head': cfg.head = SimpleNamespace(correction=HeadCorrection.FULL)
-    elif change == 'current': cfg.bispinor_gw = BispinorGWMode.BARE_TRANSVERSE
     elif change == 'smearing': cfg.occ_smearing_width_ry = .01
     else: cfg.screening = SimpleNamespace(occ_broadening_ev=.01)
     class ForbiddenSource:
@@ -129,6 +128,15 @@ def test_admitted_smooth_fractional_scope_needs_no_atomic_manifest(tmp_path, res
     cfg = _config(tmp_path)
     cfg = replace(cfg, restart=restart)
     assert cfg.paths.atomic_reconstruction_dir is None
+    _validate_smooth_fractional_charge(cfg)
+
+
+@pytest.mark.parametrize('mode', ['bare_transverse', 'full_shared_pole'])
+def test_exact_smooth_current_uses_the_same_fixed_source_scope(tmp_path, mode):
+    from dataclasses import replace
+    from gw.gw_config import BispinorGWMode
+    from gw.gw_init import _validate_smooth_fractional_charge
+    cfg = replace(_config(tmp_path), bispinor_gw=BispinorGWMode(mode))
     _validate_smooth_fractional_charge(cfg)
 
 

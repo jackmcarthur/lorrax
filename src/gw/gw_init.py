@@ -875,11 +875,22 @@ def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
 		nmu, mun = faces
 	else:
 		with timing.section("gw_jax.load_centroid_wfns_current"):
-			psi_y, psi_x = load_centroids_band_chunked(
-				wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
-				band_range=band_slices.full_range, band_chunk_size=int(band_chunk_size),
-				k_chunk_size=k_chunk_size, bispinor_lift=representation.current_lift,
-				k_domain=sym.parent_k_domain)
+			if getattr(getattr(meta_T, 'mu_basis', None), 'coordinate_kind', 'fft_indices') == 'fractional':
+				from common.psi_G_store import load_parent_psi_G
+				point_source = load_parent_psi_G(
+					wfn=wfn, mesh_xy=mesh_xy, meta=meta_T,
+					band_range=band_slices.full_range, band_chunk=int(band_chunk_size),
+					centroid_indices=cent_T_idx, placement='none', bispinor=True,
+					bispinor_lift=representation.current_lift,
+					k_domain=sym.parent_k_domain, print_fn=lambda *_: None)
+				psi_y, psi_x = point_source.faces
+				wfn.release_read_staging()
+			else:
+				psi_y, psi_x = load_centroids_band_chunked(
+					wfn, sym, meta_T, cent_T_idx, True, mesh_xy,
+					band_range=band_slices.full_range, band_chunk_size=int(band_chunk_size),
+					k_chunk_size=k_chunk_size, bispinor_lift=representation.current_lift,
+					k_domain=sym.parent_k_domain)
 		nmu, mun = parent_faces(psi_y, psi_x, mesh_xy=mesh_xy, layout="face")
 		psi_y = psi_x = None
 	enk, _ = get_enk_bandrange(wfn, sym, band_slices.full_range,
@@ -1655,10 +1666,12 @@ def _resolve_zeta_fit_contract(
 			load_centroids as _load_cent_pf, read_centroid_coordinate_kind)
 		kind_T = read_centroid_coordinate_kind(cfg.paths.centroids_file_current)
 		if kind_T != 'fft_indices':
-			if kind_T != 'fractional' or not getattr(cfg.paths, 'atomic_reconstruction_dir', None):
-				raise NotImplementedError(
-					"Fractional current centroids require the atomic reconstructed current fitting stage.")
-			refuse_unsupported_bispinor_gw(cfg)
+			if kind_T != 'fractional':
+				raise ValueError('Unknown current centroid coordinate kind')
+			if getattr(cfg.paths, 'atomic_reconstruction_dir', None):
+				refuse_unsupported_bispinor_gw(cfg)
+			else:
+				_validate_smooth_fractional_charge(cfg)
 		from runtime.padding import padded_mu_extent
 		_, cent_T_np, n_rmu_T = _load_cent_pf(
 			cfg.paths.centroids_file_current, meta.fft_grid)
@@ -2380,7 +2393,8 @@ def _fit_transverse_zeta_channels(
             layout="face",
             mubatch_plan=_chunks_T['mubatch'], parent_psi=parent_psi,
             write_zeta_file=write_T and current_augmentation is None,
-            use_augmented_samples=current_augmentation is not None,
+            use_augmented_samples=(current_augmentation is not None or
+                getattr(getattr(_meta_T, 'mu_basis', None), 'coordinate_kind', 'fft_indices') == 'fractional'),
             current_augmentation=current_augmentation,
             current_basis_rows=_meta_T.current_basis_rows,
             print_fn=print_fn)
@@ -4069,15 +4083,19 @@ def coarse_class_for_deck(config, wfn, print0):
 
 
 def _validate_smooth_fractional_charge(cfg):
-    """Keep the new exact smooth sampling route inside its proved charge scope."""
+    """Admit exact smooth samples for a fixed-source, headless one-shot.
+
+    Charge and spatial current use the same signed-Miller Fourier sampler
+    and typed centroid transport. The operator-specific GW mode checks
+    remain at the input door.
+    """
     from .gw_config import HeadCorrection, QPSolver
     if (cfg.qp_solver is not QPSolver.ONE_SHOT_DFT
             or bool(getattr(cfg, 'density_self_consistent', False))
-            or uses_transverse_interaction(cfg)
             or cfg.head.correction is not HeadCorrection.OFF
             or getattr(cfg, 'occ_smearing_width_ry', None) not in (None, 0.)
             or float(getattr(cfg.screening, 'occ_broadening_ev', 0.)) != 0.):
-        raise ValueError('GATE smooth_fractional_charge: requires scalar headOff one-shot fixed-source unsmeared sampling')
+        raise ValueError('GATE smooth_fractional_charge: requires headOff one-shot fixed-source unsmeared sampling')
 
 
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn,
