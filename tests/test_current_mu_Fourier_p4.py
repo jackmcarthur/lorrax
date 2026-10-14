@@ -47,7 +47,7 @@ def check_current_fourier(runtime):
         assert max(errors)<2e-11,errors
         comparisons.append(max(errors));receipts.append(dict(receipt))
         # All-rank admission must decline safely, leaving onsite banks usable.
-        saved=gpu_utils._RUN_DEVICE_BUDGET_GB
+        saved=gpu_utils.device_budget_bytes()/1e9
         def declined(state,**options):
             try:
                 gpu_utils.set_device_budget_gb(1e-7 if jax.process_index()==0 else saved)
@@ -144,7 +144,7 @@ def quote_actual(runtime,manifest,g_tile):
         reciprocal_prefactor=-8*np.pi/1000.,fourier_points=4097,
         interpolation_degree=radial['interpolation_degree'],quadrature_order=radial['quadrature_order'])
     group=providers[0]['group_provider'];state=dict(coefficients=cloud,moments=moments)
-    saved=gpu_utils._RUN_DEVICE_BUDGET_GB
+    saved=gpu_utils.device_budget_bytes()/1e9
     try:
         gpu_utils.set_device_budget_gb(1e-7)
         assert group['prepare_fourier_coefficients'](state) is state
