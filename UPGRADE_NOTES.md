@@ -1,5 +1,15 @@
 # Upgrade notes
 
+## Unreleased — reuse Cartesian primitives in circular current packets
+
+Delta-only atomic current replay evaluates matching Cartesian primitives once
+for the first two circular channels. Each primitive completes the ordered
+pair equations before its complex channel weights; each channel retains its
+own factor and coefficient solve. Projection retains two compact radial
+packets, whose actual compiled workspace enters the existing memory gate.
+Other channel bases and paired delta/smooth replay retain their scalar path.
+No input change is required.
+
 ## Unreleased — stable dynamic four-current screening
 
 The full shared-pole photon bank evaluates the dynamic interaction directly
