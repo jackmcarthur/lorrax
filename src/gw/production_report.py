@@ -257,8 +257,8 @@ class GWProductionReport:
         # including ordinary shared-pole runs with debug disabled.
         if text.startswith(("Sigma quadrature receipt: ", "Response quadrature: ",
                             "Sigma checkpoint: ", "Shared-pole constructor: ",
-                            "Shared-pole sector constructor: ")) or (
-                text.startswith("  distrib_la ") and " stack " in text):
+                            "Shared-pole sector constructor: ", "  route ",
+                            "  WARNING: route ")):
             self.progress(text)
             return
         # Fixed-SC quadrature identity is a physics invariant, not backend
@@ -870,6 +870,17 @@ class GWProductionReport:
             self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")
             self.emit("  share one compiled call; their fused wall is not split into invented timings.")
         self._stage_memory(rows, stages, width=width, wall=wall)
+        self._routes()
+
+    def _routes(self) -> None:
+        """Every memory-driven route the run took and why (``common.gpu_utils.routes``)."""
+        from common.gpu_utils import routes
+        taken = routes()
+        if not taken:
+            return
+        self.heading("Routes")
+        for row in taken:
+            self.emit(f"  {row['line']}" + (f" [x{row['count']}]" if row["count"] > 1 else ""))
 
     def _stage_memory(self, rows, stages, *, width, wall) -> None:
         """The device peak of every major stage against its planner's price, and its host peak.

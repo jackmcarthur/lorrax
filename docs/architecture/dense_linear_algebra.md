@@ -415,7 +415,7 @@ With $\mu$ the padded centroid count and $Q$ the stage's q extent:
 | ζ charge factor (`rank_truncate`) | replicated whole-tile eigh pseudo-inverse, one q batch at a time under `LORRAX_ZETA_REPLICATE_CAP_GIB`; q-parallel above $Q\mu^3 \ge 5\cdot10^9$, $\lceil Q/P\rceil\mu^3$ work per device | same |
 | ζ back-solve, per G tile | whole-tile factor on its q owner, $s\lceil Q/P\rceil\mu^2$ per device; only the right-hand side moves | same |
 | ζ transverse factor (ridge LU) | whole-tile local LU once per q and channel, applied per G tile ([the solve seam](zeta_fit_mubatch.md#the-solve-seam)) | same |
-| W Dyson solve (`gw.w_isdf.solve_w`) | per-q dense LU, $\lceil Q/P\rceil$ whole $(\mu,\mu)$ tiles per device | `plan('solve_lu', backend='distributed').batched`, $sQ\mu^2/P$; the μ axes never leave the face |
+| W Dyson solve (`gw.w_isdf.solve_w`) | per-q dense LU, $\lceil Q/P\rceil$ whole $(\mu,\mu)$ tiles per device; the distributed plan when they do not fit the budget ([memory model § routes](memory-model.md#routes)) | `plan('solve_lu', backend='distributed').batched`, $sQ\mu^2/P$; the μ axes never leave the face |
 | W ladder resolvent (`bse.w_ladder`, `screening_diagrams = w_bse`) | one code path for both layouts; no whole-$\mu^2$ object per device | same |
 | eigensolves (htransform `fH_q`, `vq_interp` `C_q`, QSGW $H_k$) | route (c): one whole matrix per device | the capacity route: one matrix over the mesh |
 | shared-pole constructor | q-local rounds, else face rounds with each eigh stack on route (c) or the mesh by (D 4) | same ([bispinor sectors §4](bispinor_shared_pole_w.md#sector-route)) |

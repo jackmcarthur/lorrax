@@ -5,6 +5,33 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-13 — the device budget can only lower; memory-driven routes print once and fall back
+
+- **Budget.** A `memory_per_device_gb` above the memory rule no longer raises
+  the budget: the run warns and keeps the rule (72 on an A100-40GB runs at
+  31.60 GB). A caller-owned BFC allocator's `bytes_limit` also caps it. Under
+  the runtime's own pool nothing changes.
+- **W Dyson under `linalg = local`.** The charge solve, like the photon solve
+  before it, takes the distributed plan when one rank's whole matrices do not
+  fit the budget, instead of stopping at `GATE xla_rematerialization` or running
+  out of memory. The photon price now also counts the face-tiled V, χ and W.
+- **Provider contexts.** A `local` run that falls back to cuSOLVERMp is
+  charged the 3 GB of contexts the local rule did not withhold; when neither
+  plan fits, the run takes the one less over and warns, naming
+  `linalg = distributed`.
+- **One record.** Every memory-driven route (W Dyson, SC eigh, density scan,
+  shared-pole constructor, line selection, staged and face eigh stacks, head Γ
+  GEMM) prints once as `route <site>: <route> (<prices>)` and is listed in the
+  report's Routes table. The old per-site lines (`[W solve] linalg =
+  distributed -> …`, `Shared-pole sector constructor: route …`,
+  `distrib_la eigh stack …`, the photon and SC-eigh fallback notes, the
+  staged-eigh warning) are gone.
+- **cuFFT pricing.** An HLO FFT parse miss or an unavailable cuFFT query no
+  longer refuses: it warns and prices the scratch conservatively.
+
+No deck or environment change. claim TBD: P4 hsuite eqp identity, route
+equivalence and the A100-80 budget simulation.
+
 ## 2026-10-13 — Perlmutter site profile; launcher-agnostic distributed start
 
 Perlmutter's NCCL network values (the OFI plugin path, the site NCCL module's

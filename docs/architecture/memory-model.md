@@ -86,10 +86,15 @@ The pool is reserved before the deck is read, so `R` leaves room for
 `O_max` whatever the deck's `linalg`. The reservation is not a cap: the pool
 may map more than `R` ([§ growth](#pool-growth)). The rule reads only `M`
 and the deck's resolved `linalg`, so it is the same on every rank and every
-run. A positive `memory_per_device_gb` is used as given: above `B` it warns
-once at start-up with both numbers; below `B` it is used silently. The rule
+run. A positive `memory_per_device_gb` can only lower `B`: below `B` it is
+used silently; above `B` it warns once at start-up with both numbers and the
+run keeps `B` (a deck written for an 80 GB card runs at the rule on a 40 GB
+one instead of running out of memory mid-run). When the caller owns the
+allocator and it is a BFC arena, whose `bytes_limit` is a hard cap, `B` is at
+most `bytes_limit/(1 + 1.2·φ)`; under the runtime's `cuda_async` pool the
+reservation is not a cap and `B` reads only `M`. The rule
 is the minimum over processes (`common.gpu_utils.resolve_device_budget_gb`,
-`src/common/gpu_utils.py:45`), because static tile shapes must agree on every
+`src/common/gpu_utils.py:50`), because static tile shapes must agree on every
 process. On CPU the same rule takes `M` as the node's `MemTotal` over the
 processes on the node, and a process's devices share its budget.
 
@@ -102,8 +107,41 @@ reading.
 Every planner reads the one number `common.gpu_utils.device_budget_bytes()`,
 which the config sets when the deck resolves. kmeans, htransform, bse and
 exciton_bands have no deck key; their planners read the same owner, which
-resolves the rule on its first call. No planner reads `bytes_limit`, free
-memory or a fragmentation factor.
+resolves the rule on its first call. No planner reads `bytes_limit` (beyond
+the BFC cap above), free memory or a fragmentation factor.
+
+### Routes {#routes}
+
+Where a stage has a local plan (whole matrices per rank) and a distributed one
+(each matrix over the whole mesh), one predicate chooses,
+`common.gpu_utils.admit_local`: local when the local plan's full per-rank shape
+price fits the room, else distributed. The room is `B`, less the live stages
+the capacity ledger names where a stage has one. No site adds a margin of its
+own: `φ` covers what a shape price misses (XLA temporaries, fragmentation).
+Under `linalg = local` the rule withheld no room for cuSOLVERMp's contexts
+outside the pool, so a distributed fallback is charged
+`DISTRIBUTED_LINALG_OUTSIDE_BYTES` (3 GB) against the same room; when neither
+route fits, the run takes the one less over and warns, naming both prices and
+`linalg = distributed`, which reserves that room at start-up. A distributed
+plan that cannot run here (platform, mesh, build) keeps the local one, warned.
+Every decision prints once on rank 0 (`route <site>: <route> (<prices>)`) and
+the run report's Routes table lists each with its count; nothing else prints a
+route.
+
+| site | local plan admitted when | distributed plan |
+|---|---|---|
+| W Dyson, charge and photon (`gw.w_isdf._dyson_route`) | $16\mu^2(3\lceil Q/P\rceil + 2) + 48Q\mu^2/P \le B$ | `solve_lu` on the mesh |
+| SC eigh (`gw.sc_iteration._resolve_sc_eigh`) and density scan (`gw.qsgw_density.plan_density_scan`) | one $(n_b, n_b)$ tile $\le$ 1 % of `B`: $n_b \le 4.4\cdot10^3$ on A100-40GB, $6.4\cdot10^3$ on A100-80GB | cuSOLVERMp eigh, priced beside the replicated H and U; `band_2d` |
+| shared-pole line selection, whole-parent stages (`whole_parent_execution`) | the ledger row of whole parents per rank passes | the face |
+| shared-pole constructor (`constructor_execution`, `sector_route`) | the conservative recipe pencil's selection and reduction rows pass | face rounds |
+| staged eigh stacks (`staged_eigh`) and face eigh rooms (`distrib_la` `Plan.stack_route`) | route (c)'s stack price fits the room | the whole mesh |
+| head Γ GEMM (`gw.shared_pole_head._gamma_gemm_route`) | `distrib_la.fits_local` | `panel_matmul` (an XLA program; no context charged) |
+
+`linalg = distributed` forces the distributed plan at the W Dyson solve and the
+SC eigh; the shared-pole sites decide by capacity under both values. The two
+plans agree to round-off; the shared-pole Ritz and pole cuts are thresholded,
+so there they can differ by more (the pole-budget tie entry in the sandbox's
+known-issue list). claim TBD: route-equivalence gate.
 
 ### Why the pool's reserved bytes run past R {#pool-growth}
 

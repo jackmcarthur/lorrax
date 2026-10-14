@@ -148,8 +148,8 @@ schema is the scalar bank's with `C`/`T` line families
 
 The route is decided once per map, before any bank read, from the recipe shapes
 and the deck budget (`sector_route`, `src/gw/shared_pole_sectors.py:1588`). Every
-rank prices the same shapes, so every rank decides alike. The report prints one
-line, `Shared-pole sector constructor: route …`.
+rank prices the same shapes, so every rank decides alike. The run records one
+line, `route shared-pole sector constructor: …` ([memory model § routes](memory-model.md#routes)).
 
 **q-local.** `sector_execution` (`src/gw/shared_pole_sectors.py:1635`) prices one
 whole parent per rank for each sector at its conservative pencil side

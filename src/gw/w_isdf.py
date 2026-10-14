@@ -1861,10 +1861,6 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     py = int(mesh_xy.shape['y'])
     nat = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
-    if jax.process_index() == 0:
-        print(f"  [W solve] linalg = distributed -> {p.describe()}",
-              flush=True)
-
     def _logical_tile(A_loc):
         """Zero the nonphysical rows/columns of one distributed μ tile."""
         i0 = jax.lax.axis_index('x') * (n_ext // px)
@@ -2009,17 +2005,53 @@ def _w_solve_pref_scalar(meta) -> float:
         * float(nspinor_wfnfile))
 
 
+def _dyson_route(dyson, n, stack, mesh_xy):
+    """``"local"`` or ``"distributed"``: the deck's W plan, with the local plan
+    admitted only where one rank's whole matrices fit (``common.gpu_utils.admit_local``).
+
+    Local holds V, χ and W whole for its ⌈stack/P⌉ parents and one LU working
+    pair, beside the face-tiled V, χ and W; distributed holds the faces and
+    one face-tiled LU pair. Priced from the shapes against the fixed device
+    budget, not a live ledger; φ in the memory rule covers XLA's temporaries.
+    """
+    from common.gpu_utils import admit_local, device_budget_bytes
+    ranks = int(mesh_xy.size)
+    site = f"W Dyson {int(stack)} x {int(n)}^2"
+    if dyson == "distributed":
+        admit_local(site, 0, 0, forced="distributed")
+        return "distributed"
+    if ranks <= 1:
+        return "local"
+    faces = 16.0 * n * n * 3 * int(stack) / ranks
+    whole = 16.0 * n * n * (3 * -(-int(stack) // ranks) + 2)
+
+    def probe():
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import resolve_backend
+        resolve_backend("solve_lu", "distributed", mesh_xy)
+    local = admit_local(site, faces + whole, device_budget_bytes(),
+                        distributed_bytes=faces + 2 * 16.0 * n * n / ranks, probe=probe)
+    return "local" if local else "distributed"
+
+
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
                         dyson_solver=None,
                         distrib_la_batched_route: str = "batch_reshard",
-                        pref=None, nq=None):
+                        pref=None, nq=None, stack=None):
     """Return ``(solve_fn, pref)`` for the requested W plan; see docs/theory/bispinor-gw.md#dyson.
 
     ``pref``/``nq`` given (a caller with no ISDF ``meta``, e.g. the plane-wave
-    response sphere): χ₀'s prefactor and the q count come from the caller."""
+    response sphere): χ₀'s prefactor and the q count come from the caller.
+    ``stack`` is the operands' q extent, which prices the local plan
+    (:func:`_dyson_route`)."""
     from .gw_config import normalize_w_dyson_solver
-    dyson = normalize_w_dyson_solver(dyson_solver)
     nq = int(meta.nk_tot) if nq is None else int(nq)
+    dyson = normalize_w_dyson_solver(dyson_solver)
+    routed = _dyson_route(dyson, int(n_rmu), nq if stack is None else int(stack), mesh_xy)
+    if routed != dyson:
+        # The provider plan, not route (c): staged whole matrices are what did not fit.
+        dyson, distrib_la_batched_route = routed, "auto"
     pref_scalar = _w_solve_pref_scalar(meta) if pref is None else complex(pref)
 
     # Scalar charge solves take their logical prefix from ``meta``.  The
@@ -2097,7 +2129,8 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
         meta, mesh_xy, n_rmu=chi0_q.shape[1],
         n_rmu_logical=n_logical, dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route,
-        pref=pref, nq=None if meta is not None else int(V_q.shape[0]))
+        pref=pref, nq=None if meta is not None else int(V_q.shape[0]),
+        stack=int(V_q.shape[0]))
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
 
@@ -2977,27 +3010,6 @@ def _report_static_photon_body(
             flush=True)
 
 
-def _packed_dyson_solver(dyson_solver, nq, n, mesh_xy, print_fn):
-    """The deck's W plan for the packed Dyson solve, with cuSOLVERMp as the capacity route.
-
-    ``local`` (route (c): whole matrices per rank, 3.2-6.2x faster than
-    cuSOLVERMp at P4, sandbox claim 3987) unless one rank's whole matrices --
-    V, chi and W for its ceil(nq/P) parents plus one LU working pair -- exceed
-    the device budget; then the distributed plan, with one warning.
-    """
-    # ponytail: priced from the shapes against the fixed device budget, not the live ledger.
-    from common.gpu_utils import device_budget_bytes
-    dyson = str(dyson_solver).strip().lower()
-    whole = 16 * n * n * (3 * -(-int(nq) // int(mesh_xy.size)) + 2)
-    if dyson == "local" and whole > device_budget_bytes():
-        print_fn(f"  WARNING: [photon response] the packed Dyson solve's whole matrices "
-                 f"({whole / 1e9:.2f} GB/rank, n={n}, nq={nq}) exceed the device budget "
-                 f"({device_budget_bytes() / 1e9:.2f} GB): solving on the distributed plan",
-                 flush=True)
-        return "distributed"
-    return dyson
-
-
 def _screen_static_photon_body(
         screen_current, wfns_charge, wfns_transverse, quad, meta, mesh_xy, layout,
         current_contact, energy_reference, V_packed, distrib_la_batched_route, W_charge,
@@ -3016,8 +3028,7 @@ def _screen_static_photon_body(
 
         W_packed = solve_w(
             V_packed, chi_packed, meta, mesh_xy,
-            dyson_solver=_packed_dyson_solver(
-                dyson_solver, nq, int(layout.packed_extent), mesh_xy, print_fn),
+            dyson_solver=dyson_solver,
             # Direct sum of already-padded C/T channel blocks: unlike the
             # scalar carrier, this space has no one logical prefix to mask.
             n_rmu_logical=int(layout.packed_extent),
@@ -3762,7 +3773,8 @@ def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
         meta, mesh_xy, n_rmu=chi0_q.shape[1],
         n_rmu_logical=n_logical, dyson_solver=dyson_solver,
         distrib_la_batched_route=distrib_la_batched_route,
-        pref=pref, nq=None if meta is not None else int(V_q.shape[0]))
+        pref=pref, nq=None if meta is not None else int(V_q.shape[0]),
+        stack=int(V_q.shape[0]))
     # The DISTRIBUTED plan is a plain function around chunked jits + one
     # FFI call, not a single jit, so there is nothing to lower here —
     # the first real call builds the BLACS descriptor and compiles its

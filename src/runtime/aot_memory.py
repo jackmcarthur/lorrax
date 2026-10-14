@@ -34,12 +34,14 @@ from the platform, not the HLO: measured on jax 0.9.1 (job 7882062),
 XLA:CPU keeps the ``fft`` op in ``as_text()`` exactly like XLA:GPU, so
 "the HLO has an fft op" does not mean "cuFFT is involved".
 
-No silent demotions.  An HLO regex miss raises :class:`HloFftParseError`
-rather than reading as "no FFTs, no scratch".  An absent libcufft or a
-refused plan *on a CUDA backend* gives ``cufft_scratch = 0`` **with**
-``cufft_measured = False`` **and** an announcement from the process it
-happened on; a caller that must not under-predict checks the flag instead
-of trusting ``total``.
+No silent demotions, and no refusal.  An HLO regex miss
+(:class:`HloFftParseError`) or an absent libcufft or refused plan *on a CUDA
+backend* (:class:`CufftQueryError`) announces itself from the process it
+happened on and prices the scratch at a stated conservative figure instead,
+with ``cufft_measured = False``: twice the largest FFT op's data when the
+ops parsed (cuFFT's multi-pass workspace for 2,3,5,7-smooth lengths is at
+most one copy of the data), else the module's own temporaries and outputs
+again.
 """
 
 from __future__ import annotations
@@ -111,9 +113,9 @@ class AotPeakBreakdown:
 
 
 class HloFftParseError(RuntimeError):
-    """The HLO FFT-op regex failed on a form it should have matched.  Loud by
-    design: degrading to ``compiled_peak`` alone silently reintroduces the
-    under-prediction this module exists to remove."""
+    """The HLO FFT-op regex failed on a form it should have matched.  Never
+    read as "no FFTs, no scratch": :func:`aot_kernel_peak_bytes` announces it
+    and prices the scratch conservatively."""
 
 
 class CufftQueryError(RuntimeError):
@@ -335,6 +337,13 @@ def _query_one_plan_workspace_bytes(spec: FftSpec) -> int:
         lib.cufftDestroy(plan)
 
 
+def _fft_data_bytes(spec: FftSpec) -> int:
+    """Bytes of one FFT op's data, counted complex at its precision (its batch of transforms)."""
+    import math
+    item = 16 if spec.dtype in ("c128", "f64") else 8
+    return int(spec.batch) * math.prod(spec.transform_shape) * item
+
+
 def query_cufft_workspace_bytes(specs) -> int:
     """**Max** plan workspace over the distinct ``FftSpec``s in ``specs``.
 
@@ -461,21 +470,31 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
         - int(m.alias_size_in_bytes),
     )
 
-    fft_specs = tuple(parse_fft_specs_from_hlo(compiled.as_text()))
-
     cufft_scratch, measured = 0, True
+    try:
+        fft_specs = tuple(parse_fft_specs_from_hlo(compiled.as_text()))
+    except HloFftParseError as exc:
+        fft_specs = ()
+        if _is_cuda_platform(platform):
+            measured = False
+            cufft_scratch = compiled_increment
+            announce_once(
+                "hlo-fft-parse",
+                f"the HLO FFT-op parser missed ({exc}); cuFFT scratch is priced "
+                f"as the module's temporaries and outputs again, "
+                f"{cufft_scratch / 1e9:.2f} GB for this kernel")
     if fft_specs and _is_cuda_platform(platform):
         try:
             cufft_scratch = query_cufft_workspace_bytes(fft_specs)
         except CufftQueryError as exc:
             measured = False
+            cufft_scratch = 2 * max(
+                _fft_data_bytes(spec) for spec in fft_specs)
             announce_once(
                 f"cufft-query-unavailable:{type(exc).__name__}",
                 f"cuFFT plan-workspace query UNAVAILABLE on a CUDA backend "
-                f"({exc}).  Peak predictions for the {len(fft_specs)} FFT "
-                f"op(s) in this kernel omit the plan workspace and are "
-                f"therefore LOW BOUNDS — at the CrI3 V_q box that term was "
-                f">13.7 GB/rank")
+                f"({exc}); the plan workspace is priced as twice the largest "
+                f"FFT op's data, {cufft_scratch / 1e9:.2f} GB for this kernel")
 
     return AotPeakBreakdown(
         compiled_peak=compiled_peak,

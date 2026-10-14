@@ -1090,13 +1090,12 @@ def _batch_rows(row, batch):
 
 def _admit(compiled, meta, stage, *, native=0, resident=0, counted=0, peak=None):
     """Reserve a compiled executable's peak; ``counted`` argument bytes are charged elsewhere.
-    ``peak`` passes an ``aot_kernel_peak_bytes`` breakdown the caller already read. The
+    ``peak`` passes an ``aot_kernel_peak_bytes`` breakdown the caller already read (its cuFFT
+    term is the announced conservative figure when the query was unavailable). The
     reservation is the largest figure any rank read, so the ledger stays alike on every rank."""
     from runtime.aot_memory import aot_kernel_peak_bytes, agreed_chunk
     if peak is None:
         peak = aot_kernel_peak_bytes(compiled)
-    if not peak.cufft_measured:
-        raise ValueError(f"GATE shared_pole_capacity: {stage} FFT workspace unavailable")
     meta.shared_pole_capacity.reserve(
         stage, resident_bytes_per_rank=resident,
         workspace_bytes_per_rank=-agreed_chunk(-(max(0, int(peak.total) - counted) + int(native))),

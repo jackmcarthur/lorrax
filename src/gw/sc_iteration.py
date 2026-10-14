@@ -1366,7 +1366,7 @@ def _diagonalize_and_get_efermi(
 # U-replication route asks the same question and must agree.
 
 
-def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
+def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn, nk: int = 1) -> str:
     """``"native"`` or ``"distributed"`` for this iteration's eigh.
 
     A LAYOUT decision and nothing else.  It used to be a side effect of
@@ -1383,7 +1383,9 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     * the mesh has more than one device — on one device "distributed" is
       the same tile with an FFI call around it;
     * one tile exceeds ``qsgw_density.BAND_TILE_BUDGET_FRACTION`` of the
-      per-device budget (:func:`gw.qsgw_density.band_tile_is_large`).
+      per-device budget, with the distributed eigh priced beside the
+      replicated H and U (``common.gpu_utils.admit_local``, which prints
+      the route);
 
     and then only if the distributed backend actually resolves on this
     mesh.  ``resolve_backend`` is the probe: it raises at RESOLVE time
@@ -1404,15 +1406,20 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
     indivisible window to native, i.e. reinstate the lifted refusal by
     accident.
     """
+    from common.gpu_utils import admit_local
+
     requested = str(getattr(getattr(config, "sc", None), "eigh", "auto"))
-    if requested == "native":
-        return "native"
+    site = f"SC eigh {int(nk)} x {int(nb)}^2"
+    if requested in ("native", "distributed"):
+        admit_local(site, 0, 0, forced=requested, names=("native", "distributed"))
+        return requested
 
     from common.wfn_layout import band_sphere_spec
     from runtime.padding import padded_axis
 
     ndev = int(mesh_xy.size)
-    px, py = (int(mesh_xy.shape[a]) for a in mesh_xy.axis_names)
+    if ndev <= 1:
+        return "native"
     # ``distributed_eigh_bands`` pads to this and slices BACK by count, so
     # an indivisible nb is no longer a reason to refuse or to degrade — it
     # is just a pad.  The backend probe below must therefore be asked about
@@ -1421,33 +1428,27 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
         nb, mesh_xy, name="SC eigensolver band carrier",
         spec=band_sphere_spec(), axis=1).carrier
 
-    if requested == "distributed":
-        return "distributed"
+    from .qsgw_density import BAND_TILE_BUDGET_FRACTION
 
-    from .qsgw_density import BAND_TILE_BUDGET_FRACTION, band_tile_is_large
+    def probe():
+        from ffi import _services
+        _services.ensure_on_path()
+        from distrib_la import resolve_backend
+        resolve_backend("eigh", "distributed", mesh_xy, n=nb_solve)
 
-    tile_b = float(nb) * float(nb) * 16.0
+    c128 = 16.0
     budget_b = float(getattr(getattr(config, "memory", None),
                              "per_device_gb", 0.0)) * 1e9
-    big = band_tile_is_large(tile_b, budget_b)
-    if ndev <= 1 or not big:
-        return "native"
-
-    from ffi import _services
-    _services.ensure_on_path()
-    from distrib_la import resolve_backend
-    try:
-        resolve_backend("eigh", "distributed", mesh_xy, n=nb_solve)
-    except Exception as exc:                                  # noqa: BLE001
-        print_fn(
-            f"  SC eigh: auto wanted the distributed eigh (one (nb, nb) tile "
-            f"is {tile_b / 2**30:.3f} GiB, over "
-            f"{BAND_TILE_BUDGET_FRACTION:.0%} of the "
-            f"{budget_b / 1e9:.1f} GB/device budget) but the backend refused "
-            f"— {type(exc).__name__}: {exc}.  Falling back to the k-sharded "
-            f"native batch, which puts that whole tile on ONE device.")
-        return "native"
-    return "distributed"
+    # The native batch is admitted while one tile stays under the band-tile
+    # fraction of the budget; the distributed eigh (input, vectors and
+    # workspace faces) is priced beside the replicated H and U it runs with.
+    local = admit_local(
+        site, float(nb) * float(nb) * c128,
+        BAND_TILE_BUDGET_FRACTION * budget_b if budget_b > 0 else float("inf"),
+        distributed_bytes=3.0 * c128 * nb_solve * nb_solve / ndev,
+        distributed_room=budget_b - 2.0 * c128 * int(nk) * nb * nb,
+        probe=probe, names=("native", "distributed"))
+    return "native" if local else "distributed"
 
 
 def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
@@ -1487,7 +1488,8 @@ def qp_eigh(H: jax.Array, *, mesh_xy: Mesh, config, print_fn):
     replicated for the host writers -- 16 nk nb^2 B per device, the TASTE 1
     Σ-window figure the kin_ion loader states.
     """
-    kind = _resolve_sc_eigh(int(H.shape[1]), mesh_xy, config, print_fn=print_fn)
+    kind = _resolve_sc_eigh(int(H.shape[1]), mesh_xy, config, print_fn=print_fn,
+                            nk=int(H.shape[0]))
     E, U = _sc_eigh_bands(H, kind=kind, mesh_xy=mesh_xy, config=config)
     return E, _place(U, mesh_xy)
 
@@ -1881,7 +1883,7 @@ def run_fixed_sigma_evsc(
     max_iter = int(config.eqp2.max_iter)
     accelerator = str(config.eqp2.accelerator)
     history_depth = int(config.eqp2.history_depth)
-    eigh_kind = _resolve_sc_eigh(nb, mesh_xy, config, print_fn=print_fn)
+    eigh_kind = _resolve_sc_eigh(nb, mesh_xy, config, print_fn=print_fn, nk=nk)
 
     # The seed's eigensystem is exactly the DFT input basis.  Using this
     # explicit diagonal matrix (and its explicit identity U on call zero)
@@ -3293,7 +3295,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         nb_carry = int(state.H_qp_dft.shape[1])
         eigh_kind = _resolve_sc_eigh(
             nb_carry, inputs.mesh_xy, inputs.config,
-            print_fn=inputs.print_fn)
+            print_fn=inputs.print_fn, nk=int(state.H_qp_dft.shape[0]))
         # ``<= 1``, NOT ``== 0``.  Iteration 0 reaches this block only when
         # the carry is not exactly diagonal, which the canonical
         # ``make_initial_state_from_dft`` never produces — so an

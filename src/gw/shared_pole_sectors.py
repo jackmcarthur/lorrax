@@ -1586,8 +1586,8 @@ def staged_round(read_diagonal, read_cross, ids, real, meta, config, geometry, *
 
 
 def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=print):
-    """The map's sector route from the recipe shapes, decided once and printed on one line
-    (``Shared-pole sector constructor: route ...``, a prefix the production report keeps).
+    """The map's sector route from the recipe shapes, decided once and recorded on one line
+    (``common.gpu_utils.record_route``, site ``shared-pole sector constructor``).
 
     q-local, rounds of P parents with one whole parent per rank, when every sector's local
     round fits (``sector_execution``); otherwise rounds of R = min(nq, P) parents (balanced)
@@ -1628,7 +1628,9 @@ def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=prin
               f"q-local needs GB/rank {local} of {budget/1e9:.1f}")
     else:
         text=f"q-local, {-(-nq//width)} round(s) of {width} parents (local GB/rank {local} of {budget/1e9:.1f})"
-    print_fn(f"Shared-pole sector constructor: route {text}")
+    from common.gpu_utils import record_route
+    record_route("shared-pole sector constructor", execution, text,
+                 warning="; ".join(w for w in (row.get('warning') for row in (*rows, joint)) if w) or None)
     return execution,rows,dict(width=width,rounds=-(-nq//width))
 
 

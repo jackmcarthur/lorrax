@@ -19,7 +19,8 @@ The GW driver's phase invariants and the per-function contracts of
 `B = (M − 1.2·O)/(1 + 1.2·φ)` with `φ = 0.19`, and the XLA pool reserves
 `M − 1.2·O_max` (`runtime.planner_budget_bytes`, `runtime.pool_fraction`).
 There is no node term: outside bytes measured 2.8 GB at P4 and 2.2 GB at
-P64. A positive `memory_per_device_gb` is used as given; above the rule it warns.
+P64. A positive `memory_per_device_gb` can only lower the budget; above the rule
+it warns and the run keeps the rule (owner 2026-10-13).
 A start-up reading of the bytes outside the pool may warn, never size or route
 ([memory model](memory-model.md#budget)).
 
@@ -166,10 +167,13 @@ third plan with its own communicator creation (a world-collective
 `MPI_Comm_split`, see the square-mesh ruling below), its own divisibility
 contract and its own failure modes, and it gains nothing at that limit.
 
-**Exception: the shared-pole parent solves.** Under `local`, a shared-pole
+**Exception: plans that do not fit.** Under `local`, a shared-pole
 parent stack whose whole matrices do not fit beside the live stages takes
 the distributed plan instead (`gw.shared_pole_execution.whole_parent_execution`
-for the bank's line selection, `constructor_execution` for the constructor).
+for the bank's line selection, `constructor_execution` for the constructor),
+and so does a W Dyson solve whose whole matrices per rank do not fit the
+budget (owner 2026-10-13; `common.gpu_utils.admit_local`,
+[memory model § routes](memory-model.md#routes)).
 The fit is judged by the capacity ledger against `memory_per_device_gb`, so
 this choice reads the budget, unlike the [one-memory-path](#one-memory-path)
 and [fixed-tile](#fixed-tile) rulings. It is decided once, before the first

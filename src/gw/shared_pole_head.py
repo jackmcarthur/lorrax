@@ -60,13 +60,19 @@ def _gamma_gemm_route(mesh, b_shape, budget_bytes):
     budget_bytes=)`` makes); otherwise the distributed provider on the faces.
     Q is one Gamma parent, so the staged route puts whole N_mu x N_mu matrices
     on every rank (zero pads past the first): 66 GB/rank at N_mu 30k.
-    ``budget_bytes`` is the same on every rank, so is the route."""
+    ``budget_bytes`` is the same on every rank, so is the route; the provider
+    is ``panel_matmul``, an XLA program that opens no vendor context."""
     import distrib_la
+    from common.gpu_utils import admit_local
     q, n, k = (int(v) for v in b_shape)
-    local = -(-q // int(mesh.size))
+    ranks = int(mesh.size)
+    local = -(-q // ranks)
     shapes = ((local, n, k), (local, k, n), (local, n, n))
-    if distrib_la.fits_local(SimpleNamespace(mesh=mesh), "gemm", shapes, np.complex128,
-                             int(budget_bytes)):
+    fits = distrib_la.fits_local(SimpleNamespace(mesh=mesh), "gemm", shapes, np.complex128,
+                                 int(budget_bytes))
+    if admit_local(f"shared-pole head Gamma GEMM {q} x {n} x {k}",
+                   16 * sum(int(np.prod(s)) for s in shapes), int(budget_bytes), fits=fits,
+                   distributed_bytes=-(-16 * q * (2 * n * k + n * n) // ranks), provider=False):
         return "off", distrib_la.ROUTE_BATCH_RESHARD
     return "auto", "auto"
 

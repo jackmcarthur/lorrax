@@ -100,28 +100,39 @@ def line_selection_price(rows, *, mesh, nq, execution):
     return int(resident), int(workspace)
 
 
-def whole_parent_execution(price, *, ledger, carry=0):
+def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole parents"):
     """'local' when whole parents per rank fit the ledger beside its live stages, else 'face'.
 
     ``price(execution)`` returns the route's ``(resident, workspace)`` bytes per
     rank; ``carry`` is a resident the work runs beside. The face is the full
-    mesh, one parent after another, and is never refused. Returns
-    ``(execution, resident, workspace)``, the prices of the chosen route.
+    mesh, one parent after another, priced only when the local route does not
+    fit (its plan opens the provider). Decided and recorded by
+    ``common.gpu_utils.admit_local``. Returns ``(execution, resident,
+    workspace)``, the prices of the chosen route.
     """
-    for execution in ('local', 'face'):
-        resident, workspace = price(execution)
-        row = ledger.preview(resident_bytes_per_rank=resident + int(carry), workspace_bytes_per_rank=workspace,
-                             concurrent_with=ledger.live_stages)
-        if row['device_budget_status'] == 'PASS':
-            return execution, resident, workspace
-    return 'face', resident, workspace
+    from common.gpu_utils import admit_local
+    prices = {}
+
+    def aggregate(execution):
+        resident, workspace = prices[execution] = price(execution)
+        return ledger.preview(resident_bytes_per_rank=resident + int(carry),
+                              workspace_bytes_per_rank=workspace,
+                              concurrent_with=ledger.live_stages)
+    row = aggregate('local')
+    local = admit_local(site, row['aggregate_bytes_per_rank'], row['available_device_bytes_per_rank'],
+                        distributed_bytes=lambda: aggregate('face')['aggregate_bytes_per_rank'],
+                        names=('local', 'face'))
+    execution = 'local' if local else 'face'
+    if execution not in prices:
+        aggregate(execution)
+    return (execution, *prices[execution])
 
 
 def line_selection_execution(rows, *, mesh, ledger, nq, carry=0):
     """'local' when the producer's line selection fits with whole parents per rank, else 'face'."""
     return whole_parent_execution(
         lambda execution: line_selection_price(rows, mesh=mesh, nq=nq, execution=execution),
-        ledger=ledger, carry=carry)
+        ledger=ledger, carry=carry, site=f"shared-pole line selection {int(nq)} parents")
 
 
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
@@ -201,32 +212,39 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     reduction_phase = 'cross_reduction' if cross_original_sides is not None else 'reduction'
     reduction_args = (dict(cross_original_sides=cross_original_sides)
                       if cross_original_sides is not None else {})
-    resident_selection = resident_preview('selection', **selection_args)
-    resident_reduction = resident_preview(reduction_phase, **reduction_args)
-    if any(row['device_budget_status'] != 'PASS'
-           for row in (resident_selection, resident_reduction) if row is not None):
-        return 'face', dict(
-            reason='local resident lower bound exceeds current device budget',
-            requested_layout=resolution.layout,
-            conservative_pencil_side=side,
-            selection_face_count=selection_faces,
-            retained_output_upper_bound_bytes_per_rank=retained_outputs,
-            local_selection=resident_selection, local_reduction=resident_reduction)
-    selection = preview('selection', **selection_args)
-    reduction = preview(reduction_phase, **reduction_args)
-    admitted = all(row['device_budget_status'] == 'PASS' for row in (selection, reduction))
-    return ('local' if admitted else 'face'), dict(
-        reason=('capacity-admitted local parent' if admitted else
-                'local parent exceeds current device budget'),
-        requested_layout=resolution.layout,
-        conservative_pencil_side=side, selection_face_count=selection_faces,
-        retained_output_upper_bound_bytes_per_rank=retained_outputs,
-        local_selection=selection, local_reduction=reduction,
+    from common.gpu_utils import admit_local, last_decision
+
+    def admitted(rows):
+        # The face's own batch fills the room later (face_batch_width), so its
+        # price here is the provider's contexts alone; the caller records the
+        # map's final route.
+        need = max(row['aggregate_bytes_per_rank'] for row in rows)
+        return admit_local('shared-pole constructor', need, rows[0]['available_device_bytes_per_rank'],
+                           names=('local', 'face'), quiet=True)
+    receipt = dict(requested_layout=resolution.layout, conservative_pencil_side=side,
+                   selection_face_count=selection_faces,
+                   retained_output_upper_bound_bytes_per_rank=retained_outputs)
+    resident_rows = (resident_preview('selection', **selection_args),
+                     resident_preview(reduction_phase, **reduction_args))
+    if not admitted(resident_rows):
+        decision = last_decision()
+        return decision['route'], dict(
+            receipt, reason='local resident lower bound: ' + decision['reason'],
+            warning=decision['warning'],
+            local_selection=resident_rows[0], local_reduction=resident_rows[1])
+    rows = (preview('selection', **selection_args), preview(reduction_phase, **reduction_args))
+    local = admitted(rows)
+    decision = last_decision()
+    return ('local' if local else 'face'), dict(
+        receipt, reason=('capacity-admitted local parent: ' if local else
+                         'local parent: ') + decision['reason'],
+        warning=decision['warning'],
+        local_selection=rows[0], local_reduction=rows[1],
         reduction_admission='conservative recipe bound')
 
 
 def route_summary(mode, receipt):
-    """The constructor route and why, for one report line."""
+    """The constructor route and why, for its route record."""
     rows = ", ".join(
         f"{name} {row['aggregate_bytes_per_rank'] / 1e9:.1f}"
         for name, row in (("selection", receipt.get("local_selection")),
@@ -248,8 +266,8 @@ def route_summary(mode, receipt):
             price += f"; face program {gb(batch['program_bytes_per_rank'])} GB/rank priced from the shapes"
         price += f"; face batch {batch['parent_batch']} parent(s)" + "".join(
             f", {phase} eigh room {gb(room)} GB/rank" for phase, room in rooms.items())
-    return (f"{mode} ({receipt['reason']}, conservative pencil side "
-            f"{receipt['conservative_pencil_side']}{price})")
+    return (f"{receipt['reason']}, conservative pencil side "
+            f"{receipt['conservative_pencil_side']}{price}")
 
 
 def is_face(array):
@@ -682,21 +700,23 @@ def _mesh_eigh(mesh, n):
 def staged_eigh(mesh, stack, beside, *, ledger, live, label):
     """The plan of one staged eigh stack ``stack`` (nb, n, n): route (c), whole matrices per rank,
     when its shape price (``distrib_la.eigh_stack_bytes``) beside ``beside`` bytes per rank and
-    the ``live`` ledger stages fits the budget; otherwise the whole mesh, with one warning.
-    Shapes and the deck budget only, so every rank decides alike."""
+    the ``live`` ledger stages fits the budget; otherwise the whole mesh
+    (``common.gpu_utils.admit_local``, which records the route). Shapes and the
+    deck budget only, so every rank decides alike."""
     import distrib_la
+    from common.gpu_utils import admit_local
     from gw.shared_pole_capacity import _local_eigenplan
     n = int(stack[-1])
     local = _local_eigenplan(mesh, n)
     need = int(beside) + distrib_la.eigh_stack_bytes(local, stack, np.complex128)
     row = ledger.preview(resident_bytes_per_rank=need, workspace_bytes_per_rank=0, concurrent_with=live)
-    if row['device_budget_status'] == 'PASS':
+    # The whole mesh holds the stack's input and vector faces beside the same live set.
+    mesh_need = (row['aggregate_bytes_per_rank'] - need + int(beside)
+                 + -(-2 * 16 * int(np.prod(stack)) // int(mesh.size)))
+    if admit_local(f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2",
+                   row['aggregate_bytes_per_rank'], row['available_device_bytes_per_rank'],
+                   distributed_bytes=mesh_need, names=('route (c)', 'whole mesh')):
         return local
-    import warnings
-    warnings.warn(f"shared-pole {label}: the {int(stack[0])} x {n}^2 eigh stack needs "
-                  f"{row['aggregate_bytes_per_rank'] / 1e9:.1f} GB/rank on route (c), over the "
-                  f"{row['available_device_bytes_per_rank'] / 1e9:.1f} GB budget; it runs on the "
-                  f"whole mesh (slow)", RuntimeWarning, stacklevel=2)
     return _mesh_eigh(mesh, n)
 
 

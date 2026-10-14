@@ -40,7 +40,7 @@ layout of both eigenvector producers (``distrib_la``'s batched eigh and a
 ``jnp.linalg.eigh`` constrained to it); the whole ``(nk, nb, nb)`` is never
 gathered.  ``g_split`` gathers ONE tile's ``(K, nb, nb)`` inside the scan,
 admitted only while that tile is below the same budget share that lets the
-SC eigh hold a whole tile on one device (:func:`band_tile_is_large`);
+SC eigh hold a whole tile on one device (:data:`BAND_TILE_BUDGET_FRACTION`);
 past it ``band_2d`` keeps U distributed.
 
 EIGENVECTORS ARE COLUMNS.  ``Z[k, m, n]`` is component m of eigenvector
@@ -116,7 +116,7 @@ __all__ = ["rho_from_wfns", "rho_r_to_G", "band_rotation_spec",
            "rotate_band_axis", "rotate_band_matrix",
            "DENSITY_TAIL_ELECTRON_TOL", "density_tail_electrons",
            "density_active_band_count", "BAND_TILE_BUDGET_FRACTION",
-           "band_tile_is_large", "DensityScanPlan", "plan_density_scan"]
+           "DensityScanPlan", "plan_density_scan"]
 
 
 def _band_spec() -> P:
@@ -430,32 +430,12 @@ def density_active_band_count(occ, kweights, spin_degeneracy: float) -> int:
 # therefore caps the eigh's single-device footprint near 3%.
 #
 # Derived from bytes and the budget rather than from a band count, so it
-# tracks the device it runs on.  Where 1% puts the switch, against the
-# budgets ``gw_config`` actually resolves:
-#
-#   80 GB GPU   → budget 72 GB (0.9·bytes_limit)      → nb ≈ 6.7e3
-#   CLX node    → budget 169 GB (0.9·RAM / n_devices) → nb ≈ 1.0e4
-#   8 GB device → budget 7.2 GB                       → nb ≈ 2.2e3
-#
-# which is the band the owner ruling names — robustness at 1e4+ bands
-# over speed at 1e3, where the native batch solves ndev matrices at once
-# and wins by roughly ndev (``distrib_la.resolve``, eigh ``auto``
-# policy).  3% was the first choice and was wrong on the CPU arm: the
-# CPU budget is the whole node's RAM divided by the JAX device count, so
-# with several ranks per node it over-counts, and 3% of 169 GB puts the
-# switch past nb = 1.8e4 — it would not have fired on the nb = 1e4 case
-# the distributed eigh exists for.
+# tracks the device it runs on (the switch per card is in
+# docs/architecture/memory-model.md#routes): robustness at 1e4+ bands over
+# speed at 1e3, where the native batch solves ndev matrices at once and wins
+# by roughly ndev.  Both consumers decide through
+# ``common.gpu_utils.admit_local``, which prints and records the route.
 BAND_TILE_BUDGET_FRACTION = 0.01
-
-
-def band_tile_is_large(tile_bytes: float, budget_bytes) -> bool:
-    """Whether a band tile exceeds :data:`BAND_TILE_BUDGET_FRACTION`.
-
-    An unknown budget (``None`` or ``<= 0``) is never large — the SC eigh's
-    long-standing reading, kept so the two consumers cannot disagree.
-    """
-    budget = float(budget_bytes or 0.0)
-    return budget > 0.0 and float(tile_bytes) > BAND_TILE_BUDGET_FRACTION * budget
 
 
 class DensityScanPlan(NamedTuple):
@@ -486,10 +466,10 @@ def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
 
     ONE SIZE COMPARISON picks the rotation: the ``g_split`` route gathers a
     ``(nb, nb)`` U tile on every rank, so it is taken exactly when that tile
-    is not large against the per-device budget (:func:`band_tile_is_large`,
-    the SC eigh's own threshold).  At 72 GB/device that is
-    ``nb_carrier <= 6.7e3``; above it ``band_2d`` keeps U at
-    ``P(None,'x','y')`` and pays the ψ_k/p_x gather instead.
+    is within :data:`BAND_TILE_BUDGET_FRACTION` of the per-device budget
+    (the SC eigh's own threshold); above it ``band_2d`` keeps U at ``P(None,'x','y')`` and pays the
+    ψ_k/p_x gather instead.  An unknown budget (``None`` or ``<= 0``)
+    takes ``g_split``.
 
     THE k TILE IS BOUNDED BY THE SPHERE THE RANK ALREADY HOLDS.  One k of a
     ``g_split`` step costs two complex FFT boxes of this rank's rotated
@@ -511,7 +491,11 @@ def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
     if not have_U:
         return DensityScanPlan("local", nb_carrier, 1, int(ngkmax))
     c128 = 16.0
-    if band_tile_is_large(float(nb_carrier) ** 2 * c128, budget_bytes):
+    from common.gpu_utils import admit_local
+    budget = float(budget_bytes or 0.0)
+    if not admit_local(f"SC density scan U tile {nb_carrier}^2", float(nb_carrier) ** 2 * c128,
+                       BAND_TILE_BUDGET_FRACTION * budget if budget > 0 else float("inf"),
+                       provider=False, names=("g_split", "band_2d")):
         return DensityScanPlan("band_2d", nb_carrier, 1, int(ngkmax))
     n_rot = padded_axis(
         max(int(n_active), 1), mesh, name="density occupied rotated bands",
