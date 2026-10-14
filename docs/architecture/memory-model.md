@@ -448,7 +448,9 @@ plane-group width take the most units whose bytes fit the fixed tile: a
 parent's X_B rows, and a plane's share of the owner plane stage for one row;
 the rows per chunk then fill the budget. No timing model picks a shape. The Z store stays on host when
 it fits 0.8 of the node's `MemAvailable` over the processes on the node
-(minimum over processes); otherwise it is a slab_io scratch dataset. The
+(minimum over processes; `MemAvailable` and `MemTotal` are capped by the job's
+memory cgroup, its limit less its usage net of reclaimable page cache,
+`common.gpu_utils._meminfo_gb`); otherwise it is a slab_io scratch dataset. The
 finalize streams it in G tiles sized to a quarter of the budget.
 
 - **Over the budget**: when the smallest configuration (ψ(G) resident,

@@ -58,7 +58,7 @@ and serves every world size.
 | cost | about 7 s per image (claim 4129), on every rank that misses: nothing is shared until a file lands |
 | store | a process's first `cubin_cache_dir()` call links every store image the cache lacks into it (`ffi.fft.seed_cubin_cache`, `src/ffi/fft.py:451`) under a temporary name, renamed into place; a present entry is kept, a dangling link replaced. A bad store image is rebuilt into the cache over the link; the store file is never written. With the hsuite's 25-image store a cold run builds no image (claim 4126) |
 | building a store | `scripts/build_cubin_store.py`, one four-rank `lx run` on the target architecture with a fresh `SCRATCH`, builds the 330 k-grid-keyed images of its `GRIDS` table (the hsuite fixtures, the smoke decks and the production grids). The smoke decks, run against the same cache, add the system-keyed ones: 392 images, 3.33 GB (claim 4127). The release copies the images it ships into `cubin_store/` |
-| another architecture | the `sm<XY>` in each name makes a store per-architecture: an A100 store gives an H100 run nothing. A device the installed cuFFTDx cannot target fails the startup probe, and every factory takes the XLA backend with one warning (`GATE mathdx-probe`, [k-convolution §13](kconv.md#refusals)) |
+| another architecture | the `sm<XY>` in each name makes a store per-architecture: an A100 store gives an H100 run nothing. A device the installed cuFFTDx cannot target fails the startup probe, and every factory takes the XLA backend, announced on rank 0 and recorded as a demotion in every compile receipt and in the startup facts (`GATE mathdx-probe`, [k-convolution §13](kconv.md#refusals)) |
 
 **How the two caches meet.** Every mathdx custom call (the k-convolution
 family and the Fourier pair) carries two string attributes: `cubin_dir`, and
@@ -246,5 +246,6 @@ fail on a program built per call, per value or per context.
 | `GATE heterogeneous_gpu_targets` | the ranks hold different GPU models | one GPU model per job |
 | `GATE xla_rematerialization` | a module larger than the device, on CUDA | [memory model](memory-model.md#module-does-not-fit) |
 | `persistent compile cache OFF (…)`, `DISABLED: cannot arm …` | the opt-out, `MAX_SIZE=0`, or a directory that cannot be made | [registry §2e](../reference/env_vars.md#2e-compile-cache) |
-| `compile-storm telemetry OFF`, `jax-compat: …` | a `jax._src` surface the counter or the fit gate wraps is absent | the [JAX contract](../installation/index.md#jax); the startup check refuses an unsupported JAX first |
+| `compile-storm telemetry OFF`, `jax-compat: …` | at $P = 1$, a `jax._src` surface the counter or the fit gate wraps is absent or renamed | the [JAX contract](../installation/index.md#jax); the startup check refuses an unsupported JAX first |
+| `GATE compile-agreement`, `REFUSED: jax-support.private-arity` | at $P > 1$, the compile agreement or the device-fit gate cannot install: without them a rank-divergent compile hangs the mesh | the [JAX contract](../installation/index.md#jax) |
 | `distrib_la: UNCACHEABLE` | a checked solve traced outside `checked_program`, so its program keeps a host callback | build that program with `distrib_la.checked_program` |

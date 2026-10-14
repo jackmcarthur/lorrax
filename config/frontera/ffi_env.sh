@@ -46,7 +46,6 @@ if [ "${LORRAX_FFI_PHDF5:-0}" = "1" ]; then
     ICC_RT="${LORRAX_ICC_RUNTIME:-/opt/intel/compilers_and_libraries_2020.1.217/linux/compiler/lib/intel64_lin}"
     # Intel MPI runtime libs (libmpi.so.12 + bundled libfabric) + HDF5.
     export LD_LIBRARY_PATH="$HDF5_ROOT_DIR/lib:$LORRAX_IMPI_ROOT/lib/release:$LORRAX_IMPI_ROOT/lib:$LORRAX_IMPI_ROOT/libfabric/lib:$ICC_RT:$LD_LIBRARY_PATH"
-    export HDF5_USE_FILE_LOCKING=FALSE
 fi
 
 unset _lorrax_ffi_env_dir

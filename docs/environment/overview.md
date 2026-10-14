@@ -224,7 +224,9 @@ slow "distributed init" is the CUDA plugin load inside the first
 | `RESOURCE_EXHAUSTED: Out of memory` | read the memory-planner report in `gwjax.out` against [memory-model](../architecture/memory-model.md); lower `memory_per_device_gb` if outside-pool libraries are unusually large |
 | `cusolverMpSyevd: status=7` with NCCL error 1 | memory outside XLA's pool could not be had: XLA's live bytes plus the outside bytes exceed the card, or a caller's BFC arena is holding it (the startup report names the pair) |
 | a CPU/MPI run exits rc=1 after succeeding | the driver did not end through `runtime.run_main_and_finalize()` ([transports](transports.md)) |
-| HDF5 "file is already open" on Lustre | `HDF5_USE_FILE_LOCKING=FALSE` (runtime default) |
+| HDF5 "unable to lock file" | another process holds the file open for writing; the runtime default `HDF5_USE_FILE_LOCKING=BEST_EFFORT` makes that race visible. Close the other handle, or the writer, first |
+| HDF5 "file is already open for write" | the superblock write-open bit, not a lock ([SlabIO one owner](../architecture/slab_io.md#one-owner)) |
+| `GATE io_global_commit` at stage `SlabIO.shared_directory` | a multi-node run whose output directory is node-local (`/tmp`, local NVMe); put the run directory on `$SCRATCH` or CFS |
 | wrong data from `psum_scatter` on CPU, rc=0 | the gloo transport; CPU collectives must run `impl=mpi` ([transports](transports.md)) |
 
 Debug flags: `JAX_DEBUG_NANS=1`, `JAX_DISABLE_JIT=1`, `JAX_LOG_COMPILES=1`,

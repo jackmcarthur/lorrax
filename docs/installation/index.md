@@ -51,8 +51,10 @@ window:
    launcher's first JAX import, without importing JAX;
 3. `runtime.jax_support.enforce()`, step 5b of
    `runtime.initialize_communicator_stack` (after the first `jax.devices()`,
-   before the first `jit`), checks both live packages and the arity of each
-   arity-checked private. The version string alone is not trusted: a date-stamped
+   before the first `jit`), checks both live packages and the parameter names
+   of each private it patches (`REQUIRED_PRIVATE_PARAMS`). A mismatch refuses,
+   except that at $P = 1$ the compile agreement's and the device-fit gate's
+   rows only warn. The version string alone is not trusted: a date-stamped
    container build can report an allowed version over a different
    `jax._src`.
 

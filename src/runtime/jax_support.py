@@ -359,6 +359,8 @@ def enforce(*, announce=None) -> None:
     version_problems = check_version()
     param_problems = check_private_params()
     symbol_problems = check_private_symbols()
+    # The one caller runs this after ``jax.distributed.initialize``
+    # (``runtime.bootstrap``), so the count is the job's world.
     try:
         n_proc = int(jax.process_count())
     except Exception:  # noqa: BLE001

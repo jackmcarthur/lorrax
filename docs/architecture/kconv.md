@@ -103,7 +103,10 @@ memory per block, so every rank decides alike:
 * for the k-minor modes 4 and 5, which have no split arm, one k-box column of
   $16 \cdot ((n_x n_y (n_z|1))|1)$ B beyond it;
 * a probe compile that failed at startup on any process (`require_kconv`):
-  every factory then takes XLA.
+  every factory then takes XLA. Rank 0 prints the demotion with its cause and
+  its cost ([§1](#why-fused)), and `common.jax_compile_cache.record_demotion`
+  puts `demoted kconv` on every compile receipt and the cause in the startup
+  facts (`compile_cache.demotions`).
 
 `tests/test_kconv_xla_gate.py` holds the fallback to mathdx on the same grid (CUDA, with
 the axis cap forced to 1) and to the XLA reference at a forced axis of 48 (cpu).
@@ -133,9 +136,12 @@ probes every target in `ffi.fft.KCONV_TARGETS` in the loaded library, and
 compiles and runs one probe kernel (mode 3 on a 2×1×1 grid). A device that
 the installed cuFFTDx cannot compile for is therefore found at startup
 (`GATE mathdx-probe` text, naming its compute capability and the wheel version)
-instead of at the first convolution; a failed probe sends every factory to the XLA backend, with
-one warning. On cpu it requires the two host plan
-targets; the XLA backend needs nothing at startup. Each mathdx factory re-probes its own target when it is built, and
+instead of at the first convolution; a failed probe sends every factory to the XLA backend,
+announced and recorded as above. A CUDA device below compute capability 8.0
+refuses first (`GATE cuda-sm80`). On cpu it requires the two host plan
+targets and runs each host engine once, a 2-point FFT and (with
+`LORRAX_BANDS_GEMM_FFI` on) a 1×1 batched GEMM, so a missing engine library
+refuses before setup (`GATE plan-engine`); the XLA backend needs nothing at startup. Each mathdx factory re-probes its own target when it is built, and
 every factory checks operand shapes and dtypes at trace time.
 
 **Calling a factory.** Physics code imports the factories from
@@ -595,7 +601,9 @@ not of the traffic.
 |---|---|---|---|
 | `GATE mathdx-headers` | startup (`mathdx_root`); kernel build | no importable `nvidia.mathdx` with `include/cufftdx.hpp` | install the wheel; the `cuda12`/`cuda13` extras of `pyproject.toml` pin `nvidia-mathdx==25.6.0` |
 | `GATE kconv-target` | startup, factory | the loaded library lacks the selected target | rebuild the CUDA leg from this tree |
-| `GATE mathdx-probe` | startup, as a warning | the mode-3 probe kernel fails to compile or run on this device; every factory takes the XLA backend | a wheel whose cuFFTDx supports the device's compute capability |
+| `GATE cuda-sm80` | startup | a CUDA device below compute capability 8.0: the library's PTX is `compute_80` and the kernels use `cp.async` | an A100 or newer, or CPU |
+| `GATE mathdx-probe` | startup, as a recorded demotion | the mode-3 probe kernel fails to compile or run on this device; every factory takes the XLA backend | a wheel whose cuFFTDx supports the device's compute capability |
+| `GATE plan-engine` | startup (cpu) | the host FFTW3-ABI FFT or batched GEMM does not load or computes a wrong 2-point/1×1 result | the engine libraries `liblorrax_ffi_host.so` was linked against on `LD_LIBRARY_PATH` |
 | `GATE kconv-kgrid` | factory | the k grid is not three positive axes | pass the run's `(n_kx, n_ky, n_kz)` |
 | `GATE mathdx-kconv-axis` | handler | a direct mathdx call with a k-grid axis above 40 (`KCONV_AXIS_MAX`); the factories send such grids to the XLA backend | call through the factories |
 | `GATE mathdx-kconv-residency` | kernel build | a direct call of mode 0, 1 or 6 whose row exceeds the opt-in memory; the router streams such grids instead ([§8](#resident-rows)) | call through the router |

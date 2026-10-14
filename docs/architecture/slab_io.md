@@ -329,6 +329,11 @@ says nothing about other ranks and sees only opens that are declared to it
 
 A bare `h5py.File` elsewhere is invisible to the registry.
 
+File locks play no part in this clash: the MPI-IO driver takes none, and h5py's
+opens take `flock` locks under the runtime default
+`HDF5_USE_FILE_LOCKING=BEST_EFFORT` ([registry](../reference/env_vars.md)),
+which refuse only another process's open of a file held for writing.
+
 | condition | verdict |
 |---|---|
 | cross-stack **live overlap** where either side can write | **refused, always**: *"LORRAX HDF5 one-owner-per-file refusal"*, naming the file, the incoming open, every live foreign handle with its `where=`, and the fix (close the other handle first) |
@@ -377,8 +382,15 @@ union-read target and is not cached. Nothing here keys on process count.
 ## Launcher requirements {#launcher}
 
 - **One process per device.** The mesh is 2-D, `('x', 'y')`, with
-  `px·py = jax.process_count()`; `ffi.io.open_file` refuses otherwise. The
-  path is on a filesystem every rank shares.
+  `px·py = jax.process_count()`; `ffi.io.open_file` refuses otherwise.
+- **One shared directory.** A `"w"` or `"a"` open at $P > 1 checks once per
+  directory that every rank sees one filesystem there: rank 0 writes a nonce
+  file, every rank reads it back, and a rank that cannot makes every rank
+  refuse (`GATE io_global_commit`, stage `SlabIO.shared_directory`, naming the
+  directory and the failing rank's host). In a node-local directory each
+  node's ranks would write their own partial file and rank 0 would commit
+  node 0's copy. The directory is the path's as given, so every rank passes
+  the same string, as for any collective open.
 - **MPI world = JAX world.** At the first collective open, `_assert_mpi_world`
   compares `MPI_Comm_size(MPI_COMM_WORLD)` (probed through ctypes, with the
   MPICH or Open MPI ABI detected by symbol) to `jax.process_count()`. A
