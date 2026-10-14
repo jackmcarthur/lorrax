@@ -620,7 +620,12 @@ each bounded Fourier packet returns to its q owner before contraction.
 Actual compiled phase peaks, the live device baseline and host geometry
 staging jointly admit this placement. The current provider retains its solved
 q banks for the original final onsite completion; only the Fourier copy is
-released before that phase. The charge provider may instead consume its
+released before that phase. Current admission takes the maximum of separately
+priced read, form, Fourier, return, head check, pair and writer phases. The
+mu route fences phase completion and releases tile aliases before the next
+phase; a canonical tile retained by the asynchronous writer remains priced.
+Sequential kernel scratch is not added across these boundaries.
+The charge provider may instead consume its
 solved q bank after fencing its onsite and periodic-moment results. Both
 placements preserve the radial equations and body-then-onsite addition order.
 

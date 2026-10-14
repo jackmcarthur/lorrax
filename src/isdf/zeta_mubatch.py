@@ -1533,6 +1533,86 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
     return fn
 
 
+def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
+                                      completion, write_physical):
+    """AOT caller phases above the live pre-loop arrays, excluding mu banks.
+
+    The mu route fences reads/forms, the pair result, and each writer; all
+    tile aliases are released before the next phase. Its provider prices
+    the persistent extra mu banks and the Fourier/return phases separately.
+    """
+    from runtime.aot_memory import compiled_new_bytes
+    z0=zetas[0];st=z0.store;mesh=z0.mesh;mu=int(st.mu_pad)
+    form,step=kernels
+    v_dev,ngk_dev,sl_dev,V,S,stub,v_form=operands
+    abstract=jax.ShapeDtypeStruct((st.Q_pad,mu,st.g_tile),jnp.complex128,
+        sharding=NamedSharding(mesh,P(_XY,None,None)))
+    tile_bytes=abstract.size*16/mesh.size
+    packet=((abstract,)*3,(abstract,)*3)
+    local_args=(packet,)
+    difference_bytes=0.
+    if completion is not None:
+        difference=jax.ShapeDtypeStruct((st.Q_pad,len(pairs),st.g_tile),jnp.complex128,
+            sharding=NamedSharding(mesh,P(_XY,None,None)))
+        local_args+=(difference,)
+        difference_bytes=difference.size*16/mesh.size
+    quotes=[]
+    def quote(name,fn,args):
+        value=float(compiled_new_bytes(fn.lower(*args).compile()))
+        quotes.append(dict(owner=name,resident_increment=value))
+        return value
+    pair=quote('pair',step,((abstract,)*3,v_dev,ngk_dev,sl_dev,jnp.int32(0),V,S,*local_args))
+    forming=max(quote('form_'+str(i),fn,(z.factor,abstract,v_form,
+        ngk_dev,sl_dev,jnp.int32(0),*zero)) for i,(z,fn,zero) in enumerate(zip(zetas,form,stub)))
+    # The read chain can queue both transport and packed-axis gather. Bound
+    # their increments together; read completion precedes every form call.
+    read_peaks=[]
+    for i,z in enumerate(zetas):
+        store=z.store;slots=int(store.n_batch*store.b)
+        if store.placement=='host':
+            raw=jax.ShapeDtypeStruct((store.Q,slots,store.g_tile),jnp.complex128,
+                sharding=NamedSharding(mesh,P(None,_XY,None)))
+            reader=_rows_to_q_local(mesh,store.P,store.n_batch,store.c,slots,store.q_axis)
+            incoming=raw.size*16/mesh.size
+        else:
+            raw=jax.ShapeDtypeStruct((1,store.Q_pad,slots,store.g_tile),jnp.complex128,
+                sharding=NamedSharding(mesh,P(None,_XY,None,None)))
+            reader=_disk_tile(mesh,slots)
+            # SlabIO's pending transport and native staging are outside AOT.
+            incoming=5*raw.size*16/mesh.size
+        moved=quote('read_transport_'+str(i),reader,(raw,))
+        by_slot=jax.ShapeDtypeStruct((store.Q_pad,slots,store.g_tile),jnp.complex128,
+            sharding=NamedSharding(mesh,P(_XY,None,None)))
+        packed=quote('read_packed_'+str(i),_slots_to_packed(mesh),
+                     (by_slot,jnp.asarray(store._pfs)))
+        read_peaks.append(incoming+moved+packed+store._pfs.size*store._pfs.dtype.itemsize)
+    phases=dict(read=2*tile_bytes+max(read_peaks),
+        form=3*tile_bytes+forming,
+        pair=9*tile_bytes+difference_bytes+pair)
+    host=steady_writer=0.
+    if write_physical:
+        from gw.augmentation_current import physical_current_writer_workspace
+        price=physical_current_writer_workspace(q_logical=st.Q,q_carrier=st.Q_pad,
+            mu_packed=mu,mu_canonical=getattr(z0.mu_basis,'n_canonical',mu),
+            g_tile=st.g_tile,shards=mesh.size)
+        transport=quote('writer_transport',_to_mu_owner(mesh,st.Q,'mu'),(abstract,))
+        if z0.mu_basis is not None:
+            moved=jax.ShapeDtypeStruct((st.Q,mu,st.g_tile),jnp.complex128,
+                sharding=NamedSharding(mesh,P(None,_XY,None)))
+            unpack=jax.jit(lambda tile:z0.mu_basis.unpack_axis(tile,1,spec=P(None,_XY,None)))
+            transport+=quote('writer_unpack',unpack,(moved,))
+        steady_writer=price['canonical_transport_tile']
+        # The global dispatcher retains its last canonical tile after drain.
+        # That one tile persists through subsequent read/form/FT/pair phases.
+        phases={name:value+steady_writer for name,value in phases.items()}
+        phases['writer']=3*tile_bytes+steady_writer+max(transport,5*steady_writer)
+        host=price['host_pending']
+    return dict(phase_workspace_bytes=phases,fourier_hold_bytes=3*tile_bytes+steady_writer,
+        retained_writer_tile_bytes=steady_writer,
+        host_bytes=float(host),actual_AOT=quotes,tile_bytes=tile_bytes,
+        lifetime='Fenced read/form/pair/writer; previous tiles and pair inputs released before next phase')
+
+
 def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
                      zeta_ios=None):
     """Several V tiles over several ζ's in ONE pass over the G tiles.
@@ -1636,50 +1716,22 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
             del coefficients
     fourier_state=local_state
     prepare_fourier=None if augmentation is None else augmentation.get('prepare_fourier_coefficients')
+    # Include this persistent table view before measuring the live baseline.
+    v_form = v_dev[0]
     if callable(prepare_fourier):
-        caller_workspace=caller_host=0.
+        caller=None
         if st0.Q<mesh.size and mu%mesh.size==0:
-            from runtime.aot_memory import compiled_new_bytes
-            abstract=jax.ShapeDtypeStruct((st0.Q_pad,mu,st0.g_tile),jnp.complex128,
-                sharding=NamedSharding(mesh,P(_XY,None,None)))
-            packet=((abstract,)*3,(abstract,)*3)
-            local_args=(packet,)
-            if completion is not None:
-                local_args+=(jax.ShapeDtypeStruct((st0.Q_pad,len(pairs),st0.g_tile),jnp.complex128,
-                    sharding=NamedSharding(mesh,P(_XY,None,None))),)
-            module=step.lower((abstract,)*3,v_dev,ngk_dev,sl_dev,jnp.int32(0),V,S,*local_args).compile()
-            # Three smooth tiles, one Z read and six previous Fourier tiles.
-            # New Fourier/return storage is priced by the provider owner.
-            caller_workspace=10*abstract.size*16/mesh.size+compiled_new_bytes(module)
-            caller_workspace+=max(compiled_new_bytes(fn.lower(factor,abstract,v_dev[0],
-                ngk_dev,sl_dev,jnp.int32(0),*zero).compile())
-                for fn,factor,zero in zip(form,factors,stub))
-            if zeta_ios is not None:
-                from gw.augmentation_current import physical_current_writer_workspace
-                writer_price=physical_current_writer_workspace(q_logical=st0.Q,q_carrier=st0.Q_pad,
-                    mu_packed=mu,mu_canonical=getattr(z0.mu_basis,'n_canonical',mu),
-                    g_tile=st0.g_tile,shards=mesh.size)
-                writer=_to_mu_owner(mesh,st0.Q,'mu')
-                transport=compiled_new_bytes(writer.lower(abstract).compile())
-                caller_host=writer_price['host_pending']
-                if z0.mu_basis is not None:
-                    mu_tile=jax.ShapeDtypeStruct((st0.Q,mu,st0.g_tile),jnp.complex128,
-                        sharding=NamedSharding(mesh,P(None,_XY,None)))
-                    unpack=jax.jit(lambda tile:z0.mu_basis.unpack_axis(tile,1,spec=P(None,_XY,None)))
-                    transport+=compiled_new_bytes(unpack.lower(mu_tile).compile())
-                # The pair AOT already counts the three emitted physical
-                # outputs. The canonical writer owner additionally prices
-                # transport/SlabIO staging, including the one pending host row.
-                caller_workspace+=max(transport,5*writer_price['canonical_transport_tile'])
-            jax.block_until_ready((local_state,V,S,v_dev,ngk_dev,sl_dev))
-        fourier_state=prepare_fourier(local_state,caller_workspace_bytes=float(caller_workspace),
-                                      caller_host_bytes=float(caller_host))
+            caller=_current_fourier_caller_workspace(zetas,pairs,(form,step),
+                (v_dev,ngk_dev,sl_dev,V,S,stub,v_form),
+                completion=completion,write_physical=zeta_ios is not None)
+            jax.block_until_ready((local_state,V,S,v_dev,v_form,ngk_dev,sl_dev))
+        fourier_state=prepare_fourier(local_state,caller_phase_workspace=caller)
         if jax.process_index()==0:
             print_fn('  current Fourier distribution: '+str(augmentation['fourier_distribution_receipt']))
     jax.block_until_ready((fourier_state,V,S))
     stage_seconds['prepare_and_layout']=time.perf_counter()-t0
     loop_started=time.perf_counter()
-    v_form = v_dev[0]                  # unread by the ζ-forming half
+    bounded_mu=bool(fourier_state is not None and fourier_state.get('fourier_mu',False))
     # No look-ahead: each Z tile is read just before its ζ is formed and
     # dropped after, so a G tile holds one Z tile and the ζ tiles — the six
     # tile-sized buffers the fit's plan sized g_tile for (MuBatchPlan).
@@ -1687,11 +1739,13 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
         zt = []
         for i, z in enumerate(zetas):
             Zt = z.store.read_tile(t)
+            if bounded_mu:jax.block_until_ready(Zt)
             a, m, sh, zi = form[i](factors[i], Zt, v_form, ngk_dev, sl_dev,
                                    jnp.int32(t), *stub[i])
             stub[i] = (a, m, sh)
             zt.append(zi)
-            del Zt
+            if bounded_mu:jax.block_until_ready((a,m,sh,zi))
+            del Zt,zi
         local_tiles=()
         if augmentation is not None:
             tiles=augmentation['fourier_tile'](t,fourier_state)
@@ -1709,13 +1763,20 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
                 local_tiles+=(difference,)
         result = step(tuple(zt),v_dev,ngk_dev,sl_dev,jnp.int32(t),V,S,*local_tiles)
         V, S = result[:2]
+        if bounded_mu:
+            # Pair scratch has completed. Only the emitted physical tiles and
+            # baseline accumulators coexist with the sequential writer.
+            jax.block_until_ready(result)
+            del zt,local_tiles,tiles,part,tile
+            if completion is not None:del difference
         if zeta_ios is not None:
             for z, writer, physical in zip(zetas, zeta_ios, result[2]):
                 z._write_tile(writer, physical, t * st0.g_tile)
                 writer.sync_writes()
             del physical
         del result
-        del zt
+        if bounded_mu:jax.effects_barrier()
+        else:del zt
     jax.block_until_ready((V,S))
     stage_seconds['G_loop_body_and_writer']=time.perf_counter()-loop_started
     # Release only the extra Fourier layout, before the existing onsite phase.

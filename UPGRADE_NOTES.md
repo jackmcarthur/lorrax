@@ -2240,3 +2240,14 @@ The solved q banks retain their existing onsite lifetime and body-then-onsite
 addition order. Actual compiled/live device capacity and host geometry
 staging are agreed across ranks before the extra layout is allocated; a
 declined layout keeps q ownership. No input change is needed.
+
+## Unreleased — price current Fourier caller phases separately
+
+Small-q current layout admission now prices each sequential caller phase
+against the measured live baseline. The mu route fences read/form and pair
+completion, releases obsolete tile aliases, and keeps the writer's retained
+canonical tile in its later phase bounds. Actual pair/form/transport AOT and
+the Gamma neutrality check are included. This corrects a conservative sum
+that rejected the extra layout despite nonoverlapping scratch lifetimes;
+capacity is still an all-rank runtime decision. The q fallback keeps its
+existing per-tile execution. No equations or inputs change.

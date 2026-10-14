@@ -523,7 +523,8 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         out_specs=((mu_spec,)*3,(mu_spec,)*3),check_vma=False))
     distribution_receipt=dict(mode='q',reason='direct q-owned Fourier input')
 
-    def prepare_fourier_coefficients(state,*,caller_workspace_bytes=0.,caller_host_bytes=0.):
+    def prepare_fourier_coefficients(state,*,caller_workspace_bytes=0.,caller_host_bytes=0.,
+                                     caller_phase_workspace=None):
         """Move independent Fourier rows once, retaining all onsite operands.
 
         Solved q banks and the support witness retain their existing lifetime.
@@ -539,6 +540,15 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         if Q>=mesh.size or mu%mesh.size:
             distribution_receipt.update(mode='q',reason='q ownership covers the mesh')
             return state
+        caller_phases={}
+        caller_aot=[]
+        if caller_phase_workspace is not None:
+            caller_phases=dict(caller_phase_workspace['phase_workspace_bytes'])
+            caller_workspace_bytes=float(caller_phase_workspace['fourier_hold_bytes'])
+            caller_host_bytes=float(caller_phase_workspace['host_bytes'])
+            caller_aot=caller_phase_workspace['actual_AOT']
+            if any(not np.isfinite(v) or v<0 for v in (*caller_phases.values(),caller_workspace_bytes,caller_host_bytes)):
+                raise ValueError('current Fourier caller phase prices must be finite and nonnegative')
         coefficients=tuple(v[0] if separate_halves else v for v in state['coefficients'])
         operands=coefficients+state['moments']
         for value in operands:
@@ -570,6 +580,13 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         ft=quote('mu_Fourier',mu_fourier_kernel,(mu_operands[:3],mu_operands[3:],*geometry,rows))
         tile=abstract((Q,mu,gt),mu_sharding)
         back=quote('Fourier_mu_to_q',to_q,(tile,))
+        head_increment=head_marker_bytes=0.
+        if slab:
+            marker=abstract((Qp,gt),NamedSharding(mesh,P(XY,None)),jnp.bool_)
+            q_tile=abstract((Qp,mu,gt),NamedSharding(mesh,qspec))
+            head=quote('neutral_head',neutral_head_kernel,((q_tile,)*3,(q_tile,)*3,marker))
+            head_increment=head.resident_increment
+            head_marker_bytes=marker.size/mesh.size
         geometry_bytes=sum(v.size*v.dtype.itemsize for v in geometry)
         mu_tile_bytes=Q*mu*gt*16/mesh.size
         q_tile_bytes=Qp*mu*gt*16/mesh.size
@@ -587,6 +604,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         live_bytes=max((value.get('bytes_in_use',0) for value in stats),default=0)
         phase_peaks=dict(q_to_mu=live_bytes+conversion,
             Fourier=live_bytes+fourier,mu_to_q=live_bytes+returns)
+        if slab:
+            phase_peaks['neutral_head']=live_bytes+retained+6*q_tile_bytes+head_marker_bytes+head_increment+caller_workspace_bytes
+        phase_peaks.update({name:live_bytes+retained+value for name,value in caller_phases.items()})
         planned=max(phase_peaks.values())
         admission=np.asarray(all_gather_processes(np.asarray([int(measured),planned,
             device_budget_bytes(),host_future,host_bytes_per_process(fraction=.7)],np.float64)))
@@ -598,7 +618,8 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             planned_bytes_per_rank=float(np.max(admission[:,1])),phase_peaks=phase_peaks,
             mu_bank_bytes_per_rank=retained,future_host_bytes=host_future,actual_AOT=quotes,
             logical_q=Q,packed_mu=mu,solved_q_banks_retained=True,
-            caller_workspace_bytes=float(caller_workspace_bytes))
+            caller_workspace_bytes=float(caller_workspace_bytes),
+            caller_phase_workspace_bytes=caller_phases,caller_actual_AOT=caller_aot)
         if not accepted:return state
         record_stage_price('isdf.current_mu_Fourier',float(np.max(admission[:,1])))
         prepared=[]
@@ -851,6 +872,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                     output.append(value)
                 returned.append(tuple(output))
             result=tuple(returned)
+            del part,tile
         if slab and np.any(active[:,first:first+gt]&(norm[:,first:first+gt]**2<=CURRENT_GAMMA_K2_EPS)):
             from common.collectives import gather_to_host
             def head_rows(qslice):
