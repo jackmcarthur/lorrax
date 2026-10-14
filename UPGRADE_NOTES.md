@@ -25,8 +25,10 @@ refusals fire. Startup also changes in these ways:
   outside a Slurm step, with no `JAX_COORDINATOR_ADDRESS` and nothing jax's
   cluster detection recognizes, startup refuses (`GATE coordinator_address`)
   instead of using each rank's own host.
-- A GPU process that addresses more than one device refuses at startup
-  (`GATE one_gpu_per_process`), not at its first SlabIO open.
+- At P > 1, a GPU process that addresses more than one device refuses at
+  startup (`GATE one_gpu_per_process`). One process over several GPUs is
+  unchanged: kmeans runs that way, and the other drivers refuse it at their
+  first SlabIO open.
 - On a Slingshot node with no site profile, a multi-node CUDA step gets
   `FI_CXI_DISABLE_HOST_REGISTER=1` and `FI_CXI_RDZV_THRESHOLD=0` and a warning
   naming the missing profile. A multi-node CUDA step with neither `NCCL_NET`
@@ -35,8 +37,11 @@ refusals fire. Startup also changes in these ways:
   `_LORRAX_JAX_DISTRIBUTED_DONE` sentinel, so a driver started by a P > 1
   parent initializes its own world.
 
-GATE_RESULTS_TBD No deck change; an install without the `config/` directory
-has no site profile.
+On the P4 hsuite eqp is byte-identical in 10/10 files, cold and warm, and the
+cold wall is 324.8 s against 324.3 s on main on the same node. On a 2-node P8
+step the profile applies the same settings as before and all_to_all runs at
+31.3 GB/s per rank against 32.0 on main (claim TBD). No deck change; an
+install without the `config/` directory has no site profile.
 
 ## 2026-10-13 — I/O and environment safety checks
 

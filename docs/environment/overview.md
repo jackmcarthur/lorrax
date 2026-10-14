@@ -214,8 +214,8 @@ the first visibility variable set (`CUDA_VISIBLE_DEVICES`,
 `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`) and the coordinator on the
 step's first host, its port keyed on the job and step; outside a Slurm step
 jax's own cluster detection (Open MPI's `mpirun`) supplies it or the launch
-refuses naming `JAX_COORDINATOR_ADDRESS` (`GATE coordinator_address`). A
-GPU process that addresses more than one device refuses
+refuses naming `JAX_COORDINATOR_ADDRESS` (`GATE coordinator_address`). At
+P > 1 a GPU process that addresses more than one device refuses
 (`GATE one_gpu_per_process`): one GPU per rank is pinned by
 `src/ffi/cpp/select_gpu.sh` through `CUDA_VISIBLE_DEVICES`, not by
 `--gpus-per-task=1` ([why](machines/perlmutter.md#required-gpu-task-geometry)).

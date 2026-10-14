@@ -31,8 +31,10 @@ equals the rank count. The step itself keeps all four GPUs
 (`--gpus-per-node=4`), which the intra-node collectives need:
 `--gpus-per-task=1` confines each rank to its own device, and the first
 collective fails with `invalid device ordinal`. `-n 1 --gpus-per-node=4` is
-one process over four devices, which is not a P = 4 run; it refuses at
-startup (`GATE one_gpu_per_process`).
+one process over four devices, which is not a P = 4 run: centroid selection
+runs that way, and every driver that opens SlabIO refuses it there. Several
+processes that each address several GPUs refuse at startup
+(`GATE one_gpu_per_process`).
 
 A job uses one GPU model and memory class. A multi-node allocation requests
 `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'`; the runtime refuses a mixed 40/80 GB

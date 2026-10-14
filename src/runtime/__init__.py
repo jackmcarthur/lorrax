@@ -1538,7 +1538,11 @@ def init_jax_distributed() -> None:
 
 
 def _enforce_gpu_placement() -> None:
-    """One GPU per process, and one GPU model and memory class across the job."""
+    """One GPU per process at P > 1, and one GPU model and memory class in the job.
+
+    A single process over several GPUs is left alone: centroid selection runs
+    that way, and SlabIO refuses it by name at its first open.
+    """
     import hashlib
     import jax
     import numpy as np
@@ -1546,13 +1550,14 @@ def _enforce_gpu_placement() -> None:
 
     gpus = [device for device in jax.local_devices()
             if device.platform in ("gpu", "cuda", "rocm")]
-    if len(gpus) > 1:
+    if len(gpus) > 1 and jax.process_count() > 1:
         raise RuntimeError(
-            f"GATE one_gpu_per_process: this process addresses {len(gpus)} "
-            f"GPUs; the SlabIO, NCCL and distributed-solver transports run one "
-            f"process per GPU.  Launch one rank per GPU with each rank pinned "
-            f"to its own device (srun -n <GPUs> src/ffi/cpp/select_gpu.sh "
-            f"<cmd>, or CUDA_VISIBLE_DEVICES=<local rank>; lx run -G 4 -n 4).")
+            f"GATE one_gpu_per_process: process {jax.process_index()} of "
+            f"{jax.process_count()} addresses {len(gpus)} GPUs; the SlabIO, "
+            f"NCCL and distributed-solver transports run one process per GPU.  "
+            f"Launch one rank per GPU with each rank pinned to its own device "
+            f"(srun -n <GPUs> src/ffi/cpp/select_gpu.sh <cmd>, or "
+            f"CUDA_VISIBLE_DEVICES=<local rank>; lx run -G 4 -n 4).")
     # Remote JAX device descriptors report this client's model, so exchange
     # measured local targets rather than trusting jax.devices() metadata.
     kinds = [device.device_kind for device in gpus]
@@ -1946,7 +1951,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        progress setting is only a request; this is the check that it worked.
        It must precede clique construction because XLA can issue collectives
        from executor threads.  Then :func:`_enforce_gpu_placement`: one GPU
-       per process, refused by name otherwise, and one GPU model in the job.
+       per process at P > 1, refused by name otherwise, and one GPU model in
+       the job.
     5d. ``install_compile_agreement`` -- installs the cross-rank module-key
        refusal after the live coordination client and supported JAX surface
        exist, but before the mesh warmup performs the first compile.  A
