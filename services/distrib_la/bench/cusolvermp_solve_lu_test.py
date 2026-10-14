@@ -1,6 +1,6 @@
 """Correctness test for ``cusolvermp.batched_distributed_solve_lu``.
 
-Mirrors cusolvermp_batched_test.py but targets the general (non-Hermitian)
+Checks the general (non-Hermitian)
 distributed LU solve used by the W Dyson 'distributed' plan on CUDA meshes.
 
 Usage::

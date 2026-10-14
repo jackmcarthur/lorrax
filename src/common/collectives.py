@@ -389,9 +389,7 @@ def mesh_is_emulated(mesh) -> bool:
     The predicate reads ``process_count()``, not the XLA flag, and that is
     load-bearing in both directions: a real ``-n 4`` leg sets no flag and
     must never be labelled emulated, and a flagged single-process run must
-    never be labelled real.  Same spelling as
-    ``services/symmetry_maps/bench/bench_symmetry_maps.py``, whose ``emulated``
-    column states it per row for the same reason.
+    never be labelled real.
 
     It is also platform-blind, which is the third direction and the one
     that bites.  It reads ``devices.size`` and ``process_count()`` and

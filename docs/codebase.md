@@ -402,10 +402,10 @@ caller contracts ([substrate services](architecture/services.md)).
 
 | service | level | owns | extras |
 |---|---|---|---|
-| `distrib_la` | L3 | distributed dense linear algebra on the `('x','y')` mesh: plans, GEMM and SUMMA panels, eigh, Cholesky, LU, polar factor, with cuSOLVERMp/cuBLASMp, SLATE, ScaLAPACK and pure-JAX backends ([contract](services/distrib_la/api.md)) | `bench/`, `docs/` |
+| `distrib_la` | L3 | distributed dense linear algebra on the `('x','y')` mesh: plans, GEMM and SUMMA panels, eigh, Cholesky, LU, polar factor, with cuSOLVERMp/cuBLASMp, SLATE, ScaLAPACK and pure-JAX backends ([contract](services/distrib_la/api.md)) | `bench/` |
 | `lxkit` | L3 (`deck_doctor` L1) | the foundation the services share: capability gates, the absent-versus-broken probe vocabulary, loop-carry marking (`mark_varying`), process-local placement, native-provider attestation, the cache root; `python -m lxkit.deck_doctor` preflights a deck | |
 | `minimax` | L1 | runtime quadrature rules: screening, Σ box rules, response-bank rules, their certificates ([contract](services/minimax.md)) | |
-| `symmetry_maps` | L1 | the space group of a deck: k-grid reduction, IBZ ⇄ full-BZ tables, unfolds, q-grid time-reversal policy, the QE-schema binding ([contract](services/symmetry_maps.md)) | `bench/` |
-| `vcoul` | L1 | the bare and truncated Coulomb interaction, mini-BZ averages, the Coulomb sphere, BerkeleyGW `vcoul` parsing ([contract](services/vcoul.md)) | `bench/` |
-| `wfn_loader` | L1 | ψ(G) from `WFN.h5`, by host read or collective MPI-IO ([contract](services/wfn_loader.md)) | `bench/`, `docs/` |
+| `symmetry_maps` | L1 | the space group of a deck: k-grid reduction, IBZ ⇄ full-BZ tables, unfolds, q-grid time-reversal policy, the QE-schema binding ([contract](services/symmetry_maps.md)) | |
+| `vcoul` | L1 | the bare and truncated Coulomb interaction, mini-BZ averages, the Coulomb sphere, BerkeleyGW `vcoul` parsing ([contract](services/vcoul.md)) | |
+| `wfn_loader` | L1 | ψ(G) from `WFN.h5`, by host read or collective MPI-IO ([contract](services/wfn_loader.md)) | |
 | `zeta_loader` | L1 | the `zeta_q.h5` reader and format contract ([contract](services/zeta_loader.md)) | `bench/` |

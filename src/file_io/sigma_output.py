@@ -886,8 +886,7 @@ def write_sigma_freq_debug_table(
 # The 113.08 eV was investigated before the extraction was written, on the
 # owner's instruction, because a number that large usually means the Σ
 # procedure did something wrong.  It did not, and the answer is in two
-# halves (``tools/sigma_star_spread_decompose.py``, and the prose in
-# ``NOTE_sigma_star_spread.md``).
+# halves.
 #
 # HALF ONE: the raw metric can read enormous from gauge alone.  ⟨mk|O|nk⟩
 # is not a physical quantity when m and n are degenerate — the diagonaliser

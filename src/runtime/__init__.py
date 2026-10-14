@@ -623,10 +623,8 @@ def set_x64_on_imported_jax():
     Setting the variable is enough only when jax is imported after it: jax
     latches x64 once, when ``jax._src.config`` is first imported.  An entry
     point that imports jax first and the driver second leaves it latched at
-    whatever the environment said before the runtime ran --
-    ``tools/profile_gw_xprof.py`` (``import jax`` at :20, ``from gw import
-    gw_jax`` at :68) takes that order, and so does any test or notebook that
-    touches jax before a driver.  Measured 2026-08-27 (WSL box, jax 0.9.1,
+    whatever the environment said before the runtime ran -- a profiling
+    wrapper, a test or a notebook that touches jax before a driver.  Measured 2026-08-27 (WSL box, jax 0.9.1,
     JAX_PLATFORMS=cpu, ``env -u JAX_ENABLE_X64``): in that order the process
     ran with ``jnp.zeros(1, dtype=float).dtype == float32``, silently, for
     the whole run.  The flag is set here rather than re-asserted in each

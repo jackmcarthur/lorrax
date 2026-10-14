@@ -302,9 +302,8 @@ class DftVelocityHeadData:
     instead of on the mode string.
 
     This is the configuration every accepted sodium head number was
-    produced in (claims 0180/0181/0189, through
-    ``tools/qsgw_head_spectrum.py --dft-velocity-only``).  The covariant
-    upgrade is parked on claim 0183.
+    produced in (claims 0180/0181/0189).  The covariant upgrade is parked
+    on claim 0183.
     """
 
     velocity_dft_cart: jax.Array
@@ -722,10 +721,8 @@ def load_dft_velocity_head(
 ) -> DftVelocityHeadData:
     """Load the completed exact-DFT velocity stage, and only that stage.
 
-    This is the loader ``tools/qsgw_head_spectrum.py --dft-velocity-only``
-    has always used — it lived in that tool until ``sc_head_update =
-    dft_velocity`` gave the driver the same route, and it moved here rather
-    than being copied so the two cannot drift.
+    ``sc_head_update = dft_velocity`` takes this route; it has one owner so
+    a diagnostic and the driver cannot drift.
 
     The key difference from :func:`load_parallel_transport_head` is
     deliberate:

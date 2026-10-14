@@ -87,8 +87,7 @@ h5_journal.rank*.log
 h5_journal_crash.rank*.txt
 
 # Stray compiler default-output scrap. Do NOT blanket-ignore *.out:
-# tracked reference files match it (src/psp/psp_dataclass.out,
-# tests/regression/cohsex_debug/sigma_*_ref.out).
+# a tracked reference output may use that suffix.
 a.out
 
 # generic-cloud lane artifacts (config/cloud/)

@@ -34,8 +34,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# `bench/` holds claims-style baseline drivers, not a pytest suite.
-norecursedirs = ["bench"]
 # The SAME two markers the monorepo registers.  Declared in both places on
 # purpose: `pytest services/wfn_loader/tests` from the monorepo root picks
 # THIS file as its rootdir config (it is the nearest pyproject.toml above
