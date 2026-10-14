@@ -40,7 +40,7 @@ command -v uv || {
     | env UV_INSTALL_DIR=$SCRATCH/.local/bin UV_NO_MODIFY_PATH=1 sh
   export PATH=$SCRATCH/.local/bin:$PATH
 }
-git clone https://github.com/jackmcarthur/lorrax.git $SCRATCH/lorrax
+git clone --filter=blob:none https://github.com/jackmcarthur/lorrax.git $SCRATCH/lorrax
 cd $SCRATCH/lorrax
 uv sync --extra cuda13
 ```
