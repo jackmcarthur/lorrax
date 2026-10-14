@@ -55,6 +55,73 @@ def live_device_bytes(*objects):
     return sum(count(value) for value in objects)
 
 
+def _shared_current_packet_plan(mesh, vertex_terms, packet):
+    """Reuse matching first/second channel primitives with bounded packets.
+
+    Other bases and the compensated two-output route keep their ordinary
+    scalar execution. Only program metadata is retained, never a point RHS.
+    """
+    import jax
+    import jax.numpy as jnp
+    from isdf.local_rhs import _projected_rhs_add
+    from runtime.aot_memory import compiled_new_bytes
+    if len(vertex_terms) != 3:
+        return None
+    first, second = (tuple(terms) for terms in vertex_terms[:2])
+    pairs = tuple((int(i), int(j)) for _, i, j in first)
+    if (len(pairs) < 2 or len(set(pairs)) != len(pairs)
+            or pairs != tuple((int(i), int(j)) for _, i, j in second)):
+        return None
+    weights = tuple((complex(left[0]), complex(right[0]))
+                    for left, right in zip(first, second))
+    initialize = jax.jit(lambda: tuple(jnp.zeros(packet.shape, packet.dtype)
+                                      for _ in range(2)),
+                         out_shardings=(packet.sharding,) * 2)
+    adds = tuple(_projected_rhs_add(mesh, weight) for weight in weights)
+    quotes = [dict(owner='shared_current_packet_initialize',
+        resident_increment=int(compiled_new_bytes(initialize.lower().compile())))]
+    for weight, fn in dict(zip(weights, adds)).items():
+        quotes.append(dict(owner='shared_current_packet_add',
+            weights=[[w.real, w.imag] for w in weight],
+            resident_increment=int(compiled_new_bytes(
+                fn.lower((packet, packet), packet).compile()))))
+    packet_bytes = packet.size * packet.dtype.itemsize / mesh.size
+    increment = max(quotes[0]['resident_increment'],
+        3 * packet_bytes + max(q['resident_increment'] for q in quotes[1:]))
+    return dict(pairs=pairs, initialize=initialize, adds=adds,
+        shape=packet.shape, mesh=mesh,
+        receipt=dict(channels=[1, 2], unique_vertex_pairs=[list(p) for p in pairs],
+            compact_accumulators_bytes=2 * packet_bytes,
+            additional_workspace_bytes=increment, actual_AOT=quotes,
+            policy='Completion before complex weights; projected primitives only; distinct OWN factors'))
+
+
+def _shared_current_rhs_packets(plan, project, **operands):
+    """Project each Cartesian delta once, then fan out its channel weights."""
+    import jax
+    from isdf.local_rhs import _iter_local_density_rhs_primitives
+    from isdf.zeta_mubatch import _require_q_owned
+    accumulators = plan['initialize']()
+    jax.block_until_ready(accumulators)
+    primitives = _iter_local_density_rhs_primitives(
+        **operands, vertex_pairs=plan['pairs'], return_smooth=False)
+    try:
+        index = 0
+        for _, value, _ in primitives:
+            packet = project(value)
+            _require_q_owned(packet, plan['mesh'], plan['shape'],
+                             name='shared completed current primitive')
+            packet.block_until_ready()
+            accumulators = plan['adds'][index](accumulators, packet)
+            jax.block_until_ready(accumulators)
+            del packet, value
+            index += 1
+    finally:
+        # In particular, drop a yielded raw RHS if projection/solve refused.
+        primitives.close()
+    return accumulators
+
+
 class DeferredCurrentDensity:
     """Bounded source/C replay; each raw current packet is consumed once."""
     def __init__(self, current, charge_state, *, source, coefficients, parameters):
@@ -137,6 +204,11 @@ class DeferredCurrentDensity:
         ids = s['q_full_indices'] if s['indexed_q'] is None else np.arange(len(s['q_full_indices']))
         select,_ = stage._rhs_storage_kernels(mesh,ids,s['qpad'],na,nh,nr,rp,nf)
         to_q = face_to_batch_reshard(mesh)
+        shared = None
+        if kinds == 1:
+            packet = jax.ShapeDtypeStruct((s['qpad'], plan.n_centroid_packed, nfp),
+                jnp.complex128, sharding=NamedSharding(mesh, P(('x', 'y'), None, None)))
+            shared = _shared_current_packet_plan(mesh, s['vertex_terms'], packet)
         gs,fs,qs = P(None,None,None,('x','y')), P(None,'x',None,'y'), P(('x','y'),None,None)
         shape = lambda dims,dtype,spec:jax.ShapeDtypeStruct(dims,dtype,
             sharding=NamedSharding(mesh,spec))
@@ -162,11 +234,15 @@ class DeferredCurrentDensity:
         # accounts for its compiled intermediates; no multiplier is relaxed.
         packet_work = (points+s['workspace']['total']+angular
             +max(q['arguments']+q['outputs']+q['temporary']-q['aliases'] for q in quotes))
+        if shared is not None:
+            packet_work += shared['receipt']['additional_workspace_bytes']
         price = final_banks+external+packet_work
         budget = float(device_budget_bytes())
         s['replay_preflight'] = dict(final_banks=final_banks,actual_live_device_leaves=external,
             packet_shape_bound=packet_work,actual_sampler_AOT=quotes,planned_bytes_per_rank=price,
             budget_bytes_per_rank=budget,scope='Sampler AOT plus conservative current RHS bounds; not pair/onsite AOT admission')
+        if shared is not None:
+            s['replay_preflight']['shared_current_primitives'] = shared['receipt']
         if price > budget:
             warn_over_budget('isdf.current_packet_replay',price,budget)
             raise MemoryError('deferred current packet replay exceeds its live device budget')
@@ -212,18 +288,29 @@ class DeferredCurrentDensity:
                             tile = kernels['face'](ae,jnp.int32(p0),jnp.int32(b0))
                             ae = kernels['update_face'](ae,correct(tile,C,delta,image),jnp.int32(p0),jnp.int32(b0))
                 ae_faces,ps_faces = (ae,stage._face_complement(ae,mesh)),(ps,stage._face_complement(ps,mesh))
+                common = dict(centroid_faces=s['parent_faces'],
+                    atom_ae_faces=ae_faces,atom_ps_faces=ps_faces,left_plan=plan,right_plan=right_plan,
+                    weight_l=p['weight_l'],weight_r=p['weight_r'],kgrid=s['kgrid'],mesh_xy=mesh,
+                    q_neg_idx=s['qneg'],q_indices=s['indexed_q'])
+                if shared is not None:
+                    packets = list(_shared_current_rhs_packets(shared,
+                        lambda value: to_q(compressor(select(value))), **common))
+                    for channel in range(2):
+                        packet, packets[channel] = packets[channel], None
+                        stream.append(channel, 0, packet, r0)
+                        del packet
+                    del packets
                 for channel,terms in enumerate(s['vertex_terms']):
-                    values = local_density_rhs(centroid_faces=s['parent_faces'],
-                        atom_ae_faces=ae_faces,atom_ps_faces=ps_faces,left_plan=plan,right_plan=right_plan,
-                        weight_l=p['weight_l'],weight_r=p['weight_r'],kgrid=s['kgrid'],mesh_xy=mesh,
-                        q_neg_idx=s['qneg'],q_indices=s['indexed_q'],vertex_terms=terms,return_smooth=kinds==2)
+                    if shared is not None and channel < 2:
+                        continue
+                    values = local_density_rhs(**common,vertex_terms=terms,return_smooth=kinds==2)
                     values = values if kinds==2 else (values,)
                     for kind,value in enumerate(values):
                         packet = to_q(compressor(select(value)))
                         stream.append(channel,kind,packet,r0)
                         del packet
                     del values,value
-                del ae_faces,ps_faces,ae,ps,phases,tile,C,image
+                del common,ae_faces,ps_faces,ae,ps,phases,tile,C,image
         result = stream.finish()
         self._consumed = True
         self.source = self.coefficients = self.parameters = self.charge_state = self._charge_zeta = None

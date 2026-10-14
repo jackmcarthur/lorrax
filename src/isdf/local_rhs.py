@@ -131,9 +131,50 @@ def local_density_rhs(*, centroid_faces, atom_ae_faces, atom_ps_faces,
         Every finite primitive contributes to both outputs after identical
         LR+RL completion, q selection and complex weighting.
     """
+    terms = tuple((complex(w), int(i), int(j)) for w, i, j in vertex_terms)
+    if not terms or any(i not in range(4) or j not in range(4) for _, i, j in terms):
+        raise ValueError("local_density_rhs: vertex terms must use Cartesian vertices 0..3")
+    if any(not np.isfinite(w) for w, _, _ in terms):
+        raise ValueError("local_density_rhs: vertex weights must be finite")
+    primitives = _iter_local_density_rhs_primitives(
+        centroid_faces=centroid_faces, atom_ae_faces=atom_ae_faces,
+        atom_ps_faces=atom_ps_faces, left_plan=left_plan, right_plan=right_plan,
+        weight_l=weight_l, weight_r=weight_r, kgrid=kgrid, mesh_xy=mesh_xy,
+        q_neg_idx=q_neg_idx, q_indices=q_indices,
+        vertex_pairs=tuple((i, j) for _, i, j in terms), return_smooth=return_smooth)
+    total = smooth_total = None
+    index = 0
+    for _, piece, smooth in primitives:
+        weight = terms[index][0]
+        if weight != 1.0:
+            piece = weight * piece
+        total = piece if total is None else total + piece
+        if return_smooth:
+            if weight != 1.0:
+                smooth = weight * smooth
+            smooth_total = smooth if smooth_total is None else smooth_total + smooth
+        # enumerate caches the yielded array tuple across next(); plain
+        # iteration plus these releases leave only the required totals live.
+        del piece, smooth
+        index += 1
+    if return_smooth:
+        return total, smooth_total
+    return total
+
+
+def _iter_local_density_rhs_primitives(*, centroid_faces, atom_ae_faces,
+        atom_ps_faces, left_plan, right_plan, weight_l, weight_r, kgrid,
+        mesh_xy, vertex_pairs, q_neg_idx=None, q_indices=None,
+        return_smooth=False):
+    """Yield one completed Cartesian primitive without retaining a cache.
+
+    Completion and requested-q selection precede every complex channel
+    weight. The caller must finish projecting a yielded primitive before
+    advancing; resumption drops it before constructing the next endpoint.
+    Repeated pairs remain repeated, preserving the scalar owner's order.
+    """
     from isdf.core import (_c_q_dirac_quarters,
                            complete_ordered_pair_normal_equations)
-
     _authenticate_plan_pair(left_plan, right_plan, kgrid=kgrid, mesh_xy=mesh_xy)
     npar, nb, ns, nmu = _authenticate_faces(
         centroid_faces, left_plan, name='centroid')
@@ -146,15 +187,12 @@ def local_density_rhs(*, centroid_faces, atom_ae_faces, atom_ps_faces,
     wl, wr = jnp.asarray(weight_l, jnp.float64), jnp.asarray(weight_r, jnp.float64)
     if wl.shape != (nb,) or wr.shape != (nb,):
         raise ValueError(f"local_density_rhs: band weights must have shape {(nb,)}")
-    terms = tuple((complex(w), int(i), int(j)) for w, i, j in vertex_terms)
-    if not terms or any(i not in range(4) or j not in range(4) for _, i, j in terms):
+    pairs = tuple((int(i), int(j)) for i, j in vertex_pairs)
+    if not pairs or any(i not in range(4) or j not in range(4) for i, j in pairs):
         raise ValueError("local_density_rhs: vertex terms must use Cartesian vertices 0..3")
-    if any(not np.isfinite(w) for w, _, _ in terms):
-        raise ValueError("local_density_rhs: vertex weights must be finite")
     gemm = _rhs_gemm(mesh_xy, npar, nb, ns, nmu, ae[-1])
     selected_q, completion_neg, output_rows = _selected_q_layout(q_indices,kgrid,q_neg_idx)
-    total = smooth_total = None
-    for weight, left_vertex, right_vertex in terms:
+    for left_vertex, right_vertex in pairs:
         def endpoint_rhs(right_nmu):
             return _c_q_dirac_quarters(
                 centroid_faces[1], right_nmu, wl, wr, plan=left_plan,
@@ -171,17 +209,32 @@ def local_density_rhs(*, centroid_faces, atom_ae_faces, atom_ps_faces,
             piece = complete_ordered_pair_normal_equations(piece, completion_neg)
         if output_rows is not None:
             piece = jnp.take(piece,jnp.asarray(output_rows),axis=0)
-        if weight != 1.0:
-            piece = weight * piece
-        total = piece if total is None else total + piece
         if return_smooth:
             if completion_neg is not None:
                 ps_rhs = complete_ordered_pair_normal_equations(ps_rhs, completion_neg)
             if output_rows is not None:
                 ps_rhs = jnp.take(ps_rhs,jnp.asarray(output_rows),axis=0)
-            if weight != 1.0:
-                ps_rhs = weight * ps_rhs
-            smooth_total = ps_rhs if smooth_total is None else smooth_total + ps_rhs
-    if return_smooth:
-        return total, smooth_total
-    return total
+            yield (left_vertex, right_vertex), piece, ps_rhs
+            del ps_rhs
+        else:
+            yield (left_vertex, right_vertex), piece, None
+        del piece
+
+
+@lru_cache(maxsize=None)
+def _projected_rhs_add(mesh_xy, weights):
+    """Weight one shared q-owned packet; only its accumulators are donated."""
+    import jax
+    from jax import shard_map
+    from jax.sharding import PartitionSpec as P
+    weights = tuple(complex(w) for w in weights)
+    if not weights or any(not np.isfinite(w) for w in weights):
+        raise ValueError('shared current RHS weights must be finite and nonempty')
+    spec = P(('x', 'y'), None, None)
+
+    def add(accumulators, primitive):
+        return tuple(value + weight * primitive
+                     for value, weight in zip(accumulators, weights))
+    return jax.jit(shard_map(add, mesh=mesh_xy,
+        in_specs=((spec,) * len(weights), spec),
+        out_specs=(spec,) * len(weights), check_vma=False), donate_argnums=(0,))
