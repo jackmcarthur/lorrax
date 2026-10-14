@@ -704,3 +704,8 @@ relativistic difference converged on its own meV scale. Point counts and atomic
 PCA discarded weights are diagnostics; neither is an exchange certificate.
 The complete fitting wall includes reconstruction, local fitting, contraction
 and cold orchestration when compared with the incumbent.
+
+The augmented current pair kernel executes its pair expressions sequentially in
+a loop with tuple accumulators. Each expression keeps its original products and
+addition order; no G subdivision or sampling change is introduced. Actual AOT
+pricing includes the loop and its selected pair branch.

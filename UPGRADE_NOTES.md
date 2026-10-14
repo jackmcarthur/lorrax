@@ -2251,3 +2251,10 @@ the Gamma neutrality check are included. This corrects a conservative sum
 that rejected the extra layout despite nonoverlapping scratch lifetimes;
 capacity is still an all-rank runtime decision. The q fallback keeps its
 existing per-tile execution. No equations or inputs change.
+
+Current augmented pair contractions now execute one existing pair expression per
+loop iteration, carrying the original tuple accumulators. This bounds simultaneous
+weighted G operands without changing the four-product algebra, G tiles, shell or
+physical output, donation contract, or body-before-onsite addition order. The
+no-augmentation path retains the unrolled kernel. Exact-shape AOT and runtime
+validation are required before any capacity or speed claim.

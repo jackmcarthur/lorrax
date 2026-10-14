@@ -1497,8 +1497,7 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
         g_idx = t * g_tile + jnp.arange(n_g, dtype=jnp.int32)
         mask = g_idx[None, :] < ngk[:, None]                    # (q, g)
         cols = jnp.clip(g_idx, 0, v.shape[-1] - 1)
-        V_out = []
-        for i, (a, b) in enumerate(pairs):
+        def pair_value(i, a, b, previous):
             vt = jnp.where(mask, jnp.take(v[i], cols, axis=1), 0)
             product=lambda left,right:jnp.einsum('qmg,qg,qng->qmn',jnp.conj(left),vt,right)
             dV = product(Z[a],Z[b])
@@ -1515,7 +1514,22 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
                 else:
                     dV += (product(Z[a],delta[b])+product(delta[a],Z[b])
                            +product(compensation[a],compensation[b]))
-            V_out.append(V[i] + dV)
+            return previous + dV
+        if use_local_augmentation and len(pairs)>1:
+            # A tuple carry keeps the original accumulator ABI and donation.
+            # One conditional branch executes per iteration, so independent
+            # pair products do not retain every weighted G operand at once.
+            def update_pair(index, values):
+                branches=[]
+                for i,(a,b) in enumerate(pairs):
+                    def update(current,i=i,a=a,b=b):
+                        value=pair_value(i,a,b,current[i])
+                        return current[:i]+(value,)+current[i+1:]
+                    branches.append(update)
+                return jax.lax.switch(index,branches,values)
+            V_out=jax.lax.fori_loop(0,len(pairs),update_pair,V)
+        else:
+            V_out=tuple(pair_value(i,a,b,V[i]) for i,(a,b) in enumerate(pairs))
         hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
         S_out, physical_tiles = [], []
         for a in range(n_z):
