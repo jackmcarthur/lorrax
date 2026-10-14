@@ -306,6 +306,19 @@ def compute_sigma_c_cd_omega_grid(
     nk_red = int(sym.nk_red)
     kw_rows = np.asarray([int(np.flatnonzero((irr_k == i) & (sidx_k == 0))[0]) for i in range(nk_red)])
     full_bz = nk_red == nk and np.array_equal(kw_rows, np.arange(nk))
+    # Symmetry certificate (instrument, off by default; docs/dev/env_vars.md): append one non-identity member
+    # of each of the first N multi-member stars to the computed rows; the wedge-unfolded cube is compared
+    # with these direct rows after assembly.  Production rows stay the file wedge.
+    n_cert = 0 if full_bz else int(os.environ.get("LORRAX_CD_STAR_CERTIFICATE", "0") or 0)
+    cert = []
+    for i in range(nk_red):
+        if len(cert) >= n_cert:
+            break
+        others = [int(k) for k in np.flatnonzero(irr_k == i) if int(sidx_k[k]) != 0]
+        if others:
+            cert.append((i, others[0]))
+    rows_all = np.concatenate([kw_rows, np.asarray([k for _, k in cert], dtype=kw_rows.dtype)])
+    n_rows = int(rows_all.size)
     nq_pad = -(-nk // ndev) * ndev
     nq_loc = nq_pad // ndev
     pad_q = np.arange(nq_pad) % nk if nq_pad > nk else np.arange(nk)
@@ -342,7 +355,7 @@ def compute_sigma_c_cd_omega_grid(
     nE = int(omega.size)
     enk_L = energy[:, l0:l1]
     f_L = f_cd[:, l0:l1]
-    eps_own = energy[kw_rows, m0:m1]                               # [kw, nb_s] own energies
+    eps_own = energy[rows_all, m0:m1]                              # [rows, nb_s] own energies
 
     # residue coverage (GATE cd_residue_coverage): the largest |x| any live residue reads
     E_all = np.concatenate([omega, eps_own.ravel()])
@@ -396,12 +409,12 @@ def compute_sigma_c_cd_omega_grid(
     if tuple(int(v) for v in psi_full.shape[:2]) != (nk, nb_full) or int(psi_full.shape[-1]) != n:
         raise ValueError(f"GATE cd_psi_shape: {psi_full.shape} vs (nk={nk}, nb_full={nb_full}, s, n={n})")
     psi_L = jax.jit(lambda a: a[:, l0:l1] * 1.0, out_shardings=rep)(psi_full)               # [nk, L, s, n]
-    psi_M = jax.jit(lambda a, r: a[r, m0:m1] * 1.0, out_shardings=rep)(psi_full, jnp.asarray(kw_rows))
+    psi_M = jax.jit(lambda a, r: a[r, m0:m1] * 1.0, out_shardings=rep)(psi_full, jnp.asarray(rows_all))
     del psi_full
 
     def _rep(a):
         return jax.device_put(np.asarray(a), rep)
-    tabs = dict(psi_L=psi_L, psi_M=psi_M, KMQ=_rep(KMQ_pad.astype(np.int32)), kw=_rep(kw_rows.astype(np.int32)),
+    tabs = dict(psi_L=psi_L, psi_M=psi_M, KMQ=_rep(KMQ_pad.astype(np.int32)), kw=_rep(rows_all.astype(np.int32)),
                 enk=_rep(enk_L), f=_rep(f_L), omega=_rep(omega), eps_own=_rep(eps_own),
                 qneg=_rep(qneg_pad.astype(np.int32)), qvalid=_rep(qvalid), u_all=_rep(u_ry_all), w_all=_rep(w_ry_all))
     u_dev, w_dev = _rep(u_ry), _rep(w_ry)
@@ -486,7 +499,7 @@ def compute_sigma_c_cd_omega_grid(
     join_fn = jax.jit(lambda a, b: jnp.concatenate([a, b], axis=0), out_shardings=face4)
 
     zeros = lambda *s: jax.device_put(np.zeros(s, np.complex128), rep)
-    acc_shape, own_shape = (nE, nk_red, nb_s, nb_s), (nk_red, nb_s)
+    acc_shape, own_shape = (nE, n_rows, nb_s, nb_s), (n_rows, nb_s)
     acc_imag, own_imag = zeros(*acc_shape), zeros(*own_shape)
     acc_real, own_real = zeros(*acc_shape), zeros(*own_shape)
     acc_anc, own_anc = zeros(*acc_shape), zeros(*own_shape)
@@ -496,14 +509,15 @@ def compute_sigma_c_cd_omega_grid(
         timings[name] = timings.get(name, 0.0) + time.monotonic() - t0
 
     def partial_dump(name, **arrays):
-        out = {k: host(v) for k, v in arrays.items()}                # collective on every rank
+        out = {k: host(v)[:nk_red] for k, v in arrays.items()}       # collective on every rank; wedge rows
         if rank0 and run_dir is not None:
             np.savez(os.path.join(run_dir, f"cd_partial_{name}.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
                      elapsed_s=time.monotonic() - started, **out)
 
     # ---- Sigma_x identity (INVARIANT: the CD pair densities reproduce the static exchange) ------------
     t0 = time.monotonic()
-    sx_cd = K.sigma_x(to_qpar(v_full), zeros(nk_red, nb_s, nb_s), tabs)
+    sx_cd = K.sigma_x(to_qpar(v_full), zeros(n_rows, nb_s, nb_s), tabs)
+    sx_cd = sx_cd[:nk_red] if cert else sx_cd
     jax.block_until_ready(sx_cd)
     clock("sigma_x", t0)
     sx_cd_h = host(sx_cd)
@@ -601,8 +615,11 @@ def compute_sigma_c_cd_omega_grid(
 
     # ---- assemble: cube on the file wedge -> padded band carrier -> full BZ ---------------------------
     t0 = time.monotonic()
-    sigma_w = acc_anc + acc_imag + acc_real                                  # [E, kw, nb_s, nb_s] replicated
-    parts = dict(anchor=host(own_anc), imag=host(own_imag), real=host(own_real))
+    sigma_w = acc_anc + acc_imag + acc_real                                  # [E, rows, nb_s, nb_s] replicated
+    sigma_cert = jax.jit(lambda a: a[:, nk_red:] * 1.0, out_shardings=rep)(sigma_w) if cert else None
+    if cert:
+        sigma_w = jax.jit(lambda a: a[:, :nk_red] * 1.0, out_shardings=rep)(sigma_w)
+    parts = {k: host(v)[:nk_red] for k, v in (("anchor", own_anc), ("imag", own_imag), ("real", own_real))}
     own = parts["anchor"] + parts["imag"] + parts["real"]
     axis = sigma_band_axis(nb_s, mesh_xy, ansatz="cd")
     nbc = int(axis.carrier)
@@ -615,6 +632,15 @@ def compute_sigma_c_cd_omega_grid(
             sym, jnp.moveaxis(v, 1, 0), trs_rule="transpose"), 0, 1), out_shardings=out_sh)(cube)
     jax.block_until_ready(cube)
     clock("assemble", t0)
+    cert_note = None
+    if cert:
+        k_cert = jnp.asarray([k for _, k in cert], dtype=jnp.int32)
+        unf = host(jax.jit(lambda v, kk: jnp.take(v, kk, axis=1)[:, :, :nb_s, :nb_s], out_shardings=rep)(cube, k_cert))
+        direct = host(sigma_cert)
+        dev = float(np.abs(unf - direct).max() * EV * 1e3)
+        scale = float(np.abs(direct).max() * EV * 1e3)
+        cert_note = dict(stars=[[int(i), int(k)] for i, k in cert], max_abs_meV=dev, max_ref_meV=scale)
+        _say(print_fn, started, f"symmetry certificate (direct star rows vs wedge-unfolded cube): {json.dumps(cert_note)}")
     ledger.append(ledger_sample("assemble", 0, time.monotonic() - t0))
     finite = bool(np.isfinite(own).all())
     barrier("cd_sigma_done")
@@ -626,10 +652,10 @@ def compute_sigma_c_cd_omega_grid(
                    bytes_per_knot_real=chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis="real"),
                    seconds=timings, elapsed_s=time.monotonic() - started, sigma_x_identity=sx_note,
                    coulomb_support_ranks=[int(host(support).min()), int(host(support).max())],
-                   full_bz=full_bz, kw_rows=kw_rows.tolist(), finite=finite, ndev=ndev)
+                   full_bz=full_bz, kw_rows=kw_rows.tolist(), finite=finite, ndev=ndev, symmetry_certificate=cert_note)
     if rank0 and run_dir is not None:
         np.savez(os.path.join(run_dir, "cd_sigma_own_energy.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
-                 eps_own_ry=eps_own, sigma_c_own_ry=own, sigma_c_anchor_own_ry=parts["anchor"],
+                 eps_own_ry=eps_own[:nk_red], sigma_c_own_ry=own, sigma_c_anchor_own_ry=parts["anchor"],
                  sigma_c_imag_own_ry=parts["imag"], sigma_c_real_own_ry=parts["real"],
                  sigma_x_diag_ry=np.real(np.diagonal(sx_cd_h, axis1=1, axis2=2)),
                  sigma_x_kmn_ry=sx_cd_h, mu_ry=mu, omega_ry=omega, u_ry=u_ry_all, w_ry=w_ry_all, real_ry=real_ry[:J])
