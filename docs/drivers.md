@@ -228,6 +228,22 @@ Operating at thousands of centroids (the distributed plan, per-rank scalings):
 [dense solves on P devices](architecture/dense_linear_algebra.md#stage-plans). Environment variables:
 [registry](reference/env_vars.md).
 
+### Contour-deformation frequency integration (`sigma_frequency_integration = contour_deformation`)
+
+The one dynamic-Sigma dispatch (`gw.sigma_dispatch._compute_mpa_sigma`) and the one
+finalizer (`finalize_dynamic_sigma`) are shared with the pole models; only the body kernel
+changes: `gw.cd.sigma.compute_sigma_c_cd_omega_grid` streams the exact ISDF W(z) at the CD
+nodes and knots (exact ordered Lehmann chi0, the response bank's Dyson pair equations as a
+local batched LU over (z, q), `symmetry_maps` q-wedge unfold with the general-operator
+`pair_transpose` rule) and accumulates Sigma_c on the file k wedge inside one `shard_map`
+over the q axis (scan over the rank's q, scan over the chunk's z).  W(z) is never persisted.
+Besides `sigma_mnk.h5` the run writes `cd_sigma_own_energy.npz` (the diagonal at the DFT
+energies -- the verification observable against a CD harness), `cd_sigma_receipt.json`
+(recipe, J, reach, nodes, per-stage seconds, Sigma_x identity) and `cd_leak_ledger.csv`
+(device bytes in use and pool high-water per stage and chunk).  Keys, gates and the first
+landing's limits: [input reference](input_reference.md#sigma); design and measurements:
+[dev note](dev/cd_frequency_integration.md).
+
 ## downfold — `gw.downfold_cli`
 
 Compresses a finished GW restart onto $\mu_S$ of its $\mu_L$ centroids for the
