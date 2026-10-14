@@ -766,16 +766,22 @@ def gflat_to_rchunk_aot_memory(
     ) if platform in ("cuda", "rocm") else lowered.compile()
     from runtime.aot_memory import aot_kernel_peak_bytes
     memory = aot_kernel_peak_bytes(compiled, platform=platform)
-    if platform == "cuda" and not memory.fft_specs:
-        raise RuntimeError(
-            "gflat_to_rchunk_aot_memory: the compiled canonical WFN "
-            "r-slab program exposes no FFT operation, so its cuFFT workspace "
-            "cannot be certified")
-    if platform == "cuda" and not memory.cufft_measured:
-        raise RuntimeError(
-            "gflat_to_rchunk_aot_memory: the canonical WFN r-slab program's "
-            "cuFFT workspace query is unavailable on CUDA; refusing a "
-            "known-low memory preflight")
+    # An unavailable cuFFT query is already priced conservatively (and
+    # announced) by aot_kernel_peak_bytes.  The r-slab program always
+    # transforms, so finding no FFT op means its HLO changed shape: price the
+    # scratch as a parse miss is priced, the module's temporaries and outputs again.
+    if platform == "cuda" and not memory.fft_specs and memory.cufft_measured:
+        from dataclasses import replace
+        from runtime.aot_memory import announce_once
+        scratch = int(memory.resident_increment)
+        announce_once(
+            "rchunk-no-fft",
+            f"gflat_to_rchunk_aot_memory: the compiled canonical WFN r-slab "
+            f"program shows no FFT op; its cuFFT scratch is priced as the "
+            f"module's temporaries and outputs again, {scratch / 1e9:.2f} GB")
+        memory = replace(memory, cufft_scratch=scratch, total=memory.total + scratch,
+                         resident_increment=memory.resident_increment + scratch,
+                         cufft_measured=False)
     _RCHUNK_PEAK_CACHE[key] = memory
     return memory
 

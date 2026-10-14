@@ -27,7 +27,8 @@ The binding rulings behind breaking changes are in
   `distrib_la eigh stack …`, the photon and SC-eigh fallback notes, the
   staged-eigh warning) are gone.
 - **cuFFT pricing.** An HLO FFT parse miss or an unavailable cuFFT query no
-  longer refuses: it warns and prices the scratch conservatively.
+  longer refuses (the Σ τ admission, the canonical WFN r-slab preflight): it
+  warns and prices the scratch conservatively.
 
 No deck or environment change. claim TBD: P4 hsuite eqp identity, route
 equivalence and the A100-80 budget simulation.
