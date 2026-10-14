@@ -40,7 +40,7 @@ def check_physical(runtime):
         F[:,6:,:]=1e4-2e4j;F[:,:,6:]=3e4+4e4j;F[Q:]=np.nan
         st=ZStore(mesh=mesh,q_axis=padded_axis(Q,mesh,name='physical slab q'),mu_pad=mu,
             g_axis=padded_axis(4,4,name='initial G'),b=mu,placement='host')
-        z=ZetaG(st,mesh=mesh,L_q=put(F),solver_kind='positive_rank_truncate',
+        z=ZetaG(st,mesh=mesh,L_q=put(F),lu_piv=None,solver_kind='positive_rank_truncate',
             batched_route='batch_reshard',path='physical retained Slab fixture',n_rmu_solve=6,
             n_rmu=6,mu_basis=basis,ngk_per_q=np.full(Q,4),gvec_components=np.zeros((Q,3,4),np.int32))
         z.fit_vertex_mu_L=c+1;z.fit_augmentation_identity='same-field'
