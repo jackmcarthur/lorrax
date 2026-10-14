@@ -135,7 +135,7 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
             rho, _, _, f = pair_rows(T, g)
             a = contract(rho, V[iq], nk)
             return s + T["qvalid"][g] * jnp.einsum("kmnl,kl->kmn", a, f), None
-        inc, _ = jax.lax.scan(over_q, jnp.zeros_like(acc), jnp.arange(nq_loc))
+        inc, _ = jax.lax.scan(over_q, jnp.zeros_like(acc), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc)
 
     def cd_imag_contract(W, u_c, w_c, acc, own, T):
@@ -148,10 +148,10 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
                 ops, wts = laws.imag_node_terms(a, u_c[iz], w_c[iz], x, f, eta)
                 _, wts_own = laws.imag_node_terms(a, u_c[iz], w_c[iz], x_own, f, eta)
                 return (c2[0] + laws.apply(ops, wts), c2[1] + laws.own_apply(ops, wts_own)), None
-            (s_acc, s_own), _ = jax.lax.scan(over_z, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(W.shape[0]))
+            (s_acc, s_own), _ = jax.lax.scan(over_z, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(W.shape[0]), unroll=1)
             v = T["qvalid"][g]
             return (carry[0] + v * s_acc, carry[1] + v * s_own), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc))
+        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc), psum_add(own, inc_own)
 
     def cd_real_contract(W, dW, z_c, node0, acc, own, T):
@@ -173,10 +173,10 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
                 inc = laws.apply(jnp.concatenate([op_p, op_n], -1), jnp.concatenate([w_p, w_n], -1))
                 inc_own = laws.own_apply(op_p, wo_p) + laws.own_apply(op_n, wo_n)
                 return (c2[0] + inc, c2[1] + inc_own), None
-            (s_acc, s_own), _ = jax.lax.scan(over_z, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(W.shape[0]))
+            (s_acc, s_own), _ = jax.lax.scan(over_z, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(W.shape[0]), unroll=1)
             v = T["qvalid"][g]
             return (carry[0] + v * s_acc, carry[1] + v * s_own), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc))
+        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc), psum_add(own, inc_own)
 
     def cd_anchor(W0, dW0, acc, own, T):
@@ -191,7 +191,7 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
                                             apply_fn=laws.own_apply)
             v = T["qvalid"][g]
             return (carry[0] + v * (total - sub), carry[1] + v * (total_o - sub_o)), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc))
+        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc), psum_add(own, inc_own)
 
     q3, q4 = P(axes), P(None, axes)
@@ -258,8 +258,8 @@ def compute_sigma_c_cd_omega_grid(
     from gw.ppm_sigma import SigmaOmegaResult, sigma_band_axis
     from gw.w_isdf import compute_chi0_direct_fractional, _w_solve_pref_scalar
     from runtime.tiles import tile_units, TILE_BYTES
-    from symmetry_maps import kgrid_shift_map, q_negation_index, star_tables_of
-    from symmetry_maps.maps import unfold_wavefunction_local, unfold_file_wedge_band_operator
+    from symmetry_maps import (kgrid_shift_map, q_negation_index, star_tables_of,
+                               unfold_file_wedge_band_operator, unfold_wavefunction_local)
 
     started = time.monotonic()
     EV = float(RYD_TO_EV)
@@ -295,28 +295,30 @@ def compute_sigma_c_cd_omega_grid(
     nq_irr = int(q_irr.size)
     qneg = np.asarray(q_negation_index(grid), dtype=np.int64)
 
-    def kmq(q):
-        off = -np.asarray(np.unravel_index(int(q), grid), np.int32)
-        return np.asarray(kgrid_shift_map(*grid, off)[0], np.int64)
-    KMQ = np.stack([kmq(q) for q in range(nk)])                 # [nq_full, nk]: index of k - q
+    ijk = np.stack(np.unravel_index(np.arange(nk), grid), axis=-1)                    # [nk, 3]
+    dif = (ijk[None, :, :] - ijk[:, None, :]) % np.asarray(grid)                        # [nq, nk, 3]: k - q
+    KMQ = np.ravel_multi_index((dif[..., 0], dif[..., 1], dif[..., 2]), grid).astype(np.int64)
+    probe_q = min(1, nk - 1)
+    if not np.array_equal(KMQ[probe_q], np.asarray(kgrid_shift_map(*grid, -ijk[probe_q].astype(np.int32))[0])):
+        raise ValueError("GATE cd_kq_map: the vectorized k - q table disagrees with symmetry_maps.kgrid_shift_map")
     kq_sym = np.asarray(sym.kq_map, dtype=np.int64)             # [nk_full, nq_red]
     if kq_sym.shape == (nk, nk) and int(np.sum(KMQ != kq_sym.T)):
         raise ValueError("GATE cd_kq_map: kgrid_shift_map vs SymMaps.kq_map differ")
     irr_k, sidx_k, _nsp = star_tables_of(sym)
     nk_red = int(sym.nk_red)
-    kw_rows = np.asarray([int(np.flatnonzero((irr_k == i) & (sidx_k == 0))[0]) for i in range(nk_red)])
+    idx0 = np.flatnonzero(np.asarray(sidx_k) == 0)
+    stars, first = np.unique(np.asarray(irr_k)[idx0], return_index=True)
+    if not np.array_equal(stars, np.arange(nk_red)):
+        raise ValueError("GATE cd_file_wedge: a star has no identity member in star_tables_of(sym)")
+    kw_rows = idx0[first]                                                               # [nk_red] file-wedge rows
     full_bz = nk_red == nk and np.array_equal(kw_rows, np.arange(nk))
     # Symmetry certificate (instrument, off by default; docs/dev/env_vars.md): append one non-identity member
     # of each of the first N multi-member stars to the computed rows; the wedge-unfolded cube is compared
     # with these direct rows after assembly.  Production rows stay the file wedge.
     n_cert = 0 if full_bz else int(os.environ.get("LORRAX_CD_STAR_CERTIFICATE", "0") or 0)
-    cert = []
-    for i in range(nk_red):
-        if len(cert) >= n_cert:
-            break
-        others = [int(k) for k in np.flatnonzero(irr_k == i) if int(sidx_k[k]) != 0]
-        if others:
-            cert.append((i, others[0]))
+    cand = np.flatnonzero(np.asarray(sidx_k) != 0)
+    c_stars, c_first = np.unique(np.asarray(irr_k)[cand], return_index=True)
+    cert = list(zip(c_stars[:n_cert].tolist(), cand[c_first][:n_cert].tolist()))
     rows_all = np.concatenate([kw_rows, np.asarray([k for _, k in cert], dtype=kw_rows.dtype)])
     n_rows = int(rows_all.size)
     nq_pad = -(-nk // ndev) * ndev
@@ -413,7 +415,7 @@ def compute_sigma_c_cd_omega_grid(
     del psi_full
 
     def _rep(a):
-        return jax.device_put(np.asarray(a), rep)
+        return replicate_to_mesh(np.asarray(a), mesh_xy)
     tabs = dict(psi_L=psi_L, psi_M=psi_M, KMQ=_rep(KMQ_pad.astype(np.int32)), kw=_rep(rows_all.astype(np.int32)),
                 enk=_rep(enk_L), f=_rep(f_L), omega=_rep(omega), eps_own=_rep(eps_own),
                 qneg=_rep(qneg_pad.astype(np.int32)), qvalid=_rep(qvalid), u_all=_rep(u_ry_all), w_all=_rep(w_ry_all))
@@ -498,7 +500,8 @@ def compute_sigma_c_cd_omega_grid(
     tail_fn = jax.jit(lambda a: a[a.shape[0] - 2 * GH:] * 1.0, out_shardings=face4)
     join_fn = jax.jit(lambda a, b: jnp.concatenate([a, b], axis=0), out_shardings=face4)
 
-    zeros = lambda *s: jax.device_put(np.zeros(s, np.complex128), rep)
+    def zeros(*shape):
+        return jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=rep)()
     acc_shape, own_shape = (nE, n_rows, nb_s, nb_s), (n_rows, nb_s)
     acc_imag, own_imag = zeros(*acc_shape), zeros(*own_shape)
     acc_real, own_real = zeros(*acc_shape), zeros(*own_shape)

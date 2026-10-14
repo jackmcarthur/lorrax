@@ -3566,8 +3566,19 @@ def _fractional_pair_scan_face(
             b_y = _roll(_children(_gather_nmu(psi_nmu_b, ib), unfold_y))
             eb = jax.lax.dynamic_slice(eb_full, (0, ib), (nk, tile))
             fb = jax.lax.dynamic_slice(fb_full, (0, ib), (nk, tile))
-            contribution = _pair_contribution(
-                a_x, b_x, a_y, b_y, ea, eb, fa, fb, ga, gb)
+            # A tile pair whose occupation differences vanish at every k adds
+            # exactly zero (weights (f_a - f_b) / (e_a - e_b + z) = 0): skip
+            # its density products.  The predicate reads the replicated
+            # occupation tables, so every rank takes the same branch (no
+            # rank-conditional collective; the gathers above stay outside).
+            # An insulator skips its v-v and c-c tiles, a metal its tiles
+            # wholly above (or below) every partially occupied band.
+            live = jnp.any(fa[:, :, None] != fb[:, None, :])
+            contribution = jax.lax.cond(
+                live,
+                lambda: _pair_contribution(
+                    a_x, b_x, a_y, b_y, ea, eb, fa, fb, ga, gb),
+                lambda: jnp.zeros_like(acc_inner))
             return acc_inner + contribution, None
 
         acc_inner, _ = jax.lax.scan(

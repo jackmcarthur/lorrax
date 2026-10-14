@@ -90,7 +90,7 @@ def imag_anchor_sums(u_nodes, w_nodes, x, f, eta, beta):
         minus, plus = imag_node_kernels(u, w, x, f, eta)
         return tuple((sm + minus / (u * u + b * b), sp + plus / (u * u + b * b))
                      for (sm, sp), b in zip(carry, beta)), None
-    out, _ = jax.lax.scan(body, tuple((zero, zero) for _ in beta), (u_nodes, w_nodes))
+    out, _ = jax.lax.scan(body, tuple((zero, zero) for _ in beta), (u_nodes, w_nodes), unroll=1)
     return [tuple(pair) for pair in out]
 
 
