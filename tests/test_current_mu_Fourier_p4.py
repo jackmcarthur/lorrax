@@ -38,6 +38,10 @@ def check_current_fourier(runtime):
         actual=original(zetas,pairs,v_tables,**kwargs)
         receipt=group['fourier_distribution_receipt']
         assert receipt['mode']=='mu',receipt
+        pair_receipt=group.get('pair_distribution_receipt')
+        if pair_receipt is not None:
+            expected='face' if group['body_metric']=='mixed_reciprocal' else 'q'
+            assert pair_receipt['mode']==expected,pair_receipt
         for quote in receipt['actual_AOT']:
             assert quote['collective_counts']['all-gather']==0,quote
             if quote['owner']=='mu_Fourier':assert not any(quote['collective_counts'].values()),quote
@@ -45,7 +49,7 @@ def check_current_fourier(runtime):
         errors += [float(np.max(abs(host(z.shell)-r))) for z,r in zip(zetas,shell)]
         if payload is not None:errors += [float(np.max(abs(v.payload-r))) for v,r in zip(writers,payload)]
         assert max(errors)<2e-11,errors
-        comparisons.append(max(errors));receipts.append(dict(receipt))
+        comparisons.append(max(errors));receipts.append(dict(receipt,pair_distribution=pair_receipt))
         # All-rank admission must decline safely, leaving onsite banks usable.
         saved=gpu_utils.device_budget_bytes()/1e9
         def declined(state,**options):
@@ -58,6 +62,7 @@ def check_current_fourier(runtime):
         group['prepare_fourier_coefficients']=declined
         try:
             fallback=original(zetas,pairs,v_tables,**kwargs)
+            assert group['pair_distribution_receipt']['mode']=='q'
             assert max(float(np.max(abs(host(v)-r))) for v,r in zip(fallback,reference))<2e-11
         finally:group['prepare_fourier_coefficients']=prepare
         return actual

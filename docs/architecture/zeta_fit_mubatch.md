@@ -361,3 +361,25 @@ the store and the finalize. The ψ G slots, the plane groups and the fit bands
 are padded by name. Pad q rows and pad G slots carry v = 0 and ngk = 0, so
 they contribute nothing to V. Pad batch slots are −1 in
 `OwnerOrbitBatches.mu`, and their Z rows are zero.
+
+
+## Small-q current body faces
+
+For an admitted μ-Fourier mixed-current family with fewer logical q rows than
+ranks, `contract_v_group` transports its three smooth, three delta and three
+compensation panels through `_to_mu_owner(..., 'xy')`. The existing
+`distrib_la.gemm_plan(layout='face')` evaluates the same four-Gram body on
+`P(None,'x','y')`; `transpose_xy` owns each complementary operand. Pair-specific
+complex weights use a bounded q/G transport and are not conjugated. The six
+face accumulators survive through the original final onsite addition. Shells
+and physical `smooth+delta` writer packets retain their q-owned contracts.
+
+The caller quotes the actual compiled face kernel, including its transports
+and panel scratch, and the service's native workspace. It prices all future
+face accumulators in every phase, conservatively leaving the original q
+accumulators in the measured baseline; their one-time conversion is fenced
+and separately priced. Admission is collective. Other metrics, nondivisible
+G tiles, q domains covering the mesh, and refused capacity retain q products.
+The implementation shares its four-product equation and physical shell
+formation with that fallback; no physics approximation or input knob selects
+this distribution.

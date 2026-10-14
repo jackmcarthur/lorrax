@@ -1459,6 +1459,35 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
     return fn
 
 
+def _current_pair_value(product, Z, local_tiles, a, b, *, compensated=False, inner=None):
+    """Mixed current body: ZZ + Zδ + δZ + gg, or its compensated completion."""
+    value = product(Z[a], Z[b])
+    if local_tiles:
+        delta, compensation = local_tiles[0]
+        if compensated:
+            value = product(Z[a]+compensation[a], Z[b]+compensation[b])
+            if inner is not None:
+                ta, tb = Z[a]+compensation[a], Z[b]+compensation[b]
+                na, nb = delta[a]-compensation[a], delta[b]-compensation[b]
+                value += inner(na, nb)+inner(ta, nb)+inner(na, tb)
+        else:
+            value += (product(Z[a], delta[b])+product(delta[a], Z[b])
+                      +product(compensation[a], compensation[b]))
+    return value
+
+
+def _current_shell_outputs(Z, delta, S, sl, g_idx, mask, return_physical):
+    """Gather physical ζ=Z+δ into the shell and the canonical writer packet."""
+    hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
+    shells, physical_tiles = [], []
+    for a in range(len(Z)):
+        physical = Z[a]+delta[a] if delta else Z[a]
+        shells.append(S[a]+jnp.einsum('qmg,qgs->qms', physical, hit))
+        if return_physical:
+            physical_tiles.append(jnp.where(mask[:, None, :], physical, 0))
+    return tuple(shells), tuple(physical_tiles)
+
+
 def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
                       compensated_body=False, return_physical=False,
                       transverse_completion=False):
@@ -1500,20 +1529,12 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
         def pair_value(i, a, b, previous):
             vt = jnp.where(mask, jnp.take(v[i], cols, axis=1), 0)
             product=lambda left,right:jnp.einsum('qmg,qg,qng->qmn',jnp.conj(left),vt,right)
-            dV = product(Z[a],Z[b])
-            if use_local_augmentation:
-                delta,compensation=local_tiles[0]
-                if compensated_body:
-                    dV=product(Z[a]+compensation[a],Z[b]+compensation[b])
-                    if transverse_completion:
-                        dt=jnp.where(mask,local_tiles[1][:,i,:],0)
-                        inner=lambda left,right:jnp.einsum('qmg,qg,qng->qmn',left.conj(),dt,right)
-                        ta,tb=Z[a]+compensation[a],Z[b]+compensation[b]
-                        na,nb=delta[a]-compensation[a],delta[b]-compensation[b]
-                        dV+=(inner(na,nb)+inner(ta,nb)+inner(na,tb))
-                else:
-                    dV += (product(Z[a],delta[b])+product(delta[a],Z[b])
-                           +product(compensation[a],compensation[b]))
+            inner = None
+            if transverse_completion:
+                dt=jnp.where(mask,local_tiles[1][:,i,:],0)
+                inner=lambda left,right:jnp.einsum('qmg,qg,qng->qmn',left.conj(),dt,right)
+            dV = _current_pair_value(product,Z,local_tiles,a,b,
+                                     compensated=compensated_body,inner=inner)
             return previous + dV
         if use_local_augmentation and len(pairs)>1:
             # A tuple carry keeps the original accumulator ABI and donation.
@@ -1530,25 +1551,94 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
             V_out=jax.lax.fori_loop(0,len(pairs),update_pair,V)
         else:
             V_out=tuple(pair_value(i,a,b,V[i]) for i,(a,b) in enumerate(pairs))
-        hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
-        S_out, physical_tiles = [], []
-        for a in range(n_z):
-            physical=Z[a]+local_tiles[0][0][a] if use_local_augmentation else Z[a]
-            dS = jnp.einsum('qmg,qgs->qms', physical, hit)
-            S_out.append(S[a] + dS)
-            if return_physical:
-                physical_tiles.append(jnp.where(mask[:, None, :], physical, 0))
+        S_out, physical_tiles = _current_shell_outputs(Z,
+            local_tiles[0][0] if use_local_augmentation else (),S,sl,g_idx,mask,return_physical)
         if return_physical:
-            return tuple(V_out), tuple(S_out), tuple(physical_tiles)
-        return tuple(V_out), tuple(S_out)
+            return tuple(V_out), S_out, physical_tiles
+        return tuple(V_out), S_out
 
     fn = jax.jit(k, donate_argnums=(5, 6))
     _kernel_cache[key] = fn
     return fn
 
 
+def _pair_face_tile_kernel(mesh, Q, mu, g_tile, pairs, *, return_physical=False):
+    """Mixed-current four-Gram body on all centroid faces, with q-owned I/O.
+
+    Input panels have shape (Q_pad, mu, g_tile), P(('x','y'),None,None).
+    V alone has shape (Q, mu, mu), P(None,'x','y'); shell and physical
+    outputs retain the q layout. Small kernel weights cross the same bounded
+    transport as the panels; no whole panel is replicated. The complete
+    compiled call owns panel transport, SUMMA scratch, and shell formation.
+    """
+    from common.collectives import transpose_xy
+    from distrib_la import gemm_plan, workspace_bytes_per_rank
+    pairs=tuple((int(a),int(b)) for a,b in pairs)
+    key=('pair_face_tile',_mesh_id(mesh),int(Q),int(mu),int(g_tile),pairs,bool(return_physical))
+    if key in _kernel_cache:return _kernel_cache[key]
+    px,py=int(mesh.shape['x']),int(mesh.shape['y'])
+    if any(n%d for n in (mu,g_tile) for d in (px,py)):
+        raise ValueError('current pair face axes must tile both mesh directions')
+    n_z=1+max(max(pair) for pair in pairs)
+    qspec=P(_XY,None,None);face=P(None,'x','y')
+    qsh=NamedSharding(mesh,qspec);fsh=NamedSharding(mesh,face)
+    to_face=_to_mu_owner(mesh,Q,'xy')
+    plan=gemm_plan(mesh,m=mu,k=g_tile,n=mu,nq=Q,dtype=jnp.complex128,
+                   layout='face',beta=0.,warmup=False)
+    native=workspace_bytes_per_rank(plan,'gemm',((Q,mu,g_tile),(Q,g_tile,mu)),jnp.complex128)
+
+    @partial(shard_map,mesh=mesh,in_specs=(P(_XY,None),P(_XY),P()),
+             out_specs=qspec,check_vma=False)
+    def weight_rows(v,ngk,t):
+        g_idx=t*g_tile+jnp.arange(g_tile,dtype=jnp.int32)
+        values=jnp.where(g_idx[None,:]<ngk[:,None],
+                         jnp.take(v,jnp.clip(g_idx,0,v.shape[-1]-1),axis=1),0)
+        # Identical x rows make each destination rank's one row sufficient.
+        return jnp.broadcast_to(values[:,None,:],(values.shape[0],px,g_tile))
+
+    @partial(shard_map,mesh=mesh,in_specs=face,out_specs=P(None,'y'),check_vma=False)
+    def weight_row(value):
+        return value[:,0,:]
+
+    @partial(shard_map,mesh=mesh,
+             in_specs=((qspec,)*n_z,(qspec,)*n_z,(qspec,)*n_z,P(_XY,None),P(_XY),P()),
+             out_specs=((qspec,)*n_z,(qspec,)*n_z if return_physical else ()),check_vma=False)
+    def shell(Z,delta,S,sl,ngk,t):
+        g_idx=t*g_tile+jnp.arange(g_tile,dtype=jnp.int32)
+        return _current_shell_outputs(Z,delta,S,sl,g_idx,g_idx[None,:]<ngk[:,None],return_physical)
+
+    def k(Z,v,ngk,sl,t,V,S,local_tiles):
+        panels=tuple(to_face(value) for value in Z+local_tiles[0]+local_tiles[1])
+        smooth,delta,compensation=panels[:n_z],panels[n_z:2*n_z],panels[2*n_z:]
+        # Each pair executes serially; the original four-product addition tree
+        # is shared with the q kernel. transpose_xy owns the complementary face.
+        def update_pair(index,values):
+            branches=[]
+            for i,(a,b) in enumerate(pairs):
+                def update(current,i=i,a=a,b=b):
+                    weight=weight_row(to_face(weight_rows(v[i],ngk,t)))
+                    def product(left,right):
+                        return plan(left.conj()*weight[:,None,:],transpose_xy(right,mesh))
+                    dV=_current_pair_value(product,smooth,((delta,compensation),),a,b)
+                    return current[:i]+(current[i]+dV,)+current[i+1:]
+                branches.append(update)
+            return jax.lax.switch(index,branches,values)
+        V_out=jax.lax.fori_loop(0,len(pairs),update_pair,V)
+        S_out,physical=shell(Z,local_tiles[0],S,sl,ngk,t)
+        return (V_out,S_out,physical) if return_physical else (V_out,S_out)
+
+    inputs=((qsh,)*n_z,NamedSharding(mesh,P(None,_XY,None)),
+            NamedSharding(mesh,P(_XY)),NamedSharding(mesh,P(_XY,None)),NamedSharding(mesh,P()),
+            (fsh,)*len(pairs),(qsh,)*n_z,((qsh,)*n_z,(qsh,)*n_z))
+    outputs=((fsh,)*len(pairs),(qsh,)*n_z)
+    if return_physical:outputs+=((qsh,)*n_z,)
+    fn=jax.jit(k,in_shardings=inputs,out_shardings=outputs,donate_argnums=(5,6))
+    _kernel_cache[key]=(fn,native)
+    return fn,native
+
+
 def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
-                                      completion, write_physical):
+                                      completion, write_physical, face_Q=None, face_native_bytes=0):
     """AOT caller phases above the live pre-loop arrays, excluding mu banks.
 
     The mu route fences reads/forms, the pair result, and each writer; all
@@ -1572,10 +1662,27 @@ def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
         difference_bytes=difference.size*16/mesh.size
     quotes=[]
     def quote(name,fn,args):
-        value=float(compiled_new_bytes(fn.lower(*args).compile()))
-        quotes.append(dict(owner=name,resident_increment=value))
+        compiled=fn.lower(*args).compile()
+        value=float(compiled_new_bytes(compiled))
+        receipt=dict(owner=name,resident_increment=value)
+        if name=='pair_face':
+            hlo=compiled.as_text().lower()
+            receipt.update(native_workspace_bytes=face_native_bytes,
+                collective_counts={kind:hlo.count(kind+'(') for kind in
+                    ('all-gather','all-to-all','all-reduce','collective-permute')})
+        quotes.append(receipt)
         return value
-    pair=quote('pair',step,((abstract,)*3,v_dev,ngk_dev,sl_dev,jnp.int32(0),V,S,*local_args))
+    face_bytes=0.
+    if face_Q is not None:
+        if completion is not None:
+            raise ValueError('current face pair supports the mixed body without transverse completion')
+        face_value=jax.ShapeDtypeStruct((face_Q,mu,mu),jnp.complex128,
+            sharding=NamedSharding(mesh,P(None,'x','y')))
+        V=(face_value,)*len(pairs)
+        face_bytes=len(pairs)*face_value.size*16/mesh.size
+    pair=quote('pair_face' if face_Q is not None else 'pair',step,
+        ((abstract,)*3,v_dev,ngk_dev,sl_dev,jnp.int32(0),V,S,*local_args))
+    pair+=face_native_bytes
     forming=max(quote('form_'+str(i),fn,(z.factor,abstract,v_form,
         ngk_dev,sl_dev,jnp.int32(0),*zero)) for i,(z,fn,zero) in enumerate(zip(zetas,form,stub)))
     # The read chain can queue both transport and packed-axis gather. Bound
@@ -1621,7 +1728,18 @@ def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
         phases={name:value+steady_writer for name,value in phases.items()}
         phases['writer']=3*tile_bytes+steady_writer+max(transport,5*steady_writer)
         host=price['host_pending']
-    return dict(phase_workspace_bytes=phases,fourier_hold_bytes=3*tile_bytes+steady_writer,
+    if face_Q is not None:
+        # The measured baseline still includes every original q accumulator.
+        # Charge the new face accumulators throughout all future phases, without
+        # crediting the q arrays released after the one-time fenced conversion.
+        phases={name:value+face_bytes for name,value in phases.items()}
+        q_value=jax.ShapeDtypeStruct((st.Q_pad,mu,mu),jnp.complex128,
+            sharding=NamedSharding(mesh,P(_XY,None,None)))
+        moving=quote('pair_accumulator_q_to_face',_finish_v(mesh,face_Q),(q_value,))
+        phases['pair_layout']=face_bytes+moving+steady_writer
+    return dict(phase_workspace_bytes=phases,fourier_hold_bytes=3*tile_bytes+steady_writer+face_bytes,
+        pair_layout='face' if face_Q is not None else 'q',
+        retained_face_accumulator_bytes=face_bytes,native_pair_workspace_bytes=face_native_bytes,
         retained_writer_tile_bytes=steady_writer,
         host_bytes=float(host),actual_AOT=quotes,tile_bytes=tile_bytes,
         lifetime='Fenced read/form/pair/writer; previous tiles and pair inputs released before next phase')
@@ -1732,20 +1850,46 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     prepare_fourier=None if augmentation is None else augmentation.get('prepare_fourier_coefficients')
     # Include this persistent table view before measuring the live baseline.
     v_form = v_dev[0]
+    face_step=None
+    if (callable(prepare_fourier) and st0.Q<mesh.size and mu%mesh.size==0
+            and body_metric=='mixed_reciprocal' and completion is None
+            and callable(augmentation.get('onsite_face'))
+            and all(st0.g_tile%int(mesh.shape[axis])==0 for axis in ('x','y'))):
+        face_step,face_native=_pair_face_tile_kernel(mesh,st0.Q,mu,st0.g_tile,pairs,
+            return_physical=zeta_ios is not None)
     if callable(prepare_fourier):
         caller=None
         if st0.Q<mesh.size and mu%mesh.size==0:
-            caller=_current_fourier_caller_workspace(zetas,pairs,(form,step),
+            caller=_current_fourier_caller_workspace(zetas,pairs,(form,face_step or step),
                 (v_dev,ngk_dev,sl_dev,V,S,stub,v_form),
-                completion=completion,write_physical=zeta_ios is not None)
+                completion=completion,write_physical=zeta_ios is not None,
+                face_Q=st0.Q if face_step is not None else None,
+                face_native_bytes=face_native if face_step is not None else 0)
             jax.block_until_ready((local_state,V,S,v_dev,v_form,ngk_dev,sl_dev))
         fourier_state=prepare_fourier(local_state,caller_phase_workspace=caller)
         if jax.process_index()==0:
             print_fn('  current Fourier distribution: '+str(augmentation['fourier_distribution_receipt']))
+    bounded_mu=bool(fourier_state is not None and fourier_state.get('fourier_mu',False))
+    face_body=bounded_mu and face_step is not None
+    if face_body:
+        pending=list(V);V=[]
+        for index in range(len(pending)):
+            value=_finish_v(mesh,st0.Q)(pending[index])
+            jax.block_until_ready(value)
+            pending[index]=None
+            V.append(value)
+        V=tuple(V)
+        del pending,value
+        step=face_step
+    if augmentation is not None:
+        augmentation['pair_distribution_receipt']=dict(mode='face' if face_body else 'q',
+            reason='admitted mixed-current face body' if face_body else 'ordinary q body',
+            logical_q=st0.Q,packed_mu=mu)
+        if jax.process_index()==0:
+            print_fn('  current pair distribution: '+str(augmentation['pair_distribution_receipt']))
     jax.block_until_ready((fourier_state,V,S))
     stage_seconds['prepare_and_layout']=time.perf_counter()-t0
     loop_started=time.perf_counter()
-    bounded_mu=bool(fourier_state is not None and fourier_state.get('fourier_mu',False))
     # No look-ahead: each Z tile is read just before its ζ is formed and
     # dropped after, so a G tile holds one Z tile and the ζ tiles — the six
     # tile-sized buffers the fit's plan sized g_tile for (MuBatchPlan).
@@ -1801,15 +1945,16 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     if face_onsite:
         # Only thin field panels cross from q ownership to the distributed
         # face. The local provider never forms a whole-q onsite matrix here.
-        pending=list(V)
-        V=[]
-        for index in range(len(pending)):
-            value=_finish_v(mesh,st0.Q)(pending[index])
-            jax.block_until_ready(value)
-            pending[index]=None
-            V.append(value)
-        V=tuple(V)
-        del pending
+        if not face_body:
+            pending=list(V)
+            V=[]
+            for index in range(len(pending)):
+                value=_finish_v(mesh,st0.Q)(pending[index])
+                jax.block_until_ready(value)
+                pending[index]=None
+                V.append(value)
+            V=tuple(V)
+            del pending
         correction=augmentation['onsite_face'](local_state,pairs)
         expected=NamedSharding(mesh,P(None,'x','y'))
         if (not isinstance(correction,tuple) or len(correction)!=len(pairs)
@@ -1842,7 +1987,7 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     stage_seconds['finish']=time.perf_counter()-finish_started
     for z in zetas:z.current_stage_seconds=dict(stage_seconds)
     receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, "
-               f"{st0.n_Gt} G tiles, q-local, "
+               f"{st0.n_Gt} G tiles, {'face body' if face_body else 'q-local'}, "
                f"{time.perf_counter() - t0:.2f}s (store read "
                f"{sum(z.store.t_read for z in zetas):.2f}s); "
                f"{'physical ζ family written' if zeta_ios is not None else 'no ζ file'}")

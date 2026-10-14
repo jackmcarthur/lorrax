@@ -1,5 +1,15 @@
 # Upgrade notes
 
+## Unreleased — distribute small-q current body Grams across centroid faces
+
+When the existing Fourier capacity gate admits the extra layout, mixed-current
+body Grams use the distributed matrix service across the complete mesh. The
+four-product equations, physical current files, shell extraction and final
+onsite addition are unchanged. Capacity rejection and other body metrics keep
+the ordinary q layout. No deck or sampling change is required. Floating-point
+reduction order changes with the distributed products; focused numerical and
+material propagation validation is required before a performance claim.
+
 ## Unreleased — reuse Cartesian primitives in circular current packets
 
 Delta-only atomic current replay evaluates matching Cartesian primitives once
