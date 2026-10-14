@@ -429,6 +429,18 @@ with the first and which only the decks that select it ever test.
   owners (`16·⌈Q/P⌉·μ²` bytes per rank) and only the right-hand side moves;
   with `Q < P` the ranks past `Q` idle in the solve.
 
+## 2026-10-14 — Contour deformation is a Σ frequency-integration axis (approved design; on branch `wip/cd-production`, not landed)
+
+**Ruling (lead, for the owner's production-CD goal).** `sigma_frequency_integration = pole_model |
+contour_deformation` under `compute_mode = mpa`.  Contour deformation evaluates Σ_c on the exact
+ISDF W(z) — exact ordered Lehmann χ⁰, the response bank's Dyson pair equations — streams W in
+`runtime.tiles` chunks without persisting it, and hands its cube to the one dynamic-Σ finalizer.
+
+**Consequences.** One Σ consumer and one finalizer serve both integrations; CD adds no writer and no
+eqp path.  The first landing refuses by name `head_correction` other than `off`, `linalg` other than
+`local`, band extrapolation and a per-window η.  The spectral-density χ⁰ accelerator is a later step
+behind its own sub-key and certificate; W(z) persistence (`write_w`) is not offered.
+
 ## 2026-09-18 — Headless shared-pole SC is allowed for brute-grid development
 
 `sigma_w_model = shared_pole` with `qp_solver = self_consistent` and
