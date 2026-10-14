@@ -5,6 +5,51 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-13 — I/O and environment safety checks
+
+- **Shared output directory.** A SlabIO `"w"` or `"a"` open at P > 1 now checks,
+  once per directory, that every rank sees one filesystem there (rank 0 writes a
+  nonce file; every rank reads it back). A node-local directory (`/tmp`, local
+  NVMe, a per-node bind) refuses on every rank with `GATE io_global_commit`,
+  stage `SlabIO.shared_directory`, naming the directory and the failing host.
+  Before, each node wrote its own partial file and rank 0 committed node 0's.
+  Single-node runs in `/tmp` are unaffected. Put a multi-node run directory on
+  `$SCRATCH` or CFS.
+- **HDF5 file locking.** The runtime default of `HDF5_USE_FILE_LOCKING` is now
+  `BEST_EFFORT` (was `FALSE`): h5py's opens take `flock` locks where the
+  filesystem supports them, so another process's open of a file held for
+  writing refuses ("unable to lock file") instead of racing. The FFI's MPI-IO
+  driver takes no locks, so the two HDF5 stacks do not refuse each other.
+  An exported value still wins; `config/frontera/ffi_env.sh` no longer exports
+  `FALSE`. On Perlmutter NERSC's Slurm task prolog exports `FALSE` into every
+  task that has no value, so Perlmutter runs keep `FALSE` unless the launch
+  exports `BEST_EFFORT`; with it exported, the P4 hsuite is unchanged (claim TBD).
+- **Host memory.** `MemTotal` and `MemAvailable` are capped by the job's memory
+  cgroup (v2 `memory.max`/`memory.current`, v1 `limit_in_bytes`/`usage_in_bytes`,
+  page cache it can reclaim not counted as used), so the host-residence choices
+  and the CPU device budget see a batch job's limit, not the node's.
+- **Startup checks.** A CUDA device below compute capability 8.0 refuses
+  (`GATE cuda-sm80`). On a CPU mesh the host FFT and batched GEMM engines run
+  once at startup (`GATE plan-engine`). A failed mathdx probe still sends every
+  k-convolution to XLA, but rank 0 now prints the demotion with its cause and
+  cost, and every compile receipt ends `demoted kconv` (claim TBD for the cost
+  figures, which are `docs/architecture/kconv.md#why-fused`'s).
+- **JAX private surface.** `runtime.jax_support` checks the parameter names, not
+  only the counts, of every `jax._src` callable LORRAX patches, now including
+  `compile_or_get_cached`, `backend_compile_and_load` and
+  `ExecuteReplicated.__init__`. At P > 1 a compile-agreement or device-fit-gate
+  patch that cannot install refuses by name (`GATE compile-agreement`); at P = 1
+  it warns.
+- **ROCm.** SlabIO keys its library on the device vendor, so a ROCm mesh
+  refuses by name (`unknown platform 'rocm'`) instead of loading the CUDA
+  library; `distrib_la` warns when a non-CPU device takes the host LAPACK
+  subspace plan.
+
+On the P4 hsuite (one A100 node, against main 94741c5ae) eqp is byte-identical
+in 10/10 files cold, warm and with `BEST_EFFORT` in force; the release-cold
+wall is 324.1 s against 324.3 s, with the same 3036 lookups and 2260 compiles
+(claim TBD). No deck change.
+
 ## 2026-10-13 — dipole: the kinetic velocity rides the velocity sweep
 
 With `parallel_transport_out` set, the dipole stage now computes the p-only
