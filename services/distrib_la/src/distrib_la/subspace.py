@@ -283,6 +283,17 @@ def _distribute(local, vector_sharding, *, native_collectives=False):
     return DistributedSubspacePlan(local, vector_sharding, context)
 
 
+def _host_plan(capacity, n_eig, max_block_size):
+    """The host LAPACK plan, which a device with no native provider (ROCm) also takes, warned."""
+    vendor = device_vendor(jax.local_devices()[0])
+    if vendor != 'cpu':
+        import warnings
+        warnings.warn(f'distrib_la subspace: no native {vendor} provider; the host LAPACK '
+                      'pure_callback runs instead and copies every block to the host',
+                      RuntimeWarning, stacklevel=3)
+    return CpuSubspacePlan(capacity, n_eig, max_block_size)
+
+
 def plan_subspace(*, capacity, n_eig, vector_sharding=None, max_block_size=None,
                   native_collectives=False):
     """Resolve before tracing; ``vector_sharding`` includes the unsharded row axis.
@@ -293,7 +304,7 @@ def plan_subspace(*, capacity, n_eig, vector_sharding=None, max_block_size=None,
     """
     _validate_plan_geometry(capacity, n_eig, vector_sharding, max_block_size)
     local = (plan_local_subspace(capacity=capacity, n_eig=n_eig, max_block_size=max_block_size)
-             if device_vendor(jax.local_devices()[0]) == 'cuda' else CpuSubspacePlan(capacity, n_eig, max_block_size))
+             if device_vendor(jax.local_devices()[0]) == 'cuda' else _host_plan(capacity, n_eig, max_block_size))
     return _distribute(local, vector_sharding, native_collectives=native_collectives)
 
 
@@ -315,7 +326,7 @@ def plan_orthogonalization(*, capacity, max_block_size, vector_sharding=None,
             raise RuntimeError(f'orthogonalization provider unavailable: {result}')
         local = LocalSubspacePlan(capacity, 1, 0, max_block_size=max_block_size)
     else:
-        local = CpuSubspacePlan(capacity, 1, max_block_size)
+        local = _host_plan(capacity, 1, max_block_size)
     implementation = _distribute(local, vector_sharding,
                                   native_collectives=native_collectives)
     def orthogonalize(basis, block, active, *, start=0):

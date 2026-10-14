@@ -295,10 +295,16 @@ def kconv_backend(mesh: Mesh, kgrid=None, *, kminor: bool = False) -> str:
 def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
     """Startup check of the router's backend on this mesh; returns it or refuses.
 
-    CUDA: the nvidia-mathdx wheel, every family target and one probe compile;
-    cpu: the two host plan targets.  The XLA backend needs no library.
+    CUDA: compute capability 8.0 or newer on every local device, the
+    nvidia-mathdx wheel, every family target and one probe compile; a failed
+    probe on any process demotes every k-convolution to XLA, announced on
+    rank 0 and recorded (``common.jax_compile_cache.record_demotion``).  cpu:
+    the two host plan targets and one call of each host engine.  The XLA
+    backend needs no library.
     """
     from ffi.gate import announce_once, mesh_ffi_platform
+    if mesh_ffi_platform(mesh) == "CUDA":
+        _require_sm80()
     backend = kconv_backend(mesh)
     if backend == "mathdx":
         root = mathdx_root()
@@ -313,6 +319,14 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
         from jax.experimental import multihost_utils
         if int(np.max(multihost_utils.process_allgather(np.int32(bool(why))))):
             _MATHDX_DOWN[:] = [why or "a peer process failed the mathdx probe compile"]
+            from common.jax_compile_cache import record_demotion
+            record_demotion("kconv", f"nvidia-mathdx -> XLA: {_MATHDX_DOWN[0]}")
+            if jax.process_index() == 0:
+                print(f"*** [kconv] DEMOTED: every k-convolution (Sigma, zeta fit, "
+                      f"ladder W) runs on the XLA backend, a full-k copy per call: "
+                      f"several times the fused route's memory and about 2x its "
+                      f"time (docs/architecture/kconv.md#why-fused).  Cause: "
+                      f"{_MATHDX_DOWN[0]} ***", flush=True)
             return kconv_backend(mesh)
         announce_once(("kconv", "backend", backend),
                       f"[kconv] k-convolution router: CUDA -> nvidia-mathdx ({root}); "
@@ -321,6 +335,7 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
     elif backend == "plan":
         for target in (FLAT_K_TARGET, GW_CONV_TARGET):
             _require_target(target, "cpu")
+        _probe_host_engines(mesh)
         announce_once(("kconv", "backend", backend),
                       "[kconv] k-convolution router: cpu -> FFTW3-ABI host plan route",
                       scope="rank0", emit=announce)
@@ -331,12 +346,55 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
     return backend
 
 
+def _require_sm80() -> None:
+    """Refuse a CUDA device below compute capability 8.0: the CUDA library's
+    PTX targets compute_80, and the mathdx kernels use ``cp.async``."""
+    for dev in jax.local_devices():
+        cc = str(getattr(dev, "compute_capability", "") or "")
+        try:
+            old = tuple(int(v) for v in cc.split(".")[:2]) < (8, 0)
+        except ValueError:
+            continue
+        if old:
+            raise RuntimeError(
+                f"GATE cuda-sm80: got {dev.device_kind} (compute capability {cc}); want "
+                "compute capability 8.0 or newer; why: liblorrax_ffi.so is built for "
+                "compute_80 and the mathdx kernels use cp.async; fix: run on an A100 or "
+                "newer GPU, or on CPU.")
+
+
+def _probe_host_engines(mesh: Mesh) -> None:
+    """Run the plan backend's host engines once at startup: a 2-point FFT on
+    the FFTW3-ABI handler and, when ``LORRAX_BANDS_GEMM_FFI`` is on, a 1x1
+    batched GEMM.  The handlers bind their engines at the first call, so a
+    missing engine library refuses here instead of at the first transform."""
+    from ffi.gemm import gemm_batch, gemm_ffi_enabled
+    local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
+    with jax.default_device(local[0] if local else jax.local_devices()[0]):
+        try:
+            fft = np.asarray(jax.jit(lambda x: _host_flat_k(x, (2, 1, 1), "fftn"))(
+                jnp.asarray([1.0, 0.0], jnp.complex128)))
+            gemm = (np.asarray(jax.jit(gemm_batch)(jnp.full((1, 1, 1), 2.0),
+                                                   jnp.full((1, 1, 1), 3.0)))
+                    if gemm_ffi_enabled() else np.full((1, 1, 1), 6.0))
+            err = "" if (np.allclose(fft, [1.0, 1.0]) and np.allclose(gemm, 6.0)) else (
+                f"wrong results: FFT [1, 0] -> {fft.tolist()}, GEMM 2*3 -> {gemm.ravel().tolist()}")
+        except Exception as e:                                      # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+    if err:
+        raise RuntimeError(
+            f"GATE plan-engine: got a host FFT/GEMM engine that does not run ({err}); want "
+            "the FFTW3-ABI FFT and the batched CBLAS GEMM of liblorrax_ffi_host.so to load "
+            "and compute; fix: put the engine libraries the host library was linked against "
+            "on LD_LIBRARY_PATH (docs/architecture/ffi_layout.md#3c-which-fft-engine-the-host-library-binds).")
+
+
 def _probe_kconv_compile(mesh: Mesh) -> None:
     """Compile and run one tiny mathdx kernel (mode 3, k-grid 2x1x1) on this
     process's first mesh device (else its first local device), so a device the installed cuFFTDx cannot
     compile for is found at startup, not at the first k-convolution.  A failure
     raises ``GATE mathdx-probe`` naming the compute capability; :func:`require_kconv`
-    catches it and every process demotes to the XLA backend with one warning.
+    catches it and every process demotes to the XLA backend, announced and recorded.
     The cubin is disk-cached like every other."""
     local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
     dev = local[0] if local else jax.local_devices()[0]

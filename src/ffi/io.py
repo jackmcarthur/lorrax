@@ -108,16 +108,14 @@ def validate_mesh_2d(mesh: Mesh) -> tuple[int, int]:
 
 
 def _platform_for_mesh(mesh: Mesh) -> str:
-    """Which FFI library owns the collective context for ``mesh`` — "CUDA"
-    for a GPU mesh, "cpu" for a CPU mesh.  The phdf5 read handlers are
-    registered under both platform strings (same jax.ffi target names), and
-    the collective open/dataset lifecycle must go through the matching .so.
+    """Which FFI library owns the collective context for ``mesh``: "CUDA",
+    "cpu", or a vendor with no library ("rocm"), which ``get_lib`` refuses by
+    name.  The phdf5 read handlers are registered under both library platform
+    strings (same jax.ffi target names), and the collective open/dataset
+    lifecycle must go through the matching .so.
     """
-    try:
-        plat = mesh.devices.flat[0].platform
-    except Exception:
-        plat = ""
-    return "CUDA" if plat in ("gpu", "cuda") else "cpu"
+    from ffi.gate import mesh_ffi_platform
+    return mesh_ffi_platform(mesh)
 
 
 _MODE_FLAGS = {"w": 0, "a": 1, "r": 2}

@@ -7,6 +7,8 @@ pool limit or a fragmentation factor (docs/architecture/memory-model.md,
 "Budget").
 """
 
+import os
+
 
 def minimum_process_budget_gb(local_gb: float) -> float:
     """Agree the smallest device budget before choosing collective shapes.
@@ -166,16 +168,65 @@ def warn_over_budget(stage: str, need_bytes: float, budget_bytes: float, *,
         print("WARNING: " + message, file=sys.stderr, flush=True)
 
 
-def _meminfo_gb(field: str) -> float | None:
-    """This node's ``/proc/meminfo`` ``field`` in GB (1e9 B), or None if unreadable."""
+def _meminfo_gb(field: str, *, proc: str = '/proc',
+                cgroup_root: str = '/sys/fs/cgroup') -> float | None:
+    """``MemTotal`` or ``MemAvailable`` in GB (1e9 B), capped by this process's
+    memory cgroups, or None if ``/proc/meminfo`` is unreadable.
+
+    A batch job's cgroup can hold far less than the node, and its OOM killer
+    acts on the cgroup.  ``MemTotal`` is capped by every enclosing cgroup's
+    limit and ``MemAvailable`` by its limit minus its usage, page cache it can
+    reclaim (``inactive_file``) not counted as usage: cgroup v2
+    ``memory.max``/``memory.current``, v1
+    ``memory.limit_in_bytes``/``memory.usage_in_bytes``.
+    """
+    value = None
     try:
-        with open('/proc/meminfo', 'r') as f:
+        with open(os.path.join(proc, 'meminfo')) as f:
             for line in f:
                 if line.startswith(field + ':'):
-                    return int(line.split()[1]) * 1024 / 1e9
-    except (FileNotFoundError, ValueError, IndexError):
-        pass
-    return None
+                    value = int(line.split()[1]) * 1024
+                    break
+        with open(os.path.join(proc, 'self', 'cgroup')) as f:
+            groups = [line.rstrip('\n').split(':', 2) for line in f]
+    except (OSError, ValueError, IndexError):
+        groups = []
+    if value is None:
+        return None
+    cap = float(value)
+    for row in groups:
+        if len(row) != 3:
+            continue
+        if row[1] == '':
+            base, names, stat = cgroup_root, ('memory.max', 'memory.current'), 'inactive_file'
+        elif 'memory' in row[1].split(','):
+            base, stat = os.path.join(cgroup_root, 'memory'), 'total_inactive_file'
+            names = ('memory.limit_in_bytes', 'memory.usage_in_bytes')
+        else:
+            continue
+        parts = [p for p in row[2].split('/') if p]
+        for depth in range(len(parts) + 1):
+            here = os.path.join(base, *parts[:depth])
+            try:
+                with open(os.path.join(here, names[0])) as f:
+                    limit = f.read().strip()
+                with open(os.path.join(here, names[1])) as f:
+                    used = int(f.read())
+            except (OSError, ValueError):
+                continue
+            if limit == 'max':
+                continue
+            if field == 'MemTotal':
+                cap = min(cap, int(limit))
+                continue
+            try:
+                with open(os.path.join(here, 'memory.stat')) as f:
+                    used -= next((int(line.split()[1]) for line in f
+                                  if line.split()[0] == stat), 0)
+            except (OSError, ValueError, IndexError):
+                pass
+            cap = min(cap, max(0, int(limit) - used))
+    return cap / 1e9
 
 
 def get_host_memory_available_gb() -> float | None:

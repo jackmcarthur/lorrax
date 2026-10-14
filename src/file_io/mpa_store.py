@@ -498,8 +498,8 @@ def _h5(target, mode, *, where=None):
 
 #: The exact HDF5 phrase.  It is the SUPERBLOCK's ``status_flags``
 #: write-open bit, not a POSIX lock, which is why
-#: ``HDF5_USE_FILE_LOCKING=FALSE`` does not touch it and why the runs that
-#: die this way have it set.
+#: ``HDF5_USE_FILE_LOCKING`` does not touch it and why the runs that died
+#: this way had it FALSE.
 _STATUS_FLAGS_PHRASE = "file is already open for write"
 
 
@@ -517,8 +517,8 @@ def _superblock_flag_diagnosis(exc, path, mode, where):
     clean.  It is intermittent at 4 ranks on ONE node too, so "single-node
     is safe" is a frequency statement, not an invariant.
 
-    WHAT IT IS NOT.  Not a POSIX lock: ``HDF5_USE_FILE_LOCKING=FALSE`` is
-    injected into every ``lx`` step and was FALSE for the passing runs too.
+    WHAT IT IS NOT.  Not a POSIX lock: the failing runs and the passing runs
+    both had ``HDF5_USE_FILE_LOCKING=FALSE``.
     Not this entry point's bookkeeping: ``file_io.hdf5_owner`` is per-process by
     construction and at the failing open no FFI handle is live in THAT
     rank's process.  Not caused by the A1 work: a detached worktree at
@@ -554,8 +554,8 @@ def _superblock_flag_diagnosis(exc, path, mode, where):
         f"one file (audit A1; docs/architecture/slab_io.md#one-owner).\n"
         f"  file  : {path}\n"
         f"  open  : mode={mode!r} from {where}, rank {rank}/{world}\n"
-        f"  NOT   : a POSIX lock — HDF5_USE_FILE_LOCKING is already FALSE "
-        f"on every lx step and was FALSE on the passing single-node runs;\n"
+        f"  NOT   : a POSIX lock — runs with HDF5_USE_FILE_LOCKING=FALSE "
+        f"failed this way and passed this way alike;\n"
         f"  NOT   : file_io.hdf5_owner — it is per-process and no FFI "
         f"handle is live in THIS process at this open;\n"
         f"  NOT   : a regression from the A1 work — an A/B at bf57701b, "

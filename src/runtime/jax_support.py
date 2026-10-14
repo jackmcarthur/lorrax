@@ -31,7 +31,7 @@ Two measured facts make the version string untrustworthy as the sole evidence:
    ``cache_key._hash_accelerator_config``).
    Two of them changed shape between the two generations, so the patched
    function is called with the wrong number of arguments and the run dies on
-   its FIRST ``jit`` compile (measured; see :data:`REQUIRED_PRIVATE_ARITY`).
+   its FIRST ``jit`` compile (measured; see :data:`REQUIRED_PRIVATE_PARAMS`).
 
 So the gate asserts BOTH: the declared support window, *and* the specific
 private-API shapes the tree is written against.  A future container that
@@ -94,6 +94,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import sys
 from typing import Any
 
 __all__ = [
@@ -101,7 +102,7 @@ __all__ = [
     "describe",
     "enforce",
     "check_version",
-    "check_private_arity",
+    "check_private_params",
     "check_private_symbols",
 ]
 
@@ -170,11 +171,32 @@ SUPPORTED_MAX_EXCLUSIVE = (0, 10, 0)
 # what turns a future mismatch into a named refusal rather than a TypeError on
 # the first jit.
 # --------------------------------------------------------------------------
-REQUIRED_PRIVATE_ARITY: dict[tuple[str, str], int] = {
-    ("jax._src.cache_key", "_hash_accelerator_config"): 2,
-    ("jax._src.cache_key", "_hash_serialized_compile_options"): 3,
-    ("jax._src.compilation_cache", "get_executable_and_time"): 4,
-    ("jax._src.compilation_cache", "is_executable_in_cache"): 2,
+#
+# The table holds parameter NAMES, not counts: the counter reads the module
+# and the host callbacks by position and by keyword, so a rename or a swap of
+# equal arity is as fatal as a new parameter.  A trailing "..." matches a
+# prefix.  The second field is what the patch arms.  ``cache`` rows refuse at
+# every P.  ``agreement`` (the compile counter that runs the cross-rank
+# compile agreement) and ``fit-gate`` (the device-fit gate) refuse at P > 1,
+# where they are the protection against a rank-divergent compile hanging the
+# mesh, and warn at P = 1, where they only count.
+REQUIRED_PRIVATE_PARAMS: dict[tuple[str, str], tuple[tuple[str, ...], str]] = {
+    ("jax._src.cache_key", "_hash_accelerator_config"):
+        (("hash_obj", "accelerators"), "cache"),
+    ("jax._src.cache_key", "_hash_serialized_compile_options"):
+        (("hash_obj", "compile_options_obj", "strip_device_assignment"), "cache"),
+    ("jax._src.compilation_cache", "get_executable_and_time"):
+        (("cache_key", "compile_options", "backend", "executable_devices"), "cache"),
+    ("jax._src.compilation_cache", "is_executable_in_cache"):
+        (("backend", "cache_key"), "cache"),
+    ("jax._src.compiler", "compile_or_get_cached"):
+        (("backend", "computation", "devices", "compile_options", "host_callbacks",
+          "executable_devices", "pgle_profiler"), "agreement"),
+    ("jax._src.compiler", "backend_compile_and_load"):
+        (("backend", "module", "executable_devices", "options", "host_callbacks"),
+         "agreement"),
+    ("jax._src.interpreters.pxla", "ExecuteReplicated.__init__"):
+        (("self", "xla_executable", "name", "backend", "..."), "fit-gate"),
 }
 
 #: Private symbols that must merely EXIST for the compile-cache patches to
@@ -279,29 +301,31 @@ def check_version() -> list[str]:
     return problems
 
 
-def check_private_arity() -> list[str]:
-    """Verify the ``jax._src`` shapes this tree monkeypatches. Returns problems."""
+def check_private_params() -> list[tuple[str, str]]:
+    """Verify the ``jax._src`` signatures this tree monkeypatches.
+
+    Returns ``(what the patch arms, problem)`` pairs, empty when every
+    signature is the one in :data:`REQUIRED_PRIVATE_PARAMS`.
+    """
     import importlib
 
-    problems: list[str] = []
-    for (modname, attr), want_n in REQUIRED_PRIVATE_ARITY.items():
+    problems: list[tuple[str, str]] = []
+    for (modname, attr), (want, arms) in REQUIRED_PRIVATE_PARAMS.items():
         try:
-            mod = importlib.import_module(modname)
+            fn = importlib.import_module(modname)
+            for part in attr.split("."):
+                fn = getattr(fn, part)
         except Exception as exc:  # noqa: BLE001
-            problems.append(f"{modname} is not importable ({type(exc).__name__})")
-            continue
-        fn = getattr(mod, attr, None)
-        if fn is None:
-            problems.append(f"{modname}.{attr} is ABSENT (expected {want_n} params)")
+            problems.append((arms, f"{modname}.{attr} is ABSENT ({type(exc).__name__})"))
             continue
         try:
-            got_n = len(inspect.signature(fn).parameters)
+            got = tuple(inspect.signature(fn).parameters)
         except (TypeError, ValueError):
             continue  # not introspectable; not evidence of a mismatch
-        if got_n != want_n:
-            problems.append(
-                f"{modname}.{attr} takes {got_n} parameters, this tree patches "
-                f"it with {want_n}")
+        prefix = want[-1] == "..."
+        if (got[:len(want) - 1] if prefix else got) != (want[:-1] if prefix else want):
+            problems.append((arms, f"{modname}.{attr} has parameters {got}, this "
+                                   f"tree patches it as {want}"))
     return problems
 
 
@@ -330,9 +354,24 @@ def enforce(*, announce=None) -> None:
     ``announce`` is retained for call-signature stability; unsupported
     versions are never downgraded or silenced.
     """
+    import jax
+
     version_problems = check_version()
-    arity_problems = check_private_arity()
+    param_problems = check_private_params()
     symbol_problems = check_private_symbols()
+    try:
+        n_proc = int(jax.process_count())
+    except Exception:  # noqa: BLE001
+        n_proc = 1
+    # At P = 1 the compile agreement and the device-fit gate guard nothing
+    # a refusal would protect; they warn and the run continues.
+    soft = [(arms, why) for arms, why in param_problems
+            if n_proc == 1 and arms != "cache"]
+    for arms, why in soft:
+        print(f"WARNING [{RULE_PRIVATE_ARITY}] the {arms} patch will not install: "
+              f"{why}", file=sys.stderr, flush=True)
+    arity_problems = [f"{why} (arms the {arms})" for arms, why in param_problems
+                      if (arms, why) not in soft]
     all_problems = version_problems + arity_problems + symbol_problems
 
     if not all_problems:
@@ -360,8 +399,10 @@ def enforce(*, announce=None) -> None:
     _refuse(
         RULE_PRIVATE_ARITY,
         got="; ".join(arity_problems),
-        want="the jax._src arities common/jax_compile_cache.py patches against "
-             "(see REQUIRED_PRIVATE_ARITY)",
+        want="the jax._src signatures common/jax_compile_cache.py patches "
+             "against (see REQUIRED_PRIVATE_PARAMS); at P > 1 the compile "
+             "agreement and the device-fit gate keep a rank-divergent "
+             "compile from hanging the mesh",
         fix="use the certified JAX/JAXLIB 0.9 environment; the compile-cache "
             "patches cannot safely run against this private surface",
     )

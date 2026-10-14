@@ -144,9 +144,18 @@ class _CacheState:
         self._compile_client = None
         self._compile_sequence = 0
         self.probe_keys: set[str] = set()
+        # Routes demoted at startup, name -> why: they change which programs
+        # this run compiles, so the receipts and the startup facts carry them.
+        self.demotions: dict[str, str] = {}
 
 
 _STATE = _CacheState()
+
+
+def record_demotion(name: str, why: str) -> None:
+    """Record that route ``name`` runs its slower fallback, and why."""
+    _STATE.demotions[str(name)] = str(why)
+
 
 class UnsafeCachePolicy(RuntimeError):
     """A requested disk-cache lifecycle would violate the cache contract."""
@@ -720,9 +729,10 @@ def _install_device_fit_gate() -> None:
 
     The wrap is signature-checked at install, like the other ``jax._src``
     patches here: when ``ExecuteReplicated`` is absent or its ``__init__`` does
-    not start ``(self, xla_executable, name, backend)``, the gate is skipped
-    with one stderr notice.  A check that cannot read a module's figures lets
-    it run, with the same notice; only :class:`ModuleDoesNotFit` propagates.
+    not start ``(self, xla_executable, name, backend)``, the install refuses at
+    P > 1 (:class:`_JaxSurfaceUnsupported`) and is skipped with one stderr
+    notice at P = 1.  A check that cannot read a module's figures lets it run,
+    with the same notice; only :class:`ModuleDoesNotFit` propagates.
     """
     import inspect
     from jax._src.interpreters import pxla
@@ -737,13 +747,14 @@ def _install_device_fit_gate() -> None:
     except Exception:                                      # noqa: BLE001
         params = None
     if cls is None or params != head:
-        # Same discipline as the other jax._src patches: a changed private
-        # surface is skipped with one notice, never mis-wrapped.
-        _fit_gate_notice(
-            f"jax {_jax_generation()}: pxla.ExecuteReplicated.__init__ is "
-            f"{'absent' if cls is None else f'{params!r}'}, not {head!r}; "
-            f"GATE xla_rematerialization is NOT armed (a module larger than "
-            f"the device fails at allocation instead).")
+        # A changed private surface is never mis-wrapped.
+        msg = (f"jax {_jax_generation()}: pxla.ExecuteReplicated.__init__ is "
+               f"{'absent' if cls is None else f'{params!r}'}, not {head!r}; "
+               f"GATE xla_rematerialization is NOT armed (a module larger than "
+               f"the device fails at allocation instead).")
+        if _STATE.n_proc > 1:
+            raise _JaxSurfaceUnsupported(msg)
+        _fit_gate_notice(msg)
         return
     _orig_init = cls.__init__
 
@@ -1002,7 +1013,8 @@ def compile_receipt(label: str, emit=None) -> str:
     uncacheable = sum(row[0] - seen.get(n, 0) for n, row in s.uncacheable.items())
     line = (f"{label} compile: real {s.compiles - compiles} ({s.compile_secs - secs:.1f} s), "
             f"cache hits {s.hits - hits}, uncacheable {uncacheable}"
-            + (f" [{', '.join(names)}]" if names else ""))
+            + (f" [{', '.join(names)}]" if names else "")
+            + (f", demoted {', '.join(sorted(s.demotions))}" if s.demotions else ""))
     s.receipt_mark = (s.compiles, s.compile_secs, s.hits,
                       {n: row[0] for n, row in s.uncacheable.items()})
     if s.proc_idx == 0:
@@ -1048,6 +1060,7 @@ def compile_cache_stats() -> dict:
         "is_cache_writer": s.proc_idx == 0,
         "write_scope": "process-local; JAX writes on process 0 only",
         "keys": sorted(s.probe_keys),
+        "demotions": dict(s.demotions),
     }
 
 
@@ -1303,6 +1316,14 @@ def ensure_jax_compile_cache() -> None:
         install_compile_agreement()
         atexit.register(_report)
     except Exception as exc:                               # noqa: BLE001
+        if n_proc > 1:
+            raise RuntimeError(
+                f"GATE compile-agreement: got the compile agreement or the "
+                f"device-fit gate not installed at P={n_proc} "
+                f"({type(exc).__name__}: {exc}); want both armed, because "
+                f"without them a rank-divergent compile hangs the mesh with "
+                f"no message; fix: the certified JAX 0.9 environment "
+                f"(runtime.jax_support).") from exc
         if proc_idx == 0:
             _say(f"compile-storm telemetry OFF: the XLA compile counter did "
                  f"not install ({type(exc).__name__}: {exc}); xla_compiles "

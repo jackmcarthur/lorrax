@@ -740,22 +740,13 @@ def set_default_env(*, platform: str = "gpu") -> None:
     # explicit ``=0`` here, before the first array exists.
     enforce_x64(_x64_requested(), where=f"the {_X64_ENV} environment variable")
     set_x64_on_imported_jax()
-    # HDF5 FILE LOCKING OFF BY DEFAULT (audit A1, 2026-08-15).  A LORRAX
-    # process maps TWO independent HDF5 library instances — h5py's bundled
-    # wheel libhdf5 and the FFI's cray libhdf5_parallel — and the stores
-    # are touched through both, sequentially.  Each instance takes its own
-    # advisory locks and cannot see the other's, so one instance's stale
-    # lock refuses the other's legitimate open with "unable to lock file"
-    # on a file nothing is actually writing.
-    #
-    # A MITIGATION, NOT A FIX, and the difference matters: this masks
-    # LOCK-level refusals only.  The metadata-cache divergence between the
-    # two instances is untouched by it, and that is the actual A1 hazard —
-    # ``file_io.hdf5_owner`` is what refuses a live cross-stack overlap and
-    # counts the sequential alternation that remains.  HDF5 reads this at
-    # file-open time, so setting it here (before any store is opened)
-    # rather than at some module's import is what makes it order-independent.
-    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+    # HDF5 file locking: best effort.  h5py's sec2 opens take flock locks
+    # where the filesystem has them, so two processes cannot write one file
+    # unseen, and skip them where it does not (Lustre without flock).  The
+    # FFI's MPI-IO driver takes no locks, so the FFI and h5py stacks cannot
+    # refuse each other here; ``file_io.hdf5_owner`` owns that clash.  HDF5
+    # reads this at file open, so it is set before any store opens.
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "BEST_EFFORT")
     if platform == "gpu":
         os.environ.setdefault("JAX_PLATFORMS", f"{_gpu_plugin_platform()},cpu")
     elif platform == "cpu":

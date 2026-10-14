@@ -564,6 +564,56 @@ def _replace_inode_for_write(path: str) -> None:
     _barrier("slab_io_replace_inode")
 
 
+_SHARED_DIRS: set[str] = set()
+
+
+def _assert_shared_directory(path: str) -> None:
+    """Refuse a multi-process write into a directory the ranks do not share.
+
+    In a node-local directory each node's ranks write their own partial file
+    and rank 0 commits node 0's copy alone.  Once per directory, rank 0 writes
+    a nonce file, every rank reads it back, and the ranks agree on the result.
+    Every rank must call.  The directory is ``path``'s as given, which every
+    rank must pass alike, so the agreement keys and the cache match across
+    ranks even where the string resolves to different storage.
+    """
+    directory = os.path.dirname(path) or "."
+    if jax.process_count() == 1 or directory in _SHARED_DIRS:
+        return
+    import secrets
+    import socket
+    from common.collectives import agree_io_error, rank0_transaction
+
+    def _write():
+        nonce = secrets.token_hex(16)
+        with open(os.path.join(directory, f".lorrax-shared-{nonce}"), "w") as f:
+            f.write(nonce)
+        return nonce
+
+    nonce = rank0_transaction(directory, stage="SlabIO.shared_directory/nonce",
+                              write=_write, return_value=True)
+    probe = os.path.join(directory, f".lorrax-shared-{nonce}")
+    try:
+        with open(probe) as f:
+            seen = f.read()
+    except OSError:
+        seen = None
+    error = None if seen == nonce else OSError(
+        f"rank {jax.process_index()} on {socket.gethostname()} cannot read the "
+        "nonce rank 0 wrote: this directory is not one filesystem for every "
+        "rank. Put the run directory on a filesystem every node mounts "
+        "($SCRATCH, CFS), not /tmp or node-local NVMe")
+    try:
+        agree_io_error(error, path=directory, stage="SlabIO.shared_directory")
+    finally:
+        if _rank0():
+            try:
+                os.remove(probe)
+            except OSError:
+                pass
+    _SHARED_DIRS.add(directory)
+
+
 # ---------------------------------------------------------------------------
 # The MPI world this context ACTUALLY has, vs the one it was opened for
 # ---------------------------------------------------------------------------
@@ -2282,6 +2332,7 @@ class _FfiBackend(_DatasetGeometry):
             # collective native-open boundary.
             from ffi.io import assert_writable_open_available
             assert_writable_open_available(path)
+            _assert_shared_directory(path)
         # Invalidate an append before MPI-IO can mutate old committed data.
         # A reader checks before opening the collective handle as well.
         from common.collectives import rank0_transaction
