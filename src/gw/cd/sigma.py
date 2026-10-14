@@ -211,6 +211,33 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
         anchor=wrap(cd_anchor, (q3, q3, P(), P(), P()), (P(), P())))
 
 
+def build_dyson_kernels(mesh_xy, *, n, pref):
+    """Dyson pair on the (q, z)-parallel flat layout P(('x','y'), None, None): local batched LU (class B).
+
+    pair(H [b, n, n], chi [b, n, n], dchi/ds [b, n, n]) -> (W_c, dW_c/ds); value(H, chi) -> W_c, with
+    X = pref H chi H, W_c = H X (1 - X)^-1 H, W = W_c + H H, dW_c/ds = W (pref dchi/ds) W
+    (the response bank's pair equations, ``gw.response_bank._response_programs``).
+    """
+    eye = jnp.eye(n, dtype=jnp.complex128)
+    flat = NamedSharding(mesh_xy, P(("x", "y"), None, None))
+
+    def one_value(h, chi_raw):
+        x = pref * (h @ chi_raw @ h)
+        return h @ (x @ jnp.linalg.solve(eye - x, eye)) @ h
+
+    def one_pair(h, chi_raw, dchi_raw):
+        wc = one_value(h, chi_raw)
+        w = wc + h @ h
+        return wc, w @ (pref * dchi_raw) @ w
+
+    def cd_dyson_pair(hs, chi_flat, dchi_flat):
+        return jax.vmap(one_pair)(hs, chi_flat, dchi_flat)
+
+    def cd_dyson_value(hs, chi_flat):
+        return jax.vmap(one_value)(hs, chi_flat)
+    return (jax.jit(cd_dyson_pair, out_shardings=(flat, flat)), jax.jit(cd_dyson_value, out_shardings=flat))
+
+
 # ------------------------------------------------------------------------------- the Sigma consumer
 def compute_sigma_c_cd_omega_grid(
     wfns, cd_handle, meta, mesh_xy, *, sym, config, omega_grid_ry, efermi_ry,
@@ -407,21 +434,8 @@ def compute_sigma_c_cd_omega_grid(
     if bool(np.any(host(negative))):
         raise ValueError("GATE cd_coulomb_psd: negative eigenvalue in V_q")
     h_rep = jax.jit(lambda a: a * 1.0, out_shardings=rep)(h_irr)                      # [nq_irr, n, n]
-    eye = jnp.eye(n, dtype=jnp.complex128)
     zq_par = NamedSharding(mesh_xy, P(("x", "y"), None, None))
-
-    def _pair_one(h, chi_raw, dchi_raw):
-        """response_bank pair equations, one (q, z): W_c and dW_c/ds."""
-        x = pref * (h @ chi_raw @ h)
-        e = jnp.linalg.solve(eye - x, eye)
-        wc = h @ (x @ e) @ h
-        w = wc + h @ h
-        return wc, w @ (pref * dchi_raw) @ w
-
-    def _value_one(h, chi_raw):
-        x = pref * (h @ chi_raw @ h)
-        e = jnp.linalg.solve(eye - x, eye)
-        return h @ (x @ e) @ h
+    dyson_pair, dyson_value = build_dyson_kernels(mesh_xy, n=n, pref=pref)
 
     def cd_to_qz(chi4):
         """[nz, nq_irr, n, n] face -> [(q, z), n, n] q-major flat on the (q,z)-parallel layout."""
@@ -433,13 +447,6 @@ def compute_sigma_c_cd_omega_grid(
     roots_qz = jax.jit(lambda h, nz_: jnp.repeat(h, nz_, axis=0, total_repeat_length=nq_irr * nz_),
                        static_argnums=1, out_shardings=zq_par)
 
-    def cd_dyson_pair(hs, chi_flat, dchi_flat):
-        return jax.vmap(_pair_one)(hs, chi_flat, dchi_flat)
-
-    def cd_dyson_value(hs, chi_flat):
-        return jax.vmap(_value_one)(hs, chi_flat)
-    dyson_pair = jax.jit(cd_dyson_pair, out_shardings=(zq_par, zq_par))
-    dyson_value = jax.jit(cd_dyson_value, out_shardings=zq_par)
     pad_rows = nq_pad - nk
 
     def cd_full_zone_direct(flat):
