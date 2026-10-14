@@ -65,6 +65,7 @@ def check_current_fourier(runtime):
             assert group['pair_distribution_receipt']['mode']=='q'
             assert max(float(np.max(abs(host(v)-r))) for v,r in zip(fallback,reference))<2e-11
         finally:group['prepare_fourier_coefficients']=prepare
+        group['pair_distribution_receipt']=pair_receipt
         return actual
 
     class Writer:

@@ -354,15 +354,36 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
     hlo=executable.as_text().lower()
     for forbidden in ('all-gather(', 'all-to-all(', 'all-reduce('):assert forbidden not in hlo,forbidden
     memory=executable.memory_analysis()
-    # Exact zero augmentation parity with the unchanged legacy grouped pass.
+    # Zero augmentation: exact q-layout parity, bounded face reduction error.
     for z in zetas:z.local_augmentation=None
     baseline=tuple(np.asarray(gather_to_host(v)) for v in contract_v_group(zetas,pairs,v_tables,keep=keep))
+    baseline_shell=tuple(np.asarray(gather_to_host(z.shell)) for z in zetas)
     for c,(z,p) in enumerate(zip(zetas,providers)):
         zero_rhs=np.zeros((Qp,mu,na*nh*nr),complex)
         if compensated:zero_rhs=np.concatenate((zero_rhs,ps_rhs_host[c]),axis=-1)
         z.local_augmentation=dict(p,rhs=put(zero_rhs))
     zero=tuple(np.asarray(gather_to_host(v)) for v in contract_v_group(zetas,pairs,v_tables,keep=keep))
-    assert all(np.array_equal(a,b) for a,b in zip(zero,baseline))
+    zero_layout=bundle.get('pair_distribution_receipt',{}).get('mode','q')
+    zero_diagnostics=[]
+    for index,(value,reference) in enumerate(zip(zero,baseline)):
+        a,b=pairs[index]
+        weight=np.pad(abs(v_tables[index]),((0,1),(0,gpad-ng)))
+        absolute_product=np.einsum('qmg,qg,qng->qmn',abs(smooth[a]),weight,abs(smooth[b]))
+        # Two complex dot-product reductions with at most gpad terms. 64
+        # accounts conservatively for real operations and both reduction trees;
+        # the operand absolute-product norm, not a physical-unit tolerance,
+        # scales the bound even when the result cancels.
+        bound=64*np.finfo(np.float64).eps*gpad*float(np.max(absolute_product))
+        difference=value-reference
+        row=dict(max_abs=float(np.max(abs(difference))),rms=float(np.sqrt(np.mean(abs(difference)**2))),
+            operator_norm=max(float(np.linalg.norm(v,2)) for v in difference),
+            reference_max=float(np.max(abs(reference))),roundoff_bound=bound,layout=zero_layout)
+        zero_diagnostics.append(row)
+        if jax.process_index()==0:print('zero augmentation reduction diagnostic:',row,flush=True)
+        if zero_layout=='face':assert row['max_abs']<=bound,row
+        else:assert np.array_equal(value,reference),row
+    assert all(np.array_equal(np.asarray(gather_to_host(z.shell)),reference)
+               for z,reference in zip(zetas,baseline_shell))
     if not streamed_coefficients:
         for z in zetas:z.close()
     streamed_error = None
@@ -396,7 +417,7 @@ def check_breit_group(runtime,*,circular=True,prefactor_multiplier=-8.,
         streamed_aot=dict(memory=stream.memory_receipt,quotes=stream.aot_quotes)
         for z in zetas:z.close()
         assert banks._banks is None
-    return dict(sys_dim=sys_dim,circular=circular,compensated=compensated,averaged_heads=averaged_heads,embedded_gamma=embedded_gamma,
+    return dict(zero_augmentation_reduction=zero_diagnostics,sys_dim=sys_dim,circular=circular,compensated=compensated,averaged_heads=averaged_heads,embedded_gamma=embedded_gamma,
         streamed_vs_incumbent_max_abs=streamed_error,streamed_solve_store_AOT=streamed_aot,
         completion_term_signals=([max(float(np.max(abs(v[t]))) for v in completion_terms) for t in range(3)] if sys_dim==2 else None),
         individually_omitted_completion_final_errors=omission_errors,

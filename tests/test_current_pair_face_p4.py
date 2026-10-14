@@ -71,8 +71,10 @@ def check_pair_face(runtime):
                                float(np.max(abs(host(Sf[a])-host(Sq[a]))))))
                 if physical:
                     want=np.where(mask[:,None,:],full,0)
+                    assert np.array_equal(host(result[2][a]),host(qresult[2][a]))
                     errors.extend((float(np.max(abs(host(result[2][a])-want))),
                                    float(np.max(abs(host(result[2][a])-host(qresult[2][a]))))))
+            assert all(np.array_equal(host(a),host(b)) for a,b in zip(Sf,Sq))
             for i in range(6):
                 errors.extend((float(np.max(abs(host(Vf[i])-expected[i,:Q]))),
                                float(np.max(abs(host(Vf[i])-host(Vq[i])[:Q])))))
@@ -91,7 +93,10 @@ if __name__=='__main__':
     def run():
         import jax
         from tests.test_current_mu_Fourier_p4 import check_current_fourier
-        result=dict(pair=check_pair_face(runtime),complete=check_current_fourier(runtime))
+        pair=check_pair_face(runtime)
+        if jax.process_index()==0:
+            Path(args.output).with_suffix('.pair_only.json').write_text(json.dumps(pair,indent=2)+'\n')
+        result=dict(pair=pair,complete=check_current_fourier(runtime))
         if jax.process_index()==0:
             Path(args.output).write_text(json.dumps(result,indent=2)+'\n')
         return 0
