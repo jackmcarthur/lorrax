@@ -23,6 +23,7 @@ Shapes are documented per function; all arrays are jax arrays inside a trace.
 from __future__ import annotations
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 from common.units import RYD_TO_EV
@@ -36,6 +37,12 @@ BETA_RY = BETA_EV / float(RYD_TO_EV)
 def apply(a, w):
     """out[E, k, m, n] = sum_l a[k, m, n, l] * w[k, E, l]."""
     return jnp.einsum('kmnl,kel->ekmn', a, w)
+
+
+def own_apply(a, w):
+    """Own-energy diagonal: out[k, m] = sum_l a[k, m, m, l] * w[k, m, l] (E bound to the bra m)."""
+    diag = jnp.moveaxis(jnp.diagonal(a, axis1=1, axis2=2), -1, 1)       # [k, m, l]
+    return jnp.einsum('kml,kml->km', diag, w)
 
 
 def dagger(a):
@@ -58,24 +65,33 @@ def imag_node_kernels(u, w, x, f, eta):
     return minus, plus
 
 
-def imag_raw_node(a, u, w, x, f, eta):
-    """Anchor-free contribution of one imaginary node: [E, k, m, n]."""
+def imag_node_terms(a, u, w, x, f, eta):
+    """One imaginary node as (operators [k, m, n, 2l], weights [k, E, 2l]): a and its dagger stacked on l."""
     minus, plus = imag_node_kernels(u, w, x, f, eta)
-    return apply(a, minus) + apply(dagger(a), plus)
+    return jnp.concatenate([a, dagger(a)], axis=-1), jnp.concatenate([minus, plus], axis=-1)
+
+
+def imag_raw_node(a, u, w, x, f, eta, apply_fn=apply):
+    """Anchor-free contribution of one imaginary node: [E, k, m, n] (``apply_fn = own_apply``: [k, m])."""
+    return apply_fn(*imag_node_terms(a, u, w, x, f, eta))
 
 
 def imag_anchor_sums(u_nodes, w_nodes, x, f, eta, beta):
-    """S_-(beta), S_+(beta) for each beta: lists of ([k,E,l], [k,E,l]) summed over the rule."""
-    out = []
-    for b in beta:
-        sm = jnp.zeros(x.shape, jnp.complex128)
-        sp = jnp.zeros(x.shape, jnp.complex128)
-        for u, w in zip(u_nodes, w_nodes):
-            minus, plus = imag_node_kernels(u, w, x, f, eta)
-            sm = sm + minus / (u * u + b * b)
-            sp = sp + plus / (u * u + b * b)
-        out.append((sm, sp))
-    return out
+    """S_-(beta), S_+(beta) for each beta: list of ([k,E,l], [k,E,l]) summed over the rule.
+
+    One ``lax.scan`` over the nodes in rule order (the summation order of ordered_cd's loop), so the
+    trace is one node body however many nodes the rule has.
+    """
+    u_nodes, w_nodes = jnp.asarray(u_nodes), jnp.asarray(w_nodes)
+    zero = jnp.zeros(x.shape, jnp.complex128)
+
+    def body(carry, uw):
+        u, w = uw
+        minus, plus = imag_node_kernels(u, w, x, f, eta)
+        return tuple((sm + minus / (u * u + b * b), sp + plus / (u * u + b * b))
+                     for (sm, sp), b in zip(carry, beta)), None
+    out, _ = jax.lax.scan(body, tuple((zero, zero) for _ in beta), (u_nodes, w_nodes))
+    return [tuple(pair) for pair in out]
 
 
 # --------------------------------------------------------------------------- anchor at i eta
@@ -102,24 +118,24 @@ def anchor_selector(x, f, eta, beta):
             + (1.0 - fb) * sign / (2.0 * beta * (beta + sign * dc)))
 
 
-def anchor_part(value0, deriv0, x, f, eta, beta):
-    """Analytic anchor integral [E, k, m, n] and the anchor coefficients (cp, cm)."""
+def anchor_part(value0, deriv0, x, f, eta, beta, apply_fn=apply):
+    """Analytic anchor integral [E, k, m, n] (``own_apply``: [k, m]) and the anchor coefficients (cp, cm)."""
     fb, dv, dc = kernels(x, f, eta)
     cp = anchor_fit(value0, deriv0, eta, beta)
     cm = anchor_fit(dagger(value0), dagger(deriv0), eta, beta)
-    total = jnp.zeros((x.shape[1],) + value0.shape[:3], jnp.complex128)
+    total = 0
     for p, m, b in zip(cp, cm, beta):
         odd = (fb * odd_anchor(dv, x, b, -np.pi) + (1.0 - fb) * odd_anchor(dc, x, b, np.pi)) * (1j / (2.0 * np.pi))
-        total = total + apply(0.5 * (p + m), anchor_selector(x, f, eta, b))
-        total = total + apply(p - m, odd)
+        total = total + apply_fn(0.5 * (p + m), anchor_selector(x, f, eta, b))
+        total = total + apply_fn(p - m, odd)
     return total, cp, cm
 
 
-def anchor_subtraction(cp, cm, sums):
+def anchor_subtraction(cp, cm, sums, apply_fn=apply):
     """The imaginary node sums' anchor part: sum_beta cp S_- + cm S_+  -> [E, k, m, n]."""
     out = 0
     for j in range(len(cp)):
-        out = out + apply(cp[j], sums[j][0]) + apply(cm[j], sums[j][1])
+        out = out + apply_fn(cp[j], sums[j][0]) + apply_fn(cm[j], sums[j][1])
     return out
 
 
@@ -140,17 +156,23 @@ def hermite_coefficients(x, f, h):
     return index.astype(jnp.int32), rs * h00, rs * h01, rs * h * h10, rs * h * h11
 
 
-def real_knot(node, z, a, d, at, dt, x, f, h):
-    """One real knot's Hermite residue contribution [E, k, m, n].
+def real_knot_terms(node, z, a, d, x, f, h, negative):
+    """One real knot's Hermite residues on ONE branch as (operators [k, m, n, 2l], weights [k, E, 2l]).
 
-    a, d: contractions of -W_c,q(z), -dW_c,q/ds (read by residues x >= 0); at, dt: the
-    W_{-q}^T twins (read by x < 0); ``node`` is the knot index of z = x_node + i eta.
-    Derivative node data = d/ds * 2z = d/dx.
+    ``negative=False``: residues x >= 0 (unoccupied l), read a, d = contractions of -W_c,q(z),
+    -dW_c,q/ds; ``negative=True``: residues x < 0 (occupied l), read the W_{-q}^T twins.  The
+    derivative node datum is d/ds * 2z = d/dx.  ``node`` is the knot index of z = x_node + i eta.
     """
     index, vl, vr, dl, dr = hermite_coefficients(x, f, h)
     sel_v = jnp.where(index == node, vl, 0.0) + jnp.where(index + 1 == node, vr, 0.0)
     sel_d = jnp.where(index == node, dl, 0.0) + jnp.where(index + 1 == node, dr, 0.0)
-    neg = x < 0.0
-    out = apply(a, jnp.where(neg, 0.0, sel_v)) + apply(d * (2 * z), jnp.where(neg, 0.0, sel_d))
-    out = out + apply(at, jnp.where(neg, sel_v, 0.0)) + apply(dt * (2 * z), jnp.where(neg, sel_d, 0.0))
-    return out
+    keep = (x < 0.0) if negative else (x >= 0.0)
+    return (jnp.concatenate([a, d * (2 * z)], axis=-1),
+            jnp.concatenate([jnp.where(keep, sel_v, 0.0), jnp.where(keep, sel_d, 0.0)], axis=-1))
+
+
+def real_knot(node, z, a, d, at, dt, x, f, h, apply_fn=apply):
+    """One real knot's Hermite residue contribution [E, k, m, n]: both branches, one apply (K = 4l)."""
+    op_p, w_p = real_knot_terms(node, z, a, d, x, f, h, negative=False)
+    op_n, w_n = real_knot_terms(node, z, at, dt, x, f, h, negative=True)
+    return apply_fn(jnp.concatenate([op_p, op_n], axis=-1), jnp.concatenate([w_p, w_n], axis=-1))
