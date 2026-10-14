@@ -35,10 +35,9 @@ PY="$LORRAX_ROOT/.venv/bin/python"
 CUDA_MODULE="cudatoolkit/13.2"
 CUSOLVERMP_VERSION="0.9.1.9318.post1"
 CUBLASMP_VERSION="0.10.0.3695"
-PHDF5_VERSION="1.14.3.7"
-PHDF5_ROOT="/opt/cray/pe/hdf5-parallel/$PHDF5_VERSION/gnu/12.3"
 # shellcheck disable=SC1091
 source "$LORRAX_ROOT/config/perlmutter/ffi_mpi.sh"
+PHDF5_ROOT="$LORRAX_PM_HDF5_ROOT"
 MPICH_ROOT="$LORRAX_PM_MPICH_ROOT"
 
 die() { echo "[build_ffi_cuda] REFUSED: $*" >&2; exit 2; }
@@ -89,15 +88,12 @@ for p in "$STAGE/include/cusolverMp.h" "$STAGE/include/cublasmp.h" \
 done
 
 # --- configure + build ------------------------------------------------------
-# The library search path is a DT_RPATH (--disable-new-dtags), which the loader
-# reads BEFORE LD_LIBRARY_PATH.  Two things depend on that order:
-#   - cudatoolkit/13.2 puts the HPC SDK's math_libs on LD_LIBRARY_PATH, which
-#     carries cuSOLVERMp 0.8 / cuBLASMp 0.8 under the same SONAMEs as the
-#     staged 0.9.1 / 0.10 this leg is compiled against.  Found first, they
-#     fail inside the first distributed eigh (cusolverMpSyevd status=7).
-#   - /opt/cray/pe/lib64 (the ld.so.cache fallback) points
-#     libhdf5_parallel_gnu.so.310 at the site-default HDF5, which links the
-#     site-default MPI, so the pinned HDF5 and MPI lib dirs are listed too.
+# The leg's only search path is $ORIGIN (CMakeLists.txt).  cudatoolkit/13.2
+# puts the HPC SDK's cuSOLVERMp 0.8 / cuBLASMp 0.8 on LD_LIBRARY_PATH under the
+# same SONAMEs as the staged 0.9.1 / 0.10 this leg is compiled against (found
+# first, they fail the first distributed eigh with cusolverMpSyevd status=7).
+# A sealed bundle carries the staged pair beside the leg and preloads it by
+# exact path, so the sealed bundle, not a search path, decides which one serves.
 [[ "${1:-}" == "--fresh" ]] && rm -rf "${BUILD:?}"
 cmake --fresh -S "$SRC" -B "$BUILD" \
     -DLORRAX_FFI_PLATFORM=cuda \
@@ -127,8 +123,7 @@ cmake --fresh -S "$SRC" -B "$BUILD" \
     -DLORRAX_MPI_INCLUDE_DIR="$MPICH_ROOT/include" \
     -DLORRAX_MPICH_LIB_DIR="$MPICH_ROOT/lib" \
     -DLORRAX_MPI_LIBRARY="$LORRAX_PM_MPI_LIBRARY" \
-    -DLORRAX_SLATE_INSTALL_DIR="$PREFIX/no-slate" \
-    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--disable-new-dtags -Wl,-rpath,$PHDF5_ROOT/lib:$MPICH_ROOT/lib"
+    -DLORRAX_SLATE_INSTALL_DIR="$PREFIX/no-slate"
 cmake --build "$BUILD" --parallel "${LORRAX_BUILD_JOBS:-16}"
 SO="$BUILD/liblorrax_ffi.so"
 [[ -f "$SO" ]] || { echo "[build_ffi_cuda] FAILED: no .so produced" >&2; exit 1; }
@@ -136,12 +131,12 @@ SO="$BUILD/liblorrax_ffi.so"
 "$SRC/stage/stamp_provenance.sh" "$SO" \
     leg=cuda cuda_module="$CUDA_MODULE" cuda_root="$CUDA" \
     cusolvermp="$CUSOLVERMP_VERSION" cublasmp="$CUBLASMP_VERSION" \
-    phdf5="cray-hdf5-parallel/$PHDF5_VERSION" phdf5_root="$PHDF5_ROOT" \
+    phdf5="$LORRAX_PM_HDF5_MODULE" phdf5_root="$PHDF5_ROOT" \
     hdf5_soversion=310 mpi="$LORRAX_PM_MPICH_MODULE" mpi_root="$MPICH_ROOT" \
     || echo "[build_ffi_cuda] WARNING: provenance stamp failed" >&2
 
 # --- post-link gates (scripts/verify_ffi_build.sh) --------------------------
-LD_LIBRARY_PATH="$STAGE/lib:$CUDA/lib64:$MATH/lib64:$COMM/nccl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+LD_LIBRARY_PATH="$STAGE/lib:$CUDA/lib64:$MATH/lib64:$COMM/nccl/lib:$LORRAX_PM_RUNTIME_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 LORRAX_FFI_EXPECT_BACKENDS=cusolvermp,cufft,phdf5 \
 LORRAX_FFI_EXPECT_MPI="$LORRAX_PM_MPI_SONAME" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION=310 \

@@ -41,7 +41,6 @@ CUDNN_VERSION="9.12.0.46"            # nvidia-cudnn-cu13 (NERSC cuDNN targets CU
 CUSOLVERMP_VERSION="0.9.1.9318.post1" # also pinned in ../build_ffi_cuda.sh
 CUBLASMP_VERSION="0.10.0.3695"        # also pinned in ../build_ffi_cuda.sh
 MATHDX_VERSION="25.6.0"              # pyproject.toml [cuda13]; required on NVIDIA GPUs
-PHDF5_ROOT="/opt/cray/pe/hdf5-parallel/1.14.3.7/gnu/12.3"   # ../build_ffi_cuda.sh
 # shellcheck disable=SC1091
 source "$LORRAX_MODULE_DIR/../ffi_mpi.sh"
 

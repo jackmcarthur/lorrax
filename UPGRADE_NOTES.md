@@ -5,6 +5,40 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-13 — FFI bundle: the LU factors are a declared output; both legs carry RUNPATH $ORIGIN
+
+The fused distributed LU solves behind `linalg = distributed` (the W Dyson
+solve: cuSOLVERMp on CUDA, ScaLAPACK on CPU) now call new targets,
+`lorrax_cusolvermp_batched_solve_lu_factors` and
+`lorrax_scalapack_batched_solve_lu_factors`. They return the LU factors as a
+second output aliased to A. The old targets wrote the factors into A without
+declaring it, so a reader of A later in the same program, or the caller's
+own array, could see the factors. XLA now copies A only while something still
+reads it. On the P4 hsuite eqp is byte-identical in 10/10 files, and the
+release-cold wall is unchanged (327.8 s against 328.2 s on main; claim TBD).
+The ABI-6 targets stay in the libraries for older trees, and the handler ABI
+stays 6.
+
+A tree at or after this commit needs a bundle built from it. On an older
+bundle its distributed LU refuses at resolve, naming the missing target. On
+CPU meshes the ScaLAPACK backend imports again: since 8deacaeae
+`distrib_la._scalapack` imported a name `_slate` no longer defines, so every
+CPU distributed eigh and LU failed at import.
+
+Both legs now carry one search path, `$ORIGIN`, as a `DT_RUNPATH`, so the
+run environment's `LD_LIBRARY_PATH` decides every machine library.
+`config/perlmutter/ffi_mpi.sh` lists the pinned HDF5, cray-mpich and LibSci
+directories, and the module puts them ahead of `/opt/cray/pe/lib64`. With
+them, a GPU and a CPU process map the same files as with the previous bundle
+(claim TBD). Without the LibSci directory, a run refuses at load because it
+would map two MPI runtimes (claim TBD). A site module that loads this bundle
+must name these directories. `seal_bundle.py` refuses a leg whose search path
+is not one `$ORIGIN`-first `DT_RUNPATH`, and any bundled library that
+searches a relative, scratch or build directory.
+
+kconv_outer's build log now prints `store FAILED` when a cubin could not be
+written to the disk cache. No deck change.
+
 ## 2026-10-13 — the device budget can only lower; memory-driven routes print once and fall back
 
 - **Budget.** A `memory_per_device_gb` above the memory rule no longer raises

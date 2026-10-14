@@ -874,9 +874,9 @@ class Plan:
         from distrib_la._result_check import checked, matrix_sketch, rhs_sketch, solve_errors
 
         def safe(A, B, *, mesh, _phase="all", **kwargs):
-            # The sketch is taken before the call, which may consume A and B. The
-            # cuSOLVERMp LU writes its factors into A without declaring the alias,
-            # so the barrier keeps XLA from scheduling the sketch after the call.
+            # The sketch is taken before the call, which consumes A and B: the LU
+            # factors are an output aliased to A and X one aliased to B.  The
+            # barrier keeps XLA from scheduling the sketch after the call.
             sketch = (*matrix_sketch(A), *rhs_sketch(B))
             sketch, A, B = jax.lax.optimization_barrier((sketch, A, B))
             X = call(A, B, mesh=mesh, **kwargs)

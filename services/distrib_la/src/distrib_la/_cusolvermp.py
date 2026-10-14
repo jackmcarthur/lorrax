@@ -204,7 +204,7 @@ wrapper rejects p != q up front.
 _EIGH_TARGET = "lorrax_cusolvermp_eigh"
 _POTRF_TARGET = "lorrax_cusolvermp_batched_potrf"
 _POTRS_TARGET = "lorrax_cusolvermp_batched_potrs"
-_SOLVE_LU_TARGET = "lorrax_cusolvermp_batched_solve_lu"
+_SOLVE_LU_TARGET = "lorrax_cusolvermp_batched_solve_lu_factors"
 _GETRF_TARGET = "lorrax_cusolvermp_batched_getrf"
 _GETRS_TARGET = "lorrax_cusolvermp_batched_getrs"
 
@@ -972,6 +972,7 @@ def batched_distributed_solve_lu(
     jit_solve = _JIT_CACHE.get(key)
     if jit_solve is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
+        LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
         attrs = dict(nq=nq, n=n, nrhs=nrhs,
                      mb_a=mb_a, nb_a=nb_a, mb_b=mb_b, nb_b=nb_b,
                      ctx_key=int(ctx_key))
@@ -983,12 +984,12 @@ def batched_distributed_solve_lu(
         def _solve(local_A, local_B):
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
             local_B_T = jnp.transpose(local_B, (0, 2, 1))
-            # Single output X_T.  A is donated in-place (getrf scribbles
-            # LU factors into A's buffer); B → X aliasing makes getrs
-            # in-place on B.
-            X_T = jax.ffi.ffi_call(
-                _SOLVE_LU_TARGET, X_local_T,
-                input_output_aliases={1: 0},
+            # getrf and getrs work in place: the factors overwrite A and X
+            # overwrites B, both declared, so XLA copies an operand only
+            # while something still reads it.
+            X_T, _ = jax.ffi.ffi_call(
+                _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
+                input_output_aliases={0: 1, 1: 0},
             )(local_A_T, local_B_T, **attrs)
             return jnp.transpose(X_T, (0, 2, 1))
 

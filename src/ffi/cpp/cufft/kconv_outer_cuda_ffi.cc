@@ -311,7 +311,8 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int fma, std::string_v
                      img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, fma ? "fma" : "dmma",
                      cc_major, cc_minor, img.ms,
                      kThreads, minb, b.smem,
-                     path.empty() ? "not cached (no cubin_dir)" : (img.from_disk ? path.c_str() : "stored"));
+                     path.empty() ? "not cached (no cubin_dir)"
+                                  : (img.from_disk ? path.c_str() : (img.stored ? "stored" : "store FAILED")));
     }
     *out = &(g_cache[key] = b);
     return ffi::Error::Success();
@@ -864,7 +865,8 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
                      "in %.1f ms (8x8 tile, ping-pong 2 x 8 warps, 1 block/SM, smem=%d B of %d, cubin %s)\n",
                      img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, mb, conj_r, fma ? "fma" : "dmma",
                      vstage ? "staged" : "L2", cc_major, cc_minor, img.ms, b.smem, smem_optin,
-                     path.empty() ? "not cached (no cubin_dir)" : (img.from_disk ? path.c_str() : "stored"));
+                     path.empty() ? "not cached (no cubin_dir)"
+                                  : (img.from_disk ? path.c_str() : (img.stored ? "stored" : "store FAILED")));
     }
     *out = &(g_dcache[key] = b);
     return ffi::Error::Success();

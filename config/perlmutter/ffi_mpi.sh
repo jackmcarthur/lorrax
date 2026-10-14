@@ -1,6 +1,8 @@
 # shellcheck shell=bash
 # ============================================================================
-# The ONE MPI every Perlmutter FFI build links: sourced by BOTH legs.
+# The ONE MPI every Perlmutter FFI build links, with the LibSci and HDF5 built
+# against it, and the directories a run resolves them from: sourced by BOTH legs
+# and the module recipe (module/stack.sh).
 #   host leg: config/perlmutter/build_ffi_host.sh
 #   CUDA leg: config/perlmutter/build_ffi_cuda.sh
 #   SLATE:    src/ffi/cpp/stage/slate_build_perlmutter.sh (after PrgEnv-gnu)
@@ -29,6 +31,15 @@ LORRAX_PM_LIBSCI_MODULE="cray-libsci/25.09.0"
 LORRAX_PM_MPICH_ROOT="/opt/cray/pe/mpich/9.0.1/ofi/gnu/12.3"
 LORRAX_PM_MPI_LIBRARY="$LORRAX_PM_MPICH_ROOT/lib/libmpi_gnu_123.so"
 LORRAX_PM_MPI_SONAME="libmpi_gnu_123.so.12"
+LORRAX_PM_LIBSCI_ROOT="/opt/cray/pe/libsci/25.09.0/GNU/12.3/x86_64"
+LORRAX_PM_HDF5_MODULE="cray-hdf5-parallel/1.14.3.7"
+LORRAX_PM_HDF5_ROOT="/opt/cray/pe/hdf5-parallel/1.14.3.7/gnu/12.3"
+
+# The legs' only search path is $ORIGIN (a RUNPATH), so the run environment
+# names these directories, ahead of /opt/cray/pe/lib64, whose links point at
+# the site-default HDF5, LibSci and cray-mpich.  The module's LD_LIBRARY_PATH
+# (module/install_module.sh) and both legs' verify steps take this list.
+LORRAX_PM_RUNTIME_LIB_DIRS="$LORRAX_PM_HDF5_ROOT/lib:$LORRAX_PM_MPICH_ROOT/lib:$LORRAX_PM_LIBSCI_ROOT/lib"
 
 # Load the pinned MPI and unload darshan.  The Cray CC wrapper links the
 # loaded cray-mpich implicitly and injects libdarshan.so.0 whenever the darshan

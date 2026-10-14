@@ -173,15 +173,20 @@ that file only.
   from their wheels under `LORRAX_BUILD_PREFIX` (default `<clone>/.build`).
   It builds no SLATE, so `slate` on a CUDA mesh refuses when `distrib_la`
   resolves it.
-- **Library search path.** Each leg's search path is a `DT_RPATH`
-  (`--disable-new-dtags`), which the loader reads before `LD_LIBRARY_PATH`.
-  This matters twice: `cudatoolkit/13.2` puts the HPC SDK's cuSOLVERMp 0.8
-  and cuBLASMp 0.8 on `LD_LIBRARY_PATH` under the same SONAMEs as the staged
-  versions (found first, they fail the first distributed eigh with
-  `cusolverMpSyevd status=7`), and `/opt/cray/pe/lib64` maps
-  `libhdf5_parallel_gnu.so.310` to the site-default HDF5, which links the
-  site-default MPI. The pinned HDF5 and MPICH directories are therefore on
-  each leg's RPATH, and a run needs no `LD_LIBRARY_PATH`.
+- **Library search path.** Each leg's only search path is `$ORIGIN`, a
+  `DT_RUNPATH`, so the run environment decides every machine library.
+  `/opt/cray/pe/lib64` maps `libhdf5_parallel_gnu.so.310`, the LibSci
+  SONAMEs and `libmpi_gnu.so.12` to the site defaults, which link a second
+  MPI; `config/perlmutter/ffi_mpi.sh` therefore lists the pinned HDF5,
+  cray-mpich and LibSci directories (`LORRAX_PM_RUNTIME_LIB_DIRS`), and the
+  module puts them on `LD_LIBRARY_PATH` ahead of it, as both legs' verify
+  steps do. `cudatoolkit/13.2` also puts the HPC SDK's cuSOLVERMp 0.8 and
+  cuBLASMp 0.8 on `LD_LIBRARY_PATH` under the same SONAMEs as the staged
+  0.9.1 / 0.10 (found first, they fail the first distributed eigh with
+  `cusolverMpSyevd status=7`). A sealed bundle carries the staged pair
+  beside the legs and preloads it by exact path, so a run should use a
+  sealed pair; an unsealed build finds its private providers only on
+  `LD_LIBRARY_PATH`.
 - Build in a zero-GPU compute step
   ([the install page gives the `srun` line](perlmutter.md#build)).
 
@@ -249,7 +254,11 @@ python src/ffi/cpp/stage/seal_bundle.py \
 
 The sealer publishes a new directory (it refuses an existing one) holding
 both legs and the listed private libraries under `lib/`, and one
-`lorrax_ffi_bundle.json`. The manifest binds the pair, the handler ABI, the
+`lorrax_ffi_bundle.json`. It refuses a leg whose search path is not one
+`DT_RUNPATH` starting with `$ORIGIN`, and any library in the bundle that
+searches a relative directory, a scratch directory (`/pscratch`, `/tmp`,
+`$SCRATCH`, through symlinks too) or a build tree (`.build`, `build`,
+`build_host`, `CMakeFiles`, or the sealing checkout). The manifest binds the pair, the handler ABI, the
 full source revision, each file's size and SHA-256, each ELF SONAME and
 `DT_NEEDED` list, and the private closure in dependency-first order.
 

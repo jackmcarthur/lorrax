@@ -624,13 +624,15 @@ add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
 set_target_properties(lorrax_ffi PROPERTIES
     OUTPUT_NAME "lorrax_ffi"
     PREFIX "lib"
-    # $ORIGIN is first so an immutable staged bundle can carry only its
-    # private redistributable providers beside this file.  MPI, site HDF5,
-    # CUDA and NCCL remain runtime-owned and are NEVER copied there; the
-    # existing site/build paths below continue to serve legacy build trees.
+    # The search path is $ORIGIN alone, a DT_RUNPATH (--enable-new-dtags
+    # below).  A sealed bundle's private providers sit beside this file; MPI,
+    # site HDF5, CUDA and NCCL belong to the run environment, whose
+    # LD_LIBRARY_PATH a RUNPATH does not outrank, so a module can redirect
+    # them and no build or site directory is baked in.
     BUILD_WITH_INSTALL_RPATH ON
-    INSTALL_RPATH "$ORIGIN;${CUSOLVERMP_LIBDIR};${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64;/lorrax_phdf5/lib;/lorrax_slate/lib;${LORRAX_SLATE_INSTALL_DIR}/lib64"
+    INSTALL_RPATH "$ORIGIN"
 )
+target_link_options(lorrax_ffi PRIVATE "LINKER:--enable-new-dtags")
 
 # ----------------------------------------------------------------------------
 #  PRIVATE SYMBOLS — the fix for KNOWN_FAILURES L1 (cross-.so ODR).
@@ -830,7 +832,6 @@ message(STATUS "XLA FFI headers: ${LORRAX_XLA_FFI_INCLUDE_DIR}")
 
 set(LORRAX_FFI_HOST_SOURCES "")
 set(_host_link_libs "")
-set(_host_rpaths "")
 
 # ----------------------------------------------------------------------------
 # parallel-HDF5 + MPI (CUDA-free).  Same probe as the CUDA CMakeLists, minus
@@ -877,13 +878,6 @@ if(LORRAX_FFI_HAVE_PHDF5)
         phdf5/write_ffi.cc
     )
     list(APPEND _host_link_libs ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}")
-    get_filename_component(_hdf5_libdir "${HDF5_C_LIBRARY_hdf5}" DIRECTORY)
-    if(_hdf5_libdir)
-        list(APPEND _host_rpaths "${_hdf5_libdir}")
-    endif()
-    if(LORRAX_MPICH_LIB_DIR)
-        list(APPEND _host_rpaths "${LORRAX_MPICH_LIB_DIR}")
-    endif()
 endif()
 
 #  ===========================================================================
@@ -976,11 +970,10 @@ option(LORRAX_HOST_HAVE_SCALAPACK
        "Build the ScaLAPACK host handlers (distributed eigh + fused LU)" ON)
 
 # Accumulators.  Nothing is appended to LORRAX_FFI_HOST_SOURCES /
-# _host_link_libs / _host_rpaths in the RESOLVE half — the APPEND half
+# _host_link_libs in the RESOLVE half — the APPEND half
 # further down does that, in a fixed order, so the emitted link line is
 # independent of which optional pieces were found.
 set(_host_math_link   "")   # ScaLAPACK+BLACS+BLAS+OpenMP, in link order
-set(_host_math_rpaths "")   # directories the resolved libraries live in
 set(_mkl_incdir       "")   # MKL header dir, when MKL is the ScaLAPACK source
 set(_scalapack_on     0)
 set(_mklfft_on        0)
@@ -1067,7 +1060,6 @@ if(LORRAX_HOST_HAVE_SCALAPACK)
                 list(APPEND _host_math_link "-lgomp")
             endif()
             list(APPEND _host_math_link "-lpthread" "-lm" "-ldl")
-            list(APPEND _host_math_rpaths "${_mkl_libdir}")
             get_filename_component(_mkl_incdir
                                    "${_mkl_libdir}/../../include" ABSOLUTE)
             set(_scalapack_on 1)
@@ -1318,7 +1310,6 @@ endif()
 if(slate_FOUND)
     list(APPEND LORRAX_FFI_HOST_SOURCES slate/host_ffi.cc)
     list(APPEND _host_link_libs slate)
-    list(APPEND _host_rpaths "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64" "/lorrax_slate/lib")
 endif()
 if(_scalapack_on)
     list(APPEND LORRAX_FFI_HOST_SOURCES
@@ -1364,8 +1355,6 @@ if(_mklblas_on)
     # cblas_?gemm ride libmkl_intel_lp64, already on the math link line).
     if(_gemm_cblas_lib)
         list(APPEND _host_math_link "${_gemm_cblas_lib}")
-        get_filename_component(_gemm_cblas_libdir "${_gemm_cblas_lib}" DIRECTORY)
-        list(APPEND _host_math_rpaths "${_gemm_cblas_libdir}")
     endif()
     # gomp for the TU's omp_get_max_threads(); harmless duplicate when the
     # MKL branch already appended it via mkl_gnu_thread.
@@ -1382,7 +1371,6 @@ if(_mklblas_on)
         "at RUNTIME by dlsym and announced on first use — no "
         "build-time feature probe by design")
 endif()
-list(APPEND _host_rpaths ${_host_math_rpaths})
 list(APPEND _host_link_libs ${_host_math_link})
 
 list(APPEND LORRAX_FFI_HOST_SOURCES common/build_config.cc common/ctx_registry.cc)
@@ -1452,10 +1440,10 @@ set_target_properties(lorrax_ffi_host PROPERTIES
     OUTPUT_NAME "lorrax_ffi_host"
     PREFIX "lib"
     BUILD_WITH_INSTALL_RPATH ON
-    # Same $ORIGIN-first private-provider RPATH as the CUDA leg.  Keep every
-    # existing site path after it for unsealed developer builds.
-    INSTALL_RPATH "$ORIGIN;${_host_rpaths}"
+    # The same $ORIGIN-only RUNPATH as the CUDA leg.
+    INSTALL_RPATH "$ORIGIN"
 )
+target_link_options(lorrax_ffi_host PRIVATE "LINKER:--enable-new-dtags")
 
 # The XLA FFI headers are THIRD-PARTY (vendored with jaxlib) and are not
 # warning-clean under -Wall -Wextra; SYSTEM keeps their noise out of the

@@ -42,7 +42,8 @@ LD_DIRS=(
     "$SDK/math_libs/$CUDA_VER/lib64" "$SDK/comm_libs/$CUDA_VER/nccl/lib"
 )
 [[ -d "$COMPAT" ]] && LD_DIRS+=("$COMPAT")
-LD_DIRS+=("$PHDF5_ROOT/lib" "$LORRAX_PM_MPICH_ROOT/lib" "$(dirname "$FABRIC_LIB")" /opt/cray/pe/lib64)
+IFS=: read -ra PINNED_DIRS <<< "$LORRAX_PM_RUNTIME_LIB_DIRS"
+LD_DIRS+=("${PINNED_DIRS[@]}" "$(dirname "$FABRIC_LIB")" /opt/cray/pe/lib64)
 for d in "${LD_DIRS[@]}"; do [[ -d "$d" ]] || lorrax_module_die "missing library dir $d"; done
 LD_PATH="$(IFS=:; echo "${LD_DIRS[*]}")"
 PY_DIRS=("$ROOT/src")

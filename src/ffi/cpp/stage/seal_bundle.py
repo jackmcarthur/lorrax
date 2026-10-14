@@ -51,6 +51,10 @@ from lxkit import native_provider as _native  # noqa: E402
 
 MANIFEST = "lorrax_ffi_bundle.json"
 SCHEMA = 1
+# Search-path directories a published bundle may not name: purge-eligible
+# scratch, and the trees one build writes.
+_SCRATCH_ROOTS = ("/pscratch", "/scratch", "/tmp", "/var/tmp", "/dev/shm")
+_BUILD_PARTS = frozenset({".build", "build", "build_host", "CMakeFiles"})
 
 
 def _sha256(path: Path) -> str:
@@ -69,8 +73,9 @@ def _entry(path: Path, relative: Path) -> dict[str, object]:
     }
 
 
-def _elf_dynamic(path: Path) -> tuple[str, tuple[str, ...]]:
-    """Return the one SONAME and exact DT_NEEDED names of an ELF provider."""
+def _elf_dynamic(path: Path) -> tuple[str, tuple[str, ...], list[tuple[str, str]]]:
+    """Return the one SONAME, the exact DT_NEEDED names and the
+    (DT_RPATH | DT_RUNPATH, path list) entries of an ELF provider."""
     try:
         result = subprocess.run(
             ["readelf", "-d", str(path)], text=True,
@@ -87,7 +92,40 @@ def _elf_dynamic(path: Path) -> tuple[str, tuple[str, ...]]:
         raise RuntimeError(
             f"{path} must carry exactly one ELF SONAME; found {sonames or '<none>'}")
     needed = tuple(re.findall(r"\(NEEDED\).*?\[([^]]+)\]", result.stdout))
-    return sonames[0], needed
+    search = re.findall(r"\((RPATH|RUNPATH)\).*?\[([^]]*)\]", result.stdout)
+    return sonames[0], needed, search
+
+
+def _refuse_search_path(name: str, search: list[tuple[str, str]], *,
+                        root: Path, leg: bool) -> None:
+    """Refuse a search path a published bundle cannot carry.
+
+    Every library: no relative directory (it resolves against the working
+    directory), none under scratch (purge-eligible) and none inside a build
+    tree or the sealing checkout.  A leg: exactly one DT_RUNPATH, starting with
+    $ORIGIN, so its private providers come from the bundle and LD_LIBRARY_PATH
+    (the site module) outranks every other entry.
+    """
+    scratch = [Path(r) for r in (*_SCRATCH_ROOTS, *(os.environ.get(v, "")
+               for v in ("SCRATCH", "PSCRATCH", "TMPDIR"))) if r]
+    dirs = [d for _, entry in search for d in entry.split(":") if d]
+    for d in dirs:
+        if d.startswith(("$ORIGIN", "${ORIGIN}")):
+            continue
+        forms = {Path(d), Path(os.path.realpath(d))}
+        if (not Path(d).is_absolute()
+                or any(f.is_relative_to(s) for f in forms for s in scratch)
+                or any(_BUILD_PARTS & set(f.parts) or f.is_relative_to(root)
+                       for f in forms)):
+            raise RuntimeError(
+                f"{name} searches {d!r}: a relative, scratch or build directory "
+                "cannot ship in a bundle; link with $ORIGIN and leave the "
+                "machine libraries to the run environment's LD_LIBRARY_PATH")
+    if leg and ([tag for tag, _ in search] != ["RUNPATH"]
+                or dirs[:1] not in (["$ORIGIN"], ["${ORIGIN}"])):
+        raise RuntimeError(
+            f"{name} must carry one DT_RUNPATH that starts with $ORIGIN "
+            f"(--enable-new-dtags); it has {search or 'none'}")
 
 
 def _bundle_id(doc: dict[str, object]) -> str:
@@ -187,8 +225,10 @@ def seal(*, root: Path, cuda: Path, host: Path, output: Path,
     abi = _abi_from_header(root)
     _verified_build_identity(cuda, revision)
     _verified_build_identity(host, revision)
-    cuda_soname, cuda_needed = _elf_dynamic(cuda)
-    host_soname, host_needed = _elf_dynamic(host)
+    cuda_soname, cuda_needed, cuda_search = _elf_dynamic(cuda)
+    host_soname, host_needed, host_search = _elf_dynamic(host)
+    _refuse_search_path(cuda.name, cuda_search, root=root, leg=True)
+    _refuse_search_path(host.name, host_search, root=root, leg=True)
     if cuda_soname != cuda.name or host_soname != host.name:
         raise RuntimeError(
             "provider-leg SONAMEs must equal their canonical filenames: "
@@ -199,8 +239,9 @@ def seal(*, root: Path, cuda: Path, host: Path, output: Path,
     for candidate in private:
         item = _regular_input(candidate, "private library")
         _native.refuse_private_library(item, RuntimeError)
-        soname, needed = _elf_dynamic(item)
+        soname, needed, search = _elf_dynamic(item)
         _native.refuse_private_library(Path(soname), RuntimeError)
+        _refuse_search_path(soname, search, root=root, leg=False)
         if soname in names:
             raise RuntimeError(
                 f"duplicate bundle SONAME {soname!r}; one SONAME must have "

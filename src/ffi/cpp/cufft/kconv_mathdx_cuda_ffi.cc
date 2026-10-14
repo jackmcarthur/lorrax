@@ -124,9 +124,11 @@
 // version header that reads empty disables the disk cache for that build
 // rather than dropping out of the key.  The image is written to a unique
 // temporary and renamed (atomic on one filesystem, so concurrent ranks cannot
-// tear it) and re-hashed on read; a torn, foreign or non-ELF file, or one the
-// driver refuses to load, is deleted, recompiled once and replaced.  No
-// environment variable is read here.
+// tear it) and re-hashed on read.  A torn, foreign or non-ELF file is
+// recompiled and overwritten; one the driver refuses to load is deleted,
+// recompiled once and replaced.  The environment changes only the build log
+// here: LORRAX_DEBUG_PRINT turns it on, and the launcher's rank keeps it to
+// rank 0.
 
 #include <algorithm>
 #include <cstdint>

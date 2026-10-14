@@ -128,12 +128,18 @@ included (`common/nvrtc_build.h`).
 |---|---|---|---|
 | `cusolvermp_eigh` | `EighMpFfi`, `cusolvermp/eigh_ffi.cc` | `_cusolvermp.distributed_eigh` | `linalg = distributed` on CUDA |
 | `cusolvermp_batched_potrf`, `_potrs` | `CusolverMpBatched{Potrf,Potrs}Ffi`, `cusolvermp/batched_{potrf,potrs}_ffi.cc` | `batched_distributed_cholesky`, `_potrs` | an explicit `cholesky` request (the charge ζ factor is `rank_truncate`) |
-| `cusolvermp_batched_solve_lu`, `_getrf`, `_getrs` | `CusolverMpBatched{SolveLu,Getrf,Getrs}Ffi`, `cusolvermp/batched_solve_lu_ffi.cc` | `batched_distributed_solve_lu` | the W Dyson solve under `linalg = distributed` |
+| `cusolvermp_batched_solve_lu_factors`, `_getrf`, `_getrs` | `CusolverMpBatched{SolveLuFactors,Getrf,Getrs}Ffi`, `cusolvermp/batched_solve_lu_ffi.cc` | `batched_distributed_solve_lu` | the W Dyson solve under `linalg = distributed` |
 | `scalapack_eigh` | `ScalapackEighHostFfi`, `scalapack/eigh_ffi.cc` | `_scalapack.distributed_eigh` | `linalg = distributed` on cpu |
-| `scalapack_batched_solve_lu`, `_getrf`, `_getrs` | `ScalapackBatched{SolveLu,Getrf,Getrs}HostFfi`, `scalapack/{solve_lu,getrf_getrs}_ffi.cc` | `batched_distributed_solve_lu` | `solve_lu` distributed on cpu |
+| `scalapack_batched_solve_lu_factors`, `_getrf`, `_getrs` | `ScalapackBatched{SolveLuFactors,Getrf,Getrs}HostFfi`, `scalapack/{solve_lu,getrf_getrs}_ffi.cc` | `batched_distributed_solve_lu` | `solve_lu` distributed on cpu |
 | `slate_potrf`, `_batched_potrf`, `_batched_trsm` | `Slate*HostFfi`, `slate/host_ffi.cc` | `_slate.*` | an explicit `cholesky = slate` on cpu |
 | `slate_eigh` (host) | `SlateEighHostFfi`, `slate/host_ffi.cc` | — | always refused at resolve (SIGSEGV, bug L-2) |
 | `slate_*` (CUDA) | `slate/{eigh,potrf,trsm,batched_potrf,batched_trsm}_ffi.cc` | `_slate.*` | built only when a `gpu_backend=cuda` SLATE is found; the `lorrax_A` bundle has none |
+
+The fused LU solves return the factors as a second output that the caller
+aliases to A, so XLA sees the write. The ABI-6 targets
+`cusolvermp_batched_solve_lu` and `scalapack_batched_solve_lu`, which write
+the factors into A without declaring it, stay in the libraries for older
+trees and go at the next ABI bump.
 
 The ctypes C entry points: the cuSOLVERMp/NCCL grid context
 (`cusolvermp/c_api.cc`), the MPI mesh context SLATE and ScaLAPACK share
@@ -224,7 +230,14 @@ includes name the directory.
   cuFFT or NVRTC. The nvcc TUs compile for `CMAKE_CUDA_ARCHITECTURES`,
   default `80;86-real;89-real;90-real;100-real;120` (SASS for each, PTX for
   compute_80 and compute_120). `LORRAX_FFI_HAVE_CAL` is §4.
-* **Both legs.** `$ORIGIN` is first in `RPATH`. `exports_{cuda,host}.map`
+* **Both legs.** The only search path is `$ORIGIN`, a `DT_RUNPATH`
+  (`--enable-new-dtags`). A sealed bundle's private providers sit beside
+  the leg and are preloaded by exact path; MPI, site HDF5, LibSci, CUDA and
+  NCCL come from the run environment's `LD_LIBRARY_PATH`, which a `RUNPATH`
+  does not outrank, so a module can redirect them and no build or site
+  directory is baked in. `seal_bundle.py` refuses a leg whose search path
+  is not that, and any bundled library that searches a relative, scratch
+  or build directory. `exports_{cuda,host}.map`
   localise every LORRAX-owned symbol, and the host leg's C entry points carry
   a `_host` suffix (`cpp/common/c_abi.h`), so the two libraries define no
   LORRAX name in common when both are `dlopen`ed `RTLD_GLOBAL`. Each leg

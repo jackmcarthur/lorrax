@@ -164,7 +164,7 @@ _SPEC = {
     ("eigh", "scalapack"):      ("lorrax_scalapack_eigh",           ("cpu",)),
     ("cholesky", "cusolvermp"): ("lorrax_cusolvermp_batched_potrf", ("CUDA",)),
     ("cholesky", "slate"):      ("lorrax_slate_potrf",      ("CUDA", "cpu", "rocm")),
-    ("solve_lu", "cusolvermp"): (("lorrax_cusolvermp_batched_solve_lu",
+    ("solve_lu", "cusolvermp"): (("lorrax_cusolvermp_batched_solve_lu_factors",
                                     "lorrax_cusolvermp_batched_getrf",
                                     "lorrax_cusolvermp_batched_getrs"),
                                    ("CUDA",)),
@@ -173,7 +173,7 @@ _SPEC = {
     # split getrf/getrs pair the hoisted ζ factor stage requires.  All
     # three are probed — an old host .so without the pair refuses at
     # resolve time instead of dying mid-run inside the factor stage.
-    ("solve_lu", "scalapack"):  (("lorrax_scalapack_batched_solve_lu",
+    ("solve_lu", "scalapack"):  (("lorrax_scalapack_batched_solve_lu_factors",
                                   "lorrax_scalapack_batched_getrf",
                                   "lorrax_scalapack_batched_getrs"),
                                  ("cpu",)),

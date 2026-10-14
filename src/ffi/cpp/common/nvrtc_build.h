@@ -15,8 +15,8 @@
 //
 // Disk image: "LRXKCONV1\n" + 16 hex key + 16 hex payload hash + '\n' + cubin, written to a
 // unique temporary and renamed (atomic on one filesystem, so concurrent ranks cannot tear it),
-// re-hashed on read; a torn, foreign or non-ELF file, or one the driver refuses, is deleted,
-// recompiled once and replaced.
+// re-hashed on read.  A torn, foreign or non-ELF file is recompiled and overwritten; one the
+// driver refuses is deleted, recompiled once and replaced.
 #pragma once
 
 #include <cuda.h>

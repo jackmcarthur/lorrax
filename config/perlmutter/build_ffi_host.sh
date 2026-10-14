@@ -121,7 +121,7 @@ LORRAX_PM_PRGENV="${LORRAX_PM_PRGENV:-PrgEnv-gnu}"
 # shellcheck disable=SC1091
 source "$LORRAX_ROOT/config/perlmutter/ffi_mpi.sh"
 LORRAX_PM_LIBSCI="${LORRAX_PM_LIBSCI:-$LORRAX_PM_LIBSCI_MODULE}"
-LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-cray-hdf5-parallel/1.14.3.7}"
+LORRAX_PM_HDF5="${LORRAX_PM_HDF5:-$LORRAX_PM_HDF5_MODULE}"
 # cray-fftw supplies the FFT engine.  The flat-k handlers call the FFTW3
 # ADVANCED interface and resolve every entry point by RUNTIME dlsym, and the
 # library that defines them is brought in by a RUNTIME dlopen ladder
@@ -203,6 +203,12 @@ module unload cudatoolkit           2>/dev/null || true
 : "${CRAY_LIBSCI_PREFIX_DIR:?cray-libsci did not set CRAY_LIBSCI_PREFIX_DIR}"
 : "${CRAY_MPICH_DIR:?cray-mpich did not set CRAY_MPICH_DIR}"
 : "${HDF5_DIR:?cray-hdf5-parallel did not set HDF5_DIR}"
+# The run environment names these directories (ffi_mpi.sh), not this leg.
+[[ "$CRAY_LIBSCI_PREFIX_DIR" == "$LORRAX_PM_LIBSCI_ROOT" && "$HDF5_DIR" == "$LORRAX_PM_HDF5_ROOT" ]] || {
+    echo "[build_ffi_host] ERROR: LibSci $CRAY_LIBSCI_PREFIX_DIR / HDF5 $HDF5_DIR are not the" >&2
+    echo "[build_ffi_host]   run-time pins in config/perlmutter/ffi_mpi.sh; change that file." >&2
+    exit 2
+}
 
 # Capture the prefixes, THEN unload cray-libsci.
 #
@@ -333,10 +339,6 @@ FFTW_ARGS=()
 if [[ -n "$LORRAX_PM_FFTW_LIB" ]]; then
     FFTW_ARGS=(-DLORRAX_FFTW3_LIBRARY="$LORRAX_PM_FFTW_LIB")
 fi
-# The pinned HDF5's lib dir goes on the RPATH.  /opt/cray/pe/lib64 (the
-# ld.so.cache fallback) points libhdf5_parallel_gnu.so.310 at the site-default
-# HDF5, which links the site-default MPI, not the pinned one; without the
-# RPATH a process gets two MPIs unless LD_LIBRARY_PATH names the pinned HDF5.
 cmake "$SRC" \
     "${FFTW_ARGS[@]}" \
     -DLORRAX_FFI_PLATFORM=host \
@@ -350,8 +352,7 @@ cmake "$SRC" \
     -DLORRAX_MPI_INCLUDE_DIR="$LORRAX_PM_MPICH_DIR/include" \
     -DLORRAX_MPICH_LIB_DIR="$LORRAX_PM_MPICH_DIR/lib" \
     -DLORRAX_MPI_LIBRARY="$LORRAX_PM_MPI_LIBRARY" \
-    -DHDF5_ROOT="$LORRAX_PM_HDF5_DIR" \
-    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath,$LORRAX_PM_HDF5_DIR/lib"
+    -DHDF5_ROOT="$LORRAX_PM_HDF5_DIR"
 
 cmake --build . --parallel "${LORRAX_BUILD_JOBS:-8}"
 
@@ -504,7 +505,7 @@ LORRAX_FFI_EXPECT_BACKENDS="${LORRAX_FFI_EXPECT_BACKENDS:-scalapack,gemm,slate,p
 LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-$LORRAX_PM_MPI_SONAME}" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-$_stage_sov}" \
 LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
-LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:${LD_LIBRARY_PATH:-}" \
+LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:$LORRAX_PM_RUNTIME_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 LORRAX_GATE_FFTW_PY="${LORRAX_GATE_FFTW_PY:-$LORRAX_VENV_PY}" \
 GATE_TAG=build_ffi_host \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg host "$SO_FILE" || {
@@ -544,4 +545,4 @@ GATE_TAG=build_ffi_host \
 
 echo
 echo "[build_ffi_host] done.  .so at: $SO_FILE"
-echo "[build_ffi_host] the loader finds it here by default; its RUNPATH carries SLATE."
+echo "[build_ffi_host] unsealed, it finds SLATE only on LD_LIBRARY_PATH; seal_bundle.py makes the pair."

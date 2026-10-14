@@ -14,7 +14,7 @@ build.  Both ops need a SQUARE or 1-D ``('x','y')`` mesh (square descriptor
 blocks, one tile per rank).
 
 The SlateCtx lifecycle (``ensure_registered`` / ``get_or_init_context`` /
-``validate_mesh`` / ``_mesh_key``) is shared with the SLATE backend and
+``validate_mesh``) is shared with the SLATE backend and
 imported from :mod:`._slate`: the BLACS grid is built on the slate
 context's rank-remapped MPI comm.
 
@@ -31,8 +31,8 @@ from jax.sharding import Mesh, PartitionSpec as P
 
 from jax import shard_map
 from distrib_la._shape import ipiv_local_len
-from distrib_la._slate import (_mesh_key, ensure_registered,
-                               context_key, validate_mesh)
+from distrib_la._slate import ensure_registered, context_key, validate_mesh
+from distrib_la.resolve import mesh_key as _mesh_key
 
 __all__ = [
     "batched_distributed_eigh",
@@ -218,7 +218,7 @@ stride assert).  Host-only: on a GPU mesh use ``distributed_lu =
 cusolvermp`` instead.
 """
 
-_SOLVE_LU_TARGET = "lorrax_scalapack_batched_solve_lu"
+_SOLVE_LU_TARGET = "lorrax_scalapack_batched_solve_lu_factors"
 _GETRF_TARGET = "lorrax_scalapack_batched_getrf"
 _GETRS_TARGET = "lorrax_scalapack_batched_getrs"
 
@@ -439,6 +439,7 @@ def batched_distributed_solve_lu(
     jit_solve = _JIT_CACHE.get(key)
     if jit_solve is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
+        LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
         attrs = dict(nq=nq, n=n, nrhs=nrhs, g=g, nb_b=nb_b,
                      ctx_key=int(ctx_key))
 
@@ -451,9 +452,10 @@ def batched_distributed_solve_lu(
             # (same convention as every slate/cusolvermp wrapper).
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
             local_B_T = jnp.transpose(local_B, (0, 2, 1))
-            X_T = jax.ffi.ffi_call(
-                _SOLVE_LU_TARGET, X_local_T,
-                input_output_aliases={1: 0},
+            # The factors overwrite A and X overwrites B, both declared.
+            X_T, _ = jax.ffi.ffi_call(
+                _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
+                input_output_aliases={0: 1, 1: 0},
             )(local_A_T, local_B_T, **attrs)
             return jnp.transpose(X_T, (0, 2, 1))
 

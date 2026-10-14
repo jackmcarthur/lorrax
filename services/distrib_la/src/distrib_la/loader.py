@@ -116,7 +116,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cusolvermp_eigh":             "EighMpFfi",
     "lorrax_cusolvermp_batched_potrf":    "CusolverMpBatchedPotrfFfi",
     "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
-    "lorrax_cusolvermp_batched_solve_lu": "CusolverMpBatchedSolveLuFfi",
+    "lorrax_cusolvermp_batched_solve_lu_factors": "CusolverMpBatchedSolveLuFactorsFfi",
     "lorrax_cusolvermp_batched_getrf":    "CusolverMpBatchedGetrfFfi",
     "lorrax_cusolvermp_batched_getrs":    "CusolverMpBatchedGetrsFfi",
     "lorrax_slate_eigh":                  "SlateEighFfi",
@@ -138,7 +138,7 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_batched_potrf":           "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":            "SlateBatchedTrsmHostFfi",
     "lorrax_scalapack_eigh":                "ScalapackEighHostFfi",
-    "lorrax_scalapack_batched_solve_lu":    "ScalapackBatchedSolveLuHostFfi",
+    "lorrax_scalapack_batched_solve_lu_factors": "ScalapackBatchedSolveLuFactorsHostFfi",
     "lorrax_scalapack_batched_getrf":       "ScalapackBatchedGetrfHostFfi",
     "lorrax_scalapack_batched_getrs":       "ScalapackBatchedGetrsHostFfi",
 }

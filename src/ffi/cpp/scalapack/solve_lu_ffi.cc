@@ -20,10 +20,13 @@
 //                      Python wrapper → per-slice col-major local block.
 //   B : (Nq, N, NRHS)  same treatment.
 //   X : same layout as B; solved in place (wrapper aliases B → X).
+//   LU: same layout as A; the factors (wrapper aliases A → LU).  The ABI-6
+//       target has no LU output and writes the factors into A.
 // descA/descB use SQUARE blocks g = N / max(Px, Py) — pXgetrf requires
 // MB_A == NB_A, which restricts meshes to square or 1-D (the wrapper
 // validates; on those meshes block-cyclic == JAX's contiguous shards).
-// A is factored in place (donated by the wrapper); ipiv stays internal.
+// Both writes are declared outputs, so XLA copies A or B only while
+// something still reads it; ipiv stays internal.
 
 #include "../common/ctx_registry.h"
 #include <complex>
@@ -87,7 +90,7 @@ static ffi::Error SolveLuImpl(
     int64_t g, int64_t nb_b,
     SlateCtx* ctx,
     const T* A_in, const T* B_in,
-    T* A_scratch, T* X_out)
+    T* LU_out, T* X_out)
 {
     const int p = ctx->p;
     const int q = ctx->q;
@@ -133,10 +136,9 @@ static ffi::Error SolveLuImpl(
     }
 
     // In-place staging, same convention as the cusolvermp handler: A is
-    // factored in its (donated) input buffer; B copied to X unless the
-    // wrapper aliased them.
-    if (A_scratch != static_cast<const T*>(A_in)) {
-        std::memcpy(A_scratch, A_in, nq * A_slice * sizeof(T));
+    // copied to the factor output and B to X unless the wrapper aliased them.
+    if (LU_out != static_cast<const T*>(A_in)) {
+        std::memcpy(LU_out, A_in, nq * A_slice * sizeof(T));
     }
     if (X_out != static_cast<const T*>(B_in)) {
         std::memcpy(X_out, B_in, nq * B_slice * sizeof(T));
@@ -146,7 +148,7 @@ static ffi::Error SolveLuImpl(
     std::vector<int> ipiv(static_cast<size_t>(lld_a) + i_g);
 
     for (int64_t iq = 0; iq < nq; ++iq) {
-        T* A_slice_ptr = A_scratch + iq * A_slice;
+        T* A_slice_ptr = LU_out + iq * A_slice;
         T* X_slice_ptr = X_out + iq * B_slice;
 
         info = 0;
@@ -174,10 +176,11 @@ static ffi::Error SolveLuImpl(
     return ffi::Error::Success();
 }
 
-static ffi::Error SolveLuDispatch(
+static ffi::Error SolveLu(
     ffi::AnyBuffer A,
     ffi::AnyBuffer B,
     ffi::Result<ffi::AnyBuffer> X_out,
+    void* lu, ffi::DataType lu_type,
     int64_t nq, int64_t n, int64_t nrhs,
     int64_t g, int64_t nb_b,
     int64_t ctx_key)
@@ -197,9 +200,9 @@ static ffi::Error SolveLuDispatch(
     lorrax_ffi::scalapack::MklThreadScope mkl_scope(
         lorrax_ffi::scalapack::scalapack_mkl_threads());
     const auto dtype = A.element_type();
-    if (B.element_type() != dtype || X_out->element_type() != dtype) {
+    if (B.element_type() != dtype || X_out->element_type() != dtype || lu_type != dtype) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "scalapack.solve_lu: A, B, X must share dtype");
+                          "scalapack.solve_lu: A, B, X, LU must share dtype");
     }
     // PROVENANCE — same guard as the eigh handler.  The LU shims are not
     // bug L-2, but they carry the other two defects (hard-coded
@@ -218,15 +221,13 @@ static ffi::Error SolveLuDispatch(
             return ffi::Error(ffi::ErrorCode::kUnimplemented, refusal);
         }
     }
-    // A's buffer is donated — getrf factors in place (cast away const,
-    // same convention as the cusolvermp twin).
     switch (dtype) {
         case ffi::DataType::F64:
             return SolveLuImpl<double>(
                 nq, n, nrhs, g, nb_b, ctx,
                 static_cast<const double*>(A.untyped_data()),
                 static_cast<const double*>(B.untyped_data()),
-                const_cast<double*>(static_cast<const double*>(A.untyped_data())),
+                static_cast<double*>(lu),
                 static_cast<double*>(X_out->untyped_data()));
         case ffi::DataType::C128:
             using C128 = std::complex<double>;
@@ -234,7 +235,7 @@ static ffi::Error SolveLuDispatch(
                 nq, n, nrhs, g, nb_b, ctx,
                 static_cast<const C128*>(A.untyped_data()),
                 static_cast<const C128*>(B.untyped_data()),
-                const_cast<C128*>(static_cast<const C128*>(A.untyped_data())),
+                static_cast<C128*>(lu),
                 static_cast<C128*>(X_out->untyped_data()));
         default: {
             std::ostringstream os;
@@ -245,18 +246,52 @@ static ffi::Error SolveLuDispatch(
     }
 }
 
+static ffi::Error SolveLuFactorsDispatch(
+    ffi::AnyBuffer A, ffi::AnyBuffer B,
+    ffi::Result<ffi::AnyBuffer> X_out, ffi::Result<ffi::AnyBuffer> LU_out,
+    int64_t nq, int64_t n, int64_t nrhs, int64_t g, int64_t nb_b, int64_t ctx_key)
+{
+    return SolveLu(A, B, X_out, LU_out->untyped_data(), LU_out->element_type(),
+                   nq, n, nrhs, g, nb_b, ctx_key);
+}
+
+// The factors land in A, which this target does not declare as an output.
+static ffi::Error SolveLuDispatch(
+    ffi::AnyBuffer A, ffi::AnyBuffer B, ffi::Result<ffi::AnyBuffer> X_out,
+    int64_t nq, int64_t n, int64_t nrhs, int64_t g, int64_t nb_b, int64_t ctx_key)
+{
+    return SolveLu(A, B, X_out, A.untyped_data(), A.element_type(),
+                   nq, n, nrhs, g, nb_b, ctx_key);
+}
+
 }  // namespace lorrax_ffi::scalapack_solve_lu
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    ScalapackBatchedSolveLuHostFfi,
-    lorrax_ffi::scalapack_solve_lu::SolveLuDispatch,
+    ScalapackBatchedSolveLuFactorsHostFfi,
+    lorrax_ffi::scalapack_solve_lu::SolveLuFactorsDispatch,
     xla::ffi::Ffi::Bind()
-        .Arg<xla::ffi::AnyBuffer>()      // A (donated, LU factored in place)
+        .Arg<xla::ffi::AnyBuffer>()      // A
         .Arg<xla::ffi::AnyBuffer>()      // B
-        .Ret<xla::ffi::AnyBuffer>()      // X (aliased to B — in-place solve)
+        .Ret<xla::ffi::AnyBuffer>()      // X (aliased to B)
+        .Ret<xla::ffi::AnyBuffer>()      // LU factors (aliased to A)
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nrhs")
         .Attr<int64_t>("g")              // square block: N / max(Px, Py)
         .Attr<int64_t>("nb_b")           // B col block: NRHS/Py (or NRHS if Py==1)
         .Attr<int64_t>("ctx_key"));   // SlateCtx (shared with ffi.slate)
+
+// Replaced by lorrax_scalapack_batched_solve_lu_factors; kept for ABI-6 trees, deleted at the next ABI bump.
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    ScalapackBatchedSolveLuHostFfi,
+    lorrax_ffi::scalapack_solve_lu::SolveLuDispatch,
+    xla::ffi::Ffi::Bind()
+        .Arg<xla::ffi::AnyBuffer>()      // A (the factors overwrite it)
+        .Arg<xla::ffi::AnyBuffer>()      // B
+        .Ret<xla::ffi::AnyBuffer>()      // X (aliased to B)
+        .Attr<int64_t>("nq")
+        .Attr<int64_t>("n")
+        .Attr<int64_t>("nrhs")
+        .Attr<int64_t>("g")
+        .Attr<int64_t>("nb_b")
+        .Attr<int64_t>("ctx_key"));

@@ -33,14 +33,16 @@
 //                        to (NRHS/Py, N/Px) row-major ≡ col-major
 //                        (N/Px × NRHS/Py) per slice.
 //   X : same layout as B; written in place.
+//   LU: same layout as A; the factors, the second output.
 //
 // descA : (N, N) with mb=nb=N/Px=N/Py (caller passes mb_a, nb_a).
 // descB : (N, NRHS) with mb_b=N/Px (row block matches A), nb_b=NRHS/Py.
 //
-// A is overwritten with its LU factors in place (we don't need the
-// original A after the solve).  Callers should declare
-// `input_output_aliases={0: <out-index>}` on a jit surround if they
-// want XLA to donate A's buffer.  The pivot vector is allocated per
+// getrf and getrs work in place, so the caller of the _factors target aliases
+// A -> LU and B -> X (input_output_aliases={0: 1, 1: 0}).  Every write is then
+// a declared output: XLA copies an operand only while something still reads
+// it, and otherwise the factors reuse A's buffer.  The ABI-6 target has no LU
+// output and writes the factors into A.  The pivot vector is allocated per
 // call via cudaMalloc and freed before the ctx→xla
 // cross-stream event.  cuSOLVERMp requires LOCr(M_A) + MB_A pivot entries
 // per rank, including the extra block used by distributed row interchanges.
@@ -564,11 +566,12 @@ static ffi::Error BatchedGetrsDispatch(
     }
 }
 
-static ffi::Error BatchedSolveLuDispatch(
+static ffi::Error BatchedSolveLu(
     cudaStream_t stream,
     ffi::AnyBuffer A,
     ffi::AnyBuffer B,
     ffi::Result<ffi::AnyBuffer> X_out,
+    void* lu, ffi::DataType lu_type,
     int64_t nq, int64_t n, int64_t nrhs,
     int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b,
     int64_t ctx_key)
@@ -580,19 +583,17 @@ static ffi::Error BatchedSolveLuDispatch(
                           "batched_solve_lu: ctx_handle is null");
     }
     const auto dtype = A.element_type();
-    if (B.element_type() != dtype || X_out->element_type() != dtype) {
+    if (B.element_type() != dtype || X_out->element_type() != dtype || lu_type != dtype) {
         return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                          "batched_solve_lu: A, B, X_out must share dtype");
+                          "batched_solve_lu: A, B, X_out, LU_out must share dtype");
     }
-    // A's buffer is donated — getrf factors in place.  Cast away const
-    // to let the FFI write to it.
     switch (dtype) {
         case ffi::DataType::F64:
             return BatchedSolveLuImpl<double>(
                 nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, stream, ctx,
                 static_cast<const double*>(A.untyped_data()),
                 static_cast<const double*>(B.untyped_data()),
-                const_cast<double*>(static_cast<const double*>(A.untyped_data())),
+                static_cast<double*>(lu),
                 static_cast<double*>(X_out->untyped_data()));
         case ffi::DataType::C128:
             using C128 = std::complex<double>;
@@ -600,7 +601,7 @@ static ffi::Error BatchedSolveLuDispatch(
                 nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, stream, ctx,
                 static_cast<const C128*>(A.untyped_data()),
                 static_cast<const C128*>(B.untyped_data()),
-                const_cast<C128*>(static_cast<const C128*>(A.untyped_data())),
+                static_cast<C128*>(lu),
                 static_cast<C128*>(X_out->untyped_data()));
         default: {
             std::ostringstream os;
@@ -611,16 +612,56 @@ static ffi::Error BatchedSolveLuDispatch(
     }
 }
 
+static ffi::Error BatchedSolveLuFactorsDispatch(
+    cudaStream_t stream, ffi::AnyBuffer A, ffi::AnyBuffer B,
+    ffi::Result<ffi::AnyBuffer> X_out, ffi::Result<ffi::AnyBuffer> LU_out,
+    int64_t nq, int64_t n, int64_t nrhs,
+    int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b, int64_t ctx_key)
+{
+    return BatchedSolveLu(stream, A, B, X_out, LU_out->untyped_data(), LU_out->element_type(),
+                          nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, ctx_key);
+}
+
+// The factors land in A, which this target does not declare as an output.
+static ffi::Error BatchedSolveLuDispatch(
+    cudaStream_t stream, ffi::AnyBuffer A, ffi::AnyBuffer B,
+    ffi::Result<ffi::AnyBuffer> X_out,
+    int64_t nq, int64_t n, int64_t nrhs,
+    int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b, int64_t ctx_key)
+{
+    return BatchedSolveLu(stream, A, B, X_out, A.untyped_data(), A.element_type(),
+                          nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, ctx_key);
+}
+
 }  // namespace lorrax_ffi::cusolvermp_batched_solve_lu
 
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    CusolverMpBatchedSolveLuFactorsFfi,
+    lorrax_ffi::cusolvermp_batched_solve_lu::BatchedSolveLuFactorsDispatch,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()      // A
+        .Arg<xla::ffi::AnyBuffer>()      // B
+        .Ret<xla::ffi::AnyBuffer>()      // X (aliased to B)
+        .Ret<xla::ffi::AnyBuffer>()      // LU factors (aliased to A)
+        .Attr<int64_t>("nq")
+        .Attr<int64_t>("n")
+        .Attr<int64_t>("nrhs")
+        .Attr<int64_t>("mb_a")
+        .Attr<int64_t>("nb_a")
+        .Attr<int64_t>("mb_b")
+        .Attr<int64_t>("nb_b")
+        .Attr<int64_t>("ctx_key"));
+
+// Replaced by lorrax_cusolvermp_batched_solve_lu_factors; kept for ABI-6 trees, deleted at the next ABI bump.
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CusolverMpBatchedSolveLuFfi,
     lorrax_ffi::cusolvermp_batched_solve_lu::BatchedSolveLuDispatch,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
-        .Arg<xla::ffi::AnyBuffer>()      // A (donated, LU factored in place)
+        .Arg<xla::ffi::AnyBuffer>()      // A (the factors overwrite it)
         .Arg<xla::ffi::AnyBuffer>()      // B
-        .Ret<xla::ffi::AnyBuffer>()      // X (aliased to B — in-place solve)
+        .Ret<xla::ffi::AnyBuffer>()      // X (aliased to B)
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nrhs")
