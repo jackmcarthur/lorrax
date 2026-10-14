@@ -1557,6 +1557,7 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     stamps remain caller-owned until all files and the group have closed.
     """
     t0 = time.perf_counter()
+    stage_seconds={}
     augmentation=None
     if any(getattr(z,'local_augmentation',None) is not None for z in zetas):
         from isdf.atomic_breit import authenticate_group
@@ -1633,6 +1634,51 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
                     z.n_rmu_solve,st0.Q)(z.factor,rhs))
             local_state=augmentation['prepare'](tuple(coefficients))
             del coefficients
+    fourier_state=local_state
+    prepare_fourier=None if augmentation is None else augmentation.get('prepare_fourier_coefficients')
+    if callable(prepare_fourier):
+        caller_workspace=caller_host=0.
+        if st0.Q<mesh.size and mu%mesh.size==0:
+            from runtime.aot_memory import compiled_new_bytes
+            abstract=jax.ShapeDtypeStruct((st0.Q_pad,mu,st0.g_tile),jnp.complex128,
+                sharding=NamedSharding(mesh,P(_XY,None,None)))
+            packet=((abstract,)*3,(abstract,)*3)
+            local_args=(packet,)
+            if completion is not None:
+                local_args+=(jax.ShapeDtypeStruct((st0.Q_pad,len(pairs),st0.g_tile),jnp.complex128,
+                    sharding=NamedSharding(mesh,P(_XY,None,None))),)
+            module=step.lower((abstract,)*3,v_dev,ngk_dev,sl_dev,jnp.int32(0),V,S,*local_args).compile()
+            # Three smooth tiles, one Z read and six previous Fourier tiles.
+            # New Fourier/return storage is priced by the provider owner.
+            caller_workspace=10*abstract.size*16/mesh.size+compiled_new_bytes(module)
+            caller_workspace+=max(compiled_new_bytes(fn.lower(factor,abstract,v_dev[0],
+                ngk_dev,sl_dev,jnp.int32(0),*zero).compile())
+                for fn,factor,zero in zip(form,factors,stub))
+            if zeta_ios is not None:
+                from gw.augmentation_current import physical_current_writer_workspace
+                writer_price=physical_current_writer_workspace(q_logical=st0.Q,q_carrier=st0.Q_pad,
+                    mu_packed=mu,mu_canonical=getattr(z0.mu_basis,'n_canonical',mu),
+                    g_tile=st0.g_tile,shards=mesh.size)
+                writer=_to_mu_owner(mesh,st0.Q,'mu')
+                transport=compiled_new_bytes(writer.lower(abstract).compile())
+                caller_host=writer_price['host_pending']
+                if z0.mu_basis is not None:
+                    mu_tile=jax.ShapeDtypeStruct((st0.Q,mu,st0.g_tile),jnp.complex128,
+                        sharding=NamedSharding(mesh,P(None,_XY,None)))
+                    unpack=jax.jit(lambda tile:z0.mu_basis.unpack_axis(tile,1,spec=P(None,_XY,None)))
+                    transport+=compiled_new_bytes(unpack.lower(mu_tile).compile())
+                # The pair AOT already counts the three emitted physical
+                # outputs. The canonical writer owner additionally prices
+                # transport/SlabIO staging, including the one pending host row.
+                caller_workspace+=max(transport,5*writer_price['canonical_transport_tile'])
+            jax.block_until_ready((local_state,V,S,v_dev,ngk_dev,sl_dev))
+        fourier_state=prepare_fourier(local_state,caller_workspace_bytes=float(caller_workspace),
+                                      caller_host_bytes=float(caller_host))
+        if jax.process_index()==0:
+            print_fn('  current Fourier distribution: '+str(augmentation['fourier_distribution_receipt']))
+    jax.block_until_ready((fourier_state,V,S))
+    stage_seconds['prepare_and_layout']=time.perf_counter()-t0
+    loop_started=time.perf_counter()
     v_form = v_dev[0]                  # unread by the ζ-forming half
     # No look-ahead: each Z tile is read just before its ζ is formed and
     # dropped after, so a G tile holds one Z tile and the ζ tiles — the six
@@ -1648,7 +1694,7 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
             del Zt
         local_tiles=()
         if augmentation is not None:
-            tiles=augmentation['fourier_tile'](t,local_state)
+            tiles=augmentation['fourier_tile'](t,fourier_state)
             if (not isinstance(tiles,tuple) or len(tiles)!=2
                     or any(not isinstance(part,tuple) or len(part)!=3 for part in tiles)):
                 raise ValueError("grouped static provider must return three delta and compensation tiles")
@@ -1670,6 +1716,11 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
             del physical
         del result
         del zt
+    jax.block_until_ready((V,S))
+    stage_seconds['G_loop_body_and_writer']=time.perf_counter()-loop_started
+    # Release only the extra Fourier layout, before the existing onsite phase.
+    del fourier_state
+    onsite_started=time.perf_counter()
     face_onsite=(augmentation is not None and st0.Q<mesh.size
                  and callable(augmentation.get('onsite_face')))
     if face_onsite:
@@ -1700,6 +1751,9 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
         for tile in correction:
             _require_q_owned(tile,mesh,(st0.Q_pad,mu,mu),name='grouped current onsite correction')
         V=tuple(add(value,tile) for value,tile in zip(V,correction))
+    jax.block_until_ready(V)
+    stage_seconds['onsite']=time.perf_counter()-onsite_started
+    finish_started=time.perf_counter()
     out = []
     for Vp in V:
         if not face_onsite:
@@ -1709,6 +1763,9 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
         Sa = _finish_shell(mesh, st0.Q)(Sa)
         z.shell = z0.mu_basis.unpack_axis(Sa, 1) if z0.mu_basis is not None else Sa
         z.shell_slots = keep
+    jax.block_until_ready((out,tuple(z.shell for z in zetas)))
+    stage_seconds['finish']=time.perf_counter()-finish_started
+    for z in zetas:z.current_stage_seconds=dict(stage_seconds)
     receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, "
                f"{st0.n_Gt} G tiles, q-local, "
                f"{time.perf_counter() - t0:.2f}s (store read "
@@ -1716,6 +1773,7 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
                f"{'physical ζ family written' if zeta_ios is not None else 'no ζ file'}")
     if jax.process_index() == 0:
         print_fn(receipt)
+        print_fn('  current V stage seconds: '+str(stage_seconds))
     return out
 
 

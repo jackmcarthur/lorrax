@@ -492,10 +492,11 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
     def fourier_local(coefficients,moment_coefficients,bessel,angle,g_radial,degree_rows):
         outputs=[];compensations=[]
         for c in range(3):
-            values=coefficients[c][0] if separate_halves else coefficients[c]
-            shaped=None if compensated else values.reshape(values.shape[0],mu,na,nh,nr)
-            qm=moment_coefficients[c].reshape(values.shape[0],mu,na,nh,2)
-            zero=jnp.zeros((values.shape[0],mu,gt),jnp.complex128)
+            values=coefficients[c]
+            local_mu=values.shape[1]
+            shaped=None if compensated else values.reshape(values.shape[0],local_mu,na,nh,nr)
+            qm=moment_coefficients[c].reshape(values.shape[0],local_mu,na,nh,2)
+            zero=jnp.zeros((values.shape[0],local_mu,gt),jnp.complex128)
             def add(acc,step):
                 atom,h=step//nh,step%nh;lrow=degree_rows[h]
                 source=(values[:,:,step*nr+jnp.arange(nr)] if compensated else shaped[:,:,atom,h])
@@ -506,10 +507,106 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             d,g=jax.lax.scan(add,(zero,zero),jnp.arange(na*nh),unroll=1)[0]
             outputs.append(d);compensations.append(g)
         return tuple(outputs),tuple(compensations)
-    fourier_kernel=jax.jit(shard_map(fourier_local,mesh=mesh,
+    def fourier_q_local(coefficients,*args):
+        values=tuple(v[0] for v in coefficients) if separate_halves else coefficients
+        return fourier_local(values,*args)
+
+    fourier_kernel=jax.jit(shard_map(fourier_q_local,mesh=mesh,
         in_specs=(coefficient_specs,(qspec,)*3,P(XY,None,None,None),
                   P(XY,None,None,None),P(XY,None,None,None),P()),
         out_specs=((qspec,)*3,(qspec,)*3),check_vma=False))
+
+    mu_spec=P(None,XY,None)
+    mu_sharding=NamedSharding(mesh,mu_spec)
+    mu_fourier_kernel=jax.jit(shard_map(fourier_local,mesh=mesh,
+        in_specs=((mu_spec,)*3,(mu_spec,)*3,P(),P(),P(),P()),
+        out_specs=((mu_spec,)*3,(mu_spec,)*3),check_vma=False))
+    distribution_receipt=dict(mode='q',reason='direct q-owned Fourier input')
+
+    def prepare_fourier_coefficients(state,*,caller_workspace_bytes=0.,caller_host_bytes=0.):
+        """Move independent Fourier rows once, retaining all onsite operands.
+
+        Solved q banks and the support witness retain their existing lifetime.
+        The optional mu layout is admitted on every rank before allocation,
+        using the maximum of sequential transpose/Fourier/return phases.
+        """
+        from common.collectives import all_gather_processes
+        from common.gpu_utils import device_budget_bytes,host_bytes_per_process,record_stage_price
+        from runtime.aot_memory import aot_kernel_peak_bytes
+        from isdf.zeta_mubatch import _to_mu_owner,_rows_to_q_local
+        if any(not np.isfinite(v) or v<0 for v in (caller_workspace_bytes,caller_host_bytes)):
+            raise ValueError('current Fourier caller workspace must be finite and nonnegative')
+        if Q>=mesh.size or mu%mesh.size:
+            distribution_receipt.update(mode='q',reason='q ownership covers the mesh')
+            return state
+        coefficients=tuple(v[0] if separate_halves else v for v in state['coefficients'])
+        operands=coefficients+state['moments']
+        for value in operands:
+            _require_q_owned(value,mesh,value.shape,name='current Fourier source')
+        to_mu=_to_mu_owner(mesh,Q,'mu')
+        to_q=_rows_to_q_local(mesh,mesh.size,1,mu//mesh.size,mu,st.q_axis)
+        abstract=lambda shape,sharding,dtype=jnp.complex128:jax.ShapeDtypeStruct(shape,dtype,sharding=sharding)
+        mu_operands=tuple(abstract((Q,mu,v.shape[-1]),mu_sharding) for v in operands)
+        rep=NamedSharding(mesh,P())
+        geometry=(abstract((Q,len(radial['degrees']),gt,nr),rep,jnp.float64),
+                  abstract((Q,na,nh,gt),rep),
+                  abstract((Q,len(radial['degrees']),2,gt),rep,jnp.float64))
+        quotes=[]
+        def quote(name,fn,args):
+            compiled=fn.lower(*args).compile()
+            peak=aot_kernel_peak_bytes(compiled)
+            hlo=compiled.as_text().lower()
+            result=dict(owner=name,total=peak.total,resident_increment=peak.resident_increment,
+                collective_counts={name:hlo.count(name+'(') for name in
+                                   ('all-gather','all-to-all','all-reduce')})
+            quotes.append(result)
+            return peak
+        mu_bytes=[v.size*v.dtype.itemsize/mesh.size for v in mu_operands]
+        retained=0.;conversion=0.
+        for index,value in enumerate(operands):
+            peak=quote('coefficient_q_to_mu' if index<3 else 'moment_q_to_mu',to_mu,(value,))
+            conversion=max(conversion,retained+peak.resident_increment)
+            retained+=mu_bytes[index]
+        ft=quote('mu_Fourier',mu_fourier_kernel,(mu_operands[:3],mu_operands[3:],*geometry,rows))
+        tile=abstract((Q,mu,gt),mu_sharding)
+        back=quote('Fourier_mu_to_q',to_q,(tile,))
+        geometry_bytes=sum(v.size*v.dtype.itemsize for v in geometry)
+        mu_tile_bytes=Q*mu*gt*16/mesh.size
+        q_tile_bytes=Qp*mu*gt*16/mesh.size
+        # ft.total already contains the mu banks and geometry. Return copies
+        # are sequential and fenced; five completed q tiles precede the sixth.
+        fourier=ft.total-rows.size*rows.dtype.itemsize+caller_workspace_bytes
+        returns=retained+geometry_bytes+6*mu_tile_bytes+5*q_tile_bytes+back.resident_increment+caller_workspace_bytes
+        # Onsite runs after dropping the Fourier-only bank, so it has the
+        # original measured live set and original owner/capacity proof.
+        bessel_bytes=geometry[0].size*8;angle_bytes=geometry[1].size*16
+        host_future=5*bessel_bytes+4*angle_bytes+Q*gt*(3*8+len(radial['degrees'])*2*8+8*8)+caller_host_bytes
+        jax.block_until_ready(state)
+        stats=[device.memory_stats() or {} for device in mesh.local_devices]
+        measured=all('bytes_in_use' in value for value in stats)
+        live_bytes=max((value.get('bytes_in_use',0) for value in stats),default=0)
+        phase_peaks=dict(q_to_mu=live_bytes+conversion,
+            Fourier=live_bytes+fourier,mu_to_q=live_bytes+returns)
+        planned=max(phase_peaks.values())
+        admission=np.asarray(all_gather_processes(np.asarray([int(measured),planned,
+            device_budget_bytes(),host_future,host_bytes_per_process(fraction=.7)],np.float64)))
+        accepted=(np.all(admission[:,0]==1) and np.all(admission[:,1]<=admission[:,2])
+                  and np.all(admission[:,3]<=admission[:,4]))
+        distribution_receipt.update(mode='mu' if accepted else 'q',
+            reason='small q domain' if accepted else 'extra layout capacity not admitted',
+            actual_live_baseline=live_bytes,measured_live_baseline=measured,
+            planned_bytes_per_rank=float(np.max(admission[:,1])),phase_peaks=phase_peaks,
+            mu_bank_bytes_per_rank=retained,future_host_bytes=host_future,actual_AOT=quotes,
+            logical_q=Q,packed_mu=mu,solved_q_banks_retained=True,
+            caller_workspace_bytes=float(caller_workspace_bytes))
+        if not accepted:return state
+        record_stage_price('isdf.current_mu_Fourier',float(np.max(admission[:,1])))
+        prepared=[]
+        for value in operands:
+            moved=to_mu(value)
+            moved.block_until_ready()
+            prepared.append(moved)
+        return dict(coefficients=tuple(prepared[:3]),moments=tuple(prepared[3:]),fourier_mu=True)
 
     def coupled_field(values,c,atom,m0,modes_,radial_width,hrows_,spin_weights_,feature_offset=0):
         # Same sparse Cartesian/VSH projection for both onsite layouts.
@@ -734,10 +831,26 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             Y=np.stack([4*np.pi*(-1j)**int(l)*sph_harm_y(l,m,theta,phi) for l,m in labels],axis=1)
             phase=np.exp(-1j*np.einsum('bgi,ai->bag',vec,centers))
             return phase[:,:,None]*Y[:,None]*valid[:,None,None]*fourier_scale
-        result=fourier_kernel(state['coefficients'],state['moments'],
-            put_q_rows(source_rows,(len(radial['degrees']),gt,nr)),
-            put_q_rows(angle_rows,(na,nh,gt)),
-            put_q_rows(comp_rows,(len(radial['degrees']),2,gt)),rows)
+        mu_layout=state.get('fourier_mu',False)
+        coefficients=state['coefficients']
+        def place(builder,tail):
+            return put(builder(slice(0,Q))) if mu_layout else put_q_rows(builder,tail)
+        result=(mu_fourier_kernel if mu_layout else fourier_kernel)(coefficients,state['moments'],
+            place(source_rows,(len(radial['degrees']),gt,nr)),
+            place(angle_rows,(na,nh,gt)),
+            place(comp_rows,(len(radial['degrees']),2,gt)),rows)
+        if mu_layout:
+            from isdf.zeta_mubatch import _rows_to_q_local
+            to_q=_rows_to_q_local(mesh,mesh.size,1,mu//mesh.size,mu,st.q_axis)
+            returned=[]
+            for part in result:
+                output=[]
+                for tile in part:
+                    value=to_q(tile)
+                    value.block_until_ready()
+                    output.append(value)
+                returned.append(tuple(output))
+            result=tuple(returned)
         if slab and np.any(active[:,first:first+gt]&(norm[:,first:first+gt]**2<=CURRENT_GAMMA_K2_EPS)):
             from common.collectives import gather_to_host
             def head_rows(qslice):
@@ -850,6 +963,8 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
     bundle=dict(kernel=SLAB_STATIC_KERNEL if slab else STATIC_KERNEL,geometry_sha256=digest.hexdigest(),
         zeta_identity=tuple(id(z) for z in zetas),prepare=prepare,
         fourier_tile=fourier_tile,onsite=onsite,authenticate_kernel=authenticate_kernel,
+        prepare_fourier_coefficients=prepare_fourier_coefficients,
+        fourier_distribution_receipt=distribution_receipt,mu_fourier_kernel=mu_fourier_kernel,
         reciprocal_prefactor=k0,local_geometry_scale=onsite_scale,current_basis_rows=B,
         body_metric=body_metric,local_cross_policy=('onsite_smooth_neutral' if compensated
                                                    else 'mixed_reciprocal'),

@@ -613,8 +613,16 @@ the owner of \(C\) and its factor. `isdf.local_rhs` forms the rectangular local
 normal equation using the same four Dirac-half contractions and typed symmetry
 transport as the ordinary Gram. `isdf.augmentation` owns the radial Poisson and
 mixed-metric equations; `isdf.atomic_coulomb` supplies streamed radial callbacks
-to `ZetaG.contract_v`. Tables are small host precomputations. Coefficients,
-Fourier tiles and the Coulomb accumulator retain their q-owner sharding.
+to `ZetaG.contract_v`. Tables are host precomputations. Normal-equation solves
+and Coulomb accumulation use q ownership. For fewer logical q rows than
+processors, independent Fourier centroid rows can move over the full mesh;
+each bounded Fourier packet returns to its q owner before contraction.
+Actual compiled phase peaks, the live device baseline and host geometry
+staging jointly admit this placement. The current provider retains its solved
+q banks for the original final onsite completion; only the Fourier copy is
+released before that phase. The charge provider may instead consume its
+solved q bank after fencing its onsite and periodic-moment results. Both
+placements preserve the radial equations and body-then-onsite addition order.
 
 Normalized atomic radial caches are immutable, optional prepared artifacts.
 Their loader binds atomic payload and metadata, quadrature and support controls,

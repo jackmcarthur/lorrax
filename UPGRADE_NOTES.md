@@ -2229,3 +2229,14 @@ q owner. Actual compiled memory and live capacity are checked before the
 extra bank; a declined layout retains the existing q distribution. No input
 change is needed. This changes execution placement, with no performance or
 material accuracy claim before matched verification.
+
+## Unreleased — balance small-q current Fourier rows over centroids
+
+When fewer current q rows than processors are active, the grouped atomic
+Fourier transform can distribute independent centroid rows over the mesh.
+The same three OWN factors, radial transforms, Slab completion and physical
+writer are used; bounded Fourier packets return to their original q owners.
+The solved q banks retain their existing onsite lifetime and body-then-onsite
+addition order. Actual compiled/live device capacity and host geometry
+staging are agreed across ranks before the extra layout is allocated; a
+declined layout keeps q ownership. No input change is needed.
