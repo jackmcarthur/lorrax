@@ -1,0 +1,34 @@
+# What Perlmutter provides and requires. runtime.network_env reads this file
+# when LORRAX_SITE_PROFILE or NERSC_HOST is "perlmutter" and owns when it
+# applies.
+
+# A multi-node CUDA step.
+[nccl]
+# The Slurm network option srun must create the step with: in a step with a
+# VNI, MPI-IO and NCCL's OFI initialization fail together and NCCL runs over
+# TCP sockets.
+step_network = "no_vni"
+
+# The settings of the site module nccl/2.29.2-cu13 (`module show`), filled in
+# where the caller has not exported them. FI_CXI_RDZV_THRESHOLD=0, set by every
+# NERSC NCCL module since 2.18, prevents the cross-node send/recv deadlock.
+[nccl.env]
+NCCL_NET = "AWS Libfabric"
+NCCL_NET_PLUGIN = "/global/common/software/nersc9/nccl/2.29.2-cu13/plugin/lib/libnccl-net.so"
+NCCL_NET_GDR_LEVEL = "PHB"
+FI_CXI_DISABLE_HOST_REGISTER = "1"
+FI_CXI_RDZV_THRESHOLD = "0"
+NCCL_CROSS_NIC = "2"
+NCCL_SOCKET_IFNAME = "hsn"
+
+# The collective cost model gw.comm_model prices receipts with, fitted by
+# tools/comm_model_bench.py: T = alpha0 + alpha_peer * n_peers + V / beta.
+# t_dispatch_s is one synced jitted call, host to host; t_scan_step_s is one
+# lax.scan step with no collective.
+[comm_model]
+alpha0_s = 31.6e-6
+alpha_peer_s = 2.74e-6
+beta_Bps = 19.7e9
+t_dispatch_s = 72e-6
+t_scan_step_s = 5.4e-6
+measured = "P16 (4 nodes x 4 A100-80GB), NCCL over OFI/cxi with FI_CXI_RDZV_THRESHOLD=0; all_to_all 1 KB-1 GB, model/measured 0.70-1.16"

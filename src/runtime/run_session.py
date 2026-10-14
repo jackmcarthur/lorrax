@@ -12,11 +12,11 @@ that sequence, written once::
         ...physics, reporting through run.report...
         run.complete(files=[("mean-field matrices", "written", out_path)])
 
-A launcher whose P tasks each joined a one-process world refuses before the
-report opens (:func:`refuse_split_launch`).  A refusal raised inside the
-``with`` block still closes the report: the stage
-table printed so far, the retained warnings and the line ``LORRAX ...
-REFUSED (<ExceptionType>: GATE <id>)``.  The exception then propagates to
+A launcher whose P tasks would each form a one-process world refuses at
+startup (``runtime.init_jax_distributed``).  A refusal raised inside the
+``with`` block still closes the report: the stage table printed so far, the
+retained warnings and the line ``LORRAX ... REFUSED (<ExceptionType>: GATE
+<id>)``.  The exception then propagates to
 ``runtime.run_main_and_finalize`` unchanged.
 
 The report class is the driver's; this module imports none (it is L3 and a
@@ -43,7 +43,7 @@ import time
 import common.timing as timing
 from runtime.production_stream import ProductionStdout
 
-__all__ = ["RunSession", "published_artifacts", "refuse_split_launch"]
+__all__ = ["RunSession", "published_artifacts"]
 
 #: The row this module prepends to a declared stage table.
 RUNTIME_ROW = "runtime + imports"
@@ -68,27 +68,6 @@ def _record_pre_main(runtime, prefix: str, pre_main: float | None) -> None:
             timing.record(f"{prefix}.runtime_stack.{phase}", float(seconds))
     timing.record(f"{prefix}.imports",
                   max(pre_main - float(phases.get("total", 0.0)), 0.0))
-
-
-def refuse_split_launch(runtime) -> None:
-    """Refuse a launcher's P tasks that each joined a one-process world.
-
-    Then there is no world to partition over: every task computes the whole
-    result, believes it is rank 0, and overwrites the same output file.
-    Compared before any input or report file is opened.
-    """
-    from runtime import _resolve_proc_count
-
-    advertised = _resolve_proc_count()
-    world = int(runtime.process_count)
-    if advertised > 1 and world <= 1:
-        raise SystemExit(
-            f"the launcher advertises {advertised} tasks (SLURM_NTASKS / "
-            f"JAX_PROCESS_COUNT) but jax.distributed joined a world of "
-            f"{world}.  Every task would redo the whole calculation and "
-            f"overwrite the same output file.  Fix the distributed launch "
-            f"(JAX_COORDINATOR_ADDRESS must be reachable from every "
-            f"task) or run `-n 1`.")
 
 
 def published_artifacts(rows, *, print_fn) -> bool:
@@ -148,7 +127,6 @@ class RunSession:
     def __enter__(self) -> "RunSession":
         from runtime import debug_print_enabled, rank0_print
 
-        refuse_split_launch(self.runtime)
         self._t_main = time.perf_counter()
         self._pre_main = timing.process_elapsed_s()
         timing.reset()

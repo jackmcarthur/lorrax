@@ -368,7 +368,7 @@ Level L2: none of these modules knows what a band or a k point is.
 | `cli_seam.py` | Answers `--help` and refuses bad arguments before the runtime starts. |
 | `env_flags.py` | The boolean environment-variable grammar. |
 | `jax_support.py` | Refuses a JAX stack outside the supported series. |
-| `network_env.py` | Site network defaults set before JAX and NCCL start. |
+| `network_env.py` | Launch topology, Slurm host lists and the site profile (`config/<site>/site.toml`) applied before JAX and NCCL start. |
 | `padding.py` | Mesh-padded axes: logical-to-carrier receipts, zero padding, masks ([padding](architecture/padding.md)). |
 | `pjrt_log_filter.py` | Removes known benign runtime notices from stderr. |
 | `production_stream.py` | One production stdout stream per driver invocation. |

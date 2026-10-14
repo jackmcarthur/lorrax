@@ -4,11 +4,12 @@ Measure (one rank per GPU, square mesh, every rank):
     lx run -N 4 -G 4 -n 16 -- python3 tools/comm_model_bench.py > bench.log
 Fit (no JAX; any host):
     python3 tools/comm_model_bench.py --fit bench.log [more.log ...]
-then store the printed row in ``gw.comm_model.MACHINES`` with the machine,
-date and pool.  Collectives are emitted as LORRAX emits them: shard_map over
-('x','y'), ``lax.all_to_all(tiled=True)`` / ``all_gather(tiled=True)``, n
-steps of one ``lax.scan`` in one jit.  Only the peer count varies (all mesh
-ranks, then one mesh axis); nothing is topology-aware.  Env: SIZES_MB
+then store the printed row in the site profile's ``[comm_model]`` table
+(``config/<site>/site.toml``).  Collectives are emitted as LORRAX emits
+them: shard_map over ('x','y'), ``lax.all_to_all(tiled=True)`` /
+``all_gather(tiled=True)``, n steps of one ``lax.scan`` in one jit.  Only
+the peer count varies (all mesh ranks, then one mesh axis); nothing is
+topology-aware.  Env: SIZES_MB
 (default 1,16,128,1024 per rank).
 """
 import json

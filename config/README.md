@@ -101,14 +101,25 @@ lx run --cpu -N 1 -n 1 -- "$LORRAX_CHECKOUT/config/perlmutter/build_mpiwrapper.s
 For the complete CPU rank prelude and validated geometry, follow
 [`docs/environment/machines/perlmutter.md`](../docs/environment/machines/perlmutter.md).
 
+## Site profile
+
+`config/<site>/site.toml` states what a site provides to a running job: the
+Slurm network option a multi-node step needs, the site NCCL module's
+settings, and the measured collective cost model. `runtime.network_env` reads
+it before NCCL starts and owns the policy: when each table applies, what a
+caller's export overrides, and what refuses
+([network transport at startup](../docs/environment/machines/perlmutter.md#network-transport-at-startup)).
+The profile is selected by `LORRAX_SITE_PROFILE`, else `NERSC_HOST`.
+
 ## Ownership and portability
 
 - `config/perlmutter/site_config.sh` owns Perlmutter paths and vendor stack.
+- `config/perlmutter/site.toml` owns Perlmutter's run-time network values.
 - `docs/architecture/ffi_layout.md` owns native binding and ABI design.
 - `docs/reference/env_vars.md` owns runtime environment variables.
 - `docs/environment/machines/perlmutter.md` owns launch geometry and current
   machine verification.
 
 For another Shifter site, copy the Perlmutter config directory and replace
-only the site capability values. A non-Shifter site needs a different
+only the site capability values, `site.toml` included. A non-Shifter site needs a different
 environment descriptor; do not emulate `lx` with copied shell functions.

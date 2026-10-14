@@ -31,7 +31,8 @@ equals the rank count. The step itself keeps all four GPUs
 (`--gpus-per-node=4`), which the intra-node collectives need:
 `--gpus-per-task=1` confines each rank to its own device, and the first
 collective fails with `invalid device ordinal`. `-n 1 --gpus-per-node=4` is
-one process over four devices, which is not a P = 4 run.
+one process over four devices, which is not a P = 4 run; it refuses at
+startup (`GATE one_gpu_per_process`).
 
 A job uses one GPU model and memory class. A multi-node allocation requests
 `-C 'gpu&hbm40g'` or `-C 'gpu&hbm80g'`; the runtime refuses a mixed 40/80 GB
@@ -47,13 +48,18 @@ tree while claiming another ([env vars](../../reference/env_vars.md)).
 
 `runtime.network_env` decides the NCCL transport before JAX or NCCL starts,
 from the step's node count (`SLURM_STEP_NUM_NODES` or the expanded
-`SLURM_STEP_NODELIST`, never the allocation's).
+`SLURM_STEP_NODELIST`, never the allocation's). Perlmutter's values live in
+its site profile, `config/perlmutter/site.toml`, selected by
+`NERSC_HOST=perlmutter` (or `LORRAX_SITE_PROFILE=perlmutter`): the Slurm
+network option a step needs (`step_network`), the site NCCL module's settings
+(`[nccl.env]`) and the collective cost model receipts price with
+(`[comm_model]`). The runtime owns when they apply:
 
 | placement | result |
 |---|---|
 | one node | no network settings |
-| several nodes, CUDA, `SLURM_NETWORK` contains `no_vni` | the site OFI/CXI profile: `NCCL_NET_PLUGIN` = the absolute path of `nccl/2.29.2-cu13`'s plugin, plus that module's settings including `FI_CXI_RDZV_THRESHOLD=0`; a value the caller set is kept |
-| several nodes, CUDA, no `no_vni` | **refuses**, naming the relaunch: without a VNI, NCCL falls back to TCP sockets (about 12× slower) and MPI-IO with NCCL initialization fails |
+| several nodes, CUDA, `SLURM_NETWORK` contains `no_vni` | the profile's `[nccl.env]`: `NCCL_NET_PLUGIN` = the absolute path of `nccl/2.29.2-cu13`'s plugin, plus that module's settings including `FI_CXI_RDZV_THRESHOLD=0`; a value the caller set is kept |
+| several nodes, CUDA, no `no_vni` | **refuses**, naming the relaunch: without a VNI-free step, NCCL falls back to TCP sockets (about 12× slower) and MPI-IO with NCCL initialization fails |
 | `NCCL_NET=Socket` on several nodes | **refuses** |
 | explicit `NCCL_NET` or `NCCL_NET_PLUGIN` | the caller's configuration, unchanged |
 
@@ -63,6 +69,14 @@ setting it from Python is too late. `FI_CXI_RDZV_THRESHOLD=0` prevents a
 cross-node send/receive deadlock (in XLA's `all_to_all` and
 `collective_permute`) in which libfabric's NCCL proxy thread synchronizes the
 device while the NCCL kernel waits on that thread.
+
+Another Slingshot machine (a node with `/sys/class/cxi`) without a profile
+gets only `FI_CXI_DISABLE_HOST_REGISTER=1` and `FI_CXI_RDZV_THRESHOLD=0` and
+a startup warning naming the missing profile; any multi-node CUDA step with
+neither `NCCL_NET` nor a net plugin (`NCCL_NET_PLUGIN`, or `libnccl-net.so`
+on `LD_LIBRARY_PATH`) warns that NCCL may fall back to sockets. A new site
+adds `config/<NERSC_HOST or LORRAX_SITE_PROFILE>/site.toml` with the same
+tables.
 
 ## Cray MPICH GPU support is off {#mpich-gpu-support}
 

@@ -5,6 +5,39 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-13 — Perlmutter site profile; launcher-agnostic distributed start
+
+Perlmutter's NCCL network values (the OFI plugin path, the site NCCL module's
+settings, the `no_vni` step requirement) and the collective cost model's
+constants moved from `runtime/network_env.py` and `gw/comm_model.py` into
+`config/perlmutter/site.toml`, selected by `NERSC_HOST` or
+`LORRAX_SITE_PROFILE`. On Perlmutter the same settings apply and the same
+refusals fire. Startup also changes in these ways:
+
+- World size and rank come from the `JAX_*` overrides, then
+  `OMPI_COMM_WORLD_*`, `MV2_COMM_WORLD_*`, `PMI_SIZE`/`PMI_RANK`, then
+  `SLURM_NTASKS`/`SLURM_PROCID`. A launch whose tasks would each form a
+  one-process world refuses in every driver (`GATE split_launch`); before,
+  only drivers on `RunSession` checked, after the fact.
+- The coordinator is the Slurm step's first host, from a Python host-list
+  parse instead of `scontrol`, on port 61440 + (`SLURM_JOB_ID` + 257
+  `SLURM_STEP_ID`) mod 4096 instead of 22000 + `SLURM_STEP_ID`. At P > 1
+  outside a Slurm step, with no `JAX_COORDINATOR_ADDRESS` and nothing jax's
+  cluster detection recognizes, startup refuses (`GATE coordinator_address`)
+  instead of using each rank's own host.
+- A GPU process that addresses more than one device refuses at startup
+  (`GATE one_gpu_per_process`), not at its first SlabIO open.
+- On a Slingshot node with no site profile, a multi-node CUDA step gets
+  `FI_CXI_DISABLE_HOST_REGISTER=1` and `FI_CXI_RDZV_THRESHOLD=0` and a warning
+  naming the missing profile. A multi-node CUDA step with neither `NCCL_NET`
+  nor a net plugin warns.
+- `jax.distributed.is_initialized()` replaces the inherited
+  `_LORRAX_JAX_DISTRIBUTED_DONE` sentinel, so a driver started by a P > 1
+  parent initializes its own world.
+
+GATE_RESULTS_TBD No deck change; an install without the `config/` directory
+has no site profile.
+
 ## 2026-10-13 — I/O and environment safety checks
 
 - **Shared output directory.** A SlabIO `"w"` or `"a"` open at P > 1 now checks,
@@ -49,6 +82,7 @@ On the P4 hsuite (one A100 node, against main 94741c5ae) eqp is byte-identical
 in 10/10 files cold, warm and with `BEST_EFFORT` in force; the release-cold
 wall is 324.1 s against 324.3 s, with the same 3036 lookups and 2260 compiles
 (claim TBD). No deck change.
+
 
 ## 2026-10-13 — dipole: the kinetic velocity rides the velocity sweep
 

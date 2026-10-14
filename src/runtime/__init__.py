@@ -50,14 +50,12 @@ this module exists to end.
 
 This module imports jax only inside function bodies, so importing it costs
 nothing and the env defaults it sets are in place before jax reads them.
-The distributed guard (``_LORRAX_JAX_DISTRIBUTED_DONE``) is an env sentinel
-so it survives module reloads; the mesh guard (``_STACK``) is a module global
-because a second mesh is a per-process hazard, not a per-job one.
+The distributed guard is jax's own ``jax.distributed.is_initialized()`` and
+the mesh guard (``_STACK``) a module global: both hazards are per process.
 """
 from __future__ import annotations
 
 import os
-import subprocess
 
 # Step 5b's gate.  A SIBLING module (see its "WHY IT LIVES IN runtime/"), and
 # imported at module scope on purpose: it pulls only ``inspect``/``os`` at
@@ -84,8 +82,6 @@ from .pjrt_log_filter import (begin_clean_shutdown_log_filter as
                               _install_pjrt_log_filter,
                               stop_pjrt_log_filter as _stop_pjrt_log_filter)
 
-
-_DISTRIBUTED_SENTINEL = "_LORRAX_JAX_DISTRIBUTED_DONE"
 
 # Canonical LORRAX boolean grammar for env knobs — ONE token set, case- and
 # whitespace-insensitive, shared by every knob in this module.  Before the
@@ -217,10 +213,8 @@ _MALLOC_TUNE: dict = {"applied": None, "mmap_mb": None, "trim_mb": None,
 _BLAS_TUNE: dict = {"applied": None, "timeout": None, "reason": None,
                     "numpy_already_imported": None}
 
-#: Filled in by :func:`init_jax_distributed`: which of the two
-#: ``jax.distributed.initialize()`` forms actually ran.  A module global (not
-#: an env var) on purpose — it is a report field, not a cross-import guard,
-#: and the guard (``_DISTRIBUTED_SENTINEL``) already exists.
+#: Filled in by :func:`init_jax_distributed`: the
+#: ``jax.distributed.initialize()`` call that ran, for the startup report.
 _DISTRIBUTED_FORM: list = []
 
 
@@ -1418,81 +1412,90 @@ def announce_cpu_collectives() -> None:
               flush=True)
 
 
+#: Launcher variables for this process's world size and rank, the JAX_*
+#: overrides first, then the process's own MPI launcher, then Slurm: hydra
+#: (Frontera's ibrun) starts its ranks under one Slurm task per node, so they
+#: inherit a shared SLURM_PROCID.
+_WORLD_SIZE_ENVS = ("JAX_PROCESS_COUNT", "JAX_NUM_PROCESSES",
+                    "OMPI_COMM_WORLD_SIZE", "MV2_COMM_WORLD_SIZE", "PMI_SIZE",
+                    "SLURM_NTASKS")
+_WORLD_RANK_ENVS = ("JAX_PROCESS_INDEX", "OMPI_COMM_WORLD_RANK",
+                    "MV2_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID")
+
+
+def _first_env(names, default: int) -> tuple:
+    """(variable, integer value) of the first of ``names`` that is set."""
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            return name, int(raw)
+    return None, default
+
+
 def _resolve_proc_count() -> int:
-    """Process count: JAX_PROCESS_COUNT → JAX_NUM_PROCESSES → SLURM_NTASKS → 1."""
-    return int(os.environ.get(
-        "JAX_PROCESS_COUNT",
-        os.environ.get(
-            "JAX_NUM_PROCESSES",
-            os.environ.get("SLURM_NTASKS", "1"))))
+    """Process count: the first of :data:`_WORLD_SIZE_ENVS` that is set, else 1."""
+    return _first_env(_WORLD_SIZE_ENVS, 1)[1]
 
 
 def _resolve_proc_id() -> int:
-    """Process index: JAX_PROCESS_INDEX → SLURM_PROCID → 0."""
-    return int(os.environ.get(
-        "JAX_PROCESS_INDEX",
-        os.environ.get("SLURM_PROCID", "0")))
+    """Process index: the first of :data:`_WORLD_RANK_ENVS` that is set, else 0."""
+    return _first_env(_WORLD_RANK_ENVS, 0)[1]
 
 
-def _resolve_coordinator_address() -> str:
-    """Coordinator address for jax.distributed.
+def _refuse_split_launch() -> None:
+    """Refuse a launch whose tasks would each form a one-process world.
 
-    ``JAX_COORDINATOR_ADDRESS`` overrides everything.  Otherwise resolve the
-    first host of the current *step* (not the whole interactive allocation)
-    and use a port derived from its numeric step id.  Allocation-wide host and
-    fixed-port fallbacks remain for non-step launchers.
+    Each would compute the whole result, believe it is rank 0 and overwrite
+    the same output files.  Decided from the launcher variables alone, before
+    any input, output or backend exists.
     """
-    coord = os.environ.get("JAX_COORDINATOR_ADDRESS")
-    if coord:
-        return coord
-    step_id = os.environ.get("SLURM_STEP_ID", "")
-    try:
-        port = 22000 + int(step_id) % 30000
-    except (TypeError, ValueError):
-        port = 12355
-    nodelist = (os.environ.get("SLURM_STEP_NODELIST")
-                or os.environ.get("SLURM_NODELIST"))
-    if nodelist:
-        try:
-            result = subprocess.run(
-                ["scontrol", "show", "hostnames", nodelist],
-                capture_output=True, text=True, check=True,
-            )
-            first_host = result.stdout.strip().split("\n")[0]
-            return f"{first_host}:{port}"
-        except Exception:
-            pass
-    host = (os.environ.get("SLURMD_NODENAME")
-            or os.environ.get("HOSTNAME")
-            or "localhost")
-    return f"{host}:{port}"
+    name, count = _first_env(_WORLD_SIZE_ENVS, 1)
+    several = [f"{v}={os.environ[v].strip()}" for v in _WORLD_SIZE_ENVS
+               if os.environ.get(v, "").strip() not in ("", "0", "1")]
+    if count <= 1 and several:
+        raise RuntimeError(
+            f"GATE split_launch: the launcher says this process is one of "
+            f"several ({', '.join(several)}), but {name}={count} resolves a "
+            f"one-process world, so every task would redo the whole "
+            f"calculation and overwrite the same outputs.  Unset {name} or "
+            f"set it to the task count, or launch one task.")
+
+
+def _resolve_coordinator_address() -> str | None:
+    """Process 0's ``host:port``, or None to leave it to jax's cluster detection.
+
+    ``JAX_COORDINATOR_ADDRESS`` overrides.  In a Slurm step: the step's first
+    host, never the allocation's, and a port in jax's range [61440, 65535]
+    keyed on the job and the step, so concurrent steps of one job and steps
+    of two jobs sharing a node take different ports.  The step's reserved
+    ports (``SLURM_STEP_RESV_PORTS``) are not used: Cray PMI listens on them.
+    """
+    explicit = os.environ.get("JAX_COORDINATOR_ADDRESS", "").strip()
+    nodelist = os.environ.get("SLURM_STEP_NODELIST", "").strip()
+    job = os.environ.get("SLURM_JOB_ID", "").strip()
+    if explicit or not (nodelist and job.isdigit()):
+        return explicit or None
+    from runtime.network_env import expand_nodelist
+    step = os.environ.get("SLURM_STEP_ID", "0").strip()
+    step = int(step) if step.isdigit() else 0
+    return f"{expand_nodelist(nodelist)[0]}:{61440 + (int(job) + 257 * step) % 4096}"
 
 
 def init_jax_distributed() -> None:
-    """Call ``jax.distributed.initialize()`` idempotently.
+    """Call ``jax.distributed.initialize()`` once per process when P > 1.
 
-    Safe to call multiple times — the ``_LORRAX_JAX_DISTRIBUTED_DONE``
-    env sentinel persists across module reloads within a process (module-
-    level Python globals do not, which is why the previous per-driver copies
-    could double-initialise in harnesses that loaded more than one entry
-    point).
+    The world comes from the launcher variables, so a launch whose tasks would
+    each form a one-process world refuses here, in every driver.  The guard is
+    jax's own ``jax.distributed.is_initialized()``: per process, so a driver
+    started by a P > 1 parent initializes its own world.
 
-    The Cray MPICH stack on Perlmutter runs each rank with
-    ``CUDA_VISIBLE_DEVICES=$SLURM_LOCALID`` — exactly one GPU per
-    process.  ``jax.distributed.initialize()`` with no args then hangs
-    in the topology exchange because it assumes each process owns
-    *all* local GPUs.  We pass ``local_device_ids`` explicitly,
-    one per device the launcher made visible (:func:`_visible_device_count`:
-    ``CUDA_VISIBLE_DEVICES``, ``ROCR_VISIBLE_DEVICES`` or
-    ``HIP_VISIBLE_DEVICES``).  First try that; on failure
-    fall back to the explicit ``(coordinator_address, num_processes,
-    process_id)`` form.
-
-    Slurm steps SKIP the auto-detected form and use
-    :func:`_resolve_coordinator_address`, because JAX auto-detection derives
-    its coordinator from ``SLURM_JOB_ID``: concurrent steps of one interactive
-    allocation can otherwise join the same coordinator.  An explicit
-    ``JAX_COORDINATOR_ADDRESS`` remains the highest-priority override.
+    ``local_device_ids`` is one id per device the launcher made visible
+    (:func:`_visible_device_count`): ``select_gpu.sh`` pins one GPU per rank
+    through ``CUDA_VISIBLE_DEVICES``, and without the ids every process would
+    claim every local GPU.  The coordinator is
+    :func:`_resolve_coordinator_address`; where that is None, jax's cluster
+    detection supplies it (Open MPI's ``mpirun``, Kubernetes, Cloud TPU) or
+    the launch refuses, naming ``JAX_COORDINATOR_ADDRESS``.
     """
     # Drivers with the three-call header (gw.kin_ion_io, psp.run_nscf, ...)
     # reach ``runtime`` here first, and this is still BEFORE anything has
@@ -1500,69 +1503,62 @@ def init_jax_distributed() -> None:
     # plugin skip can be armed.  Idempotent and self-gating; a GPU run
     # (JAX_PLATFORMS != "cpu") passes straight through.
     skip_gpu_plugin_discovery()
-
-    if os.environ.get(_DISTRIBUTED_SENTINEL):
-        return
-
+    _refuse_split_launch()
     proc_count = _resolve_proc_count()
     if proc_count <= 1:
-        os.environ[_DISTRIBUTED_SENTINEL] = "1"
-        _DISTRIBUTED_FORM.append(
+        _DISTRIBUTED_FORM[:] = [
             "jax.distributed.initialize() was not called because this is a "
-            "single-process run")
+            "single-process run"]
         return
-
     jax = _import_jax()
-
+    if jax.distributed.is_initialized():
+        return
     n_local = _visible_device_count()
-    init_kwargs = {"local_device_ids": list(range(n_local))} if n_local else {}
-    explicit_step = bool(os.environ.get("SLURM_STEP_NODELIST"))
-    if not os.environ.get("JAX_COORDINATOR_ADDRESS") and not explicit_step:
-        try:
-            jax.distributed.initialize(**init_kwargs)
-            os.environ[_DISTRIBUTED_SENTINEL] = "1"
-            _DISTRIBUTED_FORM.append(
-                f"jax.distributed.initialize() took its auto-detected form "
-                f"with local_device_ids={init_kwargs.get('local_device_ids')}")
-            return
-        except Exception as exc:
-            _record_demotion(
-                f"The auto-detected jax.distributed.initialize() form failed "
-                f"({type(exc).__name__}: {exc}), so the explicit "
-                f"coordinator/num_processes/process_id form was used instead.")
-
-    # ``local_device_ids`` matters on BOTH paths: without it the explicit form
-    # assumes each process owns every local GPU and dies with
-    # "CUDA_ERROR_INVALID_DEVICE: invalid device ordinal" under the one-GPU-
-    # per-process binding select_gpu.sh sets up.
+    local_ids = list(range(n_local)) if n_local else None
     coord = _resolve_coordinator_address()
-    jax.distributed.initialize(
-        coordinator_address=coord,
-        num_processes=proc_count,
-        process_id=_resolve_proc_id(),
-        **init_kwargs,
-    )
-    os.environ[_DISTRIBUTED_SENTINEL] = "1"
-    _DISTRIBUTED_FORM.append(
-        f"jax.distributed.initialize() took its explicit form with "
-        f"coordinator_address={coord!r}, num_processes={proc_count} and "
-        f"local_device_ids={init_kwargs.get('local_device_ids')}")
+    try:
+        jax.distributed.initialize(coordinator_address=coord,
+                                   num_processes=proc_count,
+                                   process_id=_resolve_proc_id(),
+                                   local_device_ids=local_ids)
+    except ValueError as exc:
+        if coord is not None:
+            raise
+        raise RuntimeError(
+            f"GATE coordinator_address: {proc_count} processes "
+            f"({_first_env(_WORLD_SIZE_ENVS, 1)[0]}) and no coordinator: this "
+            f"is not a Slurm step and jax's cluster detection found none "
+            f"({exc}).  Export JAX_COORDINATOR_ADDRESS=<process 0's "
+            f"host>:<free port> on every rank (config/cloud/launch.sh does), "
+            f"or launch with srun.") from exc
+    _DISTRIBUTED_FORM[:] = [
+        f"jax.distributed.initialize() ran with coordinator_address="
+        f"{coord or 'from jax cluster detection'!r}, num_processes="
+        f"{proc_count} and local_device_ids={local_ids}"]
 
 
-def _enforce_homogeneous_gpu_targets() -> None:
-    """Independent XLA compilations must use the same GPU target on all ranks."""
+def _enforce_gpu_placement() -> None:
+    """One GPU per process, and one GPU model and memory class across the job."""
     import hashlib
     import jax
     import numpy as np
     from common.collectives import all_gather_processes
 
+    gpus = [device for device in jax.local_devices()
+            if device.platform in ("gpu", "cuda", "rocm")]
+    if len(gpus) > 1:
+        raise RuntimeError(
+            f"GATE one_gpu_per_process: this process addresses {len(gpus)} "
+            f"GPUs; the SlabIO, NCCL and distributed-solver transports run one "
+            f"process per GPU.  Launch one rank per GPU with each rank pinned "
+            f"to its own device (srun -n <GPUs> src/ffi/cpp/select_gpu.sh "
+            f"<cmd>, or CUDA_VISIBLE_DEVICES=<local rank>; lx run -G 4 -n 4).")
     # Remote JAX device descriptors report this client's model, so exchange
     # measured local targets rather than trusting jax.devices() metadata.
-    kinds = sorted({device.device_kind for device in jax.local_devices()
-                    if device.platform in ("gpu", "cuda", "rocm")})
+    kinds = [device.device_kind for device in gpus]
     digest = hashlib.sha256(repr(kinds).encode()).digest()
     targets = all_gather_processes(np.frombuffer(digest, dtype=np.uint8))
-    if len(kinds) > 1 or np.any(targets != targets[0]):
+    if np.any(targets != targets[0]):
         raise RuntimeError(
             "GATE heterogeneous_gpu_targets: mixed GPU models can compile "
             "incompatible collective schedules and silently corrupt results; "
@@ -1764,9 +1760,9 @@ def fallback_to_cpu_if_no_gpu_backend() -> None:
 # ===========================================================================
 
 #: Set by the first :func:`initialize_communicator_stack`; every later call
-#: returns it.  A module global rather than an env sentinel because it holds
-#: a live ``Mesh`` -- and because the thing it guards (a SECOND mesh, hence a
-#: second set of communicators) is a per-process hazard, not a per-job one.
+#: returns it.  A module global because it holds a live ``Mesh``, and the
+#: thing it guards (a SECOND mesh, hence a second set of communicators) is a
+#: per-process hazard.
 _STACK = None
 
 
@@ -1925,8 +1921,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     3. :func:`skip_gpu_plugin_discovery` -- idempotent re-arm; the last
        point at which the CUDA dlopen (76.9 s cold, job 7882076) can still
        be avoided.
-    4. :func:`init_jax_distributed` -- one ``jax.distributed.initialize()``
-       per process, guarded by an env sentinel that survives re-imports.
+    4. :func:`init_jax_distributed` -- the split-launch refusal, then one
+       ``jax.distributed.initialize()`` per process at P > 1.
     5. :func:`fallback_to_cpu_if_no_gpu_backend` -- THIS is the first
        ``jax.devices()``, i.e. backend init.  After it the platform and the
        allocator are frozen and ``os.environ`` stops being evidence.
@@ -1949,7 +1945,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        rank and refuse a grant below ``MPI_THREAD_MULTIPLE``.  The async
        progress setting is only a request; this is the check that it worked.
        It must precede clique construction because XLA can issue collectives
-       from executor threads.
+       from executor threads.  Then :func:`_enforce_gpu_placement`: one GPU
+       per process, refused by name otherwise, and one GPU model in the job.
     5d. ``install_compile_agreement`` -- installs the cross-rank module-key
        refusal after the live coordination client and supported JAX surface
        exist, but before the mesh warmup performs the first compile.  A
@@ -2031,7 +2028,7 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     _enforce_supported_jax(say)
     # -- 5c -----------------------------------------------------------------
     _enforce_cpu_mpi_thread_multiple(say)
-    _enforce_homogeneous_gpu_targets()
+    _enforce_gpu_placement()
     # -- 5d -----------------------------------------------------------------
     from common.jax_compile_cache import install_compile_agreement
     install_compile_agreement()
@@ -2541,9 +2538,10 @@ def _enforce_required_ffi(mesh, *, announce: bool = True) -> None:
     from ffi.gemm import GATE as _GEMM_GATE
 
     _GEMM_GATE.enforce(mesh, announce=announce)
-    # The k-convolution router has no dial: it resolves by device vendor and,
-    # on CUDA, refuses here at startup when mathdx cannot be served (a missing
-    # nvidia-mathdx wheel; docs/architecture/kconv.md#router).
+    # The k-convolution router has no dial: it resolves by device vendor.  On
+    # CUDA a missing nvidia-mathdx wheel or family target refuses here, and a
+    # probe compile that fails on any rank sends every rank to the XLA
+    # backend (docs/architecture/kconv.md#router).
     require_kconv(mesh, announce=announce)
     # LocalFourierPlan's CUDA leg is one custom call in the same library.
     require_fourier_plan(mesh, announce=announce)

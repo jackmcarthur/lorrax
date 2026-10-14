@@ -63,7 +63,7 @@ default, the block is what ran. Rank 0 of a P=4 Perlmutter run:
 
 ```text
   This is rank 0 of 4, and it addresses 1 of the 4 devices in the job.
-  jax.distributed.initialize() took its explicit form with coordinator_address='nid003401:22021', num_processes=4 and local_device_ids=[0].
+  jax.distributed.initialize() ran with coordinator_address='nid003401:62227', num_processes=4 and local_device_ids=[0].
   The JAX platform resolved to 'gpu' on devices of kind 'NVIDIA A100-SXM4-40GB', from JAX_PLATFORMS='cuda,cpu', under jax 0.9.1 / jaxlib 0.9.1 with 64-bit values enabled.
   Default matmul precision is pinned to 'highest', so f32 and complex64 dots run at fp32 rather than TensorFloat32; f64/c128 is unaffected either way.
   The run's device mesh is 2x2 over axes ('x', 'y'), and its communicator cliques were warmed before the first physics jit.
@@ -202,16 +202,25 @@ export XLA_FLAGS="--xla_force_host_platform_device_count=4"  # CPU mock mesh
 ```
 
 `runtime.initialize_communicator_stack()` owns multi-process bring-up
-([services](../architecture/services.md#runtime)); every rank calls it. Under
-SLURM with `SLURM_NTASKS > 1` it calls `jax.distributed.initialize()` with
-`local_device_ids` derived from the first visibility variable set
-(`CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`); off SLURM set
-`JAX_COORDINATOR_ADDRESS`, `JAX_NUM_PROCESSES` and `JAX_PROCESS_INDEX`. One GPU
-per rank is pinned by `src/ffi/cpp/select_gpu.sh` through
-`CUDA_VISIBLE_DEVICES`, not by `--gpus-per-task=1`
-([why](machines/perlmutter.md#required-gpu-task-geometry)). `jax.distributed` bring-up costs about 1 s, flat to P=64; a
-slow "distributed init" is the CUDA plugin load inside the first
-`jax.devices()`.
+([services](../architecture/services.md#runtime)); every rank calls it. The
+world size and rank come from the launcher: the `JAX_*` overrides, then the
+process's own MPI launcher (`OMPI_COMM_WORLD_*`, `MV2_COMM_WORLD_*`,
+`PMI_SIZE`/`PMI_RANK`), then Slurm (`SLURM_NTASKS`/`SLURM_PROCID`), so ranks
+that hydra or `ibrun` starts under one Slurm task per node keep distinct ids
+([env vars](../reference/env_vars.md)). A launch whose tasks would each form
+a one-process world refuses (`GATE split_launch`). At P > 1 it calls
+`jax.distributed.initialize()` once per process, with `local_device_ids` from
+the first visibility variable set (`CUDA_VISIBLE_DEVICES`,
+`ROCR_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`) and the coordinator on the
+step's first host, its port keyed on the job and step; outside a Slurm step
+jax's own cluster detection (Open MPI's `mpirun`) supplies it or the launch
+refuses naming `JAX_COORDINATOR_ADDRESS` (`GATE coordinator_address`). A
+GPU process that addresses more than one device refuses
+(`GATE one_gpu_per_process`): one GPU per rank is pinned by
+`src/ffi/cpp/select_gpu.sh` through `CUDA_VISIBLE_DEVICES`, not by
+`--gpus-per-task=1` ([why](machines/perlmutter.md#required-gpu-task-geometry)).
+`jax.distributed` bring-up costs about 1 s, flat to P=64; a slow
+"distributed init" is the CUDA plugin load inside the first `jax.devices()`.
 
 ---
 
