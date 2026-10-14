@@ -3157,7 +3157,7 @@ def _prepare_fresh_parent_faces(
                 q_full_indices=(np.asarray(sym.q_irr_full_idx, np.int32) if write_ibz_T
                                 else np.arange(meta_T.nk_tot, dtype=np.int32)))
             from .augmentation_current import DeferredCurrentRequest
-            current_request = DeferredCurrentRequest(current_request)
+            current_request = DeferredCurrentRequest(current_request, sample_root=tmp_dir)
         from .isdf_augmentation import prepare_augmentation
         with timing.section("gw_jax.atomic_augmentation"):
             _parent_green_faces, chunks['augmentation'] = prepare_augmentation(

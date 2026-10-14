@@ -226,3 +226,39 @@ antiunitary action; the measured time-reversal verdict is unchanged. `parent_k_d
 k as its own parent. The plan then has n_parent = N_k, identity actions and
 every q row. The same parent route and route G run unchanged. The binding
 ruling is in [decisions](decisions.md).
+
+
+## Exact radial samples across the charge/current lifetime
+
+`gw.isdf_augmentation.prepare_augmentation` completes each original PS/AE
+radial sample packet before any density contraction. For a deferred current
+request, `gw.augmentation_current.prepare_radial_sample_store` reserves the
+[canonical streamed file tier](slab_io.md#streamed-tier) beneath the existing
+fit scratch directory. It stores one orientation, complex128
+`[parent, band, 4, point]` at `P(None,x,None,y)`, as two immutable records per
+radial packet. Flattening parent/spin is local; AOT rejects a packing program
+that communicates. Each write drains before the charge RHS consumes the
+packet. No sample history resides on host or device.
+
+A read restores exactly one PS/AE pair, verifies the service byte digests and
+the physical point/transport binding, and regenerates the complementary
+face with the incumbent helper. The current RHS projection and three OWN
+solves are unchanged. The existing deferred owner authenticates the source
+frame and requires the actual charge lifetime to have closed. Only accepted,
+complete storage replaces its extra source/C replay operands; the separate
+current-fit source remains live. Collective storage unavailability is logged
+and preserves the old sampler. Write errors, changed bindings and corrupt or
+incomplete reads are fatal; they never trigger resampling. Store files are
+unlinked on creation, and the replay's `finally` releases the descriptors.
+
+For `R` packets of `Nparent × Nband × 4 × Npoint` samples on `P` ranks,
+storage per rank is `2 R × 16 Nparent Nband 4 Npoint / P` bytes plus page
+padding. It incurs one write and one read. Device admission adds actual
+pack/unpack AOT and conservative canonical piece/read staging to existing
+charge/replay bounds; host staging is checked collectively at creation and
+again before replay. The read requests one span without read-ahead. The P4
+fixture `tests/test_radial_sample_reuse_p4.py` checks exact samples,
+complements, all three RHS/OWN solves, changed physical points/spin/frame,
+incomplete/repeated records, corrupted file bytes and disk refusal. Material
+capacity, end-to-end parity and net I/O benefit require compute-node proof;
+removing duplicate sampling alone is not a full fit-cost target claim.

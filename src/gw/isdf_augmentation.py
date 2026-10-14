@@ -1424,6 +1424,7 @@ def _current_augmentation_request(request, *, wfn, meta, plan, sym, public_range
         return None
     from .augmentation_current import DeferredCurrentRequest
     deferred = isinstance(request, DeferredCurrentRequest)
+    sample_root = request.sample_root if deferred else None
     if deferred:
         request = request.request
     required = {'meta','plan','centroid_indices','band_range_left','band_range_right',
@@ -1482,6 +1483,7 @@ def _current_augmentation_request(request, *, wfn, meta, plan, sym, public_range
                 q_full_indices=np.asarray(qrows,dtype=np.int32))
     if deferred:
         result['deferred_request'] = True
+        result['sample_root'] = sample_root
     return result
 
 
@@ -2328,6 +2330,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
     rhs = jnp.zeros((qpad,mu,na*nh*nr),jnp.complex128,device=NamedSharding(mesh_xy,qs))
     smooth_rhs = (jnp.zeros(rhs.shape,jnp.complex128,device=NamedSharding(mesh_xy,qs))
                   if onsite_cross else None)
+    radial_samples = None
     right_plan = compressor = selector = store_rhs = sampler = None
     occupied_trace = occupied_projection = None
     to_q = face_to_batch_reshard(mesh_xy)
@@ -2345,6 +2348,12 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
             live = np.asarray(right_plan.layout.axis.active_mask)
             npoint = int(right_plan.n_centroid_packed)
             if sampler is None:
+                if current is not None and current.get('deferred_request') and current.get('sample_root'):
+                    from .augmentation_current import prepare_radial_sample_store
+                    radial_samples, current['radial_sample_storage'] = prepare_radial_sample_store(
+                        mesh_xy, root=current['sample_root'], shape=(npar,nb,4,npoint),
+                        packets=nr//rp, resident_bytes=price)
+                    print_fn('current radial sample storage: ' + json.dumps(current['radial_sample_storage'],sort_keys=True))
                 sampler = _point_samples_kernel(mesh_xy,pc,bc,npoint,gblock,meta.n_rtot)
                 compressor,nf,nfp = _compress_rhs_kernel(mesh_xy,right_plan,na,nh,rp,Y.conj()*angles_w)
                 packet_q = q_indices if indexed_q is None else np.arange(len(q_indices))
@@ -2379,6 +2388,9 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                         face = kernels['face'](ae,jnp.int32(p0),jnp.int32(b0))
                         face = correct(face,tile_coeff,delta_device,phase_device)
                         ae = kernels['update_face'](ae,face,jnp.int32(p0),jnp.int32(b0))
+            if radial_samples is not None:
+                from .augmentation_current import write_radial_samples
+                write_radial_samples(radial_samples,r0//rp,ps,ae,right_plan,points)
             volume_weights = np.broadcast_to(norm_radial[r0:r0+rp][None,:,None]
                                 *angles_w[None,None,:],(na,rp,len(directions))).reshape(-1)
             volume_weights = right_plan.layout.axis.pack_host(volume_weights,axis=0,fill_value=0.)
@@ -2476,6 +2488,7 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
         current.update({key:artifact['radial'][key]
                        for key in ('interpolation_degree','quadrature_order','fourier_points')
                        if key in artifact['radial']})
+        current['radial_source_binding'] = expected
         if overlap_receipt is not None:
             current['overlap_receipt']=overlap_receipt
         if compact is not None:
@@ -2488,9 +2501,17 @@ def prepare_augmentation(*, wfn, sym, meta, cfg, mesh_xy, plan,
                 **artifact['public_source_identity'],
                 **_physical_full_wfn_frame_binding(overlap_receipt['inverse_sqrt'],int(wfn.nbands)))
         if current.pop('deferred_request',False):
+            parameters['source_shape'] = tuple(smooth.shape)
+            if radial_samples is not None:
+                # These operands existed only to reconstruct the already-stored
+                # exact samples. The independent current-fit parent_psi remains.
+                for key in ('caches','atom_types','kfrac','scale','wavevectors'):
+                    del parameters[key]
             current['deferred_rhs'] = DeferredCurrentDensity(current,state,
-                source=_preserve_for_donating_fit(smooth),coefficients=coefficients,
-                parameters=parameters)
+                source=(_preserve_for_donating_fit(smooth) if radial_samples is None else None),
+                coefficients=coefficients if radial_samples is None else (),
+                parameters=parameters,samples=radial_samples)
+            current.pop('sample_root',None)
         state['current']=current
     state['local_rhs_workspace_bytes_per_rank'] = point_workspace
     state['atomic_point_lookup'] = dict(budget=atomic_lookup,

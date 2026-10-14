@@ -1,5 +1,16 @@
 # Upgrade notes
 
+## Unreleased — reuse exact atomic radial samples in current replay
+
+Deferred current fitting stores the charge stage’s corrected AE and PS radial
+packets through the canonical per-rank streamed file tier, then reads those
+exact bytes after the charge closes. It regenerates only the complementary
+face orientation. Point transport and full-WFN source-frame bindings are
+authenticated before reuse; incomplete or corrupt reads refuse. A collective
+storage-capacity refusal retains the existing resampling route. No deck or
+sampling change is required. This changes intermediate lifetimes and I/O,
+not fitting equations or the current factors.
+
 ## Unreleased — reuse Cartesian primitives in circular current packets
 
 Delta-only atomic current replay evaluates matching Cartesian primitives once
