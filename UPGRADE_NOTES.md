@@ -2258,3 +2258,7 @@ weighted G operands without changing the four-product algebra, G tiles, shell or
 physical output, donation contract, or body-before-onsite addition order. The
 no-augmentation path retains the unrolled kernel. Exact-shape AOT and runtime
 validation are required before any capacity or speed claim.
+
+## Unreleased — omit unused transverse radial QR Q factors
+
+The static transverse radial block builder requests only the triangular QR factor. The same Householder factorization retains all source and compensation columns; there is no spectral cutoff or change to the field metric. This avoids materializing orthogonal Q matrices that have no consumer.

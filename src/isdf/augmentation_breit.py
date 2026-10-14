@@ -532,7 +532,7 @@ def static_transverse_block_factors(geometry,compensation):
             index=np.flatnonzero(selected)
             if not len(index):continue
             Ls=modes[index,1];C=branches[:,index].reshape(branches.shape[0],-1)
-            _,RA=np.linalg.qr(C,mode='reduced');H=C.conj().T@C
+            RA=np.linalg.qr(C,mode='r');H=C.conj().T@C
             by_M=[]
             for M in range(-int(J),int(J)+1):
                 cols=np.asarray([np.flatnonzero((modes==[J,L,M]).all(axis=1))[0] for L in Ls])
@@ -548,7 +548,9 @@ def static_transverse_block_factors(geometry,compensation):
                 return value.reshape(-1,len(Ls)*width)
             density=field_map(radial['plus'],radial['minus'],radial['plus'].shape[-1])
             analytic=field_map(gp['plus'],gp['minus'],2)
-            joint=np.linalg.qr(np.concatenate((density,analytic),axis=1),mode='reduced')[1]
+            # Only the triangular factor defines the common field coordinates.
+            # Forming the tall Q matrix adds work and storage with no consumer.
+            joint=np.linalg.qr(np.concatenate((density,analytic),axis=1),mode='r')
             fd,fg=joint[:,:density.shape[1]],joint[:,density.shape[1]:]
             sectors.append(dict(J=int(J),kind=kind,Ls=Ls,indices_by_M=tuple(by_M),
                                 delta_factor=fd,compensation_factor=fg))
