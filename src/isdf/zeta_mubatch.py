@@ -1383,7 +1383,7 @@ def _admit_charge_local_completion(mesh, store, provider, coefficients):
 
 def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
                    use_local_augmentation=False, compensated_body=False,
-                   positive_body=False):
+                   positive_body=False, retained_rows=False):
     """One G tile: ζ = C⁻¹Z, V += conj(ζ) v ζᵀ, shell gather (and M in debug).
 
     F (Q_pad, μ, μ) and Z (Q_pad, μ, g) are q-local; V, shell and M
@@ -1399,11 +1399,13 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
         raise ValueError('_v_tile_kernel: physical-low body requires its own local provider')
     key = ('v_tile', _mesh_id(mesh), solver_kind, int(n_log),
            int(g_tile), bool(debug_m), bool(with_v), bool(use_local_augmentation),
-           bool(compensated_body), bool(positive_body))
+           bool(compensated_body), bool(positive_body), bool(retained_rows))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
-    one = _logical_solve(solver_kind, n_log)
+    if retained_rows and (with_v or use_local_augmentation or solver_kind != 'positive_rank_truncate'):
+        raise ValueError('retained smooth projection is only the positive OWN form stage')
+    one = (lambda B, Z: jnp.conj(B[:n_log].T) @ Z[:n_log]) if retained_rows else _logical_solve(solver_kind, n_log)
     acc = _ACC_SPEC
     f_spec = _factor_specs(solver_kind)
     in_specs = (f_spec, P(_XY, None, None), P(_XY, None),
@@ -1461,7 +1463,7 @@ def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True,
 
 def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
                       compensated_body=False, return_physical=False,
-                      transverse_completion=False):
+                      transverse_completion=False, retained_rows=False):
     """One G tile of several ζ's: ``V^{ab} += conj(ζ^a) v^{ab} ζ^bᵀ`` per pair,
     and each ζ's shell gather — the accumulation half of :func:`_v_tile_kernel`
     over ζ tiles it formed with ``with_v=False``."""
@@ -1472,7 +1474,7 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
         raise ValueError('Slab transverse completion requires the compensated three-current family')
     key = ('pair_tile', _mesh_id(mesh), int(g_tile), pairs,
            bool(use_local_augmentation),bool(compensated_body),bool(return_physical),
-           bool(transverse_completion))
+           bool(transverse_completion),bool(retained_rows))
     fn = _kernel_cache.get(key)
     if fn is not None:
         return fn
@@ -1487,6 +1489,10 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
     if transverse_completion:
         in_specs += (P(_XY,None,None),)
 
+    if retained_rows:
+        if not use_local_augmentation or compensated_body or transverse_completion:
+            raise ValueError('retained current pair requires the mixed delta-only body')
+        in_specs += ((z_spec,)*n_z,)
     output_specs = ((acc,) * len(pairs), (acc,) * n_z)
     if return_physical:
         output_specs += ((z_spec,) * n_z,)
@@ -1533,7 +1539,12 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
         hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
         S_out, physical_tiles = [], []
         for a in range(n_z):
-            physical=Z[a]+local_tiles[0][0][a] if use_local_augmentation else Z[a]
+            if retained_rows:
+                basis = local_tiles[-1][a]
+                # Preserve physical smooth-then-delta addition before shell/writer.
+                physical = (basis @ Z[a]) + (basis @ local_tiles[0][0][a])
+            else:
+                physical=Z[a]+local_tiles[0][0][a] if use_local_augmentation else Z[a]
             dS = jnp.einsum('qmg,qgs->qms', physical, hit)
             S_out.append(S[a] + dS)
             if return_physical:
@@ -1548,7 +1559,7 @@ def _pair_tile_kernel(mesh, g_tile, pairs, *, use_local_augmentation=False,
 
 
 def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
-                                      completion, write_physical):
+                                      completion, write_physical, row_basis=None):
     """AOT caller phases above the live pre-loop arrays, excluding mu banks.
 
     The mu route fences reads/forms, the pair result, and each writer; all
@@ -1561,6 +1572,11 @@ def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
     v_dev,ngk_dev,sl_dev,V,S,stub,v_form=operands
     abstract=jax.ShapeDtypeStruct((st.Q_pad,mu,st.g_tile),jnp.complex128,
         sharding=NamedSharding(mesh,P(_XY,None,None)))
+    physical_abstract=abstract
+    physical_tile_bytes=abstract.size*16/mesh.size
+    if row_basis is not None:
+        abstract=jax.ShapeDtypeStruct((st.Q_pad,row_basis['rows'],st.g_tile),jnp.complex128,
+            sharding=physical_abstract.sharding)
     tile_bytes=abstract.size*16/mesh.size
     packet=((abstract,)*3,(abstract,)*3)
     local_args=(packet,)
@@ -1570,13 +1586,15 @@ def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
             sharding=NamedSharding(mesh,P(_XY,None,None)))
         local_args+=(difference,)
         difference_bytes=difference.size*16/mesh.size
+    if row_basis is not None:
+        local_args+=(row_basis['thin'],)
     quotes=[]
     def quote(name,fn,args):
         value=float(compiled_new_bytes(fn.lower(*args).compile()))
         quotes.append(dict(owner=name,resident_increment=value))
         return value
     pair=quote('pair',step,((abstract,)*3,v_dev,ngk_dev,sl_dev,jnp.int32(0),V,S,*local_args))
-    forming=max(quote('form_'+str(i),fn,(z.factor,abstract,v_form,
+    forming=max(quote('form_'+str(i),fn,((z.factor if row_basis is None else row_basis['thin'][i]),physical_abstract,v_form,
         ngk_dev,sl_dev,jnp.int32(0),*zero)) for i,(z,fn,zero) in enumerate(zip(zetas,form,stub)))
     # The read chain can queue both transport and packed-axis gather. Bound
     # their increments together; read completion precedes every form call.
@@ -1601,7 +1619,7 @@ def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
                      (by_slot,jnp.asarray(store._pfs)))
         read_peaks.append(incoming+moved+packed+store._pfs.size*store._pfs.dtype.itemsize)
     phases=dict(read=2*tile_bytes+max(read_peaks),
-        form=3*tile_bytes+forming,
+        form=2*tile_bytes+physical_tile_bytes+forming,
         pair=9*tile_bytes+difference_bytes+pair)
     host=steady_writer=0.
     if write_physical:
@@ -1609,7 +1627,7 @@ def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
         price=physical_current_writer_workspace(q_logical=st.Q,q_carrier=st.Q_pad,
             mu_packed=mu,mu_canonical=getattr(z0.mu_basis,'n_canonical',mu),
             g_tile=st.g_tile,shards=mesh.size)
-        transport=quote('writer_transport',_to_mu_owner(mesh,st.Q,'mu'),(abstract,))
+        transport=quote('writer_transport',_to_mu_owner(mesh,st.Q,'mu'),(physical_abstract,))
         if z0.mu_basis is not None:
             moved=jax.ShapeDtypeStruct((st.Q,mu,st.g_tile),jnp.complex128,
                 sharding=NamedSharding(mesh,P(None,_XY,None)))
@@ -1619,7 +1637,7 @@ def _current_fourier_caller_workspace(zetas, pairs, kernels, operands, *,
         # The global dispatcher retains its last canonical tile after drain.
         # That one tile persists through subsequent read/form/FT/pair phases.
         phases={name:value+steady_writer for name,value in phases.items()}
-        phases['writer']=3*tile_bytes+steady_writer+max(transport,5*steady_writer)
+        phases['writer']=3*physical_tile_bytes+steady_writer+max(transport,5*steady_writer)
         host=price['host_pending']
     return dict(phase_workspace_bytes=phases,fourier_hold_bytes=3*tile_bytes+steady_writer,
         retained_writer_tile_bytes=steady_writer,
@@ -1692,8 +1710,14 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     v_dev = device_put_process_local(v, NamedSharding(mesh, P(None, _XY, None)))
     ngk_dev = device_put_process_local(ngk, NamedSharding(mesh, P(_XY)))
     sl_dev = device_put_process_local(sl, NamedSharding(mesh, P(_XY, None)))
+    row_basis=None if augmentation is None else augmentation.get('row_basis')
+    if row_basis is not None:
+        from isdf.current_coordinates import authenticate,operator_kernel
+        authenticate(row_basis,zetas)
+        if int(sl.shape[1])>row_basis['shell_capacity']:
+            raise ValueError('retained current shell exceeds the admitted public TT column census')
     form = [_v_tile_kernel(mesh, z.solver_kind, z.n_rmu_solve, st0.g_tile,
-                           debug_m=False, with_v=False) for z in zetas]
+                           debug_m=False, with_v=False,retained_rows=row_basis is not None) for z in zetas]
     stub = [_zero_accumulators(mesh, st0.Q_pad, int(st0.mu_pad), 1,
                                debug_m=False, with_v=False) for _ in zetas]
     body_metric='mixed_reciprocal' if augmentation is None else augmentation.get('body_metric')
@@ -1708,13 +1732,20 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
                             use_local_augmentation=augmentation is not None,
                             compensated_body=body_metric=='compensated',
                             return_physical=zeta_ios is not None,
-                            transverse_completion=completion is not None)
+                            transverse_completion=completion is not None,retained_rows=row_basis is not None)
     mu = int(st0.mu_pad)
-    V = tuple(_zero_accumulators(mesh, st0.Q_pad, mu, 1,
+    rows = mu if row_basis is None else row_basis['rows']
+    V = tuple(_zero_accumulators(mesh, st0.Q_pad, rows, 1,
                                  debug_m=False)[0] for _ in pairs)
-    S = tuple(_zero_accumulators(mesh, st0.Q_pad, mu,
-                                 int(sl.shape[1]), debug_m=False)[2] for _ in zetas)
-    factors = [z.factor for z in zetas]
+    if row_basis is None:
+        S = tuple(_zero_accumulators(mesh, st0.Q_pad, mu,
+                                     int(sl.shape[1]), debug_m=False)[2] for _ in zetas)
+    else:
+        # A physical shell needs no otherwise-unused full mu-by-mu matrix.
+        zero_shell=jax.jit(lambda:jnp.zeros((st0.Q_pad,mu,int(sl.shape[1])),jnp.complex128),
+                           out_shardings=NamedSharding(mesh,_ACC_SPEC))
+        S=tuple(zero_shell() for _ in zetas)
+    factors = [z.factor for z in zetas] if row_basis is None else row_basis['thin']
     local_state=None
     if augmentation is not None:
         if augmentation.get('coefficient_owner') is not None:
@@ -1734,10 +1765,10 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     v_form = v_dev[0]
     if callable(prepare_fourier):
         caller=None
-        if st0.Q<mesh.size and mu%mesh.size==0:
+        if st0.Q<mesh.size and rows%mesh.size==0:
             caller=_current_fourier_caller_workspace(zetas,pairs,(form,step),
                 (v_dev,ngk_dev,sl_dev,V,S,stub,v_form),
-                completion=completion,write_physical=zeta_ios is not None)
+                completion=completion,write_physical=zeta_ios is not None,row_basis=row_basis)
             jax.block_until_ready((local_state,V,S,v_dev,v_form,ngk_dev,sl_dev))
         fourier_state=prepare_fourier(local_state,caller_phase_workspace=caller)
         if jax.process_index()==0:
@@ -1745,7 +1776,7 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     jax.block_until_ready((fourier_state,V,S))
     stage_seconds['prepare_and_layout']=time.perf_counter()-t0
     loop_started=time.perf_counter()
-    bounded_mu=bool(fourier_state is not None and fourier_state.get('fourier_mu',False))
+    bounded_mu=bool(row_basis is not None or fourier_state is not None and fourier_state.get('fourier_mu',False))
     # No look-ahead: each Z tile is read just before its ζ is formed and
     # dropped after, so a G tile holds one Z tile and the ζ tiles — the six
     # tile-sized buffers the fit's plan sized g_tile for (MuBatchPlan).
@@ -1768,13 +1799,15 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
                 raise ValueError("grouped static provider must return three delta and compensation tiles")
             for part,label in zip(tiles,('delta','compensation')):
                 for tile in part:
-                    _require_q_owned(tile,mesh,(st0.Q_pad,mu,st0.g_tile),name=f'grouped current {label}')
+                    _require_q_owned(tile,mesh,(st0.Q_pad,rows,st0.g_tile),name=f'grouped current {label}')
             local_tiles=(tiles,)
             if completion is not None:
                 difference=augmentation['kernel_difference_tile'](t,pairs,tuple(v))
                 _require_q_owned(difference,mesh,(st0.Q_pad,len(pairs),st0.g_tile),
                                  name='grouped current Slab-minus-bulk kernel packet')
                 local_tiles+=(difference,)
+        if row_basis is not None:
+            local_tiles+=(row_basis['thin'],)
         result = step(tuple(zt),v_dev,ngk_dev,sl_dev,jnp.int32(t),V,S,*local_tiles)
         V, S = result[:2]
         if bounded_mu:
@@ -1796,9 +1829,33 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     # Release only the extra Fourier layout, before the existing onsite phase.
     del fourier_state
     onsite_started=time.perf_counter()
-    face_onsite=(augmentation is not None and st0.Q<mesh.size
+    face_onsite=(row_basis is None and augmentation is not None and st0.Q<mesh.size
                  and callable(augmentation.get('onsite_face')))
-    if face_onsite:
+    if row_basis is not None:
+        # Finish body and onsite separately in physical coordinates, preserving
+        # the incumbent body-then-onsite addition. Never retain two full banks.
+        expand=operator_kernel(mesh)
+        pending=list(V)
+        V=[]
+        for index,(a,b) in enumerate(pairs):
+            value=expand(factors[a],pending[index],factors[b])
+            jax.block_until_ready(value)
+            pending[index]=None
+            V.append(value)
+        del pending
+        correction=list(augmentation['onsite'](local_state,pairs))
+        add=_add_q_owned(mesh)
+        for index,(a,b) in enumerate(pairs):
+            tile=expand(factors[a],correction[index],factors[b])
+            jax.block_until_ready(tile)
+            correction[index]=None
+            value=add(V[index],tile)
+            jax.block_until_ready(value)
+            V[index]=value
+            del tile,value
+        V=tuple(V)
+        del correction
+    elif face_onsite:
         # Only thin field panels cross from q ownership to the distributed
         # face. The local provider never forms a whole-q onsite matrix here.
         pending=list(V)
@@ -1833,10 +1890,14 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None,
     for Vp in V:
         if not face_onsite:
             Vp = _finish_v(mesh, st0.Q)(Vp)
+            if row_basis is not None:jax.block_until_ready(Vp)
         out.append(z0.mu_basis.unpack_operator(Vp) if z0.mu_basis is not None else Vp)
+        if row_basis is not None:jax.block_until_ready(out[-1])
     for z, Sa in zip(zetas, S):
         Sa = _finish_shell(mesh, st0.Q)(Sa)
+        if row_basis is not None:jax.block_until_ready(Sa)
         z.shell = z0.mu_basis.unpack_axis(Sa, 1) if z0.mu_basis is not None else Sa
+        if row_basis is not None:jax.block_until_ready(z.shell)
         z.shell_slots = keep
     jax.block_until_ready((out,tuple(z.shell for z in zetas)))
     stage_seconds['finish']=time.perf_counter()-finish_started

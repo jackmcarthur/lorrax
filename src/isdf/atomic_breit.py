@@ -262,7 +262,7 @@ def authenticate_group(zetas,pairs,v_tables):
 
 
 def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_reciprocal',
-                          smooth_support=None,
+                          smooth_support=None, _row_basis=None,
                           radius,lm,centers_cart,q_plus_G_cart,
                           cell_volume,fft_points,support_radius,
                           minimum_atom_image_distance,reciprocal_prefactor,
@@ -305,6 +305,17 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
     from isdf.current_coefficients import CurrentCoefficientBanks
     coefficient_owner = rhs if isinstance(rhs, CurrentCoefficientBanks) else None
     owned_banks = coefficient_owner is not None
+    row_basis = coefficient_owner.row_basis if owned_banks else _row_basis
+    if _row_basis is not None and (owned_banks or any(not isinstance(v,jax.ShapeDtypeStruct) for v in rhs)):
+        raise ValueError('retained row preflight accepts only abstract coefficient operands')
+    if row_basis is not None:
+        from isdf.current_coordinates import authenticate,row_kernel
+        thin = authenticate(row_basis,zetas)
+        if body_metric != 'mixed_reciprocal' or smooth_rhs is not None:
+            raise ValueError('retained current rows require the mixed delta-only body')
+        expand_rows = row_kernel(zetas[0].mesh,zetas[0].store.Q)
+    else:
+        thin=()
     separate_halves = owned_banks and coefficient_owner.operand_kind == 'delta_and_ps'
     physical_mixed = False
     if smooth_support is not None:
@@ -347,6 +358,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                 or not np.array_equal(z.ngk_per_q,z0.ngk_per_q)
                 or not np.array_equal(z.gvec_components,z0.gvec_components)):
             raise ValueError("all current channels must share exact store, centroid and q/G geometry")
+    physical_mu=mu
+    if row_basis is not None:
+        mu=int(row_basis['rows'])
     r=np.asarray(radius,dtype=float);labels=np.asarray(lm)
     centers=np.asarray(centers_cart,dtype=float);K=np.asarray(q_plus_G_cart,dtype=float)
     volume=float(cell_volume);N=int(fft_points);R=float(support_radius);k0=float(reciprocal_prefactor)
@@ -364,6 +378,12 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         interpolation_degree=interpolation_degree,quadrature_order=quadrature_order)
     angular,radial=geometry['angular'],geometry['radial'];labels=angular['lm']
     nh,nr,na=len(labels),len(r),len(centers);nf=na*nh*nr
+    if owned_banks and row_basis is not None:
+        admitted_geometry=row_basis['admission']['geometry_binding']
+        if (tuple(admitted_geometry['radial_shape'])!=(na,nh,nr)
+                or body_head_slots is None
+                or admitted_geometry['body_head_identity']!=body_head_slots.get('payload_sha256')):
+            raise ValueError('retained current physical geometry differs from pre-replay admission')
     if owned_banks and coefficient_owner.radial_shape[:3] != (na, nh, nr):
         raise ValueError('streamed current coefficient radial geometry disagrees with provider')
     for value in rhs:
@@ -524,7 +544,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
     distribution_receipt=dict(mode='q',reason='direct q-owned Fourier input')
 
     def prepare_fourier_coefficients(state,*,caller_workspace_bytes=0.,caller_host_bytes=0.,
-                                     caller_phase_workspace=None):
+                                     caller_phase_workspace=None,_preflight_future_bytes=None):
         """Move independent Fourier rows once, retaining all onsite operands.
 
         Solved q banks and the support witness retain their existing lifetime.
@@ -537,6 +557,11 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         from isdf.zeta_mubatch import _to_mu_owner,_rows_to_q_local
         if any(not np.isfinite(v) or v<0 for v in (caller_workspace_bytes,caller_host_bytes)):
             raise ValueError('current Fourier caller workspace must be finite and nonnegative')
+        if row_basis is not None and _preflight_future_bytes is None:
+            admitted_layout=row_basis['admission']['fourier_layout']['mode']
+            if admitted_layout!='mu':
+                distribution_receipt.update(mode='q',reason='retained pre-replay admission selected q ownership')
+                return state
         if Q>=mesh.size or mu%mesh.size:
             distribution_receipt.update(mode='q',reason='q ownership covers the mesh')
             return state
@@ -584,7 +609,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         if slab:
             marker=abstract((Qp,gt),NamedSharding(mesh,P(XY,None)),jnp.bool_)
             q_tile=abstract((Qp,mu,gt),NamedSharding(mesh,qspec))
-            head=quote('neutral_head',neutral_head_kernel,((q_tile,)*3,(q_tile,)*3,marker))
+            head=quote('neutral_head',neutral_head_kernel,((q_tile,)*3,(q_tile,)*3,marker,*((thin,) if row_basis is not None else ())))
             head_increment=head.resident_increment
             head_marker_bytes=marker.size/mesh.size
         geometry_bytes=sum(v.size*v.dtype.itemsize for v in geometry)
@@ -598,10 +623,15 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         # original measured live set and original owner/capacity proof.
         bessel_bytes=geometry[0].size*8;angle_bytes=geometry[1].size*16
         host_future=5*bessel_bytes+4*angle_bytes+Q*gt*(3*8+len(radial['degrees'])*2*8+8*8)+caller_host_bytes
-        jax.block_until_ready(state)
+        if _preflight_future_bytes is None:
+            jax.block_until_ready(state)
+        elif (not np.isfinite(_preflight_future_bytes) or _preflight_future_bytes<0
+              or any(not isinstance(v,jax.ShapeDtypeStruct) for v in operands)):
+            raise ValueError('Fourier preflight requires abstract operands and a finite future live set')
         stats=[device.memory_stats() or {} for device in mesh.local_devices]
         measured=all('bytes_in_use' in value for value in stats)
         live_bytes=max((value.get('bytes_in_use',0) for value in stats),default=0)
+        if _preflight_future_bytes is not None:live_bytes+=float(_preflight_future_bytes)
         phase_peaks=dict(q_to_mu=live_bytes+conversion,
             Fourier=live_bytes+fourier,mu_to_q=live_bytes+returns)
         if slab:
@@ -620,7 +650,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             logical_q=Q,packed_mu=mu,solved_q_banks_retained=True,
             caller_workspace_bytes=float(caller_workspace_bytes),
             caller_phase_workspace_bytes=caller_phases,caller_actual_AOT=caller_aot)
-        if not accepted:return state
+        if not accepted and row_basis is not None and _preflight_future_bytes is None:
+            raise MemoryError('retained current Fourier phase exceeded its pre-replay admission')
+        if not accepted or _preflight_future_bytes is not None:return state
         record_stage_price('isdf.current_mu_Fourier',float(np.max(admission[:,1])))
         prepared=[]
         for value in operands:
@@ -791,11 +823,13 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
     if physical_mixed:
         from isdf.current_tail import laplacian3_positive_map,make_sobolev_norm_kernel
         tail_map = laplacian3_positive_map(compensation)
-        tail_kernel,tail_positive,tail_absolute = make_sobolev_norm_kernel(mesh,mu=mu,atoms=na,
+        tail_kernel,tail_positive,tail_absolute = make_sobolev_norm_kernel(mesh,mu=physical_mu,atoms=na,
             lm=labels,positive_map=tail_map,fft_points=N,volume=volume)
         tail_observer = (tail_kernel,put(tail_positive),put(tail_absolute))
 
     def prepare(coefficients):
+        if row_basis is not None and not owned_banks:
+            raise ValueError('retained runtime requires a completed authenticated current bank owner')
         if owned_banks:
             if coefficients is not None:
                 raise ValueError('streamed current provider consumes only its authenticated half-bank owner')
@@ -810,7 +844,19 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         moments = prepare_kernel(coefficients,M)
         if tail_observer is not None:
             kernel,L,A = tail_observer
-            norms = kernel(moments,L,A)
+            physical_moments=moments
+            if row_basis is not None:
+                physical_moments=[]
+                for B,q in zip(thin,moments):
+                    value=expand_rows(B,q)
+                    jax.block_until_ready(value)
+                    physical_moments.append(value)
+                physical_moments=tuple(physical_moments)
+                del value
+            norms = kernel(physical_moments,L,A)
+            if row_basis is not None:
+                jax.block_until_ready(norms)
+                del physical_moments
             sink = bundle.get('compensation_tail_diagnostics')
             if not isinstance(sink,dict):
                 raise ValueError('physical current tail observer requires its actual diagnostic sink')
@@ -879,7 +925,7 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                 vec,valid=vectors(qslice)
                 return valid&(np.einsum('qgi,qgi->qg',vec,vec)<=CURRENT_GAMMA_K2_EPS)
             marker=put_q_rows(head_rows,(gt,))
-            error,scale=neutral_head_kernel(*result,marker)
+            error,scale=neutral_head_kernel(*result,marker,*((thin,) if row_basis is not None else ()))
             error,scale=float(gather_to_host(error)),float(gather_to_host(scale))
             if error>2e-12+256*np.finfo(float).eps*scale:
                 raise ValueError('Slab current completion requires actual delta(0)=g(0) in its represented Fourier tiles')
@@ -888,14 +934,19 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
         return result
 
     if slab:
-        def neutral_head_local(delta,g,marker):
+        def neutral_head_local(delta,g,marker,*basis):
+            if row_basis is not None:
+                # Check physical centroids, expanding the two represented
+                # fields separately rather than testing a retained norm.
+                delta=tuple(B@value for B,value in zip(basis[0],delta))
+                g=tuple(B@value for B,value in zip(basis[0],g))
             error=jnp.max(jnp.stack([jnp.max(jnp.where(marker[:,None],abs(a-b),0))
                                    for a,b in zip(delta,g)]))
             scale=jnp.max(jnp.stack([jnp.max(jnp.where(marker[:,None],jnp.maximum(abs(a),abs(b)),0))
                                    for a,b in zip(delta,g)]))
             return jax.lax.pmax(error,XY),jax.lax.pmax(scale,XY)
         neutral_head_kernel=jax.jit(shard_map(neutral_head_local,mesh=mesh,
-            in_specs=((qspec,)*3,(qspec,)*3,P(XY,None)),out_specs=(P(),P()),check_vma=False))
+            in_specs=((qspec,)*3,(qspec,)*3,P(XY,None))+(((qspec,)*3,) if row_basis is not None else ()),out_specs=(P(),P()),check_vma=False))
 
     def kernel_difference_tile(t,pairs,v_tables):
         """D_target - D_bulk-point, keeping only the addressed q/G packet."""
@@ -920,6 +971,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
                                      sparse_rows,sparse_weights,bucket_arrays)
 
     def authenticate_kernel(pairs,v_tables):
+        if row_basis is not None:
+            from isdf.current_coordinates import authenticate
+            authenticate(row_basis,zetas)
         if (bundle.get('kernel')!=(SLAB_STATIC_KERNEL if slab else STATIC_KERNEL)
                 or bundle.get('body_metric')!=body_metric
                 or bundle.get('local_cross_policy')!=('onsite_smooth_neutral' if compensated
@@ -997,6 +1051,9 @@ def radial_breit_providers(zetas,rhs,*,smooth_rhs=None,body_metric='mixed_recipr
             'retained_spline_bytes','max_density_validation_error','validation_points')},
         field_tile=ft,centroid_tile=mt,geometry=geometry,compensation=compensation,
         prepare_kernel=prepare_kernel,fourier_kernel=fourier_kernel,
+        row_basis=row_basis,physical_mu=physical_mu,
+        neutral_head_kernel=neutral_head_kernel if slab else None,
+        tail_observer=tail_observer,
         onsite_kernel=make_onsite,
         onsite_face=onsite_face,onsite_face_kernel=make_onsite_face,
         onsite_face_packet_diagnostics=dict(

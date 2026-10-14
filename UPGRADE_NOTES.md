@@ -1,5 +1,16 @@
 # Upgrade notes
 
+## Unreleased — exact retained coordinates for physical current completion
+
+The physical mixed current route can carry the existing positive OWN factors'
+exact nonzero columns through local Fourier, pair and onsite contractions.
+It reconstructs physical centroid operators, shell columns and complete zeta
+restart outputs before publication. No spectrum cut, input setting or physical
+model changes. All future phases must fit before radial RHS replay; unsupported
+or unadmitted cases retain the full-coordinate route. Different reduction order
+requires material observable validation before treating this candidate as an
+accepted production optimization.
+
 ## Unreleased — reuse Cartesian primitives in circular current packets
 
 Delta-only atomic current replay evaluates matching Cartesian primitives once

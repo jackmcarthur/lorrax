@@ -2640,7 +2640,148 @@ def attach_local_augmentation(zeta_g, state, *, body_contract=None):
     return zeta_g
 
 
-def _price_current_contraction_aot(channels, state, kg, controls):
+def _price_retained_current(channels, state, group, row_basis):
+    """All future physical phases above the actual pre-replay live baseline.
+
+    Banks have not been allocated. Every kernel is the runtime owner; physical
+    reconstruction and native read/write transports are priced separately.
+    A failed collective quote returns admission=False before RHS consumption.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import all_gather_processes
+    from common.gpu_utils import device_budget_bytes,host_bytes_per_process
+    from runtime.aot_memory import aot_kernel_peak_bytes
+    from isdf.current_coordinates import row_kernel,operator_kernel
+    from isdf.zeta_mubatch import (_pair_tile_kernel,_v_tile_kernel,
+        _current_fourier_caller_workspace,_finish_v,_finish_shell,_add_q_owned)
+    z=channels[0];st=z.store;mesh=z.mesh
+    Q,Qp,M,R,G=int(st.Q),int(st.Q_pad),int(st.mu_pad),row_basis['rows'],int(st.g_tile)
+    na,nh,nr=len(state['centers_cart']),len(state['lm']),len(state['radius'])
+    # Bispinor TT specs have no head_slots callback. Each full q can name at
+    # most one one-leg source column, plus mandatory slot zero (_head_shell).
+    n_shell=1+len(np.asarray(state['sym'].irr_idx_q))
+    row_basis['shell_capacity']=n_shell
+    sh=NamedSharding(mesh,P(('x','y'),None,None))
+    shape=lambda dims,dtype=jnp.complex128,spec=None:jax.ShapeDtypeStruct(dims,dtype,
+        sharding=sh if spec is None else NamedSharding(mesh,spec))
+    clouds=tuple(shape((Qp,R,na*nh*nr)) for _ in channels)
+    moments=tuple(shape((Qp,R,na*nh*2)) for _ in channels)
+    physical_moments=tuple(shape((Qp,M,na*nh*2)) for _ in channels)
+    tile=shape((Qp,R,G));physical_tile=shape((Qp,M,G))
+    pairs=tuple((a,b) for a in range(3) for b in range(a,3))
+    V=tuple(shape((Qp,R,R)) for _ in pairs)
+    S=tuple(shape((Qp,M,n_shell)) for _ in channels)
+    v=shape((6,Qp,st.g_axis.carrier),spec=P(None,('x','y'),None))
+    vf=shape((Qp,st.g_axis.carrier),spec=P(('x','y'),None))
+    ng=shape((Qp,),jnp.int32,P(('x','y')))
+    slots=shape((Qp,n_shell),jnp.int32,P(('x','y'),None))
+    zero=shape((Qp,1,1));stub=((zero,zero,zero),)*3
+    thin=row_basis['thin'];quotes=[]
+    def quote(name,fn,args):
+        value=aot_kernel_peak_bytes(fn.lower(*args).compile())
+        if not value.cufft_measured:
+            raise MemoryError('retained current native workspace could not be measured')
+        quotes.append(dict(owner=name,resident_increment=value.resident_increment,
+                           total=value.total,native_workspace=value.cufft_scratch))
+        return value.resident_increment
+    size=lambda value:value.size*value.dtype.itemsize/mesh.size
+    bank=sum(map(size,clouds));moment=sum(map(size,moments))
+    persistent=bank+moment+sum(map(size,V))+sum(map(size,S))+size(v)+size(vf)+size(ng)+size(slots)+9*size(zero)
+    tail_norm_bytes=3*Qp*M*8/mesh.size
+    phases={}
+    phases['moments']=persistent+quote('moments',group['prepare_kernel'],
+        (clouds,shape((nh,2,nr),jnp.float64,P())))
+    degree=len(group['geometry']['radial']['degrees'])
+    geometry=(shape((Qp,degree,G,nr),jnp.float64,P(('x','y'),None,None,None)),
+              shape((Qp,na,nh,G),spec=P(('x','y'),None,None,None)),
+              shape((Qp,degree,2,G),jnp.float64,P(('x','y'),None,None,None)))
+    ft=quote('Fourier_q',group['fourier_kernel'],(clouds,moments,*geometry,shape((nh,),jnp.int32,P())))
+    # Smooth reduced tiles and the previous canonical writer tile remain live
+    # through Fourier/head; the latter is supplied by the canonical caller.
+    step=_pair_tile_kernel(mesh,G,pairs,use_local_augmentation=True,
+                           return_physical=True,retained_rows=True)
+    form=tuple(_v_tile_kernel(mesh,z.solver_kind,z.n_rmu_solve,G,debug_m=False,
+                             with_v=False,retained_rows=True) for z in channels)
+    caller=_current_fourier_caller_workspace(channels,pairs,(form,step),
+        (v,ng,slots,V,S,stub,vf),completion=None,write_physical=True,row_basis=row_basis)
+    phases['Fourier_q']=persistent+sum(map(size,geometry))+ft+caller['fourier_hold_bytes']
+    phases.update({key:persistent+value for key,value in caller['phase_workspace_bytes'].items()})
+    phases['onsite']=persistent+quote('onsite_q',group['onsite_kernel'](pairs),
+        (clouds,moments,*group['onsite_kernel_arguments']))
+    expand=row_kernel(mesh,Q)
+    expansion=max(quote('physical_moment_expand_'+str(c),expand,(B,m))
+                  for c,(B,m) in enumerate(zip(thin,moments)))
+    fullmom=sum(map(size,physical_moments))
+    phases['tail_moment_expansion']=persistent+fullmom+expansion
+    tail,L,A=group['tail_observer']
+    phases['tail']=persistent+fullmom+quote('physical_tail',tail,(physical_moments,L,A))
+    head=group['neutral_head_kernel']
+    if head is not None:
+        marker=shape((Qp,G),jnp.bool_,P(('x','y'),None))
+        phases['physical_Gamma']=persistent+6*size(tile)+size(marker)+caller['fourier_hold_bytes']+quote(
+            'physical_Gamma',head,((tile,)*3,(tile,)*3,marker,thin))
+    fullmatrix=shape((Qp,M,M))
+    expand_operator=operator_kernel(mesh)
+    operator=max(quote('operator_expand_'+str(i),expand_operator,(thin[a],V[i],thin[b]))
+                 for i,(a,b) in enumerate(pairs))
+    # Six completed physical body outputs coexist with the reduced onsite
+    # fields/matrices. The seventh physical matrix is the current correction.
+    fullV=6*size(fullmatrix)
+    phases['onsite']+=fullV
+    phases['body_onsite_expansion']=persistent+fullV+operator
+    phases['physical_onsite_add']=persistent+fullV+size(fullmatrix)+quote(
+        'physical_onsite_add',_add_q_owned(mesh),(fullmatrix,fullmatrix))
+    face=shape((Q,M,M),spec=P(None,'x','y'))
+    finish=quote('finish_V',_finish_v(mesh,Q),(fullmatrix,))
+    if z.mu_basis is not None:
+        unpack=jax.jit(z.mu_basis.unpack_operator)
+        finish+=quote('unpack_V',unpack,(face,))
+    shell_face=shape((Q,M,n_shell),spec=P(None,('x','y'),None))
+    shell_finish=quote('finish_shell',_finish_shell(mesh,Q),(S[0],))
+    if z.mu_basis is not None:
+        unpack_shell=jax.jit(lambda a:z.mu_basis.unpack_axis(a,1))
+        shell_finish+=quote('unpack_shell',unpack_shell,(shell_face,))
+    phases['finish']=persistent+fullV+6*size(face)+3*size(shell_face)+max(finish,shell_finish)
+    for name in tuple(phases):
+        if name not in ('moments','tail_moment_expansion','tail'):
+            phases[name]+=tail_norm_bytes
+    for name in ('onsite','body_onsite_expansion','physical_onsite_add','finish'):
+        phases[name]+=caller['retained_writer_tile_bytes']
+    # Ask the same provider to quote its optional mu distribution without
+    # allocating it. A declined mu layout still has the admitted q route.
+    group['prepare_fourier_coefficients'](dict(coefficients=clouds,moments=moments),
+        caller_phase_workspace=caller,_preflight_future_bytes=persistent+tail_norm_bytes)
+    layout=dict(group['fourier_distribution_receipt'])
+    stats=[device.memory_stats() or {} for device in mesh.local_devices]
+    measured=all('bytes_in_use' in value for value in stats)
+    baseline=max((value.get('bytes_in_use',0) for value in stats),default=0)
+    peaks={key:baseline+value for key,value in phases.items()}
+    if layout['mode']=='mu':
+        peaks.update({'mu_'+key:value for key,value in layout['phase_peaks'].items()})
+    # Q-owned host geometry plus its bounded spline builders. Replicated mu
+    # geometry was independently checked by the same optional-layout owner.
+    local_q=(Qp+mesh.size-1)//mesh.size
+    source=local_q*degree*G*nr*8;angles=local_q*na*nh*G*16
+    host=5*source+4*angles+local_q*G*(3*8+degree*2*8+8*8)+caller['host_bytes']
+    local=np.array([int(measured),max(peaks.values()),device_budget_bytes(),
+                    host,host_bytes_per_process(fraction=.7)],np.float64)
+    agreed=np.asarray(all_gather_processes(local))
+    accepted=bool(np.all(agreed[:,0]==1) and np.all(agreed[:,1]<=agreed[:,2])
+                  and np.all(agreed[:,3]<=agreed[:,4]))
+    return dict(scope='Exact retained OWN coordinates; all physical phases before RHS replay',
+        admitted=accepted,rows=R,physical_mu=M,shell_capacity=n_shell,
+        geometry_binding=dict(q_logical=Q,q_carrier=Qp,g_tile=G,g_carrier=int(st.g_axis.carrier),
+            g_logical=int(st.g_axis.logical),radial_shape=(na,nh,nr),
+            body_head_identity=group['body_head_slots_sha256']),
+        selection_digest=row_basis['selection_digest'],actual_live_baseline=baseline,
+        future_persistent=persistent,persistent_tail_norm_bytes=tail_norm_bytes,phase_peaks_bytes=peaks,actual_AOT=quotes,
+        caller_AOT=caller['actual_AOT'],fourier_layout=layout,future_host_bytes=host,
+        planned_peak_bytes=float(agreed[:,1].max()),budget_bytes=float(agreed[:,2].min()))
+
+
+def _price_current_contraction_aot(channels, state, kg, controls, *, row_basis=None, body_contract=None, witness=None):
     """Quote the actual local/mixed owners before any final bank allocation.
 
     Only shape descriptors enter the current coefficient operands. The
@@ -2659,6 +2800,7 @@ def _price_current_contraction_aot(channels, state, kg, controls):
     z = channels[0]
     st, mesh = z.store, z.mesh
     Qp, mu, gt = int(st.Q_pad), int(st.mu_pad), int(st.g_tile)
+    if row_basis is not None:mu=row_basis['rows']
     na, nh, nr = len(state['centers_cart']), len(state['lm']), len(state['radius'])
     nf = na*nh*nr
     shape = lambda dims,dtype=jnp.complex128,spec=P(('x','y'),None,None): jax.ShapeDtypeStruct(
@@ -2667,13 +2809,20 @@ def _price_current_contraction_aot(channels, state, kg, controls):
     # Head/layer/source admission has already run through the actual typed
     # witness. These computational kernels use the bulk onsite factors and
     # mixed body in both domains; head geometry changes operands, not HLO.
+    retained_controls={} if row_basis is None else dict(_row_basis=row_basis,smooth_support=witness,**body_contract)
+    retained_controls.setdefault('reciprocal_prefactor',-8*np.pi/state['cell_volume'])
     providers = radial_breit_providers(channels,clouds,body_metric='mixed_reciprocal',
         radius=state['radius'],lm=state['lm'],centers_cart=state['centers_cart'],
         q_plus_G_cart=kg,cell_volume=state['cell_volume'],fft_points=state['fft_points'],
         support_radius=state['support_radius'],minimum_atom_image_distance=state['minimum_atom_image_distance'],
-        reciprocal_prefactor=-8*np.pi/state['cell_volume'],current_basis_rows=state['current_basis_rows'],
-        **controls)
+        current_basis_rows=state['current_basis_rows'],
+        **retained_controls,**controls)
     group = providers[0]['group_provider']
+    if row_basis is not None:
+        result=_price_retained_current(channels,state,group,row_basis)
+        del providers,group
+        gc.collect()
+        return result
     pairs = tuple((a,b) for a in range(3) for b in range(a,3))
     moments = tuple(shape((Qp,mu,na*nh*2)) for _ in range(3))
     quotes = []
@@ -2853,6 +3002,7 @@ def attach_current_augmentation(zetas, state, *, body_contract):
         witness = certify_smooth_current_support(state['wfn'],state['plan'],channels,
             body_contract['body_head_slots'],centers_cart=state['centers_cart'],
             support_radius=state['support_radius'])
+    row_basis=None
     workspace=_current_contract_workspace_bytes(qpad=channels[0].store.Q_pad,
         mu=channels[0].store.mu_pad,atoms=len(state['centers_cart']),harmonics=len(state['lm']),
         radial_points=len(state['radius']),g_tile=channels[0].store.g_tile,shards=channels[0].mesh.size,
@@ -2873,8 +3023,23 @@ def attach_current_augmentation(zetas, state, *, body_contract):
     kg = (gv+qfrac[:,None])@state['reciprocal']
     controls={key:state[key] for key in ('interpolation_degree','quadrature_order','fourier_points') if key in state}
     if physical:
-        state['contraction_actual_AOT'] = _price_current_contraction_aot(channels,state,kg,controls)
-    coefficients = deferred.replay(channels,smooth_support=witness) if deferred is not None else None
+        from isdf.current_coordinates import select
+        row_basis=select(channels)
+        if row_basis is not None:
+            receipt=_price_current_contraction_aot(channels,state,kg,controls,
+                row_basis=row_basis,body_contract=body_contract,witness=witness)
+            state['retained_current_coordinates']=receipt
+            row_basis['admission']=receipt
+            if not receipt['admitted']:
+                row_basis=None
+        if row_basis is None:
+            state['contraction_actual_AOT'] = _price_current_contraction_aot(channels,state,kg,controls)
+        else:
+            state['contraction_actual_AOT']=receipt
+        if channels[0].print_fn is not None:
+            channels[0].print_fn('  current retained coordinates: '+str(state.get(
+                'retained_current_coordinates',dict(admitted=False,reason='unsupported, full rank or selection capacity'))))
+    coefficients = deferred.replay(channels,smooth_support=witness,row_basis=row_basis) if deferred is not None else None
     providers=radial_breit_providers(channels,coefficients if coefficients is not None else state['rhs'],
         smooth_rhs=None if coefficients is not None else state['smooth_rhs'],
         body_metric='mixed_reciprocal' if physical else 'compensated',smooth_support=witness,

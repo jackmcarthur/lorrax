@@ -606,6 +606,50 @@ The retained spectrum and discarded feature weight are diagnostics;
 independent current-action and occupied self-energy comparisons determine
 the physical fitting error.
 
+
+## Exact coordinates of the existing current pseudoinverse
+
+For the physical mixed route with positive OWN factors, the optional internal
+carrier removes only exactly zero columns of each already fitted factor.
+`isdf.current_coordinates` inspects both logical axes used by `solve_at_logical`,
+excludes q ghosts, refuses nonfinite factors, and binds the exact column IDs to
+the original factor/source owners. It introduces no new eigenvalue threshold.
+Let each selected factor be \(B_c[\mu,r_c]\), with its existing inverse square-root
+weights. With stored Fourier arrays oriented as \([\mu,G]\),
+
+\[
+x_c=B_c^\dagger Z_c,\qquad d_c=B_c^\dagger R_c,\qquad
+\zeta_c=B_c x_c,\quad \delta_c=B_c\widehat\delta_c,\quad
+g_c=B_c\widehat g_c.
+\]
+
+The radial, angular and compensation maps act on feature axes, so the reduced
+local coefficients use those same procedural owners. Each ordered mixed Gram
+is accumulated with the incumbent four products in retained coordinates,
+then expanded as \(V_{ab}=\overline B_a W_{ab}B_b^T\). This orientation differs
+from \(B_a W_{ab}B_b^\dagger\). Each channel keeps its own factor and selection.
+Body and onsite matrices expand separately and are added in that order.
+Writer and shell packets separately expand \(B_c x_c+B_c\widehat\delta_c\),
+preserving the physical smooth-then-delta addition. The Gamma gate compares
+expanded delta and compensation; the Sobolev observer retains its absolute-map
+rounding envelope on expanded physical moments, not a retained-coordinate norm.
+
+Before consuming any RHS, the existing shape-only provider preflight prices
+thin-factor selection, full input projection, reduced banks and all later
+read/form, Fourier, pair, physical expansion, onsite, head/tail and canonical
+writer/finish phases. The optional mu Fourier layout uses the same phase owner.
+Every rank must admit capacity; a declined selection keeps the incumbent route.
+After packet consumption an authentication/capacity failure aborts. No full
+solved coefficient cloud is retained beside its reduced replacement. Onsite
+completion overwrites one physical body slot after each fenced addition.
+Required restart payloads and public physical centroid interfaces remain full.
+
+This is an algebraic change of internal coordinates, with a changed floating
+reduction order. Synthetic algebra tests do not certify an ill-conditioned
+material: actual packet errors, full saved operators and fixed-operand public
+occupied exchange must also be checked. Operation counts do not certify a
+workflow speed target.
+
 ## Implementation and accuracy
 
 The [raw-parent fitting stage](../architecture/zeta_fit_face_psi_cct.md) remains

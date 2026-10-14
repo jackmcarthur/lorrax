@@ -48,11 +48,21 @@ def _fit_binding(zeta):
             id(zeta.mu_basis), id(zeta.mesh))
 
 
+def _row_binding(basis):
+    if basis is None:
+        return None
+    admission=basis.get('admission',{})
+    return (id(basis),basis['selection_digest'],basis.get('shell_capacity'),
+            id(admission),admission.get('admitted'),admission.get('selection_digest'),
+            repr(admission.get('geometry_binding')),
+            admission.get('fourier_layout',{}).get('mode'))
+
+
 class CurrentCoefficientBanks:
     """Sealed OWN3 coefficient payload, produced only by a completed stream."""
     __slots__ = ('_zetas', '_factors', '_bindings', '_banks', '_bank_ids',
                  'shape', 'radial_shape', 'identity', 'angular_identity',
-                 '_operand_kind', '_smooth_support')
+                 '_operand_kind', '_smooth_support', 'row_basis', '_row_binding')
 
     @property
     def operand_kind(self):
@@ -73,6 +83,8 @@ class CurrentCoefficientBanks:
         self.shape, self.radial_shape = stream.shape, stream.radial_shape
         self.identity, self.angular_identity = stream.identity, stream.angular_identity
         self._operand_kind, self._smooth_support = stream.operand_kind, stream.smooth_support
+        self.row_basis = stream.row_basis
+        self._row_binding = stream._row_binding
         stream._banks = None
 
     def authenticate(self, zetas):
@@ -85,6 +97,11 @@ class CurrentCoefficientBanks:
                        for z, saved in zip(zetas, self._factors))
                 or tuple(id(v) for pair in self._banks for v in pair) != self._bank_ids):
             raise ValueError('streamed current factor/source/q/basis or bank owner changed')
+        if _row_binding(self.row_basis) != self._row_binding:
+            raise ValueError('streamed current retained-coordinate owner or admission changed')
+        if self.row_basis is not None:
+            from isdf.current_coordinates import authenticate
+            authenticate(self.row_basis, zetas)
         if self.smooth_support is not None:
             self.smooth_support.authenticate(zetas)
         for pair in self._banks:
@@ -100,6 +117,7 @@ class CurrentCoefficientBanks:
         self._banks = None
         self._zetas = self._factors = ()
         self._smooth_support = None
+        self.row_basis = None
 
 
 class CurrentCoefficientStream:
@@ -115,7 +133,7 @@ class CurrentCoefficientStream:
     """
     def __init__(self, zetas, *, atoms, harmonics, radial_points, radial_packet,
                  identity, angular_identity, resident_bytes=0., packet_features=None,
-                 operand_kind='delta_and_ps', smooth_support=None):
+                 operand_kind='delta_and_ps', smooth_support=None, row_basis=None):
         import jax
         import jax.numpy as jnp
         from jax.sharding import NamedSharding, PartitionSpec as P
@@ -141,7 +159,23 @@ class CurrentCoefficientStream:
         if min(self.radial_shape) < 1 or nr % rp:
             raise ValueError('streamed current radial packets must exactly cover the radial axis')
         self.identity, self.angular_identity = identity, angular_identity
-        self.shape = (int(st.Q_pad), int(st.mu_pad), na * nh * nr)
+        self.row_basis = row_basis
+        rows = int(st.mu_pad)
+        if row_basis is not None:
+            from isdf.current_coordinates import authenticate
+            if operand_kind != 'delta':
+                raise ValueError('retained coordinates require the authenticated delta-only route')
+            authenticate(row_basis, self._zetas)
+            admission=row_basis.get('admission',{})
+            if (not admission.get('admitted',False)
+                    or admission.get('selection_digest')!=row_basis['selection_digest']
+                    or admission.get('shell_capacity')!=row_basis['shell_capacity']
+                    or tuple(admission['geometry_binding']['radial_shape'])!=(na,nh,nr)):
+                raise ValueError('retained current banks require complete pre-replay phase admission')
+            rows = row_basis['rows']
+        self.shape = (int(st.Q_pad), rows, na * nh * nr)
+        self.input_shape = (int(st.Q_pad), int(st.mu_pad))
+        self._row_binding = _row_binding(row_basis)
         self.packet_features = na * nh * rp
         self.packet_width = self.packet_features if packet_features is None else int(packet_features)
         if self.packet_width < self.packet_features or (packet_features is not None
@@ -159,18 +193,24 @@ class CurrentCoefficientStream:
         self._factors = tuple(_factor_leaves(z) for z in self._zetas)
         self._solves = tuple(_local_coefficient_solve(z.mesh, z.solver_kind,
             z.n_rmu_solve, st.Q, donate_rhs=True) for z in self._zetas)
+        if row_basis is not None:
+            from isdf.current_coordinates import row_kernel
+            self._solves = (row_kernel(z0.mesh, st.Q, project=True, donate=True, logical_mu=z0.n_rmu_solve),)*3
+        self._solve_factors = tuple(z.factor for z in self._zetas) if row_basis is None else row_basis['thin']
         self._store = radial_packet_store(z0.mesh, na, nh, nr, rp, self.packet_features)
         sharding = NamedSharding(z0.mesh, P(('x', 'y'), None, None))
         # Compile the exact owners before any final cloud exists. In
         # particular a nonaliased full-bank update would defeat streaming.
-        packet = jax.ShapeDtypeStruct((self.shape[0], self.shape[1], self.packet_width),
+        packet = jax.ShapeDtypeStruct((*self.input_shape, self.packet_width),
                                      jnp.complex128, sharding=sharding)
         cloud = jax.ShapeDtypeStruct(self.shape, jnp.complex128, sharding=sharding)
+        stored_packet = jax.ShapeDtypeStruct((self.shape[0], self.shape[1], self.packet_width),
+                                           jnp.complex128, sharding=sharding)
         self.aot_quotes = []
         for name, fn, args in (
-                *((f'OWN{c+1}_packet_solve', fn, (z.factor, packet))
-                  for c, (z, fn) in enumerate(zip(self._zetas, self._solves))),
-                ('donated_final_bank_store', self._store, (cloud, packet, jnp.int32(0)))):
+                *((f'OWN{c+1}_packet_solve', fn, (factor, packet))
+                  for c, (factor, fn) in enumerate(zip(self._solve_factors, self._solves))),
+                ('donated_final_bank_store', self._store, (cloud, stored_packet, jnp.int32(0)))):
             stats = fn.lower(*args).compile().memory_analysis()
             quote = dict(owner=name, arguments=int(stats.argument_size_in_bytes),
                 outputs=int(stats.output_size_in_bytes), temporary=int(stats.temp_size_in_bytes),
@@ -198,6 +238,11 @@ class CurrentCoefficientStream:
         self._coverage = np.zeros((3, self._kinds, nr // rp), dtype=bool)
 
     def _authenticate(self):
+        if _row_binding(self.row_basis) != self._row_binding:
+            raise ValueError('current stream retained-coordinate owner or admission changed')
+        if self.row_basis is not None:
+            from isdf.current_coordinates import authenticate
+            authenticate(self.row_basis, self._zetas)
         if self._banks is None or tuple(_fit_binding(z) for z in self._zetas) != self._bindings:
             raise ValueError('current coefficient stream is consumed or its fit binding changed')
         if any(len(_factor_leaves(z)) != len(saved)
@@ -215,11 +260,11 @@ class CurrentCoefficientStream:
                 or k < 0 or k >= self._kinds or r0 < 0 or r0 >= self.radial_shape[2] or r0 % rp
                 or self._coverage[c, k, r0 // rp]):
             raise ValueError('current packet channel/kind/radial coverage is invalid or repeated')
-        if packet.ndim != 3 or packet.shape[:2] != self.shape[:2] or packet.shape[2] != self.packet_width:
+        if packet.ndim != 3 or packet.shape[:2] != self.input_shape or packet.shape[2] != self.packet_width:
             raise ValueError('compressed current packet shape disagrees with the radial map')
         _require_q_owned(packet, self._zetas[0].mesh, packet.shape,
                          name='consumed compressed current RHS packet')
-        solved = self._solves[c](self._zetas[c].factor, packet)
+        solved = self._solves[c](self._solve_factors[c], packet)
         self._banks[c][k] = self._store(self._banks[c][k], solved, jnp.int32(r0))
         self._banks[c][k].block_until_ready()
         self._coverage[c, k, r0 // rp] = True

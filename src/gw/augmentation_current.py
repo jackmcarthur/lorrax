@@ -165,7 +165,7 @@ class DeferredCurrentDensity:
                 for key in ('L_q', 'lu_piv', 'local_augmentation', 'shell', 'q0_response_rhs')):
             raise ValueError('deferred current replay requires the actual charge zeta to be closed')
 
-    def replay(self, channels, *, smooth_support=None):
+    def replay(self, channels, *, smooth_support=None, row_basis=None):
         import jax
         import jax.numpy as jnp
         from jax.sharding import NamedSharding, PartitionSpec as P
@@ -224,9 +224,10 @@ class DeferredCurrentDensity:
             quotes.append(dict(owner=label,arguments=int(m.argument_size_in_bytes),
                 outputs=int(m.output_size_in_bytes),temporary=int(m.temp_size_in_bytes),
                 aliases=int(m.alias_size_in_bytes)))
-        final_banks = 3*kinds*16*channels[0].store.Q_pad*channels[0].store.mu_pad*na*nh*nr/mesh.size
+        rows = channels[0].store.mu_pad if row_basis is None else row_basis['rows']
+        final_banks = 3*kinds*16*channels[0].store.Q_pad*rows*na*nh*nr/mesh.size
         external = live_device_bytes(s,self.charge_state,self.source,self.coefficients,
-                                     tuple(z.factor for z in channels))
+                                     tuple(z.factor for z in channels), row_basis)
         points = 4*16*npar*nb*4*npoint/mesh.size
         angular = s['angular_workspace']['total']
         # Full current normal-source and angular workspaces retain their
@@ -251,7 +252,7 @@ class DeferredCurrentDensity:
             radial_points=nr,radial_packet=rp,identity=s['identity'],
             angular_identity=s['angular_support_identity'],resident_bytes=external+packet_work,
             packet_features=nfp,operand_kind='delta_and_ps' if kinds==2 else 'delta',
-            smooth_support=smooth_support)
+            smooth_support=smooth_support,row_basis=row_basis)
         s['replay_preflight']['actual_solve_store_AOT'] = stream.aot_quotes
         s['replay_preflight']['solve_store_memory_receipt'] = stream.memory_receipt
         # Only final output banks exist, with no charge cloud or full raw
