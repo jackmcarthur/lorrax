@@ -65,15 +65,44 @@ def _say(print_fn, started, msg):
     print_fn(f"  CD +{time.monotonic() - started:7.1f}s {msg}")
 
 
+#: Sigma_x identity tolerance (``GATE cd_sigma_x_identity``), meV.  The CD pair densities and V_q reproduce
+#: the static exchange to round-off: measured 3.3e-10 meV (Fe 64 k x 26 bands) and 2.1e-11 meV (Si 4x4x4
+#: SOC, 8 k x 40 bands), so the design target 1e-3 meV (docs/dev/cd_frequency_integration.md) has six
+#: orders of margin and still catches a wrong pair orientation, occupation table or q weight.
+SIGMA_X_IDENTITY_TOL_MEV = 1e-3
+
+
+def sigma_x_identity_check(sx_cd_diag_ry, sx_ref_diag_ry):
+    """``(max |Re diag Sigma_x(CD) - Re diag Sigma_x(static)| in meV, note)``; refuses above the tolerance.
+
+    Parameters: two arrays of one shape ``[k, m]`` (Ry, real or complex) -- the CD route's and the
+    static route's diagonal exchange on the same rows.  Raises ``ValueError`` (``GATE
+    cd_sigma_x_identity``) when the defect exceeds :data:`SIGMA_X_IDENTITY_TOL_MEV` or is not finite.
+    """
+    dmax = float(np.max(np.abs(np.real(sx_cd_diag_ry) - np.real(sx_ref_diag_ry)))) * float(RYD_TO_EV) * 1e3
+    note = f"max|diag Sigma_x(CD) - diag Sigma_x(static)| = {dmax:.3e} meV"
+    if not dmax <= SIGMA_X_IDENTITY_TOL_MEV:
+        raise ValueError(f"GATE cd_sigma_x_identity: {note}; want: <= {SIGMA_X_IDENTITY_TOL_MEV:g} meV; why: the CD "
+                         "pair densities and V_q must reproduce the static exchange (head off)")
+    return dmax, note
+
+
 def ledger_sample(stage, chunk, seconds):
-    """One device-ledger row (this process's first device): bytes in use, the pool high-water since
-    the previous row (``runtime.xla_memory.pool_high_water``, reset here), live array count."""
+    """One device-ledger row (this process's first device): bytes in use, pool high-water, live arrays.
+
+    The high-water is read WITHOUT a reset.  ``common.timing`` owns the reset (one per section boundary)
+    and charges each interval's peak to the section on top of the stack; a reset here, once per chunk,
+    left the stage table only the interval after the last row (Fe: CD stage 0.36 GB reported against
+    4.30 GB in this ledger).  The value is therefore cumulative since the enclosing section boundary,
+    and the leak criterion is that it does not rise after the first chunk of each axis (with
+    ``bytes_in_use`` equal between equal-shaped chunks).
+    """
     from runtime.xla_memory import pool_high_water
     try:
         st = jax.local_devices()[0].memory_stats() or {}
     except Exception:  # pragma: no cover - CPU backends have no stats
         st = {}
-    high = pool_high_water(reset=True)
+    high = pool_high_water(reset=False)
     return dict(stage=stage, chunk=int(chunk), seconds=round(float(seconds), 3),
                 bytes_in_use=int(st.get("bytes_in_use", -1)), pool_high_water=-1 if high is None else int(high),
                 peak_bytes_in_use=int(st.get("peak_bytes_in_use", -1)), live_arrays=len(jax.live_arrays()))
@@ -535,12 +564,8 @@ def compute_sigma_c_cd_omega_grid(
             else:
                 ref = None
             if ref is not None:
-                dmax = float(np.max(np.abs(np.real(np.diagonal(sx_cd_h, axis1=1, axis2=2))
-                                            - np.real(np.diagonal(ref, axis1=1, axis2=2)))) * EV * 1e3)
-                sx_note = f"max|diag Sigma_x(CD) - diag Sigma_x(static)| = {dmax:.3e} meV"
-                if dmax > 0.05:
-                    raise ValueError(f"GATE cd_sigma_x_identity: {sx_note}; want: <= 0.05 meV; why: the CD pair "
-                                     "densities and V_q must reproduce the static exchange (head off)")
+                _, sx_note = sigma_x_identity_check(np.diagonal(sx_cd_h, axis1=1, axis2=2),
+                                                    np.diagonal(ref, axis1=1, axis2=2))
         except ValueError:
             raise
         except Exception as exc:  # shape/layout surprises are reported, never silently passed

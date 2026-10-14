@@ -61,12 +61,14 @@ step that removes the limit.
 refuse), `cd_head_unimplemented` (`head_correction = off` only), `cd_linalg_local` (`linalg = local`
 only), `cd_band_extrapolation_unimplemented`, `cd_single_eta` (no per-window η), `cd_knot_step`,
 `cd_imaginary_nodes`, `cd_residue_reach` / `cd_residue_coverage` (run time), `cd_sigma_x_identity`
-(run time: the CD pair densities must reproduce the static Σ_x to 0.05 meV), `cd_finite`.
+(run time: the CD pair densities must reproduce the static Σ_x to 1e-3 meV,
+`SIGMA_X_IDENTITY_TOL_MEV`; measured 3.3e-10 meV Fe, 2.1e-11 meV Si), `cd_finite`.
 
 ## Outputs beside the deck (rank 0)
 
 `cd_sigma_own_energy.npz` (the diagonal at the DFT energies and its anchor, imaginary and real parts),
 `cd_sigma_receipt.json` (recipe, J, reach, chunks and per-unit bytes, per-stage seconds, Σ_x identity,
-symmetry certificate), `cd_leak_ledger.csv` (per chunk: seconds, bytes in use, pool high-water since
-the previous row, live arrays).  `LORRAX_CD_STAR_CERTIFICATE=N` (instrument, off by default) computes
+symmetry certificate), `cd_leak_ledger.csv` (per chunk: seconds, bytes in use, pool high-water read without reset --
+cumulative since the enclosing stage boundary, which `common.timing` owns -- and live arrays; a leak
+shows as a rise after the first chunk).  `LORRAX_CD_STAR_CERTIFICATE=N` (instrument, off by default) computes
 one non-identity member of N k stars directly and compares it with the wedge-unfolded cube.
