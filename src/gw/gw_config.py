@@ -1640,6 +1640,16 @@ _DEFAULTS = {
     "sigma_out_of_grid": "cover",
     "sigma_w_model": "mpa",
     "sigma_w_accuracy": "production",
+    # ``sigma_frequency_integration``: how Sigma_c(omega) integrates over W's
+    # frequency.  pole_model = the time-domain/pole executor of
+    # sigma_w_model = mpa | shared_pole (every existing deck, bit-identical);
+    # contour_deformation = imaginary-axis quadrature + real-axis residues on
+    # the exact ISDF W(z), streamed (gw.cd).  The cd_* sub-keys are its own.
+    "sigma_frequency_integration": "pole_model",
+    "cd_imaginary_nodes": 96,
+    "cd_knot_step_ev": 0.0625,
+    "cd_residue_reach_ev": "auto",
+    "cd_knot_chunk": 0,
     # "" = the shared-pole resolver's own line and imaginary ladders.
     # "<line eV list> | <imaginary eV list>" replaces both with explicit
     # sites (gw.shared_pole_recipe.parse_support_sites); the height, held
@@ -2204,6 +2214,106 @@ def _input_key_type(key, default):
     return str
 
 
+def _resolve_cd_inputs(params):
+    """Validate the contour-deformation deck surface once (``gw.cd``).
+
+    Every refusal names ``GATE cd_*``, the key, ``got:``/``want:``/``why:``
+    (docs/dev/QUALITY_PATTERNS.md, refusal-gate rubric).  The default
+    ``pole_model`` leaves every existing deck untouched; the CD sub-keys refuse
+    by name outside the CD route, and the pole-model keys refuse inside it.
+    IMPLEMENTATION LIMITS of the first landing (cd_production_design.md
+    section 0): ``head_correction = off``, ``linalg = local``, one eta,
+    ``use_band_extrapolation = false``.
+    """
+    named = params[_DECK_NAMED_KEYS]
+    value = str(params["sigma_frequency_integration"]).strip().lower()
+    if value not in ("pole_model", "contour_deformation"):
+        raise ValueError(
+            f"GATE cd_enum: sigma_frequency_integration got: {value!r}; "
+            "want: pole_model | contour_deformation; why: unknown frequency integration")
+    params["sigma_frequency_integration"] = value
+    cd_keys = ("cd_imaginary_nodes", "cd_knot_step_ev", "cd_residue_reach_ev", "cd_knot_chunk")
+    if value != "contour_deformation":
+        for key in cd_keys:
+            if key in named:
+                raise ValueError(
+                    f"GATE cd_applicability: {key} got: {params[key]!r} with "
+                    f"sigma_frequency_integration={value!r}; want: contour_deformation; "
+                    "why: only the CD route consumes it")
+        return
+    mode = str(params["compute_mode"]).strip().lower()
+    if mode != "mpa":
+        raise ValueError(
+            "GATE cd_applicability: sigma_frequency_integration got: contour_deformation "
+            f"with compute_mode={mode!r}; want: compute_mode=mpa; why: CD is a frequency "
+            "integration of the dynamic full-frequency Sigma")
+    for key in sorted(named):
+        if key in ("sigma_w_model", "sigma_w_accuracy", "sigma_w_support_sites_ev",
+                   "write_w", "write_poles", "mpa_fit_reuse_file") or key.startswith("mpa_"):
+            raise ValueError(
+                f"GATE cd_applicability: {key} got: {params[key]!r} with "
+                "sigma_frequency_integration=contour_deformation; want: the key absent; "
+                "why: CD has no pole model, no W sample bank and no fit to reuse")
+    diagrams = str(params.get("screening_diagrams", "w_rpa")).strip().lower()
+    if diagrams != "w_rpa":
+        raise ValueError(
+            f"GATE cd_applicability: screening_diagrams got: {diagrams!r} with contour_deformation; "
+            "want: w_rpa; why: the CD W(z) stream is the RPA Dyson solve of the exact chi0")
+    head = str(params.get("head_correction", "full")).strip().lower()
+    if head != "off":
+        raise NotImplementedError(
+            f"GATE cd_head_unimplemented: head_correction got: {head!r} with contour_deformation; "
+            "want: off; why: the q->0 head at the CD nodes is not evaluated yet (IMPLEMENTATION LIMIT; "
+            "both CD references were built head-off)")
+    linalg = str(params.get("linalg", "local")).strip().lower()
+    if linalg != "local":
+        raise NotImplementedError(
+            f"GATE cd_linalg_local: linalg got: {linalg!r} with contour_deformation; want: local; "
+            "why: the CD Dyson pair runs the bank equations as a local batched LU over (z, q); the "
+            "distributed arm is not wired (IMPLEMENTATION LIMIT)")
+    eta = float(params["sigma_regularization_ev"])
+    h = float(params["cd_knot_step_ev"])
+    if not (np.isfinite(h) and 0.0 < h <= eta / 4.0 + 1e-15):
+        raise ValueError(
+            f"GATE cd_knot_step: cd_knot_step_ev got: {h!r}; want: 0 < h <= eta/4 = {eta / 4.0:g} eV "
+            "(sigma_regularization_ev/4); why: the Hermite residue law is certified at h <= eta/4")
+    n_imag = int(params["cd_imaginary_nodes"])
+    if n_imag < 5:
+        raise ValueError(f"GATE cd_imaginary_nodes: cd_imaginary_nodes got: {n_imag}; want: >= 5; "
+                         "why: the two-panel tan-mapped rule needs both panels")
+    params["cd_imaginary_nodes"] = n_imag
+    reach = str(params["cd_residue_reach_ev"]).strip().lower()
+    if reach != "auto":
+        try:
+            if not float(reach) > 0.0:
+                raise ValueError
+        except ValueError:
+            raise ValueError(
+                f"GATE cd_residue_reach: cd_residue_reach_ev got: {reach!r}; want: auto or a positive "
+                "energy in eV; why: the real-axis knot grid must cover every live residue") from None
+    params["cd_residue_reach_ev"] = reach
+    if int(params["cd_knot_chunk"]) < 0:
+        raise ValueError(f"GATE cd_knot_chunk: got: {params['cd_knot_chunk']!r}; want: >= 0 (0 = planner)")
+    patches = str(params.get("sigma_omega_patches_ev", "") or "").strip()
+    if patches:
+        for item in patches.split(","):
+            parts = [p.strip() for p in item.split(":") if p.strip()]
+            if len(parts) >= 3 and abs(float(parts[2]) - eta) > 1e-12:
+                raise ValueError(
+                    f"GATE cd_single_eta: sigma_omega_patches_ev names eta {parts[2]} in {item.strip()!r}; "
+                    f"want: one eta = sigma_regularization_ev = {eta:g}; why: a second eta is a second "
+                    "W knot set (per-window eta is not implemented in CD v1)")
+    enabled, _explicit = resolve_band_extrapolation(
+        params["use_band_extrapolation"], params["sigma_band_extrapolation"],
+        print_fn=lambda *a, **k: None)
+    if enabled:
+        raise NotImplementedError(
+            "GATE cd_band_extrapolation_unimplemented: use_band_extrapolation got: true (the parser "
+            "default) with contour_deformation; want: use_band_extrapolation = false; why: the CD "
+            "accumulator does not yet partition its l-sum into the three bracket counts "
+            "(IMPLEMENTATION LIMIT)")
+
+
 def _resolve_shared_pole_inputs(params):
     """Validate the shared-pole deck surface once, preserving explicitness."""
     from .shared_pole_recipe import shared_real_pole_v1_r3b as recipe
@@ -2549,6 +2659,11 @@ def _input_response(
         out_of_grid=str(params["sigma_out_of_grid"]).strip().lower(),
         w_model=str(params["sigma_w_model"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
+        frequency_integration=str(params["sigma_frequency_integration"]),
+        cd_imaginary_nodes=int(params["cd_imaginary_nodes"]),
+        cd_knot_step_ev=float(params["cd_knot_step_ev"]),
+        cd_residue_reach_ev=str(params["cd_residue_reach_ev"]),
+        cd_knot_chunk=int(params["cd_knot_chunk"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
@@ -3304,6 +3419,7 @@ def read_lorrax_input(filename: str) -> dict:
         params[_DECK_NAMED_KEYS] = frozenset()
     _require_sys_dim(params, filename)
     _resolve_shared_pole_inputs(params)
+    _resolve_cd_inputs(params)
     params[_LINALG_RESOLUTION] = resolve_linalg(params)
     _counts = resolve_band_counts(params, deck_named=params[_DECK_NAMED_KEYS])
     params[_BAND_COUNTS] = _counts
@@ -4001,6 +4117,13 @@ class DynamicSigmaConfig:
     out_of_grid: str = "cover"
     w_model: str = "mpa"
     w_accuracy: str = "production"
+    #: ``sigma_frequency_integration``: pole_model | contour_deformation
+    #: (``gw.cd``; gates in :func:`_resolve_cd_inputs`), and the CD sub-keys.
+    frequency_integration: str = "pole_model"
+    cd_imaginary_nodes: int = 96
+    cd_knot_step_ev: float = 0.0625
+    cd_residue_reach_ev: str = "auto"
+    cd_knot_chunk: int = 0
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
     #: resolver's own ladders) or "<line eV list> | <imaginary eV list>",
     #: an explicit support geometry for support-rule studies.  Parsed and

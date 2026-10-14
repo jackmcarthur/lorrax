@@ -1412,8 +1412,17 @@ def _compute_mpa_sigma(
         band_count_point, extrapolate_sigma_body, plan_sigma_band_brackets)
     from .ppm_windows import sigma_regularization_for_config
     sigma_w_model = getattr(config.sigma, "w_model", "mpa")
-    fit_path, head_fit_path, fit_identity, fit_digest = _mpa_sigma_model_resources(
-        W_by_role, sigma_w_model, config.head.correction)
+    cd_handle = W_by_role.get("cd_stream")
+    if cd_handle is not None:
+        # Contour deformation (gw.cd.sigma is the body kernel below): no fitted
+        # model and no body-bound head; head_correction = off is enforced at
+        # parse (GATE cd_head_unimplemented).  Everything else on this seam --
+        # eta, Fermi reference, branches, finalize -- is shared unchanged.
+        fit_path = head_fit_path = fit_identity = fit_digest = None
+        print_fn("  Sigma frequency integration: contour_deformation (gw.cd)")
+    else:
+        fit_path, head_fit_path, fit_identity, fit_digest = _mpa_sigma_model_resources(
+            W_by_role, sigma_w_model, config.head.correction)
     _xi = sigma_regularization_for_config(config)
     print_fn(_xi.describe())
     if material_class == "metal":
@@ -1579,6 +1588,11 @@ def _compute_mpa_sigma(
             sigma_lorentz = sigma_lorentz.at[1].add(ct_shell).at[2].add(tt_shell)
         else:
             body = sector_result
+    elif cd_handle is not None:
+        from .cd.sigma import compute_sigma_c_cd_omega_grid
+        body = compute_sigma_c_cd_omega_grid(
+            wfns, cd_handle, meta, mesh_xy, sym=sym, config=config, run_dir=input_dir,
+            sig_x=sig_x, **body_options)
     else:
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
