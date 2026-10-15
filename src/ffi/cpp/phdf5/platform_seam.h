@@ -36,29 +36,30 @@
 #include <cstring>
 #include <string>
 
-#ifndef LORRAX_FFI_NO_CUDA
-#include <cuda_runtime.h>
+#include "../common/leg.h"
+#if LRX_LEG_DEVICE
+#include "gpu_runtime.h"
 #endif
 
 // ---- Seam 1a: the leading dispatch/Impl parameter for the platform stream.
 // The CUDA handlers bind ``.Ctx<PlatformStream<cudaStream_t>>()`` and thread
 // the stream through to the H2D staging; the host handlers take no stream.
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
 #define LRX_STREAM_PARAM
 #define LRX_STREAM_ARG
 #else
-#define LRX_STREAM_PARAM cudaStream_t xla_stream,
+#define LRX_STREAM_PARAM lrx::gpu::Stream xla_stream,
 #define LRX_STREAM_ARG   xla_stream,
 #endif
 
 // ---- Seam 1b: handler symbol name + the stream Ctx in the Ffi::Bind chain.
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
 #  define LRX_PHDF_HANDLER(name) name##HostFfi
 #  define LRX_PHDF_STREAM_CTX
 #else
 #  define LRX_PHDF_HANDLER(name) name##Ffi
 #  define LRX_PHDF_STREAM_CTX \
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
 #endif
 
 namespace lorrax_ffi::phdf5 {
@@ -100,26 +101,26 @@ static inline bool copy_index_to_host(
     LRX_STREAM_PARAM void* dst, const void* src, size_t nbytes,
     std::string* err)
 {
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
     std::memcpy(dst, src, nbytes);
     (void)err;
     return true;
 #else
-    cudaError_t ce = cudaMemcpyAsync(dst, src, nbytes,
-                                     cudaMemcpyDeviceToHost, xla_stream);
-    if (ce != cudaSuccess) {
-        if (err) *err = std::string("cudaMemcpyAsync(D2H,xla_stream): ")
-                      + cudaGetErrorString(ce);
+    lrx::gpu::Error ce = lrx::gpu::memcpy_async(dst, src, nbytes,
+                                     lrx::gpu::kDeviceToHost, xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
+        if (err) *err = std::string(LRX_GPU_API "MemcpyAsync(D2H,xla_stream): ")
+                      + lrx::gpu::error_string(ce);
         return false;
     }
     // The host reads ``dst`` immediately after this returns, so the copy must
     // have LANDED, not merely been enqueued.  Synchronizing the XLA stream
     // (rather than the whole device) waits for exactly the ops this copy was
     // ordered behind.
-    ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
-        if (err) *err = std::string("cudaStreamSynchronize(xla_stream): ")
-                      + cudaGetErrorString(ce);
+    ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
+        if (err) *err = std::string(LRX_GPU_API "StreamSynchronize(xla_stream): ")
+                      + lrx::gpu::error_string(ce);
         return false;
     }
     return true;

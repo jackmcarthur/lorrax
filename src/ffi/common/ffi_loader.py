@@ -203,10 +203,14 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentHostFfi",
 }
 
-#: The ROCM leg's handlers.  Declared before any family is ported, so a ROCm
-#: mesh resolves to a named leg whose missing library or handler refuses by
-#: name (docs/architecture/ffi_layout.md).
-_ROCM_TARGET_SYMBOLS: dict = {}
+#: The ROCM leg's handlers: the device families ported so far, phdf5.  The
+#: device legs compile the SAME sources, so the symbols are the CUDA leg's
+#: (``LRX_PHDF_HANDLER(<X>)`` is ``<X>Ffi`` on both); only one device leg is
+#: ever loaded in a process.  A family joins this table when it joins
+#: ``CMakeLists.txt``'s ROCM source list.
+_ROCM_FAMILIES = ("lorrax_phdf5_",)
+_ROCM_TARGET_SYMBOLS = {target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
+                        if target.startswith(_ROCM_FAMILIES)}
 
 #: Leg key -> this loader's target table and the build command for its
 #: not-found error.  Everything else about a leg is ``lxkit.legs.LEGS``.
@@ -214,7 +218,7 @@ _TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,
             "cpu": _HOST_TARGET_SYMBOLS}
 _BUILD_HINTS = {
     "CUDA": "bash config/perlmutter/build_ffi_cuda.sh (Perlmutter; docs/installation/perlmutter.md)",
-    "ROCM": "the ROCM leg is not built yet (docs/architecture/ffi_layout.md)",
+    "ROCM": "bash config/frontier/build_ffi_rocm.sh (Frontier; docs/architecture/ffi_layout.md)",
     "cpu": "bash src/ffi/cpp/build_host.sh",
 }
 

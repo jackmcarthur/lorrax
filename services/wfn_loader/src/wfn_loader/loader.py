@@ -654,8 +654,10 @@ class WfnLoader:
         # reducing it to a bool — and it is per-platform UNCACHED, because a
         # ladder is exactly what a platform-blind cache would poison.
         from file_io.slab_io import probe_read_availability
+        from lxkit import LEGS, accelerator_legs
         reasons = []
-        for _plat in ("CUDA", "cpu"):
+        # Every device leg, then the host leg (lxkit.LEGS order).
+        for _plat in [leg.key for leg in accelerator_legs()] + [LEGS["cpu"].key]:
             usable, why = probe_read_availability(_plat)
             if usable:
                 return "phdf5"

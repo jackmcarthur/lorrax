@@ -1118,8 +1118,9 @@ def _ffi_identity() -> str:
         from ffi.common import ffi_loader
     except Exception:                                      # noqa: BLE001
         return "noffi"
+    from lxkit import LEGS
     ids = set()
-    for platform in ("CUDA", "cpu"):
+    for platform in LEGS:
         path = ffi_loader.loaded_lib_path(platform)
         if path is None:
             path = next((c for c in ffi_loader._candidate_paths(platform)

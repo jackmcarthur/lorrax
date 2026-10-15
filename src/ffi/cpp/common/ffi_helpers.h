@@ -15,8 +15,9 @@
 // error-formatting helpers, but must not pull in <cuda_runtime.h> or the
 // CUDA-only macros.  The device build leaves the flag undefined and gets the
 // full set unchanged.
-#ifndef LORRAX_FFI_NO_CUDA
-#include <cuda_runtime.h>
+#include "leg.h"
+#if LRX_LEG_DEVICE
+#include "gpu_runtime.h"
 #endif
 
 #include "xla/ffi/api/ffi.h"
@@ -25,17 +26,17 @@ namespace lorrax_ffi {
 
 namespace ffi = ::xla::ffi;
 
-#ifndef LORRAX_FFI_NO_CUDA
-// Format a cudaError_t as an FFI Internal error (for paths that can't
-// use the LORRAX_CUDA_CHECK macro because they need to branch on the
+#if LRX_LEG_DEVICE
+// Format a GPU runtime error (lrx::gpu::Error) as an FFI Internal error (for paths that can't
+// use the LORRAX_GPU_CHECK macro because they need to branch on the
 // specific error before returning, e.g. tolerating PeerAccessAlreadyEnabled).
-inline ffi::Error cuda_error(const char* expr, cudaError_t status) {
+inline ffi::Error gpu_error(const char* expr, lrx::gpu::Error status) {
     std::ostringstream os;
-    os << "CUDA error (" << expr << "): "
-       << cudaGetErrorName(status) << " — " << cudaGetErrorString(status);
+    os << LRX_GPU_VENDOR " error (" << expr << "): "
+       << lrx::gpu::error_name(status) << " — " << lrx::gpu::error_string(status);
     return ffi::Error(ffi::ErrorCode::kInternal, os.str());
 }
-#endif  // !LORRAX_FFI_NO_CUDA
+#endif  // LRX_LEG_DEVICE
 
 // If the expression evaluates to a non-success ffi::Error, return it.
 #define FFI_RETURN_IF_ERROR(...)                       \
@@ -44,22 +45,22 @@ inline ffi::Error cuda_error(const char* expr, cudaError_t status) {
         if (!_err.success()) return _err;              \
     } while (0)
 
-#ifndef LORRAX_FFI_NO_CUDA
-// CUDA runtime call returning cudaSuccess on OK.  Returns an FFI error
+#if LRX_LEG_DEVICE
+// GPU runtime call (CUDA or HIP, gpu_runtime.h) returning kSuccess on OK.  Returns an FFI error
 // (not throwing) so callers can use it inside handler functions.
-#define LORRAX_CUDA_CHECK(expr)                                       \
+#define LORRAX_GPU_CHECK(expr)                                       \
     do {                                                                  \
-        cudaError_t _st = (expr);                                         \
-        if (_st != cudaSuccess) {                                         \
+        lrx::gpu::Error _st = (expr);                                         \
+        if (_st != lrx::gpu::kSuccess) {                                         \
             std::ostringstream _os;                                       \
-            _os << "CUDA error at " __FILE__ ":" << __LINE__              \
-                << " (" #expr "): " << cudaGetErrorName(_st) << " — "     \
-                << cudaGetErrorString(_st);                               \
+            _os << LRX_GPU_VENDOR " error at " __FILE__ ":" << __LINE__              \
+                << " (" #expr "): " << lrx::gpu::error_name(_st) << " — "     \
+                << lrx::gpu::error_string(_st);                               \
             return ::xla::ffi::Error(::xla::ffi::ErrorCode::kInternal,    \
                                      _os.str());                          \
         }                                                                 \
     } while (0)
-#endif  // !LORRAX_FFI_NO_CUDA
+#endif  // LRX_LEG_DEVICE
 
 // Generic library-status check.  SUCCESS is the value that means OK,
 // `lib` a short descriptive label (e.g. "cusolverMp").

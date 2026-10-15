@@ -166,3 +166,18 @@ def test_the_rocm_leg_is_declared_and_refused_by_its_file_name(monkeypatch):
         dl.get_lib("ROCM")
     ok, reason = ffi_loader.probe_target("lorrax_phdf5_write", "ROCM")
     assert not ok and "ROCM" in reason
+
+
+def test_the_rocm_leg_carries_exactly_its_ported_families():
+    """The ROCM table is derived from the CUDA one (the device legs compile the
+    same sources), restricted to the families in CMakeLists.txt's ROCM list."""
+    ffi_loader, dl = _loaders()
+    rocm = ffi_loader._PLATFORMS["ROCM"]["targets"]
+    assert rocm and all(t.startswith("lorrax_phdf5_") for t in rocm)
+    assert all(ffi_loader._CUDA_TARGET_SYMBOLS[t] == s for t, s in rocm.items())
+    assert {t for t in ffi_loader._CUDA_TARGET_SYMBOLS if t.startswith("lorrax_phdf5_")} == set(rocm)
+    assert dl._PLATFORMS["ROCM"]["targets"] == {}          # no distributed linalg yet
+    cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
+    block = cmake[cmake.index('STREQUAL "rocm"'):]
+    block = block[:block.index("add_library(")]
+    assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in block and "cufft/" not in block

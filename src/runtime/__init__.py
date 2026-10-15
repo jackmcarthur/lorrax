@@ -2777,10 +2777,11 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
 
     # -- FFI ---------------------------------------------------------------
     plat_key = f["ffi_platform"]
-    f["ffi_library"] = (_ffi_library_facts(plat_key) if plat_key in ("CUDA", "cpu")
+    from lxkit import LEGS
+    f["ffi_library"] = (_ffi_library_facts(plat_key) if plat_key in LEGS
                         else {"platform": plat_key, "path": None, "loaded": False,
                               "no_library": True,
-                              "reason": "LORRAX builds no library for this platform"})
+                              "reason": "LORRAX has no leg for this platform"})
     f["ffi_dials"] = _ffi_dial_facts()
     f["linalg"] = _linalg_facts(mesh)
 

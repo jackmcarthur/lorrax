@@ -7,6 +7,9 @@ cmake_minimum_required(VERSION 3.22)
 #   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=cuda ...  -> liblorrax_ffi.so
 #       (the complete NVIDIA stack: cuSOLVERMp/cuBLASMp/cuBLAS/cuFFT/NVRTC/NCCL,
 #        + phdf5; entry scripts: build.sh, the lorrax_A runtime recipe)
+#   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=rocm ...  -> liblorrax_ffi_rocm.so
+#       (the AMD device leg: the shared device families over the HIP runtime,
+#        phdf5 so far; entry script: config/frontier/build_ffi_rocm.sh)
 #   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=host ...  -> liblorrax_ffi_host.so
 #       (CUDA-free by construction: phdf5 + ScaLAPACK + FFTW3-ABI FFT + CBLAS GEMM + SLATE
 #        gpu_backend=none; entry scripts: build_host.sh,
@@ -18,7 +21,7 @@ cmake_minimum_required(VERSION 3.22)
 # different C++ symbols — see src/ffi/common/ffi_loader.py.
 # ============================================================================
 set(LORRAX_FFI_PLATFORM "" CACHE STRING
-    "Which FFI library to configure: cuda | host (REQUIRED, no default)")
+    "Which FFI library to configure: cuda | host | rocm (REQUIRED, no default)")
 
 if(LORRAX_FFI_PLATFORM STREQUAL "cuda")
 # ============================== CUDA leg ====================================
@@ -744,6 +747,7 @@ message(STATUS "  MPI        = ${LORRAX_MPI_LIBRARY}")
 
 elseif(LORRAX_FFI_PLATFORM STREQUAL "host")
 # ============================== host leg ====================================
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxParallelHdf5.cmake")
 # LANGUAGES CXX ONLY — deliberate, do not add C or Fortran.  Nothing here is
 # Fortran (the ScaLAPACK calls go through MKL's C bindings) and the py312
 # apptainer container this builds in has no gfortran, so enabling Fortran
@@ -803,32 +807,8 @@ option(LORRAX_HOST_HAVE_SLATE "Build the SLATE host handlers (needs a gpu_backen
 # otherwise fall back to probing jax.ffi.include_dir() with Python3 — correct
 # when this cmake runs INSIDE the runtime container/venv (the Frontera path).
 # ----------------------------------------------------------------------------
-if(NOT DEFINED LORRAX_XLA_FFI_INCLUDE_DIR AND DEFINED ENV{LORRAX_XLA_FFI_INCLUDE_DIR})
-    set(LORRAX_XLA_FFI_INCLUDE_DIR "$ENV{LORRAX_XLA_FFI_INCLUDE_DIR}" CACHE PATH
-        "Directory containing xla/ffi/api/ffi.h (staged from the runtime jaxlib)")
-endif()
-if(NOT LORRAX_XLA_FFI_INCLUDE_DIR OR NOT EXISTS "${LORRAX_XLA_FFI_INCLUDE_DIR}/xla/ffi/api/ffi.h")
-    find_package(Python3 COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        execute_process(
-            COMMAND ${Python3_EXECUTABLE} -c
-                "import jax.ffi,sys; d=jax.ffi.include_dir(); sys.stdout.write(d if isinstance(d,str) else d.decode())"
-            OUTPUT_VARIABLE _jax_ffi_dir
-            RESULT_VARIABLE _jax_status
-            ERROR_VARIABLE  _jax_err)
-        if(_jax_status EQUAL 0 AND EXISTS "${_jax_ffi_dir}/xla/ffi/api/ffi.h")
-            set(LORRAX_XLA_FFI_INCLUDE_DIR "${_jax_ffi_dir}")
-        endif()
-    endif()
-endif()
-if(NOT LORRAX_XLA_FFI_INCLUDE_DIR OR NOT EXISTS "${LORRAX_XLA_FFI_INCLUDE_DIR}/xla/ffi/api/ffi.h")
-    message(FATAL_ERROR
-        "xla/ffi/api/ffi.h not found under '${LORRAX_XLA_FFI_INCLUDE_DIR}'.  "
-        "Set -DLORRAX_XLA_FFI_INCLUDE_DIR to a header stage matching the "
-        "runtime jaxlib, or run this cmake with a Python3 whose jax matches "
-        "the runtime (jax.ffi.include_dir() is probed automatically).")
-endif()
-message(STATUS "XLA FFI headers: ${LORRAX_XLA_FFI_INCLUDE_DIR}")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxXlaFfi.cmake")
+lorrax_find_xla_ffi()
 
 set(LORRAX_FFI_HOST_SOURCES "")
 set(_host_link_libs "")
@@ -841,35 +821,7 @@ set(_host_link_libs "")
 # with the config/frontera/cmake FindMPI stub on CMAKE_MODULE_PATH.
 # ----------------------------------------------------------------------------
 if(LORRAX_FFI_HAVE_PHDF5)
-    set(HDF5_PREFER_PARALLEL ON)
-    find_package(HDF5 COMPONENTS C REQUIRED)
-    if(NOT HDF5_IS_PARALLEL)
-        message(FATAL_ERROR
-            "HDF5 at ${HDF5_INCLUDE_DIRS} is NOT built with MPI-IO.  Point "
-            "-DHDF5_ROOT / $HDF5_ROOT at a parallel install.")
-    endif()
-    message(STATUS "HDF5: ${HDF5_VERSION} at ${HDF5_INCLUDE_DIRS} (parallel)")
-
-    # MPI — pinned explicitly (no find_package(MPI); see CUDA CMakeLists note).
-    if(NOT DEFINED LORRAX_MPI_INCLUDE_DIR AND DEFINED ENV{LORRAX_MPI_INCLUDE_DIR})
-        set(LORRAX_MPI_INCLUDE_DIR "$ENV{LORRAX_MPI_INCLUDE_DIR}" CACHE PATH "MPI header dir")
-    endif()
-    if(NOT DEFINED LORRAX_MPI_INCLUDE_DIR)
-        find_path(LORRAX_MPI_INCLUDE_DIR mpi.h
-            HINTS "${HDF5_INCLUDE_DIRS}" NO_DEFAULT_PATH)
-    endif()
-    if(NOT LORRAX_MPI_INCLUDE_DIR OR NOT EXISTS "${LORRAX_MPI_INCLUDE_DIR}/mpi.h")
-        message(FATAL_ERROR "mpi.h not found.  Set -DLORRAX_MPI_INCLUDE_DIR.")
-    endif()
-    if(NOT DEFINED LORRAX_MPICH_LIB_DIR AND DEFINED ENV{LORRAX_MPICH_LIB_DIR})
-        set(LORRAX_MPICH_LIB_DIR "$ENV{LORRAX_MPICH_LIB_DIR}" CACHE PATH "MPI runtime lib dir")
-    endif()
-    find_library(LORRAX_MPI_LIBRARY NAMES mpi
-        HINTS "${LORRAX_MPICH_LIB_DIR}" NO_DEFAULT_PATH)
-    if(NOT LORRAX_MPI_LIBRARY)
-        message(FATAL_ERROR "libmpi not found in ${LORRAX_MPICH_LIB_DIR}.")
-    endif()
-    message(STATUS "MPI:  include=${LORRAX_MPI_INCLUDE_DIR} lib=${LORRAX_MPI_LIBRARY}")
+    lorrax_find_parallel_hdf5()
 
     list(APPEND LORRAX_FFI_HOST_SOURCES
         phdf5/api.cc
@@ -1510,11 +1462,103 @@ foreach(_s ${LORRAX_FFI_HOST_SOURCES})
     message(STATUS "  ${_s}")
 endforeach()
 
+elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
+# ============================== ROCM leg ====================================
+# liblorrax_ffi_rocm.so: the AMD device leg (docs/architecture/ffi_layout.md,
+# "Platform legs").  The SAME shared sources as the CUDA leg, compiled with
+# -DLORRAX_FFI_ROCM so common/leg.h selects the ROCM spellings and
+# common/gpu_runtime.h the HIP runtime.  The families are host C++ calling
+# the GPU runtime API, so no device compiler is needed: the C++ compiler,
+# the HIP headers and libamdhip64 (CMake package `hip`, target hip::host).
+#
+# Families, one per port (each gated against XLA on the same device, as its
+# CUDA twin is):  phdf5.  A family with no ROCm port is simply not in the
+# source list; ffi_loader's ROCM table lists only what this leg exports.
+#
+# ROCm comes from ROCM_PATH (`module load rocm/<v>` sets it) or
+# -DCMAKE_PREFIX_PATH=<rocm root>; GPU targets need no flag here because
+# nothing is compiled for the device.
+project(lorrax_ffi_rocm LANGUAGES CXX)
+add_compile_definitions(OMPI_SKIP_MPICXX=1)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+option(LORRAX_FFI_HAVE_PHDF5 "Build the phdf5 handlers (needs parallel HDF5)" ON)
+if(NOT LORRAX_FFI_HAVE_PHDF5)
+    message(FATAL_ERROR
+        "LORRAX_FFI_HAVE_PHDF5=OFF: got a ROCM leg with no family; want phdf5, "
+        "the ROCM leg's only family so far; fix: drop -DLORRAX_FFI_HAVE_PHDF5=OFF")
+endif()
+
+if(DEFINED ENV{ROCM_PATH})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}")
+endif()
+find_package(hip CONFIG REQUIRED)
+message(STATUS "HIP: ${hip_VERSION} (${hip_DIR})")
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxXlaFfi.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxParallelHdf5.cmake")
+lorrax_find_xla_ffi()
+lorrax_find_parallel_hdf5()
+
+set(LORRAX_FFI_ROCM_SOURCES
+    phdf5/api.cc
+    phdf5/context.cc
+    phdf5/read_ffi.cc
+    phdf5/write_ffi.cc
+    common/build_config.cc
+    common/ctx_registry.cc
+)
+
+# Capability header: the shared template; only phdf5 is a claim on this leg.
+set(LORRAX_CFG_PHDF5 1)
+foreach(_k CUSOLVERMP CUBLASMP CUFFT CAL SLATE FFTW3 SCALAPACK GEMM)
+    set(LORRAX_CFG_${_k} 0)
+endforeach()
+set(LORRAX_CFG_MATH_LINK "")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
+
+add_library(lorrax_ffi_rocm SHARED ${LORRAX_FFI_ROCM_SOURCES})
+target_compile_definitions(lorrax_ffi_rocm PRIVATE LORRAX_FFI_ROCM=1)
+set_target_properties(lorrax_ffi_rocm PROPERTIES
+    OUTPUT_NAME "lorrax_ffi_rocm"
+    PREFIX "lib"
+    BUILD_WITH_INSTALL_RPATH ON
+    INSTALL_RPATH "$ORIGIN"            # the same $ORIGIN-only RUNPATH as the other legs
+)
+target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--enable-new-dtags")
+target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE
+    "${LORRAX_XLA_FFI_INCLUDE_DIR}"
+    "${HDF5_INCLUDE_DIRS}"
+    "${LORRAX_MPI_INCLUDE_DIR}"
+)
+target_include_directories(lorrax_ffi_rocm PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+find_package(Threads REQUIRED)
+target_link_libraries(lorrax_ffi_rocm PRIVATE
+    ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}" hip::host Threads::Threads ${CMAKE_DL_LIBS})
+target_compile_options(lorrax_ffi_rocm PRIVATE -Wall -Wextra)
+target_link_options(lorrax_ffi_rocm PRIVATE "-Wl,--no-undefined")
+# PRIVATE SYMBOLS: the ROCM third of the KNOWN_FAILURES L1 fix (exports_rocm.map).
+target_link_options(lorrax_ffi_rocm PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_rocm.map")
+set_property(TARGET lorrax_ffi_rocm APPEND PROPERTY
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports_rocm.map")
+message(STATUS "lorrax_ffi_rocm will build sources:")
+foreach(_s ${LORRAX_FFI_ROCM_SOURCES})
+    message(STATUS "  ${_s}")
+endforeach()
 else()
     message(FATAL_ERROR
         "LORRAX_FFI_PLATFORM is '${LORRAX_FFI_PLATFORM}' — set it explicitly:\n"
         "  -DLORRAX_FFI_PLATFORM=cuda  -> liblorrax_ffi.so (CUDA leg)\n"
         "  -DLORRAX_FFI_PLATFORM=host  -> liblorrax_ffi_host.so (CUDA-free host leg)\n"
+        "  -DLORRAX_FFI_PLATFORM=rocm  -> liblorrax_ffi_rocm.so (ROCM leg)\n"
         "There is no default on purpose: the leg used to be selected by which\n"
         "directory cmake was pointed at, and a silent default would hide a\n"
         "wrong-platform build until runtime.")

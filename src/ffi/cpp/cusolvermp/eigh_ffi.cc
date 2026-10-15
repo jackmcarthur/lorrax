@@ -73,8 +73,8 @@ static inline bool profile_enabled() {
 static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,
                                            cudaEvent_t  ev) {
-    LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
+    LORRAX_GPU_CHECK(cudaEventRecord(ev, signaller));
+    LORRAX_GPU_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
     return ffi::Error::Success();
 }
 
@@ -96,13 +96,13 @@ static ffi::Error EighImpl(
     cudaEvent_t ev[6];
     if (prof) {
         for (int i = 0; i < 6; ++i)
-            LORRAX_CUDA_CHECK(cudaEventCreate(&ev[i]));
-        LORRAX_CUDA_CHECK(cudaEventRecord(ev[0], ctx->stream));
+            LORRAX_GPU_CHECK(cudaEventCreate(&ev[i]));
+        LORRAX_GPU_CHECK(cudaEventRecord(ev[0], ctx->stream));
     }
 
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         ctx->stream, xla_stream, ctx->ev_xla_in));
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[1], ctx->stream));
+    if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[1], ctx->stream));
 
     const int64_t llda = (n + ctx->p - 1) / ctx->p;   // = n/p when exact
     cusolverMpMatrixDescriptor_t descA = nullptr, descQ = nullptr;
@@ -116,7 +116,7 @@ static ffi::Error EighImpl(
                                    mp::CudaDataTypeOf<T>::value,
                                    n, n, mb, nb, 0, 0, llda),
         CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(Q)");
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[2], ctx->stream));
+    if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[2], ctx->stream));
 
     const char jobz = compute_evecs ? 'V' : 'N';
     size_t d_ws_bytes = 0, h_ws_bytes = 0;
@@ -134,7 +134,7 @@ static ffi::Error EighImpl(
         os << "cusolverMpSyevd_bufferSize failed: status=" << (int)mp_st;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[3], ctx->stream));
+    if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[3], ctx->stream));
 
     // Device workspace from XLA's scratch pool, i.e. inside XLA's reserved
     // pool.  cuSOLVERMp's own internals (NCCL, handles, the context's
@@ -157,7 +157,7 @@ static ffi::Error EighImpl(
     auto* d_operand = reinterpret_cast<T*>(
         static_cast<char*>(d_workspace) + operand_offset(d_ws_bytes));
     const size_t operand_bytes = size_t(n / ctx->p) * (n / ctx->q) * sizeof(T);
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_operand, d_A, operand_bytes,
+    LORRAX_GPU_CHECK(cudaMemcpyAsync(d_operand, d_A, operand_bytes,
                                      cudaMemcpyDeviceToDevice, ctx->stream));
 
     // Host workspace stays on Ctx (scratch is device-only).
@@ -186,7 +186,7 @@ static ffi::Error EighImpl(
         d_workspace, d_ws_bytes,
         ctx->h_workspace, h_ws_bytes,
         ctx->d_info);
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[4], ctx->stream));
+    if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[4], ctx->stream));
 
     cusolverMpDestroyMatrixDesc(descA);
     cusolverMpDestroyMatrixDesc(descQ);
@@ -201,10 +201,10 @@ static ffi::Error EighImpl(
 
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         xla_stream, ctx->stream, ctx->ev_ctx_out));
-    if (prof) LORRAX_CUDA_CHECK(cudaEventRecord(ev[5], ctx->stream));
+    if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[5], ctx->stream));
 
     if (prof) {
-        LORRAX_CUDA_CHECK(cudaEventSynchronize(ev[5]));
+        LORRAX_GPU_CHECK(cudaEventSynchronize(ev[5]));
         float ts[5];
         cudaEventElapsedTime(&ts[0], ev[0], ev[1]);
         cudaEventElapsedTime(&ts[1], ev[1], ev[2]);

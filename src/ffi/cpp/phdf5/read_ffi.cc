@@ -44,8 +44,9 @@
 // the same split slate/scalapack use.
 // Seams 1 (handler binding) and 2 (index copy-in) live in platform_seam.h,
 // shared verbatim with write_ffi.cc; seam 3 (the staging tail) is below.
-#ifndef LORRAX_FFI_NO_CUDA
-#include <cuda_runtime.h>
+#include "../common/leg.h"
+#if LRX_LEG_DEVICE
+#include "gpu_runtime.h"
 #endif
 
 #include <hdf5.h>
@@ -72,7 +73,7 @@ namespace ffi = ::xla::ffi;
 // stage through ``ctx->read_buf`` and only the writer-thread task stages
 // through ``ctx->pinned_buf`` (ctx.h OWNERSHIP).  Reading the buffer off the
 // ctx here would have quietly re-merged the two.
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
 static inline ffi::Error stage_host_to_output(
     PhdfCtx* ctx, const void* src, void* d_dst, size_t bytes)
 {
@@ -82,13 +83,13 @@ static inline ffi::Error stage_host_to_output(
 }
 #else
 static inline ffi::Error stage_host_to_output(
-    cudaStream_t xla_stream, PhdfCtx* ctx, const void* src,
+    lrx::gpu::Stream xla_stream, PhdfCtx* ctx, const void* src,
     void* d_dst, size_t bytes)
 {
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(d_dst, src, bytes,
-                                      cudaMemcpyHostToDevice, ctx->stream));
-    LORRAX_CUDA_CHECK(cudaEventRecord(ctx->h2d_event, ctx->stream));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(xla_stream, ctx->h2d_event, 0));
+    LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(d_dst, src, bytes,
+                                      lrx::gpu::kHostToDevice, ctx->stream));
+    LORRAX_GPU_CHECK(lrx::gpu::event_record(ctx->h2d_event, ctx->stream));
+    LORRAX_GPU_CHECK(lrx::gpu::stream_wait_event(xla_stream, ctx->h2d_event, 0));
     return ffi::Error::Success();
 }
 #endif
@@ -1043,8 +1044,8 @@ static void async_read_kchunk_union_worker(
     // build the staging tail is a synchronous std::memcpy that fully
     // drains before the worker picks up the next FIFO task, so the buffer
     // is already free and there is nothing to wait on.
-#ifndef LORRAX_FFI_NO_CUDA
-    cudaEventSynchronize(ctx->h2d_event);
+#if LRX_LEG_DEVICE
+    (void)lrx::gpu::event_synchronize(ctx->h2d_event);
 #endif
     auto t_prev_h2d_done = now();
 
@@ -1126,7 +1127,7 @@ static void async_read_kchunk_union_worker(
     // file dim 0 (the per-rank shape keeps file order around the window axis).
     const bool rows_are_windows = (kchunk_axis == 0);
 
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
     constexpr int kStagingChunks = 2;
 #else
     constexpr int kStagingChunks = 3;   // + one padded chunk for short runs
@@ -1140,15 +1141,15 @@ static void async_read_kchunk_union_worker(
     }
     char* ring[2] = {static_cast<char*>(ctx->pinned_buf),
                      static_cast<char*>(ctx->pinned_buf) + chunk_cap};
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
     std::memset(d_dst, 0, bytes);
 #else
     {
-        cudaError_t ce = cudaMemsetAsync(d_dst, 0, bytes, ctx->stream);
-        if (ce != cudaSuccess) {
+        lrx::gpu::Error ce = lrx::gpu::memset_async(d_dst, 0, bytes, ctx->stream);
+        if (ce != lrx::gpu::kSuccess) {
             fail_task(ffi::ErrorCode::kInternal,
-                std::string("phdf5 read_kchunk_union: cudaMemsetAsync: ") +
-                cudaGetErrorString(ce));
+                std::string("phdf5 read_kchunk_union: " LRX_GPU_API "MemsetAsync: ") +
+                lrx::gpu::error_string(ce));
             return;
         }
     }
@@ -1313,10 +1314,10 @@ static void async_read_kchunk_union_worker(
             }
         }
         auto t_c2 = now();
-#ifndef LORRAX_FFI_NO_CUDA
+#if LRX_LEG_DEVICE
         // The previous chunk's copies read the OTHER ring half (or the padded
         // chunk), which this chunk is about to reuse.
-        if (copies_in_flight) cudaEventSynchronize(ctx->h2d_event);
+        if (copies_in_flight) (void)lrx::gpu::event_synchronize(ctx->h2d_event);
 #endif
         if (npts_file > 0) {
             // Adjacent runs merge.
@@ -1341,7 +1342,7 @@ static void async_read_kchunk_union_worker(
             }
             n_runs += runs.size();
             cursor = 0;
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
             for (const auto& r : runs) {
                 std::memcpy(static_cast<char*>(d_dst) + r.first, buf + cursor,
                             r.second);
@@ -1351,13 +1352,13 @@ static void async_read_kchunk_union_worker(
             // Long runs: one DMA each, straight from the packed chunk.  Short
             // runs (mean < 64 KiB, e.g. bank rectangles): place them in a
             // zeroed padded copy of the chunk on the host, then one DMA.
-            cudaError_t ce = cudaSuccess;
+            lrx::gpu::Error ce = lrx::gpu::kSuccess;
             if (chunk_bytes >= runs.size() * (size_t{64} << 10)) {
                 for (const auto& r : runs) {
-                    if (ce == cudaSuccess)
-                        ce = cudaMemcpyAsync(
+                    if (ce == lrx::gpu::kSuccess)
+                        ce = lrx::gpu::memcpy_async(
                             static_cast<char*>(d_dst) + r.first, buf + cursor,
-                            r.second, cudaMemcpyHostToDevice, ctx->stream);
+                            r.second, lrx::gpu::kHostToDevice, ctx->stream);
                     cursor += r.second;
                 }
             } else {
@@ -1370,16 +1371,16 @@ static void async_read_kchunk_union_worker(
                     cursor += r.second;
                 }
                 ++n_padded;
-                ce = cudaMemcpyAsync(static_cast<char*>(d_dst) + base, pad,
-                                     span, cudaMemcpyHostToDevice, ctx->stream);
+                ce = lrx::gpu::memcpy_async(static_cast<char*>(d_dst) + base, pad,
+                                     span, lrx::gpu::kHostToDevice, ctx->stream);
             }
-            if (ce != cudaSuccess) {
+            if (ce != lrx::gpu::kSuccess) {
                 fail_spaces(ffi::ErrorCode::kInternal,
-                    std::string("phdf5 read_kchunk_union: cudaMemcpyAsync: ") +
-                    cudaGetErrorString(ce));
+                    std::string("phdf5 read_kchunk_union: " LRX_GPU_API "MemcpyAsync: ") +
+                    lrx::gpu::error_string(ce));
                 return;
             }
-            cudaEventRecord(ctx->h2d_event, ctx->stream);
+            (void)lrx::gpu::event_record(ctx->h2d_event, ctx->stream);
             copies_in_flight = true;
 #endif
         }
@@ -1401,9 +1402,9 @@ static void async_read_kchunk_union_worker(
 
     // The Promise fires only once every copy (and the pad memset) is on the
     // device, so downstream XLA ops read a complete ``d_dst``.
-#ifndef LORRAX_FFI_NO_CUDA
-    cudaEventRecord(ctx->h2d_event, ctx->stream);
-    cudaEventSynchronize(ctx->h2d_event);
+#if LRX_LEG_DEVICE
+    (void)lrx::gpu::event_record(ctx->h2d_event, ctx->stream);
+    (void)lrx::gpu::event_synchronize(ctx->h2d_event);
 #endif
     auto t_h2d = now();
 

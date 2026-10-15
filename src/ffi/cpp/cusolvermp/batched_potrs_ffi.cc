@@ -52,8 +52,8 @@ static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,
                                            cudaEvent_t  ev) {
     NvtxRange range("potrs.cross_stream_wait");
-    LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
+    LORRAX_GPU_CHECK(cudaEventRecord(ev, signaller));
+    LORRAX_GPU_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
     return ffi::Error::Success();
 }
 
@@ -82,7 +82,7 @@ static ffi::Error BatchedPotrsImpl(
     // batched_potrf_ffi.cc for the rationale.
     if (d_X_out != static_cast<const T*>(d_B_in)) {
         NvtxRange range("potrs.copy_B_to_X");
-        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
+        LORRAX_GPU_CHECK(cudaMemcpyAsync(
             d_X_out, d_B_in,
             nq * B_slice * sizeof(T),
             cudaMemcpyDeviceToDevice, ctx->stream));
