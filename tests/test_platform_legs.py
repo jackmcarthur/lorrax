@@ -189,24 +189,31 @@ def test_the_rocm_leg_is_declared_and_refused_by_its_file_name(monkeypatch):
 
 def test_the_rocm_leg_carries_exactly_its_ported_families():
     """The ROCM table is the CUDA one's shared families (the device legs compile the
-    same sources), restricted to the families in CMakeLists.txt's ROCM list, plus the
-    leg's own families (kdft: the CUDA leg serves those operations with mathdx)."""
+    same sources) -- exactly the families ffi.common.families marks built on ROCM --
+    plus the leg's own families (kdft: the CUDA leg serves those operations with mathdx)."""
+    from ffi.common.families import built_prefixes
     ffi_loader, dl = _loaders()
     rocm = ffi_loader._PLATFORMS["ROCM"]["targets"]
     own = ffi_loader._ROCM_OWN_TARGET_SYMBOLS
     shared = {t: s for t, s in rocm.items() if t not in own}
-    assert shared and all(t.startswith("lorrax_phdf5_") for t in shared)
+    prefixes = tuple(p for p in built_prefixes("ROCM")
+                     if any(t.startswith(p) for t in ffi_loader._CUDA_TARGET_SYMBOLS))
+    assert set(prefixes) == {"lorrax_phdf5_", "lorrax_slate_"}
+    assert shared and all(t.startswith(prefixes) for t in shared)
     assert all(ffi_loader._CUDA_TARGET_SYMBOLS[t] == s for t, s in shared.items())
-    assert {t for t in ffi_loader._CUDA_TARGET_SYMBOLS if t.startswith("lorrax_phdf5_")} == set(shared)
+    assert {t for t in ffi_loader._CUDA_TARGET_SYMBOLS if t.startswith(prefixes)} == set(shared)
     assert own and all(t.startswith("lorrax_kdft_") for t in own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)
     assert all(rocm[t] == s for t, s in own.items())
-    assert dl._PLATFORMS["ROCM"]["targets"] == {}          # no distributed linalg yet
+    # distrib_la's ROCM table: the SLATE family only (no ROCm distributed LU yet).
+    dl_rocm = dl._PLATFORMS["ROCM"]["targets"]
+    assert dl_rocm and all(t.startswith("lorrax_slate_") for t in dl_rocm)
     cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
-    block = cmake[cmake.index('STREQUAL "rocm"'):]
-    block = block[:block.index("add_library(")]
-    assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in block and "cufft/" not in block
+    section = cmake[cmake.index('STREQUAL "rocm"'):]
+    block = section[:section.index("add_library(lorrax_ffi_rocm")]
+    assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in section and "cufft/" not in block
     assert "kdft/kdft_klead_ffi.cc" in block and "common/rtc_build.cc" in block
+    assert "slate/eigh_ffi.cc" in section       # bound with target_sources when SLATE is found
 
 
 def test_the_family_table_matches_the_loaders_routers_and_build():
