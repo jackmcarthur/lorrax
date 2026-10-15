@@ -1477,7 +1477,8 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 #
 # Families, one per port (each gated against XLA on the same device, as its
 # CUDA twin is):  phdf5;  kdft (the k-leading direct-DFT convolution and
-# transform, modes 2/3, run-time compiled).  A family with no ROCm port is
+# transform, modes 2/3, run-time compiled);  slate (distributed eigh / potrf /
+# trsm and their batched forms over a gpu_backend=hip SLATE).  A family with no ROCm port is
 # simply not in the source list; ffi_loader's ROCM table lists only what this
 # leg exports.
 #
@@ -1537,6 +1538,48 @@ set(LORRAX_CFG_PHDF5 1)
 foreach(_k CUSOLVERMP CUBLASMP CUFFT CAL SLATE FFTW3 SCALAPACK GEMM)
     set(LORRAX_CFG_${_k} 0)
 endforeach()
+# ---- SLATE (gpu_backend=hip): the slate/ family on this leg ----------------
+# The SAME slate/*.cc as the CUDA leg (leg-neutral through gpu_runtime.h),
+# against a SLATE built by config/frontier/build_slate_hip.sh.  The install
+# must be a HIP build: a gpu_backend=none SLATE links and loads, and then
+# every handler refuses with blas::get_device_count()=0 (the CUDA leg's
+# SONAME-race signature, ffi_loader.py).  So the configure refuses it here.
+option(LORRAX_ROCM_HAVE_SLATE
+    "Build the SLATE device handlers (needs a gpu_backend=hip SLATE install)" ON)
+if(LORRAX_ROCM_HAVE_SLATE)
+    if(NOT DEFINED LORRAX_SLATE_ROCM_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_ROCM_INSTALL_DIR})
+        set(LORRAX_SLATE_ROCM_INSTALL_DIR "$ENV{LORRAX_SLATE_ROCM_INSTALL_DIR}" CACHE PATH
+            "gpu_backend=hip SLATE install prefix")
+    endif()
+    if(NOT DEFINED LORRAX_SLATE_ROCM_INSTALL_DIR)
+        set(LORRAX_SLATE_ROCM_INSTALL_DIR "$ENV{HOME}/software/slate_builds/hip/install"
+            CACHE PATH "gpu_backend=hip SLATE install prefix (config/frontier/build_slate_hip.sh)")
+    endif()
+    set(slate_DIR    "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/slate")
+    set(blaspp_DIR   "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/blaspp")
+    set(lapackpp_DIR "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/lapackpp")
+    if(NOT TARGET MPI::MPI_CXX)    # slateConfig wants it; pin it to the leg's MPI
+        add_library(MPI::MPI_CXX INTERFACE IMPORTED)
+        set_target_properties(MPI::MPI_CXX PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${LORRAX_MPI_INCLUDE_DIR}"
+            INTERFACE_LINK_LIBRARIES      "${LORRAX_MPI_LIBRARY}")
+    endif()
+    find_package(slate CONFIG NO_DEFAULT_PATH PATHS "${slate_DIR}")
+    if(NOT slate_FOUND)
+        message(FATAL_ERROR
+            "GATE rocm-slate: no SLATE at ${LORRAX_SLATE_ROCM_INSTALL_DIR}; want a "
+            "gpu_backend=hip install; fix: bash config/frontier/build_slate_hip.sh, "
+            "-DLORRAX_SLATE_ROCM_INSTALL_DIR=<prefix>, or -DLORRAX_ROCM_HAVE_SLATE=OFF")
+    endif()
+    if(NOT slate_use_hip)
+        message(FATAL_ERROR
+            "GATE rocm-slate: ${LORRAX_SLATE_ROCM_INSTALL_DIR} is a SLATE without HIP "
+            "(slate_use_hip=${slate_use_hip}); its handlers would refuse with "
+            "get_device_count()=0; fix: point at the build_slate_hip.sh install")
+    endif()
+    message(STATUS "SLATE (hip): ${LORRAX_SLATE_ROCM_INSTALL_DIR}")
+    set(LORRAX_CFG_SLATE 1)
+endif()
 set(LORRAX_CFG_MATH_LINK "")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
@@ -1574,6 +1617,28 @@ message(STATUS "lorrax_ffi_rocm will build sources:")
 foreach(_s ${LORRAX_FFI_ROCM_SOURCES})
     message(STATUS "  ${_s}")
 endforeach()
+if(LORRAX_ROCM_HAVE_SLATE)
+    target_sources(lorrax_ffi_rocm PRIVATE
+        slate/context.cc slate/eigh_ffi.cc slate/potrf_ffi.cc slate/trsm_ffi.cc
+        slate/batched_potrf_ffi.cc slate/batched_trsm_ffi.cc)
+    target_link_libraries(lorrax_ffi_rocm PRIVATE slate)
+    # THE LEG BINDS ITS OWN SLATE.  libslate/libblaspp/liblapackpp share their
+    # SONAMEs with the gpu_backend=none install the host leg uses, and
+    # config/frontier/ffi_env.sh puts THAT install on LD_LIBRARY_PATH, which
+    # ld.so searches before any DT_RUNPATH.  With the $ORIGIN-only RUNPATH the
+    # other legs carry, this leg would therefore map the device-less SLATE and
+    # every handler would refuse (get_device_count()=0).  DT_RPATH is searched
+    # BEFORE LD_LIBRARY_PATH, so the leg carries the HIP install as an RPATH
+    # entry after $ORIGIN.  That directory holds only the three SLATE
+    # libraries, so it can shadow nothing else.  In a process that opens both
+    # legs the accelerator-first rule (lxkit.legs) opens this one first, and
+    # the HIP SLATE then serves the host leg too, as the CUDA SLATE does on
+    # Perlmutter.  verify_ffi_build.sh GATE 3c checks the resolution.
+    set_target_properties(lorrax_ffi_rocm PROPERTIES
+        INSTALL_RPATH "$ORIGIN;${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64")
+    target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--disable-new-dtags")  # after --enable: last wins
+    message(STATUS "  slate/{context,eigh,potrf,trsm,batched_potrf,batched_trsm}")
+endif()
 else()
     message(FATAL_ERROR
         "LORRAX_FFI_PLATFORM is '${LORRAX_FFI_PLATFORM}' — set it explicitly:\n"

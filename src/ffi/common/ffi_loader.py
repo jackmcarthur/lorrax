@@ -12,7 +12,7 @@ sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
     CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLAS/phdf5/slate/mathdx k-conv
-    ROCM  liblorrax_ffi_rocm.so  phdf5 / kdft k-leading conv + transform (hipRTC)
+    ROCM  liblorrax_ffi_rocm.so  phdf5 / slate / kdft k-leading conv + transform (hipRTC)
     cpu   liblorrax_ffi_host.so  phdf5 read+write / slate (Target::HostTask)
                                  / ScaLAPACK / FFTW3-ABI flat-k / MKL GEMM
 
@@ -203,7 +203,7 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentHostFfi",
 }
 
-#: The ROCM leg's handlers: the device families ported so far, phdf5.  The
+#: The ROCM leg's handlers: the device families ported so far, phdf5 and slate.  The
 #: device legs compile the SAME sources, so the symbols are the CUDA leg's
 #: (``LRX_PHDF_HANDLER(<X>)`` is ``<X>Ffi`` on both); only one device leg is
 #: ever loaded in a process.  A family joins this table when it joins

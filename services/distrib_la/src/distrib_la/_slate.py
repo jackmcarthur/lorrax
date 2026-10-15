@@ -1,4 +1,4 @@
-"""SLATE FFI backend — distributed dense linear algebra (CUDA + host).
+"""SLATE FFI backend — distributed dense linear algebra (CUDA, ROCM + host).
 
 Ported verbatim from LORRAX ``src/ffi/linalg/_slate.py`` at 96a6399 (itself
 the wave-2 merge of the former ``ffi.slate`` package: ``context.py``,
@@ -26,7 +26,7 @@ from jax.sharding import Mesh, PartitionSpec as P
 
 from distrib_la import loader
 from jax import shard_map
-from distrib_la.resolve import mesh_key
+from distrib_la.resolve import mesh_key, mesh_platform
 
 __all__ = [
     # context (was slate/context.py)
@@ -79,8 +79,9 @@ _SUBROW_CACHE: Dict[ContextKey, Tuple[int, str]] = {}
 
 
 def _mesh_platform(mesh: Mesh) -> str:
-    plat = mesh.devices.flat[0].platform
-    return "CUDA" if plat in ("gpu", "cuda") else "cpu"
+    """The mesh's leg key (``lxkit.LEGS``: cpu / CUDA / ROCM), from the device
+    vendor -- never from ``device.platform``, which reads ``gpu`` on ROCm too."""
+    return mesh_platform(mesh)
 
 
 def ensure_registered(mesh: Mesh) -> None:

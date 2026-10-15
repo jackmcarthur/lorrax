@@ -65,7 +65,8 @@ const char kBuildConfig[] =
     " math_link="    LORRAX_CFG_MATH_LINK;
 #elif defined(LRX_LEG_ROCM)
     // The ROCM leg's families, one key per ported family (ffi_layout.md).
-    " phdf5="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_PHDF5);
+    " phdf5="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_PHDF5)
+    " slate="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_SLATE);
 #else
     // The device leg's capabilities.  Until 2026-08-08 this leg carried NO
     // stamp at all — `strings liblorrax_ffi.so | grep scalapack=` on the

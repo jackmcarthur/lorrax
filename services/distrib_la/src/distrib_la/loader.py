@@ -151,17 +151,20 @@ _HOST_TARGET_SYMBOLS = {
 #: Per-platform library spec.  ``build_subdir`` is relative to
 #: ``src/ffi/cpp/`` of the LORRAX checkout, when there is one (see
 #: :func:`_candidate_paths`).
-#: The ROCM leg's distributed-linalg handlers: none built yet.  The leg is
-#: declared so a ROCm mesh asks for a named library and is refused by name;
-#: ``distrib_la.resolve`` already carries its SLATE preference rows.
-_ROCM_TARGET_SYMBOLS: dict = {}
+#: The ROCM leg's distributed-linalg handlers: the SLATE family, the SAME
+#: leg-neutral cpp/slate/ sources as the CUDA leg (so the same symbols; only one
+#: device leg is loaded per process), over a gpu_backend=hip SLATE
+#: (config/frontier/build_slate_hip.sh).  ``distrib_la.resolve`` carries the
+#: ROCM preference rows; cuSOLVERMp has no ROCm build, so it has no row here.
+_ROCM_TARGET_SYMBOLS: dict = {t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
+                              if t.startswith("lorrax_slate_")}
 
 #: Leg key -> this loader's target table and not-found build command.
 _TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,
             "cpu": _HOST_TARGET_SYMBOLS}
 _BUILD_HINTS = {
     "CUDA": 'src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh',
-    "ROCM": "the ROCM leg is not built yet (docs/architecture/ffi_layout.md)",
+    "ROCM": "bash config/frontier/build_slate_hip.sh && bash config/frontier/build_ffi_rocm.sh",
     "cpu": 'bash config/perlmutter/build_ffi_host.sh --fresh',
 }
 

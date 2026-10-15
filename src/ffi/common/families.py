@@ -100,10 +100,10 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         note="NVIDIA-only library; no ROCm equivalent."),
     "slate": Family(
         ("lorrax_slate_",), "slate",
-        _legs(("built", ""), ("refused", "distrib_la loader: no ROCM library (SLATE-HIP lane)"),
-              ("built", "")),
-        note="Every linalg = distributed call site refuses on ROCm until SLATE's HIP "
-             "backend is in the ROCM leg."),
+        _legs(("built", ""), ("built", ""), ("built", "")),
+        note="ROCM: SLATE v2025.05.28-1 gpu_backend=hip (config/frontier/build_slate_hip.sh), "
+             "sequential LibSci; eigh/potrf gated against the native route at P=4, n=512-8192. "
+             "Distributed solve_lu has no ROCM backend yet (no SLATE getrf handler in this tree)."),
     "scalapack": Family(
         ("lorrax_scalapack_",), "scalapack",
         _legs(("elsewhere", "cusolvermp"), ("elsewhere", "slate"), ("built", "")),
