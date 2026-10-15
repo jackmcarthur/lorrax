@@ -145,16 +145,30 @@ A cache hit checks and waits for nothing. A check waits without bound by
 default ([registry](../reference/env_vars.md#2e-compile-cache)). The agreement
 costs 6.2 s on the warm hsuite (161.9 against 155.7 s, claim 4130) and stays on.
 
-**The runtime's XLA flags.** The runtime merges three flags into
-`XLA_FLAGS`; a caller's value wins, flag by flag. The first two
-(`runtime.set_default_xla_gpu_autotune`, `src/runtime/__init__.py:497`) are
-GPU-only; a CPU run gets neither.
+**The runtime's XLA flags.** The runtime merges the GPU leg's declared
+compile flags (`PlatformLeg.xla_flag_defaults` in `lxkit.LEGS`, merged by
+`runtime.set_default_xla_gpu_autotune`) and one HLO-pass flag into
+`XLA_FLAGS`; a caller's value wins, flag by flag. The leg is the one
+`JAX_PLATFORMS` names, else the installed plugin's. The leg flags are
+GPU-only; a CPU run gets none.
 
-| flag | effect | claim |
-|---|---|---|
-| `--xla_gpu_autotune_level=0` | cold compile −12.9 % (Na) and −16.3 % (Si) at P4, execution within noise | 683 |
-| `--xla_gpu_enable_llvm_module_compilation_parallelism=true` | XLA splits each module's LLVM IR into parts compiled in parallel; hsuite release-cold XLA compile 219.5 → 195.2 s, programs of 0.5 s or more −22 %, programs under 50 ms +10 %; results bitwise, device peak unchanged | 4179 |
-| `rematerialization` added to `--xla_disable_hlo_passes` (`runtime.disable_xla_rematerialization`, `:561`) | GPU and CPU. On CUDA a module that then does not fit the device refuses before it runs ([memory model](memory-model.md#module-does-not-fit)); on CPU nothing checks | — |
+| flag | leg | effect | claim |
+|---|---|---|---|
+| `--xla_gpu_autotune_level=0` | CUDA | cold compile −12.9 % (Na) and −16.3 % (Si) at P4, execution within noise | 683 |
+| `--xla_gpu_enable_llvm_module_compilation_parallelism=true` | CUDA | XLA splits each module's LLVM IR into parts compiled in parallel; hsuite release-cold XLA compile 219.5 → 195.2 s, programs of 0.5 s or more −22 %, programs under 50 ms +10 %; results bitwise, device peak unchanged | 4179 |
+| `--xla_gpu_autotune_level=0` | ROCM | MI250X P4 seeded cold: XLA compile gnppm 21.8 → 18.3 s, exciton_bands 15.1 → 13.3 s against level 4; warm walls within noise; d/zgemm n = 1024–8192 steady state identical (zgemm 8192: 39.6 TF/s at both) | runtime lane 2026-10-14 (pool logs runtime_a2_flags, runtime_a3) |
+| `rematerialization` added to `--xla_disable_hlo_passes` (`runtime.disable_xla_rematerialization`) | all | On a GPU leg with a readable card total (CUDA, ROCm) a module that then does not fit the device refuses before it runs ([memory model](memory-model.md#module-does-not-fit)); on CPU nothing checks | — |
+
+Not declared for ROCM, each measured on MI250X at P4 (gnppm XLA compile,
+278 programs): `--xla_gpu_force_compilation_parallelism=7` 18.4 s against
+18.3 s, and the LLVM-module flag, which XLA's AMDGPU compiler cannot act on
+(it does not link split modules). Where a ROCm compile goes (gnppm, XLA
+VLOG timers): HLO passes 4.0 s, backend 12.1 s, of which LLVM AMDGPU codegen
+and HSACO link (`CompileToHsaco`) 6.1 s. Per program that is about 66 ms,
+against 88 ms per program on the A100-80 release-cold hsuite (claim 4212), so
+compile is not a ROCm-specific cost; the persistent cache removes it there
+as on CUDA (keys are rank-invariant on ROCm too: JAX reports
+`backend.platform == "gpu"` and strips the device assignment).
 
 ## 4 Where the time goes
 

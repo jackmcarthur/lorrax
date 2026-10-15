@@ -32,8 +32,10 @@ All arrays are complex128 (16 B) unless stated.
 Every planner prices its stage against one number per device, the budget `B`
 (`common.gpu_utils.device_budget_bytes`, `src/common/gpu_utils.py:71`). One
 rule sets `B` from two quantities known before the deck is read: `M`, the
-card total (`cuDeviceTotalMem`, `runtime.xla_memory.cuda_device_total_bytes`,
-`src/runtime/xla_memory.py:81`), and `O`, the bytes the process holds
+card total (`runtime.xla_memory.device_total_bytes`, through the device leg's
+declared reader, `PlatformLeg.device_memory_api` in `lxkit.LEGS`:
+`cuDeviceTotalMem` on CUDA, `hipDeviceTotalMem` from the ROCm plugin's own
+HIP runtime on ROCm), and `O`, the bytes the process holds
 outside XLA's memory pool. This section defines the pool, states the rule,
 explains why the pool's reserved bytes can run past its reservation, and
 says which part of that the rule has to price.
@@ -232,8 +234,11 @@ and 15.1 GB on A100-80GB for these two terms.
 
 ### The allocator {#allocator}
 
-`cuda_async` with its pool reserved is the one allocator configuration
-([environment § GPU pool](../environment/overview.md#gpu-pool)). The
+`cuda_async` with its pool reserved is the one allocator configuration on
+CUDA ([environment § GPU pool](../environment/overview.md#gpu-pool)); the
+allocator is the device leg's declaration (`PlatformLeg.xla_allocator`), and
+the ROCm leg declares none, so a ROCm run keeps jaxlib's BFC arena with 75 %
+of the card preallocated (51.5 of 68.7 GB on an MI250X GCD). The
 alternatives jaxlib offers were measured on CrI3 6×6 bispinor SC maps 0–2
 at P4, cold, at the rule's budget (claim 4092). "Peak in use" is
 XLA's `peak_bytes_in_use`; "high-water" is the pool's reserved high-water
@@ -590,7 +595,7 @@ its executor for the module's first execution and before any of its buffers
 exist (`runtime.aot_memory.refuse_over_device`, installed by
 `common.jax_compile_cache`). When the module's buffers,
 `temp + arguments + outputs − aliased`, exceed the card's total memory
-(`cuDeviceTotalMem`), the run stops with
+(`runtime.xla_memory.device_total_bytes`), the run stops with
 
 ```text
 GATE xla_rematerialization: REFUSED module '<name>': its compiled buffers
@@ -601,7 +606,7 @@ need 137.04 GB per device (temp 125.49 + arguments 11.55 + outputs 0.22
 This is a hard device limit, not the budget: such a module cannot run on
 this card. A module
 between the budget and the card is not refused; the budget only warns. The
-check is CUDA only. It does not run at compile, because planners compile
+check runs on every GPU leg whose card total is readable (CUDA and ROCm). It does not run at compile, because planners compile
 larger candidates on purpose to read their figures and then shrink
 ([the compiled check](#the-compiled-check), the kmeans Gram width); a
 candidate that never runs is never refused.
@@ -678,7 +683,10 @@ is invisible in it. The CUDA pool behind XLA's `cuda_async` allocator keeps
 `CU_MEMPOOL_ATTR_USED_MEM_HIGH`, which a reset sets back to the bytes in use.
 `runtime.xla_memory.pool_high_water` reads and resets it at every
 `common.timing` section boundary on the main thread (two driver calls), so
-every section has its own peak on every rank. A planner records its price
+every section has its own peak on every rank. A leg without a CUDA pool (ROCm,
+jaxlib's BFC arena) reads the arena's `peak_bytes_in_use` instead, which never
+resets: a warning says so once, and a stage below an earlier mark reads as
+that mark. A planner records its price
 with `common.gpu_utils.record_stage_price(stage, bytes, section=...)`: the
 live bytes plus what it plans. What the pool cannot see: NCCL and library
 workspaces outside it (2–3 GB per rank on A100; the start-up line prints the
