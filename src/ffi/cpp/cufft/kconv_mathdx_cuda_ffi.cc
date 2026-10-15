@@ -114,7 +114,7 @@
 // directory as the string attribute `mathdx_root`; the CUDA toolkit include
 // (for libcu++, include/cccl) is derived from the loaded libnvrtc.
 //
-// Disk cache (common/nvrtc_build.h owns the key rule and the image format): the router passes `cubin_dir` (ffi.fft.cubin_cache_dir:
+// Disk cache (common/rtc_build.h owns the key rule and the image format): the router passes `cubin_dir` (ffi.fft.cubin_cache_dir:
 // $SCRATCH/.cache/lorrax/kconv_mathdx, else ~/.cache/lorrax/kconv_mathdx;
 // "" = no disk cache).  A cubin is keyed by FNV-1a over the embedded source,
 // the NVRTC options (mode, grid, ns, rows per block, sm) and the whole
@@ -144,7 +144,7 @@
 
 #include "../common/mkl_thread_pin.h"
 #include "../common/lrx_async_gather.h"
-#include "../common/nvrtc_build.h"
+#include "../common/rtc_build.h"
 #include "kbox_stage.cuh"          // the host half: the k-box launch rule (kbox_plan)
 #include "kbox_stage_src.h"       // the same file as text, embedded into mode 11's NVRTC program
 
@@ -184,10 +184,10 @@ static ffi::Error fail(const char* where, const std::string& detail,
         if (_e != cudaSuccess) return fail((where), cudaGetErrorString(_e)); \
     } while (0)
 
-// The driver API, the NVRTC build and the cubin disk cache: common/nvrtc_build.h.
-using nvrtc::DriverApi;
-using nvrtc::driver_api;
-using nvrtc::cu_err;
+// The driver API, the NVRTC build and the cubin disk cache: common/rtc_build.h.
+using rtc::DriverApi;
+using rtc::driver_api;
+using rtc::err_string;
 
 struct ParentTables {
     const int *irr, *sym, *left, *right, *trs;
@@ -2113,8 +2113,8 @@ static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
 
-using nvrtc::exists;
-using nvrtc::toolkit_include;
+using rtc::exists;
+using rtc::toolkit_include;
 
 // The tile-table plan of modes 7 and 11 (kbox_stage.cuh UnfoldTiles).  A block holds tp pairs'
 // bank (bank_pair bytes each) and the tables; the load needs <= 64 registers at 256 threads, so
@@ -2165,7 +2165,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (cr != CUDA_SUCCESS || ctx == nullptr) {
         LRX_CUDA_CHECK(cudaFree(nullptr), "context bind (cudaFree(0))");
         cr = api.CtxGetCurrent(&ctx);
-        if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
+        if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", err_string(cr));
     }
     const Key key{ctx, mode, nkx, nky, nkz, ns, nsr, f32 ? 1 : 0, variant};
     // kLiveBit: a padded pass's program (the kconv call's live operand present), built apart so the plain
@@ -2546,9 +2546,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_THREADS=" + std::to_string(plane_threads));
     }
     // Disk cache key: source, the embedded async-gather header when the source
-    // includes it, deciding options and the toolchain (nvrtc_build.h).
+    // includes it, deciding options and the toolchain (rtc_build.h).
     namespace ag = lorrax_ffi::async_gather;
-    nvrtc::Program prog;
+    rtc::Program prog;
     prog.src = mode == 10 ? kPlaneSrc : kSrc;
     prog.name = "lrx_kconv_mathdx.cu";
     if (std::string_view(prog.src).find(ag::kHeaderName) != std::string_view::npos)
@@ -2556,14 +2556,14 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (mode == 7 || mode == 8 || mode == 11 || kbox_rows)
         prog.headers.push_back({kbox::kHeaderName, kbox::kHeaderSrc});
     prog.defs = defs;
-    nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
+    rtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv";
     if (mode == 7 && m7_arm == 1) prog.entries = {"lrx_kconv_mid", "lrx_kconv_pass"};
     if (mode == 7 && m7_arm == 2) prog.entries = {"lrx_kconv_col"};
     if (mode == 8 && kb_arm == 1) prog.entries = {"lrx_kconv_heavy"};
     if (mode == 11 && kplan.arm == 1) prog.entries = {"lrx_kconv_pencil"};
     std::string missing;
-    const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));
+    const std::string key_hex = rtc::hex16(rtc::key(prog, &missing));
     const std::string dir(missing.empty() ? std::string(cubin_dir) : std::string());
     if (!missing.empty() && !std::string(cubin_dir).empty() && (mklpin::announce_here() || log_enabled()))
         std::fprintf(stderr, "[kconv_mathdx] disk cubin cache OFF for this build: empty version header(s) %s "
@@ -2576,9 +2576,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
              << (nsr != ns ? "x" + std::to_string(nsr) : std::string()) << (f32 ? "_c64" : "") << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
-    nvrtc::Image img;
+    rtc::Image img;
     std::string where, err;
-    if (!nvrtc::build(prog, dir, path, key_hex, &img, &where, &err)) return sticky(where.c_str(), err);
+    if (!rtc::build(prog, dir, path, key_hex, &img, &where, &err)) return sticky(where.c_str(), err);
     const bool from_disk = img.from_disk, stored = img.stored, rebuilt_bad = img.rebuilt_bad;
     const double ms = img.ms;
     Built b;
@@ -2660,11 +2660,11 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             std::ostringstream os;
             os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << "), " << b.smem
                << " B of dynamic shared memory (+ ~" << plane_static << " B static) that this device refused ("
-               << cu_err(cr) << "); want <= " << smem_optin << " B in all; fix: "
+               << err_string(cr) << "); want <= " << smem_optin << " B in all; fix: "
                   "ffi.fft.make_plane_fft_gather routes such a plane to the XLA route at plan build";
             return sticky("cuFuncSetAttribute", os.str(), ffi::ErrorCode::kInvalidArgument);
         }
-        if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
+        if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", err_string(cr));
     }
     // Modes 11 (two blocks per SM) and 7: a shared-memory carveout that holds every planned block,
     // so the driver does not pick a split that holds one block fewer (a hint; residency is
@@ -2675,7 +2675,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                                   mode == 11 && kplan.arm == 1 ? chi_carve : 100);
         for (CUfunction f : {b.smem2 > 0 ? b.fn2 : nullptr, b.fn3})   // mode 7's shared-memory entries
             if (cr == CUDA_SUCCESS && f && mode == 7) cr = api.FuncSetAttribute(f, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100);
-        if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute(carveout)", cu_err(cr));
+        if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute(carveout)", err_string(cr));
     }
     if (mklpin::announce_here() || log_enabled()) {
         std::fprintf(stderr, "[kconv_mathdx] %s mode=%d%s kgrid=(%d,%d,%d) ns=%d sm_%d%d in %.1f ms "
@@ -2776,7 +2776,7 @@ static ffi::Error Launch(cudaStream_t stream, int mode, ffi::AnyBuffer A, ffi::A
     CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
                                             static_cast<unsigned>(k->smem),
                                             reinterpret_cast<CUstream>(stream), args, nullptr);
-    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", err_string(cr));
     return ffi::Error::Success();
 }
 
@@ -2903,7 +2903,7 @@ static ffi::Error LaunchRows(cudaStream_t stream, int mode, ffi::AnyBuffer X, co
         CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
                                                 static_cast<unsigned>(smem),
                                                 reinterpret_cast<CUstream>(stream), args, nullptr);
-        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", err_string(cr));
         return ffi::Error::Success();
     };
     if (k->arm == 0) {                             // one block per tile; mode 2 tiles each a slab
@@ -3011,7 +3011,7 @@ static ffi::Error KleadUnfoldImpl(
         CUresult cr = driver_api().LaunchKernel(fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
                                                 static_cast<unsigned>(smem), reinterpret_cast<CUstream>(stream),
                                                 args, nullptr);
-        return cr == CUDA_SUCCESS ? ffi::Error::Success() : fail("cuLaunchKernel", cu_err(cr));
+        return cr == CUDA_SUCCESS ? ffi::Error::Success() : fail("cuLaunchKernel", err_string(cr));
     };
     if (k->arm == 0) {
         long long blocks = (ncols + k->tr - 1) / k->tr;                 // one block per tile
@@ -3237,7 +3237,7 @@ static ffi::Error KleadLorentzImpl(
         CUresult cr = driver_api().LaunchKernel(fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
                                                 static_cast<unsigned>(smem),
                                                 reinterpret_cast<CUstream>(stream), args, nullptr);
-        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", err_string(cr));
         return ffi::Error::Success();
     };
     if (k->arm == 0)                                   // the single arm: one block per tile of whole spin groups
@@ -3394,7 +3394,7 @@ static ffi::Error KleadUnfoldFftImpl(
         CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(std::min(blocks, 2147483647LL)), 1, 1,
                                                 threads, 1, 1, static_cast<unsigned>(smem),
                                                 reinterpret_cast<CUstream>(stream), args, nullptr);
-        return cr == CUDA_SUCCESS ? ffi::Error::Success() : fail("cuLaunchKernel", cu_err(cr));
+        return cr == CUDA_SUCCESS ? ffi::Error::Success() : fail("cuLaunchKernel", err_string(cr));
     };
     if (k->arm == 0) return launch((rows + k->tr - 1) / k->tr, k->threads, k->smem);   // one block per tile
     if (auto e0 = launch(std::min(nkx * ((rows + k->tr - 1) / k->tr), cap), k->threads, k->smem); !e0.success())
@@ -3529,7 +3529,7 @@ static ffi::Error KleadChiUnfoldImpl(
                                                 threads, 1, 1,
                                                 static_cast<unsigned>(smem),
                                                 reinterpret_cast<CUstream>(stream), args, nullptr);
-        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", err_string(cr));
         return ffi::Error::Success();
     };
     if (k->arm == 0) {
@@ -3691,7 +3691,7 @@ static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::Any
     const unsigned blocks = static_cast<unsigned>(std::min<long long>(groups, 2147483647LL));
     CUresult cr = driver_api().LaunchKernel(k->fn, blocks, 1, 1, k->threads, 1, 1, static_cast<unsigned>(k->smem),
                                             reinterpret_cast<CUstream>(stream), args, nullptr);
-    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", err_string(cr));
     return ffi::Error::Success();
 }
 

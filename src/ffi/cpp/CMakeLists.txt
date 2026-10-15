@@ -527,7 +527,7 @@ if(LORRAX_CUFFT_ON)
     add_library(build_kconv_mathdx_cuda OBJECT
         cufft/kconv_mathdx_cuda_ffi.cc
         cufft/kconv_outer_cuda_ffi.cc
-        common/nvrtc_build.cc)
+        common/rtc_build.cc)
     set_target_properties(build_kconv_mathdx_cuda PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
     target_include_directories(build_kconv_mathdx_cuda SYSTEM PRIVATE
@@ -1470,6 +1470,10 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 # common/gpu_runtime.h the HIP runtime.  The families are host C++ calling
 # the GPU runtime API, so no device compiler is needed: the C++ compiler,
 # the HIP headers and libamdhip64 (CMake package `hip`, target hip::host).
+# Device kernels are compiled at run time by hipRTC (common/rtc_build.h, the
+# CUDA leg's NVRTC service with the vendor spelled by the leg), which the
+# library resolves beside the HIP runtime the process mapped -- so it is not
+# linked, and the leg loads (phdf5 serves) where no hipRTC is installed.
 #
 # Families, one per port (each gated against XLA on the same device, as its
 # CUDA twin is):  phdf5.  A family with no ROCm port is simply not in the
@@ -1477,7 +1481,8 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 #
 # ROCm comes from ROCM_PATH (`module load rocm/<v>` sets it) or
 # -DCMAKE_PREFIX_PATH=<rocm root>; GPU targets need no flag here because
-# nothing is compiled for the device.
+# nothing is compiled for the device at build time (hipRTC compiles for the
+# device's own target id at run time).
 project(lorrax_ffi_rocm LANGUAGES CXX)
 add_compile_definitions(OMPI_SKIP_MPICXX=1)
 set(CMAKE_CXX_STANDARD 17)
@@ -1509,6 +1514,7 @@ set(LORRAX_FFI_ROCM_SOURCES
     phdf5/write_ffi.cc
     common/build_config.cc
     common/ctx_registry.cc
+    common/rtc_build.cc
 )
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.

@@ -26,6 +26,7 @@
 #endif
 
 #include <cstddef>
+#include <string>
 
 #if defined(LRX_LEG_ROCM)
 #  include <hip/hip_runtime_api.h>
@@ -49,6 +50,7 @@ using MemcpyKind = LRX_GPU_SYM(MemcpyKind);
 inline constexpr Error      kSuccess            = LRX_GPU_SYM(Success);
 inline constexpr MemcpyKind kHostToDevice       = LRX_GPU_SYM(MemcpyHostToDevice);
 inline constexpr MemcpyKind kDeviceToHost       = LRX_GPU_SYM(MemcpyDeviceToHost);
+inline constexpr MemcpyKind kDeviceToDevice     = LRX_GPU_SYM(MemcpyDeviceToDevice);
 inline constexpr unsigned   kStreamNonBlocking  = LRX_GPU_SYM(StreamNonBlocking);
 inline constexpr unsigned   kEventDisableTiming = LRX_GPU_SYM(EventDisableTiming);
 #if defined(LRX_LEG_ROCM)
@@ -85,6 +87,24 @@ inline Error memcpy_async(void* dst, const void* src, std::size_t n,
 }
 inline Error memset_async(void* dst, int value, std::size_t n, Stream s) {
     return LRX_GPU_SYM(MemsetAsync)(dst, value, n, s);
+}
+
+// The device's code-object target, the run-time compilers' architecture (rtc_build.h
+// arch_option): "sm_<major><minor>" on CUDA, the full target id ("gfx90a:sramecc+:xnack-",
+// feature flags included, so an image is built for the mode the device runs in) on ROCm.
+inline Error device_arch(int dev, std::string* arch) {
+#if defined(LRX_LEG_ROCM)
+    hipDeviceProp_t prop;
+    const Error e = hipGetDeviceProperties(&prop, dev);
+    if (e == kSuccess) *arch = prop.gcnArchName;
+    return e;
+#else
+    int major = 0, minor = 0;
+    Error e = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    if (e == kSuccess) e = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    if (e == kSuccess) *arch = "sm_" + std::to_string(major) + std::to_string(minor);
+    return e;
+#endif
 }
 
 // Page-locked host memory: the two calls whose names differ per vendor.
