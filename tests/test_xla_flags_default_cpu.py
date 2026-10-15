@@ -99,3 +99,12 @@ def test_an_allocator_the_leg_cannot_build_refuses_by_name(monkeypatch):
     monkeypatch.setenv("JAX_PLATFORMS", "rocm,cpu")
     monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
     _check_allocator_env()
+
+
+def test_runtime_kernel_caches_are_well_formed():
+    scopes = {"process-file", "shared-dir"}
+    for leg in LEGS.values():
+        for env, name, scope in leg.runtime_kernel_caches:
+            assert env.isupper() and name and "/" not in name and scope in scopes
+    assert not LEGS["CUDA"].runtime_kernel_caches and not LEGS["cpu"].runtime_kernel_caches
+    assert ("ROCFFT_RTC_CACHE_PATH", "rocfft_kernel_cache", "process-file") in LEGS["ROCM"].runtime_kernel_caches

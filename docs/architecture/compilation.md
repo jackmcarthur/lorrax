@@ -170,6 +170,20 @@ compile is not a ROCm-specific cost; the persistent cache removes it there
 as on CUDA (keys are rank-invariant on ROCm too: JAX reports
 `backend.platform == "gpu"` and strips the device assignment).
 
+**Vendor run-time kernels (ROCm).** Two ROCm libraries compile device code
+at run time, outside XLA and outside JAX's cache: rocFFT builds each new FFT
+length with hipRTC (1.9–7.6 s per length per process on MI250X), and AMD
+comgr keeps the code objects behind it. The leg declares both
+(`PlatformLeg.runtime_kernel_caches`), and `common.jax_compile_cache` points
+them under `<cache>/vendor/` (beside `np<P>`; the kernels do not depend on P) when it arms the persistent cache: rocFFT
+one SQLite file per process (shared writers on Lustre spin), comgr one shared
+directory (otherwise ~590 MB in HOME). From the cache the first FFT of a
+length costs 0.02–0.04 s (Precursors lane, 2026-10-14). Not cached by
+anything: rocBLAS/Tensile initialisation, about 2.8 s on a process's first
+GEMM whatever the autotune level (3.06 s at both levels in the runtime lane's
+GEMM probe), and runtime start-up (`initialize_communicator_stack`,
+5.3–5.9 s per process).
+
 ## 4 Where the time goes
 
 **The hsuite.** One A100-80 node, P4, node-local:

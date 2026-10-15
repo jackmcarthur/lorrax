@@ -20,7 +20,13 @@ differs between legs and that more than one service needs lives in
   ``jax_plugins`` directory prefix of the leg's PJRT plugin, the XLA flags the
   runtime merges into ``XLA_FLAGS`` (a caller's value wins, flag by flag), the
   allocator the GPU pool policy sets, and the API the runtime reads the card's
-  total memory through.  Each is a *declaration*; ``runtime`` implements it.
+  total memory through.  Each is a *declaration*; ``runtime`` implements it;
+* ``runtime_kernel_caches``: the leg's vendor libraries that compile device
+  kernels at run time and keep them across processes only where a variable
+  points (rocFFT's hipRTC kernels, ``ROCFFT_RTC_CACHE_PATH``; AMD comgr's
+  code-object cache, ``AMD_COMGR_CACHE_DIR``, default ``~/.cache/comgr``).
+  :mod:`common.jax_compile_cache` points each beside the persistent compile
+  cache (Precursors lane, 2026-10-14).
 
 What stays OUT is per-service: target-symbol tables, ctypes declarations,
 build hints and backend preference rows (the "policy, never tables" rule
@@ -66,6 +72,9 @@ class PlatformLeg:
     xla_allocator: str = ""         #: XLA_PYTHON_CLIENT_ALLOCATOR of the pool policy ("" = jaxlib's)
     xla_allocators: tuple = ()      #: allocators the leg's PJRT plugin can build (() = unchecked)
     device_memory_api: str = ""     #: card-total reader in runtime.xla_memory ("" = none)
+    #: ``(env, name, scope)``: run-time-compiled vendor kernels; scope
+    #: ``"process-file"`` (one file per process) or ``"shared-dir"``.
+    runtime_kernel_caches: tuple = ()
 
 
 HOST = PlatformLeg(
@@ -116,7 +125,14 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         xla_allocator="",
         # cuda_async refused at client creation (MI250X, jax 0.9.1).
         xla_allocators=("default", "platform", "bfc"),
-        device_memory_api="hip_runtime"),
+        device_memory_api="hip_runtime",
+        # rocFFT compiles each new FFT length with hipRTC (MI250X: 1.9-7.6 s
+        # per length per process, 0.02-0.04 s from its cache); cuFFT ships its
+        # kernels, so CUDA has none.  One SQLite file per process: several
+        # writers on one file on Lustre spin.  comgr's cache (~590 MB after one
+        # hsuite) would otherwise grow in HOME.
+        runtime_kernel_caches=(("ROCFFT_RTC_CACHE_PATH", "rocfft_kernel_cache", "process-file"),
+                               ("AMD_COMGR_CACHE_DIR", "comgr", "shared-dir"))),
 })
 
 _BY_VENDOR = {leg.vendor: leg for leg in LEGS.values()}
