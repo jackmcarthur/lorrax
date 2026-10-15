@@ -237,14 +237,19 @@ def test_the_family_table_matches_the_loaders_routers_and_build():
     import ffi.fft as fft
     assert {fam.family_of(t) for t in fft._ROCM_KLEAD_TARGETS.values()} == {"kdft"}
     cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
-    block = cmake[cmake.index('STREQUAL "rocm"'):]
-    block = block[:block.index("add_library(")]
+    import re
+    section = cmake[cmake.index('STREQUAL "rocm"'):]
+    nxt = re.search(r"^(elseif|else)\(", section[1:], re.M)
+    section = section[:nxt.start() + 1] if nxt else section
+    block = section[:section.index("add_library(lorrax_ffi_rocm")]
+    # A family is built on ROCM iff one of its translation units is compiled in the ROCM section
+    # (set(...SOURCES) or target_sources); headers embedded for hipRTC (cufft/kbox_stage.cuh) do not count.
+    compiled = {u.split("/")[0] for u in re.findall(r"\b[\w]+/[\w]+\.cc\b", section)}
     for name, row in fam.FAMILIES.items():
-        assert (f"{row.source}/" in block) == (row.legs["ROCM"][0] == "built"), name
+        assert (row.source in compiled) == (row.legs["ROCM"][0] == "built"), name
     srcs = block[block.index("set(LORRAX_FFI_ROCM_SOURCES"):]
     srcs = srcs[:srcs.index(")")]
     assert "kdft/kbox_unfold_ffi.cc" in srcs and "cufft/" not in srcs
     # The one cufft/ file the leg reads: the k-box stage's text (leg-neutral; its line transform is
     # the leg's policy), embedded for hipRTC as the CUDA leg embeds it for NVRTC.
-    import re
     assert set(re.findall(r"cufft/[\w.]+", block)) <= {"cufft/kbox_stage.cuh", "cufft/kbox_stage_src.h.in"}
