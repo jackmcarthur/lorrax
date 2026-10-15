@@ -96,6 +96,63 @@ def cuda_device_total_bytes(ordinal: int = 0) -> int | None:
         return None
 
 
+def hip_device_total_bytes(ordinal: int = 0) -> int | None:
+    """The device's total memory from the HIP runtime the ROCm PJRT plugin
+    already mapped (``hipDeviceTotalMem``).  None where no ``libamdhip64`` is
+    mapped into this process: this never dlopens one, because a second HIP
+    runtime beside the plugin's own (a module ROCm on ``LD_LIBRARY_PATH``
+    against the wheel's) is two runtimes in one process.  So it answers
+    after the ROCm client exists, not before."""
+    try:
+        import ctypes
+        with open("/proc/self/maps", encoding="utf-8", errors="replace") as fh:
+            paths = sorted({line.split()[-1] for line in fh
+                            if "libamdhip64" in line and "/" in line})
+        if not paths:
+            return None
+        hip = ctypes.CDLL(paths[0], mode=os.RTLD_NOLOAD | os.RTLD_GLOBAL)
+        total = ctypes.c_size_t()
+        if hip.hipDeviceTotalMem(ctypes.byref(total), ctypes.c_int(int(ordinal))):
+            return None
+        return int(total.value) or None
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+#: ``PlatformLeg.device_memory_api`` -> its reader.  The leg declares which
+#: API answers; this module owns how.
+_DEVICE_TOTAL_READERS = {
+    "cuda_driver": cuda_device_total_bytes,
+    "hip_runtime": hip_device_total_bytes,
+}
+
+
+def _process_gpu_leg():
+    """The device leg of this process's devices when the backend is up (the
+    client's vendor), else the leg the environment selects (pre-backend)."""
+    import sys
+    from lxkit import device_vendor, leg_for_vendor, process_accelerator_leg
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    if bridge and getattr(bridge, "_backends", None):
+        import jax
+        local = jax.local_devices()
+        return leg_for_vendor(device_vendor(local[0])) if local else None
+    return process_accelerator_leg()
+
+
+def device_total_bytes(ordinal: int = 0) -> int | None:
+    """The card's total memory through this process's leg's
+    ``device_memory_api`` (:data:`lxkit.LEGS`); None on CPU, on a leg that
+    declares no reader, or where the reader cannot answer (it says why in its
+    own docstring).  The one entry point every budget and gate uses."""
+    try:
+        leg = _process_gpu_leg()
+    except Exception:                                         # noqa: BLE001
+        return None
+    reader = _DEVICE_TOTAL_READERS.get(getattr(leg, "device_memory_api", "") or "")
+    return reader(ordinal) if reader is not None else None
+
+
 def outside_pool_bytes(ordinal: int = 0) -> int | None:
     """Device bytes this process holds outside the default mempool:
     ``total - free - reserved`` (the CUDA context and modules, NCCL and
@@ -367,7 +424,17 @@ def _find_pool():
     import jax
     from lxkit import device_vendor
     if device_vendor(jax.local_devices()[0]) != "cuda":
-        _POOL["source"] = "none"
+        # No CUDA mempool to read (ROCm: jaxlib's BFC arena).  The arena's own
+        # accounting stands in, with the never-resets warning below; "none"
+        # here left every ROCm stage peak blank ("-" in the stage table).
+        stats = jax.local_devices()[0].memory_stats() or {}
+        _POOL["source"] = "peak_bytes_in_use" if "peak_bytes_in_use" in stats else "none"
+        if _POOL["source"] == "peak_bytes_in_use":
+            import warnings
+            warnings.warn("device peaks per stage read peak_bytes_in_use: this device's "
+                          "allocator keeps no CUDA pool, and that figure never resets, so "
+                          "a stage below an earlier high-water mark reads as the earlier "
+                          "mark.", RuntimeWarning)
         return None
     pointer = None
     for array in jax.live_arrays():          # one device buffer; nothing is allocated

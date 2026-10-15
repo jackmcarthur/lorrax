@@ -392,8 +392,8 @@ class ModuleDoesNotFit(RuntimeError):
 
 @functools.lru_cache(maxsize=None)
 def _device_total(ordinal: int) -> int | None:
-    from runtime.xla_memory import cuda_device_total_bytes
-    return cuda_device_total_bytes(ordinal)
+    from runtime.xla_memory import device_total_bytes
+    return device_total_bytes(ordinal)
 
 
 def refuse_over_device(executable, module_name: str, platform: str) -> None:
@@ -405,12 +405,13 @@ def refuse_over_device(executable, module_name: str, platform: str) -> None:
     (``runtime.disable_xla_rematerialization``), so nothing at compile time
     shrinks a module that does not fit; it would fail at its first
     allocation.  This refuses it at once instead.  The limit is the card's
-    total memory (``cuDeviceTotalMem``), a hard device limit: the buffers
+    total memory (``runtime.xla_memory.device_total_bytes``), a hard device limit: the buffers
     alone (``temp + arguments + outputs - aliased``, no cuFFT scratch, no
     NCCL or context) cannot fit above it.  It is not the memory budget;
-    ``memory_per_device_gb`` still only warns.  CUDA only.
+    ``memory_per_device_gb`` still only warns.  Every GPU leg whose
+    ``device_memory_api`` answers (:data:`lxkit.LEGS`; CUDA and ROCm).
     """
-    if (platform not in ("cuda", "gpu")
+    if (platform not in ("cuda", "gpu", "rocm")
             or not hasattr(executable, "get_compiled_memory_stats")):
         return
     stats = executable.get_compiled_memory_stats()

@@ -443,14 +443,14 @@ X64_OVERRIDE_ENV = "LORRAX_ALLOW_X64_OFF"
 #: first JAX backend exists, while a deployment-provided value must win.
 _XLA_FLAGS_ENV = "XLA_FLAGS"
 _XLA_GPU_AUTOTUNE_FLAG = "--xla_gpu_autotune_level"
-_XLA_GPU_AUTOTUNE_DEFAULT = "0"
 #: XLA compiles each module's LLVM IR in parallel parts; the same merge and
 #: the same rule as the autotune level (a caller's value wins), results bitwise
 #: and the device peak unchanged (sandbox claim 4179).  Not
 #: ``--xla_gpu_force_compilation_parallelism``, which forces a thread count
 #: and slowed cold compile 3.0 % (claim 684).
 _XLA_GPU_LLVM_PARALLEL_FLAG = "--xla_gpu_enable_llvm_module_compilation_parallelism"
-_XLA_GPU_LLVM_PARALLEL_DEFAULT = "true"
+#: The VALUES are per leg (``PlatformLeg.xla_flag_defaults``): the same flag
+#: can be a measured win on one vendor and a no-op or a loss on another.
 
 #: Receipt captured at the ONE interpretation site below.  Startup reporting
 #: consumes this record; it must not re-parse ``XLA_FLAGS`` and risk printing
@@ -489,60 +489,66 @@ def _xla_flag_value(raw: str, flag: str) -> str | None:
 
 
 def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
-    """Merge LORRAX's two measured GPU compile flags into ``XLA_FLAGS``.
+    """Merge the GPU leg's declared compile flags into ``XLA_FLAGS``.
 
-    ``--xla_gpu_autotune_level=0`` (sandbox claims 683--684: cold compile
-    shorter, execution inside run-to-run noise) and
+    The flags and their values are the leg's ``xla_flag_defaults``
+    (:data:`lxkit.LEGS`; evidence in ``docs/architecture/compilation.md``
+    section 3).  CUDA: ``--xla_gpu_autotune_level=0`` (sandbox claims
+    683--684: cold compile shorter, execution inside run-to-run noise) and
     ``--xla_gpu_enable_llvm_module_compilation_parallelism=true`` (claim
-    4179: each module's LLVM IR compiles in parallel parts, results bitwise,
-    device peak unchanged; ``docs/architecture/compilation.md`` holds them).
-    Both are GPU-only XLA flags: a forced CPU startup leaves ``XLA_FLAGS``
-    byte-for-byte unchanged so the host/FFTW chain never depends on a GPU
-    parser accepting them.
+    4179).  ROCm: see its row.  The leg is the one ``JAX_PLATFORMS`` selects,
+    else the installed plugin's (:func:`_gpu_leg`).  All are GPU-only XLA
+    flags: a forced CPU startup leaves ``XLA_FLAGS`` byte-for-byte unchanged
+    so the host/FFTW chain never depends on a GPU parser accepting them.
 
     Caller policy always wins, flag by flag.  A flag already present in
     either accepted spelling is neither rewritten nor appended, and its last
     value is recorded as caller provenance; a missing one is appended as
     exactly one token, preserving every unrelated flag.  The returned dict is
-    a copy of the receipt the startup report consumes.
+    a copy of the receipt the startup report consumes: ``value`` and
+    ``llvm_parallel`` are the two historical flags, ``flags`` every flag the
+    leg declares or the caller set, ``leg`` the leg key.
     """
     if platform not in ("gpu", "cpu"):
         raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
 
     raw = os.environ.get(_XLA_FLAGS_ENV, "")
-    supplied = _xla_flag_value(raw, _XLA_GPU_AUTOTUNE_FLAG)
-    supplied_llvm = _xla_flag_value(raw, _XLA_GPU_LLVM_PARALLEL_FLAG)
+    leg = _gpu_leg() if platform == "gpu" else None
+    declared = dict(leg.xla_flag_defaults) if leg is not None else {}
+    named = [_XLA_GPU_AUTOTUNE_FLAG, _XLA_GPU_LLVM_PARALLEL_FLAG]
+    names = named + [f for f in declared if f not in named]
+    supplied = {f: _xla_flag_value(raw, f) for f in names}
+    flags = {}
     if platform == "cpu":
-        def _inactive(given):
-            return ("caller-supplied XLA_FLAGS; GPU-only and inactive on this "
-                    "forced CPU startup" if given is not None else
-                    "not applied: forced CPU startup")
-        _XLA_GPU_AUTOTUNE.update({
-            "value": supplied,
-            "provenance": _inactive(supplied),
-            "llvm_parallel": supplied_llvm,
-            "llvm_parallel_provenance": _inactive(supplied_llvm),
-            "applicable": False,
-            "xla_flags": os.environ.get(_XLA_FLAGS_ENV),
-        })
-        return dict(_XLA_GPU_AUTOTUNE)
-
-    default = "LORRAX default (runtime.set_default_env)"
-    caller = "caller-supplied XLA_FLAGS"
-    additions = []
-    if supplied is None:
-        additions.append(f"{_XLA_GPU_AUTOTUNE_FLAG}={_XLA_GPU_AUTOTUNE_DEFAULT}")
-    if supplied_llvm is None:
-        additions.append(f"{_XLA_GPU_LLVM_PARALLEL_FLAG}={_XLA_GPU_LLVM_PARALLEL_DEFAULT}")
-    if additions:
-        os.environ[_XLA_FLAGS_ENV] = " ".join(([raw] if raw else []) + additions)
+        for f in names:
+            flags[f] = (supplied[f],
+                        "caller-supplied XLA_FLAGS; GPU-only and inactive on this "
+                        "forced CPU startup" if supplied[f] is not None else
+                        "not applied: forced CPU startup")
+        applicable = False
+    else:
+        default = f"LORRAX default for the {leg.key if leg else '?'} leg (lxkit.LEGS)"
+        additions = []
+        for f in names:
+            if supplied[f] is not None:
+                flags[f] = (supplied[f], "caller-supplied XLA_FLAGS")
+            elif f in declared:
+                additions.append(f"{f}={declared[f]}")
+                flags[f] = (declared[f], default)
+            else:
+                flags[f] = (None, f"not set: the {leg.key if leg else '?'} leg "
+                                  f"declares no default (lxkit.LEGS)")
+        if additions:
+            os.environ[_XLA_FLAGS_ENV] = " ".join(([raw] if raw else []) + additions)
+        applicable = True
     _XLA_GPU_AUTOTUNE.update({
-        "value": _XLA_GPU_AUTOTUNE_DEFAULT if supplied is None else supplied,
-        "provenance": default if supplied is None else caller,
-        "llvm_parallel": (_XLA_GPU_LLVM_PARALLEL_DEFAULT if supplied_llvm is None
-                          else supplied_llvm),
-        "llvm_parallel_provenance": default if supplied_llvm is None else caller,
-        "applicable": True,
+        "value": flags[_XLA_GPU_AUTOTUNE_FLAG][0],
+        "provenance": flags[_XLA_GPU_AUTOTUNE_FLAG][1],
+        "llvm_parallel": flags[_XLA_GPU_LLVM_PARALLEL_FLAG][0],
+        "llvm_parallel_provenance": flags[_XLA_GPU_LLVM_PARALLEL_FLAG][1],
+        "applicable": applicable,
+        "leg": leg.key if leg is not None else None,
+        "flags": {f: {"value": v, "provenance": why} for f, (v, why) in flags.items()},
         "xla_flags": os.environ.get(_XLA_FLAGS_ENV),
     })
     return dict(_XLA_GPU_AUTOTUNE)
@@ -842,9 +848,10 @@ def set_default_gpu_pool() -> None:
 
     Both fraction spellings at once also REFUSE (jaxlib raises on the pair
     inside plugin discovery, as "Unable to initialize backend 'cuda'").
-    Nothing is set unless this is a CUDA run on a node with a GPU device
-    (:func:`_gpu_is_present`): a CPU run, a GPU-less node and ROCm keep
-    jaxlib's own defaults.
+    Nothing is set unless this is a GPU run on a node with a GPU device
+    (:func:`_gpu_is_present`) whose leg declares an allocator
+    (``PlatformLeg.xla_allocator``, :data:`lxkit.LEGS`): a CPU run, a GPU-less
+    node and a leg that declares none (ROCm today) keep jaxlib's own defaults.
 
     The fraction is not a cap: ``cuda_async`` (``create_new_pool=false``,
     the device's default mempool, which every FFI ``cudaMallocAsync`` shares)
@@ -857,9 +864,14 @@ def set_default_gpu_pool() -> None:
     """
     plats = [p.strip().lower()
              for p in os.environ.get("JAX_PLATFORMS", "").split(",") if p.strip()]
-    if (plats[:1] == ["cpu"] or "rocm" in plats
+    if (plats[:1] == ["cpu"]
             or os.environ.get("JAX_PLATFORM_NAME", "").lower() == "cpu"
             or not _gpu_is_present()):
+        return
+    # The allocator is the leg's declaration (lxkit.LEGS xla_allocator); a leg
+    # that declares none (ROCm today) keeps jaxlib's own defaults.
+    leg = _gpu_leg()
+    if leg is None or not leg.xla_allocator:
         return
     _check_allocator_env()
     if all(os.environ.get(k) for k in _FRACTION_ENVS):
@@ -872,11 +884,11 @@ def set_default_gpu_pool() -> None:
     allocator = os.environ.get(_ALLOCATOR_ENV)
     prealloc = os.environ.get(_PREALLOCATE_ENV) or None     # blank = unset
     if allocator is None and prealloc is None:
-        os.environ[_ALLOCATOR_ENV] = "cuda_async"
+        os.environ[_ALLOCATOR_ENV] = leg.xla_allocator
         os.environ[_PREALLOCATE_ENV] = "true"
         if not any(os.environ.get(k) for k in _FRACTION_ENVS):
-            from runtime.xla_memory import cuda_device_total_bytes
-            os.environ[_FRACTION_ENVS[0]] = pool_fraction(cuda_device_total_bytes(0))
+            from runtime.xla_memory import device_total_bytes
+            os.environ[_FRACTION_ENVS[0]] = pool_fraction(device_total_bytes(0))
         return
     if allocator is None and prealloc not in ("false", "False", "0"):
         raise ValueError(
@@ -966,6 +978,7 @@ def _check_allocator_env(*, print_fn=print) -> None:
                      f"backends\".", flush=True)
         return
     if raw.lower() in ALLOCATOR_SPELLINGS:            # jaxlib: .lower(), no strip
+        _check_allocator_on_leg(raw)
         return
     raise ValueError(
         f"{_ALLOCATOR_ENV}={raw!r} is not a value jaxlib accepts.  Legal: "
@@ -977,6 +990,32 @@ def _check_allocator_env(*, print_fn=print) -> None:
         f"as \"Backend 'cuda' is not in the list of known backends\" — a "
         f"message that names neither this variable nor its value, and "
         f"reads as missing hardware rather than a typo.")
+
+
+def _check_allocator_on_leg(raw: str) -> None:
+    """Refuse a jaxlib-legal allocator that this run's GPU leg cannot build.
+
+    ``PlatformLeg.xla_allocators`` (:data:`lxkit.LEGS`) lists what the leg's
+    PJRT plugin accepts.  ROCm's refuses ``cuda_async`` at client creation
+    ("CUDA async allocator requires CUDA >= 11.2", MI250X, jax 0.9.1, runtime
+    lane 2026-10-14), inside backend discovery, as an anonymous
+    "Unable to initialize backend 'rocm'".  A CPU run is not checked.
+    """
+    first = os.environ.get("JAX_PLATFORMS", "").split(",")[0].strip().lower()
+    if first == "cpu":
+        return
+    leg = _gpu_leg()
+    if leg is None or not leg.xla_allocators or raw.lower() in leg.xla_allocators:
+        return
+    raise ValueError(
+        f"GATE xla_allocator_leg: {_ALLOCATOR_ENV}={raw!r} is not available on "
+        f"the {leg.key} leg (lxkit.LEGS xla_allocators: "
+        f"{' | '.join(leg.xla_allocators)}).  Left to jaxlib the {leg.key} "
+        f"plugin refuses it while the client is created, reported as "
+        f"\"Unable to initialize backend\".  Unset it: the runtime's pool policy "
+        f"for this leg is {leg.xla_allocator or 'jaxlib default'!r}.  A site "
+        f"script or module carrying another machine's environment is the "
+        f"usual source.")
 
 
 # ---------------------------------------------------------------------------
@@ -1554,8 +1593,8 @@ def _enforce_gpu_placement() -> None:
             f"{jax.process_count()} addresses {len(gpus)} GPUs; the SlabIO, "
             f"NCCL and distributed-solver transports run one process per GPU.  "
             f"Launch one rank per GPU with each rank pinned to its own device "
-            f"(srun -n <GPUs> src/ffi/cpp/select_gpu.sh <cmd>, or "
-            f"CUDA_VISIBLE_DEVICES=<local rank>; lx run -G 4 -n 4).")
+            f"(srun -n <GPUs> --gpus-per-task=1 --gpu-bind=closest <cmd>, or "
+            f"{'/'.join(_device_visibility_envs())}=<local rank>; lx run -G 4 -n 4).")
     # Remote JAX device descriptors report this client's model, so exchange
     # measured local targets rather than trusting jax.devices() metadata.
     kinds = [device.device_kind for device in gpus]
@@ -1631,21 +1670,39 @@ def _gpu_is_present() -> bool:
 
 
 def _gpu_plugin_platform() -> str:
-    """``"rocm"`` when the installed jaxlib GPU plugin is a ROCm build, else ``"cuda"``.
+    """The ``JAX_PLATFORMS`` name of the installed jaxlib GPU plugin's leg:
+    ``"rocm"`` for a ROCm build, else ``"cuda"``.
 
     Read from the ``jax_plugins`` namespace directories on ``sys.path``
-    (``xla_cuda13``, ``xla_rocm7``, ...): no plugin is imported and no device
-    is touched, because it decides ``JAX_PLATFORMS`` before the backend exists.
+    (``xla_cuda13``, ``xla_rocm7``, ...) against each device leg's
+    ``jax_plugin_prefix`` (:data:`lxkit.LEGS`): no plugin is imported and no
+    device is touched, because it decides ``JAX_PLATFORMS`` before the backend
+    exists.  When plugins of two legs are installed, the one whose device is
+    visible here wins (:func:`lxkit.leg_device_present`); with none found the
+    first device leg's name (``cuda``) is kept, as before.
     """
     import sys
+    from lxkit import accelerator_legs, leg_device_present
+    names = set()
     for root in sys.path:
         try:
-            names = os.listdir(os.path.join(root or ".", "jax_plugins"))
+            names.update(os.listdir(os.path.join(root or ".", "jax_plugins")))
         except OSError:
             continue
-        if any(n.startswith("xla_rocm") for n in names):
-            return "rocm"
-    return "cuda"
+    legs = accelerator_legs()
+    found = [leg for leg in legs if leg.jax_plugin_prefix
+             and any(n.startswith(leg.jax_plugin_prefix) for n in names)]
+    present = [leg for leg in found if leg_device_present(leg)]
+    return (present or found or legs)[0].jax_platforms[0]
+
+
+def _gpu_leg():
+    """The device leg a GPU startup configures, before any backend exists:
+    the leg ``JAX_PLATFORMS``'s first entry names (``set_default_env`` sets it
+    to the installed plugin's), else the installed plugin's leg."""
+    from lxkit import leg_for_jax_platform
+    first = os.environ.get("JAX_PLATFORMS", "").split(",")[0]
+    return leg_for_jax_platform(first) or leg_for_jax_platform(_gpu_plugin_platform())
 
 
 def _device_visibility_envs() -> tuple:
@@ -1654,6 +1711,28 @@ def _device_visibility_envs() -> tuple:
     this module stays stdlib-only."""
     from lxkit import accelerator_legs
     return tuple(env for leg in accelerator_legs() for env in leg.visibility_envs)
+
+
+def pin_first_visible_device(env=None) -> tuple:
+    """Restrict a process to the first GPU its launcher made visible, through
+    the GPU leg's own visibility variable; return ``(variable, value)``.
+
+    For the single-process (P1) paths that must run on ONE device.  The
+    variable is the innermost of the leg's ``visibility_envs`` already set
+    (ROCm: ``HIP_VISIBLE_DEVICES`` indexes within ``ROCR_VISIBLE_DEVICES``, so
+    narrowing the inner one is valid whatever the outer holds), else the
+    leg's innermost one, set to ``0``.  ``env`` defaults to ``os.environ``.
+    A process with no GPU leg is left alone (``(None, None)``).
+    """
+    env = os.environ if env is None else env
+    leg = _gpu_leg()
+    if leg is None or not leg.visibility_envs:
+        return None, None
+    names = leg.visibility_envs
+    var = next((n for n in reversed(names) if (env.get(n) or "").strip()), names[-1])
+    first = ((env.get(var) or "0").split(",")[0].strip()) or "0"
+    env[var] = first
+    return var, first
 
 
 def _visible_device_count() -> int:
@@ -2760,9 +2839,9 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         pool["corroboration"] = reading.peak_source
         pool["disagreement"] = reading.disagreement
         pool["accounting_present"] = reading.accounting_present
-        if f["ffi_platform"] == "CUDA" and local:
-            from .xla_memory import cuda_device_total_bytes
-            pool["device_total_bytes"] = cuda_device_total_bytes(
+        if local:
+            from .xla_memory import device_total_bytes
+            pool["device_total_bytes"] = device_total_bytes(
                 getattr(local[0], "local_hardware_id", 0) or 0)
     except Exception as exc:                                  # noqa: BLE001
         pool["corroboration"] = "unavailable"

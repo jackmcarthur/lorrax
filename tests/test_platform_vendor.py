@@ -171,21 +171,26 @@ def test_visible_device_count_per_vendor_variable():
 
 
 def test_gpu_plugin_platform_from_the_installed_plugin():
-    with tempfile.TemporaryDirectory() as root:
-        os.makedirs(os.path.join(root, "jax_plugins", "xla_rocm7"))
-        sys.path.insert(0, root)
-        try:
-            assert runtime._gpu_plugin_platform() == "rocm"
-        finally:
-            sys.path.remove(root)
-    with tempfile.TemporaryDirectory() as root:
-        os.makedirs(os.path.join(root, "jax_plugins", "xla_cuda13"))
-        saved_path = list(sys.path)
-        sys.path[:] = [root]
-        try:
-            assert runtime._gpu_plugin_platform() == "cuda"
-        finally:
-            sys.path[:] = saved_path
+    import lxkit
+    saved_path, saved_present = list(sys.path), lxkit.leg_device_present
+    try:
+        for plugin, want in (("xla_rocm7", "rocm"), ("xla_cuda13", "cuda")):
+            with tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jax_plugins", plugin))
+                sys.path[:] = [root]
+                assert runtime._gpu_plugin_platform() == want
+        # Both plugins installed (a dependency pulled the other one in): the
+        # leg whose device is visible wins, whichever it is.
+        with tempfile.TemporaryDirectory() as root:
+            for plugin in ("xla_rocm7", "xla_cuda13"):
+                os.makedirs(os.path.join(root, "jax_plugins", plugin))
+            sys.path[:] = [root]
+            for key, want in (("ROCM", "rocm"), ("CUDA", "cuda")):
+                lxkit.leg_device_present = lambda leg, k=key, **_: leg.key == k
+                assert runtime._gpu_plugin_platform() == want
+    finally:
+        sys.path[:] = saved_path
+        lxkit.leg_device_present = saved_present
 
 
 def _main():

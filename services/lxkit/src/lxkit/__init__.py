@@ -55,6 +55,7 @@ from lxkit.legs import (
     accelerator_leg_to_open_first,
     accelerator_legs,
     leg_device_present,
+    leg_for_jax_platform,
     leg_for_vendor,
     process_accelerator_leg,
 )
@@ -91,7 +92,7 @@ __all__ = [
     "device_put_process_local", "device_put_process_tiles", "mark_varying",
     # the platform legs of the native-provider ABI
     "legs", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
-    "accelerator_legs", "leg_device_present", "leg_for_vendor",
+    "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_vendor",
     "process_accelerator_leg",
     # native-provider policy (the tables remain with each caller)
     "native_provider",
