@@ -163,9 +163,15 @@ _ROCM_SLATE_LU_SYMBOLS: dict = {
     "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
     "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
 }
+#: The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc: one rocSOLVER
+#: strided-batched heevd/syevd per stack), the target of local_eigh.BATCHED_EIGH_ROUTE's ROCM
+#: row.  CUDA solves the same stacks with jaxlib's cuSOLVER, so only this leg builds it.
+_ROCM_LOCAL_EIGH_SYMBOLS: dict = {
+    "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
+}
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
                                  if t.startswith("lorrax_slate_")},
-                              **_ROCM_SLATE_LU_SYMBOLS}
+                              **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS}
 
 #: Leg key -> this loader's target table and not-found build command.
 _TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,
