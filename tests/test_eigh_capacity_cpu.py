@@ -18,6 +18,8 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+jax.config.update("jax_enable_x64", True)
+
 import distrib_la
 plan_mod = importlib.import_module("distrib_la.plan")
 resolve_mod = importlib.import_module("distrib_la.resolve")
