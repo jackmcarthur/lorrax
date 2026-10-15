@@ -126,6 +126,9 @@ _L3_MODULES = frozenset({
     # were.  It knows about ``os.environ`` and nothing else: no jax, no
     # config, no physics.
     "runtime.env_flags",
+    # stdlib-only OpenBLAS spin tuning, run as the first statement of
+    # ``runtime`` (before numpy maps a library) and gated in bootstrap
+    "runtime.blas_env",
     # the cross-process service and its one policy client
     "common.collectives", "centroid.distribution",
     # movement primitives.  Named, owned patterns — NOT generic ``shard_map``

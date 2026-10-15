@@ -39,11 +39,12 @@ import shutil
 import sys
 import time
 
-import numpy as np
-
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(REPO / "src"))
+# runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
+import runtime  # noqa: F401,E402
+import numpy as np  # noqa: E402
 from tests.hsuite import rank_session  # noqa: E402
 
 FIXTURE = HERE / "fixture"
