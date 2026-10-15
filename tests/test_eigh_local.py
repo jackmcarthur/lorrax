@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 
 from distrib_la import COMPLEX_EIGH_ROUTE, eigh_local, eigh_route
-from distrib_la.local_eigh import _reflected_eigh
+from distrib_la.local_eigh import _process_leg_key, _reflected_eigh
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 
@@ -25,7 +25,9 @@ def _herm(b, n, dtype, seed=0):
 
 @pytest.mark.parametrize("dtype", [np.complex128, np.float64])
 @pytest.mark.parametrize("uplo", [None, "U"])
-def test_cpu_is_jnp_eigh_bit_for_bit(dtype, uplo):
+def test_legs_without_a_route_are_jnp_eigh_bit_for_bit(dtype, uplo):
+    if eigh_route(np.dtype(dtype)) is not None:
+        pytest.skip(f"this process's leg ({_process_leg_key()}) routes {np.dtype(dtype).name}")
     a = jnp.asarray(_herm(3, 12, dtype))
     w0, v0 = jnp.linalg.eigh(a, UPLO=uplo)
     w1, v1 = eigh_local(a, UPLO=uplo)
@@ -48,7 +50,7 @@ def test_the_row_routes_complex_on_rocm_only():
     assert eigh_route(jnp.float64, "ROCM") is None
     assert eigh_route(jnp.complex128, "CUDA") is None
     assert eigh_route(jnp.complex128, "cpu") is None
-    assert eigh_route(jnp.complex128) is None                      # this process: cpu
+    assert eigh_route(jnp.complex128) == COMPLEX_EIGH_ROUTE.get(_process_leg_key())   # this process
 
 
 @pytest.mark.parametrize("kind", ["random", "real_valued", "diagonal", "zero_row", "block", "zero", "scalar"])
