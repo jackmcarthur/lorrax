@@ -280,15 +280,19 @@ def _resolve_bse_k_grid(bse_k_grid, input_file: Optional[str]):
     return None
 
 
-#: Deck / CLI values for ``w_head_densify``: ``c1`` is the only mode.
-W_HEAD_DENSIFY_MODES = ("c1",)
+#: Deck / CLI values for ``w_head_densify``: ``c1`` (default) re-attaches the
+#: Γ head analytically; ``srlr`` moves the whole long-range part of W (head
+#: and, in a slab, its G_z channels) into a fitted model (:func:`_srlr_terms`).
+W_HEAD_DENSIFY_MODES = ("c1", "srlr")
 
 
-def resolve_w_head_densify(mode, params=None) -> str:
-    """Resolve the coarse→fine W head treatment; ``'c1'`` is the only mode.
+def resolve_w_head_densify(mode, params=None, *, modes=W_HEAD_DENSIFY_MODES) -> str:
+    """Resolve the coarse→fine W head treatment, ``'c1'`` or ``'srlr'``.
 
     Explicit argument wins; else the deck's ``w_head_densify`` key; else
-    ``'c1'``.  The retired ``'legacy'`` arm refuses by name.
+    ``'c1'``.  The retired ``'legacy'`` arm refuses by name; ``modes`` is
+    what the calling path implements (``srlr`` runs on the ``bse_k_grid``
+    bundle path only, not on ``exciton_bands --w-coarse-grid``).
     """
     val = mode
     if val is None and params is not None:
@@ -298,11 +302,17 @@ def resolve_w_head_densify(mode, params=None) -> str:
     val = str(val).strip().lower()
     if val == "legacy":
         raise ValueError("w_head_densify = legacy is retired (2026-09-25): c1 is the only W-head densification.")
+    if val in W_HEAD_DENSIFY_MODES and val not in modes:
+        raise ValueError(
+            f"GATE w_head_densify_path: w_head_densify = {val!r} is not "
+            f"implemented on this path; want one of {tuple(modes)} (srlr runs "
+            f"on the bse_k_grid bundle densification).")
     if val not in W_HEAD_DENSIFY_MODES:
         raise ValueError(
             f"w_head_densify = {val!r} is not one of {W_HEAD_DENSIFY_MODES}. "
             f"'c1' splits the Γ head off before the densifier and re-attaches "
-            f"it per fine q.")
+            f"it per fine q; 'srlr' interpolates W with its long-range part "
+            f"replaced by a fitted dressed model.")
     return val
 
 
@@ -467,6 +477,227 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
         warnings.warn(msg, RuntimeWarning, stacklevel=2)
         log_fn(f"[w-head-c1] [WARN] {msg}")
     return S_fine
+
+
+def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
+                fine_grid, n_rmu, n_rmu_pad, mesh_xy, input_file, log_fn=print):
+    """The long-range W terms of ``w_head_densify = srlr``, on the coarse and fine q.
+
+    W = J + F̃ᴴ D F̃ exactly at every coarse q (``gw.lr_channels``).  The
+    densified W is
+
+        X(q_c) = W(q_c) − w(|q_c|) LR_m(q_c)  (q_c ≠ 0),   X(0) = W(0) − LR(0),
+        W(q_f) = T[X](q_f) + w(|q_f|) LR_m(q_f)  (q_f ≠ 0),  W(Γ) = T[X](0) + LR(0),
+
+    with T the trigonometric densifier, LR_m = F̃_mᴴ [diag(1/v) − P_m]⁻¹ F̃_m the
+    fitted model (``gw.lr_channels.fit_model``; v the split's own kernel at
+    the coarse q, the fine grid's at the fine q) and LR(0)
+    the exact coarse-Γ term (literal G = 0 has v = 0 there; the Γ head stays
+    c1's).  Subtracting the MODEL, not the exact LR, keeps every coarse tile
+    exact (on a mini-BZ-averaged 3D deck up to the coarse→fine change of the
+    head's cell average); the model's own error only changes how smooth X is.
+
+    Returns ``(A_c, D_c, A_f, D_f)``: per coarse / fine q (flat fft order) the
+    rows ``A (n_q, n_L, n_rmu_pad)`` and ``D (n_q, n_L, n_L)`` (window
+    included) of the rank-n_L terms Aᴴ D A.  Host numpy, n_L·N_μ per q.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from vcoul import CoulombGeometry, inscribed_radius, lr_channels
+    from file_io.centroids import load_centroids
+    from file_io.restart_bundle import read_lr_channels
+    from gw import lr_channels as LC
+    from gw.head_correction import resolve_head_S_cart
+
+    lr = read_lr_channels(restart_file)
+    if lr is None:
+        raise ValueError(
+            f"GATE srlr_restart_channels: {restart_file} has no W0_lr group; "
+            "want: the dressed long-range channels the static Dyson route "
+            "persists beside W0 (gw.lr_channels); fix: rerun GW with this "
+            "tree (a static-Dyson W0, e.g. compute_mode = cohsex), or "
+            "w_head_densify = c1.")
+    t = lr["tables"]
+    if t is None:
+        raise ValueError(
+            "GATE srlr_wedge_tables: W0 is stored on the full zone, so the "
+            "W0_lr rows carry no unfold tables; want: restart_q_storage = ibz.")
+    sys_dim = int(lr["sys_dim"])
+    if sys_dim != int(meta.sys_dim):
+        raise ValueError(f"srlr: W0_lr was written for sys_dim {sys_dim}, "
+                         f"the deck says {int(meta.sys_dim)}")
+    if not np.allclose(t.q_irr_frac, lr["q_frac"], atol=1e-10):
+        raise ValueError("srlr: the W0_lr rows are not W0's q wedge")
+    _, n_L, n_file = lr["Ft"].shape
+    if n_file != n_rmu:
+        raise ValueError(f"srlr: W0_lr carries {n_file} centroids, the bundle {n_rmu}")
+    c0 = int(lr["n_z"]) if sys_dim == 2 else 0
+    bvec = np.asarray(CoulombGeometry.from_wfn(wfn).bvec, dtype=np.float64)
+
+    Ft, Pf, v_c, K_full, q_full = _unfold_lr_channels(
+        lr, sym, coarse_grid=coarse_grid, n_rmu=n_rmu, n_rmu_pad=n_rmu_pad,
+        mesh_xy=mesh_xy)
+    K0 = K_full[:, c0].copy()
+    if sys_dim == 2:
+        K0[:, 2] = 0.0
+    qc = K0 @ bvec                                         # WS-representative q, Cartesian
+
+    # ── the model ─────────────────────────────────────────────────────────
+    q_ins = inscribed_radius(bvec, sys_dim)
+    r_a, r_b = LC.WINDOW_INNER * q_ins, LC.WINDOW_OUTER * q_ins
+    frac = load_centroids(params["centroids_file"], tuple(int(x) for x in wfn.fft_grid))[0]
+    r_mu = np.asarray(frac, dtype=np.float64) @ (2.0 * np.pi * np.linalg.inv(bvec).T)
+    S_cart, _prov = resolve_head_S_cart(
+        restart_file, input_file=input_file, wfn=wfn, sym=sym, meta=meta,
+        params={**params, "_mesh": mesh_xy}, print_fn=log_fn)
+    if S_cart is None:
+        raise ValueError(f"GATE srlr_head_tensor: no S tensor ({_prov}); the P "
+                         "model's head anchor needs S_cart_head or dipole.h5.")
+    model, info = LC.fit_model(qc, Ft[..., :n_rmu], Pf, r_mu=r_mu, S_cart=S_cart,
+                               c0=c0, sys_dim=sys_dim, r_fit=r_b)
+    gamma = int(np.argmin(np.linalg.norm(qc, axis=1)))
+    D0 = LC.screened_lr(Pf[gamma][None], v_c[gamma][None])[0]
+
+    def terms(qcs, v):
+        n = len(qcs)
+        A = np.zeros((n, n_L, int(n_rmu_pad)), np.complex128)
+        D = np.zeros((n, n_L, n_L), np.complex128)
+        qn = np.linalg.norm(qcs, axis=1)
+        w = LC.window(qn, r_a, r_b)
+        on = np.flatnonzero((w > 0.0) & (qn > 1e-9))
+        if on.size:
+            A[on, :, :n_rmu] = LC.model_rows(model, qcs[on])
+            D[on] = w[on, None, None] * LC.screened_lr(LC.model_P(model, qcs[on]), v[on])
+        g = np.flatnonzero(qn <= 1e-9)
+        A[g], D[g] = Ft[gamma], D0
+        return A, D, on.size
+
+    A_c, D_c, n_on_c = terms(qc, v_c)
+    fg = np.asarray(fine_grid, dtype=np.int64)
+    q_fine = np.stack(np.meshgrid(*[np.arange(n) / n for n in fg],
+                                  indexing="ij"), -1).reshape(-1, 3)
+    # The fine q take the kernel V would carry on the fine grid: the point
+    # v, or (3D mc_average_vcoul_body, W0_lr's ``head_kernel``) the head's
+    # average over the FINE mini-BZ cell, as c1's per-fine-q head does.  At a
+    # shared q ≠ 0 the tile then moves by that cell-average change only.
+    head_fn = None
+    if lr["head_kernel"] == "minibz_average":
+        from vcoul import build_v_head_miniBZ_fn_3d
+        omega = float(CoulombGeometry.from_wfn(wfn).cell_volume)
+        vfn = build_v_head_miniBZ_fn_3d(tuple(fine_grid), bvec, omega)
+        head_fn = lambda K: omega * vfn(K)                 # noqa: E731  (bare units)
+    ch_f = lr_channels(q_fine, bvec=bvec, sys_dim=sys_dim, n_z=c0, head_fn=head_fn)
+    Kf = q_fine + ch_f.gvec[:, c0]
+    if sys_dim == 2:
+        Kf[:, 2] = 0.0
+    A_f, D_f, n_on_f = terms(Kf @ bvec, ch_f.v)
+    log_fn(
+        f"[srlr] long-range model: {n_L} channel(s) per q (sys_dim {sys_dim}, "
+        f"|G_z| <= {c0}); window {r_a:.4f} -> {r_b:.4f} bohr^-1 "
+        f"(q_ins {q_ins:.4f}); fit on {info['n_fit']} coarse q: F~ degree "
+        f"{info['deg_F']} rel.res {info['relres_F']:.4f}, P degree "
+        f"{info['deg_P']} in q^2 rel.res {info['relres_P']:.4f}; model "
+        f"subtracted at {n_on_c} coarse q + exact at coarse Gamma, added at "
+        f"{n_on_f} fine q + exact at fine Gamma; head kernel "
+        f"{lr['head_kernel']}; S anchor {_prov}")
+    return A_c, D_c, A_f, D_f
+
+
+def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
+    """W0_lr's F̃ and P from the q wedge onto the full coarse zone (flat fft order).
+
+    Each channel row is one ζ-like leg (``symmetry_maps.unfold_isdf_one_leg``
+    with the channel's G); P_ab → c_a c_b* P_ab with the same τ phases,
+    conjugated on antiunitary rows; slab channels are reordered by the target
+    G_z.  Returns ``Ft (n_q, n_L, n_rmu_pad)``, ``P (n_q, n_L, n_L)``, the
+    split's kernel ``v (n_q, n_L)`` (a function of |K|), the target channel
+    momenta ``K (n_q, n_L, 3)`` and ``q_full (n_q, 3)``, both crystal.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import (bgw_integer_q_to_fractional, tau_phase_row,
+                               unfold_isdf_one_leg)
+    from common.collectives import device_put_process_local
+
+    t = lr["tables"]
+    sys_dim = int(lr["sys_dim"])
+    c0 = int(lr["n_z"]) if sys_dim == 2 else 0
+    n_qi, n_L, _ = lr["Ft"].shape
+    grid = np.asarray(coarse_grid, dtype=np.int64)
+    tp = t.padded(int(n_rmu_pad))
+    to_host = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
+    col_sh = NamedSharding(mesh_xy, P(None, "x"))
+    rows_full = []
+    for a in range(n_L):
+        col = np.zeros((n_qi, int(n_rmu_pad)), np.complex128)
+        col[:, :n_rmu] = lr["Ft"][:, a]
+        out = unfold_isdf_one_leg(
+            device_put_process_local(col, col_sh),
+            source_gvec_components=np.asarray(lr["gvec"][:, a], dtype=np.int32),
+            sym=sym, sym_idx=tp.sym_idx_q, sym_perm=tp.sym_perm,
+            L_table=tp.L_table, q_irr_frac=tp.q_irr_frac, kgrid=tuple(coarse_grid),
+            mesh_xy=mesh_xy, component_action="scalar")
+        rows_full.append(np.asarray(to_host(out)))
+    Ft = np.stack(rows_full, axis=1)                       # (nq, n_L, μ_pad)
+    nq = Ft.shape[0]
+
+    # The same star rows the one-leg unfold used: each target channel's
+    # momentum, its τ phase c_a (P transforms as c_a c_b* P, conjugated on
+    # antiunitary rows), and the channel order (slab: by G_z).
+    q_int = np.asarray(sym.kvecs_asints, dtype=np.int64)
+    fft_int = np.stack(np.meshgrid(*[np.arange(n) for n in grid],
+                                   indexing="ij"), -1).reshape(-1, 3)
+    if q_int.shape != fft_int.shape or not np.array_equal(np.mod(q_int, grid), fft_int):
+        raise ValueError(
+            "GATE srlr_q_order: SymMaps' q rows are not the bundle's flat fft "
+            "order; the unfolded rows would land on other q.")
+    q_full = bgw_integer_q_to_fractional(q_int, grid)
+    S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
+    n_sp = int(np.asarray(sym.sym_matrices).shape[0])
+    tau = np.asarray(sym.translations, dtype=np.float64)
+    idx, rows = np.asarray(tp.irr_idx_q), np.asarray(tp.sym_idx_q)
+    Pf = np.empty((nq, n_L, n_L), np.complex128)
+    vf = np.empty((nq, n_L))
+    K_full = np.empty((nq, n_L, 3))
+    for iq in range(nq):
+        s, p = int(rows[iq]), int(idx[iq])
+        Kp = np.asarray(tp.q_irr_frac[p], dtype=np.float64) + lr["gvec"][p]
+        ph = tau_phase_row(S_all[s % n_sp], tau[s % n_sp], Kp)
+        c = np.ones(n_L, np.complex128) if ph is None else ph
+        Pq = c[:, None] * lr["P"][p] * np.conj(c)[None, :]
+        if s >= n_sp:
+            Pq = np.conj(Pq)
+        Kt = (S_all[s] @ Kp.T).T
+        order = np.argsort(Kt[:, 2], kind="stable") if sys_dim == 2 else np.arange(1)
+        if sys_dim == 2 and not np.allclose(Kt[order, 2], np.arange(-c0, c0 + 1)):
+            raise ValueError(
+                f"GATE srlr_channel_relabel: q {iq} maps the G_z channels to "
+                f"{Kt[order, 2].tolist()}; want the set -n_z..n_z.")
+        Ft[iq], Pf[iq], K_full[iq] = Ft[iq][order], Pq[np.ix_(order, order)], Kt[order]
+        vf[iq] = np.asarray(lr["v"][p])[order]
+    return Ft, Pf, vf, K_full, q_full
+
+
+def _add_rank_lr(W_q, A, D, mesh_xy, sign):
+    """``W_q[μ,ν,q] += sign · Σ_ab conj(A[q,a,μ]) D[q,a,b] A[q,b,ν]`` in W's layout.
+
+    W_q ``(μ, ν, nx, ny, nz)`` at ``P('x','y',None,None,None)``; A
+    ``(n_q, n_L, μ)`` held twice, μ on x and ν on y (the ``attach_head_channel``
+    pattern), so every rank forms only its own tile and no collective runs.
+    # ponytail: A is host-built for every q (n_q·n_L·N_μ/√P per rank); build it
+    # on device from the fit coefficients if that row stack ever matters.
+    """
+    from common.collectives import device_put_process_local
+    a_x = device_put_process_local(A, NamedSharding(mesh_xy, P(None, None, "x")))
+    a_y = device_put_process_local(A, NamedSharding(mesh_xy, P(None, None, "y")))
+    d = device_put_process_local(D, NamedSharding(mesh_xy, P()))
+
+    @partial(jax.jit, out_shardings=W_q.sharding)
+    def _add(W, ax, ay, dd):
+        t = jnp.einsum("qam,qab,qbn->mnq", jnp.conj(ax), dd, ay)
+        return W + sign * t.reshape(W.shape)
+
+    return _add(W_q, a_x, a_y, d)
 
 
 def _interpolate_bse_data_to_grid(
@@ -744,13 +975,33 @@ def _interpolate_bse_data_to_grid(
     # inside the ONE sharded densifier (shard_map FFTs + jitted pad with
     # out_shardings) — the (μ,ν) sharding never drops, so per-rank peak is the
     # local (μ_loc, ν_loc, nk_fine) tile, never a replicated N_μ² array.
+    # ``srlr``: the interpolant sees W minus its fitted long-range model
+    # (head and, in a slab, the G_z channels), which is added back exactly
+    # at every fine q (``_srlr_terms``).
+    srlr = resolve_w_head_densify(None, params) == "srlr"
+    W_coarse = data["W_q"]
+    if srlr:
+        if keep is not None:
+            raise ValueError(
+                "GATE srlr_downfold: w_head_densify = srlr on a downfolded "
+                "bundle; want: the native centroid set W0_lr was written in.")
+        A_c, D_c, A_f, D_f = _srlr_terms(
+            restart_file, wfn, sym, meta, params, coarse_grid=coarse_grid,
+            fine_grid=fine_grid, n_rmu=n_rmu, n_rmu_pad=int(W_coarse.shape[0]),
+            mesh_xy=mesh_xy, input_file=input_file, log_fn=log_fn)
+        W_coarse = _add_rank_lr(W_coarse, A_c, D_c, mesh_xy, -1.0)
     densify_W = make_w_densifier(
         mesh_xy, P("x", "y", None, None, None), fine_grid, output="k")
-    W_q_fine = densify_W(data["W_q"])
+    W_q_fine = densify_W(W_coarse)
+    del W_coarse
+    if srlr:
+        W_q_fine = _add_rank_lr(W_q_fine, A_f, D_f, mesh_xy, 1.0)
     log_fn(f"[bse_k_grid] W zero-padded in R "
            f"{coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}→"
            f"{fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
-           f"(exact trig-interp; direct term now on the fine grid)")
+           f"(exact trig-interp; direct term now on the fine grid)"
+           + (" with the SR/LR long-range model split off and re-added"
+              if srlr else ""))
 
     # ── C1: re-attach W's Γ head, per fine q, on the densified BODY ────────
     # The loader DEFERRED the rank-1 whead injection when it saw a pending
@@ -771,6 +1022,10 @@ def _interpolate_bse_data_to_grid(
             input_file=input_file, restart_file=restart_file, mesh=mesh_xy,
             gamma_cell=head_channel.get("gamma_cell", "fine"), log_fn=log_fn,
             static_sample=head_channel.get("static_sample"))
+        if srlr:
+            # The model owns the head at every fine q ≠ 0; c1 keeps Γ.
+            S_fine = np.where(np.arange(S_fine.size).reshape(S_fine.shape) == 0,
+                              S_fine, 0.0)
         W_q_fine = attach_head_channel(
             W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
             head_channel["cell_volume"])

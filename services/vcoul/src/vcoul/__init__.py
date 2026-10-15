@@ -83,6 +83,11 @@ WHO CALLS WHAT
     The centrosymmetric ``{δq} = {−δq}`` mini-BZ draw the head above
     averages over — on the public API because the closure is a correctness
     requirement of the injection, not an implementation detail.
+``lr_channels(q_frac, *, bvec, sys_dim, n_z)`` / ``lr_kernel`` / ``ws_shift``
+    The long-range channels — the plane waves whose v(q+G) is non-analytic
+    in q (bulk: the WS slot; slab: the WS slot with its G_z shells) — and
+    their kernel at any q.  The SR/LR W densifier (``gw.lr_channels``,
+    ``bse.bse_densify``) splits W on them.
 ``bare_coulomb_sphere_indices`` / ``bare_coulomb_sphere_mask``
     "Which G are in q's sphere".  ``common.coulomb_sphere`` pads the
     answer into the WFN.h5 sentinel layout; the padding is the FFT box's
@@ -110,6 +115,8 @@ from vcoul.box_0d import Box0D
 from vcoul.box_fft import compute_vcoul_box
 from vcoul.bulk_3d import Bulk3D
 from vcoul.geometry import CoulombGeometry
+from vcoul.long_range import (LRChannels, inscribed_radius, lr_channels,
+                              lr_kernel, ws_shift)
 from vcoul.quadrature import (
     GAUSS_LEGENDRE_INTERVAL_PROVENANCE,
     gauss_legendre_interval,
@@ -157,6 +164,8 @@ __all__ = [
     # dispatch + the v(q+G) driver
     "SysDim", "CoulombKernel", "get_kernel", "v_qG_table", "v_qG_single",
     "HeadSlotTable", "head_slot_table",
+    # long-range channels (W densification)
+    "LRChannels", "lr_channels", "lr_kernel", "ws_shift", "inscribed_radius",
     "Bulk3D", "Slab2D", "Box0D",
     # the slab q->0 cell-average rule selection (no silent alternative)
     "Q0_RULE_EXACT", "Q0_RULE_SOBOL_DEBUG", "SlabQ0Certificate",

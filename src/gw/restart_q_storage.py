@@ -356,6 +356,16 @@ def take_pre_unfold(name):
     return _SINK[-1].pop(str(name), None)
 
 
+def deposit_lr_channels(payload):
+    """Offer W's dressed long-range channels (``gw.lr_channels``) to the W0 writer."""
+    _SINK[-1]["W0_lr"] = payload
+
+
+def take_lr_channels():
+    """The deposited long-range channels, REMOVED; ``None`` if this run made none."""
+    return _SINK[-1].pop("W0_lr", None)
+
+
 def peek_pre_unfold(name):
     """Non-destructive read, for assertions and logs only."""
     return _SINK[-1].get(str(name))

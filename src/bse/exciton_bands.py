@@ -2182,7 +2182,8 @@ def main(argv=None):
                 # able to do that, so the import lives inside the branch that
                 # uses it.
                 from gw.head_densify import attach_head_channel
-                w_head_mode = resolve_w_head_densify(args.w_head_densify, params)
+                w_head_mode = resolve_w_head_densify(
+                    args.w_head_densify, params, modes=("c1",))
                 W_q_fine_in = data["W_q"]
                 head_ch = None
                 if w_head_mode == "c1":

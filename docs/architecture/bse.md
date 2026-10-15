@@ -14,7 +14,7 @@ bands, [exciton bands](../how-to/htransform-and-exciton-bands.md#7-exciton-bands
 | input | producer | what the BSE reads |
 |---|---|---|
 | the deck (`-i`) | the GW deck | WFN path, centroid files, `nval`/`ncond`/`nband`, head settings, `bse_k_grid` |
-| `isdf_tensors_<N_mu>.h5`, in the run directory or its `tmp/` | `gw.gw_jax` with `write_restart_tensors = true` (the default) | parent ψ faces at the centroids, `enk_full` (Ry), `V_qmunu`, `W0_qmunu` and its `W0_ready` flag, the head vector `G0_mu_nu`, `vhead`/`whead` |
+| `isdf_tensors_<N_mu>.h5`, in the run directory or its `tmp/` | `gw.gw_jax` with `write_restart_tensors = true` (the default) | parent ψ faces at the centroids, `enk_full` (Ry), `V_qmunu`, `W0_qmunu` and its `W0_ready` flag, the head vector `G0_mu_nu`, `vhead`/`whead`; on a static-Dyson W0, the dressed long-range channels `W0_lr` |
 | `WFN.h5` and the centroid table named in the deck | QE → pw2bgw; `centroid.kmeans_cli` | authentication of the bundle, and the static-screening rebuild |
 | `eqp1.dat` (`--eqp`, optional) | `gw.gw_jax` | diagonal QP energies on the wedge, unfolded through the symmetry service |
 | `dipole.h5` (`--dipole`) | `psp.get_dipole_mtxels` | velocity matrix elements and `band_energies` for absorption and per-state dipoles |
@@ -128,7 +128,12 @@ used: it is $O(N_k^2)$ against the FFT's $O(N_k \log N_k)$.
 
 `bse_k_grid` densifies the bundle before any solve (`bse.bse_densify`). ψ and
 ε go through one htransform $f(H)$. W's body, with its Γ head removed, is
-zero-padded in R, and the head is re-attached analytically at each fine q. The
+zero-padded in R, and the head is re-attached analytically at each fine q
+(`w_head_densify = c1`). `w_head_densify = srlr` instead removes a fitted
+model of W's whole long-range part (the screened head and, in a slab, its G_z
+channels) before the zero-pad and adds it back at every fine q, from the
+dressed channels GW stored in `W0_lr`
+([SR/LR densification](../theory/w-srlr-densification.md)). The
 q = 0 exchange tile is k-grid invariant and is carried through unchanged,
 unless `head_minibz_average = true`: then it is rebuilt through
 `bse.vq_interp` with the fine grid's mini-BZ head

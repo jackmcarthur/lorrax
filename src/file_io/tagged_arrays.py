@@ -1208,6 +1208,44 @@ def write_w0_qmunu_to_h5(
 
 
 
+#: Restart group of W's dressed long-range channels (``gw.lr_channels``).
+LR_CHANNELS_GROUP = "W0_lr"
+
+
+def write_lr_channels_to_h5(filename, *, Ft, P, gvec, v, q_frac, n_z, sys_dim,
+                            head_kernel):
+    """Persist W0's dressed long-range channels beside ``W0_qmunu``.
+
+    Group ``W0_lr``, one row per solve q (the W0 wedge, ``q_frac`` its
+    ``q_irr_frac``): ``Ft`` (n_q, n_L, n_rmu) complex, canonical centroid
+    order, F̃ = F(1 − χV_b)⁻¹ with F_aμ = ζ_q(μ,G_a)/√Ω; ``P`` (n_q, n_L, n_L)
+    = F̃ χ Fᴴ; ``gvec`` (n_q, n_L, 3) the channel G in that q's frame; ``v``
+    (n_q, n_L) v(q+G_a) in Ry·bohr³, the value V carries (``head_kernel``:
+    ``point`` or ``minibz_average``).  W0 = J + F̃ᴴ[diag(1/v) − P]⁻¹F̃.
+    Small (n_L rows per q): rank-0 serial write.
+    """
+    arrays = dict(Ft=np.asarray(Ft, np.complex128), P=np.asarray(P, np.complex128),
+                  gvec=np.asarray(gvec, np.int32), v=np.asarray(v, np.float64),
+                  q_frac=np.asarray(q_frac, np.float64))
+
+    def _write():
+        with h5py.File(filename, "a") as f:
+            set_commit_state(f, False)
+            if LR_CHANNELS_GROUP in f:
+                del f[LR_CHANNELS_GROUP]
+            g = f.create_group(LR_CHANNELS_GROUP)
+            for k, a in arrays.items():
+                g.create_dataset(k, data=a)
+            g.attrs["n_z"] = int(n_z)
+            g.attrs["sys_dim"] = int(sys_dim)
+            g.attrs["head_kernel"] = str(head_kernel)
+            g.attrs["convention"] = (
+                "F_a(mu) = zeta_q(mu, G_a)/sqrt(Omega); W0 = J + Ft^H "
+                "[diag(1/v) - P]^-1 Ft (gw.lr_channels)")
+            set_commit_state(f, True)
+    rank0_transaction(filename, stage="restart.lr_channels", write=_write)
+
+
 def write_head_scalars_to_h5(
     filename: str,
     *,

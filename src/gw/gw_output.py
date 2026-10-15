@@ -625,6 +625,13 @@ def persist_w0_and_head(
         write_w0_qmunu_to_h5(tensors_filename, W_full,
                              n_rmu_logical=int(meta.n_rmu),
                              mesh=mesh_xy, qirr=qirr)
+        # The static Dyson route's dressed long-range channels of this W0
+        # (gw.lr_channels), read by the SR/LR densifier; none on other routes.
+        from .restart_q_storage import take_lr_channels
+        _lr = take_lr_channels()
+        if _lr is not None:
+            from file_io import write_lr_channels_to_h5
+            write_lr_channels_to_h5(tensors_filename, **_lr)
     _stamp_screening_diagrams(tensors_filename, config)
     with _tmg.section("persist_w0.write_head"):
         write_head_scalars_to_h5(

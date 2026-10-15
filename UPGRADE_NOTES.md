@@ -5,6 +5,29 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-15 — `w_head_densify = srlr`: SR/LR W densification (branch `feat/srlr-w-densify`)
+
+A second coarse-to-fine W mode beside `c1` (the default, unchanged). `srlr`
+splits W exactly at every coarse q into a short-range part and the screened
+long-range channels (bulk: the WS head slot; slab: that slot with its G_z
+shells), subtracts a fitted model of the long-range part before the
+trigonometric densifier and adds it back at every fine q
+([SR/LR densification](docs/theory/w-srlr-densification.md)). Coarse tiles
+stay exact.
+
+- **GW.** The static Dyson solve (`compute_mode = cohsex`, and every other
+  route through `gw.screening.compute_static_w`'s static role) now also
+  writes the restart group `W0_lr`: the dressed form factors F̃ and channel
+  polarizability P per irreducible q, n_L·N_μ numbers per q. Cost: three
+  skinny products against χ₀ and W. A χ₀/W mismatch refuses
+  (`GATE lr_channels_negative_P`). The shared-pole route does not write it
+  yet.
+- **BSE.** `w_head_densify = srlr` needs that group and W0 on its q wedge;
+  otherwise it refuses by name (`GATE srlr_restart_channels`,
+  `srlr_wedge_tables`). Restarts from earlier trees, and shared-pole
+  restarts, keep `c1`. `exciton_bands --w-coarse-grid` accepts `c1` only.
+- **Results.** `c1` runs are unchanged. No deck change is needed.
+
 ## 2026-10-13 — FFI bundle: the LU factors are a declared output; both legs carry RUNPATH $ORIGIN
 
 The fused distributed LU solves behind `linalg = distributed` (the W Dyson

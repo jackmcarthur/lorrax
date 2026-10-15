@@ -367,6 +367,17 @@ def compute_static_w(
                                                "batch_reshard")))
             if (head_channel is None
                     or str(getattr(head_channel, "mode", "off")) == "off"):
+                # W0's dressed long-range channels for the SR/LR densifier
+                # (gw.lr_channels): χ₀'s two skinny products are taken here,
+                # before the solve donates it.
+                lr = None
+                if role == "static":
+                    from . import lr_channels
+                    with timing.section("W.lr_channels"):
+                        lr = lr_channels.begin(
+                            chi0_q_solve, config=config, meta=meta, sym=sym,
+                            centroid_indices=centroid_indices, wedge=wedge,
+                            mesh_xy=mesh_xy)
                 with timing.section(
                         "W.exec", announce=True,
                         label=f"{_w} Dyson solve ({nq_solve} q, mu={_mu}, "
@@ -381,6 +392,9 @@ def compute_static_w(
                     # now invalid.  Do NOT touch ``chi0_q_solve`` after this.
                     del chi0_q_solve
                     W_q_solve.block_until_ready()
+                if lr is not None:
+                    with timing.section("W.lr_channels"):
+                        lr_channels.finish(lr, W_q_solve)
             else:
                 # ── Head-channel Coulomb placement (mc_average_placement) ──
                 # TWO single-V Dyson solves, then ONE real scalar per q-cell.

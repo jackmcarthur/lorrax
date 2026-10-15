@@ -739,6 +739,28 @@ def read_wavefunctions(filename, input_file, mesh_xy, *, bands=None, family="cha
     return unfold_parent_faces((face,), filename, input_file, mesh_xy, family=family)[0]
 
 
+def read_lr_channels(filename):
+    """W0's dressed long-range channels (group ``W0_lr``, ``gw.lr_channels``), or ``None``.
+
+    Host numpy, one row per W0 wedge q: ``Ft`` (n_q, n_L, n_rmu) canonical
+    order, ``P`` (n_q, n_L, n_L), ``gvec`` (n_q, n_L, 3), ``v`` (n_q, n_L),
+    ``q_frac`` (n_q, 3), ``n_z``, ``sys_dim``, ``head_kernel`` and ``tables``: W0's own unfold
+    tables (``None`` when W0 is stored on the full zone).
+    """
+    from .tagged_arrays import LR_CHANNELS_GROUP
+    with h5py.File(filename, "r") as f:
+        if LR_CHANNELS_GROUP not in f:
+            return None
+        g = f[LR_CHANNELS_GROUP]
+        out = {k: g[k][()] for k in ("Ft", "P", "gvec", "v", "q_frac")}
+        out.update(n_z=int(g.attrs["n_z"]), sys_dim=int(g.attrs["sys_dim"]),
+                   head_kernel=str(g.attrs["head_kernel"]))
+        from symmetry_maps import dataset_q_storage, read_tables
+        out["tables"] = (read_tables(f, "W0_qmunu")
+                         if dataset_q_storage(f["W0_qmunu"]) == "ibz" else None)
+    return out
+
+
 def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
                      *, nohead=False, full_exchange=False, screened_w=None):
     """Return canonical BSE ψ faces, Γ exchange and the screened q grid.
