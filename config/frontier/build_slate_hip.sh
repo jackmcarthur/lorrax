@@ -95,7 +95,16 @@ echo "[slate-hip] source at $(git -C "$SRC" describe --tags --always)"
 # flag; hipcc reads the target from here.
 export HIPCC_COMPILE_FLAGS_APPEND="--offload-arch=$GFX"
 if [[ "$FRESH" == "--fresh" ]]; then rm -rf "$BUILD" "$PREFIX"; fi
+# A build tree configured against another host BLAS keeps it in BLAS++'s
+# cached probe even with -DBLAS_LIBRARIES (observed: a LibSci-era tree relinked
+# LibSci and failed the closure check below), so the tree is stamped with the
+# BLAS it was configured for and a mismatch refuses before configuring.
+if [[ -e "$BUILD/CMakeCache.txt" && "$(cat "$BUILD/LORRAX_HOST_BLAS" 2>/dev/null)" != "$BLAS_LIB" ]]; then
+    echo "[slate-hip] ERROR: $BUILD was configured for host BLAS '$(cat "$BUILD/LORRAX_HOST_BLAS" 2>/dev/null || echo unknown)', not $BLAS_LIB; rerun with --fresh" >&2
+    exit 2
+fi
 mkdir -p "$BUILD"
+echo "$BLAS_LIB" > "$BUILD/LORRAX_HOST_BLAS"
 cmake -S "$SRC" -B "$BUILD" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=CC -DCMAKE_C_COMPILER=cc -DCMAKE_Fortran_COMPILER=ftn \
