@@ -129,35 +129,44 @@ KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCO
                  KFFT_KLEAD_TARGET, KFFT_KLEAD_UNFOLD_TARGET, KCONV_CHI_UNFOLD_TARGET,
                  KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
 
-#: The ROCM leg's k-leading pair (cpp/kdft/kdft_klead_ffi.cc): mode 2 and mode 3 by direct DFT
-#: in LDS, the operations and layouts of KCONV_KLEAD_TARGET / KFFT_KLEAD_TARGET.
+#: The ROCM leg's k-leading pair (cpp/kdft/kdft_klead_ffi.cc): mode 2 and mode 3 by mixed-radix
+#: DFT in LDS, the operations and layouts of KCONV_KLEAD_TARGET / KFFT_KLEAD_TARGET.
 KDFT_KCONV_KLEAD_TARGET = "lorrax_kdft_kconv_klead"
 KDFT_KFFT_KLEAD_TARGET = "lorrax_kdft_kfft_klead"
-# kdft measured record (MI250X, one GCD, ROCm 7.14.1, JAX 0.9.1; per mode-2 pass, c128, the XLA
-# route = this module's _xla composition inside xla_reference(); gate max |dU|/max|U| <= 7.1e-16
-# c128, 2.4e-7 c64 on every grid below).  XLA's FFT transforms minor axes only, so jnp.fft over
-# the leading k axes is transpose + FFT + transpose per transform; kdft reads and writes T once.
-#   k-grid  T (nk, a, mx, b, my)     XLA ms   kdft ms   speedup   kdft GB/s (2|T|/t)
-#   5x5x1   (25, 2, 3, 2, 3)          0.031    0.012     2.6       (launch-bound; hsuite)
-#   8x8x1   (64, 2, 500, 2, 500)      9.44     3.31      2.8       619
-#   4x4x4   (64, 2, 400, 2, 400)     11.47     1.86      6.2       705
-#   6x6x6   (216, 2, 250, 2, 250)    24.83     3.87      6.4       447
-#   12x12x1 (144, 2, 300, 2, 300)     9.99     4.77      2.1       348
-#   8x8x8   (512, 2, 150, 2, 150)     9.04     4.61      2.0       320
-# Mode 3 (one transform) 1.3-5.4x over the same grids.  Launch shape: a 16 KiB tile and 512
-# threads beat the first cut (32 KiB, 256) by 1.1-2.0x (sweep 8/16/32/60 KiB x 64..512 threads);
-# at least 8 columns per block (12x12x1 at 4 columns: 6.51 ms).  Not paid on hsuite: P4
-# kmeans..cohsex walls agree with the XLA route within run noise (113.3 vs 111.6 s cold).
+# kdft measured record (MI250X, one GCD, ROCm 7.14.1, JAX 0.9.1; c128 unless noted; per call; the
+# XLA route = this module's _xla composition inside xla_reference(); gate max |dU|/max|U| <= 2.2e-15
+# c128, 6.3e-7 c64 on 30 grids up to nk = 10240, odd, prime and unit axes included).  XLA's FFT
+# transforms minor axes only, so jnp.fft over the leading k axes is transpose + FFT + transpose
+# per transform.  kdft passes: 1 when the k tile fits a block, else 2*(groups-1)+1 (mode 2) and
+# one per group (mode 3), planned by cpp/kdft/kdft_klead_plan.h, which also holds the per-pass
+# bandwidth fit (1.16 TB/s at W >= 32 columns down to 0.44 at 400-point W = 8 tiles).
+#   k-grid    T (nk, a, mx, b, my)    mode 2 XLA -> kdft ms (x)   mode 3 fftn XLA -> kdft ms (x)
+#   8x8x1     (64, 2, 500, 2, 500)      7.92 ->  3.49 (2.3)        --
+#   6x6x6     (216, 2, 250, 2, 250)    24.99 ->  4.02 (6.2)      10.33 -> 3.04 (3.4)
+#   12x12x1   (144, 2, 300, 2, 300)     7.52 ->  3.65 (2.1)       4.21 -> 2.53 (1.7)
+#   8x8x8     (512, 2, 150, 2, 150)     9.20 ->  4.78 (1.9)       4.64 -> 2.74 (1.7)
+#   12x12x12  (1728, 2, 95, 2, 95)     14.94 ->  7.56 (2.0)       7.34 -> 4.31 (1.7)
+#   16x16x16  (4096, 2, 62, 2, 62)     11.60 ->  9.14 (1.3)       5.90 -> 4.93 (1.2)
+#   64x64x1   (4096, 2, 62, 2, 62)     11.40 ->  6.45 (1.8)       5.79 -> 3.64 (1.6)
+#   20x20x20  (8000, 2, 44, 2, 44)     15.65 ->  9.01 (1.7)       7.70 -> 4.85 (1.6)
+#   90x90x1   (8100, 2, 44, 2, 44)     19.11 ->  7.93 (2.4)       9.39 -> 4.20 (2.2)
+#   97x97x1   (9409, 2, 40, 2, 40)     27.19 -> 18.05 (1.5)      13.23 -> 9.48 (1.4)
+#   32x32x10  (10240, 2, 39, 2, 39)    25.97 ->  8.67 (3.0)      12.93 -> 5.55 (2.3)
+#   128x80x1  (10240, 2, 39, 2, 39)    11.67 ->  9.08 (1.3)       5.80 -> 5.00 (1.2)
+# The single-pass grids match the first, direct-DFT kdft within 3% (8x8x1 3.38, 6x6x6 3.96, 8x8x8
+# 4.66 ms) and beat it at 12x12x1 (4.82 ms).  Not paid on hsuite (5x5x1, launch-bound).
 #: Factory -> the kdft target that serves it on a ROCm mesh.  A factory with no row takes the
 #: XLA backend there; ``kconv_backend`` stays ``'xla'`` on ROCm, so every unported factory and
 #: every backend-keyed caller (mixed_basis_pair_convolution, greens_function_kernel) is unchanged.
 _ROCM_KLEAD_TARGETS = {"kconv_klead": KDFT_KCONV_KLEAD_TARGET,
                        "kfft_klead": KDFT_KFFT_KLEAD_TARGET}
-#: kdft's bounds (cpp/kdft/kdft_klead_ffi.cc kLdsMax, kAxisMax): one column's complex128 k tile
-#: and its twiddle allowance in a block's 64 KiB of LDS (nk + 192 <= 4096), and an axis the
-#: unrolled direct DFT holds in registers (the cuFFTDx route's cap, KCONV_AXIS_MAX).
-KDFT_NK_MAX = 3904
-KDFT_AXIS_MAX = 40
+#: kdft's verified range (cpp/kdft/kdft_klead_plan.h kNkMax, kAxisMax).  A grid whose k tile does
+#: not fit a block's 64 KiB of LDS is split into axis groups, one HBM pass each (mode 2:
+#: 2*(groups-1)+1 passes), and each axis is a mixed-radix Stockham DFT in LDS (any length; a
+#: prime above 16 is one chunked direct stage), so the bounds are where the gate was run on
+#: MI250X, not an LDS limit: every grid with nk <= 10240 and axes <= 128 (docs/architecture/kconv.md).
+KDFT_NK_MAX = 10240
+KDFT_AXIS_MAX = 128
 
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
@@ -336,20 +345,20 @@ _KDFT_DOWN: list = []
 
 
 def kdft_refusal(kgrid) -> str:
-    """Why kdft cannot serve ``kgrid`` ("" when it can): a k tile beyond its LDS bound."""
+    """Why kdft cannot serve ``kgrid`` ("" when it can): a grid beyond its verified range."""
     kg = tuple(int(v) for v in kgrid)
     nk = kg[0] * kg[1] * kg[2]
     if max(kg) > KDFT_AXIS_MAX:
-        return f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_AXIS_MAX} (direct DFT)"
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_AXIS_MAX} "
+                f"(kdft's verified range)")
     if nk > KDFT_NK_MAX:
-        return (f"GATE kdft-tile: got nk={nk}; want one column's complex128 k tile in a block's "
-                f"64 KiB of LDS (nk <= {KDFT_NK_MAX})")
+        return f"GATE kdft-nk: got nk={nk}; want nk <= {KDFT_NK_MAX} (kdft's verified range)"
     return ""
 
 
 def rocm_klead_target(mesh: Mesh, kgrid, factory: str) -> str | None:
     """The kdft target serving ``factory`` on this mesh, or ``None`` (the XLA backend): a ROCm
-    mesh outside :func:`xla_reference`, kdft not demoted, ``kgrid`` within its LDS bound
+    mesh outside :func:`xla_reference`, kdft not demoted, ``kgrid`` within its verified range
     (else one warning per grid)."""
     from ffi.gate import mesh_ffi_platform
     if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
