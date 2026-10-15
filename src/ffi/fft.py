@@ -211,11 +211,12 @@ KDFT_KMINOR_AXIS_MAX = 128
 KDFT_KCONV_KLEAD_UNFOLD_TARGET = "lorrax_kdft_kconv_klead_unfold"
 #: Factory -> the ROCM k-box target that serves it (a factory with no row keeps its XLA route,
 #: whose k transforms are the kdft pair above).
-#: The ROCM leg's k-box R-space modes (cpp/kdft/kbox_rspace_ffi.cc, single arm): mode 9 (an
-#: interaction's inverse transform read from its q wedge) and mode 11 (one chi0 tau node from the
-#: raw-parent Green pair, plain and with the four-current vertices), the operands and layouts of
-#: KFFT_KLEAD_UNFOLD_TARGET / KCONV_CHI_UNFOLD_TARGET / KCONV_CHI_VERTEX_TARGET less mathdx_root
-#: and scratch_bytes.  Single arm only (:func:`kdft_kbox_wedge_refusal`, :func:`kdft_kbox_chi_refusal`).
+#: The ROCM leg's k-box R-space modes (cpp/kdft/kbox_rspace_ffi.cc, single and split arms): mode 9
+#: (an interaction's inverse transform read from its q wedge) and mode 11 (one chi0 tau node from
+#: the raw-parent Green pair, plain and with the four-current vertices), the operands and layouts
+#: of KFFT_KLEAD_UNFOLD_TARGET / KCONV_CHI_UNFOLD_TARGET / KCONV_CHI_VERTEX_TARGET less
+#: mathdx_root.  The arm rule is :func:`kdft_kbox_arm`; the refusals :func:`kdft_kbox_wedge_refusal`,
+#: :func:`kdft_kbox_chi_refusal`.
 KDFT_KFFT_KLEAD_UNFOLD_TARGET = "lorrax_kdft_kfft_klead_unfold"
 KDFT_KCONV_CHI_UNFOLD_TARGET = "lorrax_kdft_kconv_chi_unfold"
 KDFT_KCONV_CHI_VERTEX_TARGET = "lorrax_kdft_kconv_chi_vertex"
@@ -229,16 +230,26 @@ KDFT_KBOX_LDS = 64 * 1024
 #: transform is the stage's unrolled direct DFT, so it does not widen with KDFT_AXIS_MAX.
 KDFT_KBOX_AXIS_MAX = 40
 #: Modes 9 and 11's own axis bounds (cpp/kdft/kbox_rspace_ffi.cc kAxisMaxWedge / kAxisMaxChi):
-#: the same direct-DFT line transform, gated to axis 40 (tests/test_kdft_kbox_gate.py); their
-#: residency rule, not KDFT_NK_MAX, bounds nk.
+#: the same direct-DFT line transform on both arms, gated to axis 40 (tests/test_kdft_kbox_gate.py).
 KDFT_KBOX_WEDGE_AXIS_MAX = 40
 KDFT_KBOX_CHI_AXIS_MAX = 40
-#: Mode 9's routing floor: the k-box tile's columns (whole spin groups).  Measured on one MI250X
-#: GCD at a 128 x 128 tile (scalar W, pool log kboxchi_bench2): tiles of 8-64 columns 0.99-2.1x
-#: the XLA route (kdft mode 3; 1.4-2.1x on four of five grids), tiles of 1-2 columns 0.64-0.94x
-#: (8^3, 10^3, 12^3), so those keep the XLA route.  A router rule, not a kernel limit: the
-#: handler runs any tile that fits.
-KDFT_KBOX_WEDGE_MIN_COLS = 4
+#: Modes 9 and 11's nk bound (both arms), the k-lead family's (KDFT_NK_MAX); gated at 40x16x16.
+KDFT_KBOX_RSPACE_NK_MAX = 10240
+#: The k-box arm rule's measured constants (cpp/kdft/kbox_rspace_ffi.cc, one MI250X GCD at a
+#: 128 x 128 tile, pool logs kboxsplit_sweep1 / kboxsplit_sweep2): mode 9's single arm needs a tile
+#: of KDFT_KBOX_WEDGE_MIN_COLS columns (narrower single tiles, e.g. 12x12x1, 6^3, 7^3, ran slower than
+#: the split arm); the split arm takes three passes when its two-pass plane tile holds fewer than
+#: KDFT_KBOX_PLANE_MIN_COLS columns (12^3, 16^3: 1.1-1.4x faster three-pass).
+KDFT_KBOX_WEDGE_MIN_COLS = 16
+KDFT_KBOX_PLANE_MIN_COLS = 32
+#: Mode 11's single arm also needs KDFT_KBOX_CHI_SINGLE_MIN_LINES lines per axis pass (tile columns x
+#: nk / longest axis; the n_s 1 2-D tiles of 48-80 lines ran 0.91-1.05x XLA, 1.01-1.42x split).
+KDFT_KBOX_CHI_SINGLE_MIN_LINES = 96
+#: Mode 11 on a 2-D grid (nz = 1) keeps the XLA route past this axis (GATE kdft-kbox-chi-2d): the
+#: k-box arms' direct-DFT lines measured 0.72-0.91x the XLA route at 32x32x1, 40x8x1, 40x40x1
+#: (n_s 1, 2; pool log kboxsplit_bench3) and >= 1.12x up to 24x24x1.  A router rule, not a kernel
+#: limit; 3-D grids to axis 40 measured >= 1.10x.
+KDFT_KBOX_CHI_2D_AXIS_MAX = 24
 
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
@@ -505,45 +516,98 @@ def kdft_kbox_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
             "(the k-box single arm; the split arm is not ported to ROCM)")
 
 
+def kdft_kbox_arm(mode: int, kgrid, ns: int, nsr: int | None = None,
+                  lds: int = KDFT_KBOX_LDS) -> tuple[str | None, int]:
+    """``(arm, tile_columns)`` the ROCM k-box handler takes for mode 9 or 11 on ``kgrid``
+    (``arm`` None when none fits), the mirror of ``plan()`` in cpp/kdft/kbox_rspace_ffi.cc:
+
+    * ``"single"``: the stage's single-arm rule (:func:`_kbox_single_arm`: mode 9 a group of
+      ``ns*nsr`` columns, one operand; mode 11 a group of ``ns**2`` columns, two operands), kept for
+      mode 9 at a tile of at least :data:`KDFT_KBOX_WEDGE_MIN_COLS` columns and for mode 11 at a
+      tile of at most half the LDS (two blocks per CU) with at least
+      :data:`KDFT_KBOX_CHI_SINGLE_MIN_LINES` lines per axis pass;
+    * ``"split"`` (two passes): the plane tile of the most whole groups (``ns*nsr`` columns; mode 11
+      one operand's ``ns**2``) a block's LDS holds, ``16 * ((ny*(nz|1))|1)`` B per column;
+    * ``"split3"`` (three passes, ``nz > 1``): where the two-pass tile does not fit or holds fewer
+      than :data:`KDFT_KBOX_PLANE_MIN_COLS` columns; z tiles of one padded z-line per column.
+
+    ``LORRAX_KDFT_KBOX_ARM`` = ``single`` | ``split`` (the rule's passes) | ``split2`` | ``split3``
+    (the gate's and the bench's override) picks that arm where it fits, as the handler does."""
+    import os
+    nx, ny, nz = (int(v) for v in kgrid)
+    group = int(ns) * int(ns if nsr is None else nsr)
+    operands = 2 if int(mode) == 11 else 1
+    tr, per_col = _kbox_single_arm((nx, ny, nz), group, operands, lds)
+    single_fits = bool(tr)
+    lines = tr * group * operands * nx * ny * nz // max(nx, ny, nz)
+    single_rule = single_fits and (2 * tr * per_col <= lds and lines >= KDFT_KBOX_CHI_SINGLE_MIN_LINES
+                                   if int(mode) == 11 else tr * group >= KDFT_KBOX_WEDGE_MIN_COLS)
+    pr = (ny * (nz | 1)) | 1
+    tile = max(1, lds // (pr * 16) // group) * group
+    split_fits = tile * pr * 16 <= lds
+    force = os.environ.get("LORRAX_KDFT_KBOX_ARM", "")
+    if single_fits if force == "single" else (not split_fits and single_rule) if force.startswith("split") \
+            else single_rule:
+        return "single", tr * group * operands
+    three = nz > 1 and (force == "split3" or (force != "split2" and (not split_fits or tile < KDFT_KBOX_PLANE_MIN_COLS)))
+    if three:
+        zt = max(1, lds // ((nz | 1) * 16) // group) * group
+        if zt * (nz | 1) * 16 <= lds and ((ny | 1) * 16) <= lds:
+            return "split3", zt
+    return ("split", tile) if split_fits else (None, 0)
+
+
+def _kbox_rspace_refusal(mode: int, kg, ns: int, nsr: int | None, lds: int) -> str:
+    """The shared part of modes 9 and 11's rules: the axis, the nk bound and the arms' residency."""
+    name = "kdft_kbox_wedge_refusal" if mode == 9 else "kdft_kbox_chi_refusal"
+    amax = KDFT_KBOX_WEDGE_AXIS_MAX if mode == 9 else KDFT_KBOX_CHI_AXIS_MAX
+    if max(kg) > amax:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {amax} "
+                f"(k-box mode {mode}'s direct-DFT line transform)")
+    nk = kg[0] * kg[1] * kg[2]
+    if nk > KDFT_KBOX_RSPACE_NK_MAX:
+        return (f"GATE kdft-nk: got k-grid {kg} (nk={nk}); want nk <= {KDFT_KBOX_RSPACE_NK_MAX} "
+                f"(k-box mode {mode}'s verified range: KDFT_KBOX_RSPACE_NK_MAX)")
+    if mode == 11 and kg[2] == 1 and max(kg[0], kg[1]) > KDFT_KBOX_CHI_2D_AXIS_MAX:
+        return (f"GATE kdft-kbox-chi-2d: got the 2-D k-grid {kg}; want both axes <= {KDFT_KBOX_CHI_2D_AXIS_MAX} "
+                "(k-box mode 11 on longer 2-D axes measured slower than the XLA route: KDFT_KBOX_CHI_2D_AXIS_MAX)")
+    arm, _ = kdft_kbox_arm(mode, kg, ns, nsr, lds)
+    if arm is None:
+        group = int(ns) * int(ns if nsr is None else nsr)
+        pr = (kg[1] * (kg[2] | 1)) | 1
+        return (f"GATE kdft-kbox-residency: got k-grid {kg} widths ({ns}, {nsr or ns}), whose split plane tile "
+                f"of one spin group ({group} columns of a padded (ky, kz) plane, or of a z-line) needs "
+                f"{group * pr * 16} B; want it in a block's {lds // 1024} KiB of LDS (k-box mode {mode}; ffi.fft.{name})")
+    return ""
+
+
 def kdft_kbox_wedge_refusal(kgrid, ns: int, nsr: int | None = None, lds: int = KDFT_KBOX_LDS) -> str:
     """Why the ROCM k-box stage cannot serve mode 9 (:func:`make_kfft_klead_unfold`) on ``kgrid``
     with endpoint widths ``(ns, nsr)`` ("" when it can): an axis beyond
-    :data:`KDFT_KBOX_WEDGE_AXIS_MAX`, a spin group of ``ns*nsr`` columns (one operand, one
-    transform) beyond a block's LDS (the single arm; the split arm is not ported), or a tile
-    narrower than :data:`KDFT_KBOX_WEDGE_MIN_COLS` (slower than the XLA route)."""
-    kg = tuple(int(v) for v in kgrid)
-    if max(kg) > KDFT_KBOX_WEDGE_AXIS_MAX:
-        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_KBOX_WEDGE_AXIS_MAX} "
-                "(k-box mode 9's direct-DFT line transform)")
-    group = int(ns) * int(ns if nsr is None else nsr)
-    tr, per_col = _kbox_single_arm(kg, group, 1, lds)
-    if not tr:
-        return (f"GATE kdft-kbox-residency: got k-grid {kg} widths ({ns}, {nsr or ns}), a spin group of {group} "
-                f"padded columns ({per_col} B); want it in a block's {lds // 1024} KiB of LDS (k-box mode 9's "
-                "single arm; the split arm is not ported to ROCM)")
-    if tr * group < KDFT_KBOX_WEDGE_MIN_COLS:
-        return (f"GATE kdft-kbox-tile: got k-grid {kg} widths ({ns}, {nsr or ns}), a single-arm tile of "
-                f"{tr * group} column(s); want >= {KDFT_KBOX_WEDGE_MIN_COLS} (narrower tiles measured slower "
-                "than the XLA route: KDFT_KBOX_WEDGE_MIN_COLS)")
-    return ""
+    :data:`KDFT_KBOX_WEDGE_AXIS_MAX`, nk beyond :data:`KDFT_KBOX_RSPACE_NK_MAX`, or neither arm
+    (:func:`kdft_kbox_arm`) fitting a block's LDS."""
+    return _kbox_rspace_refusal(9, tuple(int(v) for v in kgrid), ns, nsr, lds)
 
 
 def kdft_kbox_chi_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
     """Why the ROCM k-box stage cannot serve mode 11 (:func:`make_kconv_chi_unfold`,
     :func:`make_kconv_chi_vertex`) on ``kgrid`` at ``ns`` ("" when it can): an axis beyond
-    :data:`KDFT_KBOX_CHI_AXIS_MAX`, or a Green pair (two operands of ``ns**2`` columns, one
-    transform) beyond a block's LDS (the single arm; the split arm is not ported)."""
-    kg = tuple(int(v) for v in kgrid)
-    if max(kg) > KDFT_KBOX_CHI_AXIS_MAX:
-        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_KBOX_CHI_AXIS_MAX} "
-                "(k-box mode 11's direct-DFT line transform)")
-    group = int(ns) * int(ns)
-    tr, per_col = _kbox_single_arm(kg, group, 2, lds)
-    if tr:
-        return ""
-    return (f"GATE kdft-kbox-residency: got k-grid {kg} ns={ns}, a Green pair of {2 * group} padded columns "
-            f"({per_col} B); want it in a block's {lds // 1024} KiB of LDS (k-box mode 11's single arm; "
-            "the split arm is not ported to ROCM)")
+    :data:`KDFT_KBOX_CHI_AXIS_MAX`, nk beyond :data:`KDFT_KBOX_RSPACE_NK_MAX`, a 2-D grid axis beyond
+    :data:`KDFT_KBOX_CHI_2D_AXIS_MAX`, or no arm (:func:`kdft_kbox_arm`) fitting a block's LDS."""
+    return _kbox_rspace_refusal(11, tuple(int(v) for v in kgrid), ns, None, lds)
+
+
+def kdft_kbox_chi_scratch_bytes(kgrid, ns: int, tile_bytes: int, lds: int = KDFT_KBOX_LDS) -> int:
+    """Per-rank bytes the ROCM mode-11 handler draws from XLA's scratch allocator at run time
+    (the ``scratch_bytes`` it is passed): 0 on the single arm; on the split arm (:func:`kdft_kbox_arm`)
+    a ``(N_k, chunk * 2 ns^2)`` intermediate of at most 1 GiB or one local parent-Green tile,
+    whichever is smaller, and at least one pair's full-k transform (the CUDA family's rule,
+    :func:`chi_unfold_scratch_bytes`).  A runtime allocation: callers price it."""
+    if not (kdft_kbox_arm(11, kgrid, ns, None, lds)[0] or "").startswith("split"):
+        return 0
+    nk = int(np.prod([int(v) for v in kgrid]))
+    per_pair = nk * 2 * int(ns) * int(ns) * 16
+    return max(per_pair, min(int(tile_bytes), 1 << 30))
 
 
 #: Factory -> its k-box refusal rule ``(kgrid, ns, nsr) -> str``.
@@ -574,6 +638,38 @@ def rocm_kbox_target(mesh: Mesh, kgrid, factory: str, ns: int, nsr: int | None =
             warnings.warn(msg, RuntimeWarning, stacklevel=3)
         return None
     return target
+
+
+_KBOX_PREBUILT: set = set()
+
+
+def _kbox_prebuild(mesh: Mesh, mode: int, kg, ns: int, nsr: int, variant: int, live: bool) -> None:
+    """Build and load the ROCM k-box image of mode 9 or 11 on this process's mesh devices when the
+    k-box call is traced, before any XLA program runs it (``lrx_kbox_rspace_prebuild``), so the
+    hipRTC compile and the module load stay off the running program's execute thread
+    (cpp/kdft/kbox_rspace_ffi.cc).  Once per (image, device, arm override).  Raises ``GATE
+    kdft-kbox-build`` with the handler's reason (a grid the router admits always builds)."""
+    import ctypes
+    import os
+    devs = sorted({int(getattr(d, "local_hardware_id", d.id)) for d in mesh.devices.flat
+                   if d.process_index == jax.process_index()})
+    key = (int(mode), tuple(int(v) for v in kg), int(ns), int(nsr), int(variant), bool(live),
+           os.environ.get("LORRAX_KDFT_KBOX_ARM", ""), tuple(devs))
+    if key in _KBOX_PREBUILT:
+        return
+    from ffi.common import ffi_loader
+    fn = getattr(ffi_loader.get_lib("ROCM"), "lrx_kbox_rspace_prebuild", None)
+    if fn is None:
+        raise RuntimeError("GATE kdft-kbox-build: got a ROCM library without lrx_kbox_rspace_prebuild_rocm; want "
+                           "the leg built from this tree (config/frontier/build_ffi_rocm.sh)")
+    fn.argtypes = [ctypes.c_int] * 9 + [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    fn.restype = ctypes.c_int
+    why = ctypes.create_string_buffer(4096)
+    for dev in devs:
+        if fn(dev, int(mode), *(int(v) for v in kg), int(ns), int(nsr), int(variant), int(bool(live)),
+              cubin_cache_dir().encode(), why, len(why)):
+            raise RuntimeError(f"GATE kdft-kbox-build: {why.value.decode(errors='replace')}")
+    _KBOX_PREBUILT.add(key)
 
 
 def _require_kdft_targets() -> None:
@@ -2413,7 +2509,7 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
     (``unfold_isdf_operator``, then the endpoint actions): the unfold is the
     transform's load, so the full-zone interaction is never stored.  CUDA:
     nvidia-mathdx mode 9; ROCM: the k-box stage's mode 9 (``lorrax_kdft_kfft_klead_unfold``,
-    single arm) where :func:`kdft_kbox_wedge_refusal` is empty; elsewhere the service's reference
+    single or split arm, :func:`kdft_kbox_arm`) where :func:`kdft_kbox_wedge_refusal` is empty; elsewhere the service's reference
     composition, then ``ifftn``.  ``live`` (int32 ``[2]``, replicated): the pass is padded
     to a scan's largest pass and ``[lo, hi)`` its live left centroid rows; the rest come back zero.
     """
@@ -2444,6 +2540,7 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
                      cubin_dir=cubin_cache_dir())
 
         def apply_tables(w, wt, t, live):
+            _kbox_prebuild(mesh, 9, kg, n_l, n_r, 0, live is not None)
             out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
             return jax.ffi.ffi_call(kbox, out)(
                 w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r,
@@ -2560,7 +2657,9 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     table constants (baked, they are ~0.57 GB of HLO literal at Fe 20^3 with 1792 centroids).
     CUDA: nvidia-mathdx mode 11 on the k-box stage (one pass; a chunked split pass on
     large grids, its intermediate bounded by ``scratch_bytes``); ROCM: the k-box stage's mode 11
-    (``lorrax_kdft_kconv_chi_unfold``, single arm) where :func:`kdft_kbox_chi_refusal` is empty;
+    (``lorrax_kdft_kconv_chi_unfold``, single or split arm, :func:`kdft_kbox_arm`; the split arm's
+    intermediate bounded by ``scratch_bytes``, :func:`kdft_kbox_chi_scratch_bytes`) where
+    :func:`kdft_kbox_chi_refusal` is empty;
     elsewhere the service's reference composition, then the XLA transforms.
     """
     from symmetry_maps import (DEVICE_LOAD_SPECS, apply_unfold_load_tables_local,
@@ -2598,13 +2697,17 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     elif (kbox := rocm_kbox_target(mesh, kg, "kconv_chi_unfold", ns)) is not None:
 
         def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
+            budget = (int(scratch_bytes) if scratch_bytes is not None
+                      else kdft_kbox_chi_scratch_bytes(kg, ns, int(gv.size) * 16))
+            _kbox_prebuild(mesh, 11, kg, ns, ns, int(complete), live is not None)
             call = jax.ffi.ffi_call(kbox, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
                                     input_output_aliases={12: 0})
             return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
                         t.mph, t.nph, t.spin, alpha, acc, *(() if live is None else (live,)),
                         nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                         si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
-                        complete=np.int64(complete), cubin_dir=cubin_cache_dir())
+                        complete=np.int64(complete), scratch_bytes=np.int64(budget),
+                        cubin_dir=cubin_cache_dir())
     else:
         ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
 
@@ -2681,7 +2784,7 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     Green exists.  ``load``, when given, is the same tables on the devices
     (``symmetry_maps.device_load_tables``), read as operands so a consumer's
     jit holds no table constants.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); ROCM: the k-box stage's
-    mode 11 (``lorrax_kdft_kconv_chi_vertex``, single arm) where :func:`kdft_kbox_chi_refusal` is
+    mode 11 (``lorrax_kdft_kconv_chi_vertex``, single or split arm) where :func:`kdft_kbox_chi_refusal` is
     empty; elsewhere the service's reference composition.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
@@ -2728,6 +2831,9 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     elif (kbox := rocm_kbox_target(mesh, kg, "kconv_chi_vertex", ns)) is not None:
 
         def apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live):
+            budget = (int(scratch_bytes) if scratch_bytes is not None
+                      else kdft_kbox_chi_scratch_bytes(kg, ns, int(gv.size) * 16))
+            _kbox_prebuild(mesh, 11, kg, ns, ns, 2, live is not None)
             call = jax.ffi.ffi_call(kbox, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
                                     input_output_aliases={13: 0})
             return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
@@ -2735,8 +2841,9 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
                         jnp.asarray(sign_host), acc, *(() if live is None else (live,)),
                         nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                         si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
-                        signed_c=np.int64(signed), perm_l=perm_l, phase_l=phase_l, perm_r=perm_r,
-                        phase_r=phase_r, na=np.int64(na), nb=np.int64(nb), cubin_dir=cubin_cache_dir())
+                        scratch_bytes=np.int64(budget), signed_c=np.int64(signed), perm_l=perm_l,
+                        phase_l=phase_l, perm_r=perm_r, phase_r=phase_r, na=np.int64(na), nb=np.int64(nb),
+                        cubin_dir=cubin_cache_dir())
     else:
         ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
         codes = np.asarray([1, 1j, -1, -1j])

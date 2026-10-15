@@ -388,6 +388,8 @@ _SHARED_C_ENTRY_POINTS = (
     "lrx_slate_subrow_context_create",
     "lrx_slate_context_destroy",
     "lrx_slate_init_mpi",
+    # The ROCM leg's k-box image prebuild (kdft/kbox_rspace_ffi.cc; ffi.fft._kbox_prebuild).
+    "lrx_kbox_rspace_prebuild",
 )
 
 #: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.

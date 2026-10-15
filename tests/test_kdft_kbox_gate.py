@@ -16,8 +16,10 @@ Modes 9 and 11 (:func:`gate_cases_rspace`) the same way: ``make_kfft_klead_unfol
 partner tile, the conjugate rule, unequal endpoint widths and placed tables with live rows;
 ``make_kconv_chi_unfold`` with partner tiles and the completion, conj(G) partners, placed tables
 with live rows; ``make_kconv_chi_vertex`` with a sign_c and with conj(G) partners, placed, live;
-grids up to 7^3 and an axis of 40 (each mode's own bound); mode 9's tile floor
-(``GATE kdft-kbox-tile``) is checked as a refusal.
+each arm on its grids by the rule (``ffi.fft.kdft_kbox_arm``: the split arm at 8^3-20^3, the nk
+bound 40x16x16 and 40x40x1, mode 11's pair chunks through the scratch intermediate) and the split
+arm forced on the single arm's grids (``LORRAX_KDFT_KBOX_ARM``); the refusals (``GATE kdft-axis``,
+``GATE kdft-nk``, ``GATE kdft-kbox-residency``) and the arm rule are checked by name.
 
 ROCm: ``python -m tests.test_kdft_kbox_gate`` on any mesh (one GCD or a 2x2 P=4 mesh).
 ``--bench``: one GCD, the k-box route against the XLA route per call at production-shaped
@@ -145,8 +147,64 @@ def bench(mesh, grids, m, ns, reps):
 
 
 
-def gate_cases_rspace(mesh):
-    """Modes 9 and 11 against xla_reference(): ``{case: rel_error}``."""
+# Modes 9 / 11 gate grids: (grid, widths or ns, m per rank, forced arm or None for the rule).
+# The rule's split grids (ffi.fft.kdft_kbox_arm): two passes at 6^3-10^3 and 2-D grids, three
+# passes at 12^3-20^3, n_s = 4 at 10^3, 40x16x16 (the nk bound KDFT_KBOX_RSPACE_NK_MAX, axis 40);
+# 40x40x1 (mode 9) and 24x24x1 (mode 11, KDFT_KBOX_CHI_2D_AXIS_MAX) the large 2-D grids.  The single arm's grids again with the split arms forced
+# (LORRAX_KDFT_KBOX_ARM = split / split2 / split3), so each split variant meets every width, spin
+# and vertex form, and the two-pass arm meets a three-pass grid.
+M9_CASES = [((3, 2, 2), 1, 1, 6, None), ((5, 5, 1), 1, 1, 6, None), ((4, 4, 4), 2, 2, 4, None),
+            ((3, 2, 2), 2, 3, 4, None), ((7, 7, 7), 1, 1, 4, None), ((6, 6, 6), 2, 2, 2, None),
+            ((40, 8, 1), 1, 1, 3, None), ((6, 6, 1), 4, 4, 2, None),
+            ((8, 8, 8), 1, 1, 4, None), ((10, 10, 10), 1, 1, 3, None), ((12, 12, 12), 1, 1, 3, None),
+            ((12, 12, 12), 2, 3, 2, None), ((16, 16, 16), 1, 1, 2, None), ((20, 20, 20), 1, 1, 2, None),
+            ((40, 16, 16), 1, 1, 2, None), ((40, 40, 1), 1, 1, 3, None), ((9, 7, 5), 2, 2, 2, None),
+            ((3, 2, 2), 2, 3, 4, "split"), ((4, 4, 4), 2, 2, 4, "split"), ((6, 6, 1), 4, 4, 2, "split"),
+            ((5, 5, 1), 1, 1, 6, "split"), ((40, 8, 1), 1, 1, 3, "split"), ((10, 10, 10), 4, 4, 2, None),
+            ((3, 2, 2), 2, 3, 4, "split3"), ((4, 4, 4), 2, 2, 4, "split3"), ((6, 6, 6), 2, 2, 2, "split3"),
+            ((12, 12, 12), 1, 1, 3, "split2")]
+M11_CASES = [((3, 2, 2), 2, 6, None), ((5, 5, 1), 2, 6, None), ((4, 4, 4), 2, 4, None), ((3, 2, 2), 1, 6, None),
+             ((3, 2, 2), 4, 3, None), ((7, 7, 7), 2, 2, None), ((8, 8, 1), 1, 6, None), ((24, 8, 1), 2, 2, None),
+             ((8, 8, 8), 2, 4, None), ((10, 10, 10), 2, 2, None), ((12, 12, 12), 2, 2, None),
+             ((13, 13, 13), 1, 2, None), ((16, 16, 16), 1, 2, None), ((20, 20, 20), 2, 2, None),
+             ((40, 16, 16), 1, 2, None), ((24, 24, 1), 2, 3, None), ((16, 16, 1), 1, 3, None), ((9, 7, 5), 2, 2, None),
+             ((3, 2, 2), 2, 6, "split"), ((3, 2, 2), 1, 6, "split"), ((3, 2, 2), 4, 3, "split"),
+             ((5, 5, 1), 2, 6, "split"), ((7, 7, 7), 2, 2, "split2"), ((6, 6, 6), 4, 2, "split"),
+             ((10, 10, 10), 4, 2, None), ((16, 16, 16), 1, 2, "split2"), ((3, 2, 2), 2, 6, "split3"),
+             ((3, 2, 2), 1, 6, "split3"), ((3, 2, 2), 4, 3, "split3"), ((6, 6, 6), 2, 2, "split3")]
+
+
+def _arm_ok(forced, taken):
+    """A forced case must take its arm ("split": either split arm, the rule's passes)."""
+    if not forced:
+        return taken is not None
+    return taken.startswith("split") if forced == "split" else taken == {"split2": "split"}.get(forced, forced)
+
+
+class _Arm:
+    """LORRAX_KDFT_KBOX_ARM for the k-box build and calls inside the block (None: the rule)."""
+    def __init__(self, arm):
+        self.arm = arm
+
+    def __enter__(self):
+        import os
+        self.old = os.environ.get("LORRAX_KDFT_KBOX_ARM")
+        if self.arm:
+            os.environ["LORRAX_KDFT_KBOX_ARM"] = self.arm
+        else:
+            os.environ.pop("LORRAX_KDFT_KBOX_ARM", None)
+
+    def __exit__(self, *exc):
+        import os
+        if self.old is None:
+            os.environ.pop("LORRAX_KDFT_KBOX_ARM", None)
+        else:
+            os.environ["LORRAX_KDFT_KBOX_ARM"] = self.old
+
+
+def gate_cases_rspace(mesh, which=("9", "11"), big=True):
+    """Modes 9 and 11 against xla_reference(): ``{case: rel_error}``.  Each case's tag names the
+    arm the handler takes (``ffi.fft.kdft_kbox_arm`` under the case's override)."""
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
     import jax
@@ -161,22 +219,42 @@ def gate_cases_rspace(mesh):
     rnd = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)
     unitary = lambda nk, n: np.linalg.qr(rnd(nk, n, n))[0].astype(np.complex128)
     g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
-    out = {}
+    t0 = time.perf_counter()
 
-    def both(build, run):
-        f_kb = build()
+    import os
+    skip = int(os.environ.get("KBOX_GATE_SKIP_RSPACE", "0"))   # resume: skip the first N grid entries
+    only = os.environ.get("KBOX_GATE_ONLY_RSPACE")              # one grid entry per process (index)
+    only = None if only is None else int(only)
+
+    class _Out(dict):                      # one progress line per case (rank 0), as it completes
+        def __setitem__(self, k, v):
+            super().__setitem__(k, v)
+            if jax.process_index() == 0:
+                print(f"gate-case [{time.perf_counter() - t0:7.1f} s] {k} rel {v:.2e}", flush=True)
+    out = _Out()
+
+    def both(arm, build, run):
+        with _Arm(arm):
+            f_kb = build()
+            a = _gather(jax.block_until_ready(run(f_kb)))
         with F.xla_reference():
             f_x = build()
-        return _gather(jax.block_until_ready(run(f_kb))), _gather(jax.block_until_ready(run(f_x)))
+        return a, _gather(jax.block_until_ready(run(f_x)))
 
-    # mode 9: (grid, n_l, n_r, m)
-    for kg, nl_, nr_, m in (((3, 2, 2), 1, 1, 6), ((5, 5, 1), 1, 1, 6), ((4, 4, 4), 2, 2, 4),
-                            ((3, 2, 2), 2, 3, 4), ((7, 7, 7), 1, 1, 4), ((6, 6, 6), 2, 2, 2),
-                            ((40, 8, 1), 1, 1, 3), ((6, 6, 1), 4, 4, 2)):
+    def small(kg):
+        return big or int(np.prod(kg)) <= 1000
+
+    # mode 9: (grid, n_l, n_r, m, arm)
+    for ci, (kg, nl_, nr_, m, arm) in enumerate(M9_CASES if "9" in which else ()):
+        if not small(kg) or ci < skip or (only is not None and ci != only):
+            continue
         nk = int(np.prod(kg))
         n_parent = max(2, nk // 4)
-        tag = f"m9 {kg[0]}x{kg[1]}x{kg[2]} w{nl_}x{nr_}"
-        if F.rocm_kbox_target(mesh, kg, "kfft_klead_unfold", nl_, nr_) is None:
+        with _Arm(arm):
+            taken = F.kdft_kbox_arm(9, kg, nl_, nr_)[0]
+            routed = F.rocm_kbox_target(mesh, kg, "kfft_klead_unfold", nl_, nr_)
+        tag = f"m9 {kg[0]}x{kg[1]}x{kg[2]} w{nl_}x{nr_} {taken}{'(forced)' if arm else ''}"
+        if routed is None or not _arm_ok(arm, taken):
             out[f"{tag} ROUTE"] = float("inf")
             continue
         base = _tables(rng, nk, n_parent, m, m, nl_, nl_, nr_, (px, py))
@@ -186,18 +264,24 @@ def gate_cases_rspace(mesh):
         live = put(np.asarray([1, max(2, m - 1)], np.int32), P())   # >= 1 live row at m = 2
         for name, tg, kw in (("partner", base, dict(Wt=Wt)), ("conj rule", base._replace(conj_trs=1), {}),
                              ("placed, live", base, dict(Wt=Wt, load=device_load_tables(base, mesh), live=live))):
-            a, b = both(lambda: F.make_kfft_klead_unfold(mesh, kg, tg, norm="ortho"), lambda f: f(Wp, **kw))
+            a, b = both(arm, lambda: F.make_kfft_klead_unfold(mesh, kg, tg, norm="ortho"), lambda f: f(Wp, **kw))
             out[f"{tag} {name}"] = _rel(a, b)
 
-    # mode 11: (grid, ns, m)
+    # mode 11: (grid, ns, m, arm)
     vl = (((0, 1), (1, 1j)), ((1, 0), (-1, 1j)))
     vr = (((1, 0), (1j, -1)), ((0, 1), (1, -1j)))
-    for kg, ns, m in (((3, 2, 2), 2, 6), ((5, 5, 1), 2, 6), ((4, 4, 4), 2, 4), ((3, 2, 2), 1, 6),
-                      ((3, 2, 2), 4, 3), ((7, 7, 7), 2, 2), ((8, 8, 1), 1, 6), ((40, 8, 1), 2, 2)):
+    vl3 = vl + (((0, 1), (-1j, -1)),)
+    vr3 = vr + (((1, 0), (1, 1)),)
+    for ci, (kg, ns, m, arm) in enumerate(M11_CASES if "11" in which else ()):
+        if not small(kg) or ci < skip or (only is not None and ci != only):
+            continue
         nk = int(np.prod(kg))
         n_parent = max(2, nk // 4)
-        tag = f"m11 {kg[0]}x{kg[1]}x{kg[2]} ns{ns}"
-        if F.rocm_kbox_target(mesh, kg, "kconv_chi_unfold", ns) is None:
+        with _Arm(arm):
+            taken = F.kdft_kbox_arm(11, kg, ns)[0]
+            routed = F.rocm_kbox_target(mesh, kg, "kconv_chi_unfold", ns)
+        tag = f"m11 {kg[0]}x{kg[1]}x{kg[2]} ns{ns} {taken}{'(forced)' if arm else ''}"
+        if routed is None or not _arm_ok(arm, taken):
             out[f"{tag} ROUTE"] = float("inf")
             continue
         tg = _tables(rng, nk, n_parent, m, m, ns, ns, ns, (px, py))
@@ -208,36 +292,65 @@ def gate_cases_rspace(mesh):
         acc0 = rnd(n_out, nk, mu, nu)
         gl = device_load_tables(tg, mesh)
         live = put(np.asarray([1, max(2, m - 1)], np.int32), P())   # >= 1 live row at m = 2
-        chi = lambda complete: (lambda: F.make_kconv_chi_unfold(mesh, kg, tg, n_out=n_out, complete=complete,
-                                                                norm="ortho"))
-        a, b = both(chi(True), lambda f: f(put(acc0, acc_spec), G, Gc, alpha, Gt, Gct))
+        chi = lambda complete, sb=None: (lambda: F.make_kconv_chi_unfold(
+            mesh, kg, tg, n_out=n_out, complete=complete, norm="ortho", scratch_bytes=sb))
+        a, b = both(arm, chi(True), lambda f: f(put(acc0, acc_spec), G, Gc, alpha, Gt, Gct))
         out[f"{tag} partner, complete"] = _rel(a, b)
-        a, b = both(chi(False), lambda f: f(put(acc0, acc_spec), G, Gc, alpha))
+        a, b = both(arm, chi(False), lambda f: f(put(acc0, acc_spec), G, Gc, alpha))
         out[f"{tag} conj partner"] = _rel(a, b)
-        a, b = both(chi(True), lambda f: f(put(acc0, acc_spec), G, Gc, alpha, load=gl, live=live))
+        a, b = both(arm, chi(True), lambda f: f(put(acc0, acc_spec), G, Gc, alpha, load=gl, live=live))
         out[f"{tag} conj partner, complete, placed, live"] = _rel(a, b)
+        if taken.startswith("split") and m * m >= 4:
+            # several pair chunks (3 pairs each, a remainder) through the scratch intermediate
+            sb = 3 * nk * 2 * ns * ns * 16
+            a, b = both(arm, chi(False, sb), lambda f: f(put(acc0, acc_spec), G, Gc, alpha, Gt, Gct, live=live))
+            out[f"{tag} chunks of 3 pairs, live"] = _rel(a, b)
         if ns == 2:
             sign = np.where(rng.random(nk) < 0.5, -1.0, 1.0)
             sign[:2] = (1.0, -1.0)
             acc_v = rnd(len(vl) * len(vr), nk, mu, nu)
-            vtx = lambda sg: (lambda: F.make_kconv_chi_vertex(mesh, kg, tg, left_vertices=vl, right_vertices=vr,
-                                                              sign_c=sg, norm="ortho"))
-            a, b = both(vtx(sign), lambda f: f(put(acc_v, acc_spec), G, Gc, Gt, Gct))
+            vtx = lambda sg, L=vl, R=vr: (lambda: F.make_kconv_chi_vertex(
+                mesh, kg, tg, left_vertices=L, right_vertices=R, sign_c=sg, norm="ortho"))
+            a, b = both(arm, vtx(sign), lambda f: f(put(acc_v, acc_spec), G, Gc, Gt, Gct))
             out[f"{tag} vertex sign_c"] = _rel(a, b)
-            a, b = both(vtx(None), lambda f: f(put(acc_v, acc_spec), G, Gc, load=gl, live=live))
+            a, b = both(arm, vtx(None), lambda f: f(put(acc_v, acc_spec), G, Gc, load=gl, live=live))
             out[f"{tag} vertex conj partner, placed, live"] = _rel(a, b)
-    # grids the single arms cannot hold go to XLA with the named gates
-    checks = {"refusal m11 8^3 ns2 -> GATE kdft-kbox-residency": F.kdft_kbox_chi_refusal((8, 8, 8), 2),
-              "refusal m9 16^3 w1x1 -> GATE kdft-kbox-residency": F.kdft_kbox_wedge_refusal((16, 16, 16), 1, 1),
-              "refusal m9 10^3 w1x1 -> GATE kdft-kbox-tile": F.kdft_kbox_wedge_refusal((10, 10, 10), 1, 1),
+            if taken.startswith("split") and nk <= 1000:
+                # 3 x 3 = 9 channels: two pencil passes of a pair's 8 lanes (lanes past the last idle)
+                acc_9 = rnd(len(vl3) * len(vr3), nk, mu, nu)
+                a, b = both(arm, vtx(sign, vl3, vr3), lambda f: f(put(acc_9, acc_spec), G, Gc, Gt, Gct))
+                out[f"{tag} vertex 3x3 sign_c"] = _rel(a, b)
+    # grids beyond a mode's verified range go to XLA with the named gates (within axis 40 every grid
+    # has an arm: the three-pass z tile of one n_s = 4 group is <= 41 * 16 * 16 B)
+    checks = {"refusal m11 40x16x17 -> GATE kdft-nk": F.kdft_kbox_chi_refusal((40, 16, 17), 1),
+              "refusal m9 40x16x17 -> GATE kdft-nk": F.kdft_kbox_wedge_refusal((40, 16, 17), 1, 1),
               "refusal m11 41x2x1 -> GATE kdft-axis": F.kdft_kbox_chi_refusal((41, 2, 1), 1),
-              "refusal m9 41x2x1 -> GATE kdft-axis": F.kdft_kbox_wedge_refusal((41, 2, 1), 1, 1)}
+              "refusal m9 41x2x1 -> GATE kdft-axis": F.kdft_kbox_wedge_refusal((41, 2, 1), 1, 1),
+              "refusal m11 40x40x1 ns2 -> GATE kdft-kbox-chi-2d": F.kdft_kbox_chi_refusal((40, 40, 1), 2),
+              "refusal m11 32x32x1 ns1 -> GATE kdft-kbox-chi-2d": F.kdft_kbox_chi_refusal((32, 32, 1), 1),
+              "refusal m11 40x16x16 ns4 -> served": "served" if not F.kdft_kbox_chi_refusal((40, 16, 16), 4) else "x"}
     for name, why in checks.items():
         out[name] = 0.0 if why.startswith(name.split("-> ")[1]) else 1.0
+    # the arm rule (the production grids of this lane)
+    arms = {"arm m9 5x5x1 w1x1 -> single": F.kdft_kbox_arm(9, (5, 5, 1), 1, 1)[0],
+            "arm m9 12x12x1 w1x1 -> split": F.kdft_kbox_arm(9, (12, 12, 1), 1, 1)[0],
+            "arm m9 10^3 w1x1 -> split": F.kdft_kbox_arm(9, (10, 10, 10), 1, 1)[0],
+            "arm m9 16^3 w1x1 -> split3": F.kdft_kbox_arm(9, (16, 16, 16), 1, 1)[0],
+            "arm m11 6^3 ns2 -> single": F.kdft_kbox_arm(11, (6, 6, 6), 2)[0],
+            "arm m11 7^3 ns2 -> split": F.kdft_kbox_arm(11, (7, 7, 7), 2)[0],
+            "arm m11 8^3 ns2 -> split": F.kdft_kbox_arm(11, (8, 8, 8), 2)[0],
+            "arm m11 12^3 ns2 -> split3": F.kdft_kbox_arm(11, (12, 12, 12), 2)[0],
+            "arm m11 13^3 ns1 -> split3": F.kdft_kbox_arm(11, (13, 13, 13), 1)[0],
+            "arm m11 16^3 ns4 -> split3": F.kdft_kbox_arm(11, (16, 16, 16), 4)[0],
+            "arm m11 24x24x1 ns2 -> split": F.kdft_kbox_arm(11, (24, 24, 1), 2)[0],
+            "arm m11 16x16x1 ns1 -> split": F.kdft_kbox_arm(11, (16, 16, 1), 1)[0],
+            "arm m11 12x12x1 ns2 -> single": F.kdft_kbox_arm(11, (12, 12, 1), 2)[0]}
+    for name, got in arms.items():
+        out[name] = 0.0 if got == name.split("-> ")[1] else 1.0
     return out
 
 
-def bench_rspace(mesh, mode, grids, m, ns, reps):
+def bench_rspace(mesh, mode, grids, m, ns, reps, arm=None):
     """Modes 9 / 11 per call on one GCD: the k-box route against the XLA route (synthetic tables)."""
     import jax
     import numpy as np
@@ -289,12 +402,15 @@ def bench_rspace(mesh, mode, grids, m, ns, reps):
         if why:
             print(line + f" | k-box: refused ({why[:70]})", flush=True)
             continue
-        j_kb = jit_of(build())
-        jax.block_until_ready(j_kb(*args))
+        with _Arm(arm):
+            taken = F.kdft_kbox_arm(mode, kg, w if mode == 9 else ns, w if mode == 9 else None)
+            j_kb = jit_of(build())
+            jax.block_until_ready(j_kb(*args))
         say("k-box first call (build + image) done")
-        t_kb = _timed(j_kb, *args, reps=reps)
+        with _Arm(arm):
+            t_kb = _timed(j_kb, *args, reps=reps)
         err = _rel(np.asarray(j_kb(*args)), np.asarray(j_ref(*args)))
-        print(line + f" | k-box {t_kb:.3f} ms  x{t_ref / t_kb:.2f}  rel err {err:.2e}  "
+        print(line + f" | k-box[{taken[0]} tile {taken[1]}] {t_kb:.3f} ms  x{t_ref / t_kb:.2f}  rel err {err:.2e}  "
               f"(compulsory HBM {gbytes:.3f} GB -> {gbytes / t_kb * 1e3:.0f} GB/s)", flush=True)
 
 def main() -> int:
@@ -306,6 +422,9 @@ def main() -> int:
     ap.add_argument("--grids", default="5x5x1,8x8x1,12x12x1,4x4x4,6x6x6,8x8x8")
     ap.add_argument("--mode", default="all", choices=("7", "9", "11", "all"),
                     help="which k-box modes to gate (all) or bench (7, 9 or 11)")
+    ap.add_argument("--small", action="store_true", help="gate: modes 9/11 grids with nk <= 1000 only")
+    ap.add_argument("--arm", default="", choices=("", "single", "split"),
+                    help="bench: LORRAX_KDFT_KBOX_ARM for the k-box route (default: the rule)")
     args = ap.parse_args()
     import runtime
     stack = runtime.initialize_communicator_stack()
@@ -319,7 +438,7 @@ def main() -> int:
     if args.bench:
         grids = [tuple(int(v) for v in g.split("x")) for g in args.grids.split(",")]
         if args.mode in ("9", "11"):
-            bench_rspace(mesh, int(args.mode), grids, args.m, args.ns, args.reps)
+            bench_rspace(mesh, int(args.mode), grids, args.m, args.ns, args.reps, args.arm or None)
         else:
             bench(mesh, grids, args.m, args.ns, args.reps)
         runtime.finalize_process(0)
@@ -328,7 +447,8 @@ def main() -> int:
     if args.mode in ("7", "all"):
         out.update(gate_cases(mesh))
     if args.mode in ("9", "11", "all"):
-        out.update(gate_cases_rspace(mesh))
+        which = ("9", "11") if args.mode == "all" else (args.mode,)
+        out.update(gate_cases_rspace(mesh, which, big=not args.small))
     bad = {k: v for k, v in out.items() if not v <= TOL}
     if jax.process_index() == 0:
         for k, v in out.items():
