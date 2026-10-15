@@ -135,6 +135,7 @@ included (`common/rtc_build.h`).
 | `slate_potrf`, `_batched_potrf`, `_batched_trsm` | `Slate*HostFfi`, `slate/host_ffi.cc` | `_slate.*` | an explicit `cholesky = slate` on cpu |
 | `slate_eigh` (host) | `SlateEighHostFfi`, `slate/host_ffi.cc` | — | always refused at resolve (SIGSEGV, bug L-2) |
 | `slate_*` (CUDA) | `slate/{eigh,potrf,trsm,batched_potrf,batched_trsm}_ffi.cc` | `_slate.*` | built only when a `gpu_backend=cuda` SLATE is found; the `lorrax_A` bundle has none |
+| `slate_*` (ROCM) | the same leg-neutral `slate/*_ffi.cc` (`common/gpu_runtime.h`) | `_slate.*` | `linalg = distributed` eigh on ROCm (the `('eigh','ROCM')` default). SLATE `gpu_backend=hip` from `config/frontier/build_slate_hip.sh`, linked against the SEQUENTIAL LibSci (SLATE calls host BLAS from concurrent OpenMP tasks; the threaded LibSci SIGSEGVs there) and bound by the leg's DT_RPATH, ahead of the host SLATE on `LD_LIBRARY_PATH`; `verify_ffi_build.sh` GATE 3c checks it. No LU handler: `solve_lu` distributed refuses on ROCm |
 
 The fused LU solves return the factors as a second output that the caller
 aliases to A, so XLA sees the write. The ABI-6 targets
@@ -191,7 +192,7 @@ both loaders, `lxkit.native_provider`, the gate's platform key and
 |---|---|---|---|---|---|
 | `cpu` | `cpu` | `liblorrax_ffi_host.so` | `LORRAX_FFI_HOST_SO` | `_host` | always |
 | `CUDA` | `cuda` | `liblorrax_ffi.so` | `LORRAX_FFI_SO` | (none) | `JAX_PLATFORMS` unset or `cuda`/`gpu`, `/dev/nvidia*` (or WSL2's libcuda), `CUDA_VISIBLE_DEVICES` not empty |
-| `ROCM` | `rocm` | `liblorrax_ffi_rocm.so` (not built yet) | `LORRAX_FFI_ROCM_SO` | `_rocm` | `JAX_PLATFORMS` unset or `rocm`, `/dev/kfd`, `ROCR_`/`HIP_VISIBLE_DEVICES` not empty |
+| `ROCM` | `rocm` | `liblorrax_ffi_rocm.so` (`config/frontier/build_ffi_rocm.sh`) | `LORRAX_FFI_ROCM_SO` | `_rocm` | `JAX_PLATFORMS` unset or `rocm`, `/dev/kfd`, `ROCR_`/`HIP_VISIBLE_DEVICES` not empty |
 
 What stays with each loader is its own: the target-symbol tables, ctypes
 declarations (`_DEVICE_STACK_DECLARATIONS`: the device leg's communicator and
