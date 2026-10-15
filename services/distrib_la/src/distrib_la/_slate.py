@@ -403,13 +403,22 @@ back, by one ``all_to_all``.  The tile matters because heev's second stage
 single-GCD native eigh, SLATE_HIP_REPORT).  :func:`eigh_layout` picks the
 tile; :data:`_EIGH_BLOCK_MIN`/:data:`_EIGH_BLOCK_MAX` were measured on MI250X
 (SLATE_PERF_REPORT).
+
+Several tiles per rank means many concurrent SLATE tasks calling host
+BLAS/LAPACK: the SLATE must link a host BLAS that is safe for concurrent
+callers (on Frontier the sequential LOCKING OpenBLAS of
+``config/frontier/build_openblas_seq.sh``).  Against the sequential LibSci
+heev at nb < n/p returns wrong eigenpairs with no error.
 """
 
 _EIGH_FFI_TARGET = "lorrax_slate_eigh"
 
-#: The heev tile range (measured: SLATE_PERF_REPORT, P4 MI250X).
-_EIGH_BLOCK_MAX = 256
-_EIGH_BLOCK_MIN = 128
+#: The heev tile range.  Measured (P4 2x2 MI250X, steady s, SLATE_PERF_REPORT):
+#:   f64  n 8192: nb 128 10.9, 256 11.4, n/p 146     c128 n 8192: 128 17.4, 256 22.5
+#:   f64  n 4096: nb 128  3.7, 256  3.2              c128 n 4096: 128  5.1, 256  5.3
+#: nb 64 put unmtr_hb2st at 6 s (n 8192 f64; 1.7x the nb-128 wall).
+_EIGH_BLOCK_MAX = 128
+_EIGH_BLOCK_MIN = 64
 
 _JIT_CACHE: dict = {}
 
