@@ -26,7 +26,18 @@ differs between legs and that more than one service needs lives in
   points (rocFFT's hipRTC kernels, ``ROCFFT_RTC_CACHE_PATH``; AMD comgr's
   code-object cache, ``AMD_COMGR_CACHE_DIR``, default ``~/.cache/comgr``).
   :mod:`common.jax_compile_cache` points each beside the persistent compile
-  cache (Precursors lane, 2026-10-14).
+  cache (Precursors lane, 2026-10-14);
+* the vendor facts the memory model, the network policy and the profiler
+  guard implement (owner ``runtime``; Runtime-LEGS lane, 2026-10-15):
+  ``fft_plan_scratch`` (whose plan-workspace query prices the FFT scratch
+  XLA's buffer assignment cannot see, :mod:`runtime.aot_memory`),
+  ``outside_pool_api`` and ``memory_telemetry`` (the readers of bytes outside
+  the XLA pool and of whole-device used memory, :mod:`runtime.xla_memory`),
+  ``collective_library`` and ``collective_net_plugin`` (the collective
+  library of the leg's XLA collectives, which names the site profile's
+  section, and the net plugin it dlopens by name,
+  :mod:`runtime.network_env`), and ``profiler`` (the vendor tracer and the
+  largest step it does not deadlock, ``runtime.check_profiler_ranks``).
 
 What stays OUT is per-service: target-symbol tables, ctypes declarations,
 build hints and backend preference rows (the "policy, never tables" rule
@@ -75,6 +86,23 @@ class PlatformLeg:
     #: ``(env, name, scope)``: run-time-compiled vendor kernels; scope
     #: ``"process-file"`` (one file per process) or ``"shared-dir"``.
     runtime_kernel_caches: tuple = ()
+    #: plan-workspace query in runtime.aot_memory (``"cufft"`` | ``"hipfft"``);
+    #: "" = the leg's FFTs take no plan scratch outside buffer assignment.
+    fft_plan_scratch: str = ""
+    #: bytes-outside-the-pool reader in runtime.xla_memory ("" = none).
+    outside_pool_api: str = ""
+    #: whole-device used-memory sampler in runtime.xla_memory ("" = none).
+    memory_telemetry: str = ""
+    #: collective library of the leg's XLA collectives; the section of
+    #: ``config/<site>/site.toml`` that runtime.network_env applies ("" = none).
+    collective_library: str = ""
+    #: net plugin file the collective library dlopens by name when
+    #: ``NCCL_NET_PLUGIN`` is unset.
+    collective_net_plugin: str = ""
+    #: ``(tool, mapped-library marker, largest process count)``: the vendor
+    #: tracer, how a process knows it runs under it, and the largest step it
+    #: does not deadlock (0 = no limit).
+    profiler: tuple = ()
 
 
 HOST = PlatformLeg(
@@ -105,7 +133,12 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
                            ("--xla_gpu_enable_llvm_module_compilation_parallelism", "true")),
         xla_allocator="cuda_async",
         xla_allocators=("default", "platform", "bfc", "cuda_async"),
-        device_memory_api="cuda_driver"),
+        device_memory_api="cuda_driver",
+        fft_plan_scratch="cufft",
+        outside_pool_api="cuda_driver_mempool",
+        memory_telemetry="nvidia-smi",
+        collective_library="nccl", collective_net_plugin="libnccl-net.so",
+        profiler=("nsys", "libToolsInjection", 0)),
     "ROCM": PlatformLeg(
         key="ROCM", vendor="rocm",
         so_name="liblorrax_ffi_rocm.so", so_env="LORRAX_FFI_ROCM_SO",
@@ -120,9 +153,13 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # LLVM-module-parallelism row: XLA's AMDGPU compiler cannot link split
         # modules, so the flag is inert there (runtime lane 2026-10-14).
         xla_flag_defaults=(("--xla_gpu_autotune_level", "0"),),
-        # jaxlib's own BFC until a ROCm pool policy is measured (runtime lane
-        # 2026-10-14: recommendation R-pool in the lane report).
-        xla_allocator="",
+        # The pool policy's arena: BFC (cuda_async does not exist on ROCm),
+        # preallocated at runtime.pool_fraction (0.8952 of a 68.70 GB GCD,
+        # 61.50 GB) instead of jaxlib's 0.75 (51.53 GB).  Outside the arena
+        # after RCCL init, 512 MiB psum/all_to_all, a 3D FFT and a GEMM:
+        # 0.99-1.08 GB per rank at P4, against the 7.20 GB left; hsuite walls
+        # unchanged, planner budget 41.96 -> 50.08 GB (Runtime-LEGS lane 2026-10-15).
+        xla_allocator="bfc",
         # cuda_async refused at client creation (MI250X, jax 0.9.1).
         xla_allocators=("default", "platform", "bfc"),
         device_memory_api="hip_runtime",
@@ -132,7 +169,21 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # writers on one file on Lustre spin.  comgr's cache (~590 MB after one
         # hsuite) would otherwise grow in HOME.
         runtime_kernel_caches=(("ROCFFT_RTC_CACHE_PATH", "rocfft_kernel_cache", "process-file"),
-                               ("AMD_COMGR_CACHE_DIR", "comgr", "shared-dir"))),
+                               ("AMD_COMGR_CACHE_DIR", "comgr", "shared-dir")),
+        # XLA's ROCm FFT thunk takes the hipFFT plan workspace from the BFC
+        # arena: on the seven c128 3D boxes probed the arena peak rose by
+        # exactly hipfftMakePlanMany's workSize (23.3-131.1 MB, one copy of
+        # the data; workSize 0 and no rise for 96^3 x 16).  An eighth case
+        # (1D 1009 x 4096, workSize 65.5 kB) gave no reading: the peak did not
+        # rise past an earlier one.  MI250X, Runtime-LEGS lane 2026-10-15.
+        fft_plan_scratch="hipfft",
+        outside_pool_api="hip_runtime_arena",
+        # In process: amd-smi takes 1.0 s a sample and rocm-smi 0.45 s, and both
+        # number all eight GCDs, not the one ROCR_VISIBLE_DEVICES leaves visible.
+        memory_telemetry="hip_runtime",
+        collective_library="rccl", collective_net_plugin="librccl-net.so",
+        # rocprofv3 --kernel-trace deadlocks RCCL at P=4 (Screening lane, 2026-10-14).
+        profiler=("rocprofv3", "librocprofiler-sdk-tool", 1)),
 })
 
 _BY_VENDOR = {leg.vendor: leg for leg in LEGS.values()}

@@ -237,8 +237,14 @@ and 15.1 GB on A100-80GB for these two terms.
 `cuda_async` with its pool reserved is the one allocator configuration on
 CUDA ([environment § GPU pool](../environment/overview.md#gpu-pool)); the
 allocator is the device leg's declaration (`PlatformLeg.xla_allocator`), and
-the ROCm leg declares none, so a ROCm run keeps jaxlib's BFC arena with 75 %
-of the card preallocated (51.5 of 68.7 GB on an MI250X GCD). The
+the ROCm leg declares BFC (`cuda_async` does not exist there), preallocated at
+`R` like the CUDA pool: 61.50 of 68.70 GB on an MI250X GCD instead of jaxlib's
+75 % (51.53 GB), so the planner budget (41.96 -> 50.08 GB on hsuite) fits in
+the arena. Outside it, after RCCL start-up, 512 MiB collectives, a 3D FFT and a
+GEMM, each P4 rank held 0.99-1.08 GB of the 7.20 GB left (hipMemGetInfo minus
+the arena's `pool_bytes`, `runtime.xla_memory.outside_pool_bytes`). The hipFFT
+plan workspace is inside the arena and priced like cuFFT's
+(`PlatformLeg.fft_plan_scratch`, `runtime.aot_memory`). The
 alternatives jaxlib offers were measured on CrI3 6×6 bispinor SC maps 0–2
 at P4, cold, at the rule's budget (claim 4092). "Peak in use" is
 XLA's `peak_bytes_in_use`; "high-water" is the pool's reserved high-water

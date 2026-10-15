@@ -247,8 +247,10 @@ def bootstrap(*, platform: str = "gpu") -> None:
     set_default_env(platform=platform)
     announce_cpu_collectives()
     skip_gpu_plugin_discovery()
+    check_profiler_ranks()
     init_jax_distributed()
     fallback_to_cpu_if_no_gpu_backend()
+    init_mpi_before_device_collectives()
     install_failfast_excepthook()
     pin_matmul_precision()
     # Every sharding is explicit, so a legacy ``with mesh:`` would only add its
@@ -745,6 +747,7 @@ def set_default_env(*, platform: str = "gpu") -> None:
     # refuse each other here; ``file_io.hdf5_owner`` owns that clash.  HDF5
     # reads this at file open, so it is set before any store opens.
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "BEST_EFFORT")
+    apply_site_scratch(say=rank0_print)
     if platform == "gpu":
         os.environ.setdefault("JAX_PLATFORMS", f"{_gpu_plugin_platform()},cpu")
     elif platform == "cpu":
@@ -763,6 +766,57 @@ def set_default_env(*, platform: str = "gpu") -> None:
     set_default_xla_gpu_autotune(platform=xla_platform)
     from runtime.network_env import configure_gpu_network
     configure_gpu_network(platform=xla_platform, say=rank0_print)
+
+
+_SITE_SCRATCH_DONE: list = []
+
+
+def site_scratch(env=os.environ) -> tuple[str | None, str]:
+    """``(path, why)``: the scratch root the site profile declares
+    (``[paths] scratch``, environment variables expanded) when ``SCRATCH``
+    is unset, or ``(None, why not)``.  The path must expand completely and
+    be a writable directory."""
+    if env.get("SCRATCH"):
+        return None, "SCRATCH is set"
+    from runtime.network_env import site_profile
+    profile = site_profile(env)
+    template = ((profile or {}).get("paths") or {}).get("scratch")
+    if not template:
+        return None, "the site profile declares no scratch"
+    path = _expand(template, env)
+    if "$" in path:
+        return None, (f"the {profile['site']} scratch rule {template!r} does not "
+                      f"expand here ({path!r})")
+    if not (os.path.isdir(path) and os.access(path, os.W_OK)):
+        return None, f"the {profile['site']} scratch {path} is not a writable directory"
+    return path, f"{profile['site']} profile"
+
+
+def _expand(template: str, env) -> str:
+    import re
+    return re.sub(r"\$(\w+)|\$\{(\w+)\}",
+                  lambda m: env.get(m.group(1) or m.group(2), m.group(0)), template)
+
+
+def apply_site_scratch(*, say=print) -> None:
+    """Set ``SCRATCH`` from the site profile when the site defines none.
+
+    A site rule, not a cache-local one: every per-user cache root reads
+    ``SCRATCH`` (:func:`lxkit.user_cache_dir`: the persistent compile cache
+    and, beside it, the rocFFT/comgr kernel caches), so they all leave NFS
+    HOME together.  Frontier: ``$MEMBERWORK/$SLURM_JOB_ACCOUNT``.  Once per
+    process, before any cache is opened; announced either way when the
+    profile declares a rule.
+    """
+    if _SITE_SCRATCH_DONE:
+        return
+    _SITE_SCRATCH_DONE.append(True)
+    path, why = site_scratch()
+    if path:
+        os.environ["SCRATCH"] = path
+        say(f"[runtime] SCRATCH={path} ({why} [paths] scratch; the site defines none).")
+    elif why not in ("SCRATCH is set", "the site profile declares no scratch"):
+        say(f"[runtime] WARNING: {why}; per-user caches stay under HOME.")
 
 
 #: The one device-memory rule (owner 2026-10-08), the same for every vendor and
@@ -851,7 +905,9 @@ def set_default_gpu_pool() -> None:
     Nothing is set unless this is a GPU run on a node with a GPU device
     (:func:`_gpu_is_present`) whose leg declares an allocator
     (``PlatformLeg.xla_allocator``, :data:`lxkit.LEGS`): a CPU run, a GPU-less
-    node and a leg that declares none (ROCm today) keep jaxlib's own defaults.
+    node and a leg that declares none keep jaxlib's own defaults.  On ROCm
+    the allocator is BFC: the reservation is then also the arena's cap, and
+    what lies outside it is ``M - R``, the same headroom.
 
     The fraction is not a cap: ``cuda_async`` (``create_new_pool=false``,
     the device's default mempool, which every FFI ``cudaMallocAsync`` shares)
@@ -868,8 +924,9 @@ def set_default_gpu_pool() -> None:
             or os.environ.get("JAX_PLATFORM_NAME", "").lower() == "cpu"
             or not _gpu_is_present()):
         return
-    # The allocator is the leg's declaration (lxkit.LEGS xla_allocator); a leg
-    # that declares none (ROCm today) keeps jaxlib's own defaults.
+    # The allocator is the leg's declaration (lxkit.LEGS xla_allocator:
+    # cuda_async on CUDA, bfc on ROCm); a leg that declares none keeps
+    # jaxlib's own defaults.
     leg = _gpu_leg()
     if leg is None or not leg.xla_allocator:
         return
@@ -1516,6 +1573,76 @@ def _resolve_coordinator_address() -> str | None:
     step = os.environ.get("SLURM_STEP_ID", "0").strip()
     step = int(step) if step.isdigit() else 0
     return f"{expand_nodelist(nodelist)[0]}:{61440 + (int(job) + 257 * step) % 4096}"
+
+
+def _under_tool(marker: str, environ=None, maps_text: str | None = None) -> bool:
+    """This process runs under the tracer whose library name contains ``marker``:
+    it is preloaded (``LD_PRELOAD``, or rocprofv3's ``ROCP_TOOL_LIBRARIES``) or
+    already mapped."""
+    env = os.environ if environ is None else environ
+    if any(marker in env.get(v, "") for v in ("LD_PRELOAD", "ROCP_TOOL_LIBRARIES")):
+        return True
+    if maps_text is None:
+        try:
+            with open("/proc/self/maps", encoding="utf-8", errors="replace") as fh:
+                maps_text = fh.read()
+        except OSError:
+            return False
+    return marker in maps_text
+
+
+def check_profiler_ranks(*, environ=None, maps_text: str | None = None) -> None:
+    """GATE profiler: refuse a step larger than the leg's vendor tracer survives.
+
+    The device leg declares ``profiler = (tool, library marker, largest
+    process count)`` (:data:`lxkit.LEGS`); a step under that tool with more
+    processes refuses here, before the collective library starts, instead of
+    deadlocking in its first collective (rocprofv3 --kernel-trace with RCCL at
+    P=4, Screening lane 2026-10-14).  A limit of 0 never refuses (nsys).
+    """
+    leg = _gpu_leg()
+    if leg is None or not getattr(leg, "profiler", ()):
+        return
+    tool, marker, limit = leg.profiler
+    if not limit or not _under_tool(marker, environ, maps_text):
+        return
+    count = _resolve_proc_count()
+    if count > limit:
+        raise RuntimeError(
+            f"GATE profiler: refusing a {count}-process {leg.key} step under {tool}: "
+            f"{tool} deadlocks the leg's collective library above {limit} "
+            f"process(es) (lxkit.LEGS[{leg.key!r}].profiler).  Profile a "
+            f"{limit}-process run, or run without {tool}.")
+
+
+_MPI_FIRST_DONE: list = []
+
+
+def init_mpi_before_device_collectives(*, say=None) -> None:
+    """Initialize MPI through the host leg now, when the site requires MPI to
+    open its network endpoint before the device collective library does.
+
+    The site profile's ``mpi_before_collectives`` (Frontier: with RCCL's OFI
+    plugin first, cray-mpich's endpoint creation fails with ENOSPC on every
+    rank), recorded by :func:`runtime.network_env.configure_gpu_network` for a
+    multi-node step it applied.  Runs after backend start-up (the device leg
+    opens before the host leg, the SONAME rule) and before any collective;
+    collective over the launch's processes (``MPI_Init_thread``), so every
+    rank reaches it from :func:`bootstrap`.  Idempotent; a no-op elsewhere.
+    """
+    if _MPI_FIRST_DONE:
+        return
+    _MPI_FIRST_DONE.append(True)
+    from runtime.network_env import network_configuration
+    decision = network_configuration() or {}
+    if not decision.get("mpi_before_collectives"):
+        return
+    import time
+    from ffi.common import ffi_loader
+    t0 = time.time()
+    ffi_loader.phdf5_init_mpi("cpu")
+    (say or rank0_print)(f"[runtime] MPI initialized before the first {decision.get('library', '')} "
+                         f"collective ({decision['policy']}, {time.time() - t0:.2f} s).")
 
 
 def init_jax_distributed() -> None:

@@ -153,13 +153,13 @@ def test_cufft_failures_price_conservatively(monkeypatch, capsys):
     from runtime import aot_memory as aot
     stats = NS(temp_size_in_bytes=100, argument_size_in_bytes=50, output_size_in_bytes=30,
                alias_size_in_bytes=0)
-    monkeypatch.setattr(aot, "_is_cuda_platform", lambda platform: True)
+    monkeypatch.setattr(aot, "_fft_plan_api", lambda platform: "cufft")
     drifted = NS(memory_analysis=lambda: stats, as_text=lambda: "%x = c128[8] fft(%y), weird")
     peak = aot.aot_kernel_peak_bytes(drifted, platform="cuda")
     assert peak.cufft_measured is False and peak.cufft_scratch == 130 and peak.total == 180 + 130
     text = ("%fft.0 = c128[2,4,4,4]{3,2,1,0} fft(%x.1), fft_type=FFT, fft_length={4,4,4}")
 
-    def refuse(specs):
+    def refuse(specs, api="cufft"):
         raise aot.CufftQueryError("libcufft absent")
     monkeypatch.setattr(aot, "query_cufft_workspace_bytes", refuse)
     parsed = NS(memory_analysis=lambda: stats, as_text=lambda: text)

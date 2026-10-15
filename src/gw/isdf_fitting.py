@@ -1,6 +1,5 @@
 import gc
 import os
-import subprocess
 import time
 from typing import NamedTuple
 
@@ -35,13 +34,16 @@ from isdf.core import (
 )
 
 
-# Running max of nvidia-smi used MB across all probe points within a run
-# (this rank's GPU only).  jax.device_memory_stats() returns None on the
-# JAX 0.8 / CUDA 12.9 Perlmutter stack, so nvidia-smi is the only way to
-# observe the TRUE per-rank HBM peak including cuFFT plan workspace,
-# NCCL collective buffers, and other XLA-arena-external allocations.
+# Running max of whole-device used MB across all probe points within a run
+# (this rank's GPU only), from the device leg's ``memory_telemetry``
+# (runtime.xla_memory.device_used_sample: nvidia-smi on CUDA, hipMemGetInfo
+# on ROCm).  jax.device_memory_stats() returned None on the JAX 0.8 / CUDA
+# 12.9 Perlmutter stack, so this sample is the way to observe the TRUE
+# per-rank HBM peak including FFT plan workspace, collective buffers, and
+# other XLA-arena-external allocations.
 _NVSMI_PEAK_MB = 0
 _NVSMI_LAST_MB = 0
+_NVSMI_LABEL = "nvsmi"
 
 
 
@@ -101,10 +103,11 @@ def mem_probe(label, *, only_rank0=True):
             entry[0] += 1
             entry[1] += sz
     nvsmi_mb = _nvsmi_used_mb_local_gpu()
+    tag = _NVSMI_LABEL
     print(f"[mem_probe {label}] in_use={bytes_in_use/1e9:.2f} GB  "
           f"peak={peak_bytes_in_use/1e9:.2f} GB  "
           f"live_count={len(live)} live_total={total_live/1e9:.2f} GB  "
-          f"nvsmi={nvsmi_mb/1024:.2f} GB nvsmi_peak={_NVSMI_PEAK_MB/1024:.2f} GB",
+          f"{tag}={nvsmi_mb/1024:.2f} GB {tag}_peak={_NVSMI_PEAK_MB/1024:.2f} GB",
           flush=True)
     top = sorted(by_shape.items(), key=lambda kv: -kv[1][1])[:10]
     for (shape, dtype), (cnt, sz) in top:
@@ -113,26 +116,24 @@ def mem_probe(label, *, only_rank0=True):
 
 
 def _nvsmi_used_mb_local_gpu():
-    """Sample nvidia-smi for the local rank's GPU.  Returns used-MB int or 0.
+    """Sample the local rank's whole-device used memory, in MiB, or 0.
 
-    Uses ``CUDA_VISIBLE_DEVICES`` (or falls back to GPU 0) to query just
-    this rank's GPU rather than the whole node.  Updates module-level
-    ``_NVSMI_PEAK_MB`` running max.  Silently returns 0 on any failure
-    (nvidia-smi missing, parse error, timeout) — never raises.
+    The sampler is the device leg's ``memory_telemetry``
+    (:func:`runtime.xla_memory.device_used_sample`: ``nvidia-smi`` of the
+    first ``CUDA_VISIBLE_DEVICES`` entry on CUDA, ``hipMemGetInfo`` on ROCm).
+    Updates module-level ``_NVSMI_PEAK_MB`` running max.  Silently returns
+    0 on any failure (no sampler, tool missing, parse error, timeout) —
+    never raises.
     """
-    global _NVSMI_PEAK_MB, _NVSMI_LAST_MB
+    global _NVSMI_PEAK_MB, _NVSMI_LAST_MB, _NVSMI_LABEL
     try:
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        if cvd:
-            gpu_idx = cvd.split(",")[0].strip()
-        else:
-            gpu_idx = "0"
-        out = subprocess.run(
-            ["nvidia-smi", f"--id={gpu_idx}",
-             "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        mb = int(out.stdout.strip().split("\n")[0])
+        from runtime.xla_memory import device_used_sample
+        ordinal = int(getattr(jax.local_devices()[0], "local_hardware_id", 0) or 0)
+        label, used = device_used_sample(ordinal)
+        if used is None:
+            return 0
+        _NVSMI_LABEL = label
+        mb = int(used) // 2**20
         _NVSMI_LAST_MB = mb
         if mb > _NVSMI_PEAK_MB:
             _NVSMI_PEAK_MB = mb
