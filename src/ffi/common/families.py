@@ -110,6 +110,15 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "sequential LibSci; eigh/potrf gated against the native route at P=4, n=512-8192. "
              "ROCM also builds the LU family (getrf PartialPiv + getrs: distributed solve_lu, "
              "gated against jnp.linalg.solve at P=4); CUDA's LU is cusolvermp, the host's scalapack."),
+    "rocsolver": Family(
+        ("lorrax_rocsolver_",), "rocsolver",
+        _legs(("xla", "jnp.linalg.eigh (jaxlib cuSOLVER)"), ("built", ""), ("xla", "jnp.linalg.eigh (LAPACK)")),
+        gate="tests/test_rocsolver_eigh_gate.py (residual, orthogonality, eigenvalues and "
+             "eigenspaces vs jnp.linalg.eigh on the same GCD)", tol=1e-12,
+        note="ROCM batched local eigh: one rocsolver_{z,d}{heevd,syevd}_strided_batched call per "
+             "stack (jaxlib loops zheevd per matrix), a matrix rocSOLVER leaves non-finite with "
+             "info = 0 (its silent zheevd failure) is NaN in w and v; distrib_la.local_eigh."
+             "BATCHED_EIGH_ROUTE holds the drivers and stacks.  rocSOLVER is the process's mapped copy."),
     "scalapack": Family(
         ("lorrax_scalapack_",), "scalapack",
         _legs(("elsewhere", "cusolvermp"), ("elsewhere", "slate"), ("built", "")),

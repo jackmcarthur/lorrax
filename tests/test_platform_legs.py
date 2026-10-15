@@ -202,17 +202,20 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     assert shared and all(t.startswith(prefixes) for t in shared)
     assert all(ffi_loader._CUDA_TARGET_SYMBOLS[t] == s for t, s in shared.items())
     assert {t for t in ffi_loader._CUDA_TARGET_SYMBOLS if t.startswith(prefixes)} == set(shared)
-    # The leg's own targets: the kdft families, and SLATE's LU (CUDA's LU is cusolvermp).
+    # The leg's own targets: the kdft families, SLATE's LU (CUDA's LU is cusolvermp) and the
+    # batched local eigh (CUDA's is jaxlib's cuSOLVER).
     lu = {"lorrax_slate_batched_solve_lu_factors", "lorrax_slate_batched_getrf",
           "lorrax_slate_batched_getrs"}
-    assert own and all(t.startswith("lorrax_kdft_") or t in lu for t in own)
+    eigh = {"lorrax_rocsolver_batched_eigh"}
+    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh for t in own)
+    assert eigh <= set(own)
     assert lu <= set(own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)
     assert all(rocm[t] == s for t, s in own.items())
-    # distrib_la's ROCM table: the SLATE family, its LU entries included.
+    # distrib_la's ROCM table: the SLATE family, its LU entries included, and the batched eigh.
     dl_rocm = dl._PLATFORMS["ROCM"]["targets"]
-    assert dl_rocm and all(t.startswith("lorrax_slate_") for t in dl_rocm)
-    assert lu <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu)
+    assert dl_rocm and all(t.startswith("lorrax_slate_") or t in eigh for t in dl_rocm)
+    assert lu | eigh <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu | eigh)
     cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
     section = cmake[cmake.index('STREQUAL "rocm"'):]
     block = section[:section.index("add_library(lorrax_ffi_rocm")]

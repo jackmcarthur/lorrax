@@ -233,6 +233,9 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     "lorrax_kdft_kfft_klead_unfold": "KDftKfftKleadUnfoldFfi",
     "lorrax_kdft_kconv_chi_unfold":  "KDftKconvChiUnfoldFfi",
     "lorrax_kdft_kconv_chi_vertex":  "KDftKconvChiVertexFfi",
+    # The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc), called by
+    # distrib_la.local_eigh (BATCHED_EIGH_ROUTE); CUDA uses jaxlib's cuSOLVER for it.
+    "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},
