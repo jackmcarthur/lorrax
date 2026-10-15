@@ -1592,7 +1592,11 @@ set_target_properties(lorrax_ffi_rocm PROPERTIES
     BUILD_WITH_INSTALL_RPATH ON
     INSTALL_RPATH "$ORIGIN"            # the same $ORIGIN-only RUNPATH as the other legs
 )
-target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--enable-new-dtags")
+# DT_RUNPATH, except where the leg binds a SLATE: DT_RPATH (SLATE section below).
+# Not both: the Cray wrapper reorders -Wl options, so --enable-new-dtags wins.
+if(NOT LORRAX_ROCM_HAVE_SLATE)
+    target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--enable-new-dtags")
+endif()
 target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE
     "${LORRAX_XLA_FFI_INCLUDE_DIR}"
     "${HDF5_INCLUDE_DIRS}"
@@ -1636,7 +1640,7 @@ if(LORRAX_ROCM_HAVE_SLATE)
     # Perlmutter.  verify_ffi_build.sh GATE 3c checks the resolution.
     set_target_properties(lorrax_ffi_rocm PROPERTIES
         INSTALL_RPATH "$ORIGIN;${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64")
-    target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--disable-new-dtags")  # after --enable: last wins
+    target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--disable-new-dtags")
     message(STATUS "  slate/{context,eigh,potrf,trsm,batched_potrf,batched_trsm}")
 endif()
 else()
