@@ -42,6 +42,7 @@
 #include "../common/c_abi.h"
 #include "../common/ffi_helpers.h"
 #include "../common/gpu_runtime.h"
+#include "../common/leg.h"
 #include "../common/rtc_build.h"
 #include "../cufft/kbox_stage.cuh"          // the host half: the k-box launch rule (kbox_plan)
 #include "generated/kbox_stage_src.h"       // the same file as text: the kernel's named header
@@ -50,7 +51,7 @@
 namespace lorrax_ffi::kbox_rspace {
 
 // A block's LDS on gfx90a (64 KiB per CU, all of it addressable by one workgroup).
-static constexpr long long kLds = 64 * 1024;
+static constexpr long long kLds = LRX_LEG_BLOCK_LDS;   // the leg's block LDS (common/leg.h; 64 KiB on ROCM)
 // Each mode's own axis bound: the stage's line transform is the unrolled direct DFT (N^2 FMAs
 // against compile-time twiddles), so neither widens with the k-leading pair's KDFT_AXIS_MAX.
 // ffi.fft.KDFT_KBOX_WEDGE_AXIS_MAX / KDFT_KBOX_CHI_AXIS_MAX mirror them; the gate covers axis 40.
@@ -212,7 +213,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, int nsr, in
     if (ap.arm == 1) prog.entries = {kPencil[mode == 11]};
     if (ap.arm == 2) prog.entries = {kPencil[mode == 11], kYpass[mode == 11]};
     prog.headers = {{lorrax_ffi::kbox::kHeaderName, lorrax_ffi::kbox::kHeaderSrc}};
-    prog.defs = {"-O3", "-std=c++17", rtc::arch_option(arch), "-DLRX_MODE=" + std::to_string(mode),
+    prog.defs = {rtc::kOptOption, "-std=c++17", rtc::arch_option(arch), "-DLRX_MODE=" + std::to_string(mode),
                  "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky),
                  "-DLRX_NZ=" + std::to_string(nkz), "-DLRX_NS=" + std::to_string(ns),
                  "-DLRX_NSR=" + std::to_string(nsr), "-DLRX_TR=" + std::to_string(ap.trc),

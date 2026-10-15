@@ -27,6 +27,7 @@
 
 #include "../common/ffi_helpers.h"
 #include "../common/gpu_runtime.h"
+#include "../common/leg.h"
 #include "../common/rtc_build.h"
 #include "../cufft/kbox_stage.cuh"          // the host half: the k-box launch rule (kbox_plan)
 #include "generated/kbox_stage_src.h"       // the same file as text: the kernel's named header
@@ -36,7 +37,7 @@ namespace lorrax_ffi::kbox_unfold {
 
 // A block's LDS on gfx90a (64 KiB per CU, all of it addressable by one workgroup): the stage's
 // opt-in budget.  The longest axis: the direct DFT holds a line in registers (KDFT_AXIS_MAX).
-static constexpr long long kLds = 64 * 1024;
+static constexpr long long kLds = LRX_LEG_BLOCK_LDS;   // the leg's block LDS (common/leg.h; 64 KiB on ROCM)
 static constexpr int kAxisMax = 40;
 static constexpr int kGridCap = 110 * 16;   // grid-stride: enough tiles in flight for 110 CUs
 
@@ -99,7 +100,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int ns, bool live, std::strin
     prog.name = "lrx_kbox_unfold";
     prog.kernel = "lrx_kbox_m7";
     prog.headers = {{lorrax_ffi::kbox::kHeaderName, lorrax_ffi::kbox::kHeaderSrc}};
-    prog.defs = {"-O3", "-std=c++17", rtc::arch_option(arch),
+    prog.defs = {rtc::kOptOption, "-std=c++17", rtc::arch_option(arch),
                  "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky),
                  "-DLRX_NZ=" + std::to_string(nkz), "-DLRX_NS=" + std::to_string(ns),
                  "-DLRX_TR=" + std::to_string(tr), "-DLRX_NT=" + std::to_string(kp.threads),
