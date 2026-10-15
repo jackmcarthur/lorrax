@@ -175,6 +175,15 @@ KDFT_KFFT_KMINOR_TARGET = "lorrax_kdft_kfft_kminor"
 #   T (4,300,300,1,1,144) 0.83 GB     mode 4 out_layout 1 10.66    3.49 (4.59)     3.1        475
 #   T (4,250,250,1,1,216) 0.86 GB     mode 4 out_layout 1 28.10    4.10 (3.86)     6.9        422
 #   T (4,150,150,1,1,512) 0.74 GB     mode 4 out_layout 1 10.35    4.03 (3.81)     2.6        366
+# The split arm's out_layout-1 store (its last row pass) orders its blocks by the store's k
+# stride M*16 B, M = d1*d2*d3*d4 (kdft_kminor_plan.h l1_order).  Mode 4, T (4|2, mu, nu, 1, 1, nk)
+# ~1 GB, one GCD, ms per call (pool logs kminfin_final; int3 = kminfin_base1/base2):
+#   grid     M     int3 L1  now L1  L0       grid      M     int3 L1  now L1  L0
+#   128x64   1936  12.46    7.09    7.19     16x16x30  2116  10.10    7.73    6.66
+#   64x64    3600   7.85    5.22    5.31     64x64     4096   8.67    7.38    6.04
+#   16^3     3600   7.61    6.55    5.92     32x32x10  1600   8.28    7.78    6.96
+#   16^3     4096  10.63   10.54    6.72     128x64    4096  12.87   11.44    7.58
+# (the last two: nk*16 B and M*16 B both multiples of 4 KiB, the store's residual).
 #: Factory -> the kdft target that serves it on a ROCm mesh.  A factory with no row takes the
 #: XLA backend there; ``kconv_backend`` stays ``'xla'`` on ROCm, so every unported factory and
 #: every backend-keyed caller (mixed_basis_pair_convolution, greens_function_kernel) is unchanged.

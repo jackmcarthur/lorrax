@@ -17,11 +17,12 @@
 // LRX_SPLIT = O_T = nkf / NK the points of the axes before it, so the pass transforms rows*O_T
 // row-pass rows of NK.  Row-pass row r' is the run of (operand row r, leading index ot) at
 // r*nkf + ot*NK: r' = r*O_T + ot (ot fastest, so a block reads one contiguous C*NK run), except
-// for the LRX_OUT 1 store, r' = ot*rows + r (r fastest, so the permuted store writes runs of
-// consecutive operand rows).  Mode 5 then also takes LRX_OUT 1 (the split arm's last pass).
+// for the LRX_OUT 1 store (mode 5 with LRX_OUT 1: the split arm's last pass), whose block owns C
+// consecutive operand rows of one ot, so the permuted store writes runs of C rows; LRX_ORDER
+// says which index the blocks walk fastest: 0 the row chunk (every block in flight stores one
+// ot), 1 the ot.  The host picks it from the store's k stride (kdft_kminor_plan.h l1_order).
 // (r fastest everywhere ran 3x slower on power-of-two nk, whose row stride nk*16 B lands every
 // block's runs on the same HBM channels: 16^3 mode 5 10.3 ms, pool log kcore_after2.)
-//
 // One block owns C consecutive rows: a contiguous C*nk run of HBM, read once and written once.
 // The tile is staged TRANSPOSED in LDS, s[k*W + c], W odd and >= C (a zeroed pad column when
 // W > C): the DFT core (kdft_core.h, a mixed-radix Stockham line DFT on any (G, W) tile, lanes
@@ -32,6 +33,8 @@
 // Compile-time constants (deciding options, so they are in the image key):
 //   LRX_NX, LRX_NY, LRX_NZ   the k-grid (the split arm: the trailing axis group)
 //   LRX_SPLIT                1, or the split arm's O_T (row-pass rows per operand row)
+//   LRX_ORDER                the layout-1 store's block order (LRX_OUT 1 with LRX_SPLIT > 1):
+//                            0 row chunk fastest, 1 ot fastest (kdft_kminor_plan.h l1_order)
 //   LRX_C                    rows per block
 //   LRX_W                    the LDS tile's width, odd, C <= W <= C + 1 (the tile is NK*W complex)
 //   LRX_NT                   threads per block
@@ -45,6 +48,10 @@
 #ifndef LRX_SPLIT
 #define LRX_SPLIT 1
 #endif
+#ifndef LRX_ORDER
+#define LRX_ORDER 0
+#endif
+#define LRX_OTMAP (LRX_OUT == 1 && LRX_SPLIT > 1)
 #define NK (LRX_NX * LRX_NY * LRX_NZ)
 #define NKF (NK * LRX_SPLIT)
 #define NTW (LRX_NX + LRX_NY + LRX_NZ)
@@ -67,15 +74,26 @@ lrx_kdft_kminor(const cplx* x, const cplx* __restrict__ kern, cplx* y, int rows,
 #if LRX_OUT == 1
     __shared__ long long obase[LRX_C];                          // layout 1: the row's offset at k = 0
 #endif
+#if LRX_OTMAP
+    // block -> (row chunk, ot), one block each (row_blocks); LRX_ORDER: which walks fastest
+    const int nch = (rows + LRX_C - 1) / LRX_C;
+    const int bot = LRX_ORDER == 0 ? static_cast<int>(blockIdx.x) / nch : static_cast<int>(blockIdx.x) % LRX_SPLIT;
+    const int ch = LRX_ORDER == 0 ? static_cast<int>(blockIdx.x) - bot * nch : static_cast<int>(blockIdx.x) / LRX_SPLIT;
+    const int r0 = ch * LRX_C;
+    const int nr = rows - r0 < LRX_C ? rows - r0 : LRX_C;
+#else
     const int nrp = rows * LRX_SPLIT;                           // row-pass rows
     const int r0 = blockIdx.x * LRX_C;
     const int nr = nrp - r0 < LRX_C ? nrp - r0 : LRX_C;        // live rows of this tile
+#endif
 
     kdft::fill_twiddles<LRX_NX, LRX_NY, LRX_NZ, LRX_NT>(tw);
     for (int c = threadIdx.x; c < nr; c += LRX_NT) {
         const int rp = r0 + c;
-#if LRX_OUT == 1
-        const int r = LRX_SPLIT > 1 ? rp % rows : rp, ot = LRX_SPLIT > 1 ? rp / rows : 0;
+#if LRX_OTMAP
+        const int r = rp, ot = bot;
+#elif LRX_OUT == 1
+        const int r = rp, ot = 0;
 #else
         const int r = rp / LRX_SPLIT, ot = rp % LRX_SPLIT;
 #endif

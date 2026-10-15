@@ -60,20 +60,23 @@ ffi::Error fail(const char* gate, const std::string& why,
 struct Built {
     rtc::Function fn = nullptr;
     int rows = 0;
+    int order = -1;   // the split arm's out_layout-1 store's block order (row_blocks; -1: other passes)
 };
-// dev, mode, out, nkx, nky, nkz, f32, O_T, C, W
-using Key = std::tuple<int, int, int, int, int, int, int, long long, int, int>;
+// dev, mode, out, nkx, nky, nkz, f32, O_T, C, W, order
+using Key = std::tuple<int, int, int, int, int, int, int, long long, int, int, int>;
 std::mutex g_mu;
 std::map<Key, Built> g_cache;
 std::map<Key, std::string> g_fail;
 
-// The image of one row pass (or the single arm): k-grid g, O_T (1 = single), rows rw.
+// The image of one row pass (or the single arm): k-grid g, O_T (1 = single), rows rw; order: the
+// split arm's out_layout-1 store's block order (kdft_kminor_kernel.h LRX_ORDER), -1 otherwise.
 ffi::Error build(int mode, int out, const std::array<int, 3>& g, long long ot, Rows rw, bool f32,
-                 std::string_view cache_dir, const Built** res) {
+                 std::string_view cache_dir, const Built** res, int order = -1) {
+    if (!(out == 1 && ot > 1)) order = -1;
     int dev = 0;
     LORRAX_GPU_CHECK(lrx::gpu::get_device(&dev));
     const int nkx = g[0], nky = g[1], nkz = g[2];
-    const Key key{dev, mode, out, nkx, nky, nkz, f32 ? 1 : 0, ot, rw.c, rw.w};
+    const Key key{dev, mode, out, nkx, nky, nkz, f32 ? 1 : 0, ot, rw.c, rw.w, order};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *res = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kdft-build", "(cached failure) " + it->second);
@@ -92,13 +95,15 @@ ffi::Error build(int mode, int out, const std::array<int, 3>& g, long long ot, R
                  "-DLRX_W=" + std::to_string(rw.w), "-DLRX_SPLIT=" + std::to_string(ot),
                  "-DLRX_NT=" + std::to_string(kThreads), "-DLRX_MODE=" + std::to_string(mode),
                  "-DLRX_OUT=" + std::to_string(out), std::string("-DLRX_F32=") + (f32 ? "1" : "0")};
+    if (order >= 0) prog.defs.push_back("-DLRX_ORDER=" + std::to_string(order));   // the l1 store only
     const std::string key_hex = rtc::hex16(rtc::key(prog, nullptr));
     const std::string dir(cache_dir);
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
         name << dir << "/kdftm_m" << mode << (out ? "o1" : "") << "_" << nkx << "x" << nky << "x" << nkz
-             << (ot > 1 ? "_s" + std::to_string(ot) : "") << (f32 ? "_c64" : "") << "_" << rtc::arch_tag(arch) << "_" << key_hex << rtc::kImageExt;
+             << (ot > 1 ? "_s" + std::to_string(ot) : "") << (order >= 0 ? "_q" + std::to_string(order) : "")
+             << (f32 ? "_c64" : "") << "_" << rtc::arch_tag(arch) << "_" << key_hex << rtc::kImageExt;
         path = name.str();
     }
     rtc::Image img;
@@ -114,6 +119,7 @@ ffi::Error build(int mode, int out, const std::array<int, 3>& g, long long ot, R
     Built b;
     b.fn = img.fn;
     b.rows = rows;
+    b.order = order;
     *res = &g_cache.emplace(key, b).first->second;
     return ffi::Error::Success();
 }
@@ -163,7 +169,8 @@ ffi::Error launch(lrx::gpu::Stream stream, ffi::ScratchAllocator* scratch, int m
         return fail("kdft-nk", "got nk=" + std::to_string(nk) + "; want nk <= " + std::to_string(::kdft::kNkMax) +
                     " (the verified range); the router keeps larger grids on XLA", ffi::ErrorCode::kInvalidArgument);
     const MinorPlan pl = ::kdft::plan_kminor(static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                                             mode, forward ? 1 : 0, out, f32 ? 8 : 16);
+                                             mode, forward ? 1 : 0, out, f32 ? 8 : 16,
+                                             1LL * d[1] * d[2] * d[3] * d[4]);
     if (pl.rows.c == 0)
         return fail("kdft-kminor-tile", "got k-grid " + std::to_string(nkx) + "x" + std::to_string(nky) + "x" +
                     std::to_string(nkz) + "; want a row pass whose k tile fits a block's " +
@@ -178,7 +185,8 @@ ffi::Error launch(lrx::gpu::Stream stream, ffi::ScratchAllocator* scratch, int m
         int f = dir;
         void* args[] = {&src, &kp, &dst, &rows_i, &d[1], &d[2], &d[3], &d[4],
                         f32 ? static_cast<void*>(&scale32) : static_cast<void*>(&scale64), &f};
-        const long long blocks = (rows * pl.ot + b->rows - 1) / b->rows;
+        const long long blocks = ::kdft::row_blocks(rows, pl.ot, b->rows, b->order);
+        if (blocks > 0x7fffffffLL) return bad("want at most 2^31-1 row-pass blocks");
         const rtc::Result r = rtc::driver_api().LaunchKernel(
             b->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1, 0,
             reinterpret_cast<rtc::Stream>(stream), args, nullptr);
@@ -198,7 +206,7 @@ ffi::Error launch(lrx::gpu::Stream stream, ffi::ScratchAllocator* scratch, int m
     const Built* rfirst = nullptr;
     const Built* rlast = nullptr;
     FFI_RETURN_IF_ERROR(build(5, 0, pl.grid, pl.ot, pl.rows, f32, cache_dir, &rfirst));
-    if (mode == 4) FFI_RETURN_IF_ERROR(build(5, out, pl.grid, pl.ot, pl.rows, f32, cache_dir, &rlast));
+    if (mode == 4) FFI_RETURN_IF_ERROR(build(5, out, pl.grid, pl.ot, pl.last, f32, cache_dir, &rlast, pl.order));
     std::vector<rtc::Function> fns(pl.cols.size());
     for (size_t i = 0; i < pl.cols.size(); ++i)
         FFI_RETURN_IF_ERROR(build_pass(pl.cols[i], f32, cache_dir, &fns[i]));

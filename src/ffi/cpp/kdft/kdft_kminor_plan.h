@@ -45,6 +45,20 @@ constexpr long long kMinorBudget = 32 * 1024;
 constexpr int kRowsMax = 64;
 // Mode 4 out_layout 1 takes the split arm when the single arm would hold fewer rows per block.
 constexpr int kL1RowsMin = 2;
+// The split arm's out_layout-1 store (its last row pass, LRX_OUT 1 with LRX_SPLIT > 1): a block
+// owns C consecutive operand rows of one o_T and the pass takes its own rows per block
+// (power-of-two runs; the first pass keeps layout 0's odd rows).  The block ORDER and C follow
+// the store's k stride, M*cbytes (M = d1*d2*d3*d4): a multiple of kL1Stride takes order 0 (row
+// chunks fastest, one o_T in flight) and the kLdsMax budget where that reaches kL1WideRows rows,
+// else order 1 (o_T fastest) and kMinorBudget.  Measured, one MI250X GCD, mode 4, ~1 GB c128,
+// ms per call, order 0 / order 1 (pool log kminfin_sweep2; layout 0 in brackets):
+//   16^3  M=4096  10.56 / 12.81 (6.62)    M=3600  7.66 / 6.53 (5.84)
+//   64^2  M=4096   7.73 (C=32) / 11.09 (5.95)   M=3600  7.90 / 5.22 (5.24)
+//   128x64 M=4096 11.55 (C=32) / 12.85 (7.52)   M=1936 12.50 / 7.06 (7.10)
+//   20^3  M=1024   3.90 / 4.16 (3.40)     12^3 M=9216 6.56 / 7.10 (4.60), M=9604 6.72 / 6.68 (4.81)
+// Squares of chunks x o_T (16 or 64 chunks) and C=32 under order 1 lost on every shape.
+constexpr long long kL1Stride = 4096;
+constexpr int kL1WideRows = 32;
 
 // The LDS one row-pass block takes: the padded tile, the twiddles, the per-row tables.
 inline long long minor_lds_bytes(long long nk, int c, int ntw, long long cbytes) {
@@ -57,11 +71,12 @@ inline long long minor_lds_bytes(long long nk, int c, int ntw, long long cbytes)
 // (one GCD) 8x8x1 3.98 -> 3.11, 6x6x6 4.87 -> 4.09, 8x8x8 4.45 -> 3.99 ms, while odd rows win for
 // mode 5 and layout 0 (8x8x8: 1.73 -> 1.34 and 3.36 -> 2.53 ms).
 struct Rows { int c = 0, w = 0; };
-inline Rows rows_per_block(long long nk, int ntw, long long cbytes, bool pow2) {
+inline Rows rows_per_block(long long nk, int ntw, long long cbytes, bool pow2,
+                           long long budget = kMinorBudget) {
     auto fits = [&](int w) { return minor_lds_bytes(nk, w, ntw, cbytes) <= kLdsMax; };
     if (!fits(1)) return {};
     int p = kRowsMax;
-    while (p > 1 && nk * (p | 1) * cbytes > kMinorBudget) p /= 2;
+    while (p > 1 && nk * (p | 1) * cbytes > budget) p /= 2;
     while (p > 1 && !fits(p | 1)) p /= 2;
     return pow2 ? Rows{p, p | 1} : Rows{p | 1, p | 1};
 }
@@ -79,23 +94,38 @@ struct MinorPlan {
     bool split = false;
     std::array<int, 3> grid{1, 1, 1};   // the row pass's k axes (the whole grid when single)
     long long ot = 1;                   // O_T: row-pass rows per operand row (1 when single)
-    Rows rows;                          // the row pass's C, W (each row pass shares them)
+    Rows rows;                          // the row pass's C, W (the first row pass, or the single arm)
+    Rows last;                          // the split arm's last row pass (mode 4): == rows except
+                                        // for out_layout 1, whose store takes its own
+    int order = -1;                     // that store's block order (l1_order; -1: no such store)
     std::vector<Pass> cols;             // column passes in launch order (split arm)
     double cost = 0;
 };
 
 // The row-pass rows for a (sub)grid: out_layout 1 stores take aligned power-of-two row runs.
-inline Rows minor_rows(const std::array<int, 3>& g, long long cbytes, bool pow2) {
-    return rows_per_block(1LL * g[0] * g[1] * g[2], g[0] + g[1] + g[2], cbytes, pow2);
+inline Rows minor_rows(const std::array<int, 3>& g, long long cbytes, bool pow2,
+                       long long budget = kMinorBudget) {
+    return rows_per_block(1LL * g[0] * g[1] * g[2], g[0] + g[1] + g[2], cbytes, pow2, budget);
 }
+// Blocks of one row pass over `rows` operand rows: rows*O_T/C, or for the split arm's
+// out_layout-1 store (order 0 | 1; -1 for every other pass) one block per (row chunk, o_T).
+inline long long row_blocks(long long rows, long long ot, int c, int order) {
+    if (order < 0) return (rows * ot + c - 1) / c;
+    return (rows + c - 1) / c * ot;
+}
+// The out_layout-1 store's block order for a k stride of kstride_bytes (above).
+inline int l1_order(long long kstride_bytes) { return kstride_bytes % kL1Stride == 0 ? 0 : 1; }
 
 // The plan of one call; .rows.c == 0 when no arm fits (refused, GATE kdft-kminor-tile).
-inline MinorPlan plan_kminor(int nkx, int nky, int nkz, int mode, int forward, int out, long long cbytes) {
+// m: the operand's rows per d0 index (d1*d2*d3*d4), whose stride orders the out_layout-1 store.
+inline MinorPlan plan_kminor(int nkx, int nky, int nkz, int mode, int forward, int out, long long cbytes,
+                             long long m = 1) {
     const int ax[3] = {nkx, nky, nkz};
     const long long nk = 1LL * nkx * nky * nkz;
     MinorPlan best;
     best.grid = {nkx, nky, nkz};
     best.rows = minor_rows(best.grid, cbytes, out == 1);
+    best.last = best.rows;
     if (best.rows.c) {
         best.cost = row_cost(nk, best.rows, cbytes);
         if (!(mode == 4 && out == 1 && best.rows.c < kL1RowsMin)) return best;   // the single arm
@@ -114,9 +144,16 @@ inline MinorPlan plan_kminor(int nkx, int nky, int nkz, int mode, int forward, i
         for (int a = tlo; a < thi; ++a) { p.grid[a] = ax[a]; gt *= ax[a]; }
         if (gt == 1) continue;                                 // a unit trailing group: another cut
         p.ot = nk / gt;
-        const bool last_pow2 = mode == 4 && out == 1;
-        p.rows = minor_rows(p.grid, cbytes, last_pow2);
-        if (p.rows.c == 0) continue;
+        p.rows = minor_rows(p.grid, cbytes, false);
+        if (mode == 4 && out == 1) {
+            p.order = l1_order(m * cbytes);
+            p.last = minor_rows(p.grid, cbytes, true);
+            const Rows wide = minor_rows(p.grid, cbytes, true, kLdsMax);
+            if (p.order == 0 && wide.c >= kL1WideRows) p.last = wide;
+        } else {
+            p.last = p.rows;
+        }
+        if (p.rows.c == 0 || p.last.c == 0) continue;
         std::vector<Pass> groups;
         bool ok = true;
         for (size_t i = 0; i + 1 < runs.size(); ++i) {
@@ -143,7 +180,7 @@ inline MinorPlan plan_kminor(int nkx, int nky, int nkz, int mode, int forward, i
             for (size_t i = 1; i < groups.size(); ++i) { Pass c = groups[i]; c.mode = 3; c.forward = 0; p.cols.push_back(c); }
             p.cols.push_back(conv);
             for (size_t i = groups.size() - 1; i >= 1; --i) { Pass c = groups[i]; c.mode = 3; c.forward = 1; p.cols.push_back(c); }
-            p.cost = 2 * rc;
+            p.cost = rc + row_cost(gt, p.last, cbytes);
         }
         for (const Pass& c : p.cols) p.cost += c.cost;
         if (best.rows.c == 0 || p.cost < best.cost) best = p;
