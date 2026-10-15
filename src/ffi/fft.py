@@ -189,11 +189,12 @@ _ROCM_KLEAD_TARGETS = {"kconv_klead": KDFT_KCONV_KLEAD_TARGET,
 #: MI250X, not an LDS limit: every grid with nk <= 10240 and axes <= 128 (docs/architecture/kconv.md).
 KDFT_NK_MAX = 10240
 KDFT_AXIS_MAX = 128
-#: The k-minor pair's verified range (cpp/kdft/kdft_kminor_ffi.cc rows_per_block): one row's
-#: complex128 k tile in a block's LDS, as modes 4/5 on CUDA, which have no split arm, and the
-#: axes the k-minor gate was run at (kdft_core.h line DFT).  Kept apart from KDFT_NK_MAX /
-#: KDFT_AXIS_MAX, which the k-leading pair's multi-pass route widens.
-KDFT_KMINOR_NK_MAX = 3904
+#: The k-minor pair's verified range (cpp/kdft/kdft_kminor_ffi.cc, plan kdft_kminor_plan.h): the
+#: single arm (a block owns whole rows) while one row's k tile fits and is the cheaper plan, else
+#: the split arm (row passes over the trailing axis group, k-leading column passes over the
+#: others, the K multiply fused in one; 2*(groups-1)+1 HBM passes for mode 4), so the bounds are
+#: the k-leading pair's: every grid with nk <= 10240 and axes <= 128 (the gate range).
+KDFT_KMINOR_NK_MAX = 10240
 KDFT_KMINOR_AXIS_MAX = 128
 #: The ROCM leg's k-box symmetry unfold (cpp/kdft/kbox_unfold_ffi.cc): mode 7 on the k-box stage
 #: (cufft/kbox_stage.cuh, its line transform the kdft direct DFT under hipRTC), the operands and
@@ -419,16 +420,16 @@ def kdft_refusal(kgrid) -> str:
 
 
 def kdft_kminor_refusal(kgrid) -> str:
-    """Why the k-minor kdft pair cannot serve ``kgrid`` ("" when it can): one row's k tile
-    beyond a block's LDS (modes 4/5 have no split arm on either leg)."""
+    """Why the k-minor kdft pair cannot serve ``kgrid`` ("" when it can): a grid beyond its
+    verified range (the single and split arms together cover nk <= KDFT_KMINOR_NK_MAX)."""
     kg = tuple(int(v) for v in kgrid)
     nk = kg[0] * kg[1] * kg[2]
     if max(kg) > KDFT_KMINOR_AXIS_MAX:
         return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_KMINOR_AXIS_MAX} "
                 f"(the k-minor pair's verified range)")
     if nk > KDFT_KMINOR_NK_MAX:
-        return (f"GATE kdft-kminor-tile: got nk={nk}; want one row's complex128 k tile in a block's "
-                f"64 KiB of LDS (nk <= {KDFT_KMINOR_NK_MAX}; modes 4/5 have no split arm)")
+        return (f"GATE kdft-nk: got nk={nk}; want nk <= {KDFT_KMINOR_NK_MAX} "
+                f"(the k-minor pair's verified range)")
     return ""
 
 

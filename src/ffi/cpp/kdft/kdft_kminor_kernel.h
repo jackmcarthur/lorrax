@@ -12,6 +12,16 @@
 //            (LRX_OUT 0, may alias X) or (d0, nk, d3, d1, d4, d2) (LRX_OUT 1)
 //   mode 5   Y[r, :] = scale * (forward ? fftn : ifftn)(X[r, :])   (rows, nk), may alias X
 //
+// The SPLIT arm (kdft_kminor_ffi.cc, nk past one block's tile) uses this kernel as its ROW pass:
+// LRX_NX..NZ are then the trailing axis group (G = NK points, contiguous within a row) and
+// LRX_SPLIT = O_T = nkf / NK the points of the axes before it, so the pass transforms rows*O_T
+// row-pass rows of NK.  Row-pass row r' is the run of (operand row r, leading index ot) at
+// r*nkf + ot*NK: r' = r*O_T + ot (ot fastest, so a block reads one contiguous C*NK run), except
+// for the LRX_OUT 1 store, r' = ot*rows + r (r fastest, so the permuted store writes runs of
+// consecutive operand rows).  Mode 5 then also takes LRX_OUT 1 (the split arm's last pass).
+// (r fastest everywhere ran 3x slower on power-of-two nk, whose row stride nk*16 B lands every
+// block's runs on the same HBM channels: 16^3 mode 5 10.3 ms, pool log kcore_after2.)
+//
 // One block owns C consecutive rows: a contiguous C*nk run of HBM, read once and written once.
 // The tile is staged TRANSPOSED in LDS, s[k*W + c], W odd and >= C (a zeroed pad column when
 // W > C): the DFT core (kdft_core.h, a mixed-radix Stockham line DFT on any (G, W) tile, lanes
@@ -20,39 +30,77 @@
 // unchanged, as embedded rtc headers shared with the k-leading kernel.
 //
 // Compile-time constants (deciding options, so they are in the image key):
-//   LRX_NX, LRX_NY, LRX_NZ   the k-grid
+//   LRX_NX, LRX_NY, LRX_NZ   the k-grid (the split arm: the trailing axis group)
+//   LRX_SPLIT                1, or the split arm's O_T (row-pass rows per operand row)
 //   LRX_C                    rows per block
 //   LRX_W                    the LDS tile's width, odd, C <= W <= C + 1 (the tile is NK*W complex)
 //   LRX_NT                   threads per block
 //   LRX_MODE                 4 (convolution) | 5 (one transform)
-//   LRX_OUT                  mode 4's store: 0 (X's layout) | 1 ((d0, nk, d3, d1, d4, d2))
+//   LRX_OUT                  the store: 0 (X's layout) | 1 ((d0, nk, d3, d1, d4, d2): mode 4, or a
+//                            split arm's last row pass)
 //   LRX_F32                  0 (complex128) | 1 (complex64)
 
 #include "kdft_core.h"
 
+#ifndef LRX_SPLIT
+#define LRX_SPLIT 1
+#endif
 #define NK (LRX_NX * LRX_NY * LRX_NZ)
+#define NKF (NK * LRX_SPLIT)
 #define NTW (LRX_NX + LRX_NY + LRX_NZ)
 #if LRX_W % 2 == 0 || LRX_W < LRX_C || LRX_W > LRX_C + 1
 #error "LRX_W must be odd and C or C + 1: the transposing load/store relies on an odd row stride"
 #endif
 
-// x: the (rows, nk) operand; y: the result (== x when aliased: a block reads its rows whole
-// before it stores them, and stores only its own rows in layout 0 and mode 5).
-// kern: K (m0, nk) (mode 4).  d1..d4: X's extents (mode 4); rows < 2^31 (the host checks).
+// x: the (rows, nkf) operand; y: the result (== x when aliased: a block reads its rows whole
+// before it stores them, and stores only its own rows in layout 0).  kern: K (m0, nk) (mode 4).
+// d1..d4: X's extents (mode 4 and LRX_OUT 1); rows*LRX_SPLIT < 2^31 (the host checks).
 extern "C" __global__ void __launch_bounds__(LRX_NT)
 lrx_kdft_kminor(const cplx* x, const cplx* __restrict__ kern, cplx* y, int rows,
                 int d1, int d2, int d3, int d4, real scale, int forward) {
     __shared__ cplx s[NK * LRX_W];
     __shared__ cplx tw[NTW];
+    __shared__ long long roff[LRX_C];                           // a tile row's first element
+#if LRX_MODE == 4
+    __shared__ int krow[LRX_C];                                 // K's row of each tile row
+#endif
+#if LRX_OUT == 1
+    __shared__ long long obase[LRX_C];                          // layout 1: the row's offset at k = 0
+#endif
+    const int nrp = rows * LRX_SPLIT;                           // row-pass rows
     const int r0 = blockIdx.x * LRX_C;
-    const long long off0 = static_cast<long long>(r0) * NK;     // the tile's first element
-    const int nr = rows - r0 < LRX_C ? rows - r0 : LRX_C;      // live rows of this tile
-    const int live = nr * NK;
+    const int nr = nrp - r0 < LRX_C ? nrp - r0 : LRX_C;        // live rows of this tile
 
     kdft::fill_twiddles<LRX_NX, LRX_NY, LRX_NZ, LRX_NT>(tw);
-    for (int e = threadIdx.x; e < NK * LRX_C; e += LRX_NT) {    // contiguous HBM run
+    for (int c = threadIdx.x; c < nr; c += LRX_NT) {
+        const int rp = r0 + c;
+#if LRX_OUT == 1
+        const int r = LRX_SPLIT > 1 ? rp % rows : rp, ot = LRX_SPLIT > 1 ? rp / rows : 0;
+#else
+        const int r = rp / LRX_SPLIT, ot = rp % LRX_SPLIT;
+#endif
+        roff[c] = static_cast<long long>(r) * NKF + static_cast<long long>(ot) * NK;
+#if LRX_MODE == 4 || LRX_OUT == 1
+        int t = r;
+        const int i4 = t % d4; t /= d4;
+        const int i3 = t % d3; t /= d3;
+        const int i2 = t % d2; t /= d2;
+        const int i1 = t % d1; const int i0 = t / d1;
+#if LRX_MODE == 4
+        krow[c] = i1 * d2 + i2;
+#endif
+#if LRX_OUT == 1
+        obase[c] = static_cast<long long>(i0) * NKF * d1 * d2 * d3 * d4 +
+                   ((static_cast<long long>(i3) * d1 + i1) * d4 + i4) * d2 + i2 +
+                   static_cast<long long>(ot) * NK * d1 * d2 * d3 * d4;
+#endif
+        (void)i0; (void)i3; (void)i4;
+#endif
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < NK * LRX_C; e += LRX_NT) {    // runs of NK (one HBM run when SPLIT = 1)
         const int c = e / NK, k = e - c * NK;
-        s[k * LRX_W + c] = e < live ? x[off0 + e] : cplx{0, 0};
+        s[k * LRX_W + c] = c < nr ? x[roff[c] + k] : cplx{0, 0};
     }
     if (LRX_W > LRX_C)                                          // the pad column: zeros
         for (int k = threadIdx.x; k < NK; k += LRX_NT) s[k * LRX_W + LRX_C] = cplx{0, 0};
@@ -60,29 +108,10 @@ lrx_kdft_kminor(const cplx* x, const cplx* __restrict__ kern, cplx* y, int rows,
 
 #if LRX_MODE == 4
     (void)forward;
-    __shared__ int krow[LRX_C];                                 // K's row of each tile row
-#if LRX_OUT == 1
-    __shared__ long long obase[LRX_C];                          // layout 1: the row's offset at k = 0
-#endif
-    for (int c = threadIdx.x; c < LRX_C; c += LRX_NT) {
-        int t = r0 + c;
-        const int i4 = t % d4; t /= d4;
-        const int i3 = t % d3; t /= d3;
-        const int i2 = t % d2; t /= d2;
-        const int i1 = t % d1; const int i0 = t / d1;
-        krow[c] = i1 * d2 + i2;
-#if LRX_OUT == 1
-        obase[c] = static_cast<long long>(i0) * NK * d1 * d2 * d3 * d4 +
-                   ((static_cast<long long>(i3) * d1 + i1) * d4 + i4) * d2 + i2;
-#else
-        (void)i0; (void)i3; (void)i4;
-#endif
-    }
-    __syncthreads();                                            // an all-N=1 grid has no stage barrier
     kdft::dft3<LRX_NX, LRX_NY, LRX_NZ, LRX_W, LRX_NT>(s, tw, real(1));
-    for (int e = threadIdx.x; e < live; e += LRX_NT) {          // K read k-contiguous
+    for (int e = threadIdx.x; e < nr * NK; e += LRX_NT) {       // K read k-contiguous
         const int c = e / NK, k = e - c * NK;
-        const cplx w = kern[static_cast<long long>(krow[c]) * NK + k];
+        const cplx w = kern[static_cast<long long>(krow[c]) * NKF + k];
         const cplx a = s[k * LRX_W + c];
         s[k * LRX_W + c] = cplx{scale * (a.x * w.x - a.y * w.y), scale * (a.x * w.y + a.y * w.x)};
     }
@@ -90,13 +119,16 @@ lrx_kdft_kminor(const cplx* x, const cplx* __restrict__ kern, cplx* y, int rows,
     kdft::dft3<LRX_NX, LRX_NY, LRX_NZ, LRX_W, LRX_NT>(s, tw, real(-1));
     const real out_scale = real(1);
 #else
-    (void)kern; (void)d1; (void)d2; (void)d3; (void)d4;
+    (void)kern;
+#if LRX_OUT == 0
+    (void)d1; (void)d2; (void)d3; (void)d4;
+#endif
     kdft::dft3<LRX_NX, LRX_NY, LRX_NZ, LRX_W, LRX_NT>(s, tw, forward ? real(-1) : real(1));
     const real out_scale = scale;
 #endif
     if (NK == 1) __syncthreads();                               // no stage ran, so no stage barrier
 
-#if LRX_MODE == 4 && LRX_OUT == 1
+#if LRX_OUT == 1
     // (d0, nk, d3, d1, d4, d2): element (row, k) at obase[row] + k*d1*d2*d3*d4; rows fastest
     // across threads, so runs of consecutive i2 (rows with d3*d4 == 1) are contiguous.
     const long long kstride = static_cast<long long>(d1) * d2 * d3 * d4;
@@ -106,10 +138,10 @@ lrx_kdft_kminor(const cplx* x, const cplx* __restrict__ kern, cplx* y, int rows,
         y[obase[c] + k * kstride] = cplx{out_scale * v.x, out_scale * v.y};
     }
 #else
-    for (int e = threadIdx.x; e < live; e += LRX_NT) {          // contiguous HBM run
+    for (int e = threadIdx.x; e < nr * NK; e += LRX_NT) {
         const int c = e / NK, k = e - c * NK;
         const cplx v = s[k * LRX_W + c];
-        y[off0 + e] = cplx{out_scale * v.x, out_scale * v.y};
+        y[roff[c] + k] = cplx{out_scale * v.x, out_scale * v.y};
     }
 #endif
 }
