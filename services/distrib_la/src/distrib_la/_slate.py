@@ -22,9 +22,10 @@ from typing import Dict, Literal, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la import loader
+from distrib_la._cyclic import cyclic_to_block, largest_divisor, pad_with_sentinels
 from jax import shard_map
 from distrib_la.resolve import mesh_key, mesh_platform
 
@@ -34,7 +35,7 @@ __all__ = [
     "validate_mesh", "validate_tile_layout",
     # single-matrix ops
     "SlateLowerL", "distributed_cholesky",
-    "distributed_eigh",
+    "distributed_eigh", "eigh_layout",
     # the distributed LU family (ROCM leg): fused + split getrf/getrs
     "batched_distributed_solve_lu",
     "batched_distributed_getrf",
@@ -390,9 +391,47 @@ Layout: same scheme as ``distributed_cholesky`` — per-rank local
 transpose on the input (row-major JAX shard → col-major bytes for
 SLATE) paired with the C++ comm rank-remap, and a local untranspose on
 the returned eigenvector tiles.
+
+Block size: block-cyclic by relabeling (:mod:`distrib_la._cyclic`).  SLATE
+reads the operand's own ``(n/p, n/p)`` buffers with a small tile ``nb``
+(``nb | n/p``), i.e. ``Pi A Pi^T``; the eigenvector rows come back in ``A``'s
+order and only the eigenvalue index (Q's columns, over ``'y'``) is permuted
+back, by one ``all_to_all``.  The tile matters because heev's second stage
+(``hb2st``, band -> tridiagonal) runs on rank 0's HOST at band width ``nb``
+(cost ~ n^2 nb) after a gather of the band to rank 0: at one tile per rank
+(``nb = n/p``) that stage dominated (f64 n 8192, 2x2: 146 s vs 2.8 s for a
+single-GCD native eigh, SLATE_HIP_REPORT).  :func:`eigh_layout` picks the
+tile; :data:`_EIGH_BLOCK_MIN`/:data:`_EIGH_BLOCK_MAX` were measured on MI250X
+(SLATE_PERF_REPORT).
 """
 
 _EIGH_FFI_TARGET = "lorrax_slate_eigh"
+
+#: The heev tile range (measured: SLATE_PERF_REPORT, P4 MI250X).
+_EIGH_BLOCK_MAX = 256
+_EIGH_BLOCK_MIN = 128
+
+_JIT_CACHE: dict = {}
+
+
+def eigh_layout(n: int, p: int) -> Tuple[int, int]:
+    """``(N, nb)``: the side an ``n x n`` heev solves at on a ``p x p`` grid, and its tile.
+
+    ``(n, nb)`` with ``nb`` the largest divisor of ``n/p`` at most
+    :data:`_EIGH_BLOCK_MAX`, when that is at least :data:`_EIGH_BLOCK_MIN` or
+    ``n/p`` is at most :data:`_EIGH_BLOCK_MAX` (then ``nb = n/p``, one tile per
+    rank).  Otherwise each rank's tile is padded to the smallest edge with a
+    divisor in the range (at most ``_EIGH_BLOCK_MIN - 1`` rows per rank); the
+    padded rows carry sentinel eigenvalues below the spectrum
+    (:func:`distrib_la._cyclic.pad_with_sentinels`), dropped on return.
+    """
+    local = n // p
+    block = largest_divisor(local, _EIGH_BLOCK_MAX)
+    if local <= _EIGH_BLOCK_MAX or block >= _EIGH_BLOCK_MIN:
+        return n, block
+    padded = next(m for m in range(local + 1, local + _EIGH_BLOCK_MIN + 1)
+                  if largest_divisor(m, _EIGH_BLOCK_MAX) >= _EIGH_BLOCK_MIN)
+    return p * padded, largest_divisor(padded, _EIGH_BLOCK_MAX)
 
 
 def distributed_eigh(
@@ -401,6 +440,7 @@ def distributed_eigh(
     mesh: Mesh,
     compute_evecs: bool = True,
     block_size: int | None = None,
+    side: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition via SLATE's ``heev``.
 
@@ -417,13 +457,12 @@ def distributed_eigh(
         If False, only eigenvalues are meaningful; ``Q`` is still returned
         but its contents are unspecified.
     block_size
-        Override SLATE's tile size ``nb``.  Default ``n/p``, which is the
-        ONLY value for which JAX's block sharding coincides with SLATE's
-        block-cyclic tile grid on a multi-rank mesh — overriding it there
-        makes SLATE assemble a permuted global matrix (eigenvalues survive
-        the symmetric permutation; eigenvectors do not).  Overriding is
-        therefore rejected on multi-rank meshes; on a 1×1 mesh any ``nb``
-        is layout-safe.
+        SLATE's tile ``nb``, a divisor of the solve tile ``N/p``; default
+        :func:`eigh_layout`'s.  Any divisor is layout-safe (relabeling, see
+        the section note); ``N/p`` is the former one-tile-per-rank layout.
+    side
+        The solve side ``N >= n``, a multiple of ``p``; default
+        :func:`eigh_layout`'s (``side=n`` is the unpadded layout, for benches).
 
     Returns
     -------
@@ -447,48 +486,67 @@ def distributed_eigh(
     ensure_registered(mesh)
     ctx_key = context_key(mesh)
 
-    nb = n // p if block_size is None else int(block_size)
-    validate_tile_layout(n, nb, p, q, what="distributed_eigh")
+    if side is None:
+        side, default = eigh_layout(n, p)
+    else:
+        side = int(side)
+        default = largest_divisor(side // p, _EIGH_BLOCK_MAX)
+    nb = default if block_size is None else int(block_size)
+    if side < n or side % p or nb < 1 or (side // p) % nb:
+        raise ValueError(
+            f"distributed_eigh: tile {nb} does not divide the solve tile "
+            f"{side // p} (side {side}, {p}x{q} mesh).")
 
-    local_rows = n // p
-    local_cols = n // q
-    # Real-part dtype for eigenvalues (float64 for both F64 and C128).
-    w_dtype = jnp.float64 if A.dtype in (jnp.complex128, jnp.float64) \
-        else jnp.float32
-    W_local = jax.ShapeDtypeStruct((n,), w_dtype)               # replicated
-    # Q comes back as SLATE col-major tiles = row-major bytes of the
-    # per-rank block of Q^T; assembled at P('y','x') then locally
-    # untransposed (square mesh: local shape is (n/q, n/p)).
-    Q_local_T = jax.ShapeDtypeStruct((local_cols, local_rows), A.dtype)
+    key = ("eigh", mesh_key(mesh), A.dtype, n, side, nb,
+           bool(compute_evecs), int(ctx_key))
+    jit_eigh = _JIT_CACHE.get(key)
+    if jit_eigh is None:
+        local = side // p
+        # Real-part dtype for eigenvalues (float64 for both F64 and C128).
+        w_dtype = jnp.float64 if A.dtype in (jnp.complex128, jnp.float64) \
+            else jnp.float32
+        W_local = jax.ShapeDtypeStruct((side,), w_dtype)            # replicated
+        # Q comes back as SLATE col-major tiles = row-major bytes of the
+        # per-rank block of Q^T; assembled at P('y','x') then locally
+        # untransposed (square mesh: local shape is (N/q, N/p)).
+        Q_local_T = jax.ShapeDtypeStruct((local, local), A.dtype)
+        attrs = dict(n=side, nb=nb, ctx_key=int(ctx_key),
+                     compute_evecs=bool(compute_evecs))
 
-    attrs = dict(
-        n=n, nb=nb,
-        ctx_key=int(ctx_key),
-        compute_evecs=bool(compute_evecs),
-    )
+        @partial(shard_map,
+                 mesh=mesh,
+                 in_specs=P("x", "y"),
+                 out_specs=(P(), P("x", "y")),
+                 check_vma=False)
+        def _call(local_A):
+            # Local transpose: row-major shard bytes → col-major block, the
+            # layout SLATE reads (pure local op, pairs with the C++ comm
+            # rank-remap).  Same convention as distributed_cholesky.
+            local_A_T = jnp.transpose(local_A, (1, 0))
+            W, Q_T = jax.ffi.ffi_call(
+                _EIGH_FFI_TARGET, (W_local, Q_local_T))(local_A_T, **attrs)
+            # Q_T's rows are Q's columns: the eigenvalue index, over 'y',
+            # laid out block-cyclically at nb < N/p.  Put them in W's
+            # ascending order, then untranspose (Q at P('x','y')).
+            if compute_evecs and nb != local:
+                Q_T = cyclic_to_block(Q_T, n=side, p=q, mb=nb, axis="y")
+            return W, jnp.transpose(Q_T, (1, 0))
 
-    @partial(shard_map,
-             mesh=mesh,
-             in_specs=P("x", "y"),
-             out_specs=(P(), P("y", "x")),
-             check_vma=False)
-    def _call(local_A):
-        # Local transpose: row-major shard bytes → col-major block, the
-        # layout SLATE reads (pure local op, pairs with the C++ comm
-        # rank-remap).  Same convention as distributed_cholesky.
-        local_A_T = jnp.transpose(local_A, (1, 0))
-        return jax.ffi.ffi_call(
-            _EIGH_FFI_TARGET, (W_local, Q_local_T))(local_A_T, **attrs)
+        face = NamedSharding(mesh, P("x", "y"))
 
-    W, Q_T = _call(A)
+        def _padded(a):
+            whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)
+            W, Q = _call(whole)
+            # The sentinels are the side - n lowest eigenpairs; Q holds
+            # columns, of which the first n rows are a's.
+            W, Q = W[side - n:], Q[:n, side - n:]
+            return W, jax.lax.with_sharding_constraint(Q, face)
 
-    @partial(shard_map, mesh=mesh,
-             in_specs=P("y", "x"), out_specs=P("x", "y"),
-             check_vma=False)
-    def _untranspose(local_Q_T):
-        return jnp.transpose(local_Q_T, (1, 0))
+        # No donation: plan.DONATES declares eigh as donating nothing.
+        jit_eigh = jax.jit(_call if side == n else _padded)
+        _JIT_CACHE[key] = jit_eigh
 
-    return W, _untranspose(Q_T)
+    return jit_eigh(A)
 
 
 # =========================================================================
