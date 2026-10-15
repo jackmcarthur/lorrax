@@ -203,6 +203,16 @@ XLA route. The device leg the process hosts opens before the host leg
 [ffi-build](../installation/ffi-build.md)). A sealed bundle binds the host leg
 and exactly one device leg.
 
+**Native families per leg.** `src/ffi/common/families.py` (`FAMILIES`) is the
+one declaration of which native family each leg serves: `built` (the leg's
+library registers the family's targets, gated against the same-device XLA
+route at the row's `gate`/`tol`), `xla`, `elsewhere` (another family serves
+the operation, named), `host` (a `pure_callback`) or `refused` (a named GATE).
+`ffi_loader` derives its ROCM shared-family prefixes from it, and
+`tests/test_platform_legs.py` checks it against both loaders' target tables,
+`ffi.fft`'s ROCm k-leading targets and the ROCM block of `CMakeLists.txt`. A
+family changes state in that file first.
+
 ---
 
 ## 2. The one C++ tree

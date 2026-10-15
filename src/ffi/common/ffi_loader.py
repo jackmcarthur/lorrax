@@ -208,7 +208,11 @@ _HOST_TARGET_SYMBOLS = {
 #: (``LRX_PHDF_HANDLER(<X>)`` is ``<X>Ffi`` on both); only one device leg is
 #: ever loaded in a process.  A family joins this table when it joins
 #: ``CMakeLists.txt``'s ROCM source list.
-_ROCM_FAMILIES = ("lorrax_phdf5_",)
+#: Derived from :data:`ffi.common.families.FAMILIES`: the families built on ROCM whose
+#: sources the CUDA leg also builds.
+from ffi.common.families import built_prefixes as _built_prefixes
+_ROCM_FAMILIES = tuple(p for p in _built_prefixes("ROCM")
+                       if any(t.startswith(p) for t in _CUDA_TARGET_SYMBOLS))
 #: The ROCM leg's own families: leg-neutral sources the CUDA leg does not build because it
 #: serves the same operation another way.  The k-leading direct-DFT pair (cpp/kdft/,
 #: hipRTC-built; CUDA uses the nvidia-mathdx modes 2/3): ffi.fft._ROCM_KLEAD_TARGETS.

@@ -34,6 +34,25 @@ def test_the_cuda_and_host_legs_keep_their_historical_facts():
                                  "build_host", "_host", "lorrax_ffi_host_abi_version")
 
 
+def test_the_runtime_vendor_facts_are_declared_per_leg():
+    """The CUDA row carries the values the runtime hard-coded before they were leg facts;
+    the host leg declares none (exact-zero scratch, no reader, no collective library)."""
+    cuda, rocm, host = legs.LEGS["CUDA"], legs.LEGS["ROCM"], legs.LEGS["cpu"]
+    fields = ("fft_plan_scratch", "outside_pool_api", "memory_telemetry",
+              "collective_library", "collective_net_plugin")
+    assert tuple(getattr(cuda, f) for f in fields) == (
+        "cufft", "cuda_driver_mempool", "nvidia-smi", "nccl", "libnccl-net.so")
+    assert tuple(getattr(rocm, f) for f in fields) == (
+        "hipfft", "hip_runtime_arena", "hip_runtime", "rccl", "librccl-net.so")
+    assert all(not getattr(host, f) for f in fields) and host.profiler == ()
+    assert cuda.profiler[2] == 0 and rocm.profiler == ("rocprofv3", "librocprofiler-sdk-tool", 1)
+    from runtime import aot_memory, xla_memory
+    for leg in (cuda, rocm):
+        assert leg.fft_plan_scratch in aot_memory._PLAN_APIS
+        assert leg.outside_pool_api in xla_memory._OUTSIDE_POOL_READERS
+        assert leg.memory_telemetry in xla_memory._TELEMETRY
+
+
 def test_every_leg_fact_that_must_be_distinct_is_distinct():
     """Both libraries are dlopened RTLD_GLOBAL in one process: a shared file name,
     pin, C-ABI suffix or ABI symbol lets one leg answer for another."""
@@ -188,3 +207,30 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     block = block[:block.index("add_library(")]
     assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in block and "cufft/" not in block
     assert "kdft/kdft_klead_ffi.cc" in block and "common/rtc_build.cc" in block
+
+
+def test_the_family_table_matches_the_loaders_routers_and_build():
+    """ffi.common.families is the one per-leg declaration: every registered target belongs to
+    a family built on its leg, every built family registers a target there, the ROCm k-leading
+    router serves kdft targets only, and the ROCM CMake block compiles each ROCM-built family."""
+    from ffi.common import families as fam
+    ffi_loader, dl = _loaders()
+    for leg in legs.LEGS:
+        targets = set(ffi_loader._PLATFORMS[leg]["targets"]) | set(dl._PLATFORMS[leg]["targets"])
+        for target in targets:
+            name = fam.family_of(target)
+            assert name is not None, target
+            assert fam.state(name, leg)[0] == "built", (target, leg)
+        for name, row in fam.FAMILIES.items():
+            assert set(row.legs) == set(legs.LEGS) and all(s in fam.STATES for s, _ in row.legs.values())
+            if row.legs[leg][0] == "built":
+                assert any(t.startswith(row.prefixes) for t in targets), (name, leg)
+            if row.legs[leg][0] in ("elsewhere", "refused", "host"):
+                assert row.legs[leg][1], (name, leg)
+    import ffi.fft as fft
+    assert {fam.family_of(t) for t in fft._ROCM_KLEAD_TARGETS.values()} == {"kdft"}
+    cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
+    block = cmake[cmake.index('STREQUAL "rocm"'):]
+    block = block[:block.index("add_library(")]
+    for name, row in fam.FAMILIES.items():
+        assert (f"{row.source}/" in block) == (row.legs["ROCM"][0] == "built"), name
