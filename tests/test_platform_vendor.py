@@ -33,9 +33,9 @@ CASES = [
     (_dev("gpu", "cuda", "PJRT C API\ncuda 13020", "NVIDIA A100-SXM4-80GB"), "cuda", "CUDA"),
     (_dev("gpu", "gpu", "", "NVIDIA H100 80GB HBM3"), "cuda", "CUDA"),
     (_dev("cuda", "", "", ""), "cuda", "CUDA"),
-    (_dev("gpu", "rocm", "rocm 60300", "AMD Instinct MI250X"), "rocm", "rocm"),
-    (_dev("gpu", "gpu", "", "gfx90a"), "rocm", "rocm"),
-    (_dev("rocm", "", "", ""), "rocm", "rocm"),
+    (_dev("gpu", "rocm", "rocm 60300", "AMD Instinct MI250X"), "rocm", "ROCM"),
+    (_dev("gpu", "gpu", "", "gfx90a"), "rocm", "ROCM"),
+    (_dev("rocm", "", "", ""), "rocm", "ROCM"),
     (_dev("gpu", "gpu", "", "Some chipset"), "gpu", "gpu"),       # 'chipset' is not 'hip'
     (_dev("tpu", "tpu", "", "TPU v4"), "tpu", "tpu"),
 ]
@@ -59,7 +59,7 @@ def test_gpu_string_alone_is_not_cuda():
 def test_platform_from_env_per_vendor():
     saved = os.environ.get("JAX_PLATFORMS")
     try:
-        for value, want in (("cuda,cpu", "CUDA"), ("gpu", "CUDA"), ("rocm,cpu", "rocm"),
+        for value, want in (("cuda,cpu", "CUDA"), ("gpu", "CUDA"), ("rocm,cpu", "ROCM"),
                             ("cpu", "cpu"), ("", "CUDA")):
             os.environ["JAX_PLATFORMS"] = value
             assert lxkit.platform_from_env() == want, (value, lxkit.platform_from_env())
@@ -87,7 +87,7 @@ def test_rocm_mesh_never_probes_a_cuda_or_host_library():
         try:
             g.require(rocm)
         except RuntimeError as exc:
-            assert "rocm" in str(exc)
+            assert "ROCM" in str(exc)
         else:
             raise AssertionError("require() served a rocm mesh")
 

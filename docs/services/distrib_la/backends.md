@@ -31,7 +31,7 @@ SONAMEs `libslate.so.2` and `libblaspp.so.2`: the first leg opened decides
 which copy the other binds. The host build is `gpu_backend=none`, whose
 `blas::get_device_count()` is a compiled-in 0, so if it wins, every CUDA SLATE
 handler sees no device and refuses. In any process that can use CUDA the
-loader therefore opens the CUDA leg first (`loader._open_cuda_before_host`,
+loader therefore opens the CUDA leg first (`loader._open_accelerator_before_host`,
 and the same rule in `src/ffi/common/ffi_loader.py`). Before its first
 `dlopen` the loader also imports `h5py` if it is installed, so h5py's HDF5
 symbols bind first; h5py is not a dependency.

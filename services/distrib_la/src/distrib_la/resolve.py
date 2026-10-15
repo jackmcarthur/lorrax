@@ -131,17 +131,17 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 #: ScaLAPACK's routines on the same library and MPI context are clean, so
 #: there is no configuration in which slate is the right CPU eigh.  On
 #: **CUDA** it is cuSOLVERMp, the only library there with a distributed
-#: syevd.  On **rocm** it is SLATE, which is the only one of the three that
+#: syevd.  On **ROCM** it is SLATE, which is the only one of the three that
 #: builds for ROCm at all — declared-untested.
 #:
-#: There is deliberately NO ``('solve_lu', 'rocm')`` row: SLATE ships no
+#: There is deliberately NO ``('solve_lu', 'ROCM')`` row: SLATE ships no
 #: getrf/getrs handler in this tree, so a row would promise a backend that
 #: does not exist.  ``distributed`` LU on ROCm therefore refuses by naming
 #: the platform, which is the true answer.
 _DISTRIBUTED_DEFAULT = {
     ("eigh", "cpu"):      "scalapack",
     ("eigh", "CUDA"):     "cusolvermp",
-    ("eigh", "rocm"):     "slate",
+    ("eigh", "ROCM"):     "slate",
     # solve_lu: the same one-library-per-platform rule.  ScaLAPACK's
     # pXgetrf/pXgetrs on the host lib, cuSOLVERMp's batched getrf/getrs
     # on CUDA — the two backends _IMPL already lists for this op.
@@ -160,10 +160,10 @@ _NATIVE_IMPL = {
 #: A tuple of targets means ALL of them are required.
 _SPEC = {
     ("eigh", "cusolvermp"):     ("lorrax_cusolvermp_eigh",          ("CUDA",)),
-    ("eigh", "slate"):          ("lorrax_slate_eigh",       ("CUDA", "cpu", "rocm")),
+    ("eigh", "slate"):          ("lorrax_slate_eigh",       ("CUDA", "cpu", "ROCM")),
     ("eigh", "scalapack"):      ("lorrax_scalapack_eigh",           ("cpu",)),
     ("cholesky", "cusolvermp"): ("lorrax_cusolvermp_batched_potrf", ("CUDA",)),
-    ("cholesky", "slate"):      ("lorrax_slate_potrf",      ("CUDA", "cpu", "rocm")),
+    ("cholesky", "slate"):      ("lorrax_slate_potrf",      ("CUDA", "cpu", "ROCM")),
     ("solve_lu", "cusolvermp"): (("lorrax_cusolvermp_batched_solve_lu_factors",
                                     "lorrax_cusolvermp_batched_getrf",
                                     "lorrax_cusolvermp_batched_getrs"),
@@ -183,8 +183,8 @@ _SPEC = {
 def mesh_platform(mesh_xy) -> str:
     """The FFI platform key for the mesh's devices.
 
-    ``"cpu"`` / ``"CUDA"`` / ``"rocm"`` from the device vendor; anything
-    else passes through UNMAPPED so a refusal can name what it actually saw
+    ``"cpu"`` / ``"CUDA"`` / ``"ROCM"`` (a :data:`lxkit.legs.LEGS` key) from
+    the device vendor; anything else passes through UNMAPPED so a refusal can name what it actually saw
     (``'tpu'`` reads better than ``'unknown'``).
     """
     return mesh_ffi_platform(mesh_xy, FFI_PLATFORMS)

@@ -303,8 +303,9 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
     backend needs no library.
     """
     from ffi.gate import announce_once, mesh_ffi_platform
-    if mesh_ffi_platform(mesh) == "CUDA":
-        _require_sm80()
+    precondition = _KCONV_DEVICE_PRECONDITION.get(mesh_ffi_platform(mesh))
+    if precondition is not None:
+        precondition()
     backend = kconv_backend(mesh)
     if backend == "mathdx":
         root = mathdx_root()
@@ -362,6 +363,12 @@ def _require_sm80() -> None:
                 "compute_80 and the mathdx kernels use cp.async; fix: run on an A100 or "
                 "newer GPU, or on CPU.")
 
+
+
+
+#: Leg key -> the device check :func:`require_kconv` runs before the router's
+#: backend on that leg.  A leg with no row has no device precondition.
+_KCONV_DEVICE_PRECONDITION = {"CUDA": _require_sm80}
 
 def _probe_host_engines(mesh: Mesh) -> None:
     """Run the plan backend's host engines once at startup: a 2-point FFT on

@@ -108,8 +108,9 @@ def validate_mesh_2d(mesh: Mesh) -> tuple[int, int]:
 
 
 def _platform_for_mesh(mesh: Mesh) -> str:
-    """Which FFI library owns the collective context for ``mesh``: "CUDA",
-    "cpu", or a vendor with no library ("rocm"), which ``get_lib`` refuses by
+    """Which FFI library owns the collective context for ``mesh``: a leg key
+    ("CUDA", "ROCM", "cpu"; a leg whose library is not built is refused by
+    naming its .so) or a vendor with no leg, which ``get_lib`` refuses by
     name.  The phdf5 read handlers are registered under both library platform
     strings (same jax.ffi target names), and the collective open/dataset
     lifecycle must go through the matching .so.

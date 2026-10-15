@@ -176,7 +176,31 @@ each announces which entry it bound.
   Fourier-plan call), `ffi/gemm.py` (host batched GEMM), `ffi/gate.py` (the
   binding of `lxkit.gate`) and `ffi/common/ffi_loader.py`. Distributed dense
   linear algebra and the active subspace are `services/distrib_la`, which
-  opens the same two libraries through its own `distrib_la.loader`.
+  opens the same libraries through its own `distrib_la.loader`.
+
+### Platform legs {#platform-legs}
+
+A *leg* is one library that registers LORRAX's target names under one XLA
+platform. `lxkit.LEGS` (`services/lxkit/src/lxkit/legs.py`) is the one table
+of every fact that differs between legs and that more than one loader needs;
+both loaders, `lxkit.native_provider`, the gate's platform key and
+`runtime`'s device detection read it.
+
+| key | vendor | library | pin | C-ABI suffix | process hosts it when |
+|---|---|---|---|---|---|
+| `cpu` | `cpu` | `liblorrax_ffi_host.so` | `LORRAX_FFI_HOST_SO` | `_host` | always |
+| `CUDA` | `cuda` | `liblorrax_ffi.so` | `LORRAX_FFI_SO` | (none) | `JAX_PLATFORMS` unset or `cuda`/`gpu`, `/dev/nvidia*` (or WSL2's libcuda), `CUDA_VISIBLE_DEVICES` not empty |
+| `ROCM` | `rocm` | `liblorrax_ffi_rocm.so` (not built yet) | `LORRAX_FFI_ROCM_SO` | `_rocm` | `JAX_PLATFORMS` unset or `rocm`, `/dev/kfd`, `ROCR_`/`HIP_VISIBLE_DEVICES` not empty |
+
+What stays with each loader is its own: the target-symbol tables, ctypes
+declarations (`_DEVICE_STACK_DECLARATIONS`: the device leg's communicator and
+solver contexts) and build hints. A per-leg choice at a router is a table
+keyed by the leg, never an `== "CUDA"` branch: `ffi.fft.kconv_backend`'s
+native backend and `_KCONV_DEVICE_PRECONDITION`; a leg with no row takes the
+XLA route. The device leg the process hosts opens before the host leg
+(`lxkit.accelerator_leg_to_open_first`, the SONAME rule of
+[ffi-build](../installation/ffi-build.md)). A sealed bundle binds the host leg
+and exactly one device leg.
 
 ---
 

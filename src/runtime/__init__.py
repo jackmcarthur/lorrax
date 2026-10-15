@@ -1617,28 +1617,17 @@ def nccl_warmup(mesh_xy) -> None:
 def _gpu_is_present() -> bool:
     """True if a GPU of any vendor is visible to this process.
 
-    Answered before the device client exists, so from the device nodes:
-    NVIDIA ``/dev/nvidia[0-9]*`` or ``/dev/nvidiactl`` (or WSL2's mapped
-    ``/usr/lib/wsl/lib/libcuda.so.1``, since WSL2 has no ``/dev/nvidia*``),
-    AMD ``/dev/kfd``.  A vendor's visibility variable set empty
-    (``CUDA_VISIBLE_DEVICES=""``, ``ROCR_VISIBLE_DEVICES=""``,
-    ``HIP_VISIBLE_DEVICES=""``) masks that vendor's devices.  Decides whether
-    a GPU-backend init failure is benign (no GPU here: run on CPU) or genuine
-    (a GPU node with a driver problem, which is re-raised).  The vendor of the
-    devices the run uses is read later, from the client
-    (:func:`lxkit.device_vendor`).
+    Answered before the device client exists, from each device leg's device
+    nodes and visibility variables (:func:`lxkit.legs.leg_device_present`:
+    NVIDIA ``/dev/nvidia[0-9]*``, ``/dev/nvidiactl`` or WSL2's mapped
+    ``libcuda``; AMD ``/dev/kfd``; a vendor's visibility variable set empty
+    masks that vendor).  Decides whether a GPU-backend init failure is benign
+    (no GPU here: run on CPU) or genuine (a GPU node with a driver problem,
+    which is re-raised).  The vendor of the devices the run uses is read
+    later, from the client (:func:`lxkit.device_vendor`).
     """
-    def masked(*names):
-        return any((os.environ.get(n) is not None
-                    and os.environ.get(n).strip() == "") for n in names)
-    import glob
-    nvidia = not masked("CUDA_VISIBLE_DEVICES") and (
-        bool(glob.glob("/dev/nvidia[0-9]*"))
-        or os.path.exists("/dev/nvidiactl")
-        or os.path.exists("/usr/lib/wsl/lib/libcuda.so.1"))
-    amd = (not masked("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
-           and os.path.exists("/dev/kfd"))
-    return nvidia or amd
+    from lxkit import accelerator_legs, leg_device_present
+    return any(leg_device_present(leg) for leg in accelerator_legs())
 
 
 def _gpu_plugin_platform() -> str:
@@ -1659,16 +1648,19 @@ def _gpu_plugin_platform() -> str:
     return "cuda"
 
 
-#: The launcher's per-vendor device-visibility variables, in lookup order.
-_VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
-                        "HIP_VISIBLE_DEVICES")
+def _device_visibility_envs() -> tuple:
+    """The launcher's per-vendor device-visibility variables, in lookup order:
+    every device leg's (:data:`lxkit.legs.LEGS`), resolved lazily so importing
+    this module stays stdlib-only."""
+    from lxkit import accelerator_legs
+    return tuple(env for leg in accelerator_legs() for env in leg.visibility_envs)
 
 
 def _visible_device_count() -> int:
     """How many GPUs the launcher made visible to this process; 0 when no
     visibility variable restricts them.  Read from the environment because
     ``jax.distributed.initialize`` must run before the client exists."""
-    for var in _VISIBLE_DEVICE_ENVS:
+    for var in _device_visibility_envs():
         raw = os.environ.get(var, "")
         if raw.strip():
             return len([x for x in raw.split(",") if x.strip()])
@@ -2695,8 +2687,8 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
 
     f["backend"] = jax.default_backend()
     from lxkit import mesh_ffi_platform
-    # The FFI library key from the device vendor ("CUDA", "cpu", or an
-    # unmapped vendor such as "rocm", which has no LORRAX library).
+    # The FFI leg key from the device vendor ("CUDA", "ROCM", "cpu", or an
+    # unmapped vendor such as "tpu", which has no LORRAX leg).
     f["ffi_platform"] = mesh_ffi_platform(mesh)
     f["process_index"] = int(jax.process_index())
     f["process_count"] = int(jax.process_count())

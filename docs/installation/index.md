@@ -80,7 +80,7 @@ explains how to port one.
 |---|---|---|
 | `Could not locate liblorrax_ffi_host.so (platform=cpu)` or `… liblorrax_ffi.so (platform=CUDA)`, with the paths searched | no library for this platform | build the leg the message names ([Perlmutter](perlmutter.md#build), [other sites](ffi-build.md)), or load a module that supplies the pair |
 | `HANDLER ABI MISMATCH` | the library and the Python tree disagree on `LORRAX_FFI_ABI_VERSION` | rebuild and reseal both legs from the same tree ([the ABI rule](ffi-build.md#abi)) |
-| `partial sealed-bundle override refused` | only one of `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO` is set | unset both, or pin both legs of one sealed bundle |
+| `partial sealed-bundle override refused` | only one leg of the bundle's pair is pinned (`LORRAX_FFI_HOST_SO` with `LORRAX_FFI_SO` or `LORRAX_FFI_ROCM_SO`) | unset both, or pin both legs of one sealed bundle |
 | `mixed native providers` | the two selected legs claim different bundle manifests | select both legs from one bundle |
 | `JAX09_ENV_REFUSED` (from `tools/require_jax09.py`), or the `runtime.jax_support` refusal before the first `jit` | JAX or JAXLIB outside the 0.9 series, or a `jax._src` of the wrong shape | install the 0.9 series (§ [JAX contract](#jax)) |
 | `GATE mathdx-headers` | a CUDA run without `nvidia-mathdx` in the venv | `uv sync --extra cuda13` (or `cuda12`) |
