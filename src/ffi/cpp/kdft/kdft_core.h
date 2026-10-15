@@ -10,7 +10,9 @@
 //     u_r = x[i + r*M] * w^(r*k/(P*R))        r in [0, R)        (w = exp(sgn 2 pi i))
 //     y[(i - k)*R + k + q*P] = sum_r u_r w^(r*q/R)                q in [0, R)
 //
-// A work item is one butterfly (R <= kRmax: its R outputs, twiddles held in registers) or a
+// A work item is one butterfly (R <= kRmax: its R outputs in registers; bfly<R> below, a
+// split-radix FFT tree with constant twiddles for R = 2, 4, 8, 16, the direct R-term sum for any
+// other radix, its R twiddles held in registers) or a
 // kChunk-pair slice of one (a prime R > kRmax, e.g. 97: outputs q and R-q for kChunk values of q,
 // from the sums and differences of inputs r and R-r against one cos/sin, a quarter of the direct
 // DFT's FMAs and twiddle reads).  Lanes
@@ -22,6 +24,10 @@
 //
 // The radix plan (kdft_plan.h) depends on N only; the host reads the same header to size a
 // pass's thread count.
+//
+// line_reg<N>() is the same plan on one line held in a thread's registers (fully unrolled, so
+// every index and twiddle is a compile-time constant): the register pass (kdft_klead_kernel.h,
+// LRX_REG) moves a whole line per LDS round trip instead of one per stage.
 #pragma once
 
 #if LRX_F32
@@ -51,6 +57,99 @@ __device__ __forceinline__ cplx cmul(cplx a, cplx b) {
     return cplx{fma(a.x, b.x, -a.y * b.y), fma(a.x, b.y, a.y * b.x)};
 }
 
+// Compile-time loops: sfor<B, E>(f) calls f(IC<i>{}) for i in [B, E), so an index used inside is
+// a constant expression (twiddle constants, register-array indices).
+template <int V> struct IC { static constexpr int value = V; };
+template <int B, int E, class F>
+__device__ __forceinline__ void sfor(F&& f) {
+    if constexpr (B < E) {
+        f(IC<B>{});
+        sfor<B + 1, E>(f);
+    }
+}
+// The constant twiddle w_N^M = exp(sgn * 2 pi i M / N): its cos and sin are compile-time values
+// (kdft_plan.h trig2pi), so they are literal or scalar operands, never a register per lane.
+template <int N, int M> struct TwC {
+    static constexpr real c = real(trig2pi(M, N, 0));
+    static constexpr real s = real(trig2pi(M, N, 1));
+};
+template <int N, int M>
+__device__ __forceinline__ cplx twc(real sgn) { return cplx{TwC<N, M>::c, sgn * TwC<N, M>::s}; }
+
+// u <- DFT_R(u) in natural order, R a power of two <= 16: radix-2 decimation in time, the
+// trivial twiddles (m = 0, R/4) as swaps.
+template <int R>
+__device__ __forceinline__ void fft_pow2(cplx* u, real sgn) {
+    if constexpr (R == 2) {
+        const cplx a = u[0], b = u[1];
+        u[0] = cplx{a.x + b.x, a.y + b.y};
+        u[1] = cplx{a.x - b.x, a.y - b.y};
+    } else if constexpr (R > 2) {
+        constexpr int H = R / 2;
+        cplx e[H], o[H];
+#pragma unroll
+        for (int j = 0; j < H; ++j) { e[j] = u[2 * j]; o[j] = u[2 * j + 1]; }
+        fft_pow2<H>(e, sgn);
+        fft_pow2<H>(o, sgn);
+        sfor<0, H>([&](auto qi) {
+            constexpr int q = decltype(qi)::value;
+            cplx t = o[q];
+            if constexpr (4 * q == R) t = cplx{-sgn * o[q].y, sgn * o[q].x};
+            else if constexpr (q != 0) t = cmul(o[q], twc<R, q>(sgn));
+            u[q] = cplx{e[q].x + t.x, e[q].y + t.y};
+            u[q + H] = cplx{e[q].x - t.x, e[q].y - t.y};
+        });
+    }
+}
+// u <- DFT_R(u): y_q = sum_r u_r w_R^{rq}, constant twiddles.  A power of two <= 16: fft_pow2.
+// An odd radix: the conjugate-pair form (X_q and X_{R-q} from the sums u_r + u_{R-r} and
+// differences u_r - u_{R-r} against one cos / sin each: half the direct sum's FMAs).  Any other
+// radix: the direct sum.
+template <int R>
+__device__ __forceinline__ void bfly(cplx* u, real sgn) {
+    if constexpr (R == 2 || R == 4 || R == 8 || R == 16) {
+        fft_pow2<R>(u, sgn);
+    } else if constexpr (R % 2 == 1) {
+        constexpr int H = (R - 1) / 2;
+        cplx sp[H + 1], dm[H + 1];
+        cplx y0 = u[0];
+#pragma unroll
+        for (int r = 1; r <= H; ++r) {
+            sp[r] = cplx{u[r].x + u[R - r].x, u[r].y + u[R - r].y};
+            dm[r] = cplx{u[r].x - u[R - r].x, u[r].y - u[R - r].y};
+            y0 = cplx{y0.x + sp[r].x, y0.y + sp[r].y};
+        }
+        const cplx x0 = u[0];
+        sfor<1, H + 1>([&](auto qi) {
+            constexpr int q = decltype(qi)::value;
+            cplx A = x0, D{0, 0};
+            sfor<1, H + 1>([&](auto ri) {
+                constexpr int r = decltype(ri)::value;
+                constexpr int m = (r * q) % R;
+                A = cplx{fma(sp[r].x, TwC<R, m>::c, A.x), fma(sp[r].y, TwC<R, m>::c, A.y)};
+                D = cplx{fma(dm[r].x, TwC<R, m>::s, D.x), fma(dm[r].y, TwC<R, m>::s, D.y)};
+            });
+            u[q] = cplx{A.x - sgn * D.y, A.y + sgn * D.x};
+            u[R - q] = cplx{A.x + sgn * D.y, A.y - sgn * D.x};
+        });
+        u[0] = y0;
+    } else {
+        cplx y[R];
+        sfor<0, R>([&](auto qi) {
+            constexpr int q = decltype(qi)::value;
+            cplx a = u[0];
+            sfor<1, R>([&](auto ri) {
+                constexpr int r = decltype(ri)::value;
+                a = cfma(u[r], twc<R, (r * q) % R>(sgn), a);
+            });
+            y[q] = a;
+        });
+#pragma unroll
+        for (int q = 0; q < R; ++q) u[q] = y[q];
+    }
+}
+template <int R> struct IsPow2Bfly { static constexpr bool v = R == 2 || R == 4 || R == 8 || R == 16; };
+
 // The table w_N^m = exp(2 pi i m / N) of each group axis, laid out [GX | GY | GZ].
 template <int GX, int GY, int GZ, int NT>
 __device__ __forceinline__ void fill_twiddles(cplx* tw) {
@@ -79,11 +178,6 @@ __device__ __forceinline__ void stage(cplx* s, const cplx* tw, real sgn) {
     // M == 1 with whole butterflies: the item's outputs are its own inputs' slots -> in place
     constexpr bool INPLACE = WHOLE && M == 1;
     cplx acc[INPLACE ? 1 : IPT][OUT];
-    cplx wr[WHOLE ? R : 1];
-    if constexpr (WHOLE) {
-#pragma unroll
-        for (int j = 0; j < R; ++j) wr[j] = twiddle(tw, (N / R) * j, sgn);
-    }
 #pragma unroll
     for (int it = 0; it < IPT; ++it) {
         const int item = threadIdx.x + it * NT;
@@ -96,8 +190,6 @@ __device__ __forceinline__ void stage(cplx* s, const cplx* tw, real sgn) {
             const int base = (lo / S) * (S * N) + (lo % S);
             const int k = i % P;
             cplx* a = acc[INPLACE ? 0 : it];
-#pragma unroll
-            for (int q = 0; q < OUT; ++q) a[q] = cplx{0, 0};
             if constexpr (WHOLE) {
                 (void)ch;
 #pragma unroll
@@ -106,15 +198,17 @@ __device__ __forceinline__ void stage(cplx* s, const cplx* tw, real sgn) {
                     if constexpr (P > 1) {
                         if (r > 0) x = cmul(x, twiddle(tw, (N / (P * R)) * r * k, sgn));
                     }
-#pragma unroll
-                    for (int q = 0; q < R; ++q) a[q] = cfma(x, wr[(r * q) % R], a[q]);
+                    a[r] = x;
                 }
+                bfly<R>(a, sgn);
                 if constexpr (INPLACE) {
 #pragma unroll
                     for (int q = 0; q < R; ++q) s[(base + q * S) * W + w] = a[q];
                 }
             } else {
                 // a[0..CH): sum_r s_r cos(2 pi r q / R); a[CH..2CH): sum_r d_r sin(...); a[2CH]: X_0
+#pragma unroll
+                for (int q = 0; q < OUT; ++q) a[q] = cplx{0, 0};
                 const int q0 = 1 + ch * CH;
                 auto load = [&](int r) {
                     cplx x = s[(base + (i + r * M) * S) * W + w];
@@ -192,6 +286,38 @@ __device__ __forceinline__ void line_dft(cplx* s, const cplx* tw, real sgn) {
         stage<N, S, PlanOf<N>::v.r[ST], PlanOf<N>::v.p[ST], G, W, NT>(s, tw, sgn);
         line_dft<N, S, G, W, NT, ST + 1>(s, tw, sgn);
     }
+}
+
+// The plan's stages on one line v[0..N) held in registers (natural order in and out): stage ST
+// with radix R, P = the earlier radices' product, M = N/R, the Stockham map of the LDS stage.
+// Every index is a compile-time constant (sfor), so v stays in VGPRs and every twiddle is a
+// constant (TwC).  Radices above kRmax are not taken here (the register pass requires reg_ok).
+template <int N, int ST>
+__device__ __forceinline__ void reg_stages(cplx* v, real sgn) {
+    if constexpr (ST < PlanOf<N>::v.n) {
+        constexpr int R = PlanOf<N>::v.r[ST], P = PlanOf<N>::v.p[ST], M = N / R;
+        cplx y[N];
+        sfor<0, M>([&](auto ii) {
+            constexpr int i = decltype(ii)::value;
+            constexpr int k = i % P;
+            cplx u[R];
+            sfor<0, R>([&](auto ri) {
+                constexpr int r = decltype(ri)::value;
+                if constexpr (r > 0 && k > 0) u[r] = cmul(v[i + r * M], twc<N, (N / (P * R)) * r * k>(sgn));
+                else u[r] = v[i + r * M];
+            });
+            bfly<R>(u, sgn);
+#pragma unroll
+            for (int q = 0; q < R; ++q) y[(i - k) * R + k + q * P] = u[q];
+        });
+#pragma unroll
+        for (int j = 0; j < N; ++j) v[j] = y[j];
+        reg_stages<N, ST + 1>(v, sgn);
+    }
+}
+template <int N>
+__device__ __forceinline__ void line_reg(cplx* v, real sgn) {
+    reg_stages<N, 0>(v, sgn);
 }
 
 // The group's unnormalised DFT, in place: sgn = +1 inverse (exp(+2 pi i)), -1 forward.
