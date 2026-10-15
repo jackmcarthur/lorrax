@@ -71,7 +71,7 @@ def selection_face_count(recipe, *, n, logical_n, states, rows, dense_fields, mo
     return int(dense_fields) * dense + int(moment_fields) + math.ceil(panel / int(n) ** 2)
 
 
-def line_selection_price(rows, *, mesh, nq, execution):
+def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     """Per-rank bytes of the producer's selection at one line sample: (resident, workspace).
 
     Live beside the caller's reservations: the selection copies of every
@@ -88,7 +88,7 @@ def line_selection_price(rows, *, mesh, nq, execution):
     ranks = int(mesh.size)
     blocks = sum(int(a) * int(b) for a in rows for b in rows)
     largest = max(int(r) for r in rows)
-    plan = constructor_eigenplan(mesh, largest, execution)
+    plan = constructor_eigenplan(mesh, largest, execution, backend=eigh_backend)
     if execution == 'local':
         resident = 16 * 2 * math.ceil(int(nq) / ranks) * (blocks + largest ** 2)
         workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((int(nq), largest, largest),), np.complex128)
@@ -128,10 +128,12 @@ def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole pa
     return (execution, *prices[execution])
 
 
-def line_selection_execution(rows, *, mesh, ledger, nq, carry=0):
-    """'local' when the producer's line selection fits with whole parents per rank, else 'face'."""
+def line_selection_execution(rows, *, mesh, ledger, nq, eigh_backend, carry=0):
+    """'local' when the producer's line selection fits with whole parents per rank, else 'face'
+    (priced on the face plan of the deck's eigh request ``eigh_backend``)."""
     return whole_parent_execution(
-        lambda execution: line_selection_price(rows, mesh=mesh, nq=nq, execution=execution),
+        lambda execution: line_selection_price(rows, mesh=mesh, nq=nq, execution=execution,
+                                               eigh_backend=eigh_backend),
         ledger=ledger, carry=carry, site=f"shared-pole line selection {int(nq)} parents")
 
 
@@ -355,13 +357,19 @@ def face_matmul(mesh):
 
 
 @lru_cache(maxsize=None)
-def _face_eigh(mesh, n):
+def _face_eigh(mesh, n, backend):
     from distrib_la import plan
-    return plan('eigh',mesh,n=int(n),backend='distributed',budget_bytes=0)
+    return plan('eigh',mesh,n=int(n),backend=backend,budget_bytes=0)
 
 
-def face_eigh(mesh, n, room=None):
+def face_eigh(mesh, n, room=None, *, backend):
     """The whole-mesh constructor's n x n eigh plan.
+
+    ``backend`` is the deck's eigh request, ``LinalgResolution.eigh_backend``
+    (``gw.gw_config.resolve_linalg``): ``auto`` under ``linalg = local``
+    (route (c) where a stack fits, the platform's whole-mesh eigh where it
+    does not, refused by name where the leg has none), ``distributed`` under
+    ``linalg = distributed`` (refused at plan time where the leg has none).
 
     ``room`` is the caller's device bytes per rank beside its admitted live
     set (``face_eigh_room``), the same on every rank. distrib_la decides each
@@ -372,7 +380,7 @@ def face_eigh(mesh, n, room=None):
     built on them (``face_parent_program`` and the others) are shared.
     """
     import dataclasses
-    return dataclasses.replace(_face_eigh(mesh, int(n)), budget_bytes=int(room or 0))
+    return dataclasses.replace(_face_eigh(mesh, int(n), str(backend)), budget_bytes=int(room or 0))
 
 
 def face_ritz_carrier(mesh, keep_budget):
@@ -414,7 +422,9 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
-    eigh=(face_eigh(mesh,side) if eigh_plan is None else eigh_plan).batched
+    if eigh_plan is None:
+        raise ValueError('face_parent_program needs its face_eigh plan (the deck eigh request decides it)')
+    eigh=eigh_plan.batched
     def body(points,active,q,o,d,infinity):
         reduced=solve_parent_pencil(points,q,o,d,infinity,active,
             eigh=eigh,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
@@ -428,14 +438,14 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
 
 
 def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
-                      keep_budget,retain_span=False,admit=True,gram_keep=None,room=None,carrier=None):
+                      keep_budget,eigh_backend,retain_span=False,admit=True,gram_keep=None,room=None,carrier=None):
     """A fixed-width batch of parents with every matrix tiled over all ranks.
 
     ``room`` is the room the pencil's eigh stacks are decided against
     (``face_eigh``), or a function of this round's program price at its
     actual side (``face_reduction_bytes``). ``carrier`` is the kept-span width of an
     ordered reduction (``face_ritz_carrier``), None solving the whole H'_vv
-    side. A short last round's synthetic slots repeat its last parent
+    side. ``eigh_backend`` is the deck's eigh request (``face_eigh``). A short last round's synthetic slots repeat its last parent
     (``parent_rounds``); callers read only the leading real slots. An ordered round's
     columns enter the tile-interleaved order of the face (``interleave_tables``)."""
     from gw.shared_pole_pencil import interleave_tables
@@ -445,7 +455,8 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     if admit:
         budget.plan(side,phase='reduction')
     program=lambda room: face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
-                                             face_eigh(mesh,side,room),None if carrier is None else int(carrier))
+                                             face_eigh(mesh,side,room,backend=eigh_backend),
+                                             None if carrier is None else int(carrier))
     from gw.shared_pole_local import pack_panels
     packed=pack_panels(tuple([s[k] for s in states] for k in (1,2,3)),tables['order'],
                        [int(s[1].shape[-1]) for s in states],mesh_xy=mesh,layout='face')
@@ -692,17 +703,23 @@ def _hermitian_stack(mesh):
 
 
 @lru_cache(maxsize=None)
-def _mesh_eigh(mesh, n):
+def _mesh_eigh(mesh, n, backend):
+    """The whole-mesh plan of a staged stack for the deck's eigh request: an
+    explicit ``distributed`` as named; ``auto`` with no room, which is the same
+    plan wherever the leg has a whole-mesh eigh and refuses by name where not."""
     import distrib_la
-    return distrib_la.plan('eigh', mesh, n=int(n), backend='distributed', batched_route='auto')
+    if backend == 'auto':
+        return distrib_la.plan('eigh', mesh, n=int(n), backend='auto', budget_bytes=0)
+    return distrib_la.plan('eigh', mesh, n=int(n), backend=backend, batched_route='auto')
 
 
-def staged_eigh(mesh, stack, beside, *, ledger, live, label):
+def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
     """The plan of one staged eigh stack ``stack`` (nb, n, n): route (c), whole matrices per rank,
     when its shape price (``distrib_la.eigh_stack_bytes``) beside ``beside`` bytes per rank and
     the ``live`` ledger stages fits the budget; otherwise the whole mesh
     (``common.gpu_utils.admit_local``, which records the route). Shapes and the
-    deck budget only, so every rank decides alike."""
+    deck budget only, so every rank decides alike. ``backend`` is the deck's
+    eigh request (``LinalgResolution.eigh_backend``) for the whole mesh."""
     import distrib_la
     from common.gpu_utils import admit_local
     from gw.shared_pole_capacity import _local_eigenplan
@@ -717,7 +734,9 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label):
                    row['aggregate_bytes_per_rank'], row['available_device_bytes_per_rank'],
                    distributed_bytes=mesh_need, names=('route (c)', 'whole mesh')):
         return local
-    return _mesh_eigh(mesh, n)
+    mesh_plan = _mesh_eigh(mesh, n, str(backend))
+    mesh_plan.require_capacity(f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2")
+    return mesh_plan
 
 
 def stage_width(ledger, resident, program, width, *, live):

@@ -52,7 +52,9 @@ failure mode.
 
 ``auto`` and ``off`` resolve to ``native`` (pure JAX, available
 everywhere) except that ``auto`` for cholesky / solve_lu picks cusolvermp
-on a true-2D CUDA mesh when it is compiled.  ``off`` is an *override*, not
+on a true-2D CUDA mesh when it is compiled.  An eigh ``auto`` plan that carries
+a room (``plan(..., budget_bytes=)``) also names the capacity route for the
+stacks that do not fit it: :func:`resolve_eigh_capacity`.  ``off`` is an *override*, not
 a guard: it is honored unconditionally.
 
 ZERO ENVIRONMENT READS.  Nothing in this module consults ``os.environ``.
@@ -79,6 +81,7 @@ __all__ = [
     "mesh_is_cpu",
     "mesh_key",
     "resolve_backend",
+    "resolve_eigh_capacity",
     "list_backends",
     "backend_module",
 ]
@@ -714,6 +717,48 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         _announce_eigh_fixed_cost(px, py, int(n))
 
     return requested
+
+
+#: (platform, px, py) triples whose missing capacity eigh was announced.
+_CAPACITY_UNAVAILABLE_ANNOUNCED: set[tuple[str, int, int]] = set()
+
+
+def resolve_eigh_capacity(mesh_xy, *, n: int | None = None) -> tuple[str, str | None]:
+    """The whole-mesh eigh behind an ``auto`` request that carries a room.
+
+    ``plan('eigh', backend='auto', budget_bytes=room)`` asks for the local
+    route wherever it fits and the capacity route (one matrix over the whole
+    mesh) only for a stack that does not.  The capacity route is the
+    platform's ``distributed`` backend (:data:`_DISTRIBUTED_DEFAULT`),
+    resolved HERE through the full guard ladder, exactly as an explicit
+    ``distributed`` request is.  Returns ``(backend, None)`` when it passes,
+    so such a plan is the same plan an explicit ``distributed`` request
+    builds.  When it does not (no library on this leg, a partial build,
+    geometry, divisibility), returns ``(NATIVE, reason)``: the plan runs
+    route (c) and refuses by name at the first stack that needs the whole
+    mesh (``GATE eigh_capacity_route``, :meth:`distrib_la.Plan.require_capacity`).
+    That is the promise of ``auto``: it may choose, and it announces (rank 0,
+    once per platform and geometry); it never runs a stack on a route the
+    caller did not ask for.  An explicit ``distributed`` still refuses at
+    resolve time.
+    """
+    try:
+        return resolve_backend("eigh", "distributed", mesh_xy, n=n), None
+    except (ValueError, RuntimeError) as exc:
+        # The first line names the failed guard; a loader's search path follows it.
+        reason = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
+    px, py = _mesh_shape(mesh_xy)
+    key = (str(mesh_platform(mesh_xy)), px, py)
+    if key not in _CAPACITY_UNAVAILABLE_ANNOUNCED:
+        _CAPACITY_UNAVAILABLE_ANNOUNCED.add(key)
+        if _process_index() == 0:
+            print(
+                f"  [distrib_la.resolve] eigh 'auto' on the {px}x{py} "
+                f"{key[0]} mesh: no capacity (whole-mesh) eigh here ({reason}).  "
+                f"Stacks run whole matrices per rank (route (c)) where they "
+                f"fit the room; a stack that does not refuses "
+                f"(GATE eigh_capacity_route).", flush=True)
+    return NATIVE, reason
 
 
 def _available(op: str, mesh_xy) -> list[str]:

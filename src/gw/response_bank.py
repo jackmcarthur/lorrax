@@ -2333,6 +2333,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         roots = held = bank_io["photon_v"]
     carry_per_sample = 2*len(response_rows)*face_bytes
     selection = None
+    # The deck's eigh request for a face selection plan (resolve_linalg).
+    from .gw_config import linalg_resolution
+    face_eigh_backend = linalg_resolution({"linalg": config.backend.linalg}).eigh_backend
 
     def line_route(width, carry):
         """The line selection of ``width`` parents beside ``carry`` bytes: (selection,
@@ -2341,16 +2344,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         rows = ([int(meta.mu_basis.n_packed)] if vertex is None else
                 [int(b.n_packed) * (3 if f else 1) for f, b in enumerate(bank_io["mu_bases"])])
         execution, resident, workspace = line_selection_execution(
-            rows, mesh=mesh_xy, ledger=ledger, nq=width, carry=carry)
+            rows, mesh=mesh_xy, ledger=ledger, nq=width, carry=carry,
+            eigh_backend=face_eigh_backend)
         return line_selector(execution, width), resident, workspace
 
     def line_selector(execution, width):
         if vertex is None:
             from .shared_pole_directions import charge_line_selection
             return charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
-                                         execution=execution, nq=width)
+                                         execution=execution, nq=width,
+                                         eigh_backend=face_eigh_backend)
         from .shared_pole_sectors import sector_line_selection
-        return sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution, nq=width)
+        return sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution, nq=width,
+                                     eigh_backend=face_eigh_backend)
 
     if p1 > p0:
         # The line selection runs beside one sample's carry; its route is

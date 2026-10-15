@@ -314,8 +314,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                     round_states, infinity, tables, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
-                    keep_budget=keep_budget, admit=False, room=room,
-                    carrier=sizing['carrier'])
+                    keep_budget=keep_budget, eigh_backend=resolution.eigh_backend,
+                    admit=False, room=room, carrier=sizing['carrier'])
             else:
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,

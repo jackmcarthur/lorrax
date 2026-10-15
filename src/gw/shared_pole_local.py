@@ -670,7 +670,9 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
                     np.asarray(nodes, np.complex128), np.float64(eta_ry),
                     *(pick(m) for m in moments), pick(infinity_directions))
             if callable(room):
-                eigh_plan, room = face_eigh(mesh_xy, n, room(face_check_bytes(mesh_xy, n, int(model[0].shape[-1])))), None
+                # The same deck eigh request as the round's own face plan.
+                eigh_plan, room = face_eigh(mesh_xy, n, room(face_check_bytes(mesh_xy, n, int(model[0].shape[-1]))),
+                                            backend=eigh_plan.requested), None
             rows.append(jax.tree.map(np.asarray, program(eigh_plan)(*args)))
         return jax.tree.map(lambda *v: np.concatenate(v, axis=0), *rows)
 

@@ -88,7 +88,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from distrib_la._result_check import (_flag, _notices, deflate_zero_rows, in_checked_retry, native_eigh,
                                       traced_phase)
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
-                                mesh_key, resolve_backend)
+                                mesh_key, mesh_platform, resolve_backend,
+                                resolve_eigh_capacity)
 
 __all__ = ["Plan", "plan", "StackRoute", "ensure_sharding", "BATCHED_SCAN_UNROLL",
            "BATCHED_ROUTES", "BATCHED_ROUTE_CHOICES",
@@ -540,6 +541,11 @@ class Plan:
         ``'auto'`` requested and a budget given, each eigh stack's route is
         the service's capacity decision (:meth:`stack_route`): route (c) when
         the compiled program that runs it fits, otherwise the provider.
+    capacity_refusal
+        ``None``, or why an ``auto`` eigh plan with a room has no capacity
+        route on this mesh (:func:`~distrib_la.resolve.resolve_eigh_capacity`).
+        Such a plan is native: it runs route (c) wherever a stack fits the
+        room and refuses by name where one does not (:meth:`require_capacity`).
     """
 
     op: str
@@ -554,12 +560,32 @@ class Plan:
     # room are equal, so every program cached on a plan is shared across
     # rooms (the room enters no HLO; the decided route does, per shape).
     budget_bytes: int | None = field(default=None, compare=False)
+    capacity_refusal: str | None = None
 
     # ---- introspection -------------------------------------------------
     @property
     def is_native(self) -> bool:
         """True when the resolved backend is the native JAX path."""
         return self.backend == NATIVE
+
+    def require_capacity(self, what: str) -> None:
+        """Refuse by name when ``what`` needs the whole-mesh eigh and this plan has none.
+
+        A no-op on every plan except an ``auto`` eigh plan whose capacity
+        route did not resolve (:attr:`capacity_refusal`).  Called by
+        :meth:`stack_route` for each stack it sends to the whole mesh, and by
+        a caller that decides the whole mesh itself before any work.
+        """
+        if self.capacity_refusal is None:
+            return
+        px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
+        raise RuntimeError(
+            f"GATE eigh_capacity_route: {what} needs the whole-mesh (capacity) "
+            f"eigh, and the {px}x{py} {mesh_platform(self.mesh)} mesh has none "
+            f"({self.capacity_refusal}).  The 'auto' eigh runs whole matrices "
+            f"per rank (route (c)) only where they fit the room.  Fix: more "
+            f"ranks or a larger memory_per_device_gb so route (c) fits, or a "
+            f"leg that carries the platform's distributed eigh.")
 
     @property
     def donates(self) -> tuple[int, ...]:
@@ -664,16 +690,23 @@ class Plan:
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
         if static == ROUTE_BATCH_RESHARD:
             return StackRoute(static, -(-nb // ranks))
+        capacity = self.capacity_refusal is None
         if (self.requested_batched_route != "auto" or self.budget_bytes is None
-                or self.is_native or self.op != "eigh"):
+                or (self.is_native and capacity) or self.op != "eigh"):
             return StackRoute(static)
-        if self.budget_bytes == 0 or in_checked_retry():
-            # A checked program's retry is the whole-mesh program its caller sized.
+        if self.budget_bytes == 0 or (capacity and in_checked_retry()):
+            # A checked program's retry is the whole-mesh program its caller
+            # sized; a plan with no whole mesh retries on its decided route.
+            self.require_capacity(f"an eigh stack {shape} with no room")
             return StackRoute(static, room=0)
         key = self._stack_key(op, nb, shape[-1], dtype, traced)
         decided = _STACK_ROUTES.get(key)
         if decided is None:
-            decided = _STACK_ROUTES[key] = self._decide_stack(op, nb, key[3], key[4], key[6], traced)
+            decided = self._decide_stack(op, nb, key[3], key[4], key[6], traced)
+            if decided.route != ROUTE_BATCH_RESHARD:
+                self.require_capacity(
+                    f"the eigh stack {shape} ({_describe_stack(decided)})")
+            _STACK_ROUTES[key] = decided
         return decided
 
     def _stack_key(self, op, nb, n, dtype, traced):
@@ -686,7 +719,8 @@ class Plan:
         else this plan's provider route: a pure query, with no compile and no
         exchange, for pricing (``distrib_la.workspace``)."""
         static = self.batched_route
-        if static == ROUTE_BATCH_RESHARD or self.budget_bytes is None or self.is_native:
+        if (static == ROUTE_BATCH_RESHARD or self.budget_bytes is None
+                or (self.is_native and self.capacity_refusal is None)):
             return static
         shape = tuple(int(v) for v in shape)
         nb = shape[0] if len(shape) == 3 else 1
@@ -751,7 +785,9 @@ class Plan:
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what geometry."""
         px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
-        where = ("native JAX, any layout" if self.is_native else
+        where = ("route (c) only; no whole-mesh eigh on this mesh"
+                 if self.capacity_refusal is not None else
+                 "native JAX, any layout" if self.is_native else
                  f"ONE tile over the {px}x{py} mesh at P('x','y')")
         n = "" if self.n is None else f", n={self.n}"
         line = (f"{self.op}: {self.requested!r} -> {self.backend} "
@@ -1163,7 +1199,13 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         rank (0: no room). Given without a route, the service decides each
         eigh stack by capacity (:meth:`Plan.stack_route`): whole matrices per
         rank (route (c), in rounds) when the compiled program that runs it
-        fits the room, else the whole-mesh provider.
+        fits the room, else the whole-mesh provider.  With ``backend='auto'``
+        (eigh) the whole-mesh provider is the platform's ``distributed``
+        backend when it resolves on this mesh, so the plan equals the one an
+        explicit ``distributed`` request builds; when it does not, the plan is
+        native, runs route (c), and refuses by name at the first stack that
+        needs the whole mesh (:func:`~distrib_la.resolve.resolve_eigh_capacity`).
+        This is how a ``linalg = local`` deck asks for the capacity route.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
@@ -1180,14 +1222,21 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         raise ValueError(
             f"unknown batched route {batched_route!r} (known: "
             f"{'|'.join(BATCHED_ROUTE_CHOICES)})")
-    resolved = resolve_backend(op, backend, mesh_xy, n=n)
+    capacity_refusal = None
+    if op == "eigh" and budget_bytes is not None and str(backend).strip().lower() == "auto":
+        # Local where a stack fits the room, the platform's whole-mesh eigh
+        # where it does not (resolve_eigh_capacity; refused by name at that
+        # stack when this mesh has none).
+        resolved, capacity_refusal = resolve_eigh_capacity(mesh_xy, n=n)
+    else:
+        resolved = resolve_backend(op, backend, mesh_xy, n=n)
     ffi = resolved != NATIVE
     if budget_bytes is not None:
         import operator
         budget_bytes = operator.index(budget_bytes)
         if budget_bytes < 0:
             raise ValueError(f"budget_bytes must be non-negative, got {budget_bytes}")
-    face = ffi or batched_route == ROUTE_BATCH_RESHARD
+    face = ffi or batched_route == ROUTE_BATCH_RESHARD or capacity_refusal is not None
     tile = NamedSharding(mesh_xy, P("x", "y")) if face else None
     stack = NamedSharding(mesh_xy, P(None, "x", "y")) if face else None
     if batched_route == ROUTE_BATCH_RESHARD or budget_bytes is not None:
@@ -1199,4 +1248,4 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
                 mesh=mesh_xy, n=None if n is None else int(n),
                 in_sharding=tile, batch_in_sharding=stack,
                 requested_batched_route=batched_route,
-                budget_bytes=budget_bytes)
+                budget_bytes=budget_bytes, capacity_refusal=capacity_refusal)

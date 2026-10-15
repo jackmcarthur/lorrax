@@ -514,12 +514,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         chunked = ccap < kmax
         width = face_width(mesh_xy, kmax, (0, ccap) if chunked else None)
         n_chunks = -(-kmax // width)
-        # Query the same distributed dense context used by G before warming
-        # any matrix operands. The service accepts a resolved dense Plan for
-        # a GEMM workspace query, as in the shared-pole constructor.
-        from distrib_la import plan, workspace_bytes_per_rank
-        workspace_plan = plan("eigh", mesh_xy, n=m, backend="distributed",
-                              batched_route="auto")
+        # The face GEMM's workspace (distrib_la.panel_matmul, the provider of
+        # every distributed GEMM), asked of the GEMM service directly: no eigh
+        # is planned here, so no eigh backend is requested.
+        from distrib_la import matmul_workspace_bytes_per_rank
         native_workspace = 0
         panels = []
         for lo in range(0, nq, bcap):
@@ -528,9 +526,9 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             static = _shared_pole_static_key(meta, header, tables, mesh_xy=mesh_xy, layout=layout)
             count = hi - lo
             if not local:
-                native_workspace = max(native_workspace, workspace_bytes_per_rank(
-                    workspace_plan, "gemm", ((count, m, width), (count, width, m)),
-                    np.complex128))
+                native_workspace = max(native_workspace, matmul_workspace_bytes_per_rank(
+                    mesh_xy, ((count, m, width), (count, width, m)), np.complex128,
+                    backend="distributed", batched_route="auto"))
 
             def program(span=(lo, hi), tables=tables, count=count):
                 from distrib_la import gemm_plan

@@ -408,7 +408,7 @@ def _require_service_apis():
         raise RuntimeError(
             "parallel-transport preprocessing requires the public service "
             "distrib_la.plan_polar_factor(mesh, n=..., "
-            "backend='distributed', rcond=...); merge the distrib_la "
+            "backend=..., rcond=...); merge the distrib_la "
             "polar-factor service lane"
         ) from exc
     try:
@@ -1315,16 +1315,19 @@ def write_parallel_transport_artifact(
     nbands: int,
     bispinor: bool,
     batched_route: str,
+    eigh_backend: str,
     rcond: float = 1.0e-10,
     w_av_first_neighbors: bool = False,
     w_av_second_neighbors: bool = False,
 ) -> None:
     """Append streamed links and the full-BZ connection to an initialized file.
 
-    ``batched_route`` is the deck's ``linalg`` resolution
-    (``gw_config.resolve_distrib_la_batched_route``): ``batch_reshard``
-    (``linalg = local``) solves P link polars at a time, one per rank;
-    ``auto`` (``linalg = distributed``) solves each link on the mesh.
+    ``batched_route`` and ``eigh_backend`` are the deck's ``linalg``
+    resolution (``gw_config.resolve_distrib_la_batched_route`` and
+    ``gw_config.resolve_eigh_backend``): ``batch_reshard`` with ``auto``
+    (``linalg = local``) solves P link polars at a time, one per rank, and
+    plans no whole-mesh eigh; ``auto`` with ``distributed``
+    (``linalg = distributed``) solves each link on the mesh.
 
     THE STENCIL GATE LIVES HERE, per axis, not in the artifact initializer
     -- this is the ONLY stage that differentiates along k.  Since 2026-09-05
@@ -1357,7 +1360,7 @@ def write_parallel_transport_artifact(
         _require_service_apis())
     nb_padded = band_storage_extent(mesh, int(nbands))
     polar_plan = plan_polar(
-        mesh, n=nb_padded, backend="distributed", rcond=float(rcond),
+        mesh, n=nb_padded, backend=str(eigh_backend), rcond=float(rcond),
         batched_route=str(batched_route))
     full_plus, source_full, source_steps = _write_link_stage(
         str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
@@ -2242,7 +2245,7 @@ def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
 
 
 def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
-                                batched_route,
+                                batched_route, eigh_backend,
                                 rcond, velocity_only, w_av_first_neighbors,
                                 w_av_second_neighbors, atol, rtol,
                                 report, head_nbands=None) -> None:
@@ -2269,7 +2272,8 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
     with timing.section("parallel_transport_links"):
         write_parallel_transport_artifact(
             path, wfn=wfn, sym=sym, mesh=mesh, nbands=nbands,
-            bispinor=bispinor, batched_route=batched_route, rcond=rcond,
+            bispinor=bispinor, batched_route=batched_route,
+            eigh_backend=eigh_backend, rcond=rcond,
             w_av_first_neighbors=w_av_first_neighbors,
             w_av_second_neighbors=w_av_second_neighbors)
     with timing.section("parallel_transport_validation"):
