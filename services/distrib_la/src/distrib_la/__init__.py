@@ -106,7 +106,7 @@ from __future__ import annotations
 
 from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
                                hermitian_part, join_columns, on_face)
-from distrib_la.subspace import plan_orthogonalization, plan_subspace
+from distrib_la.subspace import plan_orthogonalization, plan_subspace, subspace_route, SUBSPACE_ROUTE
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
 from distrib_la.workspace import eigh_stack_bytes, fits_local, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
 from distrib_la.loader import dial_key, has_target, probe_target
@@ -160,7 +160,7 @@ __all__ = [
     "eigh_local", "eigh_route", "COMPLEX_EIGH_ROUTE",
     "local_batch", "batch_layout", "is_batch_layout",
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
-    "plan_orthogonalization",
+    "plan_orthogonalization", "subspace_route", "SUBSPACE_ROUTE",
     # face-pinned block glue for stacked [b, R, R] operators
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",

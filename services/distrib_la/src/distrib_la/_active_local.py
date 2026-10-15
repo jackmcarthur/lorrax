@@ -1,4 +1,4 @@
-"""Exact interval products for the local planned GEMM backend.
+"""Exact interval products for the local planned GEMM backend and the XLA subspace route.
 
 The allocation shapes are fixed. A dynamic interval is decomposed into
 power-of-two widths, each selecting a statically shaped dot through lax.switch.
@@ -64,3 +64,27 @@ def active_local_matmul(a, b, bounds, weights, c=None, *, alpha, beta):
 
     return jax.lax.cond(valid, contract,
         lambda _: jnp.full((a.shape[0], a.shape[1], b.shape[-1]), jnp.nan, a.dtype), None)
+
+
+def interval_rows(block, lo, hi, k, init):
+    """Fold ``block(start, width, out)`` over the rows ``[lo, hi)`` of a k-row buffer.
+
+    The interval is decomposed into power-of-two widths (at most 256), each a
+    statically shaped branch of ``lax.switch``, so only wholly active rows are
+    ever sliced: inactive rows (which may hold NaN) never enter arithmetic.
+    The whole buffer (``lo == 0``, ``hi == k``) is one ``block(0, k, out)``.
+    No host callback; ``lo``/``hi`` are traced scalars and must be valid.
+    """
+    max_bit = min(k.bit_length() - 1, 8)
+    branches = tuple((lambda w: lambda s: (s[0] + w, block(s[0], w, s[1])))(1 << bit)
+                     for bit in range(max_bit + 1))
+
+    def step(state):
+        bit = jnp.minimum(jnp.int32(31) - jax.lax.clz((hi - state[0]).astype(jnp.int32)), max_bit)
+        return jax.lax.switch(bit, branches, state)
+
+    def partial(out):
+        return jax.lax.while_loop(lambda s: s[0] < hi, step, (jnp.asarray(lo, jnp.int32), out))[1]
+
+    return jax.lax.cond((lo == 0) & (hi == k), lambda out: block(jnp.int32(0), k, out),
+                        partial, init)

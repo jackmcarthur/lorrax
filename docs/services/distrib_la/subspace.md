@@ -46,21 +46,38 @@ print(plan.workspace_specs)          # scratch the plan adds, before lowering
 
 `plan_subspace(*, capacity, n_eig, vector_sharding=None, max_block_size=None,
 native_collectives=False)` checks `1 ≤ n_eig ≤ capacity < 2³¹`, JAX x64 and the
-sharding rule above, then resolves one provider from the local device
-platform:
+sharding rule above, then resolves one provider from the process's platform
+leg. The per-leg row is `distrib_la.subspace.SUBSPACE_ROUTE` (a backend
+preference of this service, like `COMPLEX_EIGH_ROUTE`; `subspace_route()` reads
+it); a vendor with no leg takes the XLA route:
 
-| provider | when | how the operations run |
-|---|---|---|
-| `LocalSubspacePlan` | a GPU process | the `lorrax_active_subspace_*` handlers: cuBLAS and cuSolverDn on the active dimensions only |
-| `CpuSubspacePlan` | a CPU process | NumPy BLAS/LAPACK inside `jax.pure_callback` on the active rows |
-| `DistributedSubspacePlan` | `vector_sharding` over more than one device | wraps either provider in `shard_map`: each rank works on its own vector tile and only coefficient matrices are summed across the mesh |
+| route | leg | provider | how the operations run |
+|---|---|---|---|
+| `native` | CUDA | `LocalSubspacePlan` | the `lorrax_active_subspace_*` handlers: cuBLAS and cuSolverDn on the active dimensions only |
+| `xla` | ROCM | `XlaSubspacePlan` | device products on the active window (power-of-two row slices, no padded rows enter arithmetic) and `eigh_local` on the active block; no host callback |
+| `host` | cpu | `CpuSubspacePlan` | NumPy BLAS/LAPACK inside `jax.pure_callback` on the active rows |
+| — | any, `vector_sharding` over more than one device | `DistributedSubspacePlan` | wraps the provider in `shard_map`: each rank works on its own vector tile and only coefficient matrices are summed across the mesh |
+
+**The XLA route.** `gram`, `reconstruct` and `orthogonalize` slice only the
+selected rows: the interval is cut into power-of-two widths (at most 256), each
+a statically shaped product chosen by `lax.switch`; the whole buffer is one
+product. `project` multiplies the new image rows against the whole basis and
+keeps the first `active` rows of the result (a product row reads only its own
+basis row, so a NaN tail is still excluded). `eigh` solves the smallest of the
+static extents 64, 128, … below `capacity`, then `capacity`, that holds the
+active block. The inactive diagonal is shifted to twice the block's Gershgorin
+bound, so those eigenvalues sort above every active one. Arithmetic therefore
+stays within a factor two of the active size above 64. Invalid run-time windows
+return NaN (a traced program cannot raise); the native and host routes raise.
+ROCm takes this route because the host route cost bse 517 callbacks and
+exciton_bands 303 callbacks at P=4, and its callbacks made the solver jits
+uncacheable (Frontier lane report, 2026-10-15).
 
 `plan_local_subspace(*, capacity, n_eig, max_block_size=None)` is the
 one-device CUDA plan alone; it refuses on a CPU process and when any of the
 six handlers (`eigh`, `project`, `reconstruct`, `ortho`, `store`, `gram`) is
-missing, naming it. There is no CPU fallback for a GPU process and no
-padded-math fallback for a missing handler, because either would hide a cost
-the caller planned around.
+missing, naming it. There is no CPU or XLA fallback for a CUDA process with a
+missing handler, because either would hide a cost the caller planned around.
 
 ## The operations
 
@@ -126,6 +143,8 @@ order. `ortho.backend` names the resolved implementation:
 | `cuda` | one GPU | local cuBLAS CGS2, block input aliased to the output |
 | `cuda_jax_collectives` | distributed GPU (default) | local Gram; an in-place subtraction fused with the next Gram; a final in-place subtraction; two JAX `psum`s of the fixed `capacity × b` coefficients |
 | `cuda_nccl` | distributed GPU, `native_collectives=True`, one GPU per process on the whole `('x','y')` mesh | one native handler updates the block in place and all-reduces only the `count × b` active coefficients per pass; a fixed-size exchange first checks that every rank holds the same interval |
+| `xla_jax_collectives` | distributed ROCm (XLA route) | device products on local tiles; two JAX `psum`s of the fixed `capacity × b` coefficients per pass |
+| `xla` | one ROCm device | both passes as device products |
 | `jax_collectives` | distributed CPU | host callbacks on local tiles, capacity-sized JAX coefficient reductions |
 | `cpu_callback` | one CPU device | both passes in one NumPy callback |
 
@@ -150,8 +169,9 @@ admit it before lowering:
 | `qr_r`, `qr_stacked_r` | `(b, b)`, `(P·b, b)` complex128 | QR factors |
 | `orthogonalization_ranges` | `2P` int32 | the `cuda_nccl` interval check |
 
-Native context allocations, CPU callback temporaries and host LAPACK
-workspace are not in it; read the compiled schedule from
+The XLA route declares none (its scratch is XLA temporaries). Native
+context allocations, CPU callback temporaries and host LAPACK workspace are not
+in it either; read the compiled schedule from
 `memory_analysis()`. An undonated block must stay unchanged, so XLA may copy
 it; a surrounding `jit` can donate it when the caller no longer needs it.
 
