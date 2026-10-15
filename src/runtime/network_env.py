@@ -1,10 +1,13 @@
-"""Launch topology and site network defaults, resolved before JAX/NCCL start.
+"""Launch topology and site network defaults, resolved before JAX/NCCL/RCCL start.
 
 Topology comes from the current launch, never the enclosing allocation. No MPI
 or GPU library is imported here. A site profile, ``config/<site>/site.toml``,
 states what the site provides and requires; this module decides when that
-applies, what a caller's export overrides, and what refuses. Unknown sites and
-topologies keep NCCL's own policy.
+applies, what a caller's export overrides, and what refuses. The device leg
+(:data:`lxkit.LEGS`) names the collective library its XLA collectives use
+(``collective_library``: NCCL on CUDA, RCCL on ROCm; RCCL reads the same
+``NCCL_*`` variables) and so the profile section that applies. Unknown sites
+and topologies keep the library's own policy.
 """
 from __future__ import annotations
 
@@ -15,11 +18,13 @@ import tomllib
 
 #: Variables naming the site, in precedence order; the value is a directory of
 #: ``config/``.  ``NERSC_HOST`` is NERSC's own name for the machine.
-_SITE_ENVS = ('LORRAX_SITE_PROFILE', 'NERSC_HOST')
+#: ``LMOD_SYSTEM_NAME`` is the OLCF (and generic Lmod) name of the machine.
+_SITE_ENVS = ('LORRAX_SITE_PROFILE', 'NERSC_HOST', 'LMOD_SYSTEM_NAME')
 _CONFIG = Path(__file__).resolve().parents[2] / 'config'
 #: libfabric CXI provider settings for a Slingshot machine with no profile.
 #: Without the zero rendezvous threshold CXI sends small messages eagerly, and
 #: cross-node NCCL send/recv (all_to_all, collective_permute) deadlocks.
+#: Library-neutral: they configure libfabric, under NCCL's or RCCL's plugin.
 _CXI_DEFAULTS = {'FI_CXI_DISABLE_HOST_REGISTER': '1', 'FI_CXI_RDZV_THRESHOLD': '0'}
 _configuration = None
 
@@ -83,15 +88,30 @@ def site_profile(env=os.environ):
     return None
 
 
-def _sockets_refusal(site, nodes, cause, step_network):
+def _collective_leg(env, platform):
+    """The device leg whose collective library this process's XLA uses, or None.
+
+    ``JAX_PLATFORMS``'s first entry, as JAX picks its default backend
+    (``runtime.set_default_env`` sets it to the installed plugin's before this
+    runs); unset, JAX's ``gpu`` order (CUDA first), the plan this module always
+    made for an unnamed GPU platform.
+    """
+    from lxkit import leg_for_jax_platform
+    first = env.get('JAX_PLATFORMS', '').lower().split(',')[0].strip()
+    if platform == 'cpu' or first == 'cpu':
+        return None
+    return leg_for_jax_platform(first or 'gpu')
+
+
+def _sockets_refusal(site, nodes, cause, step_network, leg):
     """Name why a profiled multi-node step would use sockets, and the relaunch."""
     placement = f'{nodes} nodes' if nodes is not None else 'multiple nodes'
     relaunch = (f'Relaunch with `SLURM_NETWORK={step_network} srun ...` (`lx run` '
                 'exports it for every multi-node GPU step), and leave ' if step_network
                 else 'Leave ')
-    return (f'Refusing multi-node {site} CUDA startup on {placement}: {cause}, so '
-            f'NCCL would run over TCP sockets. {relaunch}NCCL_NET unset or set to '
-            'an OFI provider.')
+    return (f'Refusing multi-node {site} {leg.key} startup on {placement}: {cause}, so '
+            f'{leg.collective_library.upper()} would run over TCP sockets. {relaunch}'
+            'NCCL_NET unset or set to an OFI provider.')
 
 
 def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
@@ -99,22 +119,24 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
     nodes, multiple, topology_source = launch_topology(env)
     result = dict(nodes=nodes, multi_node=multiple, topology_source=topology_source,
                   policy='unchanged', applied={}, warnings=[])
-    platforms = env.get('JAX_PLATFORMS', '').lower().split(',')
-    if platform == 'cpu' or platforms[0] == 'cpu' or 'rocm' in platforms:
-        result['policy'] = 'non-CUDA'
+    leg = _collective_leg(env, platform)
+    if leg is None or not leg.collective_library:
+        result['policy'] = 'no device collectives'
         return result
+    lib = leg.collective_library.upper()
+    result['library'] = lib
     profile = site_profile(env)
-    nccl = (profile or {}).get('nccl') if multiple is True else None
-    step_network = (nccl or {}).get('step_network')
+    section = (profile or {}).get(leg.collective_library) if multiple is True else None
+    step_network = (section or {}).get('step_network')
     if 'NCCL_NET' in env or 'NCCL_NET_PLUGIN' in env:
-        if nccl and env.get('NCCL_NET', '').strip().lower() == 'socket':
+        if section and env.get('NCCL_NET', '').strip().lower() == 'socket':
             raise RuntimeError(_sockets_refusal(
-                profile['site'], nodes, 'NCCL_NET=Socket is set', step_network))
+                profile['site'], nodes, 'NCCL_NET=Socket is set', step_network, leg))
         result['policy'] = 'explicit transport'
         return result
     if multiple is not True:
         return result
-    if nccl:
+    if section:
         # The option must reach srun before it creates the step; changing
         # os.environ here cannot repair the step's network allocation.
         options = {value.strip() for value in env.get('SLURM_NETWORK', '').split(',')}
@@ -122,17 +144,30 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
             raise RuntimeError(_sockets_refusal(
                 profile['site'], nodes, f'the step was created without SLURM_NETWORK='
                 f"{step_network} (SLURM_NETWORK={env.get('SLURM_NETWORK')!r})",
-                step_network))
-        defaults = nccl.get('env', {})
+                step_network, leg))
+        defaults = section.get('env', {})
         # An absolute plugin path, because LD_LIBRARY_PATH cannot change the
         # loader's search path once Python has started.
         plugin = defaults.get('NCCL_NET_PLUGIN')
         if plugin and not (is_file or os.path.isfile)(plugin):
             raise RuntimeError(
-                f"Multi-node {profile['site']} CUDA startup cannot find the site OFI "
-                f'plugin {plugin}. Load the supported NCCL environment or export '
+                f"Multi-node {profile['site']} {leg.key} startup cannot find the site OFI "
+                f'plugin {plugin}. Load the supported {lib} environment or export '
                 'NCCL_NET_PLUGIN/NCCL_NET.')
+        # Libraries the site's transport dlopens by an unversioned name, which
+        # resolve only through the launch's LD_LIBRARY_PATH (fixed when Python
+        # starts, so this can refuse but not repair).
+        ld_path = [d for d in env.get('LD_LIBRARY_PATH', '').split(':') if d]
+        for name in section.get('launch_libraries', ()):
+            if not any((is_file or os.path.isfile)(os.path.join(d, name)) for d in ld_path):
+                raise RuntimeError(
+                    f"GATE launch_libraries: refusing multi-node {profile['site']} "
+                    f"{leg.key} startup: no {name} on LD_LIBRARY_PATH. The site "
+                    f"transport dlopens it by that name, and without it {lib} "
+                    'cannot register device memory with the network. '
+                    f"{section.get('launch_libraries_remedy', '')}".rstrip())
         result['policy'] = f"{profile['site']} profile"
+        result['mpi_before_collectives'] = bool(section.get('mpi_before_collectives'))
     else:
         on_cxi = cxi if cxi is not None else os.path.isdir('/sys/class/cxi')
         defaults = _CXI_DEFAULTS if on_cxi else {}
@@ -142,14 +177,15 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
                         'this machine')
             result['warnings'].append(
                 f'Slingshot (CXI) NICs but no site profile for {site} '
-                f'({_CONFIG}/<site>/site.toml, selected by LORRAX_SITE_PROFILE or '
-                f'NERSC_HOST); applied only the generic CXI settings '
+                f'({_CONFIG}/<site>/site.toml, selected by LORRAX_SITE_PROFILE, '
+                f'NERSC_HOST or LMOD_SYSTEM_NAME); applied only the generic CXI settings '
                 f'{sorted(_CXI_DEFAULTS)}.')
         path = env.get('LD_LIBRARY_PATH', '').split(':')
-        if not any(d and os.path.isfile(os.path.join(d, 'libnccl-net.so')) for d in path):
+        plugin_file = leg.collective_net_plugin
+        if not any(d and os.path.isfile(os.path.join(d, plugin_file)) for d in path):
             result['warnings'].append(
-                'multi-node CUDA step with neither NCCL_NET nor a net plugin '
-                '(NCCL_NET_PLUGIN, or libnccl-net.so on LD_LIBRARY_PATH): NCCL picks '
+                f'multi-node {leg.key} step with neither NCCL_NET nor a net plugin '
+                f'(NCCL_NET_PLUGIN, or {plugin_file} on LD_LIBRARY_PATH): {lib} picks '
                 'its own transport and may fall back to TCP sockets.')
     result['applied'] = {name: value for name, value in defaults.items() if name not in env}
     return result
@@ -161,7 +197,7 @@ def configure_gpu_network(*, platform='gpu', say=print):
     if _configuration is not None:
         return dict(_configuration)
     decision = plan_network_environment(os.environ, platform=platform)
-    if decision['policy'] == 'non-CUDA':
+    if decision['policy'] == 'no device collectives':
         return decision
     os.environ.update(decision['applied'])
     _configuration = decision
@@ -169,7 +205,7 @@ def configure_gpu_network(*, platform='gpu', say=print):
     placement = (f'{nodes} node(s)' if nodes is not None else
                  'multiple nodes' if decision['multi_node'] else 'unknown placement')
     applied = f"; set {', '.join(decision['applied'])}" if decision['applied'] else ''
-    say(f"[runtime] NCCL network: {placement}; {decision['policy']}{applied} "
+    say(f"[runtime] {decision['library']} network: {placement}; {decision['policy']}{applied} "
         '(resolved before backend initialization).')
     for warning in decision['warnings']:
         say(f'[runtime] WARNING: {warning}')
