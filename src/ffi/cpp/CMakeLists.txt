@@ -1523,10 +1523,14 @@ set(LORRAX_FFI_ROCM_SOURCES
 # The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated
 # whenever the kernel source changes, so the embedded text is that one file.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_kernel.h" LRX_KDFT_SRC)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_core.h" LRX_KDFT_CORE_SRC)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_plan.h" LRX_KDFT_PLAN_SRC)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_src.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/generated/kdft_klead_src.h" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_kernel.h")
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_kernel.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_core.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_plan.h")
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)
