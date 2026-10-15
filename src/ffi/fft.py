@@ -619,7 +619,7 @@ def cubin_cache_dir() -> str:
     (``common.jax_compile_cache``, one namespace per jax, jaxlib, FFI bundle
     and key schema): this store is small and content-addressed — each image
     is keyed by the hash of its source, headers, deciding NVRTC options and
-    toolchain (``common/nvrtc_build.h``), written by tmp+rename and re-hashed
+    toolchain (``common/rtc_build.h``), written by tmp+rename and re-hashed
     on read — so reusing it can never change a result, while rebuilding one
     image costs about 7 s on every rank that misses
     (``docs/architecture/compilation.md``, §2).  One
@@ -647,7 +647,7 @@ def seed_cubin_cache(store: str, cache: str) -> int:
     under a temporary name and renamed into place, so concurrent ranks cannot tear one; a
     file already present is kept, and a dangling link (a retired release) is replaced.  The
     native reader checks each image's key and hash as for any cached file
-    (``common/nvrtc_build.h``), so a torn or foreign store file is rebuilt into the cache.
+    (``common/rtc_build.h``), so a torn or foreign store file is rebuilt into the cache.
     """
     import os
     import warnings

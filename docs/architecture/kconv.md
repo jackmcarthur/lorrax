@@ -89,7 +89,8 @@ The factory picks the backend from the mesh's device vendor alone
 |---|---|
 | CUDA | the nvidia-mathdx kernel family in `liblorrax_ffi.so`: `src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`, and `kconv_outer_cuda_ffi.cc` for the BSE outer-product load |
 | cpu | the plan backend: the reference composition of each mode (the same unfolds, products and spin sums in XLA) with the FFTW3-ABI host handlers of `liblorrax_ffi_host.so` (`lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv`, [FFI layer §3c](ffi_layout.md#3c-which-fft-engine-the-host-library-binds)) |
-| any other (ROCm, …) | the XLA backend: the same composition with `jnp.fft` along the k axes; no LORRAX library |
+| ROCM | the XLA backend, except the k-leading pair: `make_local_kconv_klead` (mode 2, and so `make_kconv_klead`'s apply: Σ τ, COHSEX, the BSE W term) and `make_local_kfft_klead` (mode 3) take the kdft family of `liblorrax_ffi_rocm.so` (`src/ffi/cpp/kdft/`, a direct DFT of each column tile in LDS, hipRTC-built), through `ffi.fft._ROCM_KLEAD_TARGETS`; `kconv_backend` stays `'xla'`. Where kdft cannot serve: an axis above 40 (`GATE kdft-axis`), nk above 3904 (`GATE kdft-tile`), or a failed startup probe (`GATE kdft-probe`, demoted as the mathdx probe is) |
+| any other | the XLA backend: the same composition with `jnp.fft` along the k axes; no LORRAX library |
 
 **Where mathdx cannot serve.** On CUDA a factory takes the XLA backend, with
 one `RuntimeWarning` and a router line per grid, where `ffi.fft.mathdx_refusal`

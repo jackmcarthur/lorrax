@@ -36,16 +36,22 @@ lists. On any other device the driver JIT-compiles the PTX at first load into
 `CUDA_CACHE_PATH` ([registry §5](../reference/env_vars.md#5-external-variables-lorrax-sets-or-reads)),
 at a cost not measured.
 
-**NVRTC images.** One service, `src/ffi/cpp/common/nvrtc_build.h`, builds
+**NVRTC images.** One service, `src/ffi/cpp/common/rtc_build.h`, builds
 every kernel compiled at run time: the k-convolution family, its BSE outer
-kernels, and the Fourier plan's fused pair. It compiles for the device's own
+kernels, and the Fourier plan's fused pair. The same source is the ROCM leg's
+service with the vendor spelled by the leg (`common/leg.h`): hipRTC, resolved
+beside the HIP runtime the process mapped, for the device's full target id
+(`--offload-arch=gfx90a:sramecc+:xnack-`), keyed `hiprtc<maj>.<min>@<libhiprtc
+real path>`, and stored as `kdft_m<mode>_…_gfx90a_<key>.hsaco` in the same cache
+directory ([FFI layer](ffi_layout.md), the kdft family). The rest of this
+paragraph is the CUDA leg's. It compiles for the device's own
 `sm_<cc>`, keeps each image in process, stores it in the cubin cache and
 loads it through the driver API. The cubin cache is always on, has no knob,
 and serves every world size.
 
 | part of the key | what it is |
 |---|---|
-| program | FNV-1a over the embedded source, the text of each embedded header and the NVRTC options that decide the image (`nvrtc_build.cc:130`). Editing a source or header, comments included, invalidates its images |
+| program | FNV-1a over the embedded source, the text of each embedded header and the NVRTC options that decide the image (`rtc_build.cc`, `key`). Editing a source or header, comments included, invalidates its images |
 | toolchain | `nvrtc::mathdx_toolchain`: the cuFFTDx or cuBLASDx, commonDx, CUTLASS and CCCL version headers, the wheel's dist-info name, and the NVRTC version with the loaded `libnvrtc`'s real path. A version header that reads empty disables the disk cache for that build rather than leaving the key |
 | kernel constants | the k-convolution modes and BSE outer kernels: [k-convolution §14](kconv.md#build-and-cache); the Fourier pair: its two GEMM extents and supports (`fourier_plan_cuda_ffi.cc:249`) |
 | not keyed | file names, include paths, the host code, $N_\mu$, $P$ |
@@ -53,7 +59,7 @@ and serves every world size.
 | step | rule |
 |---|---|
 | file | `kconv_m<mode>[w<variant>]_<nkx>x<nky>x<nkz>_ns<ns>[x<n_r>][_c64]_sm<XY>_<key>.cubin`, `kconv_outer[_dec]_…` or `plan_pair_…`, framed by a `LRXKCONV1` header with the key and a payload hash. A k-convolution image is about 8.5 MB on sm_80, 6.1 MB of it line info (claim 4127) |
-| write | to a unique temporary, renamed into place (`nvrtc_build.cc:180`), so concurrent ranks each publish a whole file |
+| write | to a unique temporary, renamed into place (`rtc_build.cc`, `disk_store`), so concurrent ranks each publish a whole file |
 | read | a torn, foreign or non-ELF file is recompiled over the entry; one the driver refuses to load is unlinked first (`:251`) |
 | cost | about 7 s per image (claim 4129), on every rank that misses: nothing is shared until a file lands |
 | store | a process's first `cubin_cache_dir()` call links every store image the cache lacks into it (`ffi.fft.seed_cubin_cache`, `src/ffi/fft.py:451`) under a temporary name, renamed into place; a present entry is kept, a dangling link replaced. A bad store image is rebuilt into the cache over the link; the store file is never written. With the hsuite's 25-image store a cold run builds no image (claim 4126) |

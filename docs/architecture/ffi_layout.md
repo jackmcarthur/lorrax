@@ -88,7 +88,8 @@ its sources, its build and its target strings.
 | mathdx k-convolution | `cufft/kconv_mathdx_cuda_ffi.cc`, `cufft/kbox_stage.cuh` | CUDA; NVRTC for the device's own `sm_<cc>` at first use, disk-cached | `mathdx_kconv_{pair, parent, plane, klead, klead_unfold_xblock, klead_lorentz_conj, chi_unfold, kminor}`, `mathdx_kfft_{klead, klead_unfold, kminor}`; older trees: `mathdx_kconv_klead_{unfold, lorentz}[_rows]`, `mathdx_kconv_klead_unfold_block` |
 | plane FFT (mode 10) | the same file (`kPlaneSrc`) | CUDA; NVRTC | `mathdx_plane_fft_gather` |
 | Local Fourier plan | `cufft/fourier_plan_cuda_ffi.cc`, `cufft/fourier_plan.cu` | CUDA; C++ (cuBLAS, cuFFT), nvcc remap kernel, NVRTC cuBLASDx pair | `fourier_plan_mathdx`; older trees: `fourier_plan` |
-| NVRTC build service | `common/nvrtc_build.{h,cc}`, `common/lrx_async_gather.h`, `cufft/kbox_stage_src.h.in` | CUDA; C++ | none ([the cubin cache](compilation.md#2-native-kernels-and-nvrtc-images)) |
+| run-time compilation service | `common/rtc_build.{h,cc}`, `common/lrx_async_gather.h`, `cufft/kbox_stage_src.h.in` | CUDA (NVRTC) and ROCM (hipRTC); C++ | none ([the cubin cache](compilation.md#2-native-kernels-and-nvrtc-images)) |
+| kdft k-leading pair (modes 2, 3) | `kdft/kdft_klead_ffi.cc`, `kdft/kdft_klead_kernel.h` (device text, `kdft_klead_src.h.in`) | ROCM; hipRTC for the device's target id at first use, disk-cached; leg-neutral source | `kdft_kconv_klead`, `kdft_kfft_klead` |
 | host flat-k FFT | `fftw/fft_flat_k_ffi.cc` | host; C++, the FFTW3 ABI bound by `dlsym` | `mklfft_flat_k`, `mklfft_gw_conv` |
 | host CBLAS GEMM | `cblas/gemm_batch_ffi.cc` | host; C++ | `mklblas_gemm_batch` |
 | distributed dense LA | `cusolvermp/`, `scalapack/`, `slate/` | CUDA: cuSOLVERMp; host: ScaLAPACK, SLATE | [below](#dense-linear-algebra-targets) |
@@ -108,7 +109,7 @@ instruction (`common/lrx_async_gather.h`, `cufft/kbox_stage.cuh`).
 the plain-XLA path, what was tried and did not pay, what limits it) is one
 comment block, with sandbox claim ids, at its Python owner. It stays out of
 the CUDA sources: the cubin key hashes the embedded kernel text, comments
-included (`common/nvrtc_build.h`).
+included (`common/rtc_build.h`).
 
 | family | block above |
 |---|---|
@@ -540,7 +541,7 @@ leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
   `16·(N1'K1 + N2'K2 + K1K2 + N1'K2 + N1'N2')` bytes fit the device's opt-in
   shared memory (else two cuBLAS GEMMs); a warp per block when the smaller
   GEMM output has < 128 elements, else 128 threads. NVRTC-built per
-  `(N1', K1, N2', K2)` through `common/nvrtc_build` (the mathdx key rule with
+  `(N1', K1, N2', K2)` through `common/rtc_build` (the mathdx key rule with
   `cublasdx_version.hpp`), disk-cached with the k-convolution images; 8–13 s
   per shape cold (claim 2764). A100, whole plan against the cuBLAS chain: Fe 25³, K = 13,
   sphere→box 0.80–0.82, box→sphere 0.64–0.66; 16³–48³ 0.8–0.9; shapes that do

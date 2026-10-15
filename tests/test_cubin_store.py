@@ -3,7 +3,7 @@
 A store image the cache lacks is linked in; a cache file already present is kept; a
 dangling link (a retired release's store) is replaced; a non-image file is ignored; a
 missing store links nothing.  A torn or foreign image is the native reader's case
-(``common/nvrtc_build.h``: key and hash checked, rebuilt into the cache).
+(``common/rtc_build.h``: key and hash checked, rebuilt into the cache).
 """
 import os
 
