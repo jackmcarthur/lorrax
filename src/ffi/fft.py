@@ -17,8 +17,10 @@ environment variable (``docs/architecture/decisions.md#xla-reference``):
            make_local_kfft_klead), which takes the kdft family: a direct DFT of
            each column tile in LDS, hipRTC-built per k-grid (``cpp/kdft/``,
            :data:`_ROCM_KLEAD_TARGETS`).  ``kconv_backend`` stays ``'xla'``.
-    other  the XLA backend: the same composition with ``jnp.fft`` along the k
-           axes.  It is the reference every vendor route is gated against on
+    other  the XLA backend: the same composition with XLA's own k-axis
+           transforms (:func:`_kfft`: one dense DFT GEMM on the k axis in place
+           for a grid of at most the leg's ``xla_kdft_max_nk`` points,
+           ``jnp.fft`` above).  It is the reference every vendor route is gated against on
            the same device (:func:`xla_reference`, ``tests/test_kconv_xla_gate.py``).
 
     factory                   layout         operation
@@ -51,6 +53,7 @@ Contract: ``docs/architecture/kconv.md``.
 from __future__ import annotations
 
 import contextlib
+import functools
 import math
 from functools import lru_cache, partial
 from pathlib import Path
@@ -716,11 +719,79 @@ def _host_gw_conv_local(kgrid, norm: str | None, mult: float) -> Callable:
     return _local
 
 
+# The XLA backend's k-axis engine.  ``jnp.fft`` over the k axes of a k-leading
+# tile is XLA's FFT op on minor-most dims: a transpose to k-minor, the batched
+# 3-D transform and a transpose back, each a full pass over the tile, and
+# rocFFT's small fp64 transforms (lengths 3-12) run far below bandwidth even
+# k-minor.  A grid this small is cheaper as ONE GEMM with the dense flat-k DFT
+# matrix applied on the axis where k already sits (``F @ X`` k-leading,
+# ``X @ F`` k-minor; F is symmetric): one read and one write of the tile, no
+# layout change.  MI250X GCD, complex128, unnormalised ifftn (pool log
+# screening_t8.out, ``kfft_probe.py``), jnp.fft k-leading vs DFT GEMM:
+#     5x5x1  x 239121 rows  0.947 -> 0.443 ms  (2.1x)   rel.err 9e-16
+#     6x6x1  x 239121       1.498 -> 0.603 ms  (2.5x)           3e-15
+#     4x4x4  x 120000       1.484 -> 0.431 ms  (3.4x)           1e-15
+#     12x12x1 x 60000       1.268 -> 0.589 ms  (2.2x)           7e-15
+# The GEMM costs 8 N_k flops per element, so the rule stops at the largest grid
+# measured; above it ``jnp.fft``'s N_k log N_k wins.  The cap is a per-leg row
+# of this module (a backend preference, so it stays out of lxkit.LEGS): ROCM
+# from the measurement above; cpu so the XLA reference the host gates compare
+# against exercises the engine; CUDA has no row until the A100 crossover is
+# measured, so its XLA route (``xla_reference``, mathdx refusals) keeps
+# ``jnp.fft`` exactly as before.
+#: The largest k-grid (points) the XLA backend transforms as one dense DFT GEMM, by leg key.
+XLA_KDFT_MAX_NK = {"ROCM": 144, "cpu": 144}
+
+
+def xla_kdft_max_nk() -> int:
+    """This process's dense-DFT cap: the row of the leg of ``jax.devices()[0]`` (0 = none)."""
+    from lxkit import leg_for_vendor
+    from ffi.gate import device_vendor
+    leg = leg_for_vendor(device_vendor(jax.devices()[0]))
+    return XLA_KDFT_MAX_NK.get(leg.key, 0) if leg is not None else 0
+
+
+@functools.lru_cache(maxsize=None)
+def _kdft_matrix(kg: tuple[int, int, int], kind: str) -> np.ndarray:
+    """The unnormalised flat-k DFT matrix ``F^±`` ``(N_k, N_k)`` of ``kg`` (C order, kx
+    slowest): ``ifftn`` is ``e^{+2πi k·R}``, ``fftn`` ``e^{-2πi k·R}``.  Symmetric; the
+    phase of each axis factor is reduced mod n before ``exp``, so every entry is
+    the correctly rounded root of unity times at most two roundings of the
+    Kronecker product."""
+    sign = 1.0 if kind == "ifftn" else -1.0
+    F = np.ones((1, 1), np.complex128)
+    for n in kg:
+        j = np.arange(n)
+        F = np.kron(F, np.exp(sign * 2j * np.pi * (np.outer(j, j) % n) / n))
+    F.setflags(write=False)
+    return F
+
+
+def _uses_kdft(kgrid, backend: str) -> bool:
+    """Whether the XLA backend takes the dense DFT GEMM for this grid."""
+    return backend == "xla" and int(np.prod([int(v) for v in kgrid])) <= xla_kdft_max_nk()
+
+
+def _kdft(x, kgrid, kind: str, *, kminor: bool):
+    """Unnormalised k transform of ``x`` as one GEMM on its flat-k axis: the leading
+    axis (``x (N_k, *rows)``) or the trailing one (``x (*rows, N_k)``)."""
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    F = jnp.asarray(_kdft_matrix(kg, kind), dtype=jnp.result_type(x.dtype, jnp.complex64))
+    hi = jax.lax.Precision.HIGHEST
+    if kminor:
+        return jnp.matmul(x.reshape(-1, nk), F, precision=hi).reshape(x.shape)
+    return jnp.matmul(F, x.reshape(nk, -1), precision=hi).reshape(x.shape)
+
+
 def _kfft(x_flat, kgrid, kind: str, backend: str):
     """Unnormalised transform of the leading flat-k axis: the host handler on the
-    plan backend, ``jnp.fft`` on the XLA backend."""
+    plan backend; on the XLA backend the dense DFT GEMM up to the leg's
+    :func:`xla_kdft_max_nk` points (:func:`_kdft`), ``jnp.fft`` above."""
     if backend == "plan":
         return _host_flat_k(x_flat, kgrid, kind)
+    if _uses_kdft(kgrid, backend):
+        return _kdft(x_flat, kgrid, kind, kminor=False)
     from common.fft_helpers import local_fftn3, local_ifftn3   # see the import-cycle note
     kg = tuple(int(v) for v in kgrid)
     norm = "forward" if kind == "ifftn" else "backward"          # both unnormalised
@@ -1215,6 +1286,8 @@ def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) ->
             y = _rows_kfft_call(KFFT_KMINOR_TARGET, x.reshape(-1, nk), kg,
                                 forward=kind == "fftn", scale=scale)
             return y.reshape(x.shape)
+        if _uses_kdft(kg, backend):                        # the GEMM reads k where it sits
+            return _kdft(x, kg, kind, kminor=True) * scale
         lead = x.reshape(-1, nk).T                        # the transform is k-leading
         return (_kfft(lead, kg, kind, backend) * scale).T.reshape(x.shape)
     return _kminor
@@ -2499,6 +2572,10 @@ def make_local_kconv_kminor(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
 
     def _xla(x, k_r):
         _check_complex(x, k_r)
+        if _uses_kdft(kg, backend):                        # k stays minor: no moveaxis passes
+            u = _kdft(_kdft(x, kg, "ifftn", kminor=True) * k_r[None, :, :, None, None, :],
+                      kg, "fftn", kminor=True) * scale
+            return u if out_layout == 0 else jnp.transpose(u, (0, 5, 3, 1, 4, 2))
         lead = jnp.moveaxis(x, -1, 0)                      # the transform is k-leading
         u = _kfft(_kfft(lead, kg, "ifftn", backend)
                   * jnp.moveaxis(k_r, -1, 0)[:, None, :, :, None, None], kg, "fftn", backend)

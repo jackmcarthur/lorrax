@@ -90,7 +90,7 @@ The factory picks the backend from the mesh's device vendor alone
 | CUDA | the nvidia-mathdx kernel family in `liblorrax_ffi.so`: `src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`, and `kconv_outer_cuda_ffi.cc` for the BSE outer-product load |
 | cpu | the plan backend: the reference composition of each mode (the same unfolds, products and spin sums in XLA) with the FFTW3-ABI host handlers of `liblorrax_ffi_host.so` (`lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv`, [FFI layer §3c](ffi_layout.md#3c-which-fft-engine-the-host-library-binds)) |
 | ROCM | the XLA backend, except the k-leading pair: `make_local_kconv_klead` (mode 2, and so `make_kconv_klead`'s apply: Σ τ, COHSEX, the BSE W term) and `make_local_kfft_klead` (mode 3) take the kdft family of `liblorrax_ffi_rocm.so` (`src/ffi/cpp/kdft/`, a direct DFT of each column tile in LDS, hipRTC-built), through `ffi.fft._ROCM_KLEAD_TARGETS`; `kconv_backend` stays `'xla'`. Where kdft cannot serve: an axis above 40 (`GATE kdft-axis`), nk above 3904 (`GATE kdft-tile`), or a failed startup probe (`GATE kdft-probe`, demoted as the mathdx probe is) |
-| any other | the XLA backend: the same composition with `jnp.fft` along the k axes; no LORRAX library |
+| any other | the XLA backend: the same composition with XLA's k-axis transforms (one dense DFT GEMM on the k axis for $N_k \le$ the leg's `xla_kdft_max_nk`, `jnp.fft` above; [§15](#numerical-contract)); no LORRAX library. The ROCM rows above that are not the kdft pair take this backend too |
 
 **Where mathdx cannot serve.** On CUDA a factory takes the XLA backend, with
 one `RuntimeWarning` and a router line per grid, where `ffi.fft.mathdx_refusal`
@@ -178,12 +178,12 @@ One handler file serves modes 0–11, each a value of the compile-time
 `LRX_MODE` of one embedded source. A target string is `lorrax_mathdx_<suffix>`;
 `ffi_loader._CUDA_TARGET_SYMBOLS` maps it to its C++ handler symbol.
 
-| mode, target suffix | factory (`ffi.fft`) | computes | operands → result | plan and XLA backends (host transforms on cpu, `jnp.fft` elsewhere) |
+| mode, target suffix | factory (`ffi.fft`) | computes | operands → result | plan and XLA backends (host transforms on cpu, XLA k transforms elsewhere) |
 |---|---|---|---|---|
 | 0 `kconv_pair` | `make_fused_conv_kpair` | $U = s\,F_k\sum_{ab}\phi_l[a]\phi_r[b]\,\overline{F^{-1}A_{a,b}}\cdot F^{-1}B_{\pi_l a,\pi_r b}$ | `A`, `B` `(n_kx, n_ky, n_kz, n_s, col, μ, n_s)` → `U` `(n_kx, n_ky, n_kz, col, μ)` | two inverse transforms, the spin sum, one forward transform |
 | 1 `kconv_parent` | `make_fused_conv_kparent` | mode 0 with both operands unfolded from raw parents on the load ([§9](#mode-1)) | `D_l`, `D_r` `(n_parent, n_s, μ, n_s, ν)` and ten tables → `U` `(N_k, μ, ν)` | the typed parent load in XLA (a full-k `(N_k, n_s, μ, ν, n_s)` copy per side), then mode 0's composition |
 | 2 `kconv_klead` | `make_kconv_klead` (`apply`), `make_local_kconv_klead` | $U = s\,F_k(F^{-1}T\cdot V_R)$, $V_R$ already in R space | `T`, `U` `(N_k, a, m_x, b, m_y)`, `V_R` `(N_k, m_x, m_y)` | `lorrax_mklfft_gw_conv` (`make_kconv_klead` on cpu); the inverse transform, the product, the forward transform |
-| 3 `kfft_klead` | `make_kfft_klead`, `make_local_kfft_klead`; `prep` of `make_kconv_klead` | $Y = s\,F^{\pm}_k X$, k leading | `(N_k, rows)` | `lorrax_mklfft_flat_k`; `jnp.fft` over the three k axes |
+| 3 `kfft_klead` | `make_kfft_klead`, `make_local_kfft_klead`; `prep` of `make_kconv_klead` | $Y = s\,F^{\pm}_k X$, k leading | `(N_k, rows)` | `lorrax_mklfft_flat_k`; the XLA k transform (DFT GEMM, or `jnp.fft` over the three k axes) |
 | 4 `kconv_kminor` | `make_kconv_kminor`, `make_local_kconv_kminor` | $U = s\,F_k(F^{-1}X\cdot K_R)$, k trailing, $K_R$ made by mode 5 | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | k moved to the front, the transforms and the product, k moved back |
 | 5 `kfft_kminor` | `make_kfft_kminor`, `make_local_kfft_kminor` | $Y = s\,F^{\pm}_k X$, k trailing | `(rows, N_k)` | the same transpose around one transform |
 | 6 `kconv_plane` | `make_fused_conv_kplane` | mode 0 read from route G's plane-transform output (`g` planes of `p` points, `c` centroids per side): the Bloch phase `F[k,g,p]` applied and the `2c` axis split on the load into the left projector (slots `[0, c)`) and the right one (`[c, 2c)`) | `D` `(N_k, g, n_s, 2c, n_s, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | phase, split and transpose in XLA, then mode 0's composition |
@@ -664,6 +664,14 @@ build log lines by its §7.
   mode is complex128 only. The host plan handlers are complex128 only, so a
   complex64 operand refuses at trace time on a cpu mesh; the XLA backend takes
   either precision.
+- **XLA k transforms.** On the XLA backend a k-grid of at most the leg's
+  cap (`ffi.fft.XLA_KDFT_MAX_NK`: ROCM and cpu 144; CUDA none until its
+  crossover is measured, so CUDA's XLA route is unchanged) is transformed as one GEMM with the dense
+  flat-k DFT matrix on the axis where k sits (`ffi.fft._kdft`), not with
+  `jnp.fft`, whose XLA FFT op on minor-most dims costs a transpose each way
+  around rocFFT/cuFFT. The two agree to round-off (relative 1e-15 at
+  complex128 on MI250X up to 12×12×1), not bitwise; above the cap `jnp.fft`
+  is unchanged.
 - **In place.** Modes 2, 3 and 5, and mode 4 with `out_layout=0`, alias
   operand 0 to the result; mode 11 aliases `acc`. This is safe because each
   block reads all $N_k$ values of its columns before it stores any of them.
