@@ -223,6 +223,12 @@ KDFT_KBOX_AXIS_MAX = 40
 #: residency rule, not KDFT_NK_MAX, bounds nk.
 KDFT_KBOX_WEDGE_AXIS_MAX = 40
 KDFT_KBOX_CHI_AXIS_MAX = 40
+#: Mode 9's routing floor: the k-box tile's columns (whole spin groups).  Measured on one MI250X
+#: GCD at a 128 x 128 tile (scalar W, pool log kboxchi_bench2): tiles of 8-64 columns 0.99-2.1x
+#: the XLA route (kdft mode 3; 1.4-2.1x on four of five grids), tiles of 1-2 columns 0.64-0.94x
+#: (8^3, 10^3, 12^3), so those keep the XLA route.  A router rule, not a kernel limit: the
+#: handler runs any tile that fits.
+KDFT_KBOX_WEDGE_MIN_COLS = 4
 
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
@@ -492,19 +498,24 @@ def kdft_kbox_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
 def kdft_kbox_wedge_refusal(kgrid, ns: int, nsr: int | None = None, lds: int = KDFT_KBOX_LDS) -> str:
     """Why the ROCM k-box stage cannot serve mode 9 (:func:`make_kfft_klead_unfold`) on ``kgrid``
     with endpoint widths ``(ns, nsr)`` ("" when it can): an axis beyond
-    :data:`KDFT_KBOX_WEDGE_AXIS_MAX`, or a spin group of ``ns*nsr`` columns (one operand, one
-    transform) beyond a block's LDS (the single arm; the split arm is not ported)."""
+    :data:`KDFT_KBOX_WEDGE_AXIS_MAX`, a spin group of ``ns*nsr`` columns (one operand, one
+    transform) beyond a block's LDS (the single arm; the split arm is not ported), or a tile
+    narrower than :data:`KDFT_KBOX_WEDGE_MIN_COLS` (slower than the XLA route)."""
     kg = tuple(int(v) for v in kgrid)
     if max(kg) > KDFT_KBOX_WEDGE_AXIS_MAX:
         return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_KBOX_WEDGE_AXIS_MAX} "
                 "(k-box mode 9's direct-DFT line transform)")
     group = int(ns) * int(ns if nsr is None else nsr)
     tr, per_col = _kbox_single_arm(kg, group, 1, lds)
-    if tr:
-        return ""
-    return (f"GATE kdft-kbox-residency: got k-grid {kg} widths ({ns}, {nsr or ns}), a spin group of {group} "
-            f"padded columns ({per_col} B); want it in a block's {lds // 1024} KiB of LDS (k-box mode 9's "
-            "single arm; the split arm is not ported to ROCM)")
+    if not tr:
+        return (f"GATE kdft-kbox-residency: got k-grid {kg} widths ({ns}, {nsr or ns}), a spin group of {group} "
+                f"padded columns ({per_col} B); want it in a block's {lds // 1024} KiB of LDS (k-box mode 9's "
+                "single arm; the split arm is not ported to ROCM)")
+    if tr * group < KDFT_KBOX_WEDGE_MIN_COLS:
+        return (f"GATE kdft-kbox-tile: got k-grid {kg} widths ({ns}, {nsr or ns}), a single-arm tile of "
+                f"{tr * group} column(s); want >= {KDFT_KBOX_WEDGE_MIN_COLS} (narrower tiles measured slower "
+                "than the XLA route: KDFT_KBOX_WEDGE_MIN_COLS)")
+    return ""
 
 
 def kdft_kbox_chi_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:

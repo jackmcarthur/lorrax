@@ -16,7 +16,8 @@ Modes 9 and 11 (:func:`gate_cases_rspace`) the same way: ``make_kfft_klead_unfol
 partner tile, the conjugate rule, unequal endpoint widths and placed tables with live rows;
 ``make_kconv_chi_unfold`` with partner tiles and the completion, conj(G) partners, placed tables
 with live rows; ``make_kconv_chi_vertex`` with a sign_c and with conj(G) partners, placed, live;
-grids up to 7^3 (mode 11 at ns 2) and an axis of 40 (each mode's own bound).
+grids up to 7^3 and an axis of 40 (each mode's own bound); mode 9's tile floor
+(``GATE kdft-kbox-tile``) is checked as a refusal.
 
 ROCm: ``python -m tests.test_kdft_kbox_gate`` on any mesh (one GCD or a 2x2 P=4 mesh).
 ``--bench``: one GCD, the k-box route against the XLA route per call at production-shaped
@@ -170,7 +171,7 @@ def gate_cases_rspace(mesh):
 
     # mode 9: (grid, n_l, n_r, m)
     for kg, nl_, nr_, m in (((3, 2, 2), 1, 1, 6), ((5, 5, 1), 1, 1, 6), ((4, 4, 4), 2, 2, 4),
-                            ((3, 2, 2), 2, 3, 4), ((8, 8, 8), 1, 1, 4), ((12, 12, 12), 1, 1, 2),
+                            ((3, 2, 2), 2, 3, 4), ((7, 7, 7), 1, 1, 4), ((6, 6, 6), 2, 2, 2),
                             ((40, 8, 1), 1, 1, 3), ((6, 6, 1), 4, 4, 2)):
         nk = int(np.prod(kg))
         n_parent = max(2, nk // 4)
@@ -182,7 +183,7 @@ def gate_cases_rspace(mesh):
         base = base._replace(spin=unitary(nk, nl_), spin_r=None if nr_ == nl_ else unitary(nk, nr_))
         Wp = put(rnd(n_parent, m * px * nl_, m * py * nr_), P(None, "x", "y"))
         Wt = put(rnd(n_parent, m * px * nl_, m * py * nr_), P(None, "x", "y"))
-        live = put(np.asarray([1, m - 1], np.int32), P())
+        live = put(np.asarray([1, max(2, m - 1)], np.int32), P())   # >= 1 live row at m = 2
         for name, tg, kw in (("partner", base, dict(Wt=Wt)), ("conj rule", base._replace(conj_trs=1), {}),
                              ("placed, live", base, dict(Wt=Wt, load=device_load_tables(base, mesh), live=live))):
             a, b = both(lambda: F.make_kfft_klead_unfold(mesh, kg, tg, norm="ortho"), lambda f: f(Wp, **kw))
@@ -206,7 +207,7 @@ def gate_cases_rspace(mesh):
         alpha = put(rnd(n_out), P())
         acc0 = rnd(n_out, nk, mu, nu)
         gl = device_load_tables(tg, mesh)
-        live = put(np.asarray([1, m - 1], np.int32), P())
+        live = put(np.asarray([1, max(2, m - 1)], np.int32), P())   # >= 1 live row at m = 2
         chi = lambda complete: (lambda: F.make_kconv_chi_unfold(mesh, kg, tg, n_out=n_out, complete=complete,
                                                                 norm="ortho"))
         a, b = both(chi(True), lambda f: f(put(acc0, acc_spec), G, Gc, alpha, Gt, Gct))
@@ -228,6 +229,7 @@ def gate_cases_rspace(mesh):
     # grids the single arms cannot hold go to XLA with the named gates
     checks = {"refusal m11 8^3 ns2 -> GATE kdft-kbox-residency": F.kdft_kbox_chi_refusal((8, 8, 8), 2),
               "refusal m9 16^3 w1x1 -> GATE kdft-kbox-residency": F.kdft_kbox_wedge_refusal((16, 16, 16), 1, 1),
+              "refusal m9 10^3 w1x1 -> GATE kdft-kbox-tile": F.kdft_kbox_wedge_refusal((10, 10, 10), 1, 1),
               "refusal m11 41x2x1 -> GATE kdft-axis": F.kdft_kbox_chi_refusal((41, 2, 1), 1),
               "refusal m9 41x2x1 -> GATE kdft-axis": F.kdft_kbox_wedge_refusal((41, 2, 1), 1, 1)}
     for name, why in checks.items():
@@ -274,16 +276,22 @@ def bench_rspace(mesh, mode, grids, m, ns, reps):
             jit_of = lambda f: jax.jit(lambda c, a, b, al, l: f(c, a, b, al, load=l))
             args = (acc, G, Gc, alpha, gl)
             gbytes = (2 * n_parent * (ns * m) ** 2 + 2 * nk * m * m) * 16 / 1e9   # G pair read, acc r+w
+        t0 = time.perf_counter()
+        say = lambda what: print(f"kbox-bench   [{time.perf_counter() - t0:7.1f} s] {kg} {what}", flush=True)
         with F.xla_reference():
             f_ref = build()
         j_ref = jit_of(f_ref)
+        say("XLA route built")
         t_ref = _timed(j_ref, *args, reps=reps)
+        say("XLA route timed")
         line = (f"kbox-bench mode={mode} kgrid={kg[0]}x{kg[1]}x{kg[2]} nk={nk} n_parent={n_parent} m={m} | "
                 f"XLA route {t_ref:.3f} ms")
         if why:
             print(line + f" | k-box: refused ({why[:70]})", flush=True)
             continue
         j_kb = jit_of(build())
+        jax.block_until_ready(j_kb(*args))
+        say("k-box first call (build + image) done")
         t_kb = _timed(j_kb, *args, reps=reps)
         err = _rel(np.asarray(j_kb(*args)), np.asarray(j_ref(*args)))
         print(line + f" | k-box {t_kb:.3f} ms  x{t_ref / t_kb:.2f}  rel err {err:.2e}  "
