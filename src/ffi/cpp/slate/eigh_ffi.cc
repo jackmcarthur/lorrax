@@ -26,8 +26,12 @@
 // Input preservation: slate::heev overwrites its input with Householder
 // reduction intermediates, but A is an XLA *input* buffer and must not
 // be mutated (XLA may share it with other consumers).  We copy the
-// local shard into the Q output buffer and let SLATE destroy that copy;
-// the eigenvector tiles are then written over it after heev returns.
+// local shard into SLATE-owned tiles (see EighImpl) and let SLATE destroy
+// those; the eigenvector tiles are copied into Q after heev returns.
+//
+// Tile size: any nb dividing n/p.  The Python wrapper relabels (passes the
+// P('x','y') shard as-is with nb < n/p, so SLATE solves Pi A Pi^T) and
+// un-permutes Q's columns; see distrib_la._cyclic.
 
 #include "../common/ctx_registry.h"
 #include <complex>
@@ -104,22 +108,40 @@ static ffi::Error EighImpl(
            << "(run_shifter.sh does this when LORRAX_SLATE_STACK is set).";
         return ffi::Error(ffi::ErrorCode::kFailedPrecondition, os.str());
     }
-    const int num_devices = 1;
 
-    // Copy the input shard into the Q output buffer: heev destroys its
-    // input during the Householder reduction, and XLA input buffers
-    // must never be mutated.  The Q buffer doubles as the scratch — the
-    // eigenvector tiles overwrite it after heev returns.
-    const int64_t local_rows = (n + p - 1) / p;
-    const int64_t local_cols = (n + q - 1) / q;
-    ce = lrx::gpu::memcpy_async(d_Q_local, d_A_local,
-                         local_rows * local_cols * sizeof(T),
-                         lrx::gpu::kDeviceToDevice, xla_stream);
-    if (ce != lrx::gpu::kSuccess) {
-        std::ostringstream os;
-        os << "slate.eigh: " LRX_GPU_API "MemcpyAsync(A -> scratch) failed: "
-           << lrx::gpu::error_string(ce);
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+    // A is copied into SLATE-OWNED device tiles (stride nb) rather than
+    // wrapped with fromDevices: (1) heev destroys its input and XLA input
+    // buffers must not be mutated (this replaces the former A -> Q scratch
+    // copy, same traffic); (2) at nb < n/p a wrapped buffer has tile stride
+    // lld = n/p while SLATE's own workspace tiles have stride nb, and SLATE's
+    // device-region batching requires uniform strides within a group (the
+    // internal_batch.hh:290 assert in _slate.validate_tile_layout).  Owned
+    // tiles are uniform by construction.  The local buffer holds the rank's
+    // block-cyclic tiles at fromDevices' offsets (lld = n/p); the copy is the
+    // inverse of the Z copy-back below.
+    sl::HermitianMatrix<T> A(sl::Uplo::Lower, n, nb, p, q, ctx->comm);
+    A.insertLocalTiles(sl::Target::Devices);
+    for (int64_t tj = 0; tj < A.nt(); ++tj) {
+        for (int64_t ti = tj; ti < A.mt(); ++ti) {
+            if (!A.tileIsLocal(ti, tj)) continue;
+            const int dev = A.tileDevice(ti, tj);
+            auto tile = A(ti, tj, dev);
+            const int64_t ii = ti * nb, jj = tj * nb;
+            const int64_t ii_local = (ii / (nb * p)) * nb + (ii % nb);
+            const int64_t jj_local = (jj / (nb * q)) * nb + (jj % nb);
+            const T* src = d_A_local + ii_local + jj_local * lld_A;
+            ce = lrx::gpu::memcpy_2d_async(
+                tile.data(), tile.stride() * sizeof(T),
+                src, lld_A * sizeof(T),
+                tile.mb() * sizeof(T), tile.nb(),
+                lrx::gpu::kDeviceToDevice, xla_stream);
+            if (ce != lrx::gpu::kSuccess) {
+                std::ostringstream os;
+                os << "slate.eigh: " LRX_GPU_API "Memcpy2DAsync(A -> tile (" << ti
+                   << "," << tj << ")) failed: " << lrx::gpu::error_string(ce);
+                return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+            }
+        }
     }
     ce = lrx::gpu::stream_synchronize(xla_stream);
     if (ce != lrx::gpu::kSuccess) {
@@ -128,12 +150,6 @@ static ffi::Error EighImpl(
            << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    T* A_ptrs[1] = { d_Q_local };
-
-    // Build the distributed matrices over ctx->comm.  Lower triangular
-    // storage — SLATE only supports Uplo::Lower for heev.
-    sl::HermitianMatrix<T> A = sl::HermitianMatrix<T>::fromDevices(
-        sl::Uplo::Lower, n, A_ptrs, num_devices, lld_A, nb, p, q, ctx->comm);
 
     std::vector<real_t> Lambda(n);
 
@@ -155,9 +171,8 @@ static ffi::Error EighImpl(
             sl::heev(A, Lambda, Z, opts);
 
             // Copy local tile data back to d_Q_local (col-major within
-            // the tile; the Python wrapper local-transposes back).  At
-            // most one local tile per rank with our nb=n/p, though we
-            // loop to stay correct for smaller nb.
+            // the tile; the Python wrapper local-transposes back), at the
+            // fromDevices offsets of the rank's block-cyclic tiles.
             //
             // tileGetForReading is REQUIRED before touching tile data:
             // heev's back-transformation (unmtr_hb2st / unmtr_he2hb via
