@@ -26,19 +26,21 @@
 # One MPI and one BLAS per process: PrgEnv-gnu + the pins in ffi_mpi.sh,
 # craype-accel-amd-gfx90a UNLOADED so the Cray wrapper links no libmpi_gtl_hsa
 # (SLATE stages tiles through host memory for MPI; it needs no GPU-aware MPI).
-# Host BLAS/LAPACK = LibSci's SEQUENTIAL flavour libsci_gnu, passed EXPLICITLY
-# with cray-libsci captured-then-UNLOADED (else the wrapper injects its own).
-# SEQUENTIAL because SLATE calls host BLAS concurrently from its OpenMP task
-# threads and assumes a sequential BLAS (its own default blas_threaded=false;
-# it has no BLAS-thread control).  MEASURED 2026-10-15, P=4 2x2, heev n=2048
-# (nb=1024): against libsci_gnu_mp every run SIGSEGVs in
-# openblas_dgemm_oncopy <- dtrmm on a SLATE worker thread; OMP_NUM_THREADS=7,1
-# still crashes, OMP_NUM_THREADS=1 passes, and LD_PRELOAD of the sequential
-# libsci_gnu.so.6 passes with full threading.  n=512 (nb=256) passes either
-# way: below OpenBLAS's threading threshold.
+# Host BLAS/LAPACK = the sequential, LOCKING OpenBLAS of build_openblas_seq.sh
+# (run it first), passed EXPLICITLY with cray-libsci UNLOADED (else the
+# wrapper injects its own).  SLATE calls host BLAS concurrently from its OpenMP
+# task threads and assumes a sequential BLAS that is safe for concurrent
+# callers (its own default blas_threaded=false; it has no BLAS-thread
+# control).  LibSci has no such flavour:
+#   - libsci_gnu_mp: MEASURED 2026-10-15, P=4 2x2, heev n=2048 (nb=1024):
+#     every run SIGSEGVs in openblas_dgemm_oncopy <- dtrmm on a SLATE worker
+#     thread; OMP_NUM_THREADS=7,1 still crashes, OMP_NUM_THREADS=1 passes.
+#   - libsci_gnu (sequential, no locking): MEASURED 2026-10-15, heev at
+#     nb < n/p returns WRONG eigenvalues/vectors with no error (P=1 and P=4,
+#     Target Devices and HostTask); exact with OMP_NUM_THREADS=1 or with the
+#     locking OpenBLAS (SLATE_PERF_REPORT).  At one tile per rank (the old
+#     forced nb = n/p) few tasks overlap and it passed.
 # Earlier measurement, module left loaded: BLAS++ (linked by the HIP driver,
-# one .hip source) got the wrapper's implicit -lsci_gnu_mpi -lsci_gnu beside
-# the threaded pair -- both LibSci flavours in one library (GATE 2a).
 # Device code: SLATE's src/hip kernels are compiled by hipcc; BLAS++ enables
 # the CMake HIP language.  Both target gfx90a (no xnack feature, so the image
 # runs under either HSA_XNACK mode).
@@ -70,9 +72,14 @@ module unload craype-accel-amd-gfx90a 2>/dev/null || true
     echo "[slate-hip] ERROR: modules resolved MPICH=$CRAY_MPICH_DIR LIBSCI=$CRAY_LIBSCI_PREFIX_DIR," >&2
     echo "[slate-hip]   not the pins in config/frontier/ffi_mpi.sh" >&2; exit 2; }
 : "${ROCM_PATH:?module $ROCM_MOD did not set ROCM_PATH}"
-# Capture LibSci, THEN unload it (else the wrapper injects sequential -lsci_gnu).
-LIBSCI_LIB="$CRAY_LIBSCI_PREFIX_DIR/lib/libsci_gnu${LORRAX_SLATE_LIBSCI_FLAVOUR:-}.so"   # sequential
-[[ -f "$LIBSCI_LIB" ]] || { echo "[slate-hip] ERROR: no $LIBSCI_LIB" >&2; exit 2; }
+# The host BLAS: build_openblas_seq.sh's sequential locking OpenBLAS (GATE: its
+# stamp says USE_THREAD=0 and USE_LOCKING=1).  Unload LibSci so the wrapper
+# injects no -lsci_gnu beside it.
+BLAS_DIR="${LORRAX_SLATE_HOST_BLAS_DIR:-$ROOT/openblas/install}"
+BLAS_LIB="$BLAS_DIR/lib/libopenblas.so"
+[[ -f "$BLAS_LIB" ]] || { echo "[slate-hip] ERROR: no $BLAS_LIB (run config/frontier/build_openblas_seq.sh)" >&2; exit 2; }
+grep -q 'USE_THREAD=0' "$BLAS_DIR/LORRAX_BUILD_FLAGS" 2>/dev/null && grep -q 'USE_LOCKING=1' "$BLAS_DIR/LORRAX_BUILD_FLAGS" || {
+    echo "[slate-hip] ERROR: $BLAS_DIR is not a sequential LOCKING OpenBLAS (no USE_THREAD=0 USE_LOCKING=1 stamp)" >&2; exit 2; }
 module unload cray-libsci 2>/dev/null || true
 echo "[slate-hip] modules: $(module -t list 2>&1 | tr '\n' ' ')"
 echo "[slate-hip] ROCM_PATH=$ROCM_PATH"
@@ -96,13 +103,20 @@ cmake -S "$SRC" -B "$BUILD" \
     -DCMAKE_HIP_ARCHITECTURES="$GFX" -DGPU_TARGETS="$GFX" -DAMDGPU_TARGETS="$GFX" \
     -DCMAKE_PREFIX_PATH="$ROCM_PATH" \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-    -DBLAS_LIBRARIES="$LIBSCI_LIB" -DLAPACK_LIBRARIES="$LIBSCI_LIB" \
+    -DBLAS_LIBRARIES="$BLAS_LIB" -DLAPACK_LIBRARIES="$BLAS_LIB" \
+    -DCMAKE_INSTALL_RPATH="$BLAS_DIR/lib" \
     -Dgpu_backend=hip \
     -DSCALAPACK_LIBRARIES="" \
     -Dbuild_tests=no
 cmake --build "$BUILD" --parallel "$JOBS"
 cmake --install "$BUILD"
 
+# The host BLAS ships INSIDE the prefix: the leg links libopenblas.so.0 itself
+# (BLAS++'s link interface) and binds its closure by DT_RPATH $ORIGIN:$PREFIX/lib64,
+# so a libopenblas.so.0 outside it resolves to whatever the system has
+# (MEASURED: /usr/lib64/libopenblas.so.0, not this build).
+cp -a "$BLAS_DIR"/lib/libopenblas*.so* "$PREFIX/lib64/"
+cp "$BLAS_DIR/LORRAX_BUILD_FLAGS" "$PREFIX/lib64/libopenblas.LORRAX_BUILD_FLAGS"
 echo "[slate-hip] hip done. install: $PREFIX"
 fail=0
 for f in "$PREFIX"/lib64/libslate.so "$PREFIX"/lib64/libblaspp.so "$PREFIX"/lib64/liblapackpp.so; do
@@ -113,19 +127,15 @@ need() { readelf -d "$1" | grep NEEDED | sed 's/.*\[//;s/\]//'; }
 need "$PREFIX/lib64/libblaspp.so"  | grep -qx 'librocblas.so.5'   || { echo "[slate-hip] ERROR: BLAS++ has no rocBLAS (gpu_backend=hip not taken)" >&2; fail=1; }
 need "$PREFIX/lib64/liblapackpp.so" | grep -qx 'librocsolver.so.0' || { echo "[slate-hip] ERROR: LAPACK++ has no rocSOLVER" >&2; fail=1; }
 for f in "$PREFIX"/lib64/lib{slate,blaspp,lapackpp}.so; do
-    if need "$f" | grep -qE 'cudart|cublas|libmpi_gtl|libopenblas'; then
-        echo "[slate-hip] ERROR: $(basename "$f") links a CUDA runtime / GTL / second BLAS" >&2; fail=1; fi
+    if need "$f" | grep -qE 'cudart|cublas|libmpi_gtl|libsci'; then
+        echo "[slate-hip] ERROR: $(basename "$f") links a CUDA runtime / GTL / LibSci (a second BLAS)" >&2; fail=1; fi
     if need "$f" | grep -E '^libamdhip64' | grep -qvx 'libamdhip64.so.7'; then
         echo "[slate-hip] ERROR: $(basename "$f") links a HIP runtime other than libamdhip64.so.7" >&2; fail=1; fi
     if need "$f" | grep -E '^libmpi' | grep -qvx "$LORRAX_OLCF_MPI_SONAME"; then
         echo "[slate-hip] ERROR: $(basename "$f") links an MPI other than $LORRAX_OLCF_MPI_SONAME" >&2; fail=1; fi
 done
-# One LibSci threading flavour across the whole SLATE closure (GATE 2a's rule,
-# applied to the three libraries the leg pulls in).
-_sci="$(for f in "$PREFIX"/lib64/lib{slate,blaspp,lapackpp}.so; do need "$f"; done | grep -E '^libsci' | sort -u)"
-if printf '%s\n' "$_sci" | grep -qE '^libsci_gnu(_mpi)?\.so' && printf '%s\n' "$_sci" | grep -qE '_mp\.so'; then
-    echo "[slate-hip] ERROR: both LibSci threading flavours in the SLATE closure: $(echo $_sci)" >&2; fail=1; fi
-if [[ -z "${LORRAX_SLATE_LIBSCI_FLAVOUR:-}" ]] && printf '%s\n' "$_sci" | grep -qE '_mp\.so'; then
-    echo "[slate-hip] ERROR: a threaded LibSci in the SLATE closure ($(echo $_sci)); SLATE needs the sequential one" >&2; fail=1; fi
-echo "[slate-hip] LibSci in closure: $(echo $_sci)"
+# The one host BLAS of the SLATE closure is the locking OpenBLAS.
+need "$PREFIX/lib64/libblaspp.so" | grep -qx 'libopenblas.so.0' || {
+    echo "[slate-hip] ERROR: BLAS++ does not link libopenblas.so.0" >&2; fail=1; }
+echo "[slate-hip] host BLAS: $BLAS_LIB ($(cat "$BLAS_DIR/LORRAX_BUILD_FLAGS"))"
 exit $fail

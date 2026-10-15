@@ -523,6 +523,27 @@ elif [[ "$LEG" == rocm ]]; then
       (CMakeLists ROCM block); a stale build or an LD_PRELOAD defeats it."; _g3=1
             else
                 say "GATE 3c: libslate.so.2 -> $_sl (HIP build)"
+                # GATE 3d: SLATE's host BLAS must be safe for CONCURRENT callers
+                # (SLATE calls it from its OpenMP task threads).  LibSci is not,
+                # in either flavour: threaded SIGSEGVs, sequential returns wrong
+                # heev eigenpairs at nb < n/p (SLATE_PERF_REPORT); the site's
+                # BLAS is the locking OpenBLAS (build_openblas_seq.sh), shipped in
+                # the SLATE prefix.  Checked on the LEG's closure: SONAMEs the leg
+                # binds by DT_RPATH are the ones SLATE's own NEEDED entries meet.
+                _bl="$(ldd "$SO" 2>/dev/null | awk '$1 ~ /^lib(sci|openblas)/{print $1"="$3}' | sort -u | tr '\n' ' ')"
+                _ob="$(ldd "$SO" 2>/dev/null | awk '$1 ~ /^libopenblas/{print $3}' | head -1)"
+                if printf '%s' "$_bl" | grep -q 'libsci'; then
+                    fail 3d "the leg's closure maps LibSci ($_bl): not safe for SLATE's
+      concurrent host BLAS calls.  Rebuild with config/frontier/build_openblas_seq.sh
+      then build_slate_hip.sh."; _g3=1
+                elif [[ -z "$_ob" ]]; then
+                    fail 3d "the leg's closure maps no libopenblas ($_bl)."; _g3=1
+                elif grep -qs 'USE_LOCKING=1' "$(dirname "$_ob")/libopenblas.LORRAX_BUILD_FLAGS"; then
+                    say "GATE 3d: SLATE host BLAS $_ob ($(cat "$(dirname "$_ob")/libopenblas.LORRAX_BUILD_FLAGS"))"
+                else
+                    fail 3d "the leg binds $_ob, not a sequential LOCKING OpenBLAS (no
+      libopenblas.LORRAX_BUILD_FLAGS stamp with USE_LOCKING=1 beside it)."; _g3=1
+                fi
             fi
         fi
     fi
