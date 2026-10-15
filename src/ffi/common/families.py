@@ -103,7 +103,8 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         _legs(("built", ""), ("built", ""), ("built", "")),
         note="ROCM: SLATE v2025.05.28-1 gpu_backend=hip (config/frontier/build_slate_hip.sh), "
              "sequential LibSci; eigh/potrf gated against the native route at P=4, n=512-8192. "
-             "Distributed solve_lu has no ROCM backend yet (no SLATE getrf handler in this tree)."),
+             "ROCM also builds the LU family (getrf PartialPiv + getrs: distributed solve_lu, "
+             "gated against jnp.linalg.solve at P=4); CUDA's LU is cusolvermp, the host's scalapack."),
     "scalapack": Family(
         ("lorrax_scalapack_",), "scalapack",
         _legs(("elsewhere", "cusolvermp"), ("elsewhere", "slate"), ("built", "")),

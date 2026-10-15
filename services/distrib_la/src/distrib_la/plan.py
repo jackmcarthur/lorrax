@@ -453,6 +453,9 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("solve_lu", "scalapack"):  dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
+    ("solve_lu", "slate"):      dict(one=None,
+                                     many="batched_distributed_solve_lu",
+                                     post=None),
     # native2d is pure JAX, but it routes through the same table: its
     # kernel is a single lax.map over the whole q axis, so it has a
     # stacked entry and no single-tile one, exactly like cuSOLVERMp's

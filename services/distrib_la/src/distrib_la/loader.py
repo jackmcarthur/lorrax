@@ -156,8 +156,16 @@ _HOST_TARGET_SYMBOLS = {
 #: device leg is loaded per process), over a gpu_backend=hip SLATE
 #: (config/frontier/build_slate_hip.sh).  ``distrib_la.resolve`` carries the
 #: ROCM preference rows; cuSOLVERMp has no ROCm build, so it has no row here.
-_ROCM_TARGET_SYMBOLS: dict = {t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
-                              if t.startswith("lorrax_slate_")}
+#: Plus the SLATE LU family (cpp/slate/batched_solve_lu_ffi.cc), which only
+#: this leg builds: CUDA's distributed LU is cuSOLVERMp, the host's ScaLAPACK.
+_ROCM_SLATE_LU_SYMBOLS: dict = {
+    "lorrax_slate_batched_solve_lu_factors": "SlateBatchedSolveLuFactorsFfi",
+    "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
+    "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
+}
+_ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
+                                 if t.startswith("lorrax_slate_")},
+                              **_ROCM_SLATE_LU_SYMBOLS}
 
 #: Leg key -> this loader's target table and not-found build command.
 _TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,

@@ -35,6 +35,10 @@ __all__ = [
     # single-matrix ops
     "SlateLowerL", "distributed_cholesky",
     "distributed_eigh",
+    # the distributed LU family (ROCM leg): fused + split getrf/getrs
+    "batched_distributed_solve_lu",
+    "batched_distributed_getrf",
+    "batched_distributed_getrs",
 ]
 
 # =========================================================================
@@ -485,3 +489,171 @@ def distributed_eigh(
         return jnp.transpose(local_Q_T, (1, 0))
 
     return W, _untranspose(Q_T)
+
+
+# =========================================================================
+#  solve_lu  (slate::getrf PartialPiv + slate::getrs, Target::Devices)
+# =========================================================================
+"""``batched_distributed_solve_lu`` and the split ``getrf`` / ``getrs`` pair.
+
+The SLATE twin of the ScaLAPACK and cuSOLVERMp LU families, with the same
+call contract, so :mod:`distrib_la.plan` drives the three the same way::
+
+    A : (Nq, N, N)     P(None, 'x', 'y')   (donated -- factored in place)
+    B : (Nq, N, NRHS)  P(None, 'x', 'y')   (donated -- solved in place)
+    X : same shape/sharding as B
+
+Each matrix of the stack is spread over the WHOLE mesh (the world SLATE
+context, one tile per rank: ``nb = N / max(p, q)``), and the handler walks
+the stack.  Geometry is SLATE's single-matrix class (:func:`validate_tile_layout`):
+square or ``p x 1`` meshes; ``1 x q`` trips SLATE's stride assert.
+
+The split pair returns the pivots as an opaque int64 buffer, ``(Nq, P*2N)``
+at ``P(None, ('x','y'))``: every rank's own copy of SLATE's replicated
+``Pivots`` serialised as (tile index, element offset) pairs.  Feed ``LU`` and
+``piv`` back to :func:`batched_distributed_getrs` verbatim, on the same mesh.
+The fused entry runs the same getrf + getrs core, so getrf-once +
+getrs-per-chunk reproduces it to the bit.
+
+Built on the ROCM leg only (``distrib_la.resolve``: ``('solve_lu','slate')``
+is a ROCM row; CUDA's distributed LU is cuSOLVERMp, the host's ScaLAPACK).
+"""
+
+_SOLVE_LU_TARGET = "lorrax_slate_batched_solve_lu_factors"
+_GETRF_TARGET = "lorrax_slate_batched_getrf"
+_GETRS_TARGET = "lorrax_slate_batched_getrs"
+
+#: jit(shard_map) cache per signature (eager shard_map re-traces per call).
+_LU_JIT_CACHE: dict = {}
+
+
+def _lu_geometry(A, mesh: Mesh, *, what: str):
+    """The LU family's guard ladder: shape, registered mesh, SLATE tile layout.
+    Returns ``(p, q, nq, n, nb)``."""
+    if A.ndim != 3 or A.shape[1] != A.shape[2]:
+        raise ValueError(f"slate {what}: expected A of shape (Nq, N, N); got {A.shape}")
+    p, q = validate_mesh(mesh)
+    nq, n = int(A.shape[0]), int(A.shape[1])
+    if n % p or n % q:
+        raise ValueError(
+            f"slate {what}: N={n} must be divisible by both mesh axes ({p}, {q}).")
+    nb = n // max(p, q)
+    validate_tile_layout(n, nb, p, q, what=f"slate {what}")
+    return p, q, nq, n, nb
+
+
+def _lu_rhs(B, nq: int, n: int, q: int, dtype, *, what: str) -> int:
+    if B.ndim != 3 or int(B.shape[0]) != nq or int(B.shape[1]) != n:
+        raise ValueError(
+            f"slate {what}: B must be (Nq, N, NRHS) = ({nq}, {n}, *); got {B.shape}")
+    if B.dtype != dtype:
+        raise ValueError(f"slate {what}: B.dtype {B.dtype} != {dtype}")
+    nrhs = int(B.shape[2])
+    if nrhs % q:
+        raise ValueError(f"slate {what}: NRHS={nrhs} must be divisible by q={q}.")
+    return nrhs
+
+
+def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh) -> jax.Array:
+    """Solve ``A[q] X[q] = B[q]`` by per-q ``slate::getrf`` + ``slate::getrs``.
+
+    See the section docstring for the contract.  ``A`` and ``B`` are donated
+    (the factors overwrite A, X overwrites B); the pivots stay internal.
+    """
+    p, q, nq, n, nb = _lu_geometry(A, mesh, what="solve_lu")
+    nrhs = _lu_rhs(B, nq, n, q, A.dtype, what="solve_lu")
+    ensure_registered(mesh)
+    ctx_key = int(context_key(mesh))
+    nb_b = nrhs // q
+    key = ("slate_lu", mesh_key(mesh), A.dtype, nq, n, nrhs, nb, ctx_key)
+    fn = _LU_JIT_CACHE.get(key)
+    if fn is None:
+        X_local_T = jax.ShapeDtypeStruct((nq, nrhs // q, n // p), A.dtype)
+        LU_local_T = jax.ShapeDtypeStruct((nq, n // q, n // p), A.dtype)
+        attrs = dict(nq=nq, n=n, nrhs=nrhs, nb=nb, nb_b=nb_b, ctx_key=ctx_key)
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "x", "y"), P(None, "x", "y")),
+                 out_specs=P(None, "x", "y"), check_vma=False)
+        def _solve(local_A, local_B):
+            # Row-major shard -> col-major local block (the wrappers' convention).
+            X_T, _ = jax.ffi.ffi_call(
+                _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
+                input_output_aliases={0: 1, 1: 0},
+            )(jnp.transpose(local_A, (0, 2, 1)), jnp.transpose(local_B, (0, 2, 1)), **attrs)
+            return jnp.transpose(X_T, (0, 2, 1))
+
+        fn = jax.jit(_solve, donate_argnums=(0, 1))
+        _LU_JIT_CACHE[key] = fn
+    return fn(A, B)
+
+
+def batched_distributed_getrf(A: jax.Array, *, mesh: Mesh) -> tuple[jax.Array, jax.Array]:
+    """Factor ``A[q]`` once by ``slate::getrf`` (PartialPiv).
+
+    Returns ``(LU, piv)``: ``LU`` at ``P(None,'x','y')`` (SLATE's factors in
+    this layout on this mesh) and ``piv`` int64 ``(Nq, P*2N)`` at
+    ``P(None, ('x','y'))``.  Both are opaque: feed them to
+    :func:`batched_distributed_getrs` verbatim.  ``A`` is donated.
+    """
+    p, q, nq, n, nb = _lu_geometry(A, mesh, what="getrf")
+    ensure_registered(mesh)
+    ctx_key = int(context_key(mesh))
+    piv_len = 2 * n
+    key = ("slate_getrf", mesh_key(mesh), A.dtype, nq, n, nb, ctx_key)
+    fn = _LU_JIT_CACHE.get(key)
+    if fn is None:
+        LU_local_T = jax.ShapeDtypeStruct((nq, n // q, n // p), A.dtype)
+        piv_local = jax.ShapeDtypeStruct((nq, piv_len), jnp.int64)
+        attrs = dict(nq=nq, n=n, nb=nb, piv_len=piv_len, ctx_key=ctx_key)
+
+        @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),),
+                 out_specs=(P(None, "x", "y"), P(None, ("x", "y"))), check_vma=False)
+        def _getrf(local_A):
+            LU_T, piv = jax.ffi.ffi_call(
+                _GETRF_TARGET, (LU_local_T, piv_local),
+                input_output_aliases={0: 0},
+            )(jnp.transpose(local_A, (0, 2, 1)), **attrs)
+            return jnp.transpose(LU_T, (0, 2, 1)), piv
+
+        fn = jax.jit(_getrf, donate_argnums=(0,))
+        _LU_JIT_CACHE[key] = fn
+    return fn(A)
+
+
+def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
+                              mesh: Mesh) -> jax.Array:
+    """Solve ``A[q] X[q] = B[q]`` from :func:`batched_distributed_getrf`'s
+    ``(LU, piv)`` by ``slate::getrs``.  ``B`` is donated; X has B's
+    shape and sharding."""
+    p, q, nq, n, nb = _lu_geometry(LU, mesh, what="getrs")
+    nrhs = _lu_rhs(B, nq, n, q, LU.dtype, what="getrs")
+    piv_len = 2 * n
+    want = (nq, p * q * piv_len)
+    if tuple(piv.shape) != want or piv.dtype != jnp.int64:
+        raise ValueError(
+            f"slate getrs: piv must be int64 {want} as getrf returned it; "
+            f"got {tuple(piv.shape)} {piv.dtype}")
+    ensure_registered(mesh)
+    ctx_key = int(context_key(mesh))
+    nb_b = nrhs // q
+    key = ("slate_getrs", mesh_key(mesh), LU.dtype, nq, n, nrhs, nb, ctx_key)
+    fn = _LU_JIT_CACHE.get(key)
+    if fn is None:
+        X_local_T = jax.ShapeDtypeStruct((nq, nrhs // q, n // p), B.dtype)
+        attrs = dict(nq=nq, n=n, nrhs=nrhs, nb=nb, nb_b=nb_b, piv_len=piv_len,
+                     ctx_key=ctx_key)
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "x", "y"), P(None, ("x", "y")), P(None, "x", "y")),
+                 out_specs=P(None, "x", "y"), check_vma=False)
+        def _getrs(local_LU, local_piv, local_B):
+            X_T = jax.ffi.ffi_call(
+                _GETRS_TARGET, X_local_T, input_output_aliases={2: 0},
+            )(jnp.transpose(local_LU, (0, 2, 1)), local_piv,
+              jnp.transpose(local_B, (0, 2, 1)), **attrs)
+            return jnp.transpose(X_T, (0, 2, 1))
+
+        fn = jax.jit(_getrs, donate_argnums=(2,))
+        _LU_JIT_CACHE[key] = fn
+    return fn(LU, piv, B)

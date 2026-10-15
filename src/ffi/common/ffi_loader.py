@@ -224,6 +224,11 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     "lorrax_kdft_kconv_kminor":     "KDftKconvKminorFfi",
     "lorrax_kdft_kfft_kminor":      "KDftKfftKminorFfi",
     "lorrax_kdft_kconv_klead_unfold": "KDftKconvKleadUnfoldFfi",
+    # The SLATE LU family (cpp/slate/batched_solve_lu_ffi.cc): CUDA serves the
+    # distributed LU with cuSOLVERMp (distrib_la.resolve), so only this leg builds it.
+    "lorrax_slate_batched_solve_lu_factors": "SlateBatchedSolveLuFactorsFfi",
+    "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
+    "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},

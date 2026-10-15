@@ -1645,7 +1645,8 @@ endforeach()
 if(LORRAX_ROCM_HAVE_SLATE)
     target_sources(lorrax_ffi_rocm PRIVATE
         slate/context.cc slate/eigh_ffi.cc slate/potrf_ffi.cc slate/trsm_ffi.cc
-        slate/batched_potrf_ffi.cc slate/batched_trsm_ffi.cc)
+        slate/batched_potrf_ffi.cc slate/batched_trsm_ffi.cc
+        slate/batched_solve_lu_ffi.cc)    # LU: this leg only (CUDA's is cusolvermp)
     target_link_libraries(lorrax_ffi_rocm PRIVATE slate)
     # THE LEG BINDS ITS OWN SLATE.  libslate/libblaspp/liblapackpp share their
     # SONAMEs with the gpu_backend=none install the host leg uses, and

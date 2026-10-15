@@ -115,7 +115,8 @@ BACKEND_CHOICES = {
     "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate",
                  "scalapack"),
     "cholesky": ("auto", "off", "native2d", "cusolvermp", "slate"),
-    "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack"),
+    "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack",
+                 "slate"),
 }
 EIGH_BACKENDS = BACKEND_CHOICES["eigh"]
 CHOLESKY_BACKENDS = BACKEND_CHOICES["cholesky"]
@@ -137,10 +138,9 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 #: syevd.  On **ROCM** it is SLATE, which is the only one of the three that
 #: builds for ROCm at all — declared-untested.
 #:
-#: There is deliberately NO ``('solve_lu', 'ROCM')`` row: SLATE ships no
-#: getrf/getrs handler in this tree, so a row would promise a backend that
-#: does not exist.  ``distributed`` LU on ROCm therefore refuses by naming
-#: the platform, which is the true answer.
+#: ``('solve_lu', 'ROCM')`` is SLATE too: ``slate::getrf`` (PartialPiv,
+#: Target::Devices) + ``slate::getrs`` (cpp/slate/batched_solve_lu_ffi.cc),
+#: gated against ``jnp.linalg.solve`` on the same GCDs at P=4 (2x2).
 _DISTRIBUTED_DEFAULT = {
     ("eigh", "cpu"):      "scalapack",
     ("eigh", "CUDA"):     "cusolvermp",
@@ -150,6 +150,7 @@ _DISTRIBUTED_DEFAULT = {
     # on CUDA — the two backends _IMPL already lists for this op.
     ("solve_lu", "cpu"):  "scalapack",
     ("solve_lu", "CUDA"): "cusolvermp",
+    ("solve_lu", "ROCM"): "slate",
 }
 
 #: What the pure-JAX backends mean per op (for messages / list_backends).
@@ -180,6 +181,13 @@ _SPEC = {
                                   "lorrax_scalapack_batched_getrf",
                                   "lorrax_scalapack_batched_getrs"),
                                  ("cpu",)),
+    # SLATE's LU family: the same three entries as the two above (fused solve
+    # + split getrf/getrs), built on the ROCM leg only -- CUDA serves the op
+    # with cuSOLVERMp and the host with ScaLAPACK, so neither builds it.
+    ("solve_lu", "slate"):      (("lorrax_slate_batched_solve_lu_factors",
+                                  "lorrax_slate_batched_getrf",
+                                  "lorrax_slate_batched_getrs"),
+                                 ("ROCM",)),
 }
 
 

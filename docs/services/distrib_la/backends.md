@@ -85,7 +85,7 @@ local LU on every layout, so it has no field.
 |---|---|---|---|
 | `eigh` | `auto off distributed cusolvermp slate scalapack` | `native` everywhere | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `slate` |
 | `cholesky` | `auto off native2d cusolvermp slate` | `cusolvermp` on a CUDA mesh with `P_x ≥ 2` and `P_y ≥ 2` when compiled, else `native` | not in the vocabulary |
-| `solve_lu` | `auto off distributed cusolvermp scalapack` | as `cholesky` | CPU → `scalapack`, CUDA → `cusolvermp`; ROCm refuses |
+| `solve_lu` | `auto off distributed cusolvermp scalapack slate` | as `cholesky` | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `slate` |
 
 - `off` and its spelling `native` resolve to `native` unconditionally: the
   pure-JAX path (`jnp.linalg.eigh`, or the caller's own Cholesky and LU
@@ -106,10 +106,25 @@ local LU on every layout, so it has no field.
   vendor (`lxkit.device_vendor`: the client's platform and version strings and
   the device kind), so a ROCm mesh resolves as `rocm`, never as CUDA. The
   table's ROCm entries are the resolution only: `distributed` eigh names
-  SLATE, the one library of the three with a ROCm build, and `distributed` LU
-  has no ROCm library and refuses at guard 1. LORRAX builds no ROCm `.so`, so
+  SLATE, the one library of the three with a ROCm build, and so does
+  `distributed` LU (`slate::getrf` PartialPiv + `slate::getrs`, ROCM leg only;
+  see [SLATE LU](#slate-lu)). LORRAX builds no ROCm `.so`, so
   a SLATE request on ROCm refuses at the capability probe (guard 4). Only
   `linalg = local` (the XLA plan) runs on ROCm.
+
+### SLATE LU (ROCM leg) {#slate-lu}
+
+`_slate.batched_distributed_solve_lu(A, B, mesh=)` and the split pair
+`batched_distributed_getrf(A, mesh=)` → `(LU, piv)` /
+`batched_distributed_getrs(LU, piv, B, mesh=)` keep the ScaLAPACK and
+cuSOLVERMp contract: `A` `(Nq, N, N)` and `B` `(Nq, N, NRHS)` at
+`P(None,'x','y')`, both donated, `X` in `B`'s sharding. Each matrix spans the
+whole mesh at one tile per rank (`nb = N/max(p,q)`; square or `p×1` meshes,
+`NRHS % q == 0`). `piv` is int64 `(Nq, P·2N)` at `P(None,('x','y'))`: each
+rank's copy of SLATE's replicated pivots as (tile index, offset) pairs, opaque.
+The fused entry runs the same getrf + getrs core, so the split pair reproduces
+it bit for bit. Handlers: `cpp/slate/batched_solve_lu_ffi.cc`. CUDA does not
+build them (its LU is cuSOLVERMp).
 
 ### The guard ladder {#guard-ladder}
 
