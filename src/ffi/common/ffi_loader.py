@@ -229,6 +229,10 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     "lorrax_slate_batched_solve_lu_factors": "SlateBatchedSolveLuFactorsFfi",
     "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
     "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
+    # k-box modes 9 and 11 (cpp/kdft/kbox_rspace_ffi.cc): ffi.fft._ROCM_KBOX_TARGETS.
+    "lorrax_kdft_kfft_klead_unfold": "KDftKfftKleadUnfoldFfi",
+    "lorrax_kdft_kconv_chi_unfold":  "KDftKconvChiUnfoldFfi",
+    "lorrax_kdft_kconv_chi_vertex":  "KDftKconvChiVertexFfi",
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},

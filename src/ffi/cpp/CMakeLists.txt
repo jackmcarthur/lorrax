@@ -1521,6 +1521,7 @@ set(LORRAX_FFI_ROCM_SOURCES
     kdft/kdft_klead_ffi.cc
     kdft/kdft_kminor_ffi.cc
     kdft/kbox_unfold_ffi.cc
+    kdft/kbox_rspace_ffi.cc
 )
 
 # The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated
@@ -1553,6 +1554,12 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage_src.h.in"
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_unfold_kernel.h"
              "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh")
+# The k-box R-space kernels (modes 9 and 11, kdft/kbox_rspace_src.h.in) on the same stage text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_kernel.h" LRX_KBOX_RSPACE_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_rspace_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_kernel.h")
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)

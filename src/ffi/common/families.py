@@ -65,9 +65,11 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
     "kdft": Family(
         ("lorrax_kdft_",), "kdft",
         _legs(("elsewhere", "mathdx"), ("built", ""), ("elsewhere", "fftw")),
-        gate="kdft vs ffi.fft.xla_reference on the same GCD (modes 2/3)", tol=1e-12,
-        note="k-leading pair only (ffi.fft._ROCM_KLEAD_TARGETS); every other k-conv "
-             "factory takes XLA on ROCm.  Measured max|dU|/max|U| <= 7.1e-16 (c128)."),
+        gate="kdft vs ffi.fft.xla_reference on the same GCD (modes 2/3; the k-box modes 7/9/11: "
+             "tests/test_kdft_kbox_gate.py)", tol=1e-12,
+        note="k-leading and k-minor pairs (ffi.fft._ROCM_KLEAD_TARGETS) and the k-box single-arm "
+             "modes 7/9/11 (ffi.fft._ROCM_KBOX_TARGETS); every other k-conv factory takes XLA on "
+             "ROCm.  Measured max|dU|/max|U| <= 7.1e-16 (c128)."),
     "fourier_plan": Family(
         ("lorrax_fourier_plan",), "cufft",
         _legs(("built", ""), ("xla", "common.fourier_plan XLA leg"), ("xla", "common.fourier_plan XLA leg")),

@@ -201,12 +201,28 @@ KDFT_KMINOR_AXIS_MAX = 128
 KDFT_KCONV_KLEAD_UNFOLD_TARGET = "lorrax_kdft_kconv_klead_unfold"
 #: Factory -> the ROCM k-box target that serves it (a factory with no row keeps its XLA route,
 #: whose k transforms are the kdft pair above).
-_ROCM_KBOX_TARGETS = {"kconv_klead_unfold": KDFT_KCONV_KLEAD_UNFOLD_TARGET}
+#: The ROCM leg's k-box R-space modes (cpp/kdft/kbox_rspace_ffi.cc, single arm): mode 9 (an
+#: interaction's inverse transform read from its q wedge) and mode 11 (one chi0 tau node from the
+#: raw-parent Green pair, plain and with the four-current vertices), the operands and layouts of
+#: KFFT_KLEAD_UNFOLD_TARGET / KCONV_CHI_UNFOLD_TARGET / KCONV_CHI_VERTEX_TARGET less mathdx_root
+#: and scratch_bytes.  Single arm only (:func:`kdft_kbox_wedge_refusal`, :func:`kdft_kbox_chi_refusal`).
+KDFT_KFFT_KLEAD_UNFOLD_TARGET = "lorrax_kdft_kfft_klead_unfold"
+KDFT_KCONV_CHI_UNFOLD_TARGET = "lorrax_kdft_kconv_chi_unfold"
+KDFT_KCONV_CHI_VERTEX_TARGET = "lorrax_kdft_kconv_chi_vertex"
+_ROCM_KBOX_TARGETS = {"kconv_klead_unfold": KDFT_KCONV_KLEAD_UNFOLD_TARGET,
+                      "kfft_klead_unfold": KDFT_KFFT_KLEAD_UNFOLD_TARGET,
+                      "kconv_chi_unfold": KDFT_KCONV_CHI_UNFOLD_TARGET,
+                      "kconv_chi_vertex": KDFT_KCONV_CHI_VERTEX_TARGET}
 #: A block's LDS on gfx90a, the k-box stage's opt-in budget on ROCM (kbox_unfold_ffi.cc kLds).
 KDFT_KBOX_LDS = 64 * 1024
 #: The k-box mode-7 kernel's own axis bound (cpp/kdft/kbox_unfold_ffi.cc kAxisMax): its line
 #: transform is the stage's unrolled direct DFT, so it does not widen with KDFT_AXIS_MAX.
 KDFT_KBOX_AXIS_MAX = 40
+#: Modes 9 and 11's own axis bounds (cpp/kdft/kbox_rspace_ffi.cc kAxisMaxWedge / kAxisMaxChi):
+#: the same direct-DFT line transform, gated to axis 40 (tests/test_kdft_kbox_gate.py); their
+#: residency rule, not KDFT_NK_MAX, bounds nk.
+KDFT_KBOX_WEDGE_AXIS_MAX = 40
+KDFT_KBOX_CHI_AXIS_MAX = 40
 
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
@@ -433,6 +449,24 @@ def rocm_klead_target(mesh: Mesh, kgrid, factory: str) -> str | None:
     return target
 
 
+def _kbox_single_arm(kgrid, group: int, operands: int, lds: int) -> tuple[int, int]:
+    """``(tr, per_col)`` of the k-box stage's single arm, as ``lrx_kbox::kbox_plan`` (kbox_stage.cuh)
+    decides them for c128 and ``min_tr = 1``: ``tr`` instances of ``group`` columns of ``operands``
+    staged operands per block, 0 when one instance does not fit ``lds``; ``per_col`` is one
+    instance's bytes.  The one mirror of the rule in this module."""
+    nx, ny, nz = (int(v) for v in kgrid)
+    per_col = int(operands) * int(group) * (((nx * ny * (nz | 1)) | 1) * 16)
+    lines = nx * ny * nz // max(nx, ny, nz)
+    want = 8
+    while want * group * lines < 256:
+        want *= 2
+    cap = 1
+    while 2 * cap * per_col <= lds // 2:
+        cap *= 2
+    tr = min(want, cap)
+    return (tr if tr * per_col <= lds else 0), per_col
+
+
 def kdft_kbox_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
     """Why the ROCM k-box stage cannot serve mode 7 on ``kgrid`` at ``ns`` ("" when it can).
 
@@ -447,35 +481,74 @@ def kdft_kbox_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
         return why
     nx, ny, nz = (int(v) for v in kgrid)
     group = int(ns) * int(ns)
-    per_col = group * (((nx * ny * (nz | 1)) | 1) * 16)
-    lines = nx * ny * nz // max(nx, ny, nz)
-    want = 8
-    while want * group * lines < 256:
-        want *= 2
-    cap = 1
-    while 2 * cap * per_col <= lds // 2:
-        cap *= 2
-    tr = min(want, cap)
-    if tr * per_col <= lds and tr * group >= 2:
+    tr, per_col = _kbox_single_arm(kgrid, group, 1, lds)
+    if tr and tr * group >= 2:
         return ""
     return (f"GATE kdft-kbox-residency: got k-grid {(nx, ny, nz)} ns={ns}, a spin group of {group} padded "
             f"columns ({per_col} B, two columns at ns=1); want it in a block's {lds // 1024} KiB of LDS "
             "(the k-box single arm; the split arm is not ported to ROCM)")
 
 
-def rocm_kbox_target(mesh: Mesh, kgrid, factory: str, ns: int) -> str | None:
+def kdft_kbox_wedge_refusal(kgrid, ns: int, nsr: int | None = None, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM k-box stage cannot serve mode 9 (:func:`make_kfft_klead_unfold`) on ``kgrid``
+    with endpoint widths ``(ns, nsr)`` ("" when it can): an axis beyond
+    :data:`KDFT_KBOX_WEDGE_AXIS_MAX`, or a spin group of ``ns*nsr`` columns (one operand, one
+    transform) beyond a block's LDS (the single arm; the split arm is not ported)."""
+    kg = tuple(int(v) for v in kgrid)
+    if max(kg) > KDFT_KBOX_WEDGE_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_KBOX_WEDGE_AXIS_MAX} "
+                "(k-box mode 9's direct-DFT line transform)")
+    group = int(ns) * int(ns if nsr is None else nsr)
+    tr, per_col = _kbox_single_arm(kg, group, 1, lds)
+    if tr:
+        return ""
+    return (f"GATE kdft-kbox-residency: got k-grid {kg} widths ({ns}, {nsr or ns}), a spin group of {group} "
+            f"padded columns ({per_col} B); want it in a block's {lds // 1024} KiB of LDS (k-box mode 9's "
+            "single arm; the split arm is not ported to ROCM)")
+
+
+def kdft_kbox_chi_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM k-box stage cannot serve mode 11 (:func:`make_kconv_chi_unfold`,
+    :func:`make_kconv_chi_vertex`) on ``kgrid`` at ``ns`` ("" when it can): an axis beyond
+    :data:`KDFT_KBOX_CHI_AXIS_MAX`, or a Green pair (two operands of ``ns**2`` columns, one
+    transform) beyond a block's LDS (the single arm; the split arm is not ported)."""
+    kg = tuple(int(v) for v in kgrid)
+    if max(kg) > KDFT_KBOX_CHI_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_KBOX_CHI_AXIS_MAX} "
+                "(k-box mode 11's direct-DFT line transform)")
+    group = int(ns) * int(ns)
+    tr, per_col = _kbox_single_arm(kg, group, 2, lds)
+    if tr:
+        return ""
+    return (f"GATE kdft-kbox-residency: got k-grid {kg} ns={ns}, a Green pair of {2 * group} padded columns "
+            f"({per_col} B); want it in a block's {lds // 1024} KiB of LDS (k-box mode 11's single arm; "
+            "the split arm is not ported to ROCM)")
+
+
+#: Factory -> its k-box refusal rule ``(kgrid, ns, nsr) -> str``.
+_KBOX_REFUSAL = {
+    "kconv_klead_unfold": lambda kg, ns, nsr: kdft_kbox_refusal(kg, ns),
+    "kfft_klead_unfold": kdft_kbox_wedge_refusal,
+    "kconv_chi_unfold": lambda kg, ns, nsr: kdft_kbox_chi_refusal(kg, ns),
+    "kconv_chi_vertex": lambda kg, ns, nsr: kdft_kbox_chi_refusal(kg, ns),
+}
+
+
+def rocm_kbox_target(mesh: Mesh, kgrid, factory: str, ns: int, nsr: int | None = None) -> str | None:
     """The ROCM k-box target serving ``factory`` on this mesh, or ``None`` (the factory's XLA
     route): a ROCm mesh outside :func:`xla_reference`, kdft not demoted, and the grid within
-    :func:`kdft_kbox_refusal` (else one warning per grid)."""
+    the factory's rule in ``_KBOX_REFUSAL`` (else one warning per grid).  ``nsr``: mode 9's
+    right endpoint width (default ``ns``)."""
     from ffi.gate import mesh_ffi_platform
     if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
         return None
     target = _ROCM_KBOX_TARGETS.get(factory)
-    why = kdft_kbox_refusal(kgrid, ns) if target else ""
+    why = _KBOX_REFUSAL[factory](kgrid, ns, nsr) if target else ""
     if why:
         from ffi.gate import announce_once
         msg = f"[kconv] k-convolution router: ROCM {factory} -> XLA unfold + kdft, not the k-box stage: {why}"
-        if announce_once(("kconv", "kbox", factory, tuple(int(v) for v in kgrid), int(ns)), msg):
+        if announce_once(("kconv", "kbox", factory, tuple(int(v) for v in kgrid), int(ns),
+                          int(ns if nsr is None else nsr)), msg):
             import warnings
             warnings.warn(msg, RuntimeWarning, stacklevel=3)
         return None
@@ -2318,8 +2391,9 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
     ``make_kconv_klead(...).prep`` of the full-zone interaction
     (``unfold_isdf_operator``, then the endpoint actions): the unfold is the
     transform's load, so the full-zone interaction is never stored.  CUDA:
-    nvidia-mathdx mode 9; elsewhere the service's reference composition, then
-    ``ifftn``.  ``live`` (int32 ``[2]``, replicated): the pass is padded
+    nvidia-mathdx mode 9; ROCM: the k-box stage's mode 9 (``lorrax_kdft_kfft_klead_unfold``,
+    single arm) where :func:`kdft_kbox_wedge_refusal` is empty; elsewhere the service's reference
+    composition, then ``ifftn``.  ``live`` (int32 ``[2]``, replicated): the pass is padded
     to a scan's largest pass and ``[lo, hi)`` its live left centroid rows; the rest come back zero.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
@@ -2341,6 +2415,16 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
         def apply_tables(w, wt, t, live):
             out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
             return jax.ffi.ffi_call(KFFT_KLEAD_UNFOLD_TARGET, out)(
+                w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r,
+                *(() if live is None else (live,)), **attrs)
+    elif (kbox := rocm_kbox_target(mesh, kg, "kfft_klead_unfold", n_l, n_r)) is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(ffi_fft_scale("ifftn", norm, nk)), conj_trs=np.int64(conj),
+                     cubin_dir=cubin_cache_dir())
+
+        def apply_tables(w, wt, t, live):
+            out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
+            return jax.ffi.ffi_call(kbox, out)(
                 w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r,
                 *(() if live is None else (live,)), **attrs)
     else:
@@ -2454,8 +2538,9 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     (``symmetry_maps.device_load_tables``), read as operands so a consumer's jit holds no
     table constants (baked, they are ~0.57 GB of HLO literal at Fe 20^3 with 1792 centroids).
     CUDA: nvidia-mathdx mode 11 on the k-box stage (one pass; a chunked split pass on
-    large grids, its intermediate bounded by ``scratch_bytes``); elsewhere the service's reference
-    composition, then the XLA transforms.
+    large grids, its intermediate bounded by ``scratch_bytes``); ROCM: the k-box stage's mode 11
+    (``lorrax_kdft_kconv_chi_unfold``, single arm) where :func:`kdft_kbox_chi_refusal` is empty;
+    elsewhere the service's reference composition, then the XLA transforms.
     """
     from symmetry_maps import (DEVICE_LOAD_SPECS, apply_unfold_load_tables_local,
                                local_unfold_load_tables)
@@ -2489,6 +2574,16 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
                         si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
                         complete=np.int64(complete), scratch_bytes=np.int64(budget),
                         **_mathdx_common())
+    elif (kbox := rocm_kbox_target(mesh, kg, "kconv_chi_unfold", ns)) is not None:
+
+        def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
+            call = jax.ffi.ffi_call(kbox, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                    input_output_aliases={12: 0})
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, alpha, acc, *(() if live is None else (live,)),
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
+                        complete=np.int64(complete), cubin_dir=cubin_cache_dir())
     else:
         ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
 
@@ -2564,8 +2659,9 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     ``(na*nb, nk, mu, nu)`` at ``P(None,None,'x','y')``, donated.  No full-k
     Green exists.  ``load``, when given, is the same tables on the devices
     (``symmetry_maps.device_load_tables``), read as operands so a consumer's
-    jit holds no table constants.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); elsewhere
-    the service's reference composition.
+    jit holds no table constants.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); ROCM: the k-box stage's
+    mode 11 (``lorrax_kdft_kconv_chi_vertex``, single arm) where :func:`kdft_kbox_chi_refusal` is
+    empty; elsewhere the service's reference composition.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
     kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
@@ -2608,6 +2704,18 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
                         scratch_bytes=np.int64(budget), signed_c=np.int64(signed),
                         perm_l=perm_l, phase_l=phase_l, perm_r=perm_r, phase_r=phase_r,
                         na=np.int64(na), nb=np.int64(nb), **_mathdx_common())
+    elif (kbox := rocm_kbox_target(mesh, kg, "kconv_chi_vertex", ns)) is not None:
+
+        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live):
+            call = jax.ffi.ffi_call(kbox, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                    input_output_aliases={13: 0})
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, jnp.ones((1,), jnp.complex128),
+                        jnp.asarray(sign_host), acc, *(() if live is None else (live,)),
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
+                        signed_c=np.int64(signed), perm_l=perm_l, phase_l=phase_l, perm_r=perm_r,
+                        phase_r=phase_r, na=np.int64(na), nb=np.int64(nb), cubin_dir=cubin_cache_dir())
     else:
         ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
         codes = np.asarray([1, 1j, -1, -1j])
