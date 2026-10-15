@@ -26,7 +26,7 @@ and `certified=False`.
 | `fit_damped_reciprocal(rectangles, *, target_error, ...)` | One positive rule `1/d ≈ Σ w e^{−d t}` for `1/(x − iγ)` over rectangles `(x_min, x_max, γ_min, γ_max)`, `x_min > 0`. | `gw.mpa.sigma_windows` |
 | `damped_line_rule`, `damped_rectangle_rule`, `damped_rectangle_gauss_rule`, `damped_rectangle_positive_rule` | MPA positive-time line and rectangle rules, § [Damped MPA rules](#damped-mpa-rules). | `gw.mpa.model` |
 | `augment_odd_laplace(times, x_min, x_max, omega, *, tolerance, max_extra=16)` | Odd GN-PPM channel on the even rule's times, § [Odd imaginary-axis channel](#odd-imaginary-axis-channel). | `gw.minimax_screening` |
-| `response_group_rules`, `response_laplace_rule`, `response_bank_rule` | Shared-pole response rules, § [Response-bank rule sessions](#response-bank-rule-sessions). | `response_group_rules`: `gw.response_bank`; `response_laplace_rule`: `gw.minimax_screening`; `response_bank_rule`: none |
+| `response_group_rules`, `ResponseGroupTree`, `response_laplace_rule`, `response_bank_rule` | Shared-pole response rules, § [Response-bank rule sessions](#response-bank-rule-sessions). | `response_group_rules`, `ResponseGroupTree`: `gw.response_bank`; `response_laplace_rule`: `gw.minimax_screening`; `response_bank_rule`: none |
 | `matsubara_response_rule(beta_ry_inv, delta_max_ry, n_indices, *, rel_tol=1e-8)` | Finite-temperature KMS-paired imaginary-time rule, § [Matsubara rules](#finite-temperature-matsubara-rules). | `gw.w_isdf` |
 | `positive_reciprocal`, `odd_reciprocal`, `damped_line_reciprocal` | Analytic constructions on three one-dimensional reciprocal domains, § [Analytic reciprocal constructors](#analytic-reciprocal-constructors). | none directly; `analytic_line_box_rule` wraps the line rule |
 
@@ -109,6 +109,18 @@ or response arrays, and none certifies W or Σ accuracy.
   (the pin of `analytic_box_rule`): the pencil's QR,
   SVD and least squares pick different times at different thread counts, and
   the shared-pole W poles inherit them.
+* **`ResponseGroupTree(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
+  decay_rate=0)`** (the same build, one node at a time). Nodes are tuples of
+  sample indices; `children(node)` gives the two halves, `tried(node)` is False
+  for a node halved without a try, `size(node)` is its pencil sample count,
+  and `attempt(node)` is the node's whole-group construction: `[rule]` or None
+  (halve it); one sample returns its rule or raises the refusal. An attempt
+  is a pure function of its node on one machine class at the pinned thread
+  count, so any process may evaluate it. `pending(attempts)` lists the tried
+  nodes the serial walk still needs; `rules(attempts)` walks the tree with
+  attempts evaluated elsewhere (computing any missing ones) and returns the
+  bytes of `response_group_rules`, which is `ResponseGroupTree(...).rules()`.
+  `gw.response_bank` evaluates the attempts across processes.
 * **`response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
   previous=None, domain_pad_ry=0, ordered=False, reference_ry=None)`** (remote
   noncrossing cells). Elliptic decay rates, a small Lyapunov solve and a

@@ -1561,34 +1561,109 @@ def response_groups(z, group_size):
     return [order[i:i+group_size] for i in range(0, len(order), group_size)]
 
 
-def _gather_group_rules(requests, build):
-    """Build requested groups round-robin across hosts; replicate the small rules."""
+#: Stands in a request's attempt table for a node whose attempt raised: the
+#: walk stops there, and the refusal is raised only if the serial walk reaches it.
+_REFUSED = object()
+
+
+def _rule_round(trees, known, world):
+    """One round's attempts per process: the serial walks' next nodes, then speculation.
+
+    Every process computes the same plan from the same ``known`` tables. The
+    nodes the walks need now are placed longest-first on the least-loaded
+    process; the round then lasts about the longest load ``T``. Untried
+    descendants of those nodes, most likely needed first (the product of
+    their undecided tried ancestors' pencil sizes over the largest, since a
+    wider shared pencil fails more often), fill each process up to ``T``. A
+    speculative attempt that the walk never reaches is discarded; it never
+    changes a rule. Costs are the attempt's ~size^3 estimate.
+    """
+    need = [(i, node) for i, tree in enumerate(trees) for node in tree.pending(known[i])]
+    if not need:
+        return None
+    cost = {}
+
+    def estimate(i, node):
+        if (i, node) not in cost:
+            cost[i, node] = float(trees[i].size(node))**3
+        return cost[i, node]
+    load, plan = [0.]*world, [[] for _ in range(world)]
+    for task in sorted(need, key=lambda t: -estimate(*t)):
+        r = min(range(world), key=lambda r: (load[r], r))
+        plan[r].append(task)
+        load[r] += estimate(*task)
+    if world > 1:
+        span = max(load)
+        wide = max(float(t.size(t.root)) for t in trees)
+        candidates = []
+
+        def descend(i, node, odds, depth):
+            for half in trees[i].children(node):
+                if trees[i].tried(half):
+                    if half not in known[i]:
+                        candidates.append((-odds, depth, len(candidates), i, half))
+                    elif known[i][half] is not None:
+                        continue
+                    descend(i, half, odds*min(1., trees[i].size(half)/wide), depth+1)
+                else:
+                    descend(i, half, odds, depth+1)
+        for i, node in need:
+            descend(i, node, min(1., trees[i].size(node)/wide), 1)
+        for *_, i, node in sorted(candidates):
+            r = min(range(world), key=lambda r: (load[r], r))
+            if load[r] + estimate(i, node) <= span:
+                plan[r].append((i, node))
+                load[r] += estimate(i, node)
+    return plan
+
+
+def _gather_group_rules(requests, tree):
+    """Build every request's rule tree across hosts; replicate the small rules.
+
+    ``tree(members)`` is the request's ``minimax.ResponseGroupTree``. Its
+    serial walk is a chain of whole-group attempts, each a pure function of
+    its node (one machine class, pinned BLAS threads), so any process may
+    evaluate any attempt: rounds of attempts (:func:`_rule_round`) run on all
+    processes, cross hosts as data, and every process walks the same tables
+    to the serial walk's rules, byte for byte (one list per request). Refusals
+    cross as data and are raised only where the serial walk would raise them.
+    """
     import pickle
     from common.collectives import all_gather_processes, process_count, process_rank
     rank, world = int(process_rank()), int(process_count())
-    local = []
-    for index in range(rank, len(requests), world):
-        try:
-            local.append((index, build(requests[index]), None))
-        except Exception as error:  # refusals cross hosts as data, then raise
-            local.append((index, None, f"{type(error).__name__}: {error}"))
-    if world == 1:
-        shards = [local]
-    else:
-        payload = np.frombuffer(pickle.dumps(local, protocol=pickle.HIGHEST_PROTOCOL), np.uint8)
-        lengths = np.asarray(all_gather_processes(np.asarray(payload.size, np.int32)), np.int64).reshape(-1)
-        padded = np.zeros(int(lengths.max()), np.uint8)
-        padded[:payload.size] = payload
-        gathered = np.asarray(all_gather_processes(padded), np.uint8)
-        shards = [pickle.loads(np.ascontiguousarray(gathered[r, :int(n)]).tobytes())
-                  for r, n in enumerate(lengths)]
-    rows = sorted((row for shard in shards for row in shard), key=lambda row: row[0])
-    if [row[0] for row in rows] != list(range(len(requests))):
-        raise RuntimeError("response rule construction did not gather every group")
-    for _, _, error in rows:
-        if error is not None:
-            raise ValueError(error)
-    return [rule for _, rules, _ in rows for rule in rules]
+    trees = [tree(members) for members in requests]
+    known = [dict() for _ in trees]
+    errors = [dict() for _ in trees]
+    while (plan := _rule_round(trees, known, world)) is not None:
+        local = []
+        for i, node in plan[rank]:
+            try:
+                local.append((i, node, trees[i].attempt(node), None))
+            except Exception as error:  # refusals cross hosts as data, then raise
+                local.append((i, node, None, f"{type(error).__name__}: {error}"))
+        if world == 1:
+            shards = [local]
+        else:
+            payload = np.frombuffer(pickle.dumps(local, protocol=pickle.HIGHEST_PROTOCOL), np.uint8)
+            lengths = np.asarray(all_gather_processes(np.asarray(payload.size, np.int32)), np.int64).reshape(-1)
+            padded = np.zeros(int(lengths.max()), np.uint8)
+            padded[:payload.size] = payload
+            gathered = np.asarray(all_gather_processes(padded), np.uint8)
+            shards = [pickle.loads(np.ascontiguousarray(gathered[r, :int(n)]).tobytes())
+                      for r, n in enumerate(lengths)]
+        for shard in shards:
+            for i, node, rules, error in shard:
+                known[i][node] = _REFUSED if error is not None else rules
+                if error is not None:
+                    errors[i][node] = error
+    out = []
+    for i, t in enumerate(trees):
+        attempts = {node: got for node, got in known[i].items() if got is not _REFUSED}
+        refused = [node for node in t.pending(attempts) if node in errors[i]]
+        if refused:
+            raise ValueError(errors[i][refused[0]])
+        out.append(t.rules(attempts))
+    return out
 
 
 #: The energy pad (eV) of a held SC response plan: the rule interval and the
@@ -1686,18 +1761,20 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
         requests = response_groups(z, len(z))
         previous = [] if old is None else old["rule_groups"]
 
-        def build(members):
+        def tree(members):
             local = {m: i for i, m in enumerate(members)}
             warm = [dict(rule, members=[local[m] for m in rule["members"]])
                     for rule in previous if set(rule["members"]) <= set(members)]
-            rules = minimax.response_group_rules(
+            return minimax.ResponseGroupTree(
                 plan["lo"], plan["hi"], z[members],
                 rel_tol=sample_plan["bank_rule_tolerance"]/amplitude,
                 decay_rate=decay_rate, previous=warm)
-            return [dict(rule, members=[members[m] for m in rule["members"]]) for rule in rules]
 
         with timing.section("bank.rule_construction", announce=True):
-            plan["rule_groups"] = _gather_group_rules(requests, build)
+            plan["rule_groups"] = [
+                dict(rule, members=[members[m] for m in rule["members"]])
+                for members, rules in zip(requests, _gather_group_rules(requests, tree))
+                for rule in rules]
         if session is not None:
             session["frequency"] = plan
     if plan["decay_rate"]:
