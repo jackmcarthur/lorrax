@@ -215,10 +215,13 @@ _ROCM_FAMILIES = tuple(p for p in _built_prefixes("ROCM")
                        if any(t.startswith(p) for t in _CUDA_TARGET_SYMBOLS))
 #: The ROCM leg's own families: leg-neutral sources the CUDA leg does not build because it
 #: serves the same operation another way.  The k-leading direct-DFT pair (cpp/kdft/,
-#: hipRTC-built; CUDA uses the nvidia-mathdx modes 2/3): ffi.fft._ROCM_KLEAD_TARGETS.
+#: hipRTC-built; CUDA uses the nvidia-mathdx modes 2/3) and the k-minor pair (modes 4/5):
+#: ffi.fft._ROCM_KLEAD_TARGETS.
 _ROCM_OWN_TARGET_SYMBOLS = {
     "lorrax_kdft_kconv_klead":      "KDftKconvKleadFfi",
     "lorrax_kdft_kfft_klead":       "KDftKfftKleadFfi",
+    "lorrax_kdft_kconv_kminor":     "KDftKconvKminorFfi",
+    "lorrax_kdft_kfft_kminor":      "KDftKfftKminorFfi",
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},

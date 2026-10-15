@@ -90,6 +90,7 @@ its sources, its build and its target strings.
 | Local Fourier plan | `cufft/fourier_plan_cuda_ffi.cc`, `cufft/fourier_plan.cu` | CUDA; C++ (cuBLAS, cuFFT), nvcc remap kernel, NVRTC cuBLASDx pair | `fourier_plan_mathdx`; older trees: `fourier_plan` |
 | run-time compilation service | `common/rtc_build.{h,cc}`, `common/lrx_async_gather.h`, `cufft/kbox_stage_src.h.in` | CUDA (NVRTC) and ROCM (hipRTC); C++ | none ([the cubin cache](compilation.md#2-native-kernels-and-nvrtc-images)) |
 | kdft k-leading pair (modes 2, 3) | `kdft/kdft_klead_ffi.cc`, `kdft/kdft_klead_kernel.h` (device text, `kdft_klead_src.h.in`) | ROCM; hipRTC for the device's target id at first use, disk-cached; leg-neutral source | `kdft_kconv_klead`, `kdft_kfft_klead` |
+| kdft k-minor pair (modes 4, 5) | `kdft/kdft_kminor_ffi.cc`, `kdft/kdft_kminor_kernel.h` (device text, `kdft_kminor_src.h.in`) | ROCM; as the k-leading pair | `kdft_kconv_kminor`, `kdft_kfft_kminor` |
 | host flat-k FFT | `fftw/fft_flat_k_ffi.cc` | host; C++, the FFTW3 ABI bound by `dlsym` | `mklfft_flat_k`, `mklfft_gw_conv` |
 | host CBLAS GEMM | `cblas/gemm_batch_ffi.cc` | host; C++ | `mklblas_gemm_batch` |
 | distributed dense LA | `cusolvermp/`, `scalapack/`, `slate/` | CUDA: cuSOLVERMp; host: ScaLAPACK, SLATE | [below](#dense-linear-algebra-targets) |

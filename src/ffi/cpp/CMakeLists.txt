@@ -1477,8 +1477,8 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 #
 # Families, one per port (each gated against XLA on the same device, as its
 # CUDA twin is):  phdf5;  kdft (the k-leading direct-DFT convolution and
-# transform, modes 2/3, run-time compiled);  slate (distributed eigh / potrf /
-# trsm and their batched forms over a gpu_backend=hip SLATE).  A family with no ROCm port is
+# transform, modes 2/3, and the k-minor pair, modes 4/5, run-time compiled);  slate (distributed
+# eigh / potrf / trsm and their batched forms over a gpu_backend=hip SLATE).  A family with no ROCm port is
 # simply not in the source list; ffi_loader's ROCM table lists only what this
 # leg exports.
 #
@@ -1519,6 +1519,7 @@ set(LORRAX_FFI_ROCM_SOURCES
     common/ctx_registry.cc
     common/rtc_build.cc
     kdft/kdft_klead_ffi.cc
+    kdft/kdft_kminor_ffi.cc
 )
 
 # The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated
@@ -1532,6 +1533,13 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_kernel.h"
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_core.h"
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_plan.h")
+# The k-minor kernel (modes 4/5, kdft/kdft_kminor_src.h.in), embedded the same way; it includes
+# the core through kdft_klead_src.h's kCoreSrc / kPlanSrc (one embedded copy of the core).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_kminor_kernel.h" LRX_KDFT_KMINOR_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_kminor_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kdft_kminor_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_kminor_kernel.h")
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)
