@@ -23,6 +23,11 @@ BUILD=${LORRAX_ROCM_BUILD_DIR:-$ROOT/src/ffi/cpp/build_rocm}
 
 export LMOD_PAGER=none
 module load PrgEnv-gnu/8.7.0 "$MPICH_MOD" "$HDF5_MOD" "$ROCM_MOD" cmake cray-python/3.12.12
+# No wrapper-injected LibSci: PrgEnv-gnu loads the site-default cray-libsci and
+# the CC wrapper would add its threaded pair to the link.  The leg's one host
+# BLAS is the SEQUENTIAL LibSci its SLATE links (build_slate_hip.sh), which
+# arrives through SLATE's CMake interface.
+module unload cray-libsci 2>/dev/null || true
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"         # cmake probes jax.ffi.include_dir() from here
 

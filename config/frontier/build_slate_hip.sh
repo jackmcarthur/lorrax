@@ -26,12 +26,19 @@
 # One MPI and one BLAS per process: PrgEnv-gnu + the pins in ffi_mpi.sh,
 # craype-accel-amd-gfx90a UNLOADED so the Cray wrapper links no libmpi_gtl_hsa
 # (SLATE stages tiles through host memory for MPI; it needs no GPU-aware MPI).
-# Host BLAS/LAPACK = LibSci's threaded flavour libsci_gnu_mp, the flavour the
-# host leg links (build_ffi_host.sh LORRAX_OLCF_LIBSCI_FLAVOUR=_mp), passed
-# EXPLICITLY with cray-libsci captured-then-UNLOADED.  Measured 2026-10-15 with
-# the module left loaded: BLAS++ (linked by the HIP driver because of its one
-# .hip source) received the wrapper's implicit -lsci_gnu_mpi -lsci_gnu on top
-# of the threaded pair -- both LibSci flavours in one library (GATE 2a).
+# Host BLAS/LAPACK = LibSci's SEQUENTIAL flavour libsci_gnu, passed EXPLICITLY
+# with cray-libsci captured-then-UNLOADED (else the wrapper injects its own).
+# SEQUENTIAL because SLATE calls host BLAS concurrently from its OpenMP task
+# threads and assumes a sequential BLAS (its own default blas_threaded=false;
+# it has no BLAS-thread control).  MEASURED 2026-10-15, P=4 2x2, heev n=2048
+# (nb=1024): against libsci_gnu_mp every run SIGSEGVs in
+# openblas_dgemm_oncopy <- dtrmm on a SLATE worker thread; OMP_NUM_THREADS=7,1
+# still crashes, OMP_NUM_THREADS=1 passes, and LD_PRELOAD of the sequential
+# libsci_gnu.so.6 passes with full threading.  n=512 (nb=256) passes either
+# way: below OpenBLAS's threading threshold.
+# Earlier measurement, module left loaded: BLAS++ (linked by the HIP driver,
+# one .hip source) got the wrapper's implicit -lsci_gnu_mpi -lsci_gnu beside
+# the threaded pair -- both LibSci flavours in one library (GATE 2a).
 # Device code: SLATE's src/hip kernels are compiled by hipcc; BLAS++ enables
 # the CMake HIP language.  Both target gfx90a (no xnack feature, so the image
 # runs under either HSA_XNACK mode).
@@ -64,7 +71,7 @@ module unload craype-accel-amd-gfx90a 2>/dev/null || true
     echo "[slate-hip]   not the pins in config/frontier/ffi_mpi.sh" >&2; exit 2; }
 : "${ROCM_PATH:?module $ROCM_MOD did not set ROCM_PATH}"
 # Capture LibSci, THEN unload it (else the wrapper injects sequential -lsci_gnu).
-LIBSCI_LIB="$CRAY_LIBSCI_PREFIX_DIR/lib/libsci_gnu_mp.so"
+LIBSCI_LIB="$CRAY_LIBSCI_PREFIX_DIR/lib/libsci_gnu${LORRAX_SLATE_LIBSCI_FLAVOUR:-}.so"   # sequential
 [[ -f "$LIBSCI_LIB" ]] || { echo "[slate-hip] ERROR: no $LIBSCI_LIB" >&2; exit 2; }
 module unload cray-libsci 2>/dev/null || true
 echo "[slate-hip] modules: $(module -t list 2>&1 | tr '\n' ' ')"
@@ -118,5 +125,7 @@ done
 _sci="$(for f in "$PREFIX"/lib64/lib{slate,blaspp,lapackpp}.so; do need "$f"; done | grep -E '^libsci' | sort -u)"
 if printf '%s\n' "$_sci" | grep -qE '^libsci_gnu(_mpi)?\.so' && printf '%s\n' "$_sci" | grep -qE '_mp\.so'; then
     echo "[slate-hip] ERROR: both LibSci threading flavours in the SLATE closure: $(echo $_sci)" >&2; fail=1; fi
+if [[ -z "${LORRAX_SLATE_LIBSCI_FLAVOUR:-}" ]] && printf '%s\n' "$_sci" | grep -qE '_mp\.so'; then
+    echo "[slate-hip] ERROR: a threaded LibSci in the SLATE closure ($(echo $_sci)); SLATE needs the sequential one" >&2; fail=1; fi
 echo "[slate-hip] LibSci in closure: $(echo $_sci)"
 exit $fail
