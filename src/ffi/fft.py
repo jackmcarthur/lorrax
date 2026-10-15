@@ -13,6 +13,10 @@ environment variable (``docs/architecture/decisions.md#xla-reference``):
            products and spin sums in XLA) with the host FFTW3-ABI flat-k
            transforms and fused Σ convolution (``cpp/fftw/``).  Kept because it
            is 3.8-7.4x faster than ``jnp.fft`` at a CrI3 rank tile.
+    ROCM   the XLA backend, except the k-leading pair (make_local_kconv_klead,
+           make_local_kfft_klead), which takes the kdft family: a direct DFT of
+           each column tile in LDS, hipRTC-built per k-grid (``cpp/kdft/``,
+           :data:`_ROCM_KLEAD_TARGETS`).  ``kconv_backend`` stays ``'xla'``.
     other  the XLA backend: the same composition with ``jnp.fft`` along the k
            axes.  It is the reference every vendor route is gated against on
            the same device (:func:`xla_reference`, ``tests/test_kconv_xla_gate.py``).
@@ -68,6 +72,7 @@ __all__ = [
     "KCONV_PAIR_TARGET", "KCONV_PARENT_TARGET", "KCONV_KLEAD_TARGET",
     "KFFT_KLEAD_TARGET", "KCONV_KMINOR_TARGET", "KFFT_KMINOR_TARGET",
     "KCONV_TARGETS", "KCONV_AXIS_MAX",
+    "KDFT_KCONV_KLEAD_TARGET", "KDFT_KFFT_KLEAD_TARGET", "kdft_refusal", "rocm_klead_target",
     "kconv_backend", "require_kconv", "mathdx_root", "cubin_cache_dir", "conv_kpair_scale",
     "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
     "KCONV_PLANE_TARGET",
@@ -120,6 +125,36 @@ KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCO
                  KCONV_KLEAD_UNFOLD_TARGET, KCONV_KLEAD_LORENTZ_TARGET,
                  KFFT_KLEAD_TARGET, KFFT_KLEAD_UNFOLD_TARGET, KCONV_CHI_UNFOLD_TARGET,
                  KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
+
+#: The ROCM leg's k-leading pair (cpp/kdft/kdft_klead_ffi.cc): mode 2 and mode 3 by direct DFT
+#: in LDS, the operations and layouts of KCONV_KLEAD_TARGET / KFFT_KLEAD_TARGET.
+KDFT_KCONV_KLEAD_TARGET = "lorrax_kdft_kconv_klead"
+KDFT_KFFT_KLEAD_TARGET = "lorrax_kdft_kfft_klead"
+# kdft measured record (MI250X, one GCD, ROCm 7.14.1, JAX 0.9.1; per mode-2 pass, c128, the XLA
+# route = this module's _xla composition inside xla_reference(); gate max |dU|/max|U| <= 7.1e-16
+# c128, 2.4e-7 c64 on every grid below).  XLA's FFT transforms minor axes only, so jnp.fft over
+# the leading k axes is transpose + FFT + transpose per transform; kdft reads and writes T once.
+#   k-grid  T (nk, a, mx, b, my)     XLA ms   kdft ms   speedup   kdft GB/s (2|T|/t)
+#   5x5x1   (25, 2, 3, 2, 3)          0.031    0.012     2.6       (launch-bound; hsuite)
+#   8x8x1   (64, 2, 500, 2, 500)      9.44     3.31      2.8       619
+#   4x4x4   (64, 2, 400, 2, 400)     11.47     1.86      6.2       705
+#   6x6x6   (216, 2, 250, 2, 250)    24.83     3.87      6.4       447
+#   12x12x1 (144, 2, 300, 2, 300)     9.99     4.77      2.1       348
+#   8x8x8   (512, 2, 150, 2, 150)     9.04     4.61      2.0       320
+# Mode 3 (one transform) 1.3-5.4x over the same grids.  Launch shape: a 16 KiB tile and 512
+# threads beat the first cut (32 KiB, 256) by 1.1-2.0x (sweep 8/16/32/60 KiB x 64..512 threads);
+# at least 8 columns per block (12x12x1 at 4 columns: 6.51 ms).  Not paid on hsuite: P4
+# kmeans..cohsex walls agree with the XLA route within run noise (113.3 vs 111.6 s cold).
+#: Factory -> the kdft target that serves it on a ROCm mesh.  A factory with no row takes the
+#: XLA backend there; ``kconv_backend`` stays ``'xla'`` on ROCm, so every unported factory and
+#: every backend-keyed caller (mixed_basis_pair_convolution, greens_function_kernel) is unchanged.
+_ROCM_KLEAD_TARGETS = {"kconv_klead": KDFT_KCONV_KLEAD_TARGET,
+                       "kfft_klead": KDFT_KFFT_KLEAD_TARGET}
+#: kdft's bounds (cpp/kdft/kdft_klead_ffi.cc kLdsMax, kAxisMax): one column's complex128 k tile
+#: and its twiddle allowance in a block's 64 KiB of LDS (nk + 192 <= 4096), and an axis the
+#: unrolled direct DFT holds in registers (the cuFFTDx route's cap, KCONV_AXIS_MAX).
+KDFT_NK_MAX = 3904
+KDFT_AXIS_MAX = 40
 
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
@@ -292,6 +327,77 @@ def kconv_backend(mesh: Mesh, kgrid=None, *, kminor: bool = False) -> str:
     return "xla"
 
 
+#: Why the kdft family cannot run on this job's devices: set once by :func:`require_kconv`
+#: when its probe fails on any process.
+_KDFT_DOWN: list = []
+
+
+def kdft_refusal(kgrid) -> str:
+    """Why kdft cannot serve ``kgrid`` ("" when it can): a k tile beyond its LDS bound."""
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    if max(kg) > KDFT_AXIS_MAX:
+        return f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_AXIS_MAX} (direct DFT)"
+    if nk > KDFT_NK_MAX:
+        return (f"GATE kdft-tile: got nk={nk}; want one column's complex128 k tile in a block's "
+                f"64 KiB of LDS (nk <= {KDFT_NK_MAX})")
+    return ""
+
+
+def rocm_klead_target(mesh: Mesh, kgrid, factory: str) -> str | None:
+    """The kdft target serving ``factory`` on this mesh, or ``None`` (the XLA backend): a ROCm
+    mesh outside :func:`xla_reference`, kdft not demoted, ``kgrid`` within its LDS bound
+    (else one warning per grid)."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    target = _ROCM_KLEAD_TARGETS.get(factory)
+    why = kdft_refusal(kgrid) if target else ""
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM {factory} -> XLA (jnp.fft), not kdft: {why}"
+        if announce_once(("kconv", "kdft", tuple(int(v) for v in kgrid)), msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return None
+    return target
+
+
+def _require_kdft_targets() -> None:
+    """Refuse a ROCM library without the kdft pair: a build defect, not a routing condition."""
+    for target in _ROCM_KLEAD_TARGETS.values():
+        _require_target(target, "ROCM")
+
+
+def _probe_kdft(mesh: Mesh) -> None:
+    """Build and run the kdft transform once (mode 3, k-grid 2x1x1) on this process's first mesh
+    device: a device hipRTC cannot compile for is found at startup.  Raises ``GATE kdft-probe``."""
+    local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
+    dev = local[0] if local else jax.local_devices()[0]
+    try:
+        with jax.default_device(dev):
+            y = np.asarray(jax.jit(lambda x: _kdft_rows_call(
+                KDFT_KFFT_KLEAD_TARGET, x, (2, 1, 1), forward=True, scale=1.0))(
+                jnp.asarray([[1.0], [0.0]], jnp.complex128)))
+        err = "" if np.allclose(y.ravel(), [1.0, 1.0]) else f"wrong result: FFT [1, 0] -> {y.ravel().tolist()}"
+    except Exception as e:                                          # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+    if err:
+        raise RuntimeError(f"GATE kdft-probe: got a kdft probe failure on {dev.device_kind}; want the "
+                           f"hipRTC-built k-leading transform to compile and run; cause: {err}")
+
+
+def _kdft_rows_call(target, x2, kg, *, forward: bool, scale: float, v=None):
+    """One kdft call on a (nk, rows) tile (mode 3) or T (nk, a, mx, b, my) with V_R (mode 2)."""
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                 scale=np.float64(scale), cubin_dir=cubin_cache_dir())
+    if v is None:
+        attrs["forward"] = np.int64(1 if forward else 0)
+    args = (x2,) if v is None else (x2, v)
+    return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(x2.shape, x2.dtype),
+                            input_output_aliases={0: 0})(*args, **attrs)
+
+
 def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
     """Startup check of the router's backend on this mesh; returns it or refuses.
 
@@ -340,6 +446,25 @@ def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
         announce_once(("kconv", "backend", backend),
                       "[kconv] k-convolution router: cpu -> FFTW3-ABI host plan route",
                       scope="rank0", emit=announce)
+    elif mesh_ffi_platform(mesh) == "ROCM" and not _XLA_REFERENCE:
+        try:
+            _probe_kdft(mesh)
+            why = ""
+        except RuntimeError as e:
+            why = str(e)
+        from jax.experimental import multihost_utils
+        if int(np.max(multihost_utils.process_allgather(np.int32(bool(why))))):
+            _KDFT_DOWN[:] = [why or "a peer process failed the kdft probe"]
+            from common.jax_compile_cache import record_demotion
+            record_demotion("kconv", f"kdft -> XLA: {_KDFT_DOWN[0]}")
+            if jax.process_index() == 0:
+                print(f"*** [kconv] DEMOTED: the ROCm k-leading pair runs on the XLA backend. "
+                      f"Cause: {_KDFT_DOWN[0]} ***", flush=True)
+        announce_once(("kconv", "backend", backend),
+                      "[kconv] k-convolution router: ROCM -> XLA (jnp.fft k-axis transforms); "
+                      + ("k-leading pair also XLA (kdft demoted)" if _KDFT_DOWN else
+                         f"k-leading pair -> kdft (hipRTC; cache {cubin_cache_dir()})"),
+                      scope="rank0", emit=announce)
     else:
         announce_once(("kconv", "backend", backend),
                       f"[kconv] k-convolution router: {mesh_ffi_platform(mesh)} -> XLA "
@@ -368,7 +493,7 @@ def _require_sm80() -> None:
 
 #: Leg key -> the device check :func:`require_kconv` runs before the router's
 #: backend on that leg.  A leg with no row has no device precondition.
-_KCONV_DEVICE_PRECONDITION = {"CUDA": _require_sm80}
+_KCONV_DEVICE_PRECONDITION = {"CUDA": _require_sm80, "ROCM": _require_kdft_targets}
 
 def _probe_host_engines(mesh: Mesh) -> None:
     """Run the plan backend's host engines once at startup: a 2-point FFT on
@@ -1056,6 +1181,14 @@ def make_local_kfft_klead(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> 
     if kconv_backend(mesh, kgrid) == "plan":
         return lambda x: _host_flat_k(x, kg, kind, scale)
 
+    target = rocm_klead_target(mesh, kg, "kfft_klead")
+    if target is not None:
+        def _kdft(x):
+            _check_complex(x)
+            return _kdft_rows_call(target, x.reshape(nk, -1), kg, forward=kind == "fftn",
+                                   scale=scale).reshape(x.shape)
+        return _kdft
+
     def _xla(x):
         _check_complex(x)
         return _kfft(x, kg, kind, "xla") * scale
@@ -1336,6 +1469,13 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
                 KCONV_KLEAD_TARGET, jax.ShapeDtypeStruct(t.shape, t.dtype),
                 input_output_aliases={0: 0})(t, v_r, **attrs, **_mathdx_common())
         return _mathdx
+
+    target = rocm_klead_target(mesh, kg, "kconv_klead")
+    if target is not None:
+        def _kdft(t, v_r):
+            _check_complex(t, v_r)
+            return _kdft_rows_call(target, t, kg, forward=True, scale=scale, v=v_r)
+        return _kdft
 
     backend = kconv_backend(mesh, kgrid)
 
