@@ -36,7 +36,26 @@ The laws are `gw.cd.laws`, pinned on CPU against the ordered (time-reversal-exac
 | W_c, dW_c/ds | the response bank's pair equations, X = pref·HχH, W_c = HX(1−X)⁻¹H, dW_c/ds = W(pref·dχ)W, as a local batched LU over the (q, z) flat axis (`gw.cd.sigma.build_dyson_kernels`) |
 | W at star q | `symmetry_maps.QirrOperator.unfold` with the general-operator `pair_transpose` rule |
 | Σ_c(k) at star k | `symmetry_maps.unfold_file_wedge_band_operator` (rule `transpose`) from the file wedge |
-| the contraction | `gw.cd.sigma.build_contraction_kernels`: one `shard_map` over q; pair densities ρ_q[k,m,l,μ] recomputed per q from replicated ψ tables |
+| the contraction | `gw.cd.sigma.build_contraction_kernels`: one `shard_map` over q; pair densities ρ_q[k,m,l,μ] recomputed per q from replicated ψ tables; on the real axis only the banded rows of each knot chunk (below) |
+
+## Banded residue rows (real axis)
+
+A Hermite residue at (E, l) reads only the two knots bracketing |x| = |E − ε_l(k−q)|
+(`laws.HERMITE_STENCIL`, lower knot `laws.hermite_lower_knot`), on one branch: x ≥ 0 (weight −(1−f),
+W_q) or x < 0 (weight f, W_−q^T).  A (k, l) row none of whose residues reads a chunk's knots adds an
+exact zero there, so `residue_band_tables` (host, once per run, one bit per branch × q × k × l × chunk)
+lists for each chunk and branch the live bands of every (q, k) row (E over the ω grid and the row's own
+energies; stencil widened by one knot each side, so a last-ulp difference between numpy's and XLA's
+|x|/h cannot drop a row), and the kernel gathers ψ, ε, f on those bands only.  Widths are the chunk's
+largest live count rounded up to a multiple of `BAND_RUNG` = 8 (capped at L): padding slots hold dead
+bands, whose weights are exact zeros, so no mask is needed, and the kernel compiles once per distinct
+(L₊, L₋) pair.  A branch no residue reads is not traced; a chunk neither branch reads is skipped.  The
+Hermite coefficients (`laws.hermite_branch_coefficients`) are built once per (chunk, q, branch); a knot
+selects them through `index == node` (`laws.real_knot_select`).  The integration rule is unchanged; the
+result differs from the dense contraction only in summation order (CPU pin
+`tests/test_cd_banded_residues.py`: ≤ 1e-13 relative, with a red twin).  Fe 64 k × 36 bands, 276 chunks
+of 6 knots: 6 width pairs, 35 % of the dense rows contracted (live 11 % / 40 % on the x ≥ 0 / x < 0 branch).
+The receipt's `residue_bands` records the widths and fractions of the run.
 
 ## Streaming and memory
 
@@ -68,7 +87,7 @@ only), `cd_band_extrapolation_unimplemented`, `cd_single_eta` (no per-window η)
 
 `cd_sigma_own_energy.npz` (the diagonal at the DFT energies and its anchor, imaginary and real parts),
 `cd_sigma_receipt.json` (recipe, J, reach, chunks and per-unit bytes, per-stage seconds, Σ_x identity,
-symmetry certificate), `cd_leak_ledger.csv` (per chunk: seconds, bytes in use, pool high-water read without reset --
+symmetry certificate, `residue_bands` widths and live/contracted fractions), `cd_leak_ledger.csv` (per chunk: seconds, bytes in use, pool high-water read without reset --
 cumulative since the enclosing stage boundary, which `common.timing` owns -- and live arrays; a leak
 shows as a rise after the first chunk).  `LORRAX_CD_STAR_CERTIFICATE=N` (instrument, off by default) computes
 one non-identity member of N k stars directly and compares it with the wedge-unfolded cube.

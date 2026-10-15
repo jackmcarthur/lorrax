@@ -54,12 +54,14 @@ SCRIPT = textwrap.dedent(r'''
         rho = np.einsum("klsu,kmsu->kmlu", psi[r].conj(), psi[:, :m])
         return rho, omega[None, :, None] - enk[r][:, None, :], eps_own[:, :, None] - enk[r][:, None, :], f[r]
     con = lambda rho, op: np.asarray(contract(jnp.asarray(rho), jnp.asarray(op), nk))
-    # real axis: two calls of two knots each (accumulation), knots 3..6
+    # real axis: two calls of two knots each (accumulation), knots 3..6; full band tables (every l on
+    # both branches) are the dense contraction -- tests/test_cd_banded_residues.py pins the banded tables
     z = (np.arange(3, 3 + nz) * h) + 1j * eta
     acc, own = zeros(nE, nk, m, m), zeros(nk, m)
+    full = put(np.broadcast_to(np.arange(L, dtype=np.int32), (nq_pad, nk, L)).copy())
     for a0 in (0, 2):
         acc, own = K.real(jax.device_put(W[a0:a0 + 2], qpar4), jax.device_put(dW[a0:a0 + 2], qpar4),
-                          jnp.asarray(z[a0:a0 + 2]), jnp.int32(3 + a0), acc, own, T)
+                          jnp.asarray(z[a0:a0 + 2]), jnp.int32(3 + a0), acc, own, T, (full, full), (False, True))
     ref, ref_o = 0, 0
     for q in range(nk):
         rho, x, xo, fq = rows(q)

@@ -140,6 +140,17 @@ def anchor_subtraction(cp, cm, sums, apply_fn=apply):
 
 
 # --------------------------------------------------------------------------- real-axis residues
+#: Knot offsets a Hermite residue reads from its lower knot floor(|x|/h): value and derivative at the
+#: two knots bracketing |x|.  The banded residue tables (``gw.cd.sigma.residue_band_tables``) are built
+#: from this stencil and :func:`hermite_lower_knot`; the selectors below read exactly these two knots.
+HERMITE_STENCIL = (0, 1)
+
+
+def hermite_lower_knot(x, h, xp=jnp):
+    """floor(|x| / h): the lower knot of the residue at x (float array; ``xp`` = jnp in-kernel, np on the host)."""
+    return xp.floor(xp.abs(x) / h)
+
+
 def hermite_coefficients(x, f, h):
     """Run211 uniform-|x| cubic Hermite selectors: (index[k,E,l] int32, vl, vr, dl, dr).
 
@@ -148,12 +159,39 @@ def hermite_coefficients(x, f, h):
     """
     fb = jnp.broadcast_to(f[:, None, :], x.shape)
     query = jnp.abs(x)
-    index = jnp.floor(query / h)
+    index = hermite_lower_knot(x, h)
     t = jnp.clip(query / h - index, 0.0, 1.0)
     rs = jnp.where(x < 0.0, fb, -(1.0 - fb))
     h00, h10 = 2 * t ** 3 - 3 * t ** 2 + 1, t ** 3 - 2 * t ** 2 + t
     h01, h11 = -2 * t ** 3 + 3 * t ** 2, t ** 3 - t ** 2
     return index.astype(jnp.int32), rs * h00, rs * h01, rs * h * h10, rs * h * h11
+
+
+def hermite_branch_coefficients(x, f, h, negative):
+    """The knot-independent part of ONE branch's Hermite residues: (index, vl, vr, dl, dr) [k, E, l].
+
+    :func:`hermite_coefficients` with the branch mask folded in once: ``negative=False`` keeps x >= 0
+    (unoccupied l, weight -(1 - f)), ``negative=True`` keeps x < 0 (occupied l, weight f); the other
+    side is zero.  A knot depends on these only through ``index == node`` (:func:`real_knot_select`),
+    so the CD kernel builds them once per (knot chunk, q) instead of once per knot.
+    """
+    index, vl, vr, dl, dr = hermite_coefficients(x, f, h)
+    keep = (x < 0.0) if negative else (x >= 0.0)
+    return (index,) + tuple(jnp.where(keep, c, 0.0) for c in (vl, vr, dl, dr))
+
+
+def real_knot_select(node, coeffs):
+    """One knot's Hermite weights [k, E, 2l] (value block, then derivative block) from branch coefficients."""
+    index, vl, vr, dl, dr = coeffs
+    left, right = index == node, index + 1 == node          # HERMITE_STENCIL: the knot is the lower or upper one
+    sel_v = jnp.where(left, vl, 0.0) + jnp.where(right, vr, 0.0)
+    sel_d = jnp.where(left, dl, 0.0) + jnp.where(right, dr, 0.0)
+    return jnp.concatenate([sel_v, sel_d], axis=-1)
+
+
+def real_knot_operators(z, a, d):
+    """One knot's operators [k, m, n, 2l]: the value contraction a and the slope datum d/ds * 2z = d/dx."""
+    return jnp.concatenate([a, d * (2 * z)], axis=-1)
 
 
 def real_knot_terms(node, z, a, d, x, f, h, negative):
@@ -163,12 +201,7 @@ def real_knot_terms(node, z, a, d, x, f, h, negative):
     -dW_c,q/ds; ``negative=True``: residues x < 0 (occupied l), read the W_{-q}^T twins.  The
     derivative node datum is d/ds * 2z = d/dx.  ``node`` is the knot index of z = x_node + i eta.
     """
-    index, vl, vr, dl, dr = hermite_coefficients(x, f, h)
-    sel_v = jnp.where(index == node, vl, 0.0) + jnp.where(index + 1 == node, vr, 0.0)
-    sel_d = jnp.where(index == node, dl, 0.0) + jnp.where(index + 1 == node, dr, 0.0)
-    keep = (x < 0.0) if negative else (x >= 0.0)
-    return (jnp.concatenate([a, d * (2 * z)], axis=-1),
-            jnp.concatenate([jnp.where(keep, sel_v, 0.0), jnp.where(keep, sel_d, 0.0)], axis=-1))
+    return real_knot_operators(z, a, d), real_knot_select(node, hermite_branch_coefficients(x, f, h, negative))
 
 
 def real_knot(node, z, a, d, at, dt, x, f, h, apply_fn=apply):

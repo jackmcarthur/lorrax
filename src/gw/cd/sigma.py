@@ -24,7 +24,10 @@ unreferenced knots so every chunk has one shape):
 
 The real axis needs no W_{-q} gather: the rank holding W_q' adds pair q''s x >= 0 residues
 (contractions with W_q') and pair (-q')'s x < 0 residues (contractions with W_q'^T), recomputing
-the pair densities rho_{-q'} from the replicated tables.  FD-9 ghost knots roll from chunk to
+the pair densities rho_{-q'} from the replicated tables.  A residue at (E, l) reads only the two knots
+bracketing |x|, so each knot chunk contracts, per branch, only the (k, l) rows some residue of that
+branch reads in the chunk (:func:`residue_band_tables`, host-built once; widths padded to BAND_RUNG
+so a handful of shapes compile); every other row would add an exact zero.  FD-9 ghost knots roll from chunk to
 chunk (chi0 runs once per knot).  The q axis is padded to a multiple of P with zero W rows
 (``qvalid`` masks them).  Accumulators are replicated; each kernel returns acc + psum(increment).
 
@@ -58,7 +61,8 @@ CD_RECIPE = dict(version="cd_production_v2", laws="ordered_cd TRREF / Run211 jet
                  beta_ev=[0.5, 4.0], slope="fd9 rolling ghosts", imaginary_rule="tan_mapped_gauss two-panel",
                  chi0="w_isdf.compute_chi0_direct_fractional(ordered=True)",
                  dyson="response_bank pair equations, local batched jnp.linalg.solve over (q, z)",
-                 tile="runtime.tiles.tile_units", real_axis="owner-rank branches, no W_-q gather")
+                 tile="runtime.tiles.tile_units", real_axis="owner-rank branches, no W_-q gather",
+                 residue_rows="banded per knot chunk and branch (live bands, BAND_RUNG 8; exact)")
 
 
 def _say(print_fn, started, msg):
@@ -118,21 +122,125 @@ def chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, *, axis):
     return 16.0 * n * n * per / ndev
 
 
+# ------------------------------------------------------------------------------- residue band tables
+#: Width rung of the banded residue tables.  A knot chunk's per-branch band count (the most live bands of
+#: any (q, k) row) is padded up to a multiple of BAND_RUNG, capped at L, so the real-axis kernel compiles
+#: once per distinct (L+, L-) pair instead of once per chunk.  Fe 64 k x 36 bands, 276 chunks: 6 pairs,
+#: 35 % of the dense rows contracted (29 % at exact widths, 38 pairs; rung 4: 32 %, 12 pairs).
+BAND_RUNG = 8
+
+
+def band_rung(count, L):
+    """Static table width for ``count`` live bands: 0 (branch skipped) or min(L, BAND_RUNG * ceil(count / BAND_RUNG))."""
+    count = int(count)
+    return 0 if count == 0 else min(int(L), BAND_RUNG * -(-count // BAND_RUNG))
+
+
+def residue_band_tables(enk_L, f_L, KMQ_pad, qneg_pad, rows, omega, eps_own, h_ry, chunk, n_chunks):
+    """Which intermediate bands l each knot chunk's residues read, per occupation branch (host, numpy).
+
+    The Hermite residue of (k, E, l) at x = E - eps_l(k - q) reads only the knots floor(|x|/h) + (0, 1)
+    (``laws.HERMITE_STENCIL``), on the x >= 0 branch (weight -(1 - f), pair q, W_q) or the x < 0 branch
+    (weight f, pair -q, W_{-q}^T).  A (k, l) row none of whose residues reads a knot of a chunk contributes
+    an exact zero to that chunk, so the chunk need contract only its live rows (the integration rule is
+    unchanged).  E runs over the omega grid AND the row's own energies (the own-energy diagonal).  The
+    stencil is widened by one knot on each side: numpy's |x|/h and XLA's (which may fold the division into
+    a reciprocal multiply) can differ in the last ulp, and a superset of the live rows is exact where a
+    missed row is not.  x and f are formed by the same arithmetic as :func:`pair_rows`.
+
+    Parameters
+    ----------
+    enk_L, f_L : [nk, L] float64 -- energies (Ry) and floored occupations of the kernel tables.
+    KMQ_pad : [nq_pad, nk] int (k - q rows); qneg_pad : [nq_pad] int; rows : [kw] int (file wedge + certificate).
+    omega : [E] (Ry, absolute); eps_own : [kw, m] (Ry); h_ry : knot step; chunk, n_chunks : the knot tiling.
+
+    Returns
+    -------
+    ``(tables, summary)``.  ``tables(c)`` -> ``(bands, negative)``: a tuple of int32 tables
+    [nq_pad, kw, Lb] (one per branch that chunk c reads; Lb = :func:`band_rung` of the chunk's largest
+    live count) listing per (q, k) the live bands in ascending order, then dead bands as padding, and the
+    matching tuple of branch flags.  Padding needs no mask: a dead band's weights at the chunk's knots are
+    exact zeros.  ``summary`` holds the widths and live/contracted fractions for the receipt.  Storage is
+    one bit per (branch, q, k, l, chunk).
+    """
+    enk_L, f_L = np.asarray(enk_L, np.float64), np.asarray(f_L, np.float64)
+    rows, omega, eps_own = np.asarray(rows), np.asarray(omega, np.float64), np.asarray(eps_own, np.float64)
+    nq_pad, kw, L = int(KMQ_pad.shape[0]), int(rows.size), int(enk_L.shape[1])
+    n_knots = int(chunk) * int(n_chunks)
+    nbytes = -(-int(n_chunks) // 8)
+    packed = np.zeros((2, nq_pad, nbytes, kw, L), np.uint8)
+    width = np.zeros((2, int(n_chunks)), np.int64)
+    live_rows = np.zeros(2)
+    ne = omega.size + eps_own.shape[1]
+    qb = max(1, int((64 << 20) // (2 * kw * ne * L * 8)))                 # q block: x below 64 MiB
+    pair_g = np.arange(nq_pad)
+    pair_all = np.stack([pair_g, np.asarray(qneg_pad)[pair_g]])          # [branch, q]: the pair each branch reads
+    for g0 in range(0, nq_pad, qb):
+        g1 = min(g0 + qb, nq_pad)
+        r = np.asarray(KMQ_pad)[pair_all[:, g0:g1]][..., rows]           # [2, qb, kw]
+        e, f = enk_L[r], f_L[r]                                          # [2, qb, kw, L]
+        x = np.concatenate([omega[None, None, None, :, None] - e[..., None, :],
+                            np.broadcast_to(eps_own[None, None, :, :, None], e.shape[:3] + eps_own.shape[1:] + (1,))
+                            - e[..., None, :]], axis=3)                   # [2, qb, kw, E + m, L]
+        side = np.stack([x[0] >= 0.0, x[1] < 0.0])
+        weight = np.stack([(1.0 - f[0]) != 0.0, f[1] != 0.0])[..., None, :]
+        ok = side & weight                                               # live residues of each branch
+        b_, q_, k_, _, l_ = np.nonzero(ok)
+        lower = laws.hermite_lower_knot(x[ok], h_ry, xp=np).astype(np.int64)
+        hit = np.zeros((2, g1 - g0, int(n_chunks), kw, L), bool)
+        base = (b_ * (g1 - g0) + q_) * (int(n_chunks) * kw * L) + k_ * L + l_      # flat index at chunk 0
+        flat = hit.reshape(-1)
+        for d in (-1,) + tuple(laws.HERMITE_STENCIL) + (laws.HERMITE_STENCIL[-1] + 1,):
+            knot = lower + d
+            sel = (knot >= 0) & (knot < n_knots)
+            flat[base[sel] + (knot[sel] // int(chunk)) * (kw * L)] = True
+        packed[:, g0:g1] = np.packbits(hit, axis=2)
+        counts = hit.sum(axis=-1)                                        # [2, qb, n_chunks, kw]
+        width = np.maximum(width, counts.max(axis=(1, 3)))
+        live_rows += counts.sum(axis=(1, 2, 3))
+
+    widths = np.array([[band_rung(width[b, c], L) for c in range(int(n_chunks))] for b in (0, 1)])
+
+    def tables(c):
+        bits = (packed[:, :, c >> 3] >> (7 - (c & 7))) & 1               # [2, nq_pad, kw, L]
+        bands, negative = [], []
+        for b in (0, 1):
+            if widths[b, c]:
+                order = np.argsort(1 - bits[b], axis=-1, kind="stable")[..., :widths[b, c]]
+                bands.append(order.astype(np.int32))
+                negative.append(b == 1)
+        return tuple(bands), tuple(negative)
+
+    dense = float(nq_pad * kw * L * n_chunks)
+    pairs = {}
+    for c in range(int(n_chunks)):
+        key = f"{widths[0, c]}/{widths[1, c]}"
+        pairs[key] = pairs.get(key, 0) + 1
+    summary = dict(rung=BAND_RUNG, L=L, n_chunks=int(n_chunks), live_fraction=[float(v / dense) for v in live_rows],
+                   contracted_fraction=[float(widths[b].sum() / (L * n_chunks)) for b in (0, 1)],
+                   empty_chunks=[int((widths[b] == 0).sum()) for b in (0, 1)], widths_pos_neg=pairs)
+    return tables, summary
+
+
 # ------------------------------------------------------------------------------- pair-basis kernels
-def pair_rows(T, q):
+def pair_rows(T, q, bands=None):
     """Pair densities and energy tables of pair q (k -> k - q) at the file-wedge rows.
 
     T (replicated): psi_L [nk, L, s, n], psi_M [kw, m, s, n], KMQ [nq_pad, nk], kw [kw],
-    enk [nk, L], f [nk, L], omega [E], eps_own [kw, m].
-    Returns rho [kw, m, L, n] = conj(psi_{k-q,l}) psi_{k,m} summed over spinor, x [kw, E, L],
-    x_own [kw, m, L] (Ry, omega - eps_l(k-q)), f [kw, L].
+    enk [nk, L], f [nk, L], omega [E], eps_own [kw, m].  ``bands`` [kw, Lb] int32 (optional): the
+    intermediate bands to keep per row (a :func:`residue_band_tables` table at this q); all L if None.
+    Returns rho [kw, m, Lb, n] = conj(psi_{k-q,l}) psi_{k,m} summed over spinor, x [kw, E, Lb],
+    x_own [kw, m, Lb] (Ry, omega - eps_l(k-q)), f [kw, Lb].
     """
     rows = T["KMQ"][q][T["kw"]]
-    psi_l = T["psi_L"][rows]
+    if bands is None:
+        psi_l, e, f = T["psi_L"][rows], T["enk"][rows], T["f"][rows]
+    else:
+        psi_l, e, f = (T[key][rows[:, None], bands] for key in ("psi_L", "enk", "f"))
     rho = jnp.einsum("klsu,kmsu->kmlu", jnp.conj(psi_l), T["psi_M"])
-    x = T["omega"][None, :, None] - T["enk"][rows][:, None, :]
-    x_own = T["eps_own"][:, :, None] - T["enk"][rows][:, None, :]
-    return rho, x, x_own, T["f"][rows]
+    x = T["omega"][None, :, None] - e[:, None, :]
+    x_own = T["eps_own"][:, :, None] - e[:, None, :]
+    return rho, x, x_own, f
 
 
 def contract(rho, op, nk):
@@ -146,9 +254,12 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
 
     sigma_x(V [nq_pad, n, n] q-par, acc [kw, m, m], T)                     -> acc + Sigma_x
     imag(W [nz, nq_pad, n, n] q-par, u [nz], w [nz], acc [E,kw,m,m], own [kw,m], T) -> (acc', own')
-    real(W, dW, z [nz], node0, acc, own, T)                                 -> (acc', own')
+    real(W, dW, z [nz], node0, acc, own, T, bands, negative)                -> (acc', own')
     anchor(W0, dW0 [nq_pad, n, n] at z = i eta, acc, own, T)                -> (acc', own')
     Every kernel returns its input accumulator plus the psum over ranks of its own increment.
+    ``real`` contracts only the banded rows of the chunk: ``bands`` are the replicated int32 tables
+    [nq_pad, kw, Lb] of :func:`residue_band_tables` for the branches that read the chunk, ``negative``
+    their branch flags (static).  Full tables (every l, both branches) give the dense contraction.
     """
     axes = ("x", "y")
 
@@ -183,24 +294,33 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
         (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc), psum_add(own, inc_own)
 
-    def cd_real_contract(W, dW, z_c, node0, acc, own, T):
+    def cd_real_contract(W, dW, z_c, node0, acc, own, T, bands, negative):
+        """One knot chunk's Hermite residues on the banded rows of ``bands`` (one table per live branch).
+
+        ``negative`` (static, one flag per table): False = x >= 0 residues of pair g against W_g,
+        True = x < 0 residues of pair -g against W_g^T.  Per (chunk, q) the pair densities are gathered
+        on the table's bands only and the Hermite coefficients are built once; per knot only the
+        ``index == node`` selection, the contractions and the apply remain.
+        """
         def over_q(carry, iq):
             g = q0() + iq
-            gn = T["qneg"][g]
-            rho_p, x_p, xo_p, f_p = pair_rows(T, g)       # pair g, residues x >= 0, operator W_g
-            rho_n, x_n, xo_n, f_n = pair_rows(T, gn)      # pair -g, residues x < 0, operator W_g^T
+            sides = []
+            for table, neg in zip(bands, negative):
+                rho, x, x_own, f = pair_rows(T, T["qneg"][g] if neg else g, table[g])
+                sides.append((rho, laws.hermite_branch_coefficients(x, f, h_ry, neg),
+                              laws.hermite_branch_coefficients(x_own, f, h_ry, neg), neg))
 
             def over_z(c2, iz):
                 node, z = node0 + iz, z_c[iz]
                 Wz, dWz = W[iz, iq], dW[iz, iq]
-                a, d = contract(rho_p, Wz, nk), contract(rho_p, dWz, nk)
-                at, dt = contract(rho_n, Wz.T, nk), contract(rho_n, dWz.T, nk)
-                op_p, w_p = laws.real_knot_terms(node, z, a, d, x_p, f_p, h_ry, negative=False)
-                op_n, w_n = laws.real_knot_terms(node, z, at, dt, x_n, f_n, h_ry, negative=True)
-                _, wo_p = laws.real_knot_terms(node, z, a, d, xo_p, f_p, h_ry, negative=False)
-                _, wo_n = laws.real_knot_terms(node, z, at, dt, xo_n, f_n, h_ry, negative=True)
-                inc = laws.apply(jnp.concatenate([op_p, op_n], -1), jnp.concatenate([w_p, w_n], -1))
-                inc_own = laws.own_apply(op_p, wo_p) + laws.own_apply(op_n, wo_n)
+                ops, wts, inc_own = [], [], 0
+                for rho, coeffs, coeffs_own, neg in sides:
+                    op = laws.real_knot_operators(z, contract(rho, Wz.T if neg else Wz, nk),
+                                                  contract(rho, dWz.T if neg else dWz, nk))
+                    ops.append(op)
+                    wts.append(laws.real_knot_select(node, coeffs))
+                    inc_own = inc_own + laws.own_apply(op, laws.real_knot_select(node, coeffs_own))
+                inc = laws.apply(jnp.concatenate(ops, -1), jnp.concatenate(wts, -1))
                 return (c2[0] + inc, c2[1] + inc_own), None
             (s_acc, s_own), _ = jax.lax.scan(over_z, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(W.shape[0]), unroll=1)
             v = T["qvalid"][g]
@@ -225,18 +345,33 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
 
     q3, q4 = P(axes), P(None, axes)
 
-    def wrap(fn, in_specs, out_specs):
+    def wrap(fn, in_specs, out_specs, name=None):
         sm = shard_map(fn, mesh=mesh_xy, in_specs=in_specs, out_specs=out_specs, check_vma=False)
 
         def named(*args):
             return sm(*args)
-        named.__name__ = named.__qualname__ = fn.__name__
+        named.__name__ = named.__qualname__ = name or fn.__name__
         return jax.jit(named)
+
+    real_programs = {}
+
+    def real(W, dW, z_c, node0, acc, own, T, bands, negative):
+        """Banded real-axis kernel; one program per branch-flag tuple, jit-cached per table width."""
+        negative = tuple(bool(v) for v in negative)
+        if len(negative) != len(bands) or not negative:
+            raise ValueError(f"GATE cd_band_tables: {len(bands)} tables vs branch flags {negative}; want one flag per "
+                             "table and at least one table (a chunk no residue reads is skipped by the caller)")
+        if negative not in real_programs:
+            def body(W, dW, z_c, node0, acc, own, T, bands):
+                return cd_real_contract(W, dW, z_c, node0, acc, own, T, bands, negative)
+            real_programs[negative] = wrap(body, (q4, q4, P(), P(), P(), P(), P(), P()), (P(), P()),
+                                           name="cd_real_contract")
+        return real_programs[negative](W, dW, z_c, node0, acc, own, T, tuple(bands))
 
     return SimpleNamespace(
         sigma_x=wrap(cd_sigma_x, (q3, P(), P()), P()),
         imag=wrap(cd_imag_contract, (q4, P(), P(), P(), P(), P()), (P(), P())),
-        real=wrap(cd_real_contract, (q4, q4, P(), P(), P(), P(), P()), (P(), P())),
+        real=real,
         anchor=wrap(cd_anchor, (q3, q3, P(), P(), P()), (P(), P())))
 
 
@@ -421,6 +556,11 @@ def compute_sigma_c_cd_omega_grid(
          f"chunk imag {chunk_i} ({chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis='imag') / 2**20:.1f} MiB/node), "
          f"real {chunk_r} ({chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis='real') / 2**20:.1f} MiB/knot)"
          + (f" [cd_knot_chunk override {override}]" if override else ""))
+    t_bands = time.monotonic()
+    band_tables, band_summary = residue_band_tables(enk_L, f_L, KMQ_pad, qneg_pad, rows_all, omega, eps_own,
+                                                    h_ry, chunk_r, J_pad // chunk_r)
+    band_summary["build_s"] = round(time.monotonic() - t_bands, 3)
+    _say(print_fn, started, "residue band tables (the rows each knot chunk contracts): " + json.dumps(band_summary))
 
     # ---- wavefunctions at every full k (parents unfolded by the typed centroid action) ---------------
     carrier = wfns.green_parent
@@ -632,8 +772,11 @@ def compute_sigma_c_cd_omega_grid(
             clock("anchor", t0)
             partial_dump("anchor", sigma_c_anchor_own_ry=own_anc, sigma_c_imag_own_ry=own_imag)
         t0 = time.monotonic()
-        acc_real, own_real = K.real(W, dW, z_core, jnp.int32(j0), acc_real, own_real, tabs)
-        jax.block_until_ready(acc_real)
+        bands, negative = band_tables(ic)
+        if bands:                                       # a chunk no live residue reads adds an exact zero
+            acc_real, own_real = K.real(W, dW, z_core, jnp.int32(j0), acc_real, own_real, tabs,
+                                        tuple(_rep(b) for b in bands), negative)
+            jax.block_until_ready(acc_real)
         clock("contract_real", t0)
         del W, dW
         ledger.append(ledger_sample("real", ic, time.monotonic() - t_chunk))
@@ -680,7 +823,8 @@ def compute_sigma_c_cd_omega_grid(
                    bytes_per_knot_real=chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis="real"),
                    seconds=timings, elapsed_s=time.monotonic() - started, sigma_x_identity=sx_note,
                    coulomb_support_ranks=[int(host(support).min()), int(host(support).max())],
-                   full_bz=full_bz, kw_rows=kw_rows.tolist(), finite=finite, ndev=ndev, symmetry_certificate=cert_note)
+                   full_bz=full_bz, kw_rows=kw_rows.tolist(), finite=finite, ndev=ndev, symmetry_certificate=cert_note,
+                   residue_bands=band_summary)
     if rank0 and run_dir is not None:
         np.savez(os.path.join(run_dir, "cd_sigma_own_energy.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
                  eps_own_ry=eps_own[:nk_red], sigma_c_own_ry=own, sigma_c_anchor_own_ry=parts["anchor"],
