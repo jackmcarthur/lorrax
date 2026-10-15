@@ -29,8 +29,10 @@ Under pytest the device gate skips; the row's CPU checks run.
 """
 import sys
 
-import numpy as np
-import pytest
+# runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
+import runtime  # noqa: F401,E402
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
 
 TOL = 1e-12
 PROJ_TOL = 1e-9
