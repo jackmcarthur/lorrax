@@ -76,6 +76,7 @@ __all__ = [
     "KFFT_KLEAD_TARGET", "KCONV_KMINOR_TARGET", "KFFT_KMINOR_TARGET",
     "KCONV_TARGETS", "KCONV_AXIS_MAX",
     "KDFT_KCONV_KLEAD_TARGET", "KDFT_KFFT_KLEAD_TARGET", "kdft_refusal", "rocm_klead_target",
+    "KDFT_KCONV_KMINOR_TARGET", "KDFT_KFFT_KMINOR_TARGET", "kdft_kminor_refusal",
     "kconv_backend", "require_kconv", "mathdx_root", "cubin_cache_dir", "conv_kpair_scale",
     "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
     "KCONV_PLANE_TARGET",
@@ -155,11 +156,32 @@ KDFT_KFFT_KLEAD_TARGET = "lorrax_kdft_kfft_klead"
 #   128x80x1  (10240, 2, 39, 2, 39)    11.67 ->  9.08 (1.3)       5.80 -> 5.00 (1.2)
 # The single-pass grids match the first, direct-DFT kdft within 3% (8x8x1 3.38, 6x6x6 3.96, 8x8x8
 # 4.66 ms) and beat it at 12x12x1 (4.82 ms).  Not paid on hsuite (5x5x1, launch-bound).
+#: The ROCM leg's k-minor pair (cpp/kdft/kdft_kminor_ffi.cc): modes 4 and 5, the operations and
+#: layouts of KCONV_KMINOR_TARGET / KFFT_KMINOR_TARGET (the BSE rung and the BSE kernel prep).
+KDFT_KCONV_KMINOR_TARGET = "lorrax_kdft_kconv_kminor"
+KDFT_KFFT_KMINOR_TARGET = "lorrax_kdft_kfft_kminor"
+# kdft k-minor record (modes 4/5; MI250X, one GCD, ROCm 7.14.1, JAX 0.9.1; c128; XLA = the same
+# factory inside xla_reference(): the dense DFT GEMM on the minor k axis for nk <= 144, jnp.fft
+# with k moved leading above; gate max|dU|/max|U| <= 1.6e-15 c128, 4.4e-7 c64 on 70 cases, axes to
+# 128 incl. primes 97 and 127, nk to 3904).  Launch: 32 KiB footprint / 512 threads (sweep of
+# {8,16,32,60} KiB x {256,512,1024}); rows per block odd, or a power of two for out_layout 1
+# (cpp/kdft/kdft_kminor_ffi.cc).  "v1" = the first cut's own direct DFT, before kdft_core.h.
+#   tile                              op                 XLA ms   kdft ms (v1)    speedup   GB/s
+#   W (1000,1000, 8,8,1)  1.02 GB     mode 5 ifftn        3.63     1.71 (1.62)     2.1       1196
+#   W (600,600, 12,12,1)  0.83 GB     mode 5 ifftn        4.90     1.37 (1.94)     3.6       1212
+#   W (600,600, 6,6,6)    1.24 GB     mode 5 ifftn       16.33     2.33 (2.14)     7.0       1067
+#   W (300,300, 8,8,8)    0.74 GB     mode 5 ifftn        5.56     1.30 (1.54)     4.3       1137
+#   T (4,500,500,1,1,64)  1.02 GB     mode 4 out_layout 1 8.23     3.13 (2.92)     2.6        655
+#   T (4,300,300,1,1,144) 0.83 GB     mode 4 out_layout 1 10.66    3.49 (4.59)     3.1        475
+#   T (4,250,250,1,1,216) 0.86 GB     mode 4 out_layout 1 28.10    4.10 (3.86)     6.9        422
+#   T (4,150,150,1,1,512) 0.74 GB     mode 4 out_layout 1 10.35    4.03 (3.81)     2.6        366
 #: Factory -> the kdft target that serves it on a ROCm mesh.  A factory with no row takes the
 #: XLA backend there; ``kconv_backend`` stays ``'xla'`` on ROCm, so every unported factory and
 #: every backend-keyed caller (mixed_basis_pair_convolution, greens_function_kernel) is unchanged.
 _ROCM_KLEAD_TARGETS = {"kconv_klead": KDFT_KCONV_KLEAD_TARGET,
-                       "kfft_klead": KDFT_KFFT_KLEAD_TARGET}
+                       "kfft_klead": KDFT_KFFT_KLEAD_TARGET,
+                       "kconv_kminor": KDFT_KCONV_KMINOR_TARGET,
+                       "kfft_kminor": KDFT_KFFT_KMINOR_TARGET}
 #: kdft's verified range (cpp/kdft/kdft_klead_plan.h kNkMax, kAxisMax).  A grid whose k tile does
 #: not fit a block's 64 KiB of LDS is split into axis groups, one HBM pass each (mode 2:
 #: 2*(groups-1)+1 passes), and each axis is a mixed-radix Stockham DFT in LDS (any length; a
@@ -167,6 +189,12 @@ _ROCM_KLEAD_TARGETS = {"kconv_klead": KDFT_KCONV_KLEAD_TARGET,
 #: MI250X, not an LDS limit: every grid with nk <= 10240 and axes <= 128 (docs/architecture/kconv.md).
 KDFT_NK_MAX = 10240
 KDFT_AXIS_MAX = 128
+#: The k-minor pair's verified range (cpp/kdft/kdft_kminor_ffi.cc rows_per_block): one row's
+#: complex128 k tile in a block's LDS, as modes 4/5 on CUDA, which have no split arm, and the
+#: axes the k-minor gate was run at (kdft_core.h line DFT).  Kept apart from KDFT_NK_MAX /
+#: KDFT_AXIS_MAX, which the k-leading pair's multi-pass route widens.
+KDFT_KMINOR_NK_MAX = 3904
+KDFT_KMINOR_AXIS_MAX = 128
 
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
@@ -356,6 +384,24 @@ def kdft_refusal(kgrid) -> str:
     return ""
 
 
+def kdft_kminor_refusal(kgrid) -> str:
+    """Why the k-minor kdft pair cannot serve ``kgrid`` ("" when it can): one row's k tile
+    beyond a block's LDS (modes 4/5 have no split arm on either leg)."""
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    if max(kg) > KDFT_KMINOR_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_KMINOR_AXIS_MAX} "
+                f"(the k-minor pair's verified range)")
+    if nk > KDFT_KMINOR_NK_MAX:
+        return (f"GATE kdft-kminor-tile: got nk={nk}; want one row's complex128 k tile in a block's "
+                f"64 KiB of LDS (nk <= {KDFT_KMINOR_NK_MAX}; modes 4/5 have no split arm)")
+    return ""
+
+
+#: Factory -> its kdft refusal rule (default :func:`kdft_refusal`).
+_KDFT_REFUSAL = {"kconv_kminor": kdft_kminor_refusal, "kfft_kminor": kdft_kminor_refusal}
+
+
 def rocm_klead_target(mesh: Mesh, kgrid, factory: str) -> str | None:
     """The kdft target serving ``factory`` on this mesh, or ``None`` (the XLA backend): a ROCm
     mesh outside :func:`xla_reference`, kdft not demoted, ``kgrid`` within its verified range
@@ -364,11 +410,11 @@ def rocm_klead_target(mesh: Mesh, kgrid, factory: str) -> str | None:
     if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
         return None
     target = _ROCM_KLEAD_TARGETS.get(factory)
-    why = kdft_refusal(kgrid) if target else ""
+    why = _KDFT_REFUSAL.get(factory, kdft_refusal)(kgrid) if target else ""
     if why:
         from ffi.gate import announce_once
         msg = f"[kconv] k-convolution router: ROCM {factory} -> XLA (jnp.fft), not kdft: {why}"
-        if announce_once(("kconv", "kdft", tuple(int(v) for v in kgrid)), msg):
+        if announce_once(("kconv", "kdft", factory, tuple(int(v) for v in kgrid)), msg):
             import warnings
             warnings.warn(msg, RuntimeWarning, stacklevel=3)
         return None
@@ -1286,6 +1332,20 @@ def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) ->
     mathdx = backend == "mathdx"
     if mathdx:
         _require_target(KFFT_KMINOR_TARGET, "CUDA")
+    target = None if mathdx else rocm_klead_target(mesh, kg, "kfft_kminor")
+    if target is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), forward=np.int64(kind == "fftn"),
+                     cubin_dir=cubin_cache_dir())
+
+        def _kdft_kminor(x):
+            _check_complex(x)
+            if tuple(int(v) for v in x.shape[-3:]) != kg:
+                raise ValueError(f"k-minor transform expects trailing k axes {kg}; got {x.shape}")
+            x2 = x.reshape(-1, nk)
+            return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(x2.shape, x2.dtype),
+                                    input_output_aliases={0: 0})(x2, **attrs).reshape(x.shape)
+        return _kdft_kminor
 
     def _kminor(x):
         _check_complex(x)
@@ -2576,6 +2636,19 @@ def make_local_kconv_kminor(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
             return jax.ffi.ffi_call(KCONV_KMINOR_TARGET, out, **kw)(
                 x, k_r, **attrs, **_mathdx_common())
         return _mathdx
+
+    target = rocm_klead_target(mesh, kg, "kconv_kminor")
+    if target is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), out_layout=np.int64(out_layout),
+                     cubin_dir=cubin_cache_dir())
+
+        def _kdft_kminor_conv(x, k_r):
+            _check_complex(x, k_r)
+            out = jax.ShapeDtypeStruct(kconv_kminor_out_shape(x.shape, out_layout), x.dtype)
+            kw = {"input_output_aliases": {0: 0}} if out_layout == 0 else {}
+            return jax.ffi.ffi_call(target, out, **kw)(x, k_r, **attrs)
+        return _kdft_kminor_conv
 
     backend = kconv_backend(mesh, kgrid, kminor=True)
 
