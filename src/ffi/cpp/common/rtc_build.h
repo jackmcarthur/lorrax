@@ -64,6 +64,7 @@ using Function = hipFunction_t;
 using Stream   = hipStream_t;
 inline constexpr Result kOk = hipSuccess;
 inline constexpr const char* kImageExt = ".hsaco";               // cache file extension
+inline constexpr const char* kOptOption = "-O3";                  // hipRTC (clang) optimisation level
 #else
 using Result   = CUresult;
 using Module   = CUmodule;
@@ -71,6 +72,9 @@ using Function = CUfunction;
 using Stream   = CUstream;
 inline constexpr Result kOk = CUDA_SUCCESS;
 inline constexpr const char* kImageExt = ".cubin";
+// NVRTC takes no -O<n> (13.4: "unrecognized option -O3"); device optimisation is its default,
+// spelled out so a kernel's option list has one shape on both legs.
+inline constexpr const char* kOptOption = "--dopt=on";
 #endif
 
 // The module API: resolved lazily on CUDA, the linked HIP runtime on ROCm.  The CUDA leg also

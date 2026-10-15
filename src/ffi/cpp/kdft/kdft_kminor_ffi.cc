@@ -86,7 +86,7 @@ ffi::Error build(int mode, int out, const std::array<int, 3>& g, long long ot, R
     prog.name = "lrx_kdft_kminor";
     prog.kernel = "lrx_kdft_kminor";
     prog.headers = {{"kdft_core.h", kCoreSrc}, {"kdft_plan.h", kPlanSrc}};
-    prog.defs = {"-O3", "-std=c++17", rtc::arch_option(arch),
+    prog.defs = {rtc::kOptOption, "-std=c++17", rtc::arch_option(arch),
                  "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky),
                  "-DLRX_NZ=" + std::to_string(nkz), "-DLRX_C=" + std::to_string(rows),
                  "-DLRX_W=" + std::to_string(rw.w), "-DLRX_SPLIT=" + std::to_string(ot),

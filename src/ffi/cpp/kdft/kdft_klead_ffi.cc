@@ -73,7 +73,7 @@ ffi::Error build_pass(const Pass& p, bool f32, std::string_view cache_dir, rtc::
     prog.name = "lrx_kdft_klead";
     prog.kernel = "lrx_kdft_pass";
     prog.headers = {{"kdft_core.h", kCoreSrc}, {"kdft_plan.h", kPlanSrc}};
-    prog.defs = {"-O3", "-std=c++17", rtc::arch_option(arch),
+    prog.defs = {rtc::kOptOption, "-std=c++17", rtc::arch_option(arch),
                  "-DLRX_GX=" + std::to_string(p.g[0]), "-DLRX_GY=" + std::to_string(p.g[1]),
                  "-DLRX_GZ=" + std::to_string(p.g[2]), "-DLRX_W=" + std::to_string(p.w),
                  "-DLRX_NT=" + std::to_string(p.nt), "-DLRX_MODE=" + std::to_string(p.mode),

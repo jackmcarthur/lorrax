@@ -19,6 +19,7 @@
 #include <cmath>
 #include <vector>
 
+#include "../common/leg.h"   // LRX_LEG_BLOCK_LDS: the leg's per-block LDS ceiling
 #include "kdft_plan.h"
 
 namespace kdft {
@@ -32,7 +33,11 @@ constexpr long long kNkMax = 10240;
 // (0.53 at G = 216, 0.44 at G = 400, both W = 8).  pass_cost() is that fit, relative to the
 // best pass; the plan minimises its sum.
 constexpr long long kTileBudget = 16 * 1024;
-constexpr long long kLdsMax = 64 * 1024;
+// A block's LDS ceiling is the leg's (common/leg.h): 64 KiB on ROCM, 48 KiB static shared
+// memory on CUDA, so every tile the plan emits compiles on the leg that runs it.  The budgets
+// and fits here and in kdft_kminor_plan.h were measured on MI250X and stay leg-neutral numbers.
+constexpr long long kLdsMax = LRX_LEG_BLOCK_LDS;
+static_assert(kLdsMax >= kTileBudget, "kdft plans need a device leg (common/leg.h LRX_LEG_BLOCK_LDS)");
 constexpr int kWMax = 64;
 constexpr int kThreadsMax = 512;
 // The fit is good to a few per cent: within that, take the wider tile and the fewer passes
@@ -114,8 +119,9 @@ inline int tile_threads(const std::array<int, 3>& g, int w) {
 // 2.68 ms, 8x8x8 3.27 -> 2.48, 12^3 6.96 -> 6.21, 20^3 7.20 -> 6.09, 16^3 6.09 -> 5.91), and a
 // 64 KiB block beats two 32 KiB blocks per CU (6x6x6 4.67 -> 3.47, 32x32x10 9.68 -> 7.24): the
 // in-register line DFT leaves a block few barriers to wait on, so wide column tiles (long HBM
-// rows) matter more than a second resident block.
-constexpr long long kRegLds = 64 * 1024;
+// rows) matter more than a second resident block.  The exchange is the block's whole LDS: the
+// leg's ceiling (64 KiB on ROCM, as measured; 48 KiB on CUDA).
+constexpr long long kRegLds = kLdsMax;
 constexpr int kRegHold = 32;
 inline bool reg_tile(const std::array<int, 3>& g, long long cbytes, long long inner, Pass* p) {
     int na = 0;

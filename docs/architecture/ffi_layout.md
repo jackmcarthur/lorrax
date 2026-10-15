@@ -215,6 +215,14 @@ the operation, named), `host` (a `pure_callback`) or `refused` (a named GATE).
 `ffi.fft`'s ROCm k-leading targets and the ROCM block of `CMakeLists.txt`. A
 family changes state in that file first.
 
+**Per-leg facts in C++.** The C++ tree's counterpart of `lxkit.LEGS` is
+`src/ffi/cpp/common/leg.h`: the leg selector, its spellings, and the device
+facts kernels are sized by (`LRX_LEG_BLOCK_LDS`, the static shared memory one
+block may declare: 64 KiB on ROCM, 48 KiB on CUDA). The run-time compiler's
+per-leg spellings (image extension, optimisation option `rtc::kOptOption`:
+`-O3` for hipRTC, `--dopt=on` for NVRTC, which rejects `-O3`) are
+`common/rtc_build.h`'s.
+
 ---
 
 ## 2. The one C++ tree

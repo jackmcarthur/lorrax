@@ -48,3 +48,17 @@
 #  define LRX_LEG_PASTE(name) name
 #  define LRX_LEG_TAG(prefix, version) prefix##Cuda##version
 #endif
+
+// The static shared memory (LDS) one thread block may declare -- the ceiling the run-time
+// compiled kdft kernels size their __shared__ tiles to (kdft/kdft_klead_plan.h kLdsMax,
+// kRegLds).  ROCM: 64 KiB, the LDS a gfx90a workgroup may allocate (MI250X: 64 KiB per CU).
+// CUDA: 48 KiB, the static __shared__ limit; sm_80/sm_90 grant more only as dynamic shared
+// memory after the cudaFuncAttributeMaxDynamicSharedMemorySize opt-in, which kernels with static
+// tiles cannot take (ptxas rejects e.g. a 0xc800-byte tile: 0xc800 > 0xc000).  Host: no kernels.
+#if defined(LRX_LEG_ROCM)
+#  define LRX_LEG_BLOCK_LDS (64 * 1024)
+#elif defined(LRX_LEG_CUDA)
+#  define LRX_LEG_BLOCK_LDS (48 * 1024)
+#else
+#  define LRX_LEG_BLOCK_LDS 0
+#endif
