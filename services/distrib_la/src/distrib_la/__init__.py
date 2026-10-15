@@ -153,9 +153,11 @@ from distrib_la.resolve import (
 
 from ._batch_reshard import batch_layout, is_batch_layout, local_batch
 from ._result_check import checked_program, checked_shapes
+from distrib_la.local_eigh import eigh_local, eigh_route, COMPLEX_EIGH_ROUTE
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
 __all__ = [
+    "eigh_local", "eigh_route", "COMPLEX_EIGH_ROUTE",
     "local_batch", "batch_layout", "is_batch_layout",
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
     "plan_orthogonalization",

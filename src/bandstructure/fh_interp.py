@@ -58,6 +58,7 @@ from common.collectives import (
     spill_to_host,
 )
 from runtime.padding import padded_axis
+from distrib_la import eigh_local
 
 
 def _build_mesh_xy() -> Mesh:
@@ -1521,7 +1522,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         def _kpath_batch(batch_k, fH_R):
             """Return the same ordered eigenvectors used by the path bands."""
             mat = _fourier_matrix(batch_k, fH_R)
-            values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
+            values, vectors = jax.vmap(eigh_local)(mat)
             return values[:, :states], vectors[:, :, :states]
     else:
         batch_vec_shard = NamedSharding(
@@ -1533,7 +1534,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         def _fH_kpath_batch(batch_k, fH_R):
             """Retain only fitted-state eigenspaces before releasing fH_R."""
             mat = _fourier_matrix(batch_k, fH_R)
-            values, vectors = jax.vmap(jnp.linalg.eigh)(mat)
+            values, vectors = jax.vmap(eigh_local)(mat)
             return values[:, :states], vectors[:, :, :states]
 
         _active_out_shardings = (

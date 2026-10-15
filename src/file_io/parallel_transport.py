@@ -35,6 +35,7 @@ from common.parallel_transport import (
 )
 from common.wfn_layout import band_sphere_spec
 from file_io.slab_io import SlabIO
+from distrib_la import eigh_local
 
 
 SCHEMA_VERSION = 4
@@ -1495,7 +1496,7 @@ def transported_frame(
     # and with each other; a generic real combination of them therefore has
     # the same eigenvectors and a batched Hermitian eigh diagonalizes S
     # exactly, with no matrix-logarithm branch beyond the principal one.
-    _values, V = jnp.linalg.eigh(hermitian + 0.7548 * antihermitian)
+    _values, V = eigh_local(hermitian + 0.7548 * antihermitian)
     theta = jnp.angle(jnp.diagonal(
         _dagger(V) @ S @ V, axis1=-2, axis2=-1))
     exponents = -jnp.arange(n, dtype=jnp.float64) / float(n)

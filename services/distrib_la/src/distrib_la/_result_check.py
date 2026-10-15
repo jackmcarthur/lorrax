@@ -125,8 +125,10 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False):
     return solve
 
 
-#: The local (one-device) eigh of every native route: jnp.linalg.eigh, deflated.
-native_eigh = jax.jit(deflate_zero_rows(jnp.linalg.eigh))
+#: The local (one-device) eigh of every native route: eigh_local (jnp.linalg.eigh with the
+#: leg's implementation, :mod:`distrib_la.local_eigh`), deflated.
+from distrib_la.local_eigh import eigh_local as _eigh_local
+native_eigh = jax.jit(deflate_zero_rows(_eigh_local))
 
 
 def orthonormalize(vectors, *, matmul):

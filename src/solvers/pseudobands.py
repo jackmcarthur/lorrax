@@ -38,6 +38,7 @@ from solvers.dos import (
     compute_dos, dos_weighted_windows, geometric_windows,
     compute_window_partition, DOSResult, WindowPartition,
 )
+from distrib_la import eigh_local
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -235,7 +236,7 @@ def _galerkin_ritz(
     H_proj = 0.5 * (H_proj + H_proj.conj().T)  # enforce Hermitian
 
     # Diagonalize k×k matrix
-    theta, S = jnp.linalg.eigh(H_proj)
+    theta, S = eigh_local(H_proj)
 
     # Ritz vectors
     Xi = jnp.einsum('kl,kd->ld', S.T, Q)  # (k, dim)
