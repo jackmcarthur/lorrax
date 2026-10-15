@@ -1476,8 +1476,10 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 # linked, and the leg loads (phdf5 serves) where no hipRTC is installed.
 #
 # Families, one per port (each gated against XLA on the same device, as its
-# CUDA twin is):  phdf5.  A family with no ROCm port is simply not in the
-# source list; ffi_loader's ROCM table lists only what this leg exports.
+# CUDA twin is):  phdf5;  kdft (the k-leading direct-DFT convolution and
+# transform, modes 2/3, run-time compiled).  A family with no ROCm port is
+# simply not in the source list; ffi_loader's ROCM table lists only what this
+# leg exports.
 #
 # ROCm comes from ROCM_PATH (`module load rocm/<v>` sets it) or
 # -DCMAKE_PREFIX_PATH=<rocm root>; GPU targets need no flag here because
@@ -1515,7 +1517,16 @@ set(LORRAX_FFI_ROCM_SOURCES
     common/build_config.cc
     common/ctx_registry.cc
     common/rtc_build.cc
+    kdft/kdft_klead_ffi.cc
 )
+
+# The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated
+# whenever the kernel source changes, so the embedded text is that one file.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_kernel.h" LRX_KDFT_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kdft_klead_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_kernel.h")
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)

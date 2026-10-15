@@ -12,7 +12,7 @@ sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
     CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLAS/phdf5/slate/mathdx k-conv
-    ROCM  liblorrax_ffi_rocm.so  declared leg; no families built yet
+    ROCM  liblorrax_ffi_rocm.so  phdf5 / kdft k-leading conv + transform (hipRTC)
     cpu   liblorrax_ffi_host.so  phdf5 read+write / slate (Target::HostTask)
                                  / ScaLAPACK / FFTW3-ABI flat-k / MKL GEMM
 
@@ -209,8 +209,16 @@ _HOST_TARGET_SYMBOLS = {
 #: ever loaded in a process.  A family joins this table when it joins
 #: ``CMakeLists.txt``'s ROCM source list.
 _ROCM_FAMILIES = ("lorrax_phdf5_",)
-_ROCM_TARGET_SYMBOLS = {target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
-                        if target.startswith(_ROCM_FAMILIES)}
+#: The ROCM leg's own families: leg-neutral sources the CUDA leg does not build because it
+#: serves the same operation another way.  The k-leading direct-DFT pair (cpp/kdft/,
+#: hipRTC-built; CUDA uses the nvidia-mathdx modes 2/3): ffi.fft._ROCM_KLEAD_TARGETS.
+_ROCM_OWN_TARGET_SYMBOLS = {
+    "lorrax_kdft_kconv_klead":      "KDftKconvKleadFfi",
+    "lorrax_kdft_kfft_klead":       "KDftKfftKleadFfi",
+}
+_ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
+                           if target.startswith(_ROCM_FAMILIES)},
+                        **_ROCM_OWN_TARGET_SYMBOLS}
 
 #: Leg key -> this loader's target table and the build command for its
 #: not-found error.  Everything else about a leg is ``lxkit.legs.LEGS``.
