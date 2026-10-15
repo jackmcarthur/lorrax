@@ -87,9 +87,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._result_check import (_flag, _notices, deflate_zero_rows, in_checked_retry, native_eigh,
                                       traced_phase)
-from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
+from distrib_la.resolve import (NATIVE, NATIVE2D, ONE_DEVICE, OPS, backend_module,
                                 mesh_key, mesh_platform, resolve_backend,
-                                resolve_eigh_capacity)
+                                resolve_eigh_capacity, size_route_note)
 
 __all__ = ["Plan", "plan", "StackRoute", "ensure_sharding", "BATCHED_SCAN_UNROLL",
            "BATCHED_ROUTES", "BATCHED_ROUTE_CHOICES",
@@ -209,9 +209,16 @@ def new_stack_routes() -> list[str]:
     """One line per eigh-stack decision made since the last call, for a driver log.
 
     The service decides (:meth:`Plan.stack_route`); a driver prints these
-    lines through its own reporter, once per (op, B, n, dtype, room).
+    lines through its own reporter, once per (op, B, n, dtype, room).  The
+    ``distributed`` size route's decisions (resolve guard 1b) ride the same
+    channel, once per (op, leg, mesh, n), as ``"<what>: <backend>, <reason>"``.
     """
+    from distrib_la import resolve as _resolve
     lines = []
+    for key, line in _resolve._SIZE_DECISIONS.items():
+        if ("size",) + key not in _REPORTED:
+            _REPORTED.add(("size",) + key)
+            lines.append(line)
     for key, route in _STACK_ROUTES.items():
         if key not in _REPORTED:
             _REPORTED.add(key)
@@ -456,6 +463,15 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("solve_lu", "slate"):      dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
+    # one_device (the size route of ``distributed``): pure JAX with the FFI
+    # operand contract, so the checked chain and every route apply to it as
+    # to a library.  Its stacked entry is route (c) in bounded rounds.
+    ("eigh", ONE_DEVICE):       dict(one="distributed_eigh",
+                                     many="batched_distributed_eigh",
+                                     post=_eigh_columns),
+    ("solve_lu", ONE_DEVICE):   dict(one=None,
+                                     many="batched_distributed_solve_lu",
+                                     post=None),
     # native2d is pure JAX, but it routes through the same table: its
     # kernel is a single lax.map over the whole q axis, so it has a
     # stacked entry and no single-tile one, exactly like cuSOLVERMp's
@@ -564,6 +580,8 @@ class Plan:
     # rooms (the room enters no HLO; the decided route does, per shape).
     budget_bytes: int | None = field(default=None, compare=False)
     capacity_refusal: str | None = None
+    #: What the ``distributed`` size route decided (resolve guard 1b), or None.
+    size_route: str | None = field(default=None, compare=False)
 
     # ---- introspection -------------------------------------------------
     @property
@@ -791,7 +809,11 @@ class Plan:
         where = ("route (c) only; no whole-mesh eigh on this mesh"
                  if self.capacity_refusal is not None else
                  "native JAX, any layout" if self.is_native else
+                 f"each matrix whole on one device, face layout P('x','y') on the {px}x{py} mesh"
+                 if self.backend == ONE_DEVICE else
                  f"ONE tile over the {px}x{py} mesh at P('x','y')")
+        if self.size_route is not None:
+            where += f"; {self.size_route}"
         n = "" if self.n is None else f", n={self.n}"
         line = (f"{self.op}: {self.requested!r} -> {self.backend} "
                 f"({where}{n}); batched "
@@ -1251,4 +1273,5 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
                 mesh=mesh_xy, n=None if n is None else int(n),
                 in_sharding=tile, batch_in_sharding=stack,
                 requested_batched_route=batched_route,
-                budget_bytes=budget_bytes, capacity_refusal=capacity_refusal)
+                budget_bytes=budget_bytes, capacity_refusal=capacity_refusal,
+                size_route=size_route_note(op, backend, mesh_xy, n, resolved))

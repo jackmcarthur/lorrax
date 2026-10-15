@@ -83,9 +83,9 @@ local LU on every layout, so it has no field.
 
 | op | requested names | `auto` resolves to | `distributed` resolves to |
 |---|---|---|---|
-| `eigh` | `auto off distributed cusolvermp slate scalapack` | `native` everywhere | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `slate` |
+| `eigh` | `auto off distributed cusolvermp slate scalapack one_device` | `native` everywhere | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` for `n ≤ 16384`, else `slate` ([size route](#size-route)) |
 | `cholesky` | `auto off native2d cusolvermp slate` | `cusolvermp` on a CUDA mesh with `P_x ≥ 2` and `P_y ≥ 2` when compiled, else `native` | not in the vocabulary |
-| `solve_lu` | `auto off distributed cusolvermp scalapack slate` | as `cholesky` | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `slate` |
+| `solve_lu` | `auto off distributed cusolvermp scalapack slate one_device` | as `cholesky` (ROCm: `native`) | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` for `n ≤ 8192`, else `slate` ([size route](#size-route)) |
 
 - `off` and its spelling `native` resolve to `native` unconditionally: the
   pure-JAX path (`jnp.linalg.eigh`, or the caller's own Cholesky and LU
@@ -95,6 +95,8 @@ local LU on every layout, so it has no field.
   once, while a distributed library solves one matrix `P` ways and walks the
   batch serially. When `auto` Cholesky or LU demotes a compiled cuSOLVERMp
   (a 1-D mesh) or cannot load its handler on a 2-D mesh, rank 0 says so once.
+  The candidate is a per-leg row (`resolve._AUTO_FFI`, CUDA only); on a leg
+  without one (ROCm) `auto` is `native` with no probe and no notice.
 - `distributed` means "spread one matrix over the whole mesh with this
   platform's distributed library". There is no `distributed` Cholesky, because
   the CPU Cholesky story is a channel policy in the caller, not one library.
@@ -108,9 +110,10 @@ local LU on every layout, so it has no field.
   table's ROCm entries are the resolution only: `distributed` eigh names
   SLATE, the one library of the three with a ROCm build, and so does
   `distributed` LU (`slate::getrf` PartialPiv + `slate::getrs`, ROCM leg only;
-  see [SLATE LU](#slate-lu)). LORRAX builds no ROCm `.so`, so
-  a SLATE request on ROCm refuses at the capability probe (guard 4). Only
-  `linalg = local` (the XLA plan) runs on ROCm.
+  see [SLATE LU](#slate-lu)), both behind the leg's size route
+  ([size route](#size-route)). The ROCm leg (`liblorrax_ffi_rocm.so`) carries
+  the HIP SLATE family; a leg built without it refuses a SLATE request at the
+  capability probe (guard 4).
 
 ### SLATE LU (ROCM leg) {#slate-lu}
 
@@ -119,8 +122,18 @@ local LU on every layout, so it has no field.
 `batched_distributed_getrs(LU, piv, B, mesh=)` keep the ScaLAPACK and
 cuSOLVERMp contract: `A` `(Nq, N, N)` and `B` `(Nq, N, NRHS)` at
 `P(None,'x','y')`, both donated, `X` in `B`'s sharding. Each matrix spans the
-whole mesh at one tile per rank (`nb = N/max(p,q)`; square or `p×1` meshes,
-`NRHS % q == 0`). `piv` is int64 `(Nq, P·2N)` at `P(None,('x','y'))`: each
+whole mesh, block-cyclic by relabeling as the eigh: the handler reads each
+rank's own `(N/p, N/q)` buffer with a tile `nb` dividing both local edges
+(`_slate.lu_layout`: the largest divisor at most 256, else one tile per rank),
+so SLATE factors $\Pi A \Pi^T$ and solves for $\Pi B$. On a square mesh X
+returns in A's row order with no data movement; on a `p×1` mesh one
+`all_to_all` orders its rows (`_slate._rows_in_order`). Square or `p×1` meshes,
+`NRHS % q == 0`. The operands are copied into SLATE-owned tiles (uniform
+stride) and back. Measured at P4 2×2 (pool log `distla_lugate1`, steady s,
+NRHS = n): n 8192 f64 nb 128 / 256 / 512 / 4096 (one tile) = 3.23 / 2.17 /
+2.79 / 9.59; c128 3.87 / 3.63 / 4.18 / 26.1. `getrs` is now the larger half
+(c128 n 8192: getrf 1.03 s, getrs 2.58 s). It runs only beyond the size
+route's bound. `piv` is int64 `(Nq, P·2N)` at `P(None,('x','y'))`: each
 rank's copy of SLATE's replicated pivots as (tile index, offset) pairs, opaque.
 The fused entry runs the same getrf + getrs core, so the split pair reproduces
 it bit for bit. Handlers: `cpp/slate/batched_solve_lu_ffi.cc`. CUDA does not
@@ -133,6 +146,10 @@ so a returned name cannot fail later for an availability or geometry reason:
 
 1. **Vocabulary.** The name belongs to the op; `distributed` is first replaced
    by the platform's library and then checked as if named.
+   - **1b. Size.** On a leg with a `ONE_DEVICE_MAX_N` row (ROCm only) and a
+     known `n` within the bound, `distributed` resolves to `one_device`
+     instead ([size route](#size-route)); announced once per decision and
+     recorded on the plan (`Plan.size_route`, `Plan.describe()`).
 2. **Platform.** cuSOLVERMp is CUDA-only, ScaLAPACK host-only; SLATE is
    declared on CUDA, CPU and ROCm.
 3. **Known-broken combinations**, each a deterministic crash with no Python
@@ -189,6 +206,54 @@ handler. `lorrax_slate_batched_potrf` / `_batched_trsm` exist on both legs,
 but no Python wrapper calls them. No native GEMM handler is called.
 
 ## Distributed is a capacity route {#capacity-route}
+
+### The size route (ROCm) {#size-route}
+
+`distributed` names "one matrix over the whole mesh" because some matrix
+does not fit one device. Where it does fit, the library's fixed cost is the
+whole cost. On the ROCM leg SLATE's host stages (`hb2st` on rank 0, `stedc` on
+HostTask) cost 0.22-0.29 s per eigh at `n = 32-128` (native 0.0016-0.0045 s,
+SLATE LU is 3.9-35x native even
+block-cyclic (n 512-8192; pool log `distla_lugate1`). So the ROCM leg declares a size row,
+`resolve.ONE_DEVICE_MAX_N`: `distributed` with a known `n` at or below it
+resolves to `one_device`, beyond it to `slate`.
+
+`one_device` (`distrib_la._one_device`) keeps the FFI operand contract
+(`P('x','y')` tile or `P(None,'x','y')` stack in, the same layout out). Route
+(c)'s staged exchange moves each matrix whole onto one device, the leg's native
+kernel solves it (`native_eigh`, `jnp.linalg.solve`), and the inverse
+exchange returns the face layout. A stack spreads `ceil(B/P)` matrices per rank,
+so the P-scaling that `distributed` exists for is kept. A single matrix is a
+stack of one: rank 0 solves it and the inverse exchange scatters that one
+result. Per round a rank holds at most `max_n²` elements of whole matrices,
+in equal rounds otherwise. The plan's checked chain applies as to a library.
+
+This is not the silent downgrade the resolver forbids. That rule protects the
+replicated factor's O(nq·μ³)-with-no-P-scaling wall and the route changes no one
+sees. The size route is declared in a leg row, printed once per decision
+(rank 0) and kept in `Plan.describe()`. An explicit `slate` is still honoured
+as named. `one_device` refuses (`GATE one_device`) on a leg without a row or
+beyond the bound. The capacity provider of an `auto` plan with a room
+(`resolve_eigh_capacity`) stays the library. It runs only stacks of which not
+one whole matrix per rank fits the room, and `one_device` would need exactly
+that.
+
+Measured at P4 2×2 MI250X, complex128, steady s (pool log `distla_bound1`):
+
+| n | eigh `one_device` | native, 1 GCD | SLATE 2×2 (before) | LU `one_device` (NRHS = n) | native LU |
+|---|---|---|---|---|---|
+| 32 | 0.0061 | 0.0016 | 0.236 | — | — |
+| 128 | 0.0091 | 0.0045 | 0.289 | — | — |
+| 2048 | 0.151 | 0.142 | 3.97 | 0.051 | 0.034 |
+| 8192 | 6.45 | 6.37 | 17.3 | 1.06 | 0.94 |
+| 16384 | 42.4 (peak 27.9 GB/rank) | 42.1 | 76.4 | beyond the bound | wrong (below) |
+
+The SLATE column at n ≥ 2048 is from the SLATE-perf lane. The LU bound is 8192.
+The native complex128 LU on one GCD (jaxlib getrf/getrs on rocSOLVER, ROCm
+7.14.1) returns a wrong solution with no error at n = 12288 and 16384 (residual
+8e-3; pool log `distla_lubig`). float64 at 16384 and complex128 at n ≤ 11616 are
+exact (`distla_lubig2`). The checked solve refused the one-device result by name
+(`GATE distrib_la_result_check`). Beyond 8192 the LU is SLATE's.
 
 For a matrix that fits one device, a distributed library's cost is its fixed
 per-call charge, almost all of it inside `cusolverMpSyevd`, which the local

@@ -39,7 +39,7 @@ __all__ = [
     # the distributed LU family (ROCM leg): fused + split getrf/getrs
     "batched_distributed_solve_lu",
     "batched_distributed_getrf",
-    "batched_distributed_getrs",
+    "batched_distributed_getrs", "lu_layout",
 ]
 
 # =========================================================================
@@ -571,9 +571,16 @@ call contract, so :mod:`distrib_la.plan` drives the three the same way::
     X : same shape/sharding as B
 
 Each matrix of the stack is spread over the WHOLE mesh (the world SLATE
-context, one tile per rank: ``nb = N / max(p, q)``), and the handler walks
-the stack.  Geometry is SLATE's single-matrix class (:func:`validate_tile_layout`):
-square or ``p x 1`` meshes; ``1 x q`` trips SLATE's stride assert.
+context), and the handler walks the stack.  Block-cyclic BY RELABELING
+(:mod:`distrib_la._cyclic`), as the eigh: the handler reads each rank's own
+``(N/p, N/q)`` buffer with a tile ``nb`` dividing both local edges
+(:func:`lu_layout`), so SLATE factors ``Pi A Pi'^T`` and solves for ``Pi B``.
+On a square mesh ``Pi' = Pi`` and X comes back in A's row order with no data
+movement; on a ``p x 1`` mesh X's rows come back block-cyclic over ``'x'`` and
+one ``all_to_all`` (:func:`distrib_la._cyclic.cyclic_to_block`) orders them.
+Geometry: square or ``p x 1`` meshes; ``1 x q`` trips SLATE's stride assert.
+Several tiles per rank means concurrent SLATE tasks in host BLAS: the SLATE must
+link the locking sequential OpenBLAS (see the eigh section; verifier GATE 3d).
 
 The split pair returns the pivots as an opaque int64 buffer, ``(Nq, P*2N)``
 at ``P(None, ('x','y'))``: every rank's own copy of SLATE's replicated
@@ -593,10 +600,32 @@ _GETRS_TARGET = "lorrax_slate_batched_getrs"
 #: jit(shard_map) cache per signature (eager shard_map re-traces per call).
 _LU_JIT_CACHE: dict = {}
 
+#: The getrf tile range (P4 2x2 MI250X, pool log ``distla_lunb``, DISTLA report).
+_LU_BLOCK_MAX = 256
+_LU_BLOCK_MIN = 64
 
-def _lu_geometry(A, mesh: Mesh, *, what: str):
-    """The LU family's guard ladder: shape, registered mesh, SLATE tile layout.
-    Returns ``(p, q, nq, n, nb)``."""
+
+def lu_layout(n: int, p: int, q: int) -> int:
+    """The getrf/getrs tile ``nb`` for an ``n x n`` matrix on a ``p x q`` mesh.
+
+    The largest divisor of both local edges (``gcd(n/p, n/q)``) at most
+    :data:`_LU_BLOCK_MAX`, when it is at least :data:`_LU_BLOCK_MIN` or the edge is
+    at most :data:`_LU_BLOCK_MAX`; otherwise one tile per rank (``n/max(p,q)``,
+    the former layout: correct, with the host-panel cost it had).
+    """
+    import math
+    local = math.gcd(n // p, n // q)
+    block = largest_divisor(local, _LU_BLOCK_MAX)
+    if local <= _LU_BLOCK_MAX or block >= _LU_BLOCK_MIN:
+        return block
+    return n // max(p, q)
+
+
+def _lu_geometry(A, mesh: Mesh, *, what: str, block_size: int | None = None):
+    """The LU family's guard ladder: shape, registered mesh, mesh class, tile.
+    Returns ``(p, q, nq, n, nb)``.  The mesh class mirrors
+    :func:`validate_tile_layout`'s (square or ``p x 1``); the tile rule is the
+    relabeling one (``nb`` divides ``n/p`` and ``n/q``), not one tile per rank."""
     if A.ndim != 3 or A.shape[1] != A.shape[2]:
         raise ValueError(f"slate {what}: expected A of shape (Nq, N, N); got {A.shape}")
     p, q = validate_mesh(mesh)
@@ -604,9 +633,32 @@ def _lu_geometry(A, mesh: Mesh, *, what: str):
     if n % p or n % q:
         raise ValueError(
             f"slate {what}: N={n} must be divisible by both mesh axes ({p}, {q}).")
-    nb = n // max(p, q)
-    validate_tile_layout(n, nb, p, q, what=f"slate {what}")
+    if p > 1 and q > 1 and p != q:
+        raise ValueError(f"slate {what}: mesh {p}x{q} unsupported (square or Nx1 only).")
+    if p == 1 and q > 1:
+        raise ValueError(
+            f"slate {what}: 1x{q} meshes hit a SLATE stride assert "
+            f"(internal_batch.hh:290); use the {q}x1 mesh.")
+    nb = lu_layout(n, p, q) if block_size is None else int(block_size)
+    if nb < 1 or (n // p) % nb or (n // q) % nb:
+        raise ValueError(
+            f"slate {what}: tile {nb} must divide both local edges ({n // p}, {n // q}).")
     return p, q, nq, n, nb
+
+
+def _rows_in_order(X, *, n: int, p: int, q: int, nb: int):
+    """Inside a shard_map: X's local rows ``(nq, n/p, c)`` in A's order.
+
+    SLATE writes X's row ``i`` at its relabeled slot: on a square mesh that is
+    row ``i`` itself (``Pi' = Pi``), on a ``p x 1`` mesh row ``i`` sits
+    block-cyclically over ``'x'`` -- one :func:`cyclic_to_block`.
+    """
+    if p == 1 or q > 1 or nb == n // p:
+        return X
+    nq, rows, cols = X.shape
+    flat = jnp.transpose(X, (1, 0, 2)).reshape(rows, nq * cols)
+    flat = cyclic_to_block(flat, n=n, p=p, mb=nb, axis="x")
+    return jnp.transpose(flat.reshape(rows, nq, cols), (1, 0, 2))
 
 
 def _lu_rhs(B, nq: int, n: int, q: int, dtype, *, what: str) -> int:
@@ -621,13 +673,16 @@ def _lu_rhs(B, nq: int, n: int, q: int, dtype, *, what: str) -> int:
     return nrhs
 
 
-def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh) -> jax.Array:
+def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh,
+                                 block_size: int | None = None) -> jax.Array:
     """Solve ``A[q] X[q] = B[q]`` by per-q ``slate::getrf`` + ``slate::getrs``.
 
     See the section docstring for the contract.  ``A`` and ``B`` are donated
     (the factors overwrite A, X overwrites B); the pivots stay internal.
+    ``block_size`` overrides :func:`lu_layout` (benches; any divisor of both
+    local edges is layout-safe).
     """
-    p, q, nq, n, nb = _lu_geometry(A, mesh, what="solve_lu")
+    p, q, nq, n, nb = _lu_geometry(A, mesh, what="solve_lu", block_size=block_size)
     nrhs = _lu_rhs(B, nq, n, q, A.dtype, what="solve_lu")
     ensure_registered(mesh)
     ctx_key = int(context_key(mesh))
@@ -648,22 +703,23 @@ def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh) -> j
                 _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
                 input_output_aliases={0: 1, 1: 0},
             )(jnp.transpose(local_A, (0, 2, 1)), jnp.transpose(local_B, (0, 2, 1)), **attrs)
-            return jnp.transpose(X_T, (0, 2, 1))
+            return _rows_in_order(jnp.transpose(X_T, (0, 2, 1)), n=n, p=p, q=q, nb=nb)
 
         fn = jax.jit(_solve, donate_argnums=(0, 1))
         _LU_JIT_CACHE[key] = fn
     return fn(A, B)
 
 
-def batched_distributed_getrf(A: jax.Array, *, mesh: Mesh) -> tuple[jax.Array, jax.Array]:
+def batched_distributed_getrf(A: jax.Array, *, mesh: Mesh,
+                              block_size: int | None = None) -> tuple[jax.Array, jax.Array]:
     """Factor ``A[q]`` once by ``slate::getrf`` (PartialPiv).
 
     Returns ``(LU, piv)``: ``LU`` at ``P(None,'x','y')`` (SLATE's factors in
     this layout on this mesh) and ``piv`` int64 ``(Nq, P*2N)`` at
     ``P(None, ('x','y'))``.  Both are opaque: feed them to
-    :func:`batched_distributed_getrs` verbatim.  ``A`` is donated.
+    :func:`batched_distributed_getrs` verbatim (same ``block_size``).  ``A`` is donated.
     """
-    p, q, nq, n, nb = _lu_geometry(A, mesh, what="getrf")
+    p, q, nq, n, nb = _lu_geometry(A, mesh, what="getrf", block_size=block_size)
     ensure_registered(mesh)
     ctx_key = int(context_key(mesh))
     piv_len = 2 * n
@@ -689,11 +745,11 @@ def batched_distributed_getrf(A: jax.Array, *, mesh: Mesh) -> tuple[jax.Array, j
 
 
 def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
-                              mesh: Mesh) -> jax.Array:
+                              mesh: Mesh, block_size: int | None = None) -> jax.Array:
     """Solve ``A[q] X[q] = B[q]`` from :func:`batched_distributed_getrf`'s
     ``(LU, piv)`` by ``slate::getrs``.  ``B`` is donated; X has B's
     shape and sharding."""
-    p, q, nq, n, nb = _lu_geometry(LU, mesh, what="getrs")
+    p, q, nq, n, nb = _lu_geometry(LU, mesh, what="getrs", block_size=block_size)
     nrhs = _lu_rhs(B, nq, n, q, LU.dtype, what="getrs")
     piv_len = 2 * n
     want = (nq, p * q * piv_len)
@@ -719,7 +775,7 @@ def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
                 _GETRS_TARGET, X_local_T, input_output_aliases={2: 0},
             )(jnp.transpose(local_LU, (0, 2, 1)), local_piv,
               jnp.transpose(local_B, (0, 2, 1)), **attrs)
-            return jnp.transpose(X_T, (0, 2, 1))
+            return _rows_in_order(jnp.transpose(X_T, (0, 2, 1)), n=n, p=p, q=q, nb=nb)
 
         fn = jax.jit(_getrs, donate_argnums=(2,))
         _LU_JIT_CACHE[key] = fn

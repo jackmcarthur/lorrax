@@ -15,14 +15,25 @@
 // (one core, below), so getrf-once + getrs-per-chunk reproduces the fused
 // solve to the bit on the same mesh.
 //
-// Layout contract (same as potrf_ffi.cc / eigh_ffi.cc; see ctx.h):
+// Layout contract (same as eigh_ffi.cc; see ctx.h):
 //   - The world SlateCtx (p, q) with its rank remap: JAX shard (mx, my) is
-//     SLATE tile (mx, my).
+//     SLATE process (mx, my).
 //   - Each rank's buffer is its (n/p, n/q) shard transposed by the Python
 //     wrapper, i.e. the true block in col-major with lld = n/p.
-//   - A tiles: nb = n / max(p, q) — one tile per rank on a square mesh, all
-//     local column tiles on a p x 1 mesh.  B / X: row tile nb (B.mt() must
-//     equal A.mt() for getrs), column tile nb_b = nrhs / q.
+//   - Block-cyclic BY RELABELING (distrib_la/_cyclic.py): A tiles are nb x nb
+//     with nb dividing n/p and n/q.  The rank's local buffer is read at the
+//     offsets fromDevices would use, so SLATE factors Pi A Pi'^T (Pi sends
+//     local row block c of x-rank r to global block c*p + r; Pi' the same over
+//     q).  B / X: row tile nb (B.mt() == A.mt()), column tile nb_b = nrhs / q,
+//     read through the same Pi.  On a square mesh Pi' = Pi and X comes back in
+//     A's row order with no movement; on a p x 1 mesh X's rows come back
+//     block-cyclic and the Python wrapper puts them in order (one all_to_all).
+//   - The operands are COPIED into SLATE-owned device tiles (stride = tile
+//     edge) and the results copied back: a wrapped buffer at nb < n/p has tile
+//     stride lld = n/p beside SLATE's own nb-stride workspace tiles, the
+//     non-uniform-stride class of SLATE's device batching (internal_batch.hh:290),
+//     and the owned tiles are uniform by construction (eigh_ffi.cc's rule).
+//     At nb = n/max(p, q) this is the former one-tile-per-rank layout.
 //
 // Pivots.  slate::Pivots is vector<vector<Pivot>>, one vector per block
 // column k with min(tileMb(k), tileNb(k)) entries; getrf MPI_Bcasts every
@@ -79,34 +90,69 @@ static ffi::Error preflight(const char* what, lrx::gpu::Stream stream,
         return ffi::Error(ffi::ErrorCode::kFailedPrecondition, os.str());
     }
     const int p = ctx->p, q = ctx->q;
-    const int64_t g = (p > q) ? p : q;
-    if (n % p != 0 || n % q != 0 || nb != n / g) {
+    if (n % p != 0 || n % q != 0 || nb < 1 || (n / p) % nb != 0 || (n / q) % nb != 0) {
         std::ostringstream os;
         os << "slate." << what << ": layout n=" << n << ", nb=" << nb << " on a "
-           << p << "x" << q << " ctx is not one tile per rank (want nb = n/max(p,q))";
+           << p << "x" << q << " ctx: nb must divide both local edges n/p and n/q";
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     return ffi::Error::Success();
 }
 
-// Copy src -> dst (no-op when XLA aliased them), then let it land.
-static ffi::Error stage(const char* what, void* dst, const void* src, std::size_t bytes,
-                        lrx::gpu::Stream stream) {
-    if (dst == src || bytes == 0) return ffi::Error::Success();
-    lrx::gpu::Error ce = lrx::gpu::memcpy_async(dst, src, bytes, lrx::gpu::kDeviceToDevice, stream);
-    if (ce != lrx::gpu::kSuccess) return gpu_fail(what, LRX_GPU_API "MemcpyAsync(D2D)", ce);
-    ce = lrx::gpu::stream_synchronize(stream);
-    if (ce != lrx::gpu::kSuccess) return gpu_fail(what, LRX_GPU_API "StreamSynchronize(stage)", ce);
+// The rank's col-major local block (leading dim lld) <-> M's local tiles, at
+// the offsets fromDevices would use: tile (ti, tj) of x-rank ti % p, y-rank
+// tj % q sits at local row (ti / p) * mb, local column (tj / q) * nbc.
+template <typename T>
+static ffi::Error copy_in(const char* what, sl::Matrix<T>& M, const T* src, int64_t lld,
+                          int p, int q, lrx::gpu::Stream stream) {
+    const int64_t mb = M.tileMb(0), nbc = M.tileNb(0);
+    for (int64_t tj = 0; tj < M.nt(); ++tj)
+        for (int64_t ti = 0; ti < M.mt(); ++ti) {
+            if (!M.tileIsLocal(ti, tj)) continue;
+            auto t = M(ti, tj, M.tileDevice(ti, tj));
+            const T* from = src + (ti / p) * mb + (tj / q) * nbc * lld;
+            lrx::gpu::Error ce = lrx::gpu::memcpy_2d_async(
+                t.data(), t.stride() * sizeof(T), from, lld * sizeof(T),
+                t.mb() * sizeof(T), t.nb(), lrx::gpu::kDeviceToDevice, stream);
+            if (ce != lrx::gpu::kSuccess)
+                return gpu_fail(what, LRX_GPU_API "Memcpy2DAsync(local block -> tile)", ce);
+        }
+    lrx::gpu::Error ce = lrx::gpu::stream_synchronize(stream);
+    if (ce != lrx::gpu::kSuccess) return gpu_fail(what, LRX_GPU_API "StreamSynchronize(copy in)", ce);
     return ffi::Error::Success();
 }
 
+// tileGetForReading first: a routine can leave a tile's valid copy on the host
+// (eigh_ffi.cc's stale-MOSI finding).  Synchronised before M frees its tiles.
 template <typename T>
-static sl::Matrix<T> wrap(T* ptr, int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
-                          const lorrax_ffi::slate::SlateCtx* ctx) {
-    T* ptrs[1] = { ptr };
-    const int64_t lld = m / ctx->p;
-    return sl::Matrix<T>::fromDevices(m, ncols, ptrs, 1, lld, mb, nb_cols,
-                                      ctx->p, ctx->q, ctx->comm);
+static ffi::Error copy_out(const char* what, sl::Matrix<T>& M, T* dst, int64_t lld,
+                           int p, int q, lrx::gpu::Stream stream) {
+    const int64_t mb = M.tileMb(0), nbc = M.tileNb(0);
+    for (int64_t tj = 0; tj < M.nt(); ++tj)
+        for (int64_t ti = 0; ti < M.mt(); ++ti) {
+            if (!M.tileIsLocal(ti, tj)) continue;
+            const int dev = M.tileDevice(ti, tj);
+            M.tileGetForReading(ti, tj, dev, sl::LayoutConvert::ColMajor);
+            auto t = M(ti, tj, dev);
+            T* to = dst + (ti / p) * mb + (tj / q) * nbc * lld;
+            lrx::gpu::Error ce = lrx::gpu::memcpy_2d_async(
+                to, lld * sizeof(T), t.data(), t.stride() * sizeof(T),
+                t.mb() * sizeof(T), t.nb(), lrx::gpu::kDeviceToDevice, stream);
+            if (ce != lrx::gpu::kSuccess)
+                return gpu_fail(what, LRX_GPU_API "Memcpy2DAsync(tile -> local block)", ce);
+        }
+    lrx::gpu::Error ce = lrx::gpu::stream_synchronize(stream);
+    if (ce != lrx::gpu::kSuccess) return gpu_fail(what, LRX_GPU_API "StreamSynchronize(copy out)", ce);
+    return ffi::Error::Success();
+}
+
+// SLATE-owned device tiles: A (n x n, nb x nb) or B / X (n x nrhs, nb x nb_b).
+template <typename T>
+static sl::Matrix<T> owned(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
+                           const lorrax_ffi::slate::SlateCtx* ctx) {
+    sl::Matrix<T> M(m, ncols, mb, nb_cols, ctx->p, ctx->q, ctx->comm);
+    M.insertLocalTiles(sl::Target::Devices);
+    return M;
 }
 
 static const sl::Options& lu_opts() {
@@ -166,16 +212,20 @@ static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate:
                                      const T* A, const T* B, T* X, T* LU) {
     const char* what = "batched_solve_lu";
     if (auto e = preflight(what, stream, ctx, n, nb); !e.success()) return e;
-    const int64_t a_elems = (n / ctx->p) * (n / ctx->q);
-    const int64_t b_elems = (n / ctx->p) * (nrhs / ctx->q);
-    if (auto e = stage(what, LU, A, nq * a_elems * sizeof(T), stream); !e.success()) return e;
-    if (auto e = stage(what, X, B, nq * b_elems * sizeof(T), stream); !e.success()) return e;
+    const int p = ctx->p, q = ctx->q;
+    const int64_t lld = n / p;
+    const int64_t a_elems = lld * (n / q);
+    const int64_t b_elems = lld * (nrhs / q);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        auto Aq = wrap<T>(LU + iq * a_elems, n, n, nb, nb, ctx);
-        auto Xq = wrap<T>(X + iq * b_elems, n, nrhs, nb, nb_b, ctx);
+        auto Aq = owned<T>(n, n, nb, nb, ctx);
+        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx);
+        if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
+        if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
         if (auto e = factor_one<T>(what, Aq, piv, iq); !e.success()) return e;
         if (auto e = solve_one<T>(Aq, piv, Xq, iq); !e.success()) return e;
+        if (auto e = copy_out<T>(what, Xq, X + iq * b_elems, lld, p, q, stream); !e.success()) return e;
+        if (auto e = copy_out<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
     }
     return ffi::Error::Success();
 }
@@ -192,13 +242,16 @@ static ffi::Error GetrfImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
         os << "slate." << what << ": piv_len=" << piv_len << " != 2*n=" << 2 * n;
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
-    const int64_t a_elems = (n / ctx->p) * (n / ctx->q);
-    if (auto e = stage(what, LU, A, nq * a_elems * sizeof(T), stream); !e.success()) return e;
+    const int p = ctx->p, q = ctx->q;
+    const int64_t lld = n / p;
+    const int64_t a_elems = lld * (n / q);
     std::vector<int64_t> h_piv(static_cast<std::size_t>(nq * piv_len), 0);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        auto Aq = wrap<T>(LU + iq * a_elems, n, n, nb, nb, ctx);
+        auto Aq = owned<T>(n, n, nb, nb, ctx);
+        if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
         if (auto e = factor_one<T>(what, Aq, piv, iq); !e.success()) return e;
+        if (auto e = copy_out<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         int64_t* out = h_piv.data() + iq * piv_len;
         int64_t at = 0;
         for (const auto& panel : piv)
@@ -234,9 +287,10 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
         os << "slate." << what << ": piv_len=" << piv_len << " != 2*n=" << 2 * n;
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
-    const int64_t a_elems = (n / ctx->p) * (n / ctx->q);
-    const int64_t b_elems = (n / ctx->p) * (nrhs / ctx->q);
-    if (auto e = stage(what, X, B, nq * b_elems * sizeof(T), stream); !e.success()) return e;
+    const int p = ctx->p, q = ctx->q;
+    const int64_t lld = n / p;
+    const int64_t a_elems = lld * (n / q);
+    const int64_t b_elems = lld * (nrhs / q);
     std::vector<int64_t> h_piv(static_cast<std::size_t>(nq * piv_len), 0);
     lrx::gpu::Error ce = lrx::gpu::memcpy_async(h_piv.data(), d_piv, h_piv.size() * sizeof(int64_t),
                                                 lrx::gpu::kDeviceToHost, stream);
@@ -244,10 +298,10 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
     ce = lrx::gpu::stream_synchronize(stream);
     if (ce != lrx::gpu::kSuccess) return gpu_fail(what, LRX_GPU_API "StreamSynchronize(piv)", ce);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        // getrs only reads the factors (triangular views + row swaps on B);
-        // the const_cast is the batched_trsm handler's, for the same reason.
-        auto Aq = wrap<T>(const_cast<T*>(LU) + iq * a_elems, n, n, nb, nb, ctx);
-        auto Xq = wrap<T>(X + iq * b_elems, n, nrhs, nb, nb_b, ctx);
+        auto Aq = owned<T>(n, n, nb, nb, ctx);
+        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx);
+        if (auto e = copy_in<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
+        if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         const int64_t* in = h_piv.data() + iq * piv_len;
         sl::Pivots piv;
         int64_t at = 0;
@@ -263,6 +317,7 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
                               "slate.batched_getrs: pivot buffer does not match this A geometry "
                               "(feed back getrf's piv verbatim, same mesh)");
         if (auto e = solve_one<T>(Aq, piv, Xq, iq); !e.success()) return e;
+        if (auto e = copy_out<T>(what, Xq, X + iq * b_elems, lld, p, q, stream); !e.success()) return e;
     }
     return ffi::Error::Success();
 }
@@ -374,7 +429,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nrhs")
-        .Attr<int64_t>("nb")                     // A tile: n / max(p, q)
+        .Attr<int64_t>("nb")                     // A tile: divides n/p and n/q
         .Attr<int64_t>("nb_b")                   // B column tile: nrhs / q
         .Attr<int64_t>("ctx_key"));
 

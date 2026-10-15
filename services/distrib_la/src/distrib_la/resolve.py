@@ -9,6 +9,13 @@ lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
                       (``distributed`` resolves to the platform's default
                       distributed library FIRST, then runs the whole
                       ladder as if it had been named explicitly)
+    1b. size        — ``distributed`` on a leg with a size row
+                      (:data:`ONE_DEVICE_MAX_N`, the ROCM leg) and a known
+                      ``n`` at or below the row's bound resolves to
+                      ``one_device`` instead: the matrix fits one device,
+                      where the library's fixed per-call cost is the whole
+                      cost (§ "Distributed is a capacity route").  Declared,
+                      recorded on the plan and announced once; never silent.
     2. platform     — does the backend run on this mesh's device kind?
                       (cusolvermp is CUDA-only; scalapack is host-only)
     2b. known-broken— slate eigh on a CPU mesh (bug L-2: SIGSEGV)
@@ -72,6 +79,10 @@ __all__ = [
     "OPS",
     "NATIVE",
     "NATIVE2D",
+    "ONE_DEVICE",
+    "ONE_DEVICE_MAX_N",
+    "one_device_max_n",
+    "size_route_note",
     "BACKEND_CHOICES",
     "EIGH_BACKENDS",
     "CHOLESKY_BACKENDS",
@@ -103,6 +114,19 @@ NATIVE = "native"
 #: orders of magnitude in BOTH directions is the caller's decision.
 NATIVE2D = "native2d"
 
+#: Each matrix moved WHOLE onto one device (route (c)'s staged exchange,
+#: :mod:`distrib_la._batch_reshard`), solved there by the leg's native JAX
+#: kernel, and returned in the caller's face layout ``P(None,'x','y')``
+#: (:mod:`distrib_la._one_device`).  Pure JAX, like ``native2d``, but not a
+#: mode of ``native``: it takes the FFI backends' operand contract, so a
+#: ``distributed`` call site runs it unchanged.  It is what ``distributed``
+#: resolves to on a leg with a size row (:data:`ONE_DEVICE_MAX_N`) for a
+#: matrix within the row's bound; beyond the bound the leg's library runs.
+#: A batch is spread over the mesh (``ceil(B/P)`` whole matrices per rank,
+#: in rounds bounded by the row), so it keeps the P-scaling the
+#: ``distributed`` name exists for; one matrix is solved by one rank.
+ONE_DEVICE = "one_device"
+
 #: Per-op user vocabulary (requested names).  ``auto``/``off`` resolve to
 #: ``native``; the rest name a concrete implementation.  ``distributed``
 #: is the PLATFORM-DEFAULT distributed backend (:data:`_DISTRIBUTED_DEFAULT`);
@@ -113,10 +137,10 @@ NATIVE2D = "native2d"
 #: channel-policy ladder in the caller, not one library.
 BACKEND_CHOICES = {
     "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate",
-                 "scalapack"),
+                 "scalapack", ONE_DEVICE),
     "cholesky": ("auto", "off", "native2d", "cusolvermp", "slate"),
     "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack",
-                 "slate"),
+                 "slate", ONE_DEVICE),
 }
 EIGH_BACKENDS = BACKEND_CHOICES["eigh"]
 CHOLESKY_BACKENDS = BACKEND_CHOICES["cholesky"]
@@ -151,6 +175,40 @@ _DISTRIBUTED_DEFAULT = {
     ("solve_lu", "cpu"):  "scalapack",
     ("solve_lu", "CUDA"): "cusolvermp",
     ("solve_lu", "ROCM"): "slate",
+}
+
+#: ``distributed`` by SIZE — (op, leg) → the largest ``n`` that
+#: ``distributed`` serves with ``one_device`` (each matrix whole on one
+#: device, the leg's native solver).  ONE row per leg that measured it; a
+#: leg without a row keeps its library for every ``n`` (CUDA has no row:
+#: its routing is unchanged).  The bound is in ``n`` and was measured at
+#: complex128, the larger of the two dtypes, so float64 is inside it.
+#:
+#: ROCM (MI250X GCD, 64 GB; pool logs ``distla_bound1``, ``distla_lubig*``):
+#:   eigh 16384: the one-device program at n = 16384 complex128 takes 42.4 s
+#:     (native 42.1 s, SLATE 2x2 76.4 s), peak 27.9 GB per rank, resid 9e-15;
+#:     SLATE eigh steady is 64-147x the native wall at n = 32-128 complex128
+#:     (0.22-0.29 s vs 0.0016-0.0045 s, ``distla_bound1``) and 2.7-33x at
+#:     n = 2048-8192 (SLATE_PERF_REPORT).  Beyond 16384 one
+#:     GCD is not measured, so the library takes over (the capacity route).
+#:   solve_lu 8192: the native complex128 LU (jaxlib getrf/getrs on rocSOLVER,
+#:     ROCm 7.14.1) returns a WRONG solution with no error at n = 12288 and
+#:     16384 (residual 8e-3; float64 16384 and complex128 <= 11616 are exact),
+#:     so the bound is the largest n the gate covered (512-8192, f64/c128).
+#:     One-device LU at 8192 c128 takes 1.06 s against SLATE's 3.63 s.
+ONE_DEVICE_MAX_N = {
+    ("eigh", "ROCM"):     16384,
+    ("solve_lu", "ROCM"): 8192,
+}
+
+#: ``auto`` cholesky / solve_lu: the leg's FFI candidate on a true-2-D mesh
+#: (else native).  CUDA only: cuSOLVERMp.  A leg without a row resolves
+#: ``auto`` to native as its documented policy (no probe, no notice) -- the
+#: ROCM leg used to probe the CUDA handler here and print a CUDA-specific
+#: "NOT AVAILABLE" notice on every ROCm 2x2 mesh.
+_AUTO_FFI = {
+    ("cholesky", "CUDA"): "cusolvermp",
+    ("solve_lu", "CUDA"): "cusolvermp",
 }
 
 #: What the pure-JAX backends mean per op (for messages / list_backends).
@@ -354,7 +412,7 @@ def _announce_auto_geometry_demote(op: str, px: int, py: int) -> None:
             f"instead.", flush=True)
 
 
-def _announce_auto_capability_demote(op: str, target: str) -> None:
+def _announce_auto_capability_demote(op: str, target: str, platform: str) -> None:
     """Rank-0, once-per-(op, target) announcement that ``auto`` demoted to
     native because the handler is NOT LOADABLE — the mesh geometry was fine.
 
@@ -380,7 +438,7 @@ def _announce_auto_capability_demote(op: str, target: str) -> None:
     if _process_index() != 0:
         return
     try:
-        reason = loader.probe_target(target, "CUDA")
+        reason = loader.probe_target(target, platform)
     except Exception as exc:               # noqa: BLE001 — never let the
         reason = f"(probe_target itself failed: {exc!r})"   # witness raise
     print(
@@ -432,8 +490,14 @@ def _announce_eigh_fixed_cost(px: int, py: int, n: int) -> None:
 
 def resolve_backend(op: str, requested: str, mesh_xy, *,
                     n: int | None = None,
-                    compute_evecs: bool = True) -> str:
+                    compute_evecs: bool = True,
+                    size_route: bool = True) -> str:
     """Resolve a requested backend name for ``op`` on ``mesh_xy``.
+
+    ``distributed`` takes the leg's size route first (guard 1b,
+    :data:`ONE_DEVICE_MAX_N`); :func:`size_route_note` says what it decided.
+    ``size_route=False`` resolves ``distributed`` to the leg's library whatever
+    ``n`` (the capacity provider, :func:`resolve_eigh_capacity`).
 
     Returns the concrete backend to run: ``"native"``, ``"native2d"``, or
     one of the FFI backend names (``"cusolvermp" | "slate" | "scalapack"``).
@@ -517,6 +581,12 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         return NATIVE2D
 
     requested_spelling = requested   # keep the user's spelling for messages
+    if requested == "distributed" and size_route:
+        sized = _size_route(op, mesh_xy, n)
+        if sized is not None:
+            requested = sized
+    if requested == ONE_DEVICE:
+        return _resolve_one_device(op, mesh_xy, n, requested_spelling)
     if requested == "distributed":
         # "Spread ONE tile over the whole mesh, with whatever library this
         # platform's distributed eigh is."  Explicit — every guard below
@@ -532,16 +602,20 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
     if requested == "auto":
         if op == "eigh" or mesh_is_cpu(mesh_xy):
             return NATIVE
-        target, _ = _SPEC[(op, "cusolvermp")]
-        if px >= 2 and py >= 2 and loader.has_target(target, "CUDA"):
-            return "cusolvermp"
+        platform = mesh_platform(mesh_xy)
+        candidate = _AUTO_FFI.get((op, platform))
+        if candidate is None:
+            return NATIVE                  # this leg's policy: no FFI auto
+        target, _ = _SPEC[(op, candidate)]
+        if px >= 2 and py >= 2 and loader.has_target(target, platform):
+            return candidate
         # 'auto' MAY demote, but must announce.  The only demote here that
         # is not the documented default policy ("native unless a compiled
         # cusolvermp on a true-2D CUDA mesh") is the geometry one: handler
         # compiled, mesh 1-D.  Mesh geometry is identical on every rank, so
         # a rank-0 line suffices; deduped so repeated plan() calls do not
         # spam.
-        if loader.has_target(target, "CUDA") and not (px >= 2 and py >= 2):
+        if loader.has_target(target, platform) and not (px >= 2 and py >= 2):
             _announce_auto_geometry_demote(op, px, py)
         elif px >= 2 and py >= 2:
             # Geometry was fine, so the ONLY reason we are here is that the
@@ -549,7 +623,7 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
             # _announce_auto_capability_demote for why this used to be
             # silent and why that was the highest-consequence failure mode
             # in the resolver.
-            _announce_auto_capability_demote(op, target)
+            _announce_auto_capability_demote(op, target, platform)
         return NATIVE
 
     # ── explicit FFI backend: run the full guard ladder ──────────────
@@ -727,6 +801,81 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
     return requested
 
 
+#: Every size-route decision of this process, (op, leg, px, py, n) -> one line
+#: for a driver's route ledger (read through :func:`distrib_la.new_stack_routes`:
+#: production drivers discard component stdout, so the rank-0 notice alone
+#: would not reach a run's log).
+_SIZE_DECISIONS: dict = {}
+
+
+def one_device_max_n(op: str, platform: str) -> int | None:
+    """The leg's ``one_device`` bound for ``op`` (:data:`ONE_DEVICE_MAX_N`), or None."""
+    return ONE_DEVICE_MAX_N.get((op, str(platform)))
+
+
+def _size_route(op: str, mesh_xy, n) -> str | None:
+    """Guard 1b: ``one_device`` when the leg has a size row and ``n`` is known and
+    within it; None (the leg's library) otherwise.  Announced once per decision."""
+    platform = mesh_platform(mesh_xy)
+    bound = one_device_max_n(op, platform)
+    if bound is None or n is None:
+        return None
+    px, py = _mesh_shape(mesh_xy)
+    library = _DISTRIBUTED_DEFAULT.get((op, platform))
+    chosen = ONE_DEVICE if int(n) <= bound else library
+    _SIZE_DECISIONS.setdefault(
+        (op, platform, px, py, int(n)),
+        f"{op} 'distributed' n={int(n)} on the {px}x{py} {platform} mesh: {chosen}, "
+        f"size route (ONE_DEVICE_MAX_N: n <= {bound} -> {ONE_DEVICE}, larger -> {library})")
+    announce_once(
+        ("distrib_la.resolve", op, "size-route", platform, px, py, chosen),
+        f"  [distrib_la.resolve] {op} 'distributed' on the {px}x{py} {platform} "
+        f"mesh: size route (leg row ONE_DEVICE_MAX_N, n <= {bound} -> "
+        f"'{ONE_DEVICE}', larger -> '{library}'): n={int(n)} -> '{chosen}'.  "
+        f"'{ONE_DEVICE}' solves each matrix whole on one device with the native "
+        f"kernel and returns the caller's P(None,'x','y') layout; an explicit "
+        f"'{library}' is honoured as named.", scope="rank0")
+    return ONE_DEVICE if chosen == ONE_DEVICE else None
+
+
+def size_route_note(op: str, requested: str, mesh_xy, n, backend: str) -> str | None:
+    """The plan record of guard 1b: what the size route decided, or None when it
+    did not apply (no leg row, ``n`` unknown, or a request other than ``distributed``)."""
+    if str(requested).strip().lower() != "distributed":
+        return None
+    platform = mesh_platform(mesh_xy)
+    bound = one_device_max_n(op, platform)
+    if bound is None or n is None:
+        return None
+    rel = "<=" if int(n) <= bound else ">"
+    return f"size route {platform}: n={int(n)} {rel} {bound} -> {backend}"
+
+
+def _resolve_one_device(op: str, mesh_xy, n, spelling: str) -> str:
+    """The ``one_device`` guards: a leg row (its bound plans the rounds), the bound,
+    and divisibility (route (c) moves face tiles).  Refusals name GATE one_device."""
+    platform = mesh_platform(mesh_xy)
+    bound = one_device_max_n(op, platform)
+    via = "" if spelling == ONE_DEVICE else f" (requested as {spelling!r})"
+    if bound is None:
+        raise ValueError(
+            f"GATE one_device: {op} backend '{ONE_DEVICE}'{via} has no size row on "
+            f"platform {platform!r} (ONE_DEVICE_MAX_N rows: {sorted(ONE_DEVICE_MAX_N)}); "
+            f"its per-device bound is a measured leg fact.  Use 'off' (native) or "
+            f"'distributed'.")
+    px, py = _mesh_shape(mesh_xy)
+    if n is not None and int(n) > bound:
+        raise ValueError(
+            f"GATE one_device: {op} backend '{ONE_DEVICE}'{via} at n={int(n)} exceeds "
+            f"the {platform} bound {bound} (ONE_DEVICE_MAX_N).  Use 'distributed'.")
+    if n is not None and (int(n) % px or int(n) % py):
+        raise ValueError(
+            f"GATE one_device: {op} backend '{ONE_DEVICE}'{via} needs n ({n}) "
+            f"divisible by both mesh axes ({px}, {py}): the operand arrives as face "
+            f"tiles.  Pad n or change the mesh.")
+    return ONE_DEVICE
+
+
 #: (platform, px, py) triples whose missing capacity eigh was announced.
 _CAPACITY_UNAVAILABLE_ANNOUNCED: set[tuple[str, int, int]] = set()
 
@@ -751,7 +900,11 @@ def resolve_eigh_capacity(mesh_xy, *, n: int | None = None) -> tuple[str, str | 
     resolve time.
     """
     try:
-        return resolve_backend("eigh", "distributed", mesh_xy, n=n), None
+        # The LIBRARY, never the size route: this provider runs only the
+        # stacks of which not one whole matrix per rank fits the caller's
+        # room, and the one-device route would need exactly that.
+        return resolve_backend("eigh", "distributed", mesh_xy, n=n,
+                               size_route=False), None
     except (ValueError, RuntimeError) as exc:
         # The first line names the failed guard; a loader's search path follows it.
         reason = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
@@ -774,6 +927,8 @@ def _available(op: str, mesh_xy) -> list[str]:
     mesh (the pure-JAX ones always qualify)."""
     out = [NATIVE] + ([NATIVE2D] if NATIVE2D in BACKEND_CHOICES[op] else [])
     platform = mesh_platform(mesh_xy)
+    if (op, platform) in ONE_DEVICE_MAX_N:
+        out.append(ONE_DEVICE)
     for (o, b), (target, platforms) in _SPEC.items():
         if o != op or platform not in platforms:
             continue
@@ -825,6 +980,9 @@ def backend_module(backend: str):
     if backend == NATIVE2D:
         from distrib_la import _native2d
         return _native2d
+    if backend == ONE_DEVICE:
+        from distrib_la import _one_device
+        return _one_device
     if backend == "cusolvermp":
         from distrib_la import _cusolvermp
         return _cusolvermp
@@ -836,5 +994,5 @@ def backend_module(backend: str):
         return _scalapack
     raise ValueError(
         f"no FFI backend module named {backend!r} "
-        f"(known: cusolvermp, slate, scalapack, native2d; 'native' is "
+        f"(known: cusolvermp, slate, scalapack, native2d, one_device; 'native' is "
         f"jnp + the caller's own routes and has no module).")
