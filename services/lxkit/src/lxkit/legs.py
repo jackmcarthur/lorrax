@@ -152,7 +152,16 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # GEMM steady state identical (d/zgemm n=1024..8192, 39.6 TF/s).  No
         # LLVM-module-parallelism row: XLA's AMDGPU compiler cannot link split
         # modules, so the flag is inert there (runtime lane 2026-10-14).
-        xla_flag_defaults=(("--xla_gpu_autotune_level", "0"),),
+        # Synchronous collectives: an async all-reduce on XLA's collective
+        # stream beside a collective of another communicator on the compute
+        # stream deadlocks RCCL across ranks (GPUs at 100 %, every rank inside
+        # the program).  Minimal repro hangs at iteration 1, 300/300 with this
+        # flag; hsuite bisp_sc hung 3/3 and sp_export 1/1, PASS with it
+        # (disteigh lane 2026-10-15, d76a2bee4; pool logs disteigh_repro_*,
+        # disteigh_bisp3).  Part of the leg's collective policy beside
+        # collective_library: it holds on one node and across nodes.
+        xla_flag_defaults=(("--xla_gpu_autotune_level", "0"),
+                           ("--xla_gpu_disable_async_collectives", "ALLCOLLECTIVES")),
         # The pool policy's arena: BFC (cuda_async does not exist on ROCm),
         # preallocated at runtime.pool_fraction (0.8952 of a 68.70 GB GCD,
         # 61.50 GB) instead of jaxlib's 0.75 (51.53 GB).  Outside the arena
