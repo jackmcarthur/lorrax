@@ -211,7 +211,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
     section = cmake[cmake.index('STREQUAL "rocm"'):]
     block = section[:section.index("add_library(lorrax_ffi_rocm")]
-    assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in section and "cufft/" not in block
+    assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in section
     assert "kdft/kdft_klead_ffi.cc" in block and "common/rtc_build.cc" in block
     assert "slate/eigh_ffi.cc" in section       # bound with target_sources when SLATE is found
 
@@ -241,3 +241,10 @@ def test_the_family_table_matches_the_loaders_routers_and_build():
     block = block[:block.index("add_library(")]
     for name, row in fam.FAMILIES.items():
         assert (f"{row.source}/" in block) == (row.legs["ROCM"][0] == "built"), name
+    srcs = block[block.index("set(LORRAX_FFI_ROCM_SOURCES"):]
+    srcs = srcs[:srcs.index(")")]
+    assert "kdft/kbox_unfold_ffi.cc" in srcs and "cufft/" not in srcs
+    # The one cufft/ file the leg reads: the k-box stage's text (leg-neutral; its line transform is
+    # the leg's policy), embedded for hipRTC as the CUDA leg embeds it for NVRTC.
+    import re
+    assert set(re.findall(r"cufft/[\w.]+", block)) <= {"cufft/kbox_stage.cuh", "cufft/kbox_stage_src.h.in"}

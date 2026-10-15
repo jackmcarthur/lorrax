@@ -1520,6 +1520,7 @@ set(LORRAX_FFI_ROCM_SOURCES
     common/rtc_build.cc
     kdft/kdft_klead_ffi.cc
     kdft/kdft_kminor_ffi.cc
+    kdft/kbox_unfold_ffi.cc
 )
 
 # The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated
@@ -1540,6 +1541,18 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_kminor_src.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/generated/kdft_kminor_src.h" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_kminor_kernel.h")
+# The k-box unfold kernel (kdft/kbox_unfold_src.h.in) and the k-box stage it includes as a named
+# header (cufft/kbox_stage_src.h.in, the CUDA leg's own embedding of the same file): one stage
+# text for both legs, its line transform the leg's policy (kbox_stage.cuh).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_unfold_kernel.h" LRX_KBOX_UNFOLD_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_unfold_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_unfold_src.h" @ONLY)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh" LRX_KBOX_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_stage_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_unfold_kernel.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh")
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)

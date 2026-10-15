@@ -89,7 +89,7 @@ The factory picks the backend from the mesh's device vendor alone
 |---|---|
 | CUDA | the nvidia-mathdx kernel family in `liblorrax_ffi.so`: `src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`, and `kconv_outer_cuda_ffi.cc` for the BSE outer-product load |
 | cpu | the plan backend: the reference composition of each mode (the same unfolds, products and spin sums in XLA) with the FFTW3-ABI host handlers of `liblorrax_ffi_host.so` (`lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv`, [FFI layer §3c](ffi_layout.md#3c-which-fft-engine-the-host-library-binds)) |
-| ROCM | the XLA backend, except the k-leading pair: `make_local_kconv_klead` (mode 2, and so `make_kconv_klead`'s apply: Σ τ, COHSEX, the BSE W term) and `make_local_kfft_klead` (mode 3) take the kdft family of `liblorrax_ffi_rocm.so` (`src/ffi/cpp/kdft/`, hipRTC-built: a column tile's k axes transformed in LDS by mixed-radix Stockham DFT, one HBM pass when the k tile fits a block and otherwise one pass per contiguous axis group, 2·(groups−1)+1 for mode 2; plan in `kdft_klead_plan.h`), through `ffi.fft._ROCM_KLEAD_TARGETS`; so does the k-minor pair, `make_local_kconv_kminor` (mode 4: the BSE ring rung, both `out_layout`s) and `make_local_kfft_kminor` (mode 5: the BSE kernel prep), one HBM pass on a block of whole contiguous rows staged transposed in LDS with the same DFT core (`kdft/kdft_kminor_ffi.cc`; no split arm, so one row's k tile must fit a block: nk ≤ `ffi.fft.KDFT_KMINOR_NK_MAX`, `GATE kdft-kminor-tile`; axes ≤ `KDFT_KMINOR_AXIS_MAX`, `GATE kdft-axis`); `kconv_backend` stays `'xla'`. Where kdft cannot serve: beyond its verified range, an axis above 128 (`GATE kdft-axis`) or nk above 10240 (`GATE kdft-nk`), or a failed startup probe (`GATE kdft-probe`, demoted as the mathdx probe is) |
+| ROCM | the XLA backend, except the k-leading pair: `make_local_kconv_klead` (mode 2, and so `make_kconv_klead`'s apply: Σ τ, COHSEX, the BSE W term) and `make_local_kfft_klead` (mode 3) take the kdft family of `liblorrax_ffi_rocm.so` (`src/ffi/cpp/kdft/`, hipRTC-built: a column tile's k axes transformed in LDS by mixed-radix Stockham DFT, one HBM pass when the k tile fits a block and otherwise one pass per contiguous axis group, 2·(groups−1)+1 for mode 2; plan in `kdft_klead_plan.h`), through `ffi.fft._ROCM_KLEAD_TARGETS`; so does the k-minor pair, `make_local_kconv_kminor` (mode 4: the BSE ring rung, both `out_layout`s) and `make_local_kfft_kminor` (mode 5: the BSE kernel prep), one HBM pass on a block of whole contiguous rows staged transposed in LDS with the same DFT core (`kdft/kdft_kminor_ffi.cc`; no split arm, so one row's k tile must fit a block: nk ≤ `ffi.fft.KDFT_KMINOR_NK_MAX`, `GATE kdft-kminor-tile`; axes ≤ `KDFT_KMINOR_AXIS_MAX`, `GATE kdft-axis`); `kconv_backend` stays `'xla'`. Where kdft cannot serve: beyond its verified range, an axis above 128 (`GATE kdft-axis`) or nk above 10240 (`GATE kdft-nk`), or a failed startup probe (`GATE kdft-probe`, demoted as the mathdx probe is). Mode 7 (`make_kconv_klead_unfold`, the Σ τ kernel) takes the k-box stage itself, `lorrax_kdft_kconv_klead_unfold` (`src/ffi/cpp/kdft/kbox_unfold_*`, through `ffi.fft._ROCM_KBOX_TARGETS`), on the single arm only: a grid whose spin group does not fit a block's 64 KiB of LDS keeps the XLA unfold + kdft route (`GATE kdft-kbox-residency`, `ffi.fft.kdft_kbox_refusal`), as does an axis above `ffi.fft.KDFT_KBOX_AXIS_MAX` = 40 (its line transform is the stage's unrolled direct DFT; `GATE kdft-axis`) |
 | any other | the XLA backend: the same composition with XLA's k-axis transforms (one dense DFT GEMM on the k axis for $N_k \le$ the leg's `xla_kdft_max_nk`, `jnp.fft` above; [§15](#numerical-contract)); no LORRAX library. The ROCM rows above that are not kdft factories take this backend too |
 
 **Where mathdx cannot serve.** On CUDA a factory takes the XLA backend, with
@@ -234,9 +234,15 @@ Every mode except 0, 1, 6 and 10 runs on one stage,
 - **Store**: the scaled write, through a row map where the mode keeps only
   some k rows.
 
-The stage owns the transforms and the launch rule. A transform runs cuFFTDx
-thread FFTs along z, then y, then x; the forward transform after the Mid
-uses the same axis order.
+The stage owns the transforms and the launch rule. A transform runs one line
+transform per line along z, then y, then x; the forward transform after the Mid
+uses the same axis order. The line transform is the leg's policy, the stage's
+one vendor seam (`line_fft`, with the copy and the lane read): a cuFFTDx thread
+FFT under NVRTC, the kdft direct DFT against compile-time twiddles under hipRTC
+(`LRX_KBOX_DIRECT_DFT`; a wavefront of 64 lanes). `lrx_kbox::fft_direction`
+names the leg's direction type, so one mode text serves both legs; the CUDA
+images are byte-identical to those of the stage before the split (CUDA 13.4
+NVRTC, sm_80, modes 2/3, 7, 8, 9, 11 and the BSE outer load).
 
 **Bank geometry** (`lrx_kbox::Geometry`). A column's z line is padded to
 $n_{kz}|1$ and the column stride to $(n_{kx}n_{ky}(n_{kz}|1))|1$ elements;
@@ -614,6 +620,8 @@ not of the traffic.
 | `GATE mathdx-kconv-outer-tile`, `-outer-decode-tile`, `-outer-arch`, `-outer-rank` | kernel build | the BSE outer load's bank or accumulator does not fit, the device is older than sm_80, or K is not a multiple of 4 | call through the factories, which check `klead_outer_refusal` / `klead_outer_decode_refusal` and pad K |
 | `GATE mathdx-plane-split`, `mathdx-plane-residency` | kernel build | a direct mode-10 call on a plane with no split or too large | call through `make_plane_fft_gather` |
 | `GATE plane-fft-dtype` | trace | mode 10's `F` is not complex128 | pass complex128 |
+| `GATE kdft-kbox-residency` | factory build (ROCM) and kernel build | mode 7's spin group (two columns at $n_s = 1$) does not fit a block's 64 KiB of LDS on the k-box single arm (`ffi.fft.kdft_kbox_refusal`, the handler's `kbox_plan`); the split arm is not ported | none: the router keeps the XLA unfold + kdft route, one warning per grid |
+| `GATE kdft-kbox-build`, `kdft-kbox-operands`, `kdft-kbox-launch` | kernel build, apply | the hipRTC compile, the operand contract or the launch of `lorrax_kdft_kconv_klead_unfold` failed | a build defect |
 | `k-leading unfold conv: …` (and `lorentz conv`, `chi unfold`, `unfold fft`) | factory; apply | tables cut for another mesh, operands whose parent count or endpoint widths differ from the tables, or a missing partner on a plan with antiunitary rows | build the tables from the same plan and mesh as the operands; pass the partner |
 
 A kernel-build failure (an NVRTC compile, missing toolkit headers, a module

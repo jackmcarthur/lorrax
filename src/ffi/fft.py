@@ -195,6 +195,18 @@ KDFT_AXIS_MAX = 128
 #: KDFT_AXIS_MAX, which the k-leading pair's multi-pass route widens.
 KDFT_KMINOR_NK_MAX = 3904
 KDFT_KMINOR_AXIS_MAX = 128
+#: The ROCM leg's k-box symmetry unfold (cpp/kdft/kbox_unfold_ffi.cc): mode 7 on the k-box stage
+#: (cufft/kbox_stage.cuh, its line transform the kdft direct DFT under hipRTC), the operands and
+#: layouts of KCONV_KLEAD_UNFOLD_TARGET.  Single arm only (:func:`kdft_kbox_refusal`).
+KDFT_KCONV_KLEAD_UNFOLD_TARGET = "lorrax_kdft_kconv_klead_unfold"
+#: Factory -> the ROCM k-box target that serves it (a factory with no row keeps its XLA route,
+#: whose k transforms are the kdft pair above).
+_ROCM_KBOX_TARGETS = {"kconv_klead_unfold": KDFT_KCONV_KLEAD_UNFOLD_TARGET}
+#: A block's LDS on gfx90a, the k-box stage's opt-in budget on ROCM (kbox_unfold_ffi.cc kLds).
+KDFT_KBOX_LDS = 64 * 1024
+#: The k-box mode-7 kernel's own axis bound (cpp/kdft/kbox_unfold_ffi.cc kAxisMax): its line
+#: transform is the stage's unrolled direct DFT, so it does not widen with KDFT_AXIS_MAX.
+KDFT_KBOX_AXIS_MAX = 40
 
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
@@ -421,9 +433,58 @@ def rocm_klead_target(mesh: Mesh, kgrid, factory: str) -> str | None:
     return target
 
 
+def kdft_kbox_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM k-box stage cannot serve mode 7 on ``kgrid`` at ``ns`` ("" when it can).
+
+    The stage's single-arm rule (``lrx_kbox::kbox_plan`` with mode 7's arguments: a group of
+    ``ns**2`` columns, one c128 operand, a convolution, ``min_tr = 1``) against a block's LDS,
+    and a tile of at least two columns, as the handler decides; the split arm is not ported."""
+    if max(int(v) for v in kgrid) > KDFT_KBOX_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {tuple(int(v) for v in kgrid)}; want every axis <= "
+                f"{KDFT_KBOX_AXIS_MAX} (the k-box stage's direct-DFT line transform)")
+    why = kdft_refusal(kgrid)
+    if why:
+        return why
+    nx, ny, nz = (int(v) for v in kgrid)
+    group = int(ns) * int(ns)
+    per_col = group * (((nx * ny * (nz | 1)) | 1) * 16)
+    lines = nx * ny * nz // max(nx, ny, nz)
+    want = 8
+    while want * group * lines < 256:
+        want *= 2
+    cap = 1
+    while 2 * cap * per_col <= lds // 2:
+        cap *= 2
+    tr = min(want, cap)
+    if tr * per_col <= lds and tr * group >= 2:
+        return ""
+    return (f"GATE kdft-kbox-residency: got k-grid {(nx, ny, nz)} ns={ns}, a spin group of {group} padded "
+            f"columns ({per_col} B, two columns at ns=1); want it in a block's {lds // 1024} KiB of LDS "
+            "(the k-box single arm; the split arm is not ported to ROCM)")
+
+
+def rocm_kbox_target(mesh: Mesh, kgrid, factory: str, ns: int) -> str | None:
+    """The ROCM k-box target serving ``factory`` on this mesh, or ``None`` (the factory's XLA
+    route): a ROCm mesh outside :func:`xla_reference`, kdft not demoted, and the grid within
+    :func:`kdft_kbox_refusal` (else one warning per grid)."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    target = _ROCM_KBOX_TARGETS.get(factory)
+    why = kdft_kbox_refusal(kgrid, ns) if target else ""
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM {factory} -> XLA unfold + kdft, not the k-box stage: {why}"
+        if announce_once(("kconv", "kbox", factory, tuple(int(v) for v in kgrid), int(ns)), msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return None
+    return target
+
+
 def _require_kdft_targets() -> None:
-    """Refuse a ROCM library without the kdft pair: a build defect, not a routing condition."""
-    for target in _ROCM_KLEAD_TARGETS.values():
+    """Refuse a ROCM library without the kdft targets: a build defect, not a routing condition."""
+    for target in (*_ROCM_KLEAD_TARGETS.values(), *_ROCM_KBOX_TARGETS.values()):
         _require_target(target, "ROCM")
 
 
@@ -1914,9 +1975,10 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     row is transformed but never stored.  ``load``, when given, is the same
     tables on the devices (``symmetry_maps.device_load_tables``, or a pass's
     cut of them, ``gw.subtile_stream.window_load``), read as operands so the
-    consumer's program holds no table constants.  CUDA: nvidia-mathdx mode 7;
-    elsewhere the service's reference composition, then the XLA convolution and
-    the row selection.
+    consumer's program holds no table constants.  CUDA: nvidia-mathdx mode 7; ROCM: the
+    k-box stage's mode 7 (``lorrax_kdft_kconv_klead_unfold``) where :func:`kdft_kbox_refusal`
+    is empty; elsewhere the service's reference composition, then the XLA convolution (kdft on
+    ROCM) and the row selection.
 
     ``apply(..., rows=(x0, bx, xs, xn))`` stores one x block with the whole spin group: block
     row ``r`` in ``[0, xn*bx)`` of every rank's ``mu`` tile is the local left centroid
@@ -1958,6 +2020,20 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             out = jax.ShapeDtypeStruct((n_out, ns, xn * bx if bx else mx, ns, my), g.dtype)
             return jax.ffi.ffi_call(KCONV_KLEAD_UNFOLD_TARGET, out)(
+                flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                jnp.asarray(kout), v_r, *(() if live is None else (live,)),
+                conj_src=np.int64(bool(conj_src)),
+                x0=np.int64(x0), bx=np.int64(bx), xs=np.int64(xs), xn=np.int64(xn), **attrs)
+    elif (kbox := rocm_kbox_target(mesh, kg, "kconv_klead_unfold", ns)) is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(si * sf * float(mult)), cubin_dir=cubin_cache_dir())
+
+        def apply_tables(g, gt, v_r, t, conj_src, block, live):
+            n_par, mx, _, my, _ = (int(v) for v in g.shape)
+            x0, bx, xs, xn = (0, 0, 0, 0) if block is None else block
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            out = jax.ShapeDtypeStruct((n_out, ns, xn * bx if bx else mx, ns, my), g.dtype)
+            return jax.ffi.ffi_call(kbox, out)(
                 flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
                 jnp.asarray(kout), v_r, *(() if live is None else (live,)),
                 conj_src=np.int64(bool(conj_src)),
