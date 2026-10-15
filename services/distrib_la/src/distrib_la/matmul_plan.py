@@ -420,8 +420,8 @@ def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
             require_active_local_cuda()
             active_impl = active_local_cuda
         else:
-            from distrib_la._active_local import active_local_matmul
-            active_impl = active_local_matmul
+            from distrib_la._active_local import local_active_impl
+            active_impl = local_active_impl(mesh_platform(mesh))
     a_sh, b_sh, out_sh = (NamedSharding(mesh, spec)
                            for spec in (a_spec, b_spec, out_spec))
     local = partial(_axis_matmul, alpha=alpha, beta=beta, reduction_axis=reduction_axis)

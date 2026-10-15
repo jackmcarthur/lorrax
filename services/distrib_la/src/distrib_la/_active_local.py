@@ -1,12 +1,69 @@
 """Exact interval products for the local planned GEMM backend and the XLA subspace route.
 
-The allocation shapes are fixed. A dynamic interval is decomposed into
-power-of-two widths, each selecting a statically shaped dot through lax.switch.
-Only disjoint, wholly active slices enter a dot. This avoids padding arithmetic
-and works on CPU and GPU through their existing JAX dot lowering.
+Two XLA routes compute ``a[q][:, lo:hi] diag(w[q]) b[q][lo:hi, :]`` per parent:
+
+- ``"interval"`` (:func:`active_local_matmul`): a dynamic interval is decomposed
+  into power-of-two widths, each selecting a statically shaped dot through
+  ``lax.switch``; only disjoint, wholly active slices enter a dot, so no padding
+  arithmetic is spent.  The price is device control flow: a parent ``scan``,
+  a ``while_loop`` over the pieces and a ``cond`` per piece, every trip a
+  host-driven step of the XLA GPU runtime.
+- ``"masked"`` (:func:`masked_local_matmul`): ONE batched dot over the whole
+  storage axis, inactive columns of ``a diag(w)`` and rows of ``b`` *selected*
+  to zero first (``where``, never a multiply, so NaN/Inf in inactive storage
+  never enters arithmetic).  No control flow; it spends the inactive columns'
+  FLOPs and two operand-sized temporaries.  Equal to the interval route up to
+  the dot's summation order (the added terms are exact zeros).
+
+:data:`ACTIVE_LOCAL_ROUTE` picks one per leg.
 """
 import jax
 import jax.numpy as jnp
+
+
+#: Active-range local GEMM implementation by ``lxkit`` leg key -- a backend
+#: preference of this service (as ``subspace.SUBSPACE_ROUTE``), so it lives here
+#: and not in ``lxkit.LEGS``.  ``"native"``: the ``lorrax_cublas_local_*``
+#: handlers (``_active_local_cuda``); ``"interval"``: :func:`active_local_matmul`;
+#: ``"masked"``: :func:`masked_local_matmul`.  A vendor with no row takes
+#: ``"interval"``.  ROCM: ``"masked"`` -- on MI250X (ROCm 7.14.1, JAX 0.9.1)
+#: every XLA ``while``/``cond`` trip costs ~36 us of host-driven launches and
+#: copies (command buffers off or forced: no better), and the interval route's
+#: ~64 x (3-6) trips per call made Sigma's tau windows 68 s vs 7.5 s on A100
+#: (Fe 4x4x4, n_mu 312, P=4; GPU idle 77% of the trace).
+ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "masked"}
+
+
+def active_local_route(platform):
+    """The active-range route for an FFI platform key (``resolve.mesh_platform``)."""
+    return ACTIVE_LOCAL_ROUTE.get(platform, "interval")
+
+
+def masked_local_matmul(a, b, bounds, weights, c=None, *, alpha, beta):
+    """:func:`active_local_matmul`'s contract as one masked batched dot.
+
+    ``a`` ``(nq,m,k)``, ``b`` ``(nq,k,n)``, ``weights`` ``(nq,k)``, int ``bounds``
+    ``(nq,2)``.  Columns outside ``[lo, hi)`` are selected to zero in
+    ``a diag(w)`` and in ``b`` before the dot; an empty interval gives zeros.
+    Invalid dynamic bounds produce an all-NaN output, as the interval route.
+    """
+    k = a.shape[-1]
+    lo, hi = bounds[:, 0], bounds[:, 1]
+    valid = jnp.all((lo >= 0) & (lo <= hi) & (hi <= k))
+    column = jnp.arange(k, dtype=bounds.dtype)
+    live = (column >= lo[:, None]) & (column < hi[:, None])          # (nq, k)
+    zero = jnp.zeros((), a.dtype)
+    left = jnp.where(live[:, None, :], a * weights[:, None, :].astype(a.dtype), zero)
+    right = jnp.where(live[:, :, None], b, zero)
+    result = (alpha if a.dtype.kind == 'c' else alpha.real) * jnp.matmul(left, right)
+    if beta != 0:
+        result = result + (beta if a.dtype.kind == 'c' else beta.real) * c
+    return jnp.where(valid, result, jnp.full((), jnp.nan, a.dtype))
+
+
+def local_active_impl(platform):
+    """The XLA implementation behind a non-native route (``"interval"`` | ``"masked"``)."""
+    return masked_local_matmul if active_local_route(platform) == "masked" else active_local_matmul
 
 
 def _interval_product(a, b, weights, lo, hi):

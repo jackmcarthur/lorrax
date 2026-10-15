@@ -87,8 +87,11 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         note="Opt-in dial (LORRAX_BANDS_GEMM_FFI); tolerance not declared in code yet."),
     "cublas_local": Family(
         ("lorrax_cublas_local_",), "cublas",
-        _legs(("built", ""), ("xla", "distrib_la._active_local"), ("xla", "distrib_la._active_local")),
-        note="Sigma's active-range GEMM; same-device XLA gate owed."),
+        _legs(("built", ""), ("xla", "distrib_la._active_local (masked: ACTIVE_LOCAL_ROUTE)"),
+              ("xla", "distrib_la._active_local (interval: ACTIVE_LOCAL_ROUTE)")),
+        gate="tests/test_active_local_routes.py (masked vs interval vs dense, CPU)", tol=1e-13,
+        note="Sigma's active-range GEMM. ROCM takes the masked route (one batched dot, no device "
+             "control flow); the interval route's while/cond trips are launch-bound there."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",
         _legs(("built", ""), ("host", "distrib_la.subspace pure_callback (LAPACK)"),

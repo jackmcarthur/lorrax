@@ -152,13 +152,14 @@ def _panel_contraction(mesh, active=True):
                 return _native_out(left, right, bounds, alpha=one)
             return _native(left, right, bounds, c, alpha=one, beta=one)
     else:
-        from ._active_local import active_local_matmul
+        from ._active_local import local_active_impl
+        active_impl = local_active_impl(mesh_platform(mesh))
 
         def contract(left, right, bounds, c):
             if bounds is None:
                 return c + left @ right
             weights = jnp.ones(left.shape[::2], left.dtype)
-            return active_local_matmul(left, right, bounds, weights, c, alpha=one,
+            return active_impl(left, right, bounds, weights, c, alpha=one,
                                        beta=np.complex128(0.0) if c is None else one)
     return contract
 
