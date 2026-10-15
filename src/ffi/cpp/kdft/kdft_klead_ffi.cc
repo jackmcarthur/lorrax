@@ -17,10 +17,10 @@
 // one source would build into the CUDA leg as well; CMake lists it in the ROCM leg, where
 // there is no cuFFTDx.
 //
-// Images: one per (pass mode, group, W, threads, precision, device architecture), compiled once
-// per process and disk-cached in the router's cubin_dir as
-// kdft_<conv|fft>_<gx>x<gy>x<gz>_w<W>t<NT>[_c64]_<arch>_<key><ext> with the common key rule.  A
-// refusal names its GATE.
+// Images: one per (pass mode, kernel, group, W, threads, precision, device architecture),
+// compiled once per process and disk-cached in the router's cubin_dir as
+// kdft_<conv|fft|mconv>_<gx>x<gy>x<gz>_w<W>t<NT>[_r|_rh][_c64]_<arch>_<key><ext> with the common
+// key rule (_r: the register kernel, _rh: with the half exchange).  A refusal names its GATE.
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -35,11 +35,13 @@
 #include "../common/gpu_runtime.h"
 #include "../common/rtc_build.h"
 #include "generated/kdft_klead_src.h"
-#include "kdft_klead_plan.h"
+#include "kdft_klead_ffi.h"
 
 namespace lorrax_ffi::kdft {
 
 using ::kdft::Pass;
+
+static const char* mode_tag(int mode) { return mode == 2 ? "conv" : mode == 4 ? "mconv" : "fft"; }
 
 static ffi::Error fail(const char* gate, const std::string& why,
                        ffi::ErrorCode code = ffi::ErrorCode::kInternal) {
@@ -50,15 +52,16 @@ static std::string grid_str(int64_t a, int64_t b, int64_t c) {
     return std::to_string(a) + "x" + std::to_string(b) + "x" + std::to_string(c);
 }
 
-using Key = std::tuple<int, int, int, int, int, int, int, int>;   // dev, mode, gx, gy, gz, w, nt, f32
+// dev, mode, gx, gy, gz, w, nt, f32, reg*2 + xh
+using Key = std::tuple<int, int, int, int, int, int, int, int, int>;
 static std::mutex g_mu;
 static std::map<Key, rtc::Function> g_cache;
 static std::map<Key, std::string> g_fail;
 
-static ffi::Error build(const Pass& p, bool f32, std::string_view cache_dir, rtc::Function* out) {
+ffi::Error build_pass(const Pass& p, bool f32, std::string_view cache_dir, rtc::Function* out) {
     int dev = 0;
     LORRAX_GPU_CHECK(lrx::gpu::get_device(&dev));
-    const Key key{dev, p.mode, p.g[0], p.g[1], p.g[2], p.w, p.nt, f32 ? 1 : 0};
+    const Key key{dev, p.mode, p.g[0], p.g[1], p.g[2], p.w, p.nt, f32 ? 1 : 0, p.reg * 2 + p.xh};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kdft-build", "(cached failure) " + it->second);
@@ -74,14 +77,16 @@ static ffi::Error build(const Pass& p, bool f32, std::string_view cache_dir, rtc
                  "-DLRX_GX=" + std::to_string(p.g[0]), "-DLRX_GY=" + std::to_string(p.g[1]),
                  "-DLRX_GZ=" + std::to_string(p.g[2]), "-DLRX_W=" + std::to_string(p.w),
                  "-DLRX_NT=" + std::to_string(p.nt), "-DLRX_MODE=" + std::to_string(p.mode),
+                 "-DLRX_REG=" + std::to_string(p.reg), "-DLRX_XH=" + std::to_string(p.xh),
                  std::string("-DLRX_F32=") + (f32 ? "1" : "0")};
     const std::string key_hex = rtc::hex16(rtc::key(prog, nullptr));
     const std::string dir(cache_dir);
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
-        name << dir << "/kdft_" << (p.mode == 2 ? "conv" : "fft") << "_" << grid_str(p.g[0], p.g[1], p.g[2])
-             << "_w" << p.w << "t" << p.nt << (f32 ? "_c64" : "") << "_" << rtc::arch_tag(arch) << "_"
+        name << dir << "/kdft_" << mode_tag(p.mode) << "_" << grid_str(p.g[0], p.g[1], p.g[2])
+             << "_w" << p.w << "t" << p.nt << (p.reg ? (p.xh ? "_rh" : "_r") : "") << (f32 ? "_c64" : "")
+             << "_" << rtc::arch_tag(arch) << "_"
              << key_hex << rtc::kImageExt;
         path = name.str();
     }
@@ -92,10 +97,10 @@ static ffi::Error build(const Pass& p, bool f32, std::string_view cache_dir, rtc
         return fail("kdft-build", where + " -- " + err);
     }
     if (!img.from_disk)
-        std::fprintf(stderr, "[kconv_kdft] " LRX_RTC_API " %s %s%s group=(%d,%d,%d) %s W=%d NT=%d in %.1f ms%s\n",
-                     img.rebuilt_bad ? "rebuilt (cached image refused)" : "built",
-                     p.mode == 2 ? "conv" : "fft", f32 ? " c64" : "", p.g[0], p.g[1], p.g[2], arch.c_str(),
-                     p.w, p.nt, img.ms, img.stored ? " (stored)" : "");
+        std::fprintf(stderr, "[kconv_kdft] " LRX_RTC_API " %s %s%s%s group=(%d,%d,%d) %s W=%d NT=%d in %.1f ms%s\n",
+                     img.rebuilt_bad ? "rebuilt (cached image refused)" : "built", mode_tag(p.mode),
+                     p.reg ? (p.xh ? " reg/half" : " reg") : "", f32 ? " c64" : "", p.g[0], p.g[1], p.g[2],
+                     arch.c_str(), p.w, p.nt, img.ms, img.stored ? " (stored)" : "");
     g_cache.emplace(key, img.fn);
     *out = img.fn;
     return ffi::Error::Success();
@@ -147,7 +152,7 @@ static ffi::Error launch(lrx::gpu::Stream stream, int mode, ffi::AnyBuffer X, co
                     " KiB of LDS", ffi::ErrorCode::kInvalidArgument);
     std::vector<rtc::Function> fns(passes.size());
     for (size_t i = 0; i < passes.size(); ++i)
-        FFI_RETURN_IF_ERROR(build(passes[i], f32, cache_dir, &fns[i]));
+        FFI_RETURN_IF_ERROR(build_pass(passes[i], f32, cache_dir, &fns[i]));
 
     void* t = Y->untyped_data();
     if (t != X.untyped_data())                                  // not aliased: work on the result
@@ -165,8 +170,10 @@ static ffi::Error launch(lrx::gpu::Stream stream, int mode, ffi::AnyBuffer X, co
         int fwd = p.forward;
         double scale64 = scaled ? scale : 1.0;
         float scale32 = static_cast<float>(scale64);
+        long long kob = 1;
+        int m0 = 1, m1 = 1;
         void* args[] = {&t, &v, &inner, &ntile, &mx, &nb, &my,
-                        f32 ? static_cast<void*>(&scale32) : static_cast<void*>(&scale64), &fwd};
+                        f32 ? static_cast<void*>(&scale32) : static_cast<void*>(&scale64), &fwd, &kob, &m0, &m1};
         const rtc::Result r = rtc::driver_api().LaunchKernel(
             fns[i], static_cast<unsigned>(blocks), 1, 1, static_cast<unsigned>(p.nt), 1, 1, 0,
             reinterpret_cast<rtc::Stream>(stream), args, nullptr);

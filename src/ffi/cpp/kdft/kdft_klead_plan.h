@@ -7,6 +7,12 @@
 // convolution pass, and the leading groups' forward passes: 2*(groups-1)+1 HBM round trips.
 // The plan is the feasible grouping of least summed pass_cost (below), so a grid may take more
 // passes when they stream faster (8x8x8 mode 3: two passes, 2.89 ms, against one, 3.89 ms).
+//
+// The convolution pass takes the REGISTER kernel (kdft_klead_kernel.h LRX_REG) when every group
+// axis is reg_ok (kdft_plan.h): lines in VGPRs, LDS only for the axis exchange, so its block
+// needs G*W complex (or half, LRX_XH) instead of the Stockham tile plus a barrier pair per
+// stage (reg_tile below).  The k-minor split arm
+// (kdft_kminor_plan.h) reuses tile_width / reg_tile for its column passes.
 #pragma once
 
 #include <array>
@@ -38,7 +44,8 @@ struct Pass {
     long long outer = 1;             // O
     long long inner_k = 1;           // I / ncols
     int w = 0, nt = 0;
-    int mode = 3;                    // 2: the convolution pass; 3: a transform pass
+    int reg = 0, xh = 0;             // the register kernel; its half (real, imag) exchange
+    int mode = 3;                    // 2: the convolution pass; 3: a transform pass; 4: k-minor conv
     int forward = 0;                 // a mode-3 pass's direction
     double cost = 0;                 // pass_cost of its tile
 };
@@ -60,15 +67,23 @@ inline bool has_long_radix(int n) {
 // Inner indices per block for a group (0: one column does not fit the LDS), and its cost.  A
 // group with a long radix takes the widest tile that fits: its stage needs lines, not occupancy
 // (97x97x1: 18.4 ms at W = 32 against 42 ms at W = 8 per mode-2 call).
-inline int tile_width(const std::array<int, 3>& g, long long cbytes, double* cost) {
+// Columns per block are capped at the power of two covering the inner extent (a k-minor column
+// pass, whose inner extent is a product of k axes, may have fewer than kWMax).
+inline int width_cap(long long inner) {
+    int c = 1;
+    while (c < kWMax && c < inner) c *= 2;
+    return c;
+}
+inline int tile_width(const std::array<int, 3>& g, long long cbytes, double* cost, long long inner = kWMax) {
     const long long G = 1LL * g[0] * g[1] * g[2];
     const long long tws = g[0] + g[1] + g[2];
     const bool wide = has_long_radix(g[0]) || has_long_radix(g[1]) || has_long_radix(g[2]);
+    const int cap = width_cap(inner);
     int best = 0;
     double best_cost = 0;
-    for (int w = 1; w <= kWMax; w *= 2) {
+    for (int w = 1; w <= cap; w *= 2) {
         if ((G * w + tws) * cbytes > kLdsMax) break;
-        const double c = pass_cost(w, G * w * cbytes);
+        const double c = pass_cost(w < inner ? w : static_cast<int>(inner), G * w * cbytes);
         if (wide || best == 0 || c <= best_cost * kWiderSlack) { best = w; best_cost = c; }
     }
     *cost = best_cost;
@@ -87,6 +102,51 @@ inline int tile_threads(const std::array<int, 3>& g, int w) {
         }
     const long long nt = (items + 63) / 64 * 64;
     return static_cast<int>(nt < kThreadsMax ? nt : kThreadsMax);
+}
+
+// The register kernel's tile for a group (false: not eligible, the LDS kernel serves it).  The
+// block holds the exchange buffer only, so W is the widest power of two whose HALF (real, then
+// imaginary) exchange, G*W real, fits kRegLds (one block's LDS) with W >= 4; else the full
+// exchange at W >= 8 (a one-axis group exchanges nothing: W = the cap).  Threads: one per line of
+// the busiest axis (whole wavefronts, <= kThreadsMax), each holding at most kRegHold points.
+// Measured on one MI250X GCD, mode 2, ~1 GB c128 operands, per call (pool logs kcore_tune1,
+// kcore_tune2): the half exchange at twice the width beats the full one at 64 KiB (8x8x1 3.17 ->
+// 2.68 ms, 8x8x8 3.27 -> 2.48, 12^3 6.96 -> 6.21, 20^3 7.20 -> 6.09, 16^3 6.09 -> 5.91), and a
+// 64 KiB block beats two 32 KiB blocks per CU (6x6x6 4.67 -> 3.47, 32x32x10 9.68 -> 7.24): the
+// in-register line DFT leaves a block few barriers to wait on, so wide column tiles (long HBM
+// rows) matter more than a second resident block.
+constexpr long long kRegLds = 64 * 1024;
+constexpr int kRegHold = 32;
+inline bool reg_tile(const std::array<int, 3>& g, long long cbytes, long long inner, Pass* p) {
+    int na = 0;
+    for (int n : g)
+        if (n > 1) { ++na; if (!reg_ok(n)) return false; }
+    const long long G = 1LL * g[0] * g[1] * g[2];
+    const int cap = width_cap(inner);
+    auto threads = [&](int w, int* nt) {
+        long long lmax = 0;
+        for (int n : g)
+            if (n > 1 || na == 0) { const long long l = G / n * w; if (l > lmax) lmax = l; }
+        long long t = (lmax + 63) / 64 * 64;
+        if (t > kThreadsMax) t = kThreadsMax;
+        for (int n : g)
+            if ((n > 1 || na == 0) && (G / n * w + t - 1) / t * n > kRegHold) return false;
+        *nt = static_cast<int>(t);
+        return true;
+    };
+    for (int xh : {1, 0}) {
+        const int wmin = (xh ? 4 : 8) < cap ? (xh ? 4 : 8) : cap;
+        for (int w = cap; w >= wmin; w /= 2) {
+            const long long lds = na >= 2 ? G * w * cbytes / (xh ? 2 : 1) : 0;   // no twiddle table
+            int nt = 0;
+            if (lds > kRegLds || !threads(w, &nt)) continue;
+            if (na < 2 && xh) break;                             // no exchange: the full form
+            p->w = w; p->nt = nt; p->reg = 1; p->xh = xh;
+            p->cost = pass_cost(w < inner ? w : static_cast<int>(inner), lds);
+            return true;
+        }
+    }
+    return false;
 }
 
 // The passes of one call, in launch order; empty when no grouping fits the LDS.
@@ -119,7 +179,10 @@ inline std::vector<Pass> plan_passes(int nkx, int nky, int nkz, int mode, int fo
             const int n = static_cast<int>(groups.size());
             for (int i = 0; i < n - 1; ++i)
                 if (!unit(groups[i])) { Pass p = groups[i]; p.mode = 3; p.forward = 0; seq.push_back(p); }
-            Pass mid = groups[n - 1]; mid.mode = 2; seq.push_back(mid);
+            Pass mid = groups[n - 1]; mid.mode = 2;
+            Pass rg = mid;
+            if (reg_tile(rg.g, cbytes, rg.inner_k * kWMax, &rg)) mid = rg;   // I = inner_k*ncols, wide
+            seq.push_back(mid);
             for (int i = n - 2; i >= 0; --i)
                 if (!unit(groups[i])) { Pass p = groups[i]; p.mode = 3; p.forward = 1; seq.push_back(p); }
         } else {
