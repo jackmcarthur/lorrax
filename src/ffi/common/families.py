@@ -94,10 +94,11 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "control flow); the interval route's while/cond trips are launch-bound there."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",
-        _legs(("built", ""), ("host", "distrib_la.subspace pure_callback (LAPACK)"),
+        _legs(("built", ""), ("xla", "distrib_la.subspace XlaSubspacePlan (SUBSPACE_ROUTE)"),
               ("host", "distrib_la.subspace pure_callback (LAPACK)")),
-        note="ROCm: 1.5-2.1 s per BSE solve on the host and uncacheable jit_solve "
-             "(wave-1); the Subspace lane owns the device plan."),
+        note="Provider per leg: distrib_la.subspace.SUBSPACE_ROUTE.  ROCM takes the XLA plan "
+             "(device products + eigh_local); the host route cost 1.5-2.1 s per BSE solve "
+             "and made jit_solve uncacheable."),
     "cusolvermp": Family(
         ("lorrax_cusolvermp_",), "cusolvermp",
         _legs(("built", ""), ("elsewhere", "slate (distrib_la.resolve eigh/ROCM row)"),
