@@ -16,8 +16,10 @@ rows go straight into the carry.  So
   (:func:`orbit_cuts`), so the kconv call's typed unfold reads only the pass's
   own rows;
 - the node-to-output weights act in chunks of nodes through the in-place
-  block accumulator (``gw.contour_accumulator.contour_block_accumulate_local``); its
-  terms add in order, so a chunk gives the bytes of one accumulate per node;
+  block accumulator (``gw.contour_accumulator.contour_block_accumulate_local``): one
+  read-modify-write per node (its sets together) of the live outputs only (the
+  prefix before the last nonzero weight row) and of the chunk's live nodes only;
+  its terms add in order, so a chunk gives the bytes of one accumulate per node;
 - a node may return several planes, each landing in its own block of the
   carry (:class:`Block`): the four-current stream's channel planes of one
   family pair go to their blocks of the packed photon layout.
@@ -355,6 +357,12 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, prepare, only
     n_chunks_cap = -(-n_cap // chunk)
     weights = jnp.pad(weights, ((0, 0), (0, 0), (0, n_chunks_cap * chunk - n_cap)))
     n_chunks = ((count + chunk - 1) // chunk).astype(jnp.int32)
+    # The live output prefix: a bank group's padded member slots carry zero
+    # weights on every node, so the accumulate touches only the outputs before
+    # the last one with a weight (``contour_block_accumulate_local``'s ``outputs``).
+    n_out = int(weights.shape[1])
+    live_outputs = jnp.max(jnp.where(jnp.any(weights != 0, axis=(0, 2)),
+                                     jnp.arange(1, n_out + 1, dtype=jnp.int32), 0)).astype(jnp.int32)
     spec_c = P(None, None, "x", "y")
     table = jnp.asarray(np.asarray(plan.windows, np.int32))
 
@@ -368,8 +376,8 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, prepare, only
             return jax.lax.with_sharding_constraint(jnp.zeros(shape.shape, shape.dtype),
                                                     NamedSharding(mesh, P(None, None, None, "x", "y")))
 
-        def block_add(acc, rows, projection, block):
-            def local(a, r, w):
+        def block_add(acc, rows, projection, block, live_terms):
+            def local(a, r, w, t, o):
                 if block.extents is None:
                     valid = jnp.asarray([R, a.shape[3]], jnp.int32)
                 else:
@@ -379,9 +387,11 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, prepare, only
                         jnp.clip(la - jax.lax.axis_index("x") * wa - row0, 0, R),
                         jnp.clip(lb - jax.lax.axis_index("y") * wb, 0, wb))).astype(jnp.int32)
                 return contour_block_accumulate_local(a, r, w, valid, m0=block.m0 + s,
-                                                      n0=block.n0)
-            return jax.shard_map(local, mesh=mesh, in_specs=(spec_c, spec_c, P()),
-                                 out_specs=spec_c, check_vma=False)(acc, rows, projection)
+                                                      n0=block.n0, sets=n_sets, terms=t,
+                                                      outputs=o)
+            return jax.shard_map(local, mesh=mesh, in_specs=(spec_c, spec_c, P(), P(), P()),
+                                 out_specs=spec_c, check_vma=False)(
+                acc, rows, projection, live_terms, live_outputs)
 
         def chunk_body(state):
             c, acc = state
@@ -395,9 +405,12 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, prepare, only
             w = jax.lax.optimization_barrier(
                 jax.lax.dynamic_slice_in_dim(weights, c * chunk, chunk, axis=2))
             projection = jnp.transpose(w, (2, 0, 1)).reshape(n_sets * chunk, -1)
+            # A node's sets in one read-modify-write; the chunk's nodes past
+            # ``count`` add nothing (their rows are the skipped zeros).
+            live_terms = (n_sets * jnp.clip(count - c * chunk, 0, chunk)).astype(jnp.int32)
             for b, block in enumerate(blocks):
                 plane = rows[:, b].reshape((n_sets * chunk,) + rows.shape[3:])
-                acc = block_add(acc, plane, projection, block)
+                acc = block_add(acc, plane, projection, block, live_terms)
             return c + 1, acc
 
         _, acc = jax.lax.while_loop(lambda st: st[0] < n_chunks, chunk_body,
