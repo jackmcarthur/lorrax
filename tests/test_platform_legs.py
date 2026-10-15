@@ -258,3 +258,16 @@ def test_the_family_table_matches_the_loaders_routers_and_build():
     # The one cufft/ file the leg reads: the k-box stage's text (leg-neutral; its line transform is
     # the leg's policy), embedded for hipRTC as the CUDA leg embeds it for NVRTC.
     assert set(re.findall(r"cufft/[\w.]+", block)) <= {"cufft/kbox_stage.cuh", "cufft/kbox_stage_src.h.in"}
+
+
+def test_the_active_subspace_row_states_the_subspace_route():
+    """The 'active_subspace' family row agrees with its owner, distrib_la.subspace.SUBSPACE_ROUTE
+    (native -> built, xla -> xla, host -> host), read from source so the cell needs no jax."""
+    import ast
+    from ffi.common import families as fam
+    src = open(os.path.join(_REPO, "services", "distrib_la", "src", "distrib_la", "subspace.py")).read()
+    route = next(ast.literal_eval(n.value) for n in ast.parse(src).body
+                 if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "SUBSPACE_ROUTE")
+    assert set(route) == set(legs.LEGS)
+    for leg, provider in route.items():
+        assert fam.state("active_subspace", leg)[0] == {"native": "built"}.get(provider, provider), leg

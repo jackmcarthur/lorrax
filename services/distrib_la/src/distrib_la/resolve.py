@@ -147,9 +147,12 @@ CHOLESKY_BACKENDS = BACKEND_CHOICES["cholesky"]
 LU_BACKENDS = BACKEND_CHOICES["solve_lu"]
 
 #: Device vendor → the FFI platform key this package speaks: lxkit's one
-#: map (``cuda`` → ``CUDA``, ``cpu``), with ``rocm`` passing through unmapped.
-#: The vendor is read from the device client (:func:`lxkit.device_vendor`).
-#: ROCm is a declared-untested tier: LORRAX builds no ROCm ``.so``.
+#: map, one entry per leg of ``lxkit.LEGS`` (``cuda`` → ``CUDA``, ``rocm`` →
+#: ``ROCM``, ``cpu``); a vendor with no leg passes through unmapped.  The
+#: vendor is read from the device client (:func:`lxkit.device_vendor`).  The
+#: ROCM leg has its own library (``LORRAX_FFI_ROCM_SO``,
+#: ``config/frontier/build_ffi_rocm.sh``); which of this package's targets it
+#: registers is :data:`_IMPL` below and ``ffi.common.families``.
 FFI_PLATFORMS = FFI_PLATFORM_MAP
 
 #: ``distributed`` → the platform's permanent default distributed backend.
@@ -159,8 +162,9 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 #: ScaLAPACK's routines on the same library and MPI context are clean, so
 #: there is no configuration in which slate is the right CPU eigh.  On
 #: **CUDA** it is cuSOLVERMp, the only library there with a distributed
-#: syevd.  On **ROCM** it is SLATE, which is the only one of the three that
-#: builds for ROCm at all — declared-untested.
+#: syevd.  On **ROCM** it is SLATE (gpu_backend=hip), the only one of the
+#: three that builds for ROCm; eigh/potrf are gated against the native route
+#: on MI250X at P=4 (``ffi.common.families`` 'slate' row).
 #:
 #: ``('solve_lu', 'ROCM')`` is SLATE too: ``slate::getrf`` (PartialPiv,
 #: Target::Devices) + ``slate::getrs`` (cpp/slate/batched_solve_lu_ffi.cc),
