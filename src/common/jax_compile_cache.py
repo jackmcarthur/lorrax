@@ -826,6 +826,7 @@ def _install_compile_counter() -> None:
     _orig = getattr(_compiler, _COMPILE_ENTRY_POINT)
     _orig_request = getattr(_compiler, _COMPILE_REQUEST_POINT)
 
+    @functools.wraps(_orig_request)
     def _requested(*args, **kwargs):
         s = _STATE
         if not (s.compile_agreement_enabled or s._pool is not None):
@@ -888,6 +889,7 @@ def _install_compile_counter() -> None:
                  f"({seconds:.1f} s); JAX's persistent cache never stores it, so it "
                  f"compiles again in every process")
 
+    @functools.wraps(_orig)
     def _counting(*args, **kwargs):
         current = getattr(_STATE._compile_local, "current", None)
         if _STATE.compile_agreement_enabled and current is not None:
