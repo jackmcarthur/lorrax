@@ -108,6 +108,10 @@ class PlatformLeg:
     outside_pool_api: str = ""
     #: whole-device used-memory sampler in runtime.xla_memory ("" = none).
     memory_telemetry: str = ""
+    #: ``(env, value)`` pairs: process-environment defaults of the leg's
+    #: runtime libraries, ``setdefault`` by ``runtime.set_default_env`` before
+    #: the backend starts (a caller's export wins).  () = none.
+    runtime_env_defaults: tuple = ()
     #: collective library of the leg's XLA collectives; the section of
     #: ``config/<site>/site.toml`` that runtime.network_env applies ("" = none).
     collective_library: str = ""
@@ -213,6 +217,17 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # (1D 1009 x 4096, workSize 65.5 kB) gave no reading: the peak did not
         # rise past an earlier one.  MI250X, Runtime-LEGS lane 2026-10-15.
         fft_plan_scratch="hipfft",
+        # HSA scratch reclaim off.  With ROCr's default every RCCL collective
+        # costs ~200 us of DEVICE time on MI250X (1 KB ppermute / all-gather /
+        # psum in an in-graph chain at P4, not hidden behind a 2 ms ZGEMM),
+        # unchanged by NCCL_PROTO, channel counts, SDMA, kernarg placement,
+        # launch mode, MSCCL, command buffers or async collectives; with
+        # HSA_NO_SCRATCH_RECLAIM=1 it is 9-29 us, and 16 MB ppermute 29 -> 40
+        # GB/s, intra-package all-gather 26 -> 59 GB/s bus bandwidth.  Fe V2 P4
+        # (10 879 + 3 301 collectives): bank sample_dyson 4.86 -> 3.03 s, Sigma
+        # tau 9.61 -> 9.16 s, eqp1 identical (comm lane 2026-10-15; pool logs
+        # comm_var2, comm_fe_base, comm_fe_nsr).  CUDA declares none.
+        runtime_env_defaults=(("HSA_NO_SCRATCH_RECLAIM", "1"),),
         outside_pool_api="hip_runtime_arena",
         # In process: amd-smi takes 1.0 s a sample and rocm-smi 0.45 s, and both
         # number all eight GCDs, not the one ROCR_VISIBLE_DEVICES leaves visible.

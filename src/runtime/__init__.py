@@ -757,6 +757,11 @@ def set_default_env(*, platform: str = "gpu") -> None:
     _check_allocator_env()
     if platform == "gpu":
         set_default_gpu_pool()
+        # The leg's runtime-library env (lxkit.LEGS runtime_env_defaults):
+        # read by ROCr/HIP at backend start, so it must precede it.
+        leg = _gpu_leg()
+        for name, value in (leg.runtime_env_defaults if leg is not None else ()):
+            os.environ.setdefault(name, value)
     tune_glibc_malloc()
     skip_gpu_plugin_discovery()
     resolved_platforms = os.environ.get("JAX_PLATFORMS", "")
