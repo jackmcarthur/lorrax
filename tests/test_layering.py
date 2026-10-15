@@ -114,6 +114,9 @@ _L3_MODULES = frozenset({
     "runtime.source_closure",
     # stdlib-only site network policy resolved before backend initialization
     "runtime.network_env",
+    # the leg's vendor first-use policy (kernel stores, BLAS warm-up), armed
+    # by runtime step 7b; it imports jax and lxkit only
+    "runtime.vendor_kernels",
     # ``runtime.env_flags`` — THE boolean-env grammar, and its level is the
     # whole reason it is here rather than in ``gw.gw_config``.  The parsers
     # that still swallowed an unrecognised token silently

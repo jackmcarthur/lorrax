@@ -23,10 +23,16 @@ differs between legs and that more than one service needs lives in
   total memory through.  Each is a *declaration*; ``runtime`` implements it;
 * ``runtime_kernel_caches``: the leg's vendor libraries that compile device
   kernels at run time and keep them across processes only where a variable
-  points (rocFFT's hipRTC kernels, ``ROCFFT_RTC_CACHE_PATH``; AMD comgr's
-  code-object cache, ``AMD_COMGR_CACHE_DIR``, default ``~/.cache/comgr``).
-  :mod:`common.jax_compile_cache` points each beside the persistent compile
-  cache (Precursors lane, 2026-10-14);
+  points (AMD comgr's code-object cache, ``AMD_COMGR_CACHE_DIR``, default
+  ``~/.cache/comgr``).  :mod:`common.jax_compile_cache` points each beside
+  the persistent compile cache (Precursors lane, 2026-10-14);
+* ``runtime_kernel_stores``: the vendor kernel caches that are keyed by their
+  own content and so outlive the compile-cache namespace, like LORRAX's own
+  kconv image store (rocFFT's hipRTC kernels: a read-only snapshot through
+  ``ROCFFT_RTC_SYS_CACHE_PATH``, new kernels through ``ROCFFT_RTC_CACHE_PATH``),
+  and ``blas_host_warmup``: the dtypes whose first GEMM loads the BLAS
+  library's kernel tables on the host (rocBLAS/Tensile).
+  :mod:`runtime.vendor_kernels` implements both (Cold-start lane, 2026-10-15);
 * the vendor facts the memory model, the network policy and the profiler
   guard implement (owner ``runtime``; Runtime-LEGS lane, 2026-10-15):
   ``fft_plan_scratch`` (whose plan-workspace query prices the FFT scratch
@@ -86,6 +92,15 @@ class PlatformLeg:
     #: ``(env, name, scope)``: run-time-compiled vendor kernels; scope
     #: ``"process-file"`` (one file per process) or ``"shared-dir"``.
     runtime_kernel_caches: tuple = ()
+    #: ``(writer_env, reader_env, name)``: a content-keyed vendor kernel store
+    #: in ``lxkit.user_cache_dir(name)``; the library reads the snapshot named
+    #: by ``reader_env`` and writes new kernels to one file per process named
+    #: by ``writer_env``, which ``runtime.vendor_kernels`` folds in at exit.
+    runtime_kernel_stores: tuple = ()
+    #: dtypes of one 8x8 GEMM each, compiled at runtime start-up and run on a
+    #: helper thread so the BLAS library's host initialisation overlaps the
+    #: driver's imports (() = none).
+    blas_host_warmup: tuple = ()
     #: plan-workspace query in runtime.aot_memory (``"cufft"`` | ``"hipfft"``);
     #: "" = the leg's FFTs take no plan scratch outside buffer assignment.
     fft_plan_scratch: str = ""
@@ -172,13 +187,25 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # cuda_async refused at client creation (MI250X, jax 0.9.1).
         xla_allocators=("default", "platform", "bfc"),
         device_memory_api="hip_runtime",
-        # rocFFT compiles each new FFT length with hipRTC (MI250X: 1.9-7.6 s
-        # per length per process, 0.02-0.04 s from its cache); cuFFT ships its
-        # kernels, so CUDA has none.  One SQLite file per process: several
-        # writers on one file on Lustre spin.  comgr's cache (~590 MB after one
-        # hsuite) would otherwise grow in HOME.
-        runtime_kernel_caches=(("ROCFFT_RTC_CACHE_PATH", "rocfft_kernel_cache", "process-file"),
-                               ("AMD_COMGR_CACHE_DIR", "comgr", "shared-dir")),
+        # comgr's cache (~590 MB after one hsuite) would otherwise grow in HOME.
+        runtime_kernel_caches=(("AMD_COMGR_CACHE_DIR", "comgr", "shared-dir"),),
+        # rocFFT compiles each new FFT kernel with hipRTC and the pip wheel
+        # ships no system kernel cache; cuFFT ships its kernels, so CUDA has
+        # none.  hsuite kmeans..dipole builds 16 kernels per process, 10.0 s of
+        # the cold kmeans wall (rho_from_wfns, py-spy, P4); from the store the
+        # first FFT of a length costs 0.02-0.04 s.  The kernels are keyed by
+        # name, arch, HIP version and generator checksum, so they outlive a
+        # compile-cache namespace.  New kernels go to one SQLite file per
+        # process (several writers on one file on Lustre spin) and are folded
+        # into the read-only snapshot at exit (Cold-start lane, 2026-10-15).
+        runtime_kernel_stores=(("ROCFFT_RTC_CACHE_PATH", "ROCFFT_RTC_SYS_CACHE_PATH", "rocfft"),),
+        # rocBLAS loads its Tensile tables on a process's first GEMM: 2.84 s
+        # for an 8x8 dgemm, then 0.055 s for the first zgemm, then 0.001 s
+        # (MI250X, autotune 0, P1 probe).  In the hsuite kmeans timeline that
+        # first GEMM comes ~3 s after the communicator warm-up, all of it
+        # driver imports, so a helper thread hides it (Cold-start lane,
+        # 2026-10-15).  cuBLAS ships no such table load: CUDA declares none.
+        blas_host_warmup=("float64", "complex128"),
         # XLA's ROCm FFT thunk takes the hipFFT plan workspace from the BFC
         # arena: on the seven c128 3D boxes probed the arena peak rose by
         # exactly hipfftMakePlanMany's workSize (23.3-131.1 MB, one copy of

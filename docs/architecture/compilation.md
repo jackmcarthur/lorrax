@@ -171,19 +171,30 @@ compile is not a ROCm-specific cost; the persistent cache removes it there
 as on CUDA (keys are rank-invariant on ROCm too: JAX reports
 `backend.platform == "gpu"` and strips the device assignment).
 
-**Vendor run-time kernels (ROCm).** Two ROCm libraries compile device code
-at run time, outside XLA and outside JAX's cache: rocFFT builds each new FFT
-length with hipRTC (1.9–7.6 s per length per process on MI250X), and AMD
-comgr keeps the code objects behind it. The leg declares both
-(`PlatformLeg.runtime_kernel_caches`), and `common.jax_compile_cache` points
-them under `<cache>/vendor/` (beside `np<P>`; the kernels do not depend on P) when it arms the persistent cache: rocFFT
-one SQLite file per process (shared writers on Lustre spin), comgr one shared
-directory (otherwise ~590 MB in HOME). From the cache the first FFT of a
-length costs 0.02–0.04 s (Precursors lane, 2026-10-14). Not cached by
-anything: rocBLAS/Tensile initialisation, about 2.8 s on a process's first
-GEMM whatever the autotune level (3.06 s at both levels in the runtime lane's
-GEMM probe), and runtime start-up (`initialize_communicator_stack`,
-5.3–5.9 s per process).
+**Vendor run-time kernels (ROCm).** Two ROCm libraries compile or load
+device code at run time, outside XLA and outside JAX's cache; the leg declares
+both and `runtime.vendor_kernels` implements them (CUDA and the host declare
+none). rocFFT builds each new FFT kernel with hipRTC (1.9–7.6 s per length per
+process on MI250X; the pip wheel ships no system kernel cache). Its kernels are
+keyed by name, arch, HIP version and generator checksum, so, like the kconv
+image store, they live in `lxkit.user_cache_dir("rocfft")` and outlive the
+compile-cache namespace (`PlatformLeg.runtime_kernel_stores`): rocFFT reads a
+read-only snapshot (`ROCFFT_RTC_SYS_CACHE_PATH`), writes new kernels to one
+SQLite file per process (`ROCFFT_RTC_CACHE_PATH`; shared writers on Lustre
+spin), and each process folds its file into the snapshot at exit (copy, insert,
+rename). From the store the first FFT of a length costs 0.02–0.04 s. hsuite
+kmeans→dipole builds 16 kernels per process, 10.0 s of the cold kmeans wall.
+A "cold" hsuite run (empty compile cache) therefore reads both vendor-kernel
+stores, kconv and rocFFT, as a CUDA cold run reads the kernels cuFFT ships.
+rocBLAS loads its Tensile tables on a process's first GEMM: 2.84 s for an 8x8
+dgemm, then 0.055 s for the first zgemm (P1 probe, autotune 0, either level).
+`PlatformLeg.blas_host_warmup` compiles one 8x8 GEMM per dtype at start-up
+(main thread, so the compile agreement sees the same programs on every rank)
+and runs them on a helper thread, where the load overlaps the driver's
+imports. AMD comgr's code-object cache stays per namespace
+(`runtime_kernel_caches`, `<cache>/vendor/comgr`). Runtime start-up itself
+(`initialize_communicator_stack`, 5.3–8.7 s per process: jax import ~2 s,
+distributed and backend init ~1.5 s, clique warm-up 2.6 s) is not cached.
 
 ## 4 Where the time goes
 

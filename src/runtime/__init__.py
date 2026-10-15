@@ -2171,6 +2171,11 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        The exact-line PJRT stderr filter is installed immediately afterward:
        it removes only OpenXLA's upstream-deleted executable-version notice,
        while the compile cache and all compatibility checks remain live.
+    7b. :mod:`runtime.vendor_kernels` -- the leg's vendor first-use policy:
+       its content-keyed kernel stores (rocFFT on ROCM) before the first FFT,
+       then its BLAS warm-up (rocBLAS/Tensile on ROCM): GEMMs compiled here,
+       after (7) so a warm run reads them from the cache, and run on a helper
+       thread while the driver imports.  No-ops on a leg that declares none.
     8. The startup report -- LAST, because it reads the live client, and
        the live client does not exist until (5).
     8a. :func:`enforce_x64` on the resolved flag the report just measured.
@@ -2265,6 +2270,16 @@ def initialize_communicator_stack(*, platform: str = "gpu",
         # the failure and leave fd 2 completely unmodified.
         say(f"  [runtime] exact PJRT notice filter unavailable "
             f"({type(exc).__name__}: {exc}); stderr is unfiltered")
+    # -- 7b -----------------------------------------------------------------
+    try:
+        from .vendor_kernels import arm_runtime_kernel_stores, start_blas_host_warmup
+        import jax as _jax_vk
+        _proc = int(_jax_vk.process_index())
+        arm_runtime_kernel_stores(proc_idx=_proc, say=_print_rank0)
+        start_blas_host_warmup(proc_idx=_proc, say=_print_rank0)
+    except Exception as exc:                                  # noqa: BLE001
+        _print_rank0(f"  [runtime] vendor first-use policy not applied "
+                     f"({type(exc).__name__}: {exc}); vendor kernels build on first use")
     _t_cache = time.perf_counter()
     # -- 8 ------------------------------------------------------------------
     facts = collect_startup_facts(mesh, cache_error=cache_error)

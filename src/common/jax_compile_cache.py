@@ -1297,9 +1297,9 @@ def _arm_runtime_kernel_caches(cache_base: Path, proc_idx: int) -> list:
 
     Some vendor libraries compile device kernels at run time and keep them
     across processes only where a variable points
-    (``PlatformLeg.runtime_kernel_caches``; on ROCM rocFFT's hipRTC kernels,
-    1.9-7.6 s per new FFT length per process on MI250X and 0.02-0.04 s from
-    the cache, and AMD comgr's code objects).  A ``"process-file"`` cache is
+    (``PlatformLeg.runtime_kernel_caches``; on ROCM AMD comgr's code objects).
+    Content-keyed kernel stores that outlive this namespace (rocFFT's) are
+    ``runtime_kernel_stores``, armed by :mod:`runtime.vendor_kernels`.  A ``"process-file"`` cache is
     one file per process index under ``<cache>/np<P>/vendor/`` (several
     writers on one rocFFT SQLite file on Lustre spin without progress, hsuite
     P4, Frontier); a ``"shared-dir"`` one is a directory there.  A variable

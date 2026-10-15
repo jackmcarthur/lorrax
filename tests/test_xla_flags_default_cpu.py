@@ -107,4 +107,16 @@ def test_runtime_kernel_caches_are_well_formed():
         for env, name, scope in leg.runtime_kernel_caches:
             assert env.isupper() and name and "/" not in name and scope in scopes
     assert not LEGS["CUDA"].runtime_kernel_caches and not LEGS["cpu"].runtime_kernel_caches
-    assert ("ROCFFT_RTC_CACHE_PATH", "rocfft_kernel_cache", "process-file") in LEGS["ROCM"].runtime_kernel_caches
+    assert ("AMD_COMGR_CACHE_DIR", "comgr", "shared-dir") in LEGS["ROCM"].runtime_kernel_caches
+
+
+def test_vendor_first_use_rows_are_rocm_only():
+    for leg in LEGS.values():
+        for writer_env, reader_env, name in leg.runtime_kernel_stores:
+            assert writer_env.isupper() and reader_env.isupper() and writer_env != reader_env
+            assert name and "/" not in name
+    assert not LEGS["CUDA"].runtime_kernel_stores and not LEGS["cpu"].runtime_kernel_stores
+    assert not LEGS["CUDA"].blas_host_warmup and not LEGS["cpu"].blas_host_warmup
+    assert LEGS["ROCM"].runtime_kernel_stores == (
+        ("ROCFFT_RTC_CACHE_PATH", "ROCFFT_RTC_SYS_CACHE_PATH", "rocfft"),)
+    assert LEGS["ROCM"].blas_host_warmup == ("float64", "complex128")
