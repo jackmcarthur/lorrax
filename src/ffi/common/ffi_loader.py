@@ -237,6 +237,9 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     # the port of cpp/cufft/kconv_outer_cuda_ffi.cc): ffi.fft._ROCM_OUTER_TARGETS.
     "lorrax_kdft_kconv_klead_outer": "KDftKconvKleadOuterFfi",
     "lorrax_kdft_kconv_klead_outer_decode": "KDftKconvKleadOuterDecodeFfi",
+    # k-box mode 6, the ISDF route-G pair convolution (cpp/kdft/kbox_plane_ffi.cc, the port of the
+    # mathdx plane mode): ffi.fft._ROCM_PAIR_TARGETS.
+    "lorrax_kdft_kconv_plane": "KDftKconvPlaneFfi",
     # The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc), called by
     # distrib_la.local_eigh (BATCHED_EIGH_ROUTE); CUDA uses jaxlib's cuSOLVER for it.
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",

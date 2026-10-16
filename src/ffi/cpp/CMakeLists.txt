@@ -1534,6 +1534,7 @@ set(LORRAX_FFI_ROCM_SOURCES
     kdft/kbox_unfold_ffi.cc
     kdft/kbox_rspace_ffi.cc
     kdft/kconv_outer_rocm_ffi.cc
+    kdft/kbox_plane_ffi.cc
     rocsolver/batched_eigh_ffi.cc
     hipfft/fourier_plan_rocm_ffi.cc
     active_subspace/active_devsize.cc
@@ -1601,6 +1602,12 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_src.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/generated/kconv_outer_src.h" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_kernel.h")
+# The k-box mode-6 plane convolution (the ISDF route-G pair; kdft/kbox_plane_src.h.in), on the same stage text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_plane_kernel.h" LRX_KBOX_PLANE_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_plane_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_plane_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_plane_kernel.h")
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)
