@@ -38,6 +38,53 @@ def _omega_fold(acc, sigma, coeff, omega_axis):
         sigma, axis=omega_axis)
 
 
+class WindowTable:
+    """Every planned window's coefficient inputs, placed once per Σ call.
+
+    ``fields`` are replicated device arrays with one leading row per window:
+    ``t``/``alpha`` padded to the node capacity, ``n`` the active node count,
+    ``omega``/``columns`` the window's frequencies on the full output axis,
+    ``scalars`` (omega_sign, prefactor, e_ref_sum) and caller ``extras``
+    (``x_<name>``).  :meth:`DeviceOmegaAccumulator.window_pick` reads one row
+    on device behind a device-carried window counter, so a window transfers
+    nothing from the host.  ``nodes`` are the host node counts (progress).
+    """
+
+    def __init__(self, fields, nodes):
+        self.fields = fields
+        self.nodes = tuple(int(n) for n in nodes)
+
+
+@lru_cache(maxsize=None)
+def _window_pick_program(replicated):
+    """``(table, w) -> (t_pad, coeff, n_active, extras, w + 1)`` for row ``w``, on device.
+
+    The coefficient is :func:`_omega_coefficient` on the row's padded nodes
+    and full-axis frequencies, zero outside the active nodes and columns:
+    the host table of :meth:`DeviceOmegaAccumulator.integrate_window`,
+    evaluated by the device's complex ``exp`` (rounding-level differences
+    from the host's libm, owner-accepted 2026-10-16).
+    """
+    def pick(fields, w):
+        row = {k: jax.lax.dynamic_index_in_dim(v, w, 0, keepdims=False)
+               for k, v in fields.items()}
+        t, alpha, n = row["t"], row["alpha"], row["n"]
+        sign, prefactor, e_ref = (row["scalars"][i] for i in range(3))
+        valid = row["columns"][None, :] & (jnp.arange(t.shape[0])[:, None] < n)
+        coeff = _omega_coefficient(jnp, row["omega"][None, :], t[:, None],
+                                   alpha[:, None], sign, prefactor, e_ref)
+        coeff = jnp.where(valid, coeff, jnp.zeros((), coeff.dtype))
+        extras = {k[2:]: v for k, v in row.items() if k.startswith("x_")}
+        return t, coeff, n, extras, w + jnp.ones((), w.dtype)
+    return jax.jit(pick, out_shardings=replicated)
+
+
+@lru_cache(maxsize=None)
+def _window_counter_program(replicated):
+    """The first window's counter, made on device (a compiled constant, no transfer)."""
+    return jax.jit(lambda: jnp.zeros((), jnp.int32), out_shardings=replicated)
+
+
 _WINDOW_COMPILED = {}
 
 # The overlapped window (lane LHS 2026-10-01, sandbox runs/DEV/730_lhs_20261001): two τ nodes
@@ -211,24 +258,11 @@ class DeviceOmegaAccumulator:
         executable (for a caller that admits its peak).  ``overlap``: the
         overlapped window (:data:`WINDOW_OVERLAP`) on GPU, the plain one elsewhere.
         """
-        t = np.asarray(jax.device_get(t), np.complex128)
-        alpha = np.asarray(jax.device_get(alpha), np.complex128)
-        if t.ndim != 1 or alpha.shape != t.shape or t.size == 0:
-            raise ValueError("t and alpha must be nonempty equal vectors")
+        t, alpha, columns, omega = self._window_rows(dict(
+            t=jax.device_get(t), alpha=jax.device_get(alpha),
+            omega_indices=omega_indices, omega_values=omega_values))
         if not 0 < int(n_active) <= t.size <= int(capacity):
             raise ValueError("require 0 < n_active <= len(t) <= capacity")
-        if omega_indices is None:
-            if omega_values is not None:
-                raise ValueError("omega_values requires omega_indices")
-            columns = np.arange(self._omega.size)
-            omega = self._omega
-        else:
-            columns = np.asarray(omega_indices, dtype=np.int64)
-            omega = np.asarray(omega_values, dtype=np.complex128)
-            if (columns.ndim != 1 or omega.shape != columns.shape
-                    or np.any(columns < 0) or np.any(columns >= self._omega.size)
-                    or np.unique(columns).size != columns.size):
-                raise ValueError("invalid active frequency indices/values")
         coeff = np.zeros((int(capacity), self._omega.size), np.complex128)
         coeff[:t.size, columns] = _omega_coefficient(
             np, omega[None, :], t[:, None], alpha[:, None],
@@ -238,6 +272,72 @@ class DeviceOmegaAccumulator:
         t_pad, coeff, n_active = (
             device_put_process_local(np.asarray(x), self._replicated)
             for x in (t_pad, coeff, np.int32(n_active)))
+        return self.run_window(tau_kernel, tau_arguments, t_pad, coeff, n_active, active_count,
+                               antihermitian=antihermitian, overlap=overlap,
+                               compile_only=compile_only)
+
+    def _window_rows(self, window):
+        """One window's host coefficient inputs, checked as :meth:`integrate_window` checks them."""
+        t = np.asarray(window["t"], np.complex128)
+        alpha = np.asarray(window["alpha"], np.complex128)
+        if t.ndim != 1 or alpha.shape != t.shape or t.size == 0:
+            raise ValueError("t and alpha must be nonempty equal vectors")
+        indices, values = window.get("omega_indices"), window.get("omega_values")
+        if indices is None:
+            if values is not None:
+                raise ValueError("omega_values requires omega_indices")
+            columns, omega = np.arange(self._omega.size), self._omega
+        else:
+            columns = np.asarray(indices, dtype=np.int64)
+            omega = np.asarray(values, dtype=np.complex128)
+            if (columns.ndim != 1 or omega.shape != columns.shape
+                    or np.any(columns < 0) or np.any(columns >= self._omega.size)
+                    or np.unique(columns).size != columns.size):
+                raise ValueError("invalid active frequency indices/values")
+        return t, alpha, columns, omega
+
+    def window_table(self, windows, *, capacity, extras=None):
+        """Place every window's coefficient inputs (and ``extras``) once: a :class:`WindowTable`.
+
+        ``windows`` are dicts with ``t``, ``alpha``, ``omega_indices``,
+        ``omega_values``, ``omega_sign``, ``prefactor``, ``e_ref_sum`` (the
+        :meth:`integrate_window` arguments); ``extras`` maps a name to one host
+        array per window (equal shapes).  One process-local placement per
+        field per Σ call replaces the per-window transfers of the coefficient
+        table (``capacity x n_omega`` complex) and the window operands.
+        """
+        n_w, n_omega, capacity = len(windows), int(self._omega.size), int(capacity)
+        host = dict(t=np.zeros((n_w, capacity), np.complex128),
+                    alpha=np.zeros((n_w, capacity), np.complex128),
+                    n=np.zeros(n_w, np.int32),
+                    omega=np.zeros((n_w, n_omega), np.complex128),
+                    columns=np.zeros((n_w, n_omega), bool),
+                    scalars=np.zeros((n_w, 3), np.float64))
+        for i, window in enumerate(windows):
+            t, alpha, columns, omega = self._window_rows(window)
+            if t.size > capacity:
+                raise ValueError("require len(t) <= capacity")
+            host["t"][i, :t.size], host["alpha"][i, :t.size], host["n"][i] = t, alpha, t.size
+            host["omega"][i, columns], host["columns"][i, columns] = omega, True
+            host["scalars"][i] = (float(window["omega_sign"]), float(window["prefactor"]),
+                                  float(window.get("e_ref_sum", 0.0)))
+        for name, rows in (extras or {}).items():
+            host["x_" + name] = np.stack([np.asarray(r) for r in rows])
+        fields = {k: device_put_process_local(np.ascontiguousarray(v), self._replicated)
+                  for k, v in host.items()}
+        return WindowTable(fields, host["n"])
+
+    def window_counter(self):
+        """A device window counter at 0 for :meth:`window_pick`."""
+        return _window_counter_program(self._replicated)()
+
+    def window_pick(self, table, counter):
+        """Row ``counter`` of ``table`` on device: ``(t_pad, coeff, n_active, extras, counter + 1)``."""
+        return _window_pick_program(self._replicated)(table.fields, counter)
+
+    def run_window(self, tau_kernel, tau_arguments, t_pad, coeff, n_active, active_count, *,
+                   antihermitian=False, overlap=False, compile_only=False):
+        """Run (or, ``compile_only``, compile) one window from its device operands."""
         run = _device_window_runner(
             tau_kernel, self._sharding, self._omega_axis, bool(antihermitian),
             self._reduce, bool(overlap) and self._gpu)
