@@ -732,7 +732,7 @@ _DIPOLE_IMAGES = ("v_x", "v_y", "v_z", "f(H)")
 
 def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       coarse_grid, n_val, window_start, a_band_index,
-                      mesh_xy, log_fn=print) -> dict:
+                      mesh_xy, log_fn=print, full_window: bool = False) -> dict:
     r"""r-form dipoles of a ``bse_k_grid`` bundle, in the gauge of its own ψ.
 
     The coarse WFN's velocity matrix ``v(k)`` (``psp.get_dipole_mtxels``'
@@ -810,6 +810,11 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         The htransform's ``a`` band (``htransform_a_band``).
     mesh_xy : jax.sharding.Mesh
         The ('x','y') mesh.  COLLECTIVE over it.
+    full_window : bool
+        Also return the velocity over EVERY pair of the fine window (the
+        TD-aGW equation of motion needs the vv' and cc' blocks, not only
+        c <- v): ``v_window`` and ``e_dft_window`` below.  Off by default;
+        the default outputs do not depend on it.
 
     Returns
     -------
@@ -819,7 +824,13 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         list both are indexed by; ``source`` (absolute path),
         ``velocity`` (the file's operator label), ``route``; ``on_grid_rel``
         and ``n_on_grid``; ``image_locality`` {image: (outer-shell L2
-        fraction, outer-shell max / R=0)}.
+        fraction, outer-shell max / R=0)}.  With ``full_window``:
+        ``v_window`` (3, nk_f, nb_fi, nb_fi) complex128 host, Ry·bohr,
+        ``⟨i|v̂_α|j⟩`` (bra i, ket j, valence rows first, the same U_q
+        contraction as ``d_alpha``), and ``e_dft_window`` (nk_f, nb_fi)
+        float64 host, Ry, the velocity's own band energies (the Newton
+        inversion above), so ``d_alpha = v_window[:, :, nv:, :nv] /
+        (e_dft_window[:, nv:, None] - e_dft_window[:, None, :nv])``.
     """
     from bandstructure.fh_interp import (f_transform_eigs, image_locality,
                                          newton_inv, require_newton_converged)
@@ -896,6 +907,11 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
         k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start,
         fh_energies=fh_energies)
+    v_window = None
+    if full_window:
+        nb_win = int(e_dft.shape[1])
+        v_window = np.moveaxis(np.asarray(gather_to_host(jax.jit(
+            lambda o: o[:nq, :3, :nb_win, :nb_win])(out))), 1, 0)  # (3, nq, nb, nb)
     del out
     shift_mev = float(np.max(np.abs(
         e_dft - np.asarray(gather_to_host(fine.enk_full))))) * RYD_TO_EV * 1e3
@@ -927,7 +943,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
             f"contraction convention disagrees with the htransform that built "
             f"ψ, so the dipoles are not in its gauge; fix: report it, this is "
             f"a bookkeeping defect.")
-    return {
+    result = {
         "d_alpha": d_alpha,
         "de_cv": de_cv,
         "q_frac": q_frac,
@@ -939,6 +955,10 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         "n_on_grid": int(n_on_grid),
         "image_locality": locality,
     }
+    if full_window:
+        result["v_window"] = v_window
+        result["e_dft_window"] = e_dft
+    return result
 
 
 def _coefficients_by_q(coeffs, carrier, mesh_xy):
@@ -1038,6 +1058,7 @@ def _interpolate_bse_data_to_grid(
     htransform_quality_record_fn=None,
     eqp_file: str | None = None,
     velocity_file: str | None = None,
+    velocity_full_window: bool = False,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -1089,6 +1110,9 @@ def _interpolate_bse_data_to_grid(
         the deck WFN before the fit, then carried through the same htransform
         as ψ (:func:`densified_dipoles`); the bundle's ``dipoles`` key holds
         the fine-grid window dipoles in its own ψ gauge, ``None`` without it.
+    velocity_full_window : bool
+        Pass ``full_window`` to :func:`densified_dipoles`, so ``dipoles``
+        also holds the velocity over every window pair (TD-aGW).
     head_channel : dict or None
         C1's split-and-reattach hand-off from the loader, ``None`` on the
         ``legacy`` arm.  When present it carries ``whead`` (the head scalar the
@@ -1222,7 +1246,8 @@ def _interpolate_bse_data_to_grid(
             velocity, sym=sym, basis=basis, fine=bundle,
             fh_energies=np.asarray(gather_to_host(enk_sigma)).T,
             coarse_grid=coarse_grid, n_val=n_val, window_start=b_min,
-            a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn)
+            a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn,
+            full_window=velocity_full_window)
         del bundle.coeffs_fi, velocity
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))
