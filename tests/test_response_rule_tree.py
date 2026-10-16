@@ -185,3 +185,19 @@ def test_resolved_acceptance_stands_on_the_source():
     ours, ref = minimax.response_group_rules(LO, HI, z, pencil=resolved), minimax.response_group_rules(LO, HI, z)
     assert [r["count"] for r in ours] == [r["count"] for r in ref]
     assert any(np.asarray(a["t"]).tobytes() != np.asarray(b["t"]).tobytes() for a, b in zip(ours, ref))
+
+
+def test_abandon_forecast():
+    """The error forecast abandons a geometry only when its prediction bound misses the tolerance."""
+    import file_io  # noqa: F401  (service path bootstrap)
+    from minimax import complex_response as cr
+
+    k = np.arange(12)
+    def history(err_slope, err0=8.):
+        return [(int(i), err0 + err_slope*i) for i in k]
+    assert cr._abandoned(history(-0.05), 46)                # tol only at k=160: past the pencil's last count
+    assert not cr._abandoned(history(-0.25), 46)            # tol at k=32: the scan decides there
+    assert not cr._abandoned(history(0.0, 3.), 46)          # stagnation is the patience rule's call
+    assert not cr._abandoned(history(-0.05)[:2], 46)        # no residual estimate from two points
+    scattered = [(0, 8.), (1, 7.5), (2, 8.2), (3, 7.6)]     # line misses tol, but its bound is wide
+    assert not cr._abandoned(scattered, 46)

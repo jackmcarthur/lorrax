@@ -8,6 +8,7 @@ d/d(z^2).
 """
 import numpy as np
 from scipy import linalg as la
+from scipy.special import stdtrit
 
 from .uniform_rule import _map_rows, _pinned_blas_threads
 
@@ -85,6 +86,11 @@ def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
     ``order`` is a caller-owned list of pole indices; a rejected pole moves to
     its front, so the next candidate is tested on the hardest pole first.
     """
+    return _fits_mass(lo, hi, poles, times, tol, decay_rate, order)[:3]
+
+
+def _fits_mass(lo, hi, poles, times, tol, decay_rate, order=None):
+    """:func:`_fits` and the coefficient mass of the rejected pole (nan when accepted or unfitted)."""
     order = list(range(len(poles))) if order is None else order
     fits = [None]*len(poles)
     worst = 0.
@@ -95,10 +101,10 @@ def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
         mass_rejected = fit is not None and error <= tol and fit[2][0] > _RESPONSE_MAX_KAPPA
         if fit is None or not error <= tol or not np.isfinite(fit[2]).all() or mass_rejected:
             order.insert(0, order.pop(position))
-            return None, error, bool(mass_rejected)
+            return None, error, bool(mass_rejected), (np.nan if fit is None else float(fit[2][0]))
         worst = max(worst, error)
         fits[index] = fit
-    return fits, worst, False
+    return fits, worst, False, np.nan
 
 
 def _pencil(lo, hi, poles, tol, decay_rate):
@@ -229,10 +235,55 @@ def host_pencils(zps, size, columns, steps):
         yield s, u[:, :rank].conj().T@(np.hstack(shifted)@q)@wh[:rank].conj().T
 
 
-def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift):
-    """Node counts n = 8, 12, ... of one geometry's pencil: ``(times, fits, n)`` or None."""
+#: The abandon test of a geometry's scan (:func:`_abandoned`). log10(sampled
+#: error / tol) is near-linear in the candidate index, so a least-squares line
+#: through the last ``_ABANDON_WINDOW`` candidates forecasts the scan's own end;
+#: the geometry is abandoned when the one-sided Student-t prediction bound of
+#: that line at the pencil's last candidate stays above the tolerance, at
+#: confidence 1 - ``_ABANDON_ALPHA``/(candidates) per test (Bonferroni over the
+#: tests one scan can make: a 1 % chance per geometry that the forecast
+#: abandons a scan whose line would reach the tolerance). The interval comes
+#: from the line's own residuals and widens with few points, so no minimum
+#: candidate count is set: a short or scattered history never abandons.
+#: The coefficient mass is not forecast: it rises ~1 decade per candidate and
+#: drops near convergence, so its line overshoots the mass gate by up to 2.8
+#: decades on geometries that accept (hsuite bisp_sc, sp_export traces).
+#: Validated by exact replay of every tried node of five trees (Fe V2 88 nodes,
+#: hsuite sp_export, bisp_sc, Na SC iterations 0 and 1, 43 nodes each): no
+#: accepting geometry abandoned, closest bound 2.06 decades above it (Fe).
+_ABANDON_WINDOW, _ABANDON_ALPHA = 8, 0.01
+
+
+def _abandoned(history, last):
+    """True when the forecast of ``history`` [(k, log10 err/tol)] cannot reach the tolerance by ``last``.
+
+    ``last`` is the index of the geometry's last candidate.
+    """
+    k, e = (np.asarray(v, float) for v in zip(*history[-_ABANDON_WINDOW:])) if history else ((), ())
+    ok = np.isfinite(e)
+    k, e = k[ok], e[ok]
+    n = len(k)
+    if n < 3 or k[-1] >= last:
+        return False
+    slope, intercept = np.polyfit(k, e, 1)
+    if slope >= 0:
+        return False                      # stagnation: the patience rule's call
+    spread = np.sqrt(np.sum((e - intercept - slope*k)**2)/(n - 2))
+    t = float(stdtrit(n - 2, 1 - _ABANDON_ALPHA/(last + 1)))
+    kbar = k.mean()
+    width = t*spread*np.sqrt(1 + 1/n + (last - kbar)**2/np.sum((k - kbar)**2))
+    return intercept + slope*last - width > 0
+
+
+def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift, abandon=True):
+    """Node counts n = 8, 12, ... of one geometry's pencil: ``(times, fits, n)`` or None.
+
+    ``abandon``: apply :func:`_abandoned` after each rejected candidate.
+    """
     best, best_n = np.inf, 0
-    for n in range(8, len(shift) + 1, 4):
+    counts = range(8, len(shift) + 1, 4)
+    history = []
+    for n in counts:
         roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
                           check_finite=False)
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -244,7 +295,7 @@ def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s
             times = times[times.real <= decay_rate]
         if not len(times):
             continue
-        fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate, order)
+        fits, error, mass_rejected, mass = _fits_mass(lo, hi, poles, times, tol, decay_rate, order)
         if fits is not None:
             return times, fits, n
         if mass_rejected:
@@ -253,6 +304,10 @@ def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s
             best, best_n = error, n
         elif patience is not None and n - best_n >= patience:
             return None  # No decade of accuracy in this many more exponentials.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            history.append((len(history), np.log10(error/tol)))
+        if abandon and _abandoned(history, len(counts) - 1):
+            return None  # Forecast: the tolerance lies past the pencil's last count.
     return None
 
 
