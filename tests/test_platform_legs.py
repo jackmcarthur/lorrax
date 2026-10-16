@@ -202,7 +202,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     shared = {t: s for t, s in rocm.items() if t not in own}
     prefixes = tuple(p for p in built_prefixes("ROCM")
                      if any(t.startswith(p) for t in ffi_loader._CUDA_TARGET_SYMBOLS))
-    assert set(prefixes) == {"lorrax_phdf5_", "lorrax_slate_", "lorrax_cublas_local_"}
+    assert set(prefixes) == {"lorrax_phdf5_", "lorrax_slate_", "lorrax_cublas_local_", "lorrax_active_gemm_"}
     assert shared and all(t.startswith(prefixes) for t in shared)
     assert all(ffi_loader._CUDA_TARGET_SYMBOLS[t] == s for t, s in shared.items())
     assert {t for t in ffi_loader._CUDA_TARGET_SYMBOLS if t.startswith(prefixes)} == set(shared)
@@ -213,9 +213,10 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     eigh = {"lorrax_rocsolver_batched_eigh"}
     fplan = {"lorrax_fourier_plan_rocm"}          # LocalFourierPlan's ROCM leg (cpp/hipfft/)
     agemm = {"lorrax_active_gemm_device", "lorrax_active_gemm_device_out"}
-    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | fplan | agemm for t in own)
+    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | fplan for t in own)
     assert fplan <= set(own)
-    assert agemm <= set(own)
+    # The device-bounds active GEMM is built on both legs: shared (from the CUDA table), not own.
+    assert agemm <= set(shared) and not agemm & set(own)
     assert eigh <= set(own)
     assert lu <= set(own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)

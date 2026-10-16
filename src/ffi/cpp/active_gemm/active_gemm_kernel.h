@@ -32,6 +32,9 @@
 #ifndef LRX_MFMA
 #define LRX_MFMA 0
 #endif
+#ifndef LRX_DMMA
+#define LRX_DMMA 0
+#endif
 
 struct alignas(16) lrx_z { double re, im; };
 
@@ -165,10 +168,7 @@ __device__ __forceinline__ void lrx_active_gemm(
 // complex128 is the exact 4M form, four real MFMAs per tile:
 //   Dre += Are Bre + (-Aim) Bim,  Dim += Are Bim + Aim Bre
 // (negation is exact, so the rounding is that of the FMA path's four products; no 3M form).
-// CUDA (sm_80+): the analogue is DMMA, mma.sync.aligned.m8n8k4.row.col.f64 -- a warp's lane l
-// supplies A[l/4][l%4], B[l%4][l/4] and holds C[l/4][2(l%4)+{0,1}]; a 64 x 64 block tile is
-// 8 warps x (8 x 8 DMMA tiles 4 x 2).  It is not written here because it cannot be tested
-// (no CUDA GPU): the CUDA leg runs the FMA path above until a DMMA arm is gated on an A100.
+// CUDA (sm_80+): the analogue is DMMA, mma.sync.aligned.m8n8k4.row.col.f64 (LRX_DMMA below).
 #if LRX_MFMA
 #if !defined(__AMDGCN__)
 #error "LRX_MFMA is the AMDGPU matrix-core path (hipRTC on gfx90a / gfx94x only)"
@@ -335,6 +335,173 @@ __device__ __forceinline__ void lrx_active_gemm_mfma(
         }
 }
 #define LRX_GEMM_BODY(T, CJ) lrx_active_gemm_mfma<T, 32, CJ>
+#endif
+
+// ---------------------------------------------------------------------------------------------
+// LRX_DMMA 1 (CUDA leg, compute capability >= 8.0; the host sets it from the device's SM): the
+// same slabs, bounds, validity, register prefetch and epilogue as the MFMA path, with the inner
+// product on the FP64 tensor cores.  One mma.sync.aligned.m8n8k4.row.col.f64 is
+// D(8x8) += A(8x4) B(4x8) for a warp: lane l supplies A[l/4][l%4] and B[l%4][l/4] and holds
+// D[l/4][2(l%4) + {0,1}] (PTX ISA, "Matrix fragments for mma.m8n8k4 with .f64").  The block's
+// eight warps tile C 2 (rows) x 4 (columns): a BM x BN block tile gives each warp
+// (BM/2) x (BN/4), i.e. RT x CT DMMA tiles (64 x 64: 4 x 2; 32 x 32: 2 x 1).  complex128 is the
+// exact 4M form, four real DMMAs per tile in the MFMA path's order:
+//   Dre += Are Bre + (-Aim) Bim,  Dim += Are Bim + Aim Bre
+// so both matrix-core arms round as the FMA path's four products.  Generic over every SM that
+// has mma.sync f64 (8.x, 9.x, 10.x, 12.x); older SMs refuse at compile time, and the host never
+// asks for them (they take the FMA path).
+#if LRX_DMMA
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+#error "LRX_DMMA needs mma.sync m8n8k4 f64 (compute capability 8.0 or newer)"
+#endif
+#if (LRX_TK % 4) != 0 || LRX_NT != 256
+#error "the DMMA path is laid out for 256 threads (8 warps) and TK a multiple of 4"
+#endif
+__device__ __forceinline__ void lrx_dmma(double (&d)[2], double a, double b) {
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%0, %1};"
+                 : "+d"(d[0]), "+d"(d[1]) : "d"(a), "d"(b));
+}
+template <int RT, int CT>
+__device__ __forceinline__ void lrx_dmma_step(double (&cr)[RT][CT][2], double (&)[RT][CT][2],
+                                              const double (&a)[RT], const double (&b)[CT]) {
+#pragma unroll
+    for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+        for (int ct = 0; ct < CT; ++ct) lrx_dmma(cr[rt][ct], a[rt], b[ct]);
+}
+template <int RT, int CT>
+__device__ __forceinline__ void lrx_dmma_step(double (&cr)[RT][CT][2], double (&ci)[RT][CT][2],
+                                              const lrx_z (&a)[RT], const lrx_z (&b)[CT]) {
+#pragma unroll
+    for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+        for (int ct = 0; ct < CT; ++ct) lrx_dmma(cr[rt][ct], a[rt].re, b[ct].re);
+#pragma unroll
+    for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+        for (int ct = 0; ct < CT; ++ct) lrx_dmma(ci[rt][ct], a[rt].re, b[ct].im);
+#pragma unroll
+    for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+        for (int ct = 0; ct < CT; ++ct) lrx_dmma(cr[rt][ct], -a[rt].im, b[ct].im);
+#pragma unroll
+    for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+        for (int ct = 0; ct < CT; ++ct) lrx_dmma(ci[rt][ct], a[rt].im, b[ct].re);
+}
+__device__ __forceinline__ double lrx_dacc(double re, double, double) { return re; }
+__device__ __forceinline__ lrx_z lrx_dacc(double re, double im, lrx_z) { lrx_z z; z.re = re; z.im = im; return z; }
+
+// BM x BN block tile (64 x 64 or 32 x 32).
+template <typename T, int BM, int BN, bool CJ>
+__device__ __forceinline__ void lrx_active_gemm_dmma(
+    const T* __restrict__ A, const T* __restrict__ B, const T* __restrict__ W,
+    const int* __restrict__ bounds, int bstride, int nb, T* C, int m, int k, int n,
+    double alpha_re, double alpha_im, double beta_re, double beta_im, int read_c) {
+    constexpr int WM = BM / 2, WN = BN / 4, RT = WM / 8, CT = WN / 8;
+    static_assert(RT * 8 * 2 == BM && CT * 8 * 4 == BN, "block tile / warp grid");
+    __shared__ T As[LRX_TK][BM + 1];
+    __shared__ T Bs[LRX_TK][BN + 1];
+    const T zero = lrx_zero(T());
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int wr = warp >> 2, wc = warp & 3, g = lane >> 2, kq = lane & 3;
+    const long long q = blockIdx.z;
+    const int row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+    bool valid = true;
+    for (int p = 0; p < nb; ++p) {
+        const int l = bounds[2 * p], h = bounds[2 * p + 1];
+        valid = valid && l >= 0 && l <= h && h <= k;
+    }
+    const int lo = valid ? bounds[q * bstride] : 0;
+    const int hi = valid ? bounds[q * bstride + 1] : 0;
+    double cr[RT][CT][2], ci[RT][CT][2];
+#pragma unroll
+    for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+        for (int ct = 0; ct < CT; ++ct) { cr[rt][ct][0] = cr[rt][ct][1] = 0.0; ci[rt][ct][0] = ci[rt][ct][1] = 0.0; }
+    const T* Aq = A + q * (long long)m * k;
+    const T* Bq = B + q * (long long)k * n;
+    const T* Wq = W ? W + q * (long long)k : nullptr;
+    constexpr int EA = (BM * LRX_TK + LRX_NT - 1) / LRX_NT, EB = (LRX_TK * BN + LRX_NT - 1) / LRX_NT;
+    T ra[EA], rb[EB];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int x = 0; x < EA; ++x) {
+            const int e = t + x * LRX_NT;
+            const int r = e / LRX_TK, kc = e - r * LRX_TK, i = row0 + r, kk = k0 + kc;
+            T v = zero;
+            if (e < BM * LRX_TK && i < m && kk < hi) {
+                v = Aq[(long long)i * k + kk];
+                if (Wq) v = lrx_mul(v, Wq[kk]);
+            }
+            ra[x] = v;
+        }
+#pragma unroll
+        for (int x = 0; x < EB; ++x) {
+            const int e = t + x * LRX_NT;
+            const int kr = e / BN, jc = e - kr * BN, jj = col0 + jc, kk = k0 + kr;
+            T v = zero;
+            if (e < LRX_TK * BN && kk < hi && jj < n) {
+                v = Bq[(long long)kk * n + jj];
+                if constexpr (CJ) v = lrx_conj(v);
+            }
+            rb[x] = v;
+        }
+    };
+    if (lo < hi) fetch(lo);
+    for (int k0 = lo; k0 < hi; k0 += LRX_TK) {             // uniform per block
+#pragma unroll
+        for (int x = 0; x < EA; ++x) {
+            const int e = t + x * LRX_NT, r = e / LRX_TK;
+            if (e < BM * LRX_TK) As[e - r * LRX_TK][r] = ra[x];
+        }
+#pragma unroll
+        for (int x = 0; x < EB; ++x) {
+            const int e = t + x * LRX_NT, kr = e / BN;
+            if (e < LRX_TK * BN) Bs[kr][e - kr * BN] = rb[x];
+        }
+        __syncthreads();
+        if (k0 + LRX_TK < hi) fetch(k0 + LRX_TK);
+#pragma unroll
+        for (int ks = 0; ks < LRX_TK; ks += 4) {
+            T a[RT], b[CT];
+#pragma unroll
+            for (int rt = 0; rt < RT; ++rt) a[rt] = As[ks + kq][wr * WM + rt * 8 + g];
+#pragma unroll
+            for (int ct = 0; ct < CT; ++ct) b[ct] = Bs[ks + kq][wc * WN + ct * 8 + g];
+            lrx_dmma_step<RT, CT>(cr, ci, a, b);
+        }
+        __syncthreads();
+    }
+    const T alpha = lrx_scalar(alpha_re, alpha_im, T());
+    const T beta = lrx_scalar(beta_re, beta_im, T());
+    T* Cq = C + q * (long long)m * n;
+#pragma unroll
+    for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+        for (int ct = 0; ct < CT; ++ct) {
+            const int i = row0 + wr * WM + rt * 8 + g;
+            if (i >= m) continue;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int j = col0 + wc * WN + ct * 8 + 2 * kq + h;
+                if (j >= n) continue;
+                const long long o = (long long)i * n + j;
+                T v;
+                if (!valid) {
+                    v = lrx_nan(T());
+                } else {
+                    v = lrx_mul(alpha, lrx_dacc(cr[rt][ct][h], ci[rt][ct][h], T()));
+                    if (read_c) v = lrx_add(v, lrx_mul(beta, Cq[o]));
+                }
+                Cq[o] = v;
+            }
+        }
+}
+#endif
+#if LRX_MFMA
+#elif LRX_DMMA
+#define LRX_GEMM_BODY(T, CJ) (lrx_active_gemm_dmma<T, 64, 64, CJ>)
 #else
 #define LRX_GEMM_BODY(T, CJ) lrx_active_gemm<T, CJ>
 #endif
@@ -354,8 +521,12 @@ LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d, double, (LRX_GEMM_BODY(double, false)))
 // conj_b images: B conjugated on load, a compile-time variant (no branch in the load path).
 LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_zc, lrx_z, (LRX_GEMM_BODY(lrx_z, true)))
 #if LRX_MFMA
-// 32 x 32 block tile (MFMA path only; the host requests it where it pads less).
+// 32 x 32 block tile (matrix-core paths only; the host requests it where it pads less).
 LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z32, lrx_z, (lrx_active_gemm_mfma<lrx_z, 16, false>))
 LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d32, double, (lrx_active_gemm_mfma<double, 16, false>))
 LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z32c, lrx_z, (lrx_active_gemm_mfma<lrx_z, 16, true>))
+#elif LRX_DMMA
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z32, lrx_z, (lrx_active_gemm_dmma<lrx_z, 32, 32, false>))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d32, double, (lrx_active_gemm_dmma<double, 32, 32, false>))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z32c, lrx_z, (lrx_active_gemm_dmma<lrx_z, 32, 32, true>))
 #endif

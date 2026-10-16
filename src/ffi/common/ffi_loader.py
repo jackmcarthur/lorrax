@@ -113,6 +113,10 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
     "lorrax_cublas_local_active_range_gemm_out": "CublasLocalActiveRangeGemmOutFfi",
     "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
+    # The active-range GEMM with DEVICE-side bounds (cpp/active_gemm/, leg-neutral, run-time
+    # compiled; DMMA f64 on compute capability >= 8.0): ACTIVE_LOCAL_ROUTE's "device" row.
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
     # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
     # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
     # (mode, grid, ns, context) and disk-cached.  CUDA-only; the ffi.fft router
@@ -253,11 +257,8 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     # LocalFourierPlan's ROCM leg (cpp/hipfft/fourier_plan_rocm_ffi.cc, the port of the CUDA
     # leg's cufft/fourier_plan_cuda_ffi.cc): ffi.fft.FOURIER_PLAN_TARGETS["ROCM"].
     "lorrax_fourier_plan_rocm":      "LorraxFourierPlanRocmFfi",
-    # The active-range GEMM with device-side bounds (cpp/active_gemm/, leg-neutral, run-time
-    # compiled), distrib_la ACTIVE_LOCAL_ROUTE's ROCM "device" row; the CUDA leg serves the
-    # operation with cublas_local (and adopts this source by listing it).
-    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
-    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
+    # (The device-bounds active-range GEMM, cpp/active_gemm/, is built on both legs now: its
+    # targets reach this table through _ROCM_FAMILIES from the CUDA table above.)
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},

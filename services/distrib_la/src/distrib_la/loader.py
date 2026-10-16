@@ -118,6 +118,10 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
     "lorrax_cublas_local_active_range_gemm_out": "CublasLocalActiveRangeGemmOutFfi",
     "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
+    # The active-range GEMM with DEVICE-side bounds (cpp/active_gemm/, leg-neutral, run-time
+    # compiled; DMMA f64 on compute capability >= 8.0): ACTIVE_LOCAL_ROUTE's "device" row.
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
     "lorrax_cusolvermp_eigh":             "EighMpFfi",
     "lorrax_cusolvermp_batched_potrf":    "CusolverMpBatchedPotrfFfi",
     "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
@@ -181,14 +185,10 @@ _ROCM_ACTIVE_SUBSPACE_SYMBOLS: dict = {
 #: ROCM leg compiles the CUDA leg's source on rocBLAS (common/gpu_blas.h), so it exports
 #: the same three symbols (ACTIVE_LOCAL_ROUTE's "native" row on both legs).
 #: The active-range GEMM with device-side bounds (cpp/active_gemm/: leg-neutral, run-time
-#: compiled), ACTIVE_LOCAL_ROUTE's ROCM "device" row; the CUDA leg does not list it yet.
-_ROCM_ACTIVE_GEMM_SYMBOLS: dict = {
-    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
-    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
-}
+#: compiled) is built on both legs: ACTIVE_LOCAL_ROUTE's "device" row, in the CUDA table above.
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
-                                 if t.startswith(("lorrax_slate_", "lorrax_cublas_local_"))},
-                              **_ROCM_ACTIVE_GEMM_SYMBOLS,
+                                 if t.startswith(("lorrax_slate_", "lorrax_cublas_local_",
+                                                  "lorrax_active_gemm_"))},
                               **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS,
                               **_ROCM_ACTIVE_SUBSPACE_SYMBOLS}
 
