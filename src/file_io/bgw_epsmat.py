@@ -38,6 +38,7 @@ __all__ = [
     "QGspace", "kinetic_energies", "gvector_order", "gcutoff", "q_gspace",
     "matrix_block_window", "create_epsmat_file", "write_q_gspace",
     "write_q_diagonal", "read_q_gspace", "read_epsmat_header", "midgap_ry",
+    "matrix_shape", "register_matrix",
 ]
 
 MATRIX = "mats/matrix"
@@ -141,9 +142,28 @@ def matrix_block_window(iq, ifreq, n_pad):
 
     The block is ``(1, 1, 1, n_pad, n_pad, 2)`` at ``(iq, 0, ifreq, 0, 0, 0)``;
     its sharding is ``P(None, None, None, 'x', 'y', None)``.  A SlabIO write
-    clips to ``nmtx_max`` and a read zero-fills past it.
+    on a handle that ran :func:`register_matrix` clips to ``nmtx_max``; a
+    read zero-fills past it.
     """
     return (int(iq), 0, int(ifreq), 0, 0, 0), (1, 1, 1, int(n_pad), int(n_pad), 2)
+
+
+def matrix_shape(nq, nmtx_max, nfreq=1):
+    """Logical ``mats/matrix`` extent ``(nq, nmatrix = 1, nfreq, nmtx_max, nmtx_max, 2)``."""
+    return (int(nq), 1, int(nfreq), int(nmtx_max), int(nmtx_max), 2)
+
+
+def register_matrix(io, nq, nmtx_max, nfreq=1):
+    """Register the skeleton's ``mats/matrix`` on a SlabIO write handle.
+
+    SlabIO's parallel tier writes only datasets its handle created or
+    registered: an unregistered write takes its extent from the padded
+    block and ``phdf5_ensure_dataset`` refuses the existing shape.
+    ``create_dataset`` at the identical logical shape and dtype reuses the
+    dataset :func:`create_epsmat_file` made, and every later write clips
+    the mesh pad at ``nmtx_max``.
+    """
+    io.create_dataset(MATRIX, shape=matrix_shape(nq, nmtx_max, nfreq), dtype=np.float64)
 
 
 def midgap_ry(wfn_file, nband):
@@ -218,8 +238,8 @@ def create_epsmat_file(path, *, wfn_file, qpts, qgrid, nmtx, ecuts, nband,
         g.create_dataset("vcoul", shape=(nq, nmax), dtype="f8")
         g.create_dataset("gind_eps2rho", shape=(nq, ng), dtype="i4")
         g.create_dataset("gind_rho2eps", shape=(nq, ng), dtype="i4")
-        # Contiguous (no chunks): SlabIO reuses an identical existing dataset.
-        f.create_dataset(MATRIX, shape=(nq, 1, nfreq, nmax, nmax, 2), dtype="f8")
+        # Contiguous (no chunks): register_matrix reuses it from SlabIO.
+        f.create_dataset(MATRIX, shape=matrix_shape(nq, nmax, nfreq), dtype="f8")
         f.create_dataset(DIAGONAL, shape=(nq, nmax, 2), dtype="f8")
 
 

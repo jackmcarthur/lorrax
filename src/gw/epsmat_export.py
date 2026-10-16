@@ -508,11 +508,12 @@ def _face_program(mesh, n, mu_pad):
 
 
 def q_algebra(src, iq, mesh, *, rcond, print_fn=print):
-    """Read stored q ``iq`` and return ``(Z, B, K, V, Wc, v_sphere)``; gates V and W.
+    """Read stored q ``iq`` and return ``(Z, B, K, V, Wc, v_sphere, diag)``; gates V and W.
 
     ``B``/``K`` are padded to ``μ_pad`` (zero pad rows/columns); ``V``/``Wc``
     are the logical replicated μ² matrices; ``v_sphere`` is LORRAX v on the
-    stored sphere.
+    stored sphere; ``diag`` holds the two gate figures and the spectrum
+    range of K (−1 ≼ K ≼ 0 for a passive static response).
     """
     from isdf import cplus
     Vs, Ws, Z = read_q_rows(src, iq, mesh)
@@ -547,7 +548,8 @@ def q_algebra(src, iq, mesh, *, rcond, print_fn=print):
     pad = src.mu_pad - n
     Bp = jnp.pad(B, ((0, pad), (0, pad)))
     Kp = jnp.pad(K, ((0, pad), (0, pad)))
-    return Z, Bp, Kp, V, Wc, v_sphere
+    diag = {"err_v": err_v, "herm_w": herm_w, "k_min": float(ev[0]), "k_max": float(ev[-1])}
+    return Z, Bp, Kp, V, Wc, v_sphere, diag
 
 
 def _check_projection(proj, V_e, B, K, Wc, n, iq, where):
@@ -688,8 +690,9 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
         barrier(f"epsmat.{name}.skeleton")
         diags, figs = [], []
         with SlabIO(path, mode="a", mesh=mesh) as io:
+            be.register_matrix(io, len(rows), max(r.gspace.nmtx for r in rows))
             for r in rows:
-                Z, B, K, V, Wc, _ = q_algebra(src, r.iq_store, mesh, rcond=cfg.rcond,
+                Z, B, K, V, Wc, _, qd = q_algebra(src, r.iq_store, mesh, rcond=cfg.rcond,
                                               print_fn=print_fn)
                 n = r.gspace.nmtx
                 miller = comps[r.gspace.order[:n]] + r.g0[None, :]
@@ -710,9 +713,10 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
                 err, rt = _check_projection(proj, V_e, B, K, Wc, src.n_mu, r.iq_store, name)
                 d = np.asarray(jax.device_get(diag))[:n]
                 diags.append((r.iq_file, d))
-                figs.append({"q": np.round(r.q_file, 6).tolist(), "nmtx": n,
-                             "projection_err": err, "roundtrip_vs_W": rt,
-                             "head": (None if head is None else complex(head))})
+                figs.append({"q": np.round(r.q_file, 6).tolist(), "iq_file": int(r.iq_file),
+                             "iq_store": int(r.iq_store), "g0": np.asarray(r.g0).tolist(),
+                             "nmtx": n, "projection_err": err, "roundtrip_vs_W": rt,
+                             "head": (None if head is None else complex(head)), **qd})
                 print_fn(f"    {name}[{r.iq_file}] nmtx {n}: block identity {err:.2e}, "
                          f"Zᴴ(ε⁻¹−1)vZ vs W−V {rt:.2e}"
                          + ("" if head is None else f", head ε⁻¹_00(q0)={complex(head):.6f}"))
@@ -774,6 +778,10 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
     figs = []
     comps = heads["eps0mat"]["components"]
     with SlabIO(target, mode="a", mesh=mesh) as io:
+        # Register the copy's W0_qmunu (identical logical shape: reuse), the
+        # parallel tier's precondition for writing into an existing dataset.
+        io.create_dataset("W0_qmunu", shape=(src.q_stored.shape[0], src.n_mu, src.n_mu),
+                          dtype=np.complex128)
         for iq in range(src.q_stored.shape[0]):
             is_g = iq in set(gamma.tolist())
             name = "eps0mat" if is_g else "epsmat"
@@ -793,7 +801,7 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
                 iqf, g0 = int(idx[0]), -g0s[0]
             qg, _ = be.read_q_gspace(files[name], iqf)
             n = qg.nmtx
-            Z, B, K, V, Wc, _ = q_algebra(src, iq, mesh, rcond=cfg.rcond, print_fn=print_fn)
+            Z, B, K, V, Wc, _, qd = q_algebra(src, iq, mesh, rcond=cfg.rcond, print_fn=print_fn)
             # q_BGW = q_store + g0, so ζ̃_{q_BGW}(G) = ζ̃_{q_store}(G + g0).
             miller = comps[qg.order[:n]] + g0[None, :]
             slots = zeta_slots(src.zeta.gvecs(q=[iq])[0], src.zeta.ngk_valid(q=[iq])[0],
@@ -808,17 +816,28 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
                                    drop_head=is_g)[: src.n_mu, : src.n_mu]
             W_new = V + Wc_bgw
             rel = float(jnp.linalg.norm(Wc_bgw - Wc) / jnp.linalg.norm(Wc))
+            # BerkeleyGW's W = ε⁻¹v is Hermitian only in the orientation read here.
+            herm_bgw = float(jnp.linalg.norm(Wc_bgw - jnp.conj(Wc_bgw).T) / jnp.linalg.norm(Wc_bgw))
+            Bl = B[: src.n_mu, : src.n_mu]
+            Kb = whitened_correlation(0.5 * (Wc_bgw + jnp.conj(Wc_bgw).T), Bl)
+            Kl = K[: src.n_mu, : src.n_mu]
+            evb = np.linalg.eigvalsh(np.asarray(jax.device_get(Kb)))
+            rel_k = float(np.linalg.norm(np.asarray(jax.device_get(Kb - Kl)), 2)
+                          / np.linalg.norm(np.asarray(jax.device_get(Kl)), 2))
             io.write_slab("W0_qmunu", _face_program(mesh, src.n_mu, src.mu_pad)(W_new),
                           offset=(iq, 0, 0))
             head_bgw = None
             if is_g:
                 with h5py.File(files[name], "r") as f:
                     head_bgw = complex(f[be.MATRIX][0, 0, 0, 0, 0, 0] + 1j * f[be.MATRIX][0, 0, 0, 0, 0, 1])
-            figs.append({"q": np.round(src.q_stored[iq], 6).tolist(), "file": name,
-                         "iq_file": iqf, "nmtx": n, "rel_Wc_bgw_vs_lorrax": rel,
-                         "bgw_head": head_bgw})
+            figs.append({"q": np.round(src.q_stored[iq], 6).tolist(), "iq_store": int(iq),
+                         "file": name, "iq_file": iqf, "g0": np.asarray(g0).tolist(), "nmtx": n,
+                         "rel_Wc_bgw_vs_lorrax": rel, "herm_bgw": herm_bgw,
+                         "rel_K_bgw_vs_lorrax": rel_k, "k_bgw_min": float(evb[0]),
+                         "k_bgw_max": float(evb[-1]), "bgw_head": head_bgw, **qd})
             print_fn(f"    stored q {iq} <- {name}[{iqf}] nmtx {n}: "
-                     f"|Wc_BGW − Wc_LX|/|Wc_LX| = {rel:.4e}"
+                     f"|Wc_BGW − Wc_LX|/|Wc_LX| = {rel:.4e}, |Wc_BGW − h.c.|/|Wc_BGW| = {herm_bgw:.1e}, "
+                     f"‖K_BGW − K‖₂/‖K‖₂ = {rel_k:.4e}, K_BGW∈[{evb[0]:.4f}, {evb[-1]:.2e}]"
                      + ("" if head_bgw is None else f", BGW ε⁻¹_00(q0) = {head_bgw:.6f}"))
         io.stamp_dataset_attrs("W0_qmunu", {
             "W0_source": "bgw_epsmat", "bgw_reference": os.path.abspath(cfg.bgw_reference),

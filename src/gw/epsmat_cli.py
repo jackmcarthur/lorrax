@@ -42,6 +42,20 @@ from gw.epsmat_config import EPSMAT_DEFAULTS, EpsmatConfig   # noqa: E402
 __all__ = ["build_parser", "main"]
 
 
+def _json_safe(x):
+    """Plain-JSON copy of a figures tree: complex as ``[re, im]``, numpy as Python."""
+    import numpy as np
+    if isinstance(x, dict):
+        return {str(k): _json_safe(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, np.ndarray)):
+        return [_json_safe(v) for v in (x.tolist() if isinstance(x, np.ndarray) else x)]
+    if isinstance(x, (complex, np.complexfloating)):
+        return [float(x.real), float(x.imag)]
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     timing.reset()
@@ -83,6 +97,13 @@ def main(argv=None) -> int:
             print0(f"  wrote {result['path']}: W0_qmunu from BerkeleyGW on "
                    f"{len(result['q'])} stored q; max |Wc_BGW − Wc_LX|/|Wc_LX| = {worst:.4e}")
     if rank0:
+        import json
+        import os
+        receipt = os.path.join(cfg.output_dir, f"epsmat_{cfg.mode}.json")
+        with open(receipt, "w") as f:
+            json.dump(_json_safe({"mode": cfg.mode, "config": cfg.describe().splitlines(),
+                                  "result": result}), f, indent=1)
+        print0(f"  receipt {receipt}")
         timing.report(print_fn=print, title="--- epsmat timing (s) ---")
     barrier("epsmat.outputs_written")
     return 0

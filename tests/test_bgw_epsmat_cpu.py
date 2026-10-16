@@ -225,10 +225,12 @@ def test_file_layout_reads_back_as_epsinv(tmp_path):
     from file_io.epsreader import EPSReader
     from file_io.slab_io import SlabIO
     mesh = _mesh()
-    q = (1 / 6, 1 / 3, 0.0)
-    r = export(mesh, q, ecuts=2.5)
+    # ecuts 2.8: nmtx 43 under a 44-row mesh pad, so the write must clip.
+    q, ecuts = (1 / 6, 1 / 3, 0.0), 2.8
+    r = export(mesh, q, ecuts=ecuts)
     n = r["n"]
-    rho, qg = bgw_list(np.asarray(q), 2.5)
+    assert r["blk"].shape[0] > n
+    rho, qg = bgw_list(np.asarray(q), ecuts)
     wfn = tmp_path / "WFN.h5"
     with h5py.File(wfn, "w") as f:
         f["mf_header/gspace/components"] = rho.astype(np.int32)
@@ -237,13 +239,14 @@ def test_file_layout_reads_back_as_epsinv(tmp_path):
         f["mf_header/crystal/celvol"] = OMEGA
     path = str(tmp_path / "epsmat.h5")
     be.create_epsmat_file(path, wfn_file=str(wfn), qpts=[q], qgrid=(6, 6, 1), nmtx=[n],
-                          ecuts=2.5, nband=8, efermi_ry=0.0, icutv=6)
+                          ecuts=ecuts, nband=8, efermi_ry=0.0, icutv=6)
     vb = v_slab(np.asarray(q), rho[qg.order[:n]]) * OMEGA
     be.write_q_gspace(path, 0, qg, vb)
     offset, shape = be.matrix_block_window(0, 0, r["blk"].shape[0])
     blk6 = jax.device_put(r["blk"].reshape(shape),
                           NamedSharding(mesh, P(None, None, None, "x", "y", None)))
     with SlabIO(path, mode="a", mesh=mesh) as io:
+        be.register_matrix(io, 1, n)
         io.write_slab(be.MATRIX, blk6, offset=offset)
     be.write_q_diagonal(path, 0, r["diag"][:n])
     with EPSReader(path) as eps:
@@ -260,6 +263,11 @@ def test_file_layout_reads_back_as_epsinv(tmp_path):
     assert np.linalg.norm(W - W.conj().T) / np.linalg.norm(W) < 1e-10
     Wt = E.T * vc[None, :]
     assert np.linalg.norm(Wt - Wt.conj().T) / np.linalg.norm(Wt) > 1e-3
+    # Red twin: the same padded write on a handle that did not register the
+    # skeleton's dataset refuses (reuse-or-refuse, both SlabIO tiers).
+    with pytest.raises(ValueError, match="the dataset exists"):
+        with SlabIO(path, mode="a", mesh=mesh) as io:
+            io.write_slab(be.MATRIX, blk6, offset=offset)
     with h5py.File(path, "r") as f:
         assert f[be.MATRIX].chunks is None and int(f["eps_header/params/icutv"][()]) == 6
 

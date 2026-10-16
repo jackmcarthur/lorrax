@@ -137,7 +137,10 @@ is the part of W that `epsilon_cutoff` leaves out; it is printed per q.
 path; the source is never written (`GATE epsmat_project_output`). At Γ the
 G = 0 row and column of `eps0mat.h5` are dropped: the bundle's Γ body has
 v(G = 0) = 0 and LORRAX carries the head as its rank-one `whead` term, which
-is kept from the bundle (§5).
+is kept from the bundle (§5). Both modes write `epsmat_<mode>.json` in
+`output_dir`: per q the gate figures, the range of K and, for `project`, the
+Hermiticity of the projected BerkeleyGW W − V (a check of the block
+orientation on BerkeleyGW's own data) and $\|K_{\text{BGW}}-K\|_2/\|K\|_2$.
 
 ## 5. q → 0
 
