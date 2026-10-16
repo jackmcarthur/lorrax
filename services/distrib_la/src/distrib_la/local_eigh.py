@@ -44,8 +44,15 @@ SILENTLY on some inputs: NaN eigenvectors, finite eigenvalues, info = 0.  Measur
 eigh_probe4, n = 312): 3 of 128 reflected degenerate matrices (multiplicity >= 16) in both
 routes, every unreflected real-valued one, and 8 of the 64 unreflected Fe ISDF C_q matrices
 (eigh_probe5; the reflector clears all 64); ``zheevdj`` had 0 of 1536, float64 0 of 768.
-jaxlib passes such a matrix on as finite eigenvalues with NaN vectors; this route turns every
-non-finite or info != 0 matrix into NaN in both outputs, so the caller's checks see it.
+jaxlib passes such a matrix on as finite eigenvalues with NaN vectors.  This route marks every non-finite or info != 0 matrix
+NaN in both outputs, on the device (no host read), and the caller's result check refuses it by
+name: the q-batched plans' batch_reshard route checks every stack (GATE
+distrib_la_result_check after its retries).  hsuite na_sc's exact ISDF C_q stack
+c128[4, 96, 96] (a 40-fold eigenvalue) is one such input (gate case, below the c128 window).
+A re-solve of the failed matrices would need the failure count on the host (one sync per
+call), so the handler has none.  WORKSPACE: the handler runs a stack in chunks whose rocSOLVER
+workspace fits the fixed tile (``BatchedEighRow.tile_bytes``), one XLA scratch allocation;
+:func:`batched_workspace_bytes` prices it from shapes.
 A routed stack whose
 target is not loadable refuses by GATE ``batched_eigh_target`` (no fallback to the loop).
 Gate: ``tests/test_rocsolver_eigh_gate.py`` (residual, orthogonality, eigenvalues and
@@ -75,7 +82,8 @@ import jax.numpy as jnp
 import numpy as np
 
 __all__ = ["eigh_local", "EighResult", "COMPLEX_EIGH_ROUTE", "eigh_route",
-           "BATCHED_EIGH_ROUTE", "BatchedEighRow", "EighWindow", "batched_eigh_row"]
+           "BATCHED_EIGH_ROUTE", "BatchedEighRow", "EighWindow", "batched_eigh_row",
+           "batched_workspace_bytes"]
 
 
 class EighResult(NamedTuple):
@@ -95,12 +103,18 @@ class EighWindow(NamedTuple):
     min_batch: int       #: smallest stack (product of the leading axes) it takes
     min_n: int           #: smallest matrix side it takes
     max_n: int           #: largest matrix side it takes
+    workspace_tiles: int  #: rocSOLVER workspace per matrix is at most this many n x n elements
+                          #: (pool log eighc_wsq: c128 2.26-3.80, f64 3.26-4.84), the shape-only
+                          #: price of :func:`batched_workspace_bytes`
 
 
 class BatchedEighRow(NamedTuple):
     """A leg's native batched solver: its target and, per dtype name, the window it serves."""
     target: str          #: XLA FFI target (distrib_la.loader's table for the leg)
     windows: dict        #: dtype name -> EighWindow
+    tile_bytes: int = 1 << 30  #: the fixed tile, ``runtime.tiles.TILE_BYTES`` (a service cannot
+                               #: import ``src``; tests/test_rocsolver_eigh_gate.py pins it): the
+                               #: handler runs a stack in chunks whose workspace fits it
 
 
 #: Leg key -> its batched native eigh.  Absent (or a stack outside the row) = the solve is
@@ -113,8 +127,8 @@ class BatchedEighRow(NamedTuple):
 #: (1.86x at b = 2); n > 3120 not measured.  heevdj (eigh_bench3) only
 #: wins at n <= 312 and is 2.8x slower than heevd at 16 x 312, so no window takes it.
 BATCHED_EIGH_ROUTE = {"ROCM": BatchedEighRow("lorrax_rocsolver_batched_eigh", {
-    "complex128": EighWindow("heevd", min_batch=2, min_n=40, max_n=3120),
-    "float64":    EighWindow("syevd", min_batch=2, min_n=40, max_n=3120)})}
+    "complex128": EighWindow("heevd", min_batch=2, min_n=40, max_n=3120, workspace_tiles=4),
+    "float64":    EighWindow("syevd", min_batch=2, min_n=40, max_n=3120, workspace_tiles=5)})}
 
 
 def _process_leg_key():
@@ -141,6 +155,19 @@ def batched_eigh_row(shape, dtype, leg_key=None):
     return row
 
 
+def batched_workspace_bytes(shape, dtype, leg_key=None):
+    """Per-device bytes the leg's batched target adds beside its operand and outputs for a local
+    stack ``shape``, from shapes only (0 when the row does not take it): the rocSOLVER workspace,
+    ``min(tile, b x workspace_tiles x n^2 x itemsize)``, plus the tridiagonal E (b n float64).
+    The tile caps the first term whatever the batch (the handler chunks the stack)."""
+    row = batched_eigh_row(shape, dtype, leg_key)
+    if row is None:
+        return 0
+    win = row.windows[np.dtype(dtype).name]
+    b, n, item = math.prod(shape[:-2]), int(shape[-1]), np.dtype(dtype).itemsize
+    return min(int(row.tile_bytes), b * win.workspace_tiles * n * n * item) + b * n * 8
+
+
 def _require_target(target):
     from distrib_la.loader import probe_target
     leg = _process_leg_key()
@@ -150,7 +177,7 @@ def _require_target(target):
                            f"want: the leg built with src/ffi/cpp/rocsolver (BATCHED_EIGH_ROUTE row)")
 
 
-def _batched_call(target, a, driver):
+def _batched_call(target, a, driver, tile_bytes):
     """One strided-batched rocSOLVER call on a stack of FULL Hermitian matrices.
 
     The handler reads the row-major buffer as column-major, i.e. solves A^T = conj(A), whose
@@ -160,7 +187,8 @@ def _batched_call(target, a, driver):
         target,
         (jax.ShapeDtypeStruct(a.shape, a.dtype), jax.ShapeDtypeStruct(a.shape[:-1], real),
          jax.ShapeDtypeStruct(a.shape[:-2], jnp.int32)),
-        vmap_method="broadcast_all")(a, lower=np.int64(1), jacobi=np.int64(driver.endswith("j")))
+        vmap_method="broadcast_all")(a, lower=np.int64(1), jacobi=np.int64(driver.endswith("j")),
+                                     tile_bytes=np.int64(tile_bytes))
     return w, jnp.conj(jnp.swapaxes(r, -1, -2)), info
 
 
@@ -170,11 +198,13 @@ def _failed(w, v, info):
 
 
 def _native_batched_eigh(row, a):
-    """eigh of a stack of full Hermitian matrices by ``row`` (one call, no device control
-    flow).  A matrix rocSOLVER reports failed, or leaves non-finite with info = 0 (its silent
-    mode, module docstring), is NaN in both w and v: jaxlib's failure contract, made explicit."""
+    """eigh of a stack of full Hermitian matrices by ``row`` (one FFI call; no device control
+    flow, no host read).  A matrix rocSOLVER reports failed, or leaves non-finite with info = 0
+    (its silent mode, module docstring), is NaN in both w and v, on the device: jaxlib's failure
+    contract, made explicit, for the caller's result check to refuse by name."""
     _require_target(row.target)
-    w, v, info = _batched_call(row.target, a, row.windows[np.dtype(a.dtype).name].driver)
+    win = row.windows[np.dtype(a.dtype).name]
+    w, v, info = _batched_call(row.target, a, win.driver, row.tile_bytes)
     bad = _failed(w, v, info)
     w = jnp.where(bad[..., None], jnp.nan, w)
     v = jnp.where(bad[..., None, None], jnp.nan, v)

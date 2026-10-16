@@ -220,11 +220,16 @@ NA_SC_STACKS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
 
 def captured_cases(mesh):
     """The native target on the captured na_sc stacks, whatever the row's window: every device
-    solves the whole stack; reference host LAPACK, jaxlib's loop (the old route) reported beside."""
+    solves the whole stack; reference host LAPACK, jaxlib's loop (the old route) reported beside.
+    A matrix rocSOLVER fails silently must come back NaN in both w and v (marked on the device);
+    the others must pass.  Then the checked q-batched plan (route batch_reshard) on the C_q stack
+    with the c128 window opened to it: its result check must catch the marked matrices and
+    either repair them by its own retries (a valid result) or refuse by name."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from lxkit import device_put_process_local
+    import distrib_la
     from distrib_la import local_eigh as le
 
     spec = P(tuple(mesh.axis_names))
@@ -235,21 +240,98 @@ def captured_cases(mesh):
     sm = lambda f: jax.jit(jax.shard_map(lambda t: tuple(f(t)), mesh=mesh, in_specs=spec, out_specs=(spec, spec)))
     out = {}
     with np.load(NA_SC_STACKS) as data:
-        for key in sorted(data.files):
-            stack = data[key]
-            glob = np.concatenate([stack] * ndev)
-            x = device_put_process_local(glob, NamedSharding(mesh, spec))
-            for tag, f in (("native", native), ("old loop", loop)):
-                w, v = sm(f)(x)
-                ms = []
-                for sw, sv in zip(w.addressable_shards, v.addressable_shards):
-                    a_loc = glob[sw.index[0]]
-                    w_r, v_r = np.linalg.eigh(a_loc)
-                    ms.append(compare(a_loc, np.asarray(sw.data), np.asarray(sv.data), w_r, v_r))
-                m = {k: (all(d[k] for d in ms) if k == "finite" else max(d[k] for d in ms)) for k in ms[0]}
-                if tag == "old loop":
-                    m["report_only"] = True
-                out[f"na_sc {key:10s} c128 b={stack.shape[0]} n={stack.shape[-1]} [{tag}]"] = m
+        stacks = {k: data[k] for k in data.files}
+    for key in sorted(stacks):
+        stack = stacks[key]
+        glob = np.concatenate([stack] * ndev)
+        x = device_put_process_local(glob, NamedSharding(mesh, spec))
+        for tag, f in (("native", native), ("old loop", loop)):
+            w, v = sm(f)(x)
+            ms, failed, marked = [], 0, True
+            for sw, sv in zip(w.addressable_shards, v.addressable_shards):
+                a_loc, w_n, v_n = glob[sw.index[0]], np.asarray(sw.data), np.asarray(sv.data)
+                fin = np.array([np.isfinite(v_n[i]).all() and np.isfinite(w_n[i]).all() for i in range(len(v_n))])
+                failed += int((~fin).sum())
+                marked &= bool(np.isnan(w_n[~fin]).all() and np.isnan(v_n[~fin]).all())
+                if fin.any():
+                    w_r, v_r = np.linalg.eigh(a_loc[fin])
+                    ms.append(compare(a_loc[fin], w_n[fin], v_n[fin], w_r, v_r))
+            m = ({k: (all(d[k] for d in ms) if k == "finite" else max(d[k] for d in ms)) for k in ms[0]}
+                 if ms else dict(res=0.0, orth=0.0, dw=0.0, proj=0.0, proj_ratio=0.0, finite=True))
+            m["finite"] = m["finite"] and (marked if tag == "native" else failed == 0)
+            m["new_nan"] = failed
+            if tag == "old loop":
+                m["report_only"] = True
+            out[f"na_sc {key:10s} c128 b={stack.shape[0]} n={stack.shape[-1]} [{tag}]"] = m
+    # The checked plan on the C_q stack, the window opened to n = 96 for this case only.
+    cq = stacks["cq_factor"]
+    win = row.windows["complex128"]
+    le.BATCHED_EIGH_ROUTE["ROCM"] = row._replace(windows={**row.windows, "complex128": win._replace(min_n=cq.shape[-1])})
+    try:
+        plan = distrib_la.plan("eigh", mesh, backend="off", n=cq.shape[-1], batched_route="batch_reshard")
+        face = NamedSharding(mesh, P(None, "x", "y"))
+        x = device_put_process_local(cq, face)
+        label = f"na_sc cq_factor  c128 b={cq.shape[0]} n={cq.shape[-1]} [checked plan, window opened]"
+        try:
+            w, v = plan.batched(x)
+            w_h = np.asarray(jax.device_get(w)) if w.is_fully_addressable else None
+            if w_h is None:
+                from jax.experimental import multihost_utils
+                w_h = np.asarray(multihost_utils.process_allgather(w, tiled=True))
+                v_h = np.asarray(multihost_utils.process_allgather(v, tiled=True))
+            else:
+                v_h = np.asarray(jax.device_get(v))
+            w_r, v_r = np.linalg.eigh(cq)
+            m = compare(cq, w_h, v_h, w_r, v_r)
+            m["outcome"] = "valid after the check"
+        except ValueError as exc:
+            named = "distrib_la_result_check" in str(exc)
+            m = dict(res=0.0, orth=0.0, dw=0.0, proj=0.0, proj_ratio=0.0, finite=named,
+                     outcome=("refused by name: " if named else "UNNAMED refusal: ") + str(exc)[:160])
+        out[label] = m
+    finally:
+        le.BATCHED_EIGH_ROUTE["ROCM"] = row
+    return out
+
+
+#: Stacks whose rocSOLVER workspace exceeds the fixed tile, so the handler runs them in chunks
+#: (pool log eighc_wsq: c128 n = 1960 139 MB, n = 3120 352 MB of workspace per matrix -> 7 and 3
+#: matrices per 1 GiB chunk).  Compared on the device against jnp.linalg.eigh (no host LAPACK).
+TILE_CASES = (("random", 8, 1960, "complex128"), ("random", 4, 3120, "complex128"),
+              ("random", 6, 3120, "float64"))
+
+
+def tile_cases(mesh):
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit import device_put_process_local
+    from distrib_la import local_eigh as le
+
+    spec = P(tuple(mesh.axis_names))
+    ndev = int(np.prod(mesh.devices.shape))
+    rng = np.random.default_rng(20261016)
+    out = {}
+    for kind, b, n, dt in TILE_CASES:
+        row = le.batched_eigh_row((b, n, n), np.dtype(dt))
+        assert row is not None, (b, n, dt)
+        x = device_put_process_local(_case(kind, rng, b * ndev, n, dt), NamedSharding(mesh, spec))
+
+        def metrics(t):
+            w, v = le.eigh_local(t)
+            w0, _ = jnp.linalg.eigh(t)
+            scale = jnp.max(jnp.abs(t))
+            vh = jnp.conj(jnp.swapaxes(v, -1, -2))
+            res = jnp.max(jnp.abs(t @ v - v * w[..., None, :])) / scale
+            orth = jnp.max(jnp.abs(vh @ v - jnp.eye(n, dtype=t.dtype)))
+            dw = jnp.max(jnp.abs(w - w0)) / scale
+            return jnp.stack([res, orth, dw])[None]
+        r = jax.jit(jax.shard_map(metrics, mesh=mesh, in_specs=spec, out_specs=P(tuple(mesh.axis_names))))(x)
+        vals = np.max(np.concatenate([np.asarray(s.data) for s in r.addressable_shards]), axis=0)
+        ws_bytes = le.batched_workspace_bytes((b, n, n), np.dtype(dt))
+        out[f"tile  {kind:6s} {dt:10s} b={b:3d} n={n:4d} (priced workspace {ws_bytes / 2**20:.0f} MiB)"] = dict(
+            res=float(vals[0]), orth=float(vals[1]), dw=float(vals[2]), proj=0.0, proj_ratio=0.0,
+            finite=bool(np.all(np.isfinite(vals))))
     return out
 
 
@@ -264,13 +346,14 @@ def main() -> int:
         print(f"SKIP: needs a ROCm mesh, got {mesh_ffi_platform(mesh)}", flush=True)
         runtime.finalize_process(0)
         return 0
-    out = {**gate_cases(mesh), **captured_cases(mesh)}
+    out = {**gate_cases(mesh), **captured_cases(mesh), **tile_cases(mesh)}
     bad = {k: m for k, m in out.items() if not m.get("report_only") and not passes(m)}
     for k, m in out.items():
         print(f"r{jax.process_index()} {'ok  ' if not k in bad else 'FAIL'} {k}  res {m['res']:.1e} "
               f"orth {m['orth']:.1e} dw {m['dw']:.1e} proj {m['proj']:.1e} (bound ratio {m['proj_ratio']:.1e})"
-              + (f"  [failed matrices: old route {m['ref_nan']}, new route {m['new_nan']}]"
-                 if m.get("ref_nan") or m.get("new_nan") else ""), flush=True)
+              + (f"  [failed matrices: old route {m.get('ref_nan', 0)}, new route {m['new_nan']}]"
+                 if m.get("ref_nan") or m.get("new_nan") else "")
+              + (f"  [{m['outcome']}]" if "outcome" in m else ""), flush=True)
     nbad = len(bad)
     print(f"r{jax.process_index()} ROCSOLVER_EIGH_GATE {'PASS' if not bad else 'FAIL'} on "
           f"{tuple(mesh.devices.shape)}: {len(out) - len(bad)}/{len(out)} (tol {TOL:g}, proj {PROJ_TOL:g})",
@@ -343,6 +426,33 @@ def test_the_na_sc_stacks_carry_the_padding_multiplet():
         assert w[0] < pad[0, 0].real < w[-1]
         assert np.sum(np.abs(w - pad[0, 0].real) <= 1e-12 * w[-1]) >= 40
 
+
+def test_the_tile_and_the_workspace_price():
+    """The row's tile is runtime.tiles.TILE_BYTES; the price bounds the measured workspace
+    (pool log eighc_wsq) and never exceeds one tile plus E; outside the row it is 0."""
+    from runtime.tiles import TILE_BYTES
+    from distrib_la.local_eigh import BATCHED_EIGH_ROUTE, batched_workspace_bytes
+    row = BATCHED_EIGH_ROUTE["ROCM"]
+    assert row.tile_bytes == TILE_BYTES
+    measured = {("complex128", 128): 15925440, ("complex128", 312): 63689152,       # b = 16
+                ("complex128", 3120): 5628233792, ("float64", 128): 10141888,
+                ("float64", 3120): 4063690816}
+    for (dt, n), ws in measured.items():
+        price = batched_workspace_bytes((16, n, n), dt, "ROCM")
+        assert price >= min(ws, TILE_BYTES) and price <= TILE_BYTES + 16 * n * 8
+    assert batched_workspace_bytes((16, 312, 312), "complex128", "CUDA") == 0
+    assert batched_workspace_bytes((1, 312, 312), "complex128", "ROCM") == 0
+
+
+def test_the_route_has_no_host_repair():
+    """Owner rule: no per-call host read.  The handler has no D2H copy or stream sync, and the
+    route passes no repair attribute."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "ffi", "cpp",
+                            "rocsolver", "batched_eigh_ffi.cc")).read()
+    for token in ("kDeviceToHost", "stream_synchronize", "hipDeviceSynchronize", "hipStreamSynchronize"):
+        assert token not in src, token
+    from distrib_la import local_eigh
+    assert "repair=" not in open(local_eigh.__file__).read()
 
 def test_device_gate_needs_rocm():
     pytest.skip("run as a script on a ROCm mesh: python -m tests.test_rocsolver_eigh_gate")
