@@ -27,6 +27,9 @@ _CONFIG = Path(__file__).resolve().parents[2] / 'config'
 #: Library-neutral: they configure libfabric, under NCCL's or RCCL's plugin.
 _CXI_DEFAULTS = {'FI_CXI_DISABLE_HOST_REGISTER': '1', 'FI_CXI_RDZV_THRESHOLD': '0'}
 _configuration = None
+#: The variables that choose the collective library's transport: never filled in
+#: once the caller has set either (``plan_network_environment``, explicit transport).
+_TRANSPORT_CHOICE = ('NCCL_NET', 'NCCL_NET_PLUGIN')
 
 
 def _positive_int(value):
@@ -147,15 +150,27 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
             raise RuntimeError(_sockets_refusal(
                 profile['site'], nodes, 'NCCL_NET=Socket is set', step_network, leg))
         result['policy'] = 'explicit transport'
+        if multiple is not True:
+            return result
+        # The caller chose WHICH transport (NCCL_NET / NCCL_NET_PLUGIN, e.g. an
+        # export in a job script); neither is filled in.  What the fabric needs
+        # whoever chose it still holds: the site's start-up requirements (the
+        # launch libraries the transport dlopens; MPI opening its endpoint
+        # before the collective library's plugin, without which cray-mpich's
+        # MPI_Init_thread fails with ENOSPC on every rank) and the site's other
+        # settings, filled in where the caller has not exported them exactly as
+        # on the profile branch.  Without the libfabric/CXI settings a Frontier
+        # P=16 Fe V2 step under an exported NCCL_NET hung in its first ISDF
+        # collective (2026-10-16; with only the FI_* settings added it ran).
         if section:
-            # The caller chose the transport (a site module such as Frontier's
-            # rccl-net-plugin exports NCCL_NET/NCCL_NET_PLUGIN), so no default is
-            # filled in; the site's start-up REQUIREMENTS hold whoever chose it:
-            # the launch libraries the transport dlopens, and MPI opening its
-            # endpoint before the collective library's plugin (without it,
-            # cray-mpich's MPI_Init_thread fails with ENOSPC on every rank).
             _require_launch_libraries(section, env, profile['site'], leg, lib, is_file)
             result['mpi_before_collectives'] = bool(section.get('mpi_before_collectives'))
+            defaults = section.get('env', {})
+        else:
+            on_cxi = cxi if cxi is not None else os.path.isdir('/sys/class/cxi')
+            defaults = _CXI_DEFAULTS if on_cxi else {}
+        result['applied'] = {name: value for name, value in defaults.items()
+                             if name not in env and name not in _TRANSPORT_CHOICE}
         return result
     if multiple is not True:
         return result

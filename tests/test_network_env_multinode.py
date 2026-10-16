@@ -46,13 +46,14 @@ def plan(env, *, is_file=lambda path: True, cxi=False):
 
 # --- the decision matrix -----------------------------------------------------
 # (site, leg, step, transport) -> (policy, applied, mpi_before_collectives)
-# applied: "site" = every key of the site's section env; {} = nothing.
+# applied: "site" = every key of the site's section env; "fabric" = those keys except the
+# transport choice (NCCL_NET, NCCL_NET_PLUGIN), which the caller made; {} = nothing.
 # mpi: True/False = recorded; None = not recorded (no profile section applies).
 MATRIX = [
     # Frontier, ROCm: the profile on a multi-node step; its start-up requirements under any transport.
     ("frontier", "rocm", "2node", "none", "frontier profile", "site", True),
-    ("frontier", "rocm", "2node", "net", "explicit transport", {}, True),
-    ("frontier", "rocm", "2node", "plugin", "explicit transport", {}, True),
+    ("frontier", "rocm", "2node", "net", "explicit transport", "fabric", True),
+    ("frontier", "rocm", "2node", "plugin", "explicit transport", "fabric", True),
     ("frontier", "rocm", "1node", "none", "unchanged", {}, None),
     ("frontier", "rocm", "1node", "plugin", "explicit transport", {}, None),
     ("frontier", "rocm", "unknown", "none", "unchanged", {}, None),
@@ -61,8 +62,8 @@ MATRIX = [
     ("frontier", "cpu", "2node", "none", "no device collectives", {}, None),
     # Perlmutter, CUDA: the profile on a multi-node step; no MPI-first requirement.
     ("perlmutter", "cuda", "2node", "none", "perlmutter profile", "site", False),
-    ("perlmutter", "cuda", "2node", "net", "explicit transport", {}, False),
-    ("perlmutter", "cuda", "2node", "plugin", "explicit transport", {}, False),
+    ("perlmutter", "cuda", "2node", "net", "explicit transport", "fabric", False),
+    ("perlmutter", "cuda", "2node", "plugin", "explicit transport", "fabric", False),
     ("perlmutter", "cuda", "1node", "none", "unchanged", {}, None),
     ("perlmutter", "cuda", "unknown", "none", "unchanged", {}, None),
     ("perlmutter", "rocm", "2node", "none", "unchanged", {}, None),
@@ -79,7 +80,10 @@ MATRIX = [
 def test_decision_matrix(site, leg, step, transport, policy, applied, mpi):
     result = plan(env_of(site, leg, step, transport))
     assert result["policy"] == policy
-    want = {"frontier": FRONTIER_ENV, "perlmutter": PERLMUTTER_ENV}[site] if applied == "site" else applied
+    site_env = {"frontier": FRONTIER_ENV, "perlmutter": PERLMUTTER_ENV}.get(site, {})
+    want = (site_env if applied == "site" else
+            {k: v for k, v in site_env.items() if k not in ("NCCL_NET", "NCCL_NET_PLUGIN")}
+            if applied == "fabric" else applied)
     assert result["applied"] == want
     assert result.get("mpi_before_collectives") == mpi
     if leg != "cpu":
@@ -97,6 +101,23 @@ def test_unprofiled_slingshot_applies_only_the_generic_cxi_settings(leg):
     result = plan(env_of("none", leg, "2node", "none"), cxi=True)
     assert result["policy"] == "generic Slingshot" and result["applied"] == ne._CXI_DEFAULTS
     assert result.get("mpi_before_collectives") is None
+
+
+@pytest.mark.parametrize("leg", ["cuda", "rocm"])
+def test_unprofiled_slingshot_explicit_transport_still_gets_the_generic_cxi_settings(leg):
+    result = plan(env_of("none", leg, "2node", "net"), cxi=True)
+    assert result["policy"] == "explicit transport" and result["applied"] == ne._CXI_DEFAULTS
+    one = plan(env_of("none", leg, "1node", "net"), cxi=True)
+    assert one["policy"] == "explicit transport" and one["applied"] == {}
+
+
+@pytest.mark.parametrize("site, leg", [("frontier", "rocm"), ("perlmutter", "cuda")])
+def test_explicit_transport_never_fills_the_transport_choice_and_caller_exports_win(site, leg):
+    for transport in ("net", "plugin"):
+        result = plan(env_of(site, leg, "2node", transport, FI_CXI_RDZV_THRESHOLD="16384"))
+        assert "NCCL_NET" not in result["applied"] and "NCCL_NET_PLUGIN" not in result["applied"]
+        assert "FI_CXI_RDZV_THRESHOLD" not in result["applied"]
+        assert result["applied"]["FI_CXI_DISABLE_HOST_REGISTER"] == "1"
 
 
 # --- refusals ----------------------------------------------------------------
