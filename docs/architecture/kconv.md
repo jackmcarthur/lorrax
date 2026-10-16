@@ -580,7 +580,11 @@ per-lane accumulator $\lceil N_k/16\rceil\cdot\lceil n_c/8\rceil \le 8$ m8n8
 blocks (`ffi.fft.klead_outer_decode_refusal`). A caller that gets a reason
 from either refusal function keeps the next route down (outer load with an
 XLA decode, or the XLA encode with mode 2); the route order and its
-announcement are on the [BSE page](bse.md#the-matvec).
+announcement are on the [BSE page](bse.md#the-matvec). Both handlers address
+each operand with 32-bit offsets from per-tile 64-bit bases, so every
+operand of one call holds fewer than $2^{31}$ elements; the BSE W term
+splits its $(\mu, \nu)$ tile into blocks that keep each call below that and
+its stored U within the fixed tile (`bse_stack_matvec.plan_w_blocks`).
 `LORRAX_BSE_OUTER_KSUM=fma` runs both K sums on the fp64 FMA pipe instead of
 the tensor cores, for comparing the two on devices where their rates differ.
 
@@ -611,6 +615,7 @@ not of the traffic.
 | `GATE mathdx-kconv-chi-residency` | kernel build | mode 11 cannot hold the grid | none here: the router sends such grids to the XLA backend (`mathdx_refusal`), so this gate means that rule and the handler's disagree, which is a bug |
 | `GATE mathdx-kconv-unfold-scratch`, `-lorentz-scratch`, `-chi-scratch` | apply | XLA's scratch allocator refuses the split-arm intermediate of mode 7, 8 or 11 ([§7](#tiles)) | for mode 11, a smaller `scratch_bytes` |
 | `GATE mathdx-kconv-outer-tile`, `-outer-decode-tile`, `-outer-arch`, `-outer-rank` | kernel build | the BSE outer load's bank or accumulator does not fit, the device is older than sm_80, or K is not a multiple of 4 | call through the factories, which check `klead_outer_refusal` / `klead_outer_decode_refusal` and pad K |
+| `klead outer conv` / `klead outer decode`: an operand holds ≥ 2³¹ elements | handler | one call's U, legs, fragment tiles, W block or A reaches $2^{31}$ elements (32-bit offsets) | call through `bse_stack_matvec`, whose `plan_w_blocks` keeps every call's operands below the cap |
 | `GATE mathdx-plane-split`, `mathdx-plane-residency` | kernel build | a direct mode-10 call on a plane with no split or too large | call through `make_plane_fft_gather` |
 | `GATE plane-fft-dtype` | trace | mode 10's `F` is not complex128 | pass complex128 |
 | `k-leading unfold conv: …` (and `lorentz conv`, `chi unfold`, `unfold fft`) | factory; apply | tables cut for another mesh, operands whose parent count or endpoint widths differ from the tables, or a missing partner on a plan with antiunitary rows | build the tables from the same plan and mesh as the operands; pass the partner |

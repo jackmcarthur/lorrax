@@ -2184,7 +2184,7 @@ def main(argv=None):
                 from gw.head_densify import attach_head_channel
                 w_head_mode = resolve_w_head_densify(
                     args.w_head_densify, params, modes=("c1",))
-                W_q_fine_in = data["W_q"]
+                W_q_fine_in, data["W_q"] = data["W_q"], None   # consumed: attach_head_channel donates it
                 head_ch = None
                 if w_head_mode == "c1":
                     head_ch = _resolve_native_w_head(
