@@ -107,7 +107,7 @@ def raw_cases(platform):
     nat.require_prepared_active_local_cuda(platform)
     dev = jax.local_devices()[0]
     put = lambda x: jax.device_put(jnp.asarray(x), dev)
-    out, loud = {}, {}
+    out, loud, conj_bitwise = {}, {}, {}
     cases = [(name, (NQ, M, K, N), dt, bd) for name, bd in BOUNDS.items()
              for dt in (np.complex128, np.float64)]
     rng0 = np.random.default_rng(11)
@@ -141,6 +141,14 @@ def raw_cases(platform):
             loud[tag] = bool(ok.all())
             got["device"] = jax.jit(lambda A, B, BD, W, C: dvc.active_local_device(
                 A, B, BD, W, C if beta != 0 else None, alpha=alpha, beta=beta))(A, B, BD, W, C)
+            # conj_b: the kernel reads conj(Bc) on load; on Bc = conj(b) it must reproduce the
+            # plain call bit for bit (the same products in the same order).
+            Bc = put(np.conj(b))
+            got["device_conj_b"] = jax.jit(lambda A, B, BD, W, C: dvc.active_local_device(
+                A, B, BD, W, C if beta != 0 else None, alpha=alpha, beta=beta,
+                conj_b=True))(A, Bc, BD, W, C)
+            conj_bitwise[tag] = bool(np.array_equal(np.asarray(got["device_conj_b"]),
+                                                    np.asarray(got["device"]), equal_nan=True))
             got["device_raw_unweighted"] = jax.jit(lambda X, B, BD, C: dvc.device_call(
                 X, B, BD, None, C if beta != 0 else None, alpha=alpha, beta=beta))(wa, B, BD, C)
             if np.all(bounds == bounds[0]):
@@ -190,6 +198,8 @@ def raw_cases(platform):
         inval[f"device_withC{bad}"] = bool(np.all(np.isnan(g)))
     for tag, v in loud.items():
         inval[f"full_poisoned_is_nan_or_exact {tag}"] = v
+    for tag, v in conj_bitwise.items():
+        inval[f"device_conj_b_bitwise {tag}"] = v
     try:
         BD = put(np.array([[6, 3]] * NQ, np.int32))
         np.asarray(jax.jit(lambda A, B, BD: nat._native_out(A, B, BD, alpha=np.complex128(1)))(A, B, BD))
@@ -232,7 +242,11 @@ def plan_cases(mesh, platform):
                                     weights=jnp.asarray(w))
             prep = plan.prepare_active_range(lo.tolist(), hi.tolist())
             got_p = prep(A, B, glob(c, so), weights=jnp.asarray(w))
-            for label, arr in ((route, got), (route + "_prepared", got_p)):
+            # conj_b on conj(b): every route must reproduce the plain contraction
+            got_cj = plan.active_range(A, glob(np.conj(b), sb), jnp.asarray(lo), jnp.asarray(hi),
+                                       glob(c, so), weights=jnp.asarray(w), conj_b=True)
+            for label, arr in ((route, got), (route + "_prepared", got_p),
+                               (route + "_conj_b", got_cj)):
                 res[label] = max(_rel(s.data, ref[s.index]) for s in arr.addressable_shards)
     finally:
         al.ACTIVE_LOCAL_ROUTE[platform] = row0

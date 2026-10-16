@@ -53,13 +53,16 @@ __device__ __forceinline__ void lrx_mac(double& acc, double a, double b) { acc +
 __device__ __forceinline__ void lrx_mac(lrx_z& acc, lrx_z a, lrx_z b) {
     acc.re += a.re * b.re; acc.re -= a.im * b.im; acc.im += a.re * b.im; acc.im += a.im * b.re;
 }
+// conj_b: B is read conjugated on load (the Green / W right operand conj(psi), never formed).
+__device__ __forceinline__ double lrx_conj(double v) { return v; }
+__device__ __forceinline__ lrx_z lrx_conj(lrx_z v) { v.im = -v.im; return v; }
 __device__ __forceinline__ double lrx_qnan() {
     union { long long i; double d; } u; u.i = 0x7ff8000000000000LL; return u.d;
 }
 __device__ __forceinline__ double lrx_nan(double) { return lrx_qnan(); }
 __device__ __forceinline__ lrx_z lrx_nan(lrx_z) { lrx_z z; z.re = lrx_qnan(); z.im = lrx_qnan(); return z; }
 
-template <typename T>
+template <typename T, bool CJ>
 __device__ __forceinline__ void lrx_active_gemm(
     const T* __restrict__ A, const T* __restrict__ B, const T* __restrict__ W,
     const int* __restrict__ bounds, int bstride, int nb, T* C, int m, int k, int n,
@@ -104,7 +107,10 @@ __device__ __forceinline__ void lrx_active_gemm(
         for (int e = t; e < LRX_TK * LRX_TN; e += LRX_NT) {
             const int kr = e / LRX_TN, jc = e - kr * LRX_TN, jj = col0 + jc, kk = k0 + kr;
             T v = zero;
-            if (kk < hi && jj < n) v = Bq[(long long)kk * n + jj];
+            if (kk < hi && jj < n) {
+                v = Bq[(long long)kk * n + jj];
+                if constexpr (CJ) v = lrx_conj(v);
+            }
             Bs[kr][jc] = v;
         }
         __syncthreads();
@@ -213,7 +219,7 @@ __device__ __forceinline__ lrx_z lrx_acc(double re, double im, lrx_z) { lrx_z z;
 // two accumulator sets that alternate over k4 steps, so a wave still issues four independent
 // MFMA chains; they are summed in the epilogue (a different, still exact-product, summation
 // order: within the 1e-13 gate).
-template <typename T, int WT>
+template <typename T, int WT, bool CJ>
 __device__ __forceinline__ void lrx_active_gemm_mfma(
     const T* __restrict__ A, const T* __restrict__ B, const T* __restrict__ W,
     const int* __restrict__ bounds, int bstride, int nb, T* C, int m, int k, int n,
@@ -269,7 +275,10 @@ __device__ __forceinline__ void lrx_active_gemm_mfma(
             const int e = t + x * LRX_NT;
             const int kr = e / BN, jc = e - kr * BN, jj = col0 + jc, kk = k0 + kr;
             T v = zero;
-            if (kk < hi && jj < n) v = Bq[(long long)kk * n + jj];
+            if (kk < hi && jj < n) {
+                v = Bq[(long long)kk * n + jj];
+                if constexpr (CJ) v = lrx_conj(v);
+            }
             rb[x] = v;
         }
     };
@@ -325,9 +334,9 @@ __device__ __forceinline__ void lrx_active_gemm_mfma(
             }
         }
 }
-#define LRX_GEMM_BODY(T) lrx_active_gemm_mfma<T, 32>
+#define LRX_GEMM_BODY(T, CJ) lrx_active_gemm_mfma<T, 32, CJ>
 #else
-#define LRX_GEMM_BODY(T) lrx_active_gemm<T>
+#define LRX_GEMM_BODY(T, CJ) lrx_active_gemm<T, CJ>
 #endif
 
 #define LRX_ACTIVE_GEMM_ENTRY(name, T, BODY)                                                  \
@@ -340,10 +349,13 @@ __device__ __forceinline__ void lrx_active_gemm_mfma(
     }
 
 // 64 x 64 block tile (both paths).
-LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z, lrx_z, LRX_GEMM_BODY(lrx_z))
-LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d, double, LRX_GEMM_BODY(double))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z, lrx_z, (LRX_GEMM_BODY(lrx_z, false)))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d, double, (LRX_GEMM_BODY(double, false)))
+// conj_b images: B conjugated on load, a compile-time variant (no branch in the load path).
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_zc, lrx_z, (LRX_GEMM_BODY(lrx_z, true)))
 #if LRX_MFMA
 // 32 x 32 block tile (MFMA path only; the host requests it where it pads less).
-LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z32, lrx_z, (lrx_active_gemm_mfma<lrx_z, 16>))
-LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d32, double, (lrx_active_gemm_mfma<double, 16>))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z32, lrx_z, (lrx_active_gemm_mfma<lrx_z, 16, false>))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d32, double, (lrx_active_gemm_mfma<double, 16, false>))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z32c, lrx_z, (lrx_active_gemm_mfma<lrx_z, 16, true>))
 #endif

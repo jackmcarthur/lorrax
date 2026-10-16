@@ -159,6 +159,10 @@ class GemmPlan:
     reduction_axis: str | None = None
     _active_fn_with_c: Callable | None = field(default=None, compare=False, hash=False)
     _active_fn_no_c: Callable | None = field(default=None, compare=False, hash=False)
+    #: ``active_range(conj_b=True)``: the same contraction on ``conj(B)``, read conjugated by
+    #: the device kernel as it loads ``B`` (other routes conjugate inside the same jit).
+    _active_fn_conj_with_c: Callable | None = field(default=None, compare=False, hash=False)
+    _active_fn_conj_no_c: Callable | None = field(default=None, compare=False, hash=False)
 
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what shape."""
@@ -219,7 +223,7 @@ class GemmPlan:
                       self.out_sharding)
         return self._fn_with_c(A, B, c_or_out)
 
-    def active_range(self, A, B, lo, hi, C=None, *, out=None, weights=None):
+    def active_range(self, A, B, lo, hi, C=None, *, out=None, weights=None, conj_b=False):
         """Contract exact intervals, optionally scaling columns by weights[nq,K].
 
         Construct with ``enable_active_range=True``. Full allocation shapes
@@ -228,6 +232,9 @@ class GemmPlan:
         products, the local backend's tile) runs over the interval only: CUDA
         cuBLAS pointer views, or bounded JAX panels elsewhere. Neither route
         multiplies inactive tails.
+
+        ``conj_b``: contract ``conj(B)`` without forming it -- the device route conjugates on
+        load; every other route conjugates inside its own jit (as a caller's ``jnp.conj``).
 
         Require 0 <= lo <= hi <= K. Invalid Python integer bounds raise eagerly;
         invalid traced bounds raise in the native provider or produce an
@@ -263,14 +270,20 @@ class GemmPlan:
                 raise ValueError("gemm_plan.active_range: weights must have shape(nq,K)")
         if weights is None:
             weights = jnp.ones((self.nq, self.k), dtype=self.dtype)
+        fn_no_c, fn_with_c = self._active_fn_no_c, self._active_fn_with_c
+        if conj_b and self.dtype.kind == "c":
+            if self._active_fn_conj_with_c is not None:
+                fn_no_c, fn_with_c = self._active_fn_conj_no_c, self._active_fn_conj_with_c
+            else:
+                B = jnp.conj(B)
         active_args = (A, B, bounds, weights)
         c = C if C is not None else out
         if c is None:
-            if self._active_fn_no_c is None:
+            if fn_no_c is None:
                 raise ValueError("gemm_plan.active_range: C is required when beta != 0")
-            return self._active_fn_no_c(*active_args)
+            return fn_no_c(*active_args)
         _check_operand(self, "C/out", c, (self.nq, self.m, self.n), self.out_sharding)
-        return self._active_fn_with_c(*active_args, c)
+        return fn_with_c(*active_args, c)
 
     def prepare_active_range(self, lo, hi):
         """Capture eager bounds and return a trace-safe interval callable.
@@ -478,8 +491,31 @@ def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
         else:
             jax.block_until_ready(active_with_c(a0, b0, bounds, weights,
                 _zeros((nq, m, n), dtype, out_sh)))
+    # conj_b variants: the device kernel's load-side conjugation; elsewhere conj inside the jit.
+    if active_impl is active_local_device_impl():
+        active_conj = partial(active_impl, alpha=alpha, beta=beta, conj_b=True)
+    else:
+        def active_conj(a, b, *rest):
+            return active(a, jnp.conj(b), *rest)
+    if beta == 0:
+        conj_no_c = jax.jit(shard_map(active_conj, mesh=mesh,
+            in_specs=(a_spec, b_spec, P(), P()), out_specs=out_spec, check_vma=False))
+        def conj_with_c(a, b, limits, weight, c):
+            return conj_no_c(a, b, limits, weight)
+    else:
+        conj_no_c = None
+        conj_with_c = jax.jit(shard_map(active_conj, mesh=mesh,
+            in_specs=(a_spec, b_spec, P(), P(), out_spec), out_specs=out_spec,
+            check_vma=False), donate_argnums=(4,))
     return replace(plan, _active_fn_with_c=active_with_c,
-                   _active_fn_no_c=active_no_c)
+                   _active_fn_no_c=active_no_c,
+                   _active_fn_conj_with_c=conj_with_c, _active_fn_conj_no_c=conj_no_c)
+
+
+def active_local_device_impl():
+    """The device route's active-range callable (identity for the ``conj_b`` dispatch)."""
+    from distrib_la._active_local_device import active_local_device
+    return active_local_device
 
 
 def _panel_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta) -> GemmPlan:

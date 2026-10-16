@@ -43,7 +43,10 @@ static ffi::Error fail(const char* gate, const std::string& why,
     return ffi::Error(code, std::string("GATE ") + gate + ": " + why);
 }
 
-struct Kernels { rtc::Function z = nullptr, d = nullptr, z32 = nullptr, d32 = nullptr; };
+struct Kernels {
+    rtc::Function z = nullptr, d = nullptr, z32 = nullptr, d32 = nullptr;
+    rtc::Function zc = nullptr, z32c = nullptr;    // conj_b: B conjugated on load
+};
 
 // Targets with FP64 MFMA (v_mfma_f64_16x16x4f64): CDNA2 gfx90a and CDNA3 gfx94x.
 static bool mfma_target(const std::string& arch) {
@@ -71,11 +74,12 @@ static ffi::Error kernels(std::string_view cache_dir, Kernels* out) {
     prog.src = kKernelSrc;
     prog.name = "lrx_active_gemm";
     prog.kernel = "lrx_active_gemm_z";
-    prog.entries = {"lrx_active_gemm_d"};
+    prog.entries = {"lrx_active_gemm_d", "lrx_active_gemm_zc"};
     // The FP64 matrix-core path where the device has one (ROCM gfx90a / gfx94x: MFMA f64 16x16x4);
     // every other target (and the CUDA leg, until a DMMA arm is gated) takes the FMA path.
     const int mfma = mfma_target(arch) ? 1 : 0;
-    if (mfma) prog.entries = {"lrx_active_gemm_d", "lrx_active_gemm_z32", "lrx_active_gemm_d32"};
+    if (mfma) prog.entries = {"lrx_active_gemm_d", "lrx_active_gemm_zc", "lrx_active_gemm_z32",
+                              "lrx_active_gemm_d32", "lrx_active_gemm_z32c"};
     prog.defs = {rtc::kOptOption, "-std=c++17", rtc::arch_option(arch),
                  "-DLRX_TM=" + std::to_string(kTm), "-DLRX_TN=" + std::to_string(kTn),
                  "-DLRX_TK=" + std::to_string(kTk), "-DLRX_MFMA=" + std::to_string(mfma)};
@@ -101,9 +105,10 @@ static ffi::Error kernels(std::string_view cache_dir, Kernels* out) {
     Kernels k;
     k.z = img.fn;
     k.d = img.fns.empty() ? nullptr : img.fns[0];
-    if (img.fns.size() == 3) { k.z32 = img.fns[1]; k.d32 = img.fns[2]; }
-    if (k.d == nullptr)
-        return fail("active-gemm-build", "entry lrx_active_gemm_d missing", ffi::ErrorCode::kInternal);
+    if (img.fns.size() >= 2) k.zc = img.fns[1];
+    if (img.fns.size() == 5) { k.z32 = img.fns[2]; k.d32 = img.fns[3]; k.z32c = img.fns[4]; }
+    if (k.d == nullptr || k.zc == nullptr)
+        return fail("active-gemm-build", "entry lrx_active_gemm_d or lrx_active_gemm_zc missing", ffi::ErrorCode::kInternal);
     g_cache.emplace(dev, k);
     *out = k;
     return ffi::Error::Success();
@@ -115,7 +120,7 @@ static ffi::Error Launch(lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuff
                          const ffi::AnyBuffer* c_in, ffi::Result<ffi::AnyBuffer> c_out,
                          int64_t nq, int64_t m, int64_t k, int64_t n, int64_t weighted,
                          double alpha_re, double alpha_im, double beta_re, double beta_im,
-                         std::string_view cache_dir) {
+                         int64_t conj_b, std::string_view cache_dir) {
     const auto bad = [](const std::string& why) { return fail("active-gemm-operands", why); };
     if (nq < 1 || m < 1 || k < 1 || n < 1)
         return bad("want positive nq, m, K, n");
@@ -157,7 +162,10 @@ static ffi::Error Launch(lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuff
     };
     const bool small = ks.z32 != nullptr && useful(32) > useful(64) + 0.05 && (m + 31) / 32 <= 65535;
     const int64_t bt = small ? 32 : kTm;
-    rtc::Function fn = dt == ffi::DataType::C128 ? (small ? ks.z32 : ks.z) : (small ? ks.d32 : ks.d);
+    const bool cj = conj_b != 0 && dt == ffi::DataType::C128;   // real B: conj is the identity
+    rtc::Function fn = dt == ffi::DataType::C128
+        ? (cj ? (small ? ks.z32c : ks.zc) : (small ? ks.z32 : ks.z))
+        : (small ? ks.d32 : ks.d);
     const void* A = a.untyped_data();
     const void* B = b.untyped_data();
     const void* W = weighted ? w.untyped_data() : nullptr;
@@ -183,18 +191,19 @@ static ffi::Error Dispatch(lrx::gpu::Stream s, ffi::AnyBuffer a, ffi::AnyBuffer 
                            ffi::BufferR2<ffi::S32> bounds, ffi::AnyBuffer c_in,
                            ffi::Result<ffi::AnyBuffer> c_out, int64_t nq, int64_t m, int64_t k,
                            int64_t n, int64_t weighted, double alpha_re, double alpha_im,
-                           double beta_re, double beta_im, std::string_view cubin_dir) {
+                           double beta_re, double beta_im, int64_t conj_b,
+                           std::string_view cubin_dir) {
     return Launch(s, a, b, w, bounds, &c_in, c_out, nq, m, k, n, weighted, alpha_re, alpha_im,
-                  beta_re, beta_im, cubin_dir);
+                  beta_re, beta_im, conj_b, cubin_dir);
 }
 
 static ffi::Error OutDispatch(lrx::gpu::Stream s, ffi::AnyBuffer a, ffi::AnyBuffer b,
                               ffi::AnyBuffer w, ffi::BufferR2<ffi::S32> bounds,
                               ffi::Result<ffi::AnyBuffer> c_out, int64_t nq, int64_t m, int64_t k,
                               int64_t n, int64_t weighted, double alpha_re, double alpha_im,
-                              std::string_view cubin_dir) {
+                              int64_t conj_b, std::string_view cubin_dir) {
     return Launch(s, a, b, w, bounds, nullptr, c_out, nq, m, k, n, weighted, alpha_re, alpha_im,
-                  0.0, 0.0, cubin_dir);
+                  0.0, 0.0, conj_b, cubin_dir);
 }
 
 }  // namespace lorrax_ffi::active_gemm
@@ -218,6 +227,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("alpha_im")
         .Attr<double>("beta_re")
         .Attr<double>("beta_im")
+        .Attr<int64_t>("conj_b")                       // 1: B read conjugated on load
         .Attr<std::string_view>("cubin_dir"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -236,4 +246,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("weighted")
         .Attr<double>("alpha_re")
         .Attr<double>("alpha_im")
+        .Attr<int64_t>("conj_b")
         .Attr<std::string_view>("cubin_dir"));
