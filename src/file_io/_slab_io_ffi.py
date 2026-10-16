@@ -474,48 +474,59 @@ def _announce_read_layout(path: str) -> None:
 @contextmanager
 def _large_read_progress(path: str, name: str, *, global_bytes: int,
                          local_bytes: int):
-    """Make a synchronous H5Dread distinguishable from a frozen process."""
+    """Make a large-file H5Dread distinguishable from a frozen process, without waiting for it.
+
+    Rank 0, a file of at least ``_LARGE_READ_LAYOUT_BYTES``: START at dispatch, then a daemon
+    thread polls the result (``is_ready``: no stream synchronization) and prints PROGRESS every
+    ``_READ_HEARTBEAT_SECONDS`` and COMPLETE once the bytes have landed (elapsed from dispatch).
+    Yields ``watch(result)``; the read is never waited for here, so the caller's thread runs on.
+    A dispatch that raises prints FAILED.
+    """
+    pending: list = []
     if not _rank0():
-        yield
+        yield pending.append
         return
     try:
         file_bytes = int(os.path.getsize(path))
     except OSError:
         file_bytes = -1
     if file_bytes < _LARGE_READ_LAYOUT_BYTES:
-        yield
+        yield pending.append
         return
 
     started = time.monotonic()
-    stopped = threading.Event()
     label = f"{os.path.basename(path)}:{name}"
     print(
         f"  [SlabIO.read] START {label} global_bytes={int(global_bytes)} "
         f"local_bytes={int(local_bytes)}",
         flush=True)
-
-    def heartbeat() -> None:
-        while not stopped.wait(_READ_HEARTBEAT_SECONDS):
-            print(
-                f"  [SlabIO.read] PROGRESS {label} "
-                f"elapsed={time.monotonic() - started:.1f} s; "
-                "collective H5Dread has not returned",
-                flush=True)
-
-    thread = threading.Thread(
-        target=heartbeat, name="lorrax-slabio-read-progress", daemon=True)
-    thread.start()
-    outcome = "FAILED"
     try:
-        yield
-        outcome = "COMPLETE"
-    finally:
-        stopped.set()
-        thread.join(timeout=1.0)
+        yield pending.append
+    except BaseException:
+        print(f"  [SlabIO.read] FAILED {label} elapsed={time.monotonic() - started:.1f} s",
+              flush=True)
+        raise
+
+    def landed() -> None:
+        delay, beat = 1e-3, started + _READ_HEARTBEAT_SECONDS
+        while not all(r.is_ready() for r in pending):
+            now = time.monotonic()
+            if now >= beat:
+                beat = now + _READ_HEARTBEAT_SECONDS
+                print(
+                    f"  [SlabIO.read] PROGRESS {label} "
+                    f"elapsed={now - started:.1f} s; "
+                    "collective H5Dread has not returned",
+                    flush=True)
+            time.sleep(delay)
+            delay = min(2 * delay, 0.25)
         print(
-            f"  [SlabIO.read] {outcome} {label} "
+            f"  [SlabIO.read] COMPLETE {label} "
             f"elapsed={time.monotonic() - started:.1f} s",
             flush=True)
+
+    threading.Thread(target=landed, name="lorrax-slabio-read-progress",
+                     daemon=True).start()
 
 
 def _replace_inode_for_write(path: str) -> None:
@@ -2291,7 +2302,9 @@ class _CollectiveLane:
         # union reader is asynchronous, so a following metadata operation,
         # synchronous read or write must wait for its Promise as well.
         for key in list(self._reads):
-            jax.block_until_ready(self._reads.pop(key))
+            live = [m for m in self._reads.pop(key) if not m.is_ready()]
+            if live:
+                jax.block_until_ready(live)
 
     def quiesce(self, slot) -> None:
         """Every queued write and in-flight read is done before HDF5 entry."""
@@ -2326,7 +2339,9 @@ class _CollectiveLane:
         if self._owner is slot:
             self._worker().drain()
             self._owner = None
-        jax.block_until_ready(self._reads.pop(id(slot), []))
+        live = [m for m in self._reads.pop(id(slot), []) if not m.is_ready()]
+        if live:
+            jax.block_until_ready(live)
 
 
 _LANE = _CollectiveLane()
@@ -3186,9 +3201,15 @@ class _FfiBackend(_DatasetGeometry):
         _local_bytes = int(np.prod(local_shape, dtype=np.int64)) * _dtype.itemsize
         with _large_read_progress(
                 self.path, name, global_bytes=_global_bytes,
-                local_bytes=_local_bytes):
+                local_bytes=_local_bytes) as watch:
             result = sm(handle_arr, offset_arr, valid_shape_arr)
-            result.block_until_ready()
+            watch(result)
+        # No wait here: the read handler runs on the XLA thread after this returns, and
+        # the next HDF5 entry point of ANY handle waits for it (_CollectiveLane, as the
+        # union reads), which closes the three hazards the entry drain above names
+        # (read-after-write, the shared pinned buffer, two threads in HDF5).  The lane
+        # holds ``result`` until that entry point or until it is ready.
+        _LANE.track_read(self._dispatcher, result)
         return result
 
     def _read_file_rows(self, name, shape, dtype, off, vshape, mesh, spec, plan):
@@ -3210,7 +3231,8 @@ class _FfiBackend(_DatasetGeometry):
         result = jnp.zeros(shape, dtype, device=NamedSharding(mesh, spec))
         with _large_read_progress(self.path, name,
                 global_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize,
-                local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p):
+                local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p) as watch:
+            landed = None
             for idx in itertools.product(*(range(0, vshape[a], steps[a]) for a in range(k))):
                 idx = tuple(min(i, vshape[a] - steps[a]) for a, i in enumerate(idx))
                 for c0 in range(0, vshape[k], rows):
@@ -3224,6 +3246,10 @@ class _FfiBackend(_DatasetGeometry):
                         out_struct=jax.ShapeDtypeStruct(tuple(local), jnp.dtype(dtype)))
                     p_off = tuple(off[a] + idx[a] for a in range(k)) + (off[k] + c0,) + tuple(off[k + 1:])
                     valid = tuple(steps) + (real,) + tuple(vshape[k + 1:])
+                    if landed is not None:
+                        # The next piece's ReadImpl rewrites the shared pinned buffer at
+                        # launch: the previous piece must have landed (a host decision).
+                        landed.block_until_ready()
                     piece = read(handle, _replicated_i64_vector(p_off, mesh),
                                  _replicated_i64_vector(valid, mesh))
                     starts = device_put_process_local(np.asarray(
@@ -3232,7 +3258,11 @@ class _FfiBackend(_DatasetGeometry):
                     insert = _file_order_read_insert(mesh, shape, jnp.dtype(dtype),
                         spec, k, compact, carrier, real)
                     result = insert(result, piece, starts)
-                    result.block_until_ready()
+                    landed = result
+            if landed is not None:
+                watch(landed)
+        if landed is not None:
+            _LANE.track_read(self._dispatcher, landed)
         return result
 
     # ------------------------------------------------------------------

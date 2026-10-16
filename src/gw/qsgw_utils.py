@@ -876,7 +876,8 @@ def build_qsgw_sigma_xc(
         sigma_c_omega_ry, sigma_x_kij_ry,
         idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
     )
-    sigma_xc_qsgw.block_until_ready()
+    from common.timing import stage_wait
+    stage_wait(sigma_xc_qsgw)   # a timing-only wait (LORRAX_STAGE_SYNC)
     if band_axis is not None and replicated_output:
         from runtime.padding import strip_axis
         sigma_xc_qsgw = strip_axis(

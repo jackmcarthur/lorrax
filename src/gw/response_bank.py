@@ -1394,7 +1394,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                                                   q_ids=tuple(qids[q0:q1]), execute=execute)
                     # The batch's totals finish here, so their device time is theirs.
-                    jax.block_until_ready((a0, a1) + ((o0, o1) if ordered else ()))
+                    timing.stage_wait((a0, a1) + ((o0, o1) if ordered else ()))
                 with _moment_phase(receipt, "diagnostics"):
                     _check_bare_hermitian(mesh_xy, q0, receipt, A0=a0, A1=a1)
                 with _moment_phase(receipt, "coulomb"):
@@ -1404,7 +1404,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                 with _moment_phase(receipt, "dyson"):
                     result = execute(moments, operands + (() if vertex is None else (contact,)),
                                      "moment_dyson")
-                    jax.block_until_ready(result)
+                    timing.stage_wait(result)
                 names = (("constant", "M0", "M1", "M2", "M3") if vertex is not None else
                          (("M0", "M1", "M2", "M3") if ordered else ("M1", "M3")))
                 values = dict(zip(names,result))
