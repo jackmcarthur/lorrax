@@ -277,6 +277,13 @@ KDFT_OUTER_ACC_MAX = 32
 # keeps the XLA decode (GATE kdft-kconv-outer-decode-slower).  LORRAX_KDFT_OUTER=all (the gate's and
 # the bench's A/B) routes both wherever the kernels fit.
 KDFT_OUTER_BOX_COLS = 64
+#: The ROCM leg's k-box mode 6 (cpp/kdft/kbox_plane_ffi.cc, the port of the mathdx plane mode): the
+#: ISDF route-G pair convolution read from the D-plane FFT output, the operands and attributes of
+#: KCONV_PLANE_TARGET less mathdx_root.  Rule: :func:`kdft_plane_refusal`.
+KDFT_KCONV_PLANE_TARGET = "lorrax_kdft_kconv_plane"
+_ROCM_PAIR_TARGETS = {"kconv_plane": KDFT_KCONV_PLANE_TARGET}
+#: Mode 6's axis bound (kbox_plane_ffi.cc kAxisMax): the stage's direct-DFT line.
+KDFT_PLANE_AXIS_MAX = 40
 
 
 def _kdft_outer_all() -> bool:
@@ -732,6 +739,54 @@ def kdft_outer_decode_refusal(kgrid, n_c: int, lds: int = KDFT_KBOX_LDS) -> str:
                 "XLA decode einsum chain on MI250X (ffi.fft, kdft outer record); the XLA decode is kept "
                 "(LORRAX_KDFT_OUTER=all overrides)")
     return ""
+
+
+def kdft_plane_no(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> int:
+    """Output columns per tile of the ROCM mode-6 kernel (0 when none fits), the mirror of
+    ``plan_no`` in cpp/kdft/kbox_plane_ffi.cc: the most (<= 16) whose ``2 ns^2`` padded c128
+    columns each fit half a block's LDS, else all of it."""
+    nx, ny, nz = (int(v) for v in kgrid)
+    per = 2 * int(ns) ** 2 * 16 * ((nx * ny * (nz | 1)) | 1)
+    for budget in (lds // 2, lds):
+        if budget // per >= 1:
+            return min(16, budget // per)
+    return 0
+
+
+def kdft_plane_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM mode-6 kernel cannot serve ``kgrid`` at ``ns`` (\"\" when it can): an axis beyond
+    :data:`KDFT_PLANE_AXIS_MAX`, or one output column's ``2 ns^2`` padded columns beyond a block's LDS."""
+    kg = tuple(int(v) for v in kgrid)
+    if max(kg) > KDFT_PLANE_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_PLANE_AXIS_MAX} "
+                "(k-box mode 6's direct-DFT line transform)")
+    if int(ns) not in (1, 2, 4):
+        return f"GATE kdft-kconv-plane-tile: got ns={ns}; want 1, 2 or 4"
+    if kdft_plane_no(kg, ns, lds) == 0:
+        return (f"GATE kdft-kconv-plane-tile: got k-grid {kg} ns={ns}, whose output column needs "
+                f"{2 * int(ns) ** 2 * 16 * ((kg[0] * kg[1] * (kg[2] | 1)) | 1)} B; want it in a block's {lds // 1024} KiB of LDS")
+    return ""
+
+
+def rocm_plane_target(mesh: Mesh, kgrid, ns: int) -> str | None:
+    """The ROCM mode-6 target serving :func:`make_fused_conv_kplane` on this mesh, or ``None`` (the XLA
+    route): a ROCm mesh outside :func:`xla_reference`, kdft not demoted, the handler in the loaded
+    library, and :func:`kdft_plane_refusal` empty (else one warning per grid)."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(KDFT_KCONV_PLANE_TARGET, "ROCM")
+    why = kdft_plane_refusal(kgrid, ns) if ok else f"no {KDFT_KCONV_PLANE_TARGET} handler ({why})"
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM kconv_plane -> XLA (the plane composition), not kdft: {why}"
+        if announce_once(("kconv", "plane", tuple(int(v) for v in kgrid), int(ns)), msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return None
+    _note_rocm_target(KDFT_KCONV_PLANE_TARGET)
+    return KDFT_KCONV_PLANE_TARGET
 
 
 def rocm_outer_target(mesh: Mesh, kgrid, factory: str, n_c: int | None = None) -> str | None:
@@ -1512,6 +1567,7 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
     — :func:`make_fused_conv_kparent` on the identity plan, without the
     transposed, phased and split copy of ``D`` that its operand layout needs.
     CUDA: nvidia-mathdx mode 6 (the phase and the split are applied on load);
+    ROCM: its port on the k-box stage (``cpp/kdft/kbox_plane_ffi.cc``, :func:`kdft_plane_refusal`);
     the plan and XLA backends run the same composition.  ``s`` is the forward-norm
     pair scale of the parent factory.
     """
@@ -1551,6 +1607,19 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
             out = jax.ShapeDtypeStruct((nk, c, D.shape[1] * D.shape[5]), D.dtype)
             return jax.ffi.ffi_call(KCONV_PLANE_TARGET, out)(D, F, **attrs)
         return _mathdx
+
+    target = rocm_plane_target(mesh, kgrid, ns)
+    if target is not None:
+        attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz), scale=np.float64(scale),
+                     perm_l=_check_perm(perm_l, ns, "left"), phase_l=_conv_kpair_phase_codes(phase_l, ns, "left"),
+                     perm_r=_check_perm(perm_r, ns, "right"), phase_r=_conv_kpair_phase_codes(phase_r, ns, "right"),
+                     cubin_dir=cubin_cache_dir())
+
+        def _kdft(D, F):
+            c = _check_plane_operands(D, F, nk, ns)
+            out = jax.ShapeDtypeStruct((nk, c, D.shape[1] * D.shape[5]), D.dtype)
+            return jax.ffi.ffi_call(target, out)(D, F, **attrs)
+        return _kdft
 
     pl, pr = _check_perm(perm_l, ns, "left"), _check_perm(perm_r, ns, "right")
     phl = np.asarray(phase_l, np.complex128).reshape(-1)
@@ -3306,7 +3375,7 @@ def _rocm_route_receipt(factory: Callable) -> Callable:
         if _ROUTE_TRACE:                                  # nested: the outer factory announces
             _ROUTE_TRACE[-1].extend(used)
             return fn
-        own = _ROCM_KLEAD_TARGETS.get(name) or _ROCM_KBOX_TARGETS.get(name) or _ROCM_OUTER_TARGETS.get(name)
+        own = _ROCM_KLEAD_TARGETS.get(name) or _ROCM_KBOX_TARGETS.get(name) or _ROCM_OUTER_TARGETS.get(name) or _ROCM_PAIR_TARGETS.get(name)
         if own is not None and own in used:
             route = " + ".join(used)
         else:

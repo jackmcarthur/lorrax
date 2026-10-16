@@ -69,7 +69,8 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "tests/test_kdft_kbox_gate.py)", tol=1e-12,
         note="k-leading and k-minor pairs (ffi.fft._ROCM_KLEAD_TARGETS) and the k-box single-arm "
              "modes 7/9/11 (ffi.fft._ROCM_KBOX_TARGETS), the BSE outer-product load and its fused "
-             "decode (ffi.fft._ROCM_OUTER_TARGETS; tests/test_kdft_outer_gate.py); every other k-conv "
+             "decode (ffi.fft._ROCM_OUTER_TARGETS; tests/test_kdft_outer_gate.py), k-box mode 6 (the ISDF "
+             "route-G pair, ffi.fft._ROCM_PAIR_TARGETS; tests/test_kdft_plane_gate.py); every other k-conv "
              "factory takes XLA on ROCm.  Measured max|dU|/max|U| <= 7.1e-16 (c128); the outer load and "
              "its decode: <= 1.6e-15 (tests/test_kdft_outer_gate.py, 1.524e-15)."),
     "fourier_plan": Family(
