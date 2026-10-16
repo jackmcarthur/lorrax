@@ -370,7 +370,9 @@ def test_plan_stored_u_fits_the_tile():
         assert 16 * nk * 5 * bm * bn <= TILE_BYTES, (nk, mu, bm, bn)
         assert bm % 8 == 0 and bn % 8 == 0 and (nm - 1) * bm < mu <= nm * bm and (nn - 1) * bn < mu <= nn * bn
         assert nk * 4 * bm * bn < 2 ** 31
-    # CrI3 30x30, N_mu 3000, P4: 13 x 13 blocks of 120 x 120 (U block 0.83 GB)
+    # CrI3 30x30 k-grid (nk 900), N_mu 3000 on P4 (2x2): a 1500 x 1500 tile per rank, 42v x 14c,
+    # spinors -> 13 x 13 blocks of 120 x 120 (U block 0.83 GB); the 1504 tile plans the same
+    assert plan_w_blocks("xla", nk=900, ns=2, mu_loc=1500, nu_loc=1500, n_c=14, rank=14) == ((120, 13), (120, 13))
     assert plan_w_blocks("xla", nk=900, ns=2, mu_loc=1504, nu_loc=1504, n_c=14, rank=14) == ((120, 13), (120, 13))
 
 
