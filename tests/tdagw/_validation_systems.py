@@ -220,13 +220,16 @@ def propagate_state(header_dir, system, rho0, *, tf_as, dt_measure_as, rtol=1e-1
     mtsteps = np.arange(v["control.timesteps.t0"], v["control.timesteps.tf"]
                         - 1e-8 * v["control.timesteps.dt_measure"],
                         v["control.timesteps.dt_measure"])
-    cfg = tp.PropagatorConfig(method="dp54", t0=v["control.timesteps.t0"],
-                              tf=v["control.timesteps.tf"],
-                              dt_measure=v["control.timesteps.dt_measure"],
-                              dt=v["control.timesteps.dt_measure"], n_sub=1, n_corr=2,
-                              atol=v["control.ivp.atol"], rtol=v["control.ivp.rtol"],
-                              max_step=v["control.timesteps.max_step"], chunk=mtsteps.size,
-                              remainder=False)
+    # dp54 from the deck's controller; only the fields this PropagatorConfig
+    # declares (n_sub went away with the fixed-step sampling rework)
+    want = dict(method="dp54", t0=v["control.timesteps.t0"], tf=v["control.timesteps.tf"],
+                dt_measure=v["control.timesteps.dt_measure"],
+                dt=v["control.timesteps.dt_measure"], n_sub=1, n_corr=2,
+                atol=v["control.ivp.atol"], rtol=v["control.ivp.rtol"],
+                max_step=v["control.timesteps.max_step"], chunk=mtsteps.size,
+                remainder=False)
+    cfg = tp.PropagatorConfig(**{k: x for k, x in want.items()
+                                 if k in tp.PropagatorConfig._fields})
     got = {}
 
     def on_chunk(i0, i1, samples, rho_fn, t_state):
