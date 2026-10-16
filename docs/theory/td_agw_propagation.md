@@ -433,6 +433,181 @@ every printed digit (3.0e-9 at 5 as, 0.96 s per fs; the whole-ρ CFM4 7.4e-7). W
 ISDF model the step is ΔΣ-bound (96 ms per call at 30×30, against 3.3 ms for one 44-band
 exponential at 900 k), and the bundle route has no intraband term.
 
+## Validation ladder {#validation}
+
+Six rungs test the propagator against references that share no code with
+it — closed forms, the BSE of the same kernel, SciPy's DOP853 — each through
+the driver's whole path (a header on disk or a GW bundle → deck → `stages` →
+`tdgw.h5`, on a 2×2 host mesh with k padded) and each with red twins that
+must fail (`tests/tdagw/test_validation_*_cpu.py`, `JAX_PLATFORMS=cpu` with
+four host devices; the algebra is `tools/td_response.py`). Tolerances are
+fixed in advance from the scheme's order, the rounding and the size of the
+next order in the drive; `pytest --junitxml` records every measured value as
+a testsuite property. Weak drives run at $\pm E_0$ and are analysed through
+the odd part, linear up to $O(E_0^3)$: a window without inversion and with
+intra-manifold dipoles has a physical second-order response
+($P^{(2)}/P^{(1)} \sim |\rho_{cv}|$) that would otherwise set the floor.
+
+**Linear response is the full BSE.** Linearized about $\rho^\mathrm{eq}$,
+Eqs. (1)–(2) for $z = (\delta\rho_{cv}, \delta\rho_{vc})$ over the pairs
+$t = (k, c, v)$ read
+
+$$
+i\dot z = L z + E_b(t)\,u_b,\qquad
+L = \begin{pmatrix} D + K_{XX} & K_{XY}\\ -K_{YX} & -D - K_{YY}\end{pmatrix},\qquad
+u_b = (r^b_{cv}, -r^b_{vc}), \tag{V1}
+$$
+
+with $D = \mathrm{diag}(E_c - E_v)$ and $K_{XY}[t, t'] = K_{kcv,k'v'c'}$ etc. the
+blocks of $\Delta\Sigma_{k,nm} = \sum K_{knm,k'n'm'}\,\delta\rho_{k',n'm'}$: the
+full (non-TDA) BSE of the kernel. With $L = Z\,\mathrm{diag}(\lambda)\,Z^{-1}$
+and $o_a = w_k(r^a_{vc}, r^a_{cv})$ every mode carries the residue
+$R^S_{ab} = (o_a\cdot Z_S)(Z^{-1}_S\cdot u_b)$ — for a positive mode
+$w_k D^S_a D^{S*}_b$ with $D^S = \langle 0|\mathbf r|S\rangle$ — and
+
+$$
+\langle r_a\rangle(t) = -i\sum_S R^S_{ab}\int_{-\infty}^{t} e^{-i\lambda_S(t-t')}E_b(t')\,dt',
+\qquad
+\chi_{ab}(\omega) = -\frac{g_s}{\Omega}\sum_S\frac{R^S_{ab}}{\omega - \lambda_S}, \tag{V2}
+$$
+
+$\mathbf P = -g_s\langle\mathbf r\rangle/\Omega$, in closed form for Gaussian
+drives (Faddeeva functions). Three consequences are checked with no
+frequency-resolution limit: P(t) itself; the projection of the propagated
+state on the left eigenvectors (scaled $Z^\dagger\eta Z = 1$,
+$\eta = \mathrm{diag}(1, -1)$, so $|c_S|^2/N_k$ is the exciton number per
+cell), which after the pulse is the first-order amplitude rotating as
+$e^{-i\Omega_S t}$; and the damped transform, exact by the convolution theorem,
+
+$$
+\mathcal F[P\,e^{-\eta t}](\omega) = \chi(\omega + i\eta)\,\mathcal F[E\,e^{-\eta t}](\omega), \tag{V3}
+$$
+
+up to the truncation $e^{-\eta T}$. Frequencies fitted to the time signal
+(matrix pencil, fixed-frequency least squares) are ill-posed below the
+Fourier limit $2\pi/T$ and are not used.
+
+| rung | system, drive | reference | gate (tolerance) | measured (login node, lorrax_A) | red twins (all fail) |
+|---|---|---|---|---|---|
+| 1 Rabi | two-level × 5 k (1.95–2.06 eV, d = 1 bohr); cw 2e9 V/m, π pulse 3.9e9 V/m (τ 4 fs); Γ = 0 and 5/20 meV; 48 fs | exact (below); DOP853 at rtol 1e-13 for detuned and Gaussian drives | ρ to 1e-7 (order-4 schemes), 3e-5 (`magnus2`), 1e-8 (`dp54` 1e-10); observed order within 0.3 of nominal | `rk4` 1.7e-8, order 4.006; `etdrk4` 2.4e-9, 4.000; `cfm4` 1.6e-10, 4.000 (4.000 with Γ); `magnus2` 1.3e-5, 2.000; `dp54` 1.6e-9, ×98 per 100× rtol | bra/ket-swapped dipole: O(1); gap/(2 Ry) for (e/Ry)·Ry/Ha: 9.7e-6 at every step, order ≈ 0 |
+| 2 TD == BSE | 3v3c spinors, 3×3 k, ISDF-form Hartree + SEX (kernel.h5); kicks (τ 50 as) and σ± pulses (τ 1.5 fs, 1e6 V/m) | (V1)–(V3) | P(t) 1e-6 `dp54`, 1e-5 `etdrk4`/`cfm4` (10 as); per state amplitude 1e-5, frequency 1 µeV; Im χ± 1e-5; σ+/σ− population ratio = I+/I− | 5.2e-8 / 4.3e-7 / 3.0e-7; 156 states 3.4e-7 and 5.6e-9 eV; 1.6e-7 / 1.2e-7; 9.1e-7 | TDA kernel: P off by 1.1e-2; full run vs TDA BSE; reversed I± |
+| 3 conservation | same window, σ+ 2e9 V/m (0.13 excitons per cell), 30 fs | unitary flow, E[ρ] (below) | Tr 1e-11, Hermiticity 1e-12, purity 1e-11 (Magnus) / 1e-8 (RK); work theorem 1e-6; drift after the pulse 1e-9 (`magnus2` in `whole_rho`, the default; `interaction`: drift(2 as)/drift(1 as) in 4 ± 1 and ≤ 3.52e-8 at 1 as); equilibrium 1e-15 (RK) / 2e-12 (Magnus) | Tr ≤ 3.0e-12, Hermiticity ≤ 7.3e-14, purity 5.9e-14 (`cfm4`) to 1.9e-10 (`rk4`); work 1.3e-8 (`magnus2` 4.1e-7 at 1 as); drift ≤ 4.5e-11 (`magnus2` `interaction` 7.0e-8 / 1.76e-8 at 2 / 1 as, ratio 4.000); equilibrium 0 (RK), ≤ 6.5e-13 (Magnus) | K → (1 + 0.1i)K; dephasing (purity); E without the ½; ΔΣ of ρ instead of ρ − ρ^eq; one k shifted by 1e-10 |
+| 4 f-sum | same window, IP / full / TDA; kick κ = 1e-5 | odd short-time series of P (below) | m1 1e-7, m3 1e-6, j(0+) 1e-8 | m1, m3, j(0+) ≤ 2.6e-10 (the κ²\|r\|² residue), IP, full and TDA; interacting m1/S_IP − 1 = −4.99 % | TDA run vs the full m1 (5.1e-4); interacting run vs S_IP |
+| 5 helicity | Haldane honeycomb, 6×6 k (C3), ISDF-form interaction; τ 2 fs pulses on S0 (σ+, 1.4754 eV) and S1 (σ−, 2.0885 eV) | C3 selection, first-order theory | bright states pure: min(I±)/max ≤ 1e-13; N(σ∓)/N(σ±) ≤ 1e-12; N(S0) vs theory 1e-5 | 8.5e-15; 1.1e-20 and 2.5e-17; 8.2e-7 | reversed convention; (cos, −sin) as σ+; 1e-3 x/y dipole anisotropy (leak 3.4e-8) |
+| 6 magneto-optics | Haldane ±φ; x and y kicks; η 0.15 eV, 70 fs | (V3), sheet and film optics (below) | χ, ε_xy, σ_xy, Kerr, Faraday 1e-5; Onsager 1e-10; σ_xy/ω² flat to 1 %; film → sheet linear in d | 8.3e-8 (χ_xx), 1.9e-7 (χ_xy, ε_xy), 2.3e-7 (σ_xy, Kerr, Faraday; maxima 897 and 11 mrad); 6e-15; 9.2e-4; 3.4e-5 / 1.8e-4 at 6.6 Å, anisotropic tensor 1.9e-5 → 1.9e-7 for d ÷ 100 | reversed table convention; Onsager without the sign; transposed σ in Kerr; circular-mode film on an anisotropic tensor |
+
+**Rung 1.** A circular drive on a circular transition has no
+counter-rotating term: with $\mathbf r_{cv} = d\,(1, -i, 0)/\sqrt2$ and
+σ+ $= E_0(\cos\omega t, \sin\omega t, 0)$, $H_{cv} = g\,e^{-i\omega t}$,
+$g = E_0 d/\sqrt2$, and $T = \mathrm{diag}(1, e^{-i\omega t})$ makes $H$ time
+independent and commutes with $\Gamma\circ$, so ρ(t) is one exponential of an
+affine generator with or without relaxation: $\rho_{cc} = (4g^2/W^2)\sin^2(Wt/2)$,
+$W^2 = \delta^2 + 4g^2$, beyond the rotating-wave approximation (the σ− drive
+of the same transition is the counter-rotating problem, exact too). The
+observed order separates truncation, which scales with h, from a modelling
+error, which does not: the energy-unit twin (2 Ry/Ha − 1 = 3.6e-7) sits 9.7e-6
+from the run at every step.
+
+**Rung 3.** $\Delta\Sigma$ is Hermitian for Hermitian $\delta\rho$, so the flow
+is unitary: $\mathrm{Tr}\,\rho_k$, Hermiticity and the spectrum of ρ
+($\rho^2 = \rho$ at Γ = 0) are kept. With $K_{knm,k'n'm'} = K_{k'm'n',kmn}$
+($\bar V$ symmetric, $W(-q) = W(q)^T$) it is the gradient flow of
+
+$$
+E[\rho] = g_s\sum_k w_k\Big[\mathrm{Tr}(\varepsilon_k\rho_k)
+  + \tfrac12\,\mathrm{Tr}\big(\Delta\Sigma_k[\delta\rho]\,\delta\rho_k\big)\Big], \tag{V4}
+$$
+
+the ½ being the Hartree and screened-exchange double counting, and
+$dE/dt = \Omega\,\mathbf E\cdot\mathbf j$ with the measured current (the
+$iE_b[r_b, r_a]$ term absent from TDGW's velocity drops out of $\mathbf E\cdot\mathbf j$
+by antisymmetry). The Magnus rounding floor above sets the equilibrium
+tolerance: $N_\mathrm{exp}\,\varepsilon$.
+
+**Rung 4.** After $\rho(0^+) = e^{-i\kappa x}\rho^\mathrm{eq}e^{i\kappa x}$,
+$P_x(t) = (g_s/\Omega)\,\kappa\,(m_1 t - m_3 t^3/6 + \dots)$ with
+$m_n = \sum_S\lambda_S^n R^S_{xx}$; $m_1 = o\cdot L\cdot u$ is the window's
+f-sum, for the IP window $S_\mathrm{IP} = 2\sum_k w_k\sum_{cv}(E_c - E_v)|x_{cv}|^2$
+and with the kernel $S_\mathrm{IP} + o\cdot K_L\cdot u$, the double commutator of
+the interaction inside the window (zero for a local interaction in a complete
+basis). The full BSE obeys the sum rule of its own kernel (Thouless); the
+TDA drops the coupling block's $2\,\mathrm{Re}(d^\dagger K_{XY} d^*)$.
+
+**Rung 5.** On a k grid closed under C3, with interaction and dipoles
+covariant (lattice sums truncated on a disk — a parallelogram breaks C3 at
+4.5e-6), each exciton carries a C3 eigenvalue and
+$\langle 0|x \mp iy|S\rangle$ vanishes unless it matches: bright states are pure
+σ+ or σ−. A σ+ drive couples through $\langle S|x + iy|0\rangle$, i.e.
+$I_+ = |D_x - iD_y|^2/2$, and leaves σ− states empty even where its spectrum
+covers them; what leaks is the pulse's own counter-rotating component
+$(x - iy)\,\tilde g(\Omega_S + \omega)$, 4e-7 at τ = 1 fs (first-order theory
+reproduces it) and below 1e-20 at 2 fs.
+
+**Rung 6.** $\chi_\pm = \chi_{xx} \pm i\chi_{xy}$ for the $(x \pm iy)$ field; from
+the exciton table of an in-plane isotropic (C3, C4, C6) window
+$\chi_+(z) = -(g_s/\Omega)\sum_S[I_+(S)/(z - \Omega_S) - I_-(S)/(z + \Omega_S)]$
+and $\chi_-$ with $I_+ \leftrightarrow I_-$: the BSE $\varepsilon_{xy}$ of an
+exciton table. The sheet conductivity is $\sigma^\mathrm{2D} = -i\omega\,\chi(\omega + i\eta)\,L_z$
+at real ω — the Lorentzian-broadened convention $\varepsilon(\omega) = 1 + 4\pi\chi(\omega + i\eta)$;
+continuing $-i(\omega + i\eta)\chi$ instead changes σ by O(η/ω) and spoils the
+d → 0 limit below (9 % on the toy). At normal incidence a free-standing sheet
+has $T = (1 + \tfrac{2\pi}{c}\sigma^\mathrm{2D})^{-1}$,
+$R = -\tfrac{2\pi}{c}\sigma^\mathrm{2D}T$ on the in-plane Jones vector, and Kerr
+and Faraday are $\theta + i\epsilon$ of the outgoing ellipse (lab frame, from x
+toward y counter-clockwise viewed from +z; rotations compared modulo π). The
+film model takes $\varepsilon_\mathrm{film} - 1 = (\varepsilon - 1)L_z/d$
+(d = 6.6 Å, the interlayer spacing of bulk CrI3, as Wu et al. 2019) and the
+Airy formulas on the eigenpolarizations of the in-plane $\varepsilon_\mathrm{film}$
+(circular, $n_\pm = \sqrt{\varepsilon_{xx} \pm i\varepsilon_{xy}}$, only when it is
+isotropic); it converges to the sheet linearly in d. The interband
+length-gauge $\sigma_{xy} = -i\omega\chi_{xy}$ vanishes as ω²: the dc anomalous
+Hall term would come from the intraband commutator, absent from a
+velocity-built (itype 1) header. Time reversal (φ → −φ, or M → −M) flips
+$\varepsilon_{xy}$ and keeps $\varepsilon_{xx}$ (Onsager).
+
+**CrI3 516** (6×6 k, PBE+SOC spinors, FM; the bundle route with the ISDF
+Hartree + SEX model, N_μ 978, and TDREF's eqp; `tools/td_validation_cri3.py`,
+run `DEV/829_td_agw_validation_20261016`, 2026-10-16). The leg samples the
+model's kernel column by column — Hermitian as a matrix to 1.1e-14, the
+symmetry behind Eq. (V4) — and propagates ±E₀ drives with `etdrk4` at 10 as
+for 60 fs on four A100s (24 000 ΔΣ per window: 168 s for four 8v8c trials,
+212 s for eight 2v2c trials); rungs 2, 4–6 are then evaluated on the host.
+
+- *8v8c* (bands 123–138, 2304 pairs, `degeneracy_mode = strict`): P(t) of
+  the x and y kicks equals the full-BSE closed form to 2.8e-7 and
+  χ(ω + iη) to 1.1e-7 (η 0.2 eV, e^{−ηT} 1.2e-8). The spectrum is real
+  (|Im λ| ≤ 6e-15 eV), in-plane isotropic to 1.5e-9 (χ_xx − χ_yy) and 7e-9
+  (χ_xy + χ_yx), and every bright state is pure σ+ or σ− to 2.9e-10.
+- *2v2c* (bands 129–132, `degeneracy_mode = off`: on the QP spectrum bands
+  128 and 129 are 0.548 meV apart at k = 24, inside the strict gate's 1 meV,
+  although at least 48.2 meV apart in DFT, the minimum over k). A σ+ pulse
+  (τ 2 fs, 1e6 V/m) on the lowest bright σ+ state (1.8087 eV, I+ 0.0152
+  bohr² per cell) fills σ− states at
+  1.62e-17 of the σ+ population, the counter-rotating leak of first-order
+  theory (1.62e-17), and N(S+) equals first order to 8.3e-8; the σ− pulse
+  is the mirror image (5.5e-17). ε_xy, σ_xy, Kerr and Faraday from TD equal
+  the BSE to 7.3e-8, and χ± from the exciton table to 5e-8. At η 0.2 eV the
+  free sheet's Kerr rotation peaks at 314 mrad (1.995 eV), the Faraday
+  rotation at −0.52 mrad (2.215 eV); the 6.6 Å film is within 8.5e-6 of the sheet.
+- *f-sum.* In the window the interaction lowers m1 below the IP sum with
+  QP energies by 30 % (8v8c: 2.063 against 2.946 Ha·bohr² per cell) and 33 %
+  (2v2c: 0.1121 against 0.1678). With DFT energies the IP sums are 1.507 and
+  0.0807, so the QP-energy sum is the DFT one times the weighted ratio of
+  transition energies (1.96, 2.08) — r is DFT's — and m1 sits at 1.37 and
+  1.39 times it. Against the whole dipole set (130 valence × 30 conduction
+  bands, 26.58) the 8v8c window holds 5.7 % (1.16 % of N_e = 130) and 2v2c
+  0.30 % (0.062 %); the 160-band set itself holds 20 % of N_e, the rest lying
+  in higher bands (the velocity p − i[r, V_NL] of a nonlocal pseudopotential
+  also moves the complete-basis sum off N_e).
+
+**Scripts outside pytest.** A script that imports jax before `runtime` runs in
+float32 unless `JAX_ENABLE_X64=1` (`runtime.set_x64_on_imported_jax`). On the
+synthetic window that shows as a 3e-7 error in the measured field and a P(t)
+error that grows as the step shrinks (`etdrk4` 8.5e-6 at 20 as to 5.8e-5 at
+2.5 as, `cfm4` 5e-2 to 1e-1 at 10 as); with x64 the same runs give 3.5e-7 at
+20 as to 2.3e-9 at 5 as, order 4 down to the third-order residue.
+Rung 1's order criterion catches it.
+
 ## Layout and programs {#layout}
 
 ρ is `(ntr, nk_pad, nb, nb)` complex128: a leading trial axis (drives
