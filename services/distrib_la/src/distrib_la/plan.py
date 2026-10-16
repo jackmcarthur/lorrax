@@ -502,40 +502,132 @@ def _measured_code_hash() -> str:
     return h.hexdigest()[:16]
 
 
-def _measured_cache_path() -> str:
+@lru_cache(maxsize=None)
+def native_closure_identity(platform: str) -> str:
+    """SHIM of ``lxkit.native_provider.native_closure_identity(platform) -> str`` (the Dep-enforce
+    lane's sha256 of the leg's recorded closure plus its verified mapped files), same signature:
+    until it lands, the loaded FFI library's resolved path and content hash ("none" where no
+    library loads).  A cost measured against another native closure is another key."""
+    import hashlib
+    import os
+    try:
+        from distrib_la.loader import loaded_lib_path
+        path = loaded_lib_path(platform)
+    except Exception:
+        path = None
+    if not path or not os.path.exists(path):
+        return "none"
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 22), b""):
+            h.update(block)
+    return f"{os.path.realpath(path)}:{h.hexdigest()[:16]}"
+
+
+def _measured_cache_dir() -> str:
     import os
     from lxkit import user_cache_dir
-    return os.path.join(str(user_cache_dir("distrib_la")), "measured_cost.json")
+    return os.path.join(str(user_cache_dir("distrib_la")), "measured_cost")
 
 
-def _measured_cache_get(key: str):
+def _measured_cache_file(disk_key: str) -> str:
+    import hashlib
+    import os
+    return os.path.join(_measured_cache_dir(), hashlib.sha256(disk_key.encode()).hexdigest()[:32] + ".json")
+
+
+def _payload_digest(disk_key: str, value) -> str:
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps([disk_key, value], sort_keys=True).encode()).hexdigest()
+
+
+def _valid_costs(value, candidates) -> bool:
+    """A cached figure set is used only whole and well-typed: the library's bytes and every
+    candidate round's (an int each); anything else is a miss and is re-measured."""
+    if not isinstance(value, dict) or not isinstance(value.get("library"), int):
+        return False
+    rounds = value.get("rounds")
+    return (isinstance(rounds, dict) and set(rounds) == {str(r) for r in candidates}
+            and all(isinstance(v, int) and v >= 0 for v in rounds.values()))
+
+
+def _measured_cache_get(disk_key: str, candidates):
+    """This signature's agreed costs from its own file, validated (key, digest, types); None on
+    a miss, a stale code hash (another key), a partial or corrupt file: never a mis-route."""
     import json
     try:
-        with open(_measured_cache_path()) as f:
-            return json.load(f).get(key)
+        with open(_measured_cache_file(disk_key)) as f:
+            entry = json.load(f)
     except (OSError, ValueError):
         return None
+    if (not isinstance(entry, dict) or entry.get("key") != disk_key
+            or entry.get("digest") != _payload_digest(disk_key, entry.get("value"))
+            or not _valid_costs(entry.get("value"), candidates)):
+        return None
+    return entry["value"]
 
 
-def _measured_cache_put(key: str, value) -> None:
-    """Atomic read-modify-replace; every rank writes the same figures (a shape rule)."""
+def _measured_cache_put(disk_key: str, value) -> None:
+    """One writer per key (process 0, after the agreement), published atomically: written to a
+    private temp file, then os.replace'd over the key's file; a reader sees the old file or the
+    whole new one."""
     import json
     import os
-    path = _measured_cache_path()
+    if int(jax.process_index()) != 0:
+        return
+    path = _measured_cache_file(disk_key)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
-            with open(path) as f:
-                table = json.load(f)
-        except (OSError, ValueError):
-            table = {}
-        table[key] = value
-        tmp = f"{path}.{os.getpid()}.tmp"
+        tmp = f"{path}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
         with open(tmp, "w") as f:
-            json.dump(table, f)
+            json.dump({"key": disk_key, "value": value,
+                       "digest": _payload_digest(disk_key, value)}, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except OSError:
         pass
+
+
+#: Agreements per signature hash in this process (every rank traces in the same order).
+_AGREE_GEN: dict = {}
+
+
+def _exchange(tag: str, payload: dict) -> list:
+    """Every process's ``payload`` (JSON), in process order, through the coordination service's
+    key-value store: a host exchange, no device work and no device sync.  One process: itself."""
+    import json
+    if jax.process_count() == 1:
+        return [payload]
+    from jax._src.distributed import global_state
+    from distrib_la._collectives import _wait_for_bootstrap
+    client = global_state.client
+    gen = _AGREE_GEN[tag] = _AGREE_GEN.get(tag, -1) + 1
+    base = f"distrib_la/measured/{tag}/{gen}"
+    me = int(jax.process_index())
+    client.key_value_set(f"{base}/{me}", json.dumps(payload))
+    return [json.loads(_wait_for_bootstrap(client, f"{base}/{r}", me,
+                                           "every rank's measured route costs"))
+            for r in range(jax.process_count())]
+
+
+def _agreed(values: list):
+    """The conservative agreement of every rank's figures: the SMALLEST library bytes and the
+    LARGEST one_device bytes per round count, so the route decided from them is the same on every
+    rank and never raises any rank's peak.  None where no rank has a library (all agree on that);
+    a mix is refused by name on every rank alike."""
+    libs = [v.get("library") for v in values]
+    if all(l is None for l in libs):
+        return None
+    if any(l is None for l in libs):
+        raise RuntimeError("distrib_la measured size route: the leg library resolves on some "
+                           "processes and not others; refusing rather than route divergently")
+    rounds = {}
+    for v in values:
+        for r, c in v["rounds"].items():
+            rounds[r] = None if c is None or rounds.get(r, 0) is None else max(rounds.get(r, 0), int(c))
+    return {"library": min(int(l) for l in libs), "rounds": rounds}
 
 
 def _measured_rounds(p, A, args, single: bool = False):
@@ -571,27 +663,44 @@ def _measured_rounds(p, A, args, single: bool = False):
     disk_key = json.dumps([p.op, shapes, [str(d) for d in dtypes],
                            [int(p.mesh.shape["x"]), int(p.mesh.shape["y"])], platform, kind,
                            library, p.requested_batched_route, bool(single),
-                           _measured_code_hash()])
-    cached = _measured_cache_get(disk_key)
-    source = "cached"
-    if cached is not None and _library_bytes is _LIBRARY_BYTES_DEFAULT:
-        lib = cached["library"]
-        costs = {int(r): c for r, c in cached["rounds"].items()}
+                           _measured_code_hash(), native_closure_identity(platform)])
+    import hashlib
+    import time
+    tag = hashlib.sha256(disk_key.encode()).hexdigest()[:24]
+    started = time.perf_counter()
+    default = _library_bytes is _LIBRARY_BYTES_DEFAULT
+    cached = _measured_cache_get(disk_key, candidates) if default else None
+    # Round 1: does EVERY rank hold this signature's agreed costs?  Only then is nothing
+    # compiled; one miss and every rank measures, so all lower the same programs (a library
+    # plan's first lowering may bootstrap its context collectively).
+    probe = _exchange(tag + "/probe", {"hit": cached is not None,
+                                       "library": None if cached is None else cached["library"],
+                                       "rounds": {} if cached is None else cached["rounds"]})
+    if all(v["hit"] for v in probe):
+        source = "cached"
+        agreed = _agreed(probe)
     else:
         source = "compiled"
         spec = P("x", "y") if single else P(None, "x", "y")
         face = NamedSharding(p.mesh, spec)
         abstract = tuple(jax.ShapeDtypeStruct(s, d, sharding=face) for s, d in zip(shapes, dtypes))
-        lib = _library_bytes(p, abstract, single)
-        costs = {}
-        if lib is not None:
+        lib_local = _library_bytes(p, abstract, single)
+        rounds_local = {}
+        if lib_local is not None:
             for r in candidates:
                 fn = ((lambda *o: p(*o, _rounds=1)) if single
                       else (lambda *o, _r=r: p.batched(*o, _rounds=_r)))
-                costs[r] = _program_bytes(fn, abstract)
-            if _library_bytes is _LIBRARY_BYTES_DEFAULT:
-                _measured_cache_put(disk_key, {"library": lib,
-                                               "rounds": {str(r): c for r, c in costs.items()}})
+                c_r = _program_bytes(fn, abstract)
+                rounds_local[str(r)] = None if c_r is None else int(c_r)
+        # Round 2: every rank's own figures, agreed conservatively.
+        agreed = _agreed(_exchange(tag + "/measure",
+                                   {"library": None if lib_local is None else int(lib_local),
+                                    "rounds": rounds_local}))
+        if agreed is not None and default and _valid_costs(agreed, candidates):
+            _measured_cache_put(disk_key, agreed)
+    lib = None if agreed is None else agreed["library"]
+    costs = {} if agreed is None else {int(r): c for r, c in agreed["rounds"].items()}
+    seconds = time.perf_counter() - started
     if lib is None:
         chosen = None
     else:
@@ -605,7 +714,8 @@ def _measured_rounds(p, A, args, single: bool = False):
                library if chosen == 0 else f"one_device in {chosen} round(s)")
     line = (f"{p.op} 'distributed' {'x'.join(map(str, shapes[0]))} on the "
             f"{int(p.mesh.shape['x'])}x{int(p.mesh.shape['y'])} {platform} mesh: measured "
-            f"({source}) per-rank GB, {library} {gb(lib)} vs one_device by rounds {{{tried}}}"
+            f"({source}, agreed over {jax.process_count()} process(es), {seconds:.2f} s) per-rank GB, "
+            f"{library} {gb(lib)} vs one_device by rounds {{{tried}}}"
             f"{'' if p.budget_bytes is None else f' (room {int(p.budget_bytes) / 1e9:.2f} GB)'}"
             f" -> {verdict}")
     _resolve._SIZE_DECISIONS.setdefault(("measured",) + key, line)
