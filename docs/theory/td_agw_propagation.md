@@ -69,6 +69,95 @@ $g_s = 2$ for `nspinor = 1`, 1 for spinors:
   plus $i[\Delta\Sigma, \mathbf r^\mathrm{inter}] - i[\mathbf r^\mathrm{intra}, \Delta\Sigma]$
   unless `use_v0`; `inter_only` keeps the interband parts;
 - `density_matrix` / `lessG`: a band block of ρ / of $i\rho$; `Efield`: $\mathbf E(t)$.
+- `carrier_density`: $(n_c, n_v)$ per unit cell, $n_c = g_s\sum_k w_k \sum_c \rho_{k,cc}$ over the
+  unoccupied rows and $n_v$ the holes in the occupied ones (LORRAX);
+- `exciton_projection`: $c_S(t) = \sum_{kcv} A^{S*}_{kcv}\rho_{k,cv}(t)$ on the BSE eigenvectors of
+  `eigenvectors` (`bse_jax --write-eigs`, same window and k grid); $|c_S|^2/N_k$ is the
+  population of exciton S per unit cell (LORRAX).
+
+## The system from a GW bundle {#bundle}
+
+`[lorrax] system = "bundle"` builds the header in memory from a LORRAX GW
+restart bundle (`bundle_input` = its GW deck); no TDGW WFN, `vmtxel` or
+finite-difference step runs. One `load_td_model` call supplies the model's
+wavefunctions, the window record and, for `bse_k_grid` decks, the fine-grid
+velocity, so the header and ΔΣ share one ψ gauge.
+
+| header | from the bundle |
+|---|---|
+| bands | `[system] ibndmin..ibndmax` (1-based, inclusive), DFT order |
+| `e_kn` | QP energies by DFT index from `eqp_file` (the window re-slice of `bse_window.apply_eqp_and_reslice_bands`), Ry → eV → Ha with TDGW's `HA_IN_EV` |
+| `f_kn` | 1 for the DFT indices below `ivbm`, as TDGW |
+| `kpts` | the bundle's C-order grid in [0, 1) |
+| `rinter` | $r_{nm} = v_{nm}/(i(E_n - E_m))$, $v$ the bundle's DFT velocity $p + i[V_\mathrm{NL}, r]$ in the model's ψ gauge, $E$ the DFT energies of that velocity |
+| `itype` | 1: no intraband commutator, as TDGW's `use_vmtxel` route |
+
+**Velocity.** Native decks slice `dipole_file` (the bundle's `dipole.h5`) to
+the window and refuse when its band energies differ from the restart's DFT
+energies by more than 1e-8 Ry (`td_dipole_energies`). `bse_k_grid` decks take
+Route B's window velocity in the fine $U_q$ gauge
+(`densified_dipoles(full_window=True)`) with its Newton-inverted DFT
+energies. With `--eqp` the fine states are QP-mixed and $v_{nm}/\Delta E$ is
+not their position (the onset oscillator strength comes out 13–19 % low on
+8 → 30 k); Route B then returns `r_window`, the exact
+$\langle\tilde i|\hat r|\tilde j\rangle$ of the fine states (same-occupation
+pairs masked at 0.05 eV upstream), and the builder takes it as given: no
+division, `cut` and `cv` applied on top, `mask` only at Route B's 0.05 eV
+(`td_pair_gap_route_b`).
+
+**The denominator uses DFT energies.** $v = i[H, r]$ holds in the eigenbasis
+of the Hamiltonian whose velocity it is, the DFT one; QP differences would
+rescale every $r_{cv}$ by $\Delta E^\mathrm{DFT}/\Delta E^\mathrm{QP}$, a
+velocity-renormalisation choice this route does not make.
+
+**n = m and near-degenerate pairs.** $r_{nn} = 0$ and the intraband
+commutator is absent, as on TDGW's `vmtxel` route; TDGW's finite-difference
+route (`itype` 2) adds $\mathbf E\cdot[\mathbf r^\mathrm{intra}, \rho]$
+(`TDGW_RINTRA_IN_EOM`, on by default). It vanishes at first order in the field
+($[\mathbf r^\mathrm{intra}, \rho^\mathrm{eq}] = 0$ for filled bands): on TDGW's
+516 finite-difference header (IP, a 10 as kick) dropping it changes P(t) by
+8.8e-7 at 1e7 V/m and 7.9e-4 at 5e9 V/m (linear in $E_0$), the carrier
+density by 3.2e-7 and 3.8e-4, and no Im ε peak by more than 0.1 meV.
+Same-occupation pairs ($vv'$, $cc'$)
+make $v_{nm}/\Delta E$ singular as $\Delta E \to 0$: `pair_rule = "mask"`
+(default) multiplies $r_{nm}$ by $1 - e^{-\Delta E^2/2\Delta^2}$ with
+$\Delta$ = `pair_gap_ev` (default `esmear`), `cut` zeroes the pairs with
+$|\Delta E| < \Delta$, `cv` keeps the c↔v blocks only (TDGW's `vmtxel` layout).
+c↔v pairs are never masked; a c↔v gap at or below $\Delta$ refuses
+(`td_cv_gap`). The run header prints the pairs below $\Delta$: on CrI3 516
+(6×6 k, 2v2c) 2 of 36 $vv'$ and 23 of 36 $cc'$ (bands 131/132 nearly
+degenerate), smallest c–v DFT gap 1.514 eV.
+
+**Gauge receipt.** `check_eigenvectors` = a `bse_jax --write-eigs --dipole`
+file on the same bundle and window: the builder forms
+$\langle 0|\mathbf r|S\rangle = \sum_{kcv} A^S_{kcv}\, r_{k,vc}$ from the
+header and compares it with `bse_jax`'s dipoles, so the TD drive and the BSE
+oscillator strengths are the same numbers. On 516 the 16 lowest states agree
+to 9.6e-15 (I+ 6.4e-15).
+
+**Against TDGW's own header (516).** k points, bands, occupations and
+`e_kn` equal those of TDGW's `vmtxel` header (energies to 0.0 Ha); the IP
+Im ε_xx peaks are 2.8405 / 2.9833 / 3.0876 / 3.5446 / 3.6576 eV against
+2.8406 / 2.9824 / 3.0868 / 3.5454 / 3.6578 eV. The intensities differ:
+BerkeleyGW's `vmtxel` uses the momentum operator, which lacks $i[V_\mathrm{NL}, r]$,
+and its $\sum_{kcv}|r_{cv}|^2$ is 10.1 % below the bundle's (per-k ratios
+0.43–2.42 along x; the best global phase between the two is ≈ 1, the same WFN
+gauge).
+
+**Circular drives.** σ+ is $\mathbf E = E_0 f(t)(\cos\omega t, +\sin\omega t, 0)$
+(`E_x = "E0 * f * np.cos(w * t)"`, `E_y = "E0 * f * np.sin(w * t)"`,
+`w = ħω / HBAR_IN_EV_AS` in rad/as) and couples to
+$I_+ = |D_x - iD_y|^2/2$, $D = \langle 0|\mathbf r|S\rangle$. On a chiral
+three-band model σ± select their exciton to a population ratio below 1e-12
+and the swapped twin exchanges them; the first-order population per cell is
+$E_0^2 I_+ \pi\tau^2/2$ for $f = e^{-((t-t_0)/\tau)^2}$ (checked to 2e-4).
+Start the pulse at $t_0 \ge 4\tau$: a Gaussian cut at $t = 0$ while still at
+$e^{-9}$ of its peak leaves the counter-rotating channel at
+$E_0 f(0) d/(\sqrt2(\Omega + \omega))$, which is physical for that drive.
+
+**TDA.** `[lorrax] tda = true` applies TDGW's TDA to the ISDF ΔΣ: only
+$\delta\rho_{cv}$ drives, only $\Delta\Sigma_{cv}$ and its conjugate are kept
+(the projection of `tdgw_bridge --tda`).
 
 ## Integrators {#integrators}
 
@@ -114,7 +203,13 @@ converge, so `n_corr` < 1 refuses. The extrapolation amplifies the predictor's e
 one correction contracts it only while $h\,\lVert\partial\Delta\Sigma/\partial\rho\rVert$
 is small: with the CrI3 COHSEX kernel (6×6 k, 2v2c) `cfm4` with one
 correction diverges from 50 as, while two corrections are stable to 300 as.
-The default is two. The first two (`cfm4`) or three (`magnus2`) steps,
+The norm grows with the window: on the 30×30 CrI3 bundle (42v14c, N_μ 714)
+two corrections are unstable at 50 as — a mode seeded at rounding grows by
+3.6 % per step (1.1 fs⁻¹ in amplitude, non-oscillating at two steps per
+sample) and becomes visible after ~18 fs whatever the drive, and the TDA
+update diverges sooner (from 7 fs) — while 25 as is flat (carrier density
+constant to 0.1 % over 24 fs after a kick). Check a new window with a short
+kick run at the intended step before production. The default is two. The first two (`cfm4`) or three (`magnus2`) steps,
 before the history exists, take three extra corrections. Relaxation and the
 intraband term are not commutators; they enter by Strang splitting
 $R(h/2)\,M(h)\,R(h/2)$, with $R$ the exact relaxation around an RK4 step of
@@ -236,11 +331,14 @@ unchanged.
 
 ## What refuses {#refusals}
 
-A deck without `load_header_from` or with `use_vmtxel`
-(`td_header_source`), restart from a checkpoint (`td_checkpoint_restart`),
+A deck with neither `load_header_from` nor `[lorrax] system = "bundle"`, or
+with both, or with `use_vmtxel` (`td_header_source`), restart from a checkpoint (`td_checkpoint_restart`),
 patched sampling, box geometry, `velocity_operator`, a fixed step that does
 not divide `dt_measure`, `n_corr` < 1, and a `dp54` step that falls below
-SciPy's minimum (`td_dp54_step_too_small`) refuse with a named GATE.
+SciPy's minimum (`td_dp54_step_too_small`) refuse with a named GATE. The
+bundle route adds `td_bundle_input`, `td_ivbm`, `td_bundle_key` (bundle keys
+on a header deck), `td_cv_gap`, `td_velocity_hermitian`, `td_dipole_energies`,
+`td_eigenvector_kpts`, `td_degeneracy_mode` and `td_tda_model`.
 
 **BerkeleyGW dipoles.** The dipole is whatever the header carries. For
 BerkeleyGW's momentum matrix elements, run TDGW once with `use_vmtxel = true`

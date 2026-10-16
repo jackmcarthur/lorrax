@@ -293,3 +293,63 @@ def test_bundle_deck_refusals():
     ok = parse_td_deck(deck(system="bundle", bundle_input="gw.in", dipole_file="d.h5"))
     assert ok.values["lorrax.pair_gap_ev"] == 0.05 and ok.values["lorrax.system"] == "bundle"
     assert os.path.basename(ok.values["lorrax.bundle_input"]) == "gw.in"
+
+
+def test_describe_prints_the_bundle_receipts(tmp_path):
+    """The run header carries the builder's pair counts and the gauge receipt."""
+    if len(jax.devices()) < 4:
+        pytest.skip("needs 4 host devices")
+    import dataclasses
+    from types import SimpleNamespace
+    from common.collectives import resolve_mesh
+    from tdagw import stages
+    from tdagw.td_config import parse_td_deck
+    hdr, _ = _chiral_header()
+    hdir = tmp_path / "hdr"
+    hdir.mkdir()
+    tdgw_io.init_output(str(hdir / "tdgw.h5"), hdr, t0=0.0, tf=1.0, mdt=0.5,
+                        mtsteps=np.array([0.0, 0.5]), measurements=[])
+    raw = {"control": {"calc_type": "IP", "timesteps": {"t0": 0, "tf": 200, "dt_measure": 100},
+                       "files": {"outdir": str(tmp_path / "out"), "load_header_from": str(hdir)}},
+           "system": {"ibndmin": 1, "ibndmax": 3, "ivbm": 1, "geometry": "bulk"},
+           "measurements": {"types": ["Efield"]},
+           "lorrax": {"trials": [_drive(+1)]}}
+    deck = parse_td_deck(raw, source="describe")
+    mesh = resolve_mesh()
+    system = stages.load_system(deck, mesh)
+    model = stages.build_self_energy(deck, system, mesh)
+    e, _, v = _planted(nk=2)
+    _, prec = ts.position_from_velocity(v, e, 3, rule="mask", gap_ry=0.05 / RYD_TO_EV)
+    rec = dict(densified=False, energy_source="eqp", velocity=dict(route="coarse dipole.h5 (whole window)"),
+               pairs=prec, bse_dipoles=dict(n_states=2, dipole_rel_dev=1e-15, i_plus_rel_dev=2e-15,
+                                            i_minus_rel_dev=0.0))
+    system = (system._replace(receipts=rec) if hasattr(system, "_replace")
+              else dataclasses.replace(system, receipts=rec))
+    text = stages.describe(deck, system, model, SimpleNamespace(mesh_shape=(2, 2), n_devices=4, platform="cpu"))
+    assert "TD system       : native bundle" in text and "pair rule mask at 0.05 eV" in text
+    assert f"cc' below: {prec['cc']['below_gap']} of {prec['cc']['pairs']}" in text
+    assert "gauge receipt   : <0|r|S> of 2 BSE states" in text and "rel dev 1.00e-15" in text
+
+
+
+def test_window_position_from_route_b_is_used_as_given():
+    """r_window (Route B, exact position of the fine states) enters without a v/dE division."""
+    e, x, _ = _planted(nk=2)
+    gap = 0.05 / RYD_TO_EV
+    r, rec = ts.position_from_window_r(x, e, 3, rule="mask", gap_ry=gap)
+    xd = x.copy(); xd[:, :, np.arange(6), np.arange(6)] = 0.0
+    assert np.allclose(r, xd, rtol=0, atol=1e-15)                          # mask applied upstream, not twice
+    assert rec["rule"].startswith("mask") and rec["vv"]["pairs"] == 2 * 3 and rec["cc"]["pairs"] == 2 * 3
+    r_cv, _ = ts.position_from_window_r(x, e, 3, rule="cv", gap_ry=gap)
+    assert np.abs(r_cv[:, :, :3, :3]).max() == 0 and np.abs(r_cv[:, :, 3:, 3:]).max() == 0
+    assert np.allclose(r_cv[:, :, 3:, :3], x[:, :, 3:, :3], atol=1e-15)
+    e2 = e.copy(); e2[:, 1] = e2[:, 0] + 1e-3 / RYD_TO_EV
+    r_cut, rc = ts.position_from_window_r(x, e2, 3, rule="cut", gap_ry=gap)
+    assert np.abs(r_cut[:, :, 0, 1]).max() == 0 and rc["vv"]["below_gap"] >= 2
+    with pytest.raises(ValueError, match="GATE td_position_hermitian"):
+        ts.position_from_window_r(x + 1e-3j * np.abs(x).max(), e, 3, gap_ry=gap)
+    bad = e.copy(); bad[0, 3] = bad[0, 2] - 0.01
+    with pytest.raises(ValueError, match="GATE td_cv_gap"):
+        ts.position_from_window_r(x, bad, 3, gap_ry=gap)
+    with pytest.raises(ValueError, match="GATE td_pair_gap_route_b"):
+        ts.position_from_window_r(x, e, 3, rule="mask", gap_ry=0.1 / RYD_TO_EV)

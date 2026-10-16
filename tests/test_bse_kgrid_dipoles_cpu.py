@@ -15,8 +15,9 @@ exact fine-grid dipoles are one ``eigh`` away.  Run with
    keeps the velocity file's energies: the dipoles do not move with the QP
    energies, and dividing by the QP ΔE (the red twin) would.
 4. A permuted fine q list fires ``GATE densified_dipole_on_grid``;
-   ``window_dipoles`` refuses a densified bundle without its own dipoles and
-   an undensified bundle whose dipole has another k list.
+   ``window_dipoles`` refuses a densified bundle without its own dipoles, an
+   undensified bundle whose dipole has another k list, and one whose dipole
+   is stamped for another WFN (or not stamped).
 """
 from types import SimpleNamespace
 
@@ -191,8 +192,11 @@ def test_permuted_q_list_fires_the_on_grid_gate():
 
 
 def test_window_dipoles_refusals(tmp_path, monkeypatch):
+    import bse.absorption_common as absorption_common
     import file_io.dipole as dipole
     monkeypatch.setattr(dipole, "wfn_psi_basis", lambda path: "dft")
+    monkeypatch.setattr(absorption_common, "_deck_wfn_fingerprint",
+                        lambda path: "sha-of-the-deck-wfn")
     dense = {"densified": True, "dipoles": None, "nkx": 3, "nky": 3, "nkz": 1,
              "n_val": 1, "n_cond": 1}
     with pytest.raises(ValueError, match="GATE densified_dipoles"):
@@ -201,13 +205,23 @@ def test_window_dipoles_refusals(tmp_path, monkeypatch):
     with h5py.File(path, "w") as f:
         f["dipole_cart"] = np.zeros((3, 4, 2, 2), complex)
         f["band_energies"] = np.tile([-1.0, 1.0], (4, 1))
-        f.attrs.update({"nk": 4, "nbands": 2, "basis": "dft"})
+        f.attrs.update({"nk": 4, "nbands": 2, "basis": "dft",
+                        "prov_wfn_sha256": "sha-of-the-deck-wfn"})
     coarse = dict(dense, densified=False)
     with pytest.raises(ValueError, match="GATE dipole_k_grid"):
         window_dipoles(coarse, path, n_occ=1, wfn_path="WFN.h5")
     ok = dict(coarse, nkx=2, nky=2)
     d, de = window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
     assert d.shape == (3, 4, 1, 1) and de.shape == (4, 1, 1)
+    # Another WFN's file on the same k list, and an unstamped one (AUDIT B12).
+    for stamp in ("sha-of-another-wfn", None):
+        with h5py.File(path, "a") as f:
+            if stamp is None:
+                del f.attrs["prov_wfn_sha256"]
+            else:
+                f.attrs["prov_wfn_sha256"] = stamp
+        with pytest.raises(ValueError, match="GATE velocity_wfn_fingerprint"):
+            window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
 
 
 def test_on_grid_identity_follows_the_fh_band_order():

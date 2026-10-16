@@ -52,6 +52,13 @@ def test_red_twin_fails(result, twin):
     assert not result[f"both:{twin}"]["rel"] <= 1e-12, result[f"both:{twin}"]
 
 
+def test_tda_matches_the_projected_kernel(result):
+    """tda_n_val = 2: only drho_cv drives and only dSigma_cv (+ its conjugate) is kept."""
+    r = result["both:tda"]
+    assert r["rel"] <= 1e-12 and r["pad"] == 0.0, r
+    assert not result["both:twin_tda_full"]["rel"] <= 1e-12, result["both:twin_tda_full"]
+
+
 def _only_four_all_to_all(extra):
     return (not extra["removed"] and len(extra["added"]) == 4
             and all(a.startswith("all-to-all:") for a in extra["added"]))

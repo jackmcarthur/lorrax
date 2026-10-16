@@ -45,7 +45,7 @@ import numpy as np
 
 from common.units import RYD_TO_EV
 
-__all__ = ["PAIR_RULES", "TdBundleSystem", "position_from_velocity",
+__all__ = ["PAIR_RULES", "TdBundleSystem", "position_from_velocity", "position_from_window_r",
            "window_energies", "bundle_header", "exciton_dipoles",
            "bse_dipole_receipt", "build_td_system"]
 
@@ -152,6 +152,72 @@ def position_from_velocity(v, e_ry, n_val: int, *, rule: str = "mask",
                    vv=_block(vv & off), cc=_block(cc & off),
                    cv_pairs=int(nk * n_val * (nb - n_val)),
                    max_abs_r_bohr=float(np.abs(r).max()))
+    return r, receipt
+
+
+#: the gap of the mask Route B applies to r_window (bse_densify, pair rule mask)
+ROUTE_B_MASK_GAP_EV = 0.05
+
+
+def position_from_window_r(r, e_ry, n_val: int, *, rule: str = "mask",
+                           gap_ry: float) -> tuple[np.ndarray, dict]:
+    """The window position Route B supplies (``r_window``), with this module's rules.
+
+    ``r`` (3, nk, nb, nb) is ``<i|r|j>`` (bohr) in the fine states, already
+    masked by Route B's own ``mask`` rule on same-occupation pairs; ``cut``
+    and ``cv`` are applied on top of it here, ``mask`` is not applied twice.
+    ``e_ry`` are the velocity's band energies (receipt counts and the c-v
+    gate only; no division).
+    """
+    if rule not in PAIR_RULES:
+        raise _gate("td_pair_rule", repr(rule), " | ".join(PAIR_RULES), "set [lorrax] pair_rule")
+    if rule == "mask" and abs(gap_ry * RYD_TO_EV - ROUTE_B_MASK_GAP_EV) > 1e-9:
+        raise _gate("td_pair_gap_route_b", f"pair rule mask at {gap_ry * RYD_TO_EV:g} eV",
+                    f"Route B's mask scale {ROUTE_B_MASK_GAP_EV:g} eV (applied upstream)",
+                    "set pair_gap_ev = 0.05, or pair_rule = 'cut' | 'cv'")
+    r = np.asarray(r, dtype=np.complex128)
+    e = np.asarray(e_ry, dtype=np.float64)
+    nk, nb = e.shape
+    if r.shape != (3, nk, nb, nb):
+        raise _gate("td_window_position_shape", r.shape, (3, nk, nb, nb),
+                    "pass Route B's r_window of the window the energies describe")
+    scale = float(np.abs(r).max()) or 1.0
+    rh = np.conj(np.swapaxes(r, -1, -2))
+    herm = float(np.abs(r - rh).max()) / scale
+    if herm > VELOCITY_HERMITIAN_RTOL:
+        raise _gate("td_position_hermitian", f"max|r - r^H|/max|r| = {herm:.3e}",
+                    f"<= {VELOCITY_HERMITIAN_RTOL:.0e}", "r_window is not a Hermitian band operator")
+    r = 0.5 * (r + rh)
+    de = e[:, :, None] - e[:, None, :]
+    occ = np.arange(nb) < n_val
+    cv = occ[:, None] != occ[None, :]
+    off = ~np.eye(nb, dtype=bool)
+    same = off & ~cv
+    min_cv = float(de[:, n_val:, :n_val].min())
+    if not min_cv > gap_ry:
+        raise _gate("td_cv_gap", f"min (E_c - E_v) = {min_cv * RYD_TO_EV:.6g} eV",
+                    f"> {gap_ry * RYD_TO_EV:.3g} eV at every k",
+                    "use a window whose conduction rows lie above its valence rows")
+    if rule == "cut":
+        r = np.where((same[None] & (np.abs(de) < gap_ry))[None], 0.0, r)
+    elif rule == "cv":
+        r = np.where(same[None, None], 0.0, r)
+    r[:, :, np.arange(nb), np.arange(nb)] = 0.0
+
+    def _block(mask):
+        sel = np.triu(mask, 1)
+        gaps = np.abs(de)[:, sel]
+        return dict(pairs=int(sel.sum()) * nk, below_gap=int((gaps < gap_ry).sum()),
+                    exact=int((gaps < EXACT_DEGENERACY_RY).sum()),
+                    min_gap_ev=float(gaps.min() * RYD_TO_EV) if gaps.size else None)
+
+    vv = np.zeros((nb, nb), bool); vv[:n_val, :n_val] = True
+    cc = np.zeros((nb, nb), bool); cc[n_val:, n_val:] = True
+    receipt = dict(rule=rule + (" (Route B mask upstream)" if rule == "mask" else " on Route B's masked r"),
+                   gap_ev=float(gap_ry * RYD_TO_EV), position_hermitian_dev=herm,
+                   min_cv_gap_ev=min_cv * RYD_TO_EV, vv=_block(vv & off), cc=_block(cc & off),
+                   cv_pairs=int(nk * n_val * (nb - n_val)), max_abs_r_bohr=float(np.abs(r).max()),
+                   source="r_window (exact position of the fine states)")
     return r, receipt
 
 
@@ -316,9 +382,11 @@ def _densified_velocity(model: dict) -> tuple[np.ndarray, np.ndarray, dict]:
     if not np.array_equal(rows, np.arange(rows.size)):
         raise _gate("td_densified_k_order", "the fine q list is not the C-order grid",
                     "the model's flat k rows", "report it: a bookkeeping defect")
+    r_win = dip.get("r_window")
     return (np.asarray(dip["v_window"]), np.asarray(dip["e_dft_window"], np.float64),
-            dict(route=dip["route"] + ", full window", source=dip["source"],
-                 velocity=dip["velocity"], on_grid_rel=dip["on_grid_rel"]))
+            dict(route=dip["route"] + ", full window" + (", exact r_window" if r_win is not None else ""),
+                 source=dip["source"], velocity=dip["velocity"], on_grid_rel=dip["on_grid_rel"]),
+            None if r_win is None else np.asarray(r_win))
 
 
 # ---------------------------------------------------------------------------
@@ -358,13 +426,18 @@ def build_td_system(input_file: str, mesh_xy, *, bands, dipole_file: str,
     window = model["window"]
     e_qp, n_val = window_energies(window)
     if densified:
-        v, e_dft, vrec = _densified_velocity(model)
+        v, e_dft, vrec, r_win = _densified_velocity(model)
     else:
         enk = np.asarray(read_metadata(restart)["energies"], dtype=np.float64)
+        r_win = None
         v, e_dft, vrec = _coarse_velocity(model, input_file, dipole_file,
                                           bands=(b_lo, b_hi), e_dft_ry=enk[:, b_lo:b_hi])
-    r, prec = position_from_velocity(v, e_dft, n_val, rule=pair_rule,
-                                     gap_ry=float(gap_ev) / RYD_TO_EV)
+    if r_win is not None:                    # Route B's exact position (QP-mixed fine states)
+        r, prec = position_from_window_r(r_win, e_dft, n_val, rule=pair_rule,
+                                         gap_ry=float(gap_ev) / RYD_TO_EV)
+    else:
+        r, prec = position_from_velocity(v, e_dft, n_val, rule=pair_rule,
+                                         gap_ry=float(gap_ev) / RYD_TO_EV)
     structure = _structure(input_file)
     hdr = bundle_header(structure=structure, k_frac=model["k_frac"], kgrid=model["kgrid"],
                         bands=(b_lo, b_hi), nspinor=int(model["nspinor"]),

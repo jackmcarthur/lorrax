@@ -5,7 +5,8 @@ and cc' blocks as well as c <- v).  On the toy tight-binding slab of
 ``tests/test_bse_kgrid_dipoles_cpu.py`` (imported, not copied):
 
 1. The default outputs are bitwise those of a ``full_window=True`` run: the
-   flag adds ``v_window`` / ``e_dft_window`` and changes nothing else.
+   flag adds ``v_window`` / ``e_dft_window`` / ``r_window`` (and the pair rule
+   it used) and changes nothing else.
 2. The window's c <- v block over its own ΔE IS ``d_alpha`` and its energy
    differences ARE ``de_cv`` (bitwise: one contraction, two slices).
 3. The window is Hermitian, and its off-diagonal pairs (the ones the TD
@@ -68,7 +69,8 @@ def runs():
 def test_default_outputs_are_bitwise_unchanged(runs):
     _, d0, d1, _ = runs
     assert "v_window" not in d0 and "e_dft_window" not in d0
-    assert set(d1) - set(d0) == {"v_window", "e_dft_window"}
+    assert set(d1) - set(d0) == {"v_window", "e_dft_window", "r_window",
+                                 "pair_rule", "pair_gap_ev"}
     for key, val in d0.items():
         if isinstance(val, np.ndarray):
             assert val.dtype == d1[key].dtype and np.array_equal(val, d1[key]), key

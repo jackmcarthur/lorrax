@@ -70,6 +70,7 @@ TD_DEFAULTS = {
     "lorrax.pair_gap_ev": None,
     "lorrax.check_eigenvectors": "",
     "lorrax.degeneracy_mode": "",
+    "lorrax.tda": False,
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -250,6 +251,10 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     if vals["lorrax.isdf_terms"] not in ("both", "sex", "hartree"):
         raise _gate("td_isdf_terms", repr(vals["lorrax.isdf_terms"]),
                     "both | sex | hartree", "set [lorrax] isdf_terms")
+    if vals["lorrax.tda"] and model != "isdf":
+        raise _gate("td_tda_model", f"tda = true with model = {model!r}",
+                    "model = 'isdf' (a dense kernel.h5 carries its own TDA flag)",
+                    "drop tda, or use the ISDF model")
     vals["lorrax.model"] = model
 
     # units: as -> a.u., eV -> Ha

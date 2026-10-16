@@ -120,6 +120,21 @@ def main():
             rel = float(np.max(np.abs(got[:, :nk] - ref)) / np.max(np.abs(ref)))
             pad = float(np.max(np.abs(got[:, nk:]), initial=0.0))
             out[f"{terms}:{tag}"] = dict(rel=rel, pad=pad)
+    # TDGW TDA semantics (nv = 2 occupied rows): dSigma_cv = 1/2 K_{cv,c'v'} drho_{c'v'}, vc = cv^H, rest 0
+    nv = 2
+    K = dense_reference(psi, Wq, zeta, v)[order][:, :, :, order]
+    drho = rho_h[:, :nk] - rho_eq_h[None, :nk]
+    x = np.zeros_like(drho); x[:, :, nv:, :nv] = drho[:, :, nv:, :nv]
+    y_cv = 0.5 * np.einsum("knmKNM,tKNM->tknm", K, x)[:, :, nv:, :nv]
+    ref = np.zeros_like(drho); ref[:, :, nv:, :nv] = y_cv
+    ref[:, :, :nv, nv:] = np.conj(np.swapaxes(y_cv, -1, -2))
+    for tag, tda in (("tda", nv), ("twin_tda_full", None)):
+        sm = isdf_model(model, mesh, k_frac=k_hdr, rho_eq=rho_eq, tda_n_val=tda)
+        with F.xla_reference():
+            y = jax.jit(lambda prm, r: sm.apply(prm, r, 0.0))(sm.params, rho)
+        got = gather(y)
+        out[f"both:{tag}"] = dict(rel=float(np.max(np.abs(got[:, :nk] - ref)) / np.max(np.abs(ref))),
+                                  pad=float(np.max(np.abs(got[:, nk:]), initial=0.0)))
     out["mesh"] = list(mesh.devices.shape)
     out["nk_pad"] = nk_pad
     out.update(_collective_tables(mesh, model, sm_both(model, mesh, k_hdr, rho_eq), rho,
@@ -137,7 +152,7 @@ def _twin_constraint_apply(static, params, rho, t):
     import jax.numpy as jnp
     from tdagw.model import build_td_agw_apply, td_state_sharding
     from tdagw.self_energy import _ISDF_OPERANDS
-    mesh, kgrid, nspinor, nb_pad, rows, perm, nk, sex, hartree = static
+    mesh, kgrid, nspinor, nb_pad, rows, perm, nk, sex, hartree, _ = static
     ops, rho_eq = params
     d = rho - rho_eq[None]
     nb, nk_pad = d.shape[-1], d.shape[1]

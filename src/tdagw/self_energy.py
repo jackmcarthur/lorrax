@@ -38,7 +38,7 @@ dense K cannot exist); and :func:`zero_model`, the independent-particle run
 from __future__ import annotations
 
 import functools
-from typing import Callable, NamedTuple
+from typing import Optional, Callable, NamedTuple
 
 import numpy as np
 import jax.numpy as jnp
@@ -204,10 +204,12 @@ def _isdf_apply(static, params, rho, t):
     del t
     from common.staged_reshard import batch_to_face_reshard, face_to_batch_reshard
     from tdagw.model import build_td_agw_apply
-    mesh, kgrid, nspinor, nb_pad, rows, perm, nk, sex, hartree = static
+    mesh, kgrid, nspinor, nb_pad, rows, perm, nk, sex, hartree, nv = static
     ops, rho_eq = params
     d = rho - rho_eq[None]
     nb, nk_pad = d.shape[-1], d.shape[1]
+    if nv is not None:                   # TDGW TDA: only delta rho_cv drives, only dSigma_cv kept
+        d = jnp.zeros_like(d).at[:, :, nv:, :nv].set(d[:, :, nv:, :nv])
     d = jnp.pad(d, ((0, 0), (0, 0), (0, nb_pad - nb), (0, nb_pad - nb)))
     d = batch_to_face_reshard(mesh, lead=1)(d)                 # k whole, bands on the mesh
     x = jnp.take(d, jnp.asarray(perm), axis=1)                 # the model's C-order k rows
@@ -215,12 +217,16 @@ def _isdf_apply(static, params, rho, t):
     y = build_td_agw_apply(mesh, model, sex=sex, hartree=hartree)(x)
     y = jnp.take(y, jnp.asarray(rows), axis=1)                 # back to the propagator's k order
     y = jnp.pad(y, ((0, 0), (0, nk_pad - nk), (0, 0), (0, 0)))
-    y = face_to_batch_reshard(mesh, lead=1)(y)                 # k on the mesh again
-    return 0.5 * y[..., :nb, :nb]
+    y = face_to_batch_reshard(mesh, lead=1)(y)[..., :nb, :nb]  # k on the mesh again
+    if nv is not None:
+        y_cv = y[:, :, nv:, :nv]
+        y = (jnp.zeros_like(y).at[:, :, nv:, :nv].set(y_cv)
+             .at[:, :, :nv, nv:].set(jnp.conj(jnp.swapaxes(y_cv, -1, -2))))
+    return 0.5 * y
 
 
 def isdf_model(model: dict, mesh, *, k_frac, rho_eq, sex: bool = True,
-               hartree: bool = True) -> SelfEnergyModel:
+               hartree: bool = True, tda_n_val: Optional[int] = None) -> SelfEnergyModel:
     """The ISDF TD-aGW self-energy update of :mod:`tdagw.model`, in Ha.
 
     Parameters
@@ -232,6 +238,10 @@ def isdf_model(model: dict, mesh, *, k_frac, rho_eq, sex: bool = True,
         that row must be the same point mod G.
     rho_eq : (nk_pad, nb, nb) equilibrium density on the propagator's mesh.
     sex, hartree : keep the screened-exchange and Hartree terms.
+    tda_n_val : TDGW's TDA semantics with the window's first ``tda_n_val`` rows
+        as valence: dSigma_cv = K_{cv,c'v'} delta rho_{c'v'}, dSigma_vc =
+        dSigma_cv^H, every other block 0 (``tdgw_bridge.make_tdgw_dsigma``'s
+        projection; it drops the resonant/antiresonant coupling).
     """
     from tdagw.model import flat_k_rows
     rows = np.asarray(flat_k_rows(k_frac, model["kgrid"]), np.int64)
@@ -253,10 +263,11 @@ def isdf_model(model: dict, mesh, *, k_frac, rho_eq, sex: bool = True,
     static = (mesh, tuple(int(n) for n in model["kgrid"]), int(model["nspinor"]),
               int(model["nb_pad"]), tuple(rows.tolist()),
               tuple(np.argsort(rows).tolist()), int(rows.size), bool(sex),
-              bool(hartree))
+              bool(hartree), None if tda_n_val is None else int(tda_n_val))
     apply = functools.partial(_isdf_apply, static)
     params = (tuple(model[k] for k in _ISDF_OPERANDS), rho_eq)
     terms = "+".join(n for n, on in (("Hartree", hartree), ("SEX", sex)) if on)
+    tda = "" if tda_n_val is None else f", TDA ({int(tda_n_val)} valence rows)"
     return SelfEnergyModel(apply=apply, params=params, linear=True,
-                           name=f"ISDF TD-aGW ({terms}), N_mu = {model['n_rmu']}, "
+                           name=f"ISDF TD-aGW ({terms}){tda}, N_mu = {model['n_rmu']}, "
                                 f"k grid {tuple(model['kgrid'])}")

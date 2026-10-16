@@ -42,6 +42,20 @@ TRUNCATION = {3: 0, 2: 6}             # sys_dim -> none / cell_slab
 KERNEL_TYPE = {1: 1, 2: 3}            # nspinor -> singlet / spinor
 
 
+def _refuse(gate: str, got, want, why: str, fix: str):
+    raise ValueError(f"GATE {gate}: got: {got}; want: {want}; why: {why}; fix: {fix} "
+                     f"(docs/theory/td_agw.md)")
+
+
+def _header_code(table: dict, key: int, gate: str, name: str) -> int:
+    """BerkeleyGW header code of ``key``, refused by name outside ``table``."""
+    if int(key) not in table:
+        _refuse(gate, f"{name} = {key}", f"one of {sorted(table)}",
+                f"TDGW's td/io.py reads the BerkeleyGW header codes {sorted(table.values())} only",
+                "export a slab or bulk spinor/scalar kernel, or extend TDGW's reader first")
+    return table[int(key)]
+
+
 def tdgw_file_band_order(ibndmin: int, nb: int, ivbm: int) -> np.ndarray:
     """File index of each window band ``ibndmin, ibndmin+1, …`` (1-based).
 
@@ -52,9 +66,10 @@ def tdgw_file_band_order(ibndmin: int, nb: int, ivbm: int) -> np.ndarray:
     bands = int(ibndmin) + np.arange(int(nb))
     n_v = int(ivbm) - int(ibndmin) + 1
     if not 0 < n_v < int(nb):
-        raise ValueError(f"GATE tdgw_kernel_window: got: ibndmin={ibndmin}, nb={nb}, "
-                         f"ivbm={ivbm}; want: ibndmin <= ivbm < ibndmin+nb-1; fix: give "
-                         f"a window with valence and conduction bands")
+        _refuse("tdgw_kernel_window", f"ibndmin={ibndmin}, nb={nb}, ivbm={ivbm}",
+                "ibndmin <= ivbm < ibndmin+nb-1",
+                "the file lists valence bands from ivbm down, then conduction bands",
+                "give a window with valence and conduction bands")
     return np.where(bands <= ivbm, ivbm - bands, n_v + bands - ivbm - 1)
 
 
@@ -79,11 +94,15 @@ def write_tdgw_kernel(path: str, K: np.ndarray, *, kpts: np.ndarray, ibndmin: in
     K = np.asarray(K)
     nk, nb = int(K.shape[0]), int(K.shape[1])
     if K.shape != (nk, nb, nb, nk, nb, nb):
-        raise ValueError(f"GATE tdgw_kernel_shape: got: {K.shape}; want: (nk, nb, nb, nk, nb, nb); "
-                         f"fix: pass the dense kernel of the window")
+        _refuse("tdgw_kernel_shape", K.shape, "(nk, nb, nb, nk, nb, nb)",
+                "the file stores every (k n m, k' n' m') element of the window",
+                "pass the dense kernel of the window")
     if np.shape(kpts) != (nk, 3):
-        raise ValueError(f"GATE tdgw_kernel_kpts: got: {np.shape(kpts)}; want: ({nk}, 3); "
-                         f"fix: pass TDGW's WFN k list")
+        _refuse("tdgw_kernel_kpts", np.shape(kpts), f"({nk}, 3)",
+                "TDGW maps the kernel's rows to its k points by this list",
+                "pass TDGW's WFN k list")
+    truncation = _header_code(TRUNCATION, sys_dim, "tdgw_kernel_truncation", "sys_dim")
+    kernel_type = _header_code(KERNEL_TYPE, nspinor, "tdgw_kernel_type", "nspinor")
     f = tdgw_file_band_order(ibndmin, nb, ivbm)
     inv = np.argsort(f)                       # window band at each file slot
     Kt = np.transpose(K, (3, 0, 1, 2, 4, 5))  # (k', k, n, m, n', m')
@@ -100,8 +119,8 @@ def write_tdgw_kernel(path: str, K: np.ndarray, *, kpts: np.ndarray, ibndmin: in
         b["nvb"], b["ncb"] = np.int32(n_v), np.int32(nb - n_v)
         kh = h.create_group("header")
         kh["screening"] = np.int32(SCREENING_SEMICONDUCTOR)
-        kh["truncation"] = np.int32(TRUNCATION[int(sys_dim)])
-        kh["kernel_type"] = np.int32(KERNEL_TYPE[int(nspinor)])
+        kh["truncation"] = np.int32(truncation)
+        kh["kernel_type"] = np.int32(kernel_type)
         h.create_dataset("kernel", data=data)
         h.attrs["lorrax_provenance"] = json.dumps(provenance or {}, default=str)
 
