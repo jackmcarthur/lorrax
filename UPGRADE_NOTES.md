@@ -5,6 +5,41 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-16 — rocm/integration8: follow-ups on the release
+
+Integration 8 lands the follow-up lanes below on the release `aff42ce37`. Fe V2, MI250X,
+P=4, one node (`/lustre/orion/mat280/scratch/jackmc/int8/<run>/run.r0.log`):
+- Total 89.33 s (release, `int7/feR1`) → 84.92 s (`h5fe1`). Rule construction
+  32.91 → 27.40 s, constructor 14.27 → 12.85 s, Σ τ other 6.13 → 3.73 s.
+- eqp0 / eqp1 are bitwise equal to the release after every group. From syn/w12 on,
+  `sigma_mnk.h5` moves by ≤ 2.2e-14 relative (per dataset, max |Δ| / max |ref|) and
+  `qp_wfn_rotations.h5` `U_mnk` by ≤ 2.6e-11; before it every file is bitwise.
+- Device peak per rank 6.77 GB, as the release, in every stage row. On ROCm a stage row
+  reads the allocator's `peak_bytes_in_use`, which never resets, so every row shows the
+  run's high-water mark (set in ζ), not the stage's own peak.
+- Rank-0 transfer census, release → integration 8 (`int7/cenR` → `int8/h5fe2`): H2D
+  `device_put` 737 → 238, D2H 433 → 348, explicit D2H 74 → 70, `jax.block_until_ready`
+  18 → 5.
+- hsuite P=4: 16/16. Na SC completes (the release refused it, `GATE shared_pole_zero_ritz`
+  at q=2) and matches its reference: eqp max |Δ| 4.0e-7 eV.
+
+**What a user must change.**
+- **Rebuild the FFI libraries** from this tree (`config/frontier/build_ffi_rocm.sh`; host
+  and CUDA likewise). The handler ABI goes 6 → 8: SlabIO's read, read_multi, k-chunk union
+  and write handlers take no control operand ([SlabIO](docs/architecture/slab_io.md#stream-race)),
+  and `active_gemm_device` takes `conj_b`. A library of another ABI refuses at load.
+- New refusals: `GATE phdf5_posted_control`, `GATE slab_io_write_finite`,
+  `GATE shared_pole_round_tables_device`, `GATE shared_pole_ritz_eigh_finite` (an
+  eigensolver failure left after the Jacobi re-solve; such a round used to refuse as
+  `shared_pole_zero_ritz`).
+
+| lane (commit) | what | measured effect (Fe V2 P=4 unless noted) | gate |
+|---|---|---|---|
+| lsync/w5 polar (7e5898496, 005699355), slabmr/w8 (473f3bde9), comm7 T1 (9265e080a), ctor5/w12 (49ada1eaf, 3a7876794) | polar cuts from one device word; SlabIO posted control (ABI 8), device order fence, k-chunk union reader, staging budget; transpose partner without self pairs; constructor round tables, directions recipe and pole counts on the device | constructor 14.27 → 12.77 s; census as above | Fe bitwise (2 runs); phdf5 read_multi, active, kdft gates at P=4 |
+| crash/w9 (b697bce69; int8 bf8041aee: public import) | distinct inert sentinels; Jacobi re-solve of a non-finite local round; `shared_pole_ritz_eigh_finite` | Na SC completes; no re-solve fired in hsuite (the sentinels suffice) | hsuite 16/16; Fe bitwise |
+| syn/w12-i8 (dfce55663) | active GEMM reads B conjugated on load; identity little-group projector; per-branch W orientation | Σ τ other 5.84 → 3.70 s | eqp bitwise, Σ ≤ 2.2e-14 relative |
+| rcgpu (6b8629482) | the rule tree abandons a geometry on its error forecast's prediction bound | rule construction 32.42 → 27.40 s | Fe bitwise |
+
 ## 2026-10-16 — rocm/integration7: the ROCm leg's host syncs, transfers and kernels
 
 Integration 7 lands the lane branches listed below on `rocm/integration6` 4e6b28dfc. The rules
