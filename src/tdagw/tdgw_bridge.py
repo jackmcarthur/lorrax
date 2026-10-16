@@ -31,7 +31,8 @@ import numpy as np
 __all__ = ["lorrax_driver_class", "make_tdgw_dsigma", "require_parallel_h5py", "tdgw_run_lorrax", "main"]
 
 
-def make_tdgw_dsigma(apply, model: dict, mesh_xy, k_rows: np.ndarray):
+def make_tdgw_dsigma(apply, model: dict, mesh_xy, k_rows: np.ndarray, *,
+                     tda_n_val: int | None = None):
     """``dsigma(drho) -> ΔΣ`` at TDGW's seam: host (nk, nb, nb), TDGW k order, Ha.
 
     Parameters
@@ -39,6 +40,10 @@ def make_tdgw_dsigma(apply, model: dict, mesh_xy, k_rows: np.ndarray):
     apply : callable — :func:`tdagw.model.build_td_agw_apply`'s operator.
     model : dict — its bundle (``n_bands``, ``nb_pad``).
     k_rows : (nk,) int — the model's flat k row of each TDGW k point.
+    tda_n_val : int, optional — TDGW's TDA semantics with the window's first
+        ``tda_n_val`` bands as valence: ΔΣ_cv = K_{cv,c'v'} δρ_{c'v'},
+        ΔΣ_vc = ΔΣ_cv†, every other block 0 (what native TDGW does with an
+        ``nblocks = 1`` kernel).
 
     The δρ passed in is the same full array on every process; it is placed
     on the mesh from that host copy (each process supplies its own shards),
@@ -51,12 +56,23 @@ def make_tdgw_dsigma(apply, model: dict, mesh_xy, k_rows: np.ndarray):
     rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
     k_rows = np.asarray(k_rows, dtype=np.int64)
 
+    nv = None if tda_n_val is None else int(tda_n_val)
+
     def dsigma(drho):
         x = np.empty_like(np.asarray(drho, dtype=np.complex128))
         x[k_rows] = drho
+        if nv is not None:
+            x_cv = x[:, nv:, :nv].copy()
+            x = np.zeros_like(x)
+            x[:, nv:, :nv] = x_cv
         xc = pad_td_state(x[None], model)
         xd = jax.make_array_from_callback(xc.shape, st, lambda i: xc[i])
         y = strip_td_state(np.asarray(rep(apply(xd)).addressable_data(0)), model)[0]
+        if nv is not None:
+            y_cv = y[:, nv:, :nv].copy()
+            y = np.zeros_like(y)
+            y[:, nv:, :nv] = y_cv
+            y[:, :nv, nv:] = np.conj(np.swapaxes(y_cv, -1, -2))
         return 0.5 * y[k_rows]
     return dsigma
 
@@ -155,6 +171,8 @@ def _parse(argv):
     p.add_argument("--zeta", default=None, help="zeta_q.h5 (default: beside the restart)")
     p.add_argument("--terms", choices=("both", "sex", "hartree"), default="both")
     p.add_argument("--receipt", default=None, help="JSON receipt (default: <outdir>/lorrax_model.json)")
+    p.add_argument("--tda", action="store_true",
+                   help="TDGW's TDA semantics (dSigma_cv = K_cv,cv drho_cv, dSigma_vc = dSigma_cv^dagger)")
     return p.parse_args(argv)
 
 
@@ -178,12 +196,14 @@ def main(argv=None) -> int:
     w = WfnLoader(wfn_file)
     k_tdgw = np.asarray(w.kvecs(k="ibz"))
     w.close()
-    dsigma = make_tdgw_dsigma(apply, model, mesh, flat_k_rows(k_tdgw, model["kgrid"]))
+    dsigma = make_tdgw_dsigma(apply, model, mesh, flat_k_rows(k_tdgw, model["kgrid"]),
+                              tda_n_val=(s.ivbm - s.ibndmin + 1) if args.tda else None)
     if jax.process_index() == 0:
         os.makedirs(config.control.files.outdir, exist_ok=True)
         with open(args.receipt or os.path.join(config.control.files.outdir,
                                                "lorrax_model.json"), "w") as fh:
-            json.dump(dict(model["receipts"], terms=args.terms, config=os.path.abspath(args.config)),
+            json.dump(dict(model["receipts"], terms=args.terms, tda=bool(args.tda),
+                           config=os.path.abspath(args.config)),
                       fh, indent=1, default=str)
     tdgw_run_lorrax(config, dsigma, k_frac_expected=k_tdgw)
     runtime.finalize_process(0)

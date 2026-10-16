@@ -104,6 +104,13 @@ $-K$ in Ry, read as $K^{\rm TDGW}=-\,\texttt{kernel}/2$ Ha; the dataset is
 with the band axes in file order $(i_{\rm vbm}, i_{\rm vbm}-1,\dots,
 i_{\rm vbm}+1, i_{\rm vbm}+2,\dots)$, and `bse_header/params/nblocks = 4`
 selects every block. `tdagw.kernel_export` writes $K$ in that convention.
+With `nblocks = 1` TDGW's TDA reader takes only the $(cv, c'v')$ block of the
+same dataset and propagates $\Delta\Sigma_{cv}=K_{cv,c'v'}\,\delta\rho_{c'v'}$,
+$\Delta\Sigma_{vc}=\Delta\Sigma_{cv}^\dagger$, every other block zero; the
+exporter's and the bridge's `--tda` produce exactly that. At TDGW 41a5c34 a
+native run can use only that file: its extended reader builds the kernel
+without the run's parallel k axis, and the first update refuses at any rank
+count.
 
 ## Cost
 

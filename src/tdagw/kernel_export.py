@@ -11,6 +11,13 @@ the file: valence from i_vbm downwards, then conduction from i_vbm + 1 upwards
 (TDGW's ``bands_file_b``).  k and k' follow ``kpts``, which must be the k list
 of TDGW's WFN.h5 in its own order (``BSEKernel.check_basis``).
 
+With ``tda=True`` the same dataset is written under ``nblocks = 1``; TDGW's
+TDA reader then takes only its (c v, c' v') block and propagates with
+ΔΣ_cv = K_{cv,c'v'} δρ_{c'v'}, ΔΣ_vc = ΔΣ_cv†.  At TDGW 41a5c34 that is the
+only kernel a native ``tdgw-run`` can use: the extended reader builds the
+kernel without the run's parallel k axis and the first ΔΣ update refuses at
+any rank count (``Incompatible axes: (k, n_k) and (None, n_k)``).
+
 ``python -m tdagw.kernel_export`` builds the model from a GW restart and
 TDGW's WFN (``tdagw.model.load_td_model``), samples K column by column from
 the model's operator (``dense_td_kernel``) and writes the file on rank 0.
@@ -52,8 +59,9 @@ def tdgw_file_band_order(ibndmin: int, nb: int, ivbm: int) -> np.ndarray:
 
 
 def write_tdgw_kernel(path: str, K: np.ndarray, *, kpts: np.ndarray, ibndmin: int,
-                      ivbm: int, sys_dim: int, nspinor: int, provenance: dict | None = None):
-    """Write ``K`` (Ry) as TDGW's extended (nblocks = 4) ``kernel.h5``.
+                      ivbm: int, sys_dim: int, nspinor: int, provenance: dict | None = None,
+                      tda: bool = False):
+    """Write ``K`` (Ry) as TDGW's extended (nblocks = 4) or TDA (nblocks = 1) ``kernel.h5``.
 
     Parameters
     ----------
@@ -66,6 +74,7 @@ def write_tdgw_kernel(path: str, K: np.ndarray, *, kpts: np.ndarray, ibndmin: in
     sys_dim, nspinor : int — the header's truncation and kernel-type codes.
     provenance : dict, optional — stored as JSON in the root attribute
         ``lorrax_provenance``.
+    tda : bool — header ``nblocks = 1``: TDGW reads the (c v, c' v') block only.
     """
     K = np.asarray(K)
     nk, nb = int(K.shape[0]), int(K.shape[1])
@@ -84,7 +93,7 @@ def write_tdgw_kernel(path: str, K: np.ndarray, *, kpts: np.ndarray, ibndmin: in
     with h5py.File(path, "w") as h:
         bh = h.create_group("bse_header")
         bh["flavor"] = np.int32(2)
-        bh.create_group("params")["nblocks"] = np.int32(4)
+        bh.create_group("params")["nblocks"] = np.int32(1 if tda else 4)
         bh.create_group("kpoints")["kpts"] = np.asarray(kpts, dtype=np.float64)
         b = bh.create_group("bands")
         b["n1b"], b["n2b"] = np.int32(nb), np.int32(nb)
@@ -109,6 +118,8 @@ def _parse(argv):
     p.add_argument("--terms", choices=("both", "sex", "hartree"), default="both")
     p.add_argument("--out", required=True, help="kernel.h5 to write")
     p.add_argument("--receipt", default=None, help="JSON receipt (default: <out>.json)")
+    p.add_argument("--tda", action="store_true",
+                   help="write nblocks = 1 (TDGW's TDA reader; the only kind native tdgw-run runs)")
     return p.parse_args(argv)
 
 
@@ -131,7 +142,7 @@ def main(argv=None) -> int:
     w.close()
     rows = flat_k_rows(k_tdgw, model["kgrid"])
     K = K[rows][:, :, :, rows]
-    rec = dict(model["receipts"], terms=args.terms, out=os.path.abspath(args.out),
+    rec = dict(model["receipts"], terms=args.terms, tda=bool(args.tda), out=os.path.abspath(args.out),
                ibndmin=args.ibndmin, ibndmax=args.ibndmax, ivbm=args.ivbm,
                kernel_frobenius_ry=float(np.linalg.norm(K)),
                kernel_antihermitian_rel=float(
@@ -141,7 +152,7 @@ def main(argv=None) -> int:
     if jax.process_index() == 0:
         write_tdgw_kernel(args.out, K, kpts=k_tdgw, ibndmin=args.ibndmin, ivbm=args.ivbm,
                           sys_dim=int(model["receipts"]["coulomb"]["sys_dim"]),
-                          nspinor=int(model["nspinor"]), provenance=rec)
+                          nspinor=int(model["nspinor"]), provenance=rec, tda=args.tda)
         with open(args.receipt or args.out + ".json", "w") as fh:
             json.dump(rec, fh, indent=1, default=str)
         print(f"[tdagw] kernel.h5 written: {args.out}  |K|_F = {rec['kernel_frobenius_ry']:.6e} Ry, "
