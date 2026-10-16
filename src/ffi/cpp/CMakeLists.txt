@@ -1481,9 +1481,9 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 # eigh / potrf / trsm and their batched forms over a gpu_backend=hip SLATE);
 # rocsolver (the batched local Hermitian eigh, one rocsolver_{z,d}{heevd,syevd}_strided_batched
 # call per stack, resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked);
-# active_subspace (the CUDA leg's own sources, leg-neutral through common/gpu_blas.h and
-# gpu_solver.h: rocBLAS zgemm / rocSOLVER zheevd resolved from the mapped librocblas.so.5 /
-# librocsolver.so.0, not linked; distributed_ortho is CUDA-only).  A family with no ROCm port is
+# active_subspace (active_subspace/active_devsize.cc: the CUDA family's targets with device-side
+# sizes -- hipRTC kernels, no per-call host read; distributed_ortho and the active-block eigh
+# stay CUDA-only, the ROCM plan solves the capacity matrix through rocsolver).  A family with no ROCm port is
 # simply not in the source list; ffi_loader's ROCM table lists only what this
 # leg exports.
 #
@@ -1528,9 +1528,14 @@ set(LORRAX_FFI_ROCM_SOURCES
     kdft/kbox_unfold_ffi.cc
     kdft/kbox_rspace_ffi.cc
     rocsolver/batched_eigh_ffi.cc
-    active_subspace/active_eigh.cc
-    active_subspace/active_ops.cc
+    active_subspace/active_devsize.cc
 )
+# The sync-free active-subspace kernels' text for hipRTC (active_subspace/active_dev_src.h.in).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/active_subspace/active_dev_kernel.h" LRX_ACTIVE_DEV_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/active_subspace/active_dev_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/active_dev_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/active_subspace/active_dev_kernel.h")
 
 # The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated
 # whenever the kernel source changes, so the embedded text is that one file.

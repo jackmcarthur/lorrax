@@ -169,12 +169,14 @@ _ROCM_SLATE_LU_SYMBOLS: dict = {
 _ROCM_LOCAL_EIGH_SYMBOLS: dict = {
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
 }
-#: The active-subspace family (cpp/active_subspace/, leg-neutral: rocBLAS/rocSOLVER on this
-#: leg) -- the CUDA symbols less the one-communicator CGS2 handler, which needs cuSolverMp's
-#: NCCL context (distrib_la.subspace refuses native_collectives on this leg by GATE).
+#: The active-subspace family on this leg (cpp/active_subspace/active_devsize.cc: device-side
+#: sizes, no host read) -- the CUDA symbols less the one-communicator CGS2 handler (needs
+#: cuSolverMp's NCCL context) and the active-block eigh (the ROCM plan solves the capacity
+#: matrix through lorrax_rocsolver_batched_eigh: distrib_la.active_subspace.NATIVE_HANDLERS).
 _ROCM_ACTIVE_SUBSPACE_SYMBOLS: dict = {
     t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
-    if t.startswith("lorrax_active_subspace_") and t != "lorrax_active_subspace_distributed_ortho"}
+    if t.startswith("lorrax_active_subspace_")
+    and t not in ("lorrax_active_subspace_distributed_ortho", "lorrax_active_subspace_eigh")}
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
                                  if t.startswith("lorrax_slate_")},
                               **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS,

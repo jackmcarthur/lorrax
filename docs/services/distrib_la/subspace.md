@@ -53,7 +53,7 @@ it); a vendor with no leg takes the XLA route:
 
 | route | leg | provider | how the operations run |
 |---|---|---|---|
-| `native` | CUDA, ROCM | `LocalSubspacePlan` | the `lorrax_active_subspace_*` handlers on the active dimensions only: cuBLAS and cuSolverDn (CUDA), rocBLAS and rocSOLVER (ROCM), one leg-neutral source (`common/gpu_blas.h`, `gpu_solver.h`) |
+| `native` | CUDA, ROCM | `LocalSubspacePlan` | the `lorrax_active_subspace_*` handlers on the active dimensions only; implementation per leg `active_subspace.NATIVE_HANDLERS`: cuBLAS and cuSolverDn (CUDA, `blas`), run-time compiled kernels reading the window on the device (ROCM, `devsize`, `active_devsize.cc`) |
 | `xla` | reference; a vendor with no leg | `XlaSubspacePlan` | device products on the active window (power-of-two row slices, no padded rows enter arithmetic) and `eigh_local` on the active block; no host callback |
 | `host` | cpu | `CpuSubspacePlan` | NumPy BLAS/LAPACK inside `jax.pure_callback` on the active rows |
 | — | any, `vector_sharding` over more than one device | `DistributedSubspacePlan` | wraps the provider in `shard_map`: each rank works on its own vector tile and only coefficient matrices are summed across the mesh |
@@ -74,13 +74,17 @@ It is the reference every native row is gated against
 the same device). ROCm took it from 2026-10-15 (the host route cost bse 517
 callbacks at P=4 and made the solver jits uncacheable) until the native port.
 
-**The ROCM native eigensolve** reflects the active block first, as
-`local_eigh`'s ROCM complex route does: rocSOLVER `zheevd` fails (info != 0, or
-NaN vectors with info = 0) on structured complex blocks such as real-valued
-ones of n >= 96, so the handler solves `H A H` with the fixed dense
-Householder reflector restricted to the active rows and returns `H C`; a
-scalar block is answered exactly, and a failed solve is NaN in the
-eigenvalues. CUDA's cuSolverDn solve is unreflected, as before.
+**The ROCM native route has no per-call host sync.** Its handlers
+(`active_devsize.cc`) read `start`/`count` (and `m`, `columns`,
+`compute_image`) on the device: tall-skinny product kernels with fixed-order
+k-split partials in the declared `blas` scratch, a thread-per-entry combine,
+`project` as one product plus a conjugate-transpose mirror. An invalid window
+poisons the outputs with NaN (as the XLA route) instead of raising. The
+eigensolve reads no size either: the capacity matrix (active block, inactive
+diagonal distinct values in [2b, 4b), b the block's Gershgorin bound) is
+reflected (rocSOLVER `zheevd` fails on structured complex matrices) and solved
+by `lorrax_rocsolver_batched_eigh` at batch 1; cost O(capacity³) per call.
+`lorrax_active_subspace_eigh` and `_distributed_ortho` are CUDA-only.
 
 `plan_local_subspace(*, capacity, n_eig, max_block_size=None)` is the
 one-device native plan of the process's device leg alone; it refuses on a CPU

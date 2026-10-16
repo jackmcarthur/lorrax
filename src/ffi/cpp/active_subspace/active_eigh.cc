@@ -1,52 +1,48 @@
-// Exact active-prefix Hermitian eigensolve with XLA-owned workspace.
-// Leg-neutral: cuSOLVERDn on the CUDA leg, rocSOLVER on the ROCM leg, both through
-// common/gpu_solver.h (its CUDA spellings are the cuSOLVER calls this file made before).
+// Experiment: exact active-prefix cuSOLVER eigensolve with XLA-owned workspace.
 #include "xla/ffi/api/ffi.h"
 #include <algorithm>
 #include <climits>
 #include <complex>
 #include <cstdint>
+#include <cuda_runtime_api.h>
+#include <cusolverDn.h>
 #include <string>
-
-#include "../common/c_abi.h"
-#include "../common/gpu_runtime.h"
-#include "../common/gpu_solver.h"
 namespace ffi = xla::ffi;
 namespace lorrax_ffi::active_subspace {
-namespace solver = lrx::gpu::solver;
 struct Handle {
-  solver::Handle h = nullptr;
-  Handle() { solver::create(&h); }
+  cusolverDnHandle_t h = nullptr;
+  Handle() { cusolverDnCreate(&h); }
   ~Handle() {
     if (h)
-      solver::destroy(h);
+      cusolverDnDestroy(h);
   }
 };
-static solver::Handle handle() {
+static cusolverDnHandle_t handle() {
   thread_local Handle h;
   return h.h;
 }
-// lrx_active_eigh_lwork on CUDA, lrx_active_eigh_lwork_rocm on ROCM (c_abi.h).
-extern "C" int LRX_C_ENTRY(lrx_active_eigh_lwork)(int n) {
+extern "C" int lrx_active_eigh_lwork(int n) {
   int size = 0;
-  auto rc = solver::zheevd_buffer_size(handle(), n, nullptr, n, nullptr, &size);
-  return rc == solver::kSuccess ? size : -int(rc);
+  auto rc = cusolverDnZheevd_bufferSize(handle(), CUSOLVER_EIG_MODE_VECTOR,
+                                        CUBLAS_FILL_MODE_LOWER, n, nullptr, n,
+                                        nullptr, &size);
+  return rc == CUSOLVER_STATUS_SUCCESS ? size : -int(rc);
 }
 #define CUDA_CHECK(call)                                                       \
   do {                                                                         \
     auto err = (call);                                                         \
-    if (err != lrx::gpu::kSuccess)                                             \
-      return ffi::Error::Internal(lrx::gpu::error_string(err));                \
+    if (err != cudaSuccess)                                                    \
+      return ffi::Error::Internal(cudaGetErrorString(err));                    \
   } while (0)
 #define SOLVER_CHECK(call)                                                     \
   do {                                                                         \
     auto err = (call);                                                         \
-    if (err != solver::kSuccess)                                               \
-      return ffi::Error::Internal(LRX_SOLVER_API " status " +                  \
+    if (err != CUSOLVER_STATUS_SUCCESS)                                        \
+      return ffi::Error::Internal("cuSOLVER status " +                         \
                                   std::to_string(int(err)));                   \
   } while (0)
 static ffi::Error
-active_eigh(lrx::gpu::Stream stream, ffi::BufferR2<ffi::C128> h,
+active_eigh(cudaStream_t stream, ffi::BufferR2<ffi::C128> h,
             ffi::BufferR0<ffi::S32> active,
             ffi::Result<ffi::BufferR1<ffi::F64>> eigenvalues,
             ffi::Result<ffi::BufferR2<ffi::C128>> coefficients,
@@ -62,54 +58,54 @@ active_eigh(lrx::gpu::Stream stream, ffi::BufferR2<ffi::C128> h,
       coefficients->dimensions()[1] != b || evalwork->dimensions()[0] != cap ||
       info->dimensions()[0] != 1)
     return ffi::Error::InvalidArgument("active_eigh buffer geometry mismatch");
-  if (const char *why = solver::unavailable())
-    return ffi::Error(ffi::ErrorCode::kFailedPrecondition, why);
   int n = 0;
-  CUDA_CHECK(lrx::gpu::memcpy_async(&n, active.typed_data(), sizeof(int),
-                                    lrx::gpu::kDeviceToHost, stream));
-  CUDA_CHECK(lrx::gpu::stream_synchronize(stream));
+  CUDA_CHECK(cudaMemcpyAsync(&n, active.typed_data(), sizeof(int),
+                             cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
   if (n < 1 || n > cap)
     return ffi::Error::InvalidArgument(
         "active_eigh active size outside capacity");
-  auto a = reinterpret_cast<solver::Complex *>(work->typed_data());
+  auto a = reinterpret_cast<cuDoubleComplex *>(work->typed_data());
   const int64_t declared = work->dimensions()[0] - int64_t(cap) * cap;
   if (declared < 1 || declared > INT_MAX)
     return ffi::Error::InvalidArgument("active_eigh workspace geometry");
   const int lwork = declared;
   auto scratch = a + int64_t(cap) * cap;
   int needed = 0;
-  SOLVER_CHECK(solver::set_stream(handle(), stream));
-  SOLVER_CHECK(solver::zheevd_buffer_size(handle(), n, a, cap,
-                                          evalwork->typed_data(), &needed));
+  SOLVER_CHECK(cusolverDnSetStream(handle(), stream));
+  SOLVER_CHECK(cusolverDnZheevd_bufferSize(handle(), CUSOLVER_EIG_MODE_VECTOR,
+                                           CUBLAS_FILL_MODE_LOWER, n, a, cap,
+                                           evalwork->typed_data(), &needed));
   if (needed > lwork)
     return ffi::Error::InvalidArgument(
         "active_eigh insufficient declared workspace");
-  CUDA_CHECK(lrx::gpu::memcpy_2d_async(a, cap * sizeof(solver::Complex), h.typed_data(),
-                                      cap * sizeof(solver::Complex),
-                                      n * sizeof(solver::Complex), n,
-                                      lrx::gpu::kDeviceToDevice, stream));
-  SOLVER_CHECK(solver::zheevd(handle(), n, a, cap, evalwork->typed_data(),
-                              scratch, lwork, info->typed_data()));
+  CUDA_CHECK(cudaMemcpy2DAsync(a, cap * sizeof(cuDoubleComplex), h.typed_data(),
+                               cap * sizeof(cuDoubleComplex),
+                               n * sizeof(cuDoubleComplex), n,
+                               cudaMemcpyDeviceToDevice, stream));
+  SOLVER_CHECK(cusolverDnZheevd(
+      handle(), CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, n, a, cap,
+      evalwork->typed_data(), scratch, lwork, info->typed_data()));
   const int columns = std::min(n, b);
-  CUDA_CHECK(lrx::gpu::memset_async(eigenvalues->typed_data(), 0, b * sizeof(double),
-                                    stream));
-  CUDA_CHECK(lrx::gpu::memcpy_async(eigenvalues->typed_data(), evalwork->typed_data(),
-                                    columns * sizeof(double), lrx::gpu::kDeviceToDevice,
-                                    stream));
-  CUDA_CHECK(lrx::gpu::memset_async(coefficients->typed_data(), 0,
-                                    int64_t(cap) * b * sizeof(solver::Complex),
-                                    stream));
-  CUDA_CHECK(lrx::gpu::memcpy_2d_async(
-      coefficients->typed_data(), cap * sizeof(solver::Complex), a,
-      cap * sizeof(solver::Complex), n * sizeof(solver::Complex), columns,
-      lrx::gpu::kDeviceToDevice, stream));
+  CUDA_CHECK(cudaMemsetAsync(eigenvalues->typed_data(), 0, b * sizeof(double),
+                             stream));
+  CUDA_CHECK(cudaMemcpyAsync(eigenvalues->typed_data(), evalwork->typed_data(),
+                             columns * sizeof(double), cudaMemcpyDeviceToDevice,
+                             stream));
+  CUDA_CHECK(cudaMemsetAsync(coefficients->typed_data(), 0,
+                             int64_t(cap) * b * sizeof(cuDoubleComplex),
+                             stream));
+  CUDA_CHECK(cudaMemcpy2DAsync(
+      coefficients->typed_data(), cap * sizeof(cuDoubleComplex), a,
+      cap * sizeof(cuDoubleComplex), n * sizeof(cuDoubleComplex), columns,
+      cudaMemcpyDeviceToDevice, stream));
   return ffi::Error::Success();
 }
 } // namespace lorrax_ffi::active_subspace
 using namespace lorrax_ffi::active_subspace;
 XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceEighFfi, active_eigh,
                               ffi::Ffi::Bind()
-                                  .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
                                   .Arg<ffi::BufferR2<ffi::C128>>()
                                   .Arg<ffi::BufferR0<ffi::S32>>()
                                   .Ret<ffi::BufferR1<ffi::F64>>()

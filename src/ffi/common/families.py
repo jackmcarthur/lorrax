@@ -99,11 +99,13 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         gate="tests/test_subspace_native_gate.py (native vs XlaSubspacePlan and CpuSubspacePlan "
              "on the same device: project, eigh, reconstruct, Gram, CGS2, subtract, store, "
              "NaN-poisoned inactive rows, one compilation per plan)", tol=1e-12,
-        note="Provider per leg: distrib_la.subspace.SUBSPACE_ROUTE.  One leg-neutral source "
-             "(common/gpu_blas.h, gpu_solver.h): cuBLAS/cuSOLVERDn on CUDA, rocBLAS/rocSOLVER "
-             "resolved from the process's mapped copies on ROCM.  distributed_ortho (one NCCL "
-             "all-reduce per CGS pass) needs cuSolverMp's communicator, so it is CUDA-only; "
-             "ROCM reduces the coefficients with JAX psum (native_collectives refuses by GATE)."),
+        note="Provider per leg: distrib_la.subspace.SUBSPACE_ROUTE; implementation per leg: "
+             "distrib_la.active_subspace.NATIVE_HANDLERS.  CUDA: cuBLAS/cuSOLVERDn on the active "
+             "dimensions (active_ops.cc, active_eigh.cc; host-read descriptors).  ROCM: "
+             "active_devsize.cc, run-time compiled kernels reading the descriptors on the device "
+             "(no per-call host sync), and the shifted, reflected capacity eigensolve through "
+             "lorrax_rocsolver_batched_eigh.  distributed_ortho needs cuSolverMp's communicator: "
+             "CUDA-only (ROCM: JAX psum; native_collectives refuses by GATE)."),
     "cusolvermp": Family(
         ("lorrax_cusolvermp_",), "cusolvermp",
         _legs(("built", ""), ("elsewhere", "slate (distrib_la.resolve eigh/ROCM row)"),

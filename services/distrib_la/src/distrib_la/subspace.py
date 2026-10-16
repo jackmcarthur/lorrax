@@ -17,8 +17,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from lxkit import device_vendor
 
 from distrib_la._active_local import interval_rows
-from distrib_la.active_subspace import (LocalSubspacePlan, _orthogonalization_range, native_leg,
-                                       plan_local_subspace)
+from distrib_la.active_subspace import (LocalSubspacePlan, _orthogonalization_range, native_fields,
+                                       native_leg, plan_local_subspace)
 from distrib_la.loader import probe_target
 from distrib_la.local_eigh import eigh_local
 
@@ -518,7 +518,7 @@ def plan_orthogonalization(*, capacity, max_block_size, vector_sharding=None,
         if not result.ok:
             raise RuntimeError(f'orthogonalization provider unavailable: {result}')
         local = LocalSubspacePlan(capacity, 1, 0, max_block_size=max_block_size,
-                                  vendor=leg.vendor)
+                                  **native_fields(leg))
     else:
         local = _local_plan(route, capacity, 1, max_block_size)
     implementation = _distribute(local, vector_sharding,

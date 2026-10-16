@@ -249,9 +249,13 @@ def check_normalize():
 def check_refusal():
     v, hv, c, p = _problem()
     nat = _native(CAP, B)
-    with pytest.raises(Exception):
-        np.asarray(jax.jit(nat.orthogonalize)(jnp.asarray(v), jnp.asarray(p),
-                                              jnp.int32(60), start=jnp.int32(8)))
+    # blas handlers raise; devsize kernels (device-side descriptors) poison the output.
+    try:
+        out = np.asarray(jax.jit(nat.orthogonalize)(jnp.asarray(v), jnp.asarray(p),
+                                                    jnp.int32(60), start=jnp.int32(8)))
+    except Exception:
+        return
+    assert np.isnan(out).all(), "invalid window neither raised nor poisoned the output"
 
 
 # The hopping keeps the diagonal preconditioner approximate: on an exactly diagonal operator

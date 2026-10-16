@@ -219,7 +219,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
                            for t in dl_rocm)
     active = {t for t in dl_rocm if t.startswith("lorrax_active_subspace_")}
     assert active == {t for t in dl._CUDA_TARGET_SYMBOLS if t.startswith("lorrax_active_subspace_")
-                      } - {"lorrax_active_subspace_distributed_ortho"}
+                      } - {"lorrax_active_subspace_distributed_ortho", "lorrax_active_subspace_eigh"}
     assert all(dl_rocm[t] == dl._CUDA_TARGET_SYMBOLS[t] for t in active)
     assert lu | eigh <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu | eigh)
     cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
