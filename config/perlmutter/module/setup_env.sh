@@ -8,7 +8,9 @@
 # the module puts a source snapshot on PYTHONPATH instead).  JAX is the
 # `cuda13-local` build, which uses the site CUDA toolkit and installs no CUDA
 # runtime.  cuDNN and nvidia-mathdx install with --no-deps: their dependency
-# closures would add a second CUDA runtime that shadows the toolkit's.
+# closures would add a second CUDA runtime that shadows the toolkit's.  NCCL is
+# the nvidia-nccl-cu13 wheel (stack.sh NCCL_VERSION, the clone's uv.lock pin),
+# also --no-deps: the one NCCL of every route; never the HPC SDK's comm_libs.
 # The venv is never refreshed in place: a pin change is a new prefix.
 # ============================================================================
 set -euo pipefail
@@ -33,10 +35,12 @@ echo "[setup_env] installing $(grep -c '==' "$REQ") locked packages + jax[cuda13
     "jax[cuda13-local]==$JAX_VERSION"
 "$UV" pip install --quiet --python "$VENV/bin/python" --no-deps \
     "nvidia-cudnn-cu13==$CUDNN_VERSION" \
-    "nvidia-mathdx==$MATHDX_VERSION"
+    "nvidia-mathdx==$MATHDX_VERSION" \
+    "nvidia-nccl-cu13==$NCCL_VERSION"
 
 SITE="$(lorrax_module_site_packages)"
-for p in "$SITE/nvidia/mathdx/include/cufftdx.hpp" "$SITE/nvidia/cudnn/lib"; do
+for p in "$SITE/nvidia/mathdx/include/cufftdx.hpp" "$SITE/nvidia/cudnn/lib" \
+         "$SITE/nvidia/nccl/lib/libnccl.so.2" "$SITE/nvidia/nccl/include/nccl.h"; do
     [[ -e "$p" ]] || lorrax_module_die "the wheels did not supply $p"
 done
 if ls -d "$SITE"/nvidia/cuda_runtime "$SITE"/nvidia/cu13/lib/libcudart.so* >/dev/null 2>&1; then
@@ -47,6 +51,6 @@ import importlib.metadata as md
 import jax_plugins.xla_cuda13  # noqa: F401  the local-CUDA plugin
 print("[setup_env] " + " ".join(f"{n}={md.version(n)}" for n in
       ("jax", "jaxlib", "jax-cuda13-plugin", "jax-cuda13-pjrt",
-       "nvidia-cudnn-cu13", "nvidia-mathdx")))
+       "nvidia-cudnn-cu13", "nvidia-mathdx", "nvidia-nccl-cu13")))
 PY
 echo "[setup_env] venv: $VENV"
