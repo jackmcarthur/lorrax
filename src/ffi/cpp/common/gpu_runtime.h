@@ -94,6 +94,13 @@ inline Error memcpy_2d_async(void* dst, std::size_t dpitch, const void* src,
 inline Error memset_async(void* dst, int value, std::size_t n, Stream s) {
     return LRX_GPU_SYM(MemsetAsync)(dst, value, n, s);
 }
+// Plan-lifetime device tables (the Fourier plan's matrices and remap maps): allocated and
+// uploaded once when a plan is built, kept for the process.
+inline Error device_malloc(void** p, std::size_t n) { return LRX_GPU_SYM(Malloc)(p, n); }
+inline Error memcpy_sync(void* dst, const void* src, std::size_t n, MemcpyKind kind) {
+    return LRX_GPU_SYM(Memcpy)(dst, src, n, kind);
+}
+inline Error peek_at_last_error() { return LRX_GPU_SYM(PeekAtLastError)(); }
 
 // The device's code-object target, the run-time compilers' architecture (rtc_build.h
 // arch_option): "sm_<major><minor>" on CUDA, the full target id ("gfx90a:sramecc+:xnack-",

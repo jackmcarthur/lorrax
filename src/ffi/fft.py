@@ -3013,9 +3013,17 @@ def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,
 
 
 # =============================================================================
-# The local Fourier plan's CUDA leg (``common.fourier_plan.LocalFourierPlan``)
+# The local Fourier plan's device legs (``common.fourier_plan.LocalFourierPlan``)
 # =============================================================================
 FOURIER_PLAN_TARGET = "lorrax_fourier_plan_mathdx"
+#: The route row: leg -> the native target of a ``LocalFourierPlan`` with a GEMM stage, and
+#: the build attributes that target takes besides the plan's (``fourier_plan_ffi``).  A leg
+#: with no row takes the plan's XLA leg.  CUDA: cuBLAS GEMM axes, the fused cuBLASDx pair
+#: (``mathdx_root``/``cubin_dir`` from :func:`pair_build_attrs`, ``""`` = no pair), cuFFT
+#: (cpp/cufft/fourier_plan_cuda_ffi.cc).  ROCM: its port, rocBLAS GEMM axes, hipFFT and the
+#: hipRTC remap kernel cached under ``cubin_dir`` (cpp/hipfft/fourier_plan_rocm_ffi.cc).
+FOURIER_PLAN_TARGETS = {"CUDA": FOURIER_PLAN_TARGET, "ROCM": "lorrax_fourier_plan_rocm"}
+_FOURIER_PLAN_ATTRS = {"CUDA": ("mathdx_root", "cubin_dir"), "ROCM": ("cubin_dir",)}
 # The nvidia-mathdx wheels the plan's fused pair is validated with: its NVRTC build
 # defines CCCL's structured-bindings include guard to reconcile the wheel's CUTLASS
 # with CUDA 13's CCCL (fourier_plan_cuda_ffi.cc, pair_kernel).  Another wheel serves
@@ -3023,24 +3031,43 @@ FOURIER_PLAN_TARGET = "lorrax_fourier_plan_mathdx"
 # require_kconv); a plan built on it runs its GEMM pairs as the cuBLAS chain.
 PAIR_MATHDX_WHEELS = ("25.6.0",)
 
+_FOURIER_PLAN_ANNOUNCE = {
+    "CUDA": "(cuBLAS Fourier GEMMs, the fused cuBLASDx pair on a validated nvidia-mathdx "
+            "wheel, one cuFFT group)",
+    "ROCM": "(rocBLAS Fourier GEMMs, one hipFFT group, hipRTC remap; no fused pair)",
+}
+
 
 def require_fourier_plan(mesh: Mesh, *, announce: bool = True) -> str:
     """Startup check of ``LocalFourierPlan``'s leg on this mesh; returns it or refuses.
 
-    CUDA: the ``lorrax_fourier_plan_mathdx`` handler must be in the loaded library
-    (the plan's CUDA leg is that one custom call).  The leg itself needs no mathdx
-    wheel; the fused pair checks its wheel where a plan builds it
+    A device leg with a :data:`FOURIER_PLAN_TARGETS` row: its handler must be in the loaded
+    library (the plan's device leg is that one custom call).  CUDA needs no mathdx wheel
+    for it; the fused pair checks its wheel where a plan builds it
     (:func:`pair_build_attrs`).  cpu: the XLA ops, nothing to probe.
     """
     from ffi.gate import announce_once, mesh_ffi_platform
-    if mesh_ffi_platform(mesh) != "CUDA":
+    leg = mesh_ffi_platform(mesh)
+    target = FOURIER_PLAN_TARGETS.get(leg)
+    if target is None:
         return "xla"
-    _require_target(FOURIER_PLAN_TARGET, "CUDA")
-    announce_once(("fourier_plan", "cuda"),
-                  f"[fourier_plan] LocalFourierPlan CUDA leg: {FOURIER_PLAN_TARGET} "
-                  "(cuBLAS Fourier GEMMs, the fused cuBLASDx pair on a validated nvidia-mathdx "
-                  "wheel, one cuFFT group)", scope="rank0", emit=announce)
+    _require_target(target, leg)
+    announce_once(("fourier_plan", leg.lower()),
+                  f"[fourier_plan] LocalFourierPlan {leg} leg: {target} "
+                  f"{_FOURIER_PLAN_ANNOUNCE[leg]}", scope="rank0", emit=announce)
     return "ffi"
+
+
+def fourier_plan_build_attrs(leg: str, *, n_gemm: int) -> dict:
+    """The build attributes of ``leg``'s route row for :func:`fourier_plan_ffi`, for a plan
+    with ``n_gemm`` GEMM axes on a process where the leg is present.  The pair's row
+    (``mathdx_root``): :func:`pair_build_attrs` when a pair is possible, else ``""`` (no pair).
+    ``cubin_dir`` alone (the ROCM remap image): :func:`cubin_cache_dir`."""
+    names = _FOURIER_PLAN_ATTRS[leg]
+    if "mathdx_root" in names:
+        pair = pair_build_attrs() if n_gemm >= 2 else {}
+        return {k: pair.get(k, "") for k in names}
+    return {k: cubin_cache_dir() for k in names}
 
 
 def pair_build_attrs() -> dict:
@@ -3070,24 +3097,27 @@ def pair_build_attrs() -> dict:
 
 
 def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
-                     order, sign, mathdx_root="", cubin_dir=""):
-    """One ``lorrax_fourier_plan_mathdx`` custom call over the ``len(n)`` trailing axes
-    of ``x`` (row-major in, row-major out; ``cpp/cufft/fourier_plan_cuda_ffi.cc``).
+                     order, sign, leg="CUDA", mathdx_root="", cubin_dir=""):
+    """One custom call of ``leg``'s :data:`FOURIER_PLAN_TARGETS` row over the ``len(n)``
+    trailing axes of ``x`` (row-major in, row-major out; CUDA
+    ``cpp/cufft/fourier_plan_cuda_ffi.cc``, ROCM ``cpp/hipfft/fourier_plan_rocm_ffi.cc``).
 
     Every attribute is per transform axis in physical order: full extent
     ``n``, compact extents ``kin``/``kout``, the concatenated supports
     ``in_idx``/``out_idx`` (identity ranges on an axis without one), the 0/1
     flags ``sup_in``/``sup_out``/``gemm``, the axis' jnp.fft ``scale``, and
     ``order``: GEMM axes in execution order with -1 where the FFT group runs.
-    ``mathdx_root``/``cubin_dir`` build the fused supported pair (the two
+    CUDA: ``mathdx_root``/``cubin_dir`` build the fused supported pair (the two
     trailing axes' GEMMs back to back as one cuBLASDx kernel, when a block fits
-    it on the device); ``""`` runs every GEMM through cuBLAS.
+    it on the device); ``""`` runs every GEMM through cuBLAS.  ROCM: ``cubin_dir``
+    caches the remap kernel's hipRTC image (``""``: not cached).
     """
     d = len(n)
     out = jax.ShapeDtypeStruct(tuple(x.shape[:-d]) + tuple(int(k) for k in kout), x.dtype)
     i64 = lambda v: np.asarray(v, dtype=np.int64)
-    return jax.ffi.ffi_call(FOURIER_PLAN_TARGET, out)(
+    build = dict(mathdx_root=mathdx_root, cubin_dir=cubin_dir)
+    return jax.ffi.ffi_call(FOURIER_PLAN_TARGETS[leg], out)(
         x, n=i64(n), kin=i64(kin), kout=i64(kout), in_idx=i64(in_idx), out_idx=i64(out_idx),
         sup_in=i64(sup_in), sup_out=i64(sup_out), gemm=i64(gemm),
         scale=np.asarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign),
-        mathdx_root=mathdx_root, cubin_dir=cubin_dir)
+        **{k: build[k] for k in _FOURIER_PLAN_ATTRS[leg]})

@@ -236,6 +236,9 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     # The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc), called by
     # distrib_la.local_eigh (BATCHED_EIGH_ROUTE); CUDA uses jaxlib's cuSOLVER for it.
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
+    # LocalFourierPlan's ROCM leg (cpp/hipfft/fourier_plan_rocm_ffi.cc, the port of the CUDA
+    # leg's cufft/fourier_plan_cuda_ffi.cc): ffi.fft.FOURIER_PLAN_TARGETS["ROCM"].
+    "lorrax_fourier_plan_rocm":      "LorraxFourierPlanRocmFfi",
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},
