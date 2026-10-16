@@ -330,3 +330,26 @@ def test_describe_prints_the_bundle_receipts(tmp_path):
     assert f"cc' below: {prec['cc']['below_gap']} of {prec['cc']['pairs']}" in text
     assert "gauge receipt   : <0|r|S> of 2 BSE states" in text and "rel dev 1.00e-15" in text
 
+
+
+def test_window_position_from_route_b_is_used_as_given():
+    """r_window (Route B, exact position of the fine states) enters without a v/dE division."""
+    e, x, _ = _planted(nk=2)
+    gap = 0.05 / RYD_TO_EV
+    r, rec = ts.position_from_window_r(x, e, 3, rule="mask", gap_ry=gap)
+    xd = x.copy(); xd[:, :, np.arange(6), np.arange(6)] = 0.0
+    assert np.allclose(r, xd, rtol=0, atol=1e-15)                          # mask applied upstream, not twice
+    assert rec["rule"].startswith("mask") and rec["vv"]["pairs"] == 2 * 3 and rec["cc"]["pairs"] == 2 * 3
+    r_cv, _ = ts.position_from_window_r(x, e, 3, rule="cv", gap_ry=gap)
+    assert np.abs(r_cv[:, :, :3, :3]).max() == 0 and np.abs(r_cv[:, :, 3:, 3:]).max() == 0
+    assert np.allclose(r_cv[:, :, 3:, :3], x[:, :, 3:, :3], atol=1e-15)
+    e2 = e.copy(); e2[:, 1] = e2[:, 0] + 1e-3 / RYD_TO_EV
+    r_cut, rc = ts.position_from_window_r(x, e2, 3, rule="cut", gap_ry=gap)
+    assert np.abs(r_cut[:, :, 0, 1]).max() == 0 and rc["vv"]["below_gap"] >= 2
+    with pytest.raises(ValueError, match="GATE td_position_hermitian"):
+        ts.position_from_window_r(x + 1e-3j * np.abs(x).max(), e, 3, gap_ry=gap)
+    bad = e.copy(); bad[0, 3] = bad[0, 2] - 0.01
+    with pytest.raises(ValueError, match="GATE td_cv_gap"):
+        ts.position_from_window_r(x, bad, 3, gap_ry=gap)
+    with pytest.raises(ValueError, match="GATE td_pair_gap_route_b"):
+        ts.position_from_window_r(x, e, 3, rule="mask", gap_ry=0.1 / RYD_TO_EV)

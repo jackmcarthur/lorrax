@@ -97,10 +97,13 @@ the window and refuse when its band energies differ from the restart's DFT
 energies by more than 1e-8 Ry (`td_dipole_energies`). `bse_k_grid` decks take
 Route B's window velocity in the fine $U_q$ gauge
 (`densified_dipoles(full_window=True)`) with its Newton-inverted DFT
-energies. With `--eqp` the fine states are QP-mixed, $v_{nm}/\Delta E$ is then
-not $U^\dagger r U$ (the onset oscillator strength comes out 13–19 % low on
-8 → 30 k), and the bundle route of a `bse_k_grid` deck is provisional until
-Route B supplies $r$ itself.
+energies. With `--eqp` the fine states are QP-mixed and $v_{nm}/\Delta E$ is
+not their position (the onset oscillator strength comes out 13–19 % low on
+8 → 30 k); Route B then returns `r_window`, the exact
+$\langle\tilde i|\hat r|\tilde j\rangle$ of the fine states (same-occupation
+pairs masked at 0.05 eV upstream), and the builder takes it as given: no
+division, `cut` and `cv` applied on top, `mask` only at Route B's 0.05 eV
+(`td_pair_gap_route_b`).
 
 **The denominator uses DFT energies.** $v = i[H, r]$ holds in the eigenbasis
 of the Hamiltonian whose velocity it is, the DFT one; QP differences would
@@ -200,7 +203,13 @@ converge, so `n_corr` < 1 refuses. The extrapolation amplifies the predictor's e
 one correction contracts it only while $h\,\lVert\partial\Delta\Sigma/\partial\rho\rVert$
 is small: with the CrI3 COHSEX kernel (6×6 k, 2v2c) `cfm4` with one
 correction diverges from 50 as, while two corrections are stable to 300 as.
-The default is two. The first two (`cfm4`) or three (`magnus2`) steps,
+The norm grows with the window: on the 30×30 CrI3 bundle (42v14c, N_μ 714)
+two corrections are unstable at 50 as — a mode seeded at rounding grows by
+3.6 % per step (1.1 fs⁻¹ in amplitude, non-oscillating at two steps per
+sample) and becomes visible after ~18 fs whatever the drive, and the TDA
+update diverges sooner (from 7 fs) — while 25 as is flat (carrier density
+constant to 0.1 % over 24 fs after a kick). Check a new window with a short
+kick run at the intended step before production. The default is two. The first two (`cfm4`) or three (`magnus2`) steps,
 before the history exists, take three extra corrections. Relaxation and the
 intraband term are not commutators; they enter by Strang splitting
 $R(h/2)\,M(h)\,R(h/2)$, with $R$ the exact relaxation around an RK4 step of
