@@ -473,53 +473,59 @@ def _announce_read_layout(path: str) -> None:
 @contextmanager
 def _large_read_progress(path: str, name: str, *, global_bytes: int,
                          local_bytes: int):
-    """Make a synchronous H5Dread distinguishable from a frozen process.
+    """Make a large-file H5Dread distinguishable from a frozen process, without waiting for it.
 
-    Yields whether it watches (rank 0, a file of at least ``_LARGE_READ_LAYOUT_BYTES``):
-    only a watched read waits for its bytes inside the context, so START/COMPLETE time
-    the read itself; every other read returns at dispatch.
+    Rank 0, a file of at least ``_LARGE_READ_LAYOUT_BYTES``: START at dispatch, then a daemon
+    thread polls the result (``is_ready``: no stream synchronization) and prints PROGRESS every
+    ``_READ_HEARTBEAT_SECONDS`` and COMPLETE once the bytes have landed (elapsed from dispatch).
+    Yields ``watch(result)``; the read is never waited for here, so the caller's thread runs on.
+    A dispatch that raises prints FAILED.
     """
+    pending: list = []
     if not _rank0():
-        yield False
+        yield pending.append
         return
     try:
         file_bytes = int(os.path.getsize(path))
     except OSError:
         file_bytes = -1
     if file_bytes < _LARGE_READ_LAYOUT_BYTES:
-        yield False
+        yield pending.append
         return
 
     started = time.monotonic()
-    stopped = threading.Event()
     label = f"{os.path.basename(path)}:{name}"
     print(
         f"  [SlabIO.read] START {label} global_bytes={int(global_bytes)} "
         f"local_bytes={int(local_bytes)}",
         flush=True)
-
-    def heartbeat() -> None:
-        while not stopped.wait(_READ_HEARTBEAT_SECONDS):
-            print(
-                f"  [SlabIO.read] PROGRESS {label} "
-                f"elapsed={time.monotonic() - started:.1f} s; "
-                "collective H5Dread has not returned",
-                flush=True)
-
-    thread = threading.Thread(
-        target=heartbeat, name="lorrax-slabio-read-progress", daemon=True)
-    thread.start()
-    outcome = "FAILED"
     try:
-        yield True
-        outcome = "COMPLETE"
-    finally:
-        stopped.set()
-        thread.join(timeout=1.0)
+        yield pending.append
+    except BaseException:
+        print(f"  [SlabIO.read] FAILED {label} elapsed={time.monotonic() - started:.1f} s",
+              flush=True)
+        raise
+
+    def landed() -> None:
+        delay, beat = 1e-3, started + _READ_HEARTBEAT_SECONDS
+        while not all(r.is_ready() for r in pending):
+            now = time.monotonic()
+            if now >= beat:
+                beat = now + _READ_HEARTBEAT_SECONDS
+                print(
+                    f"  [SlabIO.read] PROGRESS {label} "
+                    f"elapsed={now - started:.1f} s; "
+                    "collective H5Dread has not returned",
+                    flush=True)
+            time.sleep(delay)
+            delay = min(2 * delay, 0.25)
         print(
-            f"  [SlabIO.read] {outcome} {label} "
+            f"  [SlabIO.read] COMPLETE {label} "
             f"elapsed={time.monotonic() - started:.1f} s",
             flush=True)
+
+    threading.Thread(target=landed, name="lorrax-slabio-read-progress",
+                     daemon=True).start()
 
 
 def _replace_inode_for_write(path: str) -> None:
@@ -3132,10 +3138,9 @@ class _FfiBackend(_DatasetGeometry):
         _local_bytes = int(np.prod(local_shape, dtype=np.int64)) * _dtype.itemsize
         with _large_read_progress(
                 self.path, name, global_bytes=_global_bytes,
-                local_bytes=_local_bytes) as watched:
+                local_bytes=_local_bytes) as watch:
             result = sm(handle_arr, offset_arr, valid_shape_arr)
-            if watched:
-                result.block_until_ready()
+            watch(result)
         # No wait here: the read handler runs on the XLA thread after this returns, and
         # the next HDF5 entry point of ANY handle waits for it (_CollectiveLane, as the
         # union reads), which closes the three hazards the entry drain above names
@@ -3163,7 +3168,7 @@ class _FfiBackend(_DatasetGeometry):
         result = jnp.zeros(shape, dtype, device=NamedSharding(mesh, spec))
         with _large_read_progress(self.path, name,
                 global_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize,
-                local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p) as watched:
+                local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p) as watch:
             landed = None
             for idx in itertools.product(*(range(0, vshape[a], steps[a]) for a in range(k))):
                 idx = tuple(min(i, vshape[a] - steps[a]) for a, i in enumerate(idx))
@@ -3191,8 +3196,8 @@ class _FfiBackend(_DatasetGeometry):
                         spec, k, compact, carrier, real)
                     result = insert(result, piece, starts)
                     landed = result
-            if watched and landed is not None:
-                landed.block_until_ready()
+            if landed is not None:
+                watch(landed)
         if landed is not None:
             _LANE.track_read(self._dispatcher, landed)
         return result
