@@ -114,6 +114,20 @@ def _sockets_refusal(site, nodes, cause, step_network, leg):
             'NCCL_NET unset or set to an OFI provider.')
 
 
+def _require_launch_libraries(section, env, site, leg, lib, is_file):
+    """Refuse a profiled multi-node step whose LD_LIBRARY_PATH lacks a library the site's
+    transport dlopens by an unversioned name (fixed when Python starts: refuse, not repair)."""
+    ld_path = [d for d in env.get('LD_LIBRARY_PATH', '').split(':') if d]
+    for name in section.get('launch_libraries', ()):
+        if not any((is_file or os.path.isfile)(os.path.join(d, name)) for d in ld_path):
+            raise RuntimeError(
+                f"GATE launch_libraries: refusing multi-node {site} "
+                f"{leg.key} startup: no {name} on LD_LIBRARY_PATH. The site "
+                f"transport dlopens it by that name, and without it {lib} "
+                'cannot register device memory with the network. '
+                f"{section.get('launch_libraries_remedy', '')}".rstrip())
+
+
 def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
     """Resolve defaults without modifying the caller's environment."""
     nodes, multiple, topology_source = launch_topology(env)
@@ -133,6 +147,15 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
             raise RuntimeError(_sockets_refusal(
                 profile['site'], nodes, 'NCCL_NET=Socket is set', step_network, leg))
         result['policy'] = 'explicit transport'
+        if section:
+            # The caller chose the transport (a site module such as Frontier's
+            # rccl-net-plugin exports NCCL_NET/NCCL_NET_PLUGIN), so no default is
+            # filled in; the site's start-up REQUIREMENTS hold whoever chose it:
+            # the launch libraries the transport dlopens, and MPI opening its
+            # endpoint before the collective library's plugin (without it,
+            # cray-mpich's MPI_Init_thread fails with ENOSPC on every rank).
+            _require_launch_libraries(section, env, profile['site'], leg, lib, is_file)
+            result['mpi_before_collectives'] = bool(section.get('mpi_before_collectives'))
         return result
     if multiple is not True:
         return result
@@ -155,17 +178,8 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
                 f'plugin {plugin}. Load the supported {lib} environment or export '
                 'NCCL_NET_PLUGIN/NCCL_NET.')
         # Libraries the site's transport dlopens by an unversioned name, which
-        # resolve only through the launch's LD_LIBRARY_PATH (fixed when Python
-        # starts, so this can refuse but not repair).
-        ld_path = [d for d in env.get('LD_LIBRARY_PATH', '').split(':') if d]
-        for name in section.get('launch_libraries', ()):
-            if not any((is_file or os.path.isfile)(os.path.join(d, name)) for d in ld_path):
-                raise RuntimeError(
-                    f"GATE launch_libraries: refusing multi-node {profile['site']} "
-                    f"{leg.key} startup: no {name} on LD_LIBRARY_PATH. The site "
-                    f"transport dlopens it by that name, and without it {lib} "
-                    'cannot register device memory with the network. '
-                    f"{section.get('launch_libraries_remedy', '')}".rstrip())
+        # resolve only through the launch's LD_LIBRARY_PATH.
+        _require_launch_libraries(section, env, profile['site'], leg, lib, is_file)
         result['policy'] = f"{profile['site']} profile"
         result['mpi_before_collectives'] = bool(section.get('mpi_before_collectives'))
     else:

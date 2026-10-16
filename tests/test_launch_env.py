@@ -208,6 +208,28 @@ def test_frontier_profile_refuses_a_launch_without_the_hsa_name():
                                     is_file=lambda path: not path.endswith("libhsa-runtime64.so"))
 
 
+def test_frontier_explicit_transport_keeps_the_site_start_up_requirements():
+    # rccl-net-plugin exports the transport: nothing is filled in, but MPI must
+    # still come before RCCL and the HSA name must still be on the launch path.
+    module = {**FRONTIER, "LD_LIBRARY_PATH": "/shim",
+              "NCCL_NET_PLUGIN": "/sw/frontier/rccl-plugins/x/librccl-net.so"}
+    result = plan(module)
+    assert result["policy"] == "explicit transport" and result["applied"] == {}
+    assert result["mpi_before_collectives"] is True
+    with pytest.raises(RuntimeError, match="GATE launch_libraries.*libhsa-runtime64.so"):
+        ne.plan_network_environment({**module, "NCCL_NET": "AWS Libfabric"},
+                                    is_file=lambda path: not path.endswith("libhsa-runtime64.so"))
+    single = plan({**module, "SLURM_STEP_NODELIST": "frontier07208"})
+    assert single["policy"] == "explicit transport" and "mpi_before_collectives" not in single
+
+
+def test_perlmutter_explicit_transport_is_unchanged():
+    result = plan({"NERSC_HOST": "perlmutter", "NCCL_NET": "AWS Libfabric",
+                   "SLURM_STEP_NODELIST": "nid[001000-001001]"})
+    assert result["policy"] == "explicit transport" and result["applied"] == {}
+    assert result["mpi_before_collectives"] is False
+
+
 def test_rocm_single_node_and_cpu_keep_the_library_policy():
     one = plan({**FRONTIER, "SLURM_STEP_NODELIST": "frontier07208"})
     assert one["policy"] == "unchanged" and one["applied"] == {}
