@@ -122,6 +122,8 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         note="Sigma's active-range GEMM with DEVICE-side bounds: one run-time-compiled kernel "
              "(hipRTC / NVRTC via rtc_build), K loop clamped per row from the device bounds, "
              "weights applied on load; no host read or sync, no operand copy, no workspace. "
+             "Inner product on the FP64 matrix cores (MFMA f64 16x16x4, complex as the exact 4M "
+             "form) on gfx90a / gfx94x; the FMA path elsewhere (CUDA until a DMMA arm is gated). "
              "ROCM's ACTIVE_LOCAL_ROUTE row."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",
