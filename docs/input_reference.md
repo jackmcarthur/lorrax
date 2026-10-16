@@ -295,7 +295,7 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `control.loglevel` | `info` | TDGW's log level. Accepted for compatibility; the driver reports through its run session. |
 | `control.calc_type` | unset (required) | `IP` (no self-energy update) or `COHSEX` (dΣ[ρ] from `lorrax.model`). Anything else refuses (`td_calc_type`). |
 | `control.timesteps.t0` | unset (required) | Start time, as. |
-| `control.timesteps.dt_measure` | unset (required) | Sampling interval, as. Samples are TDGW's grid t0 + i·dt_measure. With a fixed-step method it must be a positive integer multiple of `lorrax.dt` (`td_dt_measure_multiple`). |
+| `control.timesteps.dt_measure` | unset (required) | Sampling interval, as. Samples are TDGW's grid t0 + i·dt_measure. Fixed-step methods sample it by dense output, so `lorrax.dt` need not divide it, except `magnus2`, which needs an integer ratio (`td_dense_output`). |
 | `control.timesteps.tf` | unset (required) | Final time, as. |
 | `control.timesteps.ntcheck` | `5000` | Samples per checkpoint, as in TDGW: every ntcheck samples the driver appends the measurements and rewrites `tdgw_data/checkpoint`. It is also the jitted chunk length unless `lorrax.chunk` is set. |
 | `control.timesteps.max_step` | unset (= no limit) | `dp54` only: SciPy's `max_step`, as. |
@@ -305,7 +305,7 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `control.files.outdir` | unset (required) | Output directory: `tdgw.h5` and `tdgw.toml`, or one `trial-<i>/` per drive with `lorrax.trials`. |
 | `control.files.use_vmtxel` | `false` | `true` refuses (`td_header_source`): the dipole comes from the TDGW header. |
 | `control.files.load_header_from` | `""` (required here) | A TDGW output directory; its `tdgw.h5` header supplies energies, the k grid and the dipole, and is copied into the output. Empty refuses (`td_header_source`). |
-| `control.files.load_checkpoint_from` | `""` | Restart is not implemented; a value refuses (`td_checkpoint_restart`). |
+| `control.files.load_checkpoint_from` | `""` | An earlier run's output directory: the run continues from its last checkpoint exactly (the integrator's carry in `tdgw_data/checkpoint/lorrax`; the same samples, bitwise, as the uninterrupted run) and copies the rows before it. `outdir` must differ (`td_checkpoint_outdir`); a TDGW checkpoint, which holds no carry, refuses (`td_restart_carry`), and so do settings other than `outdir`, `load_checkpoint_from`, `lorrax.chunk` and, for fixed steps, `tf` (`td_restart_settings`). |
 | `system.ibndmin` | unset (required) | First band of the window, 1-based (TDGW). It must equal the header's window (`td_band_window`). |
 | `system.ibndmax` | unset (required) | Last band of the window, 1-based, inclusive. |
 | `system.ivbm` | unset | Valence-band maximum, 1-based. Required by `tdgw_kernel` (`td_ivbm`); `isdf` takes the occupied count from it. |
@@ -319,9 +319,10 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `system.Efunc.E_y` | `0.0` | As `E_x`, along y. |
 | `system.Efunc.E_z` | `0.0` | As `E_x`, along z. |
 | `measurements.types` | unset (required) | The measurement list: `Efield`, `polarization`, `current`, `density_matrix`, `lessG` (TDGW's), and LORRAX's own `carrier_density` (conduction electrons and valence holes per cell, (2,) per sample) and `exciton_projection` (amplitudes c_S = Σ conj(A^S_kcv) ρ_cv(k) on the states of a BSE `eigenvectors.h5`; |c_S|²/N_k excitons per cell). `velocity_operator` refuses (`td_measurement_unsupported`). Per-measurement options are `[measurements.<i>]` tables (below). |
-| `lorrax.method` | `dp54` | `dp54` (SciPy RK45, adaptive; takes TDGW's steps), `rk4`, `etdrk4` (Krogstad), `magnus2` (exponential midpoint) or `cfm4` (fourth-order commutator-free Magnus). |
-| `lorrax.dt` | unset | The fixed step, as, for every method but `dp54`; refused with `dp54` (`td_dt`). |
-| `lorrax.n_corr` | `2` | Corrections per step of `magnus2` (midpoint Hamiltonian) and `cfm4` (Gauss-node Hamiltonians); each costs one dΣ evaluation per node. At least 1 (`td_n_corr`). One correction after the extrapolated predictor is stable only while the step times the strength of dΣ[ρ] is small: on CrI3 2v2c COHSEX it diverges from 50 as, where two corrections are stable to 300 as. |
+| `lorrax.method` | `dp54` | `dp54` (SciPy RK45, adaptive; takes TDGW's steps), `rk4`, `etdrk4` (Krogstad), `magnus2` (exponential midpoint) or `cfm4` (fourth-order commutator-free Magnus; fourth order also with Γ and the intraband term). The Magnus schemes integrate Δρ = ρ − ρ_eq in the interaction picture of the band energies. |
+| `lorrax.dt` | unset | The fixed step, as, for every method but `dp54`; refused with `dp54` (`td_dt`). `auto` (`magnus2`, `cfm4`): the largest step the start-of-run stability check accepts, floored to 0.01 as (`magnus2`: dt_measure / n). A `magnus2` / `cfm4` step above that limit refuses (`td_magnus_stability`, naming the limit). |
+| `lorrax.n_corr` | `2` | Corrections per step of `magnus2` (midpoint Hamiltonian) and `cfm4` (Gauss-node Hamiltonians); each costs one dΣ evaluation per node. At least 1 (`td_n_corr`). The stable step is not monotone in `n_corr`: `cfm4` with the cubic predictor is stable for h·σ ≤ 0.117 / 0.730 / 1.144 with 1 / 2 / 3 corrections, σ the spectral radius of the linearized dΣ commutator map, estimated at the start of the run (`td_magnus_stability`); on CrI3 2v2c COHSEX (σ = 1.64 eV) the check allows 43 / 266 / 416 as (margin 1.1). |
+| `lorrax.predictor` | `cubic` | The dΣ predictor of `magnus2` / `cfm4` before the corrections: `cubic` (`cfm4`: through the last two steps' four Gauss-node values; `magnus2`: quadratic through three midpoints) or `linear` (`cfm4` only, through the last step's two: the same order, about twice the error, a 1.6× larger stable step, h·σ ≤ 1.203 with two corrections) (`td_predictor`). |
 | `lorrax.model` | `""` (= `none` for IP, `tdgw_kernel` for COHSEX) | The self-energy update: `none`, `tdgw_kernel` (TDGW's dense `kernel.h5`) or `isdf` (the LORRAX ISDF model of a GW restart bundle). |
 | `lorrax.kernel_file` | `""` (= `indir/kernel.h5`) | The BerkeleyGW-layout kernel for `tdgw_kernel`. |
 | `lorrax.isdf_input` | `""` | The GW deck of the restart bundle, required by `isdf` (`td_isdf_input`). |

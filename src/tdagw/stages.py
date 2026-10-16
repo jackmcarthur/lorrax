@@ -332,8 +332,9 @@ def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
         raise ValueError(
             f"GATE td_restart_carry: got: {paths[0]} without a LORRAX integrator carry "
             f"(it_next {rec['it_next']}); want: a checkpoint written by "
-            f"tdagw.tdgw_jax; fix: rerun from t0 (a TDGW checkpoint holds the state, not "
-            f"the integrator's carry, and cannot continue a run exactly)")
+            f"tdagw.tdgw_jax; why: a TDGW checkpoint holds the state, not the integrator's "
+            f"carry (dSigma history, step controller), so the run cannot continue exactly; "
+            f"fix: rerun from t0")
     want = json.loads(restart_fingerprint(deck, system, model, dt))
     got = json.loads(rec["fingerprint"])
     diff = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))

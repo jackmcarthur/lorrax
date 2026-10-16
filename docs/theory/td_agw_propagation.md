@@ -170,8 +170,8 @@ $n_b\times n_b$ `eigh` per k and two products.
 | `dp54` | Dormand–Prince 5(4), SciPy's `RK45` | 5 (error estimate 4) | 6 (FSAL) | 0 | adaptive |
 | `rk4` | classical Runge–Kutta | 4 | 4 | 0 | `lorrax.dt` |
 | `etdrk4` | Krogstad's exponential RK on the diagonal $L_{nm} = -i(E_n - E_m) - \Gamma_{nm}$ | 4 | 4 | 0 (diagonal) | `lorrax.dt` |
-| `magnus2` | exponential midpoint, self-consistent midpoint $H$ | 2 | `n_corr` | `n_corr` + 1 | `lorrax.dt` |
-| `cfm4` | commutator-free Magnus CFET4:2 at the Gauss nodes | 4 with Γ = 0 and the intraband term off, above the rounding floor; 2 otherwise | 2 `n_corr` | 4 `n_corr` + 2 | `lorrax.dt` |
+| `magnus2` | exponential midpoint on Δρ in the interaction picture; Strang-split relaxation and intraband term | 2 | `n_corr` | `n_corr` + 1 | `lorrax.dt` dividing `dt_measure`, or `auto` |
+| `cfm4` | commutator-free Magnus CFET4:2 at the Gauss nodes on Δρ in the interaction picture; relaxation and intraband term by Yoshida's triple jump | 4 | 2 `n_corr` | 4 `n_corr` + 2, three times that with Γ or the intraband term | `lorrax.dt` or `auto` |
 
 **`dp54` reproduces TDGW's run.** The tableau, the error norm (RMS over the
 logical entries, $\mathrm{atol} + \mathrm{rtol}\,\max(|y|, |y_\mathrm{new}|)$),
@@ -187,40 +187,126 @@ intraband term) explicitly; its step is limited by the coupling, not by the
 largest transition energy, and it is exact when the explicit part
 vanishes. The $\varphi$ functions use a Taylor series for $|hL| < 0.5$.
 
-**`magnus2` and `cfm4`** write the commutator part as
-$\rho \to U\rho U^\dagger$ with $U = e^{-ih\bar H}$, so the spectrum of ρ is
-conserved exactly when $\Gamma = 0$ and the intraband term is off. $H$ at a
-node needs ΔΣ of ρ at that node: a predictor extrapolates ΔΣ from earlier
-steps (quadratic through the last three midpoints for `magnus2`, cubic
-through the last two steps' four Gauss-node values for `cfm4`), and each
-correction propagates $\rho_n$ to the node(s) and re-evaluates ΔΣ there.
-Each correction gains one order of $h$, so the cubic predictor plus one
-correction gives order 4 for the commutator flow (Γ = 0, intraband term off):
-measured 4.5–5.5 with one correction and 3.95–3.99 with two on the unit test,
-4.2–4.5 and 4.0 in an independent synthetic Liouville check. Without a
-correction the history holds only predicted values and the scheme does not
-converge, so `n_corr` < 1 refuses. The extrapolation amplifies the predictor's error, so
-one correction contracts it only while $h\,\lVert\partial\Delta\Sigma/\partial\rho\rVert$
-is small: with the CrI3 COHSEX kernel (6×6 k, 2v2c) `cfm4` with one
-correction diverges from 50 as, while two corrections are stable to 300 as.
-The norm grows with the window: on the 30×30 CrI3 bundle (42v14c, N_μ 714)
-two corrections are unstable at 50 as — a mode seeded at rounding grows by
-3.6 % per step (1.1 fs⁻¹ in amplitude, non-oscillating at two steps per
-sample) and becomes visible after ~18 fs whatever the drive, and the TDA
-update diverges sooner (from 7 fs) — while 25 as is flat (carrier density
-constant to 0.1 % over 24 fs after a kick). Check a new window with a short
-kick run at the intended step before production. The default is two. The first two (`cfm4`) or three (`magnus2`) steps,
-before the history exists, take three extra corrections. Relaxation and the
-intraband term are not commutators; they enter by Strang splitting
-$R(h/2)\,M(h)\,R(h/2)$, with $R$ the exact relaxation around an RK4 step of
-the intraband flow, so with either one active the global order is 2 with an
-error constant set by the size of $[M, R]$: measured 2.00 for any Γ ≠ 0 on the
-synthetic check, and on CrI3 with the intraband term 2.0 at 5e8 V/m (1 to
-10 as) and 2.01–2.03 at 5e9 V/m (5 to 50 as). `cfm4` is therefore fourth
-order only with Γ = 0, the intraband term off (or negligible) and errors above
-the rounding floor below.
+**`magnus2` and `cfm4` integrate the deviation in the interaction picture.**
+With $x = \rho - \rho^\mathrm{eq}$, the band-energy phases are exact,
+$x_{nm} \to e^{-i(E_n - E_m)\tau}x_{nm}$, and the coupling
+$B(t) = \mathbf E(t)\cdot\mathbf r^\mathrm{inter} + \Delta\Sigma[\rho(t)]$, taken
+in that frame, acts by conjugation with $U = e^{-ih\bar B}$ (`magnus2`: $B$ at
+the midpoint; `cfm4`: two exponentials of $B$ at the Gauss nodes, CFET4:2).
+The update is written on the deviation,
 
-### Three accuracy limits {#accuracy-limits}
+$$
+x \to U x U^\dagger + [U - 1, \rho^\mathrm{eq}]\,U^\dagger, \qquad
+U - 1 = V\big(e^{-i\tau w} - 1\big)V^\dagger, \tag{4}
+$$
+
+with $V, w$ from the `eigh` of the generator, so every term has the size of
+$x$ or of $h\bar B$: rounding is relative to the response, not to the O(1)
+occupations, and the weak-field floor of conjugating the whole ρ is gone
+([accuracy limits](#accuracy-limits)). The spectrum of $\rho^\mathrm{eq} + x$
+is conserved exactly when Γ = 0 and the intraband term is off. ΔΣ is frozen
+over a step as the polynomial through its node values (linear through the two
+Gauss nodes for `cfm4`), so everything else on the step — the corrections'
+node flows, the composition below, dense output — costs exponentials, not ΔΣ
+evaluations. A predictor extrapolates the node values from earlier steps,
+rotated into the current frame (`lorrax.predictor`: `cubic`, through the last
+two steps' four Gauss-node values for `cfm4` and quadratic through the last
+three midpoints for `magnus2`; `linear`, `cfm4` only, through the last step's
+two); each correction propagates $x$ to the nodes with the frozen generator
+and re-evaluates ΔΣ there. Without a correction the history holds only
+predicted values and the scheme does not converge, so `n_corr` < 1 refuses.
+The first two (`cfm4`) or three (`magnus2`) steps, before the history
+exists, take three extra corrections. The default is two corrections.
+
+**Relaxation and the intraband term are composed.** They are not
+commutators. With either active, $S_2(\tau) = R(\tau/2)\,M(\tau)\,R(\tau/2)$
+— $M$ the Magnus flow, $R$ the exact relaxation around an RK4 step of the
+intraband flow — is the step of `magnus2` (Strang, second order in $[M, R]$),
+and `cfm4` takes Yoshida's triple jump
+$S_2(\gamma_1 h)\,S_2(\gamma_0 h)\,S_2(\gamma_1 h)$, $\gamma_1 = 1/(2 - 2^{1/3})$,
+$\gamma_0 = 1 - 2\gamma_1$ (Phys. Lett. A 150, 262 (1990)), adjacent $R$ pieces
+merged. ΔΣ stays frozen across the three sub-steps, so the composition
+triples the exponentials and leaves ΔΣ at 2 `n_corr` per step. On CrI3 (6×6 k,
+2v2c, ISDF COHSEX, intraband term on, two corrections) the relative L2 error
+of P(t) over 30 fs at 50 / 25 / 10 / 5 as (80 / 160 / 400 / 800 ΔΣ per fs), with
+the whole-ρ `cfm4` it replaces:
+
+| drive (reference) | `cfm4` | whole-ρ `cfm4`, Strang | `etdrk4` |
+|---|---|---|---|
+| 100 V/m (exact linear response) | 3.1e-5 / 1.9e-6 / 4.7e-8 / 3.0e-9: order 4.0 | 1.4e-5 / 3.4e-6 / 5.0e-6 / 6.6e-6: rounding floor | 1.0e-4 / 6.5e-6 / 1.7e-7 / — |
+| 5e8 V/m (DP54, rtol 1e-11, 1 as cap) | 3.1e-5 / 1.9e-6 / 4.7e-8 / 3.0e-9: 4.0 | 1.7e-5 / 1.3e-6 / 1.6e-7 / 4.0e-8: 2.0 | — / 6.5e-6 / 1.7e-7 / — |
+| 5e9 V/m (same) | 3.4e-5 / 2.1e-6 / 5.2e-8 / 3.3e-9: 4.0 | 3.3e-4 / 8.2e-5 / 1.3e-5 / 3.2e-6: 2.0 | — / 7.4e-6 / 1.9e-7 / — |
+| 5e8 V/m, Γ = 0.05 eV (same) | 4.6e-5 / 2.8e-6 / 7.2e-8 / 4.5e-9: 4.0 | 1.7e-4 / 2.2e-5 / 1.5e-6 / 1.9e-7: 2.9 | — / 2.6e-6 / 6.8e-8 / 4.2e-9 |
+
+The DP54 references agree with a run at a 2 as cap to 2.5e-13. At 5e8 V/m
+this window still responds linearly (the same relative errors as at
+100 V/m). With Γ ≠ 0 `cfm4`, `etdrk4` (Γ exact in its linear part) and `rk4`
+are fourth order; at equal ΔΣ cost `cfm4` and `etdrk4` then agree within 10 %,
+while without Γ `cfm4` is 3.5× more accurate.
+
+**Stability of the corrected step.** For a ΔΣ linear in the deviation, each
+eigenmode of the coupling map $\mathcal L x = -i\,(\Delta\Sigma[x] -
+\Delta\Sigma[0]) \circ (f_m - f_n)$ (eigenvalues $\pm i\omega$ for a Hermitian
+kernel, TDA or a stable full BSE) evolves alone, and a step is a linear
+recurrence on $u_n$ and the history's node values $G$: the predictor
+$G \leftarrow W G_\mathrm{hist}$, each correction $G \leftarrow z u_n \mathbf 1 + z A G$,
+$u_{n+1} = u_n + b\cdot G$, with $z = i\omega h$, $A$ and $b$ the integrals of the
+Lagrange basis on the nodes (for the Gauss pair the Gauss-collocation matrix,
+$|\mathrm{eig}\,A| = 1/(2\sqrt3)$) and $W$ the extrapolation weights
+(`solvers.time_integrators.magnus_amplification`). The step is stable while the
+recurrence's spectral radius stays at 1 for $h\sigma \le y_\mathrm{lim}$, σ the
+spectral radius of $\mathcal L$ (`magnus_stability_limit`: growth below 1e-6 per
+step on the imaginary axis):
+
+| $y_\mathrm{lim}$ | 1 correction | 2 | 3 | 4 |
+|---|---|---|---|---|
+| `cfm4`, cubic predictor | 0.117 | 0.730 | 1.144 | 0.515 |
+| `cfm4`, linear predictor | 0.625 | 1.203 | 0.231 | 0.458 |
+| `magnus2` | 0.346 | 0.126 | 0.212 | 0.819 |
+
+The limit is not monotone in `n_corr`: a truncated fixed-point iteration is an
+explicit polynomial in $z$, as RK1 and RK2 are on the imaginary axis, and the
+extrapolating predictor (its weights' magnitudes sum to 50 for the cubic)
+feeds the error into every step. Corrections iterated to convergence would
+reach the Gauss collocation's own bound, $h\sigma \le 2\sqrt3 = 3.46$, but at
+the steps of interest they converge only after 10–35 correction pairs (not
+implemented). An unstable mode grows from rounding whatever the drive and
+saturates at O(1), each step being unitary. The recurrence reproduces the
+growth per step of the real step on a two-level TDA toy to 1e-3 (stable,
+weakly and strongly unstable settings; `tests/tdagw/test_prop_stability_cpu.py`).
+
+**The check at the start of a `magnus2` / `cfm4` run** estimates σ by 20 power
+iterations of $\mathcal L^2$ on the model itself (40 ΔΣ evaluations in the
+run's layout, `tdagw.propagate.coupling_radius`) and refuses a step with
+$1.1\,h\sigma > y_\mathrm{lim}$ (`td_magnus_stability`, naming the largest stable
+step and those of the neighbouring settings); `lorrax.dt = "auto"` takes that
+step. The field is left out of σ: E·r is weak where the limit binds and is
+not extrapolated. On CrI3 2v2c (6×6 k, ISDF COHSEX) σ = 1.644 eV after 20
+iterations against 1.650 eV from the exact spectrum, so `cfm4` with the
+cubic predictor is allowed 42.6 / 265.7 / 416.4 as with 1 / 2 / 3 corrections
+(the linear predictor 227.5 / 437.9 / 84.1 as, `magnus2` 125.9 / 45.9 /
+77.2 as): one correction diverges from 50 as, and two are stable to 300 as
+(292 as without the margin), as measured. `rk4` and `etdrk4` have their own
+explicit limits ([choosing](#choosing)), which are not checked.
+
+**Fixed steps sample by dense output.** `rk4`, `etdrk4` and `cfm4` step from
+t0 by `lorrax.dt` and evaluate each sample of the `dt_measure` grid inside the
+step that covers it, so `dt` need not divide `dt_measure`: `rk4` and `etdrk4`
+by the cubic Hermite interpolant of the step's end values and slopes taken in
+the frame of the diagonal $L$ (FSAL slopes, no extra ΔΣ), `cfm4` by its own
+flow over the frozen generator to the sample time (exponentials only).
+`magnus2` freezes ΔΣ at one node, so a sample inside its step would be first
+order; it keeps samples on steps (`td_dense_output`). On CrI3 at 100 V/m
+samples between steps stay on each method's fourth-order line: `etdrk4` at
+15 as 9.1e-7 (8.5e-7 from the 10 and 25 as runs), `rk4` at 15 as 3.2e-6
+(3.2e-6), `cfm4` 1.2e-5 at 40 as (1.2e-5) and 4.7e-7 at 15 as (2.4e-7). The
+frame removes the band-energy phases before interpolating, which is exact for
+the free flow and accurate for a response near the transition frequencies; a
+component far from them (the counter-rotating part of a strong off-resonant
+drive) oscillates faster in that frame than in the lab frame, so there keep
+`dt` well below 1/(ω_drive + ΔE_max) or let it divide `dt_measure`.
+
+### Accuracy limits {#accuracy-limits}
 
 **Short pulses under `dp54`.** The controller starts with a step of
 `dt_measure` and measures its error against `atol` while ρ is still at
@@ -232,34 +318,17 @@ of P(t) against the exact linear response, while `max_step` = 2 as gives
 `control.timesteps.max_step` to about a fifth of the pulse width when the
 amplitude matters.
 
-**Rounding floor of the Magnus schemes.** `magnus2` and `cfm4` conjugate the
+**Rounding floor of the whole-ρ Magnus steps (removed).** Conjugating the
 whole ρ, whose O(1) occupations set the absolute rounding of every
-exponential (ε ≈ 1.1e-16 per entry), while the coherence a weak field induces
-is small: |ρ_cv| ≈ 1e-9 on CrI3 for a 100 as pulse at 100 V/m, ≈ 1e-6 on the
-synthetic window at 1e5 V/m. The rounding accumulates as a random walk, so
-the relative P(t) error has a floor of about (ε/|ρ_cv|)·√N_steps, ∝ 1/E₀,
-that rises as the step shrinks. On CrI3 at 100 V/m over 30 fs `cfm4` (two
-corrections) is lowest at 25 as, 3.4e-6 after 1200 steps, and rises to
-1.3e-5 at 2 as after 15000 steps (exponent 0.53 in N; the estimate gives
-2.7e-6 and 9.7e-6); the same runs at 5e8 V/m reach 1.6e-9 at 1 as. On the
-synthetic window the floor is 2.5e-8 at 5 as. RK4, ETDRK4 and DP54 add small
-increments to Δρ and reach 1e-11 on CrI3 at 100 V/m. The cure is the
-interaction picture on
-Δρ = ρ − ρ^eq: integrate diag(E^QP) as exact phases, take exponentials of the
-small coupling only, and update
-Δρ ← P (U Δρ U^† + [U − 1, ρ^eq] U^†) P^†, every term of the size of Δρ
-(not implemented).
+exponential (ε ≈ 1.1e-16 per entry), left a relative error floor of about
+(ε/|ρ_cv|)·√N_steps ∝ 1/E₀ that rose as the step shrank: on CrI3 at 100 V/m
+(|ρ_cv| ≈ 1e-9) the whole-ρ `cfm4` was lowest at 25 as, 3.4e-6, and rose to
+6.6e-6 at 5 as. Eq. (4) removes it: the same runs reach 3.0e-9 at 5 as.
 
-**Strang splitting in strong fields.** The intraband term is not a
-commutator, so `magnus2` and `cfm4` split it off (Strang), and its splitting
-error grows with the field. On CrI3 at 5e9 V/m `cfm4` (two corrections) is
-second order, 3.5e-6 / 1.4e-5 / 9.0e-5 at 5 / 10 / 25 as over 10 fs, while
-with the intraband term off it is fourth order, 8.8e-10 / 1.4e-8 / 5.7e-7, and
-beats ETDRK4 (2.3e-6 at 25 as). ETDRK4 and DP54 carry the intraband term in
-their explicit part and stay fourth/fifth order (ETDRK4 3.1e-6 at 25 as with
-it on). A fourth-order composition of the Strang step (Yoshida's triple
-jump, three Strang steps per step) or an exponential integrator for the
-intraband flow would remove the limit (not implemented).
+**Strang splitting in strong fields (removed).** The intraband term grows
+with the field, and its Strang splitting made the whole-ρ `cfm4` second order
+in strong fields (3.2e-6 at 5 as at 5e9 V/m); the triple jump restores order
+4 (3.3e-9, table above).
 
 ### Choosing a method {#choosing}
 
@@ -268,30 +337,33 @@ simulated fs; error is the relative L2 error of P(t) over 30 fs.
 
 | system | DP54 | ETDRK4 | CFM4 (2 corrections) | RK4 |
 |---|---|---|---|---|
-| CrI3, 6×6 k, 2v2c, ISDF COHSEX, 100 V/m (exact linear response as reference) | 3.5e-4 at 46 (rtol 1e-6); 3.3e-6 at 114 (rtol 1e-8) | 1.0e-4 at 80 (50 as); 6.5e-6 at 160 (25 as) | 1.4e-5 at 80 (50 as); 3.4e-6 at 160 (25 as) | 3.9e-8 at 800 (5 as) |
-| synthetic 4v4c, 6×6 k, transitions to 12 eV, dense TDA kernel | 2.9e-5 at 337 (rtol 1e-6) | 2.2e-5 at 160 (25 as) | 6.4e-6 at 161 (25 as) | 1.7e-5 at 800 (5 as) |
+| CrI3, 6×6 k, 2v2c, ISDF COHSEX, 100 V/m (exact linear response as reference) | 3.5e-4 at 46 (rtol 1e-6); 3.3e-6 at 114 (rtol 1e-8) | 1.0e-4 at 80 (50 as); 6.5e-6 at 160 (25 as); 1.7e-7 at 400 (10 as) | 3.1e-5 at 80 (50 as); 1.9e-6 at 160 (25 as); 4.7e-8 at 400 (10 as) | 3.9e-8 at 800 (5 as) |
+| synthetic 4v4c, 6×6 k, transitions to 12 eV, dense TDA kernel | 2.9e-5 at 337 (rtol 1e-6) | 2.2e-5 at 160 (25 as) | 6.4e-6 at 161 (25 as; whole-ρ `cfm4`) | 1.7e-5 at 800 (5 as) |
 
 On the CrI3 window (transitions 1.4–4 eV) DP54's steps after the pulse are
-long. It needs the fewest ΔΣ evaluations at every measured accuracy except
-near 1e-5, where CFM4 with two corrections at 50 as ties it (1.4e-5 at 80,
-between DP54's 3.3e-5 at 72 and 3.3e-6 at 114). The bright-peak positions
+long, and it needs the fewest ΔΣ evaluations at the measured accuracies;
+at a fixed step CFM4 (two corrections) is 3.5× more accurate than ETDRK4 at
+the same count, and fourth order to 3.0e-9 at 5 as. The bright-peak positions
 move by 0.035 meV at rtol 1e-6 and not at all below. The same runs on four
 GPUs through the ISDF adapter at 5e8 V/m reproduce the CPU errors to four
-digits: DP54 (rtol 1e-6) 1.92e-5 at 80.6, 0.20 s per fs; CFM4 (two
+digits: DP54 (rtol 1e-6) 1.92e-5 at 80.6, 0.20 s per fs; the whole-ρ CFM4 (two
 corrections, 50 as) 1.72e-5 at 80.4, 0.21 s per fs; ETDRK4 (25 as) 6.53e-6 at
 160, 0.31 s per fs. On the synthetic window, whose 12 eV transitions limit an
 explicit step, ETDRK4 and CFM4 need 2–4× fewer evaluations than DP54. RK4
 diverges beyond h·ΔE_max ≈ 2.8 (150 as at 12 eV); ETDRK4 and CFM4 with two
 corrections stay usable (error < 1e-2) to about 100 as on both windows;
-`magnus2` is unconditionally bounded but second order.
+`magnus2` is bounded (unitary) but second order, and its corrected step is
+checked like `cfm4`'s.
 
 **Default: `dp54`**, at `rtol` 1e-6 to 1e-7, with `max_step` near a fifth of
 the pulse width for short pulses: it takes TDGW's steps, needs no step choice
 and is as cheap as the best fixed step on narrow windows. Use `etdrk4` or
-`cfm4` (two corrections, `dt` 25–50 as) when the window spans a wide energy
-range or a fixed step that divides `dt_measure` is wanted for a long
-production drive; in strong fields with the intraband term on prefer
-`etdrk4`, which stays fourth order where `cfm4` drops to second (above). On
+`cfm4` (two corrections, `dt` 25–50 as, or `auto`) when the window spans a
+wide energy range or a fixed ΔΣ count is wanted for a long production drive;
+both are fourth order with Γ and the intraband term. `cfm4` is the more
+accurate at a given step and unitary, but checks its step against the
+coupling (above) and, with Γ or the intraband term, takes three times the
+exponentials. On
 four A100s the ISDF ΔΣ dominates the wall time (2.95 ms per call at 2v2c, 9.0
 ms at 30v × 14c on 6×6 k, against 1.05 ms for one exponential and 0.27 ms per
 sample at 30v × 14c), so the wall time follows the ΔΣ count. On synthetic 30v
@@ -315,7 +387,14 @@ device count with inert zero blocks (zero weight and operators; the error
 norm counts the logical entries only). The static operators share the k
 sharding. Each exponential is a per-device batched `eigh` inside
 `shard_map`; the only cross-k access outside ΔΣ is the $k+b$ gather of
-Eq. (3). One jitted program advances a chunk of `lorrax.chunk` samples
+Eq. (3). The `isdf` adapter moves Δρ from this k layout to the model's band
+layout, and ΔΣ back, with explicit staged all-to-alls
+(`common.staged_reshard.batch_to_face_reshard` / `face_to_batch_reshard`,
+one per mesh axis, built outside the traced step); an implicit sharding
+constraint there made XLA replicate the whole state on every call
+("Involuntary full rematerialization": an all-gather of ρ and of ΔΣ; AUDIT
+B10). The adapter now adds exactly four all-to-alls to the model's own
+collectives, with the same values. One jitted program advances a chunk of `lorrax.chunk` samples
 (default `ntcheck`) with the carry donated; the host receives each chunk's
 samples and writes them with the checkpoint.
 
@@ -329,13 +408,33 @@ measurement and `tdgw_data/checkpoint/{it_next,tchkp,lessG_knn}`, plus a
 that trial in `[system.Efunc]`). `tdgw-pp linear` reads the directory
 unchanged.
 
+**Restart.** Every checkpoint also stores the integrator's whole carry in the
+first trial's file, `tdgw_data/checkpoint/lorrax` (`leaf_<i>` datasets at
+logical k; attributes `step`, `n_leaves` and `fingerprint`, the settings the
+carry is valid for): ρ with the Magnus node history, the FSAL slope or DP54's
+controller state. `control.files.load_checkpoint_from` resumes from it into a
+new `outdir`, copies the rows before it and continues bitwise: all five methods
+reproduce the uninterrupted run's samples and final checkpoint exactly on a
+2×2 host mesh (`tests/tdagw/test_prop_restart_cpu.py`), while the carry's
+history zeroed (`cfm4`) or DP54's controller restarted from the state alone,
+as TDGW restarts, differ at 1e-12 and 6e-10 in ρ_cv. Only `outdir`,
+`load_checkpoint_from`, `lorrax.chunk` and, for fixed steps, `tf` may change
+(`td_restart_settings`); a TDGW checkpoint holds the state but no carry and
+refuses (`td_restart_carry`). TDGW and `tdgw-pp` read the checkpoint's three
+datasets and ignore the group.
+
 ## What refuses {#refusals}
 
 A deck with neither `load_header_from` nor `[lorrax] system = "bundle"`, or
-with both, or with `use_vmtxel` (`td_header_source`), restart from a checkpoint (`td_checkpoint_restart`),
-patched sampling, box geometry, `velocity_operator`, a fixed step that does
-not divide `dt_measure`, `n_corr` < 1, and a `dp54` step that falls below
-SciPy's minimum (`td_dp54_step_too_small`) refuse with a named GATE. The
+with both, or with `use_vmtxel` (`td_header_source`), patched sampling, box
+geometry, `velocity_operator`, a `magnus2` step that does not divide
+`dt_measure` (`td_dense_output`), `n_corr` < 1, a `linear` predictor outside
+`cfm4` (`td_predictor`), a `magnus2` / `cfm4` step above the stability limit
+(`td_magnus_stability`), a restart into its own `outdir`
+(`td_checkpoint_outdir`), from a checkpoint without a LORRAX carry
+(`td_restart_carry`) or under other settings (`td_restart_settings`), and a
+`dp54` step that falls below SciPy's minimum (`td_dp54_step_too_small`) refuse
+with a named GATE. The
 bundle route adds `td_bundle_input`, `td_ivbm`, `td_bundle_key` (bundle keys
 on a header deck), `td_cv_gap`, `td_velocity_hermitian`, `td_dipole_energies`,
 `td_eigenvector_kpts`, `td_degeneracy_mode` and `td_tda_model`.
