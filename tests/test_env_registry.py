@@ -568,5 +568,23 @@ def test_input_reference_check_can_fail():
     assert tool.render_default(None) == "unset"
 
 
+def test_input_reference_td_table_can_fail():
+    """The TD-aGW table (dotted TOML keys) is checked like the GW table."""
+    tool = _load_input_reference_tool()
+    page = "\n".join([
+        "## TD-aGW — the `tdgw.toml` deck",
+        "| key | default | meaning |",
+        "|---|---|---|",
+        "| `control.ivp.rtol` | `1e-5` | wrong default |",
+        "| `lorrax.gone` | `1` | no longer accepted |",
+    ])
+    new, errors = tool.sync(page, {}, {}, "", {"control.ivp.rtol": 1e-6,
+                                               "lorrax.method": "dp54"})
+    joined = "\n".join(errors)
+    assert "| `control.ivp.rtol` | `1e-6` |" in new, new
+    assert "`lorrax.gone` is documented" in joined, joined
+    assert "`lorrax.method` (td deck) has no row" in joined, joined
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

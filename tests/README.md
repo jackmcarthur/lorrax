@@ -28,6 +28,17 @@ A new test needs no bootstrap import of its own.
   rank one share shape (CPU, three simulated ranks).
 - `test_stream_passes_cpu.py`: the scanned row-pass loop on a host mesh
   under x64 (CPU): two windows add the bytes of one.
+- `tdagw/test_prop_*.py`: the TD-aGW propagator (CPU). `integrators`: the
+  stepper of `solvers.time_integrators` against SciPy (DP54 takes SciPy RK45's
+  steps; measured orders; Magnus unitarity; Strang order), each with a red
+  twin. `tdgw_parity`: on a frozen TDGW 0.3.0 fixture (`fixtures/syn2v2c`,
+  built by `fixtures/make_tdgw_fixture.py`) the driver's stages on a 2x2 host
+  mesh take TDGW's steps and reproduce every measurement to 1e-12; red twins
+  drop the intraband term and flip the kernel sign; four devices equal one.
+  `deck`: every parser refusal names its gate. `isdf_adapter`: the ISDF
+  adapter's dSigma equals 1/2 K (rho - rho_eq) for a synthetic TDMODEL model
+  with a permuted k order and padded k; red twins drop the Ry -> Ha halving
+  and pass rho for Delta rho.
 - `test_sigma_kconv_scratch.py`: mode 7's split-arm scratch follows the
   handler's rule and is priced in the Σ pass and the τ window checks (CPU).
 - `test_qe_reported_inputs.py`: the V_NL spin-orbit mode is QE's
@@ -59,6 +70,18 @@ A new test needs no bootstrap import of its own.
   two call sites compiles once, partner directions keep one carrier, face
   rounds share one width. The audit-row tests are strict xfails until their
   fix lands.
+- `test_bse_kgrid_dipoles_cpu.py`: the `bse_k_grid` dipoles on a toy
+  tight-binding slab (CPU, 2x2 host mesh): on-grid identities, off-grid
+  dipoles against exact ones in the densified states' gauge, a planted coarse
+  gauge invisible and a velocity-only gauge seen, DFT denominators under a
+  scissor, and the window-dipole refusals.
+- `test_bse_helicity_cpu.py`: per-state in-plane helicity on a C3-symmetric
+  toy (s, p_x, p_y with an orbital Zeeman term; CPU, 2x2 host mesh): the Γ
+  transitions into p± take the field-defined σ± labels that ⟨L_z⟩ certifies;
+  the swapped and the conjugated conventions fail that check; a global phase,
+  a band gauge and the zone size leave the per-cell table unchanged; the
+  native and `bse_k_grid` routes give one table; `bse_jax` reads
+  `--helicity-table` on the Lanczos route.
 - `test_w_pad_nyquist_cpu.py`: the W densifier's R zero-pad (CPU): an even
   coarse axis splits its Nyquist coefficient, so coarse tiles stay exact and
   every fine tile is Hermitian; the single-sided red twin is not.

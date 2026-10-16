@@ -17,7 +17,7 @@ bands, [exciton bands](../how-to/htransform-and-exciton-bands.md#7-exciton-bands
 | `isdf_tensors_<N_mu>.h5`, in the run directory or its `tmp/` | `gw.gw_jax` with `write_restart_tensors = true` (the default) | parent ψ faces at the centroids, `enk_full` (Ry), `V_qmunu`, `W0_qmunu` and its `W0_ready` flag, the head vector `G0_mu_nu`, `vhead`/`whead`; on a static-Dyson W0, the dressed long-range channels `W0_lr` |
 | `WFN.h5` and the centroid table named in the deck | QE → pw2bgw; `centroid.kmeans_cli` | authentication of the bundle, and the static-screening rebuild |
 | `eqp1.dat` (`--eqp`, optional) | `gw.gw_jax` | diagonal QP energies on the wedge, unfolded through the symmetry service |
-| `dipole.h5` (`--dipole`) | `psp.get_dipole_mtxels` | velocity matrix elements and `band_energies` for absorption and per-state dipoles |
+| `dipole.h5` (`--dipole`) | `psp.get_dipole_mtxels` | velocity matrix elements and `band_energies` for absorption and per-state dipoles; under `bse_k_grid`, the deck (coarse) WFN's file, which the densifier carries to the fine grid |
 | `dipole_qsgw.h5` (`--dipole`) | a QSGW run with a velocity head ([QSGW dipoles](../self_consistency.md#qsgw-dipoles)) | the same layout: $U^\dagger v\,U$ with the head's velocity $v$ (`qsgw_head.qp_velocity`) and `band_energies` = $E_{QP}$; stamped `basis = qp` and, when the run writes `WFN_qp.h5`, bound to that WFN's fingerprint. It pairs only with a restart built from `WFN_qp.h5` |
 
 Exactly one `isdf_tensors_*.h5` may sit in the run directory and its `tmp/`
@@ -140,7 +140,8 @@ unless `head_minibz_average = true`: then it is rebuilt through
 `bse.vq_interp` with the fine grid's mini-BZ head
 ([LT head](../theory/lt-exchange-head.md)), and the W head's Γ-cell reference
 uses the analytic sphere. Without `bse_k_grid` the optical BSE does not read
-`head_minibz_average`.
+`head_minibz_average`. With `--dipole`, the velocity goes through the same
+htransform as ψ ([dipoles](#dipoles-and-absorption)).
 
 ## The matvec
 
@@ -208,6 +209,41 @@ dipole file's own `band_energies`: DFT energies for `dipole.h5`, $E_{QP}$ for
 `dipole_qsgw.h5`. `--eqp` changes the transition energies of the Hamiltonian,
 not the dipoles.
 
+A `bse_k_grid` bundle carries its own dipoles (`bse_densify.densified_dipoles`)
+and never slices a file (`absorption_common.window_dipoles` is the one source
+of both). The deck WFN's velocity, unfolded in the loader's gauge, which is
+the Galerkin fit's, enters the htransform's basis and is Fourier-interpolated
+as $f(H)$ is (`bandstructure.orbital.interpolate_band_operator`), then
+contracted with the same fine eigenvectors $U_q$ that build the densified ψ:
+
+$$v_B(k) = C_k^{T}\, v(k)\, C_k^{*},\qquad
+V_R = \frac{1}{N_k}\sum_k e^{2\pi i k\cdot R}\, v_B(k),\qquad
+v(q) = U_q^\dagger\, \mathrm{Herm}\Big[\sum_R e^{-2\pi i q\cdot R} V_R\Big]\, U_q .$$
+
+The energies are the velocity's own. Each fine state's energy is the
+Rayleigh quotient of the file's $f(H)$, Newton-inverted, so under `--eqp` the
+QP states keep DFT denominators ($r$ is scissor-invariant):
+
+$$E_n(q) = f^{-1}\big(U_{qn}^\dagger\,[f(H)]_{\rm file}(q)\, U_{qn}\big),\qquad
+d^\alpha_{cvq} = \frac{v^\alpha_{cv}(q)}{E_c(q) - E_v(q)} .$$
+
+Dipoles and ψ share $U_q$, so no map between two sets of states, and no
+gauge fit, exists, and no fine NSCF is needed. A fine WFN's own `dipole.h5`
+is in that loader's gauge, which differs from the densified ψ by the random
+per-(k, band) phases of an independent diagonalization; it refuses
+(`GATE velocity_wfn_fingerprint`). At every fine q that is a coarse k the
+fine window states span the coarse states at the window's positions in
+the fH's own energy order (QP under `--eqp`, which can move a band across
+a window edge: MoS₂ 9×9 at Γ), and the interpolated operators reproduce
+the coarse ones in them (`GATE densified_dipole_on_grid`); the
+log also gives each velocity image's outer-shell locality beside $f(H)$'s,
+the signature of a velocity in another gauge. Their accuracy is the
+densified ψ's: the guard bands and rank that converge ψ converge the dipoles.
+On MoS₂ 9×9→12×12 (DFT fH) the window dipoles match the fine NSCF's own
+`dipole.h5` to 6e-6 at shared k and to 0.8 % rms off them (Frobenius norm
+per k, 2 % max), and the ε₂ of the SR/LR densified BSE is 2.0 % rms of
+the direct 12×12 peak.
+
 `absorption_haydock` always uses the TDA BSE kernel, D + V − W, and needs at
 least two devices. It seeds one Lanczos recursion per polarization; the three
 seeds are one trial block of the stack matvec. It does not reorthogonalize and
@@ -225,6 +261,26 @@ dipole.h5` contracts each written eigenvector with the dipole
 eigenvector tile) and stores $\langle 0|\hat r_\alpha|S\rangle$ as
 `exciton_data/dipoles`, shape (1, N, 3, 2), in bohr. Flag rules:
 [drivers](../drivers.md#bse-bsebse_jax).
+
+In-plane helicity: `--helicity-table` adds each written state's circular
+strengths to `bse.out` (`absorption_common.inplane_helicity`, the one place
+the convention lives). σ+ is the field $E(t) = E_0(\cos\omega t, \sin\omega t,
+0) = \mathrm{Re}[E_0\varepsilon_+ e^{-i\omega t}]$ with
+$\varepsilon_\pm = (\hat x \pm i\hat y)/\sqrt2$: it rotates x → y,
+counter-clockwise seen from +z. Absorption into $|S\rangle$ goes as
+$|\langle S|\varepsilon\cdot\hat r|0\rangle|^2 = |\varepsilon\cdot D^*|^2$ with
+$D = \langle 0|\hat r|S\rangle$, so
+
+$$I_\pm = \frac{|D_x \mp i D_y|^2}{2N_k},\qquad \eta = \frac{I_+ - I_-}{I_+ + I_-},$$
+
+per unit cell in bohr² (an exciton normalized over $N_k$ points has
+$|D|^2 \propto N_k$). The stored dipoles are $D$ times the global $-i$ of the
+velocity form ($d = \langle c|\hat v|v\rangle/\Delta E = i\langle c|\hat r|v\rangle$)
+on the native and the `bse_k_grid` routes alike, which no modulus sees; the
+conjugated spelling $\langle S|\hat r|0\rangle$ would swap $I_+$ and $I_-$. On a
+C3-symmetric toy the transitions into $p_\pm = (p_x \pm i p_y)/\sqrt2$ come out
+pure σ± ($\langle L_z\rangle = \pm1$), and the two routes agree to 1e-14 at
+shared k (`tests/test_bse_helicity_cpu.py`).
 
 ## Outputs
 
@@ -271,6 +327,12 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE bse_static_w_provenance` | the same | the bundle has no WFN/centroid receipt |
 | `GATE bse_static_w_head_vector` | `bse_loading.load_bse_data_from_restart_sharded` | a rebuild on a bundle without `G0_mu_nu` |
 | `GATE dipole_basis` | `file_io.dipole.require_dipole_basis` | a dipole whose `basis` stamp (`dft` or `qp`; an unstamped file reads `dft`) differs from the basis of the WFN's ψ, e.g. `dipole_qsgw.h5` with a DFT WFN |
+| `GATE dipole_k_grid` | `file_io.dipole.require_dipole_k_grid` | a dipole whose k list is not the bundle's (another grid's file) |
+| `GATE velocity_wfn_fingerprint` | `file_io.dipole.velocity_stamp` | under `bse_k_grid`, a `--dipole` that is not the deck WFN's, e.g. the fine grid's own `dipole.h5`; read before the htransform fit |
+| `GATE densified_dipoles` | `absorption_common.window_dipoles` | a `bse_k_grid` bundle whose dipoles were not built from `--dipole` (loaded without `velocity_file`) |
+| `GATE densified_velocity_bands` | `bse_densify.densified_dipoles` | a velocity file with fewer bands than the htransform window |
+| `GATE densified_dipole_gap` | the same | a non-positive $E_c - E_v$ in the velocity's own energies |
+| `GATE densified_dipole_on_grid` | the same | the on-grid identities fail: a fine q list, band window or contraction that is not the htransform's |
 | `BseWindowOutsideZetaTrainingError` | `bse_window.assert_bse_window_in_zeta_training` | a window band outside the ζ fit legs |
 | band-window degeneracy | `common.band_degeneracy.resolve_band_window` | a window edge inside a multiplet under `--band-degeneracy strict` |
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |

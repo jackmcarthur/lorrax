@@ -8,8 +8,9 @@ default column come from the parsers.  From the repo root::
     python3 tools/gen_input_reference.py --check  # exit 1 if the page differs
 
 The rewrite sets the head of every default cell from ``gw_config._DEFAULTS``
-(the ``[downfold]`` table from ``downfold_config.DOWNFOLD_DEFAULTS``) and
-keeps the hand-written note after it.  Both modes refuse, writing nothing,
+(the ``[downfold]`` table from ``downfold_config.DOWNFOLD_DEFAULTS``, the
+TD-aGW ``tdgw.toml`` table from ``tdagw.td_config.TD_DEFAULTS``, whose keys
+are dotted TOML paths) and keeps the hand-written note after it.  Both modes refuse, writing nothing,
 when a key has no row, when a key has two rows, or when a row names a key
 the parser no longer accepts; a row whose default cell is ``retired`` is
 allowed only if ``gw_config.py`` still refuses that key by name.
@@ -34,8 +35,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 CONFIG = REPO / "src" / "gw" / "gw_config.py"
 DOWNFOLD = REPO / "src" / "gw" / "downfold_config.py"
+TD = REPO / "src" / "tdagw" / "td_config.py"
 OUT = REPO / "docs" / "input_reference.md"
 DOWNFOLD_HEADING = "## Downfold"
+TD_HEADING = "## TD-aGW"
 
 
 def _module_consts(path):
@@ -113,26 +116,30 @@ _CELL_SPLIT = re.compile(r"(?<!\\)\|")
 _HEAD = re.compile(r"^(.*?)((?:\s+\(|\s+—).*)?$")
 
 
-def sync(text, gw_defaults, downfold_defaults, config_source):
+def sync(text, gw_defaults, downfold_defaults, config_source, td_defaults=None):
     """Return (page with generated default heads, list of refusals)."""
     errors = []
-    seen = {"gw": {}, "downfold": {}}
+    td_defaults = {} if td_defaults is None else td_defaults
+    tables = {"gw": gw_defaults, "downfold": downfold_defaults, "td": td_defaults}
+    seen = {name: {} for name in tables}
     default_col = None
     out = []
     table = "gw"
     for lineno, line in enumerate(text.split("\n"), 1):
         if line.startswith(DOWNFOLD_HEADING):
             table = "downfold"
+        elif line.startswith(TD_HEADING):
+            table = "td"
         cells = _CELL_SPLIT.split(line)
         if len(cells) > 2 and cells[1].strip() == "key":
             heads = [c.strip() for c in cells]
             default_col = heads.index("default") if "default" in heads else None
-        m = re.match(r"^\| `([A-Za-z0-9_]+)` \|", line)
+        m = re.match(r"^\| `([A-Za-z0-9_.]+)` \|", line)
         if not m or default_col is None:
             out.append(line)
             continue
         key = m.group(1)
-        defaults = gw_defaults if table == "gw" else downfold_defaults
+        defaults = tables[table]
         if key in seen[table]:
             errors.append(f"line {lineno}: `{key}` has a second row "
                           f"(first at line {seen[table][key]})")
@@ -150,7 +157,7 @@ def sync(text, gw_defaults, downfold_defaults, config_source):
         note = _HEAD.match(cell).group(2) or ""
         cells[default_col] = f" {render_default(defaults[key])}{note} "
         out.append("|".join(cells))
-    for table, defaults in (("gw", gw_defaults), ("downfold", downfold_defaults)):
+    for table, defaults in tables.items():
         for key in defaults:
             if key not in seen[table]:
                 errors.append(f"`{key}` ({table} deck) has no row; add one by "
@@ -163,7 +170,7 @@ def problems():
     text = OUT.read_text()
     new, errors = sync(text, harvest_defaults(CONFIG, "_DEFAULTS"),
                        harvest_defaults(DOWNFOLD, "DOWNFOLD_DEFAULTS"),
-                       CONFIG.read_text())
+                       CONFIG.read_text(), harvest_defaults(TD, "TD_DEFAULTS"))
     if not errors and new != text:
         diff = difflib.unified_diff(text.split("\n"), new.split("\n"),
                                     "committed", "generated", lineterm="", n=0)

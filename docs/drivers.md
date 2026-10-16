@@ -15,13 +15,15 @@ LORRAX has six core drivers in seven modules: GW preprocessing is two modules
 
 [`gw.downfold_cli`](#downfold-gwdownfold_cli) sits beside the chain: it
 compresses a finished GW restart for the two BSE drivers.
+[`tdagw.tdgw_jax`](#td-agw-tdagwtdgw_jax) also sits beside it: it propagates
+real-time TD-aGW on the header of a TDGW run.
 [`tdagw.kernel_export` and `tdagw.tdgw_bridge`](#tdgw-kernel-and-bridge-tdagwkernel_export-tdagwtdgw_bridge)
 sit beside it too: they hand the BSE interaction to TDGW's real-time propagation.
 
 Every driver brings up the runtime with one module-top call,
 `runtime.initialize_communicator_stack` (mesh, communicators, startup report).
-`gw_jax`, `kin_ion_io`, `kmeans_cli` and `downfold_cli` answer `--help` and bad
-arguments before that call (`runtime.cli_seam`). Launch geometry is owned by
+`gw_jax`, `kin_ion_io`, `kmeans_cli`, `downfold_cli` and `tdgw_jax` answer `--help`
+and bad arguments before that call (`runtime.cli_seam`). Launch geometry is owned by
 the machine pages ([Perlmutter](environment/machines/perlmutter.md),
 [Frontera](environment/machines/frontera.md)); every deck key is in the
 [input reference](input_reference.md). The tables below list only the keys
@@ -277,7 +279,8 @@ Lanczos-only.
 | `--solver` | `lanczos` | *Lanczos*. `lanczos` (spectrum shape), `davidson` (per-state convergence, `--davidson-*`), `trlan` (thick restart, bounded memory, `--trlan-*`) |
 | `--block-size` / `--max-lanczos-iter` / `--n-reorth` | 1 / auto / −1 | *Lanczos*. Block width / total Krylov dimension / reorthogonalization window (−1 = full, needed for degenerate spinor spectra) |
 | `--n-eig` / `--write-eigs [N]` | 5 / off | *Lanczos*. Eigenpairs; write `eigenvectors.h5` |
-| `--dipole FILE` | none | *Lanczos*, with `--write-eigs` and `--tda`: store each written state's dipole $\langle 0\lvert\hat r\rvert S\rangle$ from `FILE` (a `dipole.h5`) in `eigenvectors.h5` |
+| `--dipole FILE` | none | *Lanczos*, with `--write-eigs` and `--tda`: store each written state's dipole $\langle 0\lvert\hat r\rvert S\rangle$ from `FILE` (a `dipole.h5`) in `eigenvectors.h5`. Under `bse_k_grid`, `FILE` is the deck (coarse) WFN's, carried through the densifying htransform ([dipoles](architecture/bse.md#dipoles-and-absorption)); `absorption_haydock --dipole` reads it the same way |
+| `--helicity-table` | off | *Lanczos*, with `--dipole`: add each written state's in-plane circular strengths to `bse.out`, $I_\pm = \lvert D_x \mp i D_y\rvert^2/(2N_k)$ in bohr² per unit cell for $D = \langle 0\lvert\hat r\rvert S\rangle$, and $\eta = (I_+ - I_-)/(I_+ + I_-)$. σ+ is the field $E_0(\cos\omega t, \sin\omega t, 0)$: x → y, counter-clockwise seen from +z ([helicity](architecture/bse.md#dipoles-and-absorption)) |
 | `--eqp FILE` | none | *Lanczos*. Diagonal QP energies from the wedge `eqp1.dat`, unfolded through the symmetry service; the restart must be proved to come from the same unrotated WFN |
 | `bse_k_grid` (deck) | `""` | fine grid "NX NY NZ", each axis at least the coarse extent |
 | `head_minibz_average` (deck) | false | read only under `bse_k_grid`: rebuilds the q = 0 exchange tile with the fine grid's mini-BZ head and takes the W head's Γ-cell reference from the analytic sphere ([LT head](theory/lt-exchange-head.md)); must match the GW run |
@@ -299,6 +302,31 @@ Invoke: `python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-ei
 [Band interpolation and exciton bands](how-to/htransform-and-exciton-bands.md#7-exciton-bands)
 owns the method, the exchange routes (`--vq-mode`) and their certification,
 the flags, the output format and the refusals.
+
+## td-agw — `tdagw.tdgw_jax`
+
+Propagates the real-time TD-aGW equation of motion of TDGW (Xiaoxun Gong's
+code) for one or several drives: $\dot\rho = -i[H(t), \rho] - i\mathbf
+E\cdot[\mathbf r^\mathrm{intra}, \rho] - \Gamma\circ(\rho - \rho^\mathrm{eq})$
+with $H = \mathrm{diag}(E^\mathrm{QP}) + \mathbf E\cdot\mathbf r +
+\Delta\Sigma[\rho]$, in TDGW's units and conventions. It reads a TDGW deck,
+takes energies, k grid and dipoles from the header of a TDGW run, and writes
+`tdgw.h5` + `tdgw.toml` that `tdgw-pp` reads unchanged. The equation, the
+integrators, the layout and the output are on
+[TD-aGW propagation](theory/td_agw_propagation.md).
+
+Invoke: `python -u -m tdagw.tdgw_jax -i tdgw.toml`. The only flag is
+`-i/--input`; everything else is a deck key
+([input reference](input_reference.md#td-agw)). The mesh is the run's
+startup mesh; the k axis is sharded over every device.
+
+| deck key | default | what it changes |
+|---|---|---|
+| `control.files.load_header_from` | required | the TDGW run whose header (band window, k grid, energies, dipole) is propagated |
+| `lorrax.method` | `dp54` | `dp54` takes TDGW's RK45 steps (the parity mode); `etdrk4`, `cfm4`, `magnus2`, `rk4` take a fixed `lorrax.dt` |
+| `lorrax.model` | by `calc_type` | ΔΣ[ρ]: `none`, TDGW's `kernel.h5` (`tdgw_kernel`) or the ISDF model of a GW restart bundle (`isdf`, with `lorrax.isdf_input`) |
+| `lorrax.trials` | one drive | several `{E_x, E_y, E_z}` drives propagated together; one `trial-<i>/` output each |
+| `lorrax.intraband` | `true` | the intraband commutator $\mathbf E\cdot[\mathbf r^\mathrm{intra}, \rho]$ |
 
 ## TDGW kernel and bridge — `tdagw.kernel_export`, `tdagw.tdgw_bridge`
 

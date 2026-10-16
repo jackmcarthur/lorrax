@@ -122,6 +122,8 @@ def load_bse_data_from_restart_sharded(
     htransform_rank_record_fn=None,
     htransform_quality_record_fn=None,
     eqp_file: Optional[str] = None,
+    velocity_file: Optional[str] = None,
+    velocity_full_window: bool = False,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
 
@@ -138,6 +140,15 @@ def load_bse_data_from_restart_sharded(
     the fine ε are quasiparticle; ``data["densified"]`` tells the caller
     whether it still owes the coarse QP re-slice
     (``bse_window.apply_eqp_and_reslice_bands``).
+
+    ``velocity_file`` (``--dipole``) is read only on the densified path: the
+    coarse WFN's ``dipole.h5``, carried through the same htransform as ψ, and
+    ``data["dipoles"]`` holds the window dipoles in the fine ψ gauge
+    (``bse_densify.densified_dipoles``).  Off it, the driver slices the file
+    itself (``absorption_common.window_dipoles``).  ``velocity_full_window``
+    also keeps the velocity over every window pair and its own band
+    energies (``data["dipoles"]["v_window"]``, ``["e_dft_window"]``), which
+    the TD-aGW system builder (``tdagw.td_system``) needs; off by default.
 
     ``inject_head=False`` returns the head-LESS V_q0 / W_q bodies exactly as
     stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
@@ -331,7 +342,10 @@ def load_bse_data_from_restart_sharded(
             htransform_a_band=htransform_a_band,
             htransform_rank_record_fn=htransform_rank_record_fn,
             htransform_quality_record_fn=htransform_quality_record_fn,
-            eqp_file=None if eqp_file is None else os.path.abspath(eqp_file))
+            eqp_file=None if eqp_file is None else os.path.abspath(eqp_file),
+            velocity_file=(None if velocity_file is None
+                           else os.path.abspath(velocity_file)),
+            velocity_full_window=bool(velocity_full_window))
     # A densified bundle's ε already carry ``eqp_file``; the drivers re-slice
     # the coarse restart's QP energies only when this is False.
     data["densified"] = bool(densify_pending)
