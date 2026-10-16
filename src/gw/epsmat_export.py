@@ -29,7 +29,7 @@ from jax import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 __all__ = [
-    "match_q_umklapp", "zeta_slots", "q0_head", "coulomb_whitener",
+    "match_q_umklapp", "zeta_slots", "coulomb_whitener",
     "whitened_correlation", "epsinv_block", "project_block", "coulomb_gram",
     "run_epsmat_export", "run_epsmat_projection",
 ]
@@ -95,18 +95,6 @@ def zeta_slots(sphere_miller, ngk, miller, *, fill):
     pos = np.clip(np.searchsorted(ks[order], km), 0, ks.size - 1)
     found = ks[order][pos] == km
     return np.where(found, order[pos], int(fill)).astype(np.int32)
-
-
-def q0_head(S_cart, q0_cart, v_q0_ry):
-    """ε⁻¹_00(q0) = 1 / (1 − v(q0) q0ᵀ S q0), the direct (no-local-field) head.
-
-    ``S_cart`` (3, 3) is the Cartesian q² coefficient of χ₀₀ in
-    1/(Ry bohr²) (docs/theory/s-tensor-convention.md), ``q0_cart`` (3,) in
-    1/bohr, ``v_q0_ry`` the truncated Coulomb at q0 over Ω, in Ry.
-    """
-    q = np.asarray(q0_cart, dtype=np.float64)
-    qsq = complex(np.einsum("i,ij,j->", q, np.asarray(S_cart, dtype=np.complex128), q))
-    return 1.0 / (1.0 - float(v_q0_ry) * qsq)
 
 
 # ---------------------------------------------------------------------------
@@ -663,7 +651,13 @@ def plan_export(cfg, src, *, print_fn=print):
 
 
 def _q0_head_value(cfg, src, q0):
-    """ε⁻¹_00(q0) from the bundle's long-wavelength model (or 1 when asked)."""
+    """ε⁻¹_00(q0) = W_h(q0) / v(q0), the direct head of the bundle's S tensor (E8).
+
+    ``W_h = v / (1 − v q0ᵀSq0)`` is the owner's pointwise head
+    (``gw.head_densify``: slab or bulk), with ``v`` the truncated
+    8π/|q0|² in Ry bohr³ — no 1/Ω: ``q0ᵀSq0`` is χ₀₀ per volume
+    (``docs/theory/s-tensor-convention.md``).  ``q0`` crystal, ``(3,)``.
+    """
     if cfg.q0_head == "unscreened":
         return 1.0 + 0.0j
     if src.head["S_cart"] is None:
@@ -671,9 +665,19 @@ def _q0_head_value(cfg, src, q0):
                 "the Cartesian q² tensor of the producer's head",
                 "the q → 0 head of ε⁻¹ is the long-wavelength model",
                 "rerun GW with head_correction on, or set q0_head = unscreened")
-    q0c = np.asarray(q0, dtype=np.float64) @ src.geometry.bvec
-    v0 = float(bare_v_bgw_units(src, q0, np.zeros((1, 3), int))[0]) / src.geometry.cell_volume
-    return q0_head(src.head["S_cart"], q0c, v0)
+    from .head_densify import head_scalar_pointwise, slab_head_scalar_pointwise
+    q0c = (np.asarray(q0, dtype=np.float64) @ src.geometry.bvec)[None, :]
+    sys_dim = int(src.config.sys_dim)
+    if sys_dim == 2:
+        w_h = slab_head_scalar_pointwise(src.geometry, q0c, src.head["S_cart"])[0]
+    elif sys_dim == 3:
+        w_h = head_scalar_pointwise(q0c, src.head["S_cart"])[0]
+    else:
+        _refuse("epsmat_q0_head_source", f"sys_dim {sys_dim}", "2 (slab) or 3 (bulk)",
+                "the pointwise head exists for the slab and bulk kernels",
+                "set q0_head = unscreened")
+    v_h = float(bare_v_bgw_units(src, q0, np.zeros((1, 3), int))[0])
+    return complex(float(w_h) / v_h)
 
 
 def run_epsmat_export(cfg, mesh, *, print_fn=print):

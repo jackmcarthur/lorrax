@@ -169,8 +169,11 @@ $$
 \tag{E8}
 $$
 
-  with $v(q_0)$ the truncated Coulomb at $q_0$ over Ω, in Ry. BerkeleyGW's
-  head includes local fields; the bundle's `head_correction` says which head
+  with $v(q_0)$ the truncated $8\pi/|q_0|^2$ in Ry bohr³, without 1/Ω: the
+  owner's pointwise head (`gw.head_densify`) divided by the bare $v(q_0)$.
+  Dividing v by Ω weakens the head by Ω; on CrI3 6×6 that gives
+  $1-\varepsilon^{-1}_{00}=2.6\times10^{-6}$ against BerkeleyGW's
+  $1.6\times10^{-2}$. BerkeleyGW's head includes local fields; the bundle's `head_correction` says which head
   LORRAX had (`no_local_fields` on CrI3 6×6). Sigma rebuilds its q → 0 head
   from this $\varepsilon^{-1}_{00}(q_0)$, so (E8) is what reaches Σ.
   `q0_head = unscreened` writes 1.

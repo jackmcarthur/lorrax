@@ -211,12 +211,30 @@ def test_q0_block_head_wings_and_body():
 
 
 def test_q0_head_is_the_direct_s_tensor_model():
-    from gw.epsmat_export import q0_head
+    """ε⁻¹_00(q0) = 1 / (1 − v q0ᵀSq0) with v the truncated 8π/|q0|² in Ry bohr³.
+
+    Pinned to the owner's convention (``gw.head_densify``) through the
+    production path ``_q0_head_value``.  Red twin: v/Ω (Ry), the convention
+    the first CrI3 export used, gives a head weaker by Ω — 0.9999974 against
+    BerkeleyGW's 0.98423 on the 6x6 slab.
+    """
+    from types import SimpleNamespace
+    from vcoul import CoulombGeometry
+    from gw import epsmat_export as ee
     S = -np.diag([0.4, 0.4, 0.02]).astype(complex)
-    q0 = np.array([0.001, 0.0, 0.0]) @ BVEC
-    v0 = float(v_slab(np.array([0.001, 0, 0]), np.zeros((1, 3)))[0])
-    h = q0_head(S, q0, v0)
-    assert abs(h - 1 / (1 + v0 * 0.4 * np.dot(q0, q0))) < 1e-14 and 0 < h.real < 1
+    q0 = np.array([0.001, 0.0, 0.0])
+    src = SimpleNamespace(
+        geometry=CoulombGeometry(bvec=BVEC, cell_volume=OMEGA), head={"S_cart": S}, kgrid=(6, 6, 1),
+        config=SimpleNamespace(sys_dim=2, head=SimpleNamespace(bare_coulomb_cutoff=None,
+                                                               mc_average_vcoul_body=False)))
+    h = ee._q0_head_value(SimpleNamespace(q0_head="s_tensor"), src, q0)
+    qc = q0 @ BVEC
+    v_bgw = float(v_slab(q0, np.zeros((1, 3)))[0]) * OMEGA      # Ry bohr³
+    want = 1 / (1 + v_bgw * 0.4 * np.dot(qc, qc))
+    assert abs(h - want) < 1e-12 and 0 < h.real < 1
+    per_omega = 1 / (1 + v_bgw / OMEGA * 0.4 * np.dot(qc, qc))
+    assert abs(per_omega - h) > 100 * abs(1 - h) * 1e-3 and abs(1 - per_omega) < abs(1 - h) / 100
+    assert ee._q0_head_value(SimpleNamespace(q0_head="unscreened"), src, q0) == 1
 
 
 def test_file_layout_reads_back_as_epsinv(tmp_path):
