@@ -219,3 +219,32 @@ def test_plan_key_has_one_plan(tmp_path):
         DownfoldConfig.from_input_file(deck("local"), **QUIET)
     with pytest.raises(ValueError, match=r"GATE downfold_plan: got: plan = 'gspmd'"):
         DownfoldConfig.from_input_file(deck("gspmd"), **QUIET)
+
+
+def test_wedge_round_trip_streams_on_the_device(mesh, monkeypatch):
+    """The child-wedge gate's residual, q-streamed on the device, is 0 on an exact unfold."""
+    from types import SimpleNamespace
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import unfold_isdf_operator
+    from gw.downfold_run import _unfold_roundtrip_rel
+    rng = np.random.default_rng(6)
+    mu = 8
+    perm = np.stack([np.arange(mu), np.roll(np.arange(mu), 2)]).astype(np.int32)
+    L = np.zeros((2, mu, 3))
+    tables = SimpleNamespace(irr_idx_q=np.array([0, 0, 1, 1]), sym_idx_q=np.array([0, 1, 0, 1]),
+                             q_irr_frac=np.array([[0., 0., 0.], [0.5, 0., 0.]]), n_sym_spatial=2)
+    a = rng.normal(size=(2, mu, mu)) + 1j * rng.normal(size=(2, mu, mu))
+    wedge = jax.device_put(a + a.conj().transpose(0, 2, 1), NamedSharding(mesh, P(None, "x", "y")))
+    full = unfold_isdf_operator(
+        wedge, irr_idx=jnp.asarray(tables.irr_idx_q), sym_idx=jnp.asarray(tables.sym_idx_q),
+        sym_perm=jnp.asarray(perm), L_table=jnp.asarray(L),
+        q_irr_frac=jnp.asarray(tables.q_irr_frac), mesh_xy=mesh, n_sym_spatial=2)
+    slots = np.array([0, 2])                       # the full-zone index of each wedge q
+    monkeypatch.setattr("runtime.tiles.TILE_BYTES", 1)          # one q per tile
+    assert _unfold_roundtrip_rel(full, tables, perm, L, slots, mesh, mu) <= 1e-15
+    # RED TWIN: a full-zone q that is not the unfold of its wedge q is caught.
+    bad = np.asarray(full).copy()
+    bad[3] *= 1.0 + 1e-6
+    bad = jax.device_put(bad, NamedSharding(mesh, P(None, "x", "y")))
+    assert _unfold_roundtrip_rel(bad, tables, perm, L, slots, mesh, mu) > 1e-7
