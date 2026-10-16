@@ -356,7 +356,7 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE bse_static_w_head_vector` | `bse_loading.load_bse_data_from_restart_sharded` | a rebuild on a bundle without `G0_mu_nu` |
 | `GATE dipole_basis` | `file_io.dipole.require_dipole_basis` | a dipole whose `basis` stamp (`dft` or `qp`; an unstamped file reads `dft`) differs from the basis of the WFN's ψ, e.g. `dipole_qsgw.h5` with a DFT WFN |
 | `GATE dipole_k_grid` | `file_io.dipole.require_dipole_k_grid` | a dipole whose k list is not the bundle's (another grid's file) |
-| `GATE velocity_wfn_fingerprint` | `file_io.dipole.velocity_stamp` | under `bse_k_grid`, a `--dipole` that is not the deck WFN's, e.g. the fine grid's own `dipole.h5`; read before the htransform fit |
+| `GATE velocity_wfn_fingerprint` | `file_io.dipole.require_dipole_wfn_fingerprint` (from `velocity_stamp` and `absorption_common.window_dipoles`) | a `--dipole` that is not the deck WFN's: under `bse_k_grid` e.g. the fine grid's own `dipole.h5` (read before the htransform fit); on an undensified run another WFN's file with the same k list, or a file with no `prov_wfn_sha256` |
 | `GATE densified_dipoles` | `absorption_common.window_dipoles` | a `bse_k_grid` bundle whose dipoles were not built from `--dipole` (loaded without `velocity_file`) |
 | `GATE densified_velocity_bands` | `bse_densify.densified_dipoles` | a velocity file with fewer bands than the htransform window |
 | `GATE densified_position_gap` | `bse_densify.densified_dipoles` | `--eqp` fine states whose DFT eigenbasis puts a conduction row at or below a valence row |

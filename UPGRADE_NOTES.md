@@ -5,6 +5,15 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-16 — undensified BSE: the `--dipole` file must be stamped for the deck WFN
+
+`absorption_common.window_dipoles` now checks the file's `prov_wfn_sha256`
+against the deck WFN's fingerprint on undensified runs too (AUDIT B12), with
+the gate the `bse_k_grid` path already had (`GATE velocity_wfn_fingerprint`):
+another WFN's `dipole.h5` on the same k list (another NSCF, cutoff or
+structure) used to pass the nk check silently. A file with no stamp refuses;
+regenerate it with `python -m psp.get_dipole_mtxels -i <deck>`.
+
 ## 2026-10-16 — `bse_k_grid` + `--eqp`: the dipoles are the exact position of the fine QP states
 
 **Changes numbers.** With `--eqp` the densified fine states diagonalize the
