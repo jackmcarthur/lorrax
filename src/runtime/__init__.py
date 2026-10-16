@@ -2252,6 +2252,12 @@ def initialize_communicator_stack(*, platform: str = "gpu",
         import jax as _jax_vk
         _proc = int(_jax_vk.process_index())
         arm_runtime_kernel_stores(proc_idx=_proc, say=_print_rank0)
+        # The last LORRAX environment writes (OPENBLAS_NUM_THREADS when unset) happen here, and
+        # then the environment freezes, before the first native helper thread starts: a later
+        # setenv races native getenv (GATE env-frozen, runtime.env_guard; the rc 139 SIGSEGV).
+        default_blas_threads()
+        from .env_guard import freeze_process_environment
+        freeze_process_environment("runtime.initialize_communicator_stack step 7b")
         start_blas_host_warmup(proc_idx=_proc, say=_print_rank0)
     except Exception as exc:                                  # noqa: BLE001
         _print_rank0(f"  [runtime] vendor first-use policy not applied "
@@ -2573,6 +2579,8 @@ def default_blas_threads() -> str | None:
     it, and the handlers have their own caps (LORRAX_MKLBLAS_THREADS,
     LORRAX_SCALAPACK_MKL_THREADS).
     """
+    if _BLAS_AUTO:
+        return _BLAS_AUTO[0]
     if os.environ.get("OPENBLAS_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS"):
         return None
     cores = _physical_cores_in_affinity()
@@ -2599,7 +2607,13 @@ def default_blas_threads() -> str | None:
             break
     except Exception:                                         # noqa: BLE001
         pass
-    return f"{cores} (auto: physical cores of the affinity mask; {applied})"
+    _BLAS_AUTO.append(f"{cores} (auto: physical cores of the affinity mask; {applied})")
+    return _BLAS_AUTO[0]
+
+
+#: :func:`default_blas_threads`' description, kept from its one effective call: step 7b runs it
+#: before the environment freezes (runtime.env_guard), and step 8's startup facts report it.
+_BLAS_AUTO: list = []
 
 
 def _thread_env() -> dict:

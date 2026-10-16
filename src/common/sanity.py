@@ -66,6 +66,7 @@ disabled) so callers can chain or ignore the result freely.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import Any, Callable
 
@@ -118,7 +119,27 @@ class NonFiniteResultError(SanityError):
 _ALLOW_NONFINITE_ENV = "LORRAX_ALLOW_NONFINITE_RESULT"
 
 
+#: In-process level overrides (innermost last): :func:`forced_level`.  A stage that must run
+#: strict whatever the operator chose says so here, never through ``os.environ`` (a mid-run
+#: environment write races native threads' ``getenv``: ``runtime.env_guard``, GATE env-frozen).
+_FORCED: list = []
+
+
+@contextlib.contextmanager
+def forced_level(level: str):
+    """Run the block at sanity ``level`` (``'strict'``, ``'warn'`` or ``'off'``), then restore."""
+    if level not in ("strict", "warn", "off"):
+        raise ValueError(f"sanity level {level!r}: want 'strict', 'warn' or 'off'")
+    _FORCED.append(level)
+    try:
+        yield
+    finally:
+        _FORCED.pop()
+
+
 def _level() -> str:
+    if _FORCED:
+        return _FORCED[-1]
     raw = os.environ.get("LORRAX_SANITY")
     if raw is None:
         return "warn"

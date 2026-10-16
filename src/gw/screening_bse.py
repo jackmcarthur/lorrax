@@ -477,8 +477,9 @@ def _gate_w_or_refuse(W, req, *, stage, sym, print_fn=print, kgrid=None,
     (``w_bse`` or ``w_rpa_resolvent``) is either the ladder kernel's input or
     the operator Sigma will consume, so a failed invariant would bless
     known-bad physics with rc=0.  Pin strict only for this stage, regardless
-    of the process-wide ``LORRAX_SANITY`` default, and restore the
-    operator's setting before returning or refusing.
+    of the process-wide ``LORRAX_SANITY`` default (in-process,
+    :func:`common.sanity.forced_level`: no environment write, GATE env-frozen),
+    and restore the operator's setting before returning or refusing.
 
     ``include_w`` defaults ``True`` so every EXISTING direct caller (this
     module's own production call sites did not thread it before this axis
@@ -489,12 +490,18 @@ def _gate_w_or_refuse(W, req, *, stage, sym, print_fn=print, kgrid=None,
 
     diagram_name = _resolvent_diagram_name(include_w)
     rule_id = f"{diagram_name}_w_stage_invariants"
-    previous = os.environ.get("LORRAX_SANITY")
-    os.environ["LORRAX_SANITY"] = "strict"
+    with sanity.forced_level("strict"):
+        _gate_w_strict(W, req, stage, rule_id, diagram_name, print_fn=print_fn, kgrid=kgrid,
+                       mesh_xy=mesh_xy, trs_allowed=bool(sym.trs_allowed))
+
+
+def _gate_w_strict(W, req, stage, rule_id, diagram_name, *, print_fn, kgrid, mesh_xy, trs_allowed):
+    """:func:`_gate_w` under :func:`common.sanity.forced_level` ``'strict'``, its refusal by rule id."""
+    from common import sanity
     try:
         _gate_w(
             W, req, print_fn=print_fn, kgrid=kgrid, mesh_xy=mesh_xy,
-            trs_allowed=bool(sym.trs_allowed))
+            trs_allowed=trs_allowed)
     except sanity.SanityError as exc:
         raise ValueError(
             f"GATE {rule_id}: screening_diagrams = {diagram_name} "
@@ -512,11 +519,6 @@ def _gate_w_or_refuse(W, req, *, stage, sym, print_fn=print, kgrid=None,
             f"plausible rc=0 quasiparticle output\n"
             f"  doc:  docs/input_reference.md '## Screening', "
             f"screening_diagrams; docs/dev/QUALITY_PATTERNS.md #7.") from exc
-    finally:
-        if previous is None:
-            os.environ.pop("LORRAX_SANITY", None)
-        else:
-            os.environ["LORRAX_SANITY"] = previous
 
 def prepare_ladder_restart(
     wfns, V_q, *, quad, e_ref, sym, centroid_indices, config, meta, mesh_xy,
