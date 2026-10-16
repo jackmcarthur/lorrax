@@ -32,7 +32,6 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int,
     cut's per-q figures, which the caller hands to :func:`report` on the host
     after the program; see the module docstring.  ``where`` names the
     caller's matrix in every notice."""
-    from isdf.core import _certify_the_cut, _close_the_cut
     # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
     # n_μ over-completes the pair-density rank (κ~1e13); plain
     # Cholesky then amplifies ULP/mesh/nband roundoff into O(1) V_q
@@ -40,6 +39,21 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int,
     # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
     # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
     lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
+    return factor_from_eigh(lam, V, rcond=rcond, rank_log=rank_log, where=where)
+
+
+def factor_from_eigh(lam, V, *, rcond: float, rank_log: bool,
+                     where: str = "zeta rank_truncate"):
+    """The cut of :func:`factor` on eigenpairs already solved: ``(B, figures)``.
+
+    ``lam`` ``(nq, n)`` ascending and ``V`` ``(nq, n, n)`` (eigenvectors as
+    columns), e.g. from ``distrib_la``'s face eigensolve, where ``V`` sits at
+    ``P(None,'x','y')``: ``B = V·diag(λ^(−1/2))`` over the kept modes is a
+    column scaling, so ``B`` keeps ``V``'s layout and no rank holds an
+    ``n × n`` whole.  Exact-zero eigenvalues (zero pad rows) fall below any
+    cut.
+    """
+    from isdf.core import _certify_the_cut, _close_the_cut
     lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
     keep = lam > (rcond * lam_max)       # near-null cut
     # …and the near-null cut is not allowed to stop mid-multiplet.  THIS

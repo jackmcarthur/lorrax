@@ -5,16 +5,16 @@ Pair densities and χ are EXPANDED in ζ, V and W are PROJECTED on it
 
     ε⁻¹_q(G,G') − δ = v_q(G) [Z χ Zᴴ](G,G'),   χ = V⁺ (W − V) V⁺        (E4)
 
-evaluated as ``diag(v) Y K Yᴴ`` with ``B Bᴴ = V⁺`` (``isdf.cplus.factor``),
-``Y = Z B`` and the whitened correlation ``K = Bᴴ (W − V) B`` (−1 ≼ K ≼ 0 at
-ω = 0).  The reverse is ``W = V + Z_εᴴ [(ε⁻¹ − 1) diag(v)] Z_ε`` on the file's
-own G list.  One q at a time: ζ̃_q arrives μ-sharded, is gathered onto the
-BerkeleyGW G list and moved G-sharded by one all-to-all; each device builds
-its ``P('x','y')`` tile of the ``(G, G')`` block from the x- and y-row blocks
-of Y (one all-gather over ``y`` and one transpose-partner permute).  V, W, B
-and K are ``N_μ²`` and REPLICATED on every device, the charge-ζ factor's
-plan (``isdf.cplus``): 16 N_μ² B each (15 MB at N_μ = 978).  The block is
-the only ``N_G²`` object and never exists outside its tiles.
+with ``V⁺ = B Bᴴ`` from the face eigensolve of V (``distrib_la``) and the cut
+of ``isdf.cplus.factor_from_eigh``, ``K = Bᴴ (W − V) B`` (−1 ≼ K ≼ 0 at
+ω = 0) and ``χ = B K Bᴴ``.  The reverse is ``W = V + Z_εᴴ [(ε⁻¹ − 1) diag(v)]
+Z_ε`` on the file's own G list.  One q at a time, and every matrix on a
+``P(None,'x','y')`` face: ζ̃_q arrives μ-sharded and becomes the ``(μ, G)``
+face by one all-to-all over ``y``; V, W, B, K and χ are ``(μ, μ)`` faces;
+the ``(G, G')`` block is a face, written tile by tile.  Products are
+``distrib_la.panel_matmul`` (2-D SUMMA, live panels ≤ ``PANEL_BYTES`` per
+rank), so per rank the μ-space state is ``16 μ_pad²/P`` B per matrix and the
+block ``16 n²/P`` B; only vectors and scalars are replicated.
 """
 from __future__ import annotations
 
@@ -98,253 +98,249 @@ def zeta_slots(sphere_miller, ngk, miller, *, fill):
 
 
 # ---------------------------------------------------------------------------
-# μ-space algebra (replicated N_μ²)
+# μ-space algebra on P(None,'x','y') faces (distrib_la)
 # ---------------------------------------------------------------------------
+# Every N_μ²- and N_G²-class object below is a face: rank (x, y) holds the
+# (x, y) tile and nothing else.  Products are distrib_la.panel_matmul (a 2-D
+# SUMMA whose live panels are bounded by PANEL_BYTES), the eigensolve is the
+# service's face plan, and masks and scalings are elementwise programs on
+# the face.  Only vectors (eigenvalues, v, the block diagonal) and scalars
+# are replicated.
 
-def coulomb_whitener(V_log, *, rcond):
-    """``(B, figures)`` with ``B Bᴴ = V⁺`` on the retained Coulomb span.
+#: Bytes per rank the two live operand panels of one product may hold.
+PANEL_BYTES = 64 << 20
 
-    ``V_log`` ``(n, n)`` is the logical, Hermitian-PSD V_q (Ry).  The cut keeps
-    ``λ > rcond λ_max`` closed over degenerate multiplets and certified by
-    ``isdf.cplus.factor``; dropped modes are zero columns of B, so shapes do
-    not depend on the rank.  Columns of ``U = diag(v)^{1/2} Z B`` are
-    orthonormal in G space.
-    """
-    from isdf import cplus
-    B, figures = cplus.factor(V_log[None], rcond=float(rcond), rank_log=True,
-                              n_log=int(V_log.shape[-1]), where="epsmat V+")
-    return B[0], figures
-
-
-def whitened_correlation(Wc_log, B):
-    """K = Bᴴ (W − V) B, Hermitian part: the symmetrized response ``v^{1/2} χ v^{1/2}``
-    in the orthonormal basis of the Coulomb span (−1 ≼ K ≼ 0 at ω = 0, W 9)."""
-    K = jnp.conj(B).T @ Wc_log @ B
-    return 0.5 * (K + jnp.conj(K).T)
-
-
-# ---------------------------------------------------------------------------
-# Sharded per-q programs (built once per static signature)
-# ---------------------------------------------------------------------------
 
 def _square_side(mesh):
     px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
     if px != py:
         _refuse("epsmat_square_mesh", f"mesh {px}x{py}", "a square mesh",
-                "the column block of a P('x','y') tile is the transpose partner's row block",
+                "the face products are a SUMMA on a p x p grid",
                 "run on 1, 4, 9, 16, ... devices")
     return px
-
-
-def _transpose_perm(p):
-    """ppermute pairs over the flattened (x, y) axis: device (y, x) -> (x, y)."""
-    return [(y * p + x, x * p + y) for x in range(p) for y in range(p)]
-
-
-def _row_blocks(rows, p):
-    """``(rows of the x block, rows of the y block)`` of a row-chunked matrix.
-
-    Inside ``shard_map``: chunk ``c = x p + y`` holds rows ``[c n/P, (c+1) n/P)``,
-    so the all-gather over ``y`` is the x row block, and the y row block is
-    the x row block of the transpose partner.
-    """
-    rx = jax.lax.all_gather(rows, "y", axis=0, tiled=True)
-    ry = rx if p == 1 else jax.lax.ppermute(rx, _XY, _transpose_perm(p))
-    return rx, ry
-
-
-def _to_g_rows(zt_local):
-    """μ-sharded ``(μ/P, n)`` -> G-row chunk ``(n/P, μ)`` by one all-to-all."""
-    zc = jax.lax.all_to_all(zt_local, _XY, 1, 0, tiled=True)
-    return zc.T
-
-
-def _tile_indices(n_tile):
-    a = jax.lax.axis_index("x") * n_tile + jnp.arange(n_tile)
-    b = jax.lax.axis_index("y") * n_tile + jnp.arange(n_tile)
-    return a, b
-
-
-@functools.lru_cache(maxsize=None)
-def _epsinv_program(mesh, n_pad, mu_pad, ng_disk, is_q0):
-    """jit: (ζ̃ (1, μ, ngkmax) μ-sharded, slots, B, K, v, n_valid, head) ->
-    (block (n, n, 2) at P('x','y',None), diagonal (n,) replicated).
-
-    The diagonal leaves REPLICATED (one all-gather of n numbers) because the
-    driver fetches it to the host: a ``P(('x','y'))`` array spans devices of
-    other processes and cannot be fetched on any one of them."""
-    p = _square_side(mesh)
-    n_tile = n_pad // p
-    zsh = NamedSharding(mesh, P(None, _XY, None))
-    rep = NamedSharding(mesh, P())
-
-    def tile(zt, B, K, v_x, v_y, v_c, n_valid, head):
-        y = _to_g_rows(zt) @ B                               # (n/P, μ) Y = Z B
-        yx, yy = _row_blocks(y, p)
-        # T[a, b] = ε⁻¹(G_b, G_a) − δ = v_b (Y K Yᴴ)[b, a]   (BGW block orientation)
-        t = (jnp.conj(yx) @ K.T) @ yy.T * v_y[None, :]
-        a, b = _tile_indices(n_tile)
-        eye = (a[:, None] == b[None, :]) & (a[:, None] < n_valid)
-        t = t + eye.astype(t.dtype)
-        d = 1.0 + v_c * jnp.sum((y @ K) * jnp.conj(y), axis=1)
-        if is_q0:
-            # q -> 0: wings zero, head from the long-wavelength model.
-            wing = (a[:, None] == 0) | (b[None, :] == 0)
-            t = jnp.where(wing, 0.0, t)
-            t = jnp.where((a[:, None] == 0) & (b[None, :] == 0), head, t)
-            c0 = (jax.lax.axis_index("x") * p + jax.lax.axis_index("y")) == 0
-            d = d.at[0].set(jnp.where(c0, head, d[0]))
-        return jnp.stack([t.real, t.imag], axis=-1), d
-
-    smap = shard_map(
-        tile, mesh=mesh,
-        in_specs=(P(_XY, None), P(), P(), P("x"), P("y"), P(_XY), P(), P()),
-        out_specs=(P("x", "y", None), P(_XY)), check_vma=False)
-
-    def run(zeta, slots, B, K, v, n_valid, head):
-        z = jnp.pad(zeta[0], ((0, 0), (0, 1)))               # slot ng_disk reads zero
-        z = jnp.take(z, slots, axis=1)                        # (μ, n) μ-sharded, local
-        return smap(z, B, K, v, v, v, n_valid, head)
-
-    return jax.jit(run, in_shardings=(zsh, rep, rep, rep, rep, rep, rep),
-                   out_shardings=(NamedSharding(mesh, P("x", "y", None)), rep))
-
-
-@functools.lru_cache(maxsize=None)
-def _projection_program(mesh, n_pad, mu_pad, ng_disk, drop_head):
-    """jit: (block (1,1,1,n,n,2) BGW orientation, ζ̃, slots, v, n_valid) ->
-    W_c = Z_εᴴ [(ε⁻¹ − 1) diag(v)] Z_ε, (μ, μ) replicated."""
-    p = _square_side(mesh)
-    n_tile = n_pad // p
-    zsh = NamedSharding(mesh, P(None, _XY, None))
-    bsh = NamedSharding(mesh, P(None, None, None, "x", "y", None))
-    rep = NamedSharding(mesh, P())
-
-    def tile(blk, zt, v_x, n_valid):
-        z = _to_g_rows(zt)                                    # (n/P, μ)
-        zx, zy = _row_blocks(z, p)
-        a, b = _tile_indices(n_tile)
-        live = (a[:, None] < n_valid) & (b[None, :] < n_valid)
-        t = jnp.where(live, blk[..., 0] + 1j * blk[..., 1], 0.0)
-        t = t - (a[:, None] == b[None, :]).astype(t.dtype) * live
-        if drop_head:
-            t = jnp.where((a[:, None] == 0) | (b[None, :] == 0), 0.0, t)
-        # Σ_ab conj(Z[G_b, μ]) T[a, b] v_a Z[G_a, ν]
-        part = jnp.conj(zy).T @ t.T @ (v_x[:, None] * zx)
-        return jax.lax.psum(part, _XY)
-
-    smap = shard_map(tile, mesh=mesh,
-                     in_specs=(P("x", "y", None), P(_XY, None), P("x"), P()),
-                     out_specs=P(), check_vma=False)
-
-    def run(block, zeta, slots, v, n_valid):
-        z = jnp.pad(zeta[0], ((0, 0), (0, 1)))
-        z = jnp.take(z, slots, axis=1)
-        return smap(block[0, 0, 0], z, v, n_valid)
-
-    return jax.jit(run, in_shardings=(bsh, zsh, rep, rep, rep), out_shardings=rep)
-
-
-@functools.lru_cache(maxsize=None)
-def _gram_program(mesh, n_pad, mu_pad, ng_disk):
-    """jit: (ζ̃ (1, μ, ngkmax) μ-sharded, slots (n,), v (n,)) ->
-    ``Z_sᴴ diag(v) Z_s`` on the gathered G list, (μ, μ) replicated."""
-    zsh = NamedSharding(mesh, P(None, _XY, None))
-    rep = NamedSharding(mesh, P())
-
-    def tile(zt, v_c):
-        z = _to_g_rows(zt)
-        return jax.lax.psum((jnp.conj(z) * v_c[:, None]).T @ z, _XY)
-
-    smap = shard_map(tile, mesh=mesh, in_specs=(P(_XY, None), P(_XY)),
-                     out_specs=P(), check_vma=False)
-
-    def run(zeta, slots, v):
-        z = jnp.pad(zeta[0], ((0, 0), (0, 1)))
-        return smap(jnp.take(z, slots, axis=1), v)
-
-    return jax.jit(run, in_shardings=(zsh, rep, rep), out_shardings=rep)
 
 
 def _pad_to(n, m):
     return -(-int(n) // int(m)) * int(m)
 
 
-def epsinv_block(zeta_q, slots, B, K, v_eps, *, mesh, n_valid, q0_head_value=None):
-    """ε⁻¹_q(G,G') on one BerkeleyGW G list, in the file's block orientation.
+def _face(mesh):
+    return NamedSharding(mesh, P(None, "x", "y"))
+
+
+def eigh_plan(mesh, n):
+    """The face eigensolver of one ``(n, n)`` Hermitian matrix at ``P('x','y')``.
+
+    ``distributed`` (cuSOLVERMp on CUDA, ScaLAPACK on CPU) whenever each
+    device has its own process; with one process every device's data is in
+    that process already, and the native solve costs the same memory.
+    distrib_la's ``auto`` resolves eigh to native everywhere, which would
+    solve a gathered matrix on every rank.  Eigenvalues come back ascending
+    and replicated, eigenvectors as columns on the input's face.
+    """
+    import distrib_la as dla
+    backend = "distributed" if jax.process_count() > 1 else "native"
+    return dla.plan("eigh", mesh, backend=backend, n=int(n))
+
+
+def _pm(a, b, mesh, transa="N", transb="N"):
+    """``op(a) @ op(b)`` for ``(1, ·, ·)`` faces (distrib_la.panel_matmul)."""
+    import distrib_la as dla
+    return dla.panel_matmul(a, b, mesh=mesh, panel_bytes=PANEL_BYTES,
+                            transa=transa, transb=transb)
+
+
+@functools.lru_cache(maxsize=None)
+def _zeta_face_program(mesh, n_pad, mu_pad, ng_disk):
+    """jit: ζ̃ ``(1, μ, ngkmax)`` μ-sharded + slots ``(n,)`` -> ``Z_f (1, μ, n)`` face.
+
+    ``Z_f[μ, G] = ζ̃_μ(G)`` on the requested G list (slot ``ngkmax`` reads
+    zero).  One all-to-all over ``y``: rank (x, y) sends its μ/P rows' column
+    block y' to (x, y') and receives the μ/p rows of its x block.
+    """
+    def tile(zt, slots):
+        z = jnp.pad(zt, ((0, 0), (0, 0), (0, 1)))
+        z = jnp.take(z, slots, axis=2)                       # (1, μ/P, n)
+        return jax.lax.all_to_all(z, "y", 2, 1, tiled=True)  # (1, μ/p, n/p)
+
+    smap = shard_map(tile, mesh=mesh, in_specs=(P(None, _XY, None), P()),
+                     out_specs=P(None, "x", "y"), check_vma=False)
+    return jax.jit(smap, in_shardings=(NamedSharding(mesh, P(None, _XY, None)),
+                                       NamedSharding(mesh, P())),
+                   out_shardings=_face(mesh))
+
+
+def zeta_face(zeta_q, slots, *, mesh, n_pad):
+    """``Z_f (1, μ_pad, n_pad)`` at ``P(None,'x','y')``: ζ̃ on the G list ``slots``.
+
+    ``zeta_q`` ``(1, μ_pad, ngkmax)`` μ-sharded (``ZetaLoader.read_zeta_G_slab``);
+    ``slots`` ``(n,)`` the stored-sphere slot of each G (``ngkmax`` outside it);
+    columns past ``n`` are zero.
+    """
+    p = _square_side(mesh)
+    mu_pad, ngk = int(zeta_q.shape[1]), int(zeta_q.shape[2])
+    if n_pad % p:
+        _refuse("epsmat_block_extent", f"G extent {n_pad}", f"a multiple of {p}",
+                "the G axis is a face axis", "pad the G list to the mesh")
+    sl = np.full(int(n_pad), ngk, dtype=np.int32)
+    sl[: len(slots)] = np.asarray(slots, dtype=np.int32)
+    return _zeta_face_program(mesh, int(n_pad), mu_pad, ngk)(zeta_q, jnp.asarray(sl))
+
+
+@functools.lru_cache(maxsize=None)
+def _scale_columns(mesh):
+    """jit: face ``(1, m, n)`` times replicated ``(n,)``, conjugated or not."""
+    rep = NamedSharding(mesh, P())
+    return (jax.jit(lambda a, v: a * v[None, None, :], in_shardings=(_face(mesh), rep),
+                    out_shardings=_face(mesh)),
+            jax.jit(lambda a, v: jnp.conj(a) * v[None, None, :], in_shardings=(_face(mesh), rep),
+                    out_shardings=_face(mesh)))
+
+
+def coulomb_gram(Zf, v, *, mesh):
+    """``V_s = Zᴴ diag(v) Z`` (Ry), ``(1, μ_pad, μ_pad)`` face, from ``Z_f`` and v ``(n_pad,)``.
+
+    With every stored-sphere slot this is the bundle's own V_q (the
+    normalization gate); on the eps G list it is ``V_ε``.
+    """
+    _, conj_scale = _scale_columns(mesh)
+    return _pm(conj_scale(Zf, jnp.asarray(v, jnp.float64)), Zf, mesh, transb="T")
+
+
+def hermitian(a):
+    """``(a + aᴴ)/2`` on ``a``'s face (distrib_la.hermitian_part)."""
+    import distrib_la as dla
+    return dla.hermitian_part(a)
+
+
+def coulomb_whitener(V_face, *, rcond, plan):
+    """``(B, figures)`` with ``B Bᴴ = V⁺`` on the retained Coulomb span, B on V's face.
+
+    ``V_face`` ``(1, μ_pad, μ_pad)`` Hermitian-PSD V_q (Ry; zero pad rows,
+    which the eigensolve returns as exact zeros below the cut).  The cut keeps
+    ``λ > rcond λ_max``, closed over degenerate multiplets and certified
+    (``isdf.cplus.factor_from_eigh``); dropped modes are zero columns, so
+    shapes do not depend on the rank.
+    """
+    from isdf import cplus
+    lam, U = plan(hermitian(V_face)[0])
+    U = jax.device_put(U, NamedSharding(V_face.sharding.mesh, P("x", "y")))
+    B, figures = cplus.factor_from_eigh(lam[None], U[None], rcond=float(rcond),
+                                        rank_log=True, where="epsmat V+")
+    return jax.device_put(B, V_face.sharding), figures
+
+
+def whitened_correlation(Wc_face, B, *, mesh):
+    """K = Bᴴ (W − V) B, Hermitian part, on the face: the symmetrized
+    response ``v^{1/2} χ v^{1/2}`` in the Coulomb span (−1 ≼ K ≼ 0 at ω = 0)."""
+    return hermitian(_pm(B, _pm(hermitian(Wc_face), B, mesh), mesh, transa="C"))
+
+
+def response(B, K, *, mesh):
+    """``χ^μ = B K Bᴴ`` (= V⁺(W − V)V⁺ on the retained span), on the face."""
+    return _pm(_pm(B, K, mesh), B, mesh, transb="C")
+
+
+@functools.lru_cache(maxsize=None)
+def _block_finish(mesh, n_pad, is_q0):
+    """jit: ``T1 = conj(Z_f)ᵀ χᵀ Z_f`` face -> the file block and its diagonal.
+
+    ``T[a, b] = ε⁻¹(G_b, G_a) = δ_ab + v_b T1[a, b]`` (BerkeleyGW orientation);
+    rows and columns past ``n_valid`` are zero.  At q → 0 the wings are zero
+    and the head is the long-wavelength model.  Returns the
+    ``(1, 1, 1, n, n, 2)`` (Re, Im) block at ``P(None,None,None,'x','y',None)``
+    and the diagonal ``(n,)`` replicated (every process reads it).
+    """
+    rep = NamedSharding(mesh, P())
+    bsh = NamedSharding(mesh, P(None, None, None, "x", "y", None))
+
+    def run(t1, v, n_valid, head):
+        a = jnp.arange(n_pad)[:, None]
+        b = jnp.arange(n_pad)[None, :]
+        t = t1[0] * v[None, :] + ((a == b) & (a < n_valid)).astype(t1.dtype)
+        if is_q0:
+            t = jnp.where((a == 0) | (b == 0), 0.0, t)
+            t = jnp.where((a == 0) & (b == 0), head, t)
+        blk = jnp.stack([t.real, t.imag], axis=-1)[None, None, None]
+        return blk, jnp.diagonal(t)
+
+    return jax.jit(run, in_shardings=(_face(mesh), rep, rep, rep), out_shardings=(bsh, rep))
+
+
+def epsinv_block(Zf, chi, v_eps, *, mesh, n_valid, q0_head_value=None):
+    """ε⁻¹_q(G,G') on one BerkeleyGW G list, in the file's block orientation (E6).
 
     Parameters
     ----------
-    zeta_q : (1, μ_pad, ngkmax) complex128, ``P(None, ('x','y'), None)``
-        ζ̃ on the stored per-q sphere (``ZetaLoader.read_zeta_G_slab``).
-    slots : (n,) int
-        ζ-sphere slot of each eps-ordered G (``ngkmax`` = outside the sphere).
-    B, K : (μ_pad, μ_pad) complex128, replicated
-        Whitener and whitened correlation (:func:`coulomb_whitener`).
-    v_eps : (n,) float
-        LORRAX v(q+G)/Ω in Ry at the eps G list (the V_q values).
-    n_valid : int
-        nmtx; rows/columns past it are zero (mesh pad).
-    q0_head_value : complex | None
-        For the q → 0 file: the head ε⁻¹_00(q0); wings are written zero.
+    Zf : (1, μ_pad, n_pad) complex128 face — ζ̃ on the eps G list (:func:`zeta_face`).
+    chi : (1, μ_pad, μ_pad) complex128 face — :func:`response`.
+    v_eps : (n,) float — LORRAX v(q+G)/Ω in Ry at the eps G list.
+    n_valid : int — nmtx; rows and columns past it are zero (mesh pad).
+    q0_head_value : complex | None — at q → 0 the head ε⁻¹_00(q0); wings zero.
 
     Returns
     -------
-    block : (n_pad, n_pad, 2) float64 at ``P('x','y',None)``, ``[a, b]`` =
-        (Re, Im) ε⁻¹(G_b, G_a); diagonal : (n_pad,) complex, replicated (the
-        host reads it on every process).
+    block : (1, 1, 1, n_pad, n_pad, 2) float64 at ``P(None,None,None,'x','y',None)``,
+        ``[a, b]`` = (Re, Im) ε⁻¹(G_b, G_a); diagonal : (n_pad,) complex, replicated.
     """
-    p = _square_side(mesh)
-    mu_pad, ngk = int(zeta_q.shape[1]), int(zeta_q.shape[2])
-    n_pad = _pad_to(max(int(n_valid), 1), p * p)
-    sl = np.full(n_pad, ngk, dtype=np.int32)
-    sl[: len(slots)] = np.asarray(slots, dtype=np.int32)
+    n_pad = int(Zf.shape[2])
     vv = np.zeros(n_pad, dtype=np.float64)
     vv[: len(v_eps)] = np.asarray(v_eps, dtype=np.float64)
-    prog = _epsinv_program(mesh, n_pad, mu_pad, ngk, q0_head_value is not None)
+    t1 = _pm(jnp.conj(Zf), _pm(chi, Zf, mesh, transa="T"), mesh, transa="T")
     head = 1.0 + 0.0j if q0_head_value is None else complex(q0_head_value)
-    return prog(zeta_q, jnp.asarray(sl), B, K, jnp.asarray(vv),
-                jnp.int32(n_valid), jnp.complex128(head))
+    return _block_finish(mesh, n_pad, q0_head_value is not None)(
+        t1, jnp.asarray(vv), jnp.int32(n_valid), jnp.complex128(head))
 
 
-def project_block(block, zeta_q, slots, v_eps, *, mesh, n_valid, drop_head):
-    """W_c(q) = Z_εᴴ [(ε⁻¹ − 1) diag(v)] Z_ε from one block in file orientation.
+@functools.lru_cache(maxsize=None)
+def _block_minus_one(mesh, n_pad, drop_head):
+    """jit: file block ``(1,1,1,n,n,2)`` -> ``T − 1`` face ``(1, n, n)``, masked.
 
-    ``block`` ``(1, 1, 1, n_pad, n_pad, 2)`` at
-    ``P(None, None, None, 'x', 'y', None)``; ``drop_head`` removes the G = 0
-    row and column (the q → 0 head and wings, which LORRAX carries outside
-    the body).  Returns ``(μ_pad, μ_pad)`` complex128, replicated, Ry.
+    Rows/columns past ``n_valid`` are zero; ``drop_head`` also zeroes the
+    G = 0 row and column (the q → 0 head and wings LORRAX carries outside
+    the body)."""
+    rep = NamedSharding(mesh, P())
+    bsh = NamedSharding(mesh, P(None, None, None, "x", "y", None))
+
+    def run(blk, n_valid):
+        a = jnp.arange(n_pad)[:, None]
+        b = jnp.arange(n_pad)[None, :]
+        live = (a < n_valid) & (b < n_valid)
+        t = jnp.where(live, blk[0, 0, 0, ..., 0] + 1j * blk[0, 0, 0, ..., 1], 0.0)
+        t = t - ((a == b) & live).astype(t.dtype)
+        if drop_head:
+            t = jnp.where((a == 0) | (b == 0), 0.0, t)
+        return t[None]
+
+    return jax.jit(run, in_shardings=(bsh, rep), out_shardings=_face(mesh))
+
+
+def project_block(block, Zf, v_eps, *, mesh, n_valid, drop_head):
+    """W_c(q) = Z_εᴴ [(ε⁻¹ − 1) diag(v)] Z_ε (E7) from one block in file orientation.
+
+    ``block`` ``(1, 1, 1, n_pad, n_pad, 2)`` at ``P(None,None,None,'x','y',None)``,
+    ``Zf`` the ζ̃ face on the same G list.  Returns ``(1, μ_pad, μ_pad)``
+    complex128 on the face, Ry.  With ``T − 1 = (ε⁻¹ − 1)ᵀ``:
+    ``W_c = conj(Z_f) [(Z_f diag v)(T − 1)]ᵀ``.
     """
     p = _square_side(mesh)
-    mu_pad, ngk = int(zeta_q.shape[1]), int(zeta_q.shape[2])
     n_pad = int(block.shape[3])
-    if n_pad % (p * p):
-        _refuse("epsmat_block_extent", f"block extent {n_pad}",
-                f"a multiple of {p * p}", "the G axis is chunked over every device",
+    if n_pad % p or n_pad != int(Zf.shape[2]):
+        _refuse("epsmat_block_extent", f"block extent {n_pad}, ζ̃ face {int(Zf.shape[2])}",
+                f"one extent, a multiple of {p}", "the G axis is a face axis",
                 "read the block through bgw_epsmat.matrix_block_window")
-    sl = np.full(n_pad, ngk, dtype=np.int32)
-    sl[: len(slots)] = np.asarray(slots, dtype=np.int32)
     vv = np.zeros(n_pad, dtype=np.float64)
     vv[: len(v_eps)] = np.asarray(v_eps, dtype=np.float64)
-    prog = _projection_program(mesh, n_pad, mu_pad, ngk, bool(drop_head))
-    return prog(block, zeta_q, jnp.asarray(sl), jnp.asarray(vv), jnp.int32(n_valid))
+    scale, _ = _scale_columns(mesh)
+    tm1 = _block_minus_one(mesh, n_pad, bool(drop_head))(block, jnp.int32(n_valid))
+    S = _pm(scale(Zf, jnp.asarray(vv)), tm1, mesh)
+    return _pm(jnp.conj(Zf), S, mesh, transb="T")
 
 
-def coulomb_gram(zeta_q, slots, v, *, mesh):
-    """``Z_sᴴ diag(v) Z_s`` over the G rows ``slots`` of the stored sphere, replicated.
-
-    With every physical slot this is the bundle's own V_q (the
-    normalization gate); with the eps G list it is ``V_ε``.
-    """
-    p = _square_side(mesh)
-    mu_pad, ngk = int(zeta_q.shape[1]), int(zeta_q.shape[2])
-    n = len(slots)
-    n_pad = _pad_to(max(n, 1), p * p)
-    sl = np.full(n_pad, ngk, dtype=np.int32)
-    sl[:n] = np.asarray(slots, dtype=np.int32)
-    vv = np.zeros(n_pad, dtype=np.float64)
-    vv[:n] = np.asarray(v, dtype=np.float64)
-    return _gram_program(mesh, n_pad, mu_pad, ngk)(zeta_q, jnp.asarray(sl), jnp.asarray(vv))
+def face_spectrum(A_face, plan):
+    """Eigenvalues ``(n,)`` (ascending, host) of the Hermitian part of a face."""
+    lam, _ = plan(hermitian(A_face)[0])
+    return np.asarray(jax.device_get(lam))
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +359,7 @@ class ExportSource(NamedTuple):
     config: object               # gw_config.LorraxConfig of the producer deck
     head: dict                   # S_cart, G0, whead, head_correction label
     wfn_file: str
+    eigh: object                 # distrib_la face eigensolver, n = mu_pad (eigh_plan)
 
 
 def _bundle_file(source_restart):
@@ -428,12 +425,21 @@ def open_export_source(cfg, mesh, *, print_fn=print):
                 f"bundle (q {q_stored.shape[0]}, μ {n_mu})",
                 "V and W are projected on this ζ", "point zeta_file at the bundle's own ζ")
     mu_pad = int(padded_mu_axis(n_mu, mesh).carrier)
+    eigh = eigh_plan(mesh, mu_pad)
+    n_dev = int(mesh.devices.size)
+    print_fn(f"  eigh        {eigh.describe()}")
+    print_fn(f"  μ faces     {16 * mu_pad**2 / n_dev / 2**30:.3f} GiB per device per matrix "
+             f"(16 μ_pad²/P, P = {n_dev})")
+    if jax.process_count() == 1 and n_dev > 1:
+        print_fn(f"  NOTE        eigh native in one process: each solve gathers "
+                 f"{16 * mu_pad**2 / 2**30:.3f} GiB per device; one process per device "
+                 f"takes the distributed solver")
     print_fn(f"  bundle      {bundle}\n  zeta        {zeta_path}\n"
              f"  stored q    {q_stored.shape[0]} ({storage}) on k-grid {kgrid}, "
              f"μ {n_mu} (carrier {mu_pad})\n  head        {head['head_correction']}")
     return ExportSource(bundle=bundle, zeta=zl, q_stored=q_stored, kgrid=kgrid,
                         n_mu=n_mu, mu_pad=mu_pad, geometry=geometry, config=gw,
-                        head=head, wfn_file=gw.paths.wfn_file)
+                        head=head, wfn_file=gw.paths.wfn_file, eigh=eigh)
 
 
 def lorrax_v(src, q_frac, miller):
@@ -500,41 +506,27 @@ def read_q_rows(src, iq, mesh):
     return V, W, Z
 
 
-@functools.lru_cache(maxsize=None)
-def _replicate_logical(mesh, n):
-    """jit: a stored ``(1, μ_pad, μ_pad)`` face -> its logical ``(μ, μ)``, replicated."""
-    return jax.jit(lambda a: a[0, :n, :n], out_shardings=NamedSharding(mesh, P()))
-
-
-@functools.lru_cache(maxsize=None)
-def _face_program(mesh, n, mu_pad):
-    """jit: a replicated logical ``(μ, μ)`` -> the stored ``(1, μ_pad, μ_pad)`` face."""
-    pad = int(mu_pad) - int(n)
-    return jax.jit(lambda a: jnp.pad(a, ((0, pad), (0, pad)))[None],
-                   out_shardings=NamedSharding(mesh, P(None, "x", "y")))
-
-
 def q_algebra(src, iq, mesh, *, rcond, print_fn=print):
-    """Read stored q ``iq`` and return ``(Z, B, K, V, Wc, v_sphere, diag)``; gates V and W.
+    """Stored q ``iq`` on faces: ``(Z, B, K, chi, V, Wc, diag)``; gates V and W.
 
-    ``B``/``K`` are padded to ``μ_pad`` (zero pad rows/columns); ``V``/``Wc``
-    are the logical replicated μ² matrices; ``v_sphere`` is LORRAX v on the
-    stored sphere; ``diag`` holds the two gate figures and the spectrum
-    range of K (−1 ≼ K ≼ 0 for a passive static response).
+    ``Z`` is ζ̃ ``(1, μ_pad, ngkmax)`` μ-sharded; ``B``, ``K``, ``chi = B K Bᴴ``,
+    ``V`` and ``Wc = W − V`` are ``(1, μ_pad, μ_pad)`` at ``P(None,'x','y')``
+    (zero pad rows); ``diag`` holds the two gate figures and the range of
+    K (−1 ≼ K ≼ 0 for a passive static response).
     """
     from isdf import cplus
-    Vs, Ws, Z = read_q_rows(src, iq, mesh)
-    n = src.n_mu
-    rep = _replicate_logical(mesh, n)
-    V, W = rep(Vs), rep(Ws)
-    del Vs, Ws
+    V, W, Z = read_q_rows(src, iq, mesh)
+    p = _square_side(mesh)
     sphere = src.zeta.gvecs(q=[int(iq)])[0]
     ngk = int(src.zeta.ngk_valid(q=[int(iq)])[0])
     v_sphere = lorrax_v(src, src.q_stored[iq], sphere[:ngk])
-    Vrec = coulomb_gram(Z, np.arange(ngk), v_sphere, mesh=mesh)[:n, :n]
-    nV = float(jnp.linalg.norm(V))
-    err_v = float(jnp.linalg.norm(Vrec - V)) / nV
-    herm_w = float(jnp.linalg.norm(W - jnp.conj(W).T) / jnp.linalg.norm(W))
+    n_s = _pad_to(max(ngk, 1), p)
+    vs = np.zeros(n_s); vs[:ngk] = v_sphere
+    Zs = zeta_face(Z, np.arange(ngk), mesh=mesh, n_pad=n_s)
+    Vrec = coulomb_gram(Zs, vs, mesh=mesh)
+    del Zs
+    err_v = float(jnp.linalg.norm(Vrec - V)) / float(jnp.linalg.norm(V))
+    herm_w = 2.0 * float(jnp.linalg.norm(W - hermitian(W))) / float(jnp.linalg.norm(W))
     if not np.isfinite(err_v) or err_v > V_RECONSTRUCTION_TOL:
         _refuse("epsmat_v_reconstruction", f"|Zᴴ v Z − V|/|V| = {err_v:.3e} at stored q {iq}",
                 f"<= {V_RECONSTRUCTION_TOL:.0e}",
@@ -544,37 +536,31 @@ def q_algebra(src, iq, mesh, *, rcond, print_fn=print):
         _refuse("epsmat_static_w_hermitian", f"|W − Wᴴ|/|W| = {herm_w:.3e}",
                 f"<= {STATIC_W_HERMITIAN_TOL:.0e}", "W(ω=0) is Hermitian, (E3) with a Hermitian static χ",
                 "the bundle's W0_qmunu is not a static screened interaction")
-    Vh = 0.5 * (V + jnp.conj(V).T)
-    B, figures = coulomb_whitener(Vh, rcond=rcond)
-    cplus.report(figures, rcond=float(rcond), n_log=n, where="epsmat V+")
+    B, figures = coulomb_whitener(V, rcond=rcond, plan=src.eigh)
+    cplus.report(figures, rcond=float(rcond), n_log=src.n_mu, where="epsmat V+")
     Wc = W - V
-    K = whitened_correlation(0.5 * (Wc + jnp.conj(Wc).T), B)
-    ev = np.linalg.eigvalsh(np.asarray(jax.device_get(K)))
+    K = whitened_correlation(Wc, B, mesh=mesh)
+    chi = response(B, K, mesh=mesh)
+    ev = face_spectrum(K, src.eigh)
     print_fn(f"  q {iq} {np.round(src.q_stored[iq], 6).tolist()}: |V_rec−V|/|V|={err_v:.2e} "
              f"|W−Wᴴ|/|W|={herm_w:.2e} K∈[{ev[0]:.4f}, {ev[-1]:.2e}]")
-    pad = src.mu_pad - n
-    Bp = jnp.pad(B, ((0, pad), (0, pad)))
-    Kp = jnp.pad(K, ((0, pad), (0, pad)))
     diag = {"err_v": err_v, "herm_w": herm_w, "k_min": float(ev[0]), "k_max": float(ev[-1])}
-    return Z, Bp, Kp, V, Wc, v_sphere, diag
+    return Z, B, K, chi, V, Wc, diag
 
 
-def _check_projection(proj, V_e, B, K, Wc, n, iq, where):
-    """GATE: the block projects back to V_e B K Bᴴ V_e (exact for any G list)."""
-    ref = V_e @ B[:n, :n] @ K[:n, :n] @ jnp.conj(B[:n, :n]).T @ V_e
-    err = float(jnp.linalg.norm(proj[:n, :n] - ref) / jnp.linalg.norm(Wc))
+def _check_projection(proj, V_e, chi, Wc, iq, where, mesh):
+    """GATE: the block projects back to ``V_ε χ V_ε`` (exact for any G list); faces."""
+    ref = _pm(_pm(V_e, chi, mesh), V_e, mesh)
+    nwc = float(jnp.linalg.norm(Wc))
+    err = float(jnp.linalg.norm(proj - ref)) / nwc
     if not np.isfinite(err) or err > BLOCK_PROJECTION_TOL:
         _refuse("epsmat_block_projection", f"relative error {err:.3e} at stored q {iq} ({where})",
                 f"<= {BLOCK_PROJECTION_TOL:.0e}",
                 "the written block is not the ISDF response (layout or sharding defect)",
                 "report the deck; do not consume the file")
-    rt = float(jnp.linalg.norm(proj[:n, :n] - Wc) / jnp.linalg.norm(Wc))
+    rt = float(jnp.linalg.norm(proj - Wc)) / nwc
     return err, rt
 
-
-# ---------------------------------------------------------------------------
-# Export: LORRAX -> eps0mat.h5 / epsmat.h5
-# ---------------------------------------------------------------------------
 
 class QPlan(NamedTuple):
     """One output q: file row, stored row, umklapp, BerkeleyGW G list."""
@@ -695,7 +681,7 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
     plans, comps = plan_export(cfg, src, print_fn=print_fn)
     os.makedirs(cfg.output_dir, exist_ok=True)
     rank0 = process_rank() == 0
-    _square_side(mesh)
+    p = _square_side(mesh)
     out = {}
     for name, (q_file, ecuts, rows) in plans.items():
         path = os.path.join(cfg.output_dir, f"{name}.h5")
@@ -715,8 +701,8 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
         with SlabIO(path, mode="a", mesh=mesh) as io:
             be.register_matrix(io, len(rows), max(r.gspace.nmtx for r in rows))
             for r in rows:
-                Z, B, K, V, Wc, _, qd = q_algebra(src, r.iq_store, mesh, rcond=cfg.rcond,
-                                              print_fn=print_fn)
+                Z, B, K, chi, V, Wc, qd = q_algebra(src, r.iq_store, mesh, rcond=cfg.rcond,
+                                                    print_fn=print_fn)
                 n = r.gspace.nmtx
                 miller = comps[r.gspace.order[:n]] + r.g0[None, :]
                 slots = zeta_slots(src.zeta.gvecs(q=[r.iq_store])[0],
@@ -724,16 +710,19 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
                                    fill=Z.shape[2])
                 v_eps = _file_q_v(src, r.q_file, comps[r.gspace.order[:n]], name == "eps0mat")
                 head = _q0_head_value(cfg, src, r.q_file) if name == "eps0mat" else None
-                blk, diag = epsinv_block(Z, slots, B, K, v_eps, mesh=mesh, n_valid=n,
-                                         q0_head_value=head)
-                offset, shape = be.matrix_block_window(r.iq_file, 0, blk.shape[0])
-                blk6 = blk.reshape(shape)
+                n_pad = _pad_to(max(n, 1), p * p)
+                Zf = zeta_face(Z, slots, mesh=mesh, n_pad=n_pad)
+                blk6, diag = epsinv_block(Zf, chi, v_eps, mesh=mesh, n_valid=n,
+                                          q0_head_value=head)
+                offset, _ = be.matrix_block_window(r.iq_file, 0, n_pad)
                 io.write_slab(be.MATRIX, blk6, offset=offset)
-                proj = project_block(blk6, Z, slots, v_eps, mesh=mesh, n_valid=n,
+                proj = project_block(blk6, Zf, v_eps, mesh=mesh, n_valid=n,
                                      drop_head=name == "eps0mat")
                 # v_eps[0] = 0 at q0, so V_ε carries no head term (the head is (E8)).
-                V_e = coulomb_gram(Z, slots, v_eps, mesh=mesh)[: src.n_mu, : src.n_mu]
-                err, rt = _check_projection(proj, V_e, B, K, Wc, src.n_mu, r.iq_store, name)
+                vv = np.zeros(n_pad); vv[:n] = v_eps
+                V_e = coulomb_gram(Zf, vv, mesh=mesh)
+                err, rt = _check_projection(proj, V_e, chi, Wc, r.iq_store, name, mesh)
+                del Zf, blk6, proj, V_e
                 d = np.asarray(jax.device_get(diag))[:n]
                 diags.append((r.iq_file, d))
                 figs.append({"q": np.round(r.q_file, 6).tolist(), "iq_file": int(r.iq_file),
@@ -824,7 +813,7 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
                 iqf, g0 = int(idx[0]), -g0s[0]
             qg, _ = be.read_q_gspace(files[name], iqf)
             n = qg.nmtx
-            Z, B, K, V, Wc, _, qd = q_algebra(src, iq, mesh, rcond=cfg.rcond, print_fn=print_fn)
+            Z, B, K, chi, V, Wc, qd = q_algebra(src, iq, mesh, rcond=cfg.rcond, print_fn=print_fn)
             # q_BGW = q_store + g0, so ζ̃_{q_BGW}(G) = ζ̃_{q_store}(G + g0).
             miller = comps[qg.order[:n]] + g0[None, :]
             slots = zeta_slots(src.zeta.gvecs(q=[iq])[0], src.zeta.ngk_valid(q=[iq])[0],
@@ -835,20 +824,19 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
             with SlabIO(files[name], mode="r", mesh=mesh) as rd:
                 blk = rd.read_slab(be.MATRIX, shape=shape, dtype=np.float64, offset=offset,
                                    mesh=mesh, partition_spec=P(None, None, None, "x", "y", None))
-            Wc_bgw = project_block(blk, Z, slots, v_eps, mesh=mesh, n_valid=n,
-                                   drop_head=is_g)[: src.n_mu, : src.n_mu]
+            Zf = zeta_face(Z, slots, mesh=mesh, n_pad=n_pad)
+            Wc_bgw = project_block(blk, Zf, v_eps, mesh=mesh, n_valid=n, drop_head=is_g)
+            del Zf, blk
             W_new = V + Wc_bgw
-            rel = float(jnp.linalg.norm(Wc_bgw - Wc) / jnp.linalg.norm(Wc))
+            rel = float(jnp.linalg.norm(Wc_bgw - Wc)) / float(jnp.linalg.norm(Wc))
             # BerkeleyGW's W = ε⁻¹v is Hermitian only in the orientation read here.
-            herm_bgw = float(jnp.linalg.norm(Wc_bgw - jnp.conj(Wc_bgw).T) / jnp.linalg.norm(Wc_bgw))
-            Bl = B[: src.n_mu, : src.n_mu]
-            Kb = whitened_correlation(0.5 * (Wc_bgw + jnp.conj(Wc_bgw).T), Bl)
-            Kl = K[: src.n_mu, : src.n_mu]
-            evb = np.linalg.eigvalsh(np.asarray(jax.device_get(Kb)))
-            rel_k = float(np.linalg.norm(np.asarray(jax.device_get(Kb - Kl)), 2)
-                          / np.linalg.norm(np.asarray(jax.device_get(Kl)), 2))
-            io.write_slab("W0_qmunu", _face_program(mesh, src.n_mu, src.mu_pad)(W_new),
-                          offset=(iq, 0, 0))
+            herm_bgw = (2.0 * float(jnp.linalg.norm(Wc_bgw - hermitian(Wc_bgw)))
+                        / float(jnp.linalg.norm(Wc_bgw)))
+            Kb = whitened_correlation(Wc_bgw, B, mesh=mesh)
+            evb = face_spectrum(Kb, src.eigh)
+            ek = face_spectrum(K, src.eigh)
+            rel_k = float(np.max(np.abs(face_spectrum(Kb - K, src.eigh))) / np.max(np.abs(ek)))
+            io.write_slab("W0_qmunu", W_new, offset=(iq, 0, 0))
             head_bgw = None
             if is_g:
                 with h5py.File(files[name], "r") as f:
