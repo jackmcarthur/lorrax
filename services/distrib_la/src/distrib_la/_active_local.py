@@ -35,9 +35,13 @@ import jax.numpy as jnp
 #: ``"device"``.  Not ``"native"``: the cuBLAS/rocBLAS handler's per-call host read +
 #: stream sync drains the stream inside Sigma's tau loop (Fe Sigma tau 13.5 s vs 9.1 s
 #: masked on MI250X); not ``"masked"``: its ``where`` selects form two operand-sized
-#: copies per call (~3.2 s of selects per Fe Sigma tau run).  CUDA keeps ``"native"``
-#: (measured on A100: the read idles the GPU <= 1.2 %); ``"device"`` is its adoption path.
-ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "device"}
+#: copies per call (~3.2 s of selects per Fe Sigma tau run).  CUDA: ``"device"`` too, on the
+#: DMMA f64 arm (compute capability >= 8.0; FMA below): per call on A100-SXM4 (one GPU,
+#: tests/test_active_local_native_gate.py --time) Fe W shape 358 us vs 778 us for the guarded
+#: cuBLAS arm (bounds read + sync + two conds), Fe G shape 268 vs 282 us, distinct intervals
+#: 301 vs 1302 us and 263 vs 609 us; only at a fully live K is the bare cuBLAS call faster
+#: (867 vs 927 us), and Fe's live fraction is 0.26-0.32.
+ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "device", "ROCM": "device"}
 
 
 #: How the native arm (``_active_local_cuda.active_local_cuda``) guards invalid and full

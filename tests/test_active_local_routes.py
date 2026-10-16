@@ -99,7 +99,7 @@ def test_invalid_bounds_give_nan(bad):
 
 
 def test_route_rows():
-    assert ACTIVE_LOCAL_ROUTE == {"cpu": "interval", "CUDA": "native", "ROCM": "device"}
+    assert ACTIVE_LOCAL_ROUTE == {"cpu": "interval", "CUDA": "device", "ROCM": "device"}
     assert active_local_route("tpu") == "interval"
     assert local_active_impl("cpu") is active_local_matmul
 

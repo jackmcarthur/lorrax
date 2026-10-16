@@ -366,7 +366,7 @@ def test_rows():
     pytest.importorskip("jax")
     from distrib_la._active_local import (ACTIVE_LOCAL_GUARD, ACTIVE_LOCAL_ROUTE,
                                           active_local_guard, active_local_route)
-    assert ACTIVE_LOCAL_ROUTE["CUDA"] == "native" and ACTIVE_LOCAL_ROUTE["ROCM"] == "device"
+    assert ACTIVE_LOCAL_ROUTE["CUDA"] == "device" and ACTIVE_LOCAL_ROUTE["ROCM"] == "device"
     assert active_local_route("cpu") == "interval"
     assert ACTIVE_LOCAL_GUARD == {"CUDA": "cond", "ROCM": "select"}
     assert active_local_guard("tpu") == "cond"
