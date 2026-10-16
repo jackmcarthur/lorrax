@@ -75,6 +75,12 @@ A new test needs no bootstrap import of its own.
   dipoles against exact ones in the densified states' gauge, a planted coarse
   gauge invisible and a velocity-only gauge seen, DFT denominators under a
   scissor, and the window-dipole refusals.
+- `test_bse_kgrid_dipoles_rfix_cpu.py`: `--eqp` (`qp_states`) dipoles on the same
+  toy with band-dependent QP shifts: the exact position of the fine QP states
+  to the interpolation floor (0.4 %) against the toy's full eigenbasis, the
+  pre-fix Rayleigh-quotient `v/ΔE` red twin 12x off; the DFT path bitwise
+  `v/ΔE`; `r_window` Hermitian with `d = i r[c, v]`; the pair rule equal to
+  `tdagw.td_system.position_from_velocity`'s; the rotation record.
 - `test_bse_helicity_cpu.py`: per-state in-plane helicity on a C3-symmetric
   toy (s, p_x, p_y with an orbital Zeeman term; CPU, 2x2 host mesh): the Γ
   transitions into p± take the field-defined σ± labels that ⟨L_z⟩ certifies;

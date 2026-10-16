@@ -176,6 +176,25 @@ def require_dipole_k_grid(attrs, nk: int, *, dipole_path) -> None:
             f"the deck's WFN (python -m psp.get_dipole_mtxels -i <deck>).")
 
 
+def require_dipole_wfn_fingerprint(attrs, *, dipole_path, wfn_path, want) -> None:
+    """Refuse a velocity stamped for another WFN than the one it is contracted with.
+
+    ``want`` is ``common.parallel_transport.wfn_fingerprint`` of ``wfn_path``
+    (the caller holds the loader).  Shapes cannot tell: another NSCF, cutoff
+    or structure on the same k grid has the same ``(nk, nb)``.  A file with
+    no ``prov_wfn_sha256`` stamp refuses too.
+    """
+    got = attrs.get("prov_wfn_sha256")
+    got = got.decode() if isinstance(got, bytes) else got
+    if got != want:
+        raise ValueError(
+            f"GATE velocity_wfn_fingerprint: {dipole_path!s} is stamped for WFN "
+            f"{got!r}, not {wfn_path!s} ({want!r}); why: the velocity is "
+            f"contracted against this WFN's states, and another WFN's file with "
+            f"the same k list passes every shape check; fix: the dipole.h5 built "
+            f"from this WFN, or the SC run's dipole_qsgw.h5 beside its WFN_qp.h5")
+
+
 def velocity_stamp(path, *, wfn, wfn_path) -> tuple[str, str, np.ndarray]:
     """``(velocity label, basis, band_energies)`` of a velocity of ``wfn``'s states.
 
@@ -193,13 +212,8 @@ def velocity_stamp(path, *, wfn, wfn_path) -> tuple[str, str, np.ndarray]:
         attrs = dict(h5.attrs)
         energies = np.asarray(h5[BAND_ENERGIES_DATASET][()], dtype=np.float64)
     require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
-    want = wfn_fingerprint(wfn)
-    if text(attrs.get("prov_wfn_sha256")) != want:
-        raise ValueError(
-            f"GATE velocity_wfn_fingerprint: {path!s} is stamped for WFN "
-            f"{text(attrs.get('prov_wfn_sha256'))!r}, not {wfn_path!s} "
-            f"({want!r}); fix: the dipole.h5 built from this WFN, or the SC "
-            "run's dipole_qsgw.h5 beside its WFN_qp.h5")
+    require_dipole_wfn_fingerprint(attrs, dipole_path=path, wfn_path=wfn_path,
+                                   want=wfn_fingerprint(wfn))
     label = text(attrs.get("velocity", "p + i[V_NL, r] (DFT velocity)"))
     return str(label), str(text(attrs.get(DIPOLE_BASIS_ATTR, "dft"))), energies
 
