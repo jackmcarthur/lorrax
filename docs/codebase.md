@@ -28,7 +28,7 @@ else.
 
 | package | level | owns | entry points | imported by |
 |---|---|---|---|---|
-| `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (shared pole, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
+| `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (shared pole, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
 | `bse` | L1 | the Bethe–Salpeter equation: kernels, TDA and full solvers, absorption, exciton bands, the $W_\mathrm{BSE}$ ladder | `python -m bse.bse_jax`, `bse.exciton_bands`, `bse.absorption_haydock`, `bse.bse_feast`, `bse.bse_kpm`, `bse.bse_w_exact` | `gw.screening_bse`, `file_io.restart_bundle` (both lazily) |
 | `bandstructure` | L1 | band interpolation (htransform), fine-k wavefunctions for the BSE, band operators | `python -m bandstructure.htransform` | `bse` |
 | `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, pivoted-Cholesky pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw` |
@@ -71,6 +71,9 @@ else.
 | `downfold_run.py` | Orchestrates a downfold calculation. |
 | `dynamic_sigma.py` | Post-processes frequency-dependent self-energy data. |
 | `efermi.py` | Resolves occupations and Fermi levels. |
+| `epsmat_cli.py` | Driver: BerkeleyGW `eps0mat.h5` / `epsmat.h5` from a bundle's static W (`mode = export`), or BerkeleyGW's ε⁻¹ projected on the bundle's ζ (`mode = project`); `python -m gw.epsmat_cli`. |
+| `epsmat_config.py` | Parses and validates the `[epsmat]` input file. |
+| `epsmat_export.py` | The ζ-space W ↔ BerkeleyGW ε⁻¹(G, G′) maps, one q at a time: Coulomb whitening, the eps-sphere block, the reverse projection. |
 | `eqp_bgw.py` | Writes BerkeleyGW-compatible quasiparticle tables. |
 | `experimental/__init__.py` | Package for staged GW features not yet wired into `gw_jax`. |
 | `experimental/head_wing_schur.py` | Sharded head/wing/body Schur decomposition of W; the head-channel specs are live. |
@@ -218,6 +221,7 @@ else.
 | `_slab_io_ffi.py` | Implements the native SlabIO transport binding. |
 | `_slab_io_rank.py` | SlabIO's per-rank streamed tier: an operator written segment by segment and read back by output. |
 | `_slab_io_serial.py` | Implements serial SlabIO transport. |
+| `bgw_epsmat.py` | The BerkeleyGW 4.0 `epsmat.h5` / `eps0mat.h5` format: schema, G order, writer. |
 | `centroids.py` | Loads centroid tables through one format and symmetry entry point. |
 | `commit_state.py` | Persistent completion receipt for collective artifact writes. |
 | `dipole.py` | The `dipole.h5` format: the q → 0 velocity matrix, band energies, finite-q terms. |

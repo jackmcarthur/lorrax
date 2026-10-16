@@ -4,7 +4,8 @@ The time-dependent adiabatic GW equation of motion (TD-aGW) propagates the
 band-basis density matrix on the full k grid. Its self-energy update is the
 static-COHSEX change linear in the density-matrix change. LORRAX applies that
 update on the ISDF basis with the BSE kernel's own W term and a G-space
-Hartree term (`tdagw.model`).
+Hartree term (`tdagw.model`). The steps from a GW run to a drive are on
+[TD-aGW end to end](../how-to/td-agw-workflow.md).
 
 ## Equation of motion
 

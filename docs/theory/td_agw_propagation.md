@@ -6,7 +6,8 @@ conventions, with TDGW's deck, header and output files. This page owns the
 equation of motion as integrated, the integrators, the array layout and the
 output contract. The interaction ΔΣ[ρ] of the ISDF model is derived on
 [TD-aGW interaction](td_agw.md); the deck keys are in the
-[input reference](../input_reference.md#td-agw).
+[input reference](../input_reference.md#td-agw). The steps from a GW run to a
+drive are on [TD-aGW end to end](../how-to/td-agw-workflow.md).
 
 ## The equation of motion {#eom}
 

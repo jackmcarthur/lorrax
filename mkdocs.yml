@@ -72,6 +72,7 @@ nav:
       - "How-to: complete-basis WFN": how-to/complete-basis-wfn.md
       - "How-to: BerkeleyGW users": how-to/berkeleygw-users.md
       - "How-to: band and exciton interpolation": how-to/htransform-and-exciton-bands.md
+      - "How-to: TD-aGW end to end": how-to/td-agw-workflow.md
       - Self-consistency: self_consistency.md
       - BSE: architecture/bse.md
       - Downfold driver: downfold.md

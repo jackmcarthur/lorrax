@@ -292,7 +292,7 @@ Lanczos-only.
 | `--solver` | `lanczos` | *Lanczos*. `lanczos` (spectrum shape), `davidson` (per-state convergence, `--davidson-*`), `trlan` (thick restart, bounded memory, `--trlan-*`) |
 | `--block-size` / `--max-lanczos-iter` / `--n-reorth` | 1 / auto / −1 | *Lanczos*. Block width / total Krylov dimension / reorthogonalization window (−1 = full, needed for degenerate spinor spectra) |
 | `--n-eig` / `--write-eigs [N]` | 5 / off | *Lanczos*. Eigenpairs; write `eigenvectors.h5` |
-| `--dipole FILE` | none | *Lanczos*, with `--write-eigs` and `--tda`: store each written state's dipole $\langle 0\lvert\hat r\rvert S\rangle$ from `FILE` (a `dipole.h5`) in `eigenvectors.h5`. Under `bse_k_grid`, `FILE` is the deck (coarse) WFN's, carried through the densifying htransform ([dipoles](architecture/bse.md#dipoles-and-absorption)); `absorption_haydock --dipole` reads it the same way |
+| `--dipole FILE` | none | *Lanczos*, with `--write-eigs` and `--tda`: store each written state's dipole $\langle 0\lvert\hat r\rvert S\rangle$ from `FILE` (a `dipole.h5`) in `eigenvectors.h5`. Under `bse_k_grid`, `FILE` is the deck (coarse) WFN's, carried through the densifying htransform ([dipoles](architecture/bse.md#dipoles-and-absorption)); `absorption_haydock --dipole` reads it the same way. σ± strengths from these dipoles: the [helicity convention](architecture/bse.md#helicity) |
 | `--eqp FILE` | none | *Lanczos*. Diagonal QP energies from the wedge `eqp1.dat`, unfolded through the symmetry service; the restart must be proved to come from the same unrotated WFN |
 | `bse_k_grid` (deck) | `""` | fine grid "NX NY NZ", each axis at least the coarse extent |
 | `head_minibz_average` (deck) | false | read only under `bse_k_grid`: rebuilds the q = 0 exchange tile with the fine grid's mini-BZ head and takes the W head's Γ-cell reference from the analytic sphere ([LT head](theory/lt-exchange-head.md)); must match the GW run |
@@ -325,7 +325,8 @@ with $H = \mathrm{diag}(E^\mathrm{QP}) + \mathbf E\cdot\mathbf r +
 takes energies, k grid and dipoles from the header of a TDGW run, and writes
 `tdgw.h5` + `tdgw.toml` that `tdgw-pp` reads unchanged. The equation, the
 integrators, the layout and the output are on
-[TD-aGW propagation](theory/td_agw_propagation.md).
+[TD-aGW propagation](theory/td_agw_propagation.md); the whole chain, from the GW
+run to a drive, is [TD-aGW end to end](how-to/td-agw-workflow.md).
 
 Invoke: `python -u -m tdagw.tdgw_jax -i tdgw.toml`. The only flag is
 `-i/--input`; everything else is a deck key
