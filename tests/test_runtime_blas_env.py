@@ -90,10 +90,14 @@ def test_numpy_first_still_tunes_scipy_and_the_gate_names_numpy():
     _need_openblas()
     res = _run("import numpy, runtime, scipy.linalg")
     assert res["env"] == "1"
-    live = [r for r in res["libs"] if r["witness"] == "live symbol"]
-    assert live and all(r["state"] == "tuned" for r in live)
+    # Classified by library, not by witness: numpy's wheel may export the live symbol (it does
+    # in the Perlmutter cuda13 venv), so its untuned row can carry witness 'live symbol' too.
+    numpy_copy = [r for r in res["libs"] if "openblas64_" in r["lib"]]
+    scipy_copy = [r for r in res["libs"] if "openblas64_" not in r["lib"]]
+    assert scipy_copy and all(r["state"] == "tuned" for r in scipy_copy)
+    assert numpy_copy and all(r["state"] == "untuned" for r in numpy_copy)
     assert res["gate"] and res["gate"].startswith("GATE blas_spin:")
-    assert any(r["state"] == "untuned" for r in res["libs"])
+    assert all(r["lib"] in res["gate"] for r in numpy_copy)
 
 
 def test_an_exported_value_is_honoured_whatever_the_order():
