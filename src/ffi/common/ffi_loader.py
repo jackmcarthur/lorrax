@@ -152,6 +152,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionFfi",
+    "lorrax_phdf5_read_multi":        "PhdfReadMultiFfi",
     "lorrax_slate_eigh":              "SlateEighFfi",
     "lorrax_slate_potrf":             "SlatePotrfFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfFfi",
@@ -199,6 +200,7 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_phdf5_read":              "PhdfReadHostFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",
+    "lorrax_phdf5_read_multi":        "PhdfReadMultiHostFfi",
     "lorrax_phdf5_write":             "PhdfWriteHostFfi",
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentHostFfi",
 }

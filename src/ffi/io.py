@@ -298,6 +298,8 @@ Preferred public entry point remains :mod:`file_io.slab_io`, whose
 _TARGET_READ = "lorrax_phdf5_read"
 _TARGET_READ_KCHUNK = "lorrax_phdf5_read_kchunk"
 _TARGET_READ_KCHUNK_UNION = "lorrax_phdf5_read_kchunk_union"
+#: N datasets, one handler, one collective ``H5Dread_multi`` (``PhdfReadMulti``).
+_TARGET_READ_MULTI = "lorrax_phdf5_read_multi"
 
 
 # =============================================================================
@@ -448,6 +450,35 @@ def ffi_read_call(
         handle,
         offset_base,
         valid_shape,
+        mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
+    )
+
+
+def ffi_read_multi_call(
+    out_structs: Sequence[jax.ShapeDtypeStruct],
+    control: jax.Array,
+    *,
+    mesh_shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+) -> list:
+    """N hyperslabs of N datasets of one file -- one handler, one ``H5Dread_multi``.
+
+    ``control`` is the ONE replicated int64 descriptor table
+    ``{ctx, N, ds_id[N], offset_base[N][ndim], valid_shape[N][ndim]}``; the
+    N outputs share ``ndim`` and the sharding encoding and keep their own
+    shapes and dtypes.  Each output is the block :func:`ffi_read_call` would
+    return for the same request (the handler places and selects every rank
+    with ReadDispatch's own helpers).
+    """
+    n = len(out_structs)
+    ndim = len(axis_count_per_dim)
+    require_control_i64("read_multi control", control, ndim=1,
+                        length=2 + n * (1 + 2 * ndim))
+    return jax.ffi.ffi_call(_TARGET_READ_MULTI, list(out_structs))(
+        control,
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),

@@ -2055,6 +2055,78 @@ def _get_read_sm(mesh, partition_spec, *,
     return jax.jit(sm_bare)
 
 
+def _local_block_shape(shape, axis_count_per_dim, axis_flat, mesh_shape):
+    """One rank's equal block of ``shape``: each dim divided by the product of
+    the mesh sizes of the axes sharding it (the read handlers' ``mem_dims``)."""
+    local, flat = list(int(s) for s in shape), 0
+    for d in range(len(local)):
+        na = axis_count_per_dim[d]
+        if na > 0:
+            div = 1
+            for k in range(na):
+                div *= int(mesh_shape[axis_flat[flat + k]])
+            local[d] //= div
+            flat += na
+    return tuple(local)
+
+
+def _disjoint_waves(batch):
+    """Split read_multi requests into waves whose file selections are disjoint.
+
+    HDF5's multi-dataset selection I/O refuses two selections of one call that
+    share a file address ("duplicate addr in selections", 1.14.3, measured on
+    the gate's repeated-parent case). A round repeats its last parent, and a
+    sparse face read takes one run per parent, so: an identical request is
+    read once and aliased (``aliases``: ``(i, j)`` = request i takes j's
+    value); a request whose valid box overlaps one already in a wave on the
+    same dataset starts or joins a later wave. Normally one wave. Boxes are the
+    global ``[offset, offset + valid_shape)``, so the split is the same on
+    every rank.
+    """
+    first, aliases, waves = {}, [], []
+    for entry in batch:
+        i, name, off, vshape, st = entry
+        key = (name, tuple(off), tuple(vshape), tuple(st.shape), str(st.dtype))
+        if key in first:
+            aliases.append((i, first[key]))
+            continue
+        first[key] = i
+        for wave in waves:
+            if not any(n == name and all(o < po + pv and po < o + v
+                                         for o, v, po, pv in zip(off, vshape, poff, pvs))
+                       for _, n, poff, pvs, _ in wave):
+                wave.append(entry)
+                break
+        else:
+            waves.append([entry])
+    return aliases, waves
+
+
+@functools.lru_cache(maxsize=None)
+def _get_read_multi_sm(mesh, partition_spec, *, mesh_shape, axis_count_per_dim,
+                       axis_flat, out_structs):
+    """N reads in ONE ``PhdfReadMulti`` handler; returns ``(*outs, done)``.
+
+    Keyed on geometry only (the ctx, dataset ids and origins are the runtime
+    control table), so a constructor's rounds share one executable.  ``done``
+    is one element per rank sliced from the largest output in the same program:
+    ready exactly when the rank's read has landed, holding none of its bytes
+    (the k-chunk union reader's token, ``ffi.io``).
+    """
+    from ffi.io import ffi_read_multi_call
+    big = max(range(len(out_structs)), key=lambda i: math.prod(out_structs[i].shape))
+
+    def _per_rank(control_local):
+        outs = ffi_read_multi_call(
+            out_structs, control_local, mesh_shape=mesh_shape,
+            axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat)
+        return (*outs, outs[big].reshape(-1)[:1])
+    return jax.jit(shard_map(
+        _per_rank, mesh=mesh, in_specs=(P(),),
+        out_specs=(*([partition_spec] * len(out_structs)), P(tuple(mesh.axis_names))),
+        check_vma=False))
+
+
 #: AOT executables of ``_get_write_sm`` callables, keyed on the callable and
 #: the operands' (shape, dtype, sharding).  Same key space as that cache: a
 #: handful of write signatures per run.
@@ -3089,17 +3161,9 @@ class _FfiBackend(_DatasetGeometry):
 
         # Per-rank output shape: divide by the product of the mesh
         # sizes of all axes sharding that dim.
-        local_shape = list(read_shape)
-        _flat_idx = 0
-        for d in range(len(read_shape)):
-            na = axis_count_per_dim[d]
-            if na > 0:
-                div = 1
-                for k in range(na):
-                    div *= int(mesh_shape[axis_flat[_flat_idx + k]])
-                local_shape[d] = int(local_shape[d]) // div
-                _flat_idx += na
-        out_struct = jax.ShapeDtypeStruct(tuple(local_shape), jnp.dtype(dtype))
+        local_shape = _local_block_shape(read_shape, axis_count_per_dim,
+                                         axis_flat, mesh_shape)
+        out_struct = jax.ShapeDtypeStruct(local_shape, jnp.dtype(dtype))
 
         ds_id = self._ds_id(name, readonly=True)
         ctx_handle = self.fh
@@ -3170,6 +3234,88 @@ class _FfiBackend(_DatasetGeometry):
                     result = insert(result, piece, starts)
                     result.block_until_ready()
         return result
+
+    # ------------------------------------------------------------------
+    # N datasets, ONE handler and ONE collective H5Dread_multi.  Same padding
+    # contract as read_slab per request; see SlabIO.read_multi.
+    def read_multi(self, requests, *, partition_spec: P, mesh: Mesh | None = None) -> list:
+        from ffi.common import ffi_loader
+        from ffi.io import _TARGET_READ_MULTI
+
+        mesh = mesh or self.mesh
+        # The read_slab drain, once for the whole list (same three hazards).
+        self._drain_for_read()
+        requests = list(requests)
+        if not requests:
+            return []
+        usable, why = ffi_loader.probe_target(_TARGET_READ_MULTI, self._platform())
+        if not usable:
+            raise RuntimeError(
+                f"GATE slab_io_read_multi: got: {why}; want: the {_TARGET_READ_MULTI} "
+                f"handler (PhdfReadMulti, HDF5 >= 1.14 H5Dread_multi) in this leg's "
+                f"library; fix: rebuild the leg (config/<site>/build_ffi_*.sh).")
+        sharding = NamedSharding(mesh, partition_spec)
+        ndim = len(tuple(requests[0]["shape"]))
+        axis_count_per_dim, axis_flat = _sharding_to_axis_info(sharding, ndim)
+        mesh_shape = tuple(mesh.shape[ax] for ax in mesh.axis_names)
+        out, batch, rows = [None] * len(requests), [], []
+        for i, req in enumerate(requests):
+            name = req["name"]
+            ds_shape, ds_dtype = self._dataset_geom(name)
+            dtype = jnp.dtype(req.get("dtype") or ds_dtype)
+            off, read_shape, _ = _normalize_slab_request(
+                op="read_multi", name=name, offset=req.get("offset"),
+                slab_shape=req["shape"], global_shape=None, check_bounds=False)
+            if len(read_shape) != ndim:
+                raise ValueError(
+                    f"read_multi: request {i} ({name!r}) is {len(read_shape)}-D; one "
+                    f"call shares one {ndim}-D partition_spec")
+            vshape = _normalize_valid_shape(
+                op="read_multi", name=name, valid_shape=req.get("valid_shape"),
+                slab_shape=read_shape, offset=off, ds_shape=ds_shape)
+            _validate_block_divisible(
+                op="read_multi", name=name, shape=read_shape,
+                axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
+                mesh_shape=mesh_shape)
+            plan = _file_order_read_plan(read_shape, vshape, partition_spec,
+                                         dtype.itemsize, mesh, ds_shape)
+            if plan is not None:
+                # read_slab's own route for this request: bounded file rows of
+                # a large fully distributed payload (synchronous, the same bytes).
+                rows.append((i, name, read_shape, dtype, off, vshape, plan))
+            elif math.prod(read_shape) == 0:
+                out[i] = jnp.zeros(read_shape, dtype, device=sharding)
+            else:
+                batch.append((i, name, off, vshape, jax.ShapeDtypeStruct(
+                    _local_block_shape(read_shape, axis_count_per_dim, axis_flat,
+                                       mesh_shape), dtype)))
+        for i, name, read_shape, dtype, off, vshape, plan in rows:
+            out[i] = self._read_file_rows(name, read_shape, dtype, off, vshape,
+                                          mesh, partition_spec, plan)
+        aliases, waves = _disjoint_waves(batch)
+        for wave in waves:
+            ds_ids = [self._ds_id(name, readonly=True) for _, name, _, _, _ in wave]
+            control = np.concatenate([
+                np.asarray((self.fh, len(wave), *ds_ids), np.int64),
+                np.asarray([o for _, _, o, _, _ in wave], np.int64).reshape(-1),
+                np.asarray([v for _, _, _, v, _ in wave], np.int64).reshape(-1)])
+            # ONE descriptor table, staged process-locally (no assert_equal
+            # all-gather; _replicated_i64_vector says why).
+            control = device_put_process_local(control, NamedSharding(mesh, P()))
+            sm = _get_read_multi_sm(
+                mesh, partition_spec, mesh_shape=mesh_shape,
+                axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
+                out_structs=tuple(st for *_, st in wave))
+            *values, done = sm(control)
+            # No block_until_ready: the handler runs in program order on the
+            # XLA thread, and the next HDF5 entry point of any handle (or this
+            # handle's close) waits for ``done`` (_CollectiveLane).
+            _LANE.track_read(self._dispatcher, done)
+            for (i, *_), value in zip(wave, values):
+                out[i] = value
+        for i, j in aliases:
+            out[i] = out[j]          # an identical request: the same immutable value
+        return out
 
     # ------------------------------------------------------------------
     # n windows, ONE H5Dread.  Same padding contract as read_slab, one

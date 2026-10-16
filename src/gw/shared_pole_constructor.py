@@ -105,7 +105,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         from jax.sharding import NamedSharding, PartitionSpec as P
         from file_io.shared_pole_store import (
             charge_representation, validate_shared_pole_bank, open_shared_pole_bank,
-            read_line_panels, read_shared_pole_bank, write_shared_pole_model,
+            read_line_panel_round, read_shared_pole_bank, write_shared_pole_model,
         )
         from gw.gw_config import linalg_resolution
         from common.staged_reshard import face_to_batch_reshard
@@ -260,9 +260,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 samples = read_shared_pole_bank(
                     bank_io, meta=meta, header=header, q_ids=ids,
                     partition_spec=read_spec, sample_ids=dense_fit, fields=("Wc", "dWc_ds"))
-                line = {sid: read_line_panels(bank_io, meta=meta, header=header, family="charge",
-                                              sample=sid, q_ids=ids, partition_spec=read_spec)
-                        for sid in range(line_lo, line_hi)}
+                # The round's line panels in one collective read (SlabIO.read_multi).
+                line = read_line_panel_round(bank_io, meta=meta, header=header, family="charge",
+                                             samples=range(line_lo, line_hi), q_ids=ids,
+                                             partition_spec=read_spec)
             # The store admits this complete bounded scratch batch before
             # allocation. Charge it while directions/actions are selected;
             # release it before admitting the dense pencil.
