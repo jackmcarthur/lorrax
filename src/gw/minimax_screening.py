@@ -698,7 +698,9 @@ def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
 @jax.jit
 def _star_weighted_count(mask, w):
     """``sum(mask)`` with each q row counted ``w[q]`` times (its star size)."""
-    return jnp.sum(mask.astype(jnp.float64) * w[:, None, None])
+    # An integer count, summed as one (exact in any order, so the cross-rank part has no
+    # topology-dependent rounding; the same float64 value as the float sum of 0/1 x w).
+    return jnp.sum(mask.astype(jnp.int64) * w.astype(jnp.int64)[:, None, None]).astype(jnp.float64)
 
 
 @partial(
@@ -991,7 +993,7 @@ def _gn_ppm_fit_kernel(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback, n_log,
         # the float64 exactness argument above is never silently violated.
         n_modes = jnp.sum(
             jnp.broadcast_to(mode_mask, good.shape).astype(jnp.float64))
-    n_good = jnp.sum(good.astype(jnp.float64))
+    n_good = jnp.sum(good, dtype=jnp.int64).astype(jnp.float64)   # an exact integer count
     omega_min = jnp.min(jnp.where(good, omega_vals, jnp.inf))
     omega_max = jnp.max(jnp.where(good, omega_vals, -jnp.inf))
     pair_scale = jnp.maximum(
