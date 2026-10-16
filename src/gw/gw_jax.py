@@ -1218,6 +1218,16 @@ def _attach_raw_sigma(results, config, enk_dft, sigma_result):
     ``_sigma_output_fields``/``_sigma_diagnostic_fields`` apply to the
     extrapolated pair, so the raw columns equal an extrapolation-off run's.
     """
+    import dataclasses
+    if sigma_result.sigma_c_on_shell_diag is not None:
+        # On shell: the eqp operand and its raw twin, averaged within
+        # degenerate sets as the curve is.
+        return dataclasses.replace(
+            results,
+            sigma_c_on_shell_diag=_averaged_on_shell(
+                sigma_result.sigma_c_on_shell_diag, config, enk_dft),
+            sigma_c_on_shell_diag_raw=_averaged_on_shell(
+                sigma_result.sigma_c_on_shell_diag_unextrap, config, enk_dft))
     raw_omega_ry = sigma_result.sigma_c_omega_diag_unextrap_ry
     raw_at_dft_ev = sigma_result.sigma_c_at_dft_diag_unextrap_ev
     if raw_omega_ry is None or raw_at_dft_ev is None:
@@ -1235,6 +1245,27 @@ def _attach_raw_sigma(results, config, enk_dft, sigma_result):
     return dataclasses.replace(
         results, sigma_c_omega_diag_raw_ev=raw_omega_ev,
         sigma_c_diag_at_dft_raw_ry=raw_at_dft_ev / RYD_TO_EV)
+
+
+def _averaged_on_shell(diag, config, enk_dft):
+    """An on-shell eqp operand averaged within degenerate sets (None passes through).
+
+    The three complex members are averaged exactly as the grid's diagonal
+    curve is, so Z is formed from the averaged derivative as the grid formed
+    it from the averaged curve; the coverage mask is a per-state fact.
+    """
+    if diag is None or config.no_degen_averaging:
+        return diag
+    import dataclasses
+    energies = np.asarray(enk_dft, dtype=np.float64)
+    tol = float(config.degen_avg_tol_ry)
+
+    def avg(a):
+        return average_within_degenerate_sets(
+            np.asarray(a, dtype=np.complex128), energies_kn_ry=energies, tol_ry=tol)
+    return dataclasses.replace(diag, at_dft_ev=avg(diag.at_dft_ev),
+                               at_eval_ev=avg(diag.at_eval_ev),
+                               dsigma_at_eval=avg(diag.dsigma_at_eval))
 
 
 def _assemble_gw_results(
@@ -1384,11 +1415,13 @@ def _report_final_observables(
                                        _head_parts_ev)))
     if sigma_c_odd_at_dft_ev is not None:
         _odd_abs = np.abs(np.asarray(sigma_c_odd_at_dft_ev))
+        # An SC run on shell has no DFT-basis Sigma_c(E_DFT): the share is
+        # then of |Sigma_x| (named in the line below).
         _xc_diag_ev = (
             np.sum(np.asarray(sigma_lorentz_diag_skn_ry), axis=0) * RYD_TO_EV
             if sigma_lorentz_diag_skn_ry is not None else
             np.asarray(sig_x_diag_ry) * RYD_TO_EV
-            + np.asarray(sigma_c_at_dft_ev))
+            + (0.0 if sigma_c_at_dft_ev is None else np.asarray(sigma_c_at_dft_ev)))
         _xc_abs = np.abs(_xc_diag_ev)
         _max_share = (np.max(_odd_abs) / np.max(_xc_abs)
                       if np.max(_xc_abs) > 0.0 else np.max(_odd_abs))
@@ -1402,8 +1435,8 @@ def _report_final_observables(
             f"{_odd_prefix}: measured-broken-TR ordered residue; "
             f"max|sigC_odd|={np.max(_odd_abs):.6e} eV; "
             f"mean|sigC_odd|={np.mean(_odd_abs):.6e} eV; "
-            f"max-share-of-|Sigma_xc|={_max_share:.6e}; "
-            f"mean-share-of-|Sigma_xc|={_mean_share:.6e}")
+            f"max-share-of-|Sigma_{'xc' if sigma_c_at_dft_ev is not None or sigma_lorentz_diag_skn_ry is not None else 'x'}|={_max_share:.6e}; "
+            f"mean-share-of-|Sigma_{'xc' if sigma_c_at_dft_ev is not None or sigma_lorentz_diag_skn_ry is not None else 'x'}|={_mean_share:.6e}")
         if sigma_result.ppm_probe_hermiticity_residual is not None:
             _odd_line += (
                 f"; W(iomega_p)-Hermiticity="

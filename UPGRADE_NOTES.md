@@ -51,6 +51,39 @@ stay exact.
   `srlr_wedge_tables`). Restarts from earlier trees, and shared-pole
   restarts, keep `c1`. `exciton_bands --w-coarse-grid` accepts `c1` only.
 - **Results.** `c1` runs are unchanged. No deck change is needed.
+## 2026-10-16 — dynamic Σ_c is evaluated on shell; the ω grid is `sigma_omega_grid_debug`
+
+The τ sweep of every dynamic Σ (GN/HL-PPM, MPA, shared-pole, four-current
+sectors) now folds each σ(τ) into what its readers use, not into an ω grid:
+the QSGW pair Σ_mn(E_m), Σ_mn(E_n) and the band diagonals at E_eval and E_DFT
+with the exact dΣ/dω ([On-shell Σ_c](docs/theory/sigma-on-shell.md)). The
+Σ cube is depth 2 instead of n_ω, and the windows are planned on the states'
+own energies.
+
+Results that move:
+
+- The QSGW Σ and eqp0 lose the ω-grid interpolation error, because they read
+  Σ at the state's own energy.
+- eqp1's Z is the analytic derivative, not the ±0.5 eV central difference.
+- The band-extrapolation fit reads each state's Σ where H reads it.
+
+Off-grid states keep the `sigma_out_of_grid` and Σ(ω = 0) rules.
+
+Measured hsuite deltas: claim TBD.
+
+`sigma_mnk.h5` keeps `sigma_c_kij_ev`/`sigma_total_kij_ev`, now `(2, nk, nb,
+nb)`. It adds per-table diagonals and `sigma_evaluation = on_shell`, and has
+no `omega_ev`. The eqp receipt carries the on-shell operand in place of the
+C(ω) curve.
+
+Deck changes:
+
+- `qp_solver = eqp2` needs `sigma_omega_grid_debug = true`
+  (`GATE eqp2_needs_omega_grid`).
+- On shell, `sigma_freq_debug.dat`, `qp_omega0_ev`, an SC run's DFT-basis
+  `sigC(Edft)` and the MPA sweep checkpoint are omitted by name.
+- GN/HL-PPM's q→0 head is now the closed form MPA's is; its grid values are
+  unchanged.
 
 ## 2026-10-13 — FFI bundle: the LU factors are a declared output; both legs carry RUNPATH $ORIGIN
 

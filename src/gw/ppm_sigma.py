@@ -10,6 +10,7 @@ remains outside that store because it is frequency independent.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, NamedTuple
@@ -156,6 +157,249 @@ class BandDiagonalSlots:
         return self
 
 
+#: The on-shell evaluation tables, in slot order (:func:`on_shell_request`).
+#: ``pair``: E_eval as the QSGW build reads it (``sigma_out_of_grid``);
+#: ``eval0``/``dft0``: E_eval and E_DFT under the eqp readers' rule (an
+#: uncovered state reads Sigma(omega = 0)).  A table equal to an earlier one
+#: is not repeated; :meth:`OnShellRequest.slot` resolves the name.
+ON_SHELL_TABLES = ("pair", "eval0", "dft0")
+
+
+@dataclass(frozen=True)
+class OnShellRequest:
+    """Where an on-shell Sigma_c is evaluated: one energy per state and table.
+
+    ``tables_ry`` ``(n_table, nk, nb_logical)`` float64, Ry, measured from the
+    Sigma body's omega reference, full BZ, logical Sigma bands; table 0 is
+    ``pair``.  ``frequencies_ry`` is their sorted distinct union, the
+    planner's frequency list, and ``index`` each entry's position in it.
+    ``covered_kn`` marks the states whose E_eval lies inside the sampled
+    range ``omega_range_ev``; the derivative slot is read only there (Z = 1
+    elsewhere, as the grid's clamped probes gave).
+    """
+    tables_ry: np.ndarray
+    names: tuple
+    aliases: dict
+    frequencies_ry: np.ndarray
+    index: np.ndarray
+    covered_kn: np.ndarray
+    omega_range_ev: tuple
+
+    @property
+    def n_table(self) -> int:
+        return int(self.tables_ry.shape[0])
+
+    @property
+    def n_slot(self) -> int:
+        """One value slot per table, then dSigma/domega on ``pair``."""
+        return self.n_table + 1
+
+    def slot(self, name: str) -> int:
+        """The diagonal slot of table ``name`` (``"derivative"``: the last)."""
+        if name == "derivative":
+            return self.n_table
+        return int(self.aliases[name])
+
+    def table_ev(self, name: str) -> np.ndarray:
+        from common.units import RYD_TO_EV
+        return self.tables_ry[self.slot(name)] * RYD_TO_EV
+
+    def select_k(self, select_rows) -> "OnShellRequest":
+        """The request on the k rows ``select_rows`` keeps (a leading-axis selector)."""
+        def rows(a):
+            return np.moveaxis(np.asarray(select_rows(np.moveaxis(np.asarray(a), 1, 0))), 0, 1)
+        return replace(self, tables_ry=rows(self.tables_ry), index=rows(self.index),
+                       covered_kn=np.asarray(select_rows(np.asarray(self.covered_kn))))
+
+
+def on_shell_request(*, e_eval_rel_ev, e_dft_rel_ev, omega_range_ev, out_of_grid):
+    """The on-shell tables for one Sigma call (:class:`OnShellRequest`).
+
+    ``e_eval_rel_ev`` / ``e_dft_rel_ev`` ``(nk, nb)``: the energies the QSGW
+    ansatz evaluates Sigma at and the DFT energies, both measured from the
+    Sigma body's omega reference.  ``omega_range_ev`` is the sampled range
+    (``config.omega_grid_ev``: in the on-shell evaluation only its extent is
+    read).  The read rules are the grid readers' own:
+    :func:`gw.qsgw_utils.sigma_eval_omega` for ``pair`` (what H reads) and
+    the eqp readers' Sigma(omega = 0) rule for ``eval0``/``dft0``, so the
+    on-shell numbers are the grid's without its interpolation.
+    """
+    from common.units import RYD_TO_EV
+    from .qsgw_utils import omega_coverage, sigma_eval_omega
+    grid = np.asarray(omega_range_ev, dtype=np.float64)
+    e_eval = np.asarray(e_eval_rel_ev, dtype=np.float64)
+    e_dft = np.asarray(e_dft_rel_ev, dtype=np.float64)
+    if e_eval.shape != e_dft.shape or e_eval.ndim != 2:
+        raise ValueError(f"on_shell_request: E_eval {e_eval.shape} and E_DFT "
+                         f"{e_dft.shape} must be one (nk, nb) shape")
+    if not float(grid[0]) <= 0.0 <= float(grid[-1]):
+        raise ValueError("on_shell_request: omega = 0 must lie in the sampled range "
+                         f"[{float(grid[0]):.3f}, {float(grid[-1]):.3f}] eV")
+    pair = sigma_eval_omega(grid, e_eval, out_of_grid)[0]
+    covered = omega_coverage(grid, e_eval)[0]
+    candidates = (("pair", pair), ("eval0", np.where(covered, e_eval, 0.0)),
+                  ("dft0", np.where(omega_coverage(grid, e_dft)[0], e_dft, 0.0)))
+    tables, names, aliases = [], [], {}
+    for name, table in candidates:
+        for i, kept in enumerate(tables):
+            if np.array_equal(kept, table):
+                aliases[name] = i
+                break
+        else:
+            aliases[name] = len(tables)
+            tables.append(table)
+            names.append(name)
+    tables_ry = np.stack(tables) / RYD_TO_EV
+    frequencies, index = np.unique(tables_ry, return_inverse=True)
+    return OnShellRequest(
+        tables_ry=tables_ry, names=tuple(names), aliases=aliases,
+        frequencies_ry=frequencies,
+        index=np.asarray(index, dtype=np.int32).reshape(tables_ry.shape),
+        covered_kn=np.asarray(covered, dtype=bool),
+        omega_range_ev=(float(grid[0]), float(grid[-1])))
+
+
+@lru_cache(maxsize=8)
+def _slots_sum_fn(mesh_xy):
+    return jax.jit(lambda values, i: jnp.sum(values[i], axis=-1),
+                   out_shardings=NamedSharding(mesh_xy, P()))
+
+
+def slots_from_diagonal(diag, n_slot_cols):
+    """``(..., nb)`` -> the :func:`band_diagonal_slots` layout ``(..., nb, p_y)``.
+
+    Band ``n`` lives on the tile row block ``n // (nb / p_y)``, whose diagonal
+    tile writes it into column ``n // (nb / p_y)``; every other column is an
+    exact zero.  An elementwise select, so it fuses into its consumer.
+    """
+    nb = int(diag.shape[-1])
+    block = nb // int(n_slot_cols)
+    owner = (jnp.arange(nb)[:, None] // block) == jnp.arange(int(n_slot_cols))[None, :]
+    return jnp.where(owner, diag[..., :, None], jnp.zeros((), diag.dtype))
+
+
+def _diag_matrix(diag):
+    """``(..., nb)`` -> ``(..., nb, nb)`` with ``diag`` on the band diagonal (fused select)."""
+    nb = int(diag.shape[-1])
+    eye = jnp.arange(nb)[:, None] == jnp.arange(nb)[None, :]
+    return jnp.where(eye, diag[..., :, None], jnp.zeros((), diag.dtype))
+
+
+@lru_cache(maxsize=8)
+def _on_shell_head_fn(mesh_xy, with_pair):
+    """Add a band-diagonal head to an on-shell Sigma: the pair's diagonal and
+    every value slot get the head's value at their table, the derivative slot
+    its derivative.  ``head`` is ``(n_slot, nk, nb_carrier)`` replicated;
+    ``pair_head`` its pair-table row twice."""
+    spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+
+    def add(pair, slots, head, pair_head):
+        slots = slots + slots_from_diagonal(head, slots.shape[-1])
+        if pair is None:
+            return None, slots
+        return pair + _diag_matrix(pair_head), slots
+    return jax.jit(add, out_shardings=(spec if with_pair else None, spec))
+
+
+@dataclass(frozen=True)
+class OnShellSigma:
+    """Sigma_c on shell: the QSGW pair and the eqp readers' diagonals, no omega axis.
+
+    ``pair`` ``(2, nk, nb, nb)`` at ``P(None, None, 'x', 'y')``:
+    ``pair[0, k, m, n] = Sigma_mn(k, omega_km)`` and ``pair[1, k, m, n] =
+    Sigma_mn(k, omega_kn)`` on ``request``'s ``pair`` table; ``None`` for a
+    diagonal-only twin.  ``slots`` ``(n_slot, nk, nb, p_y)`` at the same spec
+    (:func:`band_diagonal_slots` layout): the band diagonal on each table, then
+    dSigma_nn/domega on ``pair``.  Every array is Ry (the derivative is
+    dimensionless) on the full BZ and the padded band carrier.
+    """
+    pair: "jax.Array | None"
+    slots: jax.Array
+    request: OnShellRequest
+    mesh_xy: Mesh
+
+    @property
+    def shape(self):
+        """The pair's shape (its slot axis leads, as an omega axis would)."""
+        return tuple(self.pair.shape) if self.pair is not None else tuple(self.slots.shape)
+
+    @property
+    def dtype(self):
+        return self.slots.dtype
+
+    def diagonal(self, name: str, band_axis=None, *, host=True):
+        """``(nk, nb_logical)`` on the host: table ``name``'s diagonal, or ``"derivative"``."""
+        value = _slots_sum_fn(self.mesh_xy)(self.slots, self.request.slot(name))
+        if not host:
+            return None
+        value = np.asarray(value)
+        if band_axis is not None:
+            from runtime.padding import strip_axis
+            value = np.asarray(strip_axis(value, band_axis, axis=-1))
+        return value
+
+    def z_factor(self, band_axis=None):
+        """``1/(1 - dRe Sigma_nn/domega)`` at E_eval, 1 off the sampled range."""
+        d = np.real(self.diagonal("derivative", band_axis))
+        return np.where(self.request.covered_kn, 1.0 / (1.0 - d), 1.0)
+
+    def with_head(self, head, band_axis=None):
+        """Add the band-diagonal q->0 head (``head_correction.HeadSigmaDiag``)."""
+        if head is None:
+            return self
+        from common.collectives import device_put_process_local
+        values, deriv = [], None
+        for name in self.request.names:
+            v, d = head.on_shell(self.request.tables_ry[self.request.slot(name)])
+            values.append(v)
+            if name == "pair":
+                deriv = d
+        rows = np.stack(values + [deriv])
+        carrier = int(self.slots.shape[2])
+        if rows.shape[-1] != carrier:
+            rows = np.pad(rows, ((0, 0), (0, 0), (0, carrier - rows.shape[-1])))
+        rep = NamedSharding(self.mesh_xy, P())
+        head_rows = device_put_process_local(np.asarray(rows, np.complex128), rep)
+        pair_head = device_put_process_local(
+            np.ascontiguousarray(np.broadcast_to(rows[:1], (2,) + rows.shape[1:])), rep)
+        pair, slots = _on_shell_head_fn(self.mesh_xy, self.pair is not None)(
+            self.pair, self.slots, head_rows, pair_head)
+        return replace(self, pair=pair, slots=slots)
+
+    def diagonal_only(self) -> "OnShellSigma":
+        return replace(self, pair=None)
+
+    def select_k(self, select_rows) -> "OnShellSigma":
+        """On the k rows ``select_rows`` keeps (a leading-axis selector)."""
+        def rows(a):
+            return None if a is None else jnp.moveaxis(
+                select_rows(jnp.moveaxis(a, 1, 0)), 0, 1)
+        return replace(self, pair=rows(self.pair), slots=rows(self.slots),
+                       request=self.request.select_k(select_rows))
+
+    def __add__(self, other: "OnShellSigma") -> "OnShellSigma":
+        """The sum of two evaluations of one request (the four-current classes)."""
+        return add_on_shell_term(self, other)
+
+    def __sub__(self, other: "OnShellSigma") -> "OnShellSigma":
+        """The difference of two evaluations of one request (the ordered-residue twin)."""
+        if other.request is not self.request:
+            raise ValueError("OnShellSigma: a difference needs one request")
+        sub = _on_shell_difference_fn(self.mesh_xy)
+        return replace(self, slots=sub(self.slots, other.slots),
+                       pair=None if self.pair is None else sub(self.pair, other.pair))
+
+    def block_until_ready(self):
+        jax.block_until_ready((self.pair, self.slots))
+        return self
+
+
+@lru_cache(maxsize=8)
+def _on_shell_difference_fn(mesh_xy):
+    return jax.jit(lambda a, b: a - b,
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+
+
 @dataclass(frozen=True)
 class BandCountCube:
     """The cumulative band-count points of Sigma_c(omega), served one at a time.
@@ -185,14 +429,23 @@ class BandCountCube:
     #: Added to every point: ``(nk, nb, nb)``, the PPM static-limit term (the
     #: same at every ω), or ``(n_omega, nk, nb, nb)`` on the full BZ, the
     #: four-current classes and constant that are not extrapolated
-    #: (``gw.mpa.sector_sigma.compute_sector_sigma``).
-    term: jax.Array | None = None
+    #: (``gw.mpa.sector_sigma.compute_sector_sigma``); on shell, an
+    #: :class:`OnShellSigma` of those classes.
+    term: "jax.Array | OnShellSigma | None" = None
+    #: The on-shell evaluation (:class:`OnShellRequest`), or None (the grid).
+    #: On shell every matrix carries the two pair slots, ``diagonals`` is
+    #: empty and ``slot_diagonals`` holds the ``(n_slot, n_wedge_k, nb, p_y)``
+    #: diagonal slots of EVERY count (the derivative and the eqp tables of
+    #: the extrapolated Sigma combine all of them).
+    on_shell: "OnShellRequest | None" = None
+    slot_diagonals: list = dataclasses.field(default_factory=list)
 
     @property
     def shape(self):
         n_omega, _, nb_i, nb_j = self.matrices[0].shape
-        return (len(self.matrices) + len(self.diagonals), n_omega,
-                int(self.nk), nb_i, nb_j)
+        n_count = (len(self.slot_diagonals) if self.on_shell is not None
+                   else len(self.matrices) + len(self.diagonals))
+        return (n_count, n_omega, int(self.nk), nb_i, nb_j)
 
     def diagonal_only(self, i: int) -> bool:
         return 0 < int(i) < self.shape[0] - 1
@@ -206,12 +459,23 @@ class BandCountCube:
                 f"BandCountCube: count {i} is kept on its band diagonal "
                 f"only; read it with diagonal({i})")
         value = self.unfold(self._matrix(i))
+        if self.on_shell is not None:
+            return self._on_shell_point(i, value)
         if self.term is None:
             return value
         return _add_static_term_fn(value.sharding, self.fresh)(value, self.term)
 
+    def _on_shell_point(self, i: int, pair):
+        """Count ``i`` on the full BZ as an :class:`OnShellSigma` (``pair`` None: its diagonals)."""
+        slots = self.unfold_rows(self.slot_diagonals[int(i)])
+        point = OnShellSigma(pair=pair, slots=slots, request=self.on_shell,
+                             mesh_xy=self.mesh_xy)
+        return point if self.term is None else add_on_shell_term(point, self.term)
+
     def diagonal(self, i: int) -> "BandDiagonalSlots":
         """The band diagonal of count ``i`` on the full BZ, without its cube."""
+        if self.on_shell is not None:
+            return self._on_shell_point(i, None)
         slots = (self.diagonals[int(i) - 1] if self.diagonal_only(i) else
                  _diagonal_of_cube_fn(self.mesh_xy)(self._matrix(i)))
         slots = self.unfold_rows(slots)
@@ -220,7 +484,7 @@ class BandCountCube:
         return BandDiagonalSlots(slots, self.mesh_xy)
 
     def block_until_ready(self):
-        jax.block_until_ready((self.matrices, self.diagonals))
+        jax.block_until_ready((self.matrices, self.diagonals, self.slot_diagonals))
         return self
 
     def release(self):
@@ -228,6 +492,7 @@ class BandCountCube:
         (without symmetry they are the points themselves)."""
         self.matrices.clear()
         self.diagonals.clear()
+        self.slot_diagonals.clear()
 
     def __sub__(self, other):
         if self.term is not None or other.term is not None:
@@ -236,7 +501,46 @@ class BandCountCube:
         return replace(
             self,
             matrices=[a - b for a, b in zip(self.matrices, other.matrices)],
-            diagonals=[a - b for a, b in zip(self.diagonals, other.diagonals)])
+            diagonals=[a - b for a, b in zip(self.diagonals, other.diagonals)],
+            slot_diagonals=[a - b for a, b in zip(self.slot_diagonals,
+                                                  other.slot_diagonals)])
+
+
+@lru_cache(maxsize=8)
+def _on_shell_static_term_fn(mesh_xy, n_table):
+    """An omega-independent ``(nk, nb, nb)`` term on an on-shell Sigma: both pair
+    slots and every value slot take it, the derivative slot nothing."""
+    term_slots = band_diagonal_slots(mesh_xy, 3)
+    spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+
+    def add(pair, slots, term):
+        d = term_slots(term)[None]
+        slots = slots + jnp.concatenate(
+            [jnp.broadcast_to(d, (n_table,) + d.shape[1:]),
+             jnp.zeros_like(d)], axis=0)
+        return (None if pair is None else pair + term[None]), slots
+    return jax.jit(add, out_shardings=(spec, spec))
+
+
+@lru_cache(maxsize=8)
+def _on_shell_sum_fn(mesh_xy):
+    spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    return jax.jit(lambda a, b: None if a is None else a + b, out_shardings=spec)
+
+
+def add_on_shell_term(point: OnShellSigma, term) -> OnShellSigma:
+    """``point + term``: a static ``(nk, nb, nb)`` term or an on-shell one."""
+    if isinstance(term, OnShellSigma):
+        if term.request is not point.request:
+            raise ValueError("on-shell term: evaluated on a different request")
+        add = _on_shell_sum_fn(point.mesh_xy)
+        return replace(point, slots=add(point.slots, term.slots),
+                       pair=(None if point.pair is None else add(point.pair, term.pair)))
+    if term.ndim != 3:
+        raise ValueError(f"on-shell term: a static (nk, nb, nb) term, got {term.shape}")
+    pair, slots = _on_shell_static_term_fn(point.mesh_xy, point.request.n_table)(
+        point.pair, point.slots, term)
+    return replace(point, pair=pair, slots=slots)
 
 
 @lru_cache(maxsize=8)
@@ -920,6 +1224,7 @@ def compute_sigma_c_ppm_omega_grid(
     occupation_state=None,
     plan: 'BandBracketPlan | None' = None,
     fixed_quadrature_session=None,
+    on_shell_for=None,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
@@ -934,6 +1239,10 @@ def compute_sigma_c_ppm_omega_grid(
     evaluated by the shared spatial kernel and returned as cumulative band
     counts.  The optional static-COHSEX invalid-pole term remains separate
     from the dynamic store and is added exactly once to each cumulative count.
+
+    ``on_shell_for(efermi_ry)`` returns the on-shell request at this body's
+    omega reference (``dynamic_sigma.sigma_on_shell_request``), or None for
+    the grid; the reference is the bundle's VBM/midgap resolved here.
     """
     from .mpa.sigma import MemoryPoleSource, compute_sigma_c_mpa_omega_grid
 
@@ -1048,6 +1357,13 @@ def compute_sigma_c_ppm_omega_grid(
         f"  {ansatz_name} fit -> in-memory one-pole source (no store); "
         f"invalid policy={invalid_mode}")
 
+    efermi_ry = float(jax.device_get(state.efermi))
+    request = None if on_shell_for is None else on_shell_for(efermi_ry)
+    if request is not None:
+        # The windows are planned on the states' own energies.
+        omega_req = request.frequencies_ry
+        print_fn(f"  Sigma_c on shell: {request.n_table} energy table(s) "
+                 f"{request.names}, {omega_req.size} distinct frequencies")
     branches = branches_for_omega_grid(
         omega_req,
         E_cond=state.E_cond,
@@ -1057,7 +1373,8 @@ def compute_sigma_c_ppm_omega_grid(
     result = compute_sigma_c_mpa_omega_grid(
         wfns, poles, meta, mesh_xy,
         omega_grid_ry=omega_req,
-        efermi_ry=float(jax.device_get(state.efermi)),
+        efermi_ry=efermi_ry,
+        on_shell_request=request,
         regularization_width_ry=regularization_width_ry,
         edge_factor=float(sigma_cfg.window_edge_factor),
         quadrature_eps=float(sigma_cfg.quadrature_eps),
@@ -1090,4 +1407,4 @@ def compute_sigma_c_ppm_omega_grid(
         band_counts=result.band_counts,
         static_coh_at_counts=static_coh_at_counts,
         odd_even_residue_ratio=ppm.odd_even_residue_ratio,
-        efermi_ry=float(jax.device_get(state.efermi)))
+        efermi_ry=efermi_ry)

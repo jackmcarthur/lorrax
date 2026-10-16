@@ -1760,6 +1760,15 @@ _DEFAULTS = {
     "sigma_freq_debug_output": False,
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
     "sigma_lorentz_debug_output": False,
+    # Sigma_c on the omega GRID, ``(n_omega, nk, nb, nb)``, instead of on
+    # shell.  Default false: a dynamic Sigma folds only the QSGW pair
+    # Sigma_mn(E_m), Sigma_mn(E_n) and the eqp readers' band diagonals
+    # (value, exact dSigma/domega) at the map's energies (gw.ppm_accumulators,
+    # docs/theory/sigma-on-shell.md).  True keeps the grid cube for the
+    # readers only it serves: fixed-Sigma evSC (qp_solver = eqp2), the
+    # sigma_mnk.h5 omega cube, the freq-debug tables, qp_omega0_ev and the
+    # DFT-basis Sigma_c(E_DFT) of an SC run.
+    "sigma_omega_grid_debug": False,
     # QP wavefunction file dump.  Default True: end-of-run write of
     # ``WFN_qp.h5`` (BGW format, ψ rotated by the final U, energies
     # replaced by E_QP).  Fires for both one-shot and SC; set False to
@@ -2673,6 +2682,7 @@ def _input_storage(
         sigma_freq_debug_output=bool(params["sigma_freq_debug_output"]),
         sigma_freq_debug_file=str(params["sigma_freq_debug_file"]),
         sigma_lorentz_debug_output=bool(params["sigma_lorentz_debug_output"]),
+        sigma_omega_grid_debug=bool(params["sigma_omega_grid_debug"]),
         write_wfn_h5=bool(params["write_wfn_h5"]),
         write_w=bool(params["write_w"]),
     )
@@ -4452,6 +4462,9 @@ class DebugConfig:
     sigma_freq_debug_output: bool
     sigma_freq_debug_file: str
     sigma_lorentz_debug_output: bool
+    #: Sigma_c on the omega grid (``sigma_omega_grid_debug``); False is the
+    #: on-shell evaluation (``gw.ppm_sigma.OnShellSigma``).
+    sigma_omega_grid_debug: bool
     write_wfn_h5: bool
     #: Dump the WHOLE shared-pole Wc frequency sample bank (every fixed
     #: sample, plus ``dWc_ds``/M1/M3) to ``<map>_w.h5``.  Debugging only.

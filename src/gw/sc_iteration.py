@@ -1761,6 +1761,13 @@ def run_fixed_sigma_evsc(
         assert_omega_grid_covers, build_qsgw_sigma_xc, omega_coverage)
 
     sigma_c_dft = sigma_result.sigma_c_omega_kij_ry
+    if sigma_c_dft is None and sigma_result.sigma_c_on_shell is not None:
+        raise ValueError(
+            "GATE eqp2_needs_omega_grid: fixed-Sigma evSC re-reads one Sigma_c(omega) "
+            "at moving energies in a rotating basis, and this run's Sigma was "
+            "evaluated on shell (at its own energies only).\n"
+            "  want: sigma_omega_grid_debug = true with qp_solver = eqp2\n"
+            "  doc:  docs/theory/sigma-on-shell.md")
     sigma_x_dft = sigma_result.sigma_x_kij_ry
     v_h_dft = sigma_result.v_h_kij_ry
     omega_ev = sigma_result.omega_grid_ev
@@ -4886,6 +4893,8 @@ def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
     sigma = state_out.outputs.sigma_result
     cube, omega = sigma.sigma_c_omega_kij_ry, sigma.omega_grid_ev
     if cube is None or omega is None:
+        # On shell there is no Sigma at the grid edges to compare with
+        # Sigma(0): the edge-ambiguity census is a grid diagnostic.
         return 0, ""
     from .qsgw_utils import extract_sigma_diag_replicated, sigma_grid_edge_ambiguity
     diag = np.asarray(extract_sigma_diag_replicated(cube, inputs.mesh_xy),
@@ -4924,6 +4933,9 @@ def _sc_z_factors(
     Static modes have zero frequency derivative and therefore return one.
     """
     sigma = state_out.outputs.sigma_result
+    if sigma.sigma_c_on_shell_diag is not None:
+        # On shell: the exact dSigma/domega at the map's evaluation energies.
+        return np.asarray(sigma.sigma_c_on_shell_diag.z_factor(), dtype=np.float64)
     cube = sigma.sigma_c_omega_kij_ry
     omega = sigma.omega_grid_ev
     if cube is None or omega is None:
@@ -7410,6 +7422,12 @@ def run_sc_driver(
         # eqp report above is SC's raw-vs-tail record).
         sigma_c_omega_diag_unextrap_ry=None,
         sigma_c_at_dft_diag_unextrap_ev=None,
+        # The on-shell Sigma is tied to the QP basis's band indices (no
+        # rotation acts on it): the DFT-basis output carries none, and its
+        # DFT-basis Sigma_c(E_DFT) is the grid's alone (named at write).
+        sigma_c_on_shell=None,
+        sigma_c_on_shell_diag=None,
+        sigma_c_on_shell_diag_unextrap=None,
         sigma_omega_h5_path=sigma_omega_h5_path,
         # ONE omega reference, fifth site, ACTUALLY ON THE WRITER'S PATH.
         # This line used to read ``float(wfn.efermi) * RYD_TO_EV``
@@ -7560,7 +7578,8 @@ def dump_sigma_omega_h5_final(
     """
     sigma_result = (
         state.outputs.sigma_result if state.outputs is not None else None)
-    if sigma_result is None or sigma_result.sigma_c_omega_kij_ry is None:
+    if sigma_result is None or (sigma_result.sigma_c_omega_kij_ry is None
+                                and sigma_result.sigma_c_on_shell is None):
         return None
     if exact_hartree_dft is not None:
         if sigma_basis_U is None:
@@ -7613,7 +7632,8 @@ def dump_sigma_omega_h5_final(
     star_already_selected = (
         sigma_result.kset == SIGMA_KSET_STAR_WEDGE)
     path = write_sigma_omega(
-        sigma_result.sigma_c_omega_kij_ry,
+        (sigma_result.sigma_c_omega_kij_ry if sigma_result.sigma_c_omega_kij_ry is not None
+         else sigma_result.sigma_c_on_shell),
         sig_x=sigma_result.sigma_x_kij_ry,
         sig_h=sigma_result.v_h_kij_ry,
         v_h_scalar=sigma_result.v_h_scalar_kij_ry,

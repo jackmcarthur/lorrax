@@ -41,6 +41,7 @@ from .band_extrapolation import (
     pooled_state_mask,
     sc_tolerance_ruling,
 )
+from .dynamic_sigma import sigma_on_shell_request
 from .gw_config import LorraxConfig
 from .head_correction import HeadResolver
 from .ppm_sigma import (
@@ -159,8 +160,7 @@ def _compute_analytic_head_diag(
     reports/sigma_ppm_tighten_2026-07-04).  Injection is deliberately left
     to the ansatz-neutral dynamic-Sigma finalizer.
     """
-    from .head_correction import (compute_ppm_head_sigma_diag,
-                                  on_shell_occupied_head_sigma_ry)
+    from .head_correction import HeadSigmaDiag, on_shell_occupied_head_sigma_ry
 
     occupations = None
     if iteration_head is None:
@@ -188,23 +188,29 @@ def _compute_analytic_head_diag(
         efermi_ry = float(body_efermi_ry)
     n_occ = min(meta.nelec, enk_full_np.shape[1])
 
-    # The head is band-diagonal; compute that lossless (nω, nk, nb)
-    # representation once.  The neutral injection seam avoids a dense head
-    # entirely for the sharded layout.
-    head_sigma_diag_ry = compute_ppm_head_sigma_diag(
-        head_gn,
+    # The head is band-diagonal and kept as its closed form, the one MPA's
+    # head is (``HeadSigmaDiag``): the grid finalize evaluates its rows where
+    # it adds them, the on-shell one its value and derivative at the
+    # evaluation energies.  Its cells are ``compute_ppm_head_sigma_diag``'s
+    # arithmetic (one real pole Omega_h - i*eta, residue R_h, the same
+    # occupation step), so the grid numbers are unchanged.
+    if occupations is None:
+        occupations = np.zeros((enk_full_np.shape[1],), dtype=np.float64)
+        occupations[: max(0, min(int(n_occ), enk_full_np.shape[1]))] = 1.0
+    live = abs(head_gn.R_h) >= 1.0e-30 and abs(head_gn.omega_h) >= 1.0e-30
+    head_sigma_diag_ry = HeadSigmaDiag.build(
         omega_grid_ry=np.asarray(config.omega_grid_ry, dtype=np.float64),
-        enk_ry=enk_full_np,
-        efermi_ry=efermi_ry,
-        n_occ=n_occ,
-        occupations=occupations,
-        cell_volume=float(meta.cell_volume),
-        nk_tot=int(meta.nk_tot),
-    )
+        enk_ry=enk_full_np, efermi_ry=efermi_ry, occupations=occupations,
+        poles_ry=np.asarray([head_gn.omega_h - 1j * 1.0e-6] if live else [], np.complex128),
+        residues_ry=np.asarray([head_gn.R_h] if live else [], np.float64),
+        cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
 
     # max|dense| == max|diag| (off-diagonals are exact zeros; |diag| >= 0),
-    # so the diagnostic is unchanged on every path.
-    head_max_ev = float(np.max(np.abs(head_sigma_diag_ry))) * RYD_TO_EV
+    # so the diagnostic is unchanged on every path.  Band blocks bound the
+    # host temporary.
+    nb_head = int(enk_full_np.shape[1])
+    head_max_ev = max((float(np.max(np.abs(head_sigma_diag_ry.band_rows(b, min(b + 64, nb_head)))))
+                       for b in range(0, nb_head, 64)), default=0.0) * RYD_TO_EV
     # Derived from the SAME kernel that built the tensor above, not from a
     # second spelling of its closed form: the hand-written ``-R_h/(...)``
     # that used to live here had drifted in sign against both the kernel
@@ -220,7 +226,7 @@ def _compute_analytic_head_diag(
         f"  Σ_c head shift: max|Σ^head_diag| = {head_max_ev:.4f} eV "
         f"(on-shell occ band → {on_shell_occ:+.4f} eV)"
     )
-    return np.asarray(head_sigma_diag_ry)
+    return head_sigma_diag_ry
 
 
 def _combine_extrapolation(first, rest, w):
@@ -308,6 +314,8 @@ def _extrapolated_point(cube, weights, top=None):
         raise ValueError(
             f"_extrapolated_point: band counts {between} carry weight, but "
             f"the sweep keeps only their band diagonal (BandCountCube)")
+    if cube.on_shell is not None:
+        return _on_shell_combination(cube, live, w[live])
     if cube.fresh:
         return _streamed_combination(cube, live, w[live])
     first = cube.point(live[0])
@@ -318,6 +326,37 @@ def _extrapolated_point(cube, weights, top=None):
     # it is then read, not taken.
     return _extrapolation_kernel(first.sharding, first is not top)(
         first, rest, w[live])
+
+
+def _on_shell_combination(cube, live, w):
+    """``sum_b w_b * S(N_b)`` of an on-shell cube: its pair and its slots.
+
+    The pair is combined by :func:`_combine_extrapolation`, the grid's
+    arithmetic, with the two pair slots in the omega axis's place; each
+    diagonal slot of state ``(k, n)`` takes ``w_b[k, n]``, the pair rule's
+    ``½(w_n + w_n)`` on the diagonal.  Every count's slots are kept
+    (``BandCountCube.slot_diagonals``), so the derivative and the eqp tables
+    of the extrapolated Sigma are combinations too.
+    """
+    from .ppm_sigma import OnShellSigma
+    points = [cube.point(b) for b in live]
+    pair = _extrapolation_kernel(points[0].pair.sharding, cube.fresh)(
+        points[0].pair, tuple(p.pair for p in points[1:]), w)
+    slots = _slot_combination_fn(points[0].slots.sharding)(
+        tuple(p.slots for p in points), jnp.asarray(w))
+    return OnShellSigma(pair=pair, slots=slots, request=points[0].request,
+                        mesh_xy=points[0].mesh_xy)
+
+
+@lru_cache(maxsize=8)
+def _slot_combination_fn(sharding):
+    def combine(slots, w):
+        acc = None
+        for b, a in enumerate(slots):
+            term = a * w[b][None, :, :, None]
+            acc = term if acc is None else acc + term
+        return acc
+    return jax.jit(combine, out_shardings=sharding)
 
 
 #: omega slabs of one streamed combination (a slab's unfolded counts are
@@ -410,7 +449,13 @@ def _report_band_extrapolation(
             else np.asarray(head_sigma_diag_w_kn_ry))
 
     points = []
-    for i in range(cube.shape[0]):
+    if cube.on_shell is not None:
+        # On shell the fit reads each state where H reads it: the pair
+        # table's diagonal (``sigma_out_of_grid``), the head added there.
+        for i in range(cube.shape[0]):
+            points.append(cube.diagonal(i).with_head(head).diagonal(
+                "pair", sigma_omega.band_axis) * RYD_TO_EV)
+    for i in (range(cube.shape[0]) if cube.on_shell is None else ()):
         # The cube lives on the padded band carrier; the head, the DFT
         # energies and the fit are logical.  The reader strips at this
         # consumer boundary and adds the head at the two omega slots each
@@ -805,6 +850,11 @@ def compute_ppm_sigma_pipeline(
                 fixed_quadrature_session=(
                     None if fixed_quadrature_session is None else
                     fixed_quadrature_session.setdefault("primary", {})),
+                on_shell_for=(
+                    None if bool(config.debug.sigma_omega_grid_debug) else
+                    lambda efermi_ry: sigma_on_shell_request(
+                        config, e_eval_ev=e_qp_ev, wfn=wfn, sym=sym, meta=meta,
+                        band_slices=band_slices, efermi_ry=efermi_ry)),
                 print_fn=print_fn,
             )
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries

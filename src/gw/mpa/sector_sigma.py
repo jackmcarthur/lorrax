@@ -855,7 +855,10 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     # Static band axes use the same carrier as dynamic Sigma; pad only through
     # the existing semantic band-axis owner before broadcasting in omega.
     constant=pad_square(constant,total.band_axis,axes=(1,2))
-    result=replace(total,sigma_c_kij=total.sigma_c_kij+constant[None])
+    from gw.ppm_sigma import OnShellSigma, add_on_shell_term
+    result=replace(total,sigma_c_kij=(
+        add_on_shell_term(total.sigma_c_kij,constant)
+        if isinstance(total.sigma_c_kij,OnShellSigma) else total.sigma_c_kij+constant[None]))
     if counts is not None:
         # TT, CT, TC and W∞ − V enter every CC count alike.
         result=replace(counts,sigma_c_kij=replace(counts.sigma_c_kij,term=result.sigma_c_kij))

@@ -1299,6 +1299,7 @@ def _integrate_sigma_batches(
     tau_kernel_factory=None,
     q_wedge=None,
     tau_capacity=None,
+    on_shell_request=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
@@ -1313,7 +1314,13 @@ def _integrate_sigma_batches(
     ``q_wedge``: the slabs are on the q wedge (GN-PPM, owner 2026-09-25);
     W(τ) is built on the wedge and read by the Sigma convolution through the
     wedge's unfold tables (mathdx mode 9), whose device tables ride the
-    residue argument."""
+    residue argument.
+
+    ``on_shell_request`` (``gw.ppm_sigma.OnShellRequest``): fold only the on-shell
+    pair and diagonal slots (``gw.ppm_accumulators``); ``omega_grid_ry`` is
+    then the request's frequency list, which the windows were planned on.
+    The result is an ``OnShellSigma`` (no brackets) or an on-shell
+    ``BandCountCube``."""
     # Band fences are profiling boundaries (see ``_unfenced``).  This executor
     # is shared with the incumbent elementwise-MPA route (``w_synthesis is
     # None``), which is never fenced whatever a harness has installed.
@@ -1364,9 +1371,20 @@ def _integrate_sigma_batches(
             shape = ((shape,) * (len(brackets) - n_between),
                      ((omega.size, spatial_shape[0], sigma_axis.carrier,
                        int(mesh_xy.shape["y"])),) * n_between)
+        tables = None
+        if on_shell_request is not None:
+            if not np.array_equal(omega, np.asarray(on_shell_request.frequencies_ry, np.float64)):
+                raise ValueError("on-shell Sigma: the windows were planned on a frequency "
+                                 "list other than the request's")
+            tables = _on_shell_parent_tables(on_shell_request, k_unfold_plan, sigma_axis, mesh_xy)
+            n_counts = len(brackets) if bracketed else 1
+            reduce = _on_shell_reduce(mesh_xy, len(brackets) if bracketed else None)
+            shape = (((2, *spatial_shape),) * (2 if n_counts > 1 else 1),
+                     ((tables.n_slot, spatial_shape[0], sigma_axis.carrier,
+                       int(mesh_xy.shape["y"])),) * n_counts)
         accumulator = DeviceOmegaAccumulator(
             omega, shape=shape, sharding=output_sharding, omega_axis=0,
-            reduce=reduce)
+            reduce=reduce, on_shell=tables)
         kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
         if tau_kernel_factory is not None:
@@ -1558,18 +1576,30 @@ def _integrate_sigma_batches(
     fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
         sigma = accumulator.finalize()
-        if bracketed:
+        if bracketed or on_shell_request is not None:
             # The counts stay on the wedge; each is unfolded when it is read.
             matrices, diagonals = sigma
             sym = k_unfold_plan.sym
             full = _wedge_is_full_bz(sym)
+            unfold = ((lambda value: value) if full else
+                      _on_shell_unfold_fn(sym, output_sharding) if on_shell_request is not None else
+                      _unfold_sigma_cube_fn(sym, 1, output_sharding))
             sigma = BandCountCube(
-                matrices=list(matrices), diagonals=list(diagonals),
-                unfold=((lambda value: value) if full else
-                        _unfold_sigma_cube_fn(sym, 1, output_sharding)),
+                matrices=list(matrices),
+                diagonals=[] if on_shell_request is not None else list(diagonals),
+                unfold=unfold,
                 unfold_rows=((lambda slots: slots) if full else
                              _band_count_rows_fn(sym, mesh_xy)),
-                nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy)
+                nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy,
+                on_shell=on_shell_request,
+                slot_diagonals=list(diagonals) if on_shell_request is not None else [])
+            if not bracketed:
+                # One count: the on-shell Sigma itself.
+                sigma = sigma.point(0)
+        else:
+            sigma = _unfold_sigma_cube(
+                sigma, k_unfold_plan.sym, k_axis=1, sharding=output_sharding)
+        if bracketed:
             if band_counts is None:
                 band_counts = tuple(
                     int(s.nb_sigma_sum) if hi is None else int(hi)
@@ -1579,9 +1609,6 @@ def _integrate_sigma_batches(
             if len(band_counts) != len(brackets):
                 raise ValueError(
                     "MPA Sigma band_counts must align with band brackets")
-        else:
-            sigma = _unfold_sigma_cube(
-                sigma, k_unfold_plan.sym, k_axis=1, sharding=output_sharding)
         # Format read by the sandbox parser (tools/parse_lorrax_sigma_run.py);
         # every node now runs inside its window's executable, so none is
         # left undispatched.
@@ -1676,6 +1703,91 @@ def _band_count_rows_fn(sym, mesh_xy):
     rows = np.asarray(star_tables_of(sym)[0], dtype=np.int32)
     return jax.jit(lambda slots: slots[:, jnp.asarray(rows)],
                    out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+
+
+@lru_cache(maxsize=8)
+def _on_shell_reduce(mesh_xy, n_brackets):
+    """``sigma(t)`` -> the on-shell fold's ``(matrices, diagonals)``.
+
+    The matrices are the cumulative first and last counts (one with no
+    brackets, ``n_brackets`` None), the diagonals those of EVERY cumulative
+    count (``(k, nb, p_y)``, :func:`gw.ppm_sigma.band_diagonal_slots`), whose
+    slots the extrapolation combines.
+    """
+    from gw.ppm_sigma import band_diagonal_slots
+    if int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
+        raise ValueError(
+            "GATE on_shell_square_mesh: the on-shell Sigma keeps band diagonals in "
+            "place, which needs a square processor mesh; run sigma_omega_grid_debug "
+            "on this mesh")
+    diag_slots = band_diagonal_slots(mesh_xy, 3)
+
+    def reduce(sigma):
+        if n_brackets is None:
+            return (sigma,), (diag_slots(sigma),)
+        running = sigma[0]
+        matrices, diagonals = [running], [diag_slots(running)]
+        for b in range(1, n_brackets):
+            running = running + sigma[b]
+            diagonals.append(diag_slots(running))
+        if n_brackets > 1:
+            matrices.append(running)
+        return tuple(matrices), tuple(diagonals)
+
+    return reduce
+
+
+@lru_cache(maxsize=8)
+def _on_shell_unfold_fn(sym, sharding):
+    """FILE wedge -> full BZ for the on-shell pair ``(2, k, nb, nb)``.
+
+    The band operator's transport (:func:`_unfold_sigma_cube_fn`) transposes
+    on an antiunitary row: ``Sigma(k') = Sigma(k)^T``.  The pair's slot 0
+    carries the frequency of the ROW state and slot 1 that of the COLUMN
+    state, and a transpose exchanges them, so there
+    ``pair[0](k') = pair[1](k)^T``: an antiunitary row reads the slot-swapped
+    pair.  A diagonal is unchanged (``_band_count_rows_fn``).
+    """
+    from symmetry_maps import star_tables_of
+    base = _unfold_sigma_cube_fn(sym, 1, sharding)
+    _, sidx, n_spatial = star_tables_of(sym)
+    anti = np.asarray(sidx) >= int(n_spatial)
+    if not np.any(anti):
+        return base
+    anti = jnp.asarray(anti)
+
+    def unfold(pair):
+        return jnp.where(anti[None, :, None, None], base(pair[::-1]), base(pair))
+    return jax.jit(unfold, out_shardings=sharding)
+
+
+def _on_shell_parent_tables(request, k_unfold_plan, sigma_axis, mesh_xy):
+    """The request's tables on the parent k rows and the padded band carrier.
+
+    ``GATE on_shell_star_invariant``: the per-state energies must be the same
+    at every k of a star, since the wedge Sigma is evaluated at its parent's
+    energies and transported to the star.  A QP spectrum is (the SC loop's
+    states are symmetric); a violation would put one star partner's Sigma at
+    another's energy.
+    """
+    from gw.ppm_accumulators import OnShellTables
+    full = np.asarray(request.tables_ry, np.float64)
+    parent = np.asarray(k_unfold_plan.parent_rows(full, axis=1))
+    irr = np.asarray(k_unfold_plan.irr_idx)
+    drift = float(np.max(np.abs(parent[:, irr] - full), initial=0.0))
+    if drift > 1.0e-9:
+        raise ValueError(
+            f"GATE on_shell_star_invariant: the on-shell energies differ by {drift:.3e} Ry "
+            "between k points of one star")
+    index = np.asarray(k_unfold_plan.parent_rows(np.asarray(request.index), axis=1))
+    pad = int(sigma_axis.carrier) - int(parent.shape[-1])
+    if pad < 0:
+        raise ValueError(f"on-shell tables carry {parent.shape[-1]} bands, the Sigma "
+                         f"carrier {sigma_axis.carrier}")
+    parent = np.pad(parent, ((0, 0), (0, 0), (0, pad)))
+    index = np.pad(index.astype(np.int32), ((0, 0), (0, 0), (0, pad)), constant_values=-1)
+    omega = device_put_process_local(parent, NamedSharding(mesh_xy, P()))
+    return OnShellTables(omega=omega, index=index, omega_host=parent)
 
 
 def _attach_ordered_odd_sigma(total, even):
@@ -1803,6 +1915,7 @@ def integrate_sigma_store(
     odd_residue_off=False,
     tau_capacity=None,
     tau_kernel_factory=None,
+    on_shell_request=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -1846,7 +1959,8 @@ def integrate_sigma_store(
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
             q_wedge=q_wedge, tau_capacity=tau_capacity,
-            tau_kernel_factory=tau_kernel_factory, print_fn=print_fn)
+            tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
+            print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -1937,6 +2051,7 @@ def compute_sigma_c_mpa_omega_grid(
     omega_group=None,
     group_fixed=None,
     linalg=None,
+    on_shell_request=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1945,6 +2060,10 @@ def compute_sigma_c_mpa_omega_grid(
     per-frequency broadening and window labels (``sigma_box_plan.plan_sigma_windows``).
     ``linalg``: the deck's resolved dense layout, which places a shared-pole
     model's W(τ) synthesis (:func:`_shared_pole_memory_schedule`).
+    ``on_shell_request`` (``gw.ppm_sigma.OnShellRequest``): evaluate Sigma_c on shell
+    only; ``omega_grid_ry`` must then be the request's ``frequencies_ry``
+    (the planner's frequency list, on which ``omega_eta_ry``/``omega_group``
+    are labelled).  None is the grid (``sigma_omega_grid_debug``).
 
     ``occupation_state`` (duck-typed ``gw.efermi.OccupationState``): None is
     the incumbent insulating semantics, bit-exact.  With a state, the causal
@@ -1975,6 +2094,10 @@ def compute_sigma_c_mpa_omega_grid(
     """
     if sigma_w_model not in ("mpa", "shared_pole"):
         raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
+    if on_shell_request is not None and not np.array_equal(
+            np.asarray(omega_grid_ry, np.float64), on_shell_request.frequencies_ry):
+        raise ValueError("compute_sigma_c_mpa_omega_grid: an on-shell call plans its windows "
+                         "on the request's frequency list (omega_grid_ry)")
     shared_pole = sigma_w_model == "shared_pole"
     if shared_pole and tau_kernel_factory is not None:
         raise ValueError(
@@ -2207,7 +2330,8 @@ def compute_sigma_c_mpa_omega_grid(
                         w_synthesis=synthesis,
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
-                        tau_capacity=geometry.get("sc_tau_capacity"), print_fn=print_fn)
+                        tau_capacity=geometry.get("sc_tau_capacity"), on_shell_request=on_shell_request,
+                        print_fn=print_fn)
                 except BaseException:
                     if owned:
                         synthesis.close()
@@ -2221,7 +2345,7 @@ def compute_sigma_c_mpa_omega_grid(
                     pole_batch_size=pole_batch_size, brackets=band_brackets,
                     band_counts=band_counts,
                     tau_capacity=geometry.get("sc_tau_capacity"),
-                    tau_kernel_factory=tau_kernel_factory,
+                    tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
                     print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
@@ -2237,7 +2361,7 @@ def compute_sigma_c_mpa_omega_grid(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=True,
-            tau_kernel_factory=tau_kernel_factory,
+            tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
             print_fn=lambda *args, **kwargs: None)
         return _attach_ordered_odd_sigma(total, even)
 

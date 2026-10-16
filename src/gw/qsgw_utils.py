@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -800,6 +801,11 @@ def build_qsgw_sigma_xc(
     """
     omega = np.asarray(omega_ev, dtype=np.float64)
     E = np.asarray(e_qp_kn_ev, dtype=np.float64)
+    if hasattr(sigma_c_omega_ry, "request"):
+        return _build_qsgw_sigma_xc_on_shell(
+            sigma_c_omega_ry, sigma_x_kij_ry, omega, E, mesh_xy,
+            replicated_output=replicated_output, band_axis=band_axis,
+            out_of_grid=out_of_grid)
     if sigma_c_omega_ry.ndim != 4:
         raise ValueError(
             f"sigma_c_omega_ry must have shape (nω, nk, nb, nb); "
@@ -892,6 +898,68 @@ def build_qsgw_sigma_xc(
         "omega_max_ev": omega_hi,
     }
     return sigma_xc_qsgw, diagnostics
+
+
+def check_on_shell_reads(table_ev, want_ev, *, what):
+    """``GATE on_shell_reads``: an on-shell table holds the energies a reader asks for.
+
+    The on-shell Sigma was evaluated at energies fixed before its sweep
+    (``ppm_sigma.on_shell_request``); a reader that now asks for others would
+    get Sigma at the wrong energy with nothing to interpolate.  The tables
+    round-trip eV -> Ry -> eV, hence the 1e-9 eV tolerance.
+    """
+    table, want = np.asarray(table_ev, np.float64), np.asarray(want_ev, np.float64)
+    if table.shape != want.shape or not np.allclose(table, want, rtol=0.0, atol=1.0e-9):
+        drift = (np.inf if table.shape != want.shape
+                 else float(np.max(np.abs(table - want), initial=0.0)))
+        raise ValueError(
+            f"GATE on_shell_reads ({what}): the on-shell Sigma was evaluated at other "
+            f"energies (max |dE| = {drift:.3e} eV, shapes {table.shape} vs {want.shape}); "
+            "the read energies must be the ones given to the Sigma sweep")
+
+
+@lru_cache(maxsize=8)
+def _qsgw_on_shell_kernel(mesh_xy: Mesh, replicated_output: bool):
+    out_3d = NamedSharding(
+        mesh_xy, P(None, None, None) if replicated_output else P(None, "x", "y"))
+
+    @jax.jit
+    def _kernel(pair, sig_x):
+        # The QSGW ansatz with the reads made by the sweep itself:
+        # pair[0] = Sigma_mn(E_m), pair[1] = Sigma_mn(E_n).
+        M = jax.lax.with_sharding_constraint(0.5 * (pair[0] + pair[1]) + sig_x, out_3d)
+        Mh = 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
+        return jax.lax.with_sharding_constraint(Mh, out_3d)
+    return _kernel
+
+
+def _build_qsgw_sigma_xc_on_shell(sigma, sigma_x_kij_ry, omega, E, mesh_xy, *,
+                                  replicated_output, band_axis, out_of_grid):
+    """:func:`build_qsgw_sigma_xc` of an on-shell Sigma (``ppm_sigma.OnShellSigma``).
+
+    Same ansatz, same out-of-grid rule, no interpolation: the pair holds
+    Sigma_mn at the read energies :func:`sigma_eval_omega` gives, which is
+    checked (``GATE on_shell_reads``) rather than assumed.
+    """
+    if sigma.pair is None:
+        raise ValueError("build_qsgw_sigma_xc: a diagonal-only on-shell Sigma has no pair")
+    read, inside = sigma_eval_omega(omega, E, out_of_grid)
+    check_on_shell_reads(sigma.request.table_ev("pair"), read, what="QSGW pair")
+    n_clipped = int(np.count_nonzero(~inside))
+    if band_axis is not None:
+        from runtime.padding import authenticate_axis, pad_square
+        authenticate_axis(sigma.pair, band_axis, axis=-1, where="QSGW on-shell Sigma_c")
+        sigma_x_kij_ry = pad_square(sigma_x_kij_ry, band_axis)
+    out = _qsgw_on_shell_kernel(mesh_xy, bool(replicated_output))(sigma.pair, sigma_x_kij_ry)
+    out.block_until_ready()
+    if band_axis is not None and replicated_output:
+        from runtime.padding import strip_axis
+        out = strip_axis(strip_axis(out, band_axis, axis=-2), band_axis, axis=-1)
+    nk, nb = E.shape
+    return out, {
+        "n_clipped": float(n_clipped),
+        "frac_clipped": float(n_clipped) / float(nk * nb) if nk * nb else 0.0,
+        "omega_min_ev": float(omega[0]), "omega_max_ev": float(omega[-1])}
 
 
 # ---------------------------------------------------------------------------

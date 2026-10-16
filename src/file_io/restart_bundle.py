@@ -1870,6 +1870,8 @@ def read_eqp_assembly_receipt(filepath):
 		EQP_ASSEMBLY_C_BASIS_ATTR,
 		EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
 		EQP_ASSEMBLY_C_OMEGA_DATASET,
+		EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET,
+		EQP_ASSEMBLY_C_ONSHELL_DATASET,
 		EQP_ASSEMBLY_DATASET,
 		EQP_ASSEMBLY_DEGENERACY_POLICIES,
 		EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR,
@@ -1911,13 +1913,21 @@ def read_eqp_assembly_receipt(filepath):
 		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
 			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
 		canonical_present = EQP_ASSEMBLY_DATASET in h5
-		curve_present = EQP_ASSEMBLY_C_OMEGA_DATASET in h5
+		on_shell = EQP_ASSEMBLY_C_ONSHELL_DATASET in h5
+		curve_name = (EQP_ASSEMBLY_C_ONSHELL_DATASET if on_shell
+		              else EQP_ASSEMBLY_C_OMEGA_DATASET)
+		if on_shell and EQP_ASSEMBLY_C_OMEGA_DATASET in h5:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} carries both a C(omega) curve and an "
+				"on-shell EQP operand; refusing an ambiguous receipt.")
+		curve_present = curve_name in h5
 		components_present = EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET in h5
 		raw_component_present = any(
 			name in h5 for name in SIGMA_DIRECT_COMPONENT_DATASETS)
 		candidate_names = [name for name in (
 			EQP_ASSEMBLY_CANDIDATE_DATASET,
 			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
+			EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET,
 			EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET) if name in h5]
 		new_schema = bool(
 			expected is not None or canonical_present or curve_present
@@ -1978,7 +1988,7 @@ def read_eqp_assembly_receipt(filepath):
 				or components_present != component_aware):
 			missing = [name for name, there in (
 				(EQP_ASSEMBLY_DATASET, canonical_present),
-				(EQP_ASSEMBLY_C_OMEGA_DATASET, curve_present),
+				(curve_name, curve_present),
 				(EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET,
 				 components_present or not component_aware)) if not there]
 			extra = ([] if component_aware or not components_present else
@@ -2029,8 +2039,7 @@ def read_eqp_assembly_receipt(filepath):
 				f"k_storage={k_storage!r}, "
 				f"hartree_state={hartree_state!r}, policy={policy!r}.")
 		values = np.asarray(ds[()], dtype=np.complex128)
-		c_omega = np.asarray(
-			h5[EQP_ASSEMBLY_C_OMEGA_DATASET][()], dtype=np.complex128)
+		c_omega = np.asarray(h5[curve_name][()], dtype=np.complex128)
 		h_components = (np.asarray(
 			h5[EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET][()],
 			dtype=np.complex128) if component_aware else None)
@@ -2063,13 +2072,16 @@ def read_eqp_assembly_receipt(filepath):
 				np.real(values[0]), np.real(h_components[0]),
 				np.real(h_components[1]), where="persisted EQP receipt")
 		if (c_omega.ndim != 3 or c_omega.shape[1:] != values.shape[1:]
+				or (on_shell and c_omega.shape[0] != 4)
 				or not np.all(np.isfinite(c_omega))):
 			raise ValueError(
-				f"malformed {EQP_ASSEMBLY_C_OMEGA_DATASET} shape "
+				f"malformed {curve_name} shape "
 				f"{c_omega.shape} for H/X/C {values.shape}, or non-finite values.")
 		omega_rel_ev, omega_reference_ev, omega_reference_provenance = (
 			_omega_metadata_from_open_h5(h5))
-		if omega_rel_ev is None or omega_rel_ev.shape != (c_omega.shape[0],):
+		if on_shell:
+			pass
+		elif omega_rel_ev is None or omega_rel_ev.shape != (c_omega.shape[0],):
 			raise ValueError(
 				f"{EQP_ASSEMBLY_C_OMEGA_DATASET} has {c_omega.shape[0]} omega "
 				f"rows but {OMEGA_DATASET!r} is absent or has shape "
@@ -2116,7 +2128,9 @@ def read_eqp_assembly_receipt(filepath):
 				None if h_components is None else np.real(h_components[1])),
 			"sigma_x_diag_ev": np.real(values[1]),
 			"sigma_c_at_dft_diag_ev": values[2],
-			"sigma_c_omega_diag_ev": c_omega,
+			"sigma_c_omega_diag_ev": None if on_shell else c_omega,
+			# On shell: C(E_DFT), C(E_eval), dC/domega, coverage (rows).
+			"sigma_c_on_shell": c_omega if on_shell else None,
 			"omega_rel_ev": omega_rel_ev,
 			"omega_reference_ev": omega_reference_ev,
 			"omega_reference_provenance": omega_reference_provenance,
@@ -2816,10 +2830,18 @@ def _omega_metadata_from_open_h5(h5):
 		OMEGA_REFERENCE_ATTR,
 		OMEGA_REFERENCE_PROVENANCE_ATTR,
 	)
+	from file_io.sigma_output import ON_SHELL_ENERGIES_DATASET
+	on_shell_axis = ON_SHELL_ENERGIES_DATASET.format(table="pair")
 	if OMEGA_DATASET not in h5:
-		return None, None, None
-	ds = h5[OMEGA_DATASET]
-	omega = np.asarray(ds[()], dtype=np.float64)
+		if on_shell_axis not in h5:
+			return None, None, None
+		# An on-shell file has no omega axis; its reference rides on the
+		# evaluation energies.
+		ds = h5[on_shell_axis]
+		omega = None
+	else:
+		ds = h5[OMEGA_DATASET]
+		omega = np.asarray(ds[()], dtype=np.float64)
 	if OMEGA_REFERENCE_ATTR not in ds.attrs:
 		return omega, None, None
 	ref = float(ds.attrs[OMEGA_REFERENCE_ATTR])
