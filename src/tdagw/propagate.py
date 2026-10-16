@@ -80,6 +80,7 @@ K_AXES = ("x", "y")
 _ON_STEP_TOL = 1e-9
 #: Power iterations of L(L(x)) in :func:`coupling_radius` (two dSigma calls each).
 COUPLING_POWER_ITERATIONS = 20
+COUPLING_ZERO_FLOOR = 1e-12      # Ha: a coupling radius below it is no coupling (IP)
 #: The step check takes h (MARGIN * sigma) <= the stability limit: the power
 #: iteration approaches sigma from below.
 STABILITY_MARGIN = 1.1
@@ -481,7 +482,12 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
     the eigenvalues of L are ±iω (real ω for a Hermitian coupling, TDA or a
     stable full BSE), so L^2 has the dominant real eigenvalue -σ^2 and σ_j
     rises to σ.  One jitted call, 2 n_iter dSigma evaluations on the
-    model's own operands and layout.  Returns (σ, the n_iter estimates).
+    model's own operands and layout.  A map without coupling (IP, or a
+    kernel of zeros) has ||L(L(x))|| <= COUPLING_ZERO_FLOOR^2 ||x||: the
+    iteration keeps x and the estimate is 0, never 0/0, and a radius below
+    the floor (1e-12 Ha, 2.7e-11 eV: it would bound only steps above 1e11
+    a.u.) returns σ = 0.0.  A map that returns non-finite values gives
+    σ = nan (the gate refuses it by name).  Returns (σ, the n_iter estimates).
     """
     nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
     rng = np.random.default_rng(seed)
@@ -491,6 +497,8 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
     w = np.asarray(gather_to_host(ops.w_k)) > 0.0                     # logical k
     x = x * (np.abs(gap) > 0.5) * w[None, :, None, None]
     x = 0.5 * (x + np.conj(np.swapaxes(x, -1, -2)))
+    if not np.any(x):                                 # no cv pair on a logical k: nothing couples
+        return 0.0, np.zeros(int(n_iter))
     x0 = place_state(x, mesh)
     gap_d = place_state(np.broadcast_to(gap, x.shape).astype(complex), mesh)
     zero = place_state(np.zeros_like(x), mesh)
@@ -503,13 +511,16 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
 
         def body(y, _):
             z = lmap(lmap(y))
-            ratio = nrm(z) / nrm(y)
-            return z / nrm(z), jnp.sqrt(ratio)
+            nz, ny = nrm(z), nrm(y)
+            dead = nz <= COUPLING_ZERO_FLOOR ** 2 * ny       # a zero map: keep y, estimate 0
+            return (jnp.where(dead, y, z / jnp.where(dead, 1.0, nz)),
+                    jnp.where(dead, 0.0, jnp.sqrt(nz / ny)))
         _, est = jax.lax.scan(body, x / nrm(x), None, length=int(n_iter), unroll=1)
         return est
 
     est = np.asarray(gather_to_host(jax.jit(run)(x0, gap_d, zero, ops, model.params)))
-    return float(est[-1]), est
+    sigma = float(est[-1])
+    return (0.0 if 0.0 <= sigma < COUPLING_ZERO_FLOOR else sigma), est
 
 
 def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:

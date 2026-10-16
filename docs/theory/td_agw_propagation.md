@@ -299,7 +299,10 @@ weakly and strongly unstable settings; `tests/tdagw/test_prop_stability_cpu.py`)
 **The check at the start of a `magnus2` / `cfm4` run** applies two tests on the model
 itself. (1) σ by 20 power iterations of $\mathcal L^2$ (40 ΔΣ evaluations in the run's
 layout, `tdagw.propagate.coupling_radius`): a step with $1.1\,h\sigma > y_\mathrm{lim}$
-refuses (`td_magnus_stability`). (2) The step probe (`tdagw.propagate.step_growth`): 48
+refuses (`td_magnus_stability`). A model without interaction (IP: the map vanishes,
+$\|\mathcal L^2 x\| \le (10^{-12}\,\mathrm{Ha})^2 \|x\|$, `COUPLING_ZERO_FLOOR`) has σ = 0: any
+step passes, with no probe ("no coupling" in the log); a non-finite σ (a map that returns
+NaN or inf) refuses by name. (2) The step probe (`tdagw.propagate.step_growth`): 48
 steps of the run's own Magnus step (its predictor, corrections and composition) with the
 field off, from a random coherence and an independently seeded node history, at 1.25 dt;
 a growth above 2e-3 per step refuses, so an accepted step lies a measured 25 % below the

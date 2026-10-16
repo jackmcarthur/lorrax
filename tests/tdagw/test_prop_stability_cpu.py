@@ -165,3 +165,42 @@ def test_probe_tracks_the_recurrence(gate):
 def test_red_twin_ungated_step_is_unstable(gate):
     t, u = gate["over_ungated"], gate["under"]
     assert (not t["finite"]) or t["max_p"] > 100.0 * u["max_p"], (t, u)
+
+
+@pytest.fixture(scope="module")
+def zero_gate(tmp_path_factory):
+    env = dict(os.environ, JAX_PLATFORMS="cpu",
+               XLA_FLAGS="--xla_force_host_platform_device_count=4",
+               PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    out = subprocess.run([sys.executable, os.path.join(_HERE, "_zero_coupling_case.py"),
+                          str(tmp_path_factory.mktemp("zero"))],
+                         capture_output=True, text=True, env=env, timeout=1800)
+    assert out.returncode == 0, out.stderr[-4000:]
+    line = next(l for l in out.stdout.splitlines() if l.startswith("RESULT "))
+    return json.loads(line[7:])
+
+
+def test_zero_map_has_zero_radius(zero_gate):
+    """No coupling (dSigma = 0): sigma = 0 exactly and every estimate finite, never 0/0."""
+    assert zero_gate["sigma"] == 0.0 and zero_gate["est_finite"], zero_gate
+    assert zero_gate["est_max"] == 0.0, zero_gate
+
+
+def test_gate_accepts_a_model_without_coupling(zero_gate):
+    """An IP deck (no interaction), cfm4 in the interaction frame at an explicit 20 as, runs:
+    the gate names the case and runs no probe (TDVAL's rung-1 Rabi decks)."""
+    r = zero_gate["ip"]
+    assert "refused" not in r and r["finite"] and abs(r["dt_as"] - 20.0) < 1e-6, r
+    assert r["probes"] == [] and any("no coupling" in l for l in r["log"]), r
+
+
+def test_red_twin_nan_map_refuses_by_name(zero_gate):
+    r = zero_gate["nan"]
+    assert r.get("refused") == "GATE td_magnus_stability", r
+    assert "coupling radius sigma = nan" in r["message"], r
+
+
+def test_red_twin_no_probe_refuses_by_name(zero_gate):
+    """A finite radius with no usable sigma limit: refused by name, not an IndexError."""
+    r = zero_gate["no_probe"]
+    assert r.get("refused") == "GATE td_magnus_stability" and "no probe ran" in r["message"], r
