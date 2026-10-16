@@ -5,6 +5,36 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-16 — undensified BSE: the `--dipole` file must be stamped for the deck WFN
+
+`absorption_common.window_dipoles` now checks the file's `prov_wfn_sha256`
+against the deck WFN's fingerprint on undensified runs too (AUDIT B12), with
+the gate the `bse_k_grid` path already had (`GATE velocity_wfn_fingerprint`):
+another WFN's `dipole.h5` on the same k list (another NSCF, cutoff or
+structure) used to pass the nk check silently. A file with no stamp refuses;
+regenerate it with `python -m psp.get_dipole_mtxels -i <deck>`.
+
+## 2026-10-16 — `bse_k_grid` + `--eqp`: the dipoles are the exact position of the fine QP states
+
+**Changes numbers.** With `--eqp` the densified fine states diagonalize the
+interpolated QP f(H), which mixes the velocity's DFT bands off the coarse
+grid, and `d = v/ΔE` of their Rayleigh-quotient energies was not their
+position: CrI3 8×8→12×12 against the native 12×12 lost 1.4 % of Σ|d|² and
+13 % below 1.6 eV (Σ|v|² kept to 4e-4; the lowest transition's quotient
+60 meV high), 8×8→30×30 1.5 % and 19 %. `densified_dipoles(qp_states=True)`
+(the loader passes `eqp_file is not None`) forms r in the DFT eigenbasis of
+the fine states' own f(H) block and rotates it back; without `--eqp` the
+dipoles are bitwise unchanged. Oscillator strengths, ε₂ and helicity tables
+of `bse_k_grid` runs with `--eqp` move (the 30×30 CrI3 bright states are
+the ones that showed 14–23 % below native 8×8); rerun them, or re-contract a
+saved `eigenvectors.h5` with `python -m bse.dump_window_dipoles` (same
+deterministic gauge; `--check-eigenvectors --check-key d_alpha_rq` proves it
+on the old run first). `full_window` adds `r_window` (pair rule `mask` by
+default, `velocity_pair_rule` / `velocity_pair_gap_ev` on the loader) next to
+`v_window`: TD-aGW should take r from it rather than `v_window/ΔE`. The route
+label of fixed runs ends with "exact r in the fine QP states (DFT eigenbasis
+of their f(H) block, v1)".
+
 ## 2026-10-16 — `bse_jax --helicity-table`: per-state σ± strengths in the report
 
 With `--lanczos --tda --write-eigs --dipole`, `--helicity-table` adds each

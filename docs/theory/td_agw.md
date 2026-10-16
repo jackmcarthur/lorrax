@@ -91,6 +91,29 @@ TD-aGW spectrum and the full (non-TDA) BSE share their poles once $V$ carries
 no head. Step 4 is the BSE exchange term with $V_{q0}$ factored through
 $\tilde\zeta_0(\mathbf G)$; no $N_\mu^2$ Coulomb tile is formed.
 
+## Loading a model
+
+`tdagw.model.load_td_model(deck, mesh, bands=(b_lo, b_hi))` reads W (with its
+q = 0 head) and, by default, ψ through the BSE restart loader
+(`bse_loading.load_bse_data_from_restart_sharded`), so a deck with
+`bse_k_grid` delivers the densified ψ and W. ψ come instead from TDGW's WFN
+with `wfn_file`. The Hartree operator always comes from the q = 0 row of
+`zeta_q.h5`. Four options are off by default, and with all of them off the
+loader call is the earlier one:
+
+| option | effect |
+|---|---|
+| `eqp_file` | the BSE run's `--eqp`. On a `bse_k_grid` deck it enters the htransform, so the fine ψ are the quasiparticle f(H) states of a `bse_jax --eqp` run on that deck and the fine ε are QP. On a coarse deck ψ do not change and the file only sets the window energies |
+| `velocity_file` | the coarse `dipole.h5` (`--dipole`), carried through the htransform; read on the densified route only, refused elsewhere and by a loader that has no velocity |
+| `velocity_full_window` | the velocity over every window pair (vv', cc' and cv); refused until the loader offers it |
+| `keep_window` | `model["window"]`: the loader's ε (Ry, window ascending), `n_occ`, `n_val`, `n_cond`, dipoles and where the energies came from; on a coarse deck with `eqp_file` the ε are re-sliced as `bse_jax --eqp` does them |
+
+The densified route reproduces the BSE. On CrI3 30×30 (`bse_k_grid` on a
+μ_S = 714 downfold, bands [88, 144), the 6000-centroid run's eqp) the lowest
+three roots of D + K, solved by block Davidson through `apply` with the BSE's
+rank-one exchange head added, match `bse_jax` on the same deck to 0.004 meV.
+A wrong ψ row or k label would move them by tens of meV.
+
 ## Units, normalization and the TDGW kernel file
 
 LORRAX works in Ry. $\psi(\mathbf r_\mu)$ is sampled exactly as the GW run
@@ -131,3 +154,101 @@ The W term costs one k-convolution of an $(n_sN_\mu)^2/P$ tile per density
 matrix, $O(N_kN_\mu^2\log N_k/P)$, plus the encode and decode,
 $O(N_kn_bn_s^2N_\mu^2/P)$; the Hartree term is $O(N_kn_b^2N_\mu/P+N_\mu N_G/P)$
 with two psums of a $(B,N_\mu)$ vector.
+
+## Outlook: instantaneous dynamical Σ(t)
+
+This section is a design; none of it is implemented. The kernel above
+linearizes static COHSEX about $\rho^{\rm eq}$ with W frozen. An
+instantaneous dynamical self-energy keeps the equation of motion and its
+time-local form (no memory integral) but builds Σ from the state at time t.
+That adds dynamical screening and the response of the screening to the
+excited carriers (band-gap renormalization, Pauli blocking of W), which the
+static kernel leaves out.
+
+### Coherences and populations
+
+Write $\delta\rho=\delta\rho^{\rm coh}+\delta\rho^{\rm pop}$ in the
+instantaneous quasiparticle basis $U_{\mathbf k}(t)$ of the field-free
+Hamiltonian $H^0_{\mathbf k}(t)=\mathrm{diag}(\varepsilon^{\rm QP}_{\mathbf k})+\Delta\Sigma_{\mathbf k}(t)$:
+the populations $f_{i\mathbf k}=(U^\dagger_{\mathbf k}\rho_{\mathbf k}U_{\mathbf k})_{ii}$
+form the diagonal part and the rest is the coherent part. The update becomes
+
+$$
+\Delta\Sigma_{\mathbf k}(t)=\big(K\,\delta\rho^{\rm coh}\big)_{\mathbf k}
++\Sigma^{\rm dyn}_{\mathbf k}[f(t)]-\Sigma^{\rm dyn}_{\mathbf k}[f^{\rm eq}].
+$$
+
+The coherent part keeps the static kernel and `apply`, so the excitonic
+polarization is unchanged. The population part comes from a refreshed
+dynamical Σ, whose own static linearization in $\delta f$ takes the place of
+$K\,\delta\rho^{\rm pop}$, so no term is counted twice. In a weak field
+$\delta f=O(E^2)$ while $\delta\rho^{\rm coh}=O(E)$, so linear response, and
+with it the BSE equivalence of the kernel section, is exactly the present
+model. The field term $e\mathbf E\cdot\mathbf r$ stays out of $H^0$: the
+basis then follows the carriers, not the optical cycle.
+
+`apply(drho)` thus becomes one member of a pluggable
+`dsigma(state) -> ΔΣ`, where `state` carries $\rho_{\mathbf k}(t)$,
+$H^0_{\mathbf k}(t)$ and a cache. With $\Sigma^{\rm dyn}\equiv$ static COHSEX
+and no split it reduces to the present model.
+
+### One refresh of $\Sigma^{\rm dyn}[f]$
+
+The QSGW map ([self-consistency §1](../self_consistency.md#1-the-map)) does
+the same steps with an aufbau occupation. Here the occupations are the TD
+populations:
+
+1. diagonalize $H^0_{\mathbf k}=U\,\mathrm{diag}(E)\,U^\dagger$ in the window and
+   rotate the centroid orbitals once from the fixed basis,
+   $\tilde\psi_{i\mathbf k}(\mu)=\sum_m U_{mi}\psi_{m\mathbf k}(\mu)$;
+   out-of-window bands keep $f=1$ or $0$;
+2. $G_{\mathbf k}(\mu,\nu;\tau_j)$ at the response rule's times from
+   $(\tilde\psi, E, f)$: the particle branch weighted by $1-f$, the hole branch
+   by $f$, so a partly filled state enters both;
+3. $\chi^0_q$ and $\partial_s\chi^0_q$ at the supports: one k-convolution of
+   $G(\tau_j)\,G(-\tau_j)$ per time (the W term's FFT path), projected by the
+   rule's rows (`minimax.response_group_rules`);
+4. $W_q=[1-v_q\chi^0_q]^{-1}v_q$ at the supports, then either the shared-pole
+   pencil per parent q (poles $\Omega_j(t)$, factors $b_j(t)$;
+   [shared-pole model](shared-pole-w-model.md)) or the two-residue GN-PPM fit
+   at $\omega=0$ and $i\omega_p$ ([GN-PPM](gn-ppm-nonhermitian.md)), on the
+   ordered route, because the magnet and a helicity-selective drive both break
+   time reversal;
+5. $\Sigma_c(\omega)$ on the window from the pole model, and $\Sigma_x[f]$;
+6. the static operator at the instantaneous energies,
+   $\Sigma_{ij}=\tfrac12[\Sigma_{ij}(E_i)+\Sigma_{ij}(E_j)]^{\rm h}$
+   ([on-shell Σ](sigma-on-shell.md)), rotated back to the fixed basis.
+
+Excited carriers open intraband transitions with $f_i(1-f_j)\neq0$ and small
+$\Delta$, so the state is transiently metallic. The response rule must then be
+planned with the metal's occupation envelope and the q = 0 intraband (Drude)
+head ([self-consistency §7](../self_consistency.md#7-metals)), not the
+insulator's interval.
+
+### Cached and recomputed
+
+| object | held | rebuilt |
+|---|---|---|
+| $r_\mu$, $\tilde\zeta_q(\mathbf G)$, $V(q)$, the heads | whole run (the restart) | — |
+| window ψ at the centroids, fixed basis | whole run | rotated each refresh |
+| out-of-window $G(\tau_j)$ | while the response rule is held | with the rule |
+| response rules, supports, Σ rules | under the QSGW hold tests ([self-consistency §6](../self_consistency.md#shared-pole-w-with-retained-quadrature)) | when the populated transition interval leaves the plan, logged by name |
+| $U$, $E$, $f$; window $G(\tau_j)$; $\chi^0$, $W$ and the pole model at the supports; $\Sigma_c$ on the window | — | every refresh |
+
+### Cost
+
+Per step the cost stays one `apply` of the coherent part plus the basis
+rotation, $O(N_kn_b^3)$. Measured on 4 A100 at b = 1, one `apply` takes
+95 ms at 30×30 (N_μ = 714, 56 bands, 21.7 GB/device peak) and 309 ms at
+12×12 (N_μ = 3000, 60 bands, 34.8 GB/device peak). A refresh costs $N_\tau$ k-convolutions for
+$\chi^0$, each the size of one `apply`'s convolution, plus
+$O(N_qN_sN_\mu^3/P)$ for the W solves at $N_s$ supports, which dominates at
+production $N_\mu$, plus the window Σ, $O(N_qN_{\rm pole}n_bN_\mu^2/P)$.
+The refresh is driven by the populations, not the clock: it runs when
+$\max|\delta f|$ has moved by a set tolerance since the last one, which
+follows the pulse envelope and the carrier relaxation rather than the optical
+period.
+
+Checks before use: zero field gives $\Delta\Sigma\equiv0$; a weak field
+reproduces the present linear response; and a refresh at thermalized hot
+populations equals a one-shot GW of the GW driver at the same occupations.

@@ -68,8 +68,50 @@ ZETA_G_SPEC = P(None, ("x", "y"))
 V_G_SPEC = P(("x", "y"))
 
 
+#: Why each gate refuses: one reason per gate name, read by :func:`_refuse`.
+_WHY = {
+    "td_model_terms": "an operator with neither term is identically zero",
+    "td_model_k_axis": "the W term reshapes the flat k axis onto the grid, so a partial k list "
+                       "pairs the wrong k - k'",
+    "td_model_mu_axis": "every centroid-indexed operand must share one padded extent, or the "
+                        "mesh shards misalign their rows",
+    "td_model_w_grid": "the k-convolution pairs each psi row with the W_R cell of the same grid",
+    "td_k_on_grid": "the W convolution needs k on the unshifted grid, and a nearest-k fallback "
+                    "would mislabel rows",
+    "td_k_full_grid": "the k-convolution's FFT needs every grid point exactly once",
+    "td_wfn_full_grid": "psi is sampled at every grid k, and an IBZ WFN would need an unfolding "
+                        "this path does not do",
+    "td_zeta_q0_row": "the Hartree term drops exactly the G = 0 slot of the q = 0 sphere",
+    "td_band_origin": "bands are absolute indices, and a stored window that starts elsewhere "
+                      "would offset psi against W",
+    "td_window_gap": "rho_eq = diag(f) needs occupied and empty bands in the window",
+    "td_window_resolved": "the loader moved a window edge to close a degenerate multiplet, so "
+                          "psi would not be the requested bands",
+    "td_wfn_densified": "the densified psi come from the htransform, and TDGW's coarse WFN is "
+                        "another basis",
+    "td_centroids_md5": "psi sampled at other centroids does not match the restart's W and zeta",
+    "td_wfn_geometry": "psi(r_mu) from another FFT grid or cell falls on other points than the "
+                       "restart's centroids",
+    "td_velocity_full_window": "a full-window velocity is read from a velocity file",
+    "td_velocity_loader": "this loader cannot carry the velocity, and dropping the request would "
+                          "return no dipoles",
+    "td_velocity_route": "the loader reads the velocity on the densified route only, so elsewhere "
+                         "the request would be ignored",
+    "td_velocity_full_window_loader": "this loader returns the window's cv dipoles only, so the "
+                                      "vv' and cc' pairs would be missing",
+    "td_eqp_n_occ": "psi hold the DFT window, and a QP spectrum with another n_occ changes which "
+                    "bands are occupied",
+    "td_coulomb_policy": "the Hartree term must use the Coulomb kernel that V and W were built "
+                         "with, which the stamp names",
+    "td_coulomb_bgw_vcoul": "compute_v_q_per_G does not reproduce BerkeleyGW's vcoul overlay, so "
+                            "Vbar would differ from the stored V",
+    "td_zeta_gamma_row": "the Hartree term reads the q = 0 row, and another row is a finite-q "
+                         "operator",
+}
+
+
 def _refuse(gate: str, got, want, fix: str):
-    raise ValueError(f"GATE {gate}: got: {got}; want: {want}; fix: {fix} "
+    raise ValueError(f"GATE {gate}: got: {got}; want: {want}; why: {_WHY[gate]}; fix: {fix} "
                      f"(docs/theory/td_agw.md)")
 
 
@@ -419,7 +461,9 @@ def hartree_operator_from_zeta(zeta_file: str, mesh_xy: Mesh, n_rmu_pad: int, *,
 
 def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None = None,
                   zeta_file: str | None = None, n_occ: int | None = None,
-                  degeneracy_mode: str | None = None) -> dict:
+                  degeneracy_mode: str | None = None, eqp_file: str | None = None,
+                  velocity_file: str | None = None, velocity_full_window: bool = False,
+                  keep_window: bool = False) -> dict:
     """The model bundle from a GW restart: W from the BSE loader, ψ from TDGW's WFN.
 
     W(q) (with its q = 0 head) comes from the BSE restart loader
@@ -435,6 +479,27 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         must straddle n_occ and close degenerate multiplets at both edges.
     wfn_file : str, optional — TDGW's full-grid WFN.h5.
     zeta_file : str, optional — default ``<restart dir>/zeta_q.h5``.
+    eqp_file : str, optional — BerkeleyGW ``eqp.dat``, the BSE run's ``--eqp``.
+        On a ``bse_k_grid`` deck it enters the loader's htransform, so the
+        fine ψ are the quasiparticle f(H) states (the states of a
+        ``bse_jax --eqp`` run on the same deck) and the fine ε are QP.  On a
+        coarse deck ψ stay the restart's (or ``wfn_file``'s) and the file
+        only sets ``window``'s energies (``keep_window``).
+    velocity_file : str, optional — the coarse WFN's ``dipole.h5``
+        (``bse_jax --dipole``).  The loader reads it on the densified route
+        only; refuses on a coarse deck and with a loader that has no
+        ``velocity_file``.
+    velocity_full_window : bool — ask the loader for the velocity over every
+        window pair (vv', cc' and cv); refuses when the loader has no such
+        option.  Needs ``velocity_file``.
+    keep_window : bool — keep the loader's window as ``model["window"]``:
+        ``eps_v``/``eps_c`` (Ry, the loader's padded (nk, n_pad) layout,
+        window bands ascending, pad slots the loader's sentinel), ``n_occ``,
+        ``n_val``, ``n_cond``, ``dipoles`` (the loader's, or None),
+        ``densified``, ``eqp_file`` and ``energy_source``.
+
+    All four are off by default, and then the loader call and the bundle are
+    those of the previous signature.
 
     Returns
     -------
@@ -442,7 +507,8 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         provenance and the ψ gauge comparison against the restart; the
         cross-check operands are ``V_q0_stored`` (the restart's q = 0
         exchange tile), ``V_q0_bse`` (the BSE loader's, stored + the vhead
-        head) and ``g0_X`` (the head vector), all (nmu_pad, …) on the mesh.
+        head) and ``g0_X`` (the head vector), all (nmu_pad, …) on the mesh;
+        ``window`` with ``keep_window``.
     """
     from bse.bse_feast import ensure_W_R
     from bse.bse_loading import load_bse_data_from_restart_sharded
@@ -467,9 +533,15 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         _refuse("td_window_gap", f"bands [{b_lo}, {b_hi}) with n_occ={n_occ}",
                 "b_lo < n_occ < b_hi", "give a window that straddles the gap")
     n_val, n_cond = n_occ - b_lo, b_hi - n_occ
+    densifies = None
+    if velocity_file is not None:
+        densifies = _deck_densifies(input_file, header)
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val, n_cond, mesh_xy=mesh_xy, input_file=input_file,
-        n_occ=n_occ, degeneracy_mode=degeneracy_mode or DEFAULT_MODE)
+        n_occ=n_occ, degeneracy_mode=degeneracy_mode or DEFAULT_MODE,
+        **_loader_options(load_bse_data_from_restart_sharded, eqp_file=eqp_file,
+                          velocity_file=velocity_file,
+                          velocity_full_window=velocity_full_window, densifies=densifies))
     if (int(data["n_val"]), int(data["n_cond"])) != (n_val, n_cond):
         _refuse("td_window_resolved", f"loader window {data['n_val']}v x {data['n_cond']}c",
                 f"{n_val}v x {n_cond}c", "close the multiplets at both window edges")
@@ -481,42 +553,44 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         data["psi_v_X"], data["psi_c_X"])
     cfg = LorraxConfig.from_input_file(input_file)
     deck_wfn = WfnLoader(cfg.paths.wfn_file)
-    receipts = dict(restart_file=os.path.abspath(restart_file), n_occ=int(n_occ),
-                    bands=(b_lo, b_hi), densified=bool(data.get("densified", False)))
-    if wfn_file is not None:
-        if data.get("densified", False):
-            _refuse("td_wfn_densified", "wfn_file with a bse_k_grid deck",
-                    "ψ from one source", "drop wfn_file (the densified ψ is the htransform's)")
-        centroids = load_centroid_basis(cfg.paths.centroids_file, deck_wfn.fft_grid,
-                                        sym=deck_wfn.symmetry())
-        idx = np.asarray(centroids.centroid_indices)
-        digest = header["centroid_hashes"].get("charge")
-        if digest is not None and str(np.asarray(digest).astype(str)) != centroid_table_md5(idx):
-            _refuse("td_centroids_md5", "deck centroids differ from the restart's",
-                    "the restart's centroid table", "point the deck at the restart's centroids")
-        tdgw_wfn = WfnLoader(wfn_file)
-        same_grid = tuple(tdgw_wfn.fft_grid) == tuple(deck_wfn.fft_grid)
-        same_cell = np.allclose(np.asarray(tdgw_wfn.bvec), np.asarray(deck_wfn.bvec), atol=1e-8)
-        tdgw_wfn.close()
-        if not (same_grid and same_cell):
-            _refuse("td_wfn_geometry", f"fft_grid {tuple(tdgw_wfn.fft_grid)}, same_cell={same_cell}",
-                    f"the restart WFN's fft_grid {tuple(deck_wfn.fft_grid)} and cell",
-                    "generate TDGW's WFN from the GW run's SCF and cutoff")
-        psi, k_frac, _ = sample_window_psi(wfn_file, idx, (b_lo, b_hi), mesh_xy,
-                                           kgrid=kgrid, n_rmu_pad=n_rmu_pad)
-        receipts["psi_source"] = os.path.abspath(wfn_file)
-        receipts["psi_vs_restart"] = _gauge_receipt(psi, psi_restart, mesh_xy)
-    else:
-        psi = psi_restart
-        # The loader's flat k axis is reshaped to (nkx, nky, nkz) by the W
-        # convolution, so its rows are the C-order grid, coarse or densified.
-        k_frac = _c_order_k(kgrid)
-        if not data.get("densified", False):
-            flat_k_rows(np.asarray(deck_wfn.kvecs(k="full_bz")), kgrid)   # full, unshifted grid
-        receipts["psi_source"] = "restart"
-    coulomb = _coulomb_from_policy(read_coulomb_policy_from_h5(restart_file), deck_wfn,
-                                   restart_file)
-    deck_wfn.close()
+    try:
+        receipts = dict(restart_file=os.path.abspath(restart_file), n_occ=int(n_occ),
+                        bands=(b_lo, b_hi), densified=bool(data.get("densified", False)))
+        if wfn_file is not None:
+            if data.get("densified", False):
+                _refuse("td_wfn_densified", "wfn_file with a bse_k_grid deck",
+                        "ψ from one source", "drop wfn_file (the densified ψ is the htransform's)")
+            centroids = load_centroid_basis(cfg.paths.centroids_file, deck_wfn.fft_grid,
+                                            sym=deck_wfn.symmetry())
+            idx = np.asarray(centroids.centroid_indices)
+            digest = header["centroid_hashes"].get("charge")
+            if digest is not None and str(np.asarray(digest).astype(str)) != centroid_table_md5(idx):
+                _refuse("td_centroids_md5", "deck centroids differ from the restart's",
+                        "the restart's centroid table", "point the deck at the restart's centroids")
+            tdgw_wfn = WfnLoader(wfn_file)
+            same_grid = tuple(tdgw_wfn.fft_grid) == tuple(deck_wfn.fft_grid)
+            same_cell = np.allclose(np.asarray(tdgw_wfn.bvec), np.asarray(deck_wfn.bvec), atol=1e-8)
+            tdgw_wfn.close()
+            if not (same_grid and same_cell):
+                _refuse("td_wfn_geometry", f"fft_grid {tuple(tdgw_wfn.fft_grid)}, same_cell={same_cell}",
+                        f"the restart WFN's fft_grid {tuple(deck_wfn.fft_grid)} and cell",
+                        "generate TDGW's WFN from the GW run's SCF and cutoff")
+            psi, k_frac, _ = sample_window_psi(wfn_file, idx, (b_lo, b_hi), mesh_xy,
+                                               kgrid=kgrid, n_rmu_pad=n_rmu_pad)
+            receipts["psi_source"] = os.path.abspath(wfn_file)
+            receipts["psi_vs_restart"] = _gauge_receipt(psi, psi_restart, mesh_xy)
+        else:
+            psi = psi_restart
+            # The loader's flat k axis is reshaped to (nkx, nky, nkz) by the W
+            # convolution, so its rows are the C-order grid, coarse or densified.
+            k_frac = _c_order_k(kgrid)
+            if not data.get("densified", False):
+                flat_k_rows(np.asarray(deck_wfn.kvecs(k="full_bz")), kgrid)   # full, unshifted grid
+            receipts["psi_source"] = "restart"
+        coulomb = _coulomb_from_policy(read_coulomb_policy_from_h5(restart_file), deck_wfn,
+                                       restart_file)
+    finally:
+        deck_wfn.close()
     zeta_file = zeta_file or os.path.join(os.path.dirname(restart_file), "zeta_q.h5")
     _gamma_row(restart_file, kgrid)
     zeta_G, v_G, zr = hartree_operator_from_zeta(zeta_file, mesh_xy, n_rmu_pad, coulomb=coulomb)
@@ -528,7 +602,97 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
     model["V_q0_stored"] = read_interaction(restart_file, "bare", mesh_xy)[0]
     model["V_q0_bse"] = data["V_q0"]
     model["g0_X"] = data["g0_X"]
+    for name, path in (("eqp_file", eqp_file), ("velocity_file", velocity_file)):
+        if path is not None:
+            receipts[name] = os.path.abspath(path)
+    if velocity_full_window:
+        receipts["velocity_full_window"] = True
+    if keep_window:
+        model["window"] = _window_record(
+            data, restart_file=restart_file, input_file=input_file, n_occ=n_occ,
+            eqp_file=eqp_file, mesh_xy=mesh_xy,
+            degeneracy_mode=degeneracy_mode or DEFAULT_MODE)
     return model
+
+
+def _deck_densifies(input_file: str, header: dict) -> bool:
+    """True when the deck's ``bse_k_grid`` differs from the restart's grid (the loader's own test)."""
+    from bse.bse_densify import _resolve_bse_k_grid
+    fine = _resolve_bse_k_grid(None, input_file)
+    coarse = tuple(int(n) for n in np.asarray(header["grid"]).reshape(-1)[:3])
+    return fine is not None and tuple(int(n) for n in fine) != coarse
+
+
+def _loader_options(loader, *, eqp_file=None, velocity_file=None,
+                    velocity_full_window: bool = False, densifies=None) -> dict:
+    """The optional keywords :func:`load_td_model` forwards to the BSE loader.
+
+    Empty at the defaults, so the default call is the loader's own.  The
+    velocity keywords are forwarded only to a loader that declares them, and
+    only on the densified route (``densifies``), the one route on which the
+    loader reads the velocity; elsewhere the request refuses by name instead
+    of being dropped.
+    """
+    import inspect
+    params = inspect.signature(loader).parameters
+    out = {}
+    if eqp_file is not None:
+        out["eqp_file"] = os.path.abspath(eqp_file)
+    if velocity_full_window and velocity_file is None:
+        _refuse("td_velocity_full_window", "velocity_full_window=True, velocity_file=None",
+                "a velocity_file", "pass the coarse WFN's dipole.h5 (bse_jax --dipole)")
+    if velocity_file is not None:
+        if "velocity_file" not in params:
+            _refuse("td_velocity_loader", f"{loader.__module__}.{loader.__name__} has no "
+                    "velocity_file", "a loader that carries the velocity through the "
+                    "htransform (BSEDIP feat/bse-kgrid-dipoles-2026-10-16)",
+                    "run from a checkout that merges the BSEDIP loader")
+        if not densifies:
+            _refuse("td_velocity_route", "velocity_file on a deck without a densifying "
+                    "bse_k_grid", "a bse_k_grid deck (the loader reads the velocity there "
+                    "only)", "slice the coarse dipole.h5 with absorption_common.window_dipoles")
+        out["velocity_file"] = os.path.abspath(velocity_file)
+    if velocity_full_window:
+        if "velocity_full_window" not in params:
+            _refuse("td_velocity_full_window_loader", f"{loader.__module__}."
+                    f"{loader.__name__} has no velocity_full_window",
+                    "a loader that returns the velocity over every window pair "
+                    "(vv', cc' and cv)", "add velocity_full_window to the BSE loader")
+        out["velocity_full_window"] = True
+    return out
+
+
+def _window_record(data: dict, *, restart_file: str, input_file: str, n_occ: int,
+                   eqp_file, mesh_xy: Mesh, degeneracy_mode: str) -> dict:
+    """``model["window"]``: the loader's window energies, occupation and dipoles.
+
+    On the densified route the loader's ε already carry ``eqp_file`` (its
+    htransform).  On a coarse deck with ``eqp_file`` they are re-sliced as
+    ``bse_jax --eqp`` does (``bse_window.apply_eqp_and_reslice_bands``); a
+    QP gap that moves ``n_occ`` refuses, since ψ hold the DFT window.
+    """
+    densified = bool(data.get("densified", False))
+    n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
+    eps_v, eps_c = data["eps_v"], data["eps_c"]
+    if densified:
+        source = "htransform (eqp)" if eqp_file is not None else "htransform (dft)"
+    elif eqp_file is not None:
+        from bse.bse_window import apply_eqp_and_reslice_bands
+        grid_x, grid_y = mesh_xy.devices.shape
+        eps_v, eps_c, n_occ_eff = apply_eqp_and_reslice_bands(
+            restart_file, eqp_file, input_file, n_val, n_cond, n_occ, grid_x, grid_y,
+            degeneracy_mode=degeneracy_mode)
+        if int(n_occ_eff) != int(n_occ):
+            _refuse("td_eqp_n_occ", f"n_occ {n_occ_eff} on the QP spectrum of {eqp_file}",
+                    f"the DFT window's n_occ {n_occ}",
+                    "pass n_occ, or a window whose QP and DFT occupations agree")
+        source = "eqp re-slice (bse_window.apply_eqp_and_reslice_bands)"
+    else:
+        source = "restart"
+    return dict(eps_v=eps_v, eps_c=eps_c, n_occ=int(n_occ), n_val=n_val, n_cond=n_cond,
+                dipoles=data.get("dipoles"), densified=densified,
+                eqp_file=None if eqp_file is None else os.path.abspath(eqp_file),
+                energy_source=source)
 
 
 def _c_order_k(kgrid) -> np.ndarray:

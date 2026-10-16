@@ -401,6 +401,13 @@ def slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ, n_val, n_cond):
     return d_alpha, de_cv
 
 
+def _deck_wfn_fingerprint(wfn_path):
+    """``wfn_fingerprint`` of the deck WFN (header and bounded samples)."""
+    from common.parallel_transport import wfn_fingerprint
+    from wfn_loader import WfnLoader
+    return wfn_fingerprint(WfnLoader(str(wfn_path)))
+
+
 def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
     """``(d_alpha, de_cv)`` of the BSE window ``data`` solves: THE dipole source.
 
@@ -410,7 +417,9 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
     has another k list, and a fine grid's ``dipole.h5`` has the right shape
     in the wrong gauge.  Any other bundle slices ``dipole_file``
     (:func:`slice_dipole_to_bse_window`) at ``n_occ`` over the loader's
-    resolved window, after ``file_io.dipole.require_dipole_k_grid``.
+    resolved window, after ``file_io.dipole.require_dipole_k_grid`` and the
+    file's WFN stamp against ``wfn_path``
+    (``file_io.dipole.require_dipole_wfn_fingerprint``).
 
     Returns
     -------
@@ -431,12 +440,16 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
                 f"velocity_file=dipole_file to "
                 f"load_bse_data_from_restart_sharded.")
         return dip["d_alpha"], dip["de_cv"]
-    from file_io.dipole import require_dipole_k_grid
+    from file_io.dipole import (require_dipole_k_grid,
+                                require_dipole_wfn_fingerprint)
     from file_io.restart_bundle import load_dipole_h5
     dipole_cart, deltaE, attrs = load_dipole_h5(dipole_file, wfn_path=wfn_path)
     require_dipole_k_grid(
         attrs, int(data["nkx"]) * int(data["nky"]) * int(data["nkz"]),
         dipole_path=dipole_file)
+    require_dipole_wfn_fingerprint(attrs, dipole_path=dipole_file,
+                                   wfn_path=wfn_path,
+                                   want=_deck_wfn_fingerprint(wfn_path))
     return slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ,
                                       int(data["n_val"]), int(data["n_cond"]))
 

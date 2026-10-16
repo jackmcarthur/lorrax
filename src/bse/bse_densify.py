@@ -729,10 +729,101 @@ DENSIFIED_DIPOLE_DEGEN_RY = 1.0e-6
 #: Component names of the four lattice images :func:`densified_dipoles` builds.
 _DIPOLE_IMAGES = ("v_x", "v_y", "v_z", "f(H)")
 
+#: Pair rules for same-occupation (vv', cc') pairs of the window position
+#: operator, and the exact-degeneracy floor (Ry): the rule and the floor of
+#: ``tdagw.td_system.position_from_velocity`` (pinned by a CPU test).
+DENSIFIED_POSITION_PAIR_RULES = ("mask", "cut", "cv")
+DENSIFIED_POSITION_EXACT_DEGENERACY_RY = 1.0e-12
+#: q points per host block of the fine-state position rotation.
+_POSITION_Q_CHUNK = 64
+#: Appended to the route label when the dipoles are the exact r of the fine
+#: QP states (the label is what eigenvectors.h5 / Haydock outputs record).
+DENSIFIED_POSITION_FORM = "exact r in the fine QP states (DFT eigenbasis of their f(H) block, v1)"
+
+
+def _position_from_velocity_rule(v, e, n_val, *, rule, gap_ry):
+    r"""``r_nm = v_nm / (i (E_n − E_m))`` over every window pair, one pair rule.
+
+    ``v`` (3, nq, nb, nb) is ``⟨n|v̂|m⟩`` between eigenstates of the
+    velocity's own Hamiltonian with energies ``e`` (nq, nb), valence rows
+    first.  The diagonal and exact degeneracies (|ΔE| below
+    :data:`DENSIFIED_POSITION_EXACT_DEGENERACY_RY`) carry no position; c↔v
+    pairs are kept as they are; same-occupation pairs follow ``rule``:
+    ``mask`` multiplies by ``1 − exp(−ΔE²/(2 gap²))``, ``cut`` zeroes
+    ``|ΔE| < gap``, ``cv`` zeroes them all.  Both v and r are Hermitized.
+    This is ``tdagw.td_system.position_from_velocity``'s rule without its
+    gates and receipt (the callers gate).
+    """
+    v = np.asarray(v, dtype=np.complex128)
+    e = np.asarray(e, dtype=np.float64)
+    nb = int(e.shape[-1])
+    v = 0.5 * (v + np.conj(np.swapaxes(v, -1, -2)))
+    de = e[:, :, None] - e[:, None, :]                       # E_n - E_m
+    occ = np.arange(nb) < int(n_val)
+    cv = occ[:, None] != occ[None, :]
+    off = ~np.eye(nb, dtype=bool)
+    same = off & ~cv
+    exact = np.abs(de) < DENSIFIED_POSITION_EXACT_DEGENERACY_RY
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.where((off[None] & ~exact)[None], v / (1j * de[None]), 0.0)
+    if rule == "mask":
+        r = r * np.where(same[None], -np.expm1(-de ** 2 / (2.0 * gap_ry ** 2)),
+                         1.0)[None]
+    elif rule == "cut":
+        r = np.where((same[None] & (np.abs(de) < gap_ry))[None], 0.0, r)
+    else:
+        r = np.where(same[None, None], 0.0, r)
+    r[:, :, np.arange(nb), np.arange(nb)] = 0.0
+    return 0.5 * (r + np.conj(np.swapaxes(r, -1, -2)))
+
+
+def _position_in_fine_states(v_win, f_win, n_val, newton, *, rule, gap_ry,
+                             chunk=_POSITION_Q_CHUNK):
+    r"""⟨ĩ|r̂|j̃⟩ in fine states that are NOT eigenstates of the velocity's H.
+
+    With ``--eqp`` the fine states |ĩ⟩ diagonalize the interpolated QP
+    ``f(H)``; the velocity's own (DFT) ``f(H)`` block ``f_win`` is then not
+    diagonal in them.  Per q: ``f_win = W diag(φ) Wᴴ``, ``ε = f⁻¹(φ)``
+    (``newton``), ``v' = Wᴴ v W``, ``r' = v'/(i Δε)`` with the pair rule
+    (:func:`_position_from_velocity_rule`), ``r = W r' Wᴴ``.  Exact for
+    the c↔v pairs when W does not mix the window's valence and conduction
+    rows; ``offblock`` measures that mixing.
+
+    Returns ``(r_win (3, nq, nb, nb), eps (nq, nb) Ry, offblock (nq,),
+    cv_eig_sum)``, the last the Σ|v'_cv/Δε|² of the eigenbasis (the window
+    sum the rotation must preserve).
+    """
+    nq, nb = int(f_win.shape[0]), int(f_win.shape[-1])
+    r_win = np.empty((3, nq, nb, nb), np.complex128)
+    eps_all = np.empty((nq, nb), np.float64)
+    offblock = np.zeros(nq, np.float64)
+    cv_eig_sum = 0.0
+    for q0 in range(0, nq, int(chunk)):
+        sl = slice(q0, min(nq, q0 + int(chunk)))
+        fq = np.asarray(f_win[sl], dtype=np.complex128)
+        fq = 0.5 * (fq + np.conj(np.swapaxes(fq, -1, -2)))
+        phi, w = np.linalg.eigh(fq)
+        eps = np.asarray(newton(phi), dtype=np.float64)
+        order = np.argsort(eps, axis=1, kind="stable")
+        eps = np.take_along_axis(eps, order, axis=1)
+        w = np.take_along_axis(w, order[:, None, :], axis=2)
+        vp = np.einsum("qim,aqij,qjn->aqmn", w.conj(), v_win[:, sl], w)
+        rp = _position_from_velocity_rule(vp, eps, n_val, rule=rule,
+                                          gap_ry=gap_ry)
+        cv_eig_sum += float(np.sum(np.abs(rp[:, :, n_val:, :n_val]) ** 2))
+        r_win[:, sl] = np.einsum("qim,aqmn,qjn->aqij", w, rp, w.conj())
+        eps_all[sl] = eps
+        offblock[sl] = np.maximum(
+            np.linalg.norm(w[:, :n_val, n_val:], axis=(1, 2)),
+            np.linalg.norm(w[:, n_val:, :n_val], axis=(1, 2)))
+    return r_win, eps_all, offblock, cv_eig_sum
+
 
 def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       coarse_grid, n_val, window_start, a_band_index,
-                      mesh_xy, log_fn=print) -> dict:
+                      mesh_xy, log_fn=print, full_window: bool = False,
+                      qp_states: bool = False, pair_rule: str = "mask",
+                      pair_gap_ev: float = 0.05) -> dict:
     r"""r-form dipoles of a ``bse_k_grid`` bundle, in the gauge of its own ψ.
 
     The coarse WFN's velocity matrix ``v(k)`` (``psp.get_dipole_mtxels``'
@@ -810,6 +901,24 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         The htransform's ``a`` band (``htransform_a_band``).
     mesh_xy : jax.sharding.Mesh
         The ('x','y') mesh.  COLLECTIVE over it.
+    full_window : bool
+        Also return the velocity over EVERY pair of the fine window (the
+        TD-aGW equation of motion needs the vv' and cc' blocks, not only
+        c <- v): ``v_window`` and ``e_dft_window`` below.  Off by default;
+        the default outputs do not depend on it.
+    qp_states : bool
+        The fine states are eigenstates of a QUASIPARTICLE f(H) (``--eqp``;
+        the loader passes ``eqp_file is not None``).  Then the velocity's
+        DFT f(H) block is not diagonal in them, and ``v/ΔE`` of its
+        Rayleigh quotients is not their position (CrI3 8→12: Σ|d|² 0.986,
+        onset 0.87 against the native fine grid): the dipoles become the
+        exact ``⟨c̃|r̂|ṽ⟩`` of :func:`_position_in_fine_states`.  False
+        (DFT f(H)): the outputs are bitwise those of ``v/ΔE``.
+    pair_rule, pair_gap_ev : str, float
+        Same-occupation pairs of the window position (``r_window``, and the
+        c̃ṽ dipoles where W mixes valence and conduction rows):
+        ``mask`` (default) ``1 − exp(−ΔE²/(2 gap²))``, ``cut``, ``cv``;
+        ``tdagw.td_system.position_from_velocity``'s rule and scale.
 
     Returns
     -------
@@ -819,7 +928,22 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         list both are indexed by; ``source`` (absolute path),
         ``velocity`` (the file's operator label), ``route``; ``on_grid_rel``
         and ``n_on_grid``; ``image_locality`` {image: (outer-shell L2
-        fraction, outer-shell max / R=0)}.
+        fraction, outer-shell max / R=0)}.  With ``full_window``:
+        ``v_window`` (3, nk_f, nb_fi, nb_fi) complex128 host, Ry·bohr,
+        ``⟨i|v̂_α|j⟩`` (bra i, ket j, valence rows first, the same U_q
+        contraction as ``d_alpha``), and ``e_dft_window`` (nk_f, nb_fi)
+        float64 host, Ry, the velocity's own band energies (the Newton
+        inversion above), so ``d_alpha = v_window[:, :, nv:, :nv] /
+        (e_dft_window[:, nv:, None] - e_dft_window[:, None, :nv])`` on the
+        DFT path; and ``r_window`` (3, nk_f, nb_fi, nb_fi) complex128 host,
+        bohr, ``⟨ĩ|r̂_α|j̃⟩`` over every window pair in the same states (the
+        pair rule above; no intraband position, i.e. a zero diagonal in the
+        velocity's eigenbasis, which the QP path rotates into the fine
+        states), so ``d_alpha = i r_window[:, :, nv:, :nv]`` on the QP path.  With ``qp_states``: ``d_alpha`` is the exact
+        r-form (``route`` names :data:`DENSIFIED_POSITION_FORM`),
+        ``d_alpha_rq`` the previous ``v/ΔE_RQ`` (diagnostic), ``rfix`` the
+        rotation's record (off-block mixing, window-sum invariance,
+        Σ|d|² after/before, the RQ shift of the lowest transition).
     """
     from bandstructure.fh_interp import (f_transform_eigs, image_locality,
                                          newton_inv, require_newton_converged)
@@ -891,12 +1015,70 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
             f"whose conduction bands lie above its valence bands in that "
             f"Hamiltonian (dipole_qsgw.h5 for a QSGW state).")
     d_alpha = np.moveaxis(v_cv, 1, 0) / de_cv[None]             # (3, nq, nc, nv)
+    if pair_rule not in DENSIFIED_POSITION_PAIR_RULES:
+        raise ValueError(
+            f"GATE densified_pair_rule: got {pair_rule!r}; want one of "
+            f"{' | '.join(DENSIFIED_POSITION_PAIR_RULES)}; why: the rule "
+            f"decides the same-occupation pairs of the window position; fix: "
+            f"pass pair_rule='mask' (default).")
+    gap_ry = float(pair_gap_ev) / RYD_TO_EV
+    v_win = f_win = None
+    if qp_states or full_window:
+        nb_win = int(e_dft.shape[1])
+        win = np.asarray(gather_to_host(jax.jit(
+            lambda o: o[:nq, :, :nb_win, :nb_win])(out)))          # (nq, 4, nb, nb)
+        v_win, f_win = np.moveaxis(win[:, :3], 1, 0), win[:, 3]
+        del win
+    d_alpha_rq = rfix = r_window = None
+    if qp_states:
+        def _newton(phi):
+            e, res = newton_inv(a_f, n_f, shift, jnp.asarray(phi))
+            require_newton_converged(float(res), where="densified_dipoles r-fix")
+            return np.asarray(e, dtype=np.float64)
+        r_window, eps_eig, offblock, cv_eig_sum = _position_in_fine_states(
+            v_win, f_win, n_val, _newton, rule=pair_rule, gap_ry=gap_ry)
+        de_eig = eps_eig[:, n_val:, None] - eps_eig[:, None, :n_val]
+        if not float(de_eig.min()) > 0.0:
+            raise ValueError(
+                f"GATE densified_position_gap: got min (eps_c - eps_v) = "
+                f"{float(de_eig.min()) * RYD_TO_EV:.6g} eV in the DFT "
+                f"eigenbasis of the fine f(H) block; want > 0 at every q; why: "
+                f"r = v/(i dE) needs the window's conduction rows above its "
+                f"valence rows in the velocity's Hamiltonian; fix: a window "
+                f"whose QP and DFT orders agree across the gap.")
+        d_alpha_rq = d_alpha
+        d_alpha = 1j * r_window[:, :, n_val:, :n_val]
+        f_off = float(np.max(np.linalg.norm(
+            f_win - np.einsum("qii->qi", f_win)[..., None] * np.eye(f_win.shape[-1]),
+            axis=(1, 2)) / np.maximum(np.linalg.norm(f_win, axis=(1, 2)), 1e-300)))
+        sum_fix = float(np.sum(np.abs(d_alpha) ** 2))
+        sum_rq = float(np.sum(np.abs(d_alpha_rq) ** 2))
+        low_shift = (de_cv.min(axis=(1, 2)) - de_eig.min(axis=(1, 2))) * RYD_TO_EV * 1e3
+        rfix = {"applied": True, "pair_rule": pair_rule, "pair_gap_ev": float(pair_gap_ev),
+                "max_offblock_mixing": float(offblock.max()),
+                "fh_offdiag_rel_max": f_off,
+                "window_sum_eig_over_fixed": float(cv_eig_sum / sum_fix) if sum_fix > 0 else float("nan"),
+                "sum_d2_fixed_over_rq": float(sum_fix / sum_rq) if sum_rq > 0 else float("nan"),
+                "lowest_dE_rq_minus_eig_meV_mean": float(low_shift.mean()),
+                "lowest_dE_rq_minus_eig_meV_max": float(np.abs(low_shift).max())}
+        log_fn(f"[bse_k_grid dipoles] r-fix (fine states of a QP f(H)): r from the "
+               f"DFT eigenbasis of their f(H) block, rotated back; max off-block "
+               f"(v<->c) mixing {rfix['max_offblock_mixing']:.3e}; f(H) off-diagonal "
+               f"max {f_off:.3e} (relative); window sum |d|^2 eigenbasis/fixed "
+               f"{rfix['window_sum_eig_over_fixed']:.12f}; sum |d|^2 fixed/RQ "
+               f"{rfix['sum_d2_fixed_over_rq']:.6f}; lowest dE RQ - eigen mean "
+               f"{rfix['lowest_dE_rq_minus_eig_meV_mean']:.3f} meV, max "
+               f"{rfix['lowest_dE_rq_minus_eig_meV_max']:.3f} meV")
+    elif full_window:
+        r_window = _position_from_velocity_rule(v_win, e_dft, n_val,
+                                                rule=pair_rule, gap_ry=gap_ry)
 
     on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
         out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
         k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start,
         fh_energies=fh_energies)
-    del out
+    v_window = v_win if full_window else None                   # (3, nq, nb, nb)
+    del out, f_win
     shift_mev = float(np.max(np.abs(
         e_dft - np.asarray(gather_to_host(fine.enk_full))))) * RYD_TO_EV * 1e3
     log_fn(f"[bse_k_grid dipoles] {path} ({label}) carried through the "
@@ -927,18 +1109,29 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
             f"contraction convention disagrees with the htransform that built "
             f"ψ, so the dipoles are not in its gauge; fix: report it, this is "
             f"a bookkeeping defect.")
-    return {
+    result = {
         "d_alpha": d_alpha,
         "de_cv": de_cv,
         "q_frac": q_frac,
         "source": os.path.abspath(str(path)),
         "velocity": str(label),
-        "route": "bse_k_grid htransform velocity (bse_densify.densified_dipoles)",
+        "route": "bse_k_grid htransform velocity (bse_densify.densified_dipoles)"
+                 + (f" + {DENSIFIED_POSITION_FORM}" if qp_states else ""),
         "on_grid_rel": float(on_grid_rel),
         "on_grid_state_dev": float(state_dev),
         "n_on_grid": int(n_on_grid),
         "image_locality": locality,
     }
+    if full_window:
+        result["v_window"] = v_window
+        result["e_dft_window"] = e_dft
+        result["r_window"] = r_window
+        result["pair_rule"] = pair_rule
+        result["pair_gap_ev"] = float(pair_gap_ev)
+    if qp_states:
+        result["d_alpha_rq"] = d_alpha_rq
+        result["rfix"] = rfix
+    return result
 
 
 def _coefficients_by_q(coeffs, carrier, mesh_xy):
@@ -1038,6 +1231,9 @@ def _interpolate_bse_data_to_grid(
     htransform_quality_record_fn=None,
     eqp_file: str | None = None,
     velocity_file: str | None = None,
+    velocity_full_window: bool = False,
+    velocity_pair_rule: str = "mask",
+    velocity_pair_gap_ev: float = 0.05,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -1089,6 +1285,12 @@ def _interpolate_bse_data_to_grid(
         the deck WFN before the fit, then carried through the same htransform
         as ψ (:func:`densified_dipoles`); the bundle's ``dipoles`` key holds
         the fine-grid window dipoles in its own ψ gauge, ``None`` without it.
+    velocity_full_window : bool
+        Pass ``full_window`` to :func:`densified_dipoles`, so ``dipoles``
+        also holds the velocity over every window pair (TD-aGW).
+    velocity_pair_rule, velocity_pair_gap_ev : str, float
+        :func:`densified_dipoles`' ``pair_rule`` / ``pair_gap_ev`` (the
+        same-occupation pairs of ``r_window``).
     head_channel : dict or None
         C1's split-and-reattach hand-off from the loader, ``None`` on the
         ``legacy`` arm.  When present it carries ``whead`` (the head scalar the
@@ -1222,7 +1424,9 @@ def _interpolate_bse_data_to_grid(
             velocity, sym=sym, basis=basis, fine=bundle,
             fh_energies=np.asarray(gather_to_host(enk_sigma)).T,
             coarse_grid=coarse_grid, n_val=n_val, window_start=b_min,
-            a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn)
+            a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn,
+            full_window=velocity_full_window, qp_states=eqp_file is not None,
+            pair_rule=velocity_pair_rule, pair_gap_ev=velocity_pair_gap_ev)
         del bundle.coeffs_fi, velocity
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))

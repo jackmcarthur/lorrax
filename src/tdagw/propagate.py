@@ -33,7 +33,6 @@ written into device buffers); the host sees the state only between chunks.
 """
 from __future__ import annotations
 
-import functools
 from typing import Callable, NamedTuple, Optional
 
 import numpy as np
@@ -94,7 +93,8 @@ class SampleSpec(NamedTuple):
     """What one sample measures (TDGW measurement workers).
 
     kinds : tuple of (name, kind, opts) with kind in Efield, polarization,
-        current, density_matrix, lessG and opts a tuple of (key, value).
+        current, density_matrix, lessG, carrier_density, exciton_projection
+        and opts a tuple of (key, value).
     """
     kinds: tuple
 
@@ -167,6 +167,11 @@ def place_operators(host: dict, mesh) -> tuple:
                   _place(_pad_k(np.asarray(v0_intra, complex), 1, nk_pad), mesh, 1)),
         intra=intra)
     return ops, nk_pad
+
+
+def place_projector(A, mesh, nk_pad: int):
+    """BSE eigenvectors (n_states, nk, nc, nv) on the mesh, k-sharded and padded."""
+    return _place(_pad_k(np.asarray(A, complex), 1, nk_pad), mesh, 1)
 
 
 def place_kernel(kmat, mesh):
@@ -269,8 +274,14 @@ def _sample(ph, ops, spec: SampleSpec, drive, *, cell_volume, nspinor):
                 b1, b2 = o["bslice1"], o["bslice2"]
                 blk = rho[:, :, b1[0]:b1[1], b2[0]:b2[1]]
                 out[name] = blk if kind == "density_matrix" else 1j * blk
+            elif kind == "carrier_density":
+                out[name] = eom.carrier_density(ops, rho, nspinor=nspinor)
+            elif kind == "exciton_projection":
+                out[name] = eom.exciton_projection(ops, rho, n_val=int(o["n_val"]))
             else:
-                raise ValueError(f"unknown measurement kind {kind!r}")
+                raise ValueError(f"GATE td_measurement_kind: got: {kind!r}; want: one of "
+                                 f"the kinds _sample implements; fix: internal (the deck "
+                                 f"parser admits only those)")
         return out
     return fn
 
@@ -321,7 +332,8 @@ def _fixed_step_fn(cfg: PropagatorConfig, ph, conjugate):
                            if cfg.remainder else c_fn(t, y, h))
             return (pin(y), jnp.concatenate([hist[2:], jnp.stack([b1, b2])]), k + 1)
         return step
-    raise ValueError(cfg.method)
+    raise ValueError(f"GATE td_method: got: {cfg.method!r}; want: dp54 | rk4 | etdrk4 | "
+                     f"magnus2 | cfm4; fix: internal (the deck parser admits only those)")
 
 
 def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh):
@@ -340,11 +352,16 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
     return jax.jit(build)(rho0, ops, mparams)
 
 
-@functools.lru_cache(maxsize=None)
 def _chunk_program(cfg: PropagatorConfig, spec: SampleSpec, model_apply,
                    model_name: str, drive_key, mesh, cell_volume: float,
                    nspinor: int, count: int, n_samples: int, last: bool):
-    """The jitted chunk for one static configuration (cached by its key)."""
+    """The jitted chunk for one static configuration.
+
+    Not cached here: ``run_propagation`` keeps one program per (chunk
+    length, last) for the duration of a run, so nothing outlives the run (a
+    process-wide cache keyed by the drive and model closures, hashed by
+    identity, was never hit by an equivalent run and pinned their operands).
+    """
     drive = drive_key[0]
     model = SelfEnergyModel(apply=model_apply, params=None, linear=True,
                             name=model_name)
@@ -384,12 +401,16 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     n_meas = int(mtsteps.size)
     fixed = cfg.method != "dp54"
     step0 = 0
+    programs = {}                       # (n_samples, last) -> jitted chunk, this run only
     for i0 in range(0, n_meas, cfg.chunk):
         i1 = min(n_meas, i0 + cfg.chunk)
         last = i1 == n_meas
-        prog = _chunk_program(cfg, spec, model.apply, model.name, (drive,),
-                              mesh, float(cell_volume), int(nspinor), int(count),
-                              int(i1 - i0), bool(last and not fixed))
+        key = (int(i1 - i0), bool(last and not fixed))
+        if key not in programs:
+            programs[key] = _chunk_program(cfg, spec, model.apply, model.name, (drive,),
+                                           mesh, float(cell_volume), int(nspinor),
+                                           int(count), *key)
+        prog = programs[key]
         times = jnp.asarray(mtsteps[i0:i1])
         carry, samples = prog(carry, ops, model.params, times, step0)
         step0 += (i1 - i0) * cfg.n_sub

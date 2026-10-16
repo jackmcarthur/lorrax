@@ -93,7 +93,8 @@ def require_parallel_h5py(n_ranks: int, mpi_enabled: bool | None = None) -> None
     if int(n_ranks) > 1 and not mpi_enabled:
         raise RuntimeError(
             f"GATE tdgw_bridge_h5py_mpi: got: serial h5py ({h5py.__file__}) under {int(n_ranks)} "
-            f"TDGW ranks; want: an h5py built against parallel HDF5; fix: put an MPI h5py linked "
+            f"TDGW ranks; want: an h5py built against parallel HDF5; why: TDGW's ranks write one "
+            f"tdgw.h5 together, and serial h5py writers corrupt it; fix: put an MPI h5py linked "
             f"to the libhdf5_parallel the LORRAX FFI loads first on PYTHONPATH, or run on one rank")
 
 
@@ -134,7 +135,8 @@ def tdgw_run_lorrax(config, dsigma, *, k_frac_expected=None, comm=None):
     from TDGW.td.ivp.ivp import solve_ivp
     if config.control.calc_type != "COHSEX":
         raise ValueError(f"GATE tdgw_bridge_calc_type: got: {config.control.calc_type!r}; "
-                         f"want: 'COHSEX'; fix: the bridge supplies the self-energy update, "
+                         f"want: 'COHSEX'; why: only TDGW's COHSEX path calls get_dSigma; "
+                         f"fix: the bridge supplies the self-energy update, "
                          f"so set calc_type = \"COHSEX\" (an IP run needs no bridge)")
     grid = R._prep(config, comm)
     if grid is None:
@@ -146,7 +148,8 @@ def tdgw_run_lorrax(config, dsigma, *, k_frac_expected=None, comm=None):
         if k_tdgw.shape != np.shape(k_frac_expected) or np.max(np.abs(d - np.rint(d))) > 1e-8:
             raise ValueError("GATE tdgw_bridge_kpts: got: TDGW's k list differs from the "
                              "model's TDGW-order list; want: the same points in the same "
-                             "order; fix: build the model from this run's indir/WFN.h5")
+                             "order; why: the bridge permutes rho and dSigma by that list; "
+                             "fix: build the model from this run's indir/WFN.h5")
     chkpdata = R._load_chkp(config, grid)
     Driver = lorrax_driver_class()
     Driver.lorrax_dsigma = staticmethod(dsigma)
