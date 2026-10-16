@@ -328,14 +328,16 @@ the full zone:
 | 471 8×8 (898), N_μ 3000 (`14_bseprod_c3000`) | 64, 3000 | 1.1 + 2.4 s | 2 × 0.2 × 6.4 = 2.6 s | 16.6 + 11.7 s | **~34 s** | — |
 | 471 8×8 (898), N_μ 6000 (`15_bseprod_c6000`) | 64, 6000 | 3.7 + 8.7 s | 2 × 0.9 × 6.4 = 11.5 s | 86.4 + 12.4 s | **~123 s** | — |
 | 30×30, 42v × 14c (`34_bseprodb_df3000r8_w88_144`) | via the 8×8 parent | as 8×8 | as 8×8 | window on 30×30 | **8×8 + densify** | 95.4 ms |
-| 518 12×12 (898), 30v × 30c (`32_bseprodb_k12_c3000`) | 144, 3000 | 2.4 + 14.6 s | 2 × 0.3 × 7.6 = 4.5 s | 46.3 + 13.9 s | **~82 s** | 309.3 ms |
+| 518 12×12 (898), 30v × 30c (`32_bseprodb_k12_c3000`) | 144, 3000 | 2.4 + 14.6 s | 2 × 0.3 × 7.6 = 4.5 s | 46.3 + 13.9 s | **≤ 82 s** | 309.3 ms |
 
 Measured, the static member (`screening="static_rpa"`: Eq. (5) cross-gap,
 Dyson on 36 q, Eq. (7) on the window, 160 bands) costs 0.41 s per warm call on
 516 at 4 A100, 139× the frozen `apply`; the exact same-side enumeration adds
 0.54 s. "Window Σ" is the Σ τ sweep plus the other Σ stages except exchange and
-Hartree, which $K\delta\rho$ already carries; the Dyson column scales the
-runs' wedge solves (10 q at 8×8, 19 at 12×12) to the full zone. The frozen
+Hartree, which $K\delta\rho$ already carries, measured on the runs' own
+160-band Σ window (`nval 130`, `ncond 30`): for a 30v × 30c window it is an
+upper bound. The Dyson column scales the runs' wedge solves (10 q at 8×8, 19
+at 12×12) to the full zone. The frozen
 `apply` walls are TDPROP's (516 2v2c) and TDMODEL's (30×30, 12×12) at b = 1;
 at 30v × 14c on 6×6 k it is 9.0 ms.
 
@@ -343,8 +345,8 @@ The 30×30 W update runs on the 8×8 parent (the 30×30 NSCF has 200 bands, not
 the 898 of the sums) and is densified as W already is
 (`bse_densify`, srlr/c1); the window populations are folded to the parent grid
 through the htransform. **Every-call refresh is unaffordable**: at 80 ΔΣ calls
-per fs (cfm4, 50 as, two corrections) the 12×12 refresh is 1.8 h per fs on 4
-A100, 265× the frozen `apply`. Memory: with no point-group symmetry the
+per fs (cfm4, 50 as, two corrections) the 12×12 refresh is up to 1.8 h per fs
+on 4 A100, up to 265× the frozen `apply`. Memory: with no point-group symmetry the
 $G_{\rm eq}$ parent tiles at 12×12 are $144\,(2\cdot3000)^2\cdot16$ B = 83 GB
 each (20.7 GB/rank at P4), so the refresh needs P16, k-chunked Greens
 (`feat/bse-wterm-chunking`) or a C3-symmetric drive (σ± at normal incidence on
@@ -359,7 +361,7 @@ tolerance since the last refresh, and in between applies
 $\Delta\Sigma=K\delta\rho+\Delta\Sigma^{\rm dyn}_{\rm last}$ (its coherent part
 exact, its population part held). The refresh is a host-side decision at a
 chunk boundary, so the jitted step stays one program. At one refresh per fs,
-a 30 fs 12×12 drive costs 30 × 82 s + 2400 × 0.31 s ≈ 53 min on 4 A100.
+a 30 fs 12×12 drive costs at most 30 × 82 s + 2400 × 0.31 s ≈ 53 min on 4 A100.
 
 ## 8. Validation {#validation}
 
