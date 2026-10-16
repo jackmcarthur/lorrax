@@ -39,8 +39,10 @@ COMPAT="/usr/local/cuda-$CUDA_VER/compat"
 LD_DIRS=(
     "$SITE/nvidia/cudnn/lib"
     "$CUDA/lib64" "$CUDA/nvvm/lib64" "$CUDA/extras/CUPTI/lib64"
-    "$SDK/math_libs/$CUDA_VER/lib64" "$SDK/comm_libs/$CUDA_VER/nccl/lib"
+    "$SDK/math_libs/$CUDA_VER/lib64" "$SITE/nvidia/nccl/lib"
 )
+# NCCL is the venv's nvidia-nccl-cu13 wheel (stack.sh), never comm_libs: the
+# bundle's closure records the wheel's libnccl and refuses any other.
 [[ -d "$COMPAT" ]] && LD_DIRS+=("$COMPAT")
 IFS=: read -ra PINNED_DIRS <<< "$LORRAX_PM_RUNTIME_LIB_DIRS"
 LD_DIRS+=("${PINNED_DIRS[@]}" "$(dirname "$FABRIC_LIB")" /opt/cray/pe/lib64)

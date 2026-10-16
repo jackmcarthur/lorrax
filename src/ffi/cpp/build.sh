@@ -186,6 +186,14 @@ echo
 echo "[build] --- ldd check ---"
 ldd "${SO_FILE}" | grep -Ei 'cusolver|nccl|cuda|cal' || true
 
+# Dependency closure (lxkit.native_provider): every library of the leg's NEEDED
+# closure as this verify environment resolves it, recorded beside the leg; the
+# loader opens exactly those files and refuses a process mapping another copy.
+"${PYTHON_EXE:-python3}"  "${SCRIPT_DIR}/stage/write_checkout_closure.py" "${SO_FILE}" \
+    --python "${PYTHON_EXE:-python3}" --private-dir "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA}/lib64" \
+    --library-dirs "${LD_LIBRARY_PATH:-}" --skip-missing-dirs || {
+        echo "[build] FAILED: dependency closure" >&2; exit 1; }
+
 # ===========================================================================
 # THE BUILD CONTRACT.  Unconditional, and a failure here fails the build.
 #
@@ -261,7 +269,8 @@ echo "[build] GATE 9 PASSED: 0 lorrax_ffi internals exported"
 "${SCRIPT_DIR}/stage/stamp_provenance.sh" "${SO_FILE}" \
     "leg=cuda" \
     "nvhpc_cuda=${NVHPC_CUDA}" \
-    "build_dir=${BUILD_DIR}" || {
+    "build_dir=${BUILD_DIR}" \
+    "closure_sha256=$("${PYTHON_EXE:-python3}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "${SO_FILE}.closure.json")" || {
         echo "[build] WARNING: provenance stamp failed (build itself is fine)" >&2
     }
 

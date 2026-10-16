@@ -8,7 +8,9 @@
 # Layout under the prefix:
 #   python/                          uv-managed CPython the venv is built on
 #   venv/                            the runtime venv (setup_env.sh)
-#   build/                           SLATE + cuSOLVERMp stage, shared by builds
+#   native/                          SLATE + cuSOLVERMp stage, shared by builds
+#                                    (not build/: the sealer refuses search paths
+#                                    through a directory named build)
 #   releases/source-<rev8>/          git-archive snapshots (publish.sh)
 #   releases/<rev8>-bundle-<id12>/   sealed FFI bundles (publish.sh)
 #   modulefiles/<name>/<version>.lua the published module (publish.sh)
@@ -41,6 +43,8 @@ CUDNN_VERSION="9.12.0.46"            # nvidia-cudnn-cu13 (NERSC cuDNN targets CU
 CUSOLVERMP_VERSION="0.9.1.9318.post1" # also pinned in ../build_ffi_cuda.sh
 CUBLASMP_VERSION="0.10.0.3695"        # also pinned in ../build_ffi_cuda.sh
 MATHDX_VERSION="25.6.0"              # pyproject.toml [cuda13]; required on NVIDIA GPUs
+NCCL_VERSION="2.30.7"                # nvidia-nccl-cu13: the uv.lock pin, on every route
+                                     # (also ../build_ffi_cuda.sh); never comm_libs NCCL
 # shellcheck disable=SC1091
 source "$LORRAX_MODULE_DIR/../ffi_mpi.sh"
 
