@@ -107,6 +107,7 @@ def main():
     sysm = build_td_system(a.deck, mesh, bands=tuple(a.bands), dipole_file=a.dipole,
                            eqp_file=a.eqp, log=(print if rank0 else (lambda s: None)))
     td, hdr = sysm.model, sysm.hdr
+    k_hdr = np.asarray(hdr["kpts"])
     kgrid = tuple(int(n) for n in td["kgrid"])
     nk = int(np.prod(kgrid))
     restart = _find_restart_file(a.deck)
@@ -246,12 +247,12 @@ def main():
         jax.block_until_ready(sp["ff"])
         t_chi = time.perf_counter() - t0
         chi = sp["ff"] + sp["fa"] + sp["aa"]
-        W = gather(dyson(chi))
         nrm = lambda x: float(np.max(np.abs(gather(x))))
-        out["B1"] = dict(rel_q0=rel_q(W)[0], rel_qne0_max=max(rel_q(W)[1:]),
-                         rel_all_max=max(rel_q(W)), rel_per_q=rel_q(W),
-                         fa_share=nrm(sp["fa"]) / nrm(chi), aa_share=nrm(sp["aa"]) / nrm(chi),
-                         chi_build_s=t_chi)
+        shares = dict(fa_share=nrm(sp["fa"]) / nrm(chi), aa_share=nrm(sp["aa"]) / nrm(chi))
+        W = gather(dyson(chi))                      # solve_w donates chi: shares taken first
+        rq = rel_q(W)
+        out["B1"] = dict(rel_q0=rq[0], rel_qne0_max=max(rq[1:]), rel_all_max=max(rq),
+                         rel_per_q=rq, chi_build_s=t_chi, **shares)
         _done("B1", _t)
     except Exception:
         _failed("B1", _t)
@@ -313,8 +314,8 @@ def main():
     try:
         # ---- A1: frozen-W pulse (isdf vs dynsig frozen) ----
         host = header_operators(hdr, geometry="slab", esmear_ha=0.05 / 27.211386, intraband=False)
+        host["gamma"] = np.zeros((nA, nA))         # no depopulation/dephasing: a Hamiltonian run
         ops, nk_pad = tp.place_operators(host, mesh)
-        k_hdr = np.asarray(hdr["kpts"])
         rho_eq_h = np.zeros((nk_pad, nA, nA), complex)
         rho_eq_h[:nk] = gather(ops.rho_eq)[:nk]
         rho_eq = tp._place(rho_eq_h, mesh, 0)
@@ -334,8 +335,8 @@ def main():
             res = []
             stats, carry = tp.run_propagation(
                 cfg_p, spec, tp.place_state(rho_eq_h[None], mesh), ops, model, drive, mesh,
-                cell_volume=float(hdr["cell_volume"]) if "cell_volume" in hdr else omega,
-                nspinor=int(td["nspinor"]), count=1, mtsteps=np.arange(n_meas) * dt * n_sub,
+                cell_volume=float(host["cell_volume"]), nspinor=int(host["nspinor"]),
+                count=1, mtsteps=np.arange(n_meas) * dt * n_sub,
                 on_chunk=lambda i0, i1, s, rf, t: res.append((np.asarray(s["polarization"]), rf())))
             return np.concatenate([r[0] for r in res]), res[-1][1], stats
 
@@ -346,7 +347,9 @@ def main():
         relp = float(np.max(np.abs(p_frz - p_iso)) / np.max(np.abs(p_iso)))
         out["A1"] = dict(rel_P=relp, rel_rho=float(np.max(np.abs(r_frz - r_iso))
                                                    / np.max(np.abs(r_iso - rho_eq_h[None]))),
-                         max_abs_P=float(np.max(np.abs(p_iso))), dsigma_calls=int(st["dsigma"]))
+                         max_abs_P=float(np.max(np.abs(p_iso))), dsigma_calls=int(st["dsigma"]),
+                         max_abs_drho=float(np.max(np.abs(r_iso - rho_eq_h[None]))),
+                         cell_volume_bohr3=float(host["cell_volume"]))
 
         _done("A1", _t)
     except Exception:
