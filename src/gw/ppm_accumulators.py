@@ -80,6 +80,13 @@ def _window_pick_program(replicated):
 
 
 @lru_cache(maxsize=None)
+def _zeros_program(sharding, shapes):
+    """The accumulator's zero totals, made on device (no fill-value transfer)."""
+    return jax.jit(lambda: tuple(jnp.zeros(one, jnp.complex128) for one in shapes),
+                   out_shardings=(sharding,) * len(shapes))
+
+
+@lru_cache(maxsize=None)
 def _window_counter_program(replicated):
     """The first window's counter, made on device (a compiled constant, no transfer)."""
     return jax.jit(lambda: jnp.zeros((), jnp.int32), out_shardings=replicated)
@@ -237,7 +244,7 @@ class DeviceOmegaAccumulator:
                     "n_omega")
         # Each rank stores every output frequency and parent-k point for its
         # assigned block of the two band axes.
-        totals = tuple(jnp.zeros(one, jnp.complex128, device=sharding) for one in shapes)
+        totals = _zeros_program(sharding, shapes)()
         n_matrix = 1 if reduce is None else len(shape[0])
         self._total = (totals[0] if reduce is None else
                        (totals[:n_matrix], totals[n_matrix:]))

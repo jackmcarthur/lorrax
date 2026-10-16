@@ -150,6 +150,27 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 _CHARGE_KCONV: dict = {}
 
 
+_PLACED_LOAD = {}
+
+
+def _placed_load_tables(mesh_xy, plan, tables):
+    """``plan``'s unfold load tables placed once per (mesh, plan), shared by every kconv entry.
+
+    The kconv caches hold two entries (one per row extent); each new entry
+    re-placed the same plan tables (8 fields per entry).  ``tables`` is
+    ``plan.unfold_load_tables()`` (a pure function of the plan); the key holds
+    the plan, so its identity cannot be reused while the entry lives.
+    """
+    key = (mesh_xy, plan)
+    hit = _PLACED_LOAD.get(key)
+    if hit is None:
+        from symmetry_maps import device_load_tables
+        while len(_PLACED_LOAD) >= 2:
+            _PLACED_LOAD.pop(next(iter(_PLACED_LOAD)))
+        hit = _PLACED_LOAD[key] = (tables, tuple(device_load_tables(tables, mesh_xy)))
+    return hit[1]
+
+
 def _charge_stream_kconv(mesh_xy, kgrid, plan):
     """``ffi.fft.make_kconv_chi_unfold`` on ``plan`` and its tables placed once.
 
@@ -162,10 +183,9 @@ def _charge_stream_kconv(mesh_xy, kgrid, plan):
     hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
-        from symmetry_maps import device_load_tables
         tables = plan.unfold_load_tables()
         hit = (make_kconv_chi_unfold(mesh_xy, kgrid, tables, n_out=1, complete=False, norm="ortho"),
-               tuple(device_load_tables(tables, mesh_xy)))
+               _placed_load_tables(mesh_xy, plan, tables))
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
         _CHARGE_KCONV[key] = hit
@@ -186,14 +206,13 @@ def _charge_window_kconv(mesh_xy, kgrid, plan, rows):
     hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
-        from symmetry_maps import device_load_tables
         from .subtile_stream import window_tables
         base = plan.unfold_load_tables()
         side, ns = int(mesh_xy.shape["x"]), int(np.asarray(base.spin).shape[-1])
         local_rows = int(np.asarray(base.lsrc).shape[1]) // (side * ns)
         shape = base if int(rows) == local_rows else window_tables(base, rows, side, ns)
         hit = (make_kconv_chi_unfold(mesh_xy, kgrid, shape, n_out=1, complete=False, norm="ortho"),
-               tuple(device_load_tables(base, mesh_xy)))
+               _placed_load_tables(mesh_xy, plan, base))
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
         _CHARGE_KCONV[key] = hit

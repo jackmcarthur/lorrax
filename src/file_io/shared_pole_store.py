@@ -22,7 +22,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from runtime.padding import combined_divisor, padded_axis, spec_divisor
 from common import timing
-from common.collectives import (agree_io_error, device_put_process_local, process_rank, psum_replicate,
+from common.collectives import (agree_io_error, device_put_process_local, device_put_process_local_cached,
+                                process_rank, psum_replicate,
                                 rank0_transaction)
 from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import agree_io_refusal, assert_committed, set_commit_state
@@ -395,6 +396,30 @@ def _factor_valid(b, poles2, K):
           & jnp.all(jnp.where(active[:, 1:], poles2[:, 1:] >= poles2[:, :-1], True)))
 
 
+def _poles_valid_host(poles2, K):
+    """The poles/counts part of :func:`_factor_valid` on host arrays (the same predicates)."""
+    active = np.arange(poles2.shape[1])[None, :] < K[:, None]
+    return bool(np.all(np.isfinite(poles2))
+                & np.all(np.where(active, poles2 > 0, poles2 == 1))
+                & np.all(np.where(active[:, 1:], poles2[:, 1:] >= poles2[:, :-1], True)))
+
+
+@jax.jit
+def _factor_b_valid(b, K):
+    """The factor part of :func:`_factor_valid`: finite, exact zero past each count."""
+    active = jnp.arange(b.shape[3])[None, :] < K[:, None]
+    return jnp.all(jnp.isfinite(b)) & jnp.all(jnp.where(active[:, None, None, :], True, b == 0))
+
+
+def _placed_counts(b, K):
+    """``K`` replicated on ``b``'s mesh, placed once per distinct count vector."""
+    from jax.sharding import NamedSharding, PartitionSpec
+    sharding = getattr(b, "sharding", None)
+    if not isinstance(sharding, NamedSharding):
+        return K
+    return device_put_process_local_cached(np.ascontiguousarray(K), NamedSharding(sharding.mesh, PartitionSpec()))
+
+
 @timing.timed("factor_validation")
 def _check_factor(b, poles2, K):
     """Gate the physical active prefix and exact inactive sentinel."""
@@ -404,7 +429,12 @@ def _check_factor(b, poles2, K):
         _refuse("factor/poles/count shape mismatch")
     if np.any(K < 0) or np.any(K > b.shape[3]):
         _refuse("K outside factor column capacity")
-    ok = _factor_valid(b, poles2, K)
+    if isinstance(poles2, np.ndarray) and isinstance(K, np.ndarray):
+        # Host poles and counts (the digest's chunks): their predicates on the
+        # host, the factor's on the device with the counts placed once.
+        ok = _poles_valid_host(poles2, K) and bool(_factor_b_valid(b, _placed_counts(b, K)))
+    else:
+        ok = _factor_valid(b, poles2, K)
     if not bool(ok):
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
