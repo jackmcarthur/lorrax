@@ -30,7 +30,7 @@ G3 a sigma+ pulse centred on the sigma- state S1 leaves S1 empty (<= 1e-12 of
 R1 the reversed convention (I+ = |D_x + i D_y|^2/2) labels S1 sigma+: G2 fails
 R2 the drive (cos wt, -sin wt) presented as sigma+: G2 fails
 R3 dipoles with a 1e-3 x/y anisotropy (C3 broken in r only, as finite-difference
-   dipoles on a coarse grid break it): G2's 1e-12 fails, N(sigma-)/N(sigma+) ~ 1e-7
+   dipoles on a coarse grid break it): G2's 1e-12 fails, N(sigma-)/N(sigma+) = 3e-8
 """
 import os
 

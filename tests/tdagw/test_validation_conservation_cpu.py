@@ -30,9 +30,10 @@ Work theorem: Simpson quadrature of E.j on the 10-as samples, error
 truncation at 1 as (4e-7): 1e-6.  Energy after the pulse: 1e-9 of the
 absorbed energy.  Equilibrium: the Runge-Kutta family's right-hand side
 vanishes identically at rho_eq (1e-15); a Magnus step conjugates the whole
-rho, whose O(1) occupations set an absolute rounding of ~eps per exponential
+rho, whose O(1) occupations set an absolute rounding of ~u per exponential
 that accumulates linearly (the Magnus rounding floor of the theory page):
-N_exp eps <= 2e-12 for the <= 1.5e4 exponentials of these runs.
+N_exp u = 1.7e-12 for the <= 1.5e4 exponentials of these runs (u = 2^-53 = 1.1e-16,
+the unit roundoff): 2e-12.
 
 G1 Tr rho_k = n_val, rho = rho^H, rho^2 = rho, every method, Gamma = 0
 G2 E(t) - E(0) == Omega int E.j dt; E constant after the pulse; every method
