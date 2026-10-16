@@ -742,7 +742,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         trs = hole_trs if (ordered and space == 'val') else particle_trs
         return f"{int(np.sum(trs == 0))}/{int(np.sum(trs == 1))}"
     synthesis.path_note = (
-        "Sigma W synthesis: realization " + ("identity pair" if all_identity else "little-group")
+        "route Sigma W synthesis: realization " + ("identity pair" if all_identity else "little-group")
         + f" ({sum(p['identity'] for p in panels)}/{len(panels)} panels), "
         + ("ordered" if ordered else "trs-even") + " store; "
         + "; ".join(f"{sp} rows W/Wt {_rows(sp)} -> {branch_orientation(sp)}"
@@ -2516,7 +2516,7 @@ def compute_sigma_c_mpa_omega_grid(
                         if sector_context is None else sector_context["synthesis"](
                             reader, ledger, frequencies, schedule))
                     print_fn("  " + getattr(synthesis, "path_note",
-                                            "Sigma W synthesis: pair (no per-branch orientation)"))
+                                            "route Sigma W synthesis: pair (no per-branch orientation)"))
                 # A sector's caller owns its synthesis lifetime
                 # (compute_sector_sigma); the scalar model's ends here.
                 owned = sector_context is None
