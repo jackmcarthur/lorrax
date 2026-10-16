@@ -16,8 +16,13 @@ eigenvectors are ``[u; w] / sqrt 2``), as ``distrib_la``'s polar factor does.
 rocSOLVER's ``zgesvd`` behind ``jnp.linalg.svd`` takes 5.3 s on the n = 1460
 pencil and its Jacobi driver returns wrong singular values (s rel err 0.96),
 so neither is the route (rcgpu_probe1: QR + dilation 0.34 s for the pencil).
-The rounding differs from host LAPACK: rules agree to rounding, not to the
-byte (rcgpu lane report).
+The dilation resolves a small singular value only to ~eps*sigma_max, where
+host LAPACK's bidiagonalization keeps it to ~1e-4 relative; a pencil read near
+its rounding floor (Fe V2 group [0:22]: sigma_80/sigma_1 ~ 1e-14 at the
+accepted count) then moves its nodes at 1e-3. :attr:`DevicePencils.sigma_error`
+declares that floor, and minimax decides an accepting geometry whose count it
+does not resolve again on ``host_pencils``: such a rule is the host's bytes
+(Fe: group [0:22] only; pool log rcgpu_ab8).
 
 Shapes are exact. Zero-padded buckets (zero rows and trailing zero columns of
 the stack, mathematically neutral) come back non-finite from the ROCm leg on
@@ -88,6 +93,11 @@ def _program(shape):
 
 class DevicePencils:
     """``minimax.host_pencils`` on the default device, on executables compiled ahead."""
+
+    #: Absolute singular-value error of the dilation, in units of sigma_max
+    #: (Fe V2 [0:22], geometry 3: sigma_80 = 8.9e-15 sigma_1 off by 17 %, ~7 eps);
+    #: minimax re-decides an acceptance whose count this does not resolve.
+    sigma_error = 8*float(np.finfo(np.float64).eps)
 
     def __init__(self):
         self._ready = {}                                   # (size, poles, columns) -> Future[Compiled]
