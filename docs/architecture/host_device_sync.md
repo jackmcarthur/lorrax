@@ -149,18 +149,16 @@ letting `jax.device_put` assert cross-process equality with an all-gather
 
 | site | what the host needs | how it gets it |
 |---|---|---|
-| spectral direction cuts (`distrib_la.polar.right_singular_vectors`, `leading_eigenvectors`) | per-row retained counts (they fix the carrier extent) and a finite verdict | `_device_cut_word`: one int64 `[counts…, nonfinite rows]` per eigh family. The spectrum stays on the device; `RetainedSpectrum` rows report their size without a transfer and read the family once if a caller asks for values. `LORRAX_CHECK_COUNTS=1` recomputes every cut on the host and refuses on disagreement (`GATE spectral_cut_agreement`). |
-| shared-pole partner rounds | counts above `cutoff² · max eig(top)`, closed over the multiplet | `distrib_la.leading_eigenvectors_above`: both eighs, the threshold and the closure on the device, one word |
 | checked solves (`distrib_la._result_check`) | failed? any notice to print? | `_read_status`: one int32 word `[failed, notice_0, …]` per status, on every rank. The error table is read only when a notice prints. |
 | the reciprocity census (`response_bank`) | receipt rows | scalars kept on the device and read once, at `_finish_receipt` |
 | the shared-pole model digest (`shared_pole_store._model_digest`) | refuse if any panel is invalid; hash bytes | per-panel verdicts read once after the loop; one `psum_replicate` of all q-batches' row hashes |
 | the Coulomb sub-span start, Σ window tables, omega-slab starts | loop control | device-carried counters (dput/w2, dput/w3) |
 | the bank's rule pencils | the shift pencil of a geometry | one read per consumed geometry, the next one prefetched ([shared-pole model §2](shared_pole_model.md)) |
 
-Fe V2 P=4, rank 0: polar reads 99 → 83 and 8.625 → 0.025 MB; checked-solve
+Fe V2 P=4, rank 0: checked-solve
 status 164 → 82; the reciprocity census 64 → 1; digest verdicts and reductions
-33 + 18 → 2 + 3. eqp was byte-identical in every case (lsync D2H and polar
-reports). The counts that remain set static shapes of the next programs, so the
+33 + 18 → 2 + 3. eqp was byte-identical in every case (lsync D2H
+report). The counts that remain set static shapes of the next programs, so the
 host must have them.
 
 ## 7 Loops and conditionals, both legs {#loops}

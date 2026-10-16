@@ -5,6 +5,90 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-16 — rocm/integration7: the ROCm leg's host syncs, transfers and kernels
+
+Integration 7 lands the lane branches listed below on `rocm/integration6` 4e6b28dfc. The rules
+and tools are in [Host–device sync](docs/architecture/host_device_sync.md),
+[Determinism](docs/architecture/determinism.md),
+[Start-up, environment and caches](docs/architecture/startup_environment.md) and
+[ROCm leg](docs/architecture/rocm_leg.md).
+- Fe V2, MI250X, P=4, one node: total 112.18 s (int6 control, frontier00605)
+  → 91.83 / 90.61 s (frontier00620; there was no int6 control on that node).
+  Rule construction 48.82 → 33.70 / 33.02 s, constructor 17.75 → 13.96 /
+  14.09 s, Σ τ other 7.89 → 6.72 / 6.70 s.
+- Rank-0 transfer census, int6 → int7 tip (`xsync/cen2` → `int7/cen5`): H2D
+  `device_put` 7545 → 713, D2H 2089 → 425, explicit D2H 461 → 71,
+  `block_until_ready` (array + `jax.`) 907 + 117 → 119 + 6. The `jax.` count
+  depends on timing (SlabIO waits only on reads still in flight), so other runs
+  give 6–17 (the lsync/w3 run below: 119 + 7 = 126).
+- eqp against int6/e5 (int7 tip, off-shell Σ_c): 2.3e-8 / 5.0e-8 eV (eqp0 / eqp1); the Fe gate is
+  ≤ 1e-7 eV.
+
+Every wall above is from the integration release notes (rank-0 stage timing;
+`/lustre/orion/mat280/scratch/jackmc/int7/<run>/run.r0.log`); per-lane numbers
+are from the lane's report.
+
+**With main's on-shell Σ_c (this merge).** main makes on-shell dynamic Σ_c the
+default (entry below). Merging it with dput/w2's device Σ window table needed one
+semantic resolution (`ppm_accumulators.integrate_window`/`run_window`,
+`sigma._sigma_window_table`): the shared-pole sweep keeps the window table for its
+operands (nodes, masks, reference energies, intervals), and on shell each window's
+coefficient is main's `_on_shell_pack`, placed once with the table
+(`DeviceOmegaAccumulator.on_shell_coefficients`), so a window still transfers nothing
+from the host. Fe V2 P=4 on the release branch (frontier03277): total 89.33–95.02 s,
+Σ τ other 6.13 s (6.67 s for the off-shell int7 tip on the same node). Against the
+off-shell int7 tip, eqp0 moves ≤ 0.032 eV; eqp1 moves up to 10.4 eV on states on Σ
+pole structure, because Z is now the analytic derivative (Z ∈ [−1.44, 3.20]; 241 of
+1664 states with |ΔZ| > 0.1). The Fe reference is re-established on this branch.
+Follow-up: an on-shell `window_pick` (today the table's dense coefficient is still
+computed on the device and discarded on shell; transient capacity × n_ω complex).
+
+**What a user must change.**
+- **Per-stage walls need `LORRAX_STAGE_SYNC=1`.** Timing-only device waits no
+  longer run by default. Totals are exact, but a stage row is host-attributed:
+  device work is charged to the first later stage that reads it. The stage table
+  prints which attribution is in force.
+- **The environment freezes at start-up step 7b.** A LORRAX write that adds an
+  environment key after that refuses (`GATE env-frozen`); another library's is
+  announced. A warning of either kind in a log is a bug to report.
+- **Rebuild the ROCm FFI library** from this tree (`config/frontier/build_ffi_rocm.sh`).
+  New handlers: `kdft_kconv_parent`, `kdft_plane_fft_gather`, the read_multi
+  phdf5 handler, and the MFMA tiles of `active_gemm_device`.
+- **`wfn_trs` stamps** move to schema `wfn-trs-stamp-v2`: an old stamp is a miss
+  and is measured again once.
+- **Multi-rank runs no longer depend on the GPU placement.** The four-rank
+  reductions on the Fe path are rank-ordered, so two runs with different
+  rank→GPU maps give the same bits.
+- New registry rows: `LORRAX_STAGE_SYNC`, `LORRAX_CHECK_COUNTS`,
+  `LORRAX_KDFT_KBOX_ARM`.
+
+| lane (commit) | what | measured effect (Fe V2 P=4 unless noted) | gate |
+|---|---|---|---|
+| ctorfix/w8 (b601b2801), mfma/w8 (43af0af0b), dput/w1 (6259b21ef), census tool (8f6a2c8fe) | stacked partner eighs and device pack tables; FP64 MFMA tiles in the device-bounds active-range GEMM; content-keyed cached placement and the device-agreed polar spectrum | merged together: total 112.18 → 104.87 s, constructor 17.75 → 14.34 s, Σ τ other 7.89 → 6.82 s, line_select 1.48 → 1.03 s; census H2D `device_put` 7545 → 1528 | active gate 64/64 at P=4; eqp 2.1e-8 / 6.2e-8 eV |
+| dput/w2 (8229a52e3) | Σ window table on the device, device zeros and row slices, pack offsets on the device, SlabIO commit zeros | bank and Σ stages pass `transfer_guard("disallow")` (lane, g5b) | eqp 1.4e-8 / 2.1e-8 eV |
+| kconv/w1 (446148490) | kdft modes 1 and 10 on ROCm | ζ 3.14 → 3.00 s; ζ device peak per rank 10.70 → 6.77 GB; mode 1 2.45×, mode 10 1.32× per call (lane) | `test_kdft_parent_gate.py` at P=4, 1e-12 |
+| crash/w8 (c885977cc) | the environment freeze (rc 139 start-up SIGSEGV); atomic, validated `wfn_trs` stamps | 0 crashes in 48 stressed start-ups (lane) | CPU +12 tests (`test_env_guard`, cache safety) |
+| lsync/final (42c9647a7) | χ₀ contour accumulate with a static-trip inner loop | χ₀ direct dispatch 12 930 → 5 798 syncs at P=1; wall neutral (lane) | eqp bitwise |
+| slabmr/w8 (60c9049af) | `SlabIO.read_multi` / `PhdfReadMulti` on every leg | `sample_batch_read` 2.80–2.87 → 2.12–2.16 s; constructor host syncs 836 → 292 (lane) | phdf5 read_multi gate 10/10 at P=4 |
+| lsync/w3 (8e3d3eec0) | timing-only waits under `LORRAX_STAGE_SYNC=1`; coordination-service barrier; read heartbeat off the caller | explicit waits 1024 → 126 per rank; walls 106.98 → 106.94 s same node (lane) | eqp byte-identical |
+| rcgpu/w1 (ee0e014ff) | rule-construction shift pencils on the GPU | rule construction 49.23 → 33.76 s (lane) | eqp 6.2e-7 / 1.54e-6 eV (gate ≤ 5e-6) |
+| mfma2/w9 (9f46a8690) | active GEMM 32×32 tile and register K prefetch | Σ τ other 7.00 → 6.67 s (lane); W full-K call 10.4 → 13.9 TF/s | active gate 64/64 |
+| dput/w3 (29a402fab) | polar counts cut on the device; Coulomb sub-span start and Σ ω-slab starts on the device | rank-0 H2D 1531 → 1446 (lane) | eqp 2.6e-8 / 5.4e-8 eV vs the previous tip |
+| lsync/w4 (2caadcb95) | rank-uniform status word per checked solve; deferred reciprocity census; batched digest verdicts and reduction | census D2H 455 → 425, explicit D2H 235 → 71 (merges 11–12 together) | eqp bitwise, same node |
+| rcgpu/w2 (5252601a4) | host re-decision of device acceptances the dilation cannot resolve | eqp vs e5 1.5e-6 → 2.3e-8 / 5.0e-8 eV; +0.2–0.3 s (lane) | Fe gate ≤ 1e-7 eV restored |
+| det/w1 (92385e7fc) | rank-order four-rank reductions (`lxkit.ordered_psum`, `ordered_psum_scatter`) | bitwise across three placements on two nodes; wall cost not measurable (lane) | hsuite scalar chain; `test_ordered_collectives.py` |
+
+**Known issues** (release notes):
+- hsuite na_sc: on the det tip a deterministic `GATE shared_pole_zero_ritz` (q=2,
+  SC W map 0) on every placement; before det/w1 it was flaky (a tolerance miss of
+  1.09–1.12e-1 eV against 4.3e-2, or an intermittent V_q NaN). Root cause: a
+  marginal SC path sensitive to 1-ulp reduction order; owned by the crash lane.
+- bisp_sc: before det/w1 it intermittently refused with an all-zero CT Gram
+  (`GATE shared_pole_sector_retained_metric_positive`); after det/w1 it passed on
+  every placement tested (three placements, two nodes) and on the release branch.
+- On shell, the Σ window table's dense coefficient is computed and discarded
+  (follow-up: an on-shell `window_pick`).
+
 ## 2026-10-16 — `bse_k_grid` with `--eqp`: the QP energies enter the htransform
 
 `bse_jax` and `absorption_haydock` re-sliced the coarse restart's QP energies
