@@ -226,6 +226,21 @@ def exciton_dipoles(r, A, n_val: int) -> np.ndarray:
     return np.einsum("skcv,xkvc->sx", np.asarray(A), r_vc)
 
 
+def eigenvector_kpts(params: dict, nk: int) -> np.ndarray:
+    """The k points of a ``load_eigenvectors_h5`` params dict as (nk, 3).
+
+    ``bse_jax`` writes ``exciton_header/kpoints/kpts`` in the BerkeleyGW
+    layout (3, nk) (``bse_window`` stores ``kpts.T``); (nk, 3) is accepted too.
+    """
+    kp = np.asarray(params["kpts"], dtype=np.float64)
+    if kp.shape == (3, nk):
+        return kp.T.copy()
+    if kp.shape == (nk, 3):
+        return kp
+    raise _gate("td_eigenvector_kpts", f"kpts of shape {kp.shape}", f"(3, {nk}) or ({nk}, 3)",
+                "pass a bse_jax --write-eigs file of the same k grid")
+
+
 def bse_dipole_receipt(r, eigenvectors_file: str, n_val: int, kpts, *,
                        n_states: Optional[int] = None) -> dict:
     """The BSE's stored ``⟨0|r̂|S⟩`` reproduced from this header's r.
@@ -239,7 +254,8 @@ def bse_dipole_receipt(r, eigenvectors_file: str, n_val: int, kpts, *,
     _, A, params = load_eigenvectors_h5(eigenvectors_file)
     _, stored = load_exciton_dipoles_h5(eigenvectors_file)
     n = A.shape[0] if n_states is None else min(int(n_states), A.shape[0])
-    dk = np.asarray(params["kpts"], dtype=np.float64) - np.asarray(kpts, dtype=np.float64)
+    kpts = np.asarray(kpts, dtype=np.float64)
+    dk = eigenvector_kpts(params, kpts.shape[0]) - kpts
     if dk.shape != (A.shape[1], 3) or np.abs(dk - np.rint(dk)).max() > 1e-6:
         raise _gate("td_projection_kpoints", "eigenvector k list differs from the header's",
                     "the same k points in the same order",

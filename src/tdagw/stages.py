@@ -110,7 +110,9 @@ def _projector(kw: dict, hdr: dict) -> np.ndarray:
         raise ValueError(f"GATE td_projection_window: got: eigenvectors (nk, nc, nv) = "
                          f"{A.shape[1:]}; want: {(nk, nb - n_val, n_val)}; fix: solve the "
                          f"BSE on the TD window and k grid")
-    dk = np.asarray(params["kpts"], float) - np.asarray(hdr["kpts"], float)
+    from tdagw.td_system import eigenvector_kpts
+    hk = np.asarray(hdr["kpts"], float)
+    dk = eigenvector_kpts(params, hk.shape[0]) - hk
     if np.abs(dk - np.rint(dk)).max() > 1e-6:
         raise ValueError("GATE td_projection_kpoints: got: an eigenvector k list that "
                          "differs from the header's; want: the same k points in the same "

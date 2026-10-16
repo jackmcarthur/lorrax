@@ -133,7 +133,7 @@ def _write_eigenvectors(path, A, kpts, *, eig_ev, dipoles=None):
             p[key] = val
         kp = f.create_group("exciton_header/kpoints")
         kp["nk"] = nk
-        kp["kpts"] = np.asarray(kpts, float)
+        kp["kpts"] = np.asarray(kpts, float).T.copy()        # bse_jax layout (3, nk)
 
 
 def test_bse_dipole_receipt_and_the_swapped_twin(tmp_path):
