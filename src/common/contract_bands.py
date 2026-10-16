@@ -166,6 +166,7 @@ import functools
 from typing import Callable
 
 import jax
+from lxkit import ordered_psum_scatter
 import numpy as np
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -250,7 +251,6 @@ def reduce_scatter_to_band_block(part, *, px: int, py: int,
     shape[ra:ra + 1] = [px, m // px]        # ra < ca: split the later first
     r = jnp.moveaxis(part.reshape(shape), (ra, ca + 1), (0, 1))
     r = r.reshape(px * py, *r.shape[2:])
-    from lxkit import ordered_psum_scatter     # rank order on every GCD placement
     return ordered_psum_scatter(r, axes, scatter_dimension=0, tiled=False)
 
 
@@ -626,7 +626,7 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
                            for o in ops])
             if rows is None:                 # x blocks carry their padding rows
                 t = jnp.pad(t, ((0, 0),) * 3 + ((0, slab_pad), (0, 0)))
-            t = jax.lax.psum_scatter(t, ax_y, scatter_dimension=3,
+            t = ordered_psum_scatter(t, ax_y, scatter_dimension=3,
                                      tiled=True)
             return jnp.einsum("kasm,eksmc->ekac", slab, t)
 
@@ -1029,7 +1029,7 @@ def contract_bands_block_reshard(
         right_im = _right(jnp.imag(o_local))
         # ONE psum_scatter(y) for both channels; n is axis 4 of the stack:
         # (2, nk, s, μ_X_loc, n) → (2, nk, s, μ_X_loc, n/p_y)
-        right_rs = jax.lax.psum_scatter(
+        right_rs = ordered_psum_scatter(
             jnp.stack([right_re, right_im], axis=0), ax_y,
             scatter_dimension=4, tiled=True)
 
@@ -1042,7 +1042,7 @@ def contract_bands_block_reshard(
         result_im = _left(right_rs[1])
         # ONE psum_scatter(x) for both channels; m is axis 2 of the stack:
         # (2, nk, m, n/p_y) → (2, nk, m/p_x, n/p_y)
-        out = jax.lax.psum_scatter(
+        out = ordered_psum_scatter(
             jnp.stack([result_re, result_im], axis=0), ax_x,
             scatter_dimension=2, tiled=True)
         return (out[0].astype(jnp.complex128),
@@ -1054,35 +1054,35 @@ def contract_bands_block_reshard(
         # extra="none"; de-promoted (policy 3) when O is real.
         right = _right_maybe_split(o_local, psi_yn_local, _right_none)
         # ONE psum_scatter(y): (nk, s, μ_X_loc, n) → (nk, s, μ_X_loc, n/p_y)
-        right_rs = jax.lax.psum_scatter(right, ax_y,
+        right_rs = ordered_psum_scatter(right, ax_y,
                                         scatter_dimension=3, tiled=True)
         result = jnp.einsum('kmsx,ksxn->kmn',
                             jnp.conj(psi_xr_local), right_rs, optimize=True)
         # ONE psum_scatter(x): (nk, m, n/p_y) → (nk, m/p_x, n/p_y)
-        return jax.lax.psum_scatter(result, ax_x,
+        return ordered_psum_scatter(result, ax_x,
                                     scatter_dimension=1, tiled=True)
 
     def _body_leading(psi_xr_local, o_local, psi_yn_local):
         right = _right_maybe_split(o_local, psi_yn_local, _right_leading)
         # ONE stacked psum_scatter(y) for all E slices (policy 2):
         # (E, nk, s, μ_X_loc, n) → (E, nk, s, μ_X_loc, n/p_y)
-        right_rs = jax.lax.psum_scatter(right, ax_y,
+        right_rs = ordered_psum_scatter(right, ax_y,
                                         scatter_dimension=4, tiled=True)
         result = jnp.einsum('kmsx,eksxn->ekmn',
                             jnp.conj(psi_xr_local), right_rs, optimize=True)
         # (E, nk, m, n/p_y) → (E, nk, m/p_x, n/p_y)
-        return jax.lax.psum_scatter(result, ax_x,
+        return ordered_psum_scatter(result, ax_x,
                                     scatter_dimension=2, tiled=True)
 
     def _body_minor(psi_xr_local, o_local, psi_yn_local):
         right = _right_maybe_split(o_local, psi_yn_local, _right_minor)
         # (nk, s, μ_X_loc, n, E) → (nk, s, μ_X_loc, n/p_y, E)
-        right_rs = jax.lax.psum_scatter(right, ax_y,
+        right_rs = ordered_psum_scatter(right, ax_y,
                                         scatter_dimension=3, tiled=True)
         result = jnp.einsum('kmsx,ksxne->kmne',
                             jnp.conj(psi_xr_local), right_rs, optimize=True)
         # (nk, m, n/p_y, E) → (nk, m/p_x, n/p_y, E)
-        return jax.lax.psum_scatter(result, ax_x,
+        return ordered_psum_scatter(result, ax_x,
                                     scatter_dimension=1, tiled=True)
 
     # -- specs, guard, shard_map ---------------------------------------

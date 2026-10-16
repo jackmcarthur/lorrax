@@ -774,7 +774,7 @@ def _operator_digest_program(mesh_xy, shape):
         g = 2 * ((q * jnp.uint64(n) + r) * jnp.uint64(m) + c)
         bits = jax.lax.bitcast_convert_type(jnp.stack([v.real, v.imag], -1), jnp.uint64)
         total = jnp.sum(bits[..., 0] * (2 * g + 1) + bits[..., 1] * (2 * g + 3), dtype=jnp.uint64)
-        return jax.lax.psum(total, ("x", "y"))
+        return jax.lax.psum(total, ("x", "y"))  # exact-reduce: uint64 checksum
     return jax.jit(shard_map(local, mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(),
                              check_vma=False))
 

@@ -3478,7 +3478,7 @@ def _fractional_pair_scan_face(
             global_band - y_idx * shard_w_y, 0, shard_w_y - 1)
         gathered = jnp.take(psi_mun_local, local_idx, axis=3)
         gathered = jnp.where(owns[None, None, None, :], gathered, 0)
-        return jax.lax.psum(gathered, 'y')
+        return jax.lax.psum(gathered, 'y')  # exact-reduce: masked gather, one owner per band
 
     def _gather_nmu(psi_nmu_local, g_lo):
         """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank — masked-gather + psum('x') from psi_nmu's local shard (bands on 'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile` bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s, mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc) needs one transpose to match the band-last endpoint (nk, s, mu, n) order; see docs/architecture/fractional_chi0_response_face.md."""
@@ -3493,7 +3493,7 @@ def _fractional_pair_scan_face(
             global_band - x_idx * shard_w_x, 0, shard_w_x - 1)
         gathered = jnp.take(psi_nmu_local, local_idx, axis=1)
         gathered = jnp.where(owns[None, :, None, None], gathered, 0)
-        gathered = jax.lax.psum(gathered, 'x')
+        gathered = jax.lax.psum(gathered, 'x')  # exact-reduce: masked gather, one owner per band
         return jnp.transpose(gathered, (0, 2, 3, 1))
 
     # ``nb_full`` is a storage extent and can include rank-padding above the

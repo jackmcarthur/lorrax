@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import jax
+from lxkit import ordered_psum, ordered_psum_scatter
 import jax.numpy as jnp
 import os
 import numpy as np
@@ -1669,7 +1670,7 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int,
             local = jnp.einsum(
                 "akij,kij,bkij->ab", jnp.conj(v_local), weight, v_local, optimize=True
             )
-            return jax.lax.psum(local, (ax_x, ax_y))
+            return ordered_psum(local, (ax_x, ax_y))
 
         # Bounded frequency-by-band-pair temporary (mirrors
         # ``_head_wing_kernel``'s ``_HEAD_WING_FREQUENCY_BLOCK`` ring: see
@@ -1948,7 +1949,7 @@ def _head_wing_kernel_face(
                 part = _weighted_stack(lambda w: contract(w, *ends))
                 part = part.reshape(n_omega_padded, *part.shape[2:])
                 # M_b is tile-major: the scatter's chunk t is mu tile t's block.
-                blk_out = jax.lax.psum(jax.lax.psum_scatter(
+                blk_out = ordered_psum(ordered_psum_scatter(
                     part, scatter_axis, scatter_dimension=dim, tiled=True), sum_axis)
                 return jax.lax.dynamic_update_slice_in_dim(
                     acc, blk_out, start, axis=dim), None
@@ -2348,8 +2349,8 @@ def _static_head_wings_kernel_face(mesh: Mesh, layout="face", classes: bool = Fa
     sum_x = lambda value: value
     sum_y = lambda value: value
     if distributed_bands:
-        sum_x = lambda value: jax.lax.psum(value, ax_x)
-        sum_y = lambda value: jax.lax.psum(value, ax_y)
+        sum_x = lambda value: ordered_psum(value, ax_x)
+        sum_y = lambda value: ordered_psum(value, ax_y)
 
     def _band_slice(weight_full, coord, width):
         zero = jnp.zeros((), dtype=coord.dtype)
@@ -2530,14 +2531,14 @@ def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int,
             "akij,kij,bkij->ab",
             jnp.conj(v_local), weight, v_local, optimize=True,
         )
-        tensor = jax.lax.psum(local, (ax_x, ax_y))
+        tensor = ordered_psum(local, (ax_x, ax_y))
         if not metal_split:
             return tensor
         partner = jnp.where((ix[:, None] != iy[None, :])[None], share, 0.0)
         spread = jnp.real(jnp.einsum(
             "akij,kij,bkij->kiab", jnp.conj(v_local),
             partner.astype(v_local.dtype), v_local, optimize=True))
-        return tensor, jax.lax.psum(spread, ax_y)
+        return tensor, ordered_psum(spread, ax_y)
 
     split_specs = ((P(None, None, "x"), P(None, None, "y"), P(None, None))
                    if metal_split else ())
@@ -2672,7 +2673,7 @@ def _velocity_diagonal_kernel(mesh: Mesh) -> Callable:
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
         eq = (ix[:, None] == iy[None, :])[None, None]
-        return jax.lax.psum(
+        return jax.lax.psum(  # exact-reduce: the diagonal element has one owner on y
             jnp.real(jnp.sum(jnp.where(eq, v_local, 0.0), axis=-1)), ax_y)
 
     kernel = jax.jit(shard_map(
@@ -2878,8 +2879,8 @@ def _raw_hall_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
             & (~separated)
             & (jnp.abs(f_bra[:, :, None] - f_ket[:, None, :]) > 1.0e-12))
         return (
-            jax.lax.psum(cB_raw, (ax_x, ax_y)),
-            jax.lax.psum(unsafe.astype(jnp.int32), (ax_x, ax_y)),
+            ordered_psum(cB_raw, (ax_x, ax_y)),
+            jax.lax.psum(unsafe.astype(jnp.int32), (ax_x, ax_y)),  # exact-reduce: int32 counts
         )
 
     sm = shard_map(

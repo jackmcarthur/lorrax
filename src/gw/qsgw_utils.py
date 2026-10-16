@@ -361,7 +361,7 @@ def _extract_diag_sharded_kernel(mesh_xy: Mesh):
             vals = tile[:, :, a_c, b_c]         # (nω, nk, nb) local gather
             vals = jnp.where(own[None, None, :], vals,
                              jnp.zeros((), dtype=tile.dtype))
-            return jax.lax.psum(vals, axis_name=('x', 'y'))
+            return jax.lax.psum(vals, axis_name=('x', 'y'))  # exact-reduce: one owner per diagonal element
 
         fn = _diag_sharded
         _EXTRACT_DIAG_SHARDED_KERNEL_CACHE[key] = fn
@@ -421,7 +421,7 @@ def sigma_diag_at_omega_slots(sigma_w_kij, mesh_xy: Mesh, slots_s_kn, *,
             vals = tile[slot, k, a_c, b_c]      # (n_slot, nk, nb) local gather
             vals = jnp.where(own[None, None, :], vals,
                              jnp.zeros((), dtype=tile.dtype))
-            return jax.lax.psum(vals, axis_name=('x', 'y'))
+            return jax.lax.psum(vals, axis_name=('x', 'y'))  # exact-reduce: one owner per diagonal element
 
         fn = _diag_slots
         _EXTRACT_DIAG_SLOTS_KERNEL_CACHE[key] = fn

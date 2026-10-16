@@ -9,6 +9,7 @@ import os
 
 import numpy as np
 import jax
+from lxkit import ordered_psum
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -622,7 +623,7 @@ def fold_small_head_wings_sharded(
         local = jnp.einsum(
             "...am,...mn,...nb->...ab",
             y_local, w_local, z_local, optimize=True)
-        correction = jax.lax.psum(local, ("x", "y"))
+        correction = ordered_psum(local, ("x", "y"))
         return s_direct + correction / volume
 
     folded = shard_map(
@@ -664,10 +665,10 @@ def fold_cartesian_head_wings_sharded(
 def _small_head_wing_halves_sharded(Y_x, W_body_xy, Z_y, *, mesh_xy):
     """Compiled body of :func:`small_head_wing_halves_sharded`."""
     def _local(y_local, w_local, z_local):
-        yw = jax.lax.psum(
+        yw = ordered_psum(
             jnp.einsum("aAi,ij->aAj", y_local, w_local, optimize=True),
             "x")
-        wz = jax.lax.psum(
+        wz = ordered_psum(
             jnp.einsum("ij,bjB->biB", w_local, z_local, optimize=True),
             "y")
         return yw, wz

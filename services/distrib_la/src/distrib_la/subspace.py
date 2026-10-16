@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 from lxkit import device_vendor
+from lxkit import ordered_psum
 
 from distrib_la._active_local import interval_rows
 from distrib_la.active_subspace import (LocalSubspacePlan, _orthogonalization_range, native_fields,
@@ -362,7 +363,7 @@ class DistributedSubspacePlan:
     def gram(self, v, p, active, *, start=0):
         def body(v, p, active, start):
             c = self.local.gram(v, p, active, start=start)
-            return jax.lax.psum(c, self.axes)
+            return ordered_psum(c, self.axes)
         spec = self.vector_sharding.spec
         return self._map(body, (spec, spec, P(), P()), P())(v, p, active, start)
 
@@ -371,7 +372,7 @@ class DistributedSubspacePlan:
         # would multiply its retained block by the processor count.
         def body(v, hv, active, start, count):
             delta = self.local.project(v, hv, active, jnp.zeros((self.capacity, self.capacity), jnp.complex128), start, count)
-            return jax.lax.psum(delta, self.axes)
+            return ordered_psum(delta, self.axes)
         spec = self.vector_sharding.spec
         delta = self._map(body, (spec, spec, P(), P(), P()), P())(v, hv, active, start, count)
         row = jnp.arange(self.capacity)
@@ -393,13 +394,13 @@ class DistributedSubspacePlan:
         if isinstance(self.local, LocalSubspacePlan) and self.orthogonalization_context is None:
             def body(v, p, active, start):
                 start, active = _orthogonalization_range(start, active, self.capacity)
-                c = jax.lax.psum(self.local.gram(v, p, active, start=start), self.axes)
+                c = ordered_psum(self.local.gram(v, p, active, start=start), self.axes)
                 # Form the second pass's local overlaps while updating p in
                 # place, avoiding a separate vector-sized projection buffer.
                 # They still need a global sum before the second subtraction.
                 p, c = self.local.subtract_projection(
                     v, p, c, active, start=start, next_gram=True)
-                c = jax.lax.psum(c, self.axes)
+                c = ordered_psum(c, self.axes)
                 return self.local.subtract_projection(v, p, c, active, start=start)
             spec = self.vector_sharding.spec
             return self._map(body, (spec, spec, P(), P()), spec)(v, p, active, start)

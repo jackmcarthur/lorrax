@@ -247,7 +247,7 @@ def _agree_kernel(mesh):
         root = jnp.asarray(True)
         for a in axes:
             root = root & (jax.lax.axis_index(a) == 0)
-        bits = jax.lax.psum(jnp.where(root, bits, jnp.zeros_like(bits)), axes)
+        bits = jax.lax.psum(jnp.where(root, bits, jnp.zeros_like(bits)), axes)  # exact-reduce: root's bits, zeros elsewhere
         return jax.lax.bitcast_convert_type(bits, s.dtype)
     return jax.jit(shard_map(body, mesh=mesh, in_specs=P(), out_specs=P(), check_vma=False))
 

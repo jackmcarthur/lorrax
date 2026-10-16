@@ -265,6 +265,10 @@ def bootstrap(*, platform: str = "gpu") -> None:
     init_mpi_before_device_collectives()
     install_failfast_excepthook()
     pin_matmul_precision()
+    # LORRAX_REDUCTION_GUARD=log|raise: record or refuse raw floating sums over
+    # more than two ranks (topology-ordered); a no-op when unset.
+    from lxkit import install_reduction_guard_from_env
+    install_reduction_guard_from_env()
     # Every sharding is explicit, so a legacy ``with mesh:`` would only add its
     # mesh to every program's key and re-trace held programs: JAX refuses one.
     _import_jax().config.update("jax_disallow_mesh_context_manager", True)

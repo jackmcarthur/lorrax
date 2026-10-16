@@ -108,6 +108,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from jax import shard_map as _shard_map_fn
 from lxkit import mark_varying
+from lxkit import ordered_psum
 
 from common.contract_bands import reduce_scatter_to_band_block
 from common.fft_helpers import (klead_outer_decode_refusal, klead_outer_refusal,
@@ -405,13 +406,13 @@ def _exchange_U(S_part, V_q0):
     and a second psum completes and replicates U = V_q0 · S, (b, μ).  Both
     psums move a (b, μ) vector -- the V term's only collectives.
     """
-    S = lax.psum(S_part, ("x", "y"))
+    S = ordered_psum(S_part, ("x", "y"))
     mx, ny = V_q0.shape
     S_y = lax.dynamic_slice_in_dim(S, lax.axis_index("y") * ny, ny, axis=1)
     U_x = jnp.einsum("MN,bN->bM", V_q0, S_y)                    # (b, μ_x) partial in ν
     U = lax.dynamic_update_slice_in_dim(
         jnp.zeros_like(S), U_x, lax.axis_index("x") * mx, axis=1)
-    return lax.psum(U, ("x", "y"))
+    return ordered_psum(U, ("x", "y"))
 
 
 def _make_v_term(mesh_xy, pair: bool):
