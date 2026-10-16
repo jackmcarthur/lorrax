@@ -139,6 +139,11 @@ def _preview_lanczos(
             report.htransform_quality(
                 receipt,
                 title="BSE-grid htransform interpolation quality")
+        if qp_rotation is not None:
+            from .bse_qp_rotation import report_lines
+            report.heading("QP-rotated basis")
+            for line in report_lines(qp_rotation):
+                report.emit(line)
     if stage_progress is not None:
         stage_progress.step()
     nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]

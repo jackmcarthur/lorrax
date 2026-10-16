@@ -14,8 +14,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from bse.absorption_common import slice_dipole_to_bse_window
 from bse.bse_qp_rotation import (certify_star_gauge, qp_window_dipoles,
-                                 qp_window_from_artifact, rotate_window_psi,
-                                 star_parents, star_relation_residuals)
+                                 qp_window_from_artifact, report_lines,
+                                 rotate_window_psi, star_parents,
+                                 star_relation_residuals)
 from common.band_degeneracy import BandWindowDegeneracyError
 
 jax.config.update("jax_enable_x64", True)
@@ -174,6 +175,10 @@ def test_sharded_rotation_identity_bitwise_unitary_exact_star_gauge_gated():
     assert out_v.sharding.spec == P(None, None, None, "x")
     assert np.array_equal(np.asarray(out_v), psi[:, n_occ - 2:n_occ])
     assert np.array_equal(np.asarray(out_c), psi[:, n_occ:n_occ + 2])
+    assert [row[0] for row in qp["diagnostics"]["psi_star"]] == ["1", "sigma_z"]
+    qp["diagnostics"].update(star_h_residual=0.0, star_h_sensitivity=1.0,
+                             n_antiunitary=int(anti.sum()))
+    assert any(line.startswith("Star gauge") for line in report_lines(qp))
     Ur = np.stack([_unitary(nb) for _ in range(nk)])
     Ur[2], Ur[3] = np.conj(Ur[0]), np.conj(Ur[1])   # its star images
     qr = _qp(Ur, E, n_occ, 2, 2)

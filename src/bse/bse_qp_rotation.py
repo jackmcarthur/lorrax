@@ -202,7 +202,8 @@ def certify_star_gauge(S, Sz, parent, antiunitary, *, where, log=print):
     the rotation block (module docstring).  Raises ``GATE bse_qp_star_gauge``
     when either misses the ``ibz_slab`` rule by more than
     :data:`STAR_RELATION_RTOL`; logs both residuals and the opposite rule's
-    smallest residual over the antiunitary k (the sensitivity).
+    smallest residual over the antiunitary k (the sensitivity).  Returns
+    ``[(name, max residual, worst k, sensitivity), ...]`` for the run report.
     """
     anti = np.asarray(antiunitary, dtype=bool)
     rows = []
@@ -228,6 +229,7 @@ def certify_star_gauge(S, Sz, parent, antiunitary, *, where, log=print):
             f"only when psi_k = g psi_p.  fix: a restart whose centroids are "
             f"orbit-closed under the WFN's magnetic group, or a QP rotation "
             f"artifact diagonalized in this restart's own full-BZ gauge.")
+    return rows
 
 
 @functools.partial(jax.jit, static_argnames=("replicated",))
@@ -274,10 +276,11 @@ def rotate_window_psi(psi_v_src, psi_c_src, qp, mesh_xy, *, log=print):
     if qp["certify_psi_star"]:
         S, Sz = _source_band_matrices(psi_v_src, psi_c_src,
                                       replicated=replicated)
-        certify_star_gauge(gather_to_host(S), gather_to_host(Sz),
-                           qp["parent"], qp["antiunitary"],
-                           where=os.path.basename(qp["path"]), log=log)
+        qp["diagnostics"]["psi_star"] = certify_star_gauge(
+            gather_to_host(S), gather_to_host(Sz), qp["parent"],
+            qp["antiunitary"], where=os.path.basename(qp["path"]), log=log)
     else:
+        qp["diagnostics"]["psi_star"] = None
         log("  [qp-rotations] the restart stores psi on every full-BZ k: no "
             "star relation at the centroids to certify.")
     u_val, u_cond = (device_put_process_local(
@@ -286,6 +289,39 @@ def rotate_window_psi(psi_v_src, psi_c_src, qp, mesh_xy, *, log=print):
     return _rotate_block(
         psi_v_src, psi_c_src, u_val, u_cond,
         sharding=NamedSharding(mesh_xy, P(None, None, None, "x")))
+
+
+def report_lines(qp):
+    """The run report's QP-rotated-basis block: inputs, window, certificates."""
+    q0, q1 = qp["band_range"]
+    lo, hi = qp["n_occ"] - qp["n_val"], qp["n_occ"] + qp["n_cond"]
+    d = qp["diagnostics"]
+    star = d.get("psi_star")
+    psi_line = ("not applicable (the restart stores psi on every full-BZ k)"
+                if star is None else "; ".join(
+                    f"{name} {res:.2e} (opposite rule >= {sens:.2e})"
+                    for name, res, _, sens in star))
+    gap = (np.min(qp["eps_c"]) - np.max(qp["eps_v"])) * RYD_TO_EV
+    return (
+        f"QP rotations   : {qp['path']}",
+        f"QP block       : DFT bands [{q0}, {q1}) rotated whole; window "
+        f"[{lo}, {hi}) in QP order ({qp['n_val']}v x {qp['n_cond']}c); "
+        f"band-agnostic QP gap {gap:.4f} eV",
+        f"Star gauge     : artifact H_QP {d['star_h_residual']:.2e} (opposite "
+        f"rule >= {d['star_h_sensitivity']:.2e}); restart psi band matrices "
+        f"{psi_line}; {d['n_antiunitary']} antiunitary k; tolerance "
+        f"{STAR_RELATION_RTOL:.0e}",
+        f"DFT-window leak: {d['dft_window_leakage_max']:.4f} at k "
+        f"{d['dft_window_leakage_at'][0]}, QP band "
+        f"{d['dft_window_leakage_at'][1]} (weight outside DFT bands "
+        f"[{lo}, {hi}); the rotation itself is exact over the block)",
+        f"Cross-gap mix  : theta_vc {d['theta_vc_max']:.4f}, theta_cv "
+        f"{d['theta_cv_max']:.4f}, largest single state "
+        f"{d['cross_gap_weight_max']:.4f}",
+        "Dipoles        : interband-commutator QP velocity v_DFT + [dH, W] "
+        "(qp_window_dipoles); the omitted explicit d_k dH is first order "
+        "in theta",
+    )
 
 
 def qp_window_dipoles(dipole_cart, delta_e, qp):
@@ -418,7 +454,7 @@ def load_qp_rotation(restart_file, input_file, qp_rotations_file, *, header,
             f"why: its off-wedge rows are star images by its own tables.")
     parent, anti = star_parents(irr, sidx, nss, kirr)
     H = np.einsum("kmn,kn,kln->kml", U, E, np.conj(U))
-    h_res, _ = star_relation_residuals(H, parent, anti)
+    h_res, h_other = star_relation_residuals(H, parent, anti)
     if not float(h_res.max()) <= STAR_RELATION_RTOL:
         k_bad = int(np.argmax(h_res))
         raise ValueError(
@@ -439,6 +475,9 @@ def load_qp_rotation(restart_file, input_file, qp_rotations_file, *, header,
                           and int(np.size(rows)) < int(sym.nk_tot)))
     d = window["diagnostics"]
     d["star_h_residual"] = float(h_res.max())
+    d["star_h_sensitivity"] = (float(h_other[anti].min()) if anti.any()
+                               else float("nan"))
+    d["n_antiunitary"] = int(np.sum(anti))
     lo, hi = int(n_occ) - window["n_val"], int(n_occ) + window["n_cond"]
     log(f"  [qp-rotations] {path}: block [{q0}, {q1}), window [{lo}, {hi}) "
         f"in QP order ({window['n_val']}v x {window['n_cond']}c), "
