@@ -667,7 +667,8 @@ def read_metadata(filename):
     """Return small, replicated bundle facts in canonical file order.
 
     Energies are (full_k, band) in Ry; the head vector is (centroid,).
-    Family shapes describe raw (parent_k, band, spin, centroid) faces.
+    Family shapes describe raw (parent_k, band, spin, centroid) faces;
+    ``parent_k_rows`` are the full-BZ rows those faces hold.
     """
     with h5py.File(filename, "r") as f:
         _require_current(f)
@@ -682,6 +683,7 @@ def read_metadata(filename):
         return dict(
             logical_band_count=nb_logical,
             energies=value("enk_full"), grid=value("kgrid"),
+            parent_k_rows=value("psi_parent_k_rows"),
             band_window=value("band_window"), band_split=value("band_window_split"),
             zeta_fit_windows=value("zeta_fit_windows"),
             centroid_count=int(f["n_rmu_logical"][()]),
