@@ -2,7 +2,8 @@
 
 Every check is paired with the case that must fail it: a permuted U for the
 U = I dipole identity, an unconjugated antiunitary row for the star gauge, a
-degenerate QP edge and a window outside the block for the window guard.
+degenerate QP edge and a window outside the block for the window guard, and
+every mismatched ``dipole.h5`` for the QP route of ``window_dipoles``.
 The sharded rotation runs on a 2x2 host mesh (``JAX_PLATFORMS=cpu`` with
 ``--xla_force_host_platform_device_count=4``), the four-device logic case of
 the four-GPU rule; the GPU leg owns the driver.
@@ -68,6 +69,65 @@ def test_identity_rotation_is_the_eqp_dipole_bitwise_and_permutation_is_not():
     assert not np.array_equal(dp, ref)
     assert np.max(np.abs(dp - ref)) > 1e-2 * np.max(np.abs(ref))
 
+
+
+def test_qp_route_of_window_dipoles_takes_the_dipole_file_gates(tmp_path,
+                                                                 monkeypatch):
+    """``absorption_common.window_dipoles`` on a ``--qp-rotations`` bundle.
+
+    The QP route reads the file through the DFT route's checks: at U = I it is
+    the DFT slice bit for bit, and a ``dipole.h5`` on another k grid, with
+    another WFN's stamp or none, or with ``skip_vnl`` (momentum only) refuses;
+    the DFT route still takes the momentum-only file.
+    """
+    import h5py
+    import bse.absorption_common as absorption_common
+    import file_io.dipole as dipole
+    from bse.absorption_common import window_dipoles
+    monkeypatch.setattr(dipole, "wfn_psi_basis", lambda path: "dft")
+    monkeypatch.setattr(absorption_common, "_deck_wfn_fingerprint",
+                        lambda path: "sha-of-the-deck-wfn")
+    nk, nb, n_occ, nv, nc = 4, 10, 6, 4, 3
+    e, v, _ = _dft_model(nk, nb, n_occ)
+    path = tmp_path / "dipole.h5"
+
+    def write(nk_file=nk, **attrs):
+        rows = np.arange(nk_file) % nk
+        with h5py.File(path, "w") as f:
+            f["dipole_cart"] = v[:, rows]
+            f["band_energies"] = e[rows]
+            f.attrs.update({"nk": nk_file, "nbands": nb, "basis": "dft",
+                            "prov_wfn_sha256": "sha-of-the-deck-wfn"})
+            for key, value in attrs.items():
+                if value is None:
+                    del f.attrs[key]
+                else:
+                    f.attrs[key] = value
+
+    shift = np.where(np.arange(nb) < n_occ, -0.3, 0.4)
+    U = np.broadcast_to(np.eye(nb, dtype=complex), (nk, nb, nb)).copy()
+    dft = {"densified": False, "nkx": 2, "nky": 2, "nkz": 1,
+           "n_val": nv, "n_cond": nc}
+    qp = dict(dft, qp_rotation=_qp(U, e + shift, n_occ, nv, nc))
+    write()
+    ref, ref_de = window_dipoles(dft, path, n_occ=n_occ, wfn_path="WFN.h5")
+    d, de = window_dipoles(qp, path, n_occ=n_occ, wfn_path="WFN.h5")
+    assert d.shape == ref.shape == (3, nk, nc, nv)
+    assert de.shape == ref_de.shape
+    assert np.array_equal(d, ref)
+    # Red twins on the QP route: the files the DFT route refuses, and the
+    # momentum-only one.
+    for kwargs, gate in (({"nk_file": 9}, "GATE dipole_k_grid"),
+                         ({"prov_wfn_sha256": "sha-of-another-wfn"},
+                          "GATE velocity_wfn_fingerprint"),
+                         ({"prov_wfn_sha256": None},
+                          "GATE velocity_wfn_fingerprint"),
+                         ({"skip_vnl": True}, "GATE bse_qp_dipole_velocity")):
+        write(**kwargs)
+        with pytest.raises(ValueError, match=gate):
+            window_dipoles(qp, path, n_occ=n_occ, wfn_path="WFN.h5")
+    write(skip_vnl=True)
+    window_dipoles(dft, path, n_occ=n_occ, wfn_path="WFN.h5")
 
 def test_cross_gap_free_rotation_rotates_the_position_matrix_exactly():
     nk, nb, n_occ, nv, nc = 2, 10, 6, 6, 4

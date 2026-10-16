@@ -173,6 +173,7 @@ def write_eigenvectors_stream(
     use_tda: bool = True,
     dipoles: Optional[np.ndarray] = None,
     qp_rotations_file: Optional[str] = None,
+    dipole_attrs: Optional[dict] = None,
 ) -> None:
     # ``qp_rotations_file``: the amplitudes are on QP-rotated states
     # (``bse.bse_qp_rotation``); stamped as ``exciton_header`` attributes
@@ -227,6 +228,8 @@ def write_eigenvectors_stream(
     # ⟨0|r̂_α|S⟩ from ``absorption_common.exciton_dipoles_distributed``, written
     # beside the eigenvectors as ``exciton_data/dipoles`` (1, n_write, 3, 2) —
     # a LORRAX extension BGW readers ignore (``eigenvectors.h5.spec``).
+    # ``dipole_attrs`` (optional) are written as that dataset's attributes:
+    # a bse_k_grid run stamps where its dipoles came from.
     RYD2EV = 13.6056980659
     if dipoles is not None:
         dipoles = np.asarray(dipoles)
@@ -411,9 +414,11 @@ def write_eigenvectors_stream(
                 coupling_dset[0, i, :, :, :, :, 1] = im
 
         if dipoles is not None:
-            exciton_data.create_dataset(
+            dset = exciton_data.create_dataset(
                 "dipoles",
                 data=np.stack([dipoles.real, dipoles.imag], axis=-1)[None])
+            for key, value in (dipole_attrs or {}).items():
+                dset.attrs[key] = value
 
     print(f"Wrote {n_write} eigenvectors to {output_file}"
           + ("" if use_tda else " (+ coupling Y)")

@@ -63,6 +63,7 @@ def _preview_lanczos(
     n_eig: int = 5,
     write_eigs: int | None = None,
     dipole_file: str | None = None,
+    helicity_table: bool = False,
     max_lanczos_iter: int | None = None,
     include_W: bool = True,
     eqp_file: str | None = None,
@@ -113,6 +114,7 @@ def _preview_lanczos(
                 _htransform_quality_records.append),
             eqp_file=eqp_file,
             qp_rotations_file=qp_rotations_file,
+            velocity_file=dipole_file,
         )
         qp_rotation = data.get("qp_rotation")
         grid_x, grid_y = mesh_xy.devices.shape
@@ -226,45 +228,45 @@ def _preview_lanczos(
     if write_eigs is not None:
         n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
         dipoles = None
+        dipole_attrs = None
         if dipole_file is not None:
-            # ⟨0|r̂_α|S⟩ per written state: the dipole.h5 Haydock seeds from
-            # (``psp.get_dipole_mtxels``), sliced to the RESOLVED window with the
-            # n_occ the loader and ``--eqp`` settled on, contracted against the
-            # solve's distributed eigenvectors in state blocks (no gather).
-            from file_io.restart_bundle import load_dipole_h5, read_metadata
+            # ⟨0|r̂_α|S⟩ per written state: the window dipoles Haydock seeds
+            # from (``absorption_common.window_dipoles``: the dipole.h5 slice
+            # at the n_occ the loader and ``--eqp`` settled on, a bse_k_grid
+            # bundle's own, or a --qp-rotations bundle's QP-basis dipoles),
+            # contracted against the solve's distributed eigenvectors in state
+            # blocks (no gather).
+            from file_io.restart_bundle import read_metadata
             from .absorption_common import (build_dipole_vector_bse,
                                             exciton_dipoles_distributed,
-                                            slice_dipole_to_bse_window)
+                                            window_dipoles)
             from .bse_io import resolve_n_occ
             from .bse_window import _parse_wfn_path
             n_occ_dip = (n_occ_eqp if n_occ_eqp is not None else resolve_n_occ(
                 read_metadata(restart_file)["energies"], n_occ=n_occ,
                 input_file=input_file))
             with timing.section("bse.exciton_dipoles", announce=True):
-                dipole_cart, deltaE, dipole_attrs = load_dipole_h5(
-                    dipole_file, wfn_path=_parse_wfn_path(input_file))
-                if qp_rotation is None:
-                    d_alpha, _ = slice_dipole_to_bse_window(
-                        dipole_cart, deltaE, n_occ_dip, n_val_eff, n_cond_eff)
-                else:
-                    # eq. (3) of bse.bse_qp_rotation: the cross-gap split
-                    # v = [E, W] + v_same holds for the velocity of H_DFT.
-                    if bool(dipole_attrs.get("skip_vnl", False)):
-                        raise ValueError(
-                            f"GATE bse_qp_dipole_velocity: got {dipole_file} "
-                            f"with skip_vnl = true (momentum only); want the "
-                            f"velocity p - i[r, V_NL] of H_DFT.  why: the QP "
-                            f"dipole splits v into [E_DFT, W] and its "
-                            f"same-class block.  fix: rebuild it with "
-                            f"python -m psp.get_dipole_mtxels -i <deck>.")
-                    from .bse_qp_rotation import qp_window_dipoles
-                    d_alpha = qp_window_dipoles(dipole_cart, deltaE,
-                                                qp_rotation)
-                del dipole_cart, deltaE
+                d_alpha, _ = window_dipoles(
+                    data, dipole_file, n_occ=n_occ_dip,
+                    wfn_path=_parse_wfn_path(input_file))
+                if data["densified"]:
+                    dipole_attrs = {
+                        "route": data["dipoles"]["route"],
+                        "source": data["dipoles"]["source"],
+                        "velocity": data["dipoles"]["velocity"],
+                        "on_grid_rel": data["dipoles"]["on_grid_rel"]}
                 dipoles = exciton_dipoles_distributed(
                     eigenvectors, build_dipole_vector_bse(
                         d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
                     n_write)
+            if helicity_table and report is not None:
+                # Report-only: the per-state σ± strengths of the dipoles just
+                # stored, under the one convention ``inplane_helicity`` owns.
+                from .absorption_common import helicity_table_lines
+                report.heading("In-plane helicity per state (per unit cell)")
+                for line in helicity_table_lines(
+                        eigenvalues_host[:n_write] * ryd2ev, dipoles, nk):
+                    report.emit(line)
         with timing.section("bse.write_eigenvectors", announce=True):
             write_eigenvectors_stream(
                 "eigenvectors.h5",
@@ -280,6 +282,7 @@ def _preview_lanczos(
                 dipoles=dipoles,
                 qp_rotations_file=(None if qp_rotation is None
                                    else qp_rotation["path"]),
+                dipole_attrs=dipole_attrs,
             )
 
     if stage_progress is not None:
@@ -379,7 +382,16 @@ def build_parser():
         help="with --write-eigs (TDA): contract each written state against "
              "this dipole.h5 (psp.get_dipole_mtxels, the file "
              "absorption_haydock reads) and store <0|r|S> as "
-             "exciton_data/dipoles in eigenvectors.h5")
+             "exciton_data/dipoles in eigenvectors.h5.  Under bse_k_grid it "
+             "is the deck (coarse) WFN's dipole.h5: the densifier carries it "
+             "through the htransform into the fine states")
+    parser.add_argument(
+        "--helicity-table", action="store_true",
+        help="with --dipole: add each written state's in-plane circular "
+             "strengths to the report, I+- = |D_x -+ i D_y|^2/(2 N_k) per unit "
+             "cell for D = <0|r|S>, and eta = (I+ - I-)/(I+ + I-); sigma+ is the "
+             "field E0 (cos wt, sin wt, 0), x -> y, counter-clockwise seen "
+             "from +z (absorption_common.inplane_helicity)")
     parser.add_argument(
         "--report-file", default=None,
         help="human-readable Lanczos report (default: bse.out)")
@@ -527,7 +539,8 @@ _ROUTE_DESTS = {
         "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
         "davidson_m_max", "trlan_m_max", "trlan_n_keep", "eqp", "n_occ",
-        "band_degeneracy", "degeneracy_tol_ry", "dipole", "qp_rotations"},
+        "band_degeneracy", "degeneracy_tol_ry", "dipole", "helicity_table",
+        "qp_rotations"},
 }
 
 
@@ -566,6 +579,9 @@ def parse_args(argv=None):
                      "eigenvectors: it needs --write-eigs and --tda (the "
                      "full-BSE oscillator strength needs both halves of the "
                      "paired vector)")
+    if args.helicity_table and args.dipole is None:
+        parser.error("--helicity-table reports the per-state dipoles: it needs "
+                     "--dipole (with --write-eigs and --tda)")
     return route, args
 
 
@@ -657,6 +673,8 @@ def main(argv=None) -> int:
             "Eigenvectors   : " + (
                 "written to a separate numerical artifact"
                 + (" with per-state dipoles <0|r|S>" if args.dipole else "")
+                + (" and their in-plane helicity table" if args.helicity_table
+                   else "")
                 if args.write_eigs is not None else "not requested"),
         ))
         report.sampling(wfn=wfn, sym=sym)
@@ -672,6 +690,7 @@ def main(argv=None) -> int:
             n_eig=args.n_eig,
             write_eigs=args.write_eigs,
             dipole_file=args.dipole,
+            helicity_table=args.helicity_table,
             max_lanczos_iter=args.max_lanczos_iter,
             include_W=not (args.rpa or not args.bse),
             eqp_file=args.eqp,

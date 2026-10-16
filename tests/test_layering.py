@@ -587,6 +587,7 @@ _DRIVER_PLUMBING_BUDGET = {
     "gw.eqp_bgw": 0,
     "postprocess.rotate_wfn_to_qp": 0,
     "gw.downfold_cli": 0,
+    "tdagw.tdgw_jax": 0,
 
     # --- not clean, with the reason ---------------------------------------
     # ``from jax.sharding import Mesh, NamedSharding, PartitionSpec`` at :90.
@@ -698,6 +699,7 @@ _DRIVER_MAIN_STATEMENTS = {
     "bandstructure.htransform": (("main",), 124),
     "gw.kin_ion_io": (("main",), 128),
     "psp.get_dipole_mtxels": (("main",), 236),
+    "tdagw.tdgw_jax": (("main",), 12),
 }
 
 
