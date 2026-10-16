@@ -309,7 +309,9 @@ TDGW `kernel.h5` (Rydberg, TDGW's band order and the k order of its `WFN.h5`),
 which an unmodified TDGW run reads in place of a BerkeleyGW kernel.
 `tdagw.tdgw_bridge` runs TDGW with its self-energy update replaced by the
 matrix-free operator, so no dense kernel is formed. Both refuse a `WFN.h5`
-whose k-points are not the full bundle grid.
+whose k-points are not the full bundle grid. On more than one rank the bridge
+needs an h5py built against parallel HDF5, because TDGW writes its output
+collectively, and refuses otherwise.
 
 Invoke: `python -m tdagw.kernel_export --input cohsex.in --wfn WFN.h5 --ibndmin 129 --ibndmax 132 --ivbm 130 --out kernel.h5 [--terms both|sex|hartree] [--receipt r.json]`
 and `python -m tdagw.tdgw_bridge tdgw.toml --input cohsex.in [--terms both|sex|hartree] [--receipt r.json]`.

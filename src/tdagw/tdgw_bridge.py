@@ -28,7 +28,7 @@ import sys
 import runtime  # noqa: F401  (before numpy: the runtime tunes BLAS spin at import)
 import numpy as np
 
-__all__ = ["lorrax_driver_class", "make_tdgw_dsigma", "tdgw_run_lorrax", "main"]
+__all__ = ["lorrax_driver_class", "make_tdgw_dsigma", "require_parallel_h5py", "tdgw_run_lorrax", "main"]
 
 
 def make_tdgw_dsigma(apply, model: dict, mesh_xy, k_rows: np.ndarray):
@@ -59,6 +59,26 @@ def make_tdgw_dsigma(apply, model: dict, mesh_xy, k_rows: np.ndarray):
         y = strip_td_state(np.asarray(rep(apply(xd)).addressable_data(0)), model)[0]
         return 0.5 * y[k_rows]
     return dsigma
+
+
+def require_parallel_h5py(n_ranks: int, mpi_enabled: bool | None = None) -> None:
+    """Refuse a multi-rank TDGW run whose h5py cannot open files with ``driver='mpio'``.
+
+    TDGW writes its output collectively: ``tensor2.core.mpio.PH5File`` picks
+    ``driver='mpio'`` whenever its task grid has more than one rank, and it
+    cannot tell a serial h5py from a parallel one (h5py 3.x lists ``'mpio'``
+    among its drivers either way), so a serial h5py otherwise fails only when
+    TDGW first opens its output, after the model is built.  ``mpi_enabled``
+    defaults to ``h5py.get_config().mpi``.
+    """
+    import h5py
+    if mpi_enabled is None:
+        mpi_enabled = bool(h5py.get_config().mpi)
+    if int(n_ranks) > 1 and not mpi_enabled:
+        raise RuntimeError(
+            f"GATE tdgw_bridge_h5py_mpi: got: serial h5py ({h5py.__file__}) under {int(n_ranks)} "
+            f"TDGW ranks; want: an h5py built against parallel HDF5; fix: put an MPI h5py linked "
+            f"to the libhdf5_parallel the LORRAX FFI loads first on PYTHONPATH, or run on one rank")
 
 
 def lorrax_driver_class():
@@ -147,6 +167,7 @@ def main(argv=None) -> int:
     from tdagw.model import build_td_agw_apply, flat_k_rows, load_td_model
     from wfn_loader import WfnLoader
     mesh = stack.mesh
+    require_parallel_h5py(jax.process_count())         # each TDGW rank is one JAX process
     config = load_tdgw_config(args.config)
     wfn_file = os.path.join(config.control.files.indir, "WFN.h5")
     s = config.system

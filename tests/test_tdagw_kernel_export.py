@@ -5,7 +5,9 @@ with TDGW's own ``TDGW.td.io.read_kernel`` (extended, nblocks = 4).  TDGW's
 convention is K^TDGW = −kernel/2 Ha, so the gate is ``read == K / 2``; the
 red twins write a sign-flipped kernel, one with the valence pair left in
 ascending order and one with k and k' swapped, and each must fail the same
-check (or be refused by TDGW).
+check (or be refused by TDGW).  The bridge's parallel-h5py gate is checked
+beside it: a serial h5py refuses under more than one TDGW rank and passes on
+one, and a bridge with no check (the twin) must fail to refuse.
 
 Runs as a script where TDGW is importable (one process)::
 
@@ -60,6 +62,20 @@ def run_checks(tmp):
         except Exception as e:                  # noqa: BLE001 - a refusal is a catch
             print(f"     twin {name}: TDGW refused ({type(e).__name__})", flush=True)
             twins[name] = float("inf")
+    # The bridge's parallel-h5py gate: TDGW writes collectively at P > 1, so a serial h5py
+    # must refuse there (and only there); a missing check is the twin.
+    from tdagw.tdgw_bridge import require_parallel_h5py
+
+    def refuses(check, n_ranks, mpi):
+        try:
+            check(n_ranks, mpi)
+        except RuntimeError as e:
+            return "GATE tdgw_bridge_h5py_mpi" in str(e)
+        return False
+    out["bridge refuses serial h5py, 4 ranks"] = 0.0 if refuses(require_parallel_h5py, 4, False) else 1.0
+    out["bridge admits serial h5py, 1 rank"] = 0.0 if not refuses(require_parallel_h5py, 1, False) else 1.0
+    out["bridge admits MPI h5py, 4 ranks"] = 0.0 if not refuses(require_parallel_h5py, 4, True) else 1.0
+    twins["no h5py check, 4 serial ranks"] = 0.0 if refuses(lambda n, m: None, 4, False) else 1.0
     return out, twins
 
 
