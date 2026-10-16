@@ -107,7 +107,12 @@ def test_the_place_scatter_moves_reals():
         accs = _pack_start(*key)()
         assert accs[0].dtype == np.float64, layout
         panel = jax.device_put(np.ones((4, 12, 4), np.complex128), NamedSharding(mesh, spec))
-        dest = jax.device_put(np.zeros((4, 4), np.int32), NamedSharding(mesh, dest_spec))
-        hlo = _pack_place(*key, 4).lower(accs, (panel,), dest).as_text(dialect="hlo")
+        if layout == "batch":
+            # The batch program inverts its rows of the round's order table from the panel offset.
+            operands = (jax.device_put(np.zeros((4, 8), np.int32), NamedSharding(mesh, dest_spec)),
+                        jax.device_put(np.int32(0), NamedSharding(mesh, P())))
+        else:
+            operands = (jax.device_put(np.zeros((4, 4), np.int32), NamedSharding(mesh, dest_spec)),)
+        hlo = _pack_place(*key, 4).lower(accs, (panel,), *operands).as_text(dialect="hlo")
         scatters = [line for line in hlo.splitlines() if " scatter(" in line]
         assert scatters and not any("c128" in line for line in scatters), (layout, scatters)
