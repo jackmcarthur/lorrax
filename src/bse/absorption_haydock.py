@@ -21,7 +21,9 @@ forms an ``A``, so it cannot conjugate one wrongly: it evaluates
 ``⟨d|(z − H)⁻¹|d⟩`` with the seed ``|d⟩ = Σ_t d_t |t⟩`` taken straight
 from ``slice_dipole_to_bse_window`` (correct, because
 ``⟨t|r̂|0⟩ = ⟨ck|r̂|vk⟩ = d_t``) and the Lanczos inner product
-``⟨s|H|s⟩`` conjugating the bra as usual.  Its spectral weights are
+``⟨s|H|s⟩`` conjugating the bra as usual (on a ``bse_k_grid`` bundle the
+seed is the bundle's own fine-gauge dipoles, ``window_dipoles``).  Its
+spectral weights are
 therefore ``|⟨S|d⟩|² = |Σ_t conj(A_t) d_t|²``, which is exactly
 ``|⟨0|r̂|S⟩|²`` for the contraction in
 ``absorption_common.exciton_dipole_projections``.  Any sum-over-states
@@ -52,8 +54,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import make_kfft_kminor
 
-from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, slice_dipole_to_bse_window, write_absorption_dat, write_absorption_h5)
-from file_io.restart_bundle import (load_dipole_h5)
+from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, window_dipoles, write_absorption_dat, write_absorption_h5)
 from .bse_window import _parse_wfn_path
 from .bse_io import (load_bse_data_from_restart_sharded)
 from file_io.restart_bundle import (_find_restart_file)
@@ -162,6 +163,7 @@ def run_haydock(
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
         input_file=input_file, n_occ=n_occ, eqp_file=eqp_file,
+        velocity_file=dipole_file,
     )
     # Resolve n_occ for the downstream dipole slice — same source as the
     # loader used (WFN.h5 ifmax → largest-gap fallback).
@@ -198,10 +200,8 @@ def run_haydock(
           f"{nc_pad} cond × {nv_pad} val × {nk} k = {nc_pad * nv_pad * nk}")
 
     # Build the dipole seed vectors |d^α⟩ in BSE basis with proper padding.
-    dipole_cart, deltaE, _ = load_dipole_h5(
-        dipole_file, wfn_path=_parse_wfn_path(input_file))
-    d_alpha, de_cv = slice_dipole_to_bse_window(
-        dipole_cart, deltaE, n_occ, n_val_eff, n_cond_eff)
+    d_alpha, de_cv = window_dipoles(data, dipole_file, n_occ=n_occ,
+                                    wfn_path=_parse_wfn_path(input_file))
     print(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond_eff}, "
           f"nv={n_val_eff})")
     d_block_np = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)
@@ -304,6 +304,10 @@ def run_haydock(
             "n_spin": n_spin,
             "n_spinor": n_spinor,
             "n_iter": n_iter,
+            **({"dipole_route": data["dipoles"]["route"],
+                "dipole_source": data["dipoles"]["source"],
+                "dipole_on_grid_rel": data["dipoles"]["on_grid_rel"]}
+               if data["densified"] else {}),
         },
     )
     print(f"[haydock] wrote {out_h5}")
@@ -321,7 +325,9 @@ def main(argv=None):
     p.add_argument("--eqp", default=None,
                    help="BGW eqp1.dat for QP corrections (optional)")
     p.add_argument("--dipole", default="dipole.h5",
-                   help="dipole.h5 from psp.get_dipole_mtxels (default: dipole.h5)")
+                   help="dipole.h5 from psp.get_dipole_mtxels (default: "
+                        "dipole.h5); under bse_k_grid the deck (coarse) WFN's, "
+                        "carried through the htransform into the fine states")
     p.add_argument("--V-cell", type=float, required=True,
                    help="Unit-cell volume (bohr^3)")
     p.add_argument("--n-iter", type=int, default=200,

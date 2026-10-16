@@ -327,6 +327,46 @@ def slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ, n_val, n_cond):
     return d_alpha, de_cv
 
 
+def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
+    """``(d_alpha, de_cv)`` of the BSE window ``data`` solves: THE dipole source.
+
+    A ``bse_k_grid`` bundle carries its own (``data["dipoles"]``, built by
+    ``bse_densify.densified_dipoles`` from ``dipole_file``, the coarse WFN's
+    velocity, in the fine ψ gauge) and never slices a file: the coarse file
+    has another k list, and a fine grid's ``dipole.h5`` has the right shape
+    in the wrong gauge.  Any other bundle slices ``dipole_file``
+    (:func:`slice_dipole_to_bse_window`) at ``n_occ`` over the loader's
+    resolved window, after ``file_io.dipole.require_dipole_k_grid``.
+
+    Returns
+    -------
+    d_alpha : (3, nk, nc, nv) complex — ⟨ck|v̂_α|vk⟩ / ΔE (bohr).
+    de_cv   : (nk, nc, nv) float — the velocity's own E_c − E_v (Ry).
+    """
+    import os
+    if data.get("densified"):
+        dip = data.get("dipoles")
+        if dip is None or dip["source"] != os.path.abspath(str(dipole_file)):
+            raise ValueError(
+                f"GATE densified_dipoles: got a bse_k_grid bundle whose "
+                f"dipoles are {None if dip is None else dip['source']!r}; "
+                f"want those built from {os.path.abspath(str(dipole_file))!r}; "
+                f"why: a densified bundle's dipoles exist only in its own ψ "
+                f"gauge, and slicing a dipole file onto it is wrong (another "
+                f"k list, or the right shape in another gauge); fix: pass "
+                f"velocity_file=dipole_file to "
+                f"load_bse_data_from_restart_sharded.")
+        return dip["d_alpha"], dip["de_cv"]
+    from file_io.dipole import require_dipole_k_grid
+    from file_io.restart_bundle import load_dipole_h5
+    dipole_cart, deltaE, attrs = load_dipole_h5(dipole_file, wfn_path=wfn_path)
+    require_dipole_k_grid(
+        attrs, int(data["nkx"]) * int(data["nky"]) * int(data["nkz"]),
+        dipole_path=dipole_file)
+    return slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ,
+                                      int(data["n_val"]), int(data["n_cond"]))
+
+
 def build_dipole_vector_bse(d_alpha, n_cond_pad=None, n_val_pad=None):
     """Reshape (3, nk, nc, nv) → (3, nc_pad, nv_pad, nk) BSE block-vector form.
 
@@ -483,6 +523,7 @@ __all__ = [
     "load_eigenvectors_h5",
     "load_exciton_dipoles_h5",
     "slice_dipole_to_bse_window",
+    "window_dipoles",
     "build_dipole_vector_bse",
     "lorentzian_broaden",
     "jdos_from_transitions",

@@ -111,6 +111,7 @@ def _preview_lanczos(
             htransform_quality_record_fn=(
                 _htransform_quality_records.append),
             eqp_file=eqp_file,
+            velocity_file=dipole_file,
         )
         grid_x, grid_y = mesh_xy.devices.shape
         # EQP override on enk_full (BGW eqp1.dat semantics).  A bse_k_grid
@@ -218,26 +219,32 @@ def _preview_lanczos(
     if write_eigs is not None:
         n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
         dipoles = None
+        dipole_attrs = None
         if dipole_file is not None:
-            # ⟨0|r̂_α|S⟩ per written state: the dipole.h5 Haydock seeds from
-            # (``psp.get_dipole_mtxels``), sliced to the RESOLVED window with the
-            # n_occ the loader and ``--eqp`` settled on, contracted against the
-            # solve's distributed eigenvectors in state blocks (no gather).
-            from file_io.restart_bundle import load_dipole_h5, read_metadata
+            # ⟨0|r̂_α|S⟩ per written state: the window dipoles Haydock seeds
+            # from (``absorption_common.window_dipoles``: the dipole.h5 slice
+            # at the n_occ the loader and ``--eqp`` settled on, or a
+            # bse_k_grid bundle's own), contracted against the solve's
+            # distributed eigenvectors in state blocks (no gather).
+            from file_io.restart_bundle import read_metadata
             from .absorption_common import (build_dipole_vector_bse,
                                             exciton_dipoles_distributed,
-                                            slice_dipole_to_bse_window)
+                                            window_dipoles)
             from .bse_io import resolve_n_occ
             from .bse_window import _parse_wfn_path
             n_occ_dip = (n_occ_eqp if n_occ_eqp is not None else resolve_n_occ(
                 read_metadata(restart_file)["energies"], n_occ=n_occ,
                 input_file=input_file))
             with timing.section("bse.exciton_dipoles", announce=True):
-                dipole_cart, deltaE, _ = load_dipole_h5(
-                    dipole_file, wfn_path=_parse_wfn_path(input_file))
-                d_alpha, _ = slice_dipole_to_bse_window(
-                    dipole_cart, deltaE, n_occ_dip, n_val_eff, n_cond_eff)
-                del dipole_cart, deltaE
+                d_alpha, _ = window_dipoles(
+                    data, dipole_file, n_occ=n_occ_dip,
+                    wfn_path=_parse_wfn_path(input_file))
+                if data["densified"]:
+                    dipole_attrs = {
+                        "route": data["dipoles"]["route"],
+                        "source": data["dipoles"]["source"],
+                        "velocity": data["dipoles"]["velocity"],
+                        "on_grid_rel": data["dipoles"]["on_grid_rel"]}
                 dipoles = exciton_dipoles_distributed(
                     eigenvectors, build_dipole_vector_bse(
                         d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
@@ -255,6 +262,7 @@ def _preview_lanczos(
                 n_write,
                 use_tda=tda,
                 dipoles=dipoles,
+                dipole_attrs=dipole_attrs,
             )
 
     if stage_progress is not None:
@@ -354,7 +362,9 @@ def build_parser():
         help="with --write-eigs (TDA): contract each written state against "
              "this dipole.h5 (psp.get_dipole_mtxels, the file "
              "absorption_haydock reads) and store <0|r|S> as "
-             "exciton_data/dipoles in eigenvectors.h5")
+             "exciton_data/dipoles in eigenvectors.h5.  Under bse_k_grid it "
+             "is the deck (coarse) WFN's dipole.h5: the densifier carries it "
+             "through the htransform into the fine states")
     parser.add_argument(
         "--report-file", default=None,
         help="human-readable Lanczos report (default: bse.out)")
