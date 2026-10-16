@@ -13,6 +13,7 @@ from functools import partial
 from pathlib import Path
 
 import jax
+from lxkit import ordered_sum
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -1649,8 +1650,8 @@ def complete_velocity_validation(
     # (gw.qsgw_head.link_correction_bound), on the elements the head reads.
     head_set = head_velocity_set(occupations)[None]
     metrics["head_set_relative_l2"] = float(jax.device_get(
-        jnp.sqrt(jnp.sum(jnp.where(head_set, jnp.abs(reconstructed - exact) ** 2, 0.0))
-                 / jnp.maximum(jnp.sum(jnp.where(head_set, jnp.abs(exact) ** 2, 0.0)),
+        jnp.sqrt(ordered_sum(jnp.where(head_set, jnp.abs(reconstructed - exact) ** 2, 0.0))
+                 / jnp.maximum(ordered_sum(jnp.where(head_set, jnp.abs(exact) ** 2, 0.0)),
                                1.0e-60))))
     metrics["entrywise_passed"] = bool(metrics["passed"])
     metrics["stencil_orders"] = tuple(int(o) for o in orders)
@@ -1673,13 +1674,13 @@ def complete_velocity_validation(
     transition = (
         (delta_e > 0.0) & (jnp.abs(occupation_difference) > 1.0e-10))
     transition = transition[None]
-    exact_norm = jnp.sqrt(jnp.sum(
+    exact_norm = jnp.sqrt(ordered_sum(
         jnp.where(transition, jnp.abs(exact) ** 2, 0.0)))
-    reconstructed_norm = jnp.sqrt(jnp.sum(
+    reconstructed_norm = jnp.sqrt(ordered_sum(
         jnp.where(transition, jnp.abs(reconstructed) ** 2, 0.0)))
-    transition_error = jnp.sqrt(jnp.sum(jnp.where(
+    transition_error = jnp.sqrt(ordered_sum(jnp.where(
         transition, jnp.abs(reconstructed - exact) ** 2, 0.0)))
-    overlap = jnp.sum(jnp.where(
+    overlap = ordered_sum(jnp.where(
         transition, jnp.conj(exact) * reconstructed, 0.0 + 0.0j))
     overlap = overlap / jnp.maximum(
         exact_norm * reconstructed_norm, jnp.asarray(1.0e-30))

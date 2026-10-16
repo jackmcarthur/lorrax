@@ -15,6 +15,7 @@ from pathlib import Path
 import time
 
 import jax
+from lxkit import ordered_norm, ordered_sum
 from common import timing
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
@@ -571,11 +572,11 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
     return (*totals, census)
 
 
-@jax.jit
 def _odd_moment_ratios(M0, M1, M2, M3):
     # Per parent of a [b, n, n] batch: ratios of the 1/z and 1/z^3 coefficients,
-    # m0 = 2 M0 and m2 = 2 M2.
-    norm = lambda a: jnp.linalg.norm(a, axis=(-2, -1))
+    # m0 = 2 M0 and m2 = 2 M2.  Norms in rank order on each stack's own layout
+    # (lxkit.ordered_norm reads the concrete sharding).
+    norm = lambda a: ordered_norm(a, axis=(-2, -1))
     return jnp.stack([2 * norm(M0) / norm(M1), 2 * norm(M2) / norm(M3)], axis=-1)
 
 
@@ -3024,8 +3025,9 @@ def _photon_norm_program(layout, mesh_xy):
 
     @jax.jit
     def norms(value):
-        return jnp.stack([jnp.sqrt(sum(jnp.sum(jnp.abs(photon_block_view(value, layout, a, b, mesh_xy))**2,
-                                               axis=(-2, -1)) for a, b in pairs))
+        face = P(None, "x", "y")
+        return jnp.stack([jnp.sqrt(sum(ordered_sum(jnp.abs(photon_block_view(value, layout, a, b, mesh_xy))**2,
+                                                   axis=(-2, -1), mesh=mesh_xy, spec=face) for a, b in pairs))
                           for _, pairs in _PHOTON_SECTOR_BLOCKS], axis=-1)
     return norms
 

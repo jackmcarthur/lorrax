@@ -60,8 +60,9 @@ over three or more devices; the op's `stack_frame_id` names the source line.
 **Memory.** At or below the slab (`LORRAX_ORDERED_SLAB_MB`, default 8 MiB) the ordered
 sum holds the operand's `all_to_all` copy, about 1.25x the operand. Above it, the
 reduction runs in slabs inside one loop, with the all-reduce in the operand's own buffer
-as the library all-reduce does, so the extra transient is about two slabs (16 MiB) at
-any size. Measured on MI250X compiled programs (det lane, `memgpu.py`): a 64 MiB
+as the library all-reduce does, so the extra transient is at most two slabs (16 MiB) at
+any size. That bound is the named cap `T_ord` of the memory rule (`lxkit.ordered_transient_bytes`,
+[memory model](../architecture/memory-model.md#rule)): it comes off the planner budget once. Measured on MI250X compiled programs (det lane, `memgpu.py`): a 64 MiB
 reduce-scatter takes the library's temp plus at most 16 MiB; a slabbed all-reduce takes
 less temp than the library's.
 

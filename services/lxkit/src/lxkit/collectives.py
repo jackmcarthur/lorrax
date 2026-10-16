@@ -38,7 +38,8 @@ from __future__ import annotations
 import os
 import sys
 
-__all__ = ["ordered_psum_scatter", "ordered_psum", "ordered_reduce", "slab_bytes",
+__all__ = ["ordered_psum_scatter", "ordered_psum", "ordered_reduce", "ordered_sum", "ordered_norm",
+           "slab_bytes", "ordered_transient_bytes", "ORDERED_TRANSIENT_SLABS",
            "install_reduction_guard", "install_reduction_guard_from_env",
            "reduction_trace", "EXACT_MARKER"]
 
@@ -47,6 +48,12 @@ __all__ = ["ordered_psum_scatter", "ordered_psum", "ordered_reduce", "slab_bytes
 EXACT_MARKER = "exact-reduce:"
 
 DEFAULT_SLAB_BYTES = 8 << 20
+#: Device bytes an ordered reduction may hold beyond the library collective, in slabs:
+#: the slabbed reduce-scatter's slab copy and its all_to_all output (the all-reduce runs
+#: in the operand's buffer; the one-shot path, used at or below one slab, holds
+#: <= 1.25 slab).  Fixed: it does not grow with the operand.  runtime's memory rule
+#: reserves :func:`ordered_transient_bytes` out of the planner budget.
+ORDERED_TRANSIENT_SLABS = 2
 _TRACE: list = []
 _GUARD = {"mode": None}
 
@@ -58,6 +65,11 @@ def slab_bytes() -> int:
     except ValueError:
         mb = 0.0
     return int(mb * (1 << 20)) if mb > 0 else DEFAULT_SLAB_BYTES
+
+
+def ordered_transient_bytes() -> int:
+    """The named cap of the rank-order reductions' transient: ``ORDERED_TRANSIENT_SLABS`` slabs."""
+    return ORDERED_TRANSIENT_SLABS * slab_bytes()
 
 
 def _axis_size(axis_name) -> int:
@@ -280,6 +292,85 @@ def ordered_reduce(local_fn, *arrays):
             lambda *loc: ordered_psum(local_fn(*loc), axes), mesh=mesh, in_specs=specs,
             out_specs=P(), check_vma=False))
     return prog(*arrays)
+
+
+_SUM_PROGRAMS: dict = {}
+
+
+def _in_manual_context() -> bool:
+    try:
+        from jax.sharding import get_abstract_mesh
+        return bool(getattr(get_abstract_mesh(), "manual_axes", ()))
+    except Exception:
+        return False
+
+
+def ordered_sum(x, axis=None, *, keepdims: bool = False, mesh=None, spec=None):
+    """``jnp.sum(x, axis)`` with the cross-rank part added in rank order.
+
+    ``jnp.sum`` / ``linalg.norm`` / ``trace`` over a mesh-sharded dimension make XLA insert
+    a library all-reduce (topology order).  Here each rank sums its own block inside a
+    ``shard_map`` and the partials over the mesh axes that shard ``axis`` go through
+    :func:`ordered_psum`; kept dimensions keep their sharding.
+
+    Layout: a concrete array's own ``NamedSharding``; inside a traced program, ``mesh`` and
+    ``spec`` (the operand's ``PartitionSpec``, which the caller owns) -- a tracer without
+    them is refused rather than handed to XLA.  ``spec=P()`` (replicated) or an operand on
+    one device is a plain local sum.  Inside ``shard_map`` it is ``jnp.sum`` of the local
+    block (the cross-rank sum is then the caller's explicit ``ordered_psum``).  Integer
+    and boolean operands are exact anyway.  (``custom_partitioning`` would infer the
+    layout, but its op key is a per-process object id, which breaks the cross-rank
+    compile agreement and the persistent compile cache.)
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    tracer = isinstance(x, jax.core.Tracer)
+    if not tracer and not hasattr(x, "sharding"):
+        x = jnp.asarray(x)
+    nd = x.ndim
+    if axis is None:
+        axes = tuple(range(nd))
+    else:
+        axes = tuple(sorted(a % nd for a in (axis if isinstance(axis, (tuple, list)) else (axis,))))
+    if not axes or not _inexact(x.dtype) or _in_manual_context():
+        return jnp.sum(x, axis=axes, keepdims=keepdims)
+    if mesh is None or spec is None:
+        sh = getattr(x, "sharding", None) if not tracer else None
+        if tracer:
+            raise TypeError("ordered_sum inside a traced program needs mesh= and spec= (the operand's "
+                            "layout); without them XLA would add the ranks' partials in topology order.")
+        if not isinstance(sh, NamedSharding):
+            return jnp.sum(x, axis=axes, keepdims=keepdims)
+        mesh, spec = sh.mesh, sh.spec
+    full = tuple(spec) + (None,) * (nd - len(tuple(spec)))
+    red = set()
+    for i in axes:
+        red.update(_spec_axes((full[i],)))
+    red = tuple(a for a in mesh.axis_names if a in red)
+    if not red and not tracer:
+        return jnp.sum(x, axis=axes, keepdims=keepdims)
+    # traced: always through shard_map, which enforces ``spec`` (a plain jnp.sum would leave
+    # XLA free to keep the operand sharded and insert its own all-reduce)
+    out_spec = P(*[full[i] for i in range(nd) if i not in axes])
+    key = (mesh, full, axes, nd)
+    progs = _SUM_PROGRAMS.get(key)
+    if progs is None:
+        if len(_SUM_PROGRAMS) > 256:
+            _SUM_PROGRAMS.clear()
+        body = jax.shard_map(lambda xl: ordered_psum(jnp.sum(xl, axis=axes), red) if red else jnp.sum(xl, axis=axes), mesh=mesh,
+                             in_specs=P(*full), out_specs=out_spec, check_vma=False)
+        progs = _SUM_PROGRAMS[key] = (body, jax.jit(body))
+    out = progs[0](x) if tracer else progs[1](x)
+    return jnp.expand_dims(out, axes) if keepdims else out
+
+
+def ordered_norm(x, axis=None, *, keepdims: bool = False, mesh=None, spec=None):
+    """Frobenius / 2-norm ``sqrt(sum(re^2 + im^2))`` over ``axis`` through :func:`ordered_sum`
+    (``jnp.linalg.norm``'s default for a vector or an axis pair)."""
+    import jax.numpy as jnp
+    sq = jnp.real(x) ** 2 + jnp.imag(x) ** 2 if jnp.iscomplexobj(x) else x * x
+    return jnp.sqrt(ordered_sum(sq, axis, keepdims=keepdims, mesh=mesh, spec=spec))
 
 
 # -- the runtime guard ---------------------------------------------------------------

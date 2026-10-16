@@ -19,6 +19,7 @@ import numpy as np
 from typing import Callable
 
 import jax
+from lxkit import ordered_norm
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -213,7 +214,7 @@ def _normal_svd(A, eigh):
     return _singular_values(evals), v
 
 
-def _shifted_normal_eigh(g, eigh):
+def _shifted_normal_eigh(g, eigh, mesh=None):
     """eigh of the PSD normal matrix G as I + G/||G||_F, eigenvalues mapped back.
 
     cuSOLVERMp STEDC failed (info 4, in58730813.3/.4) on the zero cluster of a
@@ -224,7 +225,8 @@ def _shifted_normal_eigh(g, eigh):
     tau * sigma_max moves by ~eps sqrt(r) / tau**2 relative: 3e-8 at
     r = 2e4, tau = 1e-3, against the 1e-6 multiplet tolerance.
     """
-    scale = jnp.linalg.norm(g, axis=(-2, -1))
+    scale = (jnp.linalg.norm(g, axis=(-2, -1)) if mesh is None else
+             ordered_norm(g, axis=(-2, -1), mesh=mesh, spec=P(*((None,) * (g.ndim - 2)), "x", "y")))
     scale = jnp.where(scale > 0, scale, 1)
     eye = jnp.eye(g.shape[-1], dtype=g.dtype)
     mu, v = eigh(g / scale[..., None, None] + eye)
@@ -578,7 +580,7 @@ def _direction_svd_kernel(eigh_plan, ndim):
             g = matmul(stack, stack, mesh=eigh_plan.mesh, transa="C",
                        backend=gemm_backend, batched_route="auto")
             if eigh_plan.backend == "cusolvermp":
-                evals, v = _shifted_normal_eigh(g, eigh_plan.batched)
+                evals, v = _shifted_normal_eigh(g, eigh_plan.batched, eigh_plan.mesh)
             else:
                 evals, v = eigh_plan.batched(g)
             s = _singular_values(evals)

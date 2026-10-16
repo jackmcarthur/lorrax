@@ -188,3 +188,56 @@ def test_ordered_reduce_on_sharded_arrays():
     import pytest
     with pytest.raises(TypeError, match="shard_map"):                 # traced: refused, never unordered
         jax.jit(lambda v: ordered_reduce(_rows_gram, v))(a)
+
+
+def test_ordered_sum_is_placement_independent():
+    """``lxkit.ordered_sum`` / ``ordered_norm``: inside a jit on the caller's layout (``mesh=``,
+    ``spec=``), and eagerly on a concrete array's own sharding -- no library all-reduce over
+    the four ranks, the right value, the same bits on permuted device orders; a tracer
+    without a layout is refused; a plain sum inside ``shard_map``."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    import pytest
+    from jax import shard_map
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from lxkit import ordered_norm, ordered_psum, ordered_sum
+    jax.config.update("jax_enable_x64", True)
+    _mesh((2, 2), ("x", "y"))
+    devs = np.asarray(jax.devices()[:4])
+    rng = np.random.default_rng(11)
+    g = rng.standard_normal((5, 8, 12)) + 1j * rng.standard_normal((5, 8, 12))
+    for spec, axis in ((P(None, "x", "y"), (-2, -1)), (P(None, "x", "y"), -1), (P(None, "x", None), (1, 2)),
+                       (P(None, ("x", "y"), None), 1), (P(), (1, 2))):
+        traced, eager = [], []
+        for perm in ([0, 1, 2, 3], [2, 0, 3, 1], [3, 2, 1, 0]):
+            mesh = Mesh(devs[perm].reshape(2, 2), ("x", "y"))
+            a = jax.device_put(jnp.asarray(g), NamedSharding(mesh, spec))
+            f = jax.jit(lambda v: ordered_sum(v, axis, mesh=mesh, spec=spec))
+            hlo = f.lower(a).compile().as_text()
+            assert not any("all-reduce" in l and "{0,1,2,3}" in l for l in hlo.splitlines()), (spec, axis)
+            r = np.asarray(f(a))
+            assert np.allclose(r, g.sum(axis=axis)), (spec, axis)
+            traced.append(r.tobytes())
+            eager.append(np.asarray(ordered_sum(a, axis)).tobytes())
+        assert traced[0] == traced[1] == traced[2] and eager[0] == eager[1] == eager[2], (spec, axis)
+    mesh = Mesh(devs.reshape(2, 2), ("x", "y"))
+    a = jax.device_put(jnp.asarray(g), NamedSharding(mesh, P(None, "x", "y")))
+    assert np.allclose(np.asarray(ordered_norm(a, (-2, -1))), np.linalg.norm(g, axis=(1, 2)))
+    assert np.allclose(np.asarray(ordered_sum(a, (1, 2), keepdims=True)), g.sum(axis=(1, 2), keepdims=True))
+    with pytest.raises(TypeError, match="mesh= and spec="):
+        jax.jit(lambda v: ordered_sum(v, -1))(a)
+    sm = jax.jit(shard_map(lambda v: ordered_psum(ordered_sum(v, (-2, -1)), ("x", "y")), mesh=mesh,
+                           in_specs=P(None, "x", "y"), out_specs=P(), check_vma=False))
+    assert np.allclose(np.asarray(sm(a)), g.sum(axis=(1, 2)))
+
+
+def test_planner_budget_reserves_the_ordered_transient():
+    import runtime
+    from lxkit import collectives as C
+    assert C.ordered_transient_bytes() == C.ORDERED_TRANSIENT_SLABS * C.slab_bytes() == 2 * (8 << 20)
+    total = 64e9
+    plain = ((total - runtime.MEMORY_MARGIN * runtime.outside_pool_allowance_bytes("local"))
+             / (1.0 + runtime.MEMORY_MARGIN * runtime.POOL_OVERSHOOT))
+    want = max(min(plain - C.ordered_transient_bytes(), runtime.pool_reservation_bytes(total)), 0.25 * total)
+    assert runtime.planner_budget_bytes(total, "local") == want
