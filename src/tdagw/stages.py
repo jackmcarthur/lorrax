@@ -382,6 +382,14 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
     """
     T = tdgw_io.T_IN_ATTOSEC
     sigma, est = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0)
+    if not np.isfinite(sigma):
+        raise ValueError(
+            f"GATE td_magnus_stability: got: coupling radius sigma = {sigma} (power iteration on "
+            f"the linearized dSigma commutator map, {len(est)} estimates, finite: "
+            f"{int(np.sum(np.isfinite(est)))}); want: a finite radius (0 for a model without "
+            f"interaction); why: the model's dSigma returns non-finite values, and every step "
+            f"would propagate them; fix: check the self-energy model (kernel export, operands, "
+            f"units) and its tests")
     dt_sig, y_lim = tp.magnus_dt_limit(cfg, sigma)
     if cfg.frame == "whole_rho":                       # no static limit: the probe decides
         dt_sig, y_lim = cfg.dt_measure, float("nan")
@@ -422,8 +430,14 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
     else:
         stable = (cfg.frame == "whole_rho" or cfg.dt <= dt_sig) and probe(cfg.dt)
     receipt = dict(sigma_ev=sigma * tdgw_io.HA_IN_EV, y=cfg.dt * sigma, y_lim=y_lim,
-                   dt_max_as=dt_sig * T, change=float(abs(est[-1] - est[-2]) / est[-1]),
+                   dt_max_as=dt_sig * T,
+                   change=float(abs(est[-1] - est[-2]) / est[-1]) if sigma > 0.0 else 0.0,
                    probes=probes)
+    if sigma <= 0.0:
+        say(f"  stability       : no coupling (sigma = 0: the dSigma commutator map vanishes on "
+            f"this model, below {tp.COUPLING_ZERO_FLOOR:.0e} Ha), any step is stable"
+            + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
+        return cfg, receipt
     pr = "; ".join(f"{q['growth']:.4g} per step at {q['probe_dt_as']:.4g} as" for q in probes)
     say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius of the "
         f"dSigma commutator map, {len(est)} power iterations, last change "
@@ -448,6 +462,13 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
             f"a mode of the coupling grows from rounding, independent of the drive; fix: "
             f"[lorrax] dt = 'auto', or dt <= {receipt['dt_max_as']:.4g} as subject to the probe, or "
             + "; ".join(alts) + ", or method = 'etdrk4' / 'dp54'")
+    if not stable and not probes:
+        raise ValueError(
+            f"GATE td_magnus_stability: got: dt = {cfg.dt * T:.4g} as with sigma = "
+            f"{receipt['sigma_ev']:.4g} eV and a sigma limit of {receipt['dt_max_as']:.4g} as, "
+            f"so no probe ran; want: a finite sigma limit to compare dt with, then the probe; "
+            f"why: without either test the step is not known to be stable; fix: dt = 'auto', "
+            f"another n_corr / predictor, or method = 'etdrk4' / 'dp54'")
     if not stable:
         q = probes[-1]
         raise ValueError(
