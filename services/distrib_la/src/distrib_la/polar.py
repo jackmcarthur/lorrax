@@ -231,8 +231,43 @@ def _shifted_normal_eigh(g, eigh):
     return (mu - 1) * scale[..., None], v
 
 
+@lru_cache(maxsize=32)
+def _agree_kernel(mesh):
+    """Every device's copy of a replicated spectrum replaced by mesh device 0's bits, on device.
+
+    The bits travel as unsigned integers and every other device contributes
+    zero to one psum, so the sum is device 0's bit pattern exactly (no float
+    rounding, signed zeros and NaN payloads kept).
+    """
+    from jax import shard_map
+    axes = tuple(mesh.axis_names)
+
+    def body(s):
+        bits = jax.lax.bitcast_convert_type(s, _UINT_OF[jnp.dtype(s.dtype).itemsize])
+        root = jnp.asarray(True)
+        for a in axes:
+            root = root & (jax.lax.axis_index(a) == 0)
+        bits = jax.lax.psum(jnp.where(root, bits, jnp.zeros_like(bits)), axes)
+        return jax.lax.bitcast_convert_type(bits, s.dtype)
+    return jax.jit(shard_map(body, mesh=mesh, in_specs=P(), out_specs=P(), check_vma=False))
+
+
+_UINT_OF = {4: jnp.uint32, 8: jnp.uint64}
+
+
 def _host_spectrum(s):
-    """One O(n) spectrum for all eager rank cuts, including roundoff tails."""
+    """One O(n) spectrum for all eager rank cuts, including roundoff tails.
+
+    Every process must cut the same bits.  A mesh-replicated spectrum is made
+    uniform on the device (``_agree_kernel``: device 0's bits) and read once;
+    the previous host broadcast (one host-to-device put and one collective
+    per eigh, ``multihost_utils.broadcast_one_to_all``) serves only an input
+    that is not a mesh array.
+    """
+    sharding = getattr(s, "sharding", None)
+    if isinstance(sharding, NamedSharding) and jnp.dtype(s.dtype).itemsize in _UINT_OF:
+        values = np.asarray(_agree_kernel(sharding.mesh)(s))
+        return values[..., ::-1].copy()
     from jax.experimental.multihost_utils import broadcast_one_to_all
     values = np.asarray(s)
     bits = broadcast_one_to_all(values.view(np.uint64))
