@@ -16,8 +16,11 @@ inside ``shard_map``, the ``batch_reshard`` geometry of line_select and the cons
   the new route passes only if it fails no more matrices than the old one and every failed
   matrix is NaN in both w and v (the route's explicit failure);
 * eigenspaces: per eigenvalue cluster (gap > 1e-8 max|A|) the projector difference
-  ``max|V_c V_c^H - R_c R_c^H| <= PROJ_TOL`` -- vectors are compared as subspaces, never
-  entrywise (degenerate spectra and the gauge are free).
+  ``max|V_c V_c^H - R_c R_c^H|`` within the Davis-Kahan bound of a backward-stable solve,
+  ``max(PROJ_TOL, 4 n eps max|A| / gap)`` -- vectors are compared as subspaces, never
+  entrywise (degenerate spectra and the gauge are free).  Scales are max|A|.
+* the captured hsuite na_sc stacks (``NA_SC_STACKS``): the native target on them, window
+  bypassed, against host LAPACK, with the old route's numbers printed beside.
 
 Cases: random, exactly degenerate (multiplicity 3 and 8 clusters, ``Q diag(l) Q^H``),
 real-valued complex, diagonal with repeats, zero rows, block-diagonal, an all-zero and a
@@ -27,6 +30,7 @@ Plus the row: a stack outside it (batch 1) is ``jnp.linalg.eigh`` bit for bit.
 ROCm: ``python -m tests.test_rocsolver_eigh_gate`` on any mesh (one GCD or the 2x2 P=4 mesh).
 Under pytest the device gate skips; the row's CPU checks run.
 """
+import os
 import sys
 
 # runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
@@ -68,22 +72,33 @@ def _case(kind, rng, b, n, dtype):
 
 
 def compare(a, w, v, w_ref, v_ref):
-    """The gate's numbers for one local stack (numpy arrays)."""
-    scale = max(1.0, float(np.abs(a).max()))
+    """The gate's numbers for one local stack (numpy arrays).  Scales are max|A| (a small-norm
+    matrix is judged relative to itself).  Eigenspaces are compared per cluster of the
+    reference spectrum (gap > 1e-8 max|A|) as projectors, against the Davis-Kahan bound of a
+    backward-stable solve: max(PROJ_TOL, 4 n eps max|A| / gap), gap the cluster's distance to
+    the rest of the spectrum; ``proj_ratio`` is the worst cluster's difference over its bound."""
+    scale = float(np.abs(a).max()) or 1.0
     n = a.shape[-1]
+    eps = float(np.finfo(np.float64).eps)
     vh = np.conj(np.swapaxes(v, -1, -2))
     res = float(np.abs(a @ v - v * w[..., None, :]).max()) / scale
     orth = float(np.abs(vh @ v - np.eye(n)).max())
     dw = float(np.abs(w - w_ref).max()) / scale
-    proj = 0.0
+    proj, ratio = 0.0, 0.0
     for i in range(a.shape[0]):
-        cuts = np.flatnonzero(np.diff(w_ref[i]) > 1e-8 * scale) + 1
+        wr = w_ref[i]
+        cuts = np.flatnonzero(np.diff(wr) > 1e-8 * scale) + 1
         for lo, hi in zip(np.r_[0, cuts], np.r_[cuts, n]):
+            if hi - lo == n:
+                continue                                   # one cluster: every basis spans it
+            gap = min(wr[lo] - wr[lo - 1] if lo > 0 else np.inf, wr[hi] - wr[hi - 1] if hi < n else np.inf)
             p = v[i][:, lo:hi] @ np.conj(v[i][:, lo:hi].T)
             r = v_ref[i][:, lo:hi] @ np.conj(v_ref[i][:, lo:hi].T)
-            proj = max(proj, float(np.abs(p - r).max()))
+            d = float(np.abs(p - r).max())
+            proj = max(proj, d)
+            ratio = max(ratio, d / max(PROJ_TOL, 4 * n * eps * scale / gap))
     finite = bool(np.all(np.isfinite(w)) and np.all(np.isfinite(v)))
-    return dict(res=res, orth=orth, dw=dw, proj=proj, finite=finite)
+    return dict(res=res, orth=orth, dw=dw, proj=proj, proj_ratio=ratio, finite=finite)
 
 
 def _full_np(a, uplo, sym):
@@ -98,7 +113,7 @@ def _full_np(a, uplo, sym):
 
 def passes(m):
     return (m["finite"] and m["res"] <= TOL and m["orth"] <= TOL and m["dw"] <= TOL
-            and m["proj"] <= PROJ_TOL)
+            and m["proj_ratio"] <= 1.0)
 
 
 CASES = (
@@ -141,9 +156,15 @@ def gate_cases(mesh):
     for kind, b, n, dt, uplo, sym in CASES:
         glob = _case(kind, rng, b * ndev, n, dt)        # b matrices per device
         x = device_put_process_local(glob, NamedSharding(mesh, spec))
-        row = le.batched_eigh_row((b, n, n), np.dtype(dt))
-        assert row is not None, f"stack {(b, n, n)} {dt} is outside the ROCM row {le.BATCHED_EIGH_ROUTE}"
-        new = lambda t: le.eigh_local(t, UPLO=uplo, symmetrize_input=sym)
+        # In the row's window: eigh_local itself.  Outside it: the native target directly (the
+        # same solve, window bypassed), so a narrower window keeps every case on the handler.
+        if le.batched_eigh_row((b, n, n), np.dtype(dt)) is not None:
+            new = lambda t: le.eigh_local(t, UPLO=uplo, symmetrize_input=sym)
+        elif dt == "complex128":
+            new = lambda t: le._reflected_eigh(t, uplo, sym, solve=lambda bb: le._native_batched_eigh(
+                le.BATCHED_EIGH_ROUTE["ROCM"], bb))
+        else:
+            new = lambda t: le._native_batched_eigh(le.BATCHED_EIGH_ROUTE["ROCM"], le._full(t, uplo, sym))
         host_ref = dt == "complex128" and kind in STRUCTURED
         if host_ref:        # the leg's previous route (reflector + jaxlib's zheevd loop) ...
             ref = lambda t: le._reflected_eigh(t, uplo, sym, solve=jnp.linalg.eigh)
@@ -182,9 +203,53 @@ def gate_cases(mesh):
     w1, v1 = le.eigh_local(a1)
     w2, v2 = jnp.linalg.eigh(a1)
     out["batch-1 float64 is jnp.linalg.eigh bit for bit"] = dict(
-        finite=True, res=0.0, orth=0.0, proj=0.0,
+        finite=True, res=0.0, orth=0.0, proj=0.0, proj_ratio=0.0,
         dw=0.0 if (np.array_equal(np.asarray(w1), np.asarray(w2))
                    and np.array_equal(np.asarray(v1), np.asarray(v2))) else 1.0)
+    return out
+
+
+#: Stacks captured from hsuite na_sc on MI250X (wave 6, rocm/integration5), as eigh_local
+#: receives them: ``cq_factor`` c128[4, 96, 96], the ISDF charge C_q of ``isdf.cplus.factor``
+#: (SPD, lambda 7e-9 .. 1e-2, rows 56..95 decoupled with one constant diagonal, so a 40-fold
+#: eigenvalue sits inside the spectrum), and ``directions`` c128[3, 96, 96], the constructor's
+#: ``leading_response_directions`` stack (deflate_zero_rows sentinels, 2-3-fold multiplets).
+NA_SC_STACKS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data",
+                            "rocsolver_eigh_na_sc_stacks.npz")
+
+
+def captured_cases(mesh):
+    """The native target on the captured na_sc stacks, whatever the row's window: every device
+    solves the whole stack; reference host LAPACK, jaxlib's loop (the old route) reported beside."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit import device_put_process_local
+    from distrib_la import local_eigh as le
+
+    spec = P(tuple(mesh.axis_names))
+    ndev = int(np.prod(mesh.devices.shape))
+    row = le.BATCHED_EIGH_ROUTE["ROCM"]
+    native = lambda t: le._reflected_eigh(t, None, True, solve=lambda b: le._native_batched_eigh(row, b))
+    loop = lambda t: le._reflected_eigh(t, None, True, solve=jnp.linalg.eigh)
+    sm = lambda f: jax.jit(jax.shard_map(lambda t: tuple(f(t)), mesh=mesh, in_specs=spec, out_specs=(spec, spec)))
+    out = {}
+    with np.load(NA_SC_STACKS) as data:
+        for key in sorted(data.files):
+            stack = data[key]
+            glob = np.concatenate([stack] * ndev)
+            x = device_put_process_local(glob, NamedSharding(mesh, spec))
+            for tag, f in (("native", native), ("old loop", loop)):
+                w, v = sm(f)(x)
+                ms = []
+                for sw, sv in zip(w.addressable_shards, v.addressable_shards):
+                    a_loc = glob[sw.index[0]]
+                    w_r, v_r = np.linalg.eigh(a_loc)
+                    ms.append(compare(a_loc, np.asarray(sw.data), np.asarray(sv.data), w_r, v_r))
+                m = {k: (all(d[k] for d in ms) if k == "finite" else max(d[k] for d in ms)) for k in ms[0]}
+                if tag == "old loop":
+                    m["report_only"] = True
+                out[f"na_sc {key:10s} c128 b={stack.shape[0]} n={stack.shape[-1]} [{tag}]"] = m
     return out
 
 
@@ -199,11 +264,11 @@ def main() -> int:
         print(f"SKIP: needs a ROCm mesh, got {mesh_ffi_platform(mesh)}", flush=True)
         runtime.finalize_process(0)
         return 0
-    out = gate_cases(mesh)
-    bad = {k: m for k, m in out.items() if not passes(m)}
+    out = {**gate_cases(mesh), **captured_cases(mesh)}
+    bad = {k: m for k, m in out.items() if not m.get("report_only") and not passes(m)}
     for k, m in out.items():
         print(f"r{jax.process_index()} {'ok  ' if not k in bad else 'FAIL'} {k}  res {m['res']:.1e} "
-              f"orth {m['orth']:.1e} dw {m['dw']:.1e} proj {m['proj']:.1e}"
+              f"orth {m['orth']:.1e} dw {m['dw']:.1e} proj {m['proj']:.1e} (bound ratio {m['proj_ratio']:.1e})"
               + (f"  [failed matrices: old route {m['ref_nan']}, new route {m['new_nan']}]"
                  if m.get("ref_nan") or m.get("new_nan") else ""), flush=True)
     nbad = len(bad)
@@ -261,6 +326,22 @@ def test_compare_is_gauge_and_degeneracy_blind():
     assert passes(compare(a, w, v2, w, v))
     v3 = v2.copy(); v3[0][:, [0, 3]] = v3[0][:, [3, 0]]     # swapped across clusters: caught
     assert not passes(compare(a, w, v3, w, v))
+
+
+def test_the_na_sc_stacks_carry_the_padding_multiplet():
+    """The captured C_q stack keeps its structure: 40 decoupled rows on one constant diagonal,
+    i.e. an exactly 40-fold eigenvalue strictly inside the spectrum (the regression's trigger)."""
+    with np.load(NA_SC_STACKS) as data:
+        cq, dirs = data["cq_factor"], data["directions"]
+    assert cq.shape == (4, 96, 96) and dirs.shape == (3, 96, 96) and cq.dtype == np.complex128
+    for a in (cq, dirs):
+        assert np.array_equal(a, np.conj(np.swapaxes(a, -1, -2)))
+    for m in cq:
+        pad = m[56:, 56:]
+        assert np.all(m[56:, :56] == 0) and np.all(pad == pad[0, 0] * np.eye(40))
+        w = np.linalg.eigvalsh(m)
+        assert w[0] < pad[0, 0].real < w[-1]
+        assert np.sum(np.abs(w - pad[0, 0].real) <= 1e-12 * w[-1]) >= 40
 
 
 def test_device_gate_needs_rocm():

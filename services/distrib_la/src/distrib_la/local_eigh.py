@@ -50,6 +50,18 @@ A routed stack whose
 target is not loadable refuses by GATE ``batched_eigh_target`` (no fallback to the loop).
 Gate: ``tests/test_rocsolver_eigh_gate.py`` (residual, orthogonality, eigenvalues and
 eigenspaces against ``jnp.linalg.eigh`` on the same GCD).
+
+VALID, NOT IDENTICAL.  The batched driver and jaxlib's loop are both backward stable, not
+bitwise equal: on exactly degenerate eigenvalues they return different orthonormal bases of
+the same eigenspaces, and elsewhere they differ at rounding level.  No caller may depend on
+either.  hsuite na_sc does (wave-6 integration, pool logs eighb_*): its outcome follows the
+eigensolver's rounding at ``isdf.cplus.factor``'s c128[4, 96, 96] charge C_q stack (40
+decoupled rows on one constant diagonal, a 40-fold eigenvalue inside the spectrum).  C+ differs
+between the routes by <= 1.9e-8 relative, as each route does from host LAPACK, and the stage
+gives: jaxlib's loop, a 0.110 eV tolerance miss; the batched driver, GATE
+shared_pole_zero_ritz (its ``infinite_weight_ok``, a 1e-6 bound on near-null Ritz weight);
+jaxlib's loop on a second unitary reflection of the same matrix, PASS.  The stacks are gate
+cases (``tests/data/rocsolver_eigh_na_sc_stacks.npz``).
 """
 
 from __future__ import annotations
