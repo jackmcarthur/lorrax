@@ -163,25 +163,37 @@ simulated fs; error is the relative L2 error of P(t) over 30 fs.
 | CrI3, 6×6 k, 2v2c, ISDF COHSEX, 100 V/m (exact linear response as reference) | 3.5e-4 at 46 (rtol 1e-6); 3.3e-6 at 114 (rtol 1e-8) | 1.0e-4 at 80 (50 as); 6.5e-6 at 160 (25 as) | 1.4e-5 at 80 (50 as); 3.4e-6 at 160 (25 as) | 3.9e-8 at 800 (5 as) |
 | synthetic 4v4c, 6×6 k, transitions to 12 eV, dense TDA kernel | 2.9e-5 at 337 (rtol 1e-6) | 2.2e-5 at 160 (25 as) | 6.4e-6 at 161 (25 as) | 1.7e-5 at 800 (5 as) |
 
-On the CrI3 window (transitions 1.4–4 eV) DP54's steps after the pulse
-are long, and it needs the fewest ΔΣ evaluations at every accuracy; the
-bright-peak positions move by 0.035 meV at rtol 1e-6 and not at all below.
-On the synthetic window, whose 12 eV transitions limit an explicit step,
-ETDRK4 and CFM4 need 2–4× fewer evaluations than DP54. RK4 diverges beyond
-h·ΔE_max ≈ 2.8 (150 as at 12 eV); ETDRK4 and CFM4 with two corrections stay
-usable (error < 1e-2) to about 100 as on both windows; `magnus2` is
-unconditionally bounded but second order.
+On the CrI3 window (transitions 1.4–4 eV) DP54's steps after the pulse are
+long. It needs the fewest ΔΣ evaluations at every measured accuracy except
+near 1e-5, where CFM4 with two corrections at 50 as ties it (1.4e-5 at 80,
+between DP54's 3.3e-5 at 72 and 3.3e-6 at 114). The bright-peak positions
+move by 0.035 meV at rtol 1e-6 and not at all below. The same runs on four
+GPUs through the ISDF adapter at 5e8 V/m reproduce the CPU errors to four
+digits: DP54 (rtol 1e-6) 1.92e-5 at 80.6, 0.20 s per fs; CFM4 (two
+corrections, 50 as) 1.72e-5 at 80.4, 0.21 s per fs; ETDRK4 (25 as) 6.53e-6 at
+160, 0.31 s per fs. On the synthetic window, whose 12 eV transitions limit an
+explicit step, ETDRK4 and CFM4 need 2–4× fewer evaluations than DP54. RK4
+diverges beyond h·ΔE_max ≈ 2.8 (150 as at 12 eV); ETDRK4 and CFM4 with two
+corrections stay usable (error < 1e-2) to about 100 as on both windows;
+`magnus2` is unconditionally bounded but second order.
 
 **Default: `dp54`**, at `rtol` 1e-6 to 1e-7, with `max_step` near a fifth of
-the pulse width for short pulses: it takes TDGW's steps, needs no step
-choice and is the cheapest on narrow windows. Use `etdrk4` or `cfm4` (two
-corrections, `dt` 25–50 as) when the window spans a wide energy range or a
-fixed step that divides `dt_measure` is wanted for a long production drive;
-in strong fields with the intraband term on prefer `etdrk4`, which stays
-fourth order where `cfm4` drops to second (above).
-On four A100s the ISDF ΔΣ dominates the wall time (2.95 ms per call at
-2v2c, 9.0 ms at 30v × 14c on 6×6 k, against 1.05 ms for one exponential and
-0.27 ms per sample at 30v × 14c), so the wall time follows the ΔΣ count.
+the pulse width for short pulses: it takes TDGW's steps, needs no step choice
+and is as cheap as the best fixed step on narrow windows. Use `etdrk4` or
+`cfm4` (two corrections, `dt` 25–50 as) when the window spans a wide energy
+range or a fixed step that divides `dt_measure` is wanted for a long
+production drive; in strong fields with the intraband term on prefer
+`etdrk4`, which stays fourth order where `cfm4` drops to second (above). On
+four A100s the ISDF ΔΣ dominates the wall time (2.95 ms per call at 2v2c, 9.0
+ms at 30v × 14c on 6×6 k, against 1.05 ms for one exponential and 0.27 ms per
+sample at 30v × 14c), so the wall time follows the ΔΣ count. On synthetic 30v
+× 14c headers with a rank-1000 stand-in ΔΣ, a DP54 step costs 2.9 / 4.9 /
+23.4 ms at 64 / 144 / 900 k (one exponential 1.1 / 1.2 / 3.3 ms) and rank 0
+peaks at 4.2 GB at 900 k. The whole drive apart from ΔΣ then costs at most
+0.69 s per fs (DP54, 23.5 steps per fs) or 0.73 s per fs (ETDRK4, 25 as) at
+900 k, so a production run costs (ΔΣ calls per fs) × t_ΔΣ + at most 0.7 s per
+fs. A fixed step fixes the ΔΣ count in advance: four per step for ETDRK4 and
+for CFM4 with two corrections, i.e. 80 per fs at 50 as.
 
 ## Layout and programs {#layout}
 
