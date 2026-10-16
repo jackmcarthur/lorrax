@@ -55,3 +55,15 @@ def test_kernel_export_refusals_carry_why(tmp_path, call):
     with pytest.raises(ValueError) as e:
         call(str(tmp_path / "k.h5"))
     assert FORMAT.match(str(e.value))
+
+
+@pytest.mark.parametrize("ibndmin, nb, ivbm", [(129, 4, 130), (100, 60, 130), (88, 56, 130), (1, 2, 1)])
+def test_kernel_band_order_is_the_tdgw_io_definition(ibndmin, nb, ivbm):
+    from tdagw.tdgw_io import kernel_file_bands
+    order = KE.tdgw_file_band_order(ibndmin, nb, ivbm)
+    n_v = ivbm - ibndmin + 1
+    fb = kernel_file_bands(ivbm, n_v, nb - n_v)
+    bands = ibndmin + np.arange(nb)
+    assert np.array_equal(fb[order], bands)                      # file slot of each window band
+    v = bands <= ivbm                                            # the closed form it replaced
+    assert np.array_equal(order, np.where(v, ivbm - bands, n_v + bands - ivbm - 1))
