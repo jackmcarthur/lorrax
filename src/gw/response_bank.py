@@ -2209,7 +2209,16 @@ class _MemberRows:
 
     def __getitem__(self, key):
         i, rows = key
-        return _member_rows(self.carry, self.first + int(i), np.asarray(rows))
+        sharding = getattr(self.carry, "sharding", None)
+        if not isinstance(sharding, NamedSharding):
+            return _member_rows(self.carry, self.first + int(i), np.asarray(rows))
+        # The member index and its rows repeat across groups: placed once per
+        # distinct value instead of two host transfers on every take.
+        from common.collectives import device_put_process_local_cached
+        rep = NamedSharding(sharding.mesh, P())
+        return _member_rows(self.carry,
+                            device_put_process_local_cached(np.int64(self.first + int(i)), rep),
+                            device_put_process_local_cached(np.asarray(rows), rep))
 
 
 @jax.jit
