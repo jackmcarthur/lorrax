@@ -112,6 +112,10 @@ class PlatformLeg:
     #: runtime libraries, ``setdefault`` by ``runtime.set_default_env`` before
     #: the backend starts (a caller's export wins).  () = none.
     runtime_env_defaults: tuple = ()
+    #: ``O`` of the memory rule on this leg: device bytes a process holds
+    #: outside XLA's pool at ``linalg = local`` (docs/architecture/memory-model.md#rule).
+    #: None = ``runtime.OUTSIDE_POOL_BYTES``.
+    outside_pool_bytes: Optional[float] = None
     #: collective library of the leg's XLA collectives; the section of
     #: ``config/<site>/site.toml`` that runtime.network_env applies ("" = none).
     collective_library: str = ""
@@ -182,8 +186,8 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         xla_flag_defaults=(("--xla_gpu_autotune_level", "0"),
                            ("--xla_gpu_disable_async_collectives", "ALLCOLLECTIVES")),
         # The pool policy's arena: BFC (cuda_async does not exist on ROCm),
-        # preallocated at runtime.pool_fraction (0.8952 of a 68.70 GB GCD,
-        # 61.50 GB) instead of jaxlib's 0.75 (51.53 GB).  Outside the arena
+        # preallocated at runtime.pool_fraction (0.8760 of a 68.70 GB GCD,
+        # 60.18 GB, after outside_pool_bytes below) instead of jaxlib's 0.75 (51.53 GB).  Outside the arena
         # after RCCL init, 512 MiB psum/all_to_all, a 3D FFT and a GEMM:
         # 0.99-1.08 GB per rank at P4, against the 7.20 GB left; hsuite walls
         # unchanged, planner budget 41.96 -> 50.08 GB (Runtime-LEGS lane 2026-10-15).
@@ -228,6 +232,14 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # tau 9.61 -> 9.16 s, eqp1 identical (comm lane 2026-10-15; pool logs
         # comm_var2, comm_fe_base, comm_fe_nsr).  CUDA declares none.
         runtime_env_defaults=(("HSA_NO_SCRATCH_RECLAIM", "1"),),
+        # O of the memory rule.  With scratch reclaim off ROCr keeps each queue's
+        # largest scratch: outside the BFC arena (hipMemGetInfo total - free -
+        # pool_bytes, sampled every 0.25 s) the max over P4 ranks was 4.07 GB in
+        # hsuite kmeans (2.71 GB with HSA_NO_SCRATCH_RECLAIM=0) and 3.30 GB on Fe
+        # V2 (2.13 GB), resident from the first ISDF stage on; 3 GB (the CUDA
+        # figure) no longer covers it (comm lane 2026-10-16, pool logs comm_mhs_*,
+        # comm_mfe_*).  R = M - 1.2 (O + 3 GB): 60.18 of 68.70 GB.
+        outside_pool_bytes=4.1e9,
         outside_pool_api="hip_runtime_arena",
         # In process: amd-smi takes 1.0 s a sample and rocm-smi 0.45 s, and both
         # number all eight GCDs, not the one ROCR_VISIBLE_DEVICES leaves visible.
