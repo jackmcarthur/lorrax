@@ -482,6 +482,19 @@ def _shared_pole_static_key(meta, header, tables, *, mesh_xy, layout):
         {name: value for name, value in tables.items() if name != "policy"}))
 
 
+def _w_orientation(all_identity, reads_w, reads_wt):
+    """The W orientation one Sigma branch forms: ``"pair"``, ``"plus"`` or ``"transpose"``.
+
+    A single orientation only when every panel's realization is the identity pair (no
+    stabilizer mixes W with its partner) AND the branch's load rows read that orientation
+    alone; a branch whose rows read both (or, defensively, neither) forms the pair through
+    the transpose exchange exactly as before.
+    """
+    if not all_identity or reads_w == reads_wt:
+        return "pair"
+    return "plus" if reads_w else "transpose"
+
+
 def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy, layout="face",
                              weights_fn=_shared_pole_weights, stage="sigma"):
     """Read the factors once and bind W(τ) on the irreducible q for the window executable.
@@ -647,10 +660,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     # its load reads.  The unread tile slot carries the read one; the load never reads it.
     all_identity = all(p["identity"] for p in panels)
     def branch_orientation(space):
-        reads_w, reads_wt = branch_reads(space)
-        if not all_identity or (reads_w and reads_wt):
-            return "pair"
-        return "plus" if reads_w else "transpose"
+        return _w_orientation(all_identity, *branch_reads(space))
     def _w_kernel_for(orientation):
         spans = tuple((p["span"], p["kernels"][orientation]) for p in panels)
         def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node):
@@ -728,6 +738,15 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     synthesis.q_wedge = q_wedge
     synthesis.branch_orientation = branch_orientation
     synthesis.w_kernel_for = lambda space: w_kernels[branch_orientation(space)]
+    def _rows(space):
+        trs = hole_trs if (ordered and space == 'val') else particle_trs
+        return f"{int(np.sum(trs == 0))}/{int(np.sum(trs == 1))}"
+    synthesis.path_note = (
+        "Sigma W synthesis: realization " + ("identity pair" if all_identity else "little-group")
+        + f" ({sum(p['identity'] for p in panels)}/{len(panels)} panels), "
+        + ("ordered" if ordered else "trs-even") + " store; "
+        + "; ".join(f"{sp} rows W/Wt {_rows(sp)} -> {branch_orientation(sp)}"
+                    for sp in (("cond", "val") if ordered else ("cond",))))
     return synthesis
 
 
@@ -2496,6 +2515,8 @@ def compute_sigma_c_mpa_omega_grid(
                         layout=schedule.get("factor_layout", wfns.layout))
                         if sector_context is None else sector_context["synthesis"](
                             reader, ledger, frequencies, schedule))
+                    print_fn("  " + getattr(synthesis, "path_note",
+                                            "Sigma W synthesis: pair (no per-branch orientation)"))
                 # A sector's caller owns its synthesis lifetime
                 # (compute_sector_sigma); the scalar model's ends here.
                 owned = sector_context is None
