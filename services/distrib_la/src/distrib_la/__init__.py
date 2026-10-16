@@ -135,7 +135,7 @@ from distrib_la.plan import (
 )
 from distrib_la.polar import (PolarPlan, plan_polar_factor, polar_factor,
                              right_singular_vectors, leading_eigenvectors,
-                             retain_leading_eigenvectors)
+                             leading_eigenvectors_above, retain_leading_eigenvectors)
 from distrib_la.resolve import (
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
@@ -170,7 +170,7 @@ __all__ = [
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local", "eigh_stack_bytes",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
-    "right_singular_vectors", "leading_eigenvectors",
+    "right_singular_vectors", "leading_eigenvectors", "leading_eigenvectors_above",
     "retain_leading_eigenvectors",
     # distributed matrix multiplication
     "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",

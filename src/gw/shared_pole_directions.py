@@ -700,14 +700,14 @@ def _round_partner_directions_many(pairs, cutoff, *, real, kernels, eigh_plan, c
     rank its own slots' rows) so the leading eigensystems of all pairs are TWO
     batch-layout eigh calls (the scale ``top`` and the complement ``perp``), on the
     leg's batched route where its row covers the stack (``distrib_la.local_eigh``),
-    and every row's spectrum reaches the host in one read. Each pair's retained
+    and only every row's count reaches the host, in one read (``leading_eigenvectors_above``). Each pair's retained
     directions are then cut back to its own carrier, the column extent of its own
     largest count (the stacked carrier's further columns are the exact zero tail),
     so the shapes are the per-pair call's. Face stacks, a single pair and pairs of
     unequal shape take the per-pair call.
     """
     from gw.shared_pole_execution import is_face
-    from gw.shared_pole_local import _pad_columns, host_tree
+    from gw.shared_pole_local import _pad_columns
     count = len(pairs)
     if (count < 2 or any(is_face(q) for q, _ in pairs)
             or len({(tuple(q.shape), tuple(o.shape)) for q, o in pairs}) != 1):
@@ -719,24 +719,15 @@ def _round_partner_directions_many(pairs, cutoff, *, real, kernels, eigh_plan, c
     top = kernels.interleave(count)(*(t for t, _ in dedupe))
     perp = kernels.interleave(count)(*(p for _, p in dedupe))
     del dedupe
-    m = int(perp.shape[-1])
-    _, largest = distrib_la.leading_eigenvectors(top, 1, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                 multiplet_tol=tol, real_rows=rows)
-    del top
-    directions, spectrum = distrib_la.leading_eigenvectors(
-        perp, m, eigh_plan=eigh_plan, column_extent=column_extent, multiplet_tol=tol, real_rows=rows)
-    del perp
-    spectrum_h, largest_h = host_tree((tuple(spectrum), tuple(largest)))
-    counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
-                   if i // count < real else 0 for i, (values, t) in enumerate(zip(spectrum_h, largest_h)))
-    per_pair = [tuple(counts[s * count + e] for s in range(slots)) for e in range(count)]
-    if max(counts) == 0:
+    # Both eighs, the cut against each row's largest top eigenvalue and the
+    # multiplet closure in one service call; the host reads only the counts.
+    kept_directions, sizes = distrib_la.leading_eigenvectors_above(
+        perp, top, cutoff, real=rows, eigh_plan=eigh_plan, column_extent=column_extent,
+        multiplet_tol=tol, real_rows=rows)
+    del top, perp
+    per_pair = [tuple(sizes[s * count + e] for s in range(slots)) for e in range(count)]
+    if kept_directions is None:
         return [(_times_zero(q), c) for (q, _), c in zip(pairs, per_pair)]
-    kept_directions, kept = distrib_la.retain_leading_eigenvectors(
-        directions, spectrum, counts, mesh=eigh_plan.mesh,
-        column_extent=column_extent, multiplet_tol=tol, real_rows=rows)
-    del directions
-    sizes = tuple(int(v.size) for v in kept)
     out = []
     for e, (part, (q, _)) in enumerate(zip(kernels.deinterleave(count)(kept_directions), pairs)):
         if max(per_pair[e]) == 0:
@@ -779,23 +770,15 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     from gw.shared_pole_execution import is_face
     spectral_rows = None if is_face(q) else real
     top, perp = kernels.dedupe(q, output)
-    m = int(perp.shape[-1])
-    _, largest = distrib_la.leading_eigenvectors(top, 1, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                 multiplet_tol=tol, real_rows=spectral_rows)
-    directions, spectrum = distrib_la.leading_eigenvectors(
-        perp, m, eigh_plan=eigh_plan, column_extent=column_extent,
+    directions, counts = distrib_la.leading_eigenvectors_above(
+        perp, top, cutoff, real=real, eigh_plan=eigh_plan, column_extent=column_extent,
         multiplet_tol=tol, real_rows=spectral_rows)
-    counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
-                   if i < real else 0 for i, (values, t) in enumerate(zip(spectrum, largest)))
-    if max(counts) == 0:
+    if directions is None:
         return _times_zero(q), counts
     from gw.shared_pole_local import _pad_columns
-    directions, kept = distrib_la.retain_leading_eigenvectors(
-        directions, spectrum, counts, mesh=eigh_plan.mesh,
-        column_extent=column_extent, multiplet_tol=tol, real_rows=spectral_rows)
     if directions.shape[-1] < q.shape[-1]:
         directions = _pad_columns(directions.sharding, directions.shape, int(q.shape[-1]))(directions)
-    return directions, tuple(int(v.size) for v in kept)
+    return directions, counts
 
 
 def _model_diagnostics(model, moments, infinity_directions, *, matmul):
