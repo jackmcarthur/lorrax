@@ -18,7 +18,10 @@ applier fused and unfused (``build_bse_stack_pair_matvec``); spinor counts 1 and
 with remainders (29 = 8 + 8 + 8 + 5 rows per rank, the last block clamped onto its neighbour).
 Red twins: a plan with one μ block dropped, and one whose W_R block start is off by one row; the
 same check must report both.  The over-budget case lowers the device budget below the W term's
-price: the stage warns and still runs (TASTE 96).
+price: the stage warns and still runs (TASTE 96).  The memory case compiles (abstractly; nothing
+is allocated) the route-3 matvec on a 30x30 grid in 8 x 8 blocks of a 480 x 480 tile per rank and
+requires its temps below half of the rank's ``W_R``; its red twin slices the blocks from the 5-D
+tile, which GPU layout assignment turns into one k-leading relayout of the whole tile.
 
 CPU, one process with four host devices: ``JAX_PLATFORMS=cpu
 XLA_FLAGS=--xla_force_host_platform_device_count=4 python3 tests/test_bse_w_blocks.py``.
@@ -259,6 +262,42 @@ def run_densify_cases(mesh):
     return out
 
 
+def run_memory_case(mesh):
+    """Per-rank compiled temps of the route-3 matvec, ``(blocks from _w_block, red twin, W_R bytes)``.
+
+    CrI3-like 30x30 grid, ns 2, a 480 x 480 tile per rank in 8 x 8 blocks of 64 rows, abstract
+    operands.  The red twin slices each block from the 5-D tile, the program the AOT gate refused at
+    98.5 GB per rank on CrI3 30x30, N_μ 3000, P4: there GPU layout assignment gave the
+    loop-invariant tile the k-major layout of the k-leading kernel operand, one relayout of the
+    WHOLE tile ahead of the scans.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from bse import bse_stack_matvec as B
+    from runtime import tiles
+    kg, nk, n_c, n_v, ns, n_mu, nb = (30, 30, 1), 900, 4, 6, 2, 960, 2
+    sds = lambda shape, spec, dt=jnp.complex128: jax.ShapeDtypeStruct(shape, dt, sharding=NamedSharding(mesh, spec))
+    args = (sds((nb, n_c, n_v, nk), P(None, "x", "y", None)),
+            sds((nk, n_c, ns, n_mu), P(None, None, None, "x")), sds((nk, n_c, ns, n_mu), P(None, None, None, "y")),
+            sds((nk, n_v, ns, n_mu), P(None, None, None, "x")), sds((nk, n_v, ns, n_mu), P(None, None, None, "y")),
+            sds((nk, n_c), P(None, None), jnp.float64), sds((nk, n_v), P(None, None), jnp.float64),
+            sds((n_mu, n_mu) + kg, P("x", "y", None, None, None)), sds((n_mu, n_mu), P("x", "y")),
+            sds((nk, n_c, n_v, n_mu), P(None, "x", "y", None)))
+    tile = 16 * nk * (ns * ns + 1) * 64 * 64
+
+    def temp(block_fn):
+        with _patched(B, **_route_patches("xla"), _w_block=block_fn), _patched(tiles, TILE_BYTES=tile):
+            matvec = B.build_bse_stack_matvec(mesh, *kg, kernel="bse")
+            return matvec.lower(*args).compile().memory_analysis().temp_size_in_bytes
+
+    def five_d(W_R, m0, n0, bm, bn):
+        return lax.dynamic_slice(W_R, (m0, n0) + (0,) * (W_R.ndim - 2), (bm, bn) + tuple(W_R.shape[2:]))
+    mu_loc = n_mu // 2
+    return temp(B._w_block), temp(five_d), 16 * nk * mu_loc * mu_loc
+
+
 def main() -> int:
     import runtime
     stack = runtime.initialize_communicator_stack()
@@ -270,20 +309,30 @@ def main() -> int:
         return 0
     out, red, warned = run_cases(mesh)
     out.update(run_densify_cases(mesh))
+    temp, twin, w_bytes = run_memory_case(mesh)
+    on_gpu = jax.devices()[0].platform == "gpu"
+    mem_ok = temp < 0.5 * w_bytes
+    twin_ok = twin >= w_bytes if on_gpu else True    # the relayout is GPU layout assignment's
     bad = {k: v for k, v in out.items() if not v <= TOL}
     caught = {k: v for k, v in red.items() if v > 1e-6}
     warned = warned or jax.process_index() != 0      # the warning is rank 0's
+    ok = not bad and len(caught) == len(red) and warned and mem_ok and twin_ok
     if jax.process_index() == 0:
         for k, v in out.items():
             print(f"{'ok  ' if v <= TOL else 'FAIL'} {k:44s} rel {v:.3e}", flush=True)
         for k, v in red.items():
             print(f"{'ok  ' if v > 1e-6 else 'FAIL'} red twin {k:35s} rel {v:.3e} (must exceed 1e-6)", flush=True)
         print(f"{'ok  ' if warned else 'FAIL'} over-budget price warned (memory over budget at bse.w_term)", flush=True)
-        ok = not bad and len(caught) == len(red) and warned
+        print(f"{'ok  ' if mem_ok else 'FAIL'} W term temps {temp / 1e9:.3f} GB per rank "
+              f"(must stay below half of W_R, {w_bytes / 1e9:.2f} GB)", flush=True)
+        print(f"{'ok  ' if twin_ok else 'FAIL'} red twin 5-D block slice: temps {twin / 1e9:.3f} GB per rank "
+              + ("(must reach W_R: the whole-tile relayout)" if on_gpu else "(cpu: no relayout to catch)"),
+              flush=True)
         print(f"BSE_W_BLOCKS {'PASS' if ok else 'FAIL'}: {len(out) - len(bad)}/{len(out)} cases within "
               f"{TOL:g}, {len(caught)}/{len(red)} red twins caught, over-budget warning "
-              f"{'seen' if warned else 'MISSING'}", flush=True)
-    rc = 0 if (not bad and len(caught) == len(red) and warned) else 1
+              f"{'seen' if warned else 'MISSING'}, W term temps {temp / 1e9:.2f} GB "
+              f"{'<' if mem_ok else '>='} W_R/2 (twin {twin / 1e9:.2f} GB)", flush=True)
+    rc = 0 if ok else 1
     runtime.finalize_process(rc)
     return rc
 
@@ -292,6 +341,18 @@ def test_w_blocks_need_a_2x2_mesh():
     """Collected by pytest: the cases need their own 2x2 mesh, so they run as a script."""
     import pytest
     pytest.skip("run as a script on a 2x2 mesh: python3 tests/test_bse_w_blocks.py")
+
+
+def test_w_block_matches_the_5d_slice():
+    """``_w_block`` (the slice of the tile's 2-D view) is W_R's 5-D block at interior, edge and clamped offsets."""
+    import jax.numpy as jnp
+    import numpy as np
+    from bse import bse_stack_matvec as B
+    rng = np.random.default_rng(31)
+    W = jnp.asarray(rng.standard_normal((29, 23, 3, 2, 1)) + 1j * rng.standard_normal((29, 23, 3, 2, 1)))
+    ref = np.asarray(W)
+    for m0, n0, bm, bn in ((0, 0, 8, 8), (8, 16, 8, 7), (21, 15, 8, 8), (0, 0, 29, 23)):
+        assert np.array_equal(np.asarray(B._w_block(W, m0, n0, bm, bn)), ref[m0:m0 + bm, n0:n0 + bn])
 
 
 def test_plan_whole_tile_when_it_fits():

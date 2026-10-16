@@ -197,7 +197,13 @@ the unblocked program, bit for bit. Otherwise, inside the trial scan, a
 `lax.scan` over ν blocks carries the $(c, v, k)$ partial and a nested
 `lax.scan` over μ blocks carries $A^{(j)}$; each block's $W_R$ slice is laid
 out in its step, and the last block of an axis is clamped onto its neighbour
-with the shared rows zeroed in the legs. On a route-1 block the fused store
+with the shared rows zeroed in the legs. The slice is cut from the tile's 2-D
+$(\mu_{loc}, \nu_{loc} N_k)$ view (`_w_block`): cut from the 5-D tile, XLA's GPU
+layout assignment meets route 3's k-leading kernel operand by relaying out the
+whole loop-invariant tile ahead of the scans, one tile-sized copy (32.4 GB per
+rank at CrI3 30×30, $N_\mu$ = 3000, four ranks, where the AOT gate refused the
+Davidson module at 98.5 GB; 66.1 GB from the 2-D view). No layout of the 2-D
+view makes the block's transpose a bitcast, so it stays a block-sized copy. On a route-1 block the fused store
 forms $A^{(ij)}$ directly. CrI3 30×30 at $N_\mu$ = 3000 on four ranks
 (route 3; U alone would be 130 GB per rank per trial) plans 13 × 13 blocks of
 120 × 120. The plan, the U block and the W term's per-rank price print once

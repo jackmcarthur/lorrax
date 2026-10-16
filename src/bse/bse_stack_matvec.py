@@ -627,6 +627,23 @@ def _take_block(arrays, i, b, n):
                  for a in arrays), start
 
 
+def _w_block(W_R, m0, n0, bm, bn):
+    """The (μ, ν) block of the rank's ``W_R`` tile at ``(m0, n0)``, ``(bm, bn, kx, ky, kz)``.
+
+    Sliced from the tile's 2-D ``(μ_loc, ν_loc·nk)`` view, so that no layout of the sliced array
+    turns the block's k-leading relayout (:func:`_w_r_klead`) into a bitcast.  Sliced 5-D, XLA's
+    GPU layout assignment meets the k-leading kernel operand by giving the loop-invariant tile a
+    k-major layout ahead of the scans -- one transposed copy of the WHOLE tile, 32.4 GB per rank at
+    CrI3 30x30, N_μ 3000, P4, the module the AOT gate refused at 98.5 GB (buffer assignment,
+    2026-10-16).  From the 2-D view the transpose stays a block-sized copy inside the step.
+    """
+    mu_loc, nu_loc = int(W_R.shape[0]), int(W_R.shape[1])
+    kshape = tuple(int(n) for n in W_R.shape[2:])
+    nk = math.prod(kshape)
+    flat = W_R.reshape(mu_loc, nu_loc * nk)
+    return lax.dynamic_slice(flat, (m0, n0 * nk), (bm, bn * nk)).reshape((bm, bn) + kshape)
+
+
 def _blocked_w_term(plan, W_R, w_layout):
     """``wterm(mu, nu, block, sqrt_nk) -> (WX)_b``: this rank's (c_full, v_full, nk) W-term
     partial of one trial, summed over the (μ, ν) blocks of ``plan``.
@@ -647,16 +664,15 @@ def _blocked_w_term(plan, W_R, w_layout):
     ``block`` on the whole legs.  Otherwise a ``lax.scan`` over ν blocks carries the
     (c, v, nk) partial and a nested ``lax.scan`` over μ blocks carries A_j, both
     ``unroll=1``: one compiled body whatever the block count (13 x 13 per trial at CrI3
-    30x30, N_μ 3000, P4, growing as N_μ²/P), each block's ``W_R`` slice laid out inside its
-    step.  The last block of an axis is clamped and its shared rows zeroed in every leg
-    (:func:`_take_block`), so no operand is padded.
+    30x30, N_μ 3000, P4, growing as N_μ²/P), each block's ``W_R`` slice
+    (:func:`_w_block`) laid out inside its step.  The last block of an axis is clamped and its
+    shared rows zeroed in every leg (:func:`_take_block`), so no operand is padded.
     """
     (bm, nm), (bn, nn) = plan
     if nm * nn == 1:
         W = w_layout(W_R)                          # once per call, outside the trial scan
         return lambda mu, nu, block, sqrt_nk: _decode_v(block(mu, nu, W), nu[0], sqrt_nk)
     mu_loc, nu_loc = int(W_R.shape[0]), int(W_R.shape[1])
-    kshape = tuple(int(n) for n in W_R.shape[2:])
 
     def wterm(mu, nu, block, sqrt_nk):
         nk, n_c, ns = (int(n) for n in mu[0].shape[:3])
@@ -667,8 +683,7 @@ def _blocked_w_term(plan, W_R, w_layout):
 
             def mu_step(A, i):
                 mu_i, m0 = _take_block(mu, i, bm, mu_loc)
-                W_ij = w_layout(lax.dynamic_slice(W_R, (m0, n0) + (0,) * len(kshape),
-                                                  (bm, bn) + kshape))
+                W_ij = w_layout(_w_block(W_R, m0, n0, bm, bn))
                 return A + _rank_partial(block(mu_i, nu_j, W_ij)), None
 
             A0 = mark_varying(jnp.zeros((nk, n_c, ns, bn), mu[0].dtype), ("x", "y"))
