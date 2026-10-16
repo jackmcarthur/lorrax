@@ -116,8 +116,10 @@ route (`itype` 2) adds $\mathbf E\cdot[\mathbf r^\mathrm{intra}, \rho]$
 (`TDGW_RINTRA_IN_EOM`, on by default). It vanishes at first order in the field
 ($[\mathbf r^\mathrm{intra}, \rho^\mathrm{eq}] = 0$ for filled bands): on TDGW's
 516 finite-difference header (IP, a 10 as kick) dropping it changes P(t) by
-8.8e-7 at 1e7 V/m and 7.9e-4 at 5e9 V/m (linear in $E_0$), the carrier
-density by 3.2e-7 and 3.8e-4, and no Im ε peak by more than 0.1 meV.
+8.8e-7 at 1e7 V/m and 7.9e-4 at 5e9 V/m, the carrier density by 3.2e-7
+and 3.8e-4 (a 500x field step gives 898x and 1188x: local exponents
+1.09 and 1.14 from these two points, not linear in $E_0$), and no Im ε
+peak by more than 0.1 meV.
 Same-occupation pairs ($vv'$, $cc'$)
 make $v_{nm}/\Delta E$ singular as $\Delta E \to 0$: `pair_rule = "mask"`
 (default) multiplies $r_{nm}$ by $1 - e^{-\Delta E^2/2\Delta^2}$ with

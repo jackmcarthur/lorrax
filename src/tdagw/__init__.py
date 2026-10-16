@@ -16,6 +16,8 @@ The JAX propagator (driver ``python -m tdagw.tdgw_jax -i tdgw.toml``):
                          jitted chunk program;
 ``tdagw.tdgw_io``        TDGW header, deck drive and ``tdgw.h5`` output;
 ``tdagw.td_config``      the deck schema and its refusals;
+``tdagw.td_system``      the TD system built from a GW restart bundle
+                         (``[lorrax] system = "bundle"``) and its receipts;
 ``tdagw.stages``         the driver's stages (system, model, outputs, run);
 ``tdagw.tdgw_jax``       the driver.
 
