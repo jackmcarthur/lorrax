@@ -1888,6 +1888,39 @@ def open_shared_pole_bank(path, *, mesh_xy):
     return _bank_io(path, "r", mesh_xy)
 
 
+class RoundReader:
+    """One read handle of a bank for every round of a constructor.
+
+    A file bank is ONE ``SlabIO`` read transaction for all rounds (the file is
+    opened, its datasets opened and their geometry queried once, not once per
+    round and phase). A resident bank keeps its per-phase ``with``: the tier's
+    reads are checked and agreed when each phase ends, before the caller uses
+    them. ``phase()`` yields the handle for one read phase.
+    """
+
+    def __init__(self, path, *, mesh_xy):
+        self.path, self.mesh, self._io = path, mesh_xy, None
+
+    def __enter__(self):
+        if not isinstance(self.path, ResidentBankPayload):
+            self._io = SlabIO(self.path, mode="r", mesh=self.mesh).__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        io, self._io = self._io, None
+        return io.__exit__(*exc) if io is not None else False
+
+    @contextmanager
+    def phase(self):
+        if isinstance(self.path, ResidentBankPayload):
+            with self.path as io:
+                yield io
+        else:
+            if self._io is None:
+                _refuse("round reader phase outside its open transaction")
+            yield self._io
+
+
 def line_panel_geometry(meta, *, ordered, photon_bases=None):
     """Families of a bank's line panels: {family: (rows, cross rows or None)}, and
     the per-family state count S (TRS 2: z, conj z; ordered 4: also -z, -conj z).
@@ -2695,30 +2728,16 @@ def _restore_parent_order(value, ids, layout, contiguous, interval, mesh):
     return value
 
 
-def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sample_ids=None,
-                          fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None, sector=None):
-    """Read committed bounded scratch fields into packed distributed operators.
+def _dense_plan(io, q_span, *, meta, header, sample_span, sample_ids, fields, q_ids,
+                partition_spec, sector):
+    """Validated read requests of committed bank fields (no I/O).
 
-    Returns a plain dict of complex128 arrays. Dense samples require explicit
-    ``sample_span`` (a contiguous id span) or ``sample_ids`` (ids whose dense
-    rows are contiguous, e.g. the fitted samples on either side of the
-    line-panel span); no implicit all-bank read is offered, and a line-panel
-    sample is read with ``read_line_panels``. The caller authenticates
-    ``header`` before opening ``io``.
-
-    Parents are a contiguous ``q_span`` or a list ``q_ids`` (repeats allowed:
-    a round's synthetic slots repeat its last parent); the leading axis of
-    every field follows that order. ``partition_spec`` chooses the layout:
-    ``None`` returns face tiles (``[q, s, mu_X, nu_Y]`` samples,
-    ``[q, mu_X, nu_Y]`` moments); ``P(('x','y'), None, ...)`` returns batch
-    layout, whole matrices on the rank that owns each parent (rank
-    ``x*Py + y`` owns rows ``[r*q/P, (r+1)*q/P)``), for which the number of
-    parents must be a multiple of P. A contiguous ascending run is one
-    collective read in the requested layout: in batch layout each rank reads
-    only its own whole rows. A permuted complete interval is read once in face
-    layout, reordered, then moved to batch layout by the staged x-then-y
-    exchange. Sparse lists use one face read per parent. Values are identical
-    either way.
+    Returns ``(ledger, entries)``: one ``(name, spec, parts, pack, assemble)``
+    per field, ``parts`` one ``(request, price)`` per parent run (``price`` is
+    ``(argument, output, temporary)`` bytes; a sector read carries its
+    ``prefix``/``offset`` and ``price=None``). One plan serves
+    :func:`read_shared_pole_bank` and :func:`read_round_samples`, so both
+    return the same arrays.
     """
     if header.get("schema") != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
@@ -2767,8 +2786,7 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sa
             _refuse(f"scratch bank has no {name} field")
         if not marked.all():
             _refuse(f"scratch bank {name} requested span is incomplete")
-    out = {}
-    retained = 0
+    entries = []
     for name in fields:
         geometry = _sample_field(header, name)
         sample = geometry is not None
@@ -2780,9 +2798,7 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sa
             prefix = (count, len(rows)) if sample else (count,)
             offset = (q, rows[0], 0, 0) if sample else (q, 0, 0)
             if sector is not None:
-                row = _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, ledger, retained)
-                retained += _local_bytes(row.shape, row.dtype, mesh, spec)
-                parts.append(row)
+                parts.append((dict(prefix=prefix, offset=offset), None))
                 continue
             d = shape["d"] if "photon_layout" in header else basis.n_canonical
             logical = shape["d"] if "photon_layout" in header else basis.n_logical
@@ -2792,20 +2808,122 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sa
             else:
                 arg, output, temporary = _conversion_bytes(basis,
                     prefix+(d,d),spec,unpack=False,operator=True)
+            parts.append((dict(name=name, shape=prefix + (d, d), valid_shape=prefix + (logical, logical),
+                               offset=offset, dtype=np.complex128), (arg, output, temporary)))
+
+        def pack(value, spec=spec):
+            return value if "photon_layout" in header else basis.pack_operator(value, spec=spec)
+
+        def assemble(packed, spec=spec):
+            value = packed[0] if len(packed) == 1 else _bank_stack_rows(mesh, spec)(tuple(packed))
+            del packed[:]
+            return _restore_parent_order(value, ids, layout, contiguous, interval, mesh)
+        entries.append((name, spec, parts, pack, assemble))
+    return ledger, entries
+
+
+def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sample_ids=None,
+                          fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None, sector=None):
+    """Read committed bounded scratch fields into packed distributed operators.
+
+    Returns a plain dict of complex128 arrays. Dense samples require explicit
+    ``sample_span`` (a contiguous id span) or ``sample_ids`` (ids whose dense
+    rows are contiguous, e.g. the fitted samples on either side of the
+    line-panel span); no implicit all-bank read is offered, and a line-panel
+    sample is read with ``read_line_panels``. The caller authenticates
+    ``header`` before opening ``io``.
+
+    Parents are a contiguous ``q_span`` or a list ``q_ids`` (repeats allowed:
+    a round's synthetic slots repeat its last parent); the leading axis of
+    every field follows that order. ``partition_spec`` chooses the layout:
+    ``None`` returns face tiles (``[q, s, mu_X, nu_Y]`` samples,
+    ``[q, mu_X, nu_Y]`` moments); ``P(('x','y'), None, ...)`` returns batch
+    layout, whole matrices on the rank that owns each parent (rank
+    ``x*Py + y`` owns rows ``[r*q/P, (r+1)*q/P)``), for which the number of
+    parents must be a multiple of P. A contiguous ascending run is one
+    collective read in the requested layout: in batch layout each rank reads
+    only its own whole rows. A permuted complete interval is read once in face
+    layout, reordered, then moved to batch layout by the staged x-then-y
+    exchange. Sparse lists use one face read per parent. Values are identical
+    either way.
+    """
+
+    ledger, entries = _dense_plan(io, q_span, meta=meta, header=header, sample_span=sample_span,
+                                  sample_ids=sample_ids, fields=fields, q_ids=q_ids,
+                                  partition_spec=partition_spec, sector=sector)
+    mesh = meta.mu_basis.mesh_xy
+    out = {}
+    retained = 0
+    for name, spec, parts, pack, assemble in entries:
+        packed = []
+        for request, price in parts:
+            if sector is not None:
+                row = _read_photon_bank_sector(io, name, request["prefix"], request["offset"], spec,
+                                               header, sector, ledger, retained)
+                retained += _local_bytes(row.shape, row.dtype, mesh, spec)
+                packed.append(row)
+                continue
+            arg, output, temporary = price
             _admit(ledger,"read_bank_"+name,retained+arg+output,temporary,
                    device_panel=arg,native_host=True,io=io)
             canonical = io.read_slab(
-                name, shape=prefix + (d,d),
-                valid_shape=prefix + (logical,logical),
-                offset=offset, dtype=np.complex128, partition_spec=spec)
-            row = canonical if "photon_layout" in header else basis.pack_operator(canonical, spec=spec)
+                name, shape=request["shape"], valid_shape=request["valid_shape"],
+                offset=request["offset"], dtype=np.complex128, partition_spec=spec)
+            packed.append(pack(canonical))
             retained += output
             del canonical
-            parts.append(row)
-        value = parts[0] if len(parts) == 1 else _bank_stack_rows(mesh, spec)(tuple(parts))
-        del parts
-        out[name] = _restore_parent_order(value, ids, layout, contiguous, interval, mesh)
+        out[name] = assemble(packed)
     return out
+
+
+def read_round_samples(io, q_span=None, *, meta, header, fields, sample_span=None, sample_ids=None,
+                       q_ids=None, partition_spec=None, line_family=None, line_samples=()):
+    """A round's committed bank fields and line panels in ONE collective read.
+
+    ``(dense, line)``: ``dense`` is :func:`read_shared_pole_bank`'s dict for
+    ``fields`` and ``line`` is :func:`read_line_panel_round`'s dict for
+    ``line_samples`` of ``line_family`` (empty without samples); every value
+    is exactly what those readers return (one plan each). All their parent
+    runs go to ``io.read_multi`` together, so they share one rank: sample
+    fields with line panels (4-D), or moment fields alone (3-D). No sector
+    reads (the photon sector reader keeps its own route).
+
+    Device bytes: the read's outputs are the raw fields and panels; each is
+    packed and released in turn, so the store admits the worst point of that
+    sequence (raw parts not yet packed, packed parts so far, the part's
+    conversion temporary). On an identity basis the outputs are the values.
+    """
+    line_samples = [int(v) for v in line_samples]
+    ledger, entries = _dense_plan(io, q_span, meta=meta, header=header, sample_span=sample_span,
+                                  sample_ids=sample_ids, fields=fields, q_ids=q_ids,
+                                  partition_spec=partition_spec, sector=None)
+    lines = [_line_panel_plan(io, q_span, meta=meta, header=header, family=line_family,
+                              sample=sid, cross=False, q_ids=q_ids, partition_spec=partition_spec)
+             for sid in line_samples]
+    groups = [(spec, parts) for _, spec, parts, _, _ in entries + lines]
+    specs = {spec for spec, _ in groups}
+    ranks = {len(request["shape"]) for _, parts in groups for request, _ in parts}
+    if len(specs) != 1 or len(ranks) != 1:
+        _refuse("round sample read needs one layout and one rank for every field and line panel")
+    spec, = specs
+    prices = [price for _, parts in groups for _, price in parts]
+    args = [arg for arg, _, _ in prices]
+    resident = max(sum(args[k:]) + sum(o for _, o, _ in prices[:k + 1]) for k in range(len(prices)))
+    _admit(ledger, "read_round_" + "_".join(name for name, *_ in entries) + (
+        f"_line{len(lines)}" if lines else ""), resident, max(t for _, _, t in prices),
+        device_panel=sum(args), native_host=True, io=io)
+    values = io.read_multi([request for _, parts in groups for request, _ in parts],
+                           partition_spec=spec)
+    out, k = [], 0
+    for _, _, parts, pack, assemble in entries + lines:
+        packed = []
+        for j in range(k, k + len(parts)):
+            packed.append(pack(values[j]))
+            values[j] = None             # each raw part is released as it is packed
+        out.append(assemble(packed))
+        k += len(parts)
+    dense = {name: value for (name, *_), value in zip(entries, out)}
+    return dense, dict(zip(line_samples, out[len(entries):]))
 
 
 def _line_panel_plan(io, q_span, *, meta, header, family, sample, cross, q_ids, partition_spec):
