@@ -370,3 +370,4 @@ and `--print-schema` prints them.
 | `files` | `eps0mat epsmat` | `export`: the files to write. |
 | `rcond` | `1e-8` | Coulomb-whitening cut: eigenvalues of V_q above `rcond`·λ_max are kept (amplification ≤ 1/`rcond`), the cut closed over degenerate multiplets. |
 | `q0_head` | `s_tensor` | ε⁻¹₀₀(q0): `s_tensor`, the direct head 1/(1 − v(q0) q0ᵀSq0) from the bundle's `S_cart_head`; `unscreened` writes 1 (debug). |
+| `q0_body_3d` | `refuse` | `sys_dim = 3` with `eps0mat` in `files`: the q → 0 body lacks the O(1) head–wing term ε_b0 ε_00⁻¹ ε_0b ([theory](theory/bgw_epsmat_export.md#5-q-0)). `refuse` stops before writing (`GATE epsmat_q0_body_3d`); `omit_head_wing` writes that body and records it in the receipt. Slab decks ignore it. |

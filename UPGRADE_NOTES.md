@@ -78,6 +78,28 @@ velocity's own DFT energies there.
   and Haydock h5 metadata name the dipole route, its source file and the
   on-grid identity.
 
+
+## 2026-10-16 — `file_io.epsreader`: ε⁻¹(G, G') in row-G order; 3-D `eps0mat` export refuses
+
+`EPSReader.get_eps_matrix` returns ε⁻¹_q(G, G') with rows G and columns G'
+— the transpose of the stored block, whose `[a, b]` is ε⁻¹(G_b, G_a)
+(BerkeleyGW's Fortran column order; `file_io.bgw_epsmat`). It returned the
+stored block before. `get_eps_diagonal` reads `mats/matrix-diagonal` as
+`(nq, nmtx, 2)`. `tests/test_bgw_epsmat_cpu.py` pins both on a corner of a
+BerkeleyGW-written file. `gw.epsmat_cli` export now refuses a `sys_dim = 3`
+`eps0mat` (`GATE epsmat_q0_body_3d`) unless the deck sets
+`q0_body_3d = omit_head_wing`: the 3-D q → 0 body lacks the O(1) head–wing
+term. Its μ-space algebra runs on `P(None,'x','y')` faces with the
+`distrib_la` face eigensolver (cuSOLVERMp when each device has its own
+process).
+
+- **Results.** Main's one reader of the file, `gw/head_correction.py`, reads
+  `epshead` and does not move. Code that read `get_eps_matrix` as the stored
+  block must drop its transpose. Exported blocks move at the conditioning of
+  V, ≤ 3.1e-9 relative on CrI3 6×6 (κ(V) 5.7–7.6e6); projections at 1.5e-14.
+- **Decks.** A bulk export of `eps0mat` adds `q0_body_3d = omit_head_wing`
+  or exports `files = epsmat`.
+
 ## 2026-10-16 — `bse_k_grid` with `--eqp`: the QP energies enter the htransform
 
 `bse_jax` and `absorption_haydock` re-sliced the coarse restart's QP energies

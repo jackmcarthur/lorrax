@@ -8,7 +8,9 @@ inverse ε⁻¹ = (1 − v χ₀(G,G'))⁻¹ that shares no code with the export
 check carries a red twin: the case in which the property is false.
 """
 import functools
+import os
 
+import h5py
 import numpy as np
 import pytest
 import jax
@@ -73,16 +75,25 @@ def bgw_list(q, ecuts, is_q0=False):
     return rho, be.q_gspace(rho, BDOT, q, ecuts, is_q0=is_q0)
 
 
-def sharded_inputs(mesh, Z, V, W, rcond=1e-10):
+FACE_SPEC = P(None, "x", "y")
+
+
+def faces(mesh, Z, V, W, rcond=1e-10):
+    """ζ̃ μ-sharded and the toy's μ-space faces (V, W − V, B, K, χ) through the production path."""
     from gw import epsmat_export as ee
     ngk = Z.shape[0]
     zt = np.zeros((1, N_MU_PAD, ngk + 3), np.complex128)
     zt[0, :N_MU, :ngk] = Z.T
     zeta = jax.device_put(zt, NamedSharding(mesh, P(None, ("x", "y"), None)))
-    B, _ = ee.coulomb_whitener(jnp.asarray(0.5 * (V + V.conj().T)), rcond=rcond)
-    K = ee.whitened_correlation(jnp.asarray(W - V), B)
-    pad = N_MU_PAD - N_MU
-    return zeta, jnp.pad(B, ((0, pad), (0, pad))), jnp.pad(K, ((0, pad), (0, pad))), B, K
+    face = NamedSharding(mesh, FACE_SPEC)
+    pad = ((0, N_MU_PAD - N_MU), (0, N_MU_PAD - N_MU))
+    Vf = jax.device_put(np.pad(V, pad)[None], face)
+    Wcf = jax.device_put(np.pad(W - V, pad)[None], face)
+    plan = ee.eigh_plan(mesh, N_MU_PAD)
+    B, _ = ee.coulomb_whitener(Vf, rcond=rcond, plan=plan)
+    K = ee.whitened_correlation(Wcf, B, mesh=mesh)
+    chi = ee.response(B, K, mesh=mesh)
+    return dict(zeta=zeta, Vf=Vf, Wcf=Wcf, B=B, K=K, chi=chi, plan=plan)
 
 
 def export(mesh, q, ecuts, *, is_q0=False, head=None, rcond=1e-10):
@@ -90,15 +101,17 @@ def export(mesh, q, ecuts, *, is_q0=False, head=None, rcond=1e-10):
     sphere, Z, v, chi0, V, W = toy(tuple(q))
     rho, qg = bgw_list(np.asarray(q), ecuts, is_q0)
     miller = rho[qg.order[: qg.nmtx]]
-    zeta, Bp, Kp, B, K = sharded_inputs(mesh, Z, V, W, rcond)
+    f = faces(mesh, Z, V, W, rcond)
     slots = ee.zeta_slots(np.vstack([sphere, np.zeros((3, 3), int)]), sphere.shape[0], miller,
-                          fill=zeta.shape[2])
+                          fill=f["zeta"].shape[2])
     v_eps = v_slab(np.asarray(q), miller)
-    blk, diag = ee.epsinv_block(zeta, slots, Bp, Kp, v_eps, mesh=mesh, n_valid=qg.nmtx,
-                                q0_head_value=head)
-    return dict(sphere=sphere, Z=Z, v=v, chi0=chi0, V=V, W=W, miller=miller, qg=qg,
-                zeta=zeta, Bp=Bp, Kp=Kp, B=B, K=K, slots=slots, v_eps=v_eps,
-                blk=np.asarray(blk), diag=np.asarray(diag), n=qg.nmtx)
+    n_pad = ee._pad_to(qg.nmtx, 4)
+    Zf = ee.zeta_face(f["zeta"], slots, mesh=mesh, n_pad=n_pad)
+    blk6, diag = ee.epsinv_block(Zf, f["chi"], v_eps, mesh=mesh, n_valid=qg.nmtx,
+                                 q0_head_value=head)
+    return dict(sphere=sphere, Z=Z, v=v, chi0=chi0, V=V, W=W, miller=miller, qg=qg, **f,
+                Zf=Zf, slots=slots, v_eps=v_eps, n_pad=n_pad, blk6=blk6,
+                blk=np.asarray(blk6)[0, 0, 0], diag=np.asarray(diag), n=qg.nmtx)
 
 
 def rows_in_sphere(sphere, miller):
@@ -167,15 +180,13 @@ def test_projection_round_trip_and_its_gate():
     q = (0.0, 1 / 6, 0.0)
     r = export(mesh, q, ecuts=5.0)                             # eps list = the ζ sphere
     n = r["n"]
-    blk6 = jax.device_put(r["blk"].reshape(1, 1, 1, *r["blk"].shape),
-                          NamedSharding(mesh, P(None, None, None, "x", "y", None)))
-    proj = np.asarray(ee.project_block(blk6, r["zeta"], r["slots"], r["v_eps"], mesh=mesh,
-                                       n_valid=n, drop_head=False))[:N_MU, :N_MU]
+    blk6 = r["blk6"]
+    proj = ee.project_block(blk6, r["Zf"], r["v_eps"], mesh=mesh, n_valid=n, drop_head=False)
     Wc = r["W"] - r["V"]
-    assert np.linalg.norm(proj - Wc) / np.linalg.norm(Wc) < 1e-10
-    V_e = np.asarray(ee.coulomb_gram(r["zeta"], r["slots"], r["v_eps"], mesh=mesh))[:N_MU, :N_MU]
-    err, rt = ee._check_projection(jnp.asarray(proj), jnp.asarray(V_e), r["Bp"], r["Kp"],
-                                   jnp.asarray(Wc), N_MU, 0, "test")
+    assert np.linalg.norm(np.asarray(proj)[0, :N_MU, :N_MU] - Wc) / np.linalg.norm(Wc) < 1e-10
+    vv = np.zeros(r["n_pad"]); vv[:n] = r["v_eps"]
+    V_e = ee.coulomb_gram(r["Zf"], vv, mesh=mesh)
+    err, rt = ee._check_projection(proj, V_e, r["chi"], r["Wcf"], 0, "test", mesh)
     assert err < 1e-10 and rt < 1e-10
     # Red twin: the naive block (ε⁻¹ − 1 = Z (W − V) Zᴴ / v) projects far from W − V,
     # and the projection gate refuses it.
@@ -185,12 +196,10 @@ def test_projection_round_trip_and_its_gate():
     nb = np.zeros_like(r["blk"])
     nb[:n, :n, 0], nb[:n, :n, 1] = naive.T.real, naive.T.imag
     nb6 = jax.device_put(nb.reshape(blk6.shape), blk6.sharding)
-    bad = ee.project_block(nb6, r["zeta"], r["slots"], r["v_eps"], mesh=mesh, n_valid=n,
-                           drop_head=False)[:N_MU, :N_MU]
-    assert np.linalg.norm(np.asarray(bad) - Wc) / np.linalg.norm(Wc) > 0.5
+    bad = ee.project_block(nb6, r["Zf"], r["v_eps"], mesh=mesh, n_valid=n, drop_head=False)
+    assert np.linalg.norm(np.asarray(bad)[0, :N_MU, :N_MU] - Wc) / np.linalg.norm(Wc) > 0.5
     with pytest.raises(ValueError, match="GATE epsmat_block_projection"):
-        ee._check_projection(bad, jnp.asarray(V_e), r["Bp"], r["Kp"], jnp.asarray(Wc),
-                             N_MU, 0, "red twin")
+        ee._check_projection(bad, V_e, r["chi"], r["Wcf"], 0, "red twin", mesh)
 
 
 def test_q0_block_head_wings_and_body():
@@ -260,9 +269,8 @@ def test_file_layout_reads_back_as_epsinv(tmp_path):
                           ecuts=ecuts, nband=8, efermi_ry=0.0, icutv=6)
     vb = v_slab(np.asarray(q), rho[qg.order[:n]]) * OMEGA
     be.write_q_gspace(path, 0, qg, vb)
-    offset, shape = be.matrix_block_window(0, 0, r["blk"].shape[0])
-    blk6 = jax.device_put(r["blk"].reshape(shape),
-                          NamedSharding(mesh, P(None, None, None, "x", "y", None)))
+    offset, _ = be.matrix_block_window(0, 0, r["blk"].shape[0])
+    blk6 = r["blk6"]
     with SlabIO(path, mode="a", mesh=mesh) as io:
         be.register_matrix(io, 1, n)
         io.write_slab(be.MATRIX, blk6, offset=offset)
@@ -294,13 +302,17 @@ def test_v_gram_reproduces_v_and_catches_a_rescaled_zeta():
     from gw import epsmat_export as ee
     mesh = _mesh()
     sphere, Z, v, chi0, V, W = toy((0.0, 1 / 3, 0.0))
-    zeta, *_ = sharded_inputs(mesh, Z, V, W)
+    zeta = faces(mesh, Z, V, W)["zeta"]
     ngk = Z.shape[0]
-    Vrec = np.asarray(ee.coulomb_gram(zeta, np.arange(ngk), v, mesh=mesh))[:N_MU, :N_MU]
+    n_s = ee._pad_to(ngk, 2)
+    vs = np.zeros(n_s); vs[:ngk] = v
+    Vrec = np.asarray(ee.coulomb_gram(ee.zeta_face(zeta, np.arange(ngk), mesh=mesh, n_pad=n_s),
+                                      vs, mesh=mesh))[0, :N_MU, :N_MU]
     assert np.linalg.norm(Vrec - V) / np.linalg.norm(V) < 1e-12
     # Red twin: a ζ normalized differently by 0.1 % is caught at the gate tolerance.
-    Vbad = np.asarray(ee.coulomb_gram(jax.device_put(1.001 * np.asarray(zeta), zeta.sharding),
-                                      np.arange(ngk), v, mesh=mesh))[:N_MU, :N_MU]
+    bad = jax.device_put(1.001 * np.asarray(zeta), zeta.sharding)
+    Vbad = np.asarray(ee.coulomb_gram(ee.zeta_face(bad, np.arange(ngk), mesh=mesh, n_pad=n_s),
+                                      vs, mesh=mesh))[0, :N_MU, :N_MU]
     assert np.linalg.norm(Vbad - V) / np.linalg.norm(V) > ee.V_RECONSTRUCTION_TOL
 
 
@@ -353,24 +365,110 @@ def test_efermi_is_bgw_midgap(tmp_path):
 
 
 
-def test_host_fetched_outputs_are_replicated():
-    """Every array the drivers fetch to the host leaves its program replicated.
+def test_matrices_are_faces_and_only_vectors_replicate():
+    """Every N_μ²- and N_G²-class array is a P(None,'x','y') face; vectors are replicated.
 
-    On P processes a ``P(('x','y'))`` array spans other processes' devices and
-    ``jax.device_get`` refuses it (the CrI3 P=4 export died there while every
-    single-process check passed).  Red twin: the block, which stays tiled, is
-    not replicated, and neither is a ``P(('x','y'))`` copy of the diagonal.
+    The audit rule: no N_μ² object on fewer than all P devices.  V, W − V, B, K, χ,
+    V_ε, the projection and the block stay tiled; the diagonal (read on the host by
+    every process) and the eigenvalues are the only replicated arrays.  Red twin:
+    the replicated μ-space plan this replaced — B gathered whole — is not a face.
     """
     from gw import epsmat_export as ee
     mesh = _mesh()
     r = export(mesh, (1 / 6, 1 / 3, 0.0), ecuts=2.5)
-    blk, diag = ee.epsinv_block(r["zeta"], r["slots"], r["Bp"], r["Kp"], r["v_eps"],
-                                mesh=mesh, n_valid=r["n"])
-    blk6 = jax.device_put(np.asarray(blk).reshape((1, 1, 1) + tuple(blk.shape)),
-                          NamedSharding(mesh, P(None, None, None, "x", "y", None)))
-    proj = ee.project_block(blk6, r["zeta"], r["slots"], r["v_eps"], mesh=mesh,
-                            n_valid=r["n"], drop_head=False)
-    gram = ee.coulomb_gram(r["zeta"], r["slots"], r["v_eps"], mesh=mesh)
-    assert diag.is_fully_replicated and proj.is_fully_replicated and gram.is_fully_replicated
-    assert not blk.is_fully_replicated
-    assert not jax.device_put(diag, NamedSharding(mesh, P(("x", "y")))).is_fully_replicated
+    proj = ee.project_block(r["blk6"], r["Zf"], r["v_eps"], mesh=mesh, n_valid=r["n"],
+                            drop_head=False)
+    vv = np.zeros(r["n_pad"]); vv[: r["n"]] = r["v_eps"]
+    gram = ee.coulomb_gram(r["Zf"], vv, mesh=mesh)
+    for name, a in (("V", r["Vf"]), ("W-V", r["Wcf"]), ("B", r["B"]), ("K", r["K"]),
+                    ("chi", r["chi"]), ("Zf", r["Zf"]), ("proj", proj), ("V_eps", gram)):
+        assert a.sharding.spec == FACE_SPEC and not a.is_fully_replicated, name
+    assert r["blk6"].sharding.spec == P(None, None, None, "x", "y", None)
+    assert not r["blk6"].is_fully_replicated
+    _, diag = ee.epsinv_block(r["Zf"], r["chi"], r["v_eps"], mesh=mesh, n_valid=r["n"])
+    assert diag.is_fully_replicated
+    whole = jax.device_put(r["B"], NamedSharding(mesh, P()))
+    assert whole.is_fully_replicated and whole.sharding.spec != FACE_SPEC
+
+
+def test_eigh_plan_requests_the_distributed_solver_on_many_processes(monkeypatch):
+    """One process per device -> distrib_la 'distributed'; one process -> native.
+
+    Red twin: distrib_la's 'auto' is native everywhere and would solve a gathered
+    matrix on every rank, so the plan must never ask for it.
+    """
+    import distrib_la as dla
+    from gw import epsmat_export as ee
+    mesh = _mesh()
+    asked = []
+    monkeypatch.setattr(dla, "plan", lambda op, m, *, backend, n: asked.append((op, backend, n)))
+    ee.eigh_plan(mesh, 12)
+    monkeypatch.setattr(jax, "process_count", lambda: 4)
+    ee.eigh_plan(mesh, 12)
+    assert asked == [("eigh", "native", 12), ("eigh", "distributed", 12)]
+    assert all(b != "auto" for _, b, _ in asked)
+
+
+FIXTURE_BGW = os.path.join(os.path.dirname(__file__), "fixtures", "bgw_epsmat_corner48.h5")
+
+
+def test_epsreader_orientation_on_a_berkeleygw_written_block():
+    """EPSReader returns ε⁻¹(G, G') with rows G, columns G' on BerkeleyGW's own output.
+
+    The fixture is the 48 × 48 low-|q+G| corner of BerkeleyGW 4.0 epsilon.cplx.x's
+    epsmat.h5 at q = (0, 1/3, 0) (CrI3 6×6, run 516), stored values verbatim
+    (tests/fixtures/make_corner48.py).  χ is Hermitian, so (ε⁻¹ − 1)/v(q+G),
+    rows scaled, is Hermitian in the right orientation only: 1e-15 for
+    ``get_eps_matrix``; the stored block untransposed gives 0.78 (red twin).
+    ``get_eps_diagonal`` reads ``mats/matrix-diagonal`` ``(nq, nmtx, 2)`` and is
+    the matrix diagonal bit for bit.
+    """
+    from file_io.epsreader import EPSReader
+    r = EPSReader(FIXTURE_BGW)
+    n = int(r.nmtx[0])
+    M = r.get_eps_matrix(0)
+    v = np.asarray(r.vcoul[0, :n], dtype=np.float64)
+
+    def herm(m):
+        x = (m - np.eye(n)) / v[:, None]
+        return np.linalg.norm(x - x.conj().T) / np.linalg.norm(x)
+
+    assert M.shape == (n, n) == (48, 48)
+    assert herm(M) < 1e-12
+    assert herm(M.T) > 0.5                   # the stored block as it lies on disk
+    assert np.array_equal(r.get_eps_diagonal(0), np.diag(M))
+    with h5py.File(FIXTURE_BGW, "r") as f:
+        assert f["mats/matrix-diagonal"].shape == (1, n, 2)
+
+
+@pytest.mark.parametrize("files,sys_dim,flag,want", [
+    (("eps0mat", "epsmat"), 2, "refuse", "q -> 0 limit"),
+    (("epsmat",), 3, "refuse", "no eps0mat"),
+    (("eps0mat",), 3, "omit_head_wing", "omit_head_wing"),
+])
+def test_q0_body_policy_writes(files, sys_dim, flag, want):
+    from gw.epsmat_export import q0_body_policy
+    assert q0_body_policy(files, sys_dim, flag).startswith(want)
+
+
+def test_q0_body_policy_refuses_a_3d_eps0mat_without_the_flag():
+    """A 3-D q → 0 body without its O(1) head–wing term is written only by name."""
+    from gw.epsmat_export import q0_body_policy
+    with pytest.raises(ValueError, match="GATE epsmat_q0_body_3d"):
+        q0_body_policy(("eps0mat", "epsmat"), 3, "refuse")
+    with pytest.raises(ValueError, match="GATE epsmat_q0_body_sys_dim"):
+        q0_body_policy(("eps0mat",), 1, "omit_head_wing")
+
+
+def test_q0_body_3d_key_is_validated(tmp_path):
+    from gw.epsmat_config import EpsmatConfig
+    deck = tmp_path / "e.in"
+    base = ("[epsmat]\nsource_restart = /x\nparent_input_file = /x/g.in\n"
+            "output_dir = /x/o\nepsilon_cutoff = 5.0\n")
+    deck.write_text(base)
+    assert EpsmatConfig.from_input_file(str(deck)).q0_body_3d == "refuse"
+    deck.write_text(base + "q0_body_3d = omit_head_wing\n")
+    assert EpsmatConfig.from_input_file(str(deck)).q0_body_3d == "omit_head_wing"
+    deck.write_text(base + "q0_body_3d = yes\n")
+    with pytest.raises(ValueError, match="GATE epsmat_q0_body_3d_value"):
+        EpsmatConfig.from_input_file(str(deck))

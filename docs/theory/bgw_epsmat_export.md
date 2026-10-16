@@ -163,7 +163,10 @@ parts are written differently.
   the q → 0 limit: the head–wing term of the block inverse,
   $\varepsilon_{b0}\varepsilon_{00}^{-1}\varepsilon_{0b}$, is O(q). In 3D it
   is O(1) ($v(q)\propto q^{-2}$, $\chi_{0G}\propto q$) and the bundle's body
-  omits it; the file inherits that approximation.
+  omits it, so a `sys_dim = 3` export of `eps0mat` refuses
+  (`GATE epsmat_q0_body_3d`) unless the deck names the approximation,
+  `q0_body_3d = omit_head_wing`; the receipt then records it. Other
+  `sys_dim` refuse (`GATE epsmat_q0_body_sys_dim`).
 * **Wings**: written 0. They vanish as O(q) in 2D, and BerkeleyGW's Sigma
   zeroes them at $q_0$ for semiconductor screening under every truncation
   (`fixwings`).
@@ -222,23 +225,42 @@ not reconstructed, so a wedge bundle exports its wedge and a full-zone bundle
 
 ## 8. Cost and distribution
 
-Per q, with n = `nmtx`, r ≤ $N_\mu$ the kept rank and P devices on a square
-√P × √P mesh (`GATE epsmat_square_mesh`):
+Per q, with n = `nmtx` and μ = $N_\mu$, each padded to a multiple of P, on P
+devices in a square √P × √P mesh (`GATE epsmat_square_mesh`). Every matrix
+is a `P(None,'x','y')` face: device (x, y) holds one (·/√P) × (·/√P) tile of
+V, W − V, B, K, χ, ζ̃ on the eps G list (μ × n), the block (n × n), V_ε and
+the projection. Only vectors (v, eigenvalues, the block diagonal) and scalars
+are replicated. Products are `distrib_la.panel_matmul` (2-D SUMMA; the two
+live operand panels hold at most `PANEL_BYTES` = 64 MiB per device).
 
 | step | flops per device | memory per device | collectives |
 |---|---|---|---|
-| $V^{+}$ factor, K | $N_\mu^3$ (replicated eigh) | 16 $N_\mu^2$ B each for V, W, B, K | — |
-| ζ̃ onto the eps G list | — | 16 n $N_\mu$/P B | one all-to-all |
-| $Y_\varepsilon=Z_\varepsilon B$ | n $N_\mu$ r/P | 16 n r/√P B | one all-gather of the row block over `y`, one transpose-partner permute |
-| block tile, (E6) | n² r/P | 16 n²/P B | — |
+| V, W − V | — | 16 μ²/P B each | none (SlabIO reads the tile) |
+| $V^{+}$ factor (eigh of V), K spectrum | ≈ μ³/P | 16 μ²/P B + solver workspace | inside the solver |
+| K = Bᴴ(W − V)B, χ = B K Bᴴ | 4 μ³/P | 16 μ²/P B each | SUMMA panels over `x` and `y` |
+| ζ̃ onto the eps G list | — | 16 n μ/P B | one all-to-all over `y` |
+| block $T_1=\bar Z^{\mathsf T}\chi^{\mathsf T}Z$, (E6) | (μ² n + μ n²)/P | 16 n²/P B | SUMMA panels |
 | write | — | — | none: each device writes its tile through SlabIO |
-| projection gate | n² r/P | — | one $N_\mu\times N_\mu$ all-reduce |
+| projection and its gate | (2 μ² n + μ n² + 2 μ³)/P | 16 μ²/P B | SUMMA panels; scalar norms |
 
-No collective moves the n × n block. On a 2 × 2 mesh the compiled export
-program holds exactly one all-to-all (ζ̃), one all-gather and one
-collective-permute of the row block, and one all-gather of the n-vector
-diagonal, which leaves replicated because every process reads it on the host.
-A file costs 16 n_max² bytes per q (BerkeleyGW pads every q to `nmtx_max`).
+The eigensolve is a `distrib_la` plan on the face: `distributed`
+(cuSOLVERMp on CUDA, ScaLAPACK on CPU) when each device has its own process,
+the production launch; `native` in one process, where the solve gathers the
+16 μ² B matrix on every device (the run banner prints that figure).
+`distrib_la`'s `auto` is native everywhere and is never requested. On CrI3
+6×6 (μ = 980, P = 4) a face is 3.8 MB per device; at μ = 2.7 × 10⁴ it is
+2.9 GB at P = 4 and 0.73 GB at P = 16, against 11.7 GB per device for one
+replicated matrix. The n × n block is produced in place; the projection
+streams it as one SUMMA operand in panels. A file costs 16 n_max² bytes per q
+(BerkeleyGW pads every q to `nmtx_max`).
+
+Changing the eigensolver moves the export at the conditioning of V, not at
+round-off. On the CrI3 6×6 bundle the face path (cuSOLVERMp) and the
+replicated path it replaced (one cuSOLVER solve per device, V's lower
+triangle) write blocks that differ by ≤ 3.1 × 10⁻⁹ (Frobenius, relative to
+ε⁻¹ − 1) at κ(V) = 5.7–7.6 × 10⁶ on the kept span (κ ε = 1.3–1.7 × 10⁻⁹), with
+the same kept rank at every q. The projection, which solves nothing, agrees
+to 1.5 × 10⁻¹⁴.
 
 ## 9. Not exported
 
