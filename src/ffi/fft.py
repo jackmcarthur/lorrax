@@ -281,7 +281,16 @@ KDFT_OUTER_BOX_COLS = 64
 #: ISDF route-G pair convolution read from the D-plane FFT output, the operands and attributes of
 #: KCONV_PLANE_TARGET less mathdx_root.  Rule: :func:`kdft_plane_refusal`.
 KDFT_KCONV_PLANE_TARGET = "lorrax_kdft_kconv_plane"
-_ROCM_PAIR_TARGETS = {"kconv_plane": KDFT_KCONV_PLANE_TARGET}
+#: Mode 1 (cpp/kdft/kbox_parent_ffi.cc, the port of the mathdx parent mode): the ISDF parent-load pair
+#: convolution, the operands, attributes and centroid_major input layout of KCONV_PARENT_TARGET less
+#: mathdx_root.  Rule: :func:`kdft_parent_refusal`.
+KDFT_KCONV_PARENT_TARGET = "lorrax_kdft_kconv_parent"
+#: Mode 10 (cpp/kdft/plane_gather_ffi.cc, the port of the mathdx kPlaneSrc): the route-G plane FFT read
+#: from its cylinder, the operands and attributes of PLANE_FFT_GATHER_TARGET less mathdx_root.
+#: Rule: :func:`kdft_plane_fft_refusal`.
+KDFT_PLANE_FFT_GATHER_TARGET = "lorrax_kdft_plane_fft_gather"
+_ROCM_PAIR_TARGETS = {"kconv_plane": KDFT_KCONV_PLANE_TARGET, "kconv_parent": KDFT_KCONV_PARENT_TARGET,
+                      "plane_fft_gather": KDFT_PLANE_FFT_GATHER_TARGET}
 #: Mode 6's axis bound (kbox_plane_ffi.cc kAxisMax): the stage's direct-DFT line.
 KDFT_PLANE_AXIS_MAX = 40
 
@@ -787,6 +796,97 @@ def rocm_plane_target(mesh: Mesh, kgrid, ns: int) -> str | None:
         return None
     _note_rocm_target(KDFT_KCONV_PLANE_TARGET)
     return KDFT_KCONV_PLANE_TARGET
+
+
+def kdft_parent_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM mode-1 kernel cannot serve ``kgrid`` at ``ns`` (\"\" when it can).  Its tile is mode 6's
+    (``2 ns^2`` padded operand columns per output column, :func:`kdft_plane_no`), so the bound is too:
+    an axis beyond :data:`KDFT_PLANE_AXIS_MAX`, or one output column beyond a block's LDS."""
+    why = kdft_plane_refusal(kgrid, ns, lds)
+    return why.replace("kdft-kconv-plane-tile", "kdft-kconv-parent-tile").replace("k-box mode 6", "k-box mode 1")
+
+
+def _rocm_pair_target(mesh: Mesh, target: str, why_fn, key: tuple, what: str) -> str | None:
+    """Shared tail of the ROCM pair-family routers: a ROCm mesh outside :func:`xla_reference`, kdft not
+    demoted, ``target`` in the loaded library and ``why_fn()`` empty, else ``None`` with one warning per key."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(target, "ROCM")
+    why = why_fn() if ok else f"no {target} handler ({why})"
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM {what} -> XLA, not kdft: {why}"
+        if announce_once(key, msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=4)
+        return None
+    _note_rocm_target(target)
+    return target
+
+
+def rocm_parent_target(mesh: Mesh, kgrid, ns: int) -> str | None:
+    """The ROCM mode-1 target serving :func:`make_fused_conv_kparent` on this mesh, or ``None`` (the XLA
+    route): :func:`_rocm_pair_target` with :func:`kdft_parent_refusal`."""
+    kg = tuple(int(v) for v in kgrid)
+    return _rocm_pair_target(mesh, KDFT_KCONV_PARENT_TARGET, lambda: kdft_parent_refusal(kg, ns),
+                             ("kconv", "parent", kg, int(ns)), "kconv_parent (the typed parent load + pair tail)")
+
+
+#: Mode 10's factor-line bound on ROCM (plane_gather_ffi.cc kFactorMax): the direct DFT of the k-box
+#: stage, the same 40 as the CUDA thread FFT, so :func:`plane_fft_split` serves both legs.
+KDFT_PLANE_FFT_FACTOR_MAX = 40
+KDFT_PLANE_FFT_PB_MAX = 8
+#: Mode 10 routing, measured on one MI250X GCD (tests/test_kdft_parent_gate.py --bench, pool log
+#: kconv_b1b; ms per call, XLA run-concatenate + rocFFT 2-D -> kdft): 25^2 Fe slab (64,25,2,78,2)
+#: 20.00 -> 15.16 (1.32x), 54^2 1.29 -> 0.99 (1.31x), 45^2 3.26x, 40^2 2.36x, 24x30 2.26x, 16^2 1.47x,
+#: 27^2 1.07x; 32^2 0.30 -> 0.32 (0.93x, rocFFT's radix-2 plan): an axis listed here keeps the XLA
+#: route (GATE kdft-plane-slower).  Every other axis with a split above 32 has no split (64, 128).
+#: Tried: the factor line as one direct DFT (M^2 products): 25^2 0.80x, 54^2 0.94x; one register
+#: Cooley-Tukey step (M (R + Q) products, plane_gather_kernel.h line_fft) is what paid.
+KDFT_PLANE_FFT_SLOW_AXES = (32,)
+
+
+def _kdft_plane_fft_lds(nb: int, nc: int, rows: int, pb: int) -> int:
+    """LDS of ``pb`` resident planes and the kernel's static tables (plane_gather_ffi.cc lds_bytes)."""
+    return 16 * nb * (nc | 1) * pb + nb + 4 * max(1, rows) + 8 * pb + 16
+
+
+def kdft_plane_fft_pb(nb: int, nc: int, rows: int, lds: int = KDFT_KBOX_LDS) -> int:
+    """Planes per block of the ROCM mode-10 kernel (0 when none fits), the mirror of ``plan_pb``: the most
+    (<= 8) within half a block's LDS (two blocks per CU), else one plane in all of it."""
+    nb, nc, rows = int(nb), int(nc), int(rows)
+    pb = max([p for p in range(1, KDFT_PLANE_FFT_PB_MAX + 1) if _kdft_plane_fft_lds(nb, nc, rows, p) <= lds // 2],
+             default=0)
+    return pb or (1 if _kdft_plane_fft_lds(nb, nc, rows, 1) <= lds else 0)
+
+
+def kdft_plane_fft_refusal(nb: int, nc: int, rows: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM mode-10 kernel cannot serve an ``(nb, nc)`` plane with ``rows`` occupied rows (\"\" when
+    it can): an axis with no Good-Thomas split into factors <= 40 (:func:`plane_fft_split`), or a plane
+    beyond a block's LDS."""
+    nb, nc = int(nb), int(nc)
+    if plane_fft_split(nb) is None or plane_fft_split(nc) is None:
+        return (f"GATE kdft-plane-split: got plane ({nb},{nc}); want each axis n = n1*n2 with gcd 1 and both "
+                f"factors <= {KDFT_PLANE_FFT_FACTOR_MAX}, or a prime power <= {KDFT_PLANE_FFT_FACTOR_MAX} "
+                "(the direct-DFT factor line)")
+    if kdft_plane_fft_pb(nb, nc, rows, lds) == 0:
+        return (f"GATE kdft-plane-residency: got plane ({nb},{nc}), whose resident plane needs "
+                f"{_kdft_plane_fft_lds(nb, nc, rows, 1)} B; want it in a block's {lds // 1024} KiB of LDS")
+    return ""
+
+
+def rocm_plane_fft_target(mesh: Mesh, nb: int, nc: int, rows: int) -> str | None:
+    """The ROCM mode-10 target serving :func:`make_plane_fft_gather` on this mesh, or ``None`` (the XLA
+    route): :func:`_rocm_pair_target` with :func:`kdft_plane_fft_refusal`."""
+    def why():
+        r = kdft_plane_fft_refusal(nb, nc, rows)
+        slow = [n for n in (int(nb), int(nc)) if n in KDFT_PLANE_FFT_SLOW_AXES]
+        return r or (f"GATE kdft-plane-slower: got plane ({nb},{nc}) with axis {slow[0]}, measured slower than "
+                     "the XLA route (ffi.fft.KDFT_PLANE_FFT_SLOW_AXES)" if slow else "")
+    return _rocm_pair_target(mesh, KDFT_PLANE_FFT_GATHER_TARGET, why,
+                             ("plane_fft", "rocm", int(nb), int(nc)), f"plane_fft_gather plane ({nb},{nc})")
 
 
 def rocm_outer_target(mesh: Mesh, kgrid, factory: str, n_c: int | None = None) -> str | None:
@@ -1550,7 +1650,36 @@ def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
             )(D_l, D_r, *tables, **attrs)
         return _mathdx
 
+    target = rocm_parent_target(mesh, kgrid, ns)
+    if target is not None:
+        return _kdft_parent_fn(target, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, centroid_major)
+
     return _kparent(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend)
+
+
+def _kdft_parent_fn(target, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, centroid_major) -> Callable:
+    """The ROCM mode-1 call of :func:`make_fused_conv_kparent` (the CUDA call's operands, attributes and
+    input layout less ``mathdx_root``).
+
+    Measured on one MI250X GCD against the XLA route (typed parent load + pair tail; pool log kconv_b1,
+    ms per call): 4^3 ns 2, 64 parents, 156^2 per rank (Fe V2 P=4) 4.21 -> 1.71 (2.45x), 312^2 2.28x,
+    78^2 with 8 parents 6.18x, 2^3 1.57x, 1x1x1 1.33x: routed wherever :func:`kdft_parent_refusal` is empty.
+    """
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz), scale=np.float64(scale),
+                 centroid_major=np.int64(bool(centroid_major)),
+                 perm_l=_check_perm(perm_l, ns, "left"), phase_l=_conv_kpair_phase_codes(phase_l, ns, "left"),
+                 perm_r=_check_perm(perm_r, ns, "right"), phase_r=_conv_kpair_phase_codes(phase_r, ns, "right"),
+                 cubin_dir=cubin_cache_dir())
+    layout = (0, 4, 3, 2, 1) if centroid_major else None
+
+    def _kdft(D_l, D_r, tables):
+        _check_parent_operands(D_l, D_r, ns)
+        out = jax.ShapeDtypeStruct((nk, D_l.shape[2], D_l.shape[4]), D_l.dtype)
+        return jax.ffi.ffi_call(target, out, input_layouts=(layout, layout, *(None for _ in tables)))(
+            D_l, D_r, *tables, **attrs)
+    return _kdft
 
 
 def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r) -> Callable:
@@ -1931,8 +2060,10 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
     serve (an axis with no thread-FFT split, :func:`plane_fft_split`, or a
     plane above the device's opt-in shared memory) takes the XLA route
     (static-run concatenate + cuFFT 2-D), decided here once and announced.
+    ROCM: the port of mode 10 (``cpp/kdft/plane_gather_ffi.cc``, the same splits, factor lines
+    the kdft direct DFT) where :func:`kdft_plane_fft_refusal` is empty, else the XLA route.
     Elsewhere the XLA route.  The returned function's ``route`` attribute names
-    the one taken (``'mathdx'`` or ``'xla'``).
+    the one taken (``'mathdx'``, ``'kdft'`` or ``'xla'``).
     """
     nb, nc = (int(v) for v in plane_shape)
     n_col = int(n_col)
@@ -1960,7 +2091,10 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
 
     _xla.route = "xla"
     if kconv_backend(mesh) != "mathdx":
-        return _xla
+        occ = (pfc < n_col).reshape(nb, nc)
+        n_rows = int(occ.any(axis=1).sum())
+        target = rocm_plane_fft_target(mesh, nb, nc, n_rows)
+        return _xla if target is None else _kdft_plane_fft_fn(target, pfc, n_col, nb, nc)
     from ffi.gate import announce_once
     sb, sc = plane_fft_split(nb), plane_fft_split(nc)
     need, have = plane_resident_bytes(nb, nc), _optin_smem_bytes()
@@ -1974,17 +2108,30 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
                       f"cuFFT 2-D), not mathdx mode 10: {why}", scope="rank0")
         return _xla
     _require_target(PLANE_FFT_GATHER_TARGET, "CUDA")
-    occ = (pfc < n_col).reshape(nb, nc)
-    rows = np.flatnonzero(occ.any(axis=1)).astype(np.int32)
-    gidx = np.where(occ[rows], pfc.reshape(nb, nc)[rows], -1).astype(np.int32)
+    rows, gidx = _plane_gather_tables(pfc, n_col, nb, nc)
     attrs = dict(nb=np.int64(nb), nc=np.int64(nc), b1=np.int64(sb[0]), c1=np.int64(sc[0]),
                  **_mathdx_common())
     announce_once(("plane_fft", nb, nc),
                   f"[plane_fft] plane ({nb},{nc}): mathdx mode 10, splits {sb} x {sc}, "
                   f"{rows.size} of {nb} rows occupied", scope="rank0")
+    _mathdx = _plane_gather_call(PLANE_FFT_GATHER_TARGET, attrs, n_col, nb, nc, gidx, rows)
+    _mathdx.route = "mathdx"
+    return _mathdx
 
-    def _mathdx(F, start=None, size=None):
-        _check_c128(F)
+def _plane_gather_tables(pfc: np.ndarray, n_col: int, nb: int, nc: int):
+    """Mode 10's static row tables: the occupied rows and each of their cells' cylinder column (-1 empty)."""
+    occ = (pfc < n_col).reshape(nb, nc)
+    rows = np.flatnonzero(occ.any(axis=1)).astype(np.int32)
+    gidx = np.where(occ[rows], pfc.reshape(nb, nc)[rows], -1).astype(np.int32)
+    return rows, gidx
+
+
+def _plane_gather_call(target, attrs, n_col, nb, nc, gidx, rows) -> Callable:
+    """The mode-10 call shared by both legs: ``fn(F[, start, size])`` with the slab contract."""
+    def call(F, start=None, size=None):
+        if jnp.dtype(F.dtype) != jnp.dtype(jnp.complex128):
+            raise TypeError(f"GATE plane-fft-dtype: got F {F.dtype}; want complex128 (mode 10 and "
+                            "its XLA route keep one contract; the kernel is fp64); fix: pass complex128")
         if int(F.shape[-1]) != n_col:
             raise ValueError(f"plane FFT expects F (..., n_col={n_col}); got {F.shape}")
         lead = F.shape[:-1]
@@ -1995,10 +2142,24 @@ def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -
             lead = (F.shape[0], int(size)) + F.shape[2:-1]
         out = jax.ShapeDtypeStruct(lead + (nb, nc), F.dtype)
         s0 = jnp.asarray(0 if start is None else start, jnp.int32)
-        return jax.ffi.ffi_call(PLANE_FFT_GATHER_TARGET, out)(
-            F, jnp.asarray(gidx), jnp.asarray(rows), s0, **attrs)
-    _mathdx.route = "mathdx"
-    return _mathdx
+        return jax.ffi.ffi_call(target, out)(F, jnp.asarray(gidx), jnp.asarray(rows), s0, **attrs)
+    return call
+
+
+def _kdft_plane_fft_fn(target, pfc, n_col, nb, nc) -> Callable:
+    """The ROCM mode-10 call of :func:`make_plane_fft_gather` (the CUDA call less ``mathdx_root``)."""
+    rows, gidx = _plane_gather_tables(pfc, n_col, nb, nc)
+    sb, sc = plane_fft_split(nb), plane_fft_split(nc)
+    attrs = dict(nb=np.int64(nb), nc=np.int64(nc), b1=np.int64(sb[0]), c1=np.int64(sc[0]),
+                 cubin_dir=cubin_cache_dir())
+    from ffi.gate import announce_once
+    announce_once(("plane_fft", "kdft", nb, nc),
+                  f"[plane_fft] plane ({nb},{nc}): kdft mode 10, splits {sb} x {sc}, {rows.size} of {nb} rows "
+                  f"occupied, {kdft_plane_fft_pb(nb, nc, rows.size)} planes per block", scope="rank0")
+    fn = _plane_gather_call(target, attrs, n_col, nb, nc, gidx, rows)
+    fn.route = "kdft"
+    return fn
+
 
 def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
                      norm: str | None = "ortho", mult: float = 1.0) -> KConvStored:

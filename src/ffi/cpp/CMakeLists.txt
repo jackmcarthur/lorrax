@@ -1535,6 +1535,8 @@ set(LORRAX_FFI_ROCM_SOURCES
     kdft/kbox_rspace_ffi.cc
     kdft/kconv_outer_rocm_ffi.cc
     kdft/kbox_plane_ffi.cc
+    kdft/kbox_parent_ffi.cc
+    kdft/plane_gather_ffi.cc
     rocsolver/batched_eigh_ffi.cc
     hipfft/fourier_plan_rocm_ffi.cc
     active_subspace/active_devsize.cc
@@ -1608,6 +1610,18 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_plane_src.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_plane_src.h" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_plane_kernel.h")
+# The k-box mode-1 parent-load pair convolution (the ISDF C_q; kdft/kbox_parent_src.h.in) and the
+# mode-10 plane FFT with gather-on-load (route G; kdft/plane_gather_src.h.in), on the same stage text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_parent_kernel.h" LRX_KBOX_PARENT_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_parent_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_parent_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_parent_kernel.h")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/plane_gather_kernel.h" LRX_PLANE_GATHER_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/plane_gather_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/plane_gather_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/plane_gather_kernel.h")
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)
