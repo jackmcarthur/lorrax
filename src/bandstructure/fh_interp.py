@@ -361,6 +361,21 @@ def _fh_locality_metrics(fh_r: jax.Array,
     return shell_fraction, shell_max_over_r0
 
 
+def image_locality(operator_R: jax.Array,
+                   kgrid: tuple[int, int, int]) -> tuple[float, float]:
+    """``(outer-shell L2 fraction, outer-shell max / |R=0|)`` of a lattice image.
+
+    ``operator_R`` is ``(nk, rank, rank)``, ``P(None, 'x', 'y')`` (``fH_R``, or
+    a band operator's ``orbital._operator_R``); the outer shell is
+    :func:`outer_r_shell_mask` of the coarse ``kgrid``.  Two scale-free
+    numbers, reduced without gathering the image.  A locality diagnostic,
+    not a fine-k accuracy statement (TASTE 19).
+    """
+    fraction, max_over_r0 = jax.device_get(_fh_locality_metrics(
+        operator_R, jnp.asarray(outer_r_shell_mask(kgrid))))
+    return float(fraction), float(max_over_r0)
+
+
 def select_active_eigenpairs(eigenvalues: jax.Array,
                              eigenvectors: jax.Array,
                              active_character: jax.Array,
@@ -849,12 +864,11 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         from time import perf_counter as _quality_clock
         _quality_t0 = _quality_clock()
         _outer_shell = outer_r_shell_mask(kgrid_co)
-        _shell_fraction, _shell_max_over_r0 = jax.device_get(
-            _fh_locality_metrics(fH_R, jnp.asarray(_outer_shell)))
+        _shell_fraction, _shell_max_over_r0 = image_locality(fH_R, kgrid_co)
         quality_record_fn({
             "row_isometry_max": _projection_defect,
-            "outer_shell_l2_fraction": float(_shell_fraction),
-            "outer_shell_max_over_r0": float(_shell_max_over_r0),
+            "outer_shell_l2_fraction": _shell_fraction,
+            "outer_shell_max_over_r0": _shell_max_over_r0,
             "outer_shell_vectors": int(np.count_nonzero(_outer_shell)),
             "r_vectors": int(_outer_shell.size),
             "locality_wall_seconds": float(_quality_clock() - _quality_t0),

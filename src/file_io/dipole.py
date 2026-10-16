@@ -49,6 +49,7 @@ __all__ = [
     "LEGACY_DELTA_E_DATASET",
     "band_energies_on_full_bz",
     "require_dipole_basis",
+    "require_dipole_k_grid",
     "velocity_stamp",
     "wfn_psi_basis",
     "delta_e",
@@ -154,6 +155,25 @@ def require_dipole_basis(attrs, *, dipole_path, wfn_path) -> None:
             f"{want!r}-basis states.  Build the dipole from the WFN the BSE "
             f"runs on (python -m psp.get_dipole_mtxels -i <deck>); "
             f"dipole_qsgw.h5 pairs only with a QP WFN.")
+
+
+def require_dipole_k_grid(attrs, nk: int, *, dipole_path) -> None:
+    """Refuse a dipole whose full-BZ k list is not the BSE bundle's.
+
+    ``dipole_cart`` is contracted against the transition index ``(c, v, k)``,
+    so the file's k list must be the bundle's, in the bundle's order.  A
+    coarse file sliced onto a ``bse_k_grid`` bundle used to crash after the
+    eigensolve; a ``bse_k_grid`` bundle carries its own dipoles
+    (``bse.bse_densify.densified_dipoles``) and never slices a file.
+    """
+    got = int(attrs.get("nk", -1))
+    if got != int(nk):
+        raise ValueError(
+            f"GATE dipole_k_grid: {dipole_path!s} holds nk={got} k-points; "
+            f"want the BSE bundle's nk={int(nk)}; why: the dipole is "
+            f"contracted against the transition index (c, v, k), so the two "
+            f"k lists must be one list in one order; fix: the dipole.h5 of "
+            f"the deck's WFN (python -m psp.get_dipole_mtxels -i <deck>).")
 
 
 def velocity_stamp(path, *, wfn, wfn_path) -> tuple[str, str, np.ndarray]:

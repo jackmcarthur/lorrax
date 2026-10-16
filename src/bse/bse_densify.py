@@ -709,6 +709,298 @@ def _add_rank_lr(W_q, A, D, mesh_xy, sign):
     return _add(W_q, a_x, a_y, d)
 
 
+#: Bound of the operator identity in :func:`densified_dipoles`.  At a fine q
+#: that is also a coarse k the interpolated operator is ``U^† C^T O C^* U``
+#: exactly — the lattice image's FFT round trip and nothing else — so a
+#: deviation above round-off is bookkeeping (a conjugation, a band order),
+#: never a fit error, and the bound does not scale with the deck.
+DENSIFIED_DIPOLE_ONGRID_RTOL = 1.0e-8
+
+#: Floor of the state identity: at a coarse k the fine window states ARE the
+#: coarse ones, ``σ(C_k^* U_q) = 1``, up to the fit's projection defect
+#: ``max|C Cᴴ − I|`` (the measured margin is 10x that defect, plus this floor).
+DENSIFIED_DIPOLE_STATE_FLOOR = 1.0e-8
+
+#: Component names of the four lattice images :func:`densified_dipoles` builds.
+_DIPOLE_IMAGES = ("v_x", "v_y", "v_z", "f(H)")
+
+
+def densified_dipoles(velocity, *, sym, basis, fine, coarse_grid, n_val,
+                      window_start, a_band_index, mesh_xy,
+                      log_fn=print) -> dict:
+    r"""r-form dipoles of a ``bse_k_grid`` bundle, in the gauge of its own ψ.
+
+    The coarse WFN's velocity matrix ``v(k)`` (``psp.get_dipole_mtxels``'
+    ``dipole.h5``, unfolded in the loader's gauge, which is the Galerkin
+    fit's) is carried through the htransform that densified ψ and contracted
+    with the SAME fine eigenvectors ``U_q`` that build the densified ψ
+    (``compute_wfns_fi``'s ``coeffs_fi``), so no map between two sets of
+    states, and no gauge fit, exists:
+
+    .. math::
+        v_B(k) = C_k^{T} v(k)\, C_k^{*},\qquad
+        V_R = \frac{1}{N_k}\sum_k e^{2\pi i k\cdot R}\, v_B(k),\qquad
+        v_{ij}(q) = \Big[U_q^\dagger\,
+            \mathrm{Herm}\sum_R e^{-2\pi i q\cdot R} V_R\; U_q\Big]_{ij}
+
+    (``bandstructure.orbital.interpolate_band_operator``, the htransform's
+    band-operator route).  The transition energies are the velocity's own:
+    the file's ``band_energies`` (DFT for ``dipole.h5``), never ``--eqp``,
+    because ``r = v/ΔE`` is scissor-invariant.  Under ``--eqp`` the fine
+    states are eigenvectors of the QP ``f(H)``, so each band's energy is the
+    Rayleigh quotient of the file's ``f(H)`` in it, Newton-inverted (exact
+    when the two Hamiltonians share eigenvectors, second order otherwise):
+
+    .. math::
+        E_n(q) = f^{-1}\big(U_{qn}^\dagger\, [f(H)]_{\mathrm{file}}(q)\,
+        U_{qn}\big),\qquad
+        d^\alpha_{cvq} = \frac{v^\alpha_{cv}(q)}{E_c(q) - E_v(q)},
+
+    the ``d^α_{cvk} = ⟨ck|v̂_α|vk⟩/ΔE`` of
+    ``absorption_common.slice_dipole_to_bse_window``.  No centroid inner
+    product enters, so the centroid set cannot bias it.
+
+    Two receipts.  The on-grid identity is a gate: at every fine q that is a
+    coarse k the fine window states are the coarse ones,
+    ``σ(W) = 1`` for ``W = C_k^* U_q`` (catches a q list or band window that
+    is not the htransform's), and the four images reproduce ``W^† O(k) W``
+    to :data:`DENSIFIED_DIPOLE_ONGRID_RTOL` (catches a contraction
+    convention).  Each image's outer-shell locality
+    (``fh_interp.image_locality``) is a diagnostic: a velocity whose gauge
+    differs from ``ctilde``'s is not smooth in k and shows up there, which no
+    identity at the coarse points can see.
+
+    Parameters
+    ----------
+    velocity : tuple
+        ``(parents, energies, label, path)``: ``bandstructure.orbital.
+        stored_velocity`` of ``path`` (authenticated against the htransform's
+        WFN), ``parents`` (n_parent, 3, nb_file, nb_file) Ry·bohr at the
+        file-wedge rows, ``energies`` (n_parent, nb_file) Ry.
+    sym
+        The WFN's symmetry maps (``irr_idx_k``, ``unfolded_kpts``, the polar
+        time-odd unfold).
+    basis : isdf.galerkin.GalerkinBasis
+        The htransform's basis: ``ctilde`` (nk_co, nb_fit, rank) over the
+        absolute bands ``basis.band_range``.
+    fine : SimpleNamespace
+        ``compute_wfns_fi(..., return_coeffs=True)``: ``coeffs_fi``
+        (nk_f, rank, nb_fi), q-sharded ``P(('x','y'))``, valence rows first;
+        ``q_frac`` (nk_f, 3).
+    coarse_grid : tuple of int
+        (nkx, nky, nkz) of ``ctilde``'s flat k axis.
+    n_val : int
+        Valence rows of ``coeffs_fi``.
+    window_start : int
+        First fitted band ``coeffs_fi`` returns (``compute_wfns_fi``'s
+        ``band_window_fi[0]``, relative to ``basis.band_range[0]``).
+    a_band_index : int or None
+        The htransform's ``a`` band (``htransform_a_band``).
+    mesh_xy : jax.sharding.Mesh
+        The ('x','y') mesh.  COLLECTIVE over it.
+
+    Returns
+    -------
+    dict
+        ``d_alpha`` (3, nk_f, nc, nv) complex128 host, bohr; ``de_cv``
+        (nk_f, nc, nv) float64 host, Ry; ``q_frac`` (nk_f, 3), the fine k
+        list both are indexed by; ``source`` (absolute path),
+        ``velocity`` (the file's operator label), ``route``; ``on_grid_rel``
+        and ``n_on_grid``; ``image_locality`` {image: (outer-shell L2
+        fraction, outer-shell max / R=0)}.
+    """
+    from bandstructure.fh_interp import (f_transform_eigs, image_locality,
+                                         newton_inv, require_newton_converged)
+    from bandstructure.orbital import interpolate_band_operator
+    from common.collectives import device_put_process_local, gather_to_host
+    from common.units import RYD_TO_EV
+    from runtime.padding import padded_axis
+    from symmetry_maps import unfold_file_wedge_polar_matrix
+
+    parents, e_parent, label, path = velocity
+    b0, b1 = (int(b) for b in basis.band_range)
+    nb_fit = b1 - b0
+    if int(parents.shape[-1]) < b1:
+        raise ValueError(
+            f"GATE densified_velocity_bands: {path} carries "
+            f"{int(parents.shape[-1])} bands; want >= {b1}, the top of the "
+            f"htransform window [{b0},{b1}); why: the velocity is carried "
+            f"through every fitted band; fix: rerun psp.get_dipole_mtxels "
+            f"with number_bands >= {b1}.")
+    nk_co = int(np.prod(coarse_grid))
+    v_full = unfold_file_wedge_polar_matrix(
+        sym, np.asarray(parents)[:, :, b0:b1, b0:b1])         # (nk, 3, nb, nb)
+    e_full = np.asarray(e_parent, dtype=np.float64)[
+        np.asarray(sym.irr_idx_k)][:, b0:b1]                   # (nk, nb) Ry
+    f_eps, a_f, n_f, shift = f_transform_eigs(
+        jnp.asarray(e_full.T), a_band_index=a_band_index)
+    f_full = np.asarray(f_eps, dtype=np.float64).T             # (nk, nb)
+
+    # Four band operators on one replicated carrier (48·nk·nb² B per
+    # device, the htransform's own velocity layout): the three velocity
+    # components and f(H) of the velocity's energies.  Band axes padded to
+    # the mesh so the image's (x, y) face divides.
+    nbp = padded_axis(nb_fit, mesh_xy, name="densified velocity bands").carrier
+    ops = np.zeros((4, nk_co, nbp, nbp), np.complex128)
+    ops[:3, :, :nb_fit, :nb_fit] = np.moveaxis(v_full, 1, 0)
+    ops[3][:, np.arange(nb_fit), np.arange(nb_fit)] = f_full
+    ops = device_put_process_local(ops, NamedSharding(mesh_xy, P()))
+
+    q_frac = np.asarray(fine.q_frac, dtype=np.float64)
+    nq = int(q_frac.shape[0])
+    coeffs = _coefficients_by_q(fine.coeffs_fi, padded_axis(
+        nq, mesh_xy, name="densified dipole q carrier").carrier, mesh_xy)
+    locality = {}
+
+    def _record(component, operator_R):
+        locality[_DIPOLE_IMAGES[component]] = image_locality(
+            operator_R, tuple(coarse_grid))
+
+    out = interpolate_band_operator(ops, basis.ctilde, coeffs, q_frac,
+                                    tuple(coarse_grid), mesh_xy,
+                                    image_record_fn=_record)
+    del ops, coeffs
+    v_cv = np.asarray(gather_to_host(jax.jit(
+        lambda o: o[:nq, :3, n_val:, :n_val])(out)))            # (nq, 3, nc, nv)
+    lam = np.asarray(gather_to_host(jax.jit(
+        lambda o: jnp.real(jnp.diagonal(o[:nq, 3], axis1=-2, axis2=-1)))(out)))
+    e_dft, residual = newton_inv(a_f, n_f, shift, jnp.asarray(lam))
+    require_newton_converged(float(residual), where="densified_dipoles")
+    e_dft = np.asarray(e_dft, dtype=np.float64)                 # (nq, nb_fi)
+    de_cv = e_dft[:, n_val:, None] - e_dft[:, None, :n_val]     # (nq, nc, nv)
+    if not (np.all(np.isfinite(v_cv)) and float(de_cv.min()) > 0.0):
+        raise ValueError(
+            f"GATE densified_dipole_gap: got min (E_c - E_v) = "
+            f"{float(de_cv.min()) * RYD_TO_EV:.6g} eV over the fine "
+            f"grid in {path}'s energies (finite velocity: "
+            f"{bool(np.all(np.isfinite(v_cv)))}); want every transition "
+            f"positive and finite; why: r = v/(E_c - E_v) is undefined at a "
+            f"band inversion of the velocity's own Hamiltonian; fix: a window "
+            f"whose conduction bands lie above its valence bands in that "
+            f"Hamiltonian (dipole_qsgw.h5 for a QSGW state).")
+    d_alpha = np.moveaxis(v_cv, 1, 0) / de_cv[None]             # (3, nq, nc, nv)
+
+    on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
+        out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
+        k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start)
+    del out
+    shift_mev = float(np.max(np.abs(
+        e_dft - np.asarray(gather_to_host(fine.enk_full))))) * RYD_TO_EV * 1e3
+    log_fn(f"[bse_k_grid dipoles] {path} ({label}) carried through the "
+           f"htransform on bands [{b0},{b1}): d_alpha {d_alpha.shape} in the "
+           f"densified ψ gauge (the bundle's own U_q)")
+    state_tol = DENSIFIED_DIPOLE_STATE_FLOOR + 10.0 * defect
+    log_fn(f"[bse_k_grid dipoles] on-grid identity at {n_on_grid} fine q "
+           f"that are coarse k: states max|σ(C*U) - 1| = {state_dev:.3e} "
+           f"(gate {state_tol:.1e} = 1e-8 + 10 max|C Cᴴ - I|), images max rel "
+           f"deviation {on_grid_rel:.3e} (gate "
+           f"{DENSIFIED_DIPOLE_ONGRID_RTOL:.0e})")
+    log_fn(f"[bse_k_grid dipoles] transition energies from {path}'s "
+           f"band_energies (Rayleigh quotients of its f(H) in the fine "
+           f"states): max |E - eps_bundle| = {shift_mev:.3f} meV (the --eqp "
+           f"shift; 0 without --eqp)")
+    log_fn("[bse_k_grid dipoles] image locality, outer-shell L2 fraction "
+           "(diagnostic): " + ", ".join(
+               f"{name} {locality[name][0]:.3e}" for name in _DIPOLE_IMAGES
+               if name in locality))
+    if not (state_dev <= state_tol
+            and on_grid_rel <= DENSIFIED_DIPOLE_ONGRID_RTOL):
+        raise ValueError(
+            f"GATE densified_dipole_on_grid: got max|σ(C*U) - 1| = "
+            f"{state_dev:.3e} and image deviation {on_grid_rel:.3e} at the "
+            f"{n_on_grid} fine q that are coarse k; want <= {state_tol:.1e} "
+            f"and <= {DENSIFIED_DIPOLE_ONGRID_RTOL:.0e} (identities of the "
+            f"interpolant); why: the fine q list, the band window or the "
+            f"contraction convention disagrees with the htransform that built "
+            f"ψ, so the dipoles are not in its gauge; fix: report it, this is "
+            f"a bookkeeping defect.")
+    return {
+        "d_alpha": d_alpha,
+        "de_cv": de_cv,
+        "q_frac": q_frac,
+        "source": os.path.abspath(str(path)),
+        "velocity": str(label),
+        "route": "bse_k_grid htransform velocity (bse_densify.densified_dipoles)",
+        "on_grid_rel": float(on_grid_rel),
+        "on_grid_state_dev": float(state_dev),
+        "n_on_grid": int(n_on_grid),
+        "image_locality": locality,
+    }
+
+
+def _coefficients_by_q(coeffs, carrier, mesh_xy):
+    """``coeffs`` (nq, rank, nb) zero-padded to ``carrier`` q rows, q-sharded.
+
+    ``compute_wfns_fi`` hands its eigenvectors over face-sharded,
+    ``P(None, 'x', 'y')``; ``interpolate_band_operator`` reads them
+    ``P(('x','y'), None, None)``, one whole matrix per q per device.  The pad
+    is local on the face and the move is the staged two-``all_to_all``
+    reshard (``common.staged_reshard``), never a replicate-then-repartition;
+    a shape it cannot serve takes the plain constraint.
+    """
+    from common.staged_reshard import (face_to_batch_reshard,
+                                       face_to_batch_reshard_supported)
+    padded = jax.jit(
+        lambda c: jnp.pad(c, ((0, carrier - c.shape[0]), (0, 0), (0, 0))),
+        out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(coeffs)
+    if face_to_batch_reshard_supported(mesh_xy, padded.shape):
+        return face_to_batch_reshard(mesh_xy)(padded)
+    return jax.jit(lambda c: c, out_shardings=NamedSharding(
+        mesh_xy, P(("x", "y"), None, None)))(padded)
+
+
+def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
+                             q_fine, window_start):
+    """The two on-grid identities of :func:`densified_dipoles`.
+
+    ``out`` (carrier, 4, nb_fi, nb_fi) is ``interpolate_band_operator``'s
+    output, ``ctilde`` (nk_co, nb_fit, rank), ``coeffs`` (nk_f, rank, nb_fi),
+    ``ops_host = (v_full (nk_co, 3, nb_fit, nb_fit), f_full (nk_co,
+    nb_fit))``.  A fine q matches the coarse row whose ``k_coarse`` equals it
+    modulo a reciprocal lattice vector (to 1e-8), never by assumed order.
+    With ``W = C_k^* U_q`` (nb_fit, nb_fi), the window rows
+    ``W[window_start:window_start+nb_fi]`` are unitary and the four images
+    are ``W^† O(k) W``.  Only the shared rows are gathered.
+
+    Returns ``(image rel deviation, max|σ(W_window) − 1|, max|C Cᴴ − I| over
+    the shared k, n_shared)``.
+    """
+    from common.collectives import gather_to_host
+
+    v_full, f_full = ops_host
+    kc = np.asarray(k_coarse, dtype=np.float64)
+    pairs = []
+    for i, q in enumerate(np.asarray(q_fine, dtype=np.float64)):
+        d = kc - q[None, :]
+        d -= np.round(d)
+        hit = np.flatnonzero(np.all(np.abs(d) < 1e-8, axis=1))
+        if hit.size:
+            pairs.append((i, int(hit[0])))
+    if not pairs:
+        raise ValueError(
+            "GATE densified_dipole_on_grid: no fine q coincides with a coarse "
+            "k (Γ is on every uniform grid); want the fine and coarse grids "
+            "of one zone; why: the identity cannot be read; fix: report it.")
+    fi = np.asarray([p[0] for p in pairs])
+    co = np.asarray([p[1] for p in pairs])
+    U = np.asarray(gather_to_host(coeffs[fi]))                  # (n, rank, nb_fi)
+    C = np.asarray(gather_to_host(ctilde[co]))                  # (n, nb_fit, rank)
+    O = np.asarray(gather_to_host(out[fi]))                     # (n, 4, nb_fi, nb_fi)
+    nb_fi = int(U.shape[2])
+    W = np.einsum("nma,nai->nmi", np.conj(C), U)                # ⟨ψ_m(k)|ψ_i(q)⟩
+    sigma = np.linalg.svd(W[:, window_start:window_start + nb_fi],
+                          compute_uv=False)
+    gram = np.einsum("nma,npa->nmp", C, np.conj(C))
+    defect = float(np.max(np.abs(gram - np.eye(gram.shape[1])[None])))
+    v_ref = np.einsum("nmi,nxmp,npj->nxij", np.conj(W), v_full[co], W)
+    f_ref = np.einsum("nmi,nm,nmj->nij", np.conj(W), f_full[co], W)
+    ref = np.concatenate([v_ref, f_ref[:, None]], axis=1)
+    scale = np.linalg.norm(ref.reshape(len(pairs), -1), axis=1)
+    dev = np.linalg.norm((O - ref).reshape(len(pairs), -1), axis=1)
+    return (float(np.max(dev / np.where(scale > 0, scale, 1.0))),
+            float(np.max(np.abs(sigma - 1.0))), defect, len(pairs))
+
+
 def _interpolate_bse_data_to_grid(
     data: dict,
     fine_grid: tuple[int, int, int],
@@ -722,6 +1014,7 @@ def _interpolate_bse_data_to_grid(
     htransform_rank_record_fn=None,
     htransform_quality_record_fn=None,
     eqp_file: str | None = None,
+    velocity_file: str | None = None,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -768,6 +1061,11 @@ def _interpolate_bse_data_to_grid(
         The wedge ``eqp1.dat`` (``--eqp``).  Its QP energies enter the fH
         through ``initialize_wfns``, the one reader on this path, so the fine
         ε are quasiparticle; the coarse bundle's ε are not re-sliced after.
+    velocity_file : str or None
+        The COARSE WFN's ``dipole.h5`` (``--dipole``).  Authenticated against
+        the deck WFN before the fit, then carried through the same htransform
+        as ψ (:func:`densified_dipoles`); the bundle's ``dipoles`` key holds
+        the fine-grid window dipoles in its own ψ gauge, ``None`` without it.
     head_channel : dict or None
         C1's split-and-reattach hand-off from the loader, ``None`` on the
         ``legacy`` arm.  When present it carries ``whead`` (the head scalar the
@@ -838,6 +1136,18 @@ def _interpolate_bse_data_to_grid(
     # HLO constant and is process-local by construction.
     keep = None if keep_idx is None else np.asarray(keep_idx, dtype=np.int32)
 
+    # ── The coarse velocity, authenticated BEFORE the fit ────────────────
+    # It must be the deck WFN's own (basis and fingerprint): a fine grid's
+    # dipole.h5 has the bundle's nk and the WRONG gauge, and refuses here.
+    wfn_sym = velocity = None
+    if velocity_file is not None:
+        from bandstructure.orbital import stored_velocity
+        wfn_sym = ht.setup_wfn_and_sym(_parse_wfn_path(input_file),
+                                       mesh_xy=mesh_xy)
+        velocity = stored_velocity(
+            velocity_file, wfn=wfn_sym[0], wfn_path=_parse_wfn_path(input_file),
+            sym=wfn_sym[1], mesh=mesh_xy) + (velocity_file,)
+
     # ── ψ_{v,c}(k_fine), ε_{v,c}(k_fine): ONE htransform fH ───────────────
     _fit_subset = keep
     (wfn, sym, meta, _mesh, basis,
@@ -845,7 +1155,8 @@ def _interpolate_bse_data_to_grid(
          input_file, params, log_fn, mesh_xy=mesh_xy, eqp_file=eqp_file,
          centroid_subset_idx=_fit_subset,
          rank_record_fn=htransform_rank_record_fn,
-         distrib_la_batched_route=_distrib_la_batched_route)
+         distrib_la_batched_route=_distrib_la_batched_route,
+         wfn_sym=wfn_sym)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
@@ -879,7 +1190,15 @@ def _interpolate_bse_data_to_grid(
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
         distrib_la_batched_route=_distrib_la_batched_route,
-        htransform_quality_record_fn=htransform_quality_record_fn)
+        htransform_quality_record_fn=htransform_quality_record_fn,
+        return_coeffs=velocity is not None)
+    dipoles = None
+    if velocity is not None:
+        dipoles = densified_dipoles(
+            velocity, sym=sym, basis=basis, fine=bundle,
+            coarse_grid=coarse_grid, n_val=n_val, window_start=b_min,
+            a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn)
+        del bundle.coeffs_fi, velocity
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))
     y4 = NamedSharding(mesh_xy, P(None, None, None, "y"))
@@ -1076,5 +1395,8 @@ def _interpolate_bse_data_to_grid(
         "V_q_coarse": data["V_q_full"],
         "V_q_coarse_grid": coarse_grid,
         "nkx": fine_grid[0], "nky": fine_grid[1], "nkz": fine_grid[2],
+        # The fine window dipoles in this bundle's ψ gauge, or None: a
+        # densified bundle never slices a dipole file (window_dipoles).
+        "dipoles": dipoles,
     })
     return out
