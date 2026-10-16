@@ -1719,9 +1719,7 @@ static void async_read_kchunk_union_worker(
 
 static ffi::Future ReadKchunkUnionDispatch(
     LRX_STREAM_PARAM
-    ffi::Buffer<ffi::DataType::S64> handle_buf,   // (2,) {ctx_handle, ds_id}
-    ffi::Buffer<ffi::DataType::S64> offset_buf,   // (n_kchunk, N_file)
-    ffi::Buffer<ffi::DataType::S64> count_buf,    // (n_kchunk, N_file)
+    ffi::AnyBuffer dst,                            // the caller's output, aliased to A_out (ABI 7)
     ffi::Result<ffi::AnyBuffer> A_out,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
@@ -1729,40 +1727,48 @@ static ffi::Future ReadKchunkUnionDispatch(
     int64_t n_kchunk_attr,
     int64_t kchunk_axis_attr)  // position of the n_kchunk axis in A_out
 {
-    // ``ctx_handle``/``ds_id`` as a RUNTIME buffer — see ReadDispatch.  This
-    // handler is the one xla_dump attributed the measured +2-entries-per-
-    // ctx-address growth to.
+    // Control by POSTED ADDRESS (ctx.h, handler ABI 7): SlabIO allocated
+    // ``dst``, aliased it to ``A_out`` and posted {ctx, ds_id, n_kchunk,
+    // N_file, offset[n_kchunk][N_file], count[n_kchunk][N_file]} under its
+    // address -- ``count`` is THIS rank's own rows.  No control operand, so no
+    // table placement, no D2H copy-in and no xla_stream sync; the worker's
+    // copies are ordered behind the destination's fill by the device-side
+    // fence below (ctx.h order_event), which the copy-in's host sync used to
+    // provide.
     //
     // NOTE: this dispatch returns ffi::Future, so a failure BEFORE ``ctx`` is
     // known cannot return a bare ffi::Error — it must still hand back a
     // Future carrying the error.  ``fail`` below needs ctx (it announces), so
-    // the two pre-ctx failures build their own Promise/Future pair.
+    // the pre-ctx failures build their own Promise/Future pair.
     auto fail_early = [](ffi::ErrorCode code, const std::string& msg) {
         ffi::Promise p;
         ffi::Future f(p);
         p.SetError(ffi::Error(code, msg));
         return f;
     };
-    if (handle_buf.dimensions().size() != 1 ||
-        handle_buf.dimensions()[0] != 2) {
-        return fail_early(
-            ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: handle_buf must have shape (2,) == "
-            "{ctx_handle, ds_id}");
+    if (dst.untyped_data() != A_out->untyped_data()) {
+        return fail_early(ffi::ErrorCode::kInvalidArgument,
+            "GATE phdf5_posted_control: phdf5 read_kchunk_union: output is not "
+            "the aliased destination SlabIO posted for (input_output_aliases "
+            "not honoured)");
     }
-    int64_t handle_host[2] = {0, 0};
+    std::vector<int64_t> control;
     {
-        std::string herr;
-        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
-                                handle_buf.untyped_data(),
-                                2 * sizeof(int64_t), &herr)) {
-            return fail_early(
-                ffi::ErrorCode::kInternal,
-                "phdf5 read_kchunk_union: copy(handle) failed: " + herr);
+        std::string perr;
+        if (!take_control(reinterpret_cast<uint64_t>(A_out->untyped_data()),
+                          kCtlReadKchunkUnion, &control, &perr)) {
+            return fail_early(ffi::ErrorCode::kInvalidArgument,
+                              "phdf5 read_kchunk_union: " + perr);
         }
     }
-    auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
-    const hid_t ds_id = (hid_t)handle_host[1];
+    if (control.size() < 4) {
+        std::ostringstream os;
+        os << "phdf5 read_kchunk_union: posted control has " << control.size()
+           << " values; want 4 + 2 n_kchunk N_file";
+        return fail_early(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(control[0]);
+    const hid_t ds_id = (hid_t)control[1];
 
     auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
         announce_error(ctx, msg);
@@ -1773,15 +1779,15 @@ static ffi::Future ReadKchunkUnionDispatch(
     };
 
     if (!ctx) {
-        return fail(ffi::ErrorCode::kInvalidArgument,
-                    "phdf5 read_kchunk_union: ctx_handle is null");
+        return fail_early(ffi::ErrorCode::kInvalidArgument,
+                          "phdf5 read_kchunk_union: ctx_handle is null");
     }
     // Audit B2 — see the note in ReadDispatch.  This dispatch returns a
     // Future, so the refusal goes back through ``fail_early`` (which does not
     // touch ctx), not through ``fail``.
     {
         std::string live_err;
-        if (!check_live_ctx(ctx, handle_host[0], "phdf5 read_kchunk_union",
+        if (!check_live_ctx(ctx, control[0], "phdf5 read_kchunk_union",
                             &live_err)) {
             return fail_early(ffi::ErrorCode::kInvalidArgument, live_err);
         }
@@ -1808,12 +1814,14 @@ static ffi::Future ReadKchunkUnionDispatch(
         return fail(ffi::ErrorCode::kInvalidArgument,
             "phdf5 read_kchunk_union: axis_count_per_dim / N_file mismatch");
     }
-    const auto obd = offset_buf.dimensions();
-    const auto cbd = count_buf.dimensions();
-    if (obd.size() != 2 || (int64_t)obd[0] != n_kchunk || (size_t)obd[1] != N_file
-        || cbd.size() != 2 || (int64_t)cbd[0] != n_kchunk || (size_t)cbd[1] != N_file) {
-        return fail(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: offset_buf / count_buf shape mismatch");
+    if (control[2] != n_kchunk || control[3] != (int64_t)N_file ||
+        control.size() != 4 + 2 * (size_t)n_kchunk * N_file) {
+        std::ostringstream os;
+        os << "phdf5 read_kchunk_union: posted control names n_kchunk="
+           << control[2] << " N_file=" << control[3] << " in " << control.size()
+           << " values; the output has n_kchunk=" << n_kchunk << " N_file="
+           << N_file << " (want " << 4 + 2 * (size_t)n_kchunk * N_file << ")";
+        return fail(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     {
         std::string enc_err;
@@ -1824,25 +1832,9 @@ static ffi::Future ReadKchunkUnionDispatch(
         }
     }
 
-    // Bring both small index buffers to host (D2H on CUDA; already host-
-    // resident on the host build).
-    std::vector<int64_t> off_host((size_t)n_kchunk * N_file);
-    std::vector<int64_t> cnt_host((size_t)n_kchunk * N_file);
-    {
-        std::string cperr;
-        if (!copy_index_to_host(LRX_STREAM_ARG off_host.data(),
-                                offset_buf.untyped_data(),
-                                off_host.size() * sizeof(int64_t), &cperr)) {
-            return fail(ffi::ErrorCode::kInternal,
-                "phdf5 read_kchunk_union: copy(offset): " + cperr);
-        }
-        if (!copy_index_to_host(LRX_STREAM_ARG cnt_host.data(),
-                                count_buf.untyped_data(),
-                                cnt_host.size() * sizeof(int64_t), &cperr)) {
-            return fail(ffi::ErrorCode::kInternal,
-                "phdf5 read_kchunk_union: copy(count): " + cperr);
-        }
-    }
+    // The two tables, already host memory (posted before the call).
+    const int64_t* off_host = control.data() + 4;
+    const int64_t* cnt_host = off_host + (size_t)n_kchunk * N_file;
 
     // Per-rank coord shift on sharded dims (same encoding as single-
     // offset handler).  Applied to both offset and count uniformly:
@@ -1953,9 +1945,23 @@ static ffi::Future ReadKchunkUnionDispatch(
             std::move(per_rank_max), std::move(sharded), kax,
             std::move(promise));
     };
-    // ``xla_stream`` is used ABOVE, by the three control-operand copies (seam
-    // 2 is stream-ordered — SLAB_IO_ROOT_CAUSE_AUDIT.md B1).  The QUEUED TASK
-    // below does not need it: it owns its own synchronization via h2d_event.
+    // ABI 7 order fence: the worker's zero fill and copies run on ctx->stream
+    // into a donated destination whose own fill (and any earlier user of its
+    // memory) is still queued on xla_stream.  Until ABI 6 the control copy-in
+    // synced xla_stream on the host; now ctx->stream waits for it on the
+    // device, enqueued BEFORE the task so every copy of the task follows it.
+#if LRX_LEG_DEVICE
+    {
+        lrx::gpu::Error oe = lrx::gpu::event_record(ctx->order_event, xla_stream);
+        if (oe == lrx::gpu::kSuccess)
+            oe = lrx::gpu::stream_wait_event(ctx->stream, ctx->order_event, 0);
+        if (oe != lrx::gpu::kSuccess) {
+            return fail(ffi::ErrorCode::kInternal,
+                std::string("phdf5 read_kchunk_union: " LRX_GPU_API " order fence failed: ") +
+                lrx::gpu::error_string(oe));
+        }
+    }
+#endif
     {
         std::lock_guard<std::mutex> lk(ctx->queue_mu);
         ctx->task_queue.emplace_back(std::move(task));
@@ -2005,9 +2011,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     lorrax_ffi::phdf5::ReadKchunkUnionDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // handle {ctx, ds}
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_buf (n_kchunk, N_file)
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // count_buf  (n_kchunk, N_file)
+        .Arg<xla::ffi::AnyBuffer>()   // destination, aliased to the result (ABI 7)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")

@@ -513,10 +513,7 @@ def ffi_read_kchunk_call(
 
 
 def ffi_read_kchunk_union_call(
-    out_struct: jax.ShapeDtypeStruct,
-    handle: jax.Array,               # (2,) == [ctx_handle, ds_id]
-    offset_base: jax.Array,          # (n_kchunk, ndim_file) int64
-    count_base: jax.Array,           # (n_kchunk, ndim_file) int64
+    dst: jax.Array,
     *,
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
@@ -527,17 +524,19 @@ def ffi_read_kchunk_union_call(
     """Compound-hyperslab kchunk — ONE H5Dread pulls ``n_kchunk`` disjoint
     windows via ``H5S_SELECT_OR``.  Caller supplies per-k counts so the
     per-k file rectangles are disjoint by construction.  ``kchunk_axis``
-    locates the k axis inside ``out_struct`` (required so memspace
-    iteration order matches filespace iteration order — see
-    ``read_kchunk_union_sharded`` docstring).
+    locates the k axis inside ``dst`` (required so memspace iteration order
+    matches filespace iteration order — see ``read_kchunk_union_sharded``).
+
+    Handler ABI 7: no control operand.  ``dst`` is this rank's block of a
+    caller-allocated output, aliased to the result and donated; the control
+    ``{ctx, ds_id, n_kchunk, N_file, offset[n][N], count[n][N]}`` (this rank's
+    own counts) is posted under ``dst``'s address (cpp/phdf5/ctx.h POSTED
+    CONTROL), so neither table is placed on the device.
     """
-    require_control_i64("read_kchunk_union handle", handle, ndim=1, length=2)
-    require_control_i64("read_kchunk_union offset_base", offset_base, ndim=2)
-    require_control_i64("read_kchunk_union count_base", count_base, ndim=2)
-    return jax.ffi.ffi_call(_TARGET_READ_KCHUNK_UNION, out_struct)(
-        handle,
-        offset_base,
-        count_base,
+    return jax.ffi.ffi_call(_TARGET_READ_KCHUNK_UNION,
+                            jax.ShapeDtypeStruct(dst.shape, dst.dtype),
+                            input_output_aliases={0: 0})(
+        dst,
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -560,45 +559,61 @@ def read_kchunk_union_sharded(
     dtype,
     mesh: Mesh,
     file_partition_spec: P,
-    count_partition_spec: P | None = None,
-) -> Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
+) -> Callable:
     """See ``_read_kchunk_union_sharded_cached`` for impl; this wrapper
-    normalises Sequence args to tuples for lru_cache hashability.
+    normalises Sequence args to tuples for lru_cache hashability and posts
+    each call's control (handler ABI 7).
 
-    ``count_partition_spec`` (optional): partition spec for the
-    ``count_base`` argument.  Defaults to ``P()`` (fully replicated; all
-    ranks see the same global counts table, as the original API).  Pass
-    ``P(('x','y'), None)`` (or any other sharding on the leading
-    n_kchunk axis) when the caller wants per-rank counts — useful when
-    a rank's read window must be clamped to the on-disk file extent
-    (e.g. ``mnband`` not divisible by world_size).  The ``count_base``
-    global shape must then be ``(world * n_kchunk, ndim_file)``; each
-    rank receives its ``(n_kchunk, ndim_file)`` slice.
+    Returns ``reader(dst, offsets, counts_local) -> (array, done)``:
+    ``dst`` is the caller-allocated destination (global shape = the slab
+    shape with ``n_kchunk`` inserted at ``kchunk_axis``; donated),
+    ``offsets`` the ``(n_kchunk, ndim_file)`` window origins (same on every
+    rank) and ``counts_local`` THIS rank's ``(n_kchunk, ndim_file)`` counts
+    (a rank's window may be clamped to the file extent, so counts differ per
+    rank).  Both are host values: they are posted, never placed.
     """
-    if count_partition_spec is None:
-        count_partition_spec = P()
+    from ffi.common import ffi_loader
     # ``fh``/``ds_name`` resolve to the runtime handle HERE, outside the
-    # compiled-closure cache.  That is the whole fix: the jitted closure
-    # below is keyed on GEOMETRY only, so two files, two datasets, or two
-    # processes with different heap addresses now share one compiled
-    # module instead of forking one each.  The dataset open stays memoised
-    # on ``(fh, ds_name)`` so the collective H5Dopen count does not change
-    # (this wrapper runs on every ``read_slabs`` call).
+    # compiled-closure cache: the jitted closure is keyed on GEOMETRY only,
+    # so two files, datasets or processes share one compiled module.  The
+    # dataset open stays memoised on ``(fh, ds_name)`` so the collective
+    # H5Dopen count does not change (this wrapper runs on every
+    # ``read_slabs`` call).
     ds_id = _open_dataset_memo(int(fh), str(ds_name), mesh)
-    handle = handle_vector(int(fh), ds_id, mesh)
+    n, ndim = int(n_kchunk), len(per_rank_file_shape)
     inner = _read_kchunk_union_sharded_cached(
-        n_kchunk=int(n_kchunk), kchunk_axis=int(kchunk_axis),
+        n_kchunk=n, kchunk_axis=int(kchunk_axis),
         file_global_shape=tuple(int(s) for s in file_global_shape),
         per_rank_file_shape=tuple(int(s) for s in per_rank_file_shape),
         dtype=jnp.dtype(dtype),
         mesh=mesh, file_partition_spec=file_partition_spec,
-        count_partition_spec=count_partition_spec,
     )
+    platform = _platform_for_mesh(mesh)
 
-    # The handle is HIDDEN: callers keep the two-argument
-    # ``reader(offset_base, count_base)`` shape they already have.
-    def _reader(offset_base: jax.Array, count_base: jax.Array):
-        return inner(handle, offset_base, count_base)
+    def _reader(dst: jax.Array, offsets, counts_local):
+        off = np.asarray(offsets, dtype=np.int64)
+        cnt = np.asarray(counts_local, dtype=np.int64)
+        if off.shape != (n, ndim) or cnt.shape != (n, ndim):
+            raise ValueError(
+                f"read_kchunk_union: offsets {off.shape} / counts {cnt.shape}; want "
+                f"({n}, {ndim}) each (this rank's own counts)")
+        shards = dst.addressable_shards
+        if len(shards) != 1:
+            raise ValueError(
+                f"GATE phdf5_posted_control: got: {len(shards)} addressable shards; "
+                f"want: one device per process (a posted control is keyed by this "
+                f"rank's one buffer address)")
+        address = int(shards[0].data.unsafe_buffer_pointer())
+        control = (int(fh), int(ds_id), n, ndim,
+                   *(int(v) for v in off.ravel()), *(int(v) for v in cnt.ravel()))
+        ffi_loader.phdf5_post_control(address, "read_kchunk_union", control,
+                                      platform=platform)
+        try:
+            return inner(dst)
+        except BaseException:
+            ffi_loader.phdf5_retract_control(address, "read_kchunk_union",
+                                             platform=platform)
+            raise
 
     return _reader
 
@@ -680,9 +695,8 @@ def _read_kchunk_union_sharded_cached(
     dtype,
     mesh: Mesh,
     file_partition_spec: P,
-    count_partition_spec: P = P(),
-) -> Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
-    """Build a jitted ``f(handle, offset_base, count_base) → (array, done)`` callable
+) -> Callable[[jax.Array], tuple[jax.Array, jax.Array]]:
+    """Build a jitted ``f(dst) → (array, done)`` callable
     that issues **ONE** ``H5Dread`` for ``n_kchunk`` per-k windows via
     ``H5S_SELECT_OR``.  Correctness preconditions — see below.
 
@@ -719,11 +733,9 @@ def _read_kchunk_union_sharded_cached(
     Returns
     -------
     callable
-        ``f(handle, offset_base, count_base)``; ``handle`` is the ``(2,)``
-        ``[ctx_handle, ds_id]`` vector (replicated, ``P()``) and the other
-        two are ``(n_kchunk, ndim_file) int64``.  Callers should reach this
-        through :func:`read_kchunk_union_sharded`, which supplies the
-        handle and preserves the two-argument call shape.
+        ``f(dst)``; ``dst`` is the donated destination (handler ABI 7: the
+        control is posted under its address by
+        :func:`read_kchunk_union_sharded`, the only way to reach this).
         Output shape is ``per_rank_file_shape`` with ``n_kchunk`` inserted
         at ``kchunk_axis``; partition spec gets ``None`` inserted at the
         same position.  ``done`` holds at most one element per rank, sliced
@@ -751,11 +763,9 @@ def _read_kchunk_union_sharded_cached(
     out_partition_spec = P(*_insert_at(
         list(file_partition_spec), kchunk_axis, None))
 
-    def _per_rank(handle_local, offset_base_local, count_base_local):
+    def _per_rank(dst_local):
         out = ffi_read_kchunk_union_call(
-            out_struct,
-            handle_local,
-            offset_base_local, count_base_local,
+            dst_local,
             mesh_shape=(p, q),
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat,
@@ -764,12 +774,13 @@ def _read_kchunk_union_sharded_cached(
         )
         return out, out.reshape(-1)[:1]
 
+    del out_struct                      # the destination carries the shape
     return jax.jit(shard_map(
         _per_rank, mesh=mesh,
-        in_specs=(P(), P(), count_partition_spec),
+        in_specs=(out_partition_spec,),
         out_specs=(out_partition_spec, P(tuple(mesh.axis_names))),
         check_vma=False,
-    ))
+    ), donate_argnums=(0,))
 
 
 # =========================================================================

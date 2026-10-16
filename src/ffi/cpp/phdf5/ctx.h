@@ -335,8 +335,8 @@ bool ctx_is_live(const PhdfCtx* ctx, size_t* n_live);
 bool staging_totals(const PhdfCtx* ctx, size_t* n_live, size_t* pinned_bytes);
 
 // ─── POSTED CONTROL (handler ABI 7) ──────────────────────────────────────
-// The read, read_multi, write and write_independent handlers take NO control
-// operand.  SlabIO posts each call's control values (ctx, dataset ids,
+// The read, read_multi, read_kchunk_union, write and write_independent
+// handlers take NO control operand.  SlabIO posts each call's control values (ctx, dataset ids,
 // origin, valid extent) here through a ctypes entry point, keyed by the
 // address of the call's OWN data buffer and the handler kind: the output the
 // caller allocated and aliased into the call (reads), or the operand (writes).
@@ -349,6 +349,7 @@ bool staging_totals(const PhdfCtx* ctx, size_t* n_live, size_t* pinned_bytes);
 // posted for (an XLA copy defeated the alias), or nothing was posted.
 enum ControlKind : int64_t {
     kCtlRead = 1, kCtlReadMulti = 2, kCtlWrite = 3, kCtlWriteIndependent = 4,
+    kCtlReadKchunkUnion = 5,
 };
 // A write's control is {ctx, ds_id, offset[N], valid_shape[N]} and may carry
 // ONE trailing flags word.  kWriteFlagRequireFinite: the writer thread checks

@@ -80,6 +80,15 @@
 //                library would receive one Arg where it expects three: refused
 //                by name at load instead.
 //
+//   ABI 7 -> 8   (2026-10-16, slabmr/w8).  PhdfReadKchunkUnion lost its three
+//                S64 control operands (handle, offset table, count table) and
+//                takes one destination aliased to its result; SlabIO posts
+//                {ctx, ds_id, n_kchunk, N_file, offsets, this rank's counts}
+//                under the destination's address (ctx.h kCtlReadKchunkUnion).
+//                An ABI-7 library -- including one built from the first ABI-7
+//                trees, whose union handler still took operands -- would get
+//                one Arg where it expects three; refused by name at load.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -104,4 +113,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 7
+#define LORRAX_FFI_ABI_VERSION 8

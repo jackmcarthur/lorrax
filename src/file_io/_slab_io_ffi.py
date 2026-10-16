@@ -1397,8 +1397,44 @@ def _file_order_plan(shape, vshape, spec, itemsize, p, mesh_axes, ds_shape,
     return None
 
 
+def _piece_schedule(k, vshape, steps, rows):
+    """The ``(idx..., c0)`` loop of a file-order plan as a static mixed radix.
+
+    Piece ``j`` of the loop (axes before ``k`` outermost, ``c0`` innermost,
+    the order ``_file_order_pieces`` and ``_read_file_rows`` walk) starts at
+    ``min(i_a * steps[a], vshape[a] - steps[a])`` on each axis ``a < k`` and at
+    ``ic * rows`` on axis ``k``, where ``(i_0, ..., i_{k-1}, ic)`` are the
+    digits of ``j`` in this radix.  Shape-determining, so it is static: the
+    piece programs compute their slice starts from a device-resident counter
+    and no start vector is placed per piece.
+    """
+    radix = tuple(-(-int(vshape[a]) // int(steps[a])) for a in range(k))
+    lim = tuple(int(vshape[a]) - int(steps[a]) for a in range(k))
+    return (int(k), radix, tuple(int(s) for s in steps), lim,
+            -(-int(vshape[k]) // int(rows)), int(rows))
+
+
+def _schedule_starts(j, schedule, n):
+    """Slice starts of piece ``j`` (a traced int32 scalar) under ``schedule``."""
+    k, radix, steps, lim, nc, rows = schedule
+    starts = [jnp.int32(0)] * n
+    rest = j // nc
+    for a in reversed(range(k)):
+        starts[a] = jnp.minimum((rest % radix[a]) * steps[a], lim[a]).astype(jnp.int32)
+        rest = rest // radix[a]
+    starts[k] = ((j % nc) * rows).astype(jnp.int32)
+    return starts
+
+
 @functools.lru_cache(maxsize=None)
-def _file_order_take(mesh, shape, dtype, k, sizes, height, spec):
+def _piece_counter(mesh):
+    """Piece counter zero, computed on the device (no host-to-device copy)."""
+    return jax.jit(lambda: jnp.zeros((), jnp.int32),
+                   out_shardings=NamedSharding(mesh, P()))
+
+
+@functools.lru_cache(maxsize=None)
+def _file_order_take(mesh, shape, dtype, k, sizes, height, spec, schedule):
     """Slice on owned shards, then exchange bounded pieces into file rows.
 
     The dynamic slice must be inside the manual region: a global slice
@@ -1412,6 +1448,10 @@ def _file_order_take(mesh, shape, dtype, k, sizes, height, spec):
     local_sizes = tuple(int(sizes[d]) // math.prod(
         int(mesh.shape[a]) for a in (source[d] or ())) for d in range(n))
     present = source[k] or ()
+
+    def take(a, j):
+        # Starts from the device-resident piece counter (``_piece_schedule``).
+        return piece(a, _schedule_starts(j, schedule, n)), j + 1
 
     def piece(a, starts):
         out = jax.lax.dynamic_slice(a, [starts[i] for i in range(n)], local_sizes)
@@ -1445,10 +1485,11 @@ def _file_order_take(mesh, shape, dtype, k, sizes, height, spec):
                     out, jax.lax.axis_index(ax) * (out.shape[k] // mesh.shape[ax]),
                     out.shape[k] // mesh.shape[ax], axis=k)
         return out
-    sm = shard_map(piece, mesh=mesh, in_specs=(spec, P()),
-                   out_specs=target.spec, check_vma=False)
-    return jax.jit(sm, in_shardings=(NamedSharding(mesh, spec),
-                                   NamedSharding(mesh, P())), out_shardings=target)
+    rep = NamedSharding(mesh, P())
+    sm = shard_map(take, mesh=mesh, in_specs=(spec, P()),
+                   out_specs=(target.spec, P()), check_vma=False)
+    return jax.jit(sm, in_shardings=(NamedSharding(mesh, spec), rep),
+                   out_shardings=(target, rep))
 
 
 def _file_order_move_supported(spec, shape, k, mesh):
@@ -1474,8 +1515,9 @@ def _file_order_pieces(A, off, vshape, plan, mesh):
     p = int(mesh.size)
     whole = _spec_axes(A.sharding.spec, A.ndim)[k] is not None
     lead_axis = max((a for a in range(k) if int(vshape[a]) > 1), default=None)
-    rep = NamedSharding(mesh, P())
     steps = [lead if a == lead_axis else 1 for a in range(k)]
+    schedule = _piece_schedule(k, vshape, steps, rows)
+    j = _piece_counter(mesh)()
     for idx in itertools.product(*(range(0, int(vshape[a]), steps[a]) for a in range(k))):
         # A short last lead block starts earlier, so every piece has one
         # compiled shape and stays inside the valid extent; the rows it
@@ -1486,13 +1528,13 @@ def _file_order_pieces(A, off, vshape, plan, mesh):
             take_k = int(A.shape[k]) if whole else real
             sizes = tuple(steps) + (take_k,) + tuple(int(d) for d in A.shape[k + 1:])
             take = _file_order_take(mesh, tuple(int(d) for d in A.shape), A.dtype, k,
-                                    sizes, -(-take_k // p) * p, A.sharding.spec)
-            starts = device_put_process_local_cached(
-                np.asarray(idx + (c0,) + (0,) * (A.ndim - k - 1), dtype=np.int32), rep)
+                                    sizes, -(-take_k // p) * p, A.sharding.spec,
+                                    schedule)
             p_off = (tuple(int(off[a]) + idx[a] for a in range(k))
                      + (int(off[k]) + c0,) + tuple(int(o) for o in off[k + 1:]))
             p_valid = tuple(steps) + (real,) + tuple(int(v) for v in vshape[k + 1:])
-            yield take(A, starts), p_off, p_valid
+            piece, j = take(A, j)
+            yield piece, p_off, p_valid
 
 
 
@@ -1520,7 +1562,7 @@ def _file_order_read_plan(shape, vshape, spec, itemsize, mesh, ds_shape):
 
 @functools.lru_cache(maxsize=None)
 def _file_order_read_insert(mesh, shape, dtype, spec, k, compact_shape,
-                            carrier_shape, real_rows):
+                            carrier_shape, real_rows, schedule):
     """Pad one compact file piece, inverse-exchange it and donate its owner.
 
     Staging scales as one bounded piece/P, independent of total k rows and
@@ -1532,7 +1574,8 @@ def _file_order_read_insert(mesh, shape, dtype, spec, k, compact_shape,
     source = _spec_axes(spec, n)
     file_spec = P(*([None] * k), axes, *([None] * (n - k - 1)))
 
-    def insert(dst, piece, starts):
+    def insert(dst, piece, j):
+        starts = _schedule_starts(j, schedule, n)    # device-resident counter
         pad = [(0, int(carrier_shape[d]) - int(compact_shape[d]))
                for d in range(n)]
         piece = jnp.pad(piece, pad)
@@ -1548,15 +1591,15 @@ def _file_order_read_insert(mesh, shape, dtype, spec, k, compact_shape,
                                           concat_axis=k, tiled=True)
         piece = jax.lax.slice_in_dim(piece, 0, real_rows, axis=k)
         return jax.lax.dynamic_update_slice(dst, piece,
-                                            [starts[d] for d in range(n)])
+                                            [starts[d] for d in range(n)]), j + 1
 
     sm = shard_map(insert, mesh=mesh, in_specs=(spec, file_spec, P()),
-                   out_specs=spec, check_vma=False)
+                   out_specs=(spec, P()), check_vma=False)
     return jax.jit(sm, donate_argnums=(0,),
                    in_shardings=(NamedSharding(mesh, spec),
                                  NamedSharding(mesh, file_spec),
                                  NamedSharding(mesh, P())),
-                   out_shardings=NamedSharding(mesh, spec))
+                   out_shardings=(NamedSharding(mesh, spec), NamedSharding(mesh, P())))
 
 
 def _normalize_slab_request(
@@ -2067,6 +2110,18 @@ def _local_address(a) -> int:
 
 #: Trailing write-control flag (cpp/phdf5/ctx.h kWriteFlagRequireFinite).
 _WRITE_REQUIRE_FINITE = 1
+
+
+def _mesh_position(mesh) -> int:
+    """This process's device's row-major position in ``mesh.devices``: the
+    shard index of an axis sharded over ``tuple(mesh.axis_names)``."""
+    mine = [i for i, d in enumerate(mesh.devices.flat)
+            if d.process_index == jax.process_index()]
+    if len(mine) != 1:
+        raise ValueError(
+            f"GATE phdf5_posted_control: got: {len(mine)} devices of this process in "
+            f"the mesh; want: one device per process (the FFI tier's geometry)")
+    return mine[0]
 
 
 def _posted(platform, address, kind, values, call):
@@ -2948,7 +3003,14 @@ class _FfiBackend(_DatasetGeometry):
         require_finite: bool = False,
     ) -> None:
         if not isinstance(A, jax.Array):
-            A = jnp.asarray(A)
+            # Host data: staged replicated from this process's own copy, once
+            # (``_onto_handle_mesh``'s first case without the detour through one
+            # device and back to the host).  Dtype as ``jnp.asarray`` gives it.
+            host = np.asarray(A)
+            canonical = jax.dtypes.canonicalize_dtype(host.dtype)
+            if host.dtype != canonical:
+                host = host.astype(canonical)
+            A = device_put_process_local(host, _replicated_sharding(self.mesh, host.ndim))
         if (not isinstance(A.sharding, NamedSharding)
                 or A.sharding.mesh is not self.mesh):
             A = _onto_handle_mesh(A, self.mesh, name)
@@ -3261,7 +3323,11 @@ class _FfiBackend(_DatasetGeometry):
         mesh_shape = tuple(mesh.shape[a] for a in mesh.axis_names)
         ctl = (self.fh, self._ds_id(name, readonly=True))
         platform = self._platform()
-        result = jnp.zeros(shape, dtype, device=NamedSharding(mesh, spec))
+        # Computed zeros (no fill value passed as a jit argument).
+        result, = _get_destinations(mesh, (spec,), (tuple(int(s) for s in shape),),
+                                    (jnp.dtype(dtype),))()
+        schedule = _piece_schedule(k, vshape, steps, rows)
+        j = _piece_counter(mesh)()
         with _large_read_progress(self.path, name,
                 global_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize,
                 local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p) as watch:
@@ -3287,12 +3353,9 @@ class _FfiBackend(_DatasetGeometry):
                                              (jnp.dtype(dtype),))()
                     piece = _posted(platform, _local_address(dst), "read",
                                     (*ctl, *p_off, *valid), lambda: read(dst))
-                    starts = device_put_process_local(np.asarray(
-                        idx + (c0,) + (0,) * (n - k - 1), np.int32),
-                        NamedSharding(mesh, P()))
                     insert = _file_order_read_insert(mesh, shape, jnp.dtype(dtype),
-                        spec, k, compact, carrier, real)
-                    result = insert(result, piece, starts)
+                        spec, k, compact, carrier, real, schedule)
+                    result, j = insert(result, piece, j)
                     landed = result
             if landed is not None:
                 watch(landed)
@@ -3452,36 +3515,33 @@ class _FfiBackend(_DatasetGeometry):
                 axis_flat=axis_flat, mesh_shape=mesh_shape),
             valid_shapes=valid_t)
 
-        # BOTH tables staged PROCESS-LOCALLY.  ``jax.device_put`` of host
-        # numpy onto a multi-process sharding runs JAX's hidden
-        # ``assert_equal`` all-gather (scorecard AA.1/Y.3) — a blocking
-        # collective per call on buffers that are identical (offsets) or
-        # exactly this rank's own rows (counts) by construction.  The counts
-        # table is the expensive one to assert: P x (world x n_windows) x
-        # ndim x 8 B is O(P^2), 18.9 MB at P=64 and 95.5 MB at P=144.
-        # ``LORRAX_CHECK_REPLICA=1`` re-arms the assertion.
-        counts_spec = P(tuple(mesh.axis_names), None)
-        offsets_dev = device_put_process_local(
-            offsets_t, NamedSharding(mesh, P(None, None)))
-        counts_dev = device_put_process_local(
-            counts, NamedSharding(mesh, counts_spec))
+        # Handler ABI 7: neither table is placed.  The offsets and THIS rank's
+        # own rows of the counts table are posted under the destination's
+        # address (cpp/phdf5/ctx.h POSTED CONTROL); the destination is
+        # allocated here and donated, as read_slab's.
+        from ffi.io import _insert_at
+        n_win = int(offsets_t.shape[0])
+        me = _mesh_position(mesh)
+        counts_local = np.asarray(counts)[me * n_win:(me + 1) * n_win]
+        out_shape = tuple(_insert_at(list(slab_shape), int(window_axis), n_win))
+        out_spec = P(*_insert_at(list(partition_spec), int(window_axis), None))
+        dst, = _get_destinations(mesh, (out_spec,), (out_shape,), (jnp.dtype(dtype),))()
 
         reader = read_kchunk_union_sharded(
             self.fh, name,
-            n_kchunk=int(offsets_t.shape[0]),
+            n_kchunk=n_win,
             kchunk_axis=int(window_axis),
             file_global_shape=ds_shape,
             per_rank_file_shape=per_rank_shape,
             dtype=dtype,
             mesh=mesh,
             file_partition_spec=partition_spec,
-            count_partition_spec=counts_spec,
         )
         # No ``block_until_ready`` here, unlike read_slab: the union handler
         # returns an async ``ffi::Future`` and the caller's next op is what
         # sequences it (measured ~1% end-to-end, read_ffi.cc:819-829).
         # Blocking would be a behaviour change dressed as symmetry.
-        result, done = reader(offsets_dev, counts_dev)
+        result, done = reader(dst, offsets_t, counts_local)
         # The read runs on this file's native worker thread; another
         # handle's next HDF5 call waits for it (_CollectiveLane).
         _LANE.track_read(self._dispatcher, done)

@@ -333,7 +333,7 @@ class FfiLibraryNotBuilt(FileNotFoundError):
 #: this boundary is unavoidable; what IS avoidable is the mirror drifting
 #: silently, and ``tests/test_ffi_abi_stamp.py`` parses the header and fails if
 #: these two numbers disagree.
-LORRAX_FFI_ABI_VERSION = 7
+LORRAX_FFI_ABI_VERSION = 8
 
 #: platform -> the C entry point that reports the library's ABI.  Per leg on
 #: purpose: both libraries are dlopened RTLD_GLOBAL in a GPU process and
@@ -1130,7 +1130,8 @@ def phdf5_staging_totals(ctx_handle: int = 0,
 
 
 #: Handler kinds of the posted-control registry (cpp/phdf5/ctx.h ControlKind).
-PHDF5_CONTROL_KIND = {"read": 1, "read_multi": 2, "write": 3, "write_independent": 4}
+PHDF5_CONTROL_KIND = {"read": 1, "read_multi": 2, "write": 3, "write_independent": 4,
+                      "read_kchunk_union": 5}
 
 
 def phdf5_post_control(address: int, kind: str, values, *, platform: str) -> None:

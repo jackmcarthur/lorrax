@@ -274,6 +274,44 @@ with SlabIO(PATH, mode="r", mesh=mesh) as io:
         matches_ref(m, expected(r)) for m, r in zip(many, requests(BATCH, lines[:8], 0, ndev)))
     jax.block_until_ready(busy)
 verdict("posted_reads_behind_queue", ok)
+# read_slabs (k-chunk union reader, asynchronous worker) on posted control behind the
+# queue: two disjoint field windows of real_f64, the window axis before the fields.
+WIN = [(0, 2), (2, 2)]
+ref64 = ref(100, (NQ, FIELDS, ROWS, 4), np.float64)
+# Expected exactly: ONE post, of kind read_kchunk_union (through ffi.io, which
+# posts for the union reader; SlabIO's _posted carries none), no placement, and
+# no control left pending once the read has landed.
+from ffi.common import ffi_loader as _fl
+from ffi.io import _platform_for_mesh as _pfm
+union_posts = []
+_post0 = _fl.phdf5_post_control
+
+
+def _counted_post(address, kind, values, *, platform):
+    union_posts.append(kind)
+    return _post0(address, kind, values, platform=platform)
+
+
+with SlabIO(PATH, mode="r", mesh=mesh) as io:
+    jax.block_until_ready(_busy(hx))
+    busy = _busy(hx)
+    _fl.phdf5_post_control = _counted_post
+    try:
+        with Count() as c_us:
+            u = io.read_slabs("real_f64", shape=(ndev, 2, ROWS, 4),
+                              offsets=[(0, f0, 0, 0) for f0, _ in WIN],
+                              valid_shapes=[(min(ndev, NQ), nf, ROWS, 4) for _, nf in WIN],
+                              partition_spec=BATCH, window_axis=1)
+    finally:
+        _fl.phdf5_post_control = _post0
+    want = np.stack([ref64[:ndev, f0:f0 + nf] for f0, nf in WIN], axis=1)
+    okU = matches_ref(u, want)
+    jax.block_until_ready((u, busy))
+    pend_u = _fl.phdf5_pending_controls(platform=_pfm(mesh))
+verdict("read_slabs_posted_behind_queue",
+        okU and union_posts == ["read_kchunk_union"] and c_us.posts == 0
+        and pend_u == 0 and c_us.puts == 0,
+        f"posts={union_posts} slabio_posts={c_us.posts} pending={pend_u} puts={c_us.puts}")
 RPATH = os.path.join(OUT, f"posted_race_gate_P{ndev}.h5")
 blk = full[:ndev]
 B0 = jax.make_array_from_callback(blk.shape, jax.sharding.NamedSharding(mesh, row_spec),
@@ -287,6 +325,58 @@ with SlabIO(RPATH, mode="r", mesh=mesh) as rio:
     back = rio.read_slab("w", shape=blk.shape, offset=(0, 0, 0, 0), dtype=np.complex128,
                          partition_spec=P(None, None, None, None))
 verdict("posted_write_behind_queue", np.array_equal(np.asarray(back.addressable_shards[0].data), blk))
+# File-order pieces (writes) and file rows (reads) with slice starts computed in the
+# piece programs from a device-resident counter: no placement per piece.  A small
+# piece budget forces the plans on small arrays: case A cuts lead-axis pieces whose
+# last one is clamped back inside the extent; case B cuts several row pieces, the
+# last one short.  P=1 never cuts pieces (one rank's write is one run).
+from jax.sharding import NamedSharding as _NS
+
+
+def _file_order_case(tag, shape, budget, min_run):
+    spec = P(None, None, None, tuple(mesh.axis_names))
+    full = ref(7, shape, np.complex128)
+    A = jax.make_array_from_callback(shape, _NS(mesh, spec), lambda idx: full[idx])
+    path = os.path.join(OUT, f"file_order_{tag}_P{ndev}.h5")
+    saved = sff._file_order_plan.__defaults__
+    orig = (sff.device_put_process_local, sff.device_put_process_local_cached)
+    puts = [0]
+
+    def counted(f):
+        def g(*a, **k):
+            puts[0] += 1
+            return f(*a, **k)
+        return g
+    sff._file_order_plan.__defaults__ = (budget, min_run)
+    sff.device_put_process_local, sff.device_put_process_local_cached = map(counted, orig)
+    try:
+        plan = sff._file_order_plan(shape, shape, sff._spec_axes(spec, len(shape)), 16, ndev,
+                                    tuple(mesh.axis_names), shape)
+        with SlabIO(path, mode="w", mesh=mesh) as w:
+            w.create_dataset(tag, shape=shape, dtype=np.complex128)
+            w.write_slab(tag, A, offset=(0,) * len(shape))
+        with SlabIO(path, mode="r", mesh=mesh) as r:
+            back = r.read_slab(tag, shape=shape, offset=(0,) * len(shape),
+                               dtype=np.complex128, partition_spec=spec)
+            ok_back = matches_ref(back, full)
+    finally:
+        sff._file_order_plan.__defaults__ = saved
+        sff.device_put_process_local, sff.device_put_process_local_cached = orig
+    barrier(f"read_multi_gate.file_order_{tag}")
+    ok_raw = True
+    if rank == 0:
+        import h5py
+        with h5py.File(path, "r") as f:
+            ok_raw = bool(np.array_equal(f[tag][()], full))
+    if ndev == 1:
+        verdict(f"file_order_{tag}", plan is None and ok_back and ok_raw, "P=1: no pieces")
+    else:
+        verdict(f"file_order_{tag}", isinstance(plan, tuple) and ok_back and ok_raw and puts[0] == 0,
+                f"plan={plan} back={ok_back} raw={ok_raw} puts={puts[0]}")
+
+
+_file_order_case("lead_clamped", (5, 3, 8, 48), 3584, 512)      # steps (1, 2): 2 -> 1
+_file_order_case("rows_short", (5, 3, 64, 48), 8192, 512)       # rows 40: 0, 40 (24 real)
 # write_slab(require_finite=True): the writer checks the bytes it holds.  A rank whose
 # block has a NaN writes nothing, still enters the collective, and every rank raises
 # at close; the finite dataset round-trips and no NaN reaches the file.

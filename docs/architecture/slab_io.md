@@ -636,8 +636,8 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
 
 ## Control operands and handle validation {#stream-race}
 
-**Since handler ABI 7 the read, read_multi and write handlers take no control
-operand.** SlabIO posts each call's control values (ctx, dataset id, origin,
+**Since handler ABI 7 the read, read_multi, read_kchunk_union and write handlers
+take no control operand.** SlabIO posts each call's control values (ctx, dataset id, origin,
 valid extent; read_multi: all N of them plus the N destination addresses)
 through `lrx_phdf5_post_control`, keyed by the address of the call's own
 buffer on this rank: a destination SlabIO allocated and donated, aliased to the
@@ -646,9 +646,14 @@ address of the buffer it was handed; a missing entry refuses
 (`GATE phdf5_posted_control`). No descriptor is placed on the device, the
 handler makes no D2H copy and no `xla_stream` sync, and the match does not
 depend on the order XLA runs the calls (an operand-free FIFO would: the CPU
-client runs ready programs concurrently). The k-chunk union reader still takes
-its offset/count tables as operands. The paragraphs below describe the operand
-form the k-chunk handlers keep.
+client runs ready programs concurrently). The k-chunk union reader
+(`read_slabs`) posts `{ctx, ds_id, n, ndim, offsets[n][ndim], counts[n][ndim]}`,
+the counts being this rank's own rows, and records a device-side order fence
+before its worker's copies (the operand copy-in's host sync used to order them).
+File-order pieces compute their slice starts in the piece program from a
+device-resident counter, so no start vector is placed per piece either. Only
+`phdf5_read_kchunk`, which has no caller, keeps the operand form the paragraphs
+below describe.
 
 `(ctx handle, ds_id)`, `offset` and `valid_shape` travel as replicated int64
 device operands rather than FFI attributes. As a result, one compiled
