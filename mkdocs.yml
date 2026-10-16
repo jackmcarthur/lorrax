@@ -107,6 +107,7 @@ nav:
       - Four-current heads and frequency: theory/four-current-head-corrections.md
       - TD-aGW interaction: theory/td_agw.md
       - TD-aGW propagation: theory/td_agw_propagation.md
+      - "BerkeleyGW ε⁻¹ export": theory/bgw_epsmat_export.md
   - Architecture:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md
