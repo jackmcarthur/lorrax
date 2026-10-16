@@ -466,7 +466,15 @@ def magnus_midpoint_step(explicit: Callable, state_part: Callable,
 
 def cfm4_step(explicit: Callable, state_part: Callable, conjugate: Callable,
               t, y, h, b_guess, *, n_corr):
-    """Fourth-order commutator-free Magnus step (CFET4:2).
+    """Commutator-free Magnus step CFET4:2, fourth order for the commutator flow alone.
+
+    Composed by :func:`strang_step` with a remainder that does not commute
+    with it (relaxation Γ ≠ 0, the TD-aGW intraband term) the step is second
+    order (measured 2.00 for any Γ ≠ 0; 2.0 on CrI3 with the intraband term).
+    It conjugates the whole y, so its rounding is about ε|y| per step: for a
+    small deviation Δy from a stationary y (weak-field Δρ) the relative error
+    has a floor of about (ε|y|/|Δy|)·√N_steps that rises as h shrinks
+    (3.4e-6 at 25 as to 1.3e-5 at 2 as on CrI3 at 100 V/m).
 
     y_{n+1} = V2 V1 y_n V1^H V2^H with
     V1 = exp(-i h (alpha2 H1 + alpha1 H2)) applied first,

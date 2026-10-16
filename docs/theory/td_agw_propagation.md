@@ -82,7 +82,7 @@ $n_b\times n_b$ `eigh` per k and two products.
 | `rk4` | classical Runge–Kutta | 4 | 4 | 0 | `lorrax.dt` |
 | `etdrk4` | Krogstad's exponential RK on the diagonal $L_{nm} = -i(E_n - E_m) - \Gamma_{nm}$ | 4 | 4 | 0 (diagonal) | `lorrax.dt` |
 | `magnus2` | exponential midpoint, self-consistent midpoint $H$ | 2 | `n_corr` | `n_corr` + 1 | `lorrax.dt` |
-| `cfm4` | commutator-free Magnus CFET4:2 at the Gauss nodes | 4 | 2 `n_corr` | 4 `n_corr` + 2 | `lorrax.dt` |
+| `cfm4` | commutator-free Magnus CFET4:2 at the Gauss nodes | 4 with Γ = 0 and the intraband term off, above the rounding floor; 2 otherwise | 2 `n_corr` | 4 `n_corr` + 2 | `lorrax.dt` |
 
 **`dp54` reproduces TDGW's run.** The tableau, the error norm (RMS over the
 logical entries, $\mathrm{atol} + \mathrm{rtol}\,\max(|y|, |y_\mathrm{new}|)$),
@@ -106,8 +106,11 @@ steps (quadratic through the last three midpoints for `magnus2`, cubic
 through the last two steps' four Gauss-node values for `cfm4`), and each
 correction propagates $\rho_n$ to the node(s) and re-evaluates ΔΣ there.
 Each correction gains one order of $h$, so the cubic predictor plus one
-correction gives order 4; without a correction the scheme is unstable, and
-`n_corr` < 1 refuses. The extrapolation amplifies the predictor's error, so
+correction gives order 4 for the commutator flow (Γ = 0, intraband term off):
+measured 4.5–5.5 with one correction and 3.95–3.99 with two on the unit test,
+4.2–4.5 and 4.0 in an independent synthetic Liouville check. Without a
+correction the history holds only predicted values and the scheme does not
+converge, so `n_corr` < 1 refuses. The extrapolation amplifies the predictor's error, so
 one correction contracts it only while $h\,\lVert\partial\Delta\Sigma/\partial\rho\rVert$
 is small: with the CrI3 COHSEX kernel (6×6 k, 2v2c) `cfm4` with one
 correction diverges from 50 as, while two corrections are stable to 300 as.
@@ -116,7 +119,11 @@ before the history exists, take three extra corrections. Relaxation and the
 intraband term are not commutators; they enter by Strang splitting
 $R(h/2)\,M(h)\,R(h/2)$, with $R$ the exact relaxation around an RK4 step of
 the intraband flow, so with either one active the global order is 2 with an
-error constant set by the size of $[M, R]$.
+error constant set by the size of $[M, R]$: measured 2.00 for any Γ ≠ 0 on the
+synthetic check, and on CrI3 with the intraband term 2.0 at 5e8 V/m (1 to
+10 as) and 2.01–2.03 at 5e9 V/m (5 to 50 as). `cfm4` is therefore fourth
+order only with Γ = 0, the intraband term off (or negligible) and errors above
+the rounding floor below.
 
 ### Three accuracy limits {#accuracy-limits}
 
@@ -132,11 +139,17 @@ amplitude matters.
 
 **Rounding floor of the Magnus schemes.** `magnus2` and `cfm4` conjugate the
 whole ρ, whose O(1) occupations set the absolute rounding of every
-exponential, while the induced coherence in weak-field linear response is
-small (|ρ_cv| ~ 1e-6). Each step therefore adds a relative error of order
-ε/|ρ_cv|, and the P(t) error stops falling near 1e-8 after 10⁴ steps; RK4,
-ETDRK4 and DP54 add small increments and reach 1e-11. The floor is far below
-spectroscopic tolerances. The cure is the interaction picture on
+exponential (ε ≈ 1.1e-16 per entry), while the coherence a weak field induces
+is small: |ρ_cv| ≈ 1e-9 on CrI3 for a 100 as pulse at 100 V/m, ≈ 1e-6 on the
+synthetic window at 1e5 V/m. The rounding accumulates as a random walk, so
+the relative P(t) error has a floor of about (ε/|ρ_cv|)·√N_steps, ∝ 1/E₀,
+that rises as the step shrinks. On CrI3 at 100 V/m over 30 fs `cfm4` (two
+corrections) is lowest at 25 as, 3.4e-6 after 1200 steps, and rises to
+1.3e-5 at 2 as after 15000 steps (exponent 0.53 in N; the estimate gives
+2.7e-6 and 9.7e-6); the same runs at 5e8 V/m reach 1.6e-9 at 1 as. On the
+synthetic window the floor is 2.5e-8 at 5 as. RK4, ETDRK4 and DP54 add small
+increments to Δρ and reach 1e-11 on CrI3 at 100 V/m. The cure is the
+interaction picture on
 Δρ = ρ − ρ^eq: integrate diag(E^QP) as exact phases, take exponentials of the
 small coupling only, and update
 Δρ ← P (U Δρ U^† + [U − 1, ρ^eq] U^†) P^†, every term of the size of Δρ
