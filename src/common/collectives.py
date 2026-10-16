@@ -782,7 +782,10 @@ def _psum_kernel(ndim: int, mesh):
         @partial(shard_map, mesh=mesh, in_specs=(P(axes, *rest),),
                  out_specs=P(*rest), check_vma=False)
         def _body(x):
-            return jax.lax.psum(x[0], axes)
+            # Rank-order sum (lxkit.ordered_psum): the library all-reduce's order
+            # follows the GCD placement (det lane 2026-10-16: the exact Hartree's rho).
+            from lxkit import ordered_psum
+            return ordered_psum(x[0], axes)
 
         fn = jax.jit(_body)
         _PSUM_KERNELS[key] = fn

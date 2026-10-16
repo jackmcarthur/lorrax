@@ -37,6 +37,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import io_callback
 from common.collectives import to_transpose_partner
+from lxkit import ordered_psum_scatter
 from jax import shard_map
 from common.wfn_layout import (band_sphere_spec, PSI_NMU_SPEC, PSI_MUNT_SPEC,
                                PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC)
@@ -1018,7 +1019,10 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
             X = jnp.moveaxis(X, 0, 1).reshape(bc_w, ns, mu_pad)
             # One reduce-scatter onto the x-major 1/P μ slice (ψ_x); on the
             # square mesh the y-major slice (ψ_y) is the transpose partner's.
-            Xs = jax.lax.psum_scatter(X, XY, scatter_dimension=2, tiled=True)
+            # Rank-order sum (lxkit.collectives): RCCL's reduce-scatter adds the P partial
+            # DFTs in an order taken from the GCDs' topology, and the ISDF fit amplifies
+            # its 1-ulp spread (Fe V2: zeta 1e-8, eqp print flips; det lane 2026-10-16).
+            Xs = ordered_psum_scatter(X, XY, scatter_dimension=2, tiled=True)
             Xy = to_transpose_partner(Xs, px)
             Xx = jnp.conj(Xs)
             z = jnp.int32(0)

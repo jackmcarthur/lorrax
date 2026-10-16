@@ -250,7 +250,8 @@ def reduce_scatter_to_band_block(part, *, px: int, py: int,
     shape[ra:ra + 1] = [px, m // px]        # ra < ca: split the later first
     r = jnp.moveaxis(part.reshape(shape), (ra, ca + 1), (0, 1))
     r = r.reshape(px * py, *r.shape[2:])
-    return jax.lax.psum_scatter(r, axes, scatter_dimension=0, tiled=False)
+    from lxkit import ordered_psum_scatter     # rank order on every GCD placement
+    return ordered_psum_scatter(r, axes, scatter_dimension=0, tiled=False)
 
 
 # ---------------------------------------------------------------------------

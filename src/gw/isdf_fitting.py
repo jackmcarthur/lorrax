@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 import numpy as np
 import jax
+from lxkit import ordered_psum
 import jax.numpy as jnp
 import jax.experimental.multihost_utils  # noqa: F401  (sync_global_devices)
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -177,7 +178,7 @@ def add_pad_diagonal_sharded(C, active_mask, n_logical, *, mesh_xy):
         cols = jax.lax.axis_index('y') * nu_loc + jnp.arange(nu_loc)
         on_diag = rows[:, None] == cols[None, :]
         local_trace = jnp.sum(jnp.where(on_diag[None], c, 0), axis=(-2, -1))
-        trace = jax.lax.psum(local_trace, ('x', 'y'))
+        trace = ordered_psum(local_trace, ('x', 'y'))     # rank order, any placement (lxkit)
         scale = (trace.real * inv_n).astype(c.dtype)
         pad_here = jnp.take(pad_rows_full, rows)
         mask = (on_diag & pad_here[:, None]).astype(c.dtype)
