@@ -115,15 +115,16 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "masked); masked and interval stay as the XLA references."),
     "active_gemm": Family(
         ("lorrax_active_gemm_",), "active_gemm",
-        _legs(("elsewhere", "cublas_local (this leg-neutral source builds on CUDA once listed)"),
-              ("built", ""), ("xla", "distrib_la._active_local (interval: ACTIVE_LOCAL_ROUTE)")),
+        _legs(("built", ""), ("built", ""),
+              ("xla", "distrib_la._active_local (interval: ACTIVE_LOCAL_ROUTE)")),
         gate="tests/test_active_local_native_gate.py (device vs masked vs interval vs dense on "
              "the same device, P=1 and P=4)", tol=1e-13,
         note="Sigma's active-range GEMM with DEVICE-side bounds: one run-time-compiled kernel "
              "(hipRTC / NVRTC via rtc_build), K loop clamped per row from the device bounds, "
              "weights applied on load; no host read or sync, no operand copy, no workspace. "
-             "Inner product on the FP64 matrix cores (MFMA f64 16x16x4, complex as the exact 4M "
-             "form) on gfx90a / gfx94x; the FMA path elsewhere (CUDA until a DMMA arm is gated). "
+             "Inner product on the FP64 matrix cores, complex as the exact 4M form: MFMA f64 16x16x4 "
+             "on gfx90a / gfx94x, DMMA m8n8k4 f64 on CUDA compute capability >= 8.0; the FMA "
+             "path elsewhere. "
              "ROCM's ACTIVE_LOCAL_ROUTE row."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",

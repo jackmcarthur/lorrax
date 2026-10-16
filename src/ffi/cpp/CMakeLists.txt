@@ -527,6 +527,9 @@ if(LORRAX_CUFFT_ON)
     add_library(build_kconv_mathdx_cuda OBJECT
         cufft/kconv_mathdx_cuda_ffi.cc
         cufft/kconv_outer_cuda_ffi.cc
+        # The active-range GEMM with DEVICE-side bounds (active_gemm/: the ROCM leg's
+        # leg-neutral source, NVRTC-built here; DMMA f64 on compute capability >= 8.0).
+        active_gemm/active_gemm_device_ffi.cc
         common/rtc_build.cc)
     set_target_properties(build_kconv_mathdx_cuda PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
@@ -538,7 +541,14 @@ if(LORRAX_CUFFT_ON)
     target_include_directories(build_kconv_mathdx_cuda PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/common"
+        "${CMAKE_CURRENT_BINARY_DIR}"
         "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    # The device-bounds active-range GEMM kernel as text for NVRTC (the ROCM leg's same rule).
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h" LRX_ACTIVE_GEMM_SRC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_src.h.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/generated/active_gemm_src.h" @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h")
     # The k-box stage's text for NVRTC (cufft/kbox_stage_src.h.in): regenerated whenever
     # kbox_stage.cuh changes, so the embedded header and the host launch rule are one file.
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh" LRX_KBOX_SRC)
