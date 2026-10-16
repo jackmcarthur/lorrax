@@ -63,6 +63,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
+from lxkit import ordered_sum
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
 from .band_partition import (
@@ -5068,7 +5069,8 @@ def _protected_residual_norms(H_out, H_in, mask_kn, eigvalsh_kshard):
     """
     fp = _masked_residual_mev(H_out, H_in, np.asarray(mask_kn, dtype=bool))
     spec = float(np.abs(np.asarray(eigvalsh_kshard(fp))).max())
-    frob = float(jnp.sqrt(jnp.sum(jnp.abs(fp) ** 2)))
+    # k-sharded fp: the cross-rank part of the sum in rank order (placement-independent bits)
+    frob = float(jnp.sqrt(ordered_sum(jnp.abs(fp) ** 2)))
     return spec, frob
 
 

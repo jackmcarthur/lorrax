@@ -28,6 +28,7 @@ from typing import Callable, NamedTuple
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import jax
+from lxkit import ordered_reduce
 import jax.numpy as jnp
 import numpy as np
 
@@ -306,6 +307,24 @@ def rcrop_nojit(
     )
 
 
+def _rows_sq_norm(a):
+    """Per row of a (k, *state) stack: sum |a|^2 over the state (a rank's partial)."""
+    return jnp.sum(jnp.abs(a) ** 2, axis=tuple(range(1, a.ndim)))
+
+
+def _rows_gram(a):
+    ax = tuple(range(1, a.ndim))
+    return jnp.tensordot(jnp.conj(a), a, axes=(ax, ax))
+
+
+def _rows_dot(a, f):
+    return jnp.tensordot(jnp.conj(a), f, axes=(tuple(range(1, a.ndim)), tuple(range(f.ndim))))
+
+
+def _sq_norm(v):
+    return jnp.sum(jnp.abs(v) ** 2)
+
+
 def _solve_alpha_filtered(Fw: jnp.ndarray, cond_max: float = 1.0e12):
     """``_solve_crop_alpha_stacked`` with the Walker-Ni conditioning filter.
 
@@ -320,16 +339,19 @@ def _solve_alpha_filtered(Fw: jnp.ndarray, cond_max: float = 1.0e12):
     bshape = (k,) + (1,) * (Fw.ndim - 1)
     f_new = Fw[-1]
     F_hist = Fw[:k]
-    hist_norms = np.asarray(jnp.sqrt(jnp.sum(jnp.abs(F_hist) ** 2, axis=ax)))
+    # Every reduction over the (sharded) state runs in rank order (lxkit.ordered_reduce):
+    # as jnp.sum/tensordot on the sharded history XLA added the ranks' partials with a
+    # library all-reduce in device-topology order, so the mixing step, and every later
+    # map, depended on the GCD placement (det lane 2026-10-16).
+    hist_norms = np.sqrt(np.asarray(ordered_reduce(_rows_sq_norm, F_hist)))
     valid = hist_norms > 1e-14
     F_prev = jnp.where(jnp.asarray(valid).reshape(bshape),
                        F_hist - f_new[None], 0.0 + 0.0j)
-    col = np.asarray(jnp.sqrt(jnp.sum(jnp.abs(F_prev) ** 2, axis=ax)))
+    col = np.sqrt(np.asarray(ordered_reduce(_rows_sq_norm, F_prev)))
     scale = np.where(col > 0.0, col, 1.0)
     F_s = F_prev / jnp.asarray(scale).reshape(bshape)
-    G = np.real(np.asarray(jnp.tensordot(jnp.conj(F_s), F_s, axes=(ax, ax))))
-    b = -np.real(np.asarray(jnp.tensordot(
-        jnp.conj(F_s), f_new, axes=(ax, tuple(range(f_new.ndim))))))
+    G = np.real(np.asarray(ordered_reduce(_rows_gram, F_s)))
+    b = -np.real(np.asarray(ordered_reduce(_rows_dot, F_s, f_new)))
     use = [i for i in range(k) if valid[i] and col[i] > 0.0]
     while use:
         Gu = G[np.ix_(use, use)]
@@ -431,7 +453,7 @@ def anderson_nojit(
         return v if metric is None else v * metric
 
     def _norm(v):
-        return float(jnp.sqrt(jnp.sum(jnp.abs(_weighted(v)) ** 2)))
+        return float(np.sqrt(np.asarray(ordered_reduce(_sq_norm, _weighted(v)))))
 
     fresh = resume is None
     if fresh:

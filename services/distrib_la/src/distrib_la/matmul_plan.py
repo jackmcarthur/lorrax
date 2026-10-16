@@ -26,6 +26,7 @@ from functools import partial
 from typing import Callable
 
 import jax
+from lxkit import ordered_psum_scatter
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -371,7 +372,7 @@ def _axis_matmul(a, b, c=None, *, alpha, beta, reduction_axis=None):
     scale = alpha if a.dtype.kind == "c" else alpha.real
     result = scale * jnp.matmul(a, b)
     if reduction_axis is not None:
-        result = jax.lax.psum_scatter(result, reduction_axis,
+        result = ordered_psum_scatter(result, reduction_axis,
             scatter_dimension=1 if reduction_axis == "x" else 2, tiled=True)
     if beta != 0:
         scale = beta if a.dtype.kind == "c" else beta.real

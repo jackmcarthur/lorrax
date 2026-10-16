@@ -67,7 +67,7 @@ The card's free bytes are `F(t) = M − O(t) − V(t)`.
 ### The rule {#rule}
 
 ```text
-B = (M − 1.2·O) / (1 + 1.2·φ)     the planner budget   (runtime.planner_budget_bytes, src/runtime/__init__.py:812)
+B = (M − 1.2·O) / (1 + 1.2·φ) − T_ord   the planner budget   (runtime.planner_budget_bytes, src/runtime/__init__.py:812)
 R = M − 1.2·O_max                 the pool's reservation (runtime.pool_reservation_bytes, :797; runtime.pool_fraction = R/M)
 ```
 
@@ -77,7 +77,14 @@ for the cuSOLVERMp/cuBLASMp contexts, their communicators and workspace
 (`POOL_OVERSHOOT`, `:802`) is the fraction by which the pool's in-use bytes
 `U` may run above the budget the planners priced: peaks they under-price,
 and free space trapped between live buffers ([§ what φ covers](#what-phi-covers)).
-1.2 is the margin (`MEMORY_MARGIN`). `B` is at most `R` and at least `M/4`.
+1.2 is the margin (`MEMORY_MARGIN`). `T_ord` is the one named cap of the
+rank-order reductions' transient inside the pool, `lxkit.ORDERED_TRANSIENT_SLABS` (2)
+slabs of `LORRAX_ORDERED_SLAB_MB` (8 MiB) = 16 MiB
+(`runtime.ordered_reduction_transient_bytes`). It is fixed: an ordered all-reduce
+or reduce-scatter of any operand size holds at most two slabs beyond the library
+collective ([rank-order reductions](../environment/transports.md#rank-order-reductions)),
+so it comes off `B` once and every planner and route (`admit_local`'s room is `B`
+less the live stages) sees it. `B` is at most `R` and at least `M/4`.
 
 | card | M | R | B, linalg local | B, linalg distributed |
 |---|---|---|---|---|

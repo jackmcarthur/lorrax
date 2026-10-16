@@ -265,6 +265,10 @@ def bootstrap(*, platform: str = "gpu") -> None:
     init_mpi_before_device_collectives()
     install_failfast_excepthook()
     pin_matmul_precision()
+    # LORRAX_REDUCTION_GUARD=log|raise: record or refuse raw floating sums over
+    # more than two ranks (topology-ordered); a no-op when unset.
+    from lxkit import install_reduction_guard_from_env
+    install_reduction_guard_from_env()
     # Every sharding is explicit, so a legacy ``with mesh:`` would only add its
     # mesh to every program's key and re-trace held programs: JAX refuses one.
     _import_jax().config.update("jax_disallow_mesh_context_manager", True)
@@ -841,7 +845,7 @@ def apply_site_scratch(*, say=print) -> None:
 #: readings (sandbox claim 3978).  With ``M`` the card total and ``O`` the bytes
 #: outside the XLA pool:
 #:
-#:     planner budget    B = (M - 1.2 O) / (1 + 1.2 phi)     (planner_budget_bytes)
+#:     planner budget    B = (M - 1.2 O) / (1 + 1.2 phi) - T_ord   (planner_budget_bytes)
 #:     pool reservation  R = M - 1.2 O_max                  (pool_fraction)
 #:
 #: ``O`` is 3 GB (the CUDA context and modules, XLA's NCCL communicators, cuFFT
@@ -855,7 +859,8 @@ def apply_site_scratch(*, say=print) -> None:
 #: #pool-growth).  The pool is reserved before the deck is read, so
 #: ``R`` leaves room for the larger ``O``; the reservation is not a cap.  Both
 #: read only ``M`` and the deck's resolved ``linalg``: the same on every rank
-#: and every run.
+#: and every run.  ``T_ord`` (16 MiB, :func:`ordered_reduction_transient_bytes`)
+#: is the rank-order reductions' fixed transient inside the pool.
 OUTSIDE_POOL_BYTES = 3e9
 #: The cuSOLVERMp/cuBLASMp contexts, their NCCL communicators and workspace
 #: under ``linalg = distributed`` (5.9 GB outside at P4 against 2.9).  Owner:
@@ -885,11 +890,23 @@ def outside_pool_allowance_bytes(linalg: str = "local") -> float:
                                  if linalg == "distributed" else 0.0)
 
 
+def ordered_reduction_transient_bytes() -> float:
+    """``T_ord``: the named cap of the rank-order reductions' transient.
+
+    ``lxkit.ordered_transient_bytes()``, ``ORDERED_TRANSIENT_SLABS`` (2) slabs of
+    ``LORRAX_ORDERED_SLAB_MB`` (8 MiB): 16 MiB.  Fixed: an ordered all-reduce or
+    reduce-scatter of any size holds at most this much beyond the library
+    collective (docs/environment/transports.md#rank-order-reductions), so the
+    rule reserves it once, out of ``B``, for every planner and route."""
+    from lxkit import ordered_transient_bytes
+    return float(ordered_transient_bytes())
+
+
 def planner_budget_bytes(total_bytes: float, linalg: str = "local") -> float:
-    """``B = (M - 1.2 O) / (1 + 1.2 phi)``, at most the reservation and at least ``M / 4``."""
+    """``B = (M - 1.2 O) / (1 + 1.2 phi) - T_ord``, at most the reservation and at least ``M / 4``."""
     total = float(total_bytes)
     budget = ((total - MEMORY_MARGIN * outside_pool_allowance_bytes(linalg))
-              / (1.0 + MEMORY_MARGIN * POOL_OVERSHOOT))
+              / (1.0 + MEMORY_MARGIN * POOL_OVERSHOOT)) - ordered_reduction_transient_bytes()
     return max(min(budget, pool_reservation_bytes(total)), 0.25 * total)
 
 

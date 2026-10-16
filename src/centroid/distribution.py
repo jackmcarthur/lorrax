@@ -27,6 +27,7 @@ to name.
 from __future__ import annotations
 
 import jax
+from lxkit import ordered_psum
 from jax import lax, config
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax import shard_map
@@ -171,7 +172,7 @@ def sum_over_grid(x, grid_axis):
     embarrassingly parallel over grid points, and the update step needs
     each centroid's total weight and weighted displacement over ALL points.
     """
-    return lax.psum(x, axis_name=grid_axis)
+    return ordered_psum(x, axis_name=grid_axis)
 
 
 def grid_parallel_loop(mesh: Mesh, iterate, *, grid_axis=MESH_AXES,
