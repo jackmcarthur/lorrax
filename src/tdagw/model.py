@@ -68,8 +68,50 @@ ZETA_G_SPEC = P(None, ("x", "y"))
 V_G_SPEC = P(("x", "y"))
 
 
+#: Why each gate refuses: one reason per gate name, read by :func:`_refuse`.
+_WHY = {
+    "td_model_terms": "an operator with neither term is identically zero",
+    "td_model_k_axis": "the W term reshapes the flat k axis onto the grid, so a partial k list "
+                       "pairs the wrong k - k'",
+    "td_model_mu_axis": "every centroid-indexed operand must share one padded extent, or the "
+                        "mesh shards misalign their rows",
+    "td_model_w_grid": "the k-convolution pairs each psi row with the W_R cell of the same grid",
+    "td_k_on_grid": "the W convolution needs k on the unshifted grid, and a nearest-k fallback "
+                    "would mislabel rows",
+    "td_k_full_grid": "the k-convolution's FFT needs every grid point exactly once",
+    "td_wfn_full_grid": "psi is sampled at every grid k, and an IBZ WFN would need an unfolding "
+                        "this path does not do",
+    "td_zeta_q0_row": "the Hartree term drops exactly the G = 0 slot of the q = 0 sphere",
+    "td_band_origin": "bands are absolute indices, and a stored window that starts elsewhere "
+                      "would offset psi against W",
+    "td_window_gap": "rho_eq = diag(f) needs occupied and empty bands in the window",
+    "td_window_resolved": "the loader moved a window edge to close a degenerate multiplet, so "
+                          "psi would not be the requested bands",
+    "td_wfn_densified": "the densified psi come from the htransform, and TDGW's coarse WFN is "
+                        "another basis",
+    "td_centroids_md5": "psi sampled at other centroids does not match the restart's W and zeta",
+    "td_wfn_geometry": "psi(r_mu) from another FFT grid or cell falls on other points than the "
+                       "restart's centroids",
+    "td_velocity_full_window": "a full-window velocity is read from a velocity file",
+    "td_velocity_loader": "this loader cannot carry the velocity, and dropping the request would "
+                          "return no dipoles",
+    "td_velocity_route": "the loader reads the velocity on the densified route only, so elsewhere "
+                         "the request would be ignored",
+    "td_velocity_full_window_loader": "this loader returns the window's cv dipoles only, so the "
+                                      "vv' and cc' pairs would be missing",
+    "td_eqp_n_occ": "psi hold the DFT window, and a QP spectrum with another n_occ changes which "
+                    "bands are occupied",
+    "td_coulomb_policy": "the Hartree term must use the Coulomb kernel that V and W were built "
+                         "with, which the stamp names",
+    "td_coulomb_bgw_vcoul": "compute_v_q_per_G does not reproduce BerkeleyGW's vcoul overlay, so "
+                            "Vbar would differ from the stored V",
+    "td_zeta_gamma_row": "the Hartree term reads the q = 0 row, and another row is a finite-q "
+                         "operator",
+}
+
+
 def _refuse(gate: str, got, want, fix: str):
-    raise ValueError(f"GATE {gate}: got: {got}; want: {want}; fix: {fix} "
+    raise ValueError(f"GATE {gate}: got: {got}; want: {want}; why: {_WHY[gate]}; fix: {fix} "
                      f"(docs/theory/td_agw.md)")
 
 
@@ -511,42 +553,44 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         data["psi_v_X"], data["psi_c_X"])
     cfg = LorraxConfig.from_input_file(input_file)
     deck_wfn = WfnLoader(cfg.paths.wfn_file)
-    receipts = dict(restart_file=os.path.abspath(restart_file), n_occ=int(n_occ),
-                    bands=(b_lo, b_hi), densified=bool(data.get("densified", False)))
-    if wfn_file is not None:
-        if data.get("densified", False):
-            _refuse("td_wfn_densified", "wfn_file with a bse_k_grid deck",
-                    "ψ from one source", "drop wfn_file (the densified ψ is the htransform's)")
-        centroids = load_centroid_basis(cfg.paths.centroids_file, deck_wfn.fft_grid,
-                                        sym=deck_wfn.symmetry())
-        idx = np.asarray(centroids.centroid_indices)
-        digest = header["centroid_hashes"].get("charge")
-        if digest is not None and str(np.asarray(digest).astype(str)) != centroid_table_md5(idx):
-            _refuse("td_centroids_md5", "deck centroids differ from the restart's",
-                    "the restart's centroid table", "point the deck at the restart's centroids")
-        tdgw_wfn = WfnLoader(wfn_file)
-        same_grid = tuple(tdgw_wfn.fft_grid) == tuple(deck_wfn.fft_grid)
-        same_cell = np.allclose(np.asarray(tdgw_wfn.bvec), np.asarray(deck_wfn.bvec), atol=1e-8)
-        tdgw_wfn.close()
-        if not (same_grid and same_cell):
-            _refuse("td_wfn_geometry", f"fft_grid {tuple(tdgw_wfn.fft_grid)}, same_cell={same_cell}",
-                    f"the restart WFN's fft_grid {tuple(deck_wfn.fft_grid)} and cell",
-                    "generate TDGW's WFN from the GW run's SCF and cutoff")
-        psi, k_frac, _ = sample_window_psi(wfn_file, idx, (b_lo, b_hi), mesh_xy,
-                                           kgrid=kgrid, n_rmu_pad=n_rmu_pad)
-        receipts["psi_source"] = os.path.abspath(wfn_file)
-        receipts["psi_vs_restart"] = _gauge_receipt(psi, psi_restart, mesh_xy)
-    else:
-        psi = psi_restart
-        # The loader's flat k axis is reshaped to (nkx, nky, nkz) by the W
-        # convolution, so its rows are the C-order grid, coarse or densified.
-        k_frac = _c_order_k(kgrid)
-        if not data.get("densified", False):
-            flat_k_rows(np.asarray(deck_wfn.kvecs(k="full_bz")), kgrid)   # full, unshifted grid
-        receipts["psi_source"] = "restart"
-    coulomb = _coulomb_from_policy(read_coulomb_policy_from_h5(restart_file), deck_wfn,
-                                   restart_file)
-    deck_wfn.close()
+    try:
+        receipts = dict(restart_file=os.path.abspath(restart_file), n_occ=int(n_occ),
+                        bands=(b_lo, b_hi), densified=bool(data.get("densified", False)))
+        if wfn_file is not None:
+            if data.get("densified", False):
+                _refuse("td_wfn_densified", "wfn_file with a bse_k_grid deck",
+                        "ψ from one source", "drop wfn_file (the densified ψ is the htransform's)")
+            centroids = load_centroid_basis(cfg.paths.centroids_file, deck_wfn.fft_grid,
+                                            sym=deck_wfn.symmetry())
+            idx = np.asarray(centroids.centroid_indices)
+            digest = header["centroid_hashes"].get("charge")
+            if digest is not None and str(np.asarray(digest).astype(str)) != centroid_table_md5(idx):
+                _refuse("td_centroids_md5", "deck centroids differ from the restart's",
+                        "the restart's centroid table", "point the deck at the restart's centroids")
+            tdgw_wfn = WfnLoader(wfn_file)
+            same_grid = tuple(tdgw_wfn.fft_grid) == tuple(deck_wfn.fft_grid)
+            same_cell = np.allclose(np.asarray(tdgw_wfn.bvec), np.asarray(deck_wfn.bvec), atol=1e-8)
+            tdgw_wfn.close()
+            if not (same_grid and same_cell):
+                _refuse("td_wfn_geometry", f"fft_grid {tuple(tdgw_wfn.fft_grid)}, same_cell={same_cell}",
+                        f"the restart WFN's fft_grid {tuple(deck_wfn.fft_grid)} and cell",
+                        "generate TDGW's WFN from the GW run's SCF and cutoff")
+            psi, k_frac, _ = sample_window_psi(wfn_file, idx, (b_lo, b_hi), mesh_xy,
+                                               kgrid=kgrid, n_rmu_pad=n_rmu_pad)
+            receipts["psi_source"] = os.path.abspath(wfn_file)
+            receipts["psi_vs_restart"] = _gauge_receipt(psi, psi_restart, mesh_xy)
+        else:
+            psi = psi_restart
+            # The loader's flat k axis is reshaped to (nkx, nky, nkz) by the W
+            # convolution, so its rows are the C-order grid, coarse or densified.
+            k_frac = _c_order_k(kgrid)
+            if not data.get("densified", False):
+                flat_k_rows(np.asarray(deck_wfn.kvecs(k="full_bz")), kgrid)   # full, unshifted grid
+            receipts["psi_source"] = "restart"
+        coulomb = _coulomb_from_policy(read_coulomb_policy_from_h5(restart_file), deck_wfn,
+                                       restart_file)
+    finally:
+        deck_wfn.close()
     zeta_file = zeta_file or os.path.join(os.path.dirname(restart_file), "zeta_q.h5")
     _gamma_row(restart_file, kgrid)
     zeta_G, v_G, zr = hartree_operator_from_zeta(zeta_file, mesh_xy, n_rmu_pad, coulomb=coulomb)
