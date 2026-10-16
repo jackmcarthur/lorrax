@@ -99,6 +99,7 @@ nav:
       - Shared-pole screened interaction: theory/shared-pole-w-model.md
       - The Sigma(omega) quadrature problem: theory/sigma-quadrature-problem.md
       - Sigma_c band extrapolation: theory/band-extrapolation.md
+      - On-shell Sigma_c: theory/sigma-on-shell.md
       - Metallic MPA screening: theory/metallic-mpa-screening.md
       - The metallic q→0 head: theory/metal-q0-head.md
       - "Bispinor (four-current) GW": theory/bispinor-gw.md

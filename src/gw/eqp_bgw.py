@@ -377,6 +377,46 @@ def compute_z_factor_from_omega_grid(
 	return sigma_c_at_dft, z_factor
 
 
+@dataclass(frozen=True)
+class OnShellDiagonal:
+	"""The on-shell Sigma_c band diagonal the eqp assembly reads, (nk, nb) each.
+
+	The on-shell evaluation (``gw.ppm_sigma.OnShellSigma``) has no omega
+	axis to interpolate or difference: it carries Sigma_c at the two centres
+	the assembly reads and the EXACT derivative of the same quadrature at the
+	linearization centre.  ``at_dft_ev`` is Sigma_c(E_DFT) (eqp0's centre),
+	``at_eval_ev`` Sigma_c(E_eval) (eqp1's, equal to ``at_dft_ev`` one-shot),
+	``dsigma_at_eval`` dSigma_c/domega there (dimensionless) and
+	``covered_kn`` where E_eval lies on the sampled range: outside it Z = 1,
+	as the grid's two clamped probes gave.  All eV, complex, except the mask.
+	"""
+	at_dft_ev: np.ndarray
+	at_eval_ev: np.ndarray
+	dsigma_at_eval: np.ndarray
+	covered_kn: np.ndarray
+
+	def z_factor(self) -> np.ndarray:
+		"""``1 / (1 - dRe Sigma_c/domega)`` at E_eval, 1 off the sampled range."""
+		d = np.real(np.asarray(self.dsigma_at_eval))
+		return np.where(np.asarray(self.covered_kn, dtype=bool),
+		                1.0 / (1.0 - d), 1.0)
+
+	def map_rows(self, fn) -> "OnShellDiagonal":
+		"""Apply one (nk, nb) -> (nk', nb') host reduction to every member."""
+		return OnShellDiagonal(
+			at_dft_ev=np.asarray(fn(np.asarray(self.at_dft_ev))),
+			at_eval_ev=np.asarray(fn(np.asarray(self.at_eval_ev))),
+			dsigma_at_eval=np.asarray(fn(np.asarray(self.dsigma_at_eval))),
+			covered_kn=np.asarray(fn(np.asarray(self.covered_kn, dtype=bool)), dtype=bool))
+
+	def select_k(self, select_rows) -> "OnShellDiagonal":
+		return self.map_rows(lambda a: np.asarray(select_rows(a)))
+
+	@property
+	def shape(self):
+		return tuple(np.shape(self.at_dft_ev))
+
+
 def _implied_vxc_window_ev() -> tuple[float, float]:
 	"""The physical window for ``V_xc = E_DFT − (kin_ion + V_H)``, in eV.
 
@@ -558,6 +598,10 @@ class EqpAssembly:
 	implied_vxc_ev: np.ndarray | None
 	hartree_transverse_diag_ev: np.ndarray | None = None
 	nspin: int = 1
+	#: The on-shell operand (:class:`OnShellDiagonal`) that produced
+	#: ``sigma_c_at_dft_diag_ev`` and ``z_factor``, when the run had no omega
+	#: curve; ``sigma_c_omega_diag_ev`` is then None.
+	sigma_c_on_shell: "OnShellDiagonal | None" = None
 	#: Where eqp1 was linearized, when that was not E_DFT (self-consistent
 	#: runs).  None on every one-shot path, where it IS E_DFT.
 	e_eval_ev: np.ndarray | None = None
@@ -591,6 +635,9 @@ def assemble_eqp(
 	# ω-relative eV of the SAME energies; both or neither.
 	e_eval_ev: np.ndarray | None = None,                   # (nk, nb)
 	e_eval_rel_ev: np.ndarray | None = None,               # (nk, nb)
+	# The on-shell operand (no omega curve): Sigma_c(E_DFT), Sigma_c(E_eval)
+	# and the exact dSigma_c/domega at E_eval.  Exclusive with the curve.
+	sigma_c_on_shell: "OnShellDiagonal | None" = None,
 	dE_ev: float = Z_FINITE_DIFFERENCE_EV,
 	nspin: int = 1,
 	hartree_scalar_diag_ev: np.ndarray | None = None,
@@ -677,7 +724,28 @@ def assemble_eqp(
 			"ω-relative halves of ONE linearization point — pass both or "
 			"neither")
 	sigma_c_at_eval = None
-	if sigma_c_omega_diag_ev is None:
+	if sigma_c_on_shell is not None:
+		# THE ON-SHELL OPERAND: the same two centres and derivative the curve
+		# branch below forms, read where the Sigma sweep evaluated them.
+		if sigma_c_omega_diag_ev is not None or sigma_c_at_dft_diag_ev is not None:
+			raise ValueError(
+				"assemble_eqp: the on-shell operand is the one correlation "
+				"producer; a C(omega) curve or a second C(E_DFT) would duplicate it.")
+		sigma_c_at_dft = np.asarray(sigma_c_on_shell.at_dft_ev, dtype=np.complex128)
+		z_factor = sigma_c_on_shell.z_factor()
+		if e_eval_rel_ev is not None and e_dft_rel_ev is not None and not np.array_equal(
+				np.asarray(e_eval_rel_ev, dtype=np.float64),
+				np.asarray(e_dft_rel_ev, dtype=np.float64)):
+			sigma_c_at_eval = np.asarray(sigma_c_on_shell.at_eval_ev, dtype=np.complex128)
+			print_fn(
+				"  eqp1 linearization: Σ was evaluated away from E_DFT this "
+				f"call (max |E_eval − E_DFT| = "
+				f"{float(np.max(np.abs(np.asarray(e_eval_ev, dtype=np.float64) - np.asarray(e_dft_ev, dtype=np.float64)))):.4f} eV) "
+				"— Z and the Σ_c it multiplies are centred there, not at "
+				"E_DFT.  eqp0 stays at E_DFT.")
+		else:
+			e_eval_ev = None
+	elif sigma_c_omega_diag_ev is None:
 		# Static mode: no ω-grid, Z = 1 trivially.
 		if sigma_c_at_dft_diag_ev is None:
 			raise ValueError(
@@ -758,6 +826,7 @@ def assemble_eqp(
 		nspin=int(nspin),
 		e_eval_ev=(None if e_eval_ev is None
 		           else np.asarray(e_eval_ev, dtype=np.float64)),
+		sigma_c_on_shell=sigma_c_on_shell,
 	)
 
 
@@ -1131,11 +1200,14 @@ def make_eqp_bgw(
 			f"[{_receipt['band_start']},{_receipt['band_stop']}) but the "
 			f"requested window is [{band_start},{band_stop}).")
 	expect_shape = (nk_irr, nb_window)
+	_on_shell_rows = _receipt.get("sigma_c_on_shell")
 	if (_receipt["hartree_diag_ev"].shape != expect_shape
 			or _receipt["sigma_x_diag_ev"].shape != expect_shape
 			or _receipt["sigma_c_at_dft_diag_ev"].shape != expect_shape
-			or _receipt["sigma_c_omega_diag_ev"].shape
-			!= (omega_rel_ev.size, *expect_shape)):
+			or (_on_shell_rows is None and _receipt["sigma_c_omega_diag_ev"].shape
+			    != (omega_rel_ev.size, *expect_shape))
+			or (_on_shell_rows is not None
+			    and _on_shell_rows.shape != (4, *expect_shape))):
 		raise ValueError("EQP receipt operands do not match the requested window.")
 	if not np.array_equal(
 			_receipt["file_wedge_full_bz_rows"], kirr_to_kfull):
@@ -1163,6 +1235,10 @@ def make_eqp_bgw(
 		hartree_diag_ev=np.real(hartree_diag),
 		sigma_x_diag_ev=np.real(sigma_x_diag),
 		sigma_c_omega_diag_ev=sigma_c_omega_diag,
+		sigma_c_on_shell=(None if _on_shell_rows is None else OnShellDiagonal(
+			at_dft_ev=_on_shell_rows[0], at_eval_ev=_on_shell_rows[1],
+			dsigma_at_eval=_on_shell_rows[2],
+			covered_kn=np.real(_on_shell_rows[3]) != 0.0)),
 		omega_rel_ev=omega_rel_ev,
 		e_dft_rel_ev=e_dft_rel_ev,
 		e_eval_ev=e_eval_ev,

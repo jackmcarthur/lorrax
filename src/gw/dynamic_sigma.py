@@ -122,6 +122,13 @@ def add_head_sigma_diag(
         and delete the body array.  Only a caller that reads the body no
         further may pass True.
     """
+    if hasattr(sigma_c_body_omega, "request"):
+        # On shell: the head's value at each table and its derivative.
+        if head_sigma_diag_w_kn_ry is not None and not hasattr(
+                head_sigma_diag_w_kn_ry, "on_shell"):
+            raise ValueError("an on-shell Sigma takes its head as a closed form "
+                             "(head_correction.HeadSigmaDiag)")
+        return sigma_c_body_omega.with_head(head_sigma_diag_w_kn_ry, band_axis)
     if head_sigma_diag_w_kn_ry is None:
         return sigma_c_body_omega
 
@@ -186,6 +193,40 @@ def add_head_sigma_diag(
         dense, dtype=sigma_c_body_omega.dtype)
 
 
+def sigma_dft_energies_ev(*, wfn, sym, meta, band_slices) -> np.ndarray:
+    """E_DFT ``(nk, nb)`` (eV, absolute) on the Sigma bands: the eqp0 centre."""
+    enk_dft, _ = get_enk_bandrange(
+        wfn, sym, band_slices.sigma_range,
+        band_slices.sigma_range, nspinor=meta.nspinor)
+    return np.asarray(enk_dft) * RYD_TO_EV
+
+
+def sigma_on_shell_request(config, *, e_eval_ev, wfn, sym, meta, band_slices,
+                           efermi_ry):
+    """The on-shell evaluation of one dynamic Sigma call, or None (the grid).
+
+    ``sigma_omega_grid_debug`` keeps the omega grid; otherwise the request
+    (``gw.ppm_sigma.on_shell_request``) holds E_eval (``e_eval_ev``, the
+    energies the QSGW ansatz reads, absolute eV) and E_DFT, both measured
+    from ``efermi_ry``, the body's omega reference.  These are the very
+    subtractions :func:`eval_sigma_c_at_dft_energies` and the finalize make,
+    so the finalize's reads match the tables bit for bit
+    (``sigma_dispatch.finalize_dynamic_sigma`` checks it).
+    """
+    if bool(config.debug.sigma_omega_grid_debug):
+        return None
+    from .ppm_sigma import on_shell_request
+    if e_eval_ev is None:
+        raise ValueError("an on-shell Sigma needs the energies it is evaluated at (e_qp_ev)")
+    efermi_ev = float(efermi_ry) * RYD_TO_EV
+    return on_shell_request(
+        e_eval_rel_ev=np.asarray(e_eval_ev, dtype=np.float64) - efermi_ev,
+        e_dft_rel_ev=sigma_dft_energies_ev(
+            wfn=wfn, sym=sym, meta=meta, band_slices=band_slices) - efermi_ev,
+        omega_range_ev=np.asarray(config.omega_grid_ev, dtype=np.float64),
+        out_of_grid=config.sigma.out_of_grid)
+
+
 def eval_sigma_c_at_dft_energies(
     sigma_c_omega: jax.Array, *,
     config,
@@ -221,10 +262,8 @@ def eval_sigma_c_at_dft_energies(
     at-DFT array cannot say by itself which of its cells were sampled and
     which are grid endpoints.
     """
-    enk_dft, _ = get_enk_bandrange(
-        wfn, sym, band_slices.sigma_range,
-        band_slices.sigma_range, nspinor=meta.nspinor)
-    enk_dft_ev = np.asarray(enk_dft) * RYD_TO_EV
+    enk_dft_ev = sigma_dft_energies_ev(
+        wfn=wfn, sym=sym, meta=meta, band_slices=band_slices)
     vbm_ev = float(wfn.vbm) * RYD_TO_EV
     cbm_ev = float(wfn.cbm) * RYD_TO_EV
     ref_ry = float(wfn.efermi) if efermi_ry is None else float(efermi_ry)
@@ -253,13 +292,28 @@ def eval_sigma_c_at_dft_energies(
     uncovered_bands = tuple(coarse_band_report(
         omega_dft_rel_ev, ~covered, mu_ev=0.0,
         band_offset=band_slices.sigma_range[0]))
-    # Two omega slots per (k, n) leave the cube; the (n_omega, nk, nb)
-    # diagonal is not made on any host (full BZ: 3.7 GB per rank at Fe 20^3).
-    sigma_c_at_dft_ev = interp_sigma_diag_along_omega(
-        sigma_c_omega, mesh_xy, grid_ev, omega_dft_rel_ev,
-        band_axis=band_axis, scale=RYD_TO_EV,
-        context="Sigma_c at E_DFT (eqp0/eqp1)",
-        print_fn=print_fn)
+    if hasattr(sigma_c_omega, "request"):
+        # On shell: the sweep evaluated Sigma_c at these very energies (an
+        # uncovered state at omega = 0, the reader's rule), so it is read,
+        # not interpolated.
+        from .qsgw_utils import check_on_shell_reads
+        check_on_shell_reads(sigma_c_omega.request.table_ev("dft0"),
+                             np.where(covered, omega_dft_rel_ev, 0.0),
+                             what="Sigma_c at E_DFT")
+        if n_uncovered:
+            print_fn(f"  omega coverage [Sigma_c at E_DFT (eqp0/eqp1)]: {n_uncovered} of "
+                     f"{omega_dft_rel_ev.size} ({100.0 * frac_uncovered:.1f}%) evaluation "
+                     f"energies outside [{float(grid_ev[0]):.3f}, {float(grid_ev[-1]):.3f}] "
+                     "use Sigma(omega=0).")
+        sigma_c_at_dft_ev = sigma_c_omega.diagonal("dft0", band_axis) * RYD_TO_EV
+    else:
+        # Two omega slots per (k, n) leave the cube; the (n_omega, nk, nb)
+        # diagonal is not made on any host (full BZ: 3.7 GB per rank at Fe 20^3).
+        sigma_c_at_dft_ev = interp_sigma_diag_along_omega(
+            sigma_c_omega, mesh_xy, grid_ev, omega_dft_rel_ev,
+            band_axis=band_axis, scale=RYD_TO_EV,
+            context="Sigma_c at E_DFT (eqp0/eqp1)",
+            print_fn=print_fn)
 
     return (
         sigma_c_at_dft_ev,
@@ -387,6 +441,43 @@ def write_sigma_omega(
         star = star_tables(sym)
 
     from .qsgw_utils import is_band_sharded_sigma_omega
+    if hasattr(sigma_c_omega, "request"):
+        # On shell: the pair in place of the omega cubes, and the eqp
+        # diagonals the file's reader reassembles from (every rank enters
+        # the diagonal reads, which are collective).
+        request = sigma_c_omega.request
+        total_fn, c_fn = _ev_tensor_fns(sigma_c_omega.pair.sharding)
+        on_shell = dict(
+            names=request.names,
+            energies_rel_ev=np.stack([request.table_ev(n) for n in request.names]),
+            diag_ev=np.stack([sigma_c_omega.diagonal(n, band_axis) * RYD_TO_EV
+                              for n in request.names]),
+            dsigma=sigma_c_omega.diagonal("derivative", band_axis))
+        write_sigma_omega_h5(
+            out_path, None, total_fn(sigma_c_omega.pair, sig_x, hartree_ev),
+            sigma_c_kij_ev=c_fn(sigma_c_omega.pair),
+            sigma_sx_kij_ev=RYD_TO_EV * sig_x,
+            hartree_kij_ev=hartree_ev,
+            hartree_scalar_kij_ev=(
+                None if h_transverse is None
+                else RYD_TO_EV * v_h_scalar),
+            hartree_transverse_kij_ev=(
+                None if h_transverse is None
+                else RYD_TO_EV * h_transverse),
+            mesh=mesh_xy, star=star,
+            star_already_selected=star_already_selected,
+            omega_reference_ev=omega_reference_ev,
+            omega_reference_provenance=omega_reference_provenance,
+            sigma_regularization=sigma_regularization,
+            eval_energies_rel_ev=eval_energies_rel_ev,
+            eval_energies_provenance=eval_energies_provenance,
+            omega_coverage=omega_coverage,
+            band_extrapolation=band_extrapolation,
+            band_axis=band_axis,
+            on_shell=on_shell,
+            print_fn=print_fn,
+        )
+        return out_path
     if is_band_sharded_sigma_omega(sigma_c_omega):
         shd = sigma_c_omega.sharding
 

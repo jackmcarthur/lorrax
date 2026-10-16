@@ -83,9 +83,27 @@ SPREAD_ATTR_PREFIX = "star_spread_"
 #: The dynamic cubes are ``(n_omega, nk, nb, nb)``; everything else is
 #: ``(nk, …)``.  A dataset absent from this table has no k axis at all
 #: (``omega_ev``) and is written verbatim.
+#: The on-shell file layout (``write_sigma_omega_h5(on_shell=...)``): the
+#: two cubes ``sigma_{total,c}_kij_ev`` hold the PAIR ``(2, nk, nb, nb)`` =
+#: Sigma_mn(E_m), Sigma_mn(E_n) (stamped ``pair_slots``; no ``omega_ev`` is
+#: written, so a reader that needs an omega axis fails on it), beside the
+#: diagonal on each evaluation table, the exact dSigma_c/domega and the
+#: tables themselves (omega-relative eV).
+#: Per evaluation table (``gw.ppm_sigma.ON_SHELL_TABLES``), band diagonals
+#: ``(nk, nb)``: Sigma_c there (eV) and the table's energies (omega-relative eV).
+ON_SHELL_DIAG_DATASET = "sigma_c_onshell_{table}_kn_ev"
+ON_SHELL_ENERGIES_DATASET = "onshell_{table}_rel_ev"
+ON_SHELL_DSIGMA_DATASET = "sigma_c_onshell_dsigma_kn"
+#: Root-level marker dataset naming the evaluation (``on_shell``; absent: grid).
+SIGMA_EVALUATION_ATTR = "sigma_evaluation"
+_ON_SHELL_TABLE_NAMES = ("pair", "eval0", "dft0")
+
 SIGMA_K_AXIS = {
 	"sigma_total_kij_ev": 1,
 	"sigma_c_kij_ev": 1,
+	**{ON_SHELL_DIAG_DATASET.format(table=t): 0 for t in _ON_SHELL_TABLE_NAMES},
+	**{ON_SHELL_ENERGIES_DATASET.format(table=t): 0 for t in _ON_SHELL_TABLE_NAMES},
+	ON_SHELL_DSIGMA_DATASET: 0,
 	"sigma_sx_kij_ev": 0,
 	"hartree_kij_ev": 0,
 	"hartree_scalar_kij_ev": 0,
@@ -219,6 +237,13 @@ EQP_ASSEMBLY_DATASET = "eqp_assembly_conditioned_diagonals_ev"
 EQP_ASSEMBLY_CANDIDATE_DATASET = (
 	"__eqp_assembly_conditioned_diagonals_ev_candidate")
 EQP_ASSEMBLY_C_OMEGA_DATASET = "eqp_assembly_conditioned_sigma_c_omega_diag_ev"
+#: The on-shell companion in place of the C(omega) curve, ``(4, nk, nb)``:
+#: C(E_DFT), C(E_eval), dC/domega at E_eval and the coverage mask (1 where
+#: E_eval lies on the sampled range, Z = 1 elsewhere), from
+#: ``eqp_bgw.OnShellDiagonal``.
+EQP_ASSEMBLY_C_ONSHELL_DATASET = "eqp_assembly_conditioned_sigma_c_onshell_ev"
+EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET = (
+	"__eqp_assembly_conditioned_sigma_c_onshell_ev_candidate")
 EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET = (
 	"__eqp_assembly_conditioned_sigma_c_omega_diag_ev_candidate")
 EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET = (
@@ -980,7 +1005,8 @@ def _slab_to_host(a):
 
 
 def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
-                            n_sym_spatial, *, k_axis=0, omega_index=None):
+                            n_sym_spatial, *, k_axis=0, omega_index=None,
+                            on_shell_pair=False):
 	"""How far this array is from its own star relation.  FOUR numbers.
 
 	Computed on the COMPLETE full-BZ array, before any row is dropped —
@@ -1029,7 +1055,14 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 	# devices to measure one slice of it — 1.3 GB on the mos2_4x4 deck for
 	# a 33 MB answer.  Slicing first keeps the transfer to the slice.
 	ndim = len(np.shape(values))
-	if ndim == 4:
+	if ndim == 4 and on_shell_pair:
+		# An on-shell pair's slots carry the row and the column state's
+		# frequency, which an antiunitary star member exchanges with its
+		# transpose: the half-sum is the slice that transports as a band
+		# operator.  Stamped as index -2.
+		M = 0.5 * (_slab_to_host(values[0]) + _slab_to_host(values[1]))
+		omega_index = -2
+	elif ndim == 4:
 		if omega_index is None:
 			omega_index = np.shape(values)[0] // 2
 		M = _slab_to_host(values[int(omega_index)])
@@ -1150,7 +1183,7 @@ def _write_omega_cube(io, name, arr):
 
 def extract_and_stamp_k_irr(
 	payload, star, *, omega_ev=None, nk_full=None,
-	star_already_selected=False, print_fn=None,
+	star_already_selected=False, on_shell_pairs=(), print_fn=None,
 ):
 	"""THE RULED ORDERING, in one implementation.  Measure, then drop.
 
@@ -1181,6 +1214,10 @@ def extract_and_stamp_k_irr(
 	stamped but they are not selected a second time.  Star-spread attributes
 	are deliberately absent because the discarded members cannot be measured;
 	manufacturing an exact-zero spread by unfolding would be a fake green.
+
+	``on_shell_pairs`` names the 4-D arrays that are an on-shell pair, whose
+	star spread is measured on the half-sum of the two slots
+	(:func:`sigma_star_spread_stats`).
 
 	``star`` of ``None`` is the full-BZ write.  The payload comes back
 	untouched and ``attrs_for`` returns ``None`` for every name, which is
@@ -1252,7 +1289,8 @@ def extract_and_stamp_k_irr(
 			# whole, and only those rows outlive the step.
 			stats = sigma_star_spread_stats(
 				arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
-				k_axis=SIGMA_K_AXIS[name], omega_index=omega_index)
+				k_axis=SIGMA_K_AXIS[name], omega_index=omega_index,
+				on_shell_pair=name in on_shell_pairs)
 			selected[name] = star_select_k_irr(
 				arr, rows_to_keep, k_axis=SIGMA_K_AXIS[name])
 			del arr
@@ -1417,6 +1455,7 @@ def write_sigma_omega_h5(
 	omega_coverage=None,
 	band_extrapolation=None,
 	band_axis=None,
+	on_shell=None,
 	print_fn=None,
 ):
 	"""Write frequency-dependent Sigma_mnk(omega) arrays to HDF5.
@@ -1447,6 +1486,18 @@ def write_sigma_omega_h5(
 
 	All large writes go through :mod:`file_io.slab_io`, which has one
 	transport (per-rank collective MPI-IO) and no selector.
+
+	``on_shell``
+	    The on-shell layout (``gw.ppm_sigma.OnShellSigma``): the two cubes
+	    are the PAIR ``(2, nk, nb, nb)``, slot 0 Sigma_mn(E_m) and slot 1
+	    Sigma_mn(E_n), under their usual names and stamped ``pair_slots``;
+	    no ``omega_ev`` is written.  A dict of host arrays on the logical bands:
+	    ``names`` (the tables), ``energies_rel_ev`` ``(n_table, nk, nb)``,
+	    ``diag_ev`` ``(n_table, nk, nb)`` and ``dsigma`` ``(nk, nb)``, written
+	    one ``(nk, nb)`` dataset per table (:data:`ON_SHELL_DIAG_DATASET`,
+	    :data:`ON_SHELL_ENERGIES_DATASET`) through the same k extraction.  The
+	    omega reference is stamped on the ``pair`` energies.  ``omega_ev`` is
+	    ignored.
 
 	``star``
 	    ``(irr_idx_k, sym_idx_k, n_sym_spatial)`` — the same triple
@@ -1509,8 +1560,10 @@ def write_sigma_omega_h5(
 		shape_ref = tuple(sigma_total_kij_ev.shape)
 	else:
 		shape_ref = tuple(sigma_c_kij_ev.shape)
-	if len(shape_ref) != 4:
-		raise ValueError("dynamic sigma tensors must have shape (n_omega, nk, nb, nb).")
+	if len(shape_ref) != 4 or (on_shell is not None and shape_ref[0] != 2):
+		raise ValueError("dynamic sigma tensors must have shape (n_omega, nk, nb, nb), "
+		                 "an on-shell pair (2, nk, nb, nb).")
+	name_total, name_c = "sigma_total_kij_ev", "sigma_c_kij_ev"
 	n_omega, nk, nb, nb2 = shape_ref
 	if nb != nb2:
 		raise ValueError("dynamic sigma tensors must be square in band indices.")
@@ -1562,8 +1615,8 @@ def write_sigma_omega_h5(
 			sigma_c_kij_ev, sigma_sx_kij_ev, hartree_kij_ev)
 
 	payload = {
-		"sigma_total_kij_ev": total,
-		"sigma_c_kij_ev": sigma_c_kij_ev,
+		name_total: total,
+		name_c: sigma_c_kij_ev,
 		"sigma_sx_kij_ev": sigma_sx_kij_ev,
 		"hartree_kij_ev": hartree_kij_ev,
 		"hartree_scalar_kij_ev": hartree_scalar_kij_ev,
@@ -1576,6 +1629,16 @@ def write_sigma_omega_h5(
 	if eval_energies_rel_ev is not None:
 		payload[SIGMA_EVAL_DATASET] = np.asarray(
 			eval_energies_rel_ev, dtype=np.float64)
+	on_shell_names = ()
+	if on_shell is not None:
+		for i, table in enumerate(on_shell["names"]):
+			e_name = ON_SHELL_ENERGIES_DATASET.format(table=table)
+			d_name = ON_SHELL_DIAG_DATASET.format(table=table)
+			payload[e_name] = np.asarray(on_shell["energies_rel_ev"][i], np.float64)
+			payload[d_name] = np.asarray(on_shell["diag_ev"][i], np.complex128)
+			on_shell_names += (e_name, d_name)
+		payload[ON_SHELL_DSIGMA_DATASET] = np.asarray(on_shell["dsigma"], np.complex128)
+		on_shell_names += (ON_SHELL_DSIGMA_DATASET,)
 	extrap_arrays = dict((band_extrapolation or {}).get("arrays", {}))
 	extrap_attrs = dict((band_extrapolation or {}).get("attrs", {}))
 	# Into the SAME payload, so the extraction, the stamp and the spread
@@ -1585,15 +1648,18 @@ def write_sigma_omega_h5(
 	# The ordering is :func:`extract_and_stamp_k_irr`'s, shared with the
 	# QSGW appender rather than spelled twice.
 	payload, _attrs, compact_irr, sym_idx_k = extract_and_stamp_k_irr(
-		payload, star, omega_ev=omega_ev, nk_full=nk,
-		star_already_selected=star_already_selected, print_fn=print_fn)
+		payload, star, omega_ev=(None if on_shell is not None else omega_ev),
+		nk_full=nk, star_already_selected=star_already_selected,
+		on_shell_pairs=(name_total, name_c) if on_shell is not None else (),
+		print_fn=print_fn)
 	if star is not None:
-		nk = int(np.shape(payload["sigma_total_kij_ev"])[1])
+		nk = int(np.shape(payload[name_total])[1])
 		storage_shape = (n_omega, nk, logical_nb, logical_nb)
 
 	eval_rel_extracted = payload.pop(SIGMA_EVAL_DATASET, None)
-	total = payload["sigma_total_kij_ev"]
-	sigma_c_kij_ev = payload["sigma_c_kij_ev"]
+	on_shell_extracted = {name: payload.pop(name) for name in on_shell_names}
+	total = payload[name_total]
+	sigma_c_kij_ev = payload[name_c]
 	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"]
 	hartree_kij_ev = payload["hartree_kij_ev"]
 	hartree_scalar_kij_ev = payload["hartree_scalar_kij_ev"]
@@ -1640,11 +1706,17 @@ def write_sigma_omega_h5(
 			EQP_ASSEMBLY_EXPECTED_DATASET,
 			np.asarray(receipt_schema, dtype=np.int32),
 		)
-		io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
-		# The ω axis's own reference, stamped ON the ω axis — one place to
-		# look, and it cannot drift away from the array it describes.
+		# The ω axis (the on-shell energies) and its own reference, stamped ON
+		# it — one place to look, and it cannot drift away from the array it
+		# describes.
+		axis_name = OMEGA_DATASET
+		if on_shell is None:
+			io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
+		else:
+			axis_name = ON_SHELL_ENERGIES_DATASET.format(table="pair")
+			io.write_attr(SIGMA_EVALUATION_ATTR, np.asarray(b"on_shell"))
 		if omega_reference_ev is not None:
-			io.stamp_dataset_attrs(OMEGA_DATASET, {
+			io.stamp_dataset_attrs(axis_name, {
 				OMEGA_REFERENCE_ATTR: float(omega_reference_ev),
 				OMEGA_REFERENCE_PROVENANCE_ATTR: str(
 					omega_reference_provenance or "unstated"),
@@ -1654,7 +1726,7 @@ def write_sigma_omega_h5(
 			# ran at (``gw.ppm_windows.resolve_sigma_regularization``) --
 			# re-derived from the config here, not threaded, so the two
 			# cannot disagree by construction.
-			io.stamp_dataset_attrs(OMEGA_DATASET, {
+			io.stamp_dataset_attrs(axis_name, {
 				SIGMA_REGULARIZATION_ATTR:
 					float(sigma_regularization.resolved_ev),
 				SIGMA_REGULARIZATION_REQUESTED_ATTR:
@@ -1671,16 +1743,29 @@ def write_sigma_omega_h5(
 				np.asarray(compact_irr, dtype=np.int32))
 			io.write_attr(SYM_IDX_DATASET,
 				np.asarray(sym_idx_k, dtype=np.int32))
-		io.create_dataset("sigma_total_kij_ev",
+		def _cube_attrs(name):
+			at = _operator_attrs(name)
+			if on_shell is not None:
+				at[SIGMA_EVALUATION_ATTR] = "on_shell"
+				at["pair_slots"] = "Sigma_mn(E_m),Sigma_mn(E_n)"
+			return at
+		io.create_dataset(name_total,
 			shape=storage_shape, dtype=np.complex128,
-			attrs=_operator_attrs("sigma_total_kij_ev"))
-		_write_omega_cube(io, "sigma_total_kij_ev", total)
+			attrs=_cube_attrs(name_total))
+		_write_omega_cube(io, name_total, total)
 		del total
 		if sigma_c_kij_ev is not None:
-			io.create_dataset("sigma_c_kij_ev",
+			io.create_dataset(name_c,
 				shape=storage_shape, dtype=np.complex128,
-				attrs=_operator_attrs("sigma_c_kij_ev"))
-			_write_omega_cube(io, "sigma_c_kij_ev", sigma_c_kij_ev)
+				attrs=_cube_attrs(name_c))
+			_write_omega_cube(io, name_c, sigma_c_kij_ev)
+		for name, arr in on_shell_extracted.items():
+			# Energies are real; the diagonals and dSigma/domega complex.
+			dtype = np.float64 if name.startswith("onshell_") else np.complex128
+			at = dict(_attrs(name) or {})
+			at[SIGMA_EVALUATION_ATTR] = "on_shell"
+			io.create_dataset(name, shape=tuple(np.shape(arr)), dtype=dtype, attrs=at)
+			io.write_slab(name, np.asarray(arr, dtype=dtype))
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
 				shape=_operator_storage_shape(sigma_sx_kij_ev),
@@ -1852,15 +1937,28 @@ def append_eqp_assembly_receipt_h5(
 			f"append_eqp_assembly_receipt_h5: {abs_path} does not exist; the "
 			"receipt belongs to an existing sigma_mnk.h5 and never creates one.")
 
-	if assembly.sigma_c_omega_diag_ev is None:
+	on_shell = getattr(assembly, "sigma_c_on_shell", None)
+	if assembly.sigma_c_omega_diag_ev is None and on_shell is None:
 		raise ValueError(
 			"a dynamic sigma_mnk.h5 receipt requires an EqpAssembly carrying "
-			"its conditioned C(omega) curve.")
+			"its conditioned C(omega) curve or its on-shell operand.")
 	h = np.asarray(assembly.hartree_diag_ev, dtype=np.float64)
 	x = np.asarray(assembly.sigma_x_diag_ev, dtype=np.float64)
 	c = np.asarray(assembly.sigma_c_at_dft_diag_ev, dtype=np.complex128)
-	c_omega = np.asarray(
-		assembly.sigma_c_omega_diag_ev, dtype=np.complex128)
+	if on_shell is not None:
+		# The curve's place: the operand C(E_DFT) and Z came from.
+		curve_name = EQP_ASSEMBLY_C_ONSHELL_DATASET
+		curve_candidate = EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET
+		c_omega = np.stack([
+			np.asarray(on_shell.at_dft_ev, np.complex128),
+			np.asarray(on_shell.at_eval_ev, np.complex128),
+			np.asarray(on_shell.dsigma_at_eval, np.complex128),
+			np.asarray(on_shell.covered_kn, dtype=bool).astype(np.complex128)])
+	else:
+		curve_name = EQP_ASSEMBLY_C_OMEGA_DATASET
+		curve_candidate = EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET
+		c_omega = np.asarray(
+			assembly.sigma_c_omega_diag_ev, dtype=np.complex128)
 	h_transverse_obj = getattr(
 		assembly, "hartree_transverse_diag_ev", None)
 	component_aware = h_transverse_obj is not None
@@ -1883,12 +1981,12 @@ def append_eqp_assembly_receipt_h5(
 	if c_omega.ndim != 3 or c_omega.shape[1:] != h.shape:
 		raise ValueError(
 			"EQP assembly receipt needs the completed assembly's conditioned "
-			f"C(omega) curve with shape (n_omega,{h.shape[0]},{h.shape[1]}); "
-			f"got {c_omega.shape}.")
+			f"C(omega) curve with shape (n_omega,{h.shape[0]},{h.shape[1]}) "
+			f"(on shell: (4,...)); got {c_omega.shape}.")
 	if assembly.z_factor is None:
 		raise ValueError(
 			"a dynamic sigma_mnk.h5 receipt requires an EqpAssembly with Z "
-			"derived from its conditioned C(omega) curve.")
+			"derived from its conditioned C(omega) curve or on-shell operand.")
 	b0, b1 = int(assembly.band_offset), int(assembly.band_offset + h.shape[1])
 	if b0 < 0 or b1 <= b0 or h.shape[1] != b1 - b0:
 		raise ValueError(
@@ -2001,7 +2099,8 @@ def append_eqp_assembly_receipt_h5(
 					f"datasets {foreign_components}.")
 		candidate_names = [
 				EQP_ASSEMBLY_CANDIDATE_DATASET,
-				EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET]
+				EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
+				EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET]
 		if component_aware:
 			candidate_names.append(
 				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET)
@@ -2009,8 +2108,7 @@ def append_eqp_assembly_receipt_h5(
 			if name in h5:
 				del h5[name]
 		ds = h5.create_dataset(EQP_ASSEMBLY_CANDIDATE_DATASET, data=values)
-		h5.create_dataset(
-			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET, data=c_omega)
+		h5.create_dataset(curve_candidate, data=c_omega)
 		if component_aware:
 			h5.create_dataset(
 				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET,
@@ -2030,16 +2128,15 @@ def append_eqp_assembly_receipt_h5(
 		h5.flush()
 		canonical_names = [
 			EQP_ASSEMBLY_DATASET,
-			EQP_ASSEMBLY_C_OMEGA_DATASET]
+			EQP_ASSEMBLY_C_OMEGA_DATASET,
+			EQP_ASSEMBLY_C_ONSHELL_DATASET]
 		if component_aware:
 			canonical_names.append(EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET)
 		for name in canonical_names:
 			if name in h5:
 				del h5[name]
 		h5.move(EQP_ASSEMBLY_CANDIDATE_DATASET, EQP_ASSEMBLY_DATASET)
-		h5.move(
-			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
-			EQP_ASSEMBLY_C_OMEGA_DATASET)
+		h5.move(curve_candidate, curve_name)
 		if component_aware:
 			h5.move(
 				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET,
@@ -2053,7 +2150,7 @@ def append_eqp_assembly_receipt_h5(
 		print_fn(
 			f"  EQP assembly receipt -> {os.path.basename(abs_path)}: "
 			f"schema v{receipt_schema}, assembled H/X/C(E_DFT) {h.shape} "
-			f"+ conditioned C(omega) "
+			f"+ conditioned {'on-shell C' if on_shell is not None else 'C(omega)'} "
 			f"{c_omega.shape}, DFT H/X/C, "
 			f"file wedge, {policy}, "
 			f"live G-space H{component_text}; C(E_DFT) and Z share the "

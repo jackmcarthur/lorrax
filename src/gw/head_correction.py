@@ -2060,6 +2060,34 @@ class HeadSigmaDiag:
             out[cells] = _head_pole_sum(delta[:, cells], f[cells], pole, pref)[0]
         return out.reshape(slots.shape)
 
+    def on_shell(self, omega_kn_ry) -> tuple[np.ndarray, np.ndarray]:
+        """``(value, dvalue/domega)`` host (nk, nb) at per-state ``omega_kn_ry``.
+
+        The on-shell reader (``ppm_sigma.OnShellSigma.with_head``): the value
+        is :func:`_head_pole_sum` of each cell, the arithmetic of every other
+        reader; the derivative is its exact omega derivative,
+        ``-sum_p pref_p [f/(delta + z_p)^2 + (1 - f)/(delta - z_p)^2]``.
+        """
+        omega = np.asarray(omega_kn_ry, dtype=np.float64)
+        if omega.shape != self.enk_ry.shape:
+            raise ValueError(f"on-shell energies must be {self.enk_ry.shape}, got {omega.shape}")
+        value = np.zeros(omega.size, dtype=np.complex128)
+        deriv = np.zeros(omega.size, dtype=np.complex128)
+        if self.poles_ry.size:
+            delta = (omega - (self.enk_ry - self.efermi_ry)).reshape(1, -1)
+            f = self.occupations.reshape(-1)
+            pref = self.residues_ry / (self.cell_volume * float(self.nk_tot))
+            pole = self.poles_ry[:, None, None]
+            step = _head_cell_limit(self.poles_ry.size)
+            for i in range(0, omega.size, step):
+                cells = slice(i, i + step)
+                d, fc = delta[:, cells], f[cells][None, None, :]
+                value[cells] = _head_pole_sum(d, f[cells], pole, pref)[0]
+                deriv[cells] = -np.sum(pref[:, None, None] * (
+                    fc / (d[None] + pole) ** 2 + (1.0 - fc) / (d[None] - pole) ** 2),
+                    axis=0)[0]
+        return value.reshape(omega.shape), deriv.reshape(omega.shape)
+
     def select_k(self, select_rows) -> "HeadSigmaDiag":
         """The head on the k rows ``select_rows`` keeps (a leading-axis selector)."""
         return replace(

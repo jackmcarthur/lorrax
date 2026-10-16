@@ -135,6 +135,11 @@ class GWResults:
     # eqp1_raw columns.
     sigma_c_omega_diag_raw_ev: np.ndarray | None = None
     sigma_c_diag_at_dft_raw_ry: np.ndarray | None = None
+    #: The on-shell operands (``eqp_bgw.OnShellDiagonal``, full-BZ (nk, nb),
+    #: degeneracy-averaged like the curve) in place of the two curves above
+    #: when Sigma was evaluated on shell (``sigma_omega_grid_debug`` off).
+    sigma_c_on_shell_diag: object | None = None
+    sigma_c_on_shell_diag_raw: object | None = None
     omega_rel_ev: np.ndarray | None = None
     # The energies Σ WAS EVALUATED AT this call (``SigmaResult.e_eval_ev``),
     # absolute eV, shape (nk_result, nb_sigma).  E_DFT for a one-shot run;
@@ -739,6 +744,11 @@ def write_freq_debug(
     _has_photon_head = results.photon_head_sigma_basis is not None
     if not config.debug.sigma_freq_debug_output:
         return
+    if results.use_ppm and results.sigma_c_omega_diag_ev is None:
+        # The table's Sigma columns are reads of the omega curve.
+        print_fn("  sigma_freq_debug.dat: omitted, Sigma_c was evaluated on shell "
+                 "(no omega curve); set sigma_omega_grid_debug = true for this table")
+        return
     from file_io import write_sigma_freq_debug_table
     from .eqp_bgw import (
         compute_eqp_diag, compute_z_factor_from_omega_grid)
@@ -1121,7 +1131,7 @@ def write_qsgw_qp_ladders(
     # single-rank block; naming the layout costs the operator one line and
     # one rerun.
     if sigma_c_omega is None or omega_grid_ev is None:
-        omitted.append("qp_omega0_ev (no Σ_c(ω) cube in this run)")
+        omitted.append("qp_omega0_ev (no Σ_c(ω) cube in this run: a static mode, or Σ_c on shell — sigma_omega_grid_debug keeps it)")
     elif is_band_sharded_sigma_omega(sigma_c_omega):
         omitted.append(
             "qp_omega0_ev (sigma_omega_layout = sharded; the optional "
@@ -1687,6 +1697,13 @@ def write_results(
         sigma_c_at_dft_diag_ev = (
             _wedge_sigma_c(results.sigma_c_diag_at_dft_ry) * r2e
         )
+    elif results.use_ppm:
+        # A dynamic run with no Sigma_c(E_DFT): an SC run on shell, whose
+        # Sigma has no DFT-basis omega cube to read it from.  NaN, named,
+        # never the static COH column (zero in a dynamic mode).
+        print_fn("  sigma_diag.dat: sigC(E_DFT) omitted (NaN): the on-shell Sigma of an "
+                 "SC run has no DFT-basis Sigma(omega); sigma_omega_grid_debug restores it")
+        sigma_c_at_dft_diag_ev = np.full(np.shape(_wedge(corr_out)), np.nan + 0.0j)
     else:
         sigma_c_at_dft_diag_ev = _wedge(corr_out)
 
@@ -1700,13 +1717,17 @@ def write_results(
     sigma_c_omega_diag_ev_irr = None
     e_dft_rel_ev_irr = None
     e_eval_ev_irr = e_eval_rel_ev_irr = None
-    if results.sigma_c_omega_diag_ev is not None and results.omega_rel_ev is not None:
-        sigma_c_omega_diag_ev_irr = np.asarray(
-            results.sigma_c_omega_diag_ev, dtype=np.complex128
-        ).transpose(1, 0, 2)
-        # k axis is 1 on the omega cube; reduce on axis 0 and put it back.
-        sigma_c_omega_diag_ev_irr = _wedge_sigma_c(
-            sigma_c_omega_diag_ev_irr).transpose(1, 0, 2)
+    on_shell_irr = (None if results.sigma_c_on_shell_diag is None
+                    else results.sigma_c_on_shell_diag.map_rows(_wedge_sigma_c))
+    if on_shell_irr is not None or (
+            results.sigma_c_omega_diag_ev is not None and results.omega_rel_ev is not None):
+        if on_shell_irr is None:
+            sigma_c_omega_diag_ev_irr = np.asarray(
+                results.sigma_c_omega_diag_ev, dtype=np.complex128
+            ).transpose(1, 0, 2)
+            # k axis is 1 on the omega cube; reduce on axis 0 and put it back.
+            sigma_c_omega_diag_ev_irr = _wedge_sigma_c(
+                sigma_c_omega_diag_ev_irr).transpose(1, 0, 2)
         if results.efermi_ev is None:
             raise ValueError(
                 "write_results: results.efermi_ev required for PPM Z-factor; "
@@ -1750,9 +1771,10 @@ def write_results(
         hartree_transverse_diag_ev=hartree_transverse_diag_ev,
         sigma_x_diag_ev=sigma_x_diag_ev,
         sigma_c_at_dft_diag_ev=(
-            None if sigma_c_omega_diag_ev_irr is not None
+            None if (sigma_c_omega_diag_ev_irr is not None or on_shell_irr is not None)
             else sigma_c_at_dft_diag_ev),
         sigma_c_omega_diag_ev=sigma_c_omega_diag_ev_irr,
+        sigma_c_on_shell=on_shell_irr,
         omega_rel_ev=results.omega_rel_ev,
         e_dft_rel_ev=e_dft_rel_ev_irr,
         e_eval_ev=e_eval_ev_irr,
@@ -1770,7 +1792,26 @@ def write_results(
     # run's eqp0.dat/eqp1.dat.  The eqp files themselves carry the tail.
     raw_assembly = None
     sigma_c_raw_kn_ev = None
-    if (results.sigma_c_omega_diag_raw_ev is not None
+    if results.sigma_c_on_shell_diag_raw is not None and on_shell_irr is not None:
+        raw_irr = results.sigma_c_on_shell_diag_raw.map_rows(_wedge_sigma_c)
+        raw_assembly = assemble_eqp(
+            kpoints_irr_frac=kpts_irr,
+            band_offset=results.band_start,
+            e_dft_ev=e_dft_ev_irr,
+            kin_ion_diag_ev=kin_ion_diag_ev,
+            hartree_diag_ev=hartree_diag_ev,
+            hartree_scalar_diag_ev=hartree_scalar_diag_ev,
+            hartree_transverse_diag_ev=hartree_transverse_diag_ev,
+            sigma_x_diag_ev=sigma_x_diag_ev,
+            sigma_c_on_shell=raw_irr,
+            e_dft_rel_ev=e_dft_rel_ev_irr,
+            e_eval_ev=e_eval_ev_irr,
+            e_eval_rel_ev=e_eval_rel_ev_irr,
+            nspin=1,
+            print_fn=lambda *args, **kwargs: None,
+        )
+        sigma_c_raw_kn_ev = np.asarray(raw_irr.at_dft_ev)
+    elif (results.sigma_c_omega_diag_raw_ev is not None
             and sigma_c_omega_diag_ev_irr is not None):
         raw_omega_irr = _wedge_sigma_c(np.asarray(
             results.sigma_c_omega_diag_raw_ev, dtype=np.complex128

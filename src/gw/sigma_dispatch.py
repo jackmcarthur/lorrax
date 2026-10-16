@@ -156,6 +156,14 @@ class SigmaResult:
     sigma_c_omega_diag_unextrap_ry: np.ndarray | None = None
     sigma_c_at_dft_diag_unextrap_ev: np.ndarray | None = None
     sigma_c_omega_kij_ry: jax.Array | None = None
+    #: The ON-SHELL Sigma_c (``gw.ppm_sigma.OnShellSigma``: the QSGW pair and
+    #: the diagonal slots, head included), in place of
+    #: ``sigma_c_omega_kij_ry`` when ``sigma_omega_grid_debug`` is off.  Its
+    #: host eqp operand (``eqp_bgw.OnShellDiagonal``) rides beside it, and
+    #: the raw (un-extrapolated) twin's when the band extrapolation drives.
+    sigma_c_on_shell: object | None = None
+    sigma_c_on_shell_diag: object | None = None
+    sigma_c_on_shell_diag_unextrap: object | None = None
     sigma_band_axis: PaddedAxis | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     sigma_c_odd_at_dft_diag_ev: np.ndarray | None = None
@@ -279,6 +287,12 @@ SIGMA_BASIS_FIELDS = (
     # rotated, so the SC finalize drops them: raw columns are one-shot only.
     "sigma_c_omega_diag_unextrap_ry",
     "sigma_c_at_dft_diag_unextrap_ev",
+    # The on-shell Sigma and its eqp operands: frequencies tied to the
+    # compute basis's band indices, so no rotation acts on them (an SC
+    # finalize drops them; ``sigma_omega_grid_debug`` keeps a rotatable cube).
+    "sigma_c_on_shell",
+    "sigma_c_on_shell_diag",
+    "sigma_c_on_shell_diag_unextrap",
 )
 
 #: Band-indexed but read from the WFN file, hence DFT basis on every
@@ -330,6 +344,9 @@ SIGMA_RESULT_K_AXES = {
     "sigma_lorentz_skij_ry": 1,
     "photon_head_sigma_diag_tskn_ry": 2,
     "sigma_c_omega_kij_ry": 1,
+    "sigma_c_on_shell": 1,
+    "sigma_c_on_shell_diag": 0,
+    "sigma_c_on_shell_diag_unextrap": 0,
     "sigma_c_at_dft_diag_ev": 0,
     "sigma_c_odd_at_dft_diag_ev": 0,
     "sigma_c_omega_diag_unextrap_ry": 1,
@@ -642,6 +659,9 @@ def finalize_dynamic_sigma(
             efermi_ry=efermi_ry,
             efermi_provenance=efermi_provenance,
         )
+        on_shell = hasattr(sigma_c_omega, "request")
+        on_shell_diag = (_on_shell_eqp_operand(sigma_c_omega, sigma_band_axis)
+                         if on_shell else None)
         sigma_c_odd_at_dft_ev = None
         if sigma_c_odd_body_omega is not None:
             (sigma_c_odd_at_dft_ev,
@@ -750,7 +770,21 @@ def finalize_dynamic_sigma(
         # never mixed into the carry.
         sigma_xc_qsgw_unextrap = None
         raw_diag_ry = raw_at_dft_ev = None
-        if hasattr(sigma_c_body_omega_unextrap, "at_omega_slots"):
+        raw_on_shell_diag = None
+        if hasattr(sigma_c_body_omega_unextrap, "request"):
+            # The on-shell twin: N3's diagonals (its pair too under
+            # sigma_freq_debug_output), with the same head.
+            twin = add_head_sigma_diag(
+                sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry,
+                band_axis=sigma_band_axis)
+            raw_on_shell_diag = _on_shell_eqp_operand(twin, sigma_band_axis)
+            raw_at_dft_ev = raw_on_shell_diag.at_dft_ev
+            if twin.pair is not None:
+                sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
+                    twin, sig_x_rep, omega_grid_ev, e_qp_rel_ev, mesh_xy,
+                    band_axis=sigma_band_axis,
+                    out_of_grid=config.sigma.out_of_grid)
+        elif hasattr(sigma_c_body_omega_unextrap, "at_omega_slots"):
             # The default twin: N3's band diagonal (ppm_pipeline.
             # extrapolate_sigma_body).  The raw columns read the same
             # numbers as from the head-added cube below; the head is added
@@ -831,7 +865,10 @@ def finalize_dynamic_sigma(
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
         sigma_c_omega_diag_unextrap_ry=raw_diag_ry,
         sigma_c_at_dft_diag_unextrap_ev=raw_at_dft_ev,
-        sigma_c_omega_kij_ry=sigma_c_omega,
+        sigma_c_omega_kij_ry=None if on_shell else sigma_c_omega,
+        sigma_c_on_shell=sigma_c_omega if on_shell else None,
+        sigma_c_on_shell_diag=on_shell_diag,
+        sigma_c_on_shell_diag_unextrap=raw_on_shell_diag,
         sigma_band_axis=sigma_band_axis,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
         sigma_c_odd_at_dft_diag_ev=sigma_c_odd_at_dft_ev,
@@ -865,6 +902,22 @@ def finalize_dynamic_sigma(
         photon_head_sigma_diag_tskn_ry=photon_head_sigma_diag_tskn_ry,
         photon_head_sigma_basis=photon_head_sigma_basis,
     )
+
+
+def _on_shell_eqp_operand(sigma_c, band_axis):
+    """The eqp assembly's on-shell operand (``eqp_bgw.OnShellDiagonal``) in eV.
+
+    Sigma_c at E_DFT and at E_eval under the eqp readers' rule (an uncovered
+    state at omega = 0) and the exact dSigma_c/domega at E_eval, all read
+    from the slots the sweep filled (every rank enters: the reads are
+    collective).
+    """
+    from .eqp_bgw import OnShellDiagonal
+    return OnShellDiagonal(
+        at_dft_ev=sigma_c.diagonal("dft0", band_axis) * RYD_TO_EV,
+        at_eval_ev=sigma_c.diagonal("eval0", band_axis) * RYD_TO_EV,
+        dsigma_at_eval=sigma_c.diagonal("derivative", band_axis),
+        covered_kn=np.asarray(sigma_c.request.covered_kn, dtype=bool))
 
 
 # ---------------------------------------------------------------------------
@@ -1369,6 +1422,17 @@ def _compute_mpa_sigma(
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
         material_class=material_class,
         print_fn=print_fn)
+    from .dynamic_sigma import sigma_on_shell_request
+    on_shell_request = sigma_on_shell_request(
+        config, e_eval_ev=e_qp_ev, wfn=wfn, sym=sym, meta=meta,
+        band_slices=band_slices, efermi_ry=sigma_efermi_ry)
+    if on_shell_request is not None:
+        # The windows are planned on the states' own energies.
+        body_options.update(omega_grid_ry=on_shell_request.frequencies_ry,
+                            on_shell_request=on_shell_request)
+        print_fn(f"  Sigma_c on shell: {on_shell_request.n_table} energy table(s) "
+                 f"{on_shell_request.names}, "
+                 f"{on_shell_request.frequencies_ry.size} distinct frequencies")
     patch = getattr(config, "sc_coarse_windows_ev", None) or None
     if patch is not None:
         # THE COARSE (SEMICORE) WINDOWS (gw.qp_support): their samples sit in
@@ -1377,7 +1441,9 @@ def _compute_mpa_sigma(
         # at max(sigma_quadrature_eps, qp_support.SEMICORE_EPS).  The scalar
         # body and every sector call (mpa.sector_sigma) read the same labels.
         from .qp_support import window_labels
-        omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+        omega_ev = np.asarray(body_options["omega_grid_ry"], dtype=np.float64) * RYD_TO_EV
+        if on_shell_request is None:
+            omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
         eta_ev, group = window_labels(omega_ev, patch, _xi.resolved_ry * RYD_TO_EV)
         body_options.update(omega_eta_ry=eta_ev / RYD_TO_EV, omega_group=group,
                             group_fixed=tuple(bool(w[3]) for w in patch))
@@ -1426,10 +1492,15 @@ def _compute_mpa_sigma(
             where="sigma_dispatch MPA plan seam")
         # Before the checkpoint: the bracket plan is part of the sweep's identity.
         body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
-    checkpoint = _sweep_checkpoint(
-        config, input_dir, fit_identity, fit_digest, head, lorentz_output,
-        e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
-        efermi_ry=sigma_efermi_ry)
+    checkpoint = None
+    if on_shell_request is None:
+        checkpoint = _sweep_checkpoint(
+            config, input_dir, fit_identity, fit_digest, head, lorentz_output,
+            e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
+            efermi_ry=sigma_efermi_ry)
+    elif bool(getattr(config, "restart", False)):
+        print_fn("Sigma checkpoint: none on the on-shell route (it stores the omega "
+                 "cube); the sweep is recomputed")
     if checkpoint is not None and bool(getattr(config, "restart", False)):
         import common.timing as timing
         from file_io.sigma_checkpoint import read_sigma_checkpoint
