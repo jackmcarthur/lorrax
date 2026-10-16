@@ -53,6 +53,8 @@ TD_DEFAULTS = {
     "lorrax.method": "dp54",
     "lorrax.dt": None,
     "lorrax.n_corr": 2,
+    "lorrax.predictor": "cubic",
+    "lorrax.magnus_frame": "",
     "lorrax.model": "",
     "lorrax.kernel_file": "",
     "lorrax.isdf_input": "",
@@ -202,10 +204,11 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     if vals["lorrax.pair_rule"] not in PAIR_RULES:
         raise _gate("td_pair_rule", repr(vals["lorrax.pair_rule"]),
                     " | ".join(PAIR_RULES), "set [lorrax] pair_rule")
-    if vals["control.files.load_checkpoint_from"]:
-        raise _gate("td_checkpoint_restart", "load_checkpoint_from set",
-                    "a run from t0", "restart is not implemented in LORRAX's "
-                    "propagator; rerun from t0")
+    chk = vals["control.files.load_checkpoint_from"]
+    if chk and os.path.abspath(chk) == os.path.abspath(str(vals["control.files.outdir"])):
+        raise _gate("td_checkpoint_outdir", f"load_checkpoint_from = outdir = {chk!r}",
+                    "a new outdir (TDGW's rule: the restart writes a new tdgw.h5)",
+                    "set [control.files] outdir to another directory")
     if vals["system.patched_sampling"]:
         raise _gate("td_patched_sampling", "patched_sampling = true",
                     "a regular k grid", "use an unpatched header")
@@ -216,8 +219,23 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         raise _gate("td_method", repr(vals["lorrax.method"]), " | ".join(METHODS),
                     "set [lorrax] method")
     if int(vals["lorrax.n_corr"]) < 1:
-        raise _gate("td_n_corr", vals["lorrax.n_corr"], ">= 1",
-                    "a Magnus predictor without a correction is unstable")
+        raise _gate("td_n_corr", vals["lorrax.n_corr"], ">= 1 (with no correction the node "
+                    "history holds only predicted values and the step does not converge: "
+                    "order 0)", "set [lorrax] n_corr >= 1 (2 is the default)")
+    if vals["lorrax.predictor"] not in ("cubic", "linear") or (
+            vals["lorrax.predictor"] == "linear" and vals["lorrax.method"] != "cfm4"):
+        raise _gate("td_predictor", f"predictor = {vals['lorrax.predictor']!r} with "
+                    f"method {vals['lorrax.method']!r}",
+                    "cubic | linear (linear: cfm4 only)", "set [lorrax] predictor")
+    frame = vals["lorrax.magnus_frame"]
+    if frame not in ("", "whole_rho", "interaction") or (
+            frame and vals["lorrax.method"] not in ("magnus2", "cfm4")) or (
+            frame == "whole_rho" and vals["lorrax.method"] != "magnus2"):
+        raise _gate("td_magnus_frame", f"magnus_frame = {frame!r} with method "
+                    f"{vals['lorrax.method']!r}", "'' | whole_rho | interaction, for magnus2; "
+                    "cfm4 runs on Delta rho in the interaction picture only (its order 4 with "
+                    "Gamma and the intraband term, and no rounding floor)",
+                    "drop [lorrax] magnus_frame or use it with magnus2")
     model = vals["lorrax.model"] or (
         "none" if vals["control.calc_type"] == "IP" else "tdgw_kernel")
     if model not in MODELS:
@@ -261,21 +279,25 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         vals["lorrax.pair_gap_ev"] = float(vals["system.esmear"])
     for k in ("system.esmear", "system.depopulation", "system.dephasing"):
         vals[k] = float(vals[k]) / HA_IN_EV
-    if vals["lorrax.method"] != "dp54":
-        if vals["lorrax.dt"] is None:
-            raise _gate("td_dt", "no [lorrax] dt for a fixed-step method",
-                        "dt in attoseconds", "set [lorrax] dt")
+    if vals["lorrax.dt"] == "auto":
+        if vals["lorrax.method"] not in ("magnus2", "cfm4"):
+            raise _gate("td_dt", f"dt = 'auto' with method {vals['lorrax.method']!r}",
+                        "'auto' only for magnus2 / cfm4 (their step limit is measured "
+                        "on the model at the start of the run)", "set [lorrax] dt in as")
+    elif vals["lorrax.method"] != "dp54":
+        if vals["lorrax.dt"] is None or float(vals["lorrax.dt"]) <= 0.0:
+            raise _gate("td_dt", f"[lorrax] dt = {vals['lorrax.dt']!r} for a fixed-step "
+                        "method", "dt > 0 in attoseconds", "set [lorrax] dt")
         dt = float(vals["lorrax.dt"]) / T_IN_ATTOSEC
         ratio = vals["control.timesteps.dt_measure"] / dt
-        if abs(ratio - round(ratio)) > 1e-9 * max(1.0, ratio) or round(ratio) < 1:
-            raise _gate("td_dt_measure_multiple",
-                        f"dt_measure/dt = {ratio:.12g}",
-                        "a positive integer (samples land on steps)",
-                        "choose dt = dt_measure / n")
+        if (vals["lorrax.method"] == "magnus2"
+                and abs(ratio - round(ratio)) > 1e-9 * max(1.0, ratio)):
+            raise _gate("td_dense_output", f"magnus2 with dt_measure/dt = {ratio:.12g}",
+                        "samples on steps (an integer ratio): magnus2 freezes dSigma at "
+                        "one node, so a sample inside a step would be first order",
+                        "choose dt = dt_measure / n, or cfm4 / etdrk4 / rk4 (dense output)")
         vals["lorrax.dt"] = dt
-        vals["lorrax.n_sub"] = int(round(ratio))
     else:
-        vals["lorrax.n_sub"] = 1
         if vals["lorrax.dt"] is not None:
             raise _gate("td_dt", "[lorrax] dt with method = dp54",
                         "no dt (the controller chooses the steps)",

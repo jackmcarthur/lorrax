@@ -25,7 +25,8 @@ import scipy.constants as _cst
 __all__ = ["HA_IN_EV", "T_IN_ATTOSEC", "EFIELD_IN_VPERM", "HBAR_IN_EV_AS", "kernel_file_bands",
            "TDGW_LAYOUT_VERSION", "efield_function", "read_header",
            "header_operators", "read_bgw_kernel", "init_output",
-           "write_samples", "write_checkpoint", "dump_toml"]
+           "write_samples", "write_checkpoint", "read_checkpoint",
+           "copy_samples", "dump_toml", "LORRAX_CHECKPOINT"]
 
 # TDGW/constants.py, verbatim definitions
 HA_IN_EV = _cst.physical_constants["Hartree energy in eV"][0]
@@ -350,14 +351,68 @@ def write_samples(path: str, rows: dict):
                 td[name]["data"][start:start + len(data)] = data
 
 
-def write_checkpoint(path: str, *, it_next: int, tchkp: float, lessG):
-    """TDGW checkpoint: next measurement index, state time, G^< = i rho."""
+#: The group under ``tdgw_data/checkpoint`` holding LORRAX's integrator carry
+#: (TDGW and tdgw-pp read the checkpoint's three datasets and ignore it).
+LORRAX_CHECKPOINT = "lorrax"
+
+
+def write_checkpoint(path: str, *, it_next: int, tchkp: float, lessG, carry=None):
+    """TDGW checkpoint: next measurement index, state time, G^< = i rho.
+
+    ``carry`` = dict(leaves=[arrays], step=int, fingerprint=str) also
+    writes the integrator's whole carry (logical k) under
+    ``checkpoint/lorrax`` (``leaf_<i>`` datasets, attributes ``step``,
+    ``n_leaves``, ``fingerprint``), replacing the previous one, so a run
+    restarted from this file continues the uninterrupted one bitwise.
+    """
     import h5py
     with h5py.File(path, "a") as f:
         c = f["tdgw_data/checkpoint"]
         c["it_next"][...] = it_next
         c["tchkp"][...] = tchkp
         c["lessG_knn"][...] = lessG
+        if carry is not None:
+            if LORRAX_CHECKPOINT in c:
+                del c[LORRAX_CHECKPOINT]
+            g = c.create_group(LORRAX_CHECKPOINT)
+            for i, leaf in enumerate(carry["leaves"]):
+                g.create_dataset(f"leaf_{i:03d}", data=np.asarray(leaf))
+            g.attrs["n_leaves"] = len(carry["leaves"])
+            g.attrs["step"] = int(carry["step"])
+            g.attrs["fingerprint"] = carry["fingerprint"]
+
+
+def read_checkpoint(path: str) -> dict:
+    """The checkpoint of a ``tdgw.h5`` (read-only): TDGW's fields and LORRAX's carry.
+
+    Returns dict(it_next, tchkp, leaves, step, fingerprint); ``leaves`` is
+    None when the file has no LORRAX carry (a TDGW run's file).
+    """
+    import h5py
+    with h5py.File(path, "r") as f:
+        c = f["tdgw_data/checkpoint"]
+        out = dict(it_next=int(c["it_next"][()]), tchkp=float(c["tchkp"][()]),
+                   leaves=None, step=None, fingerprint=None)
+        if LORRAX_CHECKPOINT in c:
+            g = c[LORRAX_CHECKPOINT]
+            out["leaves"] = [g[f"leaf_{i:03d}"][()] for i in range(int(g.attrs["n_leaves"]))]
+            out["step"] = int(g.attrs["step"])
+            out["fingerprint"] = str(g.attrs["fingerprint"])
+    return out
+
+
+def copy_samples(src: str, dst: str, rows: dict):
+    """Copy rows [0, rows[name]) of each ``time_domain`` dataset of ``src`` into ``dst``.
+
+    TDGW's ``BaseDriver.load_data`` for a restart on the same measurement
+    grid; ``src`` is opened read-only.
+    """
+    import h5py
+    with h5py.File(src, "r") as a, h5py.File(dst, "a") as b:
+        ta, tb = a["tdgw_data/time_domain"], b["tdgw_data/time_domain"]
+        for name, n in rows.items():
+            if n:
+                tb[name]["data"][:n] = ta[name]["data"][:n]
 
 
 def _toml_value(v):

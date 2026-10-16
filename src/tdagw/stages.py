@@ -22,7 +22,8 @@ from tdagw.self_energy import (SelfEnergyModel, dense_kernel_from_tdgw_layout,
 from tdagw.td_config import TdDeck
 
 __all__ = ["TdSystem", "load_system", "build_self_energy", "open_outputs",
-           "sample_spec", "propagate", "describe", "summarize"]
+           "sample_spec", "restart_fingerprint", "load_checkpoint", "propagate",
+           "describe", "summarize"]
 
 
 class TdSystem(NamedTuple):
@@ -247,12 +248,20 @@ def open_outputs(deck: TdDeck, system: TdSystem) -> TdOutputs:
                      meas=tuple(meas), mtsteps=mtsteps)
 
 
-def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, rho_fn,
-                 t_state):
-    """Write measurement rows [i0, i1) and the checkpoint, process 0 only."""
-    rho = rho_fn()                                       # every rank gathers
+def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, state_fn,
+                 t_state, fingerprint: str):
+    """Write measurement rows [i0, i1) and the checkpoint, process 0 only.
+
+    The checkpoint holds TDGW's fields in every trial's file and the
+    integrator's whole carry (logical k) in the first trial's file.
+    """
+    rho, leaves, step = state_fn()                       # every rank gathers
     if process_rank() != 0:
         return
+    nk = system.nk
+    logical = [np.asarray(a) if np.ndim(a) < 3 else np.take(np.asarray(a), np.arange(nk),
+                                                            axis=np.ndim(a) - 3)
+               for a in leaves]
     for tr, path in enumerate(outs.paths):
         rows = {}
         for name, typ, kw, itr in outs.meas:
@@ -264,13 +273,205 @@ def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, rho_fn,
                 data = data[:, :system.nk]
             rows[name] = ((sel[0] - itr.start) // itr.step, data)
         tdgw_io.write_samples(path, rows)
+        carry = (dict(leaves=logical, step=step, fingerprint=fingerprint)
+                 if tr == 0 else None)
         tdgw_io.write_checkpoint(path, it_next=i1, tchkp=t_state,
-                                 lessG=1j * np.asarray(rho)[tr, :system.nk])
+                                 lessG=1j * np.asarray(rho)[tr, :system.nk], carry=carry)
+
+
+def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
+                        dt=None) -> str:
+    """The settings a checkpoint's carry is valid for, as one JSON string.
+
+    Everything that changes the arithmetic of a step or the sample grid:
+    integrator, step and controller, run window (tf only for dp54, whose
+    last step is clipped at tf), drives, dissipation, intraband term,
+    window, k list size, header source, self-energy model, measurements.
+    The chunk length is not in it (chunking does not change a value).
+    ``dt`` is the step the run uses (``lorrax.dt = 'auto'`` resolved).
+    """
+    import json
+    v = dict(deck.values)
+    if dt is not None:
+        v["lorrax.dt"] = float(dt)
+    keys = ["lorrax.method", "lorrax.dt", "lorrax.n_corr", "lorrax.predictor", "control.ivp.atol",
+            "control.ivp.rtol", "control.timesteps.max_step", "control.timesteps.t0",
+            "control.timesteps.dt_measure", "system.depopulation", "system.dephasing",
+            "system.esmear", "system.geometry", "system.ibndmin", "system.ibndmax",
+            "lorrax.intraband", "lorrax.system", "lorrax.bundle_input",
+            "control.files.load_header_from"]
+    if v["lorrax.method"] == "dp54":
+        keys.append("control.timesteps.tf")
+    fp = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in keys}
+    fp["lorrax.magnus_frame"] = magnus_frame(v)
+    fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
+              nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
+              measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
+                            for n, t, kw in deck.measurements])
+    return json.dumps(fp, sort_keys=True, default=str)
+
+
+def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
+                    outs: TdOutputs, dt=None):
+    """The resume record of ``[control.files] load_checkpoint_from``, or None.
+
+    Reads the checkpointed run's ``tdgw.h5`` (the first trial's file holds
+    the carry), refuses a carry made under other settings
+    (:func:`restart_fingerprint`), copies the measurement rows already
+    taken into this run's files (process 0) and returns dict(carry, step,
+    i_next) for :func:`tdagw.propagate.run_propagation`.
+    """
+    import json
+    src = deck.values["control.files.load_checkpoint_from"]
+    if not src:
+        return None
+    ntr = len(deck.trials)
+    paths = ([os.path.join(src, "tdgw.h5")] if ntr == 1 else
+             [os.path.join(src, f"trial-{i}", "tdgw.h5") for i in range(ntr)])
+    rec = tdgw_io.read_checkpoint(paths[0])
+    if rec["leaves"] is None or rec["it_next"] < 0:
+        raise ValueError(
+            f"GATE td_restart_carry: got: {paths[0]} without a LORRAX integrator carry "
+            f"(it_next {rec['it_next']}); want: a checkpoint written by "
+            f"tdagw.tdgw_jax; why: a TDGW checkpoint holds the state, not the integrator's "
+            f"carry (dSigma history, step controller), so the run cannot continue exactly; "
+            f"fix: rerun from t0")
+    want = json.loads(restart_fingerprint(deck, system, model, dt))
+    got = json.loads(rec["fingerprint"])
+    diff = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))
+    if diff:
+        raise ValueError(
+            f"GATE td_restart_settings: got: checkpoint settings differing in "
+            f"{', '.join(diff)}; want: the checkpointed run's settings; why: its carry "
+            f"would continue a different calculation; fix: restart with the deck of "
+            f"{src} (only outdir, load_checkpoint_from, chunk and, for fixed steps, tf "
+            f"may change)")
+    if process_rank() == 0:
+        for path_src, path_dst in zip(paths, outs.paths):
+            rows = {name: len(range(itr.start, min(itr.stop, rec["it_next"]), itr.step))
+                    for name, _, _, itr in outs.meas}
+            tdgw_io.copy_samples(path_src, path_dst, rows)
+    return dict(carry=rec["leaves"], step=rec["step"], i_next=rec["it_next"],
+                tchkp=rec["tchkp"], source=src)
+
+
+def magnus_frame(v) -> str:
+    """The Magnus frame of a deck: [lorrax] magnus_frame, else whole_rho for magnus2."""
+    return v["lorrax.magnus_frame"] or ("whole_rho" if v["lorrax.method"] == "magnus2"
+                                        else "interaction")
+
+
+def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mesh, *,
+                       auto: bool, say):
+    """The corrected Magnus step limit on this model: refuse, or pick dt for 'auto'.
+
+    Two tests on the model itself.  (1) σ = :func:`tdagw.propagate.coupling_radius`
+    (power iteration) and the scalar recurrence's limit dt_σ =
+    :func:`tdagw.propagate.magnus_dt_limit`: a step above it refuses.  (2) The
+    scheme's own step, field off, from a random coherence
+    (:func:`tdagw.propagate.step_growth`) at PROBE_STEP_FACTOR × dt must not grow
+    (g <= 1 + PROBE_TOLERANCE): an accepted step lies a measured 25 % below the
+    instability.  The recurrence treats the coupling as static; in the
+    interaction picture it is not, and on the 30x30 df714 CrI3 model the real
+    limit lies below dt_σ (above it on the 6x6 2v2c one).  'auto' starts at
+    dt_σ and backtracks by PROBE_BACKTRACK until the probe passes (floored to
+    0.01 as; magnus2: dt_measure / n).  The whole_rho frame of magnus2 has no
+    recurrence (its predictor extrapolates the lab-frame dSigma): the probe
+    alone decides, and 'auto' starts at dt_measure.  Returns (cfg with dt, the
+    receipt).
+    """
+    T = tdgw_io.T_IN_ATTOSEC
+    sigma, est = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0)
+    dt_sig, y_lim = tp.magnus_dt_limit(cfg, sigma)
+    if cfg.frame == "whole_rho":                       # no static limit: the probe decides
+        dt_sig, y_lim = cfg.dt_measure, float("nan")
+    probes = []
+
+    def snap(dt):
+        dt_as = np.floor(dt * T * 100.0) / 100.0
+        if cfg.method == "magnus2":
+            dt_as = cfg.dt_measure * T / np.ceil(cfg.dt_measure / (dt_as / T) - 1e-9)
+        return float(dt_as) / T
+
+    def probe(dt):
+        h = tp.PROBE_STEP_FACTOR * dt
+        g = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0)[0]
+        probes.append(dict(dt_as=dt * T, probe_dt_as=h * T, growth=g))
+        return g <= 1.0 + tp.PROBE_TOLERANCE
+
+    if sigma <= 0.0:                                  # no coupling: any step is stable
+        if auto:
+            cfg = cfg._replace(dt=cfg.dt_measure)
+        stable = True
+    elif auto:
+        dt = snap(dt_sig)
+        for _ in range(tp.PROBE_BACKTRACKS):
+            if probe(dt):
+                break
+            dt = snap(tp.PROBE_BACKTRACK * dt)
+        else:
+            raise ValueError(
+                f"GATE td_magnus_stability: got: no step down to {probes[-1]['dt_as']:.4g} as "
+                f"whose probe at {tp.PROBE_STEP_FACTOR} dt stays bounded (growth "
+                f"{probes[-1]['growth']:.4g} per step); want: a step the scheme is stable at "
+                f"with a 25 % margin; why: a mode of the coupling grows from rounding, "
+                f"independent of the drive; fix: set [lorrax] dt explicitly, more corrections, "
+                f"or method = 'etdrk4' / 'dp54'")
+        cfg = cfg._replace(dt=dt)
+        stable = True
+    else:
+        stable = (cfg.frame == "whole_rho" or cfg.dt <= dt_sig) and probe(cfg.dt)
+    receipt = dict(sigma_ev=sigma * tdgw_io.HA_IN_EV, y=cfg.dt * sigma, y_lim=y_lim,
+                   dt_max_as=dt_sig * T, change=float(abs(est[-1] - est[-2]) / est[-1]),
+                   probes=probes)
+    pr = "; ".join(f"{q['growth']:.4g} per step at {q['probe_dt_as']:.4g} as" for q in probes)
+    say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius of the "
+        f"dSigma commutator map, {len(est)} power iterations, last change "
+        f"{100 * receipt['change']:.2g} %), h*sigma = {receipt['y']:.3g}, "
+        + (f"limit {y_lim:.3g} ({cfg.method}, {cfg.predictor} predictor, n_corr {cfg.n_corr}) "
+           f"-> dt <= {receipt['dt_max_as']:.4g} as" if cfg.frame != "whole_rho" else
+           f"whole_rho frame (no static limit)") + (f"; probe {pr}" if probes else "")
+        + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
+    if not stable and cfg.frame != "whole_rho" and cfg.dt > dt_sig:
+        alts = []
+        for nc, pre in ((cfg.n_corr + 1, cfg.predictor), (cfg.n_corr, "linear")):
+            if pre == "linear" and cfg.method != "cfm4":
+                continue
+            d, _ = tp.magnus_dt_limit(cfg._replace(n_corr=nc, predictor=pre), sigma)
+            alts.append(f"n_corr = {nc}, predictor = {pre!r}: dt <= {d * T:.4g} as")
+        raise ValueError(
+            f"GATE td_magnus_stability: got: dt = {cfg.dt * T:.4g} as, h*sigma = "
+            f"{receipt['y']:.3g} with sigma = {receipt['sigma_ev']:.4g} eV (the spectral radius "
+            f"of the linearized dSigma commutator map on this model); want: h*sigma*"
+            f"{tp.STABILITY_MARGIN} <= {y_lim:.3g}, the imaginary-axis stability limit of "
+            f"{cfg.method} with the {cfg.predictor} predictor and n_corr = {cfg.n_corr}; why: "
+            f"a mode of the coupling grows from rounding, independent of the drive; fix: "
+            f"[lorrax] dt = 'auto', or dt <= {receipt['dt_max_as']:.4g} as subject to the probe, or "
+            + "; ".join(alts) + ", or method = 'etdrk4' / 'dp54'")
+    if not stable:
+        q = probes[-1]
+        raise ValueError(
+            f"GATE td_magnus_stability: got: dt = {cfg.dt * T:.4g} as passes the sigma limit "
+            f"({receipt['dt_max_as']:.4g} as{'; whole_rho: none' if cfg.frame == 'whole_rho' else ''}) "
+            f"but the scheme's own step at "
+            f"{tp.PROBE_STEP_FACTOR} dt = {q['probe_dt_as']:.4g} as grows by {q['growth']:.4g} "
+            f"per step on this model (field off, {tp.PROBE_STEPS} steps from a random "
+            f"coherence); want: growth <= {1.0 + tp.PROBE_TOLERANCE:.4g} at {tp.PROBE_STEP_FACTOR} "
+            f"dt, a 25 % margin; why: in the interaction picture the coupling is time dependent, "
+            f"so the static limit can overestimate the stable step, and a mode grows from "
+            f"rounding independent of the drive; fix: [lorrax] dt = 'auto' (the largest step "
+            f"that passes), a smaller dt, or method = 'etdrk4' / 'dp54'")
+    return cfg, receipt
 
 
 def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
               outs: TdOutputs, mesh, *, say=print) -> dict:
-    """Run the propagation; returns counters and walls (seconds)."""
+    """Run the propagation from t0, or from the checkpoint the deck names.
+
+    ``[control.files] load_checkpoint_from`` continues that run exactly
+    (:func:`load_checkpoint`: its rows are copied, its carry resumed).
+    Returns counters and walls (seconds).
+    """
     v = deck.values
     ntr = len(deck.trials)
     rho0 = np.zeros((ntr, system.nk_pad, system.nb, system.nb), complex)
@@ -283,22 +484,29 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
                    for _, typ, _, _ in outs.meas if typ in ("density_matrix", "lessG"))
     if dm_bytes:
         chunk = max(1, min(chunk, int(TILE_BYTES // dm_bytes)))
+    auto = v["lorrax.dt"] == "auto"
     cfg = tp.PropagatorConfig(
         method=v["lorrax.method"], t0=v["control.timesteps.t0"],
         tf=v["control.timesteps.tf"], dt_measure=v["control.timesteps.dt_measure"],
-        dt=float(v["lorrax.dt"] or v["control.timesteps.dt_measure"]),
-        n_sub=int(v["lorrax.n_sub"]), n_corr=int(v["lorrax.n_corr"]),
+        dt=float(v["control.timesteps.dt_measure"] if auto or not v["lorrax.dt"]
+                 else v["lorrax.dt"]),
+        n_corr=int(v["lorrax.n_corr"]), predictor=v["lorrax.predictor"], frame=magnus_frame(v),
         atol=float(v["control.ivp.atol"]), rtol=float(v["control.ivp.rtol"]),
         max_step=float(v["control.timesteps.max_step"]), chunk=min(chunk, nt),
         remainder=bool(v["system.depopulation"] != 0.0
                        or v["system.dephasing"] != 0.0
                        or system.ops.intra is not None))
+    check = None
+    if cfg.method in ("magnus2", "cfm4"):
+        cfg, check = _magnus_step_check(cfg, system, model, drive, mesh, auto=auto, say=say)
+    resume = load_checkpoint(deck, system, model, outs, cfg.dt)
     count = ntr * system.nk * system.nb * system.nb
+    fingerprint = restart_fingerprint(deck, system, model, cfg.dt)
     walls = []
     t_start = time.perf_counter()
 
-    def on_chunk(i0, i1, samples, rho_fn, t_state):
-        _write_chunk(outs, system, i0, i1, samples, rho_fn, t_state)
+    def on_chunk(i0, i1, samples, state_fn, t_state):
+        _write_chunk(outs, system, i0, i1, samples, state_fn, t_state, fingerprint)
         walls.append(time.perf_counter())
         say(f"  samples {i0:7d}-{i1 - 1:7d}  t = {t_state * tdgw_io.T_IN_ATTOSEC:12.3f} as"
             f"  wall {walls[-1] - t_start:9.2f} s")
@@ -308,11 +516,17 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             cfg, sample_spec(deck, system), tp.place_state(rho0, mesh),
             system.ops, model, drive, mesh, cell_volume=system.cell_volume,
             nspinor=system.nspinor, count=count, mtsteps=outs.mtsteps,
-            on_chunk=on_chunk)
+            on_chunk=on_chunk, resume=resume)
+    stats["check_dsigma"] = 0 if check is None else (
+        2 * tp.COUPLING_POWER_ITERATIONS + len(check["probes"]) * tp.PROBE_STEPS
+        * tp.dsigma_per_step(cfg.method, cfg.n_corr))
+    stats["check_probes"] = [] if check is None else check["probes"]
+    stats["dt"] = cfg.dt
     stats["wall"] = time.perf_counter() - t_start
     stats["wall_first_chunk"] = (walls[0] - t_start) if walls else 0.0
     stats["chunk"] = cfg.chunk
-    stats["simulated_fs"] = (cfg.tf - cfg.t0) * tdgw_io.T_IN_ATTOSEC / 1000.0
+    t_from = cfg.t0 if resume is None else float(resume["tchkp"])
+    stats["simulated_fs"] = (stats["t_final"] - t_from) * tdgw_io.T_IN_ATTOSEC / 1000.0
     return stats
 
 
@@ -323,7 +537,8 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
     step = ("adaptive (SciPy RK45 controller), atol %.3g rtol %.3g, first step "
             "dt_measure" % (v["control.ivp.atol"], v["control.ivp.rtol"])
             if v["lorrax.method"] == "dp54" else
-            "fixed dt = %.6g as (%d per sample)" % (v["lorrax.dt"] * T, v["lorrax.n_sub"]))
+            "fixed dt = %.6g as (dt_measure / dt = %.6g)" % (
+                v["lorrax.dt"] * T, v["control.timesteps.dt_measure"] / v["lorrax.dt"]))
     lines = [
         "TD-aGW propagation (TDGW conventions)",
         f"  deck            : {deck.source}",
@@ -357,6 +572,9 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
                 f"  gauge receipt   : <0|r|S> of {bd['n_states']} BSE states from the header r "
                 f"and the eigenvectors vs bse_jax's: rel dev {bd['dipole_rel_dev']:.2e}, "
                 f"I+ {bd['i_plus_rel_dev']:.2e}, I- {bd['i_minus_rel_dev']:.2e}")
+    if v["control.files.load_checkpoint_from"]:
+        lines.append(f"  restart from    : {v['control.files.load_checkpoint_from']} "
+                     f"(its integrator carry; values continue bitwise)")
     unused = td_config.unused_keys(deck)
     if unused:
         lines.append("  read, not used  : " + ", ".join(unused)

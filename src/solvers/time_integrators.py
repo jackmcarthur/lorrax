@@ -15,19 +15,24 @@ The families, with the equation each step integrates:
   linear part integrated exactly through φ-functions
   (Hochbruck & Ostermann, Acta Numer. 19, 209 (2010), §2.3, the scheme of
   Krogstad, J. Comput. Phys. 203, 72 (2005)).
-* **Magnus, unitary** (:func:`magnus_midpoint_step`, :func:`cfm4_step`):
-  the isospectral flow y' = -i[H(t, y), y] with H = A(t) + B(t, y), where A is
-  cheap and known at every t and B is the expensive state-dependent part.
-  Each exponential is applied by the caller's ``conjugate(H, y, tau)`` =
-  exp(-i tau H) y exp(+i tau H); the predictor extrapolates B from earlier
-  steps so the step itself pays only the corrector evaluations of B.
-* **Strang splitting** (:func:`strang_step`): S(h) = R(h/2) ∘ M(h) ∘ R(h/2)
-  for a remainder flow R that the unitary step does not contain.
+* **Magnus in the interaction picture of a free flow, on a deviation**
+  (:func:`ip_magnus_step` with :func:`ip_cf4_flow` or
+  :func:`ip_midpoint_flow`): the isospectral flow
+  y' = -i[A0 + A(t) + B(t, y), y] with A0 constant and exactly integrable
+  (``free(X, s) = e^{-isA0} X e^{isA0}``), A(t) cheap and known at every t,
+  B(t, y) the expensive state-dependent part, and a stationary y_eq of A0.
+  The state is the deviation x = y - y_eq and every exponential acts on the
+  interaction-picture generator G_I(s) = e^{isA0} (A + B) e^{-isA0} only, so
+  each term of an update has the size of x, not of y.
+* **Composed Strang splitting** (:func:`compose_strang`):
+  R(f1 h/2) M(f1 h) R((f1 + f2) h/2) … M(fn h) R(fn h/2) for a remainder
+  flow R that the unitary step does not contain; ``(1,)`` is Strang (order
+  2), :data:`TRIPLE_JUMP` is Yoshida's fourth-order composition.
 
 Stepping loops live in :func:`dp54_advance` (adaptive, emits samples from
 the dense output at caller-given times) and :func:`fixed_advance` (fixed
-step, a sample every ``n_sub`` steps); both are ``lax`` loops with no host
-round trip.
+step, samples at arbitrary times from the method's dense output); both are
+``lax`` loops with no host round trip.
 """
 from __future__ import annotations
 
@@ -43,9 +48,14 @@ __all__ = [
     "DP54_SAFETY", "DP54_MIN_FACTOR", "DP54_MAX_FACTOR", "DP54_ERROR_EXPONENT",
     "Dp54State", "dp54_initial_state", "dp54_step", "dp54_error_norm", "dp54_dense", "dp54_advance",
     "rk4_step", "phi_functions", "EtdCoefficients", "etdrk4_coefficients", "etdrk4_step",
-    "extrapolation_weights", "MIDPOINT_HISTORY", "CFM4_HISTORY",
-    "magnus_midpoint_step", "cfm4_step", "strang_step", "fixed_advance",
-    "CFM4_NODES", "CFM4_WEIGHTS",
+    "hermite_dense",
+    "extrapolation_weights", "lagrange_weights",
+    "CFM4_NODES", "CFM4_WEIGHTS", "CFM4_HISTORY", "MIDPOINT_NODES", "MIDPOINT_HISTORY",
+    "CF4_QUADRATURE", "TRIPLE_JUMP",
+    "ip_cf4_flow", "ip_midpoint_flow", "ip_magnus_step", "frozen_generator",
+    "magnus_midpoint_step",
+    "magnus_amplification", "magnus_stability_limit", "magnus_growth",
+    "compose_strang", "fixed_advance",
 ]
 
 # ---------------------------------------------------------------------------
@@ -313,9 +323,13 @@ def dp54_advance(rhs: Callable, state: Dp54State, *, t_bound, max_step,
 # Classical RK4
 # ---------------------------------------------------------------------------
 
-def rk4_step(rhs: Callable, t, y, h):
-    """Classical fourth-order Runge–Kutta step for y' = rhs(t, y)."""
-    k1 = rhs(t, y)
+def rk4_step(rhs: Callable, t, y, h, k1=None):
+    """Classical fourth-order Runge–Kutta step for y' = rhs(t, y).
+
+    ``k1`` = rhs(t, y) when the caller already has it (first-same-as-last
+    carry of the fixed-step driver); the arithmetic is the same either way.
+    """
+    k1 = rhs(t, y) if k1 is None else k1
     k2 = rhs(t + 0.5 * h, y + (0.5 * h) * k1)
     k3 = rhs(t + 0.5 * h, y + (0.5 * h) * k2)
     k4 = rhs(t + h, y + h * k3)
@@ -388,14 +402,15 @@ def etdrk4_coefficients(lam, h) -> EtdCoefficients:
         b4=4.0 * p3 - p2)
 
 
-def etdrk4_step(nonlin: Callable, coef: EtdCoefficients, t, y, h):
+def etdrk4_step(nonlin: Callable, coef: EtdCoefficients, t, y, h, n1=None):
     """One Krogstad ETDRK4 step of y' = lam ∘ y + nonlin(t, y).
 
     ``coef`` = :func:`etdrk4_coefficients` (lam, h), broadcastable to y.
-    Four evaluations of ``nonlin``; exact for nonlin = const and stiff
-    order 4 under the conditions of Hochbruck & Ostermann (2010).
+    Four evaluations of ``nonlin`` (three when the caller passes
+    ``n1`` = nonlin(t, y)); exact for nonlin = const and stiff order 4 under
+    the conditions of Hochbruck & Ostermann (2010).
     """
-    n1 = nonlin(t, y)
+    n1 = nonlin(t, y) if n1 is None else n1
     a = coef.e_half * y + h * coef.a21 * n1
     n2 = nonlin(t + 0.5 * h, a)
     b = coef.e_half * y + h * (coef.a31 * n1 + coef.a32 * n2)
@@ -406,9 +421,44 @@ def etdrk4_step(nonlin: Callable, coef: EtdCoefficients, t, y, h):
                                   + coef.b4 * n4)
 
 
+def hermite_dense(lam, y0, n0, y1, n1, h, theta):
+    """y(t + θh) for y' = lam ∘ y + n(t), cubic Hermite in the frame of ``lam``.
+
+    u(s) = e^{-lam s} ∘ y(t + s) has u' = e^{-lam s} ∘ n, so the phases and
+    decays of ``lam`` are carried exactly and only the slow amplitude is
+    interpolated: u(θh) from u(0) = y0, u'(0) = n0, u(h) = e^{-lam h} y1,
+    u'(h) = e^{-lam h} n1 (the four cubic Hermite basis polynomials), then
+    y(t + θh) = e^{lam θh} ∘ u(θh).  Local error O(h^4 |u''''|), the global
+    order of a fourth-order step; θ = 0 and θ = 1 return y0 and y1 to
+    rounding.  ``n`` is the derivative minus ``lam ∘ y`` at each end.
+    """
+    back = jnp.exp(-lam * h)
+    th = theta
+    h00 = (2.0 * th - 3.0) * th * th + 1.0
+    h10 = ((th - 2.0) * th + 1.0) * th
+    h01 = (3.0 - 2.0 * th) * th * th
+    h11 = (th - 1.0) * th * th
+    u = h00 * y0 + (h * h10) * n0 + h01 * (back * y1) + (h * h11) * (back * n1)
+    return jnp.exp(lam * (th * h)) * u
+
+
 # ---------------------------------------------------------------------------
-# Magnus integrators for y' = -i[A(t) + B(y), y]
+# Magnus in the interaction picture of a free flow, on a deviation
 # ---------------------------------------------------------------------------
+#
+# The equation is y' = -i[A0 + A(t) + B(t, y), y] (+ a remainder flow, see
+# compose_strang) with three caller callables:
+#
+#   free(X, s)          = e^{-isA0} X e^{isA0}, the exact free flow (A0 constant);
+#   conj_dev(W, x, tau) = e^{-i tau W} (y_eq + x) e^{i tau W} - y_eq, the unitary
+#                         conjugation of the full state written for the
+#                         deviation x = y - y_eq, every term of the size of x
+#                         (y_eq is stationary: free(y_eq, s) = y_eq);
+#   generator(t)        = A(t) + B(t), Schrödinger picture.
+#
+# In the frame of the step start t, x_I(s) = free(x(t + s), -s) obeys
+# x_I' = -i[G_I(s), y_eq + x_I] with G_I(s) = free(generator(t + s), -s): the
+# exponentials see the coupling only, never A0, and A0's phases are exact.
 
 #: Gauss–Legendre nodes c1 < c2 on [0, 1] and the CFM4 weights
 #: alpha1 = (3 - 2 sqrt3)/12, alpha2 = (3 + 2 sqrt3)/12 (Blanes & Moan 2006;
@@ -416,6 +466,12 @@ def etdrk4_step(nonlin: Callable, coef: EtdCoefficients, t, y, h):
 CFM4_NODES = (0.5 - np.sqrt(3.0) / 6.0, 0.5 + np.sqrt(3.0) / 6.0)
 CFM4_WEIGHTS = ((3.0 - 2.0 * np.sqrt(3.0)) / 12.0,
                 (3.0 + 2.0 * np.sqrt(3.0)) / 12.0)
+#: The exponential midpoint rule's one node.
+MIDPOINT_NODES = (0.5,)
+#: Gauss–Legendre rule on [0, 1] for the moments of the interaction-picture
+#: generator in :func:`ip_cf4_flow`: (nodes, weights).  With the two CFM4
+#: nodes the moment form IS CFET4:2.
+CF4_QUADRATURE = (CFM4_NODES, (0.5, 0.5))
 
 
 def extrapolation_weights(past, target) -> np.ndarray:
@@ -444,16 +500,87 @@ CFM4_HISTORY = (-2.0 + 0.5 - np.sqrt(3.0) / 6.0, -2.0 + 0.5 + np.sqrt(3.0) / 6.0
                 -1.0 + 0.5 - np.sqrt(3.0) / 6.0, -1.0 + 0.5 + np.sqrt(3.0) / 6.0)
 
 
+def frozen_generator(field: Callable, free: Callable, t, h, nodes, values) -> Callable:
+    """generator(t') = A(t') + B_frozen(t') with B frozen as a polynomial in time.
+
+    ``values[i]`` is B at t + nodes[i] h in the interaction picture of t;
+    B_frozen(t + s) = free(p(s), s) with p the Lagrange polynomial through
+    the node values (constant for one node, linear for two).  Defined for
+    every t', so a composition that steps outside [t, t + h] (the triple
+    jump) still integrates one fixed smooth equation.
+    """
+    nodes = tuple(float(c) for c in nodes)
+
+    def generator(ta):
+        s = ta - t
+        u = s / h
+        p = None
+        for i, ci in enumerate(nodes):
+            li = 1.0
+            for j, cj in enumerate(nodes):
+                if j != i:
+                    li = li * ((u - cj) / (ci - cj))
+            p = li * values[i] if p is None else p + li * values[i]
+        return field(ta) + free(p, s)
+    return generator
+
+
+def ip_cf4_flow(generator: Callable, free: Callable, conj_dev: Callable, t, x, h,
+                quadrature=CF4_QUADRATURE):
+    """Commutator-free fourth-order Magnus over [t, t + h], interaction picture.
+
+    With the moments of G_I(s) = free(generator(t + s), -s),
+
+        B0 = (1/h) ∫_0^h G_I(s) ds,   B1 = (12/h) ∫_0^h (s/h - 1/2) G_I(s) ds
+
+    (``quadrature`` = Gauss–Legendre (nodes, weights) on [0, 1]),
+
+        x_I(h) = Ψ(B0/2 + B1/6) Ψ(B0/2 - B1/6) x,   Ψ(W) x = conj_dev(W, x, h),
+
+    the right exponential applied first (= exp(-ih(α2 G1 + α1 G2)) of
+    CFET4:2 at the two Gauss nodes; Blanes, Casas & Ros, BIT 40, 434 (2000)
+    for the moment form), and x(t + h) = free(x_I(h), h).  Fourth order;
+    unitary in y = y_eq + x for any h; two calls of ``conj_dev``.
+    """
+    xq, wq = quadrature
+    b0 = b1 = None
+    for xi, wi in zip(xq, wq):
+        s = float(xi) * h
+        g = free(generator(t + s), -s)
+        b0 = float(wi) * g if b0 is None else b0 + float(wi) * g
+        c = 12.0 * float(wi) * (float(xi) - 0.5)
+        if c != 0.0:
+            b1 = c * g if b1 is None else b1 + c * g
+    y = conj_dev(0.5 * b0 - b1 / 6.0, x, h)
+    y = conj_dev(0.5 * b0 + b1 / 6.0, y, h)
+    return free(y, h)
+
+
+def ip_midpoint_flow(generator: Callable, free: Callable, conj_dev: Callable, t, x, h):
+    """Exponential midpoint rule, interaction picture: x_I(h) = Ψ(G_I(h/2)) x.
+
+    Second order; unitary in y = y_eq + x; one call of ``conj_dev``.
+    """
+    g = free(generator(t + 0.5 * h), -0.5 * h)
+    return free(conj_dev(g, x, h), h)
+
+
 def magnus_midpoint_step(explicit: Callable, state_part: Callable,
                          conjugate: Callable, t, y, h, b_guess, *, n_iter):
-    """Exponential midpoint rule with a self-consistent midpoint Hamiltonian.
+    """Exponential midpoint rule on the whole state, self-consistent midpoint Hamiltonian.
 
     y_{n+1} = exp(-i h H_m) y_n exp(+i h H_m),
     H_m = A(t + h/2) + B(t + h/2, (y_n + y_{n+1})/2),
     solved by ``n_iter`` fixed-point corrections (each one evaluation of B)
     from ``b_guess``, a prediction of B at the midpoint.  ``n_iter`` may be
-    traced.  Second order; unitary for any ``n_iter``.  Returns
-    (y_{n+1}, B_m); B_m feeds the next predictor.
+    traced.  Second order; unitary for any ``n_iter``.  B at the average of
+    the end states is the implicit-midpoint structure: for B = the gradient
+    of a quadratic energy (a Hermitian kernel) and A constant, the energy
+    Tr(A y) + (1/2)<y - y_eq, B> is conserved exactly when the corrections
+    have converged (Tr(H_m (U y U^H - y)) = 0), and to the iteration error
+    otherwise.  It conjugates the whole y, so its rounding is about ε|y| per
+    step (a floor ∝ 1/E0 for a weak-field deviation; ip_magnus_step has
+    none).  Returns (y_{n+1}, B_m); B_m feeds the next predictor.
     """
     a_mid = explicit(t + 0.5 * h)
 
@@ -464,104 +591,217 @@ def magnus_midpoint_step(explicit: Callable, state_part: Callable,
     return conjugate(a_mid + b, y, h), b
 
 
-def cfm4_step(explicit: Callable, state_part: Callable, conjugate: Callable,
-              t, y, h, b_guess, *, n_corr):
-    """Commutator-free Magnus step CFET4:2, fourth order for the commutator flow alone.
+def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
+                   free: Callable, t, x, h, guess, *, nodes, n_corr):
+    """One predictor–corrector Magnus step on the deviation x = y - y_eq.
 
-    Composed by :func:`strang_step` with a remainder that does not commute
-    with it (relaxation Γ ≠ 0, the TD-aGW intraband term) the step is second
-    order (measured 2.00 for any Γ ≠ 0; 2.0 on CrI3 with the intraband term).
-    It conjugates the whole y, so its rounding is about ε|y| per step: for a
-    small deviation Δy from a stationary y (weak-field Δρ) the relative error
-    has a floor of about (ε|y|/|Δy|)·√N_steps that rises as h shrinks
-    (3.4e-6 at 25 as to 1.3e-5 at 2 as on CrI3 at 100 V/m).
+    B is frozen as the polynomial through its values at the ``nodes``
+    (offsets in units of h; :data:`CFM4_NODES` or :data:`MIDPOINT_NODES`),
+    held in the interaction picture of t.  ``guess`` predicts them.  Each
+    of the ``n_corr`` corrections (may be traced) propagates x from t to
+    every node with ``inner(generator, t, x, tau)`` over the frozen
+    generator and evaluates B there (``state_part(t', x)``, the expensive
+    call): len(nodes) evaluations per correction.  The step is
+    ``inner`` over [t, t + h] with the final node values, so B is evaluated
+    only at the nodes however ``inner`` is composed (a fourth-order
+    composition of a remainder costs exponentials, not B).  A correction
+    contracts the node error by O(h ||dB/dy||).  Consistency: a predictor of
+    order m reaches the scheme's order after max(1, order - m) corrections,
+    and at least one is required (with none the history holds only predicted
+    values: measured order 0).  Stability is a separate bound: the corrected
+    step is stable only while h·σ stays below a limit that is not monotone in
+    ``n_corr`` (:func:`magnus_stability_limit`; cubic CFM4 predictor 0.117 /
+    0.730 / 1.144 for 1 / 2 / 3 corrections), and the static σ can
+    overestimate it, so a run measures its own step
+    (``tdagw.propagate.step_growth``).
 
-    y_{n+1} = V2 V1 y_n V1^H V2^H with
-    V1 = exp(-i h (alpha2 H1 + alpha1 H2)) applied first,
-    V2 = exp(-i h (alpha1 H1 + alpha2 H2)),
-    H_i = A(t + c_i h) + B(t + c_i h, y(t + c_i h)) at the Gauss nodes c_i.
-
-    ``b_guess = (B1, B2)`` predicts B at the two nodes.  Each of the
-    ``n_corr`` corrections (may be traced) propagates y_n to both nodes by
-    the same CFM4 formula on [t, t + c_i h] with B interpolated linearly
-    through the current node values (A exact) and re-evaluates B there: two
-    evaluations of B and four exponentials per correction, two exponentials
-    for the step.  A correction contracts the node error by O(h ||dB/dy||),
-    so a predictor of order m reaches the scheme's order 4 after
-    max(1, 4 - m) corrections: at least one, because the returned node
-    values feed the next predictor, and with none B is extrapolated from its
-    own guesses and never sees y (the cubic history predictor then stays at
-    error 0.27 under step halving in the unit test, where one correction
-    gives order 4.5-5.5 and two give 3.95-3.99).  One correction is unstable
-    on the CrI3 COHSEX kernel from 50 as, so the TD-aGW driver defaults to
-    two.  Returns (y_{n+1}, (B1, B2)).
+    Returns (x(t + h), node values in the frame of t).
     """
-    c1, c2 = CFM4_NODES
-    al1, al2 = CFM4_WEIGHTS
+    nodes = tuple(float(c) for c in nodes)
 
-    def to_node(c, b1, b2):
-        # CFM4 over [t, t + c h], B linear through (c1 h, b1), (c2 h, b2)
-        s1, s2 = c1 * c * h, c2 * c * h
-        lin = lambda s: b1 + ((s - c1 * h) / ((c2 - c1) * h)) * (b2 - b1)
-        h1 = explicit(t + s1) + lin(s1)
-        h2 = explicit(t + s2) + lin(s2)
-        y1 = conjugate(al2 * h1 + al1 * h2, y, c * h)
-        return conjugate(al1 * h1 + al2 * h2, y1, c * h)
+    def corr(_, g):
+        gen = frozen_generator(field, free, t, h, nodes, g)
+        return tuple(free(state_part(t + c * h, inner(gen, t, x, c * h)), -c * h)
+                     for c in nodes)
 
-    def corr(_, b):
-        b1, b2 = b
-        return (state_part(t + c1 * h, to_node(c1, b1, b2)),
-                state_part(t + c2 * h, to_node(c2, b1, b2)))
-
-    b1, b2 = jax.lax.fori_loop(0, n_corr, corr, tuple(b_guess))
-    h1 = explicit(t + c1 * h) + b1
-    h2 = explicit(t + c2 * h) + b2
-    y1 = conjugate(al2 * h1 + al1 * h2, y, h)
-    return conjugate(al1 * h1 + al2 * h2, y1, h), (b1, b2)
+    g = jax.lax.fori_loop(0, n_corr, corr, tuple(guess))
+    return inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g
 
 
-def strang_step(core: Callable, remainder: Callable, t, y, h):
-    """S(h) = R(t + h/2 -> t + h) ∘ M(t -> t + h) ∘ R(t -> t + h/2).
+def _node_quadrature(nodes):
+    """A[i, j] = ∫_0^{c_i} ℓ_j, b[j] = ∫_0^1 ℓ_j for the Lagrange basis ℓ_j on ``nodes``."""
+    from numpy.polynomial import polynomial as npoly
+    nodes = np.asarray(nodes, float)
+    m = nodes.size
+    a, b = np.zeros((m, m)), np.zeros(m)
+    for j in range(m):
+        c = np.array([1.0])
+        for k in range(m):
+            if k != j:
+                c = npoly.polymul(c, np.array([-nodes[k], 1.0]) / (nodes[j] - nodes[k]))
+        ic = npoly.polyint(c)
+        b[j] = npoly.polyval(1.0, ic)
+        a[:, j] = npoly.polyval(nodes, ic)
+    return a, b
 
-    ``core(t, y, h)`` and ``remainder(t, y, tau)`` advance y over [t, t+h]
-    and [t, t+tau].  Second order in the splitting error [M, R].  ``core``
-    may return (y, aux); the aux is passed through.
+
+def magnus_amplification(nodes, history, n_corr: int, z) -> np.ndarray:
+    """The linearized predictor–corrector Magnus step on u' = λu, z = hλ.
+
+    For a coupling B linear in the deviation (linear response), every
+    eigenmode of the coupling map evolves alone, B = λu up to a constant,
+    and :func:`ip_magnus_step` reduces to the recurrence on
+    s = (u_n, G of the ``history`` nodes), G = h B:
+
+        G <- W G_hist                      (the predictor; W of extrapolation_weights)
+        G <- z u_n 1 + z A G               (each of n_corr corrections)
+        u_{n+1} = u_n + b·G,  history <- the newest len(history) node values,
+
+    A, b the integrals of the Lagrange basis on the nodes (for the two Gauss
+    nodes: the 2-stage Gauss collocation matrix, |eig A| = 1/(2 sqrt 3), so
+    the corrections are its fixed-point iteration).  Returns the
+    (1 + len(history))-square matrix of that map.
     """
-    y = remainder(t, y, 0.5 * h)
-    out = core(t, y, h)
-    y, aux = out if isinstance(out, tuple) else (out, None)
-    y = remainder(t + 0.5 * h, y, 0.5 * h)
-    return (y, aux) if isinstance(out, tuple) else y
+    a, b = _node_quadrature(nodes)
+    w = extrapolation_weights(history, list(nodes))
+    m, nh = w.shape
+    out = np.zeros((1 + nh, 1 + nh), complex)
+    for col in range(1 + nh):
+        s0 = np.zeros(1 + nh, complex)
+        s0[col] = 1.0
+        u, hist = s0[0], s0[1:]
+        g = w @ hist
+        for _ in range(int(n_corr)):
+            g = z * u * np.ones(m) + z * (a @ g)
+        out[:, col] = np.concatenate([[u + b @ g], np.concatenate([hist, g])[-nh:]])
+    return out
+
+
+def magnus_stability_limit(nodes, history, n_corr: int, *, growth: float = 1e-6,
+                           y_cap: float = 8.0, dy: float = 1e-3) -> float:
+    """Largest y with spectral radius of magnus_amplification(i y') <= 1 + growth for all y' <= y.
+
+    The stability interval of the predictor–corrector step on the imaginary
+    axis (Hermitian couplings: TDA, or a full BSE with real frequencies): a
+    step h is stable for a coupling map of spectral radius σ when h σ <= y.
+    ``growth`` is the largest per-step growth of any mode accepted (1e-6:
+    1 % over 10^4 steps); scanned on a grid of spacing ``dy`` up to
+    ``y_cap``.  Values (growth 1e-6, dy 1e-3), CFM4 nodes: cubic predictor
+    (CFM4_HISTORY) 0.117 / 0.730 / 1.144 for 1 / 2 / 3 corrections, linear
+    (the last step's two nodes) 0.625 / 1.203 / 0.231; the midpoint rule's
+    quadratic predictor 0.126 at 2.  Not monotone in the corrections: the
+    truncated fixed-point (Picard) iteration of a collocation is unstable on
+    the imaginary axis at some truncation orders, as explicit RK of order 1
+    and 2 are.  ``tests/tdagw/test_prop_stability_cpu.py`` checks the
+    recurrence against the growth of the real step.
+    """
+    for y in np.arange(dy, y_cap + 0.5 * dy, dy):
+        if magnus_growth(nodes, history, n_corr, y) > 1.0 + growth:
+            return float(y - dy)
+    return float(y_cap)
+
+
+def magnus_growth(nodes, history, n_corr: int, y: float) -> float:
+    """Growth per step of the recurrence at z = i y: the spectral radius of magnus_amplification."""
+    return float(np.max(np.abs(np.linalg.eigvals(
+        magnus_amplification(nodes, history, n_corr, 1j * float(y))))))
 
 
 # ---------------------------------------------------------------------------
-# Fixed-step loop with periodic samples
+# Splitting of a remainder flow: Strang and its fourth-order composition
 # ---------------------------------------------------------------------------
 
-def fixed_advance(step: Callable, carry, *, t_start, h, n_sub: int,
-                  n_samples: int, sample_fn: Callable, step0=0):
-    """Sample, then take ``n_sub`` fixed steps, ``n_samples`` times.
+_CBRT2 = 2.0 ** (1.0 / 3.0)
+#: Yoshida's triple jump (Phys. Lett. A 150, 262 (1990)): S4(h) =
+#: S2(g1 h) S2(g0 h) S2(g1 h), g1 = 1/(2 - 2^(1/3)), g0 = 1 - 2 g1; fourth
+#: order for any symmetric second-order S2.
+TRIPLE_JUMP = (1.0 / (2.0 - _CBRT2), -_CBRT2 / (2.0 - _CBRT2), 1.0 / (2.0 - _CBRT2))
 
-    ``step(t, carry, h) -> carry``; ``sample_fn(t, carry) -> pytree``.
-    Times are ``t_start + (step0 + i) * h`` from an integer step counter,
-    so no rounding accumulates over a long run.  Returns
-    (carry, samples) with samples stacked along a new leading axis; the
-    carry is at time ``t_start + (step0 + n_samples * n_sub) * h``.
+
+def compose_strang(core: Callable, remainder: Callable, t, y, h, fractions=(1.0,)):
+    """∏_j S2(f_j h), S2(τ) at a = R(a + τ/2 -> a + τ) ∘ M(a -> a + τ) ∘ R(a -> a + τ/2).
+
+    ``core(a, y, tau)`` and ``remainder(a, y, tau)`` advance y over
+    [a, a + tau] (tau may be negative).  Adjacent remainder pieces are merged
+    into one call over the joined interval, so the composition calls
+    ``remainder`` len(fractions) + 1 times: R(f1 h/2) M(f1 h)
+    R((f1 + f2) h/2) … M(fn h) R(fn h/2).  ``(1,)`` is Strang (second order
+    in the splitting error [M, R]); :data:`TRIPLE_JUMP` cancels the h^3
+    error of the symmetric S2 and is fourth order (Yoshida 1990), with
+    fourth-order (or exact) core and remainder flows.
     """
-    def one(carry_i, _):
-        carry, i = carry_i
-        t = t_start + i.astype(jnp.float64) * h
-        out = sample_fn(t, carry)
+    f = tuple(float(v) for v in fractions)
+    y = remainder(t, y, 0.5 * f[0] * h)
+    a = t
+    for j, fj in enumerate(f):
+        y = core(a, y, fj * h)
+        r0 = a + 0.5 * fj * h
+        a = a + fj * h
+        tail = 0.5 * fj * h + (0.5 * f[j + 1] * h if j + 1 < len(f) else 0.0)
+        y = remainder(r0, y, tail)
+    return y
 
-        def sub(ci, _):
-            c, j = ci
-            return (step(t_start + j.astype(jnp.float64) * h, c, h), j + 1), None
 
-        (carry, i), _ = jax.lax.scan(sub, (carry, i), None, length=int(n_sub),
-                                     unroll=1)
-        return (carry, i), out
+# ---------------------------------------------------------------------------
+# Fixed-step loop with samples from the dense output
+# ---------------------------------------------------------------------------
 
-    (carry, _), samples = jax.lax.scan(
-        one, (carry, jnp.asarray(step0, jnp.int64)), None,
-        length=int(n_samples), unroll=1)
-    return carry, samples
+def fixed_advance(step: Callable, dense: Callable, state_of: Callable, carry, *,
+                  t_start, h, step0, n_steps: int, sample_step, sample_theta,
+                  sample_times, sample_fn: Callable):
+    """Take ``n_steps`` fixed steps from step ``step0``, emitting every sample on the way.
+
+    Step j covers [t_j, t_j + h] with t_j = t_start + j h from the integer
+    counter (no rounding accumulates over a long run).
+    ``step(t, carry, h, t_next) -> (carry, aux)`` with t_next = t_{j+1} from
+    the same counter (a first-same-as-last derivative evaluated at t_next
+    is bitwise the next step's own first stage);
+    ``dense(t, carry_old, carry_new, aux, theta) -> state`` at t + θh;
+    ``state_of(carry) -> state``; ``sample_fn(t, state) -> pytree``.
+
+    Sample i lies in step ``sample_step[i]`` at fraction ``sample_theta[i]``
+    in [0, 1) (ascending in time, all in [step0, step0 + n_steps)): θ = 0
+    samples ``state_of`` at t_j before the step (bitwise the stepped state,
+    at time t_j), θ > 0 the dense output after the step (at
+    ``sample_times[i]``).  Returns (carry, samples), samples stacked on a new
+    leading axis of length len(sample_times).
+    """
+    n = int(sample_times.shape[0])
+    template = jax.eval_shape(sample_fn, jnp.asarray(t_start, jnp.float64),
+                              state_of(carry))
+    buf0 = jax.tree.map(lambda s: jnp.zeros((n,) + s.shape, s.dtype), template)
+    last = max(n - 1, 0)
+
+    def put(buf, i, val):
+        return jax.tree.map(lambda a, v: jax.lax.dynamic_update_index_in_dim(
+            a, v, i, axis=0), buf, val)
+
+    def due(i, j):
+        k = jnp.minimum(i, last)
+        return (i < n) & (sample_step[k] == j)
+
+    def boundary(i, buf, j, t, c):
+        cond = lambda ib: due(ib[0], j) & (sample_theta[jnp.minimum(ib[0], last)] == 0.0)
+        body = lambda ib: (ib[0] + 1, put(ib[1], ib[0], sample_fn(t, state_of(c))))
+        return jax.lax.while_loop(cond, body, (i, buf))
+
+    def interior(i, buf, j, t, c0, c1, aux):
+        def body(ib):
+            k, b = ib
+            val = sample_fn(sample_times[k], dense(t, c0, c1, aux, sample_theta[k]))
+            return k + 1, put(b, k, val)
+        return jax.lax.while_loop(lambda ib: due(ib[0], j), body, (i, buf))
+
+    def one(cib, _):
+        c, i, buf, j = cib
+        t = t_start + j.astype(jnp.float64) * h
+        if n:
+            i, buf = boundary(i, buf, j, t, c)
+        c1, aux = step(t, c, h, t_start + (j + 1).astype(jnp.float64) * h)
+        if n:
+            i, buf = interior(i, buf, j, t, c, c1, aux)
+        return (c1, i, buf, j + 1), None
+
+    init = (carry, jnp.int32(0), buf0, jnp.asarray(step0, jnp.int64))
+    (carry, _, buf, _), _ = jax.lax.scan(one, init, None, length=int(n_steps), unroll=1)
+    return carry, buf

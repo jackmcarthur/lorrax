@@ -12,6 +12,11 @@ G1 adapter dSigma == 1/2 K (rho - rho_eq) for both terms, SEX, Hartree,
    K the explicit-sum kernel, rel <= 1e-12; k pads stay exactly zero
 R1 the same apply without the Ry -> Ha halving fails G1
 R2 rho_eq = 0 (the model sees rho, not Delta rho) fails G1
+G2 (AUDIT B10) the adapter's optimized HLO holds the model's own collectives
+   plus exactly four all-to-all (the staged batch->face and face->batch
+   movers, one shard per rank each) and nothing else
+R3 the adapter resharding by one sharding constraint adds all-gathers (GSPMD
+   replicates the state on every device) and fails G2
 """
 import json
 import os
@@ -52,3 +57,18 @@ def test_tda_matches_the_projected_kernel(result):
     r = result["both:tda"]
     assert r["rel"] <= 1e-12 and r["pad"] == 0.0, r
     assert not result["both:twin_tda_full"]["rel"] <= 1e-12, result["both:twin_tda_full"]
+
+
+def _only_four_all_to_all(extra):
+    return (not extra["removed"] and len(extra["added"]) == 4
+            and all(a.startswith("all-to-all:") for a in extra["added"]))
+
+
+def test_adapter_moves_by_four_all_to_all(result):
+    assert _only_four_all_to_all(result["b10:adapter"]), result["b10:adapter"]
+
+
+def test_red_twin_constraint_reshard_gathers(result):
+    extra = result["b10:twin_constraint"]
+    assert not _only_four_all_to_all(extra), extra
+    assert any(a.startswith("all-gather:") for a in extra["added"]), extra
