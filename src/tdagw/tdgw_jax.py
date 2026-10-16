@@ -10,7 +10,8 @@ from the TDGW run named by ``load_header_from``, propagates
     H(t) = diag(E^QP) + E(t)·r^inter + dSigma[rho(t)]
 
 and writes ``tdgw.h5`` + ``tdgw.toml`` that ``tdgw-pp`` reads unchanged
-(one directory per batched drive).  Theory and integrators:
+(one directory per batched drive); ``load_checkpoint_from`` continues a
+run from its last checkpoint, bitwise.  Theory and integrators:
 ``docs/theory/td_agw_propagation.md``.
 """
 from __future__ import annotations
@@ -52,7 +53,7 @@ def main(argv=None):
         outs = stages.open_outputs(deck, system)                 # tdgw.h5 + tdgw.toml
         run.emit(stages.describe(deck, system, model, RUNTIME))
         stats = stages.propagate(deck, system, model, drive, outs,
-                                 RUNTIME.mesh, say=run.emit)
+                                 RUNTIME.mesh, say=run.emit)     # from t0 or the checkpoint
         run.emit(stages.summarize(deck, stats))
         run.complete(files=[("tdgw.h5", "written", p) for p in outs.paths])
     return 0

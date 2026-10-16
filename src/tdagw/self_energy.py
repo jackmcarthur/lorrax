@@ -191,24 +191,32 @@ def _isdf_apply(static, params, rho, t):
 
     P permutes TDGW's k order into the model's flat C order
     (``tdagw.model.flat_k_rows``) and pads the band axes to the model's
-    carrier; the model's operator runs on its own layout
-    ``P(None, None, 'x', 'y')`` (k whole, bands on the mesh), so one
-    all-to-all moves rho there and one moves dSigma back.
+    carrier.  The model's operator runs on its own layout
+    ``P(None, None, 'x', 'y')`` (k whole, bands on the mesh); Delta rho
+    moves there from the propagator's ``P(None, ('x','y'), None, None)``
+    by :func:`common.staged_reshard.batch_to_face_reshard` and dSigma back
+    by :func:`common.staged_reshard.face_to_batch_reshard`: two
+    ``all_to_all`` per direction inside one ``shard_map``, one shard per
+    rank at every stage (a sharding constraint between the two layouts
+    makes GSPMD replicate the whole state on every device).  The band pad,
+    the k permutation and the k pad are local in the layout they run in.
     """
     del t
-    from jax.lax import with_sharding_constraint
-    from tdagw.model import build_td_agw_apply, td_state_sharding
+    from common.staged_reshard import batch_to_face_reshard, face_to_batch_reshard
+    from tdagw.model import build_td_agw_apply
     mesh, kgrid, nspinor, nb_pad, rows, perm, nk, sex, hartree = static
     ops, rho_eq = params
     d = rho - rho_eq[None]
     nb, nk_pad = d.shape[-1], d.shape[1]
     d = jnp.pad(d, ((0, 0), (0, 0), (0, nb_pad - nb), (0, nb_pad - nb)))
-    d = with_sharding_constraint(d, td_state_sharding(mesh))
-    x = jnp.take(d, jnp.asarray(perm), axis=1)
+    d = batch_to_face_reshard(mesh, lead=1)(d)                 # k whole, bands on the mesh
+    x = jnp.take(d, jnp.asarray(perm), axis=1)                 # the model's C-order k rows
     model = dict(zip(_ISDF_OPERANDS, ops), kgrid=kgrid, nspinor=nspinor)
     y = build_td_agw_apply(mesh, model, sex=sex, hartree=hartree)(x)
-    y = jnp.take(y, jnp.asarray(rows), axis=1)[..., :nb, :nb]
-    return 0.5 * jnp.pad(y, ((0, 0), (0, nk_pad - nk), (0, 0), (0, 0)))
+    y = jnp.take(y, jnp.asarray(rows), axis=1)                 # back to the propagator's k order
+    y = jnp.pad(y, ((0, 0), (0, nk_pad - nk), (0, 0), (0, 0)))
+    y = face_to_batch_reshard(mesh, lead=1)(y)                 # k on the mesh again
+    return 0.5 * y[..., :nb, :nb]
 
 
 def isdf_model(model: dict, mesh, *, k_frac, rho_eq, sex: bool = True,
@@ -239,6 +247,9 @@ def isdf_model(model: dict, mesh, *, k_frac, rho_eq, sex: bool = True,
             f"GATE td_isdf_window: got: model window {model['n_bands']} bands; "
             f"want: the propagated {nb}; fix: load the model with the deck's "
             f"[system] ibndmin..ibndmax")
+    from common.staged_reshard import batch_to_face_reshard, face_to_batch_reshard
+    batch_to_face_reshard(mesh, lead=1)            # build (and warm) both movers now,
+    face_to_batch_reshard(mesh, lead=1)            # on every rank, outside any trace
     static = (mesh, tuple(int(n) for n in model["kgrid"]), int(model["nspinor"]),
               int(model["nb_pad"]), tuple(rows.tolist()),
               tuple(np.argsort(rows).tolist()), int(rows.size), bool(sex),

@@ -22,7 +22,8 @@ from tdagw.self_energy import (SelfEnergyModel, dense_kernel_from_tdgw_layout,
 from tdagw.td_config import TdDeck
 
 __all__ = ["TdSystem", "load_system", "build_self_energy", "open_outputs",
-           "sample_spec", "propagate", "describe", "summarize"]
+           "sample_spec", "restart_fingerprint", "load_checkpoint", "propagate",
+           "describe", "summarize"]
 
 
 class TdSystem(NamedTuple):
@@ -245,12 +246,20 @@ def open_outputs(deck: TdDeck, system: TdSystem) -> TdOutputs:
                      meas=tuple(meas), mtsteps=mtsteps)
 
 
-def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, rho_fn,
-                 t_state):
-    """Write measurement rows [i0, i1) and the checkpoint, process 0 only."""
-    rho = rho_fn()                                       # every rank gathers
+def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, state_fn,
+                 t_state, fingerprint: str):
+    """Write measurement rows [i0, i1) and the checkpoint, process 0 only.
+
+    The checkpoint holds TDGW's fields in every trial's file and the
+    integrator's whole carry (logical k) in the first trial's file.
+    """
+    rho, leaves, step = state_fn()                       # every rank gathers
     if process_rank() != 0:
         return
+    nk = system.nk
+    logical = [np.asarray(a) if np.ndim(a) < 3 else np.take(np.asarray(a), np.arange(nk),
+                                                            axis=np.ndim(a) - 3)
+               for a in leaves]
     for tr, path in enumerate(outs.paths):
         rows = {}
         for name, typ, kw, itr in outs.meas:
@@ -262,13 +271,91 @@ def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, rho_fn,
                 data = data[:, :system.nk]
             rows[name] = ((sel[0] - itr.start) // itr.step, data)
         tdgw_io.write_samples(path, rows)
+        carry = (dict(leaves=logical, step=step, fingerprint=fingerprint)
+                 if tr == 0 else None)
         tdgw_io.write_checkpoint(path, it_next=i1, tchkp=t_state,
-                                 lessG=1j * np.asarray(rho)[tr, :system.nk])
+                                 lessG=1j * np.asarray(rho)[tr, :system.nk], carry=carry)
+
+
+def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel) -> str:
+    """The settings a checkpoint's carry is valid for, as one JSON string.
+
+    Everything that changes the arithmetic of a step or the sample grid:
+    integrator, step and controller, run window (tf only for dp54, whose
+    last step is clipped at tf), drives, dissipation, intraband term,
+    window, k list size, header source, self-energy model, measurements.
+    The chunk length is not in it (chunking does not change a value).
+    """
+    import json
+    v = deck.values
+    keys = ["lorrax.method", "lorrax.dt", "lorrax.n_corr", "control.ivp.atol",
+            "control.ivp.rtol", "control.timesteps.max_step", "control.timesteps.t0",
+            "control.timesteps.dt_measure", "system.depopulation", "system.dephasing",
+            "system.esmear", "system.geometry", "system.ibndmin", "system.ibndmax",
+            "lorrax.intraband", "lorrax.system", "lorrax.bundle_input",
+            "control.files.load_header_from"]
+    if v["lorrax.method"] == "dp54":
+        keys.append("control.timesteps.tf")
+    fp = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in keys}
+    fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
+              nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
+              measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
+                            for n, t, kw in deck.measurements])
+    return json.dumps(fp, sort_keys=True, default=str)
+
+
+def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
+                    outs: TdOutputs):
+    """The resume record of ``[control.files] load_checkpoint_from``, or None.
+
+    Reads the checkpointed run's ``tdgw.h5`` (the first trial's file holds
+    the carry), refuses a carry made under other settings
+    (:func:`restart_fingerprint`), copies the measurement rows already
+    taken into this run's files (process 0) and returns dict(carry, step,
+    i_next) for :func:`tdagw.propagate.run_propagation`.
+    """
+    import json
+    src = deck.values["control.files.load_checkpoint_from"]
+    if not src:
+        return None
+    ntr = len(deck.trials)
+    paths = ([os.path.join(src, "tdgw.h5")] if ntr == 1 else
+             [os.path.join(src, f"trial-{i}", "tdgw.h5") for i in range(ntr)])
+    rec = tdgw_io.read_checkpoint(paths[0])
+    if rec["leaves"] is None or rec["it_next"] < 0:
+        raise ValueError(
+            f"GATE td_restart_carry: got: {paths[0]} without a LORRAX integrator carry "
+            f"(it_next {rec['it_next']}); want: a checkpoint written by "
+            f"tdagw.tdgw_jax; fix: rerun from t0 (a TDGW checkpoint holds the state, not "
+            f"the integrator's carry, and cannot continue a run exactly)")
+    want = json.loads(restart_fingerprint(deck, system, model))
+    got = json.loads(rec["fingerprint"])
+    diff = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))
+    if diff:
+        raise ValueError(
+            f"GATE td_restart_settings: got: checkpoint settings differing in "
+            f"{', '.join(diff)}; want: the checkpointed run's settings; why: its carry "
+            f"would continue a different calculation; fix: restart with the deck of "
+            f"{src} (only outdir, load_checkpoint_from, chunk and, for fixed steps, tf "
+            f"may change)")
+    if process_rank() == 0:
+        for path_src, path_dst in zip(paths, outs.paths):
+            rows = {name: len(range(itr.start, min(itr.stop, rec["it_next"]), itr.step))
+                    for name, _, _, itr in outs.meas}
+            tdgw_io.copy_samples(path_src, path_dst, rows)
+    return dict(carry=rec["leaves"], step=rec["step"], i_next=rec["it_next"],
+                tchkp=rec["tchkp"], source=src)
 
 
 def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
               outs: TdOutputs, mesh, *, say=print) -> dict:
-    """Run the propagation; returns counters and walls (seconds)."""
+    """Run the propagation from t0, or from the checkpoint the deck names.
+
+    ``[control.files] load_checkpoint_from`` continues that run exactly
+    (:func:`load_checkpoint`: its rows are copied, its carry resumed).
+    Returns counters and walls (seconds).
+    """
+    resume = load_checkpoint(deck, system, model, outs)
     v = deck.values
     ntr = len(deck.trials)
     rho0 = np.zeros((ntr, system.nk_pad, system.nb, system.nb), complex)
@@ -285,18 +372,19 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
         method=v["lorrax.method"], t0=v["control.timesteps.t0"],
         tf=v["control.timesteps.tf"], dt_measure=v["control.timesteps.dt_measure"],
         dt=float(v["lorrax.dt"] or v["control.timesteps.dt_measure"]),
-        n_sub=int(v["lorrax.n_sub"]), n_corr=int(v["lorrax.n_corr"]),
+        n_corr=int(v["lorrax.n_corr"]),
         atol=float(v["control.ivp.atol"]), rtol=float(v["control.ivp.rtol"]),
         max_step=float(v["control.timesteps.max_step"]), chunk=min(chunk, nt),
         remainder=bool(v["system.depopulation"] != 0.0
                        or v["system.dephasing"] != 0.0
                        or system.ops.intra is not None))
     count = ntr * system.nk * system.nb * system.nb
+    fingerprint = restart_fingerprint(deck, system, model)
     walls = []
     t_start = time.perf_counter()
 
-    def on_chunk(i0, i1, samples, rho_fn, t_state):
-        _write_chunk(outs, system, i0, i1, samples, rho_fn, t_state)
+    def on_chunk(i0, i1, samples, state_fn, t_state):
+        _write_chunk(outs, system, i0, i1, samples, state_fn, t_state, fingerprint)
         walls.append(time.perf_counter())
         say(f"  samples {i0:7d}-{i1 - 1:7d}  t = {t_state * tdgw_io.T_IN_ATTOSEC:12.3f} as"
             f"  wall {walls[-1] - t_start:9.2f} s")
@@ -306,11 +394,12 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             cfg, sample_spec(deck, system), tp.place_state(rho0, mesh),
             system.ops, model, drive, mesh, cell_volume=system.cell_volume,
             nspinor=system.nspinor, count=count, mtsteps=outs.mtsteps,
-            on_chunk=on_chunk)
+            on_chunk=on_chunk, resume=resume)
     stats["wall"] = time.perf_counter() - t_start
     stats["wall_first_chunk"] = (walls[0] - t_start) if walls else 0.0
     stats["chunk"] = cfg.chunk
-    stats["simulated_fs"] = (cfg.tf - cfg.t0) * tdgw_io.T_IN_ATTOSEC / 1000.0
+    t_from = cfg.t0 if resume is None else float(resume["tchkp"])
+    stats["simulated_fs"] = (stats["t_final"] - t_from) * tdgw_io.T_IN_ATTOSEC / 1000.0
     return stats
 
 
@@ -321,7 +410,8 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
     step = ("adaptive (SciPy RK45 controller), atol %.3g rtol %.3g, first step "
             "dt_measure" % (v["control.ivp.atol"], v["control.ivp.rtol"])
             if v["lorrax.method"] == "dp54" else
-            "fixed dt = %.6g as (%d per sample)" % (v["lorrax.dt"] * T, v["lorrax.n_sub"]))
+            "fixed dt = %.6g as (dt_measure / dt = %.6g)" % (
+                v["lorrax.dt"] * T, v["control.timesteps.dt_measure"] / v["lorrax.dt"]))
     lines = [
         "TD-aGW propagation (TDGW conventions)",
         f"  deck            : {deck.source}",
@@ -340,6 +430,9 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
         f"  mesh            : {runtime.mesh_shape} on {runtime.n_devices} "
         f"{runtime.platform} device(s)",
     ]
+    if v["control.files.load_checkpoint_from"]:
+        lines.append(f"  restart from    : {v['control.files.load_checkpoint_from']} "
+                     f"(its integrator carry; values continue bitwise)")
     unused = td_config.unused_keys(deck)
     if unused:
         lines.append("  read, not used  : " + ", ".join(unused)

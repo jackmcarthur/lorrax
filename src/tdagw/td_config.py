@@ -201,10 +201,11 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     if vals["lorrax.pair_rule"] not in PAIR_RULES:
         raise _gate("td_pair_rule", repr(vals["lorrax.pair_rule"]),
                     " | ".join(PAIR_RULES), "set [lorrax] pair_rule")
-    if vals["control.files.load_checkpoint_from"]:
-        raise _gate("td_checkpoint_restart", "load_checkpoint_from set",
-                    "a run from t0", "restart is not implemented in LORRAX's "
-                    "propagator; rerun from t0")
+    chk = vals["control.files.load_checkpoint_from"]
+    if chk and os.path.abspath(chk) == os.path.abspath(str(vals["control.files.outdir"])):
+        raise _gate("td_checkpoint_outdir", f"load_checkpoint_from = outdir = {chk!r}",
+                    "a new outdir (TDGW's rule: the restart writes a new tdgw.h5)",
+                    "set [control.files] outdir to another directory")
     if vals["system.patched_sampling"]:
         raise _gate("td_patched_sampling", "patched_sampling = true",
                     "a regular k grid", "use an unpatched header")
@@ -257,20 +258,19 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     for k in ("system.esmear", "system.depopulation", "system.dephasing"):
         vals[k] = float(vals[k]) / HA_IN_EV
     if vals["lorrax.method"] != "dp54":
-        if vals["lorrax.dt"] is None:
-            raise _gate("td_dt", "no [lorrax] dt for a fixed-step method",
-                        "dt in attoseconds", "set [lorrax] dt")
+        if vals["lorrax.dt"] is None or float(vals["lorrax.dt"]) <= 0.0:
+            raise _gate("td_dt", f"[lorrax] dt = {vals['lorrax.dt']!r} for a fixed-step "
+                        "method", "dt > 0 in attoseconds", "set [lorrax] dt")
         dt = float(vals["lorrax.dt"]) / T_IN_ATTOSEC
         ratio = vals["control.timesteps.dt_measure"] / dt
-        if abs(ratio - round(ratio)) > 1e-9 * max(1.0, ratio) or round(ratio) < 1:
-            raise _gate("td_dt_measure_multiple",
-                        f"dt_measure/dt = {ratio:.12g}",
-                        "a positive integer (samples land on steps)",
-                        "choose dt = dt_measure / n")
+        if (vals["lorrax.method"] == "magnus2"
+                and abs(ratio - round(ratio)) > 1e-9 * max(1.0, ratio)):
+            raise _gate("td_dense_output", f"magnus2 with dt_measure/dt = {ratio:.12g}",
+                        "samples on steps (an integer ratio): magnus2 freezes dSigma at "
+                        "one node, so a sample inside a step would be first order",
+                        "choose dt = dt_measure / n, or cfm4 / etdrk4 / rk4 (dense output)")
         vals["lorrax.dt"] = dt
-        vals["lorrax.n_sub"] = int(round(ratio))
     else:
-        vals["lorrax.n_sub"] = 1
         if vals["lorrax.dt"] is not None:
             raise _gate("td_dt", "[lorrax] dt with method = dp54",
                         "no dt (the controller chooses the steps)",

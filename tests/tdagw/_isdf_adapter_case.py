@@ -3,7 +3,9 @@
     JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \\
         python3 tests/tdagw/_isdf_adapter_case.py
 
-Prints one JSON line.  The synthetic operands and the explicit-sum kernel
+Prints one JSON line, with the B10 collective tables: the collectives the
+adapter's compiled program adds to the model's own, for the adapter and for
+the twin that reshards by one sharding constraint.  The synthetic operands and the explicit-sum kernel
 follow tests/test_tdagw_model.py (TDMODEL's _synthetic and _dense_reference,
 copied so this file does not import another test module):
 K[k,n,m,k',n',m'] in Ry on the model's flat C-order k grid, SEX
@@ -120,7 +122,77 @@ def main():
             out[f"{terms}:{tag}"] = dict(rel=rel, pad=pad)
     out["mesh"] = list(mesh.devices.shape)
     out["nk_pad"] = nk_pad
+    out.update(_collective_tables(mesh, model, sm_both(model, mesh, k_hdr, rho_eq), rho,
+                                  ntr, nk))
     print("RESULT " + json.dumps(out), flush=True)
+
+
+def sm_both(model, mesh, k_hdr, rho_eq):
+    from tdagw.self_energy import isdf_model
+    return isdf_model(model, mesh, k_frac=k_hdr, rho_eq=rho_eq)
+
+
+def _twin_constraint_apply(static, params, rho, t):
+    """The adapter as it was: one sharding constraint between the two layouts."""
+    import jax.numpy as jnp
+    from tdagw.model import build_td_agw_apply, td_state_sharding
+    from tdagw.self_energy import _ISDF_OPERANDS
+    mesh, kgrid, nspinor, nb_pad, rows, perm, nk, sex, hartree = static
+    ops, rho_eq = params
+    d = rho - rho_eq[None]
+    nb, nk_pad = d.shape[-1], d.shape[1]
+    d = jnp.pad(d, ((0, 0), (0, 0), (0, nb_pad - nb), (0, nb_pad - nb)))
+    d = jax.lax.with_sharding_constraint(d, td_state_sharding(mesh))
+    x = jnp.take(d, jnp.asarray(perm), axis=1)
+    y = build_td_agw_apply(mesh, dict(zip(_ISDF_OPERANDS, ops), kgrid=kgrid, nspinor=nspinor),
+                           sex=sex, hartree=hartree)(x)
+    y = jnp.take(y, jnp.asarray(rows), axis=1)[..., :nb, :nb]
+    return 0.5 * jnp.pad(y, ((0, 0), (0, nk_pad - nk), (0, 0), (0, 0)))
+
+
+def _collectives(hlo):
+    """[(kind, result shape)] of every collective in an optimized HLO module."""
+    import re
+    rows = []
+    for line in hlo.splitlines():
+        m = re.search(r"\b(all-gather|all-to-all|all-reduce|collective-permute|"
+                      r"reduce-scatter)(-start)?\(", line)
+        if m and "=" in line.split(m.group(0))[0]:
+            shape = re.sub(r"\{[^}]*\}", "", line.split("=", 1)[1].split(m.group(0))[0]).strip()
+            rows.append((m.group(1), shape))
+    return rows
+
+
+def _collective_tables(mesh, model, sm, rho, ntr, nk):
+    """B10: the adapter adds exactly the movers' four all_to_all to the model's own collectives."""
+    from collections import Counter
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from ffi import fft as F
+    from tdagw.model import build_td_agw_apply, td_state_sharding
+    from tdagw.self_energy import _ISDF_OPERANDS
+    kspec = NamedSharding(mesh, P(None, ("x", "y"), None, None))
+
+    def table(fn, *args):
+        with F.xla_reference():
+            return Counter(_collectives(jax.jit(fn).lower(*args).compile().as_text()))
+
+    ops = sm.params[0]
+    nb_pad = int(model["nb_pad"])
+    x_face = jax.device_put(np.zeros((ntr, nk, nb_pad, nb_pad), complex), td_state_sharding(mesh))
+    m_apply = build_td_agw_apply(mesh, dict(zip(_ISDF_OPERANDS, ops), kgrid=model["kgrid"],
+                                            nspinor=model["nspinor"]))
+    model_t = table(lambda x: m_apply(x), x_face)
+    static = sm.apply.args[0]
+    pinned = lambda f: (lambda prm, r: jax.lax.with_sharding_constraint(f(prm, r), kspec))
+    adapter_t = table(pinned(lambda prm, r: sm.apply(prm, r, 0.0)), sm.params, rho)
+    twin_t = table(pinned(lambda prm, r: _twin_constraint_apply(static, prm, r, 0.0)),
+                   sm.params, rho)
+
+    def extra(t):
+        add, gone = t - model_t, model_t - t
+        return dict(added=sorted(f"{k}:{s}" for (k, s), n in add.items() for _ in range(n)),
+                    removed=sorted(f"{k}:{s}" for (k, s), n in gone.items() for _ in range(n)))
+    return {"b10:adapter": extra(adapter_t), "b10:twin_constraint": extra(twin_t)}
 
 
 if __name__ == "__main__":
