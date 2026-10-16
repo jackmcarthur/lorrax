@@ -57,7 +57,9 @@ def _run(raw, mesh, *, stop_after=None):
     outs = stages.open_outputs(deck, system)
     seen = []
 
-    def say(s):
+    def say(s):                                     # stop after the stop_after-th chunk
+        if not s.lstrip().startswith("samples"):    # (the stability receipt is not one)
+            return
         seen.append(s)
         if stop_after is not None and len(seen) >= stop_after:
             raise _Stop()

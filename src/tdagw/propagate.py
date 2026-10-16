@@ -68,7 +68,7 @@ from tdagw.self_energy import SelfEnergyModel
 __all__ = ["METHODS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
            "place_operators", "place_kernel", "place_state", "make_conj_dev",
            "sample_plan", "chunk_plan", "initial_carry", "carry_to_host",
-           "carry_from_host", "run_propagation"]
+           "carry_from_host", "coupling_radius", "magnus_dt_limit", "run_propagation"]
 
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 #: Bootstrap: while the predictor history is incomplete (first steps) the
@@ -77,6 +77,11 @@ BOOTSTRAP_EXTRA = 3
 K_AXES = ("x", "y")
 #: A sample within this fraction of a step from a step end is ON the step.
 _ON_STEP_TOL = 1e-9
+#: Power iterations of L(L(x)) in :func:`coupling_radius` (two dSigma calls each).
+COUPLING_POWER_ITERATIONS = 20
+#: The step check takes h (MARGIN * sigma) <= the stability limit: the power
+#: iteration approaches sigma from below.
+STABILITY_MARGIN = 1.1
 
 
 def dsigma_per_step(method: str, n_corr: int) -> int:
@@ -96,6 +101,8 @@ class PropagatorConfig(NamedTuple):
     chunk : samples per jitted call.
     remainder : the non-commutator flow (Gamma or intraband) is nonzero; a
         purely Hamiltonian run skips it (Magnus steps exactly unitary).
+    predictor : cfm4's dSigma predictor, "cubic" (the last two steps' four
+        node values) or "linear" (the last step's two).
     """
     method: str
     t0: float
@@ -108,6 +115,7 @@ class PropagatorConfig(NamedTuple):
     max_step: float
     chunk: int
     remainder: bool
+    predictor: str = "cubic"
 
 
 class SampleSpec(NamedTuple):
@@ -327,14 +335,14 @@ def _sample(ph, ops, spec: SampleSpec, drive, *, cell_volume, nspinor):
 
 
 def _magnus_parts(cfg: PropagatorConfig):
-    """(nodes, flow, remainder fractions or None, history weights, bootstrap steps)."""
+    """(nodes, flow, remainder fractions or None, history offsets, bootstrap steps)."""
     cfm4 = cfg.method == "cfm4"
     nodes = ti.CFM4_NODES if cfm4 else ti.MIDPOINT_NODES
     flow = ti.ip_cf4_flow if cfm4 else ti.ip_midpoint_flow
     fractions = None if not cfg.remainder else (ti.TRIPLE_JUMP if cfm4 else (1.0,))
-    hist = ti.CFM4_HISTORY if cfm4 else ti.MIDPOINT_HISTORY
-    w = jnp.asarray(ti.extrapolation_weights(hist, list(nodes)))
-    return nodes, flow, fractions, w, (2 if cfm4 else 3)
+    hist = ((ti.CFM4_HISTORY if cfg.predictor == "cubic" else ti.CFM4_HISTORY[2:])
+            if cfm4 else ti.MIDPOINT_HISTORY)
+    return nodes, flow, fractions, hist, -(-len(hist) // len(nodes))
 
 
 def _fixed_parts(cfg: PropagatorConfig, ph):
@@ -358,7 +366,8 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
             return ti.hermite_dense(lam, c0[0], c0[2], c1[0], c1[2], cfg.dt, th)
         return step, dense, (lambda c: c[0])
     if cfg.method in ("magnus2", "cfm4"):
-        nodes, flow, fractions, w, n_boot = _magnus_parts(cfg)
+        nodes, flow, fractions, hist_offsets, n_boot = _magnus_parts(cfg)
+        w = jnp.asarray(ti.extrapolation_weights(hist_offsets, list(nodes)))
 
         def inner(gen, t, x, tau):
             core = lambda a, y, s: flow(gen, ph["free"], ph["conj_dev"], a, y, s)
@@ -401,9 +410,69 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
                     ph["nonlin"](cfg.t0, rho0))
         x0 = ph["pin"](rho0 - ph["rho_eq"])
         b0 = ph["dsig_dev"](cfg.t0, x0)
-        n_hist = 3 if cfg.method == "magnus2" else 4
+        n_hist = len(_magnus_parts(cfg)[3])
         return (x0, jnp.stack([b0] * n_hist), jnp.int32(0))
     return jax.jit(build)(rho0, ops, mparams)
+
+
+# ---------------------------------------------------------------------------
+# The step limit of the corrected Magnus steps
+# ---------------------------------------------------------------------------
+
+def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float,
+                    n_iter: int = COUPLING_POWER_ITERATIONS, seed: int = 0):
+    """Power-iteration estimate of the spectral radius σ (Ha) of the coupling map.
+
+        L(x) = -i [dSigma[rho^eq + x] - dSigma[rho^eq], rho^eq]
+             = -i (dSigma[x] - dSigma[0]) ∘ (f_m - f_n)
+
+    the linearized coupling of the Magnus steps (the field is left out: it
+    is weak where the limit binds, and E·r is exact in the free flow's
+    frame anyway).  From a fixed random x (cv and vc blocks, one trial,
+    logical k), x <- L(L(x)) / ||L(L(x))||, σ_j = (||L(L x_j)|| / ||x_j||)^(1/2):
+    the eigenvalues of L are ±iω (real ω for a Hermitian coupling, TDA or a
+    stable full BSE), so L^2 has the dominant real eigenvalue -σ^2 and σ_j
+    rises to σ.  One jitted call, 2 n_iter dSigma evaluations on the
+    model's own operands and layout.  Returns (σ, the n_iter estimates).
+    """
+    nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((1, nk_pad, nb, nb)) + 1j * rng.standard_normal((1, nk_pad, nb, nb))
+    f = np.real(np.diagonal(np.asarray(gather_to_host(ops.rho_eq)), axis1=-2, axis2=-1))
+    gap = (f[:, None, :] - f[:, :, None])[None]                      # f_m - f_n
+    w = np.asarray(gather_to_host(ops.w_k)) > 0.0                     # logical k
+    x = x * (np.abs(gap) > 0.5) * w[None, :, None, None]
+    x = 0.5 * (x + np.conj(np.swapaxes(x, -1, -2)))
+    x0 = place_state(x, mesh)
+    gap_d = place_state(np.broadcast_to(gap, x.shape).astype(complex), mesh)
+    zero = place_state(np.zeros_like(x), mesh)
+
+    def run(x, gap, zero, ops, mparams):
+        ph = _physics(ops, mparams, model, drive, mesh)
+        d0 = ph["dsig_dev"](t0, zero)
+        lmap = lambda y: ph["pin"](-1j * (ph["dsig_dev"](t0, y) - d0) * gap)
+        nrm = lambda y: jnp.sqrt(jnp.sum(jnp.abs(y) ** 2))
+
+        def body(y, _):
+            z = lmap(lmap(y))
+            ratio = nrm(z) / nrm(y)
+            return z / nrm(z), jnp.sqrt(ratio)
+        _, est = jax.lax.scan(body, x / nrm(x), None, length=int(n_iter), unroll=1)
+        return est
+
+    est = np.asarray(gather_to_host(jax.jit(run)(x0, gap_d, zero, ops, model.params)))
+    return float(est[-1]), est
+
+
+def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:
+    """(dt_max a.u., y_lim): the largest stable step of cfg's Magnus scheme for radius σ.
+
+    y_lim = :func:`solvers.time_integrators.magnus_stability_limit` of the
+    scheme's nodes, predictor and n_corr; dt_max = y_lim / (STABILITY_MARGIN σ).
+    """
+    nodes, _, _, hist, _ = _magnus_parts(cfg)
+    y_lim = ti.magnus_stability_limit(nodes, hist, int(cfg.n_corr))
+    return (np.inf if sigma <= 0.0 else y_lim / (STABILITY_MARGIN * sigma)), y_lim
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +637,7 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
         stats = dict(accepted=n_steps, rejected=0,
                      dsigma=n_steps * dsigma_per_step(cfg.method, cfg.n_corr))
         if cfg.method in ("magnus2", "cfm4"):
-            boot = max(0, min(s_end, 3 if cfg.method == "magnus2" else 2) - s_start)
+            boot = max(0, min(s_end, _magnus_parts(cfg)[4]) - s_start)
             per = 1 if cfg.method == "magnus2" else 2
             stats["dsigma"] += boot * BOOTSTRAP_EXTRA * per
         stats["dsigma"] += 1 if resume is None else 0          # the initial carry's call

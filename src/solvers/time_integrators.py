@@ -53,6 +53,7 @@ __all__ = [
     "CFM4_NODES", "CFM4_WEIGHTS", "CFM4_HISTORY", "MIDPOINT_NODES", "MIDPOINT_HISTORY",
     "CF4_QUADRATURE", "TRIPLE_JUMP",
     "ip_cf4_flow", "ip_midpoint_flow", "ip_magnus_step", "frozen_generator",
+    "magnus_amplification", "magnus_stability_limit",
     "compose_strang", "fixed_advance",
 ]
 
@@ -591,6 +592,81 @@ def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
 
     g = jax.lax.fori_loop(0, n_corr, corr, tuple(guess))
     return inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g
+
+
+def _node_quadrature(nodes):
+    """A[i, j] = ∫_0^{c_i} ℓ_j, b[j] = ∫_0^1 ℓ_j for the Lagrange basis ℓ_j on ``nodes``."""
+    from numpy.polynomial import polynomial as npoly
+    nodes = np.asarray(nodes, float)
+    m = nodes.size
+    a, b = np.zeros((m, m)), np.zeros(m)
+    for j in range(m):
+        c = np.array([1.0])
+        for k in range(m):
+            if k != j:
+                c = npoly.polymul(c, np.array([-nodes[k], 1.0]) / (nodes[j] - nodes[k]))
+        ic = npoly.polyint(c)
+        b[j] = npoly.polyval(1.0, ic)
+        a[:, j] = npoly.polyval(nodes, ic)
+    return a, b
+
+
+def magnus_amplification(nodes, history, n_corr: int, z) -> np.ndarray:
+    """The linearized predictor–corrector Magnus step on u' = λu, z = hλ.
+
+    For a coupling B linear in the deviation (linear response), every
+    eigenmode of the coupling map evolves alone, B = λu up to a constant,
+    and :func:`ip_magnus_step` reduces to the recurrence on
+    s = (u_n, G of the ``history`` nodes), G = h B:
+
+        G <- W G_hist                      (the predictor; W of extrapolation_weights)
+        G <- z u_n 1 + z A G               (each of n_corr corrections)
+        u_{n+1} = u_n + b·G,  history <- the newest len(history) node values,
+
+    A, b the integrals of the Lagrange basis on the nodes (for the two Gauss
+    nodes: the 2-stage Gauss collocation matrix, |eig A| = 1/(2 sqrt 3), so
+    the corrections are its fixed-point iteration).  Returns the
+    (1 + len(history))-square matrix of that map.
+    """
+    a, b = _node_quadrature(nodes)
+    w = extrapolation_weights(history, list(nodes))
+    m, nh = w.shape
+    out = np.zeros((1 + nh, 1 + nh), complex)
+    for col in range(1 + nh):
+        s0 = np.zeros(1 + nh, complex)
+        s0[col] = 1.0
+        u, hist = s0[0], s0[1:]
+        g = w @ hist
+        for _ in range(int(n_corr)):
+            g = z * u * np.ones(m) + z * (a @ g)
+        out[:, col] = np.concatenate([[u + b @ g], np.concatenate([hist, g])[-nh:]])
+    return out
+
+
+def magnus_stability_limit(nodes, history, n_corr: int, *, growth: float = 1e-6,
+                           y_cap: float = 8.0, dy: float = 1e-3) -> float:
+    """Largest y with spectral radius of magnus_amplification(i y') <= 1 + growth for all y' <= y.
+
+    The stability interval of the predictor–corrector step on the imaginary
+    axis (Hermitian couplings: TDA, or a full BSE with real frequencies): a
+    step h is stable for a coupling map of spectral radius σ when h σ <= y.
+    ``growth`` is the largest per-step growth of any mode accepted (1e-6:
+    1 % over 10^4 steps); scanned on a grid of spacing ``dy`` up to
+    ``y_cap``.  Values (growth 1e-6, dy 1e-3), CFM4 nodes: cubic predictor
+    (CFM4_HISTORY) 0.117 / 0.730 / 1.144 for 1 / 2 / 3 corrections, linear
+    (the last step's two nodes) 0.625 / 1.203 / 0.231; the midpoint rule's
+    quadratic predictor 0.126 at 2.  Not monotone in the corrections: the
+    truncated fixed-point (Picard) iteration of a collocation is unstable on
+    the imaginary axis at some truncation orders, as explicit RK of order 1
+    and 2 are.  ``tests/tdagw/test_prop_integrators_cpu.py`` checks the
+    recurrence against the growth of the real step.
+    """
+    for y in np.arange(dy, y_cap + 0.5 * dy, dy):
+        rho = np.max(np.abs(np.linalg.eigvals(
+            magnus_amplification(nodes, history, n_corr, 1j * y))))
+        if rho > 1.0 + growth:
+            return float(y - dy)
+    return float(y_cap)
 
 
 # ---------------------------------------------------------------------------

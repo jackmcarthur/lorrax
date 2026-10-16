@@ -277,7 +277,8 @@ def _write_chunk(outs: TdOutputs, system: TdSystem, i0, i1, samples, state_fn,
                                  lessG=1j * np.asarray(rho)[tr, :system.nk], carry=carry)
 
 
-def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel) -> str:
+def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
+                        dt=None) -> str:
     """The settings a checkpoint's carry is valid for, as one JSON string.
 
     Everything that changes the arithmetic of a step or the sample grid:
@@ -285,10 +286,13 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel) 
     last step is clipped at tf), drives, dissipation, intraband term,
     window, k list size, header source, self-energy model, measurements.
     The chunk length is not in it (chunking does not change a value).
+    ``dt`` is the step the run uses (``lorrax.dt = 'auto'`` resolved).
     """
     import json
-    v = deck.values
-    keys = ["lorrax.method", "lorrax.dt", "lorrax.n_corr", "control.ivp.atol",
+    v = dict(deck.values)
+    if dt is not None:
+        v["lorrax.dt"] = float(dt)
+    keys = ["lorrax.method", "lorrax.dt", "lorrax.n_corr", "lorrax.predictor", "control.ivp.atol",
             "control.ivp.rtol", "control.timesteps.max_step", "control.timesteps.t0",
             "control.timesteps.dt_measure", "system.depopulation", "system.dephasing",
             "system.esmear", "system.geometry", "system.ibndmin", "system.ibndmax",
@@ -305,7 +309,7 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel) 
 
 
 def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
-                    outs: TdOutputs):
+                    outs: TdOutputs, dt=None):
     """The resume record of ``[control.files] load_checkpoint_from``, or None.
 
     Reads the checkpointed run's ``tdgw.h5`` (the first trial's file holds
@@ -328,7 +332,7 @@ def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             f"(it_next {rec['it_next']}); want: a checkpoint written by "
             f"tdagw.tdgw_jax; fix: rerun from t0 (a TDGW checkpoint holds the state, not "
             f"the integrator's carry, and cannot continue a run exactly)")
-    want = json.loads(restart_fingerprint(deck, system, model))
+    want = json.loads(restart_fingerprint(deck, system, model, dt))
     got = json.loads(rec["fingerprint"])
     diff = sorted(k for k in set(want) | set(got) if want.get(k) != got.get(k))
     if diff:
@@ -347,6 +351,50 @@ def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
                 tchkp=rec["tchkp"], source=src)
 
 
+def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mesh, *,
+                       auto: bool, say):
+    """The corrected Magnus step limit on this model: refuse, or pick dt for 'auto'.
+
+    σ = :func:`tdagw.propagate.coupling_radius` (power iteration on the
+    model), dt_max = :func:`tdagw.propagate.magnus_dt_limit`.  ``auto``
+    takes dt = dt_max floored to 0.01 as (magnus2: dt_measure / n, its
+    samples stay on steps); otherwise a dt above dt_max refuses with the
+    limits of the other choices.  Returns (cfg with dt, the receipt dict).
+    """
+    T = tdgw_io.T_IN_ATTOSEC
+    sigma, est = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0)
+    dt_max, y_lim = tp.magnus_dt_limit(cfg, sigma)
+    if auto:
+        dt_as = np.floor(dt_max * T * 100.0) / 100.0
+        if cfg.method == "magnus2":
+            dt_as = cfg.dt_measure * T / np.ceil(cfg.dt_measure / (dt_as / T) - 1e-9)
+        cfg = cfg._replace(dt=float(dt_as) / T)
+    receipt = dict(sigma_ev=sigma * tdgw_io.HA_IN_EV, y=cfg.dt * sigma, y_lim=y_lim,
+                   dt_max_as=dt_max * T, change=float(abs(est[-1] - est[-2]) / est[-1]))
+    say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius of the "
+        f"dSigma commutator map, {len(est)} power iterations, last change "
+        f"{100 * receipt['change']:.2g} %), h*sigma = {receipt['y']:.3g}, limit {y_lim:.3g} "
+        f"({cfg.method}, {cfg.predictor} predictor, n_corr {cfg.n_corr}) -> dt <= "
+        f"{receipt['dt_max_as']:.4g} as" + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
+    if not auto and cfg.dt > dt_max:
+        alts = []
+        for nc, pr in ((cfg.n_corr + 1, cfg.predictor), (cfg.n_corr, "linear")):
+            if pr == "linear" and cfg.method != "cfm4":
+                continue
+            d, _ = tp.magnus_dt_limit(cfg._replace(n_corr=nc, predictor=pr), sigma)
+            alts.append(f"n_corr = {nc}, predictor = {pr!r}: dt <= {d * T:.4g} as")
+        raise ValueError(
+            f"GATE td_magnus_stability: got: dt = {cfg.dt * T:.4g} as, h*sigma = "
+            f"{receipt['y']:.3g} with sigma = {receipt['sigma_ev']:.4g} eV (the spectral radius "
+            f"of the linearized dSigma commutator map on this model); want: h*sigma*"
+            f"{tp.STABILITY_MARGIN} <= {y_lim:.3g}, the imaginary-axis stability limit of "
+            f"{cfg.method} with the {cfg.predictor} predictor and n_corr = {cfg.n_corr}; why: "
+            f"a mode of the coupling grows from rounding, independent of the drive; fix: "
+            f"[lorrax] dt <= {receipt['dt_max_as']:.4g} as, or dt = 'auto', or "
+            + "; ".join(alts) + ", or method = 'etdrk4' / 'dp54'")
+    return cfg, receipt
+
+
 def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
               outs: TdOutputs, mesh, *, say=print) -> dict:
     """Run the propagation from t0, or from the checkpoint the deck names.
@@ -355,7 +403,6 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
     (:func:`load_checkpoint`: its rows are copied, its carry resumed).
     Returns counters and walls (seconds).
     """
-    resume = load_checkpoint(deck, system, model, outs)
     v = deck.values
     ntr = len(deck.trials)
     rho0 = np.zeros((ntr, system.nk_pad, system.nb, system.nb), complex)
@@ -368,18 +415,24 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
                    for _, typ, _, _ in outs.meas if typ in ("density_matrix", "lessG"))
     if dm_bytes:
         chunk = max(1, min(chunk, int(TILE_BYTES // dm_bytes)))
+    auto = v["lorrax.dt"] == "auto"
     cfg = tp.PropagatorConfig(
         method=v["lorrax.method"], t0=v["control.timesteps.t0"],
         tf=v["control.timesteps.tf"], dt_measure=v["control.timesteps.dt_measure"],
-        dt=float(v["lorrax.dt"] or v["control.timesteps.dt_measure"]),
-        n_corr=int(v["lorrax.n_corr"]),
+        dt=float(v["control.timesteps.dt_measure"] if auto or not v["lorrax.dt"]
+                 else v["lorrax.dt"]),
+        n_corr=int(v["lorrax.n_corr"]), predictor=v["lorrax.predictor"],
         atol=float(v["control.ivp.atol"]), rtol=float(v["control.ivp.rtol"]),
         max_step=float(v["control.timesteps.max_step"]), chunk=min(chunk, nt),
         remainder=bool(v["system.depopulation"] != 0.0
                        or v["system.dephasing"] != 0.0
                        or system.ops.intra is not None))
+    check = None
+    if cfg.method in ("magnus2", "cfm4"):
+        cfg, check = _magnus_step_check(cfg, system, model, drive, mesh, auto=auto, say=say)
+    resume = load_checkpoint(deck, system, model, outs, cfg.dt)
     count = ntr * system.nk * system.nb * system.nb
-    fingerprint = restart_fingerprint(deck, system, model)
+    fingerprint = restart_fingerprint(deck, system, model, cfg.dt)
     walls = []
     t_start = time.perf_counter()
 
@@ -395,6 +448,8 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             system.ops, model, drive, mesh, cell_volume=system.cell_volume,
             nspinor=system.nspinor, count=count, mtsteps=outs.mtsteps,
             on_chunk=on_chunk, resume=resume)
+    stats["check_dsigma"] = 0 if check is None else 2 * tp.COUPLING_POWER_ITERATIONS
+    stats["dt"] = cfg.dt
     stats["wall"] = time.perf_counter() - t_start
     stats["wall_first_chunk"] = (walls[0] - t_start) if walls else 0.0
     stats["chunk"] = cfg.chunk

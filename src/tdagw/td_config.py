@@ -53,6 +53,7 @@ TD_DEFAULTS = {
     "lorrax.method": "dp54",
     "lorrax.dt": None,
     "lorrax.n_corr": 2,
+    "lorrax.predictor": "cubic",
     "lorrax.model": "",
     "lorrax.kernel_file": "",
     "lorrax.isdf_input": "",
@@ -218,6 +219,11 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     if int(vals["lorrax.n_corr"]) < 1:
         raise _gate("td_n_corr", vals["lorrax.n_corr"], ">= 1",
                     "a Magnus predictor without a correction is unstable")
+    if vals["lorrax.predictor"] not in ("cubic", "linear") or (
+            vals["lorrax.predictor"] == "linear" and vals["lorrax.method"] != "cfm4"):
+        raise _gate("td_predictor", f"predictor = {vals['lorrax.predictor']!r} with "
+                    f"method {vals['lorrax.method']!r}",
+                    "cubic | linear (linear: cfm4 only)", "set [lorrax] predictor")
     model = vals["lorrax.model"] or (
         "none" if vals["control.calc_type"] == "IP" else "tdgw_kernel")
     if model not in MODELS:
@@ -257,7 +263,12 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         vals["lorrax.pair_gap_ev"] = float(vals["system.esmear"])
     for k in ("system.esmear", "system.depopulation", "system.dephasing"):
         vals[k] = float(vals[k]) / HA_IN_EV
-    if vals["lorrax.method"] != "dp54":
+    if vals["lorrax.dt"] == "auto":
+        if vals["lorrax.method"] not in ("magnus2", "cfm4"):
+            raise _gate("td_dt", f"dt = 'auto' with method {vals['lorrax.method']!r}",
+                        "'auto' only for magnus2 / cfm4 (their step limit is measured "
+                        "on the model at the start of the run)", "set [lorrax] dt in as")
+    elif vals["lorrax.method"] != "dp54":
         if vals["lorrax.dt"] is None or float(vals["lorrax.dt"]) <= 0.0:
             raise _gate("td_dt", f"[lorrax] dt = {vals['lorrax.dt']!r} for a fixed-step "
                         "method", "dt > 0 in attoseconds", "set [lorrax] dt")
