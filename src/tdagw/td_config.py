@@ -54,6 +54,7 @@ TD_DEFAULTS = {
     "lorrax.dt": None,
     "lorrax.n_corr": 2,
     "lorrax.predictor": "cubic",
+    "lorrax.magnus_frame": "",
     "lorrax.model": "",
     "lorrax.kernel_file": "",
     "lorrax.isdf_input": "",
@@ -218,13 +219,23 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         raise _gate("td_method", repr(vals["lorrax.method"]), " | ".join(METHODS),
                     "set [lorrax] method")
     if int(vals["lorrax.n_corr"]) < 1:
-        raise _gate("td_n_corr", vals["lorrax.n_corr"], ">= 1",
-                    "a Magnus predictor without a correction is unstable")
+        raise _gate("td_n_corr", vals["lorrax.n_corr"], ">= 1 (with no correction the node "
+                    "history holds only predicted values and the step does not converge: "
+                    "order 0)", "set [lorrax] n_corr >= 1 (2 is the default)")
     if vals["lorrax.predictor"] not in ("cubic", "linear") or (
             vals["lorrax.predictor"] == "linear" and vals["lorrax.method"] != "cfm4"):
         raise _gate("td_predictor", f"predictor = {vals['lorrax.predictor']!r} with "
                     f"method {vals['lorrax.method']!r}",
                     "cubic | linear (linear: cfm4 only)", "set [lorrax] predictor")
+    frame = vals["lorrax.magnus_frame"]
+    if frame not in ("", "whole_rho", "interaction") or (
+            frame and vals["lorrax.method"] not in ("magnus2", "cfm4")) or (
+            frame == "whole_rho" and vals["lorrax.method"] != "magnus2"):
+        raise _gate("td_magnus_frame", f"magnus_frame = {frame!r} with method "
+                    f"{vals['lorrax.method']!r}", "'' | whole_rho | interaction, for magnus2; "
+                    "cfm4 runs on Delta rho in the interaction picture only (its order 4 with "
+                    "Gamma and the intraband term, and no rounding floor)",
+                    "drop [lorrax] magnus_frame or use it with magnus2")
     model = vals["lorrax.model"] or (
         "none" if vals["control.calc_type"] == "IP" else "tdgw_kernel")
     if model not in MODELS:

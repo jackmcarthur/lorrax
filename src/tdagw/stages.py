@@ -303,6 +303,7 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
     if v["lorrax.method"] == "dp54":
         keys.append("control.timesteps.tf")
     fp = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in keys}
+    fp["lorrax.magnus_frame"] = magnus_frame(v)
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
               nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
               measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
@@ -354,6 +355,12 @@ def load_checkpoint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
                 tchkp=rec["tchkp"], source=src)
 
 
+def magnus_frame(v) -> str:
+    """The Magnus frame of a deck: [lorrax] magnus_frame, else whole_rho for magnus2."""
+    return v["lorrax.magnus_frame"] or ("whole_rho" if v["lorrax.method"] == "magnus2"
+                                        else "interaction")
+
+
 def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mesh, *,
                        auto: bool, say):
     """The corrected Magnus step limit on this model: refuse, or pick dt for 'auto'.
@@ -368,11 +375,16 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
     interaction picture it is not, and on the 30x30 df714 CrI3 model the real
     limit lies below dt_σ (above it on the 6x6 2v2c one).  'auto' starts at
     dt_σ and backtracks by PROBE_BACKTRACK until the probe passes (floored to
-    0.01 as; magnus2: dt_measure / n).  Returns (cfg with dt, the receipt).
+    0.01 as; magnus2: dt_measure / n).  The whole_rho frame of magnus2 has no
+    recurrence (its predictor extrapolates the lab-frame dSigma): the probe
+    alone decides, and 'auto' starts at dt_measure.  Returns (cfg with dt, the
+    receipt).
     """
     T = tdgw_io.T_IN_ATTOSEC
     sigma, est = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0)
     dt_sig, y_lim = tp.magnus_dt_limit(cfg, sigma)
+    if cfg.frame == "whole_rho":                       # no static limit: the probe decides
+        dt_sig, y_lim = cfg.dt_measure, float("nan")
     probes = []
 
     def snap(dt):
@@ -387,7 +399,7 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
         probes.append(dict(dt_as=dt * T, probe_dt_as=h * T, growth=g))
         return g <= 1.0 + tp.PROBE_TOLERANCE
 
-    if not np.isfinite(dt_sig):                       # no coupling: any step is stable
+    if sigma <= 0.0:                                  # no coupling: any step is stable
         if auto:
             cfg = cfg._replace(dt=cfg.dt_measure)
         stable = True
@@ -408,18 +420,19 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
         cfg = cfg._replace(dt=dt)
         stable = True
     else:
-        stable = cfg.dt <= dt_sig and probe(cfg.dt)
+        stable = (cfg.frame == "whole_rho" or cfg.dt <= dt_sig) and probe(cfg.dt)
     receipt = dict(sigma_ev=sigma * tdgw_io.HA_IN_EV, y=cfg.dt * sigma, y_lim=y_lim,
                    dt_max_as=dt_sig * T, change=float(abs(est[-1] - est[-2]) / est[-1]),
                    probes=probes)
     pr = "; ".join(f"{q['growth']:.4g} per step at {q['probe_dt_as']:.4g} as" for q in probes)
     say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius of the "
         f"dSigma commutator map, {len(est)} power iterations, last change "
-        f"{100 * receipt['change']:.2g} %), h*sigma = {receipt['y']:.3g}, limit {y_lim:.3g} "
-        f"({cfg.method}, {cfg.predictor} predictor, n_corr {cfg.n_corr}) -> dt <= "
-        f"{receipt['dt_max_as']:.4g} as" + (f"; probe {pr}" if probes else "")
+        f"{100 * receipt['change']:.2g} %), h*sigma = {receipt['y']:.3g}, "
+        + (f"limit {y_lim:.3g} ({cfg.method}, {cfg.predictor} predictor, n_corr {cfg.n_corr}) "
+           f"-> dt <= {receipt['dt_max_as']:.4g} as" if cfg.frame != "whole_rho" else
+           f"whole_rho frame (no static limit)") + (f"; probe {pr}" if probes else "")
         + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
-    if not stable and cfg.dt > dt_sig:
+    if not stable and cfg.frame != "whole_rho" and cfg.dt > dt_sig:
         alts = []
         for nc, pre in ((cfg.n_corr + 1, cfg.predictor), (cfg.n_corr, "linear")):
             if pre == "linear" and cfg.method != "cfm4":
@@ -439,7 +452,8 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
         q = probes[-1]
         raise ValueError(
             f"GATE td_magnus_stability: got: dt = {cfg.dt * T:.4g} as passes the sigma limit "
-            f"({receipt['dt_max_as']:.4g} as) but the scheme's own step at "
+            f"({receipt['dt_max_as']:.4g} as{'; whole_rho: none' if cfg.frame == 'whole_rho' else ''}) "
+            f"but the scheme's own step at "
             f"{tp.PROBE_STEP_FACTOR} dt = {q['probe_dt_as']:.4g} as grows by {q['growth']:.4g} "
             f"per step on this model (field off, {tp.PROBE_STEPS} steps from a random "
             f"coherence); want: growth <= {1.0 + tp.PROBE_TOLERANCE:.4g} at {tp.PROBE_STEP_FACTOR} "
@@ -476,7 +490,7 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
         tf=v["control.timesteps.tf"], dt_measure=v["control.timesteps.dt_measure"],
         dt=float(v["control.timesteps.dt_measure"] if auto or not v["lorrax.dt"]
                  else v["lorrax.dt"]),
-        n_corr=int(v["lorrax.n_corr"]), predictor=v["lorrax.predictor"],
+        n_corr=int(v["lorrax.n_corr"]), predictor=v["lorrax.predictor"], frame=magnus_frame(v),
         atol=float(v["control.ivp.atol"]), rtol=float(v["control.ivp.rtol"]),
         max_step=float(v["control.timesteps.max_step"]), chunk=min(chunk, nt),
         remainder=bool(v["system.depopulation"] != 0.0

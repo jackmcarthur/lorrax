@@ -53,6 +53,7 @@ __all__ = [
     "CFM4_NODES", "CFM4_WEIGHTS", "CFM4_HISTORY", "MIDPOINT_NODES", "MIDPOINT_HISTORY",
     "CF4_QUADRATURE", "TRIPLE_JUMP",
     "ip_cf4_flow", "ip_midpoint_flow", "ip_magnus_step", "frozen_generator",
+    "magnus_midpoint_step",
     "magnus_amplification", "magnus_stability_limit", "magnus_growth",
     "compose_strang", "fixed_advance",
 ]
@@ -564,6 +565,32 @@ def ip_midpoint_flow(generator: Callable, free: Callable, conj_dev: Callable, t,
     return free(conj_dev(g, x, h), h)
 
 
+def magnus_midpoint_step(explicit: Callable, state_part: Callable,
+                         conjugate: Callable, t, y, h, b_guess, *, n_iter):
+    """Exponential midpoint rule on the whole state, self-consistent midpoint Hamiltonian.
+
+    y_{n+1} = exp(-i h H_m) y_n exp(+i h H_m),
+    H_m = A(t + h/2) + B(t + h/2, (y_n + y_{n+1})/2),
+    solved by ``n_iter`` fixed-point corrections (each one evaluation of B)
+    from ``b_guess``, a prediction of B at the midpoint.  ``n_iter`` may be
+    traced.  Second order; unitary for any ``n_iter``.  B at the average of
+    the end states is the implicit-midpoint structure: for B = the gradient
+    of a quadratic energy (a Hermitian kernel) and A constant, the energy
+    Tr(A y) + (1/2)<y - y_eq, B> is conserved exactly when the corrections
+    have converged (Tr(H_m (U y U^H - y)) = 0), and to the iteration error
+    otherwise.  It conjugates the whole y, so its rounding is about ε|y| per
+    step (a floor ∝ 1/E0 for a weak-field deviation; ip_magnus_step has
+    none).  Returns (y_{n+1}, B_m); B_m feeds the next predictor.
+    """
+    a_mid = explicit(t + 0.5 * h)
+
+    def corr(_, b):
+        return state_part(t + 0.5 * h, 0.5 * (y + conjugate(a_mid + b, y, h)))
+
+    b = jax.lax.fori_loop(0, n_iter, corr, b_guess)
+    return conjugate(a_mid + b, y, h), b
+
+
 def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
                    free: Callable, t, x, h, guess, *, nodes, n_corr):
     """One predictor–corrector Magnus step on the deviation x = y - y_eq.
@@ -578,8 +605,15 @@ def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
     ``inner`` over [t, t + h] with the final node values, so B is evaluated
     only at the nodes however ``inner`` is composed (a fourth-order
     composition of a remainder costs exponentials, not B).  A correction
-    contracts the node error by O(h ||dB/dy||); a predictor of order m
-    reaches the scheme's order after max(1, order - m) corrections.
+    contracts the node error by O(h ||dB/dy||).  Consistency: a predictor of
+    order m reaches the scheme's order after max(1, order - m) corrections,
+    and at least one is required (with none the history holds only predicted
+    values: measured order 0).  Stability is a separate bound: the corrected
+    step is stable only while h·σ stays below a limit that is not monotone in
+    ``n_corr`` (:func:`magnus_stability_limit`; cubic CFM4 predictor 0.117 /
+    0.730 / 1.144 for 1 / 2 / 3 corrections), and the static σ can
+    overestimate it, so a run measures its own step
+    (``tdagw.propagate.step_growth``).
 
     Returns (x(t + h), node values in the frame of t).
     """

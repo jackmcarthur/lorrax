@@ -114,6 +114,10 @@ class PropagatorConfig(NamedTuple):
         purely Hamiltonian run skips it (Magnus steps exactly unitary).
     predictor : cfm4's dSigma predictor, "cubic" (the last two steps' four
         node values) or "linear" (the last step's two).
+    frame : magnus2's frame, "interaction" (Delta rho in the interaction
+        picture of the band energies, ti.ip_magnus_step) or "whole_rho" (the
+        whole rho, ti.magnus_midpoint_step: exact quadratic invariants);
+        cfm4 is always "interaction".
     """
     method: str
     t0: float
@@ -127,6 +131,7 @@ class PropagatorConfig(NamedTuple):
     chunk: int
     remainder: bool
     predictor: str = "cubic"
+    frame: str = "interaction"
 
 
 class SampleSpec(NamedTuple):
@@ -303,9 +308,15 @@ def _physics(ops, mparams, model: SelfEnergyModel, drive: Callable, mesh):
             x = ti.rk4_step(f, t, x, tau)
         return pin(decay * x)
 
+    def explicit(t):
+        """diag(E^QP) + E(t)·r^inter: the field part of the whole-rho generator."""
+        return pin(eom.field_hamiltonian(ops, drive(t)))
+
+    no_occ = jnp.zeros_like(occ)
     return dict(dsig=dsig, rhs=rhs, field=field, free=free, nonlin=nonlin,
-                lam=lam, remainder=remainder, pin=pin,
+                lam=lam, remainder=remainder, pin=pin, explicit=explicit,
                 conj_dev=lambda w, x, tau: pin(conj(w, x, occ, tau)),
+                conjugate=lambda w, y, tau: pin(conj(w, y, no_occ, tau)),
                 dsig_dev=lambda t, x: dsig(t, ops.rho_eq[None] + x),
                 rho_eq=ops.rho_eq[None])
 
@@ -376,6 +387,28 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
         def dense(t, c0, c1, aux, th):
             return ti.hermite_dense(lam, c0[0], c0[2], c1[0], c1[2], cfg.dt, th)
         return step, dense, (lambda c: c[0])
+    if cfg.method == "magnus2" and cfg.frame == "whole_rho":
+        w = jnp.asarray(ti.extrapolation_weights(ti.MIDPOINT_HISTORY, [0.5])[0])
+        rho_eq = ph["rho_eq"]
+        rem = lambda a, y, tau: rho_eq + ph["remainder"](a, y - rho_eq, tau)
+
+        def step(t, c, h, t_next):
+            y, hist, k = c
+            n_it = jnp.where(k < len(ti.MIDPOINT_HISTORY), cfg.n_corr + BOOTSTRAP_EXTRA,
+                             cfg.n_corr)
+            guess, box = jnp.tensordot(w, hist, axes=1), []
+
+            def core(a, yy, tau):
+                y1, b = ti.magnus_midpoint_step(ph["explicit"], ph["dsig"], ph["conjugate"],
+                                                a, yy, tau, guess, n_iter=n_it)
+                box.append(b)
+                return y1
+            y1 = ti.compose_strang(core, rem, t, y, h) if cfg.remainder else core(t, y, h)
+            return (pin(y1), jnp.concatenate([hist[1:], box[-1][None]]), k + 1), box[-1]
+
+        def dense(t, c0, c1, b, th):          # the midpoint flow (magnus2 samples on steps)
+            return ph["conjugate"](ph["explicit"](t + 0.5 * cfg.dt) + b, c0[0], th * cfg.dt)
+        return step, dense, (lambda c: c[0])
     if cfg.method in ("magnus2", "cfm4"):
         nodes, flow, fractions, hist_offsets, n_boot = _magnus_parts(cfg)
         w = jnp.asarray(ti.extrapolation_weights(hist_offsets, list(nodes)))
@@ -408,7 +441,8 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
 
     dp54 : SciPy's state.   rk4 : (rho, rhs).   etdrk4 : (rho, coef, N).
     magnus2 / cfm4 : (Delta rho, dSigma node history in the interaction
-    picture of the next step's start, step counter).
+    picture of the next step's start, step counter); magnus2 in the whole_rho
+    frame: (rho, the last three midpoint dSigma, step counter).
     """
     def build(rho0, ops, mparams):
         ph = _physics(ops, mparams, model, drive, mesh)
@@ -419,6 +453,9 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
         if cfg.method == "etdrk4":
             return (rho0, ti.etdrk4_coefficients(ph["lam"], cfg.dt),
                     ph["nonlin"](cfg.t0, rho0))
+        if cfg.method == "magnus2" and cfg.frame == "whole_rho":
+            b0 = ph["dsig"](cfg.t0, rho0)
+            return (rho0, jnp.stack([b0] * len(ti.MIDPOINT_HISTORY)), jnp.int32(0))
         x0 = ph["pin"](rho0 - ph["rho_eq"])
         b0 = ph["dsig_dev"](cfg.t0, x0)
         n_hist = len(_magnus_parts(cfg)[3])
@@ -487,13 +524,14 @@ def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:
 
 
 def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: float,
-                t0: float, n_steps: int = PROBE_STEPS, eps: float = 1e-14, seed: int = 1):
+                t0: float, n_steps: int = PROBE_STEPS, eps: float = None, seed: int = 1):
     """Growth per step of a small coherence under the scheme's own step at h, field off.
 
     The scheme-exact counterpart of :func:`coupling_radius`: from a random
     Hermitian deviation (cv and vc blocks, logical k, largest entry ``eps``;
     the deviation form keeps it exact, so the probe stays linear even where
-    the step is violently unstable) and a node history seeded from
+    the step is violently unstable; 1e-8 for the whole_rho frame, which
+    rounds at 1e-16 of the occupations) and a node history seeded from
     independent ones (the predictor's parasitic roots start at full size),
     ``n_steps`` steps of cfg's Magnus step past its bootstrap (predictor,
     corrections, composition; E = 0) and
@@ -503,6 +541,9 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
     block rotates there at about the sum of two transition energies.  One
     jitted call, h traced.  Returns (g, the norms after each step).
     """
+    whole = cfg.method == "magnus2" and cfg.frame == "whole_rho"
+    if eps is None:              # the whole rho rounds at 1e-16 of its O(1) occupations
+        eps = 1e-8 if whole else 1e-14
     nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
     rng = np.random.default_rng(seed)
     x = rng.standard_normal((1, nk_pad, nb, nb)) + 1j * rng.standard_normal((1, nk_pad, nb, nb))
@@ -512,7 +553,8 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
     x = x * (np.abs(gap) > 0.5) * w[None, :, None, None]
     x = 0.5 * (x + np.conj(np.swapaxes(x, -1, -2)))
     scale = eps / np.max(np.abs(x))
-    n_hist, n_boot = len(_magnus_parts(cfg)[3]), _magnus_parts(cfg)[4]
+    n_hist, n_boot = ((len(ti.MIDPOINT_HISTORY), len(ti.MIDPOINT_HISTORY)) if whole else
+                      (len(_magnus_parts(cfg)[3]), _magnus_parts(cfg)[4]))
     xs = [x * scale]
     for _ in range(n_hist):                       # independent seeds of the node history
         y = rng.standard_normal(x.shape) + 1j * rng.standard_normal(x.shape)
@@ -526,13 +568,14 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
     def run(x0, xh, ops, mparams, h):
         ph = _physics(ops, mparams, model, off, mesh)
         step, _, _ = _fixed_parts(cfg, ph)
+        base = ph["rho_eq"] if whole else 0.0
         hist = jnp.stack([ph["dsig_dev"](t0, xh[j:j + 1]) for j in range(n_hist)])
-        carry = (x0, hist, jnp.int32(n_boot))     # past the bootstrap: the predictor acts at once
+        carry = (base + x0, hist, jnp.int32(n_boot))  # past the bootstrap: the predictor acts at once
 
         def body(c, i):
             t = t0 + i * h
             c, _ = step(t, c, h, t + h)
-            return c, jnp.sqrt(jnp.sum(jnp.abs(c[0]) ** 2))
+            return c, jnp.sqrt(jnp.sum(jnp.abs(c[0] - base) ** 2))
         return jax.lax.scan(body, carry, jnp.arange(int(n_steps)), unroll=1)[1]
 
     norms = np.asarray(gather_to_host(jax.jit(run)(x0, xh, ops, model.params, jnp.asarray(float(h)))))

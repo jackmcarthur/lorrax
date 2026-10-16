@@ -170,7 +170,7 @@ $n_b\times n_b$ `eigh` per k and two products.
 | `dp54` | Dormand–Prince 5(4), SciPy's `RK45` | 5 (error estimate 4) | 6 (FSAL) | 0 | adaptive |
 | `rk4` | classical Runge–Kutta | 4 | 4 | 0 | `lorrax.dt` |
 | `etdrk4` | Krogstad's exponential RK on the diagonal $L_{nm} = -i(E_n - E_m) - \Gamma_{nm}$ | 4 | 4 | 0 (diagonal) | `lorrax.dt` |
-| `magnus2` | exponential midpoint on Δρ in the interaction picture; Strang-split relaxation and intraband term | 2 | `n_corr` | `n_corr` + 1 | `lorrax.dt` dividing `dt_measure`, or `auto` |
+| `magnus2` | exponential midpoint, on the whole ρ (`magnus_frame = whole_rho`, the default) or on Δρ in the interaction picture; Strang-split relaxation and intraband term | 2 | `n_corr` | `n_corr` + 1 | `lorrax.dt` dividing `dt_measure`, or `auto` |
 | `cfm4` | commutator-free Magnus CFET4:2 at the Gauss nodes on Δρ in the interaction picture; relaxation and intraband term by Yoshida's triple jump | 4 | 2 `n_corr` | 4 `n_corr` + 2, three times that with Γ or the intraband term | `lorrax.dt` or `auto` |
 
 **`dp54` reproduces TDGW's run.** The tableau, the error norm (RMS over the
@@ -187,7 +187,7 @@ intraband term) explicitly; its step is limited by the coupling, not by the
 largest transition energy, and it is exact when the explicit part
 vanishes. The $\varphi$ functions use a Taylor series for $|hL| < 0.5$.
 
-**`magnus2` and `cfm4` integrate the deviation in the interaction picture.**
+**`cfm4`, and `magnus2` with `magnus_frame = interaction`, integrate the deviation in the interaction picture.**
 With $x = \rho - \rho^\mathrm{eq}$, the band-energy phases are exact,
 $x_{nm} \to e^{-i(E_n - E_m)\tau}x_{nm}$, and the coupling
 $B(t) = \mathbf E(t)\cdot\mathbf r^\mathrm{inter} + \Delta\Sigma[\rho(t)]$, taken
@@ -217,6 +217,26 @@ and re-evaluates ΔΣ there. Without a correction the history holds only
 predicted values and the scheme does not converge, so `n_corr` < 1 refuses.
 The first two (`cfm4`) or three (`magnus2`) steps, before the history
 exists, take three extra corrections. The default is two corrections.
+
+**`magnus2` on the whole ρ (the default frame).** $\rho \to e^{-ihH_m}\rho\,e^{ihH_m}$
+with $H_m = \mathrm{diag}(E^\mathrm{QP}) + \mathbf E(t + h/2)\cdot\mathbf r^\mathrm{inter} +
+\Delta\Sigma[(\rho_n + \rho_{n+1})/2]$, solved by `n_corr` fixed-point corrections from a
+quadratic extrapolation of the last three midpoint values
+(`time_integrators.magnus_midpoint_step`). ΔΣ at the average of the end states is the
+implicit-midpoint structure: after the pulse $\mathrm{Tr}(H_m(\rho_{n+1} - \rho_n)) = 0$,
+so the energy $E = \sum_k w_k[\mathrm{Tr}(E^\mathrm{QP}\rho_k) + \tfrac12\mathrm{Tr}(\Delta\Sigma_k\,\Delta\rho_k)]$
+of a Hermitian kernel is conserved up to the corrections' residual and rounding, as are the
+spectrum and $\mathrm{Tr}\,\rho^2$. The interaction-picture step splits the band energies
+from the coupling and conserves E only to second order. On the TDGW fixture (Γ = 0, its pulse
+×10, 400–4000 as) the largest post-pulse |ΔE| relative to the excitation energy is 2.8e-11 /
+5.5e-11 at 5 / 2.5 as on the whole ρ (rounding, ∝ √N and 1/E₀: 3.1e-9 with the pulse ×1),
+and 1.6e-9 / 4.0e-10 in the interaction picture, a drift falling 4.0× when h halves and
+independent of the field (`tests/tdagw/test_prop_magnus_frame_cpu.py`); in TDVAL's harness
+1.4e-12 against 1.76e-8. The whole ρ is the default because magnus2's truncation error, not
+its rounding, sets its accuracy at production fields: on CrI3 at 100 V/m it is 1.4e-3 at 5 as
+on the whole ρ and 1.3e-4 in the interaction picture (exact band phases), against a whole-ρ
+floor near 1e-5 at 100 V/m that falls as 1/E₀; the structure-preserving form is kept, and the
+interaction picture is the choice for a weak-field magnus2 run that needs the accuracy.
 
 **Relaxation and the intraband term are composed.** They are not
 commutators. With either active, $S_2(\tau) = R(\tau/2)\,M(\tau)\,R(\tau/2)$
@@ -275,19 +295,38 @@ saturates at O(1), each step being unitary. The recurrence reproduces the
 growth per step of the real step on a two-level TDA toy to 1e-3 (stable,
 weakly and strongly unstable settings; `tests/tdagw/test_prop_stability_cpu.py`).
 
-**The check at the start of a `magnus2` / `cfm4` run** estimates σ by 20 power
-iterations of $\mathcal L^2$ on the model itself (40 ΔΣ evaluations in the
-run's layout, `tdagw.propagate.coupling_radius`) and refuses a step with
-$1.1\,h\sigma > y_\mathrm{lim}$ (`td_magnus_stability`, naming the largest stable
-step and those of the neighbouring settings); `lorrax.dt = "auto"` takes that
-step. The field is left out of σ: E·r is weak where the limit binds and is
-not extrapolated. On CrI3 2v2c (6×6 k, ISDF COHSEX) σ = 1.644 eV after 20
-iterations against 1.650 eV from the exact spectrum, so `cfm4` with the
-cubic predictor is allowed 42.6 / 265.7 / 416.4 as with 1 / 2 / 3 corrections
-(the linear predictor 227.5 / 437.9 / 84.1 as, `magnus2` 125.9 / 45.9 /
-77.2 as): one correction diverges from 50 as, and two are stable to 300 as
-(292 as without the margin), as measured. `rk4` and `etdrk4` have their own
-explicit limits ([choosing](#choosing)), which are not checked.
+**The check at the start of a `magnus2` / `cfm4` run** applies two tests on the model
+itself. (1) σ by 20 power iterations of $\mathcal L^2$ (40 ΔΣ evaluations in the run's
+layout, `tdagw.propagate.coupling_radius`): a step with $1.1\,h\sigma > y_\mathrm{lim}$
+refuses (`td_magnus_stability`). (2) The step probe (`tdagw.propagate.step_growth`): 48
+steps of the run's own Magnus step (its predictor, corrections and composition) with the
+field off, from a random coherence and an independently seeded node history, at 1.25 dt;
+a growth above 2e-3 per step refuses, so an accepted step lies a measured 25 % below the
+instability. `lorrax.dt = "auto"` starts at the σ limit and shrinks it ×0.85 until the probe
+passes. The recurrence treats the coupling as static; in the interaction picture it is not
+(several transition energies, and a kernel's resonant–antiresonant block rotates at about the
+sum of two of them), so the static limit is exact for one transition only. On CrI3 2v2c
+(6×6 k, ISDF COHSEX) σ = 1.644 eV after 20 iterations against 1.650 eV from the exact
+spectrum gives 42.6 / 265.7 / 416.4 as for 1 / 2 / 3 corrections; the real two-correction
+step is stable at 265.7 as and grows at 332 as (probe 1.074 per step, the recurrence 1.158),
+so the static limit (292 as without the margin) holds there, and one correction diverges from
+50 as as measured. On the 30×30 bundle (42v × 14c, N_μ 714) σ = 6.278 eV gives 69.58 as,
+but a 24 fs run after TDPROP's kick grows there:
+
+| 30×30 df714, `cfm4`, 2 corrections | 24 fs run after a kick: n_c(5 / 18 / 22 / 24 fs) | the check |
+|---|---|---|
+| 50 as | 9.931e-11 / 9.933e-11 / 9.932e-11 / 9.934e-11: stable | accepted (probe at 62.5 as: 1.0000018 per step) |
+| 69.58 as (the σ limit) | 9.93e-11 / 2.2e-9 / 2.0e-4 / 9.4e-3: grows (1.105 per step) | refused (probe at 87.0 as: 1.930 per step) |
+| 100 as, check bypassed | 1.7 / 7.2 / 7.4 / 7.5: grows, saturated | refused by the σ test |
+| `dt = "auto"` | — | 50.26 as (probes 1.930 at 87.0 as, 1.195 at 73.9 as, 1.0000025 at 62.8 as) |
+
+The edge therefore lies between 62.8 and 69.6 as. On the whole ρ (`magnus2`'s default
+frame) the predictor extrapolates the lab-frame ΔΣ, the recurrence does not apply, and the
+probe alone decides (`auto` starts at `dt_measure`). The probe bounds the growth only to
+about 2e-3 per step (48 steps at 1.25 dt): a mode growing more slowly, which matters only
+over thousands of steps, is not excluded. The field is left out of both tests: E·r is not
+extrapolated. `rk4` and `etdrk4` have their own explicit limits ([choosing](#choosing)),
+which are not checked.
 
 **Fixed steps sample by dense output.** `rk4`, `etdrk4` and `cfm4` step from
 t0 by `lorrax.dt` and evaluate each sample of the `dt_measure` grid inside the
@@ -378,6 +417,18 @@ inside the step what it costs alone. A fixed step fixes the ΔΣ count in
 advance: four per step for ETDRK4 and for CFM4 with two corrections, i.e. 80
 per fs at 50 as.
 
+With Γ or the intraband term the fourth-order `cfm4` takes three times the exponentials,
+which shows where ΔΣ is cheap: on four A100s, on the synthetic 30v × 14c 30×30 header with
+the rank-1000 stand-in ΔΣ (4.3 ms per call), the wall per fs of 2 fs (compiled run) is
+DP54 1.29 s, RK4 (10 as) 1.89 s, ETDRK4 (25 as) 1.16 s, and CFM4 (25 as, two corrections)
+2.45 s with the intraband term off, 5.17 s with Γ = 0.05 eV and 9.41 s with the intraband
+term on (the whole-ρ CFM4 with Strang: 1.85 / 1.88 / 2.27 s). A run of one chunk also
+writes one checkpoint of the whole carry, 0.3–0.9 s there (DP54's carry is ten states). On
+the 516 window (6×6 k, 2v2c, a dense kernel) the four-GPU CFM4 errors equal the CPU ones to
+every printed digit (3.0e-9 at 5 as, 0.96 s per fs; the whole-ρ CFM4 7.4e-7). With the
+ISDF model the step is ΔΣ-bound (96 ms per call at 30×30, against 3.3 ms for one 44-band
+exponential at 900 k), and the bundle route has no intraband term.
+
 ## Layout and programs {#layout}
 
 ρ is `(ntr, nk_pad, nb, nb)` complex128: a leading trial axis (drives
@@ -394,7 +445,10 @@ one per mesh axis, built outside the traced step); an implicit sharding
 constraint there made XLA replicate the whole state on every call
 ("Involuntary full rematerialization": an all-gather of ρ and of ΔΣ; AUDIT
 B10). The adapter now adds exactly four all-to-alls to the model's own
-collectives, with the same values. One jitted program advances a chunk of `lorrax.chunk` samples
+collectives, with the same values: on the 30×30 df714 model (P4) the ΔΣ program has 4
+all-to-all, 2 all-gather, 2 all-reduce and 1 reduce-scatter (96.4 ms per call) and the run
+logs no rematerialization (TDPROP's runs of the same decks: 7 and 38), and the 516-bundle
+ISDF run reproduces TDPROP's GPU output bitwise (20000 samples). One jitted program advances a chunk of `lorrax.chunk` samples
 (default `ntcheck`) with the carry donated; the host receives each chunk's
 samples and writes them with the checkpoint.
 
@@ -429,8 +483,9 @@ A deck with neither `load_header_from` nor `[lorrax] system = "bundle"`, or
 with both, or with `use_vmtxel` (`td_header_source`), patched sampling, box
 geometry, `velocity_operator`, a `magnus2` step that does not divide
 `dt_measure` (`td_dense_output`), `n_corr` < 1, a `linear` predictor outside
-`cfm4` (`td_predictor`), a `magnus2` / `cfm4` step above the stability limit
-(`td_magnus_stability`), a restart into its own `outdir`
+`cfm4` (`td_predictor`), a `magnus2` / `cfm4` step above the stability limit or with a
+growing step probe (`td_magnus_stability`), `magnus_frame = whole_rho` outside `magnus2`
+(`td_magnus_frame`), a restart into its own `outdir`
 (`td_checkpoint_outdir`), from a checkpoint without a LORRAX carry
 (`td_restart_carry`) or under other settings (`td_restart_settings`), and a
 `dp54` step that falls below SciPy's minimum (`td_dp54_step_too_small`) refuse
