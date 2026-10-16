@@ -8,7 +8,9 @@ inverse ε⁻¹ = (1 − v χ₀(G,G'))⁻¹ that shares no code with the export
 check carries a red twin: the case in which the property is false.
 """
 import functools
+import os
 
+import h5py
 import numpy as np
 import pytest
 import jax
@@ -405,3 +407,68 @@ def test_eigh_plan_requests_the_distributed_solver_on_many_processes(monkeypatch
     ee.eigh_plan(mesh, 12)
     assert asked == [("eigh", "native", 12), ("eigh", "distributed", 12)]
     assert all(b != "auto" for _, b, _ in asked)
+
+
+FIXTURE_BGW = os.path.join(os.path.dirname(__file__), "fixtures", "bgw_epsmat_corner48.h5")
+
+
+def test_epsreader_orientation_on_a_berkeleygw_written_block():
+    """EPSReader returns ε⁻¹(G, G') with rows G, columns G' on BerkeleyGW's own output.
+
+    The fixture is the 48 × 48 low-|q+G| corner of BerkeleyGW 4.0 epsilon.cplx.x's
+    epsmat.h5 at q = (0, 1/3, 0) (CrI3 6×6, run 516), stored values verbatim
+    (tests/fixtures/make_corner48.py).  χ is Hermitian, so (ε⁻¹ − 1)/v(q+G),
+    rows scaled, is Hermitian in the right orientation only: 1e-15 for
+    ``get_eps_matrix``; the stored block untransposed gives 0.78 (red twin).
+    ``get_eps_diagonal`` reads ``mats/matrix-diagonal`` ``(nq, nmtx, 2)`` and is
+    the matrix diagonal bit for bit.
+    """
+    from file_io.epsreader import EPSReader
+    r = EPSReader(FIXTURE_BGW)
+    n = int(r.nmtx[0])
+    M = r.get_eps_matrix(0)
+    v = np.asarray(r.vcoul[0, :n], dtype=np.float64)
+
+    def herm(m):
+        x = (m - np.eye(n)) / v[:, None]
+        return np.linalg.norm(x - x.conj().T) / np.linalg.norm(x)
+
+    assert M.shape == (n, n) == (48, 48)
+    assert herm(M) < 1e-12
+    assert herm(M.T) > 0.5                   # the stored block as it lies on disk
+    assert np.array_equal(r.get_eps_diagonal(0), np.diag(M))
+    with h5py.File(FIXTURE_BGW, "r") as f:
+        assert f["mats/matrix-diagonal"].shape == (1, n, 2)
+
+
+@pytest.mark.parametrize("files,sys_dim,flag,want", [
+    (("eps0mat", "epsmat"), 2, "refuse", "q -> 0 limit"),
+    (("epsmat",), 3, "refuse", "no eps0mat"),
+    (("eps0mat",), 3, "omit_head_wing", "omit_head_wing"),
+])
+def test_q0_body_policy_writes(files, sys_dim, flag, want):
+    from gw.epsmat_export import q0_body_policy
+    assert q0_body_policy(files, sys_dim, flag).startswith(want)
+
+
+def test_q0_body_policy_refuses_a_3d_eps0mat_without_the_flag():
+    """A 3-D q → 0 body without its O(1) head–wing term is written only by name."""
+    from gw.epsmat_export import q0_body_policy
+    with pytest.raises(ValueError, match="GATE epsmat_q0_body_3d"):
+        q0_body_policy(("eps0mat", "epsmat"), 3, "refuse")
+    with pytest.raises(ValueError, match="GATE epsmat_q0_body_sys_dim"):
+        q0_body_policy(("eps0mat",), 1, "omit_head_wing")
+
+
+def test_q0_body_3d_key_is_validated(tmp_path):
+    from gw.epsmat_config import EpsmatConfig
+    deck = tmp_path / "e.in"
+    base = ("[epsmat]\nsource_restart = /x\nparent_input_file = /x/g.in\n"
+            "output_dir = /x/o\nepsilon_cutoff = 5.0\n")
+    deck.write_text(base)
+    assert EpsmatConfig.from_input_file(str(deck)).q0_body_3d == "refuse"
+    deck.write_text(base + "q0_body_3d = omit_head_wing\n")
+    assert EpsmatConfig.from_input_file(str(deck)).q0_body_3d == "omit_head_wing"
+    deck.write_text(base + "q0_body_3d = yes\n")
+    with pytest.raises(ValueError, match="GATE epsmat_q0_body_3d_value"):
+        EpsmatConfig.from_input_file(str(deck))

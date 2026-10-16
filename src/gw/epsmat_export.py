@@ -29,7 +29,7 @@ from jax import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 __all__ = [
-    "match_q_umklapp", "zeta_slots", "coulomb_whitener",
+    "match_q_umklapp", "zeta_slots", "coulomb_whitener", "q0_body_policy",
     "whitened_correlation", "epsinv_block", "project_block", "coulomb_gram",
     "run_epsmat_export", "run_epsmat_projection",
 ]
@@ -223,11 +223,24 @@ def coulomb_whitener(V_face, *, rcond, plan):
     shapes do not depend on the rank.
     """
     from isdf import cplus
+    mesh = V_face.sharding.mesh
     lam, U = plan(hermitian(V_face)[0])
-    U = jax.device_put(U, NamedSharding(V_face.sharding.mesh, P("x", "y")))
-    B, figures = cplus.factor_from_eigh(lam[None], U[None], rcond=float(rcond),
-                                        rank_log=True, where="epsmat V+")
-    return jax.device_put(B, V_face.sharding), figures
+    B, figures = cplus.factor_from_eigh(lam[None], _on_face(mesh)(U)[None],
+                                        rcond=float(rcond), rank_log=True, where="epsmat V+")
+    return _on_face(mesh)(B), figures
+
+
+@functools.lru_cache(maxsize=None)
+def _on_face(mesh):
+    """jit: ``(n, n)`` or ``(1, n, n)`` -> the same values on the ``(x, y)`` face.
+
+    The eigensolve may hand its vectors back on another layout (the native
+    plan in one process returns them whole); this lays them, and B, on V's
+    face inside a program."""
+    def run(a):
+        spec = P("x", "y") if a.ndim == 2 else P(None, "x", "y")
+        return jax.lax.with_sharding_constraint(a, NamedSharding(mesh, spec))
+    return jax.jit(run)
 
 
 def whitened_correlation(Wc_face, B, *, mesh):
@@ -666,6 +679,34 @@ def _q0_head_value(cfg, src, q0):
     return complex(float(w_h) / v_h)
 
 
+def q0_body_policy(files, sys_dim, q0_body_3d):
+    """How ``eps0mat``'s body is written (§5), or the refusal; a receipt string.
+
+    In 2D the head–wing term ε_b0 ε_00⁻¹ ε_0b of the block inverse is O(q)
+    and the bundle's body is the q → 0 limit.  In 3D it is O(1)
+    (v ∝ q⁻², χ_0G ∝ q) and absent from the bundle's body, so the file is
+    written only when the deck names that approximation
+    (``q0_body_3d = omit_head_wing``).  No other ``sys_dim`` has a derived body.
+    """
+    if "eps0mat" not in files:
+        return "no eps0mat"
+    sys_dim = int(sys_dim)
+    if sys_dim == 2:
+        return "q -> 0 limit (head-wing term O(q))"
+    if sys_dim != 3:
+        _refuse("epsmat_q0_body_sys_dim", f"sys_dim {sys_dim} with eps0mat in files",
+                "sys_dim 2 or 3", "the q → 0 body is derived for slab and bulk only",
+                "export files = epsmat")
+    if q0_body_3d != "omit_head_wing":
+        _refuse("epsmat_q0_body_3d", "sys_dim 3 with eps0mat in files",
+                "q0_body_3d = omit_head_wing, or files = epsmat",
+                "in 3D the head–wing term ε_b0 ε_00⁻¹ ε_0b of the q → 0 body is O(1) "
+                "and the bundle's body omits it",
+                "set q0_body_3d = omit_head_wing to write that approximation (the receipt "
+                "records it), or export files = epsmat")
+    return "omit_head_wing (3D: the O(1) head-wing term is absent)"
+
+
 def run_epsmat_export(cfg, mesh, *, print_fn=print):
     """Write ``eps0mat.h5`` / ``epsmat.h5`` from a LORRAX bundle, one q at a time.
 
@@ -678,6 +719,8 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
     from file_io.slab_io import SlabIO
 
     src = open_export_source(cfg, mesh, print_fn=print_fn)
+    q0_body = q0_body_policy(cfg.files, src.config.sys_dim, cfg.q0_body_3d)
+    print_fn(f"  q0 body     {q0_body}")
     plans, comps = plan_export(cfg, src, print_fn=print_fn)
     os.makedirs(cfg.output_dir, exist_ok=True)
     rank0 = process_rank() == 0
@@ -736,7 +779,8 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
             for iq_file, d in diags:
                 be.write_q_diagonal(path, iq_file, d)
         barrier(f"epsmat.{name}.done")
-        out[name] = {"path": path, "ecuts": ecuts, "q": figs}
+        out[name] = {"path": path, "ecuts": ecuts, "q": figs,
+                     **({"q0_body": q0_body} if name == "eps0mat" else {})}
     return out
 
 

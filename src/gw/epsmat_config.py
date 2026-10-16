@@ -45,6 +45,9 @@ EPSMAT_DEFAULTS = {
     # ε⁻¹_00(q0): ``s_tensor`` (the bundle's direct q² tensor) or
     # ``unscreened`` (1; debug).
     "q0_head": "s_tensor",
+    # sys_dim 3 eps0mat: the q -> 0 body omits the O(1) head-wing term
+    # ε_b0 ε_00⁻¹ ε_0b.  ``refuse`` or ``omit_head_wing`` (write that body).
+    "q0_body_3d": "refuse",
 }
 
 _FILES = ("eps0mat", "epsmat")
@@ -94,6 +97,7 @@ class EpsmatConfig:
     files: tuple
     rcond: float
     q0_head: str
+    q0_body_3d: str
 
     @classmethod
     def from_input_file(cls, filename: str) -> "EpsmatConfig":
@@ -131,6 +135,12 @@ class EpsmatConfig:
         if head not in ("s_tensor", "unscreened"):
             raise ValueError(f"GATE epsmat_q0_head: got {head!r}; want s_tensor | "
                              f"unscreened; why: the q → 0 head source; fix: set q0_head")
+        body = p["q0_body_3d"].lower()
+        if body not in ("refuse", "omit_head_wing"):
+            raise ValueError(f"GATE epsmat_q0_body_3d_value: got {body!r}; want refuse | "
+                             f"omit_head_wing; why: the 3-D q → 0 body without its "
+                             f"head–wing term is an approximation taken by name; fix: set "
+                             f"q0_body_3d")
         ref = path("bgw_reference", mode == "project")
         ecut = float(p["epsilon_cutoff"])
         if mode == "export" and not ref and ecut <= 0.0:
@@ -143,7 +153,7 @@ class EpsmatConfig:
                    parent_input_file=path("parent_input_file", True),
                    output_dir=path("output_dir", True), bgw_reference=ref,
                    epsilon_cutoff=ecut, q0_vector=q0, files=files, rcond=rcond,
-                   q0_head=head)
+                   q0_head=head, q0_body_3d=body)
 
     def describe(self) -> str:
         """The resolved input, one key per line, for the run banner."""
