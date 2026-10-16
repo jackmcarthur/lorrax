@@ -39,6 +39,27 @@ A new test needs no bootstrap import of its own.
   adapter's dSigma equals 1/2 K (rho - rho_eq) for a synthetic TDMODEL model
   with a permuted k order and padded k; red twins drop the Ry -> Ha halving
   and pass rho for Delta rho.
+- `tdagw/test_validation_*_cpu.py`: the TD-aGW validation ladder
+  ([theory](../docs/theory/td_agw_propagation.md#validation)), CPU on a 2x2
+  host mesh through the driver's deck -> stages -> `tdgw.h5` route; each rung
+  has red twins, tolerances are fixed a priori and every measured value is a
+  junit testsuite property (the `record` fixture). Systems and references are
+  in `tdagw/_validation_systems.py`, the response algebra in
+  `tools/td_response.py`. `rabi`: a two-level system under cw and Gaussian
+  drives, with and without relaxation, against the exact rotating-frame
+  solution and DOP853; every integrator at its observed order; the swapped
+  dipole and the 0.36 ppm Ry/Ha slip fail. `bse`: on a 3v3c window with an
+  ISDF-form Hartree + SEX kernel, P(t), per-state amplitudes and frequencies
+  and Im χ± equal the full BSE of the kernel; the TDA kernel fails.
+  `conservation`: trace, Hermiticity and purity, the energy functional with
+  its ½ and the work theorem, equilibrium stationarity, every integrator.
+  `sumrules`: m1 = o.L.u, m3 and j(0+) after an instantaneous kick (IP, full,
+  TDA); the TDA misses the full sum rule. `helicity`: σ± selection on a
+  C3-symmetric Haldane toy down to the pulse's counter-rotating leak; the
+  reversed convention and C3-broken dipoles fail. `magnetooptics`: χ_xy, ε_xy,
+  σ_xy and sheet and film Kerr/Faraday rotation from TD equal the BSE;
+  Onsager; no dc Hall term in the interband length gauge; the film converges
+  to the sheet for an anisotropic tensor.
 - `test_sigma_kconv_scratch.py`: mode 7's split-arm scratch follows the
   handler's rule and is priced in the Σ pass and the τ window checks (CPU).
 - `test_qe_reported_inputs.py`: the V_NL spin-orbit mode is QE's
