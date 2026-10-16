@@ -41,7 +41,30 @@ from distrib_la._batch_reshard import (batch_reshard_call, reshard_program,
 from distrib_la.resolve import ONE_DEVICE, mesh_key, mesh_platform, one_device_max_n
 
 __all__ = ["distributed_eigh", "batched_distributed_eigh",
-           "batched_distributed_solve_lu", "rounds_for", "held_per_rank"]
+           "batched_distributed_solve_lu", "rounds_for", "held_per_rank",
+           "one_device_bytes", "ONE_DEVICE_LU_TILES"]
+
+#: Whole n^2 tiles a rank holds while ``one_device`` solves one LU system with
+#: n right-hand sides: A, B and X whole plus the factor's working pair (the local
+#: plan's price, ``gw.w_isdf._dyson_route``).
+ONE_DEVICE_LU_TILES = 5
+
+
+def one_device_bytes(op: str, n: int, itemsize: int = 16) -> int:
+    """Per-rank device bytes of the smallest ``one_device`` round: ONE whole matrix.
+
+    eigh: :data:`distrib_la.plan.BATCH_EIGH_TILES` n^2 elements (the stack price of
+    route (c), :func:`distrib_la.eigh_stack_bytes`); solve_lu:
+    :data:`ONE_DEVICE_LU_TILES`.  complex128 by default, the dtype the leg rows
+    were measured at.  A shape rule: every rank computes the same figure."""
+    if op == "eigh":
+        from distrib_la.plan import BATCH_EIGH_TILES
+        tiles = BATCH_EIGH_TILES
+    elif op == "solve_lu":
+        tiles = ONE_DEVICE_LU_TILES
+    else:
+        raise ValueError(f"one_device_bytes: no one_device route for {op!r}")
+    return int(tiles) * int(n) * int(n) * int(itemsize)
 
 _JIT_CACHE: dict = {}
 

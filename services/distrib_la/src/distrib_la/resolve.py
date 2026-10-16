@@ -495,13 +495,17 @@ def _announce_eigh_fixed_cost(px: int, py: int, n: int) -> None:
 def resolve_backend(op: str, requested: str, mesh_xy, *,
                     n: int | None = None,
                     compute_evecs: bool = True,
-                    size_route: bool = True) -> str:
+                    size_route: bool = True,
+                    room: int | None = None) -> str:
     """Resolve a requested backend name for ``op`` on ``mesh_xy``.
 
     ``distributed`` takes the leg's size route first (guard 1b,
     :data:`ONE_DEVICE_MAX_N`); :func:`size_route_note` says what it decided.
     ``size_route=False`` resolves ``distributed`` to the leg's library whatever
-    ``n`` (the capacity provider, :func:`resolve_eigh_capacity`).
+    ``n`` (the capacity provider, :func:`resolve_eigh_capacity`).  ``room``
+    (bytes per rank beside the caller's live set, ``plan(budget_bytes=)``) caps
+    the size route too: ``one_device`` only where one whole matrix's priced
+    program (:func:`distrib_la._one_device.one_device_bytes`) fits it.
 
     Returns the concrete backend to run: ``"native"``, ``"native2d"``, or
     one of the FFI backend names (``"cusolvermp" | "slate" | "scalapack"``).
@@ -586,7 +590,7 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
 
     requested_spelling = requested   # keep the user's spelling for messages
     if requested == "distributed" and size_route:
-        sized = _size_route(op, mesh_xy, n)
+        sized = _size_route(op, mesh_xy, n, room)
         if sized is not None:
             requested = sized
     if requested == ONE_DEVICE:
@@ -817,9 +821,15 @@ def one_device_max_n(op: str, platform: str) -> int | None:
     return ONE_DEVICE_MAX_N.get((op, str(platform)))
 
 
-def _size_route(op: str, mesh_xy, n) -> str | None:
-    """Guard 1b: ``one_device`` when the leg has a size row and ``n`` is known and
-    within it; None (the leg's library) otherwise.  Announced once per decision."""
+def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
+    """Guard 1b: ``one_device`` when the leg has a size row, ``n`` is known and
+    within it, and (given a ``room``) one whole matrix's priced program fits that
+    room; None (the leg's library) otherwise.  Announced once per decision.
+
+    The room cap is the capacity half of the route: ``one_device`` holds whole
+    matrices on a rank, exactly what a caller that hands ``distributed`` a room
+    has found does not fit (``common.gpu_utils.admit_local``, memory-model.md#routes).
+    A shape price against a caller value every rank shares: no exchange, no sync."""
     platform = mesh_platform(mesh_xy)
     bound = one_device_max_n(op, platform)
     if bound is None or n is None:
@@ -827,10 +837,19 @@ def _size_route(op: str, mesh_xy, n) -> str | None:
     px, py = _mesh_shape(mesh_xy)
     library = _DISTRIBUTED_DEFAULT.get((op, platform))
     chosen = ONE_DEVICE if int(n) <= bound else library
+    priced = ""
+    if chosen == ONE_DEVICE and room is not None:
+        from distrib_la._one_device import one_device_bytes
+        need = one_device_bytes(op, int(n))
+        if need > int(room):
+            chosen = library
+        priced = (f"; one whole matrix {need / 1e9:.2f} GB/rank "
+                  f"{'over' if chosen != ONE_DEVICE else 'within'} room {int(room) / 1e9:.2f} GB")
     _SIZE_DECISIONS.setdefault(
-        (op, platform, px, py, int(n)),
+        (op, platform, px, py, int(n), None if room is None else int(room)),
         f"{op} 'distributed' n={int(n)} on the {px}x{py} {platform} mesh: {chosen}, "
-        f"size route (ONE_DEVICE_MAX_N: n <= {bound} -> {ONE_DEVICE}, larger -> {library})")
+        f"size route (ONE_DEVICE_MAX_N: n <= {bound} -> {ONE_DEVICE}, larger -> {library}"
+        f"{priced})")
     announce_once(
         ("distrib_la.resolve", op, "size-route", platform, px, py, chosen),
         f"  [distrib_la.resolve] {op} 'distributed' on the {px}x{py} {platform} "
@@ -838,7 +857,7 @@ def _size_route(op: str, mesh_xy, n) -> str | None:
         f"'{ONE_DEVICE}', larger -> '{library}'): n={int(n)} -> '{chosen}'.  "
         f"'{ONE_DEVICE}' solves each matrix whole on one device with the native "
         f"kernel and returns the caller's P(None,'x','y') layout; an explicit "
-        f"'{library}' is honoured as named.", scope="rank0")
+        f"'{library}' is honoured as named{priced}.", scope="rank0")
     return ONE_DEVICE if chosen == ONE_DEVICE else None
 
 
@@ -852,7 +871,8 @@ def size_route_note(op: str, requested: str, mesh_xy, n, backend: str) -> str | 
     if bound is None or n is None:
         return None
     rel = "<=" if int(n) <= bound else ">"
-    return f"size route {platform}: n={int(n)} {rel} {bound} -> {backend}"
+    over = " (one whole matrix over the room)" if int(n) <= bound and backend != ONE_DEVICE else ""
+    return f"size route {platform}: n={int(n)} {rel} {bound} -> {backend}{over}"
 
 
 def _resolve_one_device(op: str, mesh_xy, n, spelling: str) -> str:
