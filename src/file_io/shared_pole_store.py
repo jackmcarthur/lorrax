@@ -893,7 +893,7 @@ def _model_digest(path, header, mesh, *, capacity):
            host_metadata=batch_limit*(256*nmu*components+8*kmax), native_host=True)
     # Every panel's device verdict is read once, after the loop (the digest is
     # refused, never returned, if any panel is invalid).
-    verdicts = []
+    verdicts, reduced = [], []
     with open_shared_pole_model(path, mesh_xy=mesh) as io:
         for q0, q_new in _covering_windows(header["n_q_irr"], batch_limit):
             q1 = q0+batch_limit
@@ -937,9 +937,13 @@ def _model_digest(path, header, mesh, *, capacity):
             for q in range(batch):
                 for row, hasher in hashers[q].items():
                     row_hash[q,row] = np.frombuffer(hasher.digest(), np.uint8)
-            with timing.section('digest_reduction'):
-                row_hash = psum_replicate(row_hash, mesh)
-                # Preserve the original q-major row-hashes then poles byte stream.
+            # Reduced once for every batch after the loop (one exchange, not one per batch).
+            reduced.append((row_hash, host_poles, q_new, batch))
+    if reduced:
+        with timing.section('digest_reduction'):
+            row_hashes = psum_replicate(np.stack([r[0] for r in reduced]), mesh)
+            # Preserve the original q-major row-hashes then poles byte stream.
+            for row_hash, (_, host_poles, q_new, batch) in zip(row_hashes, reduced):
                 for q in range(q_new, batch):
                     digest.update(row_hash[q].astype(np.uint8).tobytes())
                     digest.update(np.asarray(host_poles[q:q+1], dtype="<f8").tobytes())

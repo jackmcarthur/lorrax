@@ -80,3 +80,23 @@ def test_store_verdicts_refuse_the_first_bad_entry():
         sps._refuse_invalid([True, jnp.asarray(True), jnp.asarray(False)])
     with pytest.raises(Exception, match="invalid inactive sentinel"):
         sps._refuse_invalid([False])
+
+
+def test_notices_without_a_read_word_still_read_the_table():
+    """No memo (no _flag/_read_status before): the table is read and the notice prints."""
+    from distrib_la import _result_check as rc
+    rc._FAILED.clear(); rc._NOTICE.clear()
+    status = (jnp.asarray(False), jnp.asarray([[1e-3, 1e-3], [1e-16, 1e-16]]))
+    assert _prints(status, 64)
+
+
+def test_one_word_covers_every_table_of_a_program():
+    from distrib_la import _result_check as rc
+    rc._FAILED.clear(); rc._NOTICE.clear()
+    quiet = jnp.asarray([[1e-16, 1e-16], [np.nan, np.nan]])
+    loud = jnp.asarray([[1e-3, 1e-3], [1e-16, 1e-16]])
+    failed = jnp.asarray(False)
+    assert rc._read_status(failed, (quiet, loud), [(64, np.complex128)] * 2) is False
+    assert rc._memo(rc._NOTICE, quiet) is False and rc._memo(rc._NOTICE, loud) is True
+    assert rc._flag((failed, (quiet, loud))) is False          # memo: no second read
+    assert not _prints((failed, quiet), 64) and _prints((failed, loud), 64)
