@@ -96,8 +96,22 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 # (claim 2764), cutting FFT time by 26–47%.  The empty full-axis column is kept for
 # parts with weak FP64 (B300, sm_86/89/120), where a complex128 FFT is compute-bound
 # and an emulated ZGEMM row is unmeasured.
+# Two optional entries follow (absent: the A100 behaviour).  The fifth: whether an axis with
+# only an OUTPUT support (a restriction) may take the GEMM (default True).  The sixth: whether
+# the FFT arm runs on the device leg too (default False: a plan with no GEMM stage takes the
+# XLA leg, as A100 measured).
+#
+# MI250X (one GCD), complex128, ``lorrax_fourier_plan_rocm`` against the XLA leg
+# (pool log fplan_h2probe2, sweep at ~64 MB per box batch, K/N ~ 0.52): an input-support
+# (embedding) axis on the rocBLAS ZGEMM is 0.38-0.88 of XLA's take + rocFFT at every 3-D N in
+# 12..80 and 0.40-0.94 at every 2-D N in 16..128; a restriction GEMM is erratic (0.61-1.66,
+# Fe's N = 25: 1.25), so restrictions stay on the FFT arm; and the device FFT arm (hipRTC remap +
+# hipFFT) is 0.56-1.00 of XLA at every point (the reverse of A100), so it runs on the device
+# leg.  Full axes stay FFT (unmeasured as GEMMs); the K/N bound is A100's (MI250X measured at
+# 0.52 only).
 GEMM_CROSSOVER: dict[str, tuple] = {
     "NVIDIA A100": (range(0), range(16, 129), 0.54, range(32, 129)),
+    "AMD Instinct MI250X": (range(0), range(12, 81), 0.54, range(16, 129), False, True),
 }
 
 _NORMS = (None, "backward", "ortho", "forward")
@@ -135,21 +149,39 @@ def gemm_crossover(device_kind: str) -> tuple[range, range, float, range]:
             row[3] if len(row) > 3 else row[1])
 
 
+def native_policy(device_kind: str) -> tuple[bool, bool]:
+    """``(restriction axes may take the GEMM, the FFT arm runs on the device leg)`` of the
+    device's GEMM_CROSSOVER row (its optional fifth and sixth entries; ``(True, False)``)."""
+    row = next((r for p, r in GEMM_CROSSOVER.items() if device_kind.startswith(p)), ())
+    return (bool(row[4]) if len(row) > 4 else True, bool(row[5]) if len(row) > 5 else False)
+
+
 def _default_leg():
     """``None``: the leg follows the platform the call is lowered for.  Tests and
     the sweep force ``'xla'`` or ``'ffi'`` by patching this."""
     return None
 
 
-def _cuda_present(mesh) -> bool:
-    """Whether the plan can be lowered for CUDA: the mesh's platform, else any CUDA device."""
+def _leg_present(leg: str, mesh) -> bool:
+    """Whether the plan can be lowered for device leg ``leg``: the mesh's platform, else any
+    device of the leg's JAX platform in this process."""
     if mesh is not None:
         from ffi.gate import mesh_ffi_platform
-        return mesh_ffi_platform(mesh) == "CUDA"
+        return mesh_ffi_platform(mesh) == leg
+    from lxkit import LEGS
     try:
-        return len(jax.devices("cuda")) > 0
+        return len(jax.devices(LEGS[leg].jax_platforms[0])) > 0
     except RuntimeError:
         return False
+
+
+def _process_leg() -> str:
+    """The leg of this process's default devices, by vendor (``device.platform`` is ``'gpu'``
+    for every GPU vendor): ``'CUDA'``, ``'ROCM'`` or ``'cpu'``."""
+    from ffi.gate import device_vendor
+    from lxkit import LEGS
+    vendor = device_vendor(jax.devices()[0])
+    return next((k for k, leg in LEGS.items() if leg.vendor == vendor), "cpu")
 
 
 class LocalFourierPlan:
@@ -163,8 +195,9 @@ class LocalFourierPlan:
     ``device_kind`` defaults to the kind of ``mesh``'s first device, else
     ``jax.devices()[0]``'s (it chooses GEMM axes only, never correctness).
     A plan with a GEMM stage chooses its leg when the call is lowered, from the
-    platform it is lowered for (``jax.lax.platform_dependent``): one
-    ``lorrax_fourier_plan_mathdx`` custom call on CUDA, XLA ops elsewhere, so a CPU
+    platform it is lowered for (``jax.lax.platform_dependent``): one custom call on a
+    leg with a route row (``ffi.fft.FOURIER_PLAN_TARGETS``: ``lorrax_fourier_plan_mathdx``
+    on CUDA, ``lorrax_fourier_plan_rocm`` on ROCM), XLA ops elsewhere, so a CPU
     operand in a GPU process takes the XLA leg.  A plan without one takes the XLA
     leg everywhere (``plan.leg == 'xla'``, set at construction).  The fused pair's
     nvidia-mathdx wheel is checked at construction (``ffi.fft.pair_build_attrs``).  Contract on every platform: complex128, at most three
@@ -229,6 +262,7 @@ class LocalFourierPlan:
             device_kind = (mesh.devices.flat[0] if mesh is not None else jax.devices()[0]).device_kind
         self.device_kind = str(device_kind)
         n_full, n_sup, kn_max, n_sup12 = gemm_crossover(self.device_kind)
+        restrict_gemm, native_fft = native_policy(self.device_kind)
         if len(axes) < 3:
             n_sup = n_sup12
 
@@ -242,7 +276,7 @@ class LocalFourierPlan:
                 raise ValueError(f"LocalFourierPlan: empty support on axis {ax}")
             if np.unique(i_idx).size != i_idx.size:
                 raise ValueError(f"LocalFourierPlan: in_support on axis {ax} repeats an index")
-            supported = ax in in_support or ax in out_support
+            supported = ax in in_support or (restrict_gemm and ax in out_support)
             self._axis[ax] = (n, i_idx, o_idx, ax in in_support, ax in out_support)
             if (n in n_sup and i_idx.size * o_idx.size <= kn_max * n * n) if supported else n in n_full:
                 A = dft_matrix(n, o_idx, i_idx, sign=sign,
@@ -270,13 +304,19 @@ class LocalFourierPlan:
         # A plan with no GEMM stage takes the XLA leg on every platform: on A100 the CUDA
         # leg's FFT arm (remap embed + cuFFT) is 1.20-1.33x the XLA leg's take-embed + cuFFT
         # on 24²-80² and 24³-64³ sphere->box plans, with cuFFT itself equal (claim 2786).
-        self.leg = None if gemm else "xla"
-        self._pair = {}
-        if _cuda_present(mesh):         # the CUDA leg's handler must be loaded before lowering
-            from ffi.fft import FOURIER_PLAN_TARGET, _require_target, pair_build_attrs
-            _require_target(FOURIER_PLAN_TARGET, "CUDA")
-            if len(gemm) >= 2:          # a fused pair is possible: its wheel is checked here
-                self._pair = pair_build_attrs()
+        # MI250X measured the reverse (GEMM_CROSSOVER's sixth entry): its FFT arm runs on the device leg.
+        self.leg = None if gemm or native_fft else "xla"
+        # Every device leg with a route row (ffi.fft.FOURIER_PLAN_TARGETS) is a branch of the
+        # lowering-time choice; a present leg's handler must be loaded before lowering.
+        # Only a leg present in this process (the mesh's, else any of its devices) is a branch:
+        # the lowered program of a CUDA process is the one it was before the ROCM row existed.
+        from ffi.fft import FOURIER_PLAN_TARGETS, _require_target, fourier_plan_build_attrs
+        self._n_gemm, self._build = len(gemm), {}
+        for leg_key, target in FOURIER_PLAN_TARGETS.items():
+            if _leg_present(leg_key, mesh):
+                _require_target(target, leg_key)
+                # CUDA: a fused pair is possible with two GEMM axes; its wheel is checked here.
+                self._build[leg_key] = fourier_plan_build_attrs(leg_key, n_gemm=len(gemm))
         fft_stages = self.stages
         self.stages = ([(ax, "gemm", A.shape[1], A.shape[0]) for _, ax, A in pre]
                        + fft_stages
@@ -297,8 +337,10 @@ class LocalFourierPlan:
                                  f"{x.shape[ax]}, the plan expects {k}")
         leg = _default_leg() or self.leg
         if leg is not None:
-            return self._call_ffi(x) if leg == "ffi" else self._call_xla(x)
-        return jax.lax.platform_dependent(x, cuda=self._call_ffi, default=self._call_xla)
+            return self._call_ffi(x, _process_leg()) if leg == "ffi" else self._call_xla(x)
+        from lxkit import LEGS
+        branches = {LEGS[k].jax_platforms[0]: (lambda x, k=k: self._call_ffi(x, k)) for k in self._build}
+        return jax.lax.platform_dependent(x, default=self._call_xla, **branches)
 
     def _call_xla(self, x):
         """The XLA leg: each GEMM contracts its axis in place (``tensordot``, the new
@@ -328,13 +370,13 @@ class LocalFourierPlan:
             x = jnp.transpose(x, [a % nd for a in self.out_perm])
         return x
 
-    def _call_ffi(self, x):
-        """The CUDA leg: the transform axes are moved trailing (free when they
-        already are), then one custom call executes the same stages row-major
-        (GEMMs by cuBLAS with the matrix broadcast, the FFT group by cuFFT; the
-        two trailing axes' GEMMs, back to back, as one cuBLASDx plane kernel
-        when a block fits it on the device)."""
-        from ffi.fft import fourier_plan_ffi
+    def _call_ffi(self, x, leg):
+        """A device leg (``leg``, a key of ``ffi.fft.FOURIER_PLAN_TARGETS``): the transform
+        axes are moved trailing (free when they already are), then one custom call executes
+        the same stages row-major (GEMMs by the vendor BLAS with the matrix broadcast, the FFT
+        group by the vendor FFT; on CUDA the two trailing axes' GEMMs, back to back, as one
+        cuBLASDx plane kernel when a block fits it on the device)."""
+        from ffi.fft import fourier_plan_build_attrs, fourier_plan_ffi
         nd = x.ndim
         phys = sorted(a % nd for a in self.axes)
         trailing = list(range(nd - len(phys), nd))
@@ -357,7 +399,8 @@ class LocalFourierPlan:
             sup_out=[int(c[4]) for c in cols],
             gemm=[int(by_pos[p] in gemm_axes) for p in phys],
             scale=[_axis_scale(c[0], self.sign, self.norm) for c in cols], order=order,
-            sign=self.sign, **self._pair)
+            sign=self.sign, leg=leg, **(self._build[leg] if leg in self._build else
+                                        fourier_plan_build_attrs(leg, n_gemm=self._n_gemm)))
         if phys != trailing:
             y = jnp.moveaxis(y, trailing, phys)
         if self.out_perm is not None:

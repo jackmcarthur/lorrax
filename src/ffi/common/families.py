@@ -72,9 +72,21 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "ROCm.  Measured max|dU|/max|U| <= 7.1e-16 (c128)."),
     "fourier_plan": Family(
         ("lorrax_fourier_plan",), "cufft",
-        _legs(("built", ""), ("xla", "common.fourier_plan XLA leg"), ("xla", "common.fourier_plan XLA leg")),
-        note="LocalFourierPlan's CUDA leg (cuBLAS Fourier GEMMs + one cuFFT group); "
-             "same-device XLA gate owed."),
+        _legs(("built", ""), ("elsewhere", "fourier_plan_rocm"), ("xla", "common.fourier_plan XLA leg")),
+        gate="tests/test_fourier_plan_xla_gate.py (ffi leg vs XLA leg of one plan, same device)",
+        tol=1e-12,
+        note="LocalFourierPlan's CUDA leg (cuBLAS Fourier GEMMs + one cuFFT group); the gate "
+             "serves both device legs and is unrun on CUDA (no CUDA device since wave 7)."),
+    "fourier_plan_rocm": Family(
+        ("lorrax_fourier_plan_rocm",), "hipfft",
+        _legs(("elsewhere", "fourier_plan"), ("built", ""), ("xla", "common.fourier_plan XLA leg")),
+        gate="tests/test_fourier_plan_xla_gate.py (ffi leg vs XLA leg of one plan, same GCD)",
+        tol=1e-12,
+        note="LocalFourierPlan's ROCM leg, ported from cufft/fourier_plan_cuda_ffi.cc: rocBLAS "
+             "ZGEMM axes (stride-0 matrix, no transposes) + one hipFFT group + a hipRTC remap; no "
+             "fused pair (cuBLASDx has no ROCm twin: GEMM pairs run as two rocBLAS calls).  Route "
+             "row: ffi.fft.FOURIER_PLAN_TARGETS['ROCM']; GEMM axes per common.fourier_plan."
+             "GEMM_CROSSOVER."),
     "fftw": Family(
         ("lorrax_mklfft_",), "fftw",
         _legs(("elsewhere", "mathdx"), ("xla", "ffi.fft.kconv_backend -> 'xla'"), ("built", "")),

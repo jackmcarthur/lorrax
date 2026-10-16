@@ -207,7 +207,9 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     lu = {"lorrax_slate_batched_solve_lu_factors", "lorrax_slate_batched_getrf",
           "lorrax_slate_batched_getrs"}
     eigh = {"lorrax_rocsolver_batched_eigh"}
-    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh for t in own)
+    fplan = {"lorrax_fourier_plan_rocm"}          # LocalFourierPlan's ROCM leg (cpp/hipfft/)
+    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | fplan for t in own)
+    assert fplan <= set(own)
     assert eigh <= set(own)
     assert lu <= set(own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)

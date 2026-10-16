@@ -36,7 +36,7 @@ LORRAX library (ROCm) has no engine for that operation.
 | **BSE W term, trial-stack matvec**: `U = s·FFT_k(IFFT_k T · W_R)` with `T = Σ_K L R`, `K = min(n_c, n_v)`, formed on the load; the decode's (t, μ) contraction in the store | `bse.bse_stack_matvec.build_bse_stack_matvec`: TDA Lanczos, Davidson and thick-restart Lanczos, TDA FEAST and KPM, the spectral-bound Lanczos of FEAST and KPM with or without `--tda`, Haydock, `bse.exciton_bands`; `build_bse_stack_pair_matvec`: the matrix-free `bse.bse_nontda` solver, which the CLI does not select | the first that serves: `lorrax_mathdx_kconv_klead_outer_decode` (T and U never stored; two 8-warp groups ping-pong on two banks; K sum on the fp64 tensor cores, or the FMA pipe under `LORRAX_BSE_OUTER_KSUM=fma`); `lorrax_mathdx_kconv_klead_outer` with the decode in XLA (`lorrax_mathdx_kconv_klead_outer_ksum` under `LORRAX_BSE_OUTER_KSUM=fma`); the XLA encode and mode 2 (`lorrax_mathdx_kconv_klead`). The route is announced once (`[bse] W term`) | the einsum for T, the plan route of `make_local_kconv_klead`, the decode einsum | the einsum for T, the composition of `make_local_kconv_klead`, the decode einsum | — | `ffi.fft.make_local_kconv_klead_outer_decode`, `make_local_kconv_klead_outer`, `make_local_kconv_klead`, `klead_outer_refusal`, `klead_outer_decode_refusal` ([BSE](bse.md#the-matvec)) |
 | **BSE W term, ring matvec**: `U = s·FFT_k(IFFT_k X · K_R)`, k trailing | `bse.bse_ring_comm.build_bse_ring_matvec_full`: the full (non-TDA) operator of FEAST and KPM and of the dense `bse.bse_nontda` build; the screening resolvents of `bse.w_ladder` (`w_bse`), `bse.bse_w_exact` and `bse.w_omega_chain`; the dense (A, B) oracle of the equality gates | mode 4, with a complex64 image for the fp32-GMRES arm | XLA moves k to the front, host transforms and product, k moves back; complex128 only | k moved to the front, the transforms and the product, k moved back | `tests/test_kconv_xla_gate.py` (mode 4) | `ffi.fft.make_kconv_kminor`, `make_local_kconv_kminor` |
 | **Sphere ↔ box 3-D FFT**: ψ_nk(G) ↔ ψ_nk(r), densities, plane-wave matrix elements | ψ at the centroids (`common.wfn_transforms`), the kmeans valence density (`psp.get_DFT_mtxels`), the V_H, kin_ion and dipole matrix elements (`common.mtxel_sweep`), the QSGW density (`gw.qsgw_density`), DFT operators (`psp.dft_operators`) | XLA `fft` → cuFFT inside jaxlib | XLA:CPU `fft` | this row: `jnp.fft` inside the caller's `shard_map`; no FFI route reaches it | none on numerics; `tests/test_fft_shardmap_context.py` checks only that call sites sit inside a `shard_map` | `common.fft_helpers.local_fftn3`, `local_ifftn3`, `make_sharded_fftn_3d`, `make_sharded_ifftn_3d` |
-| **Separable local DFT with supports**: `y = R_out·F·E_in·x`, ≤ 3 axes | no production caller besides the route-G plane FFT's `in_gather` form | `lorrax_fourier_plan_mathdx`: cuBLAS ZGEMM axes, the fused cuBLASDx pair when it fits the opt-in shared memory, one cuFFT group; startup refuses an nvidia-mathdx other than 25.6.0 (`GATE mathdx-pair-wheel`); cuFFT/cuBLAS sizes below 2³¹ (`GATE fourier-plan-int32`) ([plan](#local-fourier-plan-localfourierplan)) | the XLA leg | `dot_general` GEMM axes and one `jnp.fft` group, on every non-CUDA lowering | — | `common.fourier_plan.LocalFourierPlan` ([service](../dev/fourier_plan.md)) |
+| **Separable local DFT with supports**: `y = R_out·F·E_in·x`, ≤ 3 axes | `gw.plane_wave_pipeline` (the plane-wave K4 driver: both `MixedBasisPairConvolution`s' sphere↔box transforms); the route-G plane FFT's `in_gather` form | `lorrax_fourier_plan_mathdx`: cuBLAS ZGEMM axes, the fused cuBLASDx pair when it fits the opt-in shared memory, one cuFFT group; startup refuses an nvidia-mathdx other than 25.6.0 (`GATE mathdx-pair-wheel`); cuFFT/cuBLAS sizes below 2³¹ (`GATE fourier-plan-int32`) ([plan](#local-fourier-plan-localfourierplan)) | the XLA leg | `dot_general` GEMM axes and one `jnp.fft` group, on every lowering without a route row (ROCM: `lorrax_fourier_plan_rocm`, [plan](#local-fourier-plan-localfourierplan)) | `tests/test_fourier_plan_xla_gate.py` | `common.fourier_plan.LocalFourierPlan` ([service](../dev/fourier_plan.md)) |
 | **Green build GEMM**: `G_k(μ,ν;τ) = Σ_n ψ_nk(μ) w_n(τ) ψ*_nk(ν)` at the k parents | every Green of gwjax: χ₀ (`gw.w_isdf`), Σ (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`), the ζ-fit projectors (`gw.isdf_fitting`) → the parent Green `(n_parent, μ, s, ν, s')` | a batched 2-D SUMMA (`distrib_la.panel_matmul`, [bounded face products](../services/distrib_la/api.md#bounded-face-products)): XLA all-gathers of band panels of at most `N_b/p` columns, every k in one exchange, each multiplied by the classic-cuBLAS local active-range GEMM (`distrib_la._active_local_cuda`); the response bank's band-window Greens take the same SUMMA with host-known intervals (`gemm_plan(layout='face').prepare_active_range`) | the same SUMMA with the JAX local interval product (`distrib_la._active_local.active_local_matmul`) | the CPU engine is plain XLA | — | `gw.greens_function_kernel.face_green_product`, `build_G_parents`; `distrib_la.panel_matmul` ([active GEMM ranges](../services/distrib_la/api.md#active-ranges)) |
 | **Band projection**: `O_k,mn = Σ ψ*_mk(μ) O_k(μ,ν) ψ_nk(ν)` | Σ_mn from Σ_k(μ,ν) (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`, `gw.photon_sigma`, `gw.mpa.sector_sigma`); BSE W decode (`bse.bse_ring_comm`), `common.zeta_projection` | face layout: stationary-operator stream (XLA dots, ψ collectives only); legacy body: XLA einsums and two `psum_scatter`s | face layout: none; legacy body: the right contraction on `lorrax_mklblas_gemm_batch` (CBLAS, [§3a](#3a-the-dependency-matrix)) | the legacy body's einsums (`LORRAX_BANDS_GEMM_FFI=0` on cpu) | — | `common.contract_bands.contract_bands_block_reshard` ([vendor GEMM](../dev/vendor_gemm_service.md)) |
 | **Hermitian eigensolve**, batched local or distributed | the charge ζ factor (rank-truncating eigh of each C_q, dense and replicated under both `linalg` layouts), the QSGW `H_k` (`gw.sc_iteration.qp_eigh`) | local: `jnp.linalg.eigh` (cuSOLVER in jaxlib); `linalg = distributed`: cuSOLVERMp `syevd` | local: LAPACK in jaxlib; distributed: ScaLAPACK `p?heevd`/`p?syevd`; host SLATE eigh always refuses at resolve (bug L-2) | `jnp.linalg.eigh` | nothing observes which vendor answered | `distrib_la.plan('eigh')`; the charge factor: `isdf.cplus.factor` ([`distrib_la`](../services/distrib_la/api.md), [deck dial](../services/distrib_la/backends.md)) |
@@ -88,6 +88,7 @@ its sources, its build and its target strings.
 | mathdx k-convolution | `cufft/kconv_mathdx_cuda_ffi.cc`, `cufft/kbox_stage.cuh` | CUDA; NVRTC for the device's own `sm_<cc>` at first use, disk-cached | `mathdx_kconv_{pair, parent, plane, klead, klead_unfold_xblock, klead_lorentz_conj, chi_unfold, kminor}`, `mathdx_kfft_{klead, klead_unfold, kminor}`; older trees: `mathdx_kconv_klead_{unfold, lorentz}[_rows]`, `mathdx_kconv_klead_unfold_block` |
 | plane FFT (mode 10) | the same file (`kPlaneSrc`) | CUDA; NVRTC | `mathdx_plane_fft_gather` |
 | Local Fourier plan | `cufft/fourier_plan_cuda_ffi.cc`, `cufft/fourier_plan.cu` | CUDA; C++ (cuBLAS, cuFFT), nvcc remap kernel, NVRTC cuBLASDx pair | `fourier_plan_mathdx`; older trees: `fourier_plan` |
+| Local Fourier plan, ROCM leg | `hipfft/fourier_plan_rocm_ffi.cc` (remap kernel text inside, hipRTC) | ROCM; C++ over rocBLAS + hipFFT resolved by `dlsym` from the wheel copies JAX mapped (not linked); the port of the CUDA leg without the fused pair | `fourier_plan_rocm` |
 | run-time compilation service | `common/rtc_build.{h,cc}`, `common/lrx_async_gather.h`, `cufft/kbox_stage_src.h.in` | CUDA (NVRTC) and ROCM (hipRTC); C++ | none ([the cubin cache](compilation.md#2-native-kernels-and-nvrtc-images)) |
 | kdft k-leading pair (modes 2, 3) | `kdft/kdft_klead_ffi.cc`, `kdft/kdft_klead_kernel.h` (device text, `kdft_klead_src.h.in`) | ROCM; hipRTC for the device's target id at first use, disk-cached; leg-neutral source | `kdft_kconv_klead`, `kdft_kfft_klead` |
 | kdft k-minor pair (modes 4, 5) | `kdft/kdft_kminor_ffi.cc`, `kdft/kdft_kminor_kernel.h` (device text, `kdft_kminor_src.h.in`) | ROCM; as the k-leading pair | `kdft_kconv_kminor`, `kdft_kfft_kminor` |
@@ -533,14 +534,14 @@ then raise ([`decisions.md`](decisions.md), 2026-08-04).
 
 ---
 
-## 9. The Local Fourier plan's CUDA leg {#local-fourier-plan-localfourierplan}
+## 9. The Local Fourier plan's device legs {#local-fourier-plan-localfourierplan}
 
 `common.fourier_plan.LocalFourierPlan` computes `y = R_out·F·E_in·x` over at
 most three local axes; its contract, supports and per-axis GEMM/FFT selection
 (`GEMM_CROSSOVER`, the support-fraction bound) are the service page
 [`../dev/fourier_plan.md`](../dev/fourier_plan.md). This section owns the CUDA
 leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
-`fourier_plan.cu`.
+`fourier_plan.cu`, and its ROCM port, `cpp/hipfft/fourier_plan_rocm_ffi.cc`.
 
 * **Legs.** A plan with a GEMM stage chooses its leg when the call is lowered
   (`lax.platform_dependent`). On CUDA it is one `lorrax_fourier_plan_mathdx`
@@ -553,6 +554,23 @@ leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
   equal on both legs. `lorrax_fourier_plan`
   (the same handler without the pair's two string attributes) stays in the
   library for older trees.
+* **ROCM leg.** `cpp/hipfft/fourier_plan_rocm_ffi.cc`, target
+  `lorrax_fourier_plan_rocm` (family `fourier_plan_rocm`; route row
+  `ffi.fft.FOURIER_PLAN_TARGETS`): the CUDA leg's executor step for step --
+  rocBLAS `zgemm` / `zgemm_strided_batched` with the stride-0 matrix (workspace
+  sized once per plan in rocBLAS size-query mode, then from XLA scratch), one
+  hipFFT Z2Z plan per contiguous FFT run with the work area from XLA scratch,
+  and the remap kernel built by hipRTC (`common/rtc_build`, cached under
+  `cubin_dir`). No fused pair (cuBLASDx has no ROCm twin): GEMM pairs run as
+  two rocBLAS calls. Only the legs present in the process are
+  `platform_dependent` branches, so a CUDA process lowers exactly the program it
+  did before the ROCM row. The MI250X row of `GEMM_CROSSOVER` sends embedding
+  axes to the GEMM, keeps restrictions on the FFT arm and runs the FFT arm on
+  the device leg (measured reverse of A100; numbers in the row's comment).
+  Gate: `tests/test_fourier_plan_xla_gate.py` (both legs; ROCM 13/13 at P=1 and
+  P=4, worst 1.2e-15 relative to max|XLA|). Scratch: each ping-pong buffer is
+  sized by the largest intermediate it holds (the CUDA leg allocates two of the
+  chain's largest extent; Fe's pair-convolution budget leaves no room for that).
 * **Fused pair.** When the two trailing axes are GEMM axes executed back to
   back, one cuBLASDx kernel per plane does both,
   `Q (N1'×N2') = α·A1 (N1'×K1)·P (K1×K2)·A2ᵀ (K2×N2')`, with the plane, both
@@ -566,8 +584,8 @@ leg, `cpp/cufft/fourier_plan_cuda_ffi.cc` with the remap kernel in
   per shape cold (claim 2764). A100, whole plan against the cuBLAS chain: Fe 25³, K = 13,
   sphere→box 0.80–0.82, box→sphere 0.64–0.66; 16³–48³ 0.8–0.9; shapes that do
   not fit (64³, 72³, 96²) are unchanged. Boxes whose long axis is an FFT axis
-  (CrI3 80×80×250) never pair. No production caller builds a separable plan on
-  main (the ζ site uses `in_gather`). The GEMM rows and the pair are kept for
+  (CrI3 80×80×250) never pair. The one caller that builds separable plans is
+  `gw.plane_wave_pipeline` (the ζ site uses `in_gather`). The GEMM rows and the pair are kept for
   real-space GW's sphere↔box transforms at Fe-class boxes; the service page has
   the estimate and the per-device projection.
 * **CUTLASS under NVRTC.** The nvidia-mathdx 25.6 wheel's CUTLASS 3.9 declares
