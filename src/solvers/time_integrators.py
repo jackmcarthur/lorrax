@@ -480,7 +480,13 @@ def cfm4_step(explicit: Callable, state_part: Callable, conjugate: Callable,
     evaluations of B and four exponentials per correction, two exponentials
     for the step.  A correction contracts the node error by O(h ||dB/dy||),
     so a predictor of order m reaches the scheme's order 4 after
-    max(0, 4 - m) corrections.  Returns (y_{n+1}, (B1, B2)).
+    max(1, 4 - m) corrections: at least one, because the returned node
+    values feed the next predictor, and with none B is extrapolated from its
+    own guesses and never sees y (the cubic history predictor then stays at
+    error 0.27 under step halving in the unit test, where one correction
+    gives order 4.5-5.5 and two give 3.95-3.99).  One correction is unstable
+    on the CrI3 COHSEX kernel from 50 as, so the TD-aGW driver defaults to
+    two.  Returns (y_{n+1}, (B1, B2)).
     """
     c1, c2 = CFM4_NODES
     al1, al2 = CFM4_WEIGHTS
