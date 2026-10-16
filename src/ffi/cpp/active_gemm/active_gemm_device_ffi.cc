@@ -43,7 +43,7 @@ static ffi::Error fail(const char* gate, const std::string& why,
     return ffi::Error(code, std::string("GATE ") + gate + ": " + why);
 }
 
-struct Kernels { rtc::Function z = nullptr, d = nullptr; };
+struct Kernels { rtc::Function z = nullptr, d = nullptr, z32 = nullptr, d32 = nullptr; };
 
 // Targets with FP64 MFMA (v_mfma_f64_16x16x4f64): CDNA2 gfx90a and CDNA3 gfx94x.
 static bool mfma_target(const std::string& arch) {
@@ -75,6 +75,7 @@ static ffi::Error kernels(std::string_view cache_dir, Kernels* out) {
     // The FP64 matrix-core path where the device has one (ROCM gfx90a / gfx94x: MFMA f64 16x16x4);
     // every other target (and the CUDA leg, until a DMMA arm is gated) takes the FMA path.
     const int mfma = mfma_target(arch) ? 1 : 0;
+    if (mfma) prog.entries = {"lrx_active_gemm_d", "lrx_active_gemm_z32", "lrx_active_gemm_d32"};
     prog.defs = {rtc::kOptOption, "-std=c++17", rtc::arch_option(arch),
                  "-DLRX_TM=" + std::to_string(kTm), "-DLRX_TN=" + std::to_string(kTn),
                  "-DLRX_TK=" + std::to_string(kTk), "-DLRX_MFMA=" + std::to_string(mfma)};
@@ -100,6 +101,7 @@ static ffi::Error kernels(std::string_view cache_dir, Kernels* out) {
     Kernels k;
     k.z = img.fn;
     k.d = img.fns.empty() ? nullptr : img.fns[0];
+    if (img.fns.size() == 3) { k.z32 = img.fns[1]; k.d32 = img.fns[2]; }
     if (k.d == nullptr)
         return fail("active-gemm-build", "entry lrx_active_gemm_d missing", ffi::ErrorCode::kInternal);
     g_cache.emplace(dev, k);
@@ -147,7 +149,15 @@ static ffi::Error Launch(lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuff
 
     Kernels ks;
     FFI_RETURN_IF_ERROR(kernels(cache_dir, &ks));
-    rtc::Function fn = dt == ffi::DataType::C128 ? ks.z : ks.d;
+    // Block tile per call: 64 x 64, or 32 x 32 (MFMA images) where it pads clearly less --
+    // Fe's W synthesis (m = n = 156): 64-row tiles cover 192 x 192 (66 % useful), 32-row tiles
+    // 160 x 160 (95 %).  A pure function of (m, n): no device or host data is read.
+    const auto useful = [&](int64_t t) {
+        return double(m) * double(n) / (double((m + t - 1) / t * t) * double((n + t - 1) / t * t));
+    };
+    const bool small = ks.z32 != nullptr && useful(32) > useful(64) + 0.05 && (m + 31) / 32 <= 65535;
+    const int64_t bt = small ? 32 : kTm;
+    rtc::Function fn = dt == ffi::DataType::C128 ? (small ? ks.z32 : ks.z) : (small ? ks.d32 : ks.d);
     const void* A = a.untyped_data();
     const void* B = b.untyped_data();
     const void* W = weighted ? w.untyped_data() : nullptr;
@@ -158,8 +168,8 @@ static ffi::Error Launch(lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuff
     int read_c = (c_in && (beta_re != 0.0 || beta_im != 0.0)) ? 1 : 0;
     void* args[] = {&A, &B, &W, &BD, &bstride, &nb, &C, &mi, &ki, &ni,
                     &alpha_re, &alpha_im, &beta_re, &beta_im, &read_c};
-    const unsigned gx = static_cast<unsigned>((n + kTn - 1) / kTn);
-    const unsigned gy = static_cast<unsigned>((m + kTm - 1) / kTm);
+    const unsigned gx = static_cast<unsigned>((n + bt - 1) / bt);
+    const unsigned gy = static_cast<unsigned>((m + bt - 1) / bt);
     const rtc::Result r = rtc::driver_api().LaunchKernel(
         fn, gx, gy, static_cast<unsigned>(nq), kThreads, 1, 1, 0,
         reinterpret_cast<rtc::Stream>(stream), args, nullptr);

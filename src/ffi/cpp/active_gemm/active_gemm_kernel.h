@@ -154,7 +154,8 @@ __device__ __forceinline__ void lrx_active_gemm(
 // v_mfma_f64_16x16x4f64 is D(16x16) += A(16x4) B(4x16) for a wavefront: lane l holds
 // D[4(l/16)+r][l%16] (r = 0..3), supplies B[l/16][l%16], and supplies A[rho(l%16)][l/16] with
 // rho(x) = 4 (x%4) + x/4 in D's row numbering -- MEASURED on MI250X with one-hot operands
-// (mfma_probe, wave 8), not the naive A[l%16][l/16].  The block's four wavefronts tile C 2 x 2, 32 x 32 each (2 x 2 MFMA tiles).
+// (mfma_probe, wave 8), not the naive A[l%16][l/16].  The block's four wavefronts tile C 2 x 2:
+// 32 x 32 each (2 x 2 MFMA tiles, block 64 x 64) or 16 x 16 each (one tile, block 32 x 32).
 // complex128 is the exact 4M form, four real MFMAs per tile:
 //   Dre += Are Bre + (-Aim) Bim,  Dim += Are Bim + Aim Bre
 // (negation is exact, so the rounding is that of the FMA path's four products; no 3M form).
@@ -166,60 +167,67 @@ __device__ __forceinline__ void lrx_active_gemm(
 #if !defined(__AMDGCN__)
 #error "LRX_MFMA is the AMDGPU matrix-core path (hipRTC on gfx90a / gfx94x only)"
 #endif
-#if (LRX_TK % 4) != 0 || LRX_TM != 64 || LRX_TN != 64 || LRX_NT != 256
-#error "the MFMA path is laid out for a 64 x 64 tile, 256 threads and TK a multiple of 4"
+#if (LRX_TK % 8) != 0 || LRX_NT != 256
+#error "the MFMA path is laid out for 256 threads and TK a multiple of 8"
 #endif
 typedef double lrx_d4 __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ lrx_d4 lrx_mfma(double a, double b, lrx_d4 c) {
     return __builtin_amdgcn_mfma_f64_16x16x4f64(a, b, c, 0, 0, 0);
 }
-__device__ __forceinline__ void lrx_mfma_step(lrx_d4 (&cr)[2][2], lrx_d4 (&)[2][2],
-                                              const double (&a)[2], const double (&b)[2]) {
+// One k4 step for a wave's NT x NT MFMA tiles into accumulator set kp.  Real: one MFMA per
+// tile; complex: four (exact 4M form), issued in four passes over the tiles.
+template <int NT, int KP>
+__device__ __forceinline__ void lrx_mfma_step(lrx_d4 (&cr)[KP][NT][NT], lrx_d4 (&)[KP][NT][NT], int kp,
+                                              const double (&a)[NT], const double (&b)[NT]) {
 #pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
+    for (int rt = 0; rt < NT; ++rt)
 #pragma unroll
-        for (int ct = 0; ct < 2; ++ct) cr[rt][ct] = lrx_mfma(a[rt], b[ct], cr[rt][ct]);
+        for (int ct = 0; ct < NT; ++ct) cr[kp][rt][ct] = lrx_mfma(a[rt], b[ct], cr[kp][rt][ct]);
 }
-__device__ __forceinline__ void lrx_mfma_step(lrx_d4 (&cr)[2][2], lrx_d4 (&ci)[2][2],
-                                              const lrx_z (&a)[2], const lrx_z (&b)[2]) {
-    // Four independent passes, each over the four tiles, so dependent MFMAs on one
-    // accumulator are four instructions apart.
+template <int NT, int KP>
+__device__ __forceinline__ void lrx_mfma_step(lrx_d4 (&cr)[KP][NT][NT], lrx_d4 (&ci)[KP][NT][NT], int kp,
+                                              const lrx_z (&a)[NT], const lrx_z (&b)[NT]) {
 #pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
+    for (int rt = 0; rt < NT; ++rt)
 #pragma unroll
-        for (int ct = 0; ct < 2; ++ct) cr[rt][ct] = lrx_mfma(a[rt].re, b[ct].re, cr[rt][ct]);
+        for (int ct = 0; ct < NT; ++ct) cr[kp][rt][ct] = lrx_mfma(a[rt].re, b[ct].re, cr[kp][rt][ct]);
 #pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
+    for (int rt = 0; rt < NT; ++rt)
 #pragma unroll
-        for (int ct = 0; ct < 2; ++ct) ci[rt][ct] = lrx_mfma(a[rt].re, b[ct].im, ci[rt][ct]);
+        for (int ct = 0; ct < NT; ++ct) ci[kp][rt][ct] = lrx_mfma(a[rt].re, b[ct].im, ci[kp][rt][ct]);
 #pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
+    for (int rt = 0; rt < NT; ++rt)
 #pragma unroll
-        for (int ct = 0; ct < 2; ++ct) cr[rt][ct] = lrx_mfma(-a[rt].im, b[ct].im, cr[rt][ct]);
+        for (int ct = 0; ct < NT; ++ct) cr[kp][rt][ct] = lrx_mfma(-a[rt].im, b[ct].im, cr[kp][rt][ct]);
 #pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
+    for (int rt = 0; rt < NT; ++rt)
 #pragma unroll
-        for (int ct = 0; ct < 2; ++ct) ci[rt][ct] = lrx_mfma(a[rt].im, b[ct].re, ci[rt][ct]);
+        for (int ct = 0; ct < NT; ++ct) ci[kp][rt][ct] = lrx_mfma(a[rt].im, b[ct].re, ci[kp][rt][ct]);
 }
-__device__ __forceinline__ double lrx_acc(const lrx_d4& cr, const lrx_d4&, int r, double) { return cr[r]; }
-__device__ __forceinline__ lrx_z lrx_acc(const lrx_d4& cr, const lrx_d4& ci, int r, lrx_z) {
-    lrx_z z; z.re = cr[r]; z.im = ci[r]; return z;
-}
+__device__ __forceinline__ double lrx_acc(double re, double, double) { return re; }
+__device__ __forceinline__ lrx_z lrx_acc(double re, double im, lrx_z) { lrx_z z; z.re = re; z.im = im; return z; }
 
-template <typename T>
+// WT: the wave tile (32: 2 x 2 MFMA tiles, block 64 x 64; 16: one MFMA tile, block 32 x 32).
+// The host picks per call from (m, n): Fe's W synthesis has m = n = 156, which 64-row tiles
+// cover as 192 (34 % of the MFMA work is padding) and 32-row tiles as 160 (2.5 %).  WT 16 keeps
+// two accumulator sets that alternate over k4 steps, so a wave still issues four independent
+// MFMA chains; they are summed in the epilogue (a different, still exact-product, summation
+// order: within the 1e-13 gate).
+template <typename T, int WT>
 __device__ __forceinline__ void lrx_active_gemm_mfma(
     const T* __restrict__ A, const T* __restrict__ B, const T* __restrict__ W,
     const int* __restrict__ bounds, int bstride, int nb, T* C, int m, int k, int n,
     double alpha_re, double alpha_im, double beta_re, double beta_im, int read_c) {
-    __shared__ T As[LRX_TK][LRX_TM + 1];
-    __shared__ T Bs[LRX_TK][LRX_TN + 1];
+    constexpr int NT = WT / 16, KP = NT == 1 ? 2 : 1, BM = 2 * WT, BN = 2 * WT;
+    __shared__ T As[LRX_TK][BM + 1];
+    __shared__ T Bs[LRX_TK][BN + 1];
     const T zero = lrx_zero(T());
     const int t = threadIdx.x, lane = t & 63, wave = t >> 6;
     const int wr = wave >> 1, wc = wave & 1, li = lane & 15, lk = lane >> 4;
     // The A operand's row for this lane, in D's row numbering (measured on gfx90a, see above).
     const int arow = ((li & 3) << 2) | (li >> 2);
     const long long q = blockIdx.z;
-    const int row0 = blockIdx.y * LRX_TM, col0 = blockIdx.x * LRX_TN;
+    const int row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
     bool valid = true;
     for (int p = 0; p < nb; ++p) {
         const int l = bounds[2 * p], h = bounds[2 * p + 1];
@@ -227,41 +235,66 @@ __device__ __forceinline__ void lrx_active_gemm_mfma(
     }
     const int lo = valid ? bounds[q * bstride] : 0;
     const int hi = valid ? bounds[q * bstride + 1] : 0;
-    lrx_d4 cr[2][2], ci[2][2];
+    lrx_d4 cr[KP][NT][NT], ci[KP][NT][NT];
 #pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
+    for (int kp = 0; kp < KP; ++kp)
 #pragma unroll
-        for (int ct = 0; ct < 2; ++ct)
+        for (int rt = 0; rt < NT; ++rt)
 #pragma unroll
-            for (int r = 0; r < 4; ++r) { cr[rt][ct][r] = 0.0; ci[rt][ct][r] = 0.0; }
+            for (int ct = 0; ct < NT; ++ct)
+#pragma unroll
+                for (int r = 0; r < 4; ++r) { cr[kp][rt][ct][r] = 0.0; ci[kp][rt][ct][r] = 0.0; }
     const T* Aq = A + q * (long long)m * k;
     const T* Bq = B + q * (long long)k * n;
     const T* Wq = W ? W + q * (long long)k : nullptr;
-    for (int k0 = lo; k0 < hi; k0 += LRX_TK) {             // uniform per block
-        for (int e = t; e < LRX_TM * LRX_TK; e += LRX_NT) {
+    // Register prefetch: the next K slab's guarded global loads are issued before this slab's
+    // MFMAs, so their latency overlaps the matrix work (no second LDS buffer, no workspace).
+    constexpr int EA = BM * LRX_TK / LRX_NT, EB = LRX_TK * BN / LRX_NT;
+    static_assert(EA * LRX_NT == BM * LRX_TK && EB * LRX_NT == LRX_TK * BN, "slab / thread split");
+    T ra[EA], rb[EB];
+    auto fetch = [&](int k0) {
+#pragma unroll
+        for (int x = 0; x < EA; ++x) {
+            const int e = t + x * LRX_NT;
             const int r = e / LRX_TK, kc = e - r * LRX_TK, i = row0 + r, kk = k0 + kc;
             T v = zero;
             if (i < m && kk < hi) {
                 v = Aq[(long long)i * k + kk];
                 if (Wq) v = lrx_mul(v, Wq[kk]);
             }
-            As[kc][r] = v;
+            ra[x] = v;
         }
-        for (int e = t; e < LRX_TK * LRX_TN; e += LRX_NT) {
-            const int kr = e / LRX_TN, jc = e - kr * LRX_TN, jj = col0 + jc, kk = k0 + kr;
+#pragma unroll
+        for (int x = 0; x < EB; ++x) {
+            const int e = t + x * LRX_NT;
+            const int kr = e / BN, jc = e - kr * BN, jj = col0 + jc, kk = k0 + kr;
             T v = zero;
             if (kk < hi && jj < n) v = Bq[(long long)kk * n + jj];
-            Bs[kr][jc] = v;
+            rb[x] = v;
+        }
+    };
+    if (lo < hi) fetch(lo);
+    for (int k0 = lo; k0 < hi; k0 += LRX_TK) {             // uniform per block
+#pragma unroll
+        for (int x = 0; x < EA; ++x) {
+            const int e = t + x * LRX_NT, r = e / LRX_TK;
+            As[e - r * LRX_TK][r] = ra[x];
+        }
+#pragma unroll
+        for (int x = 0; x < EB; ++x) {
+            const int e = t + x * LRX_NT, kr = e / BN;
+            Bs[kr][e - kr * BN] = rb[x];
         }
         __syncthreads();
+        if (k0 + LRX_TK < hi) fetch(k0 + LRX_TK);
 #pragma unroll
         for (int ks = 0; ks < LRX_TK; ks += 4) {
-            T a[2], b[2];
+            T a[NT], b[NT];
 #pragma unroll
-            for (int rt = 0; rt < 2; ++rt) a[rt] = As[ks + lk][wr * 32 + rt * 16 + arow];
+            for (int rt = 0; rt < NT; ++rt) a[rt] = As[ks + lk][wr * WT + rt * 16 + arow];
 #pragma unroll
-            for (int ct = 0; ct < 2; ++ct) b[ct] = Bs[ks + lk][wc * 32 + ct * 16 + li];
-            lrx_mfma_step(cr, ci, a, b);
+            for (int ct = 0; ct < NT; ++ct) b[ct] = Bs[ks + lk][wc * WT + ct * 16 + li];
+            lrx_mfma_step<NT, KP>(cr, ci, (ks / 4) % KP, a, b);
         }
         __syncthreads();
     }
@@ -269,39 +302,48 @@ __device__ __forceinline__ void lrx_active_gemm_mfma(
     const T beta = lrx_scalar(beta_re, beta_im, T());
     T* Cq = C + q * (long long)m * n;
 #pragma unroll
-    for (int rt = 0; rt < 2; ++rt)
+    for (int rt = 0; rt < NT; ++rt)
 #pragma unroll
-        for (int ct = 0; ct < 2; ++ct) {
-            const int j = col0 + wc * 32 + ct * 16 + li;
+        for (int ct = 0; ct < NT; ++ct) {
+            const int j = col0 + wc * WT + ct * 16 + li;
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                const int i = row0 + wr * 32 + rt * 16 + 4 * lk + r;
+                const int i = row0 + wr * WT + rt * 16 + 4 * lk + r;
                 if (i >= m || j >= n) continue;
+                double re = 0.0, im = 0.0;
+#pragma unroll
+                for (int kp = 0; kp < KP; ++kp) { re += cr[kp][rt][ct][r]; im += ci[kp][rt][ct][r]; }
                 const long long o = (long long)i * n + j;
                 T v;
                 if (!valid) {
                     v = lrx_nan(T());
                 } else {
-                    v = lrx_mul(alpha, lrx_acc(cr[rt][ct], ci[rt][ct], r, T()));
+                    v = lrx_mul(alpha, lrx_acc(re, im, T()));
                     if (read_c) v = lrx_add(v, lrx_mul(beta, Cq[o]));
                 }
                 Cq[o] = v;
             }
         }
 }
-#define LRX_GEMM_BODY lrx_active_gemm_mfma
+#define LRX_GEMM_BODY(T) lrx_active_gemm_mfma<T, 32>
 #else
-#define LRX_GEMM_BODY lrx_active_gemm
+#define LRX_GEMM_BODY(T) lrx_active_gemm<T>
 #endif
 
-#define LRX_ACTIVE_GEMM_ENTRY(name, T)                                                        \
+#define LRX_ACTIVE_GEMM_ENTRY(name, T, BODY)                                                  \
     extern "C" __global__ void __launch_bounds__(LRX_NT) name(                                \
         const T* A, const T* B, const T* W, const int* bounds, int bstride, int nb, T* C,     \
         int m, int k, int n, double alpha_re, double alpha_im, double beta_re,                \
         double beta_im, int read_c) {                                                         \
-        LRX_GEMM_BODY<T>(A, B, W, bounds, bstride, nb, C, m, k, n, alpha_re, alpha_im,        \
-                           beta_re, beta_im, read_c);                                         \
+        BODY(A, B, W, bounds, bstride, nb, C, m, k, n, alpha_re, alpha_im, beta_re, beta_im,  \
+             read_c);                                                                         \
     }
 
-LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z, lrx_z)
-LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d, double)
+// 64 x 64 block tile (both paths).
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z, lrx_z, LRX_GEMM_BODY(lrx_z))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d, double, LRX_GEMM_BODY(double))
+#if LRX_MFMA
+// 32 x 32 block tile (MFMA path only; the host requests it where it pads less).
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_z32, lrx_z, (lrx_active_gemm_mfma<lrx_z, 16>))
+LRX_ACTIVE_GEMM_ENTRY(lrx_active_gemm_d32, double, (lrx_active_gemm_mfma<double, 16>))
+#endif
