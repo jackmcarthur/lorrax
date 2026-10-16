@@ -721,6 +721,7 @@ def _interpolate_bse_data_to_grid(
     htransform_a_band: int | None = None,
     htransform_rank_record_fn=None,
     htransform_quality_record_fn=None,
+    eqp_file: str | None = None,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -763,6 +764,10 @@ def _interpolate_bse_data_to_grid(
 
     Parameters
     ----------
+    eqp_file : str or None
+        The wedge ``eqp1.dat`` (``--eqp``).  Its QP energies enter the fH
+        through ``initialize_wfns``, the one reader on this path, so the fine
+        ε are quasiparticle; the coarse bundle's ε are not re-sliced after.
     head_channel : dict or None
         C1's split-and-reattach hand-off from the loader, ``None`` on the
         ``legacy`` arm.  When present it carries ``whead`` (the head scalar the
@@ -837,7 +842,7 @@ def _interpolate_bse_data_to_grid(
     _fit_subset = keep
     (wfn, sym, meta, _mesh, basis,
      enk_sigma) = ht.initialize_wfns(
-         input_file, params, log_fn, mesh_xy=mesh_xy,
+         input_file, params, log_fn, mesh_xy=mesh_xy, eqp_file=eqp_file,
          centroid_subset_idx=_fit_subset,
          rank_record_fn=htransform_rank_record_fn,
          distrib_la_batched_route=_distrib_la_batched_route)

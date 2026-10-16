@@ -110,10 +110,14 @@ def _preview_lanczos(
             htransform_rank_record_fn=_htransform_rank_records.append,
             htransform_quality_record_fn=(
                 _htransform_quality_records.append),
+            eqp_file=eqp_file,
         )
         grid_x, grid_y = mesh_xy.devices.shape
-        # EQP override on enk_full (BGW eqp1.dat semantics).
-        if eqp_file is not None:
+        # EQP override on enk_full (BGW eqp1.dat semantics).  A bse_k_grid
+        # bundle took the QP energies inside its htransform; re-slicing the
+        # coarse restart here would put coarse ε on the fine k axis.
+        n_occ_eqp = None
+        if eqp_file is not None and not data["densified"]:
             # Re-slice the band window on the eqp-corrected energies. Uses the
             # loader-CLAMPED band counts (data['n_val']/data['n_cond']), not the
             # raw CLI n_val/n_cond, so an over-request can't slice out of bounds.
@@ -225,7 +229,7 @@ def _preview_lanczos(
                                             slice_dipole_to_bse_window)
             from .bse_io import resolve_n_occ
             from .bse_window import _parse_wfn_path
-            n_occ_dip = (n_occ_eqp if eqp_file is not None else resolve_n_occ(
+            n_occ_dip = (n_occ_eqp if n_occ_eqp is not None else resolve_n_occ(
                 read_metadata(restart_file)["energies"], n_occ=n_occ,
                 input_file=input_file))
             with timing.section("bse.exciton_dipoles", announce=True):

@@ -161,7 +161,7 @@ def run_haydock(
     print(f"[haydock] loading BSE data from {restart_file}")
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
-        input_file=input_file, n_occ=n_occ,
+        input_file=input_file, n_occ=n_occ, eqp_file=eqp_file,
     )
     # Resolve n_occ for the downstream dipole slice — same source as the
     # loader used (WFN.h5 ifmax → largest-gap fallback).
@@ -169,7 +169,8 @@ def run_haydock(
     enk_full_np = read_metadata(restart_file)["energies"]
     from .bse_io import resolve_n_occ
     n_occ = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
-    if eqp_file is not None:
+    if eqp_file is not None and not data["densified"]:
+        # (A bse_k_grid bundle took the QP energies inside its htransform.)
         # Re-slice the band window AND re-resolve n_occ on the eqp-corrected
         # energies (a QP shift can move the gap). Overwrite n_occ so the
         # downstream dipole slice below uses the corrected value too, rather

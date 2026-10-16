@@ -5,6 +5,17 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-16 — `bse_k_grid` with `--eqp`: the QP energies enter the htransform
+
+`bse_jax` and `absorption_haydock` re-sliced the coarse restart's QP energies
+after `bse_k_grid` had densified the bundle, onto a k axis they do not have.
+`--eqp` now goes into the densifying htransform (`initialize_wfns`, its one
+reader on that path), so the fine ε are quasiparticle and nothing is
+re-sliced after.
+
+- **Results.** `bse_k_grid` runs with `--eqp` run on QP energies. Runs
+  without `--eqp`, or without `bse_k_grid`, are unchanged.
+
 ## 2026-10-16 — W densifier: an even coarse axis splits its Nyquist coefficient
 
 `bse_k_grid` and `exciton_bands --w-coarse-grid` interpolate W by zero-padding

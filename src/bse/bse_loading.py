@@ -121,6 +121,7 @@ def load_bse_data_from_restart_sharded(
     htransform_a_band: int | None = None,
     htransform_rank_record_fn=None,
     htransform_quality_record_fn=None,
+    eqp_file: Optional[str] = None,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
 
@@ -132,6 +133,11 @@ def load_bse_data_from_restart_sharded(
     ``None`` the value is read from the cohsex.in ``bse_k_grid`` key (via
     ``input_file``); unset or == the coarse grid → the coarse bundle is
     returned byte-identically (fast path untouched).
+
+    ``eqp_file`` (``--eqp``) enters the htransform on the densified path, so
+    the fine ε are quasiparticle; ``data["densified"]`` tells the caller
+    whether it still owes the coarse QP re-slice
+    (``bse_window.apply_eqp_and_reslice_bands``).
 
     ``inject_head=False`` returns the head-LESS V_q0 / W_q bodies exactly as
     stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
@@ -324,7 +330,11 @@ def load_bse_data_from_restart_sharded(
             distrib_la_batched_route=distrib_la_batched_route,
             htransform_a_band=htransform_a_band,
             htransform_rank_record_fn=htransform_rank_record_fn,
-            htransform_quality_record_fn=htransform_quality_record_fn)
+            htransform_quality_record_fn=htransform_quality_record_fn,
+            eqp_file=None if eqp_file is None else os.path.abspath(eqp_file))
+    # A densified bundle's ε already carry ``eqp_file``; the drivers re-slice
+    # the coarse restart's QP energies only when this is False.
+    data["densified"] = bool(densify_pending)
     return data
 
 
@@ -341,8 +351,8 @@ def _load_ring_subset(restart_file, n_val, n_cond, px, py, eqp_file=None,
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val, n_cond, mesh_xy=resolve_mesh(), input_file=input_file,
         n_occ=n_occ, degeneracy_mode=degeneracy_mode,
-        degeneracy_tol_ry=degeneracy_tol_ry)
-    if eqp_file is not None:
+        degeneracy_tol_ry=degeneracy_tol_ry, eqp_file=eqp_file)
+    if eqp_file is not None and not data["densified"]:
         data["eps_v"], data["eps_c"], _ = apply_eqp_and_reslice_bands(
             restart_file, eqp_file, input_file, data["n_val"], data["n_cond"],
             n_occ, px, py, degeneracy_mode=degeneracy_mode,
