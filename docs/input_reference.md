@@ -319,7 +319,7 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `measurements.types` | unset (required) | The measurement list: `Efield`, `polarization`, `current`, `density_matrix`, `lessG`. `velocity_operator` refuses (`td_measurement_unsupported`). Per-measurement options are `[measurements.<i>]` tables (below). |
 | `lorrax.method` | `dp54` | `dp54` (SciPy RK45, adaptive; takes TDGW's steps), `rk4`, `etdrk4` (Krogstad), `magnus2` (exponential midpoint) or `cfm4` (fourth-order commutator-free Magnus). |
 | `lorrax.dt` | unset | The fixed step, as, for every method but `dp54`; refused with `dp54` (`td_dt`). |
-| `lorrax.n_corr` | `1` | Corrections per step of `magnus2` (midpoint Hamiltonian) and `cfm4` (Gauss-node Hamiltonians); each costs one dΣ evaluation per node. At least 1 (`td_n_corr`). |
+| `lorrax.n_corr` | `2` | Corrections per step of `magnus2` (midpoint Hamiltonian) and `cfm4` (Gauss-node Hamiltonians); each costs one dΣ evaluation per node. At least 1 (`td_n_corr`). One correction after the extrapolated predictor is stable only while the step times the strength of dΣ[ρ] is small: on CrI3 2v2c COHSEX it diverges from 50 as, where two corrections are stable to 300 as. |
 | `lorrax.model` | `""` (= `none` for IP, `tdgw_kernel` for COHSEX) | The self-energy update: `none`, `tdgw_kernel` (TDGW's dense `kernel.h5`) or `isdf` (the LORRAX ISDF model of a GW restart bundle). |
 | `lorrax.kernel_file` | `""` (= `indir/kernel.h5`) | The BerkeleyGW-layout kernel for `tdgw_kernel`. |
 | `lorrax.isdf_input` | `""` | The GW deck of the restart bundle, required by `isdf` (`td_isdf_input`). |

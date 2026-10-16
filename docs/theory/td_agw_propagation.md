@@ -107,7 +107,11 @@ through the last two steps' four Gauss-node values for `cfm4`), and each
 correction propagates $\rho_n$ to the node(s) and re-evaluates ΔΣ there.
 Each correction gains one order of $h$, so the cubic predictor plus one
 correction gives order 4; without a correction the scheme is unstable, and
-`n_corr` < 1 refuses. The first two (`cfm4`) or three (`magnus2`) steps,
+`n_corr` < 1 refuses. The extrapolation amplifies the predictor's error, so
+one correction contracts it only while $h\,\lVert\partial\Delta\Sigma/\partial\rho\rVert$
+is small: with the CrI3 COHSEX kernel (6×6 k, 2v2c) `cfm4` with one
+correction diverges from 50 as, while two corrections are stable to 300 as.
+The default is two. The first two (`cfm4`) or three (`magnus2`) steps,
 before the history exists, take three extra corrections. Relaxation and the
 intraband term are not commutators; they enter by Strang splitting
 $R(h/2)\,M(h)\,R(h/2)$, with $R$ the exact relaxation around an RK4 step of

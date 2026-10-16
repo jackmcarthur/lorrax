@@ -51,7 +51,7 @@ TD_DEFAULTS = {
     "measurements.types": None,
     "lorrax.method": "dp54",
     "lorrax.dt": None,
-    "lorrax.n_corr": 1,
+    "lorrax.n_corr": 2,
     "lorrax.model": "",
     "lorrax.kernel_file": "",
     "lorrax.isdf_input": "",
