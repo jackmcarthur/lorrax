@@ -939,21 +939,25 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
 
 @lru_cache(maxsize=None)
 def store_pole_rows(mesh_xy, blocks, width, order):
-    """The model store's poles [nq, width], replicated, joined on the device from each round's
-    sorted pole rows: round i keeps ``blocks[i] = (real, keep)`` rows and columns, padded to
-    ``width`` with 1.0 (the store's inert pole), then the parents are put in canonical
-    ``order`` (a static permutation): the host join of the same rows, value for value."""
+    """The model store's poles [nq, width] and counts [nq] int64, replicated, joined on the
+    device from each round's sorted pole rows and active flags: round i keeps
+    ``blocks[i] = (real, keep)`` rows and columns, padded to ``width`` with 1.0 (the store's
+    inert pole), its counts the active flags summed per row, then the parents are put in
+    canonical ``order`` (a static permutation): the host join of the same rows and the host
+    ``active.sum(axis=-1)``, value for value."""
     import jax
     import jax.numpy as jnp
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
     permutation = np.asarray(order, np.int64)
 
-    def join(*poles):
+    def join(poles, active):
         rows = [jnp.pad(p[:r, :k], ((0, 0), (0, width - k)), constant_values=1.0)
                 for p, (r, k) in zip(poles, blocks)]
-        return jnp.concatenate(rows)[permutation]
-    return jax.jit(join, out_shardings=NamedSharding(mesh_xy, P()))
+        counts = [a[:r].sum(axis=-1, dtype=jnp.int64) for a, (r, _) in zip(active, blocks)]
+        return jnp.concatenate(rows)[permutation], jnp.concatenate(counts)[permutation]
+    rep = NamedSharding(mesh_xy, P())
+    return jax.jit(join, out_shardings=(rep, rep))
 
 
 @lru_cache(maxsize=None)

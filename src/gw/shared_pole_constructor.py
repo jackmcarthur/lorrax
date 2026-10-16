@@ -452,7 +452,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 factors.append(face_rows(mesh_xy, tuple(range(real)), width)(round_model[0]) if execution == 'face' else
                                face_rows(mesh_xy, tuple(range(real)), width)(to_face(round_model[0])))
                 # The round's sorted poles stay on the device; the writer joins them there.
-                store_poles.append((vectors[0], (int(real), int(width))))
+                store_poles.append(((vectors[0], vectors[1]), (int(real), int(width))))
                 store_counts.append(counts[:real])
                 placed += list(ids[:real])
                 del round_model, round_signed, qi, reductions, vectors
@@ -465,8 +465,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         width = max(block.shape[-1] for block in factors)
         public_b = canonical_factors(mesh_xy, tuple(int(i) for i in order))(*factors)
         from gw.shared_pole_local import store_pole_rows
-        store_poles = store_pole_rows(mesh_xy, tuple(b for _, b in store_poles), int(width),
-                                      tuple(int(i) for i in order))(*(p for p, _ in store_poles))
+        store_poles, store_device_counts = store_pole_rows(
+            mesh_xy, tuple(b for _, b in store_poles), int(width), tuple(int(i) for i in order))(
+            tuple(p for (p, _), _ in store_poles), tuple(a for (_, a), _ in store_poles))
         budget.batch_width = nq
         budget.retained_panels = ()
         budget.plan(width, phase="model")
@@ -482,7 +483,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         store_header = write_shared_pole_model(
             target, public_b, store_poles,
             np.concatenate(store_counts)[order], q_span=(0, nq), meta=meta, tables=bank["tables"], recipe=recipe,
-            receipts={"identity": identity, "q_receipts": [receipts[q] for q in range(nq)]}, ordered=ordered)
+            receipts={"identity": identity, "q_receipts": [receipts[q] for q in range(nq)]}, ordered=ordered,
+            device_counts=store_device_counts)
         ledger.live_stages = upstream
         del public_b
     with phase("return"):

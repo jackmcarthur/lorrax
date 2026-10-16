@@ -188,9 +188,42 @@ def test_store_pole_rows_equals_host_join():
     rng = np.random.default_rng(9)
     rep = NamedSharding(mesh, P())
     blocks = [rng.normal(size=(4, 7)), rng.normal(size=(4, 7))]
+    flags = [rng.random((4, 7)) < 0.5, rng.random((4, 7)) < 0.5]
     shapes = ((4, 5), (2, 3))
     order = (5, 0, 2, 4, 1, 3)
     host = np.concatenate([np.pad(b[:r, :k], ((0, 0), (0, 6 - k)), constant_values=1.0)
                            for b, (r, k) in zip(blocks, shapes)])[list(order)]
-    got = store_pole_rows(mesh, shapes, 6, order)(*(jax.device_put(b, rep) for b in blocks))
+    host_counts = np.concatenate([a[:r].sum(axis=-1, dtype=np.int64) for a, (r, _) in zip(flags, shapes)])[list(order)]
+    got, counts = store_pole_rows(mesh, shapes, 6, order)(tuple(jax.device_put(b, rep) for b in blocks),
+                                                          tuple(jax.device_put(a, rep) for a in flags))
     assert np.asarray(got).tobytes() == host.tobytes()
+    assert counts.sharding.is_fully_replicated and np.asarray(counts).dtype == np.int64
+    assert np.asarray(counts).tobytes() == host_counts.tobytes()
+
+
+def test_store_device_counts_paths_equal_host_paths():
+    """The store's device-count paths (factor check, final pole rows, digest window counts)
+    give the host-count paths' values, with no count crossing from the host."""
+    from file_io import shared_pole_store as st
+    from common.device_index import device_index
+    mesh = _mesh()
+    rep = NamedSharding(mesh, P())
+    rng = np.random.default_rng(3)
+    K = np.array([3, 0, 5, 2], np.int64)
+    poles2 = np.sort(rng.random((4, 6)) + 0.1, axis=1)
+    poles2 = np.where(np.arange(6)[None, :] < K[:, None], poles2, 1.0)
+    b = rng.normal(size=(4, 4, 1, 6)) + 1j * rng.normal(size=(4, 4, 1, 6))
+    b = np.where(np.arange(6)[None, None, None, :] < K[:, None, None, None], b, 0)
+    bd = jax.device_put(b, NamedSharding(mesh, P(None, "x", None, "y")))
+    pd, kd = jax.device_put(poles2, rep), jax.device_put(K, rep)
+    with jax.transfer_guard_host_to_device("disallow"):
+        ok_dev = st._factor_valid(bd, pd, kd)
+        rows = st._final_pole_rows(8)(pd, kd)
+        window = st._window_counts(2, 4)(kd, device_index(mesh, 1), device_index(mesh, 2))
+    assert bool(ok_dev) and bool(st._factor_valid(bd, pd, K))
+    active = jnp.arange(8)[None, :] < jnp.asarray(K)[:, None]
+    want = jnp.where(active, jnp.pad(pd[:, :8], ((0, 0), (0, 2)), constant_values=1.0), 1.0)
+    assert np.asarray(rows).tobytes() == np.asarray(want).tobytes()
+    assert np.asarray(window).tobytes() == np.clip(K[1:3] - 2, 0, 4).tobytes()
+    bad = b.copy(); bad[0, 0, 0, 4] = 1.0                                  # nonzero past K[0] = 3
+    assert not bool(st._factor_valid(jax.device_put(bad, NamedSharding(mesh, P(None, "x", None, "y"))), pd, kd))

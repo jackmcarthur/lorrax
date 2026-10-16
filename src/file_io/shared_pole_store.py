@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from functools import lru_cache
+from common.device_index import device_index
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -421,11 +422,14 @@ def _placed_counts(b, K):
 
 
 @timing.timed("factor_validation")
-def _check_factor(b, poles2, K, pending=None):
+def _check_factor(b, poles2, K, pending=None, device_counts=None):
     """Gate the physical active prefix and exact inactive sentinel.
 
     ``pending`` (a list): the device half of the verdict is appended there instead of
     read now, and the caller refuses on all of them in one read (:func:`_refuse_invalid`).
+    ``device_counts``: the same counts ``K`` already on the devices (replicated int64, the
+    constructor's own), used by the device half so no count crosses from the host; the host
+    predicates on ``K`` are unchanged.
     """
     if b.dtype != np.complex128 or poles2.dtype != np.float64 or K.dtype != np.int64:
         _refuse(f"dtypes {(b.dtype, poles2.dtype, K.dtype)}")
@@ -438,9 +442,9 @@ def _check_factor(b, poles2, K, pending=None):
         # host, the factor's on the device with the counts placed once.
         if not _poles_valid_host(poles2, K):
             _refuse_invalid([False])
-        ok = _factor_b_valid(b, _placed_counts(b, K))
+        ok = _factor_b_valid(b, _placed_counts(b, K) if device_counts is None else device_counts)
     else:
-        ok = _factor_valid(b, poles2, K)
+        ok = _factor_valid(b, poles2, K if device_counts is None else device_counts)
     if pending is not None:
         pending.append(ok)
         return
@@ -479,7 +483,8 @@ def preview_model_write(meta, shape, *, basis=None):
 
 @timing.timed("shared_pole_store.write_model")
 def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
-                            recipe, receipts, ordered=False, basis=None, sector=None):
+                            recipe, receipts, ordered=False, basis=None, sector=None,
+                            device_counts=None):
     """Stage a bounded q batch and finalize automatically at complete K census.
 
     Parameters
@@ -490,6 +495,10 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         Sorted squared poles in Ry², same padded column capacity as b.
     K : array, int64, (b,)
         Physical active counts; inactive b=0 and poles2=1 exactly.
+    device_counts : jax.Array, int64, (b,), replicated, optional
+        The same counts on the devices (the constructor's, read to the host as ``K``). The
+        device checks, the final pole rows and a whole-model digest take them, so no count
+        crosses from the host; without them ``K`` is placed (once per distinct vector).
     q_span : slice or pair of int
         Contiguous canonical raw-parent range [start, stop).
     meta, tables, recipe, receipts : bundles / dict
@@ -527,7 +536,9 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         _admit(ledger, "write_model", output, temporary+arg+3*int(poles2.size)*8,
                device_panel=max(arg,output,8*int(poles2.size)), native_host=True)
         K = np.asarray(K)
-        _check_factor(b, poles2, K)
+        if device_counts is not None and tuple(device_counts.shape) != K.shape:
+            _refuse("device counts do not match K")
+        _check_factor(b, poles2, K, device_counts=device_counts)
         lo, hi = _span(q_span, header["n_q_irr"], "q_span")
         if hi - lo != b.shape[0]:
             _refuse("q_span does not match factor batch")
@@ -591,7 +602,8 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
     with SlabIO(path, mode="a", mesh=mesh) as io:
         if extent:
             with timing.section("write_slab"):
-                _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent)
+                _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent,
+                                   device_counts=device_counts)
             width, name = extent, None
         elif width:
             io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], components, width), dtype=np.complex128)
@@ -610,8 +622,19 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
             io.sync_writes()
     del canonical
     if all(header["written_q"]):
-        return _finalize_model(path, meta=meta, header=header, basis=basis)
+        # The writer's device counts cover the model only when this batch is all of it.
+        whole = device_counts if (lo, hi) == (0, header["n_q_irr"]) else None
+        return _finalize_model(path, meta=meta, header=header, basis=basis, device_counts=whole)
     return header
+
+
+@lru_cache(maxsize=None)
+def _window_counts(batch, width):
+    """A digest window's counts from the model's device counts: rows ``[q0, q0 + batch)``
+    less the column start ``c0``, clipped to ``[0, width]`` (``np.clip`` of the host's)."""
+    def cut(K, q0, c0):
+        return jnp.clip(jax.lax.dynamic_slice_in_dim(K, q0, batch) - c0.astype(K.dtype), 0, width)
+    return jax.jit(cut)
 
 
 def _held_key(header):
@@ -635,9 +658,10 @@ def _direct_extent(meta, header, live, *, whole):
     return extent if 0 < live <= extent else None
 
 
-def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent):
+def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent, device_counts=None):
     """One batch into the final datasets at rows ``[lo, lo + b)``: every column written
-    (the native provider never fills), exact zeros past the carrier, unit poles past K."""
+    (the native provider never fills), exact zeros past the carrier, unit poles past K
+    (from ``device_counts`` when the caller has them on the devices)."""
     spec = P(None, "x", None, "y")
     components = header.get("factor_components", 1)
     # The datasets were created by an earlier transaction, so each write names
@@ -650,10 +674,27 @@ def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent
         pad = mesh_divisible_shape((b, basis.n_canonical, components, extent-written), mesh, spec)
         io.write_slab("factor", _zeros(mesh, spec, tuple(pad)), offset=(lo, 0, 0, written),
                       global_shape=shape)
-    active = jnp.arange(extent)[None, :] < jnp.asarray(K)[:, None]
-    poles = jnp.pad(poles2[:, :extent], ((0, 0), (0, max(extent-int(poles2.shape[-1]), 0))),
-                    constant_values=1.0)
-    io.write_slab("poles2_ry2", jnp.where(active, poles, 1.0), offset=(lo, 0), global_shape=shape[::3])
+    if device_counts is not None and isinstance(poles2, jax.Array):
+        rows = _final_pole_rows(int(extent))(poles2, device_counts)
+    else:
+        active = jnp.arange(extent)[None, :] < jnp.asarray(K)[:, None]
+        poles = jnp.pad(poles2[:, :extent], ((0, 0), (0, max(extent-int(poles2.shape[-1]), 0))),
+                        constant_values=1.0)
+        rows = jnp.where(active, poles, 1.0)
+    io.write_slab("poles2_ry2", rows, offset=(lo, 0), global_shape=shape[::3])
+
+
+@lru_cache(maxsize=None)
+def _final_pole_rows(extent):
+    """:func:`_write_final_batch`'s pole rows as one program: ``poles2`` cut or padded to
+    ``extent`` with 1.0 and 1.0 past each count (the eager path's operations, value for value;
+    the constants are the program's)."""
+    def rows(poles2, K):
+        active = jnp.arange(extent)[None, :] < K[:, None]
+        poles = jnp.pad(poles2[:, :extent], ((0, 0), (0, max(extent-int(poles2.shape[-1]), 0))),
+                        constant_values=1.0)
+        return jnp.where(active, poles, 1.0)
+    return jax.jit(rows)
 
 
 def _stage_direct(path, header):
@@ -727,7 +768,7 @@ def _zeros(mesh, spec, shape):
 
 
 @timing.timed("shared_pole_store.finalize")
-def _finalize_model(path, *, meta, header, basis=None):
+def _finalize_model(path, *, meta, header, basis=None, device_counts=None):
     """Write the final datasets and commit the census with the digest.
 
     A direct model (``direct_extent``: its batches landed in the final
@@ -796,7 +837,7 @@ def _finalize_model(path, *, meta, header, basis=None):
             del factor, poles
         io.write_attr("K", np.asarray(header["K"], np.int64))
         _write_header(io, header)
-    header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta))
+    header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta), device_counts=device_counts)
     def finish():
         with h5py.File(path, "a") as f:
             set_commit_state(f, False)
@@ -865,7 +906,7 @@ def _covering_windows(total, span):
 
 
 @timing.timed("shared_pole_store.digest")
-def _model_digest(path, header, mesh, *, capacity):
+def _model_digest(path, header, mesh, *, capacity, device_counts=None):
     """Grid-independent SHA256 of metadata and canonical row digests.
 
     Read a bounded q batch and column panel through SlabIO. Each canonical row
@@ -918,7 +959,11 @@ def _model_digest(path, header, mesh, *, capacity):
                     b = io.read_slab("factor", shape=(batch,ncan,components,width), offset=(q0,0,0,c0),
                                      partition_spec=P(None,"x",None,None))
                     counts = np.clip(active_counts-c0, 0, width)
-                    _check_factor(b, host_poles[:,c0:c1], counts, pending=verdicts)
+                    # The writer's own counts on the devices (a whole model): the window's
+                    # counts are cut there, so none crosses from the host.
+                    window = (None if device_counts is None else _window_counts(batch, width)(
+                        device_counts, device_index(mesh, q0), device_index(mesh, c0)))
+                    _check_factor(b, host_poles[:,c0:c1], counts, pending=verdicts, device_counts=window)
                 with timing.section('host_digest_hashing'):
                     for shard in b.addressable_shards:
                         if shard.replica_id != 0:
