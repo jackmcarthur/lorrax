@@ -64,6 +64,13 @@ A new test needs no bootstrap import of its own.
   dipoles against exact ones in the densified states' gauge, a planted coarse
   gauge invisible and a velocity-only gauge seen, DFT denominators under a
   scissor, and the window-dipole refusals.
+- `test_bse_helicity_cpu.py`: per-state in-plane helicity on a C3-symmetric
+  toy (s, p_x, p_y with an orbital Zeeman term; CPU, 2x2 host mesh): the Γ
+  transitions into p± take the field-defined σ± labels that ⟨L_z⟩ certifies;
+  the swapped and the conjugated conventions fail that check; a global phase,
+  a band gauge and the zone size leave the per-cell table unchanged; the
+  native and `bse_k_grid` routes give one table; `bse_jax` reads
+  `--helicity-table` on the Lanczos route.
 - `test_w_pad_nyquist_cpu.py`: the W densifier's R zero-pad (CPU): an even
   coarse axis splits its Nyquist coefficient, so coarse tiles stay exact and
   every fine tile is Hermitian; the single-sided red twin is not.

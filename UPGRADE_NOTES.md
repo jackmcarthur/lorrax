@@ -5,6 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-16 — `bse_jax --helicity-table`: per-state σ± strengths in the report
+
+With `--lanczos --tda --write-eigs --dipole`, `--helicity-table` adds each
+written state's in-plane circular strengths to `bse.out`:
+I± = |D_x ∓ i D_y|²/(2 N_k) in bohr² per unit cell for D = ⟨0|r|S⟩, and
+η = (I+ − I−)/(I+ + I−). σ+ is the field E₀(cos ωt, sin ωt, 0), which rotates
+x → y, counter-clockwise seen from +z
+([helicity](docs/architecture/bse.md#dipoles-and-absorption)).
+
+- **Results.** Report-only and off by default: `eigenvectors.h5` and every
+  other output are unchanged. CrI3 8×8→30×30 (c1, provisional W, 42v × 14c):
+  A at 1.5777 eV is σ+ (η = +1.0000), B at 2.0223 eV σ− (−0.9997), and the
+  strongest σ+ state is at 2.3121 eV (I+ = 1.06 bohr² per cell, η = +0.9988).
+
 ## 2026-10-16 — `bse_k_grid` dipoles: the deck WFN's velocity through the densifying htransform
 
 `bse_jax --write-eigs --dipole` and `absorption_haydock` sliced a `dipole.h5`
