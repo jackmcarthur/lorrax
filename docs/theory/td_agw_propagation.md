@@ -438,6 +438,40 @@ Hall term would come from the intraband commutator, absent from a
 velocity-built (itype 1) header. Time reversal (φ → −φ, or M → −M) flips
 $\varepsilon_{xy}$ and keeps $\varepsilon_{xx}$ (Onsager).
 
+**CrI3 516** (6×6 k, PBE+SOC spinors, FM; the bundle route with the ISDF
+Hartree + SEX model, N_μ 978, and TDREF's eqp; `tools/td_validation_cri3.py`,
+run `DEV/829_td_agw_validation_20261016`, 2026-10-16). The leg samples the
+model's kernel column by column — Hermitian as a matrix to 1.1e-14, the
+symmetry behind Eq. (V4) — and propagates ±E₀ drives with `etdrk4` at 10 as
+for 60 fs on four A100s (24 000 ΔΣ per window: 168 s for four 8v8c trials,
+212 s for eight 2v2c trials); rungs 2, 4–6 are then evaluated on the host.
+
+- *8v8c* (bands 123–138, 2304 pairs, `degeneracy_mode = strict`): P(t) of
+  the x and y kicks equals the full-BSE closed form to 2.8e-7 and
+  χ(ω + iη) to 1.1e-7 (η 0.2 eV, e^{−ηT} 1.2e-8). The spectrum is real
+  (|Im λ| ≤ 6e-15 eV), in-plane isotropic to 1.5e-9 (χ_xx − χ_yy) and 7e-9
+  (χ_xy + χ_yx), and every bright state is pure σ+ or σ− to 2.9e-10.
+- *2v2c* (bands 129–132, `degeneracy_mode = off`: on the QP spectrum bands
+  128 and 129 are 0.548 meV apart at k = 24, inside the strict gate's 1 meV,
+  although 61.9 meV apart in DFT). A σ+ pulse (τ 2 fs, 1e6 V/m) on the lowest
+  bright σ+ state (1.8087 eV, I+ 0.0152 bohr² per cell) fills σ− states at
+  1.62e-17 of the σ+ population, the counter-rotating leak of first-order
+  theory (1.62e-17), and N(S+) equals first order to 8.3e-8; the σ− pulse
+  is the mirror image (5.5e-17). ε_xy, σ_xy, Kerr and Faraday from TD equal
+  the BSE to 7.3e-8, and χ± from the exciton table to 5e-8. At η 0.2 eV the
+  free sheet's Kerr rotation peaks at 314 mrad (1.995 eV), the Faraday
+  rotation at −0.52 mrad (2.215 eV); the 6.6 Å film is within 8.5e-6 of the sheet.
+- *f-sum.* In the window the interaction lowers m1 below the IP sum with
+  QP energies by 30 % (8v8c: 2.063 against 2.946 Ha·bohr² per cell) and 33 %
+  (2v2c: 0.1121 against 0.1678). With DFT energies the IP sums are 1.507 and
+  0.0807, so the QP-energy sum is the DFT one times the weighted ratio of
+  transition energies (1.96, 2.08) — r is DFT's — and m1 sits at 1.37 and
+  1.39 times it. Against the whole dipole set (130 valence × 30 conduction
+  bands, 26.58) the 8v8c window holds 5.7 % (1.16 % of N_e = 130) and 2v2c
+  0.30 % (0.062 %); the 160-band set itself holds 20 % of N_e, the rest lying
+  in higher bands (the velocity p − i[r, V_NL] of a nonlocal pseudopotential
+  also moves the complete-basis sum off N_e).
+
 **Scripts outside pytest.** A script that imports jax before `runtime` runs in
 float32 unless `JAX_ENABLE_X64=1` (`runtime.set_x64_on_imported_jax`). On the
 synthetic window that shows as a 3e-7 error in the measured field and a P(t)
