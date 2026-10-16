@@ -268,6 +268,6 @@ choose each value.
 | `downfold_rcond` | `1.1e-6` | Relative eigenvalue cut on the small basis's Gram, which caps the pseudo-inverse amplification at 1/rcond. |
 | `downfold_select_tol` | unset (= √eps) | Stopping tolerance of the pivoted Cholesky. It is a different knob from `downfold_rcond` and gives a different rank; both are printed. |
 | `mode` | `cur` | `cur` takes a subset of the parent's centroids, so no second ζ fit exists. `refit` refuses. |
-| `plan` | `auto` | `auto`/`local`: the local plan, independent of the process grid. `distributed` refuses. |
+| `plan` | `auto` | `auto`/`distributed`: the one plan — every stack at `P(None,'x','y')`, the Gram streamed over its local columns and the transfer over q in fixed tiles; one device is its P = 1 case. `local` (the retired all-q plan) refuses. |
 | `report_residual` | `true` | Prints the per-q Pythagorean error bar ε_W (two GEMMs at μ_L per q). |
 | `residual_refuse_above` | unset | Refuses to write the bundle when the worst-q ε_W exceeds this value. It is a tripwire, not a meV guarantee. |

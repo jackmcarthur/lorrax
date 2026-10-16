@@ -968,6 +968,26 @@ def gram_q0_aot_peak_bytes(
 
 
 
+def downfold_gram_col_tile(nk: int, ns: int, mu_loc: int, col_loc: int):
+	"""``(width, starts)`` of the column stream in :func:`c_q_downfold`.
+
+	One local column of the ``(μ_loc, col_loc)`` face costs, per rank, the two
+	open-spin pair densities ``P_l``, ``P_r`` ``(nk, ns, ·, μ_loc, ns)``, one
+	more of that size for the contraction's staging and the pair kernel's
+	scratch, and the output column ``(nk, μ_loc)`` in both of its orders::
+
+	    bytes / column = (3·ns² + 2) · nk · μ_loc · 16
+
+	The width is :func:`runtime.tiles.tile_plan` of that, so the shapes alone
+	decide it and every rank and every card runs the same program.  Measured
+	reason it exists: unstreamed, the CrI3 8x8 μ_L 6000 Gram compiled to
+	121 GB per device at P4 (110.6 GB of it the two all-k pair densities).
+	"""
+	from runtime.tiles import tile_plan
+	per_col = (3 * int(ns) * int(ns) + 2) * int(nk) * int(mu_loc) * 16
+	return tile_plan(per_col, int(col_loc))
+
+
 def c_q_downfold(
 	psi_l_X: jax.Array,
 	psi_l_Y: jax.Array,
@@ -979,7 +999,31 @@ def c_q_downfold(
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
 ) -> jax.Array:
-	"""Contract the shared rectangular downfold Gram through the local pair-convolution owner."""
+	"""The rectangular pair-density Gram, streamed over its local columns.
+
+	``C[q, μ, ν] = s · FFT_k Σ_ab conj(IFFT_k P_l[k,a,ν,μ,b]) · IFFT_k P_r[k,a,ν,μ,b]``
+	with ``P_x[k,a,ν,μ,b] = Σ_n ψ^X_x[k,μ,n,a] ψ^Y_x[k,n,b,ν]`` (the k-convolution
+	router's pair contract, ``ffi.fft.make_fused_conv_kpair``).  The convolution
+	acts on each ``(μ, ν)`` element separately, so the local column axis is
+	cut into equal tiles (:func:`downfold_gram_col_tile`) and one ``lax.scan``
+	inside the ``shard_map`` builds each tile's pair densities, convolves them
+	and writes the tile into the output in place.  A single tile is the
+	unstreamed kernel.
+
+	Parameters
+	----------
+	psi_l_X, psi_r_X : (nk, n_rmu, nb, ns) complex128, ``P(None,'x',None,None)``
+	    Conjugated ψ at the row centroids, the two legs' band windows.
+	psi_l_Y, psi_r_Y : (nk, nb, ns, n_col) complex128, ``P(None,None,None,'y')``
+	    Plain ψ at the column centroids.
+
+	Returns
+	-------
+	(nk, n_rmu, n_col) complex128 at ``P(None,'x','y')``, labelled by the
+	kernel's own q (the downfold relabels it, ``gw.downfold.pair_density_gram``).
+	Per-rank live set: the output plus one column tile, at most
+	:data:`runtime.tiles.TILE_BYTES` of pair densities.
+	"""
 	nkx, nky, nkz = kgrid
 	nk = int(psi_l_X.shape[0])
 	n_rmu = int(psi_l_X.shape[1])
@@ -991,17 +1035,19 @@ def c_q_downfold(
 	rhs_id = gamma_R is None
 	pair_kernel, pair_gamma_key = _conv_kpair_setup(
 		mesh_xy, kgrid, ns, gamma_L, gamma_R)
+	mu_loc = n_rmu // int(mesh_xy.shape['x'])
+	col_loc = n_col // int(mesh_xy.shape['y'])
+	width, starts = downfold_gram_col_tile(nk, ns, mu_loc, col_loc)
 
 	cache_key = ('c_q_from_psi_sm', _mesh_key(mesh_xy), nk, n_rmu, n_col, ns,
 	             nb_l, nb_r, nkx, nky, nkz, lhs_id, rhs_id,
-	             pair_gamma_key)
+	             pair_gamma_key, width, starts)
 	if cache_key not in _pair_pipeline_sm_cache:
-		_lhs_id = lhs_id
-		_rhs_id = rhs_id
 		_pair_kernel = pair_kernel
 		L_spec = P(None, 'x', None, None)
 		R_spec = P(None, None, None, 'y')
 		out_spec = P(None, 'x', 'y')
+		col_starts = np.asarray(starts, dtype=np.int32)
 
 		@partial(shard_map, mesh=mesh_xy,
 		         in_specs=(L_spec, R_spec, L_spec, R_spec,
@@ -1010,42 +1056,26 @@ def c_q_downfold(
 		         check_vma=False)
 		def _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
 		           perm_L_, phase_L_, perm_R_, phase_R_):
-			# Per-rank shapes (n_rmu_local on 'x', n_col_local on 'y',
-			# bands replicated):
-			#   psi_l_X_ : (nk, n_rmu_local, nb_l, ns)
-			#   psi_l_Y_ : (nk, nb_l, ns, n_col_local)
-			#
-			# Einsum output order matters for memory: the gemm naturally
-			# produces ``(k, ns_l · col_local, ns_r · μ_local)`` with the
-			# bitcast factoring as ``(k, ns_l, col_local, μ_local, ns_r)``.
-			# We pick output spec ``'karmb'`` (k, ns_l, col, μ, ns_r) so
-			# the rank-7 reshape that feeds the IFFT is a pure bitcast —
-			# no extra 4-GiB buffer for the rank-3 → rank-7 transpose
-			# (which the natural ``'kabmr'`` order forced).  Verified
-			# from HLO: dropped one of the three rank-5 lifetime slots.
-			mu_loc = psi_l_X_.shape[1]
-			col_loc = psi_l_Y_.shape[3]
-			P_l = jnp.einsum(
-				'kmna,knbr->karmb', psi_l_X_, psi_l_Y_, optimize=True)
-			P_r = jnp.einsum(
-				'kmna,knbr->karmb', psi_r_X_, psi_r_Y_, optimize=True)
-			# Split k → (kx, ky, kz) — bitcast given the above layout.
-			# Rank-7: (kx, ky, kz, ns_l, col, μ, ns_r).
-			P_l_3d = P_l.reshape(nkx, nky, nkz, ns, col_loc, mu_loc, ns)
-			del P_l
-			P_r_3d = P_r.reshape(nkx, nky, nkz, ns, col_loc, mu_loc, ns)
-			del P_r
-			# The router's pair convolution: one device-local call inside this
-			# shard_map, no nested map and no collective.
-			C_q_3d = _pair_kernel(P_l_3d, P_r_3d)
-			del P_l_3d, P_r_3d
-			# Reshape back to (nk, col, μ); transpose final two axes
-			# to satisfy out_spec ``P(None, 'x', 'y')`` for (nk, μ, col).
-			# This transpose acts on the rank-3 reduced form (~16 MB),
-			# not the rank-5 pair density.
-			return jnp.transpose(
-				C_q_3d.reshape(nkx * nky * nkz, col_loc, mu_loc),
-				(0, 2, 1))
+			# Per-rank: psi_*_X_ (nk, μ_loc, nb, ns), psi_*_Y_ (nk, nb, ns, col_loc).
+			# The einsum's output order ``'karmb'`` (k, ns_l, col, μ, ns_r) is
+			# what the GEMM produces, so the rank-7 reshape that feeds the pair
+			# kernel is a bitcast (HLO-verified: no transpose buffer).
+			def _tile(C, c0):
+				yl = jax.lax.dynamic_slice_in_dim(psi_l_Y_, c0, width, axis=3)
+				yr = jax.lax.dynamic_slice_in_dim(psi_r_Y_, c0, width, axis=3)
+				P_l = jnp.einsum('kmna,knbr->karmb', psi_l_X_, yl, optimize=True)
+				P_r = jnp.einsum('kmna,knbr->karmb', psi_r_X_, yr, optimize=True)
+				U = _pair_kernel(
+					P_l.reshape(nkx, nky, nkz, ns, width, mu_loc, ns),
+					P_r.reshape(nkx, nky, nkz, ns, width, mu_loc, ns))
+				# (nk, col, μ) -> (nk, μ, col): the transpose acts on the
+				# reduced tile, never on the rank-7 pair density.
+				U = jnp.transpose(U.reshape(nkx * nky * nkz, width, mu_loc), (0, 2, 1))
+				return jax.lax.dynamic_update_slice_in_dim(C, U, c0, axis=2), None
+
+			C0 = jnp.zeros((nkx * nky * nkz, mu_loc, col_loc), dtype=psi_l_X_.dtype)
+			C, _ = jax.lax.scan(_tile, C0, jnp.asarray(col_starts), unroll=1)
+			return C
 
 		@jax.jit
 		def fn(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, pL, phL, pR, phR):

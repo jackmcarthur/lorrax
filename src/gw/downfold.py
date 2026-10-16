@@ -115,24 +115,29 @@ same cost class as the congruence itself — and it is worth it.
 
 SHARDING
 --------
-Three SEQUENTIAL top-level regions, no nesting: the Gram build (one
-``shard_map``, ``isdf.core``'s), the solve (rank-local by construction —
-``S_SS`` replicated, the μ_L axis sharded), and the congruence (one
-``shard_map``, ``common.contract_bands``').  Every congruence output is
+One plan for every process grid (``docs/downfold.md``, "The distributed
+plan"); one device is its P = 1 case.  Every stacked object is at
+``P(None,'x','y')`` with q the flat leading axis.  Three sequential regions,
+no nesting: the Gram (one ``shard_map``, ``isdf.core.c_q_downfold``, streaming
+its local columns in fixed tiles), the selection on the q = 0 face (the
+spectrum through ``distrib_la``, the row-sharded pivoted Cholesky), and D3-D5
+streamed over q in fixed tiles (:func:`stream_transfer`: a replicated
+``S_SS`` per tile, one ``eigh_local`` per q, the rank-local solve, the
+congruence through ``common.contract_bands``).  Every congruence output is
 sharding-pinned: leaving an ``UΣU†``-shaped einsum's output free once emitted
 an all-reduce of the FULL cube where pinning it emitted two all-gathers of
-cube/p (``SIGMA_SCALING.md`` §7).
+cube/p (``SIGMA_SCALING.md`` §7).  The tiles come from
+``runtime.tiles.TILE_BYTES`` and the shapes, never from free memory.
 
-Stage 1 implements the LOCAL/GSPMD plan only.  The 2-D ``distrib_la`` grid
-and the q-sharded local-LA alternative are later stages; so is the
-asymmetric Σ-serving window (which the probe measures at ~2× μ_S, not the
-order of magnitude the design feared) and the ``refit`` mode.
+The asymmetric Σ-serving window (which the probe measures at ~2× μ_S, not
+the order of magnitude the design feared) and the ``refit`` mode are later
+stages.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from functools import partial
+from functools import lru_cache, partial
 
 import numpy as np
 
@@ -160,8 +165,16 @@ __all__ = [
     "orbit_complete_keep",
     "child_unfold_tables",
     "slice_psi_to_centroids",
+    "pool_gram_spectrum",
     "build_transfer",
+    "record_kept_rank",
     "congruence",
+    "transfer_q_tile",
+    "q_slab_programs",
+    "announce_ranks",
+    "stream_transfer",
+    "resident_bytes_per_rank",
+    "describe_price",
     "transform_head_vector",
     "observable_norm2",
     "epsilon_w",
@@ -447,9 +460,10 @@ class SelectionReport:
     #: pivoted Cholesky's certificate.  Necessary, NOT sufficient; runs
     #: about 3x the eigenvalue rank at the same nominal tolerance.
     select_rank: int
-    #: #{λ of S_SS[keep,keep] > rcond·λ_max} — what the transfer solve will
-    #: actually retain at q=0.
-    eigen_rank_kept: int
+    #: #{λ of S_SS[keep,keep] > rcond·λ_max} — what the transfer solve
+    #: retains at q=0.  ``None`` until the solve has measured it
+    #: (:func:`record_kept_rank`).
+    eigen_rank_kept: int | None
     pool_report: rank_criterion.RankReport | None = None
     kept_report: rank_criterion.RankReport | None = None
     requested_auto: bool = False
@@ -474,6 +488,15 @@ class SelectionReport:
     @property
     def orbit_mode(self) -> bool:
         return self.n_orbits_kept is not None
+
+    def kept_line(self, indent="  ") -> str:
+        """The point-granularity certificate on the realized set."""
+        got = ("measured by the transfer solve (below)"
+               if self.eigen_rank_kept is None else
+               f"{self.eigen_rank_kept} of {self.mu_small} POINTS")
+        return (f"{indent}[downfold/select]   EIGENVALUE rank of the KEPT "
+                f"block S_SS[keep,keep] at q=0: {got}   <- the "
+                f"point-granularity certificate, taken on the REALIZED set")
 
     @property
     def floored_by(self) -> int:
@@ -512,10 +535,7 @@ class SelectionReport:
                if self.orbit_mode else
                (f" POINTS   <- necessary, NOT sufficient (~3x the eigenvalue "
                 f"rank at the same nominal tolerance; RANK_PROBE §7)")),
-            f"{indent}[downfold/select]   EIGENVALUE rank of the KEPT "
-            f"block S_SS[keep,keep] at q=0: {self.eigen_rank_kept} of "
-            f"{self.mu_small} POINTS   <- the point-granularity certificate, "
-            f"taken on the REALIZED set",
+            self.kept_line(indent),
         ]
         if self.orbit_mode:
             lines.append(
@@ -529,20 +549,68 @@ class SelectionReport:
         return "\n".join(lines)
 
 
-def _eigen_rank(G_host: np.ndarray, rcond: float, *, label: str,
-                n_logical: int | None = None) -> rank_criterion.RankReport:
-    """Hermitian eigenvalue spectrum of ``G`` → a :class:`RankReport`.
+def _eigen_rank(ev: np.ndarray, rcond: float, *, label: str
+                ) -> rank_criterion.RankReport:
+    """Ascending Hermitian spectrum ``ev`` → a :class:`RankReport`.
 
     ``common.rank_criterion`` verbatim: the criterion is a cap on how much
     the pseudo-inverse amplifies round-off, the margin is the rank inflation
     from loosening the cap by four decades, and the R19 anchor rides beside
     it.  Nothing here looks for a gap; these spectra do not have one.
     """
-    n = int(G_host.shape[-1]) if n_logical is None else int(n_logical)
-    sub = np.asarray(G_host)[:n, :n]
-    ev = np.linalg.eigvalsh(0.5 * (sub + sub.conj().T))
+    ev = np.asarray(ev, dtype=np.float64).ravel()
     return rank_criterion.rank_report(
-        ev, rcond, label=label, quantity="eigenvalues", n_rows=n)
+        ev, rcond, label=label, quantity="eigenvalues", n_rows=int(ev.size))
+
+
+def pool_gram_spectrum(S_q0, mesh_xy, mu_logical: int) -> np.ndarray:
+    """Ascending eigenvalues of the logical block of the q = 0 pool Gram.
+
+    Parameters
+    ----------
+    S_q0 : (M_pad, M_pad) complex128 at ``P('x','y')``
+        The q = 0 pair-density Gram of the parent set, zero-padded past
+        ``mu_logical`` rows and columns.
+    mu_logical : int
+        The parent's logical centroid count μ_L.
+
+    Returns
+    -------
+    (μ_L,) float64, the same array on every process.
+
+    The solve is ``distrib_la``'s planned ``eigh`` on the face (the default
+    stack route: the one matrix whole on one rank, eigenvalues replicated),
+    so the μ_L² Gram never reaches a host.  A zero pad row is an exact zero
+    row, which the service deflates to an exact zero eigenvalue; the
+    ``M_pad − μ_L`` eigenvalues of smallest magnitude are those and are
+    dropped, so the spectrum is the logical block's.
+    """
+    import distrib_la as dla
+    from common.collectives import gather_to_host
+
+    M = int(S_q0.shape[-1])
+    n_pad = M - int(mu_logical)
+    stack = _face_stack_of(mesh_xy)(S_q0)
+    w, _ = dla.plan("eigh", mesh_xy, n=M).batched(stack)
+    ev = np.asarray(gather_to_host(w), dtype=np.float64).reshape(-1)[:M]
+    if n_pad:
+        live = np.sort(np.argsort(np.abs(ev), kind="stable")[n_pad:])
+        ev = ev[live]
+    return ev
+
+
+@lru_cache(maxsize=None)
+def _face_stack_of(mesh_xy):
+    """``A (n, n) at P('x','y') -> A[None] at P(None,'x','y')``, one program per mesh."""
+    return jax.jit(lambda a: a[None],
+                   out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
+@lru_cache(maxsize=None)
+def _diag_max_of(mesh_xy):
+    """``max Re diag(A)`` of a face, replicated — one program per mesh."""
+    return jax.jit(lambda a: jnp.max(jnp.real(jnp.diagonal(a))),
+                   out_shardings=NamedSharding(mesh_xy, P()))
 
 
 # ---------------------------------------------------------------------------
@@ -852,9 +920,11 @@ def select_cur_centroids(
     mu_L = int(mu_large_logical)
 
     # ---- 1. THE CEILING.  Eigenvalue rank of the pool Gram at rcond. ----
-    G_host = np.asarray(gather_to_host(S_q0))
-    pool_rep = _eigen_rank(G_host, rcond, label="downfold pool Gram (q=0)",
-                           n_logical=mu_L)
+    # The spectrum comes off the device face through distrib_la; the μ_L²
+    # Gram is never gathered (it was 0.58 GB per process at μ_L 6000, solved
+    # twice on every host).
+    _pool_ev = pool_gram_spectrum(S_q0, mesh_xy, mu_L)
+    pool_rep = _eigen_rank(_pool_ev, rcond, label="downfold pool Gram (q=0)")
     ceiling = int(pool_rep.rank_criterion)
 
     # ---- 1b. THE CEILING MUST NOT LAND MID-MULTIPLET. -------------------
@@ -884,8 +954,6 @@ def select_cur_centroids(
     # ceiling that is itself ≤ what rank_criterion proposed.  Both are
     # kept-set quantities and both round DOWN; ``common/spectral_closure``'s
     # TWO-RULE FAMILY section carries the rule and the band-window exception.
-    _pool_ev = np.linalg.eigvalsh(
-        0.5 * (G_host[:mu_L, :mu_L] + G_host[:mu_L, :mu_L].conj().T))
     ceiling, _sc_pool = spectral_closure.resolve_spectral_cut(
         _pool_ev, ceiling, where="downfold pool Gram (q=0) rank ceiling",
         rcond=float(rcond), log=print_fn)
@@ -954,7 +1022,9 @@ def select_cur_centroids(
 
     G_rows = jax.lax.with_sharding_constraint(
         S_q0, NamedSharding(mesh_xy, P(select_axis, None)))
-    d0max = float(np.real(np.diag(G_host)[:mu_L]).max())
+    # Pads are zero and a Gram diagonal is non-negative, so the face's max is
+    # the logical block's.
+    d0max = float(np.asarray(gather_to_host(_diag_max_of(mesh_xy)(S_q0))))
 
     # ---- 2a. ORBIT MODE, WHEN THE PARENT'S SOURCE MAP IS AVAILABLE ------
     # The kernel has had this all along; the downfold used to pass ``None``
@@ -1061,14 +1131,13 @@ def select_cur_centroids(
     # exists in this tree because that confusion already shipped once (a gate
     # passed at "42 of 42 directions certified" on a file holding 1908
     # points, and the ζ back-solve then truncated ~450 modes per q).
-    kept_rep = _eigen_rank(G_host[np.ix_(keep_idx, keep_idx)], rcond,
-                           label="downfold S_SS (q=0)")
-
+    # S_SS[keep, keep] at q = 0 IS the transfer solve's first matrix, so the
+    # solve measures it (:func:`record_kept_rank`) and nothing gathers it here.
     rep = SelectionReport(
         mu_large=mu_L, mu_small=mu_S, rcond=float(rcond), select_tol=tol,
         eigen_rank_pool=ceiling, select_rank=int(rank),
-        eigen_rank_kept=int(kept_rep.rank_criterion),
-        pool_report=pool_rep, kept_report=kept_rep,
+        eigen_rank_kept=None,
+        pool_report=pool_rep, kept_report=None,
         requested_auto=requested_auto, star=star,
         mu_small_requested=int(mu_S_requested),
         n_orbits_kept=n_orbits_kept, n_orbits_pool=n_orbits_avail,
@@ -1379,26 +1448,33 @@ def slice_psi_to_centroids(psi_X, psi_Y, keep_idx, mu_small_pad, mesh_xy):
 
 def build_transfer(S_SS, S_cross, mesh_xy, *, rcond: float,
                    axes=("x", "y"), print_fn=print, announce: bool = True):
-    """``T = S_SS⁻¹ S_cross`` — the rank-truncated transfer, both shardings.
+    """``T = S_SS⁺ S_cross`` on one q tile — the rank-truncated transfer.
 
-    ``S_SS`` arrives at ``P(None,'x','y')`` and is gathered to REPLICATED
-    (it is the one replicated object on this path, and it is bounded by μ_S,
-    the dimension the whole exercise makes small).  ``S_cross`` arrives at
-    ``P(None,'x','y')`` and is resharded to ``P(None,None,'x')`` and
-    ``P(None,None,'y')``, because the congruence needs T on both mesh axes
-    and deriving the second by resharding the first hands the partitioner an
-    all-to-all it plans itself.
+    Parameters
+    ----------
+    S_SS : (n_q, μ_S, μ_S) complex128 at ``P(None,'x','y')``
+        Gathered to REPLICATED: the one replicated object on this path,
+        ``n_q·μ_S²·16`` bytes per rank, bounded by the q tile and by μ_S, the
+        dimension the downfold makes small.
+    S_cross : (n_q, μ_S, μ_L) complex128 at ``P(None,'x','y')``
+        Resharded to ``P(None,None,'x')`` for the rank-local solve.
 
-    The solve itself is ``common.zeta_projection.least_squares_transfer``
-    verbatim — same eigh, same truncation, same κ_eff and zero-rank
-    refusals.  Only the two matrices fed to it changed: the ζ-sphere Gram
-    became the pair-density Gram, and the ζ cross-overlap became the
-    pair-density cross-Gram.  Its own log line is suppressed and this
-    function prints the authoritative report instead, built from
+    Returns ``(T_x, T_y, per_q_reports, ev)``: ``T`` at ``P(None,None,'x')``
+    and ``P(None,None,'y')`` (the second a reshard of the first, so both legs
+    of the congruence carry the same numbers), one ``RankReport`` per q, and
+    the ``(n_q, μ_S)`` ascending spectrum of ``S_SS`` on every process.
+
+    One eigendecomposition per q — ``distrib_la.eigh_local``, the solve
+    ``common.zeta_projection.least_squares_transfer`` makes — serves the
+    report and the solve; the solve itself (truncation, κ_eff and zero-rank
+    refusals, spectral closure) is ``least_squares_transfer`` verbatim, with
+    the pair-density Gram in place of the ζ-sphere Gram.  Its own log line is
+    suppressed and the downfold prints the authoritative report, built from
     ``common.rank_criterion`` so the margin and the R19 anchor come with it.
-
-    Returns ``(T_x, T_y, per_q_reports)``.
     """
+    from common.collectives import gather_to_host
+    from distrib_la import eigh_local
+
     ax_x, ax_y = axes
     if not (0.0 < float(rcond) < 1.0):
         raise ValueError(
@@ -1408,27 +1484,41 @@ def build_transfer(S_SS, S_cross, mesh_xy, *, rcond: float,
         S_SS, NamedSharding(mesh_xy, P(None, None, None)))
     cross_x = jax.lax.with_sharding_constraint(
         S_cross, NamedSharding(mesh_xy, P(None, None, ax_x)))
-    cross_y = jax.lax.with_sharding_constraint(
-        S_cross, NamedSharding(mesh_xy, P(None, None, ax_y)))
 
-    # The per-q truncation report, from the module that owns the criterion.
-    # Computed BEFORE the solve: ``least_squares_transfer``'s own eigh is an
-    # implementation detail and this must not depend on it.
-    ev = np.asarray(jax.device_get(jnp.linalg.eigvalsh(gram)))
+    # The per-q truncation report, from the module that owns the criterion,
+    # on the same spectrum the solve truncates.
+    w, V = eigh_local(gram)
+    ev = np.asarray(gather_to_host(w), dtype=np.float64)
     reports = [rank_criterion.rank_report(
         ev[q], rcond, label=f"downfold S_SS q={q}", quantity="eigenvalues",
         n_rows=int(ev.shape[-1])) for q in range(int(ev.shape[0]))]
     if announce:
-        _announce_ranks(reports, rcond, int(gram.shape[-1]), print_fn, ev=ev)
+        announce_ranks(reports, rcond, int(gram.shape[-1]), print_fn, ev=ev)
 
     T_x = least_squares_transfer(gram, cross_x, mesh_xy, ax_x, rcond=rcond,
-                                 print_fn=lambda *a, **k: None)
-    T_y = least_squares_transfer(gram, cross_y, mesh_xy, ax_y, rcond=rcond,
-                                 print_fn=lambda *a, **k: None)
-    return T_x, T_y, reports
+                                 print_fn=lambda *a, **k: None, eig=(w, V))
+    T_y = _reshard_of(mesh_xy, P(None, None, ax_y))(T_x)
+    return T_x, T_y, reports, ev
 
 
-def _announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
+def record_kept_rank(sel, report) -> None:
+    """Fill ``sel``'s kept-block certificate from the solve's q = 0 report.
+
+    ``S_SS[keep, keep]`` at q = 0 is the first matrix the transfer solve
+    factors, so its rank at ``downfold_rcond`` is read off the solve instead
+    of being gathered and solved a second time at selection.
+    """
+    sel.kept_report = report
+    sel.eigen_rank_kept = int(report.rank_criterion)
+
+
+@lru_cache(maxsize=None)
+def _reshard_of(mesh_xy, spec):
+    """The identity at ``spec`` — one program per (mesh, layout)."""
+    return jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, spec))
+
+
+def announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
     ranks = np.array([r.rank_criterion for r in reports], dtype=np.int64)
     kap = np.array([r.kappa_eff if r.kappa_eff is not None else np.nan
                     for r in reports])
@@ -1493,16 +1583,18 @@ def _announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
 # D4 — the congruence, and the vector that rides along with it
 # ---------------------------------------------------------------------------
 
-def congruence(mesh_xy, T_x, T_y, *, axes=("x", "y")):
-    """Build ``project(A_L) -> A_S = T A_L T†`` for every linear object.
+@lru_cache(maxsize=None)
+def congruence(mesh_xy, *, axes=("x", "y")):
+    """``(operands, project)``: ``A_S = T A_L T†`` for every linear object.
 
+    Built once per mesh.  ``operands(T_x, T_y)`` places one tile's transfer in
+    the primitive's layout; ``project(A_L, *operands)`` is
     ``common.zeta_projection.project_w_between_zeta_bases`` unmodified —
-    which is ``contract_bands_block_reshard(extra="none", channels="none")``
-    under the identification (k batch → q; μ,ν → μ_L; m,n → μ_S; ψ_left →
-    conj(T) on 'x'; ψ_right → T† on 'y').  It inherits the two-stage
-    ``psum_scatter``, so no (μ_L, μ_L) tile is ever gathered, and it returns
-    at ``P(None,'x','y')`` — the same layout it consumed, so the output is a
-    drop-in for any consumer that already eats a sharded W.
+    ``contract_bands_block_reshard(extra="none", channels="none")`` under the
+    identification (k batch → q; μ,ν → μ_L; m,n → μ_S; ψ_left → conj(T) on
+    'x'; ψ_right → T† on 'y').  It inherits the two-stage ``psum_scatter``, so
+    no (μ_L, μ_L) tile is ever gathered, and it returns at ``P(None,'x','y')``
+    — the layout it consumed.
 
     Apply once per LINEAR object: V, W(0), each ω/τ tile, and the ``_nohead``
     twins.  **Not** to a plasmon-pole reduction: ``B_q`` is a residue and
@@ -1512,15 +1604,9 @@ def congruence(mesh_xy, T_x, T_y, *, axes=("x", "y")):
     MPA model in the small basis; anyone who congruences ``Omega_q`` gets
     numbers that look plausible and are meaningless.
     """
-    psi_left, psi_right = jax.jit(
-        lambda a, b: transfer_operands_from_dense(a, b, mesh_xy, axes)
-    )(T_x, T_y)
-    project = project_w_between_zeta_bases(mesh_xy, axes=axes)
-
-    def _apply(A_L):
-        return project(A_L, psi_left, psi_right)
-
-    return _apply
+    operands = jax.jit(
+        lambda a, b: transfer_operands_from_dense(a, b, mesh_xy, axes))
+    return operands, project_w_between_zeta_bases(mesh_xy, axes=axes)
 
 
 def transform_head_vector(g0_L, T_x, q_index: int, mesh_xy, *,
@@ -1590,6 +1676,11 @@ def observable_norm2(A, S, mesh_xy, *, axes=("x", "y")):
     emitted two all-gathers of cube/p and no full-cube buffer.  The
     difference was one ``with_sharding_constraint``.
     """
+    return _norm2_of(mesh_xy, tuple(axes))(A, S)
+
+
+@lru_cache(maxsize=None)
+def _norm2_of(mesh_xy, axes):
     ax_x, ax_y = axes
     munu = NamedSharding(mesh_xy, P(None, ax_x, ax_y))
     rep = NamedSharding(mesh_xy, P(None))
@@ -1602,7 +1693,7 @@ def observable_norm2(A, S, mesh_xy, *, axes=("x", "y")):
             jnp.einsum("qij,qjk->qik", S_, A_, optimize=True), munu)
         return jnp.real(jnp.sum(AS * jnp.conj(SA), axis=(1, 2)))
 
-    return _norm2(A, S)
+    return _norm2
 
 
 def epsilon_w(W_L, S_LL, W_S, S_SS, mesh_xy, *, axes=("x", "y")):
@@ -1634,3 +1725,186 @@ def epsilon_w(W_L, S_LL, W_S, S_SS, mesh_xy, *, axes=("x", "y")):
                          np.nan)
     eps = np.sqrt(np.maximum(0.0, 1.0 - ratio))
     return eps, n2_L, n2_S
+
+
+# ---------------------------------------------------------------------------
+# D3–D5 streamed over q — the distributed plan's q loop
+# ---------------------------------------------------------------------------
+
+def transfer_q_tile(n_q, mu_L_pad, mu_S_pad, mesh_xy, *, residual: bool):
+    """``(width, starts)`` of the q stream, from the shapes alone.
+
+    Per q, per rank, the live set of one D3–D5 step is the parent-tensor
+    slice in flight and, with the residual, the ``S_LL`` slice and the two
+    pinned ``(μ_L, μ_L)`` products (``μ_L²/P`` each); ``S_cross``, ``T`` on
+    both mesh axes, the solve's intermediate and the congruence operands
+    (``μ_S·μ_L/p`` each, one centroid axis sharded); and the replicated
+    ``S_SS``, its eigenvectors and the eigensolver's scratch (``μ_S²``)::
+
+        bytes / q = 16·[(2 + 3·residual)·μ_L²/P + 9·μ_S·μ_L/p + 5·μ_S²]
+
+    :func:`runtime.tiles.tile_plan` of that, so the tile never depends on
+    free memory.  CrI3 8x8 at μ_L 6000, μ_S 1500, P4: 1.55 GB per q, one q
+    per tile; the 3000 → 716 child: 0.42 GB, two q per tile.
+    """
+    from runtime.tiles import tile_plan
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    P_, p_ = px * py, max(px, py)
+    L2, LS, S2 = (float(mu_L_pad) ** 2, float(mu_S_pad) * float(mu_L_pad),
+                  float(mu_S_pad) ** 2)
+    per_q = 16.0 * ((2 + 3 * int(bool(residual))) * L2 / P_
+                    + 9.0 * LS / p_ + 5.0 * S2)
+    return tile_plan(per_q, int(n_q))
+
+
+@lru_cache(maxsize=None)
+def q_slab_programs(mesh_xy, width):
+    """``(take, put)`` of ``width`` q rows of a ``P(None,'x','y')`` stack.
+
+    q is the flat leading axis and is not sharded, so both are rank-local;
+    ``put`` donates the stack it writes into.
+    """
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    take = jax.jit(
+        lambda a, q0: jax.lax.dynamic_slice_in_dim(a, q0, width, axis=0),
+        out_shardings=face)
+    put = jax.jit(
+        lambda a, t, q0: jax.lax.dynamic_update_slice_in_dim(a, t, q0, axis=0),
+        out_shardings=face, donate_argnums=0)
+    return take, put
+
+
+@lru_cache(maxsize=None)
+def _zeros_of(mesh_xy, shape):
+    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                   out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
+def stream_transfer(S_LL, S_SS, S_cross, tensors, mesh_xy, *, rcond: float,
+                    g0_L=None, residual_names=("W0_qmunu", "V_qmunu"),
+                    print_fn=print):
+    """D3–D5 over q in fixed tiles: the transfer, the congruence, ε_W.
+
+    Every stage after the Gram is q-DIAGONAL — ``T[q]`` is built from
+    ``S_SS[q]`` and ``S_cross[q]`` alone and the congruence is per q — so q
+    runs in tiles of :func:`transfer_q_tile`, and each tile is the whole chain
+    on ``(width, ·, ·)`` slices of the resident stacks:
+
+        T[q]   = S_SS[q]⁺ S_cross[q]                      (rank-truncated)
+        A_S[q] = T[q] A_L[q] T[q]†        for every linear object A
+        ε_W(q) = sqrt(1 − tr(W_S S_SS W_S† S_SS) / tr(W_L S_LL W_L† S_LL))
+
+    A tile holding every q is the unstreamed chain; the stream changes which
+    q are in flight, never the arithmetic on any one of them.
+
+    Parameters
+    ----------
+    S_LL : (n_q, μ_L, μ_L) complex128 at ``P(None,'x','y')``, or ``None``
+        The parent Gram; ``None`` skips the residual.
+    S_SS : (n_q, μ_S, μ_S) at ``P(None,'x','y')``
+    S_cross : (n_q, μ_S, μ_L) at ``P(None,'x','y')``
+    tensors : dict of name -> (n_q, μ_L, μ_L) at ``P(None,'x','y')``
+        The parent's linear objects (V, W0 and any ``_nohead`` twins).
+    g0_L : (μ_L,) complex128 or None
+        The q = 0 head vector, transported with ``conj(T[q=0])``.
+
+    Returns
+    -------
+    dict with ``small`` (name -> (n_q, μ_S, μ_S) at ``P(None,'x','y')``),
+    ``T`` ((n_q, μ_S, μ_L) at ``P(None,'x','y')``, for ζ), ``reports``
+    (one ``RankReport`` per q), ``ev`` ((n_q, μ_S) host), ``eps`` and
+    ``norms`` (per name in ``residual_names``, (n_q,) host), ``g0_S``,
+    ``width`` and ``n_tiles``.
+    """
+    n_q, mu_S = int(S_SS.shape[0]), int(S_SS.shape[-1])
+    mu_L = int(S_cross.shape[-1])
+    width, starts = transfer_q_tile(n_q, mu_L, mu_S, mesh_xy,
+                                    residual=S_LL is not None)
+    take, put = q_slab_programs(mesh_xy, width)
+    operands, project = congruence(mesh_xy)
+    to_face = _reshard_of(mesh_xy, P(None, "x", "y"))
+
+    small = {name: _zeros_of(mesh_xy, (n_q, mu_S, mu_S))() for name in tensors}
+    T = _zeros_of(mesh_xy, (n_q, mu_S, mu_L))()
+    reports = [None] * n_q
+    ev = np.zeros((n_q, mu_S), dtype=np.float64)
+    names = [n for n in residual_names if n in tensors and S_LL is not None]
+    eps = {n: np.full(n_q, np.nan) for n in names}
+    n2 = {n: (np.full(n_q, np.nan), np.full(n_q, np.nan)) for n in names}
+    g0_S = None
+
+    for q0 in starts:
+        q0j = jnp.int32(q0)
+        S_SS_t = take(S_SS, q0j)
+        T_x, T_y, rep_t, ev_t = build_transfer(
+            S_SS_t, take(S_cross, q0j), mesh_xy, rcond=rcond,
+            print_fn=print_fn, announce=False)
+        ops = operands(T_x, T_y)
+        S_LL_t = take(S_LL, q0j) if names else None
+        for name, A in tensors.items():
+            A_t = take(A, q0j)
+            A_S = project(A_t, *ops)
+            if name in names:
+                e, nL, nS = epsilon_w(A_t, S_LL_t, A_S, S_SS_t, mesh_xy)
+                eps[name][q0:q0 + width] = e
+                n2[name][0][q0:q0 + width] = nL
+                n2[name][1][q0:q0 + width] = nS
+            del A_t
+            small[name] = put(small[name], A_S, q0j)
+        T = put(T, to_face(T_x), q0j)
+        if q0 == 0 and g0_L is not None:
+            g0_S = transform_head_vector(g0_L, T_x, 0, mesh_xy)
+        reports[q0:q0 + width] = rep_t
+        ev[q0:q0 + width] = ev_t
+        del T_x, T_y, ops, S_SS_t, S_LL_t
+    return {"small": small, "T": T, "reports": reports, "ev": ev,
+            "eps": eps, "norms": n2, "g0_S": g0_S,
+            "width": width, "n_tiles": len(starts)}
+
+
+def resident_bytes_per_rank(*, nk, nb, ns, n_q, mu_L_pad, mu_S_pad,
+                            n_tensors, mesh_xy, residual: bool):
+    """The plan's per-rank memory price, as ``[(label, bytes), ...]``.
+
+    Every stack is at ``P(None,'x','y')`` (``1/P``); the ψ faces carry one
+    centroid axis on one mesh axis (``1/p``).  The two streamed rows are each
+    bounded by one fixed tile (:data:`runtime.tiles.TILE_BYTES`) per step;
+    the pool spectrum is held only during the selection, on whole-matrix
+    ranks (the eigh stack route: the matrix plus 8·n² of solver scratch).
+    """
+    from runtime.tiles import TILE_BYTES
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    P_, p_ = px * py, max(px, py)
+    c = 16.0
+    L2, LS, S2 = (float(mu_L_pad) ** 2, float(mu_S_pad) * float(mu_L_pad),
+                  float(mu_S_pad) ** 2)
+    width, _ = transfer_q_tile(n_q, mu_L_pad, mu_S_pad, mesh_xy,
+                               residual=residual)
+    per_q = 16.0 * ((2 + 3 * int(bool(residual))) * L2 / P_
+                    + 9.0 * LS / p_ + 5.0 * S2)
+    return [
+        ("parent psi faces (nk, nb, ns, mu_L)/p, X and Y",
+         2 * c * nk * nb * ns * mu_L_pad / p_),
+        (f"parent tensors x{n_tensors} (n_q, mu_L, mu_L)/P",
+         n_tensors * c * n_q * L2 / P_),
+        ("S_LL (n_q, mu_L, mu_L)/P", c * n_q * L2 / P_ if residual else 0.0),
+        ("S_cross + T store (n_q, mu_S, mu_L)/P", 2 * c * n_q * LS / P_),
+        (f"S_SS + child tensors x{n_tensors} (n_q, mu_S, mu_S)/P",
+         (1 + n_tensors) * c * n_q * S2 / P_),
+        ("child psi faces (nk, nb, ns, mu_S)/p", 2 * c * nk * nb * ns * mu_S_pad / p_),
+        ("streamed Gram column tile (<= TILE_BYTES)", float(TILE_BYTES)),
+        (f"streamed q tile ({width} q)", width * per_q),
+        ("pool spectrum, selection only (9 mu_L^2 on one rank)", 9 * c * L2),
+    ]
+
+
+def describe_price(rows, indent="  ") -> str:
+    """The price table the driver prints, in GB per rank."""
+    lines = [f"{indent}[downfold/price] per-rank memory of the distributed "
+             f"plan (GB):"]
+    lines += [f"{indent}[downfold/price]   {b / 1e9:8.2f}  {label}"
+              for label, b in rows]
+    lines.append(f"{indent}[downfold/price]   {sum(b for _, b in rows) / 1e9:8.2f}"
+                 f"  total (the selection-only row and the streamed rows are "
+                 f"never all live at once, so this is an upper bound)")
+    return "\n".join(lines)

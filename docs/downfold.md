@@ -15,7 +15,7 @@ rule for sizing an over-complete parent is established.
 
 For each momentum transfer $q$, $S_q$ is the $\mu_L\times\mu_L$ pair-density
 Gram of the retained window (left bands $m$, right bands $n$), built by
-`isdf.core.c_q_from_psi_sm`. Pivoted Cholesky on it selects the kept rows
+`isdf.core.c_q_downfold`. Pivoted Cholesky on it selects the kept rows
 $S \subset L$. The transfer is the least-squares fit in that metric,
 
 $$
@@ -48,6 +48,82 @@ $$
 
 At $q = 0$ the head dominates both norms; the ratio stays meaningful, the
 absolute norms do not compare across $q$.
+
+## The distributed plan
+
+One plan serves every process grid, P = p² ranks on the mesh `('x','y')`;
+one device is its P = 1 case. Every stacked object lives at
+`P(None,'x','y')`, q (and k) is the flat leading axis, and no μ_L²-class object
+is replicated, gathered to a host, or held on fewer than all P ranks.
+
+| object | shape | class | layout | bytes per rank |
+|---|---|---|---|---|
+| parent ψ faces (conj X, plain Y) | (nk, nb, ns, μ_L) | N_μ | X `P(None,'x',None,None)`, Y `P(None,None,None,'y')` | 2·16·nk·nb·ns·μ_L/p |
+| V_L, W_L (and `_nohead` twins) | (n_q, μ_L, μ_L) | N_μ² | `P(None,'x','y')` | 16·n_q·μ_L²/P each |
+| S_LL, the window Gram | (n_q, μ_L, μ_L) | N_μ² | `P(None,'x','y')` | 16·n_q·μ_L²/P |
+| S_cross, T (kept for ζ) | (n_q, μ_S, μ_L) | N_μ·N_μS | `P(None,'x','y')` | 16·n_q·μ_S·μ_L/P each |
+| S_SS, V_S, W_S | (n_q, μ_S, μ_S) | N_μS² | `P(None,'x','y')` | 16·n_q·μ_S²/P each |
+
+**Gram (D1).** $S(q)$ for every q comes from one k-convolution
+(`isdf.core.c_q_downfold` through the `ffi.fft` pair router). The
+convolution acts on each $(\mu,\nu)$ element separately, so each rank streams
+its local columns: one `lax.scan` inside the `shard_map` (`unroll=1`) builds a
+column tile's open-spin pair densities $P_{l,r}(k)$, convolves them and writes
+the tile in place. The tile is `runtime.tiles.tile_plan` of
+$(3n_s^2+2)\,n_k\,\mu_{loc}\cdot 16$ bytes per column against
+`TILE_BYTES` (1 GiB per rank): the shapes alone size it, every tile has one
+width, and the last start is clamped so the overlap is recomputed rather than
+padded. Unstreamed, the CrI3 8×8 μ_L 6000 Gram compiled to 121 GB per device at
+P4, 110.6 GB of it the two all-k pair densities; streamed, its live set is the
+output plus one tile.
+
+**Selection (D2)** reads only the q = 0 face. Its eigenvalue spectrum is
+`distrib_la.plan('eigh')` on the face (the stack route: the matrix whole on
+one rank, 9·μ_L²·16 bytes there during the selection, eigenvalues replicated);
+the pivoted Cholesky is `common.pivoted_cholesky`'s row-sharded select (rows
+over all P ranks); the diagonal maximum is a device reduction. The kept-block
+certificate is the transfer solve's own q = 0 rank, not a second solve.
+
+**Transfer, congruence, error bar (D3–D5)** are q-diagonal, so they stream over
+q in equal tiles of `tile_plan` of
+
+$$
+16\big[(2+3r)\,\mu_L^2/P + 9\,\mu_S\mu_L/p + 5\,\mu_S^2\big]\ \text{bytes per q}
+$$
+
+($r = 1$ with the residual). Per tile: $S_{SS}$ is replicated (bounded by the
+tile and by μ_S), factored once per q by `distrib_la.eigh_local`, and that one
+spectrum serves the report and the rank-truncated solve
+(`common.zeta_projection.least_squares_transfer`, rank-local over the sharded
+μ_L axis); $T$ on the `'y'` axis is a reshard of $T$ on `'x'`, so both legs of
+the congruence carry the same numbers; the congruence is
+`contract_bands_block_reshard`'s two-stage `psum_scatter`, which never gathers a
+(μ_L, μ_L) tile; ε_W is two sharding-pinned GEMMs. Each tile's outputs are
+written in place into the child stacks and the T store. A tile holding every q
+is the unstreamed chain: the stream changes which q are in flight, never the
+arithmetic on any one q.
+
+**After the stream.** The child wedge-storability gate and its parent control
+take the wedge rows on the device and unfold over the full zone in q tiles,
+reducing each to its maximum there (the parent control at 6000 used to gather
+37 GB per process). ζ transport gathers only the rows of $T$ at the stored ζ q
+(n_q,ζ·μ_S·μ_L·16 bytes per process) and applies them on rank 0, one q at a
+time.
+
+**Memory price.** Every run prints its table (`[downfold/price]`,
+`gw.downfold.resident_bytes_per_rank`). Upper bounds, GB per rank, for the
+CrI3 8×8 80 Ry parents (nb 898, n_s 2, two tensors, residual on):
+
+| case | ψ faces | parent tensors | S_LL | S_cross + T | small | Gram tile | q tile | pool eigh | total |
+|---|---|---|---|---|---|---|---|---|---|
+| 6000 → 1500, P4 | 11.03 | 18.43 | 9.22 | 4.61 | 4.49 | 1.07 | 1.55 | 5.18 | 55.6 |
+| 3000 → 716, P4 | 5.52 | 4.61 | 2.30 | 1.10 | 1.71 | 1.07 | 0.75 | 1.30 | 18.4 |
+| 6000 → 1500, P16 | 5.52 | 4.61 | 2.30 | 1.15 | 1.81 | 1.07 | 0.68 | 5.18 | 22.3 |
+
+("small" is the child stacks and the child ψ faces.) The largest remaining
+item is the ψ faces, held at 1/p over the full band axis because the child
+bundle stores every band; the pool eigensolve's stack route is the capacity
+bound on μ_L (one matrix and its scratch on one rank).
 
 ## Input
 
@@ -174,5 +250,6 @@ elsewhere and is not on the selection path.
   each frequency or time) and refit PPM or MPA in the small basis.
 - **Not validated for Σ.** The small bundle serves the retained-window BSE and
   the exciton bands built on it.
-- `mode = refit` (a fresh k-means and ζ fit on the window) and
-  `plan = distributed` refuse.
+- `mode = refit` (a fresh k-means and ζ fit on the window) refuses, and so does
+  `plan = local`: the all-q local plan is retired; `auto` and `distributed` both
+  name the distributed plan.
