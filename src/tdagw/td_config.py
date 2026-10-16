@@ -18,7 +18,8 @@ import os
 from typing import NamedTuple
 
 __all__ = ["TD_DEFAULTS", "TD_REQUIRED", "MEASUREMENT_KEYWORDS",
-           "MEASUREMENT_TYPES", "TdDeck", "read_td_deck", "parse_td_deck"]
+           "MEASUREMENT_TYPES", "SYSTEMS", "TdDeck", "read_td_deck", "parse_td_deck",
+           "UNUSED_TDGW_KEYS", "unused_keys"]
 
 #: The accepted keys and their defaults.  None = required or unset.
 TD_DEFAULTS = {
@@ -60,16 +61,29 @@ TD_DEFAULTS = {
     "lorrax.intraband": True,
     "lorrax.chunk": 0,
     "lorrax.trials": None,
+    "lorrax.system": "tdgw_header",
+    "lorrax.bundle_input": "",
+    "lorrax.eqp_file": "",
+    "lorrax.dipole_file": "",
+    "lorrax.pair_rule": "mask",
+    "lorrax.pair_gap_ev": None,
+    "lorrax.check_eigenvectors": "",
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
                "control.timesteps.dt_measure", "control.timesteps.tf",
-               "control.files.indir", "control.files.outdir", "system.ibndmin",
+               "control.files.outdir", "system.ibndmin",
                "system.ibndmax", "system.geometry", "measurements.types")
+#: TDGW's measurement workers, then two of LORRAX's own (not in TDGW):
+#: ``carrier_density`` (conduction electrons and valence holes per cell) and
+#: ``exciton_projection`` (the amplitudes ``Σ conj(A^S) ρ_cv`` on the states
+#: of a BSE eigenvectors file).
 MEASUREMENT_TYPES = ("Efield", "polarization", "current", "density_matrix",
-                     "lessG")
+                     "lessG", "carrier_density", "exciton_projection")
 MEASUREMENT_KEYWORDS = ("dataset_name", "itrange", "ntsave", "brange1",
-                        "brange2", "krange", "use_v0", "inter_only")
+                        "brange2", "krange", "use_v0", "inter_only",
+                        "eigenvectors", "n_states")
+SYSTEMS = ("tdgw_header", "bundle")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
 
@@ -145,13 +159,43 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
                     "IP | COHSEX", "set [control] calc_type")
     if vals["control.files.use_vmtxel"]:
         raise _gate("td_header_source", "use_vmtxel = true",
-                    "the header (structure, WFN header, dipole) of a TDGW run",
+                    "the header (structure, WFN header, dipole) of a TDGW run "
+                    "(a use_vmtxel run's header carries BerkeleyGW's dipoles) "
+                    "or [lorrax] system = 'bundle'",
                     "set [control.files] load_header_from to a TDGW output")
-    if not vals["control.files.load_header_from"]:
-        raise _gate("td_header_source", "load_header_from empty",
-                    "a TDGW output directory holding tdgw.h5",
-                    "point [control.files] load_header_from at a TDGW run "
-                    "(tdgw-run writes the header before it propagates)")
+    if vals["lorrax.system"] not in SYSTEMS:
+        raise _gate("td_system", repr(vals["lorrax.system"]), " | ".join(SYSTEMS),
+                    "set [lorrax] system")
+    if vals["lorrax.system"] == "bundle":
+        if vals["control.files.load_header_from"]:
+            raise _gate("td_header_source", "load_header_from with system = 'bundle'",
+                        "one header source", "drop load_header_from (the bundle "
+                        "builds the header) or use system = 'tdgw_header'")
+        for key in ("lorrax.bundle_input", "lorrax.dipole_file"):
+            if not vals[key]:
+                raise _gate("td_bundle_input", f"system = 'bundle' without {key}",
+                            "the GW deck of the restart and the coarse WFN's dipole.h5",
+                            f"set {key}")
+        if vals["system.ivbm"] is None:
+            raise _gate("td_ivbm", "system = 'bundle' without [system] ivbm",
+                        "the number of occupied bands (1-based VBM index)", "set ivbm")
+    else:
+        for key in ("lorrax.bundle_input", "lorrax.eqp_file", "lorrax.dipole_file",
+                    "lorrax.check_eigenvectors"):
+            if vals[key]:
+                raise _gate("td_bundle_key", f"{key} with system = 'tdgw_header'",
+                            "bundle keys only with system = 'bundle'",
+                            "drop it or set [lorrax] system = 'bundle'")
+        if not vals["control.files.load_header_from"]:
+            raise _gate("td_header_source", "load_header_from empty",
+                        "a TDGW output directory holding tdgw.h5",
+                        "point [control.files] load_header_from at a TDGW run "
+                        "(tdgw-run writes the header before it propagates), or "
+                        "build the system from a GW bundle: [lorrax] system = 'bundle'")
+    from tdagw.td_system import PAIR_RULES
+    if vals["lorrax.pair_rule"] not in PAIR_RULES:
+        raise _gate("td_pair_rule", repr(vals["lorrax.pair_rule"]),
+                    " | ".join(PAIR_RULES), "set [lorrax] pair_rule")
     if vals["control.files.load_checkpoint_from"]:
         raise _gate("td_checkpoint_restart", "load_checkpoint_from set",
                     "a run from t0", "restart is not implemented in LORRAX's "
@@ -173,9 +217,24 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     if model not in MODELS:
         raise _gate("td_model", repr(model), " | ".join(MODELS),
                     "set [lorrax] model")
+    bundle = vals["lorrax.system"] == "bundle"
+    if model == "isdf" and bundle:
+        if vals["lorrax.isdf_input"] not in ("", vals["lorrax.bundle_input"]):
+            raise _gate("td_isdf_input", "isdf_input differs from bundle_input",
+                        "one bundle for the system and the model",
+                        "drop isdf_input (the bundle's model is used)")
+        vals["lorrax.isdf_input"] = vals["lorrax.bundle_input"]
     if model == "isdf" and not vals["lorrax.isdf_input"]:
         raise _gate("td_isdf_input", "model = isdf without [lorrax] isdf_input",
                     "the GW deck of the restart bundle", "set isdf_input")
+    if model == "isdf" and not bundle and not vals["control.files.indir"]:
+        raise _gate("td_indir", "model = isdf on a TDGW header without [control.files] indir",
+                    "TDGW's indir (its WFN.h5 fixes the ψ gauge of the header)",
+                    "set indir, or build the system from the bundle: system = 'bundle'")
+    if model == "tdgw_kernel" and not (vals["lorrax.kernel_file"]
+                                       or vals["control.files.indir"]):
+        raise _gate("td_kernel_file", "model = tdgw_kernel without kernel_file or indir",
+                    "a TDGW kernel.h5", "set [lorrax] kernel_file or [control.files] indir")
     if vals["lorrax.isdf_terms"] not in ("both", "sex", "hartree"):
         raise _gate("td_isdf_terms", repr(vals["lorrax.isdf_terms"]),
                     "both | sex | hartree", "set [lorrax] isdf_terms")
@@ -188,6 +247,8 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     ms = vals["control.timesteps.max_step"]
     vals["control.timesteps.max_step"] = (math.inf if ms is None
                                           else float(ms) / T_IN_ATTOSEC)
+    if vals["lorrax.pair_gap_ev"] is None:
+        vals["lorrax.pair_gap_ev"] = float(vals["system.esmear"])
     for k in ("system.esmear", "system.depopulation", "system.dephasing"):
         vals[k] = float(vals[k]) / HA_IN_EV
     if vals["lorrax.method"] != "dp54":
@@ -219,7 +280,14 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
                         "drop it (velocity_operator is TDGW-only)")
         kw = dict(per_meas.get(i, {}))
         name = kw.pop("dataset_name", typ)
+        if typ == "exciton_projection" and not kw.get("eigenvectors"):
+            raise _gate("td_exciton_projection", f"measurement {i} without eigenvectors",
+                        "a bse_jax --write-eigs eigenvectors.h5 on the same bundle and window",
+                        f"set measurements.{i}.eigenvectors")
         meas.append((name, typ, kw))
+    if sum(m[1] == "exciton_projection" for m in meas) > 1:
+        raise _gate("td_exciton_projection", "two exciton_projection measurements",
+                    "one", "project onto one eigenvector file (raise n_states)")
     names = [m[0] for m in meas]
     if len(set(names)) != len(names):
         raise _gate("td_measurement_names", names, "unique dataset names",
@@ -234,3 +302,24 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     tdgw = {k: v for k, v in raw.items() if k != "lorrax"}
     return TdDeck(tdgw=tdgw, values=vals, measurements=tuple(meas),
                   trials=trials, source=source)
+
+
+#: TDGW keys a deck may carry that this driver reads and does not use: TDGW's
+#: logging level, its vacuum centring for the dipole origin (the bundle and
+#: TDGW-header routes take r from the header), and the snapshot stride of a
+#: measurement (every sample on the dt_measure grid is written).
+UNUSED_TDGW_KEYS = ("control.loglevel", "system.center_of_vacuum")
+
+
+def unused_keys(deck) -> list:
+    """The UNUSED_TDGW_KEYS and ``measurements.<i>.ntsave`` the deck sets."""
+    def has(d, dotted):
+        for part in dotted.split("."):
+            if not isinstance(d, dict) or part not in d:
+                return False
+            d = d[part]
+        return True
+    out = [k for k in UNUSED_TDGW_KEYS if has(deck.tdgw, k)]
+    out += [f"measurements.{i}.ntsave" for i, (_, _, kw) in enumerate(deck.measurements)
+            if "ntsave" in kw]
+    return out

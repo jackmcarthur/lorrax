@@ -16,7 +16,7 @@ import numpy as np
 from common import timing
 from common.collectives import process_rank
 from tdagw import propagate as tp
-from tdagw import tdgw_io
+from tdagw import td_config, tdgw_io
 from tdagw.self_energy import (SelfEnergyModel, dense_kernel_from_tdgw_layout,
                                dense_kernel_model, isdf_model, zero_model)
 from tdagw.td_config import TdDeck
@@ -31,6 +31,8 @@ class TdSystem(NamedTuple):
     hdr : raw TDGW header (host).   ops : tdagw.eom.TdOperators on the mesh.
     nk, nk_pad, nb : logical k, padded k, bands.  cell_volume (bohr^3),
     nspinor.  bands : (start, stop, step) 1-based absolute window.
+    model : the bundle's ``load_td_model`` output (system = 'bundle'), reused
+    by the ISDF ΔΣ, else None.  receipts : ``tdagw.td_system`` receipts or None.
     """
     hdr: dict
     ops: object
@@ -40,12 +42,27 @@ class TdSystem(NamedTuple):
     cell_volume: float
     nspinor: int
     bands: tuple
+    model: object = None
+    receipts: dict = None
 
 
 def load_system(deck: TdDeck, mesh) -> TdSystem:
-    """The header of ``load_header_from`` and the operators of Eq. (1)-(2)."""
+    """The header (``load_header_from``, or built from a GW bundle) and Eq. (1)-(2)."""
     v = deck.values
-    hdr = tdgw_io.read_header(v["control.files.load_header_from"])
+    bundle_model = receipts = None
+    if v["lorrax.system"] == "bundle":
+        from tdagw.td_system import build_td_system
+        built = build_td_system(
+            v["lorrax.bundle_input"], mesh,
+            bands=(int(v["system.ibndmin"]) - 1, int(v["system.ibndmax"])),
+            dipole_file=v["lorrax.dipole_file"], eqp_file=v["lorrax.eqp_file"] or None,
+            n_occ=int(v["system.ivbm"]), pair_rule=v["lorrax.pair_rule"],
+            gap_ev=float(v["lorrax.pair_gap_ev"]), zeta_file=v["lorrax.isdf_zeta"] or None,
+            eigenvectors_file=v["lorrax.check_eigenvectors"] or None,
+            log=lambda s: print(s) if process_rank() == 0 else None)
+        hdr, bundle_model, receipts = built.hdr, built.model, built.receipts
+    else:
+        hdr = tdgw_io.read_header(v["control.files.load_header_from"])
     start, stop, step = hdr["bands"]
     want = (int(v["system.ibndmin"]), int(v["system.ibndmax"]) + 1, 1)
     if (start, stop, step) != want:
@@ -61,9 +78,43 @@ def load_system(deck: TdDeck, mesh) -> TdSystem:
     host["gamma"] = (v["system.depopulation"] * eye
                      + v["system.dephasing"] * (1.0 - eye))
     ops, nk_pad = tp.place_operators(host, mesh)
+    proj = [kw for _, typ, kw in deck.measurements if typ == "exciton_projection"]
+    if proj:
+        ops = ops._replace(proj=tp.place_projector(
+            _projector(proj[0], hdr), mesh, nk_pad))
     return TdSystem(hdr=hdr, ops=ops, nk=host["e_qp"].shape[0], nk_pad=nk_pad,
                     nb=nb, cell_volume=host["cell_volume"],
-                    nspinor=host["nspinor"], bands=hdr["bands"])
+                    nspinor=host["nspinor"], bands=hdr["bands"],
+                    model=bundle_model, receipts=receipts)
+
+
+def _n_val(hdr: dict) -> int:
+    """Occupied window rows (TDGW occupations: the leading full bands)."""
+    f = np.asarray(hdr["f_kn"])
+    n_val = int(np.rint(f[0].sum()))
+    if not np.array_equal(f, np.broadcast_to((np.arange(f.shape[1]) < n_val) * 1.0, f.shape)):
+        raise ValueError("GATE td_occupations: got: occupations that are not the leading "
+                         "rows at every k; want: valence rows first; fix: a gapped window")
+    return n_val
+
+
+def _projector(kw: dict, hdr: dict) -> np.ndarray:
+    """The ``exciton_projection`` eigenvectors, checked against the header."""
+    from bse.absorption_common import load_eigenvectors_h5
+    _, A, params = load_eigenvectors_h5(kw["eigenvectors"])
+    n = A.shape[0] if kw.get("n_states") is None else min(int(kw["n_states"]), A.shape[0])
+    nk, nb = np.asarray(hdr["e_kn"]).shape
+    n_val = _n_val(hdr)
+    if A.shape[1:] != (nk, nb - n_val, n_val):
+        raise ValueError(f"GATE td_projection_window: got: eigenvectors (nk, nc, nv) = "
+                         f"{A.shape[1:]}; want: {(nk, nb - n_val, n_val)}; fix: solve the "
+                         f"BSE on the TD window and k grid")
+    dk = np.asarray(params["kpts"], float) - np.asarray(hdr["kpts"], float)
+    if np.abs(dk - np.rint(dk)).max() > 1e-6:
+        raise ValueError("GATE td_projection_kpoints: got: an eigenvector k list that "
+                         "differs from the header's; want: the same k points in the same "
+                         "order; fix: solve the BSE on the bundle the header comes from")
+    return A[:n]
 
 
 def build_self_energy(deck: TdDeck, system: TdSystem, mesh) -> SelfEnergyModel:
@@ -71,6 +122,11 @@ def build_self_energy(deck: TdDeck, system: TdSystem, mesh) -> SelfEnergyModel:
     v = deck.values
     if v["lorrax.model"] == "none":
         return zero_model()
+    if v["lorrax.model"] == "isdf" and system.model is not None:
+        terms = v["lorrax.isdf_terms"]
+        return isdf_model(system.model, mesh, k_frac=system.hdr["kpts"],
+                          rho_eq=system.ops.rho_eq, sex=terms in ("both", "sex"),
+                          hartree=terms in ("both", "hartree"))
     if v["lorrax.model"] == "isdf":
         from tdagw.model import load_td_model
         terms = v["lorrax.isdf_terms"]
@@ -135,6 +191,8 @@ def sample_spec(deck: TdDeck, system: TdSystem) -> tp.SampleSpec:
         if typ == "current":
             opts["use_v0"] = bool(kw.get("use_v0", False))
             opts["inter_only"] = bool(kw.get("inter_only", False))
+        if typ == "exciton_projection":
+            opts["n_val"] = _n_val(system.hdr)
         kinds.append((name, typ, tuple(sorted(opts.items()))))
     return tp.SampleSpec(kinds=tuple(kinds))
 
@@ -158,6 +216,12 @@ def open_outputs(deck: TdDeck, system: TdSystem) -> TdOutputs:
             shapes.append((name, mtsteps[itr.start:itr.stop:itr.step], (3,), np.float64))
         elif typ in ("polarization", "current"):
             shapes.append((name, mtsteps[itr.start:itr.stop:itr.step], (3,), np.complex128))
+        elif typ == "carrier_density":
+            shapes.append((name, mtsteps[itr.start:itr.stop:itr.step], (2,), np.float64))
+        elif typ == "exciton_projection":
+            n_states = int(system.ops.proj.shape[0])
+            shapes.append((name, mtsteps[itr.start:itr.stop:itr.step], (n_states,),
+                           np.complex128))
         else:
             b1 = _brange_slice(kw.get("brange1"), system.bands)
             b2 = _brange_slice(kw.get("brange2"), system.bands)
@@ -258,7 +322,7 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
     lines = [
         "TD-aGW propagation (TDGW conventions)",
         f"  deck            : {deck.source}",
-        f"  header          : {system.hdr['path']}",
+        f"  header          : {system.hdr['path'] or 'built from the GW bundle ' + str(v['lorrax.bundle_input'])}",
         f"  window          : bands {system.bands[0]}..{system.bands[1] - 1}, "
         f"nb = {system.nb}, nk = {system.nk} (padded {system.nk_pad}), "
         f"nspinor = {system.nspinor}",
@@ -273,6 +337,10 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
         f"  mesh            : {runtime.mesh_shape} on {runtime.n_devices} "
         f"{runtime.platform} device(s)",
     ]
+    unused = td_config.unused_keys(deck)
+    if unused:
+        lines.append("  read, not used  : " + ", ".join(unused)
+                     + " (TDGW logging / vacuum centring / snapshot stride)")
     return "\n".join(lines)
 
 

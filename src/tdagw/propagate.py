@@ -94,7 +94,8 @@ class SampleSpec(NamedTuple):
     """What one sample measures (TDGW measurement workers).
 
     kinds : tuple of (name, kind, opts) with kind in Efield, polarization,
-        current, density_matrix, lessG and opts a tuple of (key, value).
+        current, density_matrix, lessG, carrier_density, exciton_projection
+        and opts a tuple of (key, value).
     """
     kinds: tuple
 
@@ -167,6 +168,11 @@ def place_operators(host: dict, mesh) -> tuple:
                   _place(_pad_k(np.asarray(v0_intra, complex), 1, nk_pad), mesh, 1)),
         intra=intra)
     return ops, nk_pad
+
+
+def place_projector(A, mesh, nk_pad: int):
+    """BSE eigenvectors (n_states, nk, nc, nv) on the mesh, k-sharded and padded."""
+    return _place(_pad_k(np.asarray(A, complex), 1, nk_pad), mesh, 1)
 
 
 def place_kernel(kmat, mesh):
@@ -269,8 +275,14 @@ def _sample(ph, ops, spec: SampleSpec, drive, *, cell_volume, nspinor):
                 b1, b2 = o["bslice1"], o["bslice2"]
                 blk = rho[:, :, b1[0]:b1[1], b2[0]:b2[1]]
                 out[name] = blk if kind == "density_matrix" else 1j * blk
+            elif kind == "carrier_density":
+                out[name] = eom.carrier_density(ops, rho, nspinor=nspinor)
+            elif kind == "exciton_projection":
+                out[name] = eom.exciton_projection(ops, rho, n_val=int(o["n_val"]))
             else:
-                raise ValueError(f"unknown measurement kind {kind!r}")
+                raise ValueError(f"GATE td_measurement_kind: got: {kind!r}; want: one of "
+                                 f"the kinds _sample implements; fix: internal (the deck "
+                                 f"parser admits only those)")
         return out
     return fn
 
@@ -321,7 +333,8 @@ def _fixed_step_fn(cfg: PropagatorConfig, ph, conjugate):
                            if cfg.remainder else c_fn(t, y, h))
             return (pin(y), jnp.concatenate([hist[2:], jnp.stack([b1, b2])]), k + 1)
         return step
-    raise ValueError(cfg.method)
+    raise ValueError(f"GATE td_method: got: {cfg.method!r}; want: dp54 | rk4 | etdrk4 | "
+                     f"magnus2 | cfm4; fix: internal (the deck parser admits only those)")
 
 
 def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh):

@@ -290,7 +290,20 @@ def _copy_or_write_header(f, hdr):
     dp["rinter_iknn"] = hdr["rinter"]
     e = np.asarray(hdr["e_kn"])
     dp["v0inter_iknn"] = 1j * np.asarray(hdr["rinter"]) * (e[None, :, :, None] - e[None, :, None, :])
+    if hdr.get("td_system") is not None:
+        import json
+        # LORRAX provenance of a bundle-built header (tdagw.td_system); TDGW
+        # and tdgw-pp ignore attributes.
+        dp.attrs["lorrax_td_system"] = json.dumps(hdr["td_system"], default=_json_default)
     return g
+
+
+def _json_default(x):
+    if isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    return str(x)
 
 
 def init_output(path: str, hdr: dict, *, t0, tf, mdt, mtsteps, measurements):

@@ -66,8 +66,13 @@ class TdOperators(NamedTuple):
     w_k : (nk,) float, k weights summing to 1 over the logical k; 0 on pads.
     v0_inter : (3, nk, nb, nb) complex, i (E_n - E_m) r_nm, the
         equilibrium interband velocity.
-    v0_intra : (3, nk, nb) complex or None, i dE_kn/dk (TDGW ``v0intra``).
+    v0_intra : (3, nk, nb) complex or None, TDGW ``v0intra``: the real finite
+        difference sum_b w_b b (E_{k+b,n} - E_{kn}) over the shell vectors b
+        (TDGW dipwfn.py), stored complex.
     intra : IntraBand or None (no intraband commutator).
+    proj : (n_states, nk, nc, nv) complex or None, BSE eigenvectors A^S_kcv
+        (valence lowest first) for the ``exciton_projection`` measurement;
+        k-sharded like ρ, zero on pads.
     """
     e_qp: jax.Array
     rho_eq: jax.Array
@@ -77,6 +82,7 @@ class TdOperators(NamedTuple):
     v0_inter: jax.Array
     v0_intra: Optional[jax.Array]
     intra: Optional[IntraBand]
+    proj: Optional[jax.Array] = None
 
 
 def dissipation_rates(depopulation_ha: float, dephasing_ha: float, nb: int):
@@ -175,6 +181,34 @@ def polarization(ops: TdOperators, rho, *, cell_volume: float, nspinor: int):
     kept as TDGW does for diagnosis.  Returns (ntr, 3).
     """
     return -_expectation(ops.w_k, cell_volume, nspinor, rho, ops.r_inter)
+
+
+def carrier_density(ops: TdOperators, rho, *, nspinor: int):
+    """(ntr, 2): conduction electrons and valence holes per cell.
+
+    ``n_c = Σ_k w_k Σ_n (1 - f_n) Re ρ_nn`` and ``n_v = Σ_k w_k Σ_n f_n
+    (1 - Re ρ_nn)`` with ``f = diag ρ_eq`` (x2 if nspinor = 1).  Equal when
+    the window conserves charge; a LORRAX measurement, not TDGW's.
+    """
+    f = jnp.real(jnp.diagonal(ops.rho_eq, axis1=-2, axis2=-1))      # (nk, nb)
+    occ = jnp.real(jnp.diagonal(rho, axis1=-2, axis2=-1))           # (ntr, nk, nb)
+    w = ops.w_k[None, :, None] * (2.0 if nspinor == 1 else 1.0)
+    n_c = jnp.sum(w * (1.0 - f)[None] * occ, axis=(1, 2))
+    n_v = jnp.sum(w * f[None] * (1.0 - occ), axis=(1, 2))
+    return jnp.stack([n_c, n_v], axis=-1)
+
+
+def exciton_projection(ops: TdOperators, rho, *, n_val: int):
+    """(ntr, n_states): ``c_S = Σ_kcv conj(A^S_kcv) ρ_cv(k)``.
+
+    ``ρ_nm = ⟨a†_m a_n⟩``, so ``ρ_cv = Σ_S c_S A^S_cv`` in the TDA linear
+    regime (|S⟩ = Σ A^S_cvk a†_ck a_vk |0⟩) and ``c_S`` evolves as
+    ``exp(-i Ω_S t)`` after the drive.  ``|c_S|^2 / N_k`` is the number of
+    excitons S per cell; a LORRAX measurement, not TDGW's.
+    """
+    nc = ops.proj.shape[2]
+    blk = rho[:, :, n_val:n_val + nc, :n_val]
+    return jnp.einsum("skcv,tkcv->ts", jnp.conj(ops.proj), blk)
 
 
 def current_operator(ops: TdOperators, dsigma, *, use_v0: bool,

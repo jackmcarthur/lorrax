@@ -283,7 +283,9 @@ self-energy model. Keys are dotted TOML paths (`control.ivp.rtol` is `rtol` in
 unknown key refuses (`td_unknown_key`) in one error naming every such key.
 Units are TDGW's: times in attoseconds, energies in eV, fields in V/m. The
 header (structure, WFN header, dipole) is read from a TDGW run
-(`load_header_from`); the driver does not build dipoles. The equation of
+(`load_header_from`) or built from a GW restart bundle with
+`lorrax.system = bundle` (energies, occupations and r = v/(iΔE) from the
+bundle's own velocity; [TD system from a GW bundle](theory/td_agw_propagation.md#bundle)). The equation of
 motion, the integrators and the output layout are on
 [TD-aGW propagation](theory/td_agw_propagation.md); the interaction model
 behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
@@ -299,7 +301,7 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `control.timesteps.max_step` | unset (= no limit) | `dp54` only: SciPy's `max_step`, as. |
 | `control.ivp.rtol` | `1e-6` | `dp54` relative tolerance (SciPy RK45 semantics: RMS error norm over the logical, unpadded entries). |
 | `control.ivp.atol` | `1e-12` | `dp54` absolute tolerance, in units of ρ. |
-| `control.files.indir` | unset (required) | TDGW's input directory: `kernel.h5` for `lorrax.model = tdgw_kernel`, `WFN.h5` for `isdf`. |
+| `control.files.indir` | unset (required by `tdgw_kernel` without `kernel_file`, and by `isdf` on a TDGW header) | TDGW's input directory: `kernel.h5` for `lorrax.model = tdgw_kernel`, `WFN.h5` for `isdf` on a TDGW header (`td_kernel_file`, `td_indir`). Unused by `lorrax.system = bundle`. |
 | `control.files.outdir` | unset (required) | Output directory: `tdgw.h5` and `tdgw.toml`, or one `trial-<i>/` per drive with `lorrax.trials`. |
 | `control.files.use_vmtxel` | `false` | `true` refuses (`td_header_source`): the dipole comes from the TDGW header. |
 | `control.files.load_header_from` | `""` (required here) | A TDGW output directory; its `tdgw.h5` header supplies energies, the k grid and the dipole, and is copied into the output. Empty refuses (`td_header_source`). |
@@ -316,7 +318,7 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `system.Efunc.E_x` | `0.0` | Field component along x, V/m: a number or a TDGW expression in `t` (as) with numpy as `np`. |
 | `system.Efunc.E_y` | `0.0` | As `E_x`, along y. |
 | `system.Efunc.E_z` | `0.0` | As `E_x`, along z. |
-| `measurements.types` | unset (required) | The measurement list: `Efield`, `polarization`, `current`, `density_matrix`, `lessG`. `velocity_operator` refuses (`td_measurement_unsupported`). Per-measurement options are `[measurements.<i>]` tables (below). |
+| `measurements.types` | unset (required) | The measurement list: `Efield`, `polarization`, `current`, `density_matrix`, `lessG` (TDGW's), and LORRAX's own `carrier_density` (conduction electrons and valence holes per cell, (2,) per sample) and `exciton_projection` (amplitudes c_S = Σ conj(A^S_kcv) ρ_cv(k) on the states of a BSE `eigenvectors.h5`; |c_S|²/N_k excitons per cell). `velocity_operator` refuses (`td_measurement_unsupported`). Per-measurement options are `[measurements.<i>]` tables (below). |
 | `lorrax.method` | `dp54` | `dp54` (SciPy RK45, adaptive; takes TDGW's steps), `rk4`, `etdrk4` (Krogstad), `magnus2` (exponential midpoint) or `cfm4` (fourth-order commutator-free Magnus). |
 | `lorrax.dt` | unset | The fixed step, as, for every method but `dp54`; refused with `dp54` (`td_dt`). |
 | `lorrax.n_corr` | `2` | Corrections per step of `magnus2` (midpoint Hamiltonian) and `cfm4` (Gauss-node Hamiltonians); each costs one dΣ evaluation per node. At least 1 (`td_n_corr`). One correction after the extrapolated predictor is stable only while the step times the strength of dΣ[ρ] is small: on CrI3 2v2c COHSEX it diverges from 50 as, where two corrections are stable to 300 as. |
@@ -328,9 +330,18 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `lorrax.intraband` | `true` | Keep the intraband term E·[r^intra, ρ] (TDGW keeps it); `false` drops it. |
 | `lorrax.chunk` | `0` (= `ntcheck`) | Samples per jitted chunk (one host write and checkpoint each); capped so a density-matrix buffer fits the streaming tile. |
 | `lorrax.trials` | unset | A list of `{E_x, E_y, E_z}` tables propagated together on a leading trial axis (for example two circular polarizations); one output directory per trial. |
+| `lorrax.system` | `tdgw_header` | Where the header comes from: `tdgw_header` (a TDGW run's `tdgw.h5`, `load_header_from`) or `bundle` (built from the GW restart bundle `bundle_input` by `tdagw.td_system`, no TDGW WFN). `bundle` refuses `load_header_from` and needs `bundle_input`, `dipole_file` and `system.ivbm` (`td_bundle_input`, `td_ivbm`). |
+| `lorrax.bundle_input` | `""` | The GW deck of the restart bundle (`system = bundle`); a deck with `bse_k_grid` builds the densified system. With `model = isdf` it is also the model's deck. |
+| `lorrax.eqp_file` | `""` (= DFT energies) | The BSE run's `eqp1.dat` (`system = bundle`): QP energies by DFT index on a coarse deck, the htransform's QP f(H) states and energies on a `bse_k_grid` deck. |
+| `lorrax.dipole_file` | `""` | The coarse WFN's `dipole.h5` (`psp.get_dipole_mtxels`) for r = v/(iΔE) with the velocity's own (DFT) energies (`system = bundle`). |
+| `lorrax.pair_rule` | `mask` | Same-occupation pairs (vv', cc') of the bundle's r: `mask` multiplies r by 1 − exp(−ΔE²/(2 gap²)), `cut` zeroes pairs with \|ΔE\| < gap, `cv` keeps the c↔v blocks only (TDGW's `use_vmtxel` layout). n = m is always zero (no intraband commutator on this route). |
+| `lorrax.pair_gap_ev` | unset (= `system.esmear`) | The energy scale of `pair_rule`, eV; also the smallest accepted c↔v gap (`td_cv_gap`). |
+| `lorrax.check_eigenvectors` | `""` | A `bse_jax --write-eigs --dipole` file on the same bundle and window: the builder reproduces its ⟨0\|r\|S⟩ from the header (the gauge receipt, logged and stored in the header). |
 
 `[measurements.<i>]` options, by measurement index `<i>` (0-based, as in
 TDGW): `dataset_name` (default: the type), `itrange` and `ntsave` (TDGW's
 sample selection), `brange1`, `brange2`, `krange` (density-matrix blocks,
-1-based bands), `use_v0` and `inter_only` (current). An unknown option refuses
+1-based bands), `use_v0` and `inter_only` (current), `eigenvectors` (required)
+and `n_states` (`exciton_projection`: the BSE file on the TD window and k
+grid, and how many of its states). An unknown option refuses
 (`td_unknown_key`).
