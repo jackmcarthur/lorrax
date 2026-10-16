@@ -1,6 +1,8 @@
 """Fixed-capacity, active-prefix algebra for one-device iterative solvers.
 
-This CUDA provider uses runtime dimensions in BLAS/cuSOLVER. It never gathers
+The native provider (CUDA: cuBLAS/cuSOLVER; ROCM: rocBLAS/rocSOLVER, the same
+leg-neutral handlers in ``src/ffi/cpp/active_subspace``) uses runtime dimensions in
+BLAS/LAPACK. It never gathers
 vectors from a distributed mesh. Size scalars are copied to the host inside
 the FFI handlers: JIT-compatible does not mean host-synchronization-free.
 The arrays returned as scratch by FFI are XLA-owned, fixed at compilation.
@@ -48,12 +50,24 @@ def _flat(array, *, local_shard=False):
 
 @dataclass(frozen=True)
 class LocalSubspacePlan:
-    """Resolved complex128 CUDA operations; vector axes are process-local."""
+    """Resolved complex128 native operations; vector axes are process-local.
+
+    ``vendor`` is the device leg's vendor (``lxkit.LEGS[...].vendor``: ``cuda`` or
+    ``rocm``); it names the plan's backend and never selects code (the lowering
+    platform picks the leg's registered handler).  ``reflect`` is the leg's
+    complex-eigh policy (``local_eigh.COMPLEX_EIGH_ROUTE == "reflector"``, ROCM):
+    the native eigensolve then runs on ``H A H`` with a fixed dense Householder
+    reflector supported on the active block, because rocSOLVER ``zheevd`` fails
+    (info != 0, or silently with NaN vectors) on structured complex matrices such
+    as real-valued blocks of n >= 96 (``local_eigh`` module docstring).
+    """
     capacity: int
     n_eig: int
     lwork: int
     local_shard: bool = False
     max_block_size: int | None = None
+    vendor: str = 'cuda'
+    reflect: bool = False
 
     def qr(self, rows):
         """Reduced QR of a row-vector block; no capacity buffer is involved."""
@@ -99,9 +113,45 @@ class LocalSubspacePlan:
             input_layouts=[(1, 0), ()],
             output_layouts=[(0,), (1, 0), (0,), (0,), (0,)],
             vmap_method='sequential')
+        if self.reflect:
+            return self._reflected_eigh(call, h, active)
         e, c, _, _, info = call(self._flat(h), jnp.asarray(active, jnp.int32))
         e = jnp.where(jnp.arange(b) < active, e, jnp.inf)
         return jnp.where(info[0] == 0, e, jnp.nan), c
+
+    def _reflected_eigh(self, call, h, active):
+        """The native eigensolve of B = H A H, H = I - 2 u u^H, u the fixed dense reflector of
+        ``local_eigh`` restricted to the active block (same spectrum; C = H C_B).
+
+        A is the active block's lower triangle mirrored (the host and XLA routes' matrix);
+        inactive rows are zero in B and C and never enter arithmetic.  A scalar active block
+        (alpha I) is invariant under every unitary, so it is answered exactly; a failed or
+        non-finite solve is NaN in the eigenvalues (the batched route's failure contract).
+        """
+        from distrib_la.local_eigh import _reflector
+        cap, b = self.capacity, self.n_eig
+        m = jnp.asarray(active, jnp.int32)
+        inside = jnp.arange(cap) < m
+        block = inside[:, None] & inside[None, :]
+        a = jnp.where(block, h, 0)
+        a = jnp.tril(a) + jnp.conj(jnp.tril(a, -1)).T
+        u = jnp.where(inside, _reflector(cap, jnp.complex128), 0)
+        u = u / jnp.linalg.norm(u)
+        au = a @ u
+        uau = jnp.real(jnp.vdot(u, au))
+        bm = (a - 2 * u[:, None] * jnp.conj(au)[None, :] - 2 * au[:, None] * jnp.conj(u)[None, :]
+              + 4 * uau * (u[:, None] * jnp.conj(u)[None, :]))
+        e, cb, _, _, info = call(bm, m)
+        c = cb - 2 * u[:, None] * (jnp.conj(u) @ cb)[None, :]
+        alpha = a[0, 0]
+        scalar = jnp.all(jnp.where(block, a == alpha * jnp.eye(cap, dtype=a.dtype), True))
+        column = jnp.arange(b) < m
+        e = jnp.where(scalar, jnp.real(alpha), e)
+        c = jnp.where(scalar, jnp.where(inside[:, None] & column[None, :],
+                                        jnp.eye(cap, b, dtype=c.dtype), 0), c)
+        ok = scalar | ((info[0] == 0) & jnp.all(jnp.isfinite(c)) & jnp.all(jnp.isfinite(e)))
+        e = jnp.where(column, e, jnp.inf)
+        return jnp.where(ok, e, jnp.nan), c
 
     def store(self, v, hv, p, hp, start, count):
         """Update only an active row interval, with XLA-declared buffer aliases."""
@@ -236,8 +286,29 @@ class LocalSubspacePlan:
             self.constrain, p))
 
 
+#: The handlers every native local plan calls (``distributed_ortho`` is the
+#: opt-in collective one, probed by ``subspace._distribute``).
+NATIVE_LOCAL_OPS = ('eigh', 'project', 'reconstruct', 'ortho', 'store', 'gram',
+                    'subtract', 'subtract_gram')
+
+
+def native_leg():
+    """The process's device leg (``lxkit.LEGS`` entry) for the native provider.
+
+    Refuses by GATE on a process without a device leg: the native handlers are
+    device code (the host leg's provider is ``CpuSubspacePlan``).
+    """
+    from lxkit import leg_for_vendor
+    vendor = device_vendor(jax.local_devices()[0])
+    leg = leg_for_vendor(vendor)
+    if leg is None or leg.key == 'cpu':
+        raise ValueError(f'GATE subspace_native: the native active-subspace provider needs a '
+                         f'device leg (CUDA or ROCM); this process runs {vendor!r}')
+    return leg
+
+
 def plan_local_subspace(*, capacity: int, n_eig: int, max_block_size: int | None = None) -> LocalSubspacePlan:
-    """Resolve the CUDA provider once, before tracing an iterative solver.
+    """Resolve the native provider of this process's device leg once, before tracing.
 
     No CPU/distributed fallback is implied. Changing the maximum capacity or
     block size creates a new plan; changing the active dimension does not.
@@ -248,13 +319,14 @@ def plan_local_subspace(*, capacity: int, n_eig: int, max_block_size: int | None
         raise ValueError('require 1 <= n_eig <= capacity < 2**31')
     if not jax.config.x64_enabled:
         raise ValueError('local active subspace requires JAX x64')
-    if device_vendor(jax.local_devices()[0]) != 'cuda':
-        raise ValueError('local active subspace currently requires CUDA')
-    for op in ('eigh', 'project', 'reconstruct', 'ortho', 'store', 'gram'):
-        result = probe_target('lorrax_active_subspace_'+op, 'CUDA')
+    leg = native_leg()
+    for op in NATIVE_LOCAL_OPS:
+        result = probe_target('lorrax_active_subspace_'+op, leg.key)
         if not result.ok:
             raise RuntimeError(f'active subspace provider unavailable: {result}')
     if max_block_size is not None and (not isinstance(max_block_size, int) or not 1 <= max_block_size < 2**31):
         raise ValueError('max_block_size must be a positive Python integer below 2**31')
-    return LocalSubspacePlan(capacity, n_eig, active_eigh_workspace(capacity),
-                             max_block_size=max_block_size)
+    from distrib_la.local_eigh import eigh_route
+    return LocalSubspacePlan(capacity, n_eig, active_eigh_workspace(capacity, leg.key),
+                             max_block_size=max_block_size, vendor=leg.vendor,
+                             reflect=eigh_route(jnp.complex128, leg.key) == 'reflector')

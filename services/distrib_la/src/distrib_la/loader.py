@@ -169,9 +169,16 @@ _ROCM_SLATE_LU_SYMBOLS: dict = {
 _ROCM_LOCAL_EIGH_SYMBOLS: dict = {
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
 }
+#: The active-subspace family (cpp/active_subspace/, leg-neutral: rocBLAS/rocSOLVER on this
+#: leg) -- the CUDA symbols less the one-communicator CGS2 handler, which needs cuSolverMp's
+#: NCCL context (distrib_la.subspace refuses native_collectives on this leg by GATE).
+_ROCM_ACTIVE_SUBSPACE_SYMBOLS: dict = {
+    t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
+    if t.startswith("lorrax_active_subspace_") and t != "lorrax_active_subspace_distributed_ortho"}
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
                                  if t.startswith("lorrax_slate_")},
-                              **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS}
+                              **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS,
+                              **_ROCM_ACTIVE_SUBSPACE_SYMBOLS}
 
 #: Leg key -> this loader's target table and not-found build command.
 _TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,
@@ -254,6 +261,8 @@ _SLATE_C_ENTRY_POINTS = (
     "lrx_slate_init_mpi",
     "lrx_ctx_bind",
     "lrx_ctx_unbind",
+    # cpp/active_subspace/active_eigh.cc: the eigensolver workspace query.
+    "lrx_active_eigh_lwork",
 )
 
 #: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.
@@ -804,13 +813,18 @@ def dial_key() -> tuple:
                  for _, spec in sorted(_PLATFORMS.items()))
 
 
-def active_eigh_workspace(capacity: int) -> int:
-    """Query the declared local eigensolver scratch; no vendor edge escapes here."""
-    lib = get_lib("CUDA")
+def active_eigh_workspace(capacity: int, platform: str = "CUDA") -> int:
+    """Query the declared local eigensolver scratch (complex128 elements) on a device leg.
+
+    No vendor edge escapes here: the leg's library answers through its own (suffixed,
+    ``_bind_c_abi``) ``lrx_active_eigh_lwork``.  A negative answer is the solver's status
+    (ROCM: -1000 = rocBLAS/rocSOLVER not mapped, GATE rocblas-mapped).
+    """
+    lib = get_lib(platform)
     try:
         query = lib.lrx_active_eigh_lwork
     except AttributeError as exc:
-        raise LibraryUnusable("active subspace requires a rebuilt CUDA provider") from exc
+        raise LibraryUnusable(f"active subspace requires a rebuilt {platform} provider") from exc
     query.argtypes = [ctypes.c_int]
     query.restype = ctypes.c_int
     size = int(query(capacity))

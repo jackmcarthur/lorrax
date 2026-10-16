@@ -53,8 +53,8 @@ it); a vendor with no leg takes the XLA route:
 
 | route | leg | provider | how the operations run |
 |---|---|---|---|
-| `native` | CUDA | `LocalSubspacePlan` | the `lorrax_active_subspace_*` handlers: cuBLAS and cuSolverDn on the active dimensions only |
-| `xla` | ROCM | `XlaSubspacePlan` | device products on the active window (power-of-two row slices, no padded rows enter arithmetic) and `eigh_local` on the active block; no host callback |
+| `native` | CUDA, ROCM | `LocalSubspacePlan` | the `lorrax_active_subspace_*` handlers on the active dimensions only: cuBLAS and cuSolverDn (CUDA), rocBLAS and rocSOLVER (ROCM), one leg-neutral source (`common/gpu_blas.h`, `gpu_solver.h`) |
+| `xla` | reference; a vendor with no leg | `XlaSubspacePlan` | device products on the active window (power-of-two row slices, no padded rows enter arithmetic) and `eigh_local` on the active block; no host callback |
 | `host` | cpu | `CpuSubspacePlan` | NumPy BLAS/LAPACK inside `jax.pure_callback` on the active rows |
 | — | any, `vector_sharding` over more than one device | `DistributedSubspacePlan` | wraps the provider in `shard_map`: each rank works on its own vector tile and only coefficient matrices are summed across the mesh |
 
@@ -69,15 +69,25 @@ active block. The inactive diagonal is shifted to twice the block's Gershgorin
 bound, so those eigenvalues sort above every active one. Arithmetic therefore
 stays within a factor two of the active size above 64. Invalid run-time windows
 return NaN (a traced program cannot raise); the native and host routes raise.
-ROCm takes this route because the host route cost bse 517 callbacks and
-exciton_bands 303 callbacks at P=4, and its callbacks made the solver jits
-uncacheable (Frontier lane report, 2026-10-15).
+It is the reference every native row is gated against
+(`tests/test_subspace_native_gate.py`, tol 1e-12 relative to the XLA result on
+the same device). ROCm took it from 2026-10-15 (the host route cost bse 517
+callbacks at P=4 and made the solver jits uncacheable) until the native port.
+
+**The ROCM native eigensolve** reflects the active block first, as
+`local_eigh`'s ROCM complex route does: rocSOLVER `zheevd` fails (info != 0, or
+NaN vectors with info = 0) on structured complex blocks such as real-valued
+ones of n >= 96, so the handler solves `H A H` with the fixed dense
+Householder reflector restricted to the active rows and returns `H C`; a
+scalar block is answered exactly, and a failed solve is NaN in the
+eigenvalues. CUDA's cuSolverDn solve is unreflected, as before.
 
 `plan_local_subspace(*, capacity, n_eig, max_block_size=None)` is the
-one-device CUDA plan alone; it refuses on a CPU process and when any of the
-six handlers (`eigh`, `project`, `reconstruct`, `ortho`, `store`, `gram`) is
-missing, naming it. There is no CPU or XLA fallback for a CUDA process with a
-missing handler, because either would hide a cost the caller planned around.
+one-device native plan of the process's device leg alone; it refuses on a CPU
+process (GATE subspace_native) and when any of the eight handlers (`eigh`,
+`project`, `reconstruct`, `ortho`, `store`, `gram`, `subtract`,
+`subtract_gram`) is missing, naming it. There is no CPU or XLA fallback for a
+device process with a missing handler, because either would hide a cost the caller planned around.
 
 ## The operations
 
@@ -140,11 +150,11 @@ order. `ortho.backend` names the resolved implementation:
 
 | `backend` | when | mechanism |
 |---|---|---|
-| `cuda` | one GPU | local cuBLAS CGS2, block input aliased to the output |
-| `cuda_jax_collectives` | distributed GPU (default) | local Gram; an in-place subtraction fused with the next Gram; a final in-place subtraction; two JAX `psum`s of the fixed `capacity × b` coefficients |
-| `cuda_nccl` | distributed GPU, `native_collectives=True`, one GPU per process on the whole `('x','y')` mesh | one native handler updates the block in place and all-reduces only the `count × b` active coefficients per pass; a fixed-size exchange first checks that every rank holds the same interval |
-| `xla_jax_collectives` | distributed ROCm (XLA route) | device products on local tiles; two JAX `psum`s of the fixed `capacity × b` coefficients per pass |
-| `xla` | one ROCm device | both passes as device products |
+| `cuda` / `rocm` | one GPU | local cuBLAS / rocBLAS CGS2, block input aliased to the output |
+| `cuda_jax_collectives` / `rocm_jax_collectives` | distributed GPU (default) | local Gram; an in-place subtraction fused with the next Gram; a final in-place subtraction; two JAX `psum`s of the fixed `capacity × b` coefficients |
+| `cuda_nccl` | distributed CUDA GPU (the ROCM leg refuses by GATE subspace_native_collectives: the handler needs cuSOLVERMp's NCCL context), `native_collectives=True`, one GPU per process on the whole `('x','y')` mesh | one native handler updates the block in place and all-reduces only the `count × b` active coefficients per pass; a fixed-size exchange first checks that every rank holds the same interval |
+| `xla_jax_collectives` | distributed, XLA route | device products on local tiles; two JAX `psum`s of the fixed `capacity × b` coefficients per pass |
+| `xla` | one device, XLA route | both passes as device products |
 | `jax_collectives` | distributed CPU | host callbacks on local tiles, capacity-sized JAX coefficient reductions |
 | `cpu_callback` | one CPU device | both passes in one NumPy callback |
 

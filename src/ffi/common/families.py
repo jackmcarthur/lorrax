@@ -94,11 +94,16 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "control flow); the interval route's while/cond trips are launch-bound there."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",
-        _legs(("built", ""), ("xla", "distrib_la.subspace XlaSubspacePlan (SUBSPACE_ROUTE)"),
+        _legs(("built", ""), ("built", ""),
               ("host", "distrib_la.subspace pure_callback (LAPACK)")),
-        note="Provider per leg: distrib_la.subspace.SUBSPACE_ROUTE.  ROCM takes the XLA plan "
-             "(device products + eigh_local); the host route cost 1.5-2.1 s per BSE solve "
-             "and made jit_solve uncacheable."),
+        gate="tests/test_subspace_native_gate.py (native vs XlaSubspacePlan and CpuSubspacePlan "
+             "on the same device: project, eigh, reconstruct, Gram, CGS2, subtract, store, "
+             "NaN-poisoned inactive rows, one compilation per plan)", tol=1e-12,
+        note="Provider per leg: distrib_la.subspace.SUBSPACE_ROUTE.  One leg-neutral source "
+             "(common/gpu_blas.h, gpu_solver.h): cuBLAS/cuSOLVERDn on CUDA, rocBLAS/rocSOLVER "
+             "resolved from the process's mapped copies on ROCM.  distributed_ortho (one NCCL "
+             "all-reduce per CGS pass) needs cuSolverMp's communicator, so it is CUDA-only; "
+             "ROCM reduces the coefficients with JAX psum (native_collectives refuses by GATE)."),
     "cusolvermp": Family(
         ("lorrax_cusolvermp_",), "cusolvermp",
         _legs(("built", ""), ("elsewhere", "slate (distrib_la.resolve eigh/ROCM row)"),

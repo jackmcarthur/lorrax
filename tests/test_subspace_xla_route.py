@@ -1,6 +1,7 @@
 """distrib_la subspace XLA route: gated against the host LAPACK route on the same device.
 
-The XLA provider (ROCm's row of SUBSPACE_ROUTE) must reproduce the host
+The XLA provider (the reference route every native row is gated against; a vendor
+with no leg takes it) must reproduce the host
 provider's numbers, ignore poisoned (NaN) inactive storage as the native
 provider does, compile once for every runtime window, and stage no host
 callback (so a solver jit holding it stays cacheable).
@@ -36,8 +37,8 @@ def _poison(a, start, stop):
 
 
 def test_leg_rows():
-    assert SUBSPACE_ROUTE == {"cpu": "host", "CUDA": "native", "ROCM": "xla"}
-    assert subspace_route("ROCM") == "xla" and subspace_route("CUDA") == "native"
+    assert SUBSPACE_ROUTE == {"cpu": "host", "CUDA": "native", "ROCM": "native"}
+    assert subspace_route("ROCM") == "native" and subspace_route("CUDA") == "native"
     assert subspace_route("cpu") == "host" and subspace_route("TPU") == "xla"
 
 

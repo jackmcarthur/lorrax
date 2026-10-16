@@ -1480,7 +1480,10 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 # transform, modes 2/3, and the k-minor pair, modes 4/5, run-time compiled);  slate (distributed
 # eigh / potrf / trsm and their batched forms over a gpu_backend=hip SLATE);
 # rocsolver (the batched local Hermitian eigh, one rocsolver_{z,d}{heevd,syevd}_strided_batched
-# call per stack, resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked).  A family with no ROCm port is
+# call per stack, resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked);
+# active_subspace (the CUDA leg's own sources, leg-neutral through common/gpu_blas.h and
+# gpu_solver.h: rocBLAS zgemm / rocSOLVER zheevd resolved from the mapped librocblas.so.5 /
+# librocsolver.so.0, not linked; distributed_ortho is CUDA-only).  A family with no ROCm port is
 # simply not in the source list; ffi_loader's ROCM table lists only what this
 # leg exports.
 #
@@ -1525,6 +1528,8 @@ set(LORRAX_FFI_ROCM_SOURCES
     kdft/kbox_unfold_ffi.cc
     kdft/kbox_rspace_ffi.cc
     rocsolver/batched_eigh_ffi.cc
+    active_subspace/active_eigh.cc
+    active_subspace/active_ops.cc
 )
 
 # The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated

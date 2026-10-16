@@ -1,17 +1,27 @@
+// Active-subspace BLAS handlers (project, reconstruct, Gram, CGS2 orthogonalization,
+// subtraction, store).  Leg-neutral: cuBLAS on the CUDA leg, rocBLAS on the ROCM leg, both
+// through common/gpu_blas.h and common/gpu_runtime.h, whose CUDA spellings are the calls this
+// file made before.  The one-communicator CGS2 handler (distributed_orthogonalize) needs the
+// cuSolverMp context's NCCL communicator and stream, which only the CUDA leg builds, so it is
+// compiled on that leg alone (families.py: the ROCM leg reduces through JAX psum instead).
 #include "../common/ctx_registry.h"
 #include "xla/ffi/api/ffi.h"
 #include <climits>
 #include <complex>
 #include <cstdint>
-#include <cublas_v2.h>
-#include <cuda_runtime_api.h>
-#include <mutex>
-#include <nccl.h>
 #include <string>
 
+#include "../common/gpu_blas.h"
+#include "../common/gpu_runtime.h"
+#if defined(LRX_LEG_CUDA)
+#include <mutex>
+#include <nccl.h>
+
 #include "../cusolvermp/ctx.h"
+#endif
 namespace ffi = xla::ffi;
 namespace lorrax_ffi::active_subspace {
+namespace blas = lrx::gpu::blas;
 using B = ffi::BufferR2<ffi::C128>;
 using C = ffi::BufferR1<ffi::C128>;
 using I = ffi::BufferR1<ffi::S32>;
@@ -20,19 +30,29 @@ using CR = ffi::Result<C>;
 using IR = ffi::Result<I>;
 using Scratch = ffi::BufferR1<ffi::U8>;
 using ScratchResult = ffi::Result<Scratch>;
+#if defined(LRX_LEG_CUDA)
 using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
-#define CUDA(call)                                                             \
+#endif
+#define GPU(call)                                                              \
   do {                                                                         \
     auto rc = (call);                                                          \
-    if (rc != cudaSuccess)                                                     \
-      return ffi::Error::Internal(cudaGetErrorString(rc));                     \
+    if (rc != lrx::gpu::kSuccess)                                              \
+      return ffi::Error::Internal(lrx::gpu::error_string(rc));                 \
   } while (0)
 #define BLAS(call)                                                             \
   do {                                                                         \
     auto rc = (call);                                                          \
-    if (rc != CUBLAS_STATUS_SUCCESS)                                           \
-      return ffi::Error::Internal("cublas " + std::to_string(rc));             \
+    if (rc != blas::kSuccess)                                                  \
+      return ffi::Error::Internal(LRX_BLAS_API " " + std::to_string(rc));      \
   } while (0)
+// The ROCM leg resolves rocBLAS at run time (gpu_blas.h): refuse by its GATE before any
+// call.  On the CUDA leg unavailable() is a constant nullptr and this compiles away.
+#define BLAS_READY()                                                           \
+  do {                                                                         \
+    if (const char *why = blas::unavailable())                                 \
+      return ffi::Error(ffi::ErrorCode::kFailedPrecondition, why);             \
+  } while (0)
+#if defined(LRX_LEG_CUDA)
 #define NCCL(call)                                                             \
   do {                                                                         \
     auto rc = (call);                                                          \
@@ -40,48 +60,52 @@ using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
       return ffi::Error::Internal(std::string("nccl ") +                      \
                                   ncclGetErrorString(rc));                     \
   } while (0)
+#endif
 struct BlasHandle {
-  cublasHandle_t h = nullptr;
-  BlasHandle() { cublasCreate(&h); }
+  blas::Handle h = nullptr;
+  BlasHandle() { blas::create(&h); }
   ~BlasHandle() {
     if (h)
-      cublasDestroy(h);
+      blas::destroy(h);
   }
 };
-static cublasHandle_t handle() {
+static blas::Handle handle() {
   thread_local BlasHandle h;
   return h.h;
 }
-static cuDoubleComplex *ptr(B a) {
-  return reinterpret_cast<cuDoubleComplex *>(a.typed_data());
+static blas::Complex *ptr(B a) {
+  return reinterpret_cast<blas::Complex *>(a.typed_data());
 }
-static cuDoubleComplex *ptr(R a) {
-  return reinterpret_cast<cuDoubleComplex *>(a->typed_data());
+static blas::Complex *ptr(R a) {
+  return reinterpret_cast<blas::Complex *>(a->typed_data());
 }
-static cuDoubleComplex *ptr(CR a) {
-  return reinterpret_cast<cuDoubleComplex *>(a->typed_data());
+#if defined(LRX_LEG_CUDA)  // the coefficient panel of distributed_orthogonalize
+static blas::Complex *ptr(CR a) {
+  return reinterpret_cast<blas::Complex *>(a->typed_data());
 }
+#endif
 
+#if defined(LRX_LEG_CUDA)
 // A cuSolverMp context owns a private stream and pooled events.  Once armed,
 // this guard makes XLA wait for that stream even when a later library call
 // returns an error, so XLA-owned scratch cannot be recycled while native work
 // is still using it.
 class ContextStreamJoin {
 public:
-  ContextStreamJoin(cudaStream_t xla_stream, LorraxCusolverMpCtx *ctx)
+  ContextStreamJoin(lrx::gpu::Stream xla_stream, LorraxCusolverMpCtx *ctx)
       : xla_stream_(xla_stream), ctx_(ctx) {}
 
   ffi::Error start() {
-    CUDA(cudaEventRecord(ctx_->active_subspace_ev_xla_in, xla_stream_));
-    CUDA(cudaStreamWaitEvent(ctx_->stream,
+    GPU(lrx::gpu::event_record(ctx_->active_subspace_ev_xla_in, xla_stream_));
+    GPU(lrx::gpu::stream_wait_event(ctx_->stream,
                              ctx_->active_subspace_ev_xla_in, 0));
     armed_ = true;
     return ffi::Error::Success();
   }
 
   ffi::Error finish() {
-    CUDA(cudaEventRecord(ctx_->active_subspace_ev_ctx_out, ctx_->stream));
-    CUDA(cudaStreamWaitEvent(xla_stream_,
+    GPU(lrx::gpu::event_record(ctx_->active_subspace_ev_ctx_out, ctx_->stream));
+    GPU(lrx::gpu::stream_wait_event(xla_stream_,
                              ctx_->active_subspace_ev_ctx_out, 0));
     armed_ = false;
     return ffi::Error::Success();
@@ -92,28 +116,30 @@ public:
       // Error recovery is best effort: destructors cannot return an FFI
       // error, but retaining the dependency is safer than letting XLA reuse
       // result scratch while already-enqueued context work is in flight.
-      if (cudaEventRecord(ctx_->active_subspace_ev_ctx_out,
-                          ctx_->stream) == cudaSuccess)
-        (void)cudaStreamWaitEvent(xla_stream_,
+      if (lrx::gpu::event_record(ctx_->active_subspace_ev_ctx_out,
+                          ctx_->stream) == lrx::gpu::kSuccess)
+        (void)lrx::gpu::stream_wait_event(xla_stream_,
                                   ctx_->active_subspace_ev_ctx_out, 0);
     }
   }
 
 private:
-  cudaStream_t xla_stream_;
+  lrx::gpu::Stream xla_stream_;
   LorraxCusolverMpCtx *ctx_;
   bool armed_ = false;
 };
-static ffi::Error project(cudaStream_t stream, B v, B hv, B h, I active, R out,
+#endif  // LRX_LEG_CUDA
+static ffi::Error project(lrx::gpu::Stream stream, B v, B hv, B h, I active, R out,
                           ScratchResult scratch) {
+  BLAS_READY();
   if (active.dimensions()[0] != 3 || v.dimensions()[0] < 1 ||
       v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
       v.dimensions()[1] > INT_MAX)
     return ffi::Error::InvalidArgument("project descriptor/dimension overflow");
   int q[3];
-  CUDA(cudaMemcpyAsync(q, active.typed_data(), sizeof(q),
-                       cudaMemcpyDeviceToHost, stream));
-  CUDA(cudaStreamSynchronize(stream));
+  GPU(lrx::gpu::memcpy_async(q, active.typed_data(), sizeof(q),
+                       lrx::gpu::kDeviceToHost, stream));
+  GPU(lrx::gpu::stream_synchronize(stream));
   int cap = v.dimensions()[0], d = v.dimensions()[1], m = q[0], start = q[1],
       r = q[2];
   if (hv.dimensions()[0] != cap || hv.dimensions()[1] != d ||
@@ -122,34 +148,35 @@ static ffi::Error project(cudaStream_t stream, B v, B hv, B h, I active, R out,
     return ffi::Error::InvalidArgument("project buffer geometry");
   if (m > cap || m < 1 || start < 0 || r < 0 || int64_t(start) + r != m)
     return ffi::Error::InvalidArgument("project active geometry");
-  BLAS(cublasSetStream(handle(), stream));
-  BLAS(cublasSetWorkspace(handle(), scratch->typed_data(),
+  BLAS(blas::set_stream(handle(), stream));
+  BLAS(blas::set_workspace(handle(), scratch->typed_data(),
                           scratch->dimensions()[0]));
   if (out->typed_data() != h.typed_data())
     return ffi::Error::InvalidArgument(
         "active projection requires declared input/output alias");
-  const cuDoubleComplex one{1, 0}, zero{0, 0};
+  const blas::Complex one{1, 0}, zero{0, 0};
   if (r) {
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, m, r, d, &one, ptr(v),
+    BLAS(blas::zgemm(handle(), blas::kOpC, blas::kOpN, m, r, d, &one, ptr(v),
                      d, ptr(hv) + int64_t(start) * d, d, &zero,
                      ptr(out) + int64_t(start) * cap, cap));
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, r, m, d, &one,
+    BLAS(blas::zgemm(handle(), blas::kOpC, blas::kOpN, r, m, d, &one,
                      ptr(hv) + int64_t(start) * d, d, ptr(v), d, &zero,
                      ptr(out) + start, cap));
   }
   return ffi::Error::Success();
 }
-static ffi::Error reconstruct(cudaStream_t stream, B v, B hv, B c, I active,
+static ffi::Error reconstruct(lrx::gpu::Stream stream, B v, B hv, B c, I active,
                               R x, R hx, ScratchResult scratch) {
+  BLAS_READY();
   if (active.dimensions()[0] != 4 || v.dimensions()[0] < 1 ||
       v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
       v.dimensions()[1] > INT_MAX || x->dimensions()[0] > INT_MAX)
     return ffi::Error::InvalidArgument(
         "reconstruct descriptor/dimension overflow");
   int q[4];
-  CUDA(cudaMemcpyAsync(q, active.typed_data(), sizeof(q),
-                       cudaMemcpyDeviceToHost, stream));
-  CUDA(cudaStreamSynchronize(stream));
+  GPU(lrx::gpu::memcpy_async(q, active.typed_data(), sizeof(q),
+                       lrx::gpu::kDeviceToHost, stream));
+  GPU(lrx::gpu::stream_synchronize(stream));
   int cap = v.dimensions()[0], d = v.dimensions()[1], b = x->dimensions()[0],
       m = q[0], columns = q[1], start = q[3];
   if (hv.dimensions()[0] != cap || hv.dimensions()[1] != d ||
@@ -159,37 +186,38 @@ static ffi::Error reconstruct(cudaStream_t stream, B v, B hv, B c, I active,
     return ffi::Error::InvalidArgument("reconstruct buffer geometry");
   if (m < 0 || start < 0 || int64_t(start) + m > cap || columns < 0 || columns > b)
     return ffi::Error::InvalidArgument("reconstruct active geometry");
-  BLAS(cublasSetStream(handle(), stream));
-  BLAS(cublasSetWorkspace(handle(), scratch->typed_data(),
+  BLAS(blas::set_stream(handle(), stream));
+  BLAS(blas::set_workspace(handle(), scratch->typed_data(),
                           scratch->dimensions()[0]));
-  const cuDoubleComplex one{1, 0}, zero{0, 0};
+  const blas::Complex one{1, 0}, zero{0, 0};
   if (!m || !columns) {
-    CUDA(cudaMemsetAsync(ptr(x), 0, int64_t(b)*d*sizeof(cuDoubleComplex), stream));
-    CUDA(cudaMemsetAsync(ptr(hx), 0, int64_t(b)*d*sizeof(cuDoubleComplex), stream));
+    GPU(lrx::gpu::memset_async(ptr(x), 0, int64_t(b)*d*sizeof(blas::Complex), stream));
+    GPU(lrx::gpu::memset_async(ptr(hx), 0, int64_t(b)*d*sizeof(blas::Complex), stream));
     return ffi::Error::Success();
   }
   if (columns < b) {
-    CUDA(cudaMemsetAsync(ptr(x) + int64_t(columns) * d, 0,
-                         int64_t(b - columns) * d * sizeof(cuDoubleComplex),
+    GPU(lrx::gpu::memset_async(ptr(x) + int64_t(columns) * d, 0,
+                         int64_t(b - columns) * d * sizeof(blas::Complex),
                          stream));
   }
-  BLAS(cublasZgemm(handle(), CUBLAS_OP_N, CUBLAS_OP_N, d, columns, m, &one,
+  BLAS(blas::zgemm(handle(), blas::kOpN, blas::kOpN, d, columns, m, &one,
                    ptr(v) + int64_t(start)*d, d, ptr(c) + start, cap, &zero, ptr(x), d));
   if (q[2]) {
     if (columns < b)
-      CUDA(cudaMemsetAsync(ptr(hx) + int64_t(columns) * d, 0,
-                           int64_t(b - columns) * d * sizeof(cuDoubleComplex),
+      GPU(lrx::gpu::memset_async(ptr(hx) + int64_t(columns) * d, 0,
+                           int64_t(b - columns) * d * sizeof(blas::Complex),
                            stream));
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_N, CUBLAS_OP_N, d, columns, m, &one,
+    BLAS(blas::zgemm(handle(), blas::kOpN, blas::kOpN, d, columns, m, &one,
                      ptr(hv) + int64_t(start)*d, d, ptr(c) + start, cap, &zero, ptr(hx), d));
   } else {
-    CUDA(cudaMemsetAsync(ptr(hx), 0, int64_t(b) * d * sizeof(cuDoubleComplex),
+    GPU(lrx::gpu::memset_async(ptr(hx), 0, int64_t(b) * d * sizeof(blas::Complex),
                          stream));
   }
   return ffi::Error::Success();
 }
-static ffi::Error orthogonalize(cudaStream_t stream, B v, B p, I active, R out,
+static ffi::Error orthogonalize(lrx::gpu::Stream stream, B v, B p, I active, R out,
                                 R work, ScratchResult scratch) {
+  BLAS_READY();
   if (active.dimensions()[0] != 2 || v.dimensions()[0] < 1 ||
       v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
       v.dimensions()[1] > INT_MAX || p.dimensions()[0] < 1 ||
@@ -197,9 +225,9 @@ static ffi::Error orthogonalize(cudaStream_t stream, B v, B p, I active, R out,
     return ffi::Error::InvalidArgument(
         "orthogonalize descriptor/dimension overflow");
   int q[2];
-  CUDA(cudaMemcpyAsync(q, active.typed_data(), sizeof(q),
-                       cudaMemcpyDeviceToHost, stream));
-  CUDA(cudaStreamSynchronize(stream));
+  GPU(lrx::gpu::memcpy_async(q, active.typed_data(), sizeof(q),
+                       lrx::gpu::kDeviceToHost, stream));
+  GPU(lrx::gpu::stream_synchronize(stream));
   int start = q[0], m = q[1];
   int cap = v.dimensions()[0], d = v.dimensions()[1], b = p.dimensions()[0];
   if (p.dimensions()[1] != d || out->dimensions()[0] != b ||
@@ -208,33 +236,34 @@ static ffi::Error orthogonalize(cudaStream_t stream, B v, B p, I active, R out,
     return ffi::Error::InvalidArgument("orthogonalize buffer geometry");
   if (m < 0 || start < 0 || int64_t(start) + m > cap)
     return ffi::Error::InvalidArgument("ortho active geometry");
-  BLAS(cublasSetStream(handle(), stream));
-  BLAS(cublasSetWorkspace(handle(), scratch->typed_data(),
+  BLAS(blas::set_stream(handle(), stream));
+  BLAS(blas::set_workspace(handle(), scratch->typed_data(),
                           scratch->dimensions()[0]));
-  const cuDoubleComplex one{1, 0}, zero{0, 0}, minus{-1, 0};
+  const blas::Complex one{1, 0}, zero{0, 0}, minus{-1, 0};
   // The legacy wrapper returns a fresh buffer.  New callers may declare the
   // same operand/result alias and avoid this block-sized device copy.
   if (out->typed_data() != p.typed_data())
-    CUDA(cudaMemcpyAsync(out->typed_data(), p.typed_data(),
-                         int64_t(b) * d * sizeof(cuDoubleComplex),
-                         cudaMemcpyDeviceToDevice, stream));
+    GPU(lrx::gpu::memcpy_async(out->typed_data(), p.typed_data(),
+                         int64_t(b) * d * sizeof(blas::Complex),
+                         lrx::gpu::kDeviceToDevice, stream));
   if (!m) return ffi::Error::Success();
   for (int pass = 0; pass < 2; ++pass) {
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, m, b, d, &one, ptr(v) + int64_t(start)*d,
+    BLAS(blas::zgemm(handle(), blas::kOpC, blas::kOpN, m, b, d, &one, ptr(v) + int64_t(start)*d,
                      d, ptr(out), d, &zero, ptr(work), cap));
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_N, CUBLAS_OP_N, d, b, m, &minus,
+    BLAS(blas::zgemm(handle(), blas::kOpN, blas::kOpN, d, b, m, &minus,
                      ptr(v) + int64_t(start)*d, d, ptr(work), cap, &one, ptr(out), d));
   }
   return ffi::Error::Success();
 }
 
+#if defined(LRX_LEG_CUDA)
 // Two-pass classical Gram-Schmidt for a vector block distributed over every
 // process.  V and P remain process-local; only the count-by-block overlap
 // coefficients cross the all-process NCCL communicator.  A fixed-size range
 // exchange precedes the variable-size reductions so one disagreeing rank is
 // rejected by every peer before any peer can enter a different collective.
 static ffi::Error distributed_orthogonalize(
-    cudaStream_t xla_stream, B v, B p, I range, R out, CR coefficients,
+    lrx::gpu::Stream xla_stream, B v, B p, I range, R out, CR coefficients,
     IR gathered_ranges, ScratchResult scratch, int64_t ctx_key) {
     const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "cusolvermp");
   if (!ctx_handle)
@@ -281,10 +310,10 @@ static ffi::Error distributed_orthogonalize(
     return error;
   NCCL(ncclAllGather(range.typed_data(), gathered_ranges->typed_data(), 2,
                      ncclInt32, ctx->nccl_comm, ctx->stream));
-  CUDA(cudaMemcpyAsync(host_ranges.data(), gathered_ranges->typed_data(),
+  GPU(lrx::gpu::memcpy_async(host_ranges.data(), gathered_ranges->typed_data(),
                        host_ranges.size() * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost, ctx->stream));
-  CUDA(cudaStreamSynchronize(ctx->stream));
+                       lrx::gpu::kDeviceToHost, ctx->stream));
+  GPU(lrx::gpu::stream_synchronize(ctx->stream));
 
   const int64_t start = host_ranges[0], count = host_ranges[1];
   for (int rank = 1; rank < ctx->world_size; ++rank) {
@@ -299,14 +328,14 @@ static ffi::Error distributed_orthogonalize(
   if (!count)
     return streams.finish();
 
-  BLAS(cublasSetStream(handle(), ctx->stream));
-  BLAS(cublasSetWorkspace(handle(), scratch->typed_data(),
+  BLAS(blas::set_stream(handle(), ctx->stream));
+  BLAS(blas::set_workspace(handle(), scratch->typed_data(),
                           scratch->dimensions()[0]));
-  const cuDoubleComplex one{1, 0}, zero{0, 0}, minus{-1, 0};
+  const blas::Complex one{1, 0}, zero{0, 0}, minus{-1, 0};
   auto *c = ptr(coefficients);
   const size_t coefficient_count = static_cast<size_t>(count * b);
   for (int pass = 0; pass < 2; ++pass) {
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N,
+    BLAS(blas::zgemm(handle(), blas::kOpC, blas::kOpN,
                      static_cast<int>(count), static_cast<int>(b),
                      static_cast<int>(d), &one,
                      ptr(v) + start * d, static_cast<int>(d), ptr(out),
@@ -314,7 +343,7 @@ static ffi::Error distributed_orthogonalize(
                      static_cast<int>(count)));
     NCCL(ncclAllReduce(c, c, 2 * coefficient_count, ncclDouble, ncclSum,
                        ctx->nccl_comm, ctx->stream));
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+    BLAS(blas::zgemm(handle(), blas::kOpN, blas::kOpN,
                      static_cast<int>(d), static_cast<int>(b),
                      static_cast<int>(count), &minus,
                      ptr(v) + start * d, static_cast<int>(d), c,
@@ -323,6 +352,7 @@ static ffi::Error distributed_orthogonalize(
   }
   return streams.finish();
 }
+#endif  // LRX_LEG_CUDA
 
 // Apply one distributed Gram-Schmidt correction after JAX has reduced the
 // coefficient matrix.  The vectors are stored as rows by JAX, so cuBLAS sees
@@ -330,27 +360,27 @@ static ffi::Error distributed_orthogonalize(
 // column-major with leading dimension capacity.  When next_coefficients is
 // present, form the next process-local V^H P panel after updating P; the
 // caller will reduce that panel before the second subtraction.
-static ffi::Error subtract_host(cudaStream_t stream, B v, B p, B coefficients,
+static ffi::Error subtract_host(lrx::gpu::Stream stream, B v, B p, B coefficients,
                                 int cap, int d, int b, int start, int count,
-                                R out, cuDoubleComplex *next_coefficients,
+                                R out, blas::Complex *next_coefficients,
                                 ScratchResult scratch) {
   if (!count) {
     if (next_coefficients)
-      CUDA(cudaMemsetAsync(next_coefficients, 0,
-                           int64_t(cap) * b * sizeof(cuDoubleComplex), stream));
+      GPU(lrx::gpu::memset_async(next_coefficients, 0,
+                           int64_t(cap) * b * sizeof(blas::Complex), stream));
     return ffi::Error::Success();
   }
-  BLAS(cublasSetStream(handle(), stream));
-  BLAS(cublasSetWorkspace(handle(), scratch->typed_data(),
+  BLAS(blas::set_stream(handle(), stream));
+  BLAS(blas::set_workspace(handle(), scratch->typed_data(),
                           scratch->dimensions()[0]));
-  const cuDoubleComplex one{1, 0}, zero{0, 0}, minus{-1, 0};
-  BLAS(cublasZgemm(handle(), CUBLAS_OP_N, CUBLAS_OP_N, d, b, count,
+  const blas::Complex one{1, 0}, zero{0, 0}, minus{-1, 0};
+  BLAS(blas::zgemm(handle(), blas::kOpN, blas::kOpN, d, b, count,
                    &minus, ptr(v) + int64_t(start) * d, d,
                    ptr(coefficients) + start, cap, &one, ptr(out), d));
   if (next_coefficients) {
-    CUDA(cudaMemsetAsync(next_coefficients, 0,
-                         int64_t(cap) * b * sizeof(cuDoubleComplex), stream));
-    BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, count, b, d,
+    GPU(lrx::gpu::memset_async(next_coefficients, 0,
+                         int64_t(cap) * b * sizeof(blas::Complex), stream));
+    BLAS(blas::zgemm(handle(), blas::kOpC, blas::kOpN, count, b, d,
                      &one, ptr(v) + int64_t(start) * d, d, ptr(out), d,
                      &zero, next_coefficients + start, cap));
   }
@@ -381,15 +411,16 @@ static ffi::Error validate_subtract_geometry(B v, B p, B coefficients,
 // In logical row-major notation, apply
 // P -= C[start:start+count].T @ V[start:start+count].  cuBLAS sees the same
 // buffers transposed: P and V are d-by-block/active column-major matrices.
-static ffi::Error subtract(cudaStream_t stream, B v, B p, B coefficients,
+static ffi::Error subtract(lrx::gpu::Stream stream, B v, B p, B coefficients,
                            I range, R out, ScratchResult scratch) {
+  BLAS_READY();
   auto error = validate_subtract_geometry(v, p, coefficients, range, out);
   if (!error.success())
     return error;
   int q[2];
-  CUDA(cudaMemcpyAsync(q, range.typed_data(), sizeof(q),
-                       cudaMemcpyDeviceToHost, stream));
-  CUDA(cudaStreamSynchronize(stream));
+  GPU(lrx::gpu::memcpy_async(q, range.typed_data(), sizeof(q),
+                       lrx::gpu::kDeviceToHost, stream));
+  GPU(lrx::gpu::stream_synchronize(stream));
   const int64_t cap = v.dimensions()[0], d = v.dimensions()[1];
   const int64_t b = p.dimensions()[0], start = q[0], count = q[1];
   if (start < 0 || count < 0 || start + count > cap)
@@ -405,10 +436,11 @@ static ffi::Error subtract(cudaStream_t stream, B v, B p, B coefficients,
 // coefficients for the second CGS pass.  Clearing all of C is part of the
 // contract: a subsequent full-capacity JAX reduction must never communicate
 // stale entries outside the selected basis interval.
-static ffi::Error subtract_gram(cudaStream_t stream, B v, B p,
+static ffi::Error subtract_gram(lrx::gpu::Stream stream, B v, B p,
                                 B coefficients, I range, R out,
                                 R next_coefficients,
                                 ScratchResult scratch) {
+  BLAS_READY();
   auto error = validate_subtract_geometry(v, p, coefficients, range, out);
   if (!error.success())
     return error;
@@ -418,9 +450,9 @@ static ffi::Error subtract_gram(cudaStream_t stream, B v, B p,
     return ffi::Error::InvalidArgument(
         "active subspace subtract/Gram requires declared C output alias");
   int q[2];
-  CUDA(cudaMemcpyAsync(q, range.typed_data(), sizeof(q),
-                       cudaMemcpyDeviceToHost, stream));
-  CUDA(cudaStreamSynchronize(stream));
+  GPU(lrx::gpu::memcpy_async(q, range.typed_data(), sizeof(q),
+                       lrx::gpu::kDeviceToHost, stream));
+  GPU(lrx::gpu::stream_synchronize(stream));
   const int64_t cap = v.dimensions()[0], d = v.dimensions()[1];
   const int64_t b = p.dimensions()[0], start = q[0], count = q[1];
   if (start < 0 || count < 0 || start + count > cap)
@@ -432,33 +464,34 @@ static ffi::Error subtract_gram(cudaStream_t stream, B v, B p,
                        ptr(next_coefficients), scratch);
 }
 
-static ffi::Error gram(cudaStream_t stream, B v, B p, I range, R out,
+static ffi::Error gram(lrx::gpu::Stream stream, B v, B p, I range, R out,
                        ScratchResult scratch) {
+  BLAS_READY();
   if (range.dimensions()[0] != 2 || v.dimensions()[0] < 1 ||
       v.dimensions()[0] > INT_MAX || v.dimensions()[1] < 1 ||
       v.dimensions()[1] > INT_MAX || p.dimensions()[0] < 1 ||
       p.dimensions()[0] > INT_MAX)
     return ffi::Error::InvalidArgument("gram descriptor/dimension overflow");
   int q[2];
-  CUDA(cudaMemcpyAsync(q, range.typed_data(), sizeof(q), cudaMemcpyDeviceToHost, stream));
-  CUDA(cudaStreamSynchronize(stream));
+  GPU(lrx::gpu::memcpy_async(q, range.typed_data(), sizeof(q), lrx::gpu::kDeviceToHost, stream));
+  GPU(lrx::gpu::stream_synchronize(stream));
   int cap = v.dimensions()[0], d = v.dimensions()[1], b = p.dimensions()[0];
   int start = q[0], count = q[1];
   if (p.dimensions()[1] != d || out->dimensions()[0] != cap ||
       out->dimensions()[1] != b || start < 0 || count < 0 || int64_t(start)+count > cap)
     return ffi::Error::InvalidArgument("gram buffer/range geometry");
-  CUDA(cudaMemsetAsync(ptr(out), 0, int64_t(cap)*b*sizeof(cuDoubleComplex), stream));
+  GPU(lrx::gpu::memset_async(ptr(out), 0, int64_t(cap)*b*sizeof(blas::Complex), stream));
   if (!count) return ffi::Error::Success();
-  BLAS(cublasSetStream(handle(), stream));
-  BLAS(cublasSetWorkspace(handle(), scratch->typed_data(), scratch->dimensions()[0]));
-  const cuDoubleComplex one{1,0}, zero{0,0};
-  BLAS(cublasZgemm(handle(), CUBLAS_OP_C, CUBLAS_OP_N, count, b, d, &one,
+  BLAS(blas::set_stream(handle(), stream));
+  BLAS(blas::set_workspace(handle(), scratch->typed_data(), scratch->dimensions()[0]));
+  const blas::Complex one{1,0}, zero{0,0};
+  BLAS(blas::zgemm(handle(), blas::kOpC, blas::kOpN, count, b, d, &one,
                   ptr(v)+int64_t(start)*d, d, ptr(p), d, &zero, ptr(out)+start, cap));
   return ffi::Error::Success();
 }
 // XLA aliases the first two operands to the two results. Only the active
 // inserted block is copied; neither the capacity tail nor a false branch is.
-static ffi::Error store(cudaStream_t stream, B v, B hv, B p, B hp, I range,
+static ffi::Error store(lrx::gpu::Stream stream, B v, B hv, B p, B hp, I range,
                         R out, R hout) {
   if (range.dimensions()[0] != 2 || v.dimensions()[0] != hv.dimensions()[0] ||
       v.dimensions()[1] != hv.dimensions()[1] ||
@@ -471,20 +504,20 @@ static ffi::Error store(cudaStream_t stream, B v, B hv, B p, B hp, I range,
     return ffi::Error::InvalidArgument(
         "active store requires declared input/output aliases");
   int q[2];
-  CUDA(cudaMemcpyAsync(q, range.typed_data(), sizeof(q), cudaMemcpyDeviceToHost,
+  GPU(lrx::gpu::memcpy_async(q, range.typed_data(), sizeof(q), lrx::gpu::kDeviceToHost,
                        stream));
-  CUDA(cudaStreamSynchronize(stream));
+  GPU(lrx::gpu::stream_synchronize(stream));
   int64_t start = q[0], count = q[1], d = v.dimensions()[1];
   if (start < 0 || count < 0 || count > p.dimensions()[0] ||
       start + count > v.dimensions()[0])
     return ffi::Error::InvalidArgument("active store range outside capacity");
   if (count) {
-    CUDA(cudaMemcpyAsync(ptr(out) + start * d, ptr(p),
-                         count * d * sizeof(cuDoubleComplex),
-                         cudaMemcpyDeviceToDevice, stream));
-    CUDA(cudaMemcpyAsync(ptr(hout) + start * d, ptr(hp),
-                         count * d * sizeof(cuDoubleComplex),
-                         cudaMemcpyDeviceToDevice, stream));
+    GPU(lrx::gpu::memcpy_async(ptr(out) + start * d, ptr(p),
+                         count * d * sizeof(blas::Complex),
+                         lrx::gpu::kDeviceToDevice, stream));
+    GPU(lrx::gpu::memcpy_async(ptr(hout) + start * d, ptr(hp),
+                         count * d * sizeof(blas::Complex),
+                         lrx::gpu::kDeviceToDevice, stream));
   }
   return ffi::Error::Success();
 }
@@ -492,7 +525,7 @@ static ffi::Error store(cudaStream_t stream, B v, B hv, B p, B hp, I range,
 using namespace lorrax_ffi::active_subspace;
 XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceProjectFfi, project,
                               ffi::Ffi::Bind()
-                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
                                   .Arg<B>()
                                   .Arg<B>()
                                   .Arg<B>()
@@ -501,7 +534,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceProjectFfi, project,
                                   .Ret<Scratch>());
 XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceReconstructFfi, reconstruct,
                               ffi::Ffi::Bind()
-                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
                                   .Arg<B>()
                                   .Arg<B>()
                                   .Arg<B>()
@@ -511,7 +544,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceReconstructFfi, reconstruct,
                                   .Ret<Scratch>());
 XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceOrthoFfi, orthogonalize,
                               ffi::Ffi::Bind()
-                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
                                   .Arg<B>()
                                   .Arg<B>()
                                   .Arg<I>()
@@ -519,10 +552,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceOrthoFfi, orthogonalize,
                                   .Ret<B>()
                                   .Ret<Scratch>());
 
+#if defined(LRX_LEG_CUDA)
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ActiveSubspaceDistributedOrthoFfi, distributed_orthogonalize,
     ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<B>()
         .Arg<B>()
         .Arg<I>()
@@ -531,11 +565,12 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<I>()
         .Ret<Scratch>()
         .Attr<int64_t>("ctx_key"));
+#endif  // LRX_LEG_CUDA
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ActiveSubspaceSubtractFfi, subtract,
     ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<B>()
         .Arg<B>()
         .Arg<B>()
@@ -546,7 +581,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ActiveSubspaceSubtractGramFfi, subtract_gram,
     ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<B>()
         .Arg<B>()
         .Arg<B>()
@@ -557,7 +592,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceStoreFfi, store,
                               ffi::Ffi::Bind()
-                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
                                   .Arg<B>()
                                   .Arg<B>()
                                   .Arg<B>()
@@ -567,5 +602,5 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceStoreFfi, store,
                                   .Ret<B>());
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(ActiveSubspaceGramFfi, gram,
-    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
       .Arg<B>().Arg<B>().Arg<I>().Ret<B>().Ret<Scratch>());
