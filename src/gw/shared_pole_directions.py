@@ -731,7 +731,7 @@ def _round_partner_directions_many(pairs, cutoff, *, real, kernels, eigh_plan, c
                    if i // count < real else 0 for i, (values, t) in enumerate(zip(spectrum_h, largest_h)))
     per_pair = [tuple(counts[s * count + e] for s in range(slots)) for e in range(count)]
     if max(counts) == 0:
-        return [(q * 0, c) for (q, _), c in zip(pairs, per_pair)]
+        return [(_times_zero(q), c) for (q, _), c in zip(pairs, per_pair)]
     kept_directions, kept = distrib_la.retain_leading_eigenvectors(
         directions, spectrum, counts, mesh=eigh_plan.mesh,
         column_extent=column_extent, multiplet_tol=tol, real_rows=rows)
@@ -740,7 +740,7 @@ def _round_partner_directions_many(pairs, cutoff, *, real, kernels, eigh_plan, c
     out = []
     for e, (part, (q, _)) in enumerate(zip(kernels.deinterleave(count)(kept_directions), pairs)):
         if max(per_pair[e]) == 0:
-            out.append((q * 0, per_pair[e]))
+            out.append((_times_zero(q), per_pair[e]))
             continue
         widths = tuple(sizes[s * count + e] for s in range(slots))
         carrier = int(column_extent(max(widths)))
@@ -750,6 +750,12 @@ def _round_partner_directions_many(pairs, cutoff, *, real, kernels, eigh_plan, c
             part = _pad_columns(part.sharding, tuple(part.shape), int(q.shape[-1]))(part)
         out.append((part, widths))
     return out
+
+
+@jax.jit
+def _times_zero(a):
+    """``a * 0`` on device: the zero is a compiled constant, not an eager host scalar (same values)."""
+    return a * 0
 
 
 @lru_cache(maxsize=None)
@@ -782,7 +788,7 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
                    if i < real else 0 for i, (values, t) in enumerate(zip(spectrum, largest)))
     if max(counts) == 0:
-        return q * 0, counts
+        return _times_zero(q), counts
     from gw.shared_pole_local import _pad_columns
     directions, kept = distrib_la.retain_leading_eigenvectors(
         directions, spectrum, counts, mesh=eigh_plan.mesh,

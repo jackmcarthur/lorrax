@@ -83,7 +83,7 @@ def test_window_runner_branches_share_one_program(route):
     tables = {s: jax.device_put(np.full(3, v), rep) for s, v in (("cond", 1.0), ("val", 2.0))}
     by_synthesis = route == "synthesis"
     synthesis = WSynthesis(lambda load, _ref, _t: load,
-                           lambda space, _i, _b: (tables[space] if by_synthesis else tables["cond"],),
+                           lambda space, _intervals: (tables[space] if by_synthesis else tables["cond"],),
                            lambda: (), lambda _r=None: None, 0, ("glue2-toy", route))
     spatial = lambda xn, yr, xr, yn, energies, weight, e_ref, t, w, *k: xn * ((k[0] if k else w)[0] * t)
     xn = jax.device_put(np.ones((2, 4, 4), np.complex128), face)
@@ -94,7 +94,7 @@ def test_window_runner_branches_share_one_program(route):
     count, zero = jax.device_put((np.int32(1), np.float64(0.0)), rep)
 
     def window(space, **kw):
-        args = tau.window_arguments(xn, xn, None, None, zero, zero, space, None, None)
+        args = tau.window_arguments(xn, xn, None, None, zero, zero, space, None)
         return acc.integrate_window(tau.window_kernel(), args, np.ones(2), np.ones(2),
                                     n_active=2, active_count=count, capacity=2, omega_sign=1.0,
                                     prefactor=1.0, **kw)

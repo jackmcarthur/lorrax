@@ -605,15 +605,16 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     except BaseException:
         capacity.live_stages=ambient
         raise
-    replicated=NamedSharding(mesh_xy,P())
 
     def w_kernel(x,y,omega,interval,ref,time):
         return ParentW(*kernel(x,y,omega,interval,ref,time))
 
-    def window_operands(space,indices,bounds):
-        # Host intervals once per window, on the parent q rows; every tau node reuses them.
-        intervals=shared_pole_intervals(frequencies,np.asarray(indices),np.asarray(bounds))
-        return (b_x,b_y,poles,device_put_process_local(np.ascontiguousarray(intervals),replicated))
+    def window_intervals(indices,bounds):
+        # Host plan data on the parent q rows: stacked into the Σ window table (one placement per Σ call).
+        return shared_pole_intervals(frequencies,np.asarray(indices),np.asarray(bounds))
+
+    def window_operands(space,intervals):
+        return (b_x,b_y,poles,intervals)
     closed=False
 
     def close(result=None):
@@ -628,7 +629,7 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
             closed=True
     synthesis=WSynthesis(w_kernel,window_operands,lambda:(b_x,b_y,poles),
                       close,0,('w-parent',mesh_xy,tuple(left['grid']),nq,m,nc,n,nt,kcarrier,id(w_plan),
-                               route,same),tile_bytes=tile)
+                               route,same),tile_bytes=tile,window_intervals=window_intervals)
     synthesis.w_tables=tuple(w_tables)
     synthesis.route=route
     return synthesis

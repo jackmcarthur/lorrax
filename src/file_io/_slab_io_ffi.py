@@ -1273,6 +1273,12 @@ def _onto_handle_mesh(A: jax.Array, mesh: Mesh, name: str) -> jax.Array:
         f"common.collectives.gather_to_host.  doc: docs/architecture/slab_io.md#contract.")
 
 
+@functools.lru_cache(maxsize=None)
+def _commit_zeros_program(sharding, count):
+    """``zeros(count, int32)`` at ``sharding``, the commit-state initializer of a write open."""
+    return jax.jit(lambda: jnp.zeros((count,), jnp.int32), out_shardings=sharding)
+
+
 def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
     """Small int64 control buffer, explicitly replicated on ``mesh``.
 
@@ -2503,9 +2509,8 @@ class _FfiBackend(_DatasetGeometry):
             # element; every other rank participates with an empty slab.
             count = int(mesh.size)
             sharding = NamedSharding(mesh, P(tuple(mesh.axis_names)))
-            pending = jax.make_array_from_callback(
-                (count,), sharding,
-                lambda index: np.zeros((count,), dtype=np.int32)[index])
+            # Made on device (a compiled constant): no host table per open.
+            pending = _commit_zeros_program(sharding, count)()
             try:
                 self.write_slab(COMMIT_STATE, pending)
                 self._drain_pending()

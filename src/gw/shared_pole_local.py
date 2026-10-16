@@ -304,10 +304,9 @@ def pack_panels(fields, order, widths, *, mesh_xy, layout='batch', order_device=
 
     Batch layout: ``order_device`` is the same table on the devices
     (``P(BATCH)``, :func:`round_operands`), and each panel's program inverts its
-    own rows of it in place from the panel's offset, a replicated scalar placed
-    once per value (``shared_pole_directions.replicated``: the offsets are the
-    recipe carriers' sums, the same in every round), so no table crosses to the
-    devices per panel. The face layout inverts on the host.
+    own rows of it in place from the panel's offset, carried on the device from
+    panel to panel (each program returns ``offset + width``), so neither a table
+    nor an offset crosses to the devices per panel. The face layout inverts on the host.
     """
     import numpy as np
     order = np.asarray(order)
@@ -317,14 +316,16 @@ def pack_panels(fields, order, widths, *, mesh_xy, layout='batch', order_device=
     key = (mesh_xy, layout, slots, extent, shapes)
     accs = _pack_start(*key)()
     if layout == 'batch':
-        from gw.shared_pole_directions import replicated
-        put = replicated(mesh_xy)
         if order_device is None:
             order_device = _batch_put(mesh_xy, order.astype(np.int32))
+        # The panel offset is carried on the device: 0 from a compiled constant,
+        # advanced by each panel program by its (static) width, so the offsets
+        # (sum of the widths before each panel) never cross from the host.
+        offset = _pack_offset_zero(mesh_xy)()
     for s, width in enumerate(int(w) for w in widths):
         panels = tuple(panels[s] for panels in fields)
         if layout == 'batch':
-            accs = _pack_place(*key, width)(accs, panels, order_device, put(np.int32(offsets[s])))
+            accs, offset = _pack_place(*key, width)(accs, panels, order_device, offset)
             continue
         # dest[b, j]: where column j of panel s lands in slot b's pencil, F (dropped) if nowhere.
         b, f = np.nonzero((order >= offsets[s]) & (order < offsets[s] + width))
@@ -432,9 +433,10 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
     if layout == 'batch':
         def body(accs, panels, order, offset):
             dest = _panel_destinations(order, offset, width, extent)
-            return tuple(_place_rows(a, p, dest, extent) for a, p in zip(accs, panels))
+            return (tuple(_place_rows(a, p, dest, extent) for a, p in zip(accs, panels)),
+                    offset + jnp.asarray(width, offset.dtype))
         specs = ((P(BATCH),) * len(shapes), (P(BATCH),) * len(shapes), P(BATCH), P())
-        out = (P(BATCH),) * len(shapes)
+        out = ((P(BATCH),) * len(shapes), P())
     else:
         def body(accs, panels, dest):
             placed = []
@@ -453,6 +455,15 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
         out = (slab,) * len(shapes)
     return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=specs, out_specs=out, check_vma=False),
                    donate_argnums=0)
+
+
+@lru_cache(maxsize=None)
+def _pack_offset_zero(mesh_xy):
+    """A batch pack's first panel offset, made on device (a compiled constant, no transfer)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.jit(lambda: jnp.zeros((), jnp.int32), out_shardings=NamedSharding(mesh_xy, P()))
 
 
 @lru_cache(maxsize=None)

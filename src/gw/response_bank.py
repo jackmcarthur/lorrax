@@ -1715,7 +1715,7 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     mu = sample_plan["census"]["mu_ry"]
     decay_rate, amplitude = response_occupation_envelope(energy, f, u, mu)
     from .greens_function_kernel import _phase_band_interval
-    lo_band, hi_band = jax.device_get(_phase_band_interval(jnp.asarray(np.stack((f, u)))))
+    lo_band, hi_band = _phase_band_interval(np.stack((np.asarray(f), np.asarray(u))))
     # Enclose every parent's exact weight support. Fixed bounds share one
     # batched GEMM on the direct stream's band-complete ψ rows and remain safe
     # when a complex-time phase underflows.
@@ -1867,8 +1867,14 @@ def _group_stream_arguments(rules, group):
 
 
 def _group_zeros(mesh_xy, shape):
-    """The donated group carry [member, q, mu_X, nu_Y]."""
-    return jnp.zeros(shape, jnp.complex128, device=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+    """The donated group carry [member, q, mu_X, nu_Y], made on device (no fill-value transfer)."""
+    return _group_zeros_program(mesh_xy, tuple(int(n) for n in shape))()
+
+
+@lru_cache(maxsize=16)
+def _group_zeros_program(mesh_xy, shape):
+    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
 def _group_carry(mesh_xy, shape):
@@ -2231,6 +2237,18 @@ class _MemberRows:
         return _member_rows(self.carry,
                             device_put_process_local_cached(np.int64(self.first + int(i)), rep),
                             device_put_process_local_cached(np.asarray(rows), rep))
+
+
+def _parent_row(value, i, mesh_xy):
+    """``value[i:i+1]`` on device: the row index is a placed constant, not an eager slice's host start."""
+    from common.collectives import device_put_process_local_cached
+    return _parent_row_program(value, device_put_process_local_cached(
+        np.int32(i), NamedSharding(mesh_xy, P())))
+
+
+@jax.jit
+def _parent_row_program(value, i):
+    return jax.lax.dynamic_slice_in_dim(value, i, 1, axis=0)
 
 
 @jax.jit
@@ -2714,7 +2732,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 # Fe 4^3 charge), and a batch-layout line pair is never sliced.
                 if vertex is None and z[sample].real == 0 and _self_negative(int(qids[iq]),meta):
                     part = slice(iq-q0,iq-q0+1)
-                    _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
+                    _reciprocity_census(receipt,_parent_row(value,iq-q0,mesh_xy),z[sample:sample+1],
+                                        int(qids[iq]),iq,meta)
                     # Diagnostic only (nothing reads it): an extra Dyson solve per
                     # imaginary sample at every TRIM parent, so it runs under the
                     # debug-output dial, never in the production prefactor.
