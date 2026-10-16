@@ -508,9 +508,11 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         receipts["psi_vs_restart"] = _gauge_receipt(psi, psi_restart, mesh_xy)
     else:
         psi = psi_restart
-        k_frac = np.asarray(deck_wfn.kvecs(k="full_bz"))
+        # The loader's flat k axis is reshaped to (nkx, nky, nkz) by the W
+        # convolution, so its rows are the C-order grid, coarse or densified.
+        k_frac = _c_order_k(kgrid)
         if not data.get("densified", False):
-            flat_k_rows(k_frac, kgrid)                         # refuses a mis-ordered grid
+            flat_k_rows(np.asarray(deck_wfn.kvecs(k="full_bz")), kgrid)   # full, unshifted grid
         receipts["psi_source"] = "restart"
     coulomb = _coulomb_from_policy(read_coulomb_policy_from_h5(restart_file), deck_wfn,
                                    restart_file)
@@ -527,6 +529,12 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
     model["V_q0_bse"] = data["V_q0"]
     model["g0_X"] = data["g0_X"]
     return model
+
+
+def _c_order_k(kgrid) -> np.ndarray:
+    """(nk, 3) fractional k of the flat C-order grid, row i = (ix, iy, iz)/N."""
+    return np.stack(np.meshgrid(*[np.arange(int(n)) / int(n) for n in kgrid], indexing="ij"),
+                    -1).reshape(-1, 3)
 
 
 def _coulomb_from_policy(policy, wfn, restart_file) -> dict:

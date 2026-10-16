@@ -15,6 +15,8 @@ LORRAX has six core drivers in seven modules: GW preprocessing is two modules
 
 [`gw.downfold_cli`](#downfold-gwdownfold_cli) sits beside the chain: it
 compresses a finished GW restart for the two BSE drivers.
+[`tdagw.kernel_export` and `tdagw.tdgw_bridge`](#tdgw-kernel-and-bridge-tdagwkernel_export-tdagwtdgw_bridge)
+sit beside it too: they hand the BSE interaction to TDGW's real-time propagation.
 
 Every driver brings up the runtime with one module-top call,
 `runtime.initialize_communicator_stack` (mesh, communicators, startup report).
@@ -297,3 +299,19 @@ Invoke: `python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-ei
 [Band interpolation and exciton bands](how-to/htransform-and-exciton-bands.md#7-exciton-bands)
 owns the method, the exchange routes (`--vq-mode`) and their certification,
 the flags, the output format and the refusals.
+
+## TDGW kernel and bridge — `tdagw.kernel_export`, `tdagw.tdgw_bridge`
+
+Both read a GW restart bundle through the BSE loader and build the TD-aGW
+interaction $\Delta\Sigma = K\,\delta\rho$ (screened exchange plus Hartree,
+$G = 0$ excluded) on a band window. `tdagw.kernel_export` writes $K$ as a
+TDGW `kernel.h5` (Rydberg, TDGW's band order and the k order of its `WFN.h5`),
+which an unmodified TDGW run reads in place of a BerkeleyGW kernel.
+`tdagw.tdgw_bridge` runs TDGW with its self-energy update replaced by the
+matrix-free operator, so no dense kernel is formed. Both refuse a `WFN.h5`
+whose k-points are not the full bundle grid.
+
+Invoke: `python -m tdagw.kernel_export --input cohsex.in --wfn WFN.h5 --ibndmin 129 --ibndmax 132 --ivbm 130 --out kernel.h5 [--terms both|sex|hartree] [--receipt r.json]`
+and `python -m tdagw.tdgw_bridge tdgw.toml --input cohsex.in [--terms both|sex|hartree] [--receipt r.json]`.
+[The TD-aGW interaction model](theory/td_agw.md) owns the equations, the
+units, the kernel-file convention and the cost.
