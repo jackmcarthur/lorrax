@@ -163,6 +163,26 @@ static std::string h5_object_name(hid_t id)
 // an interaction with CUDA's stream-ordered allocator).  Using a
 // single ctx-owned event reused across writes avoids the per-call
 // destroy entirely; the event is destroyed once in close_ctx.
+// Index of the first NaN/Inf scalar of width 4 or 8 in ``bytes``, or
+// SIZE_MAX.  Exponent-all-ones test on the bit pattern (memcpy: no aliasing).
+static size_t first_nonfinite(const void* p, size_t bytes, int width) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    if (width == 8) {
+        const uint64_t mask = 0x7ff0000000000000ULL;
+        for (size_t i = 0, n = bytes / 8; i < n; ++i) {
+            uint64_t u; std::memcpy(&u, b + 8 * i, 8);
+            if ((u & mask) == mask) return i;
+        }
+    } else if (width == 4) {
+        const uint32_t mask = 0x7f800000u;
+        for (size_t i = 0, n = bytes / 4; i < n; ++i) {
+            uint32_t u; std::memcpy(&u, b + 4 * i, 4);
+            if ((u & mask) == mask) return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
 static void async_worker(
     PhdfCtx* ctx,
     hid_t ds_id,
@@ -176,6 +196,7 @@ static void async_worker(
     bool wait_for_d2h,
     size_t bytes,                        // per-rank payload, for the timing line
     bool collective,                     // two-phase collective vs independent
+    int finite_width,                    // 0, or 4/8: refuse a NaN/Inf scalar
     ffi::Promise promise)
 {
     // Diagnostic timing, symmetric with read_ffi.cc's two do_time sites.
@@ -353,6 +374,15 @@ static void async_worker(
 
     auto t_select = now();
 
+    // require_finite: the bytes are this rank's whole block, already on the
+    // host (after the D2H wait above).  A rank with a NaN/Inf writes nothing
+    // but stays in the collective; its Promise fails after the rendezvous.
+    const size_t bad_at = finite_width ? first_nonfinite(src_buf, bytes, finite_width)
+                                       : SIZE_MAX;
+    if (bad_at != SIZE_MAX) {
+        H5Sselect_none(filespace);
+        H5Sselect_none(memspace);
+    }
     hid_t dxpl = collective ? ctx->dxpl_coll : ctx->dxpl_indep;
     herr_t st = H5Dwrite(ds_id, native_type, memspace, filespace, dxpl,
                          src_buf);
@@ -376,6 +406,17 @@ static void async_worker(
         fail_task(ffi::ErrorCode::kInternal,
                   "phdf5 async write: H5Dwrite failed ds=" +
                   h5_object_name(ds_id));
+        return;
+    }
+    if (bad_at != SIZE_MAX) {
+        std::ostringstream os;
+        os << "GATE slab_io_write_finite: got: a non-finite value at scalar "
+           << bad_at << " of rank " << ctx->rank << "'s block of "
+           << h5_object_name(ds_id) << "; want: every value finite "
+           << "(write_slab require_finite=True); this rank wrote nothing and "
+           << "every rank raises at the next read or close, so the write is "
+           << "never published";
+        fail_task(ffi::ErrorCode::kInvalidArgument, os.str());
         return;
     }
 
@@ -424,42 +465,49 @@ static ffi::Future WriteDispatchImpl(
     bool independent,
     LRX_STREAM_PARAM
     ffi::AnyBuffer A,
-    ffi::Buffer<ffi::DataType::S64> handle_buf,   // shape (2,) {ctx_handle, ds_id}
-    ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
-    ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
-    // The handle pair is replicated across the mesh (the shard_map passes it
-    // with ``P()``), so it keeps the every-rank-or-none property the refusals
-    // below depend on.
-    if (handle_buf.dimensions().size() != 1 ||
-        handle_buf.dimensions()[0] != 2) {
+    auto refuse = [](ffi::ErrorCode code, const std::string& msg) {
         ffi::Promise p;
         ffi::Future f(p);
-        p.SetError(ffi::Error(
-            ffi::ErrorCode::kInvalidArgument,
-            "phdf5 write: handle_buf must have shape (2,) == "
-            "{ctx_handle, ds_id}"));
+        p.SetError(ffi::Error(code, msg));
         return f;
-    }
-    int64_t handle_host[2] = {0, 0};
+    };
+    // Control by POSTED ADDRESS (ctx.h, handler ABI 7): SlabIO posted
+    // {ctx, ds_id, offset[N], valid_shape[N]} under this operand's address.
+    // That retires the D2H copy-in and its xla_stream sync, and with them the
+    // B1 race class (an unordered copy of a not-yet-written offset buffer):
+    // the values are host memory before the call is dispatched.
+    const size_t n_ctl = A.dimensions().size();
+    std::vector<int64_t> control;
     {
-        // No ctx yet, so there is nothing to announce through.
-        std::string herr;
-        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
-                                handle_buf.untyped_data(),
-                                2 * sizeof(int64_t), &herr)) {
-            ffi::Promise p;
-            ffi::Future f(p);
-            p.SetError(ffi::Error(
-                ffi::ErrorCode::kInternal,
-                "phdf5 write: copy(handle) failed: " + herr));
-            return f;
+        std::string perr;
+        if (!take_control(reinterpret_cast<uint64_t>(A.untyped_data()),
+                          independent ? kCtlWriteIndependent : kCtlWrite,
+                          &control, &perr)) {
+            return refuse(ffi::ErrorCode::kInvalidArgument, "phdf5 write: " + perr);
         }
     }
+    if (control.size() != 2 + 2 * n_ctl && control.size() != 3 + 2 * n_ctl) {
+        std::ostringstream os;
+        os << "phdf5 write: posted control has " << control.size()
+           << " values; want 2 + 2 ndim = " << 2 + 2 * n_ctl
+           << " (+1 flags word)";
+        return refuse(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    const int64_t write_flags =
+        control.size() == 3 + 2 * n_ctl ? control.back() : 0;
+    if (write_flags & ~kWriteFlagRequireFinite) {
+        std::ostringstream os;
+        os << "phdf5 write: unknown flags 0x" << std::hex << write_flags
+           << " in the posted control (want kWriteFlagRequireFinite only)";
+        return refuse(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    const bool require_finite = (write_flags & kWriteFlagRequireFinite) != 0;
+    const int64_t handle_host[2] = {control[0], control[1]};
     auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
     const hid_t ds_id = (hid_t)handle_host[1];
 
@@ -503,15 +551,9 @@ static ffi::Future WriteDispatchImpl(
                     "phdf5 write: operand is 0-D; there is no hyperslab to "
                     "write");
     }
-    if (offset_buf.dimensions().size() != 1 ||
-        (size_t)offset_buf.dimensions()[0] != N ||
-        valid_shape_buf.dimensions().size() != 1 ||
-        (size_t)valid_shape_buf.dimensions()[0] != N ||
-        axis_count_per_dim.size() != N) {
+    if (axis_count_per_dim.size() != N) {
         std::ostringstream os;
         os << "phdf5 write: rank mismatch  A.ndim=" << N
-           << " offset_buf.ndim=" << offset_buf.dimensions().size()
-           << " valid_shape_buf.ndim=" << valid_shape_buf.dimensions().size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
         return fail(ffi::ErrorCode::kInvalidArgument, os.str());
     }
@@ -524,28 +566,9 @@ static ffi::Future WriteDispatchImpl(
         }
     }
 
-    // Seam 2 — fetch the small index buffers (N × 8 bytes = 24-40 bytes
-    // typically).  CUDA: an ``xla_stream``-ordered cudaMemcpyAsync D2H plus a
-    // stream synchronize, microseconds (the unordered form raced the operand
-    // producer — SLAB_IO_ROOT_CAUSE_AUDIT.md B1; on THIS path a raced offset
-    // lands collective writes at wrong file offsets, which is route (ii) to
-    // the segfault-at-close).  Host: the XLA buffer is already host-resident,
-    // so a plain memcpy.
-    std::string idx_err;
-    std::vector<int64_t> offset_host(N);
-    if (!copy_index_to_host(LRX_STREAM_ARG offset_host.data(),
-                            offset_buf.untyped_data(),
-                            N * sizeof(int64_t), &idx_err)) {
-        return fail(ffi::ErrorCode::kInternal,
-                    "phdf5 write: index copy(offset) failed: " + idx_err);
-    }
-    std::vector<int64_t> valid_shape_host(N);
-    if (!copy_index_to_host(LRX_STREAM_ARG valid_shape_host.data(),
-                            valid_shape_buf.untyped_data(),
-                            N * sizeof(int64_t), &idx_err)) {
-        return fail(ffi::ErrorCode::kInternal,
-                    "phdf5 write: index copy(valid_shape) failed: " + idx_err);
-    }
+    std::vector<int64_t> offset_host(control.begin() + 2, control.begin() + 2 + N);
+    std::vector<int64_t> valid_shape_host(control.begin() + 2 + N,
+                                          control.begin() + 2 + 2 * N);
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
 
@@ -672,6 +695,13 @@ static ffi::Future WriteDispatchImpl(
         }
     }
 
+    // Scalar width the finite check reads (0: integers are always finite).
+    int finite_width = 0;
+    if (require_finite) {
+        if (dtype == ffi::DataType::F32 || dtype == ffi::DataType::C64) finite_width = 4;
+        if (dtype == ffi::DataType::F64 || dtype == ffi::DataType::C128) finite_width = 8;
+    }
+
     hid_t dset = (hid_t)ds_id;
     if (dset < 0 || H5Iis_valid(dset) <= 0) {
         return fail(ffi::ErrorCode::kInvalidArgument,
@@ -730,12 +760,26 @@ static ffi::Future WriteDispatchImpl(
     // 2026-04-18, likely an interaction with the cuda_async
     // stream-ordered allocator).  Using a single ctx-owned event
     // reused across writes avoids the per-call destroy entirely; the
-    // event is destroyed once in close_ctx.  Correctness: Python's
-    // ``A.block_until_ready()`` on the main thread before enqueue
-    // ensures A's device storage is finalised before we read it; the
+    // event is destroyed once in close_ctx.  Correctness: the order_event fence
+    // below puts the D2H behind A's producer on xla_stream (device side); the
     // Python worker serialises writes so by the time the next
     // handler runs, the previous H5Dwrite has already consumed
     // pinned_buf.
+    // ABI 7: the D2H must follow A's producer on xla_stream.  Until ABI 6
+    // the control copy-in's xla_stream sync ordered it (on the host); now a
+    // device-side fence does (ctx.h order_event), so the handler still
+    // returns without a host wait.
+    {
+        lrx::gpu::Error oe = lrx::gpu::event_record(ctx->order_event, xla_stream);
+        if (oe == lrx::gpu::kSuccess)
+            oe = lrx::gpu::stream_wait_event(ctx->stream, ctx->order_event, 0);
+        if (oe != lrx::gpu::kSuccess) {
+            std::ostringstream os;
+            os << "phdf5 write: " LRX_GPU_API "order fence failed: "
+               << lrx::gpu::error_string(oe);
+            return fail(ffi::ErrorCode::kInternal, os.str());
+        }
+    }
     lrx::gpu::Error ce = lrx::gpu::memcpy_async(src_buf, A.untyped_data(), bytes,
                                      lrx::gpu::kDeviceToHost, ctx->stream);
     if (ce != lrx::gpu::kSuccess) {
@@ -766,14 +810,14 @@ static ffi::Future WriteDispatchImpl(
                  mem_dims = std::move(mem_dims),
                  offset_base = std::move(offset_host),
                  valid_shape = std::move(valid_shape_host),
-                 src_buf, wait_for_d2h, bytes, collective,
+                 src_buf, wait_for_d2h, bytes, collective, finite_width,
                  promise = std::move(promise)]() mutable
     {
         async_worker(ctx, dset, native_type,
                      std::move(offset), std::move(file_count),
                      std::move(mem_dims),
                      std::move(offset_base), std::move(valid_shape),
-                     src_buf, wait_for_d2h, bytes, collective,
+                     src_buf, wait_for_d2h, bytes, collective, finite_width,
                      std::move(promise));
     };
 
@@ -793,32 +837,24 @@ static ffi::Future WriteDispatchImpl(
 static ffi::Future WriteDispatch(
     LRX_STREAM_PARAM
     ffi::AnyBuffer A,
-    ffi::Buffer<ffi::DataType::S64> handle_buf,
-    ffi::Buffer<ffi::DataType::S64> offset_buf,
-    ffi::Buffer<ffi::DataType::S64> valid_shape_buf,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
-    return WriteDispatchImpl(false, LRX_STREAM_ARG A, handle_buf, offset_buf,
-                             valid_shape_buf, token_out, mesh_shape,
+    return WriteDispatchImpl(false, LRX_STREAM_ARG A, token_out, mesh_shape,
                              axis_count_per_dim, axis_flat);
 }
 
 static ffi::Future WriteIndependentDispatch(
     LRX_STREAM_PARAM
     ffi::AnyBuffer A,
-    ffi::Buffer<ffi::DataType::S64> handle_buf,
-    ffi::Buffer<ffi::DataType::S64> offset_buf,
-    ffi::Buffer<ffi::DataType::S64> valid_shape_buf,
     ffi::Result<ffi::Buffer<ffi::DataType::S32>> token_out,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
-    return WriteDispatchImpl(true, LRX_STREAM_ARG A, handle_buf, offset_buf,
-                             valid_shape_buf, token_out, mesh_shape,
+    return WriteDispatchImpl(true, LRX_STREAM_ARG A, token_out, mesh_shape,
                              axis_count_per_dim, axis_flat);
 }
 
@@ -834,10 +870,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfWrite), lorrax_ffi::phdf5::WriteDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::AnyBuffer>()
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // handle {ctx, ds}
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_base
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // valid_shape
+        .Arg<xla::ffi::AnyBuffer>()   // the slab; its address keys the posted control (ABI 7)
         .Ret<xla::ffi::Buffer<xla::ffi::DataType::S32>>()
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
@@ -850,10 +883,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     lorrax_ffi::phdf5::WriteIndependentDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::AnyBuffer>()
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // handle {ctx, ds}
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_base
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // valid_shape
+        .Arg<xla::ffi::AnyBuffer>()   // the slab; its address keys the posted control (ABI 7)
         .Ret<xla::ffi::Buffer<xla::ffi::DataType::S32>>()
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")

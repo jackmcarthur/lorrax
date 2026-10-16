@@ -11,6 +11,8 @@
 //   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
 //   LORRAX_PHDF5_COLL_META        (0)   collective metadata ops
 //   LORRAX_PHDF5_ALIGN_MB         (4)   H5Pset_alignment threshold/length
+//   LORRAX_PHDF5_READ_STAGING_RETAIN_MB (256) process-wide budget for read
+//                                       staging kept above 32 MiB per file
 //   LORRAX_PHDF5_STRIPE_COUNT  (policy) Lustre striping_factor hint; unset =
 //                                       clamp(world_size, 4, 128)
 //   LORRAX_PHDF5_STRIPE_SIZE_FS(policy) Lustre striping_unit hint (lfs form;
@@ -31,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -269,6 +272,30 @@ bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes) {
                           need_bytes, "ensure_pinned");
 }
 
+// Synchronous-read staging above this is retained only under the process
+// budget below (settle_read_buf); within it, per file, always.
+static constexpr size_t kMaxRetainedReadStaging = size_t{32} << 20;
+static std::atomic<size_t> g_read_reserved{0};
+
+static size_t read_retain_budget() {
+    static const size_t budget = [] {
+        // Clamp before the shift, as ALIGN_MB: <= 0 retains nothing above
+        // the per-file bound (the old behaviour); 64 GiB caps a typo.
+        long mb = env_long("LORRAX_PHDF5_READ_STAGING_RETAIN_MB", 256);
+        if (mb < 0) mb = 0;
+        if (mb > (64L << 10)) mb = 64L << 10;
+        return static_cast<size_t>(mb) << 20;
+    }();
+    return budget;
+}
+
+static void release_read_reservation(PhdfCtx* ctx) {
+    if (ctx->read_reserved) {
+        g_read_reserved.fetch_sub(ctx->read_reserved, std::memory_order_acq_rel);
+        ctx->read_reserved = 0;
+    }
+}
+
 // SYNCHRONOUS-READER staging (ctx.h OWNERSHIP).
 bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes) {
 #if LRX_LEG_DEVICE
@@ -278,6 +305,9 @@ bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes) {
     if (ctx->read_buf &&
         lrx::gpu::event_synchronize(ctx->h2d_event) != lrx::gpu::kSuccess) return false;
 #endif
+    // Growth frees the buffer the reservation was taken for.
+    if (ctx->read_capacity.load(std::memory_order_acquire) < need_bytes)
+        release_read_reservation(ctx);
     return ensure_staging(&ctx->read_buf, &ctx->read_capacity,
                           need_bytes, "ensure_read_buf");
 }
@@ -287,6 +317,7 @@ static std::atomic<size_t> retired_read_bytes{0};
 void retire_read_buf(PhdfCtx* ctx) {
     void* retired = ctx->read_buf;
     if (!retired) return;
+    release_read_reservation(ctx);
     const size_t capacity =
         ctx->read_capacity.load(std::memory_order_acquire);
     ctx->read_buf = nullptr;
@@ -315,6 +346,22 @@ void retire_read_buf(PhdfCtx* ctx) {
     }
     ctx->queue_cv.notify_one();
 #endif
+}
+
+void settle_read_buf(PhdfCtx* ctx) {
+    const size_t cap = ctx->read_capacity.load(std::memory_order_acquire);
+    if (cap <= kMaxRetainedReadStaging || ctx->read_reserved == cap) return;
+    release_read_reservation(ctx);
+    const size_t budget = read_retain_budget();
+    size_t cur = g_read_reserved.load(std::memory_order_acquire);
+    while (cur + cap <= budget) {
+        if (g_read_reserved.compare_exchange_weak(cur, cur + cap,
+                                                  std::memory_order_acq_rel)) {
+            ctx->read_reserved = cap;
+            return;
+        }
+    }
+    retire_read_buf(ctx);
 }
 
 // -----------------------------------------------------------------
@@ -420,6 +467,7 @@ static void abandon_partial_ctx(PhdfCtx* ctx, MPI_Info* info) noexcept {
 #if LRX_LEG_DEVICE
     if (ctx->d2h_event) (void)lrx::gpu::event_destroy(ctx->d2h_event);
     if (ctx->h2d_event) (void)lrx::gpu::event_destroy(ctx->h2d_event);
+    if (ctx->order_event) (void)lrx::gpu::event_destroy(ctx->order_event);
     if (ctx->stream)    (void)lrx::gpu::stream_destroy(ctx->stream);
 #endif
     delete ctx;
@@ -815,6 +863,8 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
                   LRX_GPU_API "EventCreate(phdf5 d2h_event)");
     throw_if_cuda(lrx::gpu::event_create_with_flags(&ctx->h2d_event, lrx::gpu::kEventDisableTiming),
                   LRX_GPU_API "EventCreate(phdf5 h2d_event)");
+    throw_if_cuda(lrx::gpu::event_create_with_flags(&ctx->order_event, lrx::gpu::kEventDisableTiming),
+                  LRX_GPU_API "EventCreate(phdf5 order_event)");
 #endif
 
     // --- start dedicated writer thread (FIFO task queue) ---
@@ -1310,12 +1360,14 @@ void close_ctx(PhdfCtx* ctx, int64_t* timing_out) {
     staging_free(ctx->pinned_buf);
     ctx->pinned_buf = nullptr;
     ctx->pinned_capacity.store(0, std::memory_order_release);
+    release_read_reservation(ctx);
     staging_free(ctx->read_buf);
     ctx->read_buf = nullptr;
     ctx->read_capacity.store(0, std::memory_order_release);
 #if LRX_LEG_DEVICE
     if (ctx->d2h_event) (void)lrx::gpu::event_destroy(ctx->d2h_event);
     if (ctx->h2d_event) (void)lrx::gpu::event_destroy(ctx->h2d_event);
+    if (ctx->order_event) (void)lrx::gpu::event_destroy(ctx->order_event);
     if (ctx->stream)    (void)lrx::gpu::stream_destroy(ctx->stream);
 #endif
 
@@ -1329,6 +1381,50 @@ void close_ctx(PhdfCtx* ctx, int64_t* timing_out) {
     // registered inside ensure_mpi_initialized in HDF5/MPI runtimes).
 
     delete ctx;
+}
+
+// ─── Posted control registry (ctx.h POSTED CONTROL) ────────────────────
+namespace {
+std::mutex g_control_mu;
+std::map<std::pair<uint64_t, int64_t>, std::vector<int64_t>> g_controls;
+}  // namespace
+
+int post_control(uint64_t addr, int64_t kind, const int64_t* v, int64_t n) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    auto key = std::make_pair(addr, kind);
+    if (g_controls.count(key)) return 1;
+    g_controls.emplace(key, std::vector<int64_t>(v, v + (n > 0 ? n : 0)));
+    return 0;
+}
+
+bool retract_control(uint64_t addr, int64_t kind) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    return g_controls.erase(std::make_pair(addr, kind)) > 0;
+}
+
+bool take_control(uint64_t addr, int64_t kind, std::vector<int64_t>* out,
+                  std::string* err) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    auto it = g_controls.find(std::make_pair(addr, kind));
+    if (it == g_controls.end()) {
+        std::ostringstream os;
+        os << "GATE phdf5_posted_control: got: no control posted for kind " << kind
+           << " at buffer 0x" << std::hex << addr << std::dec << " (" << g_controls.size()
+           << " pending); want: SlabIO's post for this call's own buffer; why: the "
+           << "handler takes its descriptors by the address of the buffer it was "
+           << "handed, so a copy XLA inserted (alias not honoured) or a call SlabIO "
+           << "did not post refuses here instead of reading another call's offsets";
+        *err = os.str();
+        return false;
+    }
+    *out = std::move(it->second);
+    g_controls.erase(it);
+    return true;
+}
+
+size_t pending_controls() {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    return g_controls.size();
 }
 
 }  // namespace lorrax_ffi::phdf5

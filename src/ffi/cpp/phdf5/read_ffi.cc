@@ -86,6 +86,11 @@ static inline ffi::Error stage_host_to_output(
     lrx::gpu::Stream xla_stream, PhdfCtx* ctx, const void* src,
     void* d_dst, size_t bytes)
 {
+    // ABI 7: the destination may be a donated buffer whose fill is still
+    // queued on xla_stream; the copy on ctx->stream must follow it (ctx.h
+    // order_event).  Device-side wait, no host sync.
+    LORRAX_GPU_CHECK(lrx::gpu::event_record(ctx->order_event, xla_stream));
+    LORRAX_GPU_CHECK(lrx::gpu::stream_wait_event(ctx->stream, ctx->order_event, 0));
     LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(d_dst, src, bytes,
                                       lrx::gpu::kHostToDevice, ctx->stream));
     LORRAX_GPU_CHECK(lrx::gpu::event_record(ctx->h2d_event, ctx->stream));
@@ -94,20 +99,28 @@ static inline ffi::Error stage_host_to_output(
 }
 #endif
 
-// Keep small pinned buffers for repeated reads, but never retain a large
-// slab in each of several open file contexts. The threshold bounds idle
-// read staging to 32 MiB per file; it does not cap the live H5Dread slab.
-// This is the synchronous-read buffer only. The writer thread owns
-// pinned_buf, including the async k-chunk union reader.
-static constexpr size_t kMaxRetainedReadStaging = size_t{32} << 20;
+// Idle read staging is bounded per file (32 MiB) and, above that, by one
+// process-wide budget (context.cc settle_read_buf), so a large slab is not
+// retained in each of several open file contexts.  This is the
+// synchronous-read buffer only. The writer thread owns pinned_buf,
+// including the async k-chunk union reader.
+
+// True when H5Dread overwrites every element of the staging block, so the
+// zero fill (the padding contract: ranks outside valid_shape read zeros) has
+// nothing to do.  An empty (H5S_NONE) or clipped selection is partial.
+static inline bool selection_fills(hid_t memspace, const std::vector<hsize_t>& mem_dims) {
+    hsize_t n = 1;
+    for (hsize_t d : mem_dims) n *= d;
+    const hssize_t got = H5Sget_select_npoints(memspace);
+    return got >= 0 && static_cast<hsize_t>(got) == n;
+}
 
 static inline ffi::Error finish_read(
     LRX_STREAM_PARAM PhdfCtx* ctx, const void* src, void* d_dst, size_t bytes)
 {
     FFI_RETURN_IF_ERROR(
         stage_host_to_output(LRX_STREAM_ARG ctx, src, d_dst, bytes));
-    if (ctx->read_capacity.load(std::memory_order_acquire) >
-        kMaxRetainedReadStaging) retire_read_buf(ctx);
+    settle_read_buf(ctx);
     return ffi::Error::Success();
 }
 
@@ -374,7 +387,6 @@ static ffi::Error ReadImpl(
         return fail_read(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     void* stage = ctx->read_buf;
-    std::memset(stage, 0, bytes);
 
     hid_t native_type = dt::h5_native_type<T>();
     hid_t filespace = H5I_INVALID_HID, memspace = H5I_INVALID_HID;
@@ -387,6 +399,7 @@ static ffi::Error ReadImpl(
             return fail_read(code, sel_err);
         }
     }
+    if (!selection_fills(memspace, mem_dims)) std::memset(stage, 0, bytes);
 
     hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
     const auto native_t0 = ctx->timing_enabled
@@ -424,90 +437,65 @@ static ffi::Error ReadImpl(
 // outside it get zeros, and edge ranks read clipped hyperslabs.
 static ffi::Error ReadDispatch(
     LRX_STREAM_PARAM
-    ffi::Buffer<ffi::DataType::S64> handle_buf,   // shape (2,) {ctx_handle, ds_id}
-    ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
-    ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
+    ffi::AnyBuffer dst,                    // the caller's output, aliased to A_out
     ffi::Result<ffi::AnyBuffer> A_out,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
-    // ``ctx_handle`` and ``ds_id`` arrive as a RUNTIME buffer, not as FFI
-    // Attrs.  Attrs are baked into the HLO, and ctx_handle is a heap
-    // address, so as an Attr it made every module unique PER PROCESS: the
-    // persistent compile cache could never hit one and rewrote it on every
-    // run.  MEASURED 2026-08-07 with a byte-identical workload and a
-    // private cache dir: jit__per_rank entries went 4 -> 8 -> 12 over three
-    // runs while a plain jit control stayed at 1, and the shared np1 cache
-    // held 6813 such corpses out of 14443 entries.  ds_id moves with it —
-    // as an Attr it also forked a module per (file, dataset) pair, so the
-    // module count scaled with the deck instead of with the geometry.
-    // This is the same argument that already made ``offset_base`` a Buffer;
-    // see the note above WriteDispatch in write_ffi.cc.
-    //
-    // Both values are replicated across the mesh (the shard_map passes them
-    // with ``P()``), so every refusal below is still computed from inputs
-    // that are identical on every rank.
-    if (handle_buf.dimensions().size() != 1 ||
-        handle_buf.dimensions()[0] != 2) {
-        return ffi::Error(
-            ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read: handle_buf must have shape (2,) == "
-            "{ctx_handle, ds_id}");
+    // Control by POSTED ADDRESS (ctx.h, handler ABI 7): SlabIO allocated
+    // ``dst``, aliased it to ``A_out`` and posted {ctx, ds_id, offset[N],
+    // valid_shape[N]} under its address.  No control operand, so no device
+    // array, no D2H copy-in and no xla_stream sync; the ctx address and ds_id
+    // still never enter the HLO (the reason ABI 2 made them runtime values:
+    // as Attrs they forked a module per process and per dataset).
+    const auto dims = A_out->dimensions();
+    const size_t N = dims.size();
+    if (N == 0) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "phdf5 read: output is 0-D; there is no hyperslab to read");
     }
-    int64_t handle_host[2] = {0, 0};
+    if (dst.untyped_data() != A_out->untyped_data()) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "GATE phdf5_posted_control: phdf5 read: output is not the aliased "
+            "destination SlabIO posted for (input_output_aliases not honoured)");
+    }
+    std::vector<int64_t> control;
     {
-        // No ctx yet, so there is nothing to announce through: return
-        // plainly.  A failure here is a broken D2H copy, not a collective
-        // divergence — it hits every rank identically.
-        std::string herr;
-        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
-                                handle_buf.untyped_data(),
-                                2 * sizeof(int64_t), &herr)) {
-            return ffi::Error(ffi::ErrorCode::kInternal,
-                              "phdf5 read: copy(handle) failed: " + herr);
+        std::string perr;
+        if (!take_control(reinterpret_cast<uint64_t>(A_out->untyped_data()),
+                          kCtlRead, &control, &perr)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, "phdf5 read: " + perr);
         }
     }
-    auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
-    const hid_t ds_id = (hid_t)handle_host[1];
-
-    // Every refusal in this dispatch is computed from replicated inputs (FFI
-    // Attrs, the replicated handle buffer, the equal-block output shape, a
-    // collectively-opened ds_id), so it fires on every rank or none — the
-    // only kind a collective tolerates.
+    if (control.size() != 2 + 2 * N) {
+        std::ostringstream os;
+        os << "phdf5 read: posted control has " << control.size()
+           << " values; want 2 + 2 ndim = " << 2 + 2 * N;
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(control[0]);
+    const hid_t ds_id = (hid_t)control[1];
+    if (!ctx) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "phdf5 read: ctx_handle is null");
+    }
+    {
+        std::string live_err;
+        if (!check_live_ctx(ctx, control[0], "phdf5 read", &live_err)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err);
+        }
+    }
+    // Every refusal below is computed from replicated values (Attrs, the
+    // posted control -- the same on every rank by construction -- and the
+    // equal-block output shape), so it fires on every rank or none.
     auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
         announce_error(ctx, msg);
         return ffi::Error(code, msg);
     };
-
-    if (!ctx) {
-        return fail(ffi::ErrorCode::kInvalidArgument,
-                    "phdf5 read: ctx_handle is null");
-    }
-    // Audit B2: validated against the live-ctx registry BEFORE ``fail``
-    // (which reads ctx->rank) or anything else touches this pointer.
-    {
-        std::string live_err;
-        if (!check_live_ctx(ctx, handle_host[0], "phdf5 read", &live_err)) {
-            return ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err);
-        }
-    }
-
-    const auto dims = A_out->dimensions();
-    const size_t N = dims.size();
-    if (N == 0) {
-        return fail(ffi::ErrorCode::kInvalidArgument,
-                    "phdf5 read: output is 0-D; there is no hyperslab to read");
-    }
-    if (offset_buf.dimensions().size() != 1 ||
-        (size_t)offset_buf.dimensions()[0] != N ||
-        valid_shape_buf.dimensions().size() != 1 ||
-        (size_t)valid_shape_buf.dimensions()[0] != N ||
-        axis_count_per_dim.size() != N) {
+    if (axis_count_per_dim.size() != N) {
         std::ostringstream os;
         os << "phdf5 read: rank mismatch  A.ndim=" << N
-           << " offset_buf.ndim=" << offset_buf.dimensions().size()
-           << " valid_shape_buf.ndim=" << valid_shape_buf.dimensions().size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
         return fail(ffi::ErrorCode::kInvalidArgument, os.str());
     }
@@ -519,24 +507,8 @@ static ffi::Error ReadDispatch(
             return fail(ffi::ErrorCode::kInvalidArgument, enc_err);
         }
     }
-
-    // Bring the small offset + valid_shape buffers (N × 8 bytes each) into
-    // host memory (D2H on CUDA; already host-resident on the host build).
-    std::vector<int64_t> offset_host(N);
-    std::string cperr;
-    if (!copy_index_to_host(LRX_STREAM_ARG offset_host.data(),
-                            offset_buf.untyped_data(),
-                            N * sizeof(int64_t), &cperr)) {
-        return fail(ffi::ErrorCode::kInternal,
-                    "phdf5 read: copy(offset) failed: " + cperr);
-    }
-    std::vector<int64_t> valid_shape_host(N);
-    if (!copy_index_to_host(LRX_STREAM_ARG valid_shape_host.data(),
-                            valid_shape_buf.untyped_data(),
-                            N * sizeof(int64_t), &cperr)) {
-        return fail(ffi::ErrorCode::kInternal,
-                    "phdf5 read: copy(valid_shape) failed: " + cperr);
-    }
+    std::vector<int64_t> offset_host(control.begin() + 2, control.begin() + 2 + N);
+    std::vector<int64_t> valid_shape_host(control.begin() + 2 + N, control.end());
 
     std::vector<hsize_t> offset(N), file_count(N), mem_dims(N);
     {
@@ -599,8 +571,8 @@ static ffi::Error ReadDispatch(
 //  N ``ReadDispatch`` requests, placed by the same ``rank_hyperslab`` and
 //  selected by the same ``select_rank_slab``, so the bytes that land are the
 //  ones N ``read_slab`` calls return.  What it removes is per-request: N
-//  dispatches, N descriptor puts (one control table instead of 3 N vectors),
-//  N D2H copy-ins of those descriptors (each a stream sync on a device leg),
+//  dispatches, N descriptor puts and their D2H copy-ins (each a stream sync on
+//  a device leg; since ABI 7 every read posts its control instead),
 //  N collective rendezvous and N Python ``block_until_ready``.
 //
 //  The handler is synchronous on the XLA thread, like ReadDispatch: the
@@ -610,7 +582,8 @@ static ffi::Error ReadDispatch(
 //  the host staging is the sum of the N rank blocks (ReadDispatch's was the
 //  largest one), retired after the copy above 32 MiB exactly as before.
 //
-//  control (S64, 1-D): {ctx, N, ds_id[N], offset[N][ndim], valid[N][ndim]}.
+//  Posted control (ctx.h, ABI 7), keyed by output 0's address:
+//  {ctx, N, ds_id[N], offset[N][ndim], valid[N][ndim], address[N]}.
 // ────────────────────────────────────────────────────────────────────────────
 #if H5_VERSION_GE(1, 14, 0)
 static bool native_type_of(ffi::DataType t, hid_t* type, size_t* size) {
@@ -629,7 +602,7 @@ static bool native_type_of(ffi::DataType t, hid_t* type, size_t* size) {
 
 static ffi::Error ReadMultiDispatch(
     LRX_STREAM_PARAM
-    ffi::Buffer<ffi::DataType::S64> control_buf,
+    ffi::RemainingArgs dsts,               // the caller's outputs, aliased to outs
     ffi::RemainingRets outs,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
@@ -638,24 +611,47 @@ static ffi::Error ReadMultiDispatch(
     static const char* kWho = "phdf5 read_multi";
     const size_t n_out = outs.size();
     const size_t ndim = axis_count_per_dim.size();
-    const size_t want = 2 + n_out * (1 + 2 * ndim);
-    if (n_out == 0 || ndim == 0 || control_buf.dimensions().size() != 1 ||
-        (size_t)control_buf.dimensions()[0] != want) {
+    const size_t want = 2 + n_out * (2 + 2 * ndim);
+    if (n_out == 0 || ndim == 0 || dsts.size() != n_out) {
         std::ostringstream os;
-        os << kWho << ": control must be 1-D of length 2 + N(1 + 2 ndim) = "
-           << want << " for N=" << n_out << " ndim=" << ndim;
+        os << kWho << ": " << dsts.size() << " destinations for " << n_out
+           << " outputs of ndim " << ndim;
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
-    // ONE descriptor copy-in for the whole request list (a device leg's
-    // copy_index_to_host is a D2H plus an xla_stream sync).
-    std::vector<int64_t> control(want);
+    // Control by POSTED ADDRESS (ctx.h, handler ABI 7), keyed by output 0:
+    // {ctx, N, ds_id[N], offset[N][ndim], valid[N][ndim], address[N]}.
+    std::vector<int64_t> control;
     {
-        std::string herr;
-        if (!copy_index_to_host(LRX_STREAM_ARG control.data(),
-                                control_buf.untyped_data(),
-                                want * sizeof(int64_t), &herr)) {
-            return ffi::Error(ffi::ErrorCode::kInternal,
-                              std::string(kWho) + ": copy(control) failed: " + herr);
+        auto r0 = outs.get<ffi::AnyBuffer>(0);
+        if (!r0.has_value()) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                              std::string(kWho) + ": output decode failed");
+        }
+        std::string perr;
+        if (!take_control(reinterpret_cast<uint64_t>(r0.value()->untyped_data()),
+                          kCtlReadMulti, &control, &perr)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                              std::string(kWho) + ": " + perr);
+        }
+    }
+    if (control.size() != want) {
+        std::ostringstream os;
+        os << kWho << ": posted control has " << control.size()
+           << " values; want 2 + N(2 + 2 ndim) = " << want;
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    for (size_t i = 0; i < n_out; ++i) {
+        auto ri = outs.get<ffi::AnyBuffer>(i);
+        auto di = dsts.get<ffi::AnyBuffer>(i);
+        const uint64_t posted = (uint64_t)control[2 + n_out * (1 + 2 * ndim) + i];
+        if (!ri.has_value() || !di.has_value() ||
+            ri.value()->untyped_data() != di.value().untyped_data() ||
+            reinterpret_cast<uint64_t>(ri.value()->untyped_data()) != posted) {
+            std::ostringstream os;
+            os << "GATE phdf5_posted_control: " << kWho << ": output " << i
+               << " is not the aliased destination SlabIO posted (0x" << std::hex
+               << posted << std::dec << ")";
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
         }
     }
     auto* ctx = reinterpret_cast<PhdfCtx*>(control[0]);
@@ -739,7 +735,6 @@ static ffi::Error ReadMultiDispatch(
         return fail(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     char* stage = static_cast<char*>(ctx->read_buf);
-    std::memset(stage, 0, total);
 
     // Every rank lists every request in the same order (shapes are the
     // equal-block shards, identical on every rank); a rank's empty block is
@@ -765,6 +760,8 @@ static ffi::Error ReadMultiDispatch(
             os << err << " (request " << i << " of " << n_out << ")";
             return fail(code, os.str());
         }
+        if (!selection_fills(ms, req[i].mem_dims))
+            std::memset(stage + req[i].stage_off, 0, req[i].bytes);
         dsets.push_back(req[i].ds);
         types.push_back(req[i].type);
         mems.push_back(ms);
@@ -797,8 +794,11 @@ static ffi::Error ReadMultiDispatch(
     if (st < 0) {
         return fail(ffi::ErrorCode::kInternal, std::string(kWho) + ": H5Dread_multi failed");
     }
-    // Device-staging tail: N async copies, ONE event, ONE stream wait.
+    // Device-staging tail: N async copies, ONE event, ONE stream wait.  The
+    // copies follow the destinations' fills on xla_stream (ctx.h order_event).
 #if LRX_LEG_DEVICE
+    LORRAX_GPU_CHECK(lrx::gpu::event_record(ctx->order_event, xla_stream));
+    LORRAX_GPU_CHECK(lrx::gpu::stream_wait_event(ctx->stream, ctx->order_event, 0));
     for (size_t i = 0; i < n_out; ++i) {
         if (req[i].bytes == 0) continue;
         LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(req[i].dst, stage + req[i].stage_off,
@@ -812,8 +812,7 @@ static ffi::Error ReadMultiDispatch(
         if (req[i].bytes) std::memcpy(req[i].dst, stage + req[i].stage_off, req[i].bytes);
     }
 #endif
-    if (ctx->read_capacity.load(std::memory_order_acquire) >
-        kMaxRetainedReadStaging) retire_read_buf(ctx);
+    settle_read_buf(ctx);
     return ffi::Error::Success();
 }
 #endif  // H5_VERSION_GE(1, 14, 0)
@@ -1720,9 +1719,7 @@ static void async_read_kchunk_union_worker(
 
 static ffi::Future ReadKchunkUnionDispatch(
     LRX_STREAM_PARAM
-    ffi::Buffer<ffi::DataType::S64> handle_buf,   // (2,) {ctx_handle, ds_id}
-    ffi::Buffer<ffi::DataType::S64> offset_buf,   // (n_kchunk, N_file)
-    ffi::Buffer<ffi::DataType::S64> count_buf,    // (n_kchunk, N_file)
+    ffi::AnyBuffer dst,                            // the caller's output, aliased to A_out (ABI 7)
     ffi::Result<ffi::AnyBuffer> A_out,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
@@ -1730,40 +1727,48 @@ static ffi::Future ReadKchunkUnionDispatch(
     int64_t n_kchunk_attr,
     int64_t kchunk_axis_attr)  // position of the n_kchunk axis in A_out
 {
-    // ``ctx_handle``/``ds_id`` as a RUNTIME buffer — see ReadDispatch.  This
-    // handler is the one xla_dump attributed the measured +2-entries-per-
-    // ctx-address growth to.
+    // Control by POSTED ADDRESS (ctx.h, handler ABI 7): SlabIO allocated
+    // ``dst``, aliased it to ``A_out`` and posted {ctx, ds_id, n_kchunk,
+    // N_file, offset[n_kchunk][N_file], count[n_kchunk][N_file]} under its
+    // address -- ``count`` is THIS rank's own rows.  No control operand, so no
+    // table placement, no D2H copy-in and no xla_stream sync; the worker's
+    // copies are ordered behind the destination's fill by the device-side
+    // fence below (ctx.h order_event), which the copy-in's host sync used to
+    // provide.
     //
     // NOTE: this dispatch returns ffi::Future, so a failure BEFORE ``ctx`` is
     // known cannot return a bare ffi::Error — it must still hand back a
     // Future carrying the error.  ``fail`` below needs ctx (it announces), so
-    // the two pre-ctx failures build their own Promise/Future pair.
+    // the pre-ctx failures build their own Promise/Future pair.
     auto fail_early = [](ffi::ErrorCode code, const std::string& msg) {
         ffi::Promise p;
         ffi::Future f(p);
         p.SetError(ffi::Error(code, msg));
         return f;
     };
-    if (handle_buf.dimensions().size() != 1 ||
-        handle_buf.dimensions()[0] != 2) {
-        return fail_early(
-            ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: handle_buf must have shape (2,) == "
-            "{ctx_handle, ds_id}");
+    if (dst.untyped_data() != A_out->untyped_data()) {
+        return fail_early(ffi::ErrorCode::kInvalidArgument,
+            "GATE phdf5_posted_control: phdf5 read_kchunk_union: output is not "
+            "the aliased destination SlabIO posted for (input_output_aliases "
+            "not honoured)");
     }
-    int64_t handle_host[2] = {0, 0};
+    std::vector<int64_t> control;
     {
-        std::string herr;
-        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
-                                handle_buf.untyped_data(),
-                                2 * sizeof(int64_t), &herr)) {
-            return fail_early(
-                ffi::ErrorCode::kInternal,
-                "phdf5 read_kchunk_union: copy(handle) failed: " + herr);
+        std::string perr;
+        if (!take_control(reinterpret_cast<uint64_t>(A_out->untyped_data()),
+                          kCtlReadKchunkUnion, &control, &perr)) {
+            return fail_early(ffi::ErrorCode::kInvalidArgument,
+                              "phdf5 read_kchunk_union: " + perr);
         }
     }
-    auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
-    const hid_t ds_id = (hid_t)handle_host[1];
+    if (control.size() < 4) {
+        std::ostringstream os;
+        os << "phdf5 read_kchunk_union: posted control has " << control.size()
+           << " values; want 4 + 2 n_kchunk N_file";
+        return fail_early(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(control[0]);
+    const hid_t ds_id = (hid_t)control[1];
 
     auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
         announce_error(ctx, msg);
@@ -1774,15 +1779,15 @@ static ffi::Future ReadKchunkUnionDispatch(
     };
 
     if (!ctx) {
-        return fail(ffi::ErrorCode::kInvalidArgument,
-                    "phdf5 read_kchunk_union: ctx_handle is null");
+        return fail_early(ffi::ErrorCode::kInvalidArgument,
+                          "phdf5 read_kchunk_union: ctx_handle is null");
     }
     // Audit B2 — see the note in ReadDispatch.  This dispatch returns a
     // Future, so the refusal goes back through ``fail_early`` (which does not
     // touch ctx), not through ``fail``.
     {
         std::string live_err;
-        if (!check_live_ctx(ctx, handle_host[0], "phdf5 read_kchunk_union",
+        if (!check_live_ctx(ctx, control[0], "phdf5 read_kchunk_union",
                             &live_err)) {
             return fail_early(ffi::ErrorCode::kInvalidArgument, live_err);
         }
@@ -1809,12 +1814,14 @@ static ffi::Future ReadKchunkUnionDispatch(
         return fail(ffi::ErrorCode::kInvalidArgument,
             "phdf5 read_kchunk_union: axis_count_per_dim / N_file mismatch");
     }
-    const auto obd = offset_buf.dimensions();
-    const auto cbd = count_buf.dimensions();
-    if (obd.size() != 2 || (int64_t)obd[0] != n_kchunk || (size_t)obd[1] != N_file
-        || cbd.size() != 2 || (int64_t)cbd[0] != n_kchunk || (size_t)cbd[1] != N_file) {
-        return fail(ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read_kchunk_union: offset_buf / count_buf shape mismatch");
+    if (control[2] != n_kchunk || control[3] != (int64_t)N_file ||
+        control.size() != 4 + 2 * (size_t)n_kchunk * N_file) {
+        std::ostringstream os;
+        os << "phdf5 read_kchunk_union: posted control names n_kchunk="
+           << control[2] << " N_file=" << control[3] << " in " << control.size()
+           << " values; the output has n_kchunk=" << n_kchunk << " N_file="
+           << N_file << " (want " << 4 + 2 * (size_t)n_kchunk * N_file << ")";
+        return fail(ffi::ErrorCode::kInvalidArgument, os.str());
     }
     {
         std::string enc_err;
@@ -1825,25 +1832,9 @@ static ffi::Future ReadKchunkUnionDispatch(
         }
     }
 
-    // Bring both small index buffers to host (D2H on CUDA; already host-
-    // resident on the host build).
-    std::vector<int64_t> off_host((size_t)n_kchunk * N_file);
-    std::vector<int64_t> cnt_host((size_t)n_kchunk * N_file);
-    {
-        std::string cperr;
-        if (!copy_index_to_host(LRX_STREAM_ARG off_host.data(),
-                                offset_buf.untyped_data(),
-                                off_host.size() * sizeof(int64_t), &cperr)) {
-            return fail(ffi::ErrorCode::kInternal,
-                "phdf5 read_kchunk_union: copy(offset): " + cperr);
-        }
-        if (!copy_index_to_host(LRX_STREAM_ARG cnt_host.data(),
-                                count_buf.untyped_data(),
-                                cnt_host.size() * sizeof(int64_t), &cperr)) {
-            return fail(ffi::ErrorCode::kInternal,
-                "phdf5 read_kchunk_union: copy(count): " + cperr);
-        }
-    }
+    // The two tables, already host memory (posted before the call).
+    const int64_t* off_host = control.data() + 4;
+    const int64_t* cnt_host = off_host + (size_t)n_kchunk * N_file;
 
     // Per-rank coord shift on sharded dims (same encoding as single-
     // offset handler).  Applied to both offset and count uniformly:
@@ -1954,9 +1945,23 @@ static ffi::Future ReadKchunkUnionDispatch(
             std::move(per_rank_max), std::move(sharded), kax,
             std::move(promise));
     };
-    // ``xla_stream`` is used ABOVE, by the three control-operand copies (seam
-    // 2 is stream-ordered — SLAB_IO_ROOT_CAUSE_AUDIT.md B1).  The QUEUED TASK
-    // below does not need it: it owns its own synchronization via h2d_event.
+    // ABI 7 order fence: the worker's zero fill and copies run on ctx->stream
+    // into a donated destination whose own fill (and any earlier user of its
+    // memory) is still queued on xla_stream.  Until ABI 6 the control copy-in
+    // synced xla_stream on the host; now ctx->stream waits for it on the
+    // device, enqueued BEFORE the task so every copy of the task follows it.
+#if LRX_LEG_DEVICE
+    {
+        lrx::gpu::Error oe = lrx::gpu::event_record(ctx->order_event, xla_stream);
+        if (oe == lrx::gpu::kSuccess)
+            oe = lrx::gpu::stream_wait_event(ctx->stream, ctx->order_event, 0);
+        if (oe != lrx::gpu::kSuccess) {
+            return fail(ffi::ErrorCode::kInternal,
+                std::string("phdf5 read_kchunk_union: " LRX_GPU_API " order fence failed: ") +
+                lrx::gpu::error_string(oe));
+        }
+    }
+#endif
     {
         std::lock_guard<std::mutex> lk(ctx->queue_mu);
         ctx->task_queue.emplace_back(std::move(task));
@@ -1983,9 +1988,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfRead), lorrax_ffi::phdf5::ReadDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // handle {ctx, ds}
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // offset_base
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // valid_shape
+        .Arg<xla::ffi::AnyBuffer>()   // destination, aliased to the result (ABI 7)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
@@ -2008,9 +2011,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     lorrax_ffi::phdf5::ReadKchunkUnionDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // handle {ctx, ds}
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // offset_buf (n_kchunk, N_file)
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()   // count_buf  (n_kchunk, N_file)
+        .Arg<xla::ffi::AnyBuffer>()   // destination, aliased to the result (ABI 7)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
@@ -2023,8 +2024,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfReadMulti), lorrax_ffi::phdf5::ReadMultiDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // control {ctx, N, ds[N], off[N][d], valid[N][d]}
-        .RemainingRets()                                   // the N outputs
+        .RemainingArgs()   // the N destinations, aliased to the results (ABI 7)
+        .RemainingRets()   // the N outputs
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));

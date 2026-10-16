@@ -333,7 +333,7 @@ class FfiLibraryNotBuilt(FileNotFoundError):
 #: this boundary is unavoidable; what IS avoidable is the mirror drifting
 #: silently, and ``tests/test_ffi_abi_stamp.py`` parses the header and fails if
 #: these two numbers disagree.
-LORRAX_FFI_ABI_VERSION = 6
+LORRAX_FFI_ABI_VERSION = 8
 
 #: platform -> the C entry point that reports the library's ABI.  Per leg on
 #: purpose: both libraries are dlopened RTLD_GLOBAL in a GPU process and
@@ -409,6 +409,10 @@ _SHARED_C_ENTRY_POINTS = (
     "lrx_phdf5_dataset_geometry",
     "lrx_phdf5_read_whole",
     "lrx_phdf5_staging_totals",
+    # Posted control (handler ABI 7; cpp/phdf5/ctx.h POSTED CONTROL).
+    "lrx_phdf5_post_control",
+    "lrx_phdf5_retract_control",
+    "lrx_phdf5_pending_controls",
     "lrx_slate_context_create",
     "lrx_slate_subrow_context_create",
     "lrx_slate_context_destroy",
@@ -582,6 +586,15 @@ def _declare_phdf5(lib: ctypes.CDLL) -> None:
             ctypes.POINTER(ctypes.c_int64),      # pinned + read staging bytes
         ]
         lib.lrx_phdf5_staging_totals.restype = ctypes.c_int
+    if hasattr(lib, "lrx_phdf5_post_control"):
+        lib.lrx_phdf5_post_control.argtypes = [
+            ctypes.c_uint64, ctypes.c_int64,     # buffer address, handler kind
+            ctypes.POINTER(ctypes.c_int64), ctypes.c_int64]
+        lib.lrx_phdf5_post_control.restype = ctypes.c_int
+        lib.lrx_phdf5_retract_control.argtypes = [ctypes.c_uint64, ctypes.c_int64]
+        lib.lrx_phdf5_retract_control.restype = ctypes.c_int
+        lib.lrx_phdf5_pending_controls.argtypes = []
+        lib.lrx_phdf5_pending_controls.restype = ctypes.c_int64
     if hasattr(lib, "lrx_phdf5_close_timed"):
         lib.lrx_phdf5_close_timed.argtypes = [
             ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
@@ -1114,6 +1127,43 @@ def phdf5_staging_totals(ctx_handle: int = 0,
     staged = ctypes.c_int64(0)
     fn(int(ctx_handle), ctypes.byref(n_live), ctypes.byref(staged))
     return int(n_live.value), int(staged.value)
+
+
+#: Handler kinds of the posted-control registry (cpp/phdf5/ctx.h ControlKind).
+PHDF5_CONTROL_KIND = {"read": 1, "read_multi": 2, "write": 3, "write_independent": 4,
+                      "read_kchunk_union": 5}
+
+
+def phdf5_post_control(address: int, kind: str, values, *, platform: str) -> None:
+    """Post one call's control values under its own buffer ``address`` (ABI 7).
+
+    Process-local; the handler of ``kind`` takes them by the address of the
+    buffer it is handed.  Refuses (GATE phdf5_posted_control) when an entry
+    for this address and kind is already pending, which would be two calls on
+    one buffer in flight.
+    """
+    lib = get_lib(platform)
+    # Addresses travel as int64 (two's complement above 2**63).
+    vals = [int(x) - (1 << 64) if int(x) >= (1 << 63) else int(x) for x in values]
+    buf = (ctypes.c_int64 * max(len(vals), 1))(*vals)
+    rc = lib.lrx_phdf5_post_control(
+        ctypes.c_uint64(int(address)), PHDF5_CONTROL_KIND[kind], buf, len(vals))
+    if rc != 0:
+        raise RuntimeError(
+            f"GATE phdf5_posted_control: got: a {kind} control already pending for buffer "
+            f"0x{int(address):x}; want: one call in flight per buffer and kind; why: the "
+            f"handler finds its control by its buffer's address")
+
+
+def phdf5_retract_control(address: int, kind: str, *, platform: str) -> bool:
+    """Withdraw a post whose call did not dispatch; True when one was pending."""
+    return get_lib(platform).lrx_phdf5_retract_control(
+        ctypes.c_uint64(int(address)), PHDF5_CONTROL_KIND[kind]) == 0
+
+
+def phdf5_pending_controls(*, platform: str) -> int:
+    """Posted controls no handler has taken yet (0 when no call is in flight)."""
+    return int(get_lib(platform).lrx_phdf5_pending_controls())
 
 
 # Mapping from numpy/jax dtype to the integer tag matching xla::ffi::DataType.
