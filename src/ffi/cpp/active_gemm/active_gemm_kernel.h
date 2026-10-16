@@ -16,8 +16,9 @@
 //
 // Tiling: a TM x TN tile of C per block of LRX_NT = 256 threads (16 x 16, 4 x 4 outputs each:
 // rows ty + 16 r, columns tx + 16 c); the interval in TK-deep LDS slabs zero-filled past hi.
-// LDS: 2 * TK * (TM + 1) elements = 33.3 KiB (complex128): under the CUDA leg's 48 KiB static
-// limit and the ROCM leg's 64 KiB.  Grid (ceil(n/TN), ceil(m/TM), nq).
+// LDS: 2 * TK * (TM + 1) elements = 16.6 KiB at TK 8 (complex128), so three blocks share a
+// gfx90a CU's 64 KiB (TK 16, 33.3 KiB, allowed one: Fe W shape 2.7 ms vs rocBLAS 0.8 ms at
+// full K); under the CUDA leg's 48 KiB static limit.  Grid (ceil(n/TN), ceil(m/TM), nq).
 #ifndef LRX_TM
 #define LRX_TM 64
 #endif
@@ -25,7 +26,7 @@
 #define LRX_TN 64
 #endif
 #ifndef LRX_TK
-#define LRX_TK 16
+#define LRX_TK 8
 #endif
 #define LRX_NT 256
 
@@ -86,28 +87,22 @@ __device__ __forceinline__ void lrx_active_gemm(
     const T* Bq = B + q * (long long)k * n;
     const T* Wq = W ? W + q * (long long)k : nullptr;
     for (int k0 = lo; k0 < hi; k0 += LRX_TK) {             // uniform per block
-        {   // A slab: TM rows x TK columns, 4 consecutive columns per thread, weighted on load
-            const int r = t >> 2, c4 = (t & 3) * 4, i = row0 + r;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int kk = k0 + c4 + j;
-                T v = zero;
-                if (i < m && kk < hi) {
-                    v = Aq[(long long)i * k + kk];
-                    if (Wq) v = lrx_mul(v, Wq[kk]);
-                }
-                As[c4 + j][r] = v;
+        // A slab (TM rows x TK columns, weighted on load) and B slab (TK rows x TN columns):
+        // consecutive threads take consecutive columns (coalesced); past hi or the edge: zero.
+        for (int e = t; e < LRX_TM * LRX_TK; e += LRX_NT) {
+            const int r = e / LRX_TK, kc = e - r * LRX_TK, i = row0 + r, kk = k0 + kc;
+            T v = zero;
+            if (i < m && kk < hi) {
+                v = Aq[(long long)i * k + kk];
+                if (Wq) v = lrx_mul(v, Wq[kk]);
             }
+            As[kc][r] = v;
         }
-        {   // B slab: TK rows x TN columns, 4 consecutive columns per thread
-            const int kr = t >> 4, c4 = (t & 15) * 4, kk = k0 + kr;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int jj = col0 + c4 + j;
-                T v = zero;
-                if (kk < hi && jj < n) v = Bq[(long long)kk * n + jj];
-                Bs[kr][c4 + j] = v;
-            }
+        for (int e = t; e < LRX_TK * LRX_TN; e += LRX_NT) {
+            const int kr = e / LRX_TN, jc = e - kr * LRX_TN, jj = col0 + jc, kk = k0 + kr;
+            T v = zero;
+            if (kk < hi && jj < n) v = Bq[(long long)kk * n + jj];
+            Bs[kr][jc] = v;
         }
         __syncthreads();
 #pragma unroll

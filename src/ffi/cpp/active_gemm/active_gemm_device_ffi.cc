@@ -36,7 +36,7 @@
 
 namespace lorrax_ffi::active_gemm {
 
-constexpr int kTm = 64, kTn = 64, kTk = 16, kThreads = 256;   // = active_gemm_kernel.h defaults
+constexpr int kTm = 64, kTn = 64, kTk = 8, kThreads = 256;   // = active_gemm_kernel.h defaults
 
 static ffi::Error fail(const char* gate, const std::string& why,
                        ffi::ErrorCode code = ffi::ErrorCode::kInvalidArgument) {
