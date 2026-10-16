@@ -453,8 +453,9 @@ for 60 fs on four A100s (24 000 ΔΣ per window: 168 s for four 8v8c trials,
   (χ_xy + χ_yx), and every bright state is pure σ+ or σ− to 2.9e-10.
 - *2v2c* (bands 129–132, `degeneracy_mode = off`: on the QP spectrum bands
   128 and 129 are 0.548 meV apart at k = 24, inside the strict gate's 1 meV,
-  although 61.9 meV apart in DFT). A σ+ pulse (τ 2 fs, 1e6 V/m) on the lowest
-  bright σ+ state (1.8087 eV, I+ 0.0152 bohr² per cell) fills σ− states at
+  although at least 48.2 meV apart in DFT, the minimum over k). A σ+ pulse
+  (τ 2 fs, 1e6 V/m) on the lowest bright σ+ state (1.8087 eV, I+ 0.0152
+  bohr² per cell) fills σ− states at
   1.62e-17 of the σ+ population, the counter-rotating leak of first-order
   theory (1.62e-17), and N(S+) equals first order to 8.3e-8; the σ− pulse
   is the mirror image (5.5e-17). ε_xy, σ_xy, Kerr and Faraday from TD equal
