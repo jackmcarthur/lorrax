@@ -109,6 +109,7 @@ nav:
       - TD-aGW interaction: theory/td_agw.md
       - TD-aGW propagation: theory/td_agw_propagation.md
       - "BerkeleyGW ε⁻¹ export": theory/bgw_epsmat_export.md
+      - TD-aGW dynamical self-energy: theory/td_agw_dynamical.md
   - Architecture:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md
