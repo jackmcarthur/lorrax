@@ -1715,7 +1715,7 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     mu = sample_plan["census"]["mu_ry"]
     decay_rate, amplitude = response_occupation_envelope(energy, f, u, mu)
     from .greens_function_kernel import _phase_band_interval
-    lo_band, hi_band = jax.device_get(_phase_band_interval(jnp.asarray(np.stack((f, u)))))
+    lo_band, hi_band = _phase_band_interval(np.stack((np.asarray(f), np.asarray(u))))
     # Enclose every parent's exact weight support. Fixed bounds share one
     # batched GEMM on the direct stream's band-complete ψ rows and remain safe
     # when a complex-time phase underflows.
