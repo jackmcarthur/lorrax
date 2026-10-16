@@ -373,15 +373,19 @@ the ζ-projector and SC-rotation shapes at P4 (sandbox claim 3987).
 
 | route | operands | kernel |
 |---|---|---|
-| CUDA, ROCM face | both at `P(None,'x','y')` | `panel_matmul`'s local panel products on `lorrax_cublas_local_active_range_gemm` (host-known intervals: `…_prepared_active_range_gemm`) |
-| CUDA, ROCM axis | A `P(None,'x',None)`, B `P(None,None,'y')` | `lorrax_cublas_local_active_range_gemm`: local BLAS pointer views, no collective |
+| CUDA face | both at `P(None,'x','y')` | `panel_matmul`'s local panel products on `lorrax_cublas_local_active_range_gemm` (host-known intervals: `…_prepared_active_range_gemm`) |
+| CUDA axis | A `P(None,'x',None)`, B `P(None,None,'y')` | `lorrax_cublas_local_active_range_gemm`: local BLAS pointer views, no collective |
 | other face | both at `P(None,'x','y')` | `panel_matmul`'s local panel products on the axis kernel below |
-| other axis | as the device axis | `_active_local.active_local_matmul`: JAX dot panels |
+| other axis | as CUDA axis | ROCM: `_active_local.masked_local_matmul` (one batched dot); cpu: `active_local_matmul` (JAX dot panels) |
 
-`_active_local.ACTIVE_LOCAL_ROUTE` holds the row per leg (CUDA and ROCM
-`native`, cpu `interval`).  The native handler is one leg-neutral source,
+`_active_local.ACTIVE_LOCAL_ROUTE` holds the row per leg (CUDA `native`,
+ROCM `masked`, cpu `interval`).  The native handler is one leg-neutral source,
 cuBLAS on CUDA and rocBLAS on ROCM (`common/gpu_blas.h`; rocBLAS is the copy
-the JAX ROCm plugin maps, handles created with atomics off).  The `masked`
+the JAX ROCm plugin maps, handles created with atomics off); the ROCM leg
+builds and gates it, but its per-call host read of the bounds drains the
+stream inside Sigma's tau loop on MI250X (Fe P=4 Sigma tau 13.5 s native vs
+9.1 s masked), so the ROCM row stays `masked` until device-side bounds exist
+(`ACTIVE_LOCAL_GUARD`'s `full` arm, 7.8 s, changes the NaN contract).  The `masked`
 route (one batched dot over `where`-selected operands) and the `interval`
 route stay as the XLA references; `tests/test_active_local_native_gate.py`
 gates the native route against both on the same device.  The cuBLAS kernel
