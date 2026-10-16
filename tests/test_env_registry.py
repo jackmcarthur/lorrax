@@ -556,7 +556,8 @@ def test_input_reference_check_can_fail():
         "| key | default | meaning |",
         "| `d` | unset (required) | fine |",
     ])
-    new, errors = tool.sync(page, {"a": 5, "b": 1e-4}, {"d": None},
+    new, errors = tool.sync(page, {"gw": {"a": 5, "b": 1e-4},
+                                   "downfold": {"d": None}},
                             'if "old" in section: raise')
     joined = "\n".join(errors)
     assert "`a` | int | `5` (note)" in new, new
@@ -578,12 +579,38 @@ def test_input_reference_td_table_can_fail():
         "| `control.ivp.rtol` | `1e-5` | wrong default |",
         "| `lorrax.gone` | `1` | no longer accepted |",
     ])
-    new, errors = tool.sync(page, {}, {}, "", {"control.ivp.rtol": 1e-6,
-                                               "lorrax.method": "dp54"})
+    new, errors = tool.sync(page, {"td": {"control.ivp.rtol": 1e-6,
+                                          "lorrax.method": "dp54"}}, "")
     joined = "\n".join(errors)
     assert "| `control.ivp.rtol` | `1e-6` |" in new, new
     assert "`lorrax.gone` is documented" in joined, joined
     assert "`lorrax.method` (td deck) has no row" in joined, joined
+
+
+def test_input_reference_every_registered_table_can_fail():
+    """Each ``TABLES`` heading routes its rows to its own parser's defaults.
+
+    For every registered section: a wrong default is rewritten, a stale key
+    and a missing row are refused by that table's name.  The red twin drops
+    the heading, so the same rows land in the previous section and the
+    refusals no longer name the table.
+    """
+    tool = _load_input_reference_tool()
+    names = [row[0] for row in tool.TABLES]
+    assert names[0] == "gw" and len(set(names)) == len(names), names
+    for name, heading, _path, _const in tool.TABLES[1:]:
+        rows = ["| key | default | meaning |", "|---|---|---|",
+                "| `k_wrong` | `2` | wrong default |",
+                "| `k_stale` | `1` | no longer accepted |"]
+        defaults = {name: {"k_wrong": 1, "k_missing": 3}}
+        new, errors = tool.sync("\n".join([heading + " — planted"] + rows),
+                                defaults, "")
+        joined = "\n".join(errors)
+        assert "| `k_wrong` | `1` |" in new, (name, new)
+        assert "`k_stale` is documented" in joined, (name, joined)
+        assert f"`k_missing` ({name} deck) has no row" in joined, (name, joined)
+        _, twin = tool.sync("\n".join(rows), defaults, "")
+        assert "`k_wrong` is documented" in "\n".join(twin), (name, twin)
 
 
 if __name__ == "__main__":

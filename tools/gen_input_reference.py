@@ -7,12 +7,12 @@ default column come from the parsers.  From the repo root::
     python3 tools/gen_input_reference.py          # rewrite the default cells
     python3 tools/gen_input_reference.py --check  # exit 1 if the page differs
 
-The rewrite sets the head of every default cell from ``gw_config._DEFAULTS``
-(the ``[downfold]`` table from ``downfold_config.DOWNFOLD_DEFAULTS``, the
-TD-aGW ``tdgw.toml`` table from ``tdagw.td_config.TD_DEFAULTS``, whose keys
-are dotted TOML paths, and the ``[epsmat]`` table from
-``epsmat_config.EPSMAT_DEFAULTS``) and keeps the hand-written note after it.
-Both modes refuse, writing nothing,
+The rewrite sets the head of every default cell from the parser that
+``TABLES`` names for its section (``gw_config._DEFAULTS`` for the GW deck,
+then ``downfold_config.DOWNFOLD_DEFAULTS``, ``tdagw.td_config.TD_DEFAULTS``,
+whose keys are dotted TOML paths, and ``epsmat_config.EPSMAT_DEFAULTS`` under
+their headings) and keeps the hand-written note after it.  A new input file is
+one ``TABLES`` row plus its section on the page.  Both modes refuse, writing nothing,
 when a key has no row, when a key has two rows, or when a row names a key
 the parser no longer accepts; a row whose default cell is ``retired`` is
 allowed only if ``gw_config.py`` still refuses that key by name.
@@ -36,13 +36,20 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 CONFIG = REPO / "src" / "gw" / "gw_config.py"
-DOWNFOLD = REPO / "src" / "gw" / "downfold_config.py"
-TD = REPO / "src" / "tdagw" / "td_config.py"
-EPSMAT = REPO / "src" / "gw" / "epsmat_config.py"
 OUT = REPO / "docs" / "input_reference.md"
-DOWNFOLD_HEADING = "## Downfold"
-TD_HEADING = "## TD-aGW"
-EPSMAT_HEADING = "## Epsmat"
+
+#: THE TABLE REGISTRY, in page order: (table, the heading that opens its
+#: section, the parser module, its defaults dict).  A section runs from its
+#: heading to the next registered heading; the GW deck is the page's first
+#: section and has no heading of its own.
+TABLES = (
+    ("gw", None, CONFIG, "_DEFAULTS"),
+    ("downfold", "## Downfold", REPO / "src" / "gw" / "downfold_config.py",
+     "DOWNFOLD_DEFAULTS"),
+    ("td", "## TD-aGW", REPO / "src" / "tdagw" / "td_config.py", "TD_DEFAULTS"),
+    ("epsmat", "## Epsmat", REPO / "src" / "gw" / "epsmat_config.py",
+     "EPSMAT_DEFAULTS"),
+)
 
 
 def _module_consts(path):
@@ -102,6 +109,12 @@ def harvest_defaults(path, dict_name):
     raise SystemExit(f"{dict_name} dict not found in {path}")
 
 
+def harvest_tables(tables=TABLES):
+    """``{table: defaults}`` for every ``TABLES`` row, read by AST."""
+    return {name: harvest_defaults(path, const)
+            for name, _heading, path, const in tables}
+
+
 def render_default(v):
     if v is None:
         return "unset"
@@ -120,25 +133,30 @@ _CELL_SPLIT = re.compile(r"(?<!\\)\|")
 _HEAD = re.compile(r"^(.*?)((?:\s+\(|\s+—).*)?$")
 
 
-def sync(text, gw_defaults, downfold_defaults, config_source, td_defaults=None,
-         epsmat_defaults=None):
-    """Return (page with generated default heads, list of refusals)."""
+def sync(text, defaults, config_source, tables=TABLES):
+    """Return (page with generated default heads, list of refusals).
+
+    ``defaults`` maps ``TABLES`` names to their parser's defaults; a table it
+    leaves out is empty, so every row in that section refuses as unknown.
+    ``config_source`` is ``gw_config.py``'s text (the ``retired`` rule).
+    """
+    names = [row[0] for row in tables]
+    stray = sorted(set(defaults) - set(names))
+    if stray:
+        raise ValueError(f"sync: tables {stray} are not in the registry {names}")
+    defaults = {name: defaults.get(name, {}) for name in names}
+    headings = [(heading, name) for name, heading, _path, _const in tables
+                if heading]
     errors = []
-    td_defaults = {} if td_defaults is None else td_defaults
-    epsmat_defaults = {} if epsmat_defaults is None else epsmat_defaults
-    tables = {"gw": gw_defaults, "downfold": downfold_defaults,
-              "td": td_defaults, "epsmat": epsmat_defaults}
-    seen = {name: {} for name in tables}
+    seen = {name: {} for name in names}
     default_col = None
     out = []
-    table = "gw"
+    table = names[0]
     for lineno, line in enumerate(text.split("\n"), 1):
-        if line.startswith(DOWNFOLD_HEADING):
-            table = "downfold"
-        elif line.startswith(TD_HEADING):
-            table = "td"
-        elif line.startswith(EPSMAT_HEADING):
-            table = "epsmat"
+        for heading, name in headings:
+            if line.startswith(heading):
+                table = name
+                break
         cells = _CELL_SPLIT.split(line)
         if len(cells) > 2 and cells[1].strip() == "key":
             heads = [c.strip() for c in cells]
@@ -148,13 +166,12 @@ def sync(text, gw_defaults, downfold_defaults, config_source, td_defaults=None,
             out.append(line)
             continue
         key = m.group(1)
-        defaults = tables[table]
         if key in seen[table]:
             errors.append(f"line {lineno}: `{key}` has a second row "
                           f"(first at line {seen[table][key]})")
         seen[table][key] = lineno
         cell = cells[default_col].strip()
-        if key not in defaults:
+        if key not in defaults[table]:
             if not (table == "gw" and cell == "retired"
                     and f'"{key}"' in config_source):
                 errors.append(
@@ -164,10 +181,10 @@ def sync(text, gw_defaults, downfold_defaults, config_source, td_defaults=None,
             out.append(line)
             continue
         note = _HEAD.match(cell).group(2) or ""
-        cells[default_col] = f" {render_default(defaults[key])}{note} "
+        cells[default_col] = f" {render_default(defaults[table][key])}{note} "
         out.append("|".join(cells))
-    for table, defaults in tables.items():
-        for key in defaults:
+    for table, table_defaults in defaults.items():
+        for key in table_defaults:
             if key not in seen[table]:
                 errors.append(f"`{key}` ({table} deck) has no row; add one by "
                               f"hand in its section")
@@ -177,10 +194,7 @@ def sync(text, gw_defaults, downfold_defaults, config_source, td_defaults=None,
 def problems():
     """Every way the committed page differs from the parsers (empty = in step)."""
     text = OUT.read_text()
-    new, errors = sync(text, harvest_defaults(CONFIG, "_DEFAULTS"),
-                       harvest_defaults(DOWNFOLD, "DOWNFOLD_DEFAULTS"),
-                       CONFIG.read_text(), harvest_defaults(TD, "TD_DEFAULTS"),
-                       harvest_defaults(EPSMAT, "EPSMAT_DEFAULTS"))
+    new, errors = sync(text, harvest_tables(), CONFIG.read_text())
     if not errors and new != text:
         diff = difflib.unified_diff(text.split("\n"), new.split("\n"),
                                     "committed", "generated", lineterm="", n=0)
