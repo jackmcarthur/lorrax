@@ -129,7 +129,8 @@ def build_self_energy(deck: TdDeck, system: TdSystem, mesh) -> SelfEnergyModel:
         terms = v["lorrax.isdf_terms"]
         return isdf_model(system.model, mesh, k_frac=system.hdr["kpts"],
                           rho_eq=system.ops.rho_eq, sex=terms in ("both", "sex"),
-                          hartree=terms in ("both", "hartree"))
+                          hartree=terms in ("both", "hartree"),
+                          tda_n_val=_n_val(system.hdr) if v["lorrax.tda"] else None)
     if v["lorrax.model"] == "isdf":
         from tdagw.model import load_td_model
         terms = v["lorrax.isdf_terms"]
@@ -141,7 +142,8 @@ def build_self_energy(deck: TdDeck, system: TdSystem, mesh) -> SelfEnergyModel:
             n_occ=None if v["system.ivbm"] is None else int(v["system.ivbm"]))
         return isdf_model(model, mesh, k_frac=system.hdr["kpts"],
                           rho_eq=system.ops.rho_eq, sex=terms in ("both", "sex"),
-                          hartree=terms in ("both", "hartree"))
+                          hartree=terms in ("both", "hartree"),
+                          tda_n_val=_n_val(system.hdr) if v["lorrax.tda"] else None)
     path = v["lorrax.kernel_file"] or os.path.join(v["control.files.indir"],
                                                    "kernel.h5")
     if v["system.ivbm"] is None:

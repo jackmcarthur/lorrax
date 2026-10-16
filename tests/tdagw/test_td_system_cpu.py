@@ -329,3 +329,4 @@ def test_describe_prints_the_bundle_receipts(tmp_path):
     assert "TD system       : native bundle" in text and "pair rule mask at 0.05 eV" in text
     assert f"cc' below: {prec['cc']['below_gap']} of {prec['cc']['pairs']}" in text
     assert "gauge receipt   : <0|r|S> of 2 BSE states" in text and "rel dev 1.00e-15" in text
+
