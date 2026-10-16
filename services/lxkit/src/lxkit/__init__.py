@@ -1,8 +1,9 @@
 """``lxkit`` — the shared foundation every LORRAX service stands on.
 
-Six things that standalone services need and must not own private copies of:
+Seven things that standalone services need and must not own private copies of:
 the env-dial :class:`~lxkit.gate.Gate` (grammar, rank discipline,
-announce-or-refuse), the ABSENT-vs-BROKEN probe vocabulary
+announce-or-refuse), the platform legs of the native-provider ABI
+(:mod:`lxkit.legs`), the ABSENT-vs-BROKEN probe vocabulary
 (:mod:`lxkit.probe`), the loop-carry marking
 (:func:`mark_varying`), process-local array placement
 (:mod:`lxkit.placement`), native-provider selection/attestation policy
@@ -47,9 +48,21 @@ from lxkit.gate import (
     rank_id,
     reset_gate_state,
 )
-from lxkit import native_provider
-from lxkit.cache import user_cache_dir
-from lxkit.placement import device_put_process_local, device_put_process_tiles
+from lxkit import legs, native_provider
+from lxkit.legs import (
+    LEGS,
+    PlatformLeg,
+    accelerator_leg_to_open_first,
+    accelerator_legs,
+    leg_device_present,
+    leg_for_jax_platform,
+    leg_for_vendor,
+    process_accelerator_leg,
+)
+from lxkit.cache import atomic_write_bytes, user_cache_dir
+from lxkit.placement import (device_put_process_local, device_put_process_local_cached,
+                             device_put_process_tiles, placement_cache_stats)
+from lxkit.collectives import ordered_psum, ordered_psum_scatter
 from lxkit.probe import (
     AVAILABLE,
     LibraryNotBuilt,
@@ -78,9 +91,15 @@ __all__ = [
     "ProbeResult", "AVAILABLE", "LibraryNotBuilt", "LibraryUnusable",
     "unknown_target", "not_loadable", "missing_symbol",
     # JAX utilities
-    "device_put_process_local", "device_put_process_tiles", "mark_varying",
+    "device_put_process_local", "device_put_process_local_cached",
+    "device_put_process_tiles", "placement_cache_stats", "mark_varying",
+    "ordered_psum", "ordered_psum_scatter",
+    # the platform legs of the native-provider ABI
+    "legs", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
+    "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_vendor",
+    "process_accelerator_leg",
     # native-provider policy (the tables remain with each caller)
     "native_provider",
     # the per-user persistent-cache root
-    "user_cache_dir",
+    "atomic_write_bytes", "user_cache_dir",
 ]

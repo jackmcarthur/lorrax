@@ -414,13 +414,18 @@ def _weighted_tau_phases(enk, t, *, e_ref=0.0, mask=None,
 
 
 def _phase_band_interval(phases):
-    """Return each parent's smallest half-open interval containing nonzeros."""
+    """Return each parent's smallest half-open interval containing nonzeros.
+
+    A host array is reduced on the host (the same integer result), so host
+    weights never cross to the device and back for this bound.
+    """
+    xp = np if isinstance(phases, np.ndarray) else jnp
     nb = phases.shape[-1]
-    index = jnp.arange(nb, dtype=jnp.int32)
+    index = xp.arange(nb, dtype=xp.int32)
     live = phases != 0
-    lo = jnp.min(jnp.where(live, index, nb), axis=-1)
-    hi = jnp.max(jnp.where(live, index + 1, 0), axis=-1)
-    return jnp.minimum(lo, hi), hi
+    lo = xp.min(xp.where(live, index, nb), axis=-1)
+    hi = xp.max(xp.where(live, index + 1, 0), axis=-1)
+    return xp.minimum(lo, hi), hi
 
 
 def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,

@@ -77,7 +77,7 @@
  * vague-linkage names (slate::, blas::, xla::ffi::, libstdc++ internals) are
  * still defined by both files, and the FIRST library loaded still answers
  * them for both.  That is the SAME defect `libslate.so.2` / `libblaspp.so.2`
- * sharing one SONAME already is, it is what `_open_cuda_before_host` in both
+ * sharing one SONAME already is, it is what `_open_accelerator_before_host` in both
  * loaders exists for, and `test_so_acceptance.py`'s check 5 ratchets it.
  * It is NOT L1 and this file does not claim to fix it.
  *

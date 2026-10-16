@@ -156,7 +156,7 @@ def test_perlmutter_profile_refuses_a_missing_plugin():
     ({"NERSC_HOST": "perlmutter", "SLURM_STEP_NUM_NODES": "1"}, "unchanged"),
     ({"NERSC_HOST": "perlmutter", "NCCL_NET": "AWS Libfabric", **TWO_NODES},
      "explicit transport"),
-    ({"NERSC_HOST": "perlmutter", "JAX_PLATFORMS": "cpu", **TWO_NODES}, "non-CUDA"),
+    ({"NERSC_HOST": "perlmutter", "JAX_PLATFORMS": "cpu", **TWO_NODES}, "no device collectives"),
 ])
 def test_profile_leaves_other_steps_alone(env, policy):
     result = plan(env)
@@ -181,3 +181,58 @@ def test_an_unknown_explicit_site_refuses():
 def test_perlmutter_profile_carries_the_comm_model_row():
     row = ne.site_profile({"NERSC_HOST": "perlmutter"})["comm_model"]
     assert row["beta_Bps"] == 19.7e9 and row["alpha0_s"] == 31.6e-6
+
+
+# --- Frontier (ROCm, RCCL) ----------------------------------------------------
+
+FRONTIER = dict(LMOD_SYSTEM_NAME="frontier", JAX_PLATFORMS="rocm,cpu",
+                SLURM_STEP_NODELIST="frontier[07208,07210]")
+
+
+def test_frontier_profile_applies_the_rccl_module_settings():
+    result = plan({**FRONTIER, "LD_LIBRARY_PATH": "/shim"})
+    assert result["policy"] == "frontier profile" and result["library"] == "RCCL"
+    applied = result["applied"]
+    assert applied["NCCL_NET"] == "AWS Libfabric" and applied["NCCL_NET_GDR_LEVEL"] == "PHB"
+    assert applied["NCCL_NET_PLUGIN"].endswith("/rocm/7.13.0/lib/librccl-net.so")
+    assert applied["FI_CXI_RDZV_THRESHOLD"] == "0" and applied["FI_MR_CACHE_MONITOR"] == "kdreg2"
+    assert result["mpi_before_collectives"] is True
+    assert plan({"NERSC_HOST": "perlmutter", **TWO_NODES})["mpi_before_collectives"] is False
+    kept = plan({**FRONTIER, "LD_LIBRARY_PATH": "/shim", "FI_MR_CACHE_MONITOR": "memhooks"})
+    assert "FI_MR_CACHE_MONITOR" not in kept["applied"]
+
+
+def test_frontier_profile_refuses_a_launch_without_the_hsa_name():
+    with pytest.raises(RuntimeError, match="GATE launch_libraries.*libhsa-runtime64.so.*rocm_env.sh"):
+        ne.plan_network_environment({**FRONTIER, "LD_LIBRARY_PATH": "/a:/b"},
+                                    is_file=lambda path: not path.endswith("libhsa-runtime64.so"))
+
+
+def test_rocm_single_node_and_cpu_keep_the_library_policy():
+    one = plan({**FRONTIER, "SLURM_STEP_NODELIST": "frontier07208"})
+    assert one["policy"] == "unchanged" and one["applied"] == {}
+    cpu = plan({**FRONTIER, "JAX_PLATFORMS": "cpu"})
+    assert cpu["policy"] == "no device collectives"
+
+
+def test_the_frontier_site_rule_sets_scratch(tmp_path):
+    import runtime
+    work = tmp_path / "mat280"
+    work.mkdir()
+    env = {"LMOD_SYSTEM_NAME": "frontier", "MEMBERWORK": str(tmp_path), "SLURM_JOB_ACCOUNT": "mat280"}
+    assert runtime.site_scratch(env) == (str(work), "frontier profile")
+    path, why = runtime.site_scratch({k: v for k, v in env.items() if k != "SLURM_JOB_ACCOUNT"})
+    assert path is None and "does not expand" in why
+    assert runtime.site_scratch({**env, "SCRATCH": "/s"}) == (None, "SCRATCH is set")
+
+
+def test_the_profiler_gate_refuses_rocprofv3_above_one_process(monkeypatch):
+    import runtime
+    monkeypatch.setenv("JAX_PLATFORMS", "rocm,cpu")
+    monkeypatch.setenv("SLURM_NTASKS", "4")
+    env = {"LD_PRELOAD": "/x/librocprofiler-sdk-tool.so"}
+    with pytest.raises(RuntimeError, match="GATE profiler.*rocprofv3"):
+        runtime.check_profiler_ranks(environ=env, maps_text="")
+    runtime.check_profiler_ranks(environ={}, maps_text="")          # not profiled
+    monkeypatch.setenv("SLURM_NTASKS", "1")
+    runtime.check_profiler_ranks(environ=env, maps_text="")         # one process

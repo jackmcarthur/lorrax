@@ -251,10 +251,20 @@ def axis_mask(tag: PaddedAxis, *, dtype=bool):
 
 
 def jax_slice_axis(A, stop: int, *, axis: int):
-    """JAX/NumPy-compatible leading slice used by owner operations."""
-    index = [slice(None)] * int(A.ndim)
-    index[int(axis) % int(A.ndim)] = slice(0, int(stop))
-    return A[tuple(index)]
+    """JAX/NumPy-compatible leading slice used by owner operations.
+
+    A JAX array takes ``lax.slice_in_dim`` (static bounds): eager ``A[0:stop]``
+    lowers to a dynamic slice whose start is a host scalar transferred per call.
+    """
+    import numpy as np
+
+    ax = int(axis) % int(A.ndim)
+    if isinstance(A, np.ndarray):
+        index = [slice(None)] * int(A.ndim)
+        index[ax] = slice(0, int(stop))
+        return A[tuple(index)]
+    import jax
+    return jax.lax.slice_in_dim(A, 0, int(stop), axis=ax)
 
 
 def _pad_body(A, fill, diagonal, *, logical, carrier, axes):

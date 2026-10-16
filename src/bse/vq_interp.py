@@ -110,6 +110,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from distrib_la import plan as linalg_plan                          # noqa: E402
+from distrib_la import eigh_local
 
 # pipeline constants (§13.5 production shape; reference values verbatim)
 ALPHA = 0.30          # Gaussian split width, 1/bohr; broad optimum ~1.5-2x dq
@@ -1027,7 +1028,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
         @partial(jax.jit, out_shardings=(qb2, qb3))
         def _eigh_batch(C):
             C = jax.lax.with_sharding_constraint(C, qb3)
-            lam, R = jnp.linalg.eigh(C)
+            lam, R = eigh_local(C)
             return lam, R
         return _eigh_batch
 

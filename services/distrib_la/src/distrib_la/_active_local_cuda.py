@@ -1,8 +1,11 @@
-"""Exact active-range local GEMM through classic cuBLAS.
+"""Exact active-range local GEMM through classic BLAS (cuBLAS on CUDA, rocBLAS on ROCM).
 
-Its callers import it only for a mesh whose device vendor is NVIDIA
-(``distrib_la.mesh_platform(mesh) == "CUDA"``), so it never loads a CUDA
-library elsewhere.  Each invocation operates on one process-local tile and
+Its callers import it only for a mesh whose ``ACTIVE_LOCAL_ROUTE`` row is
+``"native"`` (``_active_local.active_local_route(mesh_platform(mesh))``), and
+pass that platform key to the probes, so it never loads a device library
+elsewhere.  Both device legs build the same leg-neutral handler
+(``src/ffi/cpp/cublas/local_active_gemm_ffi.cc`` over ``common/gpu_blas.h``),
+so the target names, the contract and this module are one for both.  Each invocation operates on one process-local tile and
 issues no communication.  Runtime bounds remain device operands; the FFI reads
 only their small metadata array to the host and views the original row-major
 buffers without packing slices.  It stays the CUDA arm because it is 3.7-5.0x
@@ -26,18 +29,18 @@ _PREPARED_TARGET = "lorrax_cublas_local_prepared_active_range_gemm"
 _WORKSPACE_BYTES = 4 * 1024 * 1024
 
 
-def require_active_local_cuda() -> None:
-    """Load and capability-probe the CUDA handler before tracing a plan."""
+def require_active_local_cuda(platform: str = "CUDA") -> None:
+    """Load and capability-probe the device handler (``platform``: CUDA | ROCM) before tracing."""
     for target in (_TARGET, _OUT_TARGET):
-        usable, reason = probe_target(target, "CUDA")
+        usable, reason = probe_target(target, platform)
         if not usable:
             raise RuntimeError(
                 "local active cuBLAS GEMM is unavailable: " + reason)
 
 
-def require_prepared_active_local_cuda() -> None:
-    """Load and capability-probe the prepared CUDA handler before tracing."""
-    usable, reason = probe_target(_PREPARED_TARGET, "CUDA")
+def require_prepared_active_local_cuda(platform: str = "CUDA") -> None:
+    """Load and capability-probe the prepared device handler (CUDA | ROCM) before tracing."""
+    usable, reason = probe_target(_PREPARED_TARGET, platform)
     if not usable:
         raise RuntimeError(
             "local prepared active cuBLAS GEMM is unavailable: " + reason)
@@ -146,14 +149,22 @@ def _prepared_native(a, b, c, *, active_bounds, alpha, beta):
 #   loop, host-blocked 2.04 -> 0 s with the sweep unchanged (2829).
 # Decides it: flops scale with the live interval; the bounds read is cheap because the GPU queue
 #   refills within ~20 us of it (2829).
-def active_local_cuda(a, b, bounds, weights, c=None, *, alpha, beta):
+def active_local_cuda(a, b, bounds, weights, c=None, *, alpha, beta, guard="cond"):
     """Compute weighted local interval products with fixed allocation shapes.
 
     ``a`` is ``(nq,m,K)``, ``b`` is ``(nq,K,n)``, ``bounds`` is
     ``(nq,2)``, and ``weights`` is ``(nq,K)``.  All are local values inside
-    the plan's shard_map. Full bounds retain the original JAX dense product;
-    valid partial bounds use the cuBLAS pointer-view handler; invalid dynamic
-    bounds produce an all-NaN result without entering the native call.
+    the plan's shard_map.  ``guard`` (``_active_local.ACTIVE_LOCAL_GUARD``):
+    ``"cond"`` -- full bounds retain the original JAX dense product, valid
+    partial bounds use the pointer-view handler, invalid dynamic bounds
+    produce an all-NaN result without entering the native call;
+    ``"select"`` -- no device control flow: every row of an invalid set is
+    replaced by an empty interval, the handler always runs (full bounds
+    included), and the result is NaN where the bounds were invalid;
+    ``"full"`` -- no host read: the prepared target over all K columns with
+    the weights zeroed outside each row's interval (NaN for invalid bounds),
+    exact for finite inactive storage, NaN in a row whose inactive storage is
+    not finite (see ``ACTIVE_LOCAL_GUARD``).
     """
     if a.ndim != 3 or b.ndim != 3 or a.shape[0] != b.shape[0] or a.shape[2] != b.shape[1]:
         raise ValueError("local active cuBLAS GEMM operand geometry mismatch")
@@ -173,6 +184,23 @@ def active_local_cuda(a, b, bounds, weights, c=None, *, alpha, beta):
     weighted_a = a * weights[:, None, :]
     lo, hi = bounds[:, 0], bounds[:, 1]
     valid = jnp.all((lo >= 0) & (lo <= hi) & (hi <= a.shape[2]))
+    if guard == "full":
+        col = jnp.arange(a.shape[2], dtype=bounds.dtype)
+        live = (col >= lo[:, None]) & (col < hi[:, None])
+        w = jnp.where(valid, jnp.where(live, weights, jnp.zeros((), a.dtype)),
+                      jnp.full((), jnp.nan, a.dtype))
+        cc = jnp.zeros(shape, a.dtype) if c is None else c
+        every = np.array([0, a.shape[2]], np.int64)
+        return _prepared_native(a * w[:, None, :], b, cc, active_bounds=every, alpha=alpha,
+                                beta=beta if c is not None else np.complex128(0.0))
+    if guard == "select":
+        safe = jnp.where(valid, bounds, jnp.zeros_like(bounds))
+        result = (_native_out(weighted_a, b, safe, alpha=alpha) if c is None
+                  else _native(weighted_a, b, safe, c, alpha=alpha, beta=beta))
+        return jnp.where(valid, result, jnp.full((), jnp.nan, a.dtype))
+    if guard != "cond":
+        raise ValueError(
+            f"local active GEMM guard must be 'cond', 'select' or 'full', got {guard!r}")
     full = jnp.all((lo == 0) & (hi == a.shape[2]))
     nan = lambda _: jnp.full(shape, jnp.nan, dtype=a.dtype)
     # No C: the `_out` handler writes every row itself (no zero-filled alias).

@@ -32,7 +32,7 @@
 // the unfused chain): the 64-column bank in opt-in shared memory, every axis <= 40 (the fp64
 // cuFFTDx thread FFT), K a multiple of 4 (the kconv call zero-pads), complex128 only.
 //
-// The NVRTC build, the disk cache and the version keying are common/nvrtc_build.h's, exactly
+// The NVRTC build, the disk cache and the version keying are common/rtc_build.h's, exactly
 // as the family's (the same mathdx toolchain headers enter the key).
 
 #include <algorithm>
@@ -46,7 +46,7 @@
 #include <tuple>
 
 #include "../common/mkl_thread_pin.h"
-#include "../common/nvrtc_build.h"
+#include "../common/rtc_build.h"
 #include "kbox_stage.cuh"          // host half: Geometry
 #include "kbox_stage_src.h"        // the same file as text, embedded into the NVRTC program
 
@@ -212,9 +212,9 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
 }
 )__lrx__";
 
-using nvrtc::DriverApi;
-using nvrtc::driver_api;
-using nvrtc::cu_err;
+using rtc::DriverApi;
+using rtc::driver_api;
+using rtc::err_string;
 
 struct Built { CUfunction fn = nullptr; int smem = 0, minb = 1, sms = 0; };
 using Key = std::tuple<CUcontext, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, fma
@@ -231,7 +231,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int fma, std::string_v
     if (cr != CUDA_SUCCESS || ctx == nullptr) {
         if (cudaFree(nullptr) != cudaSuccess) return fail("context bind", "cudaFree(0)");
         cr = api.CtxGetCurrent(&ctx);
-        if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
+        if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", err_string(cr));
     }
     const Key key{ctx, nkx, nky, nkz, K, fma};
     std::lock_guard<std::mutex> lock(g_mu);
@@ -266,13 +266,13 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int fma, std::string_v
     }
     const int minb = std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
     std::string why;
-    const std::string cuda_inc = nvrtc::toolkit_include(&why);
+    const std::string cuda_inc = rtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
     const std::string root(mathdx_root);
-    if (!nvrtc::exists(root + "/include/cufftdx.hpp"))
+    if (!rtc::exists(root + "/include/cufftdx.hpp"))
         return sticky("GATE mathdx-headers", "got no cufftdx.hpp under " + root + "/include; want the "
                       "nvidia-mathdx wheel; fix: pip install nvidia-mathdx", ffi::ErrorCode::kFailedPrecondition);
-    nvrtc::Program prog;
+    rtc::Program prog;
     prog.src = kOuterSrc;
     prog.name = "lrx_kconv_outer.cu";
     prog.headers = {{kbox::kHeaderName, kbox::kHeaderSrc}};
@@ -283,10 +283,10 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int fma, std::string_v
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
         "-DLRX_MINB=" + std::to_string(minb), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10),
         "-DLRX_FMA=" + std::to_string(fma)};
-    nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
+    rtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer";
     std::string missing;
-    const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));
+    const std::string key_hex = rtc::hex16(rtc::key(prog, &missing));
     const std::string dir(missing.empty() ? std::string(cubin_dir) : std::string());
     std::string path;
     if (!dir.empty()) {
@@ -295,16 +295,16 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int fma, std::string_v
              << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
-    nvrtc::Image img;
+    rtc::Image img;
     std::string where, err;
-    if (!nvrtc::build(prog, dir, path, key_hex, &img, &where, &err)) return sticky(where.c_str(), err);
+    if (!rtc::build(prog, dir, path, key_hex, &img, &where, &err)) return sticky(where.c_str(), err);
     Built b;
     b.fn = img.fn;
     b.smem = static_cast<int>(smem);
     b.minb = minb;
     b.sms = sms;
     cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
-    if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
+    if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", err_string(cr));
     if (mklpin::announce_here() || mklpin::debug_print_here()) {
         std::fprintf(stderr, "[kconv_outer] %s kgrid=(%d,%d,%d) K=%d %s sm_%d%d in %.1f ms (8x8 tile, %d threads, "
                      "%d blocks/SM, smem=%d B, cubin %s)\n",
@@ -379,7 +379,7 @@ static ffi::Error KleadOuterConvImpl(cudaStream_t stream, ffi::AnyBuffer L, ffi:
     CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
                                             static_cast<unsigned>(k->smem), reinterpret_cast<CUstream>(stream),
                                             args, nullptr);
-    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", err_string(cr));
     return ffi::Error::Success();
 }
 
@@ -780,7 +780,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     if (cr != CUDA_SUCCESS || ctx == nullptr) {
         if (cudaFree(nullptr) != cudaSuccess) return fail("context bind", "cudaFree(0)");
         cr = api.CtxGetCurrent(&ctx);
-        if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
+        if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", err_string(cr));
     }
     int dev = 0, cc_major = 0, cc_minor = 0, smem_optin = 0, sms = 0;
     if (cudaGetDevice(&dev) != cudaSuccess ||
@@ -820,13 +820,13 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     }
     const long long smem = vstage ? smemv : smem2;
     std::string why;
-    const std::string cuda_inc = nvrtc::toolkit_include(&why);
+    const std::string cuda_inc = rtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
     const std::string root(mathdx_root);
-    if (!nvrtc::exists(root + "/include/cufftdx.hpp"))
+    if (!rtc::exists(root + "/include/cufftdx.hpp"))
         return sticky("GATE mathdx-headers", "got no cufftdx.hpp under " + root + "/include; want the "
                       "nvidia-mathdx wheel; fix: pip install nvidia-mathdx", ffi::ErrorCode::kFailedPrecondition);
-    nvrtc::Program prog;
+    rtc::Program prog;
     prog.src = kDecodeSrc;
     prog.name = "lrx_kconv_outer_decode.cu";
     prog.headers = {{kbox::kHeaderName, kbox::kHeaderSrc}};
@@ -837,10 +837,10 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
         "-DLRX_MB=" + std::to_string(mb), "-DLRX_CONJ=" + std::to_string(conj_r), "-DLRX_FMA=" + std::to_string(fma),
         "-DLRX_VSTAGE=" + std::to_string(vstage), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
-    nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
+    rtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer_decode";
     std::string missing;
-    const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));
+    const std::string key_hex = rtc::hex16(rtc::key(prog, &missing));
     const std::string dir(missing.empty() ? std::string(cubin_dir) : std::string());
     std::string path;
     if (!dir.empty()) {
@@ -850,16 +850,16 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
              << key_hex << ".cubin";
         path = name.str();
     }
-    nvrtc::Image img;
+    rtc::Image img;
     std::string where, err;
-    if (!nvrtc::build(prog, dir, path, key_hex, &img, &where, &err)) return sticky(where.c_str(), err);
+    if (!rtc::build(prog, dir, path, key_hex, &img, &where, &err)) return sticky(where.c_str(), err);
     Built b;
     b.fn = img.fn;
     b.smem = static_cast<int>(smem);
     b.minb = 1;
     b.sms = sms;
     cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
-    if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
+    if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", err_string(cr));
     if (mklpin::announce_here() || mklpin::debug_print_here()) {
         std::fprintf(stderr, "[kconv_outer] decode %s kgrid=(%d,%d,%d) K=%d c-blocks=%d conj_r=%d K-sum=%s V=%s sm_%d%d "
                      "in %.1f ms (8x8 tile, ping-pong 2 x 8 warps, 1 block/SM, smem=%d B of %d, cubin %s)\n",
@@ -956,7 +956,7 @@ static ffi::Error KleadOuterDecode(cudaStream_t stream, ffi::ScratchAllocator sc
     CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(grid), 1, 1, kThreads, 1, 1,
                                             static_cast<unsigned>(k->smem), reinterpret_cast<CUstream>(stream),
                                             args, nullptr);
-    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", err_string(cr));
     return ffi::Error::Success();
 }
 

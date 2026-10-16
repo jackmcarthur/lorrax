@@ -134,6 +134,7 @@ class _CacheState:
         self.receipt_mark = (0, 0.0, 0, {})   # compile_receipt's last window edge
         self.read_secs = 0.0   # time spent loading executables from disk
         self.namespace = ""    # default-policy namespace ("" when explicit/off)
+        self.vendor_caches: list = []   # runtime_kernel_caches variables this process set
         self.compile_agreement_configured = False
         self.compile_agreement_enabled = False
         self.compile_agreement_reason = "not installed"
@@ -826,6 +827,7 @@ def _install_compile_counter() -> None:
     _orig = getattr(_compiler, _COMPILE_ENTRY_POINT)
     _orig_request = getattr(_compiler, _COMPILE_REQUEST_POINT)
 
+    @functools.wraps(_orig_request)
     def _requested(*args, **kwargs):
         s = _STATE
         if not (s.compile_agreement_enabled or s._pool is not None):
@@ -888,6 +890,7 @@ def _install_compile_counter() -> None:
                  f"({seconds:.1f} s); JAX's persistent cache never stores it, so it "
                  f"compiles again in every process")
 
+    @functools.wraps(_orig)
     def _counting(*args, **kwargs):
         current = getattr(_STATE._compile_local, "current", None)
         if _STATE.compile_agreement_enabled and current is not None:
@@ -1061,6 +1064,7 @@ def compile_cache_stats() -> dict:
         "write_scope": "process-local; JAX writes on process 0 only",
         "keys": sorted(s.probe_keys),
         "demotions": dict(s.demotions),
+        "vendor_caches": {k: os.environ.get(k) for k in s.vendor_caches},
     }
 
 
@@ -1118,8 +1122,9 @@ def _ffi_identity() -> str:
         from ffi.common import ffi_loader
     except Exception:                                      # noqa: BLE001
         return "noffi"
+    from lxkit import LEGS
     ids = set()
-    for platform in ("CUDA", "cpu"):
+    for platform in LEGS:
         path = ffi_loader.loaded_lib_path(platform)
         if path is None:
             path = next((c for c in ffi_loader._candidate_paths(platform)
@@ -1287,6 +1292,46 @@ def _disarm_persistent_cache(_jax) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _arm_runtime_kernel_caches(cache_base: Path, proc_idx: int) -> list:
+    """Point the leg's run-time kernel caches beside the compile cache; return what was set.
+
+    Some vendor libraries compile device kernels at run time and keep them
+    across processes only where a variable points
+    (``PlatformLeg.runtime_kernel_caches``; on ROCM AMD comgr's code objects).
+    Content-keyed kernel stores that outlive this namespace (rocFFT's) are
+    ``runtime_kernel_stores``, armed by :mod:`runtime.vendor_kernels`.  A ``"process-file"`` cache is
+    one file per process index under ``<cache>/np<P>/vendor/`` (several
+    writers on one rocFFT SQLite file on Lustre spin without progress, hsuite
+    P4, Frontier); a ``"shared-dir"`` one is a directory there.  A variable
+    the caller exported wins.  Runs before the first FFT, which is when
+    rocFFT reads its variable.  Never raises: a cache that cannot be placed
+    is named once and the library compiles again, as without it.
+    """
+    try:
+        import jax as _jax
+        from lxkit import device_vendor, leg_for_vendor
+        leg = leg_for_vendor(device_vendor(_jax.local_devices()[0]))
+    except Exception:                                      # noqa: BLE001
+        return []
+    armed = []
+    for env, name, scope in (leg.runtime_kernel_caches if leg is not None else ()):
+        if os.environ.get(env):
+            continue
+        base = cache_base / "vendor"
+        path = base / (f"{name}.p{proc_idx}.db" if scope == "process-file" else name)
+        try:
+            (path if scope != "process-file" else base).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            if proc_idx == 0:
+                _say(f"{env} not set: cannot create {path} ({exc}); {leg.key} "
+                     f"run-time kernels compile again in every process.")
+            continue
+        os.environ[env] = str(path)
+        armed.append(env)
+    _STATE.vendor_caches = armed
+    return armed
+
+
 # ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
@@ -1379,6 +1424,8 @@ def ensure_jax_compile_cache() -> None:
     if n_proc > 1:
         _install_rank_invariant_cpu_key()
     _STATE.enabled = True
+    # The vendor kernels do not depend on P: one store per namespace, beside np<P>.
+    _arm_runtime_kernel_caches(Path(cache_dir).expanduser(), proc_idx)
     if cache_source != "explicit":
         _STATE.namespace = Path(cache_dir).name
         if proc_idx == 0:

@@ -28,6 +28,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la import loader
 from distrib_la._collectives import broadcast_bytes
+from distrib_la._cyclic import cyclic_to_block, largest_divisor, pad_with_sentinels
 from distrib_la._shape import ipiv_local_len
 from jax import shard_map
 from distrib_la.resolve import mesh_key
@@ -224,7 +225,8 @@ _JIT_CACHE: dict = {}
 _mesh_key = mesh_key
 
 
-# Block-cyclic eigh by relabeling.  A P('x','y') operand is one (n/p, n/p)
+# Block-cyclic eigh by relabeling (the helpers live in distrib_la._cyclic,
+# shared with the SLATE eigh).  A P('x','y') operand is one (n/p, n/p)
 # tile per rank.  Handing cuSOLVERMp the SAME local buffers with a smaller
 # square block mb (mb | n/p) makes it read them as Pi A Pi^T, Pi sending rank
 # r's local block c to global block c*p + r.  Rows and columns get the same
@@ -249,7 +251,7 @@ _BLOCK_MIN = 128
 
 def _largest_block(local: int) -> int:
     """The largest divisor of a tile edge ``local`` that is at most :data:`_BLOCK_MAX`."""
-    return max(d for d in range(1, min(local, _BLOCK_MAX) + 1) if local % d == 0)
+    return largest_divisor(local, _BLOCK_MAX)
 
 
 def _block_size(n: int, p: int) -> int:
@@ -278,23 +280,6 @@ def solve_layout(n: int, p: int) -> tuple[int, int]:
     padded = next(m for m in range(local + 1, local + _BLOCK_MIN + 1)
                   if _largest_block(m) >= _BLOCK_MIN)
     return p * padded, _largest_block(padded)
-
-
-def pad_with_sentinels(a, side: int):
-    """``a`` (n x n) padded to ``side``, the padded diagonal below its spectrum.
-
-    The padded rows and columns are zero except their diagonal, which holds
-    distinct sentinels ``-2 b (1 + j/side)``, ``b`` the Gershgorin bound of
-    ``a``: decoupled eigenpairs below every eigenvalue of ``a``.
-    """
-    n = int(a.shape[-1])
-    bound = jnp.max(jnp.sum(jnp.abs(a), axis=-1))
-    bound = jnp.where(bound > 0, bound, 1).astype(jnp.float64)
-    row = jax.lax.broadcasted_iota(jnp.int32, (side, side), 0)
-    col = jax.lax.broadcasted_iota(jnp.int32, (side, side), 1)
-    sentinel = -2 * bound * (1 + (col - n).astype(jnp.float64) / side)
-    whole = jnp.pad(a, ((0, side - n), (0, side - n)))
-    return whole + jnp.where((row == col) & (col >= n), sentinel, 0).astype(a.dtype)
 
 
 def drop_sentinels(W, Q, n: int):
@@ -327,32 +312,9 @@ def retry_block(n: int, p: int) -> int | None:
 
 
 def _cyclic_rows_to_block(Q, *, n: int, p: int, mb: int):
-    """Inside a shard_map: put rows held block-cyclically over 'x' in order.
-
-    Local row ``c*mb + t`` of 'x' rank ``a`` is global row
-    ``(c*p + a)*mb + t``; it moves to rank ``g // C``, slot ``g % C`` of
-    the contiguous layout (``g = c*p + a``, ``C = n/(p*mb)``).  Each pair of
-    ranks exchanges a contiguous run of at most ``J`` blocks, padded to
-    ``J`` for one ``all_to_all``.
-    """
-    C = n // (p * mb)
-    runs = [[(max(0, -(-(t * C - a) // p)),
-              min(C, -(-((t + 1) * C - a) // p))) for t in range(p)]
-            for a in range(p)]
-    J = max(hi - lo for row in runs for lo, hi in row)
-    send = np.zeros((p, p * J), np.int32)       # [a, t*J + j] -> local block
-    recv = np.zeros((p, C), np.int32)           # [t, slot] -> s*J + j
-    for a in range(p):
-        for t, (lo, hi) in enumerate(runs[a]):
-            for j, c in enumerate(range(lo, hi)):
-                send[a, t * J + j] = c
-                recv[t, (c * p + a) - t * C] = a * J + j
-    a = jax.lax.axis_index("x")
-    blocks = Q.reshape(C, mb, Q.shape[-1])
-    out = jnp.take(blocks, jnp.asarray(send)[a], axis=0)
-    out = jax.lax.all_to_all(out, "x", 0, 0, tiled=True)
-    out = jnp.take(out, jnp.asarray(recv)[a], axis=0)
-    return out.reshape(Q.shape)
+    """Inside a shard_map: put rows held block-cyclically over 'x' in order
+    (:func:`distrib_la._cyclic.cyclic_to_block` on ``'x'``)."""
+    return cyclic_to_block(Q, n=n, p=p, mb=mb, axis="x")
 
 
 def _validate_mesh(mesh: Mesh):

@@ -124,7 +124,7 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     return out
 
 
-def sector_line_selection(bank, meta, *, mesh_xy, execution, nq):
+def sector_line_selection(bank, meta, *, mesh_xy, execution, nq, eigh_backend):
     """The photon bank's C and T families for the producer's line selection.
 
     Each endpoint block is cut from the face-tiled photon operator exactly as
@@ -152,7 +152,8 @@ def sector_line_selection(bank, meta, *, mesh_xy, execution, nq):
         families.append(dict(name=('C','T')[family],index=family,
             recipe=sector_recipe(meta.shared_pole_recipe,n),logical_n=n,
             rows=(3 if family else 1)*int(basis.n_packed),cross=True))
-    return LineSelection(families,block,mesh_xy=mesh_xy,ordered=True,execution=execution,nq=nq)
+    return LineSelection(families,block,mesh_xy=mesh_xy,ordered=True,execution=execution,nq=nq,
+                         eigh_backend=eigh_backend)
 
 
 def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=print):
@@ -180,7 +181,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
     from common.collectives import (device_put_process_local, gather_to_host,
                                     rank0_transaction)
     from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata, open_shared_pole_bank,
-        read_line_panels,write_shared_pole_model,write_shared_pole_sector_manifest)
+        read_line_panel_round,write_shared_pole_model,write_shared_pole_sector_manifest)
     from gw.shared_pole_local import batch_to_face,canonical_factors,carrier_history,face_rows,parent_rounds
     from gw.shared_pole_screening import _json
     from gw.shared_pole_directions import _sample_point
@@ -208,9 +209,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
 
     def read_line(io,family,ids,layout,cross=False):
         spec=None if layout=='face' else P(('x','y'))
-        return {sid:read_line_panels(io,meta=meta,header=header,family=('C','T')[family],sample=sid,
-                                     cross=cross,q_ids=ids,partition_spec=spec)
-                for sid in range(line_lo,line_hi)}
+        # The round's line panels in one collective read (SlabIO.read_multi).
+        return read_line_panel_round(io,meta=meta,header=header,family=('C','T')[family],
+                                     samples=range(line_lo,line_hi),cross=cross,q_ids=ids,
+                                     partition_spec=spec)
 
     def read_diagonal(family,ids,real,layout='face',retained=()):
         # One sector's moments, dense samples and line panels for ``ids``.
@@ -775,7 +777,8 @@ def staged_sector(read, ids, real, meta, config, geometry, *, mesh_xy, route):
     # The selection runs the round's parents at once: its eighs run one whole matrix per rank,
     # so its unit is the layer of the round (decisions.md#fixed-tile), one [R x dense] stack per kind.
     stack=(width*max(1,int(tile['dense'])),packed,packed)
-    eig=staged_eigh(mesh_xy,stack,width*int(tile['unit']),ledger=ledger,live=ambient,label=f'{name} selection')
+    eig=staged_eigh(mesh_xy,stack,width*int(tile['unit']),ledger=ledger,live=ambient,label=f'{name} selection',
+                    backend=budget._resolution.eigh_backend)
     with timing.section('decoupled.selection'):
         samples,moments,line=read(ids,width)
         line={} if line is None else line
@@ -806,7 +809,8 @@ def staged_sector(read, ids, real, meta, config, geometry, *, mesh_xy, route):
                        concurrent_with=ambient)
     ledger.live_stages=(*ambient,row['stage'])
     labels=('H_vv','Schur','reduced')
-    plans=tuple(staged_eigh(mesh_xy,(width,m,m),bound+held,ledger=ledger,live=ambient,label=f'{name} {label}')
+    plans=tuple(staged_eigh(mesh_xy,(width,m,m),bound+held,ledger=ledger,live=ambient,label=f'{name} {label}',
+                            backend=budget._resolution.eigh_backend)
                 for (m,bound),label in zip(boundaries,labels))
 
     @contextmanager
@@ -879,7 +883,8 @@ def slice_sector(sector, slots, mesh_xy):
     return out
 
 
-def staged_cross(sectors, read, ids, real, meta, *, mesh_xy, sample_ids, cross_elements, released, release):
+def staged_cross(sectors, read, ids, real, meta, *, mesh_xy, sample_ids, cross_elements, released, release,
+                 eigh_backend):
     """One round's CT from its CC and TT on the face: each sub-batch's joint pencil from its own
     samples (``read(ids, real)``; ``cross_elements`` its cross panels per parent, priced) at one
     compacted span for the round, written in place into
@@ -887,7 +892,8 @@ def staged_cross(sectors, read, ids, real, meta, *, mesh_xy, sample_ids, cross_e
     round's stack. The pencils run beside the sectors' held outputs (the ledger's live stages);
     ``release()`` then drops the sectors' selection panels and spans, and the eighs run beside
     ``released``. Priced at the round's joint side; sub-batches are the widest halving of the
-    round whose pencil program fits beside the stacks. Returns the round's CT outputs."""
+    round whose pencil program fits beside the stacks. ``eigh_backend`` is the deck's eigh request
+    for a whole-mesh stack (``staged_eigh``). Returns the round's CT outputs."""
     import jax
     import numpy as np
     import distrib_la
@@ -932,7 +938,8 @@ def staged_cross(sectors, read, ids, real, meta, *, mesh_xy, sample_ids, cross_e
             pencil=list(_assemble(mesh_xy,width,parts()))
         release()
         ledger.live_stages=(*released,stack_row['stage'])
-        plans=tuple(staged_eigh(mesh_xy,(width,m,m),bound,ledger=ledger,live=released,label=f'CT {label}')
+        plans=tuple(staged_eigh(mesh_xy,(width,m,m),bound,ledger=ledger,live=released,label=f'CT {label}',
+                                backend=eigh_backend)
                     for (m,bound),label in zip(boundaries,('metric','Ritz')))
 
         @contextmanager
@@ -1574,7 +1581,8 @@ def staged_round(read_diagonal, read_cross, ids, real, meta, config, geometry, *
         sectors=[whole[0],whole[1]]
         with timing.section('spole.sector.CT.all', announce=True):
             cross=staged_cross(sectors,read_cross,ids,real,meta,mesh_xy=mesh_xy,cross_elements=route['CT'],
-                sample_ids=sample_ids,released=(*upstream,*kept),release=lambda:release_selection_panels(sectors))
+                sample_ids=sample_ids,released=(*upstream,*kept),release=lambda:release_selection_panels(sectors),
+                eigh_backend=linalg_resolution({'linalg':config.backend.linalg}).eigh_backend)
         rows[0]['joint']['staged']=cross['staged']
     finally:
         ledger.live_stages=upstream

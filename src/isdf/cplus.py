@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from common import rank_criterion
+from distrib_la import eigh_local
 
 
 def apply(B, Z):
@@ -35,7 +36,7 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
     # errors that GN-PPM magnifies to tens of eV.  Rank-truncation
     # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
     # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
-    lam, V = jnp.linalg.eigh(C_log)      # Hermitian-SPD, λ ascending
+    lam, V = eigh_local(C_log)      # Hermitian-SPD, λ ascending
     lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
     keep = lam > (rcond * lam_max)       # near-null cut
     # …and the near-null cut is not allowed to stop mid-multiplet.  THIS

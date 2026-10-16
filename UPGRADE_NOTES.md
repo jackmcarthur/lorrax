@@ -116,6 +116,27 @@ Deck changes:
 - GN/HL-PPM's q→0 head is now the closed form MPA's is; its grid values are
   unchanged.
 
+## 2026-10-14 — one platform-leg table; ROCM is a declared leg
+
+The per-platform facts of the native libraries (file, pin, build directory,
+C-ABI suffix, ABI symbol, and how a process knows it can host a device leg)
+were restated in `lxkit.gate`, `lxkit.native_provider`, `ffi.common.ffi_loader`,
+`distrib_la.loader` and `runtime`. They are now one table, `lxkit.LEGS`
+([platform legs](docs/architecture/ffi_layout.md#platform-legs)), and the two
+loaders' copies of the CUDA-first open logic are one function
+(`lxkit.accelerator_leg_to_open_first`).
+
+No result moves on CUDA or cpu, and no deck or environment change is needed
+there: the CUDA and host legs keep their file names, pins and ABI symbols, and
+a sealed CUDA bundle loads as before (`tests/test_platform_legs.py` pins the
+facts). On a ROCm mesh the FFI platform key is now `ROCM`, a declared leg
+whose library (`liblorrax_ffi_rocm.so`, pin `LORRAX_FFI_ROCM_SO`) is not built
+yet: a request for a native target refuses by naming that file, where it
+used to refuse with `unknown platform 'rocm'`. `distrib_la.resolve` keys its
+ROCm rows `ROCM`. On WSL2 the loaders now see the mapped libcuda as a CUDA
+device, as `runtime` already did, so the CUDA leg opens before the host leg
+there too.
+
 ## 2026-10-13 — FFI bundle: the LU factors are a declared output; both legs carry RUNPATH $ORIGIN
 
 The fused distributed LU solves behind `linalg = distributed` (the W Dyson

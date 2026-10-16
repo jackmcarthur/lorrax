@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import jax
 import jax.numpy as jnp
+from distrib_la import eigh_local
 
 RYTOEV = 13.605693122994            # QE Modules/constants.f90
 _SPIN_PAIR = {0: 0, 1: 2, 2: 1, 3: 3}  # QE is1: (up,dn) <-> (dn,up); 0-based
@@ -447,7 +448,7 @@ def lowdin_rows_with_derivative(Z, dZ, hub_idx):
     """
     O = jnp.conj(Z) @ Z.T                                    # O_rr' = <Z_r|Z_r'>
     O = 0.5 * (O + jnp.conj(O.T))
-    lam, U = jnp.linalg.eigh(O)
+    lam, U = eigh_local(O)
     sq = jnp.sqrt(lam)
     Oih = (U * (1.0 / sq)[None, :]) @ jnp.conj(U.T)          # O^{-1/2}
     F = -1.0 / (sq[:, None] * sq[None, :] * (sq[:, None] + sq[None, :]))

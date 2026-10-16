@@ -26,7 +26,7 @@
 #include <cstdio>
 #include <sstream>
 
-#include <cuda_runtime.h>
+#include "../common/gpu_runtime.h"
 #include <blas.hh>
 #include <slate/slate.hh>
 
@@ -45,17 +45,17 @@ static ffi::Error BatchedTrsmImpl(
     int64_t nbatch_local, int64_t n, int64_t m, int64_t nb,
     int side_int, int uplo_int, int op_int, int diag_int,
     double alpha_re, double alpha_im,
-    cudaStream_t xla_stream,
+    lrx::gpu::Stream xla_stream,
     lorrax_ffi::slate::SlateCtx* ctx,
     const T* d_A,
     const T* d_B_in,
     T* d_X_out)
 {
-    cudaError_t ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    lrx::gpu::Error ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.batched_trsm: cudaStreamSynchronize(xla_stream) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.batched_trsm: " LRX_GPU_API "StreamSynchronize(xla_stream) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -95,20 +95,20 @@ static ffi::Error BatchedTrsmImpl(
     const int64_t B_slice_elems = B_rows * ((B_cols + q - 1) / q);
 
     // Copy the entire B batch to X, then solve each slice in place.
-    ce = cudaMemcpyAsync(d_X_out, d_B_in,
+    ce = lrx::gpu::memcpy_async(d_X_out, d_B_in,
                          nbatch_local * B_slice_elems * sizeof(T),
-                         cudaMemcpyDeviceToDevice, xla_stream);
-    if (ce != cudaSuccess) {
+                         lrx::gpu::kDeviceToDevice, xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.batched_trsm: cudaMemcpyAsync(B->X) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.batched_trsm: " LRX_GPU_API "MemcpyAsync(B->X) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.batched_trsm: cudaStreamSynchronize after B->X failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.batched_trsm: " LRX_GPU_API "StreamSynchronize after B->X failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -162,7 +162,7 @@ static ffi::Error BatchedTrsmImpl(
 }
 
 static ffi::Error BatchedTrsmDispatch(
-    cudaStream_t stream,
+    lrx::gpu::Stream stream,
     ffi::AnyBuffer A,
     ffi::AnyBuffer B,
     ffi::Result<ffi::AnyBuffer> X_out,
@@ -217,7 +217,7 @@ static ffi::Error BatchedTrsmDispatch(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     SlateBatchedTrsmFfi, lorrax_ffi::slate_batched_trsm::BatchedTrsmDispatch,
     xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<xla::ffi::AnyBuffer>()              // A (triangular)
         .Arg<xla::ffi::AnyBuffer>()              // B (RHS)
         .Ret<xla::ffi::AnyBuffer>()              // X

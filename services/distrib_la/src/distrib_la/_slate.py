@@ -1,4 +1,4 @@
-"""SLATE FFI backend — distributed dense linear algebra (CUDA + host).
+"""SLATE FFI backend — distributed dense linear algebra (CUDA, ROCM + host).
 
 Ported verbatim from LORRAX ``src/ffi/linalg/_slate.py`` at 96a6399 (itself
 the wave-2 merge of the former ``ffi.slate`` package: ``context.py``,
@@ -22,11 +22,12 @@ from typing import Dict, Literal, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la import loader
+from distrib_la._cyclic import cyclic_to_block, largest_divisor, pad_with_sentinels
 from jax import shard_map
-from distrib_la.resolve import mesh_key
+from distrib_la.resolve import mesh_key, mesh_platform
 
 __all__ = [
     # context (was slate/context.py)
@@ -34,7 +35,11 @@ __all__ = [
     "validate_mesh", "validate_tile_layout",
     # single-matrix ops
     "SlateLowerL", "distributed_cholesky",
-    "distributed_eigh",
+    "distributed_eigh", "eigh_layout",
+    # the distributed LU family (ROCM leg): fused + split getrf/getrs
+    "batched_distributed_solve_lu",
+    "batched_distributed_getrf",
+    "batched_distributed_getrs", "lu_layout",
 ]
 
 # =========================================================================
@@ -79,8 +84,9 @@ _SUBROW_CACHE: Dict[ContextKey, Tuple[int, str]] = {}
 
 
 def _mesh_platform(mesh: Mesh) -> str:
-    plat = mesh.devices.flat[0].platform
-    return "CUDA" if plat in ("gpu", "cuda") else "cpu"
+    """The mesh's leg key (``lxkit.LEGS``: cpu / CUDA / ROCM), from the device
+    vendor -- never from ``device.platform``, which reads ``gpu`` on ROCm too."""
+    return mesh_platform(mesh)
 
 
 def ensure_registered(mesh: Mesh) -> None:
@@ -385,9 +391,56 @@ Layout: same scheme as ``distributed_cholesky`` — per-rank local
 transpose on the input (row-major JAX shard → col-major bytes for
 SLATE) paired with the C++ comm rank-remap, and a local untranspose on
 the returned eigenvector tiles.
+
+Block size: block-cyclic by relabeling (:mod:`distrib_la._cyclic`).  SLATE
+reads the operand's own ``(n/p, n/p)`` buffers with a small tile ``nb``
+(``nb | n/p``), i.e. ``Pi A Pi^T``; the eigenvector rows come back in ``A``'s
+order and only the eigenvalue index (Q's columns, over ``'y'``) is permuted
+back, by one ``all_to_all``.  The tile matters because heev's second stage
+(``hb2st``, band -> tridiagonal) runs on rank 0's HOST at band width ``nb``
+(cost ~ n^2 nb) after a gather of the band to rank 0: at one tile per rank
+(``nb = n/p``) that stage dominated (f64 n 8192, 2x2: 146 s vs 2.8 s for a
+single-GCD native eigh, SLATE_HIP_REPORT).  :func:`eigh_layout` picks the
+tile; :data:`_EIGH_BLOCK_MIN`/:data:`_EIGH_BLOCK_MAX` were measured on MI250X
+(SLATE_PERF_REPORT).
+
+Several tiles per rank means many concurrent SLATE tasks calling host
+BLAS/LAPACK: the SLATE must link a host BLAS that is safe for concurrent
+callers (on Frontier the sequential LOCKING OpenBLAS of
+``config/frontier/build_openblas_seq.sh``).  Against the sequential LibSci
+heev at nb < n/p returns wrong eigenpairs with no error.
 """
 
 _EIGH_FFI_TARGET = "lorrax_slate_eigh"
+
+#: The heev tile range.  Measured (P4 2x2 MI250X, steady s, SLATE_PERF_REPORT):
+#:   f64  n 8192: nb 128 10.9, 256 11.4, n/p 146     c128 n 8192: 128 17.4, 256 22.5
+#:   f64  n 4096: nb 128  3.7, 256  3.2              c128 n 4096: 128  5.1, 256  5.3
+#: nb 64 put unmtr_hb2st at 6 s (n 8192 f64; 1.7x the nb-128 wall).
+_EIGH_BLOCK_MAX = 128
+_EIGH_BLOCK_MIN = 64
+
+_JIT_CACHE: dict = {}
+
+
+def eigh_layout(n: int, p: int) -> Tuple[int, int]:
+    """``(N, nb)``: the side an ``n x n`` heev solves at on a ``p x p`` grid, and its tile.
+
+    ``(n, nb)`` with ``nb`` the largest divisor of ``n/p`` at most
+    :data:`_EIGH_BLOCK_MAX`, when that is at least :data:`_EIGH_BLOCK_MIN` or
+    ``n/p`` is at most :data:`_EIGH_BLOCK_MAX` (then ``nb = n/p``, one tile per
+    rank).  Otherwise each rank's tile is padded to the smallest edge with a
+    divisor in the range (at most ``_EIGH_BLOCK_MIN - 1`` rows per rank); the
+    padded rows carry sentinel eigenvalues below the spectrum
+    (:func:`distrib_la._cyclic.pad_with_sentinels`), dropped on return.
+    """
+    local = n // p
+    block = largest_divisor(local, _EIGH_BLOCK_MAX)
+    if local <= _EIGH_BLOCK_MAX or block >= _EIGH_BLOCK_MIN:
+        return n, block
+    padded = next(m for m in range(local + 1, local + _EIGH_BLOCK_MIN + 1)
+                  if largest_divisor(m, _EIGH_BLOCK_MAX) >= _EIGH_BLOCK_MIN)
+    return p * padded, largest_divisor(padded, _EIGH_BLOCK_MAX)
 
 
 def distributed_eigh(
@@ -396,6 +449,7 @@ def distributed_eigh(
     mesh: Mesh,
     compute_evecs: bool = True,
     block_size: int | None = None,
+    side: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition via SLATE's ``heev``.
 
@@ -412,13 +466,12 @@ def distributed_eigh(
         If False, only eigenvalues are meaningful; ``Q`` is still returned
         but its contents are unspecified.
     block_size
-        Override SLATE's tile size ``nb``.  Default ``n/p``, which is the
-        ONLY value for which JAX's block sharding coincides with SLATE's
-        block-cyclic tile grid on a multi-rank mesh — overriding it there
-        makes SLATE assemble a permuted global matrix (eigenvalues survive
-        the symmetric permutation; eigenvectors do not).  Overriding is
-        therefore rejected on multi-rank meshes; on a 1×1 mesh any ``nb``
-        is layout-safe.
+        SLATE's tile ``nb``, a divisor of the solve tile ``N/p``; default
+        :func:`eigh_layout`'s.  Any divisor is layout-safe (relabeling, see
+        the section note); ``N/p`` is the former one-tile-per-rank layout.
+    side
+        The solve side ``N >= n``, a multiple of ``p``; default
+        :func:`eigh_layout`'s (``side=n`` is the unpadded layout, for benches).
 
     Returns
     -------
@@ -442,45 +495,288 @@ def distributed_eigh(
     ensure_registered(mesh)
     ctx_key = context_key(mesh)
 
-    nb = n // p if block_size is None else int(block_size)
-    validate_tile_layout(n, nb, p, q, what="distributed_eigh")
+    if side is None:
+        side, default = eigh_layout(n, p)
+    else:
+        side = int(side)
+        default = largest_divisor(side // p, _EIGH_BLOCK_MAX)
+    nb = default if block_size is None else int(block_size)
+    if side < n or side % p or nb < 1 or (side // p) % nb:
+        raise ValueError(
+            f"distributed_eigh: tile {nb} does not divide the solve tile "
+            f"{side // p} (side {side}, {p}x{q} mesh).")
 
-    local_rows = n // p
-    local_cols = n // q
-    # Real-part dtype for eigenvalues (float64 for both F64 and C128).
-    w_dtype = jnp.float64 if A.dtype in (jnp.complex128, jnp.float64) \
-        else jnp.float32
-    W_local = jax.ShapeDtypeStruct((n,), w_dtype)               # replicated
-    # Q comes back as SLATE col-major tiles = row-major bytes of the
-    # per-rank block of Q^T; assembled at P('y','x') then locally
-    # untransposed (square mesh: local shape is (n/q, n/p)).
-    Q_local_T = jax.ShapeDtypeStruct((local_cols, local_rows), A.dtype)
+    key = ("eigh", mesh_key(mesh), A.dtype, n, side, nb,
+           bool(compute_evecs), int(ctx_key))
+    jit_eigh = _JIT_CACHE.get(key)
+    if jit_eigh is None:
+        local = side // p
+        # Real-part dtype for eigenvalues (float64 for both F64 and C128).
+        w_dtype = jnp.float64 if A.dtype in (jnp.complex128, jnp.float64) \
+            else jnp.float32
+        W_local = jax.ShapeDtypeStruct((side,), w_dtype)            # replicated
+        # Q comes back as SLATE col-major tiles = row-major bytes of the
+        # per-rank block of Q^T; assembled at P('y','x') then locally
+        # untransposed (square mesh: local shape is (N/q, N/p)).
+        Q_local_T = jax.ShapeDtypeStruct((local, local), A.dtype)
+        attrs = dict(n=side, nb=nb, ctx_key=int(ctx_key),
+                     compute_evecs=bool(compute_evecs))
 
-    attrs = dict(
-        n=n, nb=nb,
-        ctx_key=int(ctx_key),
-        compute_evecs=bool(compute_evecs),
-    )
+        @partial(shard_map,
+                 mesh=mesh,
+                 in_specs=P("x", "y"),
+                 out_specs=(P(), P("x", "y")),
+                 check_vma=False)
+        def _call(local_A):
+            # Local transpose: row-major shard bytes → col-major block, the
+            # layout SLATE reads (pure local op, pairs with the C++ comm
+            # rank-remap).  Same convention as distributed_cholesky.
+            local_A_T = jnp.transpose(local_A, (1, 0))
+            W, Q_T = jax.ffi.ffi_call(
+                _EIGH_FFI_TARGET, (W_local, Q_local_T))(local_A_T, **attrs)
+            # Q_T's rows are Q's columns: the eigenvalue index, over 'y',
+            # laid out block-cyclically at nb < N/p.  Put them in W's
+            # ascending order, then untranspose (Q at P('x','y')).
+            if compute_evecs and nb != local:
+                Q_T = cyclic_to_block(Q_T, n=side, p=q, mb=nb, axis="y")
+            return W, jnp.transpose(Q_T, (1, 0))
 
-    @partial(shard_map,
-             mesh=mesh,
-             in_specs=P("x", "y"),
-             out_specs=(P(), P("y", "x")),
-             check_vma=False)
-    def _call(local_A):
-        # Local transpose: row-major shard bytes → col-major block, the
-        # layout SLATE reads (pure local op, pairs with the C++ comm
-        # rank-remap).  Same convention as distributed_cholesky.
-        local_A_T = jnp.transpose(local_A, (1, 0))
-        return jax.ffi.ffi_call(
-            _EIGH_FFI_TARGET, (W_local, Q_local_T))(local_A_T, **attrs)
+        face = NamedSharding(mesh, P("x", "y"))
 
-    W, Q_T = _call(A)
+        def _padded(a):
+            whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)
+            W, Q = _call(whole)
+            # The sentinels are the side - n lowest eigenpairs; Q holds
+            # columns, of which the first n rows are a's.
+            W, Q = W[side - n:], Q[:n, side - n:]
+            return W, jax.lax.with_sharding_constraint(Q, face)
 
-    @partial(shard_map, mesh=mesh,
-             in_specs=P("y", "x"), out_specs=P("x", "y"),
-             check_vma=False)
-    def _untranspose(local_Q_T):
-        return jnp.transpose(local_Q_T, (1, 0))
+        # No donation: plan.DONATES declares eigh as donating nothing.
+        jit_eigh = jax.jit(_call if side == n else _padded)
+        _JIT_CACHE[key] = jit_eigh
 
-    return W, _untranspose(Q_T)
+    return jit_eigh(A)
+
+
+# =========================================================================
+#  solve_lu  (slate::getrf PartialPiv + slate::getrs, Target::Devices)
+# =========================================================================
+"""``batched_distributed_solve_lu`` and the split ``getrf`` / ``getrs`` pair.
+
+The SLATE twin of the ScaLAPACK and cuSOLVERMp LU families, with the same
+call contract, so :mod:`distrib_la.plan` drives the three the same way::
+
+    A : (Nq, N, N)     P(None, 'x', 'y')   (donated -- factored in place)
+    B : (Nq, N, NRHS)  P(None, 'x', 'y')   (donated -- solved in place)
+    X : same shape/sharding as B
+
+Each matrix of the stack is spread over the WHOLE mesh (the world SLATE
+context), and the handler walks the stack.  Block-cyclic BY RELABELING
+(:mod:`distrib_la._cyclic`), as the eigh: the handler reads each rank's own
+``(N/p, N/q)`` buffer with a tile ``nb`` dividing both local edges
+(:func:`lu_layout`), so SLATE factors ``Pi A Pi'^T`` and solves for ``Pi B``.
+On a square mesh ``Pi' = Pi`` and X comes back in A's row order with no data
+movement; on a ``p x 1`` mesh X's rows come back block-cyclic over ``'x'`` and
+one ``all_to_all`` (:func:`distrib_la._cyclic.cyclic_to_block`) orders them.
+Geometry: square or ``p x 1`` meshes; ``1 x q`` trips SLATE's stride assert.
+Several tiles per rank means concurrent SLATE tasks in host BLAS: the SLATE must
+link the locking sequential OpenBLAS (see the eigh section; verifier GATE 3d).
+
+The split pair returns the pivots as an opaque int64 buffer, ``(Nq, P*2N)``
+at ``P(None, ('x','y'))``: every rank's own copy of SLATE's replicated
+``Pivots`` serialised as (tile index, element offset) pairs.  Feed ``LU`` and
+``piv`` back to :func:`batched_distributed_getrs` verbatim, on the same mesh.
+The fused entry runs the same getrf + getrs core, so getrf-once +
+getrs-per-chunk reproduces it to the bit.
+
+Built on the ROCM leg only (``distrib_la.resolve``: ``('solve_lu','slate')``
+is a ROCM row; CUDA's distributed LU is cuSOLVERMp, the host's ScaLAPACK).
+"""
+
+_SOLVE_LU_TARGET = "lorrax_slate_batched_solve_lu_factors"
+_GETRF_TARGET = "lorrax_slate_batched_getrf"
+_GETRS_TARGET = "lorrax_slate_batched_getrs"
+
+#: jit(shard_map) cache per signature (eager shard_map re-traces per call).
+_LU_JIT_CACHE: dict = {}
+
+#: The getrf tile range (P4 2x2 MI250X, pool log ``distla_lunb``, DISTLA report).
+_LU_BLOCK_MAX = 256
+_LU_BLOCK_MIN = 64
+
+
+def lu_layout(n: int, p: int, q: int) -> int:
+    """The getrf/getrs tile ``nb`` for an ``n x n`` matrix on a ``p x q`` mesh.
+
+    The largest divisor of both local edges (``gcd(n/p, n/q)``) at most
+    :data:`_LU_BLOCK_MAX`, when it is at least :data:`_LU_BLOCK_MIN` or the edge is
+    at most :data:`_LU_BLOCK_MAX`; otherwise one tile per rank (``n/max(p,q)``,
+    the former layout: correct, with the host-panel cost it had).
+    """
+    import math
+    local = math.gcd(n // p, n // q)
+    block = largest_divisor(local, _LU_BLOCK_MAX)
+    if local <= _LU_BLOCK_MAX or block >= _LU_BLOCK_MIN:
+        return block
+    return n // max(p, q)
+
+
+def _lu_geometry(A, mesh: Mesh, *, what: str, block_size: int | None = None):
+    """The LU family's guard ladder: shape, registered mesh, mesh class, tile.
+    Returns ``(p, q, nq, n, nb)``.  The mesh class mirrors
+    :func:`validate_tile_layout`'s (square or ``p x 1``); the tile rule is the
+    relabeling one (``nb`` divides ``n/p`` and ``n/q``), not one tile per rank."""
+    if A.ndim != 3 or A.shape[1] != A.shape[2]:
+        raise ValueError(f"slate {what}: expected A of shape (Nq, N, N); got {A.shape}")
+    p, q = validate_mesh(mesh)
+    nq, n = int(A.shape[0]), int(A.shape[1])
+    if n % p or n % q:
+        raise ValueError(
+            f"slate {what}: N={n} must be divisible by both mesh axes ({p}, {q}).")
+    if p > 1 and q > 1 and p != q:
+        raise ValueError(f"slate {what}: mesh {p}x{q} unsupported (square or Nx1 only).")
+    if p == 1 and q > 1:
+        raise ValueError(
+            f"slate {what}: 1x{q} meshes hit a SLATE stride assert "
+            f"(internal_batch.hh:290); use the {q}x1 mesh.")
+    nb = lu_layout(n, p, q) if block_size is None else int(block_size)
+    if nb < 1 or (n // p) % nb or (n // q) % nb:
+        raise ValueError(
+            f"slate {what}: tile {nb} must divide both local edges ({n // p}, {n // q}).")
+    return p, q, nq, n, nb
+
+
+def _rows_in_order(X, *, n: int, p: int, q: int, nb: int):
+    """Inside a shard_map: X's local rows ``(nq, n/p, c)`` in A's order.
+
+    SLATE writes X's row ``i`` at its relabeled slot: on a square mesh that is
+    row ``i`` itself (``Pi' = Pi``), on a ``p x 1`` mesh row ``i`` sits
+    block-cyclically over ``'x'`` -- one :func:`cyclic_to_block`.
+    """
+    if p == 1 or q > 1 or nb == n // p:
+        return X
+    nq, rows, cols = X.shape
+    flat = jnp.transpose(X, (1, 0, 2)).reshape(rows, nq * cols)
+    flat = cyclic_to_block(flat, n=n, p=p, mb=nb, axis="x")
+    return jnp.transpose(flat.reshape(rows, nq, cols), (1, 0, 2))
+
+
+def _lu_rhs(B, nq: int, n: int, q: int, dtype, *, what: str) -> int:
+    if B.ndim != 3 or int(B.shape[0]) != nq or int(B.shape[1]) != n:
+        raise ValueError(
+            f"slate {what}: B must be (Nq, N, NRHS) = ({nq}, {n}, *); got {B.shape}")
+    if B.dtype != dtype:
+        raise ValueError(f"slate {what}: B.dtype {B.dtype} != {dtype}")
+    nrhs = int(B.shape[2])
+    if nrhs % q:
+        raise ValueError(f"slate {what}: NRHS={nrhs} must be divisible by q={q}.")
+    return nrhs
+
+
+def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh,
+                                 block_size: int | None = None) -> jax.Array:
+    """Solve ``A[q] X[q] = B[q]`` by per-q ``slate::getrf`` + ``slate::getrs``.
+
+    See the section docstring for the contract.  ``A`` and ``B`` are donated
+    (the factors overwrite A, X overwrites B); the pivots stay internal.
+    ``block_size`` overrides :func:`lu_layout` (benches; any divisor of both
+    local edges is layout-safe).
+    """
+    p, q, nq, n, nb = _lu_geometry(A, mesh, what="solve_lu", block_size=block_size)
+    nrhs = _lu_rhs(B, nq, n, q, A.dtype, what="solve_lu")
+    ensure_registered(mesh)
+    ctx_key = int(context_key(mesh))
+    nb_b = nrhs // q
+    key = ("slate_lu", mesh_key(mesh), A.dtype, nq, n, nrhs, nb, ctx_key)
+    fn = _LU_JIT_CACHE.get(key)
+    if fn is None:
+        X_local_T = jax.ShapeDtypeStruct((nq, nrhs // q, n // p), A.dtype)
+        LU_local_T = jax.ShapeDtypeStruct((nq, n // q, n // p), A.dtype)
+        attrs = dict(nq=nq, n=n, nrhs=nrhs, nb=nb, nb_b=nb_b, ctx_key=ctx_key)
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "x", "y"), P(None, "x", "y")),
+                 out_specs=P(None, "x", "y"), check_vma=False)
+        def _solve(local_A, local_B):
+            # Row-major shard -> col-major local block (the wrappers' convention).
+            X_T, _ = jax.ffi.ffi_call(
+                _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
+                input_output_aliases={0: 1, 1: 0},
+            )(jnp.transpose(local_A, (0, 2, 1)), jnp.transpose(local_B, (0, 2, 1)), **attrs)
+            return _rows_in_order(jnp.transpose(X_T, (0, 2, 1)), n=n, p=p, q=q, nb=nb)
+
+        fn = jax.jit(_solve, donate_argnums=(0, 1))
+        _LU_JIT_CACHE[key] = fn
+    return fn(A, B)
+
+
+def batched_distributed_getrf(A: jax.Array, *, mesh: Mesh,
+                              block_size: int | None = None) -> tuple[jax.Array, jax.Array]:
+    """Factor ``A[q]`` once by ``slate::getrf`` (PartialPiv).
+
+    Returns ``(LU, piv)``: ``LU`` at ``P(None,'x','y')`` (SLATE's factors in
+    this layout on this mesh) and ``piv`` int64 ``(Nq, P*2N)`` at
+    ``P(None, ('x','y'))``.  Both are opaque: feed them to
+    :func:`batched_distributed_getrs` verbatim (same ``block_size``).  ``A`` is donated.
+    """
+    p, q, nq, n, nb = _lu_geometry(A, mesh, what="getrf", block_size=block_size)
+    ensure_registered(mesh)
+    ctx_key = int(context_key(mesh))
+    piv_len = 2 * n
+    key = ("slate_getrf", mesh_key(mesh), A.dtype, nq, n, nb, ctx_key)
+    fn = _LU_JIT_CACHE.get(key)
+    if fn is None:
+        LU_local_T = jax.ShapeDtypeStruct((nq, n // q, n // p), A.dtype)
+        piv_local = jax.ShapeDtypeStruct((nq, piv_len), jnp.int64)
+        attrs = dict(nq=nq, n=n, nb=nb, piv_len=piv_len, ctx_key=ctx_key)
+
+        @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),),
+                 out_specs=(P(None, "x", "y"), P(None, ("x", "y"))), check_vma=False)
+        def _getrf(local_A):
+            LU_T, piv = jax.ffi.ffi_call(
+                _GETRF_TARGET, (LU_local_T, piv_local),
+                input_output_aliases={0: 0},
+            )(jnp.transpose(local_A, (0, 2, 1)), **attrs)
+            return jnp.transpose(LU_T, (0, 2, 1)), piv
+
+        fn = jax.jit(_getrf, donate_argnums=(0,))
+        _LU_JIT_CACHE[key] = fn
+    return fn(A)
+
+
+def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
+                              mesh: Mesh, block_size: int | None = None) -> jax.Array:
+    """Solve ``A[q] X[q] = B[q]`` from :func:`batched_distributed_getrf`'s
+    ``(LU, piv)`` by ``slate::getrs``.  ``B`` is donated; X has B's
+    shape and sharding."""
+    p, q, nq, n, nb = _lu_geometry(LU, mesh, what="getrs", block_size=block_size)
+    nrhs = _lu_rhs(B, nq, n, q, LU.dtype, what="getrs")
+    piv_len = 2 * n
+    want = (nq, p * q * piv_len)
+    if tuple(piv.shape) != want or piv.dtype != jnp.int64:
+        raise ValueError(
+            f"slate getrs: piv must be int64 {want} as getrf returned it; "
+            f"got {tuple(piv.shape)} {piv.dtype}")
+    ensure_registered(mesh)
+    ctx_key = int(context_key(mesh))
+    nb_b = nrhs // q
+    key = ("slate_getrs", mesh_key(mesh), LU.dtype, nq, n, nrhs, nb, ctx_key)
+    fn = _LU_JIT_CACHE.get(key)
+    if fn is None:
+        X_local_T = jax.ShapeDtypeStruct((nq, nrhs // q, n // p), B.dtype)
+        attrs = dict(nq=nq, n=n, nrhs=nrhs, nb=nb, nb_b=nb_b, piv_len=piv_len,
+                     ctx_key=ctx_key)
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, "x", "y"), P(None, ("x", "y")), P(None, "x", "y")),
+                 out_specs=P(None, "x", "y"), check_vma=False)
+        def _getrs(local_LU, local_piv, local_B):
+            X_T = jax.ffi.ffi_call(
+                _GETRS_TARGET, X_local_T, input_output_aliases={2: 0},
+            )(jnp.transpose(local_LU, (0, 2, 1)), local_piv,
+              jnp.transpose(local_B, (0, 2, 1)), **attrs)
+            return _rows_in_order(jnp.transpose(X_T, (0, 2, 1)), n=n, p=p, q=q, nb=nb)
+
+        fn = jax.jit(_getrs, donate_argnums=(2,))
+        _LU_JIT_CACHE[key] = fn
+    return fn(LU, piv, B)

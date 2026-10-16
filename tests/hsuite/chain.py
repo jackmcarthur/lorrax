@@ -39,11 +39,12 @@ import shutil
 import sys
 import time
 
-import numpy as np
-
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(REPO / "src"))
+# runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
+import runtime  # noqa: F401,E402
+import numpy as np  # noqa: E402
 from tests.hsuite import rank_session  # noqa: E402
 
 FIXTURE = HERE / "fixture"
@@ -311,7 +312,8 @@ _STAGE_RECEIPT = re.compile(r"compile: real (\d+) \(([0-9.]+) s\), cache hits (\
 # misses. "NVRTC rebuilt" is a cached image the driver refused, compiled again:
 # it costs the same, so it counts. \b, not a space: the Fourier pair's line has
 # nothing between "built" and "in".
-_NVRTC = re.compile(r"NVRTC (?:re)?built\b.*? in ([0-9.]+) ms")
+# NVRTC (CUDA) and hipRTC (ROCm) builds through common/rtc_build: one census row.
+_NVRTC = re.compile(r"(?:NVRTC|hiprtc) (?:re)?built\b.*? in ([0-9.]+) ms")
 # JAX's compile-path events (jax._src.dispatch): tracing, lowering to MLIR,
 # and compile_or_get_cached (a persistent-cache read or an XLA compile).  A
 # trace nests inside another, so a stage's seconds are the union of its spans.
@@ -521,8 +523,10 @@ def _env(cache_dir):
     if rank_session._resolve_proc_count() == 1:
         # P1 (lx test): the drivers run on ONE device.  A single process
         # holding four devices is the in-process mesh the flat-k FFT refuses.
-        visible = env.get("CUDA_VISIBLE_DEVICES", "0").split(",")
-        env["CUDA_VISIBLE_DEVICES"] = visible[0]
+        # Through the GPU leg's own visibility variable (ROCm: HIP_VISIBLE_DEVICES
+        # inside ROCR_VISIBLE_DEVICES), not CUDA_VISIBLE_DEVICES everywhere.
+        from runtime import pin_first_visible_device
+        pin_first_visible_device(env)
     if cache_dir is not None:
         env["ISDF_JAX_CACHE_DIR"] = str(cache_dir)
     env["JAX_ENABLE_X64"] = "1"

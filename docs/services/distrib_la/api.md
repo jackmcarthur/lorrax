@@ -254,9 +254,16 @@ Nothing crosses the host.
 ### The eigh-stack API {#eigh-stack}
 
 A caller that holds a face stack `(B, n, n)` passes its room per rank beside
-its own live set, `plan('eigh', mesh, n=n, backend='distributed',
+its own live set, `plan('eigh', mesh, n=n, backend=request,
 budget_bytes=room)`, and the service decides each stack (`Plan.stack_route`,
-a `StackRoute`):
+a `StackRoute`). `request` is the deck's eigh request
+(`LinalgResolution.eigh_backend`): `distributed` under `linalg = distributed`,
+which refuses at plan time where the leg has no distributed eigh; `auto` under
+`linalg = local`, whose whole-mesh provider is the platform's `distributed`
+backend when it resolves on the mesh (`resolve.resolve_eigh_capacity`; the plan
+then equals the explicit one) and otherwise none: the plan is native, runs
+route (c), and refuses by name at the first stack that needs the whole mesh
+(`GATE eigh_capacity_route`, `Plan.require_capacity`), announced once on rank 0.
 
 - **Route (c)** when the program that runs the stack, priced from the shapes
   (`_stack_price`: `BATCH_EIGH_TILES` = 8 n² per whole matrix a rank holds,
@@ -268,7 +275,8 @@ a `StackRoute`):
   holds the whole chain. The most whole matrices per rank that fit win, and
   the stack runs in that many slices, one `lax.scan` over slice starts writing
   the face outputs in place.
-- **The whole-mesh provider** otherwise, including room 0.
+- **The whole-mesh provider** otherwise, including room 0 (an `auto` plan
+  with no provider refuses here; its checked retry stays on route (c)).
 - **Every rank decides alike.** The candidates and their prices follow from
   the shape and the room only: nothing is compiled to be measured and no size
   is exchanged between ranks.

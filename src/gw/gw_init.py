@@ -2522,7 +2522,7 @@ def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
     if wedge is None:
         return whole
     op = whole.restrict(QirrOperator(values=None, **wedge[0]))
-    jax.block_until_ready(op.values)
+    timing.stage_wait(op.values)
     return op
 
 
@@ -2930,11 +2930,11 @@ def _prepare_fresh_isdf(
         # Route G's stage split through V_q (read, faces, C, fit, V_q),
         # a receipt kept by the production report.  A bispinor run hands
         # V_q the ζ files (its Z stores are closed after the fits).
-        V_qmunu.block_until_ready()
+        timing.stage_wait(V_qmunu)
         _rows = []
         timing.report(print_fn=_rows.append, title="", max_depth=3)
         print0("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
-    V_qmunu.block_until_ready()
+    timing.stage_wait(V_qmunu)
     print0("  Chunked ISDF path complete")
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
 

@@ -473,7 +473,10 @@ def batch_layout_eigh_call(op: str, mesh: Mesh, A, *, real_rows: int | None = No
         fn = jax.jit(shard_map(_body, mesh=mesh, in_specs=(spec, P()),
                                out_specs=(P(), spec), check_vma=False))
         _JIT_CACHE[key] = fn
-    return fn(A, np.int32(nreal))
+    # The count is placed once per distinct (mesh, count), not transferred on
+    # every call as a host scalar (the run's rounds repeat a few counts).
+    from distrib_la._collectives import device_put_process_local_cached
+    return fn(A, device_put_process_local_cached(np.int32(nreal), NamedSharding(mesh, P())))
 
 
 def batch_reshard_call(

@@ -25,7 +25,12 @@ distrib_la refusal without knowing whose library it was.
 Environment
 -----------
 ``LORRAX_FFI_SO``       absolute path to ``liblorrax_ffi.so`` (CUDA)
+``LORRAX_FFI_ROCM_SO``  absolute path to ``liblorrax_ffi_rocm.so`` (ROCM)
 ``LORRAX_FFI_HOST_SO``  absolute path to ``liblorrax_ffi_host.so`` (cpu)
+
+The legs (file, pin, build dir, C-ABI suffix, ABI symbol) are
+:data:`lxkit.legs.LEGS`, shared with LORRAX's own loader; this module owns
+its target tables, ctypes declarations and build hints.
 
 These historical names identify the currently supported provider ABI, whose
 C++ implementation lives in LORRAX.  A standalone installation may pin a
@@ -50,6 +55,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from lxkit import native_provider as _native
+from lxkit.legs import LEGS, accelerator_leg_to_open_first
 from lxkit.probe import (AVAILABLE, LibraryNotBuilt, LibraryUnusable,
                          ProbeResult, missing_symbol, not_loadable,
                          unknown_target)
@@ -74,8 +80,7 @@ LORRAX_FFI_ABI_VERSION = 6
 #: because both libraries are dlopened RTLD_GLOBAL and already share sixteen
 #: symbol names; a shared spelling would let the first-loaded library answer
 #: for the second, which is the exact failure being detected.
-_ABI_SYMBOLS = {"cpu": "lorrax_ffi_host_abi_version",
-                "CUDA": "lorrax_ffi_cuda_abi_version"}
+_ABI_SYMBOLS = {key: leg.abi_symbol for key, leg in LEGS.items()}
 
 class AbiMismatch(LibraryUnusable):
     """The library loaded fine and speaks a DIFFERENT handler ABI.
@@ -146,33 +151,60 @@ _HOST_TARGET_SYMBOLS = {
 #: Per-platform library spec.  ``build_subdir`` is relative to
 #: ``src/ffi/cpp/`` of the LORRAX checkout, when there is one (see
 #: :func:`_candidate_paths`).
-_PLATFORMS = {
-    "CUDA": dict(
-        so_name="liblorrax_ffi.so",
-        env="LORRAX_FFI_SO",
-        build_subdir="build",
-        targets=_CUDA_TARGET_SYMBOLS,
-        build_hint="src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh",
-    ),
-    "cpu": dict(
-        so_name="liblorrax_ffi_host.so",
-        env="LORRAX_FFI_HOST_SO",
-        build_subdir="build_host",
-        targets=_HOST_TARGET_SYMBOLS,
-        build_hint="bash config/perlmutter/build_ffi_host.sh --fresh",
-    ),
+#: The ROCM leg's distributed-linalg handlers: the SLATE family, the SAME
+#: leg-neutral cpp/slate/ sources as the CUDA leg (so the same symbols; only one
+#: device leg is loaded per process), over a gpu_backend=hip SLATE
+#: (config/frontier/build_slate_hip.sh).  ``distrib_la.resolve`` carries the
+#: ROCM preference rows; cuSOLVERMp has no ROCm build, so it has no row here.
+#: Plus the SLATE LU family (cpp/slate/batched_solve_lu_ffi.cc), which only
+#: this leg builds: CUDA's distributed LU is cuSOLVERMp, the host's ScaLAPACK.
+_ROCM_SLATE_LU_SYMBOLS: dict = {
+    "lorrax_slate_batched_solve_lu_factors": "SlateBatchedSolveLuFactorsFfi",
+    "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
+    "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
+}
+#: The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc: one rocSOLVER
+#: strided-batched heevd/syevd per stack), the target of local_eigh.BATCHED_EIGH_ROUTE's ROCM
+#: row.  CUDA solves the same stacks with jaxlib's cuSOLVER, so only this leg builds it.
+_ROCM_LOCAL_EIGH_SYMBOLS: dict = {
+    "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
+}
+#: The active-subspace family on this leg (cpp/active_subspace/active_devsize.cc: device-side
+#: sizes, no host read) -- the CUDA symbols less the one-communicator CGS2 handler (needs
+#: cuSolverMp's NCCL context) and the active-block eigh (the ROCM plan solves the capacity
+#: matrix through lorrax_rocsolver_batched_eigh: distrib_la.active_subspace.NATIVE_HANDLERS).
+_ROCM_ACTIVE_SUBSPACE_SYMBOLS: dict = {
+    t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
+    if t.startswith("lorrax_active_subspace_")
+    and t not in ("lorrax_active_subspace_distributed_ortho", "lorrax_active_subspace_eigh")}
+#: The local active-range GEMM (cpp/cublas/local_active_gemm_ffi.cc) is leg-neutral: the
+#: ROCM leg compiles the CUDA leg's source on rocBLAS (common/gpu_blas.h), so it exports
+#: the same three symbols (ACTIVE_LOCAL_ROUTE's "native" row on both legs).
+#: The active-range GEMM with device-side bounds (cpp/active_gemm/: leg-neutral, run-time
+#: compiled), ACTIVE_LOCAL_ROUTE's ROCM "device" row; the CUDA leg does not list it yet.
+_ROCM_ACTIVE_GEMM_SYMBOLS: dict = {
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
+}
+_ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
+                                 if t.startswith(("lorrax_slate_", "lorrax_cublas_local_"))},
+                              **_ROCM_ACTIVE_GEMM_SYMBOLS,
+                              **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS,
+                              **_ROCM_ACTIVE_SUBSPACE_SYMBOLS}
+
+#: Leg key -> this loader's target table and not-found build command.
+_TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,
+            "cpu": _HOST_TARGET_SYMBOLS}
+_BUILD_HINTS = {
+    "CUDA": 'src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh',
+    "ROCM": "bash config/frontier/build_slate_hip.sh && bash config/frontier/build_ffi_rocm.sh",
+    "cpu": 'bash config/perlmutter/build_ffi_host.sh --fresh',
 }
 
-#: What a request for a platform LORRAX builds no library for gets told.
-#: ``rocm`` is in :data:`distrib_la.resolve._DISTRIBUTED_DEFAULT` as a
-#: DECLARED-UNTESTED tier — the preference row exists so the day a ROCm
-#: mesh appears the answer is a named refusal about the .so rather than a
-#: nonsense "host-only" message about the backend.
-_NO_LIBRARY = {
-    "rocm": ("LORRAX builds no ROCm FFI library.  The ROCm tier is "
-             "DECLARED-UNTESTED: distrib_la carries the backend preference "
-             "rows (SLATE everywhere) so the routing question has an "
-             "answer, but no ROCm .so has ever been built or measured."),
+_PLATFORMS = {
+    key: dict(so_name=leg.so_name, env=leg.so_env, build_subdir=leg.build_subdir,
+              targets=_TARGETS[key], build_hint=_BUILD_HINTS[key])
+    for key, leg in LEGS.items()
 }
 
 # Error buffer size for the lrx_ wrappers.
@@ -241,10 +273,12 @@ _SLATE_C_ENTRY_POINTS = (
     "lrx_slate_init_mpi",
     "lrx_ctx_bind",
     "lrx_ctx_unbind",
+    # cpp/active_subspace/active_eigh.cc: the eigensolver workspace query.
+    "lrx_active_eigh_lwork",
 )
 
 #: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.
-_C_ABI_SUFFIX = {"CUDA": "", "cpu": "_host"}
+_C_ABI_SUFFIX = {key: leg.c_abi_suffix for key, leg in LEGS.items()}
 
 
 def _bind_c_abi(lib: ctypes.CDLL, platform: str) -> None:
@@ -501,67 +535,25 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
 # in the ODR fix touches that.  Retiring the pre-open would re-open the eight
 # ``FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0`` cells.
 # ``test_so_acceptance.py``'s check 5 is what will say when it CAN go.
-_CUDA_FIRST_TRIED = False
+#: Device legs this loader has already tried to open ahead of the host leg.
+_ACCELERATOR_FIRST_TRIED: set = set()
 
 
-def _nvidia_device_visible() -> bool:
-    """A GPU device node this process can see.
-
-    Split out from :func:`_process_can_use_cuda` so its cells can construct
-    both answers without monkeypatching ``glob``/``os.path`` for the whole
-    session -- the hardware half of the question is the one a pure test
-    cannot arrange for real.
-    """
-    return (any(Path("/dev").glob("nvidia[0-9]*"))
-            or Path("/dev/nvidiactl").exists())
-
-
-def _process_can_use_cuda() -> bool:
-    """Can THIS process run CUDA work at all?  Environment only.
-
-    TRUTHFUL AT LOAD TIME is the whole requirement, and it rules out the
-    obvious answer: ``jax.default_backend()`` INITIALIZES the XLA backend --
-    the same reason :func:`get_lib` refuses to default its ``platform``
-    argument -- so asking it from inside a loader call would make the loader
-    decide the process's backend.  Both signals below are ones JAX itself
-    acts on and both are readable before any backend exists:
-
-      * ``JAX_PLATFORMS``.  The first entry wins, mirroring how JAX picks
-        its default backend; ``cpu`` there forbids a GPU backend outright,
-        so no CUDA handler in this process can ever run and there is
-        nothing for the load order to protect.
-      * A VISIBLE NVIDIA DEVICE.  ``CUDA_VISIBLE_DEVICES=""`` is the
-        spelling that means "no GPU, deliberately", and JAX's own
-        ``backends()`` skips cuda when no device node is visible
-        (``xla_bridge.py``: ``if platform == "cuda" and not
-        has_visible_nvidia_gpu(): continue``).
+def _open_accelerator_before_host() -> None:
+    """Win the ``libslate``/``libblaspp`` SONAME for the device build.
 
     THIS READS THE ENVIRONMENT AND STILL SELECTS NO BACKEND.  The module
     docstring's rule -- env grants a capability, a deck key picks the
-    backend -- is intact: what is being decided here is which FILES this
-    process dlopens, never which linalg backend answers a call.
-
-    Deliberately NOT a probe of the library.  "Is the CUDA .so loadable
-    here" is a different question and the best-effort ``try`` in
-    :func:`_open_cuda_before_host` is what answers it.
+    backend -- is intact: what is decided here is which FILES this process
+    dlopens (:func:`lxkit.legs.accelerator_leg_to_open_first`), never which
+    linalg backend answers a call.  A CPU-platform process opens the host
+    library and nothing else.
     """
-    return _native.process_can_use_cuda(device_visible=_nvidia_device_visible)
-
-
-def _open_cuda_before_host() -> None:
-    """Win the ``libslate``/``libblaspp`` SONAME for the CUDA build.
-
-    Only where there is a CUDA build in the running to win it: a
-    CPU-platform process opens the host library and nothing else.
-    """
-    global _CUDA_FIRST_TRIED
-    if _CUDA_FIRST_TRIED or "CUDA" in _LIBS:
+    key = accelerator_leg_to_open_first("cpu", _LIBS, _ACCELERATOR_FIRST_TRIED)
+    if key is None:
         return
-    if not _process_can_use_cuda():
-        return
-    _CUDA_FIRST_TRIED = True
     try:
-        get_lib("CUDA")
+        get_lib(key)
     except Exception:                                          # noqa: BLE001
         pass
 
@@ -578,28 +570,27 @@ def loaded_platforms_in_order() -> list:
 def get_lib(platform: str) -> ctypes.CDLL:
     """Return the loaded FFI library for ``platform``; idempotent.
 
-    ``platform`` is ``"CUDA"`` or ``"cpu"``.  It is REQUIRED — unlike
+    ``platform`` is a :data:`lxkit.legs.LEGS` key.  It is REQUIRED — unlike
     lorrax's loader this one has no ``None`` default, because resolving it
     from the JAX default backend calls ``jax.default_backend()``, which
     INITIALIZES the XLA backend, and every caller here already knows the
     platform from its mesh.
 
-    In a CUDA-CAPABLE process, opening the ``cpu`` library opens the
-    ``CUDA`` one first — see the SONAME note above; it is a correctness
+    In a process that can host a device leg, opening the ``cpu`` library
+    opens that leg's first — see the SONAME note above; it is a correctness
     requirement, not a warm-up.  In a CPU-platform process it does NOT:
-    there is no CUDA handler to protect and the mixed load costs that
+    there is no device handler to protect and the mixed load costs that
     process its host phdf5 path.
     """
     if platform not in _PLATFORMS:
         raise LibraryNotBuilt(
-            f"distrib_la: no FFI library for platform {platform!r} "
-            f"(known: {sorted(_PLATFORMS)})."
-            + (f"  {_NO_LIBRARY[platform]}" if platform in _NO_LIBRARY else ""))
+            f"distrib_la: no FFI leg for platform {platform!r} "
+            f"(known: {sorted(_PLATFORMS)}).")
     lib = _LIBS.get(platform)
     if lib is not None:
         return lib
     if platform == "cpu":
-        _open_cuda_before_host()
+        _open_accelerator_before_host()
         lib = _LIBS.get(platform)
         if lib is not None:                    # re-entrancy, not reachable today
             return lib
@@ -649,8 +640,7 @@ def probe_target(target_name: str, platform: str):
     if spec is None:
         return ProbeResult(False, (
             f"distrib_la builds no FFI library for platform {platform!r} "
-            f"(known: {', '.join(sorted(_PLATFORMS))})."
-            + (f"  {_NO_LIBRARY[platform]}" if platform in _NO_LIBRARY else "")))
+            f"(known: {', '.join(sorted(_PLATFORMS))})."))
     sym = spec["targets"].get(target_name)
     if sym is None:
         return unknown_target(target_name, platform, spec["targets"])
@@ -835,13 +825,18 @@ def dial_key() -> tuple:
                  for _, spec in sorted(_PLATFORMS.items()))
 
 
-def active_eigh_workspace(capacity: int) -> int:
-    """Query the declared local eigensolver scratch; no vendor edge escapes here."""
-    lib = get_lib("CUDA")
+def active_eigh_workspace(capacity: int, platform: str = "CUDA") -> int:
+    """Query the declared local eigensolver scratch (complex128 elements) on a device leg.
+
+    No vendor edge escapes here: the leg's library answers through its own (suffixed,
+    ``_bind_c_abi``) ``lrx_active_eigh_lwork``.  A negative answer is the solver's status
+    (ROCM: -1000 = rocBLAS/rocSOLVER not mapped, GATE rocblas-mapped).
+    """
+    lib = get_lib(platform)
     try:
         query = lib.lrx_active_eigh_lwork
     except AttributeError as exc:
-        raise LibraryUnusable("active subspace requires a rebuilt CUDA provider") from exc
+        raise LibraryUnusable(f"active subspace requires a rebuilt {platform} provider") from exc
     query.argtypes = [ctypes.c_int]
     query.restype = ctypes.c_int
     size = int(query(capacity))

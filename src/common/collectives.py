@@ -85,7 +85,8 @@ from typing import Any, Callable, NamedTuple
 from ffi import _services
 
 _services.ensure_on_path()
-from lxkit import device_put_process_local, device_put_process_tiles
+from lxkit import (device_put_process_local, device_put_process_local_cached,
+                   device_put_process_tiles, placement_cache_stats)
 
 
 __all__ = [
@@ -108,7 +109,9 @@ __all__ = [
     "prepare_mesh",
     # staging a host table onto a mesh, without a collective
     "device_put_process_local",
+    "device_put_process_local_cached",
     "device_put_process_tiles",
+    "placement_cache_stats",
     "replicate_to_mesh",
     "shard_over_k",
     # reductions and gathers
@@ -172,6 +175,39 @@ def device_count() -> int:
     return int(jax.device_count())
 
 
+#: Seconds a rank waits at a :func:`barrier` for its peers before the barrier fails
+#: (the coordination service's deadline; a rank that never arrives -- a mismatched
+#: name, a dead peer -- surfaces as this error instead of a hang).
+BARRIER_TIMEOUT_S = 1800
+_BARRIER_SERIAL: dict = {}
+
+
+def _coordination_barrier(name, _mh):
+    """Host barrier through the distributed runtime's coordination service.
+
+    No device work: ``multihost_utils.sync_global_devices`` all-gathers a name hash
+    through the devices (an H2D put, a collective and a D2H read per barrier).  Every
+    caller here orders HOST work (a rank-0 HDF5 write, a file closed before another
+    rank opens it, a timing band), which the coordination barrier orders without
+    touching a device.  Each use of a name gets its own barrier id (the n-th use on
+    every rank, in program order), so a name can recur.  Without a distributed client
+    (a multi-process run started outside ``jax.distributed``) the device barrier is
+    used, with one notice (GATE barrier_coordination).
+    """
+    from jax._src import distributed as _dist
+    client = getattr(_dist.global_state, "client", None)
+    if client is None:
+        if "notice" not in _BARRIER_SERIAL:
+            _BARRIER_SERIAL["notice"] = True
+            print("  GATE barrier_coordination: no distributed runtime client; "
+                  "collectives.barrier uses the device barrier (sync_global_devices)",
+                  flush=True)
+        _mh.sync_global_devices(name)
+        return
+    n = _BARRIER_SERIAL[name] = _BARRIER_SERIAL.get(name, 0) + 1
+    client.wait_at_barrier(f"lorrax.barrier:{name}:{n}", int(BARRIER_TIMEOUT_S * 1000))
+
+
 def barrier(name: str, *, print_fn: Callable[..., Any] = print) -> bool:
     """Synchronize all processes at ``name``; fatal if the collective fails.
 
@@ -196,7 +232,7 @@ def barrier(name: str, *, print_fn: Callable[..., Any] = print) -> bool:
     if process_count() <= 1:
         return False
     try:
-        _mh.sync_global_devices(name)
+        _coordination_barrier(name, _mh)
     except Exception as exc:
         # Do NOT swallow.  A broken barrier in a multi-process run means
         # this rank is about to diverge from its peers; continuing turns a
@@ -782,7 +818,10 @@ def _psum_kernel(ndim: int, mesh):
         @partial(shard_map, mesh=mesh, in_specs=(P(axes, *rest),),
                  out_specs=P(*rest), check_vma=False)
         def _body(x):
-            return jax.lax.psum(x[0], axes)
+            # Rank-order sum (lxkit.ordered_psum): the library all-reduce's order
+            # follows the GCD placement (det lane 2026-10-16: the exact Hartree's rho).
+            from lxkit import ordered_psum
+            return ordered_psum(x[0], axes)
 
         fn = jax.jit(_body)
         _PSUM_KERNELS[key] = fn

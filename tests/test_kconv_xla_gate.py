@@ -21,6 +21,14 @@ with four host devices, ``JAX_PLATFORMS=cpu
 XLA_FLAGS=--xla_force_host_platform_device_count=4 python3 tests/test_kconv_xla_gate.py``.
 Under pytest it skips.
 
+ROCm (the kdft routes, ``ffi.fft._ROCM_KLEAD_TARGETS``; ``kconv_backend`` stays ``'xla'``
+there): the same cases, then :func:`kdft_cases` -- the k-minor split arm and the k-leading
+multi-pass plan on grids to the verified bound (nk <= 10240: 16^3, 20^3, 97x97, 16x16x30,
+128x64, 128x80, odd and prime axes), modes 5, 4 (both layouts), 3 and 2, complex128 and
+complex64, the router's decision on each grid (a grid that silently took XLA fails), and the
+named refusals past the bound.  One GCD or a 2x2 mesh:
+``prun.sh <lane> <name> 1|4 <wt> -- python3 tests/test_kconv_xla_gate.py``.
+
 The router's fallback (``ffi.fft.mathdx_refusal``) is gated too.  CUDA: with
 ``KCONV_AXIS_MAX`` forced to 1, every factory takes the XLA backend and must
 match mathdx on the same grid.  cpu: with the mesh reported as CUDA, a k axis of
@@ -31,6 +39,16 @@ import os
 import sys
 
 TOL = 1e-12
+TOL_C64 = 1e-5          # complex64 operands (both routes in single precision)
+#: The kdft gate grids (ROCm): split-arm and large-nk shapes to the verified bound
+#: (ffi.fft.KDFT_KMINOR_NK_MAX = 10240), odd / prime / unit axes, and two grids whose
+#: out_layout-1 call takes the split arm inside the single arm's range (12^3, 16x16x15).
+KDFT_GRIDS = ((16, 16, 16), (20, 20, 20), (97, 97, 1), (16, 16, 30), (128, 64, 1), (128, 80, 1),
+              (64, 64, 1), (32, 32, 10), (13, 17, 19), (7, 11, 61), (101, 101, 1), (1, 128, 80),
+              (3, 127, 10), (12, 12, 12), (16, 16, 15))
+KDFT_GRIDS_C64 = ((16, 16, 16), (97, 97, 1), (20, 20, 20))
+#: Past the bound: the router keeps these on XLA and names the gate.
+KDFT_REFUSED = (((128, 81, 1), "GATE kdft-nk"), ((129, 1, 1), "GATE kdft-axis"))
 
 
 def _rel(a, b):
@@ -249,6 +267,81 @@ def run_cases(mesh, kg=(3, 2, 2), arm=None, skip=()):
     return out
 
 
+def kdft_cases(mesh, grids=KDFT_GRIDS, grids_c64=KDFT_GRIDS_C64):
+    """The ROCm kdft routes on large and split-arm grids: ``({name: (rel_error, tol)}, [decision
+    failures])``.  Each factory is built by default (kdft) and inside ``ffi.fft.xla_reference()``
+    on the same mesh; X carries d3*d4 > 1 rows, so the out_layout-1 store is the general
+    permutation, and enough rows per shard for several row-chunk squares."""
+    import warnings
+    import jax
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from ffi import fft as F
+    from lxkit import device_put_process_local
+
+    rng = np.random.default_rng(20261015)
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    mu, nu = 6 * px, 6 * py
+    out, wrong = {}, []
+
+    def put(a, spec):
+        return device_put_process_local(np.asarray(a), NamedSharding(mesh, spec))
+
+    def rnd(dt, *shape):
+        return (rng.standard_normal(shape) + 1j * rng.standard_normal(shape)).astype(dt)
+
+    def both(build, call):
+        a = _gather(jax.block_until_ready(call(build())))
+        with F.xla_reference():
+            fn = build()
+        return a, _gather(jax.block_until_ready(call(fn)))
+
+    for dt, gl in ((np.complex128, grids), (np.complex64, grids_c64)):
+        tol, tag = (TOL, "") if dt == np.complex128 else (TOL_C64, " c64")
+        for kg in gl:
+            g = "x".join(map(str, kg))
+            nk = int(np.prod(kg))
+            for fac in ("kfft_kminor", "kconv_kminor", "kfft_klead", "kconv_klead"):
+                if F.rocm_klead_target(mesh, kg, fac) is None:
+                    wrong.append(f"{g} {fac} left kdft")
+            Xm = put(rnd(dt, 3, mu, nu, *kg), P(None, "x", "y", None, None, None))
+            for kind in ("ifftn", "fftn"):
+                a, b = both(lambda: F.make_kfft_kminor(mesh, kg, P(None, "x", "y", None, None, None),
+                                                       kind=kind, norm="ortho"), lambda f: f(Xm))
+                out[f"kdft mode5 {g} {kind}{tag}"] = (_rel(a, b), tol)
+            Xb = put(rnd(dt, 2, mu, nu, 2, 3, nk), P(None, "x", "y", None, None, None))
+            Kr = put(np.exp(2j * np.pi * rng.random((mu, nu, nk))).astype(dt), P("x", "y", None))
+            for ol in (0, 1):
+                a, b = both(lambda: F.make_kconv_kminor(mesh, kg, P(None, "x", "y", None, None, None),
+                                                        P("x", "y", None), norm="ortho", mult=0.7,
+                                                        out_layout=ol), lambda f: f(Xb, Kr))
+                out[f"kdft mode4 {g} out_layout {ol}{tag}"] = (_rel(a, b), tol)
+            if dt != np.complex128:
+                continue
+            X3 = put(rnd(dt, nk, mu, nu), P(None, "x", "y"))
+            a, b = both(lambda: F.make_kfft_klead(mesh, kg, P(None, None, None, "x", "y"), kind="ifftn",
+                                                  norm="ortho"), lambda f: f(X3))
+            out[f"kdft mode3 {g} ifftn"] = (_rel(a, b), tol)
+            T = put(rnd(dt, nk, 2, mu, 2, nu), P(None, None, "x", None, "y"))
+            Wk = put(rnd(dt, nk, mu, nu), P(None, "x", "y"))
+            def klead():
+                return F.make_kconv_klead(mesh, kg, P(None, None, None, None, "x", None, "y"),
+                                          P(None, None, None, "x", "y"), norm="ortho", mult=0.7)
+            a, b = both(klead, lambda c: c.apply(T, c.prep(Wk)))
+            out[f"kdft mode2 {g}"] = (_rel(a, b), tol)
+    for kg, gate in KDFT_REFUSED:
+        for fac in ("kfft_kminor", "kconv_kminor", "kfft_klead"):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                tgt = F.rocm_klead_target(mesh, kg, fac)
+            msg = " ".join(str(x.message) for x in w)
+            rule = (F.kdft_kminor_refusal if "kminor" in fac else F.kdft_refusal)(kg)
+            # the router announces once, on process 0; every rank reads its rule
+            if tgt is not None or gate not in rule or (jax.process_index() == 0 and gate not in msg):
+                wrong.append(f"{kg} {fac}: want XLA with {gate}, got target {tgt} / {rule[:80]!r} / {msg[:80]!r}")
+    return out, wrong
+
+
 def _fallback_cases(mesh, backend):
     """The router's XLA fallback: ``({name: rel_error}, [decision failures])``."""
     from ffi import fft as F
@@ -285,6 +378,8 @@ def main() -> int:
     from ffi import fft as F
     mesh = stack.mesh
     backend = F.kconv_backend(mesh)
+    if backend == "xla" and F.rocm_klead_target(mesh, (3, 2, 2), "kconv_kminor") is not None:
+        return _main_kdft(mesh, runtime)
     if tuple(mesh.devices.shape) != (2, 2) or backend == "xla":
         print(f"SKIP: needs a 2x2 mesh with a vendor route, got backend {backend} on a "
               f"{tuple(mesh.devices.shape)} mesh", flush=True)
@@ -302,6 +397,32 @@ def main() -> int:
         print(f"KCONV_XLA_GATE {'PASS' if not (bad or wrong) else 'FAIL'} ({backend} vs xla, "
               f"and the XLA fallback): {len(out) - len(bad)}/{len(out)} cases within {TOL:g}, "
               f"{len(wrong)} decision failures", flush=True)
+    rc = 1 if (bad or wrong) else 0
+    runtime.finalize_process(rc)
+    return rc
+
+
+def _main_kdft(mesh, runtime) -> int:
+    """The ROCm gate: :func:`run_cases` (kdft against XLA at the small grid) and
+    :func:`kdft_cases`, on one GCD or a 2x2 mesh."""
+    import jax
+    shape = tuple(mesh.devices.shape)
+    if shape not in ((1, 1), (2, 2)):
+        print(f"SKIP: the kdft gate runs on one GCD or a 2x2 mesh, got {shape}", flush=True)
+        runtime.finalize_process(0)
+        return 0
+    out = {k: (v, TOL) for k, v in run_cases(mesh).items()}
+    extra, wrong = kdft_cases(mesh)
+    out.update(extra)
+    bad = {k for k, (v, tol) in out.items() if not v <= tol}
+    if jax.process_index() == 0:
+        for k, (v, tol) in out.items():
+            print(f"{'ok  ' if k not in bad else 'FAIL'} {k:44s} rel {v:.3e} (tol {tol:g})", flush=True)
+        for w in wrong:
+            print(f"FAIL decision: {w}", flush=True)
+        print(f"KCONV_XLA_GATE {'PASS' if not (bad or wrong) else 'FAIL'} (kdft vs xla on {shape}): "
+              f"{len(out) - len(bad)}/{len(out)} cases within tolerance, {len(wrong)} decision failures",
+              flush=True)
     rc = 1 if (bad or wrong) else 0
     runtime.finalize_process(rc)
     return rc

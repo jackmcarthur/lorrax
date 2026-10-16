@@ -18,7 +18,7 @@
 #include <cstdio>
 #include <sstream>
 
-#include <cuda_runtime.h>
+#include "../common/gpu_runtime.h"
 #include <blas.hh>
 #include <slate/slate.hh>
 
@@ -40,17 +40,17 @@ static ffi::Error TrsmImpl(
     int op_int,       // 0 = NoTrans, 1 = Trans, 2 = ConjTrans
     int diag_int,     // 0 = NonUnit, 1 = Unit
     double alpha_re, double alpha_im,
-    cudaStream_t xla_stream,
+    lrx::gpu::Stream xla_stream,
     lorrax_ffi::slate::SlateCtx* ctx,
     const T* d_A,
     const T* d_B_in,
     T* d_X_out)
 {
-    cudaError_t ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    lrx::gpu::Error ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.trsm: cudaStreamSynchronize(xla_stream) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.trsm: " LRX_GPU_API "StreamSynchronize(xla_stream) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -77,20 +77,20 @@ static ffi::Error TrsmImpl(
     // Count how many elements of B/X are local to this rank.
     const int64_t local_rows = (X_rows + p - 1) / p;
     const int64_t local_cols = (X_cols + q - 1) / q;
-    ce = cudaMemcpyAsync(d_X_out, d_B_in,
+    ce = lrx::gpu::memcpy_async(d_X_out, d_B_in,
                          local_rows * local_cols * sizeof(T),
-                         cudaMemcpyDeviceToDevice, xla_stream);
-    if (ce != cudaSuccess) {
+                         lrx::gpu::kDeviceToDevice, xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.trsm: cudaMemcpyAsync(B -> X) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.trsm: " LRX_GPU_API "MemcpyAsync(B -> X) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.trsm: cudaStreamSynchronize after B->X copy failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.trsm: " LRX_GPU_API "StreamSynchronize after B->X copy failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -157,7 +157,7 @@ static ffi::Error TrsmImpl(
 }
 
 static ffi::Error TrsmDispatch(
-    cudaStream_t stream,
+    lrx::gpu::Stream stream,
     ffi::AnyBuffer A,
     ffi::AnyBuffer B,
     ffi::Result<ffi::AnyBuffer> X_out,
@@ -210,7 +210,7 @@ static ffi::Error TrsmDispatch(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     SlateTrsmFfi, lorrax_ffi::slate_trsm::TrsmDispatch,
     xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<xla::ffi::AnyBuffer>()              // A (triangular)
         .Arg<xla::ffi::AnyBuffer>()              // B (right-hand side)
         .Ret<xla::ffi::AnyBuffer>()              // X (solution, same shape as B)

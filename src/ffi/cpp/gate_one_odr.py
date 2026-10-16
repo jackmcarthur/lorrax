@@ -27,7 +27,7 @@ HOW TO RUN IT (Perlmutter; needs a GPU node and BOTH pins):
 `JAX_PLATFORMS=cuda,cpu` is the whole setup, and `runtime.set_default_env`
 below supplies it together with x64 (the SlabIO handle is int64), so the
 gate no longer depends on the lorrax_A module exporting either: the process IS CUDA-capable
-(`jax.default_backend() == 'gpu'`), which is what `_process_can_use_cuda()`
+(`jax.default_backend() == 'gpu'`), which is what `lxkit.legs.process_accelerator_leg()`
 answers True to, so `get_lib('cpu')` pre-opens the CUDA library FIRST and
 BOTH .so files end up in the process; and the SlabIO mesh is built from
 `jax.devices('cpu')`, so `ffi.io._platform_for_mesh` routes the phdf5

@@ -89,7 +89,8 @@ The factory picks the backend from the mesh's device vendor alone
 |---|---|
 | CUDA | the nvidia-mathdx kernel family in `liblorrax_ffi.so`: `src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`, and `kconv_outer_cuda_ffi.cc` for the BSE outer-product load |
 | cpu | the plan backend: the reference composition of each mode (the same unfolds, products and spin sums in XLA) with the FFTW3-ABI host handlers of `liblorrax_ffi_host.so` (`lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv`, [FFI layer §3c](ffi_layout.md#3c-which-fft-engine-the-host-library-binds)) |
-| any other (ROCm, …) | the XLA backend: the same composition with `jnp.fft` along the k axes; no LORRAX library |
+| ROCM | the XLA backend, except the k-leading pair: `make_local_kconv_klead` (mode 2, and so `make_kconv_klead`'s apply: Σ τ, COHSEX, the BSE W term) and `make_local_kfft_klead` (mode 3) take the kdft family of `liblorrax_ffi_rocm.so` (`src/ffi/cpp/kdft/`, hipRTC-built: a column tile's k axes transformed in LDS by mixed-radix Stockham DFT, or for the convolution pass of a group whose axes are ≤ 32 by whole lines in registers with LDS only for the axis exchange, one HBM pass when the k tile fits a block and otherwise one pass per contiguous axis group, 2·(groups−1)+1 for mode 2; plan in `kdft_klead_plan.h`), through `ffi.fft._ROCM_KLEAD_TARGETS`; so does the k-minor pair, `make_local_kconv_kminor` (mode 4: the BSE ring rung, both `out_layout`s) and `make_local_kfft_kminor` (mode 5: the BSE kernel prep), one HBM pass on a block of whole contiguous rows staged transposed in LDS with the same DFT core where one row's k tile fits and is the cheaper plan, else the split arm: row passes over the trailing axis group and k-leading column passes over the others with the K multiply fused in one, 2·(groups−1)+1 HBM passes for mode 4 (out_layout 1 takes an XLA scratch buffer of X's size, and its last row pass stores the permuted layout with the blocks ordered by the store's k stride, `kdft_kminor_plan.h` `l1_order`; plan in `kdft/kdft_kminor_plan.h`; every kdft tile is sized to the leg's block LDS, `common/leg.h` `LRX_LEG_BLOCK_LDS`: 64 KiB on ROCM, 48 KiB on CUDA); nk ≤ `ffi.fft.KDFT_KMINOR_NK_MAX` = 10240 (`GATE kdft-nk`), axes ≤ `KDFT_KMINOR_AXIS_MAX` (`GATE kdft-axis`); `kconv_backend` stays `'xla'`. Where kdft cannot serve: beyond its verified range, an axis above 128 (`GATE kdft-axis`) or nk above 10240 (`GATE kdft-nk`), or a failed startup probe (`GATE kdft-probe`, demoted as the mathdx probe is). Mode 7 (`make_kconv_klead_unfold`, the Σ τ kernel) takes the k-box stage itself, `lorrax_kdft_kconv_klead_unfold` (`src/ffi/cpp/kdft/kbox_unfold_*`, through `ffi.fft._ROCM_KBOX_TARGETS`), on the single arm only: a grid whose spin group does not fit a block's 64 KiB of LDS keeps the XLA unfold + kdft route (`GATE kdft-kbox-residency`, `ffi.fft.kdft_kbox_refusal`), as does an axis above `ffi.fft.KDFT_KBOX_AXIS_MAX` = 40 (its line transform is the stage's unrolled direct DFT; `GATE kdft-axis`). Modes 9 and 11 take the same stage (`src/ffi/cpp/kdft/kbox_rspace_*`, same table) on three arms (`ffi.fft.kdft_kbox_arm`, the mirror of the handler's `plan()`; constants measured on one MI250X GCD): the single arm (one HBM pass), the two-pass split (the stage's (k_y, k_z) plane pass on tiles of whole groups, then the x pencil) and, on 3-D grids whose two-pass tile holds fewer than `KDFT_KBOX_PLANE_MIN_COLS` = 32 columns, the three-pass split (the load with the z lines on tiles of one padded z-line per column, the y lines in place, the x pencil). `make_kfft_klead_unfold` (mode 9, W from its q wedge) → `lorrax_kdft_kfft_klead_unfold`, single while the tile holds at least `KDFT_KBOX_WEDGE_MIN_COLS` = 16 columns (5×5×1, 8×8×1, 4³), else split, the scale applied in the pencil in place on Y. `make_kconv_chi_unfold` / `make_kconv_chi_vertex` (mode 11, the χ₀ τ node, plain and four-current) → `lorrax_kdft_kconv_chi_unfold` / `_chi_vertex`, single while a tile of whole Green pairs leaves two blocks per CU and its axis passes have at least `KDFT_KBOX_CHI_SINGLE_MIN_LINES` = 96 lines ($n_s = 2$ to 6³ and 12×12×1), else split: the plane pass, tile-major, into a $(N_k, \text{chunk}\cdot 2n_s^2)$ intermediate of pair chunks from XLA's scratch allocator (at most `scratch_bytes` = `ffi.fft.kdft_kbox_chi_scratch_bytes`), then the group pencil (a pair's columns on one wavefront, reduced by lane reads); on a 2-D grid it keeps the XLA route past `KDFT_KBOX_CHI_2D_AXIS_MAX` = 24 (`GATE kdft-kbox-chi-2d`, measured slower). The factory builds and loads each image when it traces the call (`ffi.fft._kbox_prebuild` → `lrx_kbox_rspace_prebuild_rocm`), off the running program's execute thread. Each mode has its own axis bound (`KDFT_KBOX_WEDGE_AXIS_MAX`, `KDFT_KBOX_CHI_AXIS_MAX` = 40, `GATE kdft-axis`) and the k-lead family's nk bound (`KDFT_KBOX_RSPACE_NK_MAX` = 10240, `GATE kdft-nk`); within them every grid has an arm (`GATE kdft-kbox-residency` is the handler's defensive rule); beyond any rule the factory keeps its XLA route. The BSE outer load and its fused decode (`make_local_kconv_klead_outer`, `make_local_kconv_klead_outer_decode`) take `lorrax_kdft_kconv_klead_outer` / `_outer_decode` (`src/ffi/cpp/kdft/kconv_outer_*`, through `ffi.fft._ROCM_OUTER_TARGETS`; [§11](#bse-outer)). Mode 6, `make_fused_conv_kplane` (the ISDF route-G pair convolution, the ζ fit's μ-batch loop), takes `lorrax_kdft_kconv_plane` (`src/ffi/cpp/kdft/kbox_plane_*`, through `ffi.fft._ROCM_PAIR_TARGETS`): the CUDA plane mode's load (conj(F·D), the L/R split on the load, no phased copy of D) on the k-box single arm, a tile of NO ≤ 16 output columns with their 2·n_s² operand columns in half a block's LDS (else all of it; `ffi.fft.kdft_plane_no`), the phased pair product into NO compact rows, the forward transform on those rows only; axes ≤ `KDFT_PLANE_AXIS_MAX` = 40 (`GATE kdft-axis`), one output column within the LDS (`GATE kdft-kconv-plane-tile`; `ffi.fft.kdft_plane_refusal`); gate `tests/test_kdft_plane_gate.py`. Mode 1, `make_fused_conv_kparent` (the ζ-fit pair Gram $C_q$ of `isdf.core`, typed parent tables), takes `lorrax_kdft_kconv_parent` (`src/ffi/cpp/kdft/kbox_parent_*`, same table): the CUDA parent mode's typed parent load (both phases, the antiunitary conjugation and the open-spin coefficients on the load, the same `centroid_major` input layout) in mode 6's tile (`ffi.fft.kdft_parent_refusal`, `GATE kdft-kconv-parent-tile`), one thread per (output column, k) reading each source once for all $n_s^2$ entries; measured 1.3–6.2× the XLA route on one MI250X GCD, so routed wherever it fits (record above `ffi.fft._kdft_parent_fn`). Mode 10, `make_plane_fft_gather`, takes `lorrax_kdft_plane_fft_gather` (`src/ffi/cpp/kdft/plane_gather_*`; [§10](#mode-10)) where `ffi.fft.kdft_plane_fft_refusal` is empty, except a plane with an axis in `ffi.fft.KDFT_PLANE_FFT_SLOW_AXES` (32: measured 0.93×; `GATE kdft-plane-slower`). Gate for modes 1 and 10: `tests/test_kdft_parent_gate.py`. Every factory built on a ROCm mesh announces its route once (`[kconv] k-convolution router: ROCM <factory> k-grid <grid> -> <route>`, visible with `LORRAX_DEBUG_PRINT=1`) |
+| any other | the XLA backend: the same composition with XLA's k-axis transforms (one dense DFT GEMM on the k axis for $N_k \le$ the leg's `xla_kdft_max_nk`, `jnp.fft` above; [§15](#numerical-contract)); no LORRAX library. The ROCM rows above that are not kdft factories take this backend too |
 
 **Where mathdx cannot serve.** On CUDA a factory takes the XLA backend, with
 one `RuntimeWarning` and a router line per grid, where `ffi.fft.mathdx_refusal`
@@ -177,12 +178,12 @@ One handler file serves modes 0–11, each a value of the compile-time
 `LRX_MODE` of one embedded source. A target string is `lorrax_mathdx_<suffix>`;
 `ffi_loader._CUDA_TARGET_SYMBOLS` maps it to its C++ handler symbol.
 
-| mode, target suffix | factory (`ffi.fft`) | computes | operands → result | plan and XLA backends (host transforms on cpu, `jnp.fft` elsewhere) |
+| mode, target suffix | factory (`ffi.fft`) | computes | operands → result | plan and XLA backends (host transforms on cpu, XLA k transforms elsewhere) |
 |---|---|---|---|---|
 | 0 `kconv_pair` | `make_fused_conv_kpair` | $U = s\,F_k\sum_{ab}\phi_l[a]\phi_r[b]\,\overline{F^{-1}A_{a,b}}\cdot F^{-1}B_{\pi_l a,\pi_r b}$ | `A`, `B` `(n_kx, n_ky, n_kz, n_s, col, μ, n_s)` → `U` `(n_kx, n_ky, n_kz, col, μ)` | two inverse transforms, the spin sum, one forward transform |
 | 1 `kconv_parent` | `make_fused_conv_kparent` | mode 0 with both operands unfolded from raw parents on the load ([§9](#mode-1)) | `D_l`, `D_r` `(n_parent, n_s, μ, n_s, ν)` and ten tables → `U` `(N_k, μ, ν)` | the typed parent load in XLA (a full-k `(N_k, n_s, μ, ν, n_s)` copy per side), then mode 0's composition |
 | 2 `kconv_klead` | `make_kconv_klead` (`apply`), `make_local_kconv_klead` | $U = s\,F_k(F^{-1}T\cdot V_R)$, $V_R$ already in R space | `T`, `U` `(N_k, a, m_x, b, m_y)`, `V_R` `(N_k, m_x, m_y)` | `lorrax_mklfft_gw_conv` (`make_kconv_klead` on cpu); the inverse transform, the product, the forward transform |
-| 3 `kfft_klead` | `make_kfft_klead`, `make_local_kfft_klead`; `prep` of `make_kconv_klead` | $Y = s\,F^{\pm}_k X$, k leading | `(N_k, rows)` | `lorrax_mklfft_flat_k`; `jnp.fft` over the three k axes |
+| 3 `kfft_klead` | `make_kfft_klead`, `make_local_kfft_klead`; `prep` of `make_kconv_klead` | $Y = s\,F^{\pm}_k X$, k leading | `(N_k, rows)` | `lorrax_mklfft_flat_k`; the XLA k transform (DFT GEMM, or `jnp.fft` over the three k axes) |
 | 4 `kconv_kminor` | `make_kconv_kminor`, `make_local_kconv_kminor` | $U = s\,F_k(F^{-1}X\cdot K_R)$, k trailing, $K_R$ made by mode 5 | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | k moved to the front, the transforms and the product, k moved back |
 | 5 `kfft_kminor` | `make_kfft_kminor`, `make_local_kfft_kminor` | $Y = s\,F^{\pm}_k X$, k trailing | `(rows, N_k)` | the same transpose around one transform |
 | 6 `kconv_plane` | `make_fused_conv_kplane` | mode 0 read from route G's plane-transform output (`g` planes of `p` points, `c` centroids per side): the Bloch phase `F[k,g,p]` applied and the `2c` axis split on the load into the left projector (slots `[0, c)`) and the right one (`[c, 2c)`) | `D` `(N_k, g, n_s, 2c, n_s, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | phase, split and transpose in XLA, then mode 0's composition |
@@ -233,9 +234,15 @@ Every mode except 0, 1, 6 and 10 runs on one stage,
 - **Store**: the scaled write, through a row map where the mode keeps only
   some k rows.
 
-The stage owns the transforms and the launch rule. A transform runs cuFFTDx
-thread FFTs along z, then y, then x; the forward transform after the Mid
-uses the same axis order.
+The stage owns the transforms and the launch rule. A transform runs one line
+transform per line along z, then y, then x; the forward transform after the Mid
+uses the same axis order. The line transform is the leg's policy, the stage's
+one vendor seam (`line_fft`, with the copy and the lane read): a cuFFTDx thread
+FFT under NVRTC, the kdft direct DFT against compile-time twiddles under hipRTC
+(`LRX_KBOX_DIRECT_DFT`; a wavefront of 64 lanes). `lrx_kbox::fft_direction`
+names the leg's direction type, so one mode text serves both legs; the CUDA
+images are byte-identical to those of the stage before the split (CUDA 13.4
+NVRTC, sm_80, modes 2/3, 7, 8, 9, 11 and the BSE outer load).
 
 **Bank geometry** (`lrx_kbox::Geometry`). A column's z line is padded to
 $n_{kz}|1$ and the column stride to $(n_{kx}n_{ky}(n_{kz}|1))|1$ elements;
@@ -537,6 +544,8 @@ both factors at most 40, or $(n, 1)$ for $n \le 40$ without one. Block FFTs
 are not used because cuFFTDx's fp64 database lacks lengths such as 45, 54,
 75, 90, 150 and 250, which would need Bluestein and a host-built workspace.
 
+**ROCM** (`src/ffi/cpp/kdft/plane_gather_*`): the same kernel design and splits (`plane_fft_split`, factors ≤ 40), with three differences. Each factor line is one register Cooley–Tukey step of direct DFTs against the k-box stage's compile-time twiddles ($M = RQ$, $R$ the largest divisor ≤ $\sqrt M$; $M(R+Q)$ products; a prime factor is one direct DFT), the role cuFFTDx's thread FFT plays on CUDA. The gather is synchronous (gfx90a has no `cp.async` in this subset) and the grid is grid-stride, not persistent. $P_B$ is the most planes (≤ 8) within half a block's 64 KiB of LDS, else one plane within all of it (`ffi.fft.kdft_plane_fft_pb`; `GATE kdft-plane-residency` beyond, so 80² keeps the XLA route on ROCM). Measured per call on one GCD: 25² Fe slab 1.32×, 54² 1.31×, 40²–45² 2.4–3.3×, 32² 0.93× (kept on XLA).
+
 `make_plane_fft_gather` decides once, at build, and announces the route.
 Mode 10 serves a plane when both axes split and
 
@@ -584,6 +593,29 @@ announcement are on the [BSE page](bse.md#the-matvec).
 `LORRAX_BSE_OUTER_KSUM=fma` runs both K sums on the fp64 FMA pipe instead of
 the tensor cores, for comparing the two on devices where their rates differ.
 
+**ROCM** (`src/ffi/cpp/kdft/kconv_outer_rocm_ffi.cc`, kernels in `kconv_outer_kernel.h` on the
+same k-box stage, line transform the direct DFT): the CUDA kernels' work items, V-reuse order,
+decode phases (`plan_phases`), slots and item counter, with three differences. The K sum and the
+decode run on the FP64 FMA pipe (gfx90a has no spelling of the m8n8k4 fragment contract), so U and
+A agree with the XLA chain to round-off (gate `tests/test_kdft_outer_gate.py`, 1e-12; measured
+≤ 1.5e-15), K is not padded, and the decode takes $\psi_c$ as the BSE holds it (`prep` is the
+identity). The tile is the largest XB × YB ≤ 8 × 8 box of padded columns within half a block's
+64 KiB of LDS, else all of it (`ffi.fft.kdft_outer_tile`; an 8 × 8 bank is 66.5 KB at 8×8×1, so
+that grid takes a 2 × 8 (x × y) box at half the LDS). One block-wide group (no ping-pong). The rules:
+axes ≤ `KDFT_OUTER_AXIS_MAX` = 40 (`GATE kdft-axis`), one padded column within the LDS
+(`GATE kdft-kconv-outer-tile`), and for the decode at most `KDFT_OUTER_ACC_MAX` = 32 complex
+accumulators per thread at 256 or 512 threads (`GATE kdft-kconv-outer-decode-tile`;
+`ffi.fft.kdft_outer_refusal`, `kdft_outer_decode_refusal`). A library without the handlers is
+refused by name (`klead_outer_refusal`), and the BSE then announces the XLA encode with kdft mode 2.
+Routing is measured (one MI250X GCD, the record beside `ffi.fft.KDFT_OUTER_BOX_COLS`): the outer load
+beats the XLA encode + kdft mode 2 only where the CUDA kernel's 8 × 8 box fits half the LDS
+(1.37× at 5×5×1); a smaller box re-reads the R leg per x block from L2 (0.74× at 8×8×1 with
+μ = ν = 724, 1.07× at 4³), so such grids keep the unfused chain (`GATE kdft-kconv-outer-box`). The
+fused decode measured 0.33–0.60× the outer load + XLA decode einsum, so the BSE keeps the XLA decode
+(`GATE kdft-kconv-outer-decode-slower`). `LORRAX_KDFT_OUTER=all` routes both wherever the kernels
+fit (the gate's and the bench's A/B). Beating the chain at $N_k \ge 64$ needs a denser load: the
+kdft register pass (lines in VGPRs, LDS only for the axis exchange) or an MFMA K sum.
+
 ## 12. Cost {#cost}
 
 Each transform costs $O(n_{\rm col}N_k\log N_k)$ flops. HBM traffic is one
@@ -613,6 +645,17 @@ not of the traffic.
 | `GATE mathdx-kconv-outer-tile`, `-outer-decode-tile`, `-outer-arch`, `-outer-rank` | kernel build | the BSE outer load's bank or accumulator does not fit, the device is older than sm_80, or K is not a multiple of 4 | call through the factories, which check `klead_outer_refusal` / `klead_outer_decode_refusal` and pad K |
 | `GATE mathdx-plane-split`, `mathdx-plane-residency` | kernel build | a direct mode-10 call on a plane with no split or too large | call through `make_plane_fft_gather` |
 | `GATE plane-fft-dtype` | trace | mode 10's `F` is not complex128 | pass complex128 |
+| `GATE kdft-plane-split`, `kdft-plane-residency`, `kdft-plane-slower` | factory build (ROCM) and kernel build | mode 10 on ROCM: an axis with no split into factors ≤ 40, a plane beyond a block's 64 KiB of LDS, or an axis measured slower than the XLA route (`KDFT_PLANE_FFT_SLOW_AXES`) (`ffi.fft.kdft_plane_fft_refusal`, `rocm_plane_fft_target`) | none: the factory keeps the XLA route, one warning per plane |
+| `GATE kdft-kconv-parent-tile` | factory build (ROCM) and kernel build | mode 1's output column ($2n_s^2$ padded columns) does not fit a block's 64 KiB of LDS (`ffi.fft.kdft_parent_refusal`) | none: the factory keeps the XLA route, one warning per grid |
+| `GATE kdft-kconv-outer-box`, `kdft-kconv-outer-decode-slower` | factory build (ROCM) | the measured routing rule: the outer load's 8 × 8 box exceeds half a block's LDS, or the fused decode (always; measured slower) | none: the BSE keeps the next route down, one warning per grid; `LORRAX_KDFT_OUTER=all` is the A/B |
+| `GATE kdft-kconv-outer-tile`, `kdft-kconv-outer-decode-tile` | factory build (ROCM) and kernel build | the ROCM outer load's padded column does not fit a block's 64 KiB of LDS (nk above about 4000), or the fused decode needs more than 32 accumulators per thread (`ffi.fft.kdft_outer_refusal`, `kdft_outer_decode_refusal`) | none: the BSE keeps the next route down (outer load + XLA decode, or the XLA encode + kdft mode 2), one warning per grid |
+| `GATE kdft-kbox-residency` | factory build (ROCM) and kernel build | mode 7's spin group (two columns at $n_s = 1$) does not fit a block's 64 KiB of LDS on the k-box single arm (`ffi.fft.kdft_kbox_refusal`, the handler's `kbox_plan`); the split arm is not ported | none: the router keeps the XLA unfold + kdft route, one warning per grid |
+| `GATE kdft-kbox-residency` (modes 9, 11) | factory build (ROCM) and kernel build | neither k-box arm holds the grid: the single arm's spin group ($n_l n_r$ columns, mode 9) or Green pair ($2 n_s^2$, mode 11) exceeds a block's 64 KiB of LDS and so does the split arm's plane tile of one group ($n_l n_r$, resp. $n_s^2$, columns of a padded $(k_y, k_z)$ plane; e.g. $n_s = 4$ at 16³) (`ffi.fft.kdft_kbox_wedge_refusal` / `kdft_kbox_chi_refusal` via `kdft_kbox_arm`, the handler's `plan()`) | none: the factory keeps its XLA route, one warning per grid |
+| `GATE kdft-nk` (modes 9, 11) | factory build (ROCM) | nk above `ffi.fft.KDFT_KBOX_RSPACE_NK_MAX` = 10240, the k-lead family's verified range (gated at 40×16×16) | none: the factory keeps its XLA route, one warning per grid |
+| `GATE kdft-kbox-chi-2d` | factory build (ROCM) | mode 11 on a 2-D k-grid with an axis above `ffi.fft.KDFT_KBOX_CHI_2D_AXIS_MAX` = 24: measured 0.72–0.91× the XLA route (32×32×1, 40×8×1, 40×40×1; one MI250X GCD, 128×128 tile) | none: the factory keeps its XLA route, one warning per grid |
+| `GATE kdft-kbox-build` (modes 9, 11) | trace (ROCM) and kernel build | the image of a routed grid did not compile or load (the factory's prebuild, `ffi.fft._kbox_prebuild`, raises the handler's reason) | a defect: rebuild the leg from this tree |
+| `GATE kdft-kbox-chi-scratch` | kernel run (ROCM) | XLA's scratch allocator refused mode 11's split-arm intermediate (`scratch_bytes`, at least one pair's $N_k \cdot 2 n_s^2$ c128) | pass a smaller `scratch_bytes` |
+| `GATE kdft-kbox-build`, `kdft-kbox-operands`, `kdft-kbox-launch` | kernel build, apply | the hipRTC compile, the operand contract or the launch of `lorrax_kdft_kconv_klead_unfold`, `_kfft_klead_unfold`, `_kconv_chi_unfold` or `_kconv_chi_vertex` failed | a build defect |
 | `k-leading unfold conv: …` (and `lorentz conv`, `chi unfold`, `unfold fft`) | factory; apply | tables cut for another mesh, operands whose parent count or endpoint widths differ from the tables, or a missing partner on a plan with antiunitary rows | build the tables from the same plan and mesh as the operands; pass the partner |
 
 A kernel-build failure (an NVRTC compile, missing toolkit headers, a module
@@ -663,6 +706,14 @@ build log lines by its §7.
   mode is complex128 only. The host plan handlers are complex128 only, so a
   complex64 operand refuses at trace time on a cpu mesh; the XLA backend takes
   either precision.
+- **XLA k transforms.** On the XLA backend a k-grid of at most the leg's
+  cap (`ffi.fft.XLA_KDFT_MAX_NK`: ROCM and cpu 144; CUDA none until its
+  crossover is measured, so CUDA's XLA route is unchanged) is transformed as one GEMM with the dense
+  flat-k DFT matrix on the axis where k sits (`ffi.fft._kdft`), not with
+  `jnp.fft`, whose XLA FFT op on minor-most dims costs a transpose each way
+  around rocFFT/cuFFT. The two agree to round-off (relative 1e-15 at
+  complex128 on MI250X up to 12×12×1), not bitwise; above the cap `jnp.fft`
+  is unchanged.
 - **In place.** Modes 2, 3 and 5, and mode 4 with `out_layout=0`, alias
   operand 0 to the result; mode 11 aliases `acc`. This is safe because each
   block reads all $N_k$ values of its columns before it stores any of them.

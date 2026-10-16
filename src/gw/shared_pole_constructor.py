@@ -105,7 +105,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         from jax.sharding import NamedSharding, PartitionSpec as P
         from file_io.shared_pole_store import (
             charge_representation, validate_shared_pole_bank, open_shared_pole_bank,
-            read_line_panels, read_shared_pole_bank, write_shared_pole_model,
+            read_line_panel_round, read_shared_pole_bank, write_shared_pole_model,
         )
         from gw.gw_config import linalg_resolution
         from common.staged_reshard import face_to_batch_reshard
@@ -260,9 +260,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 samples = read_shared_pole_bank(
                     bank_io, meta=meta, header=header, q_ids=ids,
                     partition_spec=read_spec, sample_ids=dense_fit, fields=("Wc", "dWc_ds"))
-                line = {sid: read_line_panels(bank_io, meta=meta, header=header, family="charge",
-                                              sample=sid, q_ids=ids, partition_spec=read_spec)
-                        for sid in range(line_lo, line_hi)}
+                # The round's line panels in one collective read (SlabIO.read_multi).
+                line = read_line_panel_round(bank_io, meta=meta, header=header, family="charge",
+                                             samples=range(line_lo, line_hi), q_ids=ids,
+                                             partition_spec=read_spec)
             # The store admits this complete bounded scratch batch before
             # allocation. Charge it while directions/actions are selected;
             # release it before admitting the dense pencil.
@@ -314,8 +315,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                     round_states, infinity, tables, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
-                    keep_budget=keep_budget, admit=False, room=room,
-                    carrier=sizing['carrier'])
+                    keep_budget=keep_budget, eigh_backend=resolution.eigh_backend,
+                    admit=False, room=room, carrier=sizing['carrier'])
             else:
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
@@ -323,8 +324,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
             qi = infinity[0]
             del round_states, infinity
-            round_reduction, round_zero, round_retained, round_permutation = jax.tree.map(np.asarray, round_diagnostics)
-            poles, active = (np.asarray(a) for a in vectors)
+            # One device-to-host read of the round's replicated diagnostics and vectors.
+            from gw.shared_pole_local import host_tree
+            (round_reduction, round_zero, round_retained, round_permutation), (poles, active) = host_tree(
+                (tuple(round_diagnostics), tuple(vectors)))
             budget.retained_panels = tuple(factors)
         with phase("gates"):
             for slot, q in enumerate(ids[:real]):

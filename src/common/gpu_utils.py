@@ -388,18 +388,19 @@ def get_device_memory_gb(linalg: str = "local") -> float:
     if jax.default_backend() == 'cpu':
         total = (_meminfo_gb('MemTotal') or 0.0) * 1e9 / _processes_on_this_node()
         return planner_budget_bytes(total, linalg) / max(1, jax.local_device_count()) / 1e9
-    from lxkit import device_vendor
-    from runtime.xla_memory import cuda_device_total_bytes
+    from runtime.xla_memory import device_total_bytes
     device = jax.local_devices()[0]
-    total = (cuda_device_total_bytes(int(getattr(device, 'local_hardware_id', 0) or 0))
-             if device_vendor(device) == 'cuda' else None)
+    # The card total through the device leg's declared reader (lxkit.LEGS
+    # device_memory_api: cuDeviceTotalMem on CUDA, hipDeviceTotalMem on ROCm).
+    total = device_total_bytes(int(getattr(device, 'local_hardware_id', 0) or 0))
     if total is None:
-        # No CUDA card total: the client's pool limit stands in for the card.
+        # No card total from the leg: the client's pool limit stands in for the card.
         total = int((device.memory_stats() or {}).get('bytes_limit', 0))
         from runtime.aot_memory import announce_once
         announce_once("gpu-budget-pool-limit",
-                      f"device total unreadable (not a CUDA device); the XLA pool "
-                      f"limit {total / 1e9:.2f} GB stands in for the card")
+                      f"device total unreadable (this device's leg declares no "
+                      f"reader, or it did not answer); the XLA pool limit "
+                      f"{total / 1e9:.2f} GB stands in for the card")
     budget = planner_budget_bytes(total, linalg)
     limit = _enforced_pool_limit(device)
     if limit:

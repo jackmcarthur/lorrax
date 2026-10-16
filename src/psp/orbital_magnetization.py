@@ -44,6 +44,8 @@ import sys
 import argparse
 from pathlib import Path
 
+# runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
+import runtime  # noqa: F401
 import numpy as np
 import jax  # noqa: F401  (devices are queried only after runtime startup)
 

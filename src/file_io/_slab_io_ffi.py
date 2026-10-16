@@ -45,7 +45,7 @@ from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import (barrier as _barrier, device_put_process_local,
-                                gather_to_host)
+                                device_put_process_local_cached, gather_to_host)
 from runtime import debug_print_enabled
 from runtime.padding import authenticate_padded_axis, padded_axis
 
@@ -324,7 +324,7 @@ def _stripe_size_bytes(nranks: int | None = None) -> int:
             f"'MiB'/'MB' spellings are not accepted).") from None
 
 
-def _export_striping_env(nranks: int | None = None) -> tuple[int, int]:
+def _resolve_striping(nranks: int | None = None) -> tuple[int, int]:
     """Materialise the resolved striping into ``os.environ``; return it.
 
     WHY THIS EXISTS, and why it is not spooky action.  The FFI writer's
@@ -358,19 +358,20 @@ def _export_striping_env(nranks: int | None = None) -> tuple[int, int]:
     over 0..4100 ranks), so the agreement is by construction and this
     function is back to being only what its name says: the operator
     override's channel to C++, and a run log's record of the layout.
+
+    NO LONGER EXPORTS (2026-10-16, GATE env-frozen).  Writing these two keys
+    into the process environment at every SlabIO open raced native threads'
+    ``getenv`` (glibc: a new key reallocates ``environ``): the rc 139 start-up
+    SIGSEGV, the rocBLAS warm-up thread faulting in HSA's ``getenv`` while this
+    ran before the WFN.h5 open (``runtime.env_guard``).  Nothing needed the
+    export: an operator's override is already in the environment, where the
+    C++ reads it (number + optional K/M/G, as the docs spell it), and unset the
+    C++ derives this same policy from the world size (``stripe_policy_count``/
+    ``_unit``; transcriptions agree at every world size 0..4100, checked
+    2026-10-16 -- the test named above is not in this tree).  The resolved layout is returned for
+    the caller's run-log line, and the operator values are still validated here.
     """
-    count = _stripe_count(nranks)
-    unit = _stripe_size_bytes(nranks)
-    os.environ["LORRAX_PHDF5_STRIPE_COUNT"] = str(count)
-    # Re-export in the `lfs setstripe -S` spelling both parsers accept, so
-    # a run log's environment reads the way the docs and `lfs` do.  A unit
-    # that is not a whole number of MiB (only reachable by an explicit
-    # override like '512k') keeps the byte spelling, which both parsers
-    # also accept — an exact value beats a pretty one.
-    os.environ["LORRAX_PHDF5_STRIPE_SIZE_FS"] = (
-        f"{unit >> 20}M" if unit >= (1 << 20) and unit % (1 << 20) == 0
-        else str(unit))
-    return count, unit
+    return _stripe_count(nranks), _stripe_size_bytes(nranks)
 
 
 def file_stripe_layout(path: str) -> tuple[int, int] | None:
@@ -473,48 +474,59 @@ def _announce_read_layout(path: str) -> None:
 @contextmanager
 def _large_read_progress(path: str, name: str, *, global_bytes: int,
                          local_bytes: int):
-    """Make a synchronous H5Dread distinguishable from a frozen process."""
+    """Make a large-file H5Dread distinguishable from a frozen process, without waiting for it.
+
+    Rank 0, a file of at least ``_LARGE_READ_LAYOUT_BYTES``: START at dispatch, then a daemon
+    thread polls the result (``is_ready``: no stream synchronization) and prints PROGRESS every
+    ``_READ_HEARTBEAT_SECONDS`` and COMPLETE once the bytes have landed (elapsed from dispatch).
+    Yields ``watch(result)``; the read is never waited for here, so the caller's thread runs on.
+    A dispatch that raises prints FAILED.
+    """
+    pending: list = []
     if not _rank0():
-        yield
+        yield pending.append
         return
     try:
         file_bytes = int(os.path.getsize(path))
     except OSError:
         file_bytes = -1
     if file_bytes < _LARGE_READ_LAYOUT_BYTES:
-        yield
+        yield pending.append
         return
 
     started = time.monotonic()
-    stopped = threading.Event()
     label = f"{os.path.basename(path)}:{name}"
     print(
         f"  [SlabIO.read] START {label} global_bytes={int(global_bytes)} "
         f"local_bytes={int(local_bytes)}",
         flush=True)
-
-    def heartbeat() -> None:
-        while not stopped.wait(_READ_HEARTBEAT_SECONDS):
-            print(
-                f"  [SlabIO.read] PROGRESS {label} "
-                f"elapsed={time.monotonic() - started:.1f} s; "
-                "collective H5Dread has not returned",
-                flush=True)
-
-    thread = threading.Thread(
-        target=heartbeat, name="lorrax-slabio-read-progress", daemon=True)
-    thread.start()
-    outcome = "FAILED"
     try:
-        yield
-        outcome = "COMPLETE"
-    finally:
-        stopped.set()
-        thread.join(timeout=1.0)
+        yield pending.append
+    except BaseException:
+        print(f"  [SlabIO.read] FAILED {label} elapsed={time.monotonic() - started:.1f} s",
+              flush=True)
+        raise
+
+    def landed() -> None:
+        delay, beat = 1e-3, started + _READ_HEARTBEAT_SECONDS
+        while not all(r.is_ready() for r in pending):
+            now = time.monotonic()
+            if now >= beat:
+                beat = now + _READ_HEARTBEAT_SECONDS
+                print(
+                    f"  [SlabIO.read] PROGRESS {label} "
+                    f"elapsed={now - started:.1f} s; "
+                    "collective H5Dread has not returned",
+                    flush=True)
+            time.sleep(delay)
+            delay = min(2 * delay, 0.25)
         print(
-            f"  [SlabIO.read] {outcome} {label} "
+            f"  [SlabIO.read] COMPLETE {label} "
             f"elapsed={time.monotonic() - started:.1f} s",
             flush=True)
+
+    threading.Thread(target=landed, name="lorrax-slabio-read-progress",
+                     daemon=True).start()
 
 
 def _replace_inode_for_write(path: str) -> None:
@@ -1273,6 +1285,12 @@ def _onto_handle_mesh(A: jax.Array, mesh: Mesh, name: str) -> jax.Array:
         f"common.collectives.gather_to_host.  doc: docs/architecture/slab_io.md#contract.")
 
 
+@functools.lru_cache(maxsize=None)
+def _commit_zeros_program(sharding, count):
+    """``zeros(count, int32)`` at ``sharding``, the commit-state initializer of a write open."""
+    return jax.jit(lambda: jnp.zeros((count,), jnp.int32), out_shardings=sharding)
+
+
 def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
     """Small int64 control buffer, explicitly replicated on ``mesh``.
 
@@ -1293,7 +1311,12 @@ def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
     # ``ffi.io.{ffi_read_call,ffi_write_call}``, and those refuse a
     # non-int64 control operand by name (``require_control_i64``).  Checking
     # it twice would be two places to keep in step with one C++ signature.
-    return device_put_process_local(
+    #
+    # Placed once per distinct value (``device_put_process_local_cached``):
+    # a dataset's handle pair and the offsets/extents of a slab re-read every
+    # round repeat, so a repeated control vector costs no host-to-device
+    # transfer.  The cached buffer is an input operand only (never donated).
+    return device_put_process_local_cached(
         np.asarray(tuple(int(v) for v in values), dtype=np.int64),
         NamedSharding(mesh, P()),
     )
@@ -1495,7 +1518,7 @@ def _file_order_pieces(A, off, vshape, plan, mesh):
             sizes = tuple(steps) + (take_k,) + tuple(int(d) for d in A.shape[k + 1:])
             take = _file_order_take(mesh, tuple(int(d) for d in A.shape), A.dtype, k,
                                     sizes, -(-take_k // p) * p, A.sharding.spec)
-            starts = device_put_process_local(
+            starts = device_put_process_local_cached(
                 np.asarray(idx + (c0,) + (0,) * (A.ndim - k - 1), dtype=np.int32), rep)
             p_off = (tuple(int(off[a]) + idx[a] for a in range(k))
                      + (int(off[k]) + c0,) + tuple(int(o) for o in off[k + 1:]))
@@ -2043,6 +2066,78 @@ def _get_read_sm(mesh, partition_spec, *,
     return jax.jit(sm_bare)
 
 
+def _local_block_shape(shape, axis_count_per_dim, axis_flat, mesh_shape):
+    """One rank's equal block of ``shape``: each dim divided by the product of
+    the mesh sizes of the axes sharding it (the read handlers' ``mem_dims``)."""
+    local, flat = list(int(s) for s in shape), 0
+    for d in range(len(local)):
+        na = axis_count_per_dim[d]
+        if na > 0:
+            div = 1
+            for k in range(na):
+                div *= int(mesh_shape[axis_flat[flat + k]])
+            local[d] //= div
+            flat += na
+    return tuple(local)
+
+
+def _disjoint_waves(batch):
+    """Split read_multi requests into waves whose file selections are disjoint.
+
+    HDF5's multi-dataset selection I/O refuses two selections of one call that
+    share a file address ("duplicate addr in selections", 1.14.3, measured on
+    the gate's repeated-parent case). A round repeats its last parent, and a
+    sparse face read takes one run per parent, so: an identical request is
+    read once and aliased (``aliases``: ``(i, j)`` = request i takes j's
+    value); a request whose valid box overlaps one already in a wave on the
+    same dataset starts or joins a later wave. Normally one wave. Boxes are the
+    global ``[offset, offset + valid_shape)``, so the split is the same on
+    every rank.
+    """
+    first, aliases, waves = {}, [], []
+    for entry in batch:
+        i, name, off, vshape, st = entry
+        key = (name, tuple(off), tuple(vshape), tuple(st.shape), str(st.dtype))
+        if key in first:
+            aliases.append((i, first[key]))
+            continue
+        first[key] = i
+        for wave in waves:
+            if not any(n == name and all(o < po + pv and po < o + v
+                                         for o, v, po, pv in zip(off, vshape, poff, pvs))
+                       for _, n, poff, pvs, _ in wave):
+                wave.append(entry)
+                break
+        else:
+            waves.append([entry])
+    return aliases, waves
+
+
+@functools.lru_cache(maxsize=None)
+def _get_read_multi_sm(mesh, partition_spec, *, mesh_shape, axis_count_per_dim,
+                       axis_flat, out_structs):
+    """N reads in ONE ``PhdfReadMulti`` handler; returns ``(*outs, done)``.
+
+    Keyed on geometry only (the ctx, dataset ids and origins are the runtime
+    control table), so a constructor's rounds share one executable.  ``done``
+    is one element per rank sliced from the largest output in the same program:
+    ready exactly when the rank's read has landed, holding none of its bytes
+    (the k-chunk union reader's token, ``ffi.io``).
+    """
+    from ffi.io import ffi_read_multi_call
+    big = max(range(len(out_structs)), key=lambda i: math.prod(out_structs[i].shape))
+
+    def _per_rank(control_local):
+        outs = ffi_read_multi_call(
+            out_structs, control_local, mesh_shape=mesh_shape,
+            axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat)
+        return (*outs, outs[big].reshape(-1)[:1])
+    return jax.jit(shard_map(
+        _per_rank, mesh=mesh, in_specs=(P(),),
+        out_specs=(*([partition_spec] * len(out_structs)), P(tuple(mesh.axis_names))),
+        check_vma=False))
+
+
 #: AOT executables of ``_get_write_sm`` callables, keyed on the callable and
 #: the operands' (shape, dtype, sharding).  Same key space as that cache: a
 #: handful of write signatures per run.
@@ -2207,7 +2302,9 @@ class _CollectiveLane:
         # union reader is asynchronous, so a following metadata operation,
         # synchronous read or write must wait for its Promise as well.
         for key in list(self._reads):
-            jax.block_until_ready(self._reads.pop(key))
+            live = [m for m in self._reads.pop(key) if not m.is_ready()]
+            if live:
+                jax.block_until_ready(live)
 
     def quiesce(self, slot) -> None:
         """Every queued write and in-flight read is done before HDF5 entry."""
@@ -2242,7 +2339,9 @@ class _CollectiveLane:
         if self._owner is slot:
             self._worker().drain()
             self._owner = None
-        jax.block_until_ready(self._reads.pop(id(slot), []))
+        live = [m for m in self._reads.pop(id(slot), []) if not m.is_ready()]
+        if live:
+            jax.block_until_ready(live)
 
 
 _LANE = _CollectiveLane()
@@ -2362,13 +2461,11 @@ class _FfiBackend(_DatasetGeometry):
         if mode == "w":
             _replace_inode_for_write(path)
             _barrier("slab_io_ffi_prestripe")
-        # Resolve the striping policy and put it where the C++ writer can
-        # see it (its only input is getenv), BEFORE open_file — that call
-        # is where context.cc builds the MPI_Info and H5Fcreate applies
-        # the layout.  A file opened 'a'/'r' keeps the inode it already
-        # has, so the hints are a no-op there; export anyway so the log
-        # line and the environment agree on every path.
-        _sc, _su = _export_striping_env()
+        # Resolve (and validate) the striping policy for the log line.  The C++
+        # writer derives the same layout from the world size, or reads the
+        # operator's LORRAX_PHDF5_STRIPE_* itself; nothing is exported, since
+        # an environment write here raced native getenv (runtime.env_guard).
+        _sc, _su = _resolve_striping()
         if mode == "w" and _rank0() and debug_print_enabled():
             print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode={mode} "
                   f"ranks={jax.process_count()} stripe_count={_sc} "
@@ -2498,9 +2595,8 @@ class _FfiBackend(_DatasetGeometry):
             # element; every other rank participates with an empty slab.
             count = int(mesh.size)
             sharding = NamedSharding(mesh, P(tuple(mesh.axis_names)))
-            pending = jax.make_array_from_callback(
-                (count,), sharding,
-                lambda index: np.zeros((count,), dtype=np.int32)[index])
+            # Made on device (a compiled constant): no host table per open.
+            pending = _commit_zeros_program(sharding, count)()
             try:
                 self.write_slab(COMMIT_STATE, pending)
                 self._drain_pending()
@@ -3080,17 +3176,9 @@ class _FfiBackend(_DatasetGeometry):
 
         # Per-rank output shape: divide by the product of the mesh
         # sizes of all axes sharding that dim.
-        local_shape = list(read_shape)
-        _flat_idx = 0
-        for d in range(len(read_shape)):
-            na = axis_count_per_dim[d]
-            if na > 0:
-                div = 1
-                for k in range(na):
-                    div *= int(mesh_shape[axis_flat[_flat_idx + k]])
-                local_shape[d] = int(local_shape[d]) // div
-                _flat_idx += na
-        out_struct = jax.ShapeDtypeStruct(tuple(local_shape), jnp.dtype(dtype))
+        local_shape = _local_block_shape(read_shape, axis_count_per_dim,
+                                         axis_flat, mesh_shape)
+        out_struct = jax.ShapeDtypeStruct(local_shape, jnp.dtype(dtype))
 
         ds_id = self._ds_id(name, readonly=True)
         ctx_handle = self.fh
@@ -3113,9 +3201,15 @@ class _FfiBackend(_DatasetGeometry):
         _local_bytes = int(np.prod(local_shape, dtype=np.int64)) * _dtype.itemsize
         with _large_read_progress(
                 self.path, name, global_bytes=_global_bytes,
-                local_bytes=_local_bytes):
+                local_bytes=_local_bytes) as watch:
             result = sm(handle_arr, offset_arr, valid_shape_arr)
-            result.block_until_ready()
+            watch(result)
+        # No wait here: the read handler runs on the XLA thread after this returns, and
+        # the next HDF5 entry point of ANY handle waits for it (_CollectiveLane, as the
+        # union reads), which closes the three hazards the entry drain above names
+        # (read-after-write, the shared pinned buffer, two threads in HDF5).  The lane
+        # holds ``result`` until that entry point or until it is ready.
+        _LANE.track_read(self._dispatcher, result)
         return result
 
     def _read_file_rows(self, name, shape, dtype, off, vshape, mesh, spec, plan):
@@ -3137,7 +3231,8 @@ class _FfiBackend(_DatasetGeometry):
         result = jnp.zeros(shape, dtype, device=NamedSharding(mesh, spec))
         with _large_read_progress(self.path, name,
                 global_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize,
-                local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p):
+                local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p) as watch:
+            landed = None
             for idx in itertools.product(*(range(0, vshape[a], steps[a]) for a in range(k))):
                 idx = tuple(min(i, vshape[a] - steps[a]) for a, i in enumerate(idx))
                 for c0 in range(0, vshape[k], rows):
@@ -3151,6 +3246,10 @@ class _FfiBackend(_DatasetGeometry):
                         out_struct=jax.ShapeDtypeStruct(tuple(local), jnp.dtype(dtype)))
                     p_off = tuple(off[a] + idx[a] for a in range(k)) + (off[k] + c0,) + tuple(off[k + 1:])
                     valid = tuple(steps) + (real,) + tuple(vshape[k + 1:])
+                    if landed is not None:
+                        # The next piece's ReadImpl rewrites the shared pinned buffer at
+                        # launch: the previous piece must have landed (a host decision).
+                        landed.block_until_ready()
                     piece = read(handle, _replicated_i64_vector(p_off, mesh),
                                  _replicated_i64_vector(valid, mesh))
                     starts = device_put_process_local(np.asarray(
@@ -3159,8 +3258,94 @@ class _FfiBackend(_DatasetGeometry):
                     insert = _file_order_read_insert(mesh, shape, jnp.dtype(dtype),
                         spec, k, compact, carrier, real)
                     result = insert(result, piece, starts)
-                    result.block_until_ready()
+                    landed = result
+            if landed is not None:
+                watch(landed)
+        if landed is not None:
+            _LANE.track_read(self._dispatcher, landed)
         return result
+
+    # ------------------------------------------------------------------
+    # N datasets, ONE handler and ONE collective H5Dread_multi.  Same padding
+    # contract as read_slab per request; see SlabIO.read_multi.
+    def read_multi(self, requests, *, partition_spec: P, mesh: Mesh | None = None) -> list:
+        from ffi.common import ffi_loader
+        from ffi.io import _TARGET_READ_MULTI
+
+        mesh = mesh or self.mesh
+        # The read_slab drain, once for the whole list (same three hazards).
+        self._drain_for_read()
+        requests = list(requests)
+        if not requests:
+            return []
+        usable, why = ffi_loader.probe_target(_TARGET_READ_MULTI, self._platform())
+        if not usable:
+            raise RuntimeError(
+                f"GATE slab_io_read_multi: got: {why}; want: the {_TARGET_READ_MULTI} "
+                f"handler (PhdfReadMulti, HDF5 >= 1.14 H5Dread_multi) in this leg's "
+                f"library; fix: rebuild the leg (config/<site>/build_ffi_*.sh).")
+        sharding = NamedSharding(mesh, partition_spec)
+        ndim = len(tuple(requests[0]["shape"]))
+        axis_count_per_dim, axis_flat = _sharding_to_axis_info(sharding, ndim)
+        mesh_shape = tuple(mesh.shape[ax] for ax in mesh.axis_names)
+        out, batch, rows = [None] * len(requests), [], []
+        for i, req in enumerate(requests):
+            name = req["name"]
+            ds_shape, ds_dtype = self._dataset_geom(name)
+            dtype = jnp.dtype(req.get("dtype") or ds_dtype)
+            off, read_shape, _ = _normalize_slab_request(
+                op="read_multi", name=name, offset=req.get("offset"),
+                slab_shape=req["shape"], global_shape=None, check_bounds=False)
+            if len(read_shape) != ndim:
+                raise ValueError(
+                    f"read_multi: request {i} ({name!r}) is {len(read_shape)}-D; one "
+                    f"call shares one {ndim}-D partition_spec")
+            vshape = _normalize_valid_shape(
+                op="read_multi", name=name, valid_shape=req.get("valid_shape"),
+                slab_shape=read_shape, offset=off, ds_shape=ds_shape)
+            _validate_block_divisible(
+                op="read_multi", name=name, shape=read_shape,
+                axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
+                mesh_shape=mesh_shape)
+            plan = _file_order_read_plan(read_shape, vshape, partition_spec,
+                                         dtype.itemsize, mesh, ds_shape)
+            if plan is not None:
+                # read_slab's own route for this request: bounded file rows of
+                # a large fully distributed payload (synchronous, the same bytes).
+                rows.append((i, name, read_shape, dtype, off, vshape, plan))
+            elif math.prod(read_shape) == 0:
+                out[i] = jnp.zeros(read_shape, dtype, device=sharding)
+            else:
+                batch.append((i, name, off, vshape, jax.ShapeDtypeStruct(
+                    _local_block_shape(read_shape, axis_count_per_dim, axis_flat,
+                                       mesh_shape), dtype)))
+        for i, name, read_shape, dtype, off, vshape, plan in rows:
+            out[i] = self._read_file_rows(name, read_shape, dtype, off, vshape,
+                                          mesh, partition_spec, plan)
+        aliases, waves = _disjoint_waves(batch)
+        for wave in waves:
+            ds_ids = [self._ds_id(name, readonly=True) for _, name, _, _, _ in wave]
+            control = np.concatenate([
+                np.asarray((self.fh, len(wave), *ds_ids), np.int64),
+                np.asarray([o for _, _, o, _, _ in wave], np.int64).reshape(-1),
+                np.asarray([v for _, _, _, v, _ in wave], np.int64).reshape(-1)])
+            # ONE descriptor table, staged process-locally (no assert_equal
+            # all-gather; _replicated_i64_vector says why).
+            control = device_put_process_local(control, NamedSharding(mesh, P()))
+            sm = _get_read_multi_sm(
+                mesh, partition_spec, mesh_shape=mesh_shape,
+                axis_count_per_dim=axis_count_per_dim, axis_flat=axis_flat,
+                out_structs=tuple(st for *_, st in wave))
+            *values, done = sm(control)
+            # No block_until_ready: the handler runs in program order on the
+            # XLA thread, and the next HDF5 entry point of any handle (or this
+            # handle's close) waits for ``done`` (_CollectiveLane).
+            _LANE.track_read(self._dispatcher, done)
+            for (i, *_), value in zip(wave, values):
+                out[i] = value
+        for i, j in aliases:
+            out[i] = out[j]          # an identical request: the same immutable value
+        return out
 
     # ------------------------------------------------------------------
     # n windows, ONE H5Dread.  Same padding contract as read_slab, one

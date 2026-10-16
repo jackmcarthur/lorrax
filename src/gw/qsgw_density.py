@@ -609,7 +609,11 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
         # THE ONE REDUCTION.  Every rank holds the density of its own bands
         # summed over every k (or, per_k, stacked by k); nothing crossed the
         # mesh for the field before this line.
-        return jax.lax.psum(per_k_fields if per_k else acc, band_axes)
+        # Rank-order sum (lxkit.ordered_psum): the library all-reduce's order follows
+        # the GCD placement (det lane 2026-10-16: the exact Hartree's rho, Fe V2).
+        from lxkit import ordered_psum
+        return jax.tree_util.tree_map(lambda v: ordered_psum(v, band_axes),
+                                      per_k_fields if per_k else acc)
 
     return body
 

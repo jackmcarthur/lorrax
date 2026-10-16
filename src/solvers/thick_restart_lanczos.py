@@ -89,6 +89,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+from distrib_la import eigh_local
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -307,7 +308,7 @@ def thick_restart_lanczos_eig(
         _tally('restart')
         T = 0.5 * (T + jnp.conj(T).T)
         if subspace_plan is None:
-            theta, Y = jnp.linalg.eigh(T)
+            theta, Y = eigh_local(T)
             theta_k = theta[:n_keep]
             Y_k = Y[:, :n_keep]
             Qk = jnp.einsum('mn,m...->n...', Y_k, Q[:m_max], optimize=True)

@@ -30,7 +30,7 @@
 //     the device's opt-in shared memory; a pair that does not fit runs as two
 //     cuBLAS GEMMs.  The kernel is NVRTC-built per (N1', K1, N2', K2) from the
 //     nvidia-mathdx wheel (`mathdx_root`, passed only on a wheel in
-//     ffi.fft.PAIR_MATHDX_WHEELS, see pair_kernel) through common/nvrtc_build, disk cached under
+//     ffi.fft.PAIR_MATHDX_WHEELS, see pair_kernel) through common/rtc_build, disk cached under
 //     `cubin_dir` by that service's key rule.
 //
 // Plans (device matrices, remap tables, cuFFT plans) are cached per
@@ -63,7 +63,7 @@
 
 #include "fourier_plan.h"
 #include "../common/mkl_thread_pin.h"
-#include "../common/nvrtc_build.h"
+#include "../common/rtc_build.h"
 
 namespace lorrax_ffi::fourier_plan {
 
@@ -213,7 +213,7 @@ static ffi::Error pair_kernel(int dev, int64_t n1, int64_t k1, int64_t n2, int64
     static std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t>, PairKernel> built;
     const auto key = std::make_tuple(dev, n1, k1, n2, k2);
     if (auto it = built.find(key); it != built.end()) { *out = it->second; return ffi::Error::Success(); }
-    const nvrtc::DriverApi& api = nvrtc::driver_api();
+    const rtc::DriverApi& api = rtc::driver_api();
     if (!api.ok) return err("pair: driver API: " + api.err);
     int cc_major = 0, cc_minor = 0, sms = 0, smem_sm = 0;
     if (cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
@@ -222,9 +222,9 @@ static ffi::Error pair_kernel(int dev, int64_t n1, int64_t k1, int64_t n2, int64
         cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev) != cudaSuccess)
         return err("pair: cudaDeviceGetAttribute");
     std::string why;
-    const std::string cuda_inc = nvrtc::toolkit_include(&why);
+    const std::string cuda_inc = rtc::toolkit_include(&why);
     if (cuda_inc.empty()) return err("pair: CUDA toolkit headers for NVRTC: " + why);
-    if (!nvrtc::exists(root + "/include/cublasdx.hpp"))
+    if (!rtc::exists(root + "/include/cublasdx.hpp"))
         return ffi::Error(ffi::ErrorCode::kFailedPrecondition,
                           "lorrax_fourier_plan: GATE mathdx-headers: got no cublasdx.hpp under " + root +
                               "/include; want the nvidia-mathdx wheel (the fused supported pair is built "
@@ -236,7 +236,7 @@ static ffi::Error pair_kernel(int dev, int64_t n1, int64_t k1, int64_t n2, int64
     k.threads = std::min(n1 * k2, n1 * n2) < 128 ? 32 : 128;
     const int per_sm = std::max(1, std::min(smem_sm / (k.smem + 1024), 2048 / k.threads));
     k.grid = sms * per_sm;
-    nvrtc::Program prog;
+    rtc::Program prog;
     prog.src = kPairSrc;
     prog.name = "lrx_plan_pair.cu";
     // The nvidia-mathdx 25.6 wheel's CUTLASS 3.9 declares std::tuple_size/tuple_element
@@ -253,10 +253,10 @@ static ffi::Error pair_kernel(int dev, int64_t n1, int64_t k1, int64_t n2, int64
                  "-DLRX_N2=" + std::to_string(n2), "-DLRX_K2=" + std::to_string(k2),
                  "-DLRX_THREADS=" + std::to_string(k.threads),
                  "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
-    nvrtc::mathdx_toolchain(root, cuda_inc, "cublasdx", &prog);
+    rtc::mathdx_toolchain(root, cuda_inc, "cublasdx", &prog);
     prog.kernel = "lrx_plan_pair";
     std::string missing;
-    const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));
+    const std::string key_hex = rtc::hex16(rtc::key(prog, &missing));
     const std::string dir = missing.empty() ? cubin_dir : std::string();
     std::string path;
     if (!dir.empty()) {
@@ -265,13 +265,13 @@ static ffi::Error pair_kernel(int dev, int64_t n1, int64_t k1, int64_t n2, int64
              << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
-    nvrtc::Image img;
+    rtc::Image img;
     std::string where, e;
-    if (!nvrtc::build(prog, dir, path, key_hex, &img, &where, &e)) return err("pair: " + where + ": " + e);
+    if (!rtc::build(prog, dir, path, key_hex, &img, &where, &e)) return err("pair: " + where + ": " + e);
     k.fn = img.fn;
     if (k.smem > 49152) {
         const CUresult cr = api.FuncSetAttribute(k.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, k.smem);
-        if (cr != CUDA_SUCCESS) return err("pair: cuFuncSetAttribute: " + nvrtc::cu_err(cr));
+        if (cr != CUDA_SUCCESS) return err("pair: cuFuncSetAttribute: " + rtc::err_string(cr));
     }
     if (mklpin::announce_here())
         std::fprintf(stderr, "[fourier_plan] fused pair (%lld,%lld)x(%lld,%lld) sm_%d%d: %s in %.1f ms (%s)\n",
@@ -636,10 +636,10 @@ static ffi::Error run(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::A
             double ar = st.sr, ai = st.si;
             void* args[] = {&X, &Y, &st.mat, &st.mat2, &planes, &ar, &ai};
             const unsigned grid = unsigned(std::min<long long>(planes, st.grid));
-            const CUresult cr = nvrtc::driver_api().LaunchKernel(
+            const CUresult cr = rtc::driver_api().LaunchKernel(
                 st.fn, grid, 1, 1, unsigned(st.threads), 1, 1, unsigned(st.smem),
                 reinterpret_cast<CUstream>(stream), args, nullptr);
-            if (cr != CUDA_SUCCESS) return err("pair launch: " + nvrtc::cu_err(cr));
+            if (cr != CUDA_SUCCESS) return err("pair launch: " + rtc::err_string(cr));
         } else if (st.kind == Step::kRemap) {
             launch_remap(src, dst, st.remap, st.sr, st.si, stream);
         } else {
