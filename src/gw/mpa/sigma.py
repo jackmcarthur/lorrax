@@ -1444,6 +1444,7 @@ def _integrate_sigma_batches(
     tau_capacity=None,
     omega_grid_ry=None,
     keep_branches=False,
+    matrix_counts=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
@@ -1514,6 +1515,9 @@ def _integrate_sigma_batches(
             int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
         face_kwargs["face_band_extent"] = sigma_axis.carrier
         output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        if matrix_counts is not None and request is None:
+            raise ValueError("MPA Sigma matrix_counts (band_extrapolation_checkpoints) "
+                             "needs the on-shell sweep")
         if request is None:
             omega = np.asarray(omega_grid_ry, np.float64)
             if omega.ndim != 1 or not omega.size:
@@ -1528,12 +1532,22 @@ def _integrate_sigma_batches(
                 raise ValueError(f"on-shell Sigma: the request holds {request.parent_ry.shape[1]} "
                                  f"parent k rows, the k plan {k_unfold_plan.n_parent}")
             n_counts = len(brackets) if bracketed else 1
+            keep = None
+            if matrix_counts is not None:
+                # band_extrapolation_checkpoints: the kept matrices are the
+                # main plan's N1 and N3 among the union's counts.
+                keep = tuple(sorted({int(i) for i in matrix_counts}))
+                if not bracketed or not keep or keep[0] < 0 or keep[-1] >= n_counts:
+                    raise ValueError(
+                        f"MPA Sigma matrix_counts {matrix_counts} must index the "
+                        f"{n_counts} band counts of a bracketed on-shell sweep")
+            n_matrix = len(keep) if keep is not None else (2 if n_counts > 1 else 1)
 
             def new_accumulator():
                 return DeviceOmegaAccumulator(
                     request, carrier=sigma_axis.carrier, sharding=output_sharding,
-                    reduce=_on_shell_reduce(mesh_xy, len(brackets) if bracketed else None),
-                    shape=(((2, *spatial_shape),) * (2 if n_counts > 1 else 1),
+                    reduce=_on_shell_reduce(mesh_xy, len(brackets) if bracketed else None, keep),
+                    shape=(((2, *spatial_shape),) * n_matrix,
                            ((request.n_slot, spatial_shape[0], sigma_axis.carrier,
                              int(mesh_xy.shape["y"])),) * n_counts))
         # keep_branches: one total per causal branch, both always present (a
@@ -1809,7 +1823,9 @@ def _integrate_sigma_batches(
                 unfold=(lambda value: value) if full else _on_shell_unfold_fn(sym, output_sharding),
                 unfold_rows=((lambda slots: slots) if full else
                              _band_count_rows_fn(sym, mesh_xy)),
-                nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=request)
+                nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=request,
+                matrix_index=(() if matrix_counts is None else
+                              tuple(sorted({int(i) for i in matrix_counts}))))
             # One count: the on-shell Sigma itself.
             return sigma if bracketed else sigma.point(0)
 
@@ -1984,13 +2000,15 @@ def _band_count_rows_fn(sym, mesh_xy):
 
 
 @lru_cache(maxsize=8)
-def _on_shell_reduce(mesh_xy, n_brackets):
+def _on_shell_reduce(mesh_xy, n_brackets, keep=None):
     """``sigma(t)`` -> the on-shell fold's ``(matrices, diagonals)``.
 
     The matrices are the cumulative first and last counts (one with no
     brackets, ``n_brackets`` None), the diagonals those of EVERY cumulative
     count (``(k, nb, p_y)``, :func:`gw.ppm_sigma.band_diagonal_slots`), whose
-    slots the extrapolation combines.
+    slots the extrapolation combines.  ``keep`` (ascending count indices,
+    ``band_extrapolation_checkpoints``): the matrices of those counts instead
+    of the first and last.
     """
     from gw.ppm_sigma import band_diagonal_slots
     # A square mesh is resolve_mesh's invariant (band_diagonal_slots checks it).
@@ -2000,6 +2018,15 @@ def _on_shell_reduce(mesh_xy, n_brackets):
         if n_brackets is None:
             return (sigma,), (diag_slots(sigma),)
         running = sigma[0]
+        if keep is not None:
+            matrices, diagonals = [], []
+            for b in range(n_brackets):
+                if b:
+                    running = running + sigma[b]
+                if b in keep:
+                    matrices.append(running)
+                diagonals.append(diag_slots(running))
+            return tuple(matrices), tuple(diagonals)
         matrices, diagonals = [running], [diag_slots(running)]
         for b in range(1, n_brackets):
             running = running + sigma[b]
@@ -2165,6 +2192,7 @@ def integrate_sigma_store(
     tau_kernel_factory=None,
     omega_grid_ry=None,
     keep_branches=False,
+    matrix_counts=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -2209,7 +2237,8 @@ def integrate_sigma_store(
             band_counts=band_counts, odd_residue_off=odd_residue_off,
             q_wedge=q_wedge, tau_capacity=tau_capacity,
             tau_kernel_factory=tau_kernel_factory, omega_grid_ry=omega_grid_ry,
-            keep_branches=keep_branches, print_fn=print_fn)
+            keep_branches=keep_branches, matrix_counts=matrix_counts,
+            print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -2290,6 +2319,7 @@ def compute_sigma_c_mpa_omega_grid(
     sigma_branches=None,
     band_brackets=None,
     band_counts=None,
+    band_matrix_counts=None,
     fixed_quadrature_session=None,
     material_class=None,
     sigma_w_model="mpa",
@@ -2586,6 +2616,7 @@ def compute_sigma_c_mpa_omega_grid(
                         wfns, ((0, None, None, None),), n_poles, plan,
                         request, meta, mesh_xy, pole_batch_size=n_poles,
                         brackets=band_brackets, band_counts=band_counts,
+                        matrix_counts=band_matrix_counts,
                         w_synthesis=synthesis,
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
@@ -2605,7 +2636,8 @@ def compute_sigma_c_mpa_omega_grid(
                     band_counts=band_counts,
                     tau_capacity=geometry.get("sc_tau_capacity"),
                     tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
-                    keep_branches=keep_branches, print_fn=print_fn)
+                    keep_branches=keep_branches, matrix_counts=band_matrix_counts,
+                    print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
         # extra sweep whose sigma_c_odd_kij nobody reads.
@@ -2621,6 +2653,7 @@ def compute_sigma_c_mpa_omega_grid(
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=True,
             tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
+            matrix_counts=band_matrix_counts,
             print_fn=lambda *args, **kwargs: None)
         return _attach_ordered_odd_sigma(total, even)
 

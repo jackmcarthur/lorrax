@@ -40,6 +40,7 @@ from .band_extrapolation import (
     plan_band_brackets,
     pooled_state_mask,
     sc_tolerance_ruling,
+    plan_band_checkpoints,
 )
 from .dynamic_sigma import sigma_on_shell_request
 from .gw_config import LorraxConfig
@@ -557,6 +558,191 @@ def _grid_fit_points(cube, head_sigma_diag_w_kn_ry, sigma_omega, mesh_xy, omega_
         for i in range(cube.shape[0])]
 
 
+def _extrapolation_reads(sigma_omega, *, e_state_ev, wfn):
+    """``(enk_ev, omega_eval_ev)``: where the band-count fit reads each row.
+
+    THE ROW'S OWN ENERGY, NOT THE DFT ENERGY OF ITS SORTED INDEX.  The
+    cube's rows are the states of the bundle Sigma was built in; in SC they
+    are the input's sorted QP states.  Where a QP singlet and doublet swap
+    order against DFT, the DFT energy by index gave the two members of one
+    doublet two tail ratios and split it (bcc Na 3^3, map 1: 2.5 meV at
+    k = (1/3,1/3,1/3)), and the next W broke the crystal symmetry
+    (GATE shared_pole_gram_valid at map 2).  One-shot and SC map 0 read E_DFT.
+    One owner for the run's fit (:func:`_report_band_extrapolation`) and the
+    checkpoints' (:func:`evaluate_band_checkpoints`).
+    """
+    enk_ev = np.asarray(e_state_ev, dtype=np.float64)
+    omega_eval_ev = enk_ev - (float(wfn.efermi) if sigma_omega.efermi_ry is None
+                              else float(sigma_omega.efermi_ry)) * RYD_TO_EV
+    return enk_ev, omega_eval_ev
+
+
+def _extrapolation_ladder(wfn, band_slices):
+    """The DFT-only band ladder of the shell fit (absolute band indexing).
+
+    THE LADDER IS DFT-ONLY, AND IT IS BUILT FROM THE WFN'S OWN EIGENVALUES
+    AND k WEIGHTS — the mean field, never the Σ values.  Absolute band
+    indexing (band 1 = the WFN's first band), because the Weyl counting law
+    counts from the bottom of the band manifold; ``b0`` carries the Σ sum's
+    offset into it.
+    """
+    return build_band_ladder(
+        enk_ry=np.asarray(wfn.energies[0], dtype=np.float64),
+        kweights=np.asarray(wfn.kweights, dtype=np.float64),
+        n_target=plane_wave_band_count(wfn.ngk, int(wfn.nspinor)),
+        b0=int(band_slices.b0),
+    )
+
+
+#: The on-shell tables a checkpoint records: what H reads (``pair``), the eqp
+#: readers' E_DFT table (``dft0``; Sigma(omega = 0) off the sampled range) and
+#: dSigma/domega on ``pair``.
+CHECKPOINT_TABLES = ("pair", "dft0", "derivative")
+
+
+def evaluate_band_checkpoints(
+    sigma_omega, head_sigma_diag_w_kn_ry, *, e_state_ev, plan, band_slices, wfn,
+):
+    """Raw and spectral-shell band-diagonal Σ_c and Z at every checkpoint count.
+
+    ``plan.checkpoints`` (:class:`gw.band_extrapolation.BandCheckpointPlan`)
+    names, for each checkpoint ``N``, its own three counts among the union
+    sweep's cumulative counts.  Each is fitted exactly as the run's own fit
+    (:func:`_report_band_extrapolation`: the same ladder, pooled-state mask,
+    evaluation energies and q→0 head), on the pair table's diagonal, and its
+    weights combine the three counts' on-shell slots
+    (:func:`_slot_combination_fn`, the run's combination), so the shell value
+    and its derivative are the same affine combination the run applies at
+    its own count.  Collective: every rank calls it.
+
+    Returns a host payload: per checkpoint the counts, the fit's (β, Ω,
+    residual, failures, tail ratios) and, per table of
+    :data:`CHECKPOINT_TABLES`, the raw ``S(N)`` and shell ``Ŝ(N)`` diagonals
+    in eV (the derivative dimensionless), ``(nk_full, nb_logical)``, with the
+    raw diagonal of every union count beside them.
+    """
+    from .ppm_sigma import OnShellSigma
+    cube = sigma_omega.sigma_c_kij
+    ck = plan.checkpoints
+    request = cube.request
+    if request is None:
+        raise ValueError("evaluate_band_checkpoints: on-shell cubes only")
+    axis = sigma_omega.band_axis
+    enk_ev, omega_eval_ev = _extrapolation_reads(sigma_omega, e_state_ev=e_state_ev, wfn=wfn)
+    head = head_sigma_diag_w_kn_ry
+    ladder = _extrapolation_ladder(wfn, band_slices)
+    mask = pooled_state_mask(omega_eval_ev)
+    points = [cube.diagonal(i).with_head(head) for i in range(len(ck.union.counts))]
+
+    def tables(point):
+        out = {name: np.asarray(point.diagonal(name, axis)) for name in CHECKPOINT_TABLES}
+        # Z = 1/(1 - Re dSigma_nn/domega) at E_eval, 1 off the sampled range.
+        d = np.real(out["derivative"])
+        out["z"] = np.where(request.covered_kn, 1.0 / (1.0 - d), 1.0)
+        return out
+
+    raw = [tables(p) for p in points]
+    carrier = int(points[0].slots.shape[2])
+    members = []
+    for member, idx in zip(ck.members, ck.member_index):
+        s_at = np.stack([raw[i]["pair"] for i in idx]) * RYD_TO_EV
+        fit = fit_band_extrapolation_spectral(
+            np.asarray(member.counts), s_at, ladder, e_state_ev=enk_ev, fit_mask=mask)
+        w = np.asarray(fit.weights(), dtype=np.float64)
+        w = np.pad(w, ((0, 0), (0, 0), (0, carrier - w.shape[-1])))
+        group = [points[i] for i in idx]
+        slots = _slot_combination_fn(group[0].slots.sharding)(
+            tuple(p.slots for p in group), jnp.asarray(w))
+        shell = tables(OnShellSigma(pair=None, slots=slots, request=request,
+                                    mesh_xy=group[0].mesh_xy))
+        members.append(dict(
+            count=int(member.counts[-1]), counts=tuple(int(c) for c in member.counts),
+            requested=tuple(int(c) for c in member.requested), notes=tuple(member.notes),
+            union_index=tuple(int(i) for i in idx),
+            raw=raw[idx[-1]], shell=shell,
+            beta=float(fit.beta), omega_ev=float(fit.omega_ev),
+            residual_ev=float(fit.residual_ev), n_failed=int(fit.n_failed),
+            tail_ratio=np.asarray(np.real(fit.tail_ratio), np.float64),
+            s_inf_fit_ev=np.asarray(fit.s_inf),
+            fit_vs_combination_ev=float(np.max(np.abs(
+                np.asarray(fit.s_inf) - shell["pair"] * RYD_TO_EV)))))
+    return dict(
+        union_counts=tuple(int(c) for c in ck.union.counts), raw_union=raw,
+        members=members, enk_ev=enk_ev, omega_eval_ev=omega_eval_ev,
+        b0=int(band_slices.b0), kirr_fullids=np.asarray(
+            wfn.symmetry().kirr_fullids, dtype=np.int64),
+        n_target=int(plane_wave_band_count(wfn.ngk, int(wfn.nspinor))))
+
+
+def write_band_checkpoints(payload, *, directory, print_fn):
+    """``sigma_band_checkpoints.h5`` + ``.dat`` beside ``sigma_diag.dat`` (rank 0).
+
+    The h5 keeps the full-BZ arrays (Σ in eV, complex; Z real); the text table
+    lists the irreducible k (``kirr_fullids`` rows, the WFN's own k order) and
+    every logical Σ band at every checkpoint: Re/Im Σ_c on ``dft0`` raw and
+    shell, and Z raw and shell.  Returns the two paths.
+    """
+    import os
+    import h5py
+    h5_path = os.path.join(directory, "sigma_band_checkpoints.h5")
+    dat_path = os.path.join(directory, "sigma_band_checkpoints.dat")
+    if jax.process_index() != 0:
+        return h5_path, dat_path
+    rows, b0 = payload["kirr_fullids"], int(payload["b0"])
+    with h5py.File(h5_path, "w") as f:
+        f.attrs["schema"] = "sigma-band-checkpoints-v1"
+        f.attrs["units"] = "eV (Sigma_c), dimensionless (derivative, Z)"
+        f.create_dataset("union_counts", data=np.asarray(payload["union_counts"], np.int64))
+        f.create_dataset("enk_ev", data=payload["enk_ev"])
+        f.create_dataset("omega_eval_ev", data=payload["omega_eval_ev"])
+        f.create_dataset("kirr_fullids", data=rows)
+        f.attrs["b0"] = b0
+        f.attrs["n_target"] = int(payload["n_target"])
+        g = f.create_group("union_raw")
+        for i, tab in enumerate(payload["raw_union"]):
+            gi = g.create_group(f"c{i:02d}_N{payload['union_counts'][i]}")
+            for name, value in tab.items():
+                scale = RYD_TO_EV if name in ("pair", "dft0") else 1.0
+                gi.create_dataset(name, data=np.asarray(value) * scale)
+        for m in payload["members"]:
+            gm = f.create_group(f"N{m['count']}")
+            for key in ("counts", "requested", "union_index"):
+                gm.attrs[key] = np.asarray(m[key], np.int64)
+            for key in ("beta", "omega_ev", "residual_ev", "n_failed", "fit_vs_combination_ev"):
+                gm.attrs[key] = m[key]
+            gm.attrs["notes"] = "\n".join(m["notes"])
+            gm.create_dataset("tail_ratio", data=m["tail_ratio"])
+            gm.create_dataset("s_inf_fit_pair_ev", data=m["s_inf_fit_ev"])
+            for arm in ("raw", "shell"):
+                ga = gm.create_group(arm)
+                for name, value in m[arm].items():
+                    scale = RYD_TO_EV if name in ("pair", "dft0") else 1.0
+                    ga.create_dataset(name, data=np.asarray(value) * scale)
+    with open(dat_path, "w") as f:
+        f.write("# LORRAX band_extrapolation_checkpoints: one-shot on-shell Sigma_c(E_DFT) "
+                "(dft0 table, q->0 head included) and Z, raw S(N) and spectral-shell S_hat(N)\n")
+        f.write("# k_irr band E_DFT_eV N ReSigC_raw_eV ReSigC_shell_eV ImSigC_raw_eV "
+                "ImSigC_shell_eV Z_raw Z_shell\n")
+        enk = payload["enk_ev"]
+        for m in payload["members"]:
+            r, sh = m["raw"], m["shell"]
+            for a, kf in enumerate(rows):
+                for j in range(enk.shape[1]):
+                    f.write(f"{a + 1:4d} {b0 + j + 1:5d} {enk[kf, j]:14.8f} {m['count']:5d} "
+                            f"{np.real(r['dft0'][kf, j]) * RYD_TO_EV:14.8f} "
+                            f"{np.real(sh['dft0'][kf, j]) * RYD_TO_EV:14.8f} "
+                            f"{np.imag(r['dft0'][kf, j]) * RYD_TO_EV:14.8f} "
+                            f"{np.imag(sh['dft0'][kf, j]) * RYD_TO_EV:14.8f} "
+                            f"{r['z'][kf, j]:12.8f} {sh['z'][kf, j]:12.8f}\n")
+    for m in payload["members"]:
+        print_fn(f"  Σc band checkpoint N = {m['count']}: counts {m['counts']}, "
+                 f"Ω = {m['omega_ev']:.2f} eV, β = {m['beta']:.1f}, "
+                 f"{m['n_failed']} state(s) without a tail, fit vs combination "
+                 f"{m['fit_vs_combination_ev']:.1e} eV")
+    print_fn(f"  Σc band checkpoints: {h5_path}, {dat_path}")
+    return h5_path, dat_path
+
+
 def _report_band_extrapolation(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
     e_state_ev, plan, config, band_slices, wfn, mesh_xy, print_fn,
@@ -583,16 +769,7 @@ def _report_band_extrapolation(
     Σ cube.
     """
     cube = sigma_omega.sigma_c_kij
-    # THE ROW'S OWN ENERGY, NOT THE DFT ENERGY OF ITS SORTED INDEX.  The
-    # cube's rows are the states of the bundle Sigma was built in; in SC they
-    # are the input's sorted QP states.  Where a QP singlet and doublet swap
-    # order against DFT, the DFT energy by index gave the two members of one
-    # doublet two tail ratios and split it (bcc Na 3^3, map 1: 2.5 meV at
-    # k = (1/3,1/3,1/3)), and the next W broke the crystal symmetry
-    # (GATE shared_pole_gram_valid at map 2).  One-shot and SC map 0 read E_DFT.
-    enk_ev = np.asarray(e_state_ev, dtype=np.float64)
-    omega_eval_ev = enk_ev - (float(wfn.efermi) if sigma_omega.efermi_ry is None
-                              else float(sigma_omega.efermi_ry)) * RYD_TO_EV
+    enk_ev, omega_eval_ev = _extrapolation_reads(sigma_omega, e_state_ev=e_state_ev, wfn=wfn)
     if cube.request is not None:
         # The fit reads each state where H reads it: the pair table's diagonal
         # (``sigma_out_of_grid``) with the closed-form head added there, in eV
@@ -615,12 +792,7 @@ def _report_band_extrapolation(
     # band indexing (band 1 = the WFN's first band), because the Weyl
     # counting law counts from the bottom of the band manifold; ``b0``
     # carries the Σ sum's offset into it.
-    ladder = build_band_ladder(
-        enk_ry=np.asarray(wfn.energies[0], dtype=np.float64),
-        kweights=np.asarray(wfn.kweights, dtype=np.float64),
-        n_target=plane_wave_band_count(wfn.ngk, int(wfn.nspinor)),
-        b0=int(band_slices.b0),
-    )
+    ladder = _extrapolation_ladder(wfn, band_slices)
     # The pooled (beta, Omega) fit reads each external state's DFT energy on
     # the ladder's own (absolute eV) reference: the model's denominator is
     # E_A - E_i + Omega.  It is pooled over the states within +-10 eV of E_F.
@@ -707,7 +879,7 @@ def _report_band_extrapolation(
     return spectral_h5_payload(plan, fit), fit.weights()
 
 
-def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where):
+def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where, checkpoints_ok=False):
     """The Σ band-bracket plan of one dynamic stage, validated and logged.
 
     One owner for every pole-sum Σ (GN/HL-PPM and scalar MPA): the plan fixes
@@ -725,8 +897,7 @@ def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where):
     # likewise defines n_occ, n_cond and its DFT ladder inside this same
     # Σ window.  Identical counts on an unsplit deck.
     # Pinned by tests/test_band_extrapolation_sigma_count.py.
-    plan = plan_band_brackets(
-        enabled=bool(config.sigma.band_extrapolation),
+    planner_options = dict(
         enk_ry=np.asarray(wfns.enk[:, s.sigma_sum]),
         n_occ=int(s.b2 - s.b0),
         nb_logical=int(meta.b_id_4_sigma_user or s.b4) - int(s.b0),
@@ -734,6 +905,19 @@ def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where):
         bracket_scheme=str(
             config.sigma.band_extrapolation_bracket_scheme),
     )
+    checkpoints = tuple(getattr(config.sigma, "band_extrapolation_checkpoints", ()) or ())
+    if checkpoints and not (checkpoints_ok and bool(config.sigma.band_extrapolation)):
+        raise ValueError(
+            f"GATE band_extrapolation_checkpoints: {checkpoints} named at {where}, "
+            f"which does not serve them (scalar on-shell MPA only)")
+    if checkpoints:
+        # Σ-RELATIVE counts: the deck names absolute band counts from band 1
+        # and the Σ sum starts at b0 (0 on every deck that sums from band 1).
+        plan = plan_band_checkpoints(
+            checkpoints=tuple(int(c) - int(s.b0) for c in checkpoints), **planner_options)
+    else:
+        plan = plan_band_brackets(
+            enabled=bool(config.sigma.band_extrapolation), **planner_options)
     # ...AND THE COMMENT ABOVE IS NOT ENOUGH, SO THIS IS CHECKED.  A plan
     # built from the wrong count is invisible in every weight-level
     # diagnostic — the OLS coefficients depend only on the abscissae's
@@ -751,6 +935,13 @@ def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where):
             f"{plan.bracket_scheme}; {plan.n_brackets} disjoint "
             f"band brackets {plan.bounds} against ONE W(τ) per τ; "
             f"band counts {plan.counts} (requested {plan.requested}).")
+        if plan.checkpoints is not None:
+            ck = plan.checkpoints
+            print_fn(
+                f"  Σc band checkpoints: counts {ck.checkpoint_counts} in ONE sweep of "
+                f"{len(ck.union.counts)} disjoint brackets {ck.union.bounds}; each "
+                f"checkpoint's own counts "
+                + "; ".join(f"{m.counts[-1]}: {m.counts}" for m in ck.members) + ".")
         # Emitted HERE and not only in the report block at the end: a
         # planner fallback is a fact about the run that the operator
         # should see before Σ is spent, not after.  ``WARNING:`` is what
@@ -784,6 +975,23 @@ def extrapolate_sigma_body(
     on E_nk" eigvalsh block) is kept only under ``sigma_freq_debug_output``.
     The caller drops its own ``top`` reference.
     """
+    union = None
+    if getattr(plan, "checkpoints", None) is not None:
+        # band_extrapolation_checkpoints: every checkpoint is read off the
+        # union sweep first; the run's own count then sees its three counts
+        # only (BandCountCube.restrict), the path below unchanged.
+        import os
+        union = sigma_omega.sigma_c_kij
+        with timing.section("sigma.band_checkpoints"):
+            payload = evaluate_band_checkpoints(
+                sigma_omega, head_sigma_diag_w_kn_ry, e_state_ev=e_state_ev, plan=plan,
+                band_slices=band_slices, wfn=wfn)
+            write_band_checkpoints(
+                payload, directory=os.path.dirname(str(config.paths.sigma_diag_file)) or ".",
+                print_fn=print_fn)
+        sigma_omega = dataclasses.replace(
+            sigma_omega, sigma_c_kij=union.restrict(plan.checkpoints.main_index),
+            band_counts=tuple(int(c) for c in plan.counts))
     cube = sigma_omega.sigma_c_kij
     last = int(cube.shape[0]) - 1
     extrap_payload, extrap_weights = _report_band_extrapolation(
@@ -796,6 +1004,8 @@ def extrapolate_sigma_body(
         twin, top = cube.diagonal(last), None
     extrapolated = _extrapolated_point(cube, extrap_weights, top=top)
     cube.release()
+    if union is not None:
+        union.release()
     return extrapolated, extrap_payload, twin
 
 

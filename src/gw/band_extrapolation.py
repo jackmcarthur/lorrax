@@ -461,10 +461,34 @@ class BandBracketPlan:
     bracket_scheme: str = BRACKET_SCHEME_DEFAULT
     boundary_mean_energy_ev: tuple[float, ...] = ()
     notes: tuple[str, ...] = ()
+    #: ``band_extrapolation_checkpoints``: the union plan whose sweep serves
+    #: every checkpoint count in the same pass (:func:`plan_band_checkpoints`);
+    #: None (the default) leaves the plan, the sweep and the run unchanged.
+    checkpoints: "BandCheckpointPlan | None" = None
 
     @property
     def n_brackets(self) -> int:
         return len(self.bounds)
+
+    @property
+    def sweep_bounds(self) -> tuple[tuple[int, int], ...]:
+        """The brackets the τ kernel sums: the union's under checkpoints, else ``bounds``."""
+        return self.bounds if self.checkpoints is None else self.checkpoints.union.bounds
+
+    @property
+    def sweep_counts(self) -> tuple[int, ...]:
+        """The cumulative counts of :attr:`sweep_bounds`."""
+        return self.counts if self.checkpoints is None else self.checkpoints.union.counts
+
+    @property
+    def sweep_matrix_counts(self) -> "tuple[int, ...] | None":
+        """Sweep counts whose full matrix is kept: this plan's N1 and N3 under
+        checkpoints (its extrapolated matrix combines them), else None (the
+        executor's own first and last)."""
+        if self.checkpoints is None:
+            return None
+        i1, _, i3 = self.checkpoints.main_index
+        return (i1, i3)
 
 
 def trivial_plan(nb_padded: int, n_occ: int, nb_logical: int) -> BandBracketPlan:
@@ -487,6 +511,125 @@ def trivial_plan(nb_padded: int, n_occ: int, nb_logical: int) -> BandBracketPlan
         bracket_scheme="disabled",
         boundary_mean_energy_ev=(float("nan"),),
     )
+
+
+@dataclass(frozen=True)
+class BandCheckpointPlan:
+    """Several Σ band counts served by ONE sweep: the union of their bracket cuts.
+
+    Each checkpoint count ``N`` has its own three-count plan ``members[i]``,
+    exactly the plan of a run with ``number_bands_sigma = N``
+    (:func:`plan_band_brackets` on ``[0, N)``: same fractions, same
+    degeneracy snapping).  The τ kernel sums the disjoint brackets between
+    consecutive cuts of the UNION of every member's counts and the run's own
+    (``union``), so every cumulative count any member reads is a cumulative
+    point of the one sweep; ``member_index[i]`` / ``main_index`` locate each
+    plan's three counts in ``union.counts``.  W, the windows, the τ nodes and
+    the evaluation energies are those of the full run for every member: a
+    checkpoint is the full run's band sum restricted to ``N`` bands, not a run
+    at ``N`` (whose quadrature would be planned on ``N`` bands).
+    """
+
+    union: BandBracketPlan
+    main: BandBracketPlan
+    members: tuple[BandBracketPlan, ...]
+    member_index: tuple[tuple[int, int, int], ...]
+    main_index: tuple[int, int, int]
+
+    @property
+    def checkpoint_counts(self) -> tuple[int, ...]:
+        return tuple(int(m.counts[-1]) for m in self.members)
+
+
+def parse_band_checkpoints(text) -> tuple[int, ...]:
+    """``band_extrapolation_checkpoints`` -> ascending distinct positive counts.
+
+    ``""`` (the default) is ``()``.  Comma- or space-separated integers; a
+    non-integer, a non-positive count or a repeat refuses by name.
+    """
+    if text is None:
+        return ()
+    if isinstance(text, (list, tuple)):
+        items = [str(v) for v in text]
+    else:
+        items = str(text).replace(",", " ").split()
+    counts = []
+    for item in items:
+        try:
+            value = int(item)
+        except ValueError:
+            raise ValueError(
+                f"band_extrapolation_checkpoints: {item!r} is not an integer band "
+                f"count") from None
+        if value <= 0 or str(value) != item.strip().lstrip("+"):
+            raise ValueError(
+                f"band_extrapolation_checkpoints: {item!r} is not a positive "
+                f"integer band count")
+        counts.append(value)
+    if len(set(counts)) != len(counts):
+        raise ValueError(
+            f"band_extrapolation_checkpoints: repeated count in {tuple(counts)}")
+    return tuple(sorted(counts))
+
+
+def plan_band_checkpoints(
+    *,
+    checkpoints,
+    enk_ry: np.ndarray,
+    n_occ: int,
+    nb_logical: int,
+    nb_padded: int,
+    tol_ry: float = DEGENERACY_TOL_RY,
+    fractions: tuple[float, ...] = BRACKET_FRACTIONS,
+    bracket_scheme: str = BRACKET_SCHEME_DEFAULT,
+) -> BandBracketPlan:
+    """The run's own plan with the union plan of its checkpoint counts attached.
+
+    Returns :func:`plan_band_brackets` for ``nb_logical`` (the plan the fit,
+    the log and ``sigma_mnk.h5`` describe) with ``checkpoints`` set to a
+    :class:`BandCheckpointPlan`.  Every checkpoint must lie in
+    ``[2·n_occ, nb_logical]`` (the member plan's own floor refuses below);
+    ``nb_logical`` itself may be named and is then the run's own plan.
+    """
+    nb_logical, nb_padded = int(nb_logical), int(nb_padded)
+    counts = tuple(int(c) for c in checkpoints)
+    if not counts:
+        raise ValueError("plan_band_checkpoints: no checkpoint counts")
+    if max(counts) > nb_logical:
+        raise BandExtrapolationRefused(
+            f"band_extrapolation_checkpoints {counts}: a checkpoint above "
+            f"number_bands_sigma = {nb_logical} is not a partial sum of this run")
+    options = dict(enk_ry=enk_ry, n_occ=n_occ, tol_ry=tol_ry, fractions=fractions,
+                   bracket_scheme=bracket_scheme)
+    main = plan_band_brackets(enabled=True, nb_logical=nb_logical,
+                              nb_padded=nb_padded, **options)
+    members = tuple(
+        main if n == nb_logical else
+        plan_band_brackets(enabled=True, nb_logical=n, nb_padded=n, **options)
+        for n in counts)
+    cuts = sorted({int(c) for plan in (main, *members) for c in plan.counts})
+    if cuts[-1] != nb_logical:
+        raise AssertionError("plan_band_checkpoints: the last cut must be the run's count")
+    lows = [0] + cuts[:-1]
+    highs = cuts[:-1] + [nb_padded]
+    union = BandBracketPlan(
+        bounds=tuple(zip(lows, highs)),
+        counts=tuple(cuts),
+        requested=tuple(cuts),
+        n_occ=main.n_occ,
+        n_cond=main.n_cond,
+        mean_energy_ev=(float("nan"),) * len(cuts),
+        enabled=True,
+        bracket_scheme=main.bracket_scheme,
+        boundary_mean_energy_ev=(float("nan"),) * len(cuts),
+        notes=tuple(dict.fromkeys(n for plan in (main, *members) for n in plan.notes)),
+    )
+    index = {c: i for i, c in enumerate(cuts)}
+    member_index = tuple(tuple(index[int(c)] for c in m.counts) for m in members)
+    main_index = tuple(index[int(c)] for c in main.counts)
+    return dataclasses.replace(main, checkpoints=BandCheckpointPlan(
+        union=union, main=main, members=members, member_index=member_index,
+        main_index=main_index))
 
 
 def require_extrapolation_band_floor(n_occ: int, nb_logical: int) -> None:
@@ -2340,6 +2483,9 @@ __all__ = [
     "fit_band_extrapolation_spectral",
     "format_spectral_report",
     "plan_band_brackets",
+    "plan_band_checkpoints",
+    "parse_band_checkpoints",
+    "BandCheckpointPlan",
     "plane_wave_band_count",
     "sc_tolerance_ruling",
     "spectral_trust_verdict",

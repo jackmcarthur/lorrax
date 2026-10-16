@@ -22,6 +22,7 @@ from .band_extrapolation import (
     BAND_EXTRAPOLATION_ESTIMATORS,
     BRACKET_SCHEME_DEFAULT,
     BRACKET_SCHEMES,
+    parse_band_checkpoints,
 )
 
 
@@ -1753,6 +1754,13 @@ _DEFAULTS = {
     # spread/max from 29.79/17.29 to 38.12/25.63 meV (JID 57267197).  Hence a
     # named spelling with the incumbent as the default, never an inference.
     "band_extrapolation_bracket_scheme": BRACKET_SCHEME_DEFAULT,
+    # Extra Σ band counts read off the SAME sweep (band-convergence studies):
+    # "" (default) is off and leaves the run bit-identical.  "627, 882, 1251"
+    # sums the union of every count's own bracket cuts in one pass and writes
+    # each count's raw and spectral-shell band-diagonal Σ_c and Z on shell
+    # (gw.band_extrapolation.plan_band_checkpoints,
+    # gw.ppm_pipeline.evaluate_band_checkpoints).
+    "band_extrapolation_checkpoints": "",
     "fermi_reference": "midgap",
     # Fermi-Dirac kBT of a metal's occupations, in Ry.  REQUIRED when the
     # WFN occupations identify a metal; refused on an insulator.  A deck key
@@ -2736,6 +2744,8 @@ def _input_response(
             or BRACKET_SCHEME_DEFAULT).strip().lower(),
         band_extrapolation_bracket_scheme_explicit=(
             "band_extrapolation_bracket_scheme" in _named_keys),
+        band_extrapolation_checkpoints=parse_band_checkpoints(
+            params["band_extrapolation_checkpoints"]),
         **dict(zip(
             ("band_extrapolation", "band_extrapolation_explicit"),
             resolve_band_extrapolation(
@@ -4231,6 +4241,10 @@ class DynamicSigmaConfig:
     #: Did the deck name the scheme?  An explicitly named compute control may
     #: not be silently ignored when extrapolation or all PPM stages are off.
     band_extrapolation_bracket_scheme_explicit: bool = False
+    #: ``band_extrapolation_checkpoints``: ascending Σ band counts whose raw and
+    #: spectral-shell band-diagonal Σ_c and Z the one sweep also reports
+    #: (:func:`gw.band_extrapolation.plan_band_checkpoints`); ``()`` is off.
+    band_extrapolation_checkpoints: tuple = ()
 
     def __post_init__(self):
         if self.omega_step_ev <= 0.0:

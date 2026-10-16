@@ -1039,8 +1039,37 @@ def _validate_sigma_stage(
     validate_band_extrapolation(config, mode, print_fn=print_fn)
 
 
+def _validate_band_checkpoints(config, mode):
+    """``GATE band_extrapolation_checkpoints``, before screening.
+
+    The checkpoints are cumulative points of the on-shell scalar MPA sweep
+    (``gw.ppm_pipeline.evaluate_band_checkpoints``).  Every other route
+    refuses the key by name rather than ignoring it: an ignored study key
+    would report one count as several.
+    """
+    counts = tuple(getattr(config.sigma, "band_extrapolation_checkpoints", ()) or ())
+    if not counts:
+        return
+    why = None
+    if not bool(config.sigma.band_extrapolation):
+        why = "it reads the band-extrapolation sweep; set use_band_extrapolation = true"
+    elif bool(config.debug.sigma_omega_grid_debug):
+        why = "it keeps on-shell band diagonals; unset sigma_omega_grid_debug"
+    elif getattr(mode, "value", mode) != ComputeMode.MPA.value or not (
+            mpa_sigma_runs_scalar_executor(config)):
+        why = ("it is wired into the scalar MPA executor only (compute_mode = mpa, "
+               f"scalar or bare_transverse); this stage is {getattr(mode, 'value', mode)}")
+    elif getattr(getattr(config, "qp_solver", None), "value", "one_shot_dft") != "one_shot_dft":
+        why = "it reports one-shot band diagonals; qp_solver must be one_shot_dft"
+    if why is not None:
+        raise ValueError(
+            f"GATE band_extrapolation_checkpoints: band_extrapolation_checkpoints = "
+            f"{counts} refuses: {why}.")
+
+
 def validate_band_extrapolation(config, mode, *, print_fn=None):
     """Refuse unsupported explicit requests before screening; report at Sigma."""
+    _validate_band_checkpoints(config, mode)
     # AUTO-DISABLED, LOUDLY: a stage with no bracketed pole sum (static, or a
     # bispinor MPA fit) keeps the full-band sum.
     scalar_mpa = mpa_sigma_runs_scalar_executor(config)
@@ -1512,9 +1541,14 @@ def _compute_mpa_sigma(
             (ComputeMode.MPA,), scalar_mpa=mpa_sigma_runs_scalar_executor(config)):
         plan = plan_sigma_band_brackets(
             config, wfns, meta, print_fn=print_fn,
-            where="sigma_dispatch MPA plan seam")
+            where="sigma_dispatch MPA plan seam",
+            checkpoints_ok=sector_handle.get("representation") != "sector-ordered-ph")
         # Before the checkpoint: the bracket plan is part of the sweep's identity.
-        body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
+        # Under band_extrapolation_checkpoints the sweep sums the union plan
+        # and keeps this plan's N1/N3 matrices (BandBracketPlan.sweep_*).
+        body_options.update(band_brackets=plan.sweep_bounds, band_counts=plan.sweep_counts)
+        if plan.checkpoints is not None:
+            body_options.update(band_matrix_counts=plan.sweep_matrix_counts)
     checkpoint = _sweep_checkpoint(
         config, input_dir, fit_identity, fit_digest, head, lorentz_output,
         e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
@@ -1653,7 +1687,7 @@ def _compute_mpa_sigma(
     if plan is not None:
         # The fit reads Sigma in the body's own omega frame (sigma_efermi_ry).
         if body_odd is not None:
-            body_odd = band_count_point(body_odd, plan.n_brackets - 1)
+            body_odd = band_count_point(body_odd, len(plan.sweep_counts) - 1)
         body_omega, extrap_payload, body_unextrap = extrapolate_sigma_body(
             replace(body, efermi_ry=sigma_efermi_ry), head_diag,
             e_state_ev=e_qp_ev, plan=plan, config=config, band_slices=band_slices,

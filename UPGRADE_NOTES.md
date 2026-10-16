@@ -5,6 +5,23 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — `band_extrapolation_checkpoints`: several Σ band counts from one sweep
+
+New deck key, off by default (`""`): a run without it is unchanged (same plan,
+same sweep, same reduce).  `band_extrapolation_checkpoints = 627, 882, 1251`
+gives each count its own three-count plan (the plan of a run with
+`number_bands_sigma` = that count), sums the disjoint brackets between the
+union of all their cuts and the run's own once, and writes
+`sigma_band_checkpoints.h5`/`.dat` beside `sigma_diag_file`: raw S(N) and
+spectral-shell Ŝ(N) band-diagonal Σ_c on shell, dΣ/dω and Z at every count, the
+fit's Ω/β/tail ratios, and the raw diagonal of every cut.  W, the windows and
+the evaluation energies are the full run's.  The run's own count reads its three
+counts from the union sweep (`BandCountCube.restrict`; its N1/N3 matrices are
+kept, `_on_shell_reduce(..., keep)`), equal to the plain run to round-off.
+Scalar on-shell MPA one-shot only (`GATE band_extrapolation_checkpoints`).
+Tests: `tests/test_band_checkpoints_cpu.py` (each checkpoint equals the
+production extrapolation of its restricted plan to rtol 1e-11).
+
 ## 2026-10-20 — W densifier: per-centroid-pair Wigner–Seitz embedding
 
 `bse_k_grid` and `exciton_bands --w-coarse-grid` now embed each coarse R class

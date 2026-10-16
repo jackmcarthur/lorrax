@@ -460,6 +460,10 @@ class BandCountCube:
     term: "jax.Array | OnShellSigma | None" = None
     #: Grid only: the band diagonal of each count between the first and last.
     diagonals: list = dataclasses.field(default_factory=list)
+    #: The counts whose matrix ``matrices`` holds, ascending
+    #: (``band_extrapolation_checkpoints``: the main plan's N1 and N3 among
+    #: the union's counts); ``()`` is the first and the last.
+    matrix_index: tuple = ()
 
     @property
     def shape(self):
@@ -470,10 +474,36 @@ class BandCountCube:
         return (len(self.slot_diagonals), 2, int(self.nk), nb_i, nb_j)
 
     def diagonal_only(self, i: int) -> bool:
+        if self.matrix_index:
+            return int(i) not in self.matrix_index
         return 0 < int(i) < self.shape[0] - 1
 
     def _matrix(self, i: int):
+        if self.matrix_index:
+            return self.matrices[self.matrix_index.index(int(i))]
         return self.matrices[0 if int(i) == 0 else -1]
+
+    def restrict(self, indices) -> "BandCountCube":
+        """The counts ``indices`` (ascending) as a cube of their own.
+
+        The first and the last of them must carry their matrix; the counts
+        between are served by their diagonal.  On shell only (the union sweep
+        of ``band_extrapolation_checkpoints`` keeps the matrices of its main
+        plan's N1 and N3).  The members are shared, not copied.
+        """
+        idx = tuple(int(i) for i in indices)
+        if self.request is None:
+            raise ValueError("BandCountCube.restrict: on-shell cubes only")
+        if list(idx) != sorted(set(idx)) or not idx:
+            raise ValueError(f"BandCountCube.restrict: indices {idx} must ascend")
+        if self.diagonal_only(idx[0]) or self.diagonal_only(idx[-1]):
+            raise ValueError(
+                f"BandCountCube.restrict: counts {idx[0]} and {idx[-1]} must keep "
+                f"their matrix; kept {self.matrix_index or (0, self.shape[0] - 1)}")
+        ends = (idx[0],) if len(idx) == 1 else (idx[0], idx[-1])
+        return dataclasses.replace(
+            self, matrices=[self._matrix(i) for i in ends], diagonals=[],
+            slot_diagonals=[self.slot_diagonals[i] for i in idx], matrix_index=())
 
     def point(self, i: int) -> OnShellSigma:
         if self.diagonal_only(i):
