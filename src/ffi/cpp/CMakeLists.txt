@@ -1579,7 +1579,7 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_src.h.in"
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_kernel.h")
 # The outer-product k-convolution (the BSE W term; kdft/kconv_outer_src.h.in), the port of
-# cufft/kconv_outer_cuda_ffi.cc, on the same stage text.
+# kconv_outer_cuda_ffi.cc (the CUDA leg's cufft/ directory), on the same stage text.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_kernel.h" LRX_KCONV_OUTER_SRC)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_src.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/generated/kconv_outer_src.h" @ONLY)
