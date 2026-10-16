@@ -17,7 +17,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from lxkit import device_vendor
 
 from distrib_la._active_local import interval_rows
-from distrib_la.active_subspace import LocalSubspacePlan, _orthogonalization_range, plan_local_subspace
+from distrib_la.active_subspace import (LocalSubspacePlan, _orthogonalization_range, native_fields,
+                                       native_leg, plan_local_subspace)
 from distrib_la.loader import probe_target
 from distrib_la.local_eigh import eigh_local
 
@@ -28,10 +29,12 @@ from distrib_la.local_eigh import eigh_local
 #: ``"xla"``: :class:`XlaSubspacePlan` (device products and ``eigh_local``, the
 #: XLA reference route); ``"host"``: :class:`CpuSubspacePlan` (NumPy LAPACK in
 #: ``pure_callback``).  A vendor with no leg runs the XLA route
-#: (``docs/architecture/decisions.md#xla-reference``).  ROCM: ``"xla"`` -- the
-#: host route cost bse 517 callbacks (1.52 s of 5.8 s) and exciton_bands 303
-#: (2.10 s of 12.4 s) at P=4 and made both solver jits uncacheable.
-SUBSPACE_ROUTE = {"cpu": "host", "CUDA": "native", "ROCM": "xla"}
+#: (``docs/architecture/decisions.md#xla-reference``).  ROCM: ``"native"`` -- the
+#: CUDA handlers' leg-neutral port (rocBLAS/rocSOLVER, ``src/ffi/cpp/active_subspace``),
+#: gated against ``"xla"`` and ``"host"`` on the same GCD by
+#: tests/test_subspace_native_gate.py.  (Wave 1: the host route cost bse 517 callbacks,
+#: 1.52 s of 5.8 s, and made the solver jits uncacheable; the XLA route followed.)
+SUBSPACE_ROUTE = {"cpu": "host", "CUDA": "native", "ROCM": "native"}
 
 
 def subspace_route(leg_key=None):
@@ -448,18 +451,23 @@ def _distribute(local, vector_sharding, *, native_collectives=False):
     if isinstance(local, LocalSubspacePlan):
         local = replace(local, local_shard=True)
         mesh = vector_sharding.mesh
+        leg = native_leg().key
         if native_collectives:
             if not (mesh.size == jax.process_count() and jax.local_device_count() == 1
                     and set(mesh.axis_names) == {'x', 'y'}):
                 raise ValueError('native orthogonalization collectives need one GPU per process on the complete X/Y mesh')
-            target = probe_target('lorrax_active_subspace_distributed_ortho', 'CUDA')
+            # Only a leg with a native communicator context builds this handler (CUDA:
+            # cuSolverMp's NCCL comm); elsewhere the opt-in refuses, it never degrades.
+            target = probe_target('lorrax_active_subspace_distributed_ortho', leg)
             if not target.ok:
-                raise RuntimeError(f'distributed orthogonalization provider unavailable: {target}')
+                raise RuntimeError('GATE subspace_native_collectives: distributed orthogonalization '
+                                   f'provider unavailable on the {leg} leg: {target}; '
+                                   'fix: native_collectives=False (JAX psum of the coefficients)')
             from distrib_la._cusolvermp import context_key
             context = context_key(mesh, col_major=False)
         else:
             for name in ('gram', 'subtract', 'subtract_gram'):
-                target = probe_target('lorrax_active_subspace_'+name, 'CUDA')
+                target = probe_target('lorrax_active_subspace_'+name, leg)
                 if not target.ok:
                     raise RuntimeError(f'orthogonalization provider unavailable: {target}')
     return DistributedSubspacePlan(local, vector_sharding, context)
@@ -479,11 +487,12 @@ def plan_subspace(*, capacity, n_eig, vector_sharding=None, max_block_size=None,
                   native_collectives=False):
     """Resolve before tracing; ``vector_sharding`` includes the unsharded row axis.
 
-    The provider is the leg's :data:`SUBSPACE_ROUTE`: CUDA runtime-sized native
-    BLAS/LAPACK, ROCm (and a vendor with no leg) XLA device products, CPU active
-    host LAPACK. All accept count/start windows without changing the compiled
-    array sizes. Native collectives are an explicit opt-in because their
-    context costs memory (native route only).
+    The provider is the leg's :data:`SUBSPACE_ROUTE`: CUDA and ROCm runtime-sized
+    native BLAS/LAPACK (cuBLAS/cuSOLVER, rocBLAS/rocSOLVER), a vendor with no leg
+    XLA device products, CPU active host LAPACK. All accept count/start windows
+    without changing the compiled array sizes. Native collectives are an explicit
+    opt-in because their context costs memory (native route; legs without the
+    handler refuse by GATE subspace_native_collectives).
     """
     _validate_plan_geometry(capacity, n_eig, vector_sharding, max_block_size)
     local = _local_plan(subspace_route(), capacity, n_eig, max_block_size)
@@ -504,10 +513,12 @@ def plan_orthogonalization(*, capacity, max_block_size, vector_sharding=None,
     _validate_plan_geometry(capacity, 1, vector_sharding, max_block_size)
     route = subspace_route()
     if route == 'native':
-        result = probe_target('lorrax_active_subspace_ortho', 'CUDA')
+        leg = native_leg()
+        result = probe_target('lorrax_active_subspace_ortho', leg.key)
         if not result.ok:
             raise RuntimeError(f'orthogonalization provider unavailable: {result}')
-        local = LocalSubspacePlan(capacity, 1, 0, max_block_size=max_block_size)
+        local = LocalSubspacePlan(capacity, 1, 0, max_block_size=max_block_size,
+                                  **native_fields(leg))
     else:
         local = _local_plan(route, capacity, 1, max_block_size)
     implementation = _distribute(local, vector_sharding,
@@ -526,13 +537,13 @@ def plan_orthogonalization(*, capacity, max_block_size, vector_sharding=None,
         k: v for k, v in implementation.workspace_specs.items()
         if k in ('gram', 'blas', 'orthogonalization_ranges')}
     if isinstance(implementation, DistributedSubspacePlan):
-        orthogonalize.backend = ('cuda_nccl'
+        orthogonalize.backend = (f'{local.vendor}_nccl'
             if implementation.orthogonalization_context is not None
-            else ('cuda_jax_collectives' if isinstance(local, LocalSubspacePlan)
+            else (f'{local.vendor}_jax_collectives' if isinstance(local, LocalSubspacePlan)
                   else 'xla_jax_collectives' if isinstance(local, XlaSubspacePlan)
                   else 'jax_collectives'))
     else:
-        orthogonalize.backend = ('cuda' if isinstance(local, LocalSubspacePlan)
+        orthogonalize.backend = (local.vendor if isinstance(local, LocalSubspacePlan)
                                  else 'xla' if isinstance(local, XlaSubspacePlan)
                                  else 'cpu_callback')
     return orthogonalize

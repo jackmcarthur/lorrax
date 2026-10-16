@@ -214,9 +214,15 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     assert lu <= set(own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)
     assert all(rocm[t] == s for t, s in own.items())
-    # distrib_la's ROCM table: the SLATE family, its LU entries included, and the batched eigh.
+    # distrib_la's ROCM table: the SLATE family, its LU entries included, the batched eigh and
+    # the active-subspace family (the CUDA symbols, less the NCCL-context distributed_ortho).
     dl_rocm = dl._PLATFORMS["ROCM"]["targets"]
-    assert dl_rocm and all(t.startswith("lorrax_slate_") or t in eigh for t in dl_rocm)
+    assert dl_rocm and all(t.startswith(("lorrax_slate_", "lorrax_active_subspace_")) or t in eigh
+                           for t in dl_rocm)
+    active = {t for t in dl_rocm if t.startswith("lorrax_active_subspace_")}
+    assert active == {t for t in dl._CUDA_TARGET_SYMBOLS if t.startswith("lorrax_active_subspace_")
+                      } - {"lorrax_active_subspace_distributed_ortho", "lorrax_active_subspace_eigh"}
+    assert all(dl_rocm[t] == dl._CUDA_TARGET_SYMBOLS[t] for t in active)
     assert lu | eigh <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu | eigh)
     cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
     section = cmake[cmake.index('STREQUAL "rocm"'):]
