@@ -1231,6 +1231,8 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         native, runs route (c), and refuses by name at the first stack that
         needs the whole mesh (:func:`~distrib_la.resolve.resolve_eigh_capacity`).
         This is how a ``linalg = local`` deck asks for the capacity route.
+        The room also caps an explicit ``distributed`` request's size route
+        (resolve guard 1b): ``one_device`` only where one whole matrix fits it.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
@@ -1254,7 +1256,9 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         # stack when this mesh has none).
         resolved, capacity_refusal = resolve_eigh_capacity(mesh_xy, n=n)
     else:
-        resolved = resolve_backend(op, backend, mesh_xy, n=n)
+        # A room caps the size route of ``distributed`` as well (guard 1b): one
+        # whole matrix per rank must fit it, or the leg's library runs.
+        resolved = resolve_backend(op, backend, mesh_xy, n=n, room=budget_bytes)
     ffi = resolved != NATIVE
     if budget_bytes is not None:
         import operator

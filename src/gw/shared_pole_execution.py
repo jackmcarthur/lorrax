@@ -710,7 +710,10 @@ def _mesh_eigh(mesh, n, backend):
     import distrib_la
     if backend == 'auto':
         return distrib_la.plan('eigh', mesh, n=int(n), backend='auto', budget_bytes=0)
-    return distrib_la.plan('eigh', mesh, n=int(n), backend=backend, batched_route='auto')
+    # No room either: the staged stack did not fit whole matrices per rank, so
+    # the size route (distrib_la resolve guard 1b) may not choose them again.
+    return distrib_la.plan('eigh', mesh, n=int(n), backend=backend, batched_route='auto',
+                           budget_bytes=0)
 
 
 def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
