@@ -59,10 +59,12 @@ def _header_code(table: dict, key: int, gate: str, name: str) -> int:
 def tdgw_file_band_order(ibndmin: int, nb: int, ivbm: int) -> np.ndarray:
     """File index of each window band ``ibndmin, ibndmin+1, …`` (1-based).
 
-    Valence ``b ≤ ivbm`` sits at ``ivbm − b``, conduction at
-    ``n_v + b − ivbm − 1`` with ``n_v = ivbm − ibndmin + 1`` — TDGW's
-    ``IndexedBasis(concat(v_file_b, c_file_b))`` order.
+    The file's band order is ``tdgw_io.kernel_file_bands`` (valence from
+    ``ivbm`` down, then conduction from ``ivbm + 1`` up), the one definition
+    the TDGW-convention reader shares; this returns each window band's
+    position in it.
     """
+    from tdagw.tdgw_io import kernel_file_bands
     bands = int(ibndmin) + np.arange(int(nb))
     n_v = int(ivbm) - int(ibndmin) + 1
     if not 0 < n_v < int(nb):
@@ -70,7 +72,8 @@ def tdgw_file_band_order(ibndmin: int, nb: int, ivbm: int) -> np.ndarray:
                 "ibndmin <= ivbm < ibndmin+nb-1",
                 "the file lists valence bands from ivbm down, then conduction bands",
                 "give a window with valence and conduction bands")
-    return np.where(bands <= ivbm, ivbm - bands, n_v + bands - ivbm - 1)
+    pos = {int(b): i for i, b in enumerate(kernel_file_bands(int(ivbm), n_v, int(nb) - n_v))}
+    return np.array([pos[int(b)] for b in bands], dtype=np.int64)
 
 
 def write_tdgw_kernel(path: str, K: np.ndarray, *, kpts: np.ndarray, ibndmin: int,
