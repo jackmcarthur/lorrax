@@ -17,6 +17,12 @@ machine runtime and is checked live, not copied into a Python package.
 
 Unsealed build-tree artifacts remain loadable during migration, but every
 such load prints ``LEGACY-UNSEALED`` together with the actual file hash.  A
+checkout build writes ``<leg>.closure.json`` beside each leg
+(:data:`CHECKOUT_CLOSURE_SUFFIX`): the private providers it linked and the
+machine library directories its verify step resolved them from.  The leg is
+then opened over that exact closure, as a sealed bundle is over its manifest,
+so a clone runs on the libraries it was built and verified against whatever
+the launch shell's ``LD_LIBRARY_PATH`` holds.  A
 manifest is never advisory: once either selected leg claims one, a partial
 pin, a mixed provider, a missing file, a changed byte, a wrong ABI or a wrong
 ``dladdr`` origin refuses before target registration.
@@ -43,7 +49,8 @@ from lxkit.legs import HOST, LEGS
 from lxkit.probe import LibraryNotBuilt, LibraryUnusable
 
 __all__ = [
-    "BUNDLE_MANIFEST", "BundleAttestation", "NativeAbiMismatch",
+    "BUNDLE_MANIFEST", "BundleAttestation", "CHECKOUT_CLOSURE_SUFFIX",
+    "NativeAbiMismatch", "checkout_private_closure",
     "assert_one_mapped_mpi_runtime", "check_abi", "checkout_build_dir",
     "describe_library",
     "is_private_redistributable", "locate_library", "open_and_attest",
@@ -52,6 +59,10 @@ __all__ = [
 
 BUNDLE_MANIFEST = "lorrax_ffi_bundle.json"
 _MANIFEST_SCHEMA = 1
+#: Suffix of the record a checkout build writes beside an unsealed leg
+#: (``src/ffi/cpp/stage/write_checkout_closure.py``).
+CHECKOUT_CLOSURE_SUFFIX = ".closure.json"
+_CHECKOUT_CLOSURE_SCHEMA = 1
 
 
 def _is_leg_pair(names) -> bool:
@@ -679,6 +690,133 @@ def _preload_private_closure(att: BundleAttestation,
     _PRIVATE_HANDLES[att.bundle_id] = tuple(handles)
 
 
+def _read_checkout_closure(leg: Path, unusable_cls: Type[OSError]
+                           ) -> tuple[tuple[Path, ...], tuple[Path, ...]] | None:
+    """``(private_libraries, library_dirs)`` an unsealed checkout leg was built
+    and verified against, from ``<leg>.closure.json``; ``None`` without one.
+
+    A record that names a missing file is a stale build, so it refuses (rebuild)
+    rather than falling back to whatever the search path finds: that fallback is
+    the failure the record exists to prevent.
+    """
+    side = leg.with_name(leg.name + CHECKOUT_CLOSURE_SUFFIX)
+    if not side.is_file():
+        return None
+    try:
+        doc = json.loads(side.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise unusable_cls(f"checkout closure {side} is unreadable: {exc}") from exc
+    if not isinstance(doc, dict) or doc.get("schema") != _CHECKOUT_CLOSURE_SCHEMA:
+        raise unusable_cls(
+            f"checkout closure {side} has schema "
+            f"{doc.get('schema') if isinstance(doc, dict) else None!r}, want "
+            f"{_CHECKOUT_CLOSURE_SCHEMA}; rebuild the leg")
+    private = tuple(Path(p) for p in doc.get("private_libraries", []))
+    dirs = tuple(Path(d) for d in doc.get("library_dirs", []) if d)
+    for path in private:
+        refuse_private_library(path, unusable_cls)
+        if not path.is_file():
+            raise unusable_cls(
+                f"checkout closure {side} names private provider {path}, which "
+                "is not a file: the build stage moved or was purged.  Rebuild "
+                "the leg; refusing to let the search path pick another "
+                f"{path.name}.")
+    for d in dirs:
+        if not d.is_dir():
+            raise unusable_cls(
+                f"checkout closure {side} names library directory {d}, which "
+                "does not exist on this machine; rebuild the leg here")
+    return private, dirs
+
+
+def _checkout_closure_order(leg: Path, private: Sequence[Path],
+                            dirs: Sequence[Path]) -> list[Path]:
+    """The libraries of ``leg``'s NEEDED closure that its checkout record names,
+    dependencies first: a private provider by its recorded path, any other
+    library by the first recorded directory that holds it.  A name neither
+    covers (the device runtime, NCCL/RCCL, libc) is the run environment's and
+    is left to the search path, as for a sealed bundle."""
+    by_name = {p.name: p for p in private}
+    order: list[Path] = []
+    seen: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        hit = by_name.get(name)
+        if hit is None:
+            hit = next((d / name for d in dirs if (d / name).is_file()), None)
+        if hit is None:
+            return
+        for dep in _elf_dynamic(hit.resolve()).get(_DT_NEEDED, []):
+            visit(dep)
+        order.append(hit)
+
+    for name in _elf_dynamic(leg).get(_DT_NEEDED, []):
+        visit(name)
+    return order
+
+
+def checkout_private_closure(leg: str | Path, private_dirs: Sequence[str | Path]
+                             ) -> tuple[list[Path], list[str]]:
+    """The engine-private providers of ``leg``'s NEEDED closure, for its
+    checkout record: ``(paths found by SONAME in private_dirs, dependencies
+    first; SONAMEs found in none)``.  The build side of
+    :func:`_preload_checkout_closure` (``write_checkout_closure.py``)."""
+    dirs = [Path(d) for d in private_dirs]
+    found: list[Path] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in seen or not is_private_redistributable(name):
+            return
+        seen.add(name)
+        hit = next((d / name for d in dirs if (d / name).is_file()), None)
+        if hit is None:
+            missing.append(name)
+            return
+        for dep in _elf_dynamic(hit.resolve()).get(_DT_NEEDED, []):
+            visit(dep)
+        found.append(hit)
+
+    for name in _elf_dynamic(Path(leg)).get(_DT_NEEDED, []):
+        visit(name)
+    return found, missing
+
+
+def _preload_checkout_closure(leg: Path, unusable_cls: Type[OSError]) -> None:
+    """Open an unsealed checkout leg's recorded closure by exact path, once.
+
+    The leg's search path is ``$ORIGIN`` alone, a DT_RUNPATH, which
+    ``LD_LIBRARY_PATH`` outranks, so the launch shell's modules decide which
+    file serves a SONAME.  On Perlmutter cudatoolkit/13.2 puts the HPC SDK's
+    cuSOLVERMp 0.8 under the SONAME of the staged 0.9.1 the CUDA leg is
+    compiled against (``cusolverMpGetrf_bufferSize`` / ``Syevd_bufferSize``
+    status=7 at the first distributed LU or eigh), and the site-default
+    LibSci/HDF5 map a second cray-mpich beside the pinned one.  Loading the
+    recorded files first, RTLD_GLOBAL and dependencies first, publishes their
+    SONAMEs before the leg's own dlopen resolves them, as
+    :func:`_preload_private_closure` does for a sealed bundle.  Start-up only.
+    """
+    key = f"checkout:{leg}"
+    if key in _PRIVATE_HANDLES:
+        return
+    record = _read_checkout_closure(leg, unusable_cls)
+    if record is None:
+        return
+    handles: list[ctypes.CDLL] = []
+    for path in _checkout_closure_order(leg, *record):
+        try:
+            handles.append(ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL))
+        except OSError as exc:
+            raise unusable_cls(
+                f"{path}, recorded in {leg.name}{CHECKOUT_CLOSURE_SUFFIX}, could "
+                f"not be loaded: {exc}") from exc
+    _PRIVATE_HANDLES[key] = tuple(handles)
+
+
 def _announce_loaded(path: Path, origin: Path,
                      att: BundleAttestation | None) -> None:
     if att is None:
@@ -762,6 +900,8 @@ def open_and_attest(
             f"{att.manifest_path}: {att.libraries[platform]}")
     if att is not None:
         _preload_private_closure(att, unusable_cls)
+    else:
+        _preload_checkout_closure(selected, unusable_cls)
     try:
         lib = ctypes.CDLL(str(selected), mode=ctypes.RTLD_GLOBAL)
     except OSError as exc:

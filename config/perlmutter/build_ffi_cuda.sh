@@ -93,7 +93,8 @@ done
 # same SONAMEs as the staged 0.9.1 / 0.10 this leg is compiled against (found
 # first, they fail the first distributed eigh with cusolverMpSyevd status=7).
 # A sealed bundle carries the staged pair beside the leg and preloads it by
-# exact path, so the sealed bundle, not a search path, decides which one serves.
+# exact path, so the sealed bundle, not a search path, decides which one serves;
+# an unsealed checkout leg gets the same from its <leg>.closure.json (below).
 [[ "${1:-}" == "--fresh" ]] && rm -rf "${BUILD:?}"
 cmake --fresh -S "$SRC" -B "$BUILD" \
     -DLORRAX_FFI_PLATFORM=cuda \
@@ -134,6 +135,14 @@ SO="$BUILD/liblorrax_ffi.so"
     phdf5="$LORRAX_PM_HDF5_MODULE" phdf5_root="$PHDF5_ROOT" \
     hdf5_soversion=310 mpi="$LORRAX_PM_MPICH_MODULE" mpi_root="$MPICH_ROOT" \
     || echo "[build_ffi_cuda] WARNING: provenance stamp failed" >&2
+
+# --- checkout closure (lxkit.native_provider) -------------------------------
+# The leg's $ORIGIN RUNPATH loses to LD_LIBRARY_PATH (the HPC SDK cuSOLVERMp 0.8
+# above), so the build records the staged pair and the pinned run directories
+# beside the leg; the loader opens them by exact path before the leg, as a
+# sealed bundle does its manifest, and a clone needs no LD_LIBRARY_PATH.
+"$PY" "$SRC/stage/write_checkout_closure.py" "$SO" \
+    --private-dir "$STAGE/lib" --library-dirs "$LORRAX_PM_RUNTIME_LIB_DIRS"
 
 # --- post-link gates (scripts/verify_ffi_build.sh) --------------------------
 LD_LIBRARY_PATH="$STAGE/lib:$CUDA/lib64:$MATH/lib64:$COMM/nccl/lib:$LORRAX_PM_RUNTIME_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \

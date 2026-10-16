@@ -78,7 +78,15 @@ process ([Perlmutter build facts](ffi-build.md#perlmutter)). Rebuild both
 legs after a pull that changes `src/ffi/cpp/`: a stale leg refuses with
 `HANDLER ABI MISMATCH`. The libraries are unsealed, so the first load in a run
 prints `LEGACY-UNSEALED` with the file hash; that is expected for a private
-build.
+build. Each leg also gets `<leg>.closure.json` beside it: the private providers
+it links (the staged cuSOLVERMp/cuBLASMp, SLATE) and the pinned MPI, HDF5 and
+LibSci directories of `config/perlmutter/ffi_mpi.sh`. The loader opens those
+files by exact path before the leg, as a sealed bundle does its manifest, so a
+run uses the libraries the build verified whatever the shell's
+`LD_LIBRARY_PATH` holds (cudatoolkit/13.2 puts the HPC SDK's older
+cuSOLVERMp 0.8 there under the same SONAME, which fails the first distributed
+LU or eigh with `status=7`). Moving or purging `.build` refuses at load:
+rebuild.
 
 ### 1.3 Run the test suite {#suite}
 

@@ -529,6 +529,14 @@ GATE_TAG=build_ffi_host \
 # or re-run this verifier there with LORRAX_GATE_FFTW_PY set, which is what
 # the acceptance pytest tier does.
 
+# Checkout closure (lxkit.native_provider): the SLATE install and the pinned
+# MPI/HDF5/LibSci directories, recorded beside the leg and opened by exact path
+# before it, so a clone resolves neither from the launch shell's search path.
+"$LORRAX_ROOT/.venv/bin/python" "$LORRAX_ROOT/src/ffi/cpp/stage/write_checkout_closure.py" \
+    "$SO_FILE" --private-dir "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" \
+    --library-dirs "$LORRAX_PM_RUNTIME_LIB_DIRS" || {
+        echo "[build_ffi_host] FAILED: checkout closure" >&2; exit 1; }
+
 # Build provenance beside the artifact — see the note in src/ffi/cpp/build.sh.
 "$LORRAX_ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO_FILE" \
     "leg=host" \
@@ -545,4 +553,4 @@ GATE_TAG=build_ffi_host \
 
 echo
 echo "[build_ffi_host] done.  .so at: $SO_FILE"
-echo "[build_ffi_host] unsealed, it finds SLATE only on LD_LIBRARY_PATH; seal_bundle.py makes the pair."
+echo "[build_ffi_host] unsealed: the loader opens SLATE and the pinned MPI from its closure record; seal_bundle.py makes the pair."
