@@ -134,7 +134,9 @@ is the part of W that `epsilon_cutoff` leaves out; it is printed per q.
 
 `mode = project` copies the bundle to `output_dir/tmp`, replaces `W0_qmunu` by
 (E7) at every stored q and stamps `W0_source = bgw_epsmat` with the reference
-path; the source is never written (`GATE epsmat_project_output`). At Γ the
+path; the source is never written (`GATE epsmat_project_output`). Both
+directions take $v$ at the file's own q and G list, which for q ≠ 0 is V_q's
+own $v$ (the same vector $q+G$) and at Γ is $v(q_0+G')$. At Γ the
 G = 0 row and column of `eps0mat.h5` are dropped: the bundle's Γ body has
 v(G = 0) = 0 and LORRAX carries the head as its rank-one `whead` term, which
 is kept from the bundle (§5). Both modes write `epsmat_<mode>.json` in
@@ -147,8 +149,11 @@ orientation on BerkeleyGW's own data) and $\|K_{\text{BGW}}-K\|_2/\|K\|_2$.
 `eps0mat.h5` sits at $q_0$ (`q0_vector`, or the reference file's). Its three
 parts are written differently.
 
-* **Body** (G, G′ ≠ 0): (E6) from the bundle's Γ entry, whose V and W carry
-  v(G = 0) = 0, so the body is $(\varepsilon_{bb})^{-1}$. In 2D (slab) that is
+* **Body** (G, G′ ≠ 0): (E6) with $\chi^{\mu}$ and ζ̃ of the bundle's Γ entry,
+  whose V and W carry v(G = 0) = 0, so the body is $(\varepsilon_{bb})^{-1}$,
+  and rows scaled by $v(q_0+G)$, the factor BerkeleyGW's
+  $W=\varepsilon^{-1}v(q_0+G')$ pairs with; W is then Hermitian, and using
+  Γ's χ and ζ̃ at $q_0$ is an O($q_0$) step. In 2D (slab) the body is
   the q → 0 limit: the head–wing term of the block inverse,
   $\varepsilon_{b0}\varepsilon_{00}^{-1}\varepsilon_{0b}$, is O(q). In 3D it
   is O(1) ($v(q)\propto q^{-2}$, $\chi_{0G}\propto q$) and the bundle's body
@@ -220,8 +225,10 @@ Per q, with n = `nmtx`, r ≤ $N_\mu$ the kept rank and P devices on a square
 | write | — | — | none: each device writes its tile through SlabIO |
 | projection gate | n² r/P | — | one $N_\mu\times N_\mu$ all-reduce |
 
-No collective moves the n × n block; on a 2 × 2 mesh the compiled export
-program holds exactly one all-to-all, one all-gather and one collective-permute.
+No collective moves the n × n block. On a 2 × 2 mesh the compiled export
+program holds exactly one all-to-all (ζ̃), one all-gather and one
+collective-permute of the row block, and one all-gather of the n-vector
+diagonal, which leaves replicated because every process reads it on the host.
 A file costs 16 n_max² bytes per q (BerkeleyGW pads every q to `nmtx_max`).
 
 ## 9. Not exported

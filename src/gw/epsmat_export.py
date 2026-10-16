@@ -180,7 +180,11 @@ def _tile_indices(n_tile):
 @functools.lru_cache(maxsize=None)
 def _epsinv_program(mesh, n_pad, mu_pad, ng_disk, is_q0):
     """jit: (ζ̃ (1, μ, ngkmax) μ-sharded, slots, B, K, v, n_valid, head) ->
-    (block (n, n, 2) at P('x','y',None), diagonal (n,) at P(('x','y')))."""
+    (block (n, n, 2) at P('x','y',None), diagonal (n,) replicated).
+
+    The diagonal leaves REPLICATED (one all-gather of n numbers) because the
+    driver fetches it to the host: a ``P(('x','y'))`` array spans devices of
+    other processes and cannot be fetched on any one of them."""
     p = _square_side(mesh)
     n_tile = n_pad // p
     zsh = NamedSharding(mesh, P(None, _XY, None))
@@ -215,8 +219,7 @@ def _epsinv_program(mesh, n_pad, mu_pad, ng_disk, is_q0):
         return smap(z, B, K, v, v, v, n_valid, head)
 
     return jax.jit(run, in_shardings=(zsh, rep, rep, rep, rep, rep, rep),
-                   out_shardings=(NamedSharding(mesh, P("x", "y", None)),
-                                  NamedSharding(mesh, P(_XY))))
+                   out_shardings=(NamedSharding(mesh, P("x", "y", None)), rep))
 
 
 @functools.lru_cache(maxsize=None)
@@ -300,7 +303,8 @@ def epsinv_block(zeta_q, slots, B, K, v_eps, *, mesh, n_valid, q0_head_value=Non
     Returns
     -------
     block : (n_pad, n_pad, 2) float64 at ``P('x','y',None)``, ``[a, b]`` =
-        (Re, Im) ε⁻¹(G_b, G_a); diagonal : (n_pad,) complex at ``P(('x','y'))``.
+        (Re, Im) ε⁻¹(G_b, G_a); diagonal : (n_pad,) complex, replicated (the
+        host reads it on every process).
     """
     p = _square_side(mesh)
     mu_pad, ngk = int(zeta_q.shape[1]), int(zeta_q.shape[2])
@@ -476,6 +480,21 @@ def bare_v_bgw_units(src, q_frac, miller):
         bvec=g.bvec, cell_volume=g.cell_volume, sys_dim=int(src.config.sys_dim),
         vcoul_cutoff_ry=None, bdot=g.bdot, v_head_fn=None)[0]
     return v * g.cell_volume
+
+
+def _file_q_v(src, q_file, gvecs, is_q0):
+    """LORRAX v(q+G)/Ω at the file's own q and G list, with v(G = 0) = 0 at q0.
+
+    ``q_file + G`` is the same vector as the stored ``q + (G + G0)``, so for
+    q ≠ 0 these are V_q's own values.  At q0 the rows are v(q0 + G), as
+    BerkeleyGW forms ``W = ε⁻¹ v(q0 + G')``, so W stays Hermitian; the G = 0
+    entry is zero because the head is the long-wavelength model (E8) and the
+    wings are zero, and ``χ`` and ζ̃ are the stored Γ ones (an O(q0) step).
+    """
+    v = np.array(lorrax_v(src, q_file, gvecs), dtype=np.float64)
+    if is_q0:
+        v[0] = 0.0
+    return v
 
 
 def read_q_rows(src, iq, mesh):
@@ -699,7 +718,7 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
                 slots = zeta_slots(src.zeta.gvecs(q=[r.iq_store])[0],
                                    src.zeta.ngk_valid(q=[r.iq_store])[0], miller,
                                    fill=Z.shape[2])
-                v_eps = lorrax_v(src, src.q_stored[r.iq_store], miller)
+                v_eps = _file_q_v(src, r.q_file, comps[r.gspace.order[:n]], name == "eps0mat")
                 head = _q0_head_value(cfg, src, r.q_file) if name == "eps0mat" else None
                 blk, diag = epsinv_block(Z, slots, B, K, v_eps, mesh=mesh, n_valid=n,
                                          q0_head_value=head)
@@ -708,7 +727,7 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
                 io.write_slab(be.MATRIX, blk6, offset=offset)
                 proj = project_block(blk6, Z, slots, v_eps, mesh=mesh, n_valid=n,
                                      drop_head=name == "eps0mat")
-                # v(G = 0) is already zero at Γ, so V_ε needs no head case.
+                # v_eps[0] = 0 at q0, so V_ε carries no head term (the head is (E8)).
                 V_e = coulomb_gram(Z, slots, v_eps, mesh=mesh)[: src.n_mu, : src.n_mu]
                 err, rt = _check_projection(proj, V_e, B, K, Wc, src.n_mu, r.iq_store, name)
                 d = np.asarray(jax.device_get(diag))[:n]
@@ -806,7 +825,7 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
             miller = comps[qg.order[:n]] + g0[None, :]
             slots = zeta_slots(src.zeta.gvecs(q=[iq])[0], src.zeta.ngk_valid(q=[iq])[0],
                                miller, fill=Z.shape[2])
-            v_eps = lorrax_v(src, src.q_stored[iq], miller)
+            v_eps = _file_q_v(src, heads[name]["qpts"][iqf], comps[qg.order[:n]], is_g)
             n_pad = _pad_to(n, int(mesh.shape["x"]) ** 2)
             offset, shape = be.matrix_block_window(iqf, 0, n_pad)
             with SlabIO(files[name], mode="r", mesh=mesh) as rd:

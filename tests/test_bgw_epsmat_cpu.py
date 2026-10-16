@@ -332,3 +332,27 @@ def test_efermi_is_bgw_midgap(tmp_path):
     assert midgap_ry(str(path), 3) == pytest.approx(0.40, abs=1e-15)
     off_by_one = 0.5 * (max(el[s, k, ifmax[s, k]] for s in range(2) for k in range(2)) + cbm)
     assert abs(off_by_one - midgap_ry(str(path), 4)) > 0.1
+
+
+
+def test_host_fetched_outputs_are_replicated():
+    """Every array the drivers fetch to the host leaves its program replicated.
+
+    On P processes a ``P(('x','y'))`` array spans other processes' devices and
+    ``jax.device_get`` refuses it (the CrI3 P=4 export died there while every
+    single-process check passed).  Red twin: the block, which stays tiled, is
+    not replicated, and neither is a ``P(('x','y'))`` copy of the diagonal.
+    """
+    from gw import epsmat_export as ee
+    mesh = _mesh()
+    r = export(mesh, (1 / 6, 1 / 3, 0.0), ecuts=2.5)
+    blk, diag = ee.epsinv_block(r["zeta"], r["slots"], r["Bp"], r["Kp"], r["v_eps"],
+                                mesh=mesh, n_valid=r["n"])
+    blk6 = jax.device_put(np.asarray(blk).reshape((1, 1, 1) + tuple(blk.shape)),
+                          NamedSharding(mesh, P(None, None, None, "x", "y", None)))
+    proj = ee.project_block(blk6, r["zeta"], r["slots"], r["v_eps"], mesh=mesh,
+                            n_valid=r["n"], drop_head=False)
+    gram = ee.coulomb_gram(r["zeta"], r["slots"], r["v_eps"], mesh=mesh)
+    assert diag.is_fully_replicated and proj.is_fully_replicated and gram.is_fully_replicated
+    assert not blk.is_fully_replicated
+    assert not jax.device_put(diag, NamedSharding(mesh, P(("x", "y")))).is_fully_replicated
