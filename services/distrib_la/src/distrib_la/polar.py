@@ -24,7 +24,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
 from distrib_la.resolve import mesh_key
-from distrib_la._collectives import device_put_process_local
+from distrib_la._collectives import device_put_process_local_cached
 
 __all__ = ["PolarPlan", "plan_polar_factor", "polar_factor",
            "right_singular_vectors", "leading_eigenvectors",
@@ -231,8 +231,43 @@ def _shifted_normal_eigh(g, eigh):
     return (mu - 1) * scale[..., None], v
 
 
+@lru_cache(maxsize=32)
+def _agree_kernel(mesh):
+    """Every device's copy of a replicated spectrum replaced by mesh device 0's bits, on device.
+
+    The bits travel as unsigned integers and every other device contributes
+    zero to one psum, so the sum is device 0's bit pattern exactly (no float
+    rounding, signed zeros and NaN payloads kept).
+    """
+    from jax import shard_map
+    axes = tuple(mesh.axis_names)
+
+    def body(s):
+        bits = jax.lax.bitcast_convert_type(s, _UINT_OF[jnp.dtype(s.dtype).itemsize])
+        root = jnp.asarray(True)
+        for a in axes:
+            root = root & (jax.lax.axis_index(a) == 0)
+        bits = jax.lax.psum(jnp.where(root, bits, jnp.zeros_like(bits)), axes)
+        return jax.lax.bitcast_convert_type(bits, s.dtype)
+    return jax.jit(shard_map(body, mesh=mesh, in_specs=P(), out_specs=P(), check_vma=False))
+
+
+_UINT_OF = {4: jnp.uint32, 8: jnp.uint64}
+
+
 def _host_spectrum(s):
-    """One O(n) spectrum for all eager rank cuts, including roundoff tails."""
+    """One O(n) spectrum for all eager rank cuts, including roundoff tails.
+
+    Every process must cut the same bits.  A mesh-replicated spectrum is made
+    uniform on the device (``_agree_kernel``: device 0's bits) and read once;
+    the previous host broadcast (one host-to-device put and one collective
+    per eigh, ``multihost_utils.broadcast_one_to_all``) serves only an input
+    that is not a mesh array.
+    """
+    sharding = getattr(s, "sharding", None)
+    if isinstance(sharding, NamedSharding) and jnp.dtype(s.dtype).itemsize in _UINT_OF:
+        values = np.asarray(_agree_kernel(sharding.mesh)(s))
+        return values[..., ::-1].copy()
     from jax.experimental.multihost_utils import broadcast_one_to_all
     values = np.asarray(s)
     bits = broadcast_one_to_all(values.view(np.uint64))
@@ -296,8 +331,13 @@ def _retained_columns(
     retained = (tuple(row[:n] for row, n in zip(values, count))
                 if isinstance(count, tuple) else values[:count])
     replicated = NamedSharding(mesh, P())
-    counts = device_put_process_local(np.asarray(count, dtype=np.int64), replicated)
-    spectra = jax.tree.map(lambda row: device_put_process_local(row, replicated), retained)
+    # The counts are the select's runtime mask operand, placed once per
+    # distinct count vector.  The spectra are host values already (the
+    # broadcast _host_spectrum, identical on every process) and every caller
+    # reads them on the host (sizes, cuts, receipts): they are returned as
+    # host arrays, never re-placed on the device (one transfer per row before).
+    counts = device_put_process_local_cached(np.asarray(count, dtype=np.int64), replicated)
+    spectra = jax.tree.map(lambda row: np.array(row, dtype=np.float64, copy=True), retained)
     return select(Q, counts), spectra
 
 
@@ -438,8 +478,9 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
     -------
     Q, sigma
         Q[m,r_padded] at P('x','y'), active columns first and zero tails;
-        sigma[r] replicated in descending order. r = sigma.size. Only the
-        O(m) spectrum crosses the host, never a matrix. Selection is eager.
+        sigma[r] a host float64 array (the same on every process) in
+        descending order. r = sigma.size. Only the O(m) spectrum crosses the
+        host, never a matrix, and it is not placed back. Selection is eager.
         Batched input returns Q[b,m,max(r_padded)] at P(None,'x','y') and
         a tuple of b unpadded sigma[r_q] arrays. Thus every cut/multiplet
         remains independent; the matrix tail of each row is exactly zero.

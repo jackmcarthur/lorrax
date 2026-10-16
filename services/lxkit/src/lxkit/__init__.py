@@ -60,7 +60,8 @@ from lxkit.legs import (
     process_accelerator_leg,
 )
 from lxkit.cache import user_cache_dir
-from lxkit.placement import device_put_process_local, device_put_process_tiles
+from lxkit.placement import (device_put_process_local, device_put_process_local_cached,
+                             device_put_process_tiles, placement_cache_stats)
 from lxkit.probe import (
     AVAILABLE,
     LibraryNotBuilt,
@@ -89,7 +90,8 @@ __all__ = [
     "ProbeResult", "AVAILABLE", "LibraryNotBuilt", "LibraryUnusable",
     "unknown_target", "not_loadable", "missing_symbol",
     # JAX utilities
-    "device_put_process_local", "device_put_process_tiles", "mark_varying",
+    "device_put_process_local", "device_put_process_local_cached",
+    "device_put_process_tiles", "placement_cache_stats", "mark_varying",
     # the platform legs of the native-provider ABI
     "legs", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
     "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_vendor",
