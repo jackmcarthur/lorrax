@@ -111,8 +111,14 @@ def _make_hartree_term(mesh_xy: Mesh):
 
 
 @functools.lru_cache(maxsize=None)
-def _td_program(mesh_xy: Mesh, kgrid: tuple, nspinor: int, sex: bool, hartree: bool):
-    """The jitted ``(drho, psi_X, psi_Y, M, W_R, zeta_G, v_G) -> dsigma``, one per static signature."""
+def _td_program(mesh_xy: Mesh, kgrid: tuple, nspinor: int, sex: bool, hartree: bool,
+                backend: str):
+    """The jitted ``(drho, psi_X, psi_Y, M, W_R, zeta_G, v_G) -> dsigma``, one per static signature.
+
+    ``backend`` is the k-convolution router's choice when the program is
+    built (``ffi.fft.kconv_backend``): it is part of the key so a program
+    built inside ``ffi.fft.xla_reference()`` is never served outside it.
+    """
     if not (sex or hartree):
         _refuse("td_model_terms", "sex=False, hartree=False", "at least one term",
                 "request the SEX term, the Hartree term or both")
@@ -166,8 +172,9 @@ def build_td_agw_apply(mesh_xy: Mesh, model: dict, *, sex: bool = True,
         static signature (mesh, k grid, spinor extent, terms) and per shape
         of ``drho``; the model's arrays are runtime operands.
     """
+    from ffi.fft import kconv_backend
     prog = _td_program(mesh_xy, tuple(int(n) for n in model["kgrid"]),
-                       int(model["nspinor"]), bool(sex), bool(hartree))
+                       int(model["nspinor"]), bool(sex), bool(hartree), kconv_backend(mesh_xy))
     ops = (model["psi_X"], model["psi_Y"], model["M"], model["W_R"],
            model["zeta_G"], model["v_G"])
 
@@ -432,8 +439,10 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
     Returns
     -------
     model : dict — :func:`assemble_td_model`'s bundle; ``receipts`` carries
-        the V_q0 cross-check inputs (``V_q0_stored``, ``g0``) and the ψ
-        gauge comparison against the restart.
+        provenance and the ψ gauge comparison against the restart; the
+        cross-check operands are ``V_q0_stored`` (the restart's q = 0
+        exchange tile), ``V_q0_bse`` (the BSE loader's, stored + the vhead
+        head) and ``g0_X`` (the head vector), all (nmu_pad, …) on the mesh.
     """
     from bse.bse_feast import ensure_W_R
     from bse.bse_loading import load_bse_data_from_restart_sharded
