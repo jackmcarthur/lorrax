@@ -44,6 +44,16 @@ static ffi::Error fail(const char* gate, const std::string& why,
 }
 
 struct Kernels { rtc::Function z = nullptr, d = nullptr; };
+
+// Targets with FP64 MFMA (v_mfma_f64_16x16x4f64): CDNA2 gfx90a and CDNA3 gfx94x.
+static bool mfma_target(const std::string& arch) {
+#if defined(LRX_LEG_ROCM)
+    return arch.rfind("gfx90a", 0) == 0 || arch.rfind("gfx94", 0) == 0;
+#else
+    (void)arch;
+    return false;
+#endif
+}
 static std::mutex g_mu;
 static std::map<int, Kernels> g_cache;
 static std::map<int, std::string> g_fail;
@@ -62,15 +72,18 @@ static ffi::Error kernels(std::string_view cache_dir, Kernels* out) {
     prog.name = "lrx_active_gemm";
     prog.kernel = "lrx_active_gemm_z";
     prog.entries = {"lrx_active_gemm_d"};
+    // The FP64 matrix-core path where the device has one (ROCM gfx90a / gfx94x: MFMA f64 16x16x4);
+    // every other target (and the CUDA leg, until a DMMA arm is gated) takes the FMA path.
+    const int mfma = mfma_target(arch) ? 1 : 0;
     prog.defs = {rtc::kOptOption, "-std=c++17", rtc::arch_option(arch),
                  "-DLRX_TM=" + std::to_string(kTm), "-DLRX_TN=" + std::to_string(kTn),
-                 "-DLRX_TK=" + std::to_string(kTk)};
+                 "-DLRX_TK=" + std::to_string(kTk), "-DLRX_MFMA=" + std::to_string(mfma)};
     const std::string key_hex = rtc::hex16(rtc::key(prog, nullptr));
     const std::string dir(cache_dir);
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
-        name << dir << "/active_gemm_t" << kTm << "x" << kTn << "x" << kTk << "_"
+        name << dir << "/active_gemm_t" << kTm << "x" << kTn << "x" << kTk << (mfma ? "_mfma" : "") << "_"
              << rtc::arch_tag(arch) << "_" << key_hex << rtc::kImageExt;
         path = name.str();
     }
@@ -81,9 +94,9 @@ static ffi::Error kernels(std::string_view cache_dir, Kernels* out) {
         return fail("active-gemm-build", where + " -- " + err, ffi::ErrorCode::kInternal);
     }
     if (!img.from_disk)
-        std::fprintf(stderr, "[active_gemm] " LRX_RTC_API " %s tile %dx%dx%d %s in %.1f ms%s\n",
+        std::fprintf(stderr, "[active_gemm] " LRX_RTC_API " %s tile %dx%dx%d%s %s in %.1f ms%s\n",
                      img.rebuilt_bad ? "rebuilt (cached image refused)" : "built", kTm, kTn, kTk,
-                     arch.c_str(), img.ms, img.stored ? " (stored)" : "");
+                     mfma ? " mfma" : "", arch.c_str(), img.ms, img.stored ? " (stored)" : "");
     Kernels k;
     k.z = img.fn;
     k.d = img.fns.empty() ? nullptr : img.fns[0];

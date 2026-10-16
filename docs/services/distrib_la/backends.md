@@ -388,7 +388,10 @@ stream on every call, which on MI250X drains the stream inside Sigma's tau loop
 leg-neutral kernel that reads the bounds on the device: per call no host read,
 no sync, no cond, no operand or weighted copy and no workspace; each row's K
 loop runs over its active width only and never loads inactive storage; weights
-are applied on load; invalid bounds give all-NaN.  The CUDA leg adopts it by
+are applied on load; invalid bounds give all-NaN.  On gfx90a / gfx94x the inner
+product runs on the FP64 matrix cores (`v_mfma_f64_16x16x4f64`, complex128 as the
+exact four-product form; MI250X, Fe W shape c128[64,156,936] at full K: 1.13 ms
+vs 0.81 ms rocBLAS and 1.87 ms on the FMA path); other targets take the FMA path.  The CUDA leg adopts it by
 listing the source.  The `masked` and `interval` routes stay as the XLA
 references; `tests/test_active_local_native_gate.py` gates both native routes
 against them on the same device.  The cuBLAS kernel stays the CUDA arm: on
