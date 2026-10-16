@@ -99,20 +99,28 @@ static inline ffi::Error stage_host_to_output(
 }
 #endif
 
-// Keep small pinned buffers for repeated reads, but never retain a large
-// slab in each of several open file contexts. The threshold bounds idle
-// read staging to 32 MiB per file; it does not cap the live H5Dread slab.
-// This is the synchronous-read buffer only. The writer thread owns
-// pinned_buf, including the async k-chunk union reader.
-static constexpr size_t kMaxRetainedReadStaging = size_t{32} << 20;
+// Idle read staging is bounded per file (32 MiB) and, above that, by one
+// process-wide budget (context.cc settle_read_buf), so a large slab is not
+// retained in each of several open file contexts.  This is the
+// synchronous-read buffer only. The writer thread owns pinned_buf,
+// including the async k-chunk union reader.
+
+// True when H5Dread overwrites every element of the staging block, so the
+// zero fill (the padding contract: ranks outside valid_shape read zeros) has
+// nothing to do.  An empty (H5S_NONE) or clipped selection is partial.
+static inline bool selection_fills(hid_t memspace, const std::vector<hsize_t>& mem_dims) {
+    hsize_t n = 1;
+    for (hsize_t d : mem_dims) n *= d;
+    const hssize_t got = H5Sget_select_npoints(memspace);
+    return got >= 0 && static_cast<hsize_t>(got) == n;
+}
 
 static inline ffi::Error finish_read(
     LRX_STREAM_PARAM PhdfCtx* ctx, const void* src, void* d_dst, size_t bytes)
 {
     FFI_RETURN_IF_ERROR(
         stage_host_to_output(LRX_STREAM_ARG ctx, src, d_dst, bytes));
-    if (ctx->read_capacity.load(std::memory_order_acquire) >
-        kMaxRetainedReadStaging) retire_read_buf(ctx);
+    settle_read_buf(ctx);
     return ffi::Error::Success();
 }
 
@@ -379,7 +387,6 @@ static ffi::Error ReadImpl(
         return fail_read(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     void* stage = ctx->read_buf;
-    std::memset(stage, 0, bytes);
 
     hid_t native_type = dt::h5_native_type<T>();
     hid_t filespace = H5I_INVALID_HID, memspace = H5I_INVALID_HID;
@@ -392,6 +399,7 @@ static ffi::Error ReadImpl(
             return fail_read(code, sel_err);
         }
     }
+    if (!selection_fills(memspace, mem_dims)) std::memset(stage, 0, bytes);
 
     hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
     const auto native_t0 = ctx->timing_enabled
@@ -727,7 +735,6 @@ static ffi::Error ReadMultiDispatch(
         return fail(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     char* stage = static_cast<char*>(ctx->read_buf);
-    std::memset(stage, 0, total);
 
     // Every rank lists every request in the same order (shapes are the
     // equal-block shards, identical on every rank); a rank's empty block is
@@ -753,6 +760,8 @@ static ffi::Error ReadMultiDispatch(
             os << err << " (request " << i << " of " << n_out << ")";
             return fail(code, os.str());
         }
+        if (!selection_fills(ms, req[i].mem_dims))
+            std::memset(stage + req[i].stage_off, 0, req[i].bytes);
         dsets.push_back(req[i].ds);
         types.push_back(req[i].type);
         mems.push_back(ms);
@@ -803,8 +812,7 @@ static ffi::Error ReadMultiDispatch(
         if (req[i].bytes) std::memcpy(req[i].dst, stage + req[i].stage_off, req[i].bytes);
     }
 #endif
-    if (ctx->read_capacity.load(std::memory_order_acquire) >
-        kMaxRetainedReadStaging) retire_read_buf(ctx);
+    settle_read_buf(ctx);
     return ffi::Error::Success();
 }
 #endif  // H5_VERSION_GE(1, 14, 0)

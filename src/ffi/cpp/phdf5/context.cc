@@ -11,6 +11,8 @@
 //   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
 //   LORRAX_PHDF5_COLL_META        (0)   collective metadata ops
 //   LORRAX_PHDF5_ALIGN_MB         (4)   H5Pset_alignment threshold/length
+//   LORRAX_PHDF5_READ_STAGING_RETAIN_MB (256) process-wide budget for read
+//                                       staging kept above 32 MiB per file
 //   LORRAX_PHDF5_STRIPE_COUNT  (policy) Lustre striping_factor hint; unset =
 //                                       clamp(world_size, 4, 128)
 //   LORRAX_PHDF5_STRIPE_SIZE_FS(policy) Lustre striping_unit hint (lfs form;
@@ -270,6 +272,30 @@ bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes) {
                           need_bytes, "ensure_pinned");
 }
 
+// Synchronous-read staging above this is retained only under the process
+// budget below (settle_read_buf); within it, per file, always.
+static constexpr size_t kMaxRetainedReadStaging = size_t{32} << 20;
+static std::atomic<size_t> g_read_reserved{0};
+
+static size_t read_retain_budget() {
+    static const size_t budget = [] {
+        // Clamp before the shift, as ALIGN_MB: <= 0 retains nothing above
+        // the per-file bound (the old behaviour); 64 GiB caps a typo.
+        long mb = env_long("LORRAX_PHDF5_READ_STAGING_RETAIN_MB", 256);
+        if (mb < 0) mb = 0;
+        if (mb > (64L << 10)) mb = 64L << 10;
+        return static_cast<size_t>(mb) << 20;
+    }();
+    return budget;
+}
+
+static void release_read_reservation(PhdfCtx* ctx) {
+    if (ctx->read_reserved) {
+        g_read_reserved.fetch_sub(ctx->read_reserved, std::memory_order_acq_rel);
+        ctx->read_reserved = 0;
+    }
+}
+
 // SYNCHRONOUS-READER staging (ctx.h OWNERSHIP).
 bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes) {
 #if LRX_LEG_DEVICE
@@ -279,6 +305,9 @@ bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes) {
     if (ctx->read_buf &&
         lrx::gpu::event_synchronize(ctx->h2d_event) != lrx::gpu::kSuccess) return false;
 #endif
+    // Growth frees the buffer the reservation was taken for.
+    if (ctx->read_capacity.load(std::memory_order_acquire) < need_bytes)
+        release_read_reservation(ctx);
     return ensure_staging(&ctx->read_buf, &ctx->read_capacity,
                           need_bytes, "ensure_read_buf");
 }
@@ -288,6 +317,7 @@ static std::atomic<size_t> retired_read_bytes{0};
 void retire_read_buf(PhdfCtx* ctx) {
     void* retired = ctx->read_buf;
     if (!retired) return;
+    release_read_reservation(ctx);
     const size_t capacity =
         ctx->read_capacity.load(std::memory_order_acquire);
     ctx->read_buf = nullptr;
@@ -316,6 +346,22 @@ void retire_read_buf(PhdfCtx* ctx) {
     }
     ctx->queue_cv.notify_one();
 #endif
+}
+
+void settle_read_buf(PhdfCtx* ctx) {
+    const size_t cap = ctx->read_capacity.load(std::memory_order_acquire);
+    if (cap <= kMaxRetainedReadStaging || ctx->read_reserved == cap) return;
+    release_read_reservation(ctx);
+    const size_t budget = read_retain_budget();
+    size_t cur = g_read_reserved.load(std::memory_order_acquire);
+    while (cur + cap <= budget) {
+        if (g_read_reserved.compare_exchange_weak(cur, cur + cap,
+                                                  std::memory_order_acq_rel)) {
+            ctx->read_reserved = cap;
+            return;
+        }
+    }
+    retire_read_buf(ctx);
 }
 
 // -----------------------------------------------------------------
@@ -1314,6 +1360,7 @@ void close_ctx(PhdfCtx* ctx, int64_t* timing_out) {
     staging_free(ctx->pinned_buf);
     ctx->pinned_buf = nullptr;
     ctx->pinned_capacity.store(0, std::memory_order_release);
+    release_read_reservation(ctx);
     staging_free(ctx->read_buf);
     ctx->read_buf = nullptr;
     ctx->read_capacity.store(0, std::memory_order_release);

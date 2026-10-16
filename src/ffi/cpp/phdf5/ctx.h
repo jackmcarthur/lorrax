@@ -178,6 +178,10 @@ struct LORRAX_PHDF_CTX_TYPE {
     std::atomic<size_t> pinned_capacity{0};
     void*        read_buf            = nullptr;
     std::atomic<size_t> read_capacity{0};
+    // Bytes of ``read_buf`` held against the PROCESS-WIDE retained-staging
+    // budget (context.cc settle_read_buf); 0 when the buffer is within the
+    // per-file bound or is not retained.  XLA thread, like read_buf.
+    size_t       read_reserved       = 0;
     // std::hash of ``writer_thread``'s id, published by the thread itself
     // before it runs any task.  A plain integer rather than a
     // std::atomic<std::thread::id> so the guard needs nothing exotic; a hash
@@ -265,6 +269,15 @@ bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes);
 // for release after its queued H2D completes. The caller never waits for the
 // copy here. On the host build, release is immediate after memcpy.
 void retire_read_buf(PhdfCtx* ctx);
+
+// After a synchronous read: keep ``read_buf`` for the next read when it is
+// within the per-file bound (32 MiB) or when it fits the process-wide
+// retained budget (``LORRAX_PHDF5_READ_STAGING_RETAIN_MB``, default 256);
+// otherwise retire it.  A buffer above the per-file bound used to be
+// retired after every read and re-pinned by the next: the Fe V2 shared-pole
+// constructor paid 16 x ~50 MB re-pins per run, 0.25 s of handler time on
+// the dispatch thread (lane slabmr diagnostic run d7a, before this change).
+void settle_read_buf(PhdfCtx* ctx);
 
 // ─── THE LIVE-CTX REGISTRY (SLAB_IO_ROOT_CAUSE_AUDIT.md B2) ──────────────
 //
