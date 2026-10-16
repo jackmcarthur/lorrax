@@ -203,7 +203,7 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentHostFfi",
 }
 
-#: The ROCM leg's handlers: the device families ported so far, phdf5 and slate.  The
+#: The ROCM leg's handlers: the device families ported so far (phdf5, slate, cublas_local).  The
 #: device legs compile the SAME sources, so the symbols are the CUDA leg's
 #: (``LRX_PHDF_HANDLER(<X>)`` is ``<X>Ffi`` on both); only one device leg is
 #: ever loaded in a process.  A family joins this table when it joins
@@ -243,6 +243,11 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     # LocalFourierPlan's ROCM leg (cpp/hipfft/fourier_plan_rocm_ffi.cc, the port of the CUDA
     # leg's cufft/fourier_plan_cuda_ffi.cc): ffi.fft.FOURIER_PLAN_TARGETS["ROCM"].
     "lorrax_fourier_plan_rocm":      "LorraxFourierPlanRocmFfi",
+    # The active-range GEMM with device-side bounds (cpp/active_gemm/, leg-neutral, run-time
+    # compiled), distrib_la ACTIVE_LOCAL_ROUTE's ROCM "device" row; the CUDA leg serves the
+    # operation with cublas_local (and adopts this source by listing it).
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},

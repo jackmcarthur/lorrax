@@ -1,4 +1,5 @@
-// Local exact-range batched GEMM through classic cuBLAS.
+// Local exact-range batched GEMM through classic BLAS: cuBLAS on the CUDA leg, rocBLAS on the
+// ROCM leg (common/gpu_blas.h; one source, the same symbols, as phdf5 and slate).
 //
 // Each process owns complete contraction axes and independent centroid tiles:
 //   A[nq,m,k] @ B[nq,k,n] -> C[nq,m,n].
@@ -10,6 +11,13 @@
 // Two bindings.  The aliased one takes C and applies beta.  The `_out` one takes
 // no C: beta is 0, so every batch row is written here (the GEMM over a live
 // interval, a memset of an empty one) and the output needs no zero fill first.
+//
+// Leg-neutral: every runtime call goes through lrx::gpu:: (gpu_runtime.h) and every BLAS
+// call through lrx::gpu::blas:: (gpu_blas.h).  On the CUDA leg those are inline forwards to
+// the cudaX / cublasX calls this file made before, with the same arguments, so the CUDA
+// handler is the one it was.  The bounds read (Dispatch / OutDispatch) is a stream-ordered
+// D2H of 2*n_bounds int32 and a stream sync on both legs: the A100 trace kept it (it idles the
+// GPU <= 1.2%, the queue refills within ~20 us: _active_local_cuda.py, kernel lessons).
 
 #include "xla/ffi/api/ffi.h"
 #include "common/ffi_helpers.h"
@@ -24,8 +32,7 @@
 #include <type_traits>
 #include <vector>
 
-#include <cublas_v2.h>
-#include <cuda_runtime_api.h>
+#include "common/gpu_blas.h"
 
 namespace ffi = xla::ffi;
 
@@ -33,17 +40,20 @@ namespace lorrax_ffi::cublas_local_active_gemm {
 
 constexpr int64_t kWorkspaceBytes = 4 * 1024 * 1024;
 
-#define LORRAX_LOCAL_CUDA(call)                                                \
+namespace blas = lrx::gpu::blas;
+
+#define LORRAX_LOCAL_GPU(call)                                                 \
   do {                                                                         \
-    const cudaError_t status = (call);                                          \
-    if (status != cudaSuccess)                                                  \
-      return ffi::Error::Internal(std::string("local active GEMM CUDA: ") +    \
-                                  cudaGetErrorString(status));                  \
+    const lrx::gpu::Error status = (call);                                      \
+    if (status != lrx::gpu::kSuccess)                                           \
+      return ffi::Error::Internal(                                              \
+          std::string("local active GEMM " LRX_GPU_VENDOR ": ") +              \
+          lrx::gpu::error_string(status));                                      \
   } while (0)
 
-static ffi::Error BlasError(const char* operation, cublasStatus_t status) {
+static ffi::Error BlasError(const char* operation, blas::Status status) {
   std::ostringstream message;
-  message << "local active GEMM " << operation << ": cuBLAS status "
+  message << "local active GEMM " << operation << ": " LRX_BLAS_NAME " status "
           << static_cast<int>(status);
   return ffi::Error::Internal(message.str());
 }
@@ -51,102 +61,53 @@ static ffi::Error BlasError(const char* operation, cublasStatus_t status) {
 // A distinct handle is required here.  The active-subspace service binds its
 // own handle to short-lived XLA workspace and therefore must not be shared.
 struct LocalHandle {
-  cublasHandle_t value = nullptr;
-  cublasStatus_t creation_status = CUBLAS_STATUS_NOT_INITIALIZED;
+  blas::Handle value = nullptr;
+  blas::Status creation_status = blas::kNotInitialized;
 
-  LocalHandle() { creation_status = cublasCreate(&value); }
+  LocalHandle() { creation_status = blas::create(&value); }
   ~LocalHandle() {
-    if (value != nullptr) cublasDestroy(value);
+    if (value != nullptr) blas::destroy(value);
   }
 };
 
-static ffi::Error GetHandle(cudaStream_t stream, void* workspace,
-                            size_t workspace_bytes, cublasHandle_t* result) {
+static ffi::Error GetHandle(lrx::gpu::Stream stream, void* workspace,
+                            size_t workspace_bytes, blas::Handle* result) {
+  // ROCM: rocBLAS is the process's mapped copy (GATE rocblas-mapped); CUDA: linked, nullptr.
+  if (const char* why = blas::unavailable())
+    return ffi::Error(ffi::ErrorCode::kFailedPrecondition, why);
   thread_local LocalHandle state;
-  if (state.creation_status != CUBLAS_STATUS_SUCCESS || state.value == nullptr)
+  if (state.creation_status != blas::kSuccess || state.value == nullptr)
     return BlasError("handle creation", state.creation_status);
-  // cublasSetStream resets a user-provided workspace, so the order is fixed.
-  cublasStatus_t status = cublasSetStream(state.value, stream);
-  if (status != CUBLAS_STATUS_SUCCESS)
+  // cublasSetStream resets a user-provided workspace, so the order is fixed (rocBLAS keeps
+  // the same order).
+  blas::Status status = blas::set_stream(state.value, stream);
+  if (status != blas::kSuccess)
     return BlasError("stream binding", status);
-  status = cublasSetWorkspace(state.value, workspace, workspace_bytes);
-  if (status != CUBLAS_STATUS_SUCCESS)
+  status = blas::set_workspace(state.value, workspace, workspace_bytes);
+  if (status != blas::kSuccess)
     return BlasError("workspace binding", status);
   *result = state.value;
   return ffi::Error::Success();
 }
 
 template <typename T>
-static cublasStatus_t Scale(cublasHandle_t handle, int length,
-                            const T* beta, T* data);
-
-template <>
-cublasStatus_t Scale<double>(cublasHandle_t handle, int length,
-                             const double* beta, double* data) {
-  return cublasDscal(handle, length, beta, data, 1);
-}
-
-template <>
-cublasStatus_t Scale<std::complex<double>>(
-    cublasHandle_t handle, int length, const std::complex<double>* beta,
-    std::complex<double>* data) {
-  return cublasZscal(
-      handle, length, reinterpret_cast<const cuDoubleComplex*>(beta),
-      reinterpret_cast<cuDoubleComplex*>(data), 1);
-}
-
-template <typename T>
-static cublasStatus_t GemmStridedBatched(
-    cublasHandle_t handle, int n, int m, int width, const T* alpha,
-    const T* b, int ldb, int64_t stride_b, const T* a, int lda,
-    int64_t stride_a, const T* beta, T* c, int ldc, int64_t stride_c,
-    int batch_count);
-
-template <>
-cublasStatus_t GemmStridedBatched<double>(
-    cublasHandle_t handle, int n, int m, int width, const double* alpha,
-    const double* b, int ldb, int64_t stride_b, const double* a, int lda,
-    int64_t stride_a, const double* beta, double* c, int ldc,
-    int64_t stride_c, int batch_count) {
-  return cublasDgemmStridedBatched(
-      handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, width, alpha, b, ldb,
-      stride_b, a, lda, stride_a, beta, c, ldc, stride_c, batch_count);
-}
-
-template <>
-cublasStatus_t GemmStridedBatched<std::complex<double>>(
-    cublasHandle_t handle, int n, int m, int width,
-    const std::complex<double>* alpha, const std::complex<double>* b, int ldb,
-    int64_t stride_b, const std::complex<double>* a, int lda,
-    int64_t stride_a, const std::complex<double>* beta,
-    std::complex<double>* c, int ldc, int64_t stride_c, int batch_count) {
-  return cublasZgemmStridedBatched(
-      handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, width,
-      reinterpret_cast<const cuDoubleComplex*>(alpha),
-      reinterpret_cast<const cuDoubleComplex*>(b), ldb, stride_b,
-      reinterpret_cast<const cuDoubleComplex*>(a), lda, stride_a,
-      reinterpret_cast<const cuDoubleComplex*>(beta),
-      reinterpret_cast<cuDoubleComplex*>(c), ldc, stride_c, batch_count);
-}
-
-template <typename T>
-static ffi::Error ScaleEmpty(cublasHandle_t handle, T* output, int64_t count,
+static ffi::Error ScaleEmpty(blas::Handle handle, T* output, int64_t count,
                              T beta) {
-  // The caller handles beta=0 with cudaMemsetAsync and beta=1 as a no-op.
+  // The caller handles beta=0 with a stream memset and beta=1 as a no-op.
   if (beta == T(0) || beta == T(1))
     return ffi::Error::InvalidArgument("local active GEMM internal scale misuse");
   for (int64_t offset = 0; offset < count;) {
     const int length = static_cast<int>(
         std::min<int64_t>(count - offset, std::numeric_limits<int>::max()));
-    const cublasStatus_t status = Scale(handle, length, &beta, output + offset);
-    if (status != CUBLAS_STATUS_SUCCESS) return BlasError("empty scaling", status);
+    const blas::Status status = blas::scal(handle, length, &beta, output + offset, 1);
+    if (status != blas::kSuccess) return BlasError("empty scaling", status);
     offset += length;
   }
   return ffi::Error::Success();
 }
 
 template <typename T>
-static ffi::Error Run(cudaStream_t stream, cublasHandle_t handle, const T* a,
+static ffi::Error Run(lrx::gpu::Stream stream, blas::Handle handle, const T* a,
                       const T* b, T* output,
                       const std::vector<int32_t>& bounds, int64_t n_bounds,
                       int64_t nq, int64_t m, int64_t k, int64_t n, T alpha,
@@ -169,7 +130,7 @@ static ffi::Error Run(cudaStream_t stream, cublasHandle_t handle, const T* a,
     T* c_run = output + first * stride_c;
     if (lo == hi) {
       if (beta == T(0)) {
-        LORRAX_LOCAL_CUDA(cudaMemsetAsync(
+        LORRAX_LOCAL_GPU(lrx::gpu::memset_async(
             c_run, 0, (end - first) * stride_c * sizeof(T), stream));
       } else if (beta != T(1)) {
         FFI_RETURN_IF_ERROR(
@@ -180,12 +141,12 @@ static ffi::Error Run(cudaStream_t stream, cublasHandle_t handle, const T* a,
     }
     // Row-major C=A*B is column-major C^T=B^T*A^T.  The active B rows
     // start at lo*n; the active A columns start at lo and retain lda=k.
-    const cublasStatus_t status = GemmStridedBatched(
+    const blas::Status status = blas::gemm_strided_batched(
         handle, static_cast<int>(n), static_cast<int>(m), hi - lo, &alpha,
         b + first * stride_b + int64_t(lo) * n, static_cast<int>(n), stride_b,
         a + first * stride_a + lo, static_cast<int>(k), stride_a, &beta,
         c_run, static_cast<int>(n), stride_c, batch_count);
-    if (status != CUBLAS_STATUS_SUCCESS) return BlasError("GEMM", status);
+    if (status != blas::kSuccess) return BlasError("GEMM", status);
     first = end;
   }
   return ffi::Error::Success();
@@ -197,7 +158,7 @@ static bool ProductFitsInt64(int64_t x, int64_t y) {
 
 // c_in == nullptr: the `_out` binding (no C operand, beta = 0).
 static ffi::Error DispatchWithBounds(
-    cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+    lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
     const ffi::AnyBuffer* c_in,
     ffi::Result<ffi::AnyBuffer> c_out,
     ffi::Result<ffi::BufferR1<ffi::U8>> workspace,
@@ -245,7 +206,7 @@ static ffi::Error DispatchWithBounds(
           "local active GEMM requires 0 <= lo <= hi <= storage K");
   }
 
-  cublasHandle_t handle = nullptr;
+  blas::Handle handle = nullptr;
   FFI_RETURN_IF_ERROR(GetHandle(stream, workspace->typed_data(),
                                workspace->dimensions()[0], &handle));
   if (a.element_type() == ffi::DataType::F64) {
@@ -269,7 +230,7 @@ static ffi::Error DispatchWithBounds(
 }
 
 static ffi::Error Dispatch(
-    cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+    lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
     ffi::BufferR2<ffi::S32> bounds, ffi::AnyBuffer c_in,
     ffi::Result<ffi::AnyBuffer> c_out,
     ffi::Result<ffi::BufferR1<ffi::U8>> workspace, int64_t nq, int64_t m,
@@ -281,10 +242,10 @@ static ffi::Error Dispatch(
         "local active GEMM bounds must have shape (1|nq,2)");
   const int64_t n_bounds = bounds.dimensions()[0];
   std::vector<int32_t> host_bounds(2 * n_bounds);
-  LORRAX_LOCAL_CUDA(cudaMemcpyAsync(
+  LORRAX_LOCAL_GPU(lrx::gpu::memcpy_async(
       host_bounds.data(), bounds.typed_data(), host_bounds.size() * sizeof(int32_t),
-      cudaMemcpyDeviceToHost, stream));
-  LORRAX_LOCAL_CUDA(cudaStreamSynchronize(stream));
+      lrx::gpu::kDeviceToHost, stream));
+  LORRAX_LOCAL_GPU(lrx::gpu::stream_synchronize(stream));
   return DispatchWithBounds(
       stream, a, b, &c_in, c_out, workspace, host_bounds, n_bounds, nq, m, k, n,
       alpha_re, alpha_im, beta_re, beta_im);
@@ -292,7 +253,7 @@ static ffi::Error Dispatch(
 
 // The `_out` binding: no C operand, beta = 0 (the handler writes every row).
 static ffi::Error OutDispatch(
-    cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+    lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
     ffi::BufferR2<ffi::S32> bounds, ffi::Result<ffi::AnyBuffer> c_out,
     ffi::Result<ffi::BufferR1<ffi::U8>> workspace, int64_t nq, int64_t m,
     int64_t k, int64_t n, double alpha_re, double alpha_im) {
@@ -302,17 +263,17 @@ static ffi::Error OutDispatch(
         "local active GEMM bounds must have shape (1|nq,2)");
   const int64_t n_bounds = bounds.dimensions()[0];
   std::vector<int32_t> host_bounds(2 * n_bounds);
-  LORRAX_LOCAL_CUDA(cudaMemcpyAsync(
+  LORRAX_LOCAL_GPU(lrx::gpu::memcpy_async(
       host_bounds.data(), bounds.typed_data(), host_bounds.size() * sizeof(int32_t),
-      cudaMemcpyDeviceToHost, stream));
-  LORRAX_LOCAL_CUDA(cudaStreamSynchronize(stream));
+      lrx::gpu::kDeviceToHost, stream));
+  LORRAX_LOCAL_GPU(lrx::gpu::stream_synchronize(stream));
   return DispatchWithBounds(
       stream, a, b, nullptr, c_out, workspace, host_bounds, n_bounds, nq, m, k, n,
       alpha_re, alpha_im, 0.0, 0.0);
 }
 
 static ffi::Error PreparedDispatch(
-    cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+    lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
     ffi::AnyBuffer c_in, ffi::Result<ffi::AnyBuffer> c_out,
     ffi::Result<ffi::BufferR1<ffi::U8>> workspace, int64_t nq, int64_t m,
     int64_t k, int64_t n, double alpha_re, double alpha_im, double beta_re,
@@ -341,7 +302,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CublasLocalActiveRangeGemmFfi,
     lorrax_ffi::cublas_local_active_gemm::Dispatch,
     ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::BufferR2<ffi::S32>>()
@@ -361,7 +322,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CublasLocalActiveRangeGemmOutFfi,
     lorrax_ffi::cublas_local_active_gemm::OutDispatch,
     ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::BufferR2<ffi::S32>>()
@@ -378,7 +339,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CublasLocalPreparedActiveRangeGemmFfi,
     lorrax_ffi::cublas_local_active_gemm::PreparedDispatch,
     ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()

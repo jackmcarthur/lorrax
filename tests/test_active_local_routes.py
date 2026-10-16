@@ -3,8 +3,8 @@
 ``distrib_la._active_local`` serves two XLA routes for the product
 ``a[q][:, lo:hi] diag(w[q]) b[q][lo:hi, :]`` (``ACTIVE_LOCAL_ROUTE``): the
 interval route (power-of-two slices under device control flow) and the masked
-route (one batched dot with the inactive storage selected to zero, the ROCM
-row).  Both must ignore whatever the inactive storage holds, NaN included.
+route (one batched dot with the inactive storage selected to zero).  Both are
+the references the native routes (ROCM ``device``, CUDA ``native``) are gated against.  Both must ignore whatever the inactive storage holds, NaN included.
 """
 import numpy as np
 import pytest
@@ -99,14 +99,13 @@ def test_invalid_bounds_give_nan(bad):
 
 
 def test_route_rows():
-    assert ACTIVE_LOCAL_ROUTE == {"cpu": "interval", "CUDA": "native", "ROCM": "masked"}
+    assert ACTIVE_LOCAL_ROUTE == {"cpu": "interval", "CUDA": "native", "ROCM": "device"}
     assert active_local_route("tpu") == "interval"
-    assert local_active_impl("ROCM") is masked_local_matmul
     assert local_active_impl("cpu") is active_local_matmul
 
 
 def test_masked_has_no_device_control_flow():
-    """The point of the ROCM row: the masked program lowers with no while/cond."""
+    """The masked program lowers with no while/cond (the interval route's do)."""
     rng = np.random.default_rng(2)
     a, b, w, _ = _operands(rng)
     args = (jnp.asarray(a), jnp.asarray(b), jnp.asarray(BOUNDS["mixed"]), jnp.asarray(w))

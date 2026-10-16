@@ -177,8 +177,18 @@ _ROCM_ACTIVE_SUBSPACE_SYMBOLS: dict = {
     t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
     if t.startswith("lorrax_active_subspace_")
     and t not in ("lorrax_active_subspace_distributed_ortho", "lorrax_active_subspace_eigh")}
+#: The local active-range GEMM (cpp/cublas/local_active_gemm_ffi.cc) is leg-neutral: the
+#: ROCM leg compiles the CUDA leg's source on rocBLAS (common/gpu_blas.h), so it exports
+#: the same three symbols (ACTIVE_LOCAL_ROUTE's "native" row on both legs).
+#: The active-range GEMM with device-side bounds (cpp/active_gemm/: leg-neutral, run-time
+#: compiled), ACTIVE_LOCAL_ROUTE's ROCM "device" row; the CUDA leg does not list it yet.
+_ROCM_ACTIVE_GEMM_SYMBOLS: dict = {
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
+}
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
-                                 if t.startswith("lorrax_slate_")},
+                                 if t.startswith(("lorrax_slate_", "lorrax_cublas_local_"))},
+                              **_ROCM_ACTIVE_GEMM_SYMBOLS,
                               **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS,
                               **_ROCM_ACTIVE_SUBSPACE_SYMBOLS}
 

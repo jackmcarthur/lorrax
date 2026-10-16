@@ -24,19 +24,47 @@ import jax.numpy as jnp
 #: Active-range local GEMM implementation by ``lxkit`` leg key -- a backend
 #: preference of this service (as ``subspace.SUBSPACE_ROUTE``), so it lives here
 #: and not in ``lxkit.LEGS``.  ``"native"``: the ``lorrax_cublas_local_*``
-#: handlers (``_active_local_cuda``); ``"interval"``: :func:`active_local_matmul`;
-#: ``"masked"``: :func:`masked_local_matmul`.  A vendor with no row takes
-#: ``"interval"``.  ROCM: ``"masked"`` -- on MI250X (ROCm 7.14.1, JAX 0.9.1)
-#: every XLA ``while``/``cond`` trip costs ~36 us of host-driven launches and
-#: copies (command buffers off or forced: no better), and the interval route's
-#: ~64 x (3-6) trips per call made Sigma's tau windows 68 s vs 7.5 s on A100
-#: (Fe 4x4x4, n_mu 312, P=4; GPU idle 77% of the trace).
-ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "masked"}
+#: handlers (``_active_local_cuda``; one leg-neutral source, cuBLAS on CUDA and
+#: rocBLAS on ROCM); ``"interval"``: :func:`active_local_matmul`; ``"masked"``:
+#: :func:`masked_local_matmul`; ``"device"``: the ``lorrax_active_gemm_device*``
+#: handlers (``_active_local_device``: one run-time-compiled leg-neutral kernel that
+#: reads the bounds on the device -- no host read, no stream sync, no cond, no operand
+#: or weighted copy, no workspace, FLOPs over the active width only).  A vendor with no
+#: row takes ``"interval"``.  Both XLA routes stay as the references the native routes
+#: are gated against (tests/test_active_local_native_gate.py, same device).  ROCM:
+#: ``"device"``.  Not ``"native"``: the cuBLAS/rocBLAS handler's per-call host read +
+#: stream sync drains the stream inside Sigma's tau loop (Fe Sigma tau 13.5 s vs 9.1 s
+#: masked on MI250X); not ``"masked"``: its ``where`` selects form two operand-sized
+#: copies per call (~3.2 s of selects per Fe Sigma tau run).  CUDA keeps ``"native"``
+#: (measured on A100: the read idles the GPU <= 1.2 %); ``"device"`` is its adoption path.
+ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "device"}
+
+
+#: How the native arm (``_active_local_cuda.active_local_cuda``) guards invalid and full
+#: bounds, by leg key.  ``"cond"``: two ``lax.cond`` (invalid -> NaN without a native call,
+#: full -> XLA's dense dot), the CUDA arm as measured on A100 (CUDA graphs keep a cond on
+#: the device).  ``"select"``: no device control flow -- invalid rows are sanitized to an
+#: empty interval, the native call always runs, and ``where`` puts NaN on an invalid
+#: result.  ROCM: HIP graphs have no conditional node, so each cond is a host round trip
+#: (Fe Sigma tau 13.5 s cond vs 13.3 s select on the native row).  ``"full"``: no host
+#: read at all -- the prepared target over the whole storage axis with the weights
+#: zeroed outside [lo, hi) (NaN everywhere for invalid bounds).  Exact when inactive
+#: storage is finite (the added terms are exact zeros); NON-finite inactive storage gives
+#: NaN in that row (loud, never a wrong finite value) instead of being ignored, so it
+#: changes the contract and is no leg's default (owner decision).  Fe P=4 (MI250X, one
+#: node) Sigma tau other: native + "full" 7.83 s, masked 9.14 s, native + "select" 13.28 s
+#: (A100 native: 7.54 s); eqp within 2e-8 eV of the masked reference.
+ACTIVE_LOCAL_GUARD = {"CUDA": "cond", "ROCM": "select"}
 
 
 def active_local_route(platform):
     """The active-range route for an FFI platform key (``resolve.mesh_platform``)."""
     return ACTIVE_LOCAL_ROUTE.get(platform, "interval")
+
+
+def active_local_guard(platform):
+    """The native arm's guard for an FFI platform key (``"cond"`` | ``"select"``)."""
+    return ACTIVE_LOCAL_GUARD.get(platform, "cond")
 
 
 def masked_local_matmul(a, b, bounds, weights, c=None, *, alpha, beta):
@@ -62,7 +90,10 @@ def masked_local_matmul(a, b, bounds, weights, c=None, *, alpha, beta):
 
 
 def local_active_impl(platform):
-    """The XLA implementation behind a non-native route (``"interval"`` | ``"masked"``)."""
+    """The XLA implementation behind a non-native route (``"interval"`` | ``"masked"``).
+
+    A ``"native"`` or ``"device"`` row has no XLA implementation; its callers enter
+    ``_active_local_cuda`` / ``_active_local_device`` instead."""
     return masked_local_matmul if active_local_route(platform) == "masked" else active_local_matmul
 
 
