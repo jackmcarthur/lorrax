@@ -421,6 +421,7 @@ static void abandon_partial_ctx(PhdfCtx* ctx, MPI_Info* info) noexcept {
 #if LRX_LEG_DEVICE
     if (ctx->d2h_event) (void)lrx::gpu::event_destroy(ctx->d2h_event);
     if (ctx->h2d_event) (void)lrx::gpu::event_destroy(ctx->h2d_event);
+    if (ctx->order_event) (void)lrx::gpu::event_destroy(ctx->order_event);
     if (ctx->stream)    (void)lrx::gpu::stream_destroy(ctx->stream);
 #endif
     delete ctx;
@@ -816,6 +817,8 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
                   LRX_GPU_API "EventCreate(phdf5 d2h_event)");
     throw_if_cuda(lrx::gpu::event_create_with_flags(&ctx->h2d_event, lrx::gpu::kEventDisableTiming),
                   LRX_GPU_API "EventCreate(phdf5 h2d_event)");
+    throw_if_cuda(lrx::gpu::event_create_with_flags(&ctx->order_event, lrx::gpu::kEventDisableTiming),
+                  LRX_GPU_API "EventCreate(phdf5 order_event)");
 #endif
 
     // --- start dedicated writer thread (FIFO task queue) ---
@@ -1317,6 +1320,7 @@ void close_ctx(PhdfCtx* ctx, int64_t* timing_out) {
 #if LRX_LEG_DEVICE
     if (ctx->d2h_event) (void)lrx::gpu::event_destroy(ctx->d2h_event);
     if (ctx->h2d_event) (void)lrx::gpu::event_destroy(ctx->h2d_event);
+    if (ctx->order_event) (void)lrx::gpu::event_destroy(ctx->order_event);
     if (ctx->stream)    (void)lrx::gpu::stream_destroy(ctx->stream);
 #endif
 

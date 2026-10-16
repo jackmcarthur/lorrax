@@ -245,6 +245,48 @@ with SlabIO(WPATH, mode="r", mesh=mesh) as rio:
                          partition_spec=P(None, None, None, None))
 verdict("posted_writes_queued", np.array_equal(np.asarray(back.addressable_shards[0].data), full)
         and cw.puts == 0, f"writes={NQ // ndev + 3} puts={cw.puts}")
+# ordering fence (ABI 7): reads and a write issued behind ~100 ms of queued
+# device work.  Without the fence the H2D lands before the destination's fill
+# (the fill then zeroes it) and the write D2H reads its operand before it exists.
+heavy_n = 3072 if jax.devices()[0].platform != "cpu" else 384
+from common.collectives import device_put_process_local
+hx = device_put_process_local(np.full((heavy_n, heavy_n), 1.0 / heavy_n),
+                              jax.sharding.NamedSharding(mesh, P()))
+
+
+@jax.jit
+def _busy(a):
+    for _ in range(30):
+        a = jnp.tanh(a @ a)          # bounded: the busy values stay finite
+    return a
+
+
+with SlabIO(PATH, mode="r", mesh=mesh) as io:
+    rq = requests(BATCH, [lines[5]], 0, ndev)[0]
+    jax.block_until_ready(_busy(hx))
+    busy = _busy(hx)                      # queued, not waited
+    one = io.read_slab(rq["name"], shape=rq["shape"], offset=rq["offset"],
+                       valid_shape=rq["valid_shape"], dtype=rq["dtype"], partition_spec=BATCH)
+    busy = _busy(hx)
+    many = io.read_multi([{k: v for k, v in r.items() if k != "k"}
+                          for r in requests(BATCH, lines[:8], 0, ndev)], partition_spec=BATCH)
+    ok = matches_ref(one, expected(rq)) and all(
+        matches_ref(m, expected(r)) for m, r in zip(many, requests(BATCH, lines[:8], 0, ndev)))
+    jax.block_until_ready(busy)
+verdict("posted_reads_behind_queue", ok)
+RPATH = os.path.join(OUT, f"posted_race_gate_P{ndev}.h5")
+blk = full[:ndev]
+B0 = jax.make_array_from_callback(blk.shape, jax.sharding.NamedSharding(mesh, row_spec),
+                                  lambda idx: blk[idx])
+slow = jax.jit(lambda b, a: b + 0.0 * jnp.sum(_busy(a)).astype(b.dtype))
+with SlabIO(RPATH, mode="w", mesh=mesh) as wio:
+    wio.create_dataset("w", shape=blk.shape, dtype=np.complex128)
+    jax.block_until_ready(B0)
+    wio.write_slab("w", slow(B0, hx), offset=(0, 0, 0, 0))   # operand still being produced
+with SlabIO(RPATH, mode="r", mesh=mesh) as rio:
+    back = rio.read_slab("w", shape=blk.shape, offset=(0, 0, 0, 0), dtype=np.complex128,
+                         partition_spec=P(None, None, None, None))
+verdict("posted_write_behind_queue", np.array_equal(np.asarray(back.addressable_shards[0].data), blk))
 from ffi.common import ffi_loader
 from ffi.io import _platform_for_mesh
 pending = ffi_loader.phdf5_pending_controls(platform=_platform_for_mesh(mesh))

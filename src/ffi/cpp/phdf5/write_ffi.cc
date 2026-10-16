@@ -701,12 +701,26 @@ static ffi::Future WriteDispatchImpl(
     // 2026-04-18, likely an interaction with the cuda_async
     // stream-ordered allocator).  Using a single ctx-owned event
     // reused across writes avoids the per-call destroy entirely; the
-    // event is destroyed once in close_ctx.  Correctness: Python's
-    // ``A.block_until_ready()`` on the main thread before enqueue
-    // ensures A's device storage is finalised before we read it; the
+    // event is destroyed once in close_ctx.  Correctness: the order_event fence
+    // below puts the D2H behind A's producer on xla_stream (device side); the
     // Python worker serialises writes so by the time the next
     // handler runs, the previous H5Dwrite has already consumed
     // pinned_buf.
+    // ABI 7: the D2H must follow A's producer on xla_stream.  Until ABI 6
+    // the control copy-in's xla_stream sync ordered it (on the host); now a
+    // device-side fence does (ctx.h order_event), so the handler still
+    // returns without a host wait.
+    {
+        lrx::gpu::Error oe = lrx::gpu::event_record(ctx->order_event, xla_stream);
+        if (oe == lrx::gpu::kSuccess)
+            oe = lrx::gpu::stream_wait_event(ctx->stream, ctx->order_event, 0);
+        if (oe != lrx::gpu::kSuccess) {
+            std::ostringstream os;
+            os << "phdf5 write: " LRX_GPU_API "order fence failed: "
+               << lrx::gpu::error_string(oe);
+            return fail(ffi::ErrorCode::kInternal, os.str());
+        }
+    }
     lrx::gpu::Error ce = lrx::gpu::memcpy_async(src_buf, A.untyped_data(), bytes,
                                      lrx::gpu::kDeviceToHost, ctx->stream);
     if (ce != lrx::gpu::kSuccess) {

@@ -198,6 +198,12 @@ struct LORRAX_PHDF_CTX_TYPE {
     // the Python worker / writer thread.
     lrx::gpu::Event  d2h_event           = nullptr;
     lrx::gpu::Event  h2d_event           = nullptr;
+    // ABI 7 ordering fence: recorded on xla_stream and waited on by
+    // ``stream`` before every read H2D / write D2H, so the copy follows the
+    // work that produced its buffer (the donated destination's fill, the
+    // write operand).  Until ABI 6 the control copy-in's xla_stream sync did
+    // that as a side effect, on the host.  Device-side only: no host wait.
+    lrx::gpu::Event  order_event         = nullptr;
 #endif
 
     // ─── Async-write worker ─────────────────────────────────────────

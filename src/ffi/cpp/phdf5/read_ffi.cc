@@ -86,6 +86,11 @@ static inline ffi::Error stage_host_to_output(
     lrx::gpu::Stream xla_stream, PhdfCtx* ctx, const void* src,
     void* d_dst, size_t bytes)
 {
+    // ABI 7: the destination may be a donated buffer whose fill is still
+    // queued on xla_stream; the copy on ctx->stream must follow it (ctx.h
+    // order_event).  Device-side wait, no host sync.
+    LORRAX_GPU_CHECK(lrx::gpu::event_record(ctx->order_event, xla_stream));
+    LORRAX_GPU_CHECK(lrx::gpu::stream_wait_event(ctx->stream, ctx->order_event, 0));
     LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(d_dst, src, bytes,
                                       lrx::gpu::kHostToDevice, ctx->stream));
     LORRAX_GPU_CHECK(lrx::gpu::event_record(ctx->h2d_event, ctx->stream));
@@ -780,8 +785,11 @@ static ffi::Error ReadMultiDispatch(
     if (st < 0) {
         return fail(ffi::ErrorCode::kInternal, std::string(kWho) + ": H5Dread_multi failed");
     }
-    // Device-staging tail: N async copies, ONE event, ONE stream wait.
+    // Device-staging tail: N async copies, ONE event, ONE stream wait.  The
+    // copies follow the destinations' fills on xla_stream (ctx.h order_event).
 #if LRX_LEG_DEVICE
+    LORRAX_GPU_CHECK(lrx::gpu::event_record(ctx->order_event, xla_stream));
+    LORRAX_GPU_CHECK(lrx::gpu::stream_wait_event(ctx->stream, ctx->order_event, 0));
     for (size_t i = 0; i < n_out; ++i) {
         if (req[i].bytes == 0) continue;
         LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(req[i].dst, stage + req[i].stage_off,
