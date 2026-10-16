@@ -68,7 +68,8 @@ from tdagw.self_energy import SelfEnergyModel
 __all__ = ["METHODS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
            "place_operators", "place_kernel", "place_state", "make_conj_dev",
            "sample_plan", "chunk_plan", "initial_carry", "carry_to_host",
-           "carry_from_host", "coupling_radius", "magnus_dt_limit", "run_propagation"]
+           "carry_from_host", "coupling_radius", "magnus_dt_limit", "step_growth",
+           "run_propagation"]
 
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 #: Bootstrap: while the predictor history is incomplete (first steps) the
@@ -82,6 +83,16 @@ COUPLING_POWER_ITERATIONS = 20
 #: The step check takes h (MARGIN * sigma) <= the stability limit: the power
 #: iteration approaches sigma from below.
 STABILITY_MARGIN = 1.1
+#: The step probe of the stability check (:func:`step_growth`): steps, the step
+#: relative to the σ limit at which it measures, and the growth per step taken
+#: as unstable there.
+PROBE_STEPS = 48
+PROBE_STEP_FACTOR = 1.25
+PROBE_TOLERANCE = 2e-3
+#: dt = 'auto': from the σ limit, shrink by this factor until the probe passes,
+#: at most this many probes.
+PROBE_BACKTRACK = 0.85
+PROBE_BACKTRACKS = 8
 
 
 def dsigma_per_step(method: str, n_corr: int) -> int:
@@ -473,6 +484,61 @@ def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:
     nodes, _, _, hist, _ = _magnus_parts(cfg)
     y_lim = ti.magnus_stability_limit(nodes, hist, int(cfg.n_corr))
     return (np.inf if sigma <= 0.0 else y_lim / (STABILITY_MARGIN * sigma)), y_lim
+
+
+def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: float,
+                t0: float, n_steps: int = PROBE_STEPS, eps: float = 1e-14, seed: int = 1):
+    """Growth per step of a small coherence under the scheme's own step at h, field off.
+
+    The scheme-exact counterpart of :func:`coupling_radius`: from a random
+    Hermitian deviation (cv and vc blocks, logical k, largest entry ``eps``;
+    the deviation form keeps it exact, so the probe stays linear even where
+    the step is violently unstable) and a node history seeded from
+    independent ones (the predictor's parasitic roots start at full size),
+    ``n_steps`` steps of cfg's Magnus step past its bootstrap (predictor,
+    corrections, composition; E = 0) and
+    g = (|x_n| / |x_m|)^(1/(n - m)) over the second half (Frobenius norm).
+    It sees what the scalar recurrence leaves out: in the interaction picture
+    the coupling is time dependent, and a kernel's resonant-antiresonant
+    block rotates there at about the sum of two transition energies.  One
+    jitted call, h traced.  Returns (g, the norms after each step).
+    """
+    nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((1, nk_pad, nb, nb)) + 1j * rng.standard_normal((1, nk_pad, nb, nb))
+    f = np.real(np.diagonal(np.asarray(gather_to_host(ops.rho_eq)), axis1=-2, axis2=-1))
+    gap = (f[:, None, :] - f[:, :, None])[None]
+    w = np.asarray(gather_to_host(ops.w_k)) > 0.0
+    x = x * (np.abs(gap) > 0.5) * w[None, :, None, None]
+    x = 0.5 * (x + np.conj(np.swapaxes(x, -1, -2)))
+    scale = eps / np.max(np.abs(x))
+    n_hist, n_boot = len(_magnus_parts(cfg)[3]), _magnus_parts(cfg)[4]
+    xs = [x * scale]
+    for _ in range(n_hist):                       # independent seeds of the node history
+        y = rng.standard_normal(x.shape) + 1j * rng.standard_normal(x.shape)
+        y = y * (np.abs(gap) > 0.5) * w[None, :, None, None]
+        y = 0.5 * (y + np.conj(np.swapaxes(y, -1, -2)))
+        xs.append(y * (eps / np.max(np.abs(y))))
+    x0 = place_state(xs[0], mesh)
+    xh = place_state(np.concatenate(xs[1:], axis=0), mesh)
+    off = lambda t: jnp.zeros((1, 3))                                  # the field is off
+
+    def run(x0, xh, ops, mparams, h):
+        ph = _physics(ops, mparams, model, off, mesh)
+        step, _, _ = _fixed_parts(cfg, ph)
+        hist = jnp.stack([ph["dsig_dev"](t0, xh[j:j + 1]) for j in range(n_hist)])
+        carry = (x0, hist, jnp.int32(n_boot))     # past the bootstrap: the predictor acts at once
+
+        def body(c, i):
+            t = t0 + i * h
+            c, _ = step(t, c, h, t + h)
+            return c, jnp.sqrt(jnp.sum(jnp.abs(c[0]) ** 2))
+        return jax.lax.scan(body, carry, jnp.arange(int(n_steps)), unroll=1)[1]
+
+    norms = np.asarray(gather_to_host(jax.jit(run)(x0, xh, ops, model.params, jnp.asarray(float(h)))))
+    m = int(n_steps) // 2
+    g = float((norms[-1] / norms[m - 1]) ** (1.0 / (int(n_steps) - m)))
+    return g, norms
 
 
 # ---------------------------------------------------------------------------

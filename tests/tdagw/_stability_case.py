@@ -5,10 +5,13 @@
 
 The fixture's TDA kernel is scaled by SCALE (a strong coupling, the shape of
 the 30x30 42v x 14c model's).  Prints one JSON line: sigma from the power
-iteration and from the dense spectrum of L, the gate's dt_max, the outcome
-of cfm4 runs at 2 dt_max (expect the refusal) and dt_max / 2 (expect a
-run), dt = 'auto', and the same 2 dt_max run with the gate bypassed (the
-red twin: max |P| against the stable run's).
+iteration and from the dense spectrum of L, the sigma limit dt_max, the
+plain step's probe growth at dt_max / 2 and 2 dt_max beside the
+recurrence's (no composition: the step the recurrence models), the
+outcome of cfm4 runs at 2 dt_max (the sigma test refuses), at dt_max (the
+probe at 1.25 dt_max refuses), at dt_max / 2 (runs) and dt = 'auto', and
+the same 2 dt_max run with the gate bypassed (the red twin: max |P| against
+the stable run's).
 """
 import copy
 import json
@@ -61,11 +64,11 @@ def main():
             st = stages.propagate(deck, system, model, efield_function(deck.trials), outs,
                                   mesh, say=lambda s: None)
         except ValueError as exc:
-            return dict(refused=str(exc).split(":")[0])
+            return dict(refused=str(exc).split(":")[0], message=str(exc))
         with h5py.File(outs.paths[0], "r") as f:
             p = f["tdgw_data/time_domain/polarization/data"][()]
         return dict(dt_as=st["dt"] * T_IN_ATTOSEC, max_p=float(np.max(np.abs(p))),
-                    finite=bool(np.all(np.isfinite(p))))
+                    finite=bool(np.all(np.isfinite(p))), probes=st["check_probes"])
 
     deck, system, model = build(1.0, "probe")
     sigma, est = tp.coupling_radius(None, system.ops, model, efield_function(deck.trials),
@@ -79,9 +82,17 @@ def main():
     exact = float(np.max(np.abs(np.linalg.eigvals(km))))    # TDA: L = -i K on the cv block
     cfg = tp.PropagatorConfig("cfm4", 0.0, 1.0, 1.0, 1.0, 2, 1e-6, 1e-6, np.inf, 10, True)
     dt_max = tp.magnus_dt_limit(cfg, sigma)[0] * T_IN_ATTOSEC
+    from solvers import time_integrators as ti
+    probe = {}
+    for f in (0.5, 2.0):                    # the plain step's growth against the recurrence's
+        h = f * dt_max / T_IN_ATTOSEC
+        g, _ = tp.step_growth(cfg._replace(dt=h, remainder=False), system.ops, model, mesh,
+                              h=h, t0=0.0)
+        probe[str(f)] = dict(growth=g, recurrence=ti.magnus_growth(
+            ti.CFM4_NODES, ti.CFM4_HISTORY, 2, sigma * h))
     out = dict(sigma_ev=sigma * HA_IN_EV, exact_ev=exact * HA_IN_EV, dt_max_as=dt_max,
-               over=run(2.0 * dt_max, "over"), under=run(0.5 * dt_max, "under"),
-               auto=run("auto", "auto"))
+               probe=probe, over=run(2.0 * dt_max, "over"), at_limit=run(0.999 * dt_max, "at_limit"),
+               under=run(0.5 * dt_max, "under"), auto=run("auto", "auto"))
     tp.magnus_dt_limit = lambda cfg, sigma: (np.inf, 0.0)    # the twin: no gate
     out["over_ungated"] = run(2.0 * dt_max, "over_ungated")
     print("RESULT " + json.dumps(out), flush=True)

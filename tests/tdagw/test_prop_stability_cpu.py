@@ -5,8 +5,9 @@ the deviation, is the recurrence ``time_integrators.magnus_amplification``;
 on the imaginary axis it is stable for h sigma below
 ``magnus_stability_limit``, sigma the spectral radius of the coupling map
 L(x) = -i [dSigma[x], rho_eq] (``propagate.coupling_radius``, a power
-iteration on the model).  The run refuses a step above the limit
-(``td_magnus_stability``) or picks one (``dt = 'auto'``).
+iteration on the model).  The run refuses a step above the limit, or one
+whose probe at 1.25 dt grows (``td_magnus_stability``), or picks one
+(``dt = 'auto'``).
 
 G1 the recurrence's spectral radius equals the growth per step of a mode of
    the real ip_magnus_step on a 2-level TDA toy to 1e-3 (cubic and linear
@@ -14,8 +15,14 @@ G1 the recurrence's spectral radius equals the growth per step of a mode of
    strongly unstable cases whose dominant root is clear)
 R1 the recurrence with the predictor dropped (zero history) misses it
 G2 on the TDGW fixture with its kernel scaled x40: the power iteration's
-   sigma is within 2 % below the dense spectrum's; cfm4 at 2 dt_max refuses,
-   at dt_max / 2 runs bounded, 'auto' runs at a dt <= dt_max
+   sigma is within 2 % below the dense spectrum's; cfm4 at 2 dt_max refuses
+   (the sigma test), at dt_max / 2 runs bounded, 'auto' runs at a dt <=
+   dt_max whose probe passed
+G3 the step probe (the scheme's own step, field off, from a random
+   coherence; ``propagate.step_growth``) of the plain step stays at 1 at
+   dt_max / 2 and grows at 2 dt_max; at dt_max itself the probe at 1.25 dt_max
+   grows, so the gate refuses dt_max although the sigma test passes it (on
+   the 30x30 df714 CrI3 model the real limit lies below the static one)
 R2 the 2 dt_max run with the gate bypassed is unbounded over 5 fs (|P|
    grows past 100x the stable run's or overflows): the refusal is a real
    instability
@@ -128,12 +135,31 @@ def test_power_iteration_finds_the_radius(gate):
 
 
 def test_gate_refuses_above_and_runs_below(gate):
-    assert gate["over"].get("refused") == "GATE td_magnus_stability", gate["over"]
+    o = gate["over"]
+    assert o.get("refused") == "GATE td_magnus_stability" and "h*sigma" in o["message"], o
     u = gate["under"]
     assert u.get("finite") and "refused" not in u, u
     a = gate["auto"]
     assert a.get("finite") and a["dt_as"] <= gate["dt_max_as"], a
+    assert a["probes"] and a["probes"][-1]["growth"] <= 1.0 + 2e-3, a
     assert abs(a["max_p"] - u["max_p"]) <= 1e-2 * u["max_p"], (a, u)
+
+
+def test_probe_refuses_the_static_limit(gate):
+    """At dt_max the scheme's own step at 1.25 dt_max grows: the probe refuses it."""
+    r = gate["at_limit"]
+    assert r.get("refused") == "GATE td_magnus_stability", r
+    assert "passes the sigma limit" in r["message"], r
+
+
+def test_probe_tracks_the_recurrence(gate):
+    """Field off, from a random coherence, the plain step: bounded at dt_max / 2, growing at
+    2 dt_max.  Not equal to the recurrence's growth: with several transition energies the
+    coupling is time dependent in the interaction picture even for a TDA kernel (the
+    recurrence is exact for one pair, G1), which is why the gate measures the step."""
+    lo, hi = gate["probe"]["0.5"], gate["probe"]["2.0"]
+    assert abs(lo["growth"] - 1.0) <= 2e-3, lo
+    assert hi["growth"] > 1.1 and hi["recurrence"] > 1.1, hi
 
 
 def test_red_twin_ungated_step_is_unstable(gate):

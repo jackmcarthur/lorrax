@@ -53,7 +53,7 @@ __all__ = [
     "CFM4_NODES", "CFM4_WEIGHTS", "CFM4_HISTORY", "MIDPOINT_NODES", "MIDPOINT_HISTORY",
     "CF4_QUADRATURE", "TRIPLE_JUMP",
     "ip_cf4_flow", "ip_midpoint_flow", "ip_magnus_step", "frozen_generator",
-    "magnus_amplification", "magnus_stability_limit",
+    "magnus_amplification", "magnus_stability_limit", "magnus_growth",
     "compose_strang", "fixed_advance",
 ]
 
@@ -658,15 +658,19 @@ def magnus_stability_limit(nodes, history, n_corr: int, *, growth: float = 1e-6,
     quadratic predictor 0.126 at 2.  Not monotone in the corrections: the
     truncated fixed-point (Picard) iteration of a collocation is unstable on
     the imaginary axis at some truncation orders, as explicit RK of order 1
-    and 2 are.  ``tests/tdagw/test_prop_integrators_cpu.py`` checks the
+    and 2 are.  ``tests/tdagw/test_prop_stability_cpu.py`` checks the
     recurrence against the growth of the real step.
     """
     for y in np.arange(dy, y_cap + 0.5 * dy, dy):
-        rho = np.max(np.abs(np.linalg.eigvals(
-            magnus_amplification(nodes, history, n_corr, 1j * y))))
-        if rho > 1.0 + growth:
+        if magnus_growth(nodes, history, n_corr, y) > 1.0 + growth:
             return float(y - dy)
     return float(y_cap)
+
+
+def magnus_growth(nodes, history, n_corr: int, y: float) -> float:
+    """Growth per step of the recurrence at z = i y: the spectral radius of magnus_amplification."""
+    return float(np.max(np.abs(np.linalg.eigvals(
+        magnus_amplification(nodes, history, n_corr, 1j * float(y))))))
 
 
 # ---------------------------------------------------------------------------

@@ -358,34 +358,74 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
                        auto: bool, say):
     """The corrected Magnus step limit on this model: refuse, or pick dt for 'auto'.
 
-    σ = :func:`tdagw.propagate.coupling_radius` (power iteration on the
-    model), dt_max = :func:`tdagw.propagate.magnus_dt_limit`.  ``auto``
-    takes dt = dt_max floored to 0.01 as (magnus2: dt_measure / n, its
-    samples stay on steps); otherwise a dt above dt_max refuses with the
-    limits of the other choices.  Returns (cfg with dt, the receipt dict).
+    Two tests on the model itself.  (1) σ = :func:`tdagw.propagate.coupling_radius`
+    (power iteration) and the scalar recurrence's limit dt_σ =
+    :func:`tdagw.propagate.magnus_dt_limit`: a step above it refuses.  (2) The
+    scheme's own step, field off, from a random coherence
+    (:func:`tdagw.propagate.step_growth`) at PROBE_STEP_FACTOR × dt must not grow
+    (g <= 1 + PROBE_TOLERANCE): an accepted step lies a measured 25 % below the
+    instability.  The recurrence treats the coupling as static; in the
+    interaction picture it is not, and on the 30x30 df714 CrI3 model the real
+    limit lies below dt_σ (above it on the 6x6 2v2c one).  'auto' starts at
+    dt_σ and backtracks by PROBE_BACKTRACK until the probe passes (floored to
+    0.01 as; magnus2: dt_measure / n).  Returns (cfg with dt, the receipt).
     """
     T = tdgw_io.T_IN_ATTOSEC
     sigma, est = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0)
-    dt_max, y_lim = tp.magnus_dt_limit(cfg, sigma)
-    if auto:
-        dt_as = np.floor(dt_max * T * 100.0) / 100.0
+    dt_sig, y_lim = tp.magnus_dt_limit(cfg, sigma)
+    probes = []
+
+    def snap(dt):
+        dt_as = np.floor(dt * T * 100.0) / 100.0
         if cfg.method == "magnus2":
             dt_as = cfg.dt_measure * T / np.ceil(cfg.dt_measure / (dt_as / T) - 1e-9)
-        cfg = cfg._replace(dt=float(dt_as) / T)
+        return float(dt_as) / T
+
+    def probe(dt):
+        h = tp.PROBE_STEP_FACTOR * dt
+        g = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0)[0]
+        probes.append(dict(dt_as=dt * T, probe_dt_as=h * T, growth=g))
+        return g <= 1.0 + tp.PROBE_TOLERANCE
+
+    if not np.isfinite(dt_sig):                       # no coupling: any step is stable
+        if auto:
+            cfg = cfg._replace(dt=cfg.dt_measure)
+        stable = True
+    elif auto:
+        dt = snap(dt_sig)
+        for _ in range(tp.PROBE_BACKTRACKS):
+            if probe(dt):
+                break
+            dt = snap(tp.PROBE_BACKTRACK * dt)
+        else:
+            raise ValueError(
+                f"GATE td_magnus_stability: got: no step down to {probes[-1]['dt_as']:.4g} as "
+                f"whose probe at {tp.PROBE_STEP_FACTOR} dt stays bounded (growth "
+                f"{probes[-1]['growth']:.4g} per step); want: a step the scheme is stable at "
+                f"with a 25 % margin; why: a mode of the coupling grows from rounding, "
+                f"independent of the drive; fix: set [lorrax] dt explicitly, more corrections, "
+                f"or method = 'etdrk4' / 'dp54'")
+        cfg = cfg._replace(dt=dt)
+        stable = True
+    else:
+        stable = cfg.dt <= dt_sig and probe(cfg.dt)
     receipt = dict(sigma_ev=sigma * tdgw_io.HA_IN_EV, y=cfg.dt * sigma, y_lim=y_lim,
-                   dt_max_as=dt_max * T, change=float(abs(est[-1] - est[-2]) / est[-1]))
+                   dt_max_as=dt_sig * T, change=float(abs(est[-1] - est[-2]) / est[-1]),
+                   probes=probes)
+    pr = "; ".join(f"{q['growth']:.4g} per step at {q['probe_dt_as']:.4g} as" for q in probes)
     say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius of the "
         f"dSigma commutator map, {len(est)} power iterations, last change "
         f"{100 * receipt['change']:.2g} %), h*sigma = {receipt['y']:.3g}, limit {y_lim:.3g} "
         f"({cfg.method}, {cfg.predictor} predictor, n_corr {cfg.n_corr}) -> dt <= "
-        f"{receipt['dt_max_as']:.4g} as" + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
-    if not auto and cfg.dt > dt_max:
+        f"{receipt['dt_max_as']:.4g} as" + (f"; probe {pr}" if probes else "")
+        + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
+    if not stable and cfg.dt > dt_sig:
         alts = []
-        for nc, pr in ((cfg.n_corr + 1, cfg.predictor), (cfg.n_corr, "linear")):
-            if pr == "linear" and cfg.method != "cfm4":
+        for nc, pre in ((cfg.n_corr + 1, cfg.predictor), (cfg.n_corr, "linear")):
+            if pre == "linear" and cfg.method != "cfm4":
                 continue
-            d, _ = tp.magnus_dt_limit(cfg._replace(n_corr=nc, predictor=pr), sigma)
-            alts.append(f"n_corr = {nc}, predictor = {pr!r}: dt <= {d * T:.4g} as")
+            d, _ = tp.magnus_dt_limit(cfg._replace(n_corr=nc, predictor=pre), sigma)
+            alts.append(f"n_corr = {nc}, predictor = {pre!r}: dt <= {d * T:.4g} as")
         raise ValueError(
             f"GATE td_magnus_stability: got: dt = {cfg.dt * T:.4g} as, h*sigma = "
             f"{receipt['y']:.3g} with sigma = {receipt['sigma_ev']:.4g} eV (the spectral radius "
@@ -393,8 +433,20 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
             f"{tp.STABILITY_MARGIN} <= {y_lim:.3g}, the imaginary-axis stability limit of "
             f"{cfg.method} with the {cfg.predictor} predictor and n_corr = {cfg.n_corr}; why: "
             f"a mode of the coupling grows from rounding, independent of the drive; fix: "
-            f"[lorrax] dt <= {receipt['dt_max_as']:.4g} as, or dt = 'auto', or "
+            f"[lorrax] dt = 'auto', or dt <= {receipt['dt_max_as']:.4g} as subject to the probe, or "
             + "; ".join(alts) + ", or method = 'etdrk4' / 'dp54'")
+    if not stable:
+        q = probes[-1]
+        raise ValueError(
+            f"GATE td_magnus_stability: got: dt = {cfg.dt * T:.4g} as passes the sigma limit "
+            f"({receipt['dt_max_as']:.4g} as) but the scheme's own step at "
+            f"{tp.PROBE_STEP_FACTOR} dt = {q['probe_dt_as']:.4g} as grows by {q['growth']:.4g} "
+            f"per step on this model (field off, {tp.PROBE_STEPS} steps from a random "
+            f"coherence); want: growth <= {1.0 + tp.PROBE_TOLERANCE:.4g} at {tp.PROBE_STEP_FACTOR} "
+            f"dt, a 25 % margin; why: in the interaction picture the coupling is time dependent, "
+            f"so the static limit can overestimate the stable step, and a mode grows from "
+            f"rounding independent of the drive; fix: [lorrax] dt = 'auto' (the largest step "
+            f"that passes), a smaller dt, or method = 'etdrk4' / 'dp54'")
     return cfg, receipt
 
 
@@ -451,7 +503,10 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             system.ops, model, drive, mesh, cell_volume=system.cell_volume,
             nspinor=system.nspinor, count=count, mtsteps=outs.mtsteps,
             on_chunk=on_chunk, resume=resume)
-    stats["check_dsigma"] = 0 if check is None else 2 * tp.COUPLING_POWER_ITERATIONS
+    stats["check_dsigma"] = 0 if check is None else (
+        2 * tp.COUPLING_POWER_ITERATIONS + len(check["probes"]) * tp.PROBE_STEPS
+        * tp.dsigma_per_step(cfg.method, cfg.n_corr))
+    stats["check_probes"] = [] if check is None else check["probes"]
     stats["dt"] = cfg.dt
     stats["wall"] = time.perf_counter() - t_start
     stats["wall_first_chunk"] = (walls[0] - t_start) if walls else 0.0
