@@ -867,8 +867,21 @@ MEMORY_MARGIN = 1.2
 
 
 def outside_pool_allowance_bytes(linalg: str = "local") -> float:
-    """``O`` for the deck's resolved ``linalg`` (``local`` or ``distributed``)."""
-    return OUTSIDE_POOL_BYTES + (DISTRIBUTED_LINALG_OUTSIDE_BYTES
+    """``O`` for the deck's resolved ``linalg`` (``local`` or ``distributed``).
+
+    The ``local`` term is the device leg's ``outside_pool_bytes`` (:data:`lxkit.LEGS`)
+    where it declares one, else :data:`OUTSIDE_POOL_BYTES`; read before any backend
+    exists, the same on every rank."""
+    base = OUTSIDE_POOL_BYTES
+    leg = None
+    if os.environ.get("JAX_PLATFORMS", "").split(",")[0] != "cpu":   # a forced-CPU process: default O
+        try:
+            leg = _gpu_leg()
+        except Exception:                                     # noqa: BLE001
+            leg = None      # no GPU plugin installed: a CPU process, the default O
+    if leg is not None and getattr(leg, "outside_pool_bytes", None) is not None:
+        base = float(leg.outside_pool_bytes)
+    return base + (DISTRIBUTED_LINALG_OUTSIDE_BYTES
                                  if linalg == "distributed" else 0.0)
 
 

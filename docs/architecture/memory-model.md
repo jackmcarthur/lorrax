@@ -71,7 +71,7 @@ B = (M − 1.2·O) / (1 + 1.2·φ)     the planner budget   (runtime.planner_bud
 R = M − 1.2·O_max                 the pool's reservation (runtime.pool_reservation_bytes, :797; runtime.pool_fraction = R/M)
 ```
 
-`O` is 3 GB (`OUTSIDE_POOL_BYTES`), plus 3 GB under `linalg = distributed`
+`O` is 3 GB (`OUTSIDE_POOL_BYTES`; a device leg may declare its own, `PlatformLeg.outside_pool_bytes`: 4.1 GB on ROCm, where ROCr keeps reclaimed-off scratch outside the arena, see the ROCm arena paragraph below), plus 3 GB under `linalg = distributed`
 for the cuSOLVERMp/cuBLASMp contexts, their communicators and workspace
 (`DISTRIBUTED_LINALG_OUTSIDE_BYTES`; `O_max` = 6 GB). `φ` = 0.19
 (`POOL_OVERSHOOT`, `:802`) is the fraction by which the pool's in-use bytes
@@ -238,11 +238,15 @@ and 15.1 GB on A100-80GB for these two terms.
 CUDA ([environment § GPU pool](../environment/overview.md#gpu-pool)); the
 allocator is the device leg's declaration (`PlatformLeg.xla_allocator`), and
 the ROCm leg declares BFC (`cuda_async` does not exist there), preallocated at
-`R` like the CUDA pool: 61.50 of 68.70 GB on an MI250X GCD instead of jaxlib's
+`R` like the CUDA pool: 60.18 of 68.70 GB (61.50 GB before the leg's O of 4.1 GB) on an MI250X GCD instead of jaxlib's
 75 % (51.53 GB), so the planner budget (41.96 -> 50.08 GB on hsuite) fits in
 the arena. Outside it, after RCCL start-up, 512 MiB collectives, a 3D FFT and a
 GEMM, each P4 rank held 0.99-1.08 GB of the 7.20 GB left (hipMemGetInfo minus
-the arena's `pool_bytes`, `runtime.xla_memory.outside_pool_bytes`). The hipFFT
+the arena's `pool_bytes`, `runtime.xla_memory.outside_pool_bytes`). With `HSA_NO_SCRATCH_RECLAIM=1` (the leg's runtime env) ROCr keeps each
+queue's largest scratch allocation: the bytes outside the arena, sampled
+every 0.25 s through whole runs, peaked at 4.07 GB per P4 rank in hsuite kmeans
+(2.71 GB with reclaim) and 3.30 GB on Fe V2 (2.13 GB), so the leg declares
+`outside_pool_bytes` = 4.1 GB. The hipFFT
 plan workspace is inside the arena and priced like cuFFT's
 (`PlatformLeg.fft_plan_scratch`, `runtime.aot_memory`). The
 alternatives jaxlib offers were measured on CrI3 6×6 bispinor SC maps 0–2
