@@ -90,6 +90,23 @@ TD-aGW spectrum and the full (non-TDA) BSE share their poles once $V$ carries
 no head. Step 4 is the BSE exchange term with $V_{q0}$ factored through
 $\tilde\zeta_0(\mathbf G)$; no $N_\mu^2$ Coulomb tile is formed.
 
+## Loading a model
+
+`tdagw.model.load_td_model(deck, mesh, bands=(b_lo, b_hi))` reads W (with its
+q = 0 head) and, by default, ψ through the BSE restart loader
+(`bse_loading.load_bse_data_from_restart_sharded`), so a deck with
+`bse_k_grid` delivers the densified ψ and W. ψ come instead from TDGW's WFN
+with `wfn_file`. The Hartree operator always comes from the q = 0 row of
+`zeta_q.h5`. Four options are off by default, and with all of them off the
+loader call is the earlier one:
+
+| option | effect |
+|---|---|
+| `eqp_file` | the BSE run's `--eqp`. On a `bse_k_grid` deck it enters the htransform, so the fine ψ are the quasiparticle f(H) states of a `bse_jax --eqp` run on that deck and the fine ε are QP. On a coarse deck ψ do not change and the file only sets the window energies |
+| `velocity_file` | the coarse `dipole.h5` (`--dipole`), carried through the htransform; read on the densified route only, refused elsewhere and by a loader that has no velocity |
+| `velocity_full_window` | the velocity over every window pair (vv', cc' and cv); refused until the loader offers it |
+| `keep_window` | `model["window"]`: the loader's ε (Ry, window ascending), `n_occ`, `n_val`, `n_cond`, dipoles and where the energies came from; on a coarse deck with `eqp_file` the ε are re-sliced as `bse_jax --eqp` does them |
+
 ## Units, normalization and the TDGW kernel file
 
 LORRAX works in Ry. $\psi(\mathbf r_\mu)$ is sampled exactly as the GW run
