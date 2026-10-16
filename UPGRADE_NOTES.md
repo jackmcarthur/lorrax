@@ -5,6 +5,35 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-16 — `bse_k_grid` dipoles: the deck WFN's velocity through the densifying htransform
+
+`bse_jax --write-eigs --dipole` and `absorption_haydock` sliced a `dipole.h5`
+onto a `bse_k_grid` bundle. The deck WFN's file has the coarse k list and
+failed on its shape (Haydock at trace, `bse_jax` after its eigensolve); a fine
+WFN's `dipole.h5` has the bundle's nk in that loader's own band gauge and
+contracted silently wrong (MoS₂ 9×9→12×12 SR/LR: ε₂ 18 % rms of the direct
+12×12 peak, bright A partners 29.7 and 25.4 bohr² against 45.6). The densifier
+now carries the deck WFN's velocity through the same htransform and contracts
+it with the same fine eigenvectors that build ψ
+(`bse.bse_densify.densified_dipoles`); the transition energies are the
+velocity's own DFT energies there.
+
+- **Commands.** Under `bse_k_grid`, `--dipole` names the deck (coarse) WFN's
+  `dipole.h5`, with at least the htransform window's bands. No fine NSCF is
+  needed for dipoles. Any other WFN's file refuses
+  (`GATE velocity_wfn_fingerprint`); on an undensified run a file from
+  another k grid refuses (`GATE dipole_k_grid`).
+- **Results.** MoS₂ 9×9→12×12 against the direct 12×12 run: ε₂ rms 2.01 %
+  (SR/LR) and 3.92 % (c1) of its peak; bright A pair |d|² 47.4 and 47.3,
+  B pair 53.0 and 52.7 bohr², against 45.6 and 53.1 (partners within 0.6 %;
+  the densified pairs are split by up to 0.6 meV). Without `--eqp` the window
+  dipoles match the fine NSCF's own to 6e-6 at shared k and 0.8 % rms
+  (Frobenius norm per k) off them. Densified eigenvalues are unchanged, and
+  runs without `bse_k_grid` are bit-identical.
+- **Outputs.** A densified run's `exciton_data/dipoles` (`eigenvectors.h5`)
+  and Haydock h5 metadata name the dipole route, its source file and the
+  on-grid identity.
+
 ## 2026-10-16 — `bse_k_grid` with `--eqp`: the QP energies enter the htransform
 
 `bse_jax` and `absorption_haydock` re-sliced the coarse restart's QP energies
