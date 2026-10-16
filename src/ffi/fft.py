@@ -13,10 +13,11 @@ environment variable (``docs/architecture/decisions.md#xla-reference``):
            products and spin sums in XLA) with the host FFTW3-ABI flat-k
            transforms and fused Σ convolution (``cpp/fftw/``).  Kept because it
            is 3.8-7.4x faster than ``jnp.fft`` at a CrI3 rank tile.
-    ROCM   the XLA backend, except the k-leading pair (make_local_kconv_klead,
-           make_local_kfft_klead), which takes the kdft family: a direct DFT of
-           each column tile in LDS, hipRTC-built per k-grid (``cpp/kdft/``,
-           :data:`_ROCM_KLEAD_TARGETS`).  ``kconv_backend`` stays ``'xla'``.
+    ROCM   the XLA backend, except the factories with a kdft row: the k-leading
+           and k-minor pairs (:data:`_ROCM_KLEAD_TARGETS`), the k-box modes 7/9/11
+           (:data:`_ROCM_KBOX_TARGETS`) and the BSE outer load and fused decode
+           (:data:`_ROCM_OUTER_TARGETS`), hipRTC-built per k-grid (``cpp/kdft/``).
+           ``kconv_backend`` stays ``'xla'``; each factory announces its route once.
     other  the XLA backend: the same composition with XLA's own k-axis
            transforms (:func:`_kfft`: one dense DFT GEMM on the k axis in place
            for a grid of at most the leg's ``xla_kdft_max_nk`` points,
@@ -250,6 +251,42 @@ KDFT_KBOX_CHI_SINGLE_MIN_LINES = 96
 #: (n_s 1, 2; pool log kboxsplit_bench3) and >= 1.12x up to 24x24x1.  A router rule, not a kernel
 #: limit; 3-D grids to axis 40 measured >= 1.10x.
 KDFT_KBOX_CHI_2D_AXIS_MAX = 24
+#: The ROCM leg's outer-product pair (cpp/kdft/kconv_outer_rocm_ffi.cc, the port of
+#: cpp/cufft/kconv_outer_cuda_ffi.cc): the BSE W term's T formed on the load (U and the fused decode's
+#: A), the operands and layouts of KCONV_KLEAD_OUTER_TARGET (K unpadded) and, for the decode, Pc as
+#: the BSE holds it (no fragment tiling).  Rules: :func:`kdft_outer_refusal`,
+#: :func:`kdft_outer_decode_refusal`.
+KDFT_KCONV_KLEAD_OUTER_TARGET = "lorrax_kdft_kconv_klead_outer"
+KDFT_KCONV_KLEAD_OUTER_DECODE_TARGET = "lorrax_kdft_kconv_klead_outer_decode"
+_ROCM_OUTER_TARGETS = {"kconv_klead_outer": KDFT_KCONV_KLEAD_OUTER_TARGET,
+                       "kconv_klead_outer_decode": KDFT_KCONV_KLEAD_OUTER_DECODE_TARGET}
+#: The outer kernels' axis bound (kconv_outer_rocm_ffi.cc kAxisMax): the stage's direct-DFT line.
+KDFT_OUTER_AXIS_MAX = 40
+#: The fused decode's accumulators per thread (kconv_outer_rocm_ffi.cc kAccMax, complex).
+KDFT_OUTER_ACC_MAX = 32
+# Measured routing (one MI250X GCD, c128, per call, native vs the unfused chain it replaces: the XLA
+# encode einsum + kdft mode 2 [+ the XLA decode einsum]; pool logs kcv_bench1 / kcv_sweep1, 512 threads):
+#   shape (k-grid na mx nb my K nc)       U before -> native ms (x)     A before -> native ms (x)
+#   5x5x1  2  96 2  96 8  8 (8x8 box)     0.114 ->  0.084 (1.37)        0.145 ->  0.422 (0.34)
+#   4x4x4  2 156 2 156 8  8 (2x8 box)     0.492 ->  0.459 (1.07)        0.640 ->  1.067 (0.60)
+#   8x8x1  2 362 2 362 8 14 (2x8 box)     2.371 ->  2.697 (0.88)        2.941 ->  8.188 (0.36)
+#   8x8x1  2 724 2 724 8 14 (2x8 box)     8.082 -> 10.929 (0.74)       11.263 -> 33.886 (0.33)
+# The load is L2-bound where 64 KiB of LDS caps the box below the CUDA kernel's 8 x 8 (the R leg is
+# re-read per x block), and the decode adds a sequential per-pair contraction; so the router sends
+# the outer load to kdft only where the 8 x 8 box fits half the LDS (GATE kdft-kconv-outer-box) and
+# keeps the XLA decode (GATE kdft-kconv-outer-decode-slower).  LORRAX_KDFT_OUTER=all (the gate's and
+# the bench's A/B) routes both wherever the kernels fit.
+KDFT_OUTER_BOX_COLS = 64
+
+
+def _kdft_outer_all() -> bool:
+    """``LORRAX_KDFT_OUTER``: unset or ``measured`` (the measured rule), ``all`` (every grid the
+    kernels fit: the gate's and the bench's A/B).  Anything else refuses."""
+    import os
+    v = os.environ.get("LORRAX_KDFT_OUTER", "measured").strip().lower() or "measured"
+    if v not in ("measured", "all"):
+        raise ValueError(f"LORRAX_KDFT_OUTER={v!r}: want 'measured' (default) or 'all'")
+    return v == "all"
 
 def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
     """Total scale matching jnp.fft's norm conventions exactly:
@@ -473,6 +510,7 @@ def rocm_klead_target(mesh: Mesh, kgrid, factory: str) -> str | None:
             import warnings
             warnings.warn(msg, RuntimeWarning, stacklevel=3)
         return None
+    _note_rocm_target(target)
     return target
 
 
@@ -637,7 +675,99 @@ def rocm_kbox_target(mesh: Mesh, kgrid, factory: str, ns: int, nsr: int | None =
             import warnings
             warnings.warn(msg, RuntimeWarning, stacklevel=3)
         return None
+    _note_rocm_target(target)
     return target
+
+
+def kdft_outer_tile(kgrid, lds: int = KDFT_KBOX_LDS) -> tuple[int, int]:
+    """``(xb, yb)`` of the ROCM outer load's tile on ``kgrid`` (``(0, 0)`` when none fits), the mirror
+    of ``plan_tile`` in cpp/kdft/kconv_outer_rocm_ffi.cc: the largest XB x YB box (YB = 8 with XB = 8,
+    4, 2, 1, then YB = 4, 2, 1 at XB = 1) of padded c128 columns within half a block's LDS, else
+    within all of it (the CUDA kernel's 8 x 8 bank where it fits)."""
+    nx, ny, nz = (int(v) for v in kgrid)
+    col = 16 * ((nx * ny * (nz | 1)) | 1)
+    for budget in (lds // 2, lds):
+        for yb, xb in ((8, 8), (8, 4), (8, 2), (8, 1), (4, 1), (2, 1), (1, 1)):
+            if xb * yb * col <= budget:
+                return xb, yb
+    return 0, 0
+
+
+def kdft_outer_refusal(kgrid, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM outer load cannot serve ``kgrid`` (\"\" when it can): an axis beyond
+    :data:`KDFT_OUTER_AXIS_MAX`, no tile (:func:`kdft_outer_tile`) in a block's LDS, or (the measured
+    rule, outside ``LORRAX_KDFT_OUTER=all``) an 8 x 8 box beyond half the LDS."""
+    kg = tuple(int(v) for v in kgrid)
+    if max(kg) > KDFT_OUTER_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_OUTER_AXIS_MAX} "
+                "(the outer load's direct-DFT line transform)")
+    col = 16 * ((kg[0] * kg[1] * (kg[2] | 1)) | 1)
+    if kdft_outer_tile(kg, lds)[0] == 0:
+        return (f"GATE kdft-kconv-outer-tile: got k-grid {kg}, whose padded column needs "
+                f"{col} B; want it in a block's {lds // 1024} KiB of LDS")
+    if not _kdft_outer_all() and KDFT_OUTER_BOX_COLS * col > lds // 2:
+        return (f"GATE kdft-kconv-outer-box: got k-grid {kg}, whose 8 x 8 box needs {KDFT_OUTER_BOX_COLS * col} B; "
+                f"want it in half a block's LDS ({lds // 2048} KiB): a smaller box measured 0.74-1.07x the XLA "
+                "encode + kdft mode 2 (ffi.fft, kdft outer record; LORRAX_KDFT_OUTER=all overrides)")
+    return ""
+
+
+def kdft_outer_decode_refusal(kgrid, n_c: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """:func:`kdft_outer_refusal`, and the fused decode's accumulators: ``ceil(nk * n_c * yb / t)``
+    complex per thread at ``t`` = 512 threads (1024 when that exceeds half the bound) within
+    :data:`KDFT_OUTER_ACC_MAX` (the handler's GATE kdft-kconv-outer-decode-tile); outside
+    ``LORRAX_KDFT_OUTER=all``, ``GATE kdft-kconv-outer-decode-slower`` (the measured rule)."""
+    why = kdft_outer_refusal(kgrid, lds)
+    if why:
+        return why
+    kg = tuple(int(v) for v in kgrid)
+    cells = kg[0] * kg[1] * kg[2] * int(n_c) * kdft_outer_tile(kg, lds)[1]
+    threads = 512 if -(-cells // 512) <= KDFT_OUTER_ACC_MAX // 2 else 1024
+    acc = -(-cells // threads)
+    if acc > KDFT_OUTER_ACC_MAX:
+        return (f"GATE kdft-kconv-outer-decode-tile: got k-grid {kg} n_c={n_c}, {acc} decode accumulators "
+                f"per thread at {threads} threads; want <= {KDFT_OUTER_ACC_MAX}")
+    if not _kdft_outer_all():
+        return ("GATE kdft-kconv-outer-decode-slower: the fused decode measured 0.33-0.60x the outer load + "
+                "XLA decode einsum chain on MI250X (ffi.fft, kdft outer record); the XLA decode is kept "
+                "(LORRAX_KDFT_OUTER=all overrides)")
+    return ""
+
+
+def rocm_outer_target(mesh: Mesh, kgrid, factory: str, n_c: int | None = None) -> str | None:
+    """The ROCM outer target serving ``factory`` (``kconv_klead_outer`` or ``kconv_klead_outer_decode``,
+    the latter with ``n_c``) on this mesh, or ``None``: a ROCm mesh outside :func:`xla_reference`, kdft
+    not demoted, the handler in the loaded library, and the grid within the rule (else one warning
+    per grid: the caller keeps the unfused chain)."""
+    why = rocm_outer_refusal(mesh, kgrid, factory, n_c)
+    if why is None:
+        return None
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM {factory} -> XLA encode + kdft mode 2, not the outer load: {why}"
+        if announce_once(("kconv", "outer", factory, tuple(int(v) for v in kgrid), n_c), msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return None
+    target = _ROCM_OUTER_TARGETS[factory]
+    _note_rocm_target(target)
+    return target
+
+
+def rocm_outer_refusal(mesh: Mesh, kgrid, factory: str, n_c: int | None = None) -> str | None:
+    """``None`` off a ROCm mesh (or inside :func:`xla_reference`), \"\" when the ROCM outer target
+    serves ``factory`` here, else the reason it does not (no announcement)."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    if _KDFT_DOWN:
+        return _KDFT_DOWN[0]
+    from ffi.common import ffi_loader
+    target = _ROCM_OUTER_TARGETS[factory]
+    ok, why = ffi_loader.probe_target(target, "ROCM")
+    if not ok:
+        return f"no {target} handler ({why})"
+    return kdft_outer_decode_refusal(kgrid, n_c) if n_c is not None else kdft_outer_refusal(kgrid)
 
 
 _KBOX_PREBUILT: set = set()
@@ -1883,13 +2013,14 @@ def klead_outer_refusal(mesh: Mesh, kgrid, optin: int | None = None) -> str | No
 
     CUDA needs the handler in the loaded library and the load's 64-column k-box bank,
     ``64·16·((nx·ny·(nz|1))|1)`` B, within the opt-in shared memory per block (the handler's
-    GATE mathdx-kconv-outer-tile; ``optin`` defaults to the device's attribute).  An XLA-backend
-    mesh is always served.  Callers that get a reason keep the unfused encode +
+    GATE mathdx-kconv-outer-tile; ``optin`` defaults to the device's attribute).  ROCM needs the
+    kdft outer handler and :func:`kdft_outer_refusal`'s grid (:func:`rocm_outer_refusal`).  Any
+    other XLA-backend mesh, and every mesh inside :func:`xla_reference`, is always served.  Callers that get a reason keep the unfused encode +
     :func:`make_local_kconv_klead` chain and say so.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     if kconv_backend(mesh, kgrid) != "mathdx":
-        return None
+        return rocm_outer_refusal(mesh, kg, "kconv_klead_outer") or None
     from ffi.common import ffi_loader
     ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
     if not ok:
@@ -1913,7 +2044,9 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     outer-product load (``kconv_outer_cuda_ffi.cc``) forms T in shared memory on the fp64
     tensor cores and never stores it; the transforms, the kernel multiply and the scaled store
     are mathdx mode 2's.  Its K sum reproduces XLA's batched ZGEMM of the same contraction bit
-    for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), moveaxis(V_R, -1, 0))``.  ``conj_r`` (static)
+    for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), moveaxis(V_R, -1, 0))``.
+    ROCM: the port (``cpp/kdft/kconv_outer_rocm_ffi.cc``) on the k-box stage, the K sum on the FP64
+    FMA pipe (round-off class against the XLA chain; gate 1e-12), K unpadded.  ``conj_r`` (static)
     reads ``conj(R)`` instead (the BSE right leg is a conjugated wavefunction; reading it from
     the wavefunction avoids a conjugated copy, bit for bit the explicit ``conj``).  K is zero-padded
     to a multiple of 4 (the m8n8k4 chunk; exact).  The XLA backend: that composition in XLA.
@@ -1938,6 +2071,17 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
             return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(shape, l.dtype))(
                 l, r, v_r, conj_r=np.int64(bool(conj_r)), **attrs, **_mathdx_common())
         return _mathdx
+    target = rocm_outer_target(mesh, kg, "kconv_klead_outer")
+    if target is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), cubin_dir=cubin_cache_dir())
+
+        def _kdft(l, r, v_r, conj_r=False):
+            _check_complex(l, r, v_r)
+            shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
+            return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(shape, l.dtype))(
+                l, r, v_r, conj_r=np.int64(bool(conj_r)), **attrs)
+        return _kdft
     apply = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
 
     def _xla(l, r, v_r, conj_r=False):
@@ -1953,11 +2097,14 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
     banks, ``2·64·16·RS`` B, within the opt-in shared memory (the handler stages the V tile beside
     them when that fits too, else its Mid reads V from L2), and the per-lane accumulator
     ``ceil(nk/16)·ceil(n_c/8) <= 8`` m8n8 blocks (the handler's GATE mathdx-kconv-outer-decode-tile).
-    An XLA-backend mesh is always served.  Callers that get a reason keep the outer conv + XLA decode.
+    ROCM: the kdft decode handler and :func:`kdft_outer_decode_refusal`.  Any other XLA-backend mesh is
+    always served.  Callers that get a reason keep the outer conv + XLA decode.
     """
     why = klead_outer_refusal(mesh, kgrid, optin)
-    if why is not None or kconv_backend(mesh, kgrid) != "mathdx":
+    if why is not None:
         return why
+    if kconv_backend(mesh, kgrid) != "mathdx":
+        return rocm_outer_refusal(mesh, _check_kgrid(kgrid, "xla"), "kconv_klead_outer_decode", int(n_c)) or None
     from ffi.common import ffi_loader
     ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
     if not ok:
@@ -2005,7 +2152,8 @@ def _outer_ksum_fma() -> int:
 #   one SM (I).
 # Decides it: T bytes (the encode is ~7 flop/B) until T and U leave HBM; then one block per SM,
 #   fixed by the 128 KB register accumulator; now L2 operand latency (long_scoreboard 38%, pipe
-#   58%; 2874).  DMMA and named barriers are CUDA-only; ROCm takes the XLA encode and mode 2 (I).
+#   58%; 2874).  DMMA and named barriers are CUDA-only; the ROCm port (kconv_outer_rocm_ffi.cc)
+#   keeps the load, the items and the decode's slots on the FMA pipe with one block-wide group.
 def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None = "ortho") -> tuple:
     """Rank-local ``(prep, apply)``: :func:`make_local_kconv_klead_outer` with the BSE decode's first
     contraction fused into its store, so U never reaches HBM.
@@ -2017,12 +2165,32 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
     block per SM, two 8-warp groups ping-ponging on two banks; the (phase, item) tiles go round robin
     so a wave shares one x window in L2, and the tile completing an item sums its partials in phase
     order (deterministic).  ``L`` and ``R`` are
-    tiled into fragment order per call (K zero-padded to a multiple of 4, μ and ν to 8).  The XLA
-    backend: the outer conv and the einsum in XLA.
+    tiled into fragment order per call (K zero-padded to a multiple of 4, μ and ν to 8).  ROCM
+    (``cpp/kdft/kconv_outer_rocm_ffi.cc``): the CUDA decode's items, phases, slots and counter on
+    one block-wide group, the (t, μ) sum in per-thread FMA accumulators; ``prep`` is the identity.
+    The XLA backend: the outer conv and the einsum in XLA.
     Check :func:`klead_outer_decode_refusal` first.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
     nk = kg[0] * kg[1] * kg[2]
+    if rocm_outer_refusal(mesh, kg, "kconv_klead_outer_decode", 1) == "":   # n_c is checked per call
+        scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk)
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale),
+                     cubin_dir=cubin_cache_dir())
+
+        def _prep_kdft(pc):                     # Pc (nk, c, a, mx) as the BSE holds it: no tiling
+            return pc
+
+        def _apply_kdft(l, r, v_r, pc, conj_r=False):
+            _check_complex(l, r, v_r, pc)
+            target = rocm_outer_target(mesh, kg, "kconv_klead_outer_decode", int(pc.shape[1]))
+            if target is None:                  # announced; the caller checked the refusal first
+                return jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(pc),
+                                  make_local_kconv_klead_outer(mesh, kg, norm=norm)(l, r, v_r, conj_r=conj_r))
+            out = jax.ShapeDtypeStruct((l.shape[0], pc.shape[1], r.shape[2], r.shape[3]), l.dtype)
+            return jax.ffi.ffi_call(target, out)(l, r, v_r, pc, conj_r=np.int64(bool(conj_r)), **attrs)
+        _note_rocm_target(KDFT_KCONV_KLEAD_OUTER_DECODE_TARGET)
+        return _prep_kdft, _apply_kdft
     if kconv_backend(mesh, kgrid) != "mathdx":
         outer = make_local_kconv_klead_outer(mesh, kg, norm=norm)
 
@@ -3091,3 +3259,66 @@ def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm,
         sup_in=i64(sup_in), sup_out=i64(sup_out), gemm=i64(gemm),
         scale=np.asarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign),
         mathdx_root=mathdx_root, cubin_dir=cubin_dir)
+
+
+# ---------------------------------------------------------------------------------------------
+# ROCM route receipts.  Every public factory, built on a ROCm mesh outside xla_reference(),
+# announces once (rank 0, per factory, k-grid and route) the route it took: its own native kdft
+# target, or the XLA composition and the kdft targets that composition calls inside.  The CUDA
+# and cpu legs are untouched (the wrapper returns the factory's result unchanged and prints only
+# on ROCM).  A nested factory reports into the outermost one, so one receipt names the whole route.
+# ---------------------------------------------------------------------------------------------
+_ROUTE_TRACE: list = []
+
+
+def _note_rocm_target(target: str | None) -> None:
+    """Record a kdft target chosen while a ROCm factory is being built (no-op outside one)."""
+    if target is not None and _ROUTE_TRACE:
+        _ROUTE_TRACE[-1].append(target)
+
+
+def _rocm_route_name(factory_name: str) -> str:
+    """``make_local_kconv_klead`` -> ``kconv_klead``: the router-table spelling of a factory."""
+    n = factory_name.removeprefix("make_").removeprefix("local_")
+    return {"fused_conv_kpair": "kconv_pair", "fused_conv_kparent": "kconv_parent",
+            "fused_conv_kplane": "kconv_plane"}.get(n, n)
+
+
+def _rocm_route_receipt(factory: Callable) -> Callable:
+    import inspect
+    sig = inspect.signature(factory)
+    name = _rocm_route_name(factory.__name__)
+
+    @functools.wraps(factory)
+    def built(mesh, *args, **kwargs):
+        from ffi.gate import announce_once, mesh_ffi_platform
+        try:
+            rocm = not _XLA_REFERENCE and mesh_ffi_platform(mesh) == "ROCM"
+        except (AttributeError, IndexError, TypeError):  # not a Mesh: the factory itself refuses it
+            rocm = False
+        if not rocm:
+            return factory(mesh, *args, **kwargs)
+        _ROUTE_TRACE.append([])
+        try:
+            fn = factory(mesh, *args, **kwargs)
+        finally:
+            used = list(dict.fromkeys(_ROUTE_TRACE.pop()))
+        if _ROUTE_TRACE:                                  # nested: the outer factory announces
+            _ROUTE_TRACE[-1].extend(used)
+            return fn
+        own = _ROCM_KLEAD_TARGETS.get(name) or _ROCM_KBOX_TARGETS.get(name) or _ROCM_OUTER_TARGETS.get(name)
+        if own is not None and own in used:
+            route = " + ".join(used)
+        else:
+            route = "XLA" + (f" around {' + '.join(used)}" if used else " (no native ROCM target)")
+        kg = sig.bind_partial(mesh, *args, **kwargs).arguments.get("kgrid")
+        grid = None if kg is None else tuple(int(v) for v in kg)
+        announce_once(("kconv", "rocm-route", name, grid, route),
+                      f"[kconv] k-convolution router: ROCM {name} k-grid {grid} -> {route}", scope="rank0")
+        return fn
+    return built
+
+
+for _f in [n for n in __all__ if n.startswith("make_")]:
+    globals()[_f] = _rocm_route_receipt(globals()[_f])
+del _f

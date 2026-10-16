@@ -233,6 +233,10 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     "lorrax_kdft_kfft_klead_unfold": "KDftKfftKleadUnfoldFfi",
     "lorrax_kdft_kconv_chi_unfold":  "KDftKconvChiUnfoldFfi",
     "lorrax_kdft_kconv_chi_vertex":  "KDftKconvChiVertexFfi",
+    # The BSE W term's outer-product load and its fused decode (cpp/kdft/kconv_outer_rocm_ffi.cc,
+    # the port of cpp/cufft/kconv_outer_cuda_ffi.cc): ffi.fft._ROCM_OUTER_TARGETS.
+    "lorrax_kdft_kconv_klead_outer": "KDftKconvKleadOuterFfi",
+    "lorrax_kdft_kconv_klead_outer_decode": "KDftKconvKleadOuterDecodeFfi",
     # The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc), called by
     # distrib_la.local_eigh (BATCHED_EIGH_ROUTE); CUDA uses jaxlib's cuSOLVER for it.
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
