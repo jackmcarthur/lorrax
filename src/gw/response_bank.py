@@ -984,7 +984,7 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
             if (k_token == token and tuple(k_rest) == key[2:] and k_lo <= key[1][0]
                     and key[1][1] <= k_hi and not any(x.is_deleted() for x in cover[:2])):
                 a, b = key[1][0] - k_lo, key[1][1] - k_lo
-                rows, start = _span_rows(mesh_xy, b - a), _span_start(mesh_xy, a)
+                rows, start = _span_rows(mesh_xy, b - a), _span_cursor(mesh_xy, (k_token, k_lo), a, b)
                 return rows(cover[0], start), rows(cover[1], start), list(cover[2][a:b])
     h, hi, ranks = _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute)
     if key is not None:
@@ -1003,6 +1003,42 @@ def _span_rows(mesh_xy, width):
     """
     return jax.jit(lambda x, start: jax.lax.dynamic_slice_in_dim(x, start, width, axis=0),
                    out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
+_SPAN_CURSOR = {}
+
+
+def _span_cursor(mesh_xy, cover, a, b):
+    """The start row ``a`` of a sub-span ``[a, b)`` of ``cover``, carried on device.
+
+    Constructor rounds take a cover's parents in order: span 0 starts at a
+    compiled zero and each next span at the previous start plus its width (one
+    device add), so no start crosses from the host.  An out-of-order span
+    takes :func:`_span_start` (placed once per value).
+    """
+    key = (mesh_xy, cover)
+    held = _SPAN_CURSOR.get(key)
+    if a == 0:
+        start = _span_zero(mesh_xy)()
+    elif held is not None and held[0] == a:
+        start = held[1]
+    else:
+        start = _span_start(mesh_xy, a)
+    while len(_SPAN_CURSOR) >= 4 and key not in _SPAN_CURSOR:
+        _SPAN_CURSOR.pop(next(iter(_SPAN_CURSOR)))
+    _SPAN_CURSOR[key] = (b, _span_advance(mesh_xy, b - a)(start))
+    return start
+
+
+@lru_cache(maxsize=8)
+def _span_zero(mesh_xy):
+    return jax.jit(lambda: jnp.zeros((), jnp.int32), out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@lru_cache(maxsize=32)
+def _span_advance(mesh_xy, width):
+    return jax.jit(lambda start: start + jnp.asarray(width, start.dtype),
+                   out_shardings=NamedSharding(mesh_xy, P()))
 
 
 @lru_cache(maxsize=None)
