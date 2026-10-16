@@ -7,11 +7,15 @@ that shares no code with tdagw.dynsig (``_dense_*``: the Adler-Wiser chi0
 over ordered band pairs, the Dyson solve, the COHSEX self-energy as explicit
 sums; the TD kernel as in tests/test_tdagw_model.py).
 
-Runs as a script on a 2x2 mesh, cpu, one process with four host devices,
-every k-convolution built inside ``ffi.fft.xla_reference()``::
+Runs as a script on a 2x2 mesh, every k-convolution built inside
+``ffi.fft.xla_reference()``.  CPU, one process with four host devices::
 
     JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \\
         python3 tests/test_tdagw_dynsig.py
+
+CUDA, four ranks with one GPU each (the runtime's communicator stack)::
+
+    lx run -N 1 -G 4 -n 4 -- python3 tests/test_tdagw_dynsig.py
 
 Under pytest it skips.  Gates (G) and red twins (R); each twin feeds a
 deliberately wrong ingredient to the SAME checker as the gate it shadows:
@@ -371,18 +375,35 @@ def verdict(rows):
 
 
 def main() -> int:
+    """Two launch modes: under ``lx run -n 4`` (a coordinator address in the
+    environment) the runtime's communicator stack; else the CPU unit-test
+    clause, one process with four host devices (``resolve_mesh``)."""
+    import os
+    import runtime
+    multi = bool(os.environ.get("JAX_COORDINATOR_ADDRESS"))
+    if multi:
+        mesh = runtime.initialize_communicator_stack().mesh   # before any JAX call
+    else:
+        import jax
+        jax.config.update("jax_enable_x64", True)
+        from common.collectives import resolve_mesh
+        mesh = resolve_mesh()
     import jax
-    jax.config.update("jax_enable_x64", True)
-    from common.collectives import resolve_mesh
-    mesh = resolve_mesh()
+    finalize = runtime.finalize_process if multi else (lambda rc: None)
     if tuple(mesh.devices.shape) != (2, 2):
-        print(f"SKIP: needs a 2x2 mesh, got {tuple(mesh.devices.shape)}")
+        print(f"SKIP: needs a 2x2 mesh, got {tuple(mesh.devices.shape)}", flush=True)
+        finalize(0)
         return 0
     rows = run_checks(mesh)
     ok = verdict(rows)
-    print("RESULT " + json.dumps(dict(rows=rows, ok=ok, all=all(ok.values())), default=float),
-          flush=True)
-    return 0 if all(ok.values()) else 1
+    if jax.process_index() == 0:
+        print("RESULT " + json.dumps(dict(rows=rows, ok=ok, all=all(ok.values()),
+                                          devices=jax.device_count(),
+                                          platform=jax.devices()[0].platform), default=float),
+              flush=True)
+    rc = 0 if all(ok.values()) else 1
+    finalize(rc)
+    return rc
 
 
 def test_tdagw_dynsig_needs_2x2_mesh():

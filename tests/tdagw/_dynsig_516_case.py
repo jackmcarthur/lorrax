@@ -35,11 +35,8 @@ import os
 import sys
 import time
 
-import runtime  # noqa: F401
+import runtime  # noqa: F401  (before numpy: the runtime tunes BLAS spin at import)
 import numpy as np
-import jax
-
-jax.config.update("jax_enable_x64", True)
 
 RYD_EV = 13.605693122994
 
@@ -80,11 +77,12 @@ def main():
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
 
+    stack = runtime.initialize_communicator_stack()      # before any JAX call (multi-process)
+    import jax
     import h5py
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
     from jax.experimental import multihost_utils
-    from common.collectives import resolve_mesh
     from file_io.restart_bundle import (_find_restart_file, read_interaction, read_metadata,
                                         read_wavefunctions)
     from tdagw import dynsig as D, propagate as tp
@@ -96,7 +94,7 @@ def main():
     from vcoul import CoulombGeometry
     from wfn_loader import WfnLoader
 
-    mesh = resolve_mesh()
+    mesh = stack.mesh
     rank0 = jax.process_index() == 0
     out = dict(mesh=list(mesh.devices.shape), deck=os.path.abspath(a.deck), bands=list(a.bands))
     gather = lambda x: np.asarray(multihost_utils.process_allgather(x, tiled=True))
@@ -173,6 +171,7 @@ def main():
     if a.dry:
         if rank0:
             print("RESULT " + json.dumps(out), flush=True)
+        runtime.finalize_process(0)
         return
 
     rule = D.static_rule(e_full, f_full, target_error=a.target_error, max_nodes=64)
@@ -379,8 +378,7 @@ def main():
     _save()
     if rank0:
         print("RESULT " + json.dumps(out, default=float), flush=True)
-    if out.get("errors"):
-        sys.exit(1)
+    runtime.finalize_process(1 if out.get("errors") else 0)
 
 
 if __name__ == "__main__":
