@@ -158,7 +158,7 @@ def test_costs_are_cached_on_disk_and_the_room_applied_at_lookup(mesh, leg, monk
     lib = lambda p, abstract, single: 1 << 50
     monkeypatch.setattr(plan_mod, "_library_bytes", lib)
     monkeypatch.setattr(plan_mod, "_LIBRARY_BYTES_DEFAULT", lib)
-    monkeypatch.setattr(plan_mod, "_measured_cache_path", lambda: str(tmp_path / "measured_cost.json"))
+    monkeypatch.setattr(plan_mod, "_measured_cache_dir", lambda: str(tmp_path))
     compiled = []
     real = plan_mod._program_bytes
     monkeypatch.setattr(plan_mod, "_program_bytes", lambda fn, ab: compiled.append(1) or real(fn, ab))
@@ -167,7 +167,7 @@ def test_costs_are_cached_on_disk_and_the_room_applied_at_lookup(mesh, leg, monk
                         budget_bytes=_room(leg))
     X = p.batched(_face(mesh, A), _face(mesh, B))
     first = len(compiled)
-    assert first == len(plan_mod._round_candidates(16, 4)) and (tmp_path / "measured_cost.json").exists()
+    assert first == len(plan_mod._round_candidates(16, 4)) and len(list(tmp_path.glob("*.json"))) == 1
     assert list(plan_mod._MEASURED.values()) == [1]
     plan_mod._MEASURED.clear()
     p.batched(_face(mesh, A), _face(mesh, B))
@@ -183,3 +183,90 @@ def test_costs_are_cached_on_disk_and_the_room_applied_at_lookup(mesh, leg, monk
             q.batched(_face(mesh, A), _face(mesh, B))
         assert len(compiled) == first
     assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
+
+
+def _cached_setup(mesh, leg, monkeypatch, tmp_path):
+    lib = lambda p, abstract, single: 1 << 50
+    monkeypatch.setattr(plan_mod, "_library_bytes", lib)
+    monkeypatch.setattr(plan_mod, "_LIBRARY_BYTES_DEFAULT", lib)
+    monkeypatch.setattr(plan_mod, "_measured_cache_dir", lambda: str(tmp_path))
+    compiled = []
+    real = plan_mod._program_bytes
+    monkeypatch.setattr(plan_mod, "_program_bytes", lambda fn, ab: compiled.append(1) or real(fn, ab))
+    A, B = _lu(seed=7)
+    p = distrib_la.plan("solve_lu", mesh, backend="distributed", n=8, batched_route="auto",
+                        budget_bytes=_room(leg))
+    p.batched(_face(mesh, A), _face(mesh, B))
+    return p, A, B, compiled
+
+
+@pytest.mark.parametrize("damage", ["truncate", "garbage", "digest", "stale_key", "missing_round"])
+def test_a_damaged_or_stale_cache_entry_is_re_measured(mesh, leg, monkeypatch, tmp_path, damage):
+    """A partial, corrupt, tampered or stale entry is a miss: the costs are measured again and the
+    route is the same; it is never used to route."""
+    import json
+    p, A, B, compiled = _cached_setup(mesh, leg, monkeypatch, tmp_path)
+    first, want = len(compiled), list(plan_mod._MEASURED.values())
+    (f,) = tmp_path.glob("*.json")
+    entry = json.loads(f.read_text())
+    if damage == "truncate":
+        f.write_text(f.read_text()[: len(f.read_text()) // 2])
+    elif damage == "garbage":
+        f.write_text("not json")
+    elif damage == "digest":
+        entry["value"]["library"] = 1
+        f.write_text(json.dumps(entry))
+    elif damage == "stale_key":
+        entry["key"] = entry["key"].replace('"', "'", 1)
+        f.write_text(json.dumps(entry))
+    else:
+        entry["value"]["rounds"].pop(next(iter(entry["value"]["rounds"])))
+        entry["digest"] = plan_mod._payload_digest(entry["key"], entry["value"])
+        f.write_text(json.dumps(entry))
+    plan_mod._MEASURED.clear()
+    p.batched(_face(mesh, A), _face(mesh, B))
+    assert len(compiled) == 2 * first                    # re-measured
+    assert list(plan_mod._MEASURED.values()) == want     # the same route
+
+
+def test_the_agreement_is_conservative_and_refuses_a_mixed_library():
+    peers = [{"library": 100, "rounds": {"1": 120, "2": 90}},
+             {"library": 80, "rounds": {"1": 110, "2": 95}}]
+    assert plan_mod._agreed(peers) == {"library": 80, "rounds": {"1": 120, "2": 95}}
+    assert plan_mod._agreed([{"library": None, "rounds": {}}] * 2) is None
+    with pytest.raises(RuntimeError, match="some"):
+        plan_mod._agreed([{"library": 1, "rounds": {"1": 1}}, {"library": None, "rounds": {}}])
+
+
+def test_ranks_with_divergent_figures_take_one_route(mesh, leg, monkeypatch, tmp_path):
+    """Two ranks whose own figures would route differently (this rank: one round fits; its peer:
+    not even the last) decide together: every rank takes the library."""
+    monkeypatch.setattr(plan_mod, "_measured_cache_dir", lambda: str(tmp_path))
+    A, B = _lu(seed=8)
+    p = distrib_la.plan("solve_lu", mesh, backend="distributed", n=8, batched_route="auto",
+                        budget_bytes=_room(leg))
+    costs = _od_costs(p, mesh, A, B)
+    lib = max(costs.values())                             # alone, this rank would take 1 round
+    monkeypatch.setattr(plan_mod, "_library_bytes", lambda p_, a_, s_: lib)
+    seen = []
+    def two_ranks(tag, payload):
+        seen.append(tag.rsplit("/", 1)[-1])
+        if "hit" in payload:
+            return [payload, dict(payload, hit=False)]
+        peer = {"library": lib, "rounds": {r: lib + 1 for r in payload["rounds"]}}
+        return [payload, peer]
+    monkeypatch.setattr(plan_mod, "_exchange", two_ranks)
+    plan_mod._MEASURED.clear()
+    with pytest.raises((RuntimeError, ValueError), match=LIBRARY[leg]):
+        p.batched(_face(mesh, A), _face(mesh, B))
+    assert seen == ["probe", "measure"] and list(plan_mod._MEASURED.values()) == [0]
+
+
+def test_the_native_closure_is_part_of_the_cache_key(mesh, leg, monkeypatch, tmp_path):
+    """Costs measured against one native library are another key against another: re-measured."""
+    p, A, B, compiled = _cached_setup(mesh, leg, monkeypatch, tmp_path)
+    first = len(compiled)
+    plan_mod._MEASURED.clear()
+    monkeypatch.setattr(plan_mod, "native_closure_identity", lambda platform: "/other/liblorrax_ffi.so:0123")
+    p.batched(_face(mesh, A), _face(mesh, B))
+    assert len(compiled) == 2 * first and len(list(tmp_path.glob("*.json"))) == 2
