@@ -323,13 +323,39 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     native_eigh=local_eigh.native_fn, ordered=ordered,
                     odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
             qi = infinity[0]
-            del round_states, infinity
             # One device-to-host read of the round's replicated diagnostics and vectors.
             from gw.shared_pole_local import host_tree
             (round_reduction, round_zero, round_retained, round_permutation), (poles, active) = host_tree(
                 (tuple(round_diagnostics), tuple(vectors)))
+            # rocSOLVER zheevd can return finite eigenvalues with NaN eigenvectors and info 0
+            # (distrib_la.local_eigh). A local even-route round that reports it is solved once
+            # more by Jacobi on the same, still-live inputs (no allocation lies between the solve
+            # and this read, so the peak is the round's own); every other round is untouched.
+            finite = round_reduction.get("ritz_eigh_finite")
+            if execution != 'face' and finite is not None and not all(bool(v) for v in finite[:real]):
+                from distrib_la._result_check import native_eigh_jacobi
+                bad = [ids[i] for i in range(real) if not bool(finite[i])]
+                import warnings
+                warnings.warn(f"shared-pole round: local eigh returned non-finite eigenpairs at q={bad}; "
+                              "re-solved the round by Jacobi", RuntimeWarning, stacklevel=1)
+                del round_model, round_signed, vectors, round_diagnostics
+                round_model, round_signed, vectors, round_diagnostics = reduce_round(
+                    round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
+                    native_eigh=native_eigh_jacobi, ordered=ordered,
+                    odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
+                (round_reduction, round_zero, round_retained, round_permutation), (poles, active) = host_tree(
+                    (tuple(round_diagnostics), tuple(vectors)))
+            del round_states, infinity
             budget.retained_panels = tuple(factors)
         with phase("gates"):
+            import numpy as np
+            # Host-side context for the zero-Ritz refusal: the round's own diagnostics.
+            _sp_report = lambda slot: " ".join(
+                f"{k}={np.array2string(np.asarray(d[k][slot]), precision=3, max_line_width=400)}"
+                for d in (round_zero, round_reduction) for k in (
+                    "dropped_factor_weight_fraction", "dropped_count", "factor_weight", "retained_rank",
+                    "infinite_weight_fraction", "positive_count", "negative_count", "paired_rank",
+                    "gram_min_relative", "paired_min_relative", "gram_condition") if k in d)
             for slot, q in enumerate(ids[:real]):
                 if ordered and not round_reduction["orientation_paired"][slot]:
                     raise ValueError(ORIENTATION_PAIR_REFUSAL + f" (q={q})")
@@ -344,8 +370,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                             f"inverse-root residual={round_reduction['metric_inverse_root_residual_relative'][slot]}; "
                             f"want: Gram min >= -floor (normalized_gram_validity; even route: the larger of it and gram_rounding_validity) "
                             "and valid diagonal/retained metric; why: no PSD repair")
+                if not round_reduction.get("ritz_eigh_finite", [True] * (slot + 1))[slot]:
+                    raise ValueError(f"GATE shared_pole_ritz_eigh_finite: got: non-finite Ritz eigenpairs at q={q}; "
+                                     "want: finite eigenvalues and eigenvectors of the reduced pencil; "
+                                     "why: a silent eigensolver failure, not a physical zero-Ritz weight")
                 if not round_zero["zero_policy"][slot]:
-                    raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q}; want: finite positive response within dropped-weight budget; why: no pole clipping")
+                    raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q} [{_sp_report(slot)}]; want: finite positive response within dropped-weight budget; why: no pole clipping")
                 # The ordered identity is on the ORIGINAL infinity directions: exact only for the
                 # full Galerkin span, projection accuracy after the keep/retention cuts. It is
                 # reported beside the full_m1/full_m3 diagnostic bands, as the TRS route reports
