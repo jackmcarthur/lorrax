@@ -711,8 +711,18 @@ def to_transpose_partner(t, p: int):
     face (a block held ``[.., a_X, b_Y]`` arrives as the partner's
     ``[.., a_Y, b_X]``)."""
     import jax
-    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p)]
-    return jax.lax.ppermute(t, ("x", "y"), perm)
+    import jax.numpy as jnp
+    if p == 1:
+        return t
+    # Off-diagonal pairs only; a diagonal rank IS its own partner and keeps
+    # its block.  A self pair is not free: RCCL executes it as a 0.50 ms copy
+    # of a 24.9 MB block on MI250X (P4 Fe W tile; 0.065 ms as this select,
+    # comm7 lane 2026-10-16), against 0.59-0.74 ms for the real exchange.
+    # The select fuses into the consumer; ranks still meet in one permute.
+    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p) if i != j]
+    moved = jax.lax.ppermute(t, ("x", "y"), perm)
+    on_diagonal = jax.lax.axis_index("x") == jax.lax.axis_index("y")
+    return jnp.where(on_diagonal, t, moved)
 
 
 def xy_tile_mesh(x):
