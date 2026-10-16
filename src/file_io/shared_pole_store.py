@@ -22,7 +22,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from runtime.padding import combined_divisor, padded_axis, spec_divisor
 from common import timing
-from common.collectives import (agree_io_error, device_put_process_local, process_rank, psum_replicate,
+from common.collectives import (agree_io_error, device_put_process_local, device_put_process_local_cached,
+                                process_rank, psum_replicate,
                                 rank0_transaction)
 from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import agree_io_refusal, assert_committed, set_commit_state
@@ -395,17 +396,65 @@ def _factor_valid(b, poles2, K):
           & jnp.all(jnp.where(active[:, 1:], poles2[:, 1:] >= poles2[:, :-1], True)))
 
 
+def _poles_valid_host(poles2, K):
+    """The poles/counts part of :func:`_factor_valid` on host arrays (the same predicates)."""
+    active = np.arange(poles2.shape[1])[None, :] < K[:, None]
+    return bool(np.all(np.isfinite(poles2))
+                & np.all(np.where(active, poles2 > 0, poles2 == 1))
+                & np.all(np.where(active[:, 1:], poles2[:, 1:] >= poles2[:, :-1], True)))
+
+
+@jax.jit
+def _factor_b_valid(b, K):
+    """The factor part of :func:`_factor_valid`: finite, exact zero past each count."""
+    active = jnp.arange(b.shape[3])[None, :] < K[:, None]
+    return jnp.all(jnp.isfinite(b)) & jnp.all(jnp.where(active[:, None, None, :], True, b == 0))
+
+
+def _placed_counts(b, K):
+    """``K`` replicated on ``b``'s mesh, placed once per distinct count vector."""
+    from jax.sharding import NamedSharding, PartitionSpec
+    sharding = getattr(b, "sharding", None)
+    if not isinstance(sharding, NamedSharding):
+        return K
+    return device_put_process_local_cached(np.ascontiguousarray(K), NamedSharding(sharding.mesh, PartitionSpec()))
+
+
 @timing.timed("factor_validation")
-def _check_factor(b, poles2, K):
-    """Gate the physical active prefix and exact inactive sentinel."""
+def _check_factor(b, poles2, K, pending=None):
+    """Gate the physical active prefix and exact inactive sentinel.
+
+    ``pending`` (a list): the device half of the verdict is appended there instead of
+    read now, and the caller refuses on all of them in one read (:func:`_refuse_invalid`).
+    """
     if b.dtype != np.complex128 or poles2.dtype != np.float64 or K.dtype != np.int64:
         _refuse(f"dtypes {(b.dtype, poles2.dtype, K.dtype)}")
     if b.ndim != 4 or poles2.shape != (b.shape[0], b.shape[3]) or K.shape != (b.shape[0],):
         _refuse("factor/poles/count shape mismatch")
     if np.any(K < 0) or np.any(K > b.shape[3]):
         _refuse("K outside factor column capacity")
-    ok = _factor_valid(b, poles2, K)
-    if not bool(ok):
+    if isinstance(poles2, np.ndarray) and isinstance(K, np.ndarray):
+        # Host poles and counts (the digest's chunks): their predicates on the
+        # host, the factor's on the device with the counts placed once.
+        if not _poles_valid_host(poles2, K):
+            _refuse_invalid([False])
+        ok = _factor_b_valid(b, _placed_counts(b, K))
+    else:
+        ok = _factor_valid(b, poles2, K)
+    if pending is not None:
+        pending.append(ok)
+        return
+    _refuse_invalid([ok])
+
+
+def _refuse_invalid(oks):
+    """Refuse when any verdict in ``oks`` (host bools or replicated device scalars) is false;
+    the device ones are read back in one transfer."""
+    device = [ok for ok in oks if not isinstance(ok, (bool, np.bool_))]
+    good = all(bool(ok) for ok in oks if isinstance(ok, (bool, np.bool_)))
+    if good and device:
+        good = bool(jnp.all(jnp.stack([jnp.asarray(ok, bool) for ok in device])))
+    if not good:
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
 
@@ -842,6 +891,9 @@ def _model_digest(path, header, mesh, *, capacity):
            batch_limit*(panel+24*kmax), host_payload=batch_limit*panel,
            device_panel=batch_limit*panel,
            host_metadata=batch_limit*(256*nmu*components+8*kmax), native_host=True)
+    # Every panel's device verdict is read once, after the loop (the digest is
+    # refused, never returned, if any panel is invalid).
+    verdicts, reduced = [], []
     with open_shared_pole_model(path, mesh_xy=mesh) as io:
         for q0, q_new in _covering_windows(header["n_q_irr"], batch_limit):
             q1 = q0+batch_limit
@@ -866,7 +918,7 @@ def _model_digest(path, header, mesh, *, capacity):
                     b = io.read_slab("factor", shape=(batch,ncan,components,width), offset=(q0,0,0,c0),
                                      partition_spec=P(None,"x",None,None))
                     counts = np.clip(active_counts-c0, 0, width)
-                    _check_factor(b, host_poles[:,c0:c1], counts)
+                    _check_factor(b, host_poles[:,c0:c1], counts, pending=verdicts)
                 with timing.section('host_digest_hashing'):
                     for shard in b.addressable_shards:
                         if shard.replica_id != 0:
@@ -885,12 +937,18 @@ def _model_digest(path, header, mesh, *, capacity):
             for q in range(batch):
                 for row, hasher in hashers[q].items():
                     row_hash[q,row] = np.frombuffer(hasher.digest(), np.uint8)
-            with timing.section('digest_reduction'):
-                row_hash = psum_replicate(row_hash, mesh)
-                # Preserve the original q-major row-hashes then poles byte stream.
+            # Reduced once for every batch after the loop (one exchange, not one per batch).
+            reduced.append((row_hash, host_poles, q_new, batch))
+    if reduced:
+        with timing.section('digest_reduction'):
+            row_hashes = psum_replicate(np.stack([r[0] for r in reduced]), mesh)
+            # Preserve the original q-major row-hashes then poles byte stream.
+            for row_hash, (_, host_poles, q_new, batch) in zip(row_hashes, reduced):
                 for q in range(q_new, batch):
                     digest.update(row_hash[q].astype(np.uint8).tobytes())
                     digest.update(np.asarray(host_poles[q:q+1], dtype="<f8").tobytes())
+    if verdicts:
+        _refuse_invalid(verdicts)
     return digest.hexdigest()
 
 
@@ -1588,6 +1646,14 @@ class ResidentBankPayload:
                 self._agree_reads()
         layout = _bank_layout(None if tuple(partition_spec) == tuple(face) else partition_spec)
         return value if layout == "face" else _bank_face_to_batch(self.mesh, value.ndim)(value)
+
+    def read_multi(self, requests, *, partition_spec):
+        """N :meth:`read_slab` requests: a resident payload is device slices
+        (or one host-tier load per request), with no collective file read to merge."""
+        return [self.read_slab(r["name"], shape=r["shape"], offset=r["offset"],
+                               dtype=r["dtype"], partition_spec=partition_spec,
+                               valid_shape=r.get("valid_shape"))
+                for r in requests]
 
 
 @lru_cache(maxsize=None)
@@ -2295,6 +2361,16 @@ def _complete_bank(path, header):
         _stamp_header(path, header, "shared_pole_bank.complete")
 
 
+def _refuse_nonfinite(finite):
+    """Refuse the first ``(name, all-finite)`` entry that is false: one read for the call."""
+    if not finite:
+        return
+    flags = np.asarray(jnp.stack([ok for _, ok in finite]))
+    for (name, _), ok in zip(finite, flags):
+        if not ok:
+            _refuse(f"scratch {name} contains nonfinite values")
+
+
 def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
     """Validate/admit one line sample's panels for parents [q0, q1).
 
@@ -2318,7 +2394,7 @@ def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
     charge = "photon_layout" not in header
     basis = meta.mu_basis
     spec = P(None, None, "x", "y")
-    pending = []
+    pending, finite = [], []
     for family, array in line["panels"].items():
         width = int(array.shape[-1])
         stored = panels_meta["width"][family][sample - p0]
@@ -2345,9 +2421,9 @@ def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
                 temporary = 0
             _admit(ledger, "write_bank_" + name, output, temporary + arg,
                    device_panel=max(arg, output), native_host=True)
-            if not bool(jnp.all(jnp.isfinite(value))):
-                _refuse(f"scratch {name} contains nonfinite values")
+            finite.append((name, jnp.all(jnp.isfinite(value))))
             pending.append((family, name, value, counts))
+    _refuse_nonfinite(finite)
     return sample, pending
 
 
@@ -2386,6 +2462,7 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
     masks = _bank_masks(header)
     # Validate every argument before opening the writer: a bad second field
     # must not leave an otherwise legal first field queued in the same call.
+    finite = []
     for name, array in pending:
         geometry = _sample_field(header, name)
         sample = geometry is not None
@@ -2413,8 +2490,8 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
         # Factor-sized finite-check envelope, separate from caller input.
         _admit(ledger,"write_bank_"+name,output,temporary+arg,
                device_panel=max(arg,output),native_host=True)
-        if not bool(jnp.all(jnp.isfinite(array))):
-            _refuse(f"scratch {name} contains nonfinite values")
+        finite.append((name, jnp.all(jnp.isfinite(array))))
+    _refuse_nonfinite(finite)
     line = (None if line is None else
             _prepare_line_write(header, line, q0=q0, q1=q1, meta=meta, mesh_xy=mesh_xy, ledger=ledger))
     return q0, q1, rows, pending, line, masks
@@ -2731,16 +2808,15 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sa
     return out
 
 
-def read_line_panels(io, q_span=None, *, meta, header, family, sample, cross=False,
-                     q_ids=None, partition_spec=None):
-    """One line sample's panels for one family and their retained counts.
+def _line_panel_plan(io, q_span, *, meta, header, family, sample, cross, q_ids, partition_spec):
+    """Validated read requests of one line sample's panels (no I/O).
 
-    Returns ``(panels, counts)``: complex128 ``[b, 1+2S, rows, r]`` (or the
-    ``[b, 2S, cross rows, r]`` cross panel) in the packed row order the
-    constructor uses, face tiles ``P(None,None,'x','y')`` or batch layout as
-    in :func:`read_shared_pole_bank`, and the host int ``[b]`` retained count
-    of each requested parent. The field order is the header's
-    ``line_panels.fields``: Q, then output and action per state.
+    Returns ``(name, spec, parts, pack, assemble)``: ``parts`` lists, per
+    parent run, the ``read_slab`` request plus its priced ``(argument, output,
+    temporary)`` bytes; ``pack(value)`` converts one read value to the packed
+    rows; ``assemble(packed)`` stacks the runs and restores the parent order,
+    returning ``(panels, counts)``. One plan serves the per-sample read and
+    the round read, so both return the same arrays.
     """
     if header.get("schema") != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
@@ -2768,27 +2844,105 @@ def read_line_panels(io, q_span=None, *, meta, header, family, sample, cross=Fal
     face = P(None, None, "x", "y")
     spec = face if layout == "face" or not contiguous else P(_BATCH_LAYOUT, None, None, None)
     basis = meta.mu_basis
-    ledger = _capacity(meta)
-    _check_io_capacity(ledger, basis.mesh_xy, header)
-    parts, retained = [], 0
+    parts = []
     for q, count in runs:
         shape = (count, fields, rows, width)
         if charge:
-            arg, output, temporary = _conversion_bytes(basis, shape, spec, unpack=False, axis=2)
+            price = _conversion_bytes(basis, shape, spec, unpack=False, axis=2)
         else:
-            arg = output = _local_bytes(shape, np.complex128, mesh, spec)
-            temporary = 0
+            price = (_local_bytes(shape, np.complex128, mesh, spec),) * 2 + (0,)
+        parts.append((dict(name=name, shape=shape, valid_shape=shape, offset=(q, 0, 0, 0),
+                           dtype=np.complex128), price))
+
+    def pack(value):
+        return basis.pack_axis(value, 2, spec=spec) if charge else value
+
+    def assemble(packed):
+        value = packed[0] if len(packed) == 1 else _bank_stack_rows(mesh, spec)(tuple(packed))
+        del packed[:]
+        counts = np.asarray(panels["counts"][family], np.int64)[ids, sample - p0]
+        return _restore_parent_order(value, ids, layout, contiguous, interval, mesh), counts
+    return name, spec, parts, pack, assemble
+
+
+def read_line_panels(io, q_span=None, *, meta, header, family, sample, cross=False,
+                     q_ids=None, partition_spec=None):
+    """One line sample's panels for one family and their retained counts.
+
+    Returns ``(panels, counts)``: complex128 ``[b, 1+2S, rows, r]`` (or the
+    ``[b, 2S, cross rows, r]`` cross panel) in the packed row order the
+    constructor uses, face tiles ``P(None,None,'x','y')`` or batch layout as
+    in :func:`read_shared_pole_bank`, and the host int ``[b]`` retained count
+    of each requested parent. The field order is the header's
+    ``line_panels.fields``: Q, then output and action per state. A round's
+    samples together: :func:`read_line_panel_round`.
+    """
+    name, spec, parts, pack, assemble = _line_panel_plan(
+        io, q_span, meta=meta, header=header, family=family, sample=sample, cross=cross,
+        q_ids=q_ids, partition_spec=partition_spec)
+    basis = meta.mu_basis
+    ledger = _capacity(meta)
+    _check_io_capacity(ledger, basis.mesh_xy, header)
+    packed, retained = [], 0
+    for request, (arg, output, temporary) in parts:
         _admit(ledger, "read_" + name, retained + arg + output, temporary,
                device_panel=arg, native_host=True, io=io)
-        value = io.read_slab(name, shape=shape, valid_shape=shape, offset=(q, 0, 0, 0),
-                             dtype=np.complex128, partition_spec=spec)
-        parts.append(basis.pack_axis(value, 2, spec=spec) if charge else value)
+        value = io.read_slab(request["name"], shape=request["shape"],
+                             valid_shape=request["valid_shape"],
+                             offset=request["offset"], dtype=request["dtype"],
+                             partition_spec=spec)
+        packed.append(pack(value))
         retained += output
         del value
-    value = parts[0] if len(parts) == 1 else _bank_stack_rows(mesh, spec)(tuple(parts))
-    del parts
-    counts = np.asarray(panels["counts"][family], np.int64)[ids, sample - p0]
-    return _restore_parent_order(value, ids, layout, contiguous, interval, mesh), counts
+    return assemble(packed)
+
+
+def read_line_panel_round(io, q_span=None, *, meta, header, family, samples, cross=False,
+                          q_ids=None, partition_spec=None):
+    """Every listed line sample's panels in ONE collective read.
+
+    ``{sample: (panels, counts)}``, each exactly :func:`read_line_panels`'s
+    value for that sample (one plan serves both). All runs of all samples go
+    to ``io.read_multi`` together, so a round's line panels cost one
+    dispatch, one descriptor table and no per-read host sync on the
+    collective tier, where per-sample reads cost one of each per sample.
+
+    Device bytes: the read's outputs are the round's raw panels; each is
+    packed and released in turn, so the peak is the round's panels plus, at
+    the sample being packed, its conversion (priced below as the worst
+    point of that sequence). On an identity basis nothing is converted and
+    the outputs are the panels themselves.
+    """
+    samples = [int(s) for s in samples]
+    if not samples:
+        return {}
+    plans = [_line_panel_plan(io, q_span, meta=meta, header=header, family=family,
+                              sample=sid, cross=cross, q_ids=q_ids,
+                              partition_spec=partition_spec) for sid in samples]
+    specs = {spec for _, spec, _, _, _ in plans}
+    if len(specs) != 1:
+        _refuse("line-panel round read needs one layout for every sample")
+    spec, = specs
+    basis = meta.mu_basis
+    ledger = _capacity(meta)
+    _check_io_capacity(ledger, basis.mesh_xy, header)
+    prices = [price for _, _, parts, _, _ in plans for _, price in parts]
+    args = [a for a, _, _ in prices]
+    # Packing part k: parts >= k still raw, parts <= k converted, plus its temporary.
+    resident = max(sum(args[k:]) + sum(o for _, o, _ in prices[:k + 1]) for k in range(len(prices)))
+    _admit(ledger, f"read_{plans[0][0]}..{plans[-1][0]}", resident,
+           max(t for _, _, t in prices), device_panel=sum(args), native_host=True, io=io)
+    values = io.read_multi([request for _, _, parts, _, _ in plans for request, _ in parts],
+                           partition_spec=spec)
+    out, k = {}, 0
+    for sid, (_, _, parts, pack, assemble) in zip(samples, plans):
+        packed = []
+        for j in range(k, k + len(parts)):
+            packed.append(pack(values[j]))
+            values[j] = None             # the raw panel is released as it is packed
+        out[sid] = assemble(packed)
+        k += len(parts)
+    return out
 
 
 def _export_spatial_header(path, source_wfn, meta, *, kind, source):

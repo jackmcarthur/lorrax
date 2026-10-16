@@ -125,8 +125,10 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False):
     return solve
 
 
-#: The local (one-device) eigh of every native route: jnp.linalg.eigh, deflated.
-native_eigh = jax.jit(deflate_zero_rows(jnp.linalg.eigh))
+#: The local (one-device) eigh of every native route: eigh_local (jnp.linalg.eigh with the
+#: leg's implementation, :mod:`distrib_la.local_eigh`), deflated.
+from distrib_la.local_eigh import eigh_local as _eigh_local
+native_eigh = jax.jit(deflate_zero_rows(_eigh_local))
 
 
 def orthonormalize(vectors, *, matmul):
@@ -244,9 +246,91 @@ def refusal_message(op, n, dtype, site, attempts, *errors):
             f"and no retry repaired it; result set to NaN")
 
 
-def _flag(status):
-    """Whether a replicated check status ``(failed, errors)`` failed (every rank reads the same bytes)."""
-    return bool(np.any(np.asarray(jax.device_get(status[0].addressable_data(0)))))
+#: Host reads of check statuses: ``id(array) -> (array, bit)`` for a failure flag
+#: (``status[0]``) and for a notice bit (keyed by its error table ``status[1]``, which
+#: several tables of one program share no flag with).  The array is held so its id
+#: cannot be reused while the entry lives.
+_FAILED: dict = {}
+_NOTICE: dict = {}
+
+
+def _memo(table, array):
+    hit = table.get(id(array))
+    return None if hit is None or hit[0] is not array else hit[1]
+
+
+def _remember(table, array, bit):
+    if len(table) > 64:
+        table.clear()
+    table[id(array)] = (array, bit)
+
+
+def _word_program(tols):
+    """``[failed, notice_0, ..]`` of a status and its tables on the device: one int32 word, one host read.
+
+    ``notice_i`` is exactly :func:`_notices`' print condition for table ``i``: some
+    matrix's first attempt neither all-NaN nor within ``tols[i]`` (its loop stops at
+    the first such row).
+    """
+    @jax.jit
+    def word(failed, tables):
+        bits = [jnp.any(failed)]
+        for tol, errors in zip(tols, tables):
+            first = errors.reshape(-1, *errors.shape[-2:])[:, 0]
+            shown = ~jnp.all(jnp.isnan(first), axis=-1) & ~jnp.all(first <= tol, axis=-1)
+            bits.append(jnp.any(shown))
+        return jnp.stack(bits).astype(jnp.int32)
+    return word
+
+
+_WORDS: dict = {}
+
+
+def _read_status(failed, tables, infos):
+    """Read a replicated status's failure bit and every table's notice bit in ONE transfer.
+
+    Every rank calls it for the same status (it gates the retry and the refusal on all of
+    them), so every rank compiles and runs the same program, on its own replica
+    (INVARIANTS 21: no rank-conditional compile); only the printing is rank 0's.
+    ``infos`` are the tables' ``(n, dtype)``.
+    """
+    tols = tuple(float(accept(int(n), dtype)) for n, dtype in infos)
+    program = _WORDS.get(tols) or _WORDS.setdefault(tols, _word_program(tols))
+    word = np.asarray(program(failed.addressable_data(0),
+                              tuple(t.addressable_data(0) for t in tables)))
+    for table, bit in zip(tables, word[1:]):
+        _remember(_NOTICE, table, bool(bit))
+    _remember(_FAILED, failed, bool(word[0]))
+    return bool(word[0])
+
+
+def _status(status, n=None, dtype=None):
+    """``(failed, notice)`` of a replicated status, each read at most once per array.
+
+    With ``(n, dtype)`` (and a device table) both bits come in one transfer, on
+    every rank alike; without them only the failure bit is read (notice None).
+    """
+    failed, notice = _memo(_FAILED, status[0]), None
+    want = n is not None and not isinstance(status[1], np.ndarray)
+    if want:
+        notice = _memo(_NOTICE, status[1])
+    if (failed is not None) and (notice is not None or not want):
+        return failed, notice
+    if want:
+        _read_status(status[0], (status[1],), ((n, dtype),))
+        return _memo(_FAILED, status[0]), _memo(_NOTICE, status[1])
+    failed = bool(np.any(np.asarray(jax.device_get(status[0].addressable_data(0)))))
+    _remember(_FAILED, status[0], failed)
+    return failed, notice
+
+
+def _flag(status, n=None, dtype=None):
+    """Whether a replicated check status ``(failed, errors)`` failed (every rank reads the same bytes).
+
+    With ``(n, dtype)`` rank 0 reads the notice bit in the same transfer, so the
+    :func:`_notices` that follows reads the error table only when it will print.
+    """
+    return _status(status, n, dtype)[0]
 
 
 def _notices(status, op, n, dtype, site, *, final):
@@ -259,6 +343,8 @@ def _notices(status, op, n, dtype, site, *, final):
     """
     if jax.process_index() != 0:
         return
+    if not isinstance(status[1], np.ndarray) and _memo(_NOTICE, status[1]) is False:
+        return              # read with the failure bit (_flag/_read_status): no attempt to name
     errors = status[1]
     errors = np.asarray(errors if isinstance(errors, np.ndarray) else jax.device_get(errors.addressable_data(0)))
     tol = accept(n, dtype)
@@ -423,6 +509,8 @@ def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options
     def finish(args, result):
         out, status = result
         if status:
+            infos = phases["all"].infos[_signature(args)]
+            _read_status(status[0], tuple(status[1]), [(n, dtype) for _, n, dtype, _ in infos])
             report("all", args, status, final=True)
             if _flag(status):
                 raise ValueError(f"GATE distrib_la_result_check: a checked solve in the program at "
@@ -469,8 +557,9 @@ def raise_if_failed(status, op, n, dtype, site):
             jax.debug.callback(lambda failed, errors: _notices((failed, errors), op, int(n), dtype, site,
                                                                final=True), *status)
         return
+    failed = _flag(status, n, dtype)          # every rank: the failure and notice bits, one read
     _notices(status, op, n, dtype, site, final=True)
-    if _flag(status):
+    if failed:
         raise ValueError(refusal_message(op, n, dtype, site, "every"))
 
 

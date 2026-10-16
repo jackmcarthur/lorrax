@@ -33,6 +33,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax import shard_map
 from distrib_la.matmul import MATMUL_BACKEND_CHOICES, _mesh_shape, _zeros
 from distrib_la.resolve import mesh_platform
+from distrib_la._active_local import active_local_guard, active_local_route
 
 __all__ = ["GemmPlan", "gemm_plan", "local_gemm_plan"]
 
@@ -289,12 +290,13 @@ class GemmPlan:
         a_spec, b_spec, out_spec = (self.in_sharding_a.spec,
                                     self.in_sharding_b.spec,
                                     self.out_sharding.spec)
-        if self.backend == "local" and mesh_platform(self.mesh) == "CUDA":
+        platform = mesh_platform(self.mesh)
+        if self.backend == "local" and active_local_route(platform) == "native":
             from distrib_la._active_local_cuda import (
                 prepared_active_local_cuda,
                 require_prepared_active_local_cuda,
             )
-            require_prepared_active_local_cuda()
+            require_prepared_active_local_cuda(platform)
             local_impl = partial(prepared_active_local_cuda, active_bounds=active_bounds,
                                  alpha=self.alpha, beta=self.beta)
             prepared_no_c = None
@@ -414,14 +416,21 @@ def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
         raise ValueError("local_gemm_plan active_range storage K exceeds int32 bounds")
     active_impl = None
     if enable_active_range:
-        if mesh_platform(mesh) == "CUDA":
+        platform = mesh_platform(mesh)
+        if active_local_route(platform) == "native":
             from distrib_la._active_local_cuda import (active_local_cuda,
                                                        require_active_local_cuda)
-            require_active_local_cuda()
-            active_impl = active_local_cuda
+            require_active_local_cuda(platform)
+            active_impl = (active_local_cuda if active_local_guard(platform) == "cond" else
+                           partial(active_local_cuda, guard=active_local_guard(platform)))
+        elif active_local_route(platform) == "device":
+            from distrib_la._active_local_device import (active_local_device,
+                                                         require_active_local_device)
+            require_active_local_device(platform)
+            active_impl = active_local_device
         else:
-            from distrib_la._active_local import active_local_matmul
-            active_impl = active_local_matmul
+            from distrib_la._active_local import local_active_impl
+            active_impl = local_active_impl(mesh_platform(mesh))
     a_sh, b_sh, out_sh = (NamedSharding(mesh, spec)
                            for spec in (a_spec, b_spec, out_spec))
     local = partial(_axis_matmul, alpha=alpha, beta=beta, reduction_axis=reduction_axis)

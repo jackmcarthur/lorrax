@@ -10,6 +10,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+from distrib_la import eigh_local
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -68,7 +69,7 @@ def make_pw_init(T_diag: jax.Array, n_channels: int, verbose: bool = True):
 
         Hc = jnp.einsum('msG,nsG->mn', jnp.conj(V_pw), HV_pw, optimize=True)
         Hc = 0.5 * (Hc + Hc.conj().T)
-        eigvals, C = jnp.linalg.eigh(Hc)
+        eigvals, C = eigh_local(Hc)
         C_low = C[:, :n_eig]
 
         X0 = jnp.einsum('ij,isG->jsG', C_low, V_pw, optimize=True)

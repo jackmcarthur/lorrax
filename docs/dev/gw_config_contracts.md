@@ -206,7 +206,10 @@ rulings override anything here.
   selects the distributed W Dyson solve, the distributed transverse LU
   (`distributed_lu`) and the distributed eigensolvers, including the SC
   eigh; the ζ back-solve is a whole-tile factor applied on its q owners under
-  either value.
+  either value. `LinalgResolution.eigh_backend` (`local` → `auto`,
+  `distributed` → `distributed`) is the eigh request of every whole-mesh site
+  (shared-pole face and staged plans, line selection, parallel-transport
+  polar); none names a backend itself.
 - **`eigh_backend_choices`** reads `distrib_la.BACKEND_CHOICES`, which imports
   without any `.so`; a literal fallback covers a tree without `services/`, and
   `EIGH_CHOICES_SOURCE` records which answered.

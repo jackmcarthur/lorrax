@@ -53,6 +53,17 @@ def test_mesh_context_scanner_can_fail():
 
 
 def test_mesh_context_is_part_of_the_program_key():
+    # runtime start-up disallows `with mesh:` (jax_disallow_mesh_context_manager); an earlier
+    # in-process test may have started it, so this test allows it locally and restores it.
+    previous = jax.config.jax_disallow_mesh_context_manager
+    jax.config.update("jax_disallow_mesh_context_manager", False)
+    try:
+        _mesh_context_is_part_of_the_program_key()
+    finally:
+        jax.config.update("jax_disallow_mesh_context_manager", previous)
+
+
+def _mesh_context_is_part_of_the_program_key():
     mesh = _mesh()
     f = jax.jit(lambda x: x + 1)
     x = jax.device_put(np.ones(4), NamedSharding(mesh, P("x")))

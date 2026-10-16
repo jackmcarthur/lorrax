@@ -81,7 +81,7 @@ def _mesh_of(platform, client_platform, kind):
 
 @pytest.mark.parametrize("args, want", [
     (("gpu", "cuda", "NVIDIA A100-SXM4-80GB"), "CUDA"),
-    (("gpu", "rocm", "AMD Instinct MI250X"), "rocm"),
+    (("gpu", "rocm", "AMD Instinct MI250X"), "ROCM"),
     (("cpu", "cpu", "cpu"), "cpu"),
 ])
 def test_slab_io_platform_follows_the_vendor(args, want):
@@ -89,10 +89,18 @@ def test_slab_io_platform_follows_the_vendor(args, want):
     assert _platform_for_mesh(_mesh_of(*args)) == want
 
 
-def test_slab_io_refuses_a_vendor_without_a_library():
+def test_slab_io_refuses_a_vendor_without_a_leg():
     from ffi.common.ffi_loader import get_lib
-    with pytest.raises(ValueError, match="unknown platform 'rocm'"):
-        get_lib("rocm")
+    with pytest.raises(ValueError, match="unknown platform 'tpu'"):
+        get_lib("tpu")
+
+
+def test_slab_io_refuses_a_rocm_leg_without_its_library(monkeypatch):
+    """ROCM is a declared leg: a missing library is refused by naming its .so."""
+    from ffi.common.ffi_loader import FfiLibraryNotBuilt, get_lib
+    monkeypatch.delenv("LORRAX_FFI_ROCM_SO", raising=False)
+    with pytest.raises(FfiLibraryNotBuilt, match="liblorrax_ffi_rocm.so"):
+        get_lib("ROCM")
 
 
 # ---- the jax._src signature gate -----------------------------------------------

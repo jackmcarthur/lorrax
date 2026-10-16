@@ -40,6 +40,7 @@
 
 #include "lorrax_config.h"
 #include "lorrax_ffi_abi.h"
+#include "leg.h"
 
 #define LORRAX_CFG_STR2(x) #x
 #define LORRAX_CFG_STR(x) LORRAX_CFG_STR2(x)
@@ -49,13 +50,9 @@ namespace {
 // human reading `strings` needs before any of the rest means anything: which
 // library is this, and will my Python talk to it.
 const char kBuildConfig[] =
-#ifdef LORRAX_FFI_NO_CUDA
-    "leg=host"
-#else
-    "leg=cuda"
-#endif
+    "leg=" LRX_LEG_NAME
     " abi=" LORRAX_CFG_STR(LORRAX_FFI_ABI_VERSION)
-#ifdef LORRAX_FFI_NO_CUDA
+#if defined(LRX_LEG_HOST)
     // The host leg's original five keys, in their original order and spelling.
     // scripts/verify_ffi_build.sh and services/distrib_la/tests/
     // test_so_acceptance.py both search for `scalapack=[01]` as literal bytes;
@@ -66,6 +63,10 @@ const char kBuildConfig[] =
     " slate="        LORRAX_CFG_STR(LORRAX_CFG_HAVE_SLATE)
     " phdf5="        LORRAX_CFG_STR(LORRAX_CFG_HAVE_PHDF5)
     " math_link="    LORRAX_CFG_MATH_LINK;
+#elif defined(LRX_LEG_ROCM)
+    // The ROCM leg's families, one key per ported family (ffi_layout.md).
+    " phdf5="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_PHDF5)
+    " slate="      LORRAX_CFG_STR(LORRAX_CFG_HAVE_SLATE);
 #else
     // The device leg's capabilities.  Until 2026-08-08 this leg carried NO
     // stamp at all — `strings liblorrax_ffi.so | grep scalapack=` on the
@@ -82,7 +83,7 @@ const char kBuildConfig[] =
 
 extern "C" {
 
-#ifdef LORRAX_FFI_NO_CUDA
+#if defined(LRX_LEG_HOST)
 
 const char* lorrax_ffi_host_build_config() { return kBuildConfig; }
 
@@ -92,6 +93,11 @@ const char* lorrax_ffi_host_build_config() { return kBuildConfig; }
 // find "abi=" inside a line whose other fields include a full link command is
 // a parser that will one day match the wrong thing.
 int lorrax_ffi_host_abi_version() { return LORRAX_FFI_ABI_VERSION; }
+
+#elif defined(LRX_LEG_ROCM)
+
+const char* lorrax_ffi_rocm_build_config() { return kBuildConfig; }
+int lorrax_ffi_rocm_abi_version() { return LORRAX_FFI_ABI_VERSION; }
 
 #else
 

@@ -64,6 +64,7 @@ from runtime.padding import round_up
 from solvers import time_integrators as ti
 from tdagw import eom
 from tdagw.self_energy import SelfEnergyModel
+from distrib_la import eigh_local
 
 __all__ = ["METHODS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
            "place_operators", "place_kernel", "place_state", "make_conj_dev",
@@ -252,7 +253,7 @@ def make_conj_dev(mesh) -> Callable:
 
     def local(w, x, f, tau):
         w = 0.5 * (w + jnp.conj(jnp.swapaxes(w, -1, -2)))
-        e, v = jnp.linalg.eigh(w)
+        e, v = eigh_local(w)
         vh = jnp.conj(jnp.swapaxes(v, -1, -2))
         ph = jnp.exp(-1j * tau * e)
         em1 = -2.0 * jnp.sin(0.5 * tau * e) ** 2 - 1j * jnp.sin(tau * e)

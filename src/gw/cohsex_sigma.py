@@ -692,7 +692,8 @@ def compute_cohsex_sigma(
             # heads; see _replicate_head.
             sig_x = sig_x + _replicate_head(x_head, mesh_xy)
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
-        sig_x.block_until_ready()
+        from common.timing import stage_wait
+        stage_wait(sig_x)   # a timing-only wait (LORRAX_STAGE_SYNC)
 
         # Bispinor bare exchange: add Σ^B (transverse-only sum over
         # (i, j) ∈ {1, 2, 3}²) to the bare-X diagnostic AND to the
@@ -772,7 +773,8 @@ def compute_sigma_x(
     sig_x = _replicate_band_sigma(sig_x, mesh_xy)
     nb_sigma = wfns.slices.nb_sigma
     sig_x = sig_x[:, :nb_sigma, :nb_sigma]
-    sig_x.block_until_ready()
+    from common.timing import stage_wait
+    stage_wait(sig_x)   # a timing-only wait (LORRAX_STAGE_SYNC)
 
     if static_head_terms is not None:
         x_head, _ = static_head_terms_to_kij(
@@ -782,7 +784,8 @@ def compute_sigma_x(
         # _replicate_head.  This is the X_ONLY/PPM production entry.
         sig_x = sig_x + _replicate_head(x_head, mesh_xy)
         sig_x = _replicate_band_sigma(sig_x, mesh_xy)
-        sig_x.block_until_ready()
+        from common.timing import stage_wait
+        stage_wait(sig_x)   # a timing-only wait (LORRAX_STAGE_SYNC)
 
     sig_x_b = None
     if wfns_transverse is not None and bispinor_v_q_path is not None:

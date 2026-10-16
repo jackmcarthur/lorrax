@@ -28,6 +28,7 @@ from common.fft_helpers import make_flat_k_ifftn
 from common.staged_reshard import face_to_batch_reshard
 from gw.qsgw_head import rotate_velocity_to_qp
 from runtime.padding import pad_axis, padded_axis
+from distrib_la import eigh_local
 
 PAULI = np.array([[[0, 1], [1, 0]],
                   [[0, -1j], [1j, 0]],
@@ -112,7 +113,7 @@ def _character_operator(geom, setup, table):
 
     def apply(psi_n, gvec, gmask, bidx, kvec, tab):
         Z = vnl_ops.build_vnl_kdata_traced(kvec, gvec, setup).Z * gmask[None, :]
-        lam, U = jnp.linalg.eigh(jnp.conj(Z) @ Z.T)
+        lam, U = eigh_local(jnp.conj(Z) @ Z.T)
         Zt = ((U / jnp.sqrt(lam)[None, :]) @ jnp.conj(U.T)).T @ Z
         proj = jnp.einsum("rG,nsG->rsn", jnp.conj(Zt), psi_n[0])
         return jnp.einsum("rG,orq,qsn->nsGo", Zt, tab, proj,
@@ -407,7 +408,7 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
                                      NamedSharding(mesh, P())))
     def _solve(fH_R):
         def one_pass(_, pz):
-            values, vectors = jax.vmap(jnp.linalg.eigh)(plane(pz, fH_R))
+            values, vectors = jax.vmap(eigh_local)(plane(pz, fH_R))
             energies, residual = newton_inv(
                 a_f, n_f, shift, values[:, :n_states].real)
             return None, (energies, vectors[:, :, :n_states], residual)

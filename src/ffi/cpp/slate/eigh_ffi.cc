@@ -20,14 +20,18 @@
 //                back with out_specs P('y','x') + a local transpose to
 //                recover Q at P('x','y') (cholesky handle convention).
 //   W (output):  replicated.  SLATE's heev returns eigenvalues as a
-//                std::vector<real_t> on each rank; we cudaMemcpy them
+//                std::vector<real_t> on each rank; we copy them H->D
 //                to the replicated W buffer.
 //
 // Input preservation: slate::heev overwrites its input with Householder
 // reduction intermediates, but A is an XLA *input* buffer and must not
 // be mutated (XLA may share it with other consumers).  We copy the
-// local shard into the Q output buffer and let SLATE destroy that copy;
-// the eigenvector tiles are then written over it after heev returns.
+// local shard into SLATE-owned tiles (see EighImpl) and let SLATE destroy
+// those; the eigenvector tiles are copied into Q after heev returns.
+//
+// Tile size: any nb dividing n/p.  The Python wrapper relabels (passes the
+// P('x','y') shard as-is with nb < n/p, so SLATE solves Pi A Pi^T) and
+// un-permutes Q's columns; see distrib_la._cyclic.
 
 #include "../common/ctx_registry.h"
 #include <complex>
@@ -38,7 +42,7 @@
 #include <sstream>
 #include <type_traits>
 
-#include <cuda_runtime.h>
+#include "../common/gpu_runtime.h"
 #include <blas.hh>
 #include <slate/slate.hh>
 
@@ -64,7 +68,7 @@ template <typename T>
 static ffi::Error EighImpl(
     int64_t n, int64_t nb,
     bool compute_evecs,
-    cudaStream_t xla_stream,
+    lrx::gpu::Stream xla_stream,
     lorrax_ffi::slate::SlateCtx* ctx,
     T* d_A_local,
     typename RealOf<T>::type* d_W,
@@ -75,11 +79,11 @@ static ffi::Error EighImpl(
     // Make sure any prior XLA ops on d_A_local finished before SLATE
     // touches the memory.  SLATE manages its own streams internally, so we
     // just sync XLA's stream on this thread.
-    cudaError_t ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    lrx::gpu::Error ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.eigh: cudaStreamSynchronize(xla_stream) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.eigh: " LRX_GPU_API "StreamSynchronize(xla_stream) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -93,47 +97,59 @@ static ffi::Error EighImpl(
     // queried via blas::get_device_count() at matrix-construction time
     // and must match the array length we hand in.  JAX's one-process-
     // per-GPU model requires each process to see exactly 1 GPU, so we
-    // enforce that here (and set CUDA_VISIBLE_DEVICES on the launch side
-    // via run_shifter.sh so SLATE agrees).
+    // enforce that here (the launcher masks one device per rank:
+    // CUDA_VISIBLE_DEVICES via run_shifter.sh on CUDA, srun --gpu-bind on ROCm).
     const int num_devices_visible = blas::get_device_count();
     if (num_devices_visible != 1) {
         std::ostringstream os;
         os << "slate.eigh: blas::get_device_count()=" << num_devices_visible
            << " but JAX one-process-per-GPU model requires exactly 1. "
-           << "Set CUDA_VISIBLE_DEVICES=$SLURM_LOCALID on the launcher "
+           << "Set " LRX_GPU_VENDOR "_VISIBLE_DEVICES=$SLURM_LOCALID on the launcher "
            << "(run_shifter.sh does this when LORRAX_SLATE_STACK is set).";
         return ffi::Error(ffi::ErrorCode::kFailedPrecondition, os.str());
     }
-    const int num_devices = 1;
 
-    // Copy the input shard into the Q output buffer: heev destroys its
-    // input during the Householder reduction, and XLA input buffers
-    // must never be mutated.  The Q buffer doubles as the scratch — the
-    // eigenvector tiles overwrite it after heev returns.
-    const int64_t local_rows = (n + p - 1) / p;
-    const int64_t local_cols = (n + q - 1) / q;
-    ce = cudaMemcpyAsync(d_Q_local, d_A_local,
-                         local_rows * local_cols * sizeof(T),
-                         cudaMemcpyDeviceToDevice, xla_stream);
-    if (ce != cudaSuccess) {
+    // A is copied into SLATE-OWNED device tiles (stride nb) rather than
+    // wrapped with fromDevices: (1) heev destroys its input and XLA input
+    // buffers must not be mutated (this replaces the former A -> Q scratch
+    // copy, same traffic); (2) at nb < n/p a wrapped buffer has tile stride
+    // lld = n/p while SLATE's own workspace tiles have stride nb, and SLATE's
+    // device-region batching requires uniform strides within a group (the
+    // internal_batch.hh:290 assert in _slate.validate_tile_layout).  Owned
+    // tiles are uniform by construction.  The local buffer holds the rank's
+    // block-cyclic tiles at fromDevices' offsets (lld = n/p); the copy is the
+    // inverse of the Z copy-back below.
+    sl::HermitianMatrix<T> A(sl::Uplo::Lower, n, nb, p, q, ctx->comm);
+    A.insertLocalTiles(sl::Target::Devices);
+    for (int64_t tj = 0; tj < A.nt(); ++tj) {
+        for (int64_t ti = tj; ti < A.mt(); ++ti) {
+            if (!A.tileIsLocal(ti, tj)) continue;
+            const int dev = A.tileDevice(ti, tj);
+            auto tile = A(ti, tj, dev);
+            const int64_t ii = ti * nb, jj = tj * nb;
+            const int64_t ii_local = (ii / (nb * p)) * nb + (ii % nb);
+            const int64_t jj_local = (jj / (nb * q)) * nb + (jj % nb);
+            const T* src = d_A_local + ii_local + jj_local * lld_A;
+            ce = lrx::gpu::memcpy_2d_async(
+                tile.data(), tile.stride() * sizeof(T),
+                src, lld_A * sizeof(T),
+                tile.mb() * sizeof(T), tile.nb(),
+                lrx::gpu::kDeviceToDevice, xla_stream);
+            if (ce != lrx::gpu::kSuccess) {
+                std::ostringstream os;
+                os << "slate.eigh: " LRX_GPU_API "Memcpy2DAsync(A -> tile (" << ti
+                   << "," << tj << ")) failed: " << lrx::gpu::error_string(ce);
+                return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+            }
+        }
+    }
+    ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.eigh: cudaMemcpyAsync(A -> scratch) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.eigh: " LRX_GPU_API "StreamSynchronize after A copy failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
-        std::ostringstream os;
-        os << "slate.eigh: cudaStreamSynchronize after A copy failed: "
-           << cudaGetErrorString(ce);
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-    }
-    T* A_ptrs[1] = { d_Q_local };
-
-    // Build the distributed matrices over ctx->comm.  Lower triangular
-    // storage — SLATE only supports Uplo::Lower for heev.
-    sl::HermitianMatrix<T> A = sl::HermitianMatrix<T>::fromDevices(
-        sl::Uplo::Lower, n, A_ptrs, num_devices, lld_A, nb, p, q, ctx->comm);
 
     std::vector<real_t> Lambda(n);
 
@@ -155,9 +171,8 @@ static ffi::Error EighImpl(
             sl::heev(A, Lambda, Z, opts);
 
             // Copy local tile data back to d_Q_local (col-major within
-            // the tile; the Python wrapper local-transposes back).  At
-            // most one local tile per rank with our nb=n/p, though we
-            // loop to stay correct for smaller nb.
+            // the tile; the Python wrapper local-transposes back), at the
+            // fromDevices offsets of the rank's block-cyclic tiles.
             //
             // tileGetForReading is REQUIRED before touching tile data:
             // heev's back-transformation (unmtr_hb2st / unmtr_he2hb via
@@ -166,7 +181,7 @@ static ffi::Error EighImpl(
             // dev) directly returned the pre-back-transform bytes —
             // the "eigvec layout artifact" was stale MOSI state, not a
             // layout transform.
-            cudaStream_t stream = xla_stream;
+            lrx::gpu::Stream stream = xla_stream;
             for (int64_t ti = 0; ti < Z.mt(); ++ti) {
                 for (int64_t tj = 0; tj < Z.nt(); ++tj) {
                     if (!Z.tileIsLocal(ti, tj)) continue;
@@ -184,27 +199,27 @@ static ffi::Error EighImpl(
                     const int64_t ii_local = (ii / (nb * p)) * nb + (ii % nb);
                     const int64_t jj_local = (jj / (nb * q)) * nb + (jj % nb);
                     T* dst = d_Q_local + ii_local + jj_local * lld_Q;
-                    cudaError_t ce = cudaMemcpy2DAsync(
+                    lrx::gpu::Error ce = lrx::gpu::memcpy_2d_async(
                         dst, lld_Q * sizeof(T),
                         src, stride * sizeof(T),
                         mb * sizeof(T), nb_t,
-                        cudaMemcpyDeviceToDevice, stream);
-                    if (ce != cudaSuccess) {
+                        lrx::gpu::kDeviceToDevice, stream);
+                    if (ce != lrx::gpu::kSuccess) {
                         std::ostringstream os;
-                        os << "slate.eigh: cudaMemcpy2DAsync(Z tile (" << ti
+                        os << "slate.eigh: " LRX_GPU_API "Memcpy2DAsync(Z tile (" << ti
                            << "," << tj << ") -> d_Q_local) failed: "
-                           << cudaGetErrorString(ce);
+                           << lrx::gpu::error_string(ce);
                         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
                     }
                 }
             }
             // The 2-D memcpys read SLATE-owned tile memory that Z's
             // destructor frees on scope exit — sync before Z dies.
-            ce = cudaStreamSynchronize(stream);
-            if (ce != cudaSuccess) {
+            ce = lrx::gpu::stream_synchronize(stream);
+            if (ce != lrx::gpu::kSuccess) {
                 std::ostringstream os;
-                os << "slate.eigh: cudaStreamSynchronize after Z copy "
-                   << "failed: " << cudaGetErrorString(ce);
+                os << "slate.eigh: " LRX_GPU_API "StreamSynchronize after Z copy "
+                   << "failed: " << lrx::gpu::error_string(ce);
                 return ffi::Error(ffi::ErrorCode::kInternal, os.str());
             }
         } else {
@@ -217,12 +232,12 @@ static ffi::Error EighImpl(
     }
 
     // Copy eigenvalues (host std::vector) → replicated device W buffer.
-    ce = cudaMemcpyAsync(d_W, Lambda.data(), n * sizeof(real_t),
-                         cudaMemcpyHostToDevice, xla_stream);
-    if (ce != cudaSuccess) {
+    ce = lrx::gpu::memcpy_async(d_W, Lambda.data(), n * sizeof(real_t),
+                         lrx::gpu::kHostToDevice, xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.eigh: cudaMemcpyAsync(Lambda -> d_W) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.eigh: " LRX_GPU_API "MemcpyAsync(Lambda -> d_W) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -233,7 +248,7 @@ static ffi::Error EighImpl(
 //  Dispatch — validates shapes, looks up Ctx, switches on dtype.
 // ---------------------------------------------------------------------------
 static ffi::Error EighDispatch(
-    cudaStream_t stream,
+    lrx::gpu::Stream stream,
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> W_out,
     ffi::Result<ffi::AnyBuffer> Q_out,
@@ -297,7 +312,7 @@ static ffi::Error EighDispatch(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     SlateEighFfi, lorrax_ffi::slate_ffi::EighDispatch,
     xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<xla::ffi::AnyBuffer>()              // A (local shard)
         .Ret<xla::ffi::AnyBuffer>()              // W (n,) real, replicated
         .Ret<xla::ffi::AnyBuffer>()              // Q (local shard, same dtype as A)

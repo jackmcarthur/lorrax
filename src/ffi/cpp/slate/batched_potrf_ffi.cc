@@ -24,7 +24,7 @@
 #include <cstdio>
 #include <sstream>
 
-#include <cuda_runtime.h>
+#include "../common/gpu_runtime.h"
 #include <blas.hh>
 #include <slate/slate.hh>
 
@@ -41,16 +41,16 @@ namespace sl  = ::slate;
 template <typename T>
 static ffi::Error BatchedPotrfImpl(
     int64_t nbatch_local, int64_t n, int64_t nb,
-    cudaStream_t xla_stream,
+    lrx::gpu::Stream xla_stream,
     lorrax_ffi::slate::SlateCtx* ctx,
     const T* d_A_in,
     T* d_L_out)
 {
-    cudaError_t ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    lrx::gpu::Error ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.batched_potrf: cudaStreamSynchronize(xla_stream) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.batched_potrf: " LRX_GPU_API "StreamSynchronize(xla_stream) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -76,20 +76,20 @@ static ffi::Error BatchedPotrfImpl(
     const int64_t slice_elems = local_rows * local_cols;
 
     // D2D copy of the entire batch, then factor each slice in place.
-    ce = cudaMemcpyAsync(d_L_out, d_A_in,
+    ce = lrx::gpu::memcpy_async(d_L_out, d_A_in,
                          nbatch_local * slice_elems * sizeof(T),
-                         cudaMemcpyDeviceToDevice, xla_stream);
-    if (ce != cudaSuccess) {
+                         lrx::gpu::kDeviceToDevice, xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.batched_potrf: cudaMemcpyAsync(A->L) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.batched_potrf: " LRX_GPU_API "MemcpyAsync(A->L) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.batched_potrf: cudaStreamSynchronize after A->L copy "
-              "failed: " << cudaGetErrorString(ce);
+        os << "slate.batched_potrf: " LRX_GPU_API "StreamSynchronize after A->L copy "
+              "failed: " << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -124,7 +124,7 @@ static ffi::Error BatchedPotrfImpl(
 }
 
 static ffi::Error BatchedPotrfDispatch(
-    cudaStream_t stream,
+    lrx::gpu::Stream stream,
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
     int64_t nbatch_local, int64_t n, int64_t nb,
@@ -170,7 +170,7 @@ static ffi::Error BatchedPotrfDispatch(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     SlateBatchedPotrfFfi, lorrax_ffi::slate_batched_potrf::BatchedPotrfDispatch,
     xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<xla::ffi::AnyBuffer>()                      // A
         .Ret<xla::ffi::AnyBuffer>()                      // L
         .Attr<int64_t>("nbatch_local")

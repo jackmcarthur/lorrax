@@ -133,18 +133,20 @@ def test_w_dyson_route(monkeypatch):
     import distrib_la
     monkeypatch.setattr(distrib_la, "resolve_backend", lambda *a, **k: "cusolvermp")
     mesh = NS(size=4)
-    assert w._dyson_route("local", 64, 8, mesh) == "local"
-    assert w._dyson_route("local", 64, 8, NS(size=1)) == "local"
-    assert w._dyson_route("distributed", 64, 8, mesh) == "distributed"
+    # (route, room): the room rides with the distributed plan (ae374ca4c), None for local / P1.
+    assert w._dyson_route("local", 64, 8, mesh) == ("local", None)
+    assert w._dyson_route("local", 64, 8, NS(size=1)) == ("local", None)
+    route, room = w._dyson_route("distributed", 64, 8, mesh)
+    assert route == "distributed" and room == int(31.6 * GB - 16.0 * 64 * 64 * 3 * 8 / 4)
     # n = 8192, 64 parents at P4: whole matrices 16 n^2 (3*16 + 2) = 53.7 GB/rank beside
     # 51.5 GB of faces; the distributed 52.1 + 3 GB of contexts is over too, but less.
-    assert w._dyson_route("local", 8192, 64, mesh) == "distributed"
+    assert w._dyson_route("local", 8192, 64, mesh)[0] == "distributed"
     assert gpu_utils.routes()[-1]["warning"]
     # n = 4096, 16 parents: local 3.2 + 3.8 GB fits 31.6.
-    assert w._dyson_route("local", 4096, 16, mesh) == "local"
+    assert w._dyson_route("local", 4096, 16, mesh) == ("local", None)
     # n = 6144, 16 parents: local 7.2 + 8.5 = 15.7 GB > 12 GB; distributed 7.5 + 3 GB of contexts fits.
     monkeypatch.setattr(gpu_utils, "device_budget_bytes", lambda: 12 * GB)
-    assert w._dyson_route("local", 6144, 16, mesh) == "distributed"
+    assert w._dyson_route("local", 6144, 16, mesh)[0] == "distributed"
     row = gpu_utils.routes()[-1]
     assert "provider contexts" in row["reason"] and row["warning"] is None
 
@@ -153,13 +155,13 @@ def test_cufft_failures_price_conservatively(monkeypatch, capsys):
     from runtime import aot_memory as aot
     stats = NS(temp_size_in_bytes=100, argument_size_in_bytes=50, output_size_in_bytes=30,
                alias_size_in_bytes=0)
-    monkeypatch.setattr(aot, "_is_cuda_platform", lambda platform: True)
+    monkeypatch.setattr(aot, "_fft_plan_api", lambda platform: "cufft")
     drifted = NS(memory_analysis=lambda: stats, as_text=lambda: "%x = c128[8] fft(%y), weird")
     peak = aot.aot_kernel_peak_bytes(drifted, platform="cuda")
     assert peak.cufft_measured is False and peak.cufft_scratch == 130 and peak.total == 180 + 130
     text = ("%fft.0 = c128[2,4,4,4]{3,2,1,0} fft(%x.1), fft_type=FFT, fft_length={4,4,4}")
 
-    def refuse(specs):
+    def refuse(specs, api="cufft"):
         raise aot.CufftQueryError("libcufft absent")
     monkeypatch.setattr(aot, "query_cufft_workspace_bytes", refuse)
     parsed = NS(memory_analysis=lambda: stats, as_text=lambda: text)

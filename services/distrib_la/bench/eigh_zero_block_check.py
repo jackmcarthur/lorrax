@@ -27,9 +27,10 @@ Reported, not checked: the bare library at its default and retry layouts.
 """
 import sys
 
-import numpy as np
-
+# runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
 from runtime import initialize_communicator_stack, run_main_and_finalize
+
+import numpy as np  # noqa: E402
 RUNTIME = initialize_communicator_stack()
 
 

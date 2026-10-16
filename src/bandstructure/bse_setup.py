@@ -61,6 +61,7 @@ from .fh_interp import (
     newton_inv,
     require_newton_converged,
 )
+from distrib_la import eigh_local
 
 
 #: ``compute_wfns_fi``'s jits, keyed per SIGNATURE and held for the process.
@@ -831,7 +832,7 @@ def compute_wfns_fi(
             def _q_batch(q_batch, fH_R, B, b_min, b_max):
                 """Native: Fourier sum → batched eigh → projection, ONE fused
                 jit."""
-                lam, U = jnp.linalg.eigh(_fourier(q_batch, fH_R, True))
+                lam, U = eigh_local(_fourier(q_batch, fH_R, True))
                 return _project(lam, U, B, b_min, b_max)
             return _q_batch
         return _cached_kernel(("q_batch", _sig, int(bs_)), _build)

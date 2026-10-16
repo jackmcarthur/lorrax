@@ -97,8 +97,8 @@ static bool lu_no_pivot() {
 static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,
                                            cudaEvent_t  ev) {
-    LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
+    LORRAX_GPU_CHECK(cudaEventRecord(ev, signaller));
+    LORRAX_GPU_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
     return ffi::Error::Success();
 }
 
@@ -130,13 +130,13 @@ static ffi::Error BatchedSolveLuImpl(
     // (unless aliased).  getrf and getrs are in-place on their output
     // buffers.
     if (d_A_factored_out != static_cast<const T*>(d_A_in)) {
-        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
+        LORRAX_GPU_CHECK(cudaMemcpyAsync(
             d_A_factored_out, d_A_in,
             nq * A_slice * sizeof(T),
             cudaMemcpyDeviceToDevice, ctx->stream));
     }
     if (d_X_out != static_cast<const T*>(d_B_in)) {
-        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
+        LORRAX_GPU_CHECK(cudaMemcpyAsync(
             d_X_out, d_B_in,
             nq * B_slice * sizeof(T),
             cudaMemcpyDeviceToDevice, ctx->stream));
@@ -147,9 +147,9 @@ static ffi::Error BatchedSolveLuImpl(
     // non-deterministic wrong answers on 2D grids.
     int64_t* d_ipiv = nullptr;
     const size_t ipiv_bytes = static_cast<size_t>(nq) * ipiv_slice * sizeof(int64_t);
-    LORRAX_CUDA_CHECK(cudaMalloc(
+    LORRAX_GPU_CHECK(cudaMalloc(
         reinterpret_cast<void**>(&d_ipiv), ipiv_bytes));
-    LORRAX_CUDA_CHECK(cudaMemsetAsync(d_ipiv, 0, ipiv_bytes, ctx->stream));
+    LORRAX_GPU_CHECK(cudaMemsetAsync(d_ipiv, 0, ipiv_bytes, ctx->stream));
 
     cusolverMpMatrixDescriptor_t descA = nullptr, descB = nullptr;
     LORRAX_LIB_CHECK(
@@ -200,9 +200,9 @@ static ffi::Error BatchedSolveLuImpl(
     void* d_ws_s_buf = nullptr;
     void* h_ws_f_buf = nullptr;
     void* h_ws_s_buf = nullptr;
-    if (d_ws_f > 0) LORRAX_CUDA_CHECK(cudaMallocAsync(
+    if (d_ws_f > 0) LORRAX_GPU_CHECK(cudaMallocAsync(
         &d_ws_f_buf, d_ws_f, ctx->stream));
-    if (d_ws_s > 0) LORRAX_CUDA_CHECK(cudaMallocAsync(
+    if (d_ws_s > 0) LORRAX_GPU_CHECK(cudaMallocAsync(
         &d_ws_s_buf, d_ws_s, ctx->stream));
     if (h_ws_f > 0) {
         h_ws_f_buf = std::malloc(h_ws_f);
@@ -305,11 +305,11 @@ static ffi::Error BatchedGetrfImpl(
     }
     const int64_t A_slice = lld_A * local_cols;
     if (d_LU_out != d_A_in) {
-        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
+        LORRAX_GPU_CHECK(cudaMemcpyAsync(
             d_LU_out, d_A_in, nq * A_slice * sizeof(T),
             cudaMemcpyDeviceToDevice, ctx->stream));
     }
-    LORRAX_CUDA_CHECK(cudaMemsetAsync(
+    LORRAX_GPU_CHECK(cudaMemsetAsync(
         d_ipiv_out, 0, nq * ipiv_len * sizeof(int64_t), ctx->stream));
 
     cusolverMpMatrixDescriptor_t descA = nullptr;
@@ -389,7 +389,7 @@ static ffi::Error BatchedGetrsImpl(
     const int64_t A_slice = lld_A * A_local_cols;
     const int64_t B_slice = lld_A * B_local_cols;
     if (d_X_out != d_B_in) {
-        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
+        LORRAX_GPU_CHECK(cudaMemcpyAsync(
             d_X_out, d_B_in, nq * B_slice * sizeof(T),
             cudaMemcpyDeviceToDevice, ctx->stream));
     }

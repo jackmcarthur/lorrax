@@ -1,12 +1,13 @@
 """Shared scale-relative rank discovery for iterative eigensolvers."""
 import jax.numpy as jnp
+from distrib_la import eigh_local
 
 _RANK_DROP_RTOL = 1e-10
 _TINY = 1e-300
 
 def _rank_whitener(S):
     """One rank cutoff and coefficient construction for Davidson correction blocks."""
-    e, U = jnp.linalg.eigh(S)                 # ascending, e real
+    e, U = eigh_local(S)                 # ascending, e real
     e = e[::-1]
     U = U[:, ::-1]                            # descending
     thresh = _RANK_DROP_RTOL * jnp.maximum(e[0], 0.0)

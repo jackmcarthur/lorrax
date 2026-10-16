@@ -54,8 +54,8 @@ static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,
                                            cudaEvent_t  ev) {
     NvtxRange range("potrf.cross_stream_wait");
-    LORRAX_CUDA_CHECK(cudaEventRecord(ev, signaller));
-    LORRAX_CUDA_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
+    LORRAX_GPU_CHECK(cudaEventRecord(ev, signaller));
+    LORRAX_GPU_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
     return ffi::Error::Success();
 }
 
@@ -82,7 +82,7 @@ static ffi::Error BatchedPotrfImpl(
     // of transient VRAM per rank for potrf and ~1.7 GB for potrs.
     if (d_L_out != static_cast<const T*>(d_A_in)) {
         NvtxRange range("potrf.copy_A_to_L");
-        LORRAX_CUDA_CHECK(cudaMemcpyAsync(
+        LORRAX_GPU_CHECK(cudaMemcpyAsync(
             d_L_out, d_A_in,
             nq * slice_elems * sizeof(T),
             cudaMemcpyDeviceToDevice, ctx->stream));

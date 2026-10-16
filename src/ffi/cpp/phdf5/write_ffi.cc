@@ -111,8 +111,9 @@
 #include <utility>
 #include <vector>
 
-#ifndef LORRAX_FFI_NO_CUDA
-#include <cuda_runtime.h>
+#include "../common/leg.h"
+#if LRX_LEG_DEVICE
+#include "gpu_runtime.h"
 #endif
 #include <hdf5.h>
 
@@ -190,9 +191,9 @@ static void async_worker(
     };
     auto t0 = now();
 
-#ifndef LORRAX_FFI_NO_CUDA
+#if LRX_LEG_DEVICE
     if (wait_for_d2h) {
-        cudaEventSynchronize(ctx->d2h_event);
+        (void)lrx::gpu::event_synchronize(ctx->d2h_event);
     }
 #else
     (void)wait_for_d2h;   // no D2H copy on the host build (seam 3)
@@ -687,7 +688,7 @@ static ffi::Future WriteDispatchImpl(
     }
 
     // ---- Seam 3: get the local shard to a host pointer H5Dwrite can read.
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
     // Host platform: the XLA buffer already IS host memory.  H5Dwrite reads
     // it IN PLACE — no staging allocation, no copy, nothing to wait on.
     // (Staging here would cost a second full copy of the per-rank ζ shard
@@ -735,16 +736,16 @@ static ffi::Future WriteDispatchImpl(
     // Python worker serialises writes so by the time the next
     // handler runs, the previous H5Dwrite has already consumed
     // pinned_buf.
-    cudaError_t ce = cudaMemcpyAsync(src_buf, A.untyped_data(), bytes,
-                                     cudaMemcpyDeviceToHost, ctx->stream);
-    if (ce != cudaSuccess) {
+    lrx::gpu::Error ce = lrx::gpu::memcpy_async(src_buf, A.untyped_data(), bytes,
+                                     lrx::gpu::kDeviceToHost, ctx->stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "phdf5 write: cudaMemcpyAsync D2H failed: "
-           << cudaGetErrorString(ce);
+        os << "phdf5 write: " LRX_GPU_API "MemcpyAsync D2H failed: "
+           << lrx::gpu::error_string(ce);
         return fail(ffi::ErrorCode::kInternal, os.str());
     }
-    cudaEventRecord(ctx->d2h_event, ctx->stream);
-#endif  // LORRAX_FFI_NO_CUDA
+    (void)lrx::gpu::event_record(ctx->d2h_event, ctx->stream);
+#endif  // !LRX_LEG_DEVICE
 
     // Standard Promise/Future handshake: construct promise, construct
     // future from it (one-shot), then move promise into the task

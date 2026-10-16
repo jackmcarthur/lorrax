@@ -27,8 +27,9 @@
 // (cudaMallocHost vs aligned host malloc) switch on this flag.  The CUDA
 // build leaves it undefined and compiles the stream/event/pinned members
 // below; the host build drops them.
-#ifndef LORRAX_FFI_NO_CUDA
-#include <cuda_runtime.h>
+#include "../common/leg.h"
+#if LRX_LEG_DEVICE
+#include "gpu_runtime.h"
 #endif
 #include <mpi.h>
 #include <hdf5.h>
@@ -91,11 +92,8 @@ inline bool env_flag(const char* name, bool default_value) {
 // is the ABI name.  Bump the version when a layout changes in a way that a
 // stale .so could be handed — the version is an ABI generation, not a
 // release number.
-#ifdef LORRAX_FFI_NO_CUDA
-#  define LORRAX_PHDF_CTX_TYPE PhdfCtxHostV2
-#else
-#  define LORRAX_PHDF_CTX_TYPE PhdfCtxCudaV2
-#endif
+// Per leg (common/leg.h): PhdfCtxHostV2 / PhdfCtxCudaV2 / PhdfCtxRocmV2.
+#define LORRAX_PHDF_CTX_TYPE LRX_LEG_TAG(PhdfCtx, V2)
 
 struct LORRAX_PHDF_CTX_TYPE {
     // Identity / process grid
@@ -185,9 +183,9 @@ struct LORRAX_PHDF_CTX_TYPE {
     // std::atomic<std::thread::id> so the guard needs nothing exotic; a hash
     // collision only means one illegal call is not caught.
     std::atomic<unsigned long long> writer_tid_hash{0};
-#ifndef LORRAX_FFI_NO_CUDA
+#if LRX_LEG_DEVICE
     // private CUDA stream for D2H/H2D copies.
-    cudaStream_t stream              = nullptr;
+    lrx::gpu::Stream stream              = nullptr;
     int          cuda_device         = -1;         // CUDA device id the main thread was on at open_ctx time; the writer_thread binds here before running any CUDA API (otherwise GPU pointers from main thread's context aren't recognised → cudaErrorMemoryAllocation on cudaMemcpyAsync).
     // Reused I/O-completion events.  Created in open_ctx, destroyed
     // in close_ctx.  Per-call cudaEventCreate/Destroy blocks for
@@ -198,8 +196,8 @@ struct LORRAX_PHDF_CTX_TYPE {
     // completion signalled to xla_stream so downstream ops wait).
     // Safe to reuse because reads and writes are serialised through
     // the Python worker / writer thread.
-    cudaEvent_t  d2h_event           = nullptr;
-    cudaEvent_t  h2d_event           = nullptr;
+    lrx::gpu::Event  d2h_event           = nullptr;
+    lrx::gpu::Event  h2d_event           = nullptr;
 #endif
 
     // ─── Async-write worker ─────────────────────────────────────────

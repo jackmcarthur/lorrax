@@ -158,13 +158,14 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
             "sample_face_count": sample_faces}
 
 
-def constructor_eigenplan(mesh_xy, side, execution, room=None):
+def constructor_eigenplan(mesh_xy, side, execution, room=None, *, backend):
     """The eigh service plan of a constructor layout: whole parents per rank
     ('local', the q-local kernel) or the complete mesh ('face', ``face_eigh``:
-    distrib_la decides each stack against ``room``, which is in no cache key)."""
+    distrib_la decides each stack against ``room``, which is in no cache key,
+    for the deck's eigh request ``backend``, ``LinalgResolution.eigh_backend``)."""
     if execution == "face":
         from gw.shared_pole_execution import face_eigh
-        return face_eigh(mesh_xy, int(side), room)
+        return face_eigh(mesh_xy, int(side), room, backend=backend)
     return _local_eigenplan(mesh_xy, int(side))
 
 
@@ -302,7 +303,8 @@ class ConstructorCapacity:
         """One service plan per configured execution layout and actual side;
         a face plan decides its stacks against ``face_room``."""
         return constructor_eigenplan(self._mesh_xy, int(side), self.execution,
-                                     self.face_room if self.execution == "face" else None)
+                                     self.face_room if self.execution == "face" else None,
+                                     backend=self._resolution.eigh_backend)
 
     def query_workspace(self, op, shapes, plan):
         """Native workspace bytes per rank for one op at one shape, cached."""
@@ -357,7 +359,8 @@ class ConstructorCapacity:
         # stack one whole matrix per rank is what this admission leaves over.
         self._native_maxima["eigh"] = max(self.query_workspace(
             "eigh", ((self.batch_width, extent, extent),),
-            constructor_eigenplan(self._mesh_xy, int(extent), self.execution))
+            constructor_eigenplan(self._mesh_xy, int(extent), self.execution,
+                                  backend=self._resolution.eigh_backend))
             for extent in sorted(extents))
         self._workspace = sum(self._native_maxima.values())
 

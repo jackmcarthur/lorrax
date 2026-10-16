@@ -1,16 +1,18 @@
 """Shared selection and attestation for LORRAX native provider bundles.
 
-``lxkit`` owns policy, never a provider's symbol tables.  Callers supply the
-two platform records (file name, existing pin, build hint and candidates);
+``lxkit`` owns policy, never a provider's symbol tables.  The legs
+themselves (file name, pin, ABI symbol) are :data:`lxkit.legs.LEGS`; callers
+supply their own records over them (build hint and candidates);
 this module supplies the one decision procedure used by both
 ``ffi.common.ffi_loader`` and the independently installable
 ``distrib_la.loader``.
 
-A sealed deployment is one relocatable directory containing both platform
-libraries and one ``lorrax_ffi_bundle.json``.  The manifest binds both FFI
-files, the handler ABI, the source revision and every private redistributable
-dependency by size and SHA-256.  MPI, site HDF5, CUDA runtime libraries and
-NCCL are deliberately outside that closure.  Their identity belongs to the
+A sealed deployment is one relocatable directory containing a leg pair (the
+host leg and one device leg: CUDA or ROCM) and one ``lorrax_ffi_bundle.json``.
+The manifest binds both FFI files, the handler ABI, the source revision and
+every private redistributable dependency by size and SHA-256.  MPI, site HDF5,
+the device runtime (CUDA or ROCm/HIP) and its collectives (NCCL, RCCL) are
+deliberately outside that closure.  Their identity belongs to the
 machine runtime and is checked live, not copied into a Python package.
 
 Unsealed build-tree artifacts remain loadable during migration, but every
@@ -36,6 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence, Type
 
+from lxkit.legs import HOST, LEGS
+
 from lxkit.probe import LibraryNotBuilt, LibraryUnusable
 
 __all__ = [
@@ -43,13 +47,22 @@ __all__ = [
     "assert_one_mapped_mpi_runtime", "check_abi", "checkout_build_dir",
     "describe_library",
     "is_private_redistributable", "locate_library", "open_and_attest",
-    "process_can_use_cuda",
     "refuse_private_library",
 ]
 
 BUNDLE_MANIFEST = "lorrax_ffi_bundle.json"
 _MANIFEST_SCHEMA = 1
-_PLATFORMS = frozenset(("CUDA", "cpu"))
+
+
+def _is_leg_pair(names) -> bool:
+    """A sealed bundle binds exactly the host leg and one device leg."""
+    names = set(names)
+    return (len(names) == 2 and HOST.key in names
+            and all(n == HOST.key or (n in LEGS and LEGS[n].accelerator) for n in names))
+
+
+def _pin_names(names) -> str:
+    return " and ".join(LEGS[n].so_env for n in sorted(names) if n in LEGS)
 _ANNOUNCED: set[tuple[str, str]] = set()
 _PRIVATE_HANDLES: dict[str, tuple[ctypes.CDLL, ...]] = {}
 
@@ -126,6 +139,12 @@ _RUNTIME_OWNED = (
     re.compile(r"^libnvjitlink", re.I),
     re.compile(r"^libnvidia", re.I),
     re.compile(r"^libnccl", re.I),
+    # ROCm: the HIP/HSA runtime, the code-object manager, the vendor math
+    # libraries and RCCL belong to the machine's ROCm, as CUDA's do above.
+    re.compile(r"^lib(?:amdhip64|hsa-runtime64|hsakmt|amd_comgr|hiprtc)", re.I),
+    re.compile(r"^lib(?:hip|roc)(?:blas|blaslt|fft|solver|sparse|rand)", re.I),
+    re.compile(r"^librccl", re.I),
+    re.compile(r"^libamd_smi", re.I),
     re.compile(r"^ld-linux", re.I),
     re.compile(
         r"^lib(?:c|m|dl|pthread|rt|util|resolv|crypt|gcc_s|stdc[+][+]|gomp|"
@@ -146,9 +165,9 @@ def _refuse_runtime_owned(path: Path, unusable_cls: Type[OSError]) -> None:
     if any(rx.search(name) for rx in _RUNTIME_OWNED):
         raise unusable_cls(
             f"sealed native bundle lists runtime-owned {name!r} as a private "
-            "library.  MPI, site HDF5, CUDA runtime/driver libraries and NCCL "
-            "must come from the selected machine runtime; never copy them into "
-            "a LORRAX bundle.")
+            "library.  MPI, site HDF5, the CUDA or ROCm runtime/driver "
+            "libraries and NCCL/RCCL must come from the selected machine "
+            "runtime; never copy them into a LORRAX bundle.")
 
 
 def refuse_private_library(path: str | Path,
@@ -257,14 +276,15 @@ def _read_bundle(manifest: Path, *, expected_abi: int,
             "production bundle must correspond to one immutable commit.")
 
     records = doc.get("libraries")
-    if not isinstance(records, dict) or set(records) != _PLATFORMS:
+    if not isinstance(records, dict) or not _is_leg_pair(records):
         raise unusable_cls(
-            f"native bundle manifest {manifest} must bind exactly the CUDA and "
-            f"cpu legs; got {sorted(records) if isinstance(records, dict) else records}")
+            f"native bundle manifest {manifest} must bind exactly the host leg "
+            f"and one device leg (CUDA or ROCM); got "
+            f"{sorted(records) if isinstance(records, dict) else records}")
     root = manifest.parent.resolve()
     paths: dict[str, Path] = {}
     hashes: dict[str, str] = {}
-    for platform in sorted(_PLATFORMS):
+    for platform in sorted(records):
         paths[platform], hashes[platform] = _verify_file(
             records[platform], root, field=f"libraries.{platform}",
             unusable_cls=unusable_cls)
@@ -381,17 +401,22 @@ def locate_library(
         return selected[platform]
     if len(claimed) != 1:
         raise unusable_cls(
-            "mixed native providers: selected CUDA and cpu legs claim different "
+            "mixed native providers: the selected legs claim different "
             f"bundle manifests: {sorted(str(p) for p in claimed)}")
-    if pinned_platforms and pinned_platforms != _PLATFORMS:
-        raise unusable_cls(
-            "partial sealed-bundle override refused: LORRAX_FFI_SO and "
-            "LORRAX_FFI_HOST_SO must either both be unset or both select the "
-            f"same two-leg bundle; pinned platforms={sorted(pinned_platforms)}")
-
     att = _read_bundle(next(iter(claimed)), expected_abi=expected_abi,
                        unusable_cls=unusable_cls)
-    for name in sorted(_PLATFORMS):
+    bundle_legs = set(att.libraries)
+    if platform not in bundle_legs:
+        raise unusable_cls(
+            f"sealed bundle {att.manifest_path} binds the {sorted(bundle_legs)} "
+            f"legs, not {platform}; select a bundle built for this platform")
+    pinned_in_pair = pinned_platforms & bundle_legs
+    if pinned_in_pair and pinned_in_pair != bundle_legs:
+        raise unusable_cls(
+            f"partial sealed-bundle override refused: {_pin_names(bundle_legs)} "
+            "must either both be unset or both select the same two-leg bundle; "
+            f"pinned platforms={sorted(pinned_platforms)}")
+    for name in sorted(bundle_legs):
         chosen = selected.get(name)
         expected = att.libraries[name]
         if chosen is None:
@@ -671,7 +696,7 @@ def _announce_loaded(path: Path, origin: Path,
         _ANNOUNCED.add(key)
         libs = ",".join(
             f"{name}={att.libraries[name]}#{att.library_hashes[name][:12]}"
-            for name in ("CUDA", "cpu"))
+            for name in sorted(att.libraries))
         print(
             f"[lorrax native] sealed bundle={att.bundle_id[:16]} "
             f"source={att.source_revision[:12]} abi={att.abi} {libs} "
@@ -765,22 +790,6 @@ def open_and_attest(
         _attest_private_mapping(att, unusable_cls)
     _announce_loaded(selected, origin, att)
     return lib, origin
-
-
-def process_can_use_cuda(*, environ: Mapping[str, str] | None = None,
-                         device_visible=None) -> bool:
-    """Whether this process can host a CUDA handler, without importing JAX."""
-    env = os.environ if environ is None else environ
-    first = env.get("JAX_PLATFORMS", "").split(",")[0].strip().lower()
-    if first and first not in ("cuda", "gpu"):
-        return False
-    cvd = env.get("CUDA_VISIBLE_DEVICES")
-    if cvd is not None and cvd.strip() == "":
-        return False
-    if device_visible is None:
-        device_visible = lambda: (any(Path("/dev").glob("nvidia[0-9]*"))
-                                  or Path("/dev/nvidiactl").exists())
-    return bool(device_visible())
 
 
 def describe_library(path: str | Path) -> str:

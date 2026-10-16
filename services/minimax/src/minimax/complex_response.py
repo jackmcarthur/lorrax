@@ -119,7 +119,7 @@ def _pencil(lo, hi, poles, tol, decay_rate):
     return eta, zps, geometry, size
 
 
-def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None):
+def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None, pencil=None):
     """Complex times shared by every pole, or None.
 
     A stacked (multi-channel) Hankel shift pencil: each pole contributes the
@@ -134,18 +134,87 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
         if fits is not None:
             return previous, fits
     eta, zps, geometry, size = _pencil(lo, hi, poles, tol, decay_rate)
+    columns = _pencil_columns(size, len(zps))
+    steps = [(padding, (geometry+padding)/(2*size)) for padding, _ in _GEOMETRIES]
+    # Each geometry's pencil depends on its padding only, never on a decision,
+    # so a source may build the next one while this one is scanned.
+    source = (host_pencils if pencil is None else pencil)(zps, size, columns, steps)
+    try:
+        for g, ((_, flatten), (_, step), (s, shift)) in enumerate(zip(_GEOMETRIES, steps, source)):
+            start = list(order)
+            got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift)
+            if got is not None and pencil is not None and not _resolved(pencil, s, got[2]):
+                # The source cannot resolve the accepted count's smallest
+                # singular value: the geometry is decided on the reference
+                # pencil, rebuilt and scanned again from the same pole order.
+                # The accepted node set is then the reference's own (bitwise,
+                # when the source's earlier decisions match); a rejection
+                # there is the reference's, and the scan goes on.
+                order[:] = start
+                s, shift = next(host_pencils(zps, size, columns, steps[g:g+1]))
+                got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift)
+            if got is not None:
+                return got[:2]
+    finally:
+        source.close()
+    return None
+
+
+#: A pencil source's acceptance stands when its declared singular-value error
+#: (``pencil.sigma_error``, in units of sigma_max) resolves the accepted count's
+#: smallest singular value to this relative accuracy; otherwise the reference
+#: decides that geometry. Fe V2 (device dilation, sigma_error 8 eps): the
+#: accepted counts' bounds are 2.5e-2 for group [0:22] (sigma_80/sigma_1 =
+#: 8.9e-15, nodes off by 4e-3) and <= 4.7e-5 for every other group (nodes
+#: within 3e-7 of the reference), pool logs rcgpu_ab4, rcgpu_ab6.
+_SOURCE_SIGMA_RTOL = 1e-3
+
+
+def _resolved(pencil, s, n):
+    """True when the source resolves sigma_n of its accepted count n (see _SOURCE_SIGMA_RTOL)."""
+    error = getattr(pencil, "sigma_error", None)
+    return error is not None and error*s[0] <= _SOURCE_SIGMA_RTOL*s[n - 1]
+
+
+#: (padding, flattening) of the proposal geometries, scanned in order.
+# A short interval ending near the resonance gives growing modes. Extend
+# only the proposal geometry; fit/check the physical interval.
+_GEOMETRIES = ((0., 1.), (2., .9), (4., .9), (8., 1.), (10., 1.), (16., .9))
+
+
+def _pencil_columns(size, npoles):
+    """Column subset of each pole's Hankel block.
+
+    The shared exponentials live in the ROW space (index i). A column subset
+    dense near j=0, where 1/(x-z_p) varies fastest, and geometric beyond spans
+    it; the stack stays ~2*size wide for any group.
+    """
     ids = np.arange(size)
-    for padding, flatten in ((0., 1.), (2., .9), (4., .9), (8., 1.), (10., 1.), (16., .9)):
-        # A short interval ending near the resonance gives growing modes.
-        # Extend only the proposal geometry; fit/check the physical interval.
-        step = (geometry+padding)/(2*size)
+    width = max(32, 2*size//npoles)
+    return np.unique(np.r_[ids[:16], np.round(np.geomspace(16, size-1, width)).astype(int)])
+
+
+def host_pencils(zps, size, columns, steps):
+    """The reference shift pencils, one ``(s, shift)`` per ``(padding, step)``, lazily.
+
+    Pole p's block is ``B_p[i, c] = 1/(-padding + (i + columns[c])*step - zp)``
+    over ``i < size``, scaled to unit Frobenius norm, and its shifted block is
+    the same scale over ``base + step``. The stack ``H = [B_1 .. B_P]`` is
+    factored through its tall adjoint, ``H = R^H Q^H``, and the SVD of the
+    small ``R^H = U S W^H`` gives H's singular triplets at QR cost. ``s`` holds
+    the singular values in descending order (at least ``rank``) and ``shift``
+    is the ``rank x rank`` projection ``U_r^H [shifted] Q W_r``, ``rank =
+    min(RESPONSE_RULE_CAPACITY, len(s))``.
+
+    This is the contract of the ``pencil`` argument of
+    :class:`ResponseGroupTree`: a source with the same signature (a generator
+    of the same pairs) may compute them anywhere; :func:`_shared_times` reads
+    nothing else of a geometry. Host scipy at the pinned BLAS thread count.
+    """
+    ids = np.arange(size)
+    for padding, step in steps:
         base = -padding+(ids[:, None]+ids[None, :])*step
         blocks, shifted = [], []
-        # The shared exponentials live in the ROW space (index i). A column
-        # subset dense near j=0, where 1/(x-z_p) varies fastest, and geometric
-        # beyond spans it; the stack stays ~2*size wide for any group.
-        width = max(32, 2*size//len(zps))
-        columns = np.unique(np.r_[ids[:16], np.round(np.geomspace(16, size-1, width)).astype(int)])
         for zp in zps:
             block = 1/(base[:, columns]-zp)
             scale = 1/la.norm(block)
@@ -157,29 +226,33 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
         q, r = la.qr(np.hstack(blocks).conj().T, mode="economic", check_finite=False)
         u, s, wh = la.svd(r.conj().T, check_finite=False)
         rank = min(RESPONSE_RULE_CAPACITY, len(s))
-        shift = u[:, :rank].conj().T@(np.hstack(shifted)@q)@wh[:rank].conj().T
-        best, best_n = np.inf, 0
-        for n in range(8, rank + 1, 4):
-            roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
-                              check_finite=False)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                t = -np.log(roots)/step
-            if not np.isfinite(t).all() or np.any(t.real < 0):
-                continue
-            times = (flatten*t.real+1j*t.imag)/eta
-            if decay_rate:
-                times = times[times.real <= decay_rate]
-            if not len(times):
-                continue
-            fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate, order)
-            if fits is not None:
-                return times, fits
-            if mass_rejected:
-                break  # Try the next padding/flattening geometry, not more cancelling terms.
-            if error < best/10:
-                best, best_n = error, n
-            elif patience is not None and n - best_n >= patience:
-                break  # No decade of accuracy in this many more exponentials.
+        yield s, u[:, :rank].conj().T@(np.hstack(shifted)@q)@wh[:rank].conj().T
+
+
+def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift):
+    """Node counts n = 8, 12, ... of one geometry's pencil: ``(times, fits, n)`` or None."""
+    best, best_n = np.inf, 0
+    for n in range(8, len(shift) + 1, 4):
+        roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
+                          check_finite=False)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = -np.log(roots)/step
+        if not np.isfinite(t).all() or np.any(t.real < 0):
+            continue
+        times = (flatten*t.real+1j*t.imag)/eta
+        if decay_rate:
+            times = times[times.real <= decay_rate]
+        if not len(times):
+            continue
+        fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate, order)
+        if fits is not None:
+            return times, fits, n
+        if mass_rejected:
+            return None  # Try the next padding/flattening geometry, not more cancelling terms.
+        if error < best/10:
+            best, best_n = error, n
+        elif patience is not None and n - best_n >= patience:
+            return None  # No decade of accuracy in this many more exponentials.
     return None
 
 
@@ -247,7 +320,7 @@ def _rule(z, sets):
 
 
 def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-                         decay_rate=0.):
+                         decay_rate=0., pencil=None):
     """Shared complex-time rules for a group of response samples.
 
     Built at the Sigma rule builder's pinned BLAS thread count: the Hankel
@@ -275,56 +348,148 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     decay_rate bounds occupation products by min(1,exp(decay_rate*d)); errors
     then use that envelope and 0<=Re(t)<=decay_rate. Bounds are sampled, not
     proven.
+
+    The serial walk of :class:`ResponseGroupTree`; a caller with idle
+    processes evaluates the tree's attempts there and passes them to
+    :meth:`ResponseGroupTree.rules` for the same bytes.
+
+    ``pencil`` is the source of each geometry's shift pencil (the contract of
+    :func:`host_pencils`, the default). Only the pencil's arithmetic moves
+    with it: every acceptance decision, tolerance and group stays here, on
+    the host. A geometry that accepts on another source is rebuilt on
+    :func:`host_pencils` and scanned again, so an accepted node set is the
+    reference's own; only rejections are decided on the source's rounding.
     """
-    lo, hi = float(lo_ry), float(hi_ry)
-    z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
-    if (not z.size or not np.isfinite([lo, hi, rel_tol, decay_rate]).all()
-            or not np.isfinite(z).all() or decay_rate < 0 or hi <= lo
-            or np.any(z.imag <= 0) or not 1e-13 <= rel_tol < .1):
-        raise ValueError('invalid response frequency/domain/tolerance')
-    reference = 0. if decay_rate else lo
-    old = {frozenset(rule["members"]): rule["t"][:rule["count"]]
-           for rule in (previous or ())}
+    return ResponseGroupTree(lo_ry, hi_ry, z_ry, rel_tol=rel_tol, previous=previous,
+                             decay_rate=decay_rate, pencil=pencil).rules()
 
-    def size(members):
-        return _pencil(lo, hi, _poles(z[members]), rel_tol/2, decay_rate)[3]
 
-    def build(members):
-        poles = _poles(z[members])
+class ResponseGroupTree:
+    """The halving tree of :func:`response_group_rules`, one node per member set.
+
+    A node is a tuple of indices into ``z_ry``; its children are its two
+    halves. ``attempt(node)`` is the node's whole-group construction (shared
+    pencil, else the imaginary-axis set; for one sample also the separate
+    forward/reverse sets) and is a pure function of the node on one machine
+    class at the pinned BLAS thread count, so it may run on any process. The
+    serial walk builds a node whole when its attempt succeeds and its halves
+    otherwise; ``rules(attempts)`` takes attempts evaluated elsewhere, keyed by
+    node, and computes any it is not given. A one-sample attempt never returns
+    None: it returns its rule or raises the refusal. ``pencil`` is the shift
+    pencils' source (:func:`response_group_rules`); with a device source an
+    attempt is a pure function of its node on one device class instead.
+    """
+
+    def __init__(self, lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None, decay_rate=0.,
+                 pencil=None):
+        lo, hi = float(lo_ry), float(hi_ry)
+        z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
+        if (not z.size or not np.isfinite([lo, hi, rel_tol, decay_rate]).all()
+                or not np.isfinite(z).all() or decay_rate < 0 or hi <= lo
+                or np.any(z.imag <= 0) or not 1e-13 <= rel_tol < .1):
+            raise ValueError('invalid response frequency/domain/tolerance')
+        self.lo, self.hi, self.z, self.rel_tol, self.decay_rate = lo, hi, z, rel_tol, decay_rate
+        self.pencil = pencil
+        self.reference = 0. if decay_rate else lo
+        self.root = tuple(range(len(z)))
+        self._old = {frozenset(rule["members"]): rule["t"][:rule["count"]]
+                     for rule in (previous or ())}
+
+    def size(self, members):
+        """Shift-pencil sample count of a node (its attempt costs ~size^3 per geometry)."""
+        return _pencil(self.lo, self.hi, _poles(self.z[list(members)]), self.rel_tol/2,
+                       self.decay_rate)[3]
+
+    def pencil_shapes(self, members):
+        """``(size, poles, columns)`` of every shift pencil an attempt on the node may build.
+
+        The group's stacked pencil and, for one sample, each pole's own (its
+        separate-sets fallback). A device pencil source compiles these ahead.
+        """
+        poles = _poles(self.z[list(members)])
+        out = []
+        for ps in [poles] + ([poles[i:i+1] for i in range(len(poles))] if len(members) == 1 else []):
+            size = _pencil(self.lo, self.hi, ps, self.rel_tol/2, self.decay_rate)[3]
+            out.append((size, len(ps), len(_pencil_columns(size, len(ps)))))
+        return out
+
+    def children(self, members):
+        """The two halves of a node; () for one sample."""
         half = len(members)//2
-        if len(members) > 1 and size(members) > max(size(members[:half]), size(members[half:])):
-            # The narrowest height (one half) and the farthest reach (the
-            # other) widen the whole pencil past both halves': it costs size^3
-            # per geometry, and every such group measured failed its shared
-            # fit after all six geometries (Si 40 and Fe 27 samples; Si 22
-            # samples reaching 22-42 eV; CHIRULE 2026-10-06), so the halves
-            # are built directly, exactly as they were after that failure.
-            return build(members[:half]) + build(members[half:])
-        got = _shared_times(lo, hi, poles, rel_tol/2, old.get(frozenset(members)), decay_rate,
-                            patience=None if len(members) == 1 else _STAGNATION_NODES)
+        return () if len(members) == 1 else (tuple(members[:half]), tuple(members[half:]))
+
+    def tried(self, members):
+        """False when the node's pencil is wider than both halves': built as halves untried."""
+        # The narrowest height (one half) and the farthest reach (the
+        # other) widen the whole pencil past both halves': it costs size^3
+        # per geometry, and every such group measured failed its shared
+        # fit after all six geometries (Si 40 and Fe 27 samples; Si 22
+        # samples reaching 22-42 eV; CHIRULE 2026-10-06), so the halves
+        # are built directly, exactly as they were after that failure.
+        halves = self.children(members)
+        return not halves or self.size(members) <= max(self.size(h) for h in halves)
+
+    def attempt(self, members):
+        """``[rule]`` built whole on the node, or None (build its halves)."""
+        with _pinned_blas_threads():
+            return self._attempt(list(members))
+
+    def _attempt(self, members):
+        lo, hi, z, tol, decay_rate = self.lo, self.hi, self.z, self.rel_tol/2, self.decay_rate
+        poles = _poles(z[members])
+        got = _shared_times(lo, hi, poles, tol, self._old.get(frozenset(members)), decay_rate,
+                            patience=None if len(members) == 1 else _STAGNATION_NODES,
+                            pencil=self.pencil)
         if got is None:
             # Where the pencil fails, the closed-form imaginary-axis set serves
             # every pole when it fits the pencil's capacity (two pencils' for
             # one sample, whose poles could otherwise take two sets).
-            got = _imaginary_times(lo, hi, poles, rel_tol/2, decay_rate, RESPONSE_NODE_CAPACITY
+            got = _imaginary_times(lo, hi, poles, tol, decay_rate, RESPONSE_NODE_CAPACITY
                                    if len(members) == 1 else RESPONSE_RULE_CAPACITY)
         if got is not None:
             rule = _rule(z[members], [(*got[:1], poles, got[1])])
-            return [dict(rule, members=list(members), reference_ry=reference)]
-        if len(members) == 1:
-            # Forward and reverse poles on separate node sets: each node then
-            # serves one orientation, exactly as separate per-pole rules do.
-            sets = []
-            for pole in poles:
-                one = np.asarray([pole])
-                got = _shared_times(lo, hi, one, rel_tol/2, None, decay_rate)
-                if got is None:
-                    raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
-                                     f'sample={z[members[0]]}, pole={pole}, tolerance={rel_tol}')
-                sets.append((got[0], one, got[1]))
-            rule = _rule(z[members], sets)
-            return [dict(rule, members=list(members), reference_ry=reference)]
-        return build(members[:half]) + build(members[half:])
+            return [dict(rule, members=list(members), reference_ry=self.reference)]
+        if len(members) > 1:
+            return None
+        # Forward and reverse poles on separate node sets: each node then
+        # serves one orientation, exactly as separate per-pole rules do.
+        sets = []
+        for pole in poles:
+            one = np.asarray([pole])
+            got = _shared_times(lo, hi, one, tol, None, decay_rate, pencil=self.pencil)
+            if got is None:
+                raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
+                                 f'sample={z[members[0]]}, pole={pole}, tolerance={self.rel_tol}')
+            sets.append((got[0], one, got[1]))
+        rule = _rule(z[members], sets)
+        return [dict(rule, members=list(members), reference_ry=self.reference)]
 
-    with _pinned_blas_threads():
-        return build(list(range(len(z))))
+    def pending(self, attempts):
+        """Tried nodes of the serial walk whose attempts are not in ``attempts``, in walk order."""
+        out = []
+
+        def walk(node):
+            if self.tried(node):
+                if node not in attempts:
+                    out.append(node)
+                    return
+                if attempts[node] is not None:
+                    return
+            for half in self.children(node):
+                walk(half)
+        walk(self.root)
+        return out
+
+    def rules(self, attempts=None):
+        """The serial walk's rules; attempts missing from ``attempts`` are computed here."""
+        attempts = {} if attempts is None else attempts
+
+        def build(node):
+            if self.tried(node):
+                got = attempts[node] if node in attempts else self._attempt(list(node))
+                if got is not None:
+                    return got
+            return [rule for half in self.children(node) for rule in build(half)]
+
+        with _pinned_blas_threads():
+            return build(self.root)

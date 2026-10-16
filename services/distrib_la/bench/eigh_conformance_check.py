@@ -24,9 +24,10 @@ host LAPACK to 1e-11 * max|w| where n <= 3000. Exit 1 on any FAIL.
 """
 import sys
 
-import numpy as np
-
+# runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
 from runtime import initialize_communicator_stack, run_main_and_finalize
+
+import numpy as np  # noqa: E402
 RUNTIME = initialize_communicator_stack()
 LOCAL_SIZES = (257, 389, 1144, 4576)
 LAPACK_LIMIT = 3000

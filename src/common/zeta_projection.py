@@ -92,6 +92,7 @@ from common import rank_criterion
 from common import spectral_closure
 from common.collectives import warm_mesh_cliques
 from common.contract_bands import contract_bands_block_reshard
+from distrib_la import eigh_local
 
 __all__ = [
     "least_squares_transfer",
@@ -203,7 +204,7 @@ def least_squares_transfer(
         raise ValueError(
             f"rcond must be in (0, 1) — it is a RELATIVE threshold on "
             f"λ/λ_max, got {rcond!r}.")
-    w, V = jnp.linalg.eigh(gram_S)              # ascending, replicated
+    w, V = eigh_local(gram_S)              # ascending, replicated
     lam_max = jnp.max(w, axis=-1, keepdims=True)
     keep = w > (float(rcond) * lam_max)
     # CLOSURE.  The cut above is a cap on amplification; it is not allowed to

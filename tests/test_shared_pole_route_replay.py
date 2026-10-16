@@ -29,7 +29,8 @@ from gw.shared_pole_sectors import sector_route
 import gw.shared_pole_execution as ex
 from gw.shared_pole_capacity import staged_sector_bytes, staged_cross_bytes
 from gw.shared_pole_execution import face_ritz_carrier, face_reduction_bytes, stage_width, staged_eigh
-ex._mesh_eigh = lambda mesh, n: NS(batched_route='scan', mesh=mesh)   # the mesh plan needs the native bundle
+ex._mesh_eigh = lambda mesh, n, backend: NS(batched_route='scan', mesh=mesh,   # the mesh plan needs the native bundle
+                                            require_capacity=lambda what: None)
 CASES = {  # name: (lines, imaginary, n, (CC logical, packed), (T logical, packed), nk, mesh side, nq, [(GB, upstream GB)])
     'ni14': (14, 4, 1194, (1194, 1216), (598, 640), 8000, 8, 641, [(36, 1.59)]),
     'ni': (32, 4, 1194, (1194, 1216), (598, 640), 8000, 8, 641, [(36, 1.59), (72, 1.59)]),
@@ -58,7 +59,7 @@ def round_decisions(mesh, ledger, up, rows, sides, cross_side, infinity):
     for row in (rows[1], rows[0]):
         name, packed = row['sector'], int(row['packed_extent'])
         stack = (R * max(1, tiles[name]['dense']), packed, packed)
-        plan = staged_eigh(mesh, stack, R * tiles[name]['unit'], ledger=ledger, live=live, label=name)
+        plan = staged_eigh(mesh, stack, R * tiles[name]['unit'], ledger=ledger, live=live, label=name, backend='distributed')
         got[name + '.selection'] = 'c' if plan.batched_route == 'batch_reshard' else 'mesh'
     for row in (rows[1], rows[0]):
         name, packed = row['sector'], int(row['packed_extent'])
@@ -70,7 +71,7 @@ def round_decisions(mesh, ledger, up, rows, sides, cross_side, infinity):
         stage = stage_width(ledger, stacks + held + dw, program, R, live=live)
         routes = []
         for m, bound in boundaries:
-            plan = staged_eigh(mesh, (R, m, m), bound + held, ledger=ledger, live=live, label=name)
+            plan = staged_eigh(mesh, (R, m, m), bound + held, ledger=ledger, live=live, label=name, backend='distributed')
             row_ = ledger.preview(resident_bytes_per_rank=bound + held + -(-R // P) * 8 * m * m * 16,
                                   workspace_bytes_per_rank=0, concurrent_with=live)
             routes.append(('c' if plan.batched_route == 'batch_reshard' else 'mesh',
@@ -84,7 +85,7 @@ def round_decisions(mesh, ledger, up, rows, sides, cross_side, infinity):
     stacks, boundaries = staged_cross_bytes(parents=R, ranks=P, side=cross_side, rows=[r['packed_extent'] for r in rows])
     routes = []
     for m, bound in boundaries:
-        plan = staged_eigh(mesh, (R, m, m), bound, ledger=ledger, live=(up, models), label='CT')
+        plan = staged_eigh(mesh, (R, m, m), bound, ledger=ledger, live=(up, models), label='CT', backend='distributed')
         routes.append('c' if plan.batched_route == 'batch_reshard' else 'mesh')
     got['CT'] = dict(eighs=routes)
     return got
@@ -112,7 +113,8 @@ for name, (lines, imag, n, cc, tt, nk, side, nq, budgets) in CASES.items():
             R, tiles = route['width'], rows[0]['staged_route']
             row['selection'] = {r['sector']: 'c' if staged_eigh(
                 mesh, (R * max(1, tiles[r['sector']]['dense']), int(r['packed_extent']), int(r['packed_extent'])),
-                R * tiles[r['sector']]['unit'], ledger=ledger, live=(up,), label=r['sector']).batched_route == 'batch_reshard'
+                R * tiles[r['sector']]['unit'], ledger=ledger, live=(up,), label=r['sector'],
+                backend='distributed').batched_route == 'batch_reshard'
                 else 'mesh' for r in rows}
         if name == 'cri3_p64':
             row['actual'] = round_decisions(mesh, ledger, up, rows, dict(TT=25856, CC=19264), 17408, dict(TT=640, CC=416))

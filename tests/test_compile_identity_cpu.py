@@ -61,11 +61,13 @@ def test_face_plans_differ_by_room_share_programs(monkeypatch):
     from gw.shared_pole_capacity import constructor_eigenplan
     from gw.shared_pole_execution import face_eigh
     mesh = _mesh()
-    monkeypatch.setattr(spe, "_face_eigh", lambda mesh, n: _plan(mesh))   # CPU has no distributed eigh
-    a, b = face_eigh(mesh, 8, 1 << 30), face_eigh(mesh, 8, 1 << 31)
+    monkeypatch.setattr(spe, "_face_eigh", lambda mesh, n, backend: _plan(mesh))   # CPU has no distributed eigh
+    a, b = face_eigh(mesh, 8, 1 << 30, backend="distributed"), face_eigh(mesh, 8, 1 << 31, backend="distributed")
     assert a == b and hash(a) == hash(b) and a.budget_bytes != b.budget_bytes
-    assert constructor_eigenplan(mesh, 8, "face", 1 << 30) == constructor_eigenplan(mesh, 8, "face", None)
-    assert constructor_eigenplan(mesh, 8, "local") is constructor_eigenplan(mesh, 8, "local", 1 << 30)
+    face = lambda room: constructor_eigenplan(mesh, 8, "face", room, backend="distributed")
+    assert face(1 << 30) == face(None)
+    local = lambda room=None: constructor_eigenplan(mesh, 8, "local", room, backend="distributed")
+    assert local() is local(1 << 30)
 
 
 def test_program_keys_hold_no_site_or_budget():

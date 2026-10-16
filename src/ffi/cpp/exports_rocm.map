@@ -1,0 +1,16 @@
+/* exports_rocm.map — the ROCM leg's linker version script.
+ *
+ * The same contract as exports_cuda.map and exports_host.map, whose comments
+ * carry the measurement and the five-arm table behind it (KNOWN_FAILURES L1,
+ * the cross-.so ODR violation): every LORRAX-owned definition is LOCAL to the
+ * library that compiled it, and the leg's two stamps are the exact-name
+ * exceptions.  The ROCM stamps carry `_rocm`, so the three legs' sanctioned
+ * surfaces are pairwise disjoint.  Do not widen the local pattern; read
+ * exports_cuda.map first. */
+{
+  global:
+    lorrax_ffi_rocm_build_config;
+    lorrax_ffi_rocm_abi_version;
+  local:
+    *lorrax_ffi*;
+};

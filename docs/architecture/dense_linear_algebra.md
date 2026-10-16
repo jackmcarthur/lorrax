@@ -303,7 +303,12 @@ $$
 $$
 
 the boundary being the arrays live beside that eigh; otherwise the whole mesh,
-with one warning. The shared-pole sectors decide each stack so
+with one warning. Every site asks for the whole mesh with the deck's eigh
+request, `LinalgResolution.eigh_backend` (`resolve_linalg`, the one owner):
+`linalg = local` asks `auto`, which is the platform's capacity eigh where one
+exists and a refusal by name (`GATE eigh_capacity_route`) at the stack that
+needs it where none does (ROCm today); `linalg = distributed` asks
+`distributed`, refused at plan time where the leg has none. The shared-pole sectors decide each stack so
 (`staged_eigh`, `src/gw/shared_pole_execution.py:682`); a caller that passes a
 room instead lets `distrib_la` decide each stack by the same price
 ([API § eigh-stack](../services/distrib_la/api.md#eigh-stack)). Nothing is
@@ -387,8 +392,8 @@ decisive on memory, and it is gated against XLA on the same device
 | operation | CUDA | CPU | ROCm and others |
 |---|---|---|---|
 | eigh, whole matrices (route (c), `linalg = local`) | `jnp.linalg.eigh` (cuSolverDn) | `jnp.linalg.eigh` (LAPACK) | `jnp.linalg.eigh` |
-| eigh, capacity route | cuSOLVERMp `syevd` | ScaLAPACK `pzheevd` | none: no ROCm library is built; refuses |
-| LU solve, `linalg = distributed` | cuSOLVERMp batched `getrf`/`getrs` | ScaLAPACK `pXgetrf`/`pXgetrs` | refuses |
+| eigh, capacity route | cuSOLVERMp `syevd` | ScaLAPACK `pzheevd` | none: no ROCm library is built; `linalg = local` runs route (c) and refuses (`GATE eigh_capacity_route`) only at a stack that needs the whole mesh; `linalg = distributed` refuses at plan time |
+| LU solve, `linalg = distributed` | cuSOLVERMp batched `getrf`/`getrs` | ScaLAPACK `pXgetrf`/`pXgetrs` | ROCm: SLATE `getrf` (PartialPiv, `Target::Devices`) + `getrs`; others refuse |
 | LU solve, `linalg = local` | `jax.scipy.linalg` LU per q | same | same |
 | distributed GEMM | `panel_matmul` (XLA; local GEMMs on cuBLAS) | `panel_matmul` (XLA) | `panel_matmul` (XLA) |
 | inverse root | Newton–Schulz on `panel_matmul` | same | same |

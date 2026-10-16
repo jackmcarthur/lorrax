@@ -25,7 +25,7 @@
 #include <cstdio>
 #include <sstream>
 
-#include <cuda_runtime.h>
+#include "../common/gpu_runtime.h"
 #include <blas.hh>
 #include <slate/slate.hh>
 
@@ -42,16 +42,16 @@ namespace sl  = ::slate;
 template <typename T>
 static ffi::Error PotrfImpl(
     int64_t n, int64_t nb,
-    cudaStream_t xla_stream,
+    lrx::gpu::Stream xla_stream,
     lorrax_ffi::slate::SlateCtx* ctx,
     const T* d_A_in,
     T* d_L_out)
 {
-    cudaError_t ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    lrx::gpu::Error ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.potrf: cudaStreamSynchronize(xla_stream) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.potrf: " LRX_GPU_API "StreamSynchronize(xla_stream) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -60,7 +60,7 @@ static ffi::Error PotrfImpl(
         std::ostringstream os;
         os << "slate.potrf: blas::get_device_count()=" << num_devices_visible
            << " but JAX one-process-per-GPU model requires exactly 1. "
-           << "Set CUDA_VISIBLE_DEVICES=$SLURM_LOCALID (LORRAX_SELECT_GPU=1).";
+           << "Set " LRX_GPU_VENDOR "_VISIBLE_DEVICES=$SLURM_LOCALID (LORRAX_SELECT_GPU=1).";
         return ffi::Error(ffi::ErrorCode::kFailedPrecondition, os.str());
     }
 
@@ -71,21 +71,21 @@ static ffi::Error PotrfImpl(
     // Copy the input shard into the output buffer, then factor in-place.
     const int64_t local_rows = (n + p - 1) / p;
     const int64_t local_cols = (n + q - 1) / q;
-    ce = cudaMemcpyAsync(d_L_out, d_A_in,
+    ce = lrx::gpu::memcpy_async(d_L_out, d_A_in,
                          local_rows * local_cols * sizeof(T),
-                         cudaMemcpyDeviceToDevice, xla_stream);
-    if (ce != cudaSuccess) {
+                         lrx::gpu::kDeviceToDevice, xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.potrf: cudaMemcpyAsync(A -> L) failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.potrf: " LRX_GPU_API "MemcpyAsync(A -> L) failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
     // Let the memcpy finish before SLATE touches the tiles.
-    ce = cudaStreamSynchronize(xla_stream);
-    if (ce != cudaSuccess) {
+    ce = lrx::gpu::stream_synchronize(xla_stream);
+    if (ce != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << "slate.potrf: cudaStreamSynchronize after A->L copy failed: "
-           << cudaGetErrorString(ce);
+        os << "slate.potrf: " LRX_GPU_API "StreamSynchronize after A->L copy failed: "
+           << lrx::gpu::error_string(ce);
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
 
@@ -123,7 +123,7 @@ static ffi::Error PotrfImpl(
 }
 
 static ffi::Error PotrfDispatch(
-    cudaStream_t stream,
+    lrx::gpu::Stream stream,
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
     int64_t n, int64_t nb,
@@ -169,7 +169,7 @@ static ffi::Error PotrfDispatch(
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     SlatePotrfFfi, lorrax_ffi::slate_potrf::PotrfDispatch,
     xla::ffi::Ffi::Bind()
-        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<xla::ffi::AnyBuffer>()              // A (Hermitian input)
         .Ret<xla::ffi::AnyBuffer>()              // L (Cholesky factor, lower)
         .Attr<int64_t>("n")

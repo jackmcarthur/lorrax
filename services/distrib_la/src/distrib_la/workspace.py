@@ -5,7 +5,7 @@ import operator
 
 import numpy as np
 
-from distrib_la.resolve import mesh_platform
+from distrib_la.resolve import ONE_DEVICE, mesh_platform
 from lxkit import device_vendor
 
 
@@ -306,7 +306,7 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
 def eigh_stack_bytes(plan, shape, dtype) -> int:
     """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
     its operand, from the shapes alone: on route (c) ``BATCH_EIGH_TILES`` n^2 elements per whole
-    matrix a rank holds; on the whole mesh the vectors stack, the values and one solve's
+    matrix a rank holds, plus the leg's batched eigh workspace (at most one fixed tile); on the whole mesh the vectors stack, the values and one solve's
     workspace (:func:`workspace_bytes_per_rank`, 0 off CUDA). Every rank computes the same figure.
     """
     from distrib_la.plan import BATCH_EIGH_TILES, ROUTE_BATCH_RESHARD
@@ -314,6 +314,17 @@ def eigh_stack_bytes(plan, shape, dtype) -> int:
     ranks = int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
     item = np.dtype(dtype).itemsize
     if plan.batched_route == ROUTE_BATCH_RESHARD:
-        return -(-nb // ranks) * BATCH_EIGH_TILES * n * n * item
+        # Plus the leg's batched native eigh workspace on the held stack (XLA scratch, at most
+        # one fixed tile; distrib_la.local_eigh.batched_workspace_bytes, 0 where no row takes it).
+        from distrib_la.local_eigh import batched_workspace_bytes
+        held = -(-nb // ranks)
+        return (held * BATCH_EIGH_TILES * n * n * item
+                + batched_workspace_bytes((held, n, n), dtype, mesh_platform(plan.mesh)))
+    if plan.backend == ONE_DEVICE:
+        # Whole matrices per rank, in the route's bounded rounds.
+        from distrib_la._one_device import held_per_rank
+        from distrib_la.resolve import one_device_max_n
+        bound = one_device_max_n("eigh", mesh_platform(plan.mesh)) or n
+        return held_per_rank(nb, n, ranks, bound) * BATCH_EIGH_TILES * n * n * item
     return (-(-nb * n * n * item // ranks) + nb * n * 8
             + workspace_bytes_per_rank(plan, 'eigh', ((n, n),), dtype))

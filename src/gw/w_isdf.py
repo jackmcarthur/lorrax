@@ -150,6 +150,27 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 _CHARGE_KCONV: dict = {}
 
 
+_PLACED_LOAD = {}
+
+
+def _placed_load_tables(mesh_xy, plan, tables):
+    """``plan``'s unfold load tables placed once per (mesh, plan), shared by every kconv entry.
+
+    The kconv caches hold two entries (one per row extent); each new entry
+    re-placed the same plan tables (8 fields per entry).  ``tables`` is
+    ``plan.unfold_load_tables()`` (a pure function of the plan); the key holds
+    the plan, so its identity cannot be reused while the entry lives.
+    """
+    key = (mesh_xy, plan)
+    hit = _PLACED_LOAD.get(key)
+    if hit is None:
+        from symmetry_maps import device_load_tables
+        while len(_PLACED_LOAD) >= 2:
+            _PLACED_LOAD.pop(next(iter(_PLACED_LOAD)))
+        hit = _PLACED_LOAD[key] = (tables, tuple(device_load_tables(tables, mesh_xy)))
+    return hit[1]
+
+
 def _charge_stream_kconv(mesh_xy, kgrid, plan):
     """``ffi.fft.make_kconv_chi_unfold`` on ``plan`` and its tables placed once.
 
@@ -162,10 +183,9 @@ def _charge_stream_kconv(mesh_xy, kgrid, plan):
     hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
-        from symmetry_maps import device_load_tables
         tables = plan.unfold_load_tables()
         hit = (make_kconv_chi_unfold(mesh_xy, kgrid, tables, n_out=1, complete=False, norm="ortho"),
-               tuple(device_load_tables(tables, mesh_xy)))
+               _placed_load_tables(mesh_xy, plan, tables))
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
         _CHARGE_KCONV[key] = hit
@@ -186,14 +206,13 @@ def _charge_window_kconv(mesh_xy, kgrid, plan, rows):
     hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
-        from symmetry_maps import device_load_tables
         from .subtile_stream import window_tables
         base = plan.unfold_load_tables()
         side, ns = int(mesh_xy.shape["x"]), int(np.asarray(base.spin).shape[-1])
         local_rows = int(np.asarray(base.lsrc).shape[1]) // (side * ns)
         shape = base if int(rows) == local_rows else window_tables(base, rows, side, ns)
         hit = (make_kconv_chi_unfold(mesh_xy, kgrid, shape, n_out=1, complete=False, norm="ortho"),
-               tuple(device_load_tables(base, mesh_xy)))
+               _placed_load_tables(mesh_xy, plan, base))
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
         _CHARGE_KCONV[key] = hit
@@ -1811,7 +1830,8 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
 
 def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
                                 n_rmu_logical: int,
-                                distrib_la_batched_route: str = "batch_reshard"):
+                                distrib_la_batched_route: str = "batch_reshard",
+                                room: int | None = None):
     """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded; see docs/theory/bispinor-gw.md#dyson."""
     n_ext = int(n_rmu)
     n_log = int(n_rmu_logical)
@@ -1825,7 +1845,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # prefixes (notably scalar charge versus an explicit packed carrier), so
     # omitting n_log would reuse a closure with the wrong exact-zero mask.
     cache_key = ("distributed", _mesh_key(mesh_xy), nq, n_ext, n_log,
-                 str(distrib_la_batched_route))
+                 str(distrib_la_batched_route), room)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -1853,9 +1873,11 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # raises at resolve time (the former silent 1-D-mesh degenerate-to-
     # native was removed; audit fix/zq 2026-07-28), so a returned plan is
     # always the distributed backend it names.
+    # ``room`` (the plan's bytes per rank beside the faces, _dyson_route) caps
+    # the leg's size route: one_device only where one whole system fits it.
     p = linalg_plan(
         "solve_lu", mesh_xy, backend="distributed", n=n_ext,
-        batched_route=distrib_la_batched_route)
+        batched_route=distrib_la_batched_route, budget_bytes=room)
 
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
@@ -2006,8 +2028,11 @@ def _w_solve_pref_scalar(meta) -> float:
 
 
 def _dyson_route(dyson, n, stack, mesh_xy):
-    """``"local"`` or ``"distributed"``: the deck's W plan, with the local plan
-    admitted only where one rank's whole matrices fit (``common.gpu_utils.admit_local``).
+    """``("local" | "distributed", room)``: the deck's W plan, with the local plan
+    admitted only where one rank's whole matrices fit (``common.gpu_utils.admit_local``),
+    and the distributed plan's room per rank beside the faces (None on one rank).
+    The room goes to the solve plan, so a leg's size route (distrib_la resolve guard
+    1b, ``one_device``) cannot put the whole matrices that did not fit back on a rank.
 
     Local holds V, χ and W whole for its ⌈stack/P⌉ parents and one LU working
     pair, beside the face-tiled V, χ and W; distributed holds the faces and
@@ -2017,12 +2042,13 @@ def _dyson_route(dyson, n, stack, mesh_xy):
     from common.gpu_utils import admit_local, device_budget_bytes
     ranks = int(mesh_xy.size)
     site = f"W Dyson {int(stack)} x {int(n)}^2"
+    faces = 16.0 * n * n * 3 * int(stack) / ranks
+    room = max(0, int(device_budget_bytes() - faces)) if ranks > 1 else None
     if dyson == "distributed":
         admit_local(site, 0, 0, forced="distributed")
-        return "distributed"
+        return "distributed", room
     if ranks <= 1:
-        return "local"
-    faces = 16.0 * n * n * 3 * int(stack) / ranks
+        return "local", None
     whole = 16.0 * n * n * (3 * -(-int(stack) // ranks) + 2)
 
     def probe():
@@ -2032,7 +2058,7 @@ def _dyson_route(dyson, n, stack, mesh_xy):
         resolve_backend("solve_lu", "distributed", mesh_xy)
     local = admit_local(site, faces + whole, device_budget_bytes(),
                         distributed_bytes=faces + 2 * 16.0 * n * n / ranks, probe=probe)
-    return "local" if local else "distributed"
+    return ("local", None) if local else ("distributed", room)
 
 
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
@@ -2048,7 +2074,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
     from .gw_config import normalize_w_dyson_solver
     nq = int(meta.nk_tot) if nq is None else int(nq)
     dyson = normalize_w_dyson_solver(dyson_solver)
-    routed = _dyson_route(dyson, int(n_rmu), nq if stack is None else int(stack), mesh_xy)
+    routed, room = _dyson_route(dyson, int(n_rmu), nq if stack is None else int(stack), mesh_xy)
     if routed != dyson:
         # The provider plan, not route (c): staged whole matrices are what did not fit.
         dyson, distrib_la_batched_route = routed, "auto"
@@ -2065,7 +2091,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
 
     if dyson == "distributed":
         solve_fn = _get_w_solve_fn_distributed(
-            mesh_xy, nq, n_rmu, n_log, distrib_la_batched_route)
+            mesh_xy, nq, n_rmu, n_log, distrib_la_batched_route, room=room)
     else:
         solve_fn = _get_w_solve_fn_local(
             mesh_xy, nq, n_rmu, n_rmu_logical=n_log)

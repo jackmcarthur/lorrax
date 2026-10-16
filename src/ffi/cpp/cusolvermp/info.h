@@ -23,7 +23,7 @@
 namespace lorrax_ffi::cusolvermp {
 
 inline ::xla::ffi::Error reset_info(LorraxCusolverMpCtx* ctx) {
-    LORRAX_CUDA_CHECK(cudaMemsetAsync(ctx->d_info, 0, sizeof(int), ctx->stream));
+    LORRAX_GPU_CHECK(cudaMemsetAsync(ctx->d_info, 0, sizeof(int), ctx->stream));
     return ::xla::ffi::Error::Success();
 }
 
@@ -33,9 +33,9 @@ inline ::xla::ffi::Error read_info(LorraxCusolverMpCtx* ctx, const char* routine
                                    const char* positive, int64_t n, int64_t mb,
                                    int64_t q = -1) {
     int info = 0;
-    LORRAX_CUDA_CHECK(cudaMemcpyAsync(&info, ctx->d_info, sizeof(int),
+    LORRAX_GPU_CHECK(cudaMemcpyAsync(&info, ctx->d_info, sizeof(int),
                                       cudaMemcpyDeviceToHost, ctx->stream));
-    LORRAX_CUDA_CHECK(cudaStreamSynchronize(ctx->stream));
+    LORRAX_GPU_CHECK(cudaStreamSynchronize(ctx->stream));
     if (info == 0) return ::xla::ffi::Error::Success();
     std::ostringstream os;
     os << routine << " returned info=" << info << " (n=" << n << ", block=" << mb;

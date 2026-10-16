@@ -39,6 +39,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import numpy as np
+from distrib_la import eigh_local
 
 
 # ===========================================================================
@@ -763,7 +764,7 @@ def simple_lanczos_eig(
         off = beta[:max_iter - 1]
         T = T + jnp.diag(off, 1) + jnp.diag(off, -1)
 
-    evals_T, vecs_T = jnp.linalg.eigh(T)
+    evals_T, vecs_T = eigh_local(T)
     idx = jnp.argsort(evals_T)[:n_eig]
 
     eigenvalues = evals_T[idx]
@@ -955,7 +956,7 @@ def block_lanczos_eig_jit(
         return _planned_ritz(subspace_plan, Q_all.reshape(-1, *vector_shape), T,
                              max_iter * bs, n_eig, structured_vectors)
 
-    evals_T, vecs_T = jnp.linalg.eigh(T)
+    evals_T, vecs_T = eigh_local(T)
     idx = jnp.argsort(evals_T)[:n_eig]
     eigenvalues = evals_T[idx]
 
@@ -1109,7 +1110,7 @@ def block_lanczos_eig_jit_converged(
     # Final eigh — same inactive-tail mask as the convergence check.
     T = _mask_inactive_tail(
         _build_block_tridiag(alpha_all, beta_all, M, bs), j_final * bs)
-    evals_T, vecs_T = jnp.linalg.eigh(T)
+    evals_T, vecs_T = eigh_local(T)
     idx = jnp.argsort(evals_T)[:n_eig]
     eigenvalues = evals_T[idx]
     Q_full = jnp.transpose(Q_all[:M], (1, 0, 2)).reshape(n, T_size)

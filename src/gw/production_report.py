@@ -863,12 +863,27 @@ class GWProductionReport:
             self.emit(f"  {name:<{width}} {seconds:10.2f}  "
                       f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
         self.emit(f"  {'total run':<{width}} {wall:10.2f}  {100.0:9.2f}%")
+        # The "runtime bring-up" row is the sum of these phases; state the
+        # split so a slow bring-up names its phase (Frontier Fe V2 runs ending
+        # 2026-10-15 20:33-21:06 UTC: 11 of 13 took 21-74 s, against 6.9-10.1 s
+        # for 39 of 40 runs outside that window; three lanes, two nodes, and
+        # no phase recorded anywhere).
+        phases = [(str(r["name"])[len("gw_jax.runtime_stack."):], float(r["inclusive"]))
+                  for r in rows if str(r["name"]).startswith("gw_jax.runtime_stack.")]
+        if phases:
+            self.emit("  runtime bring-up (rank 0) = " + " + ".join(
+                f"{phase} {seconds:.2f}" for phase, seconds in phases) + " s")
         if any(r["name"].startswith(("bank.", "tau.")) for r in rows):
             self.emit("  bank real_time/laplace = incumbent G/FFT correlation plus bank coefficient carry;")
             self.emit("  these fused clocks are not FFT-only or evidence of a bandwidth limit.")
             self.emit("  Sigma tau other is the window executables: W(tau) synthesis, G/W convolution,")
             self.emit("  projection and frequency fold in one program. No pure-GEMM or pure-FFT wall is inferred.")
             self.emit("  device_wait drains preceding work; rank_wait measures process alignment.")
+        from common.timing import stage_sync
+        self.emit("  stage walls: " + ("device-attributed (LORRAX_STAGE_SYNC=1: every stage waits for its device work)."
+                                      if stage_sync() else
+                                      "host-attributed (no timing-only device waits; device work lands in the first "
+                                      "later stage that reads it; LORRAX_STAGE_SYNC=1 attributes it)."))
         if spole_rows:
             self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
             self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")
