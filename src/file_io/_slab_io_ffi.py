@@ -45,7 +45,7 @@ from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import (barrier as _barrier, device_put_process_local,
-                                gather_to_host)
+                                device_put_process_local_cached, gather_to_host)
 from runtime import debug_print_enabled
 from runtime.padding import authenticate_padded_axis, padded_axis
 
@@ -1293,7 +1293,12 @@ def _replicated_i64_vector(values: Sequence[int], mesh: Mesh) -> jax.Array:
     # ``ffi.io.{ffi_read_call,ffi_write_call}``, and those refuse a
     # non-int64 control operand by name (``require_control_i64``).  Checking
     # it twice would be two places to keep in step with one C++ signature.
-    return device_put_process_local(
+    #
+    # Placed once per distinct value (``device_put_process_local_cached``):
+    # a dataset's handle pair and the offsets/extents of a slab re-read every
+    # round repeat, so a repeated control vector costs no host-to-device
+    # transfer.  The cached buffer is an input operand only (never donated).
+    return device_put_process_local_cached(
         np.asarray(tuple(int(v) for v in values), dtype=np.int64),
         NamedSharding(mesh, P()),
     )
@@ -1495,7 +1500,7 @@ def _file_order_pieces(A, off, vshape, plan, mesh):
             sizes = tuple(steps) + (take_k,) + tuple(int(d) for d in A.shape[k + 1:])
             take = _file_order_take(mesh, tuple(int(d) for d in A.shape), A.dtype, k,
                                     sizes, -(-take_k // p) * p, A.sharding.spec)
-            starts = device_put_process_local(
+            starts = device_put_process_local_cached(
                 np.asarray(idx + (c0,) + (0,) * (A.ndim - k - 1), dtype=np.int32), rep)
             p_off = (tuple(int(off[a]) + idx[a] for a in range(k))
                      + (int(off[k]) + c0,) + tuple(int(o) for o in off[k + 1:]))

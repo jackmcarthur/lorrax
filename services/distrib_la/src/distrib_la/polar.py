@@ -24,7 +24,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
 from distrib_la.resolve import mesh_key
-from distrib_la._collectives import device_put_process_local
+from distrib_la._collectives import device_put_process_local_cached
 
 __all__ = ["PolarPlan", "plan_polar_factor", "polar_factor",
            "right_singular_vectors", "leading_eigenvectors",
@@ -296,8 +296,13 @@ def _retained_columns(
     retained = (tuple(row[:n] for row, n in zip(values, count))
                 if isinstance(count, tuple) else values[:count])
     replicated = NamedSharding(mesh, P())
-    counts = device_put_process_local(np.asarray(count, dtype=np.int64), replicated)
-    spectra = jax.tree.map(lambda row: device_put_process_local(row, replicated), retained)
+    # The counts are the select's runtime mask operand, placed once per
+    # distinct count vector.  The spectra are host values already (the
+    # broadcast _host_spectrum, identical on every process) and every caller
+    # reads them on the host (sizes, cuts, receipts): they are returned as
+    # host arrays, never re-placed on the device (one transfer per row before).
+    counts = device_put_process_local_cached(np.asarray(count, dtype=np.int64), replicated)
+    spectra = jax.tree.map(lambda row: np.array(row, dtype=np.float64, copy=True), retained)
     return select(Q, counts), spectra
 
 
@@ -438,8 +443,9 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
     -------
     Q, sigma
         Q[m,r_padded] at P('x','y'), active columns first and zero tails;
-        sigma[r] replicated in descending order. r = sigma.size. Only the
-        O(m) spectrum crosses the host, never a matrix. Selection is eager.
+        sigma[r] a host float64 array (the same on every process) in
+        descending order. r = sigma.size. Only the O(m) spectrum crosses the
+        host, never a matrix, and it is not placed back. Selection is eager.
         Batched input returns Q[b,m,max(r_padded)] at P(None,'x','y') and
         a tuple of b unpadded sigma[r_q] arrays. Thus every cut/multiplet
         remains independent; the matrix tail of each row is exactly zero.

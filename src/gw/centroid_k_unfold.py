@@ -82,6 +82,23 @@ def parent_rows(irr_idx, n_parent: int, array, *, axis: int = 0):
         raise ValueError(
             "parent_rows: full-k axis has extent "
             f"{src.shape[axis]}, expected {int(irr_idx.shape[0])}.")
+    return jnp.take(src, _parent_source(irr_idx, int(n_parent)), axis=axis)
+
+
+_PARENT_SOURCE = {}
+
+
+def _parent_source(irr_idx, n_parent: int):
+    """The raw-parent -> full-row index table of :func:`parent_rows`, placed once per k plan.
+
+    A pure function of ``(irr_idx, n_parent)``; it was rebuilt and transferred
+    on every call (per Σ window and response group).  Placed with the same
+    default placement as before, so selections are bit-identical.
+    """
+    key = (irr_idx.dtype.str, irr_idx.shape, np.ascontiguousarray(irr_idx).tobytes(), n_parent)
+    hit = _PARENT_SOURCE.get(key)
+    if hit is not None:
+        return hit
     # irr_idx maps full rows to raw WFN parent rows.  Several raw rows may
     # be symmetry-redundant, but every parent used by a child carries the
     # same scalar value.  Scatter picks one child per raw parent without
@@ -95,7 +112,10 @@ def parent_rows(irr_idx, n_parent: int, array, *, axis: int = 0):
         # are immaterial but keeping the parent carrier rectangular makes
         # the direct irr_idx gather simple and stable.  Fill from row zero.
         source[unused] = 0
-    return jnp.take(src, jnp.asarray(source), axis=axis)
+    placed = jnp.asarray(source)
+    if not isinstance(placed, jax.core.Tracer):
+        _PARENT_SOURCE[key] = placed
+    return placed
 
 
 @dataclass(frozen=True, eq=False)

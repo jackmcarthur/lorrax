@@ -16,9 +16,9 @@ import sys
 import time
 
 import numpy as np
-from lxkit import device_put_process_local
+from lxkit import device_put_process_local, device_put_process_local_cached
 
-__all__ = ["broadcast_bytes", "device_put_process_local",
+__all__ = ["broadcast_bytes", "device_put_process_local", "device_put_process_local_cached",
            "warm_mesh_cliques"]
 
 

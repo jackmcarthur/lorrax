@@ -11,7 +11,8 @@ remains stdlib-only and cannot initialize a backend before distributed JAX.
 
 from __future__ import annotations
 
-__all__ = ["device_put_process_local", "device_put_process_tiles"]
+__all__ = ["device_put_process_local", "device_put_process_tiles",
+           "device_put_process_local_cached", "placement_cache_stats"]
 
 
 def device_put_process_local(host_array, sharding, *, check: bool | None = None):
@@ -89,3 +90,69 @@ def device_put_process_tiles(shape, sharding, tile):
             piece = np.ascontiguousarray(piece)
         shards.append(jax.device_put(piece, dev))
     return jax.make_array_from_single_device_arrays(shape, sharding, shards)
+
+
+# Content-keyed device constants (``device_put_process_local_cached``).
+# Bounded LRU: an entry is at most _CACHE_ENTRY_BYTES, the whole cache at most
+# _CACHE_TOTAL_BYTES of device memory per device (control vectors and counts,
+# never operators).  Stats feed the run's transfer census.
+_CACHE_ENTRY_BYTES = 64 * 1024
+_CACHE_TOTAL_BYTES = 8 * 1024 * 1024
+_cache = None
+_cache_lock = None
+_stats = {"hits": 0, "misses": 0, "bypass": 0, "bytes": 0, "peak_bytes": 0}
+
+
+def device_put_process_local_cached(host_array, sharding):
+    """``device_put_process_local`` of a small control value, placed once per distinct value.
+
+    Loop control operands that are pure functions of host plan data (slab
+    offsets and handles, per-row retained counts, real-row counts, window
+    counts) take few distinct values per run but were placed on every call:
+    one host-to-device transfer per read, eigh or window.  This returns the
+    device array placed the first time the same (sharding, dtype, shape,
+    bytes) was asked for, so a repeated value costs no transfer; the result
+    is bit-identical to an uncached placement.  Values above
+    ``_CACHE_ENTRY_BYTES`` take the uncached route.
+
+    Contract: the returned array is shared and immutable -- never donate it
+    (JAX refuses a deleted buffer by name, so a violation is loud).  Every
+    process must pass the same value (``device_put_process_local``).
+    """
+    import collections
+    import threading
+
+    import jax
+    import numpy as np
+
+    global _cache, _cache_lock
+    if isinstance(host_array, jax.Array) or isinstance(host_array, jax.core.Tracer):
+        return device_put_process_local(host_array, sharding)
+    arr = np.asarray(host_array)
+    if arr.dtype == object or arr.nbytes > _CACHE_ENTRY_BYTES:
+        _stats["bypass"] += 1
+        return device_put_process_local(arr, sharding)
+    if _cache is None:
+        _cache, _cache_lock = collections.OrderedDict(), threading.Lock()
+    key = (sharding, arr.dtype.str, arr.shape, np.ascontiguousarray(arr).tobytes())
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit is not None:
+            _cache.move_to_end(key)
+            _stats["hits"] += 1
+            return hit
+    out = device_put_process_local(arr, sharding)
+    with _cache_lock:
+        _stats["misses"] += 1
+        _cache[key] = out
+        _stats["bytes"] += int(arr.nbytes)
+        while _stats["bytes"] > _CACHE_TOTAL_BYTES and len(_cache) > 1:
+            old_key, _ = _cache.popitem(last=False)
+            _stats["bytes"] -= len(old_key[3])
+        _stats["peak_bytes"] = max(_stats["peak_bytes"], _stats["bytes"])
+    return out
+
+
+def placement_cache_stats():
+    """``{hits, misses, bypass, bytes, peak_bytes}`` of the cached placement (bytes per device)."""
+    return dict(_stats)
