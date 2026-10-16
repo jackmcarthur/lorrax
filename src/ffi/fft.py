@@ -1206,8 +1206,10 @@ def _mathdx_common() -> dict:
 
 
 def cubin_cache_dir() -> str:
-    """Where the compiled mathdx kernels are kept: ``$SCRATCH/.cache/lorrax/kconv_mathdx``,
-    or ``~/.cache/lorrax/kconv_mathdx`` where the site defines no ``SCRATCH``.
+    """Where the compiled mathdx kernels are kept: ``$SCRATCH/.cache/lorrax/kconv_mathdx/<ffi-tag>``,
+    or ``~/.cache/lorrax/kconv_mathdx/<ffi-tag>`` where the site defines no ``SCRATCH``;
+    ``<ffi-tag>`` is the enforced native closure identity
+    (``common.jax_compile_cache.native_cache_tag``).
 
     Always on, and separate from the XLA compile cache
     (``common.jax_compile_cache``, one namespace per jax, jaxlib, FFI bundle
@@ -1222,7 +1224,10 @@ def cubin_cache_dir() -> str:
     release's read-only store (:func:`seed_cubin_cache`).
     """
     from lxkit import user_cache_dir
-    d = str(user_cache_dir("kconv_mathdx"))
+    from common.jax_compile_cache import native_cache_tag
+    # One store per native closure: an image built against one NVRTC/hipRTC and
+    # library set is never offered to another (lxkit.native_provider).
+    d = str(user_cache_dir("kconv_mathdx") / native_cache_tag())
     seed_cubin_cache(str(CUBIN_STORE), d)
     return d
 
