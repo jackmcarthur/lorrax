@@ -207,7 +207,9 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     lu = {"lorrax_slate_batched_solve_lu_factors", "lorrax_slate_batched_getrf",
           "lorrax_slate_batched_getrs"}
     eigh = {"lorrax_rocsolver_batched_eigh"}
-    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh for t in own)
+    agemm = {"lorrax_active_gemm_device", "lorrax_active_gemm_device_out"}
+    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | agemm for t in own)
+    assert agemm <= set(own)
     assert eigh <= set(own)
     assert lu <= set(own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)
@@ -215,8 +217,9 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     # distrib_la's ROCM table: the SLATE family, its LU entries included, the batched eigh and
     # the local active-range GEMM (the CUDA leg's leg-neutral source, the same symbols).
     dl_rocm = dl._PLATFORMS["ROCM"]["targets"]
-    assert dl_rocm and all(t.startswith(("lorrax_slate_", "lorrax_cublas_local_")) or t in eigh
-                           for t in dl_rocm)
+    assert dl_rocm and all(t.startswith(("lorrax_slate_", "lorrax_cublas_local_")) or
+                           t in eigh | agemm for t in dl_rocm)
+    assert all(dl_rocm[t] == rocm[t] for t in agemm)
     assert all(dl_rocm[t] == ffi_loader._CUDA_TARGET_SYMBOLS[t] for t in dl_rocm
                if t.startswith("lorrax_cublas_local_"))
     assert lu | eigh <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu | eigh)
@@ -226,6 +229,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in section
     assert "kdft/kdft_klead_ffi.cc" in block and "common/rtc_build.cc" in block
     assert "cublas/local_active_gemm_ffi.cc" in block
+    assert "active_gemm/active_gemm_device_ffi.cc" in block
     assert "slate/eigh_ffi.cc" in section       # bound with target_sources when SLATE is found
 
 

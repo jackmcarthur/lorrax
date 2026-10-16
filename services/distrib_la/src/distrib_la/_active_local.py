@@ -26,17 +26,18 @@ import jax.numpy as jnp
 #: and not in ``lxkit.LEGS``.  ``"native"``: the ``lorrax_cublas_local_*``
 #: handlers (``_active_local_cuda``; one leg-neutral source, cuBLAS on CUDA and
 #: rocBLAS on ROCM); ``"interval"``: :func:`active_local_matmul`; ``"masked"``:
-#: :func:`masked_local_matmul`.  A vendor with no row takes ``"interval"``.  Both
-#: XLA routes stay as the references the native route is gated against
-#: (tests/test_active_local_native_gate.py, same device).  ROCM: ``"masked"`` --
-#: the interval route's ~64 x (3-6) while/cond trips per call cost ~36 us each on
-#: MI250X; the native handler is built and gated on ROCM, but its per-call host read
-#: of the bounds drains the stream inside Sigma's tau loop (6 calls per trip), which
-#: on MI250X exposes the trip's host launch latency, ~1.1 ms per read: Fe Sigma tau
-#: 13.3-13.7 s native vs 9.1 s masked (P=4; isolated, the read costs ~16 us and the
-#: native call is 2.3x faster than masked).  A ROCM native row needs device-side
-#: bounds; see ``ACTIVE_LOCAL_GUARD``'s ``"full"``.
-ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "masked"}
+#: :func:`masked_local_matmul`; ``"device"``: the ``lorrax_active_gemm_device*``
+#: handlers (``_active_local_device``: one run-time-compiled leg-neutral kernel that
+#: reads the bounds on the device -- no host read, no stream sync, no cond, no operand
+#: or weighted copy, no workspace, FLOPs over the active width only).  A vendor with no
+#: row takes ``"interval"``.  Both XLA routes stay as the references the native routes
+#: are gated against (tests/test_active_local_native_gate.py, same device).  ROCM:
+#: ``"device"``.  Not ``"native"``: the cuBLAS/rocBLAS handler's per-call host read +
+#: stream sync drains the stream inside Sigma's tau loop (Fe Sigma tau 13.5 s vs 9.1 s
+#: masked on MI250X); not ``"masked"``: its ``where`` selects form two operand-sized
+#: copies per call (~3.2 s of selects per Fe Sigma tau run).  CUDA keeps ``"native"``
+#: (measured on A100: the read idles the GPU <= 1.2 %); ``"device"`` is its adoption path.
+ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "device"}
 
 
 #: How the native arm (``_active_local_cuda.active_local_cuda``) guards invalid and full
@@ -91,8 +92,8 @@ def masked_local_matmul(a, b, bounds, weights, c=None, *, alpha, beta):
 def local_active_impl(platform):
     """The XLA implementation behind a non-native route (``"interval"`` | ``"masked"``).
 
-    A ``"native"`` row has no XLA implementation; its callers enter
-    ``_active_local_cuda`` instead (``active_local_route(p) == "native"``)."""
+    A ``"native"`` or ``"device"`` row has no XLA implementation; its callers enter
+    ``_active_local_cuda`` / ``_active_local_device`` instead."""
     return masked_local_matmul if active_local_route(platform) == "masked" else active_local_matmul
 
 

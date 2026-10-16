@@ -95,9 +95,19 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         note="Sigma's active-range GEMM: one leg-neutral source (cublas/local_active_gemm_ffi.cc "
              "over common/gpu_blas.h), cuBLAS on CUDA, rocBLAS on ROCM (the mapped "
              "librocblas.so.5).  Pointer views into the original buffers; the bounds metadata "
-             "is read to the host per call.  ROCM's ACTIVE_LOCAL_ROUTE row stays 'masked': that "
-             "per-call read drains the stream in Sigma's tau loop (Fe Sigma tau 13.3 s vs 9.1 s); "
-             "masked and interval stay as the XLA references."),
+             "is read to the host per call.  ROCM's ACTIVE_LOCAL_ROUTE row is 'device' (active_gemm): "
+             "that per-call read drains the stream in Sigma's tau loop (Fe Sigma tau 13.5 s vs 9.1 s "
+             "masked); masked and interval stay as the XLA references."),
+    "active_gemm": Family(
+        ("lorrax_active_gemm_",), "active_gemm",
+        _legs(("elsewhere", "cublas_local (this leg-neutral source builds on CUDA once listed)"),
+              ("built", ""), ("xla", "distrib_la._active_local (interval: ACTIVE_LOCAL_ROUTE)")),
+        gate="tests/test_active_local_native_gate.py (device vs masked vs interval vs dense on "
+             "the same device, P=1 and P=4)", tol=1e-13,
+        note="Sigma's active-range GEMM with DEVICE-side bounds: one run-time-compiled kernel "
+             "(hipRTC / NVRTC via rtc_build), K loop clamped per row from the device bounds, "
+             "weights applied on load; no host read or sync, no operand copy, no workspace. "
+             "ROCM's ACTIVE_LOCAL_ROUTE row."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",
         _legs(("built", ""), ("xla", "distrib_la.subspace XlaSubspacePlan (SUBSPACE_ROUTE)"),

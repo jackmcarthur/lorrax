@@ -1482,7 +1482,8 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 # rocsolver (the batched local Hermitian eigh, one rocsolver_{z,d}{heevd,syevd}_strided_batched
 # call per stack, resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked);
 # cublas_local (the local active-range GEMM, cublas/local_active_gemm_ffi.cc on rocBLAS through
-# common/gpu_blas.h, librocblas.so.5 resolved the same way).  A family with no ROCm port is
+# common/gpu_blas.h, librocblas.so.5 resolved the same way); active_gemm (the same operation with
+# device-side bounds, one hipRTC-built kernel).  A family with no ROCm port is
 # simply not in the source list; ffi_loader's ROCM table lists only what this
 # leg exports.
 #
@@ -1530,6 +1531,10 @@ set(LORRAX_FFI_ROCM_SOURCES
     # The local active-range GEMM: the CUDA leg's own leg-neutral source (cuBLAS there,
     # rocBLAS here through common/gpu_blas.h, resolved from the mapped librocblas.so.5).
     cublas/local_active_gemm_ffi.cc
+    # The active-range GEMM with DEVICE-side bounds (active_gemm/: one run-time-compiled kernel,
+    # no host read, no sync; ACTIVE_LOCAL_ROUTE's ROCM row).  Leg-neutral: the CUDA leg adopts
+    # it by listing the same file and generated header.
+    active_gemm/active_gemm_device_ffi.cc
 )
 
 # The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated
@@ -1563,6 +1568,12 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_unfold_kernel.h"
              "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh")
 # The k-box R-space kernels (modes 9 and 11, kdft/kbox_rspace_src.h.in) on the same stage text.
+# The device-bounds active-range GEMM kernel (active_gemm/active_gemm_src.h.in), embedded as text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h" LRX_ACTIVE_GEMM_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/active_gemm_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_kernel.h" LRX_KBOX_RSPACE_SRC)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_src.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_rspace_src.h" @ONLY)

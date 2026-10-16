@@ -236,6 +236,11 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     # The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc), called by
     # distrib_la.local_eigh (BATCHED_EIGH_ROUTE); CUDA uses jaxlib's cuSOLVER for it.
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
+    # The active-range GEMM with device-side bounds (cpp/active_gemm/, leg-neutral, run-time
+    # compiled), distrib_la ACTIVE_LOCAL_ROUTE's ROCM "device" row; the CUDA leg serves the
+    # operation with cublas_local (and adopts this source by listing it).
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},

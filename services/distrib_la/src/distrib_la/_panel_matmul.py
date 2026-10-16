@@ -153,6 +153,17 @@ def _panel_contraction(mesh, active=True):
             if c is None:
                 return _native_out(left, right, bounds, alpha=one)
             return _native(left, right, bounds, c, alpha=one, beta=one)
+    elif active_local_route(platform) == "device":
+        from ._active_local_device import device_call, require_active_local_device
+        if active:
+            require_active_local_device(platform)
+
+        def contract(left, right, bounds, c):
+            if bounds is None:
+                return c + left @ right                       # every column: XLA folds one GEMM
+            if c is None:
+                return device_call(left, right, bounds, None, None, alpha=one, beta=0)
+            return device_call(left, right, bounds, None, c, alpha=one, beta=one)
     else:
         from ._active_local import local_active_impl
         active_impl = local_active_impl(mesh_platform(mesh))

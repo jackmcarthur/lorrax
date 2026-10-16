@@ -1,8 +1,9 @@
 """The native active-range local GEMM (``lorrax_cublas_local_*``) against the XLA routes on the
 same device.
 
-The native handler (``ACTIVE_LOCAL_ROUTE``'s CUDA row; built and gated on ROCM, whose row is
-``masked``) is one leg-neutral source (``src/ffi/cpp/cublas/local_active_gemm_ffi.cc`` over ``common/gpu_blas.h``:
+Two native routes.  ``"device"`` (``ACTIVE_LOCAL_ROUTE``'s ROCM row; ``_active_local_device``,
+``src/ffi/cpp/active_gemm/``): one run-time-compiled kernel that reads the bounds on the device.
+``"native"`` (the CUDA row; built and gated on ROCM too) is one leg-neutral source (``src/ffi/cpp/cublas/local_active_gemm_ffi.cc`` over ``common/gpu_blas.h``:
 cuBLAS / rocBLAS strided-batched GEMMs on pointer views of the original buffers).  Gate
 (``ffi.common.families`` row ``cublas_local``, tol 1e-13 relative to max|reference|):
 
@@ -42,7 +43,7 @@ BOUNDS = {
 }
 # The Fe Sigma tau shapes (sigma_tau_kernel_bins.csv): W(tau) synthesis c128[64,156,156] over
 # the pole axis (K 936 at the deck's cap) and the Green build c128[64,312,312] over bands.
-FE_SHAPES = {"fe_w": (64, 156, 936, 156), "fe_g": (64, 312, 70, 312)}
+FE_SHAPES = {"fe_w": (64, 156, 936, 156), "fe_g": (64, 312, 36, 312)}   # Fe window module
 
 
 def _draw(rng, shape, dtype):
@@ -98,8 +99,10 @@ def raw_cases(platform):
     import jax
     import jax.numpy as jnp
     from distrib_la import _active_local_cuda as nat
+    from distrib_la import _active_local_device as dvc
     from distrib_la._active_local import active_local_matmul, masked_local_matmul
 
+    dvc.require_active_local_device(platform)
     nat.require_active_local_cuda(platform)
     nat.require_prepared_active_local_cuda(platform)
     dev = jax.local_devices()[0]
@@ -136,6 +139,13 @@ def raw_cases(platform):
                 guard="full"))(A, B, BD, W, C))
             ok = np.isnan(pf) | (np.abs(pf - ref) <= TOL * max(np.abs(ref).max(), 1.0))
             loud[tag] = bool(ok.all())
+            got["device"] = jax.jit(lambda A, B, BD, W, C: dvc.active_local_device(
+                A, B, BD, W, C if beta != 0 else None, alpha=alpha, beta=beta))(A, B, BD, W, C)
+            got["device_raw_unweighted"] = jax.jit(lambda X, B, BD, C: dvc.device_call(
+                X, B, BD, None, C if beta != 0 else None, alpha=alpha, beta=beta))(wa, B, BD, C)
+            if np.all(bounds == bounds[0]):
+                got["device_1pair"] = jax.jit(lambda A, B, BD, W, C: dvc.device_call(
+                    A, B, BD[:1], W, C if beta != 0 else None, alpha=alpha, beta=beta))(A, B, BD, W, C)
             got["masked"] = jax.jit(lambda A, B, BD, W, C: masked_local_matmul(
                 A, B, BD, W, C, alpha=alpha, beta=beta))(A, B, BD, W, C)
             got["interval"] = jax.jit(lambda A, B, BD, W, C: active_local_matmul(
@@ -172,6 +182,12 @@ def raw_cases(platform):
             A, B, BD, W, alpha=np.complex128(1), beta=np.complex128(0),
             guard="full"))(A, B, BD, W))
         inval[f"arm_full{bad}"] = bool(np.all(np.isnan(g)))
+        g = np.asarray(jax.jit(lambda A, B, BD, W: dvc.active_local_device(
+            A, B, BD, W, alpha=np.complex128(1), beta=np.complex128(0)))(A, B, BD, W))
+        inval[f"device{bad}"] = bool(np.all(np.isnan(g)))
+        g = np.asarray(jax.jit(lambda A, B, BD, W, C: dvc.active_local_device(
+            A, B, BD, W, C, alpha=np.complex128(1), beta=np.complex128(0.5)))(A, B, BD, W, put(c)))
+        inval[f"device_withC{bad}"] = bool(np.all(np.isnan(g)))
     for tag, v in loud.items():
         inval[f"full_poisoned_is_nan_or_exact {tag}"] = v
     try:
@@ -207,7 +223,7 @@ def plan_cases(mesh, platform):
     row0 = al.ACTIVE_LOCAL_ROUTE[platform]
     res = {}
     try:
-        for route in ("native", "masked", "interval"):
+        for route in ("device", "native", "masked", "interval"):
             al.ACTIVE_LOCAL_ROUTE[platform] = route
             plan = local_gemm_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=jnp.complex128,
                                    alpha=alpha, beta=beta, enable_active_range=True)
@@ -229,6 +245,7 @@ def timing(platform, reps=64, rounds=5):
     import jax
     import jax.numpy as jnp
     from distrib_la import _active_local_cuda as nat
+    from distrib_la import _active_local_device as dvc
     from distrib_la._active_local import masked_local_matmul
 
     dev = jax.local_devices()[0]
@@ -236,6 +253,7 @@ def timing(platform, reps=64, rounds=5):
     one = np.complex128(1.0)
     shapes = dict(FE_SHAPES)
     shapes.update({f"{k2}_distinct": v for k2, v in FE_SHAPES.items()})
+    shapes.update({f"{k2}_fullK": v for k2, v in FE_SHAPES.items()})   # live 1.0: kernel efficiency
     for name, (nq, m, k, n) in shapes.items():
         rng = np.random.default_rng(3)
         a, b, w, c = _operands(rng, nq, m, k, n, np.complex128)
@@ -243,6 +261,8 @@ def timing(platform, reps=64, rounds=5):
         if name.endswith("_distinct"):          # every parent its own interval: nq BLAS calls
             lo = rng.integers(0, k // 2, nq)
             bounds = np.stack([lo, np.minimum(k, lo + rng.integers(1, k // 2, nq))], 1).astype(np.int32)
+        if name.endswith("_fullK"):
+            bounds = np.array([[0, k]] * nq, np.int32)
         pairs = bounds.astype(np.int64).reshape(-1)
         A, B, W, C, BD = (jax.device_put(jnp.asarray(x), dev) for x in (a, b, w, c, bounds))
         small = np.complex128(1e-3)
@@ -262,11 +282,15 @@ def timing(platform, reps=64, rounds=5):
             A, B, C, active_bounds=pairs, alpha=small, beta=one)
         mask_step = lambda A, B, BD, W, C: masked_local_matmul(A, B, BD, W, C, alpha=small, beta=one)
         arm_step = lambda A, B, BD, W, C: nat.active_local_cuda(A, B, BD, W, C, alpha=small, beta=one)
+        dev_step = lambda A, B, BD, W, C: dvc.active_local_device(A, B, BD, W, C, alpha=small, beta=one)
         fns = {"native": chain(nat_step), "prepared": chain(prep_step), "masked": chain(mask_step),
                "arm": chain(arm_step),
-               "arm_select": chain(lambda A, B, BD, W, C: nat.active_local_cuda(
-                   A, B, BD, W, C, alpha=small, beta=one, guard="select")),
-               "native+8ew": chain(nat_step, 8), "prepared+8ew": chain(prep_step, 8),
+               "arm_full": chain(lambda A, B, BD, W, C: nat.active_local_cuda(
+                   A, B, BD, W, C, alpha=small, beta=one, guard="full")),
+               "device": chain(dev_step),
+               "device_unweighted": chain(lambda A, B, BD, W, C: dvc.device_call(
+                   A, B, BD, None, C, alpha=small, beta=one)),
+               "native+8ew": chain(nat_step, 8), "device+8ew": chain(dev_step, 8),
                "masked+8ew": chain(mask_step, 8)}
         for label, f in fns.items():
             f(A, B, BD, W, C).block_until_ready()
@@ -328,7 +352,7 @@ def test_rows():
     pytest.importorskip("jax")
     from distrib_la._active_local import (ACTIVE_LOCAL_GUARD, ACTIVE_LOCAL_ROUTE,
                                           active_local_guard, active_local_route)
-    assert ACTIVE_LOCAL_ROUTE["CUDA"] == "native" and ACTIVE_LOCAL_ROUTE["ROCM"] == "masked"
+    assert ACTIVE_LOCAL_ROUTE["CUDA"] == "native" and ACTIVE_LOCAL_ROUTE["ROCM"] == "device"
     assert active_local_route("cpu") == "interval"
     assert ACTIVE_LOCAL_GUARD == {"CUDA": "cond", "ROCM": "select"}
     assert active_local_guard("tpu") == "cond"
@@ -351,10 +375,33 @@ def test_select_guard_lowers_with_no_device_control_flow():
     assert text("cond").count("stablehlo.case") == 2
 
 
+def test_device_arm_lowers_to_one_call_and_no_control_flow():
+    """Owner rules: no host sync, no device control flow, no operand copy -- one custom call."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from distrib_la import _active_local_device as dvc
+    jax.config.update("jax_enable_x64", True)
+    rng = np.random.default_rng(2)
+    a, b, w, c = _operands(rng, NQ, M, K, N, np.complex128)
+    args = (jnp.asarray(a), jnp.asarray(b), jnp.asarray(BOUNDS["mixed"]), jnp.asarray(w),
+            jnp.asarray(c))
+    text = jax.jit(lambda *x: dvc.active_local_device(*x, alpha=np.complex128(1),
+                                                      beta=np.complex128(0.5))).lower(*args).as_text()
+    assert text.count("stablehlo.custom_call") == 1 and "lorrax_active_gemm_device" in text
+    for op in ("stablehlo.case", "stablehlo.while", "stablehlo.select", "stablehlo.multiply"):
+        assert op not in text, op
+
+
 def test_targets_in_both_rocm_tables_and_the_family_row():
     pytest.importorskip("jax")
     from ffi.common import ffi_loader, families
     from distrib_la import loader
+    for t in ("lorrax_active_gemm_device", "lorrax_active_gemm_device_out"):
+        assert loader._PLATFORMS["ROCM"]["targets"][t] == ffi_loader._PLATFORMS["ROCM"]["targets"][t]
+        assert t not in loader._PLATFORMS["CUDA"]["targets"]
+        assert families.family_of(t) == "active_gemm"
+    assert families.state("active_gemm", "ROCM")[0] == "built"
+    assert families.FAMILIES["active_gemm"].tol == TOL
     for t in ("lorrax_cublas_local_active_range_gemm", "lorrax_cublas_local_active_range_gemm_out",
               "lorrax_cublas_local_prepared_active_range_gemm"):
         sym = loader._PLATFORMS["CUDA"]["targets"][t]

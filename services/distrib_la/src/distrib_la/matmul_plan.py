@@ -423,6 +423,11 @@ def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
             require_active_local_cuda(platform)
             active_impl = (active_local_cuda if active_local_guard(platform) == "cond" else
                            partial(active_local_cuda, guard=active_local_guard(platform)))
+        elif active_local_route(platform) == "device":
+            from distrib_la._active_local_device import (active_local_device,
+                                                         require_active_local_device)
+            require_active_local_device(platform)
+            active_impl = active_local_device
         else:
             from distrib_la._active_local import local_active_impl
             active_impl = local_active_impl(mesh_platform(mesh))
