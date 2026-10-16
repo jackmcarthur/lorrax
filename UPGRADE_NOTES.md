@@ -5,7 +5,20 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
-## 2026-10-15 — `w_head_densify = srlr`: SR/LR W densification (branch `feat/srlr-w-densify`)
+## 2026-10-16 — W densifier: an even coarse axis splits its Nyquist coefficient
+
+`bse_k_grid` and `exciton_bands --w-coarse-grid` interpolate W by zero-padding
+it in R (`bse.bse_densify._zeropad_R_axis`). On an even coarse axis the
+Nyquist coefficient R = −n_c/2 was kept single-sided at weight 1; it is now
+split, weight ½ at R = ±n_c/2. Coarse tiles are unchanged, and every fine
+tile is Hermitian; single-sided, MoS₂ 6×6→12×12 off-grid tiles were
+20–63 % non-Hermitian.
+
+- **Results.** Odd coarse axes (MoS₂ 9×9, z = 1) are bit-identical. Runs that
+  pad an even coarse axis move, `c1` and `srlr` alike (Si 4³→8³, MoS₂ 6×6).
+  No deck change is needed.
+
+## 2026-10-15 — `w_head_densify = srlr`: SR/LR W densification
 
 A second coarse-to-fine W mode beside `c1` (the default, unchanged). `srlr`
 splits W exactly at every coarse q into a short-range part and the screened

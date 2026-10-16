@@ -59,6 +59,9 @@ A new test needs no bootstrap import of its own.
   two call sites compiles once, partner directions keep one carrier, face
   rounds share one width. The audit-row tests are strict xfails until their
   fix lands.
+- `test_w_pad_nyquist_cpu.py`: the W densifier's R zero-pad (CPU): an even
+  coarse axis splits its Nyquist coefficient, so coarse tiles stay exact and
+  every fine tile is Hermitian; the single-sided red twin is not.
 - Benchmarks and backend checks for a standalone service live in that service's
   `services/<svc>/bench/`.
 

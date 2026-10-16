@@ -65,21 +65,23 @@ def _zeropad_R_axis(x: jax.Array, axis: int, n_fine: int) -> jax.Array:
         n = i        for 0 ≤ i < ⌈N/2⌉     (the non-negative reps 0,1,…)
         n = i − N    for ⌈N/2⌉ ≤ i < N      (the negative reps …,−2,−1, wrapped)
 
-    For even ``N`` the single Nyquist rep ``n = −N/2`` sits at ``i = N/2`` (it is
-    in the negative branch here — kept single-sided, NOT split; sample agreement
-    is exact regardless, and single-sided = "coarse WS cell, zero outside",
-    which is precisely the requested zero-pad).  Embedding coarse→fine with
-    ``s = ⌈n_c/2⌉ = (n_c+1)//2`` non-negative reps:
+    Embedding coarse→fine with ``s = ⌈n_c/2⌉ = (n_c+1)//2`` non-negative reps:
 
         coarse i_c ∈ [0, s)      (reps n = 0 … s−1)      → fine i_f = i_c
         coarse i_c ∈ [s, n_c)    (reps n = −(n_c−s) … −1) → fine i_f = i_c + (n_fine − n_c)
 
     i.e. the low block keeps its indices, the high (negative-freq) block slides
-    to the TOP of the fine axis, and the gap ``i_f ∈ [s, n_fine − (n_c−s))`` is
-    ZERO (the high-|R| coefficients absent from the coarse cell — incl. the
-    fine-only Nyquist and the absent coarse ``+n_c/2``).  Realised as
-    ``concat([low, zeros, high])`` — the textbook fft zero-insertion, exact for
-    any parity of ``n_c``.
+    to the TOP of the fine axis, and the gap between them is ZERO (the high-|R|
+    coefficients absent from the coarse cell).  Realised as
+    ``concat([low, zeros, high])`` — the textbook fft zero-insertion.
+
+    Even ``n_c``: the coarse Nyquist coefficient X(−n_c/2) = X(+n_c/2) is SPLIT,
+    weight ½ at both fine reps ±n_c/2.  Coarse samples are unchanged
+    (e^{±iπj} agree there), and the rep set is symmetric under R → −R, so a
+    W(k) Hermitian at every coarse k stays Hermitian at every fine k.  Kept
+    single-sided (weight 1 at −n_c/2) every off-grid tile picks up the
+    antisymmetric i·sin(k n_c/2) X_N term: MoS₂ 6→12 tiles came out 20–63 %
+    non-Hermitian.  Odd ``n_c`` has no Nyquist rep and takes the plain path.
 
     NOTE: scale is applied ONCE by the caller (``pad_W_R_to_grid``), not here.
     """
@@ -94,8 +96,15 @@ def _zeropad_R_axis(x: jax.Array, axis: int, n_fine: int) -> jax.Array:
     s = (n_c + 1) // 2
     lo = jax.lax.slice_in_dim(x, 0, s, axis=axis)
     hi = jax.lax.slice_in_dim(x, s, n_c, axis=axis)
+    n_gap = n_fine - n_c
+    if n_c % 2 == 0:
+        half = 0.5 * jax.lax.slice_in_dim(x, s, s + 1, axis=axis)
+        lo = jnp.concatenate([lo, half], axis=axis)
+        hi = jnp.concatenate(
+            [half, jax.lax.slice_in_dim(x, s + 1, n_c, axis=axis)], axis=axis)
+        n_gap -= 1
     zshape = list(x.shape)
-    zshape[axis] = n_fine - n_c
+    zshape[axis] = n_gap
     zeros = jnp.zeros(zshape, dtype=x.dtype)
     return jnp.concatenate([lo, zeros, hi], axis=axis)
 
