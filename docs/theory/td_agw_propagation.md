@@ -118,7 +118,7 @@ $R(h/2)\,M(h)\,R(h/2)$, with $R$ the exact relaxation around an RK4 step of
 the intraband flow, so with either one active the global order is 2 with an
 error constant set by the size of $[M, R]$.
 
-### Two accuracy limits {#accuracy-limits}
+### Three accuracy limits {#accuracy-limits}
 
 **Short pulses under `dp54`.** The controller starts with a step of
 `dt_measure` and measures its error against `atol` while ρ is still at
@@ -141,6 +141,47 @@ spectroscopic tolerances. The cure is the interaction picture on
 small coupling only, and update
 Δρ ← P (U Δρ U^† + [U − 1, ρ^eq] U^†) P^†, every term of the size of Δρ
 (not implemented).
+
+**Strang splitting in strong fields.** The intraband term is not a
+commutator, so `magnus2` and `cfm4` split it off (Strang), and its splitting
+error grows with the field. On CrI3 at 5e9 V/m `cfm4` (two corrections) is
+second order, 3.5e-6 / 1.4e-5 / 9.0e-5 at 5 / 10 / 25 as over 10 fs, while
+with the intraband term off it is fourth order, 8.8e-10 / 1.4e-8 / 5.7e-7, and
+beats ETDRK4 (2.3e-6 at 25 as). ETDRK4 and DP54 carry the intraband term in
+their explicit part and stay fourth/fifth order (ETDRK4 3.1e-6 at 25 as with
+it on). A fourth-order composition of the Strang step (Yoshida's triple
+jump, three Strang steps per step) or an exponential integrator for the
+intraband flow would remove the limit (not implemented).
+
+### Choosing a method {#choosing}
+
+Measured operating points (2026-10-16). Cost is ΔΣ evaluations per
+simulated fs; error is the relative L2 error of P(t) over 30 fs.
+
+| system | DP54 | ETDRK4 | CFM4 (2 corrections) | RK4 |
+|---|---|---|---|---|
+| CrI3, 6×6 k, 2v2c, ISDF COHSEX, 100 V/m (exact linear response as reference) | 3.5e-4 at 46 (rtol 1e-6); 3.3e-6 at 114 (rtol 1e-8) | 1.0e-4 at 80 (50 as); 6.5e-6 at 160 (25 as) | 1.4e-5 at 80 (50 as); 3.4e-6 at 160 (25 as) | 3.9e-8 at 800 (5 as) |
+| synthetic 4v4c, 6×6 k, transitions to 12 eV, dense TDA kernel | 2.9e-5 at 337 (rtol 1e-6) | 2.2e-5 at 160 (25 as) | 6.4e-6 at 161 (25 as) | 1.7e-5 at 800 (5 as) |
+
+On the CrI3 window (transitions 1.4–4 eV) DP54's steps after the pulse
+are long, and it needs the fewest ΔΣ evaluations at every accuracy; the
+bright-peak positions move by 0.035 meV at rtol 1e-6 and not at all below.
+On the synthetic window, whose 12 eV transitions limit an explicit step,
+ETDRK4 and CFM4 need 2–4× fewer evaluations than DP54. RK4 diverges beyond
+h·ΔE_max ≈ 2.8 (150 as at 12 eV); ETDRK4 and CFM4 with two corrections stay
+usable (error < 1e-2) to about 100 as on both windows; `magnus2` is
+unconditionally bounded but second order.
+
+**Default: `dp54`**, at `rtol` 1e-6 to 1e-7, with `max_step` near a fifth of
+the pulse width for short pulses: it takes TDGW's steps, needs no step
+choice and is the cheapest on narrow windows. Use `etdrk4` or `cfm4` (two
+corrections, `dt` 25–50 as) when the window spans a wide energy range or a
+fixed step that divides `dt_measure` is wanted for a long production drive;
+in strong fields with the intraband term on prefer `etdrk4`, which stays
+fourth order where `cfm4` drops to second (above).
+On four A100s the ISDF ΔΣ dominates the wall time (2.95 ms per call at
+2v2c, 9.0 ms at 30v × 14c on 6×6 k, against 1.05 ms for one exponential and
+0.27 ms per sample at 30v × 14c), so the wall time follows the ΔΣ count.
 
 ## Layout and programs {#layout}
 
