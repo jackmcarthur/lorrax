@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.collectives import device_put_process_local
+from common.collectives import device_put_process_local, device_put_process_local_cached
 from common import timing
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
@@ -1472,7 +1472,8 @@ def _integrate_sigma_batches(
             fence('tau.window_arguments', sync_ranks=True)
             with timing.section('tau.window_arguments'):
                 pole_indices, bounds, phase_real, active_count = selected
-                active_count = device_put_process_local(active_count, small)
+                # One of a few window widths: placed once per distinct value.
+                active_count = device_put_process_local_cached(active_count, small)
                 win = row.window
                 weight = getattr(row, "band_weight", None)
                 if weight is None:
