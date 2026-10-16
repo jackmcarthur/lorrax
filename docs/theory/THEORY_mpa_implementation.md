@@ -306,8 +306,9 @@ stored complex head pole without adding $\eta$; the body applies $\eta$, so a
 convergence statement covers the body quadrature at a fixed head.
 
 After body and head, the common dynamic-$\Sigma$ finalizer
-(`gw.sigma_dispatch`, `gw.dynamic_sigma`) adds the diagonal head, interpolates
-the matrix-valued cube at the requested energies, writes `sigma_mnk.h5` and builds
+(`gw.sigma_dispatch`, `gw.dynamic_sigma`) adds the diagonal head, reads the
+on-shell pair at the requested energies (interpolates the matrix-valued cube
+under `sigma_omega_grid_debug = true`), writes `sigma_mnk.h5` and builds
 the static Hermitian QSGW operator.
 Self-consistent QSGW rebuilds $\chi$, $W$, the body fit and the head on every
 map (the stores are written under per-iteration names and one complete pair is

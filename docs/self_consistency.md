@@ -91,8 +91,10 @@ One map $F: H \mapsto H'$ (`sc_iteration.gw_iteration_map`) does six things:
    \qquad \Sigma = \Sigma_x + \Sigma_c ,
    $$
 
-   where $[\cdot]^{\rm h}$ is the Hermitian part, $\Sigma(\tilde E)$ is read by
-   linear interpolation on the sampled ω grid (§4), and $\tilde E$ is the
+   where $[\cdot]^{\rm h}$ is the Hermitian part, $\Sigma(\tilde E)$ is
+   evaluated at $\tilde E$ itself ([on-shell Σ_c](theory/sigma-on-shell.md);
+   under `sigma_omega_grid_debug = true`, by linear interpolation on the
+   sampled ω grid, §4), and $\tilde E$ is the
    state's current energy (a pinned semicore state reads at its DFT energy,
    §2).
 6. Rotate back and set
@@ -320,8 +322,8 @@ E_{nk} = E^{\rm DFT}_{nk} + \beta, \qquad
 u_{nk} = \begin{cases} \min(Z_{nk}, Z_{nk}^{-1}) & Z_{nk} > 0 \\ 0 & Z_{nk} \le 0 \end{cases}
 $$
 
-The sum runs over the conduction states of the QP matrix whose Σ was read on
-the sampled grid. $w_k$ is the star weight and
+The sum runs over the conduction states of the QP matrix whose Σ was read
+inside the grid's range. $w_k$ is the star weight and
 $Z_{nk} = (1 - \partial_\omega \mathrm{Re}\,\Sigma_{nn}(\omega)|_{E_{nk}})^{-1}$.
 
 - The tail is not in the rotated subspace, so it can only follow the
@@ -333,7 +335,7 @@ $Z_{nk} = (1 - \partial_\omega \mathrm{Re}\,\Sigma_{nn}(\omega)|_{E_{nk}})^{-1}$
   $s = \partial_\omega \mathrm{Re}\,\Sigma$, $u = Z$ for $s \le 0$, $1 - s$
   for $0 < s < 1$ and 0 for $s \ge 1$, so $u$ is continuous in $s$ and the
   map has no jump where a $Z$ crosses 1.
-- A state off the sampled grid is excluded, because its energy did not come
+- A state outside the grid's range is excluded, because its energy did not come
   from its own $\Sigma(E)$.
 - $Z$ comes from the previous map and rides the carry (`SCState.tail_z_kn`),
   because this map's Σ exists only after the tail has fed χ₀ and W. Map 0
@@ -436,6 +438,13 @@ other WFN refuses it by fingerprint.
 
 ## 4 The Σ grid across maps {#sigma-grid-and-quadrature}
 
+By default Σ_c is evaluated on shell, at the states' own energies
+([on-shell Σ_c](theory/sigma-on-shell.md)), and the grid below is read only
+for its range $[\omega_{\min}, \omega_{\max}]$: which energies are covered,
+and so where the out-of-grid rule and $Z = 1$ apply. Its samples are evaluated
+only under `sigma_omega_grid_debug = true`. The plan, the hold and the
+out-of-grid rule are the same on both routes.
+
 $\Sigma_c(\omega)$ is sampled on a uniform grid of step `sigma_omega_step_ev`,
 measured from the $E_F$ of the Σ frame: `efermi.resolve_sigma_efermi_ry` for
 MPA, and the current spectrum's VBM or midgap for GN/HL-PPM
@@ -469,8 +478,8 @@ edge and not map 0's (§2).
 
 **Hold.** Every later map keeps the grid while each requested state's read
 support $[E - 0.5, E + 0.5]$ eV lies inside it. E is the map's input energy,
-and 0.5 eV is the half-width of the $Z$ stencil
-(`eqp_bgw.Z_FINITE_DIFFERENCE_EV`). When a state is about to leave, only the
+and 0.5 eV is the half-width of the grid route's $Z$ stencil
+(`eqp_bgw.Z_FINITE_DIFFERENCE_EV`), kept as the read support on shell. When a state is about to leave, only the
 crossed edge grows, to $E \pm P$, which leaves 1.5 eV of motion before it can
 trigger again; one `SC window extension` line names the band, k, $E - \mu$,
 the new edge and the run's extension count. Old samples never move, and an
@@ -899,7 +908,8 @@ diagnostic):
   header says so. No Z linearization enters: at the fixed point the map output
   solves the QP equation. The gap report reads the same array.
 - `sigma_diag.dat` holds the diagonal of the final Σ on the fixed DFT states,
-  a diagnostic, not the SC spectrum. `sigma_mnk.h5` carries no eqp receipt,
+  a diagnostic, not the SC spectrum; on shell its `sigC(E_DFT)` is NaN
+  ([on-shell Σ_c](theory/sigma-on-shell.md#grid)). `sigma_mnk.h5` carries no eqp receipt,
   and `python -m gw.eqp_bgw` refuses an SC file
   (`GATE eqp_bgw_self_consistent_run`).
 - `qp_wfn_rotations.h5` (always) and `WFN_qp.h5` (when `write_wfn_h5`, the

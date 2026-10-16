@@ -20,7 +20,9 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
   selects `mpa`, so the deck names it. The tier `sigma_w_accuracy =
   production` is the default.
 - **Σ.** Σ_c(ω) on the real axis from the pole sum, by the certified
-  denominator-box quadrature ([Σ quadrature](../theory/sigma-quadrature-problem.md)).
+  denominator-box quadrature ([Σ quadrature](../theory/sigma-quadrature-problem.md)),
+  evaluated on shell at the states' own energies
+  ([on-shell Σ_c](../theory/sigma-on-shell.md)).
   `sigma_quadrature_eps = 1e-4` and `sigma_regularization_ev = 0.25` are the
   defaults. Rules are built in each run and held across SC maps; none is stored.
 - **QSGW.** `qp_solver = self_consistent`. Stop at 1 meV

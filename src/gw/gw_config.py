@@ -1093,7 +1093,9 @@ _DEFAULTS = {
     #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
     #   eqp0.dat       — BGW-format zeroth-order QP energies.
     #   eqp1.dat       — BGW-format Z-linearized QP energies (Z=1 in
-    #                    static COHSEX, central-difference Z in PPM).
+    #                    static COHSEX; in dynamic modes Z from the exact
+    #                    on-shell dSigma/domega, or the +/-0.5 eV central
+    #                    difference under sigma_omega_grid_debug).
     "sigma_diag_file": "sigma_diag.dat",
     "eqp0_file": "eqp0.dat",
     "eqp1_file": "eqp1.dat",
@@ -1179,6 +1181,8 @@ _DEFAULTS = {
     #       self-consistency, the DFT basis one-shot).
     #   qp_omega0_ev               (nk, nb) real — the QP ladder of
     #       H₀ + Σ_x + Σ_c(ω≈0), one extra eigh of an (nk, nb, nb).
+    #       Needs the Σ_c(ω) cube (sigma_omega_grid_debug = true); on
+    #       shell it is omitted and named.
     #   qp_static_cohsex_ev        (nk, nb) real — the static COHSEX
     #       ladder, H₀ + Σ_SX + Σ_COH.  Written only by a run that BUILT
     #       those two channels, which today means compute_mode = cohsex;
@@ -1355,6 +1359,8 @@ _DEFAULTS = {
     # pair.  This iterates ONLY the eigenvalues/eigenvectors against the
     # already-computed full Sigma_c(omega) table: W, screening, and Sigma
     # diagrams are never recomputed.  The 1 meV default is a max|dE| test.
+    # The table exists only under sigma_omega_grid_debug = true; on shell
+    # it refuses (GATE eqp2_needs_omega_grid).
     "write_eqp2": False,
     "eqp2_tol_ev": 1.0e-3,
     "eqp2_max_iter": 20,
@@ -1630,6 +1636,9 @@ _DEFAULTS = {
     # Sigma frequency grid
     # None (unset): the grid comes from the protected Sigma band range under
     # the SC window plan; a value is a minimum extent honoured every map.
+    # On shell (the default) only the grid's extent is read, as the covered
+    # range; Sigma is sampled on its steps and patches only under
+    # sigma_omega_grid_debug (docs/theory/sigma-on-shell.md).
     "sigma_omega_min_ev": None,
     "sigma_omega_max_ev": None,
     "sigma_omega_step_ev": 0.25,
@@ -1765,7 +1774,7 @@ _DEFAULTS = {
     # Sigma_mn(E_m), Sigma_mn(E_n) and the eqp readers' band diagonals
     # (value, exact dSigma/domega) at the map's energies (gw.ppm_accumulators,
     # docs/theory/sigma-on-shell.md).  True keeps the grid cube for the
-    # readers only it serves: fixed-Sigma evSC (qp_solver = eqp2), the
+    # readers only it serves: fixed-Sigma evSC (write_eqp2 = true), the
     # sigma_mnk.h5 omega cube, the freq-debug tables, qp_omega0_ev and the
     # DFT-basis Sigma_c(E_DFT) of an SC run.
     "sigma_omega_grid_debug": False,

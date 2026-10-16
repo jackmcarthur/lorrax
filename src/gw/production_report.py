@@ -526,6 +526,10 @@ class GWProductionReport:
             getattr(sigma_result, "omega_grid_ev", ()), dtype=np.float64)
         grid_note = (f"; step={float(config.sigma.omega_step_ev):.5f} eV; "
                      f"{int(omega_grid.size)} points")
+        if getattr(sigma_result, "sigma_c_on_shell", None) is not None:
+            # On shell the grid is only the covered range; Sigma was not
+            # sampled on its points (docs/theory/sigma-on-shell.md).
+            grid_note += "; on shell: covered range only"
         self.emit(f"Sigma omega    : [{grid_lo:+.5f}, {grid_hi:+.5f}] eV "
                   f"relative to E_F{grid_note}")
         if val_span is not None:

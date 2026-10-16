@@ -1766,7 +1766,7 @@ def run_fixed_sigma_evsc(
             "GATE eqp2_needs_omega_grid: fixed-Sigma evSC re-reads one Sigma_c(omega) "
             "at moving energies in a rotating basis, and this run's Sigma was "
             "evaluated on shell (at its own energies only).\n"
-            "  want: sigma_omega_grid_debug = true with qp_solver = eqp2\n"
+            "  want: sigma_omega_grid_debug = true with write_eqp2 = true\n"
             "  doc:  docs/theory/sigma-on-shell.md")
     sigma_x_dft = sigma_result.sigma_x_kij_ry
     v_h_dft = sigma_result.v_h_kij_ry

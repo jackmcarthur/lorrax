@@ -91,6 +91,9 @@ The extrapolated matrix is written into the buffer of S(N₁). The raw twin
 diagonal of S(N₃), which is taken before the combination; S(N₃) is then
 released, so one Σ(ω) cube leaves the stage. The sweep stores two cubes and
 one diagonal, with or without symmetry; the three-sum cube is never made.
+On shell (the default) each S(N_i) keeps its diagonal slots, S(N₁) and S(N₃)
+also the pair, in place of the ω axis
+([on-shell Σ_c](sigma-on-shell.md#extrapolation)).
 With `sigma_freq_debug_output` the full S(N₃) is kept, and each SC map also
 reports the extrapolation's effect on E_nk from a second QSGW matrix. S(N₃)
 is summed per τ node, so it differs from the sum of the three separately

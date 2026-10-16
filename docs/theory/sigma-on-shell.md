@@ -91,7 +91,7 @@ eqp receipt carries `eqp_assembly_conditioned_sigma_c_onshell_ev`
 These read Σ at energies or in a basis the sweep did not evaluate. On shell
 they refuse or are omitted by name:
 
-- `qp_solver = eqp2` (fixed-Σ evSC) refuses (`GATE eqp2_needs_omega_grid`):
+- `write_eqp2 = true` (fixed-Σ evSC) refuses (`GATE eqp2_needs_omega_grid`):
   it re-reads one Σ(ω) at moving energies in a rotating basis.
 - An SC run's DFT-basis Σ_c(E_DFT) (`sigma_diag.dat` `sigC`, written NaN).
   The pair's slots belong to the QP basis's band indices, so no rotation acts

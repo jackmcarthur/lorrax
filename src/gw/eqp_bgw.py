@@ -1221,7 +1221,8 @@ def make_eqp_bgw(
 	sigma_c_omega_diag = _receipt["sigma_c_omega_diag_ev"]
 	print(
 		f"  EQP assembly receipt: schema v{_receipt['schema_version']}, "
-		"live G-space H plus conditioned X/C(omega); raw operators untouched.")
+		"live G-space H plus conditioned X/C (on-shell operand or omega curve); "
+		"raw operators untouched.")
 
 	# From here on: zero independent semantics.  Same assembly (mean-field
 	# gate + Z-factor + Newton update), same formatter, as
@@ -1285,7 +1286,9 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument(
 		"--finite-difference-spacing",
 		type=float, default=0.5,
-		help="dE (eV) for the Z-factor central difference (BGW default 0.5)",
+		help="dE (eV) for the Z-factor central difference (BGW default 0.5); "
+		     "read only for an omega-grid file (sigma_omega_grid_debug): an "
+		     "on-shell file carries the exact dSigma/domega",
 	)
 	return p
 

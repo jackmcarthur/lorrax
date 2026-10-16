@@ -61,7 +61,8 @@ fixed-N μ).
 - μ at fixed electron count from each map's spectrum; μ is never mixed.
 - The Σ(ω) grid from the protected bands (`sigma_out_of_grid = cover`, the
   default); `sigma_omega_min_ev`/`sigma_omega_max_ev` are optional minimum
-  extents.
+  extents. Σ is evaluated on shell, so the grid sets the covered range
+  ([on-shell Σ_c](../theory/sigma-on-shell.md)).
 - The shared-pole support ladders, the Σ quadrature rules
   (`sigma_quadrature_eps`, default 1e-4) and the SC pad-then-hold windows.
 - The q→0 head from the tetrahedron Fermi-surface weights and the

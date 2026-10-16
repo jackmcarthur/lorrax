@@ -362,8 +362,9 @@ their unfold tables: no full-q W is formed for the file, and BSE unfolds on
 load ([BSE](bse.md)). Plain-MPA and metal restarts carry no `W0_qmunu`
 ([BSE](bse.md) says what a BSE on them does).
 
-The same key keeps a one-shot's swept Σ(ω) (`file_io.sigma_checkpoint`,
-`tmp/sigma_checkpoint_oneshot.h5`) when it pays for itself: only if the
+Under `sigma_omega_grid_debug = true` the same key keeps a one-shot's swept
+Σ(ω) (`file_io.sigma_checkpoint`, `tmp/sigma_checkpoint_oneshot.h5`; on shell
+there is no checkpoint and the sweep is recomputed) when it pays for itself: only if the
 measured sweep took at least 5× the predicted write (cube bytes at 1.3 GB/s,
 measured on one node), logged as one `Sigma checkpoint: written|skipped` line
 (Na 8³ [−100, +150] eV skips: 101 s sweep, 61.4 GB, 47.7 s write). The write

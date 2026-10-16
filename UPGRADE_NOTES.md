@@ -109,7 +109,7 @@ C(ω) curve.
 
 Deck changes:
 
-- `qp_solver = eqp2` needs `sigma_omega_grid_debug = true`
+- `write_eqp2 = true` needs `sigma_omega_grid_debug = true`
   (`GATE eqp2_needs_omega_grid`).
 - On shell, `sigma_freq_debug.dat`, `qp_omega0_ev`, an SC run's DFT-basis
   `sigC(Edft)` and the MPA sweep checkpoint are omitted by name.

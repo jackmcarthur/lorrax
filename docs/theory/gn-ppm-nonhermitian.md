@@ -278,6 +278,6 @@ contraction once more with $D=0$, as GN-PPM does, and writes
 `sigC_odd = Sigma_c[B,D] - Sigma_c[B,0]` to `sigma_diag.dat`
 (`gw.mpa.sigma._attach_ordered_odd_sigma`). Σ is linear in the residues, so
 this difference is the ordered term itself, computed from the two
-production Σ cubes on the same ω grid rather than from a separately
+production Σ cubes at the same frequencies rather than from a separately
 approximated formula. A run with $D = 0$ therefore writes an exactly zero
 column.

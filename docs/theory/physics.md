@@ -253,8 +253,10 @@ H_{\rm QP}=(T+V_{\rm ion})+V_{\rm H}+\Sigma^{\rm QSGW}_{xc},
 \Sigma^{\rm QSGW}_{xc,ij}(\mathbf k)=\operatorname{Herm}\,\tfrac12\!\left[\Sigma_{xc,ij}(\mathbf k,E_i)+\Sigma_{xc,ij}(\mathbf k,E_j)\right].
 $$
 
-A dynamic \(\Sigma_c(\omega)\) is interpolated on its real-frequency grid; an
-energy outside that grid takes \(\Sigma_c(\omega=0)\). `qp_solver` selects
+A dynamic \(\Sigma_c(\omega)\) is evaluated on shell, at the energies its
+readers use ([on-shell Σ_c](sigma-on-shell.md)); under
+`sigma_omega_grid_debug = true` it is interpolated on its real-frequency grid.
+An energy outside the grid's range takes \(\Sigma_c(\omega=0)\). `qp_solver` selects
 where the energies come from: `one_shot_dft` (at \(E_{\rm DFT}\)) or
 `self_consistent` (QSGW, at each map's own energies,
 which rebuilds χ₀, \(W\) and Σ from the rotated orbitals every map). In
@@ -267,7 +269,7 @@ QSGW, bands outside the Σ window follow a scissor law, not a self-energy. Owner
 |---|---|---|
 | \(\psi_{\mathbf k}(\mu)\) faces | flat k; centroid and band axes on the two mesh axes | band GEMMs stay local |
 | \(V_q,\chi_q,W_q\) | `P(None,'x','y')` | both matrix axes distributed |
-| \(\Sigma_c(\omega)_{\mathbf k,ij}\) | `P(None,None,'x','y')` over \((\omega,\mathbf k,i,j)\) | no replicated frequency cube |
+| \(\Sigma_c(\omega)_{\mathbf k,ij}\) | `P(None,None,'x','y')` over \((\omega,\mathbf k,i,j)\); ω is the pair slot on shell | no replicated frequency cube |
 | \(\widetilde z\), pole stores | irreducible q wedge | symmetry commutes with their construction |
 
 Every lattice FFT convolution consumes full-zone k/q data. Irreducible-zone

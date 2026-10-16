@@ -72,7 +72,9 @@ rulings override anything here.
   depends on the arbitrary basis inside it.
 - **`write_eqp2` never recomputes GW.** `sc_iteration.run_fixed_sigma_evsc`
   iterates the one-shot full-matrix Σ(ω), rotated into each updated QP basis;
-  G, χ₀, W and Σ are built once.
+  G, χ₀, W and Σ are built once. The Σ(ω) cube exists only under
+  `sigma_omega_grid_debug = true`; on shell it refuses
+  (`GATE eqp2_needs_omega_grid`).
 
 ## Configuration contracts (`gw.gw_config`)
 
@@ -161,7 +163,9 @@ rulings override anything here.
   `DynamicSigmaConfig.parse_omega_patches_ev` refuses a malformed patch and
   patches that are not ascending and separated by at least one step.
   `lo:hi:eta` triples are coarse windows, parsed and refused
-  (`GATE sigma_coarse_window`) by `parse_coarse_windows_ev`.
+  (`GATE sigma_coarse_window`) by `parse_coarse_windows_ev`. On shell only
+  the grid's extent is read (`ppm_sigma.on_shell_request`); its samples are
+  evaluated under `sigma_omega_grid_debug = true`.
 
 ### Screening
 

@@ -8,7 +8,9 @@ sectors. The planner is `gw.sigma_box_plan`, the rule builder the derived
 belong to [Multipole frequency integration](THEORY_mpa_implementation.md),
 [Metallic MPA screening](metallic-mpa-screening.md) and the
 [shared-pole model](../architecture/shared_pole_model.md); this page owns the
-frequency integral.
+frequency integral. The frequencies are the states' own evaluation energies
+([on-shell Σ_c](sigma-on-shell.md)), or the uniform ω grid under
+`sigma_omega_grid_debug = true`.
 
 ## 1. What is computed
 
