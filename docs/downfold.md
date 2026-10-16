@@ -115,19 +115,25 @@ reducing each to its maximum there (the parent control at 6000 used to gather
 time.
 
 **Memory price.** Every run prints its table (`[downfold/price]`,
-`gw.downfold.resident_bytes_per_rank`). Upper bounds, GB per rank, for the
-CrI3 8×8 80 Ry parents (nb 898, n_s 2, two tensors, residual on):
+`gw.downfold.resident_bytes_per_rank`): the resident stacks at their layouts,
+one Gram column tile, one q tile and the selection's whole-matrix eigensolve.
+It is an upper bound, because the selection-only and streamed rows are never
+live together. Measured on four A100-80GB at P4 (CrI3 80 Ry parents, nb 898,
+n_s 2, V and W0, residual on; device `peak_bytes_in_use` per rank, the same on
+all four):
 
-| case | ψ faces | parent tensors | S_LL | S_cross + T | small | Gram tile | q tile | pool eigh | total |
-|---|---|---|---|---|---|---|---|---|---|
-| 6000 → 1500, P4 | 11.03 | 18.43 | 9.22 | 4.61 | 4.49 | 1.07 | 1.55 | 5.18 | 55.6 |
-| 3000 → 716, P4 | 5.52 | 4.61 | 2.30 | 1.10 | 1.71 | 1.07 | 0.75 | 1.30 | 18.4 |
-| 6000 → 1500, P16 | 5.52 | 4.61 | 2.30 | 1.15 | 1.81 | 1.07 | 0.68 | 5.18 | 22.3 |
+| parent → child | n_q | printed bound | measured peak | largest resident items |
+|---|---|---|---|---|
+| 8×8, μ_L 6000 → 846 | 64 | 50.8 GB | 44.5 GB | parent V, W0 18.4; ψ faces 11.0; S_LL 9.2 |
+| 12×12, μ_L 3000 → 714 | 144 | 37.4 GB | 35.4 GB | parent V, W0 10.4; ψ faces 12.4; S_LL 5.2 |
 
-("small" is the child stacks and the child ψ faces.) The largest remaining
-item is the ψ faces, held at 1/p over the full band axis because the child
-bundle stores every band; the pool eigensolve's stack route is the capacity
-bound on μ_L (one matrix and its scratch on one rank).
+The local plan this replaced refused the first case at compile time (121 GB per
+device) and ran out of memory on the second (a 62 GB single allocation). The
+largest remaining items are the parent tensors, resident for the whole stream,
+and the ψ faces, held at 1/p over the full band axis because the child bundle
+stores every band; streaming the parent tensors from disk per q tile is the
+next reduction. The pool eigensolve's stack route bounds μ_L (one matrix and
+8·μ_L² of scratch on one rank).
 
 ## Input
 
