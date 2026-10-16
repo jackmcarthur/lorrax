@@ -1863,6 +1863,9 @@ def write_results(
         # Z, the eqp1 stencil, only where eqp1 was linearized at E_DFT.
         z_factor_kn=(None if assembly.e_eval_ev is not None
                      else assembly.z_factor),
+        z_note=("1/(1 - dRe sigC/dw) from the exact on-shell derivative at "
+                "E_DFT" if getattr(assembly, "sigma_c_on_shell", None)
+                is not None else "the eqp1 central difference at E_DFT"),
         sigma_c_raw_kn_eV=sigma_c_raw_kn_ev,
         eqp_raw_kn_eV=(None if raw_assembly is None else
                        (raw_assembly.eqp0_ev, raw_assembly.eqp1_ev)),

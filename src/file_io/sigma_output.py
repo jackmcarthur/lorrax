@@ -326,6 +326,7 @@ def write_sigma_to_file(
 	z_factor_kn=None,
 	sigma_c_raw_kn_eV=None,
 	eqp_raw_kn_eV=None,
+	z_note: str = "the eqp1 central difference at E_DFT",
 ):
 	"""Write self-energy components to file.
 
@@ -547,7 +548,7 @@ def write_sigma_to_file(
 			f.write("# sigC_odd = ordered broken-TR residue contribution "
 			        "Sigma_c[B,D] - Sigma_c[B,D=0]\n")
 		if z_diag is not None:
-			f.write("# Z is the eqp1 central difference at E_DFT\n")
+			f.write(f"# Z is {z_note}\n")
 		if raw_diag is not None:
 			names = "sigC_raw, eqp0_raw, eqp1_raw" if eqp_raw else "sigC_raw"
 			f.write(f"# {names}: {RAW_SIGMA_NOTE}\n")
