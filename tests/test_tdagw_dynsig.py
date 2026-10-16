@@ -114,7 +114,6 @@ def _dense_chi(psi, e, f, *, x_sep=0.0, mode="all"):
 def _dense_w_apply(psi, Wq, X):
     """(w X)_{k,ij} = (1/N_k) sum_{k' n m} [psi*_ik psi_nk'](mu) W_{k-k'}(mu,nu) [psi*_mk' psi_jk](nu) X_{k',nm}."""
     nk = psi.shape[0]
-    kmq = _kmq()
     out = np.zeros((nk, psi.shape[1], psi.shape[1]), complex)
     ijk = np.stack(np.unravel_index(np.arange(nk), KGRID), axis=1)
     for k in range(nk):
@@ -379,7 +378,6 @@ def main() -> int:
     environment) the runtime's communicator stack; else the CPU unit-test
     clause, one process with four host devices (``resolve_mesh``)."""
     import os
-    import runtime
     multi = bool(os.environ.get("JAX_COORDINATOR_ADDRESS"))
     if multi:
         mesh = runtime.initialize_communicator_stack().mesh   # before any JAX call

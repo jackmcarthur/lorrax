@@ -2,9 +2,13 @@
 
     lx run -N 1 -G 4 -n 4 -- python3 -u tests/tdagw/_dynsig_516_case.py \\
         --deck <05>/oneshot.in --sigma-diag <05>/sigma_diag.dat --dipole <05>/dipole.h5 \\
-        --eqp <04>/eqp1.dat --bands 128 132 --out DIR [--dry]
+        --bands 128 132 --out DIR [--eqp eqp1.dat] [--dry]
 
 One JSON line (rank 0), ``RESULT {...}``.  The restart is read-only.
+H0 is the DFT spectrum unless ``--eqp`` is given: every check below compares
+self-energies (or two models over the same H0), so none depends on it, and the
+04 run's diagonal QP spectrum puts a 0.548 meV near-degeneracy at the 128 edge
+(k = 24), which the band-window gate refuses at its 1 meV tolerance.
 
 L0  orders: read_wavefunctions rows, the metadata energies and the stored
     V_qmunu/W0_qmunu rows mapped onto the TD model's flat C-order k/q rows;
@@ -32,7 +36,6 @@ import argparse
 import functools
 import json
 import os
-import sys
 import time
 
 import runtime  # noqa: F401  (before numpy: the runtime tunes BLAS spin at import)
@@ -69,7 +72,7 @@ def main():
     ap.add_argument("--deck", required=True)
     ap.add_argument("--sigma-diag", required=True)
     ap.add_argument("--dipole", required=True)
-    ap.add_argument("--eqp", required=True)
+    ap.add_argument("--eqp", default=None, help="eqp1.dat for a QP H0 (default: DFT)")
     ap.add_argument("--bands", type=int, nargs=2, default=(128, 132))
     ap.add_argument("--nbf", type=int, default=160)
     ap.add_argument("--target-error", type=float, default=1e-7)
@@ -112,14 +115,24 @@ def main():
     omega = float(CoulombGeometry.from_wfn(wfn).cell_volume)
     k_file = np.asarray(wfn.kvecs(k="full_bz"))
     wfn.close()
-    rows_file = _rows_of(k_file, kgrid)               # file row i -> C-order row
-    order = np.argsort(rows_file)                     # C-order row j <- file row order[j]
+    rows_file = _rows_of(k_file, kgrid)               # WFN full-BZ row i -> C-order row
+    order = np.argsort(rows_file)                     # C-order row j <- WFN row order[j]
     b_lo, b_hi = (int(b) for b in a.bands)
     nA = b_hi - b_lo
 
     # ---- every band at the centroids, energies, V, W0 (read-only) ----
+    # psi rows are matched against the TD model's own window psi (the BSE
+    # loader's C-order rows; the same stored numbers, so the match is exact),
+    # not assumed; the energies follow the WFN k coordinates and are checked
+    # against the TD header below.
     psi_file = read_wavefunctions(restart, a.deck, mesh, bands=np.arange(a.nbf))
-    psi_full = jax.jit(lambda p: jnp.take(p, jnp.asarray(order), axis=0),
+    pw = gather(psi_file[:, b_lo:b_hi])
+    px = gather(td["psi_X"])[:, :nA]
+    mu_c = min(pw.shape[-1], px.shape[-1])
+    dmat = np.array([[np.max(np.abs(pw[i, ..., :mu_c] - px[j, ..., :mu_c])) for i in range(nk)]
+                     for j in range(nk)])
+    psi_rows = np.argmin(dmat, axis=1)                # C-order row j <- loader row psi_rows[j]
+    psi_full = jax.jit(lambda p: jnp.take(p, jnp.asarray(psi_rows), axis=0),
                        out_shardings=NamedSharding(mesh, P(None, None, None, "x")))(psi_file)
     with h5py.File(restart, "r") as f:
         enk = np.asarray(f["enk_full"][()], np.float64)[:, :a.nbf]      # parent rows
@@ -139,7 +152,9 @@ def main():
     W0_q = read_interaction(restart, "screened", mesh)
 
     # L0: orders against the TD model's own arrays
-    dpsi = float(np.max(np.abs(gather(psi_full[:, b_lo:b_hi]) - gather(td["psi_X"])[:, :nA])))
+    dpsi = float(np.max(dmat[np.arange(nk), psi_rows]))
+    e_hdr = np.empty((nk, nA)); e_hdr[_rows_of(np.asarray(hdr["kpts"]), kgrid)] = \
+        2.0 * np.asarray(hdr["e_kn"], np.float64)[:nk, :nA]            # Ha -> Ry, C rows
     kern = D.make_dynsig_kernels(mesh, kgrid)
     W_td_q = gather(kern.c_fft(jnp.moveaxis(td["W_R"].reshape(td["W_R"].shape[0],
                                                               td["W_R"].shape[1], nk), -1, 0)))
@@ -151,7 +166,12 @@ def main():
     q_perm = np.asarray(q_perm)
     dW_rows = [float(np.max(np.abs(W0_h[q_perm[j]] - W_td_q[j])) / np.max(np.abs(W_td_q[j])))
                for j in range(nk)]
-    out["L0"] = dict(dpsi_window=dpsi, q_perm_identity=bool(np.all(q_perm == np.arange(nk))),
+    out["L0"] = dict(dpsi_window=dpsi, psi_shapes=[list(pw.shape), list(px.shape)],
+                     psi_rows_unique=bool(len(set(psi_rows.tolist())) == nk),
+                     psi_rows_is_wfn_order=bool(np.all(psi_rows == order)),
+                     psi_rows_identity=bool(np.all(psi_rows == np.arange(nk))),
+                     e_window_vs_header_ry=float(np.max(np.abs(e_full[:, b_lo:b_hi] - e_hdr))),
+                     q_perm_identity=bool(np.all(q_perm == np.arange(nk))),
                      q_perm_unique=bool(len(set(q_perm.tolist())) == nk),
                      w0_vs_td_W_rel_q0=dW_rows[0], w0_vs_td_W_rel_qne0=max(dW_rows[1:]),
                      omega_bohr3=omega, whead=whead, vhead=vhead, n_occ=n_occ,
@@ -168,25 +188,6 @@ def main():
         W0_q = jax.jit(lambda v: jnp.take(v, jnp.asarray(q_perm), axis=0),
                        out_shardings=NamedSharding(mesh, D.CHI_SPEC))(W0_q)
     out["L0"]["t_load_s"] = time.perf_counter() - t_start
-    if a.dry:
-        if rank0:
-            print("RESULT " + json.dumps(out), flush=True)
-        runtime.finalize_process(0)
-        return
-
-    rule = D.static_rule(e_full, f_full, target_error=a.target_error, max_nodes=64)
-    out["rule"] = dict(nodes=int(len(rule["tau"])), x_min=rule["x_min"], x_max=rule["x_max"],
-                       max_error=rule["max_error"], e_sep=rule["e_sep"])
-    dyn = D.assemble_dynsig_bundle(td, psi_full, e_full, f_full, W0_q, mesh_xy=mesh, rule=rule,
-                                   V_q=V_q)
-    A, S = D.split_bundle(dyn)                       # arrays are jit operands (multi-process)
-    from gw.w_isdf import solve_w
-    from runtime.padding import padded_mu_axis
-    axis = padded_mu_axis(int(td["n_rmu"]), mesh)
-    dyson = lambda chi: solve_w(V_q, chi, None, mesh, pref=1.0, axis=axis)
-    W0h = gather(W0_q)
-    rel_q = lambda W: [float(np.max(np.abs(W[q] - W0h[q])) / np.max(np.abs(W0h[q])))
-                       for q in range(nk)]
 
     def _save():
         if rank0:
@@ -207,6 +208,36 @@ def main():
         out.setdefault("section_wall_s", {})[name] = time.perf_counter() - t0
         _save()
 
+    def _stop(rc):
+        _save()
+        if rank0:
+            print("RESULT " + json.dumps(out, default=float), flush=True)
+        runtime.finalize_process(rc)
+
+    _save()
+    if a.dry:
+        return _stop(0)
+
+    _t = time.perf_counter()
+    try:
+        rule = D.static_rule(e_full, f_full, target_error=a.target_error, max_nodes=64)
+        out["rule"] = dict(nodes=int(len(rule["tau"])), x_min=rule["x_min"], x_max=rule["x_max"],
+                           max_error=rule["max_error"], e_sep=rule["e_sep"])
+        dyn = D.assemble_dynsig_bundle(td, psi_full, e_full, f_full, W0_q, mesh_xy=mesh,
+                                       rule=rule, V_q=V_q)
+        A, S = D.split_bundle(dyn)                   # arrays are jit operands (multi-process)
+        _done("bundle", _t)
+    except Exception:
+        _failed("bundle", _t)
+        return _stop(1)
+    from gw.w_isdf import solve_w
+    from runtime.padding import padded_mu_axis
+    axis = padded_mu_axis(int(td["n_rmu"]), mesh)
+    dyson = lambda chi: solve_w(V_q, chi, None, mesh, pref=1.0, axis=axis)
+    W0h = gather(W0_q)
+    rel_q = lambda W: [float(np.max(np.abs(W[q] - W0h[q])) / np.max(np.abs(W0h[q])))
+                       for q in range(nk)]
+
     _t = time.perf_counter()
     try:
         # ---- B1 / RB1 / RB2: chi0 split -> W(0) ----
@@ -216,25 +247,31 @@ def main():
         t_chi = time.perf_counter() - t0
         chi = sp["ff"] + sp["fa"] + sp["aa"]
         W = gather(dyson(chi))
-        W_nofa = gather(dyson(sp["ff"] + sp["aa"]))
-        # RB2: active valence counted empty -> G_eq loses those holes (and the aa/fa terms)
-        f_bad = f_full.copy(); f_bad[:, b_lo:n_occ] = 0.0
-        dyn_bad = D.assemble_dynsig_bundle(td, psi_full, e_full, f_bad, W0_q, mesh_xy=mesh,
-                                           rule=D.static_rule(e_full, f_full, target_error=a.target_error),
-                                           V_q=V_q)
-        Ab, Sb = D.split_bundle(dyn_bad)
-        spb = jax.jit(lambda A_: D.chi0_split({**Sb, **A_}, kern))(Ab)
-        W_bad = gather(dyson(spb["ff"] + spb["fa"] + spb["aa"]))
         nrm = lambda x: float(np.max(np.abs(gather(x))))
         out["B1"] = dict(rel_q0=rel_q(W)[0], rel_qne0_max=max(rel_q(W)[1:]),
-                         rel_all_max=max(rel_q(W)), fa_share=nrm(sp["fa"]) / nrm(chi),
-                         aa_share=nrm(sp["aa"]) / nrm(chi), chi_build_s=t_chi)
-        out["RB1"] = dict(rel_all_max=max(rel_q(W_nofa)))
-        out["RB2"] = dict(rel_all_max=max(rel_q(W_bad)))
-
+                         rel_all_max=max(rel_q(W)), rel_per_q=rel_q(W),
+                         fa_share=nrm(sp["fa"]) / nrm(chi), aa_share=nrm(sp["aa"]) / nrm(chi),
+                         chi_build_s=t_chi)
         _done("B1", _t)
     except Exception:
         _failed("B1", _t)
+
+    _t = time.perf_counter()
+    W_nofa = W_bad = None
+    try:
+        W_nofa = gather(dyson(sp["ff"] + sp["aa"]))                   # RB1: chi0^fa dropped
+        out["RB1"] = dict(rel_all_max=max(rel_q(W_nofa)))
+        # RB2: active valence counted empty -> G_eq loses those holes (and the aa/fa terms)
+        f_bad = f_full.copy(); f_bad[:, b_lo:n_occ] = 0.0
+        dyn_bad = D.assemble_dynsig_bundle(td, psi_full, e_full, f_bad, W0_q, mesh_xy=mesh,
+                                           rule=rule, V_q=V_q)
+        Ab, Sb = D.split_bundle(dyn_bad)
+        spb = jax.jit(lambda A_: D.chi0_split({**Sb, **A_}, kern))(Ab)
+        W_bad = gather(dyson(spb["ff"] + spb["fa"] + spb["aa"]))
+        out["RB2"] = dict(rel_all_max=max(rel_q(W_bad)))
+        _done("RB1_RB2", _t)
+    except Exception:
+        _failed("RB1_RB2", _t)
 
     _t = time.perf_counter()
     try:
@@ -255,15 +292,19 @@ def main():
             return dict(max_abs_sx_ev=float(np.max(np.abs(sx - ref_sx))),
                         max_abs_coh_ev=float(np.max(np.abs(coh - ref_coh))),
                         max_abs_tot_ev=float(np.max(np.abs(sx + coh - ref_sx - ref_coh))))
-        out["B2"] = sigma_err(put(W))
         out["B2w"] = sigma_err(W0_q)
-        out["RB1"].update(sigma_err(put(W_nofa)))
-        out["RB2"].update(sigma_err(put(W_bad)))
+        out["B2"] = sigma_err(put(W))
         sx0, _ = jax.jit(lambda A_, w: D.equilibrium_sigma({**S, **A_}, kern, w,
                                                             heads=None))(A, W0_q)
         out["B2w_nohead"] = dict(max_abs_sx_ev=float(np.max(np.abs(
             np.real(np.einsum("kii->ki", gather(sx0))) * RYD_EV - ref_sx))))
-
+        out["B2_ref"] = dict(file=os.path.abspath(a.sigma_diag),
+                             max_abs_sx_ev=float(np.max(np.abs(ref_sx))),
+                             max_abs_coh_ev=float(np.max(np.abs(ref_coh))))
+        _done("B2", _t)
+        for tag, Wt in (("RB1", W_nofa), ("RB2", W_bad)):
+            if Wt is not None:
+                out[tag].update(sigma_err(put(Wt)))
         _done("B2", _t)
     except Exception:
         _failed("B2", _t)
@@ -375,10 +416,7 @@ def main():
         _failed("T1", _t)
 
     out["t_total_s"] = time.perf_counter() - t_start
-    _save()
-    if rank0:
-        print("RESULT " + json.dumps(out, default=float), flush=True)
-    runtime.finalize_process(1 if out.get("errors") else 0)
+    _stop(1 if out.get("errors") else 0)
 
 
 if __name__ == "__main__":
