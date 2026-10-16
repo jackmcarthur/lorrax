@@ -73,9 +73,13 @@ the tile in place. The tile is `runtime.tiles.tile_plan` of
 $(3n_s^2+2)\,n_k\,\mu_{loc}\cdot 16$ bytes per column against
 `TILE_BYTES` (1 GiB per rank): the shapes alone size it, every tile has one
 width, and the last start is clamped so the overlap is recomputed rather than
-padded. Unstreamed, the CrI3 8×8 μ_L 6000 Gram compiled to 121 GB per device at
-P4, 110.6 GB of it the two all-k pair densities; streamed, its live set is the
-output plus one tile.
+padded. The output is allocated once and donated to the program as the scan's
+carry, and the q → −q relabel (`negate_q_index`) is applied to each tile before
+it is written, so no second output-sized buffer exists. Unstreamed, the CrI3 8×8
+μ_L 6000 Gram compiled to 121 GB per device at P4, 110.6 GB of it the two all-k
+pair densities; streamed but relabelled afterwards as a separate full-size copy,
+it peaked at 57.1 GB (three output-sized buffers); into the donated buffer its
+live set is the output plus one tile.
 
 **Selection (D2)** reads only the q = 0 face. Its eigenvalue spectrum is
 `distrib_la.plan('eigh')` on the face (the stack route: the matrix whole on

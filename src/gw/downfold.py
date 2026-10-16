@@ -413,20 +413,18 @@ def pair_density_gram(psi_X, psi_Y, window: BandWindow, *, kgrid, mesh_xy):
     grid = tuple(int(v) for v in kgrid)
     # left (m) window -> the kernel's r legs; right (n) window -> its l legs.
     # This mapping is correct and is NOT what was wrong; see the docstring.
-    C = c_q_downfold(
+    # ...AND THE q AXIS IS REVERSED, WHICH IS THE WHOLE FIX.  Measured against
+    # the closed form and against a dense double loop on an ASYMMETRIC window
+    # (the only shape that can see it): ``c_q_downfold`` returns S(-q).  Its
+    # own caller, the ISDF fit, is self-consistent in that labelling; the
+    # downfold is the caller that must agree with the RESTART TENSORS' q
+    # axis, because it multiplies this Gram's transfer into V_qmunu[q].  The
+    # relabel is applied to each column tile inside the kernel (``q_order``),
+    # so no relabelled full-size copy of the Gram is ever made.
+    return c_q_downfold(
         psi_X[:, :, br0:br1, :], psi_Y[:, br0:br1, :, :],
         psi_X[:, :, bl0:bl1, :], psi_Y[:, bl0:bl1, :, :],
-        kgrid=grid, mesh_xy=mesh_xy)
-    # ...AND THE q AXIS IS THEN REVERSED, WHICH IS THE WHOLE FIX.  Measured
-    # against the closed form and against a dense double loop on an
-    # ASYMMETRIC window (the only shape that can see it):
-    # ``c_q_downfold`` returns S(-q).  Its own caller, the ISDF fit, is
-    # self-consistent in that labelling and is untouched here; the downfold
-    # is the caller that must agree with the RESTART TENSORS' q axis,
-    # because it multiplies this Gram's transfer into V_qmunu[q].
-    return jax.lax.with_sharding_constraint(
-        jnp.take(C, jnp.asarray(negate_q_index(grid)), axis=0),
-        NamedSharding(mesh_xy, P(None, "x", "y")))
+        kgrid=grid, mesh_xy=mesh_xy, q_order=negate_q_index(grid))
 
 
 def negate_q_index(kgrid) -> np.ndarray:

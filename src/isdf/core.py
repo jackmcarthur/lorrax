@@ -998,6 +998,7 @@ def c_q_downfold(
 	*,
 	kgrid: tuple[int, int, int],
 	mesh_xy: Mesh,
+	q_order=None,
 ) -> jax.Array:
 	"""The rectangular pair-density Gram, streamed over its local columns.
 
@@ -1008,7 +1009,9 @@ def c_q_downfold(
 	cut into equal tiles (:func:`downfold_gram_col_tile`) and one ``lax.scan``
 	inside the ``shard_map`` builds each tile's pair densities, convolves them
 	and writes the tile into the output in place.  A single tile is the
-	unstreamed kernel.
+	unstreamed kernel.  The output buffer is allocated once, outside the
+	program, and donated to it as the scan's carry, so the program holds no
+	second output-sized buffer.
 
 	Parameters
 	----------
@@ -1016,13 +1019,16 @@ def c_q_downfold(
 	    Conjugated ψ at the row centroids, the two legs' band windows.
 	psi_l_Y, psi_r_Y : (nk, nb, ns, n_col) complex128, ``P(None,None,None,'y')``
 	    Plain ψ at the column centroids.
+	q_order : sequence of int, optional
+	    Output row ``i`` is the kernel's row ``q_order[i]``, applied to each
+	    tile before it is written (``gw.downfold.pair_density_gram`` passes
+	    the ``q -> -q`` relabel), so no full-size relabelled copy exists.
 
 	Returns
 	-------
 	(nk, n_rmu, n_col) complex128 at ``P(None,'x','y')``, labelled by the
-	kernel's own q (the downfold relabels it, ``gw.downfold.pair_density_gram``).
-	Per-rank live set: the output plus one column tile, at most
-	:data:`runtime.tiles.TILE_BYTES` of pair densities.
+	kernel's own q, or by ``q_order``.  Per-rank live set: the output plus one
+	column tile, at most :data:`runtime.tiles.TILE_BYTES` of pair densities.
 	"""
 	nkx, nky, nkz = kgrid
 	nk = int(psi_l_X.shape[0])
@@ -1039,9 +1045,17 @@ def c_q_downfold(
 	col_loc = n_col // int(mesh_xy.shape['y'])
 	width, starts = downfold_gram_col_tile(nk, ns, mu_loc, col_loc)
 
+	order = (None if q_order is None
+	         else tuple(int(v) for v in np.asarray(q_order).reshape(-1)))
+	if order is not None and sorted(order) != list(range(nkx * nky * nkz)):
+		raise ValueError(
+			f"GATE c_q_downfold_q_order: got: q_order of length {len(order)} "
+			f"that is not a permutation of the {nkx * nky * nkz} k-grid rows; "
+			f"want: a permutation; why: each output q row must be one kernel "
+			f"row exactly once.  Fix: pass gw.downfold.negate_q_index(kgrid).")
 	cache_key = ('c_q_from_psi_sm', _mesh_key(mesh_xy), nk, n_rmu, n_col, ns,
 	             nb_l, nb_r, nkx, nky, nkz, lhs_id, rhs_id,
-	             pair_gamma_key, width, starts)
+	             pair_gamma_key, width, starts, order)
 	if cache_key not in _pair_pipeline_sm_cache:
 		_pair_kernel = pair_kernel
 		L_spec = P(None, 'x', None, None)
@@ -1049,12 +1063,14 @@ def c_q_downfold(
 		out_spec = P(None, 'x', 'y')
 		col_starts = np.asarray(starts, dtype=np.int32)
 
+		take_q = None if order is None else np.asarray(order, dtype=np.int32)
+
 		@partial(shard_map, mesh=mesh_xy,
-		         in_specs=(L_spec, R_spec, L_spec, R_spec,
+		         in_specs=(out_spec, L_spec, R_spec, L_spec, R_spec,
 		                   P(), P(), P(), P()),
 		         out_specs=out_spec,
 		         check_vma=False)
-		def _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
+		def _local(C0, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
 		           perm_L_, phase_L_, perm_R_, phase_R_):
 			# Per-rank: psi_*_X_ (nk, μ_loc, nb, ns), psi_*_Y_ (nk, nb, ns, col_loc).
 			# The einsum's output order ``'karmb'`` (k, ns_l, col, μ, ns_r) is
@@ -1071,18 +1087,23 @@ def c_q_downfold(
 				# (nk, col, μ) -> (nk, μ, col): the transpose acts on the
 				# reduced tile, never on the rank-7 pair density.
 				U = jnp.transpose(U.reshape(nkx * nky * nkz, width, mu_loc), (0, 2, 1))
+				if take_q is not None:
+					U = jnp.take(U, jnp.asarray(take_q), axis=0)
 				return jax.lax.dynamic_update_slice_in_dim(C, U, c0, axis=2), None
 
-			C0 = jnp.zeros((nkx * nky * nkz, mu_loc, col_loc), dtype=psi_l_X_.dtype)
 			C, _ = jax.lax.scan(_tile, C0, jnp.asarray(col_starts), unroll=1)
 			return C
 
-		@jax.jit
-		def fn(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, pL, phL, pR, phR):
-			return _local(psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
+		face = NamedSharding(mesh_xy, out_spec)
+
+		@partial(jax.jit, donate_argnums=0, out_shardings=face)
+		def fn(C0, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, pL, phL, pR, phR):
+			return _local(C0, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_,
 			              pL, phL, pR, phR)
 
-		_pair_pipeline_sm_cache[cache_key] = fn
+		zeros = jax.jit(lambda: jnp.zeros((nkx * nky * nkz, n_rmu, n_col),
+		                                  dtype=psi_l_X.dtype), out_shardings=face)
+		_pair_pipeline_sm_cache[cache_key] = (zeros, fn)
 
 	if lhs_id:
 		perm_L = jnp.arange(ns, dtype=jnp.int32)
@@ -1095,9 +1116,9 @@ def c_q_downfold(
 	else:
 		perm_R, phase_R = gamma_R
 
-	return _pair_pipeline_sm_cache[cache_key](
-		psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
-		perm_L, phase_L, perm_R, phase_R)
+	zeros, fn = _pair_pipeline_sm_cache[cache_key]
+	return fn(zeros(), psi_l_X, psi_l_Y, psi_r_X, psi_r_Y,
+	          perm_L, phase_L, perm_R, phase_R)
 
 
 # ============================================================================

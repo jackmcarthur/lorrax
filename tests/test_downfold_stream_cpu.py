@@ -139,6 +139,33 @@ def test_gram_column_stream_bounds_the_compiled_module(mesh, monkeypatch):
     assert tiled <= whole // 3
 
 
+def test_gram_holds_one_output_buffer(mesh, monkeypatch):
+    """The Gram writes into one donated output buffer; only the column tile is scratch."""
+    import isdf.core as core
+    from ffi.fft import xla_reference
+    from gw.downfold import negate_q_index
+    rng = np.random.default_rng(7)
+    kgrid, nk, nb, ns, mu = (3, 2, 1), 6, 3, 2, 128                # local face (64, 64)
+    X, Y = _faces(_psi(rng, nk, nb, ns, mu), mesh)
+    out = nk * 64 * 64 * 16
+    tile = 2 * (3 * ns * ns + 2) * nk * 64 * 16                    # two columns per tile
+    monkeypatch.setattr("runtime.tiles.TILE_BYTES", tile)
+    monkeypatch.setattr(core, "_pair_pipeline_sm_cache", {})
+    with xla_reference():
+        core.c_q_downfold(X, Y, X, Y, kgrid=kgrid, mesh_xy=mesh, q_order=negate_q_index(kgrid))
+        (zeros, fn), = core._pair_pipeline_sm_cache.values()
+        ident = (jnp.arange(ns, dtype=jnp.int32), jnp.ones(ns, jnp.complex128))
+        m = fn.lower(zeros(), X, Y, X, Y, *ident, *ident).compile().memory_analysis()
+    assert m.alias_size_in_bytes == out          # the output IS the donated buffer
+    assert m.temp_size_in_bytes <= tile          # the relabel and the carry add nothing
+    # RED TWIN: relabelling the finished Gram as a separate step (the pattern this
+    # replaced, measured at 57 GB/device on the 6000 parent) costs a second output.
+    C = jax.device_put(np.zeros((nk, mu, mu), complex), NamedSharding(mesh, P(None, "x", "y")))
+    relabel = jax.jit(lambda c: jnp.take(c, jnp.asarray(negate_q_index(kgrid)), axis=0))
+    r = relabel.lower(C).compile().memory_analysis()
+    assert r.output_size_in_bytes == out and r.alias_size_in_bytes == 0
+
+
 def test_q_stream_is_the_one_tile_chain(mesh, monkeypatch):
     """D3-D5 one q at a time equal D3-D5 on every q at once."""
     from ffi.fft import xla_reference
