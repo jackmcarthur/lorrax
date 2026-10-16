@@ -59,6 +59,48 @@ class OmegaCoverage:
                 f"out_of_range_policy={self.policy}")
 
 
+class _OmegaSlabs:
+    """``cube[lo:hi]`` along ω for a writer that reads slabs in order, the start carried on device.
+
+    Each read returns ``(slab, lo + size)`` from one program per slab size, so a
+    sequential writer (``sigma_output._write_omega_cube``) transfers no slab
+    start: the first start is a compiled constant and every later one is the
+    previous program's output.  An out-of-order read (a single ω index) places
+    its start once per value.  The slabs are the cube's own elements.
+    """
+
+    def __init__(self, cube):
+        self._cube, self._next, self._start = cube, None, None
+
+    def __call__(self, lo, hi):
+        from jax.sharding import NamedSharding, PartitionSpec
+        lo, hi = int(lo), int(hi)
+        sharding = self._cube.sharding
+        replicated = NamedSharding(sharding.mesh, PartitionSpec())
+        if lo == 0:
+            start = _slab_zero(replicated)()
+        elif lo == self._next:
+            start = self._start
+        else:
+            from common.collectives import device_put_process_local_cached
+            start = device_put_process_local_cached(np.int32(lo), replicated)
+        slab, self._start = _slab_program(sharding, replicated, hi - lo)(self._cube, start)
+        self._next = hi
+        return slab
+
+
+@lru_cache(maxsize=None)
+def _slab_zero(replicated):
+    return jax.jit(lambda: jnp.zeros((), jnp.int32), out_shardings=replicated)
+
+
+@lru_cache(maxsize=None)
+def _slab_program(sharding, replicated, size):
+    return jax.jit(lambda cube, start: (jax.lax.dynamic_slice_in_dim(cube, start, size, axis=0),
+                                        start + jnp.asarray(size, start.dtype)),
+                   out_shardings=(sharding, replicated))
+
+
 def extract_sigma_diag_logical(
     sigma_c_omega: jax.Array,
     mesh_xy,
@@ -408,13 +450,14 @@ def write_sigma_omega(
             return (jnp.take(c_ry, rows, axis=1), jnp.take(x_ry, rows, axis=0),
                     jnp.take(h_ev, rows, axis=0))
 
+        total_slabs, c_slabs = _OmegaSlabs(c_ry), _OmegaSlabs(c_ry)
         total_ev = DeferredArray(
             shape, lambda: total_fn(c_ry, x_ry, h_ev),
-            omega_range=lambda lo, hi: total_fn(c_ry[lo:hi], x_ry, h_ev),
+            omega_range=lambda lo, hi: total_fn(total_slabs(lo, hi), x_ry, h_ev),
             take_rows=lambda rows: total_fn(*_rows(rows)))
         sigma_c_ev = DeferredArray(
             shape, lambda: c_fn(c_ry),
-            omega_range=lambda lo, hi: c_fn(c_ry[lo:hi]),
+            omega_range=lambda lo, hi: c_fn(c_slabs(lo, hi)),
             take_rows=lambda rows: c_fn(_rows(rows)[0]))
         write_sigma_omega_h5(
             out_path, config.omega_grid_ev, total_ev,
