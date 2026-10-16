@@ -129,6 +129,10 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False):
 #: leg's implementation, :mod:`distrib_la.local_eigh`), deflated.
 from distrib_la.local_eigh import eigh_local as _eigh_local
 native_eigh = jax.jit(deflate_zero_rows(_eigh_local))
+#: The same deflated eigh by Jacobi: the one re-solve of a round whose native eigh came back
+#: non-finite (shared_pole_constructor / shared_pole_sectors, on their host-read diagnostics).
+from distrib_la.local_eigh import eigh_local_jacobi as _eigh_local_jacobi
+native_eigh_jacobi = jax.jit(deflate_zero_rows(_eigh_local_jacobi))
 
 
 def orthonormalize(vectors, *, matmul):

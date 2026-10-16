@@ -1045,11 +1045,36 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     signed,diagnostics=reduce_cross_round(*packed,cross,
         tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
         eigh_plan=budget.eigenplan(side))
+    # rocSOLVER zheevd's silent mode (distrib_la.local_eigh): when a CT gate would refuse and the
+    # round's eighs came back non-finite, solve the round once more by Jacobi on the same live
+    # operands (the first round's outputs are released first, so the peak is the round's own).
+    gated=all(bool(jnp.all(diagnostics[name][:real])) for name in ('gram_valid','retained_metric_positive'))
+    if not gated and 'eigh_finite' in diagnostics and not bool(jnp.all(diagnostics['eigh_finite'][:real])):
+        from types import SimpleNamespace
+        from distrib_la._result_check import native_eigh_jacobi
+        import warnings
+        warnings.warn("shared-pole CT round: local eigh returned non-finite eigenpairs; re-solved the round by Jacobi",
+                      RuntimeWarning, stacklevel=1)
+        del signed,diagnostics
+        signed,diagnostics=reduce_cross_round(*packed,cross,
+            tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
+            eigh_plan=SimpleNamespace(native_fn=native_eigh_jacobi))
     for name in ('gram_valid','retained_metric_positive'):
         if not bool(jnp.all(diagnostics[name][:real])):
+            # Every rank reaches this refusal together (the predicate is the replicated jnp.all):
+            # gather the per-parent rows across processes for the message (a collective).
+            from jax.experimental.multihost_utils import process_allgather
+            import numpy as np
+            _gathered = lambda a: np.asarray(process_allgather(a, tiled=True))
             raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; '
                 f"Gram min/max={float(jnp.min(diagnostics['gram_min_relative'][:real])):.9e}; "
-                f"threshold={gates['normalized_gram_validity']['threshold']}; no repair")
+                f"threshold={gates['normalized_gram_validity']['threshold']}; "
+                f"per parent: passed={_gathered(diagnostics[name])[:real].tolist()}, "
+                f"Gram min/max={_gathered(diagnostics['gram_min_relative'])[:real].tolist()}, "
+                + ", ".join(f"{k}={_gathered(diagnostics[k])[:real].tolist()}" for k in (
+                    'metric_initial_infinity_norm', 'metric_inverse_root_residual_relative',
+                    'metric_inverse_root_iterations', 'retained_rank') if k in diagnostics)
+                + "; no repair")
     models,zero=positive_cross_models(signed,mesh_xy=mesh_xy)
     if not bool(jnp.all(zero['zero_policy'][:real])):
         raise ValueError('GATE shared_pole_sector_zero_ritz: sector=CT')
@@ -1492,9 +1517,14 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):
     cross-sector passivity or PSD repair is applied.
     """
     gamma, u = eigh(pencil[0])
+    finite = jnp.all(jnp.isfinite(gamma), axis=-1) & jnp.all(jnp.isfinite(u), axis=(-2, -1))
     stage = joint_keep_stage(pencil, gamma, u, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding)
     values, rotation = eigh(stage["reduced"])
-    return joint_output_stage(stage, values, rotation, matmul=matmul)
+    finite = finite & jnp.all(jnp.isfinite(values), axis=-1) & jnp.all(jnp.isfinite(rotation), axis=(-2, -1))
+    model, diagnostics = joint_output_stage(stage, values, rotation, matmul=matmul)
+    # A silent eigensolver failure (finite eigenvalues, NaN vectors) is named here, so the
+    # q-local caller re-solves by Jacobi instead of refusing a healthy metric.
+    return model, dict(diagnostics, eigh_finite=finite)
 
 
 # The joint CT reduction's two GEMM stages around its two eighs (``reduce_sector_pencil``
@@ -1526,8 +1556,14 @@ def joint_keep_stage(pencil, gamma, u, *, matmul, gates, matrix_sharding=None):
     # whole-mesh eigh, checked against its operand, refuses it, while the local
     # eigh symmetrizes. Its Hermitian part is what both routes solve.
     reduced = _matrix_layout(hermitian_part(matmul(y, matmul(value, y), transa="C")), matrix_sharding)
+    # Distinct inert sentinels in [s, 2s), s = -(||reduced||_F + 1): a common value is an exactly
+    # degenerate cluster, the input on which rocSOLVER zheevd returns NaN vectors with info 0
+    # (shared_pole_reduction.reduce_shared_pole_pencil, the same Ritz construction).
     sentinel = -(jnp.linalg.norm(reduced, axis=(-2, -1)) + 1)
-    return dict(reduced=_matrix_layout(reduced + null * sentinel[:, None, None], matrix_sharding), y=y,
+    side = reduced.shape[-1]
+    spread = 1 + jnp.arange(side, dtype=sentinel.dtype) / side
+    return dict(reduced=_matrix_layout(reduced + null * (sentinel[:, None] * spread[None, :])[:, None, :],
+                                       matrix_sharding), y=y,
                 oc=oc, ot=ot, keep=keep, valid=valid, ratio=ratio, corrected=corrected, diagnostics=diagnostics)
 
 
