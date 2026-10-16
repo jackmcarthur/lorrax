@@ -1585,15 +1585,25 @@ _IDLE_SPECULATION_SPAN = 1.5
 
 
 def _attempt_cost(tree, node):
-    """Relative wall of one whole-group attempt: (size/1000)^3, +0.85 for one sample.
+    """Relative wall of one whole-group attempt, per pencil route.
 
-    The shift pencil's QR/SVD is ~size^3 per geometry; a one-sample attempt
-    scans without the stagnation patience. Fitted on 21 Frontier attempts of
-    the Fe V2 call (7 BLAS threads; 3.8 s*(size/1000)^3 + 3.3 s per one-sample
-    node, rms 1.3 s against 1.9 s for size^3 alone). Only the planner's
-    balance reads it, never a rule.
+    Host LAPACK pencils: (size/1000)^3, +0.85 for one sample. The shift
+    pencil's QR/SVD is ~size^3 per geometry; a one-sample attempt scans without
+    the stagnation patience. Fitted on 21 Frontier attempts of the Fe V2 call
+    (7 BLAS threads; 3.8 s*(size/1000)^3 + 3.3 s per one-sample node, rms 1.3 s
+    against 1.9 s for size^3 alone).
+
+    Device pencils (``tree.pencil`` set): the pencil runs ahead of the host
+    scan, so the scan dominates: (size/1000)^3 + 1.9, +3.0 for one sample.
+    Fitted on the 14 attempts of the Fe V2 walk on one MI250X GCD (1.05 s*
+    (size/1000)^3 + 1.96 s + 3.17 s per one-sample node, rms 1.1 s against 1.8
+    s for the host form; pool log rcgpu_ab1). Only the planner's balance reads
+    it, never a rule.
     """
-    return (tree.size(node)/1000.)**3 + (0.85 if len(node) == 1 else 0.)
+    one = len(node) == 1
+    if getattr(tree, "pencil", None) is not None:
+        return (tree.size(node)/1000.)**3 + 1.9 + (3.0 if one else 0.)
+    return (tree.size(node)/1000.)**3 + (0.85 if one else 0.)
 
 
 def _rule_round(trees, known, world):
@@ -1656,7 +1666,8 @@ def _gather_group_rules(requests, tree):
 
     ``tree(members)`` is the request's ``minimax.ResponseGroupTree``. Its
     serial walk is a chain of whole-group attempts, each a pure function of
-    its node (one machine class, pinned BLAS threads), so any process may
+    its node (one machine class, pinned BLAS threads; with device pencils, one
+    device class), so any process may
     evaluate any attempt: rounds of attempts (:func:`_rule_round`) run on all
     processes, cross hosts as data, and every process walks the same tables
     to the serial walk's rules, byte for byte (one list per request). Refusals
@@ -1669,6 +1680,17 @@ def _gather_group_rules(requests, tree):
     known = [dict() for _ in trees]
     errors = [dict() for _ in trees]
     while (plan := _rule_round(trees, known, world)) is not None:
+        # A device pencil source compiles the round's shapes here, on every
+        # rank in the same order (cross-rank compile agreement), each rank's
+        # first attempt first; the attempts below, which differ per rank, then
+        # only execute. Only the round's shapes: compiles share the rank's
+        # cores with the host scans.
+        for i, t in enumerate(trees):
+            prepare = getattr(getattr(t, "pencil", None), "prepare", None)
+            if prepare is not None:
+                prepare([shape for position in range(max(map(len, plan)))
+                         for tasks in plan if position < len(tasks) and tasks[position][0] == i
+                         for shape in t.pencil_shapes(tasks[position][1])])
         local = []
         for i, node in plan[rank]:
             try:
@@ -1794,6 +1816,11 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
         # batches the evaluation below.
         requests = response_groups(z, len(z))
         previous = [] if old is None else old["rule_groups"]
+        from .response_pencil import response_pencil_source
+        pencil = response_pencil_source()
+        if jax.process_index() == 0:
+            print_fn("Response rule pencils: " + ("device QR + dilation eigh, decisions on host"
+                     if pencil is not None else "host LAPACK"), flush=True)
 
         def tree(members):
             local = {m: i for i, m in enumerate(members)}
@@ -1802,7 +1829,7 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
             return minimax.ResponseGroupTree(
                 plan["lo"], plan["hi"], z[members],
                 rel_tol=sample_plan["bank_rule_tolerance"]/amplitude,
-                decay_rate=decay_rate, previous=warm)
+                decay_rate=decay_rate, previous=warm, pencil=pencil)
 
         with timing.section("bank.rule_construction", announce=True):
             plan["rule_groups"] = [

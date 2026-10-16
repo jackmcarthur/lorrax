@@ -39,7 +39,7 @@ def _fake(monkeypatch, fails):
     """Cheap stand-in numerics: a multi-sample node whose members meet ``fails`` fails."""
     from minimax import complex_response as cr
 
-    def shared(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None):
+    def shared(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None, pencil=None):
         if patience is not None and fails(poles):
             return None
         return (np.array([poles.sum()]), [(np.ones((1, 2), complex), np.zeros(2), np.zeros(2))]*len(poles))

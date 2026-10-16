@@ -28,7 +28,7 @@ def test_wide_pencil_builds_halves_untried(monkeypatch):
 
     tried = []
 
-    def shared(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None):
+    def shared(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None, pencil=None):
         tried.append(len(poles))
         return (np.array([1.+1.j]),
                 [(np.zeros((1, 2), complex), np.zeros(2), np.zeros(2))]*len(poles))
