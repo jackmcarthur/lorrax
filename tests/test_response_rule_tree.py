@@ -201,3 +201,29 @@ def test_abandon_forecast():
     assert not cr._abandoned(history(-0.05)[:2], 46)        # no residual estimate from two points
     scattered = [(0, 8.), (1, 7.5), (2, 8.2), (3, 7.6)]     # line misses tol, but its bound is wide
     assert not cr._abandoned(scattered, 46)
+
+
+def test_abandon_stagnation_independent_of_rounding():
+    """A constant history is stagnation at every level and window, whatever sign rounding gives its slope."""
+    import file_io  # noqa: F401  (service path bootstrap)
+    from minimax import complex_response as cr
+
+    for level in np.linspace(-5., 9., 141):
+        for start in range(6):
+            history = [(i, float(level)) for i in range(start, start + 12)]
+            assert not cr._abandoned(history, 46), level
+
+
+def test_abandon_decision_stable_under_ulp_perturbation():
+    """One-ulp perturbations of a history's errors never change the decision away from the bound's edge."""
+    import file_io  # noqa: F401  (service path bootstrap)
+    from minimax import complex_response as cr
+
+    rng = np.random.default_rng(7)
+    for _ in range(400):
+        k = np.arange(int(rng.integers(3, 12)))
+        e = rng.uniform(1., 9.) + rng.uniform(-1.3, -0.01)*k + rng.normal(0., 0.05, k.size)
+        base = cr._abandoned([(int(a), float(b)) for a, b in zip(k, e)], 46)
+        for sign in (-1., 1.):
+            moved = np.nextafter(e, sign*np.inf)
+            assert cr._abandoned([(int(a), float(b)) for a, b in zip(k, moved)], 46) == base

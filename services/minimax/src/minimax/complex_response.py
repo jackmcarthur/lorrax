@@ -6,6 +6,8 @@ sample group; linear projection fits 1/(d-p) and 1/(d-p)^2 on those nodes.
 No continuum certificate is claimed. Energies are Ry, times Ry^-1, slopes are
 d/d(z^2).
 """
+import math
+
 import numpy as np
 from scipy import linalg as la
 from scipy.special import stdtrit
@@ -252,27 +254,42 @@ def host_pencils(zps, size, columns, steps):
 #: hsuite sp_export, bisp_sc, Na SC iterations 0 and 1, 43 nodes each): no
 #: accepting geometry abandoned, closest bound 2.06 decades above it (Fe).
 _ABANDON_WINDOW, _ABANDON_ALPHA = 8, 0.01
+#: Stagnation threshold of the forecast line, in units of its rounding: each
+#: log error e_i is known to eps*|e_i|, which moves the least-squares slope by at
+#: most eps*max|e|*sum|k_i - kbar|/Sxx; a slope within this many such units of
+#: zero is no descent. 16 covers the fit's own rounding (a few eps) with margin.
+#: Fe V2 and hsuite trace replay (6298 tests): smallest |slope| 3.4e-6 decades
+#: per candidate, ~8 orders above it; decisions and abandon ledger unchanged.
+_ABANDON_SLOPE_ROUNDING = 16
 
 
 def _abandoned(history, last):
     """True when the forecast of ``history`` [(k, log10 err/tol)] cannot reach the tolerance by ``last``.
 
-    ``last`` is the index of the geometry's last candidate.
+    ``last`` is the index of the geometry's last candidate. The line is the
+    least-squares fit in closed form, in correctly rounded arithmetic
+    (:func:`math.fsum` and IEEE basic operations), so its bits do not depend
+    on the BLAS/LAPACK build. A slope that does not clear the rounding of its
+    own inputs (:data:`_ABANDON_SLOPE_ROUNDING`) is no descent: stagnation,
+    the patience rule's call, whatever sign rounding gave it.
     """
-    k, e = (np.asarray(v, float) for v in zip(*history[-_ABANDON_WINDOW:])) if history else ((), ())
-    ok = np.isfinite(e)
-    k, e = k[ok], e[ok]
-    n = len(k)
-    if n < 3 or k[-1] >= last:
+    points = [(float(k), float(e)) for k, e in history[-_ABANDON_WINDOW:] if math.isfinite(e)]
+    n = len(points)
+    if n < 3 or points[-1][0] >= last:
         return False
-    slope, intercept = np.polyfit(k, e, 1)
-    if slope >= 0:
+    kbar = math.fsum(k for k, _ in points)/n
+    ebar = math.fsum(e for _, e in points)/n
+    dk = [k - kbar for k, _ in points]
+    sxx = math.fsum(d*d for d in dk)
+    slope = math.fsum(d*(e - ebar) for d, (_, e) in zip(dk, points))/sxx
+    resolution = (_ABANDON_SLOPE_ROUNDING*np.finfo(np.float64).eps*max(abs(e) for _, e in points)
+                  *math.fsum(abs(d) for d in dk)/sxx)
+    if slope >= -resolution:
         return False                      # stagnation: the patience rule's call
-    spread = np.sqrt(np.sum((e - intercept - slope*k)**2)/(n - 2))
+    spread = math.sqrt(math.fsum((e - ebar - slope*d)**2 for d, (_, e) in zip(dk, points))/(n - 2))
     t = float(stdtrit(n - 2, 1 - _ABANDON_ALPHA/(last + 1)))
-    kbar = k.mean()
-    width = t*spread*np.sqrt(1 + 1/n + (last - kbar)**2/np.sum((k - kbar)**2))
-    return intercept + slope*last - width > 0
+    width = t*spread*math.sqrt(1 + 1/n + (last - kbar)**2/sxx)
+    return ebar + slope*(last - kbar) - width > 0
 
 
 def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift, abandon=True):
