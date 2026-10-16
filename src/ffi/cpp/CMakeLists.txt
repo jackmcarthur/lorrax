@@ -1527,6 +1527,7 @@ set(LORRAX_FFI_ROCM_SOURCES
     kdft/kdft_kminor_ffi.cc
     kdft/kbox_unfold_ffi.cc
     kdft/kbox_rspace_ffi.cc
+    kdft/kconv_outer_rocm_ffi.cc
     rocsolver/batched_eigh_ffi.cc
     hipfft/fourier_plan_rocm_ffi.cc
 )
@@ -1567,6 +1568,13 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_src.h.in"
                "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_rspace_src.h" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
              "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_kernel.h")
+# The outer-product k-convolution (the BSE W term; kdft/kconv_outer_src.h.in), the port of
+# cufft/kconv_outer_cuda_ffi.cc, on the same stage text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_kernel.h" LRX_KCONV_OUTER_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kconv_outer_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_kernel.h")
 
 # Capability header: the shared template; only phdf5 is a claim on this leg.
 set(LORRAX_CFG_PHDF5 1)
