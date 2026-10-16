@@ -189,11 +189,14 @@ ms at 30v × 14c on 6×6 k, against 1.05 ms for one exponential and 0.27 ms per
 sample at 30v × 14c), so the wall time follows the ΔΣ count. On synthetic 30v
 × 14c headers with a rank-1000 stand-in ΔΣ, a DP54 step costs 2.9 / 4.9 /
 23.4 ms at 64 / 144 / 900 k (one exponential 1.1 / 1.2 / 3.3 ms) and rank 0
-peaks at 4.2 GB at 900 k. The whole drive apart from ΔΣ then costs at most
-0.69 s per fs (DP54, 23.5 steps per fs) or 0.73 s per fs (ETDRK4, 25 as) at
-900 k, so a production run costs (ΔΣ calls per fs) × t_ΔΣ + at most 0.7 s per
-fs. A fixed step fixes the ΔΣ count in advance: four per step for ETDRK4 and
-for CFM4 with two corrections, i.e. 80 per fs at 50 as.
+peaks at 4.2 GB at 900 k. At 900 k the DP54 drive takes 0.69 s per fs, of
+which its 153.5 stand-in ΔΣ calls per fs at 4.3 ms each are 0.66 s (ETDRK4 at
+25 as: 0.73 s, of which 160 calls are 0.69 s). A production run therefore
+costs about (ΔΣ calls per fs) × t_ΔΣ, with t_ΔΣ the model's own per-call
+time; the rest of the drive is about 0.03–0.04 s per fs if a call costs
+inside the step what it costs alone. A fixed step fixes the ΔΣ count in
+advance: four per step for ETDRK4 and for CFM4 with two corrections, i.e. 80
+per fs at 50 as.
 
 ## Layout and programs {#layout}
 
