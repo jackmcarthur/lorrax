@@ -1,0 +1,63 @@
+{
+ "deck": {
+  "control": {
+   "loglevel": "info",
+   "calc_type": "COHSEX",
+   "timesteps": {
+    "t0": 0.0,
+    "tf": 1000.0,
+    "dt_measure": 10.0,
+    "ntcheck": 5000
+   },
+   "ivp": {
+    "rtol": 1e-06,
+    "atol": 1e-11
+   },
+   "files": {
+    "indir": "indata",
+    "outdir": "out"
+   }
+  },
+  "system": {
+   "ibndmin": 5,
+   "ibndmax": 8,
+   "ivbm": 6,
+   "geometry": "slab",
+   "center_of_vacuum": [
+    0,
+    0,
+    0
+   ],
+   "esmear": 0.05,
+   "depopulation": 0.05,
+   "dephasing": 0.05,
+   "Efunc": {
+    "E_x": "5e8 * np.exp(-((t - 150) / 50)**2)",
+    "E_y": "2.5e8 * np.exp(-((t - 150) / 50)**2)",
+    "E_z": 0
+   }
+  },
+  "measurements": {
+   "types": [
+    "Efield",
+    "polarization",
+    "current",
+    "density_matrix"
+   ],
+   "3": {
+    "dataset_name": "rho_cv",
+    "brange1": [
+     7,
+     9
+    ],
+    "brange2": [
+     5,
+     7
+    ]
+   }
+  }
+ },
+ "tdgw_nfev": 175,
+ "tdgw_commit": "41a5c34",
+ "intraband": true
+}

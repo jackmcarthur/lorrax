@@ -15,11 +15,13 @@ LORRAX has six core drivers in seven modules: GW preprocessing is two modules
 
 [`gw.downfold_cli`](#downfold-gwdownfold_cli) sits beside the chain: it
 compresses a finished GW restart for the two BSE drivers.
+[`tdagw.tdgw_jax`](#td-agw-tdagwtdgw_jax) also sits beside it: it propagates
+real-time TD-aGW on the header of a TDGW run.
 
 Every driver brings up the runtime with one module-top call,
 `runtime.initialize_communicator_stack` (mesh, communicators, startup report).
-`gw_jax`, `kin_ion_io`, `kmeans_cli` and `downfold_cli` answer `--help` and bad
-arguments before that call (`runtime.cli_seam`). Launch geometry is owned by
+`gw_jax`, `kin_ion_io`, `kmeans_cli`, `downfold_cli` and `tdgw_jax` answer `--help`
+and bad arguments before that call (`runtime.cli_seam`). Launch geometry is owned by
 the machine pages ([Perlmutter](environment/machines/perlmutter.md),
 [Frontera](environment/machines/frontera.md)); every deck key is in the
 [input reference](input_reference.md). The tables below list only the keys
@@ -297,3 +299,28 @@ Invoke: `python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-ei
 [Band interpolation and exciton bands](how-to/htransform-and-exciton-bands.md#7-exciton-bands)
 owns the method, the exchange routes (`--vq-mode`) and their certification,
 the flags, the output format and the refusals.
+
+## td-agw — `tdagw.tdgw_jax`
+
+Propagates the real-time TD-aGW equation of motion of TDGW (Xiaoxun Gong's
+code) for one or several drives: $\dot\rho = -i[H(t), \rho] - i\mathbf
+E\cdot[\mathbf r^\mathrm{intra}, \rho] - \Gamma\circ(\rho - \rho^\mathrm{eq})$
+with $H = \mathrm{diag}(E^\mathrm{QP}) + \mathbf E\cdot\mathbf r +
+\Delta\Sigma[\rho]$, in TDGW's units and conventions. It reads a TDGW deck,
+takes energies, k grid and dipoles from the header of a TDGW run, and writes
+`tdgw.h5` + `tdgw.toml` that `tdgw-pp` reads unchanged. The equation, the
+integrators, the layout and the output are on
+[TD-aGW propagation](theory/td_agw_propagation.md).
+
+Invoke: `python -u -m tdagw.tdgw_jax -i tdgw.toml`. The only flag is
+`-i/--input`; everything else is a deck key
+([input reference](input_reference.md#td-agw)). The mesh is the run's
+startup mesh; the k axis is sharded over every device.
+
+| deck key | default | what it changes |
+|---|---|---|
+| `control.files.load_header_from` | required | the TDGW run whose header (band window, k grid, energies, dipole) is propagated |
+| `lorrax.method` | `dp54` | `dp54` takes TDGW's RK45 steps (the parity mode); `etdrk4`, `cfm4`, `magnus2`, `rk4` take a fixed `lorrax.dt` |
+| `lorrax.model` | by `calc_type` | ΔΣ[ρ]: `none`, TDGW's `kernel.h5` (`tdgw_kernel`) or the ISDF model of a GW restart bundle (`isdf`, with `lorrax.isdf_input`) |
+| `lorrax.trials` | one drive | several `{E_x, E_y, E_z}` drives propagated together; one `trial-<i>/` output each |
+| `lorrax.intraband` | `true` | the intraband commutator $\mathbf E\cdot[\mathbf r^\mathrm{intra}, \rho]$ |

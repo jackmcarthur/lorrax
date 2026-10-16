@@ -105,6 +105,8 @@ nav:
       - The metallic q→0 head: theory/metal-q0-head.md
       - "Bispinor (four-current) GW": theory/bispinor-gw.md
       - Four-current heads and frequency: theory/four-current-head-corrections.md
+      - TD-aGW interaction: theory/td_agw.md
+      - TD-aGW propagation: theory/td_agw_propagation.md
   - Architecture:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md

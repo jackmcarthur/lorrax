@@ -19,7 +19,8 @@ generated: `python3 tools/gen_input_reference.py` rewrites each default cell fro
 `tests/test_env_registry.py` fails when a key has no row, a row names a key the
 parser no longer accepts, or a default cell differs from the code.
 
-The last section documents a different input file, the `[downfold]` deck.
+The last two sections document different input files: the `[downfold]` deck
+and the TD-aGW `tdgw.toml`.
 
 ## System
 
@@ -271,3 +272,65 @@ choose each value.
 | `plan` | `auto` | `auto`/`local`: the local plan, independent of the process grid. `distributed` refuses. |
 | `report_residual` | `true` | Prints the per-q Pythagorean error bar ε_W (two GEMMs at μ_L per q). |
 | `residual_refuse_above` | unset | Refuses to write the bundle when the worst-q ε_W exceeds this value. It is a tripwire, not a meV guarantee. |
+
+## TD-aGW — the `tdgw.toml` deck {#td-agw}
+
+This is not a GW deck. `python -m tdagw.tdgw_jax -i tdgw.toml` reads a TDGW
+deck (TOML, the TDGW README's "Variables of TDGW config file") unchanged, plus
+an optional `[lorrax]` table that picks the integrator, the step and the
+self-energy model. Keys are dotted TOML paths (`control.ivp.rtol` is `rtol` in
+`[control.ivp]`); `tdagw.td_config.TD_DEFAULTS` is the accepted key set, and an
+unknown key refuses (`td_unknown_key`) in one error naming every such key.
+Units are TDGW's: times in attoseconds, energies in eV, fields in V/m. The
+header (structure, WFN header, dipole) is read from a TDGW run
+(`load_header_from`); the driver does not build dipoles. The equation of
+motion, the integrators and the output layout are on
+[TD-aGW propagation](theory/td_agw_propagation.md); the interaction model
+behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
+
+| key | default | meaning |
+|---|---|---|
+| `control.loglevel` | `info` | TDGW's log level. Accepted for compatibility; the driver reports through its run session. |
+| `control.calc_type` | unset (required) | `IP` (no self-energy update) or `COHSEX` (dΣ[ρ] from `lorrax.model`). Anything else refuses (`td_calc_type`). |
+| `control.timesteps.t0` | unset (required) | Start time, as. |
+| `control.timesteps.dt_measure` | unset (required) | Sampling interval, as. Samples are TDGW's grid t0 + i·dt_measure. With a fixed-step method it must be a positive integer multiple of `lorrax.dt` (`td_dt_measure_multiple`). |
+| `control.timesteps.tf` | unset (required) | Final time, as. |
+| `control.timesteps.ntcheck` | `5000` | Samples per checkpoint, as in TDGW: every ntcheck samples the driver appends the measurements and rewrites `tdgw_data/checkpoint`. It is also the jitted chunk length unless `lorrax.chunk` is set. |
+| `control.timesteps.max_step` | unset (= no limit) | `dp54` only: SciPy's `max_step`, as. |
+| `control.ivp.rtol` | `1e-6` | `dp54` relative tolerance (SciPy RK45 semantics: RMS error norm over the logical, unpadded entries). |
+| `control.ivp.atol` | `1e-12` | `dp54` absolute tolerance, in units of ρ. |
+| `control.files.indir` | unset (required) | TDGW's input directory: `kernel.h5` for `lorrax.model = tdgw_kernel`, `WFN.h5` for `isdf`. |
+| `control.files.outdir` | unset (required) | Output directory: `tdgw.h5` and `tdgw.toml`, or one `trial-<i>/` per drive with `lorrax.trials`. |
+| `control.files.use_vmtxel` | `false` | `true` refuses (`td_header_source`): the dipole comes from the TDGW header. |
+| `control.files.load_header_from` | `""` (required here) | A TDGW output directory; its `tdgw.h5` header supplies energies, the k grid and the dipole, and is copied into the output. Empty refuses (`td_header_source`). |
+| `control.files.load_checkpoint_from` | `""` | Restart is not implemented; a value refuses (`td_checkpoint_restart`). |
+| `system.ibndmin` | unset (required) | First band of the window, 1-based (TDGW). It must equal the header's window (`td_band_window`). |
+| `system.ibndmax` | unset (required) | Last band of the window, 1-based, inclusive. |
+| `system.ivbm` | unset | Valence-band maximum, 1-based. Required by `tdgw_kernel` (`td_ivbm`); `isdf` takes the occupied count from it. |
+| `system.geometry` | unset (required) | `bulk`, `slab` or `wire`: the periodic directions of the intraband k-derivative. `box` refuses (`td_geometry`). |
+| `system.center_of_vacuum` | unset | TDGW's position origin for its own dipole build; accepted and unused, since the header carries the dipole. |
+| `system.esmear` | `0.05` | Gaussian width, eV, of the energy mask in TDGW's covariant overlap S̃ (the intraband connection), reproduced from the header's overlaps. |
+| `system.depopulation` | `0.0` | Diagonal relaxation rate Γ_nn toward ρ_eq, eV. |
+| `system.dephasing` | `0.0` | Off-diagonal relaxation rate Γ_nm, eV. |
+| `system.patched_sampling` | `false` | `true` refuses (`td_patched_sampling`). |
+| `system.Efunc.E_x` | `0.0` | Field component along x, V/m: a number or a TDGW expression in `t` (as) with numpy as `np`. |
+| `system.Efunc.E_y` | `0.0` | As `E_x`, along y. |
+| `system.Efunc.E_z` | `0.0` | As `E_x`, along z. |
+| `measurements.types` | unset (required) | The measurement list: `Efield`, `polarization`, `current`, `density_matrix`, `lessG`. `velocity_operator` refuses (`td_measurement_unsupported`). Per-measurement options are `[measurements.<i>]` tables (below). |
+| `lorrax.method` | `dp54` | `dp54` (SciPy RK45, adaptive; takes TDGW's steps), `rk4`, `etdrk4` (Krogstad), `magnus2` (exponential midpoint) or `cfm4` (fourth-order commutator-free Magnus). |
+| `lorrax.dt` | unset | The fixed step, as, for every method but `dp54`; refused with `dp54` (`td_dt`). |
+| `lorrax.n_corr` | `1` | Corrections per step of `magnus2` (midpoint Hamiltonian) and `cfm4` (Gauss-node Hamiltonians); each costs one dΣ evaluation per node. At least 1 (`td_n_corr`). |
+| `lorrax.model` | `""` (= `none` for IP, `tdgw_kernel` for COHSEX) | The self-energy update: `none`, `tdgw_kernel` (TDGW's dense `kernel.h5`) or `isdf` (the LORRAX ISDF model of a GW restart bundle). |
+| `lorrax.kernel_file` | `""` (= `indir/kernel.h5`) | The BerkeleyGW-layout kernel for `tdgw_kernel`. |
+| `lorrax.isdf_input` | `""` | The GW deck of the restart bundle, required by `isdf` (`td_isdf_input`). |
+| `lorrax.isdf_zeta` | `""` (= the deck's) | The bundle's ζ file, when not at the deck's location. |
+| `lorrax.isdf_terms` | `both` | Terms of the ISDF model: `both`, `sex` (screened exchange) or `hartree`. |
+| `lorrax.intraband` | `true` | Keep the intraband term E·[r^intra, ρ] (TDGW keeps it); `false` drops it. |
+| `lorrax.chunk` | `0` (= `ntcheck`) | Samples per jitted chunk (one host write and checkpoint each); capped so a density-matrix buffer fits the streaming tile. |
+| `lorrax.trials` | unset | A list of `{E_x, E_y, E_z}` tables propagated together on a leading trial axis (for example two circular polarizations); one output directory per trial. |
+
+`[measurements.<i>]` options, by measurement index `<i>` (0-based, as in
+TDGW): `dataset_name` (default: the type), `itrange` and `ntsave` (TDGW's
+sample selection), `brange1`, `brange2`, `krange` (density-matrix blocks,
+1-based bands), `use_v0` and `inter_only` (current). An unknown option refuses
+(`td_unknown_key`).
