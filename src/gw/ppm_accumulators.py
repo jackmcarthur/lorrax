@@ -91,6 +91,7 @@ class WindowTable:
     def __init__(self, fields, nodes):
         self.fields = fields
         self.nodes = tuple(int(n) for n in nodes)
+        self.on_shell = None  # on-shell packs (sigma._sigma_window_table), else None
 
 
 @lru_cache(maxsize=None)
