@@ -119,7 +119,7 @@ def _pencil(lo, hi, poles, tol, decay_rate):
     return eta, zps, geometry, size
 
 
-def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None):
+def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None, pencil=None):
     """Complex times shared by every pole, or None.
 
     A stacked (multi-channel) Hankel shift pencil: each pole contributes the
@@ -134,18 +134,60 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
         if fits is not None:
             return previous, fits
     eta, zps, geometry, size = _pencil(lo, hi, poles, tol, decay_rate)
+    columns = _pencil_columns(size, len(zps))
+    steps = [(padding, (geometry+padding)/(2*size)) for padding, _ in _GEOMETRIES]
+    # Each geometry's pencil depends on its padding only, never on a decision,
+    # so a source may build the next one while this one is scanned.
+    source = (host_pencils if pencil is None else pencil)(zps, size, columns, steps)
+    try:
+        for (_, flatten), (_, step), (s, shift) in zip(_GEOMETRIES, steps, source):
+            got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift)
+            if got is not None:
+                return got
+    finally:
+        source.close()
+    return None
+
+
+#: (padding, flattening) of the proposal geometries, scanned in order.
+# A short interval ending near the resonance gives growing modes. Extend
+# only the proposal geometry; fit/check the physical interval.
+_GEOMETRIES = ((0., 1.), (2., .9), (4., .9), (8., 1.), (10., 1.), (16., .9))
+
+
+def _pencil_columns(size, npoles):
+    """Column subset of each pole's Hankel block.
+
+    The shared exponentials live in the ROW space (index i). A column subset
+    dense near j=0, where 1/(x-z_p) varies fastest, and geometric beyond spans
+    it; the stack stays ~2*size wide for any group.
+    """
     ids = np.arange(size)
-    for padding, flatten in ((0., 1.), (2., .9), (4., .9), (8., 1.), (10., 1.), (16., .9)):
-        # A short interval ending near the resonance gives growing modes.
-        # Extend only the proposal geometry; fit/check the physical interval.
-        step = (geometry+padding)/(2*size)
+    width = max(32, 2*size//npoles)
+    return np.unique(np.r_[ids[:16], np.round(np.geomspace(16, size-1, width)).astype(int)])
+
+
+def host_pencils(zps, size, columns, steps):
+    """The reference shift pencils, one ``(s, shift)`` per ``(padding, step)``, lazily.
+
+    Pole p's block is ``B_p[i, c] = 1/(-padding + (i + columns[c])*step - zp)``
+    over ``i < size``, scaled to unit Frobenius norm, and its shifted block is
+    the same scale over ``base + step``. The stack ``H = [B_1 .. B_P]`` is
+    factored through its tall adjoint, ``H = R^H Q^H``, and the SVD of the
+    small ``R^H = U S W^H`` gives H's singular triplets at QR cost. ``s`` holds
+    the singular values in descending order (at least ``rank``) and ``shift``
+    is the ``rank x rank`` projection ``U_r^H [shifted] Q W_r``, ``rank =
+    min(RESPONSE_RULE_CAPACITY, len(s))``.
+
+    This is the contract of the ``pencil`` argument of
+    :class:`ResponseGroupTree`: a source with the same signature (a generator
+    of the same pairs) may compute them anywhere; :func:`_shared_times` reads
+    nothing else of a geometry. Host scipy at the pinned BLAS thread count.
+    """
+    ids = np.arange(size)
+    for padding, step in steps:
         base = -padding+(ids[:, None]+ids[None, :])*step
         blocks, shifted = [], []
-        # The shared exponentials live in the ROW space (index i). A column
-        # subset dense near j=0, where 1/(x-z_p) varies fastest, and geometric
-        # beyond spans it; the stack stays ~2*size wide for any group.
-        width = max(32, 2*size//len(zps))
-        columns = np.unique(np.r_[ids[:16], np.round(np.geomspace(16, size-1, width)).astype(int)])
         for zp in zps:
             block = 1/(base[:, columns]-zp)
             scale = 1/la.norm(block)
@@ -157,29 +199,33 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
         q, r = la.qr(np.hstack(blocks).conj().T, mode="economic", check_finite=False)
         u, s, wh = la.svd(r.conj().T, check_finite=False)
         rank = min(RESPONSE_RULE_CAPACITY, len(s))
-        shift = u[:, :rank].conj().T@(np.hstack(shifted)@q)@wh[:rank].conj().T
-        best, best_n = np.inf, 0
-        for n in range(8, rank + 1, 4):
-            roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
-                              check_finite=False)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                t = -np.log(roots)/step
-            if not np.isfinite(t).all() or np.any(t.real < 0):
-                continue
-            times = (flatten*t.real+1j*t.imag)/eta
-            if decay_rate:
-                times = times[times.real <= decay_rate]
-            if not len(times):
-                continue
-            fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate, order)
-            if fits is not None:
-                return times, fits
-            if mass_rejected:
-                break  # Try the next padding/flattening geometry, not more cancelling terms.
-            if error < best/10:
-                best, best_n = error, n
-            elif patience is not None and n - best_n >= patience:
-                break  # No decade of accuracy in this many more exponentials.
+        yield s, u[:, :rank].conj().T@(np.hstack(shifted)@q)@wh[:rank].conj().T
+
+
+def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift):
+    """Node counts n = 8, 12, ... of one geometry's pencil: ``(times, fits)`` or None."""
+    best, best_n = np.inf, 0
+    for n in range(8, len(shift) + 1, 4):
+        roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
+                          check_finite=False)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = -np.log(roots)/step
+        if not np.isfinite(t).all() or np.any(t.real < 0):
+            continue
+        times = (flatten*t.real+1j*t.imag)/eta
+        if decay_rate:
+            times = times[times.real <= decay_rate]
+        if not len(times):
+            continue
+        fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate, order)
+        if fits is not None:
+            return times, fits
+        if mass_rejected:
+            return None  # Try the next padding/flattening geometry, not more cancelling terms.
+        if error < best/10:
+            best, best_n = error, n
+        elif patience is not None and n - best_n >= patience:
+            return None  # No decade of accuracy in this many more exponentials.
     return None
 
 
@@ -247,7 +293,7 @@ def _rule(z, sets):
 
 
 def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-                         decay_rate=0.):
+                         decay_rate=0., pencil=None):
     """Shared complex-time rules for a group of response samples.
 
     Built at the Sigma rule builder's pinned BLAS thread count: the Hankel
@@ -279,9 +325,15 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     The serial walk of :class:`ResponseGroupTree`; a caller with idle
     processes evaluates the tree's attempts there and passes them to
     :meth:`ResponseGroupTree.rules` for the same bytes.
+
+    ``pencil`` is the source of each geometry's shift pencil (the contract of
+    :func:`host_pencils`, the default). Only the pencil's arithmetic moves
+    with it: every acceptance decision, tolerance and group stays here, on
+    the host. A source with other rounding gives rules equal to rounding,
+    not to the byte.
     """
     return ResponseGroupTree(lo_ry, hi_ry, z_ry, rel_tol=rel_tol, previous=previous,
-                             decay_rate=decay_rate).rules()
+                             decay_rate=decay_rate, pencil=pencil).rules()
 
 
 class ResponseGroupTree:
@@ -295,10 +347,13 @@ class ResponseGroupTree:
     serial walk builds a node whole when its attempt succeeds and its halves
     otherwise; ``rules(attempts)`` takes attempts evaluated elsewhere, keyed by
     node, and computes any it is not given. A one-sample attempt never returns
-    None: it returns its rule or raises the refusal.
+    None: it returns its rule or raises the refusal. ``pencil`` is the shift
+    pencils' source (:func:`response_group_rules`); with a device source an
+    attempt is a pure function of its node on one device class instead.
     """
 
-    def __init__(self, lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None, decay_rate=0.):
+    def __init__(self, lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None, decay_rate=0.,
+                 pencil=None):
         lo, hi = float(lo_ry), float(hi_ry)
         z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
         if (not z.size or not np.isfinite([lo, hi, rel_tol, decay_rate]).all()
@@ -306,6 +361,7 @@ class ResponseGroupTree:
                 or np.any(z.imag <= 0) or not 1e-13 <= rel_tol < .1):
             raise ValueError('invalid response frequency/domain/tolerance')
         self.lo, self.hi, self.z, self.rel_tol, self.decay_rate = lo, hi, z, rel_tol, decay_rate
+        self.pencil = pencil
         self.reference = 0. if decay_rate else lo
         self.root = tuple(range(len(z)))
         self._old = {frozenset(rule["members"]): rule["t"][:rule["count"]]
@@ -315,6 +371,19 @@ class ResponseGroupTree:
         """Shift-pencil sample count of a node (its attempt costs ~size^3 per geometry)."""
         return _pencil(self.lo, self.hi, _poles(self.z[list(members)]), self.rel_tol/2,
                        self.decay_rate)[3]
+
+    def pencil_shapes(self, members):
+        """``(size, poles, columns)`` of every shift pencil an attempt on the node may build.
+
+        The group's stacked pencil and, for one sample, each pole's own (its
+        separate-sets fallback). A device pencil source compiles these ahead.
+        """
+        poles = _poles(self.z[list(members)])
+        out = []
+        for ps in [poles] + ([poles[i:i+1] for i in range(len(poles))] if len(members) == 1 else []):
+            size = _pencil(self.lo, self.hi, ps, self.rel_tol/2, self.decay_rate)[3]
+            out.append((size, len(ps), len(_pencil_columns(size, len(ps)))))
+        return out
 
     def children(self, members):
         """The two halves of a node; () for one sample."""
@@ -341,7 +410,8 @@ class ResponseGroupTree:
         lo, hi, z, tol, decay_rate = self.lo, self.hi, self.z, self.rel_tol/2, self.decay_rate
         poles = _poles(z[members])
         got = _shared_times(lo, hi, poles, tol, self._old.get(frozenset(members)), decay_rate,
-                            patience=None if len(members) == 1 else _STAGNATION_NODES)
+                            patience=None if len(members) == 1 else _STAGNATION_NODES,
+                            pencil=self.pencil)
         if got is None:
             # Where the pencil fails, the closed-form imaginary-axis set serves
             # every pole when it fits the pencil's capacity (two pencils' for
@@ -358,7 +428,7 @@ class ResponseGroupTree:
         sets = []
         for pole in poles:
             one = np.asarray([pole])
-            got = _shared_times(lo, hi, one, tol, None, decay_rate)
+            got = _shared_times(lo, hi, one, tol, None, decay_rate, pencil=self.pencil)
             if got is None:
                 raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
                                  f'sample={z[members[0]]}, pole={pole}, tolerance={self.rel_tol}')
