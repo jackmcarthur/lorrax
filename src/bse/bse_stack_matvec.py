@@ -55,6 +55,11 @@ shape-stable ``(μ_pad, ν_pad, nkx, nky, nkz)`` argument built ONCE outside the
 matvec, so W(ω) / ladder buildouts pass a different ``W_R`` with no change to
 encode/decode/scan.
 
+The W term alone is :func:`make_w_term`; the TD-aGW interaction model
+(``tdagw.model``) applies it to a density matrix with both orbital legs the
+whole TD band window, and reuses :func:`exchange_encode` /
+:func:`exchange_decode` for its G-space Hartree term.
+
 Consumers: ``bse_lanczos.solve_bse_sharded`` (block Lanczos and Davidson),
 ``bse_feast`` (TDA GMRES contour solves, ``_rayleigh_ritz``, the spectral
 bounds), ``bse_kpm`` and the pseudopole and Haydock paths.  The non-TDA
@@ -396,6 +401,25 @@ def _rank_partial(A):
     return mark_varying(A, miss) if miss else A
 
 
+def exchange_encode(X, M):
+    """This rank's partial of the k-summed exchange encode, ``S[b,μ] = Σ_{kcv} M*[k,c,v,μ] X[b,c,v,k]``.
+
+    ``X`` (b, c_loc, v_loc, nk) and ``M`` (nk, c_loc, v_loc, μ) are the rank's
+    tiles in the transition layout ``P(None,'x','y',None)``, so the result is
+    the (b, μ) partial over this rank's (c, v) tile; a psum over ('x','y')
+    completes it.  Conjugated vertex on the encode leg (``_tda`` below).
+    """
+    return jnp.einsum("kcvN,bcvk->bN", jnp.conj(M), X)
+
+
+def exchange_decode(M, U):
+    """The exchange decode ``out[b,c,v,k] = Σ_μ M[k,c,v,μ] U[b,μ]`` on the rank's (c, v) tile.
+
+    ``U`` (b, μ) is replicated; the output is X-tiled, (b, c_loc, v_loc, nk).
+    """
+    return jnp.einsum("kcvM,bM->bcvk", M, U)
+
+
 def _exchange_U(S_part, V_q0):
     """Inside the (x, y) shard_map: the exchange term's two small reductions.
 
@@ -426,13 +450,13 @@ def _make_v_term(mesh_xy, pair: bool):
     xspec = P(None, "x", "y", None)
 
     def _tda(X, M, V_q0, enc, dec):
-        S = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M), X) * enc      # (b, μ) partial
-        return jnp.einsum("kcvM,bM->bcvk", M, _exchange_U(S, V_q0)) * dec
+        S = exchange_encode(X, M) * enc                            # (b, μ) partial
+        return exchange_decode(M, _exchange_U(S, V_q0)) * dec
 
     def _pair(X, Xb, sc, M, V_q0, enc, dec):
-        S = (jnp.einsum("kcvN,bcvk->bN", jnp.conj(M), X)
+        S = (exchange_encode(X, M)
              + sc * jnp.einsum("kcvN,bcvk->bN", M, Xb)) * enc
-        return jnp.einsum("kcvM,bM->bcvk", M, _exchange_U(S, V_q0)) * dec
+        return exchange_decode(M, _exchange_U(S, V_q0)) * dec
 
     if pair:
         return _shard_map_fn(_pair, mesh=mesh_xy,
@@ -443,57 +467,29 @@ def _make_v_term(mesh_xy, pair: bool):
                          out_specs=xspec, check_vma=False)
 
 
-def build_bse_stack_matvec(
-    mesh_xy: Mesh,
-    nkx: int,
-    nky: int,
-    nkz: int,
-    *,
-    kernel: str = "bse",
-    head_tensor: bool = False,
-):
-    """Build the trial-stack BSE matvec.
+def make_w_term(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
+    """The screened direct term ``(W X)`` of the TDA matvec as one ``shard_map``.
 
-    Parameters
-    ----------
-    kernel : {'bse', 'rpa'}
-        ``'bse'`` returns ``D + V - W`` (screened direct term); ``'rpa'`` returns
-        ``D + V`` (the W-term ``shard_map`` is not built).
-    head_tensor : bool
-        Add the cell-averaged nonanalytic exchange head as a rank-three term
-        over the TRANSITION index, and take two extra runtime arguments
-        ``(D_head, M_head)`` to carry it.  Default False traces a program with
-        no head contraction in it at all — not a zero-valued one — so the
-        off path is bit-identical, exactly as ``W_q0=None`` does for the
-        screened-direct term in ``bse_davidson_helpers``.
+    Returns ``w_term(X, psi_c_X, psi_v_Y, W_R) -> WX`` with
 
-        THE HEAD CANNOT LIVE IN THE μ BASIS, WHICH IS WHY IT IS A SEPARATE
-        TERM.  The exchange tile's head channel is rank one in μ with a
-        SCALAR Coulomb coefficient, and the object the cell average actually
-        needs is ``M_ab = <v(q) q_a q_b>_cell`` — a tensor, whose contraction
-        through μ would need ``∂_a ζ̃_μ`` and would break ``eval_vq``'s
-        ``A = zt·√v`` factorisation.  It does not have to: the head's
-        q-linear coefficient is the transition dipole, so
+    ``(WX)[b,c,v,k] = (1/N_k) Σ_{μνts} ψ*_c[k,t,μ] ψ_v[k,s,ν] Σ_k' W_μν(k-k') T_b[k',t,μ,s,ν]``,
+    ``T_b[k',t,μ,s,ν] = Σ_{c'v'} ψ_c'[k',t,μ] ψ*_v'[k',s,ν] X[b,c',v',k']``
+    (``docs/architecture/bse.md#hamiltonian``), the k' sum a k-grid
+    convolution through ``W_R`` (``bse_feast.ensure_W_R``).
 
-            K^head_{t,t'} = (1/N_k) · conj(d_a(t)) · M_ab · d_b(t')
+    Shapes and shardings: ``X`` (b, n_c, n_v, nk) at ``P(None,'x','y',None)``;
+    ``psi_c_X`` (nk, n_c, ns, μ) at ``P(None,None,None,'x')``; ``psi_v_Y``
+    (nk, n_v, ns, ν) at ``P(None,None,None,'y')``; ``W_R`` (μ, ν, nkx, nky,
+    nkz) at ``P('x','y',None,None,None)``; the result is X-shaped and
+    X-sharded.  Units are those of ``W_R`` (Ry).  The c and v legs are any
+    two orbital sets: the BSE passes conduction and valence, the TD-aGW model
+    (``tdagw.model``) passes the whole TD window on both.
 
-        is rank three over transitions and belongs beside ``M``,
-        where this matvec already carries rank-three objects
-        (``LT_HEAD_PROBLEM.md`` §6).
-
-        Structurally it IS the exchange term with ``(M, M, V_q0)``
-        replaced by ``(D_head, D_head, M_head)``, which is why it reuses the
-        same encode/decode shape and the same ``1/N_k``.  ``D_head`` is
-        ``conj(d)`` with the same ``(k, c, v, a)`` layout as ``M`` and a
-        Cartesian axis of length 3 where μ was; ``M_head`` is the real
-        symmetric ``(3, 3)`` cell moment.  Hermiticity of the added term is
-        then automatic: ``M`` real symmetric ⇒ ``K^head`` Hermitian.
+    Per block of trials: one gather of the block, a ``lax.scan`` over trials
+    with no collective in the body, one reduce-scatter (``_gather_trial_block``,
+    ``_scatter_trial_block``); the route (outer-product load or XLA encode +
+    k-leading convolution) is chosen at trace time and announced once.
     """
-    if kernel not in ("rpa", "bse"):
-        raise ValueError(f"kernel must be 'rpa' or 'bse', got {kernel!r}")
-    include_W = kernel == "bse"
-
-    sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
     # The W-term k-convolution: the router's outer-product factory when it serves
     # the band rank K = min(n_c, n_v) (decided at trace time, announced once),
@@ -550,6 +546,64 @@ def build_bse_stack_matvec(
                   P(None, None, None, "y"), P("x", "y", None, None, None)),
         out_specs=P(None, "x", "y", None),
     )
+
+    return w_stack
+
+
+def build_bse_stack_matvec(
+    mesh_xy: Mesh,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    *,
+    kernel: str = "bse",
+    head_tensor: bool = False,
+):
+    """Build the trial-stack BSE matvec.
+
+    Parameters
+    ----------
+    kernel : {'bse', 'rpa'}
+        ``'bse'`` returns ``D + V - W`` (screened direct term); ``'rpa'`` returns
+        ``D + V`` (the W-term ``shard_map`` is not built).
+    head_tensor : bool
+        Add the cell-averaged nonanalytic exchange head as a rank-three term
+        over the TRANSITION index, and take two extra runtime arguments
+        ``(D_head, M_head)`` to carry it.  Default False traces a program with
+        no head contraction in it at all — not a zero-valued one — so the
+        off path is bit-identical, exactly as ``W_q0=None`` does for the
+        screened-direct term in ``bse_davidson_helpers``.
+
+        THE HEAD CANNOT LIVE IN THE μ BASIS, WHICH IS WHY IT IS A SEPARATE
+        TERM.  The exchange tile's head channel is rank one in μ with a
+        SCALAR Coulomb coefficient, and the object the cell average actually
+        needs is ``M_ab = <v(q) q_a q_b>_cell`` — a tensor, whose contraction
+        through μ would need ``∂_a ζ̃_μ`` and would break ``eval_vq``'s
+        ``A = zt·√v`` factorisation.  It does not have to: the head's
+        q-linear coefficient is the transition dipole, so
+
+            K^head_{t,t'} = (1/N_k) · conj(d_a(t)) · M_ab · d_b(t')
+
+        is rank three over transitions and belongs beside ``M``,
+        where this matvec already carries rank-three objects
+        (``LT_HEAD_PROBLEM.md`` §6).
+
+        Structurally it IS the exchange term with ``(M, M, V_q0)``
+        replaced by ``(D_head, D_head, M_head)``, which is why it reuses the
+        same encode/decode shape and the same ``1/N_k``.  ``D_head`` is
+        ``conj(d)`` with the same ``(k, c, v, a)`` layout as ``M`` and a
+        Cartesian axis of length 3 where μ was; ``M_head`` is the real
+        symmetric ``(3, 3)`` cell moment.  Hermiticity of the added term is
+        then automatic: ``M`` real symmetric ⇒ ``K^head`` Hermitian.
+    """
+    if kernel not in ("rpa", "bse"):
+        raise ValueError(f"kernel must be 'rpa' or 'bse', got {kernel!r}")
+    include_W = kernel == "bse"
+
+    sh = make_bse_shardings(mesh_xy)
+    nk = nkx * nky * nkz
+    # The screened direct term: one shard_map, a scan over trials (``make_w_term``).
+    w_stack = make_w_term(mesh_xy, nkx, nky, nkz)
 
     v_term = _make_v_term(mesh_xy, pair=False)
 

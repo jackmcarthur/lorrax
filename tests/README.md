@@ -28,6 +28,17 @@ A new test needs no bootstrap import of its own.
   rank one share shape (CPU, three simulated ranks).
 - `test_stream_passes_cpu.py`: the scanned row-pass loop on a host mesh
   under x64 (CPU): two windows add the bytes of one.
+- `tdagw/test_prop_*.py`: the TD-aGW propagator (CPU). `integrators`: the
+  stepper of `solvers.time_integrators` against SciPy (DP54 takes SciPy RK45's
+  steps; measured orders; Magnus unitarity; Strang order), each with a red
+  twin. `tdgw_parity`: on a frozen TDGW 0.3.0 fixture (`fixtures/syn2v2c`,
+  built by `fixtures/make_tdgw_fixture.py`) the driver's stages on a 2x2 host
+  mesh take TDGW's steps and reproduce every measurement to 1e-12; red twins
+  drop the intraband term and flip the kernel sign; four devices equal one.
+  `deck`: every parser refusal names its gate. `isdf_adapter`: the ISDF
+  adapter's dSigma equals 1/2 K (rho - rho_eq) for a synthetic TDMODEL model
+  with a permuted k order and padded k; red twins drop the Ry -> Ha halving
+  and pass rho for Delta rho.
 - `test_sigma_kconv_scratch.py`: mode 7's split-arm scratch follows the
   handler's rule and is priced in the Σ pass and the τ window checks (CPU).
 - `test_qe_reported_inputs.py`: the V_NL spin-orbit mode is QE's
