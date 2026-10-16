@@ -31,10 +31,14 @@ A completed measurement is stamped across processes (``_STAMP_SCHEMA``): a
 JSON receipt in ``lxkit.user_cache_dir("wfn_trs")``, never beside the WFN,
 keyed by the file's identity (resolved path, size, mtime_ns, inode), a
 SHA-256 of the header arrays and G lists the verdict reads, the algorithm
-version and ``(tol, max_k, nocc)``.  The coefficients are not hashed: the
+version, a digest of this module's source (the code that measured and
+classified) and ``(tol, max_k, nocc)``.  The coefficients are not hashed: the
 stored band energies are a round-off fingerprint of the run that wrote them,
 so a regenerated WFN changes the digest even if size and mtime survive.  A
-check that raised is never stamped, and a stamp holding one is a miss.
+check that raised is never stamped, and a stamp holding one is a miss.  The
+receipt is published with ``lxkit.atomic_write_bytes`` and carries a SHA-256
+of its report; a stamp whose digest, types or coverage do not check is a miss,
+never a verdict.
 """
 
 from __future__ import annotations
@@ -67,7 +71,7 @@ TOL_TRS = 1.0e-6
 TOL_ABS_MAGNETIZATION = 1.0e-4
 MAX_K_DEFAULT = 12
 _ALGORITHM_VERSION = "qe-magnetization-decides-v3"
-_STAMP_SCHEMA = "wfn-trs-stamp-v1"
+_STAMP_SCHEMA = "wfn-trs-stamp-v2"
 #: A stamp is ~1.6 kB and one exists per (WFN, tol, max_k, nocc); test runs
 #: leave one per temporary WFN.  A write that finds more than this many drops
 #: the least recently written half, so the directory stays bounded.
@@ -678,6 +682,33 @@ def _stamp_dir():
     return user_cache_dir("wfn_trs")
 
 
+_CODE_KEY: list = []
+
+
+def _code_key() -> str:
+    """SHA-256 (16 hex) of this module's source: a changed measurement misses."""
+    if not _CODE_KEY:
+        try:
+            with open(__file__, "rb") as handle:
+                _CODE_KEY.append(hashlib.sha256(handle.read()).hexdigest()[:16])
+        except OSError:
+            _CODE_KEY.append("unreadable")
+    return _CODE_KEY[0]
+
+
+def _report_digest(report_json: dict) -> str:
+    return hashlib.sha256(json.dumps(report_json, sort_keys=True).encode()).hexdigest()
+
+
+def _report_values_ok(report: DensitySymmetryReport) -> bool:
+    """The fields a hit hands downstream have the types and range a measurement gives."""
+    cov = report.trs_coverage
+    return (isinstance(report.trs_holds, bool) and isinstance(report.conclusive, bool)
+            and isinstance(report.spatial_ops_ok, bool)
+            and isinstance(report.invariants_ok, bool)
+            and isinstance(cov, (int, float)) and 0.0 <= float(cov) <= 1.0)
+
+
 def _content_digest(loader) -> str:
     """SHA-256 over the named in-memory arrays in ``_STAMP_FIELDS``."""
     h = hashlib.sha256()
@@ -700,6 +731,7 @@ def _stamp_identity(loader, nocc: int, tol_trs: float,
     return {
         "qe_trs_off": qe_trs_off_reason(loader),
         "schema": _STAMP_SCHEMA, "algorithm": _ALGORITHM_VERSION,
+        "code": _code_key(),
         "path": path, "size": int(st.st_size),
         "mtime_ns": int(st.st_mtime_ns), "inode": int(st.st_ino),
         "content_sha256": digest, "tol_trs": repr(float(tol_trs)),
@@ -761,10 +793,12 @@ def _read_stamp(identity: dict | None):
             record = json.load(handle)
         if record.get("identity") != identity or not record.get("measured"):
             return None
+        if record.get("report_sha256") != _report_digest(record["report"]):
+            return None
         report = _report_from_json(record["report"])
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
-    if not _is_measured(report):
+    if not _is_measured(report) or not _report_values_ok(report):
         return None
     return report, path
 
@@ -774,26 +808,19 @@ def _write_stamp(identity: dict | None,
     """Write the stamp atomically; only a completed measurement is written."""
     if identity is None or not _is_measured(report):
         return None
+    from lxkit import atomic_write_bytes
     path = _stamp_path(identity)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
+        report_json = _report_to_json(report)
         text = json.dumps({"identity": identity, "measured": True,
                            "written_unix": time.time(),
-                           "report": _report_to_json(report)},
+                           "report": report_json,
+                           "report_sha256": _report_digest(report_json)},
                           sort_keys=True)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        atomic_write_bytes(path, text.encode("utf-8"))
     except (OSError, TypeError, ValueError) as exc:
         warnings.warn(f"2c-TRS stamp not written at {path}: {exc!r}",
                       RuntimeWarning)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
         return None
     _prune_stamps(path.parent)
     return str(path)

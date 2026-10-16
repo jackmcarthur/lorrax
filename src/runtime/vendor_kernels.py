@@ -126,6 +126,8 @@ def fold_into_snapshot(writer: Path, snapshot: Path) -> int:
         db.execute("detach database w")
     finally:
         db.close()
+    with open(tmp, "rb+") as handle:          # durable before it becomes the snapshot
+        os.fsync(handle.fileno())
     os.replace(tmp, snapshot)
     writer.unlink(missing_ok=True)
     return added
