@@ -482,15 +482,22 @@ def _shared_pole_static_key(meta, header, tables, *, mesh_xy, layout):
         {name: value for name, value in tables.items() if name != "policy"}))
 
 
-def _w_orientation(all_identity, reads_w, reads_wt):
+def _w_orientation(all_identity, reads_w, reads_wt, *, weights_on_load=True):
     """The W orientation one Sigma branch forms: ``"pair"``, ``"plus"`` or ``"transpose"``.
 
     A single orientation only when every panel's realization is the identity pair (no
     stabilizer mixes W with its partner) AND the branch's load rows read that orientation
     alone; a branch whose rows read both (or, defensively, neither) forms the pair through
     the transpose exchange exactly as before.
+
+    ``weights_on_load``: the synthesis GEMM's active route applies the per-column weights as
+    it loads ``b_X`` (the device route, ``distrib_la._active_local.ACTIVE_LOCAL_ROUTE``).  On
+    a route that forms the weighted copy ``b_X diag(d)`` itself (the CUDA native cuBLAS arm,
+    the XLA routes), the single-orientation kernel holds that copy at the window executable's
+    peak (A100 Fe V2 P=4: c128[64,156,2,36], 11.5 MB in jit(run), 'Sigma tau other' 1.11 GB
+    per rank vs 1.08 on the pair), so such a branch keeps the pair.
     """
-    if not all_identity or reads_w == reads_wt:
+    if not all_identity or reads_w == reads_wt or not weights_on_load:
         return "pair"
     return "plus" if reads_w else "transpose"
 
@@ -659,8 +666,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     # Per branch: the pair, or (every panel's realization the identity) the one orientation
     # its load reads.  The unread tile slot carries the read one; the load never reads it.
     all_identity = all(p["identity"] for p in panels)
+    from distrib_la import active_weights_on_load, mesh_platform
+    weights_on_load = active_weights_on_load(mesh_platform(mesh_xy))
     def branch_orientation(space):
-        return _w_orientation(all_identity, *branch_reads(space))
+        return _w_orientation(all_identity, *branch_reads(space), weights_on_load=weights_on_load)
     def _w_kernel_for(orientation):
         spans = tuple((p["span"], p["kernels"][orientation]) for p in panels)
         def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node):

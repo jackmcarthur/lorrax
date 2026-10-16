@@ -62,6 +62,13 @@ def active_local_route(platform):
     return ACTIVE_LOCAL_ROUTE.get(platform, "interval")
 
 
+def active_weights_on_load(platform) -> bool:
+    """Whether the platform's active-range GEMM applies per-column weights as it loads ``A``
+    (the ``"device"`` route), so no weighted copy ``A diag(w)`` is formed.  Every other route
+    (the CUDA native cuBLAS arm, the XLA routes) forms that copy before its GEMM."""
+    return active_local_route(platform) == "device"
+
+
 def active_local_guard(platform):
     """The native arm's guard for an FFI platform key (``"cond"`` | ``"select"``)."""
     return ACTIVE_LOCAL_GUARD.get(platform, "cond")

@@ -151,6 +151,7 @@ from distrib_la.resolve import (
     resolve_backend,
 )
 
+from ._active_local import active_weights_on_load
 from ._batch_reshard import batch_layout, is_batch_layout, local_batch
 from ._result_check import checked_program, checked_shapes, native_eigh_jacobi
 from distrib_la.local_eigh import eigh_local, eigh_route, COMPLEX_EIGH_ROUTE
@@ -184,6 +185,8 @@ __all__ = [
     "resolve_backend", "list_backends", "backend_module",
     "BACKEND_CHOICES", "EIGH_BACKENDS", "CHOLESKY_BACKENDS", "LU_BACKENDS",
     "OPS", "NATIVE", "mesh_platform", "mesh_is_cpu", "mesh_key",
+    # whether a platform's active-range GEMM weights its operand as it loads it
+    "active_weights_on_load",
     # capability
     "probe_target", "has_target", "dial_key",
     # round-off tolerance of every linear-algebra check

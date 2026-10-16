@@ -23,6 +23,25 @@ def test_orientation_rule_truth_table():
         assert _w_orientation(False, *reads) == "pair"
 
 
+def test_orientation_needs_weights_on_load():
+    """Off the device route the synthesis GEMM forms the weighted copy b_X diag(d) itself, which
+    a single-orientation kernel holds at its peak (A100 CUDA native arm, Fe V2 P=4: +11.5 MB in
+    the window executable): such a branch keeps the pair whatever it reads."""
+    from gw.mpa.sigma import _w_orientation
+    for reads in ((True, False), (False, True), (True, True), (False, False)):
+        for identity in (True, False):
+            assert _w_orientation(identity, *reads, weights_on_load=False) == "pair"
+    assert _w_orientation(True, True, False, weights_on_load=True) == "plus"
+
+
+def test_only_the_device_route_loads_weights():
+    from distrib_la import active_weights_on_load
+    from distrib_la._active_local import ACTIVE_LOCAL_ROUTE
+    assert active_weights_on_load("ROCM") is True
+    assert not any(active_weights_on_load(p) for p in ("cpu", "tpu"))
+    assert active_weights_on_load("CUDA") is (ACTIVE_LOCAL_ROUTE["CUDA"] == "device")
+
+
 def _tables(nsp, m, rotations_spatial):
     rot = np.concatenate([rotations_spatial, -rotations_spatial]).astype(np.int64)
     perm = np.tile(np.arange(m, dtype=np.int32), (2 * nsp, 1))
