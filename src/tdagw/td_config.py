@@ -68,6 +68,7 @@ TD_DEFAULTS = {
     "lorrax.pair_rule": "mask",
     "lorrax.pair_gap_ev": None,
     "lorrax.check_eigenvectors": "",
+    "lorrax.degeneracy_mode": "",
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -181,7 +182,7 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
                         "the number of occupied bands (1-based VBM index)", "set ivbm")
     else:
         for key in ("lorrax.bundle_input", "lorrax.eqp_file", "lorrax.dipole_file",
-                    "lorrax.check_eigenvectors"):
+                    "lorrax.check_eigenvectors", "lorrax.degeneracy_mode"):
             if vals[key]:
                 raise _gate("td_bundle_key", f"{key} with system = 'tdgw_header'",
                             "bundle keys only with system = 'bundle'",
@@ -193,6 +194,10 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
                         "(tdgw-run writes the header before it propagates), or "
                         "build the system from a GW bundle: [lorrax] system = 'bundle'")
     from tdagw.td_system import PAIR_RULES
+    if vals["lorrax.degeneracy_mode"] not in ("", "strict", "snap", "off"):
+        raise _gate("td_degeneracy_mode", repr(vals["lorrax.degeneracy_mode"]),
+                    "strict | snap | off (unset = the band-window default)",
+                    "set [lorrax] degeneracy_mode")
     if vals["lorrax.pair_rule"] not in PAIR_RULES:
         raise _gate("td_pair_rule", repr(vals["lorrax.pair_rule"]),
                     " | ".join(PAIR_RULES), "set [lorrax] pair_rule")

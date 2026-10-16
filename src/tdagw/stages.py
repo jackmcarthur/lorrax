@@ -59,6 +59,7 @@ def load_system(deck: TdDeck, mesh) -> TdSystem:
             n_occ=int(v["system.ivbm"]), pair_rule=v["lorrax.pair_rule"],
             gap_ev=float(v["lorrax.pair_gap_ev"]), zeta_file=v["lorrax.isdf_zeta"] or None,
             eigenvectors_file=v["lorrax.check_eigenvectors"] or None,
+            degeneracy_mode=v["lorrax.degeneracy_mode"] or None,
             log=lambda s: print(s) if process_rank() == 0 else None)
         hdr, bundle_model, receipts = built.hdr, built.model, built.receipts
     else:

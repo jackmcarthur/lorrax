@@ -337,6 +337,7 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `lorrax.pair_rule` | `mask` | Same-occupation pairs (vv', cc') of the bundle's r: `mask` multiplies r by 1 − exp(−ΔE²/(2 gap²)), `cut` zeroes pairs with \|ΔE\| < gap, `cv` keeps the c↔v blocks only (TDGW's `use_vmtxel` layout). n = m is always zero (no intraband commutator on this route). |
 | `lorrax.pair_gap_ev` | unset (= `system.esmear`) | The energy scale of `pair_rule`, eV; also the smallest accepted c↔v gap (`td_cv_gap`). |
 | `lorrax.check_eigenvectors` | `""` | A `bse_jax --write-eigs --dipole` file on the same bundle and window: the builder reproduces its ⟨0\|r\|S⟩ from the header (the gauge receipt, logged and stored in the header). |
+| `lorrax.degeneracy_mode` | `""` (= `strict`) | The band-window degeneracy gate of the bundle load (`strict` refuses a window edge inside a QP multiplet, `snap` widens the window, `off` keeps it; TDGW applies no such check, so reproducing a TDGW window may need `off`). |
 
 `[measurements.<i>]` options, by measurement index `<i>` (0-based, as in
 TDGW): `dataset_name` (default: the type), `itrange` and `ntsave` (TDGW's

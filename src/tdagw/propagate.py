@@ -33,7 +33,6 @@ written into device buffers); the host sees the state only between chunks.
 """
 from __future__ import annotations
 
-import functools
 from typing import Callable, NamedTuple, Optional
 
 import numpy as np
@@ -353,11 +352,16 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
     return jax.jit(build)(rho0, ops, mparams)
 
 
-@functools.lru_cache(maxsize=None)
 def _chunk_program(cfg: PropagatorConfig, spec: SampleSpec, model_apply,
                    model_name: str, drive_key, mesh, cell_volume: float,
                    nspinor: int, count: int, n_samples: int, last: bool):
-    """The jitted chunk for one static configuration (cached by its key)."""
+    """The jitted chunk for one static configuration.
+
+    Not cached here: ``run_propagation`` keeps one program per (chunk
+    length, last) for the duration of a run, so nothing outlives the run (a
+    process-wide cache keyed by the drive and model closures, hashed by
+    identity, was never hit by an equivalent run and pinned their operands).
+    """
     drive = drive_key[0]
     model = SelfEnergyModel(apply=model_apply, params=None, linear=True,
                             name=model_name)
@@ -397,12 +401,16 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     n_meas = int(mtsteps.size)
     fixed = cfg.method != "dp54"
     step0 = 0
+    programs = {}                       # (n_samples, last) -> jitted chunk, this run only
     for i0 in range(0, n_meas, cfg.chunk):
         i1 = min(n_meas, i0 + cfg.chunk)
         last = i1 == n_meas
-        prog = _chunk_program(cfg, spec, model.apply, model.name, (drive,),
-                              mesh, float(cell_volume), int(nspinor), int(count),
-                              int(i1 - i0), bool(last and not fixed))
+        key = (int(i1 - i0), bool(last and not fixed))
+        if key not in programs:
+            programs[key] = _chunk_program(cfg, spec, model.apply, model.name, (drive,),
+                                           mesh, float(cell_volume), int(nspinor),
+                                           int(count), *key)
+        prog = programs[key]
         times = jnp.asarray(mtsteps[i0:i1])
         carry, samples = prog(carry, ops, model.params, times, step0)
         step0 += (i1 - i0) * cfg.n_sub
