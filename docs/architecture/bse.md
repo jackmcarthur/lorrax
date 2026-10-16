@@ -232,8 +232,10 @@ gauge fit, exists, and no fine NSCF is needed. A fine WFN's own `dipole.h5`
 is in that loader's gauge, which matches the densified ψ only up to random
 per-(k, band) phases off the coarse grid; it refuses
 (`GATE velocity_wfn_fingerprint`). At every fine q that is a coarse k the
-fine window states are the coarse ones and the interpolated operators
-reproduce the coarse ones in them (`GATE densified_dipole_on_grid`); the
+fine window states span the coarse states at the window's positions in
+the fH's own energy order (QP under `--eqp`, which can move a band across
+a window edge: MoS₂ 9×9 at Γ), and the interpolated operators reproduce
+the coarse ones in them (`GATE densified_dipole_on_grid`); the
 log also gives each velocity image's outer-shell locality beside $f(H)$'s,
 the signature of a velocity in another gauge. Their accuracy is the
 densified ψ's: the guard bands and rank that converge ψ converge the dipoles.

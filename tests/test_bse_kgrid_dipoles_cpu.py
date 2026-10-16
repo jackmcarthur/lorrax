@@ -88,20 +88,23 @@ def _sym(kpts):
             np.eye(3), (len(np.asarray(rows)), 3, 3)))
 
 
-def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None):
+def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
+             gate_energies=None):
     """``compute_wfns_fi`` + ``densified_dipoles`` on the toy, XLA backend."""
     kc = _grid(KC)
+    e_fh = e if fh_energies is None else fh_energies
     with xla_reference():
         fine = compute_wfns_fi(
             ctilde=jnp.asarray(c), B_at_mu=jnp.ones((c.shape[2], 1, 4), complex),
-            enk_sigma=jnp.asarray((e if fh_energies is None else fh_energies).T),
+            enk_sigma=jnp.asarray(e_fh.T),
             kgrid_co=KC, kgrid_fi=KF, band_window_fi=(B_MIN, B_MAX),
             mesh_xy=mesh, return_coeffs=True)
         if q_perm is not None:
             fine.q_frac = fine.q_frac[q_perm]
         dip = densified_dipoles(
             (v, e if e_file is None else e_file, "toy dH/dk", "toy.h5"),
-            sym=_sym(kc), basis=SimpleNamespace(ctilde=jnp.asarray(c),
+            sym=_sym(kc), fh_energies=e_fh if gate_energies is None else gate_energies,
+            basis=SimpleNamespace(ctilde=jnp.asarray(c),
                                                 band_range=(0, NB)),
             fine=fine, coarse_grid=KC, n_val=N_VAL, window_start=B_MIN,
             a_band_index=None,
@@ -205,3 +208,25 @@ def test_window_dipoles_refusals(tmp_path, monkeypatch):
     ok = dict(coarse, nkx=2, nky=2)
     d, de = window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
     assert d.shape == (3, 4, 1, 1) and de.shape == (4, 1, 1)
+
+
+def test_on_grid_identity_follows_the_fh_band_order():
+    """A QP ladder that moves a band across the window edge at a shared k.
+
+    The fH's own order picks the window there (MoS2 9x9 eqp1 at Gamma swaps
+    DFT bands 18-19 out of [18, 34) for 16-17), so the on-grid state identity
+    reads the window rows from ``fh_energies``; the red twin hands the gate
+    the DFT order and must fire.
+    """
+    mesh, h = _mesh(), _model()
+    c, e, v = _states(h, _grid(KC))
+    i0 = int(np.flatnonzero(np.all(np.abs(_grid(KC)) < 1e-12, axis=1))[0])
+    e_qp = e.copy()
+    e_qp[i0, B_MIN - 1], e_qp[i0, B_MIN] = e[i0, B_MIN] + 0.02, e[i0, B_MIN - 1]
+    assert list(np.argsort(e_qp[i0])[B_MIN:B_MAX]) != list(range(B_MIN, B_MAX))
+    dip, _ = _densify(mesh, c, e, v, fh_energies=e_qp)
+    assert dip["n_on_grid"] == 9
+    assert dip["on_grid_state_dev"] < 1e-8 and dip["on_grid_rel"] < 1e-12
+    with pytest.raises(ValueError, match="GATE densified_dipole_on_grid"):
+        _densify(mesh, c, e, v, fh_energies=e_qp, gate_energies=e)
+

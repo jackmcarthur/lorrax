@@ -716,18 +716,23 @@ def _add_rank_lr(W_q, A, D, mesh_xy, sign):
 #: never a fit error, and the bound does not scale with the deck.
 DENSIFIED_DIPOLE_ONGRID_RTOL = 1.0e-8
 
-#: Floor of the state identity: at a coarse k the fine window states ARE the
-#: coarse ones, ``σ(C_k^* U_q) = 1``, up to the fit's projection defect
+#: Floor of the state identity: at a coarse k the fine window states span
+#: the coarse states the fH's energy order puts at the window's positions,
+#: ``σ(C_k^* U_q) = 1`` on those rows, up to the fit's projection defect
 #: ``max|C Cᴴ − I|`` (the measured margin is 10x that defect, plus this floor).
 DENSIFIED_DIPOLE_STATE_FLOOR = 1.0e-8
+
+#: Two coarse energies closer than this (Ry) are one degenerate level when
+#: the on-grid identity reads which coarse states a window edge holds.
+DENSIFIED_DIPOLE_DEGEN_RY = 1.0e-6
 
 #: Component names of the four lattice images :func:`densified_dipoles` builds.
 _DIPOLE_IMAGES = ("v_x", "v_y", "v_z", "f(H)")
 
 
-def densified_dipoles(velocity, *, sym, basis, fine, coarse_grid, n_val,
-                      window_start, a_band_index, mesh_xy,
-                      log_fn=print) -> dict:
+def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
+                      coarse_grid, n_val, window_start, a_band_index,
+                      mesh_xy, log_fn=print) -> dict:
     r"""r-form dipoles of a ``bse_k_grid`` bundle, in the gauge of its own ψ.
 
     The coarse WFN's velocity matrix ``v(k)`` (``psp.get_dipole_mtxels``'
@@ -761,9 +766,12 @@ def densified_dipoles(velocity, *, sym, basis, fine, coarse_grid, n_val,
     product enters, so the centroid set cannot bias it.
 
     Two receipts.  The on-grid identity is a gate: at every fine q that is a
-    coarse k the fine window states are the coarse ones,
-    ``σ(W) = 1`` for ``W = C_k^* U_q`` (catches a q list or band window that
-    is not the htransform's), and the four images reproduce ``W^† O(k) W``
+    coarse k the fine window states span the coarse states that hold the
+    window's positions in the order of ``fh_energies`` (the fH's own,
+    QP under ``--eqp``, which can move a band across a window edge: MoS₂
+    9×9 at Γ), degenerate partners included, ``σ(W_S) = 1`` for
+    ``W = C_k^* U_q`` (catches a q list or band window that is not the
+    htransform's), and the four images reproduce ``W^† O(k) W``
     to :data:`DENSIFIED_DIPOLE_ONGRID_RTOL` (catches a contraction
     convention).  Each image's outer-shell locality
     (``fh_interp.image_locality``) is a diagnostic: a velocity whose gauge
@@ -787,6 +795,10 @@ def densified_dipoles(velocity, *, sym, basis, fine, coarse_grid, n_val,
         ``compute_wfns_fi(..., return_coeffs=True)``: ``coeffs_fi``
         (nk_f, rank, nb_fi), q-sharded ``P(('x','y'))``, valence rows first;
         ``q_frac`` (nk_f, 3).
+    fh_energies : array (nk_co, nb_fit)
+        The coarse energies (Ry) the htransform's ``f(H)`` was built from
+        (``enk_sigma.T``), in ``ctilde``'s k order: they decide which
+        coarse states a window position holds.
     coarse_grid : tuple of int
         (nkx, nky, nkz) of ``ctilde``'s flat k axis.
     n_val : int
@@ -882,7 +894,8 @@ def densified_dipoles(velocity, *, sym, basis, fine, coarse_grid, n_val,
 
     on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
         out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
-        k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start)
+        k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start,
+        fh_energies=fh_energies)
     del out
     shift_mev = float(np.max(np.abs(
         e_dft - np.asarray(gather_to_host(fine.enk_full))))) * RYD_TO_EV * 1e3
@@ -950,7 +963,7 @@ def _coefficients_by_q(coeffs, carrier, mesh_xy):
 
 
 def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
-                             q_fine, window_start):
+                             q_fine, window_start, fh_energies):
     """The two on-grid identities of :func:`densified_dipoles`.
 
     ``out`` (carrier, 4, nb_fi, nb_fi) is ``interpolate_band_operator``'s
@@ -958,9 +971,12 @@ def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
     ``ops_host = (v_full (nk_co, 3, nb_fit, nb_fit), f_full (nk_co,
     nb_fit))``.  A fine q matches the coarse row whose ``k_coarse`` equals it
     modulo a reciprocal lattice vector (to 1e-8), never by assumed order.
-    With ``W = C_k^* U_q`` (nb_fit, nb_fi), the window rows
-    ``W[window_start:window_start+nb_fi]`` are unitary and the four images
-    are ``W^† O(k) W``.  Only the shared rows are gathered.
+    With ``W = C_k^* U_q`` (nb_fit, nb_fi), the rows ``S_k`` of the coarse
+    states at positions ``[window_start, window_start + nb_fi)`` of
+    ``fh_energies[k]`` sorted (every state within
+    :data:`DENSIFIED_DIPOLE_DEGEN_RY` of the two edge levels included)
+    have ``σ(W_S) = 1``, and the four images are ``W^† O(k) W``.  Only
+    the shared rows are gathered.
 
     Returns ``(image rel deviation, max|σ(W_window) − 1|, max|C Cᴴ − I| over
     the shared k, n_shared)``.
@@ -988,8 +1004,15 @@ def _dipole_on_grid_identity(out, ctilde, coeffs, *, ops_host, k_coarse,
     O = np.asarray(gather_to_host(out[fi]))                     # (n, 4, nb_fi, nb_fi)
     nb_fi = int(U.shape[2])
     W = np.einsum("nma,nai->nmi", np.conj(C), U)                # ⟨ψ_m(k)|ψ_i(q)⟩
-    sigma = np.linalg.svd(W[:, window_start:window_start + nb_fi],
-                          compute_uv=False)
+    e_fh = np.asarray(fh_energies, dtype=np.float64)[co]          # (n, nb_fit)
+    sigma = []
+    for n_, e_k in enumerate(e_fh):
+        e_sorted = np.sort(e_k)
+        lo = e_sorted[window_start] - DENSIFIED_DIPOLE_DEGEN_RY
+        hi = e_sorted[window_start + nb_fi - 1] + DENSIFIED_DIPOLE_DEGEN_RY
+        rows = np.flatnonzero((e_k >= lo) & (e_k <= hi))
+        sigma.append(np.linalg.svd(W[n_, rows], compute_uv=False))
+    sigma = np.concatenate(sigma)
     gram = np.einsum("nma,npa->nmp", C, np.conj(C))
     defect = float(np.max(np.abs(gram - np.eye(gram.shape[1])[None])))
     v_ref = np.einsum("nmi,nxmp,npj->nxij", np.conj(W), v_full[co], W)
@@ -1194,8 +1217,10 @@ def _interpolate_bse_data_to_grid(
         return_coeffs=velocity is not None)
     dipoles = None
     if velocity is not None:
+        from common.collectives import gather_to_host
         dipoles = densified_dipoles(
             velocity, sym=sym, basis=basis, fine=bundle,
+            fh_energies=np.asarray(gather_to_host(enk_sigma)).T,
             coarse_grid=coarse_grid, n_val=n_val, window_start=b_min,
             a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn)
         del bundle.coeffs_fi, velocity
