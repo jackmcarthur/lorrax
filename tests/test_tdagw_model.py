@@ -32,6 +32,8 @@ G8  the BSE identity: Hartree == bse_stack_matvec 'rpa' (ε = 0, V_q0 = V̄) and
     −SEX == 'bse' − 'rpa' on the same window                            rel <= 1e-12
 G10 the TDGW seam: the bridge's ΔΣ (TDGW k order, Ha) == ½ K δρ with K permuted
     as the exporter permutes it, for a random TDGW k order               rel <= 1e-12
+G10b the bridge's TDA mode == TDGW's TDA kernel semantics (ΔΣ_cv = ½ K_cv,c'v' δρ_c'v',
+    ΔΣ_vc = ΔΣ_cv†, other blocks 0)                                      rel <= 1e-12
 R1  one orbital leg conjugated (ψ_Y → ψ_Y*) fails G1
 G9  keeping G = 0 in v(G) adds exactly the rank-one term
     (w_s/N_k) M v₀ ζ̃*(0)ζ̃(0) M† δρ                                     rel <= 1e-12
@@ -198,6 +200,19 @@ def run_checks(mesh):
     K_tdgw = K_both[rows][:, :, :, rows]
     out["G10 bridge seam == exporter seam (Ha)"] = _rel(
         d_seam, 0.5 * np.einsum("knmKNM,KNM->knm", K_tdgw, x[0]))
+    # G10b: the bridge's TDA mode is TDGW's TDA kernel semantics: ΔΣ_cv = ½ K_{cv,c'v'} δρ_{c'v'},
+    # ΔΣ_vc = ΔΣ_cv†, all other blocks 0 (the first NB // 2 window bands are valence).
+    nv = NB // 2
+    cs, vs = slice(nv, NB), slice(0, nv)
+    with arm():
+        seam_tda = make_tdgw_dsigma(build_td_agw_apply(mesh, model), model, mesh, rows,
+                                    tda_n_val=nv)
+        d_tda = seam_tda(x[0])
+    y_cv = 0.5 * np.einsum("kcvKCV,KCV->kcv", K_tdgw[:, cs, vs][:, :, :, :, cs, vs], x[0][:, cs, vs])
+    ref_tda = np.zeros_like(x[0])
+    ref_tda[:, cs, vs] = y_cv
+    ref_tda[:, vs, cs] = np.conj(np.swapaxes(y_cv, -1, -2))
+    out["G10b bridge TDA seam == TDGW TDA semantics"] = _rel(d_tda, ref_tda)
 
     # Red twins: each must FAIL the checker of the gate it shadows.
     twins = {}
