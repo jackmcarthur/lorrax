@@ -89,7 +89,13 @@ directions carry $W-V=V\chi^{\mu}V$ with weight $\lambda_i\lambda_j$ and the
 
 What a file can hold: ε⁻¹ − 1 has rank at most $N_\mu$ per q, range in the
 columns of $vZ$ and co-range in those of $Z$; outside them ε⁻¹ = 1. That is
-the ISDF ansatz (E1), not a property of the export.
+the ISDF ansatz (E1), not a property of the export: for pair densities of the
+fitted band window, $\rho_{ij}\approx\sum_\mu\zeta_\mu C_{ij,\mu}$, matrix
+elements of the written ε⁻¹ are LORRAX's own; for any other pair the file is
+LORRAX's screening projected onto span ζ. On CrI3 6×6 that span has 638–640
+directions per q: V's remaining eigenvalues sit at $|\lambda|\le4\times10^{-6}$
+against $\lambda_{\max}\approx3\times10^{9}$, the null space of the
+rank-truncated ζ, eight decades below the kept $\lambda_{\min}\approx500$.
 
 ## 3. Restriction to BerkeleyGW's G list
 
