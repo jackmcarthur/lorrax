@@ -262,31 +262,27 @@ eigenvector tile) and stores $\langle 0|\hat r_\alpha|S\rangle$ as
 `exciton_data/dipoles`, shape (1, N, 3, 2), in bohr. Flag rules:
 [drivers](../drivers.md#bse-bsebse_jax).
 
-### Circular polarization (σ±) {#helicity}
+In-plane helicity: `--helicity-table` adds each written state's circular
+strengths to `bse.out` (`absorption_common.inplane_helicity`, the one place
+the convention lives). σ+ is the field $E(t) = E_0(\cos\omega t, \sin\omega t,
+0) = \mathrm{Re}[E_0\varepsilon_+ e^{-i\omega t}]$ with
+$\varepsilon_\pm = (\hat x \pm i\hat y)/\sqrt2$: it rotates x → y,
+counter-clockwise seen from +z. Absorption into $|S\rangle$ goes as
+$|\langle S|\varepsilon\cdot\hat r|0\rangle|^2 = |\varepsilon\cdot D^*|^2$ with
+$D = \langle 0|\hat r|S\rangle$, so
 
-The helicity convention of the per-state dipoles. σ+ is the in-plane field
-$\mathbf E(t) = E_0(\cos\omega t, \sin\omega t, 0)$: it turns from x to y,
-counter-clockwise seen from +z, and carries angular momentum $+\hbar$ along
-+z (parallel to the magnetization of a ferromagnet with $\mathbf M\parallel +z$);
-σ− is $E_0(\cos\omega t, -\sin\omega t, 0)$. With
-$D_\alpha = \langle 0|\hat r_\alpha|S\rangle$ the stored `exciton_data/dipoles`
-(Cartesian components, bohr), the circular strengths of state $S$ and its
-degree of circular polarization are
+$$I_\pm = \frac{|D_x \mp i D_y|^2}{2N_k},\qquad \eta = \frac{I_+ - I_-}{I_+ + I_-},$$
 
-$$I_\pm = \tfrac12\,\lvert D_x \mp i D_y\rvert^2,\qquad
-\eta = \frac{I_+ - I_-}{I_+ + I_-},\qquad
-I_+ + I_- = \lvert D_x\rvert^2 + \lvert D_y\rvert^2 ,$$
-
-because the absorbing ($e^{-i\omega t}$) part of $\mathbf E\cdot\hat{\mathbf r}$
-for σ+ is $\tfrac12E_0(\hat x + i\hat y)$ and
-$\langle S|\hat x + i\hat y|0\rangle = (D_x - iD_y)^*$. The global phase of the
-velocity form ($d = \langle c|\hat v|v\rangle/\Delta E$ omits the $-i$) drops
-out of $I_\pm$; conjugating $D$ would swap σ+ and σ−, which is why the
-contraction has one site (`absorption_common.exciton_dipole_projections`).
-$\lvert D\rvert^2$ of a normalized eigenvector grows as $N_k$, so a strength
-per unit cell is $I_\pm/N_k$. Within a degenerate multiplet only the multiplet
-sums of $I_\pm$ are basis independent. A TD-aGW σ± drive uses the same field
-([TD-aGW end to end](../how-to/td-agw-workflow.md#circular-drives)).
+per unit cell in bohr² (an exciton normalized over $N_k$ points has
+$|D|^2 \propto N_k$). The stored dipoles are $D$ times the global $-i$ of the
+velocity form ($d = \langle c|\hat v|v\rangle/\Delta E = i\langle c|\hat r|v\rangle$)
+on the native and the `bse_k_grid` routes alike, which no modulus sees; the
+conjugated spelling $\langle S|\hat r|0\rangle$ would swap $I_+$ and $I_-$. On a
+C3-symmetric toy the transitions into $p_\pm = (p_x \pm i p_y)/\sqrt2$ come out
+pure σ± ($\langle L_z\rangle = \pm1$), and the two routes agree to 1e-14 at
+shared k (`tests/test_bse_helicity_cpu.py`). Within a degenerate multiplet only
+the multiplet sums of $I_\pm$ are basis independent. A TD-aGW σ± drive uses the
+same field ([TD-aGW end to end](../how-to/td-agw-workflow.md#circular-drives)).
 
 ## Outputs
 
