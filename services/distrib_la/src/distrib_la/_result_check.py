@@ -246,9 +246,75 @@ def refusal_message(op, n, dtype, site, attempts, *errors):
             f"and no retry repaired it; result set to NaN")
 
 
-def _flag(status):
-    """Whether a replicated check status ``(failed, errors)`` failed (every rank reads the same bytes)."""
-    return bool(np.any(np.asarray(jax.device_get(status[0].addressable_data(0)))))
+#: Host reads of check statuses: ``id(array) -> (array, bit)`` for a failure flag
+#: (``status[0]``) and for a notice bit (keyed by its error table ``status[1]``, which
+#: several tables of one program share no flag with).  The array is held so its id
+#: cannot be reused while the entry lives.
+_FAILED: dict = {}
+_NOTICE: dict = {}
+
+
+def _memo(table, array):
+    hit = table.get(id(array))
+    return None if hit is None or hit[0] is not array else hit[1]
+
+
+def _remember(table, array, bit):
+    if len(table) > 64:
+        table.clear()
+    table[id(array)] = (array, bit)
+
+
+def _word_program(tol):
+    """``[failed, notice]`` of a status on the device: one int32 pair, one host read.
+
+    ``notice`` is exactly :func:`_notices`' print condition: some matrix's first
+    attempt neither all-NaN nor within ``tol`` (its loop stops at the first such row).
+    """
+    @jax.jit
+    def word(failed, errors):
+        first = errors.reshape(-1, *errors.shape[-2:])[:, 0]
+        shown = ~jnp.all(jnp.isnan(first), axis=-1) & ~jnp.all(first <= tol, axis=-1)
+        return jnp.stack([jnp.any(failed), jnp.any(shown)]).astype(jnp.int32)
+    return word
+
+
+_WORDS: dict = {}
+
+
+def _status(status, n=None, dtype=None):
+    """``(failed, notice)`` of a replicated status, each read at most once per array.
+
+    ``notice`` is None without ``(n, dtype)``, off rank 0 (nothing prints there) or
+    for a host table.  With them, rank 0 reads both bits in one transfer.
+    """
+    failed, notice = _memo(_FAILED, status[0]), None
+    want = n is not None and jax.process_index() == 0 and not isinstance(status[1], np.ndarray)
+    if want:
+        notice = _memo(_NOTICE, status[1])
+    if (failed is not None) and (notice is not None or not want):
+        return failed, notice
+    if want:
+        tol = float(accept(int(n), dtype))
+        program = _WORDS.get(tol) or _WORDS.setdefault(tol, _word_program(tol))
+        # On this process's replica only: rank 0 alone runs it, so it must not be a
+        # multi-process program (INVARIANTS 21); the status is replicated.
+        word = np.asarray(program(status[0].addressable_data(0), status[1].addressable_data(0)))
+        failed, notice = bool(word[0]), bool(word[1])
+        _remember(_NOTICE, status[1], notice)
+    else:
+        failed = bool(np.any(np.asarray(jax.device_get(status[0].addressable_data(0)))))
+    _remember(_FAILED, status[0], failed)
+    return failed, notice
+
+
+def _flag(status, n=None, dtype=None):
+    """Whether a replicated check status ``(failed, errors)`` failed (every rank reads the same bytes).
+
+    With ``(n, dtype)`` rank 0 reads the notice bit in the same transfer, so the
+    :func:`_notices` that follows reads the error table only when it will print.
+    """
+    return _status(status, n, dtype)[0]
 
 
 def _notices(status, op, n, dtype, site, *, final):
@@ -261,6 +327,8 @@ def _notices(status, op, n, dtype, site, *, final):
     """
     if jax.process_index() != 0:
         return
+    if _status(status, n, dtype)[1] is False:
+        return                                    # no attempt to name: the table stays on the device
     errors = status[1]
     errors = np.asarray(errors if isinstance(errors, np.ndarray) else jax.device_get(errors.addressable_data(0)))
     tol = accept(n, dtype)

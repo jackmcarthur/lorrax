@@ -1170,6 +1170,7 @@ def _receipt(stage, census, bank_io):
 
 
 def _finish_receipt(receipt, meta, header, started):
+    _resolve_reciprocity(receipt)
     receipt["seconds"]["total"] = time.monotonic()-started
     receipt["bank_complete"] = bool(header["complete"])
     receipt["capacity"] = meta.shared_pole_capacity.receipt()
@@ -1516,11 +1517,26 @@ def _reciprocity_census(receipt, value, z_batch, q_full, parent, meta):
     rows = [i for i, z in enumerate(points) if z.real == 0.0]
     if not rows:
         return
-    scalars = np.asarray(_reciprocity_scalars(value))
-    receipt.setdefault("reciprocity_real_supports", []).extend(
-        dict(q_parent=int(parent), q_full=int(q_full),
-             u_ry=float(points[i].imag), defect=float(scalars[i]))
-        for i in rows)
+    # The defect stays on the device until the receipt is finished: nothing on the
+    # host decides on it, so one stacked read serves every recorded support
+    # (_finish_receipt), not one read per sample and parent.
+    receipt.setdefault("_reciprocity_pending", []).append(
+        (_reciprocity_scalars(value), [(dict(q_parent=int(parent), q_full=int(q_full),
+                                             u_ry=float(points[i].imag)), i) for i in rows]))
+
+
+def _resolve_reciprocity(receipt):
+    """The pending reciprocity defects as receipt rows, read back in one transfer."""
+    pending = receipt.pop("_reciprocity_pending", None)
+    if not pending:
+        return
+    import jax.numpy as jnp
+    flat = np.asarray(jnp.concatenate([jnp.ravel(values) for values, _ in pending]))
+    rows, offset = receipt.setdefault("reciprocity_real_supports", []), 0
+    for values, entries in pending:
+        for entry, i in entries:
+            rows.append(dict(entry, defect=float(flat[offset + i])))
+        offset += int(np.prod(values.shape))
 
 
 @lru_cache(maxsize=8)
