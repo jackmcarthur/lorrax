@@ -152,7 +152,7 @@ from distrib_la.resolve import (
 )
 
 from ._batch_reshard import batch_layout, is_batch_layout, local_batch
-from ._result_check import checked_program, checked_shapes
+from ._result_check import checked_program, checked_shapes, native_eigh_jacobi
 from distrib_la.local_eigh import eigh_local, eigh_route, COMPLEX_EIGH_ROUTE
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
@@ -165,7 +165,7 @@ __all__ = [
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
     # plan
-    "Plan", "plan", "StackRoute", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes",
+    "Plan", "plan", "StackRoute", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
     # native dense workspace queries (no allocation)
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local", "eigh_stack_bytes",
     # polar / SVD

@@ -1051,7 +1051,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     gated=all(bool(jnp.all(diagnostics[name][:real])) for name in ('gram_valid','retained_metric_positive'))
     if not gated and 'eigh_finite' in diagnostics and not bool(jnp.all(diagnostics['eigh_finite'][:real])):
         from types import SimpleNamespace
-        from distrib_la._result_check import native_eigh_jacobi
+        from distrib_la import native_eigh_jacobi
         import warnings
         warnings.warn("shared-pole CT round: local eigh returned non-finite eigenpairs; re-solved the round by Jacobi",
                       RuntimeWarning, stacklevel=1)

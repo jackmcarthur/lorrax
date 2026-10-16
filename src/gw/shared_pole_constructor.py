@@ -336,7 +336,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # and this read, so the peak is the round's own); every other round is untouched.
                 finite = round_reduction.get("ritz_eigh_finite")
                 if execution != 'face' and finite is not None and not all(bool(v) for v in finite[:real]):
-                    from distrib_la._result_check import native_eigh_jacobi
+                    from distrib_la import native_eigh_jacobi
                     bad = [ids[i] for i in range(real) if not bool(finite[i])]
                     import warnings
                     warnings.warn(f"shared-pole round: local eigh returned non-finite eigenpairs at q={bad}; "
