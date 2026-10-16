@@ -22,3 +22,27 @@ def tile_units(per_unit_bytes: float, n_units: int, *, floor: int = 1) -> int:
     n_units = int(n_units)
     fit = int(TILE_BYTES // max(float(per_unit_bytes), 1.0))
     return max(min(int(floor), n_units), min(n_units, fit))
+
+
+def tile_plan(per_unit_bytes: float, n_units: int) -> tuple[int, tuple[int, ...]]:
+    """``(width, starts)``: equal-width tiles covering ``n_units`` units.
+
+    ``width`` is :func:`tile_units` evened out, so the fewest tiles that fit
+    :data:`TILE_BYTES` cover the axis with the least overlap:
+    ``n = ceil(n_units / fit)``, ``width = ceil(n_units / n)``.  ``starts``
+    are ``j·width`` for ``j < n``, with the last clamped to
+    ``n_units − width``, so every tile has the same width and one compiled
+    program serves all of them; no tile runs past the end and no pad unit is
+    ever introduced.  A unit inside the overlap is computed twice by the same
+    program from the same operands and written twice with the same value.
+    """
+    n_units = int(n_units)
+    if n_units < 1:
+        raise ValueError(
+            f"GATE tile_plan_extent: got: n_units={n_units}; want: >= 1; "
+            f"why: an empty axis has no tile")
+    fit = tile_units(per_unit_bytes, n_units)
+    n_tiles = -(-n_units // fit)
+    width = -(-n_units // n_tiles)
+    starts = tuple(min(j * width, n_units - width) for j in range(n_tiles))
+    return width, starts
