@@ -240,6 +240,11 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     # k-box mode 6, the ISDF route-G pair convolution (cpp/kdft/kbox_plane_ffi.cc, the port of the
     # mathdx plane mode): ffi.fft._ROCM_PAIR_TARGETS.
     "lorrax_kdft_kconv_plane": "KDftKconvPlaneFfi",
+    # k-box mode 1, the ISDF parent-load pair convolution (cpp/kdft/kbox_parent_ffi.cc, the port of the
+    # mathdx parent mode), and mode 10, the route-G plane FFT with gather-on-load
+    # (cpp/kdft/plane_gather_ffi.cc, the port of the mathdx kPlaneSrc): ffi.fft._ROCM_PAIR_TARGETS.
+    "lorrax_kdft_kconv_parent": "KDftKconvParentFfi",
+    "lorrax_kdft_plane_fft_gather": "KDftPlaneFftGatherFfi",
     # The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc), called by
     # distrib_la.local_eigh (BATCHED_EIGH_ROUTE); CUDA uses jaxlib's cuSOLVER for it.
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
