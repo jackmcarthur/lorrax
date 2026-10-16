@@ -264,6 +264,7 @@ def bootstrap(*, platform: str = "gpu") -> None:
     fallback_to_cpu_if_no_gpu_backend()
     init_mpi_before_device_collectives()
     install_failfast_excepthook()
+    install_ordered_exit()
     pin_matmul_precision()
     # Every sharding is explicit, so a legacy ``with mesh:`` would only add its
     # mesh to every program's key and re-trace held programs: JAX refuses one.
@@ -357,6 +358,34 @@ def pin_matmul_precision() -> str:
     jax = _import_jax()
     jax.config.update("jax_default_matmul_precision", precision)
     return precision
+
+
+def install_ordered_exit() -> None:
+    """At P > 1, make :func:`finalize_process` the end of the process for EVERY entry point.
+
+    A CLI that ends with ``sys.exit(main())``, ``raise SystemExit(...)`` or by
+    falling off the end used to reach interpreter teardown, where a non-main
+    Python thread still inside jaxlib aborted the process (rc 134 on every
+    rank after a successful run, Frontier 2026-10-16;
+    :mod:`runtime.ordered_exit` has the measurement and what is not known).
+    :mod:`runtime.ordered_exit` hooks the start of interpreter shutdown: exit
+    status 0 runs :func:`finalize_process` (ordered, collective teardown, then
+    ``os._exit(0)``); a nonzero status exits with it at once, without collective
+    teardown, as :func:`run_main_and_finalize` does.  Drivers that call
+    :func:`run_main_and_finalize` end before the hook runs; nothing changes
+    for them.  No-op at P = 1.  Idempotent.  Standard library only.
+    """
+    if _resolve_proc_count() <= 1:
+        return
+    from . import ordered_exit
+    state = ordered_exit.install(finalize_process)
+    if state["installed"]:
+        debug_print("[runtime] ordered process end armed: interpreter shutdown runs "
+                    "finalize_process (status 0) or exits with the status (nonzero).")
+    elif state["reason"]:
+        rank0_print(f"[runtime] WARNING: ordered process end NOT armed ({state['reason']}); "
+                    "an entry point that does not call run_main_and_finalize ends by "
+                    "interpreter teardown.")
 
 
 def install_failfast_excepthook() -> None:
@@ -2343,6 +2372,10 @@ def debug_print(*a, **k):
 _print_rank0 = rank0_print
 
 
+#: Set by the first :func:`finalize_process` call (it never returns normally).
+_FINALIZE_STARTED = False
+
+
 def finalize_process(rc: int = 0):
     """End the process by EXPLICIT, ORDERED finalization.  Does not return.
 
@@ -2386,6 +2419,12 @@ def finalize_process(rc: int = 0):
     import atexit
     import sys
 
+    global _FINALIZE_STARTED
+    if _FINALIZE_STARTED:
+        # Re-entered (an atexit duty or the ordered-exit hook reaching it
+        # again): the first call owns the teardown and ends the process.
+        return
+    _FINALIZE_STARTED = True
     try:
         import jax
         try:
