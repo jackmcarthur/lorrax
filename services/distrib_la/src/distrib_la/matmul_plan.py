@@ -33,7 +33,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax import shard_map
 from distrib_la.matmul import MATMUL_BACKEND_CHOICES, _mesh_shape, _zeros
 from distrib_la.resolve import mesh_platform
-from distrib_la._active_local import active_local_route
+from distrib_la._active_local import active_local_guard, active_local_route
 
 __all__ = ["GemmPlan", "gemm_plan", "local_gemm_plan"]
 
@@ -421,7 +421,8 @@ def _local_plan(mesh: Mesh, *, m, k, n, nq, dtype, alpha, beta,
             from distrib_la._active_local_cuda import (active_local_cuda,
                                                        require_active_local_cuda)
             require_active_local_cuda(platform)
-            active_impl = active_local_cuda
+            active_impl = (active_local_cuda if active_local_guard(platform) == "cond" else
+                           partial(active_local_cuda, guard=active_local_guard(platform)))
         else:
             from distrib_la._active_local import local_active_impl
             active_impl = local_active_impl(mesh_platform(mesh))

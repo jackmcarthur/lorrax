@@ -1,8 +1,8 @@
 """The native active-range local GEMM (``lorrax_cublas_local_*``) against the XLA routes on the
 same device.
 
-``distrib_la._active_local.ACTIVE_LOCAL_ROUTE`` sends CUDA and ROCM to the native handler, one
-leg-neutral source (``src/ffi/cpp/cublas/local_active_gemm_ffi.cc`` over ``common/gpu_blas.h``:
+The native handler (``ACTIVE_LOCAL_ROUTE``'s CUDA row; built and gated on ROCM, whose row is
+``masked``) is one leg-neutral source (``src/ffi/cpp/cublas/local_active_gemm_ffi.cc`` over ``common/gpu_blas.h``:
 cuBLAS / rocBLAS strided-batched GEMMs on pointer views of the original buffers).  Gate
 (``ffi.common.families`` row ``cublas_local``, tol 1e-13 relative to max|reference|):
 
@@ -104,7 +104,7 @@ def raw_cases(platform):
     nat.require_prepared_active_local_cuda(platform)
     dev = jax.local_devices()[0]
     put = lambda x: jax.device_put(jnp.asarray(x), dev)
-    out = {}
+    out, loud = {}, {}
     cases = [(name, (NQ, M, K, N), dt, bd) for name, bd in BOUNDS.items()
              for dt in (np.complex128, np.float64)]
     rng0 = np.random.default_rng(11)
@@ -122,8 +122,20 @@ def raw_cases(platform):
             A, B, W, C, BD = (put(x) for x in (a, b, w, c, bounds))
             wa = jax.jit(lambda A, W: A * W[:, None, :])(A, W)       # the arm's weighted A
             got = {}
-            got["arm"] = jax.jit(lambda A, B, BD, W, C: nat.active_local_cuda(
-                A, B, BD, W, C if beta != 0 else None, alpha=alpha, beta=beta))(A, B, BD, W, C)
+            for guard in ("cond", "select"):
+                got[f"arm_{guard}"] = jax.jit(lambda A, B, BD, W, C: nat.active_local_cuda(
+                    A, B, BD, W, C if beta != 0 else None, alpha=alpha, beta=beta,
+                    guard=guard))(A, B, BD, W, C)
+            # "full": exact on finite inactive storage; on NaN storage, loud (NaN), never wrong
+            A0, W0 = put(a0), put(w0)
+            got["arm_full"] = jax.jit(lambda A, B, BD, W, C: nat.active_local_cuda(
+                A, B, BD, W, C if beta != 0 else None, alpha=alpha, beta=beta,
+                guard="full"))(A0, put(b0), BD, W0, C)
+            pf = np.asarray(jax.jit(lambda A, B, BD, W, C: nat.active_local_cuda(
+                A, B, BD, W, C if beta != 0 else None, alpha=alpha, beta=beta,
+                guard="full"))(A, B, BD, W, C))
+            ok = np.isnan(pf) | (np.abs(pf - ref) <= TOL * max(np.abs(ref).max(), 1.0))
+            loud[tag] = bool(ok.all())
             got["masked"] = jax.jit(lambda A, B, BD, W, C: masked_local_matmul(
                 A, B, BD, W, C, alpha=alpha, beta=beta))(A, B, BD, W, C)
             got["interval"] = jax.jit(lambda A, B, BD, W, C: active_local_matmul(
@@ -148,10 +160,20 @@ def raw_cases(platform):
     A, B, W = (put(x) for x in (a, b, w))
     inval = {}
     for bad in ([-1, 4], [6, 3], [0, K + 1]):
-        BD = put(np.array([bad] * NQ, np.int32))
+        BD = np.array([bad] * NQ, np.int32)
+        BD[1] = (2, 9)                                            # one valid row: still all-NaN
+        BD = put(BD)
+        for guard in ("cond", "select"):
+            g = np.asarray(jax.jit(lambda A, B, BD, W: nat.active_local_cuda(
+                A, B, BD, W, alpha=np.complex128(1), beta=np.complex128(0),
+                guard=guard))(A, B, BD, W))
+            inval[f"arm_{guard}{bad}"] = bool(np.all(np.isnan(g)))
         g = np.asarray(jax.jit(lambda A, B, BD, W: nat.active_local_cuda(
-            A, B, BD, W, alpha=np.complex128(1), beta=np.complex128(0)))(A, B, BD, W))
-        inval[f"arm{bad}"] = bool(np.all(np.isnan(g)))
+            A, B, BD, W, alpha=np.complex128(1), beta=np.complex128(0),
+            guard="full"))(A, B, BD, W))
+        inval[f"arm_full{bad}"] = bool(np.all(np.isnan(g)))
+    for tag, v in loud.items():
+        inval[f"full_poisoned_is_nan_or_exact {tag}"] = v
     try:
         BD = put(np.array([[6, 3]] * NQ, np.int32))
         np.asarray(jax.jit(lambda A, B, BD: nat._native_out(A, B, BD, alpha=np.complex128(1)))(A, B, BD))
@@ -212,29 +234,40 @@ def timing(platform, reps=64, rounds=5):
     dev = jax.local_devices()[0]
     out = {}
     one = np.complex128(1.0)
-    for name, (nq, m, k, n) in FE_SHAPES.items():
+    shapes = dict(FE_SHAPES)
+    shapes.update({f"{k2}_distinct": v for k2, v in FE_SHAPES.items()})
+    for name, (nq, m, k, n) in shapes.items():
         rng = np.random.default_rng(3)
         a, b, w, c = _operands(rng, nq, m, k, n, np.complex128)
         bounds = _fe_bounds(rng, nq, k)
+        if name.endswith("_distinct"):          # every parent its own interval: nq BLAS calls
+            lo = rng.integers(0, k // 2, nq)
+            bounds = np.stack([lo, np.minimum(k, lo + rng.integers(1, k // 2, nq))], 1).astype(np.int32)
         pairs = bounds.astype(np.int64).reshape(-1)
         A, B, W, C, BD = (jax.device_put(jnp.asarray(x), dev) for x in (a, b, w, c, bounds))
         small = np.complex128(1e-3)
 
-        def chain(step):
+        def chain(step, ew=0):
             def f(A, B, BD, W, C):
                 for _ in range(reps):                      # unrolled: no device loop trips
                     # a barrier per step: fresh operand values, so XLA cannot CSE the dots
                     A, B, BD, W, C = jax.lax.optimization_barrier((A, B, BD, W, C))
                     C = step(A, B, BD, W, C)
+                    for _ in range(ew):                    # small unfusable kernels between calls
+                        C = jax.lax.optimization_barrier(C * (1 + 1e-12) + 1e-30)
                 return C
             return jax.jit(f)
-        fns = {
-            "native": chain(lambda A, B, BD, W, C: nat._native(A, B, BD, C, alpha=small, beta=one)),
-            "prepared": chain(lambda A, B, BD, W, C: nat._prepared_native(
-                A, B, C, active_bounds=pairs, alpha=small, beta=one)),
-            "masked": chain(lambda A, B, BD, W, C: masked_local_matmul(
-                A, B, BD, W, C, alpha=small, beta=one)),
-        }
+        nat_step = lambda A, B, BD, W, C: nat._native(A, B, BD, C, alpha=small, beta=one)
+        prep_step = lambda A, B, BD, W, C: nat._prepared_native(
+            A, B, C, active_bounds=pairs, alpha=small, beta=one)
+        mask_step = lambda A, B, BD, W, C: masked_local_matmul(A, B, BD, W, C, alpha=small, beta=one)
+        arm_step = lambda A, B, BD, W, C: nat.active_local_cuda(A, B, BD, W, C, alpha=small, beta=one)
+        fns = {"native": chain(nat_step), "prepared": chain(prep_step), "masked": chain(mask_step),
+               "arm": chain(arm_step),
+               "arm_select": chain(lambda A, B, BD, W, C: nat.active_local_cuda(
+                   A, B, BD, W, C, alpha=small, beta=one, guard="select")),
+               "native+8ew": chain(nat_step, 8), "prepared+8ew": chain(prep_step, 8),
+               "masked+8ew": chain(mask_step, 8)}
         for label, f in fns.items():
             f(A, B, BD, W, C).block_until_ready()
             best = []
@@ -254,12 +287,11 @@ def main() -> int:
     import jax
     jax.config.update("jax_enable_x64", True)
     from ffi.gate import mesh_ffi_platform
-    from distrib_la._active_local import active_local_route
     mesh = stack.mesh
     platform = mesh_ffi_platform(mesh)
     r = jax.process_index()
-    if platform not in ("ROCM", "CUDA") or active_local_route(platform) != "native":
-        print(f"SKIP: needs a device mesh with a native row, got {platform}", flush=True)
+    if platform not in ("ROCM", "CUDA"):
+        print(f"SKIP: needs a device mesh, got {platform}", flush=True)
         runtime.finalize_process(0)
         return 0
     bad = 0
@@ -292,11 +324,31 @@ def main() -> int:
 
 # ---- pytest: the rows (CPU) -------------------------------------------------------------
 
-def test_native_row_on_both_device_legs():
+def test_rows():
     pytest.importorskip("jax")
-    from distrib_la._active_local import ACTIVE_LOCAL_ROUTE, active_local_route
-    assert ACTIVE_LOCAL_ROUTE["CUDA"] == ACTIVE_LOCAL_ROUTE["ROCM"] == "native"
+    from distrib_la._active_local import (ACTIVE_LOCAL_GUARD, ACTIVE_LOCAL_ROUTE,
+                                          active_local_guard, active_local_route)
+    assert ACTIVE_LOCAL_ROUTE["CUDA"] == "native" and ACTIVE_LOCAL_ROUTE["ROCM"] == "masked"
     assert active_local_route("cpu") == "interval"
+    assert ACTIVE_LOCAL_GUARD == {"CUDA": "cond", "ROCM": "select"}
+    assert active_local_guard("tpu") == "cond"
+
+
+def test_select_guard_lowers_with_no_device_control_flow():
+    """The ROCM guard's point: the arm lowers with no cond (CUDA's keeps its two)."""
+    jax = pytest.importorskip("jax")
+    import jax.numpy as jnp
+    from distrib_la import _active_local_cuda as nat
+    jax.config.update("jax_enable_x64", True)
+    rng = np.random.default_rng(2)
+    a, b, w, _ = _operands(rng, NQ, M, K, N, np.complex128)
+    args = (jnp.asarray(a), jnp.asarray(b), jnp.asarray(BOUNDS["mixed"]), jnp.asarray(w))
+    one, zero = np.complex128(1), np.complex128(0)
+    def text(guard):
+        return jax.jit(lambda *x: nat.active_local_cuda(*x, alpha=one, beta=zero, guard=guard)
+                       ).lower(*args).as_text()
+    assert "stablehlo.case" not in text("select") and "stablehlo.while" not in text("select")
+    assert text("cond").count("stablehlo.case") == 2
 
 
 def test_targets_in_both_rocm_tables_and_the_family_row():

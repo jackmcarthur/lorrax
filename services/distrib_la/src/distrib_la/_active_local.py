@@ -28,16 +28,42 @@ import jax.numpy as jnp
 #: rocBLAS on ROCM); ``"interval"``: :func:`active_local_matmul`; ``"masked"``:
 #: :func:`masked_local_matmul`.  A vendor with no row takes ``"interval"``.  Both
 #: XLA routes stay as the references the native route is gated against
-#: (tests/test_active_local_native_gate.py, same device).  ROCM was ``"masked"``
-#: (the interval route's ~64 x (3-6) while/cond trips per call cost ~36 us each on
-#: MI250X); the masked route's ``where`` selects then cost ~3.2 s per Fe Sigma tau
-#: run, more than its GEMMs, which the pointer-view handler does not spend.
-ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "native"}
+#: (tests/test_active_local_native_gate.py, same device).  ROCM: ``"masked"`` --
+#: the interval route's ~64 x (3-6) while/cond trips per call cost ~36 us each on
+#: MI250X; the native handler is built and gated on ROCM, but its per-call host read
+#: of the bounds drains the stream inside Sigma's tau loop (6 calls per trip), which
+#: on MI250X exposes the trip's host launch latency, ~1.1 ms per read: Fe Sigma tau
+#: 13.3-13.7 s native vs 9.1 s masked (P=4; isolated, the read costs ~16 us and the
+#: native call is 2.3x faster than masked).  A ROCM native row needs device-side
+#: bounds; see ``ACTIVE_LOCAL_GUARD``'s ``"full"``.
+ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "masked"}
+
+
+#: How the native arm (``_active_local_cuda.active_local_cuda``) guards invalid and full
+#: bounds, by leg key.  ``"cond"``: two ``lax.cond`` (invalid -> NaN without a native call,
+#: full -> XLA's dense dot), the CUDA arm as measured on A100 (CUDA graphs keep a cond on
+#: the device).  ``"select"``: no device control flow -- invalid rows are sanitized to an
+#: empty interval, the native call always runs, and ``where`` puts NaN on an invalid
+#: result.  ROCM: HIP graphs have no conditional node, so each cond is a host round trip
+#: (Fe Sigma tau 13.5 s cond vs 13.3 s select on the native row).  ``"full"``: no host
+#: read at all -- the prepared target over the whole storage axis with the weights
+#: zeroed outside [lo, hi) (NaN everywhere for invalid bounds).  Exact when inactive
+#: storage is finite (the added terms are exact zeros); NON-finite inactive storage gives
+#: NaN in that row (loud, never a wrong finite value) instead of being ignored, so it
+#: changes the contract and is no leg's default (owner decision).  Fe P=4 (MI250X, one
+#: node) Sigma tau other: native + "full" 7.83 s, masked 9.14 s, native + "select" 13.28 s
+#: (A100 native: 7.54 s); eqp within 2e-8 eV of the masked reference.
+ACTIVE_LOCAL_GUARD = {"CUDA": "cond", "ROCM": "select"}
 
 
 def active_local_route(platform):
     """The active-range route for an FFI platform key (``resolve.mesh_platform``)."""
     return ACTIVE_LOCAL_ROUTE.get(platform, "interval")
+
+
+def active_local_guard(platform):
+    """The native arm's guard for an FFI platform key (``"cond"`` | ``"select"``)."""
+    return ACTIVE_LOCAL_GUARD.get(platform, "cond")
 
 
 def masked_local_matmul(a, b, bounds, weights, c=None, *, alpha, beta):

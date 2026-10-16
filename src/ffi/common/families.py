@@ -95,7 +95,9 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         note="Sigma's active-range GEMM: one leg-neutral source (cublas/local_active_gemm_ffi.cc "
              "over common/gpu_blas.h), cuBLAS on CUDA, rocBLAS on ROCM (the mapped "
              "librocblas.so.5).  Pointer views into the original buffers; the bounds metadata "
-             "is read to the host per call (masked and interval stay as the XLA references)."),
+             "is read to the host per call.  ROCM's ACTIVE_LOCAL_ROUTE row stays 'masked': that "
+             "per-call read drains the stream in Sigma's tau loop (Fe Sigma tau 13.3 s vs 9.1 s); "
+             "masked and interval stay as the XLA references."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",
         _legs(("built", ""), ("xla", "distrib_la.subspace XlaSubspacePlan (SUBSPACE_ROUTE)"),
