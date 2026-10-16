@@ -57,6 +57,24 @@ _WINDOW_COMPILED = {}
 # and rematerialization is off for every program (runtime.disable_xla_rematerialization).
 WINDOW_OVERLAP = {"xla_gpu_enable_latency_hiding_scheduler": True}
 
+#: Whether the Σ window pairs two τ nodes per trip, by ``lxkit`` leg key (no row:
+#: one node per trip, the plain schedule).  The pairing pays only where one node's
+#: W exchange can run beside the other's compute, i.e. with asynchronous collectives.
+#: CUDA: on, the LHS lane's measurement above (async collectives on; not re-measured
+#: since).  ROCM: off.  XLA async collectives are disabled on that leg
+#: (``lxkit.LEGS`` ROCM ``xla_flag_defaults``, the RCCL cross-communicator deadlock),
+#: so nothing overlaps: Fe V2 P=4 (pool logs stageprof_ab_on / stageprof_ab_off,
+#: 2026-10-16) Σ τ windows 9.60 -> 8.63 s and the compiled window 1.08 -> 0.93 GB
+#: with one node per trip, 0.0 ms of RCCL time beside compute, eqp identical.
+WINDOW_PAIRING = {"CUDA": True, "ROCM": False}
+
+
+def window_pairing(mesh) -> bool:
+    """The leg's :data:`WINDOW_PAIRING` row for ``mesh``'s devices (False without one)."""
+    from lxkit import device_vendor, leg_for_vendor
+    leg = leg_for_vendor(device_vendor(mesh.devices.flat[0]))
+    return bool(WINDOW_PAIRING.get(None if leg is None else leg.key, False))
+
 
 @lru_cache(maxsize=16)
 def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian,

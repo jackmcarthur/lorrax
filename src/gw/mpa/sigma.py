@@ -1387,13 +1387,16 @@ def _integrate_sigma_batches(
                            w_synthesis.q_wedge.wedge_key(),
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
             # The Green kconv call's tables, placed once per run and plan: a window argument.
-            # Two nodes per loop trip (gw.ppm_accumulators.WINDOW_OVERLAP): one
-            # node's W exchange runs beside the other's k-convolutions, when
-            # the paired window fits (SynthesisTau.fits, at the first compile).
+            # Two nodes per loop trip (gw.ppm_accumulators.WINDOW_OVERLAP) on a leg
+            # whose WINDOW_PAIRING row says so: one node's W exchange runs beside the
+            # other's k-convolutions, when the paired window fits (SynthesisTau.fits,
+            # at the first compile).
+            from gw.ppm_accumulators import window_pairing
             tau_kernel = SynthesisTau(
                 scalar_spatial, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
                 "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,),
-                kconv_tables=sigma_kconv_tables(mesh_xy, k_unfold_plan), overlap=True)
+                kconv_tables=sigma_kconv_tables(mesh_xy, k_unfold_plan),
+                overlap=window_pairing(mesh_xy))
         else:
             tau_kernel = get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
