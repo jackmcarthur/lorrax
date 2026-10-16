@@ -229,6 +229,10 @@ def test_the_frontier_site_rule_sets_scratch(tmp_path):
 def test_the_profiler_gate_refuses_rocprofv3_above_one_process(monkeypatch):
     import runtime
     monkeypatch.setenv("JAX_PLATFORMS", "rocm,cpu")
+    # The world size is the first of runtime's launcher variables that is set; inside an
+    # srun step the step's own variables would answer, so clear them all first.
+    for name in runtime._WORLD_SIZE_ENVS:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("SLURM_NTASKS", "4")
     env = {"LD_PRELOAD": "/x/librocprofiler-sdk-tool.so"}
     with pytest.raises(RuntimeError, match="GATE profiler.*rocprofv3"):

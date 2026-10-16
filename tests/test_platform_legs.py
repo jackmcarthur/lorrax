@@ -179,6 +179,10 @@ def test_both_loaders_derive_the_same_leg_specs():
 def test_the_rocm_leg_is_declared_and_refused_by_its_file_name(monkeypatch):
     ffi_loader, dl = _loaders()
     monkeypatch.delenv("LORRAX_FFI_ROCM_SO", raising=False)
+    monkeypatch.delenv("LORRAX_FFI_HOST_SO", raising=False)
+    # A ROCm library an earlier in-process test loaded must not answer for the missing file.
+    monkeypatch.delitem(ffi_loader._LIBS, "ROCM", raising=False)
+    monkeypatch.delitem(dl._LIBS, "ROCM", raising=False)
     with pytest.raises(ffi_loader.FfiLibraryNotBuilt, match="liblorrax_ffi_rocm.so"):
         ffi_loader.get_lib("ROCM")
     with pytest.raises(dl.LibraryNotBuilt, match="liblorrax_ffi_rocm.so"):
