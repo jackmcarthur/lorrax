@@ -206,9 +206,22 @@ there in this form ([SlabIO](slab_io.md#api)):
 - `read_multi`: N requests in one `PhdfReadMulti` dispatch, with no Python host
   sync. Fe constructor host syncs went 836 → 292 and `sample_batch_read`
   2.80–2.87 → 2.12–2.16 s (slabmr/w8).
-- The phdf5 handlers copy their small control vectors to the host with one D2H
-  and an `xla_stream` sync per call (`phdf5/platform_seam.h`
-  `copy_index_to_host`, both device legs).
+- Handler ABI 8 (slabmr/w8): `read`, `read_multi`, `write` and the k-chunk union
+  reader take **no control operand**.
+  - SlabIO posts each call's control values keyed by the address of the call's
+    own buffer: the donated, aliased destination for a read, the operand for a
+    write. The handler takes them by that address, so the match does not depend
+    on order. A missing or unaliased post refuses (`GATE phdf5_posted_control`).
+  - The ordering the old copy-in's host sync gave comes from a device-side order
+    fence. The dispatch records an event on `xla_stream`, and the I/O stream
+    waits on it before the task is queued.
+  - The per-call control copy-in (one D2H plus an `xla_stream` sync; 3 per
+    read/write call and 1 per `read_multi` at ABI 6) is gone.
+  - The file-order pieces compute their slice starts in the program from a
+    device counter.
+  - Fe V2 P=4, rank 0: SlabIO control placements went 1100 → 108 per run
+    (constructor 662 → 4), and SlabIO-attributed H2D 12 / 2 / 3 → 1 / 0 / 0
+    (slabmr w8b, w8d).
 - The ≥ 1 GiB-file read heartbeat polls `is_ready()` on its own thread and never
   waits on the caller.
 
