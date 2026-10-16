@@ -17,6 +17,7 @@ bands, [exciton bands](../how-to/htransform-and-exciton-bands.md#7-exciton-bands
 | `isdf_tensors_<N_mu>.h5`, in the run directory or its `tmp/` | `gw.gw_jax` with `write_restart_tensors = true` (the default) | parent ψ faces at the centroids, `enk_full` (Ry), `V_qmunu`, `W0_qmunu` and its `W0_ready` flag, the head vector `G0_mu_nu`, `vhead`/`whead`; on a static-Dyson W0, the dressed long-range channels `W0_lr` |
 | `WFN.h5` and the centroid table named in the deck | QE → pw2bgw; `centroid.kmeans_cli` | authentication of the bundle, and the static-screening rebuild |
 | `eqp1.dat` (`--eqp`, optional) | `gw.gw_jax` | diagonal QP energies on the wedge, unfolded through the symmetry service |
+| `qp_wfn_rotations.h5` (`--qp-rotations`, optional; exclusive with `--eqp`) | `gw.gw_jax` (`file_io.qp_wfn.write_qp_rotations_h5`) | the GW run's $H_{QP} = U\,\mathrm{diag}(E_{QP})\,U^\dagger$ on its Σ window, unfolded to the full BZ by `restart_bundle.read_qp_rotations_artifact`: the BSE runs in its eigenbasis ([QP-rotated basis](#the-qp-rotated-basis)) |
 | `dipole.h5` (`--dipole`) | `psp.get_dipole_mtxels` | velocity matrix elements and `band_energies` for absorption and per-state dipoles; under `bse_k_grid`, the deck (coarse) WFN's file, which the densifier carries to the fine grid |
 | `dipole_qsgw.h5` (`--dipole`) | a QSGW run with a velocity head ([QSGW dipoles](../self_consistency.md#qsgw-dipoles)) | the same layout: $U^\dagger v\,U$ with the head's velocity $v$ (`qsgw_head.qp_velocity`) and `band_energies` = $E_{QP}$; stamped `basis = qp` and, when the run writes `WFN_qp.h5`, bound to that WFN's fingerprint. It pairs only with a restart built from `WFN_qp.h5` |
 
@@ -36,6 +37,37 @@ $v\times v'$ and $c\times c'$ pair densities
 (`bse_window.assert_bse_window_in_zeta_training`). $n_c$ and $n_v$ are padded to
 the mesh with zero ψ and a signed ε sentinel (`PAD_EPS_GUARD_RY`), so pad
 states decouple.
+
+### The QP-rotated basis
+
+`--qp-rotations` (`bse.bse_qp_rotation`, native grid only) solves the BSE in the
+eigenbasis of the GW run's effective Hamiltonian on its Σ window $[q_0, q_1)$,
+$H_{QP}(k) = U(k)\,\mathrm{diag}(E_{QP}(k))\,U(k)^\dagger$ with
+$U_{mn}(k) = \langle m_\mathrm{DFT}k | n_\mathrm{QP}k\rangle$. The centroid states are
+
+$$\psi'_{nk}(\mu) = \sum_{m=q_0}^{q_1-1} \psi_{mk}(\mu)\,U_{mn}(k),$$
+
+over the complete block, which must lie in both ζ-fit legs; ε are $E_{QP}$; V and
+W0 are reused, because they live in the centroid basis. `--n-val`/`--n-cond`
+count QP states of the ascending $E_{QP}$ ladder, and the degeneracy guard runs on
+that ladder. A QP state of the window may be dominated by a DFT band outside the
+DFT-index window of the same counts; the log prints that leakage,
+$\max_{k,n}\,(1 - \sum_{m\in[lo,hi)} |U_{mn}|^2)$, and the cross-gap mixing
+$\theta = \max_k \lVert U_{VC}\rVert_F$.
+
+The artifact unfolds a wedge-stored $U$ as $U(gp) = U(p)$ for unitary $g$ and
+$U(p)^*$ for antiunitary $g$ (`symmetry_maps.star_broadcast`, `ibz_slab`). That
+is the restart's gauge only if its ψ obeys $\psi_{gp} = g\,\psi_p$, so the loader
+certifies it on the restart's own ψ: the centroid band matrices of 1 and of
+$\sigma_z$, $S_{k,mn} = \sum_{\mu,s} \sigma_s\,\psi^*_{mks}(\mu)\,\psi_{nks}(\mu)$,
+must equal $S_p$ or $S_p^*$ by the same rule to $10^{-10}$, and the artifact's own
+$H_{QP}(k)$ likewise; the log prints the opposite rule's residual as the check's
+sensitivity.
+
+The diagonal of a one-shot $H_{QP}$ is $\Sigma$ at $E_\mathrm{DFT}$ without the
+linearization factor $Z$ (`eqp0.dat`), not `eqp1.dat`; the like-for-like
+diagonal control of a rotated run is `--eqp eqp0.dat`, and the rotated minus
+that control is the off-diagonal $\Sigma - v_{xc}$ alone.
 
 ## The screened interaction W(ω = 0)
 
@@ -272,6 +304,25 @@ On MoS₂ 9×9→12×12 (DFT fH) the window dipoles match the fine NSCF's own
 per k, 2 % max), and the ε₂ of the SR/LR densified BSE is 2.0 % rms of
 the direct 12×12 peak.
 
+Under `--qp-rotations` the dipoles come from the same `window_dipoles`, after
+the same k-grid and WFN-stamp checks, and the velocity is the
+interband-commutator QP velocity of
+[QP velocity §7](../theory/qp-velocity.md#7-the-heads-that-use-the-velocity),
+$v^{QP} \approx v^\mathrm{DFT} + [\Delta H, \mathcal W]$ with
+$\mathcal W_{mn} = v_{mn}/(E_m - E_n)$ on cross-gap pairs and zero within each
+class. Writing $v^\mathrm{DFT} = [E^\mathrm{DFT}, \mathcal W] + v^\mathrm{same}$, the
+QP-basis dipole $d = v^{QP}_{c'v'}/(E'_{c'} - E'_{v'})$ is exactly
+
+$$d_{c'v'} = \big(U_c^\dagger\,\mathcal W\,U_v\big)_{c'v'}
+ + \frac{\big(U_c^\dagger\,v^\mathrm{same}\,U_v\big)_{c'v'}}{E'_{c'} - E'_{v'}}
+\qquad(\texttt{bse\_qp\_rotation.qp\_window\_dipoles}).$$
+
+At $U = I$ the second term vanishes and the first is the `--eqp` dipole, bit for
+bit. It omits the explicit $\partial_k\Delta H$ of $D_k\Delta H$, an error first
+order in $\theta$; the pure DFT velocity $U^\dagger v^\mathrm{DFT}U/\Delta E'$ would
+also drop $[\Delta H, \mathcal W]$, which for a diagonal $\Delta H$ is the term
+that keeps $r^{QP} = r^\mathrm{DFT}$. The dipole must carry $-i[r, V_\mathrm{NL}]$.
+
 `absorption_haydock` always uses the TDA BSE kernel, D + V − W, and needs at
 least two devices. It seeds one Lanczos recursion per polarization; the three
 seeds are one trial block of the stack matvec. It does not reorthogonalize and
@@ -332,6 +383,9 @@ same field ([TD-aGW end to end](../how-to/td-agw-workflow.md#circular-drives)).
   $|\langle 0|\hat r|S\rangle|^2$, ε₂): each code fixes its own phase per
   $(c, v, k)$. The writer refuses to trim
   nonzero amplitude when the declared window is narrower than the solved one.
+  Under `--qp-rotations` the amplitudes are on QP states and `exciton_header`
+  carries `transition_basis = qp_rotations` and `qp_rotations_file`; `nv`/`nc`
+  then do not index `dipole.h5`.
 - `absorption_haydock.h5` (ε₂, ε₁, JDOS, α, β, norms; with `--no-eps1` the
   ε₁ dataset is ones) and one `absorption_haydock_<pol>_eh.dat` per
   polarization, `<pol>` = `b1`, `b2`, `b3`.
@@ -366,6 +420,14 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE densified_dipole_gap` | the same | a non-positive $E_c - E_v$ in the velocity's own energies |
 | `GATE densified_dipole_on_grid` | the same | the on-grid identities fail: a fine q list, band window or contraction that is not the htransform's |
 | `BseWindowOutsideZetaTrainingError` | `bse_window.assert_bse_window_in_zeta_training` | a window band outside the ζ fit legs |
+| `GATE bse_qp_rotation_block` | `bse_qp_rotation.load_qp_rotation` | a QP block $[q_0, q_1)$ outside the ζ fit legs or the stored bands: a sliced eigenvector matrix is not unitary |
+| `GATE bse_qp_window_outside_block` | `bse_qp_rotation.qp_window_from_artifact` | a window, or its occupied boundary, outside the QP block |
+| `GATE bse_qp_k_order` | `bse_qp_rotation.load_qp_rotation` | a symmetry-service full-BZ list that is not the BSE's C-order grid |
+| `GATE bse_qp_star_tables` | the same | a wedge-stored artifact whose unfold tables are not the WFN's |
+| `GATE bse_qp_star_gauge` | the same; `bse_qp_rotation.certify_star_gauge` | an artifact $H_{QP}(k)$, or a restart centroid band matrix of 1 or $\sigma_z$, that misses its (anti)unitary star image by more than $10^{-10}$ |
+| `GATE bse_qp_dipole_velocity` | `absorption_common.window_dipoles` | `--qp-rotations --dipole` with a momentum-only (`skip_vnl`) dipole |
+| `GATE bse_qp_rotations_k_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `--qp-rotations` with `bse_k_grid` |
+| two QP descriptions | `bse_jax.parse_args`, `file_io.qp_wfn.refuse_conflicting_qp_state_sources` | `--eqp` with `--qp-rotations`; a rotation on a QP WFN deck or on a restart from another WFN |
 | band-window degeneracy | `common.band_degeneracy.resolve_band_window` | a window edge inside a multiplet under `--band-degeneracy strict` |
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |
 | non-TDA reciprocity preflight | `bse_nontda.check_restart_reciprocity` | `--lanczos` without `--tda`, with W on: a restart whose W fails the q ↔ −q reciprocity check, before the dense build |
@@ -385,9 +447,10 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
   W_∞ − V is zero because the Ward contact is TT-only). An SC run keeps its
   resident CC model past Σ until the final-map persist.
 - The BSE reads ψ from the restart, which holds the deck WFN's states. `--eqp`
-  replaces energies only (`bse/bse_window.py:569`), so a QSGW BSE with QP ψ
-  needs a GW restart generated from `WFN_qp.h5`, with `dipole_qsgw.h5` as its
-  dipole. A `WFN_qp.h5` written before 2026-09-30 from a WFN that stores both
+  replaces energies only (`bse/bse_window.py:569`); `--qp-rotations` rotates ψ
+  into the QP basis on the native grid and refuses `bse_k_grid`, so a densified
+  BSE with QP ψ needs a GW restart generated from `WFN_qp.h5`, with
+  `dipole_qsgw.h5` as its dipole. A `WFN_qp.h5` written before 2026-09-30 from a WFN that stores both
   k and −k has broken rows; regenerate it
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
 - Full BSE through `--lanczos` is dense and stops at N = 4096

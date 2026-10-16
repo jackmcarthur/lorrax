@@ -145,7 +145,9 @@ def n_pad_transitions(data) -> int:
 def _generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:
     """Monkhorst-Pack style k-point grid in crystal coords [0, 1), C-order.
 
-    Returns ``(nk, 3)``.  Single consumer: ``write_eigenvectors_stream``.
+    Returns ``(nk, 3)``: the BSE's k-row order.  Consumers:
+    ``write_eigenvectors_stream`` and the QP-rotation frame check
+    (``bse_qp_rotation.load_qp_rotation``).
     """
     kpts = []
     for ix in range(nkx):
@@ -170,8 +172,13 @@ def write_eigenvectors_stream(
     n_write: int,
     use_tda: bool = True,
     dipoles: Optional[np.ndarray] = None,
+    qp_rotations_file: Optional[str] = None,
     dipole_attrs: Optional[dict] = None,
 ) -> None:
+    # ``qp_rotations_file``: the amplitudes are on QP-rotated states
+    # (``bse.bse_qp_rotation``); stamped as ``exciton_header`` attributes
+    # ``transition_basis = "qp_rotations"`` and the artifact's path.  Absent
+    # means the deck WFN's DFT bands, so ``nv``/``nc`` index ``dipole.h5``.
     # ── WHICH WINDOW DOES THIS FILE DESCRIBE? ─────────────────────────────
     # The LOGICAL one the loader RESOLVED (``data['n_val']``/``data['n_cond']``).
     # These become BGW's ``nv``/``nc`` header fields, and
@@ -353,6 +360,10 @@ def write_eigenvectors_stream(
         exciton_header = f.create_group("exciton_header")
         exciton_header.create_dataset("version", data=1)
         exciton_header.create_dataset("flavor", data=flavor)
+        if qp_rotations_file is not None:
+            exciton_header.attrs["transition_basis"] = "qp_rotations"
+            exciton_header.attrs["qp_rotations_file"] = os.path.abspath(
+                qp_rotations_file)
 
         params = exciton_header.create_group("params")
         params.create_dataset("bse_hamiltonian_size", data=bse_hamiltonian_size)

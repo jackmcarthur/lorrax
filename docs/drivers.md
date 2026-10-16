@@ -279,8 +279,8 @@ Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos --tda --bse ...` in the
 run directory. The mesh is the run's square startup mesh; `--px`/`--py` must
 be square and use every device. The CLI is strict: an unknown flag refuses,
 and so does a flag the chosen route (Lanczos, `--kpm-dos`, or the default
-FEAST) does not read — `--eqp`, `--n-eig`, `--n-occ` and the solver flags are
-Lanczos-only.
+FEAST) does not read — `--eqp`, `--qp-rotations`, `--n-eig`, `--n-occ` and the
+solver flags are Lanczos-only.
 
 | flag | default | meaning |
 |---|---|---|
@@ -295,6 +295,7 @@ Lanczos-only.
 | `--dipole FILE` | none | *Lanczos*, with `--write-eigs` and `--tda`: store each written state's dipole $\langle 0\lvert\hat r\rvert S\rangle$ from `FILE` (a `dipole.h5`) in `eigenvectors.h5`. Under `bse_k_grid`, `FILE` is the deck (coarse) WFN's, carried through the densifying htransform ([dipoles](architecture/bse.md#dipoles-and-absorption)); with `--eqp` the dipoles are the exact position of the fine QP states; `absorption_haydock --dipole` reads it the same way, and `python -m bse.dump_window_dipoles -i deck.in --n-val NV --n-cond NC [--n-occ N] --dipole FILE [--eqp EQP] [--full-window] --out d.h5 [--check-eigenvectors eigenvectors.h5 --check-key d_alpha_rq]` writes them (and the pre-fix `d_alpha_rq`) in the run's gauge for re-contracting a saved `eigenvectors.h5` |
 | `--helicity-table` | off | *Lanczos*, with `--dipole`: add each written state's in-plane circular strengths to `bse.out`, $I_\pm = \lvert D_x \mp i D_y\rvert^2/(2N_k)$ in bohr² per unit cell for $D = \langle 0\lvert\hat r\rvert S\rangle$, and $\eta = (I_+ - I_-)/(I_+ + I_-)$. σ+ is the field $E_0(\cos\omega t, \sin\omega t, 0)$: x → y, counter-clockwise seen from +z ([helicity](architecture/bse.md#dipoles-and-absorption)) |
 | `--eqp FILE` | none | *Lanczos*. Diagonal QP energies from the wedge `eqp1.dat`, unfolded through the symmetry service; the restart must be proved to come from the same unrotated WFN |
+| `--qp-rotations FILE` | none | *Lanczos*, native grid. Solve in the eigenbasis of the GW run's $H_{QP}$ from its `qp_wfn_rotations.h5`: rotated ψ at the centroids, $E_{QP}$, QP-basis dipoles; `--n-val`/`--n-cond` count QP states. Exclusive with `--eqp`; refuses `bse_k_grid` ([QP-rotated basis](architecture/bse.md#the-qp-rotated-basis)) |
 | `bse_k_grid` (deck) | `""` | fine grid "NX NY NZ", each axis at least the coarse extent |
 | `head_minibz_average` (deck) | false | read only under `bse_k_grid`: rebuilds the q = 0 exchange tile with the fine grid's mini-BZ head and takes the W head's Γ-cell reference from the analytic sphere ([LT head](theory/lt-exchange-head.md)); must match the GW run |
 

@@ -88,6 +88,14 @@ A new test needs no bootstrap import of its own.
   a band gauge and the zone size leave the per-cell table unchanged; the
   native and `bse_k_grid` routes give one table; `bse_jax` reads
   `--helicity-table` on the Lanczos route.
+- `test_bse_qp_rotation_cpu.py`: the QP-rotated BSE basis on toy inputs
+  (CPU, 2x2 host mesh): U = I gives the `--eqp` dipole bit for bit and a
+  permuted U does not, a cross-gap-free rotation rotates the position matrix
+  exactly, the dipole equals the interband-commutator velocity over the QP gap,
+  the star gauge refuses an unconjugated antiunitary row, the QP window guard
+  refuses a cut edge and a window outside the block; the QP route of
+  `window_dipoles` equals the DFT slice at U = I and refuses a `dipole.h5` on
+  another k grid, with another WFN's stamp or none, or with `skip_vnl`.
 - `test_w_pad_nyquist_cpu.py`: the W densifier's R zero-pad (CPU): an even
   coarse axis splits its Nyquist coefficient, so coarse tiles stay exact and
   every fine tile is Hermitian; the single-sided red twin is not.

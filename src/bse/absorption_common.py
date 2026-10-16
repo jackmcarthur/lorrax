@@ -415,16 +415,21 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
     ``bse_densify.densified_dipoles`` from ``dipole_file``, the coarse WFN's
     velocity, in the fine ψ gauge) and never slices a file: the coarse file
     has another k list, and a fine grid's ``dipole.h5`` has the right shape
-    in the wrong gauge.  Any other bundle slices ``dipole_file``
-    (:func:`slice_dipole_to_bse_window`) at ``n_occ`` over the loader's
-    resolved window, after ``file_io.dipole.require_dipole_k_grid`` and the
-    file's WFN stamp against ``wfn_path``
-    (``file_io.dipole.require_dipole_wfn_fingerprint``).
+    in the wrong gauge.  Any other bundle reads ``dipole_file``
+    after ``file_io.dipole.require_dipole_k_grid`` and the file's WFN stamp
+    against ``wfn_path`` (``file_io.dipole.require_dipole_wfn_fingerprint``),
+    then slices it (:func:`slice_dipole_to_bse_window`) at ``n_occ`` over the
+    loader's resolved window, or, on a ``--qp-rotations`` bundle
+    (``data["qp_rotation"]``), takes the QP-basis dipoles of
+    ``bse.bse_qp_rotation.qp_window_dipoles`` from the same checked file,
+    which must then hold the velocity p − i[r, V_NL] of H_DFT
+    (``GATE bse_qp_dipole_velocity``).
 
     Returns
     -------
     d_alpha : (3, nk, nc, nv) complex — ⟨ck|v̂_α|vk⟩ / ΔE (bohr).
-    de_cv   : (nk, nc, nv) float — the velocity's own E_c − E_v (Ry).
+    de_cv   : (nk, nc, nv) float — the velocity's own E_c − E_v (Ry); on the
+              QP route, E′_c − E′_v of the QP states.
     """
     import os
     if data.get("densified"):
@@ -450,8 +455,24 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
     require_dipole_wfn_fingerprint(attrs, dipole_path=dipole_file,
                                    wfn_path=wfn_path,
                                    want=_deck_wfn_fingerprint(wfn_path))
-    return slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ,
-                                      int(data["n_val"]), int(data["n_cond"]))
+    qp = data.get("qp_rotation")
+    if qp is None:
+        return slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ,
+                                          int(data["n_val"]),
+                                          int(data["n_cond"]))
+    # eq. (3) of bse.bse_qp_rotation: the cross-gap split v = [E, W] + v_same
+    # holds for the velocity of H_DFT, not for the momentum alone.
+    if bool(attrs.get("skip_vnl", False)):
+        raise ValueError(
+            f"GATE bse_qp_dipole_velocity: got {dipole_file} with skip_vnl = "
+            f"true (momentum only); want the velocity p - i[r, V_NL] of "
+            f"H_DFT; why: the QP dipole splits v into [E_DFT, W] and its "
+            f"same-class block; fix: rebuild it with "
+            f"python -m psp.get_dipole_mtxels -i <deck>.")
+    from .bse_qp_rotation import qp_window_dipoles
+    de_cv = (np.asarray(qp["eps_c"])[:, :, None]
+             - np.asarray(qp["eps_v"])[:, None, :])
+    return qp_window_dipoles(dipole_cart, deltaE, qp), de_cv
 
 
 def build_dipole_vector_bse(d_alpha, n_cond_pad=None, n_val_pad=None):

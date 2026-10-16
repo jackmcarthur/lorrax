@@ -67,6 +67,7 @@ def _preview_lanczos(
     max_lanczos_iter: int | None = None,
     include_W: bool = True,
     eqp_file: str | None = None,
+    qp_rotations_file: str | None = None,
     n_occ: int | None = None,
     block_size: int = 1,
     rtol: float = 0.0,
@@ -112,8 +113,10 @@ def _preview_lanczos(
             htransform_quality_record_fn=(
                 _htransform_quality_records.append),
             eqp_file=eqp_file,
+            qp_rotations_file=qp_rotations_file,
             velocity_file=dipole_file,
         )
+        qp_rotation = data.get("qp_rotation")
         grid_x, grid_y = mesh_xy.devices.shape
         # EQP override on enk_full (BGW eqp1.dat semantics).  A bse_k_grid
         # bundle took the QP energies inside its htransform; re-slicing the
@@ -138,6 +141,11 @@ def _preview_lanczos(
             report.htransform_quality(
                 receipt,
                 title="BSE-grid htransform interpolation quality")
+        if qp_rotation is not None:
+            from .bse_qp_rotation import report_lines
+            report.heading("QP-rotated basis")
+            for line in report_lines(qp_rotation):
+                report.emit(line)
     if stage_progress is not None:
         stage_progress.step()
     nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
@@ -224,9 +232,10 @@ def _preview_lanczos(
         if dipole_file is not None:
             # ⟨0|r̂_α|S⟩ per written state: the window dipoles Haydock seeds
             # from (``absorption_common.window_dipoles``: the dipole.h5 slice
-            # at the n_occ the loader and ``--eqp`` settled on, or a
-            # bse_k_grid bundle's own), contracted against the solve's
-            # distributed eigenvectors in state blocks (no gather).
+            # at the n_occ the loader and ``--eqp`` settled on, a bse_k_grid
+            # bundle's own, or a --qp-rotations bundle's QP-basis dipoles),
+            # contracted against the solve's distributed eigenvectors in state
+            # blocks (no gather).
             from file_io.restart_bundle import read_metadata
             from .absorption_common import (build_dipole_vector_bse,
                                             exciton_dipoles_distributed,
@@ -271,6 +280,8 @@ def _preview_lanczos(
                 n_write,
                 use_tda=tda,
                 dipoles=dipoles,
+                qp_rotations_file=(None if qp_rotation is None
+                                   else qp_rotation["path"]),
                 dipole_attrs=dipole_attrs,
             )
 
@@ -491,6 +502,12 @@ def build_parser():
     parser.add_argument("--kpm-emax-ev", type=float, default=None, help="Override KPM E_max (eV).")
     parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
     parser.add_argument("--eqp", type=str, default=None, help="Path to BGW eqp1.dat for QP corrections.")
+    parser.add_argument(
+        "--qp-rotations", default=None, metavar="QP_ROTATIONS_H5",
+        help="the GW run's qp_wfn_rotations.h5: solve in the eigenbasis of "
+             "its H_QP = U diag(E_QP) U^H (rotated psi at the centroids, "
+             "E_QP, rotated dipoles; bse.bse_qp_rotation).  --n-val/--n-cond "
+             "count QP states.  Mutually exclusive with --eqp.")
     parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
     return parser
 
@@ -522,7 +539,8 @@ _ROUTE_DESTS = {
         "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
         "davidson_m_max", "trlan_m_max", "trlan_n_keep", "eqp", "n_occ",
-        "band_degeneracy", "degeneracy_tol_ry", "dipole", "helicity_table"},
+        "band_degeneracy", "degeneracy_tol_ry", "dipole", "helicity_table",
+        "qp_rotations"},
 }
 
 
@@ -551,6 +569,11 @@ def parse_args(argv=None):
             f"that reads {'it' if len(ignored) == 1 else 'them'} (--lanczos "
             f"for the eigensolve with QP energies and eigenvectors, "
             f"--kpm-dos for the density of states, neither for FEAST)")
+    if args.eqp is not None and args.qp_rotations is not None:
+        parser.error("--eqp and --qp-rotations are two descriptions of the QP "
+                     "state: the first relabels DFT bands with diagonal QP "
+                     "energies, the second rotates them into the eigenbasis "
+                     "of H_QP; choose one")
     if args.dipole is not None and (args.write_eigs is None or not args.tda):
         parser.error("--dipole stores per-state dipoles beside the written "
                      "eigenvectors: it needs --write-eigs and --tda (the "
@@ -629,6 +652,11 @@ def main(argv=None) -> int:
                 f"checked every {int(args.lanczos_check_every)} iterations"
                 if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
             "Matvec route   : trial-stack (bse_stack_matvec)",
+            "Band basis     : " + (
+                "QP-rotated, eigenstates of the GW H_QP (--qp-rotations)"
+                if args.qp_rotations else
+                "DFT bands, diagonal QP energies (--eqp)" if args.eqp else
+                "DFT bands and energies"),
             f"Band boundary  : {args.band_degeneracy}; "
             f"tolerance={float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.5f} meV",
         ))
@@ -666,6 +694,7 @@ def main(argv=None) -> int:
             max_lanczos_iter=args.max_lanczos_iter,
             include_W=not (args.rpa or not args.bse),
             eqp_file=args.eqp,
+            qp_rotations_file=args.qp_rotations,
             n_occ=args.n_occ,
             block_size=args.block_size,
             rtol=args.lanczos_rtol,
@@ -693,8 +722,9 @@ def main(argv=None) -> int:
         if result["eigenvector_file"]:
             file_rows.append(("exciton eigenvectors", "written",
                               result["eigenvector_file"]))
-        if args.eqp:
-            file_rows.append(("QP corrections", "read", args.eqp))
+        file_rows += [(label, "read", path) for label, path in (
+            ("QP corrections", args.eqp), ("QP rotations", args.qp_rotations))
+            if path]
         file_rows.append(("input deck", "read", args.input))
         run.complete(files=file_rows)
     return 0
