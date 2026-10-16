@@ -229,8 +229,8 @@ d^\alpha_{cvq} = \frac{v^\alpha_{cv}(q)}{E_c(q) - E_v(q)} .$$
 
 Dipoles and ψ share $U_q$, so no map between two sets of states, and no
 gauge fit, exists, and no fine NSCF is needed. A fine WFN's own `dipole.h5`
-is in that loader's gauge, which matches the densified ψ only up to random
-per-(k, band) phases off the coarse grid; it refuses
+is in that loader's gauge, which differs from the densified ψ by the random
+per-(k, band) phases of an independent diagonalization; it refuses
 (`GATE velocity_wfn_fingerprint`). At every fine q that is a coarse k the
 fine window states span the coarse states at the window's positions in
 the fH's own energy order (QP under `--eqp`, which can move a band across
@@ -239,6 +239,10 @@ the coarse ones in them (`GATE densified_dipole_on_grid`); the
 log also gives each velocity image's outer-shell locality beside $f(H)$'s,
 the signature of a velocity in another gauge. Their accuracy is the
 densified ψ's: the guard bands and rank that converge ψ converge the dipoles.
+On MoS₂ 9×9→12×12 (DFT fH) the window dipoles match the fine NSCF's own
+`dipole.h5` to 6e-6 at shared k and to 0.8 % rms off them (Frobenius norm
+per k, 2 % max), and the ε₂ of the SR/LR densified BSE is 2.0 % rms of
+the direct 12×12 peak.
 
 `absorption_haydock` always uses the TDA BSE kernel, D + V − W, and needs at
 least two devices. It seeds one Lanczos recursion per polarization; the three
