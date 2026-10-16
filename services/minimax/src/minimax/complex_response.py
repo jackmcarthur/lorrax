@@ -140,13 +140,40 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
     # so a source may build the next one while this one is scanned.
     source = (host_pencils if pencil is None else pencil)(zps, size, columns, steps)
     try:
-        for (_, flatten), (_, step), (s, shift) in zip(_GEOMETRIES, steps, source):
+        for g, ((_, flatten), (_, step), (s, shift)) in enumerate(zip(_GEOMETRIES, steps, source)):
+            start = list(order)
             got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift)
+            if got is not None and pencil is not None and not _resolved(pencil, s, got[2]):
+                # The source cannot resolve the accepted count's smallest
+                # singular value: the geometry is decided on the reference
+                # pencil, rebuilt and scanned again from the same pole order.
+                # The accepted node set is then the reference's own (bitwise,
+                # when the source's earlier decisions match); a rejection
+                # there is the reference's, and the scan goes on.
+                order[:] = start
+                s, shift = next(host_pencils(zps, size, columns, steps[g:g+1]))
+                got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift)
             if got is not None:
-                return got
+                return got[:2]
     finally:
         source.close()
     return None
+
+
+#: A pencil source's acceptance stands when its declared singular-value error
+#: (``pencil.sigma_error``, in units of sigma_max) resolves the accepted count's
+#: smallest singular value to this relative accuracy; otherwise the reference
+#: decides that geometry. Fe V2 (device dilation, sigma_error 8 eps): the
+#: accepted counts' bounds are 2.5e-2 for group [0:22] (sigma_80/sigma_1 =
+#: 8.9e-15, nodes off by 4e-3) and <= 4.7e-5 for every other group (nodes
+#: within 3e-7 of the reference), pool logs rcgpu_ab4, rcgpu_ab6.
+_SOURCE_SIGMA_RTOL = 1e-3
+
+
+def _resolved(pencil, s, n):
+    """True when the source resolves sigma_n of its accepted count n (see _SOURCE_SIGMA_RTOL)."""
+    error = getattr(pencil, "sigma_error", None)
+    return error is not None and error*s[0] <= _SOURCE_SIGMA_RTOL*s[n - 1]
 
 
 #: (padding, flattening) of the proposal geometries, scanned in order.
@@ -203,7 +230,7 @@ def host_pencils(zps, size, columns, steps):
 
 
 def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift):
-    """Node counts n = 8, 12, ... of one geometry's pencil: ``(times, fits)`` or None."""
+    """Node counts n = 8, 12, ... of one geometry's pencil: ``(times, fits, n)`` or None."""
     best, best_n = np.inf, 0
     for n in range(8, len(shift) + 1, 4):
         roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
@@ -219,7 +246,7 @@ def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s
             continue
         fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate, order)
         if fits is not None:
-            return times, fits
+            return times, fits, n
         if mass_rejected:
             return None  # Try the next padding/flattening geometry, not more cancelling terms.
         if error < best/10:
@@ -329,8 +356,9 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     ``pencil`` is the source of each geometry's shift pencil (the contract of
     :func:`host_pencils`, the default). Only the pencil's arithmetic moves
     with it: every acceptance decision, tolerance and group stays here, on
-    the host. A source with other rounding gives rules equal to rounding,
-    not to the byte.
+    the host. A geometry that accepts on another source is rebuilt on
+    :func:`host_pencils` and scanned again, so an accepted node set is the
+    reference's own; only rejections are decided on the source's rounding.
     """
     return ResponseGroupTree(lo_ry, hi_ry, z_ry, rel_tol=rel_tol, previous=previous,
                              decay_rate=decay_rate, pencil=pencil).rules()

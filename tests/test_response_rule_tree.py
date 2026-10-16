@@ -152,3 +152,36 @@ def test_refusal_raised_only_where_reached(monkeypatch):
     monkeypatch.setattr(minimax.ResponseGroupTree, "_attempt", lambda self, m: None)
     with pytest.raises(ValueError, match="stand-in"):
         response_bank._gather_group_rules([list(range(len(z)))], tree)
+
+
+def _perturbed_pencils(zps, size, columns, steps):
+    """The reference pencils with 1e-12 relative noise: another source's rounding."""
+    from minimax import complex_response as cr
+    rng = np.random.default_rng(7)
+    for s, shift in cr.host_pencils(zps, size, columns, steps):
+        yield s*(1 + 1e-12*rng.standard_normal(s.shape)), shift*(1 + 1e-12*rng.standard_normal(shift.shape))
+
+
+def test_accepted_geometry_is_decided_on_the_reference_pencil():
+    """A pencil source with other rounding: an accepted node set is the reference's bytes."""
+    import file_io  # noqa: F401  (service path bootstrap)
+    import minimax
+
+    z = _samples(12.0, 4)
+    _same(minimax.response_group_rules(LO, HI, z, pencil=_perturbed_pencils),
+          minimax.response_group_rules(LO, HI, z))
+
+
+
+def test_resolved_acceptance_stands_on_the_source():
+    """A source that declares it resolves its counts keeps its own acceptance (same counts)."""
+    import functools
+    import file_io  # noqa: F401  (service path bootstrap)
+    import minimax
+
+    z = _samples(12.0, 4)
+    resolved = functools.partial(_perturbed_pencils)
+    resolved.sigma_error = 0.
+    ours, ref = minimax.response_group_rules(LO, HI, z, pencil=resolved), minimax.response_group_rules(LO, HI, z)
+    assert [r["count"] for r in ours] == [r["count"] for r in ref]
+    assert any(np.asarray(a["t"]).tobytes() != np.asarray(b["t"]).tobytes() for a, b in zip(ours, ref))
