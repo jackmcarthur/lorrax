@@ -150,7 +150,18 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
         w = phases.astype(A.dtype)                  # (nk, n)
         A = A * w[:, None, :]
     # (nk, n, mu*s) P(_,'x','y')
-    B = green_right_operand(psi_nmu) if right is None else right
+    # The active-range local GEMM reads conj(psi_nmu) as it loads B (conj_b): no conjugated
+    # copy of the whole face per call.  At Fe P4 that copy was 149 MB per tau node, 0.32 ms of
+    # the W(tau) synthesis (528 ms of 6.43 s Sigma GPU time; syn lane 2026-10-16).
+    conj_on_load = (right is None and band_range is not None and not face
+                    and prepared_active_gemm is None
+                    and jnp.issubdtype(psi_nmu.dtype, jnp.complexfloating))
+    if right is not None:
+        B = right
+    elif conj_on_load:
+        B = merge_spin_centroid(psi_nmu, 2, 3)
+    else:
+        B = green_right_operand(psi_nmu)
     # Eager operations may erase singleton mesh axes before the GEMM boundary.
     from jax import lax
     in_sharding_a = getattr(gemm, "in_sharding_a", None)
@@ -176,7 +187,8 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
         G_flat = face_green_product(A, B, gemm.mesh, phases, band_range, n_full=n_full)
     else:
         G_flat = (gemm(A, B) if band_range is None
-                  else gemm.active_range(A, B, *band_range, weights=phases))
+                  else gemm.active_range(A, B, *band_range, weights=phases,
+                                         conj_b=conj_on_load))
     # (nk, mu*s, nu*s), distributed over both centroid axes.  The merged
     # endpoint order is centroid-major (``mu*ns + s``, merge_spin_centroid's
     # own collective-free direction), so the split is a pure reshape: the
