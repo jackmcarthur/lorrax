@@ -5,8 +5,8 @@
 per rank do not fit it (``common.gpu_utils.admit_local``, memory-model.md#routes),
 so the size route takes ``one_device`` only where ONE whole matrix's priced
 program (``distrib_la._one_device.one_device_bytes``) fits that room; otherwise
-the leg's library runs.  Without a room the route is unchanged; a leg without a
-size row (CUDA) is unchanged.  The ROCM leg is stood in for on a CPU mesh.
+the leg's library runs.  Without a room the route is unchanged; on CUDA (no size
+row) the room is the bound.  The ROCM leg is stood in for on a CPU mesh.
 
 Run with ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4``.
 """
@@ -71,8 +71,12 @@ def test_plan_passes_its_budget_to_the_size_route(mesh, rocm):
     assert note.endswith("-> slate (one whole matrix over the room)")
 
 
-def test_room_leaves_cuda_unchanged(mesh, monkeypatch):
+def test_room_is_the_cuda_bound(mesh, monkeypatch):
+    """CUDA has no size row: without a room it keeps cuSOLVERMp; a room that holds one whole
+    matrix is its one_device bound (resolve.ONE_DEVICE_BY_ROOM)."""
     monkeypatch.setattr(resolve_mod, "mesh_platform", lambda m: "CUDA")
-    for room in (None, 0, 1 << 40):
+    monkeypatch.setattr(od, "mesh_platform", lambda m: "CUDA")
+    for room in (None, 0):
         with pytest.raises((RuntimeError, ValueError), match="cusolvermp"):
             resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64, room=room)
+    assert resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64, room=1 << 40) == "one_device"

@@ -442,6 +442,178 @@ def _gathered_eigh(A, *, mesh):
 #: that says what to call instead.  ``tests/test_distrib_la_shape_algebra``
 #: cross-checks the flag against each wrapper's own return annotation, so
 #: the declaration cannot quietly disagree with the code.
+#: The measured-cost decisions of the ``distributed`` size route, one per call signature:
+#: rounds of the one_device program, 0 for the leg library, None for one_device's own round
+#: rule where no library resolves on this host (nothing to compare against).
+_MEASURED: dict = {}
+#: Library plans of :meth:`Plan._library_plan`, one per (op, mesh, n, route, library).
+_LIBRARY_PLANS: dict = {}
+
+
+def _program_bytes(fn, abstract) -> int | None:
+    """Per-device bytes a compiled program allocates beside its arguments: XLA's
+    ``memory_analysis`` temp + output, less the outputs aliased to arguments.  None where the
+    backend reports no analysis."""
+    stats = jax.jit(fn).lower(*abstract).compile().memory_analysis()
+    if stats is None:
+        return None
+    return (int(stats.temp_size_in_bytes) + int(stats.output_size_in_bytes)
+            - int(getattr(stats, "alias_size_in_bytes", 0) or 0))
+
+
+def _library_bytes(p, abstract, single: bool) -> int | None:
+    """The leg library program's compiled per-device bytes on these operands, or None where no
+    library resolves on this host."""
+    try:
+        lib = p._library_plan()
+    except (RuntimeError, ValueError):
+        return None
+    return _program_bytes((lambda *o: lib(*o)) if single else (lambda *o: lib.batched(*o)), abstract)
+
+
+_LIBRARY_BYTES_DEFAULT = _library_bytes
+
+
+def _round_candidates(nb: int, ranks: int) -> list:
+    """Rounds tried in order: 1, then doubling, up to one matrix per rank per round."""
+    last = max(1, -(-int(nb) // int(ranks)))
+    out, r = [1], 2
+    while r < last:
+        out.append(r)
+        r *= 2
+    if last > 1:
+        out.append(last)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _measured_code_hash() -> str:
+    """The distrib_la sources the measured programs are built from (and the jax build): a cached
+    cost is reused only by the same code."""
+    import hashlib
+    import os
+    import jaxlib
+    h = hashlib.sha256(f"{jax.__version__}/{jaxlib.__version__}".encode())
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in sorted(os.listdir(here)):
+        if name.endswith(".py"):
+            with open(os.path.join(here, name), "rb") as f:
+                h.update(name.encode() + f.read())
+    return h.hexdigest()[:16]
+
+
+def _measured_cache_path() -> str:
+    import os
+    from lxkit import user_cache_dir
+    return os.path.join(str(user_cache_dir("distrib_la")), "measured_cost.json")
+
+
+def _measured_cache_get(key: str):
+    import json
+    try:
+        with open(_measured_cache_path()) as f:
+            return json.load(f).get(key)
+    except (OSError, ValueError):
+        return None
+
+
+def _measured_cache_put(key: str, value) -> None:
+    """Atomic read-modify-replace; every rank writes the same figures (a shape rule)."""
+    import json
+    import os
+    path = _measured_cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path) as f:
+                table = json.load(f)
+        except (OSError, ValueError):
+            table = {}
+        table[key] = value
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(table, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _measured_rounds(p, A, args, single: bool = False):
+    """The measured-cost decision of a ``distributed`` plan's ``one_device`` route for one call
+    signature (owner rule 2026-10-16: no stage's per-rank device peak may go up).
+
+    Compiles, from abstract operands in the caller's face layout, the leg library's program and
+    the ``one_device`` program at each candidate round count (:func:`_round_candidates`; one
+    matrix: a single round), and prices each by XLA's ``memory_analysis`` (temp + output per
+    device; the caller's operands are common to both).  Returns the fewest rounds whose bytes
+    are within the library's and within the plan's room, 0 (the library) where none is, None
+    (one_device's own round rule) where no library resolves on this host.  A direct cost
+    comparison of the two programs, the same on every rank (shapes only, no exchange).  The
+    COSTS are cached per signature in this process and on disk (keyed by the signature, the
+    mesh, the device kind, the jax build and the distrib_la sources), so a warm run compiles
+    nothing to decide; the room is applied at lookup.  Each decision is a route-ledger line
+    (:func:`distrib_la.new_stack_routes`).  Vendor workspaces that a library or jaxlib kernel
+    allocates at run time are outside both analyses."""
+    import json
+    from distrib_la import resolve as _resolve
+    dtypes = (A.dtype,) + tuple(x.dtype for x in args)
+    shapes = (tuple(int(s) for s in A.shape),) + tuple(tuple(int(s) for s in x.shape) for x in args)
+    key = (p.op, _resolve.mesh_key(p.mesh), shapes, tuple(str(d) for d in dtypes), p.budget_bytes,
+           p.requested_batched_route, bool(single))
+    if key in _MEASURED:
+        return _MEASURED[key]
+    platform = _resolve.mesh_platform(p.mesh)
+    library = _resolve._DISTRIBUTED_DEFAULT.get((p.op, platform))
+    ranks = int(p.mesh.shape["x"]) * int(p.mesh.shape["y"])
+    candidates = [1] if single else _round_candidates(shapes[0][0], ranks)
+    devices = p.mesh.devices.flat
+    kind = str(getattr(next(iter(devices)), "device_kind", ""))
+    disk_key = json.dumps([p.op, shapes, [str(d) for d in dtypes],
+                           [int(p.mesh.shape["x"]), int(p.mesh.shape["y"])], platform, kind,
+                           library, p.requested_batched_route, bool(single),
+                           _measured_code_hash()])
+    cached = _measured_cache_get(disk_key)
+    source = "cached"
+    if cached is not None and _library_bytes is _LIBRARY_BYTES_DEFAULT:
+        lib = cached["library"]
+        costs = {int(r): c for r, c in cached["rounds"].items()}
+    else:
+        source = "compiled"
+        spec = P("x", "y") if single else P(None, "x", "y")
+        face = NamedSharding(p.mesh, spec)
+        abstract = tuple(jax.ShapeDtypeStruct(s, d, sharding=face) for s, d in zip(shapes, dtypes))
+        lib = _library_bytes(p, abstract, single)
+        costs = {}
+        if lib is not None:
+            for r in candidates:
+                fn = ((lambda *o: p(*o, _rounds=1)) if single
+                      else (lambda *o, _r=r: p.batched(*o, _rounds=_r)))
+                costs[r] = _program_bytes(fn, abstract)
+            if _library_bytes is _LIBRARY_BYTES_DEFAULT:
+                _measured_cache_put(disk_key, {"library": lib,
+                                               "rounds": {str(r): c for r, c in costs.items()}})
+    if lib is None:
+        chosen = None
+    else:
+        fits = [r for r in candidates if costs.get(r) is not None and costs[r] <= lib
+                and (p.budget_bytes is None or costs[r] <= int(p.budget_bytes))]
+        chosen = fits[0] if fits else 0
+    _MEASURED[key] = chosen
+    gb = lambda b: "n/a" if b is None else f"{b / 1e9:.4f}"
+    tried = ", ".join(f"{r}: {gb(c)}" for r, c in costs.items())
+    verdict = ("one_device's own rounds (no library on this host)" if chosen is None else
+               library if chosen == 0 else f"one_device in {chosen} round(s)")
+    line = (f"{p.op} 'distributed' {'x'.join(map(str, shapes[0]))} on the "
+            f"{int(p.mesh.shape['x'])}x{int(p.mesh.shape['y'])} {platform} mesh: measured "
+            f"({source}) per-rank GB, {library} {gb(lib)} vs one_device by rounds {{{tried}}}"
+            f"{'' if p.budget_bytes is None else f' (room {int(p.budget_bytes) / 1e9:.2f} GB)'}"
+            f" -> {verdict}")
+    _resolve._SIZE_DECISIONS.setdefault(("measured",) + key, line)
+    _resolve.announce_once(("distrib_la.plan", "measured", key),
+                           f"  [distrib_la.plan] {line}", scope="rank0")
+    return chosen
+
+
 _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("eigh", "cusolvermp"):     dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
@@ -830,7 +1002,24 @@ class Plan:
             "; stacks " + "; ".join(stacks) if stacks else "")
 
     # ---- calling -------------------------------------------------------
-    def _entry(self, key: str):
+    def _measured_applies(self) -> bool:
+        """A plan the size route resolved from ``distributed`` to ``one_device``: each call
+        shape is decided by measured cost (:func:`_measured_rounds`)."""
+        return (self.backend == ONE_DEVICE
+                and str(self.requested).strip().lower() == "distributed")
+
+    def _library_plan(self):
+        """The leg library plan ``distributed`` names on this mesh (built once)."""
+        from distrib_la import resolve as _resolve
+        library = _resolve._DISTRIBUTED_DEFAULT[(self.op, _resolve.mesh_platform(self.mesh))]
+        key = (self.op, _resolve.mesh_key(self.mesh), self.n, self.requested_batched_route, library)
+        lib = _LIBRARY_PLANS.get(key)
+        if lib is None:
+            lib = _LIBRARY_PLANS[key] = plan(self.op, self.mesh, backend=library, n=self.n,
+                                             batched_route=self.requested_batched_route)
+        return lib
+
+    def _entry(self, key: str, rounds: int | None = None):
         """The backend's ``one`` or ``many`` call and its result normaliser.
 
         An FFI eigh or LU solve comes back checked (:mod:`distrib_la._result_check`,
@@ -842,6 +1031,16 @@ class Plan:
         spec = _IMPL[(self.op, self.backend)]
         name = spec[key]
         call = None if name is None else getattr(self.module, name)
+        if call is not None and self.backend == ONE_DEVICE:
+            # The bound that plans the rounds: the leg row, or on a room leg the room this
+            # plan was resolved against (resolve.one_device_max_n), so both agree.
+            import functools
+            from distrib_la import resolve as _resolve
+            call = functools.partial(call, max_n=_resolve.one_device_max_n(
+                self.op, _resolve.mesh_platform(self.mesh), self.budget_bytes))
+            if rounds is not None and key == "many":
+                # The measured-cost size route's rounds (_measured_rounds).
+                call = functools.partial(call, rounds=int(rounds))
         if call is None or self.op not in ("eigh", "solve_lu"):
             return call, spec["post"]
         if self.op == "solve_lu":
@@ -947,7 +1146,7 @@ class Plan:
                            (X,), n=A.shape[-1], dtype=A.dtype)
         return safe
 
-    def __call__(self, A, *args, **kwargs):
+    def __call__(self, A, *args, _rounds: int | None = None, **kwargs):
         """Run the op on ONE tile (no batch axis).
 
         ``A`` (and any further matrix operands, e.g. ``solve_lu``'s RHS)
@@ -967,6 +1166,9 @@ class Plan:
                     f"isdf/core), not a single call.  Branch on "
                     f"plan.is_native and run it there.")
             return fn(A, *args, **kwargs)
+        if (_rounds is None and self.op == "eigh" and self._measured_applies()
+                and _measured_rounds(self, A, args, True) == 0):
+            return self._library_plan()(A, *args, **kwargs)
         one, post = self._entry("one")
         if one is None:
             raise NotImplementedError(
@@ -982,7 +1184,8 @@ class Plan:
         out = one(*ops, mesh=self.mesh, **kwargs)
         return post(self.backend, *out) if post is not None else out
 
-    def batched(self, A, *args, _route: str | None = None, **kwargs):
+    def batched(self, A, *args, _route: str | None = None, _rounds: int | None = None,
+                **kwargs):
         """Run the op on a STACK ``(nb, n, n)`` — uniform across backends.
 
         The same call for every backend, whatever the library underneath
@@ -1033,10 +1236,17 @@ class Plan:
                     f"{ROUTE_BATCH_RESHARD!r}.")
             return self(A, *args, **kwargs)
 
+        rounds = None
+        if route == ROUTE_BACKEND_BATCHED and self._measured_applies():
+            # The measured-cost size route: the one_device program in the fewest rounds whose
+            # compiled per-rank bytes are within the library's (and the room), else the library.
+            rounds = _rounds if _rounds is not None else _measured_rounds(self, A, args)
+            if rounds == 0:
+                return self._library_plan().batched(A, *args, **kwargs)
         ops = tuple(ensure_sharding(x, self.batch_in_sharding)
                     for x in (A, *args))
         if route == ROUTE_BACKEND_BATCHED:
-            many, post = self._entry("many")
+            many, post = self._entry("many", rounds=rounds)
             if many is None:
                 raise NotImplementedError(
                     f"{self.op} backend {self.backend!r} has no stacked FFI "
@@ -1280,4 +1490,4 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
                 in_sharding=tile, batch_in_sharding=stack,
                 requested_batched_route=batched_route,
                 budget_bytes=budget_bytes, capacity_refusal=capacity_refusal,
-                size_route=size_route_note(op, backend, mesh_xy, n, resolved))
+                size_route=size_route_note(op, backend, mesh_xy, n, resolved, budget_bytes))

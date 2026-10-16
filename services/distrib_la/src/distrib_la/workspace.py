@@ -323,8 +323,9 @@ def eigh_stack_bytes(plan, shape, dtype) -> int:
     if plan.backend == ONE_DEVICE:
         # Whole matrices per rank, in the route's bounded rounds.
         from distrib_la._one_device import held_per_rank
-        from distrib_la.resolve import one_device_max_n
-        bound = one_device_max_n("eigh", mesh_platform(plan.mesh)) or n
+        from distrib_la import resolve as _resolve
+        bound = _resolve.one_device_max_n("eigh", _resolve.mesh_platform(plan.mesh),
+                                          plan.budget_bytes) or n
         return held_per_rank(nb, n, ranks, bound) * BATCH_EIGH_TILES * n * n * item
     return (-(-nb * n * n * item // ranks) + nb * n * 8
             + workspace_bytes_per_rank(plan, 'eigh', ((n, n),), dtype))

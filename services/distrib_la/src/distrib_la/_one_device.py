@@ -101,7 +101,8 @@ def _ranks(mesh: Mesh) -> int:
 
 
 def batched_distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
-                             block_size=None, side=None, max_n: int | None = None):
+                             block_size=None, side=None, max_n: int | None = None,
+                             rounds: int | None = None):
     """Eigh of a face stack ``(B, n, n)`` at ``P(None,'x','y')``, each matrix on one device.
 
     ``compute_evecs``, ``block_size`` and ``side`` are the library wrappers'
@@ -112,7 +113,9 @@ def batched_distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
     del compute_evecs, block_size, side
     nb, n = int(A.shape[0]), int(A.shape[-1])
     bound = _bound("eigh", mesh, n, max_n)
-    return reshard_rounds_call("eigh", mesh, A, rounds=rounds_for(nb, n, _ranks(mesh), bound))
+    if rounds is None:
+        rounds = rounds_for(nb, n, _ranks(mesh), bound)
+    return reshard_rounds_call("eigh", mesh, A, rounds=int(rounds))
 
 
 def distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
@@ -136,7 +139,8 @@ def distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
     return fn(A)
 
 
-def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None):
+def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None,
+                                 rounds: int | None = None):
     """Solve ``A[q] X[q] = B[q]`` with each matrix on one device (``jnp.linalg.solve``).
 
     ``A`` (B, n, n) and ``B`` (B, n, NRHS) at ``P(None,'x','y')``; X in B's
@@ -146,7 +150,9 @@ def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None):
     validate_batch_reshard_operands("solve_lu", mesh, (A, B))
     nb, n, nrhs = int(A.shape[0]), int(A.shape[-1]), int(B.shape[-1])
     bound = _bound("solve_lu", mesh, n, max_n)
-    rounds = rounds_for(nb, n, _ranks(mesh), bound, width=nrhs)
+    if rounds is None:
+        rounds = rounds_for(nb, n, _ranks(mesh), bound, width=nrhs)
+    rounds = max(1, min(int(rounds), nb))
     if rounds == 1:
         return batch_reshard_call("solve_lu", mesh, (A, B))
     m = -(-nb // rounds)
