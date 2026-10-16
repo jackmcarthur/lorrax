@@ -18,6 +18,7 @@ from bse.bse_qp_rotation import (certify_star_gauge, qp_window_dipoles,
                                  star_parents, star_relation_residuals)
 from common.band_degeneracy import BandWindowDegeneracyError
 
+jax.config.update("jax_enable_x64", True)
 RNG = np.random.default_rng(20261016)
 
 

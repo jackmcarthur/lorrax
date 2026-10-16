@@ -145,7 +145,9 @@ def n_pad_transitions(data) -> int:
 def _generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:
     """Monkhorst-Pack style k-point grid in crystal coords [0, 1), C-order.
 
-    Returns ``(nk, 3)``.  Single consumer: ``write_eigenvectors_stream``.
+    Returns ``(nk, 3)``: the BSE's k-row order.  Consumers:
+    ``write_eigenvectors_stream`` and the QP-rotation frame check
+    (``bse_qp_rotation.load_qp_rotation``).
     """
     kpts = []
     for ix in range(nkx):

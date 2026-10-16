@@ -365,7 +365,7 @@ def load_qp_rotation(restart_file, input_file, qp_rotations_file, *, header,
                                         read_star_map,
                                         validate_qp_rotations_frame)
     from .bse_window import (BseWindowOutsideZetaTrainingError,
-                             _parse_wfn_path,
+                             _generate_kpts_grid, _parse_wfn_path,
                              assert_bse_window_in_zeta_training)
 
     path = os.path.abspath(os.fspath(qp_rotations_file))
@@ -377,8 +377,18 @@ def load_qp_rotation(restart_file, input_file, qp_rotations_file, *, header,
     wfn = WfnLoader(wfn_path)
     authenticate_qp_rotations_source_wfn(artifact, wfn, artifact_path=path)
     sym = wfn.symmetry()
+    # The BSE's k rows are the C-order grid; the star tables below index
+    # the symmetry service's full-BZ list, so both must be that grid.
+    grid_k = _generate_kpts_grid(*(int(n) for n in header["grid"]))
+    dk = np.asarray(sym.unfolded_kpts, dtype=np.float64) - grid_k
+    if dk.shape != grid_k.shape or np.abs(dk - np.rint(dk)).max() > 1e-8:
+        raise ValueError(
+            f"GATE bse_qp_k_order: got a symmetry-service full-BZ list that "
+            f"is not the BSE's C-order {tuple(header['grid'])} grid; want "
+            f"the same rows.  why: U, E and the star tables are indexed by "
+            f"that list, the restart psi by the grid.")
     U, E, (q0, q1) = validate_qp_rotations_frame(
-        artifact, kgrid=header["grid"], kpoints_crys=sym.unfolded_kpts,
+        artifact, kgrid=header["grid"], kpoints_crys=grid_k,
         artifact_path=path)
     try:
         assert_bse_window_in_zeta_training(header, q0, q1)
