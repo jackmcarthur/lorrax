@@ -143,6 +143,42 @@ then checked before it runs ([memory model](memory-model.md#the-compiled-check))
 sampled, not continuum certificates; a matched QP comparison is the acceptance
 check.
 
+**Where the pencils are computed.** Each proposal geometry's shift pencil (the
+stacked Hankel QR, the SVD of its $R^\dagger$ and the projected shift) depends on
+the geometry only, never on a decision. On a device leg it runs on the rank's
+GPU (`gw.response_pencil.DEVICE_PENCILS`, a source with the contract of
+`minimax.host_pencils`):
+- QR is `jnp.linalg.qr`. The SVD is the Hermitian dilation
+  $\left[\begin{smallmatrix}0&R^\dagger\\R&0\end{smallmatrix}\right]$ solved by
+  `distrib_la.eigh_local`. The projected shift is GEMMs.
+- The next geometry is dispatched before the current one is read, so the
+  device builds it while the host scans. Each consumed geometry costs one
+  device-to-host read of $(s, \text{shift})$, at most $192 + 192^2$ complex.
+- Every decision stays in minimax on the host: the node count, the sampled error,
+  the coefficient mass, stagnation and the group split.
+- Shapes are exact. Zero-padded buckets came back non-finite from the ROCm leg on
+  954 of the 1020 pencils of the Fe V2 tree; exact shapes on 0. Because a
+  rank's attempts are its own, every rank compiles each round's shapes before
+  the round (`DevicePencils.prepare` through `compile_ahead`), as the cross-rank
+  compile agreement requires.
+
+The dilation resolves a small singular value only to about $8\varepsilon\,\sigma_1$
+(`DevicePencils.sigma_error`); host LAPACK keeps it to about $10^{-4}$ relative.
+A source's acceptance at count $n$ stands only when
+$\texttt{sigma\_error}\cdot\sigma_1 \le 10^{-3}\,\sigma_n$
+(`minimax.complex_response._SOURCE_SIGMA_RTOL`). Otherwise minimax rebuilds that
+geometry with `host_pencils` and scans it again from the same pole order, so the
+rule is the host's bytes. A rejection there is the host's own. On Fe V2 only
+group [0:22] triggers it ($\sigma_{80}/\sigma_1 = 8.9\times10^{-15}$, a bound of
+$2.5\times10^{-2}$ against $\le 4.7\times10^{-5}$ for every other group).
+Rejected routes: rocSOLVER `gesvd`, 5.3 s per geometry against 0.34 s; its Jacobi
+driver, wrong singular values (relative error 0.96).
+
+Fe V2 P=4 (lane rcgpu): `bank.rule_construction` went 49.23 → 33.76 s. With the
+re-decision, eqp against int6/e5 went from 6.1e-7 / 1.53e-6 eV to
+2.4e-8 / 7.3e-8 eV, for +0.2–0.3 s. On CUDA the same `jnp` and `eigh_local` calls
+reach cuSOLVER; that leg has not been run.
+
 **Domain and occupations.** The transition interval spans every nonzero
 occupied/empty weight pair on the one branch support
 (`gw.efermi.band_in_occupation_window`, $|w|\ge 10^{-5}$; samples only),
