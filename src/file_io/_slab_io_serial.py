@@ -708,6 +708,14 @@ class _SerialBackend(_DatasetGeometry):
             tuple(int(s) for s in read_shape), sharding, _block)
 
     # ------------------------------------------------------------------
+    def read_multi(self, requests, *, partition_spec, mesh: Mesh | None = None) -> list:
+        """N :meth:`read_slab` requests: this tier's transport is per shard
+        (one process owns every shard), so the list is its own loop."""
+        return [self.read_slab(r["name"], shape=r["shape"], dtype=r.get("dtype"),
+                               offset=r.get("offset"), valid_shape=r.get("valid_shape"),
+                               mesh=mesh, partition_spec=partition_spec)
+                for r in requests]
+
     def read_slabs(
         self,
         name: str,

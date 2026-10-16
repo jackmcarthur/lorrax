@@ -1589,6 +1589,14 @@ class ResidentBankPayload:
         layout = _bank_layout(None if tuple(partition_spec) == tuple(face) else partition_spec)
         return value if layout == "face" else _bank_face_to_batch(self.mesh, value.ndim)(value)
 
+    def read_multi(self, requests, *, partition_spec):
+        """N :meth:`read_slab` requests: a resident payload is device slices
+        (or one host-tier load per request), with no collective file read to merge."""
+        return [self.read_slab(r["name"], shape=r["shape"], offset=r["offset"],
+                               dtype=r["dtype"], partition_spec=partition_spec,
+                               valid_shape=r.get("valid_shape"))
+                for r in requests]
+
 
 @lru_cache(maxsize=None)
 def _tier_tiles(mesh, shape, k):
@@ -2731,16 +2739,15 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sa
     return out
 
 
-def read_line_panels(io, q_span=None, *, meta, header, family, sample, cross=False,
-                     q_ids=None, partition_spec=None):
-    """One line sample's panels for one family and their retained counts.
+def _line_panel_plan(io, q_span, *, meta, header, family, sample, cross, q_ids, partition_spec):
+    """Validated read requests of one line sample's panels (no I/O).
 
-    Returns ``(panels, counts)``: complex128 ``[b, 1+2S, rows, r]`` (or the
-    ``[b, 2S, cross rows, r]`` cross panel) in the packed row order the
-    constructor uses, face tiles ``P(None,None,'x','y')`` or batch layout as
-    in :func:`read_shared_pole_bank`, and the host int ``[b]`` retained count
-    of each requested parent. The field order is the header's
-    ``line_panels.fields``: Q, then output and action per state.
+    Returns ``(name, spec, parts, pack, assemble)``: ``parts`` lists, per
+    parent run, the ``read_slab`` request plus its priced ``(argument, output,
+    temporary)`` bytes; ``pack(value)`` converts one read value to the packed
+    rows; ``assemble(packed)`` stacks the runs and restores the parent order,
+    returning ``(panels, counts)``. One plan serves the per-sample read and
+    the round read, so both return the same arrays.
     """
     if header.get("schema") != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
@@ -2768,27 +2775,105 @@ def read_line_panels(io, q_span=None, *, meta, header, family, sample, cross=Fal
     face = P(None, None, "x", "y")
     spec = face if layout == "face" or not contiguous else P(_BATCH_LAYOUT, None, None, None)
     basis = meta.mu_basis
-    ledger = _capacity(meta)
-    _check_io_capacity(ledger, basis.mesh_xy, header)
-    parts, retained = [], 0
+    parts = []
     for q, count in runs:
         shape = (count, fields, rows, width)
         if charge:
-            arg, output, temporary = _conversion_bytes(basis, shape, spec, unpack=False, axis=2)
+            price = _conversion_bytes(basis, shape, spec, unpack=False, axis=2)
         else:
-            arg = output = _local_bytes(shape, np.complex128, mesh, spec)
-            temporary = 0
+            price = (_local_bytes(shape, np.complex128, mesh, spec),) * 2 + (0,)
+        parts.append((dict(name=name, shape=shape, valid_shape=shape, offset=(q, 0, 0, 0),
+                           dtype=np.complex128), price))
+
+    def pack(value):
+        return basis.pack_axis(value, 2, spec=spec) if charge else value
+
+    def assemble(packed):
+        value = packed[0] if len(packed) == 1 else _bank_stack_rows(mesh, spec)(tuple(packed))
+        del packed[:]
+        counts = np.asarray(panels["counts"][family], np.int64)[ids, sample - p0]
+        return _restore_parent_order(value, ids, layout, contiguous, interval, mesh), counts
+    return name, spec, parts, pack, assemble
+
+
+def read_line_panels(io, q_span=None, *, meta, header, family, sample, cross=False,
+                     q_ids=None, partition_spec=None):
+    """One line sample's panels for one family and their retained counts.
+
+    Returns ``(panels, counts)``: complex128 ``[b, 1+2S, rows, r]`` (or the
+    ``[b, 2S, cross rows, r]`` cross panel) in the packed row order the
+    constructor uses, face tiles ``P(None,None,'x','y')`` or batch layout as
+    in :func:`read_shared_pole_bank`, and the host int ``[b]`` retained count
+    of each requested parent. The field order is the header's
+    ``line_panels.fields``: Q, then output and action per state. A round's
+    samples together: :func:`read_line_panel_round`.
+    """
+    name, spec, parts, pack, assemble = _line_panel_plan(
+        io, q_span, meta=meta, header=header, family=family, sample=sample, cross=cross,
+        q_ids=q_ids, partition_spec=partition_spec)
+    basis = meta.mu_basis
+    ledger = _capacity(meta)
+    _check_io_capacity(ledger, basis.mesh_xy, header)
+    packed, retained = [], 0
+    for request, (arg, output, temporary) in parts:
         _admit(ledger, "read_" + name, retained + arg + output, temporary,
                device_panel=arg, native_host=True, io=io)
-        value = io.read_slab(name, shape=shape, valid_shape=shape, offset=(q, 0, 0, 0),
-                             dtype=np.complex128, partition_spec=spec)
-        parts.append(basis.pack_axis(value, 2, spec=spec) if charge else value)
+        value = io.read_slab(request["name"], shape=request["shape"],
+                             valid_shape=request["valid_shape"],
+                             offset=request["offset"], dtype=request["dtype"],
+                             partition_spec=spec)
+        packed.append(pack(value))
         retained += output
         del value
-    value = parts[0] if len(parts) == 1 else _bank_stack_rows(mesh, spec)(tuple(parts))
-    del parts
-    counts = np.asarray(panels["counts"][family], np.int64)[ids, sample - p0]
-    return _restore_parent_order(value, ids, layout, contiguous, interval, mesh), counts
+    return assemble(packed)
+
+
+def read_line_panel_round(io, q_span=None, *, meta, header, family, samples, cross=False,
+                          q_ids=None, partition_spec=None):
+    """Every listed line sample's panels in ONE collective read.
+
+    ``{sample: (panels, counts)}``, each exactly :func:`read_line_panels`'s
+    value for that sample (one plan serves both). All runs of all samples go
+    to ``io.read_multi`` together, so a round's line panels cost one
+    dispatch, one descriptor table and no per-read host sync on the
+    collective tier, where per-sample reads cost one of each per sample.
+
+    Device bytes: the read's outputs are the round's raw panels; each is
+    packed and released in turn, so the peak is the round's panels plus, at
+    the sample being packed, its conversion (priced below as the worst
+    point of that sequence). On an identity basis nothing is converted and
+    the outputs are the panels themselves.
+    """
+    samples = [int(s) for s in samples]
+    if not samples:
+        return {}
+    plans = [_line_panel_plan(io, q_span, meta=meta, header=header, family=family,
+                              sample=sid, cross=cross, q_ids=q_ids,
+                              partition_spec=partition_spec) for sid in samples]
+    specs = {spec for _, spec, _, _, _ in plans}
+    if len(specs) != 1:
+        _refuse("line-panel round read needs one layout for every sample")
+    spec, = specs
+    basis = meta.mu_basis
+    ledger = _capacity(meta)
+    _check_io_capacity(ledger, basis.mesh_xy, header)
+    prices = [price for _, _, parts, _, _ in plans for _, price in parts]
+    args = [a for a, _, _ in prices]
+    # Packing part k: parts >= k still raw, parts <= k converted, plus its temporary.
+    resident = max(sum(args[k:]) + sum(o for _, o, _ in prices[:k + 1]) for k in range(len(prices)))
+    _admit(ledger, f"read_{plans[0][0]}..{plans[-1][0]}", resident,
+           max(t for _, _, t in prices), device_panel=sum(args), native_host=True, io=io)
+    values = io.read_multi([request for _, _, parts, _, _ in plans for request, _ in parts],
+                           partition_spec=spec)
+    out, k = {}, 0
+    for sid, (_, _, parts, pack, assemble) in zip(samples, plans):
+        packed = []
+        for j in range(k, k + len(parts)):
+            packed.append(pack(values[j]))
+            values[j] = None             # the raw panel is released as it is packed
+        out[sid] = assemble(packed)
+        k += len(parts)
+    return out
 
 
 def _export_spatial_header(path, source_wfn, meta, *, kind, source):

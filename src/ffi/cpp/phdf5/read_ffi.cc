@@ -117,6 +117,224 @@ static inline ffi::Error finish_read(
 // / ``check_dataset_rank`` / ``announce_error`` are in shard_index.h, for the
 // same reason.
 
+// The rank's hyperslab of an equal-block sharded output (the padding contract
+// above ReadDispatch): ``mem_dims`` is the rank's block, ``offset`` its file
+// origin, ``file_count`` the part of it inside ``valid_shape`` (0 on a dim the
+// rank holds only padding).  Shared by ReadDispatch and ReadMultiDispatch, so
+// the two cannot place a rank differently.  Every refusal is computed from
+// replicated operands.
+static bool rank_hyperslab(
+    const PhdfCtx* ctx, const char* who,
+    ffi::Span<const int64_t> mesh_shape,
+    ffi::Span<const int64_t> axis_count_per_dim,
+    ffi::Span<const int64_t> axis_flat,
+    const int64_t* dims, size_t N,
+    const int64_t* offset_host, const int64_t* valid_shape_host,
+    std::vector<hsize_t>* offset_out, std::vector<hsize_t>* count_out,
+    std::vector<hsize_t>* mem_dims_out, std::string* err)
+{
+    offset_out->assign(N, 0);
+    count_out->assign(N, 0);
+    mem_dims_out->assign(N, 0);
+    std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
+    auto& offset = *offset_out;
+    auto& file_count = *count_out;
+    auto& mem_dims = *mem_dims_out;
+    size_t flat_idx = 0;
+    for (size_t d = 0; d < N; ++d) {
+        if (offset_host[d] < 0 || valid_shape_host[d] < 0) {
+            std::ostringstream os;
+            os << who << ": negative offset/valid_shape at dim " << d
+               << " offset=" << offset_host[d]
+               << " valid_shape=" << valid_shape_host[d] << "\n"
+               << descriptor_forensics(
+                      offset_host[d] < 0 ? offset_host[d]
+                                         : valid_shape_host[d]);
+            *err = os.str();
+            return false;
+        }
+        if (offset_host[d] > INT64_MAX - valid_shape_host[d]) {
+            std::ostringstream os;
+            os << who << ": offset+valid_shape overflows int64 at dim "
+               << d << " (" << offset_host[d] << "+" << valid_shape_host[d]
+               << "); the bounds test would wrap negative and accept an "
+               << "out-of-range slab";
+            *err = os.str();
+            return false;
+        }
+        mem_dims[d] = (hsize_t)dims[d];
+        offset[d] = (hsize_t)offset_host[d];
+        int64_t na = axis_count_per_dim[d];
+        int64_t rank_coord = 0;
+        int64_t stride_acc = 1;
+        for (int64_t k = na - 1; k >= 0; --k) {
+            // In range: validate_shard_encoding checked the length agreement.
+            int64_t ax = axis_flat[flat_idx + k];
+            if (ax < 0 || (size_t)ax >= mesh_shape.size()) {
+                std::ostringstream os;
+                os << who << ": bad axis " << ax
+                   << " at dim " << d << " axis " << k;
+                *err = os.str();
+                return false;
+            }
+            rank_coord += coord[ax] * stride_acc;
+            stride_acc *= mesh_shape[ax];
+        }
+        int64_t local_start = rank_coord * (int64_t)mem_dims[d];
+        if (local_start >= valid_shape_host[d]) {
+            file_count[d] = 0;
+        } else {
+            int64_t remaining = valid_shape_host[d] - local_start;
+            file_count[d] = (hsize_t)(
+                remaining < (int64_t)mem_dims[d] ? remaining : (int64_t)mem_dims[d]);
+        }
+        offset[d] += (hsize_t)local_start;
+        flat_idx += (size_t)na;
+    }
+    return true;
+}
+
+// The rank's file/memory selection of one equal-block read, with the
+// rank-invariant bounds test first: ReadImpl's one request and every request of
+// ReadMultiDispatch take the SAME test in the same order, so a refusal fires on
+// every rank or none (the empty-rank rendezvous below is per rank and never
+// bounds-tested).  On success the caller owns and closes both dataspaces.
+static bool select_rank_slab(
+    PhdfCtx* ctx, const char* who, hid_t dset, int rank,
+    const std::vector<hsize_t>& offset,
+    const std::vector<hsize_t>& file_count,
+    const std::vector<hsize_t>& mem_dims,
+    const std::vector<int64_t>& offset_base,   // SAME on every rank
+    const std::vector<int64_t>& valid_shape,   // SAME on every rank
+    hid_t* filespace_out, hid_t* memspace_out,
+    ffi::ErrorCode* code, std::string* err)
+{
+    auto refuse = [&](ffi::ErrorCode c, const std::string& msg) {
+        *code = c;
+        *err = msg;
+        return false;
+    };
+    const std::string w(who);
+    if (dset < 0 || H5Iis_valid(dset) <= 0) {
+        return refuse(ffi::ErrorCode::kInvalidArgument, w + ": ds_id is invalid");
+    }
+    hid_t filespace = H5Dget_space(dset);
+    if (filespace < 0) {
+        return refuse(ffi::ErrorCode::kInternal, w + ": H5Dget_space failed");
+    }
+    // Rank agreement, checked BEFORE H5Sget_simple_extent_dims below writes
+    // file_rank entries into an rank-sized buffer.  write_ffi.cc has always
+    // had this guard; the read path did not, and reading an N-D request
+    // against an (N+k)-D dataset would have overrun the extent vector.
+    // Rank-invariant (the dataset and the request are the same on every
+    // rank), so it refuses everywhere or nowhere.
+    {
+        std::string rank_err;
+        if (!check_dataset_rank(filespace, rank, who,
+                                nullptr, &rank_err)) {
+            H5Sclose(filespace);
+            return refuse(ffi::ErrorCode::kInvalidArgument, rank_err);
+        }
+    }
+    hid_t memspace = H5Screate_simple(rank, mem_dims.data(), nullptr);
+    if (memspace < 0) {
+        H5Sclose(filespace);
+        return refuse(ffi::ErrorCode::kInternal, w + ": H5Screate_simple(memspace) failed");
+    }
+    // ── Emptiness is PER-RANK; the bounds test is RANK-INVARIANT. ──
+    //
+    // `empty_selection` picks this rank's selection.  A rank whose local
+    // block lies wholly in the mu padding gets file_count == 0 from the
+    // shard loop, selects nothing, and still enters the collective H5Dread
+    // its peers are inside; its output stays at the memset zeros.  That is
+    // the read-side twin of the write path's empty rendezvous and it must
+    // never be bounds-tested (write_ffi.cc, commit d935ce7).
+    //
+    // Until now this handler took NO bounds test at all, which made
+    // H5Sselect_hyperslab the de-facto one -- and that fires only on ranks
+    // with a non-empty selection.  So a caller whose logical slab overran
+    // the dataset while some ranks were wholly padding refused on a PROPER
+    // SUBSET: the empty ranks entered the collective H5Dread alone and
+    // stranded the communicator.  offset_base and valid_shape are
+    // replicated control vectors, identical on every rank, and max over
+    // ranks of (offset[d] + file_count[d]) is exactly offset_base[d] +
+    // valid_shape[d] -- so testing THOSE reaches the same verdict on every
+    // rank, before anyone enters the collective.  A globally empty request
+    // (valid_shape[d] == 0 anywhere) is not bounds-tested, same doctrine.
+    std::vector<hsize_t> extent((size_t)rank, 0);
+    if (H5Sget_simple_extent_dims(filespace, extent.data(), nullptr) < 0) {
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+        return refuse(ffi::ErrorCode::kInternal, w + ": H5Sget_simple_extent_dims failed");
+    }
+    bool globally_empty = false;
+    for (int d = 0; d < rank; ++d) {
+        if (valid_shape[(size_t)d] == 0) { globally_empty = true; break; }
+    }
+    if (!globally_empty) {
+        bool out_of_bounds = false;
+        for (int d = 0; d < rank; ++d) {
+            if ((hsize_t)(offset_base[(size_t)d] + valid_shape[(size_t)d])
+                    > extent[(size_t)d]) {
+                out_of_bounds = true;
+            }
+        }
+        if (out_of_bounds) {
+            std::ostringstream os;
+            os << who << ": logical slab out of bounds"
+               << " extent=" << vec_to_string(extent)
+               << " offset_base=" << vec_to_string(offset_base)
+               << " valid_shape=" << vec_to_string(valid_shape)
+               << " rank=" << ctx->rank
+               << " -- refused identically on every rank";
+            // The FIRST out-of-range operand is the one worth decoding.  A
+            // value that reads back as a small double is a stale allocation,
+            // not arithmetic — see descriptor_forensics.
+            for (int d2 = 0; d2 < rank; ++d2) {
+                if ((hsize_t)(offset_base[(size_t)d2]
+                              + valid_shape[(size_t)d2]) > extent[(size_t)d2]) {
+                    os << "\n" << descriptor_forensics(
+                        offset_base[(size_t)d2] != 0 ? offset_base[(size_t)d2]
+                                                     : valid_shape[(size_t)d2]);
+                    break;
+                }
+            }
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            return refuse(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+    }
+    bool empty_selection = false;
+    for (auto c : file_count) {
+        if (c == 0) empty_selection = true;
+    }
+    if (empty_selection) {
+        if (H5Sselect_none(filespace) < 0 || H5Sselect_none(memspace) < 0) {
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            return refuse(ffi::ErrorCode::kInternal, w + ": H5Sselect_none failed");
+        }
+    } else if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
+                             offset.data(), nullptr,
+                             file_count.data(),  nullptr) < 0) {
+        H5Sclose(memspace);
+        H5Sclose(filespace);
+        return refuse(ffi::ErrorCode::kInternal, w + ": H5Sselect_hyperslab failed");
+    } else {
+        std::vector<hsize_t> mem_start((size_t)rank, 0);
+        if (H5Sselect_hyperslab(memspace, H5S_SELECT_SET,
+                                mem_start.data(), nullptr,
+                                file_count.data(), nullptr) < 0) {
+            H5Sclose(memspace);
+            H5Sclose(filespace);
+            return refuse(ffi::ErrorCode::kInternal, w + ": H5Sselect_hyperslab(mem) failed");
+        }
+    }
+    *filespace_out = filespace;
+    *memspace_out = memspace;
+    return true;
+}
+
 template <typename T>
 static ffi::Error ReadImpl(
     LRX_STREAM_PARAM
@@ -158,129 +376,15 @@ static ffi::Error ReadImpl(
     void* stage = ctx->read_buf;
     std::memset(stage, 0, bytes);
 
-    hid_t dset = ds_id;
     hid_t native_type = dt::h5_native_type<T>();
-    if (dset < 0 || H5Iis_valid(dset) <= 0) {
-        return fail_read(ffi::ErrorCode::kInvalidArgument,
-                         "phdf5 read: ds_id is invalid");
-    }
-
-    hid_t filespace = H5Dget_space(dset);
-    if (filespace < 0) {
-        return fail_read(ffi::ErrorCode::kInternal,
-                         "phdf5 read: H5Dget_space failed");
-    }
-    // Rank agreement, checked BEFORE H5Sget_simple_extent_dims below writes
-    // file_rank entries into an rank-sized buffer.  write_ffi.cc has always
-    // had this guard; the read path did not, and reading an N-D request
-    // against an (N+k)-D dataset would have overrun the extent vector.
-    // Rank-invariant (the dataset and the request are the same on every
-    // rank), so it refuses everywhere or nowhere.
+    hid_t filespace = H5I_INVALID_HID, memspace = H5I_INVALID_HID;
     {
-        std::string rank_err;
-        if (!check_dataset_rank(filespace, rank, "phdf5 read",
-                                nullptr, &rank_err)) {
-            H5Sclose(filespace);
-            return fail_read(ffi::ErrorCode::kInvalidArgument, rank_err);
-        }
-    }
-    hid_t memspace = H5Screate_simple(rank, mem_dims.data(), nullptr);
-    if (memspace < 0) {
-        H5Sclose(filespace);
-        return fail_read(ffi::ErrorCode::kInternal,
-                         "phdf5 read: H5Screate_simple(memspace) failed");
-    }
-    // ── Emptiness is PER-RANK; the bounds test is RANK-INVARIANT. ──
-    //
-    // `empty_selection` picks this rank's selection.  A rank whose local
-    // block lies wholly in the mu padding gets file_count == 0 from the
-    // shard loop, selects nothing, and still enters the collective H5Dread
-    // its peers are inside; its output stays at the memset zeros.  That is
-    // the read-side twin of the write path's empty rendezvous and it must
-    // never be bounds-tested (write_ffi.cc, commit d935ce7).
-    //
-    // Until now this handler took NO bounds test at all, which made
-    // H5Sselect_hyperslab the de-facto one -- and that fires only on ranks
-    // with a non-empty selection.  So a caller whose logical slab overran
-    // the dataset while some ranks were wholly padding refused on a PROPER
-    // SUBSET: the empty ranks entered the collective H5Dread alone and
-    // stranded the communicator.  offset_base and valid_shape are
-    // replicated control vectors, identical on every rank, and max over
-    // ranks of (offset[d] + file_count[d]) is exactly offset_base[d] +
-    // valid_shape[d] -- so testing THOSE reaches the same verdict on every
-    // rank, before anyone enters the collective.  A globally empty request
-    // (valid_shape[d] == 0 anywhere) is not bounds-tested, same doctrine.
-    std::vector<hsize_t> extent((size_t)rank, 0);
-    if (H5Sget_simple_extent_dims(filespace, extent.data(), nullptr) < 0) {
-        H5Sclose(memspace);
-        H5Sclose(filespace);
-        return fail_read(ffi::ErrorCode::kInternal,
-                         "phdf5 read: H5Sget_simple_extent_dims failed");
-    }
-    bool globally_empty = false;
-    for (int d = 0; d < rank; ++d) {
-        if (valid_shape[(size_t)d] == 0) { globally_empty = true; break; }
-    }
-    if (!globally_empty) {
-        bool out_of_bounds = false;
-        for (int d = 0; d < rank; ++d) {
-            if ((hsize_t)(offset_base[(size_t)d] + valid_shape[(size_t)d])
-                    > extent[(size_t)d]) {
-                out_of_bounds = true;
-            }
-        }
-        if (out_of_bounds) {
-            std::ostringstream os;
-            os << "phdf5 read: logical slab out of bounds"
-               << " extent=" << vec_to_string(extent)
-               << " offset_base=" << vec_to_string(offset_base)
-               << " valid_shape=" << vec_to_string(valid_shape)
-               << " rank=" << ctx->rank
-               << " -- refused identically on every rank";
-            // The FIRST out-of-range operand is the one worth decoding.  A
-            // value that reads back as a small double is a stale allocation,
-            // not arithmetic — see descriptor_forensics.
-            for (int d2 = 0; d2 < rank; ++d2) {
-                if ((hsize_t)(offset_base[(size_t)d2]
-                              + valid_shape[(size_t)d2]) > extent[(size_t)d2]) {
-                    os << "\n" << descriptor_forensics(
-                        offset_base[(size_t)d2] != 0 ? offset_base[(size_t)d2]
-                                                     : valid_shape[(size_t)d2]);
-                    break;
-                }
-            }
-            H5Sclose(memspace);
-            H5Sclose(filespace);
-            return fail_read(ffi::ErrorCode::kInvalidArgument, os.str());
-        }
-    }
-    bool empty_selection = false;
-    for (auto c : file_count) {
-        if (c == 0) empty_selection = true;
-    }
-    if (empty_selection) {
-        if (H5Sselect_none(filespace) < 0 || H5Sselect_none(memspace) < 0) {
-            H5Sclose(memspace);
-            H5Sclose(filespace);
-            return fail_read(ffi::ErrorCode::kInternal,
-                             "phdf5 read: H5Sselect_none failed");
-        }
-    } else if (H5Sselect_hyperslab(filespace, H5S_SELECT_SET,
-                             offset.data(), nullptr,
-                             file_count.data(),  nullptr) < 0) {
-        H5Sclose(memspace);
-        H5Sclose(filespace);
-        return fail_read(ffi::ErrorCode::kInternal,
-                         "phdf5 read: H5Sselect_hyperslab failed");
-    } else {
-        std::vector<hsize_t> mem_start((size_t)rank, 0);
-        if (H5Sselect_hyperslab(memspace, H5S_SELECT_SET,
-                                mem_start.data(), nullptr,
-                                file_count.data(), nullptr) < 0) {
-            H5Sclose(memspace);
-            H5Sclose(filespace);
-            return fail_read(ffi::ErrorCode::kInternal,
-                             "phdf5 read: H5Sselect_hyperslab(mem) failed");
+        ffi::ErrorCode code = ffi::ErrorCode::kInternal;
+        std::string sel_err;
+        if (!select_rank_slab(ctx, "phdf5 read", ds_id, rank, offset, file_count,
+                              mem_dims, offset_base, valid_shape,
+                              &filespace, &memspace, &code, &sel_err)) {
+            return fail_read(code, sel_err);
         }
     }
 
@@ -290,7 +394,7 @@ static ffi::Error ReadImpl(
         : std::chrono::steady_clock::time_point{};
     const auto selected = ctx->timing_enabled
         ? H5Sget_select_npoints(filespace) : 0;
-    herr_t st = H5Dread(dset, native_type, memspace, filespace, dxpl, stage);
+    herr_t st = H5Dread(ds_id, native_type, memspace, filespace, dxpl, stage);
     if (ctx->timing_enabled && st >= 0) {
         ctx->read_calls.fetch_add(1, std::memory_order_relaxed);
         ctx->read_bytes.fetch_add(static_cast<uint64_t>(selected) * sizeof(T),
@@ -434,55 +538,15 @@ static ffi::Error ReadDispatch(
                     "phdf5 read: copy(valid_shape) failed: " + cperr);
     }
 
-    std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
     std::vector<hsize_t> offset(N), file_count(N), mem_dims(N);
-    size_t flat_idx = 0;
-    for (size_t d = 0; d < N; ++d) {
-        if (offset_host[d] < 0 || valid_shape_host[d] < 0) {
-            std::ostringstream os;
-            os << "phdf5 read: negative offset/valid_shape at dim " << d
-               << " offset=" << offset_host[d]
-               << " valid_shape=" << valid_shape_host[d] << "\n"
-               << descriptor_forensics(
-                      offset_host[d] < 0 ? offset_host[d]
-                                         : valid_shape_host[d]);
-            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+    {
+        std::string hs_err;
+        if (!rank_hyperslab(ctx, "phdf5 read", mesh_shape, axis_count_per_dim,
+                            axis_flat, dims.begin(), N, offset_host.data(),
+                            valid_shape_host.data(), &offset, &file_count,
+                            &mem_dims, &hs_err)) {
+            return fail(ffi::ErrorCode::kInvalidArgument, hs_err);
         }
-        if (offset_host[d] > INT64_MAX - valid_shape_host[d]) {
-            std::ostringstream os;
-            os << "phdf5 read: offset+valid_shape overflows int64 at dim "
-               << d << " (" << offset_host[d] << "+" << valid_shape_host[d]
-               << "); the bounds test would wrap negative and accept an "
-               << "out-of-range slab";
-            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
-        }
-        mem_dims[d] = (hsize_t)dims[d];
-        offset[d] = (hsize_t)offset_host[d];
-        int64_t na = axis_count_per_dim[d];
-        int64_t rank_coord = 0;
-        int64_t stride_acc = 1;
-        for (int64_t k = na - 1; k >= 0; --k) {
-            // In range: validate_shard_encoding checked the length agreement.
-            int64_t ax = axis_flat[flat_idx + k];
-            if (ax < 0 || (size_t)ax >= mesh_shape.size()) {
-                std::ostringstream os;
-                os << "phdf5 read: bad axis " << ax
-                   << " at dim " << d << " axis " << k;
-                return fail(ffi::ErrorCode::kInvalidArgument, os.str());
-            }
-            rank_coord += coord[ax] * stride_acc;
-            stride_acc *= mesh_shape[ax];
-        }
-        int64_t local_start = rank_coord * (int64_t)mem_dims[d];
-        if (local_start >= valid_shape_host[d]) {
-            file_count[d] = 0;
-        } else {
-            int64_t remaining = valid_shape_host[d] - local_start;
-            file_count[d] = (hsize_t)(
-                remaining < (int64_t)mem_dims[d] ? remaining : (int64_t)mem_dims[d]);
-        }
-        offset[d] += (hsize_t)local_start;
-        flat_idx += (size_t)na;
     }
 
     const auto dtype = A_out->element_type();
@@ -524,6 +588,235 @@ static ffi::Error ReadDispatch(
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Read-MULTI handler — N datasets of one file, ONE handler invocation, ONE
+//  collective ``H5Dread_multi`` (HDF5 >= 1.14; this handler is not compiled
+//  against an older library, so ``probe_target`` names the absent symbol).
+//
+//  Every output is an equal-block shard under the SAME sharding encoding and
+//  rank, with its own dataset, dtype, shape, origin and valid extent: exactly
+//  N ``ReadDispatch`` requests, placed by the same ``rank_hyperslab`` and
+//  selected by the same ``select_rank_slab``, so the bytes that land are the
+//  ones N ``read_slab`` calls return.  What it removes is per-request: N
+//  dispatches, N descriptor puts (one control table instead of 3 N vectors),
+//  N D2H copy-ins of those descriptors (each a stream sync on a device leg),
+//  N collective rendezvous and N Python ``block_until_ready``.
+//
+//  The handler is synchronous on the XLA thread, like ReadDispatch: the
+//  requests are staged into ONE ``ctx->read_buf`` region (each 256 B aligned),
+//  then each output is copied H2D on ``ctx->stream`` behind one pooled event
+//  that ``xla_stream`` waits on.  No device memory beyond the N XLA outputs;
+//  the host staging is the sum of the N rank blocks (ReadDispatch's was the
+//  largest one), retired after the copy above 32 MiB exactly as before.
+//
+//  control (S64, 1-D): {ctx, N, ds_id[N], offset[N][ndim], valid[N][ndim]}.
+// ────────────────────────────────────────────────────────────────────────────
+#if H5_VERSION_GE(1, 14, 0)
+static bool native_type_of(ffi::DataType t, hid_t* type, size_t* size) {
+    switch (t) {
+        case ffi::DataType::F32:  *type = dt::h5_native_type<float>();   *size = sizeof(float);   return true;
+        case ffi::DataType::F64:  *type = dt::h5_native_type<double>();  *size = sizeof(double);  return true;
+        case ffi::DataType::S32:  *type = dt::h5_native_type<int32_t>(); *size = sizeof(int32_t); return true;
+        case ffi::DataType::S64:  *type = dt::h5_native_type<int64_t>(); *size = sizeof(int64_t); return true;
+        case ffi::DataType::C64:  *type = dt::h5_native_type<std::complex<float>>();
+                                  *size = sizeof(std::complex<float>);  return true;
+        case ffi::DataType::C128: *type = dt::h5_native_type<std::complex<double>>();
+                                  *size = sizeof(std::complex<double>); return true;
+        default: return false;
+    }
+}
+
+static ffi::Error ReadMultiDispatch(
+    LRX_STREAM_PARAM
+    ffi::Buffer<ffi::DataType::S64> control_buf,
+    ffi::RemainingRets outs,
+    ffi::Span<const int64_t> mesh_shape,
+    ffi::Span<const int64_t> axis_count_per_dim,
+    ffi::Span<const int64_t> axis_flat)
+{
+    static const char* kWho = "phdf5 read_multi";
+    const size_t n_out = outs.size();
+    const size_t ndim = axis_count_per_dim.size();
+    const size_t want = 2 + n_out * (1 + 2 * ndim);
+    if (n_out == 0 || ndim == 0 || control_buf.dimensions().size() != 1 ||
+        (size_t)control_buf.dimensions()[0] != want) {
+        std::ostringstream os;
+        os << kWho << ": control must be 1-D of length 2 + N(1 + 2 ndim) = "
+           << want << " for N=" << n_out << " ndim=" << ndim;
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    // ONE descriptor copy-in for the whole request list (a device leg's
+    // copy_index_to_host is a D2H plus an xla_stream sync).
+    std::vector<int64_t> control(want);
+    {
+        std::string herr;
+        if (!copy_index_to_host(LRX_STREAM_ARG control.data(),
+                                control_buf.untyped_data(),
+                                want * sizeof(int64_t), &herr)) {
+            return ffi::Error(ffi::ErrorCode::kInternal,
+                              std::string(kWho) + ": copy(control) failed: " + herr);
+        }
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(control[0]);
+    if (!ctx) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          std::string(kWho) + ": ctx_handle is null");
+    }
+    {
+        std::string live_err;
+        if (!check_live_ctx(ctx, control[0], kWho, &live_err)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err);
+        }
+    }
+    auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
+        announce_error(ctx, msg);
+        return ffi::Error(code, msg);
+    };
+    if ((size_t)control[1] != n_out) {
+        std::ostringstream os;
+        os << kWho << ": control names " << control[1] << " requests for "
+           << n_out << " outputs";
+        return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    {
+        std::string enc_err;
+        if (!validate_shard_encoding(ctx, kWho, mesh_shape, axis_count_per_dim,
+                                     axis_flat, &enc_err)) {
+            return fail(ffi::ErrorCode::kInvalidArgument, enc_err);
+        }
+    }
+    const int64_t* ds_ids = control.data() + 2;
+    const int64_t* offsets = ds_ids + n_out;
+    const int64_t* valids = offsets + n_out * ndim;
+
+    struct Request {
+        hid_t ds, type;
+        void* dst;
+        size_t bytes, stage_off;
+        std::vector<hsize_t> offset, count, mem_dims;
+    };
+    std::vector<Request> req(n_out);
+    size_t total = 0;
+    for (size_t i = 0; i < n_out; ++i) {
+        auto r = outs.get<ffi::AnyBuffer>(i);
+        if (!r.has_value()) {
+            return fail(ffi::ErrorCode::kInvalidArgument,
+                        std::string(kWho) + ": output decode failed");
+        }
+        ffi::Result<ffi::AnyBuffer> out = r.value();
+        const auto dims = out->dimensions();
+        if (dims.size() != ndim) {
+            std::ostringstream os;
+            os << kWho << ": output " << i << " is " << dims.size()
+               << "-D; the sharding encoding is " << ndim << "-D";
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+        size_t elsize = 0;
+        if (!native_type_of(out->element_type(), &req[i].type, &elsize)) {
+            std::ostringstream os;
+            os << kWho << ": output " << i << " unsupported dtype "
+               << static_cast<int>(out->element_type());
+            return fail(ffi::ErrorCode::kInvalidArgument, os.str());
+        }
+        std::string err;
+        if (!rank_hyperslab(ctx, kWho, mesh_shape, axis_count_per_dim, axis_flat,
+                            dims.begin(), ndim, offsets + i * ndim,
+                            valids + i * ndim, &req[i].offset, &req[i].count,
+                            &req[i].mem_dims, &err) ||
+            !checked_buffer_bytes(req[i].mem_dims, elsize, kWho,
+                                  &req[i].bytes, &err)) {
+            return fail(ffi::ErrorCode::kInvalidArgument, err);
+        }
+        req[i].ds = (hid_t)ds_ids[i];
+        req[i].dst = out->untyped_data();
+        req[i].stage_off = total;
+        total += (req[i].bytes + 255) & ~size_t{255};
+    }
+    if (!ensure_read_buf(ctx, total ? total : 1)) {
+        std::ostringstream os;
+        os << kWho << ": staging-buffer alloc of " << total << " bytes failed";
+        return fail(ffi::ErrorCode::kResourceExhausted, os.str());
+    }
+    char* stage = static_cast<char*>(ctx->read_buf);
+    std::memset(stage, 0, total);
+
+    // Every rank lists every request in the same order (shapes are the
+    // equal-block shards, identical on every rank); a rank's empty block is
+    // an H5S_NONE selection inside the one collective, as in ReadImpl.
+    std::vector<hid_t> dsets, types, mems, files;
+    std::vector<void*> bufs;
+    auto close_all = [&]() {
+        for (hid_t m : mems) H5Sclose(m);
+        for (hid_t f : files) H5Sclose(f);
+    };
+    for (size_t i = 0; i < n_out; ++i) {
+        if (req[i].bytes == 0) continue;     // a zero-size output on every rank
+        std::vector<int64_t> off_base(offsets + i * ndim, offsets + (i + 1) * ndim);
+        std::vector<int64_t> valid(valids + i * ndim, valids + (i + 1) * ndim);
+        hid_t fs = H5I_INVALID_HID, ms = H5I_INVALID_HID;
+        ffi::ErrorCode code = ffi::ErrorCode::kInternal;
+        std::string err;
+        if (!select_rank_slab(ctx, kWho, req[i].ds, (int)ndim, req[i].offset,
+                              req[i].count, req[i].mem_dims, off_base, valid,
+                              &fs, &ms, &code, &err)) {
+            close_all();
+            std::ostringstream os;
+            os << err << " (request " << i << " of " << n_out << ")";
+            return fail(code, os.str());
+        }
+        dsets.push_back(req[i].ds);
+        types.push_back(req[i].type);
+        mems.push_back(ms);
+        files.push_back(fs);
+        bufs.push_back(stage + req[i].stage_off);
+    }
+    hid_t dxpl = ctx->use_collective_read ? ctx->dxpl_coll : ctx->dxpl_indep;
+    const auto native_t0 = ctx->timing_enabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    uint64_t selected = 0;
+    if (ctx->timing_enabled) {
+        for (size_t j = 0; j < files.size(); ++j) {
+            size_t es = H5Tget_size(types[j]);
+            selected += (uint64_t)H5Sget_select_npoints(files[j]) * es;
+        }
+    }
+    herr_t st = dsets.empty() ? 0 :
+        H5Dread_multi(dsets.size(), dsets.data(), types.data(), mems.data(),
+                      files.data(), dxpl, bufs.data());
+    if (ctx->timing_enabled && st >= 0) {
+        ctx->read_calls.fetch_add(1, std::memory_order_relaxed);
+        ctx->read_bytes.fetch_add(selected, std::memory_order_relaxed);
+        ctx->read_ns.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - native_t0).count()),
+            std::memory_order_relaxed);
+    }
+    close_all();
+    if (st < 0) {
+        return fail(ffi::ErrorCode::kInternal, std::string(kWho) + ": H5Dread_multi failed");
+    }
+    // Device-staging tail: N async copies, ONE event, ONE stream wait.
+#if LRX_LEG_DEVICE
+    for (size_t i = 0; i < n_out; ++i) {
+        if (req[i].bytes == 0) continue;
+        LORRAX_GPU_CHECK(lrx::gpu::memcpy_async(req[i].dst, stage + req[i].stage_off,
+                                          req[i].bytes, lrx::gpu::kHostToDevice,
+                                          ctx->stream));
+    }
+    LORRAX_GPU_CHECK(lrx::gpu::event_record(ctx->h2d_event, ctx->stream));
+    LORRAX_GPU_CHECK(lrx::gpu::stream_wait_event(xla_stream, ctx->h2d_event, 0));
+#else
+    for (size_t i = 0; i < n_out; ++i) {
+        if (req[i].bytes) std::memcpy(req[i].dst, stage + req[i].stage_off, req[i].bytes);
+    }
+#endif
+    if (ctx->read_capacity.load(std::memory_order_acquire) >
+        kMaxRetainedReadStaging) retire_read_buf(ctx);
+    return ffi::Error::Success();
+}
+#endif  // H5_VERSION_GE(1, 14, 0)
 
 // ────────────────────────────────────────────────────────────────────────────
 //  Read-kchunk handler — read n_kchunk independently-located hyperslab
@@ -1724,3 +2017,15 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat")
         .Attr<int64_t>("n_kchunk")
         .Attr<int64_t>("kchunk_axis"));
+
+#if H5_VERSION_GE(1, 14, 0)
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    LRX_PHDF_HANDLER(PhdfReadMulti), lorrax_ffi::phdf5::ReadMultiDispatch,
+    xla::ffi::Ffi::Bind()
+        LRX_PHDF_STREAM_CTX
+        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // control {ctx, N, ds[N], off[N][d], valid[N][d]}
+        .RemainingRets()                                   // the N outputs
+        .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
+        .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
+        .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));
+#endif

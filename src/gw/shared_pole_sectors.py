@@ -181,7 +181,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
     from common.collectives import (device_put_process_local, gather_to_host,
                                     rank0_transaction)
     from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata, open_shared_pole_bank,
-        read_line_panels,write_shared_pole_model,write_shared_pole_sector_manifest)
+        read_line_panel_round,write_shared_pole_model,write_shared_pole_sector_manifest)
     from gw.shared_pole_local import batch_to_face,canonical_factors,carrier_history,face_rows,parent_rounds
     from gw.shared_pole_screening import _json
     from gw.shared_pole_directions import _sample_point
@@ -209,9 +209,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
 
     def read_line(io,family,ids,layout,cross=False):
         spec=None if layout=='face' else P(('x','y'))
-        return {sid:read_line_panels(io,meta=meta,header=header,family=('C','T')[family],sample=sid,
-                                     cross=cross,q_ids=ids,partition_spec=spec)
-                for sid in range(line_lo,line_hi)}
+        # The round's line panels in one collective read (SlabIO.read_multi).
+        return read_line_panel_round(io,meta=meta,header=header,family=('C','T')[family],
+                                     samples=range(line_lo,line_hi),cross=cross,q_ids=ids,
+                                     partition_spec=spec)
 
     def read_diagonal(family,ids,real,layout='face',retained=()):
         # One sector's moments, dense samples and line panels for ``ids``.
