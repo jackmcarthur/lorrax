@@ -1,8 +1,11 @@
-"""Exact active-range local GEMM through classic cuBLAS.
+"""Exact active-range local GEMM through classic BLAS (cuBLAS on CUDA, rocBLAS on ROCM).
 
-Its callers import it only for a mesh whose device vendor is NVIDIA
-(``distrib_la.mesh_platform(mesh) == "CUDA"``), so it never loads a CUDA
-library elsewhere.  Each invocation operates on one process-local tile and
+Its callers import it only for a mesh whose ``ACTIVE_LOCAL_ROUTE`` row is
+``"native"`` (``_active_local.active_local_route(mesh_platform(mesh))``), and
+pass that platform key to the probes, so it never loads a device library
+elsewhere.  Both device legs build the same leg-neutral handler
+(``src/ffi/cpp/cublas/local_active_gemm_ffi.cc`` over ``common/gpu_blas.h``),
+so the target names, the contract and this module are one for both.  Each invocation operates on one process-local tile and
 issues no communication.  Runtime bounds remain device operands; the FFI reads
 only their small metadata array to the host and views the original row-major
 buffers without packing slices.  It stays the CUDA arm because it is 3.7-5.0x
@@ -26,18 +29,18 @@ _PREPARED_TARGET = "lorrax_cublas_local_prepared_active_range_gemm"
 _WORKSPACE_BYTES = 4 * 1024 * 1024
 
 
-def require_active_local_cuda() -> None:
-    """Load and capability-probe the CUDA handler before tracing a plan."""
+def require_active_local_cuda(platform: str = "CUDA") -> None:
+    """Load and capability-probe the device handler (``platform``: CUDA | ROCM) before tracing."""
     for target in (_TARGET, _OUT_TARGET):
-        usable, reason = probe_target(target, "CUDA")
+        usable, reason = probe_target(target, platform)
         if not usable:
             raise RuntimeError(
                 "local active cuBLAS GEMM is unavailable: " + reason)
 
 
-def require_prepared_active_local_cuda() -> None:
-    """Load and capability-probe the prepared CUDA handler before tracing."""
-    usable, reason = probe_target(_PREPARED_TARGET, "CUDA")
+def require_prepared_active_local_cuda(platform: str = "CUDA") -> None:
+    """Load and capability-probe the prepared device handler (CUDA | ROCM) before tracing."""
+    usable, reason = probe_target(_PREPARED_TARGET, platform)
     if not usable:
         raise RuntimeError(
             "local prepared active cuBLAS GEMM is unavailable: " + reason)

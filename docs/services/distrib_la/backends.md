@@ -373,14 +373,20 @@ the ζ-projector and SC-rotation shapes at P4 (sandbox claim 3987).
 
 | route | operands | kernel |
 |---|---|---|
-| CUDA face | both at `P(None,'x','y')` | `panel_matmul`'s local panel products on `lorrax_cublas_local_active_range_gemm` (host-known intervals: `…_prepared_active_range_gemm`) |
-| CUDA axis | A `P(None,'x',None)`, B `P(None,None,'y')` | `lorrax_cublas_local_active_range_gemm`: local cuBLAS pointer views, no collective |
+| CUDA, ROCM face | both at `P(None,'x','y')` | `panel_matmul`'s local panel products on `lorrax_cublas_local_active_range_gemm` (host-known intervals: `…_prepared_active_range_gemm`) |
+| CUDA, ROCM axis | A `P(None,'x',None)`, B `P(None,None,'y')` | `lorrax_cublas_local_active_range_gemm`: local BLAS pointer views, no collective |
 | other face | both at `P(None,'x','y')` | `panel_matmul`'s local panel products on the axis kernel below |
-| other axis | as CUDA axis | `_active_local.active_local_matmul`: JAX dot panels |
+| other axis | as the device axis | `_active_local.active_local_matmul`: JAX dot panels |
 
-The cuBLAS kernel stays the CUDA arm: on windowed bounds it is 3.7-5.0x
-faster than the JAX panels at P4, and equal on a full window (sandbox claim
-3987).
+`_active_local.ACTIVE_LOCAL_ROUTE` holds the row per leg (CUDA and ROCM
+`native`, cpu `interval`).  The native handler is one leg-neutral source,
+cuBLAS on CUDA and rocBLAS on ROCM (`common/gpu_blas.h`; rocBLAS is the copy
+the JAX ROCm plugin maps, handles created with atomics off).  The `masked`
+route (one batched dot over `where`-selected operands) and the `interval`
+route stay as the XLA references; `tests/test_active_local_native_gate.py`
+gates the native route against both on the same device.  The cuBLAS kernel
+stays the CUDA arm: on windowed bounds it is 3.7-5.0x faster than the JAX
+panels at P4, and equal on a full window (sandbox claim 3987).
 
 - **Local cuBLAS views.** `_active_local_cuda.active_local_cuda` views
   row-major tiles as column-major transposes, $C^T = B^T A^T$, and moves the

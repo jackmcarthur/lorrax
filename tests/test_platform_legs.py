@@ -198,7 +198,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     shared = {t: s for t, s in rocm.items() if t not in own}
     prefixes = tuple(p for p in built_prefixes("ROCM")
                      if any(t.startswith(p) for t in ffi_loader._CUDA_TARGET_SYMBOLS))
-    assert set(prefixes) == {"lorrax_phdf5_", "lorrax_slate_"}
+    assert set(prefixes) == {"lorrax_phdf5_", "lorrax_slate_", "lorrax_cublas_local_"}
     assert shared and all(t.startswith(prefixes) for t in shared)
     assert all(ffi_loader._CUDA_TARGET_SYMBOLS[t] == s for t, s in shared.items())
     assert {t for t in ffi_loader._CUDA_TARGET_SYMBOLS if t.startswith(prefixes)} == set(shared)
@@ -212,15 +212,20 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     assert lu <= set(own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)
     assert all(rocm[t] == s for t, s in own.items())
-    # distrib_la's ROCM table: the SLATE family, its LU entries included, and the batched eigh.
+    # distrib_la's ROCM table: the SLATE family, its LU entries included, the batched eigh and
+    # the local active-range GEMM (the CUDA leg's leg-neutral source, the same symbols).
     dl_rocm = dl._PLATFORMS["ROCM"]["targets"]
-    assert dl_rocm and all(t.startswith("lorrax_slate_") or t in eigh for t in dl_rocm)
+    assert dl_rocm and all(t.startswith(("lorrax_slate_", "lorrax_cublas_local_")) or t in eigh
+                           for t in dl_rocm)
+    assert all(dl_rocm[t] == ffi_loader._CUDA_TARGET_SYMBOLS[t] for t in dl_rocm
+               if t.startswith("lorrax_cublas_local_"))
     assert lu | eigh <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu | eigh)
     cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
     section = cmake[cmake.index('STREQUAL "rocm"'):]
     block = section[:section.index("add_library(lorrax_ffi_rocm")]
     assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in section
     assert "kdft/kdft_klead_ffi.cc" in block and "common/rtc_build.cc" in block
+    assert "cublas/local_active_gemm_ffi.cc" in block
     assert "slate/eigh_ffi.cc" in section       # bound with target_sources when SLATE is found
 
 

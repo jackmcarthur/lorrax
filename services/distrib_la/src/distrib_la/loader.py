@@ -169,8 +169,11 @@ _ROCM_SLATE_LU_SYMBOLS: dict = {
 _ROCM_LOCAL_EIGH_SYMBOLS: dict = {
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
 }
+#: The local active-range GEMM (cpp/cublas/local_active_gemm_ffi.cc) is leg-neutral: the
+#: ROCM leg compiles the CUDA leg's source on rocBLAS (common/gpu_blas.h), so it exports
+#: the same three symbols (ACTIVE_LOCAL_ROUTE's "native" row on both legs).
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
-                                 if t.startswith("lorrax_slate_")},
+                                 if t.startswith(("lorrax_slate_", "lorrax_cublas_local_"))},
                               **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS}
 
 #: Leg key -> this loader's target table and not-found build command.

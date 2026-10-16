@@ -24,14 +24,15 @@ import jax.numpy as jnp
 #: Active-range local GEMM implementation by ``lxkit`` leg key -- a backend
 #: preference of this service (as ``subspace.SUBSPACE_ROUTE``), so it lives here
 #: and not in ``lxkit.LEGS``.  ``"native"``: the ``lorrax_cublas_local_*``
-#: handlers (``_active_local_cuda``); ``"interval"``: :func:`active_local_matmul`;
-#: ``"masked"``: :func:`masked_local_matmul`.  A vendor with no row takes
-#: ``"interval"``.  ROCM: ``"masked"`` -- on MI250X (ROCm 7.14.1, JAX 0.9.1)
-#: every XLA ``while``/``cond`` trip costs ~36 us of host-driven launches and
-#: copies (command buffers off or forced: no better), and the interval route's
-#: ~64 x (3-6) trips per call made Sigma's tau windows 68 s vs 7.5 s on A100
-#: (Fe 4x4x4, n_mu 312, P=4; GPU idle 77% of the trace).
-ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "masked"}
+#: handlers (``_active_local_cuda``; one leg-neutral source, cuBLAS on CUDA and
+#: rocBLAS on ROCM); ``"interval"``: :func:`active_local_matmul`; ``"masked"``:
+#: :func:`masked_local_matmul`.  A vendor with no row takes ``"interval"``.  Both
+#: XLA routes stay as the references the native route is gated against
+#: (tests/test_active_local_native_gate.py, same device).  ROCM was ``"masked"``
+#: (the interval route's ~64 x (3-6) while/cond trips per call cost ~36 us each on
+#: MI250X); the masked route's ``where`` selects then cost ~3.2 s per Fe Sigma tau
+#: run, more than its GEMMs, which the pointer-view handler does not spend.
+ACTIVE_LOCAL_ROUTE = {"cpu": "interval", "CUDA": "native", "ROCM": "native"}
 
 
 def active_local_route(platform):
@@ -62,7 +63,10 @@ def masked_local_matmul(a, b, bounds, weights, c=None, *, alpha, beta):
 
 
 def local_active_impl(platform):
-    """The XLA implementation behind a non-native route (``"interval"`` | ``"masked"``)."""
+    """The XLA implementation behind a non-native route (``"interval"`` | ``"masked"``).
+
+    A ``"native"`` row has no XLA implementation; its callers enter
+    ``_active_local_cuda`` instead (``active_local_route(p) == "native"``)."""
     return masked_local_matmul if active_local_route(platform) == "masked" else active_local_matmul
 
 

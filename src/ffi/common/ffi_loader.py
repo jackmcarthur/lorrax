@@ -203,7 +203,7 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentHostFfi",
 }
 
-#: The ROCM leg's handlers: the device families ported so far, phdf5 and slate.  The
+#: The ROCM leg's handlers: the device families ported so far (phdf5, slate, cublas_local).  The
 #: device legs compile the SAME sources, so the symbols are the CUDA leg's
 #: (``LRX_PHDF_HANDLER(<X>)`` is ``<X>Ffi`` on both); only one device leg is
 #: ever loaded in a process.  A family joins this table when it joins

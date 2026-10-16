@@ -9,6 +9,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from jax import shard_map
 from .resolve import mesh_platform
+from ._active_local import active_local_route
 
 
 # Kernel lessons: the batched 2-D SUMMA Green build (numbers: sandbox claim ids).
@@ -138,11 +139,12 @@ def _panel_contraction(mesh, active=True):
     whose interval is an attribute, so no bounds are read and the stream does not wait.
     The bounds are valid by construction (``_interleaved_kernel``), so no guard runs."""
     one = np.complex128(1.0)
-    if mesh_platform(mesh) == "CUDA":
+    platform = mesh_platform(mesh)
+    if active_local_route(platform) == "native":
         from ._active_local_cuda import (_native, _native_out, _prepared_native,
                                          require_active_local_cuda,
                                          require_prepared_active_local_cuda)
-        (require_active_local_cuda if active else require_prepared_active_local_cuda)()
+        (require_active_local_cuda if active else require_prepared_active_local_cuda)(platform)
 
         def contract(left, right, bounds, c):
             if bounds is None:

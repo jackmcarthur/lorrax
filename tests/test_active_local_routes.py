@@ -3,8 +3,8 @@
 ``distrib_la._active_local`` serves two XLA routes for the product
 ``a[q][:, lo:hi] diag(w[q]) b[q][lo:hi, :]`` (``ACTIVE_LOCAL_ROUTE``): the
 interval route (power-of-two slices under device control flow) and the masked
-route (one batched dot with the inactive storage selected to zero, the ROCM
-row).  Both must ignore whatever the inactive storage holds, NaN included.
+route (one batched dot with the inactive storage selected to zero; the ROCM
+row before the native port, kept as a reference).  Both must ignore whatever the inactive storage holds, NaN included.
 """
 import numpy as np
 import pytest
@@ -99,9 +99,8 @@ def test_invalid_bounds_give_nan(bad):
 
 
 def test_route_rows():
-    assert ACTIVE_LOCAL_ROUTE == {"cpu": "interval", "CUDA": "native", "ROCM": "masked"}
+    assert ACTIVE_LOCAL_ROUTE == {"cpu": "interval", "CUDA": "native", "ROCM": "native"}
     assert active_local_route("tpu") == "interval"
-    assert local_active_impl("ROCM") is masked_local_matmul
     assert local_active_impl("cpu") is active_local_matmul
 
 

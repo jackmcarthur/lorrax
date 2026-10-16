@@ -87,11 +87,15 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         note="Opt-in dial (LORRAX_BANDS_GEMM_FFI); tolerance not declared in code yet."),
     "cublas_local": Family(
         ("lorrax_cublas_local_",), "cublas",
-        _legs(("built", ""), ("xla", "distrib_la._active_local (masked: ACTIVE_LOCAL_ROUTE)"),
+        _legs(("built", ""), ("built", ""),
               ("xla", "distrib_la._active_local (interval: ACTIVE_LOCAL_ROUTE)")),
-        gate="tests/test_active_local_routes.py (masked vs interval vs dense, CPU)", tol=1e-13,
-        note="Sigma's active-range GEMM. ROCM takes the masked route (one batched dot, no device "
-             "control flow); the interval route's while/cond trips are launch-bound there."),
+        gate="tests/test_active_local_native_gate.py (native vs masked vs interval vs dense on "
+             "the same device, P=1 and P=4); tests/test_active_local_routes.py (XLA routes, CPU)",
+        tol=1e-13,
+        note="Sigma's active-range GEMM: one leg-neutral source (cublas/local_active_gemm_ffi.cc "
+             "over common/gpu_blas.h), cuBLAS on CUDA, rocBLAS on ROCM (the mapped "
+             "librocblas.so.5).  Pointer views into the original buffers; the bounds metadata "
+             "is read to the host per call (masked and interval stay as the XLA references)."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",
         _legs(("built", ""), ("xla", "distrib_la.subspace XlaSubspacePlan (SUBSPACE_ROUTE)"),
