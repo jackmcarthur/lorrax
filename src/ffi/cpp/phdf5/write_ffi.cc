@@ -163,6 +163,26 @@ static std::string h5_object_name(hid_t id)
 // an interaction with CUDA's stream-ordered allocator).  Using a
 // single ctx-owned event reused across writes avoids the per-call
 // destroy entirely; the event is destroyed once in close_ctx.
+// Index of the first NaN/Inf scalar of width 4 or 8 in ``bytes``, or
+// SIZE_MAX.  Exponent-all-ones test on the bit pattern (memcpy: no aliasing).
+static size_t first_nonfinite(const void* p, size_t bytes, int width) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    if (width == 8) {
+        const uint64_t mask = 0x7ff0000000000000ULL;
+        for (size_t i = 0, n = bytes / 8; i < n; ++i) {
+            uint64_t u; std::memcpy(&u, b + 8 * i, 8);
+            if ((u & mask) == mask) return i;
+        }
+    } else if (width == 4) {
+        const uint32_t mask = 0x7f800000u;
+        for (size_t i = 0, n = bytes / 4; i < n; ++i) {
+            uint32_t u; std::memcpy(&u, b + 4 * i, 4);
+            if ((u & mask) == mask) return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
 static void async_worker(
     PhdfCtx* ctx,
     hid_t ds_id,
@@ -176,6 +196,7 @@ static void async_worker(
     bool wait_for_d2h,
     size_t bytes,                        // per-rank payload, for the timing line
     bool collective,                     // two-phase collective vs independent
+    int finite_width,                    // 0, or 4/8: refuse a NaN/Inf scalar
     ffi::Promise promise)
 {
     // Diagnostic timing, symmetric with read_ffi.cc's two do_time sites.
@@ -353,6 +374,15 @@ static void async_worker(
 
     auto t_select = now();
 
+    // require_finite: the bytes are this rank's whole block, already on the
+    // host (after the D2H wait above).  A rank with a NaN/Inf writes nothing
+    // but stays in the collective; its Promise fails after the rendezvous.
+    const size_t bad_at = finite_width ? first_nonfinite(src_buf, bytes, finite_width)
+                                       : SIZE_MAX;
+    if (bad_at != SIZE_MAX) {
+        H5Sselect_none(filespace);
+        H5Sselect_none(memspace);
+    }
     hid_t dxpl = collective ? ctx->dxpl_coll : ctx->dxpl_indep;
     herr_t st = H5Dwrite(ds_id, native_type, memspace, filespace, dxpl,
                          src_buf);
@@ -376,6 +406,17 @@ static void async_worker(
         fail_task(ffi::ErrorCode::kInternal,
                   "phdf5 async write: H5Dwrite failed ds=" +
                   h5_object_name(ds_id));
+        return;
+    }
+    if (bad_at != SIZE_MAX) {
+        std::ostringstream os;
+        os << "GATE slab_io_write_finite: got: a non-finite value at scalar "
+           << bad_at << " of rank " << ctx->rank << "'s block of "
+           << h5_object_name(ds_id) << "; want: every value finite "
+           << "(write_slab require_finite=True); this rank wrote nothing and "
+           << "every rank raises at the next read or close, so the write is "
+           << "never published";
+        fail_task(ffi::ErrorCode::kInvalidArgument, os.str());
         return;
     }
 
@@ -450,12 +491,22 @@ static ffi::Future WriteDispatchImpl(
             return refuse(ffi::ErrorCode::kInvalidArgument, "phdf5 write: " + perr);
         }
     }
-    if (control.size() != 2 + 2 * n_ctl) {
+    if (control.size() != 2 + 2 * n_ctl && control.size() != 3 + 2 * n_ctl) {
         std::ostringstream os;
         os << "phdf5 write: posted control has " << control.size()
-           << " values; want 2 + 2 ndim = " << 2 + 2 * n_ctl;
+           << " values; want 2 + 2 ndim = " << 2 + 2 * n_ctl
+           << " (+1 flags word)";
         return refuse(ffi::ErrorCode::kInvalidArgument, os.str());
     }
+    const int64_t write_flags =
+        control.size() == 3 + 2 * n_ctl ? control.back() : 0;
+    if (write_flags & ~kWriteFlagRequireFinite) {
+        std::ostringstream os;
+        os << "phdf5 write: unknown flags 0x" << std::hex << write_flags
+           << " in the posted control (want kWriteFlagRequireFinite only)";
+        return refuse(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    const bool require_finite = (write_flags & kWriteFlagRequireFinite) != 0;
     const int64_t handle_host[2] = {control[0], control[1]};
     auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
     const hid_t ds_id = (hid_t)handle_host[1];
@@ -516,7 +567,8 @@ static ffi::Future WriteDispatchImpl(
     }
 
     std::vector<int64_t> offset_host(control.begin() + 2, control.begin() + 2 + N);
-    std::vector<int64_t> valid_shape_host(control.begin() + 2 + N, control.end());
+    std::vector<int64_t> valid_shape_host(control.begin() + 2 + N,
+                                          control.begin() + 2 + 2 * N);
 
     std::vector<int64_t> coord = unravel_rank(ctx->rank, mesh_shape);
 
@@ -643,6 +695,13 @@ static ffi::Future WriteDispatchImpl(
         }
     }
 
+    // Scalar width the finite check reads (0: integers are always finite).
+    int finite_width = 0;
+    if (require_finite) {
+        if (dtype == ffi::DataType::F32 || dtype == ffi::DataType::C64) finite_width = 4;
+        if (dtype == ffi::DataType::F64 || dtype == ffi::DataType::C128) finite_width = 8;
+    }
+
     hid_t dset = (hid_t)ds_id;
     if (dset < 0 || H5Iis_valid(dset) <= 0) {
         return fail(ffi::ErrorCode::kInvalidArgument,
@@ -751,14 +810,14 @@ static ffi::Future WriteDispatchImpl(
                  mem_dims = std::move(mem_dims),
                  offset_base = std::move(offset_host),
                  valid_shape = std::move(valid_shape_host),
-                 src_buf, wait_for_d2h, bytes, collective,
+                 src_buf, wait_for_d2h, bytes, collective, finite_width,
                  promise = std::move(promise)]() mutable
     {
         async_worker(ctx, dset, native_type,
                      std::move(offset), std::move(file_count),
                      std::move(mem_dims),
                      std::move(offset_base), std::move(valid_shape),
-                     src_buf, wait_for_d2h, bytes, collective,
+                     src_buf, wait_for_d2h, bytes, collective, finite_width,
                      std::move(promise));
     };
 

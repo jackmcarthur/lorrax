@@ -1482,6 +1482,9 @@ class ResidentBankPayload:
         self._stored = {}
         self._pending = set()
         self._depth, self._read = 0, False
+        # name -> replicated device bool: every ``require_finite`` write of the
+        # field was all-finite.  Read ONCE, when the masks publish (write_attr).
+        self._finite = {}
 
     def __str__(self):
         tier = {"device": "device-resident", "host": "host-resident",
@@ -1517,6 +1520,7 @@ class ResidentBankPayload:
             for store in self._fields.values():
                 store.release()
         self._fields.clear()
+        self._finite.clear()
         self.header_json = None
 
     def _spec(self, ndim):
@@ -1581,12 +1585,37 @@ class ResidentBankPayload:
     def write_attr(self, name, value):
         # Masks and typed tables are authenticated by the JSON header alone.
         if name == "header_json":
+            # The header carries the masks: no span of a non-finite write
+            # publishes (the deferred check of ``write_slab(require_finite)``).
+            self._refuse_nonfinite_writes()
             self.header_json = bytes(value).decode()
+
+    def _refuse_nonfinite_writes(self):
+        """The deferred finite check: ONE device read for every checked write.
+
+        A resident write has no host copy to scan (the file route checks the
+        writer's staging bytes), so each ``require_finite`` write ANDs a device
+        reduction into its field's flag without a sync; the flags are read here,
+        together, where the masks publish.  The flags are global reductions, so
+        every rank reads the same verdict and refuses identically.
+        """
+        if not self._finite:
+            return
+        names = sorted(self._finite)
+        flags = _flag_stack(self.mesh, len(names))(*(self._finite[n] for n in names))
+        self._finite.clear()
+        ok = np.asarray(flags.addressable_shards[0].data)
+        bad = [n for n, good in zip(names, ok) if not good]
+        if bad:
+            _refuse(f"scratch {bad[0]} contains nonfinite values "
+                    f"(resident bank {self.label}; fields {bad})")
 
     def sync_writes(self):
         return None
 
-    def write_slab(self, name, A, *, offset):
+    def write_slab(self, name, A, *, offset, require_finite=False):
+        """``require_finite``: the check is deferred to the mask publish
+        (:meth:`_refuse_nonfinite_writes`), never a per-write sync."""
         if name not in self._fields:
             _refuse(f"resident bank {name} was not created")
         store, stored = self._fields[name], self._stored[name]
@@ -1596,6 +1625,10 @@ class ResidentBankPayload:
                 or any(o + s > n for o, s, n in zip(offset, A.shape, stored))
                 or not A.sharding.is_equivalent_to(NamedSharding(self.mesh, self._spec(A.ndim)), A.ndim)):
             _refuse(f"resident bank {name} write must be a face-tiled full-carrier span")
+        if require_finite:
+            flag = _all_finite(self.mesh)(A)
+            prev = self._finite.get(name)
+            self._finite[name] = flag if prev is None else _both_finite(self.mesh)(prev, flag)
         # A square operator is zeroed past its logical extent, as the file
         # stores it; a direction panel is stored whole.
         logical = None if name.startswith("line_") else self._logical[name][-1]
@@ -1654,6 +1687,23 @@ class ResidentBankPayload:
                                dtype=r["dtype"], partition_spec=partition_spec,
                                valid_shape=r.get("valid_shape"))
                 for r in requests]
+
+
+@lru_cache(maxsize=None)
+def _all_finite(mesh):
+    """``all(isfinite(a))`` as a replicated device bool (no host read)."""
+    return jax.jit(lambda a: jnp.all(jnp.isfinite(a)), out_shardings=NamedSharding(mesh, P()))
+
+
+@lru_cache(maxsize=None)
+def _both_finite(mesh):
+    return jax.jit(jnp.logical_and, out_shardings=NamedSharding(mesh, P()))
+
+
+@lru_cache(maxsize=None)
+def _flag_stack(mesh, n):
+    """``n`` replicated device bools -> one replicated vector (one host read)."""
+    return jax.jit(lambda *flags: jnp.stack(flags), out_shardings=NamedSharding(mesh, P()))
 
 
 @lru_cache(maxsize=None)
@@ -2394,16 +2444,6 @@ def _complete_bank(path, header):
         _stamp_header(path, header, "shared_pole_bank.complete")
 
 
-def _refuse_nonfinite(finite):
-    """Refuse the first ``(name, all-finite)`` entry that is false: one read for the call."""
-    if not finite:
-        return
-    flags = np.asarray(jnp.stack([ok for _, ok in finite]))
-    for (name, _), ok in zip(finite, flags):
-        if not ok:
-            _refuse(f"scratch {name} contains nonfinite values")
-
-
 def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
     """Validate/admit one line sample's panels for parents [q0, q1).
 
@@ -2427,7 +2467,7 @@ def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
     charge = "photon_layout" not in header
     basis = meta.mu_basis
     spec = P(None, None, "x", "y")
-    pending, finite = [], []
+    pending = []
     for family, array in line["panels"].items():
         width = int(array.shape[-1])
         stored = panels_meta["width"][family][sample - p0]
@@ -2454,9 +2494,9 @@ def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
                 temporary = 0
             _admit(ledger, "write_bank_" + name, output, temporary + arg,
                    device_panel=max(arg, output), native_host=True)
-            finite.append((name, jnp.all(jnp.isfinite(value))))
+            # Finite: checked by the writer on its host copy (write_slab
+            # require_finite in _write_bank_payload), not by a D2H read here.
             pending.append((family, name, value, counts))
-    _refuse_nonfinite(finite)
     return sample, pending
 
 
@@ -2495,7 +2535,6 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
     masks = _bank_masks(header)
     # Validate every argument before opening the writer: a bad second field
     # must not leave an otherwise legal first field queued in the same call.
-    finite = []
     for name, array in pending:
         geometry = _sample_field(header, name)
         sample = geometry is not None
@@ -2520,11 +2559,12 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
             temporary = 0
         else:
             arg, output, temporary = _conversion_bytes(basis,array.shape,spec,unpack=True,operator=True)
-        # Factor-sized finite-check envelope, separate from caller input.
+        # Factor-sized conversion envelope, separate from caller input.
         _admit(ledger,"write_bank_"+name,output,temporary+arg,
                device_panel=max(arg,output),native_host=True)
-        finite.append((name, jnp.all(jnp.isfinite(array))))
-    _refuse_nonfinite(finite)
+        # Finite: checked by the writer on its host copy (write_slab
+        # require_finite in _write_bank_payload); a non-finite field raises
+        # at the transaction's close, before its masks publish.
     line = (None if line is None else
             _prepare_line_write(header, line, q0=q0, q1=q1, meta=meta, mesh_xy=mesh_xy, ledger=ledger))
     return q0, q1, rows, pending, line, masks
@@ -2546,7 +2586,7 @@ def _write_bank_payload(io, header, meta, prepared):
         io.create_dataset(name, shape=disk_shape, dtype=np.complex128)
         canonical = array if "photon_layout" in header else basis.unpack_operator(array, spec=spec)
         offset = (q0, rows[0], 0, 0) if geometry else (q0, 0, 0)
-        io.write_slab(name, canonical, offset=offset)
+        io.write_slab(name, canonical, offset=offset, require_finite=True)
         # SlabIO's write queue owns canonical until drained. Drain each
         # field so endpoint staging cannot accumulate across fields.
         io.sync_writes()
@@ -2565,7 +2605,7 @@ def _write_bank_payload(io, header, meta, prepared):
             charge = "photon_layout" not in header and not name.endswith("_cross")
             value = basis.unpack_axis(array, 2, spec=spec) if charge else array
             io.create_dataset(name, shape=(shape["nq"],) + tuple(value.shape[1:]), dtype=np.complex128)
-            io.write_slab(name, value, offset=(q0, 0, 0, 0))
+            io.write_slab(name, value, offset=(q0, 0, 0, 0), require_finite=True)
             io.sync_writes()
             del value
             if not name.endswith("_cross"):

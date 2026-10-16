@@ -2065,6 +2065,10 @@ def _local_address(a) -> int:
     return int(shards[0].data.unsafe_buffer_pointer())
 
 
+#: Trailing write-control flag (cpp/phdf5/ctx.h kWriteFlagRequireFinite).
+_WRITE_REQUIRE_FINITE = 1
+
+
 def _posted(platform, address, kind, values, call):
     """Post ``values`` under ``address`` and make the call; withdraw the post if
     the call raised before its handler took it (ctx.h POSTED CONTROL)."""
@@ -2941,6 +2945,7 @@ class _FfiBackend(_DatasetGeometry):
         global_shape: Sequence[int] | None = None,
         valid_shape: Sequence[int] | None = None,
         dtype=None,
+        require_finite: bool = False,
     ) -> None:
         if not isinstance(A, jax.Array):
             A = jnp.asarray(A)
@@ -3007,19 +3012,20 @@ class _FfiBackend(_DatasetGeometry):
             plan = None
         if plan is None:
             self._dispatch_write(name, A, off, vshape, ds_shape, mesh_shape,
-                                 independent=False)
+                                 independent=False, require_finite=require_finite)
             return
         if plan == "as-is":
             self._dispatch_write(name, A, off, vshape, ds_shape, mesh_shape,
-                                 independent=True)
+                                 independent=True, require_finite=require_finite)
             return
         for piece, p_off, p_valid in _file_order_pieces(A, off, vshape, plan,
                                                         self.mesh):
             self._dispatch_write(name, piece, p_off, p_valid, ds_shape,
-                                 mesh_shape, independent=True)
+                                 mesh_shape, independent=True,
+                                 require_finite=require_finite)
 
     def _dispatch_write(self, name, A, off, vshape, gshape, mesh_shape, *,
-                        independent):
+                        independent, require_finite=False):
         """Queue one collective write call of ``A`` (already on this mesh)."""
         axis_count_per_dim, axis_flat = _sharding_to_axis_info(
             A.sharding, A.ndim)
@@ -3065,6 +3071,10 @@ class _FfiBackend(_DatasetGeometry):
         # two writes in flight.  The address query is on the worker too: on
         # the CPU client it waits for A's producer to start (pointer study).
         control = (ctx_handle, ds_id, *(int(v) for v in off), *(int(v) for v in vshape))
+        if require_finite:
+            # The writer checks the bytes it already holds (ctx.h
+            # kWriteFlagRequireFinite): no reduction, no D2H read here.
+            control += (_WRITE_REQUIRE_FINITE,)
         kind = "write_independent" if independent else "write"
         platform = self._platform()
         if math.prod(int(s) for s in A.shape) == 0:

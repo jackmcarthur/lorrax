@@ -415,6 +415,7 @@ class SlabIO:
         global_shape: Sequence[int] | None = None,
         valid_shape: Sequence[int] | None = None,
         dtype=None,
+        require_finite: bool = False,
     ) -> None:
         """Write A as a hyperslab of dataset ``name``.
 
@@ -443,6 +444,14 @@ class SlabIO:
         whose last chunk is short).  An override that overruns the
         dataset refuses, on every rank.  ``global_shape`` is likewise
         only needed when ``write_slab`` has to create the dataset.
+
+        ``require_finite=True`` refuses a NaN/Inf anywhere in ``A``.  The
+        check runs where the bytes already are on the host -- the writer's
+        own staging copy (FFI tier; a rank holding a non-finite value
+        writes nothing and every rank raises at the next read or at
+        :meth:`close`) or the serial tier's host blocks (raises here,
+        before anything is written) -- so it costs no device reduction and
+        no device-to-host read of its own.
         """
         with _journal.op_scope("write", self.path, stack=self._stack, ds=name,
                                off=offset, cnt=tuple(A.shape) if hasattr(
@@ -453,6 +462,7 @@ class SlabIO:
                 offset=offset, global_shape=global_shape,
                 valid_shape=valid_shape,
                 dtype=dtype,
+                require_finite=require_finite,
             )
 
     # ------------------------------------------------------------------

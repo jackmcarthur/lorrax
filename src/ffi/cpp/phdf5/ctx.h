@@ -350,6 +350,15 @@ bool staging_totals(const PhdfCtx* ctx, size_t* n_live, size_t* pinned_bytes);
 enum ControlKind : int64_t {
     kCtlRead = 1, kCtlReadMulti = 2, kCtlWrite = 3, kCtlWriteIndependent = 4,
 };
+// A write's control is {ctx, ds_id, offset[N], valid_shape[N]} and may carry
+// ONE trailing flags word.  kWriteFlagRequireFinite: the writer thread checks
+// the bytes it already holds (the pinned D2H copy on a device leg, the
+// operand on the host leg) before H5Dwrite.  A rank holding a NaN/Inf writes
+// nothing (empty selection, still inside the collective) and fails the
+// write's Promise, so every rank raises at the next read or at close and a
+// store's masks never publish (SlabIO.write_slab require_finite).  This
+// replaces a separate jnp.isfinite reduction + D2H read per array.
+constexpr int64_t kWriteFlagRequireFinite = 1;
 // 0 = posted; 1 = an entry for (addr, kind) is already pending (refused).
 int  post_control(uint64_t addr, int64_t kind, const int64_t* v, int64_t n);
 bool retract_control(uint64_t addr, int64_t kind);

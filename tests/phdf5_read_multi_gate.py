@@ -287,6 +287,46 @@ with SlabIO(RPATH, mode="r", mesh=mesh) as rio:
     back = rio.read_slab("w", shape=blk.shape, offset=(0, 0, 0, 0), dtype=np.complex128,
                          partition_spec=P(None, None, None, None))
 verdict("posted_write_behind_queue", np.array_equal(np.asarray(back.addressable_shards[0].data), blk))
+# write_slab(require_finite=True): the writer checks the bytes it holds.  A rank whose
+# block has a NaN writes nothing, still enters the collective, and every rank raises
+# at close; the finite dataset round-trips and no NaN reaches the file.
+FPATH = os.path.join(OUT, f"finite_gate_P{ndev}.h5")
+bad_blk = blk.copy()
+bad_blk.flat[0] = np.nan
+_rows = jax.sharding.NamedSharding(mesh, row_spec)
+GOOD = jax.make_array_from_callback(blk.shape, _rows, lambda idx: blk[idx])
+BAD = jax.make_array_from_callback(blk.shape, _rows, lambda idx: bad_blk[idx])
+with SlabIO(FPATH, mode="w", mesh=mesh) as fio:
+    fio.create_dataset("good", shape=blk.shape, dtype=np.complex128)
+    fio.create_dataset("bad", shape=blk.shape, dtype=np.complex128)
+    fio.write_slab("good", GOOD, offset=(0, 0, 0, 0), require_finite=True)
+raised = None
+try:
+    with SlabIO(FPATH, mode="a", mesh=mesh) as fio:
+        fio.write_slab("bad", BAD, offset=(0, 0, 0, 0), require_finite=True)
+except Exception as exc:                                  # noqa: BLE001
+    raised = f"{type(exc).__name__}: {exc}"
+verdict("write_require_finite_refuses", raised is not None and "slab_io_write_finite" in raised,
+        (raised or "no error")[:200].replace("\n", " "))
+# The refused transaction leaves the file uncommitted: SlabIO will not reopen it.
+reopened = None
+try:
+    with SlabIO(FPATH, mode="r", mesh=mesh) as rio:
+        pass
+except Exception as exc:                                  # noqa: BLE001
+    reopened = str(exc)
+verdict("write_require_finite_unpublished",
+        reopened is not None and "not globally committed" in reopened, (reopened or "reopened")[:120])
+# The bytes themselves (raw h5py, rank 0 after every rank's teardown): the finite
+# dataset landed whole, and the refusing rank's block holds no NaN.
+barrier("read_multi_gate.finite_raw")
+if rank == 0:
+    import h5py
+    with h5py.File(FPATH, "r") as f:
+        g, b = f["good"][()], f["bad"][()]
+    verdict("write_require_finite_passes_finite", np.array_equal(g, blk))
+    verdict("write_require_finite_no_nan_on_disk", bool(np.isfinite(b).all()))
+barrier("read_multi_gate.finite_raw_done")
 from ffi.common import ffi_loader
 from ffi.io import _platform_for_mesh
 pending = ffi_loader.phdf5_pending_controls(platform=_platform_for_mesh(mesh))
