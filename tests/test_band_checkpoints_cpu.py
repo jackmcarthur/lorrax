@@ -169,6 +169,13 @@ def test_checkpoint_plan_members_are_their_own_runs():
     assert plain.sweep_counts is plain.counts and plain.sweep_matrix_counts is None
     with pytest.raises(Exception):
         _plans(enk, (20, NBAND + 1))
+    # A checkpoint that splits a degenerate pair refuses by name.
+    from gw.band_extrapolation import BandExtrapolationRefused
+    deg = enk.copy()
+    deg[:, 24] = deg[:, 23]
+    with pytest.raises(BandExtrapolationRefused, match="split a degenerate"):
+        _plans(deg, (24, 30))
+    _plans(deg, (23, 30))
 
 
 def test_checkpoints_equal_their_restricted_plans_and_the_run_is_unchanged(tmp_path):

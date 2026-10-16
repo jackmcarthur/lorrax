@@ -599,6 +599,20 @@ def plan_band_checkpoints(
         raise BandExtrapolationRefused(
             f"band_extrapolation_checkpoints {counts}: a checkpoint above "
             f"number_bands_sigma = {nb_logical} is not a partial sum of this run")
+    # A checkpoint is a band count the study REPORTS, so it is held to the rule
+    # number_bands_sigma is held to: it may not split a degenerate multiplet
+    # (a split sum is not star-covariant).  The run's own count is checked at
+    # startup; its boundary is outside this window.
+    gaps = boundary_min_gaps(np.asarray(enk_ry, dtype=np.float64)[:, :nb_logical],
+                             is_full_spectrum=False)
+    split = [n for n in counts if n < nb_logical and not gaps[n] > float(tol_ry)]
+    if split:
+        raise BandExtrapolationRefused(
+            f"band_extrapolation_checkpoints: count(s) {split} split a degenerate "
+            f"multiplet (smallest gap across the boundary "
+            + ", ".join(f"{gaps[n] * RYD_TO_EV * 1e3:.4f} meV" for n in split)
+            + f", tolerance {float(tol_ry) * RYD_TO_EV * 1e3:.4f} meV); name counts "
+            f"at clean boundaries")
     options = dict(enk_ry=enk_ry, n_occ=n_occ, tol_ry=tol_ry, fractions=fractions,
                    bracket_scheme=bracket_scheme)
     main = plan_band_brackets(enabled=True, nb_logical=nb_logical,
