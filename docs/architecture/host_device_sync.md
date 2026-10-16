@@ -122,7 +122,7 @@ functions, not a pytest:
 
 | scope | guard | status (Fe V2 P=4) |
 |---|---|---|
-| `response_bank.produce_sample_bank`, `_integrate_sigma_batches` | `disallow` | passes, eqp exact (dput/w2 g5b; dput/w3 g8a with `LORRAX_CHECK_COUNTS=1`) |
+| `response_bank.produce_sample_bank`, `_integrate_sigma_batches` | `disallow` | passes, eqp exact (dput/w2 g5b) |
 | Σ per-window `window_pick`, `run_window`, `window_arguments`, selector | `disallow_explicit` | passes (same runs) |
 | `construct_shared_poles` | `disallow` | trips on the per-round round table (dput/w2 g5d) |
 

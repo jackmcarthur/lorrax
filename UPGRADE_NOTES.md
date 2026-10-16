@@ -59,8 +59,7 @@ computed on the device and discarded on shell; transient capacity × n_ω comple
 - **Multi-rank runs no longer depend on the GPU placement.** The four-rank
   reductions on the Fe path are rank-ordered, so two runs with different
   rank→GPU maps give the same bits.
-- New registry rows: `LORRAX_STAGE_SYNC`, `LORRAX_CHECK_COUNTS`,
-  `LORRAX_KDFT_KBOX_ARM`.
+- New registry rows: `LORRAX_STAGE_SYNC`, `LORRAX_KDFT_KBOX_ARM`.
 
 | lane (commit) | what | measured effect (Fe V2 P=4 unless noted) | gate |
 |---|---|---|---|
