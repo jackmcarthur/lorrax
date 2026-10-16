@@ -308,6 +308,80 @@ def load_eigenvectors_h5(path: str | Path):
 
 
 
+#: The circular convention every helicity table states in its header: the
+#: field defines the label (campaign-wide, 2026-10-16), not the exciton.
+HELICITY_CONVENTION = (
+    "σ+ is the field E(t) = E₀ (cos ωt, sin ωt, 0): x → y, counter-clockwise "
+    "seen from +z",
+    "D = ⟨0|r|S⟩ (exciton_data/dipoles); I± = |D_x ∓ i D_y|² / (2 N_k) in "
+    "bohr² per unit cell",
+    "η = (I+ − I−) / (I+ + I−): +1 is pure σ+, −1 pure σ−",
+)
+
+
+def inplane_helicity(dipoles, n_k):
+    r"""Per-state circular absorption strengths in the plane, per unit cell.
+
+    σ± is the field :math:`E(t) = E_0(\cos\omega t, \pm\sin\omega t, 0) =
+    \mathrm{Re}[E_0\,\varepsilon_\pm e^{-i\omega t}]` with
+    :math:`\varepsilon_\pm = (\hat x \pm i\hat y)/\sqrt 2` (σ+ rotates
+    x → y, counter-clockwise seen from +z).  Absorption into |S⟩ goes as
+    :math:`|\langle S|\varepsilon\cdot\hat r|0\rangle|^2 =
+    |\varepsilon\cdot D^*|^2` with :math:`D = \langle 0|\hat r|S\rangle`:
+
+    .. math::
+        I_\pm = \frac{|D_x \mp i D_y|^2}{2 N_k},\qquad
+        \eta = \frac{I_+ - I_-}{I_+ + I_-}.
+
+    ``dipoles`` is :func:`exciton_dipole_projections`' ``(n_states, 3)``,
+    which is ⟨0|r̂|S⟩ times the global −i of the velocity form
+    (``d = ⟨c|v̂|v⟩/ΔE = i⟨c|r̂|v⟩``) on the native route and on the
+    ``bse_k_grid`` route alike; no modulus sees that factor.  The
+    ⟨S|r̂|0⟩ spelling (a conjugated D) swaps I+ and I−, so the convention
+    lives in this function and nowhere else.  An exciton normalised over the
+    N_k-point zone has |D|² ∝ N_k, so the division gives strengths per unit
+    cell (bohr²), and I+ + I− is the in-plane |D|²/N_k.
+
+    Returns ``(i_plus, i_minus, eta)``, each ``(n_states,)``; ``eta`` is NaN
+    for a state with no in-plane strength.
+    """
+    d = np.asarray(dipoles, dtype=np.complex128)
+    n_k = int(n_k)
+    if d.ndim != 2 or d.shape[1] < 2 or n_k < 1:
+        raise ValueError(
+            f"inplane_helicity: want (n_states, 3) dipoles and n_k >= 1; got "
+            f"shape {d.shape} and n_k = {n_k}")
+    i_plus = np.abs(d[:, 0] - 1j * d[:, 1]) ** 2 / (2.0 * n_k)
+    i_minus = np.abs(d[:, 0] + 1j * d[:, 1]) ** 2 / (2.0 * n_k)
+    total = i_plus + i_minus
+    eta = np.full(total.shape, np.nan)
+    np.divide(i_plus - i_minus, total, out=eta, where=total > 0.0)
+    return i_plus, i_minus, eta
+
+
+def helicity_table_lines(energies_ev, dipoles, n_k):
+    """The ``bse_jax --helicity-table`` report block, one row per state.
+
+    The convention (:data:`HELICITY_CONVENTION`) and ``N_k`` head the
+    table; the rows are :func:`inplane_helicity` of ``dipoles`` beside each
+    state's energy (eV), named ``S001…`` as in the exciton-spectrum table.
+    """
+    i_plus, i_minus, eta = inplane_helicity(dipoles, n_k)
+    energies_ev = np.asarray(energies_ev, dtype=np.float64)
+    if energies_ev.shape != i_plus.shape:
+        raise ValueError(
+            f"helicity_table_lines: {energies_ev.shape[0]} energies for "
+            f"{i_plus.shape[0]} dipoles")
+    lines = [f"  {line}" for line in HELICITY_CONVENTION]
+    lines += [f"  N_k = {int(n_k)}", "",
+              "  state   energy (eV)    I+ (bohr²)     I− (bohr²)       η"]
+    for index, (e, ip, im, h) in enumerate(
+            zip(energies_ev, i_plus, i_minus, eta), start=1):
+        lines.append(f"  S{index:03d}  {e:12.5f}  {ip:13.6e}  {im:13.6e}  "
+                     + ("      n/a" if not np.isfinite(h) else f"{h:+9.4f}"))
+    return lines
+
+
 def slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ, n_val, n_cond):
     """Slice (nb, nb) dipole tables → BSE (nc, nv) sub-block.
 

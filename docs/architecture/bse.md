@@ -262,6 +262,26 @@ eigenvector tile) and stores $\langle 0|\hat r_\alpha|S\rangle$ as
 `exciton_data/dipoles`, shape (1, N, 3, 2), in bohr. Flag rules:
 [drivers](../drivers.md#bse-bsebse_jax).
 
+In-plane helicity: `--helicity-table` adds each written state's circular
+strengths to `bse.out` (`absorption_common.inplane_helicity`, the one place
+the convention lives). σ+ is the field $E(t) = E_0(\cos\omega t, \sin\omega t,
+0) = \mathrm{Re}[E_0\varepsilon_+ e^{-i\omega t}]$ with
+$\varepsilon_\pm = (\hat x \pm i\hat y)/\sqrt2$: it rotates x → y,
+counter-clockwise seen from +z. Absorption into $|S\rangle$ goes as
+$|\langle S|\varepsilon\cdot\hat r|0\rangle|^2 = |\varepsilon\cdot D^*|^2$ with
+$D = \langle 0|\hat r|S\rangle$, so
+
+$$I_\pm = \frac{|D_x \mp i D_y|^2}{2N_k},\qquad \eta = \frac{I_+ - I_-}{I_+ + I_-},$$
+
+per unit cell in bohr² (an exciton normalized over $N_k$ points has
+$|D|^2 \propto N_k$). The stored dipoles are $D$ times the global $-i$ of the
+velocity form ($d = \langle c|\hat v|v\rangle/\Delta E = i\langle c|\hat r|v\rangle$)
+on the native and the `bse_k_grid` routes alike, which no modulus sees; the
+conjugated spelling $\langle S|\hat r|0\rangle$ would swap $I_+$ and $I_-$. On a
+C3-symmetric toy the transitions into $p_\pm = (p_x \pm i p_y)/\sqrt2$ come out
+pure σ± ($\langle L_z\rangle = \pm1$), and the two routes agree to 1e-14 at
+shared k (`tests/test_bse_helicity_cpu.py`).
+
 ## Outputs
 
 - `bse.out`: the run report of the `--lanczos` route (`--report-file`;

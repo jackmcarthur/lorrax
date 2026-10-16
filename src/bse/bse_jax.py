@@ -63,6 +63,7 @@ def _preview_lanczos(
     n_eig: int = 5,
     write_eigs: int | None = None,
     dipole_file: str | None = None,
+    helicity_table: bool = False,
     max_lanczos_iter: int | None = None,
     include_W: bool = True,
     eqp_file: str | None = None,
@@ -249,6 +250,14 @@ def _preview_lanczos(
                     eigenvectors, build_dipole_vector_bse(
                         d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
                     n_write)
+            if helicity_table and report is not None:
+                # Report-only: the per-state σ± strengths of the dipoles just
+                # stored, under the one convention ``inplane_helicity`` owns.
+                from .absorption_common import helicity_table_lines
+                report.heading("In-plane helicity per state (per unit cell)")
+                for line in helicity_table_lines(
+                        eigenvalues_host[:n_write] * ryd2ev, dipoles, nk):
+                    report.emit(line)
         with timing.section("bse.write_eigenvectors", announce=True):
             write_eigenvectors_stream(
                 "eigenvectors.h5",
@@ -365,6 +374,13 @@ def build_parser():
              "exciton_data/dipoles in eigenvectors.h5.  Under bse_k_grid it "
              "is the deck (coarse) WFN's dipole.h5: the densifier carries it "
              "through the htransform into the fine states")
+    parser.add_argument(
+        "--helicity-table", action="store_true",
+        help="with --dipole: add each written state's in-plane circular "
+             "strengths to the report, I+- = |D_x -+ i D_y|^2/(2 N_k) per unit "
+             "cell for D = <0|r|S>, and eta = (I+ - I-)/(I+ + I-); sigma+ is the "
+             "field E0 (cos wt, sin wt, 0), x -> y, counter-clockwise seen "
+             "from +z (absorption_common.inplane_helicity)")
     parser.add_argument(
         "--report-file", default=None,
         help="human-readable Lanczos report (default: bse.out)")
@@ -506,7 +522,7 @@ _ROUTE_DESTS = {
         "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
         "davidson_m_max", "trlan_m_max", "trlan_n_keep", "eqp", "n_occ",
-        "band_degeneracy", "degeneracy_tol_ry", "dipole"},
+        "band_degeneracy", "degeneracy_tol_ry", "dipole", "helicity_table"},
 }
 
 
@@ -540,6 +556,9 @@ def parse_args(argv=None):
                      "eigenvectors: it needs --write-eigs and --tda (the "
                      "full-BSE oscillator strength needs both halves of the "
                      "paired vector)")
+    if args.helicity_table and args.dipole is None:
+        parser.error("--helicity-table reports the per-state dipoles: it needs "
+                     "--dipole (with --write-eigs and --tda)")
     return route, args
 
 
@@ -626,6 +645,8 @@ def main(argv=None) -> int:
             "Eigenvectors   : " + (
                 "written to a separate numerical artifact"
                 + (" with per-state dipoles <0|r|S>" if args.dipole else "")
+                + (" and their in-plane helicity table" if args.helicity_table
+                   else "")
                 if args.write_eigs is not None else "not requested"),
         ))
         report.sampling(wfn=wfn, sym=sym)
@@ -641,6 +662,7 @@ def main(argv=None) -> int:
             n_eig=args.n_eig,
             write_eigs=args.write_eigs,
             dipole_file=args.dipole,
+            helicity_table=args.helicity_table,
             max_lanczos_iter=args.max_lanczos_iter,
             include_W=not (args.rpa or not args.bse),
             eqp_file=args.eqp,
