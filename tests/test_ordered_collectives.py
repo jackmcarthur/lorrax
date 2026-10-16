@@ -241,3 +241,31 @@ def test_planner_budget_reserves_the_ordered_transient():
              / (1.0 + runtime.MEMORY_MARGIN * runtime.POOL_OVERSHOOT))
     want = max(min(plain - C.ordered_transient_bytes(), runtime.pool_reservation_bytes(total)), 0.25 * total)
     assert runtime.planner_budget_bytes(total, "local") == want
+
+
+def test_ordered_psum_replicated_out_specs_under_check_vma():
+    """``lax.psum`` is typed replicated under ``check_vma=True``, so ``out_specs=P()`` is legal;
+    ``ordered_psum`` must be too (one-shot and slabbed, pytree), with the rank-order bits.
+    Regression: head_correction._local_fold (hsuite gnppm, na_sc head) refused at trace time."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax import shard_map
+    from jax.sharding import PartitionSpec as P
+    from lxkit import ordered_psum
+    jax.config.update("jax_enable_x64", True)
+    mesh = _mesh((2, 2), ("x", "y"))
+    rng = np.random.default_rng(13)
+    g = rng.standard_normal((4, 3, 7, 5)) + 1j * rng.standard_normal((4, 3, 7, 5))
+    x = jnp.asarray(g.reshape(12, 7, 5))
+    want = _rank_fold(list(g)).tobytes()
+    for slab in (1 << 40, 64):                       # one-shot, slabbed
+        f = jax.jit(shard_map(lambda v: ordered_psum({"a": v, "b": 2 * v}, ("x", "y"), slab_bytes=slab),
+                              mesh=mesh, in_specs=P(("x", "y")), out_specs={"a": P(), "b": P()},
+                              check_vma=True))
+        out = f(x)
+        assert np.asarray(out["a"]).tobytes() == want, slab
+        # partial axis: replicated over y only, varying over x
+        h = jax.jit(shard_map(lambda v: ordered_psum(v, "y", slab_bytes=slab), mesh=mesh,
+                              in_specs=P(("x", "y")), out_specs=P("x"), check_vma=True))
+        assert np.asarray(h(x)).shape == (6, 7, 5)

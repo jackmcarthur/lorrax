@@ -194,7 +194,22 @@ def ordered_psum_scatter(x, axis_name, *, scatter_dimension: int = 0, tiled: boo
     return out.reshape(out_shape)
 
 
+def _all_gather_invariant(part, axis_name):
+    """Tiled all_gather typed invariant over ``axis_name`` (jax's ``all_gather_invariant``;
+    without it, the exact one-owner psum of the gathered value)."""
+    from jax import lax
+    try:
+        from jax._src.lax.parallel import all_gather_invariant
+    except ImportError:                                  # pragma: no cover - older/newer jax
+        import jax.numpy as jnp
+        full = lax.all_gather(part, axis_name, tiled=True)
+        return lax.psum(jnp.where(lax.axis_index(axis_name) == 0, full, jnp.zeros((), full.dtype)),
+                        axis_name)  # exact-reduce: one owner (rank 0), zeros elsewhere
+    return all_gather_invariant(part, axis_name, tiled=True)
+
+
 def _ordered_psum_leaf(x, axis_name, slab):
+    import jax
     import jax.numpy as jnp
     from jax import lax
     x = jnp.asarray(x)
@@ -204,12 +219,18 @@ def _ordered_psum_leaf(x, axis_name, slab):
     shape, L = x.shape, int(x.size)
     item = x.dtype.itemsize
     flat = x.reshape(-1)
+    # Under shard_map(check_vma=True) lax.psum's result is replicated (invariant) over
+    # axis_name; an all_gather's is typed varying.  Match psum's type where the operand
+    # varies over the reduced axes (out_specs=P() would refuse otherwise).
+    names = axis_name if isinstance(axis_name, (tuple, list)) else (axis_name,)
+    invariant = bool(set(names) & set(getattr(jax.typeof(x), "vma", ()) or ()))
     if L * item <= slab or L < 2 * n:
         pad = (-L) % n
         if pad:
             flat = jnp.concatenate([flat, jnp.zeros((pad,), flat.dtype)])
         part = _a2a_sum(flat.reshape(1, n, -1), axis_name)[0]
-        full = lax.all_gather(part, axis_name, tiled=True)
+        full = (_all_gather_invariant(part, axis_name) if invariant
+                else lax.all_gather(part, axis_name, tiled=True))
         _record("psum", x, n, "one-shot", 3 * (L + pad) * item, 0)
         return (full[:L] if pad else full).reshape(shape)
     b = max(1, min(L // n, slab // (n * item)))
@@ -229,6 +250,11 @@ def _ordered_psum_leaf(x, axis_name, slab):
         tail = jnp.concatenate([out[k * w:], jnp.zeros((tp - t,), flat.dtype)]) if tp > t else out[k * w:]
         part = _a2a_sum(tail.reshape(1, n, tp // n), axis_name)[0]
         out = lax.dynamic_update_slice(out, lax.all_gather(part, axis_name, tiled=True)[:t], (k * w,))
+    if invariant:
+        # The in-place buffer is the (varying) operand.  One exact one-owner sum types the
+        # result invariant without a second buffer: rank 0's bits plus zeros, in any order.
+        out = lax.psum(jnp.where(lax.axis_index(axis_name) == 0, out, jnp.zeros((), out.dtype)),
+                       axis_name)  # exact-reduce: one owner (rank 0), zeros elsewhere
     _record("psum", x, n, f"slabbed {k}x{w}+{t}", 3 * w * item, 0)
     return out.reshape(shape)
 
