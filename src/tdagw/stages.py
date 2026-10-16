@@ -340,6 +340,21 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
         f"  mesh            : {runtime.mesh_shape} on {runtime.n_devices} "
         f"{runtime.platform} device(s)",
     ]
+    rec = system.receipts
+    if rec:                                  # the bundle route's receipts (also in the header)
+        pr, vr = rec["pairs"], rec["velocity"]
+        lines.append(
+            f"  TD system       : {'bse_k_grid' if rec['densified'] else 'native'} bundle, "
+            f"energies {rec['energy_source']}, r = v/(i dE_DFT) from {vr['route']}; "
+            f"pair rule {pr['rule']} at {pr['gap_ev']:g} eV (vv' below: {pr['vv']['below_gap']} "
+            f"of {pr['vv']['pairs']}, cc' below: {pr['cc']['below_gap']} of {pr['cc']['pairs']}), "
+            f"min c-v gap {pr['min_cv_gap_ev']:.4f} eV, max|r| {pr['max_abs_r_bohr']:.3g} bohr")
+        if "bse_dipoles" in rec:
+            bd = rec["bse_dipoles"]
+            lines.append(
+                f"  gauge receipt   : <0|r|S> of {bd['n_states']} BSE states from the header r "
+                f"and the eigenvectors vs bse_jax's: rel dev {bd['dipole_rel_dev']:.2e}, "
+                f"I+ {bd['i_plus_rel_dev']:.2e}, I- {bd['i_minus_rel_dev']:.2e}")
     unused = td_config.unused_keys(deck)
     if unused:
         lines.append("  read, not used  : " + ", ".join(unused)

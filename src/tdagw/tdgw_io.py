@@ -22,7 +22,7 @@ import os
 import numpy as np
 import scipy.constants as _cst
 
-__all__ = ["HA_IN_EV", "T_IN_ATTOSEC", "EFIELD_IN_VPERM", "HBAR_IN_EV_AS",
+__all__ = ["HA_IN_EV", "T_IN_ATTOSEC", "EFIELD_IN_VPERM", "HBAR_IN_EV_AS", "kernel_file_bands",
            "TDGW_LAYOUT_VERSION", "efield_function", "read_header",
            "header_operators", "read_bgw_kernel", "init_output",
            "write_samples", "write_checkpoint", "dump_toml"]
@@ -202,6 +202,17 @@ def header_operators(hdr: dict, *, geometry: str, esmear_ha: float,
 # BerkeleyGW kernel.h5, TDGW's reading
 # ---------------------------------------------------------------------------
 
+
+def kernel_file_bands(ivbm: int, nvb: int, ncb: int) -> np.ndarray:
+    """The band order of a BerkeleyGW ``kernel.h5`` along its band axes (1-based).
+
+    Valence from the top down, ``ivbm, ivbm - 1, ..., ivbm - nvb + 1``, then
+    conduction from the bottom up, ``ivbm + 1, ..., ivbm + ncb``: the one
+    definition shared by this reader and ``kernel_export``'s writer.
+    """
+    return np.concatenate([np.arange(ivbm, ivbm - nvb, -1),
+                           np.arange(ivbm + 1, ivbm + 1 + ncb)]).astype(np.int64)
+
 def read_bgw_kernel(path: str, *, ivbm: int, bands: tuple):
     """TDGW ``read_kernel``: the dense kernel K acting on rho, Ha.
 
@@ -236,8 +247,8 @@ def read_bgw_kernel(path: str, *, ivbm: int, bands: tuple):
     if nblocks == 1:
         k = k[:, :, :, ::-1, :, ::-1]
         k = np.transpose(k, (1, 2, 3, 0, 4, 5))
-        c_b = np.arange(ivbm + 1, ivbm + 1 + ncb)
-        v_b = np.arange(ivbm - nvb + 1, ivbm + 1)
+        fb = kernel_file_bands(ivbm, nvb, ncb)
+        v_b, c_b = fb[:nvb][::-1], fb[nvb:]              # ascending after the reversal
         cs = int(np.searchsorted(win, c_b[0])); vs = int(np.searchsorted(win, v_b[0]))
         if not (np.array_equal(win[cs:cs + ncb], c_b)
                 and np.array_equal(win[vs:vs + nvb], v_b)):
@@ -245,8 +256,7 @@ def read_bgw_kernel(path: str, *, ivbm: int, bands: tuple):
                              "the propagated window; want: ibndmin <= ivbm-nvb+1 "
                              "and ivbm+ncb <= ibndmax; fix: widen [system] bands")
         return k, True, (cs, cs + ncb), (vs, vs + nvb), kpts
-    file_bands = np.concatenate([np.arange(ivbm, ivbm - nvb, -1),
-                                 np.arange(ivbm + 1, ivbm + 1 + ncb)])
+    file_bands = kernel_file_bands(ivbm, nvb, ncb)
     pos = {b: i for i, b in enumerate(file_bands)}
     try:
         bmap = np.array([pos[b] for b in win])
