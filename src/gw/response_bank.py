@@ -1566,6 +1566,24 @@ def response_groups(z, group_size):
 _REFUSED = object()
 
 
+#: An idle process's speculative attempt may run this many times the round's
+#: longest needed load (Fe V2 replay simulation: P=8 28.9 s against 41.5 s
+#: without it; P=2 and P=4 unchanged).
+_IDLE_SPECULATION_SPAN = 1.5
+
+
+def _attempt_cost(tree, node):
+    """Relative wall of one whole-group attempt: (size/1000)^3, +0.85 for one sample.
+
+    The shift pencil's QR/SVD is ~size^3 per geometry; a one-sample attempt
+    scans without the stagnation patience. Fitted on 21 Frontier attempts of
+    the Fe V2 call (7 BLAS threads; 3.8 s*(size/1000)^3 + 3.3 s per one-sample
+    node, rms 1.3 s against 1.9 s for size^3 alone). Only the planner's
+    balance reads it, never a rule.
+    """
+    return (tree.size(node)/1000.)**3 + (0.85 if len(node) == 1 else 0.)
+
+
 def _rule_round(trees, known, world):
     """One round's attempts per process: the serial walks' next nodes, then speculation.
 
@@ -1576,7 +1594,10 @@ def _rule_round(trees, known, world):
     their undecided tried ancestors' pencil sizes over the largest, since a
     wider shared pencil fails more often), fill each process up to ``T``. A
     speculative attempt that the walk never reaches is discarded; it never
-    changes a rule. Costs are the attempt's ~size^3 estimate.
+    changes a rule. Costs are :func:`_attempt_cost`. A process the round
+    left idle may take one candidate up to :data:`_IDLE_SPECULATION_SPAN`
+    times ``T``: on many processes the next level of the chain then starts a
+    round early instead of waiting for its own.
     """
     need = [(i, node) for i, tree in enumerate(trees) for node in tree.pending(known[i])]
     if not need:
@@ -1585,7 +1606,7 @@ def _rule_round(trees, known, world):
 
     def estimate(i, node):
         if (i, node) not in cost:
-            cost[i, node] = float(trees[i].size(node))**3
+            cost[i, node] = _attempt_cost(trees[i], node)
         return cost[i, node]
     load, plan = [0.]*world, [[] for _ in range(world)]
     for task in sorted(need, key=lambda t: -estimate(*t)):
@@ -1611,7 +1632,8 @@ def _rule_round(trees, known, world):
             descend(i, node, min(1., trees[i].size(node)/wide), 1)
         for *_, i, node in sorted(candidates):
             r = min(range(world), key=lambda r: (load[r], r))
-            if load[r] + estimate(i, node) <= span:
+            if load[r] + estimate(i, node) <= span or (
+                    not load[r] and estimate(i, node) <= _IDLE_SPECULATION_SPAN*span):
                 plan[r].append((i, node))
                 load[r] += estimate(i, node)
     return plan
