@@ -87,3 +87,32 @@ def test_barrier_uses_the_coordination_service_with_one_id_per_use(monkeypatch):
     collectives._coordination_barrier("fallback", Device)
     assert used == ["fallback"]
     assert collectives.barrier("single_process_is_a_no_op") is False
+
+
+def test_large_read_heartbeat_never_waits_on_the_caller(tmp_path, capsys):
+    """A >= 1 GiB file's read is watched on a thread (is_ready polling), not waited for."""
+    import time
+    from file_io import _slab_io_ffi as ffi
+    big = tmp_path / "big.h5"
+    with open(big, "wb") as fh:
+        fh.truncate(ffi._LARGE_READ_LAYOUT_BYTES)        # sparse: no bytes written
+
+    class Late:
+        def __init__(self, after):
+            self.t = time.monotonic() + after
+
+        def is_ready(self):
+            return time.monotonic() >= self.t
+
+        def block_until_ready(self):
+            raise AssertionError("the heartbeat waited on the caller's thread")
+    t0 = time.monotonic()
+    with ffi._large_read_progress(str(big), "x", global_bytes=8, local_bytes=8) as watch:
+        watch(Late(0.3))
+    assert time.monotonic() - t0 < 0.2                  # returned at dispatch
+    deadline, seen = time.monotonic() + 5.0, ""
+    while "COMPLETE" not in seen and time.monotonic() < deadline:
+        time.sleep(0.05)
+        seen += capsys.readouterr().out
+    assert "START" in seen or "COMPLETE" in seen
+    assert "COMPLETE" in seen, seen
