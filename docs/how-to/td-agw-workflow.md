@@ -74,7 +74,7 @@ A weak short pulse along x, then y, gives the linear response; its poles are
 those of the full BSE of the same kernel with no V head
 ([algorithm](../theory/td_agw.md#algorithm)), so `bse.bse_jax` on the same
 window is the cross-check. Circular drives follow the
-[helicity convention](../architecture/bse.md#helicity) (σ+ turns x → y,
+[helicity convention](../architecture/bse.md#dipoles-and-absorption) (σ+ turns x → y,
 counter-clockwise seen from +z); `lorrax.trials` propagates σ+ and σ−
 together, one output directory each. TDGW expressions take t in as, so a
 drive at ħω = 1.5777 eV has ω = 2.39695e-03 rad/as (ħ = 658.2119569 eV·as):
