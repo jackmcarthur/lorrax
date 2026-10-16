@@ -41,7 +41,7 @@ import time
 import runtime  # noqa: F401  (before numpy: the runtime tunes BLAS spin at import)
 import numpy as np
 
-RYD_EV = 13.605693122994
+from common.units import RYD_TO_EV   # the constant sigma_diag.dat is written with
 
 
 def _read_sigma_diag(path, n_bands):
@@ -288,8 +288,8 @@ def main():
         def sigma_err(Wq):
             sx, coh = jax.jit(lambda A_, w: D.equilibrium_sigma({**S, **A_}, kern, w,
                                                                 heads=heads))(A, Wq)
-            sx = np.real(np.einsum("kii->ki", gather(sx))) * RYD_EV
-            coh = np.real(np.einsum("kii->ki", gather(coh))) * RYD_EV
+            sx = np.real(np.einsum("kii->ki", gather(sx))) * RYD_TO_EV
+            coh = np.real(np.einsum("kii->ki", gather(coh))) * RYD_TO_EV
             return dict(max_abs_sx_ev=float(np.max(np.abs(sx - ref_sx))),
                         max_abs_coh_ev=float(np.max(np.abs(coh - ref_coh))),
                         max_abs_tot_ev=float(np.max(np.abs(sx + coh - ref_sx - ref_coh))))
@@ -298,7 +298,7 @@ def main():
         sx0, _ = jax.jit(lambda A_, w: D.equilibrium_sigma({**S, **A_}, kern, w,
                                                             heads=None))(A, W0_q)
         out["B2w_nohead"] = dict(max_abs_sx_ev=float(np.max(np.abs(
-            np.real(np.einsum("kii->ki", gather(sx0))) * RYD_EV - ref_sx))))
+            np.real(np.einsum("kii->ki", gather(sx0))) * RYD_TO_EV - ref_sx))))
         out["B2_ref"] = dict(file=os.path.abspath(a.sigma_diag),
                              max_abs_sx_ev=float(np.max(np.abs(ref_sx))),
                              max_abs_coh_ev=float(np.max(np.abs(ref_coh))))
