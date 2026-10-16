@@ -70,8 +70,9 @@ def contour_block_accumulate_local(accumulator, contribution, projection, valid,
     are read or written.  The caller guarantees the skipped terms and outputs
     carry zero weights, so skipping them is the exact zeros they would add
     (the bank's padded member slots and a chunk's nodes past the live count).
-    The step count is ``ceil(terms/sets) * ceil(outputs/out_block)``: traffic
-    scales with the live outputs, not the planned slots.
+    The step count is ``ceil(outputs/out_block)`` output blocks, each a loop of
+    static trip count over every group (groups from ``terms`` on selected away):
+    traffic scales with the live outputs, not the planned slots.
     """
     if any(a.dtype != jnp.complex128 for a in (accumulator, contribution, projection)):
         raise TypeError("contour block accumulator requires complex128 operands")
@@ -95,18 +96,32 @@ def contour_block_accumulate_local(accumulator, contribution, projection, valid,
     # once (Fe 4^3 forced face, P4: 9.87 -> 45.23 GB), and a separate block carry costs a
     # block more.  The last block is clamped to the accumulator's end; its rows below the
     # block's own first output (already done) and from ``outputs`` on are rewritten as read.
-    def step(i, acc):
-        g, b = i // n_blocks, i % n_blocks
+    #
+    # The output blocks are the outer loop and the groups an inner loop of STATIC trip count
+    # (every group of ``contribution``), a group past ``terms`` selected away: only the
+    # ceil(outputs/out_block) outer trips have a device bound.  On ROCm each trip of a
+    # device-bounded loop is a predicate D2H + stream sync (a known trip count skips it),
+    # so a chunk costs one sync per live output block, not one per (group, block).  Each
+    # element still gets its groups' terms in group order; a skipped group rewrites the
+    # block as read.  The selected-away groups (only in a stream's partial last chunk) still
+    # read and write the block.
+    n_groups = n_terms // sets
+
+    def block_step(b, acc):
         first = b * B
         o0 = jnp.minimum(first, n_out - B)
         start = (o0, i32(0), m0, n0)
-        block = jax.lax.dynamic_slice(acc, start, (B, acc.shape[1], bm, bn))
-        c = jax.lax.dynamic_slice_in_dim(contribution, g * sets, sets, axis=0)
-        p = jax.lax.dynamic_slice(projection, (g * sets, o0), (sets, B))
-        new = block
-        for s in range(sets):
-            new = new + p[s][:, None, None, None] * c[s][None]
         rows = o0 + jnp.arange(B, dtype=jnp.int32)
         keep = ((rows >= first) & (rows < live_out))[:, None, None, None] & live[None, None]
-        return jax.lax.dynamic_update_slice(acc, jnp.where(keep, new, block), start)
-    return jax.lax.fori_loop(i32(0), groups * n_blocks, step, accumulator)
+
+        def add(g, block):
+            g = i32(g)
+            c = jax.lax.dynamic_slice_in_dim(contribution, g * sets, sets, axis=0)
+            p = jax.lax.dynamic_slice(projection, (g * sets, o0), (sets, B))
+            new = block
+            for s in range(sets):
+                new = new + p[s][:, None, None, None] * c[s][None]
+            return jnp.where(keep & (g < groups), new, block)
+        block = jax.lax.dynamic_slice(acc, start, (B, acc.shape[1], bm, bn))
+        return jax.lax.dynamic_update_slice(acc, jax.lax.fori_loop(0, n_groups, add, block), start)
+    return jax.lax.fori_loop(i32(0), n_blocks, block_step, accumulator)
