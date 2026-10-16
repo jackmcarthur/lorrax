@@ -62,6 +62,7 @@ from lxkit.legs import (
 from lxkit.cache import atomic_write_bytes, user_cache_dir
 from lxkit.placement import (device_put_process_local, device_put_process_local_cached,
                              device_put_process_tiles, placement_cache_stats)
+from lxkit.collectives import ordered_psum, ordered_psum_scatter
 from lxkit.probe import (
     AVAILABLE,
     LibraryNotBuilt,
@@ -92,6 +93,7 @@ __all__ = [
     # JAX utilities
     "device_put_process_local", "device_put_process_local_cached",
     "device_put_process_tiles", "placement_cache_stats", "mark_varying",
+    "ordered_psum", "ordered_psum_scatter",
     # the platform legs of the native-provider ABI
     "legs", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
     "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_vendor",
