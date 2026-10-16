@@ -67,7 +67,8 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     pref = _w_solve_pref_scalar(meta)
     dyson, slope, moments, lu = _response_programs(
         mesh_xy, n, backend, route, pref, ordered,
-        float(meta.cell_volume) if photon else None)
+        float(meta.cell_volume) if photon else None,
+        _dyson_room(meta, mesh_xy, n) if backend == "distributed" else None)
     algebra = {
         "linalg": resolution.layout,
         "solve": lu.describe(),
@@ -89,14 +90,39 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     return dyson, slope, moments, algebra
 
 
+def _dyson_room(meta, mesh_xy, n):
+    """Per-rank room of the Dyson solve, for distrib_la's size route (resolve guard 1b).
+
+    The shared ledger's room beside its bound live reservations
+    (``CapacityLedger.room_bytes_per_rank``) less the solve's own face operands (H, chi
+    and W: 3 nq n^2 complex128 over the P ranks, the pricing of ``w_isdf._dyson_route``). A shape-and-ledger rule every rank shares: no
+    exchange, no sync. None (the leg's library, never one_device) on one rank, with no
+    ledger, or with the ledger's caller lifetimes unbound (unknown live bytes are not zero).
+    """
+    ledger = getattr(meta, "shared_pole_capacity", None)
+    ranks = int(mesh_xy.size)
+    if ledger is None or ranks <= 1:
+        return None
+    try:
+        live = ledger.live_stages
+    except ValueError:
+        return None
+    faces = 16 * int(n) * int(n) * 3 * int(meta.nk_tot) // ranks
+    return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - faces)
+
+
 @lru_cache(maxsize=None)
-def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
-    """Reuse compiled algebra across SC maps without retaining state arrays."""
+def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume, room=None):
+    """Reuse compiled algebra across SC maps without retaining state arrays.
+
+    ``room`` (:func:`_dyson_room`) is the Dyson LU plan's per-rank room: on every leg
+    distrib_la takes one_device only where one whole matrix fits it
+    (resolve.one_device_max_n), else the distributed library."""
     from types import SimpleNamespace
     from distrib_la import batch_layout, checked_program, local_batch, matmul, plan
 
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
-              batched_route=route)
+              batched_route=route, budget_bytes=room)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
 
     def program(inputs, outputs=1, resident=(), layout="face"):
