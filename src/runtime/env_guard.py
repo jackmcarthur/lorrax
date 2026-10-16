@@ -59,12 +59,18 @@ def _resolved(path: str) -> str:
         return path
 
 
+#: Standard-library frames between a caller and ``putenv``: ``os.environ[k] = v`` runs
+#: ``os._Environ.__setitem__``; ``os.environ.update`` / ``setdefault`` run
+#: ``MutableMapping`` methods in ``_collections_abc`` first.  The writer is the frame beyond them.
+_STDLIB_ENV_FRAMES = ("os.py", "<frozen os>", "_collections_abc.py", "<frozen _collections_abc>")
+
+
 def _caller() -> tuple[str, int]:
-    """The first frame outside this module and ``os`` (resolved: HOME may be a symlink)."""
+    """The first frame outside this module and the stdlib mapping machinery (resolved: HOME may be a symlink)."""
     f = sys._getframe(2)
     while f is not None:
         name = f.f_code.co_filename
-        if not (name.endswith(("os.py", "<frozen os>")) or _resolved(name) == str(_HERE)):
+        if not (name.endswith(_STDLIB_ENV_FRAMES) or _resolved(name) == str(_HERE)):
             return name, f.f_lineno
         f = f.f_back
     return "?", 0

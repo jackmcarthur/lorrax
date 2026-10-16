@@ -154,8 +154,6 @@ def test_perlmutter_profile_refuses_a_missing_plugin():
 
 @pytest.mark.parametrize("env, policy", [
     ({"NERSC_HOST": "perlmutter", "SLURM_STEP_NUM_NODES": "1"}, "unchanged"),
-    ({"NERSC_HOST": "perlmutter", "NCCL_NET": "AWS Libfabric", **TWO_NODES},
-     "explicit transport"),
     ({"NERSC_HOST": "perlmutter", "JAX_PLATFORMS": "cpu", **TWO_NODES}, "no device collectives"),
 ])
 def test_profile_leaves_other_steps_alone(env, policy):
@@ -206,6 +204,34 @@ def test_frontier_profile_refuses_a_launch_without_the_hsa_name():
     with pytest.raises(RuntimeError, match="GATE launch_libraries.*libhsa-runtime64.so.*rocm_env.sh"):
         ne.plan_network_environment({**FRONTIER, "LD_LIBRARY_PATH": "/a:/b"},
                                     is_file=lambda path: not path.endswith("libhsa-runtime64.so"))
+
+
+def test_frontier_explicit_transport_keeps_the_site_start_up_requirements():
+    # A caller-exported transport is not filled in; the site's other settings
+    # are (where unset), MPI must still come before RCCL and the HSA name must
+    # still be on the launch path.
+    module = {**FRONTIER, "LD_LIBRARY_PATH": "/shim",
+              "NCCL_NET_PLUGIN": "/sw/frontier/rccl-plugins/x/librccl-net.so"}
+    result = plan(module)
+    assert result["policy"] == "explicit transport"
+    assert "NCCL_NET" not in result["applied"] and "NCCL_NET_PLUGIN" not in result["applied"]
+    assert result["applied"]["FI_CXI_RDZV_THRESHOLD"] == "0"
+    assert result["applied"]["HSA_FORCE_FINE_GRAIN_PCIE"] == "1"
+    assert result["mpi_before_collectives"] is True
+    with pytest.raises(RuntimeError, match="GATE launch_libraries.*libhsa-runtime64.so"):
+        ne.plan_network_environment({**module, "NCCL_NET": "AWS Libfabric"},
+                                    is_file=lambda path: not path.endswith("libhsa-runtime64.so"))
+    single = plan({**module, "SLURM_STEP_NODELIST": "frontier07208"})
+    assert single["policy"] == "explicit transport" and "mpi_before_collectives" not in single
+
+
+def test_perlmutter_explicit_transport_fills_only_the_fabric_settings():
+    result = plan({"NERSC_HOST": "perlmutter", "NCCL_NET": "AWS Libfabric",
+                   "FI_CXI_RDZV_THRESHOLD": "0", "SLURM_STEP_NODELIST": "nid[001000-001001]"})
+    assert result["policy"] == "explicit transport"
+    assert set(result["applied"]) == {"NCCL_NET_GDR_LEVEL", "FI_CXI_DISABLE_HOST_REGISTER",
+                                      "NCCL_CROSS_NIC", "NCCL_SOCKET_IFNAME"}
+    assert result["mpi_before_collectives"] is False
 
 
 def test_rocm_single_node_and_cpu_keep_the_library_policy():
