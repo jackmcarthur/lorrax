@@ -220,12 +220,40 @@ $$v_B(k) = C_k^{T}\, v(k)\, C_k^{*},\qquad
 V_R = \frac{1}{N_k}\sum_k e^{2\pi i k\cdot R}\, v_B(k),\qquad
 v(q) = U_q^\dagger\, \mathrm{Herm}\Big[\sum_R e^{-2\pi i q\cdot R} V_R\Big]\, U_q .$$
 
-The energies are the velocity's own. Each fine state's energy is the
-Rayleigh quotient of the file's $f(H)$, Newton-inverted, so under `--eqp` the
-QP states keep DFT denominators ($r$ is scissor-invariant):
+The energies are the velocity's own. On the DFT path the fine states
+diagonalize the file's $f(H)$, each state's energy is its Rayleigh quotient,
+Newton-inverted, and
 
 $$E_n(q) = f^{-1}\big(U_{qn}^\dagger\,[f(H)]_{\rm file}(q)\, U_{qn}\big),\qquad
 d^\alpha_{cvq} = \frac{v^\alpha_{cv}(q)}{E_c(q) - E_v(q)} .$$
+
+Under `--eqp` the fine states diagonalize the interpolated QP $f(H)$ instead.
+A band-dependent correction makes that a different operator off the coarse
+grid, so the states mix the file's bands and $v/\Delta E$ of their Rayleigh
+quotients is not their position: on CrI3 8×8→12×12 against the native 12×12
+it loses 1.4 % of $\sum|d|^2$ (13 % below 1.6 eV), with $\sum|v|^2$ kept to
+4e-4 and the lowest transition's quotient 60 meV high. The dipoles are then
+the exact position of the fine states (`qp_states`, the loader passes
+`eqp_file is not None`): per q, $F = U^\dagger [f(H)]_{\rm file} U = W\,\mathrm{diag}(\varphi)\,W^\dagger$,
+$\varepsilon = f^{-1}(\varphi)$,
+
+$$r' = \frac{(W^\dagger v W)_{mn}}{i(\varepsilon_m - \varepsilon_n)},\qquad
+\langle \tilde c|\hat r|\tilde v\rangle = (W r' W^\dagger)_{cv},\qquad
+d_{cvq} = i\,\langle \tilde c|\hat r|\tilde v\rangle ,$$
+
+exact for the c↔v pairs when $W$ does not mix the window's valence and
+conduction rows (the log gives that off-block mixing, the window-sum
+invariance and $\sum|d|^2$ after/before). Same-occupation pairs of $r'$ follow
+`tdagw.td_system.position_from_velocity`'s rule (`mask`, default:
+$1 - e^{-\Delta\varepsilon^2/2\,\mathrm{gap}^2}$ at 0.05 eV; `cut`; `cv`); they
+enter $d$ only through that mixing. `full_window` also returns
+`r_window`, the whole window's position in the same states (zero diagonal in
+the velocity's eigenbasis; on the DFT path $v/(i\Delta E)$ with the rule), so
+$d = i\,r_{\rm window}[c, v]$; `d_alpha_rq` keeps the previous dipoles. The
+route label ends with the corrected form. `python -m bse.dump_window_dipoles`
+writes a deck's window dipoles in its run's gauge, so a saved
+`eigenvectors.h5` re-contracts on CPU (`exciton_dipole_projections`; the
+stored dipoles of a 112-state CrI3 30×30 run reproduce to 1.7e-15).
 
 Dipoles and ψ share $U_q$, so no map between two sets of states, and no
 gauge fit, exists, and no fine NSCF is needed. A fine WFN's own `dipole.h5`
@@ -331,6 +359,8 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE velocity_wfn_fingerprint` | `file_io.dipole.velocity_stamp` | under `bse_k_grid`, a `--dipole` that is not the deck WFN's, e.g. the fine grid's own `dipole.h5`; read before the htransform fit |
 | `GATE densified_dipoles` | `absorption_common.window_dipoles` | a `bse_k_grid` bundle whose dipoles were not built from `--dipole` (loaded without `velocity_file`) |
 | `GATE densified_velocity_bands` | `bse_densify.densified_dipoles` | a velocity file with fewer bands than the htransform window |
+| `GATE densified_position_gap` | `bse_densify.densified_dipoles` | `--eqp` fine states whose DFT eigenbasis puts a conduction row at or below a valence row |
+| `GATE densified_pair_rule` | `bse_densify.densified_dipoles` | a pair rule other than `mask`, `cut`, `cv` |
 | `GATE densified_dipole_gap` | the same | a non-positive $E_c - E_v$ in the velocity's own energies |
 | `GATE densified_dipole_on_grid` | the same | the on-grid identities fail: a fine q list, band window or contraction that is not the htransform's |
 | `BseWindowOutsideZetaTrainingError` | `bse_window.assert_bse_window_in_zeta_training` | a window band outside the ζ fit legs |
