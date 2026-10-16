@@ -175,6 +175,39 @@ def device_count() -> int:
     return int(jax.device_count())
 
 
+#: Seconds a rank waits at a :func:`barrier` for its peers before the barrier fails
+#: (the coordination service's deadline; a rank that never arrives -- a mismatched
+#: name, a dead peer -- surfaces as this error instead of a hang).
+BARRIER_TIMEOUT_S = 1800
+_BARRIER_SERIAL: dict = {}
+
+
+def _coordination_barrier(name, _mh):
+    """Host barrier through the distributed runtime's coordination service.
+
+    No device work: ``multihost_utils.sync_global_devices`` all-gathers a name hash
+    through the devices (an H2D put, a collective and a D2H read per barrier).  Every
+    caller here orders HOST work (a rank-0 HDF5 write, a file closed before another
+    rank opens it, a timing band), which the coordination barrier orders without
+    touching a device.  Each use of a name gets its own barrier id (the n-th use on
+    every rank, in program order), so a name can recur.  Without a distributed client
+    (a multi-process run started outside ``jax.distributed``) the device barrier is
+    used, with one notice (GATE barrier_coordination).
+    """
+    from jax._src import distributed as _dist
+    client = getattr(_dist.global_state, "client", None)
+    if client is None:
+        if "notice" not in _BARRIER_SERIAL:
+            _BARRIER_SERIAL["notice"] = True
+            print("  GATE barrier_coordination: no distributed runtime client; "
+                  "collectives.barrier uses the device barrier (sync_global_devices)",
+                  flush=True)
+        _mh.sync_global_devices(name)
+        return
+    n = _BARRIER_SERIAL[name] = _BARRIER_SERIAL.get(name, 0) + 1
+    client.wait_at_barrier(f"lorrax.barrier:{name}:{n}", int(BARRIER_TIMEOUT_S * 1000))
+
+
 def barrier(name: str, *, print_fn: Callable[..., Any] = print) -> bool:
     """Synchronize all processes at ``name``; fatal if the collective fails.
 
@@ -199,7 +232,7 @@ def barrier(name: str, *, print_fn: Callable[..., Any] = print) -> bool:
     if process_count() <= 1:
         return False
     try:
-        _mh.sync_global_devices(name)
+        _coordination_barrier(name, _mh)
     except Exception as exc:
         # Do NOT swallow.  A broken barrier in a multi-process run means
         # this rank is about to diverge from its peers; continuing turns a

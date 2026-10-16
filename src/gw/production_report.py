@@ -875,6 +875,11 @@ class GWProductionReport:
             self.emit("  Sigma tau other is the window executables: W(tau) synthesis, G/W convolution,")
             self.emit("  projection and frequency fold in one program. No pure-GEMM or pure-FFT wall is inferred.")
             self.emit("  device_wait drains preceding work; rank_wait measures process alignment.")
+        from common.timing import stage_sync
+        self.emit("  stage walls: " + ("device-attributed (LORRAX_STAGE_SYNC=1: every stage waits for its device work)."
+                                      if stage_sync() else
+                                      "host-attributed (no timing-only device waits; device work lands in the first "
+                                      "later stage that reads it; LORRAX_STAGE_SYNC=1 attributes it)."))
         if spole_rows:
             self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
             self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")

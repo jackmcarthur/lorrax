@@ -523,8 +523,8 @@ def _fit_mubatch(
                         'zeta_q_G', shape=(Q, int(meta.n_rmu), ngkmax),
                         dtype=np.complex128)
                     zeta_g.write_file(zeta_io, print_fn=print_fn)
-                jax.experimental.multihost_utils.sync_global_devices(
-                    "zeta_writes_complete")
+                from common.collectives import barrier
+                barrier("zeta_writes_complete", print_fn=print_fn)
             print_fn(f"  μ-batch ζ file (μ_L={ch.vertex}) written in "
                      f"{time.perf_counter() - t_w:.2f}s")
         print_fn(store.receipt())
@@ -809,7 +809,7 @@ def fit_zeta_to_h5(
                 from symmetry_maps import slice_q_full_to_ibz
                 C_q_flat = slice_q_full_to_ibz(
                     C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
-            C_q_flat.block_until_ready()
+            timing.stage_wait(C_q_flat)
 
         with timing.section("zeta_fit.cholesky"):
             # Route G applies a WHOLE-TILE factor on each G tile: the charge
@@ -824,7 +824,7 @@ def fit_zeta_to_h5(
                 zeta_rcond=zeta_rcond)
             # The charge factor is one array; a current factor is (factor, piv).
             L_q, lu_piv = _factor if v != 0 else (_factor, None)
-            jax.block_until_ready(L_q)
+            timing.stage_wait(L_q)
             print_fn(f"  μ_L={v} factor: {_kind} -> "
                      f"{'hoisted pivoted LU' if lu_piv is not None else 'whole-tile'} "
                      f"{tuple(L_q.shape)}, back-solve on the q owners")
@@ -854,8 +854,8 @@ def fit_zeta_to_h5(
                 if jax.process_index() == 0:
                     copy_mf_header(_wfn_src_path, path, dst_mode='a')
                     write_isdf_header(path, _isdf_hdr, mode='a')
-                jax.experimental.multihost_utils.sync_global_devices(
-                    "zeta_fit_headers_written")
+                from common.collectives import barrier
+                barrier("zeta_fit_headers_written", print_fn=print_fn)
         channels.append(ZetaChannel(v, L_q, lu_piv, _kind, _write_file, output_files[v]))
     del _face_gemm
     gc.collect()

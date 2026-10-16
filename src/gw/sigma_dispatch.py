@@ -612,8 +612,7 @@ def finalize_dynamic_sigma(
         v_h_scalar = sig_h
 
     with timing.section("sigma.finalize_input_wait"):
-        jax.block_until_ready((sigma_c_body_omega, sigma_c_body_omega_unextrap,
-                               sig_x, sig_h))
+        timing.stage_wait(sigma_c_body_omega, sigma_c_body_omega_unextrap, sig_x, sig_h)
     # The head add takes each body cube's buffer: nothing below reads a
     # headless cube (the at-DFT read, sigma_omega write, QSGW build, raw
     # columns and debug outputs all read the head-added one), so the body and
@@ -1209,7 +1208,7 @@ def _static_sigma_channels(
             mode is not ComputeMode.MPA or config.debug.sigma_lorentz_debug_output)
         # Charge pending input work to its boundary, not to exchange.
         with timing.section("sigma.input_wait"):
-            jax.block_until_ready((wfns, wfns_transverse, V_q, Gij))
+            timing.stage_wait(wfns, wfns_transverse, V_q, Gij)
         with timing.section("sigma.exchange") as sec:
             sigma_x_result = compute_sigma_x(
                 wfns, V_q, meta, mesh_xy,

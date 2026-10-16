@@ -125,10 +125,11 @@ class LoopProgress:
     def step(self, wait=None):
         """Call after each iteration completes.
 
-        ``wait`` is an optional JAX value; at a milestone step it is
-        blocked on before the line is timed, so a loop that only DISPATCHES
-        asynchronous work (the Sigma tau sweep) reports execution progress
-        rather than how far ahead the Python loop has run.  Blocking on a
+        ``wait`` is an optional JAX value; under ``LORRAX_STAGE_SYNC=1``
+        (``common.timing.stage_sync``) it is blocked on at a milestone step
+        before the line is timed, so a loop that only DISPATCHES asynchronous
+        work (the Sigma tau sweep) reports execution progress; by default no
+        timing-only wait runs and the line reports dispatch progress.  Blocking on a
         JAX value can still be globally sharded, so every process performs
         the wait (INVARIANTS row 21).  Non-milestone steps never block.
         """
@@ -143,7 +144,10 @@ class LoopProgress:
         # a local shard.  Only formatting and printing are rank-conditional
         # (INVARIANTS row 21).
         if milestone and wait is not None:
-            jax.block_until_ready(wait)
+            # A timing-only wait: under LORRAX_STAGE_SYNC=1 alone (common.timing.stage_sync).
+            # Without it the line reports how far the loop has dispatched.
+            from common.timing import stage_wait
+            stage_wait(wait)
         if self.enabled and milestone:
             elapsed = time.time() - self._start
             self.print_fn(_format_progress(

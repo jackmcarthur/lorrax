@@ -584,7 +584,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             panel_poles.append(pp)
         del x, y, poles
         panel_factors, panel_poles = tuple(panel_factors), tuple(panel_poles)
-        jax.block_until_ready((panel_factors, panel_poles))
+        timing.stage_wait(panel_factors, panel_poles)
         if ambient is not None:
             resident = sum(int(a.addressable_shards[0].data.nbytes)
                            for a in jax.tree.leaves((panel_factors, panel_poles)))
