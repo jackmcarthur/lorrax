@@ -283,7 +283,7 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
                 own=finite + infinity, extents=np.column_stack((finite, infinity)))
 
 
-def pack_panels(fields, order, widths, *, mesh_xy, layout='batch'):
+def pack_panels(fields, order, widths, *, mesh_xy, layout='batch', order_device=None):
     """Each slot's pencil columns, placed from the round's state panels one panel at a time.
 
     ``fields`` are K lists of the round's S state panels ``[B, n_k, r_s]`` (Q,
@@ -297,10 +297,17 @@ def pack_panels(fields, order, widths, *, mesh_xy, layout='batch'):
 
     One program per (layout, panel width, F) places one panel, and the panel
     count is only the number of calls: the line sites change it from map to
-    map, and no program's shape follows it. The host inverts ``order`` per
-    panel, ``dest[b, j]`` the packed column of panel column j or F where the
-    round does not take it (the scatter drops it); a source column appears at
-    most once in a slot's table, so the scatter has one writer per column.
+    map, and no program's shape follows it. ``dest[b, j]``, the packed column
+    of panel column j or F where the round does not take it (the scatter drops
+    it), inverts ``order`` per panel; a source column appears at most once in a
+    slot's table, so the scatter has one writer per column.
+
+    Batch layout: ``order_device`` is the same table on the devices
+    (``P(BATCH)``, :func:`round_operands`), and each panel's program inverts its
+    own rows of it in place from the panel's offset, a replicated scalar placed
+    once per value (``shared_pole_directions.replicated``: the offsets are the
+    recipe carriers' sums, the same in every round), so no table crosses to the
+    devices per panel. The face layout inverts on the host.
     """
     import numpy as np
     order = np.asarray(order)
@@ -309,13 +316,21 @@ def pack_panels(fields, order, widths, *, mesh_xy, layout='batch'):
     shapes = tuple((int(panels[0].shape[1]), np.dtype(panels[0].dtype).name) for panels in fields)
     key = (mesh_xy, layout, slots, extent, shapes)
     accs = _pack_start(*key)()
+    if layout == 'batch':
+        from gw.shared_pole_directions import replicated
+        put = replicated(mesh_xy)
+        if order_device is None:
+            order_device = _batch_put(mesh_xy, order.astype(np.int32))
     for s, width in enumerate(int(w) for w in widths):
+        panels = tuple(panels[s] for panels in fields)
+        if layout == 'batch':
+            accs = _pack_place(*key, width)(accs, panels, order_device, put(np.int32(offsets[s])))
+            continue
         # dest[b, j]: where column j of panel s lands in slot b's pencil, F (dropped) if nowhere.
         b, f = np.nonzero((order >= offsets[s]) & (order < offsets[s] + width))
         dest = np.full((slots, width), extent, np.int32)
         dest[b, order[b, f] - offsets[s]] = f
-        dest = _batch_put(mesh_xy, dest) if layout == 'batch' else dest
-        accs = _pack_place(*key, width)(accs, tuple(panels[s] for panels in fields), dest)
+        accs = _pack_place(*key, width)(accs, panels, dest)
     return _pack_finish(*key)(accs)
 
 
@@ -345,6 +360,20 @@ def _place_rows(acc, panel, dest, extent):
         # Each complex row as its held (re, im) reals, so the scatter moves float64.
         update = jnp.stack((update.real, update.imag), axis=-1).reshape(b * r, 2 * rows)
     return acc.at[index.reshape(-1)].set(update, mode='drop')
+
+
+def _panel_destinations(order, offset, width, extent):
+    """``dest[b, j]`` of one panel on one rank's slots, from its rows of the round's ``order``:
+    the packed column f with ``order[b, f] == offset + j``, else ``extent`` (dropped).
+    The table names each source column at most once per slot, so one writer per entry."""
+    import jax.numpy as jnp
+    b, f = order.shape
+    j = order - offset
+    taken = (j >= 0) & (j < width)
+    rows = jnp.broadcast_to(jnp.arange(b, dtype=jnp.int32)[:, None], (b, f))
+    cols = jnp.where(taken, j, width).astype(jnp.int32)
+    column = jnp.broadcast_to(jnp.arange(f, dtype=jnp.int32)[None, :], (b, f))
+    return jnp.full((b, width), extent, jnp.int32).at[rows, cols].set(column, mode='drop')
 
 
 def _held_columns(acc, dtype, extent):
@@ -401,9 +430,10 @@ def _pack_place(mesh_xy, layout, slots, extent, shapes, width):
     from jax import shard_map
     py = int(mesh_xy.shape['y'])
     if layout == 'batch':
-        def body(accs, panels, dest):
+        def body(accs, panels, order, offset):
+            dest = _panel_destinations(order, offset, width, extent)
             return tuple(_place_rows(a, p, dest, extent) for a, p in zip(accs, panels))
-        specs = ((P(BATCH),) * len(shapes), (P(BATCH),) * len(shapes), P(BATCH))
+        specs = ((P(BATCH),) * len(shapes), (P(BATCH),) * len(shapes), P(BATCH), P())
         out = (P(BATCH),) * len(shapes)
     else:
         def body(accs, panels, dest):
@@ -481,10 +511,95 @@ def own_extent_receipts(reduction, own):
     return rows
 
 
+_BATCH_CONSTANTS = {}
+
+
+def _batch_constant(mesh_xy, a):
+    """:func:`_batch_put` of a small table that repeats between rounds, placed once per value."""
+    import numpy as np
+    a = np.asarray(a)
+    key = (mesh_xy, a.dtype.str, a.shape, a.tobytes())
+    hit = _BATCH_CONSTANTS.get(key)
+    if hit is None or hit.is_deleted():
+        hit = _BATCH_CONSTANTS[key] = _batch_put(mesh_xy, a)
+    return hit
+
+
 def _batch_put(mesh_xy, a):
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
     return jax.make_array_from_callback(a.shape, NamedSharding(mesh_xy, P(BATCH)), lambda idx: a[idx])
+
+
+def round_operands(mesh_xy, tables, real):
+    """A round's host tables on the devices in ONE placement: ``(live [P], points [P, F],
+    active [P, side], order [P, F] int32)`` at ``P(BATCH)``, exact (``order`` and the flags
+    are small integers, held in the real part of one complex128 table and split on the
+    device)."""
+    import numpy as np
+    points = np.asarray(tables["points"], np.complex128)
+    active, order = np.asarray(tables["active"]), np.asarray(tables["order"])
+    live = (np.arange(len(tables["own"])) < int(real))[:, None]
+    table = np.concatenate((live, points, active, order), axis=1, dtype=np.complex128)
+    widths = (1, points.shape[1], active.shape[1], order.shape[1])
+    return _round_operand_split(mesh_xy, widths)(_batch_put(mesh_xy, table))
+
+
+@lru_cache(maxsize=None)
+def _round_operand_split(mesh_xy, widths):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    edges = np.cumsum((0,) + tuple(widths))
+
+    def split(t):
+        live, points, active, order = (t[:, a:b] for a, b in zip(edges[:-1], edges[1:]))
+        return (jnp.real(live[:, 0]) != 0, points, jnp.real(active) != 0,
+                jnp.real(order).astype(jnp.int32))
+    return jax.jit(split, out_shardings=(NamedSharding(mesh_xy, P(BATCH)),) * 4)
+
+
+def host_tree(tree):
+    """Every leaf of a pytree of device arrays on the host in ONE device-to-host read, bit for bit.
+
+    The leaves (any shape; bool, integer, float or complex) are reinterpreted as bytes on the
+    device and joined (:func:`_host_bytes_program`, one program per tree signature), read once,
+    and cut back into numpy leaves of their own dtype and shape; host leaves pass through. Each
+    leaf must be fully addressable on this process (replicated), as ``np.asarray`` requires.
+    """
+    import jax
+    import numpy as np
+    leaves, treedef = jax.tree.flatten(tree)
+    device = [i for i, a in enumerate(leaves) if isinstance(a, jax.Array)]
+    if not device:
+        return tree
+    signature = tuple((tuple(leaves[i].shape), np.dtype(leaves[i].dtype).str) for i in device)
+    raw = np.asarray(_host_bytes_program(signature)(*(leaves[i] for i in device)))
+    out, at = list(leaves), 0
+    for i, (shape, dt) in zip(device, signature):
+        dt = np.dtype(dt)
+        size = int(np.prod(shape, dtype=np.int64)) * dt.itemsize
+        chunk = raw[at:at + size]
+        at += size
+        out[i] = (chunk.view(np.uint8).astype(bool) if dt == np.bool_ else chunk.view(dt)).reshape(shape)
+    return jax.tree.unflatten(treedef, out)
+
+
+@lru_cache(maxsize=None)
+def _host_bytes_program(signature):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    def as_bytes(a):
+        dt = np.dtype(a.dtype)
+        if dt == np.bool_:
+            return a.astype(jnp.uint8).reshape(-1)
+        if np.issubdtype(dt, np.complexfloating):
+            a = jnp.stack((jnp.real(a), jnp.imag(a)), axis=-1)
+        return jax.lax.bitcast_convert_type(a, jnp.uint8).reshape(-1)
+    return jax.jit(lambda *leaves: jnp.concatenate([as_bytes(a) for a in leaves]))
 
 
 def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget,
@@ -497,13 +612,11 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
     first round, so one program serves every round and SC map, and only
     exact-zero columns ever leave the solve.
     """
-    import numpy as np
-
-    put = lambda a: _batch_put(mesh_xy, np.asarray(a))
-    live = np.arange(len(tables["own"])) < int(real)
+    live, points, active, order = round_operands(mesh_xy, tables, real)
     q, o, d = pack_panels(tuple([st[k] for st in states] for k in (1, 2, 3)), tables["order"],
-                          [int(st[1].shape[-1]) for st in states], mesh_xy=mesh_xy)
-    args = (put(live), put(tables["points"]), put(tables["active"]), q, o, d, tuple(infinity))
+                          [int(st[1].shape[-1]) for st in states], mesh_xy=mesh_xy,
+                          order_device=order)
+    args = (live, points, active, q, o, d, tuple(infinity))
     budget = None if keep_budget is None else int(keep_budget)
     return round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
                          bool(retain_span), gram_keep, budget)(*args)
@@ -681,11 +794,14 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
     # plan's public trace-safe native callable. Face arrays were dispatched
     # above and use the plan's eager ``batched`` surface in their own program.
     program = round_checks(mesh_xy, eigh_plan.native_fn, bool(ordered))
-    live = _batch_put(mesh_xy, np.arange(int(model[0].shape[0])) < int(real))
+    # The live slots, held nodes and eta repeat from round to round: placed once per value.
+    from gw.shared_pole_directions import replicated as placed
+    put = placed(mesh_xy)
+    live = _batch_constant(mesh_xy, np.arange(int(model[0].shape[0])) < int(real))
     out = program(live, model, signed, inverse_coulomb_sqrt, *held,
-                  jax.device_put(np.asarray(nodes, np.complex128), replicated),
-                  jax.device_put(np.float64(eta_ry), replicated), *moments, infinity_directions)
-    return jax.tree.map(np.asarray, out)
+                  put(np.asarray(nodes, np.complex128)), put(np.float64(eta_ry)),
+                  *moments, infinity_directions)
+    return host_tree(out)
 
 
 def _leading_row(array, *, slot):

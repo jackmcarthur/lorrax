@@ -323,8 +323,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
             qi = infinity[0]
             del round_states, infinity
-            round_reduction, round_zero, round_retained, round_permutation = jax.tree.map(np.asarray, round_diagnostics)
-            poles, active = (np.asarray(a) for a in vectors)
+            # One device-to-host read of the round's replicated diagnostics and vectors.
+            from gw.shared_pole_local import host_tree
+            (round_reduction, round_zero, round_retained, round_permutation), (poles, active) = host_tree(
+                (tuple(round_diagnostics), tuple(vectors)))
             budget.retained_panels = tuple(factors)
         with phase("gates"):
             for slot, q in enumerate(ids[:real]):
