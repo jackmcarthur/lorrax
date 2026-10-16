@@ -160,26 +160,30 @@ def begin(chi0_q, *, config, meta, sym, centroid_indices, wedge, mesh_xy):
     n_rmu = F.shape[-1]
     basis = getattr(meta, "mu_basis", None)
     rep = NamedSharding(mesh_xy, P())
-    width = (basis.n_canonical if basis is not None and not basis.is_identity
-             else int(chi0_q.shape[-1]))
-    Fc = np.zeros(F.shape[:2] + (width,), np.complex128)
-    Fc[..., :n_rmu] = F
-    from common.collectives import device_put_process_local
-    F_run = device_put_process_local(Fc, rep)
+    # The rows are host data (n_q·n_L·N_μ·16 B, n_L ≤ 9), packed on the host
+    # and carried as two μ-sharded copies, μ on x and on y (the g0_X/g0_Y
+    # pattern), so each product contracts in χ₀'s and W's (μ_X, ν_Y) layout.
     if basis is not None and not basis.is_identity:
-        F_run = basis.pack_axis(F_run, 2, spec=P(None, None, None))
+        F_run = basis.pack_host(F, axis=2)
+    else:
+        F_run = np.zeros(F.shape[:2] + (int(chi0_q.shape[-1]),), np.complex128)
+        F_run[..., :n_rmu] = F
     if int(F_run.shape[-1]) != int(chi0_q.shape[-1]):
         raise ValueError(
             f"lr_channels: channel rows carry {F_run.shape[-1]} centroids, χ₀ "
             f"{chi0_q.shape[-1]}")
+    from common.collectives import device_put_process_local
+    F_x = device_put_process_local(F_run, NamedSharding(mesh_xy, P(None, None, "x")))
+    F_y = device_put_process_local(F_run, NamedSharding(mesh_xy, P(None, None, "y")))
+    # The skinny results (n_q, n_L, N_μ) come back replicated for the host dressing.
     fchi = jax.jit(lambda f, c: jnp.einsum("qam,qmn->qan", f, c), out_shardings=rep)
     chif = jax.jit(lambda c, f: jnp.einsum("qmn,qan->qma", c, jnp.conj(f)), out_shardings=rep)
     # The physical χ is the solve's prefactor times the stored χ₀:
     # W = (1 − pref·Vχ₀)⁻¹V (gw.w_isdf.solve_w).
     from .w_isdf import _w_solve_pref_scalar
     pref = _w_solve_pref_scalar(meta)
-    Fchi = pref * np.asarray(fchi(F_run, chi0_q))
-    chiFh = pref * np.asarray(chif(chi0_q, F_run))
+    Fchi = pref * np.asarray(fchi(F_x, chi0_q))
+    chiFh = pref * np.asarray(chif(chi0_q, F_y))
     return dict(F_run=F_run, Fchi=Fchi, chiFh=chiFh, ch=ch, n_z=n_z,
                 head_kernel=head_kernel,
                 q_frac=q_frac, n_rmu=n_rmu, sys_dim=sys_dim, basis=basis,
@@ -192,12 +196,14 @@ def finish(state, W_q):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
-    rep = NamedSharding(state["mesh_xy"], P())
-    fw = jax.jit(lambda f, w: jnp.einsum("qam,qmn->qan", f, w), out_shardings=rep)
+    mesh_xy = state["mesh_xy"]
+    fw = jax.jit(lambda f, w: jnp.einsum("qam,qmn->qan", f, w),
+                 out_shardings=NamedSharding(mesh_xy, P()))
     from common.collectives import device_put_process_local
-    FchiW = np.asarray(fw(device_put_process_local(state["Fchi"], rep), W_q))
-    F = np.asarray(state["F_run"])
-    Ft, Pm = dress(F, state["Fchi"], state["chiFh"], FchiW, state["ch"].v)
+    FchiW = np.asarray(fw(device_put_process_local(
+        state["Fchi"], NamedSharding(mesh_xy, P(None, None, "x"))), W_q))
+    Ft, Pm = dress(state["F_run"], state["Fchi"], state["chiFh"], FchiW,
+                   state["ch"].v)
     # P = F χ_b Fᴴ, χ_b = (1 − χV_b)⁻¹χ the response to the positive V_b, is
     # negative definite for the NSD static χ₀ (MoS₂ 9×9: max λ_max/|λ_min| =
     # −9·10⁻⁵).  Γ is excluded: there the G = 0 channel's P vanishes by
@@ -220,8 +226,7 @@ def finish(state, W_q):
         return
     basis = state["basis"]
     if basis is not None and not basis.is_identity:
-        Ft = np.asarray(basis.unpack_axis(device_put_process_local(Ft, rep), 2,
-                                          spec=P(None, None, None)))
+        Ft = basis.unpack_host(Ft, axis=2)
     from .restart_q_storage import deposit_lr_channels
     deposit_lr_channels(dict(
         Ft=Ft[..., :state["n_rmu"]], P=Pm, gvec=state["ch"].gvec,
