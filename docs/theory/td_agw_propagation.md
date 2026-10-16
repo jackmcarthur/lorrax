@@ -225,3 +225,14 @@ A deck without `load_header_from` or with `use_vmtxel`
 patched sampling, box geometry, `velocity_operator`, a fixed step that does
 not divide `dt_measure`, `n_corr` < 1, and a `dp54` step that falls below
 SciPy's minimum (`td_dp54_step_too_small`) refuse with a named GATE.
+
+**BerkeleyGW dipoles.** The dipole is whatever the header carries. For
+BerkeleyGW's momentum matrix elements, run TDGW once with `use_vmtxel = true`
+(it writes the header before it propagates; dipole `itype` 1, no intraband
+commutator) and point `load_header_from` at that run. On CrI3 516 (6×6 k,
+2v2c, BerkeleyGW's extended kernel, `vmtxel` with b1 rescaled) the propagator
+then takes TDGW's 803 steps and matches its P(t) to 1.1e-15, and the Im ε_xx
+peaks 1.8434 / 2.1745 / 2.3422 / 2.5989 eV lie within 0.7 meV of BerkeleyGW's
+full-BSE absorption (1.8434 / 2.1752 / 2.3422 / 2.5988 eV). On that grid
+TDGW's own finite-difference dipoles give different x and y spectra (peaks at
+1.9673 and 2.2410 eV in x only), so a `vmtxel` header is the one to use there.
