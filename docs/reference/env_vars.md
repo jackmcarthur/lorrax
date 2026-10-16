@@ -155,7 +155,7 @@ The C++ writer is `ffi/cpp/phdf5/context.cc`; the Python side is
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
-| `LORRAX_PHDF5_STRIPE_COUNT` | `clamp(P, 4, 128)` | machine | Integer; a non-integer or negative value refuses (both sides). Lustre stripe count, which is also the ROMIO aggregator count. |
+| `LORRAX_PHDF5_STRIPE_COUNT` | `clamp(P, 4, 128)` | machine | Integer; a non-integer or negative value refuses (both sides). Lustre stripe count, which is also the ROMIO aggregator count. Read by both sides; LORRAX no longer re-exports it (GATE env-frozen, `runtime.env_guard`). |
 | `LORRAX_PHDF5_STRIPE_SIZE_FS` | power of two nearest `P/16` MiB, clamped to `[1, 4]` MiB | machine | `lfs setstripe -S` spelling with at most one suffix character; an unknown suffix refuses, and `4MiB` refuses. `LORRAX_PHDF5_STRIPE_SIZE` is the byte-valued legacy spelling, read when this one is unset; a non-integer refuses. |
 | `LORRAX_PHDF5_ALIGN_MB` | `4` | machine | Integer MiB `H5Pset_alignment` threshold; `0` disables. `4`, `1` and `0` measure within repeat noise. |
 | `LORRAX_PHDF5_COLL_META` | `0` | machine | `1` enables collective metadata operations (off is faster). |

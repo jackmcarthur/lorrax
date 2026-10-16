@@ -324,7 +324,7 @@ def _stripe_size_bytes(nranks: int | None = None) -> int:
             f"'MiB'/'MB' spellings are not accepted).") from None
 
 
-def _export_striping_env(nranks: int | None = None) -> tuple[int, int]:
+def _resolve_striping(nranks: int | None = None) -> tuple[int, int]:
     """Materialise the resolved striping into ``os.environ``; return it.
 
     WHY THIS EXISTS, and why it is not spooky action.  The FFI writer's
@@ -358,19 +358,20 @@ def _export_striping_env(nranks: int | None = None) -> tuple[int, int]:
     over 0..4100 ranks), so the agreement is by construction and this
     function is back to being only what its name says: the operator
     override's channel to C++, and a run log's record of the layout.
+
+    NO LONGER EXPORTS (2026-10-16, GATE env-frozen).  Writing these two keys
+    into the process environment at every SlabIO open raced native threads'
+    ``getenv`` (glibc: a new key reallocates ``environ``): the rc 139 start-up
+    SIGSEGV, the rocBLAS warm-up thread faulting in HSA's ``getenv`` while this
+    ran before the WFN.h5 open (``runtime.env_guard``).  Nothing needed the
+    export: an operator's override is already in the environment, where the
+    C++ reads it (number + optional K/M/G, as the docs spell it), and unset the
+    C++ derives this same policy from the world size (``stripe_policy_count``/
+    ``_unit``; transcriptions agree at every world size 0..4100, checked
+    2026-10-16 -- the test named above is not in this tree).  The resolved layout is returned for
+    the caller's run-log line, and the operator values are still validated here.
     """
-    count = _stripe_count(nranks)
-    unit = _stripe_size_bytes(nranks)
-    os.environ["LORRAX_PHDF5_STRIPE_COUNT"] = str(count)
-    # Re-export in the `lfs setstripe -S` spelling both parsers accept, so
-    # a run log's environment reads the way the docs and `lfs` do.  A unit
-    # that is not a whole number of MiB (only reachable by an explicit
-    # override like '512k') keeps the byte spelling, which both parsers
-    # also accept — an exact value beats a pretty one.
-    os.environ["LORRAX_PHDF5_STRIPE_SIZE_FS"] = (
-        f"{unit >> 20}M" if unit >= (1 << 20) and unit % (1 << 20) == 0
-        else str(unit))
-    return count, unit
+    return _stripe_count(nranks), _stripe_size_bytes(nranks)
 
 
 def file_stripe_layout(path: str) -> tuple[int, int] | None:
@@ -2373,13 +2374,11 @@ class _FfiBackend(_DatasetGeometry):
         if mode == "w":
             _replace_inode_for_write(path)
             _barrier("slab_io_ffi_prestripe")
-        # Resolve the striping policy and put it where the C++ writer can
-        # see it (its only input is getenv), BEFORE open_file — that call
-        # is where context.cc builds the MPI_Info and H5Fcreate applies
-        # the layout.  A file opened 'a'/'r' keeps the inode it already
-        # has, so the hints are a no-op there; export anyway so the log
-        # line and the environment agree on every path.
-        _sc, _su = _export_striping_env()
+        # Resolve (and validate) the striping policy for the log line.  The C++
+        # writer derives the same layout from the world size, or reads the
+        # operator's LORRAX_PHDF5_STRIPE_* itself; nothing is exported, since
+        # an environment write here raced native getenv (runtime.env_guard).
+        _sc, _su = _resolve_striping()
         if mode == "w" and _rank0() and debug_print_enabled():
             print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode={mode} "
                   f"ranks={jax.process_count()} stripe_count={_sc} "

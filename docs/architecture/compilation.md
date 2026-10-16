@@ -191,7 +191,20 @@ dgemm, then 0.055 s for the first zgemm (P1 probe, autotune 0, either level).
 `PlatformLeg.blas_host_warmup` compiles one 8x8 GEMM per dtype at start-up
 (main thread, so the compile agreement sees the same programs on every rank)
 and runs them on a helper thread, where the load overlaps the driver's
-imports. AMD comgr's code-object cache stays per namespace
+imports. Before that thread starts the process environment freezes
+(`runtime.env_guard`, `GATE env-frozen`): the thread's `hipModuleLoadData`
+calls `getenv` inside HSA, and glibc's `getenv` takes no lock, so a main-thread
+`os.environ` write that adds a key (and so reallocates `environ`) is a
+use-after-free there. That was the intermittent rc 139 start-up SIGSEGV
+(Frontier, 2026-10-16: 6 of 72 concurrent Fe start-ups, from the SlabIO
+striping export at the first WFN.h5 open; evidence in `runtime.env_guard`). Every LORRAX
+environment write therefore happens before step 7b; a later LORRAX write that
+adds a key refuses, any other code's is announced. With the SlabIO export removed and the
+freeze armed, the same stress (6 concurrent 4-rank start-ups over 3 nodes, hot
+and cold caches) gave 0 of 48 crashes (40 of them through the crash window; the other 8
+sat on frontier00749, whose GCDs 4-7 stall in the same window and is now excluded from
+the pool), and the Fe deck's eqp0/eqp1 were
+unchanged bit for bit (branch `crash/w8`). AMD comgr's code-object cache stays per namespace
 (`runtime_kernel_caches`, `<cache>/vendor/comgr`). Runtime start-up itself
 (`initialize_communicator_stack`, 5.3–8.7 s per process: jax import ~2 s,
 distributed and backend init ~1.5 s, clique warm-up 2.6 s) is not cached.
