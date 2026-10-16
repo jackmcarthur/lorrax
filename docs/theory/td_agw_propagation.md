@@ -114,6 +114,30 @@ $R(h/2)\,M(h)\,R(h/2)$, with $R$ the exact relaxation around an RK4 step of
 the intraband flow, so with either one active the global order is 2 with an
 error constant set by the size of $[M, R]$.
 
+### Two accuracy limits {#accuracy-limits}
+
+**Short pulses under `dp54`.** The controller starts with a step of
+`dt_measure` and measures its error against `atol` while ρ is still at
+equilibrium, so a pulse shorter than the first steps is integrated with an
+amplitude error the error estimate does not see. On CrI3 (6×6 k, 2v2c, a
+10 as Gaussian at 100 V/m) `rtol` = 1e-8 leaves 1e-5 to 3e-4 in the amplitude
+of P(t) against the exact linear response, while `max_step` = 2 as gives
+2e-11; the frequencies are unaffected. TDGW selects the same steps. Set
+`control.timesteps.max_step` to about a fifth of the pulse width when the
+amplitude matters.
+
+**Rounding floor of the Magnus schemes.** `magnus2` and `cfm4` conjugate the
+whole ρ, whose O(1) occupations set the absolute rounding of every
+exponential, while the induced coherence in weak-field linear response is
+small (|ρ_cv| ~ 1e-6). Each step therefore adds a relative error of order
+ε/|ρ_cv|, and the P(t) error stops falling near 1e-8 after 10⁴ steps; RK4,
+ETDRK4 and DP54 add small increments and reach 1e-11. The floor is far below
+spectroscopic tolerances. The cure is the interaction picture on
+Δρ = ρ − ρ^eq: integrate diag(E^QP) as exact phases, take exponentials of the
+small coupling only, and update
+Δρ ← P (U Δρ U^† + [U − 1, ρ^eq] U^†) P^†, every term of the size of Δρ
+(not implemented).
+
 ## Layout and programs {#layout}
 
 ρ is `(ntr, nk_pad, nb, nb)` complex128: a leading trial axis (drives

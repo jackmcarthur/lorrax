@@ -350,6 +350,8 @@ def _toml_value(v):
         return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    if isinstance(v, dict):                                 # inline table, e.g. lorrax.trials rows
+        return "{" + ", ".join(f"{k} = {_toml_value(x)}" for k, x in v.items()) + "}"
     raise TypeError(f"cannot write {type(v).__name__} to toml")
 
 
