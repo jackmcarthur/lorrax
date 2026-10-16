@@ -280,7 +280,9 @@ def round_tables(counts, widths, nodes, infinity_counts, infinity_width, *, colu
     finite = carriers[:, list(halves[0])].sum(axis=1)
     infinity = np.asarray([column_extent(int(c)) if blocks else 0 for c in infinity_counts], np.int64)
     return dict(order=order, points=points, active=np.concatenate((live,) + (tail,) * blocks, axis=1),
-                own=finite + infinity, extents=np.column_stack((finite, infinity)))
+                own=finite + infinity, extents=np.column_stack((finite, infinity)),
+                extent=int(extent), blocks=int(blocks), column_extent=column_extent,
+                nodes=tuple(complex(z) for z in nodes))
 
 
 def pack_panels(fields, order, widths, *, mesh_xy, layout='batch', order_device=None):
@@ -333,6 +335,152 @@ def pack_panels(fields, order, widths, *, mesh_xy, layout='batch', order_device=
         dest[b, order[b, f] - offsets[s]] = f
         accs = _pack_place(*key, width)(accs, panels, dest)
     return _pack_finish(*key)(accs)
+
+
+def pack_round(fields, widths, nodes, infinity, infinity_width, *, extent, halves, blocks, real,
+               mesh_xy, column_extent):
+    """A batch round's packed pencil columns AND its tables, built on the devices.
+
+    ``fields`` are the K lists of the round's S state panels ``[B, n_k, r_s]`` (Q, WQ, dWQ; Q
+    first), ``widths`` their carriers, ``nodes`` the S state nodes, ``infinity`` the round's
+    infinity panels (directions first, ``infinity_width`` columns), ``extent`` the per-half
+    extent and ``halves`` 2 on the ordered route (originals, then mirrors), else 1; ``blocks``
+    the infinity blocks of ``active`` (``round_tables``).  Returns ``(live [B], points [B, F],
+    active [B, side], (Q, WQ, dWQ) [B, n_k, F])`` at ``P(BATCH)``: the values
+    :func:`round_tables` + :func:`round_operands` + :func:`pack_panels` give, with nothing
+    crossing from the host.
+
+    A state's retained count on each slot is read from its own direction panel, the number
+    of its nonzero columns: retained directions are nonzero (unit vectors, or W applied to
+    them) with an exact zero tail past the count (the selection's mask, the store's panels,
+    ``_times_zero`` for an empty partner), and synthetic slots count none (``live``).  Each
+    panel's program places its columns at the slot's running position in its half, on the
+    carrier ``column_extent(count)`` (a static ladder table), sets ``points`` to its node
+    (a per-map constant table read at the panel's device index) and ``active`` on its count,
+    and advances the position: the host loop of ``round_tables``, element for element.
+    ``LORRAX_CHECK_COUNTS=1`` reads the device tables back and refuses unless they equal
+    the host's (one read; diagnostic).
+    """
+    import numpy as np
+    from gw.shared_pole_directions import device_index
+    slots, states = int(fields[0][0].shape[0]), len(widths)
+    F = int(extent) * int(halves)
+    shapes = tuple((int(panels[0].shape[1]), np.dtype(panels[0].dtype).name) for panels in fields)
+    key = (mesh_xy, 'batch', slots, F, shapes)
+    accs = _pack_start(*key)()
+    live = _live_mask(mesh_xy, slots, int(real))
+    state = _round_table_start(mesh_xy, slots, F, int(halves))()
+    table = _node_table(mesh_xy, tuple(complex(z) for z in nodes))
+    per_half = states // int(halves)
+    # The carrier ladder once per round (column_extent is a host call per count): each panel's
+    # and the infinity block's ladder are its leading entries.
+    top = max([int(w) for w in widths] + [int(infinity_width)])
+    rungs = tuple(int(column_extent(c)) if c else 0 for c in range(top + 1))
+    for s, width in enumerate(int(w) for w in widths):
+        ladder = rungs[:width + 1]
+        half = min(s // per_half, int(halves) - 1)
+        accs, state = _pack_round_place(*key, width, int(halves), int(extent), ladder)(
+            accs, tuple(panels[s] for panels in fields), live, state, table, device_index(mesh_xy, s),
+            device_index(mesh_xy, half))
+    infinity_ladder = rungs[:int(infinity_width) + 1]
+    out = _pack_round_finish(*key, int(blocks), int(infinity_width), infinity_ladder)(accs, state, live, infinity[0])
+    return out
+
+
+@lru_cache(maxsize=None)
+def _live_mask(mesh_xy, slots, real):
+    """``arange(slots) < real`` at ``P(BATCH)``, a compiled constant (one program per real count)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    return jax.jit(lambda: jnp.arange(slots) < real, out_shardings=NamedSharding(mesh_xy, P(BATCH)))()
+
+
+@lru_cache(maxsize=None)
+def _node_table(mesh_xy, nodes):
+    """The round's state nodes [S] complex128, replicated: a compiled constant per map."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    table = np.asarray(nodes, np.complex128)
+    return jax.jit(lambda: jnp.asarray(table), out_shardings=NamedSharding(mesh_xy, P()))()
+
+
+@lru_cache(maxsize=None)
+def _round_table_start(mesh_xy, slots, columns, halves):
+    """The device tables a round's panels fill: (position [B, halves] int32, points [B, F]
+    complex128, active [B, F] bool), zeros, made on the device."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    shard = NamedSharding(mesh_xy, P(BATCH))
+    return jax.jit(lambda: (jnp.zeros((slots, halves), jnp.int32), jnp.zeros((slots, columns), jnp.complex128),
+                            jnp.zeros((slots, columns), bool)), out_shardings=(shard,) * 3)
+
+
+def _retained_count(panel):
+    """Per slot: the nonzero columns of a direction panel [b, n, r] (its retained count)."""
+    import jax.numpy as jnp
+    return jnp.sum(jnp.any(panel != 0, axis=1), axis=-1).astype(jnp.int32)
+
+
+@lru_cache(maxsize=None)
+def _pack_round_place(mesh_xy, layout, slots, columns, shapes, width, halves, extent, ladder):
+    """One state panel of :func:`pack_round`: its columns, points and active flags at the slot's
+    running position in its half (a device index, so one program serves both halves);
+    accumulators and tables donated."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from jax import shard_map
+
+    def body(accs, panels, live, state, table, index, half):
+        position, points, active = state
+        count = jnp.where(live, _retained_count(panels[0]), 0)
+        carrier = jnp.asarray(ladder, jnp.int32)[count]
+        mine = jnp.arange(halves, dtype=jnp.int32)[None, :] == half
+        start = half * extent + jnp.sum(jnp.where(mine, position, 0), axis=1)
+        j = jnp.arange(width, dtype=jnp.int32)[None, :]
+        dest = jnp.where(j < carrier[:, None], start[:, None] + j, columns).astype(jnp.int32)
+        node = jax.lax.dynamic_index_in_dim(table, index, axis=0, keepdims=False)
+        # The panel's columns are the contiguous range [start, start + carrier) of each slot, so
+        # the tables take dense selects, not scatters (XLA:GPU expands a complex128 scatter into
+        # a while loop of kernel launches per scattered row; see _pack_start).
+        col = jnp.arange(columns, dtype=jnp.int32)[None, :] - start[:, None]
+        held = (col >= 0) & (col < carrier[:, None])
+        points = jnp.where(held, node, points)
+        active = jnp.where(held, col < count[:, None], active)
+        position = position + jnp.where(mine, carrier[:, None], 0)
+        return (tuple(_place_rows(a, p, dest, columns) for a, p in zip(accs, panels)),
+                (position, points, active))
+    batch = P(BATCH)
+    specs = ((batch,) * len(shapes), (batch,) * len(shapes), batch, (batch,) * 3, P(), P(), P())
+    out = ((batch,) * len(shapes), (batch,) * 3)
+    return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=specs, out_specs=out, check_vma=False),
+                   donate_argnums=(0, 3))
+
+
+@lru_cache(maxsize=None)
+def _pack_round_finish(mesh_xy, layout, slots, columns, shapes, blocks, infinity_width, ladder):
+    """The packed columns of :func:`pack_round` back to ``[B, n_k, F]`` and its ``active`` with
+    the infinity blocks (the retained count of the infinity directions); accumulators donated."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from jax import shard_map
+
+    def body(accs, state, live, qi):
+        _, points, active = state
+        count = jnp.where(live, _retained_count(qi), 0)
+        tail = jnp.arange(infinity_width)[None, :] < count[:, None]
+        packed = tuple(_held_columns(a, dt, columns) for a, (_, dt) in zip(accs, shapes))
+        return live, points, jnp.concatenate((active,) + (tail,) * blocks, axis=1), packed
+    batch = P(BATCH)
+    specs = ((batch,) * len(shapes), (batch,) * 3, batch, batch)
+    out = (batch, batch, batch, (batch,) * len(shapes))
+    return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=specs, out_specs=out, check_vma=False),
+                   donate_argnums=(0,))
 
 
 def _held(dtype):
@@ -572,45 +720,9 @@ def _round_operand_split(mesh_xy, widths):
 
 
 def host_tree(tree):
-    """Every leaf of a pytree of device arrays on the host in ONE device-to-host read, bit for bit.
-
-    The leaves (any shape; bool, integer, float or complex) are reinterpreted as bytes on the
-    device and joined (:func:`_host_bytes_program`, one program per tree signature), read once,
-    and cut back into numpy leaves of their own dtype and shape; host leaves pass through. Each
-    leaf must be fully addressable on this process (replicated), as ``np.asarray`` requires.
-    """
-    import jax
-    import numpy as np
-    leaves, treedef = jax.tree.flatten(tree)
-    device = [i for i, a in enumerate(leaves) if isinstance(a, jax.Array)]
-    if not device:
-        return tree
-    signature = tuple((tuple(leaves[i].shape), np.dtype(leaves[i].dtype).str) for i in device)
-    raw = np.asarray(_host_bytes_program(signature)(*(leaves[i] for i in device)))
-    out, at = list(leaves), 0
-    for i, (shape, dt) in zip(device, signature):
-        dt = np.dtype(dt)
-        size = int(np.prod(shape, dtype=np.int64)) * dt.itemsize
-        chunk = raw[at:at + size]
-        at += size
-        out[i] = (chunk.view(np.uint8).astype(bool) if dt == np.bool_ else chunk.view(dt)).reshape(shape)
-    return jax.tree.unflatten(treedef, out)
-
-
-@lru_cache(maxsize=None)
-def _host_bytes_program(signature):
-    import jax
-    import jax.numpy as jnp
-    import numpy as np
-
-    def as_bytes(a):
-        dt = np.dtype(a.dtype)
-        if dt == np.bool_:
-            return a.astype(jnp.uint8).reshape(-1)
-        if np.issubdtype(dt, np.complexfloating):
-            a = jnp.stack((jnp.real(a), jnp.imag(a)), axis=-1)
-        return jax.lax.bitcast_convert_type(a, jnp.uint8).reshape(-1)
-    return jax.jit(lambda *leaves: jnp.concatenate([as_bytes(a) for a in leaves]))
+    """:func:`common.host_read.host_tree` (one device-to-host read of a pytree, bit for bit)."""
+    from common.host_read import host_tree as read
+    return read(tree)
 
 
 def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget,
@@ -623,10 +735,22 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
     first round, so one program serves every round and SC map, and only
     exact-zero columns ever leave the solve.
     """
-    live, points, active, order = round_operands(mesh_xy, tables, real)
-    q, o, d = pack_panels(tuple([st[k] for st in states] for k in (1, 2, 3)), tables["order"],
-                          [int(st[1].shape[-1]) for st in states], mesh_xy=mesh_xy,
-                          order_device=order)
+    import os
+    import numpy as np
+    widths = [int(st[1].shape[-1]) for st in states]
+    halves = int(tables["order"].shape[-1]) // int(tables["extent"])
+    live, points, active, (q, o, d) = pack_round(
+        tuple([st[k] for st in states] for k in (1, 2, 3)), widths, tables["nodes"],
+        tuple(infinity), int(infinity[0].shape[-1]), extent=int(tables["extent"]), halves=halves,
+        blocks=int(tables["blocks"]), real=real, mesh_xy=mesh_xy, column_extent=tables["column_extent"])
+    if os.environ.get("LORRAX_CHECK_COUNTS", "0") not in ("", "0"):
+        want = (np.arange(len(tables["own"])) < int(real), tables["points"], tables["active"])
+        same = all(np.array_equal(np.asarray(s.data), np.asarray(w)[s.index])     # diagnostic only:
+                   for g, w in zip((live, points, active), want)                 # this process's shards
+                   for s in g.addressable_shards)
+        if not same:
+            raise ValueError("GATE shared_pole_round_tables_device: the device-built round tables "
+                             "differ from the host's (live, points, active)")
     args = (live, points, active, q, o, d, tuple(infinity))
     budget = None if keep_budget is None else int(keep_budget)
     return round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
@@ -805,14 +929,43 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
     # plan's public trace-safe native callable. Face arrays were dispatched
     # above and use the plan's eager ``batched`` surface in their own program.
     program = round_checks(mesh_xy, eigh_plan.native_fn, bool(ordered))
-    # The live slots, held nodes and eta repeat from round to round: placed once per value.
-    from gw.shared_pole_directions import replicated as placed
-    put = placed(mesh_xy)
-    live = _batch_constant(mesh_xy, np.arange(int(model[0].shape[0])) < int(real))
-    out = program(live, model, signed, inverse_coulomb_sqrt, *held,
-                  put(np.asarray(nodes, np.complex128)), put(np.float64(eta_ry)),
+    # The live slots, held nodes and eta repeat from round to round: compiled constants.
+    live = _live_mask(mesh_xy, int(model[0].shape[0]), int(real))
+    z, eta = _check_constants(mesh_xy, tuple(complex(v) for v in nodes), float(eta_ry))
+    out = program(live, model, signed, inverse_coulomb_sqrt, *held, z, eta,
                   *moments, infinity_directions)
     return host_tree(out)
+
+
+@lru_cache(maxsize=None)
+def store_pole_rows(mesh_xy, blocks, width, order):
+    """The model store's poles [nq, width], replicated, joined on the device from each round's
+    sorted pole rows: round i keeps ``blocks[i] = (real, keep)`` rows and columns, padded to
+    ``width`` with 1.0 (the store's inert pole), then the parents are put in canonical
+    ``order`` (a static permutation): the host join of the same rows, value for value."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    permutation = np.asarray(order, np.int64)
+
+    def join(*poles):
+        rows = [jnp.pad(p[:r, :k], ((0, 0), (0, width - k)), constant_values=1.0)
+                for p, (r, k) in zip(poles, blocks)]
+        return jnp.concatenate(rows)[permutation]
+    return jax.jit(join, out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@lru_cache(maxsize=None)
+def _check_constants(mesh_xy, nodes, eta):
+    """The held nodes [S] complex128 and eta float64, replicated compiled constants."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    rep = NamedSharding(mesh_xy, P())
+    z = np.asarray(nodes, np.complex128)
+    return jax.jit(lambda: (jnp.asarray(z), jnp.asarray(eta, jnp.float64)), out_shardings=(rep, rep))()
 
 
 def _leading_row(array, *, slot):
@@ -902,12 +1055,25 @@ def round_checks(mesh_xy, native_eigh, ordered):
             model, signed, inverse, wc, dw, z, eta, m1, m3, qi,
             matmul=_mm, eigh=native_eigh, gates=gates, ordered=ordered)
 
+    def parents(model, signed, inverse, wc, dw, z, eta, m1, m3, qi):
+        """The check of a rank's local parents: the equations are written for one parent (its
+        held samples share the leading broadcast axis), so several local parents are checked one
+        each under ``vmap`` (their eighs batched) and their rows joined in slot order."""
+        local = int(inverse.shape[0])
+        if local == 1:
+            return check(model, signed, inverse, wc, dw, z, eta, m1, m3, qi)
+        split = lambda a: a.reshape((local, 1) + a.shape[1:])
+        one = jax.tree.map(split, (model, signed, inverse, wc, dw, m1, m3, qi))
+        rows = jax.vmap(lambda model, signed, inverse, wc, dw, m1, m3, qi: check(
+            model, signed, inverse, wc, dw, z, eta, m1, m3, qi))(*one)
+        return jax.tree.map(lambda a: a.reshape((local * a.shape[1],) + a.shape[2:]), rows)
+
     def body(live, model, signed, inverse, wc, dw, z, eta, m1, m3, qi):
         args = (model, signed, inverse, wc, dw, z, eta, m1, m3, qi)
 
         def skip(args):
-            return jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(check, *args))
-        return jax.lax.cond(live[0], lambda args: check(*args), skip, args)
+            return jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), jax.eval_shape(parents, *args))
+        return jax.lax.cond(live[0], lambda args: parents(*args), skip, args)
 
     mapped = shard_map(body, mesh=mesh_xy, in_specs=(batch,) * 6 + (rep, rep) + (batch,) * 3, out_specs=batch,
                        check_vma=False)

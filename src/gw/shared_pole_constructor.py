@@ -451,7 +451,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 width = column_extent(int(counts[:real].max()))
                 factors.append(face_rows(mesh_xy, tuple(range(real)), width)(round_model[0]) if execution == 'face' else
                                face_rows(mesh_xy, tuple(range(real)), width)(to_face(round_model[0])))
-                store_poles.append(poles[:real, :width])
+                # The round's sorted poles stay on the device; the writer joins them there.
+                store_poles.append((vectors[0], (int(real), int(width))))
                 store_counts.append(counts[:real])
                 placed += list(ids[:real])
                 del round_model, round_signed, qi, reductions, vectors
@@ -463,8 +464,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         order = np.argsort(placed)
         width = max(block.shape[-1] for block in factors)
         public_b = canonical_factors(mesh_xy, tuple(int(i) for i in order))(*factors)
-        store_poles = np.concatenate([np.pad(block, ((0, 0), (0, width - block.shape[-1])), constant_values=1.0)
-                                      for block in store_poles])[order]
+        from gw.shared_pole_local import store_pole_rows
+        store_poles = store_pole_rows(mesh_xy, tuple(b for _, b in store_poles), int(width),
+                                      tuple(int(i) for i in order))(*(p for p, _ in store_poles))
         budget.batch_width = nq
         budget.retained_panels = ()
         budget.plan(width, phase="model")
@@ -478,7 +480,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 target = resident
                 ledger.live_stages = (*ledger.live_stages, model_residence["stage"])
         store_header = write_shared_pole_model(
-            target, public_b, jax.device_put(store_poles, NamedSharding(mesh_xy, P())),
+            target, public_b, store_poles,
             np.concatenate(store_counts)[order], q_span=(0, nq), meta=meta, tables=bank["tables"], recipe=recipe,
             receipts={"identity": identity, "q_receipts": [receipts[q] for q in range(nq)]}, ordered=ordered)
         ledger.live_stages = upstream
