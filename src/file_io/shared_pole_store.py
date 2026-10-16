@@ -421,8 +421,12 @@ def _placed_counts(b, K):
 
 
 @timing.timed("factor_validation")
-def _check_factor(b, poles2, K):
-    """Gate the physical active prefix and exact inactive sentinel."""
+def _check_factor(b, poles2, K, pending=None):
+    """Gate the physical active prefix and exact inactive sentinel.
+
+    ``pending`` (a list): the device half of the verdict is appended there instead of
+    read now, and the caller refuses on all of them in one read (:func:`_refuse_invalid`).
+    """
     if b.dtype != np.complex128 or poles2.dtype != np.float64 or K.dtype != np.int64:
         _refuse(f"dtypes {(b.dtype, poles2.dtype, K.dtype)}")
     if b.ndim != 4 or poles2.shape != (b.shape[0], b.shape[3]) or K.shape != (b.shape[0],):
@@ -432,10 +436,25 @@ def _check_factor(b, poles2, K):
     if isinstance(poles2, np.ndarray) and isinstance(K, np.ndarray):
         # Host poles and counts (the digest's chunks): their predicates on the
         # host, the factor's on the device with the counts placed once.
-        ok = _poles_valid_host(poles2, K) and bool(_factor_b_valid(b, _placed_counts(b, K)))
+        if not _poles_valid_host(poles2, K):
+            _refuse_invalid([False])
+        ok = _factor_b_valid(b, _placed_counts(b, K))
     else:
         ok = _factor_valid(b, poles2, K)
-    if not bool(ok):
+    if pending is not None:
+        pending.append(ok)
+        return
+    _refuse_invalid([ok])
+
+
+def _refuse_invalid(oks):
+    """Refuse when any verdict in ``oks`` (host bools or replicated device scalars) is false;
+    the device ones are read back in one transfer."""
+    device = [ok for ok in oks if not isinstance(ok, (bool, np.bool_))]
+    good = all(bool(ok) for ok in oks if isinstance(ok, (bool, np.bool_)))
+    if good and device:
+        good = bool(jnp.all(jnp.stack([jnp.asarray(ok, bool) for ok in device])))
+    if not good:
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
 
@@ -872,6 +891,9 @@ def _model_digest(path, header, mesh, *, capacity):
            batch_limit*(panel+24*kmax), host_payload=batch_limit*panel,
            device_panel=batch_limit*panel,
            host_metadata=batch_limit*(256*nmu*components+8*kmax), native_host=True)
+    # Every panel's device verdict is read once, after the loop (the digest is
+    # refused, never returned, if any panel is invalid).
+    verdicts, reduced = [], []
     with open_shared_pole_model(path, mesh_xy=mesh) as io:
         for q0, q_new in _covering_windows(header["n_q_irr"], batch_limit):
             q1 = q0+batch_limit
@@ -896,7 +918,7 @@ def _model_digest(path, header, mesh, *, capacity):
                     b = io.read_slab("factor", shape=(batch,ncan,components,width), offset=(q0,0,0,c0),
                                      partition_spec=P(None,"x",None,None))
                     counts = np.clip(active_counts-c0, 0, width)
-                    _check_factor(b, host_poles[:,c0:c1], counts)
+                    _check_factor(b, host_poles[:,c0:c1], counts, pending=verdicts)
                 with timing.section('host_digest_hashing'):
                     for shard in b.addressable_shards:
                         if shard.replica_id != 0:
@@ -915,12 +937,18 @@ def _model_digest(path, header, mesh, *, capacity):
             for q in range(batch):
                 for row, hasher in hashers[q].items():
                     row_hash[q,row] = np.frombuffer(hasher.digest(), np.uint8)
-            with timing.section('digest_reduction'):
-                row_hash = psum_replicate(row_hash, mesh)
-                # Preserve the original q-major row-hashes then poles byte stream.
+            # Reduced once for every batch after the loop (one exchange, not one per batch).
+            reduced.append((row_hash, host_poles, q_new, batch))
+    if reduced:
+        with timing.section('digest_reduction'):
+            row_hashes = psum_replicate(np.stack([r[0] for r in reduced]), mesh)
+            # Preserve the original q-major row-hashes then poles byte stream.
+            for row_hash, (_, host_poles, q_new, batch) in zip(row_hashes, reduced):
                 for q in range(q_new, batch):
                     digest.update(row_hash[q].astype(np.uint8).tobytes())
                     digest.update(np.asarray(host_poles[q:q+1], dtype="<f8").tobytes())
+    if verdicts:
+        _refuse_invalid(verdicts)
     return digest.hexdigest()
 
 
@@ -2333,6 +2361,16 @@ def _complete_bank(path, header):
         _stamp_header(path, header, "shared_pole_bank.complete")
 
 
+def _refuse_nonfinite(finite):
+    """Refuse the first ``(name, all-finite)`` entry that is false: one read for the call."""
+    if not finite:
+        return
+    flags = np.asarray(jnp.stack([ok for _, ok in finite]))
+    for (name, _), ok in zip(finite, flags):
+        if not ok:
+            _refuse(f"scratch {name} contains nonfinite values")
+
+
 def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
     """Validate/admit one line sample's panels for parents [q0, q1).
 
@@ -2356,7 +2394,7 @@ def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
     charge = "photon_layout" not in header
     basis = meta.mu_basis
     spec = P(None, None, "x", "y")
-    pending = []
+    pending, finite = [], []
     for family, array in line["panels"].items():
         width = int(array.shape[-1])
         stored = panels_meta["width"][family][sample - p0]
@@ -2383,9 +2421,9 @@ def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
                 temporary = 0
             _admit(ledger, "write_bank_" + name, output, temporary + arg,
                    device_panel=max(arg, output), native_host=True)
-            if not bool(jnp.all(jnp.isfinite(value))):
-                _refuse(f"scratch {name} contains nonfinite values")
+            finite.append((name, jnp.all(jnp.isfinite(value))))
             pending.append((family, name, value, counts))
+    _refuse_nonfinite(finite)
     return sample, pending
 
 
@@ -2424,6 +2462,7 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
     masks = _bank_masks(header)
     # Validate every argument before opening the writer: a bad second field
     # must not leave an otherwise legal first field queued in the same call.
+    finite = []
     for name, array in pending:
         geometry = _sample_field(header, name)
         sample = geometry is not None
@@ -2451,8 +2490,8 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
         # Factor-sized finite-check envelope, separate from caller input.
         _admit(ledger,"write_bank_"+name,output,temporary+arg,
                device_panel=max(arg,output),native_host=True)
-        if not bool(jnp.all(jnp.isfinite(array))):
-            _refuse(f"scratch {name} contains nonfinite values")
+        finite.append((name, jnp.all(jnp.isfinite(array))))
+    _refuse_nonfinite(finite)
     line = (None if line is None else
             _prepare_line_write(header, line, q0=q0, q1=q1, meta=meta, mesh_xy=mesh_xy, ledger=ledger))
     return q0, q1, rows, pending, line, masks

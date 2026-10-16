@@ -880,7 +880,7 @@ class Plan:
         # failure flag, so their buffers are never reserved beside the first
         # attempt's (EIGHSTACK: n 18304, P4, 80 GB).
         out = program("first", ())(*ops)
-        if not _flag(out[-1]):
+        if not _flag(out[-1], int(ops[0].shape[-1]), ops[0].dtype):
             return out
         _notices(out[-1], self.op, int(ops[0].shape[-1]), ops[0].dtype, site, final=False)
         del out
@@ -1056,7 +1056,7 @@ class Plan:
                     return self._finish(self._scan_over_single(ops, kwargs, phase=phase), A, site)
                 # Eager: the retries run as a second scan only when a matrix failed.
                 out = self._scan_over_single(ops, kwargs, phase="first")
-                if _flag(out[-1]):
+                if _flag(out[-1], int(A.shape[-1]), A.dtype):
                     _notices(out[-1], self.op, int(A.shape[-1]), A.dtype, site, final=False)
                     del out
                     out = self._scan_over_single(ops, kwargs, phase="retry")
@@ -1094,7 +1094,7 @@ class Plan:
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
             return values_vectors
         values_vectors, failed = program("first")(A)
-        if _flag(failed):
+        if _flag(failed, shape[-1], A.dtype):
             _notices(failed, "eigh", shape[-1], A.dtype, site, final=False)
             del values_vectors
             values_vectors, failed = program("retry")(A)
