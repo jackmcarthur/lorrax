@@ -424,90 +424,65 @@ static ffi::Error ReadImpl(
 // outside it get zeros, and edge ranks read clipped hyperslabs.
 static ffi::Error ReadDispatch(
     LRX_STREAM_PARAM
-    ffi::Buffer<ffi::DataType::S64> handle_buf,   // shape (2,) {ctx_handle, ds_id}
-    ffi::Buffer<ffi::DataType::S64> offset_buf,   // shape (ndim,)
-    ffi::Buffer<ffi::DataType::S64> valid_shape_buf, // shape (ndim,)
+    ffi::AnyBuffer dst,                    // the caller's output, aliased to A_out
     ffi::Result<ffi::AnyBuffer> A_out,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
     ffi::Span<const int64_t> axis_flat)
 {
-    // ``ctx_handle`` and ``ds_id`` arrive as a RUNTIME buffer, not as FFI
-    // Attrs.  Attrs are baked into the HLO, and ctx_handle is a heap
-    // address, so as an Attr it made every module unique PER PROCESS: the
-    // persistent compile cache could never hit one and rewrote it on every
-    // run.  MEASURED 2026-08-07 with a byte-identical workload and a
-    // private cache dir: jit__per_rank entries went 4 -> 8 -> 12 over three
-    // runs while a plain jit control stayed at 1, and the shared np1 cache
-    // held 6813 such corpses out of 14443 entries.  ds_id moves with it —
-    // as an Attr it also forked a module per (file, dataset) pair, so the
-    // module count scaled with the deck instead of with the geometry.
-    // This is the same argument that already made ``offset_base`` a Buffer;
-    // see the note above WriteDispatch in write_ffi.cc.
-    //
-    // Both values are replicated across the mesh (the shard_map passes them
-    // with ``P()``), so every refusal below is still computed from inputs
-    // that are identical on every rank.
-    if (handle_buf.dimensions().size() != 1 ||
-        handle_buf.dimensions()[0] != 2) {
-        return ffi::Error(
-            ffi::ErrorCode::kInvalidArgument,
-            "phdf5 read: handle_buf must have shape (2,) == "
-            "{ctx_handle, ds_id}");
+    // Control by POSTED ADDRESS (ctx.h, handler ABI 7): SlabIO allocated
+    // ``dst``, aliased it to ``A_out`` and posted {ctx, ds_id, offset[N],
+    // valid_shape[N]} under its address.  No control operand, so no device
+    // array, no D2H copy-in and no xla_stream sync; the ctx address and ds_id
+    // still never enter the HLO (the reason ABI 2 made them runtime values:
+    // as Attrs they forked a module per process and per dataset).
+    const auto dims = A_out->dimensions();
+    const size_t N = dims.size();
+    if (N == 0) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "phdf5 read: output is 0-D; there is no hyperslab to read");
     }
-    int64_t handle_host[2] = {0, 0};
+    if (dst.untyped_data() != A_out->untyped_data()) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+            "GATE phdf5_posted_control: phdf5 read: output is not the aliased "
+            "destination SlabIO posted for (input_output_aliases not honoured)");
+    }
+    std::vector<int64_t> control;
     {
-        // No ctx yet, so there is nothing to announce through: return
-        // plainly.  A failure here is a broken D2H copy, not a collective
-        // divergence — it hits every rank identically.
-        std::string herr;
-        if (!copy_index_to_host(LRX_STREAM_ARG handle_host,
-                                handle_buf.untyped_data(),
-                                2 * sizeof(int64_t), &herr)) {
-            return ffi::Error(ffi::ErrorCode::kInternal,
-                              "phdf5 read: copy(handle) failed: " + herr);
+        std::string perr;
+        if (!take_control(reinterpret_cast<uint64_t>(A_out->untyped_data()),
+                          kCtlRead, &control, &perr)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, "phdf5 read: " + perr);
         }
     }
-    auto* ctx = reinterpret_cast<PhdfCtx*>(handle_host[0]);
-    const hid_t ds_id = (hid_t)handle_host[1];
-
-    // Every refusal in this dispatch is computed from replicated inputs (FFI
-    // Attrs, the replicated handle buffer, the equal-block output shape, a
-    // collectively-opened ds_id), so it fires on every rank or none — the
-    // only kind a collective tolerates.
+    if (control.size() != 2 + 2 * N) {
+        std::ostringstream os;
+        os << "phdf5 read: posted control has " << control.size()
+           << " values; want 2 + 2 ndim = " << 2 + 2 * N;
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    auto* ctx = reinterpret_cast<PhdfCtx*>(control[0]);
+    const hid_t ds_id = (hid_t)control[1];
+    if (!ctx) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "phdf5 read: ctx_handle is null");
+    }
+    {
+        std::string live_err;
+        if (!check_live_ctx(ctx, control[0], "phdf5 read", &live_err)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err);
+        }
+    }
+    // Every refusal below is computed from replicated values (Attrs, the
+    // posted control -- the same on every rank by construction -- and the
+    // equal-block output shape), so it fires on every rank or none.
     auto fail = [ctx](ffi::ErrorCode code, const std::string& msg) {
         announce_error(ctx, msg);
         return ffi::Error(code, msg);
     };
-
-    if (!ctx) {
-        return fail(ffi::ErrorCode::kInvalidArgument,
-                    "phdf5 read: ctx_handle is null");
-    }
-    // Audit B2: validated against the live-ctx registry BEFORE ``fail``
-    // (which reads ctx->rank) or anything else touches this pointer.
-    {
-        std::string live_err;
-        if (!check_live_ctx(ctx, handle_host[0], "phdf5 read", &live_err)) {
-            return ffi::Error(ffi::ErrorCode::kInvalidArgument, live_err);
-        }
-    }
-
-    const auto dims = A_out->dimensions();
-    const size_t N = dims.size();
-    if (N == 0) {
-        return fail(ffi::ErrorCode::kInvalidArgument,
-                    "phdf5 read: output is 0-D; there is no hyperslab to read");
-    }
-    if (offset_buf.dimensions().size() != 1 ||
-        (size_t)offset_buf.dimensions()[0] != N ||
-        valid_shape_buf.dimensions().size() != 1 ||
-        (size_t)valid_shape_buf.dimensions()[0] != N ||
-        axis_count_per_dim.size() != N) {
+    if (axis_count_per_dim.size() != N) {
         std::ostringstream os;
         os << "phdf5 read: rank mismatch  A.ndim=" << N
-           << " offset_buf.ndim=" << offset_buf.dimensions().size()
-           << " valid_shape_buf.ndim=" << valid_shape_buf.dimensions().size()
            << " axis_count_per_dim.size=" << axis_count_per_dim.size();
         return fail(ffi::ErrorCode::kInvalidArgument, os.str());
     }
@@ -519,24 +494,8 @@ static ffi::Error ReadDispatch(
             return fail(ffi::ErrorCode::kInvalidArgument, enc_err);
         }
     }
-
-    // Bring the small offset + valid_shape buffers (N × 8 bytes each) into
-    // host memory (D2H on CUDA; already host-resident on the host build).
-    std::vector<int64_t> offset_host(N);
-    std::string cperr;
-    if (!copy_index_to_host(LRX_STREAM_ARG offset_host.data(),
-                            offset_buf.untyped_data(),
-                            N * sizeof(int64_t), &cperr)) {
-        return fail(ffi::ErrorCode::kInternal,
-                    "phdf5 read: copy(offset) failed: " + cperr);
-    }
-    std::vector<int64_t> valid_shape_host(N);
-    if (!copy_index_to_host(LRX_STREAM_ARG valid_shape_host.data(),
-                            valid_shape_buf.untyped_data(),
-                            N * sizeof(int64_t), &cperr)) {
-        return fail(ffi::ErrorCode::kInternal,
-                    "phdf5 read: copy(valid_shape) failed: " + cperr);
-    }
+    std::vector<int64_t> offset_host(control.begin() + 2, control.begin() + 2 + N);
+    std::vector<int64_t> valid_shape_host(control.begin() + 2 + N, control.end());
 
     std::vector<hsize_t> offset(N), file_count(N), mem_dims(N);
     {
@@ -599,8 +558,8 @@ static ffi::Error ReadDispatch(
 //  N ``ReadDispatch`` requests, placed by the same ``rank_hyperslab`` and
 //  selected by the same ``select_rank_slab``, so the bytes that land are the
 //  ones N ``read_slab`` calls return.  What it removes is per-request: N
-//  dispatches, N descriptor puts (one control table instead of 3 N vectors),
-//  N D2H copy-ins of those descriptors (each a stream sync on a device leg),
+//  dispatches, N descriptor puts and their D2H copy-ins (each a stream sync on
+//  a device leg; since ABI 7 every read posts its control instead),
 //  N collective rendezvous and N Python ``block_until_ready``.
 //
 //  The handler is synchronous on the XLA thread, like ReadDispatch: the
@@ -610,7 +569,8 @@ static ffi::Error ReadDispatch(
 //  the host staging is the sum of the N rank blocks (ReadDispatch's was the
 //  largest one), retired after the copy above 32 MiB exactly as before.
 //
-//  control (S64, 1-D): {ctx, N, ds_id[N], offset[N][ndim], valid[N][ndim]}.
+//  Posted control (ctx.h, ABI 7), keyed by output 0's address:
+//  {ctx, N, ds_id[N], offset[N][ndim], valid[N][ndim], address[N]}.
 // ────────────────────────────────────────────────────────────────────────────
 #if H5_VERSION_GE(1, 14, 0)
 static bool native_type_of(ffi::DataType t, hid_t* type, size_t* size) {
@@ -629,7 +589,7 @@ static bool native_type_of(ffi::DataType t, hid_t* type, size_t* size) {
 
 static ffi::Error ReadMultiDispatch(
     LRX_STREAM_PARAM
-    ffi::Buffer<ffi::DataType::S64> control_buf,
+    ffi::RemainingArgs dsts,               // the caller's outputs, aliased to outs
     ffi::RemainingRets outs,
     ffi::Span<const int64_t> mesh_shape,
     ffi::Span<const int64_t> axis_count_per_dim,
@@ -638,24 +598,47 @@ static ffi::Error ReadMultiDispatch(
     static const char* kWho = "phdf5 read_multi";
     const size_t n_out = outs.size();
     const size_t ndim = axis_count_per_dim.size();
-    const size_t want = 2 + n_out * (1 + 2 * ndim);
-    if (n_out == 0 || ndim == 0 || control_buf.dimensions().size() != 1 ||
-        (size_t)control_buf.dimensions()[0] != want) {
+    const size_t want = 2 + n_out * (2 + 2 * ndim);
+    if (n_out == 0 || ndim == 0 || dsts.size() != n_out) {
         std::ostringstream os;
-        os << kWho << ": control must be 1-D of length 2 + N(1 + 2 ndim) = "
-           << want << " for N=" << n_out << " ndim=" << ndim;
+        os << kWho << ": " << dsts.size() << " destinations for " << n_out
+           << " outputs of ndim " << ndim;
         return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
     }
-    // ONE descriptor copy-in for the whole request list (a device leg's
-    // copy_index_to_host is a D2H plus an xla_stream sync).
-    std::vector<int64_t> control(want);
+    // Control by POSTED ADDRESS (ctx.h, handler ABI 7), keyed by output 0:
+    // {ctx, N, ds_id[N], offset[N][ndim], valid[N][ndim], address[N]}.
+    std::vector<int64_t> control;
     {
-        std::string herr;
-        if (!copy_index_to_host(LRX_STREAM_ARG control.data(),
-                                control_buf.untyped_data(),
-                                want * sizeof(int64_t), &herr)) {
-            return ffi::Error(ffi::ErrorCode::kInternal,
-                              std::string(kWho) + ": copy(control) failed: " + herr);
+        auto r0 = outs.get<ffi::AnyBuffer>(0);
+        if (!r0.has_value()) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                              std::string(kWho) + ": output decode failed");
+        }
+        std::string perr;
+        if (!take_control(reinterpret_cast<uint64_t>(r0.value()->untyped_data()),
+                          kCtlReadMulti, &control, &perr)) {
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                              std::string(kWho) + ": " + perr);
+        }
+    }
+    if (control.size() != want) {
+        std::ostringstream os;
+        os << kWho << ": posted control has " << control.size()
+           << " values; want 2 + N(2 + 2 ndim) = " << want;
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
+    }
+    for (size_t i = 0; i < n_out; ++i) {
+        auto ri = outs.get<ffi::AnyBuffer>(i);
+        auto di = dsts.get<ffi::AnyBuffer>(i);
+        const uint64_t posted = (uint64_t)control[2 + n_out * (1 + 2 * ndim) + i];
+        if (!ri.has_value() || !di.has_value() ||
+            ri.value()->untyped_data() != di.value().untyped_data() ||
+            reinterpret_cast<uint64_t>(ri.value()->untyped_data()) != posted) {
+            std::ostringstream os;
+            os << "GATE phdf5_posted_control: " << kWho << ": output " << i
+               << " is not the aliased destination SlabIO posted (0x" << std::hex
+               << posted << std::dec << ")";
+            return ffi::Error(ffi::ErrorCode::kInvalidArgument, os.str());
         }
     }
     auto* ctx = reinterpret_cast<PhdfCtx*>(control[0]);
@@ -1983,9 +1966,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfRead), lorrax_ffi::phdf5::ReadDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // handle {ctx, ds}
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // offset_base
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // valid_shape
+        .Arg<xla::ffi::AnyBuffer>()   // destination, aliased to the result (ABI 7)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
@@ -2023,8 +2004,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     LRX_PHDF_HANDLER(PhdfReadMulti), lorrax_ffi::phdf5::ReadMultiDispatch,
     xla::ffi::Ffi::Bind()
         LRX_PHDF_STREAM_CTX
-        .Arg<xla::ffi::Buffer<xla::ffi::DataType::S64>>()  // control {ctx, N, ds[N], off[N][d], valid[N][d]}
-        .RemainingRets()                                   // the N outputs
+        .RemainingArgs()   // the N destinations, aliased to the results (ABI 7)
+        .RemainingRets()   // the N outputs
         .Attr<xla::ffi::Span<const int64_t>>("mesh_shape")
         .Attr<xla::ffi::Span<const int64_t>>("axis_count_per_dim")
         .Attr<xla::ffi::Span<const int64_t>>("axis_flat"));

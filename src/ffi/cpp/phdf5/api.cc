@@ -109,6 +109,28 @@ int LRX_C_ENTRY(lrx_phdf5_staging_totals)(
     return 0;
 }
 
+// Posted control (ctx.h POSTED CONTROL, handler ABI 7).  Process-local, not
+// collective: each rank posts the values of its own next call, keyed by the
+// address of that call's own data buffer on this rank.
+// Returns 0 when posted, 1 when an entry for (addr, kind) is already pending.
+int LRX_C_ENTRY(lrx_phdf5_post_control)(
+    uint64_t addr, int64_t kind, const int64_t* values, int64_t n)
+{
+    return lorrax_ffi::phdf5::post_control(addr, kind, values, n);
+}
+
+// Withdraw a post whose call never dispatched.  0 = removed, 1 = none pending.
+int LRX_C_ENTRY(lrx_phdf5_retract_control)(uint64_t addr, int64_t kind)
+{
+    return lorrax_ffi::phdf5::retract_control(addr, kind) ? 0 : 1;
+}
+
+// Entries posted and not yet taken by a handler (diagnostic; 0 when idle).
+int64_t LRX_C_ENTRY(lrx_phdf5_pending_controls)(void)
+{
+    return static_cast<int64_t>(lorrax_ffi::phdf5::pending_controls());
+}
+
 // Collective H5Dcreate/H5Dopen.  All ranks must call concurrently.
 // shape[ndim] is the N-D dataset shape; ndim >= 1.  dtype_tag: 1=F32
 // 2=F64 3=S32 4=S64 5=C64 6=C128 (matches xla::ffi::DataType).

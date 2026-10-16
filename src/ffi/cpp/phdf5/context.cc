@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -1329,6 +1330,50 @@ void close_ctx(PhdfCtx* ctx, int64_t* timing_out) {
     // registered inside ensure_mpi_initialized in HDF5/MPI runtimes).
 
     delete ctx;
+}
+
+// ─── Posted control registry (ctx.h POSTED CONTROL) ────────────────────
+namespace {
+std::mutex g_control_mu;
+std::map<std::pair<uint64_t, int64_t>, std::vector<int64_t>> g_controls;
+}  // namespace
+
+int post_control(uint64_t addr, int64_t kind, const int64_t* v, int64_t n) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    auto key = std::make_pair(addr, kind);
+    if (g_controls.count(key)) return 1;
+    g_controls.emplace(key, std::vector<int64_t>(v, v + (n > 0 ? n : 0)));
+    return 0;
+}
+
+bool retract_control(uint64_t addr, int64_t kind) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    return g_controls.erase(std::make_pair(addr, kind)) > 0;
+}
+
+bool take_control(uint64_t addr, int64_t kind, std::vector<int64_t>* out,
+                  std::string* err) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    auto it = g_controls.find(std::make_pair(addr, kind));
+    if (it == g_controls.end()) {
+        std::ostringstream os;
+        os << "GATE phdf5_posted_control: got: no control posted for kind " << kind
+           << " at buffer 0x" << std::hex << addr << std::dec << " (" << g_controls.size()
+           << " pending); want: SlabIO's post for this call's own buffer; why: the "
+           << "handler takes its descriptors by the address of the buffer it was "
+           << "handed, so a copy XLA inserted (alias not honoured) or a call SlabIO "
+           << "did not post refuses here instead of reading another call's offsets";
+        *err = os.str();
+        return false;
+    }
+    *out = std::move(it->second);
+    g_controls.erase(it);
+    return true;
+}
+
+size_t pending_controls() {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    return g_controls.size();
 }
 
 }  // namespace lorrax_ffi::phdf5

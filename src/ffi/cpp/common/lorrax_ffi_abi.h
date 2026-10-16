@@ -69,6 +69,17 @@
 //                registry common/ctx_registry.{h,cc}; new C entry points
 //                lrx_ctx_bind / lrx_ctx_unbind (leg-suffixed).
 //
+//   ABI 6 -> 7   (2026-10-16, slabmr/w8).  PhdfRead, PhdfReadMulti, PhdfWrite
+//                and PhdfWriteIndependent lost their S64 control operands
+//                (handle / offset / valid_shape, and read_multi's control
+//                table).  SlabIO posts those values through
+//                lrx_phdf5_post_control, keyed by the address of the call's
+//                own buffer (reads: a caller-allocated destination aliased to
+//                the result; writes: the operand), and the handler takes them
+//                by that address (cpp/phdf5/ctx.h POSTED CONTROL).  An ABI-6
+//                library would receive one Arg where it expects three: refused
+//                by name at load instead.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -93,4 +104,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 6
+#define LORRAX_FFI_ABI_VERSION 7

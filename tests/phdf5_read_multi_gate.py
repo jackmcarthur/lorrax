@@ -1,4 +1,4 @@
-"""phdf5 ``PhdfReadMulti`` gate: SlabIO.read_multi against read_slab (the reference route).
+"""phdf5 gate: SlabIO.read_multi against read_slab, and the posted control channel (handler ABI 7).
 
 Run on every rank of a launch (``srun -n P``), any leg:
     python tests/phdf5_read_multi_gate.py OUT_DIR [--platform gpu|cpu] [--bench N]
@@ -9,7 +9,11 @@ panels of ragged widths in batch and face layouts, mixed dtypes in one call, a
 padded extent, a zero-size request, and the shared-dataset case (one dataset
 twice). It also counts, per call, the descriptor puts and the Python
 ``block_until_ready`` calls of both routes, and times ``--bench`` rounds of a
-35-panel read both ways. Prints ``GATE <case> PASS|FAIL``; exit 1 on any FAIL.
+35-panel read both ways. Posted control (ABI 7): queued same-shape writes to
+different offsets and back-to-back async reads of one geometry must land where
+posted (a keying or ordering fault swaps rows), no descriptor reaches the
+device, and no control stays pending. Prints ``GATE <case> PASS|FAIL``; exit 1
+on any FAIL.
 """
 import os
 import sys
@@ -106,13 +110,18 @@ def matches_ref(a, e):
 
 class Count:
     def __init__(self):
-        self.puts = self.syncs = 0
+        self.puts = self.syncs = self.posts = 0
 
     def __enter__(self):
         from jax._src import array as _arr
         self._arr = _arr
         self._put, self._bur = sff.device_put_process_local, _arr.ArrayImpl.block_until_ready
+        self._post = sff._posted
         cnt = self
+
+        def post(*a, **k):
+            cnt.posts += 1
+            return self._post(*a, **k)
 
         def put(*a, **k):
             cnt.puts += 1
@@ -122,11 +131,13 @@ class Count:
             cnt.syncs += 1
             return self._bur(x)
         sff.device_put_process_local = put
+        sff._posted = post
         self._arr.ArrayImpl.block_until_ready = bur
         return self
 
     def __exit__(self, *exc):
         sff.device_put_process_local = self._put
+        sff._posted = self._post
         self._arr.ArrayImpl.block_until_ready = self._bur
 
 
@@ -164,16 +175,22 @@ with SlabIO(PATH, mode="r", mesh=mesh) as io:
         ok = all(m.shape == s.shape and m.dtype == s.dtype and m.sharding == s.sharding
                  and same(m, s) and matches_ref(m, expected(r))
                  for m, s, r in zip(multi, single, reqs))
-        verdict(case, ok, f"n={len(reqs)} multi(puts={cm.puts}, syncs={cm.syncs}) "
-                          f"read_slab(puts={cs.puts}, syncs={cs.syncs})")
+        ok = ok and cm.puts == 0 and cs.puts == 0
+        verdict(case, ok, f"n={len(reqs)} multi(posts={cm.posts}, puts={cm.puts}, syncs={cm.syncs}) "
+                          f"read_slab(posts={cs.posts}, puts={cs.puts}, syncs={cs.syncs})")
     # overlapping windows of one dataset: two disjoint waves, same bytes as read_slab
     reqs = requests(FACE, [lines[6]], 1, 3) + requests(FACE, [lines[6]], 2, 3)
     with Count() as cm:
         multi = io.read_multi([{k: v for k, v in r.items() if k != "k"} for r in reqs],
                               partition_spec=FACE)
-    verdict("overlap_waves", cm.puts == 2 and all(matches_ref(m, expected(r))
-                                                  for m, r in zip(multi, reqs)),
-            f"puts={cm.puts}")
+    verdict("overlap_waves", cm.posts == 2 and cm.puts == 0 and all(
+        matches_ref(m, expected(r)) for m, r in zip(multi, reqs)), f"posts={cm.posts} puts={cm.puts}")
+    # back-to-back async reads of ONE geometry at different offsets, no wait between
+    reqs_by_q = [requests(BATCH, [lines[7]], q, ndev)[0] for q in (0, NQ - ndev) * 8]
+    vals = [io.read_multi([{k: v for k, v in r.items() if k != "k"}], partition_spec=BATCH)[0]
+            for r in reqs_by_q]
+    verdict("posted_reads_back_to_back", all(matches_ref(v, expected(r))
+                                             for v, r in zip(vals, reqs_by_q)), f"n={len(vals)}")
     # zero-size request: zeros, no I/O, beside a real one
     reqs = requests(BATCH, [lines[0]], 0, ndev) + [dict(
         name="empty", shape=(ndev, FIELDS, ROWS, 0), offset=(0, 0, 0, 0),
@@ -208,5 +225,29 @@ with SlabIO(PATH, mode="r", mesh=mesh) as io:
             if rank == 0:
                 print(f"BENCH {route} n=35 P={ndev} warm rounds={BENCH} median_ms={np.median(w):.2f} "
                       f"min_ms={w.min():.2f} first_ms={walls[0]*1e3:.1f}", flush=True)
+# posted writes: 8 same-shape slabs to different offsets, queued with no sync between
+WPATH = os.path.join(OUT, f"posted_write_gate_P{ndev}.h5")
+wshape = (NQ, FIELDS, ROWS, 6)
+full = ref(200, wshape, np.complex128)
+row_spec = P(("x", "y"), None, None, None)
+with SlabIO(WPATH, mode="w", mesh=mesh) as wio:
+    wio.create_dataset("w", shape=wshape, dtype=np.complex128)
+    with Count() as cw:
+        for q0 in range(0, NQ, ndev):
+            blk = full[q0:q0 + ndev]
+            A = jax.make_array_from_callback(blk.shape, jax.sharding.NamedSharding(mesh, row_spec),
+                                             lambda idx, blk=blk: blk[idx])
+            wio.write_slab("w", A, offset=(q0, 0, 0, 0))
+        for k in range(1, 4):         # the same array to three offsets
+            wio.write_slab("w", A, offset=(NQ - ndev, 0, 0, 0))
+with SlabIO(WPATH, mode="r", mesh=mesh) as rio:
+    back = rio.read_slab("w", shape=wshape, offset=(0, 0, 0, 0), dtype=np.complex128,
+                         partition_spec=P(None, None, None, None))
+verdict("posted_writes_queued", np.array_equal(np.asarray(back.addressable_shards[0].data), full)
+        and cw.puts == 0, f"writes={NQ // ndev + 3} puts={cw.puts}")
+from ffi.common import ffi_loader
+from ffi.io import _platform_for_mesh
+pending = ffi_loader.phdf5_pending_controls(platform=_platform_for_mesh(mesh))
+verdict("no_pending_controls", pending == 0, f"pending={pending}")
 print(f"GATE_DONE rank={rank} fails={len(fails)}", flush=True)
 sys.exit(1 if fails else 0)

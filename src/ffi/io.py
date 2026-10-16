@@ -38,9 +38,9 @@ __all__ = [
     # readers (was phdf5/read.py)
     "handle_vector",
     "ffi_read_call", "ffi_read_kchunk_call", "ffi_read_kchunk_union_call",
-    "read_sharded_slab", "read_kchunk_union_sharded",
+    "read_kchunk_union_sharded",
     # writer (was phdf5/write.py)
-    "write_sharded_slab", "ffi_write_call",
+    "ffi_write_call", "ffi_read_multi_call",
 ]
 
 # =========================================================================
@@ -142,7 +142,7 @@ def open_file(path: str, *, mesh: Mesh, mode: str) -> int:
     -------
     int
         Opaque handle (int64 address of the C++ ``PhdfCtx``).  Pass to
-        ``write_sharded_slab`` and ``close_file``.
+        ``SlabIO`` reads/writes and ``close_file``.
     """
     if mode not in _MODE_FLAGS:
         raise ValueError(f"mode must be w/a/r; got {mode!r}")
@@ -263,8 +263,6 @@ Two entry points, each wrapping a C++ handler defined in
 ``cpp/read_ffi.cc``:
 
 ===========================  ===========================================
-``read_sharded_slab``         2-D dataset → ``P('x','y')``-sharded array.
-                              Thinnest convenience wrapper.
 ``read_kchunk_union_sharded`` N-D dataset, ``n_kchunk`` **disjoint**
                               windows via ``H5S_SELECT_OR`` compound
                               hyperslab, **one H5Dread**.  Use when the
@@ -285,6 +283,10 @@ behind it is not an option, it is a second spelling; DELETED.  Its C++
 handler is still in the deployed ``.so`` pair and its removal is
 registered to the owner, so ``ffi_read_kchunk_call`` below stays as the
 1:1 binding of a handler that still exists.
+
+``read_sharded_slab`` and ``write_sharded_slab`` (2-D convenience wrappers
+with no caller) were deleted with handler ABI 7: their control operands no
+longer exist, and SlabIO is the one entry point that posts controls.
 
 Each high-level function returns a jitted ``shard_map`` closure: the
 caller dispatches against it with runtime buffer arguments (offsets,
@@ -425,31 +427,26 @@ def handle_vector(ctx_handle: int, ds_id: int, mesh=None) -> jax.Array:
 
 
 def ffi_read_call(
-    out_struct: jax.ShapeDtypeStruct,
-    handle: jax.Array,
-    offset_base: jax.Array,
-    valid_shape: jax.Array,
+    dst: jax.Array,
     *,
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
     axis_flat: Sequence[int],
 ) -> jax.Array:
-    """Single-hyperslab read — one H5Dread of one rectangle.
+    """Single-hyperslab read — one H5Dread of one rectangle into ``dst``.
 
-    ``handle`` (``(2,)`` == ``[ctx_handle, ds_id]``), ``offset_base`` and
-    ``valid_shape`` are int64 ``jax.Array`` buffers passed at runtime (not
-    as FFI Attrs), so the shard_map closure compiles ONCE per ``(ndim,
-    dtype, sharding)`` tuple and re-dispatches across chunks, datasets,
-    files and processes.  See :func:`ffi_write_call` for the measurement
-    that moved ctx_handle/ds_id out of the Attrs.
+    Handler ABI 7: no control operand.  ``dst`` is this rank's block of a
+    caller-allocated output, aliased to the result (``input_output_aliases``)
+    and DONATED by the enclosing jit; SlabIO posts the call's control values
+    (ctx, ds_id, origin, valid extent) under ``dst``'s address
+    (``ffi_loader.phdf5_post_control``) and the handler takes them by the
+    address of the buffer it is handed (cpp/phdf5/ctx.h POSTED CONTROL).  The
+    ctx address and ds_id never enter the HLO, so one module still serves
+    every chunk, dataset, file and process (the ABI 2/3 measurement).
     """
-    require_control_i64("read handle", handle, ndim=1, length=2)
-    require_control_i64("read offset_base", offset_base, ndim=1)
-    require_control_i64("read valid_shape", valid_shape, ndim=1)
-    return jax.ffi.ffi_call(_TARGET_READ, out_struct)(
-        handle,
-        offset_base,
-        valid_shape,
+    return jax.ffi.ffi_call(_TARGET_READ, jax.ShapeDtypeStruct(dst.shape, dst.dtype),
+                            input_output_aliases={0: 0})(
+        dst,
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -457,8 +454,7 @@ def ffi_read_call(
 
 
 def ffi_read_multi_call(
-    out_structs: Sequence[jax.ShapeDtypeStruct],
-    control: jax.Array,
+    dsts: Sequence[jax.Array],
     *,
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
@@ -466,19 +462,18 @@ def ffi_read_multi_call(
 ) -> list:
     """N hyperslabs of N datasets of one file -- one handler, one ``H5Dread_multi``.
 
-    ``control`` is the ONE replicated int64 descriptor table
-    ``{ctx, N, ds_id[N], offset_base[N][ndim], valid_shape[N][ndim]}``; the
-    N outputs share ``ndim`` and the sharding encoding and keep their own
-    shapes and dtypes.  Each output is the block :func:`ffi_read_call` would
-    return for the same request (the handler places and selects every rank
-    with ReadDispatch's own helpers).
+    Handler ABI 7: each of the N caller-allocated ``dsts`` is aliased to its
+    result; the control ``{ctx, N, ds_id[N], offset[N][ndim],
+    valid_shape[N][ndim], address[N]}`` is posted under the address of
+    ``dsts[0]`` and the handler checks every output against the posted
+    addresses.  The N outputs share ``ndim`` and the sharding encoding and
+    keep their own shapes and dtypes.
     """
-    n = len(out_structs)
-    ndim = len(axis_count_per_dim)
-    require_control_i64("read_multi control", control, ndim=1,
-                        length=2 + n * (1 + 2 * ndim))
-    return jax.ffi.ffi_call(_TARGET_READ_MULTI, list(out_structs))(
-        control,
+    dsts = list(dsts)
+    return jax.ffi.ffi_call(
+        _TARGET_READ_MULTI, [jax.ShapeDtypeStruct(d.shape, d.dtype) for d in dsts],
+        input_output_aliases={i: i for i in range(len(dsts))})(
+        *dsts,
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
@@ -554,50 +549,6 @@ def ffi_read_kchunk_union_call(
 # =============================================================================
 #  High-level convenience wrappers (build a jitted shard_map closure)
 # =============================================================================
-def read_sharded_slab(
-    fh: int,
-    ds_name: str,
-    *,
-    global_shape: tuple[int, int],
-    dtype,
-    mesh: Mesh,
-) -> jax.Array:
-    """Read a 2-D dataset into a ``P('x','y')``-sharded ``jax.Array``.
-
-    Simplest entry point: one rectangular read of the whole dataset,
-    block-partitioned across the 2-D mesh.  Returns the array directly
-    (not a closure — there are no per-call parameters to vary).
-    """
-    p, q = validate_mesh_2d(mesh)
-    n_rows, n_cols = int(global_shape[0]), int(global_shape[1])
-    authenticate_padded_axis(
-        n_rows, n_rows, p, name=f"{ds_name} parallel-HDF5 row carrier")
-    authenticate_padded_axis(
-        n_cols, n_cols, q, name=f"{ds_name} parallel-HDF5 column carrier")
-
-    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
-    local_shape = (n_rows // p, n_cols // q)
-    out_struct = jax.ShapeDtypeStruct(local_shape, jnp.dtype(dtype))
-    offset_zero = jnp.zeros((2,), dtype=jnp.int64)
-    valid_shape = jnp.asarray((n_rows, n_cols), dtype=jnp.int64)
-
-    handle = handle_vector(fh, ds_id, mesh)
-
-    def _per_rank(handle_local, offset_local, valid_shape_local):
-        return ffi_read_call(
-            out_struct, handle_local, offset_local, valid_shape_local,
-            mesh_shape=(p, q),
-            axis_count_per_dim=(1, 1),
-            axis_flat=(0, 1),
-        )
-
-    return shard_map(
-        _per_rank, mesh=mesh,
-        in_specs=(P(), P(), P()), out_specs=P("x", "y"),
-        check_vma=False,
-    )(handle, offset_zero, valid_shape)
-
-
 def read_kchunk_union_sharded(
     fh: int,
     ds_name: str,
@@ -851,9 +802,6 @@ _FFI_TARGET_INDEPENDENT = "lorrax_phdf5_write_independent"
 # valid_shape is the logical global slab prefix that C++ clips against.
 def ffi_write_call(
     A_local: jax.Array,
-    handle: jax.Array,
-    offset_base: jax.Array,
-    valid_shape: jax.Array,
     *,
     mesh_shape: Sequence[int],
     axis_count_per_dim: Sequence[int],
@@ -866,113 +814,25 @@ def ffi_write_call(
     neither is right in general: independent MPI-IO for a file-order row-block
     slab (one long run per rank), two-phase collective for anything strided.
 
-    ``handle``, ``offset_base`` and ``valid_shape`` are jax.Arrays of
-    dtype int64 — passed as traced Buffer inputs (not FFI Attrs) so that
-    shard_map closures compile ONCE per ndim-dtype-sharding tuple and
-    re-dispatch across chunks, datasets and processes.
-
-    ``handle`` is ``(2,)`` == ``[ctx_handle, ds_id]``; see
-    :func:`handle_vector`.  These were Attrs until 2026-08-07, and
-    ctx_handle is a heap address, so the compiled module differed in
-    every process and the JAX persistent compile cache could never hit
-    one — it rewrote the entry on every run instead.  MEASURED with a
-    byte-identical workload into a private cache dir: ``jit__per_rank``
-    entries went 4 -> 8 -> 12 over three runs while a plain jit control
-    stayed at 1; the shared ``np1`` cache had 6813 such dead entries out
-    of 14443.  ds_id moved with it because as an Attr it forked a module
-    per (file, dataset) pair, making the module count scale with the deck.
-
-    ``offset_base``/``valid_shape`` were made Buffers earlier for the same
-    class of reason: each distinct chunk offset otherwise triggered a
-    fresh ~400 ms XLA compile of the FFI body (measured at MoS2 3x3, see
-    reports/zeta_offset_runtime_2026-04-19/).
+    Handler ABI 7: no control operand.  SlabIO posts ``{ctx, ds_id,
+    offset_base[ndim], valid_shape[ndim]}`` under the address of this rank's
+    shard of ``A`` and the handler takes them by the address of the operand it
+    is handed (cpp/phdf5/ctx.h POSTED CONTROL).  Until ABI 6 they were three
+    int64 operands -- one placement each per write, and a D2H copy plus an
+    xla_stream sync in the handler.  They were Attrs before 2026-08-07, which
+    forked a module per process (heap address) and per offset (~400 ms each,
+    reports/zeta_offset_runtime_2026-04-19/); posting keeps them out of the HLO.
 
     The mesh/axis attrs remain compile-time attrs — they are geometry, so
     a change in them genuinely IS a different module.
 
     Use inside a ``shard_map`` body.
     """
-    require_control_i64("write handle", handle, ndim=1, length=2)
-    require_control_i64("write offset_base", offset_base, ndim=1)
-    require_control_i64("write valid_shape", valid_shape, ndim=1)
     token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
     target = _FFI_TARGET_INDEPENDENT if independent else _FFI_TARGET
     return jax.ffi.ffi_call(target, token_spec, has_side_effect=True)(
         A_local,
-        handle,
-        offset_base,
-        valid_shape,
         mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
         axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
         axis_flat=np.asarray(axis_flat, dtype=np.int64),
     )
-
-
-def write_sharded_slab(
-    fh: int,
-    ds_name: str,
-    A: jax.Array,
-    *,
-    mesh: Mesh,
-    global_shape: tuple[int, int] | None = None,
-    valid_shape: tuple[int, int] | None = None,
-) -> jax.Array:
-    """Write a 2-D P('x','y')-sharded JAX array to an open HDF5 dataset.
-
-    Thin wrapper on top of the N-D FFI: sets
-    ``mesh_shape=(p,q)`` and ``axis_for_dim=(0,1)`` so each rank writes
-    its (rank/q, rank%q) hyperslab.  Shipped as the simplest 2-D entry
-    point; for N-D writes use :mod:`file_io.slab_io`.
-    """
-    if A.ndim != 2:
-        raise NotImplementedError(
-            "write_sharded_slab is 2-D only; use file_io.slab_io for N-D")
-    p, q = validate_mesh_2d(mesh)
-    phys_rows, phys_cols = (int(A.shape[0]), int(A.shape[1]))
-    valid_rows, valid_cols = (
-        tuple(int(s) for s in valid_shape)
-        if valid_shape is not None else (phys_rows, phys_cols)
-    )
-    n_rows, n_cols = (
-        tuple(int(s) for s in global_shape)
-        if global_shape is not None else (valid_rows, valid_cols)
-    )
-    authenticate_padded_axis(
-        phys_rows, phys_rows, p,
-        name=f"{ds_name} parallel-HDF5 row carrier")
-    authenticate_padded_axis(
-        phys_cols, phys_cols, q,
-        name=f"{ds_name} parallel-HDF5 column carrier")
-    if valid_rows > phys_rows or valid_cols > phys_cols:
-        raise ValueError(
-            f"valid_shape ({valid_rows},{valid_cols}) exceeds physical "
-            f"shape ({phys_rows},{phys_cols})")
-    if valid_rows > n_rows or valid_cols > n_cols:
-        raise ValueError(
-            f"valid_shape ({valid_rows},{valid_cols}) exceeds dataset "
-            f"shape ({n_rows},{n_cols})")
-    get_lib()
-
-    ds_id = ffi_loader.phdf5_ensure_dataset(
-        fh, ds_name, (int(n_rows), int(n_cols)),
-        str(jnp.dtype(A.dtype).name))
-
-    offset_array = jnp.zeros((2,), dtype=jnp.int64)
-    valid_shape_arr = jnp.asarray((valid_rows, valid_cols), dtype=jnp.int64)
-
-    handle = handle_vector(fh, ds_id, mesh)
-
-    def _per_rank(A_local, handle_local, offset_local, valid_shape_local):
-        return ffi_write_call(
-            A_local, handle_local, offset_local, valid_shape_local,
-            mesh_shape=(p, q),
-            axis_count_per_dim=(1, 1),
-            axis_flat=(0, 1),
-            independent=False,    # a 2-D block tile: strided per rank
-        )
-
-    return shard_map(
-        _per_rank, mesh=mesh,
-        in_specs=(P("x", "y"), P(), P(), P()), out_specs=P(),
-        check_vma=False,
-    )(A, handle, offset_array, valid_shape_arr)

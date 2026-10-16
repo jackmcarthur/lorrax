@@ -315,4 +315,27 @@ bool ctx_is_live(const PhdfCtx* ctx, size_t* n_live);
 // context alive for the duration of the walk.
 bool staging_totals(const PhdfCtx* ctx, size_t* n_live, size_t* pinned_bytes);
 
+// ─── POSTED CONTROL (handler ABI 7) ──────────────────────────────────────
+// The read, read_multi, write and write_independent handlers take NO control
+// operand.  SlabIO posts each call's control values (ctx, dataset ids,
+// origin, valid extent) here through a ctypes entry point, keyed by the
+// address of the call's OWN data buffer and the handler kind: the output the
+// caller allocated and aliased into the call (reads), or the operand (writes).
+// The handler takes its entry by that address.  So no device array carries a
+// descriptor, there is no D2H copy-in and no xla_stream sync, and the match
+// does not depend on the order XLA runs the calls in (a FIFO would: the CPU
+// client runs ready programs concurrently, and two same-shape writes would
+// swap offsets).  A missing entry is a refusal (GATE phdf5_posted_control),
+// never a guess: it means the buffer the handler got is not the one SlabIO
+// posted for (an XLA copy defeated the alias), or nothing was posted.
+enum ControlKind : int64_t {
+    kCtlRead = 1, kCtlReadMulti = 2, kCtlWrite = 3, kCtlWriteIndependent = 4,
+};
+// 0 = posted; 1 = an entry for (addr, kind) is already pending (refused).
+int  post_control(uint64_t addr, int64_t kind, const int64_t* v, int64_t n);
+bool retract_control(uint64_t addr, int64_t kind);
+bool take_control(uint64_t addr, int64_t kind, std::vector<int64_t>* out,
+                  std::string* err);
+size_t pending_controls();
+
 }  // namespace lorrax_ffi::phdf5
