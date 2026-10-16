@@ -69,7 +69,38 @@ Results that move:
 
 Off-grid states keep the `sigma_out_of_grid` and Σ(ω = 0) rules.
 
-Measured hsuite deltas: claim TBD.
+Measured on the P4 hsuite (on shell vs the old 0.25 eV grid, and vs the
+same grid route at `sigma_omega_step_ev = 0.025`; max|ΔE| / median, meV):
+
+| file | grid 0.25 − on shell | grid 0.025 − on shell |
+|---|---|---|
+| gnppm eqp0 | 4.7 / 0.7 | 0.2 / 0.0 |
+| spx eqp0 (spinor shared-pole) | 83.9 / 3.9 | 0.6 / 0.1 |
+| na_sc map 0 QP eigenvalues | 385.3 / 0.5 | 1.4 / 0.0 |
+| bisp_sc eqp0, eqp1 | 23.2 / 2.6 | 0.6 / 0.1 |
+| cohsex eqp0, eqp1 | 0 | — |
+
+The deltas are the 0.25 eV grid's interpolation error: refining the grid
+converges onto the on-shell values. On spx, the 0.025 eV grid's spline matches
+the on-shell Re Σ_c to 0.8 meV and the exact dΣ/dω to 0.006. The large
+outliers are states on η-scale pole structure (η = 0.25 eV); for example, Na
+k0 b6–8 at E − E_F = 11.3 eV, where Re Σ_c moves ~1 eV between adjacent
+0.25 eV nodes.
+
+eqp1 moves more (spx: up to 594 meV, median 15 meV): the ±0.5 eV stencil
+smooths dΣ/dω over 1 eV of that structure (spx k0 n0: Z = 0.355 exact vs
+0.690 stencil). The stencil error is independent of grid step: at 0.025 eV
+the grid route's eqp1 still differs by 695 meV.
+
+na_sc: map 1 now reads max|dE| = 1.95 eV, above the fixture's
+`sc_tol_ev = 1.5`. The fixture therefore runs 3 maps instead of 2, and its
+final eqp/Hartree references change at the eV level. This is a different
+stopping map, not a different fixed point.
+
+The extrapolation tail (inf − last, β) is unchanged. The Σ cube is 2 frequency
+slots instead of n_ω = 48 (spx), 41 (bisp_sc) and 87 (na_sc). References were
+regenerated at P4 from this branch; the evidence directories are
+`/pscratch/sd/j/jackm/cs_claude/sigma_depth2/runs/{grid,fine,onshell2,regen}`.
 
 `sigma_mnk.h5` keeps `sigma_c_kij_ev`/`sigma_total_kij_ev`, now `(2, nk, nb,
 nb)`. It adds per-table diagonals and `sigma_evaluation = on_shell`, and has
