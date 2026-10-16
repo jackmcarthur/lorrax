@@ -3,8 +3,8 @@
 ``distributed`` on a leg with a ``ONE_DEVICE_MAX_N`` row (the ROCM leg) and a
 known ``n`` within it resolves to ``one_device``: each matrix whole on one
 device, the native kernel, the caller's face layout.  Beyond the bound, with
-``n`` unknown, and for the capacity provider it stays the leg's library; a leg
-without a row (CUDA) is unchanged.  The ROCM leg is stood in for by patching
+``n`` unknown, and for the capacity provider it stays the leg's library.  ROCM has
+size rows; on CUDA the bound is the caller's room (ONE_DEVICE_BY_ROOM).  The ROCM leg is stood in for by patching
 the platform key on a CPU mesh; the numerics are route (c)'s on any device.
 
 Run with ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4``.
@@ -57,9 +57,16 @@ def _eigh_ok(a, w, v):
     assert r < 1e-12
 
 
-def test_size_route_rows_are_rocm_only():
+def test_size_route_rows_and_room_legs():
     assert set(resolve_mod.ONE_DEVICE_MAX_N) == {("eigh", "ROCM"), ("solve_lu", "ROCM")}
-    assert resolve_mod.one_device_max_n("eigh", "CUDA") is None
+    assert resolve_mod.ONE_DEVICE_BY_ROOM == {("eigh", "CUDA"), ("solve_lu", "CUDA")}
+    assert resolve_mod.one_device_max_n("eigh", "CUDA") is None          # no room, no bound
+    assert resolve_mod.one_device_max_n("eigh", "CUDA", 0) is None
+    for op in ("eigh", "solve_lu"):
+        need = od.one_device_bytes(op, 312)
+        assert resolve_mod.one_device_max_n(op, "CUDA", need) == 312
+        assert resolve_mod.one_device_max_n(op, "CUDA", need - 1) == 311
+    assert resolve_mod.one_device_max_n("eigh", "cpu", 1 << 40) is None
     assert "one_device" in resolve_mod.EIGH_BACKENDS and "one_device" in resolve_mod.LU_BACKENDS
 
 
@@ -86,15 +93,46 @@ def test_distributed_takes_the_size_route_on_rocm(mesh, rocm, capsys):
     assert not [l for l in distrib_la.new_stack_routes() if "size route" in l]   # reported once
 
 
-def test_cuda_resolution_is_unchanged(mesh, monkeypatch):
+def test_cuda_bound_is_the_room(mesh, monkeypatch):
+    """CUDA: one_device exactly where one whole matrix fits the caller's room; else cuSOLVERMp."""
     monkeypatch.setattr(resolve_mod, "mesh_platform", lambda m: "CUDA")
-    # RuntimeError: no loadable CUDA library on this host; ValueError: it loads (a GPU node)
-    # and the ladder refuses later (one JAX process per mesh device), as the ROCM case above.
-    with pytest.raises((RuntimeError, ValueError), match="cusolvermp"):
-        resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64)
+    monkeypatch.setattr(od, "mesh_platform", lambda m: "CUDA")
+    for op in ("eigh", "solve_lu"):
+        need = od.one_device_bytes(op, 64)
+        assert resolve_mod.resolve_backend(op, "distributed", mesh, n=64, room=need) == "one_device"
+        for n, room in ((64, None), (64, 0), (64, need - 1), (68, need), (None, need)):
+            # the library: RuntimeError where the CUDA library is absent; ValueError where it
+            # loads and the ladder refuses later (one JAX process per mesh device)
+            with pytest.raises((RuntimeError, ValueError), match="cusolvermp"):
+                resolve_mod.resolve_backend(op, "distributed", mesh, n=n, room=room)
     with pytest.raises(ValueError, match="GATE one_device"):
         resolve_mod.resolve_backend("eigh", "one_device", mesh, n=64)
+    assert resolve_mod.resolve_backend("eigh", "one_device", mesh, n=64,
+                                       room=od.one_device_bytes("eigh", 64)) == "one_device"
+    assert resolve_mod.size_route_note("eigh", "distributed", mesh, 64, "one_device",
+                                       od.one_device_bytes("eigh", 64)) == \
+        "size route CUDA: n=64 <= 64 -> one_device"
     assert resolve_mod.size_route_note("eigh", "distributed", mesh, 64, "cusolvermp") is None
+
+
+def test_cuda_room_plan_runs_in_room_bounded_rounds(mesh, monkeypatch):
+    """The plan's room both selects one_device and bounds its rounds (one matrix per rank)."""
+    monkeypatch.setattr(resolve_mod, "mesh_platform", lambda m: "CUDA")
+    monkeypatch.setattr(od, "mesh_platform", lambda m: "CUDA")
+    a = _hermitian(6, 8, seed=4)
+    room = od.one_device_bytes("eigh", 8)                 # one whole matrix per rank per round
+    p = distrib_la.plan("eigh", mesh, backend="distributed", n=8, batched_route="auto",
+                        budget_bytes=room)
+    assert p.backend == "one_device" and "size route CUDA: n=8 <= 8" in p.describe()
+    w, v = p.batched(_face(mesh, a))
+    _eigh_ok(a, w, v)
+    rng = np.random.default_rng(9)
+    A = rng.normal(size=(5, 8, 8)) + 1j * rng.normal(size=(5, 8, 8)); B = rng.normal(size=(5, 8, 8)) + 0j
+    lu = distrib_la.plan("solve_lu", mesh, backend="distributed", n=8, batched_route="auto",
+                         budget_bytes=od.one_device_bytes("solve_lu", 8))
+    assert lu.backend == "one_device"
+    X = lu.batched(_face(mesh, A), _face(mesh, B))
+    assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
 
 
 def test_auto_lu_on_rocm_probes_no_cuda_handler(mesh, rocm, capsys):
