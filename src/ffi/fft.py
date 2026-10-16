@@ -1472,7 +1472,7 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
 
     ``prep(Pc)`` tiles ``Pc`` (nk, n_c, a, mx) once per matvec (``ψ^X_c``); ``apply(L, R, V_R, Pc_t,
     conj_r=False)`` returns ``A[k,c,b,y] = Σ_{a,x} conj(Pc[k,c,a,x]) U[k,a,x,b,y]`` (nk, n_c, b, my), with
-    ``U`` the outer conv of ``(L, R, V_R, conj_r)`` -- ``bse_stack_matvec._decode``'s (t, μ) contraction,
+    ``U`` the outer conv of ``(L, R, V_R, conj_r)`` -- ``bse_stack_matvec._decode_tm``, the decode's (t, μ) contraction,
     whose (s, ν) contraction stays the caller's einsum.  CUDA (``kconv_outer_cuda_ffi.cc``): one resident
     block per SM, two 8-warp groups ping-ponging on two banks; the (phase, item) tiles go round robin
     so a wave shares one x window in L2, and the tile completing an item sums its partials in phase

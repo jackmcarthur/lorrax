@@ -166,7 +166,10 @@ zero-padded in R, and the head is re-attached analytically at each fine q
 model of W's whole long-range part (the screened head and, in a slab, its G_z
 channels) before the zero-pad and adds it back at every fine q, from the
 dressed channels GW stored in `W0_lr`
-([SR/LR densification](../theory/w-srlr-densification.md)). The
+([SR/LR densification](../theory/w-srlr-densification.md)). Both
+additions go into the fine W's donated buffer: the long-range model in q
+blocks of the fixed tile, the head as one fused pass, so the densification
+holds one fine W per rank. The
 q = 0 exchange tile is k-grid invariant and is carried through unchanged,
 unless `head_minibz_average = true`: then it is rebuilt through
 `bse.vq_interp` with the fine grid's mini-BZ head
@@ -203,6 +206,41 @@ serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
 The kernels, their refusals and the `LORRAX_BSE_OUTER_KSUM` A/B switch are in
 [the FFI layer](ffi_layout.md#kernel-operations). The decode keeps the
 (t, μ)-first order on every route.
+
+**Blocks.** T, U and $W_R$ are local in $(\mu, \nu)$: T is an outer product of
+its two ζ legs at each k, the convolution acts on each $(t\mu, s\nu)$ column
+with its own $W_R(\mu, \nu)$, and the decode sums over μ and ν. The W term is
+therefore an exact sum over blocks $I_i \times J_j$ of the rank's
+$(\mu_{loc}, \nu_{loc})$ tile,
+
+$$(WX)_{cvk} = \sum_j \frac{1}{\sqrt{N_k}} \sum_{s,\,\nu \in J_j} \psi_{vk,s}(\nu)\, A^{(j)}_{cs\nu}(k),\qquad
+A^{(j)}_{cs\nu}(k) = \sum_i \sum_{t,\,\mu \in I_i} \psi^*_{ck,t}(\mu)\, U^{(ij)}_{t\mu,s\nu}(k),$$
+
+with $U^{(ij)}$ the convolution of T's $(I_i, J_j)$ block with $W_R$'s:
+blocking reorders the μ and ν sums and nothing else.
+`bse_stack_matvec.plan_w_blocks` sizes the blocks from the shapes alone (the
+[fixed-tile rule](decisions.md#fixed-tile)). Routes 2 and 3 store U (route 3's
+T is U, in place), so they take the largest square-ish block, widths multiples
+of 8 or the whole axis, whose U block and $W_R$ block,
+$16\,N_k\,(n_s^2 + 1)\,b_\mu b_\nu$ bytes, fit `runtime.tiles.TILE_BYTES`
+(1 GiB). Route 1 stores neither (its handler bounds its scratch at U/16) and
+keeps the whole tile. On every route each operand of a block's handler call
+stays below $2^{31}$ elements, the outer load's 32-bit offsets. One block is
+the unblocked program, bit for bit. Otherwise, inside the trial scan, a
+`lax.scan` over ν blocks carries the $(c, v, k)$ partial and a nested
+`lax.scan` over μ blocks carries $A^{(j)}$; each block's $W_R$ slice is laid
+out in its step, and the last block of an axis is clamped onto its neighbour
+with the shared rows zeroed in the legs. The slice is cut from the tile's 2-D
+$(\mu_{loc}, \nu_{loc} N_k)$ view (`_w_block`): cut from the 5-D tile, XLA's GPU
+layout assignment meets route 3's k-leading kernel operand by relaying out the
+whole loop-invariant tile ahead of the scans, one tile-sized copy (32.4 GB per
+rank at CrI3 30×30, $N_\mu$ = 3000, four ranks, where the AOT gate refused the
+Davidson module at 98.5 GB; 66.1 GB from the 2-D view). No layout of the 2-D
+view makes the block's transpose a bitcast, so it stays a block-sized copy. On a route-1 block the fused store
+forms $A^{(ij)}$ directly. CrI3 30×30 at $N_\mu$ = 3000 on four ranks
+(route 3; U alone would be 130 GB per rank per trial) plans 13 × 13 blocks of
+120 × 120. The plan, the U block and the W term's per-rank price print once
+(`[bse] W term blocks:`); a price over the device budget warns and runs.
 
 Full (non-TDA) BSE runs on `bse_ring_comm.build_bse_ring_matvec_full`: it is
 the operator of FEAST and KPM without `--tda`, and `bse_nontda` builds the
@@ -432,6 +470,7 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |
 | non-TDA reciprocity preflight | `bse_nontda.check_restart_reciprocity` | `--lanczos` without `--tda`, with W on: a restart whose W fails the q ↔ −q reciprocity check, before the dense build |
 | non-TDA dense size | `bse_nontda` (`_DENSE_N_MAX`) | `--lanczos` without `--tda` at N = n_c,pad · n_v,pad · N_k > 4096 |
+| `GATE bse_w_block_operand` | `bse_stack_matvec.plan_w_blocks` | an 8 × 8 (μ, ν) W-term block whose outer-load handler call still has an operand of $2^{31}$ elements or more (a k grid near $8\cdot 10^6$ points at $n_s$ = 2) |
 | Haydock device count | `absorption_haydock.run_haydock` | fewer than two devices |
 
 ## Limits

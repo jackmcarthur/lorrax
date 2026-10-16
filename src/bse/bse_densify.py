@@ -688,25 +688,54 @@ def _unfold_lr_channels(lr, sym, *, coarse_grid, n_rmu, n_rmu_pad, mesh_xy):
 
 
 def _add_rank_lr(W_q, A, D, mesh_xy, sign):
-    """``W_q[μ,ν,q] += sign · Σ_ab conj(A[q,a,μ]) D[q,a,b] A[q,b,ν]`` in W's layout.
+    """``W_q[μ,ν,q] += sign · Σ_ab conj(A[q,a,μ]) D[q,a,b] A[q,b,ν]`` in W's layout, in place.
 
-    W_q ``(μ, ν, nx, ny, nz)`` at ``P('x','y',None,None,None)``; A
-    ``(n_q, n_L, μ)`` held twice, μ on x and ν on y (the ``attach_head_channel``
-    pattern), so every rank forms only its own tile and no collective runs.
+    W_q ``(μ, ν, nx, ny, nz)`` at ``P('x','y',None,None,None)`` is DONATED: the
+    result is written into its buffer and the caller rebinds it.  A
+    ``(n_q, n_L, μ)`` is held twice, μ on x and ν on y (the
+    ``attach_head_channel`` pattern), so every rank forms only its own tile
+    and no collective runs.  The term goes in q blocks, a ``lax.scan`` inside
+    the ``shard_map``: the most q whose (μ_loc, ν_loc, q) term and its layout
+    copy fit the fixed tile (``runtime.tiles.tile_units``), so the transient is
+    one block rather than a second W (32.6 GB per rank beside W's own 32.6 GB
+    at CrI3 30x30, N_μ 3000, P4).  The last block is clamped onto its
+    neighbour, and the q it shares is zeroed in its term.  One block is the
+    whole-grid update.
     # ponytail: A is host-built for every q (n_q·n_L·N_μ/√P per rank); build it
     # on device from the fit coefficients if that row stack ever matters.
     """
+    from jax import lax, shard_map
     from common.collectives import device_put_process_local
+    from runtime.tiles import tile_units
     a_x = device_put_process_local(A, NamedSharding(mesh_xy, P(None, None, "x")))
     a_y = device_put_process_local(A, NamedSharding(mesh_xy, P(None, None, "y")))
     d = device_put_process_local(D, NamedSharding(mesh_xy, P()))
+    w_spec = P("x", "y", None, None, None)
 
-    @partial(jax.jit, out_shardings=W_q.sharding)
-    def _add(W, ax, ay, dd):
-        t = jnp.einsum("qam,qab,qbn->mnq", jnp.conj(ax), dd, ay)
-        return W + sign * t.reshape(W.shape)
+    def _local(W, ax, ay, dd):                     # W (μ_loc, ν_loc, nx, ny, nz); ax/ay (n_q, n_L, μ_loc/ν_loc)
+        shape = W.shape
+        W = W.reshape(shape[0], shape[1], -1)
+        n_q = W.shape[2]
+        bq = tile_units(2 * 16 * shape[0] * shape[1], n_q)
 
-    return _add(W_q, a_x, a_y, d)
+        def term(q0):                              # (μ_loc, ν_loc, bq)
+            take = lambda a: lax.dynamic_slice_in_dim(a, q0, bq, axis=0)
+            return jnp.einsum("qam,qab,qbn->mnq", jnp.conj(take(ax)), take(dd), take(ay))
+        if bq == n_q:
+            return (W + sign * term(0)).reshape(shape)
+
+        def step(W, i):
+            q0 = jnp.minimum(i * bq, n_q - bq)
+            t = jnp.where(jnp.arange(bq) >= i * bq - q0, term(q0), 0)
+            blk = lax.dynamic_slice_in_dim(W, q0, bq, axis=2)
+            return lax.dynamic_update_slice_in_dim(W, blk + sign * t, q0, axis=2), None
+        W, _ = lax.scan(step, W, jnp.arange(-(-n_q // bq)), unroll=1)
+        return W.reshape(shape)
+
+    add = jax.jit(shard_map(_local, mesh=mesh_xy, out_specs=w_spec,
+                            in_specs=(w_spec, P(None, None, "x"), P(None, None, "y"), P())),
+                  donate_argnums=(0,))
+    return add(W_q, a_x, a_y, d)
 
 
 #: Bound of the operator identity in :func:`densified_dipoles`.  At a fine q

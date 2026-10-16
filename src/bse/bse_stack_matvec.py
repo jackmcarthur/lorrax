@@ -29,6 +29,12 @@ iterations and exactly ONE ``T``-family is alive regardless of ``n_trials``.  A
 Python-unrolled loop or a ``fori_loop`` over trials inside ``jit`` would keep
 ``n_trials`` live ``T`` slots; the scan does not.
 
+Inside the trial scan the W term is a sum over (μ, ν) blocks of the rank's
+``W_R`` tile (``_blocked_w_term``, planned from the shapes by
+``plan_w_blocks``): what one trial stores is one block's U, never the tile's,
+and every outer-load handler call stays below 2^31 elements.  One block is the
+unblocked program.  The design is ``docs/architecture/bse.md#the-matvec``.
+
 The ``lax.scan`` bounds ``T``, not the ``shard_map``: the GSPMD twin below runs
 the same scan with no ``shard_map`` and holds 450.01 MiB at ``n_trials=1``
 against 450.10 MiB at ``n_trials=8`` (measured 2026-08-08).  The manual
@@ -105,6 +111,9 @@ applied ONCE, not twice: ``B`` has no ``D`` term.
 """
 from __future__ import annotations
 
+import math
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -118,6 +127,8 @@ from common.contract_bands import reduce_scatter_to_band_block
 from common.fft_helpers import (klead_outer_decode_refusal, klead_outer_refusal,
                                 make_local_kconv_klead, make_local_kconv_klead_outer,
                                 make_local_kconv_klead_outer_decode)
+from common.gpu_utils import device_budget_bytes, record_stage_price, warn_over_budget
+from runtime import tiles
 from .bse_preconditioner import exchange_spin_weight
 from .bse_ring_comm import make_bse_shardings
 
@@ -247,11 +258,10 @@ def _w_r_klead(W_R):
     return jnp.moveaxis(W_R.reshape(mu_loc, nu_loc, -1), -1, 0)
 
 
-def _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk):
-    """conv(T) then decode -- the stages both blocks share.
+def _xla_conv(kconv, T_b, W_Rk):
+    """``U_b = fftn_ortho(ifftn_ortho(T_b) · W_R)``: the k-convolution of an XLA-built T.
 
-    conv: ``U_b = (1/Nk) fft_k(W_R · ifft_k-unnormalised(T_b))``, i.e.
-    ``fftn_ortho(ifftn_ortho(T_b) · W_R)``, as ONE in-place call of the
+    ``(1/Nk) fft_k(W_R · ifft_k-unnormalised(T_b))`` as ONE in-place call of the
     k-convolution router's local k-LEADING factory, ``kconv``
     (``make_local_kconv_klead``: nvidia-mathdx mode 2 on CUDA, the pass Σ's τ
     kernel runs; the plan route on cpu).  Both norm factors are one folded
@@ -265,35 +275,32 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk):
     thousand-k-point sizes LORRAX is being built for.  Do not reintroduce it,
     under any name, on any measurement.  If the k-transform is a bottleneck the
     answer is a better FFT library, never a denser algorithm.
-
-    decode: ``(WX)_b = (1/√Nk) Σ_{μ,ν,t,s} conj(ψ_c) ψ_v U_b``, contracted
-    through THIS rank's μ_loc and ν_loc only: the result is the rank's
-    ``(c_full, v_full, nk)`` PARTIAL, and the caller completes both sums
-    with one reduce-scatter per block after the scan — no collective per
-    trial.  The (t, μ) contraction reads the k-leading U as a batched ZGEMM.
     """
-    return _decode(kconv(T_b, W_Rk), psi_c_X, psi_v_Y, sqrt_nk)  # kconv in place on T_b
+    return kconv(T_b, W_Rk)                                       # in place on T_b
 
 
-def _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk):
-    """``(WX)_b = (1/√Nk) Σ conj(ψ_c) ψ_v U_b``: (t, μ) first, then (s, ν).
+def _decode_tm(U_b, psi_c_X):
+    """The decode's (t, μ) contraction, ``A[k,c,s,ν] = Σ_{t,μ} conj(ψ^X_c[k,c,t,μ]) U_b[k,t,μ,s,ν]``.
 
-    Kept in this order on every route, including the outer load: contracting the
-    smaller band set first saves flops only once the decode is compute-bound (it
-    reads U at ~69% of HBM today, 1.96 against 1.98 ms either order on CrI3 8x8),
-    and the (s, ν)-first order moved Haydock ε₂ by 1.0e-6 against 4e-7 for this one
-    (BSEMAX, claims ledger).  This rank's (μ_loc, ν_loc) partial; the caller's one
-    reduce-scatter completes it.
+    ``U_b`` (nk, ns, μ_b, ns, ν_b), k-leading, and ``psi_c_X`` (nk, c_full, ns, μ_b) give
+    (nk, c_full, ns, ν_b): this rank's partial over its μ block, a batched ZGEMM over k.
+    (t, μ) runs first on every route, including the fused load's store: contracting the
+    smaller band set first saves flops only once the decode is compute-bound (it reads U
+    at ~69% of HBM today, 1.96 against 1.98 ms either order on CrI3 8x8), and the
+    (s, ν)-first order moved Haydock ε₂ by 1.0e-6 against 4e-7 for this one (BSEMAX,
+    claims ledger).
     """
-    A = jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(psi_c_X), U_b)  # (nk, c_full, ns, ν_loc)
-    return _decode_v(A, psi_v_Y, sqrt_nk)
+    return jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(psi_c_X), U_b)
 
 
 def _decode_v(A, psi_v_Y, sqrt_nk):
-    """``_decode``'s (s, ν) contraction of its (t, μ)-contracted ``A`` (nk, c_full, ns, ν_loc).
+    """The decode's (s, ν) contraction, ``(WX)[c,v,k] = (1/√Nk) Σ_{s,ν} ψ^Y_v[k,v,s,ν] A[k,c,s,ν]``.
 
-    The fused outer route (``make_local_kconv_klead_outer_decode``) forms ``A`` in the
-    convolution's store and hands it here, so both routes run this einsum.
+    ``A`` (nk, c_full, ns, ν_b) from :func:`_decode_tm` or the fused load's store and
+    ``psi_v_Y`` (nk, v_full, ns, ν_b) give (c_full, v_full, nk): this rank's partial over
+    its (μ, ν) tile.  The decode contracts through this rank's μ_loc and ν_loc only; the
+    caller completes both sums with one reduce-scatter per trial block after the scan, so
+    no collective runs per trial.
     """
     WXcv = jnp.einsum("kvsN,kcsN->cvk", psi_v_Y, A)             # (c_full, v_full, nk)
     return WXcv / sqrt_nk
@@ -365,29 +372,333 @@ def _make_outer_router(mesh_xy, kgrid):
     return route
 
 
-def _outer_w_term(route, rank, psi_c_X, psi_v_Y, W_R, sqrt_nk, mesh_xy, kgrid):
-    """``wterm(L, R, conj_r=False) -> (WX)_b`` on the outer load, or None when the router keeps T.
+def _w_route(route, rank, mesh_xy, kgrid, n_c):
+    """``(name, conv, fused)``: the W term's route for this mesh, grid, leg rank K and band count.
 
-    With the decode factory (``make_local_kconv_klead_outer_decode``; announced once) the load's store
-    contracts U with conj(ψ^X_c) over (t, μ) and U never reaches HBM; ψ^X_c is tiled once here,
-    outside the trial scan.  Else the outer conv writes U and ``_decode`` reads it.  Either way
-    ``_decode_v`` runs the (s, ν) einsum, so the (t, μ)-first order of ``_decode`` holds.
+    ``'fused'``: the outer-product load forms T and its store contracts U with conj(ψ^X_c)
+    (``fused`` is ``make_local_kconv_klead_outer_decode``'s ``(prep, apply)``): neither T nor U
+    reaches HBM.  ``'outer'``: the load forms T (``conv``) and writes U; XLA decodes it.
+    ``'xla'``: XLA builds T and the k-leading convolution writes U.  Decided at trace time and
+    announced once (``[bse] W term:``, ``[bse] W term decode:``).
     """
     from ffi.gate import announce_once
     conv = route(rank)
     if conv is None:
-        return None
-    W_Rm = _w_r_kminor(W_R)                          # the tile as built: a reshape, no copy
-    why = klead_outer_decode_refusal(mesh_xy, kgrid, psi_c_X.shape[1])
+        return "xla", None, None
+    why = klead_outer_decode_refusal(mesh_xy, kgrid, n_c)
     announce_once(("bse", "w_term_decode", why is None),
                   "[bse] W term decode: " + ("fused into the outer load's store (U never stored)"
                                              if why is None else "XLA on the stored U: " + why))
     if why is not None:
-        return lambda L, R, conj_r=False: _decode(conv(L, R, W_Rm, conj_r=conj_r), psi_c_X, psi_v_Y, sqrt_nk)
-    prep, apply = make_local_kconv_klead_outer_decode(mesh_xy, kgrid, norm="ortho")
-    pc_t = prep(psi_c_X)
-    return lambda L, R, conj_r=False: _decode_v(
-        _rank_partial(apply(L, R, W_Rm, pc_t, conj_r=conj_r)), psi_v_Y, sqrt_nk)
+        return "outer", conv, None
+    return "fused", conv, make_local_kconv_klead_outer_decode(mesh_xy, kgrid, norm="ortho")
+
+
+def _w_layout(name):
+    """The route's view of a ``W_R`` block (μ_b, ν_b, kx, ky, kz): k-minor for the outer
+    load (a reshape), k-leading for the XLA route's convolution (a copy)."""
+    return _w_r_klead if name == "xla" else _w_r_kminor
+
+
+def _fused_decode(fused, L, R, W, pc, pc_t, conj_r):
+    """The fused load's A (nk, c_full, ns, ν_b): ``pc_t`` is ψ^X_c tiled once per call
+    (the whole tile), else this block's ``pc`` is tiled here."""
+    prep, apply = fused
+    return _rank_partial(apply(L, R, W, prep(pc) if pc_t is None else pc_t, conj_r=conj_r))
+
+
+def _tda_block(name, conv, fused, kconv, pc_t):
+    """``block(X_b, mu, nu, W) -> A``: one (μ, ν) block of the TDA W term, decoded through (t, μ).
+
+    ``X_b`` (c_full, v_full, nk) is the whole trial; ``mu = (ψ^X_c,)`` (nk, c_full, ns, μ_b) and
+    ``nu = (ψ^Y_v,)`` (nk, v_full, ns, ν_b) are the block's slices of the legs, ``W`` the block of
+    ``W_R`` in the route's layout (:func:`_w_layout`).  Returns A (nk, c_full, ns, ν_b).  Route
+    ``xla``: T by :func:`_encode_T_A`, :func:`_xla_conv`; ``outer``: T on the load from
+    :func:`_outer_legs`, U stored; ``fused``: :func:`_fused_decode`.
+    """
+    if name == "xla":
+        return lambda X_b, mu, nu, W: _decode_tm(_xla_conv(kconv, _encode_T_A(X_b, mu[0], nu[0]), W), mu[0])
+
+    def outer_load(X_b, mu, nu, W):
+        L, R, cj = _outer_legs(X_b, mu[0], nu[0])
+        if name == "outer":
+            return _decode_tm(conv(L, R, W, conj_r=cj), mu[0])
+        return _fused_decode(fused, L, R, W, mu[0], pc_t, cj)
+    return outer_load
+
+
+def _pair_blocks(name, conv, fused, kconv, pc_t, sc):
+    """``(block_AB, block_A, block_B)``: the coupling pair's W term on one (μ, ν) block.
+
+    ``xs = (X_b, Xb_b)``: the whole trial and its conjugate; ``mu = (ψ^X_c, ψ^X_v)`` and
+    ``nu = (ψ^Y_v, ψ^Y_c)``: the block's slices (the B encode's leg swap reads ψ^X_v on μ and
+    ψ^Y_c on ν, :func:`_encode_T_B` / :func:`_outer_legs_B`).  ``block_AB`` is the fused
+    applier's ONE chain of ``T_A + s·T_B`` (legs concatenated along K on the outer load);
+    ``block_A`` and ``block_B`` are the unfused twin's two chains.  Each returns A
+    (nk, c_full, ns, ν_b) for :func:`_blocked_w_term`.
+    """
+    if name == "xla":
+        def chain(T, mu, W):
+            return _decode_tm(_xla_conv(kconv, T, W), mu[0])
+
+        def T_A(xs, mu, nu):
+            return _encode_T_A(xs[0], mu[0], nu[0])
+
+        def T_B(xs, mu, nu):
+            return _encode_T_B(xs[1], nu[1], mu[1])
+        return (lambda xs, mu, nu, W: chain(T_A(xs, mu, nu) + sc * T_B(xs, mu, nu), mu, W),
+                lambda xs, mu, nu, W: chain(T_A(xs, mu, nu), mu, W),
+                lambda xs, mu, nu, W: chain(T_B(xs, mu, nu), mu, W))
+
+    def decode(L, R, cj, mu, W):
+        if name == "outer":
+            return _decode_tm(conv(L, R, W, conj_r=cj), mu[0])
+        return _fused_decode(fused, L, R, W, mu[0], pc_t, cj)
+
+    def block_AB(xs, mu, nu, W):
+        L_A, R_A, cA = _outer_legs(xs[0], mu[0], nu[0])
+        L_B, R_B = _outer_legs_B(xs[1], nu[1], mu[1])
+        R_A = jnp.conj(R_A) if cA else R_A      # one convention for the concatenation
+        return decode(jnp.concatenate([L_A, sc * L_B], axis=-1),
+                      jnp.concatenate([R_A, R_B], axis=1), False, mu, W)
+
+    def block_A(xs, mu, nu, W):
+        L_A, R_A, cA = _outer_legs(xs[0], mu[0], nu[0])
+        return decode(L_A, R_A, cA, mu, W)
+
+    def block_B(xs, mu, nu, W):
+        return decode(*_outer_legs_B(xs[1], nu[1], mu[1]), False, mu, W)
+    return block_AB, block_A, block_B
+
+
+# ===========================================================================
+# The W term over (μ, ν) blocks
+# ===========================================================================
+#
+# T, U and W_R are (μ, ν)-local: T is an outer product per k in its two ζ legs, the
+# k-convolution acts on each (t, μ, s, ν) column with its own W_R[μ, ν, ·], and the decode
+# sums over μ and ν.  So the W term is an exact sum over (μ, ν) blocks of the rank's tile
+# (``_blocked_w_term``), and the block -- not the tile -- bounds what is stored per trial.
+# That is what lifts the two size limits of the unblocked program: the stored U (T in place)
+# of the routes that keep it is nk·ns²·μ_loc·ν_loc complex128 per trial (130 GB per rank at
+# CrI3 30x30, N_μ 3000, P4), and every operand of the outer-load handlers must stay below 2^31
+# elements (their 32-bit offsets; the unfused CrI3 8x8, 42v x 30c, N_μ 6000, P4 U is 2.30e9).
+
+#: Every operand of an outer-load handler call holds fewer elements than this: the loads
+#: index from per-tile 64-bit bases with 32-bit offsets (``kconv_outer_cuda_ffi.cc``,
+#: "an operand holds >= 2^31 elements").  XLA and mathdx mode 2 index with 64 bits.
+_HANDLER_ELEMENTS = 1 << 31
+
+
+def _block_width(b, n):
+    """``b`` floored to a multiple of 8 (at least 8), or the whole axis ``n`` when ``b >= n``."""
+    return n if b >= n else min(n, max(8, b // 8 * 8))
+
+
+def _balanced(b, n):
+    """``(width, count)``: ``count = ceil(n / b)`` blocks of the narrowest multiple of 8 that
+    still covers ``n``, so the clamped last block overlaps its neighbour least."""
+    count = -(-n // b)
+    if count == 1:
+        return n, 1
+    even = -(-n // count)                               # ceil(n / count)
+    return min(b, -(-even // 8) * 8), count
+
+
+def plan_w_blocks(route, *, nk, ns, mu_loc, nu_loc, n_c, rank):
+    """The (μ, ν) blocks of one rank's W term, ``((bm, nm), (bn, nn))``, from shapes alone.
+
+    Parameters
+    ----------
+    route : {'fused', 'outer', 'xla'}
+        The W term's route (:func:`_w_route`).
+    nk : int
+        Full-zone k points of the convolution's grid.
+    ns : int
+        Spinor components of ψ (1 or 2).
+    mu_loc, nu_loc : int
+        This rank's tile of ``W_R``, ``N_μ,pad / p_x`` by ``N_μ,pad / p_y``.
+    n_c : int
+        Bands of the decode's left leg ψ^X_c (the TD window on the TD-aGW model).
+    rank : int
+        The outer load's K: ``min(n_c, n_v)``, twice that for the fused coupling pair.
+
+    Returns
+    -------
+    ((bm, nm), (bn, nn)) : tuple
+        Block widths and counts on μ and ν; ``nm·nn = 1`` is the whole tile.
+
+    Every rank derives the same plan without a collective, and no result depends on the
+    device budget (TASTE 96, ``docs/architecture/decisions.md#fixed-tile``):
+
+    * The routes that store U (``outer``; ``xla``, whose T is U in place) take the largest
+      square-ish block whose U block and W_R block, ``16·nk·(ns² + 1)·bm·bn`` B, fit one fixed
+      tile (``runtime.tiles.TILE_BYTES``, 1 GiB); a width is a multiple of 8 (the kernels'
+      8 x 8 (μ, ν) tile) or the whole axis.  The ``fused`` route stores neither T nor U (its
+      handler bounds its own scratch at U/16, ns²/16 of the resident W_R tile), so its tile
+      stays whole.
+    * Every operand of a block's handler call -- the U block, the legs and their fragment
+      tiles, the W_R block, the decoded A -- holds fewer than 2^31 elements: the wider width
+      halves until it does.  An 8 x 8 block that still breaks the rule refuses
+      (``GATE bse_w_block_operand``).
+    """
+    if route not in ("fused", "outer", "xla"):
+        raise ValueError(f"plan_w_blocks: route must be 'fused', 'outer' or 'xla', got {route!r}")
+    nk, ns, mu_loc, nu_loc, n_c, rank = (int(v) for v in (nk, ns, mu_loc, nu_loc, n_c, rank))
+    h = -(-rank // 4)                                    # K in the load's m8n8k4 chunks
+
+    def largest_operand(bm, bn):                         # elements of the call's largest operand
+        if route == "xla":
+            return 0
+        if route == "outer":                             # U, L, R
+            return max(nk * ns * ns * bm * bn, nk * ns * bm * 4 * h, nk * 4 * h * ns * bn)
+        xb, yb, mb = -(-bm // 8), -(-bn // 8), -(-n_c // 8)   # V, Pc, L, R fragments, A
+        return max(bm * bn * nk, ns * xb * nk * mb * 64, ns * xb * nk * h * 32,
+                   ns * yb * nk * h * 32, nk * n_c * ns * bn)
+
+    if route == "fused":
+        bm, bn = mu_loc, nu_loc
+    else:
+        cells = tiles.tile_units(16 * nk * (ns * ns + 1), mu_loc * nu_loc,
+                                 floor=min(64, mu_loc * nu_loc))
+        bn = _block_width(math.isqrt(cells), nu_loc)
+        bm = _block_width(cells // bn, mu_loc)
+        bn = _block_width(cells // bm, nu_loc)           # a narrow μ tile hands its room to ν
+    while largest_operand(bm, bn) >= _HANDLER_ELEMENTS:
+        if bm <= 8 and bn <= 8:
+            raise ValueError(
+                f"GATE bse_w_block_operand: got an {bm} x {bn} (mu x nu) W-term block whose "
+                f"{route} handler call holds {largest_operand(bm, bn)} elements in one operand "
+                f"(nk = {nk}, ns = {ns}, n_c = {n_c}, K = {rank}); want < 2^31 = {_HANDLER_ELEMENTS} "
+                f"(the outer load's 32-bit offsets); why: no block of this k grid fits the handler; "
+                f"fix: a coarser k grid, fewer bands in the window, or the XLA route "
+                f"(docs/architecture/bse.md#the-matvec)")
+        if bm >= bn:
+            bm = _block_width((bm + 1) // 2, mu_loc)
+        else:
+            bn = _block_width((bn + 1) // 2, nu_loc)
+    return _balanced(bm, mu_loc), _balanced(bn, nu_loc)
+
+
+def _w_plan(name, rank, W_R, mu, nu):
+    """The trace's block plan (:func:`plan_w_blocks`), announced once and priced.
+
+    The price is the W term's per-rank live set: the resident ``W_R`` tile and ψ legs, and per
+    trial the route's block transients (the stored U, the laid-out ``W_R`` block, A and its
+    accumulator, the outer load's legs, the fused handler's scratch at most U/16).  It is
+    recorded (``record_stage_price``) and, over ``device_budget_bytes()``, warned
+    (``warn_over_budget``); it never sizes the blocks.
+    """
+    from ffi.gate import announce_once
+    mu_loc, nu_loc = int(W_R.shape[0]), int(W_R.shape[1])
+    nk = int(np.prod(W_R.shape[2:]))
+    n_c, ns = int(mu[0].shape[1]), int(mu[0].shape[2])
+    plan = plan_w_blocks(name, nk=nk, ns=ns, mu_loc=mu_loc, nu_loc=nu_loc, n_c=n_c, rank=rank)
+    (bm, nm), (bn, nn) = plan
+    whole = nm * nn == 1
+    cells = 16 * nk * bm * bn                                      # one complex128 (μ, ν, k) block
+    resident = 16 * nk * mu_loc * nu_loc + 16 * sum(int(np.prod(a.shape)) for a in mu + nu)
+    stored = 0 if name == "fused" else ns * ns * cells             # U (T in place on 'xla')
+    layout = 0 if (whole and name != "xla") else cells             # the laid-out W_R block
+    decoded = 16 * nk * n_c * ns * bn * (1 if whole else 2)        # A and its accumulator
+    legs = 0 if name == "xla" else 16 * nk * ns * 4 * -(-rank // 4) * (bm + bn)
+    scratch = ns * ns * cells // 16 if name == "fused" else 0
+    price = resident + stored + layout + decoded + legs + scratch
+    gb = lambda v: f"{v / 1e9:.3g} GB"
+    announce_once(("bse", "w_term_blocks", name, plan),
+                  "[bse] W term blocks: " + (f"whole tile {mu_loc} x {nu_loc} (mu_loc x nu_loc)"
+                                             if whole else
+                                             f"{nm} x {nn} blocks of {bm} x {bn} in the {mu_loc} x "
+                                             f"{nu_loc} (mu_loc x nu_loc) tile")
+                  + (f", U block {gb(stored)} (tile {gb(tiles.TILE_BYTES)})" if stored else "")
+                  + f"; W term {gb(price)}/rank")
+    record_stage_price("bse.w_term", price)
+    budget = device_budget_bytes()
+    if price > budget:
+        warn_over_budget("bse.w_term", price, budget)
+    return plan
+
+
+def _take_block(arrays, i, b, n):
+    """Block ``i`` (traced) of width ``b`` along the LAST axis, of length ``n``, of each array; and its start.
+
+    The block starts at ``min(i·b, n − b)``: the last block is clamped to end at ``n``, and the
+    rows it shares with block ``i − 1`` (those below ``i·b``) are zeroed, so every row of the
+    axis is live in exactly one block.
+    """
+    start = jnp.minimum(i * b, n - b)
+    keep = jnp.arange(b) >= i * b - start
+    return tuple(jnp.where(keep, lax.dynamic_slice_in_dim(a, start, b, axis=a.ndim - 1), 0)
+                 for a in arrays), start
+
+
+def _w_block(W_R, m0, n0, bm, bn):
+    """The (μ, ν) block of the rank's ``W_R`` tile at ``(m0, n0)``, ``(bm, bn, kx, ky, kz)``.
+
+    Sliced from the tile's 2-D ``(μ_loc, ν_loc·nk)`` view, so that no layout of the sliced array
+    turns the block's k-leading relayout (:func:`_w_r_klead`) into a bitcast.  Sliced 5-D, XLA's
+    GPU layout assignment meets the k-leading kernel operand by giving the loop-invariant tile a
+    k-major layout ahead of the scans -- one transposed copy of the WHOLE tile, 32.4 GB per rank at
+    CrI3 30x30, N_μ 3000, P4, the module the AOT gate refused at 98.5 GB (buffer assignment,
+    2026-10-16).  From the 2-D view the transpose stays a block-sized copy inside the step.
+    """
+    mu_loc, nu_loc = int(W_R.shape[0]), int(W_R.shape[1])
+    kshape = tuple(int(n) for n in W_R.shape[2:])
+    nk = math.prod(kshape)
+    flat = W_R.reshape(mu_loc, nu_loc * nk)
+    return lax.dynamic_slice(flat, (m0, n0 * nk), (bm, bn * nk)).reshape((bm, bn) + kshape)
+
+
+def _blocked_w_term(plan, W_R, w_layout):
+    """``wterm(mu, nu, block, sqrt_nk) -> (WX)_b``: this rank's (c_full, v_full, nk) W-term
+    partial of one trial, summed over the (μ, ν) blocks of ``plan``.
+
+    THE W TERM SPLITS EXACTLY OVER (μ, ν) BLOCKS.  For blocks I_i of μ and J_j of ν,
+
+        (WX)[c,v,k] = Σ_j (1/√Nk) Σ_{s, ν∈J_j} ψ^Y_v[k,v,s,ν] A_j[k,c,s,ν],
+        A_j[k,c,s,ν] = Σ_i Σ_{t, μ∈I_i} conj(ψ^X_c[k,c,t,μ]) U_ij[k,t,μ,s,ν],
+
+    U_ij being the k-convolution of T's (I_i, J_j) block with W_R's: only the order of the μ
+    and ν sums changes (round-off).  ``block(mu_i, nu_j, W_ij)`` returns A's (i, j) term;
+    ``mu`` and ``nu`` are tuples of arrays whose LAST axis is μ and ν (the ψ legs, the first of
+    each the decode's own); ``W_R`` is the rank's (μ_loc, ν_loc, kx, ky, kz) tile and
+    ``w_layout`` the route's view of a block of it (:func:`_w_layout`).
+
+    ``plan = ((bm, nm), (bn, nn))`` from :func:`plan_w_blocks`.  The whole tile (one block) is
+    the unblocked program itself: ``W_R`` laid out once per call, outside the trial scan, and
+    ``block`` on the whole legs.  Otherwise a ``lax.scan`` over ν blocks carries the
+    (c, v, nk) partial and a nested ``lax.scan`` over μ blocks carries A_j, both
+    ``unroll=1``: one compiled body whatever the block count (13 x 13 per trial at CrI3
+    30x30, N_μ 3000, P4, growing as N_μ²/P), each block's ``W_R`` slice
+    (:func:`_w_block`) laid out inside its step.  The last block of an axis is clamped and its
+    shared rows zeroed in every leg (:func:`_take_block`), so no operand is padded.
+    """
+    (bm, nm), (bn, nn) = plan
+    if nm * nn == 1:
+        W = w_layout(W_R)                          # once per call, outside the trial scan
+        return lambda mu, nu, block, sqrt_nk: _decode_v(block(mu, nu, W), nu[0], sqrt_nk)
+    mu_loc, nu_loc = int(W_R.shape[0]), int(W_R.shape[1])
+
+    def wterm(mu, nu, block, sqrt_nk):
+        nk, n_c, ns = (int(n) for n in mu[0].shape[:3])
+        n_v = int(nu[0].shape[1])
+
+        def nu_step(WX, j):
+            nu_j, n0 = _take_block(nu, j, bn, nu_loc)
+
+            def mu_step(A, i):
+                mu_i, m0 = _take_block(mu, i, bm, mu_loc)
+                W_ij = w_layout(_w_block(W_R, m0, n0, bm, bn))
+                return A + _rank_partial(block(mu_i, nu_j, W_ij)), None
+
+            A0 = mark_varying(jnp.zeros((nk, n_c, ns, bn), mu[0].dtype), ("x", "y"))
+            A, _ = lax.scan(mu_step, A0, jnp.arange(nm), unroll=1)
+            return WX + _decode_v(A, nu_j[0], sqrt_nk), None
+
+        WX0 = mark_varying(jnp.zeros((n_c, n_v, nk), mu[0].dtype), ("x", "y"))
+        WX, _ = lax.scan(nu_step, WX0, jnp.arange(nn), unroll=1)
+        return WX
+    return wterm
 
 
 def _rank_partial(A):
@@ -509,33 +820,23 @@ def make_w_term(mesh_xy: Mesh, nkx: int, nky: int, nkz: int):
         # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
-        wterm = _outer_w_term(outer_route, min(psi_c_X.shape[1], psi_v_Y.shape[1]), psi_c_X, psi_v_Y,
-                              W_R, sqrt_nk, mesh_xy, (nkx, nky, nkz))
-        if wterm is not None:
-            def _body_outer(carry, X_b):             # X_b: (c_full, v_full, nk)
-                L, R, cj = _outer_legs(X_b, psi_c_X, psi_v_Y)
-                return carry, wterm(L, R, conj_r=cj)   # T formed on the load, never stored
-
-            _, WX = lax.scan(_body_outer, None, _gather_trial_block(X), unroll=1)
-            return _scatter_trial_block(WX, mesh_xy)
-
-        W_Rk = _w_r_klead(W_R)                       # once per call, not per trial
+        # The route (outer load fused / stored U, or XLA T), then its (μ, ν) block plan:
+        # both decided at trace time from the shapes and announced once.
+        rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
+        name, conv, fused = _w_route(outer_route, rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1])
+        plan = _w_plan(name, rank, W_R, (psi_c_X,), (psi_v_Y,))
+        wterm = _blocked_w_term(plan, W_R, _w_layout(name))
+        whole = plan[0][1] * plan[1][1] == 1
+        block = _tda_block(name, conv, fused, kconv,
+                           fused[0](psi_c_X) if name == "fused" and whole else None)
 
         def _body(carry, X_b):                       # X_b: (c_full, v_full, nk)
-            # encode: T_b[k,t,μ,s,ν] = Σ_c ψ_c[k,c,t,μ] Σ_v conj(ψ_v[k,v,s,ν]) X_b
-            # NO COLLECTIVE IN THIS BODY (survey_C §C1): X_b arrives whole,
-            # and the decode returns this rank's (μ_loc, ν_loc) partial.
-            # Encode / conv+decode are the shared module-level stages
-            # (``_encode_T_A`` / ``_conv_decode``); the coupling block reuses
-            # the SAME ``_conv_decode``, which is what makes the non-TDA
-            # fusion exact.
-            T_b = _encode_T_A(X_b, psi_c_X, psi_v_Y)
-            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk)
+            # NO COLLECTIVE IN THIS BODY (survey_C §C1): X_b arrives whole, and
+            # every block's decode returns this rank's (μ_loc, ν_loc) partial.
+            return carry, wterm((psi_c_X,), (psi_v_Y,), partial(block, X_b), sqrt_nk)
 
-        # Once per block: gather the trial block, scan, reduce once.  The
-        # per-trial 'x' all-gather of R and psum_scatter of A are gone; the
-        # partial the scan stacks is (n_trials, c, v, nk), X-sized, never a
-        # T-class buffer.
+        # Once per block of trials: gather, scan, reduce once.  The partial the
+        # scan stacks is (n_trials, c, v, nk), X-sized, never a T-class buffer.
         _, WX = lax.scan(_body, None, _gather_trial_block(X), unroll=1)
         return _scatter_trial_block(WX, mesh_xy)
 
@@ -726,49 +1027,29 @@ def build_bse_stack_pair_matvec(
         X_full = _gather_trial_block(X)                     # (b, c, v, nk)
         Xb_full = jnp.conj(X_full)
 
-        # The outer-product load (BSEMAX): the fused body concatenates the two
-        # blocks' legs along K, so ONE convolution call forms T_A + s T_B in
-        # shared memory; the twin runs one call per block.
+        # THE FUSION.  T^A and T^B have identical shape AND identical sharding
+        # (the B encode swaps legs, not layouts), so their sum needs no collective
+        # and no reshard; conv and decode are linear, so one chain serves both
+        # blocks.  On the outer-product load (BSEMAX) the fused chain concatenates
+        # the two blocks' legs along K, so ONE convolution call forms T_A + s T_B in
+        # shared memory.  The twin runs two chains, summed at the end.
         rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
-        wterm = _outer_w_term(outer_route, 2 * rank if fuse else rank, psi_c_X, psi_v_Y, W_R, sqrt_nk,
-                              mesh_xy, (nkx, nky, nkz))
-        if wterm is not None:
-            def _body_outer_fused(carry, xs):
-                X_b, Xb_b = xs
-                L_A, R_A, cA = _outer_legs(X_b, psi_c_X, psi_v_Y)
-                L_B, R_B = _outer_legs_B(Xb_b, psi_c_Y, psi_v_X)
-                R_A = jnp.conj(R_A) if cA else R_A      # one convention for the concatenation
-                return carry, wterm(jnp.concatenate([L_A, sc * L_B], axis=-1),
-                                    jnp.concatenate([R_A, R_B], axis=1))
-
-            def _body_outer_unfused(carry, xs):
-                X_b, Xb_b = xs
-                L_A, R_A, cA = _outer_legs(X_b, psi_c_X, psi_v_Y)
-                return carry, wterm(L_A, R_A, conj_r=cA) + sc * wterm(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X))
-
-            _, WX = lax.scan(_body_outer_fused if fuse else _body_outer_unfused,
-                             None, (X_full, Xb_full), unroll=1)
-            return _scatter_trial_block(WX, mesh_xy)
-
-        W_Rk = _w_r_klead(W_R)                              # once per call
+        k_rank = 2 * rank if fuse else rank
+        name, conv, fused = _w_route(outer_route, k_rank, mesh_xy, (nkx, nky, nkz), psi_c_X.shape[1])
+        mu, nu = (psi_c_X, psi_v_X), (psi_v_Y, psi_c_Y)
+        plan = _w_plan(name, k_rank, W_R, mu, nu)
+        wterm = _blocked_w_term(plan, W_R, _w_layout(name))
+        whole = plan[0][1] * plan[1][1] == 1
+        block_AB, block_A, block_B = _pair_blocks(
+            name, conv, fused, kconv, fused[0](psi_c_X) if name == "fused" and whole else None, sc)
 
         def _body_fused(carry, xs):
-            X_b, Xb_b = xs
-            # THE FUSION.  T^A and T^B have identical shape AND identical
-            # sharding, so this add needs no collective and no reshard; conv
-            # and decode are linear, so one chain serves both blocks.
-            T_b = (_encode_T_A(X_b, psi_c_X, psi_v_Y)
-                   + sc * _encode_T_B(Xb_b, psi_c_Y, psi_v_X))
-            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk)
+            return carry, wterm(mu, nu, partial(block_AB, xs), sqrt_nk)
 
         def _body_unfused(carry, xs):
             # THE TWIN.  Two full chains.  Kept only to price the fusion.
-            X_b, Xb_b = xs
-            WA = _conv_decode(_encode_T_A(X_b, psi_c_X, psi_v_Y),
-                              psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk)
-            WB = _conv_decode(_encode_T_B(Xb_b, psi_c_Y, psi_v_X),
-                              psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk)
-            return carry, WA + sc * WB
+            return carry, (wterm(mu, nu, partial(block_A, xs), sqrt_nk)
+                           + sc * wterm(mu, nu, partial(block_B, xs), sqrt_nk))
 
         _, WX = lax.scan(_body_fused if fuse else _body_unfused,
                          None, (X_full, Xb_full), unroll=1)
