@@ -211,13 +211,15 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     lu = {"lorrax_slate_batched_solve_lu_factors", "lorrax_slate_batched_getrf",
           "lorrax_slate_batched_getrs"}
     eigh = {"lorrax_rocsolver_batched_eigh"}
+    lulocal = {"lorrax_rocsolver_lu_solve"}   # the one-device LU solve (cpp/rocsolver/)
     fplan = {"lorrax_fourier_plan_rocm"}          # LocalFourierPlan's ROCM leg (cpp/hipfft/)
     agemm = {"lorrax_active_gemm_device", "lorrax_active_gemm_device_out"}
-    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | fplan for t in own)
+    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | lulocal | fplan for t in own)
     assert fplan <= set(own)
     # The device-bounds active GEMM is built on both legs: shared (from the CUDA table), not own.
     assert agemm <= set(shared) and not agemm & set(own)
     assert eigh <= set(own)
+    assert lulocal <= set(own)
     assert lu <= set(own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)
     assert all(rocm[t] == s for t, s in own.items())
@@ -226,7 +228,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     # the local active-range GEMM (the CUDA leg's leg-neutral source, the same symbols).
     dl_rocm = dl._PLATFORMS["ROCM"]["targets"]
     assert dl_rocm and all(t.startswith(("lorrax_slate_", "lorrax_active_subspace_", "lorrax_cublas_local_"))
-                           or t in eigh | agemm for t in dl_rocm)
+                           or t in eigh | lulocal | agemm for t in dl_rocm)
     active = {t for t in dl_rocm if t.startswith("lorrax_active_subspace_")}
     assert active == {t for t in dl._CUDA_TARGET_SYMBOLS if t.startswith("lorrax_active_subspace_")
                       } - {"lorrax_active_subspace_distributed_ortho", "lorrax_active_subspace_eigh"}

@@ -1490,7 +1490,9 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 # transform, modes 2/3, and the k-minor pair, modes 4/5, run-time compiled);  slate (distributed
 # eigh / potrf / trsm and their batched forms over a gpu_backend=hip SLATE);
 # rocsolver (the batched local Hermitian eigh, one rocsolver_{z,d}{heevd,syevd}_strided_batched
-# call per stack, resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked);
+# call per stack, and the one-device LU solve on a 2^31-byte-span-blocked rocBLAS trsm/gemm path
+# (rocsolver/lu_solve_ffi.cc: rocBLAS trsm's in-place path is wrong past that span), both
+# resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked);
 # fourier_plan_rocm (LocalFourierPlan's ROCM leg, the port of the CUDA leg's fourier_plan_cuda_ffi.cc:
 # rocBLAS ZGEMM axes + hipFFT groups, both resolved from the wheel copies JAX mapped, and a
 # hipRTC remap kernel);
@@ -1548,6 +1550,7 @@ set(LORRAX_FFI_ROCM_SOURCES
     kdft/kbox_parent_ffi.cc
     kdft/plane_gather_ffi.cc
     rocsolver/batched_eigh_ffi.cc
+    rocsolver/lu_solve_ffi.cc
     hipfft/fourier_plan_rocm_ffi.cc
     active_subspace/active_devsize.cc
     # The local active-range GEMM: the CUDA leg's own leg-neutral source (cuBLAS there,

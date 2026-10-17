@@ -71,6 +71,8 @@ Backend choice is a deck key; the environment grants a CAPABILITY (which
 """
 from __future__ import annotations
 
+import math
+
 
 from lxkit import FFI_PLATFORM_MAP, announce_once, mesh_ffi_platform
 
@@ -197,16 +199,32 @@ _DISTRIBUTED_DEFAULT = {
 #:     (native 42.1 s, SLATE 2x2 76.4 s), peak 27.9 GB per rank, resid 9e-15;
 #:     SLATE eigh steady is 64-147x the native wall at n = 32-128 complex128
 #:     (0.22-0.29 s vs 0.0016-0.0045 s, ``distla_bound1``) and 2.7-33x at
-#:     n = 2048-8192 (SLATE_PERF_REPORT).  Beyond 16384 one
-#:     GCD is not measured, so the library takes over (the capacity route).
-#:   solve_lu 8192: the native complex128 LU (jaxlib getrf/getrs on rocSOLVER,
-#:     ROCm 7.14.1) returns a WRONG solution with no error at n = 12288 and
-#:     16384 (residual 8e-3; float64 16384 and complex128 <= 11616 are exact),
-#:     so the bound is the largest n the gate covered (512-8192, f64/c128).
-#:     One-device LU at 8192 c128 takes 1.06 s against SLATE's 3.63 s.
+#:     n = 2048-8192 (SLATE_PERF_REPORT).  Beyond 16384 the SLATE comparison is
+#:     not measured, so the library takes over (the capacity route).  16384 is a
+#:     MEASURED-COVERAGE bound, not a correctness one: jnp.linalg.eigh (rocSOLVER
+#:     zheevd) is exact at n = 20480 (60.5 s, peak 35.2 GB, resid 8.4e-15) and
+#:     24576 (120.2 s, 50.75 GB, 8.1e-15) complex128 (pool logs lurc_e_*).
+#:   solve_lu: the CAPACITY of one GCD, an explicit rule: the largest n whose
+#:     priced one-device program (``_one_device.one_device_bytes``: 5 n^2 x 16 B,
+#:     complex128) fits the GCD's XLA allocator, :data:`_ROCM_GCD_BYTES_LIMIT`
+#:     -> isqrt(60183563895 // 80) = 27427.  There is no speed crossover below
+#:     it: one-device (distrib_la.local_lu) vs SLATE 2x2 complex128, n = 8192
+#:     0.72 vs 3.63 s, 12288 1.53 vs 10.4 s, 16384 4.10 vs 16.1 s; one-device
+#:     20480 6.18 s, 24576 13.3 s, 26624 14.2 s, 28672 22.7 s (peak 52.9 GB,
+#:     resid <= 1.1e-14), 30720 out of memory (pool logs lurc_f_*, lurc_k_*,
+#:     distla_lubigs).  The former 8192 was a correctness cap: rocBLAS trsm's
+#:     in-place path is wrong past a 2^31-byte span (ROCSOLVER_LU_REPORT.md);
+#:     local_lu solves such systems on a span-blocked path, so the native LU is
+#:     exact at every n here.
+#: One MI250X GCD's XLA allocator limit (``memory_stats()['bytes_limit']``, ROCm 7.14.1
+#: wheels, jax 0.9.1, measured on frontier07938).  The ROCM solve_lu capacity row's input.
+_ROCM_GCD_BYTES_LIMIT = 60_183_563_895
+#: ``_one_device.ONE_DEVICE_LU_TILES`` x complex128 itemsize (that module imports this one;
+#: tests/test_distrib_la_one_device.py pins the two equal).
+_ROCM_LU_BYTES_PER_N2 = 5 * 16
 ONE_DEVICE_MAX_N = {
     ("eigh", "ROCM"):     16384,
-    ("solve_lu", "ROCM"): 8192,
+    ("solve_lu", "ROCM"): math.isqrt(_ROCM_GCD_BYTES_LIMIT // _ROCM_LU_BYTES_PER_N2),
 }
 
 #: ``distributed`` by ROOM -- the (op, leg) pairs whose ``one_device`` bound is not a number
@@ -218,7 +236,8 @@ ONE_DEVICE_MAX_N = {
 #: (P=4 2x2, complex128, ``dla_sweep``): eigh n=312 x64 0.022 s vs 1.97 s, n=8192 x4 2.05 vs
 #: 6.53 s, n=16384 x4 13.7 vs 29.0 s; solve_lu n=312 x64 0.0075 vs 0.307 s, n=8192 x4 0.44 vs
 #: 1.72 s, n=16384 x4 2.88 s (cuSOLVERMp ran out of device memory); residuals <= 1.7e-14 on
-#: both, cuSOLVER's LU exact through 16384 (the rocSOLVER defect above does not occur).
+#: both, cuSOLVER's LU exact through 16384 (the rocBLAS trsm defect of distrib_la.local_lu
+#: does not occur there).
 ONE_DEVICE_BY_ROOM = frozenset({("eigh", "CUDA"), ("solve_lu", "CUDA")})
 
 #: ``auto`` cholesky / solve_lu: the leg's FFI candidate on a true-2-D mesh
