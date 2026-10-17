@@ -7,7 +7,8 @@ P3 the real ip_magnus_step on the 2-level toy grows as the recurrence with the
    named weights and with relaxed corrections (below and above the limit)
 P4 order 4 on the driven 6-level stand-in of the TD-aGW equation (DOP853
    reference): stab1 with n_corr = 1, stab2 with n_corr = 2, relaxed cubic
-   n_corr 2 (theta 0.8 on the last sweep), next to cubic n_corr 2
+   n_corr 2 (theta 0.8 on the last sweep), rob2 with its relaxation 1.033, next to
+   cubic n_corr 2
 R1 the deck refuses relaxations it cannot use (GATE td_corr_relax) and unknown
    predictors (GATE td_predictor); accepts the named ones
 """
@@ -25,7 +26,14 @@ from test_prop_implicit_cpu import _toy, _conj_dev, N, _deck_raw   # noqa: E402
 #: name -> (polynomial degree reproduced, {n_corr: documented limit})
 _NAMED = {"stab1": (3, {1: 0.645, 2: 0.654, 3: 0.299}),
           "stab2": (2, {1: 0.124, 2: 1.296, 3: 1.284}),
+          "rob2": (2, {1: 0.101, 2: 0.714, 3: 1.159}),
           "cubic": (3, {1: 0.117, 2: 0.730, 3: 1.144})}
+
+
+def test_rob2_limit_with_its_relaxation():
+    offs, w = ti.predictor_weights("rob2")
+    got = ti.magnus_stability_limit(ti.CFM4_NODES, offs, 2, weights=w, relax=(1.033,))
+    assert abs(got - 0.779) <= 1.5e-3, got
 
 
 @pytest.mark.parametrize("name", sorted(_NAMED))
@@ -124,7 +132,8 @@ def toy_ref():
     return p, t_end, ref.y[:, -1].reshape(N, N)
 
 
-_ORDER = [("cubic", 2, None), ("stab1", 1, None), ("stab2", 2, None), ("cubic", 2, (0.8,))]
+_ORDER = [("cubic", 2, None), ("stab1", 1, None), ("stab2", 2, None), ("cubic", 2, (0.8,)),
+          ("rob2", 2, (1.033,))]
 
 
 @pytest.mark.parametrize("name,n_corr,relax", _ORDER, ids=[f"{a}-{b}-{c}" for a, b, c in _ORDER])

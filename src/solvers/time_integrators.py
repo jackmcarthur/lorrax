@@ -530,6 +530,15 @@ def cfm4_history(k: int) -> tuple:
 #: "stab2": the last 3 steps' 6 node values, quadratic-exact, for n_corr = 2:
 #:     0.124 / 1.296 / 1.284; principal-root error on the axis 0.6 / 0.3 / 0.15 of
 #:     the cubic predictor's (n_corr 2) at h*|lambda| = 0.1 / 0.2 / 0.3.
+#: The scalar interval misses the interaction-picture rotation of a kernel's
+#: resonant-antiresonant block, which long histories extrapolate badly: on the
+#: 30x30 CrI3 models stab1 and stab2 are refused by the step probe below the
+#: cubic's step.  "rob2" (the last 3 steps' six values, quadratic-exact, for
+#: n_corr = 2 with corr_relax = [1.033]: 0.101 / 0.714 / 1.159 plain, 0.779
+#: with that relaxation) maximizes instead the interval of the exact step map of
+#: a two-level system with that rotation (gap 2, antiresonant coupling 0.45 of the
+#: resonant one, and neighbours; a model fitted to those probes): 0.70 there
+#: against the cubic's 0.58.
 CFM4_PREDICTORS = {
     "cubic": (CFM4_HISTORY, None),
     "linear": (CFM4_HISTORY[2:], None),
@@ -539,6 +548,9 @@ CFM4_PREDICTORS = {
     "stab2": (cfm4_history(3), (
           (0.04331356530980033, -0.14217509313969748, -0.24803277657651113, 2.354542030224016, -3.8334462720031075, 2.8257985461854997),
           (-0.9140148635051756, 3.972748068807781, -4.2091949003631814, 3.843702781727498, -6.571552761221761, 4.878311674554839))),
+    "rob2": (cfm4_history(3), (
+          (-0.08188252922792424, -0.1515948085772391, -0.1864802021903494, 3.7151493499062496, -5.766733100106381, 3.471541290195644),
+          (1.923462893255338, -3.5009154749990676, 0.5291755933999269, 1.8666348320103832, -2.8698986401163333, 3.051540796449753))),
 }
 
 
