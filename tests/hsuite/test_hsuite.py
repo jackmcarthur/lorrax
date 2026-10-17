@@ -21,9 +21,12 @@ import time
 
 from tests.hsuite import chain
 from tests.hsuite import rank_session
+from tests.hsuite import watchdog
 
 
-def test_driver_chain_matches_references():
+def test_driver_chain_matches_references(pytestconfig):
+    # The first-collective watchdog writes past pytest's capture (chain.TERMINAL_WRITE).
+    chain.TERMINAL_WRITE = watchdog.terminal_writer(pytestconfig)
     stamp = rank_session.exchange(time.strftime("%Y%m%d-%H%M%S"))[0]
     job = os.environ.get("SLURM_JOB_ID", "local")
     worker = os.environ.get("PYTEST_XDIST_WORKER", "p")

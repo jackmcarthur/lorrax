@@ -46,6 +46,7 @@ sys.path.insert(0, str(REPO / "src"))
 import runtime  # noqa: F401,E402
 import numpy as np  # noqa: E402
 from tests.hsuite import rank_session  # noqa: E402
+from tests.hsuite import watchdog  # noqa: E402
 
 FIXTURE = HERE / "fixture"
 # The metal + semicore fixture, staged in its own subdirectory of the run.
@@ -117,6 +118,23 @@ INJECT = os.environ.get("HSUITE_INJECT_REFUSAL", "")
 # end with os._exit after pytest's report (conftest.pytest_unconfigure), since
 # a normal exit waits on peers blocked in a collective.
 LONE_FAILURE = False
+# The first stage's start-up (jax.distributed.initialize + the device warm-up)
+# runs under watchdog.FirstCollectiveWatchdog: a rank that does not finish it
+# within watchdog.timeout_s() names itself, its node and GPU, and ends with
+# status 1 instead of hanging.  TERMINAL_WRITE: set by the pytest cell
+# (watchdog.terminal_writer) so the line reaches the terminal past pytest's
+# capture; None for the CLI, whose stderr is the terminal.
+TERMINAL_WRITE = None
+_FIRST_STARTUP_DONE = False
+
+
+def _coordinator():
+    """The jax.distributed coordinator this step uses (runtime's own resolution)."""
+    return runtime._resolve_coordinator_address() or "from jax cluster detection"
+
+
+def _runtime_started():
+    return getattr(runtime, "_STACK", None) is not None
 
 # nval = 3: every occupied band of the H2⁻ fixture, which htransform requires
 # (it refuses a window that omits one) and every restarted stage must share.
@@ -599,7 +617,7 @@ def run_stage(run, name, module, argv, env, timeout):
     most: if the others are left in a collective, it returns its own record
     alone and sets LONE_FAILURE.
     """
-    global LONE_FAILURE
+    global LONE_FAILURE, _FIRST_STARTUP_DONE
     import importlib
     import inspect
     import traceback
@@ -621,10 +639,22 @@ def run_stage(run, name, module, argv, env, timeout):
     cwd, saved_argv = os.getcwd(), sys.argv
     rc = 0
     start = None
+    guard = None
     try:
         os.chdir(run)
         sys.argv = [module, *argv]
+        if not _FIRST_STARTUP_DONE:
+            guard = watchdog.FirstCollectiveWatchdog(
+                stage=name, rank=rank, count=rank_session._resolve_proc_count(),
+                coordinator=_coordinator(), timeout=watchdog.timeout_s(),
+                fds=(2, saved[1]), writers=(TERMINAL_WRITE,)).start()
         main = importlib.import_module(module).main
+        # The driver module's import brings the runtime up.  A driver that
+        # starts it in main() stays guarded until main returns, and every exit
+        # from this block disarms the guard (the finally below).
+        if guard is not None and _runtime_started():
+            guard.done()
+            _FIRST_STARTUP_DONE = True
         start = _census_start()
         try:
             _injected(name, rank, "before")
@@ -639,6 +669,9 @@ def run_stage(run, name, module, argv, env, timeout):
         from common.jax_compile_cache import compile_receipt
         compile_receipt(f"hsuite {name}")
     finally:
+        if guard is not None and not _FIRST_STARTUP_DONE:
+            guard.done()
+            _FIRST_STARTUP_DONE = True
         stream.flush()
         sys.stdout, sys.stderr = saved_py
         os.dup2(saved[0], 1)
@@ -875,6 +908,12 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         if cache_dir is not None:
             cache_dir.mkdir(parents=True, exist_ok=True)
     rank_session.exchange("staged")
+    # Host-side, before any device work: where every rank runs, and the
+    # coordinator, so a later hang or node fault can be placed from the log.
+    placements = rank_session.exchange(watchdog.placement())
+    if lead:
+        print(watchdog.rank_map_line(rank_session._resolve_proc_count(), _coordinator(),
+                                     placements), flush=True)
     env = _env(cache_dir)
     walls, problems, ranks, census = {}, [], {}, {}
     t_all = time.monotonic()
