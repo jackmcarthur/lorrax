@@ -1795,8 +1795,11 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
                 # the logical Dyson system; the W pad block is exactly
                 # zero (A_pad = I, RHS_pad = 0).
                 A = jnp.eye(n_log, dtype=V_log.dtype) - V_log @ chi_log
-                lu, piv = jsp_linalg.lu_factor(A)
-                return jsp_linalg.lu_solve((lu, piv), V_log)
+                # distrib_la.local_lu: the original factor + solve below 2^31 bytes; above it the
+                # span-blocked ROCM route (rocBLAS trsm's in-place path is wrong past it).
+                from distrib_la import solve_local
+                return solve_local(A, V_log, native=lambda a, v: jsp_linalg.lu_solve(
+                    jsp_linalg.lu_factor(a), v))
 
             def solve_one(iq, W_acc):
                 W_row = solve_at_logical(
