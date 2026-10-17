@@ -73,6 +73,13 @@ class TdOperators(NamedTuple):
     proj : (n_states, nk, nc, nv) complex or None, BSE eigenvectors A^S_kcv
         (valence lowest first) for the ``exciton_projection`` measurement;
         k-sharded like ρ, zero on pads.
+    stiff : (u, b) or None, the stiff split of cfm4
+        (``tdagw.propagate.stiff_basis``): u (n_s, nk, nb, nb) complex, an
+        orthonormal basis of Hermitian deviations spanning the invariant
+        subspace of the largest eigenvalues of the coupling map, and b =
+        dSigma[rho_eq + u] - dSigma[rho_eq] (Ha), both k-sharded like ρ, zero
+        on pads.  Not an operator of Eq. (1): which part of dSigma the
+        integrator treats implicitly.
     """
     e_qp: jax.Array
     rho_eq: jax.Array
@@ -83,6 +90,7 @@ class TdOperators(NamedTuple):
     v0_intra: Optional[jax.Array]
     intra: Optional[IntraBand]
     proj: Optional[jax.Array] = None
+    stiff: Optional[tuple] = None
 
 
 def dissipation_rates(depopulation_ha: float, dephasing_ha: float, nb: int):

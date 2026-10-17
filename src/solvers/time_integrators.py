@@ -23,7 +23,9 @@ The families, with the equation each step integrates:
   B(t, y) the expensive state-dependent part, and a stationary y_eq of A0.
   The state is the deviation x = y - y_eq and every exponential acts on the
   interaction-picture generator G_I(s) = e^{isA0} (A + B) e^{-isA0} only, so
-  each term of an update has the size of x, not of y.
+  each term of an update has the size of x, not of y.  Optionally B splits
+  exactly into a slow part (predictor-corrector) and its part on a small
+  stiff subspace, solved implicitly at the nodes (:class:`FastPart`).
 * **Composed Strang splitting** (:func:`compose_strang`):
   R(f1 h/2) M(f1 h) R((f1 + f2) h/2) … M(fn h) R(fn h/2) for a remainder
   flow R that the unitary step does not contain; ``(1,)`` is Strang (order
@@ -53,6 +55,7 @@ __all__ = [
     "CFM4_NODES", "CFM4_WEIGHTS", "CFM4_HISTORY", "MIDPOINT_NODES", "MIDPOINT_HISTORY",
     "CF4_QUADRATURE", "TRIPLE_JUMP",
     "ip_cf4_flow", "ip_midpoint_flow", "ip_magnus_step", "frozen_generator",
+    "FastPart", "fast_jacobian",
     "magnus_midpoint_step",
     "magnus_amplification", "magnus_stability_limit", "magnus_growth",
     "compose_strang", "fixed_advance",
@@ -591,8 +594,75 @@ def magnus_midpoint_step(explicit: Callable, state_part: Callable,
     return conjugate(a_mid + b, y, h), b
 
 
+class FastPart(NamedTuple):
+    """The part of B on a small subspace that :func:`ip_magnus_step` treats implicitly.
+
+    For B affine in the deviation and an orthonormal basis u_1..u_n of a
+    subspace (orthogonal projector Π = Σ_j |u_j><u_j|), the split
+
+        B[x] = B[(1 - Π) x] + B_fast(x),   B_fast(x) = Σ_j <u_j, x> b_j,
+        b_j = B[u_j] - B[0],
+
+    is exact for every x (no truncation): ``project`` and ``combine`` are its
+    two halves, the state-side coefficients a_j = <u_j, x> (Frobenius) and
+    the B-side expansion.
+
+    project : x -> (*batch, n) REAL coefficients a_j = Re <u_j, x> over the
+        state's own axes (any leading batch: one state gives (n,), the
+        propagator's trial axis (ntr, n)); with u and x Hermitian the inner
+        product is real, and real coefficients keep the split exact for a
+        dSigma that is only real-linear (the exponentials Hermitize the
+        generator, so an imaginary part would be a direction the node map
+        ignores and the Newton matrix would chase).
+    combine : a (*batch, n) -> (*batch, ...) state-shaped, Σ_j a[..., j] b_j.
+    reference : m -> -i[m, y_eq], the generator's first-order action on the
+        stationary state (the linearization of the flow at y_eq; it builds
+        the Newton matrix only, never the step).
+    newton : (len(nodes) n, len(nodes) n) real (float64), (1 - J)^{-1} of the
+        linearized node map J of the real coefficients (:func:`fast_jacobian`).
+    tol : relative tolerance of the coefficient fixed point.
+    max_iter : node-map evaluations of the closing solve (>= 1).
+    """
+    project: Callable
+    combine: Callable
+    reference: Callable
+    newton: jax.Array
+    tol: float
+    max_iter: int
+
+
+def fast_jacobian(fast: FastPart, free: Callable, h, nodes, n: int):
+    """J of the coefficient node map a -> (<u_l, x(t + c_i h)>)_il, linearized at y_eq.
+
+    A change da_k of the fast coefficients at node k changes the
+    interaction-picture node value by free(B_fast(da_k), -c_k h); to first
+    order in it the flow over [t, t + c_i h] (Lagrange-frozen generator; the
+    two-point Gauss moments of :func:`ip_cf4_flow` integrate it exactly)
+    moves x(t + c_i h) by h Σ_k A_ik free(-i[B_fast(da_k), y_eq], (c_i - c_k) h),
+    A the node quadrature of the Lagrange basis.  Hence
+
+        J[(i, l), (k, j)] = h A_ik <u_l, free(L u_j, (c_i - c_k) h)>,
+        L u_j = -i[b_j, y_eq],
+
+    exact for the coupling linear in the deviation; the terms it drops are of
+    the size of the deviation and of h |A(t)| (field) relative to it, and only
+    slow the Newton iteration, never change its fixed point.  Returns the
+    (len(nodes) n)-square matrix, row (i, l), column (k, j).
+    """
+    a, _ = _node_quadrature(nodes)
+    lu = fast.reference(fast.combine(jnp.eye(n, dtype=jnp.float64)))      # (n, ...) = L u_j
+    rows = []
+    for i, ci in enumerate(nodes):
+        row = []
+        for k, ck in enumerate(nodes):
+            q = fast.project(free(lu, (float(ci) - float(ck)) * h))      # [j, l] = <u_l, .>
+            row.append((h * float(a[i, k])) * jnp.transpose(q))
+        rows.append(jnp.concatenate(row, axis=1))
+    return jnp.concatenate(rows, axis=0)
+
+
 def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
-                   free: Callable, t, x, h, guess, *, nodes, n_corr):
+                   free: Callable, t, x, h, guess, *, nodes, n_corr, fast: FastPart = None):
     """One predictor–corrector Magnus step on the deviation x = y - y_eq.
 
     B is frozen as the polynomial through its values at the ``nodes``
@@ -615,17 +685,99 @@ def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
     overestimate it, so a run measures its own step
     (``tdagw.propagate.step_growth``).
 
-    Returns (x(t + h), node values in the frame of t).
+    With ``fast`` (a :class:`FastPart`) the node values split exactly into
+    S + F: the slow part S_i = free(B(x_i) - B_fast(x_i), -c_i h) comes from
+    the expensive call at the node state x_i minus its fast part (predicted,
+    then the ``n_corr`` corrections, as without the split), the fast part
+    F_i = free(B_fast(x_i), -c_i h) = free(Σ_j a_ij b_j, -c_i h) is solved
+    implicitly in the coefficients a_ij = <u_j, x_i> of the CURRENT node
+    states.  Every node-map evaluation (propagation to the nodes with the
+    frozen generator, no B call) feeds a simplified-Newton update
+    a <- a + (1 - J)^{-1} (<u, x(a)> - a + dS) with dS the linear response of
+    the coefficients to the slow update of that correction
+    (:func:`fast_jacobian`); after the corrections a closing loop evaluates
+    the node map at the final S until ||<u, x(a)> - a|| <= tol ||a|| (at
+    most ``fast.max_iter`` evaluations) and steps with S + F(a).  The
+    stiff modes of B in span(u) are then integrated by the converged
+    two-node Gauss collocation (A-stable on the imaginary axis), and the
+    predictor-corrector limit binds only the slow map.  Nothing is
+    linearized in the step: the Newton matrix only moves the iterate.
+    ``guess`` is then (slow node values, a (*batch, len(nodes), n)).
+
+    Returns (x(t + h), node values in the frame of t); with ``fast``
+    (x(t + h), node values S + F, (S, a), (closing evaluations int32,
+    relative residual of the last one, converged bool)).
     """
     nodes = tuple(float(c) for c in nodes)
+    if fast is None:
+        def corr(_, g):
+            gen = frozen_generator(field, free, t, h, nodes, g)
+            return tuple(free(state_part(t + c * h, inner(gen, t, x, c * h)), -c * h)
+                         for c in nodes)
 
-    def corr(_, g):
-        gen = frozen_generator(field, free, t, h, nodes, g)
-        return tuple(free(state_part(t + c * h, inner(gen, t, x, c * h)), -c * h)
-                     for c in nodes)
+        g = jax.lax.fori_loop(0, n_corr, corr, tuple(guess))
+        return inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g
 
-    g = jax.lax.fori_loop(0, n_corr, corr, tuple(guess))
-    return inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g
+    quad, _ = _node_quadrature(nodes)
+    m = len(nodes)
+
+    def fast_values(a):                     # F_i, interaction picture of t
+        return tuple(free(fast.combine(a[..., i, :]), -c * h) for i, c in enumerate(nodes))
+
+    def node_states(s, a):                  # x(t + c_i h) under the frozen S + F(a)
+        f = fast_values(a)
+        gen = frozen_generator(field, free, t, h, nodes, tuple(si + fi for si, fi in zip(s, f)))
+        return tuple(inner(gen, t, x, c * h) for c in nodes)
+
+    def coefficients(xs):                   # (*batch, m, n)
+        return jnp.stack([fast.project(xi) for xi in xs], axis=-2)
+
+    def newton(a, r):
+        return a + jnp.reshape(jnp.reshape(r, r.shape[:-2] + (-1,)) @ jnp.transpose(fast.newton),
+                               a.shape)
+
+    def response(ds):                       # d<u_l, x_i> = h sum_k A_ik <u_l, free(-i[dS_k, y_eq], c_i h)>
+        refs = [fast.reference(d) for d in ds]
+        out = []
+        for i, ci in enumerate(nodes):
+            acc = None
+            for k in range(m):
+                term = float(quad[i, k]) * free(refs[k], ci * h)
+                acc = term if acc is None else acc + term
+            out.append(h * fast.project(acc))
+        return jnp.stack(out, axis=-2)
+
+    def corr(_, c):
+        s, a = c
+        xs = node_states(s, a)
+        p = coefficients(xs)
+        s_new = tuple(free(state_part(t + ci * h, xi) - fast.combine(p[..., i, :]), -ci * h)
+                      for i, (ci, xi) in enumerate(zip(nodes, xs)))
+        a = newton(a, (p - a) + response(tuple(sn - so for sn, so in zip(s_new, s))))
+        return s_new, a
+
+    s_guess, a_guess = guess
+    s, a = jax.lax.fori_loop(0, n_corr, corr, (tuple(s_guess), a_guess))
+    nrm = lambda v: jnp.sqrt(jnp.sum(jnp.abs(v) ** 2))
+
+    def close_cond(c):
+        _, it, _, ok = c
+        return (~ok) & (it < int(fast.max_iter))
+
+    def close_body(c):
+        a, it, _, _ = c
+        r = coefficients(node_states(s, a)) - a
+        na, nr = nrm(a), nrm(r)
+        finite = jnp.isfinite(na) & jnp.isfinite(nr)
+        rel = jnp.where(na > 0.0, nr / jnp.where(na > 0.0, na, 1.0), jnp.where(nr > 0.0, jnp.inf, 0.0))
+        rel = jnp.where(finite, rel, jnp.nan)        # a non-finite node map never converges
+        return newton(a, r), it + 1, rel, finite & (rel <= float(fast.tol))
+
+    init = (a, jnp.int32(0), jnp.asarray(jnp.inf, jnp.float64), jnp.asarray(False))
+    a, it, rel, ok = jax.lax.while_loop(close_cond, close_body, init)
+    g = tuple(si + fi for si, fi in zip(s, fast_values(a)))
+    return (inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g, (s, a),
+            (it, rel, ok))
 
 
 def _node_quadrature(nodes):
