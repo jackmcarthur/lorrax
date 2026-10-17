@@ -32,10 +32,13 @@ def open_h5_settled(path, mode="r", **kwargs):
     and NOT monotonically: one open succeeds and the next, milliseconds later,
     is refused (a ``stat`` threshold cannot fence it; ``fsync`` does not
     either). The data is complete: the same file reports its full size again
-    at once. So this refusal, and only this one, is retried with bounded
+    at once. So this refusal, and only this one, is retried (each refusal
+    logged) with bounded
     backoff; a file that stays short for ``SETTLE_TIMEOUT_S`` is truly
     truncated and the original error is raised. Every other error is raised
-    at once. Close-time metadata opens only; no hot path.
+    at once. Close-time metadata opens only; no hot path. Prefer one reader
+    (``common.collectives.rank0_read``): this is for the opens that remain,
+    rank 0's reopen of what other clients wrote and per-rank data reads.
     """
     import sys
     import time
@@ -52,6 +55,8 @@ def open_h5_settled(path, mode="r", **kwargs):
             if time.monotonic() - t0 > SETTLE_TIMEOUT_S:
                 raise
             tries += 1
+            print(f"  [open_h5_settled] {path}: refused open {tries} ({exc}); "
+                  f"retrying in {nap:.3f} s", file=sys.stderr, flush=True)
             time.sleep(nap)
             nap = min(2 * nap, 0.2)
             continue

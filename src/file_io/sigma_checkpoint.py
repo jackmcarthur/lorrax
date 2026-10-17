@@ -152,9 +152,13 @@ def _cubes_digest(path, names, *, stage):
     import h5py
     from common.collectives import agree_io_error, process_count, process_rank, xor_to_all
 
+    from .commit_state import open_h5_settled
+
     rank, size, local, error = process_rank(), process_count(), 0, None
     try:
-        with h5py.File(path, "r") as f:
+        # Each rank reads its own slices of the just-closed file: a data read
+        # every rank needs, so this reopen stays per rank (settled).
+        with open_h5_settled(path, "r") as f:
             t = 0
             for name in sorted(names):
                 ds = f[name]
@@ -184,8 +188,8 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
     and it binds the bytes that landed on disk. Staging files a dead process left beside ``path`` are
     removed. Returns (bytes, seconds).
     """
-    import h5py
     from common.collectives import collective_atomic_file_transaction, process_rank
+    from .commit_state import open_h5_settled
     from .slab_io import SlabIO
 
     started = time.monotonic()
@@ -208,7 +212,7 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
             blob = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
             _plain_loads(blob)
             sizes[0] = len(blob)
-        with h5py.File(staging, "a") as f:
+        with open_h5_settled(staging, "a") as f:
             record = dict(
                 schema=schema, identity=identity,
                 cubes={name: dict(shape=list(cube.shape), dtype=str(cube.dtype),
@@ -222,7 +226,7 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
             f.attrs["commit"] = hashlib.sha256(text.encode()).hexdigest()
 
     def validate(staging):
-        with h5py.File(staging, "r") as f:
+        with open_h5_settled(staging, "r") as f:
             text = f["record"][()]
             if hashlib.sha256(bytes(text)).hexdigest() != str(f.attrs["commit"]):
                 raise ValueError("checkpoint record does not match its commit")
@@ -254,8 +258,9 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
     fields that differ. ``cubes=False`` defers the cubes
     to :func:`read_checkpoint_cubes`.
     """
-    import h5py
-    from common.collectives import agree_io_error, rank0_transaction
+    import base64
+    from common.collectives import agree_io_error, rank0_read, rank0_transaction
+    from .commit_state import open_h5_settled
 
     path = Path(path)
 
@@ -263,7 +268,8 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
         if not path.exists():
             return ["absent", None]
         try:
-            with h5py.File(path, "r") as f:
+            # A short size view must not read as "partial": that would unlink it.
+            with open_h5_settled(path, "r") as f:
                 text = bytes(f["record"][()])
                 commit = str(f.attrs["commit"])
                 record = json.loads(text)
@@ -292,17 +298,26 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
     if verdict != "match":
         return None, verdict
     record, state, error = None, None, None
-    try:
-        with h5py.File(path, "r") as f:
+
+    def read_record():
+        blob = None
+        with open_h5_settled(path, "r") as f:
             text = bytes(f["record"][()])
             if hashlib.sha256(text).hexdigest() != commit:
                 raise ValueError("checkpoint changed between rank 0's check and this read")
-            record = json.loads(text)
-            if record.get("state_sha256") is not None:
+            if json.loads(text).get("state_sha256") is not None:
                 blob = f["state"][()].tobytes()
-                if hashlib.sha256(blob).hexdigest() != record["state_sha256"]:
-                    raise ValueError("checkpoint state digest differs from its record")
-                state = _plain_loads(blob)
+        return dict(text=text.decode("utf-8"),
+                    state=None if blob is None else base64.b64encode(blob).decode("ascii"))
+    try:
+        # One reader (rank 0); every rank checks the bytes it was given.
+        got = rank0_read(path, stage="checkpoint.record/read", read=read_record)
+        record = json.loads(got["text"])
+        if record.get("state_sha256") is not None:
+            blob = base64.b64decode(got["state"])
+            if hashlib.sha256(blob).hexdigest() != record["state_sha256"]:
+                raise ValueError("checkpoint state digest differs from its record")
+            state = _plain_loads(blob)
     except (OSError, KeyError, ValueError) as exc:
         error = exc
     agree_io_error(error, path=path, stage="checkpoint.record")
@@ -330,15 +345,18 @@ def read_checkpoint_cubes(path, *, commit, mesh):
     ``shape=None`` lets SlabIO round the stored extent up to this mesh, so a
     reader on another mesh gets its own padded carrier (zero past the data).
     """
-    import h5py
     from jax.sharding import PartitionSpec as P
-    from common.collectives import agree_io_error
+    from common.collectives import agree_io_error, rank0_read
+    from .commit_state import open_h5_settled
     from .slab_io import SlabIO
+
+    def read_text():
+        with open_h5_settled(path, "r") as f:
+            return bytes(f["record"][()]).decode("utf-8")
 
     error = None
     try:
-        with h5py.File(path, "r") as f:
-            text = bytes(f["record"][()])
+        text = rank0_read(path, stage="checkpoint.cubes/read", read=read_text).encode("utf-8")
         if hashlib.sha256(text).hexdigest() != commit:
             raise ValueError("checkpoint changed after it was authenticated")
         record = json.loads(text)

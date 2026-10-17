@@ -25,7 +25,7 @@ from runtime.padding import combined_divisor, padded_axis, spec_divisor
 from common import timing
 from common.collectives import (agree_io_error, device_put_process_local, device_put_process_local_cached,
                                 process_rank, psum_replicate,
-                                rank0_transaction)
+                                rank0_read, rank0_transaction)
 from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import (agree_io_refusal, assert_committed, open_h5_settled,
                                   set_commit_state)
@@ -227,6 +227,13 @@ def _read_header(path):
         return json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
 
 
+
+def _read_header_once(path, *, stage):
+    """``_read_header`` for every rank, read by rank 0 alone (``rank0_read``)."""
+    if isinstance(path, (ResidentBankPayload, ResidentSectorModel)):
+        return _read_header(path)
+    return rank0_read(path, stage=stage, read=lambda: _read_header(path))
+
 def _write_header(io, header):
     io.write_attr("header_json", np.bytes_(_json(header)))
 
@@ -235,9 +242,12 @@ def _read_staging_header(path):
     """Close every serial reader before any rank can reopen the staged writer."""
     header = error = None
     try:
-        if (path.header_json is not None if isinstance(path, ResidentSectorModel)
-                else Path(path).exists()):
-            header = _read_header(path)
+        if isinstance(path, ResidentSectorModel):
+            if path.header_json is not None:
+                header = _read_header(path)
+        else:
+            header = rank0_read(path, stage="shared_pole.staging_header/read",
+                                read=lambda: _read_header(path) if Path(path).exists() else None)
     except BaseException as exc:
         error = exc
     agree_io_refusal(error, path=path, stage="shared_pole.staging_header")
@@ -852,7 +862,7 @@ def _finalize_model(path, *, meta, header, basis=None, device_counts=None):
     with timing.section("finalisation"):
         rank0_transaction(path, stage="shared_pole.finalize", write=finish)
         _record_finalized_digest(path, header["digest"])
-        return _read_header(path)
+        return _read_header_once(path, stage="shared_pole.finalize/header")
 
 
 #: Payload digests this process computed while finalizing a model file, keyed
@@ -998,6 +1008,58 @@ def _model_digest(path, header, mesh, *, capacity, device_counts=None):
     return digest.hexdigest()
 
 
+def _model_metadata(path, expected_identity):
+    """Every metadata check of ``validate_shared_pole_model``; return the header."""
+    header = _read_header(path)
+    _check_identity(header["identity"], expected_identity)
+    if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
+        _refuse("missing final shared-pole commit or incomplete q census")
+    sector = header.get("sector")
+    components = header.get("factor_components", 1)
+    if sector is not None:
+        if (sector not in ("CC", "TT", "CT_C", "CT_T") or header["nspinor"] != 4
+                or components != (3 if sector in ("TT", "CT_T") else 1)
+                or "capacity_geometry" not in header):
+            _refuse("invalid sector endpoint metadata")
+    elif components != 1:
+        _refuse("component factors require an explicit sector identity")
+    qt = shared_pole_qirr_tables(header)
+    validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
+    if isinstance(path, ResidentSectorModel):
+        # One in-process copy: the typed tables have no second record to
+        # drift from; the payload extents and commit must still agree.
+        if (path.logical("factor") != (header["n_q_irr"], header["n_mu_logical"],
+                                       components, header["Kmax"])
+                or path.logical("poles2_ry2") != (header["n_q_irr"], header["Kmax"])
+                or path.final_commit != header["digest"]):
+            _refuse("resident model payload/commit mismatch")
+    else:
+        with open_h5_settled(path, "r") as f:
+            for name, shape, dtype in (
+                ("factor", (header["n_q_irr"],header["n_mu_logical"],header.get("factor_components",1),header["Kmax"]), np.complex128),
+                ("poles2_ry2", (header["n_q_irr"],header["Kmax"]), np.float64),
+                ("K", (header["n_q_irr"],), np.int64)):
+                if name not in f or f[name].shape != shape or f[name].dtype != dtype or f[name].chunks is not None:
+                    _refuse(f"dataset {name} shape/dtype/contiguity mismatch")
+            if "final_commit" not in f or f["final_commit"][()].decode() != header["digest"]:
+                _refuse("missing or inconsistent final commit")
+            if not np.array_equal(f["K"][:], header["K"]) or not np.array_equal(f["written_q"][:],header["written_q"]):
+                _refuse("count/completion metadata mismatch")
+            for key in _TABLE_KEYS:
+                if not np.array_equal(f["qirr/"+key][:], np.asarray(header["qirr"][key])):
+                    _refuse(f"typed qirr metadata changed: {key}")
+            if (not np.array_equal(f["q_irr_full_idx"][:], header["q_irr_full_idx"])
+                    or int(f["qirr/n_sym_spatial"][()]) != header["qirr"]["n_sym_spatial"]):
+                _refuse("typed parent or operation-count metadata changed")
+            for key, expected in header["operations"].items():
+                actual = f["operations/"+key][()]
+                if key == "typing_source":
+                    actual = actual.decode()
+                if not np.array_equal(actual, expected):
+                    _refuse(f"typed operation metadata changed: {key}")
+    return header
+
+
 def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=None):
     """Refuse partial, stale, malformed or changed payload; return header.
 
@@ -1010,53 +1072,10 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
     """
     error = None
     try:
-        header = _read_header(path)
-        _check_identity(header["identity"], expected_identity)
-        if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
-            _refuse("missing final shared-pole commit or incomplete q census")
-        sector = header.get("sector")
-        components = header.get("factor_components", 1)
-        if sector is not None:
-            if (sector not in ("CC", "TT", "CT_C", "CT_T") or header["nspinor"] != 4
-                    or components != (3 if sector in ("TT", "CT_T") else 1)
-                    or "capacity_geometry" not in header):
-                _refuse("invalid sector endpoint metadata")
-        elif components != 1:
-            _refuse("component factors require an explicit sector identity")
-        qt = shared_pole_qirr_tables(header)
-        validate_qirr_tables(qt, header["n_q_irr"], header["n_mu_logical"])
-        if isinstance(path, ResidentSectorModel):
-            # One in-process copy: the typed tables have no second record to
-            # drift from; the payload extents and commit must still agree.
-            if (path.logical("factor") != (header["n_q_irr"], header["n_mu_logical"],
-                                           components, header["Kmax"])
-                    or path.logical("poles2_ry2") != (header["n_q_irr"], header["Kmax"])
-                    or path.final_commit != header["digest"]):
-                _refuse("resident model payload/commit mismatch")
-        else:
-            with open_h5_settled(path, "r") as f:
-                for name, shape, dtype in (
-                    ("factor", (header["n_q_irr"],header["n_mu_logical"],header.get("factor_components",1),header["Kmax"]), np.complex128),
-                    ("poles2_ry2", (header["n_q_irr"],header["Kmax"]), np.float64),
-                    ("K", (header["n_q_irr"],), np.int64)):
-                    if name not in f or f[name].shape != shape or f[name].dtype != dtype or f[name].chunks is not None:
-                        _refuse(f"dataset {name} shape/dtype/contiguity mismatch")
-                if "final_commit" not in f or f["final_commit"][()].decode() != header["digest"]:
-                    _refuse("missing or inconsistent final commit")
-                if not np.array_equal(f["K"][:], header["K"]) or not np.array_equal(f["written_q"][:],header["written_q"]):
-                    _refuse("count/completion metadata mismatch")
-                for key in _TABLE_KEYS:
-                    if not np.array_equal(f["qirr/"+key][:], np.asarray(header["qirr"][key])):
-                        _refuse(f"typed qirr metadata changed: {key}")
-                if (not np.array_equal(f["q_irr_full_idx"][:], header["q_irr_full_idx"])
-                        or int(f["qirr/n_sym_spatial"][()]) != header["qirr"]["n_sym_spatial"]):
-                    _refuse("typed parent or operation-count metadata changed")
-                for key, expected in header["operations"].items():
-                    actual = f["operations/"+key][()]
-                    if key == "typing_source":
-                        actual = actual.decode()
-                    if not np.array_equal(actual, expected):
-                        _refuse(f"typed operation metadata changed: {key}")
+        header = (_model_metadata(path, expected_identity)
+                  if isinstance(path, ResidentSectorModel) else
+                  rank0_read(path, stage="shared_pole_model/metadata/read",
+                             read=lambda: _model_metadata(path, expected_identity)))
     except Exception as exc:
         error = exc
     agree_io_refusal(error, path=path, stage="shared_pole_model/metadata")
@@ -2112,9 +2131,12 @@ def read_bank_constant_header(resource, *, mesh_xy):
     if resource.get("kind") != _CONSTANT_KIND:
         return validate_shared_pole_bank(resource["path"], expected_identity=resource["identity"],
                                          mesh_xy=mesh_xy, require_complete=True)
-    with open_h5_settled(resource["path"], "r") as f:
-        raw = f["constant_json"][()]
-    header = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+    def read():
+        with open_h5_settled(resource["path"], "r") as f:
+            raw = f["constant_json"][()]
+        return raw.decode() if isinstance(raw, bytes) else str(raw)
+    header = json.loads(rank0_read(resource["path"], stage="shared_pole.constant_header",
+                                   read=read))
     _check_identity(header["identity"], resource["identity"])
     if header.pop("commit", None) != resource.get("commit"):
         _refuse("photon bank constant commit mismatch")
@@ -2314,7 +2336,28 @@ def initialize_shared_pole_bank(path, *, meta, tables, recipe, identity,
 
 
 def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
-                              require_complete=False, expected_recipe=None):
+                              require_complete=False, expected_recipe=None, collective=True):
+    """Authenticated header of a bank, read and checked once (rank 0).
+
+    A bank file is opened by rank 0 alone, which runs every check of
+    ``_validate_bank``; the header, or its refusal, reaches every rank through
+    the host control store (``rank0_read``), so P ranks never reopen the file
+    the writer just closed at once. Every process must call it in the same
+    order. ``collective=False`` reads on this rank alone, for a caller whose
+    ranks may decide differently before reaching it (a resume probe of a bank
+    an earlier process left).
+    """
+    def read():
+        return _validate_bank(path, expected_identity=expected_identity, mesh_xy=mesh_xy,
+                              require_complete=require_complete,
+                              expected_recipe=expected_recipe)
+    if isinstance(path, ResidentBankPayload) or not collective:
+        return read()
+    return rank0_read(path, stage="shared_pole.validate_bank", read=read)
+
+
+def _validate_bank(path, *, expected_identity, mesh_xy,
+                   require_complete=False, expected_recipe=None):
     """Authenticate the scratch plan and per-field commit masks before replay.
 
     Only small metadata is read. Partial files are resumable, but a consumer

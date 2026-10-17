@@ -1601,6 +1601,97 @@ def xor_to_all(digest, *, path, stage):
         reduce=lambda records: np.bitwise_xor.reduce(np.stack(records), axis=0)))
 
 
+_RANK_LOCAL_IO = threading.local()
+
+
+class _rank_local_io:
+    """Mark rank-0-only file work (``rank0_transaction``'s ``write``, a
+    ``rank0_read`` reader): a nested ``rank0_read`` inside it reads directly,
+    because its peers are not there to exchange with."""
+
+    def __enter__(self):
+        _RANK_LOCAL_IO.depth = getattr(_RANK_LOCAL_IO, "depth", 0) + 1
+
+    def __exit__(self, *_exc):
+        _RANK_LOCAL_IO.depth -= 1
+
+
+#: Largest single host-control value ``rank0_read`` stores; longer results
+#: are split, so a 1.7 MB model header never meets a transport message cap.
+_RANK0_READ_CHUNK = 512 * 1024
+#: Builtin classes a peer re-raises by name, so ``except (OSError, ValueError,
+#: KeyError)`` callers decide alike on every rank. Anything else: RuntimeError.
+_RANK0_READ_ERRORS = {cls.__name__: cls for cls in (
+    ValueError, KeyError, TypeError, OSError, FileNotFoundError, RuntimeError,
+    AttributeError, IndexError, AssertionError)}
+
+
+def rank0_read(path, *, stage, read):
+    """One process reads a committed file; every process gets the result.
+
+    ``read()`` runs on rank 0 alone and returns a JSON value (the metadata a
+    validator authenticated, never tensor payload). Its result, or its
+    failure, reaches every other rank through the host coordination store:
+    no device collective, no device memory. The peers wait for it, so this is
+    also the barrier after the writer's close, and they never open ``path``.
+
+    This removes the concurrent serial reopen of a just-committed file. At
+    P=16 on two Frontier nodes, sixteen h5py reopens of a just-closed
+    ``bank.h5`` made the Lustre client report its size short at a stripe
+    boundary for milliseconds (``truncated file: eof < stored_eof``). One
+    reader does not contend with its peers.
+
+    Every rank returns the same JSON round trip of rank 0's value. A failure
+    raises rank 0's exception on rank 0, and the same builtin class with the
+    same message on the others. Must be called by every process in the same
+    order (it takes one ``_io_control_key`` occurrence); inside rank-0-only
+    work (``rank0_transaction``'s ``write``, another reader) it reads
+    directly.
+    """
+    import json
+
+    n_proc = process_count()
+    if n_proc <= 1 or getattr(_RANK_LOCAL_IO, "depth", 0):
+        with _rank_local_io():
+            return json.loads(json.dumps(read()))
+    from jax._src.distributed import global_state
+    from ffi.common.broadcast import _arrive, wait_for_key
+
+    client = global_state.client
+    key = _io_control_key(path, stage)
+    what = f"rank 0's read of {path} ({stage})"
+    if process_rank() == 0:
+        error = None
+        try:
+            with _rank_local_io():
+                body = json.dumps(read()).encode()
+            flag = b"\0"
+        except BaseException as exc:                      # noqa: BLE001
+            error = exc
+            body = json.dumps([type(exc).__name__, str(exc)]).encode()
+            flag = b"\1"
+        chunks = [body[i:i + _RANK0_READ_CHUNK]
+                  for i in range(0, len(body), _RANK0_READ_CHUNK)] or [b""]
+        for i, chunk in enumerate(chunks):
+            client.key_value_set_bytes(f"{key}/chunk/{i}", chunk)
+        client.key_value_set_bytes(f"{key}/result", flag + str(len(chunks)).encode())
+        wait_for_key(client, f"{key}/read/complete", 0,
+                     what=f"every rank to take {what}")
+        client.key_value_delete(key)          # the whole key/ directory
+        if error is not None:
+            raise error
+        return json.loads(body)
+    head = wait_for_key(client, f"{key}/result", 0, what=what)
+    body = b"".join(wait_for_key(client, f"{key}/chunk/{i}", 0, what=what)
+                    for i in range(int(head[1:])))
+    _arrive(client, f"{key}/read", n_proc - 1)
+    value = json.loads(body)
+    if head[:1] == b"\1":
+        name, message = value
+        raise _RANK0_READ_ERRORS.get(name, RuntimeError)(message)
+    return value
+
+
 def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
     """Validate on all ranks, perform serial I/O, then broadcast its verdict.
 
@@ -1631,7 +1722,8 @@ def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
     value = None
     if process_rank() == 0:
         try:
-            value = write()
+            with _rank_local_io():
+                value = write()
         except BaseException as exc:
             error = exc
     agree_io_error(error, path=path, stage=stage)
