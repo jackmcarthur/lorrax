@@ -120,15 +120,19 @@ def test_distributed_takes_the_size_route_on_rocm(mesh, rocm, capsys):
     assert resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64) == "one_device"
     lu_bound = resolve_mod.ONE_DEVICE_MAX_N[("solve_lu", "ROCM")] // 2 * 2   # n divisible by the 2x2 mesh
     assert resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=lu_bound) == "one_device"
-    # Beyond the bound and with n unknown: the leg library, refused on this host by name.
+    # Beyond the bound and with n unknown: the leg library, refused on this host by name --
+    # ELPA for eigh (the ROCM distributed eigh since 0018), SLATE still for solve_lu.
     for n in (bound + 4, None):
-        # RuntimeError: the loaded library has no SLATE handler; ValueError: it has one
+        # RuntimeError: the loaded library has no handler; ValueError: it has one
         # and the ladder refuses later (one JAX process per mesh device).
-        with pytest.raises((RuntimeError, ValueError), match="slate"):
+        with pytest.raises((RuntimeError, ValueError), match="eigh backend 'elpa'"):
             resolve_mod.resolve_backend("eigh", "distributed", mesh, n=n)
-    # The capacity provider is the library, never the size route.
+    for n in (lu_bound + 2, None):
+        with pytest.raises((RuntimeError, ValueError), match="solve_lu backend 'slate'"):
+            resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=n)
+    # The capacity provider is the library (ELPA), never the size route.
     backend, why = resolve_mod.resolve_eigh_capacity(mesh, n=64)
-    assert backend == "native" and "slate" in why
+    assert backend == "native" and "eigh backend 'elpa'" in why and "slate" not in why.split("Build with")[0]
     assert resolve_mod.size_route_note("eigh", "distributed", mesh, 64, "one_device") == \
         f"size route ROCM: n=64 <= {bound} -> one_device"
     assert resolve_mod.size_route_note("eigh", "slate", mesh, 64, "slate") is None
