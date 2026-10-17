@@ -194,6 +194,24 @@ static void pool_report(const char* what, const lorrax_ffi::slate::SlateCtx* ctx
                  ws.used / 1e9, ws.size / 1e9);
 }
 
+template <typename T>
+static int64_t local_of(sl::Matrix<T>& M) {
+    int64_t k = 0;
+    for (int64_t j = 0; j < M.nt(); ++j)
+        for (int64_t i = 0; i < M.mt(); ++i)
+            if (M.tileIsLocal(i, j)) ++k;
+    return k;
+}
+
+// The pools' measured high-water (pool_seed.h PoolWatch), one line per matrix.
+static void hw_report(lorrax_ffi::slate::PoolWatch& pw, const char* what,
+                      const lorrax_ffi::slate::SlateCtx* ctx, int64_t n, int64_t nb, int itemsize) {
+    if (!lorrax_ffi::slate::pool_report_enabled()) return;
+    int r = 0;
+    MPI_Comm_rank(ctx->comm, &r);
+    pw.report(what, r, n, nb, itemsize);
+}
+
 static const sl::Options& lu_opts() {
     static const sl::Options opts = {
         {sl::Option::Target,   sl::Target::Devices},
@@ -261,12 +279,16 @@ static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate:
         int64_t sa = 0, sx = 0;
         auto Aq = owned<T>(n, n, nb, nb, ctx, ws, &sa);
         auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx, ws, &sx, /*rhs=*/true);
+        lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
+        lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
+        lorrax_ffi::slate::PoolWatchScope wx(pw, Xq, "X", sx, local_of(Xq));
         if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
         if (auto e = factor_one<T>(what, Aq, piv, iq); !e.success()) return e;
         if (auto e = solve_one<T>(Aq, piv, Xq, iq); !e.success()) return e;
         pool_report<T>(what, ctx, iq, Aq, sa, &Xq, sx, ws);
+        hw_report(pw, what, ctx, n, nb, (int) sizeof(T));
         if (auto e = copy_out<T>(what, Xq, X + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_out<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
     }
@@ -294,10 +316,13 @@ static ffi::Error GetrfImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
         lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);
         int64_t sa = 0;
         auto Aq = owned<T>(n, n, nb, nb, ctx, ws, &sa);
+        lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
+        lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
         if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
         if (auto e = factor_one<T>(what, Aq, piv, iq); !e.success()) return e;
         pool_report<T>(what, ctx, iq, Aq, sa, nullptr, 0, ws);
+        hw_report(pw, what, ctx, n, nb, (int) sizeof(T));
         if (auto e = copy_out<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         int64_t* out = h_piv.data() + iq * piv_len;
         int64_t at = 0;
@@ -349,6 +374,9 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
         int64_t sa = 0, sx = 0;
         auto Aq = owned<T>(n, n, nb, nb, ctx, ws, &sa);
         auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx, ws, &sx, /*rhs=*/true);
+        lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
+        lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
+        lorrax_ffi::slate::PoolWatchScope wx(pw, Xq, "X", sx, local_of(Xq));
         if (auto e = copy_in<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         const int64_t* in = h_piv.data() + iq * piv_len;
@@ -367,6 +395,7 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
                               "(feed back getrf's piv verbatim, same mesh)");
         if (auto e = solve_one<T>(Aq, piv, Xq, iq); !e.success()) return e;
         pool_report<T>(what, ctx, iq, Aq, sa, &Xq, sx, ws);
+        hw_report(pw, what, ctx, n, nb, (int) sizeof(T));
         if (auto e = copy_out<T>(what, Xq, X + iq * b_elems, lld, p, q, stream); !e.success()) return e;
     }
     return ffi::Error::Success();
