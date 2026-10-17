@@ -27,7 +27,8 @@ from common.collectives import (agree_io_error, device_put_process_local, device
                                 process_rank, psum_replicate,
                                 rank0_transaction)
 from file_io.slab_io import SlabIO, mesh_divisible_shape
-from file_io.commit_state import agree_io_refusal, assert_committed, set_commit_state
+from file_io.commit_state import (agree_io_refusal, assert_committed, open_h5_settled,
+                                  set_commit_state)
 from symmetry_maps import QirrTables, validate_qirr_tables
 
 SCHEMA = "lorrax.shared-real-pole.v1"
@@ -218,7 +219,7 @@ def _read_header(path):
         if path.header_json is None:
             _refuse(f"{path} has no committed header")
         return json.loads(path.header_json)
-    with h5py.File(path, "r") as f:
+    with open_h5_settled(path, "r") as f:
         assert_committed(f, path=path)
         if "header_json" not in f:
             _refuse("missing header_json")
@@ -249,7 +250,7 @@ def _stamp_header(path, header, stage):
         path.header_json = _json(header)
         return
     def publish():
-        with h5py.File(path, "a") as f:
+        with open_h5_settled(path, "a") as f:
             if "header_json" in f:
                 del f["header_json"]
             f.create_dataset("header_json", data=np.bytes_(_json(header)))
@@ -596,7 +597,7 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         # The native contiguous-dataset API requires its parent group to exist.
         # Metadata setup is ordered before opening the collective payload handle.
         def prepare_group():
-            with h5py.File(path, "a") as f:
+            with open_h5_settled(path, "a") as f:
                 f.require_group(name)
         rank0_transaction(path, stage="shared_pole.stage_group", write=prepare_group)
     with SlabIO(path, mode="a", mesh=mesh) as io:
@@ -702,7 +703,7 @@ def _stage_direct(path, header):
     its batches become staged batches read at their row offset."""
     name = "staging/direct"
     def move():
-        with h5py.File(path, "a") as f:
+        with open_h5_settled(path, "a") as f:
             f.require_group(name)
             f.move("factor", name + "/factor")
             f.move("poles2_ry2", name + "/poles2")
@@ -839,7 +840,7 @@ def _finalize_model(path, *, meta, header, basis=None, device_counts=None):
         _write_header(io, header)
     header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta), device_counts=device_counts)
     def finish():
-        with h5py.File(path, "a") as f:
+        with open_h5_settled(path, "a") as f:
             set_commit_state(f, False)
             if "staging" in f:
                 del f["staging"]
@@ -1033,7 +1034,7 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
                     or path.final_commit != header["digest"]):
                 _refuse("resident model payload/commit mismatch")
         else:
-            with h5py.File(path, "r") as f:
+            with open_h5_settled(path, "r") as f:
                 for name, shape, dtype in (
                     ("factor", (header["n_q_irr"],header["n_mu_logical"],header.get("factor_components",1),header["Kmax"]), np.complex128),
                     ("poles2_ry2", (header["n_q_irr"],header["Kmax"]), np.float64),
@@ -2111,7 +2112,7 @@ def read_bank_constant_header(resource, *, mesh_xy):
     if resource.get("kind") != _CONSTANT_KIND:
         return validate_shared_pole_bank(resource["path"], expected_identity=resource["identity"],
                                          mesh_xy=mesh_xy, require_complete=True)
-    with h5py.File(resource["path"], "r") as f:
+    with open_h5_settled(resource["path"], "r") as f:
         raw = f["constant_json"][()]
     header = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
     _check_identity(header["identity"], resource["identity"])
@@ -2379,7 +2380,7 @@ def validate_shared_pole_bank(path, *, expected_identity, mesh_xy,
     # Geometry only: never load a matrix through the metadata handle. A
     # device-resident bank has no file; its masks live in the header above.
     if not isinstance(path, ResidentBankPayload):
-        with h5py.File(path, "r") as file:
+        with open_h5_settled(path, "r") as file:
             # Boolean HDF5 enums are metadata, outside phdf5's numeric ABI.
             for key, mask in masks.items():
                 if key not in file or not np.array_equal(file[key][()], mask):
@@ -3159,7 +3160,7 @@ def _export_spatial_header(path, source_wfn, meta, *, kind, source):
 
     def append():
         copy_mf_header(source_wfn, path, dst_mode="a")
-        with h5py.File(path, "a") as f:
+        with open_h5_settled(path, "a") as f:
             group = f.create_group(kind + "_header")
             indices = np.asarray(meta.mu_basis.canonical_indices, np.int32)
             write_centroid_coordinates(
