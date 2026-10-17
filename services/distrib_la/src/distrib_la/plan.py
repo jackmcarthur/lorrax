@@ -1052,6 +1052,35 @@ class Plan:
         """The route :meth:`batched` takes for one operand stack (:meth:`stack_route`)."""
         return self.stack_route(shape, dtype, traced=traced).route
 
+    def decision(self, A, *args) -> tuple:
+        """The static choices :meth:`batched` makes for this call signature, without the room.
+
+        ``(backend, route, rounds, max_n)``: the resolved backend, the batched route
+        (:meth:`route_for`), the measured size route's rounds (:func:`_measured_rounds`:
+        0 the leg library, None one_device's own round rule, or None where it does not
+        apply) and one_device's bound (:func:`distrib_la.resolve.one_device_max_n`; None
+        off one_device).  These are everything a plan's room decides in the program
+        :meth:`batched` traces for ``A`` and ``args``, so a caller's program cache keys on
+        this tuple and never on the room (COMPILEAUDIT 2026-10-05 rule 4).  Host-side, on
+        arrays or ``jax.ShapeDtypeStruct`` (only shape and dtype are read), through the
+        same functions and memo caches :meth:`batched` uses, so the later trace reaches
+        the same answer from the memo.  An eigh plan with a room decides per stack in
+        :meth:`stack_route` and is not covered.
+        """
+        if self.op == "eigh" and self.budget_bytes is not None:
+            raise NotImplementedError("Plan.decision: an eigh plan with a room decides per "
+                                      "stack (stack_route); not covered")
+        route = self.route_for(A.shape, A.dtype)
+        rounds = None
+        if route == ROUTE_BACKEND_BATCHED and self._measured_applies():
+            rounds = _measured_rounds(self, A, args)
+        max_n = None
+        if self.backend == ONE_DEVICE and rounds != 0:
+            from distrib_la import resolve as _resolve
+            max_n = _resolve.one_device_max_n(self.op, _resolve.mesh_platform(self.mesh),
+                                              self.budget_bytes)
+        return (self.backend, route, rounds, max_n)
+
     def stack_route(self, shape, dtype, op: str = "eigh", traced: bool = True) -> StackRoute:
         """How :meth:`batched` runs one operand stack: the service's decision.
 

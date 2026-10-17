@@ -16,6 +16,8 @@ shape, not on a timing:
 5. Face constructor rounds share one width, the ragged tail included.
 6. The batch-layout eigh takes its real-row count as an operand: one program
    per stack serves every count.
+7. The Dyson response programs key on the LU plan's decision, never on the
+   room that decides it (COMPILEAUDIT rule 4).
 """
 import os
 import subprocess
@@ -107,6 +109,9 @@ class _CheckedPlan:
     def describe(self):
         return "checked test plan"
 
+    def decision(self, A, *args):
+        return ("checked",)
+
     def batched(self, A, *rest, **kwargs):
         from distrib_la import _result_check as rc
         if self.op == "eigh":
@@ -137,14 +142,66 @@ def test_response_programs_have_no_host_callback(checked_service):
     from gw import response_bank as rb
     mesh, n, nq = _mesh(), 8, 2
     face = jax.ShapeDtypeStruct((nq, n, n), jnp.complex128, sharding=NamedSharding(mesh, P(None, "x", "y")))
-    dyson, slope, moments, _ = rb._response_programs.__wrapped__(
-        mesh, n, "distributed", "auto", 0.5, False, None)
+    built = rb._response_programs.__wrapped__(mesh, n, "distributed", "auto", 0.5, False, None)
+    dyson, moments = built.bind(_CheckedPlan("solve_lu"), (mesh, n, "distributed", "auto", None))
+    slope = built.slope
     sqrt_v = rb._coulomb_algebra.__wrapped__(mesh, n, n, "distributed")
     counts = {"dyson.value": _host_callbacks(dyson.value.lower(face, face)),
               "slope": _host_callbacks(slope.lower(face, face, face)),
               "moments": _host_callbacks(moments.lower(face, face, face)),
               "sqrt_v": _host_callbacks(sqrt_v.lower(face))}
     assert counts == dict.fromkeys(counts, 0)
+
+
+class _RoomPlan(_CheckedPlan):
+    """A checked LU plan whose decision is a function of its room, as the size route's is."""
+    solves = 0
+
+    def __init__(self, op, *args, budget_bytes=None, **kwargs):
+        super().__init__(op)
+        self.budget_bytes = budget_bytes
+
+    def decision(self, A, *args):
+        return ("one_device" if (self.budget_bytes or 0) >= 1000 else "library",)
+
+    def batched(self, A, *rest, **kwargs):
+        _RoomPlan.solves += 1                  # once per traced solve
+        return super().batched(A, *rest, **kwargs)
+
+
+def test_response_programs_key_on_the_solve_decision_not_the_room(checked_service, monkeypatch):
+    """The Dyson programs key on the LU plan's decision (COMPILEAUDIT rule 4): a room that
+    moves without moving the decision traces and lowers nothing again; one that flips the
+    decision takes a new variant."""
+    import distrib_la
+    from gw import response_bank as rb
+    monkeypatch.setattr(distrib_la, "plan", _RoomPlan)
+    for name in ("_LU_PLANS", "_SOLVE_OPERANDS", "_DECISIONS", "_VARIANTS"):
+        monkeypatch.setattr(rb, name, {})
+    mesh, n, nq = _mesh(), 8, 2
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    h = jax.device_put(0.1 * _hermitian(n, nq, seed=1), face)
+    chi = jax.device_put(0.01 * _hermitian(n, nq, seed=2), face)
+    built = rb._response_programs.__wrapped__(mesh, n, "distributed", "auto", 0.5, False, None)
+    lowerings = _lowerings()
+
+    def value(room):
+        key = (mesh, n, "distributed", "auto", room)
+        dyson, _ = built.bind(rb._lu_plan(key), key)
+        return dyson.value, np.asarray(dyson.value(h, chi))
+
+    first, w_first = value(2000)
+    solves, lowered = _RoomPlan.solves, len(lowerings)
+    assert solves >= 1 and lowered >= 1
+    moved, w_moved = value(3000)               # the room moved, the decision did not
+    assert (_RoomPlan.solves, len(lowerings)) == (solves, lowered)
+    assert moved.resolve(h, chi) is first.resolve(h, chi)
+    np.testing.assert_array_equal(w_moved, w_first)
+    flipped, w_flipped = value(10)             # the decision flips: a new variant
+    assert flipped.resolve(h, chi) is not first.resolve(h, chi)
+    assert _RoomPlan.solves > solves
+    np.testing.assert_array_equal(w_flipped, w_first)
+    assert sorted(d for (_, _, _, d) in rb._VARIANTS) == [(("library",),), (("one_device",),)]
 
 
 def test_polar_stack_has_no_host_callback():
