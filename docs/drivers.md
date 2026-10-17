@@ -176,7 +176,7 @@ G(τ) is never materialized; it exists only as $\psi\psi^*$ phases inside the
 | `eqp0.dat`, `eqp1.dat` | BerkeleyGW-format QP energies on the WFN wedge; in SC runs, the converged SC spectrum |
 | `sigma_diag.dat` | the Σ diagonal decomposition per k and band |
 | `eqp_g0w0.dat` | dynamic one-shot runs: $H_0 + \Sigma_{xc}(E_\mathrm{DFT})$ |
-| `sigma_mnk.h5` | dynamic modes: the on-shell Σ band matrices Σ_mn(E_m), Σ_mn(E_n) and diagonals; the Σ(ω) cube under `sigma_omega_grid_debug = true` |
+| `sigma_mnk.h5` | dynamic modes: the on-shell Σ band matrices Σ_mn(E_m), Σ_mn(E_n) and diagonals |
 | `qp_wfn_rotations.h5` | the QP eigensystem $U$, $E_\mathrm{QP}$ with the source-WFN fingerprint, read by htransform, BSE and SC seeding |
 | `WFN_qp.h5` | ψ rotated by U with QP energies (`write_wfn_h5`); a one-shot run on a symmetry-reduced WFN writes none |
 | `tmp/zeta_q.h5` | ζ, plus `zeta_q_mu{1,2,3}.h5` on bispinor runs |

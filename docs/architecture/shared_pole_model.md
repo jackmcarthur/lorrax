@@ -398,26 +398,9 @@ their unfold tables: no full-q W is formed for the file, and BSE unfolds on
 load ([BSE](bse.md)). Plain-MPA and metal restarts carry no `W0_qmunu`
 ([BSE](bse.md) says what a BSE on them does).
 
-Under `sigma_omega_grid_debug = true` the same key keeps a one-shot's swept
-Σ(ω) (`file_io.sigma_checkpoint`, `tmp/sigma_checkpoint_oneshot.h5`; on shell
-there is no checkpoint and the sweep is recomputed) when it pays for itself: only if the
-measured sweep took at least 5× the predicted write (cube bytes at 1.3 GB/s,
-measured on one node), logged as one `Sigma checkpoint: written|skipped` line
-(Na 8³ [−100, +150] eV skips: 101 s sweep, 61.4 GB, 47.7 s write). The write
-finishes before finalize, which donates the body cube. It holds the body
-cube (and, when present, the odd cube and the raw twin's N₃ band-diagonal
-slots) through SlabIO from their own shards, then the head
-diagonal, band-extrapolation payload and band axis, then a commit digest. A
-rerun with `restart = true` whose identity matches (the W model's digest and
-identity, the energies Σ is read at, the ω grid, every sweep option, and
-the band-extrapolation bracket plan, `gw.sigma_dispatch`) goes
-straight to finalize; any other file is removed, named in one WARNING line,
-and the sweep recomputed. It covers one-shots only: an SC rerun starts at
-map 0, retention deletes later maps, and map 0's sweep plans the Σ windows
-the later maps hold, so SC maps, map 0 included, recompute. A failed write
-never costs the run: the partial file is removed with one WARNING line and
-finalize proceeds. The PPM route has no W digest at this seam and always
-recomputes.
+The on-shell Σ sweep is not checkpointed: a rerun with `restart = true`
+recomputes it (the ω-grid sweep checkpoint, `file_io.sigma_checkpoint`,
+retired with the grid; an on-shell checkpoint is a follow-up).
 
 `write_w = true` dumps the bank as stored (line supports as panels) and is a
 debug output.
