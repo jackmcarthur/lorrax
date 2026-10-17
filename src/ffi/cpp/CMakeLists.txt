@@ -1747,6 +1747,40 @@ if(LORRAX_ROCM_HAVE_SLATE)
     target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--disable-new-dtags")
     message(STATUS "  slate/{context,eigh,potrf,trsm,batched_potrf,batched_trsm}")
 endif()
+# ---- ELPA (AMD GPU kernels): the elpa/ family on this leg ------------------
+# ELPA 2026.02.001 built by config/frontier/build_elpa_hip.sh into its
+# content-keyed prefix (OpenMP, the LORRAX device-allocator patch, ScaLAPACK
+# static and hidden inside libelpa).  The handler shares the SLATE family's
+# per-mesh MPI context (as ScaLAPACK does), so it needs LORRAX_ROCM_HAVE_SLATE.
+# The prefix joins the RPATH AFTER SLATE's: the leg's libopenblas.so.0 stays
+# SLATE's copy (the closure writer and ld.so both resolve a SONAME once).
+option(LORRAX_ROCM_HAVE_ELPA
+    "Build the ELPA eigh handler (needs config/frontier/build_elpa_hip.sh's prefix)" ON)
+if(LORRAX_ROCM_HAVE_ELPA)
+    if(NOT LORRAX_ROCM_HAVE_SLATE)
+        message(FATAL_ERROR "GATE rocm-elpa: the ELPA handler uses the SLATE family's mesh "
+            "context; fix: -DLORRAX_ROCM_HAVE_SLATE=ON or -DLORRAX_ROCM_HAVE_ELPA=OFF")
+    endif()
+    if(NOT DEFINED LORRAX_ELPA_ROCM_DIR AND DEFINED ENV{LORRAX_ELPA_ROCM_DIR})
+        set(LORRAX_ELPA_ROCM_DIR "$ENV{LORRAX_ELPA_ROCM_DIR}")
+    endif()
+    if(NOT DEFINED LORRAX_ELPA_ROCM_DIR OR NOT EXISTS "${LORRAX_ELPA_ROCM_DIR}/LORRAX_ELPA_COMPLETE")
+        message(FATAL_ERROR "GATE rocm-elpa: no finished ELPA prefix at '${LORRAX_ELPA_ROCM_DIR}'; "
+            "fix: bash config/frontier/build_elpa_hip.sh (build_ffi_rocm.sh passes its "
+            "--print-prefix), or -DLORRAX_ROCM_HAVE_ELPA=OFF")
+    endif()
+    file(GLOB _elpa_inc "${LORRAX_ELPA_ROCM_DIR}/include/elpa*-*")
+    find_library(LORRAX_ELPA_LIBRARY NAMES elpa_openmp elpa
+                 PATHS "${LORRAX_ELPA_ROCM_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+    target_sources(lorrax_ffi_rocm PRIVATE elpa/eigh_ffi.cc)
+    target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE ${_elpa_inc})
+    target_link_libraries(lorrax_ffi_rocm PRIVATE "${LORRAX_ELPA_LIBRARY}")
+    get_target_property(_rp lorrax_ffi_rocm INSTALL_RPATH)
+    set_target_properties(lorrax_ffi_rocm PROPERTIES
+        INSTALL_RPATH "${_rp};${LORRAX_ELPA_ROCM_DIR}/lib")
+    message(STATUS "ELPA (hip): ${LORRAX_ELPA_ROCM_DIR} (${LORRAX_ELPA_LIBRARY})")
+    message(STATUS "  elpa/eigh")
+endif()
 else()
     message(FATAL_ERROR
         "LORRAX_FFI_PLATFORM is '${LORRAX_FFI_PLATFORM}' — set it explicitly:\n"

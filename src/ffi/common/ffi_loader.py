@@ -237,6 +237,8 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     "lorrax_slate_batched_solve_lu_factors": "SlateBatchedSolveLuFactorsFfi",
     "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
     "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
+    # The ELPA eigh (cpp/elpa/eigh_ffi.cc): the ROCM distributed eigh (distrib_la.resolve).
+    "lorrax_elpa_eigh":                      "ElpaEighFfi",
     # k-box modes 9 and 11 (cpp/kdft/kbox_rspace_ffi.cc): ffi.fft._ROCM_KBOX_TARGETS.
     "lorrax_kdft_kfft_klead_unfold": "KDftKfftKleadUnfoldFfi",
     "lorrax_kdft_kconv_chi_unfold":  "KDftKconvChiUnfoldFfi",
