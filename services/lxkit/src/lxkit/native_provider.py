@@ -182,7 +182,7 @@ _RUNTIME_OWNED = (
 )
 _PRIVATE_REDISTRIBUTABLE = re.compile(
     r"^lib(?:cusolverMp|cublasmp|cal|slate(?:_scalapack_api)?|blaspp|"
-    r"lapackpp|nvshmem(?:_host)?)[.]", re.I)
+    r"lapackpp|nvshmem(?:_host)?|elpa(?:_openmp)?)[.]", re.I)
 
 
 def is_private_redistributable(path: str | Path) -> bool:
@@ -216,7 +216,7 @@ def refuse_private_library(path: str | Path,
             f"refusing unclassified private library {candidate.name!r}.  A "
             "sealed bundle may carry only the centrally classified LORRAX "
             "engine redistributables (cuSolverMp/cuBLASMp/CAL, SLATE/BLAS++/"
-            "LAPACK++, or NVSHMEM); process, compiler, site and accelerator "
+            "LAPACK++, ELPA, or NVSHMEM); process, compiler, site and accelerator "
             "runtime providers remain external.")
 
 
@@ -703,7 +703,7 @@ _MUST_PIN = re.compile(
     r"^lib(?:mpi|mpich|hdf5|sci_|cusolver|cublas|cufft|cusparse|curand|cudart|"
     r"nvrtc|nvJitLink|nccl|cal[.]|nvshmem|rocsolver|rocblas|hipblas|rccl|"
     r"amdhip64|rocfft|hipfft|rocsparse|hipsparse|hipsolver|hsa-runtime64|"
-    r"amd_comgr|hiprtc|slate|blaspp|lapackpp|openblas|scalapack|fftw3)", re.I)
+    r"amd_comgr|hiprtc|slate|blaspp|lapackpp|openblas|scalapack|fftw3|elpa)", re.I)
 
 _COMPILERS = r"(?:gnu|cray|intel|nvidia|nv|aocc|amd|pgi)"
 #: One family per role, whatever the SONAME spelling: two members of a family

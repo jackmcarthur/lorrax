@@ -33,8 +33,14 @@ module unload cray-libsci 2>/dev/null || true
 source "$VENV/bin/activate"         # cmake probes jax.ffi.include_dir() from here
 
 [ "${1:-}" = "--fresh" ] && rm -rf "$BUILD"
+# ELPA, the ROCM distributed eigh (config/frontier/build_elpa_hip.sh): its
+# content-keyed prefix, built on demand (login node, ~4 min; a no-op verify after).
+ELPA_DIR=${LORRAX_ELPA_ROCM_DIR:-$(env -i HOME="$HOME" PATH=/usr/bin:/bin bash "$ROOT/config/frontier/build_elpa_hip.sh" --print-prefix)}
+[ -e "$ELPA_DIR/LORRAX_ELPA_COMPLETE" ] || env -i HOME="$HOME" USER="$USER" PATH=/usr/bin:/bin \
+    bash -lc "bash '$ROOT/config/frontier/build_elpa_hip.sh'" || { echo "[build_ffi_rocm] FAILED: ELPA" >&2; exit 1; }
 cmake -S "$ROOT/src/ffi/cpp" -B "$BUILD" \
     -DLORRAX_FFI_PLATFORM=rocm \
+    -DLORRAX_ELPA_ROCM_DIR="$ELPA_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_COMPILER=CC \
     -DHDF5_ROOT="$HDF5_DIR" \

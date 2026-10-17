@@ -193,12 +193,15 @@ _ROCM_ACTIVE_SUBSPACE_SYMBOLS: dict = {
 #: the same three symbols (ACTIVE_LOCAL_ROUTE's "native" row on both legs).
 #: The active-range GEMM with device-side bounds (cpp/active_gemm/: leg-neutral, run-time
 #: compiled) is built on both legs: ACTIVE_LOCAL_ROUTE's "device" row, in the CUDA table above.
+#: The ELPA eigh (cpp/elpa/eigh_ffi.cc over config/frontier/build_elpa_hip.sh's ELPA): the
+#: ROCM ``distributed`` eigh above the one-device bound (distrib_la.resolve).  ROCM only.
+_ROCM_ELPA_SYMBOLS: dict = {"lorrax_elpa_eigh": "ElpaEighFfi"}
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
                                  if t.startswith(("lorrax_slate_", "lorrax_cublas_local_",
                                                   "lorrax_active_gemm_"))},
                               **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS,
                               **_ROCM_LOCAL_LU_SYMBOLS,
-                              **_ROCM_ACTIVE_SUBSPACE_SYMBOLS}
+                              **_ROCM_ACTIVE_SUBSPACE_SYMBOLS, **_ROCM_ELPA_SYMBOLS}
 
 #: Leg key -> this loader's target table and not-found build command.
 _TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,

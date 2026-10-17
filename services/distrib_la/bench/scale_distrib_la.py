@@ -195,7 +195,7 @@ def fro(x):
 
 
 # --------------------------------------------------------------------------- layout
-def layout(op, backend, n, px, py):
+def layout(op, backend, n, px, py, dtype="complex128"):
     """(nb, grid, note) the backend runs this op at (bench-only read of private layout fns)."""
     grid = f"{px}x{py}"
     try:
@@ -208,6 +208,11 @@ def layout(op, backend, n, px, py):
                 return S.lu_layout(n, px, py), grid, "getrf PartialPiv + getrs, Target::Devices"
             if op == "cholesky":
                 return n // max(px, py), grid, "potrf one tile per rank (fromDevices, in place)"
+        if backend == "elpa" and op == "eigh":
+            from distrib_la import _elpa as E
+            side, nb = E.eigh_layout(n, px, dtype)
+            return nb, grid, (f"ELPA {E.SOLVER}-stage side {side}, block-cyclic by relabeling, "
+                              f"pool {E.pool_bytes(side, px, dtype) / 1e9:.2f} GB")
         if backend == "cusolvermp":
             from distrib_la import _cusolvermp as C
             if op == "eigh":
@@ -301,7 +306,7 @@ def run_case(op, n, dname, mesh, args, nrhs=None):
     try:
         p, info = make_plan(op, mesh, n, args.force_library)
         row.update(info)
-        row["nb"], row["grid"], row["layout"] = layout(op, p.backend, n, px, py)
+        row["nb"], row["grid"], row["layout"] = layout(op, p.backend, n, px, py, dname)
         if op == "solve_lu" and p.backend == "cusolvermp":
             from distrib_la._cusolvermp import lu_blocks
             row["nb"] = lu_blocks(n, px, py)[0]

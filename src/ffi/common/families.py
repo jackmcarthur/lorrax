@@ -142,7 +142,7 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "CUDA-only (ROCM: JAX psum; native_collectives refuses by GATE)."),
     "cusolvermp": Family(
         ("lorrax_cusolvermp_",), "cusolvermp",
-        _legs(("built", ""), ("elsewhere", "slate (distrib_la.resolve eigh/ROCM row)"),
+        _legs(("built", ""), ("elsewhere", "elpa (distrib_la.resolve eigh/ROCM row), slate"),
               ("elsewhere", "scalapack, slate")),
         note="NVIDIA-only library; no ROCm equivalent."),
     "slate": Family(
@@ -152,6 +152,19 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "sequential LibSci; eigh/potrf gated against the native route at P=4, n=512-8192. "
              "ROCM also builds the LU family (getrf PartialPiv + getrs: distributed solve_lu, "
              "gated against jnp.linalg.solve at P=4); CUDA's LU is cusolvermp, the host's scalapack."),
+    "elpa": Family(
+        ("lorrax_elpa_",), "elpa",
+        _legs(("elsewhere", "cusolvermp"), ("built", ""), ("elsewhere", "scalapack")),
+        gate="tests/test_distrib_la_elpa_gate.py (residual, orthogonality and eigenvalues vs "
+             "jnp.linalg.eigh on the same GCDs, P=4 2x2, float64 + complex128, padded and "
+             "unpadded sides)", tol=1e-12,
+        note="ROCM distributed eigh: ELPA 2026.02.001, the one-stage GPU solver by default "
+             "(tridiagonalization, divide-and-conquer and back-transformation on the GPU; the "
+             "two-stage path is selectable and refuses where it was measured wrong), built by "
+             "config/frontier/build_elpa_hip.sh into a content-keyed prefix with the LORRAX "
+             "device-allocator patch (ELPA's buffers come from the FFI workspace, inside the "
+             "arena) and ScaLAPACK hidden inside libelpa.  Shares the SLATE family's mesh "
+             "context.  Measured against SLATE-HIP: ELPA_ROCM_REPORT.md."),
     "rocsolver": Family(
         ("lorrax_rocsolver_",), "rocsolver",
         _legs(("xla", "jnp.linalg.eigh (jaxlib cuSOLVER)"), ("built", ""), ("xla", "jnp.linalg.eigh (LAPACK)")),
@@ -166,7 +179,8 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "tests/test_rocsolver_lu_gate.py).  rocSOLVER is the process's mapped copy."),
     "scalapack": Family(
         ("lorrax_scalapack_",), "scalapack",
-        _legs(("elsewhere", "cusolvermp"), ("elsewhere", "slate"), ("built", "")),
+        _legs(("elsewhere", "cusolvermp"), ("elsewhere", "elpa (eigh), slate (solve_lu)"),
+              ("built", "")),
         note="Host-only."),
 })
 

@@ -1,7 +1,7 @@
 """Backend resolution — the ONE guard ladder.
 
 A requested backend name (``auto | off | distributed | native2d |
-cusolvermp | slate | scalapack``, per op) becomes a concrete,
+cusolvermp | slate | elpa | scalapack``, per op) becomes a concrete,
 *guaranteed-callable* backend, or a clear resolve-time error.  Every guard
 lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
 
@@ -142,7 +142,7 @@ ONE_DEVICE = "one_device"
 #: drift).  ``cholesky`` deliberately does NOT: its CPU story is a
 #: channel-policy ladder in the caller, not one library.
 BACKEND_CHOICES = {
-    "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate",
+    "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate", "elpa",
                  "scalapack", ONE_DEVICE),
     "cholesky": ("auto", "off", "native2d", "cusolvermp", "slate"),
     "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack",
@@ -168,9 +168,16 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 #: ScaLAPACK's routines on the same library and MPI context are clean, so
 #: there is no configuration in which slate is the right CPU eigh.  On
 #: **CUDA** it is cuSOLVERMp, the only library there with a distributed
-#: syevd.  On **ROCM** it is SLATE (gpu_backend=hip), the only one of the
-#: three that builds for ROCm; eigh/potrf are gated against the native route
-#: on MI250X at P=4 (``ffi.common.families`` 'slate' row).
+#: syevd.  On **ROCM** eigh is ELPA (``distrib_la._elpa``: ELPA 2026.02.001's
+#: one-stage GPU solver, config/frontier/build_elpa_hip.sh), gated against the
+#: native route at P=4 (``ffi.common.families`` 'elpa' row).  MEASURED against
+#: SLATE-HIP, the former row, on MI250X (ELPA_ROCM_REPORT.md; cold wall, sampled
+#: residual / orthogonality <= 2.4e-14 for ELPA):
+#:     P=4 (2x2)   c128 20480: ELPA 23.0 s vs SLATE 121.8 s;  c128 30720: ELPA
+#:                 runs, SLATE aborts (he2hb workspace outside the arena);
+#:                 f64 20480: 15.3 vs 84.4 s;  f64 30720: 33.7 vs 213.6 s.
+#:     P=16 (4x4)  c128 30720: ELPA 27.3 s vs SLATE 218 s.
+#: SLATE stays selectable (``backend='slate'``) and keeps potrf / solve_lu.
 #:
 #: ``('solve_lu', 'ROCM')`` is SLATE too: ``slate::getrf`` (PartialPiv,
 #: Target::Devices) + ``slate::getrs`` (cpp/slate/batched_solve_lu_ffi.cc),
@@ -178,7 +185,7 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 _DISTRIBUTED_DEFAULT = {
     ("eigh", "cpu"):      "scalapack",
     ("eigh", "CUDA"):     "cusolvermp",
-    ("eigh", "ROCM"):     "slate",
+    ("eigh", "ROCM"):     "elpa",
     # solve_lu: the same one-library-per-platform rule.  ScaLAPACK's
     # pXgetrf/pXgetrs on the host lib, cuSOLVERMp's batched getrf/getrs
     # on CUDA — the two backends _IMPL already lists for this op.
@@ -281,6 +288,8 @@ _NATIVE_IMPL = {
 _SPEC = {
     ("eigh", "cusolvermp"):     ("lorrax_cusolvermp_eigh",          ("CUDA",)),
     ("eigh", "slate"):          ("lorrax_slate_eigh",       ("CUDA", "cpu", "ROCM")),
+    # ELPA (cpp/elpa/, config/frontier/build_elpa_hip.sh): built on the ROCM leg only.
+    ("eigh", "elpa"):           ("lorrax_elpa_eigh",        ("ROCM",)),
     ("eigh", "scalapack"):      ("lorrax_scalapack_eigh",           ("cpu",)),
     ("cholesky", "cusolvermp"): ("lorrax_cusolvermp_batched_potrf", ("CUDA",)),
     ("cholesky", "slate"):      ("lorrax_slate_potrf",      ("CUDA", "cpu", "ROCM")),
@@ -400,7 +409,7 @@ def _platform_phrase(platforms: tuple[str, ...]) -> str:
 def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
     """Guard 5 — mesh-geometry constraints, per (op, backend).  Raises
     ValueError with the reason; silent-pass otherwise."""
-    if op == "eigh" and backend in ("cusolvermp", "slate"):
+    if op == "eigh" and backend in ("cusolvermp", "slate", "elpa"):
         # These two FFI eigh wrappers reject p != q; for cusolvermp this is
         # a DEADLOCK guard (cusolverMpSyevd hangs in a collective on
         # rectangular one-tile-per-rank blocks — observed 4x1/1x4,
@@ -412,7 +421,8 @@ def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
             raise ValueError(
                 f"eigh backend {backend!r} needs a SQUARE mesh "
                 f"(cusolverMpSyevd DEADLOCKS on rectangular blocks; SLATE "
-                f"heev rejects them); got {px}x{py}.")
+                f"heev rejects them; ELPA's wrapper relabels one tile edge for "
+                f"both axes); got {px}x{py}.")
     elif backend == "slate":
         # These two rules MIRROR ``_slate.validate_tile_layout`` (the
         # call-time guard) exactly, in the same order.  Keep them in sync:
@@ -1083,10 +1093,13 @@ def backend_module(backend: str):
     if backend == "slate":
         from distrib_la import _slate
         return _slate
+    if backend == "elpa":
+        from distrib_la import _elpa
+        return _elpa
     if backend == "scalapack":
         from distrib_la import _scalapack
         return _scalapack
     raise ValueError(
         f"no FFI backend module named {backend!r} "
-        f"(known: cusolvermp, slate, scalapack, native2d, one_device; 'native' is "
+        f"(known: cusolvermp, slate, elpa, scalapack, native2d, one_device; 'native' is "
         f"jnp + the caller's own routes and has no module).")
