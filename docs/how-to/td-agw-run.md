@@ -137,6 +137,41 @@ so `tail -f` follows a running job. Its sections, in order:
 | progress | one row per chunk: samples, t (fs), wall (s), s/fs of the chunk, ETA (s), ΔΣ calls so far, \|P\|, n_c and \|E\| at the chunk's last sample, and the largest drift of Tr ρ and Tr ρ² | s/fs after the first row (which carries the compile); drifts near 1e-15 when Γ = 0 |
 | summary | stdout's summary plus ΔΣ per fs with and without the gate, steady s/fs, the gate's share, the ΔΣ wall's share of the run, the largest drifts, the final sample | the steady s/fs is the number to plan with |
 
+From the default run of the production 846 deck shortened to 3 fs (four A100s;
+`cfm4`, dt 50 as), the gate block, the progress table and the steady rate:
+
+```text
+  stability       : sigma = 6.208 eV (spectral radius of the dSigma commutator map, 20 power iterations, last change 0.025 %), h*sigma = 0.472, limit 0.73 (cfm4, cubic predictor, n_corr 2) -> dt <= 70.36 as; probe 1 per step at 62.5 as
+  gate verdict    :
+    sigma         : 6.20804 eV (spectral radius of the linearized dSigma commutator map; 20 power iterations, last change 0.025 %)
+    static limit  : h sigma 1.1 <= 0.73 (cfm4, cubic predictor, n_corr 2) -> dt <= 70.36 as; this step h sigma = 0.4716
+    probe         : dt 50 as -> probe step 62.5 as (1.25 dt), growth 1.000000 per step over 48 steps, field off: pass (<= 1.002); 35.87 s
+    chosen dt     : 50 as (the deck's)
+    gate cost     : 237 dSigma calls, 51.86 s (power iteration 41 calls 14.22 s + compile 1.42 s; 1 probe(s))
+
+  samples              t (fs)    wall (s)       s/fs    ETA (s)    dSigma    |P| (au)  n_c (/cell)   |E| (V/m)    dTr/Tr  dPur/Pur
+  --------------------------------------------------------------------------------------------------------------------------------
+  0-4                  0.5000       13.54     27.079       67.7        53   1.826e-13    1.443e-20   1.240e+00   0.0e+00   0.0e+00
+  5-9                  1.0000       20.33     13.587       27.2        93   4.694e-13    1.087e-19   3.236e+00   0.0e+00   0.0e+00
+  10-14                1.5000       27.13     13.586       20.4       133   1.237e-12    7.193e-19   8.186e+00   0.0e+00   0.0e+00
+  15-19                2.0000       33.91     13.577       13.6       173   3.078e-12    4.378e-18   2.007e+01   0.0e+00   0.0e+00
+  20-24                2.5000       40.70     13.574        6.8       213   7.421e-12    2.525e-17   4.770e+01   0.0e+00   0.0e+00
+  25-29                3.0000       47.49     13.574        0.0       253   1.727e-11    1.369e-16   1.099e+02   0.0e+00   0.0e+00
+  --------------------------------------------------------------------------------------------------------------------------------
+
+  steady s/fs     : 13.58 s per fs (chunks 2-6; the first, 13.54 s, carries the compile)
+```
+
+The first row carries the compile. Chunks 2–6 make 200 ΔΣ calls in 33.95 s over
+2.5 fs (80 calls and 13.58 s per fs), so one call costs at most 0.170 s,
+consistent with STEPLAB's isolated 0.161 s per call (the bound also carries the
+step's non-ΔΣ work). The gate's own figure in this run, 0.347 s, held the
+first-use builds of the new module's kconv kernels (a cold kernel cache); the
+summary prints the steady bound beside it for that reason. The field is still in
+the pulse's leading tail (≤ 110 V/m), so the drifts read 0: the populations moved
+by less than one part in 1e16 of Tr ρ, the check's resolution, and a zero there
+says nothing either way.
+
 The table's columns are fixed (`tdagw.td_log.PROGRESS_COLUMNS`), so
 `tdagw.td_log.parse_progress_row` reads any row back. Tr ρ and Tr ρ² are computed
 on the device at every sample with no ΔΣ call; both are invariants of the exact

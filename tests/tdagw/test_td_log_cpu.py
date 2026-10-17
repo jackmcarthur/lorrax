@@ -18,6 +18,8 @@ L6 the gate block: the measured wall of one dSigma call, the probes, the chosen 
    (auto); the split's basis
 L7 dp54: no gate, the dSigma wall bounded and not timed
 L8 a refused run's log still closes: the gate's line, the refusal message, REFUSED
+L9 the summary's bound on one dSigma call is the table's own steady window: the wall
+   of chunks 2-N over their dSigma calls
 R1 the same checker fails a log missing a section, a row shifted by one column and a
    stdout line the log lacks
 """
@@ -234,6 +236,18 @@ def test_dp54_has_no_gate(runs):
     assert "  stability gate  : none for dp54" in log
     assert "  one dSigma call : not timed" in log
     assert re.search(r"  dSigma wall     : <= [0-9.e+-]+ s per call", log)
+
+
+@pytest.mark.parametrize("tag", ["split", "plain", "dp54"])
+def test_steady_bound_from_table(runs, tag):
+    log = runs[tag]["log"]                                               # L9
+    rows = table_rows(log)
+    assert len(rows) > 1, tag
+    calls = rows[-1]["dsigma"] - rows[0]["dsigma"]
+    want = (rows[-1]["wall_s"] - rows[0]["wall_s"]) / calls        # chunks 2-N over their own calls
+    got = _floats(r"(?:bound it by|dSigma wall     :) <= ([0-9.e+-]+) s", log)
+    assert len(got) == 1, tag
+    assert abs(got[0] - want) <= 1e-3 * want + 0.011 / calls, (tag, got[0], want)
 
 
 def test_refused_run_log_closes(runs):
