@@ -1165,7 +1165,11 @@ constexpr int GITEMS = KG::NK * TPP;           // (k, pair) items of a tile
 constexpr int GMAX = 4;                        // items per thread held across A1 -> A2
 // A1 + A2.  Ends with a barrier.
 __device__ __forceinline__ void gather(lrx_c2* __restrict__ bank, const lrx_c2* __restrict__ gp,
-                                       const lrx_c2* __restrict__ gt, const UnfoldTab& t, const PInfo* __restrict__ pi) {
+                                       const lrx_c2* __restrict__ gt, const UnfoldTab& t, const PInfo* __restrict__ pi,
+                                       const int* __restrict__ lkf, const int* __restrict__ rkf) {
+#if !LRX_M7KF
+    (void)lkf; (void)rkf;
+#endif
     const lrx_c2* __restrict__ mph = reinterpret_cast<const lrx_c2*>(t.mph);
     const lrx_c2* __restrict__ nph = reinterpret_cast<const lrx_c2*>(t.nph);
     const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t.spin);
@@ -1188,8 +1192,13 @@ __device__ __forceinline__ void gather(lrx_c2* __restrict__ bank, const lrx_c2* 
                 const bool anti = t.trs[k] != 0;
                 vmask[u] = anti ? 1u << 16 : 0u;
                 src = ((anti && t.conj_trs == 0) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
+#if LRX_M7KF
+                load_ns(lkf + ((long long)p.xx * KG::NK + k) * NS, ls);    // the k-fastest copies
+                load_ns(rkf + ((long long)p.yy * KG::NK + k) * NS, rs);
+#else
                 load_ns(t.lsrc + (long long)k * t.ml + p.xx * NS, ls);
                 load_ns(t.rsrc + (long long)k * t.nl + p.yy * NS, rs);
+#endif
             }
 #pragma unroll
             for (int c = 0; c < NS; ++c) {
@@ -1350,6 +1359,46 @@ __device__ __forceinline__ void store_x(const lrx_c2* __restrict__ bank, lrx_c2*
     lrx_c2* yb, long long pb0, long long npairs, int phase, const int* __restrict__ live
 // live: the window rows [live[0], live[1]) of a padded pass (kbox_stage.cuh Live; null: all).
 #define M7_LIVE(zero) lrx_kbox::Live::rows(live, (t.nl / NR) * SSO, pb0 * SSO, zero)
+#ifndef LRX_M7KF
+#define LRX_M7KF 0
+#endif
+#if LRX_M7F && !LRX_TT && LRX_M7KF
+// The k-fastest copies of the endpoint index tables (LRX_M7KF; the host sets it where a tile holds at
+// most 4 pairs, so a warp's gather items span >= 8 k): lsrc (nk, ml) -> (ml / NS, nk, NS) and rsrc
+// (nk, nl) -> (nl / NS, nk, NS) in the call's scratch yb, so a warp's index loads read one run along k
+// per centroid instead of one sector per k.  A pure copy of the NS-int groups (the same values).
+template <int N> struct M7KfIdx;
+template <> struct M7KfIdx<1> { using T = int; };
+template <> struct M7KfIdx<2> { using T = int2; };
+using M7KfT = typename M7KfIdx<NS>::T;
+__device__ __forceinline__ long long m7kf_off(long long ml) { return (ml * KG::NK + 63) / 64 * 64; }   // ints
+__device__ __forceinline__ void m7kf_tile(const int* __restrict__ in, int* __restrict__ out, long long mc,
+                                          long long tile, M7KfT (&b)[32][33]) {
+    const M7KfT* __restrict__ iv = reinterpret_cast<const M7KfT*>(in);
+    M7KfT* __restrict__ ov = reinterpret_cast<M7KfT*>(out);
+    const long long tn = (mc + 31) / 32, k0 = (tile / tn) * 32, i0 = (tile % tn) * 32;
+    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    for (int r = ty; r < 32; r += 8) {
+        const long long k = k0 + r, i = i0 + tx;
+        if (k < KG::NK && i < mc) b[r][tx] = iv[k * mc + i];
+    }
+    __syncthreads();
+    for (int r = ty; r < 32; r += 8) {
+        const long long i = i0 + r, k = k0 + tx;
+        if (k < KG::NK && i < mc) ov[i * KG::NK + k] = b[tx][r];
+    }
+}
+// 256 threads; blocks [0, nbl) transpose lsrc, the rest rsrc (the host sums the same tile counts).
+extern "C" __global__ void __launch_bounds__(256) lrx_kconv_kf(M7_ARGS) {
+    __shared__ M7KfT buf[32][33];
+    (void)gp; (void)gt; (void)kern; (void)y; (void)scale; (void)pb0; (void)npairs; (void)phase; (void)live;
+    const long long mcl = t.ml / NS, mcr = t.nl / NS, tk = (KG::NK + 31) / 32;
+    const long long nbl = tk * ((mcl + 31) / 32);
+    int* outl = reinterpret_cast<int*>(yb);
+    if ((long long)blockIdx.x < nbl) m7kf_tile(t.lsrc, outl, mcl, blockIdx.x, buf);
+    else m7kf_tile(t.rsrc, outl + m7kf_off(t.ml), mcr, blockIdx.x - nbl, buf);
+}
+#endif
 #if LRX_ARM >= 1
 extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(M7_ARGS) {
     extern __shared__ lrx_c2 sm[];
@@ -1445,7 +1494,12 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(M7
     if (col0 < ce) m7f::fill_pinfo(pinfo[0], sp, col0);
     __syncthreads();
     for (int par = 0; col0 < ce; col0 += cstep, par ^= 1) {
-        m7f::gather(sm, gp, gt, t, pinfo[par]);
+#if LRX_M7KF
+        m7f::gather(sm, gp, gt, t, pinfo[par], reinterpret_cast<const int*>(yb),
+                    reinterpret_cast<const int*>(yb) + m7kf_off(t.ml));
+#else
+        m7f::gather(sm, gp, gt, t, pinfo[par], nullptr, nullptr);
+#endif
         m7f::pass_z<fft_direction::inverse>(sm);
         m7f::pass_y<fft_direction::inverse>(sm);
         m7f::mid_x(sm, kern, sp, pinfo[par]);
@@ -1837,6 +1891,97 @@ struct WedgeLoad {
     }
 };
 
+#ifndef LRX_W2
+#define LRX_W2 0
+#endif
+#if LRX_W2
+// The batched gather of a scalar interaction (n_l = n_r = 1, single arm; the host sets LRX_W2): the
+// same lanes as lrx_unfold_direct (TRC consecutive pairs of one k, so the right tables and sources are
+// runs), but a thread's items are issued together -- eight index sets at a time, each raw source by
+// cp.async straight into its bank cell -- and finished from the bank in batches of four, so the
+// load has a few dependent rounds per tile instead of two per item.  The products and their order
+// are lrx_unfold_pair's and lrx_spin_row's.
+static_assert(NS == 1 && NR == 1, "the batched gather serves a scalar interaction");
+#ifndef LRX_MINB9
+#define LRX_MINB9 2
+#endif
+static_assert(LRX_THREADS % TRC == 0, "a thread keeps one pair of the tile");
+struct WedgeLoadW2 {
+    static constexpr bool kDirect = true, kFinish = false;
+    const lrx_c2 *gp, *gt;
+    const UnfoldTab* t;
+    long long my;
+    template <class View>
+    __device__ void direct(const View& view, int k0, int k1, long long col0, int width,
+                           long long ncols) const {
+        (void)k0; (void)k1; (void)width;
+        // Batches sized to the register budget of the blocks the tile's shared memory admits
+        // (LRX_MINB9): <= 2 blocks of 256 threads leave 128 registers a thread.
+        constexpr int KS = LRX_THREADS / TRC, NU = (NK + KS - 1) / KS;
+        constexpr int B = 8, BF = LRX_MINB9 <= 2 ? 4 : 2;
+        const int j = threadIdx.x % TRC, kq = threadIdx.x / TRC;
+        const long long ml = t->ml, nl = t->nl, pr = col0 + j;
+        const bool pl = pr < ncols;
+        const long long xx = pl ? pr / my : 0, yy = pl ? pr - (pr / my) * my : 0;
+        const lrx_c2* __restrict__ mph = reinterpret_cast<const lrx_c2*>(t->mph);
+        const lrx_c2* __restrict__ nph = reinterpret_cast<const lrx_c2*>(t->nph);
+        const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t->spin);
+        const lrx_c2* __restrict__ spin_r = reinterpret_cast<const lrx_c2*>(t->spin_r ? t->spin_r : t->spin);
+        for (int u0 = 0; u0 < NU; u0 += B) {
+            int ls[B], rs[B], rw[B];
+            bool an[B];
+#pragma unroll
+            for (int b = 0; b < B; ++b) {
+                const int k = kq + (u0 + b) * KS;
+                const bool kl = u0 + b < NU && k < NK;
+                const int kk = kl ? k : 0;
+                an[b] = t->trs[kk] != 0;
+                rw[b] = t->row[kk];
+                ls[b] = kl ? t->lsrc[(long long)kk * ml + xx] : -1;
+                rs[b] = t->rsrc[(long long)kk * nl + yy];
+            }
+#pragma unroll
+            for (int b = 0; b < B; ++b) {
+                const int k = kq + (u0 + b) * KS;
+                if (u0 + b < NU && k < NK) {
+                    const lrx_c2* src = ((an[b] && t->conj_trs == 0) ? gt : gp) + (long long)rw[b] * ml * nl;
+                    const bool v = pl && ls[b] >= 0 && rs[b] >= 0;
+                    lrx_async::cell16(&view(k, j), v ? src + (long long)ls[b] * nl + rs[b] : gp, v);
+                }
+            }
+        }
+        lrx_async::commit();
+        lrx_async::wait_all();
+        for (int u0 = 0; u0 < NU; u0 += BF) {
+            lrx_c2 mp[BF], nq[BF], uu[BF], ur[BF];
+            bool cr[BF];
+#pragma unroll
+            for (int b = 0; b < BF; ++b) {
+                const int k = kq + (u0 + b) * KS;
+                const int kk = (u0 + b < NU && k < NK) ? k : 0;
+                cr[b] = t->trs[kk] != 0 && t->conj_trs == 1;
+                mp[b] = mph[(long long)kk * ml + xx];
+                nq[b] = nph[(long long)kk * nl + yy];
+                uu[b] = spin[kk];
+                ur[b] = spin_r[kk];
+            }
+#pragma unroll
+            for (int b = 0; b < BF; ++b) {
+                const int k = kq + (u0 + b) * KS;
+                if (u0 + b < NU && k < NK) {
+                    lrx_c2 g = lrx_mulf(lrx_mulf(mp[b], view(k, j)), nq[b]);
+                    if (cr[b]) g.y = -g.y;
+                    lrx_c2 left = {0.0, 0.0}, out = {0.0, 0.0};
+                    lrx_cmac(left, uu[b], g);
+                    lrx_cmac_conj(out, left, ur[b]);
+                    view(k, j) = out;
+                }
+            }
+        }
+    }
+};
+#endif
+
 struct WedgeStore {
     lrx_c2* y;
     const UnfoldTab* t;
@@ -1856,13 +2001,20 @@ struct WedgeScale {                            // the split arm's last axis: the
 
 // live: the window rows [live[0], live[1]) of a padded pass (null: all); a row is my * SS tile
 // columns, and as many of Y's own columns (the split arm's pencil).
-extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
+#ifndef LRX_MINB9
+#define LRX_MINB9 1
+#endif
+extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB9) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, lrx_c2* __restrict__ y,
     UnfoldTab t, double scale, int phase, const int* __restrict__ live) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
     const long long my = t.nl / NR, ncols = (t.ml / NS) * my * SS;
+#if LRX_W2
+    const WedgeLoadW2 ld{gp, gt, &t, my};
+#else
     const WedgeLoad ld{gp, gt, &t, my};
+#endif
 #if LRX_ARM == 0
     (void)phase;
     const WedgeStore st{y, &t, my, scale};
@@ -1871,7 +2023,29 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
     for (long long c0 = lv.b() + (long long)blockIdx.x * TRC; c0 < ce; c0 += (long long)gridDim.x * TRC) {
         lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ce, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ce, st);
+        // (not beside the 4-block batched gather, LRX_MINB9 4: 6^3 measured 1.05x slower with it)
+        if constexpr (LRX_THREADS % TRC == 0 && !(LRX_W2 && LRX_MINB9 > 2)) {
+            // store_tile with each thread's column fixed: its (pair, A, B) offset once per tile, then
+            // k-steps of the row stride ml*nl.  WedgeStore::put's elements and scale: bitwise.
+            using G = lrx_kbox::Geo<NX, NY, NZ>;
+            const int j = threadIdx.x % TRC;
+            const long long c = c0 + j;
+            if (c < ce) {
+                const long long pr = c / SS, xx = pr / my, yy = pr - xx * my;
+                const int a = (int)((c % SS) / NR), b = (int)(c % NR);
+                lrx_c2* y0 = y + (xx * NS + a) * t.nl + yy * NR + b;
+                const long long ks = t.ml * t.nl;
+                const lrx_c2* colp = sm + j * G::RS;
+#pragma unroll 4
+                for (int k = threadIdx.x / TRC; k < G::NK; k += LRX_THREADS / TRC) {
+                    const lrx_c2 v = colp[G::at(k)];
+                    y0[k * ks] = {v.x * scale, v.y * scale};
+                }
+            }
+            __syncthreads();
+        } else {
+            lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ce, st);
+        }
     }
     lrx_kbox::zero_dead<lrx_kbox::Geo<NX, NY, NZ>::NK, lrx_c2>(ncols, lv, st);
 #else
@@ -2359,7 +2533,9 @@ struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile
                // W_R chunk pass (phase 4), tiles of trw columns at threads3 / smem3.
                int trw = 0, threads3 = 0, smem3 = 0;
                // Mode 7, split arm: the mid (fn2 at threads2) and pass (fn3 at threads3 / smem3) entries.
-               CUfunction fn2 = nullptr, fn3 = nullptr; };
+               CUfunction fn2 = nullptr, fn3 = nullptr;
+               // Mode 7, m7f: k-fastest index-table copies (LRX_M7KF), fn2 their per-call transpose.
+               int m7kf = 0; };
 // A split arm's plane tile of whole groups of ss columns.  Every caller (modes 7, 8, 9 and mode 8's
 // W_R chunk) passes wide: the most whole groups the opt-in memory holds, one block per SM.  The
 // non-wide branch (two blocks per SM) is unused; at CrI3 24x24 it measured 1.09-1.12x per mode-8
@@ -2645,7 +2821,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // admits, at most two (Fe 8^3: 2 x 512 threads at <= 64 registers; unbounded, NVCC took 95 and
     // held one block per SM).
     const int blk = (mode == 7 && variant > 0) ? variant : ns;    // mode 7's output spin block
-    int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0, m7_arm = 0, m7_mid = 0, m7_pass = 0;
+    int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0, m7_arm = 0, m7_mid = 0, m7_pass = 0, m7_kf = 0;
     long long m7_smem = 0, m7_col_smem = 0;
     if (mode == 7) {
         // Whole spin groups per tile: the single arm when a block holds a group of two or more
@@ -2796,11 +2972,34 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_THREADS=" + std::to_string(m7_threads));
         // The fused single-arm tile (m7f, embedded source): the register load of whole groups, n_s <= 2.
         defs.push_back("-DLRX_M7F=" + std::string(m7_arm == 0 && m7_tp == 0 && blk == ns && ns <= 2 ? "1" : "0"));
+        // m7f's k-fastest index tables: where a tile holds <= 4 pairs (a warp's gather items span >= 8 k).
+        m7_kf = (m7_arm == 0 && m7_tp == 0 && blk == ns && ns <= 2 && m7_tr / (ns * ns) <= 4) ? 1 : 0;
+        defs.push_back("-DLRX_M7KF=" + std::to_string(m7_kf));
         if (m7_arm) defs.push_back("-DLRX_THREADS2=" + std::to_string(m7_mid));
         if (m7_arm == 1) defs.push_back("-DLRX_THREADS3=" + std::to_string(m7_pass));
     }
     if (kbox_rows || mode == 8) {
         defs.push_back("-DLRX_ARM=" + std::to_string(kb_arm));
+        // Mode 9's batched gather (LRX_W2): a scalar interaction on the single arm, sm_80+ cp.async.
+        if (mode == 9) {
+            // From nk = 128 (a 4^3 box: 0.93x, its 4 items a thread leave nothing to batch).  Two
+            // blocks a SM bound the registers at 128 (batches of 8 and 4); below nk = 256 four
+            // blocks where the tile admits them (64 registers, batches of 8 and 2): a small box
+            // hides its latency by occupancy.  Measured A100, scalar W, ms per call (base -> W2):
+            // 6^3 0.338 -> 0.296 at 4 blocks (0.387 at 2); 8^3 1.359 -> 0.981 at 2 (1.011-1.221 at 4).
+            const bool w2 = kb_arm == 0 && ns == 1 && nsr == 1 && cc_major >= 8 && kb_threads % kb_tr == 0 &&
+                            nk >= 128;
+            defs.push_back("-DLRX_W2=" + std::string(w2 ? "1" : "0"));
+            if (w2) {
+                int smem_sm = 0, smem_rsv = 0;
+                LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
+                               "shared memory per SM");
+                LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
+                               "reserved shared memory per block");
+                const long long nb = smem_sm / (kb_smem + smem_rsv);
+                defs.push_back("-DLRX_MINB9=" + std::to_string(nk < 256 && nb >= 4 ? 4 : 2));
+            }
+        }
         defs.push_back("-DLRX_TR=" + std::to_string(kb_tr));
         defs.push_back("-DLRX_TY=" + std::to_string(kb_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(kb_threads));
@@ -2844,6 +3043,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     prog.kernel = "lrx_kconv";
     if (mode == 7 && m7_arm == 1) prog.entries = {"lrx_kconv_mid", "lrx_kconv_pass"};
     if (mode == 7 && m7_arm == 2) prog.entries = {"lrx_kconv_col"};
+    if (mode == 7 && m7_kf) prog.entries = {"lrx_kconv_kf"};
     if (mode == 8 && kb_arm == 1) prog.entries = {"lrx_kconv_heavy"};
     if (mode == 11 && kplan.arm == 1) prog.entries = {"lrx_kconv_pencil"};
     std::string missing;
@@ -2922,6 +3122,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         }
         if (m7_arm == 2) b.smem2 = static_cast<int>(m7_col_smem);
         if (m7_tp) b.grid_cap = static_cast<long long>(sms) * m7_blocks;
+        if (m7_kf) { b.fn2 = img.fns[0]; b.m7kf = 1; }
     }
     if (mode == 10) {                                  // persistent blocks: the resident count
         int sms = 0;
@@ -3299,6 +3500,20 @@ static ffi::Error KleadUnfoldImpl(
     };
     if (k->arm == 0) {
         long long blocks = (ncols + k->tr - 1) / k->tr;                 // one block per tile
+        if (k->m7kf) {                                 // m7f's k-fastest index tables, made for this call
+            const long long nint = (ml * nk + 63) / 64 * 64 + nl * nk;   // the embedded m7kf_off layout
+            auto tb = scratch.Allocate(static_cast<size_t>(4 * nint));
+            if (!tb.has_value()) {
+                std::ostringstream os;
+                os << "GATE mathdx-kconv-unfold-scratch: got a refused " << 4 * nint
+                   << " B k-fastest index copy; want the XLA scratch allocator to grant it";
+                return fail("scratch", os.str(), ffi::ErrorCode::kResourceExhausted);
+            }
+            yb = *tb;
+            const long long tk = (nk + 31) / 32;
+            const long long nb = tk * ((ml / ns + 31) / 32) + tk * ((nl / ns + 31) / 32);
+            if (auto e0 = launch(nb, 256, 0, k->fn2); !e0.success()) return e0;
+        }
         if (k->grid_cap > 0) blocks = std::min(blocks, k->grid_cap);   // the tile tables' persistent grid
         return launch(blocks, k->threads, k->smem, k->fn);
     }
