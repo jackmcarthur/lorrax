@@ -1,100 +1,135 @@
-# ROCm one-device complex128 LU wrong answer: root cause and fix
+# ROCm one-device LU wrong answer: root cause, fix, audit
 
-Branch `rocm/lufix` (Frontier `~/wt/lufix`, commit `efed2af70` on main `4bae15f55`, **not pushed**).
-Patch: `rocm_lufix.patch` (12 files, +700/-17). Harnesses and all step logs: `lurc_harness_and_logs.tgz` (Frontier `~/lurc/`).
-Compute: 2 debug jobs × 1 node (5697579 51.5 min, 5697676 8.3 min) = **0.99 node-h** of the 1.5 node-h budget.
+**Branch:** `rocm/lufix` (Frontier `~/wt/lufix`, **not pushed**), 4 commits on main `4bae15f55`:
+
+| commit | content |
+|---|---|
+| `efed2af70` | LU route |
+| `3b457db38` | report |
+| `3ac2e4f8d` | triangular routes, f32/c64, round budget, audit |
+| this report | this report |
+
+**Patch:** `rocm_lufix.patch`. **Upstream draft (not filed):** `ROCBLAS_TRSM_UPSTREAM_DRAFT.md` and `trsm_repro.cpp`. **Harnesses and every step log:** `lurc_harness_and_logs.tgz`.
+
+**Compute:**
+
+| round | jobs | time | node-h |
+|---|---|---|---|
+| 1 | 5697579 (frontier07938) 51.5 min; 5697676 (frontier08572) 8.3 min | | 0.99 |
+| 2 | 5697722 (frontier00513) 25.0 min; 5697770 pinned to frontier07938, cancelled before it started | | 0.42 |
 
 ## Deviations / scope
-- **Fe P=4 bitwise** was run with this branch's Python and **main's** FFI library (`LORRAX_FFI_ROCM_SO` = int10 build). Fe with this branch's own rebuilt `.so` did not finish: it hung in "ISDF basis". **Main hangs the same way** with a cold `ISDF_JAX_CACHE_DIR` (details below), so the hang belongs to main. This is still provisional: I did not root-cause it.
-- **hsuite P=4** ran the same way (branch Python, main `.so` via `SO_ROCM`). The new handler is never called at Fe/hsuite sizes, because the span rule keeps n=312 on `jnp.linalg.solve`.
-- No SLATE timings at n > 16384 (the comparison through 16384 comes from the existing log `distla_lubigs`). There is no P=4 run of the `one_device` route at n > 8192. Large n was gated only through the standalone local solve.
-- The cross-version check against `/opt/rocm-10.0.0` failed to run. Its rocBLAS on this driver gives `hipErrorInvalidImage` and a segfault, so I have no upstream verdict.
-- The f64 `jnp.linalg.eigh` audit at n=24576 did not finish in about 17 min, and I cancelled it. That is unexplained and provisional; it may be slow, not wrong.
+- **The hang mechanism on frontier07938 is not root-caused.** That node was allocated to another user for about 1.5 h, so I could not attach py-spy to a hung rank there. What I did establish (section 4): the hang is specific to that node and to a cold compile cache, it affects main the same way, and it is absent on a healthy node.
+- The f64 `jnp.linalg.eigh` audit at n = 24576 does not finish. A py-spy dump shows it stuck **inside XLA compile** (`CompileAndLoad`) after 12 min, with one GCD at 100% use. This was reproduced on two nodes and is unresolved (section 5).
+- There are no SLATE timings at n > 16384. The one_device route was not run at P=4 for n > 8192; large n was gated through the standalone local solves.
+- The cross-version check against `/opt/rocm-10.0.0` cannot run on this driver.
 
-## 1. Root cause: rocBLAS trsm, not rocSOLVER getrf and not jaxlib
-The lead hypothesis was partly right: the bug is a 2^31-**byte** offset. But it is in rocBLAS `{z,d}trsm`, left side, **in-place blocked path**. It is not in getrf, not in the 32-bit API, and not in jaxlib.
+## 1. Root cause (rocBLAS trsm, not rocSOLVER getrf, not jaxlib)
+The defect is in `rocblas_{s,d,c,z}trsm`, side left, on its **in-place blocked path**. rocBLAS takes that path when m is a multiple of 128 and the RHS is wide; its workspace is about 160·m elements, against m·(nrhs+128) for the copy path.
+- **Condition:** it returns a wrong X with status 0 when **(m − 128)(m + 1)·sizeof(T) ≥ 2^31**, i.e. once the byte offset of the last 128-wide diagonal block of A crosses 2^31.
+- **Not the int32 API:** `rocblas_ztrsm_64`, `rocsolver_zgetrs` and `rocsolver_zgetrs_64` are equally wrong.
+- **Factorization is fine:** `rocsolver_?getrf` was exact at every size measured.
+- **Confirmed for all four dtypes** by the minimal repro (rocBLAS 5.5.0.cd957402), with exactly the predicted pairs:
 
-Evidence (one MI250X GCD, ROCm 7.14.1 wheels, rocSOLVER 3.35, rocBLAS `.so.5`):
-1. **getrf is exact everywhere.** The JAX probe measured ‖PA−LU‖/‖A‖ = 1.5e-13 (c128 12288) and 2.0e-13 (c128 16384). Pivots were valid and `perm` matched `piv`. The C++ harness gave the same factors from `rocsolver_zgetrf`, `rocsolver_zgetrf_64` and `hipsolverZgetrf` (jaxlib's call), with factor_rel ≤ 2.4e-12 through c128 16384 and f64 20480. jaxlib's workspace query matched rocBLAS's (e.g. 135,596,288 B at 16384).
-2. **A narrow RHS is exact; a wide RHS is wrong.** `jnp.linalg.solve` with 4 RHS is exact at c128 16384 (3.4e-15). With B = n×n (the `distla_lubig` setup) it is wrong: c128 11776 gives 4.8e-3, 12288 gives 8.5e-3, 16384 gives 7.7e-3. A blocked GEMM check shows the residual GEMM itself is exact (1.9e-15).
-3. **The triangular solve alone fails** (XLA TriangularSolve on an LU factor). At c128 12288 it is exact at nrhs 1 and 512 and wrong at nrhs ≥ 1024. At 16384 it is exact at nrhs ≤ 384 and wrong at ≥ 512. In the L solve the bad rows are the last 1280 (11008–12287).
-4. **rocBLAS reproduces it directly** (`rs_trsm.cpp`). `rocblas_ztrsm` gives 8.6e-3 at (12288, 4096) with library-managed workspace, a capped workspace or none, and with status 0. **`rocblas_ztrsm_64`, `rocsolver_zgetrs` and `rocsolver_zgetrs_64` are equally wrong.** So the int32 API is not the cause.
-5. **Which path runs, and the threshold.** Failing cases use the small-workspace in-place path (about 160·m elements). It is taken when m is a multiple of 128 and the RHS is wide. Cases that use the copy-B path (workspace m·(nrhs+128)) are exact even at large n (c128 11616/11649/11680/11712; f64 16416/23200).
-   - The threshold is a byte offset crossing 2^31. Wrong exactly when (m−128)(m+1)·itemsize ≥ 2^31, i.e. the 128-block diagonal offset of A.
-   - c128: 11648 exact (2,147,143,680 B) and 11776 wrong.
-   - f64: 16384 exact and 16512 wrong; 20480 and 24576 wrong.
-   - The prediction was made before the f64 16512 run and confirmed by it.
-6. The original `distla_lubig` facts all fit:
-   - c128 11616 was exact because 11616 is not a multiple of 128, so rocBLAS took the copy path.
-   - f64 16384 was exact because it sits just under the threshold.
-   - 12288 and 16384 were wrong.
-   - The bug is not specific to complex128: f64 fails from n = 16512.
+| dtype | exact at | wrong at | residual when wrong |
+|---|---|---|---|
+| z | 11648 | 11776 | 6.9e-2 |
+| d | 16384 | 16512 | 3.2e-2 |
+| c | 16384 | 16512 | 4.5e-2 |
+| s | 23168 | 23296 | 3.3e-2 |
 
-## 2. Fix: a span-blocked path in LORRAX's FFI
-- **`src/ffi/cpp/rocsolver/lu_solve_ffi.cc`** (ROCM leg; rocSOLVER/rocBLAS are resolved from the mapped `librocsolver.so.0`, like the eigh handler) adds target `lorrax_rocsolver_lu_solve`:
-  - It runs `rocsolver_{z,d}getrf` on the row-major A read as Aᵀ, with no transpose of A.
-  - It then solves X = P L⁻ᵀ U⁻ᵀ B by a blocked trsm (op T, diagonal blocks nb) plus GEMM updates, and finishes with `laswp`, incx = −1.
-  - **Rule:** no rocBLAS/rocSOLVER call receives an operand spanning ≥ 2^31 bytes from its own pointer. With L = INT32_MAX/itemsize:
-    - nb = min(1024, ⌊L/n⌋);
-    - RHS chunks of kc columns satisfy (kc−1)n + n ≤ L;
-    - GEMM row chunks satisfy (rows−1)n + k ≤ L.
-  - Offsets are formed in 64-bit arithmetic in the handler.
-  - Workspace comes from XLA scratch, sized by one rocBLAS size-query pass. There are no syncs.
-- **`distrib_la/local_lu.py`** (`LOCAL_LU_ROUTE`, ROCM only; the CUDA cuSOLVER LU was measured exact through 16384, so CUDA has no row):
-  - `solve_local` sends a system whose A or B spans **more than 2^31 bytes** to the handler, so every rocBLAS offset stays below 2^31. Otherwise it calls `jnp.linalg.solve` unchanged, so Fe sizes are bit-for-bit main.
-  - If the target is missing it refuses with `GATE local_lu_target`.
-  - Both `jnp.linalg.solve` call sites in `_batch_reshard.py` now call it.
-- Registered in `distrib_la.loader`, `ffi_loader`, `CMakeLists.txt`, the `families` row and `test_platform_legs`. No env vars and no XLA flags.
-- **`ONE_DEVICE_MAX_N[('solve_lu','ROCM')]`: 8192 → 27427.** The rule (stated in `resolve.py`) is one GCD's capacity: isqrt(allocator `bytes_limit` 60,183,563,895 B ÷ priced 5·n²·16 B).
-  - There is no speed crossover:
+- The same pairs hold through `jnp.linalg.solve` with nrhs = n, as relative residuals:
 
-    | n (c128) | one-device | SLATE 2x2 |
+| dtype | at the exact size | at the wrong size |
+|---|---|---|
+| c128 | 1.1e-14 | 4.8e-3 |
+| f64 | 6.2e-15 | 2.0e-3 |
+| c64 | 8.0e-6 | 2.1e-3 |
+| f32 | 4.5e-6 | 1.5e-3 |
+
+## 2. Fix
+- **Handlers.** `src/ffi/cpp/rocsolver/lu_solve_ffi.cc` (ROCM leg; rocSOLVER/rocBLAS resolved from the mapped `librocsolver.so.0`; s, d, c, z) provides two targets:
+  - `lorrax_rocsolver_lu_solve`: getrf on the row-major A read as Aᵀ, then the blocked solve.
+  - `lorrax_rocsolver_tri_solve`, three modes:
+    1. apply jax's `(lu, piv)`;
+    2. solve L x = b;
+    3. solve Lᵀ x = b (Lᴴ is mode 3 on conj(b), with the conjugation fused into the layout copy).
+  - **Rule:** no rocBLAS/rocSOLVER call gets an operand spanning ≥ 2^31 bytes from its own pointer:
+    - nb = min(1024, ⌊L/n⌋), with L = INT32_MAX/itemsize;
+    - RHS chunks satisfy (kc−1)n + n ≤ L;
+    - transposed-panel GEMM row chunks satisfy (rows−1)n + k ≤ L.
+  - Offsets are formed in 64-bit arithmetic. There are no syncs, workspace comes from XLA scratch, and there are no env vars or XLA flags.
+- **Route.** `distrib_la.local_lu` (exported from `distrib_la`):
+  - `solve_local`, `lu_solve_local` and `tri_solve_local` route a system whose A or B spans **more than 2^31 bytes**. That is a superset of the defect's condition at every n, which a CPU test asserts for m ≤ 40000.
+  - Each takes the caller's **original call** as its below-span `native`, so every site is unchanged bit for bit below the span.
+  - ROCM only: the CUDA cuSOLVER LU was measured exact through 16384.
+- **Size rows** (`resolve.py`):
+  - `ONE_DEVICE_MAX_N[('solve_lu','ROCM')]` = **27427**, the capacity of one GCD: isqrt(allocator `bytes_limit` 60,183,563,895 B ÷ the priced 5·n²·16 B).
+  - There is no SLATE crossover: one-device takes 0.72, 1.53 and 4.10 s against SLATE 2×2's 3.63, 10.4 and 16.1 s at n = 8192, 12288 and 16384.
+  - c128 28672 ran (22.7 s); 30720 runs out of memory.
+- **Owner peak rule.** The new `ONE_DEVICE_ROUND_N` keeps main's per-round element allowance: solve_lu 8192², eigh 16384². `one_device_round_n` = min(selection bound, round row), and it is applied in `_one_device`, `plan._incumbent` and `workspace`.
+  - **Effect:** a room-less (or any) stack gets main's round count exactly. A single matrix with 8192 < n ≤ 27427 goes one-device, one matrix per rank per round.
+  - **Test** `test_room_less_round_counts_are_mains`: P = 4 and 16 on the Fe/hsuite stacks (64×312, 16×312, 4×96) and on binding stacks (256×2048, 64×4096, 8×8192, eigh 256×4096). Round counts equal main's, both directly and through `plan._incumbent`. At (256×2048, P = 4) main runs 4 rounds and 27427 alone would give 1, so the budget binds there.
+
+## 3. Audit: device trsm-reaching call sites (`src/`, `services/`)
+**Routed through `local_lu`.** Their n is the ISDF μ count or a basis size, so any of them can span ≥ 2^31 B once n ≳ 11.6k (c128):
+- `gw/w_isdf` Dyson local LU (`lu_factor` + `lu_solve`);
+- `isdf/core`: `jnp.linalg.solve(L_reg, Z)`, `lu_solve` (ζ back-solve), and the `lu_solve` on the backward-error probe vector;
+- `isdf/galerkin`: `solve_triangular` ×2. The vmapped one becomes one column-batched solve on the routed path only;
+- `common/zeta_projection`: the L and Lᴴ triangular solves;
+- `bse/w_ladder`: T(I−T)⁻¹;
+- `distrib_la/_native2d`: the panel `solve_triangular` (tiles of a 2-D Cholesky can be large at small P).
+
+**Bounded by shape (no change):**
+- `gw/head_correction`, `gw/photon_direct_head`: 4×4.
+- `gw/mpa/pade_fit`: Padé order.
+- `mixing/acceleration`: history depth.
+- `psp/vnl_ops`: `inv` of the 3×3 lattice.
+- All `np.linalg` / mpmath calls: host LAPACK.
+
+**FFI:**
+- SLATE trsm (device and host): SLATE calls BLAS per tile on tile allocations (nb ≤ 512), so each operand spans at most nb·max(nb, …)·16 B ≪ 2^31. **This answers the Dist LA question: SLATE's trsm cannot hit this overflow.** The full blocking of every SLATE path at n = 20k–51k is argued from the tile layout, not measured.
+- cuSOLVERMp / ScaLAPACK: not ROCm.
+- The rocsolver eigh FFI: heevd/syevd make no left-side trsm call with large m.
+- Cholesky factorization itself (`jnp.linalg.cholesky`, rocSOLVER potrf) was not separately gated at large n. Only the triangular solves that follow it are routed.
+
+## 4. The ISDF-basis hang (round 1)
+- **frontier07938:** every Fe P=4 run with a **cold** cache namespace hung in "ISDF basis" (5 of 5): the branch library ×3, the branch library without the new TU, and **main's library with a fresh `FE_CACHE`**. Runs with a warm namespace passed (3 of 3, main's library). gdb on hung ranks shows every rank in `BlockUntilReady` / `AwaitBuffersReady` (device execution, not compile).
+- **frontier00513 (round 2):** cold and warm runs, with the branch's own library and with main, all pass (ISDF basis 22.7 s cold for the branch, 12.2 s cold for main).
+- **Ruled out:**
+  - the hipRTC kernel store: built and stored in 0.9 s, and stored by atomic rename;
+  - the lxffi key and closure: main's library hung the same way;
+  - build or cache locks: none exist on that path.
+- **Remaining explanation (provisional):** a node or GCD fault on frontier07938 that only fresh compilations expose. The likely trigger is device-side autotuning choosing kernels that hang there, while cached executables were tuned on healthy nodes. This matches the existing frontier05345 entry in the pool README.
+- **Recommendation:** add frontier07938 to the pool's `--exclude` list.
+
+## 5. eigh: `('eigh','ROCM')` 16384
+c128 zheevd is exact at 20480 (60.5 s, 35.2 GB) and 24576 (120 s, 50.75 GB). **16384 is a measured-coverage bound, not a correctness bound.** f64 at 24576: compile never finishes (see Deviations), so the f64 side of the row above 16384 is unaudited.
+
+## 6. Gates (round 2, final code, frontier00513)
+- **Device gate** (`python -m tests.test_rocsolver_lu_gate --big --thresholds`): all PASS.
+  - LU, routed:
+
+    | dtype | n | relative residual |
     |---|---|---|
-    | 8192 | 0.72 s | 3.63 s |
-    | 12288 | 1.53 s | 10.4 s |
-    | 16384 | 4.10 s | 16.1 s |
+    | c128 | 11776 / 12288 / 16384 / 20480 / 27427 | 6.8e-15 / 7.2e-15 / 8.1e-15 / 8.9e-15 / 1.0e-14 |
+    | f64 | 16512 / 20480 | 3.4e-15 / 3.7e-15 |
+    | c64 | 16512 | 4.4e-6 |
+    | f32 | 23296 | 2.1e-6 |
 
-  - Measured capacity: one-device runs at 20480 (6.2 s), 24576 (13.3 s), 26624 (14.2 s) and 28672 (22.7 s, peak 52.9 GB). 30720 is out of memory.
-  - A caller's room still caps the route.
-  - **Owner decision needed:** the row is also the rounds' element budget. A no-room caller with a large stack of small matrices now gets up to 27427² elements per round (main allowed 8192²). Room-passing callers (`w_isdf`, `response_bank`) are bounded by the size-route room check for one matrix only. I did not move ROCM to `ONE_DEVICE_BY_ROOM`, because that would make SLATE the incumbent and slow main by 3–7×.
-
-## 3. Gates
-- **Standalone on one GCD** (`python -m tests.test_rocsolver_lu_gate --big`: PASS on all 13 cases, relative residual ≤ 1.1e-14):
-  - Handler forced at small n: 312×16 c128 2.0e-16; f64 batch; nrhs 3, 100, 5000; n = 4097. Each is within about 2× of `jnp.linalg.solve`'s residual on the same GCD.
-  - Routed at large n: c128 11776 6.8e-15, 12288 7.2e-15, 16384 8.1e-15, 20480 8.9e-15, 27427 1.0e-14; f64 16512 3.4e-15, 20480 3.7e-15.
-  - The native path at those sizes stays wrong: c128 12288 8.5e-3, f64 16512 1.8e-3.
-- **Speed and peak, same harness:**
-
-  | case | handler | native |
-  |---|---|---|
-  | c128 8192 | 0.715 s, peak 4.36 GB | 0.934 s, peak 6.46 GB |
-  | c128 4096 | 0.128 s, peak 1.11 GB | 0.128 s, peak 1.90 GB |
-  | f64 16384 | 2.71 s, peak 8.66 GB | 3.64 s, peak 11.28 GB |
-
-  Per-call device peak is lower because A is not transposed.
-- **Fe P=4** (branch Python, main `.so`) vs main: eqp0/eqp1 max|d| = 0.0 eV; `sigma_mnk.h5` (14 datasets) and `qp_wfn_rotations.h5` (10) are `array_equal`. `cmp.py` flags the eqp text as "DIFFER", but every numeric field matches. Rank-0 device peak is 6.77 GB on both, and the route lines are unchanged (solve_lu 64×312×312 one_device, 1 round). The per-stage device table is empty on this allocator, so per-stage peak equality was not shown.
-- **hsuite P=4:** PASS (398.7 s; branch Python, main `.so`).
-- **CPU pytest** (`JAX_PLATFORMS=cpu`, 4 host devices): `test_rocsolver_lu_gate`, `test_distrib_la_one_device{,_measured,_room}`, `test_platform_legs` and `test_rocsolver_eigh_gate` pass. The exception is `test_platform_legs::test_the_rocm_leg_is_declared_and_refused_by_its_file_name`, which **fails identically on main** in a checkout with a built `.so`.
-- **ROCm pytest** for the gate file: 6 passed, including the GPU regression `test_large_n_route_is_exact_on_rocm[11776-c128, 16512-f64]` (skipped where there is no ROCm device).
-
-### Open: Fe with a freshly built `.so` hangs (main too)
-- With this branch's `.so` (key 51540a…), Fe P=4 blocked in "ISDF basis" for 2–10 min where main took 5.6 s. All ranks sat in `BlockUntilReady`.
-- The same happened with that TU removed from the build (key 985f8a…), so the handler is not the cause.
-- **Main also hung** with a fresh `FE_CACHE` (still stuck after 360 s).
-- Likely cause: a cold path keyed by the native closure identity or compile cache. It is unresolved and needs its own lane before the branch's own `.so` can be Fe-gated.
-
-## 4. eigh audit: ('eigh','ROCM') 16384
-`jnp.linalg.eigh` (rocSOLVER zheevd) on c128:
-
-| n | time | peak | residual | orthogonality |
-|---|---|---|---|---|
-| 20480 | 60.5 s | 35.2 GB | 8.4e-15 | 1.3e-14 |
-| 24576 | 120.2 s | 50.75 GB | 8.1e-15 | 1.35e-14 |
-
-zheevd does not take the trsm path. **16384 is therefore a measured-coverage bound** (SLATE eigh is not timed beyond it), **not a correctness bound**. A capacity rule like solve_lu's would raise it, but needs the SLATE comparison first. The f64 24576 run is the open item noted above.
+  - LU, forced small: 6 cases within about 2× of `jnp.linalg.solve`.
+  - Triangular modes: lu, L, Lᴴ forced at n = 1000 and routed at c128 12288 (7.2e-15, 1.0e-17, 4.1e-17); Lᵀ forced at f32 n = 1000; L routed at c64 16512 (6.1e-9).
+  - The native threshold report reproduced section 1.
+- **Fe P=4 with the branch's own library** (`7dd40e…`) against main, cold and warm, each on a fresh cache: eqp max|d| = 0.0 eV, and all 24 HDF5 datasets are `array_equal`. eqp differs only in the timestamp header. Rank-0 device peak is 6.77 GB on all four runs. The final import layout was re-checked warm: still bitwise.
+- **hsuite P=4 with the branch's own library:**
+  - cold: PASS, 450.7 s;
+  - warm, final code: PASS, 405.5 s;
+  - an earlier warm run FAILED at gnppm because I edited `distrib_la/__init__` while it was running (an ImportError against the stale module). It was rerun on stable code.
+- **CPU:** 162 passed in the LU/one_device/layering/crossfile set, plus measured/room/eigh-gate/compile-stability/memroute. The one remaining failure, `test_platform_legs::…refused_by_its_file_name`, fails identically on main in a checkout with a built library.
+- **ROCm pytest:** `tests/test_rocsolver_lu_gate.py`, 11 passed, including the GPU regressions at c128 11776, f64 16512, c64 16512, f32 23296 and the three triangular routes.
 
 ## Not tested
-- The one_device route at P=4 for n > 8192 (local solve only).
-- c64/f32: the handler serves c128 and f64; the route leaves other dtypes on `jnp.linalg.solve`. By the same mechanism, c64 should fail from n ≥ 16512 with a wide RHS; this is unverified.
-- Right-side trsm call sites elsewhere in LORRAX (any `triangular_solve`/`cho_solve` whose triangle spans more than 2^31 bytes is exposed). Only the distrib_la LU path was fixed.
-- The CUDA leg (unchanged; its exactness comes from the existing A100 record).
+- The one_device route at P=4 above n = 8192.
+- The routed call sites inside full GW runs at μ > 11.6k: no such input was available. The routes are covered by the gate's direct calls.
+- rocSOLVER potrf at large n.
+- The CUDA leg: unchanged, no row.
