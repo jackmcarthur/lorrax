@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Create the module's runtime venv at $LORRAX_MODULE_PREFIX/venv.
+# Create the module's runtime venv at $LORRAX_MODULE_PREFIX/venv (or LORRAX_MODULE_VENV).
 #
 #   LORRAX_MODULE_PREFIX=/abs/prefix bash setup_env.sh <clean lorrax checkout>
 #
@@ -30,7 +30,7 @@ mkdir -p "$PREFIX"
 UV_PYTHON_INSTALL_DIR="$PREFIX/python" \
     "$UV" venv --quiet --python "$PYTHON_VERSION" --python-preference only-managed "$VENV"
 
-REQ="$PREFIX/venv/lorrax-locked-requirements.txt"
+REQ="$VENV/lorrax-locked-requirements.txt"
 "$UV" export --quiet --project "$SRC" --frozen --no-emit-workspace --no-hashes \
     --extra "$LOCK_EXTRA" --format requirements-txt --output-file "$REQ"
 echo "[setup_env] installing $(grep -c '==' "$REQ") locked packages (uv.lock, extra $LOCK_EXTRA)"

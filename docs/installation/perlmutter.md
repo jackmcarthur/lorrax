@@ -226,7 +226,7 @@ over quota fails in `seal_bundle.py` with `Disk quota exceeded`.
 
 | path under `$LORRAX_MODULE_PREFIX` | written by |
 |---|---|
-| `python/`, `venv/` | `setup_env.sh` (once per prefix) |
+| `python/`, `venv/` (or `LORRAX_MODULE_VENV`, an absolute path: `lorrax_cuda13_runtime` keeps `.venv`) | `setup_env.sh` (once per prefix) |
 | `native/` (SLATE, cuSOLVERMp stage; `build/` before 2026-10-17, which `seal_bundle.py` refuses as a search-path directory) | `build.sh` (first build only) |
 | `releases/source-<rev8>/`, `releases/<rev8>-bundle-<id12>/` | `publish.sh` (read-only, never replaced) |
 | `modulefiles/<name>/<version>.lua` | `publish.sh` (the previous file kept as `.before-<rev8>`) |

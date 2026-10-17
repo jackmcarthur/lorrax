@@ -7,7 +7,8 @@
 #
 # Layout under the prefix:
 #   python/                          uv-managed CPython the venv is built on
-#   venv/                            the runtime venv (setup_env.sh)
+#   venv/                            the runtime venv (setup_env.sh); LORRAX_MODULE_VENV
+#                                    names another absolute path
 #   native/                          SLATE + cuSOLVERMp stage, shared by builds
 #                                    (not build/: the sealer refuses search paths
 #                                    through a directory named build)
@@ -35,7 +36,11 @@ lorrax_module_die() { echo "[lorrax-module] REFUSED: $*" >&2; exit 2; }
 [[ "$LORRAX_MODULE_PREFIX" == /* ]] \
     || lorrax_module_die "LORRAX_MODULE_PREFIX must be absolute: $LORRAX_MODULE_PREFIX"
 PREFIX="$(realpath -m "$LORRAX_MODULE_PREFIX")"
-VENV="$PREFIX/venv"
+# LORRAX_MODULE_VENV: an absolute venv path for a prefix that predates this
+# layout (lorrax_cuda13_runtime keeps its runtime venv at $PREFIX/.venv).
+[[ "${LORRAX_MODULE_VENV:-/}" == /* ]] \
+    || lorrax_module_die "LORRAX_MODULE_VENV must be absolute: $LORRAX_MODULE_VENV"
+VENV="$(realpath -m "${LORRAX_MODULE_VENV:-$PREFIX/venv}")"
 RELEASES="$PREFIX/releases"
 MODULE_NAME="${LORRAX_MODULE_NAME:-lorrax}"
 MODULE_VERSION="${LORRAX_MODULE_VERSION:-0.1.0}"
