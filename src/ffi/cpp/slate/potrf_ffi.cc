@@ -18,8 +18,16 @@
 //     SLATE sense; as a shard, they'd typically want L.T (real) or
 //     L.conj().T (complex) to recover standard "lower triangular in
 //     JAX row-major" form.  Tests document the exact transform.
+//
+// Device memory: SLATE's potrf calls reserveDeviceWorkspace(), one pool block per
+// local (lower) tile, which also receives the remote tiles each step needs.  Its
+// pool is seeded from the u8 WORKSPACE output (pool_seed.h;
+// distrib_la._slate.potrf_workspace_bytes sizes it), so at one tile per rank the
+// n/p x n/p block SLATE needs lives in XLA's arena, not in a device_malloc beside
+// it (MI250X P4: L outside the arena per rank, 5.2 GB at n=30720 c128).
 
 #include "../common/ctx_registry.h"
+#include <algorithm>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +41,7 @@
 
 #include "../common/ffi_helpers.h"
 #include "ctx.h"
+#include "pool_seed.h"
 
 namespace lorrax_ffi::slate_potrf {
 
@@ -45,7 +54,8 @@ static ffi::Error PotrfImpl(
     lrx::gpu::Stream xla_stream,
     lorrax_ffi::slate::SlateCtx* ctx,
     const T* d_A_in,
-    T* d_L_out)
+    T* d_L_out,
+    void* d_ws, std::size_t ws_bytes)
 {
     lrx::gpu::Error ce = lrx::gpu::stream_synchronize(xla_stream);
     if (ce != lrx::gpu::kSuccess) {
@@ -68,9 +78,11 @@ static ffi::Error PotrfImpl(
     const int q = ctx->q;
     const int64_t lld = (n + p - 1) / p;
 
-    // Copy the input shard into the output buffer, then factor in-place.
+    // Copy the input shard into the output buffer (unless XLA aliased them), then
+    // factor in place.
     const int64_t local_rows = (n + p - 1) / p;
     const int64_t local_cols = (n + q - 1) / q;
+    if (static_cast<const void*>(d_L_out) != static_cast<const void*>(d_A_in))
     ce = lrx::gpu::memcpy_async(d_L_out, d_A_in,
                          local_rows * local_cols * sizeof(T),
                          lrx::gpu::kDeviceToDevice, xla_stream);
@@ -99,8 +111,29 @@ static ffi::Error PotrfImpl(
         {sl::Option::Target, sl::Target::Devices},
     };
 
+    // Seed the pool: the reservation (one block per local lower tile) plus the
+    // remote tiles in flight -- at one tile per rank the reserved block serves
+    // the one received tile on a 2 x 2 grid; larger grids hold two more.
+    int64_t local_lower = 0;
+    for (int64_t j = 0; j < L.nt(); ++j)
+        for (int64_t i = j; i < L.mt(); ++i)
+            if (L.tileIsLocal(i, j)) ++local_lower;
+    const bool one_tile = (L.mt() == p);
+    const int64_t want = one_tile ? std::max<int64_t>(1, local_lower) + (p > 2 ? 2 : 0)
+                                  : local_lower + 2 * (L.mt() + L.nt()) + 8;
+    lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);
+    const int64_t seeded = ws.seed(L, want);
+
     try {
         int64_t info = sl::potrf(L, opts);
+        if (lorrax_ffi::slate::pool_report_enabled()) {
+            int r = 0;
+            MPI_Comm_rank(ctx->comm, &r);
+            std::fprintf(stderr, "[slate.potrf] rank=%d n=%lld nb=%lld pool seeded=%lld "
+                         "fallback=%lld blocks ws=%.3fGB\n", r, (long long) n, (long long) nb,
+                         (long long) seeded,
+                         (long long) lorrax_ffi::slate::pool_fallback(L, seeded), ws.size / 1e9);
+        }
         if (info != 0) {
             std::ostringstream os;
             os << "slate::potrf returned info=" << info
@@ -126,6 +159,7 @@ static ffi::Error PotrfDispatch(
     lrx::gpu::Stream stream,
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
+    ffi::Result<ffi::AnyBuffer> WS,
     int64_t n, int64_t nb,
     int64_t ctx_key)
 {
@@ -148,13 +182,15 @@ static ffi::Error PotrfDispatch(
             return PotrfImpl<double>(
                 n, nb, stream, ctx,
                 static_cast<const double*>(A.untyped_data()),
-                static_cast<double*>(L_out->untyped_data()));
+                static_cast<double*>(L_out->untyped_data()),
+                WS->untyped_data(), WS->size_bytes());
         case ffi::DataType::C128:
             using C128 = std::complex<double>;
             return PotrfImpl<C128>(
                 n, nb, stream, ctx,
                 static_cast<const C128*>(A.untyped_data()),
-                static_cast<C128*>(L_out->untyped_data()));
+                static_cast<C128*>(L_out->untyped_data()),
+                WS->untyped_data(), WS->size_bytes());
         default: {
             std::ostringstream os;
             os << "slate.potrf: unsupported dtype "
@@ -172,6 +208,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<xla::ffi::AnyBuffer>()              // A (Hermitian input)
         .Ret<xla::ffi::AnyBuffer>()              // L (Cholesky factor, lower)
+        .Ret<xla::ffi::AnyBuffer>()              // workspace (u8): SLATE's pool seed
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
         .Attr<int64_t>("ctx_key"));

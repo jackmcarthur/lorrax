@@ -34,6 +34,11 @@
 //     non-uniform-stride class of SLATE's device batching (internal_batch.hh:290),
 //     and the owned tiles are uniform by construction (eigh_ffi.cc's rule).
 //     At nb = n/max(p, q) this is the former one-tile-per-rank layout.
+//   - Device memory: every handler takes one more output, a u8 WORKSPACE the
+//     Python wrapper sizes (distrib_la._slate.lu_workspace_bytes) and never
+//     reads.  A's and X's SLATE pools are seeded from it (pool_seed.h), so the
+//     owned tiles and getrf/getrs's reserveDeviceWorkspace() are XLA buffers,
+//     not device_malloc calls outside the arena.
 //
 // Pivots.  slate::Pivots is vector<vector<Pivot>>, one vector per block
 // column k with min(tileMb(k), tileNb(k)) entries; getrf MPI_Bcasts every
@@ -63,6 +68,7 @@
 
 #include "../common/ffi_helpers.h"
 #include "ctx.h"
+#include "pool_seed.h"
 
 namespace lorrax_ffi::slate_lu {
 
@@ -146,13 +152,36 @@ static ffi::Error copy_out(const char* what, sl::Matrix<T>& M, T* dst, int64_t l
     return ffi::Error::Success();
 }
 
-// SLATE-owned device tiles: A (n x n, nb x nb) or B / X (n x nrhs, nb x nb_b).
+// SLATE-owned device tiles: A (n x n, nb x nb) or B / X (n x nrhs, nb x nb_b),
+// their pool seeded from the workspace with one block per local tile plus a
+// panel's worth (2 (mt + nt) + 8: distrib_la._slate._pool_blocks, the same rule).
 template <typename T>
 static sl::Matrix<T> owned(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
-                           const lorrax_ffi::slate::SlateCtx* ctx) {
+                           const lorrax_ffi::slate::SlateCtx* ctx,
+                           lorrax_ffi::slate::PoolSeed& ws, int64_t* seeded) {
     sl::Matrix<T> M(m, ncols, mb, nb_cols, ctx->p, ctx->q, ctx->comm);
+    int64_t local = 0;
+    for (int64_t j = 0; j < M.nt(); ++j)
+        for (int64_t i = 0; i < M.mt(); ++i)
+            if (M.tileIsLocal(i, j)) ++local;
+    *seeded = ws.seed(M, local + 2 * (M.mt() + M.nt()) + 8);
     M.insertLocalTiles(sl::Target::Devices);
     return M;
+}
+
+template <typename T>
+static void pool_report(const char* what, const lorrax_ffi::slate::SlateCtx* ctx, int64_t iq,
+                        sl::Matrix<T>& A, int64_t sa, sl::Matrix<T>* X, int64_t sx,
+                        const lorrax_ffi::slate::PoolSeed& ws) {
+    if (!lorrax_ffi::slate::pool_report_enabled()) return;
+    int r = 0;
+    MPI_Comm_rank(ctx->comm, &r);
+    std::fprintf(stderr, "[slate.%s] rank=%d q=%lld pool seeded A=%lld X=%lld fallback A=%lld "
+                 "X=%lld blocks; ws_used=%.3fGB ws=%.3fGB\n", what, r, (long long) iq,
+                 (long long) sa, (long long) sx,
+                 (long long) lorrax_ffi::slate::pool_fallback(A, sa),
+                 (long long) (X ? lorrax_ffi::slate::pool_fallback(*X, sx) : 0),
+                 ws.used / 1e9, ws.size / 1e9);
 }
 
 static const sl::Options& lu_opts() {
@@ -209,7 +238,8 @@ static std::vector<int64_t> panel_lengths(const sl::Matrix<T>& A) {
 template <typename T>
 static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx* ctx,
                                      int64_t nq, int64_t n, int64_t nrhs, int64_t nb, int64_t nb_b,
-                                     const T* A, const T* B, T* X, T* LU) {
+                                     const T* A, const T* B, T* X, T* LU,
+                                     void* d_ws, std::size_t ws_bytes) {
     const char* what = "batched_solve_lu";
     if (auto e = preflight(what, stream, ctx, n, nb); !e.success()) return e;
     const int p = ctx->p, q = ctx->q;
@@ -217,13 +247,16 @@ static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate:
     const int64_t a_elems = lld * (n / q);
     const int64_t b_elems = lld * (nrhs / q);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        auto Aq = owned<T>(n, n, nb, nb, ctx);
-        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx);
+        lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);     // matrix iq's SLATE objects die below
+        int64_t sa = 0, sx = 0;
+        auto Aq = owned<T>(n, n, nb, nb, ctx, ws, &sa);
+        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx, ws, &sx);
         if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
         if (auto e = factor_one<T>(what, Aq, piv, iq); !e.success()) return e;
         if (auto e = solve_one<T>(Aq, piv, Xq, iq); !e.success()) return e;
+        pool_report<T>(what, ctx, iq, Aq, sa, &Xq, sx, ws);
         if (auto e = copy_out<T>(what, Xq, X + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_out<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
     }
@@ -234,7 +267,8 @@ static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate:
 template <typename T>
 static ffi::Error GetrfImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx* ctx,
                             int64_t nq, int64_t n, int64_t nb, int64_t piv_len,
-                            const T* A, T* LU, int64_t* d_piv) {
+                            const T* A, T* LU, int64_t* d_piv,
+                            void* d_ws, std::size_t ws_bytes) {
     const char* what = "batched_getrf";
     if (auto e = preflight(what, stream, ctx, n, nb); !e.success()) return e;
     if (piv_len != 2 * n) {
@@ -247,10 +281,13 @@ static ffi::Error GetrfImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
     const int64_t a_elems = lld * (n / q);
     std::vector<int64_t> h_piv(static_cast<std::size_t>(nq * piv_len), 0);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        auto Aq = owned<T>(n, n, nb, nb, ctx);
+        lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);
+        int64_t sa = 0;
+        auto Aq = owned<T>(n, n, nb, nb, ctx, ws, &sa);
         if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
         if (auto e = factor_one<T>(what, Aq, piv, iq); !e.success()) return e;
+        pool_report<T>(what, ctx, iq, Aq, sa, nullptr, 0, ws);
         if (auto e = copy_out<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         int64_t* out = h_piv.data() + iq * piv_len;
         int64_t at = 0;
@@ -279,7 +316,7 @@ template <typename T>
 static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx* ctx,
                             int64_t nq, int64_t n, int64_t nrhs, int64_t nb, int64_t nb_b,
                             int64_t piv_len, const T* LU, const int64_t* d_piv,
-                            const T* B, T* X) {
+                            const T* B, T* X, void* d_ws, std::size_t ws_bytes) {
     const char* what = "batched_getrs";
     if (auto e = preflight(what, stream, ctx, n, nb); !e.success()) return e;
     if (piv_len != 2 * n) {
@@ -298,8 +335,10 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
     ce = lrx::gpu::stream_synchronize(stream);
     if (ce != lrx::gpu::kSuccess) return gpu_fail(what, LRX_GPU_API "StreamSynchronize(piv)", ce);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        auto Aq = owned<T>(n, n, nb, nb, ctx);
-        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx);
+        lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);
+        int64_t sa = 0, sx = 0;
+        auto Aq = owned<T>(n, n, nb, nb, ctx, ws, &sa);
+        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx, ws, &sx);
         if (auto e = copy_in<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         const int64_t* in = h_piv.data() + iq * piv_len;
@@ -317,6 +356,7 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
                               "slate.batched_getrs: pivot buffer does not match this A geometry "
                               "(feed back getrf's piv verbatim, same mesh)");
         if (auto e = solve_one<T>(Aq, piv, Xq, iq); !e.success()) return e;
+        pool_report<T>(what, ctx, iq, Aq, sa, &Xq, sx, ws);
         if (auto e = copy_out<T>(what, Xq, X + iq * b_elems, lld, p, q, stream); !e.success()) return e;
     }
     return ffi::Error::Success();
@@ -336,7 +376,7 @@ static ffi::Error bad_dtype(const char* what, ffi::DataType dt) {
 
 static ffi::Error SolveLuFactorsDispatch(
     lrx::gpu::Stream stream, ffi::AnyBuffer A, ffi::AnyBuffer B,
-    ffi::Result<ffi::AnyBuffer> X, ffi::Result<ffi::AnyBuffer> LU,
+    ffi::Result<ffi::AnyBuffer> X, ffi::Result<ffi::AnyBuffer> LU, ffi::Result<ffi::AnyBuffer> WS,
     int64_t nq, int64_t n, int64_t nrhs, int64_t nb, int64_t nb_b, int64_t ctx_key)
 {
     auto* ctx = ctx_of(ctx_key);
@@ -351,18 +391,20 @@ static ffi::Error SolveLuFactorsDispatch(
         case ffi::DataType::F64:
             return SolveLuFactorsImpl<double>(stream, ctx, nq, n, nrhs, nb, nb_b,
                 static_cast<const double*>(A.untyped_data()), static_cast<const double*>(B.untyped_data()),
-                static_cast<double*>(X->untyped_data()), static_cast<double*>(LU->untyped_data()));
+                static_cast<double*>(X->untyped_data()), static_cast<double*>(LU->untyped_data()),
+                WS->untyped_data(), WS->size_bytes());
         case ffi::DataType::C128:
             return SolveLuFactorsImpl<C128>(stream, ctx, nq, n, nrhs, nb, nb_b,
                 static_cast<const C128*>(A.untyped_data()), static_cast<const C128*>(B.untyped_data()),
-                static_cast<C128*>(X->untyped_data()), static_cast<C128*>(LU->untyped_data()));
+                static_cast<C128*>(X->untyped_data()), static_cast<C128*>(LU->untyped_data()),
+                WS->untyped_data(), WS->size_bytes());
         default: return bad_dtype("batched_solve_lu", dt);
     }
 }
 
 static ffi::Error GetrfDispatch(
     lrx::gpu::Stream stream, ffi::AnyBuffer A,
-    ffi::Result<ffi::AnyBuffer> LU, ffi::Result<ffi::AnyBuffer> piv,
+    ffi::Result<ffi::AnyBuffer> LU, ffi::Result<ffi::AnyBuffer> piv, ffi::Result<ffi::AnyBuffer> WS,
     int64_t nq, int64_t n, int64_t nb, int64_t piv_len, int64_t ctx_key)
 {
     auto* ctx = ctx_of(ctx_key);
@@ -378,17 +420,19 @@ static ffi::Error GetrfDispatch(
     switch (dt) {
         case ffi::DataType::F64:
             return GetrfImpl<double>(stream, ctx, nq, n, nb, piv_len,
-                static_cast<const double*>(A.untyped_data()), static_cast<double*>(LU->untyped_data()), d_piv);
+                static_cast<const double*>(A.untyped_data()), static_cast<double*>(LU->untyped_data()), d_piv,
+                WS->untyped_data(), WS->size_bytes());
         case ffi::DataType::C128:
             return GetrfImpl<C128>(stream, ctx, nq, n, nb, piv_len,
-                static_cast<const C128*>(A.untyped_data()), static_cast<C128*>(LU->untyped_data()), d_piv);
+                static_cast<const C128*>(A.untyped_data()), static_cast<C128*>(LU->untyped_data()), d_piv,
+                WS->untyped_data(), WS->size_bytes());
         default: return bad_dtype("batched_getrf", dt);
     }
 }
 
 static ffi::Error GetrsDispatch(
     lrx::gpu::Stream stream, ffi::AnyBuffer LU, ffi::AnyBuffer piv, ffi::AnyBuffer B,
-    ffi::Result<ffi::AnyBuffer> X,
+    ffi::Result<ffi::AnyBuffer> X, ffi::Result<ffi::AnyBuffer> WS,
     int64_t nq, int64_t n, int64_t nrhs, int64_t nb, int64_t nb_b, int64_t piv_len,
     int64_t ctx_key)
 {
@@ -407,11 +451,13 @@ static ffi::Error GetrsDispatch(
         case ffi::DataType::F64:
             return GetrsImpl<double>(stream, ctx, nq, n, nrhs, nb, nb_b, piv_len,
                 static_cast<const double*>(LU.untyped_data()), d_piv,
-                static_cast<const double*>(B.untyped_data()), static_cast<double*>(X->untyped_data()));
+                static_cast<const double*>(B.untyped_data()), static_cast<double*>(X->untyped_data()),
+                WS->untyped_data(), WS->size_bytes());
         case ffi::DataType::C128:
             return GetrsImpl<C128>(stream, ctx, nq, n, nrhs, nb, nb_b, piv_len,
                 static_cast<const C128*>(LU.untyped_data()), d_piv,
-                static_cast<const C128*>(B.untyped_data()), static_cast<C128*>(X->untyped_data()));
+                static_cast<const C128*>(B.untyped_data()), static_cast<C128*>(X->untyped_data()),
+                WS->untyped_data(), WS->size_bytes());
         default: return bad_dtype("batched_getrs", dt);
     }
 }
@@ -426,6 +472,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()              // B
         .Ret<xla::ffi::AnyBuffer>()              // X (aliased to B)
         .Ret<xla::ffi::AnyBuffer>()              // LU factors (aliased to A)
+        .Ret<xla::ffi::AnyBuffer>()              // workspace (u8): SLATE's pool seed
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nrhs")
@@ -440,6 +487,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()              // A (donated; factored in place)
         .Ret<xla::ffi::AnyBuffer>()              // LU (aliased to A)
         .Ret<xla::ffi::AnyBuffer>()              // piv (int64, 2n per matrix, replicated)
+        .Ret<xla::ffi::AnyBuffer>()              // workspace (u8): SLATE's pool seed
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
@@ -454,6 +502,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()              // piv (as getrf returned it)
         .Arg<xla::ffi::AnyBuffer>()              // B (donated; solved in place)
         .Ret<xla::ffi::AnyBuffer>()              // X (aliased to B)
+        .Ret<xla::ffi::AnyBuffer>()              // workspace (u8): SLATE's pool seed
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nrhs")
