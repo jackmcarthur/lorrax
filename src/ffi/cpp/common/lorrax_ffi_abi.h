@@ -91,12 +91,14 @@
 //
 //   ABI 8 -> 9   (2026-10-17, dlascale).  lorrax_slate_potrf takes one more
 //                attribute, seed_min_bytes (the outside allowance past which a
-//                rank's SLATE pool is seeded).  The device-leg SLATE handlers
-//                (eigh, potrf, batched_{solve_lu_factors,getrf,getrs}) also bind
+//                rank's SLATE pool is seeded), and lorrax_slate_eigh one more
+//                result, a u8 workspace seeding its device pools (sized by
+//                distrib_la._slate.eigh_workspace_bytes; CUDA and ROCM legs).
+//                potrf and batched_{solve_lu_factors,getrf,getrs} also bind
 //                xla::ffi::ScratchAllocator for their per-rank pool seed
 //                (slate/pool_seed.h); their operands and results are ABI 8's.
-//                An ABI-8 library would reject the attribute; refused by name at
-//                load instead.
+//                An ABI-8 library would reject the attribute and miss the result;
+//                refused by name at load instead.
 //
 // ---------------------------------------------------------------------------
 // THE RULE
