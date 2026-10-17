@@ -283,8 +283,22 @@ Changed:
 * Validation: BSE ≡ TD in linear response (§2) and the §6.1 identity, repeated
   in the $S$ basis.
 
-The first step is the measurement: per $k$, the principal angles between $A$
-and the projection-only Cr-3d + I-5p subspace (run DEV/835).
+**Measured for CrI3** (run DEV/835; DFT 30×30, 200 bands, Löwdin
+projections of `projwfc.x`). $A=[88,144)$ is an isolated group at every $k$:
+global gaps 7.08 eV below and 1.50 eV above (k-local 143|144 gap ≥ 1.52 eV,
+smallest at Γ). Every state of $A$ has Cr-3d + I-5p weight ≥ 0.742 (bands
+92–143 ≥ 0.911); every band outside has ≤ 0.221. No band of other character
+enters $A$ anywhere in the zone, so a Wannier construction for this group
+needs no disentanglement and spans $A$. The projection-only p–d subspace
+differs from $A$ by $d^2=56-\sum_is_i^2=1.22$–$1.40$ (outer window
+$[88,200)$). Of this, 0.91 lies in the four Cr-4s(+I-5s)–I-5p σ directions
+(cosines 0.85–0.93): bonding in bands 88–91, antibonding in bands 144–149. The
+band-edge states (124–133) change active weight by ≤ 2.0 %. The partial-zone
+hazard is the QP order at the upper edge. At Γ, GW lifts band 143 by 1.93 eV
+and band 144 by 0.46 eV (eqp1, $N_\mu$ 9000), which closes the 1.52 eV
+separation to 55 meV; eqp0 swaps up to four states at 8 of 10 coarse $k$.
+This was checked on the 8×8 eqp grid only. For CrI3 the band window stays;
+the QP-order margins at both edges on the TD grid belong in the run's gate.
 
 ## 2. The static limit is the present model {#static-limit}
 
