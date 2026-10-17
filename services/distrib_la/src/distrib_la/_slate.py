@@ -211,6 +211,11 @@ def _pool_extra(mt: int, nt: int) -> int:
     return 2 * (mt + nt) + 8
 
 
+def _rhs_pool_extra(nt: int) -> int:
+    """Remote tiles of a right-hand side (``nt`` tile columns) under getrs's trsmB."""
+    return 4 * nt + 8
+
+
 def _max_local_tiles(mt: int, nt: int, p: int, q: int, *, lower: bool = False) -> int:
     """The most tiles any rank of a 2-D block-cyclic ``p x q`` grid holds (lower
     triangle only for a Hermitian matrix): every rank gets the same workspace shape."""
@@ -250,12 +255,18 @@ def eigh_workspace_bytes(side: int, nb: int, p: int, q: int, itemsize: int,
 
 def lu_workspace_bytes(n: int, nrhs: int | None, nb: int, p: int, q: int,
                        itemsize: int) -> int:
-    """getrf / getrs pools: A (n x n, nb x nb) and, with ``nrhs``, X (n x nrhs, nb x nrhs/q)."""
+    """getrf / getrs pools: A (n x n, nb x nb) and, with ``nrhs``, X (n x nrhs, nb x nrhs/q).
+
+    X's remote tiles are trsmB's in-flight B rows (one per step, released after
+    it, lookahead + 2 steps live): ``4 q + 8`` blocks, not A's panel rule -- at
+    ``nrhs = n`` a panel's worth of ``nb x n/q`` blocks is ~2 n^2/q elements
+    (cpp/slate/batched_solve_lu_ffi.cc ``owned``, the same rule).
+    """
     mt = nt = n // nb
     pools = [((n // p // nb) * (n // q // nb) + _pool_extra(mt, nt), nb * nb * itemsize)]
     if nrhs:
         nb_b = nrhs // q
-        pools.append(((n // p // nb) + _pool_extra(mt, q), nb * nb_b * itemsize))
+        pools.append(((n // p // nb) + _rhs_pool_extra(q), nb * nb_b * itemsize))
     return _pool_bytes(*pools)
 
 
