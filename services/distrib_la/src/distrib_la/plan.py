@@ -810,6 +810,8 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
                                      many=None, post=_eigh_columns),
     ("eigh", "slate"):          dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
+    ("eigh", "elpa"):           dict(one="distributed_eigh",
+                                     many=None, post=_eigh_columns),
     ("eigh", "scalapack"):      dict(one="distributed_eigh",
                                      many="batched_distributed_eigh",
                                      post=_eigh_columns),
