@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-17 — Dyson response programs: one compile per LU decision on the CUDA room leg
+
+Under `linalg = distributed` on CUDA, the W response's Dyson programs keyed on a figure
+(`one_device`'s bound) that moves with almost any change of the ledger room, so a moved
+room recompiled them. They now key on what the program runs, `(backend, route, rounds)`
+(`distrib_la` `Plan.decision`), and the measured size route's agreed costs are memoised
+without the room, so a new room exchanges, reads and compiles nothing to decide.
+
+- **Results do not move:** the same routes and rounds are chosen as before.
+- **New refusal:** a measured size route whose ranks hold different rooms now refuses by
+  name ("has a room that differs across processes") instead of routing divergently.
+- **What you must change:** nothing.
+
 ## 2026-10-17 — k-convolution kernels: faster mathdx modes 7, 9 and 11 (CUDA); a new native target
 
 The NVRTC-built k-convolution kernels (`src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`) gain

@@ -132,18 +132,29 @@ def _matmul(a, b, *, transa="N", transb="N", **kwargs):
 
 
 @pytest.fixture
-def checked_service(monkeypatch):
+def fresh_bank(monkeypatch):
+    """response_bank's program caches, empty before and after the test."""
+    import distrib_la
+    from gw import response_bank as rb
+    monkeypatch.setattr(distrib_la, "matmul", _matmul)
+    monkeypatch.setattr(rb, "_VARIANTS", {})
+    rb._response_programs.cache_clear()
+    yield rb
+    rb._response_programs.cache_clear()
+
+
+@pytest.fixture
+def checked_service(monkeypatch, fresh_bank):
     import distrib_la
     monkeypatch.setattr(distrib_la, "plan", _CheckedPlan)
-    monkeypatch.setattr(distrib_la, "matmul", _matmul)
 
 
 def test_response_programs_have_no_host_callback(checked_service):
     from gw import response_bank as rb
     mesh, n, nq = _mesh(), 8, 2
     face = jax.ShapeDtypeStruct((nq, n, n), jnp.complex128, sharding=NamedSharding(mesh, P(None, "x", "y")))
-    built = rb._response_programs.__wrapped__(mesh, n, "distributed", "auto", 0.5, False, None)
-    dyson, moments = built.bind(_CheckedPlan("solve_lu"), (mesh, n, "distributed", "auto", None))
+    built = rb._response_programs(mesh, n, "distributed", "auto", 0.5, False, None)
+    dyson, moments, _ = built.bind(None)
     slope = built.slope
     sqrt_v = rb._coulomb_algebra.__wrapped__(mesh, n, n, "distributed")
     counts = {"dyson.value": _host_callbacks(dyson.value.lower(face, face)),
@@ -153,55 +164,47 @@ def test_response_programs_have_no_host_callback(checked_service):
     assert counts == dict.fromkeys(counts, 0)
 
 
-class _RoomPlan(_CheckedPlan):
-    """A checked LU plan whose decision is a function of its room, as the size route's is."""
-    solves = 0
-
-    def __init__(self, op, *args, budget_bytes=None, **kwargs):
-        super().__init__(op)
-        self.budget_bytes = budget_bytes
-
-    def decision(self, A, *args):
-        return ("one_device" if (self.budget_bytes or 0) >= 1000 else "library",)
-
-    def batched(self, A, *rest, **kwargs):
-        _RoomPlan.solves += 1                  # once per traced solve
-        return super().batched(A, *rest, **kwargs)
-
-
-def test_response_programs_key_on_the_solve_decision_not_the_room(checked_service, monkeypatch):
-    """The Dyson programs key on the LU plan's decision (COMPILEAUDIT rule 4): a room that
-    moves without moving the decision traces and lowers nothing again; one that flips the
-    decision takes a new variant."""
-    import distrib_la
-    from gw import response_bank as rb
-    monkeypatch.setattr(distrib_la, "plan", _RoomPlan)
-    for name in ("_LU_PLANS", "_SOLVE_OPERANDS", "_DECISIONS", "_VARIANTS"):
-        monkeypatch.setattr(rb, name, {})
+@pytest.mark.parametrize("photon", [False, True])
+def test_response_programs_key_on_the_solve_decision_not_the_room(fresh_bank, monkeypatch, photon):
+    """The Dyson programs key on the real LU plan's decision (COMPILEAUDIT rule 4) on the CUDA
+    room leg (stood in for; no library on this host), whose one_device bound moves with any
+    room: a room that moves without moving the rounds traces and lowers nothing again; one
+    that changes them takes a new variant.  Photon: value, pair and moments all solve."""
+    import importlib
+    from distrib_la._one_device import one_device_bytes
+    rb = fresh_bank
+    for mod in ("distrib_la.resolve", "distrib_la._one_device"):
+        monkeypatch.setattr(importlib.import_module(mod), "mesh_platform", lambda m: "CUDA")
+    monkeypatch.setattr(importlib.import_module("distrib_la.plan"), "_MEASURED", {})
     mesh, n, nq = _mesh(), 8, 2
     face = NamedSharding(mesh, P(None, "x", "y"))
-    h = jax.device_put(0.1 * _hermitian(n, nq, seed=1), face)
-    chi = jax.device_put(0.01 * _hermitian(n, nq, seed=2), face)
-    built = rb._response_programs.__wrapped__(mesh, n, "distributed", "auto", 0.5, False, None)
+    x = [jax.device_put(0.01 * _hermitian(n, nq, seed=s), face) for s in range(6)]
+    root = jax.device_put(0.1 * _hermitian(n, nq, seed=9), face)
+    built = rb._response_programs(mesh, n, "distributed", "auto", 0.5, False, 1.0 if photon else None)
+    calls = ({"value": (root, x[0], x[1]), "pair": (root, x[0], x[2], x[1], x[3]),
+              "moments": (root, x[2], x[3], x[4], x[5], x[1])} if photon else
+             {"value": (root, x[0]), "pair": (root, x[0], x[1])})
     lowerings = _lowerings()
 
-    def value(room):
-        key = (mesh, n, "distributed", "auto", room)
-        dyson, _ = built.bind(rb._lu_plan(key), key)
-        return dyson.value, np.asarray(dyson.value(h, chi))
-
-    first, w_first = value(2000)
-    solves, lowered = _RoomPlan.solves, len(lowerings)
-    assert solves >= 1 and lowered >= 1
-    moved, w_moved = value(3000)               # the room moved, the decision did not
-    assert (_RoomPlan.solves, len(lowerings)) == (solves, lowered)
-    assert moved.resolve(h, chi) is first.resolve(h, chi)
-    np.testing.assert_array_equal(w_moved, w_first)
-    flipped, w_flipped = value(10)             # the decision flips: a new variant
-    assert flipped.resolve(h, chi) is not first.resolve(h, chi)
-    assert _RoomPlan.solves > solves
-    np.testing.assert_array_equal(w_flipped, w_first)
-    assert sorted(d for (_, _, _, d) in rb._VARIANTS) == [(("library",),), (("one_device",),)]
+    def run(room):
+        dyson, moments, _ = built.bind(room)
+        progs = {"value": dyson.value, "pair": dyson.pair("face"), "moments": moments}
+        return {k: (progs[k].resolve(*a), [np.asarray(v) for v in jax.tree.leaves(progs[k](*a))])
+                for k, a in calls.items()}
+    first = run(10 ** 10)
+    lowered = len(lowerings)
+    assert lowered >= len(calls)
+    moved = run(10 ** 10 + 10 ** 7)            # another one_device bound, the same rounds
+    assert len(lowerings) == lowered
+    flipped = run(one_device_bytes("solve_lu", n))     # bound n: one matrix a round
+    for k in calls:
+        assert moved[k][0] is first[k][0] and flipped[k][0] is not first[k][0]
+        for a, b, c in zip(first[k][1], moved[k][1], flipped[k][1]):
+            np.testing.assert_array_equal(b, a)
+            np.testing.assert_allclose(c, a, rtol=1e-12, atol=1e-14)
+    assert sorted({d for (*_, d) in rb._VARIANTS}) == [("one_device", "backend_batched", 1),
+                                                       ("one_device", "backend_batched", 2)]
+    assert built.bind(10 ** 10)[0].value == built.bind(10 ** 10)[0].value   # a value, not an identity
 
 
 def test_polar_stack_has_no_host_callback():

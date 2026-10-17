@@ -442,10 +442,10 @@ def _gathered_eigh(A, *, mesh):
 #: that says what to call instead.  ``tests/test_distrib_la_shape_algebra``
 #: cross-checks the flag against each wrapper's own return annotation, so
 #: the declaration cannot quietly disagree with the code.
-#: The size-route decisions of a ``distributed`` plan resolved to ``one_device``, one per call
-#: signature (:func:`_measured_rounds`): rounds of the one_device program, 0 for the library,
-#: None for one_device's own round rule (main's incumbent on a size-row leg, or no library on
-#: this host).
+#: The agreed size-route costs of a ``distributed`` plan resolved to ``one_device``, one per
+#: room-free call signature (:func:`_measured_rounds`' on-disk key; None where no library
+#: resolves).  The room is applied per call: a new room is arithmetic, with no exchange, no
+#: disk read and no compile.
 _MEASURED: dict = {}
 #: Library plans of :meth:`Plan._library_plan`, one per (op, mesh, n, route, library).
 _LIBRARY_PLANS: dict = {}
@@ -688,7 +688,8 @@ def _measured_rounds(p, A, args, single: bool = False):
     could beat the incumbent is measured: a ``one_device`` incumbent in k rounds compiles the
     rounds below k (and k, for its own figure), and in 1 round nothing at all (no compile, no
     exchange).  Figures are agreed over every rank (largest candidate bytes against the
-    smallest incumbent bytes) and cached per signature on disk.
+    smallest incumbent bytes, the room refused by name unless every rank's is the same) and
+    cached per signature on disk and in memory, without the room (:data:`_MEASURED`).
 
     Returns the rounds to run, 0 for the library, None for ``one_device``'s own round rule (the
     incumbent on a size-row leg, or where no library resolves on this host).  Each decision is a
@@ -701,8 +702,7 @@ def _measured_rounds(p, A, args, single: bool = False):
     shapes = (tuple(int(s) for s in A.shape),) + tuple(tuple(int(s) for s in x.shape) for x in args)
     key = (p.op, _resolve.mesh_key(p.mesh), shapes, tuple(str(d) for d in dtypes), p.budget_bytes,
            p.requested_batched_route, bool(single))
-    if key in _MEASURED:
-        return _MEASURED[key]
+    room = None if p.budget_bytes is None else int(p.budget_bytes)
     platform = _resolve.mesh_platform(p.mesh)
     library = _resolve._DISTRIBUTED_DEFAULT.get((p.op, platform))
     ranks = int(p.mesh.shape["x"]) * int(p.mesh.shape["y"])
@@ -725,45 +725,53 @@ def _measured_rounds(p, A, args, single: bool = False):
                                [int(p.mesh.shape["x"]), int(p.mesh.shape["y"])], platform, kind,
                                library, p.requested_batched_route, bool(single), incumbent,
                                measured, _measured_code_hash(), native_closure_identity(platform)])
-        tag = hashlib.sha256(disk_key.encode()).hexdigest()[:24]
-        default = _library_bytes is _LIBRARY_BYTES_DEFAULT
-        cached = _measured_cache_get(disk_key, measured, need_library) if default else None
-        # Round 1: does EVERY rank hold this signature's agreed costs?  Only then is nothing
-        # compiled; one miss and every rank measures, so all lower the same programs (a library
-        # plan's first lowering may bootstrap its context collectively).
-        probe = _exchange(tag + "/probe", {
-            "hit": cached is not None,
-            "library": None if cached is None else cached["library"],
-            "rounds": {} if cached is None else cached["rounds"],
-            "rounds_min": {} if cached is None else cached["rounds_min"]})
-        if all(v["hit"] for v in probe):
-            source = "cached"
-            agreed = _agreed(probe, need_library)
+        if disk_key in _MEASURED:
+            source, agreed = "memoised", _MEASURED[disk_key]
         else:
-            source = "compiled"
-            spec = P("x", "y") if single else P(None, "x", "y")
-            face = NamedSharding(p.mesh, spec)
-            abstract = tuple(jax.ShapeDtypeStruct(s, d, sharding=face) for s, d in zip(shapes, dtypes))
-            lib_local = _library_bytes(p, abstract, single) if need_library else None
-            rounds_local = {}
-            if lib_local is not None or not need_library:
-                for r in measured:
-                    fn = ((lambda *o: p(*o, _rounds=1)) if single
-                          else (lambda *o, _r=r: p.batched(*o, _rounds=_r)))
-                    c_r = _program_bytes(fn, abstract)
-                    rounds_local[str(r)] = None if c_r is None else int(c_r)
-            # Round 2: every rank's own figures, agreed conservatively.
-            agreed = _agreed(_exchange(tag + "/measure",
-                                       {"library": None if lib_local is None else int(lib_local),
-                                        "rounds": rounds_local}), need_library)
-            if agreed is not None and default and _valid_costs(agreed, measured, need_library):
-                _measured_cache_put(disk_key, agreed)
+            tag = hashlib.sha256(disk_key.encode()).hexdigest()[:24]
+            default = _library_bytes is _LIBRARY_BYTES_DEFAULT
+            cached = _measured_cache_get(disk_key, measured, need_library) if default else None
+            # Round 1: does EVERY rank hold this signature's agreed costs?  Only then is
+            # nothing compiled; one miss and every rank measures, so all lower the same
+            # programs (a library plan's first lowering may bootstrap its context collectively).
+            probe = _exchange(tag + "/probe", {
+                "room": room, "hit": cached is not None,
+                "library": None if cached is None else cached["library"],
+                "rounds": {} if cached is None else cached["rounds"],
+                "rounds_min": {} if cached is None else cached["rounds_min"]})
+            if len({v["room"] for v in probe}) > 1:
+                raise RuntimeError(f"distrib_la measured size route: {p.op} {shapes[0]} has a room "
+                                   f"that differs across processes ({[v['room'] for v in probe]}); "
+                                   f"refusing rather than route divergently")
+            if all(v["hit"] for v in probe):
+                source = "cached"
+                agreed = _agreed(probe, need_library)
+            else:
+                source = "compiled"
+                spec = P("x", "y") if single else P(None, "x", "y")
+                face = NamedSharding(p.mesh, spec)
+                abstract = tuple(jax.ShapeDtypeStruct(s, d, sharding=face)
+                                 for s, d in zip(shapes, dtypes))
+                lib_local = _library_bytes(p, abstract, single) if need_library else None
+                rounds_local = {}
+                if lib_local is not None or not need_library:
+                    for r in measured:
+                        fn = ((lambda *o: p(*o, _rounds=1)) if single
+                              else (lambda *o, _r=r: p.batched(*o, _rounds=_r)))
+                        c_r = _program_bytes(fn, abstract)
+                        rounds_local[str(r)] = None if c_r is None else int(c_r)
+                # Round 2: every rank's own figures, agreed conservatively.
+                mine = {"library": None if lib_local is None else int(lib_local),
+                        "rounds": rounds_local}
+                agreed = _agreed(_exchange(tag + "/measure", mine), need_library)
+                if agreed is not None and default and _valid_costs(agreed, measured, need_library):
+                    _measured_cache_put(disk_key, agreed)
+            _MEASURED[disk_key] = agreed
         if agreed is not None:
             costs = {int(r): c for r, c in agreed["rounds"].items()}
             low = {int(r): c for r, c in agreed["rounds_min"].items()}
             inc_cost = agreed["library"] if need_library else low.get(incumbent)
     seconds = time.perf_counter() - started
-    room = None if p.budget_bytes is None else int(p.budget_bytes)
     within = lambda r: (costs.get(r) is not None and inc_cost is not None and costs[r] <= inc_cost
                         and (room is None or costs[r] <= room))
     if need_library:
@@ -775,7 +783,6 @@ def _measured_rounds(p, A, args, single: bool = False):
     else:
         fits = [r for r in measured if r < incumbent and within(r)]
         chosen = fits[0] if fits else None    # None: the incumbent, main's own round rule
-    _MEASURED[key] = chosen
     gb = lambda b: "n/a" if b is None else f"{b / 1e9:.4f}"
     inc_name = library if need_library else f"one_device in {incumbent} round(s)"
     rule = _RULE.format(room="" if room is None else f" and the room {room / 1e9:.2f} GB")
@@ -1053,33 +1060,38 @@ class Plan:
         return self.stack_route(shape, dtype, traced=traced).route
 
     def decision(self, A, *args) -> tuple:
-        """The static choices :meth:`batched` makes for this call signature, without the room.
+        """What :meth:`batched` traces for this call signature, without the room.
 
-        ``(backend, route, rounds, max_n)``: the resolved backend, the batched route
-        (:meth:`route_for`), the measured size route's rounds (:func:`_measured_rounds`:
-        0 the leg library, None one_device's own round rule, or None where it does not
-        apply) and one_device's bound (:func:`distrib_la.resolve.one_device_max_n`; None
-        off one_device).  These are everything a plan's room decides in the program
-        :meth:`batched` traces for ``A`` and ``args``, so a caller's program cache keys on
-        this tuple and never on the room (COMPILEAUDIT 2026-10-05 rule 4).  Host-side, on
-        arrays or ``jax.ShapeDtypeStruct`` (only shape and dtype are read), through the
-        same functions and memo caches :meth:`batched` uses, so the later trace reaches
-        the same answer from the memo.  An eigh plan with a room decides per stack in
-        :meth:`stack_route` and is not covered.
+        ``(backend, route, rounds)`` (:meth:`_decide`): everything a plan's room decides in
+        the program :meth:`batched` traces for ``A`` and ``args``, so a caller's program cache
+        keys on this tuple and never on the room (COMPILEAUDIT 2026-10-05 rule 4).  Host-side,
+        on arrays or ``jax.ShapeDtypeStruct`` (only shape and dtype are read).  An eigh plan
+        with a room decides per stack in :meth:`stack_route` and is not covered.
         """
         if self.op == "eigh" and self.budget_bytes is not None:
             raise NotImplementedError("Plan.decision: an eigh plan with a room decides per "
                                       "stack (stack_route); not covered")
-        route = self.route_for(A.shape, A.dtype)
+        return self._decide(A, args)
+
+    def _decide(self, A, args, traced: bool = True, route: str | None = None) -> tuple:
+        """``(backend, route, rounds)`` :meth:`batched` runs ``A``, ``args`` with: the one place
+        it is decided.  ``rounds`` is set on ``one_device``'s stacked entry only: the measured
+        size route's (:func:`_measured_rounds`; 0 the leg library), else the round rule against
+        the bound (:func:`distrib_la._one_device.rounds_for`; the leg row, or on a room leg the
+        room this plan was resolved against).  ``route`` is the gates' override."""
+        route = self.route_for(A.shape, A.dtype, traced) if route is None else route
         rounds = None
-        if route == ROUTE_BACKEND_BATCHED and self._measured_applies():
-            rounds = _measured_rounds(self, A, args)
-        max_n = None
-        if self.backend == ONE_DEVICE and rounds != 0:
-            from distrib_la import resolve as _resolve
-            max_n = _resolve.one_device_max_n(self.op, _resolve.mesh_platform(self.mesh),
-                                              self.budget_bytes)
-        return (self.backend, route, rounds, max_n)
+        if route == ROUTE_BACKEND_BATCHED and self.backend == ONE_DEVICE:
+            if self._measured_applies():
+                rounds = _measured_rounds(self, A, args)
+            if rounds is None:
+                from distrib_la import _one_device as od, resolve as _resolve
+                n = int(A.shape[-1])
+                bound = od._bound(self.op, self.mesh, n, _resolve.one_device_max_n(
+                    self.op, _resolve.mesh_platform(self.mesh), self.budget_bytes))
+                rounds = od.rounds_for(int(A.shape[0]), n, od._ranks(self.mesh), bound,
+                                       int(args[0].shape[-1]) if self.op == "solve_lu" else None)
+        return (self.backend, route, rounds)
 
     def stack_route(self, shape, dtype, op: str = "eigh", traced: bool = True) -> StackRoute:
         """How :meth:`batched` runs one operand stack: the service's decision.
@@ -1258,8 +1270,7 @@ class Plan:
             call = functools.partial(call, max_n=_resolve.one_device_max_n(
                 self.op, _resolve.mesh_platform(self.mesh), self.budget_bytes))
             if rounds is not None and key == "many":
-                # The measured-cost size route's rounds (_measured_rounds).
-                call = functools.partial(call, rounds=int(rounds))
+                call = functools.partial(call, rounds=int(rounds))      # Plan._decide's
         if call is None or self.op not in ("eigh", "solve_lu"):
             return call, spec["post"]
         if self.op == "solve_lu":
@@ -1455,13 +1466,9 @@ class Plan:
                     f"{ROUTE_BATCH_RESHARD!r}.")
             return self(A, *args, **kwargs)
 
-        rounds = None
-        if route == ROUTE_BACKEND_BATCHED and self._measured_applies():
-            # The size route against main's incumbent: the fewest-round one_device whose compiled
-            # per-rank bytes are within the incumbent's (and the room), else the incumbent.
-            rounds = _rounds if _rounds is not None else _measured_rounds(self, A, args)
-            if rounds == 0:
-                return self._library_plan().batched(A, *args, **kwargs)
+        rounds = _rounds if _rounds is not None else self._decide(A, args, traced, route)[2]
+        if rounds == 0:
+            return self._library_plan().batched(A, *args, **kwargs)
         ops = tuple(ensure_sharding(x, self.batch_in_sharding)
                     for x in (A, *args))
         if route == ROUTE_BACKEND_BATCHED:

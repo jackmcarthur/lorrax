@@ -282,7 +282,18 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   is exchanged between ranks.
 - **One plan per room.** A plan carries one room; a caller that keys
   programs on the plan (the scalar face constructor floors its rooms to whole
-  GiB) compiles again when its room changes.
+  GiB) compiles again when its room changes. A caller that keys them on the
+  plan's decision does not (next paragraph).
+- **Decision-keyed programs.** `Plan.decision(A, *args)` returns, host-side
+  on arrays or `jax.ShapeDtypeStruct`s, the `(backend, route, rounds)` that
+  `batched` traces for that call signature: the route (`route_for`) and, on
+  `one_device`'s stacked entry, its round count (the
+  [measured size route's](backends.md#measured-route), else the round rule
+  against the bound). `batched` runs from the same private `Plan._decide`, so
+  the two cannot disagree. The room enters a program only through this tuple:
+  a caller that caches programs per (signature, decision) compiles once per
+  decision, not per room (`gw.response_bank`'s Dyson programs do). An eigh plan
+  with a room decides per stack (`stack_route`) and refuses `decision`.
 - **Reporting.** Each decision is printed once per (op, B, n, dtype, room,
   phase: first attempt or whole chain) by `new_stack_routes()`, which a driver prints through its
   reporter, and listed by `describe()`. `known_route` is the pure query for

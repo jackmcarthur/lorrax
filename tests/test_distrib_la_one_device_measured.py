@@ -67,6 +67,11 @@ def _abstract(mesh, *xs):
     return tuple(jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=face) for x in xs)
 
 
+def _chosen(p, A, B):
+    """The size route's decision for this call: arithmetic on the memoised costs."""
+    return plan_mod._measured_rounds(p, A, (B,))
+
+
 def _od_costs(p, mesh, A, B):
     return {r: plan_mod._program_bytes(lambda a, b, _r=r: p.batched(a, b, _rounds=_r),
                                        _abstract(mesh, A, B))
@@ -93,7 +98,7 @@ def test_one_device_dearer_than_the_library_is_refused(mesh, leg, monkeypatch):
     assert p.backend == "one_device"
     with pytest.raises((RuntimeError, ValueError), match=LIBRARY[leg]):
         p.batched(_face(mesh, A), _face(mesh, B))
-    assert list(plan_mod._MEASURED.values()) == [0]
+    assert _chosen(p, A, B) == 0
     lines = [l for l in distrib_la.new_stack_routes() if "measured" in l]
     assert lines and lines[-1].endswith(f"-> {LIBRARY[leg]} (the incumbent)")
 
@@ -109,7 +114,7 @@ def test_fewest_rounds_within_the_library_cost_run(mesh, leg, monkeypatch):
         monkeypatch.setattr(plan_mod, "_library_bytes", lambda p_, a_, s_, _l=lib: _l)
         want = next(r for r in sorted(costs) if costs[r] <= lib)
         X = p.batched(_face(mesh, A), _face(mesh, B))
-        assert list(plan_mod._MEASURED.values()) == [want]
+        assert _chosen(p, A, B) == want
         assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
 
 
@@ -134,7 +139,7 @@ def test_no_library_on_this_host_keeps_the_round_rule(mesh, leg):
     p = distrib_la.plan("solve_lu", mesh, backend="distributed", n=8, batched_route="auto",
                         budget_bytes=_room(leg))
     X = p.batched(_face(mesh, A), _face(mesh, B))
-    assert list(plan_mod._MEASURED.values()) == [None]
+    assert _chosen(p, A, B) is None
     assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
 
 
@@ -177,11 +182,11 @@ def test_costs_are_cached_on_disk_and_the_room_applied_at_lookup(mesh, leg, monk
     X = p.batched(_face(mesh, A), _face(mesh, B))
     first = len(compiled)
     assert first == len(plan_mod._round_candidates(16, 4)) and len(list(tmp_path.glob("*.json"))) == 1
-    assert list(plan_mod._MEASURED.values()) == [1]
+    assert _chosen(p, A, B) == 1
     plan_mod._MEASURED.clear()
     p.batched(_face(mesh, A), _face(mesh, B))
     assert len(compiled) == first                       # warm: nothing compiled to decide
-    assert list(plan_mod._MEASURED.values()) == [1]
+    assert _chosen(p, A, B) == 1
     assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
 
 
@@ -207,7 +212,7 @@ def test_a_damaged_or_stale_cache_entry_is_re_measured(mesh, leg, monkeypatch, t
     route is the same; it is never used to route."""
     import json
     p, A, B, compiled = _cached_setup(mesh, leg, monkeypatch, tmp_path)
-    first, want = len(compiled), list(plan_mod._MEASURED.values())
+    first, want = len(compiled), _chosen(p, A, B)
     (f,) = tmp_path.glob("*.json")
     entry = json.loads(f.read_text())
     if damage == "truncate":
@@ -227,7 +232,7 @@ def test_a_damaged_or_stale_cache_entry_is_re_measured(mesh, leg, monkeypatch, t
     plan_mod._MEASURED.clear()
     p.batched(_face(mesh, A), _face(mesh, B))
     assert len(compiled) == 2 * first                    # re-measured
-    assert list(plan_mod._MEASURED.values()) == want     # the same route
+    assert _chosen(p, A, B) == want                      # the same route
 
 
 def test_the_agreement_is_conservative_and_refuses_a_mixed_library():
@@ -267,7 +272,7 @@ def test_ranks_with_divergent_figures_take_one_route(mesh, leg, monkeypatch, tmp
     plan_mod._MEASURED.clear()
     with pytest.raises((RuntimeError, ValueError), match=LIBRARY[leg]):
         p.batched(_face(mesh, A), _face(mesh, B))
-    assert seen == ["probe", "measure"] and list(plan_mod._MEASURED.values()) == [0]
+    assert seen == ["probe", "measure"] and _chosen(p, A, B) == 0
 
 
 @pytest.mark.parametrize("leg", ["CUDA"], indirect=True)
@@ -368,7 +373,7 @@ def test_a_one_round_one_device_incumbent_is_never_measured(mesh, leg, monkeypat
     A, B = _lu(seed=11)
     p = _lu_plan(mesh, leg)
     X = p.batched(_face(mesh, A), _face(mesh, B))
-    assert calls == [] and asked == [] and list(plan_mod._MEASURED.values()) == [None]
+    assert calls == [] and asked == [] and _chosen(p, A, B) is None
     assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
     (line,) = _ledger()
     assert "nothing measured" in line and line.endswith("-> one_device in 1 round(s) (the incumbent)")
@@ -384,7 +389,7 @@ def test_lower_memory_but_more_rounds_than_the_one_device_incumbent_keeps_it(mes
     A, B = _lu(seed=12)
     p = _lu_plan(mesh, leg)
     X = p.batched(_face(mesh, A), _face(mesh, B))
-    assert sorted(set(calls)) == [1, 2] and list(plan_mod._MEASURED.values()) == [None]
+    assert sorted(set(calls)) == [1, 2] and _chosen(p, A, B) is None
     assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
     (line,) = _ledger()
     assert "incumbent one_device in 2 round(s) 0.0000" in line
@@ -403,7 +408,7 @@ def test_fewer_rounds_within_the_one_device_incumbent_take_it(mesh, leg, monkeyp
     A, B = _lu(seed=13)
     p = _lu_plan(mesh, leg)
     X = p.batched(_face(mesh, A), _face(mesh, B))
-    assert sorted(set(calls)) == [1, 2, 4] and list(plan_mod._MEASURED.values()) == [want]
+    assert sorted(set(calls)) == [1, 2, 4] and _chosen(p, A, B) == want
     assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
     (line,) = _ledger()
     assert line.endswith("(the incumbent)" if want is None else f"-> one_device in {want} round(s)")
@@ -423,7 +428,7 @@ def test_a_library_incumbent_takes_one_device_in_k_rounds_within_it(mesh, leg, m
     else:
         X = p.batched(_face(mesh, A), _face(mesh, B))
         assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
-    assert sorted(set(calls)) == [1, 2, 4] and list(plan_mod._MEASURED.values()) == [want]
+    assert sorted(set(calls)) == [1, 2, 4] and _chosen(p, A, B) == want
     (line,) = _ledger()
     assert f"incumbent cusolvermp {lib / 1e9:.4f}" in line
     assert line.endswith("-> cusolvermp (the incumbent)" if want == 0 else f"-> one_device in {want} round(s)")
@@ -442,4 +447,62 @@ def test_a_k_round_incumbent_figure_is_cached_and_measured_once(mesh, leg, monke
     assert first == 3 and len(list(tmp_path.glob("*.json"))) == 1
     plan_mod._MEASURED.clear()
     p.batched(_face(mesh, A), _face(mesh, B))
-    assert len(calls) == first and list(plan_mod._MEASURED.values()) == [2]
+    assert len(calls) == first and _chosen(p, A, B) == 2
+
+
+# ---- the decision a caller keys on (Plan.decision, audit C4) ---------------------------------
+@pytest.mark.parametrize("leg", ["CUDA"], indirect=True)
+def test_the_decision_is_what_the_program_runs_and_not_the_room(mesh, leg, monkeypatch):
+    """CUDA room leg, no library on this host: one_device's round rule against the room's bound.
+    Two rooms with the same rounds are one decision (the bound itself moves with the room and
+    reaches no program); a room that changes the rounds flips it; and the program batched
+    traces runs the decision's rounds."""
+    ran = []
+    real = od.batched_distributed_solve_lu
+    monkeypatch.setattr(od, "batched_distributed_solve_lu",
+                        lambda *a, rounds=None, **k: ran.append(rounds) or real(*a, rounds=rounds, **k))
+    A, B = _lu(seed=17)
+    one = od.one_device_bytes("solve_lu", 8)
+
+    face = NamedSharding(mesh, P(None, "x", "y"))
+
+    def decided(room):
+        p = distrib_la.plan("solve_lu", mesh, backend="distributed", n=8, batched_route="auto",
+                            budget_bytes=room)
+        d = p.decision(*_abstract(mesh, A, B))
+        X = distrib_la.checked_program(lambda a, b: p.batched(a, b), mesh, face,
+                                       in_shardings=(face, face))(_face(mesh, A), _face(mesh, B))
+        assert ran[-1] == d[2] and np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
+        return d
+    assert resolve_mod.one_device_max_n("solve_lu", "CUDA", 10 ** 10) != \
+        resolve_mod.one_device_max_n("solve_lu", "CUDA", 10 ** 10 + 10 ** 7)
+    assert decided(10 ** 10) == decided(10 ** 10 + 10 ** 7) == ("one_device", "backend_batched", 1)
+    assert decided(one) == ("one_device", "backend_batched", 4)      # bound 8: one matrix a round
+
+
+@pytest.mark.parametrize("leg", ["CUDA"], indirect=True)
+def test_a_new_room_is_decided_from_the_memoised_costs(mesh, leg, monkeypatch, tmp_path):
+    """The agreed costs are memoised without the room: another room exchanges nothing, reads
+    and compiles nothing, and applies itself to the same figures."""
+    one = od.one_device_bytes("solve_lu", 8)
+    calls = _fake_costs(monkeypatch, {1: 3 * one, 2: 2 * one, 4: one}, tmp_path, lib=2 * one + 1)
+    seen = []
+    real = plan_mod._exchange
+    monkeypatch.setattr(plan_mod, "_exchange", lambda tag, payload: seen.append(tag) or real(tag, payload))
+    A, B = _lu(seed=18)
+    plans = [distrib_la.plan("solve_lu", mesh, backend="distributed", n=8, batched_route="auto",
+                             budget_bytes=room) for room in (1 << 40, one)]
+    assert _chosen(plans[0], A, B) == 2
+    first = (len(calls), len(seen))
+    assert _chosen(plans[1], A, B) == 4                               # only 4 rounds fit the room
+    assert (len(calls), len(seen)) == first == (3, 2)
+
+
+@pytest.mark.parametrize("leg", ["CUDA"], indirect=True)
+def test_a_room_that_differs_across_ranks_is_refused(mesh, leg, monkeypatch, tmp_path):
+    """The room rides the probe: ranks that disagree on it are refused by name, never routed."""
+    _fake_costs(monkeypatch, {1: 100, 2: 80, 4: 50}, tmp_path, lib=90)
+    monkeypatch.setattr(plan_mod, "_exchange",
+                        lambda tag, payload: [payload, dict(payload, room=payload["room"] + 1)])
+    with pytest.raises(RuntimeError, match="room that differs across processes"):
+        _chosen(_lu_plan(mesh, leg), *_lu(seed=19))

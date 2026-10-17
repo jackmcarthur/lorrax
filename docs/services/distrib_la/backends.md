@@ -86,6 +86,7 @@ local LU on every layout, so it has no field.
 | `eigh` | `auto off distributed cusolvermp slate scalapack one_device` | `native` everywhere | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` for `n ≤ 16384`, else `slate` ([size route](#size-route)) |
 | `cholesky` | `auto off native2d cusolvermp slate` | `cusolvermp` on a CUDA mesh with `P_x ≥ 2` and `P_y ≥ 2` when compiled, else `native` | not in the vocabulary |
 | `solve_lu` | `auto off distributed cusolvermp scalapack slate one_device` | as `cholesky` (ROCm: `native`) | CPU → `scalapack`, CUDA → `cusolvermp`, ROCm → `one_device` for `n ≤ 8192`, else `slate` ([size route](#size-route)) |
+| `eigh`, `solve_lu` with a room (`budget_bytes`) | as above | as above | CUDA → `one_device` where one whole matrix's priced program fits the room, else `cusolvermp` ([room leg](#measured-route)) |
 
 - `off` and its spelling `native` resolve to `native` unconditionally: the
   pure-JAX path (`jnp.linalg.eigh`, or the caller's own Cholesky and LU
@@ -254,6 +255,29 @@ The native complex128 LU on one GCD (jaxlib getrf/getrs on rocSOLVER, ROCm
 8e-3; pool log `distla_lubig`). float64 at 16384 and complex128 at n ≤ 11616 are
 exact (`distla_lubig2`). The checked solve refused the one-device result by name
 (`GATE distrib_la_result_check`). Beyond 8192 the LU is SLATE's.
+
+### The CUDA room leg and the measured size route {#measured-route}
+
+CUDA has no size row. It is a room leg (`resolve.ONE_DEVICE_BY_ROOM`): given a
+room, `distributed` resolves to `one_device` where one whole matrix's priced
+program fits it (`resolve.one_device_max_n`, the largest such `n`), else to
+`cusolvermp`. Without a room it is `cusolvermp`.
+
+A `distributed` plan resolved to `one_device` then decides each call signature
+against main's incumbent (`plan._measured_rounds`): `cusolvermp` on CUDA,
+`one_device` in the round rule's count on ROCm. The candidates are the
+`one_device` round counts that could beat it, priced by XLA's
+`memory_analysis` of their compiled programs. The fewest-round candidate whose
+per-rank bytes are within the incumbent's and within the room runs, else the
+incumbent. Every rank's figures are agreed over the coordination service's
+key-value store, with the largest candidate bytes against the smallest
+incumbent bytes. A room that differs across ranks is refused by name. The
+agreed figures are cached on disk and in memory per signature without the
+room, so a later room is decided by arithmetic: no exchange, no disk read, no
+compile. Each decision is a route-ledger line. The result is what
+`Plan.decision` reports ([decision-keyed programs](api.md#eigh-stack)).
+Vendor workspaces allocated at run time (jaxlib's cuSOLVER `getrf`/`getrs`
+scratch) are outside the analysis.
 
 For a matrix that fits one device, a distributed library's cost is its fixed
 per-call charge, almost all of it inside `cusolverMpSyevd`, which the local

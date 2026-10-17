@@ -6,7 +6,7 @@ Disk conversion belongs to the scratch writer. Dense products and solves
 enter through ``distrib_la``.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from functools import lru_cache
 import hashlib
@@ -42,8 +42,10 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     Returns
     -------
     dyson, slope, moments, receipt
-        Jitted functions accepting complex128 ``[b,n,n]`` operators at
-        ``P(None,'x','y')``, and the resolved backend/prefactor description.
+        Compiled-program callables (``__call__``, ``lower``, ``finish``) accepting
+        complex128 ``[b,n,n]`` operators at ``P(None,'x','y')``, and the resolved
+        backend/prefactor description.  The programs that hold the Dyson solve are
+        keyed on its LU plan's decision, never on the room (:class:`_Decided`).
         ``dyson.value(H, chi_raw)`` returns Wc (Ry); ``slope(H, Wc, dchi_raw)``
         returns its s derivative (Ry^-1), restoring the bare operator internally (photon input is W-V). ``moments(H, A0, A1)`` takes already scaled
         bare-response expansion coefficients and returns M1/M3 (Ry^3/Ry^5).
@@ -65,12 +67,10 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     pref = _w_solve_pref_scalar(meta)
-    lu_key = (mesh_xy, n, backend, route,
-              _dyson_room(meta, mesh_xy, n) if backend == "distributed" else None)
-    lu = _lu_plan(lu_key)
     built = _response_programs(mesh_xy, n, backend, route, pref, ordered,
                                float(meta.cell_volume) if photon else None)
-    dyson, moments = built.bind(lu, lu_key)
+    room = _dyson_room(meta, mesh_xy, n) if backend == "distributed" else None
+    dyson, moments, lu = built.bind(room)
     slope = built.slope
     algebra = {
         "linalg": resolution.layout,
@@ -114,80 +114,39 @@ def _dyson_room(meta, mesh_xy, n):
     return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - faces)
 
 
-#: The Dyson LU plan per (mesh, n, backend, route, room) (:func:`_lu_plan`): a decision
-#: input, never a program.
-_LU_PLANS: dict = {}
-#: The solve operands' avals of one solve-bearing program per call signature (room-free).
-_SOLVE_OPERANDS: dict = {}
-#: ``Plan.decision`` per (room's plan, builder, program, signature): a decision memo.
-_DECISIONS: dict = {}
-#: The solve-bearing programs, keyed on the LU plan's decision, never on the room.
+#: The solve-bearing programs per (builder, program, call signature, LU decision): never the room.
 _VARIANTS: dict = {}
 
 
-def _lu_plan(key):
-    """The Dyson LU plan for ``key = (mesh_xy, n, backend, route, room)``, resolved once.
-
-    ``room`` (:func:`_dyson_room`) is the plan's per-rank room: on every leg distrib_la
-    takes one_device only where one whole matrix fits it (resolve.one_device_max_n),
-    else the distributed library.  The plan is a decision input; the programs that run
-    it key on its decision (:class:`_Decided`).
-    """
-    lu = _LU_PLANS.get(key)
-    if lu is None:
-        from distrib_la import plan
-        mesh_xy, n, backend, route, room = key
-        lu = _LU_PLANS[key] = plan("solve_lu", mesh_xy, backend=backend, n=n,
-                                   batched_route=route, budget_bytes=room)
-    return lu
-
-
-def _signature(args):
-    """A call's (shape, dtype) per operand: what a program variant is traced on."""
-    return tuple((tuple(int(s) for s in x.shape), str(x.dtype)) for x in args)
-
-
+@dataclass(frozen=True)
 class _Decided:
     """A solve-bearing response program keyed on the Dyson LU plan's decision.
 
-    The room enters the HLO only through ``lu.decision`` (distrib_la ``Plan.decision``:
-    backend, route, measured rounds, one_device bound).  Each call signature takes the
-    variant cached on ``(builder, name, signature, decision)``, built with this ``lu``
-    on a miss and only ever traced on that signature, so a room that moves without
-    moving the decision lowers and compiles nothing again (COMPILEAUDIT 2026-10-05
-    rule 4).  The first call per signature reads the operands' avals once per process
-    (``jax.eval_shape`` with a recording solve) and the decision once per room; later
-    calls are dictionary lookups.  Callable, with the checked program's ``lower`` and
-    ``finish``; :func:`_compiled` keys on :meth:`resolve`'s variant.
+    The room enters the HLO only through ``Plan.decision`` (backend, route, rounds).  Every
+    solve in these bodies takes ``(b, n, n)`` operands at the face, ``b`` the leading
+    extent of operand 1, so each call signature takes the variant cached on ``(builder,
+    name, signature, decision)``, built with this room's plan on a miss and only ever traced
+    on that signature: a room that moves without moving the decision lowers and compiles
+    nothing again (COMPILEAUDIT 2026-10-05 rule 4).  A value (``builder`` is
+    :func:`_response_programs`' key; ``lu``, that room's plan, is not compared), so equal
+    programs compare equal.  The check-then-set needs no lock: ``compile_ahead`` lowers on
+    the calling thread (INVARIANTS 21/25).
     """
-
-    def __init__(self, builder, name, lu, lu_key):
-        self._builder, self._name, self._lu, self._lu_key = builder, name, lu, lu_key
-        self._resolved = {}
+    builder: tuple
+    name: str
+    room: object
+    lu: object = field(compare=False, repr=False)
 
     def resolve(self, *args):
         """The variant program for this call signature."""
-        sig = _signature(args)
-        prog = self._resolved.get(sig)
-        if prog is None:
-            prog = self._resolved[sig] = self._variant(sig)
-        return prog
-
-    def _variant(self, sig):
-        builder, name = self._builder, self._name
-        dkey = (self._lu_key, builder.key, name, sig)
-        decision = _DECISIONS.get(dkey)
-        if decision is None:
-            okey = (builder.key, name, sig)
-            operands = _SOLVE_OPERANDS.get(okey)
-            if operands is None:
-                operands = _SOLVE_OPERANDS[okey] = builder.solve_operands(name, sig)
-            decision = _DECISIONS[dkey] = tuple(self._lu.decision(*ops) for ops in operands)
-        vkey = (builder.key, name, sig, decision)
-        prog = _VARIANTS.get(vkey)
-        if prog is None:
-            prog = _VARIANTS[vkey] = builder.program_for(name, self._lu.batched)
-        return prog
+        x, n = args[1], self.builder[1]
+        face = jax.ShapeDtypeStruct((int(x.shape[0]), n, n), x.dtype)
+        key = (self.builder, self.name, tuple((tuple(a.shape), str(a.dtype)) for a in args),
+               self.lu.decision(face, face))
+        if key not in _VARIANTS:
+            builder = _response_programs(*self.builder)
+            _VARIANTS[key] = builder.program_for(self.name, self.lu.batched)
+        return _VARIANTS[key]
 
     def __call__(self, *args):
         return self.resolve(*args)(*args)
@@ -204,16 +163,17 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     """Reuse compiled algebra across SC maps without retaining state arrays.
 
     Returns the builder: ``slope``, the charge ``moments`` (no solve), and
-    ``bind(lu, lu_key) -> (dyson, moments)`` for the Dyson LU plan ``lu``
-    (:func:`_lu_plan`).  On the distributed backend the programs that hold the solve
-    are :class:`_Decided`, keyed on ``lu``'s decision and never on the room that
-    decides it; on ``off`` they solve locally and are built once.
+    ``bind(room) -> (dyson, moments, lu)`` with the Dyson LU plan ``lu`` at ``room``
+    (:func:`_dyson_room`: on every leg distrib_la takes one_device only where one whole
+    matrix fits it, else the distributed library).  On the distributed backend the
+    programs that hold the solve are :class:`_Decided`, keyed on that plan's decision and
+    never on the room that decides it; on ``off`` they solve locally and are built once.
     """
     from types import SimpleNamespace
-    from distrib_la import batch_layout, checked_program, local_batch, matmul
+    from distrib_la import batch_layout, checked_program, local_batch, matmul, plan
 
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
-    builder = SimpleNamespace(key=(mesh_xy, n, backend, route, pref, ordered, volume))
+    key = (mesh_xy, n, backend, route, pref, ordered, volume)
 
     def program(inputs, outputs=1, resident=(), layout="face"):
         def wrap(fn):
@@ -298,32 +258,18 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
         body, inputs, outputs, resident, layout = bodies(solve)[name]
         return program(inputs, outputs, resident, layout)(body)
 
-    def solve_operands(name, sig):
-        """The avals each solve in program ``name`` receives on call signature ``sig``."""
-        seen = []
-
-        def solve(a, b):
-            seen.append((jax.ShapeDtypeStruct(a.shape, a.dtype),
-                         jax.ShapeDtypeStruct(b.shape, b.dtype)))
-            return jnp.zeros_like(b)
-        jax.eval_shape(bodies(solve)[name][0],
-                       *(jax.ShapeDtypeStruct(s, d, sharding=face) for s, d in sig))
-        return tuple(seen)
-
     local = ({name: program_for(name, jnp.linalg.solve) for name in bodies(jnp.linalg.solve)}
              if backend == "off" else None)
     names = tuple(bodies(None))
 
-    def bind(lu, lu_key):
-        progs = local if local is not None else {
-            name: _Decided(builder, name, lu, lu_key) for name in names}
+    def bind(room):
+        lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
+        progs = local or {name: _Decided(key, name, room, lu) for name in names}
         pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
         resident = backend == "off" and volume is None
         dyson = SimpleNamespace(value=progs["value"], pair=pairs.get,
                                 place=(lambda h: batch_layout(h, mesh_xy)) if resident else (lambda h: h))
-        return dyson, progs.get("moments", builder.moments)
-
-    builder.program_for, builder.solve_operands, builder.bind = program_for, solve_operands, bind
+        return dyson, progs.get("moments", moments), lu
 
     if volume is None:
         @program(3)
@@ -363,8 +309,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             return derivative(wc + v, dchi_raw)
         moments = None
 
-    builder.slope, builder.moments = slope, moments
-    return builder
+    return SimpleNamespace(program_for=program_for, bind=bind, slope=slope, moments=moments)
 
 
 def response_weights(wfns, meta):
