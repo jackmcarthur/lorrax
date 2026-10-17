@@ -1165,11 +1165,7 @@ constexpr int GITEMS = KG::NK * TPP;           // (k, pair) items of a tile
 constexpr int GMAX = 4;                        // items per thread held across A1 -> A2
 // A1 + A2.  Ends with a barrier.
 __device__ __forceinline__ void gather(lrx_c2* __restrict__ bank, const lrx_c2* __restrict__ gp,
-                                       const lrx_c2* __restrict__ gt, const UnfoldTab& t, const PInfo* __restrict__ pi,
-                                       const int* __restrict__ lkf, const int* __restrict__ rkf) {
-#if !LRX_M7KF
-    (void)lkf; (void)rkf;
-#endif
+                                       const lrx_c2* __restrict__ gt, const UnfoldTab& t, const PInfo* __restrict__ pi) {
     const lrx_c2* __restrict__ mph = reinterpret_cast<const lrx_c2*>(t.mph);
     const lrx_c2* __restrict__ nph = reinterpret_cast<const lrx_c2*>(t.nph);
     const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t.spin);
@@ -1192,13 +1188,8 @@ __device__ __forceinline__ void gather(lrx_c2* __restrict__ bank, const lrx_c2* 
                 const bool anti = t.trs[k] != 0;
                 vmask[u] = anti ? 1u << 16 : 0u;
                 src = ((anti && t.conj_trs == 0) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
-#if LRX_M7KF
-                load_ns(lkf + ((long long)p.xx * KG::NK + k) * NS, ls);    // the k-fastest copies
-                load_ns(rkf + ((long long)p.yy * KG::NK + k) * NS, rs);
-#else
                 load_ns(t.lsrc + (long long)k * t.ml + p.xx * NS, ls);
                 load_ns(t.rsrc + (long long)k * t.nl + p.yy * NS, rs);
-#endif
             }
 #pragma unroll
             for (int c = 0; c < NS; ++c) {
@@ -1359,46 +1350,6 @@ __device__ __forceinline__ void store_x(const lrx_c2* __restrict__ bank, lrx_c2*
     lrx_c2* yb, long long pb0, long long npairs, int phase, const int* __restrict__ live
 // live: the window rows [live[0], live[1]) of a padded pass (kbox_stage.cuh Live; null: all).
 #define M7_LIVE(zero) lrx_kbox::Live::rows(live, (t.nl / NR) * SSO, pb0 * SSO, zero)
-#ifndef LRX_M7KF
-#define LRX_M7KF 0
-#endif
-#if LRX_M7F && !LRX_TT && LRX_M7KF
-// The k-fastest copies of the endpoint index tables (LRX_M7KF; the host sets it where a tile holds at
-// most 4 pairs, so a warp's gather items span >= 8 k): lsrc (nk, ml) -> (ml / NS, nk, NS) and rsrc
-// (nk, nl) -> (nl / NS, nk, NS) in the call's scratch yb, so a warp's index loads read one run along k
-// per centroid instead of one sector per k.  A pure copy of the NS-int groups (the same values).
-template <int N> struct M7KfIdx;
-template <> struct M7KfIdx<1> { using T = int; };
-template <> struct M7KfIdx<2> { using T = int2; };
-using M7KfT = typename M7KfIdx<NS>::T;
-__device__ __forceinline__ long long m7kf_off(long long ml) { return (ml * KG::NK + 63) / 64 * 64; }   // ints
-__device__ __forceinline__ void m7kf_tile(const int* __restrict__ in, int* __restrict__ out, long long mc,
-                                          long long tile, M7KfT (&b)[32][33]) {
-    const M7KfT* __restrict__ iv = reinterpret_cast<const M7KfT*>(in);
-    M7KfT* __restrict__ ov = reinterpret_cast<M7KfT*>(out);
-    const long long tn = (mc + 31) / 32, k0 = (tile / tn) * 32, i0 = (tile % tn) * 32;
-    const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
-    for (int r = ty; r < 32; r += 8) {
-        const long long k = k0 + r, i = i0 + tx;
-        if (k < KG::NK && i < mc) b[r][tx] = iv[k * mc + i];
-    }
-    __syncthreads();
-    for (int r = ty; r < 32; r += 8) {
-        const long long i = i0 + r, k = k0 + tx;
-        if (k < KG::NK && i < mc) ov[i * KG::NK + k] = b[tx][r];
-    }
-}
-// 256 threads; blocks [0, nbl) transpose lsrc, the rest rsrc (the host sums the same tile counts).
-extern "C" __global__ void __launch_bounds__(256) lrx_kconv_kf(M7_ARGS) {
-    __shared__ M7KfT buf[32][33];
-    (void)gp; (void)gt; (void)kern; (void)y; (void)scale; (void)pb0; (void)npairs; (void)phase; (void)live;
-    const long long mcl = t.ml / NS, mcr = t.nl / NS, tk = (KG::NK + 31) / 32;
-    const long long nbl = tk * ((mcl + 31) / 32);
-    int* outl = reinterpret_cast<int*>(yb);
-    if ((long long)blockIdx.x < nbl) m7kf_tile(t.lsrc, outl, mcl, blockIdx.x, buf);
-    else m7kf_tile(t.rsrc, outl + m7kf_off(t.ml), mcr, blockIdx.x - nbl, buf);
-}
-#endif
 #ifndef LRX_M7S
 #define LRX_M7S 0
 #endif
@@ -1888,12 +1839,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(M7
     if (col0 < ce) m7f::fill_pinfo(pinfo[0], sp, col0);
     __syncthreads();
     for (int par = 0; col0 < ce; col0 += cstep, par ^= 1) {
-#if LRX_M7KF
-        m7f::gather(sm, gp, gt, t, pinfo[par], reinterpret_cast<const int*>(yb),
-                    reinterpret_cast<const int*>(yb) + m7kf_off(t.ml));
-#else
-        m7f::gather(sm, gp, gt, t, pinfo[par], nullptr, nullptr);
-#endif
+        m7f::gather(sm, gp, gt, t, pinfo[par]);
         m7f::pass_z<fft_direction::inverse>(sm);
         m7f::pass_y<fft_direction::inverse>(sm);
         m7f::mid_x(sm, kern, sp, pinfo[par]);
@@ -3380,8 +3326,6 @@ struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile
                int trw = 0, threads3 = 0, smem3 = 0;
                // Mode 7, split arm: the mid (fn2 at threads2) and pass (fn3 at threads3 / smem3) entries.
                CUfunction fn2 = nullptr, fn3 = nullptr;
-               // Mode 7, m7f: k-fastest index-table copies (LRX_M7KF), fn2 their per-call transpose.
-               int m7kf = 0;
                // m7s: arm 2's whole-group passes (LRX_M7S; the column pass on a persistent grid).
                int m7s = 0;
                int m11f = 0;               // mode 11: the fused single-arm tile (writes acc on overwrite)
@@ -3689,7 +3633,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // admits, at most two (Fe 8^3: 2 x 512 threads at <= 64 registers; unbounded, NVCC took 95 and
     // held one block per SM).
     const int blk = (mode == 7 && variant > 0) ? variant : ns;    // mode 7's output spin block
-    int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0, m7_arm = 0, m7_mid = 0, m7_pass = 0, m7_kf = 0, m7_s = 0;
+    int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0, m7_arm = 0, m7_mid = 0, m7_pass = 0, m7_s = 0;
     // m7s: column blocks per SM; LRX_M7S_BITS 12 = the persistent per-tile plane loop (8) and the
     // pair-major W_R (4).  Measured at 20^3 ns 2 (A100, pass of 16 x 640): bits 0 34.97 ms, 1 32.96,
     // 4 31.48, 5 31.91, 3 33.85 (G evict_last: slower), 12 29.14, 13 29.48, 28 (x-fastest pairs) 32.84.
@@ -3876,9 +3820,6 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_THREADS=" + std::to_string(m7_threads));
         // The fused single-arm tile (m7f, embedded source): the register load of whole groups, n_s <= 2.
         defs.push_back("-DLRX_M7F=" + std::string(m7_arm == 0 && m7_tp == 0 && blk == ns && ns <= 2 ? "1" : "0"));
-        // m7f's k-fastest index tables: where a tile holds <= 4 pairs (a warp's gather items span >= 8 k).
-        m7_kf = (m7_arm == 0 && m7_tp == 0 && blk == ns && ns <= 2 && m7_tr / (ns * ns) <= 4) ? 1 : 0;
-        defs.push_back("-DLRX_M7KF=" + std::to_string(m7_kf));
         if (m7_arm) defs.push_back("-DLRX_THREADS2=" + std::to_string(m7_mid));
         if (m7_arm == 1) defs.push_back("-DLRX_THREADS3=" + std::to_string(m7_pass));
         defs.push_back("-DLRX_M7S=" + std::to_string(m7_s));
@@ -3960,7 +3901,6 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     prog.kernel = "lrx_kconv";
     if (mode == 7 && m7_arm == 1) prog.entries = {"lrx_kconv_mid", "lrx_kconv_pass"};
     if (mode == 7 && m7_arm == 2) prog.entries = {"lrx_kconv_col"};
-    if (mode == 7 && m7_kf) prog.entries = {"lrx_kconv_kf"};
     if (mode == 8 && kb_arm == 1) prog.entries = {"lrx_kconv_heavy"};
     if (mode == 11 && kplan.arm == 1) prog.entries = {"lrx_kconv_pencil"};
     std::string missing;
@@ -4042,7 +3982,6 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         if (m7_arm == 2) b.smem2 = static_cast<int>(m7_col_smem);
         b.m7s = m7_s ? (m7_s_bits << 4) | m7_col_bps : 0;   // bits << 4 | column blocks per SM
         if (m7_tp) b.grid_cap = static_cast<long long>(sms) * m7_blocks;
-        if (m7_kf) { b.fn2 = img.fns[0]; b.m7kf = 1; }
     }
     if (mode == 10) {                                  // persistent blocks: the resident count
         int sms = 0;
@@ -4423,20 +4362,6 @@ static ffi::Error KleadUnfoldImpl(
     };
     if (k->arm == 0) {
         long long blocks = (ncols + k->tr - 1) / k->tr;                 // one block per tile
-        if (k->m7kf) {                                 // m7f's k-fastest index tables, made for this call
-            const long long nint = (ml * nk + 63) / 64 * 64 + nl * nk;   // the embedded m7kf_off layout
-            auto tb = scratch.Allocate(static_cast<size_t>(4 * nint));
-            if (!tb.has_value()) {
-                std::ostringstream os;
-                os << "GATE mathdx-kconv-unfold-scratch: got a refused " << 4 * nint
-                   << " B k-fastest index copy; want the XLA scratch allocator to grant it";
-                return fail("scratch", os.str(), ffi::ErrorCode::kResourceExhausted);
-            }
-            yb = *tb;
-            const long long tk = (nk + 31) / 32;
-            const long long nb = tk * ((ml / ns + 31) / 32) + tk * ((nl / ns + 31) / 32);
-            if (auto e0 = launch(nb, 256, 0, k->fn2); !e0.success()) return e0;
-        }
         if (k->grid_cap > 0) blocks = std::min(blocks, k->grid_cap);   // the tile tables' persistent grid
         return launch(blocks, k->threads, k->smem, k->fn);
     }
