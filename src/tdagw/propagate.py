@@ -121,7 +121,10 @@ STIFF_GROUP_GAP = 1e-6
 #: Σ_k w_k Tr ρ_k, Σ_k w_k Tr ρ_k² (real parts) and |E(t)| (a.u.) per trial.
 PROGRESS = "lorrax.progress"
 #: The host entry of the cumulative counters at a chunk's end: steps, rejected tries,
-#: ΔΣ calls in steps and at samples (this run, not a resumed checkpoint's).
+#: ΔΣ calls in steps and at samples (this run, not a resumed checkpoint's), and
+#: ``new_program``: whether this chunk built its jitted program (a chunk of a new
+#: step or sample count traces and compiles, or loads from the compile cache, in
+#: its own wall).
 COUNTERS = "lorrax.counters"
 
 
@@ -1113,17 +1116,19 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                 for _, kind, opts in spec.kinds)        # one ΔΣ call per sample
 
     def program(key, n_steps, last):
-        if key not in programs:
+        """The jitted chunk of ``key`` and whether this call built it."""
+        new = key not in programs
+        if new:
             programs[key] = _chunk_program(cfg, spec, model.apply, model.name, (drive,),
                                            mesh, float(cell_volume), int(nspinor),
                                            int(count), int(n_steps), bool(last))
-        return programs[key]
+        return programs[key], new
 
     if fixed:
         sstep, stheta, n_total = sample_plan(cfg, mtsteps)
         s_end = s_start
         for i0, i1, s0, s1 in chunk_plan(sstep, n_total, cfg.chunk, i_start, s_start):
-            prog = program(("fixed", s1 - s0, i1 - i0), s1 - s0, False)
+            prog, new = program(("fixed", s1 - s0, i1 - i0), s1 - s0, False)
             carry, samples = prog(carry, ops, model.params, jnp.asarray(mtsteps[i0:i1]),
                                   jnp.asarray(sstep[i0:i1]), jnp.asarray(stheta[i0:i1]), s0)
             if split:
@@ -1141,7 +1146,8 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                         f"stiff_iter, or stiff_modes = 0")
             host = jax.tree.map(gather_to_host, samples)
             host[COUNTERS] = dict(_fixed_counters(cfg, s_start, s1, resume is None),
-                                  sample_dsigma=(i1 - i_start) if needs else 0)
+                                  sample_dsigma=(i1 - i_start) if needs else 0,
+                                  new_program=new)
             state = (lambda c=carry, s=s1: (gather_to_host(c[0] if cfg.method in ("rk4", "etdrk4")
                                                           else ops.rho_eq[None] + c[0]),
                                             carry_to_host(c), s))
@@ -1157,7 +1163,7 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
         for i0 in range(i_start, n_meas, cfg.chunk):
             i1 = min(n_meas, i0 + cfg.chunk)
             last = i1 == n_meas
-            prog = program(("dp54", i1 - i0, last), 0, last)
+            prog, new = program(("dp54", i1 - i0, last), 0, last)
             times = jnp.asarray(mtsteps[i0:i1])
             carry, samples = prog(carry, ops, model.params, times,
                                   jnp.zeros(i1 - i0, jnp.int64), jnp.zeros(i1 - i0), 0)
@@ -1166,7 +1172,8 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                     for v in (carry.n_accepted, carry.n_rejected, carry.n_rhs)]
             host[COUNTERS] = dict(accepted=done[0] - base[0], rejected=done[1] - base[1],
                                   dsigma=done[2] - base[2],
-                                  sample_dsigma=(i1 - i_start) if needs else 0)
+                                  sample_dsigma=(i1 - i_start) if needs else 0,
+                                  new_program=new)
             state = (lambda c=carry: (gather_to_host(c.y), carry_to_host(c), 0))
             on_chunk(i0, i1, host, state, float(gather_to_host(carry.t)))
         if bool(gather_to_host(carry.failed)):

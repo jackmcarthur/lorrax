@@ -132,13 +132,13 @@ so `tail -f` follows a running job. Its sections, in order:
 | provenance | start time and host, git HEAD with a clean/DIRTY flag, the source closure, the FFI bundle (sealed id, revision, sha), JAX, ranks, devices, mesh | the tree and the bundle are the ones you meant |
 | resolved deck | every key: value as written, `set` / `default` / `unset`, what an empty default resolved to; `not used` on a key the run does not read | no surprise in `not used` (e.g. `control.ivp.rtol` under `cfm4`) |
 | system | the run header, plus the k grid, occupations, QP energy range and gap, the dipole route and its receipts | the window and the gap |
-| self-energy model | model, terms, N_μ, whether ΔΣ is affine in ρ, the wall of one ΔΣ call (timed by the gate's power iteration, its compile excluded) | the per-call wall: a run costs about (ΔΣ calls per fs) × that |
+| self-energy model | model, terms, N_μ, whether ΔΣ is affine in ρ, the wall of one ΔΣ call (timed by the gate's power iteration, its compile excluded) | the per-call wall: a run costs about (ΔΣ calls per fs) × that; on a cold kernel cache it includes first-use builds, and the summary's steady bound is the figure to use |
 | integrator and stability gate | method, step, ΔΣ calls per step and per fs, chunk; the stiff split's basis; σ, the static limit, every probe (step, growth, pass), the chosen dt and the gate's cost | `chosen dt` and the probe growth (≤ 1.002 passes) |
-| progress | one row per chunk: samples, t (fs), wall (s), s/fs of the chunk, ETA (s), ΔΣ calls so far, \|P\|, n_c and \|E\| at the chunk's last sample, and the largest drift of Tr ρ and Tr ρ² | s/fs after the first row (which carries the compile); drifts near 1e-15 when Γ = 0 |
-| summary | stdout's summary plus ΔΣ per fs with and without the gate, steady s/fs, the gate's share, the ΔΣ wall's share of the run, the largest drifts, the final sample | the steady s/fs is the number to plan with |
+| progress | one row per chunk: samples, t (fs), wall (s), s/fs of the chunk, ETA (s), ΔΣ calls so far, \|P\|, n_c and \|E\| at the chunk's last sample, and the largest drift of Tr ρ and Tr ρ² | s/fs of the rows that did not compile (the first always does; a last chunk of a new step count too); drifts at rounding level when Γ = 0 |
+| summary | stdout's summary plus ΔΣ per fs with and without the gate, steady s/fs, the gate's share, the steady bound on one ΔΣ call (chunks 2–N wall over their ΔΣ calls) and the ΔΣ share of the run, the largest drifts, the final sample | the steady s/fs is the number to plan with |
 
 From the default run of the production 846 deck shortened to 3 fs (four A100s;
-`cfm4`, dt 50 as), the gate block, the progress table and the steady rate:
+`cfm4`, dt 50 as), the gate block and the progress table:
 
 ```text
   stability       : sigma = 6.208 eV (spectral radius of the dSigma commutator map, 20 power iterations, last change 0.025 %), h*sigma = 0.472, limit 0.73 (cfm4, cubic predictor, n_corr 2) -> dt <= 70.36 as; probe 1 per step at 62.5 as
@@ -158,11 +158,13 @@ From the default run of the production 846 deck shortened to 3 fs (four A100s;
   20-24                2.5000       40.70     13.574        6.8       213   7.421e-12    2.525e-17   4.770e+01   0.0e+00   0.0e+00
   25-29                3.0000       47.49     13.574        0.0       253   1.727e-11    1.369e-16   1.099e+02   0.0e+00   0.0e+00
   --------------------------------------------------------------------------------------------------------------------------------
-
-  steady s/fs     : 13.58 s per fs (chunks 2-6; the first, 13.54 s, carries the compile)
 ```
 
-The first row carries the compile. Chunks 2–6 make 200 ΔΣ calls in 33.95 s over
+A chunk of a new step or sample count compiles its program, the first always
+and often the last, which takes the steps up to tf; the summary leaves those
+chunks out of its steady rate and names them (in the stiff-split run the last
+chunk holds 6 steps, not 5, and runs at 16.8 s per fs against 7.59). Here only the
+first compiles. Chunks 2–6 make 200 ΔΣ calls in 33.95 s over
 2.5 fs (80 calls and 13.58 s per fs), so one call costs at most 0.170 s,
 consistent with STEPLAB's isolated 0.161 s per call (the bound also carries the
 step's non-ΔΣ work). The gate's own figure in this run, 0.347 s, held the
@@ -185,21 +187,24 @@ gate refuses still closes its log: the gate's lines, the refusal's message and a
 
 The first three rows were measured on four A100s on the 30×30 CrI3 ISDF model
 (N_μ = 846, 0.161 s per ΔΣ call; the σ+ deck above at 5e6 V/m over 27.9 fs; P(t)
-error against a Richardson reference; 2026-10-17). On this model a ΔΣ call
+error against a Richardson reference; 2026-10-17; the `auto` row over the 3 fs of
+the log check, its steady chunks). On this model a ΔΣ call
 outweighs everything else in a step, so the wall follows the ΔΣ count.
 
 | want | use | ΔΣ calls per fs | wall per fs | measured on |
 |---|---|---|---|---|
 | P(t) error ~1e-5 (the default choice) | `cfm4`, `n_corr = 2`, cubic predictor, `dt = 50` (also its largest stable step) | 80.5 | 13.1 s | 30×30 CrI3, error 9.8e-6 |
 | P(t) error ~1e-4 | `cfm4` with `stiff_modes = 10`, `stiff_krylov = 120`, `dt` ≈ 82–100 | 49.0; 44.6 with samples on step ends (dt 90.7) | 8.8 s; 8.0 s | 30×30 CrI3 |
-| no step choice | `dt = "auto"`: the largest step the gate's probe passes, ≈50 as plain and ≈100 as with the split | as the rows above | | 30×30 CrI3 |
+| no step choice | `dt = "auto"`: the largest step the gate's probe passes, ≈50–55 as plain; 97.54 as with the split on the 846 deck (probes at 135 and 114.8 as fail, growth 2.13 and 1.88 per step) | 41.0 with the split at 97.54 as | 7.59 s with the split | 30×30 CrI3, 3 fs, 2026-10-17 |
 | Γ or the intraband term on, ΔΣ cheap | `etdrk4`, `dt` 25–50: Γ is exact in its linear part, while `cfm4`'s triple jump takes three times the exponentials | 160 at 25 as | 1.16 s against `cfm4`'s 5.17 s (Γ = 0.05 eV) and 9.41 s (intraband) | synthetic 30v × 14c, 30×30, 4.3 ms stand-in ΔΣ |
 | TDGW's own steps, or a narrow, non-stiff window | `dp54`, the parser default (TDGW's RK45 replica) | 46 at rtol 1e-6 (error 3.5e-4) | | 6×6 CrI3 2v2c |
 
 With the ISDF ΔΣ (0.16 s a call against 3.3 ms for an exponential) the extra
 exponentials of `cfm4` with Γ cost little, so `cfm4` stays the cheaper scheme per
 accuracy there. The split's gate and basis add 3.6 ΔΣ calls per fs over a 100 fs
-run (232 + 132 calls). At 1e-5 the split gains nothing (80.1 against 80.5 calls per
+run (232 + 132 calls) at a fixed dt; with `dt = "auto"` the gate probes down from its
+static limit, 3 probes on the 846 deck (629 calls, 117.55 s, plus the basis's
+132 calls, 23.62 s), once per run. At 1e-5 the split gains nothing (80.1 against 80.5 calls per
 fs): the scheme is still fourth-order `cfm4` with the same error constant, so
 accuracy keeps the step at 50 as. One correction with the linear predictor is
 stable only with the split and is third order with 125× the error, so it saves

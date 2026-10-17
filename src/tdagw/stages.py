@@ -676,8 +676,9 @@ def _progress_reference(deck: TdDeck, system: TdSystem, outs: TdOutputs, cfg, re
 def _progress_row(ref: dict, rows: list, i0, i1, samples, t_state, wall) -> dict:
     """One progress row from a chunk's host samples (no device work).
 
-    Rate s/fs of this chunk; ETA from the mean rate of the chunks after the
-    first (the first carries the compile), or the first's alone; the ΔΣ
+    Rate s/fs of this chunk; ETA from the mean rate of the chunks that ran an
+    already-built program (``new_program``: a chunk of a new step or sample
+    count, the first always, compiles in its own wall), or this one's; the ΔΣ
     count of the run so far (steps and samples); |P|, n_c and |E| at the
     chunk's last sample (max over drives; P and n_c only when measured); the
     largest relative drift of Tr ρ and Tr ρ² over the chunk's samples and
@@ -687,14 +688,15 @@ def _progress_row(ref: dict, rows: list, i0, i1, samples, t_state, wall) -> dict
     prev_t, prev_w = (rows[-1]["t_fs"], rows[-1]["wall_s"]) if rows else (ref["t_from_fs"], 0.0)
     span = max(t_fs - prev_t, 1e-30)
     rate = (wall - prev_w) / span
-    steady = [r["s_per_fs"] for r in rows[1:]] + ([rate] if rows else [])
+    cnt = samples[tp.COUNTERS]
+    new = bool(cnt.get("new_program", not rows))
+    steady = [r["s_per_fs"] for r in rows if not r["new_program"]] + ([] if new else [rate])
     eta_rate = float(np.mean(steady)) if steady else rate
     prog = np.asarray(samples[tp.PROGRESS], float)                   # (n, ntr, 3)
-    cnt = samples[tp.COUNTERS]
     row = dict(i0=int(i0), i1=int(i1), t_fs=t_fs, wall_s=float(wall), s_per_fs=rate,
                eta_s=max(ref["t_end_fs"] - t_fs, 0.0) * eta_rate,
                dsigma=int(cnt["dsigma"]) + int(cnt.get("sample_dsigma", 0)),
-               steps=int(cnt["accepted"]), rejected=int(cnt["rejected"]),
+               steps=int(cnt["accepted"]), rejected=int(cnt["rejected"]), new_program=new,
                p_abs=None, n_c=None, e_abs=None, d_trace=None, d_purity=None)
     if prog.shape[0]:
         row.update(e_abs=float(np.max(prog[-1, :, 2])) * tdgw_io.EFIELD_IN_VPERM,

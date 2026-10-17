@@ -18,8 +18,9 @@ L6 the gate block: the measured wall of one dSigma call, the probes, the chosen 
    (auto); the split's basis
 L7 dp54: no gate, the dSigma wall bounded and not timed
 L8 a refused run's log still closes: the gate's line, the refusal message, REFUSED
-L9 the summary's bound on one dSigma call is the table's own steady window: the wall
-   of chunks 2-N over their dSigma calls
+L9 the summary's steady s/fs and its bound on one dSigma call leave out the chunks that
+   compiled a program (a new step or sample count, re-derived from the table and dt) and
+   are the other chunks' wall over their time and over their dSigma calls
 R1 the same checker fails a log missing a section, a row shifted by one column and a
    stdout line the log lacks
 """
@@ -238,16 +239,44 @@ def test_dp54_has_no_gate(runs):
     assert re.search(r"  dSigma wall     : <= [0-9.e+-]+ s per call", log)
 
 
+def _compiled_chunks(log, rows):
+    """The chunks that build a jitted program, re-derived from the log alone.
+
+    Fixed step: one program per (steps, samples) of a chunk, the steps from the
+    chunk's span over the logged dt; dp54: one per (samples, last chunk).
+    """
+    m = re.search(r"^  step            : dt = ([0-9.e+-]+) as", log, re.M)
+    keys, built, t_prev = set(), [], 0.0
+    for j, r in enumerate(rows):
+        n = r["samples"][1] - r["samples"][0] + 1
+        key = ((round((r["t_fs"] - t_prev) * 1000.0 / float(m.group(1))), n) if m
+               else (n, j == len(rows) - 1))
+        if key not in keys:
+            keys.add(key)
+            built.append(j)
+        t_prev = r["t_fs"]
+    return built
+
+
 @pytest.mark.parametrize("tag", ["split", "plain", "dp54"])
-def test_steady_bound_from_table(runs, tag):
+def test_steady_rates_leave_out_compiling_chunks(runs, tag):
+    from tdagw.td_log import _chunks
     log = runs[tag]["log"]                                               # L9
     rows = table_rows(log)
-    assert len(rows) > 1, tag
-    calls = rows[-1]["dsigma"] - rows[0]["dsigma"]
-    want = (rows[-1]["wall_s"] - rows[0]["wall_s"]) / calls        # chunks 2-N over their own calls
+    built = _compiled_chunks(log, rows)
+    steady = [j for j in range(len(rows)) if j not in built]
+    assert steady, (tag, built)
+    m = re.search(r"  steady s/fs     : ([0-9.e+-]+) s per fs \((chunks? [0-9, -]+); "
+                  r"(chunks? [0-9, -]+) compiled", log)
+    assert m and m.group(2) == _chunks(steady) and m.group(3) == _chunks(built), (tag, built)
+    d = {k: sum(rows[j][k] - rows[j - 1][k] for j in steady) for k in ("wall_s", "t_fs", "dsigma")}
+    n = len(steady)                  # the table's walls carry 0.005 s, its times 5e-5 fs
+    rate = d["wall_s"] / d["t_fs"]
+    assert abs(float(m.group(1)) - rate) <= 1e-3 * rate + (0.011 + 1e-4 * rate) * n / d["t_fs"]
     got = _floats(r"(?:bound it by|dSigma wall     :) <= ([0-9.e+-]+) s", log)
-    assert len(got) == 1, tag
-    assert abs(got[0] - want) <= 1e-3 * want + 0.011 / calls, (tag, got[0], want)
+    want = d["wall_s"] / d["dsigma"]
+    assert len(got) == 1 and abs(got[0] - want) <= 1e-3 * want + 0.011 * n / d["dsigma"], \
+        (tag, got, want)
 
 
 def test_refused_run_log_closes(runs):

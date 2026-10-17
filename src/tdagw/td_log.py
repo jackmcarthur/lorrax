@@ -72,6 +72,21 @@ _T = tdgw_io.T_IN_ATTOSEC
 _EV = tdgw_io.HA_IN_EV
 
 
+def _chunk_ranges(idx) -> str:
+    """0-based chunk indices as 1-based ranges: [1, 2, 3, 5] -> '2-4, 6'."""
+    out, idx = [], sorted(int(j) + 1 for j in idx)
+    for j in idx:
+        if out and j == out[-1][1] + 1:
+            out[-1][1] = j
+        else:
+            out.append([j, j])
+    return ", ".join(f"{a}" if a == b else f"{a}-{b}" for a, b in out)
+
+
+def _chunks(idx) -> str:
+    return ("chunk " if len(idx) == 1 else "chunks ") + _chunk_ranges(idx)
+
+
 def log_path(deck) -> str:
     """``outdir/tdagw.out`` of a parsed deck."""
     return os.path.join(str(deck.values["control.files.outdir"]), LOG_NAME)
@@ -383,6 +398,8 @@ class TdReport(ScientificProductionReport):
                   "the chunk's samples (" + (
                       "Gamma = 0: both are invariants of the exact flow)" if ham else
                       "Gamma != 0: Tr rho^2 decays by design, Tr rho is conserved)"))
+        self.emit("  a chunk of a new step or sample count compiles its program (the first always, "
+                  "often the last): its s/fs holds the compile")
         self.emit(progress_header())
         self.emit(_RULE)
 
@@ -453,13 +470,19 @@ class TdReport(ScientificProductionReport):
         out = [f"  dSigma per fs   : {prop / fs:.1f} in steps and samples; "
                f"{(prop + gate + basis) / fs:.1f} with the gate and the stiff basis over this "
                f"run's {fs:.4g} fs"]
-        steady = [r["s_per_fs"] for r in rows[1:]]
+        built = [j for j, r in enumerate(rows) if r["new_program"] or j == 0]
+        steady = [j for j in range(len(rows)) if j not in built]
+        bound = None                     # the steady chunks' wall over their own dSigma calls
         if steady:
-            out.append(f"  steady s/fs     : {np.mean(steady):.4g} s per fs (chunks 2-{len(rows)}; "
-                       f"the first, {rows[0]['wall_s']:.2f} s, carries the compile)")
+            d = {k: sum(rows[j][k] - rows[j - 1][k] for j in steady)
+                 for k in ("wall_s", "t_fs", "dsigma")}
+            out.append(f"  steady s/fs     : {d['wall_s'] / d['t_fs']:.4g} s per fs ({_chunks(steady)}; "
+                       f"{_chunks(built)} compiled a program for a new step or sample count, "
+                       f"left out)")
+            bound = d["wall_s"] / d["dsigma"] if d["dsigma"] > 0 else None
         elif rows:
-            out.append(f"  steady s/fs     : one chunk only ({rows[0]['s_per_fs']:.4g} s per fs, "
-                       f"compile included)")
+            out.append(f"  steady s/fs     : none: each of the {len(rows)} chunk(s) built its own "
+                       f"program ({stats['wall'] / fs:.4g} s per fs overall, compile included)")
         g_wall = (g or {}).get("wall_s", 0.0) + ((b or {}).get("wall_s", 0.0))
         total_calls = prop + gate + basis
         total_wall = stats["wall"] + g_wall
@@ -468,10 +491,6 @@ class TdReport(ScientificProductionReport):
                    f"{g_wall:.2f} of {total_wall:.2f} s ({100.0 * g_wall / max(total_wall, 1e-30):.1f} %)"
                    + ("; no gate for this method" if g is None else "")
                    + (f"; stiff basis {basis} calls" if b is not None else ""))
-        bound = None                     # chunks 2-N: their wall over their own dSigma calls
-        if len(rows) > 1 and rows[-1]["dsigma"] > rows[0]["dsigma"]:
-            bound = ((rows[-1]["wall_s"] - rows[0]["wall_s"])
-                     / (rows[-1]["dsigma"] - rows[0]["dsigma"]))
         if g is not None and g["power"]["dsigma"]:
             w = g["dsigma_wall_s"]
             line = f"  dSigma wall     : {w:.4g} s per call (gate)"
