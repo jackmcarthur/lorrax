@@ -89,6 +89,13 @@
 //                trees, whose union handler still took operands -- would get
 //                one Arg where it expects three; refused by name at load.
 //
+//   ABI 8 -> 9   (2026-10-17, dlascale).  The device-leg SLATE handlers
+//                lorrax_slate_eigh, lorrax_slate_potrf and the three
+//                lorrax_slate_batched_{solve_lu_factors,getrf,getrs} each take
+//                one more Ret, a u8 workspace that seeds SLATE's device pool
+//                (slate/pool_seed.h).  An ABI-8 library would get a Ret it does
+//                not bind; refused by name at load instead.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -113,4 +120,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 8
+#define LORRAX_FFI_ABI_VERSION 9

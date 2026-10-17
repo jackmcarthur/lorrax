@@ -248,6 +248,36 @@ _mesh_key = mesh_key
 _BLOCK_MAX = 256
 _BLOCK_MIN = 128
 
+#: LU above this local edge runs block-cyclic BY RELABELING too (square meshes):
+#: the same local buffers read with a square block <= _BLOCK_MAX, so cuSOLVERMp
+#: factors Pi A Pi^T and solves for Pi B, and X comes back in A's row order with
+#: no data movement (Pi' = Pi).  At one tile per rank the getrf/getrs workspaces
+#: grow with the tile: A100-80GB P4 f64 nrhs=n peaked at 53.0 GB/rank at n=30720
+#: and 83.5 GB at 40960, and complex128 nrhs=n ran out of device memory from
+#: n=30720 (dlascale pmA/pmB).  At or below the bound one tile per rank stays (the
+#: measured faster layout there, comment above), so no existing call changes.
+_LU_RELABEL_LOCAL_MIN = 8192
+
+
+def rhs_block(n: int, nrhs: int, Px: int, Py: int, mb: int) -> int:
+    """The RHS column block ``nb_b``: one block per process column at one tile per
+    rank; a divisor of the local RHS width <= :data:`_BLOCK_MAX` when the LU is
+    relabeled, so the handler can solve the RHS in chunks whose getrs workspace
+    fits (cpp/cusolvermp/batched_solve_lu_ffi.cc, getrs_chunking).  Columns are
+    independent and read and written through the same map: no movement."""
+    local = nrhs // Py
+    return local if mb == n // Px else largest_divisor(local, _BLOCK_MAX)
+
+
+def lu_blocks(n: int, Px: int, Py: int) -> tuple[int, int]:
+    """``(mb, nb)`` of the LU descriptors: one tile per rank, or a square relabeled
+    block when the local edge exceeds :data:`_LU_RELABEL_LOCAL_MIN` on a square mesh."""
+    one = (n // Px, n // Py)
+    if Px != Py or Px == 1 or n // Px <= _LU_RELABEL_LOCAL_MIN:
+        return one
+    block = _largest_block(n // Px)
+    return (block, block) if block >= _BLOCK_MIN else one
+
 
 def _largest_block(local: int) -> int:
     """The largest divisor of a tile edge ``local`` that is at most :data:`_BLOCK_MAX`."""
@@ -585,7 +615,7 @@ def batched_distributed_getrf(
 
     loader.get_lib("CUDA")
     ctx_key = context_key(mesh, col_major=False)
-    mb, nb = n // Px, n // Py
+    mb, nb = lu_blocks(n, Px, Py)
     ipiv_len = ipiv_local_len(n, Px, mb)
     key = ("getrf", _mesh_key(mesh), A.dtype, nq, n, mb, nb,
            int(ctx_key))
@@ -639,7 +669,7 @@ def batched_distributed_getrs(
 
     loader.get_lib("CUDA")
     ctx_key = context_key(mesh, col_major=False)
-    mb_b, nb_b = LU.mb, nrhs // Py
+    mb_b, nb_b = LU.mb, rhs_block(LU.n, nrhs, Px, Py, LU.mb)
     ipiv_len = ipiv_local_len(LU.n, Px, LU.mb)
     key = ("getrs", _mesh_key(mesh), B.dtype, LU.nbatch, LU.n, nrhs,
            LU.mb, LU.nb, mb_b, nb_b, int(ctx_key))
@@ -926,8 +956,8 @@ def batched_distributed_solve_lu(
     loader.get_lib("CUDA")
     ctx_key = context_key(mesh, col_major=False)
 
-    mb_a, nb_a = n // Px, n // Py
-    mb_b, nb_b = n // Px, nrhs // Py
+    mb_a, nb_a = lu_blocks(n, Px, Py)
+    mb_b, nb_b = mb_a, rhs_block(n, nrhs, Px, Py, mb_a)
 
     key = ("solve_lu", _mesh_key(mesh), A.dtype,
            nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_key))

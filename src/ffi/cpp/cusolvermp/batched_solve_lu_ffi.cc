@@ -57,6 +57,7 @@
 #include <sstream>
 #include <string>
 
+#include <algorithm>
 #include <cuda_runtime.h>
 #include <cusolverMp.h>
 
@@ -100,6 +101,52 @@ static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
     LORRAX_GPU_CHECK(cudaEventRecord(ev, signaller));
     LORRAX_GPU_CHECK(cudaStreamWaitEvent(waiter, ev, 0));
     return ffi::Error::Success();
+}
+
+// cusolverMpGetrs's workspace grows with the RHS width far past the RHS itself:
+// at n = nrhs = 30720 complex128 on 2x2 (256 blocks) it asked for 297 GB, 674 GB at
+// n = nrhs = 51200 float64 (A100-80GB, dlascale pmC).  The RHS is therefore solved
+// in column CHUNKS: k whole local column blocks of every process column (global
+// columns [c k nb_b Py, (c+1) k nb_b Py) of the block-cyclic B, contiguous in each
+// rank's buffer at column c k nb_b), each its own n x (k nb_b Py) descriptor at a
+// pointer offset.  k is the largest divisor of the local block count whose getrs
+// workspace fits kGetrsWorkspaceCap (one block if none does).  Columns are
+// independent, so the chunked solve is the same solve.
+static constexpr size_t kGetrsWorkspaceCap = size_t(2) << 30;
+
+template <typename T>
+static ffi::Error getrs_chunking(LorraxCusolverMpCtx* ctx, int64_t n, int64_t nrhs,
+                                 int64_t mb_b, int64_t nb_b, int64_t lld,
+                                 cusolverMpMatrixDescriptor_t descA, T* d_A, int64_t* d_ipiv,
+                                 T* d_X, int64_t* k_out, size_t* d_ws, size_t* h_ws) {
+    const int Py = ctx->q;
+    const int64_t blk_local = ((nrhs + Py - 1) / Py) / nb_b;     // column blocks per rank
+    if (blk_local < 1 || ((nrhs + Py - 1) / Py) % nb_b)
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "cusolvermp getrs: nb_b must divide the local RHS columns");
+    int64_t k = blk_local;
+    while (true) {
+        cusolverMpMatrixDescriptor_t dB = nullptr;
+        if (cusolverMpCreateMatrixDesc(&dB, ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                       n, k * nb_b * Py, mb_b, nb_b, 0, 0, lld)
+                != CUSOLVER_STATUS_SUCCESS)
+            return ffi::Error(ffi::ErrorCode::kInternal, "cusolverMpCreateMatrixDesc(B chunk)");
+        size_t d = 0, h = 0;
+        cusolverStatus_t st = mp::GetrsBufferSize<T>(
+            ctx->handle, CUBLAS_OP_N, n, k * nb_b * Py, d_A, 1, 1, descA, d_ipiv,
+            d_X, 1, 1, dB, &d, &h);
+        cusolverMpDestroyMatrixDesc(dB);
+        if (st != CUSOLVER_STATUS_SUCCESS) {
+            std::ostringstream os;
+            os << "cusolverMpGetrs_bufferSize failed: status=" << (int) st;
+            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        *d_ws = d; *h_ws = h; *k_out = k;
+        if (d <= kGetrsWorkspaceCap || k == 1) return ffi::Error::Success();
+        int64_t nk = k / 2;
+        while (nk > 1 && blk_local % nk) --nk;
+        k = std::max<int64_t>(1, nk);
+    }
 }
 
 template <typename T>
@@ -184,46 +231,64 @@ static ffi::Error BatchedSolveLuImpl(
         os << "cusolverMpGetrf_bufferSize failed: status=" << (int)mp_st;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
-    mp_st = mp::GetrsBufferSize<T>(
-        ctx->handle, CUBLAS_OP_N, n, nrhs,
-        d_A_factored_out, 1, 1, descA,
-        d_ipiv,
-        d_X_out, 1, 1, descB,
-        &d_ws_s, &h_ws_s);
-    if (mp_st != CUSOLVER_STATUS_SUCCESS) {
+    int64_t kc = 1;
+    if (auto e = getrs_chunking<T>(ctx, n, nrhs, mb_b, nb_b, lld_A, descA, d_A_factored_out,
+                                   d_ipiv, d_X_out, &kc, &d_ws_s, &h_ws_s); !e.success()) {
         cleanup();
-        std::ostringstream os;
-        os << "cusolverMpGetrs_bufferSize failed: status=" << (int)mp_st;
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        return e;
     }
+    // descB is replaced by one chunk-width descriptor (every chunk is the same width).
+    cusolverMpDestroyMatrixDesc(descB);
+    descB = nullptr;
+    const int64_t chunk_cols = kc * nb_b;                         // local columns per chunk
+    const int64_t n_chunks = (B_local_cols / nb_b) / kc;
+    LORRAX_LIB_CHECK(
+        cusolverMpCreateMatrixDesc(&descB, ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                   n, chunk_cols * Py, mb_b, nb_b, 0, 0, lld_A),
+        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B chunk)");
     void* d_ws_f_buf = nullptr;
     void* d_ws_s_buf = nullptr;
     void* h_ws_f_buf = nullptr;
     void* h_ws_s_buf = nullptr;
-    if (d_ws_f > 0) LORRAX_GPU_CHECK(cudaMallocAsync(
-        &d_ws_f_buf, d_ws_f, ctx->stream));
-    if (d_ws_s > 0) LORRAX_GPU_CHECK(cudaMallocAsync(
-        &d_ws_s_buf, d_ws_s, ctx->stream));
-    if (h_ws_f > 0) {
-        h_ws_f_buf = std::malloc(h_ws_f);
-        if (!h_ws_f_buf) { cleanup();
-            return ffi::Error(ffi::ErrorCode::kResourceExhausted,
-                              "malloc(h_ws_getrf) failed"); }
-    }
-    if (h_ws_s > 0) {
-        h_ws_s_buf = std::malloc(h_ws_s);
-        if (!h_ws_s_buf) { cleanup();
-            if (h_ws_f_buf) std::free(h_ws_f_buf);
-            return ffi::Error(ffi::ErrorCode::kResourceExhausted,
-                              "malloc(h_ws_getrs) failed"); }
-    }
-
     auto cleanup_ws = [&]() {
         if (d_ws_f_buf) cudaFreeAsync(d_ws_f_buf, ctx->stream);
         if (d_ws_s_buf) cudaFreeAsync(d_ws_s_buf, ctx->stream);
         if (h_ws_f_buf) std::free(h_ws_f_buf);
         if (h_ws_s_buf) std::free(h_ws_s_buf);
     };
+    // A failed workspace allocation releases what this call already holds (the
+    // getrf workspace, d_ipiv, the descriptors).  It used to return through
+    // LORRAX_GPU_CHECK with all of them live: on A100-80GB P4 the n=30720 c128
+    // getrs workspace failed, and the leaked getrf workspace then failed every
+    // later solve, potrf and eigh in the process (dlascale pmA / pmB).
+    auto ws_alloc = [&](void** buf, size_t bytes, const char* what) -> ffi::Error {
+        cudaError_t st = cudaMallocAsync(buf, bytes, ctx->stream);
+        if (st == cudaSuccess) return ffi::Error::Success();
+        *buf = nullptr;
+        cudaGetLastError();                      // clear the sticky-free OOM status
+        cleanup_ws(); cleanup();
+        std::ostringstream os;
+        os << "cuSOLVERMp LU: cudaMallocAsync(" << what << ", " << bytes
+           << " bytes) failed: " << cudaGetErrorName(st) << " (n=" << n << ", nrhs="
+           << nrhs << ", blocks " << mb_a << "x" << nb_a << ")";
+        return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
+    };
+    if (d_ws_f > 0) { auto e = ws_alloc(&d_ws_f_buf, d_ws_f, "getrf workspace");
+                      if (!e.success()) return e; }
+    if (d_ws_s > 0) { auto e = ws_alloc(&d_ws_s_buf, d_ws_s, "getrs workspace");
+                      if (!e.success()) return e; }
+    if (h_ws_f > 0) {
+        h_ws_f_buf = std::malloc(h_ws_f);
+        if (!h_ws_f_buf) { cleanup_ws(); cleanup();
+            return ffi::Error(ffi::ErrorCode::kResourceExhausted,
+                              "malloc(h_ws_getrf) failed"); }
+    }
+    if (h_ws_s > 0) {
+        h_ws_s_buf = std::malloc(h_ws_s);
+        if (!h_ws_s_buf) { cleanup_ws(); cleanup();
+            return ffi::Error(ffi::ErrorCode::kResourceExhausted,
+                              "malloc(h_ws_getrs) failed"); }
+    }
 
     const bool no_pivot = lu_no_pivot();
 
@@ -250,23 +315,26 @@ static ffi::Error BatchedSolveLuImpl(
                                  n, mb_a, q); !err.success()) {
             cleanup_ws(); cleanup(); return err;
         }
-        mp_st = mp::Getrs<T>(
-            ctx->handle, CUBLAS_OP_N, n, nrhs,
-            A_slice_ptr, 1, 1, descA,
-            ipiv_slice_ptr,
-            X_slice_ptr, 1, 1, descB,
-            d_ws_s_buf, d_ws_s,
-            h_ws_s_buf, h_ws_s,
-            ctx->d_info);
-        if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-            cleanup_ws(); cleanup();
-            std::ostringstream os;
-            os << "cusolverMpGetrs (q=" << q << ") failed: status=" << (int)mp_st;
-            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-        }
-        if (auto err = read_info(ctx, "cusolverMpGetrs", "the solve failed", n, mb_a, q);
-                !err.success()) {
-            cleanup_ws(); cleanup(); return err;
+        for (int64_t c = 0; c < n_chunks; ++c) {
+            mp_st = mp::Getrs<T>(
+                ctx->handle, CUBLAS_OP_N, n, chunk_cols * Py,
+                A_slice_ptr, 1, 1, descA,
+                ipiv_slice_ptr,
+                X_slice_ptr + c * chunk_cols * lld_A, 1, 1, descB,
+                d_ws_s_buf, d_ws_s,
+                h_ws_s_buf, h_ws_s,
+                ctx->d_info);
+            if (mp_st != CUSOLVER_STATUS_SUCCESS) {
+                cleanup_ws(); cleanup();
+                std::ostringstream os;
+                os << "cusolverMpGetrs (q=" << q << ", chunk " << c << ") failed: status="
+                   << (int)mp_st;
+                return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+            }
+            if (auto err = read_info(ctx, "cusolverMpGetrs", "the solve failed", n, mb_a, q);
+                    !err.success()) {
+                cleanup_ws(); cleanup(); return err;
+            }
         }
     }
 
@@ -407,17 +475,23 @@ static ffi::Error BatchedGetrsImpl(
     const bool no_pivot = lu_no_pivot();
     int64_t* piv0 = no_pivot ? nullptr : const_cast<int64_t*>(d_ipiv);
     size_t d_ws = 0, h_ws = 0;
-    cusolverStatus_t mp_st = mp::GetrsBufferSize<T>(
-        ctx->handle, CUBLAS_OP_N, n, nrhs,
-        const_cast<T*>(d_LU), 1, 1, descA, piv0,
-        d_X_out, 1, 1, descB, &d_ws, &h_ws);
-    if (mp_st != CUSOLVER_STATUS_SUCCESS) {
+    int64_t kc = 1;
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
+    if (auto e = getrs_chunking<T>(ctx, n, nrhs, mb_b, nb_b, lld_A, descA,
+                                   const_cast<T*>(d_LU), piv0, d_X_out, &kc, &d_ws, &h_ws);
+            !e.success()) {
         cusolverMpDestroyMatrixDesc(descA);
         cusolverMpDestroyMatrixDesc(descB);
-        std::ostringstream os;
-        os << "cusolverMpGetrs_bufferSize failed: status=" << (int)mp_st;
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        return e;
     }
+    const int64_t chunk_cols = kc * nb_b;
+    const int64_t n_chunks = (B_local_cols / nb_b) / kc;
+    cusolverMpDestroyMatrixDesc(descB);
+    descB = nullptr;
+    LORRAX_LIB_CHECK(
+        cusolverMpCreateMatrixDesc(&descB, ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                   n, chunk_cols * Py, mb_b, nb_b, 0, 0, lld_A),
+        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B chunk)");
     // This workspace may be the same persistent allocation getrf used.
     // Reuse is safe across the SPLIT handlers because getrf records
     // ev_ctx_out and makes the XLA stream wait before returning its LU/ipiv;
@@ -443,11 +517,12 @@ static ffi::Error BatchedGetrsImpl(
             cusolverMpDestroyMatrixDesc(descB);
             return err;
         }
-        mp_st = mp::Getrs<T>(
-            ctx->handle, CUBLAS_OP_N, n, nrhs, LU_q, 1, 1, descA, piv_q,
-            X_q, 1, 1, descB,
-            ctx->d_workspace, ctx->d_workspace_bytes,
-            ctx->h_workspace, ctx->h_workspace_bytes, ctx->d_info);
+        for (int64_t c = 0; c < n_chunks && mp_st == CUSOLVER_STATUS_SUCCESS; ++c)
+            mp_st = mp::Getrs<T>(
+                ctx->handle, CUBLAS_OP_N, n, chunk_cols * Py, LU_q, 1, 1, descA, piv_q,
+                X_q + c * chunk_cols * lld_A, 1, 1, descB,
+                ctx->d_workspace, ctx->d_workspace_bytes,
+                ctx->h_workspace, ctx->h_workspace_bytes, ctx->d_info);
         if (mp_st != CUSOLVER_STATUS_SUCCESS) {
             cusolverMpDestroyMatrixDesc(descA);
             cusolverMpDestroyMatrixDesc(descB);
