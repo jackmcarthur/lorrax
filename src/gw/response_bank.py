@@ -2449,7 +2449,8 @@ class _RowWindow:
 
     def __getitem__(self, key):
         i, rows = key
-        return self.value[int(i), np.asarray(rows) - self.first]
+        # The cached gather program, not eager indexing (several dispatches per take).
+        return _MemberRows(self.value, 0)[i, np.asarray(rows) - self.first]
 
 
 class _MemberRows:
