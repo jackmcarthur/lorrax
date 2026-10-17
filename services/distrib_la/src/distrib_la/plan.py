@@ -506,9 +506,12 @@ def _measured_code_hash() -> str:
 def native_closure_identity(platform: str) -> str:
     """SHIM of ``lxkit.native_provider.native_closure_identity(platform) -> str`` (the Dep-enforce
     lane's sha256 of the leg's recorded closure plus its verified mapped files), same signature:
-    until it lands, the loaded FFI library's resolved path and content hash ("none" where no
-    library loads).  A cost measured against another native closure is another key."""
+    until it lands, the loaded FFI library's resolved path and a sha256 over the leg, its
+    ``<leg>.closure.json`` record (the checkout closure the build verified) and every private
+    provider that record names ("none" where no library loads).  A cost measured against another
+    native closure -- another leg, another record, another staged cuSOLVERMp -- is another key."""
     import hashlib
+    import json
     import os
     try:
         from distrib_la.loader import loaded_lib_path
@@ -518,9 +521,27 @@ def native_closure_identity(platform: str) -> str:
     if not path or not os.path.exists(path):
         return "none"
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 22), b""):
-            h.update(block)
+
+    def feed(label: str, file: str) -> None:
+        h.update(label.encode() + b"\0" + os.path.realpath(file).encode() + b"\0")
+        with open(file, "rb") as f:
+            for block in iter(lambda: f.read(1 << 22), b""):
+                h.update(block)
+
+    feed("leg", path)
+    record = path + ".closure.json"
+    if os.path.isfile(record):
+        feed("record", record)
+        try:
+            with open(record, encoding="utf-8") as f:
+                private = json.load(f).get("private_libraries", [])
+        except (OSError, ValueError, AttributeError):
+            private = []
+        for lib in private:
+            if isinstance(lib, str) and os.path.isfile(lib):
+                feed("private", lib)
+            else:
+                h.update(b"missing\0" + str(lib).encode() + b"\0")
     return f"{os.path.realpath(path)}:{h.hexdigest()[:16]}"
 
 
