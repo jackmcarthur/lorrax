@@ -61,7 +61,7 @@ class CompileLog(logging.Handler):
 
 
 def _td_deck(ref, bands, outdir, *, tf_fs, dtm_as=50.0, efield=None, collision="off",
-             refresh_fs=0.0, refresh_df=0.0, hermitian="dynamic", method="cfm4", dt_as=20.0,
+             refresh_fs=0.0, refresh_df=0.0, hermitian="dynamic", method="cfm4", dt_as=25.0,
              chunk=5, degeneracy="", ivbm=130):
     b_lo, b_hi = bands
     ex = efield or 0.0
@@ -129,6 +129,7 @@ def main():
     ap.add_argument("--hot-amount", type=float, default=0.1)
     ap.add_argument("--hot-fs", type=float, default=4.0)
     ap.add_argument("--sections", default="D0,A,B,C,DR,H,W")
+    ap.add_argument("--drive-cases", default="off,sub,raw,sub_full,sub_norebase")
     a = ap.parse_args()
     sections = set(a.sections.split(","))
 
@@ -499,6 +500,8 @@ def main():
                      ("sub_full", "subtracted", dict(hermitian="full")),
                      ("sub_norebase", "subtracted", {})]
             rr = {}
+            keep = set(a.drive_cases.split(","))
+            cases = [c_ for c_ in cases if c_[0] in keep]
             for tag, form, kw in cases:
                 raw = _td_deck(ref, (b_lo, b_hi), os.path.join(a.out, "td", f"drive_{tag}"),
                                tf_fs=a.drive_fs, efield=PULSE, collision=form,
@@ -514,7 +517,7 @@ def main():
                                         rho_eq_w)
                 _save()
             dr["runs"] = rr
-            if rank0:
+            if rank0 and {"off", "sub", "sub_full", "sub_norebase"} <= set(rr):
                 P = {k: np.asarray(v["pol_t"]) for k, v in rr.items() if "pol_t" in v}
                 pm = max(float(np.max(np.abs(P["off"]))), 1e-300)
                 dr["pol_rel_vs_off"] = {k: float(np.max(np.abs(P[k] - P["off"]))) / pm for k in P}
