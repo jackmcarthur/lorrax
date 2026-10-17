@@ -1,13 +1,17 @@
 """The ELPA distributed eigh (``lorrax_elpa_eigh``, ROCM leg) against ``jnp.linalg.eigh``.
 
-``distrib_la._elpa.distributed_eigh`` runs ELPA 2026.02.001's two-stage solver on the AMD GPU
-(config/frontier/build_elpa_hip.sh, cpp/elpa/eigh_ffi.cc).  Gate (``ffi.common.families`` row
+``distrib_la._elpa.distributed_eigh`` runs ELPA 2026.02.001's one-stage solver on the AMD GPU
+(config/frontier/build_elpa_hip.sh, cpp/elpa/eigh_ffi.cc); two-stage is not reachable.  Gate (``ffi.common.families`` row
 ``elpa``, tol 1e-12), per case, on the square mesh:
 
 * residual ``max|A Q - Q diag(w)| / max|A| <= TOL`` and orthogonality ``max|Q^H Q - I| <= TOL``;
 * eigenvalues ``max|w - w_ref| / max|A| <= TOL`` against the XLA route on the same device;
 * the workspace pool: the handler fails loudly if ELPA kept a pooled buffer past the call, and
-  ``LORRAX_ELPA_POOL_REPORT=1`` prints each rank's pool high-water and fallbacks.
+  ``LORRAX_ELPA_POOL_REPORT=1`` prints each rank's pool high-water and fallbacks;
+* refusals (each must RAISE, never return a result): an ``ELPA_FORCE_solver`` environment
+  override, and a rocBLAS workspace deliberately too small for ELPA's back-transformation
+  (rocBLAS returns ``rocblas_status_memory_error`` without computing; the patched ELPA counts
+  it and the handler discards the result).
 
 Cases: float64 and complex128 at an unpadded side (n/p a multiple of the tile), a padded side
 (n/p with no power-of-two tile in range: sentinel rows), and a side with the smaller tile; plus
@@ -26,16 +30,20 @@ import pytest  # noqa: E402
 TOL = 1e-12
 
 #: ELPA's live device high-water through the allocator hook (GB per rank, max over ranks),
-#: MI250X, ELPA 2026.02.001 (ELPA_ROCM_REPORT.md table "pool"): (solver, dtype) -> [(n, p, GB)].
-#: Two-stage is dtype-independent at every point measured both ways.
-_P2 = [(4096, 2, 0.105), (16384, 2, 1.630), (20480, 2, 2.541), (30720, 2, 5.698),
-       (40960, 2, 10.114), (51200, 2, 15.789), (30720, 4, 1.436), (51200, 4, 3.967)]
+#: MI250X, ELPA 2026.02.001, one-stage (ELPA_ROCM_REPORT.md table "pool"): dtype -> [(n, p, GB)].
 POOL_MEASURED = {
-    (2, "complex128"): _P2, (2, "float64"): _P2,
-    (1, "complex128"): [(16384, 2, 1.638), (20480, 2, 2.541), (30720, 2, 5.699), (30720, 4, 1.436),
-                        (51200, 4, 3.967)],
-    (1, "float64"): [(16384, 2, 1.101), (20480, 2, 1.702), (30720, 2, 3.811), (40960, 2, 6.759),
-                     (30720, 4, 0.964), (51200, 4, 2.656)],
+    "complex128": [(16384, 2, 1.638), (20480, 2, 2.541), (30720, 2, 5.699), (30720, 4, 1.436),
+                   (51200, 4, 3.967)],
+    "float64": [(16384, 2, 1.101), (20480, 2, 1.702), (30720, 2, 3.811), (40960, 2, 6.759),
+                (30720, 4, 0.964), (51200, 4, 2.656)],
+}
+
+#: rocBLAS's managed high-water per ELPA handle (GB), 2x2, job 5700309 (ELPA_ROCM_REPORT.md
+#: addendum): (n, dtype) -> (BLAS handle 0, solver handle 0); every other handle stayed at
+#: rocBLAS's 32 MiB default.
+RB_MEASURED = {
+    (20480, "complex128"): (0.203, 0.454), (51200, "complex128"): (0.454, 2.657),
+    (20480, "float64"): (0.118, 0.454), (51200, "float64"): (0.244, 2.657),
 }
 
 
@@ -61,7 +69,7 @@ def gate_cases(mesh):
             for evecs in ((True, False) if n == 1024 else (True,)):
                 a = _herm(n, dtype, seed=n + (7 if dtype == np.complex128 else 0))
                 A = jax.make_array_from_callback(a.shape, face, lambda idx: a[idx])
-                side, nb = _elpa.eigh_layout(n, p, dtype)          # the default (1-stage) layout
+                side, nb = _elpa.eigh_layout(n, p, dtype)
                 calls = 2 if n == 1024 and evecs else 1
                 for _ in range(calls):              # the second call reuses the cached handle
                     W, Q = _elpa.distributed_eigh(A, mesh=mesh, compute_evecs=evecs)
@@ -76,10 +84,54 @@ def gate_cases(mesh):
                     m["orth"] = float(np.max(np.abs(np.conj(q.T) @ q - np.eye(n))))
                 key = f"{np.dtype(dtype).name} n={n} side={side} nb={nb} evecs={evecs}"
                 out[key] = m
+    out.update(refusal_cases(mesh))
+    return out
+
+
+def _raises(fn, match):
+    """(1, '') if fn raises an error whose text contains ``match``; (0, why) otherwise."""
+    try:
+        r = fn()
+        import jax
+        jax.block_until_ready(r)
+    except Exception as e:                                      # noqa: BLE001
+        return (1, "") if match in str(e) else (0, f"raised without {match!r}: {e}")
+    return 0, "returned a result"
+
+
+def refusal_cases(mesh):
+    """The two refusals (module docstring); each case passes iff the call RAISES."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from distrib_la import _elpa
+    face = NamedSharding(mesh, P("x", "y"))
+    out = {}
+    a = _herm(1024, np.float64, seed=11)
+    A = jax.make_array_from_callback(a.shape, face, lambda idx: a[idx])
+    os.environ["ELPA_FORCE_solver"] = "2"
+    try:
+        ok, why = _raises(lambda: _elpa.distributed_eigh(A, mesh=mesh), "ELPA_FORCE_")
+    finally:
+        del os.environ["ELPA_FORCE_solver"]
+    out["refuse ELPA_FORCE_solver=2"] = dict(refused=ok, why=why)
+    # Back-transformation region (BLAS handle 0) and every other region: 256 KiB, far below
+    # the measured need at n = 4096 (the stedc region is the normal one: a failed stedc makes
+    # ELPA read an unwritten info and stop).  Last: the ELPA object it uses is never used again.
+    b = _herm(4096, np.float64, seed=13)
+    B = jax.make_array_from_callback(b.shape, face, lambda idx: b[idx])
+    regions = _elpa.rocblas_regions
+    try:
+        _elpa.rocblas_regions = lambda side, p, dt: (256 << 10, regions(side, p, dt)[1], 256 << 10)
+        ok, why = _raises(lambda: _elpa.distributed_eigh(B, mesh=mesh), "rocBLAS/rocSOLVER call(s) failed")
+    finally:
+        _elpa.rocblas_regions = regions
+    out["refuse undersized rocBLAS workspace n=4096"] = dict(refused=ok, why=why)
     return out
 
 
 def passes(m):
+    if "refused" in m:
+        return m["refused"] == 1
     return m["res"] <= TOL and m["orth"] <= TOL and m["dw"] <= TOL
 
 
@@ -100,8 +152,12 @@ def main() -> int:
     out = gate_cases(mesh)
     bad = {k for k, m in out.items() if not passes(m)}
     for k, m in out.items():
-        print(f"r{jax.process_index()} {'FAIL' if k in bad else 'ok  '} {k}  res {m['res']:.1e} "
-              f"orth {m['orth']:.1e} dw {m['dw']:.1e}", flush=True)
+        tag = 'FAIL' if k in bad else 'ok  '
+        if "refused" in m:
+            print(f"r{jax.process_index()} {tag} {k}  {'refused' if m['refused'] else m['why']}", flush=True)
+        else:
+            print(f"r{jax.process_index()} {tag} {k}  res {m['res']:.1e} orth {m['orth']:.1e} "
+                  f"dw {m['dw']:.1e}", flush=True)
     print(f"r{jax.process_index()} ELPA_EIGH_GATE {'PASS' if not bad else 'FAIL'} on "
           f"{tuple(mesh.devices.shape)}: {len(out) - len(bad)}/{len(out)} (tol {TOL:g})", flush=True)
     rc = 1 if bad else 0
@@ -111,30 +167,26 @@ def main() -> int:
 
 # ---- pytest: layout, pool envelope and tables (CPU) ---------------------------------------
 
-@pytest.mark.parametrize("n,p,dtype,solver,want", [
-    (20480, 2, "complex128", 1, (20480, 64)), (20480, 2, "float64", 1, (20480, 64)),
-    (51200, 4, "complex128", 1, (51200, 64)), (30720, 2, "float64", 1, (30720, 64)),
-    (2 * 10000, 2, "float64", 1, (2 * 10048, 64)),    # 10000 = 2^4 * 625: padded
-    (2 * 10000, 2, "complex128", 1, (2 * 10048, 64)),
-    (2 * 50, 2, "complex128", 1, (2 * 64, 32)),        # local edge below the tile
-    (20480, 2, "float64", 2, (20480, 128)), (20480, 2, "complex128", 2, (20480, 64)),
-    (2 * 10048, 2, "float64", 2, (2 * 10048, 64)),    # 10048 = 2^6 * 157: the smaller tile
-    (2 * 10000, 2, "float64", 2, (2 * 10112, 128)),
+@pytest.mark.parametrize("n,p,dtype,want", [
+    (20480, 2, "complex128", (20480, 64)), (20480, 2, "float64", (20480, 64)),
+    (51200, 4, "complex128", (51200, 64)), (30720, 2, "float64", (30720, 64)),
+    (2 * 10000, 2, "float64", (2 * 10048, 64)),    # 10000 = 2^4 * 625: padded
+    (2 * 10000, 2, "complex128", (2 * 10048, 64)),
+    (2 * 50, 2, "complex128", (2 * 64, 32)),        # local edge below the tile
 ])
-def test_layout(n, p, dtype, solver, want):
+def test_layout(n, p, dtype, want):
     pytest.importorskip("jax")
     from distrib_la._elpa import eigh_layout
-    assert eigh_layout(n, p, dtype, solver) == want
+    assert eigh_layout(n, p, dtype) == want
 
 
 @pytest.mark.parametrize("p", [2, 4])
 @pytest.mark.parametrize("dtype", ["float64", "complex128"])
-@pytest.mark.parametrize("solver", [1, 2])
-def test_every_layout_is_a_power_of_two_tile_with_less_than_one_tile_of_padding(p, dtype, solver):
+def test_every_layout_is_a_power_of_two_tile_with_less_than_one_tile_of_padding(p, dtype):
     pytest.importorskip("jax")
     from distrib_la._elpa import eigh_layout
     for local in list(range(1, 300)) + list(range(300, 30000, 37)):
-        side, nb = eigh_layout(p * local, p, dtype, solver)
+        side, nb = eigh_layout(p * local, p, dtype)
         assert nb & (nb - 1) == 0 and side % p == 0 and (side // p) % nb == 0
         assert p * local <= side < p * (local + nb)
 
@@ -142,12 +194,44 @@ def test_every_layout_is_a_power_of_two_tile_with_less_than_one_tile_of_padding(
 def test_the_pool_is_a_lower_envelope_of_the_measured_high_water():
     pytest.importorskip("jax")
     from distrib_la import _elpa
-    assert _elpa.SOLVER == 1
-    for (solver, dtype), rows in POOL_MEASURED.items():
+    for dtype, rows in POOL_MEASURED.items():
         for n, p, gb in rows:
-            b = _elpa.pool_bytes(n, p, dtype, solver)
-            assert b <= (gb + 0.0005) * 1e9, (solver, dtype, n, p, b, gb)   # never above ELPA's use
-            assert b >= 0.97 * gb * 1e9, (solver, dtype, n, p, b, gb)       # and within 3 % of it
+            b = _elpa.pool_bytes(n, p, dtype)
+            assert b <= (gb + 0.0005) * 1e9, (dtype, n, p, b, gb)   # never above ELPA's use
+            assert b >= 0.97 * gb * 1e9, (dtype, n, p, b, gb)       # and within 3 % of it
+
+
+def test_the_rocblas_regions_cover_the_measured_need_with_the_margin():
+    pytest.importorskip("jax")
+    from distrib_la import _elpa
+    for (n, dtype), (back_gb, stedc_gb) in RB_MEASURED.items():
+        back, stedc, other = _elpa.rocblas_regions(n, 2, dtype)
+        for got, gb in ((back, back_gb), (stedc, stedc_gb)):
+            assert got >= 1.24 * (gb - 0.0005) * 1e9, (n, dtype, got, gb)     # the 25 % margin
+            assert got <= 1.26 * (gb + 0.0005) * 1e9, (n, dtype, got, gb)     # and no more
+        assert other == 32 << 20
+        assert _elpa.rocblas_bytes(n, 2, dtype, threads=7) == back + stedc + 12 * other   # 14 handles
+        assert _elpa.workspace_bytes(n, 2, dtype, threads=7) == \
+            _elpa.pool_bytes(n, 2, dtype) + back + stedc + 12 * other
+
+
+def test_two_stage_cannot_be_selected():
+    """ELPA's two-stage path is unreachable: no Python knob, no FFI attribute, the handle
+    pinned to ELPA_SOLVER_1STAGE (read back) and ELPA_FORCE_* overrides refused."""
+    pytest.importorskip("jax")
+    import inspect
+    import pathlib
+    from distrib_la import _elpa, resolve
+    sig = inspect.signature(_elpa.distributed_eigh)
+    assert "solver" not in sig.parameters
+    with pytest.raises(TypeError):
+        sig.bind(None, mesh=None, solver=2)
+    assert not any("two_stage" in k.lower() or k == "SOLVER" for k in vars(_elpa))
+    assert not any("2" in b or "stage" in b for b in resolve.EIGH_BACKENDS)
+    cc = (pathlib.Path(__file__).resolve().parents[1] / "src/ffi/cpp/elpa/eigh_ffi.cc").read_text()
+    assert '{"solver", ELPA_SOLVER_1STAGE}' in cc and "2STAGE" not in cc
+    assert 'Attr<int64_t>("solver")' not in cc
+    assert '"ELPA_FORCE_"' in cc and 'elpa_get(h, "solver"' in cc
 
 
 def test_the_backend_is_in_every_table():

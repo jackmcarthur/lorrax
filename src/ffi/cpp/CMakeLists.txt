@@ -1770,8 +1770,11 @@ if(LORRAX_ROCM_HAVE_ELPA)
             "--print-prefix), or -DLORRAX_ROCM_HAVE_ELPA=OFF")
     endif()
     file(GLOB _elpa_inc "${LORRAX_ELPA_ROCM_DIR}/include/elpa*-*")
+    # Uncached: a new content-keyed prefix must re-resolve (a cached path would link the
+    # previous prefix's library; an existing cache entry would also short-circuit NO_CACHE).
+    unset(LORRAX_ELPA_LIBRARY CACHE)
     find_library(LORRAX_ELPA_LIBRARY NAMES elpa_openmp elpa
-                 PATHS "${LORRAX_ELPA_ROCM_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+                 PATHS "${LORRAX_ELPA_ROCM_DIR}/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
     target_sources(lorrax_ffi_rocm PRIVATE elpa/eigh_ffi.cc)
     target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE ${_elpa_inc})
     target_link_libraries(lorrax_ffi_rocm PRIVATE "${LORRAX_ELPA_LIBRARY}")

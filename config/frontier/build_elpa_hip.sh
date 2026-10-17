@@ -160,6 +160,83 @@ s = s.replace(f, f + "  if (lorrax_elpa_free_) return lorrax_elpa_free_((void *)
 p.write_text(s)
 print("[elpa] patched", p.name, "(lorrax_elpa_set_device_allocator)")
 PY
+# --- LORRAX patch 2: rocBLAS/rocSOLVER status accounting and the handle registry --
+# ELPA's GPU wrappers (src/GPU/ROCm/rocmFunctions.hip, one TU with both templates)
+# discard most rocBLAS statuses (the gemm wrappers assign and drop them) and only print
+# rocSOLVER failures.  The ROCm leg gives every ELPA rocBLAS handle a user-owned
+# workspace inside the FFI workspace (rocblas_set_workspace); a too-small workspace
+# makes rocBLAS/rocSOLVER return rocblas_status_memory_error WITHOUT computing, which
+# stock ELPA would ignore.  The patch wraps every BLAS_<op> call and the direct rocSOLVER
+# calls (stedc, trtri, syevd) in a status counter, counts every errormessage, and
+# records each rocBLAS handle ELPA creates (kind: BLAS or solver, creation order):
+#   void lorrax_elpa_gpu_status(long *failures, long *degraded, int *last_status)
+#   int  lorrax_elpa_rocblas_handles(void **handles, int *kinds, int cap)   (-> count)
+# The handler refuses a solve during which the failure count moved.
+"$VENV/bin/python" - "$STAGE/elpa-$ELPA_VERSION/src/GPU/ROCm" <<'PY'
+import re, sys, pathlib
+d = pathlib.Path(sys.argv[1])
+p = d / "rocmFunctions.hip"; s = p.read_text()
+em = '#define errormessage(x, ...) do { fprintf(stderr, "%s:%d " x, __FILE__, __LINE__, __VA_ARGS__ ); } while (0)\n'
+assert s.count(em) == 1, "ELPA source changed: errormessage anchor"
+fn = re.compile(r"^(?:rocblas|rocsolver)_(?:create_handle|destroy_handle|set_stream|set_pointer_mode|"
+                r"get_pointer_mode|[sdcz](?:trsm|trmm|trmv|syrk|herk|copy|gemm|gemv|potrf|dot|dotc|dotu|scal|axpy))$")
+macros = [(a, b) for a, b in re.findall(r"^#define (BLAS_\w+) ((?:rocblas|rocsolver)_\w+)\s*$", s, re.M) if fn.match(b)]
+names = {a for a, _ in macros}
+assert len(macros) >= 40 and {"BLAS_zgemm", "BLAS_dgemm", "BLAS_create_handle", "BLAS_ztrmm"} <= names, sorted(names)
+direct = ["rocsolver_dstedc", "rocsolver_sstedc", "rocsolver_dtrtri", "rocsolver_strtri", "rocsolver_ztrtri",
+          "rocsolver_ctrtri", "rocsolver_dsyevd", "rocsolver_ssyevd"]
+blk = ["", "/* LORRAX patch 2 (config/frontier/build_elpa_hip.sh): status accounting + handle registry. */",
+       "#ifndef HIPBLAS", "#define LORRAX_ELPA_PATCH2 1", "#include <atomic>", "#include <mutex>",
+       "static std::atomic<long> lorrax_fail_{0}, lorrax_degraded_{0};",
+       "static std::atomic<int> lorrax_last_{0};",
+       "static std::mutex lorrax_mu_;",
+       "static rocblas_handle lorrax_h_[512]; static int lorrax_k_[512]; static int lorrax_nh_ = 0;",
+       "static thread_local int lorrax_kind_ = 0;   /* 1 inside rocsolverCreateFromC */",
+       "static inline rocblas_status lorrax_chk_(rocblas_status st) {",
+       "  if (st == rocblas_status_perf_degraded) lorrax_degraded_.fetch_add(1);",
+       "  else if (st != rocblas_status_success) { lorrax_fail_.fetch_add(1); lorrax_last_.store((int) st); }",
+       "  return st;", "}",
+       "static rocblas_status lorrax_create_(rocblas_handle *h) {",
+       "  rocblas_status st = rocblas_create_handle(h);",
+       "  if (st == rocblas_status_success) { std::lock_guard<std::mutex> g(lorrax_mu_);",
+       "    if (lorrax_nh_ < 512) { lorrax_h_[lorrax_nh_] = *h; lorrax_k_[lorrax_nh_] = lorrax_kind_; ++lorrax_nh_; }",
+       "    else lorrax_fail_.fetch_add(1); }",
+       "  return lorrax_chk_(st);", "}",
+       "static rocblas_status lorrax_destroy_(rocblas_handle h) {",
+       "  { std::lock_guard<std::mutex> g(lorrax_mu_);",
+       "    for (int i = 0; i < lorrax_nh_; ++i) if (lorrax_h_[i] == h) {",
+       "      for (int j = i + 1; j < lorrax_nh_; ++j) { lorrax_h_[j - 1] = lorrax_h_[j]; lorrax_k_[j - 1] = lorrax_k_[j]; }",
+       "      --lorrax_nh_; break; } }",
+       "  return lorrax_chk_(rocblas_destroy_handle(h));", "}",
+       'extern "C" __attribute__((visibility("default"))) void lorrax_elpa_gpu_status(long *f, long *dg, int *last) {',
+       "  if (f) *f = lorrax_fail_.load(); if (dg) *dg = lorrax_degraded_.load(); if (last) *last = lorrax_last_.load();", "}",
+       'extern "C" __attribute__((visibility("default"))) int lorrax_elpa_rocblas_handles(void **hs, int *kinds, int cap) {',
+       "  std::lock_guard<std::mutex> g(lorrax_mu_);",
+       "  for (int i = 0; i < lorrax_nh_ && i < cap; ++i) { if (hs) hs[i] = (void *) lorrax_h_[i]; if (kinds) kinds[i] = lorrax_k_[i]; }",
+       "  return lorrax_nh_;", "}",
+       "#undef errormessage",
+       '#define errormessage(x, ...) do { lorrax_fail_.fetch_add(1); fprintf(stderr, "%s:%d " x, __FILE__, __LINE__, __VA_ARGS__ ); } while (0)']
+for a, b in macros:
+    blk.append(f"#undef {a}")
+    if a == "BLAS_create_handle":   blk.append(f"#define {a}(h) lorrax_create_(h)")
+    elif a == "BLAS_destroy_handle": blk.append(f"#define {a}(h) lorrax_destroy_(h)")
+    else:                           blk.append(f"#define {a}(...) lorrax_chk_({b}(__VA_ARGS__))")
+for b in direct:
+    blk.append(f"#define {b}(...) lorrax_chk_({b}(__VA_ARGS__))")
+blk += ["#endif /* !HIPBLAS */", ""]
+s = s.replace(em, em + "\n".join(blk) + "\n")
+p.write_text(s)
+q = d / "rocsolverFunctions_template.h"; t = q.read_text()
+rc = "  return rocblasCreateFromC(gpusolver_handle);\n"
+assert t.count(rc) == 1, "ELPA source changed: rocsolverCreateFromC anchor"
+# (test/shared/GPU/ROCm/test_rocmFunctions includes this template without patch 2's block)
+t = t.replace(rc, "#ifdef LORRAX_ELPA_PATCH2\n"
+                  "  { lorrax_kind_ = 1; int lorrax_r_ = rocblasCreateFromC(gpusolver_handle); lorrax_kind_ = 0; return lorrax_r_; }\n"
+                  "#else\n" + rc + "#endif\n")
+q.write_text(t)
+print("[elpa] patched", p.name, f"({len(macros)} BLAS_ wrappers, {len(direct)} rocSOLVER wrappers,",
+      "lorrax_elpa_gpu_status, lorrax_elpa_rocblas_handles)")
+PY
 EB="$STAGE/elpa-build"; mkdir -p "$EB"
 # ELPA's test helpers include the pre-5.x flat names (rocsolver.h, rocblas.h).
 RINC="-I$ROCM_PATH/include -I$ROCM_PATH/include/rocsolver -I$ROCM_PATH/include/rocblas"
@@ -205,6 +282,8 @@ done
 need "$ELIB" | grep -q '^libscalapack' && { echo "[elpa] ERROR: libelpa NEEDs a shared ScaLAPACK" >&2; fail=1; }
 nm -D --defined-only "$ELIB" > "$STAGE/elpa.nm"   # (no grep -q on the pipe: pipefail + SIGPIPE)
 grep -q " T lorrax_elpa_set_device_allocator$" "$STAGE/elpa.nm" || { echo "[elpa] ERROR: allocator hook not exported" >&2; fail=1; }
+for s in lorrax_elpa_gpu_status lorrax_elpa_rocblas_handles; do
+    grep -q " T $s$" "$STAGE/elpa.nm" || { echo "[elpa] ERROR: $s not exported (LORRAX patch 2)" >&2; fail=1; }; done
 # ScaLAPACK/BLACS stay private to libelpa (see the header)
 if grep -E " [TDBW] (p[sdcz][a-z0-9]+_|numroc_|descinit_|indxg2p_|[Cc]?blacs_[a-z_]*|Cdgesd2d|Csys2blacs_handle)$" "$STAGE/elpa.nm" | head -3 | grep -q .; then
     echo "[elpa] ERROR: libelpa exports ScaLAPACK/BLACS symbols:" >&2; grep -E " [TDBW] (p[sdcz][a-z0-9]+_|numroc_|blacs_)" "$STAGE/elpa.nm" | head -5 >&2; fail=1; fi
