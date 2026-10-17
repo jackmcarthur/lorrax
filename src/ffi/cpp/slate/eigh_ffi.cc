@@ -144,7 +144,7 @@ static const char* kStageNames[] = {"copyin", "he2hb", "hb2st", "tridiag", "redi
 template <typename T>
 static void heev_seeded(sl::HermitianMatrix<T>& A, std::vector<typename RealOf<T>::type>& Lambda,
                         sl::Matrix<T>* Z, PoolSeed& ws, const sl::Options& opts,
-                        EighStages& st, lrx::gpu::Stream stream) {
+                        EighStages& st, lrx::gpu::Stream /*stream*/) {
     using real_t = typename RealOf<T>::type;
     const int64_t n = A.n();
     const real_t safe_min = std::numeric_limits<real_t>::min();
@@ -154,7 +154,13 @@ static void heev_seeded(sl::HermitianMatrix<T>& A, std::vector<typename RealOf<T
     const real_t sqrt_sml = std::sqrt(sml_num);
     const real_t sqrt_big = std::sqrt(big_num);
     double t = now_s();
-    real_t Anorm = sl::norm(sl::Norm::Max, A, opts);
+    // Exactly heev's call: no options, i.e. SLATE's default Target::HostTask.  With
+    // `opts` (Target::Devices) the norm ran SLATE's device genorm / henorm kernels,
+    // whose code objects HIP then loads and keeps for the life of the process: +2 MiB
+    // per rank, +4 MiB on ranks holding diagonal tiles, outside the arena (found
+    // with an allocation/code-object-load trace against unseeded heev; dlascale
+    // round 3).
+    real_t Anorm = sl::norm(sl::Norm::Max, A);
     if (std::isnan(Anorm) || std::isinf(Anorm)) {
         Lambda.assign(Lambda.size(), Anorm);
         return;
