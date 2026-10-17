@@ -1477,8 +1477,15 @@ def _selected_gram_from_projection(projection, *, selected_states,
 def _solve_selected_basis_rows(factor, selected_rows):
     """Evaluate ``B = L^-1 X`` with spin kept outside the solve axis."""
     rhs = jnp.moveaxis(selected_rows, 1, 0)
-    basis = jax.vmap(
-        lambda x: jsp_linalg.solve_triangular(factor, x, lower=True))(rhs)
+    from distrib_la import local_lu_routes as routes, tri_solve_local
+    if rhs.ndim == 3 and routes(factor.shape, (rhs.shape[1], rhs.shape[0] * rhs.shape[2]), factor.dtype):
+        # 2^31-byte span route (ROCM): the batch becomes columns of one solve.
+        s, r, m = rhs.shape
+        cols = jnp.moveaxis(rhs, 0, 1).reshape(r, s * m)
+        basis = jnp.moveaxis(tri_solve_local(factor, cols).reshape(r, s, m), 1, 0)
+    else:
+        basis = jax.vmap(
+            lambda x: jsp_linalg.solve_triangular(factor, x, lower=True))(rhs)
     return jnp.moveaxis(basis, 0, 1)
 
 
@@ -1663,7 +1670,9 @@ def _coefficients_from_projection(projection, factor):
     """``C = (Psi X^H) L^-H``, i.e. ``C^H = L^-1 (Psi X^H)^H``."""
     nk, nb, rank = projection.shape
     rhs = jnp.conj(projection.reshape(nk * nb, rank)).T
-    c_h = jsp_linalg.solve_triangular(factor, rhs, lower=True)
+    from distrib_la import tri_solve_local   # 2^31-byte span route (ROCM)
+    c_h = tri_solve_local(factor, rhs,
+                          native=lambda l, b: jsp_linalg.solve_triangular(l, b, lower=True))
     return jnp.conj(c_h).T.reshape(nk, nb, rank)
 
 

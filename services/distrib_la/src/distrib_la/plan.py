@@ -666,7 +666,8 @@ def _incumbent(p, shapes, single: bool) -> int:
     ranks = int(p.mesh.shape["x"]) * int(p.mesh.shape["y"])
     nb, n = int(shapes[0][0]), int(shapes[0][-1])
     width = int(shapes[1][-1]) if p.op == "solve_lu" and len(shapes) > 1 else None
-    return int(rounds_for(nb, n, ranks, int(row), width))
+    return int(rounds_for(nb, n, ranks, _resolve.one_device_round_n(
+        p.op, _resolve.mesh_platform(p.mesh), int(row)), width))
 
 
 _RULE = ("the fewest-round one_device whose per-rank footprint is within the incumbent's"
