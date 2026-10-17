@@ -1069,6 +1069,271 @@ struct M7Mid {                                 // the kernel V[k, x, y] of a pai
 };
 #endif
 
+#ifndef LRX_M7F
+#define LRX_M7F 0
+#endif
+#if LRX_M7F && !LRX_TT
+// The fused single-arm tile (LRX_M7F: the host sets it for the single arm's register load with
+// whole groups of NS <= 2).  The same lines, the same products and the same axis order as the
+// stage_tile / transform3 / mid_group_tile / transform3 / store_tile chain (bitwise), with the
+// thread-to-data map, the tile order and the shared-memory round trips changed:
+//   A1 gather: one thread per (k, pair) reads the pair's source indices (row, trs, lsrc, rsrc) and
+//      issues the NS*NS raw source cells by cp.async straight into the bank (zero-filled where a
+//      source is -1); both of a thread's items are issued before any is waited on, so the gathered
+//      cells cost no registers while in flight.
+//   A2 finish, same thread, same items, in place: the phases (mph G nph), the conjugations and
+//      U g U^dagger, with mph / nph / U_k loaded beside the cp.async wait.
+//   inverse z, y passes in shared memory (transform3's).
+//   C  inverse x + the Mid: one thread per ((ky, kz), column) holds its x line in registers,
+//      transforms it and multiplies W_R[k, x, y] (NX independent loads per thread).
+//   forward z, y passes in shared memory (transform3's).
+//   F  forward x + the store: the x line in registers, then only the rows with kout[k] >= 0 go to
+//      HBM (a line without a stored row is not transformed); the column's (a, b, rx, y) are formed
+//      once per thread, not per element.
+// Tile order: the tiles walk the live pairs in blocks of 16 block rows x 32 right centroids (a
+// symmetry star's sources are the pair's orbit images, so the blocks of a wave share their parent
+// sources in L2) instead of row by row.  Which pairs share a tile does not change any pair's
+// arithmetic.
+namespace m7f {
+constexpr int NT = TRC;
+constexpr int TPP = TRC / SSO;                 // pairs per tile
+constexpr int OBX = 16, OBY = 32;              // the tile order's pair blocks
+struct Span {                                  // the live pairs: block rows [lo, lo + nrow) x [0, my)
+    long long cb, ce;                          // live columns [cb, ce)
+    long long lo, nrow, my, pairs;
+    XBlock xb;
+};
+__device__ __forceinline__ Span span_of(long long cb, long long ce, long long my, long long pairs,
+                                        const XBlock& xb) {
+    const long long per_row = my * SSO;
+    return Span{cb, ce, cb / per_row, (ce - cb) / per_row, my, pairs, xb};
+}
+struct ColInfo {                               // tile column j of the tile at col0
+    long long pr, rx, yy, xx;                  // pair, its block row, right centroid, left centroid
+    int a, b;                                  // spin element of the stored block
+    bool live, real;                           // col < ce; a real source pair (pr < pairs, xx < mx)
+};
+// Live pair q (0-based from cb) -> (block row, right centroid) in the blocked order.
+__device__ __forceinline__ void pair_rc(const Span& s, long long q, long long& rx, long long& yy) {
+    const int my = int(s.my), nrow = int(s.nrow), qq = int(q);
+    const int rb = qq / (OBX * my), r0 = rb * OBX, h = min(OBX, nrow - r0);
+    int rem = qq - rb * OBX * my;
+    const int cbk = rem / (h * OBY), c0 = cbk * OBY, w = min(OBY, my - c0);
+    rem -= cbk * h * OBY;
+    rx = s.lo + r0 + rem / w;
+    yy = c0 + rem % w;
+}
+__device__ __forceinline__ ColInfo col_info(const Span& s, long long col) {
+    ColInfo c;
+    c.live = col < s.ce;
+    const int m = int((col - s.cb) % SSO);
+    c.a = m / NA;
+    c.b = m % NA;
+    if (c.live) {
+        pair_rc(s, (col - s.cb) / SSO, c.rx, c.yy);
+    } else {
+        c.rx = 0; c.yy = 0;
+    }
+    c.pr = c.rx * s.my + c.yy;
+    c.xx = lrx_x_of(s.xb, c.rx);
+    c.real = c.live && c.pr < s.pairs && c.xx < s.xb.mx;
+    return c;
+}
+
+// The tile's pairs, formed once per tile (the divisions of the blocked order and the x block stay
+// out of the phases): left centroid, right centroid, block row, flags (bit 0 live, bit 1 real).
+struct PInfo { int xx, yy, rx, flags; };
+__device__ __forceinline__ void fill_pinfo(PInfo* pi, const Span& sp, long long col0) {
+    for (int jp = threadIdx.x; jp < TPP; jp += blockDim.x) {
+        const ColInfo ci = col_info(sp, col0 + (long long)jp * SSO);
+        pi[jp] = PInfo{int(ci.xx), int(ci.yy), int(ci.rx), (ci.live ? 1 : 0) | (ci.real ? 2 : 0)};
+    }
+}
+// NS consecutive int32 table entries (one aligned 8-byte load for NS = 2: the merged endpoint
+// tables are (nk, m*NS) with the NS slots of a centroid adjacent).
+__device__ __forceinline__ void load_ns(const int* __restrict__ p, int (&v)[NS]) {
+    if constexpr (NS == 2) {
+        const int2 q = *reinterpret_cast<const int2*>(p);
+        v[0] = q.x; v[1] = q.y;
+    } else {
+#pragma unroll
+        for (int c = 0; c < NS; ++c) v[c] = p[c];
+    }
+}
+
+constexpr int GITEMS = KG::NK * TPP;           // (k, pair) items of a tile
+constexpr int GMAX = 4;                        // items per thread held across A1 -> A2
+// A1 + A2.  Ends with a barrier.
+__device__ __forceinline__ void gather(lrx_c2* __restrict__ bank, const lrx_c2* __restrict__ gp,
+                                       const lrx_c2* __restrict__ gt, const UnfoldTab& t, const PInfo* __restrict__ pi) {
+    const lrx_c2* __restrict__ mph = reinterpret_cast<const lrx_c2*>(t.mph);
+    const lrx_c2* __restrict__ nph = reinterpret_cast<const lrx_c2*>(t.nph);
+    const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t.spin);
+    for (int i0 = 0; i0 < GITEMS; i0 += GMAX * blockDim.x) {
+        unsigned vmask[GMAX];                      // A1: valid sources of each item (bit c*NS + d)
+#pragma unroll
+        for (int u = 0; u < GMAX; ++u) {
+            const int i = i0 + u * blockDim.x + threadIdx.x;
+            vmask[u] = 0;
+            if (i >= GITEMS) continue;
+            const int k = i / TPP, jp = i % TPP;
+            const PInfo p = pi[jp];
+            const bool real = p.flags & 2;
+            lrx_c2* cell = bank + (jp * SSO) * KG::RS + KG::at(k);
+            const lrx_c2* src = gp;
+            int ls[NS], rs[NS];
+#pragma unroll
+            for (int c = 0; c < NS; ++c) { ls[c] = -1; rs[c] = -1; }
+            if (real) {
+                const bool anti = t.trs[k] != 0;
+                vmask[u] = anti ? 1u << 16 : 0u;
+                src = ((anti && t.conj_trs == 0) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
+                load_ns(t.lsrc + (long long)k * t.ml + p.xx * NS, ls);
+                load_ns(t.rsrc + (long long)k * t.nl + p.yy * NS, rs);
+            }
+#pragma unroll
+            for (int c = 0; c < NS; ++c) {
+#pragma unroll
+                for (int d = 0; d < NS; ++d) {
+                    const bool ok = ls[c] >= 0 && rs[d] >= 0;
+                    lrx_async::cell16(cell + (c * NS + d) * KG::RS, ok ? src + (long long)ls[c] * t.nl + rs[d] : gp, ok);
+                    vmask[u] |= ok ? 1u << (c * NS + d) : 0u;
+                }
+            }
+        }
+        lrx_async::commit();
+        lrx_async::wait_all();                     // a thread finishes the cells it issued
+#pragma unroll
+        for (int u = 0; u < GMAX; ++u) {           // A2
+            const int i = i0 + u * blockDim.x + threadIdx.x;
+            if (i >= GITEMS) continue;
+            const int k = i / TPP, jp = i % TPP;
+            const PInfo p = pi[jp];
+            if (!(p.flags & 2)) continue;          // the cells were zero-filled
+            lrx_c2* cell = bank + (jp * SSO) * KG::RS + KG::at(k);
+            const bool anti = vmask[u] & (1u << 16), conj_row = anti && t.conj_trs == 1;
+            const bool conj_src = anti && t.conj_trs == 2;
+            lrx_c2 g[NS][NS], uu[NS][NS];
+#pragma unroll
+            for (int c = 0; c < NS; ++c) {
+                const lrx_c2 mp = mph[(long long)k * t.ml + p.xx * NS + c];
+#pragma unroll
+                for (int d = 0; d < NS; ++d) {
+                    lrx_c2 v = {0.0, 0.0};
+                    if (vmask[u] & (1u << (c * NS + d))) {
+                        lrx_c2 sv = cell[(c * NS + d) * KG::RS];
+                        if (conj_src) sv.y = -sv.y;
+                        v = lrx_mulf(lrx_mulf(mp, sv), nph[(long long)k * t.nl + p.yy * NS + d]);
+                        if (conj_row) v.y = -v.y;
+                    }
+                    g[c][d] = v;
+                }
+            }
+#pragma unroll
+            for (int aa = 0; aa < NS; ++aa)
+#pragma unroll
+                for (int bb = 0; bb < NS; ++bb) uu[aa][bb] = spin[((long long)k * NS + aa) * NS + bb];
+#pragma unroll
+            for (int aa = 0; aa < NS; ++aa) {
+                lrx_c2 out[NS];
+                lrx_spin_row(uu, uu, g, aa, out);
+#pragma unroll
+                for (int bb = 0; bb < NS; ++bb) cell[(aa * NS + bb) * KG::RS] = out[bb];
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// One pass of transform3 on axis y (lines (kx, kz) of every column).
+template <cufftdx::fft_direction Dir>
+__device__ __forceinline__ void pass_y(lrx_c2* bank) {
+    if constexpr (NY > 1) {
+        int j, li;
+        for (int l = threadIdx.x; l < NT * NX * NZ; l += blockDim.x) {
+            lrx_kbox::line_of<NT>(l, NX * NZ, j, li);
+            lrx_kbox::line_fft<NY, LRX_SM, Dir>(bank + j * KG::RS + (li / NZ) * NY * KG::ZP + li % NZ, KG::ZP);
+        }
+        __syncthreads();
+    }
+}
+// One pass of transform3 on axis z.
+template <cufftdx::fft_direction Dir>
+__device__ __forceinline__ void pass_z(lrx_c2* bank) {
+    if constexpr (NZ > 1) {
+        int j, li;
+        for (int l = threadIdx.x; l < NT * NX * NY; l += blockDim.x) {
+            lrx_kbox::line_of<NT>(l, NX * NY, j, li);
+            lrx_kbox::line_fft<NZ, LRX_SM, Dir>(bank + j * KG::RS + li * KG::ZP, 1);
+        }
+        __syncthreads();
+    }
+}
+
+// Phase C: inverse x and the Mid, in registers.
+__device__ __forceinline__ void mid_x(lrx_c2* __restrict__ bank, const lrx_c2* __restrict__ kern, const Span& sp,
+                                      const PInfo* __restrict__ pi) {
+    const XBlock& xb = sp.xb;
+    const long long my = sp.my;
+    constexpr int ITEMS = NY * NZ * NT;
+    for (int i = threadIdx.x; i < ITEMS; i += blockDim.x) {
+        const int j = i % NT, pnt = i / NT;
+        const PInfo q = pi[j / SSO];
+        lrx_c2* p = bank + j * KG::RS + KG::plane_at(pnt);
+        lrx_c2 v[NX];
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx) v[kx] = p[kx * NY * KG::ZP];
+        if constexpr (NX > 1) lrx_kbox::line_fft<NX, LRX_SM, cufftdx::fft_direction::inverse>(v, 1);
+        if (q.flags & 1) {
+            const long long xr = min((long long)q.xx, xb.mx - 1);
+            const lrx_c2* __restrict__ kp = kern + ((long long)pnt * xb.mx + xr) * my + q.yy;
+            const long long kxs = (long long)NY * NZ * xb.mx * my;    // W_R stride of one kx step
+#pragma unroll
+            for (int kx = 0; kx < NX; ++kx) v[kx] = lrx_mul(v[kx], kp[kx * kxs]);
+        }
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx) p[kx * NY * KG::ZP] = v[kx];
+    }
+    __syncthreads();
+}
+
+// Phase F: forward x and the store of the rows kout keeps.  Ends with a barrier (the bank is reused).
+__device__ __forceinline__ void store_x(const lrx_c2* __restrict__ bank, lrx_c2* __restrict__ y, const UnfoldTab& t,
+                                        const Span& sp, double scale, const PInfo* __restrict__ pi,
+                                        PInfo* __restrict__ pnext, long long col_next) {
+    const XBlock& xb = sp.xb;
+    const long long my = sp.my;
+    if (col_next < sp.ce) fill_pinfo(pnext, sp, col_next);   // the next tile's pairs, before the barrier
+    constexpr int ITEMS = NY * NZ * NT;
+    for (int i = threadIdx.x; i < ITEMS; i += blockDim.x) {
+        const int j = i % NT, pnt = i / NT;
+        const PInfo q = pi[j / SSO];
+        const int a = (j % SSO) / NA, b = j % NA;
+        int ko[NX];
+        bool any = false;
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx) {
+            ko[kx] = int(lrx_out_row(t, kx * NY * NZ + pnt));
+            any = any || ko[kx] >= 0;
+        }
+        if (!(any && (q.flags & 1))) continue;
+        const lrx_c2* p = bank + j * KG::RS + KG::plane_at(pnt);
+        lrx_c2 v[NX];
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx) v[kx] = p[kx * NY * KG::ZP];
+        if constexpr (NX > 1) lrx_kbox::line_fft<NX, LRX_SM, cufftdx::fft_direction::forward>(v, 1);
+        const long long rows = xb.rows;
+        const long long base = (a * rows + q.rx) * (my * NA) + b * my + q.yy;
+        const long long kstride = (long long)NA * rows * (my * NA);
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx)
+            if (ko[kx] >= 0) y[ko[kx] * kstride + base] = {v[kx].x * scale, v[kx].y * scale};
+    }
+    __syncthreads();
+}
+}  // namespace m7f
+#endif
+
 #ifndef LRX_MINB
 #define LRX_MINB 1
 #endif
@@ -1172,6 +1437,23 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(M7
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
         lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, p0 * SS, ce, st);   // the loop top syncs
     }
+#elif LRX_M7F
+    const m7f::Span sp = m7f::span_of(cb, ce, my, pairs, xb);
+    __shared__ m7f::PInfo pinfo[2][m7f::TPP];
+    const long long cstep = (long long)gridDim.x * TRC;
+    long long col0 = cb + (long long)blockIdx.x * TRC;
+    if (col0 < ce) m7f::fill_pinfo(pinfo[0], sp, col0);
+    __syncthreads();
+    for (int par = 0; col0 < ce; col0 += cstep, par ^= 1) {
+        m7f::gather(sm, gp, gt, t, pinfo[par]);
+        m7f::pass_z<fft_direction::inverse>(sm);
+        m7f::pass_y<fft_direction::inverse>(sm);
+        m7f::mid_x(sm, kern, sp, pinfo[par]);
+        m7f::pass_z<fft_direction::forward>(sm);
+        m7f::pass_y<fft_direction::forward>(sm);
+        m7f::store_x(sm, y, t, sp, scale, pinfo[par], pinfo[par ^ 1], col0 + cstep);
+    }
+    (void)st;
 #else
     const M7Load ld{gp, gt, &t, my, pairs, 0};
     const M7Mid mid{kern, xb, my, 0};
@@ -2512,6 +2794,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_MINB=" + std::to_string(std::max(1, m7_blocks)));
         defs.push_back("-DLRX_TR=" + std::to_string(m7_tr));
         defs.push_back("-DLRX_THREADS=" + std::to_string(m7_threads));
+        // The fused single-arm tile (m7f, embedded source): the register load of whole groups, n_s <= 2.
+        defs.push_back("-DLRX_M7F=" + std::string(m7_arm == 0 && m7_tp == 0 && blk == ns && ns <= 2 ? "1" : "0"));
         if (m7_arm) defs.push_back("-DLRX_THREADS2=" + std::to_string(m7_mid));
         if (m7_arm == 1) defs.push_back("-DLRX_THREADS3=" + std::to_string(m7_pass));
     }
