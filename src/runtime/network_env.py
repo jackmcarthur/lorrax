@@ -164,6 +164,8 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
         # collective (2026-10-16; with only the FI_* settings added it ran).
         if section:
             _require_launch_libraries(section, env, profile['site'], leg, lib, is_file)
+            result['launch_libraries'] = list(section.get('launch_libraries', ()))
+            result['launch_libraries_remedy'] = section.get('launch_libraries_remedy', '')
             result['mpi_before_collectives'] = bool(section.get('mpi_before_collectives'))
             defaults = section.get('env', {})
         else:
@@ -196,6 +198,8 @@ def plan_network_environment(env, *, platform='gpu', is_file=None, cxi=None):
         # resolve only through the launch's LD_LIBRARY_PATH.
         _require_launch_libraries(section, env, profile['site'], leg, lib, is_file)
         result['policy'] = f"{profile['site']} profile"
+        result['launch_libraries'] = list(section.get('launch_libraries', ()))
+        result['launch_libraries_remedy'] = section.get('launch_libraries_remedy', '')
         result['mpi_before_collectives'] = bool(section.get('mpi_before_collectives'))
     else:
         on_cxi = cxi if cxi is not None else os.path.isdir('/sys/class/cxi')

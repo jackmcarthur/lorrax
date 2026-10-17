@@ -71,7 +71,7 @@ __all__ = [
     "read_checkout_closure", "resolve_closure",
     "assert_one_mapped_mpi_runtime", "check_abi", "checkout_build_dir",
     "describe_library",
-    "is_private_redistributable", "locate_library", "open_and_attest",
+    "check_launch_libraries", "is_private_redistributable", "locate_library", "open_and_attest",
     "refuse_private_library",
 ]
 
@@ -1139,6 +1139,38 @@ def _enforce(record: ClosureRecord, unusable_cls: Type[OSError],
     mine = {e.family for e in record.entries}
     return _Enforced(record=record, identity=_record_identity(record, verified),
                      verified={f: v for f, v in verified.items() if f in mine})
+
+
+def check_launch_libraries(names: Sequence[str], ld_library_path: str, *,
+                           remedy: str = "",
+                           unusable_cls: Type[OSError] = LibraryUnusable) -> None:
+    """Refuse a launch whose site transport would map a second copy of a
+    recorded library.
+
+    ``names`` are the unversioned names the site transport dlopens through
+    ``LD_LIBRARY_PATH`` (``site.toml`` ``launch_libraries``; Perlmutter:
+    libfabric's ``libcudart.so``).  Such a name matches no loaded SONAME, so
+    the loader maps whatever file it finds first; where an enforced leg
+    records that library's family, the file must be the recorded one.  Call
+    after the legs open and before the first collective.
+    """
+    recorded = {fam: path for e in _ENFORCED.values()
+                for fam, (path, _sha) in (e.verified or {}).items()}
+    dirs = [d for d in ld_library_path.split(":") if d]
+    for name in names:
+        hit = next((Path(d) / name for d in dirs if (Path(d) / name).is_file()), None)
+        if hit is None:
+            continue                  # runtime.network_env refuses an absent name
+        real = hit.resolve()
+        family = library_family((_elf_dynamic(real).get(_DT_SONAME) or [real.name])[0])
+        want = recorded.get(family)
+        if want is None or _same_file(real, Path(want)):
+            continue
+        raise _gate(unusable_cls,
+                    f"{name} on LD_LIBRARY_PATH resolves to {real} ({hit.parent}), which "
+                    f"the site transport dlopens: a second copy of {family}",
+                    f"{name} -> the recorded {want}",
+                    remedy or "put the recorded file under that name first on LD_LIBRARY_PATH")
 
 
 def native_closure_identity(platform: str | None = None) -> str:

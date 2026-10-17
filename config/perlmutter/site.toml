@@ -8,6 +8,13 @@
 # VNI, MPI-IO and NCCL's OFI initialization fail together and NCCL runs over
 # TCP sockets.
 step_network = "no_vni"
+# libfabric's CUDA memory interface (NCCL's OFI plugin, below) dlopens this
+# unversioned name.  It must name the CUDA runtime the dependency closure
+# records, never a second one (Fe P=16, 2026-10-17: the toolkit's, beside the
+# wheel's).  runtime.network_env refuses a step without it; the device leg's
+# open (runtime step 5e) refuses one where it names another file.
+launch_libraries = ["libcudart.so"]
+launch_libraries_remedy = "Source config/perlmutter/gpu_env.sh before srun: it links the venv's CUDA runtime under that name and puts it on LD_LIBRARY_PATH."
 
 # The settings of the site module nccl/2.29.2-cu13 (`module show`), filled in
 # where the caller has not exported them. FI_CXI_RDZV_THRESHOLD=0, set by every

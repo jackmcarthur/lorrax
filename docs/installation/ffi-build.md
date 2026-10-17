@@ -308,6 +308,28 @@ GATE native-closure: got <what is mapped or found>; want <what the record says>;
 | `no closure record for …` | a leg built before this rule, or by a script that does not record | rebuild with the site's build script |
 | `stale closure record …` | the leg was rebuilt without its record, or a recorded file moved, was purged or was replaced (a module upgrade, a `uv sync` that changed the CUDA or ROCm wheels, a purged `.build`) | rebuild the leg |
 | `<leg> records mpi as … but <leg> (opened first) records …` | the two legs were built against different library sets | rebuild both legs in one environment |
+| `libcudart.so on LD_LIBRARY_PATH resolves to <file> …: a second copy of libcudart` (multi-node) | the site transport would dlopen a runtime other than the recorded one (below) | source the site's launch script (`config/perlmutter/gpu_env.sh`, `config/frontier/rocm_env.sh`) before `srun` |
+
+**Before the first collective.** A GPU process opens its device leg as
+start-up step 5e, after the backend exists and before the mesh creates the
+first NCCL/RCCL communicator. That is when the collective library dlopens the
+site network plugin, and the plugin binds its own runtime by SONAME
+(Perlmutter's aws-ofi-nccl: `NEEDED libcudart.so.13`, no RUNPATH). With the
+closure already mapped it binds the recorded copy.
+
+**Launch libraries.** The site transport also dlopens some libraries by an
+unversioned name, which matches no loaded SONAME and so resolves only through
+the launch's `LD_LIBRARY_PATH`: libfabric's CUDA memory interface opens
+`libcudart.so`, its ROCr one `libhsa-runtime64.so`. `site.toml` lists them as
+`launch_libraries`. The site's launch script links each name to the run
+python's wheel runtime, first on `LD_LIBRARY_PATH` (`gpu_env.sh`,
+`rocm_env.sh`); a python without that wheel (the Perlmutter module, which
+records the toolkit runtime) leaves the path as the module sets it. On a
+multi-node step, step 5e refuses when a name's first match is not the recorded
+file of its family (`native_provider.check_launch_libraries`), before the
+transport can map a second runtime. This is the one place where
+`LD_LIBRARY_PATH` decides a mapped library, so it is checked rather than
+trusted.
 
 The check runs once per leg at start-up, and once more at the first
 `native_closure_identity()` call. It costs stat calls and the ELF headers of

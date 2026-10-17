@@ -454,3 +454,94 @@ def test_sealed_private_check_covers_the_opened_legs_only(tmp_path, monkeypatch)
     npv._attest_private_mapping(att, _Unusable, ["CUDA"])          # host SLATE not open yet: fine
     with pytest.raises(_Unusable, match="libslate.so.2"):
         npv._attest_private_mapping(att, _Unusable, ["CUDA", "cpu"])
+
+
+def test_device_leg_opens_before_first_collective():
+    """The device leg (and so its recorded closure) maps before prepare_mesh
+    creates the first NCCL/RCCL communicator: a site net plugin dlopened there
+    binds its runtime by SONAME and must find the recorded copy already mapped."""
+    import ast
+    src = (Path(__file__).resolve().parents[1] / "src" / "runtime" / "__init__.py").read_text()
+    fn = next(n for n in ast.parse(src).body
+              if isinstance(n, ast.FunctionDef) and n.name == "initialize_communicator_stack")
+    calls = [(c.lineno, c.func.id if isinstance(c.func, ast.Name) else getattr(c.func, "attr", ""))
+             for c in ast.walk(fn) if isinstance(c, ast.Call)]
+    line = {name: ln for ln, name in sorted(calls, reverse=True)}
+    assert line["bootstrap"] < line["_open_device_leg_before_collectives"] < line["prepare_mesh"]
+
+
+def _launch_env(tmp_path, monkeypatch, recorded_name="rec"):
+    """Two cudart files and an enforced leg that records the first."""
+    from types import SimpleNamespace
+    from lxkit import native_provider as n
+    rec = tmp_path / recorded_name / "libcudart.so.13"
+    other = tmp_path / "toolkit" / "libcudart.so.13.2.75"
+    for f in (rec, other):
+        f.parent.mkdir(parents=True)
+        f.write_bytes(f.name.encode())
+    monkeypatch.setattr(n, "_elf_dynamic", lambda p: {n._DT_SONAME: ["libcudart.so.13"]})
+    monkeypatch.setattr(n, "_ENFORCED", {Path("/leg"): SimpleNamespace(
+        verified={"libcudart": (rec, "0" * 64)})})
+    return n, rec, other
+
+
+def _shim(d, target):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "libcudart.so").symlink_to(target)
+    return str(d)
+
+
+def test_launch_library_naming_the_recorded_file_passes(tmp_path, monkeypatch):
+    n, rec, other = _launch_env(tmp_path, monkeypatch)
+    path = f"{_shim(tmp_path / 'shim', rec)}:{_shim(tmp_path / 'tk', other)}"
+    n.check_launch_libraries(["libcudart.so"], path)
+
+
+def test_launch_library_naming_a_second_copy_refuses(tmp_path, monkeypatch):
+    n, rec, other = _launch_env(tmp_path, monkeypatch)
+    path = f"{_shim(tmp_path / 'tk', other)}:{_shim(tmp_path / 'shim', rec)}"
+    with pytest.raises(n.LibraryUnusable) as exc:
+        n.check_launch_libraries(["libcudart.so"], path, remedy="source gpu_env.sh")
+    msg = str(exc.value)
+    assert msg.startswith("GATE native-closure: got libcudart.so on LD_LIBRARY_PATH resolves to")
+    assert str(other) in msg and str(rec) in msg and "fix: source gpu_env.sh" in msg
+
+
+def test_launch_library_of_an_unrecorded_family_or_absent_name_passes(tmp_path, monkeypatch):
+    n, rec, other = _launch_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(n, "_ENFORCED", {})
+    n.check_launch_libraries(["libcudart.so"], _shim(tmp_path / "tk", other))
+    n.check_launch_libraries(["libabsent.so"], str(tmp_path))
+
+
+def test_network_decision_carries_the_site_launch_libraries(monkeypatch):
+    from runtime import network_env
+    env = {"NERSC_HOST": "perlmutter", "SLURM_STEP_NUM_NODES": "4",
+           "SLURM_NETWORK": "no_vni", "JAX_PLATFORMS": "cuda,cpu",
+           "LD_LIBRARY_PATH": "/x"}
+    d = network_env.plan_network_environment(env, is_file=lambda p: True)
+    assert d["launch_libraries"] == ["libcudart.so"] and "gpu_env.sh" in d["launch_libraries_remedy"]
+
+
+def test_gpu_env_links_the_venv_cuda_runtime(tmp_path):
+    """gpu_env.sh puts libcudart.so -> the run python's wheel runtime first on
+    LD_LIBRARY_PATH, and leaves it unchanged for a python without one."""
+    import subprocess, sys, sysconfig
+    root = Path(__file__).resolve().parents[1]
+    venv = tmp_path / "venv"
+    lib = Path(sysconfig.get_paths(vars={"base": str(venv), "platbase": str(venv)})["purelib"]) / "nvidia" / "cu13" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "libcudart.so.13").write_bytes(b"x")
+    fake_py = venv / "bin" / "python"
+    fake_py.parent.mkdir(parents=True)
+    fake_py.write_text(f"#!/bin/sh\nexec {sys.executable} -c \"import sysconfig,sys; sysconfig.get_paths=lambda *a,**k: {{'purelib': '{lib.parents[2]}'}}; exec(sys.stdin.read())\"\n")
+    fake_py.chmod(0o755)
+    sh = (f"export SCRATCH={tmp_path} XDG_CACHE_HOME={tmp_path}/cache VIRTUAL_ENV={venv} LD_LIBRARY_PATH=/tk; "
+          f"source {root}/config/perlmutter/gpu_env.sh; source {root}/config/perlmutter/gpu_env.sh; "
+          "echo $LD_LIBRARY_PATH; readlink -f ${LD_LIBRARY_PATH%%:*}/libcudart.so")
+    out = subprocess.run(["bash", "-c", sh], capture_output=True, text=True, check=True).stdout.split()
+    assert out[0].count(":") == 1 and out[0].endswith(":/tk") and "cudart-hmem" in out[0]
+    assert out[1] == str((lib / "libcudart.so.13").resolve())
+    sh2 = (f"export SCRATCH={tmp_path} VIRTUAL_ENV={tmp_path}/none LD_LIBRARY_PATH=/tk; "
+           f"source {root}/config/perlmutter/gpu_env.sh; echo $LD_LIBRARY_PATH")
+    assert subprocess.run(["bash", "-c", sh2], capture_output=True, text=True).stdout.strip() == "/tk"
