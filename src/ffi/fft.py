@@ -81,7 +81,7 @@ __all__ = [
     "kconv_backend", "require_kconv", "mathdx_root", "cubin_cache_dir", "conv_kpair_scale",
     "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
     "KCONV_PLANE_TARGET",
-    "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET",
+    "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET", "klead_unfold_kf",
     "klead_unfold_scratch_bytes",
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET", "live_row_mask",
@@ -109,8 +109,10 @@ KCONV_KLEAD_OUTER_KSUM_TARGET = "lorrax_mathdx_kconv_klead_outer_ksum"
 #: The same load with the BSE decode's (t, μ) contraction fused into the store (U never stored):
 #: :func:`make_local_kconv_klead_outer_decode`.
 KCONV_KLEAD_OUTER_DECODE_TARGET = "lorrax_mathdx_kconv_klead_outer_decode"
-#: Modes 7/8 on the parent rows, with the conj-on-load partner and (mode 7) the output spin block.
-KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_xblock"
+#: Mode 7 on the parent rows: the conj-on-load partner, the stored x block, and the k-fastest
+#: copies of the endpoint tables its fused single arm reads (:func:`klead_unfold_kf`).  The library
+#: keeps ``..._xblock`` (no copies; its single arm is the chain) for older trees.
+KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_kf"
 #: Mode 8 with W read from its irreducible-q parent tile on the load (the library keeps the V_R
 #: targets for older trees; nothing here calls them).
 KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_wparent"
@@ -2564,18 +2566,34 @@ def x_block_rows(rows) -> np.ndarray:
 #   measured 1.10-1.30x over 14^3-21^3); m11f, mode 11's fused single arm at n_s 2 (9.92 -> ~5 ms,
 #   2.0-3.3x with acc=None and the q-row store; the gather is the L1 address-divergence bound).
 # Pruned (cleanup/kconv-prune, owner 2026-10-17: below 1.15x, a host rule and kernel text each):
-#   M7KF, k-fastest copies of mode 7's index tables per call (1.03x, Fe 8^3 4.22 -> 4.08; an
-#   unpriced 4 N_k (ml + nl) B workspace); m7s at n_s 1 (bits 4 alone for a column box <= 64 KB,
+#   M7KF, k-fastest copies of mode 7's index tables per call by a kernel into handler scratch (an
+#   unpriced 4 N_k (ml + nl) B workspace; 1.03x Fe 8^3, 1.13x 12^3 n_s 1), replaced by the same
+#   copies formed in XLA by this factory (klead_unfold_kf) and read by m7f alone: kernel 0.984-1.009x
+#   of M7KF's call on 4^3-13^3 (never slower at any tile size), end to end with placed tables
+#   1.000-1.006x at Fe 8^3, 12^3, 13^3 and 1.00-1.02x at 4^3-8^3 (kc_prune/m7cmp.log, res_kf.json); m7s at n_s 1 (bits 4 alone for a column box <= 64 KB,
 #   14^3 / 15^3 only on A100, 1.007-1.124x; 14^3 previous arm 2 / bits 12 / bits 4 3.63 / 3.26 /
 #   3.26, 15^3 4.28 / 4.81 / 3.99, 32 x 240 3.17 / 3.36 / 3.01; 16^3+ bits 4 did not pay); W2 at
 #   4 blocks a SM below nk 256 and its fixed-column exception (6^3 only: 0.338 plain -> 0.296 at
 #   four blocks, 0.387 at two; the fixed-column store beside it was 1.05x slower); m9b, mode 9's persistent orbit-blocked
 #   split plane pass where the tiles fill 90% of their waves (20^3 427 tiles 6.33 -> 5.96, 24^3
 #   17.3 -> 13.6; 0.995-1.006x on 18 of 24 measured rows, 15^3 0.88x).  Their measured cost on the
-#   45-case sweep (prune / previous, per call): mode 7 Fe 8^3 1.033, 12^3 n_s 1 1.127, 13^3 n_s 2
-#   1.077, 14^3 n_s 1 1.123; mode 9 6^3 1.20-1.22 (W2 at two blocks; W2 off below nk 256 instead
+#   45-case sweep (prune / previous, per call): mode 7 14^3 n_s 1 1.123, 15^3 1.07 (before the
+#   XLA tables also Fe 8^3 1.033, 12^3 n_s 1 1.127, 13^3 n_s 2 1.077); mode 9 6^3 1.20-1.22 (W2 at two blocks; W2 off below nk 256 instead
 #   measured 6^3 1.10 and 12x12x1 1.33, so W2 from nk 128), 14^3-24^3 1.11-1.23; the rest
 #   <= 1.02 (kc_prune/sweep_ratio.csv, w2_ratio.csv).
+def klead_unfold_kf(src, ns: int):
+    """The k-fastest copy of one rank's endpoint table: ``(nk, m*ns)`` -> ``(m, nk, ns)`` int32.
+
+    Mode 7's fused single arm reads a pair's ``ns`` source slots at every k of a warp's items from
+    one run along k (the measured record above :func:`make_kconv_klead_unfold`).  Formed in XLA by
+    :func:`make_kconv_klead_unfold` from the tables it is handed: constant-folded once per plan from
+    baked host tables, one transpose of a pass's cut tables when the consumer passes ``load``
+    (``4·N_k·(μ_x + ν_y)·n_s`` B, counted by the program's ``memory_analysis``).
+    """
+    nk, w = (int(v) for v in src.shape)
+    return jnp.transpose(src.reshape(nk, w // int(ns), int(ns)), (1, 0, 2))
+
+
 def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str | None = "ortho",
                             mult: float = 1.0) -> Callable:
     """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep, load=None) -> U``.
@@ -2641,8 +2659,8 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
             out = jax.ShapeDtypeStruct((n_out, ns, xn * bx if bx else mx, ns, my), g.dtype)
             return jax.ffi.ffi_call(KCONV_KLEAD_UNFOLD_TARGET, out)(
                 flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
-                jnp.asarray(kout), v_r, *(() if live is None else (live,)),
-                conj_src=np.int64(bool(conj_src)),
+                jnp.asarray(kout), v_r, klead_unfold_kf(t.lsrc, ns), klead_unfold_kf(t.rsrc, ns),
+                *(() if live is None else (live,)), conj_src=np.int64(bool(conj_src)),
                 x0=np.int64(x0), bx=np.int64(bx), xs=np.int64(xs), xn=np.int64(xn), **attrs)
     elif (kbox := rocm_kbox_target(mesh, kg, "kconv_klead_unfold", ns)) is not None:
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),

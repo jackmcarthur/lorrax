@@ -188,7 +188,7 @@ One handler file serves modes 0–11, each a value of the compile-time
 | 4 `kconv_kminor` | `make_kconv_kminor`, `make_local_kconv_kminor` | $U = s\,F_k(F^{-1}X\cdot K_R)$, k trailing, $K_R$ made by mode 5 | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | k moved to the front, the transforms and the product, k moved back |
 | 5 `kfft_kminor` | `make_kfft_kminor`, `make_local_kfft_kminor` | $Y = s\,F^{\pm}_k X$, k trailing | `(rows, N_k)` | the same transpose around one transform |
 | 6 `kconv_plane` | `make_fused_conv_kplane` | mode 0 read from route G's plane-transform output (`g` planes of `p` points, `c` centroids per side): the Bloch phase `F[k,g,p]` applied and the `2c` axis split on the load into the left projector (slots `[0, c)`) and the right one (`[c, 2c)`) | `D` `(N_k, g, n_s, 2c, n_s, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | phase, split and transpose in XLA, then mode 0's composition |
-| 7 `kconv_klead_unfold_xblock` | `make_kconv_klead_unfold` | mode 2 on the typed unfold of the raw-parent Green ([§5](#unfold-on-load)) | `G`, `Gt` `(n_parent, μ, n_s, ν, n_s)`, `V_R` `(N_k, μ, ν)` → `U` `(n_out, n_s, μ or an x block, n_s, ν)` | `symmetry_maps.apply_unfold_load_tables_local` (a full-k copy), mode 2's composition, the row selection |
+| 7 `kconv_klead_unfold_kf` | `make_kconv_klead_unfold` | mode 2 on the typed unfold of the raw-parent Green ([§5](#unfold-on-load)) | `G`, `Gt` `(n_parent, μ, n_s, ν, n_s)`, `V_R` `(N_k, μ, ν)` → `U` `(n_out, n_s, μ or an x block, n_s, ν)` | `symmetry_maps.apply_unfold_load_tables_local` (a full-k copy), mode 2's composition, the row selection |
 | 8 `kconv_klead_lorentz_wparent` | `make_kconv_lorentz_unfold` | the four-current Σ: $U = s\,F_k\sum_{A,B}\gamma_A(F^{-1}\hat G)\gamma_B^\dagger\circ\hat W_R[k,\mu,A,\nu,B]$, $A$ ($B$) over the $n_A$ ($n_B$) Lorentz components of the left (right) endpoint (1 for charge, 3 for current), $\gamma_A$ channel $A$'s signed spin permutation, with $\hat G$ and $\hat W$ both unfolded from parents on the load | `G`, `Gt` as mode 7; `W`, `Wt` `(n_{q,parent}, μ, n_A, ν, n_B)`, $n_A, n_B \le 4$ → `U` `(n_out, n_s, μ, n_s, ν)` | both unfolds, the transforms and the γ block sum |
 | 9 `kfft_klead_unfold` | `make_kfft_klead_unfold` | $Y_k = s\,F^{-1}_k(\mathcal L_k\hat O_k \mathcal R_k^\dagger)$: the R-space operand of modes 2 and 7, read from an interaction's q wedge | `W`, `Wt` `(n_wedge, μ·n_l, ν·n_r)` → `Y` `(N_k, μ·n_l, ν·n_r)` | the unfold in XLA, then mode 2's `prep` |
 | 10 `plane_fft_gather` | `make_plane_fft_gather` (`LocalFourierPlan(in_gather=…)`) | the route-G plane FFT, gathered on load ([§10](#mode-10)) | `F` `(…, n_col)` → `Y` `(…, n_b, n_c)` | the XLA route: a static-run concatenate, then `jnp.fft.fftn` |
@@ -214,9 +214,11 @@ Where each mode is used, by owner module:
 | 10 | route G, through `common.fourier_plan.LocalFourierPlan` |
 | 11 | the χ₀ streams of `gw.w_isdf` ([§5](#unfold-consumers)) |
 
-The library also exports four mathdx targets that no current factory calls
+The library also exports five mathdx targets that no current factory calls
 (`kconv_klead_unfold_rows`, `kconv_klead_lorentz_rows`,
-`kconv_klead_unfold_block`, `kconv_klead_lorentz_conj`). They stay because a
+`kconv_klead_unfold_block`, `kconv_klead_unfold_xblock`, `kconv_klead_lorentz_conj`). They exist
+only for older source trees: the mode-7 ones carry no k-fastest tables, so their single arm is
+the chain (the same values, slower; [arms](#arms)). They stay because a
 target string never changes its operand contract: a new contract is a new
 target, so source trees built against the old ones keep loading
 ([FFI layer §8](ffi_layout.md#8-hard-invariants)).
@@ -297,9 +299,9 @@ measured record above `ffi.fft.make_kconv_klead_unfold`.
 
 | mode | arm (`arm=`) | condition (`build()`) | cubic grids A100 / H100 / 99 KiB | gain (A100) |
 |---|---|---|---|---|
-| 7 | `m7f`: fused single-arm tile | single arm (a block holds a spin group of ≥ 2 columns), whole group ($d = n_s$), $n_s \le 2$, no tile tables, `pinfo` fits | $n_s$ 1: 2³–13³ / 2³–15³ / 2³–11³; $n_s$ 2: the same | Fe 8³ 7.84 → 4.21 ms |
+| 7 | `m7f`: fused single-arm tile, reading the k-fastest tables | the `_kf` target (the tables present), single arm (a block holds a spin group of ≥ 2 columns), whole group ($d = n_s$), $n_s \le 2$, no tile tables, `pinfo` fits | $n_s$ 1: 2³–13³ / 2³–15³ / 2³–11³; $n_s$ 2: the same | Fe 8³ 7.84 → 4.06 ms |
 | 7 | `tt`: tile tables | single arm, $n_s = 4$, `tile_table_plan` finds a tile at ≥ 2 blocks per SM | 2³–8³ / 2³–9³ / 2³–7³ | 1.90× |
-| 7 | `chain`: stage, transform3, Mid, transform3, store | single arm otherwise: an output spin block $d < n_s$ (the legacy `_block` target only), or $n_s = 4$ without a tile | no current caller | (the reference) |
+| 7 | `chain`: stage, transform3, Mid, transform3, store | single arm otherwise: the legacy targets (no k-fastest tables; an output spin block $d < n_s$ only through `_block`), or $n_s = 4$ without a tile | no current caller | (the reference) |
 | 7 | `m7s`: orbit-blocked persistent plane pass, pair-major $W_R$, overlapped column pass | arm 2 (one padded column fits a block), $n_s = 2$, whole group, its static tables fit | 14³–21³ / 16³–23³ / 12³–18³ | 1.10–1.30× |
 | 7 | `arm2`: plane pass, column-resident pass | arm 2 otherwise ($n_s$ 1 and 4) | $n_s$ 1: 14³–21³ / 16³–24³ / 12³–18³; $n_s$ 4: 9³–21³ / 10³–24³ / 8³–18³ | (the reference) |
 | 7 | `arm1`: plane, x pencil, plane, pencil and store | split, one padded column exceeds a block | ≥ 22³ / ≥ 25³ / ≥ 19³ ($n_s$ 4 refused from 26³ / 30³ / 20³) | (the reference) |
@@ -311,13 +313,22 @@ measured record above `ffi.fft.make_kconv_klead_unfold`.
 | 11 | `single` | single arm otherwise ($n_s$ 1, vertices) | $n_s$ 1: 2³–17³ / 2³–19³ / 2³–14³ | (the reference) |
 | 11 | `split` | a pair's $2n_s^2$ columns exceed a block | $n_s$ 2: ≥ 11³ / ≥ 12³ / ≥ 10³ | (the reference) |
 
+**k-fastest tables.** m7f reads the endpoint tables in the layout `(m, N_k, n_s)`
+(`ffi.fft.klead_unfold_kf`; a warp's gather items read one run along k per centroid) and nothing
+else. The factory forms them with `jnp.transpose` from the tables it is handed: constant-folded
+once per plan from baked host tables, one XLA transpose of a row pass's cut tables when the
+consumer passes `load`. They are `4·N_k·(μ_x + ν_y)·n_s` B a call or pass (Fe 8³ rank tile
+80 × 640: 2.95 MB; 13³, 16 × 640: 11.5 MB), counted by the program's `memory_analysis`, no
+handler scratch. They replace M7KF, a per-call transpose kernel into the handler's scratch (its
+gain is kept: Fe 8³ 4.06 ms, end to end equal to M7KF's within 0.6 % at Fe 8³, 12³ and 13³).
+
 Pruned 2026-10-17 (each below 1.15× where it was measured; a host rule and kernel text apiece;
-record above `ffi.fft.make_kconv_klead_unfold`): mode 7's per-call k-fastest index tables (M7KF),
-m7s at $n_s = 1$, mode 9's four-block W2 rule below $N_k = 256$ with its fixed-column exception
+record above `ffi.fft.make_kconv_klead_unfold`): mode 7's per-call k-fastest index tables (M7KF,
+replaced by the XLA-formed tables above), m7s at $n_s = 1$, mode 9's four-block W2 rule below $N_k = 256$ with its fixed-column exception
 (W2 there now runs two blocks a SM), and mode 9's persistent split plane pass (m9b). Their cost
-against the previous kernels, per call on an A100: mode 7 1.03× at Fe 8³ and up to 1.13× at
-12³–15³; mode 9 1.20–1.22× at 6³ (0.30 → 0.36 ms) and 1.11–1.23× at ≥ 14³; every other case of
-the 45 within 1.02×.
+against the previous kernels, per call on an A100: mode 7 up to 1.12× at 14³–15³ $n_s = 1$ (the
+m7s rule); mode 9 1.20–1.22× at 6³ (0.30 → 0.36 ms) and 1.11–1.23× at ≥ 14³; every other case
+of the 45 within 1.02×.
 
 **Why the chain stays.** m7f's gather issues a pair's $n_s^2$ raw source cells by `cp.async`
 into that pair's $n_s^2$ bank columns before it forms $U g U^\dagger$ in place. An output spin

@@ -8,7 +8,8 @@ The binding rulings behind breaking changes are in
 ## 2026-10-17 — k-convolution kernels: four sub-1.15× arms removed (CUDA)
 
 A simplification pass on the mathdx modes 7, 9 and 11 (`src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`,
-`kbox_stage.cuh`). Removed: mode 7's per-call k-fastest index tables (M7KF), the m7s split arm at
+`kbox_stage.cuh`). Removed: mode 7's per-call k-fastest index-table kernel (M7KF; the factory now
+forms the k-fastest tables in XLA and passes them to a new target), the m7s split arm at
 n_s = 1, mode 9's four-block W2 rule below N_k = 256 and its fixed-column exception (W2 there now
 runs two blocks a SM), and mode 9's
 persistent split plane pass (m9b); the dead tuning bits of the kernel text; and the duplicated
@@ -17,13 +18,18 @@ listed per mode in [k-convolution §4](docs/architecture/kconv.md#arms).
 
 - **Results do not move:** every remaining arm computes the same lines in the same order (bitwise
   on the 45-case modes 7/9 sweep, the 21 mode-11 comparisons and the Fe 8³ P4 deck bodies).
-- **Speed:** the removed arms' gains, per call (A100, 45 k-grid cases x modes 7 and 9 against the
-  previous kernels): mode 7 1.03× at Fe 8³ (4.08 -> 4.21 ms), up to 1.13× at 12³–15³; mode 9
-  1.20–1.22× at 6³ (0.30 -> 0.36 ms) and 1.11–1.23× at ≥ 14³; every other case within 1.02×.
+- **Speed:** per call (A100, 45 k-grid cases x modes 7 and 9 against the previous kernels): mode 7
+  up to 1.12× at n_s = 1 on 14³/15³ (the m7s rule), mode 9 1.20–1.22× at 6³ (0.30 -> 0.36 ms) and
+  1.11–1.23× at ≥ 14³; every other case within 1.02× (M7KF's gain is kept: Fe 8³ mode 7 4.06 ms).
   Mode 11 is unchanged.
 - **Memory:** `ffi.fft.klead_unfold_scratch_bytes` now prices the m7s arm's pair-major W_R (16·N_k B
   a pair at n_s = 2 on 14³–21³ A100 grids), which the Σ τ window checks already add; before, that
-  arm took up to 25 % more scratch than priced. M7KF's unpriced workspace is gone.
+  arm took up to 25 % more scratch than priced. M7KF's unpriced handler workspace is gone; the
+  k-fastest tables are XLA buffers of `4·N_k·(μ_x + ν_y)·n_s` B a call (2.95 MB on a Fe 8³ P4
+  rank), counted by `memory_analysis`.
+- **New target:** mode 7 calls `lorrax_mathdx_kconv_klead_unfold_kf` (`_xblock` plus the k-fastest
+  tables; a new handler, so no ABI bump). A CUDA leg without it refuses at startup
+  (`GATE kconv-target`); `_xblock` stays for older trees and runs the chain arm there.
 - **Startup:** `require_kconv` also probes `lorrax_mathdx_kconv_chi_unfold_q`, so a CUDA leg older than
   that target refuses at startup (`GATE kconv-target`), not at the first W stream.
 - **`make_kconv_chi_unfold(rows=...)`:** a static `rows` outside `[0, N_k)` raises `ValueError`.

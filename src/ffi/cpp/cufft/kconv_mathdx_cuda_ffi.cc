@@ -214,6 +214,8 @@ struct UnfoldTab {
     int a0, b0;                                  // mode 7: first rows of the output spin block
     long long x0, bx, xs, xn;                    // mode 7: the stored x block, rows r in [0, xn*bx):
                                                  // left centroid (r / bx)*xs + x0 + r % bx (bx = 0: all)
+    const int *lkf, *rkf;                        // mode 7 m7f: lsrc / rsrc k-fastest, (ml/ns, nk, ns) and
+                                                 // (nl/ns, nk, ns) (KleadUnfoldKfConv); null elsewhere
 };
 
 // Mode 8 vertex tables and scales (the embedded source declares the same struct).
@@ -271,6 +273,7 @@ struct UnfoldTab {
     const double* spin_r;
     int a0, b0;
     long long x0, bx, xs, xn;
+    const int *lkf, *rkf;
 };
 // The output row of full k: kout[k] (-1 = not stored), or k itself.
 __device__ __forceinline__ long long lrx_out_row(const UnfoldTab& t, int k) {
@@ -1076,7 +1079,8 @@ struct M7Mid {                                 // the kernel V[k, x, y] of a pai
 // whole groups of NS <= 2).  The same lines, the same products and the same axis order as the
 // stage_tile / transform3 / mid_group_tile / transform3 / store_tile chain (bitwise), with the
 // thread-to-data map, the tile order and the shared-memory round trips changed:
-//   A1 gather: one thread per (k, pair) reads the pair's source indices (row, trs, lsrc, rsrc) and
+//   A1 gather: one thread per (k, pair) reads the pair's source indices (row, trs, and the k-fastest
+//      copies of lsrc / rsrc the factory forms in XLA, UnfoldTab::lkf / rkf) and
 //      issues the NS*NS raw source cells by cp.async straight into the bank (zero-filled where a
 //      source is -1); both of a thread's items are issued before any is waited on, so the gathered
 //      cells cost no registers while in flight.
@@ -1164,8 +1168,9 @@ __device__ __forceinline__ void gather(lrx_c2* __restrict__ bank, const lrx_c2* 
                 const bool anti = t.trs[k] != 0;
                 vmask[u] = anti ? 1u << 16 : 0u;
                 src = ((anti && t.conj_trs == 0) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
-                lrx_kbox::load_ns<NS>(t.lsrc + (long long)k * t.ml + p.xx * NS, ls);
-                lrx_kbox::load_ns<NS>(t.rsrc + (long long)k * t.nl + p.yy * NS, rs);
+                // the k-fastest copies: a warp's items read one run along k per centroid
+                lrx_kbox::load_ns<NS>(t.lkf + ((long long)p.xx * KG::NK + k) * NS, ls);
+                lrx_kbox::load_ns<NS>(t.rkf + ((long long)p.yy * KG::NK + k) * NS, rs);
             }
 #pragma unroll
             for (int c = 0; c < NS; ++c) {
@@ -3006,6 +3011,7 @@ static std::string split_tile_refusal(int mode, int nkx, int nky, int nkz, int n
 // block; mode 8: wa*8 + wb, the interaction's Lorentz widths when it is read from its parents, 0 = V_R)
 using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
 constexpr int kLiveBit = 1 << 16;                  // build(variant | kLiveBit): the kconv call's live program
+constexpr int kKfBit = 1 << 17;                    // build(7, variant | kKfBit): the call carries lkf / rkf
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
@@ -3068,7 +3074,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // kLiveBit: a padded pass's program (the kconv call's live operand present), built apart so the plain
     // program keeps no live bounds in registers (kbox_stage.cuh Live, LRX_LIVE).
     const int live_prog = (variant & kLiveBit) ? 1 : 0;
-    variant &= ~kLiveBit;
+    const bool kf_tabs = (variant & kKfBit) != 0;      // mode 7: the k-fastest tables m7f reads
+    variant &= ~(kLiveBit | kKfBit);
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kernel build (cached failure)", it->second);
@@ -3351,8 +3358,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                 }
             }
             // The fused single-arm tile (m7f, embedded source): the register load of whole groups,
-            // n_s <= 2, when its static pinfo[2][TPP] (16 B a pair) fits beside the tile.
-            m7_f = (m7_tp == 0 && blk == ns && ns <= 2 && m7_smem + 32LL * (m7_tr / sso) <= smem_optin) ? 1 : 0;
+            // n_s <= 2, on a call that carries the k-fastest tables (the _kf target; a legacy target
+            // runs the chain), when its static pinfo[2][TPP] (16 B a pair) fits beside the tile.
+            m7_f = (kf_tabs && m7_tp == 0 && blk == ns && ns <= 2 &&
+                    m7_smem + 32LL * (m7_tr / sso) <= smem_optin) ? 1 : 0;
         }
         rb = m7_tr;
     }
@@ -3892,7 +3901,8 @@ static ffi::Error KleadUnfoldImpl(
     const ffi::AnyBuffer* kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx,
     int64_t nky, int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir,
     int64_t conj_src = 0, int64_t spin_block = 0, int64_t a0 = 0, int64_t b0 = 0, int64_t x0 = 0,
-    int64_t bx = 0, int64_t xs = 0, int64_t xn = 0, const ffi::AnyBuffer* live = nullptr) {
+    int64_t bx = 0, int64_t xs = 0, int64_t xn = 0, const ffi::AnyBuffer* live = nullptr,
+    const ffi::AnyBuffer* lkf = nullptr, const ffi::AnyBuffer* rkf = nullptr) {
     auto bad = [](const std::string& why) {
         return fail("klead unfold conv", why, ffi::ErrorCode::kInvalidArgument);
     };
@@ -3934,12 +3944,14 @@ static ffi::Error KleadUnfoldImpl(
     // pieces [x0, x0 + bx) at stride xs do not overlap and start inside the tile.
     if (bx < 0 || (bx > 0 && (d != ns || xn < 1 || x0 < 0 || xs < x0 + bx || x0 >= ml / ns)))
         return bad("want the x block 0 <= x0 < ml/ns, bx >= 1, x0 + bx <= xs, xn >= 1, whole spin group");
+    if (lkf && !(is(*lkf, I, {ml / ns, nk, ns}) && rkf && is(*rkf, I, {nl / ns, nk, ns})))
+        return bad("want s32 lkf (ml/ns, nk, ns) and rkf (nl/ns, nk, ns): lsrc / rsrc k-fastest");
     const int64_t pairs = nx * (nl / ns);
     if (pairs == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     ffi::Error e = build(7, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
                          static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0,
-                         (d == ns ? 0 : static_cast<int>(d)) | (live ? kLiveBit : 0));
+                         (d == ns ? 0 : static_cast<int>(d)) | (live ? kLiveBit : 0) | (lkf ? kKfBit : 0));
     if (!e.success()) return e;
     if (k->m7s && (ml * nl >= (1LL << 31) || nk * std::max(ml, nl) >= (1LL << 31)))
         return bad("the split arm's gather indexes a parent tile and the (nk, m) tables in 32 bits; want "
@@ -3950,7 +3962,9 @@ static ffi::Error KleadUnfoldImpl(
                 static_cast<const double*>(spin.untyped_data()), ml, nl,
                 kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, conj_src ? 2 : 0, nullptr,
                 static_cast<int>(a0), static_cast<int>(b0), static_cast<long long>(x0),
-                static_cast<long long>(bx), static_cast<long long>(xs), static_cast<long long>(xn)};
+                static_cast<long long>(bx), static_cast<long long>(xs), static_cast<long long>(xn),
+                lkf ? static_cast<const int*>(lkf->untyped_data()) : nullptr,
+                rkf ? static_cast<const int*>(rkf->untyped_data()) : nullptr};
     const void* gpp = Gp.untyped_data();
     const void* gtp = Gt.untyped_data();
     const void* vp = V.untyped_data();
@@ -4051,6 +4065,20 @@ static ffi::Error KleadUnfoldXBlockConv(
     return KleadUnfoldImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
                            nkz, scale, mathdx_root, cubin_dir, conj_src, 0, 0, 0, x0, bx, xs, xn,
                            live ? &*live : nullptr);
+}
+// `_kf` (this tree's target): `_xblock` plus the k-fastest copies of the endpoint tables that the
+// fused single arm reads, lkf (ml/ns, nk, ns) and rkf (nl/ns, nk, ns), which the factory forms in
+// XLA (ffi.fft.make_kconv_klead_unfold).  The legacy targets carry none: their single arm is the
+// chain (the same values).
+static ffi::Error KleadUnfoldKfConv(
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
+    ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::AnyBuffer lkf, ffi::AnyBuffer rkf, std::optional<ffi::AnyBuffer> live,
+    ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t conj_src, int64_t x0,
+    int64_t bx, int64_t xs, int64_t xn, std::string_view mathdx_root, std::string_view cubin_dir) {
+    return KleadUnfoldImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
+                           nkz, scale, mathdx_root, cubin_dir, conj_src, 0, 0, 0, x0, bx, xs, xn,
+                           live ? &*live : nullptr, &lkf, &rkf);
 }
 static ffi::Error KleadUnfoldConv(
     cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
@@ -4911,6 +4939,35 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("conj_src")    // 1: the antiunitary partner is conj(Gp); Gt unread
         .Attr<int64_t>("x0")          // the stored x block: rows r in [0, xn*bx) are the left
         .Attr<int64_t>("bx")          //   centroids (r / bx)*xs + x0 + r % bx; bx = 0: every x
+        .Attr<int64_t>("xs")
+        .Attr<int64_t>("xn")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadUnfoldKfCudaFfi, lorrax_ffi::kconv_mathdx::KleadUnfoldKfConv,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
+        .Arg<xla::ffi::AnyBuffer>()   // Gp
+        .Arg<xla::ffi::AnyBuffer>()   // Gt (unread when conj_src)
+        .Arg<xla::ffi::AnyBuffer>()   // row
+        .Arg<xla::ffi::AnyBuffer>()   // trs
+        .Arg<xla::ffi::AnyBuffer>()   // lsrc
+        .Arg<xla::ffi::AnyBuffer>()   // rsrc
+        .Arg<xla::ffi::AnyBuffer>()   // mph
+        .Arg<xla::ffi::AnyBuffer>()   // nph
+        .Arg<xla::ffi::AnyBuffer>()   // spin
+        .Arg<xla::ffi::AnyBuffer>()   // kout
+        .Arg<xla::ffi::AnyBuffer>()   // V (R space)
+        .Arg<xla::ffi::AnyBuffer>()   // lkf (ml/ns, nk, ns) s32: lsrc k-fastest
+        .Arg<xla::ffi::AnyBuffer>()   // rkf (nl/ns, nk, ns) s32: rsrc k-fastest
+        .OptionalArg<xla::ffi::AnyBuffer>()   // live (s32 [2]): a padded pass's live window rows [lo, hi)
+        .Ret<xla::ffi::AnyBuffer>()
+        LRX_KCONV_GRID_ATTRS
+        .Attr<int64_t>("conj_src")
+        .Attr<int64_t>("x0")
+        .Attr<int64_t>("bx")
         .Attr<int64_t>("xs")
         .Attr<int64_t>("xn")
         .Attr<std::string_view>("mathdx_root")
