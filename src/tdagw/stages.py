@@ -299,7 +299,8 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             "control.timesteps.dt_measure", "system.depopulation", "system.dephasing",
             "system.esmear", "system.geometry", "system.ibndmin", "system.ibndmax",
             "lorrax.intraband", "lorrax.system", "lorrax.bundle_input",
-            "control.files.load_header_from"]
+            "control.files.load_header_from", "lorrax.stiff_modes", "lorrax.stiff_krylov",
+            "lorrax.stiff_tol", "lorrax.stiff_iter"]
     if v["lorrax.method"] == "dp54":
         keys.append("control.timesteps.tf")
     fp = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in keys}
@@ -403,9 +404,17 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
 
     def probe(dt):
         h = tp.PROBE_STEP_FACTOR * dt
-        g = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0)[0]
-        probes.append(dict(dt_as=dt * T, probe_dt_as=h * T, growth=g))
-        return g <= 1.0 + tp.PROBE_TOLERANCE
+        if cfg.method == "cfm4" and cfg.stiff:
+            g, _, fc = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0,
+                                      counters=True)
+        else:
+            g, fc = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0)[0], None
+        row = dict(dt_as=dt * T, probe_dt_as=h * T, growth=g)
+        if fc is not None:              # the split: a probe whose closing solve failed did not pass
+            row.update(fast_unconverged=fc["unconverged"], fast_max_evaluations=fc["max_evaluations"],
+                       fast_worst_rel=fc["worst_rel"])
+        probes.append(row)
+        return g <= 1.0 + tp.PROBE_TOLERANCE and not (fc and fc["unconverged"])
 
     if sigma <= 0.0:                                  # no coupling: any step is stable
         if auto:
@@ -438,8 +447,12 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
             f"this model, below {tp.COUPLING_ZERO_FLOOR:.0e} Ha), any step is stable"
             + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
         return cfg, receipt
-    pr = "; ".join(f"{q['growth']:.4g} per step at {q['probe_dt_as']:.4g} as" for q in probes)
-    say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius of the "
+    pr = "; ".join(f"{q['growth']:.4g} per step at {q['probe_dt_as']:.4g} as"
+                   + (f" (closing solve unconverged on {q['fast_unconverged']} steps)"
+                      if q.get("fast_unconverged") else "") for q in probes)
+    slow = (f" of the slow map L(1 - Pi), {cfg.stiff} stiff modes split off"
+            if cfg.method == "cfm4" and cfg.stiff else "")
+    say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius{slow} of the "
         f"dSigma commutator map, {len(est)} power iterations, last change "
         f"{100 * receipt['change']:.2g} %), h*sigma = {receipt['y']:.3g}, "
         + (f"limit {y_lim:.3g} ({cfg.method}, {cfg.predictor} predictor, n_corr {cfg.n_corr}) "
@@ -469,6 +482,15 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
             f"so no probe ran; want: a finite sigma limit to compare dt with, then the probe; "
             f"why: without either test the step is not known to be stable; fix: dt = 'auto', "
             f"another n_corr / predictor, or method = 'etdrk4' / 'dp54'")
+    if not stable and probes and probes[-1].get("fast_unconverged"):
+        q = probes[-1]
+        raise ValueError(
+            f"GATE td_stiff_solve: got: the probe of dt = {cfg.dt * T:.4g} as (the split step at "
+            f"{q['probe_dt_as']:.4g} as, field off, {tp.PROBE_STEPS} steps) missed the closing-solve "
+            f"tolerance {cfg.stiff_tol:.1e} on {q['fast_unconverged']} steps (worst rel. "
+            f"{q['fast_worst_rel']:.3e}, growth {q['growth']:.4g} per step); want: a converged fast "
+            f"part at every probe step; why: the probe would measure another scheme; fix: a smaller "
+            f"dt, more stiff_iter, or stiff_modes = 0")
     if not stable:
         q = probes[-1]
         raise ValueError(
@@ -486,11 +508,15 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
 
 
 def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
-              outs: TdOutputs, mesh, *, say=print) -> dict:
+              outs: TdOutputs, mesh, *, say=print, stiff=None) -> dict:
     """Run the propagation from t0, or from the checkpoint the deck names.
 
     ``[control.files] load_checkpoint_from`` continues that run exactly
     (:func:`load_checkpoint`: its rows are copied, its carry resumed).
+    ``[lorrax] stiff_modes`` > 0 builds the stiff split's basis
+    (:func:`tdagw.propagate.stiff_basis`) before the stability gate, or
+    takes ``stiff`` (its dict, already built for this system and model, of
+    the deck's stiff_modes) so several runs of one system pay it once.
     Returns counters and walls (seconds).
     """
     v = deck.values
@@ -516,7 +542,28 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
         max_step=float(v["control.timesteps.max_step"]), chunk=min(chunk, nt),
         remainder=bool(v["system.depopulation"] != 0.0
                        or v["system.dephasing"] != 0.0
-                       or system.ops.intra is not None))
+                       or system.ops.intra is not None),
+        stiff=int(v["lorrax.stiff_modes"]), stiff_tol=float(v["lorrax.stiff_tol"]),
+        stiff_iter=int(v["lorrax.stiff_iter"]))
+    basis = None
+    if cfg.stiff:
+        if not model.linear:
+            raise ValueError(f"GATE td_stiff_model: got: stiff_modes = {cfg.stiff} with the "
+                             f"model {model.name!r} (not affine in rho - rho_eq); want: an affine "
+                             f"dSigma; why: the split dSigma[x] = dSigma[(1 - Pi) x] + sum_j <u_j, x> "
+                             f"b_j is exact only for a linear model; fix: stiff_modes = 0")
+        basis = stiff if stiff is not None else tp.stiff_basis(
+            system.ops, model, mesh, t0=cfg.t0, n_s=cfg.stiff,
+            krylov=int(v["lorrax.stiff_krylov"]))
+        system = system._replace(ops=system.ops._replace(stiff=(basis["u"], basis["b"])))
+        cfg = cfg._replace(stiff=int(basis["n_s"]))
+        top = np.abs(basis["ritz_ev"])
+        say(f"  stiff split     : {basis['n_s']} modes of the coupling map's invariant subspace "
+            f"(|lambda| {top[basis['n_s'] - 1]:.4g} .. {top[0]:.4g} eV above the cut "
+            f"{basis['cut_ev']:.4g} eV; next {top[basis['n_s']]:.4g} eV), {basis['krylov']} real "
+            f"Arnoldi steps, invariance residual {basis['residual_ev']:.2e} eV; "
+            f"{basis['dsigma'] if stiff is None else 0} dSigma calls to build"
+            + ("" if stiff is None else " (reused)"))
     check = None
     if cfg.method in ("magnus2", "cfm4"):
         cfg, check = _magnus_step_check(cfg, system, model, drive, mesh, auto=auto, say=say)
@@ -542,6 +589,8 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
         2 * tp.COUPLING_POWER_ITERATIONS + len(check["probes"]) * tp.PROBE_STEPS
         * tp.dsigma_per_step(cfg.method, cfg.n_corr))
     stats["check_probes"] = [] if check is None else check["probes"]
+    stats["stiff_dsigma"] = 0 if (basis is None or stiff is not None) else int(basis["dsigma"])
+    stats["stiff_modes"] = int(cfg.stiff) if cfg.method == "cfm4" else 0
     stats["dt"] = cfg.dt
     stats["wall"] = time.perf_counter() - t_start
     stats["wall_first_chunk"] = (walls[0] - t_start) if walls else 0.0
@@ -615,4 +664,10 @@ def summarize(deck: TdDeck, stats: dict) -> str:
         f"first chunk incl. compile {stats['wall_first_chunk']:.2f} s)",
         f"  final time      : {stats['t_final'] * tdgw_io.T_IN_ATTOSEC:.3f} as",
     ]
+    if stats.get("fast"):
+        fc, n = stats["fast"], max(int(stats["accepted"]), 1)
+        lines.append(f"  stiff split     : {stats['stiff_modes']} modes; closing solve "
+                     f"{fc['evaluations'] / n:.2f} node-map evaluations per step (max "
+                     f"{fc['max_evaluations']}), worst rel. residual {fc['worst_rel']:.2e}; "
+                     f"{stats.get('stiff_dsigma', 0)} dSigma calls to build the basis")
     return "\n".join(lines)

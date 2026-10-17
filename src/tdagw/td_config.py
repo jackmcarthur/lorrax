@@ -72,6 +72,10 @@ TD_DEFAULTS = {
     "lorrax.check_eigenvectors": "",
     "lorrax.degeneracy_mode": "",
     "lorrax.tda": False,
+    "lorrax.stiff_modes": 0,
+    "lorrax.stiff_krylov": 0,
+    "lorrax.stiff_tol": 1e-9,
+    "lorrax.stiff_iter": 6,
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -222,6 +226,24 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         raise _gate("td_n_corr", vals["lorrax.n_corr"], ">= 1 (with no correction the node "
                     "history holds only predicted values and the step does not converge: "
                     "order 0)", "set [lorrax] n_corr >= 1 (2 is the default)")
+    n_stiff = vals["lorrax.stiff_modes"]
+    if not isinstance(n_stiff, int) or isinstance(n_stiff, bool) or n_stiff < 0:
+        raise _gate("td_stiff_modes", repr(n_stiff), "an integer >= 0 (0: no split)",
+                    "set [lorrax] stiff_modes")
+    if n_stiff and vals["lorrax.method"] != "cfm4":
+        raise _gate("td_stiff_method", f"stiff_modes = {n_stiff} with method "
+                    f"{vals['lorrax.method']!r}", "cfm4 (the split solves dSigma's stiff part "
+                    "implicitly at the two Gauss nodes of its predictor-corrector)",
+                    "drop stiff_modes or use method = 'cfm4'")
+    kry = vals["lorrax.stiff_krylov"]
+    if not isinstance(kry, int) or isinstance(kry, bool) or kry < 0 or (
+            n_stiff and kry and kry <= n_stiff):
+        raise _gate("td_stiff_krylov", repr(kry), "0 (automatic) or an integer above "
+                    "stiff_modes", "set [lorrax] stiff_krylov")
+    if not float(vals["lorrax.stiff_tol"]) > 0.0 or int(vals["lorrax.stiff_iter"]) < 1:
+        raise _gate("td_stiff_solve", f"stiff_tol = {vals['lorrax.stiff_tol']!r}, stiff_iter = "
+                    f"{vals['lorrax.stiff_iter']!r}", "stiff_tol > 0 and stiff_iter >= 1",
+                    "set [lorrax] stiff_tol / stiff_iter")
     if vals["lorrax.predictor"] not in ("cubic", "linear") or (
             vals["lorrax.predictor"] == "linear" and vals["lorrax.method"] != "cfm4"):
         raise _gate("td_predictor", f"predictor = {vals['lorrax.predictor']!r} with "

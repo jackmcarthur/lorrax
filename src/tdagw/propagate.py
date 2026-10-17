@@ -33,6 +33,16 @@ frozen between the Gauss nodes, so the composition costs exponentials and
 intraband gathers, not dSigma), for ``magnus2`` by Strang (second order);
 ETDRK4 carries Gamma exactly in its linear part.
 
+``cfm4`` may split dSigma exactly on a small stiff subspace (``[lorrax]
+stiff_modes``): with u_j an orthonormal basis of Hermitian deviations spanning
+the invariant subspace of the largest eigenvalues of the coupling map L
+(:func:`stiff_basis`, a real Arnoldi on L) and b_j = dSigma[u_j], dSigma[x] =
+dSigma[x] - Σ_j <u_j, x> b_j + Σ_j <u_j, x> b_j holds for every x (the model
+is affine), and the step treats the second sum implicitly at the Gauss nodes
+(``solvers.time_integrators.FastPart``: node coefficients <u_j, x_node> by
+simplified Newton on exponentials and projections, no dSigma call), so the
+predictor-corrector limit binds only the slow map L(1 - Π).
+
 Samples are taken on the measurement grid from each method's dense output,
 so ``dt`` need not divide ``dt_measure``: DP54 SciPy's quartic interpolant;
 RK4 and ETDRK4 a cubic Hermite in the frame of the band energies and Gamma
@@ -70,7 +80,7 @@ __all__ = ["METHODS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
            "place_operators", "place_kernel", "place_state", "make_conj_dev",
            "sample_plan", "chunk_plan", "initial_carry", "carry_to_host",
            "carry_from_host", "coupling_radius", "magnus_dt_limit", "step_growth",
-           "run_propagation"]
+           "coupling_arnoldi", "stiff_basis", "run_propagation"]
 
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 #: Bootstrap: while the predictor history is incomplete (first steps) the
@@ -95,6 +105,13 @@ PROBE_TOLERANCE = 2e-3
 #: at most this many probes.
 PROBE_BACKTRACK = 0.85
 PROBE_BACKTRACKS = 8
+#: The stiff split: Arnoldi steps on L when the deck leaves stiff_krylov at 0
+#: (at least STIFF_KRYLOV_MIN, and STIFF_KRYLOV_PER_MODE per stiff mode), and
+#: the relative gap below which two Ritz moduli are one group (a cut never
+#: separates the members of a +-lambda or conjugate pair).
+STIFF_KRYLOV_MIN = 80
+STIFF_KRYLOV_PER_MODE = 5
+STIFF_GROUP_GAP = 1e-6
 
 
 def dsigma_per_step(method: str, n_corr: int) -> int:
@@ -120,6 +137,12 @@ class PropagatorConfig(NamedTuple):
         picture of the band energies, ti.ip_magnus_step) or "whole_rho" (the
         whole rho, ti.magnus_midpoint_step: exact quadratic invariants);
         cfm4 is always "interaction".
+    stiff : cfm4 only: the number of stiff modes split off dSigma and solved
+        implicitly at the nodes (0: no split); the basis travels in
+        ``ops.stiff`` (:func:`stiff_basis`).
+    stiff_tol, stiff_iter : the closing solve of the stiff coefficients:
+        relative residual and node-map evaluations per step; a step that
+        does not reach the tolerance refuses the run (``td_stiff_solve``).
     """
     method: str
     t0: float
@@ -134,6 +157,9 @@ class PropagatorConfig(NamedTuple):
     remainder: bool
     predictor: str = "cubic"
     frame: str = "interaction"
+    stiff: int = 0
+    stiff_tol: float = 1e-9
+    stiff_iter: int = 6
 
 
 class SampleSpec(NamedTuple):
@@ -315,12 +341,42 @@ def _physics(ops, mparams, model: SelfEnergyModel, drive: Callable, mesh):
         return pin(eom.field_hamiltonian(ops, drive(t)))
 
     no_occ = jnp.zeros_like(occ)
+    fast = None
+    if ops.stiff is not None:                       # the stiff split's halves (FastPart)
+        u, b = ops.stiff
+        gap = (occ[:, None, :] - occ[:, :, None]).astype(jnp.complex128)     # f_m - f_n
+        proj, comb = _stiff_maps(mesh)
+        fast = dict(project=lambda x: proj(u, x), combine=lambda a: pin(comb(b, a)),
+                    expand=lambda a: pin(comb(u, a)),
+                    reference=lambda m: -1j * m * gap, n=int(u.shape[0]))
     return dict(dsig=dsig, rhs=rhs, field=field, free=free, nonlin=nonlin,
                 lam=lam, remainder=remainder, pin=pin, explicit=explicit,
                 conj_dev=lambda w, x, tau: pin(conj(w, x, occ, tau)),
                 conjugate=lambda w, y, tau: pin(conj(w, y, no_occ, tau)),
                 dsig_dev=lambda t, x: dsig(t, ops.rho_eq[None] + x),
-                rho_eq=ops.rho_eq[None])
+                rho_eq=ops.rho_eq[None], fast=fast)
+
+
+def _stiff_maps(mesh):
+    """(project, combine) of the stiff split, k-local inside ``shard_map``.
+
+    project(u, x) -> (b, n) float64: Re <u_j, x_q> = Re Σ_k tr(u_jk^H x_qk), one
+    all-reduce of (b, n) (u and x Hermitian: the inner product is real, and
+    the split is exact for any real-linear dSigma).  combine(b, a) -> (b, nk,
+    nb, nb): Σ_j a[q, j] b_j, local.  u, b, x : (·, nk, nb, nb) k-sharded.
+    """
+    spec4 = _spec(4, 1)
+
+    def project(u, x):
+        return jax.lax.psum(jnp.real(jnp.einsum("jkab,tkab->tj", jnp.conj(u), x)), K_AXES)
+
+    def combine(b, a):
+        return jnp.einsum("tj,jkab->tkab", a.astype(b.dtype), b)
+
+    return (shard_map(project, mesh=mesh, in_specs=(spec4, spec4), out_specs=P(),
+                      check_vma=False),
+            shard_map(combine, mesh=mesh, in_specs=(spec4, P()), out_specs=spec4,
+                      check_vma=False))
 
 
 def _sample(ph, ops, spec: SampleSpec, drive, *, cell_volume, nspinor):
@@ -369,8 +425,13 @@ def _magnus_parts(cfg: PropagatorConfig):
     return nodes, flow, fractions, hist, -(-len(hist) // len(nodes))
 
 
-def _fixed_parts(cfg: PropagatorConfig, ph):
-    """(step, dense, state_of) of a fixed-step method (see ti.fixed_advance)."""
+def _fixed_parts(cfg: PropagatorConfig, ph, h=None):
+    """(step, dense, state_of) of a fixed-step method (see ti.fixed_advance).
+
+    ``h`` : the step the split's Newton matrix is built for (a traced scalar
+    in :func:`step_growth`, so one program serves every probed step); None
+    is cfg.dt.
+    """
     pin, lam = ph["pin"], ph["lam"]
     if cfg.method == "rk4":
         def step(t, c, h, t_next):
@@ -421,6 +482,29 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
                 return core(t, x, tau)
             return ti.compose_strang(core, ph["remainder"], t, x, tau, fractions)
 
+        if _split(cfg, ph):
+            fast = _fast_part(cfg, ph, nodes, cfg.dt if h is None else h)
+            n_s, n_hist = ph["fast"]["n"], len(hist_offsets)
+
+            def step(t, c, h, t_next):
+                x, hist, hist_a, k, st = c
+                ha = jnp.reshape(hist_a, (n_hist, x.shape[0], n_s))
+                guess = (tuple(jnp.tensordot(w, hist, axes=1)),
+                         jnp.moveaxis(jnp.tensordot(w, ha, axes=1), 0, 1))
+                n_c = jnp.where(k < n_boot, cfg.n_corr + BOOTSTRAP_EXTRA, cfg.n_corr)
+                x1, g, (sl, a), solve = ti.ip_magnus_step(
+                    ph["field"], ph["dsig_dev"], inner, ph["free"], t, x, h, guess, nodes=nodes,
+                    n_corr=n_c, fast=fast)
+                hist = ph["free"](jnp.concatenate([hist[len(nodes):], jnp.stack(sl)]), h)
+                ha = jnp.concatenate([ha[len(nodes):], jnp.moveaxis(a, 1, 0)])
+                return (pin(x1), hist, jnp.reshape(ha, hist_a.shape), k + 1,
+                        _fast_stats(st, *solve)), g
+
+            def dense(t, c0, c1, g, th):
+                gen = ti.frozen_generator(ph["field"], ph["free"], t, cfg.dt, nodes, g)
+                return ph["rho_eq"] + inner(gen, t, c0[0], th * cfg.dt)
+            return step, dense, (lambda c: ph["rho_eq"] + c[0])
+
         def step(t, c, h, t_next):
             x, hist, k = c
             guess = tuple(jnp.tensordot(w, hist, axes=1))
@@ -438,13 +522,69 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
                      f"magnus2 | cfm4; fix: internal (the deck parser admits only those)")
 
 
+def _split(cfg: PropagatorConfig, ph) -> bool:
+    """cfm4 with a stiff basis on the operators: the split step."""
+    return cfg.method == "cfm4" and int(cfg.stiff) > 0 and ph["fast"] is not None
+
+
+def _fast_part(cfg: PropagatorConfig, ph, nodes, h) -> ti.FastPart:
+    """The FastPart of ops.stiff with its Newton matrix (1 - J)^{-1} at step h.
+
+    J (``ti.fast_jacobian``) depends on h, the basis and the band energies
+    only: built once per traced program, outside the step loop (3 n_s
+    projections of n_s states).
+    """
+    f = ph["fast"]
+    fast = ti.FastPart(project=f["project"], combine=f["combine"], reference=f["reference"],
+                       newton=None, tol=float(cfg.stiff_tol), max_iter=int(cfg.stiff_iter))
+    jac = ti.fast_jacobian(fast, ph["free"], h, nodes, f["n"])
+    return fast._replace(newton=jnp.linalg.inv(jnp.eye(jac.shape[0], dtype=jac.dtype) - jac))
+
+
+#: The closing-solve counters a split carry holds (replicated scalars):
+#: node-map evaluations (sum, max), unconverged steps, worst relative residual.
+def _fast_stats0():
+    return (jnp.int64(0), jnp.int32(0), jnp.int32(0), jnp.float64(0.0))
+
+
+def _fast_stats(st, it, rel, ok):
+    tot, mx, fails, worst = st
+    rel = jnp.where(jnp.isnan(rel), jnp.inf, rel)
+    return (tot + it.astype(tot.dtype), jnp.maximum(mx, it), fails + jnp.where(ok, 0, 1).astype(fails.dtype),
+            jnp.maximum(worst, rel))
+
+
+def _split_carry(ph, x0, seeds, k0, t0):
+    """(x0, slow history, coefficient history, k0, counters) of the split cfm4 step.
+
+    ``seeds`` : the states whose dSigma fills the history (initial_carry: x0
+    repeated; step_growth: independent ones).  Slow part S = dSigma[x] -
+    Σ_j <u_j, x> b_j, coefficients <u_j, x> (the history of the fast
+    initial guess, stored (n_hist, ntr * n_s): a replicated leaf).
+    """
+    f = ph["fast"]
+    a = [f["project"](y) for y in seeds]
+    sl = jnp.stack([ph["dsig_dev"](t0, y) - f["combine"](ai) for y, ai in zip(seeds, a)])
+    ha = jnp.stack(a)
+    return (x0, sl, jnp.reshape(ha, (ha.shape[0], -1)), jnp.int32(k0), _fast_stats0())
+
+
+def fast_solve_counters(carry) -> dict:
+    """The split carry's closing-solve counters on the host (every rank)."""
+    tot, mx, fails, worst = (np.asarray(gather_to_host(v)) for v in carry[4])
+    return dict(evaluations=int(tot), max_evaluations=int(mx), unconverged=int(fails),
+                worst_rel=float(worst))
+
+
 def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh):
     """The integrator's carry at t0 (one jitted call).
 
     dp54 : SciPy's state.   rk4 : (rho, rhs).   etdrk4 : (rho, coef, N).
     magnus2 / cfm4 : (Delta rho, dSigma node history in the interaction
     picture of the next step's start, step counter); magnus2 in the whole_rho
-    frame: (rho, the last three midpoint dSigma, step counter).
+    frame: (rho, the last three midpoint dSigma, step counter); cfm4 with the
+    stiff split: (Delta rho, slow node history, coefficient history, step
+    counter, closing-solve counters).
     """
     def build(rho0, ops, mparams):
         ph = _physics(ops, mparams, model, drive, mesh)
@@ -459,8 +599,10 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
             b0 = ph["dsig"](cfg.t0, rho0)
             return (rho0, jnp.stack([b0] * len(ti.MIDPOINT_HISTORY)), jnp.int32(0))
         x0 = ph["pin"](rho0 - ph["rho_eq"])
-        b0 = ph["dsig_dev"](cfg.t0, x0)
         n_hist = len(_magnus_parts(cfg)[3])
+        if _split(cfg, ph):
+            return _split_carry(ph, x0, [x0] * n_hist, 0, cfg.t0)
+        b0 = ph["dsig_dev"](cfg.t0, x0)
         return (x0, jnp.stack([b0] * n_hist), jnp.int32(0))
     return jax.jit(build)(rho0, ops, mparams)
 
@@ -478,7 +620,19 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
 
     the linearized coupling of the Magnus steps (the field is left out: it
     is weak where the limit binds, and E·r is exact in the free flow's
-    frame anyway).  From a fixed random x (cv and vc blocks, one trial,
+    frame anyway).  With a stiff basis on the operators (``ops.stiff``,
+    :func:`stiff_basis`) it is the radius of the slow map L(1 - Π),
+
+        L(1 - Π) x = -i (dSigma[x] - dSigma[0] - Σ_j <u_j, x> b_j) ∘ (f_m - f_n),
+
+    the part the predictor-corrector of the split step treats explicitly
+    (Π = Σ_j |u_j><u_j|; for an invariant span(u) its spectrum is L's with
+    the stiff eigenvalues replaced by zeros).  In the blocks of (span u, its
+    complement) L(1 - Π) = [[0, L12], [0, L22]]: its nonzero spectrum is
+    L22's, and the iteration runs on the compression (1 - Π) L (1 - Π) = L22,
+    which has that spectrum without the transient of the slow-to-fast block
+    L12 (a non-normal L12 makes the plain iterate's norm overshoot the radius
+    for many iterations).  From a fixed random x (cv and vc blocks, one trial,
     logical k), x <- L(L(x)) / ||L(L(x))||, σ_j = (||L(L x_j)|| / ||x_j||)^(1/2):
     the eigenvalues of L are ±iω (real ω for a Hermitian coupling, TDA or a
     stable full BSE), so L^2 has the dominant real eigenvalue -σ^2 and σ_j
@@ -507,7 +661,12 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
     def run(x, gap, zero, ops, mparams):
         ph = _physics(ops, mparams, model, drive, mesh)
         d0 = ph["dsig_dev"](t0, zero)
-        lmap = lambda y: ph["pin"](-1j * (ph["dsig_dev"](t0, y) - d0) * gap)
+        if ph["fast"] is None:
+            lmap = lambda y: ph["pin"](-1j * (ph["dsig_dev"](t0, y) - d0) * gap)
+        else:                                           # the slow map, compressed: (1 - Pi) L (1 - Pi)
+            f = ph["fast"]
+            deflate = lambda z: z - f["expand"](f["project"](z))
+            lmap = lambda y: deflate(ph["pin"](-1j * (ph["dsig_dev"](t0, deflate(y)) - d0) * gap))
         nrm = lambda y: jnp.sqrt(jnp.sum(jnp.abs(y) ** 2))
 
         def body(y, _):
@@ -536,7 +695,8 @@ def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:
 
 
 def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: float,
-                t0: float, n_steps: int = PROBE_STEPS, eps: float = None, seed: int = 1):
+                t0: float, n_steps: int = PROBE_STEPS, eps: float = None, seed: int = 1,
+                counters: bool = False):
     """Growth per step of a small coherence under the scheme's own step at h, field off.
 
     The scheme-exact counterpart of :func:`coupling_radius`: from a random
@@ -551,7 +711,12 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
     It sees what the scalar recurrence leaves out: in the interaction picture
     the coupling is time dependent, and a kernel's resonant-antiresonant
     block rotates there at about the sum of two transition energies.  One
-    jitted call, h traced.  Returns (g, the norms after each step).
+    jitted call, h traced.  With the stiff split (cfg.stiff, ops.stiff) the
+    probe runs the split step, its history seeded the same way (slow parts
+    and coefficients of the independent seeds), and ``counters = True``
+    returns the closing-solve counters as a third value (a probe whose
+    closing solve failed measured another scheme: the gate refuses it).
+    Returns (g, the norms after each step).
     """
     whole = cfg.method == "magnus2" and cfg.frame == "whole_rho"
     if eps is None:              # the whole rho rounds at 1e-16 of its O(1) occupations
@@ -579,21 +744,164 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
 
     def run(x0, xh, ops, mparams, h):
         ph = _physics(ops, mparams, model, off, mesh)
-        step, _, _ = _fixed_parts(cfg, ph)
+        step, _, _ = _fixed_parts(cfg, ph, h)
         base = ph["rho_eq"] if whole else 0.0
-        hist = jnp.stack([ph["dsig_dev"](t0, xh[j:j + 1]) for j in range(n_hist)])
-        carry = (base + x0, hist, jnp.int32(n_boot))  # past the bootstrap: the predictor acts at once
+        if _split(cfg, ph):            # past the bootstrap: the predictor acts at once
+            carry = _split_carry(ph, x0, [xh[j:j + 1] for j in range(n_hist)], n_boot, t0)
+        else:
+            hist = jnp.stack([ph["dsig_dev"](t0, xh[j:j + 1]) for j in range(n_hist)])
+            carry = (base + x0, hist, jnp.int32(n_boot))
 
         def body(c, i):
             t = t0 + i * h
             c, _ = step(t, c, h, t + h)
             return c, jnp.sqrt(jnp.sum(jnp.abs(c[0] - base) ** 2))
-        return jax.lax.scan(body, carry, jnp.arange(int(n_steps)), unroll=1)[1]
+        c, norms = jax.lax.scan(body, carry, jnp.arange(int(n_steps)), unroll=1)
+        return norms, (c[4] if len(c) == 5 else ())
 
-    norms = np.asarray(gather_to_host(jax.jit(run)(x0, xh, ops, model.params, jnp.asarray(float(h)))))
+    norms, st = jax.jit(run)(x0, xh, ops, model.params, jnp.asarray(float(h)))
+    norms = np.asarray(gather_to_host(norms))
     m = int(n_steps) // 2
     g = float((norms[-1] / norms[m - 1]) ** (1.0 / (int(n_steps) - m)))
-    return g, norms
+    if not counters:
+        return g, norms
+    return g, norms, (fast_solve_counters((None,) * 4 + (st,)) if st else None)
+
+
+def _coherence_start(ops, seed: int = 0):
+    """A random Hermitian deviation on the cv and vc blocks of the logical k (host), and the gap.
+
+    The start vector of :func:`coupling_radius` (same seed, same masks):
+    returns (x (1, nk_pad, nb, nb), gap (1, nk_pad, nb, nb) = f_m - f_n).
+    """
+    nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((1, nk_pad, nb, nb)) + 1j * rng.standard_normal((1, nk_pad, nb, nb))
+    f = np.real(np.diagonal(np.asarray(gather_to_host(ops.rho_eq)), axis1=-2, axis2=-1))
+    gap = (f[:, None, :] - f[:, :, None])[None]
+    w = np.asarray(gather_to_host(ops.w_k)) > 0.0
+    x = x * (np.abs(gap) > 0.5) * w[None, :, None, None]
+    return 0.5 * (x + np.conj(np.swapaxes(x, -1, -2))), gap
+
+
+def coupling_arnoldi(ops, model: SelfEnergyModel, mesh, *, t0: float, krylov: int,
+                     seed: int = 0):
+    """Arnoldi on the coupling map L of :func:`coupling_radius`, on Hermitian deviations.
+
+    L(x) = -i (dSigma[x] - dSigma[0]) ∘ (f_m - f_n) maps Hermitian deviations
+    to Hermitian deviations and is real-linear there, so the Krylov space of
+    the Hermitian start vector (:func:`_coherence_start`) is spanned by
+    Hermitian vectors with REAL Arnoldi coefficients h_ij = Re <v_i, L v_j>
+    (classical Gram-Schmidt twice; each new vector Hermitized): the Ritz
+    values come in the real pairs (λ, conj λ) and (λ, -λ) of L.  One jitted
+    call, ``krylov`` dSigma evaluations.  Returns (V (krylov + 1, nk_pad, nb,
+    nb) on the mesh, k-sharded, orthonormal; H (krylov + 1, krylov) float64,
+    host).
+    """
+    x, gap = _coherence_start(ops, seed)
+    if not np.any(x):
+        raise ValueError("GATE td_stiff_basis: got: no cv pair on a logical k; want: a coupled "
+                         "window; why: the coupling map is empty, nothing is stiff; fix: "
+                         "stiff_modes = 0")
+    m = int(krylov)
+    v0 = place_state(x / np.linalg.norm(x), mesh)
+    gap_d = place_state(gap.astype(complex), mesh)
+    spec = NamedSharding(mesh, _spec(4, 1))
+    off = lambda t: jnp.zeros((1, 3))
+
+    def run(v0, gap, ops, mparams):
+        ph = _physics(ops, mparams, model, off, mesh)
+        d0 = ph["dsig_dev"](t0, jnp.zeros_like(v0))
+        lmap = lambda y: ph["pin"](-1j * (ph["dsig_dev"](t0, y) - d0) * gap)
+        pinv = lambda a: jax.lax.with_sharding_constraint(a, spec)
+        V = pinv(jnp.zeros((m + 1,) + v0.shape[1:], v0.dtype).at[0].set(v0[0]))
+        H = jnp.zeros((m + 1, m), jnp.float64)
+
+        def body(j, c):
+            V, H = c
+            w = lmap(V[j][None])[0]
+            col = jnp.zeros((m + 1,), jnp.float64)
+            for _ in range(2):                                   # CGS2, real coefficients
+                hj = jnp.real(jnp.einsum("ikab,kab->i", jnp.conj(V), w))
+                w = w - jnp.einsum("i,ikab->kab", hj.astype(w.dtype), V)
+                col = col + hj
+            w = 0.5 * (w + jnp.conj(jnp.swapaxes(w, -1, -2)))
+            beta = jnp.sqrt(jnp.sum(jnp.abs(w) ** 2))
+            H = H.at[:, j].set(col.at[j + 1].set(beta))
+            V = pinv(V.at[j + 1].set(w / jnp.where(beta > 0.0, beta, 1.0)))
+            return V, H
+        return jax.lax.fori_loop(0, m, body, (V, H))
+
+    V, H = jax.jit(run)(v0, gap_d, ops, model.params)
+    return V, np.asarray(gather_to_host(H))
+
+
+def stiff_basis(ops, model: SelfEnergyModel, mesh, *, t0: float, n_s: int, krylov: int = 0,
+                arnoldi=None, seed: int = 0) -> dict:
+    """The stiff split's basis: u_1..u_n spanning L's invariant subspace of the n largest |λ|.
+
+    From the Arnoldi relation L V_m = V_{m+1} H (:func:`coupling_arnoldi`,
+    ``krylov`` steps; ``arnoldi`` = a (V, H) already computed, reused for
+    several n), the real Schur form H_m = Z T Z^T sorted so that the Ritz
+    values above the cut lead; u = V_m Z[:, :n] (Hermitian, orthonormal up
+    to rounding, re-orthonormalized by Cholesky QR) spans the invariant
+    subspace of those Ritz values, both members of every (λ, -λ) and
+    (λ, conj λ) group (n is raised to the end of a group of equal moduli,
+    relative gap STIFF_GROUP_GAP).  Its residual
+    ||L u - u T_11|| = h_{m+1,m} ||Z[m-1, :n]|| is reported: the split is exact
+    for ANY u (dSigma[x] = dSigma[(1 - Π) x] + Σ_j <u_j, x> b_j), the residual
+    only says how much stiffness the slow map keeps.  b_j = dSigma[u_j] -
+    dSigma[0] (n dSigma evaluations).  Returns dict(u, b (n, nk_pad, nb, nb)
+    on the mesh), n_s, ritz_ev (all Ritz values, eV, |λ| descending), cut_ev,
+    residual_ev, krylov, dsigma (evaluations made here).
+    """
+    import scipy.linalg as sla
+    from tdagw.tdgw_io import HA_IN_EV
+    n = int(n_s)
+    if arnoldi is None:
+        m = int(krylov) or max(STIFF_KRYLOV_MIN, STIFF_KRYLOV_PER_MODE * n)
+        V, H = coupling_arnoldi(ops, model, mesh, t0=t0, krylov=m, seed=seed)
+        calls = m + 1
+    else:
+        (V, H), calls = arnoldi, 0
+        m = int(H.shape[1])
+    if not 0 < n < m:
+        raise ValueError(f"GATE td_stiff_modes: got: stiff_modes = {n} with {m} Arnoldi steps; "
+                         f"want: 0 < stiff_modes < stiff_krylov; fix: raise stiff_krylov")
+    hm = H[:m, :m]
+    lam = np.linalg.eigvals(hm)
+    order = np.argsort(-np.abs(lam))
+    lam, mods = lam[order], np.abs(lam[order])
+    while n < m - 1 and mods[n - 1] - mods[n] <= STIFF_GROUP_GAP * mods[0]:
+        n += 1                                           # never cut through a pair
+    cut = 0.5 * (mods[n - 1] + mods[n])
+    _, z, sdim = sla.schur(hm, output="real", sort=lambda re, im: np.hypot(re, im) > cut)
+    if int(sdim) != n:
+        raise ValueError(f"GATE td_stiff_basis: got: {sdim} Schur vectors above the cut "
+                         f"{cut * HA_IN_EV:.6g} eV for {n} Ritz values; want: the same count; "
+                         f"why: the real Schur reordering is ill-conditioned at this cut; fix: "
+                         f"another stiff_modes (a gap in the Ritz moduli) or more stiff_krylov")
+    q = z[:, :n]
+    resid = abs(H[m, m - 1]) * np.linalg.norm(q[m - 1, :])
+    qd = jnp.asarray(q, jnp.float64)
+    spec = NamedSharding(mesh, _spec(4, 1))
+    off = lambda t: jnp.zeros((1, 3))
+
+    def build(V, qd, ops, mparams):
+        ph = _physics(ops, mparams, model, off, mesh)
+        u = jnp.einsum("ij,ikab->jkab", qd.astype(V.dtype), V[:m])
+        u = 0.5 * (u + jnp.conj(jnp.swapaxes(u, -1, -2)))
+        gram = jnp.real(jnp.einsum("ikab,jkab->ij", jnp.conj(u), u))
+        lo = jnp.linalg.cholesky(0.5 * (gram + gram.T))
+        u = jnp.einsum("ij,jkab->ikab", jnp.linalg.inv(lo).astype(u.dtype), u)
+        u = jax.lax.with_sharding_constraint(u, spec)
+        d0 = ph["dsig_dev"](t0, jnp.zeros_like(u[:1]))
+        b = jax.lax.map(lambda uj: (ph["dsig_dev"](t0, uj[None]) - d0)[0], u)
+        return u, jax.lax.with_sharding_constraint(b, spec)
+
+    u, b = jax.jit(build)(V, qd, ops, model.params)
+    return dict(u=u, b=b, n_s=n, ritz_ev=lam * HA_IN_EV, cut_ev=cut * HA_IN_EV,
+                residual_ev=float(resid) * HA_IN_EV, krylov=m, dsigma=calls + n + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -718,9 +1026,17 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     counter (every rank), and the state's time.  ``resume`` = dict(carry=
     host leaves, step=int, i_next=int) continues a checkpointed run from its
     next sample.  Returns (counters, carry): steps taken by this run,
-    rejected tries, dSigma evaluations.
+    rejected tries, dSigma evaluations; with the stiff split also the
+    closing-solve counters (``fast``).  A chunk in which any step's closing
+    solve missed its tolerance refuses (``td_stiff_solve``) before its
+    samples reach ``on_chunk``.
     """
     nk_pad = int(ops.e_qp.shape[0])
+    split = cfg.method == "cfm4" and int(cfg.stiff) > 0
+    if split and ops.stiff is None:
+        raise ValueError("GATE td_stiff_basis: got: stiff = %d with no basis on the operators; "
+                         "want: ops.stiff from tdagw.propagate.stiff_basis; fix: internal "
+                         "(stages.propagate builds it)" % int(cfg.stiff))
     s_start = i_start = 0
     if resume is None:
         carry = initial_carry(cfg, rho0, ops, model.params, model, drive, mesh)
@@ -748,6 +1064,19 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
             prog = program(("fixed", s1 - s0, i1 - i0), s1 - s0, False)
             carry, samples = prog(carry, ops, model.params, jnp.asarray(mtsteps[i0:i1]),
                                   jnp.asarray(sstep[i0:i1]), jnp.asarray(stheta[i0:i1]), s0)
+            if split:
+                fc = fast_solve_counters(carry)
+                if fc["unconverged"]:
+                    from tdagw.tdgw_io import T_IN_ATTOSEC
+                    raise ValueError(
+                        f"GATE td_stiff_solve: got: {fc['unconverged']} step(s) up to t = "
+                        f"{(cfg.t0 + s1 * cfg.dt) * T_IN_ATTOSEC:.6g} as whose closing solve of the "
+                        f"{int(cfg.stiff)} stiff coefficients missed rel. {cfg.stiff_tol:.1e} in "
+                        f"{cfg.stiff_iter} node-map evaluations (worst {fc['worst_rel']:.3e}); "
+                        f"want: the fast part converged at the nodes of every step; why: an "
+                        f"unconverged fast part leaves the stiff modes explicit, the step is not "
+                        f"the split scheme and its stability is unknown; fix: a smaller dt, more "
+                        f"stiff_iter, or stiff_modes = 0")
             host = jax.tree.map(gather_to_host, samples)
             state = (lambda c=carry, s=s1: (gather_to_host(c[0] if cfg.method in ("rk4", "etdrk4")
                                                           else ops.rho_eq[None] + c[0]),
@@ -763,6 +1092,8 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
             stats["dsigma"] += boot * BOOTSTRAP_EXTRA * per
         stats["dsigma"] += 1 if resume is None else 0          # the initial carry's call
         stats["t_final"] = cfg.t0 + s_end * cfg.dt
+        if split:
+            stats["fast"] = fast_solve_counters(carry)
     else:
         base = (0, 0, 0) if resume is None else tuple(
             int(gather_to_host(v)) for v in (carry.n_accepted, carry.n_rejected, carry.n_rhs))
