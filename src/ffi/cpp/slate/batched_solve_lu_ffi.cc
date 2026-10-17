@@ -152,14 +152,19 @@ static ffi::Error copy_out(const char* what, sl::Matrix<T>& M, T* dst, int64_t l
 }
 
 // SLATE-owned device tiles: A (n x n, nb x nb) or B / X (n x nrhs, nb x nb_b), each
-// pool seeded with THIS rank's local tiles plus the remote tiles the driver holds at
-// once, at the measured lower envelope of the pool's high-water (pool_seed.h
-// PoolWatch, MI250X 2x2, n = 4096 ... 30720), so a seed never exceeds what unseeded
-// SLATE holds on this rank; the bytes are this rank's, from XLA's scratch allocator
-// (pool_seed.h ScratchSeed):
-//   A (getrf):  (mt/p + nt/q) / 2 remote tiles (measured 10 ... 243 beside the local).
-//   X (getrs):  none (measured 0 ... 1: trsmB releases B's broadcast row after each
-//               step, work_trsm.cc B_panel.releaseRemoteWorkspace).
+// pool seeded with THIS rank's LOCAL tiles only; the bytes are this rank's, from
+// XLA's scratch allocator (pool_seed.h ScratchSeed).  A seed block is held for the
+// whole call, while unseeded SLATE holds a remote tile only while the driver needs
+// it, so a seed at the pool's high-water can still raise the device peak where the
+// peak falls after the pool shrinks:
+//   A (getrf):  high-water local + 10 ... 243 (pool_seed.h PoolWatch, MI250X 2x2,
+//               n = 4096 ... 30720), but getrf releases the remote tiles
+//               (releaseWorkspace) before getrs.  Seeding (mt/p + nt/q) / 2 of them
+//               held 30 MB per rank above unseeded lufix through getrs at 30720 f64
+//               (+10 ... +23 MB measured, 3 same-node repeats); they now come from
+//               device_malloc exactly as in lufix (<= 100 MB per rank at 51200 c128).
+//   X (getrs):  high-water local + 0 ... 1: trsmB releases B's broadcast row after
+//               each step (work_trsm.cc B_panel.releaseRemoteWorkspace).
 template <typename T>
 static sl::Matrix<T> shell(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
                            const lorrax_ffi::slate::SlateCtx* ctx) {
@@ -207,7 +212,8 @@ static void hw_report(lorrax_ffi::slate::PoolWatch& pw, const char* what,
 
 template <typename T>
 static int64_t seed_want(sl::Matrix<T>& M, const lorrax_ffi::slate::SlateCtx* ctx, bool rhs) {
-    return local_of(M) + (rhs ? 0 : (M.mt() / ctx->p + M.nt() / ctx->q) / 2);
+    (void) ctx; (void) rhs;     // A and X alike: this rank's local tiles (comment above)
+    return local_of(M);
 }
 
 // One call's seed memory: this rank's bytes, from XLA's scratch allocator, sized from
