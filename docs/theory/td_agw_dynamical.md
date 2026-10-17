@@ -6,7 +6,10 @@ split of the Green function into a frozen and an active part, the static limit
 that is the present model, what the scheme conserves and what it loses, which
 GW components it reuses, the cost per refresh measured from the GW stage
 walls, and the refactors it needs. The static-screening member is implemented
-(`tdagw.dynsig`); the GN-PPM and shared-pole members are designed here. The
+(`tdagw.dynsig`). The GN-PPM member's two GW stages are callable per refresh
+from arrays (`gw.ppm_sigma.screening_update`, `window_sigma_c`; §9 items 4–5)
+and reproduce a GN-PPM run at t = 0 (§6.1); its propagation wiring is not
+built. The shared-pole member is designed here. The
 equation of motion, integrators and layout are owned by
 [TD-aGW propagation](td_agw_propagation.md); the frozen-W kernel by
 [TD-aGW interaction](td_agw.md). Equations in Ry unless stated.
@@ -159,9 +162,12 @@ $$
 $\mathcal W$ being the BSE W-term (`bse_stack_matvec.make_w_term`) on the
 full band set; $K\delta\rho$ is the TD model unchanged.
 
-**GN-PPM member** (designed). Two supports $0$ and $i\omega_p$, Eq. (6) at
+**GN-PPM member** (stages built, §9 items 4–5; not wired into the
+propagator). Two supports $0$ and $i\omega_p$, Eq. (6) at
 each; the per-element pole fit of `ppm_sigma.fit_ppm` (ordered, since the
-magnet and a helicity drive break time reversal); $\Sigma^c_{ij}(\omega)$ by
+magnet and a helicity drive break time reversal: conduction branches take
+$R_+=B+D$, valence branches $R_-=B-D$; modes the fit marks invalid enter as
+the static $W^c(0)$ term); $\Sigma^c_{ij}(\omega)$ by
 the Σ τ sweep with $G=G_{\rm eq}+\delta G$ (symmetrized GKBA for the
 coherences, §1.1); the static operator at the instantaneous energies,
 $\Sigma_{ij}=\tfrac12[\Sigma_{ij}(e_i)+\Sigma_{ij}(e_j)]^{\rm h}$
@@ -270,9 +276,9 @@ first. This is the case for the frequency-dependent push.
 | $\chi_0$ products | `gw.w_isdf._get_chi_minimax_kernel_face` (:505), `_fused` (:772) | $(R,\mu_X,\nu_Y)$ | Eq. (5); needs weight rows (§9) |
 | fractional $\chi_0$ | `gw.w_isdf.compute_chi0_contour_fractional` (:3349), `compute_chi0_direct_fractional` (:3657) | as above | $\chi_0^{ss}$ |
 | Dyson | `gw.w_isdf.solve_w` (:2114), `meta=None` route | $(q,\mu_X,\nu_Y)$ | Eq. (6), unchanged (reused by the prototype) |
-| GN-PPM fit | `gw.ppm_sigma.fit_ppm` (:808), `minimax_screening.fit_gn_ppm_from_wc_pair` (:309) | $(q,\mu_X,\nu_Y)$ | array-callable already |
+| GN-PPM fit | `gw.ppm_sigma.pole_fit_plan` (:956) + `fit_pole_model` (:993) = `fit_ppm` (:808), the driver's call; `minimax_screening.fit_gn_ppm_from_wc_pair` (:309) | $(q,\mu_X,\nu_Y)$ | `screening_update` (:1006): Eq. (6) at both supports, then the fit (§9 item 4) |
 | shared-pole W | `gw.shared_pole_screening.screen_shared_poles` (:443), `shared_pole_constructor.construct_shared_poles` (:57) | bank and model stores on disk | §9 |
-| Σ τ sweep | `gw.ppm_tau_kernel._sigma_subtile_kernel` (:283), `_get_sigma_kij_kernel` (:482); `ppm_pipeline.compute_ppm_sigma_pipeline` (:690) | parent Greens $\times$ $W(\tau)$, window projection | GN-PPM / shared-pole Σ |
+| Σ τ sweep | `gw.ppm_tau_kernel._sigma_subtile_kernel` (:283), `_get_sigma_kij_kernel` (:482); `ppm_pipeline.compute_ppm_sigma_pipeline` (:691); window entry `ppm_sigma.window_sigma_c` (:1611) | parent Greens $\times$ $W(\tau)$, window projection | GN-PPM / shared-pole Σ |
 | static Σ | `gw.cohsex_sigma._make_cohsex_kernels_face` (:400); `bse.bse_stack_matvec.make_w_term` (:470) | $(b,n_X,m_Y,k)$ | Eq. (7) (prototype: `make_w_term` on the full band set) |
 | static head | `gw.head_correction.static_head_terms_to_kij` (:1826), `fit_head_ppm` (:1508) | band diagonal | frozen in the prototype; §1.4 |
 | frozen-W kernel | `tdagw.model.build_td_agw_apply` | $(b,k,n_X,m_Y)$ | $K\delta\rho$, unchanged |
@@ -311,6 +317,34 @@ $3.6\times10^{-7}$ relative = $4.7\times10^{-6}$ eV at 12.9 eV) plus the
 file's rounding. Tolerance $10^{-5}$ eV. The twins: $\chi_0^{fa}$ dropped
 0.41 eV, the active valence counted empty 0.10 eV, the heads dropped 0.72 eV.
 
+**GN-PPM** (`07_gw_gnppm_bundle`: the 05 deck with `compute_mode = gn_ppm`). A
+GN-PPM run persists $W(0)$ but neither $W(i\omega_p)$ nor its pole model, so
+the check (`tests/tdagw/_dynsig_gnppm_516_case.py`) replays the GW driver in
+the same process on the 07 deck and reads both supports, the fit plan and the
+poles at the fit seam. The replay (branch) matches the 07 arm (run on the
+base tree) bitwise: all 15 `sigma_mnk.h5` datasets and `sigma_diag.dat`.
+$\chi_0^{ff}+\chi_0^{fa}+\chi_0^{aa}$ at both supports (10 static and 24
+probe nodes on [0.110, 6.130] Ry, $\omega_p=2$ Ry, probe max error
+$8.7\times10^{-9}$) through `screening_update` gives the run's $W(0)$ to
+$1.3\times10^{-14}$ and $W(i\omega_p)$ to $3.4\times10^{-15}$ (relative, max over
+36 q; q = 0: $9.6\times10^{-15}$, $1.3\times10^{-15}$), and `W0_qmunu` to
+$1.1\times10^{-14}$. The poles match the run's fit with identical valid masks
+(1,984,518 of 34,574,400 modes invalid, 5.7%): $B$ to $3.5\times10^{-12}$,
+$D$ to $5.3\times10^{-11}$, $\Omega$ to $3.0\times10^{-8}$ (relative to the largest live
+value); on the live modes $\max|D|/\max|B|=2.0\times10^{-3}$. $\chi_0^{fa}$ is 33% (static)
+and 17% (probe) of $\max|\chi_0|$. `window_sigma_c` on these poles and
+`exchange_sigma` (heads $W_h$, $v_h$) give the window block of `sigma_mnk.h5`
+(both on-shell tables, off-diagonals included, float64,
+`common.units.RYD_TO_EV`): $\Sigma^c$ to $2.5\times10^{-14}$ eV ($|\Sigma^c|\le5.03$ eV),
+$\Sigma^x$ to $1.7\times10^{-13}$ eV ($|\Sigma^x|\le24.9$ eV), their sum to
+$\le1.9\times10^{-13}$ eV (the file's `sigma_total_kij_ev` is $\Sigma^x+\Sigma^c+V_H$
+exactly). The diagonal matches `sigma_diag.dat` to $9.5\times10^{-7}$ eV (six
+printed decimals). On the run's own poles the sweep gives $1.8\times10^{-15}$ eV.
+The COHSEX check's $4.7\times10^{-6}$ eV floor is absent: this check uses the
+writer's constant and reads float64. The twins: $\chi_0^{fa}$ dropped
+0.34 eV ($W(0)$ off by $1.6\times10^{-2}$), the pole order swapped ($D\to-D$)
+8.2 meV, the frozen bands omitted from $G$ 3.59 eV.
+
 ## 7. Cost per refresh {#cost}
 
 One refresh = $\delta\chi_0$ at every support (one $G_{\rm eq}$ composition
@@ -323,7 +357,7 @@ the full zone:
 
 | system (bands in the sums) | $N_k$, $N_\mu$ | $\chi_0$ static + probe | Dyson, full $q$ | window Σ | refresh | frozen `apply` |
 |---|---|---|---|---|---|---|
-| 516 6×6, 2v2c (160), GN-PPM (estimate: no GN run on 516) | 36, 978 | 0.2 + 0.4 s | 0.2 s | 7.0 s (the shared-pole run's sweep) | **~8 s** | 2.95 ms |
+| 516 6×6, 2v2c (160), GN-PPM (`07` replay, warm) | 36, 978 | 0.92 s (the run's χ0 stage, both supports) | 0.15 s (`screening_update`: both solves + fit) | 3.1 s (`window_sigma_c`) | **~4.2 s** | 2.95 ms |
 | 516 6×6, 2v2c (160), shared-pole (`04`) | 36, 978 | bank 12.5 s + moments 1.3 s | in the bank | 7.0 s | **~37 s** (constructor 16.2 s) | 2.95 ms |
 | 471 8×8 (898), N_μ 3000 (`14_bseprod_c3000`) | 64, 3000 | 1.1 + 2.4 s | 2 × 0.2 × 6.4 = 2.6 s | 16.6 + 11.7 s | **~34 s** | — |
 | 471 8×8 (898), N_μ 6000 (`15_bseprod_c6000`) | 64, 6000 | 3.7 + 8.7 s | 2 × 0.9 × 6.4 = 11.5 s | 86.4 + 12.4 s | **~123 s** | — |
@@ -333,7 +367,10 @@ the full zone:
 Measured, the static member (`screening="static_rpa"`: Eq. (5) cross-gap,
 Dyson on 36 q, Eq. (7) on the window, 160 bands) costs 0.41 s per warm call on
 516 at 4 A100, 139× the frozen `apply`; the exact same-side enumeration adds
-0.54 s. "Window Σ" is the Σ τ sweep plus the other Σ stages except exchange and
+0.54 s. The GN-PPM row is measured (4 × A100, warm compile cache): the
+07 replay's χ0 stage, and the 516 case's `screening_update` and
+`window_sigma_c` walls (first call 7.2 s); the TD split
+(`dynsig.chi0_split`) itself was not timed. "Window Σ" is the Σ τ sweep plus the other Σ stages except exchange and
 Hartree, which $K\delta\rho$ already carries, measured on the runs' own
 160-band Σ window (`nval 130`, `ncond 30`): for a 30v × 30c window it is an
 upper bound. The Dyson column scales the runs' wedge solves (10 q at 8×8, 19
@@ -391,7 +428,8 @@ static member as in §4 and §7.
 
 Each item makes a GW stage callable per refresh from in-memory arrays, with no
 file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
-7402a200b):
+7402a200b; the new entry points of items 4–5 at
+`feat/td-agw-dynsig-sigma-2026-10-17` e7d86cd6e):
 
 1. **Weight-row $\chi_0$.** `gw.w_isdf._chi_layout_operands` (:2144) hands the
    kernel val/cond **masks** and `_gap_edges`/`_laplace_chi_args` (:2164,
@@ -414,12 +452,32 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    directory; `screen_shared_poles` (:443) writes bank files and
    `construct_shared_poles` (:57) writes the model store. Change: a
    `screening_update(W0_at_supports, dchi_at_supports, plan)` returning the
-   pole model as arrays; the stores stay the GW driver's.
+   pole model as arrays; the stores stay the GW driver's. **Done for GN-PPM:**
+   `gw.ppm_sigma.screening_update` (:1006) runs Eq. (6) at both supports by
+   `solve_w` (`meta=None`, `pref=1`; δχ0 donated) and then `fit_pole_model`
+   (:993) on the plan of `pole_fit_plan` (:956); it returns
+   `(PPMBuildResult, (W(0), W(iω_p)))`. The GW driver calls the same
+   `pole_fit_plan` + `fit_pole_model` (`ppm_pipeline` :813, :830), so the TD
+   update and the run share one fit; the run's outputs are bitwise unchanged
+   (§6.1). The shared-pole half is not done.
 5. **Σ τ sweep on a window.** `ppm_pipeline.compute_ppm_sigma_pipeline` (:690)
    takes `wfns`, `config`, `meta`, `head_resolver`, `band_slices`, `wfn`,
    `sym`. Change: an array-level entry (`psi_full` faces, $G$ weights at the Σ
    nodes, the pole arrays, the window projectors), planned once; the
-   quadrature session (`fixed_quadrature_session`) is the held plan.
+   quadrature session (`fixed_quadrature_session`) is the held plan. **Done
+   for GN-PPM:** `gw.ppm_sigma.window_sigma_c` (:1611) runs the run's Σ stage
+   (`compute_sigma_c_ppm_omega_grid`, :1301) on its parent carrier with the
+   window's columns rotated by $U$, the instantaneous $e$, and $f$, $1-f$
+   branch weights (new `populations=` argument; `None` is the incumbent
+   call). `window_sigma_plan` (:1560) holds the plan: the session, the run's
+   head and the on-shell frequency list. It returns $\Sigma_{ij}(e_i)$,
+   $\Sigma_{ij}(e_j)$, the static operator
+   $U[\tfrac12(\cdot+\cdot)]^{\rm h}U^\dagger$ and, on request,
+   $\Sigma(\omega)$. Limits: the projection is the band prefix $[0,b_{\rm hi})$,
+   not the window alone, because the invalid-mode static term sums the
+   occupied bands (window decode is item 6); the head is the run's
+   `HeadSigmaDiag` at the instantaneous $e$, $f$ (frozen $W_h$, §1.4); only
+   full-zone parents are accepted (`GATE window_sigma_full_zone`).
 6. **Full-band encode, window decode.** `bse_stack_matvec.make_w_term` (:470)
    decodes onto the encode's band set (the prototype decodes 160×160 to keep
    4×4). Change: separate encode (all bands) and decode (window) faces.

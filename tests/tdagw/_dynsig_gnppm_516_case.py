@@ -23,7 +23,8 @@ W2  the poles of W1 vs the run's fit (Omega, B, D; valid masks)
 S1  items 4 + 5 chained at rho_eq: gw.ppm_sigma.window_sigma_c on W1's poles (the
     run's head, its on-shell frequency list) + tdagw.dynsig.exchange_sigma
     (heads whead/vhead) vs the run: the window block of sigma_c_kij_ev (pair,
-    off-diagonal included), Sigma_x and their sum, from sigma_mnk.h5 (float64)
+    off-diagonal included), Sigma_x and their sum (sigma_total_kij_ev minus
+    hartree_kij_ev: the writer's total carries V_H), from sigma_mnk.h5 (float64)
     and from this process's in-memory Sigma_c; eV with common.units.RYD_TO_EV
     (the writer's constant)
 S1d the diagonal vs sigma_diag.dat (sigX, Re sigC; eV printed to 1e-6)
@@ -352,8 +353,10 @@ def main():
             fc = np.asarray(f["sigma_c_kij_ev"][()])[:, :, b_lo:b_hi, b_lo:b_hi]
             fx_name = next((k for k in ("sigma_x_kij_ev", "sigma_sx_kij_ev") if k in f), None)
             fx = None if fx_name is None else np.asarray(f[fx_name][()])[:, b_lo:b_hi, b_lo:b_hi]
-            ft = (np.asarray(f["sigma_total_kij_ev"][()])[:, :, b_lo:b_hi, b_lo:b_hi]
-                  if "sigma_total_kij_ev" in f else None)
+            ft = None                     # the writer's total is sigma_x + sigma_c + V_H: drop V_H
+            if "sigma_total_kij_ev" in f and "hartree_kij_ev" in f:
+                ft = (np.asarray(f["sigma_total_kij_ev"][()])[:, :, b_lo:b_hi, b_lo:b_hi]
+                      - np.asarray(f["hartree_kij_ev"][()])[None, :, b_lo:b_hi, b_lo:b_hi])
         mx = lambda x: float(np.max(np.abs(x)))
         out["S1"] = dict(
             datasets=dsets, exchange_dataset=fx_name,
@@ -364,7 +367,8 @@ def main():
             max_abs_c_file_ev=mx(fc),
             max_abs_x_vs_file_ev=None if fx is None else mx(sx * ev - fx),
             max_abs_x_file_ev=None if fx is None else mx(fx),
-            max_abs_total_vs_file_ev=None if ft is None else mx(pair_td + (sx * ev)[None] - ft),
+            max_abs_xc_vs_file_total_minus_hartree_ev=(
+                None if ft is None else mx(pair_td + (sx * ev)[None] - ft)),
             efermi_ry=[float(cap["efermi_ry"]), s_td["efermi_ry"]])
         out["S1w"] = dict(max_abs_c_vs_file_ev=mx(pair_w - fc),
                           max_abs_c_vs_inmemory_ev=mx(pair_w - cap["body_head_pair"] * ev),
