@@ -123,12 +123,16 @@ static ffi::Error PotrfImpl(
                                   : local_lower + 2 * (L.mt() + L.nt()) + 8;
     lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);
     const int64_t seeded = ws.seed(L, want);
+    lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
+    lorrax_ffi::slate::PoolWatchScope wl(pw, L, "L", seeded, local_lower);
 
     try {
         int64_t info = sl::potrf(L, opts);
+        pw.sample();
         if (lorrax_ffi::slate::pool_report_enabled()) {
             int r = 0;
             MPI_Comm_rank(ctx->comm, &r);
+            pw.report("potrf", r, n, nb, (int) sizeof(T));
             std::fprintf(stderr, "[slate.potrf] rank=%d n=%lld nb=%lld pool seeded=%lld "
                          "fallback=%lld blocks ws=%.3fGB\n", r, (long long) n, (long long) nb,
                          (long long) seeded,

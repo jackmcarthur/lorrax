@@ -43,6 +43,7 @@
 #include <thread>
 #include <chrono>
 #include <vector>
+#include <mutex>
 
 #include "../common/gpu_runtime.h"
 
@@ -64,6 +65,19 @@ public:
     // onto device `device`'s free list.  Call before any tile exists (single
     // threaded: no SLATE task can be touching this pool yet).
     template <typename T>
+    static Memory* lorrax_memory(BaseMatrix<T>& M) {
+        return &M.storage_->memory_;
+    }
+    // Blocks of `mem` in use on `device` (capacity minus free list).  Call only while
+    // holding SLATE's `omp critical(slate_memory)` (PoolWatch), the lock under which
+    // Memory::alloc / Memory::free change both.
+    static std::size_t lorrax_in_use(Memory& mem, int device, std::size_t* cap) {
+        const std::size_t c = mem.capacity_.at(device);
+        const std::size_t f = mem.free_blocks_.at(device).size();
+        *cap = c;
+        return c > f ? c - f : 0;
+    }
+    template <typename T>
     static void lorrax_seed(BaseMatrix<T>& M, int device, char* base, std::int64_t nblocks) {
         auto& mem = M.storage_->memory_;
         for (std::int64_t i = 0; i < nblocks; ++i)
@@ -73,6 +87,20 @@ public:
 };
 
 }  // namespace slate
+
+// SLATE's pool lock.  slate::Memory::alloc / ::free run under
+// `#pragma omp critical(slate_memory)`; the pinned SLATE is GCC-built against libgomp,
+// so that critical is GOMP_critical_name_start(&.gomp_critical_user_slate_memory),
+// a symbol libslate exports (nm -D: "B .gomp_critical_user_slate_memory").  Taking
+// the same mutex from PoolWatch's thread makes its reads of capacity_ / free_blocks_
+// exact.  Both references are weak: a SLATE without them (another compiler or OpenMP
+// runtime) leaves them null and PoolWatch reports "unavailable" instead of guessing.
+extern "C" {
+extern void* lorrax_slate_memory_crit __asm__(".gomp_critical_user_slate_memory")
+    __attribute__((weak));
+void GOMP_critical_name_start(void** pptr) __attribute__((weak));
+void GOMP_critical_name_end(void** pptr) __attribute__((weak));
+}
 
 namespace lorrax_ffi::slate {
 
@@ -114,6 +142,106 @@ inline bool pool_report_enabled() {
     const char* v = std::getenv("LORRAX_SLATE_POOL_REPORT");
     return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
+
+// High-water of each seeded pool, sampled every 1 ms under SLATE's pool lock while
+// a handler runs (LORRAX_SLATE_POOL_REPORT; a diagnostic, never a policy).  "in use" =
+// pool capacity minus its free list = the blocks SLATE holds at that instant (local
+// tiles, remote / workspace tiles, device copies); the maximum over the call is the
+// measured high-water the seeding rules in distrib_la._slate are fitted to.  A matrix
+// is watched from add() until its scope object dies (declare it right after the
+// matrix so it is destroyed first).  Capacity resets (clearWorkspace with nothing in
+// use drops every block, seeded ones included) are counted as `drops`.
+struct PoolWatch {
+    struct Entry {
+        ::slate::Memory* mem = nullptr;
+        const char* name = "";
+        std::int64_t seeded = 0, local = 0;
+        std::size_t max_in_use = 0, max_cap = 0, last_cap = 0;
+        std::int64_t drops = 0;
+        bool live = false;
+    };
+    std::vector<Entry> ents;
+    std::mutex mu;
+    std::atomic<bool> stop{false};
+    std::thread th;
+    bool on = false;
+    int device = 0;
+
+    static bool available() {
+        return &lorrax_slate_memory_crit != nullptr && GOMP_critical_name_start != nullptr &&
+               GOMP_critical_name_end != nullptr;
+    }
+    explicit PoolWatch(bool enabled) : on(enabled && available()) {
+        ents.reserve(16);
+        if (!on) return;
+        th = std::thread([this] {
+            while (!stop.load()) {
+                sample();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+    }
+    void sample() {
+        std::lock_guard<std::mutex> g(mu);
+        for (auto& e : ents) {
+            if (!e.live) continue;
+            std::size_t cap = 0, used = 0;
+            GOMP_critical_name_start(&lorrax_slate_memory_crit);
+            used = ::slate::Debug::lorrax_in_use(*e.mem, device, &cap);
+            GOMP_critical_name_end(&lorrax_slate_memory_crit);
+            if (cap < e.last_cap) ++e.drops;
+            e.last_cap = cap;
+            if (used > e.max_in_use) e.max_in_use = used;
+            if (cap > e.max_cap) e.max_cap = cap;
+        }
+    }
+    template <typename T>
+    int add(::slate::BaseMatrix<T>& M, const char* name, std::int64_t seeded, std::int64_t local) {
+        if (!on) return -1;
+        std::lock_guard<std::mutex> g(mu);
+        Entry e;
+        e.mem = ::slate::Debug::lorrax_memory(M);
+        e.name = name; e.seeded = seeded; e.local = local; e.live = true;
+        ents.push_back(e);
+        return static_cast<int>(ents.size()) - 1;
+    }
+    void drop(int id) {
+        if (id < 0) return;
+        sample();                       // the last reading before the matrix dies
+        std::lock_guard<std::mutex> g(mu);
+        ents.at(id).live = false;
+    }
+    // One line per watched matrix: what was seeded vs what SLATE held at most.
+    void report(const char* op, int rank, std::int64_t n, std::int64_t nb, int itemsize) {
+        if (!pool_report_enabled()) return;
+        if (!on) {
+            std::fprintf(stderr, "[slate.pool_hw] op=%s rank=%d unavailable (SLATE pool lock "
+                         "symbol not found)\n", op, rank);
+            return;
+        }
+        std::lock_guard<std::mutex> g(mu);
+        for (auto& e : ents)
+            std::fprintf(stderr, "[slate.pool_hw] op=%s rank=%d n=%lld nb=%lld itemsize=%d mat=%s "
+                         "local=%lld seeded=%lld max_in_use=%zu max_cap=%zu drops=%lld\n",
+                         op, rank, (long long) n, (long long) nb, itemsize, e.name,
+                         (long long) e.local, (long long) e.seeded, e.max_in_use, e.max_cap,
+                         (long long) e.drops);
+    }
+    ~PoolWatch() { stop = true; if (th.joinable()) th.join(); }
+};
+
+// RAII: watch M from here until this object dies.
+struct PoolWatchScope {
+    PoolWatch& w;
+    int id;
+    template <typename T>
+    PoolWatchScope(PoolWatch& w_, ::slate::BaseMatrix<T>& M, const char* name,
+                   std::int64_t seeded, std::int64_t local)
+        : w(w_), id(w_.add(M, name, seeded, local)) {}
+    ~PoolWatchScope() { w.drop(id); }
+    PoolWatchScope(const PoolWatchScope&) = delete;
+    PoolWatchScope& operator=(const PoolWatchScope&) = delete;
+};
 
 // Device bytes in use (total - free, whole device) per stage, sampled every 20 ms on
 // a side thread while a handler runs.  A diagnostic (LORRAX_SLATE_TIMERS /
