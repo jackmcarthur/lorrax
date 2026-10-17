@@ -22,7 +22,7 @@ def _mesh():
     return Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
 
 
-def test_final_head_diagonals_rotate_with_a_padded_static_U():
+def test_final_head_terms_rotate_with_a_padded_static_U():
     from runtime.padding import pad_square, padded_axis
     from symmetry_maps import KStarMap
     from gw import sc_iteration as sc
@@ -53,10 +53,7 @@ def test_final_head_diagonals_rotate_with_a_padded_static_U():
         nb, mesh, name="static Sigma final rotation", specs=((spec, 1), (spec, 2)))
     assert static_axis.pad == 1
     U = sc._place(pad_square(U, static_axis, pad_diagonal=1.0), mesh, spec)
-    head_sigma_w = rng.normal(size=(3, ks.nk_irr, nb))
-
-    head_dft, head_sigma_dft = sc._final_head_diagonals_to_dft(
-        head, head_sigma_w, U, mesh=mesh, pad_axis=static_axis)
+    head_dft = sc._final_head_terms_to_dft(head, U, mesh=mesh, pad_axis=static_axis)
 
     weight = np.abs(U_loop_in) ** 2
     for name in ("sigma_x_diag", "sigma_sx_diag", "sigma_sx_minus_x_diag",
@@ -65,6 +62,3 @@ def test_final_head_diagonals_rotate_with_a_padded_static_U():
                          np.asarray(getattr(head_full, name))[ks.rows])
         np.testing.assert_allclose(np.asarray(getattr(head_dft, name)), want,
                                    rtol=0, atol=1e-14)
-    np.testing.assert_allclose(
-        np.asarray(head_sigma_dft), np.einsum("kmn,wkn->wkm", weight, head_sigma_w),
-        rtol=0, atol=1e-14)

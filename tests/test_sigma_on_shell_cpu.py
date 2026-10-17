@@ -7,12 +7,18 @@ table and dSigma_nn/domega) instead of an omega grid.  A synthetic
 anti-Hermitian) are folded both ways and compared with the quadrature summed in
 NumPy at the same energies:
 
-* the pair and every value slot equal the closed form (and the grid fold) at
-  the state's own energy, to round-off;
+* the pair and every value slot equal the closed form at the state's own
+  energy, to round-off;
 * the derivative slot equals the closed form's exact omega derivative, and a
   central difference of it;
 * with band brackets, every cumulative count's slots and the kept matrices do;
-* ``HeadSigmaDiag.on_shell`` is its own cells and their exact derivative.
+* ``HeadSigmaDiag.on_shell`` is independent of its grid and its derivative
+  is the central difference of its value;
+* a single pole through the PRODUCTION box rule (``sigma_quadrature_eps``,
+  ``sigma_regularization_ev`` defaults): the value slot against
+  ``1/(omega - E + i eta)`` and the derivative slot against its exact
+  derivative ``-1/(omega - E + i eta)^2``.
+* the deck keys retired with the omega grid refuse by name at parse time.
 
 Run with ``XLA_FLAGS=--xla_force_host_platform_device_count=4`` for a 2x2 band
 tiling; one host device gives the 1x1 mesh.
@@ -87,7 +93,8 @@ def _request(rng):
     e_dft = e_eval + rng.uniform(-0.05, 0.05, size=(NK, NB)) * RYD_TO_EV
     grid = np.linspace(-1.0, 1.0, 9) * RYD_TO_EV
     return on_shell_request(e_eval_rel_ev=e_eval, e_dft_rel_ev=e_dft,
-                            omega_range_ev=grid, out_of_grid="cover")
+                            omega_range_ev=grid, out_of_grid="cover",
+                            irr_idx=np.arange(NK), n_parent=NK)
 
 
 def _fold(acc, A, lam, windows, frequencies, mesh):
@@ -97,8 +104,7 @@ def _fold(acc, A, lam, windows, frequencies, mesh):
     for ext, sign, pref, e_ref, t, alpha, anti in windows:
         cols = np.nonzero(frequencies < 0)[0] if ext < 0 else np.nonzero(frequencies >= 0)[0]
         acc.integrate_window(
-            _tau_kernel, (A_d, lam_d), t, alpha, n_active=len(t),
-            active_count=None, capacity=6, omega_sign=sign, prefactor=pref,
+            _tau_kernel, (A_d, lam_d), t, alpha, active_count=None, capacity=max(6, len(t)), omega_sign=sign, prefactor=pref,
             e_ref_sum=e_ref, antihermitian=anti, omega_indices=cols,
             omega_values=ext * frequencies[cols])
     return acc.finalize()
@@ -113,9 +119,8 @@ def _parts(n_br, rng):
 @pytest.mark.parametrize("n_br", [None, 3])
 def test_on_shell_fold_matches_closed_form(n_br):
     from gw.mpa.sigma import _on_shell_reduce
-    from gw.ppm_accumulators import DeviceOmegaAccumulator, OnShellTables
-    from gw.ppm_sigma import OnShellSigma, band_diagonal_slots
-    from common.collectives import device_put_process_local
+    from gw.ppm_accumulators import DeviceOmegaAccumulator
+    from gw.ppm_sigma import OnShellSigma
 
     rng = np.random.default_rng(7)
     mesh = _mesh()
@@ -126,14 +131,11 @@ def test_on_shell_fold_matches_closed_form(n_br):
     F = request.frequencies_ry
     spec = NamedSharding(mesh, P(None, None, "x", "y"))
 
-    tables = OnShellTables(
-        omega=device_put_process_local(request.tables_ry, NamedSharding(mesh, P())),
-        index=request.index, omega_host=request.tables_ry)
     n_counts = n_br or 1
     shape = (((2, NK, NB, NB),) * (2 if n_counts > 1 else 1),
              ((request.n_slot, NK, NB, p_y),) * n_counts)
-    acc = DeviceOmegaAccumulator(F, shape=shape, sharding=spec, omega_axis=0,
-                                 reduce=_on_shell_reduce(mesh, n_br), on_shell=tables)
+    acc = DeviceOmegaAccumulator(request, carrier=NB, shape=shape, sharding=spec,
+                                 reduce=_on_shell_reduce(mesh, n_br))
     matrices, diagonals = _fold(acc, A, lam, windows, F, mesh)
 
     # The closed form at every list frequency, cumulative over brackets.
@@ -148,7 +150,7 @@ def test_on_shell_fold_matches_closed_form(n_br):
     k = np.arange(NK)[:, None, None]
     m = np.arange(NB)[None, :, None]
     n = np.arange(NB)[None, None, :]
-    I = request.index[0]
+    I = request.parent_index[0]
     for slot_m, b in zip(matrices, kept):
         got = np.asarray(slot_m)
         np.testing.assert_allclose(got[0], ref[I[:, :, None], b, k, m, n], rtol=1e-12, atol=1e-12)
@@ -157,7 +159,7 @@ def test_on_shell_fold_matches_closed_form(n_br):
     for b, slots in enumerate(diagonals):
         point = OnShellSigma(pair=None, slots=slots, request=request, mesh_xy=mesh)
         for name in request.names:
-            Ii = request.index[request.slot(name)]
+            Ii = request.parent_index[request.slot(name)]
             np.testing.assert_allclose(point.diagonal(name), ref[Ii, b, kk, bb, bb],
                                        rtol=1e-12, atol=1e-12)
         np.testing.assert_allclose(point.diagonal("derivative"), dref[I, b, kk, bb, bb],
@@ -177,20 +179,6 @@ def test_on_shell_fold_matches_closed_form(n_br):
                                rtol=1e-6, atol=1e-6)
 
 
-def test_grid_fold_matches_closed_form():
-    """The grid fold (``sigma_omega_grid_debug``) is the same closed form."""
-    from gw.ppm_accumulators import DeviceOmegaAccumulator
-    rng = np.random.default_rng(3)
-    mesh = _mesh()
-    A, lam = _parts(None, rng)
-    windows = _windows(rng)
-    F = np.linspace(-0.5, 0.5, 7)
-    spec = NamedSharding(mesh, P(None, None, "x", "y"))
-    acc = DeviceOmegaAccumulator(F, shape=(F.size, NK, NB, NB), sharding=spec, omega_axis=0)
-    np.testing.assert_allclose(np.asarray(_fold(acc, A, lam, windows, F, mesh)),
-                               _reference(A, lam, windows, F), rtol=1e-12, atol=1e-12)
-
-
 def test_head_on_shell_is_its_cells_and_derivative():
     from gw.head_correction import HeadSigmaDiag
     rng = np.random.default_rng(11)
@@ -205,8 +193,7 @@ def test_head_on_shell_is_its_cells_and_derivative():
     probe = HeadSigmaDiag.build(
         omega_grid_ry=np.sort(omega.ravel()), enk_ry=enk, efermi_ry=0.0, occupations=occ,
         poles_ry=head.poles_ry, residues_ry=head.residues_ry, cell_volume=12.0, nk_tot=NK)
-    slots = np.searchsorted(probe.omega_grid_ry, omega)[None]
-    np.testing.assert_array_equal(value, probe.at_slots(slots)[0])
+    np.testing.assert_array_equal(value, probe.on_shell(omega)[0])
     h = 1e-6
     fd = (head.on_shell(omega + h)[0] - head.on_shell(omega - h)[0]) / (2 * h)
     np.testing.assert_allclose(deriv, fd, rtol=1e-6, atol=1e-8)
@@ -215,13 +202,110 @@ def test_head_on_shell_is_its_cells_and_derivative():
 def test_request_tables_alias_equal_reads():
     from gw.ppm_sigma import on_shell_request
     e = np.asarray([[-2.0, 0.5, 30.0]])
+    k_plan = dict(irr_idx=np.arange(1), n_parent=1)
     one_shot = on_shell_request(e_eval_rel_ev=e, e_dft_rel_ev=e,
-                                omega_range_ev=np.asarray([-10.0, 10.0]), out_of_grid="cover")
+                                omega_range_ev=np.asarray([-10.0, 10.0]), out_of_grid="cover",
+                                **k_plan)
     assert one_shot.names == ("pair",) and one_shot.n_slot == 2
     assert one_shot.slot("dft0") == one_shot.slot("eval0") == 0
     assert one_shot.table_ev("pair")[0, 2] == 0.0           # uncovered: Sigma(omega = 0)
     assert list(one_shot.covered_kn[0]) == [True, True, False]
     clamp = on_shell_request(e_eval_rel_ev=e, e_dft_rel_ev=e + 0.1,
-                             omega_range_ev=np.asarray([-10.0, 10.0]), out_of_grid="clamp")
+                             omega_range_ev=np.asarray([-10.0, 10.0]), out_of_grid="clamp",
+                             **k_plan)
     assert clamp.names == ("pair", "eval0", "dft0")
     assert clamp.table_ev("pair")[0, 2] == 10.0
+    census = on_shell_request(e_eval_rel_ev=e, e_dft_rel_ev=e,
+                              omega_range_ev=np.asarray([-10.0, 10.0]), out_of_grid="static",
+                              edge_window_ev=(-12.0, 12.0), **k_plan)
+    assert census.names == ("pair", "zero", "edge")      # eval0/dft0 alias pair
+    assert list(census.table_ev("edge")[0]) == [-10.0, 10.0, 10.0]
+
+
+def _production_pole_nodes(frequencies_ry, pole_ry, eta_ry, eps):
+    """The production Sigma box rule for one pole ``pole_ry``, ``(t, alpha)``.
+
+    The planner's chain for one conduction window at one live state of energy
+    zero: :func:`gw.sigma_box_plan.make_sigma_box_spec` -> the built rule
+    (``analytic_box_rule`` on the outward-snapped build box) ->
+    :func:`gw.sigma_box_plan._accept_rule` -> the executor nodes, so that
+    ``sum_i alpha_i exp(i t_i (omega - E))`` approximates ``1/(omega - E + i eta)``.
+    """
+    from gw import sigma_box_plan as plan
+    spec = plan.make_sigma_box_spec(
+        name="single-pole", frequencies=frequencies_ry, states=np.zeros(1),
+        pole_stats=[(pole_ry, pole_ry, 0.0, 0.0)], pole_sign=+1, eta_ry=eta_ry)
+    rule = plan._BOX_RULE_BUILDER(plan._build_box(spec["box"], eta_ry, widen=True), eps,
+                                  mass_cap=plan._noise_amplification_cap())
+    fit = plan._accept_rule(spec, rule, eps, rule_source="built")
+    nodes = plan.sigma_box_executor_nodes(fit, +1, eta_ry)
+    return np.asarray(nodes.t), np.asarray(nodes.alpha), spec["kind"]
+
+
+#: The derivative slot's error bound, in the derivative's box currency (eta^-2
+#: crossing, |d|^-2 sign-definite: the square of the value's currency), as a
+#: multiple of eps.  Measured 1.3 eps (crossing) and 0.18 eps (sign-definite).
+DERIVATIVE_TOL_EPS = 10.0
+
+
+@pytest.mark.parametrize("pole_ev", [5.0, -3.0])
+def test_single_pole_derivative_at_production_eps_eta(pole_ev, capsys):
+    """dQ/domega of one pole against -1/(omega - E + i eta)^2 (production eps, eta).
+
+    Frequencies span [0, 10] eV: ``E = 5`` eV is a crossing box, ``E = -3`` eV
+    a sign-definite one.  The value slot is certified by the rule; the
+    derivative slot is not, and this measures it on the same nodes.
+    """
+    from common.units import RYD_TO_EV
+    from gw.gw_config import _DEFAULTS
+    from gw.mpa.sigma import _on_shell_reduce
+    from gw.ppm_accumulators import DeviceOmegaAccumulator
+    from gw.ppm_sigma import OnShellSigma, on_shell_request
+
+    eps = float(_DEFAULTS["sigma_quadrature_eps"])
+    eta = float(_DEFAULTS["sigma_regularization_ev"]) / RYD_TO_EV
+    mesh = _mesh()
+    p_y = int(mesh.shape["y"])
+    omega_ev = np.linspace(0.0, 10.0, NK * NB).reshape(NK, NB)
+    request = on_shell_request(e_eval_rel_ev=omega_ev, e_dft_rel_ev=omega_ev,
+                               omega_range_ev=np.asarray([-1.0, 11.0]), out_of_grid="cover",
+                               irr_idx=np.arange(NK), n_parent=NK)
+    F = request.frequencies_ry
+    pole = pole_ev / RYD_TO_EV
+    t, alpha, kind = _production_pole_nodes(F, pole, eta, eps)
+
+    spec = NamedSharding(mesh, P(None, None, "x", "y"))
+    acc = DeviceOmegaAccumulator(
+        request, carrier=NB, shape=(((2, NK, NB, NB),), ((request.n_slot, NK, NB, p_y),)),
+        sharding=spec, reduce=_on_shell_reduce(mesh, None))
+    A = np.ones((1, NK, NB, NB), np.complex128)
+    window = ((+1, +1, 1.0, 0.0, t, alpha, False),)
+    _, (slots,) = _fold(acc, A, np.asarray([pole]), window, F, mesh)
+    point = OnShellSigma(pair=None, slots=slots, request=request, mesh_xy=mesh)
+
+    w = request.table_ev("pair") / RYD_TO_EV
+    d = w - pole + 1j * eta
+    value, deriv = point.diagonal("pair"), point.diagonal("derivative")
+    rho = eta if kind == "crossing" else np.abs(d)          # the value's box currency
+    value_err = float(np.max(np.abs(value - 1.0 / d) * rho))
+    deriv_err = np.abs(deriv + 1.0 / d ** 2)
+    deriv_box = float(np.max(deriv_err * rho ** 2))
+    deriv_rel = float(np.max(deriv_err * np.abs(d) ** 2))
+    with capsys.disabled():
+        print(f"\n  single pole E={pole_ev:+.1f} eV ({kind}, {t.size} nodes, eps={eps:g}, "
+              f"eta={eta * RYD_TO_EV:g} eV): value err {value_err:.2e}, dSigma/domega err "
+              f"{deriv_box:.2e} (box currency); dSigma/domega max relative {deriv_rel:.2e}")
+    assert value_err <= 1.05 * eps
+    assert deriv_box <= DERIVATIVE_TOL_EPS * eps
+
+
+@pytest.mark.parametrize("key, value", [("sigma_omega_grid_debug", "false"), ("write_eqp2", "true"),
+                                        ("eqp2_tol_ev", "1e-3"), ("eqp2_file", "eqp2.dat")])
+def test_omega_grid_keys_refuse_by_name(tmp_path, key, value):
+    """The keys retired with the omega grid refuse at parse time, by name, any value."""
+    from gw.gw_config import read_lorrax_input
+    deck = tmp_path / "cohsex.in"
+    deck.write_text(f"[cohsex]\nsys_dim = 3\n{key} = {value}\n")
+    with pytest.raises(ValueError, match="GATE omega_grid_retired") as refusal:
+        read_lorrax_input(str(deck))
+    assert key in str(refusal.value) and "UPGRADE_NOTES.md" in str(refusal.value)
