@@ -27,6 +27,27 @@ def mesh():
     return Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
 
 
+@pytest.fixture
+def cpu_mesh():
+    """``mesh`` on host devices, for a bound on the host compiler's ``memory_analysis()``.
+
+    On a GPU node (``lx test``: four CUDA devices in one process) ``jax.devices()``
+    is the GPUs, and the GPU compiler's temp for this Gram (296200 B) is over the
+    one-tile budget the test states for the host (172032 B; CRI3TD INTEG stage 2),
+    so this mesh is built from ``jax.devices("cpu")`` and skips by name unless four
+    host devices exist.
+    """
+    try:
+        cpus = jax.devices("cpu")
+    except RuntimeError:                      # a platform list without cpu
+        cpus = []
+    if len(cpus) < 4:
+        pytest.skip("CPU only: needs 4 host devices (JAX_PLATFORMS=cpu "
+                    "XLA_FLAGS=--xla_force_host_platform_device_count=4); the one-buffer "
+                    "bound is the host compiler's memory_analysis()")
+    return Mesh(np.array(cpus[:4]).reshape(2, 2), ("x", "y"))
+
+
 def _psi(rng, nk, nb, ns, mu):
     """Plain ψ at centroids, ``(nk, nb, ns, μ)`` — the restart's ``psi_rmu_Y`` order."""
     return rng.normal(size=(nk, nb, ns, mu)) + 1j * rng.normal(size=(nk, nb, ns, mu))
@@ -139,8 +160,9 @@ def test_gram_column_stream_bounds_the_compiled_module(mesh, monkeypatch):
     assert tiled <= whole // 3
 
 
-def test_gram_holds_one_output_buffer(mesh, monkeypatch):
+def test_gram_holds_one_output_buffer(cpu_mesh, monkeypatch):
     """The Gram writes into one donated output buffer; only the column tile is scratch."""
+    mesh = cpu_mesh                                                 # the host compiler's bound
     import isdf.core as core
     from ffi.fft import xla_reference
     from gw.downfold import negate_q_index

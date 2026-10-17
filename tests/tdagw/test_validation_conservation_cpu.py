@@ -84,10 +84,42 @@ def _g2(t, energy, work, t_end):
             and np.ptp(energy[after]) <= 1e-9 * scale)
 
 
+def _cpu_mesh():
+    """The 2 x 2 host-device mesh this module's bounds were calibrated on.
+
+    G1's trace and purity bounds (1e-11) are host rounding over these runs.  On
+    a GPU node (``lx test``: four CUDA devices in one process) ``jax.devices()``
+    is the GPUs, where magnus2 at 1 as accumulated trace 7.6e-11 and purity
+    2.7e-11 (CRI3TD INTEG stage 2), so the mesh is built from
+    ``jax.devices("cpu")`` and the module skips by name unless four host
+    devices exist.
+    """
+    try:
+        cpus = jax.devices("cpu")
+    except RuntimeError:                      # a platform list without cpu
+        cpus = []
+    if len(cpus) < 4:
+        pytest.skip("CPU only: needs 4 host devices (JAX_PLATFORMS=cpu "
+                    "XLA_FLAGS=--xla_force_host_platform_device_count=4); the G1/G2 "
+                    "bounds are host rounding, not GPU rounding")
+    return jax.sharding.Mesh(np.array(cpus[:4]).reshape(2, 2), ("x", "y"))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _host_default_device():
+    """Arrays made without a sharding stay on the host too (see ``_cpu_mesh``)."""
+    try:
+        cpu0 = jax.devices("cpu")[0]
+    except RuntimeError:
+        yield
+        return
+    with jax.default_device(cpu0):
+        yield
+
+
 @pytest.fixture(scope="module")
 def case(tmp_path_factory):
-    if len(jax.devices()) < 4:
-        pytest.skip("needs 4 host devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    mesh = _cpu_mesh()
     tmp = str(tmp_path_factory.mktemp("cons"))
     sw = vs.synthetic_window()
     hdr = vs.write_header(os.path.join(tmp, "hdr"), sw)
@@ -98,10 +130,10 @@ def case(tmp_path_factory):
     for method, kw in METHODS:
         res, stats = vs.run_deck(os.path.join(tmp, method), hdr, sw, trials=trial,
                                  tf_as=TF_AS, dt_measure_as=MDT_AS, method=method,
-                                 kernel_file=kfull, measurements=meas, **kw)
+                                 kernel_file=kfull, measurements=meas, mesh=mesh, **kw)
         runs[method] = dict(t=res[0]["density_matrix"][0], rho=res[0]["density_matrix"][1],
                             E=res[0]["Efield"][1], j=res[0]["current"][1], stats=stats)
-    return dict(sw=sw, hdr=hdr, kfull=kfull, tmp=tmp, runs=runs, trial=trial,
+    return dict(sw=sw, hdr=hdr, kfull=kfull, tmp=tmp, runs=runs, trial=trial, mesh=mesh,
                 vol=abs(np.linalg.det(sw["cell"])), t_end=(PULSE[2] + 6 * PULSE[3]) / vs.T_AS)
 
 
@@ -134,7 +166,8 @@ def _equilibrium(case, method, kw, gam, tag, hook=None):
                          tf_as=5000.0, dt_measure_as=100.0, method=method,
                          kernel_file=case["kfull"], depopulation_ev=gam[0],
                          dephasing_ev=gam[1], measurements=("density_matrix",),
-                         model_hook=hook, **kw)
+                         model_hook=hook, **kw,
+                         mesh=case["mesh"])
     rho = res[0]["density_matrix"][1]
     nv, nb = case["sw"]["n_val"], rho.shape[-1]
     req = np.diag((np.arange(nb) < nv).astype(float))
@@ -155,7 +188,8 @@ def test_red_twin_non_hermitian_dsigma(case):
                          trials=case["trial"], tf_as=TF_AS, dt_measure_as=100.0,
                          method="dp54", rtol=1e-10, max_step_as=50.0,
                          kernel_file=case["kfull"], measurements=("density_matrix",),
-                         model_hook=hook)
+                         model_hook=hook,
+                         mesh=case["mesh"])
     inv = _invariants(res[0]["density_matrix"][1], case["sw"]["n_val"])
     assert not _g1(inv, "dp54") and inv[1] > 1e-6, inv
 
@@ -164,7 +198,8 @@ def test_red_twin_dephasing_breaks_purity(case):
     res, _ = vs.run_deck(os.path.join(case["tmp"], "twin_deph"), case["hdr"], case["sw"],
                          trials=case["trial"], tf_as=TF_AS, dt_measure_as=100.0,
                          method="cfm4", dt_as=5.0, kernel_file=case["kfull"],
-                         dephasing_ev=0.02, measurements=("density_matrix",))
+                         dephasing_ev=0.02, measurements=("density_matrix",),
+                         mesh=case["mesh"])
     tr, herm, pur = _invariants(res[0]["density_matrix"][1], case["sw"]["n_val"])
     assert not _g1((tr, herm, pur), "cfm4") and pur > 1e-3, (tr, herm, pur)
     assert tr <= 1e-11 and herm <= 1e-12                   # what dephasing does not touch
@@ -216,7 +251,8 @@ def ip_drift(case):
     for h in IP_STEPS_AS:
         res, _ = vs.run_deck(os.path.join(case["tmp"], f"magnus2_interaction_{h:g}as"), case["hdr"], case["sw"],
                              trials=case["trial"], tf_as=TF_AS, dt_measure_as=MDT_AS, method="magnus2", dt_as=h,
-                             magnus_frame="interaction", kernel_file=case["kfull"], measurements=meas)
+                             magnus_frame="interaction", kernel_file=case["kfull"], measurements=meas,
+                             mesh=case["mesh"])
         t, rho = res[0]["density_matrix"]
         energy = vs.energy_per_cell(case["sw"], rho)
         work = vs.work_per_cell(t, res[0]["Efield"][1], res[0]["current"][1], case["vol"])

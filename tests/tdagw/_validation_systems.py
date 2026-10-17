@@ -123,13 +123,15 @@ def run_deck(outdir, header_dir, system, *, trials, tf_as, dt_measure_as, method
              dt_as=None, n_corr=2, rtol=1e-10, atol=1e-14, max_step_as=None,
              kernel_file=None, depopulation_ev=0.0, dephasing_ev=0.0,
              measurements=("Efield", "polarization", "current", "density_matrix"),
-             meas_opts=None, model_hook=None, magnus_frame=None):
+             meas_opts=None, model_hook=None, magnus_frame=None, mesh=None):
     """Propagate ``trials`` through the driver's stages; returns (per-trial dicts, stats).
 
     Each dict maps a measurement name to ``(times_au, data)`` read back from
     that trial's ``tdgw.h5``.  ``meas_opts`` {measurement name: TDGW keywords}
     (e.g. ``{"density_matrix": {"itrange": [0, n, 10]}}``).
     ``model_hook(model) -> model`` may replace the self-energy model (a red twin).
+    ``mesh`` is the device mesh to run on; None is ``resolve_mesh()``'s canonical
+    s x s mesh over ``jax.devices()`` (a CPU-calibrated module passes its host mesh).
     """
     import h5py
     from common.collectives import resolve_mesh
@@ -161,7 +163,7 @@ def run_deck(outdir, header_dir, system, *, trials, tf_as, dt_measure_as, method
         if meas_opts and name in meas_opts:
             raw["measurements"][str(i)] = dict(meas_opts[name])
     deck = parse_td_deck(raw, source=str(outdir))
-    mesh = resolve_mesh()
+    mesh = resolve_mesh(mesh)
     sysd = stages.load_system(deck, mesh)
     model = stages.build_self_energy(deck, sysd, mesh)
     if model_hook is not None:
