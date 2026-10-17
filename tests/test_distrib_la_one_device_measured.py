@@ -270,3 +270,36 @@ def test_the_native_closure_is_part_of_the_cache_key(mesh, leg, monkeypatch, tmp
     monkeypatch.setattr(plan_mod, "native_closure_identity", lambda platform: "/other/liblorrax_ffi.so:0123")
     p.batched(_face(mesh, A), _face(mesh, B))
     assert len(compiled) == 2 * first and len(list(tmp_path.glob("*.json"))) == 2
+
+
+def test_native_closure_identity_follows_the_checkout_record(tmp_path, monkeypatch):
+    """The shim keys on the leg, its <leg>.closure.json and the private providers it names:
+    changing any of them (a rebuild against another staged cuSOLVERMp) is another cache key."""
+    import json as _json
+    import distrib_la.loader as loader_mod
+    leg = tmp_path / "liblorrax_ffi.so"; leg.write_bytes(b"leg-v1")
+    prov = tmp_path / "libcusolverMp.so.0"; prov.write_bytes(b"cusolvermp-0.9.1")
+    monkeypatch.setattr(loader_mod, "loaded_lib_path", lambda platform: str(leg), raising=False)
+
+    def ident():
+        plan_mod.native_closure_identity.cache_clear()
+        return plan_mod.native_closure_identity("CUDA")
+
+    bare = ident()
+    assert bare.startswith(str(leg.resolve()) + ":")
+    rec = tmp_path / "liblorrax_ffi.so.closure.json"
+    rec.write_text(_json.dumps({"schema": 1, "leg": leg.name, "private_libraries": [str(prov)],
+                                "library_dirs": []}))
+    with_rec = ident()
+    assert with_rec != bare
+    prov.write_bytes(b"cusolvermp-0.8")
+    assert ident() != with_rec
+    prov.write_bytes(b"cusolvermp-0.9.1")
+    assert ident() == with_rec                                             # deterministic
+    rec.write_text(_json.dumps({"schema": 1, "leg": leg.name, "private_libraries": [],
+                                "library_dirs": ["/elsewhere"]}))
+    assert ident() not in (bare, with_rec)
+    monkeypatch.setattr(loader_mod, "loaded_lib_path", lambda platform: None, raising=False)
+    plan_mod.native_closure_identity.cache_clear()
+    assert plan_mod.native_closure_identity("CUDA") == "none"
+    plan_mod.native_closure_identity.cache_clear()
