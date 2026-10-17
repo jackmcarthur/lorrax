@@ -211,8 +211,9 @@ def layout(op, backend, n, px, py, dtype="complex128"):
         if backend == "elpa" and op == "eigh":
             from distrib_la import _elpa as E
             side, nb = E.eigh_layout(n, px, dtype)
-            return nb, grid, (f"ELPA {E.SOLVER}-stage side {side}, block-cyclic by relabeling, "
-                              f"pool {E.pool_bytes(side, px, dtype) / 1e9:.2f} GB")
+            return nb, grid, (f"ELPA one-stage side {side}, block-cyclic by relabeling, "
+                              f"pool {E.pool_bytes(side, px, dtype) / 1e9:.2f} GB + rocBLAS "
+                              f"{E.rocblas_bytes(side, px, dtype) / 1e9:.2f} GB")
         if backend == "cusolvermp":
             from distrib_la import _cusolvermp as C
             if op == "eigh":

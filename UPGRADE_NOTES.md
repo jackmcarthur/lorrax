@@ -8,29 +8,37 @@ The binding rulings behind breaking changes are in
 ## 2026-10-17 — ROCm: ELPA is the distributed eigensolver
 
 On Frontier (ROCm), `eigh` with `linalg = "distributed"` above the one-device
-bound (`ONE_DEVICE_MAX_N`, unchanged) now runs ELPA 2026.02.001, one-stage,
-GPU kernels (`backend elpa`), in place of SLATE's `heev`. SLATE stays
-selectable (`backend = "slate"`) and still serves `potrf` and `solve_lu`.
-Measured on 2x2 MI250X GCDs (`ELPA_ROCM_REPORT.md`): complex128 n = 20480 in
-23 s standalone / 26 s through `distributed` (SLATE: 122 s), n = 51200 in
-209 s (SLATE aborts at 30720).  Residual and orthogonality ~1e-14.
+bound (`ONE_DEVICE_MAX_N`, unchanged) now runs ELPA 2026.02.001's one-stage GPU
+solver (`backend elpa`), in place of SLATE's `heev`. SLATE stays selectable
+(`backend = "slate"`) and still serves `potrf` and `solve_lu`. Measured on 2x2
+MI250X GCDs (`ELPA_ROCM_REPORT.md`): complex128 n = 20480 in 26 s through
+`distributed` (SLATE: 122 s), n = 51200 in 211 s (SLATE aborts at 30720).
+Residual and orthogonality ~1e-14.
 
 - **Which results move.** Only runs that diagonalise a matrix above the
   one-device bound on ROCm: eigenvalues and eigenvectors change at rounding
-  level (a different algorithm).  Runs at or below the bound (Fe P=4 among
+  level (a different algorithm). Runs at or below the bound (Fe P=4 among
   them) are bitwise unchanged.
-- **Memory.** ELPA's work arrays are drawn from an XLA-allocated workspace
-  (inside the arena, sized from measured high-waters). Outside the arena ELPA
-  keeps ~0.6 GB per cached handle plus rocBLAS/rocSOLVER transients (to
-  2.75 GB measured at n = 51200 P=4), which can exceed the
-  `DISTRIBUTED_LINALG_OUTSIDE_BYTES` = 3 GB allowance at the largest sizes.
-- **Two-stage** ELPA (`solver = 2`) is selectable only for sides up to 46080
-  on grids of 4x4 and larger: ELPA 2026.02.001's two-stage path returns
-  non-orthogonal eigenvectors there (measured; not yet reported upstream).
+- **Memory.** During the solve, ELPA's device buffers and the workspaces of
+  all of its rocBLAS/rocSOLVER handles come from one XLA workspace (inside the
+  arena, sized from measured high-waters). ELPA's input is the operand's
+  transposed temporary, aliased, so there is no copy. Between calls the
+  handles hold no device memory. Measured at n = 51200 on 2x2, the process's
+  device memory outside the arena peaked at 2.30 GB (allowance
+  `DISTRIBUTED_LINALG_OUTSIDE_BYTES` = 3 GB). If a rocBLAS workspace region is
+  too small, the solve **refuses** with
+  `rocBLAS/rocSOLVER call(s) failed during the solve`; it never returns a
+  result.
+- **Two-stage ELPA is not available.** It was slower everywhere measured and
+  returns wrong eigenvectors on 4x4 grids at n >= 47104. There is no option
+  for it, and an `ELPA_FORCE_*` environment variable makes the solve refuse
+  (ELPA would let it override the pinned settings).
 
 **What a user must change.** Rebuild the ROCm leg with
-`config/frontier/build_ffi_rocm.sh` (it builds ELPA with
-`config/frontier/build_elpa_hip.sh` into a content-keyed prefix on first use). The leg's closure record gains `libelpa_openmp.so.19` (private).
+`config/frontier/build_ffi_rocm.sh`. On first use it builds ELPA with
+`config/frontier/build_elpa_hip.sh` (two LORRAX source patches) into a
+content-keyed prefix. The leg's closure record gains `libelpa_openmp.so.19`
+(private). Unset any `ELPA_FORCE_*` variable.
 
 ## 2026-10-17 — k-convolution kernels: faster mathdx modes 7, 9 and 11 (CUDA); a new native target
 
