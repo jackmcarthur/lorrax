@@ -1805,7 +1805,14 @@ def _attempt_cost(tree, node):
     (size/1000)^3 + 1.96 s + 3.17 s per one-sample node, rms 1.1 s against 1.8
     s for the host form; pool log rcgpu_ab1). Only the planner's balance reads
     it, never a rule.
+
+    A warm node (an earlier map's rule on the same member set) is tried first
+    on that rule's nodes: one projection pass and no pencil when it fits, so
+    it costs 0 here (Fe 8^3 SC maps 1-3: 0.2-0.8 s, against 2.4 s modelled,
+    whose speculation then outlasted the round's needed work by ~3 s).
     """
+    if tree.warm(node):
+        return 0.
     one = len(node) == 1
     if getattr(tree, "pencil", None) is not None:
         return (tree.size(node)/1000.)**3 + 1.9 + (3.0 if one else 0.)
