@@ -52,8 +52,9 @@ def test_room_caps_the_size_route(mesh, rocm, op, n):
     assert resolve_mod.resolve_backend(op, "distributed", mesh, n=n, room=need) == "one_device"
     # One byte short (and the no-room 0 of a whole-mesh caller): the library
     # (no SLATE handler on this host, so the ladder names it).
+    library = {"eigh": "elpa", "solve_lu": "slate"}[op]      # ROCM's distributed library per op
     for room in (need - 1, 0):
-        with pytest.raises((RuntimeError, ValueError), match="slate"):
+        with pytest.raises((RuntimeError, ValueError), match=f"{op} backend '{library}'"):
             resolve_mod.resolve_backend(op, "distributed", mesh, n=n, room=room)
     # An explicit library or the capacity provider is untouched by the room.
     with pytest.raises((RuntimeError, ValueError), match="slate"):
@@ -65,7 +66,7 @@ def test_plan_passes_its_budget_to_the_size_route(mesh, rocm):
     need = od.one_device_bytes("eigh", n)
     p = distrib_la.plan("eigh", mesh, n=n, backend="distributed", budget_bytes=need)
     assert p.backend == "one_device"
-    with pytest.raises((RuntimeError, ValueError), match="slate"):
+    with pytest.raises((RuntimeError, ValueError), match="eigh backend 'elpa'"):
         distrib_la.plan("eigh", mesh, n=n, backend="distributed", budget_bytes=need - 1)
     note = resolve_mod.size_route_note("eigh", "distributed", mesh, n, "slate")
     assert note.endswith("-> slate (one whole matrix over the room)")
