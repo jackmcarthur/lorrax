@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la import loader
+from lxkit import native_provider as _native
 from distrib_la._cyclic import cyclic_to_block, largest_divisor, pad_with_sentinels
 from jax import shard_map
 from distrib_la.resolve import mesh_key, mesh_platform
@@ -89,15 +90,23 @@ def _mesh_platform(mesh: Mesh) -> str:
     return mesh_platform(mesh)
 
 
-def ensure_registered(mesh: Mesh) -> None:
+def ensure_registered(mesh: Mesh, target: str | None = None) -> None:
     """Load + register the FFI library for the MESH's device platform.
 
     ``jax.ffi.ffi_call`` resolves the target registered for the lowering
     platform, so the library that matters is the one matching the mesh's
     devices — not necessarily the default backend (e.g. slate ops on a
     CPU-device mesh inside a GPU-backend process).  Idempotent.
+
+    With ``target``, refuse by name when that handler would run against a
+    SLATE its leg was not built against: the host leg's SLATE handlers in a
+    device process, where the device leg's SLATE answers those SONAMEs
+    (``lxkit.native_provider.refuse_if_borrowed``).
     """
-    loader.get_lib(_mesh_platform(mesh))
+    platform = _mesh_platform(mesh)
+    loader.get_lib(platform)
+    if target is not None:
+        _native.refuse_if_borrowed(platform, target, unusable_cls=loader.LibraryUnusable)
 
 
 def validate_mesh(mesh: Mesh, *, require_square: bool = False) -> Tuple[int, int]:
@@ -348,7 +357,7 @@ def distributed_cholesky(
             f"distributed_cholesky: n={n} must be divisible by both mesh "
             f"axes ({p},{q}).")
 
-    ensure_registered(mesh)
+    ensure_registered(mesh, _POTRF_FFI_TARGET)
     ctx_key = context_key(mesh)
 
     # Default tile size divides by the larger grid axis so each rank
@@ -492,7 +501,7 @@ def distributed_eigh(
         raise ValueError(
             f"distributed_eigh: n={n} must be divisible by mesh axis size {p}.")
 
-    ensure_registered(mesh)
+    ensure_registered(mesh, _EIGH_FFI_TARGET)
     ctx_key = context_key(mesh)
 
     if side is None:
@@ -684,7 +693,7 @@ def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh,
     """
     p, q, nq, n, nb = _lu_geometry(A, mesh, what="solve_lu", block_size=block_size)
     nrhs = _lu_rhs(B, nq, n, q, A.dtype, what="solve_lu")
-    ensure_registered(mesh)
+    ensure_registered(mesh, _SOLVE_LU_TARGET)
     ctx_key = int(context_key(mesh))
     nb_b = nrhs // q
     key = ("slate_lu", mesh_key(mesh), A.dtype, nq, n, nrhs, nb, ctx_key)
@@ -720,7 +729,7 @@ def batched_distributed_getrf(A: jax.Array, *, mesh: Mesh,
     :func:`batched_distributed_getrs` verbatim (same ``block_size``).  ``A`` is donated.
     """
     p, q, nq, n, nb = _lu_geometry(A, mesh, what="getrf", block_size=block_size)
-    ensure_registered(mesh)
+    ensure_registered(mesh, _GETRF_TARGET)
     ctx_key = int(context_key(mesh))
     piv_len = 2 * n
     key = ("slate_getrf", mesh_key(mesh), A.dtype, nq, n, nb, ctx_key)
@@ -757,7 +766,7 @@ def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
         raise ValueError(
             f"slate getrs: piv must be int64 {want} as getrf returned it; "
             f"got {tuple(piv.shape)} {piv.dtype}")
-    ensure_registered(mesh)
+    ensure_registered(mesh, _GETRS_TARGET)
     ctx_key = int(context_key(mesh))
     nb_b = nrhs // q
     key = ("slate_getrs", mesh_key(mesh), LU.dtype, nq, n, nrhs, nb, ctx_key)

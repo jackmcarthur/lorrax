@@ -69,6 +69,15 @@ failed with `status=7`), and the site-default LibSci/HDF5 mapped cray-mpich
   loads another MPI, HDF5, cuBLAS, NCCL, rocBLAS, … beside the recorded one
   (for example an mpi4py built against the site-default MPI), now refuses at
   start-up instead of running.
+- **A host-leg SLATE op refuses in a device process.** There the device leg's
+  SLATE (Frontier: SLATE-HIP with OpenBLAS) answers the SLATE SONAMEs, so the
+  host leg's `lorrax_slate_*` handlers would run against a library they were
+  not built against. They are not registered, and calling one raises
+  `GATE native-closure: host-leg <target> needs SLATE-CPU but the device leg's
+  SLATE serves this process`. Run SLATE ops on the device mesh, or in a
+  CPU-only process. Closures now merge in `dlopen` order, shared by every
+  loader; before this, a process whose two loaders finished their checks in
+  the other order refused at its first batched eigh (Frontier P=16).
 - **Source the site launch script before a multi-node `srun`.**
   `config/perlmutter/gpu_env.sh` now links `libcudart.so`, which libfabric
   dlopens by that name, to the venv's CUDA runtime, first on

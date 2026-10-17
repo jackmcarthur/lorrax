@@ -386,6 +386,10 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
         # time, naming the target.
         if not hasattr(lib, cpp_symbol):
             continue
+        # Another leg's file serves this handler's library in this process:
+        # never registered, refused by name (native_provider.refuse_if_borrowed).
+        if _native.borrowed_families(platform, target_name):
+            continue
         try:
             jax.ffi.register_ffi_target(
                 target_name, jax.ffi.pycapsule(getattr(lib, cpp_symbol)),
@@ -652,6 +656,9 @@ def probe_target(target_name: str, platform: str):
             hint=(f"{spec['env']} selects the .so; LD_LIBRARY_PATH must "
                   f"cover every library that .so needs (run `ldd <so>` to "
                   f"see which are missing)."))
+    borrowed = _native.borrowed_reason(platform, target_name)
+    if borrowed:
+        return ProbeResult(False, borrowed)
     if not hasattr(lib, sym):
         return missing_symbol(target_name, sym, _LIB_PATHS.get(platform, "?"),
                               build_hint=spec["build_hint"])

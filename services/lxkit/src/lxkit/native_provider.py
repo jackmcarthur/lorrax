@@ -71,7 +71,7 @@ __all__ = [
     "read_checkout_closure", "resolve_closure",
     "assert_one_mapped_mpi_runtime", "check_abi", "checkout_build_dir",
     "describe_library",
-    "check_launch_libraries", "is_private_redistributable", "locate_library", "open_and_attest",
+    "borrowed_families", "borrowed_reason", "check_launch_libraries", "families_served_elsewhere", "is_private_redistributable", "refuse_if_borrowed", "TARGET_FAMILIES", "locate_library", "open_and_attest",
     "refuse_private_library",
 ]
 
@@ -1089,15 +1089,32 @@ class _Enforced:
     record: ClosureRecord
     identity: str
     verified: Mapping[str, tuple[Path, str]] = None    # type: ignore[assignment]
+    #: family -> the leg whose recorded file serves it in this process
+    #: (:data:`_DEVICE_LEG_WINS`): this leg's code linked against its own.
+    served_elsewhere: Mapping[str, Path] = None        # type: ignore[assignment]
 
 
 _ENFORCED: dict[Path, _Enforced] = {}          # resolved leg -> enforcement
 _PLATFORM_LEG: dict[str, Path] = {}            # platform -> resolved leg
 _REVERIFIED: list[bool] = [False]
+#: Every leg in the order its ``dlopen`` succeeded, appended at that moment by
+#: :func:`open_and_attest`, whichever loader (``ffi.common.ffi_loader``,
+#: ``distrib_la.loader``) asked.  The SONAME a library answers for belongs to
+#: the first object mapped under it, so this, not the order in which
+#: enforcements finished (a leg can be dlopened, refused, and enforced on a
+#: later call, after a leg opened behind it), is the order closures merge in.
+_DLOPEN_ORDER: list[Path] = []
+
+
+def _in_dlopen_order(records: Sequence[ClosureRecord]) -> list[ClosureRecord]:
+    """``records`` in dlopen order; a leg not yet dlopened goes last (it is
+    the one being opened)."""
+    pos = {leg: i for i, leg in enumerate(_DLOPEN_ORDER)}
+    return sorted(records, key=lambda r: pos.get(r.leg, len(pos)))
 
 
 def _enforced_records() -> list[ClosureRecord]:
-    return [e.record for e in _ENFORCED.values()]   # insertion = load order
+    return _in_dlopen_order([e.record for e in _ENFORCED.values()])
 
 
 def _preload_closure(record: ClosureRecord, unusable_cls: Type[OSError]) -> None:
@@ -1107,7 +1124,7 @@ def _preload_closure(record: ClosureRecord, unusable_cls: Type[OSError]) -> None
     key = f"closure:{record.leg}"
     if key in _PRIVATE_HANDLES:
         return
-    _merge_expectations([*_enforced_records(), record], unusable_cls)
+    _merge_expectations(_in_dlopen_order([*_enforced_records(), record]), unusable_cls)
     prior = _merge_expectations(_enforced_records(), unusable_cls)
     handles: list[ctypes.CDLL] = []
     for e in record.entries:
@@ -1133,12 +1150,78 @@ def _enforce(record: ClosureRecord, unusable_cls: Type[OSError],
     if not mapped:
         raise _gate(unusable_cls, "an unreadable /proc/self/maps",
                     "the process's mapped objects", "run on a Linux kernel with /proc")
-    records = [r for r in _enforced_records() if r.leg != record.leg] + [record]
+    records = _in_dlopen_order(
+        [r for r in _enforced_records() if r.leg != record.leg] + [record])
     verified = check_closure_mapping(records, mapped, unusable_cls=unusable_cls,
                                      build_hint=build_hint)
     mine = {e.family for e in record.entries}
+    owners = _merge_expectations(records, unusable_cls)
+    # Served elsewhere = another leg's DIFFERENT file answers the family (a
+    # family both legs record as the same bytes, MPI or HDF5, is not borrowed).
+    served = {e.family: owners[e.family][1].leg for e in record.entries
+              if e.family in owners and owners[e.family][1].leg != record.leg
+              and owners[e.family][0].sha256 != e.sha256}
     return _Enforced(record=record, identity=_record_identity(record, verified),
-                     verified={f: v for f, v in verified.items() if f in mine})
+                     verified={f: v for f, v in verified.items() if f in mine},
+                     served_elsewhere=served)
+
+
+#: Host-leg FFI targets (by name prefix) -> the recorded families their code
+#: links.  Measured on the object files, not assumed: in the host build only
+#: ``slate/host_ffi.cc.o`` (the ``Slate*HostFfi`` handlers) references a
+#: ``slate::``, ``blas::`` or ``lapack::`` symbol (``nm -C -u``); the
+#: ``lrx_slate_*`` context entries (``slate/context.cc``) are MPI only, and the
+#: ScaLAPACK/CBLAS/FFTW/phdf5 handlers use none of these families.
+TARGET_FAMILIES: Mapping[str, tuple[str, ...]] = {
+    "lorrax_slate_": ("libslate", "libblaspp", "liblapackpp"),
+}
+
+
+def families_served_elsewhere(platform: str) -> dict[str, Path]:
+    """family -> the other leg whose recorded file serves it, for ``platform``'s
+    enforced leg (empty when that leg is not open or serves all its own)."""
+    leg = _PLATFORM_LEG.get(platform)
+    enforced = _ENFORCED.get(leg) if leg is not None else None
+    return dict((enforced.served_elsewhere or {}) if enforced is not None else {})
+
+
+def borrowed_families(platform: str, target: str) -> dict[str, Path]:
+    """The families ``target`` (an FFI target or C entry of ``platform``'s leg)
+    links that another leg's file serves in this process: non-empty means the
+    code would run against a library it was not built against."""
+    needs = {f for prefix, fams in TARGET_FAMILIES.items() if target.startswith(prefix)
+             for f in fams}
+    served = families_served_elsewhere(platform)
+    return {f: served[f] for f in sorted(needs) if f in served}
+
+
+def borrowed_reason(platform: str, target: str) -> str:
+    """The refusal for ``target`` when :func:`borrowed_families` is non-empty, else ''."""
+    hit = borrowed_families(platform, target)
+    if not hit:
+        return ""
+    own_leg = _PLATFORM_LEG.get(platform)
+    built = {e.family: e.path for e in _ENFORCED[own_leg].record.entries}
+    owner = next(iter(hit.values()))
+    owner_name = next((p for p, leg in _PLATFORM_LEG.items() if leg == owner), "device")
+    serving = {f: (_ENFORCED[owner].verified or {}).get(f, (owner, ""))[0] for f in hit}
+    stack = "SLATE-CPU" if set(hit) <= _DEVICE_LEG_WINS else "/".join(sorted(hit))
+    who = "host" if platform == HOST.key else platform
+    return (f"GATE native-closure: {who}-leg {target} needs {stack} but the device leg's "
+            f"SLATE serves this process ({owner_name} leg: "
+            + ", ".join(f"{f}={serving[f]}" for f in hit)
+            + "; built against " + ", ".join(f"{f}={built.get(f)}" for f in hit)
+            + f"); want: {target} only where its own leg's {stack} is mapped (a CPU-platform "
+            f"process); fix: run the op on the {owner_name} mesh, or in a CPU-only process")
+
+
+def refuse_if_borrowed(platform: str, target: str, *,
+                       unusable_cls: Type[OSError] = LibraryUnusable) -> None:
+    """Raise when ``target`` would run against a library its leg was not built
+    against (:func:`borrowed_families`).  Never silent, never a fallback."""
+    reason = borrowed_reason(platform, target)
+    if reason:
+        raise unusable_cls(reason)
 
 
 def check_launch_libraries(names: Sequence[str], ld_library_path: str, *,
@@ -1442,6 +1525,8 @@ def open_and_attest(
     _preload_closure(record, unusable_cls)
     try:
         lib = ctypes.CDLL(str(selected), mode=ctypes.RTLD_GLOBAL)
+        if selected not in _DLOPEN_ORDER:
+            _DLOPEN_ORDER.append(selected)
     except OSError as exc:
         raise unusable_cls(
             f"{selected} exists but could not be loaded: {exc}.  This is a "
