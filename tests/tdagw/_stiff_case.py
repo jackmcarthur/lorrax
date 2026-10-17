@@ -12,7 +12,8 @@ line (RESULT ...): the gate receipts and probes of the plain and split
 schemes, runs at the same steps (P(t) against a 10 as plain cfm4
 reference), 'auto' steps, the zero-basis run (Pi = 0: the split path with u
 = b = 0) against the plain run, the closing-solve red twin (tolerance
-unreachable, probe bypassed) and the parser's refusals.
+unreachable, probe bypassed), the parser's refusals, and a split run resumed
+from its first chunk's checkpoint against the uninterrupted one.
 """
 import json
 import os
@@ -49,7 +50,7 @@ def stiff_window():
 
 
 def deck(outdir, header, kernel, nb, n_val, *, dt, n_corr=2, stiff=0, tol=1e-9, it=6,
-         tf=6000.0, method="cfm4", e0=2e8):
+         tf=6000.0, method="cfm4", e0=2e8, resume=""):
     trial = vs.trial_for(e0, 2.2, 2500.0, 700.0, "x")
     lorrax = {"method": method, "n_corr": int(n_corr), "intraband": False, "trials": [trial],
               "kernel_file": str(kernel), "model": "tdgw_kernel", "dt": dt}
@@ -59,7 +60,8 @@ def deck(outdir, header, kernel, nb, n_val, *, dt, n_corr=2, stiff=0, tol=1e-9, 
                         "timesteps": {"t0": 0, "tf": float(tf), "dt_measure": 100.0,
                                       "ntcheck": 20},
                         "ivp": {"rtol": 1e-10, "atol": 1e-14},
-                        "files": {"outdir": str(outdir), "load_header_from": str(header)}},
+                        "files": {"outdir": str(outdir), "load_header_from": str(header),
+                                  "load_checkpoint_from": str(resume)}},
             "system": {"ibndmin": 1, "ibndmax": nb, "ivbm": int(n_val), "geometry": "slab"},
             "measurements": {"types": ["polarization", "carrier_density"]}, "lorrax": lorrax}
 
@@ -147,6 +149,15 @@ def main():
     for key in ("unreachable_tol",):
         out[key].pop("log", None)
     out["bad_method"] = run("bad_method", dt=50.0, stiff=4, method="rk4")
+    # restart: the split carry (slow and coefficient histories, counters) checkpointed after the first
+    # chunk and resumed continues bitwise
+    full = run("rs_full", dt=50.0, stiff=4)
+    run("rs_head", dt=50.0, stiff=4, tf=2000.0)
+    tail = run("rs_tail", dt=50.0, stiff=4, resume=os.path.join(root, "rs_head"))
+    out["restart"] = dict(bitwise=bool(np.array_equal(full["p"], tail["p"]) and
+                                       np.array_equal(full["n_c"], tail["n_c"])),
+                          max_abs=float(np.max(np.abs(full["p"] - tail["p"]))),
+                          fast_tail=tail["fast"], n=int(len(tail["p"])))
     print("RESULT " + json.dumps(out, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o)),
           flush=True)
 

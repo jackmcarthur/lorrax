@@ -20,6 +20,8 @@ G4 through stages, gate active: the plain cfm4 refuses 100 as (sigma test);
    reference and fourth order between 100 and 50 as; dt = 'auto' of the split
    is >= 2.5 x the plain one, each with its probe passed
 G5 the zero-basis split through stages matches the plain run to rounding
+G6 a split run resumed from its first chunk's checkpoint (the carry: slow and
+   coefficient histories, closing-solve counters) continues bitwise
 R1 an unreachable closing tolerance (probe bypassed) refuses by name
    (td_stiff_solve) at a chunk end, before its samples are written
 R2 stiff_modes with a method other than cfm4 refuses at the deck (td_stiff_method)
@@ -183,3 +185,9 @@ def test_red_twin_unreachable_tolerance_refuses(stages_case):
 def test_red_twin_wrong_method_refuses(stages_case):
     """R2: stiff_modes needs cfm4."""
     assert stages_case["bad_method"].get("refused") == "GATE td_stiff_method", stages_case["bad_method"]
+
+
+def test_split_restart_is_bitwise(stages_case):
+    """G6: checkpoint after the first chunk, resume, compare with the uninterrupted run."""
+    r = stages_case["restart"]
+    assert r["bitwise"] and r["fast_tail"]["unconverged"] == 0, r
