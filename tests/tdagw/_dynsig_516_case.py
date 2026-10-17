@@ -322,7 +322,7 @@ def main():
         as_ = 41.341374575751 / 1000.0                    # a.u. per as
         dt, n_sub, n_meas = 20 * as_, 5, 60               # 20 as steps, 6 fs
         cfg_p = tp.PropagatorConfig(method="rk4", t0=0.0, tf=dt * n_sub * (n_meas - 1),
-                                    dt_measure=dt * n_sub, dt=dt, n_sub=n_sub, n_corr=1, atol=1e-10,
+                                    dt_measure=dt * n_sub, dt=dt, n_corr=1, atol=1e-10,
                                     rtol=1e-8, max_step=np.inf, chunk=n_meas, remainder=False)
         spec = tp.SampleSpec(kinds=(("polarization", "polarization", ()),))
         e0 = 5e8 / 5.14220674763e11                       # 5e8 V/m in a.u.

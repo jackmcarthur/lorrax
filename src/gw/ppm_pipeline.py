@@ -46,7 +46,8 @@ from .gw_config import LorraxConfig
 from .head_correction import HeadResolver
 from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
-    fit_ppm,
+    fit_pole_model,
+    pole_fit_plan,
 )
 from runtime.padding import PaddedAxis
 
@@ -807,12 +808,13 @@ def compute_ppm_sigma_pipeline(
         else:
             fit_inputs = (W0_op.unfold(mesh_xy), Wp_op.unfold(mesh_xy), V_op.unfold(mesh_xy))
             wedge_kw = {}
-        ppm = fit_ppm(
-            *fit_inputs, probe_omega, mesh_xy,
-            **wedge_kw,
+        # The fit's plan and the fit are the TD-aGW screening update's too
+        # (``ppm_sigma.screening_update``, docs/theory/td_agw_dynamical.md Eq. 6).
+        fit_plan = pole_fit_plan(
+            fit_inputs[2], probe_omega, mesh_xy,
+            wedge=wedge_kw,
             fallback_omega=config.ppm.fallback_omega,
             n_nodes_static=quad.node_count,
-            print_fn=print_fn,
             model_label=label,
             n_mu_logical=int(meta.n_rmu),
             mu_active_mask=getattr(meta, 'mu_active_mask', None),
@@ -822,8 +824,10 @@ def compute_ppm_sigma_pipeline(
             # support.  This is lossy versus BGW finite-pole parity; HL is a
             # different real-axis model and is deliberately unchanged.
             coarsen_extreme_tails=not is_hl,
-            ordered_orientations=ordered,
+            ordered=ordered,
+            solve_extent=int(getattr(meta, 'mu_solve_extent', meta.n_rmu)),
         )
+        ppm = fit_pole_model(fit_inputs[0], fit_inputs[1], fit_plan, print_fn=print_fn)
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)
         #

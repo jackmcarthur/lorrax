@@ -320,7 +320,7 @@ def _pulse_checks(mesh, td, dyn, e, kf, rho_eq, rho_eq_h, nk, p, rng):
     ops, nk_pad = tp.place_operators(host, mesh)
     dt, n_sub, n_meas = 1.0, 4, 40                       # a.u.
     cfg = tp.PropagatorConfig(method="rk4", t0=0.0, tf=dt * n_sub * (n_meas - 1),
-                              dt_measure=dt * n_sub, dt=dt, n_sub=n_sub, n_corr=1, atol=1e-10,
+                              dt_measure=dt * n_sub, dt=dt, n_corr=1, atol=1e-10,
                               rtol=1e-8, max_step=np.inf, chunk=n_meas, remainder=False)
     spec = tp.SampleSpec(kinds=(("polarization", "polarization", ()),))
     rho0 = tp.place_state(rho_eq_h[None], mesh)

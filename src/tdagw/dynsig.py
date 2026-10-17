@@ -67,8 +67,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from distrib_la import eigh_local
 
 __all__ = ["DynsigKernels", "assemble_dynsig_bundle", "check_state", "chi0_split", "split_bundle",
-           "dynamic_correction", "dynsig_model", "equilibrium_sigma", "instantaneous_basis",
-           "literal_sx", "make_dynsig_kernels", "screened_update", "static_rule"]
+           "dynamic_correction", "dynsig_model", "equilibrium_sigma", "exchange_sigma",
+           "instantaneous_basis", "literal_sx", "make_dynsig_kernels", "probe_rule",
+           "screened_update", "static_rule"]
 
 GREEN_SPEC = P(None, "x", None, "y", None)        # (k, mu, s, nu, t)
 CHI_SPEC = P(None, "x", "y")                      # (q, mu, nu)
@@ -288,13 +289,39 @@ def _weights(e, f, x_sep, tau, live):
 # chi0 at omega = 0 with the frozen / active split
 # ===========================================================================
 
-def chi0_split(dyn: dict, kern: DynsigKernels):
+def probe_rule(rule: dict, omega_p: float, *, target_error: float, ordered: bool = True) -> dict:
+    """The GW run's chi0(i omega_p) rule on the static rule's interval, Ry.
+
+    ``gw.minimax_screening.build_imag_probe_response_rule`` (the GN-PPM probe
+    of ``gw.screening.compute_screening``): sum_l alpha_l e^{-tau_l x} ~
+    x/(x^2 + w^2) and, ``ordered``, sum_l beta_l e^{-tau_l x} ~ w/(x^2 + w^2) on
+    the same times (docs/theory/gn-ppm-nonhermitian.md §2).  Returns
+    ``dict(tau, alpha, beta, omega_p, max_error, provenance)``.
+    """
+    from types import SimpleNamespace
+    from gw.minimax_screening import build_imag_probe_response_rule
+    q = build_imag_probe_response_rule(
+        SimpleNamespace(x_min=float(rule["x_min"]), x_max=float(rule["x_max"])), float(omega_p),
+        SimpleNamespace(target_error=float(target_error)), with_odd_kernel=bool(ordered))
+    beta = np.zeros_like(np.asarray(q.tau)) if q.alpha_odd is None else np.asarray(q.alpha_odd)
+    return dict(tau=np.asarray(q.tau), alpha=np.asarray(q.alpha), beta=beta,
+                omega_p=float(omega_p), max_error=float(q.max_error), provenance=q.provenance)
+
+
+def chi0_split(dyn: dict, kern: DynsigKernels, rule: dict | None = None):
     """chi0^ff, chi0^fa, chi0^aa at equilibrium on the run's rule, (nq, mu, nu) each, Ry^-1.
 
-    chi0_q = (g_s / N_k) sum_k sum_ab (f_a - f_b)/(E_a - E_b) rho_ab(mu) rho_ab*(nu)
+    chi0_q(z) = (g_s / N_k) sum_k sum_ab (f_a - f_b)/(E_a - E_b - z) rho_ab(mu) rho_ab*(nu)
     on the Laplace rule; G_frozen and G_active(0) are separate Green tiles at each
     node (the t = 0 consistency check of the design page: their sum must be
-    the run's chi0).  Returns a dict with the three terms.
+    the run's chi0).  ``rule=None`` is the static support z = 0 (the bundle's
+    rule).  An imaginary-axis support z = i omega_p (:func:`probe_rule`) weights
+    each node by alpha_l - i beta_l, so the R-space sum is -2 Re[sum_l (alpha_l -
+    i beta_l) G^h * G^p*] and keeps the time-reversal-odd channel of a magnet:
+    the ordered chi0(i omega_p) of ``gw.w_isdf.compute_chi0_imag_ordered``
+    (docs/theory/gn-ppm-nonhermitian.md §2), whose orientation the formula above
+    states (tests/test_tdagw_dynsig_sigma.py G0-G2; the conjugate orientation
+    is red twin R0).  Returns a dict with the three terms.
     """
     nk, mesh = int(np.prod(kern.kgrid)), kern.mesh
     b_lo, nA = dyn["band_lo"], dyn["n_active"]
@@ -302,6 +329,12 @@ def chi0_split(dyn: dict, kern: DynsigKernels):
     e, f, live = dyn["e_full"], dyn["f_full"], dyn["live"]
     x_sep = jnp.asarray(dyn["rule"]["e_sep"])
     psi_X, psi_Y = dyn["psi_X"], dyn["psi_Y"]
+    if rule is None:
+        taus, weights = dyn["tau"], dyn["alpha"]
+    else:
+        taus = jnp.asarray(np.asarray(rule["tau"], np.float64))
+        weights = jnp.asarray(np.asarray(rule["alpha"], np.float64)
+                              - 1j * np.asarray(rule["beta"], np.float64))
 
     def body(acc, node):
         tau, alpha = node
@@ -314,7 +347,7 @@ def chi0_split(dyn: dict, kern: DynsigKernels):
         return tuple(a + alpha * p for a, p in zip(acc, (ff, fa, aa))), None
 
     zero = _chi_zero(mesh, nk, dyn["nmu_pad"])
-    acc, _ = lax.scan(body, (zero, zero, zero), (dyn["tau"], dyn["alpha"]), unroll=1)
+    acc, _ = lax.scan(body, (zero, zero, zero), (taus, weights), unroll=1)
     scale = -2.0 * dyn["g_s"] / np.sqrt(nk)
     return {name: kern.c_fft(scale * jnp.real(a).astype(jnp.complex128))
             for name, a in zip(("ff", "fa", "aa"), acc)}
@@ -545,6 +578,30 @@ def equilibrium_sigma(dyn: dict, kern: DynsigKernels, W_q, *, heads=None):
         sx = sx - (w_h / (omega * nk)) * _band_diag(f)
         coh = coh + ((w_h - v_h) / (2.0 * omega * nk)) * jnp.eye(nA)[None]
     return sx, coh
+
+
+def exchange_sigma(dyn: dict, kern: DynsigKernels, x, *, heads=None):
+    """Sigma^x[rho] = -w_term[V](rho_tot) on the window, (nk, nA, nA) Ry.
+
+    The bare exchange of Eq. (1) of docs/theory/td_agw_dynamical.md with the
+    full equal-time G^< = rho (coherences kept, §1.1): rho_tot = diag(f_frozen)
+    (+) (diag f_eq + x) on the window, x = drho (nk, nA, nA) in the model's k
+    order.  ``heads = (w_h, v_h, cell_volume)`` adds the q -> 0 term
+    -v_h rho/(Omega N_k) of the window (the bare head; ``equilibrium_sigma``'s
+    screened one is -w_h f/(Omega N_k)).
+    """
+    if dyn["V_q"] is None:
+        _refuse("dynsig_exchange_needs_v", "V_q = None", "the run's bare V",
+                "pass V_q to assemble_dynsig_bundle")
+    nk = int(np.prod(kern.kgrid))
+    b_lo, nA = dyn["band_lo"], dyn["n_active"]
+    rho = x + _band_diag(dyn["f_full"][:, b_lo:b_lo + nA])
+    f_frozen = dyn["f_full"].at[:, b_lo:b_lo + nA].set(0.0)
+    sx = -_sigma_window(dyn, kern, rho, f_frozen, _w_R(dyn["V_q"], kern))
+    if heads is not None:
+        _, v_h, omega = (float(v) for v in heads)
+        sx = sx - (v_h / (omega * nk)) * rho
+    return sx
 
 
 def literal_sx(dyn: dict, kern: DynsigKernels, x, W_R, *, h=None, coherences: bool = True):

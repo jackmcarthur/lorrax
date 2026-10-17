@@ -948,6 +948,95 @@ def fit_ppm(
 
 
 # ---------------------------------------------------------------------------
+#  The held pole-fit plan and the screening update.  The GW driver
+#  (``ppm_pipeline.compute_ppm_sigma_pipeline``) and the TD-aGW refresh
+#  (docs/theory/td_agw_dynamical.md Eq. 6) run ONE fit: :func:`fit_pole_model`.
+# ---------------------------------------------------------------------------
+
+def pole_fit_plan(V_q, probe_omega, mesh_xy, *, n_mu_logical: int, fallback_omega: float,
+                  ordered: bool, coarsen_extreme_tails: bool, q_neg_index=None,
+                  mu_active_mask=None, wedge=None, n_nodes_static: int = 0,
+                  model_label: str = "GN-PPM", solve_extent: int | None = None) -> dict:
+    """Everything the two-point fit reads except its two W samples, held for a run.
+
+    Parameters
+    ----------
+    V_q : (nq, mu, mu) at ``P(None, 'x', 'y')``, Ry — the bare V on the fit's q
+        set (the wedge rows for a wedge fit; the full zone otherwise).
+    probe_omega : the second support, ``1j * omega_p`` (GN) or ``omega_p`` (HL), Ry.
+    n_mu_logical, fallback_omega, ordered, coarsen_extreme_tails, q_neg_index,
+    mu_active_mask, n_nodes_static, model_label : :func:`fit_ppm`'s options
+        (``ordered`` = ``ordered_orientations``: a measured-broken-TR deck).
+    wedge : ``dict(q_star=, q_partner=, q_wedge=)`` of a wedge fit, None for the
+        full zone (a general TD drive breaks the point group: full zone).
+    solve_extent : the centroid extent the Dyson solves of
+        :func:`screening_update` run at, ``meta.mu_solve_extent`` (the whole
+        packed carrier when the run's pads interleave per shard); default
+        ``n_mu_logical`` (a canonical, suffix-padded carrier).
+
+    Returns a plain dict: ``V_q``, ``probe_omega``, ``mesh_xy``, the centroid
+    carrier ``axis`` of the Dyson solves (:func:`screening_update`) and the
+    fit's keyword arguments ``fit``.
+    """
+    from runtime.padding import padded_mu_axis
+    return dict(
+        V_q=V_q, probe_omega=complex(probe_omega), mesh_xy=mesh_xy,
+        axis=padded_mu_axis(int(n_mu_logical if solve_extent is None else solve_extent),
+                            mesh_xy),
+        fit=dict(fallback_omega=float(fallback_omega), n_nodes_static=int(n_nodes_static),
+                 model_label=str(model_label), n_mu_logical=int(n_mu_logical),
+                 mu_active_mask=mu_active_mask, q_neg_index=q_neg_index,
+                 coarsen_extreme_tails=bool(coarsen_extreme_tails),
+                 ordered_orientations=bool(ordered), **dict(wedge or {})))
+
+
+def fit_pole_model(W_static_q, W_probe_q, plan: dict, *, print_fn=None) -> PPMBuildResult:
+    """The pole model of W sampled at the plan's two supports, 0 and ``probe_omega``.
+
+    :func:`fit_ppm` on ``(W_static_q, W_probe_q, plan['V_q'])``: per element
+    ``(q, mu, nu)`` the pole Omega, the even residue B = (R_+ + R_-)/2 and, on an
+    ordered plan, the odd residue D = (R_+ - R_-)/2
+    (docs/theory/gn-ppm-nonhermitian.md §3).  Shapes and sharding are the
+    inputs': (nq, mu, mu) at ``P(None, 'x', 'y')``, Ry.
+    """
+    return fit_ppm(W_static_q, W_probe_q, plan["V_q"], plan["probe_omega"], plan["mesh_xy"],
+                   print_fn=print_fn, **plan["fit"])
+
+
+def screening_update(W0_at_supports, dchi_at_supports, plan: dict, *, print_fn=None):
+    """W(z_s, t) = [1 - W0(z_s) dchi0(z_s, t)]^-1 W0(z_s) at both supports, then the pole fit.
+
+    docs/theory/td_agw_dynamical.md Eq. (6): ``gw.w_isdf.solve_w``'s Dyson
+    solve with the run's W0 in the place of v (``meta=None``, ``pref = 1``:
+    dchi0 is physical, Ry^-1), followed by :func:`fit_pole_model`, the fit the
+    GW driver runs.  No file is read or written; nothing is re-planned.
+
+    Parameters
+    ----------
+    W0_at_supports : (W0(0), W0(probe)) — the held screened interactions, each
+        (nq, mu, mu) at ``P(None, 'x', 'y')``, Ry, on the plan's q set.
+    dchi_at_supports : (dchi0(0), dchi0(probe)), same layout, Ry^-1.  DONATED
+        to the solves.  With V in W0's place and the full chi0 in dchi0's, this
+        is the GW run's own screening at the two supports.
+    plan : :func:`pole_fit_plan`.
+
+    Returns
+    -------
+    (poles, W) : the :class:`PPMBuildResult` (Omega_q, B_q, B_odd_q, valid_mask_q,
+        Wc0_q) and the tuple (W(0, t), W(probe, t)).
+    """
+    from .w_isdf import solve_w
+    W0s, dchis = tuple(W0_at_supports), tuple(dchi_at_supports)
+    if len(W0s) != 2 or len(dchis) != 2:
+        raise ValueError("GATE screening_update_supports: got "
+                         f"{len(W0s)} W0 and {len(dchis)} dchi0 samples; want the two "
+                         "supports 0 and probe_omega; fix: pass one of each, in that order")
+    W = tuple(solve_w(w0, dchi, None, plan["mesh_xy"], pref=1.0, axis=plan["axis"])
+              for w0, dchi in zip(W0s, dchis))
+    return fit_pole_model(W[0], W[1], plan, print_fn=print_fn), W
+
+
+# ---------------------------------------------------------------------------
 #  Sigma convolution — the device-side τ loop.  Its host-side counterpart
 #  (window construction) lives in ppm_windows; the two halves share no state
 #  beyond the window list itself.
@@ -1225,9 +1314,20 @@ def compute_sigma_c_ppm_omega_grid(
     plan: 'BandBracketPlan | None' = None,
     fixed_quadrature_session=None,
     on_shell_for=None,
+    populations=None,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
+
+    ``populations`` ``(nk, nb_full)`` real, on ``wfns``' bands (``slices.full``):
+    the band populations of a non-equilibrium state of the gapped system
+    (TD-aGW's instantaneous window, docs/theory/td_agw_dynamical.md Eq. 3; the
+    frozen bands carry their step occupations).  The causal branches then
+    carry the weights f (valence) and 1 - f (conduction) on unclipped
+    energies, as ``gw.mpa.sigma._branches`` does with an occupation state, and
+    the invalid-pole static term's occupied projector is diag(f).  ``None`` is
+    the incumbent 0/1 step split, bit-for-bit.  The step table ``wfns.occ``
+    still fixes the gap check and the omega frame.
 
     The PPM fit remains the two-point algebra in :func:`fit_ppm`.  This stage
     applies the established invalid-pole policy, hands that result to the
@@ -1315,6 +1415,13 @@ def compute_sigma_c_ppm_omega_grid(
 
     sigma_static_host = None
     static_coh_at_counts = None
+    if populations is not None:
+        if occupation_state is not None:
+            raise ValueError(
+                "GATE ppm_sigma_populations: got both an occupation state and band "
+                "populations; want one occupation source; fix: pass populations only "
+                "(a GN/HL-PPM deck carries no metallic occupation state)")
+        occupation_state = _population_state(populations, meta, enk_full.shape)
     if invalid_static and n_invalid:
         sigma_static_host = _compute_invalid_static_sigma(
             wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
@@ -1364,12 +1471,15 @@ def compute_sigma_c_ppm_omega_grid(
         omega_req = request.frequencies_ry
         print_fn(f"  Sigma_c on shell: {request.n_table} energy table(s) "
                  f"{request.names}, {omega_req.size} distinct frequencies")
-    branches = branches_for_omega_grid(
-        omega_req,
-        E_cond=state.E_cond,
-        H_val=state.H_val,
-        cond_mask=state.cond_mask,
-        val_mask=state.val_mask)
+    if populations is None:
+        branches = branches_for_omega_grid(
+            omega_req,
+            E_cond=state.E_cond,
+            H_val=state.H_val,
+            cond_mask=state.cond_mask,
+            val_mask=state.val_mask)
+    else:
+        branches = _population_branches(omega_req, enk_full, state.efermi, populations)
     result = compute_sigma_c_mpa_omega_grid(
         wfns, poles, meta, mesh_xy,
         omega_grid_ry=omega_req,
@@ -1408,3 +1518,246 @@ def compute_sigma_c_ppm_omega_grid(
         static_coh_at_counts=static_coh_at_counts,
         odd_even_residue_ratio=ppm.odd_even_residue_ratio,
         efermi_ry=efermi_ry)
+
+
+# ---------------------------------------------------------------------------
+#  Band populations of a non-equilibrium state, and the Σ τ sweep on a window
+#  (TD-aGW, docs/theory/td_agw_dynamical.md §1.2-1.4 and §9 item 5)
+# ---------------------------------------------------------------------------
+
+def _population_state(populations, meta, shape):
+    """The occupation projector's duck-typed state for band populations ``f`` (nk, nb).
+
+    ``gw.cohsex_sigma.build_Gij`` reads ``f_kn`` and ``n_electrons`` (capacity
+    weighted); the count is the populations' own, so the projector refuses a
+    population outside the Sigma window (its Hartree-density guard).
+    """
+    from types import SimpleNamespace
+    from .cohsex_sigma import _spin_capacity
+    f = np.asarray(jax.device_get(populations), dtype=np.float64)
+    if f.shape != tuple(shape):
+        raise ValueError(f"GATE ppm_sigma_population_shape: got {f.shape}; want {tuple(shape)} "
+                         "(the wfns' full band table); fix: pass every band's population")
+    return SimpleNamespace(f_kn=f, n_electrons=_spin_capacity(meta) * float(np.sum(f))
+                           / float(meta.nk_tot))
+
+
+def _population_branches(omega_ry, enk_full, efermi, populations):
+    """Causal branches of band populations: valence weight f, conduction 1 - f, energies unclipped.
+
+    ``gw.mpa.sigma._branches``' occupation-state form on the PPM frame
+    ``efermi``: a hole in a valence band sits on the conduction branch at its
+    own (negative) energy, which the step split's clipped ``E_cond`` could not
+    represent.
+    """
+    f = jnp.asarray(populations, dtype=jnp.float64)
+    energy = jnp.asarray(enk_full, dtype=jnp.float64) - efermi
+    return branches_for_omega_grid(
+        omega_ry, E_cond=energy, H_val=-energy, cond_mask=(f != 1.0), val_mask=(f != 0.0),
+        cond_weight=1.0 - f, val_weight=f)
+
+
+def window_sigma_plan(config, *, head=None, session=None, frequencies_abs_ry=None) -> dict:
+    """The held plan of :func:`window_sigma_c` from a GW run's config.
+
+    ``head``: the run's ``head_correction.HeadSigmaDiag`` (frozen q -> 0 head,
+    evaluated at the instantaneous energies and populations), or None.
+    ``session``: the fixed quadrature session dict (``mpa.sigma``'s
+    ``fixed_quadrature_session``: rules fitted once and reused while the
+    windows stay inside their padded boxes), or None (a one-shot plan, as the
+    GW run's).  ``frequencies_abs_ry``: absolute frequencies (Ry) the windows
+    are planned on in addition to the window's own energies (the GW run's
+    on-shell list reproduces its window plan exactly), or None.
+    """
+    return dict(ppm_cfg=config.ppm, sigma_cfg=config.sigma, mpa_cfg=config.mpa,
+                ansatz=config.compute_mode, screening_diagrams=config.screening.diagrams,
+                omega_grid_ry=np.asarray(config.omega_grid_ry, np.float64),
+                omega_range_ev=np.asarray(config.omega_grid_ev, np.float64),
+                out_of_grid=config.sigma.out_of_grid, head=head, session=session,
+                frequencies_abs_ry=(None if frequencies_abs_ry is None else
+                                    np.asarray(frequencies_abs_ry, np.float64)))
+
+
+@lru_cache(maxsize=8)
+def _window_rotation_fn(b_lo, n_a, nmu_sharding, mun_sharding, full_nmu, full_mun):
+    """psi_A -> psi_A U on both faces, every other band untouched (Eq. 2)."""
+    win = slice(int(b_lo), int(b_lo) + int(n_a))
+
+    def rotate(psi_nmu, psi_mun, U, keep):
+        keep_n = keep.astype(psi_nmu.dtype)
+        rot_n = jnp.einsum("kmsu,kmi->kisu", psi_nmu[:, win], U.astype(psi_nmu.dtype))
+        rot_m = jnp.einsum("ksum,kmi->ksui", psi_mun[..., win], U.astype(psi_mun.dtype))
+        psi_nmu = (psi_nmu * keep_n[None, :, None, None]).at[:, win].set(rot_n)
+        psi_mun = (psi_mun * keep_n[None, None, None, :]).at[..., win].set(rot_m)
+        return psi_nmu, psi_mun
+    return jax.jit(rotate, out_shardings=(nmu_sharding, mun_sharding))
+
+
+def _rotate_faces(psi_nmu, psi_mun, U, b_lo, keep):
+    fn = _window_rotation_fn(int(b_lo), int(U.shape[-1]), psi_nmu.sharding, psi_mun.sharding,
+                             tuple(psi_nmu.shape), tuple(psi_mun.shape))
+    return fn(psi_nmu, psi_mun, jnp.asarray(U), jnp.asarray(keep))
+
+
+def _with_frequencies(request: OnShellRequest, extra_ry) -> OnShellRequest:
+    """The request planned on its own energies united with ``extra_ry`` (Ry, its frame)."""
+    freqs = np.unique(np.concatenate([request.frequencies_ry, np.asarray(extra_ry, np.float64)]))
+    index = np.searchsorted(freqs, request.tables_ry).astype(np.int32)
+    if not np.array_equal(freqs[index], request.tables_ry):
+        raise ValueError("GATE window_sigma_frequencies: a table energy is not on the united list")
+    return replace(request, frequencies_ry=freqs, index=index)
+
+
+def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omega_ry=None,
+                   omit_frozen: bool = False, print_fn=None) -> dict:
+    """Sigma^c of a band window at an instantaneous state, from a pole model (Ry).
+
+    docs/theory/td_agw_dynamical.md §1.2-1.4 (Eqs. 2-3) and §9 item 5.  The GW
+    run's own Σ τ sweep (:func:`compute_sigma_c_ppm_omega_grid` and the shared
+    executor ``gw.mpa.sigma``) on a carrier that differs from the run's only
+    in the window: its faces are rotated, psi_A -> psi_A U (one n_A x n_A
+    rotation per k), its energies are the instantaneous e and its branch
+    weights the populations f (valence f, conduction 1 - f).  Every other
+    band keeps its equilibrium energy and step occupation, and G(tau) of
+    every band is composed at every node from the stored centroid faces;
+    no G(tau) is stored.  No file is read or written.
+
+    Parameters
+    ----------
+    wfns : the GW run's ``Wavefunctions`` bundle (raw-parent faces of every band
+        at the centroids, ``green_parent``; energies ``enk`` and step
+        occupations ``occ``, Ry).  Held for the run, never modified.  Its parent
+        rows must be the full zone (a general drive breaks the point group).
+    poles : :class:`PPMBuildResult` — :func:`fit_pole_model` / :func:`screening_update`.
+    window : ``dict(b_lo, U, e, f)`` — the active window [b_lo, b_lo + n_A) on the
+        bundle's band axis: U (nk, n_A, n_A) the instantaneous orbitals'
+        columns in the band basis, e (nk, n_A) their energies (Ry, the
+        bundle's absolute frame), f (nk, n_A) their populations; full-k rows
+        in the bundle's k order.
+    plan : :func:`window_sigma_plan`.
+    meta, mesh_xy : the run's.
+    omega_ry : optional (n_omega,) frequencies measured from the body's omega
+        reference (returned as ``efermi_ry``): the matrix Sigma^c_ij(omega)
+        is also evaluated there (the grid route).
+    omit_frozen : RED TWIN ONLY — the frozen bands are dropped from G.
+
+    Returns
+    -------
+    dict with ``pair`` (2, nk, n_A, n_A): Sigma^c_ij(e_i), Sigma^c_ij(e_j) in the
+    instantaneous basis (body, invalid-pole static term and head);
+    ``static`` (nk, n_A, n_A): U [1/2 (pair_0 + pair_1)]^h U^H, the on-shell
+    operator in the band basis (sigma-on-shell.md); ``diag`` (nk, n_A):
+    Sigma^c_ii(e_i); ``omega`` (n_omega, nk, n_A, n_A) in the band basis when
+    ``omega_ry`` is given; ``efermi_ry``; ``request`` (the on-shell tables).
+
+    The Sigma band window is [0, b_lo + n_A): the invalid-pole static term's
+    occupied projector (``cohsex_sigma.build_Gij``) needs every occupied band
+    inside it.  Projecting only the window is design item 6 (separate encode
+    and decode faces).
+    """
+    from .wavefunction_bundle import BandSlices
+    p = print if print_fn is None else print_fn
+    quiet = (lambda *a, **k: None) if print_fn is None else print_fn
+    carrier = wfns.green_parent
+    kplan = None if carrier is None else carrier.plan
+    nk = int(meta.nk_tot)
+    if kplan is None or int(kplan.n_parent) != nk or not np.array_equal(
+            np.asarray(kplan.irr_idx), np.arange(nk)):
+        raise ValueError(
+            "GATE window_sigma_full_zone: got a bundle whose parents are not the full zone "
+            f"(n_parent={None if kplan is None else int(kplan.n_parent)}, nk={nk}); want "
+            "one parent per k (a general drive breaks the point group); fix: run the GW "
+            "parent on an identity-only grid, as runs/CrI3/516")
+    s = wfns.slices
+    b_lo = int(window["b_lo"])
+    U = np.asarray(window["U"], np.complex128)
+    e = np.asarray(window["e"], np.float64)
+    f = np.asarray(window["f"], np.float64)
+    n_a = int(U.shape[-1])
+    b_hi = b_lo + n_a
+    if U.shape != (nk, n_a, n_a) or e.shape != (nk, n_a) or f.shape != (nk, n_a):
+        raise ValueError(f"GATE window_sigma_shapes: got U {U.shape}, e {e.shape}, f {f.shape}; "
+                         f"want ({nk}, {n_a}, {n_a}) and ({nk}, {n_a})")
+    if not (int(s.b2) - int(s.b0) <= b_hi <= int(s.nb_sigma_sum)) or b_lo < 0:
+        raise ValueError(f"GATE window_sigma_bands: window [{b_lo}, {b_hi}) must close above "
+                         f"the LUMO ({int(s.b2) - int(s.b0)}) inside the Sigma sum "
+                         f"({int(s.nb_sigma_sum)})")
+    win = slice(b_lo, b_hi)
+    enk = np.asarray(jax.device_get(wfns.enk), np.float64)
+    occ = np.asarray(jax.device_get(wfns.occ), np.float64)
+    enk_t = enk.copy()
+    enk_t[:, win] = e
+    pop = occ[:, s.full].copy()
+    pop[:, win] = f
+    keep = np.ones(int(carrier.psi_nmu.shape[1]))
+    if omit_frozen:
+        keep[:] = 0.0
+        keep[win] = 1.0
+    psi_nmu, psi_mun = _rotate_faces(carrier.psi_nmu, carrier.psi_mun, U, b_lo, keep)
+    rep = NamedSharding(mesh_xy, P(None, None))
+    from common.collectives import device_put_process_local
+    put = lambda a: device_put_process_local(np.ascontiguousarray(a), rep)
+    rows = np.asarray(kplan.parent_full_rows if kplan.parent_full_rows is not None
+                      else np.arange(nk))
+    carrier_t = replace(carrier, psi_nmu=psi_nmu, psi_mun=psi_mun,
+                        enk=put(enk_t[rows]), occ=carrier.occ)
+    slices_t = BandSlices.from_band_edges(
+        s.b0, min(int(s.b1), int(s.b0) + b_hi), s.b2, int(s.b0) + b_hi, s.b4,
+        b4_chi=s.b4_chi, b4_sigma=s.b4_sigma, b4_logical=s.b4_logical)
+    # The Sigma stage reads the parent carrier only; full-k faces, if the
+    # bundle holds any, would be the unrotated window and are dropped.
+    wfns_t = replace(wfns, enk=put(enk_t), slices=slices_t, green_parent=carrier_t,
+                     psi_nmu=None, psi_mun=None)
+    meta_t = dataclasses.replace(meta, b_id_3=int(meta.b_id_0) + b_hi)
+    head = plan.get("head")
+    nb_sig = int(slices_t.nb_sigma)
+    built = {}
+
+    def on_shell_for(efermi_ry):
+        e_rel = (enk_t[:, :nb_sig] - float(efermi_ry)) * RYD_TO_EV
+        req = on_shell_request(e_eval_rel_ev=e_rel, e_dft_rel_ev=e_rel,
+                               omega_range_ev=plan["omega_range_ev"],
+                               out_of_grid=plan["out_of_grid"])
+        if plan.get("frequencies_abs_ry") is not None:
+            req = _with_frequencies(req, plan["frequencies_abs_ry"] - float(efermi_ry))
+        built["request"] = req
+        return req
+
+    def run(on_shell, omega_grid):
+        return compute_sigma_c_ppm_omega_grid(
+            wfns_t, poles, meta_t, mesh_xy, ppm_cfg=plan["ppm_cfg"],
+            sigma_cfg=plan["sigma_cfg"], mpa_cfg=plan["mpa_cfg"], omega_grid_ry=omega_grid,
+            ansatz=plan["ansatz"], screening_diagrams=plan["screening_diagrams"],
+            plan=None, fixed_quadrature_session=plan.get("session"),
+            on_shell_for=on_shell_for if on_shell else None, populations=pop,
+            print_fn=quiet)
+
+    def head_rows(efermi_ry):
+        return None if head is None else replace(
+            head, enk_ry=enk_t[:, :nb_sig], occupations=pop[:, :nb_sig],
+            efermi_ry=float(efermi_ry))
+
+    from common.collectives import gather_to_host
+    res = run(True, plan["omega_grid_ry"])
+    point = res.sigma_c_kij.point(0).with_head(head_rows(res.efermi_ry))
+    pair = np.asarray(gather_to_host(point.pair))[:, :, win, win]
+    diag = np.einsum("kii->ki", pair[0])
+    Uh = np.conj(np.swapaxes(U, -1, -2))
+    S = 0.5 * (pair[0] + pair[1])
+    S = 0.5 * (S + np.conj(np.swapaxes(S, -1, -2)))
+    out = dict(pair=pair, diag=diag, static=U @ S @ Uh, efermi_ry=float(res.efermi_ry),
+               request=built.get("request"), carrier=dict(slices=slices_t, nb_sigma=nb_sig))
+    if omega_ry is not None:
+        grid = np.asarray(omega_ry, np.float64)
+        res_w = run(False, grid)
+        cube = res_w.sigma_c_kij.point(0)
+        Sw = np.asarray(gather_to_host(cube))[:, :, win, win]
+        hr = head_rows(res_w.efermi_ry)
+        if hr is not None:
+            hw = replace(hr, omega_grid_ry=grid).band_rows(b_lo, b_hi)
+            Sw = Sw + np.einsum("wki,ij->wkij", hw, np.eye(n_a))
+        out["omega"] = U[None] @ Sw @ Uh[None]
+    p(f"  window Sigma_c: bands [{b_lo}, {b_hi}) on the Sigma window [0, {nb_sig}), "
+      f"max|Sigma_ii(e_i)| = {float(np.max(np.abs(diag))) * RYD_TO_EV:.6f} eV"
+      + (" (RED TWIN: frozen bands omitted from G)" if omit_frozen else ""))
+    return out
