@@ -5,6 +5,33 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-17 — k-convolution kernels: four sub-1.15× arms removed (CUDA)
+
+A simplification pass on the mathdx modes 7, 9 and 11 (`src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`,
+`kbox_stage.cuh`). Removed: mode 7's per-call k-fastest index tables (M7KF), the m7s split arm at
+n_s = 1, mode 9's four-block W2 rule below N_k = 256 and its fixed-column exception (W2 there now
+runs two blocks a SM), and mode 9's
+persistent split plane pass (m9b); the dead tuning bits of the kernel text; and the duplicated
+pair-order, table-load and axis-pass helpers (now in `kbox_stage.cuh`). The arms that remain are
+listed per mode in [k-convolution §4](docs/architecture/kconv.md#arms).
+
+- **Results do not move:** every remaining arm computes the same lines in the same order (bitwise
+  on the 45-case modes 7/9 sweep, the 21 mode-11 comparisons and the Fe 8³ P4 deck bodies).
+- **Speed:** the removed arms' gains, per call (A100, 45 k-grid cases x modes 7 and 9 against the
+  previous kernels): mode 7 1.03× at Fe 8³ (4.08 -> 4.21 ms), up to 1.13× at 12³–15³; mode 9
+  1.20–1.22× at 6³ (0.30 -> 0.36 ms) and 1.11–1.23× at ≥ 14³; every other case within 1.02×.
+  Mode 11 is unchanged.
+- **Memory:** `ffi.fft.klead_unfold_scratch_bytes` now prices the m7s arm's pair-major W_R (16·N_k B
+  a pair at n_s = 2 on 14³–21³ A100 grids), which the Σ τ window checks already add; before, that
+  arm took up to 25 % more scratch than priced. M7KF's unpriced workspace is gone.
+- **Startup:** `require_kconv` also probes `lorrax_mathdx_kconv_chi_unfold_q`, so a CUDA leg older than
+  that target refuses at startup (`GATE kconv-target`), not at the first W stream.
+- **`make_kconv_chi_unfold(rows=...)`:** a static `rows` outside `[0, N_k)` raises `ValueError`.
+- **Build log:** the `[kconv_mathdx]` line names `variant=` and `arm=`.
+- **What you must change:** nothing in decks or environment, and no handler signature moved (ABI
+  unchanged). The kernel text changed, so the cubin store recompiles each (mode, grid) once
+  (about 8 s each); the module is republished with a bundle from this commit.
+
 ## 2026-10-17 — Dyson response programs: one compile per LU decision on the CUDA room leg
 
 Under `linalg = distributed` on CUDA, the W response's Dyson programs keyed on a figure
@@ -17,6 +44,7 @@ without the room, so a new room exchanges, reads and compiles nothing to decide.
 - **New refusal:** a measured size route whose ranks hold different rooms now refuses by
   name ("has a room that differs across processes") instead of routing divergently.
 - **What you must change:** nothing.
+
 
 ## 2026-10-17 — k-convolution kernels: faster mathdx modes 7, 9 and 11 (CUDA); a new native target
 

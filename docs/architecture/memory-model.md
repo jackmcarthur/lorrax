@@ -415,9 +415,12 @@ rank beside what is live:
 
 `S_11` is mode 11's split-arm scratch, at most one `T_p`
 (`greens_function_kernel.chi0_kconv_scratch`); it is 0 on the single pass.
-`S_7` is mode 7's, `min(R·ν, ⌊1 GiB / 16·N_k·n_s²⌋)` pairs of `16·N_k·n_s²` B,
-at most 1 GiB (`greens_function_kernel.sigma_kconv_scratch`); it is 0 on the
-single arm (bulk grids below about 14³ at n_s = 1 or 2).
+`S_7` is mode 7's, `min(R·ν, ⌊1 GiB / s⌋)` pairs of `s` B, at most 1 GiB, with
+`s = 16·N_k·n_s²` plus `16·N_k` (the chunk's pair-major `W_R`) on the m7s arm (n_s = 2
+where one padded column fits a block: 14³–21³ on an A100)
+(`greens_function_kernel.sigma_kconv_scratch` → `ffi.fft.klead_unfold_scratch_bytes`; the
+handler rounds an m7s chunk down to whole waves, so the price is its upper bound there); it is 0
+on the single arm (bulk grids below about 14³ at n_s = 1 or 2).
 
 The q-wedge Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
 rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):

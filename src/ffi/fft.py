@@ -85,7 +85,7 @@ __all__ = [
     "klead_unfold_scratch_bytes",
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET", "live_row_mask",
-    "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET",
+    "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET", "KCONV_CHI_UNFOLD_Q_TARGET", "chi_q_store_ok",
     "chi_unfold_scratch_bytes", "make_kconv_chi_vertex", "KCONV_CHI_VERTEX_TARGET",
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
@@ -130,7 +130,7 @@ KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCO
                  KCONV_KLEAD_OUTER_TARGET, KCONV_KLEAD_OUTER_DECODE_TARGET,
                  KCONV_KLEAD_UNFOLD_TARGET, KCONV_KLEAD_LORENTZ_TARGET,
                  KFFT_KLEAD_TARGET, KFFT_KLEAD_UNFOLD_TARGET, KCONV_CHI_UNFOLD_TARGET,
-                 KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
+                 KCONV_CHI_UNFOLD_Q_TARGET, KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
 
 #: The ROCM leg's k-leading pair (cpp/kdft/kdft_klead_ffi.cc): mode 2 and mode 3 by mixed-radix
 #: DFT in LDS, the operations and layouts of KCONV_KLEAD_TARGET / KFFT_KLEAD_TARGET.
@@ -2550,6 +2550,32 @@ def x_block_rows(rows) -> np.ndarray:
 # Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
 #   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
 #   unfold gather's L2 latency (long_scoreboard 49%; 2956).
+# Paid (U2c): the fused product forms of the unfold load and the chi trace (lrx_mulf, lrx_cmac),
+#   FP64 pipe busy time per chi0 tau node 62 -> 45 ms at base clock (6x6 bispinor, A100).  Did not
+#   pay: the tile-table gather with k fastest across threads, 6% slower (mode 11, A100).
+# Paid (kconv/final, 2026-10-17; A100, real Fe 8^3 tables, ms per call; the evidence directory
+#   cs_claude/sigma_depth2/kc_final): m7f, the fused single-arm tile of mode 7 at n_s <= 2 (cp.async
+#   gather, orbit-blocked tile order, x pencils in registers; Fe 8^3 mode 7 7.84 -> 4.08 with the
+#   k-fastest tables below); W2, mode 9's batched scalar gather with the fixed-column store (Fe 8^3
+#   1.317 -> 0.950; 8^3 1.359 -> 0.981 at two blocks a SM, 1.011-1.221 at four; 4^3 0.93x, so from
+#   nk 128); m7s, mode 7's arm 2 at n_s 2 (20^3, pass 16 x 640, LRX_M7S bits: none 34.97, L2
+#   evict-first stores 32.96, pair-major W_R 31.48, both 31.91, G evict-last 33.85 (slower), W_R +
+#   the persistent per-tile plane loop 29.14 (kept), + evict-first 29.48, + x-fastest pairs 32.84;
+#   measured 1.10-1.30x over 14^3-21^3); m11f, mode 11's fused single arm at n_s 2 (9.92 -> ~5 ms,
+#   2.0-3.3x with acc=None and the q-row store; the gather is the L1 address-divergence bound).
+# Pruned (cleanup/kconv-prune, owner 2026-10-17: below 1.15x, a host rule and kernel text each):
+#   M7KF, k-fastest copies of mode 7's index tables per call (1.03x, Fe 8^3 4.22 -> 4.08; an
+#   unpriced 4 N_k (ml + nl) B workspace); m7s at n_s 1 (bits 4 alone for a column box <= 64 KB,
+#   14^3 / 15^3 only on A100, 1.007-1.124x; 14^3 previous arm 2 / bits 12 / bits 4 3.63 / 3.26 /
+#   3.26, 15^3 4.28 / 4.81 / 3.99, 32 x 240 3.17 / 3.36 / 3.01; 16^3+ bits 4 did not pay); W2 at
+#   4 blocks a SM below nk 256 and its fixed-column exception (6^3 only: 0.338 plain -> 0.296 at
+#   four blocks, 0.387 at two; the fixed-column store beside it was 1.05x slower); m9b, mode 9's persistent orbit-blocked
+#   split plane pass where the tiles fill 90% of their waves (20^3 427 tiles 6.33 -> 5.96, 24^3
+#   17.3 -> 13.6; 0.995-1.006x on 18 of 24 measured rows, 15^3 0.88x).  Their measured cost on the
+#   45-case sweep (prune / previous, per call): mode 7 Fe 8^3 1.033, 12^3 n_s 1 1.127, 13^3 n_s 2
+#   1.077, 14^3 n_s 1 1.123; mode 9 6^3 1.20-1.22 (W2 at two blocks; W2 off below nk 256 instead
+#   measured 6^3 1.10 and 12x12x1 1.33, so W2 from nk 128), 14^3-24^3 1.11-1.23; the rest
+#   <= 1.02 (kc_prune/sweep_ratio.csv, w2_ratio.csv).
 def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str | None = "ortho",
                             mult: float = 1.0) -> Callable:
     """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep, load=None) -> U``.
@@ -3025,17 +3051,44 @@ def klead_unfold_scratch_bytes(kgrid, ns: int, pairs: int, optin: int | None = N
     more columns: the group's ``ns²`` columns of ``16·((nx·ny·(nz|1))|1)`` B exceed the
     opt-in shared memory, or (``ns = 1``) four columns do.  The split arm chunks the pairs
     through an ``(N_k, chunk·ns²)`` intermediate of at most 1 GiB and at least one pair; the
-    single arm draws none.  A runtime allocation: compiled ``memory_analysis()`` does not
-    count it, so callers price it.
+    single arm draws none.  Its m7s passes (arm 2 at ``ns = 2``: one padded column fits a
+    block, and the plane tile's and the column's static tables fit beside them) add the
+    chunk's pair-major ``W_R``, ``16·N_k`` B a pair, inside the same bound, and round a chunk
+    below ``pairs`` down to whole waves of plane tiles (an SM-count rule, so this price is the
+    request's upper bound there and equal to it otherwise).  A runtime allocation: compiled
+    ``memory_analysis()`` does not count it, so callers price it.
     """
     nx, ny, nz = (int(v) for v in kgrid)
     have = _optin_smem_bytes() if optin is None else int(optin)
     grp = int(ns) * int(ns)
-    col = grp * (((nx * ny * (nz | 1)) | 1) * 16)
-    if have is not None and col <= have and (grp > 1 or 4 * col <= have):
+    rs = ((nx * ny * (nz | 1)) | 1) * 16                 # one padded column, bytes
+    if have is not None and grp * rs <= have and (grp > 1 or 4 * grp * rs <= have):
         return 0
-    per_pair = nx * ny * nz * grp * 16
+    nk = nx * ny * nz
+    per_pair = nk * grp * 16
+    if have is not None and int(ns) == 2 and rs <= have:     # arm 2: is it m7s (the handler's build())?
+        pr = ((ny * (nz | 1)) | 1) * 16                    # one padded (ky, kz) plane, bytes
+        tile = max(1, have // pr // grp) * grp            # split_plane_tile(wide): columns
+        if tile * pr + (tile // grp) * 16 <= have and rs + ny * nz * 8 <= have:
+            per_pair += nk * 16
     return max(1, min(int(pairs), (1 << 30) // per_pair)) * per_pair
+
+
+#: Mode 11's write protocol (``acc=None``): the acc operand of ``KCONV_CHI_UNFOLD_TARGET`` is a
+#: rank-1 one-element placeholder (not aliased) beside the full ``(n_out, nk, mu, nu)`` result, and
+#: the handler writes ``alpha * chi_tau`` without reading it (``KleadChiUnfoldImpl``); any other
+#: acc operand must have the result's shape.  No attribute: the target's signature is unchanged.
+_CHI_WRITE_PLACEHOLDER = (1,)
+
+
+def chi_q_store_ok(mesh: Mesh, kgrid, ns: int, n_out: int) -> bool:
+    """Whether :func:`make_kconv_chi_unfold`'s ``acc=None, rows=q`` call (the q-row store,
+    ``KCONV_CHI_UNFOLD_Q_TARGET``) serves this grid: the CUDA fused single arm (m11f) only,
+    ``ns`` 2, ``n_out`` 1, a pair's ``2 ns²`` columns in the opt-in shared memory.  Elsewhere the
+    consumer takes the accumulate call and the flat-k transform (``GATE mathdx-kconv-chi-q``
+    names this rule)."""
+    return (kconv_backend(mesh, kgrid) == "mathdx" and int(ns) == 2 and int(n_out) == 1
+            and chi_unfold_scratch_bytes(kgrid, ns, 1) == 0)
 
 
 def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bool,
@@ -3092,8 +3145,7 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     si = ffi_fft_scale("ifftn", norm, nk)
     sf = ffi_fft_scale("fftn", norm, nk)
     flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
-    q_store = (kconv_backend(mesh, kgrid) == "mathdx" and ns == 2 and n_out == 1
-               and chi_unfold_scratch_bytes(kg, ns, 1) == 0)
+    q_store = chi_q_store_ok(mesh, kg, ns, n_out)
     if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KCONV_CHI_UNFOLD_TARGET, "CUDA")
 
@@ -3109,10 +3161,10 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
         def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
             budget = (int(scratch_bytes) if scratch_bytes is not None
                       else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
-            if acc is None:                    # write: a one-element acc operand, no alias
+            if acc is None:                    # write: the placeholder operand, no alias
                 out = jax.ShapeDtypeStruct((n_out, nk, int(gv.shape[1]), int(gv.shape[3])), jnp.complex128)
                 call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, out)
-                acc = jnp.zeros((1,), jnp.complex128)
+                acc = jnp.zeros(_CHI_WRITE_PLACEHOLDER, jnp.complex128)
             else:
                 call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
                                         input_output_aliases={12: 0})
@@ -3209,7 +3261,14 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
         elif Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
             raise ValueError("k-leading chi unfold: the partners must match the Greens' shape")
         if rows is not None:
-            q = jnp.asarray(np.asarray(rows, dtype=np.int32)) if isinstance(rows, (list, tuple, np.ndarray)) else rows
+            if isinstance(rows, (list, tuple, np.ndarray)):
+                q = np.asarray(rows)
+                if q.ndim != 1 or q.size < 1 or q.min() < 0 or q.max() >= nk:
+                    raise ValueError(f"k-leading chi unfold: rows= takes 1 to n q rows in [0, {nk}); "
+                                     f"got {q.tolist()}")
+                q = jnp.asarray(q.astype(np.int32))
+            else:
+                q = rows                       # a traced operand: the caller's rows (unchecked)
             return sharded(conj_src, load is not None, live is not None, "q")(
                 q, Gv, Gc, alpha, Gvt, Gct, *(() if live is None else (live,)),
                 *(() if load is None else tuple(load)))
