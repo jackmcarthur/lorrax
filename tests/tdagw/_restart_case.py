@@ -44,6 +44,7 @@ def _deck(case, outdir):
     raw["lorrax"] = {"method": case["method"], "n_corr": 2, "chunk": 20}
     if case.get("dt") is not None:
         raw["lorrax"]["dt"] = case["dt"]
+    raw["lorrax"].update(case.get("lorrax", {}))       # e.g. node_solver = anderson
     return raw
 
 

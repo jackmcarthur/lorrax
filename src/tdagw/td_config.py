@@ -54,6 +54,10 @@ TD_DEFAULTS = {
     "lorrax.dt": None,
     "lorrax.n_corr": 2,
     "lorrax.predictor": "cubic",
+    "lorrax.node_solver": "truncated",
+    "lorrax.node_tol": 1e-10,
+    "lorrax.node_max_iter": 40,
+    "lorrax.node_memory": 5,
     "lorrax.magnus_frame": "",
     "lorrax.model": "",
     "lorrax.kernel_file": "",
@@ -227,6 +231,21 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         raise _gate("td_predictor", f"predictor = {vals['lorrax.predictor']!r} with "
                     f"method {vals['lorrax.method']!r}",
                     "cubic | linear (linear: cfm4 only)", "set [lorrax] predictor")
+    from tdagw.propagate import NODE_SOLVERS
+    solver = vals["lorrax.node_solver"]
+    if solver not in NODE_SOLVERS or (solver != "truncated" and vals["lorrax.method"] != "cfm4"):
+        raise _gate("td_node_solver", f"node_solver = {solver!r} with method "
+                    f"{vals['lorrax.method']!r}", " | ".join(NODE_SOLVERS) + " (anderson: cfm4 "
+                    "only; it solves the two Gauss-node equations of the step)",
+                    "set [lorrax] node_solver")
+    tol, n_it, mem = vals["lorrax.node_tol"], vals["lorrax.node_max_iter"], vals["lorrax.node_memory"]
+    if (isinstance(tol, bool) or not isinstance(tol, (int, float)) or not 0.0 < float(tol) <= 1e-3
+            or isinstance(n_it, bool) or not isinstance(n_it, int) or n_it < 2
+            or isinstance(mem, bool) or not isinstance(mem, int) or mem < 1):
+        raise _gate("td_node_solve_settings", f"node_tol = {tol!r}, node_max_iter = {n_it!r}, "
+                    f"node_memory = {mem!r}", "0 < node_tol <= 1e-3, node_max_iter >= 2, "
+                    "node_memory >= 1 (integers)", "set them in [lorrax]")
+    vals["lorrax.node_tol"] = float(tol)
     frame = vals["lorrax.magnus_frame"]
     if frame not in ("", "whole_rho", "interaction") or (
             frame and vals["lorrax.method"] not in ("magnus2", "cfm4")) or (
@@ -284,6 +303,12 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
             raise _gate("td_dt", f"dt = 'auto' with method {vals['lorrax.method']!r}",
                         "'auto' only for magnus2 / cfm4 (their step limit is measured "
                         "on the model at the start of the run)", "set [lorrax] dt in as")
+        if solver != "truncated":
+            raise _gate("td_dt", f"dt = 'auto' with node_solver = {solver!r}",
+                        "an explicit dt: 'auto' picks the truncated step's stability limit, "
+                        "and converged nodes have none (accuracy and the cost of the node "
+                        "solve set their step; the probe still checks it)",
+                        "set [lorrax] dt in as")
     elif vals["lorrax.method"] != "dp54":
         if vals["lorrax.dt"] is None or float(vals["lorrax.dt"]) <= 0.0:
             raise _gate("td_dt", f"[lorrax] dt = {vals['lorrax.dt']!r} for a fixed-step "

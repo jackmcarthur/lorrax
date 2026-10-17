@@ -13,6 +13,9 @@ magnus2   exponential midpoint on Delta rho, interaction picture      n_corr
 cfm4      4th-order commutator-free Magnus on Delta rho, interaction  2 n_corr
           picture; Gauss-node dSigma by cubic extrapolation + n_corr
           corrections; Gamma / intraband by the triple jump (order 4)
+cfm4      the same step with the Gauss-node equations solved          2 n_eval
+(nodes)   (node_solver = anderson: Anderson acceleration of the node
+          map to node_tol; counted per step)
 ========  ==========================================================  =========
 
 The Magnus steps propagate Delta rho = rho - rho^eq in the interaction
@@ -66,13 +69,20 @@ from tdagw import eom
 from tdagw.self_energy import SelfEnergyModel
 from distrib_la import eigh_local
 
-__all__ = ["METHODS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
+__all__ = ["METHODS", "NODE_SOLVERS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
+           "NodeAccount", "converged_nodes",
            "place_operators", "place_kernel", "place_state", "make_conj_dev",
            "sample_plan", "chunk_plan", "initial_carry", "carry_to_host",
            "carry_from_host", "coupling_radius", "magnus_dt_limit", "step_growth",
            "run_propagation"]
 
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
+#: cfm4's Gauss-node values: n_corr corrections of a prediction ("truncated"), or the
+#: node equations solved to node_tol by Anderson acceleration ("anderson").
+NODE_SOLVERS = ("truncated", "anderson")
+#: Relative residuals whose first crossing each converged-node solve records: the
+#: evaluations a looser node_tol would have taken, from one tight run.
+NODE_MILESTONES = (1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9)
 #: Bootstrap: while the predictor history is incomplete (first steps) the
 #: Magnus steps take this many extra corrections.
 BOOTSTRAP_EXTRA = 3
@@ -120,6 +130,14 @@ class PropagatorConfig(NamedTuple):
         picture of the band energies, ti.ip_magnus_step) or "whole_rho" (the
         whole rho, ti.magnus_midpoint_step: exact quadratic invariants);
         cfm4 is always "interaction".
+    node_solver : cfm4's Gauss-node values, one of NODE_SOLVERS: "truncated"
+        (n_corr corrections, ti.ip_magnus_step) or "anderson" (the implicit
+        node equations solved per step, ti.ip_magnus_implicit_step; n_corr
+        unused).
+    node_tol, node_max_iter, node_memory : the converged solve's relative
+        residual ||F(g) - g|| <= node_tol ||g||, its largest number of
+        node-map evaluations (more refuses, GATE td_node_solve), and its
+        Anderson memory.
     """
     method: str
     t0: float
@@ -134,6 +152,62 @@ class PropagatorConfig(NamedTuple):
     remainder: bool
     predictor: str = "cubic"
     frame: str = "interaction"
+    node_solver: str = "truncated"
+    node_tol: float = 1e-10
+    node_max_iter: int = 40
+    node_memory: int = 5
+
+
+def converged_nodes(cfg: PropagatorConfig) -> bool:
+    """cfg's cfm4 step solves its Gauss-node equations (node_solver != truncated)."""
+    return cfg.method == "cfm4" and cfg.node_solver != "truncated"
+
+
+class NodeAccount(NamedTuple):
+    """The node solves of a converged-node run so far, carried with the state.
+
+    n_eval : int64, node-map evaluations since t0 (each one dSigma per node).
+    n_eval_max : int32, the most in one step.
+    n_fail : int32, steps whose solve did not reach node_tol in node_max_iter.
+    first_fail : int64, the step index of the first such step (-1: none).
+    res_fail : float64, its relative residual.
+    res_max : float64, the largest final relative residual of any step.
+    reached_sum, reached_max, reached_n : (len(NODE_MILESTONES),) the sum and
+        the largest of the evaluations at which each milestone was first
+        reached, and the number of steps that reached it.
+    """
+    n_eval: jax.Array
+    n_eval_max: jax.Array
+    n_fail: jax.Array
+    first_fail: jax.Array
+    res_fail: jax.Array
+    res_max: jax.Array
+    reached_sum: jax.Array
+    reached_max: jax.Array
+    reached_n: jax.Array
+
+
+def _account_zero() -> NodeAccount:
+    z = len(NODE_MILESTONES)
+    return NodeAccount(jnp.int64(0), jnp.int32(0), jnp.int32(0), jnp.int64(-1),
+                       jnp.float64(0.0), jnp.float64(0.0), jnp.zeros(z, jnp.int64),
+                       jnp.zeros(z, jnp.int32), jnp.zeros(z, jnp.int64))
+
+
+def _account(acct: NodeAccount, info, k) -> NodeAccount:
+    """acct after one step's solve ``info`` (ti.NodeSolve) at step index k."""
+    bad = ~info.converged
+    first = (acct.first_fail < 0) & bad
+    return NodeAccount(
+        n_eval=acct.n_eval + info.n_eval.astype(jnp.int64),
+        n_eval_max=jnp.maximum(acct.n_eval_max, info.n_eval.astype(jnp.int32)),
+        n_fail=acct.n_fail + bad.astype(jnp.int32),
+        first_fail=jnp.where(first, jnp.asarray(k).astype(jnp.int64), acct.first_fail),
+        res_fail=jnp.where(first, info.residual, acct.res_fail),
+        res_max=jnp.maximum(acct.res_max, info.residual),
+        reached_sum=acct.reached_sum + info.reached.astype(jnp.int64),
+        reached_max=jnp.maximum(acct.reached_max, info.reached.astype(jnp.int32)),
+        reached_n=acct.reached_n + (info.reached > 0).astype(jnp.int64))
 
 
 class SampleSpec(NamedTuple):
@@ -314,9 +388,23 @@ def _physics(ops, mparams, model: SelfEnergyModel, drive: Callable, mesh):
         """diag(E^QP) + E(t)·r^inter: the field part of the whole-rho generator."""
         return pin(eom.field_hamiltonian(ops, drive(t)))
 
+    stack_spec = NamedSharding(mesh, _spec(5, 2))
+
+    def dsig_nodes(ts, xs):
+        """dSigma at every node (deviations xs): one call on the trial-stacked states
+        when the model has no explicit time dependence (``model.time_independent``),
+        else one call per node at its own time."""
+        if model.time_independent and len(xs) > 1:
+            n = xs[0].shape[0]
+            d = dsig(ts[0], ops.rho_eq[None] + jnp.concatenate(xs, axis=0))
+            return tuple(pin(d[i * n:(i + 1) * n]) for i in range(len(xs)))
+        return tuple(dsig(tt, ops.rho_eq[None] + xx) for tt, xx in zip(ts, xs))
+
     no_occ = jnp.zeros_like(occ)
     return dict(dsig=dsig, rhs=rhs, field=field, free=free, nonlin=nonlin,
                 lam=lam, remainder=remainder, pin=pin, explicit=explicit,
+                dsig_nodes=dsig_nodes,
+                pin_stack=lambda a: jax.lax.with_sharding_constraint(a, stack_spec),
                 conj_dev=lambda w, x, tau: pin(conj(w, x, occ, tau)),
                 conjugate=lambda w, y, tau: pin(conj(w, y, no_occ, tau)),
                 dsig_dev=lambda t, x: dsig(t, ops.rho_eq[None] + x),
@@ -421,14 +509,24 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
                 return core(t, x, tau)
             return ti.compose_strang(core, ph["remainder"], t, x, tau, fractions)
 
+        implicit = converged_nodes(cfg)
+
         def step(t, c, h, t_next):
-            x, hist, k = c
+            x, hist, k = c[:3]
             guess = tuple(jnp.tensordot(w, hist, axes=1))
-            n_c = jnp.where(k < n_boot, cfg.n_corr + BOOTSTRAP_EXTRA, cfg.n_corr)
-            x1, g = ti.ip_magnus_step(ph["field"], ph["dsig_dev"], inner, ph["free"],
-                                      t, x, h, guess, nodes=nodes, n_corr=n_c)
+            if implicit:
+                x1, g, info = ti.ip_magnus_implicit_step(
+                    ph["field"], ph["dsig_nodes"], inner, ph["free"], t, x, h, guess,
+                    nodes=nodes, tol=cfg.node_tol, max_iter=int(cfg.node_max_iter),
+                    memory=int(cfg.node_memory), constrain=ph["pin_stack"],
+                    milestones=NODE_MILESTONES)
+            else:
+                n_c = jnp.where(k < n_boot, cfg.n_corr + BOOTSTRAP_EXTRA, cfg.n_corr)
+                x1, g = ti.ip_magnus_step(ph["field"], ph["dsig_dev"], inner, ph["free"],
+                                          t, x, h, guess, nodes=nodes, n_corr=n_c)
             hist = ph["free"](jnp.concatenate([hist[len(nodes):], jnp.stack(g)]), h)
-            return (pin(x1), hist, k + 1), g
+            out = (pin(x1), hist, k + 1)
+            return (out + (_account(c[3], info, k),) if implicit else out), g
 
         def dense(t, c0, c1, g, th):
             gen = ti.frozen_generator(ph["field"], ph["free"], t, cfg.dt, nodes, g)
@@ -443,8 +541,9 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
 
     dp54 : SciPy's state.   rk4 : (rho, rhs).   etdrk4 : (rho, coef, N).
     magnus2 / cfm4 : (Delta rho, dSigma node history in the interaction
-    picture of the next step's start, step counter); magnus2 in the whole_rho
-    frame: (rho, the last three midpoint dSigma, step counter).
+    picture of the next step's start, step counter), cfm4 with converged
+    nodes + its :class:`NodeAccount`; magnus2 in the whole_rho frame: (rho,
+    the last three midpoint dSigma, step counter).
     """
     def build(rho0, ops, mparams):
         ph = _physics(ops, mparams, model, drive, mesh)
@@ -461,7 +560,8 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
         x0 = ph["pin"](rho0 - ph["rho_eq"])
         b0 = ph["dsig_dev"](cfg.t0, x0)
         n_hist = len(_magnus_parts(cfg)[3])
-        return (x0, jnp.stack([b0] * n_hist), jnp.int32(0))
+        carry = (x0, jnp.stack([b0] * n_hist), jnp.int32(0))
+        return carry + (_account_zero(),) if converged_nodes(cfg) else carry
     return jax.jit(build)(rho0, ops, mparams)
 
 
@@ -529,14 +629,19 @@ def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:
 
     y_lim = :func:`solvers.time_integrators.magnus_stability_limit` of the
     scheme's nodes, predictor and n_corr; dt_max = y_lim / (STABILITY_MARGIN σ).
+    Converged nodes have no such limit (the converged step's amplification has
+    modulus 1 on the whole imaginary axis): (inf, inf), the probe decides.
     """
+    if converged_nodes(cfg):
+        return np.inf, np.inf
     nodes, _, _, hist, _ = _magnus_parts(cfg)
     y_lim = ti.magnus_stability_limit(nodes, hist, int(cfg.n_corr))
     return (np.inf if sigma <= 0.0 else y_lim / (STABILITY_MARGIN * sigma)), y_lim
 
 
 def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: float,
-                t0: float, n_steps: int = PROBE_STEPS, eps: float = None, seed: int = 1):
+                t0: float, n_steps: int = PROBE_STEPS, eps: float = None, seed: int = 1,
+                with_counts: bool = False):
     """Growth per step of a small coherence under the scheme's own step at h, field off.
 
     The scheme-exact counterpart of :func:`coupling_radius`: from a random
@@ -551,7 +656,12 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
     It sees what the scalar recurrence leaves out: in the interaction picture
     the coupling is time dependent, and a kernel's resonant-antiresonant
     block rotates there at about the sum of two transition energies.  One
-    jitted call, h traced.  Returns (g, the norms after each step).
+    jitted call, h traced.  With converged nodes the probe also solves every
+    step's node equations: a step whose solve does not converge makes
+    g = inf (the scheme is not usable at h).  Returns (g, the norms after
+    each step), and with ``with_counts`` a third item, dict(n_eval,
+    n_eval_max, n_fail, dsigma) of the probe's node solves (dsigma: every
+    dSigma call of the probe, the history seeds included).
     """
     whole = cfg.method == "magnus2" and cfg.frame == "whole_rho"
     if eps is None:              # the whole rho rounds at 1e-16 of its O(1) occupations
@@ -577,23 +687,37 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
     xh = place_state(np.concatenate(xs[1:], axis=0), mesh)
     off = lambda t: jnp.zeros((1, 3))                                  # the field is off
 
+    implicit = converged_nodes(cfg)
+
     def run(x0, xh, ops, mparams, h):
         ph = _physics(ops, mparams, model, off, mesh)
         step, _, _ = _fixed_parts(cfg, ph)
         base = ph["rho_eq"] if whole else 0.0
         hist = jnp.stack([ph["dsig_dev"](t0, xh[j:j + 1]) for j in range(n_hist)])
         carry = (base + x0, hist, jnp.int32(n_boot))  # past the bootstrap: the predictor acts at once
+        if implicit:
+            carry = carry + (_account_zero(),)
 
         def body(c, i):
             t = t0 + i * h
             c, _ = step(t, c, h, t + h)
             return c, jnp.sqrt(jnp.sum(jnp.abs(c[0] - base) ** 2))
-        return jax.lax.scan(body, carry, jnp.arange(int(n_steps)), unroll=1)[1]
+        c, norms = jax.lax.scan(body, carry, jnp.arange(int(n_steps)), unroll=1)
+        return norms, (c[3] if implicit else _account_zero())
 
-    norms = np.asarray(gather_to_host(jax.jit(run)(x0, xh, ops, model.params, jnp.asarray(float(h)))))
+    norms, acct = jax.jit(run)(x0, xh, ops, model.params, jnp.asarray(float(h)))
+    norms = np.asarray(gather_to_host(norms))
     m = int(n_steps) // 2
     g = float((norms[-1] / norms[m - 1]) ** (1.0 / (int(n_steps) - m)))
-    return g, norms
+    n_eval, n_max, n_fail = (int(gather_to_host(v)) for v in (acct.n_eval, acct.n_eval_max,
+                                                              acct.n_fail))
+    if implicit and n_fail:
+        g = float("inf")
+    if not with_counts:
+        return g, norms
+    per = len(_magnus_parts(cfg)[0])
+    dsig = n_hist + (per * n_eval if implicit else int(n_steps) * dsigma_per_step(cfg.method, cfg.n_corr))
+    return g, norms, dict(n_eval=n_eval, n_eval_max=n_max, n_fail=n_fail, dsigma=dsig)
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +798,8 @@ def carry_from_host(template, leaves, mesh, nk_pad: int):
 
 def _chunk_program(cfg: PropagatorConfig, spec: SampleSpec, model_apply,
                    model_name: str, drive_key, mesh, cell_volume: float,
-                   nspinor: int, count: int, n_steps: int, last: bool):
+                   nspinor: int, count: int, n_steps: int, last: bool,
+                   model_static: bool = False):
     """The jitted chunk for one static configuration.
 
     Not cached here: ``run_propagation`` keeps one program per (steps,
@@ -684,7 +809,7 @@ def _chunk_program(cfg: PropagatorConfig, spec: SampleSpec, model_apply,
     """
     drive = drive_key[0]
     model = SelfEnergyModel(apply=model_apply, params=None, linear=True,
-                            name=model_name)
+                            name=model_name, time_independent=bool(model_static))
 
     def run(carry, ops, mparams, sample_times, sample_step, sample_theta, step0):
         ph = _physics(ops, mparams, model, drive, mesh)
@@ -705,6 +830,23 @@ def _chunk_program(cfg: PropagatorConfig, spec: SampleSpec, model_apply,
     return jax.jit(run, donate_argnums=(0,))
 
 
+def _refuse_unconverged(cfg: PropagatorConfig, acct: NodeAccount):
+    """GATE td_node_solve when the carry's account holds an unconverged step (every rank)."""
+    n_fail = int(gather_to_host(acct.n_fail))
+    if not n_fail:
+        return
+    from tdagw.tdgw_io import T_IN_ATTOSEC
+    j = int(gather_to_host(acct.first_fail))
+    raise ValueError(
+        f"GATE td_node_solve: got: {n_fail} step(s) whose Gauss-node equations did not converge, "
+        f"the first step {j} (t = {(cfg.t0 + j * cfg.dt) * T_IN_ATTOSEC:.6g} as) at relative "
+        f"residual {float(gather_to_host(acct.res_fail)):.3g} after node_max_iter = "
+        f"{int(cfg.node_max_iter)} evaluations of the node map; want: ||F(g) - g|| <= node_tol "
+        f"||g|| = {float(cfg.node_tol):.3g} ||g|| at every step; why: an unconverged step "
+        f"integrates neither the implicit scheme nor the equation, and is not written; fix: a "
+        f"smaller [lorrax] dt, a larger node_max_iter or node_memory, or node_solver = 'truncated'")
+
+
 def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                     model: SelfEnergyModel, drive: Callable, mesh, *,
                     cell_volume: float, nspinor: int, count: int,
@@ -718,7 +860,11 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     counter (every rank), and the state's time.  ``resume`` = dict(carry=
     host leaves, step=int, i_next=int) continues a checkpointed run from its
     next sample.  Returns (counters, carry): steps taken by this run,
-    rejected tries, dSigma evaluations.
+    rejected tries, dSigma evaluations (converged nodes: counted from the
+    carry's :class:`NodeAccount`, every node-map evaluation, plus ``nodes``,
+    the solve statistics).  A converged-node chunk with a step whose solve
+    did not converge refuses (GATE td_node_solve) before ``on_chunk`` writes
+    it: no unconverged step reaches an output file.
     """
     nk_pad = int(ops.e_qp.shape[0])
     s_start = i_start = 0
@@ -732,13 +878,16 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
         s_start, i_start = int(resume["step"]), int(resume["i_next"])
     n_meas = int(mtsteps.size)
     fixed = cfg.method != "dp54"
+    implicit = converged_nodes(cfg)
     programs = {}                       # static key -> jitted chunk, this run only
+    acct0 = (int(gather_to_host(carry[3].n_eval)) if implicit else 0)
 
     def program(key, n_steps, last):
         if key not in programs:
             programs[key] = _chunk_program(cfg, spec, model.apply, model.name, (drive,),
                                            mesh, float(cell_volume), int(nspinor),
-                                           int(count), int(n_steps), bool(last))
+                                           int(count), int(n_steps), bool(last),
+                                           bool(model.time_independent))
         return programs[key]
 
     if fixed:
@@ -748,6 +897,8 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
             prog = program(("fixed", s1 - s0, i1 - i0), s1 - s0, False)
             carry, samples = prog(carry, ops, model.params, jnp.asarray(mtsteps[i0:i1]),
                                   jnp.asarray(sstep[i0:i1]), jnp.asarray(stheta[i0:i1]), s0)
+            if implicit:
+                _refuse_unconverged(cfg, carry[3])
             host = jax.tree.map(gather_to_host, samples)
             state = (lambda c=carry, s=s1: (gather_to_host(c[0] if cfg.method in ("rk4", "etdrk4")
                                                           else ops.rho_eq[None] + c[0]),
@@ -757,7 +908,21 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
         n_steps = s_end - s_start
         stats = dict(accepted=n_steps, rejected=0,
                      dsigma=n_steps * dsigma_per_step(cfg.method, cfg.n_corr))
-        if cfg.method in ("magnus2", "cfm4"):
+        if implicit:
+            a = carry[3]
+            n_eval = int(gather_to_host(a.n_eval)) - acct0
+            stats["dsigma"] = len(_magnus_parts(cfg)[0]) * n_eval
+            rs, rm, rn = (np.asarray(gather_to_host(v)) for v in (a.reached_sum, a.reached_max,
+                                                                   a.reached_n))
+            stats["nodes"] = dict(solver=cfg.node_solver, tol=float(cfg.node_tol),
+                                  memory=int(cfg.node_memory), n_eval=n_eval,
+                                  mean=n_eval / max(n_steps, 1),
+                                  max_run=int(gather_to_host(a.n_eval_max)),
+                                  res_max=float(gather_to_host(a.res_max)),
+                                  milestones={f"{thr:.0e}": dict(mean=float(rs[i] / max(rn[i], 1)),
+                                                                 max=int(rm[i]), steps=int(rn[i]))
+                                              for i, thr in enumerate(NODE_MILESTONES)})
+        elif cfg.method in ("magnus2", "cfm4"):
             boot = max(0, min(s_end, _magnus_parts(cfg)[4]) - s_start)
             per = 1 if cfg.method == "magnus2" else 2
             stats["dsigma"] += boot * BOOTSTRAP_EXTRA * per

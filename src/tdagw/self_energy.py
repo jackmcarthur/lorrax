@@ -16,6 +16,10 @@ captured as constants).  The propagator never assumes more than this:
 * ``linear = True`` declares dSigma affine in rho - rho^eq; no integrator
   relies on it today (it is reported, and a consumer that wants a Krylov
   exponential of the full Liouvillian may use it);
+* ``time_independent = True`` declares that ``apply`` ignores ``t``: the
+  propagator may then evaluate states at different times in one call,
+  stacked on the trial axis (cfm4's two Gauss nodes, b = 2); a model with
+  an explicit time dependence leaves it False and is called per time;
 * a model is free to diagonalize H(t) or build G(tau) inside ``apply`` —
   the instantaneous GN-PPM self-energy planned next is one more model with
   the same signature.
@@ -54,11 +58,14 @@ class SelfEnergyModel(NamedTuple):
     params : pytree of device arrays, the model's operands.
     linear : dSigma affine in rho - rho^eq.
     name : what the run header prints.
+    time_independent : ``apply`` does not use ``t`` (trial-stacked calls at
+        different times are allowed).
     """
     apply: Callable
     params: object
     linear: bool
     name: str
+    time_independent: bool = False
 
 
 def _zero_apply(params, rho, t):
@@ -69,7 +76,7 @@ def _zero_apply(params, rho, t):
 def zero_model() -> SelfEnergyModel:
     """dSigma = 0: TDGW ``calc_type = "IP"``."""
     return SelfEnergyModel(apply=_zero_apply, params=(), linear=True,
-                           name="independent particle (dSigma = 0)")
+                           name="independent particle (dSigma = 0)", time_independent=True)
 
 
 def _tda_apply(params, rho, t):
@@ -120,7 +127,8 @@ def dense_kernel_model(kernel, *, tda: bool, cslice=None, vslice=None,
                                   tuple(map(int, cslice)),
                                   tuple(map(int, vslice)))
         return SelfEnergyModel(apply=apply, params=(kernel,), linear=True,
-                               name=f"dense TDA kernel {tuple(kernel.shape)}")
+                               name=f"dense TDA kernel {tuple(kernel.shape)}",
+                               time_independent=True)
     if rho_eq is None:
         raise ValueError(
             "GATE td_dense_kernel_rho_eq: got: a full kernel without rho_eq; "
@@ -128,7 +136,8 @@ def dense_kernel_model(kernel, *, tda: bool, cslice=None, vslice=None,
             "pass ops.rho_eq.")
     return SelfEnergyModel(apply=_full_apply, params=(kernel, rho_eq),
                            linear=True,
-                           name=f"dense full kernel {tuple(kernel.shape)}")
+                           name=f"dense full kernel {tuple(kernel.shape)}",
+                           time_independent=True)
 
 
 def _tda_apply_static(cslice, vslice, params, rho, t):
@@ -176,7 +185,8 @@ def lowrank_kernel_model(u, lam, *, cslice, vslice) -> SelfEnergyModel:
     apply = functools.partial(_lowrank_apply, tuple(map(int, cslice)),
                               tuple(map(int, vslice)))
     return SelfEnergyModel(apply=apply, params=(u, lam), linear=True,
-                           name=f"low-rank TDA kernel, rank {int(u.shape[-1])}")
+                           name=f"low-rank TDA kernel, rank {int(u.shape[-1])}",
+                           time_independent=True)
 
 
 # ---------------------------------------------------------------------------
@@ -270,4 +280,4 @@ def isdf_model(model: dict, mesh, *, k_frac, rho_eq, sex: bool = True,
     tda = "" if tda_n_val is None else f", TDA ({int(tda_n_val)} valence rows)"
     return SelfEnergyModel(apply=apply, params=params, linear=True,
                            name=f"ISDF TD-aGW ({terms}){tda}, N_mu = {model['n_rmu']}, "
-                                f"k grid {tuple(model['kgrid'])}")
+                                f"k grid {tuple(model['kgrid'])}", time_independent=True)

@@ -302,6 +302,8 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             "control.files.load_header_from"]
     if v["lorrax.method"] == "dp54":
         keys.append("control.timesteps.tf")
+    if v["lorrax.node_solver"] != "truncated":      # converged nodes: the solve's settings
+        keys += ["lorrax.node_solver", "lorrax.node_tol", "lorrax.node_memory"]
     fp = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in keys}
     fp["lorrax.magnus_frame"] = magnus_frame(v)
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
@@ -377,10 +379,17 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
     dt_σ and backtracks by PROBE_BACKTRACK until the probe passes (floored to
     0.01 as; magnus2: dt_measure / n).  The whole_rho frame of magnus2 has no
     recurrence (its predictor extrapolates the lab-frame dSigma): the probe
-    alone decides, and 'auto' starts at dt_measure.  Returns (cfg with dt, the
-    receipt).
+    alone decides, and 'auto' starts at dt_measure.  Converged nodes
+    (``node_solver = 'anderson'``) have no static limit either (the converged
+    step is A-stable on the imaginary axis): the probe decides, and it also
+    solves each probe step's node equations, so a solve that does not converge
+    at 1.25 dt refuses.  Returns (cfg with dt, the receipt).
     """
     T = tdgw_io.T_IN_ATTOSEC
+    implicit = tp.converged_nodes(cfg)
+    if implicit and auto:
+        raise ValueError("GATE td_dt: got: dt = 'auto' with converged nodes; want: an explicit "
+                         "dt; fix: set [lorrax] dt in as")
     sigma, est = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0)
     if not np.isfinite(sigma):
         raise ValueError(
@@ -403,8 +412,12 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
 
     def probe(dt):
         h = tp.PROBE_STEP_FACTOR * dt
-        g = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0)[0]
-        probes.append(dict(dt_as=dt * T, probe_dt_as=h * T, growth=g))
+        g, _, cnt = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h,
+                                   t0=cfg.t0, with_counts=True)
+        q = dict(dt_as=dt * T, probe_dt_as=h * T, growth=g, dsigma=cnt["dsigma"])
+        if implicit:
+            q.update(n_eval=cnt["n_eval"], n_eval_max=cnt["n_eval_max"], n_fail=cnt["n_fail"])
+        probes.append(q)
         return g <= 1.0 + tp.PROBE_TOLERANCE
 
     if sigma <= 0.0:                                  # no coupling: any step is stable
@@ -438,13 +451,23 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
             f"this model, below {tp.COUPLING_ZERO_FLOOR:.0e} Ha), any step is stable"
             + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
         return cfg, receipt
-    pr = "; ".join(f"{q['growth']:.4g} per step at {q['probe_dt_as']:.4g} as" for q in probes)
+    pr = "; ".join(f"{q['growth']:.4g} per step at {q['probe_dt_as']:.4g} as"
+                   + (f" (node map {q['n_eval'] / tp.PROBE_STEPS:.2f} mean / {q['n_eval_max']} max "
+                      f"evaluations per step, {q['n_fail']} unconverged)" if implicit else "")
+                   for q in probes)
+    if implicit:
+        limit = (f"converged nodes ({cfg.node_solver}, node_tol {cfg.node_tol:.3g}, memory "
+                 f"{cfg.node_memory}): no static limit; the plain node iteration would contract "
+                 f"by h*sigma/(2 sqrt 3) = {receipt['y'] / (2.0 * np.sqrt(3.0)):.3g} per sweep")
+    elif cfg.frame != "whole_rho":
+        limit = (f"limit {y_lim:.3g} ({cfg.method}, {cfg.predictor} predictor, n_corr "
+                 f"{cfg.n_corr}) -> dt <= {receipt['dt_max_as']:.4g} as")
+    else:
+        limit = "whole_rho frame (no static limit)"
     say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius of the "
         f"dSigma commutator map, {len(est)} power iterations, last change "
-        f"{100 * receipt['change']:.2g} %), h*sigma = {receipt['y']:.3g}, "
-        + (f"limit {y_lim:.3g} ({cfg.method}, {cfg.predictor} predictor, n_corr {cfg.n_corr}) "
-           f"-> dt <= {receipt['dt_max_as']:.4g} as" if cfg.frame != "whole_rho" else
-           f"whole_rho frame (no static limit)") + (f"; probe {pr}" if probes else "")
+        f"{100 * receipt['change']:.2g} %), h*sigma = {receipt['y']:.3g}, " + limit
+        + (f"; probe {pr}" if probes else "")
         + (f"; auto dt = {cfg.dt * T:.4g} as" if auto else ""))
     if not stable and cfg.frame != "whole_rho" and cfg.dt > dt_sig:
         alts = []
@@ -469,6 +492,19 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
             f"so no probe ran; want: a finite sigma limit to compare dt with, then the probe; "
             f"why: without either test the step is not known to be stable; fix: dt = 'auto', "
             f"another n_corr / predictor, or method = 'etdrk4' / 'dp54'")
+    if not stable and implicit:
+        q = probes[-1]
+        why = (f"{q['n_fail']} of its {tp.PROBE_STEPS} steps' node equations did not converge "
+               f"in node_max_iter = {cfg.node_max_iter} evaluations" if q["n_fail"] else
+               f"it grows by {q['growth']:.4g} per step")
+        raise ValueError(
+            f"GATE td_magnus_stability: got: dt = {cfg.dt * T:.4g} as with converged nodes, but "
+            f"the scheme's own step at {tp.PROBE_STEP_FACTOR} dt = {q['probe_dt_as']:.4g} as is "
+            f"not usable on this model: {why} (field off, {tp.PROBE_STEPS} steps from a random "
+            f"coherence); want: growth <= {1.0 + tp.PROBE_TOLERANCE:.4g} per step and every node "
+            f"solve converged at {tp.PROBE_STEP_FACTOR} dt, a 25 % margin; why: a step whose "
+            f"node solve fails or grows there is not known to be usable at dt; fix: a smaller "
+            f"dt, a larger node_max_iter / node_memory, or node_solver = 'truncated'")
     if not stable:
         q = probes[-1]
         raise ValueError(
@@ -512,6 +548,8 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
         dt=float(v["control.timesteps.dt_measure"] if auto or not v["lorrax.dt"]
                  else v["lorrax.dt"]),
         n_corr=int(v["lorrax.n_corr"]), predictor=v["lorrax.predictor"], frame=magnus_frame(v),
+        node_solver=v["lorrax.node_solver"], node_tol=float(v["lorrax.node_tol"]),
+        node_max_iter=int(v["lorrax.node_max_iter"]), node_memory=int(v["lorrax.node_memory"]),
         atol=float(v["control.ivp.atol"]), rtol=float(v["control.ivp.rtol"]),
         max_step=float(v["control.timesteps.max_step"]), chunk=min(chunk, nt),
         remainder=bool(v["system.depopulation"] != 0.0
@@ -538,9 +576,8 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             system.ops, model, drive, mesh, cell_volume=system.cell_volume,
             nspinor=system.nspinor, count=count, mtsteps=outs.mtsteps,
             on_chunk=on_chunk, resume=resume)
-    stats["check_dsigma"] = 0 if check is None else (
-        2 * tp.COUPLING_POWER_ITERATIONS + len(check["probes"]) * tp.PROBE_STEPS
-        * tp.dsigma_per_step(cfg.method, cfg.n_corr))
+    stats["check_dsigma"] = 0 if check is None else (     # power iteration + every probe call
+        1 + 2 * tp.COUPLING_POWER_ITERATIONS + sum(q["dsigma"] for q in check["probes"]))
     stats["check_probes"] = [] if check is None else check["probes"]
     stats["dt"] = cfg.dt
     stats["wall"] = time.perf_counter() - t_start
@@ -568,7 +605,11 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
         f"nb = {system.nb}, nk = {system.nk} (padded {system.nk_pad}), "
         f"nspinor = {system.nspinor}",
         f"  integrator      : {v['lorrax.method']}, {step}"
-        + (f", n_corr = {v['lorrax.n_corr']}" if v["lorrax.method"] in ("magnus2", "cfm4") else ""),
+        + ((f", Gauss nodes converged ({v['lorrax.node_solver']}, node_tol "
+            f"{v['lorrax.node_tol']:.3g}, memory {v['lorrax.node_memory']}, at most "
+            f"{v['lorrax.node_max_iter']} node-map evaluations per step)")
+           if v["lorrax.node_solver"] != "truncated" else
+           f", n_corr = {v['lorrax.n_corr']}" if v["lorrax.method"] in ("magnus2", "cfm4") else ""),
         f"  self-energy     : {model.name}",
         f"  intraband [r,.] : {'on' if system.ops.intra is not None else 'off'}",
         f"  drives          : {len(deck.trials)}",
@@ -615,4 +656,10 @@ def summarize(deck: TdDeck, stats: dict) -> str:
         f"first chunk incl. compile {stats['wall_first_chunk']:.2f} s)",
         f"  final time      : {stats['t_final'] * tdgw_io.T_IN_ATTOSEC:.3f} as",
     ]
+    nd = stats.get("nodes")
+    if nd:
+        lines.insert(3, f"  node solves     : {nd['n_eval']} node-map evaluations ({nd['mean']:.3f} "
+                        f"per step, at most {nd['max_run']}), largest final residual "
+                        f"{nd['res_max']:.3g} (node_tol {nd['tol']:.3g}, {nd['solver']}, "
+                        f"memory {nd['memory']})")
     return "\n".join(lines)

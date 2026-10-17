@@ -94,7 +94,9 @@ def main():
                probe=probe, over=run(2.0 * dt_max, "over"), at_limit=run(0.999 * dt_max, "at_limit"),
                under=run(0.5 * dt_max, "under"), auto=run("auto", "auto"))
     tp.magnus_dt_limit = lambda cfg, sigma: (np.inf, 0.0)    # the twin: no gate (neither
-    tp.step_growth = lambda *a, **k: (1.0, np.ones(1))          # the sigma test nor the probe)
+    tp.step_growth = lambda *a, **k: ((1.0, np.ones(1), dict(n_eval=0, n_eval_max=0, n_fail=0,
+                                                             dsigma=0))
+                                      if k.get("with_counts") else (1.0, np.ones(1)))  # nor the probe)
     out["over_ungated"] = run(2.0 * dt_max, "over_ungated")
     print("RESULT " + json.dumps(out), flush=True)
 

@@ -53,6 +53,7 @@ __all__ = [
     "CFM4_NODES", "CFM4_WEIGHTS", "CFM4_HISTORY", "MIDPOINT_NODES", "MIDPOINT_HISTORY",
     "CF4_QUADRATURE", "TRIPLE_JUMP",
     "ip_cf4_flow", "ip_midpoint_flow", "ip_magnus_step", "frozen_generator",
+    "ANDERSON_REG", "NodeSolve", "anderson_fixed_point", "ip_magnus_implicit_step",
     "magnus_midpoint_step",
     "magnus_amplification", "magnus_stability_limit", "magnus_growth",
     "compose_strang", "fixed_advance",
@@ -628,6 +629,170 @@ def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
     return inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g
 
 
+#: Tikhonov parameter of the Anderson least squares, relative to the unit diagonal
+#: of the column-normalized Gram matrix (columns closer than ~1e-5 in angle are merged).
+ANDERSON_REG = 1e-10
+
+
+class NodeSolve(NamedTuple):
+    """The outcome of one implicit node solve (:func:`anderson_fixed_point`).
+
+    n_eval : int32, evaluations of the fixed-point map (the first, at the guess,
+        included); each costs one call of B per node.
+    converged : bool, every trial reached ||F(g) - g|| <= tol ||g||.
+    residual : float64, the largest relative residual ||F(g) - g|| / ||g|| over
+        the trials at the last evaluation (0 for g = F(g) = 0).
+    reached : int32 (len(milestones),), the evaluation at which that residual
+        first fell to <= each milestone (0: not reached).  The iterates do not
+        depend on tol before it stops, so a solve to a tighter tol tells the
+        count a looser one would take (up to its effect on later predictions).
+    """
+    n_eval: jax.Array
+    converged: jax.Array
+    residual: jax.Array
+    reached: jax.Array
+
+
+def _trial_dot(a, b):
+    """Re <a, b> per trial over tuples of arrays with the trial axis first: (ntr,)."""
+    out = None
+    for x, y in zip(a, b):
+        d = jnp.sum(jnp.real(jnp.conj(x) * y), axis=tuple(range(1, x.ndim)))
+        out = d if out is None else out + d
+    return out
+
+
+def _per_trial(s, a):
+    """s (ntr,) broadcast against a (ntr, ...)."""
+    return s.reshape(s.shape + (1,) * (a.ndim - 1)).astype(a.dtype)
+
+
+def anderson_fixed_point(fmap: Callable, g0, *, tol, max_iter: int, memory: int,
+                         reg: float = ANDERSON_REG, constrain: Callable = None,
+                         milestones=()):
+    """g = fmap(g) by Anderson acceleration, type II, real coefficients.
+
+    ``g`` is a tuple of arrays whose leading axis is the trial (each trial an
+    independent problem: its own coefficients and its own residual).  With
+    f_k = fmap(g_k) - g_k and E_k, D_k the last min(k, memory) differences of
+    f and of fmap(g), each column pair scaled by 1 / ||E_j|| (so the Gram
+    matrix has a unit diagonal and ``reg`` is relative),
+
+        gamma_k = argmin_gamma ||f_k - E_k gamma||^2 + reg ||gamma||^2,
+        g_{k+1} = fmap(g_k) - D_k gamma_k
+
+    (Walker & Ni, SIAM J. Numer. Anal. 49, 1715 (2011), mixing 1; for an
+    affine map with unlimited memory the iterates are GMRES's).  gamma is real
+    (real inner product Re<a, b>): a real combination of Hermitian iterates
+    stays Hermitian.  The first step (no columns) is the plain fixed-point
+    step.  Stops when every trial has ||f_k|| <= tol ||g_k|| (Frobenius norm
+    over all leaves), or after ``max_iter`` evaluations of ``fmap``; a
+    ``lax.while_loop`` with fixed-size column buffers, so it runs inside a jit.
+    ``constrain`` (optional) is applied to the stacked (memory, ...) buffers
+    (a sharding constraint).  ``milestones``: relative residuals whose first
+    crossing is recorded (:class:`NodeSolve` ``reached``).
+
+    Returns (fmap(g_k) at the stopping iterate, :class:`NodeSolve`).
+    """
+    m = int(memory)
+    if m < 1 or int(max_iter) < 1:
+        raise ValueError(f"anderson_fixed_point: memory {m} and max_iter {max_iter} must be >= 1")
+    pin = (lambda a: a) if constrain is None else constrain
+    g0 = tuple(g0)
+
+    def measure(g, fg):
+        f = tuple(a - b for a, b in zip(fg, g))
+        rn = jnp.sqrt(_trial_dot(f, f))
+        gn = jnp.sqrt(_trial_dot(g, g))
+        rel = jnp.where(rn == 0.0, 0.0, rn / jnp.where(gn == 0.0, 1.0, gn))
+        return f, jnp.all(rn <= tol * gn), jnp.max(rel)
+
+    thr = jnp.asarray(tuple(float(v) for v in milestones), jnp.float64)
+    f0g = tuple(fmap(g0))
+    f0, done0, res0 = measure(g0, f0g)
+    reached0 = jnp.where(res0 <= thr, 1, 0).astype(jnp.int32)
+    zeros = tuple(pin(jnp.zeros((m,) + a.shape, a.dtype)) for a in g0)
+    eye = jnp.eye(m)
+
+    def cond(s):
+        n_eval, _, _, _, _, _, _, done, _, _ = s
+        return (~done) & (n_eval < max_iter)
+
+    def body(s):
+        n_eval, n_col, g, fg, f, e_buf, d_buf, _, _, reached = s
+        valid = jnp.arange(m) < jnp.minimum(n_col, m)                         # (m,)
+        gram = None
+        rhs = None
+        for e, fl in zip(e_buf, f):
+            ee = jnp.real(jnp.einsum("it...,jt...->tij", jnp.conj(e), e))
+            ef = jnp.real(jnp.einsum("it...,t...->ti", jnp.conj(e), fl))
+            gram = ee if gram is None else gram + ee
+            rhs = ef if rhs is None else rhs + ef
+        vv = valid[:, None] & valid[None, :]
+        gram = jnp.where(vv[None], gram, eye[None]) + reg * eye[None]
+        rhs = jnp.where(valid[None], rhs, 0.0)
+        gamma = jnp.linalg.solve(gram, rhs[..., None])[..., 0]               # (ntr, m)
+        g_new = tuple(a - jnp.einsum("ti,it...->t...", gamma.astype(d.dtype), d)
+                      for a, d in zip(fg, d_buf))
+        fg_new = tuple(fmap(g_new))
+        f_new, done, res = measure(g_new, fg_new)
+        de = tuple(a - b for a, b in zip(f_new, f))
+        dd = tuple(a - b for a, b in zip(fg_new, fg))
+        nrm = jnp.sqrt(_trial_dot(de, de))
+        scale = jnp.where(nrm > 0.0, 1.0 / jnp.where(nrm > 0.0, nrm, 1.0), 0.0)
+        slot = jnp.mod(n_col, m)
+        e_buf = tuple(pin(jax.lax.dynamic_update_index_in_dim(b, _per_trial(scale, a) * a, slot, 0))
+                      for b, a in zip(e_buf, de))
+        d_buf = tuple(pin(jax.lax.dynamic_update_index_in_dim(b, _per_trial(scale, a) * a, slot, 0))
+                      for b, a in zip(d_buf, dd))
+        reached = jnp.where((reached == 0) & (res <= thr), n_eval + 1, reached).astype(jnp.int32)
+        return (n_eval + 1, n_col + 1, g_new, fg_new, f_new, e_buf, d_buf, done, res, reached)
+
+    init = (jnp.int32(1), jnp.int32(0), g0, f0g, f0, zeros, zeros, done0, res0, reached0)
+    n_eval, _, _, fg, _, _, _, done, res, reached = jax.lax.while_loop(cond, body, init)
+    return fg, NodeSolve(n_eval=n_eval, converged=done, residual=res, reached=reached)
+
+
+def ip_magnus_implicit_step(field: Callable, state_nodes: Callable, inner: Callable,
+                            free: Callable, t, x, h, guess, *, nodes, tol, max_iter: int,
+                            memory: int, reg: float = ANDERSON_REG, constrain: Callable = None,
+                            milestones=()):
+    """One Magnus step on x = y - y_eq with self-consistent (converged) node values.
+
+    The node map of :func:`ip_magnus_step`,
+
+        F(g)_i = free(B(t + c_i h, inner(gen_g, t, x, c_i h)), -c_i h),
+        gen_g = frozen_generator(field, free, t, h, nodes, g),
+
+    is the exact map of the step: every exponential, the composition with a
+    remainder, B at the propagated node states; no linearization enters.  The
+    truncated step applies it n_corr times to a prediction; here g solves the
+    implicit node equations g = F(g) to ||F(g) - g|| <= tol ||g|| per trial
+    (:func:`anderson_fixed_point` from ``guess``, at most ``max_iter``
+    evaluations of F, each len(nodes) calls of B), so the step does not
+    depend on the guess beyond the tolerance.  For B linear in the deviation
+    and one transition the converged step is the two-stage Gauss collocation
+    of the linearized flow, whose amplification has modulus 1 on the whole
+    imaginary axis (:func:`magnus_amplification` with ``n_corr=None``): the
+    h·σ limit of the truncated step does not apply.  ``state_nodes(times,
+    states) -> values`` evaluates B at every node (one batched call where the
+    caller can).  Returns (x(t + h), g in the frame of t, :class:`NodeSolve`);
+    an unconverged solve is reported, never hidden (the caller refuses it).
+    """
+    nodes = tuple(float(c) for c in nodes)
+
+    def fmap(g):
+        gen = frozen_generator(field, free, t, h, nodes, g)
+        xs = tuple(inner(gen, t, x, c * h) for c in nodes)
+        bs = state_nodes(tuple(t + c * h for c in nodes), xs)
+        return tuple(free(b, -c * h) for b, c in zip(bs, nodes))
+
+    g, info = anderson_fixed_point(fmap, tuple(guess), tol=tol, max_iter=max_iter,
+                                   memory=memory, reg=reg, constrain=constrain,
+                                   milestones=milestones)
+    return inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g, info
+
+
 def _node_quadrature(nodes):
     """A[i, j] = ∫_0^{c_i} ℓ_j, b[j] = ∫_0^1 ℓ_j for the Lagrange basis ℓ_j on ``nodes``."""
     from numpy.polynomial import polynomial as npoly
@@ -645,7 +810,7 @@ def _node_quadrature(nodes):
     return a, b
 
 
-def magnus_amplification(nodes, history, n_corr: int, z) -> np.ndarray:
+def magnus_amplification(nodes, history, n_corr, z) -> np.ndarray:
     """The linearized predictor–corrector Magnus step on u' = λu, z = hλ.
 
     For a coupling B linear in the deviation (linear response), every
@@ -659,8 +824,12 @@ def magnus_amplification(nodes, history, n_corr: int, z) -> np.ndarray:
 
     A, b the integrals of the Lagrange basis on the nodes (for the two Gauss
     nodes: the 2-stage Gauss collocation matrix, |eig A| = 1/(2 sqrt 3), so
-    the corrections are its fixed-point iteration).  Returns the
-    (1 + len(history))-square matrix of that map.
+    the corrections are its fixed-point iteration).  ``n_corr=None`` is the
+    converged step (:func:`ip_magnus_implicit_step`): G = (1 - zA)^{-1} z u_n 1,
+    the collocation itself, u_{n+1} = R(z) u_n with R the (2,2) Padé
+    approximant of e^z for the Gauss nodes (|R(iy)| = 1 for every real y);
+    the predictor drops out.  Returns the (1 + len(history))-square matrix
+    of that map.
     """
     a, b = _node_quadrature(nodes)
     w = extrapolation_weights(history, list(nodes))
@@ -671,13 +840,15 @@ def magnus_amplification(nodes, history, n_corr: int, z) -> np.ndarray:
         s0[col] = 1.0
         u, hist = s0[0], s0[1:]
         g = w @ hist
-        for _ in range(int(n_corr)):
+        if n_corr is None:
+            g = np.linalg.solve(np.eye(m) - z * a, z * u * np.ones(m))
+        for _ in range(0 if n_corr is None else int(n_corr)):
             g = z * u * np.ones(m) + z * (a @ g)
         out[:, col] = np.concatenate([[u + b @ g], np.concatenate([hist, g])[-nh:]])
     return out
 
 
-def magnus_stability_limit(nodes, history, n_corr: int, *, growth: float = 1e-6,
+def magnus_stability_limit(nodes, history, n_corr, *, growth: float = 1e-6,
                            y_cap: float = 8.0, dy: float = 1e-3) -> float:
     """Largest y with spectral radius of magnus_amplification(i y') <= 1 + growth for all y' <= y.
 
@@ -693,7 +864,8 @@ def magnus_stability_limit(nodes, history, n_corr: int, *, growth: float = 1e-6,
     truncated fixed-point (Picard) iteration of a collocation is unstable on
     the imaginary axis at some truncation orders, as explicit RK of order 1
     and 2 are.  ``tests/tdagw/test_prop_stability_cpu.py`` checks the
-    recurrence against the growth of the real step.
+    recurrence against the growth of the real step.  ``n_corr=None`` (the
+    converged nodes) has no limit on the axis: ``y_cap``.
     """
     for y in np.arange(dy, y_cap + 0.5 * dy, dy):
         if magnus_growth(nodes, history, n_corr, y) > 1.0 + growth:
@@ -701,7 +873,7 @@ def magnus_stability_limit(nodes, history, n_corr: int, *, growth: float = 1e-6,
     return float(y_cap)
 
 
-def magnus_growth(nodes, history, n_corr: int, y: float) -> float:
+def magnus_growth(nodes, history, n_corr, y: float) -> float:
     """Growth per step of the recurrence at z = i y: the spectral radius of magnus_amplification."""
     return float(np.max(np.abs(np.linalg.eigvals(
         magnus_amplification(nodes, history, n_corr, 1j * float(y))))))
