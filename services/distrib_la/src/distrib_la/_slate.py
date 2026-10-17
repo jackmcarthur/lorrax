@@ -180,6 +180,99 @@ def validate_tile_layout(n: int, nb: int, p: int, q: int, *, what: str,
             f"layout at one tile per rank.  Omit block_size.")
 
 
+# -------------------------------------------------------------------------
+#  Device workspace: SLATE's tile pool inside XLA's buffer assignment
+# -------------------------------------------------------------------------
+# SLATE's Target::Devices drivers keep their device tiles in a per-matrix pool
+# that, left alone, allocates with a raw device_malloc OUTSIDE the XLA arena:
+# insertLocalTiles takes one block per local tile, and getrf / potrf / he2hb /
+# trsm / unmqr's reserveDeviceWorkspace() one more per local tile where the tiles
+# are user-owned.  On ROCM the BFC arena is preallocated (runtime.pool_fraction,
+# 60.18 of 68.70 GB per MI250X GCD), so SLATE got ~7 GB: eigh needed ~4.5 n^2/P
+# bytes there (A, Z, Z1d, he2hb's W) and aborted every rank above n ~ 20k c128
+# at P4 (blas::Error "out of memory, in function device_malloc", thrown from an
+# OpenMP task: no FFI error, an abort).  The device handlers now take one more
+# output, a u8 workspace sized here and never read, and seed each matrix's pool
+# from it (cpp/slate/pool_seed.h), so the tiles are XLA buffers: in the compiled
+# program's memory_analysis and in the arena.  The C++ side applies the same
+# per-matrix rule (local tiles + _pool_extra) and falls back to device_malloc
+# only past the end of the buffer (LORRAX_SLATE_POOL_REPORT=1 counts it).
+_POOL_ALIGN = 256
+
+
+def _device_leg(mesh: Mesh) -> bool:
+    """The device handlers (ROCM, CUDA) take the workspace; the host leg's do not."""
+    return _mesh_platform(mesh) in ("ROCM", "CUDA")
+
+
+def _pool_extra(mt: int, nt: int) -> int:
+    """Remote tiles a Devices driver holds beside the local ones: a panel column and
+    row, twice for the lookahead (cpp/slate: extra_tiles / owned)."""
+    return 2 * (mt + nt) + 8
+
+
+def _max_local_tiles(mt: int, nt: int, p: int, q: int, *, lower: bool = False) -> int:
+    """The most tiles any rank of a 2-D block-cyclic ``p x q`` grid holds (lower
+    triangle only for a Hermitian matrix): every rank gets the same workspace shape."""
+    import numpy as np
+    i = np.arange(mt)[:, None]
+    j = np.arange(nt)[None, :]
+    best = 0
+    for x in range(p):
+        for y in range(q):
+            m = (i % p == x) & (j % q == y)
+            if lower:
+                m = m & (i >= j)
+            best = max(best, int(m.sum()))
+    return best
+
+
+def _pool_bytes(*matrices) -> int:
+    """Workspace bytes for ``(blocks, block_bytes)`` pools carved in order."""
+    total = 0
+    for blocks, block_bytes in matrices:
+        total = -(-total // _POOL_ALIGN) * _POOL_ALIGN + int(blocks) * int(block_bytes)
+    return max(total, _POOL_ALIGN)
+
+
+def eigh_workspace_bytes(side: int, nb: int, p: int, q: int, itemsize: int,
+                         compute_evecs: bool = True) -> int:
+    """The seeded heev driver's pools: A (lower), Z (2-D) and Z1d (1 x P columns)."""
+    mt = nt = side // nb
+    tile = nb * nb * itemsize
+    pools = [(_max_local_tiles(mt, nt, p, q, lower=True) + _pool_extra(mt, nt), tile)]
+    if compute_evecs:
+        ranks = p * q
+        pools.append((_max_local_tiles(mt, nt, p, q) + _pool_extra(mt, nt), tile))
+        pools.append((-(-nt // ranks) * mt + _pool_extra(mt, nt), tile))
+    return _pool_bytes(*pools)
+
+
+def lu_workspace_bytes(n: int, nrhs: int | None, nb: int, p: int, q: int,
+                       itemsize: int) -> int:
+    """getrf / getrs pools: A (n x n, nb x nb) and, with ``nrhs``, X (n x nrhs, nb x nrhs/q)."""
+    mt = nt = n // nb
+    pools = [((n // p // nb) * (n // q // nb) + _pool_extra(mt, nt), nb * nb * itemsize)]
+    if nrhs:
+        nb_b = nrhs // q
+        pools.append(((n // p // nb) + _pool_extra(mt, q), nb * nb_b * itemsize))
+    return _pool_bytes(*pools)
+
+
+def potrf_workspace_bytes(n: int, nb: int, p: int, q: int, itemsize: int) -> int:
+    """potrf's pool: its reservation (one block per local lower tile) plus the
+    remote tiles in flight; at one tile per rank one block on 2 x 2, three beyond."""
+    mt = nt = n // nb
+    if mt == p:
+        return _pool_bytes((1 + (2 if p > 2 else 0), nb * nb * itemsize))
+    return _pool_bytes((_max_local_tiles(mt, nt, p, q, lower=True) + _pool_extra(mt, nt),
+                        nb * nb * itemsize))
+
+
+def _ws_struct(nbytes: int):
+    return jax.ShapeDtypeStruct((int(nbytes),), jnp.uint8)
+
+
 def _make_ctx(mesh: Mesh) -> int:
     ensure_registered(mesh)
     rank = int(jax.process_index())
@@ -374,13 +467,20 @@ def distributed_cholesky(
     # correctly for any p x q mesh.
     L_local_T = jax.ShapeDtypeStruct((n // q, n // p), A.dtype)
     attrs = dict(n=n, nb=nb, ctx_key=int(ctx_key))
+    device = _device_leg(mesh)
+    results = ((L_local_T, _ws_struct(potrf_workspace_bytes(n, nb, p, q, A.dtype.itemsize)))
+               if device else L_local_T)
 
     @partial(shard_map, mesh=mesh,
              in_specs=P("x", "y"), out_specs=P("y", "x"),
              check_vma=False)
     def _potrf(local_A):
         local_A_T = jnp.transpose(local_A, (1, 0))
-        return jax.ffi.ffi_call(_POTRF_FFI_TARGET, L_local_T)(local_A_T, **attrs)
+        out = jax.ffi.ffi_call(_POTRF_FFI_TARGET, results,
+                               input_output_aliases={0: 0} if device else None,
+                               )(local_A_T, **attrs)
+        # The device handlers' second result is SLATE's pool seed (never read).
+        return out[0] if device else out
 
     L_raw_T = _potrf(A)
     return SlateLowerL(raw=L_raw_T, mesh=mesh, n=n, nb=nb)
@@ -515,8 +615,9 @@ def distributed_eigh(
             f"distributed_eigh: tile {nb} does not divide the solve tile "
             f"{side // p} (side {side}, {p}x{q} mesh).")
 
+    device = _device_leg(mesh)
     key = ("eigh", mesh_key(mesh), A.dtype, n, side, nb,
-           bool(compute_evecs), int(ctx_key))
+           bool(compute_evecs), int(ctx_key), device)
     jit_eigh = _JIT_CACHE.get(key)
     if jit_eigh is None:
         local = side // p
@@ -530,6 +631,10 @@ def distributed_eigh(
         Q_local_T = jax.ShapeDtypeStruct((local, local), A.dtype)
         attrs = dict(n=side, nb=nb, ctx_key=int(ctx_key),
                      compute_evecs=bool(compute_evecs))
+        results = (W_local, Q_local_T)
+        if device:
+            results = results + (_ws_struct(eigh_workspace_bytes(
+                side, nb, p, q, A.dtype.itemsize, bool(compute_evecs))),)
 
         @partial(shard_map,
                  mesh=mesh,
@@ -542,7 +647,7 @@ def distributed_eigh(
             # rank-remap).  Same convention as distributed_cholesky.
             local_A_T = jnp.transpose(local_A, (1, 0))
             W, Q_T = jax.ffi.ffi_call(
-                _EIGH_FFI_TARGET, (W_local, Q_local_T))(local_A_T, **attrs)
+                _EIGH_FFI_TARGET, results)(local_A_T, **attrs)[:2]
             # Q_T's rows are Q's columns: the eigenvalue index, over 'y',
             # laid out block-cyclically at nb < N/p.  Put them in W's
             # ascending order, then untranspose (Q at P('x','y')).
@@ -701,6 +806,7 @@ def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh,
     if fn is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // q, n // p), A.dtype)
         LU_local_T = jax.ShapeDtypeStruct((nq, n // q, n // p), A.dtype)
+        WS = _ws_struct(lu_workspace_bytes(n, nrhs, nb, p, q, A.dtype.itemsize))
         attrs = dict(nq=nq, n=n, nrhs=nrhs, nb=nb, nb_b=nb_b, ctx_key=ctx_key)
 
         @partial(shard_map, mesh=mesh,
@@ -708,8 +814,8 @@ def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh,
                  out_specs=P(None, "x", "y"), check_vma=False)
         def _solve(local_A, local_B):
             # Row-major shard -> col-major local block (the wrappers' convention).
-            X_T, _ = jax.ffi.ffi_call(
-                _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
+            X_T, _, _ = jax.ffi.ffi_call(
+                _SOLVE_LU_TARGET, (X_local_T, LU_local_T, WS),
                 input_output_aliases={0: 1, 1: 0},
             )(jnp.transpose(local_A, (0, 2, 1)), jnp.transpose(local_B, (0, 2, 1)), **attrs)
             return _rows_in_order(jnp.transpose(X_T, (0, 2, 1)), n=n, p=p, q=q, nb=nb)
@@ -737,13 +843,14 @@ def batched_distributed_getrf(A: jax.Array, *, mesh: Mesh,
     if fn is None:
         LU_local_T = jax.ShapeDtypeStruct((nq, n // q, n // p), A.dtype)
         piv_local = jax.ShapeDtypeStruct((nq, piv_len), jnp.int64)
+        WS = _ws_struct(lu_workspace_bytes(n, None, nb, p, q, A.dtype.itemsize))
         attrs = dict(nq=nq, n=n, nb=nb, piv_len=piv_len, ctx_key=ctx_key)
 
         @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),),
                  out_specs=(P(None, "x", "y"), P(None, ("x", "y"))), check_vma=False)
         def _getrf(local_A):
-            LU_T, piv = jax.ffi.ffi_call(
-                _GETRF_TARGET, (LU_local_T, piv_local),
+            LU_T, piv, _ = jax.ffi.ffi_call(
+                _GETRF_TARGET, (LU_local_T, piv_local, WS),
                 input_output_aliases={0: 0},
             )(jnp.transpose(local_A, (0, 2, 1)), **attrs)
             return jnp.transpose(LU_T, (0, 2, 1)), piv
@@ -773,6 +880,7 @@ def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
     fn = _LU_JIT_CACHE.get(key)
     if fn is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // q, n // p), B.dtype)
+        WS = _ws_struct(lu_workspace_bytes(n, nrhs, nb, p, q, LU.dtype.itemsize))
         attrs = dict(nq=nq, n=n, nrhs=nrhs, nb=nb, nb_b=nb_b, piv_len=piv_len,
                      ctx_key=ctx_key)
 
@@ -780,8 +888,8 @@ def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
                  in_specs=(P(None, "x", "y"), P(None, ("x", "y")), P(None, "x", "y")),
                  out_specs=P(None, "x", "y"), check_vma=False)
         def _getrs(local_LU, local_piv, local_B):
-            X_T = jax.ffi.ffi_call(
-                _GETRS_TARGET, X_local_T, input_output_aliases={2: 0},
+            X_T, _ = jax.ffi.ffi_call(
+                _GETRS_TARGET, (X_local_T, WS), input_output_aliases={2: 0},
             )(jnp.transpose(local_LU, (0, 2, 1)), local_piv,
               jnp.transpose(local_B, (0, 2, 1)), **attrs)
             return _rows_in_order(jnp.transpose(X_T, (0, 2, 1)), n=n, p=p, q=q, nb=nb)

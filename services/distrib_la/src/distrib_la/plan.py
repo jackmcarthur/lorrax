@@ -1624,6 +1624,27 @@ class Plan:
         return cached_scan(key, _build)(*ops)
 
 
+def _size_routed_library(op: str, requested: str, mesh_xy: Mesh, n, resolved: str) -> bool:
+    """``distributed`` resolved to the leg's library BY SIZE: ``n`` past the leg's
+    one-device row (:data:`distrib_la.resolve.ONE_DEVICE_MAX_N`).  Recorded on the
+    route ledger (:func:`new_stack_routes`) when true.  A shape rule: no exchange."""
+    from distrib_la import resolve as _resolve
+    if (str(requested).strip().lower() != "distributed" or n is None
+            or resolved in (NATIVE, ONE_DEVICE)):
+        return False
+    platform = _resolve.mesh_platform(mesh_xy)
+    bound = _resolve.ONE_DEVICE_MAX_N.get((op, platform))
+    if bound is None or int(n) <= int(bound):
+        return False
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    _resolve._SIZE_DECISIONS.setdefault(
+        ("batched-route", op, platform, px, py, int(n)),
+        f"{op} 'distributed' n={int(n)} on the {px}x{py} {platform} mesh: batched route "
+        f"'auto' -> {resolved}'s own entry (n > {bound}: the size route chose {resolved}; "
+        f"the default route (c) would solve each matrix whole on one device)")
+    return True
+
+
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
          n: int | None = None,
          batched_route: str | None = None,
@@ -1681,6 +1702,7 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     """
     if op not in OPS:
         raise ValueError(f"unknown linalg op {op!r} (known: {'|'.join(OPS)})")
+    route_defaulted = batched_route is None and budget_bytes is None
     if batched_route is None:
         batched_route = "auto" if budget_bytes is not None else BATCHED_ROUTE_DEFAULT
     batched_route = str(batched_route).strip().lower()
@@ -1698,6 +1720,14 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         # A room caps the size route of ``distributed`` as well (guard 1b): one
         # whole matrix per rank must fit it, or the leg's library runs.
         resolved = resolve_backend(op, backend, mesh_xy, n=n, room=budget_bytes)
+    if (route_defaulted and batched_route == ROUTE_BATCH_RESHARD
+            and _size_routed_library(op, backend, mesh_xy, n, resolved)):
+        # Route (c) solves each matrix WHOLE on one device: exactly what the size
+        # route just ruled out for this n.  Left as the default it ran a 20480
+        # complex LU on one GCD of a plan that reports slate (MI250X P4,
+        # dlascale probe1); the leg library's own route runs instead.  An
+        # explicit batched_route is honoured as named.
+        batched_route = "auto"
     ffi = resolved != NATIVE
     if budget_bytes is not None:
         import operator
