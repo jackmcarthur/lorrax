@@ -5,6 +5,30 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-17 — k-convolution kernels: faster mathdx modes 7, 9 and 11 (CUDA); a new native target
+
+The NVRTC-built k-convolution kernels (`src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`) gain
+faster arms; every output is bitwise identical to the previous kernels.
+
+- **Mode 7** (W_R pass): a fused single-arm tile for n_s <= 2 (cp.async gather,
+  orbit-blocked tiles, k-fastest index tables) and a split arm (persistent plane pass,
+  pair-major W_R, overlapped column pass) with an n_s = 1 rule. **Mode 9**: batched W2
+  gather and a fixed-column store. **Mode 11** (chi0 from the raw-parent Greens, n_s = 2):
+  a fused single-arm tile; `make_kconv_chi_unfold(acc=None)` writes without an
+  accumulator, and `acc=None, rows=q` stores only the q rows of the flat-k transform
+  through the new target `lorrax_mathdx_kconv_chi_unfold_q`, which `gw.w_isdf`'s direct
+  stream uses wherever `fn.q_store` holds.
+- **Results do not move:** bitwise on 45 k-grid cases x modes 7 and 9 and 21 mode-11
+  comparisons (A100), and Fe 8^3 P4 eqp0/eqp1/sigma_diag bodies. Fe 8^3 P4 one map, warm
+  (A100, BFC default pool): W response 198.6 -> 159.6 s, Sigma tau sweep 141.4 -> 107.0 s,
+  map wall 346.9 -> 273.4 s.
+- **What you must change:** nothing in decks. The Python needs a `liblorrax_ffi.so` built
+  from this source: with an older CUDA leg, an n_s = 2 mode-11 deck fails loudly
+  (`lorrax_mathdx_kconv_chi_unfold_q` unregistered; the old handler refuses `acc=None`).
+  Rebuild a clone's pair (`config/perlmutter/build_ffi_cuda.sh`); the Perlmutter module is
+  republished with a bundle from this commit. The kernel source changed, so the cubin
+  store recompiles each (mode, grid) once (about 8 s each).
+
 ## 2026-10-16 — Native dependencies: recorded at build, enforced at start-up, on every route
 
 Every FFI leg's build records the exact library set it resolved, and every
