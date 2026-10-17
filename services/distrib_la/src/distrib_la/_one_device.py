@@ -16,7 +16,7 @@ backends' operand contract, so a ``distributed`` call site runs it unchanged:
 The movement is route (c)'s (:mod:`distrib_la._batch_reshard`): one
 all_to_all puts whole matrices on ranks, the local kernel solves them
 (``native_eigh``: the leg's eigh route with zero-row deflation;
-``jnp.linalg.solve``), the inverse all_to_all returns the face layout.  A
+``local_lu.solve_local``: ``jnp.linalg.solve``, or the leg's span-blocked LU), the inverse all_to_all returns the face layout.  A
 single matrix is a stack of one: rank 0 solves it, the other ranks hold the
 synthetic padding, and the inverse exchange scatters rank 0's result, so every
 rank's tile comes from ONE solve.
