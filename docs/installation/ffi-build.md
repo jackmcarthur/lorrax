@@ -293,7 +293,25 @@ One process maps one file per family across its legs. The one exception is
 the SLATE stack (SLATE, BLAS++, LAPACK++): in a process with a device leg, the
 device leg opens first and its build answers those SONAMEs for the host leg
 too ([load order](#loader)), so the host leg's record yields for those three
-families. Any other disagreement between the legs' records refuses.
+families. Any other disagreement between the legs' records refuses. "First"
+is the order the legs' `dlopen`s succeeded, recorded at that moment in one
+registry that every loader (`ffi.common.ffi_loader`, `distrib_la.loader`)
+shares, not the order their checks finished.
+
+A yielded family means the host leg's SLATE code would run against the device
+leg's SLATE (on Frontier, SLATE-HIP with OpenBLAS). It must not run. In a
+device process neither loader registers the host leg's SLATE handlers
+(`lorrax_slate_eigh`, `_potrf`, `_batched_potrf`, `_batched_trsm`), both
+`probe_target`s report the refusal, and `distrib_la`'s SLATE call sites raise
+it by name:
+`GATE native-closure: host-leg <target> needs SLATE-CPU but the device leg's SLATE serves this process (…)`.
+The host leg's other handlers (ScaLAPACK, CBLAS, FFTW, phdf5) and its
+`lrx_slate_*` context entries link none of these libraries (`nm -C -u` on the
+host build: only `slate/host_ffi.cc` references `slate::`, `blas::` or
+`lapack::`), so they run (`native_provider.TARGET_FAMILIES`). Run a SLATE op on
+the device mesh, or in a CPU-only process, where the host leg's SLATE is its
+own. Distinct SONAMEs would not fix this: under `RTLD_GLOBAL` the first
+definition of each symbol still wins.
 
 **The refusal and its remedy.** Every refusal is one line:
 
@@ -308,6 +326,7 @@ GATE native-closure: got <what is mapped or found>; want <what the record says>;
 | `no closure record for …` | a leg built before this rule, or by a script that does not record | rebuild with the site's build script |
 | `stale closure record …` | the leg was rebuilt without its record, or a recorded file moved, was purged or was replaced (a module upgrade, a `uv sync` that changed the CUDA or ROCm wheels, a purged `.build`) | rebuild the leg |
 | `<leg> records mpi as … but <leg> (opened first) records …` | the two legs were built against different library sets | rebuild both legs in one environment |
+| `host-leg lorrax_slate_<op> needs SLATE-CPU but the device leg's SLATE serves this process` | a host-leg SLATE op called in a process with a device leg, whose SLATE answers the SONAMEs | run the op on the device mesh, or in a CPU-only process |
 | `libcudart.so on LD_LIBRARY_PATH resolves to <file> …: a second copy of libcudart` (multi-node) | the site transport would dlopen a runtime other than the recorded one (below) | source the site's launch script (`config/perlmutter/gpu_env.sh`, `config/frontier/rocm_env.sh`) before `srun` |
 
 **Before the first collective.** A GPU process opens its device leg as

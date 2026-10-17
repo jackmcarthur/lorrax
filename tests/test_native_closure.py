@@ -102,6 +102,7 @@ def tree(tmp_path, monkeypatch):
     monkeypatch.setattr(npv, "_REVERIFIED", [False])
     monkeypatch.setattr(npv, "_PRIVATE_HANDLES", {})
     monkeypatch.setattr(npv, "_EXPECTED_CACHE", {})
+    monkeypatch.setattr(npv, "_DLOPEN_ORDER", [])
     return t
 
 
@@ -545,3 +546,102 @@ def test_gpu_env_links_the_venv_cuda_runtime(tmp_path):
     sh2 = (f"export SCRATCH={tmp_path} VIRTUAL_ENV={tmp_path}/none LD_LIBRARY_PATH=/tk; "
            f"source {root}/config/perlmutter/gpu_env.sh; echo $LD_LIBRARY_PATH")
     assert subprocess.run(["bash", "-c", sh2], capture_output=True, text=True).stdout.strip() == "/tk"
+
+
+# ------------------------------------------------- dlopen order; borrowed SLATE
+def _rocm_record(tree):
+    """A ROCm leg whose SLATE-HIP build answers libslate for the host leg."""
+    leg = tree.d["build"] / "liblorrax_ffi_rocm.so"
+    leg.write_bytes(b"rocm-leg")
+    slate = tree.root / "slate_hip" / "libslate.so.2"
+    slate.parent.mkdir()
+    slate.write_bytes(b"slate-hip")
+    return npv.ClosureRecord(origin=leg, platform="ROCM", leg=leg, leg_sha256="0" * 64,
+                             entries=(npv.ClosureEntry("libslate.so.2", slate, npv._sha256(slate),
+                                                       9, 0, "private", "libslate"),),
+                             digest="r")
+
+
+def test_closures_merge_in_dlopen_order_not_enforcement_order(tree, monkeypatch):
+    """ffi_loader dlopened [rocm, host]; the host leg finished enforcing first
+    (rocm's first open was refused after its dlopen and retried), so _ENFORCED
+    holds [host]. distrib_la then opens rocm: the merge must see [rocm, host]."""
+    monkeypatch.setattr(npv.ctypes, "CDLL", lambda path, mode=0: None)
+    rocm, host = _rocm_record(tree), _host_record(tree, tree.root / "slate_cpu")
+    npv._DLOPEN_ORDER[:] = [rocm.leg, host.leg]
+    npv._ENFORCED[host.leg] = npv._Enforced(host, "h")
+    npv._preload_closure(rocm, _Unusable)                 # was: "one libslate" refusal
+    npv._ENFORCED[rocm.leg] = npv._Enforced(rocm, "r")     # insertion order: host, rocm
+    assert [r.platform for r in npv._enforced_records()] == ["ROCM", "cpu"]
+    assert npv._merge_expectations(npv._enforced_records(), _Unusable)["libslate"][1] is rocm
+    # a leg not yet dlopened merges last; a host leg truly dlopened first still refuses
+    assert npv._in_dlopen_order([host, rocm])[0] is rocm
+    npv._DLOPEN_ORDER[:] = [host.leg, rocm.leg]
+    with pytest.raises(_Unusable, match="one libslate"):
+        npv._merge_expectations(npv._enforced_records(), _Unusable)
+
+
+def _device_process(tree, monkeypatch, shared_mpi=False):
+    """rocm then host dlopened and enforced through _enforce on faked maps."""
+    rocm, host = _rocm_record(tree), _host_record(tree, tree.root / "slate_cpu")
+    rocm_slate = rocm.entries[0].path
+    mpi = tree.d["mpich"] / "libmpi_gnu_123.so.12"
+    if shared_mpi:                         # the device leg records the very same MPI
+        from dataclasses import replace
+        rocm = replace(rocm, entries=rocm.entries + tuple(e for e in host.entries
+                                                          if e.family == "mpi"))
+    monkeypatch.setattr(npv, "_mapped_sonames",
+                        lambda: {rocm.leg: rocm.leg.name, host.leg: host.leg.name,
+                                 rocm_slate: "libslate.so.2", mpi: "libmpi_gnu_123.so.12"})
+    npv._DLOPEN_ORDER[:] = [rocm.leg, host.leg]
+    for rec in (rocm, host):
+        npv._ENFORCED[rec.leg] = npv._enforce(rec, _Unusable, "")
+        npv._PLATFORM_LEG[rec.platform] = rec.leg
+    return rocm, host
+
+
+def test_a_yielded_family_is_recorded_as_served_by_the_device_leg(tree, monkeypatch):
+    rocm, host = _device_process(tree, monkeypatch, shared_mpi=True)
+    # MPI: both legs record the same file, so the host leg borrows nothing there
+    assert npv.families_served_elsewhere("cpu") == {"libslate": rocm.leg}
+    assert npv.families_served_elsewhere("ROCM") == {}
+    assert npv.borrowed_families("cpu", "lorrax_slate_eigh") == {"libslate": rocm.leg}
+
+
+@pytest.mark.parametrize("target", ["lorrax_slate_eigh", "lorrax_slate_potrf",
+                                    "lorrax_slate_batched_potrf", "lorrax_slate_batched_trsm"])
+def test_a_host_slate_target_refuses_by_name_in_a_device_process(tree, monkeypatch, target):
+    rocm, host = _device_process(tree, monkeypatch)
+    with pytest.raises(_Unusable) as exc:
+        npv.refuse_if_borrowed("cpu", target, unusable_cls=_Unusable)
+    msg = str(exc.value)
+    assert msg.startswith(f"GATE native-closure: host-leg {target} needs SLATE-CPU but the "
+                          "device leg's SLATE serves this process")
+    assert str(rocm.entries[0].path) in msg and str(tree.root / "slate_cpu" / "libslate.so.2") in msg
+    assert "fix: " in msg
+
+
+@pytest.mark.parametrize("target", ["lorrax_scalapack_eigh", "lorrax_phdf5_read",
+                                    "lorrax_mklblas_gemm_batch", "lrx_slate_context_create"])
+def test_host_targets_that_link_no_yielded_family_run(tree, monkeypatch, target):
+    _device_process(tree, monkeypatch)
+    npv.refuse_if_borrowed("cpu", target, unusable_cls=_Unusable)
+    assert npv.borrowed_reason("cpu", target) == ""
+
+
+def test_a_cpu_only_process_runs_the_host_slate_targets(tree, monkeypatch):
+    host = _host_record(tree, tree.root / "slate_cpu")
+    mpi = tree.d["mpich"] / "libmpi_gnu_123.so.12"
+    monkeypatch.setattr(npv, "_mapped_sonames", lambda: {
+        host.leg: host.leg.name, host.entries[0].path: "libslate.so.2", mpi: "libmpi_gnu_123.so.12"})
+    npv._DLOPEN_ORDER[:] = [host.leg]
+    npv._ENFORCED[host.leg] = npv._enforce(host, _Unusable, "")
+    npv._PLATFORM_LEG["cpu"] = host.leg
+    npv.refuse_if_borrowed("cpu", "lorrax_slate_eigh", unusable_cls=_Unusable)
+
+
+def test_the_target_table_names_only_families_the_device_leg_can_answer():
+    """TARGET_FAMILIES may only list families a leg can yield; anything else is
+    enforced by the one-file-per-family gate and would never be borrowed."""
+    for fams in npv.TARGET_FAMILIES.values():
+        assert set(fams) <= npv._DEVICE_LEG_WINS

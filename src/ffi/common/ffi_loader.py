@@ -641,6 +641,11 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
         # a clear AttributeError only if actually called.
         if not hasattr(lib, cpp_symbol):
             continue
+        # A handler whose library another leg serves in this process is not
+        # registered: nothing can run it (probe_target and the call sites
+        # refuse it by name, native_provider.refuse_if_borrowed).
+        if _native.borrowed_families(platform, target_name):
+            continue
         fn = getattr(lib, cpp_symbol)
         try:
             jax.ffi.register_ffi_target(
@@ -707,6 +712,9 @@ def probe_target(target_name: str, platform: str) -> tuple[bool, str]:
             f"on Frontera that is the vendor BLAS/ScaLAPACK (MKL) + the "
             f"Intel compiler runtime + parallel HDF5 + libfabric + "
             f"SLATE's lib64; run `ldd <so>` to see which are missing).")
+    borrowed = _native.borrowed_reason(platform, target_name)
+    if borrowed:
+        return False, borrowed
     if not hasattr(lib, sym):
         return False, (
             f"loaded {_loaded_path(platform)} but it does not export {sym} — "
