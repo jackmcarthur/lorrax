@@ -174,7 +174,8 @@ def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None,
                             jax.lax.with_sharding_constraint(cut(b), face))
                 return jax.lax.with_sharding_constraint(
                     jax.lax.dynamic_update_slice_in_dim(x_all, x, start, axis=0), face), None
-            x, _ = jax.lax.scan(body, jax.lax.with_sharding_constraint(jnp.zeros_like(b), face), starts)
+            x, _ = jax.lax.scan(body, jax.lax.with_sharding_constraint(jnp.zeros_like(b), face), starts,
+                                unroll=1)
             return x
         _JIT_CACHE[key] = fn
     return fn(A, B)
