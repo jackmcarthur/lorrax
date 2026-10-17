@@ -142,6 +142,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_mathdx_kconv_klead_lorentz_wparent": "KConvMathdxKleadLorentzWParentCudaFfi",
     "lorrax_mathdx_kfft_klead_unfold": "KFftMathdxKleadUnfoldCudaFfi",
     "lorrax_mathdx_kconv_chi_unfold": "KConvMathdxChiUnfoldCudaFfi",
+    "lorrax_mathdx_kconv_chi_unfold_q": "KConvMathdxChiUnfoldQCudaFfi",
     "lorrax_mathdx_kconv_chi_vertex": "KConvMathdxChiVertexCudaFfi",
     "lorrax_mathdx_kfft_klead":     "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor":   "KConvMathdxKminorCudaFfi",

@@ -117,6 +117,7 @@ KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_wparent"
 KFFT_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kfft_klead_unfold"
 #: Mode 11, the chi0 pass read from the raw-parent Green pair (:func:`make_kconv_chi_unfold`).
 KCONV_CHI_UNFOLD_TARGET = "lorrax_mathdx_kconv_chi_unfold"
+KCONV_CHI_UNFOLD_Q_TARGET = "lorrax_mathdx_kconv_chi_unfold_q"
 #: Mode 11 with the four-current channel vertices (:func:`make_kconv_chi_vertex`).
 KCONV_CHI_VERTEX_TARGET = "lorrax_mathdx_kconv_chi_vertex"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
@@ -3042,6 +3043,13 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     """One tau node of the chi0 response read from the RAW-PARENT Green pair:
     ``fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None, load=None) -> acc``.
 
+    ``acc=None`` returns ``alpha[o] * chi_tau`` itself, the update onto exact zeros (bit for bit
+    the call on a zero ``acc``): the CUDA single arm writes it without reading or zero-filling an
+    accumulator; every other route accumulates onto zeros.  ``acc=None, rows=q`` (``n_out`` 1, where
+    ``fn.q_store``) returns ``(1, len(q), mu, nu)``: the rows ``q`` of the flat-k forward transform
+    (``norm``) of that value, bit for bit :func:`make_flat_k_fftn` of it followed by the row gather,
+    formed in the transform's tile with no full-k accumulator (the CUDA fused single arm, ``ns`` 2).
+
     ``Gv``/``Gc`` ``(n_parent, mu, ns, nu, ns)`` c128 at ``P(None,'x',None,'y',None)`` are the
     centroid-major parent Greens (``gw.greens_function_kernel.build_G_parents``), NOT
     conjugated; ``tables`` are their plan's ``symmetry_maps.unfold_load_tables``
@@ -3082,15 +3090,32 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
                          f"mesh; this mesh is {mesh_shape}")
     n_out, complete = int(n_out), bool(complete)
     si = ffi_fft_scale("ifftn", norm, nk)
+    sf = ffi_fft_scale("fftn", norm, nk)
     flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
+    q_store = (kconv_backend(mesh, kgrid) == "mathdx" and ns == 2 and n_out == 1
+               and chi_unfold_scratch_bytes(kg, ns, 1) == 0)
     if kconv_backend(mesh, kgrid) == "mathdx":
         _require_target(KCONV_CHI_UNFOLD_TARGET, "CUDA")
+
+        def apply_q(gv, gc, alpha, gvt, gct, conj_src, t, live, qsel):
+            out = jax.ShapeDtypeStruct((1, int(qsel.shape[0]), int(gv.shape[1]), int(gv.shape[3])), jnp.complex128)
+            call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_Q_TARGET, out)
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, alpha, qsel, *(() if live is None else (live,)),
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), sf=np.float64(sf), conj_trs=np.int64(2 if conj_src else 0),
+                        complete=np.int64(complete), **_mathdx_common())
 
         def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
             budget = (int(scratch_bytes) if scratch_bytes is not None
                       else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
-            call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
-                                    input_output_aliases={12: 0})
+            if acc is None:                    # write: a one-element acc operand, no alias
+                out = jax.ShapeDtypeStruct((n_out, nk, int(gv.shape[1]), int(gv.shape[3])), jnp.complex128)
+                call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, out)
+                acc = jnp.zeros((1,), jnp.complex128)
+            else:
+                call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                        input_output_aliases={12: 0})
             return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
                         t.mph, t.nph, t.spin, alpha, acc, *(() if live is None else (live,)),
                         nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
@@ -3100,6 +3125,8 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     elif (kbox := rocm_kbox_target(mesh, kg, "kconv_chi_unfold", ns)) is not None:
 
         def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
+            if acc is None:
+                acc = jnp.zeros((n_out, nk, int(gv.shape[1]), int(gv.shape[3])), jnp.complex128)
             budget = (int(scratch_bytes) if scratch_bytes is not None
                       else kdft_kbox_chi_scratch_bytes(kg, ns, int(gv.size) * 16))
             _kbox_prebuild(mesh, 11, kg, ns, ns, int(complete), live is not None)
@@ -3118,6 +3145,8 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
             if conj_src:
                 gvt, gct = jnp.conj(gv), jnp.conj(gc)
             n_par, mx, _, my, _ = (int(v) for v in gv.shape)
+            if acc is None:
+                acc = jnp.zeros((n_out, nk, mx, my), jnp.complex128)
 
             def unfolded(g, gt):
                 O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
@@ -3135,25 +3164,42 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
              else local_unfold_load_tables(tables))
         return apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live)
 
+    def local_write(*args, **kw):
+        return local(None, *args, **kw)
+
+    def local_q(qsel, gv, gc, alpha, gvt, gct, *rest, conj_src=False, placed=False, has_live=False):
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if placed
+             else local_unfold_load_tables(tables))
+        return apply_q(gv, gc, alpha, gvt, gct, conj_src, t, live, qsel)
+
     from symmetry_maps import DeviceLoadTables
     g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
     sm = {}
 
-    def sharded(conj_src, placed, has_live):
-        if (conj_src, placed, has_live) not in sm:
-            sm[conj_src, placed, has_live] = _sharded(
-                partial(local, conj_src=conj_src, placed=placed, has_live=has_live), mesh,
-                (acc_spec, g_spec, g_spec, P(None), g_spec, g_spec) + ((P(None),) if has_live else ())
-                + (DEVICE_LOAD_SPECS if placed else ()), acc_spec)
-        return sm[conj_src, placed, has_live]
+    def sharded(conj_src, placed, has_live, write=False):
+        """write: False (acc in place), True (acc=None) or "q" (acc=None, rows=q)."""
+        if (conj_src, placed, has_live, write) not in sm:
+            body = {False: local, True: local_write, "q": local_q}[write]
+            sm[conj_src, placed, has_live, write] = _sharded(
+                partial(body, conj_src=conj_src, placed=placed, has_live=has_live), mesh,
+                {False: (acc_spec,), True: (), "q": (P(None),)}[write]
+                + (g_spec, g_spec, P(None), g_spec, g_spec)
+                + ((P(None),) if has_live else ()) + (DEVICE_LOAD_SPECS if placed else ()), acc_spec)
+        return sm[conj_src, placed, has_live, write]
 
-    def fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None, load=None, live=None):
-        _check_complex(acc, Gv, Gc, alpha)
+    def fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None, load=None, live=None, rows=None):
+        write = acc is None
+        if rows is not None and not (write and q_store):
+            raise ValueError("k-leading chi unfold: rows= takes acc=None on a grid with fn.q_store "
+                             "(the CUDA fused single arm, n_out 1)")
+        _check_complex(*(() if write else (acc,)), Gv, Gc, alpha)
         if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
             raise ValueError(f"k-leading chi unfold expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
                              f"got {Gv.shape} / {Gc.shape}")
-        if tuple(acc.shape) != (n_out, nk, int(Gv.shape[1]), int(Gv.shape[3])) or alpha.shape != (n_out,):
-            raise ValueError(f"k-leading chi unfold: acc {acc.shape} / alpha {alpha.shape} do not match "
+        acc_shape = (n_out, nk, int(Gv.shape[1]), int(Gv.shape[3])) if write else tuple(acc.shape)
+        if acc_shape != (n_out, nk, int(Gv.shape[1]), int(Gv.shape[3])) or alpha.shape != (n_out,):
+            raise ValueError(f"k-leading chi unfold: acc {acc_shape} / alpha {alpha.shape} do not match "
                              f"n_out={n_out}, nk={nk} and G {Gv.shape}")
         if (Gvt is None) != (Gct is None):
             raise ValueError("k-leading chi unfold: pass both partners or neither")
@@ -3162,9 +3208,15 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
             Gvt, Gct = Gv, Gc
         elif Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
             raise ValueError("k-leading chi unfold: the partners must match the Greens' shape")
-        return sharded(conj_src, load is not None, live is not None)(
-            acc, Gv, Gc, alpha, Gvt, Gct, *(() if live is None else (live,)),
+        if rows is not None:
+            q = jnp.asarray(np.asarray(rows, dtype=np.int32)) if isinstance(rows, (list, tuple, np.ndarray)) else rows
+            return sharded(conj_src, load is not None, live is not None, "q")(
+                q, Gv, Gc, alpha, Gvt, Gct, *(() if live is None else (live,)),
+                *(() if load is None else tuple(load)))
+        return sharded(conj_src, load is not None, live is not None, write)(
+            *(() if write else (acc,)), Gv, Gc, alpha, Gvt, Gct, *(() if live is None else (live,)),
             *(() if load is None else tuple(load)))
+    fn.q_store = q_store
     return fn
 
 

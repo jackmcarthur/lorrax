@@ -1476,6 +1476,24 @@ def _get_chi_fractional_contour_kernel_face(
             """The q rows of a transformed charge correlation."""
             return jnp.take(value, jnp.asarray(q), axis=0)
 
+        both_q = (None if gather_q is None else
+                  np.concatenate([np.asarray(gather_q, np.int32), np.asarray(reverse_q, np.int32)]))
+
+        def charge_q_rows(kconv, lower, upper, partners, acc_shape, **kw):
+            """The node's (gather_q, reverse_q) rows of FT_k[v] from one mode-11 call.
+
+            Where the call stores q rows itself (``kconv.q_store``: CUDA fused single arm) it
+            returns them bit for bit as the accumulate on zeros, ``chi_fftn`` and the row
+            gather, with no full-k accumulator; otherwise exactly those three steps.
+            """
+            ones = jnp.ones((1,), jnp.complex128)
+            if both_q is not None and getattr(kconv, "q_store", False):
+                sel = kconv(None, lower.G, upper.G, ones, *partners, rows=both_q, **kw)[0]
+                return sel[:len(gather_q)], sel[len(gather_q):]
+            zero = jax.lax.with_sharding_constraint(jnp.zeros(acc_shape, jnp.complex128), selected_shard)
+            value = chi_fftn(kconv(zero, lower.G, upper.G, ones, *partners, **kw)[0])
+            return rows(value, gather_q), rows(value, reverse_q)
+
         def selected(value):
             return rows(chi_fftn(value), gather_q)
 
@@ -1525,12 +1543,8 @@ def _get_chi_fractional_contour_kernel_face(
             upper = parent(upper_weight, upper_time, upper_ref, True)
             partners = (() if lower.conj_partner and upper.conj_partner
                         else (lower.partner(), upper.partner()))
-            zero = jax.lax.with_sharding_constraint(
-                jnp.zeros((1, nk, n_mu, n_mu), jnp.complex128), selected_shard)
-            value = chi_fftn(chi_kconv(zero, lower.G, upper.G,
-                                      jnp.ones((1,), jnp.complex128), *partners,
-                                      load=chi_load)[0])
-            ahead, behind = rows(value, gather_q), rows(value, reverse_q)
+            ahead, behind = charge_q_rows(chi_kconv, lower, upper, partners,
+                                          (1, nk, n_mu, n_mu), load=chi_load)
             return (jnp.conj(ahead), behind) if physical else (ahead, jnp.conj(behind))
 
         def direct_node(index, accumulators):
@@ -1608,13 +1622,9 @@ def _get_chi_fractional_contour_kernel_face(
                 upper = parent(upper_w, jnp.conj(time), energy_reference[1], True)
                 partners = (() if lower.conj_partner and upper.conj_partner
                             else (lower.partner(), upper.partner()))
-                zero = jax.lax.with_sharding_constraint(
-                    jnp.zeros((1, nk, px * R, n_mu), jnp.complex128), selected_shard)
                 # A window's rows outside its live rows add nothing (mode 11's live).
-                value = chi_fftn(pass_kconv(zero, lower.G, upper.G,
-                                           jnp.ones((1,), jnp.complex128), *partners,
-                                           load=load, **live)[0])
-                ahead, behind = rows(value, gather_q), rows(value, reverse_q)
+                ahead, behind = charge_q_rows(pass_kconv, lower, upper, partners,
+                                              (1, nk, px * R, n_mu), load=load, **live)
                 ahead, behind = ((jnp.conj(ahead), behind) if physical
                                  else (ahead, jnp.conj(behind)))
                 return jax.lax.with_sharding_constraint(jnp.stack([ahead, behind])[None],
