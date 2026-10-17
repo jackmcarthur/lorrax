@@ -5,6 +5,74 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-16 — Native dependencies: recorded at build, enforced at start-up, on every route
+
+Every FFI leg's build records the exact library set it resolved, and every
+start-up enforces it, on every route (a clone, the Perlmutter module, a sealed
+bundle) and for every leg (CUDA, ROCm, host)
+([the dependency closure](docs/installation/ffi-build.md#closure)). This closes
+the defect where a plain clone launch on Perlmutter mapped the HPC SDK's
+cuSOLVERMp 0.8 in place of the staged 0.9.1 (the first distributed LU/eigh
+failed with `status=7`), and the site-default LibSci/HDF5 mapped cray-mpich
+9.1.0 beside 9.0.1.
+
+- **Recorded.** `<leg>.closure.json` beside each leg (schema 2): the leg's
+  SHA-256 and every library of its `DT_NEEDED` closure (path, size, mtime,
+  SHA-256, SONAME, family). That covers the cuSOLVERMp/cuBLASMp stage, the
+  GPU math and collective libraries the venv's JAX plugin maps (cuBLAS,
+  cuSOLVER, cuFFT, NCCL; rocBLAS, rocSOLVER, HIP; RCCL attested once JAX maps
+  it), MPI, HDF5, LibSci, SLATE/BLAS++/LAPACK++ and the HIP SLATE's OpenBLAS.
+  `PROVENANCE` gains `closure_sha256`. Sealed bundles (manifest schema 2)
+  carry both records.
+- **Enforced.** The loader opens the recorded files by exact path before the
+  leg. After the leg's `dlopen` it requires every recorded family to be
+  mapped exactly once, as the recorded file (or byte-identical). Otherwise:
+  `GATE native-closure: got <wrong>; want <expected>; fix: <remedy>`. A missing
+  or stale record refuses too. There is no fallback and no warning mode.
+  `LD_LIBRARY_PATH` no longer decides a leg's libraries, so a clone needs no
+  hand-built library path. Each leg logs one `closure … enforced` line and one
+  `closure … libraries:` line naming every family's file and hash: the
+  identity lines for HIP, rocSOLVER, rocBLAS, RCCL, HDF5, MPI, cuSOLVERMp,
+  NCCL and the rest.
+- **Caches.** `lxkit.native_provider.native_closure_identity(platform)` keys
+  every cache that depends on native libraries:
+  - the JAX compile-cache namespace, schema `k2`, so every `k1` namespace is
+    retired by the age pruner. An explicit `ISDF_JAX_CACHE_DIR` is split by
+    the same `ffi-<12 hex>` tag;
+  - the kconv image store and the rocFFT kernel store.
+
+  The first run after upgrading recompiles once.
+
+- **NCCL: one pin, every route.** The `nvidia-nccl-cu13` 2.30.7 wheel (the
+  `uv.lock` pin). The CUDA leg now compiles and links against the wheel, not
+  the HPC SDK's `comm_libs` 2.29.3. The module venv installs the same wheel,
+  its modulefile drops `comm_libs` NCCL, and its sealed bundle records the
+  wheel. A run that maps any other `libnccl` refuses. The NCCL net plugin is
+  unchanged (`config/perlmutter/site.toml`, AWS OFI).
+
+**What a user must change.**
+- **Rebuild every FFI leg** with this tree's build scripts, and build a new
+  module prefix (the module venv gains the NCCL wheel; `setup_env.sh` never
+  refreshes a venv in place). Perlmutter:
+  `config/perlmutter/build_ffi_host.sh`, `build_ffi_cuda.sh`. Frontier:
+  `config/frontier/build_ffi_host.sh`, `build_ffi_rocm.sh`. A leg without a
+  schema-2 record refuses at start-up (`no closure record`). Reseal bundles
+  with this tree's `seal_bundle.py`; a schema-1 bundle refuses.
+- **Rebuild after changing a recorded library**: a `uv sync` that changes the
+  CUDA or ROCm wheels, a SLATE or OpenBLAS rebuild, a moved or purged `.build`,
+  or a site module upgrade in place. The next run refuses with
+  `stale closure record` until the legs are rebuilt.
+- **Drop hand-built library paths.** Launch scripts that prepend the stage or
+  the pinned directories to `LD_LIBRARY_PATH` are no longer needed; they
+  change nothing a leg maps.
+- **No second copy may be mapped.** An `LD_PRELOAD`, or a Python package that
+  loads another MPI, HDF5, cuBLAS, NCCL, rocBLAS, … beside the recorded one
+  (for example an mpi4py built against the site-default MPI), now refuses at
+  start-up instead of running.
+- Results: unchanged. The enforced libraries are the ones the documented
+  routes already ran. Fe V2 P=4 is bitwise against aff42ce37 on both
+  machines (measured: DEP_ENFORCE.md).
+
 ## 2026-10-16 — rocm/integration8: follow-ups on the release
 
 Integration 8 lands the follow-up lanes below on the release `aff42ce37`. Fe V2, MI250X,
@@ -40,6 +108,7 @@ P=4, one node (`/lustre/orion/mat280/scratch/jackmc/int8/<run>/run.r0.log`):
 | syn/w12-i8 (dfce55663) | active GEMM reads B conjugated on load; identity little-group projector; per-branch W orientation | Σ τ other 5.84 → 3.70 s | eqp bitwise, Σ ≤ 2.2e-14 relative |
 | rcgpu (6b8629482) | the rule tree abandons a geometry on its error forecast's prediction bound | rule construction 32.42 → 27.40 s | Fe bitwise |
 
+||||||| parent of 491fd4afc (docs: the build records, and the runtime enforces, every leg's dependency closure)
 ## 2026-10-16 — rocm/integration7: the ROCm leg's host syncs, transfers and kernels
 
 Integration 7 lands the lane branches listed below on `rocm/integration6` 4e6b28dfc. The rules

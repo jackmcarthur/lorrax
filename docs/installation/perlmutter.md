@@ -78,15 +78,39 @@ process ([Perlmutter build facts](ffi-build.md#perlmutter)). Rebuild both
 legs after a pull that changes `src/ffi/cpp/`: a stale leg refuses with
 `HANDLER ABI MISMATCH`. The libraries are unsealed, so the first load in a run
 prints `LEGACY-UNSEALED` with the file hash; that is expected for a private
-build. Each leg also gets `<leg>.closure.json` beside it: the private providers
-it links (the staged cuSOLVERMp/cuBLASMp, SLATE) and the pinned MPI, HDF5 and
-LibSci directories of `config/perlmutter/ffi_mpi.sh`. The loader opens those
-files by exact path before the leg, as a sealed bundle does its manifest, so a
-run uses the libraries the build verified whatever the shell's
-`LD_LIBRARY_PATH` holds (cudatoolkit/13.2 puts the HPC SDK's older
-cuSOLVERMp 0.8 there under the same SONAME, which fails the first distributed
-LU or eigh with `status=7`). Moving or purging `.build` refuses at load:
-rebuild.
+build.
+
+**The build records, and every run enforces, each leg's dependency closure**
+([the dependency closure](ffi-build.md#closure)). Each build writes
+`<leg>.closure.json` beside its leg, naming every library the leg maps:
+
+- the staged cuSOLVERMp 0.9.1 and cuBLASMp 0.10;
+- the cuBLAS, cuSOLVER, cuFFT and CUDA runtime files that the venv's JAX
+  plugin loads (the `nvidia-*-cu13` wheels);
+- NCCL: the `nvidia-nccl-cu13` 2.30.7 wheel (the `uv.lock` pin), on every
+  route. The CUDA leg compiles and links against it, and `build_ffi_cuda.sh`
+  refuses another wheel version or a record whose NCCL is not that wheel. The
+  HPC SDK's `comm_libs` NCCL (2.29.3) is never used;
+- the pinned MPI, HDF5 and LibSci of `config/perlmutter/ffi_mpi.sh`;
+- SLATE, for the host leg.
+
+At start-up the loader opens exactly those files, then refuses the process if
+any other copy of one of them is mapped. So a clone runs on what its build
+verified, whatever the shell's `LD_LIBRARY_PATH` holds. `cudatoolkit/13.2`
+puts the HPC SDK's cuSOLVERMp 0.8 there under the same SONAME, and with it the
+first distributed LU or eigh fails with `status=7`. The site-default LibSci
+maps cray-mpich 9.1.0. Neither can be loaded in place of the recorded file.
+A refusal reads
+
+```text
+GATE native-closure: got <wrong file>; want <recorded file>; fix: <remedy>
+```
+
+The remedy is to remove what maps the other copy (an `LD_PRELOAD`, or a
+package such as mpi4py built against another MPI), or to rebuild the leg in the
+environment you run in. Setting `LD_LIBRARY_PATH` neither causes nor fixes it.
+Moving or purging `.build`, or a `uv sync` that changes the CUDA wheels, makes
+the record stale, and the next run refuses until the legs are rebuilt.
 
 ### 1.3 Run the test suite {#suite}
 
@@ -145,6 +169,14 @@ The module sets:
   `LORRAX_FFI_EXPECT_BACKENDS`, which only the m4598 `lx` launcher and
   `src/ffi/cpp/in_container.sh` read; `srun` ignores them.
 
+The bundle's manifest carries each leg's dependency closure. Its libraries
+are the toolkit's CUDA math files (the module venv has no CUDA math wheels),
+the venv's `nvidia-nccl-cu13` 2.30.7 wheel (the same NCCL as a clone), the
+sealed cuSOLVERMp/cuBLASMp/SLATE copies, and the pinned MPI and HDF5. Every start-up enforces that closure exactly as for a clone
+([the dependency closure](ffi-build.md#closure)). The module's
+`LD_LIBRARY_PATH` serves JAX and the external system libraries; it cannot
+change which file a leg uses.
+
 It sets no allocator, compile-cache, HDF5 or profiling policy: the runtime
 owns those ([GPU pool](../environment/overview.md#gpu-pool)), and an export
 would override it. `gpu_env.sh` is not needed with a module. Do not add a
@@ -160,18 +192,26 @@ The recipe is `config/perlmutter/module/`; it works for any install prefix.
 | Python 3.12 (uv-managed, under the prefix), JAX 0.9.1 `cuda13-local`, cuDNN, nvidia-mathdx, `cudatoolkit/13.2` | `module/stack.sh` |
 | every other Python package | the checkout's `uv.lock` |
 | cuSOLVERMp, cuBLASMp | `build_ffi_cuda.sh` (repeated in `stack.sh`) |
+| NCCL: `nvidia-nccl-cu13` 2.30.7 (the clone's `uv.lock` pin) | `build_ffi_cuda.sh`, `stack.sh` |
 | Cray MPICH, LibSci | `ffi_mpi.sh` |
 | parallel HDF5 | `build_ffi_cuda.sh`, `build_ffi_host.sh` |
 
 The JAX plugin uses the toolkit's CUDA and installs no CUDA runtime;
 `setup_env.sh` installs cuDNN and nvidia-mathdx without their dependency
 closures and refuses a pip CUDA runtime in the venv, because one would shadow
-the toolkit's.
+the toolkit's. Because the JAX plugin's wheel directories hold no CUDA math
+library in the module venv, each leg's closure records the toolkit's copies
+(`build_ffi_cuda.sh` lists `math_libs` and `cuda/lib64` after the stage).
+`setup_env.sh` installs the NCCL wheel (`stack.sh` `NCCL_VERSION`, the
+clone's `uv.lock` pin) with `--no-deps`; the modulefile puts its `lib`, not
+`comm_libs`, on `LD_LIBRARY_PATH`; `verify_runtime.py` requires exactly that
+`libnccl` to be mapped. `accept.sh`'s `verify_runtime.py` prints and checks both
+legs' enforced closure identities.
 
 | path under `$LORRAX_MODULE_PREFIX` | written by |
 |---|---|
 | `python/`, `venv/` | `setup_env.sh` (once per prefix) |
-| `build/` (SLATE, cuSOLVERMp stage) | `build.sh` (first build only) |
+| `native/` (SLATE, cuSOLVERMp stage; `build/` before 2026-10-17, which `seal_bundle.py` refuses as a search-path directory) | `build.sh` (first build only) |
 | `releases/source-<rev8>/`, `releases/<rev8>-bundle-<id12>/` | `publish.sh` (read-only, never replaced) |
 | `modulefiles/<name>/<version>.lua` | `publish.sh` (the previous file kept as `.before-<rev8>`) |
 
