@@ -442,9 +442,10 @@ def _gathered_eigh(A, *, mesh):
 #: that says what to call instead.  ``tests/test_distrib_la_shape_algebra``
 #: cross-checks the flag against each wrapper's own return annotation, so
 #: the declaration cannot quietly disagree with the code.
-#: The measured-cost decisions of the ``distributed`` size route, one per call signature:
-#: rounds of the one_device program, 0 for the leg library, None for one_device's own round
-#: rule where no library resolves on this host (nothing to compare against).
+#: The size-route decisions of a ``distributed`` plan resolved to ``one_device``, one per call
+#: signature (:func:`_measured_rounds`): rounds of the one_device program, 0 for the library,
+#: None for one_device's own round rule (main's incumbent on a size-row leg, or no library on
+#: this host).
 _MEASURED: dict = {}
 #: Library plans of :meth:`Plan._library_plan`, one per (op, mesh, n, route, library).
 _LIBRARY_PLANS: dict = {}
@@ -563,17 +564,24 @@ def _payload_digest(disk_key: str, value) -> str:
     return hashlib.sha256(json.dumps([disk_key, value], sort_keys=True).encode()).hexdigest()
 
 
-def _valid_costs(value, candidates) -> bool:
-    """A cached figure set is used only whole and well-typed: the library's bytes and every
-    candidate round's (an int each); anything else is a miss and is re-measured."""
-    if not isinstance(value, dict) or not isinstance(value.get("library"), int):
+def _valid_costs(value, measured, need_library: bool = True) -> bool:
+    """A cached figure set is used only whole and well-typed: the library's bytes where the
+    incumbent is the library, and every measured round's largest and smallest per-rank bytes
+    (an int each); anything else is a miss and is re-measured."""
+    if not isinstance(value, dict):
         return False
-    rounds = value.get("rounds")
-    return (isinstance(rounds, dict) and set(rounds) == {str(r) for r in candidates}
-            and all(isinstance(v, int) and v >= 0 for v in rounds.values()))
+    if need_library and not isinstance(value.get("library"), int):
+        return False
+    want = {str(r) for r in measured}
+    for name in ("rounds", "rounds_min"):
+        rounds = value.get(name)
+        if not (isinstance(rounds, dict) and set(rounds) == want
+                and all(isinstance(v, int) and v >= 0 for v in rounds.values())):
+            return False
+    return True
 
 
-def _measured_cache_get(disk_key: str, candidates):
+def _measured_cache_get(disk_key: str, measured, need_library: bool = True):
     """This signature's agreed costs from its own file, validated (key, digest, types); None on
     a miss, a stale code hash (another key), a partial or corrupt file: never a mis-route."""
     import json
@@ -584,7 +592,7 @@ def _measured_cache_get(disk_key: str, candidates):
         return None
     if (not isinstance(entry, dict) or entry.get("key") != disk_key
             or entry.get("digest") != _payload_digest(disk_key, entry.get("value"))
-            or not _valid_costs(entry.get("value"), candidates)):
+            or not _valid_costs(entry.get("value"), measured, need_library)):
         return None
     return entry["value"]
 
@@ -633,40 +641,77 @@ def _exchange(tag: str, payload: dict) -> list:
             for r in range(jax.process_count())]
 
 
-def _agreed(values: list):
-    """The conservative agreement of every rank's figures: the SMALLEST library bytes and the
-    LARGEST one_device bytes per round count, so the route decided from them is the same on every
-    rank and never raises any rank's peak.  None where no rank has a library (all agree on that);
-    a mix is refused by name on every rank alike."""
+def _agreed(values: list, need_library: bool = True):
+    """The conservative agreement of every rank's figures: the SMALLEST library bytes, and per
+    round count the LARGEST one_device bytes (``rounds``: what a candidate is charged) and the
+    SMALLEST (``rounds_min``: what a one_device incumbent is credited with), so the route
+    decided from them is the same on every rank and never raises any rank's peak above the
+    incumbent's.  Where the incumbent is the library: None if no rank has one (all agree on
+    that), and a mix is refused by name on every rank alike."""
     libs = [v.get("library") for v in values]
-    if all(l is None for l in libs):
-        return None
-    if any(l is None for l in libs):
-        raise RuntimeError("distrib_la measured size route: the leg library resolves on some "
-                           "processes and not others; refusing rather than route divergently")
-    rounds = {}
+    if need_library:
+        if all(l is None for l in libs):
+            return None
+        if any(l is None for l in libs):
+            raise RuntimeError("distrib_la measured size route: the leg library resolves on some "
+                               "processes and not others; refusing rather than route divergently")
+    rounds, low = {}, {}
     for v in values:
         for r, c in v["rounds"].items():
             rounds[r] = None if c is None or rounds.get(r, 0) is None else max(rounds.get(r, 0), int(c))
-    return {"library": min(int(l) for l in libs), "rounds": rounds}
+        for r, c in (v.get("rounds_min") or v["rounds"]).items():
+            low[r] = (None if c is None or (r in low and low[r] is None)
+                      else min(low.get(r, int(c)), int(c)))
+    return {"library": min(int(l) for l in libs) if need_library else None,
+            "rounds": rounds, "rounds_min": low}
+
+
+def _incumbent(p, shapes, single: bool) -> int:
+    """The route today's main takes for this call -- the owner's INCUMBENT (2026-10-17, "never
+    regress main"): on a leg with a size row (:data:`resolve.ONE_DEVICE_MAX_N`, ROCM) the size
+    route's ``one_device`` in the round rule's count against that row
+    (:func:`distrib_la._one_device.rounds_for`; one matrix: 1 round); on a room leg (CUDA, no
+    row) the leg library.  Returns that round count, or 0 for the library.  A shape rule: no
+    exchange, no sync."""
+    from distrib_la import resolve as _resolve
+    from distrib_la._one_device import rounds_for
+    row = _resolve.ONE_DEVICE_MAX_N.get((p.op, _resolve.mesh_platform(p.mesh)))
+    if row is None:
+        return 0
+    if single:
+        return 1
+    ranks = int(p.mesh.shape["x"]) * int(p.mesh.shape["y"])
+    nb, n = int(shapes[0][0]), int(shapes[0][-1])
+    width = int(shapes[1][-1]) if p.op == "solve_lu" and len(shapes) > 1 else None
+    return int(rounds_for(nb, n, ranks, int(row), width))
+
+
+_RULE = ("the fewest-round one_device whose per-rank footprint is within the incumbent's"
+         "{room}, else the incumbent")
 
 
 def _measured_rounds(p, A, args, single: bool = False):
-    """The measured-cost decision of a ``distributed`` plan's ``one_device`` route for one call
-    signature (owner rule 2026-10-16: no stage's per-rank device peak may go up).
+    """The size-route decision of a ``distributed`` plan resolved to ``one_device``, for one call
+    signature (owner rules: no stage's per-rank device peak may go up, 2026-10-16; never regress
+    main, 2026-10-17).
 
-    Compiles, from abstract operands in the caller's face layout, the leg library's program and
-    the ``one_device`` program at each candidate round count (:func:`_round_candidates`; one
-    matrix: a single round), and prices each by XLA's ``memory_analysis`` (temp + output per
-    device; the caller's operands are common to both).  Returns the fewest rounds whose bytes
-    are within the library's and within the plan's room, 0 (the library) where none is, None
-    (one_device's own round rule) where no library resolves on this host.  A direct cost
-    comparison of the two programs, the same on every rank (shapes only, no exchange).  The
-    COSTS are cached per signature in this process and on disk (keyed by the signature, the
-    mesh, the device kind, the jax build and the distrib_la sources), so a warm run compiles
-    nothing to decide; the room is applied at lookup.  Each decision is a route-ledger line
-    (:func:`distrib_la.new_stack_routes`).  Vendor workspaces that a library or jaxlib kernel
-    allocates at run time are outside both analyses."""
+    The INCUMBENT is what today's main runs on this leg and shape (:func:`_incumbent`): the leg
+    library on a room leg (CUDA), ``one_device`` in the round rule's count on a size-row leg
+    (ROCM).  The candidates are the ``one_device`` round counts (:func:`_round_candidates`) whose
+    per-rank footprint -- XLA's ``memory_analysis`` of the compiled program, temp + output per
+    device, the caller's operands common to all -- is within the incumbent's and within the
+    plan's room; the fewest-round candidate runs (fewer rounds is the faster program on both
+    legs: a deterministic preference, no wall-time measurement), else the incumbent.  Only what
+    could beat the incumbent is measured: a ``one_device`` incumbent in k rounds compiles the
+    rounds below k (and k, for its own figure), and in 1 round nothing at all (no compile, no
+    exchange).  Figures are agreed over every rank (largest candidate bytes against the
+    smallest incumbent bytes) and cached per signature on disk.
+
+    Returns the rounds to run, 0 for the library, None for ``one_device``'s own round rule (the
+    incumbent on a size-row leg, or where no library resolves on this host).  Each decision is a
+    route-ledger line (:func:`distrib_la.new_stack_routes`) naming the incumbent, its figure and
+    the rule.  Vendor workspaces that a library or jaxlib kernel allocates at run time are
+    outside both analyses."""
     import json
     from distrib_la import resolve as _resolve
     dtypes = (A.dtype,) + tuple(x.dtype for x in args)
@@ -679,66 +724,97 @@ def _measured_rounds(p, A, args, single: bool = False):
     library = _resolve._DISTRIBUTED_DEFAULT.get((p.op, platform))
     ranks = int(p.mesh.shape["x"]) * int(p.mesh.shape["y"])
     candidates = [1] if single else _round_candidates(shapes[0][0], ranks)
-    devices = p.mesh.devices.flat
-    kind = str(getattr(next(iter(devices)), "device_kind", ""))
-    disk_key = json.dumps([p.op, shapes, [str(d) for d in dtypes],
-                           [int(p.mesh.shape["x"]), int(p.mesh.shape["y"])], platform, kind,
-                           library, p.requested_batched_route, bool(single),
-                           _measured_code_hash(), native_closure_identity(platform)])
+    incumbent = _incumbent(p, shapes, single)
+    need_library = incumbent == 0
+    if need_library:
+        measured = list(candidates)
+    else:
+        fewer = [r for r in candidates if r < incumbent]
+        measured = fewer + [incumbent] if fewer else []
     import hashlib
     import time
-    tag = hashlib.sha256(disk_key.encode()).hexdigest()[:24]
     started = time.perf_counter()
-    default = _library_bytes is _LIBRARY_BYTES_DEFAULT
-    cached = _measured_cache_get(disk_key, candidates) if default else None
-    # Round 1: does EVERY rank hold this signature's agreed costs?  Only then is nothing
-    # compiled; one miss and every rank measures, so all lower the same programs (a library
-    # plan's first lowering may bootstrap its context collectively).
-    probe = _exchange(tag + "/probe", {"hit": cached is not None,
-                                       "library": None if cached is None else cached["library"],
-                                       "rounds": {} if cached is None else cached["rounds"]})
-    if all(v["hit"] for v in probe):
-        source = "cached"
-        agreed = _agreed(probe)
-    else:
-        source = "compiled"
-        spec = P("x", "y") if single else P(None, "x", "y")
-        face = NamedSharding(p.mesh, spec)
-        abstract = tuple(jax.ShapeDtypeStruct(s, d, sharding=face) for s, d in zip(shapes, dtypes))
-        lib_local = _library_bytes(p, abstract, single)
-        rounds_local = {}
-        if lib_local is not None:
-            for r in candidates:
-                fn = ((lambda *o: p(*o, _rounds=1)) if single
-                      else (lambda *o, _r=r: p.batched(*o, _rounds=_r)))
-                c_r = _program_bytes(fn, abstract)
-                rounds_local[str(r)] = None if c_r is None else int(c_r)
-        # Round 2: every rank's own figures, agreed conservatively.
-        agreed = _agreed(_exchange(tag + "/measure",
-                                   {"library": None if lib_local is None else int(lib_local),
-                                    "rounds": rounds_local}))
-        if agreed is not None and default and _valid_costs(agreed, candidates):
-            _measured_cache_put(disk_key, agreed)
-    lib = None if agreed is None else agreed["library"]
-    costs = {} if agreed is None else {int(r): c for r, c in agreed["rounds"].items()}
+    costs, inc_cost, agreed, source = {}, None, None, None
+    if measured:
+        devices = p.mesh.devices.flat
+        kind = str(getattr(next(iter(devices)), "device_kind", ""))
+        disk_key = json.dumps([p.op, shapes, [str(d) for d in dtypes],
+                               [int(p.mesh.shape["x"]), int(p.mesh.shape["y"])], platform, kind,
+                               library, p.requested_batched_route, bool(single), incumbent,
+                               measured, _measured_code_hash(), native_closure_identity(platform)])
+        tag = hashlib.sha256(disk_key.encode()).hexdigest()[:24]
+        default = _library_bytes is _LIBRARY_BYTES_DEFAULT
+        cached = _measured_cache_get(disk_key, measured, need_library) if default else None
+        # Round 1: does EVERY rank hold this signature's agreed costs?  Only then is nothing
+        # compiled; one miss and every rank measures, so all lower the same programs (a library
+        # plan's first lowering may bootstrap its context collectively).
+        probe = _exchange(tag + "/probe", {
+            "hit": cached is not None,
+            "library": None if cached is None else cached["library"],
+            "rounds": {} if cached is None else cached["rounds"],
+            "rounds_min": {} if cached is None else cached["rounds_min"]})
+        if all(v["hit"] for v in probe):
+            source = "cached"
+            agreed = _agreed(probe, need_library)
+        else:
+            source = "compiled"
+            spec = P("x", "y") if single else P(None, "x", "y")
+            face = NamedSharding(p.mesh, spec)
+            abstract = tuple(jax.ShapeDtypeStruct(s, d, sharding=face) for s, d in zip(shapes, dtypes))
+            lib_local = _library_bytes(p, abstract, single) if need_library else None
+            rounds_local = {}
+            if lib_local is not None or not need_library:
+                for r in measured:
+                    fn = ((lambda *o: p(*o, _rounds=1)) if single
+                          else (lambda *o, _r=r: p.batched(*o, _rounds=_r)))
+                    c_r = _program_bytes(fn, abstract)
+                    rounds_local[str(r)] = None if c_r is None else int(c_r)
+            # Round 2: every rank's own figures, agreed conservatively.
+            agreed = _agreed(_exchange(tag + "/measure",
+                                       {"library": None if lib_local is None else int(lib_local),
+                                        "rounds": rounds_local}), need_library)
+            if agreed is not None and default and _valid_costs(agreed, measured, need_library):
+                _measured_cache_put(disk_key, agreed)
+        if agreed is not None:
+            costs = {int(r): c for r, c in agreed["rounds"].items()}
+            low = {int(r): c for r, c in agreed["rounds_min"].items()}
+            inc_cost = agreed["library"] if need_library else low.get(incumbent)
     seconds = time.perf_counter() - started
-    if lib is None:
-        chosen = None
+    room = None if p.budget_bytes is None else int(p.budget_bytes)
+    within = lambda r: (costs.get(r) is not None and inc_cost is not None and costs[r] <= inc_cost
+                        and (room is None or costs[r] <= room))
+    if need_library:
+        if agreed is None:
+            chosen = None                     # no library on this host: one_device's own rounds
+        else:
+            fits = [r for r in measured if within(r)]
+            chosen = fits[0] if fits else 0
     else:
-        fits = [r for r in candidates if costs.get(r) is not None and costs[r] <= lib
-                and (p.budget_bytes is None or costs[r] <= int(p.budget_bytes))]
-        chosen = fits[0] if fits else 0
+        fits = [r for r in measured if r < incumbent and within(r)]
+        chosen = fits[0] if fits else None    # None: the incumbent, main's own round rule
     _MEASURED[key] = chosen
     gb = lambda b: "n/a" if b is None else f"{b / 1e9:.4f}"
-    tried = ", ".join(f"{r}: {gb(c)}" for r, c in costs.items())
-    verdict = ("one_device's own rounds (no library on this host)" if chosen is None else
-               library if chosen == 0 else f"one_device in {chosen} round(s)")
+    inc_name = library if need_library else f"one_device in {incumbent} round(s)"
+    rule = _RULE.format(room="" if room is None else f" and the room {room / 1e9:.2f} GB")
+    if need_library and agreed is None:
+        verdict = "one_device's own rounds (no library on this host)"
+    elif chosen == 0:
+        verdict = f"{library} (the incumbent)"
+    elif chosen is None:
+        verdict = f"one_device in {incumbent} round(s) (the incumbent)"
+    else:
+        verdict = f"one_device in {chosen} round(s)"
+    if measured:
+        tried = ", ".join(f"{r}: {gb(c)}" for r, c in costs.items())
+        how = (f"measured ({source}, agreed over {jax.process_count()} process(es), "
+               f"{seconds:.2f} s) per-rank GB: incumbent {inc_name} {gb(inc_cost)}, "
+               f"one_device by rounds {{{tried}}}")
+    else:
+        how = (f"incumbent {inc_name} (main's round rule on the leg row); no candidate has fewer "
+               f"rounds, nothing measured")
     line = (f"{p.op} 'distributed' {'x'.join(map(str, shapes[0]))} on the "
-            f"{int(p.mesh.shape['x'])}x{int(p.mesh.shape['y'])} {platform} mesh: measured "
-            f"({source}, agreed over {jax.process_count()} process(es), {seconds:.2f} s) per-rank GB, "
-            f"{library} {gb(lib)} vs one_device by rounds {{{tried}}}"
-            f"{'' if p.budget_bytes is None else f' (room {int(p.budget_bytes) / 1e9:.2f} GB)'}"
-            f" -> {verdict}")
+            f"{int(p.mesh.shape['x'])}x{int(p.mesh.shape['y'])} {platform} mesh: {how}; "
+            f"rule: {rule} -> {verdict}")
     _resolve._SIZE_DECISIONS.setdefault(("measured",) + key, line)
     _resolve.announce_once(("distrib_la.plan", "measured", key),
                            f"  [distrib_la.plan] {line}", scope="rank0")
@@ -1369,8 +1445,8 @@ class Plan:
 
         rounds = None
         if route == ROUTE_BACKEND_BATCHED and self._measured_applies():
-            # The measured-cost size route: the one_device program in the fewest rounds whose
-            # compiled per-rank bytes are within the library's (and the room), else the library.
+            # The size route against main's incumbent: the fewest-round one_device whose compiled
+            # per-rank bytes are within the incumbent's (and the room), else the incumbent.
             rounds = _rounds if _rounds is not None else _measured_rounds(self, A, args)
             if rounds == 0:
                 return self._library_plan().batched(A, *args, **kwargs)
