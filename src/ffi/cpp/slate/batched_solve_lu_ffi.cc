@@ -161,10 +161,17 @@ static ffi::Error copy_out(const char* what, sl::Matrix<T>& M, T* dst, int64_t l
 //               n = 4096 ... 30720), but getrf releases the remote tiles
 //               (releaseWorkspace) before getrs.  Seeding (mt/p + nt/q) / 2 of them
 //               held 30 MB per rank above unseeded lufix through getrs at 30720 f64
-//               (+10 ... +23 MB measured, 3 same-node repeats); they now come from
-//               device_malloc exactly as in lufix (<= 100 MB per rank at 51200 c128).
+//               (+10 ... +26 MiB measured, 3 same-node repeats); they now come from
+//               device_malloc exactly as in lufix (measured 173 ... 235 blocks at
+//               30720, 500 at 51200 c128 = 0.5 GB per rank: inside the outside
+//               allowance).
 //   X (getrs):  high-water local + 0 ... 1: trsmB releases B's broadcast row after
 //               each step (work_trsm.cc B_panel.releaseRemoteWorkspace).
+// A pool whose seed is below one device allocation granule (2 MiB) is not seeded:
+// unseeded SLATE takes such tiles from slack in allocations the process already
+// holds, so arena bytes for them are a net rise (X at nrhs = 2: +64 ... +160 KiB per
+// rank, exactly X's local bytes, 3 same-node repeats).  At nrhs = n X's tiles are
+// tens of MB and are seeded.
 template <typename T>
 static sl::Matrix<T> shell(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
                            const lorrax_ffi::slate::SlateCtx* ctx) {
@@ -213,7 +220,9 @@ static void hw_report(lorrax_ffi::slate::PoolWatch& pw, const char* what,
 template <typename T>
 static int64_t seed_want(sl::Matrix<T>& M, const lorrax_ffi::slate::SlateCtx* ctx, bool rhs) {
     (void) ctx; (void) rhs;     // A and X alike: this rank's local tiles (comment above)
-    return local_of(M);
+    constexpr std::size_t kGranule = std::size_t(2) << 20;
+    const int64_t k = local_of(M);
+    return std::size_t(k) * lorrax_ffi::slate::block_bytes(M) < kGranule ? 0 : k;
 }
 
 // One call's seed memory: this rank's bytes, from XLA's scratch allocator, sized from
