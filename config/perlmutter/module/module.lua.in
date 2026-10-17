@@ -1,7 +1,7 @@
 help([[
 LORRAX @REV8@ on NERSC Perlmutter.
-Python: @VENV@ (JAX @JAX@, cuda13-local plugin).
-CUDA:   @TOOLKIT_MODULE@ (@CUDA@).
+Python: @VENV@ (JAX @JAX@, cuda13 plugin; CUDA libraries: the uv.lock wheels).
+CUDA:   @TOOLKIT_MODULE@ (@CUDA@) for nvcc/ptxas; no toolkit library is loaded.
 FFI:    sealed bundle @BUNDLE12@, host + CUDA legs, one MPI (@MPICH_MODULE@).
 
 Run (one rank per GPU; select_gpu.sh keeps all four GPUs visible for NCCL):

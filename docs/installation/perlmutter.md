@@ -197,31 +197,32 @@ The recipe is `config/perlmutter/module/`; it works for any install prefix.
 
 | what | pinned in |
 |---|---|
-| Python 3.12 (uv-managed, under the prefix), JAX 0.9.1 `cuda13-local`, cuDNN, nvidia-mathdx, `cudatoolkit/13.2` | `module/stack.sh` |
-| every other Python package | the checkout's `uv.lock` |
+| Python 3.12 (uv-managed, under the prefix), `cudatoolkit/13.2` (nvcc; no library at run time) | `module/stack.sh` |
+| every Python package, the CUDA wheels included (JAX 0.9.1 `cuda13`, cuBLAS, cuFFT, cuSOLVER, cuSPARSE, CUDA runtime, NVRTC, cuDNN, nvidia-mathdx): the clone's set | the checkout's `uv.lock`, extra `cuda13` |
 | cuSOLVERMp, cuBLASMp | `build_ffi_cuda.sh` (repeated in `stack.sh`) |
 | NCCL: `nvidia-nccl-cu13` 2.30.7 (the clone's `uv.lock` pin) | `build_ffi_cuda.sh`, `stack.sh` |
 | Cray MPICH, LibSci | `ffi_mpi.sh` |
 | parallel HDF5 | `build_ffi_cuda.sh`, `build_ffi_host.sh` |
 
-The JAX plugin uses the toolkit's CUDA and installs no CUDA runtime;
-`setup_env.sh` installs cuDNN and nvidia-mathdx without their dependency
-closures and refuses a pip CUDA runtime in the venv, because one would shadow
-the toolkit's. Because the JAX plugin's wheel directories hold no CUDA math
-library in the module venv, each leg's closure records the toolkit's copies
-(`build_ffi_cuda.sh` lists `math_libs` and `cuda/lib64` after the stage).
-`setup_env.sh` installs the NCCL wheel (`stack.sh` `NCCL_VERSION`, the
-clone's `uv.lock` pin) with `--no-deps`; the modulefile puts its `lib`, not
-`comm_libs`, on `LD_LIBRARY_PATH`; `verify_runtime.py` requires exactly that
-`libnccl` to be mapped. `accept.sh`'s `verify_runtime.py` prints and checks both
-legs' enforced closure identities.
+The module venv holds a clone's CUDA libraries. `setup_env.sh` installs
+`uv export --extra cuda13` of the checkout's lock with `--no-deps`, refuses a
+package at any other version (and a lock whose JAX or NCCL disagrees with
+`stack.sh`), and links `venv/lorrax-launch/libcudart.so` to the wheel's CUDA
+runtime, the name libfabric dlopens. Each leg's closure therefore records the
+wheels, as for a clone (the JAX plugin's directories come before the toolkit's
+in `build_ffi_cuda.sh`). The modulefile lists no toolkit library directory;
+`install_module.sh` refuses one. The toolkit module stays loaded for nvcc and
+ptxas, so `PATH` and `CUDA_HOME` are those of a clone shell. `verify_runtime.py`
+refuses a mapped toolkit CUDA library, requires the wheels' cudart, cuBLAS and
+cuFFT and every `jax*`/`nvidia-*` package at its locked version, requires
+exactly the NCCL wheel's `libnccl`, and prints both legs' enforced closure
+identities. A module run and a clone run of one tree map the same CUDA, NCCL,
+cuSOLVERMp, cuBLASMp, MPI and HDF5 files. Measured on Fe V2 P=4 (2026-10-17):
+the module run is bitwise identical to the clone run.
 
-A module run and a clone run of one tree are therefore not bitwise identical:
-NCCL, cuSOLVERMp, cuBLASMp, MPI and HDF5 are the same files, but cuBLAS,
-cuSOLVER, cuFFT, cuSPARSE and the CUDA runtime are the toolkit's (HPC SDK 26.5:
-cuBLAS 13.4.1) in the module and the wheels' (cuBLAS 13.6.1) in a clone.
-Measured on Fe V2 P=4 (2026-10-17): sigma_diag identical, `eqp1` max |Δ|
-1.3e-6 eV. Compare module runs with module runs.
+The wheel venv is about 4.3 GB. The project's `/global/common/software` quota
+is 10 GiB, so check `showquota --cmn <project>` before `setup_env.sh`: a build
+over quota fails in `seal_bundle.py` with `Disk quota exceeded`.
 
 | path under `$LORRAX_MODULE_PREFIX` | written by |
 |---|---|

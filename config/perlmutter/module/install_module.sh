@@ -36,17 +36,23 @@ SITE="$(lorrax_module_site_packages)"
 FABRIC_LIB="$(ldd "$LORRAX_PM_MPI_LIBRARY" | awk '/libfabric/ {print $3; exit}')"
 [[ -n "$FABRIC_LIB" ]] || lorrax_module_die "cannot resolve libfabric from $LORRAX_PM_MPI_LIBRARY"
 COMPAT="/usr/local/cuda-$CUDA_VER/compat"
+# The CUDA libraries are the venv's uv.lock wheels, a clone's set: JAX's
+# plugin and the legs' closures map them by path, so no toolkit library
+# directory is listed.  lorrax-launch (setup_env.sh) comes first: libfabric
+# dlopens libcudart.so by that unversioned name, and it must be the wheel's.
+# NCCL is the venv's nvidia-nccl-cu13 wheel (stack.sh), never comm_libs.
 LD_DIRS=(
-    "$SITE/nvidia/cudnn/lib"
-    "$CUDA/lib64" "$CUDA/nvvm/lib64" "$CUDA/extras/CUPTI/lib64"
-    "$SDK/math_libs/$CUDA_VER/lib64" "$SITE/nvidia/nccl/lib"
+    "$VENV/lorrax-launch" "$SITE/nvidia/cudnn/lib" "$SITE/nvidia/nccl/lib"
 )
-# NCCL is the venv's nvidia-nccl-cu13 wheel (stack.sh), never comm_libs: the
-# bundle's closure records the wheel's libnccl and refuses any other.
 [[ -d "$COMPAT" ]] && LD_DIRS+=("$COMPAT")
 IFS=: read -ra PINNED_DIRS <<< "$LORRAX_PM_RUNTIME_LIB_DIRS"
 LD_DIRS+=("${PINNED_DIRS[@]}" "$(dirname "$FABRIC_LIB")" /opt/cray/pe/lib64)
-for d in "${LD_DIRS[@]}"; do [[ -d "$d" ]] || lorrax_module_die "missing library dir $d"; done
+for d in "${LD_DIRS[@]}"; do
+    [[ -d "$d" ]] || lorrax_module_die "missing library dir $d"
+    case "$d/" in "$SDK/"*) lorrax_module_die "toolkit library dir on the module path: $d" ;; esac
+done
+[[ "$(realpath -e "$VENV/lorrax-launch/libcudart.so")" == "$(realpath -e "$SITE/nvidia/cu13/lib/libcudart.so.13")" ]] \
+    || lorrax_module_die "$VENV/lorrax-launch/libcudart.so is not the wheel's CUDA runtime"
 LD_PATH="$(IFS=:; echo "${LD_DIRS[*]}")"
 PY_DIRS=("$ROOT/src")
 for d in "$ROOT"/services/*/src; do [[ -d "$d" ]] && PY_DIRS+=("$d"); done
