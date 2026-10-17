@@ -75,6 +75,46 @@ def test_size_route_rows_and_room_legs():
     assert "one_device" in resolve_mod.EIGH_BACKENDS and "one_device" in resolve_mod.LU_BACKENDS
 
 
+#: main 4bae15f55's ONE_DEVICE_MAX_N rows: the bound its round rule planned with.
+_MAIN_ROWS = {("eigh", "ROCM"): 16384, ("solve_lu", "ROCM"): 8192}
+
+
+@pytest.mark.parametrize("op,shape", [
+    ("solve_lu", (64, 312, 312)), ("solve_lu", (16, 312, 312)), ("solve_lu", (4, 96, 96)),
+    ("solve_lu", (256, 2048, 2048)), ("solve_lu", (64, 4096, 4096)), ("solve_lu", (8, 8192, 8192)),
+    ("eigh", (64, 312, 312)), ("eigh", (16, 312, 312)), ("eigh", (4, 96, 96)),
+    ("eigh", (256, 4096, 4096))])
+@pytest.mark.parametrize("ranks", [4, 16])
+def test_room_less_round_counts_are_mains(op, shape, ranks):
+    """Fe / hsuite stacks and the stacks where the round budget binds: the rounds a room-less
+    caller runs are main's exactly, though the solve_lu selection bound rose to one GCD."""
+    nb, n = shape[0], shape[-1]
+    width = n if op == "solve_lu" else None
+    main = od.rounds_for(nb, n, ranks, _MAIN_ROWS[(op, "ROCM")], width)
+    bound = resolve_mod.one_device_max_n(op, "ROCM")
+    assert od.rounds_for(nb, n, ranks, resolve_mod.one_device_round_n(op, "ROCM", bound), width) == main
+    # the incumbent of the measured route is the same count (plan._incumbent)
+    from types import SimpleNamespace
+    plan_mod = importlib.import_module("distrib_la.plan")
+    p = SimpleNamespace(op=op, mesh=SimpleNamespace(shape={"x": ranks, "y": 1}))
+    shapes = (shape, shape) if op == "solve_lu" else (shape,)
+    old = resolve_mod.mesh_platform
+    resolve_mod.mesh_platform = lambda m: "ROCM"
+    try:
+        assert plan_mod._incumbent(p, shapes, False) == main
+    finally:
+        resolve_mod.mesh_platform = old
+    if (op, shape, ranks) == ("solve_lu", (256, 2048, 2048), 4):
+        assert main == 4 and od.rounds_for(nb, n, ranks, bound, width) < main   # the budget binds
+
+
+def test_a_single_matrix_above_mains_row_is_one_device_one_per_round(mesh, rocm):
+    n = 12288
+    assert resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=n) == "one_device"
+    assert od.held_per_rank(4, n, 4, resolve_mod.one_device_round_n(
+        "solve_lu", "ROCM", resolve_mod.one_device_max_n("solve_lu", "ROCM")), n) == 1
+
+
 def test_distributed_takes_the_size_route_on_rocm(mesh, rocm, capsys):
     bound = resolve_mod.ONE_DEVICE_MAX_N[("eigh", "ROCM")]
     assert resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64) == "one_device"

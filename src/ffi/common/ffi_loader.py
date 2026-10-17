@@ -257,6 +257,7 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     # The one-device LU solve (cpp/rocsolver/lu_solve_ffi.cc), called by distrib_la.local_lu
     # (LOCAL_LU_ROUTE) for a system spanning >= 2^31 bytes; CUDA uses jaxlib's cuSOLVER for it.
     "lorrax_rocsolver_lu_solve": "RocsolverLuSolveFfi",
+    "lorrax_rocsolver_tri_solve": "RocsolverTriSolveFfi",
     # LocalFourierPlan's ROCM leg (cpp/hipfft/fourier_plan_rocm_ffi.cc, the port of the CUDA
     # leg's cufft/fourier_plan_cuda_ffi.cc): ffi.fft.FOURIER_PLAN_TARGETS["ROCM"].
     "lorrax_fourier_plan_rocm":      "LorraxFourierPlanRocmFfi",

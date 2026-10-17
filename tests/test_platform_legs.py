@@ -211,7 +211,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     lu = {"lorrax_slate_batched_solve_lu_factors", "lorrax_slate_batched_getrf",
           "lorrax_slate_batched_getrs"}
     eigh = {"lorrax_rocsolver_batched_eigh"}
-    lulocal = {"lorrax_rocsolver_lu_solve"}   # the one-device LU solve (cpp/rocsolver/)
+    lulocal = {"lorrax_rocsolver_lu_solve", "lorrax_rocsolver_tri_solve"}   # the one-device LU solve (cpp/rocsolver/)
     fplan = {"lorrax_fourier_plan_rocm"}          # LocalFourierPlan's ROCM leg (cpp/hipfft/)
     agemm = {"lorrax_active_gemm_device", "lorrax_active_gemm_device_out"}
     assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | lulocal | fplan for t in own)

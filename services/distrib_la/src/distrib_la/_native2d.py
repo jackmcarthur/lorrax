@@ -149,7 +149,9 @@ def _chol_2d_single(mesh: Mesh, J: int, b: int):
 
         def right_solve_LH(block, L):
             """Solve X @ L^H = block for X."""
-            return solve_triangular(L.conj(), block.T, lower=True, trans="N").T
+            from distrib_la.local_lu import tri_solve_local   # 2^31-byte span route (ROCM)
+            return tri_solve_local(L.conj(), block.T, native=lambda l, b: solve_triangular(
+                l, b, lower=True, trans="N")).T
 
         def body_k(A_local, k):
             diag_px = k // J_row           # who owns diagonal block (k, k)
