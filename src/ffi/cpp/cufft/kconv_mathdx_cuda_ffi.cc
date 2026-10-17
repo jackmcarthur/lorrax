@@ -3364,6 +3364,20 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                                    "reserved shared memory per block");
                     m7_col_bps = static_cast<int>(std::max(1LL, std::min<long long>(
                         {2LL, smem_sm / (m7_col_smem + pl * 8 + smem_rsv), 2048LL / m7_mid})));
+                    // n_s = 1 (one column a pair), measured A100, ms (previous arm 2 / bits 12 / bits 4):
+                    // the persistent plane loop (bit 8) loses, so the pair-major W_R alone, and only for a
+                    // column box of <= 64 KB -- pass 16 x 640: 14^3 3.63 / 3.26 / 3.26, 15^3 4.28 / 4.81 /
+                    // 3.99; 15^3 pass 32 x 240: 3.17 / 3.36 / 3.01.  Larger boxes keep the previous arm 2:
+                    // 16^3 (70 KB) pass 32 x 208 3.03 / 3.42 / 3.16, pass 16 x 640 4.84 / 5.17 / 4.76; 18^3
+                    // 7.49 / 8.37 / 7.49 and 20^3 10.87 / 11.17 / 11.48 (one column block per SM).
+                    // n_s = 2 keeps bits 12.
+                    if (ns == 1 && (m7_col_bps < 2 || m7_col_smem > 65536)) {
+                        m7_s = 0;
+                        m7_mid = 2 * kThreads;
+                        m7_col_bps = 1;
+                    } else if (ns == 1) {
+                        m7_s_bits = 4;
+                    }
                 }
             }
         } else {

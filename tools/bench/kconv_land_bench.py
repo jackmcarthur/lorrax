@@ -22,6 +22,11 @@ GRIDS = {
     "4^3": ((4, 4, 4), 80, 640), "6^3": ((6, 6, 6), 80, 640), "8^3": ((8, 8, 8), 80, 640),
     "9^3": ((9, 9, 9), 64, 560), "12^3": ((12, 12, 12), 32, 480), "15^3": ((15, 15, 15), 32, 240),
     "16^3": ((16, 16, 16), 32, 208), "20^3": ((20, 20, 20), 16, 208),
+    # kconv/split's pass shape (16 x 640) on the split-arm grids, and 13^3 (the last single-arm cube)
+    "13^3": ((13, 13, 13), 16, 640), "14^3": ((14, 14, 14), 16, 640), "15^3s": ((15, 15, 15), 16, 640),
+    "16^3s": ((16, 16, 16), 16, 640), "18^3": ((18, 18, 18), 16, 640), "20^3s": ((20, 20, 20), 16, 640),
+    "24^3": ((24, 24, 24), 16, 640),
+    "14^3b": ((14, 14, 14), 32, 240), "14^3c": ((14, 14, 14), 16, 208), "15^3c": ((15, 15, 15), 16, 208),
     "12x12x1": ((12, 12, 1), 80, 640), "10x10x4": ((10, 10, 4), 80, 640),
 }
 
@@ -191,7 +196,7 @@ def main():
             rows_out = xn * bx if bx else mx
             c128 = lambda *s: jnp.asarray(rng.standard_normal(s) + 1j * rng.standard_normal(s))
             dput = lambda a: jax.device_put(jnp.asarray(a))
-            common = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), mathdx_root=root, cubin_dir="")
+            common = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), mathdx_root=root, cubin_dir=os.environ.get("KC_CUBIN", ""))
             rec.update(kgrid=kg, nk=nk, n_parent=n_par, mx=mx, my=my, ns=ns)
             Wp, Wt = c128(n_w, mx, my), c128(n_w, mx, my)
             T9 = {k: dput(v) for k, v in t9.items() if k not in ("n_par", "kout")}
