@@ -6,8 +6,12 @@ Reads a TDGW deck (``tdgw.toml``; the ``[lorrax]`` table picks integrator,
 step and self-energy model, ``docs/input_reference.md``), takes the header
 from the TDGW run named by ``load_header_from``, propagates
 
-    d rho/dt = -i([H(t), rho] + E·[r^intra, rho]) - Gamma∘(rho - rho^eq),
+    d rho/dt = -i([H(t), rho] + E·[r^intra, rho]) - Gamma∘(rho - rho^eq) [+ C[rho]],
     H(t) = diag(E^QP) + E(t)·r^inter + dSigma[rho(t)]
+
+(``[lorrax] collision``: the on-shell GW collision term of the GN-PPM bundle,
+whose poles the GW driver recovers in this process before the TD run,
+``docs/theory/td_agw_dynamical.md`` §1.5)
 
 and writes ``tdgw.h5`` + ``tdgw.toml`` that ``tdgw-pp`` reads unchanged
 (one directory per batched drive); ``load_checkpoint_from`` continues a
@@ -47,12 +51,17 @@ from tdagw.tdgw_io import efield_function                          # noqa: E402
 STAGES = (("TD system", "tdagw.system"), ("self-energy model", "tdagw.self_energy"),
           ("outputs", "tdagw.outputs"), ("stiff basis", "tdagw.stiff_basis"),
           ("stability gate", "tdagw.stability_gate"), ("propagation", "tdagw.propagate"))
+#: The collision term's t0 build (``[lorrax] collision``); the GW driver run that
+#: recovers its poles precedes the session and has its own log.
+COLLISION_STAGE = ("collision term", "tdagw.collision")
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     deck = read_td_deck(args.input)
-    with RunSession(RUNTIME, "tdagw", TdReport, log_path(deck), stages=STAGES,
+    source = stages.collision_source(deck, RUNTIME.mesh)         # [lorrax] collision: GW poles
+    rows = STAGES if source is None else STAGES[:-1] + (COLLISION_STAGE, STAGES[-1])
+    with RunSession(RUNTIME, "tdagw", TdReport, log_path(deck), stages=rows,
                     deck=deck) as run:                           # the log: outdir/tdagw.out
         system = stages.load_system(deck, RUNTIME.mesh)          # header, Eq. (1)-(2) operators
         model = stages.build_self_energy(deck, system, RUNTIME.mesh)  # dSigma[rho]
@@ -60,7 +69,8 @@ def main(argv=None):
         outs = stages.open_outputs(deck, system)                 # tdgw.h5 + tdgw.toml
         run.report.header(deck, system, model, RUNTIME)          # stdout: stages.describe
         stats = stages.propagate(deck, system, model, drive, outs, RUNTIME.mesh,
-                                 say=run.report.echo, log=run.report)  # from t0 or the checkpoint
+                                 say=run.report.echo, log=run.report,  # from t0 or the checkpoint
+                                 collision=source)
         run.report.summary(deck, stats)                          # stdout: stages.summarize
         run.complete(files=stages.output_files(outs))
     return 0

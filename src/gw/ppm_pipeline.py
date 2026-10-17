@@ -84,6 +84,55 @@ class PPMOutputs:
     efermi_ry: float | None = None
 
 
+#: Open :func:`observe_window_sigma_source` blocks, innermost last.
+_WINDOW_SOURCE_OBSERVERS: list = []
+
+
+class observe_window_sigma_source:
+    """Collect, from the GN/HL-PPM Sigma stage that runs inside the block, what a window Sigma reuses.
+
+    TD-aGW's frozen-screening collision term (docs/theory/td_agw_dynamical.md
+    §1.5, §9 item 5) evaluates ``gw.ppm_sigma.window_sigma_c`` on the GW run's
+    own carrier and pole model.  A GN-PPM run persists W(0) but neither
+    W(i w_p) nor its poles, so the TD driver runs the GW driver in its own
+    process and reads them here, at the return of
+    :func:`compute_ppm_sigma_pipeline`: no stage is re-implemented and the
+    driver's outputs are unchanged (with no open block the seam is one empty
+    list test).  ``with observe_window_sigma_source() as src: gw_jax.main(...)``
+    leaves in ``src``: ``wfns`` (the Sigma carrier), ``meta``, ``config``,
+    ``poles`` (``PPMBuildResult``), ``head`` (``HeadSigmaDiag`` or None),
+    ``efermi_ry``, ``request`` (the run's ``OnShellRequest`` or None), ``V_q``,
+    ``quad``.  The device fields of the poles and the carrier are copied at the
+    seam (a later stage may donate the originals); the last Sigma stage of the
+    block wins.
+    """
+
+    def __init__(self):
+        self.source = {}
+
+    def __enter__(self):
+        _WINDOW_SOURCE_OBSERVERS.append(self.source)
+        return self.source
+
+    def __exit__(self, *exc):
+        _WINDOW_SOURCE_OBSERVERS.remove(self.source)
+        return False
+
+
+def _publish_window_source(**fields):
+    """Hand the Sigma stage's objects to every open :class:`observe_window_sigma_source`."""
+    poles = fields["poles"]
+    copy = lambda a: None if a is None else jnp.copy(a)
+    fields["poles"] = dataclasses.replace(
+        poles, B_q=copy(poles.B_q), Omega_q=copy(poles.Omega_q),
+        valid_mask_q=copy(poles.valid_mask_q), Wc0_q=copy(poles.Wc0_q),
+        B_odd_q=copy(poles.B_odd_q))
+    fields["wfns"] = jax.tree.map(
+        lambda a: jnp.copy(a) if isinstance(a, jax.Array) else a, fields["wfns"])
+    for box in _WINDOW_SOURCE_OBSERVERS:
+        box.update(fields)
+
+
 def _fit_head_correction(
     head_resolver: HeadResolver, *,
     config: LorraxConfig,
@@ -915,6 +964,11 @@ def compute_ppm_sigma_pipeline(
             )
         del sigma_c_body_omega_n3
 
+    if _WINDOW_SOURCE_OBSERVERS:              # TD-aGW's window Sigma (observe_window_sigma_source)
+        _publish_window_source(
+            wfns=wfns, meta=meta, config=config, poles=ppm, head=head_sigma_diag_w_kn_ry,
+            efermi_ry=sigma_omega.efermi_ry, request=getattr(sigma_c_body_omega, "request", None),
+            V_q=V_q, quad=quad)
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
         band_axis=sigma_omega.band_axis,

@@ -505,6 +505,19 @@ class BandCountCube:
             slot_diagonals=[a - b for a, b in zip(self.slot_diagonals,
                                                   other.slot_diagonals)])
 
+    def __add__(self, other):
+        """The sum of two sweeps' counts on one plan (the causal branches of one sweep)."""
+        if self.term is not None or other.term is not None:
+            raise ValueError("BandCountCube: a sum is taken before the static term")
+        if other.on_shell is not self.on_shell:
+            raise ValueError("BandCountCube: a sum needs one on-shell request (or none)")
+        return replace(
+            self,
+            matrices=[a + b for a, b in zip(self.matrices, other.matrices)],
+            diagonals=[a + b for a, b in zip(self.diagonals, other.diagonals)],
+            slot_diagonals=[a + b for a, b in zip(self.slot_diagonals,
+                                                  other.slot_diagonals)])
+
 
 @lru_cache(maxsize=8)
 def _on_shell_static_term_fn(mesh_xy, n_table):
@@ -602,6 +615,12 @@ class SigmaOmegaResult:
     #: fell back to ``wfn.efermi`` (the DFT midgap), off by 0.5-1.1 eV on
     #: CrI3 16x16 SC (audit 2026-09-23 item 2).  None on non-PPM results.
     efermi_ry: float | None = None
+    #: ``keep_branches`` sweeps only: ``{"cond": Sigma_p, "val": Sigma_h}``, the
+    #: dynamic body of each causal branch (``gw.mpa.sigma.BRANCH_SPACES``), each
+    #: of ``sigma_c_kij``'s type before any static term: Sigma_c = Sigma_p +
+    #: Sigma_h (+ the PPM invalid-pole static term, + the caller's head).
+    #: ``None`` is the incumbent result (docs/theory/td_agw_dynamical.md §1.5).
+    branches: dict | None = None
 
 
 
@@ -1315,6 +1334,7 @@ def compute_sigma_c_ppm_omega_grid(
     fixed_quadrature_session=None,
     on_shell_for=None,
     populations=None,
+    keep_branches=False,
     print_fn=print,
 ) -> SigmaOmegaResult:
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
@@ -1343,6 +1363,11 @@ def compute_sigma_c_ppm_omega_grid(
     ``on_shell_for(efermi_ry)`` returns the on-shell request at this body's
     omega reference (``dynamic_sigma.sigma_on_shell_request``), or None for
     the grid; the reference is the bundle's VBM/midgap resolved here.
+
+    ``keep_branches``: the result also carries each causal branch's dynamic
+    body from the same sweep (``SigmaOmegaResult.branches``; the invalid-pole
+    static term is not in either, so Sigma_c = cond + val + static term).
+    False is the incumbent call, bit for bit.
     """
     from .mpa.sigma import MemoryPoleSource, compute_sigma_c_mpa_omega_grid
 
@@ -1503,6 +1528,7 @@ def compute_sigma_c_ppm_omega_grid(
         # No D=0 twin on the GN/HL route: the odd-reference Sigma was a
         # diagnostic-only second sweep, removed by owner decision 2026-09-23.
         odd_reference=False,
+        keep_branches=keep_branches,
         print_fn=print_fn)
     sigma_c_kij = result.sigma_c_kij
     if sigma_static_host is not None:
@@ -1517,7 +1543,8 @@ def compute_sigma_c_ppm_omega_grid(
         band_counts=result.band_counts,
         static_coh_at_counts=static_coh_at_counts,
         odd_even_residue_ratio=ppm.odd_even_residue_ratio,
-        efermi_ry=efermi_ry)
+        efermi_ry=efermi_ry,
+        branches=result.branches)
 
 
 # ---------------------------------------------------------------------------
@@ -1608,11 +1635,48 @@ def _with_frequencies(request: OnShellRequest, extra_ry) -> OnShellRequest:
     return replace(request, frequencies_ry=freqs, index=index)
 
 
+@lru_cache(maxsize=16)
+def _window_block_fn(mesh_xy, b_lo, n_a, ndim):
+    """The window block [b_lo, b_lo + n_a)^2 of a band-sharded Sigma, replicated.
+
+    ``ndim`` 4: ``(lead, nk, nb, nb)`` (an on-shell pair, a Sigma(omega) cube);
+    3: ``(nk, nb, nb)`` (a static term).  The block is a few KB, so it moves to
+    every device instead of the whole Sigma window to every host.
+    """
+    win = slice(int(b_lo), int(b_lo) + int(n_a))
+    rep = NamedSharding(mesh_xy, P())
+    if int(ndim) == 4:
+        return jax.jit(lambda a: a[:, :, win, win], out_shardings=rep)
+    return jax.jit(lambda a: a[:, win, win], out_shardings=rep)
+
+
+def _head_branch_rows(head, table_ry, win):
+    """The q -> 0 head on the window at one on-shell table, split by its occupation weights.
+
+    ``head`` (``gw.head_correction.HeadSigmaDiag``) is sum_p pref_p [f/(d + z_p) +
+    (1 - f)/(d - z_p)], linear in the occupation f of its own band: the hole part
+    f A is f times its value at f = 1, the particle part (1 - f) B is 1 - f times its
+    value at f = 0, both from ``HeadSigmaDiag.on_shell`` (the readers' one
+    arithmetic).  ``static`` is its static-W limit, sum_p pref_p (2 f - 1)/z_p (the
+    head's COHSEX: -f W_h(0) + W_h(0)/2 per cell).  Host (nk, n_A) each, Ry.
+    """
+    e = np.asarray(head.enk_ry)[:, win]
+    f = np.asarray(head.occupations)[:, win]
+    t = np.asarray(table_ry)[:, win]
+    hole = f * replace(head, enk_ry=e, occupations=np.ones_like(f)).on_shell(t)[0]
+    particle = (1.0 - f) * replace(head, enk_ry=e, occupations=np.zeros_like(f)).on_shell(t)[0]
+    pref = np.asarray(head.residues_ry) / (float(head.cell_volume) * float(head.nk_tot))
+    z = np.asarray(head.poles_ry, np.complex128).reshape(-1)
+    static = (2.0 * f - 1.0) * complex(np.sum(pref / z)) if z.size else np.zeros_like(hole)
+    return hole, particle, static
+
+
 def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omega_ry=None,
-                   omit_frozen: bool = False, print_fn=None) -> dict:
+                   omit_frozen: bool = False, branches: bool = False,
+                   static_limit: bool = False, print_fn=None) -> dict:
     """Sigma^c of a band window at an instantaneous state, from a pole model (Ry).
 
-    docs/theory/td_agw_dynamical.md §1.2-1.4 (Eqs. 2-3) and §9 item 5.  The GW
+    docs/theory/td_agw_dynamical.md §1.2-1.5 (Eqs. 2-3, 8) and §9 item 5.  The GW
     run's own Σ τ sweep (:func:`compute_sigma_c_ppm_omega_grid` and the shared
     executor ``gw.mpa.sigma``) on a carrier that differs from the run's only
     in the window: its faces are rotated, psi_A -> psi_A U (one n_A x n_A
@@ -1620,7 +1684,8 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     weights the populations f (valence f, conduction 1 - f).  Every other
     band keeps its equilibrium energy and step occupation, and G(tau) of
     every band is composed at every node from the stored centroid faces;
-    no G(tau) is stored.  No file is read or written.
+    no G(tau) is stored.  No file is read or written; only the window block
+    of each result leaves the devices.
 
     Parameters
     ----------
@@ -1640,15 +1705,33 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         reference (returned as ``efermi_ry``): the matrix Sigma^c_ij(omega)
         is also evaluated there (the grid route).
     omit_frozen : RED TWIN ONLY — the frozen bands are dropped from G.
+    branches : also return each causal branch's pair tables from the SAME sweep
+        (``keep_branches``): ``branch_pair`` = dict(cond, val, static), cond the
+        particle branch (weight 1 - f, residue R_+, retarded broadening), val the
+        hole branch (weight f, R_-, time-ordered broadening: E - e + Omega - i eta),
+        each with its part of the head (:func:`_head_branch_rows`), and static the
+        invalid-pole static term's block (nk, n_A, n_A), Hermitian and frequency
+        independent: pair = cond + val + static to rounding.
+    static_limit : also return ``static_limit`` = dict(sx, head): the static-W limit
+        of the populations' screened exchange, sx (nk, n_A, n_A) = the window block
+        of -<G_occ W^c(0)> with W^c(0) = W(0) - V on every mode (the invalid-pole
+        kernels with no mode masked), and head (nk, n_A) its head part
+        (:func:`_head_branch_rows`).  At fixed screening the populations enter the
+        static limit of the GN-PPM Sigma only through these (the COH half and the
+        D/Omega term are population independent).
 
     Returns
     -------
     dict with ``pair`` (2, nk, n_A, n_A): Sigma^c_ij(e_i), Sigma^c_ij(e_j) in the
     instantaneous basis (body, invalid-pole static term and head);
-    ``static`` (nk, n_A, n_A): U [1/2 (pair_0 + pair_1)]^h U^H, the on-shell
-    operator in the band basis (sigma-on-shell.md); ``diag`` (nk, n_A):
-    Sigma^c_ii(e_i); ``omega`` (n_omega, nk, n_A, n_A) in the band basis when
-    ``omega_ry`` is given; ``efermi_ry``; ``request`` (the on-shell tables).
+    ``onshell`` (nk, n_A, n_A): U Sigma~ U^H with Sigma~ = 1/2 (pair_0 + pair_1), the
+    complex on-shell operator of Eq. 8 in the band basis (no Hermitian
+    projection; its Hermitian part is the operator of sigma-on-shell.md);
+    ``diag`` (nk, n_A): Sigma^c_ii(e_i); ``omega`` (n_omega, nk, n_A, n_A) in the band
+    basis when ``omega_ry`` is given; ``efermi_ry``; ``request`` (the on-shell
+    tables); ``branch_pair`` / ``static_limit`` on request.  ``pair``,
+    ``branch_pair`` and ``static_limit`` are in the instantaneous basis (the
+    columns of U); ``onshell`` and ``omega`` in the band basis.
 
     The Sigma band window is [0, b_lo + n_A): the invalid-pole static term's
     occupied projector (``cohsex_sigma.build_Gij``) needs every occupied band
@@ -1723,14 +1806,14 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         built["request"] = req
         return req
 
-    def run(on_shell, omega_grid):
+    def run(on_shell, omega_grid, keep_branches=False):
         return compute_sigma_c_ppm_omega_grid(
             wfns_t, poles, meta_t, mesh_xy, ppm_cfg=plan["ppm_cfg"],
             sigma_cfg=plan["sigma_cfg"], mpa_cfg=plan["mpa_cfg"], omega_grid_ry=omega_grid,
             ansatz=plan["ansatz"], screening_diagrams=plan["screening_diagrams"],
             plan=None, fixed_quadrature_session=plan.get("session"),
             on_shell_for=on_shell_for if on_shell else None, populations=pop,
-            print_fn=quiet)
+            keep_branches=keep_branches, print_fn=quiet)
 
     def head_rows(efermi_ry):
         return None if head is None else replace(
@@ -1738,26 +1821,53 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
             efermi_ry=float(efermi_ry))
 
     from common.collectives import gather_to_host
-    res = run(True, plan["omega_grid_ry"])
-    point = res.sigma_c_kij.point(0).with_head(head_rows(res.efermi_ry))
-    pair = np.asarray(gather_to_host(point.pair))[:, :, win, win]
+    block4 = _window_block_fn(mesh_xy, b_lo, n_a, 4)
+    block3 = _window_block_fn(mesh_xy, b_lo, n_a, 3)
+    res = run(True, plan["omega_grid_ry"], keep_branches=bool(branches))
+    hr = head_rows(res.efermi_ry)
+    point = res.sigma_c_kij.point(0).with_head(hr)
+    pair = np.asarray(gather_to_host(block4(point.pair)))
     diag = np.einsum("kii->ki", pair[0])
     Uh = np.conj(np.swapaxes(U, -1, -2))
     S = 0.5 * (pair[0] + pair[1])
-    S = 0.5 * (S + np.conj(np.swapaxes(S, -1, -2)))
-    out = dict(pair=pair, diag=diag, static=U @ S @ Uh, efermi_ry=float(res.efermi_ry),
+    out = dict(pair=pair, diag=diag, onshell=U @ S @ Uh, efermi_ry=float(res.efermi_ry),
                request=built.get("request"), carrier=dict(slices=slices_t, nb_sigma=nb_sig))
+    if branches or static_limit:
+        req = built["request"]
+        table = req.tables_ry[req.slot("pair")]
+        hole, particle, head_static = (
+            _head_branch_rows(hr, table, win) if hr is not None else
+            (np.zeros((nk, n_a)),) * 3)
+    if branches:
+        from .mpa.sigma import BRANCH_SPACES
+        tabs = {space: np.array(gather_to_host(block4(res.branches[space].point(0).pair)))
+                for space in BRANCH_SPACES}
+        idx = np.arange(n_a)
+        tabs["val"][:, :, idx, idx] += hole[None]
+        tabs["cond"][:, :, idx, idx] += particle[None]
+        term = getattr(res.sigma_c_kij, "term", None)
+        tabs["static"] = (np.zeros((nk, n_a, n_a), np.complex128) if term is None else
+                          np.asarray(gather_to_host(block3(term))))
+        out["branch_pair"] = tabs
+    if static_limit:
+        from .cohsex_sigma import build_Gij
+        sigma_sx, _, W_all = _invalid_static_kernels(
+            wfns_t, poles.Wc0_q, True, meta_t, mesh_xy, poles.q_wedge)
+        state = _population_state(pop, meta_t, pop.shape)
+        sx = sigma_sx(wfns_t, build_Gij(meta_t, mesh_xy, state), W_all)
+        out["static_limit"] = dict(sx=np.asarray(gather_to_host(block3(sx))), head=head_static)
     if omega_ry is not None:
         grid = np.asarray(omega_ry, np.float64)
         res_w = run(False, grid)
         cube = res_w.sigma_c_kij.point(0)
-        Sw = np.asarray(gather_to_host(cube))[:, :, win, win]
-        hr = head_rows(res_w.efermi_ry)
-        if hr is not None:
-            hw = replace(hr, omega_grid_ry=grid).band_rows(b_lo, b_hi)
+        Sw = np.asarray(gather_to_host(block4(cube)))
+        hr_w = head_rows(res_w.efermi_ry)
+        if hr_w is not None:
+            hw = replace(hr_w, omega_grid_ry=grid).band_rows(b_lo, b_hi)
             Sw = Sw + np.einsum("wki,ij->wkij", hw, np.eye(n_a))
         out["omega"] = U[None] @ Sw @ Uh[None]
     p(f"  window Sigma_c: bands [{b_lo}, {b_hi}) on the Sigma window [0, {nb_sig}), "
       f"max|Sigma_ii(e_i)| = {float(np.max(np.abs(diag))) * RYD_TO_EV:.6f} eV"
-      + (" (RED TWIN: frozen bands omitted from G)" if omit_frozen else ""))
+      + (" (RED TWIN: frozen bands omitted from G)" if omit_frozen else "")
+      + (", branches kept" if branches else ""))
     return out

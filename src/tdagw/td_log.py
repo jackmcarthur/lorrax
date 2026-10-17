@@ -187,6 +187,7 @@ class TdReport(ScientificProductionReport):
         self._held = None
         self._rows = {}
         self._pending = True              # the self-energy / integrator sections not yet written
+        self._refreshes = []              # the collision term's lines (refresh), see refresh()
         if self.rank == 0:
             self.begin(input_file=deck.source)
             self.emit(f"Log            : {self.path} (stdout is a subset)")
@@ -212,6 +213,24 @@ class TdReport(ScientificProductionReport):
 
     def hold(self) -> None:
         self._held = []
+
+    def refresh(self, line: str) -> None:
+        """A collision-term line (its t0 receipt, each refresh): stdout now, the log's
+        ``Collision refreshes`` section after the progress table (whose rows stay a
+        fixed-column table), before the summary or the closing blocks."""
+        if self.rank != 0:
+            return
+        self.stdout(str(line))
+        self._refreshes.append(str(line))
+
+    def _refresh_section(self) -> None:
+        if self.rank != 0 or not self._refreshes:
+            return
+        lines, self._refreshes = self._refreshes, []
+        self.emit(_RULE)
+        self.heading("Collision refreshes")
+        for line in lines:
+            self.emit(line)
 
     # ── sections written at open ─────────────────────────────────────────
     def _provenance(self) -> None:
@@ -452,6 +471,7 @@ class TdReport(ScientificProductionReport):
         if self.rank != 0:
             return
         self.stdout(text)
+        self._refresh_section()
         self.emit(_RULE)
         self.heading("Summary")
         for line in text.split("\n"):
@@ -507,13 +527,27 @@ class TdReport(ScientificProductionReport):
                        f"their dSigma calls; not timed alone without a gate)")
         dtr = [r["d_trace"] for r in rows if r["d_trace"] is not None]
         dpu = [r["d_purity"] for r in rows if r["d_purity"] is not None]
+        coll = stats.get("collision")
         if dtr:
             ham = (deck.values["system.depopulation"] == 0.0
                    and deck.values["system.dephasing"] == 0.0)
+            why = ("collision on: Tr rho moves by the out/in balance of the held rates, "
+                   "Tr rho^2 is not conserved)" if coll else
+                   "Gamma = 0: both conserved by the exact flow)" if ham else
+                   "Gamma != 0: only Tr rho is conserved)")
             out.append(f"  invariants      : max |dTr|/Tr {max(dtr):.2e}, max |dTr rho^2|/Tr rho^2 "
-                       f"{max(dpu):.2e} over {rows[-1]['i1'] - rows[0]['i0']} samples ("
-                       + ("Gamma = 0: both conserved by the exact flow)" if ham else
-                          "Gamma != 0: only Tr rho is conserved)"))
+                       f"{max(dpu):.2e} over {rows[-1]['i1'] - rows[0]['i0']} samples (" + why)
+        if coll:
+            refs = [h for h in coll["history"] if h.get("why") != "t0"]
+            mean = lambda key: sum(h[key] for h in refs) / max(len(refs), 1)
+            out.append(f"  collision       : {coll['form']}, hermitian {coll['hermitian']}; "
+                       f"{len(refs)} refresh(es)"
+                       + (f", mean wall {mean('wall_s'):.3g} s (sweep {mean('sweep_s'):.3g}, "
+                          f"dissipator {mean('build_s'):.3g}, hermitian {mean('hermitian_s'):.3g})"
+                          if refs else "")
+                       + f"; t0 build {coll['t0']['wall_s']:.3g} s; GW source run "
+                       f"{coll['source_wall_s']:.1f} s; {stats.get('programs', 0)} chunk "
+                       f"program(s), {stats.get('jit_cache', 0)} traced")
         last = rows[-1] if rows else None
         if last is not None and (last["p_abs"] is not None or last["n_c"] is not None):
             out.append("  final sample    : "
@@ -530,6 +564,7 @@ class TdReport(ScientificProductionReport):
 
     def finish(self, *, status: str = "completed") -> None:
         self._flush_pending()
+        self._refresh_section()
         super().finish(status=status)
 
     def _flush_pending(self) -> None:

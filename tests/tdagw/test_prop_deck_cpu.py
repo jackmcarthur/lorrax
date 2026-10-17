@@ -8,6 +8,10 @@ G2 every refusal names its GATE id (one case per gate of parse_td_deck);
    while cfm4 accepts it, and a restart into a new outdir parses
 R1 the unmutated deck is refused by none of G2's checks, so each refusal
    is caused by its mutation and not by the base deck
+G3 [lorrax] collision (docs/theory/td_agw_dynamical.md §1.5): its forms, the
+   source gauge (system = bundle, collision_source = bundle_input), the refresh
+   policy (fs -> a.u.), the restart refusal; the collision keys are flagged
+   inactive with collision = off and enter the restart fingerprint only when on
 """
 import copy
 import json
@@ -63,6 +67,11 @@ _CASES = [
     ("lorrax.dt", 0.0, "td_dt"),
     ("measurements.types", ["Efield", "velocity_operator"], "td_measurement_unsupported"),
     ("measurements.types", ["Efield", "Efield"], "td_measurement_names"),
+    ("lorrax.collision", "on", "td_collision"),
+    ("lorrax.collision_hermitian", "half", "td_collision"),
+    ("lorrax.collision_refresh_fs", -1.0, "td_collision_refresh"),
+    ("lorrax.collision_refresh_df", "often", "td_collision_refresh"),
+    ("lorrax.collision", "subtracted", "td_collision_source"),
 ]
 
 
@@ -130,3 +139,46 @@ def test_refusal_names_its_gate(key, value, gid):
 def test_red_twin_base_deck_trips_no_gate():
     base = _base()
     assert not any(_refuses(copy.deepcopy(base), gid) for _, _, gid in _CASES)
+
+
+def _bundle(**lorrax):
+    raw = _base()
+    raw["control"]["files"].pop("load_header_from")
+    raw["lorrax"].update(system="bundle", bundle_input="gw/oneshot.in", dipole_file="gw/dipole.h5",
+                         **lorrax)
+    return raw
+
+
+def test_collision_on_a_bundle_parses():
+    deck = parse_td_deck(_bundle(collision="subtracted", collision_refresh_fs=0.5,
+                                 collision_refresh_df=1e-3))
+    v = deck.values
+    assert v["lorrax.collision"] == "subtracted"
+    assert v["lorrax.collision_source"] == "gw/oneshot.in"            # defaults to bundle_input
+    assert v["lorrax.collision_refresh_fs"] == pytest.approx(500.0 / T_IN_ATTOSEC)
+    assert v["lorrax.collision_refresh_df"] == 1e-3
+    assert v["lorrax.collision_hermitian"] == "dynamic"
+
+
+def test_collision_refuses_another_source_and_a_restart():
+    assert _refuses(_bundle(collision="raw", collision_source="other/gw.in"), "td_collision_source")
+    raw = _bundle(collision="raw")
+    raw["control"]["files"]["load_checkpoint_from"] = "an_earlier_run"
+    assert _refuses(raw, "td_collision_restart")
+    assert not _refuses(_bundle(collision="raw", collision_source="gw/oneshot.in"),
+                        "td_collision_source")
+
+
+def test_collision_keys_inactive_when_off_and_fingerprint():
+    from types import SimpleNamespace
+    from tdagw.stages import restart_fingerprint
+    from tdagw.td_config import inactive_keys
+    off = parse_td_deck(_bundle(collision_hermitian="full", collision_refresh_fs=1.0))
+    assert set(inactive_keys(off)) >= {"lorrax.collision_hermitian", "lorrax.collision_refresh_fs"}
+    on = parse_td_deck(_bundle(collision="subtracted"))
+    assert "lorrax.collision_hermitian" not in inactive_keys(on)
+    sysm = SimpleNamespace(nk=9, nb=4, nspinor=2)
+    model = SimpleNamespace(name="m")
+    fp_off = json.loads(restart_fingerprint(off, sysm, model, 0.1))
+    fp_on = json.loads(restart_fingerprint(on, sysm, model, 0.1))
+    assert "collision" not in fp_off and fp_on["collision"]["lorrax.collision"] == "subtracted"

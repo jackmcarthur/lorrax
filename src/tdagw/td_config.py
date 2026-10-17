@@ -81,6 +81,11 @@ TD_DEFAULTS = {
     "lorrax.stiff_krylov": 0,
     "lorrax.stiff_tol": 1e-9,
     "lorrax.stiff_iter": 6,
+    "lorrax.collision": "off",
+    "lorrax.collision_source": "",
+    "lorrax.collision_hermitian": "dynamic",
+    "lorrax.collision_refresh_fs": 0.0,
+    "lorrax.collision_refresh_df": 0.0,
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -97,6 +102,10 @@ MEASUREMENT_KEYWORDS = ("dataset_name", "itrange", "ntsave", "brange1",
                         "brange2", "krange", "use_v0", "inter_only",
                         "eigenvectors", "n_states")
 SYSTEMS = ("tdgw_header", "bundle")
+#: ``lorrax.collision``: off, or the form of the on-shell collision term (§1.5).
+COLLISION_FORMS = ("off", "subtracted", "raw")
+#: ``lorrax.collision_hermitian``: the held Hermitian part (``tdagw.collision``).
+COLLISION_HERMITIAN = ("dynamic", "full", "none")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
 #: Sample names the driver keeps for its own per-chunk record (``tdagw.propagate.PROGRESS``);
@@ -144,6 +153,42 @@ def read_td_deck(path: str) -> TdDeck:
     with open(path, "rb") as f:
         raw = tomllib.load(f)
     return parse_td_deck(raw, source=os.path.abspath(path))
+
+
+def _check_collision(vals: dict) -> None:
+    """The ``lorrax.collision*`` keys (§1.5): forms, the source's gauge, the refresh policy."""
+    form = vals["lorrax.collision"]
+    if form not in COLLISION_FORMS:
+        raise _gate("td_collision", repr(form), " | ".join(COLLISION_FORMS),
+                    "set [lorrax] collision")
+    if vals["lorrax.collision_hermitian"] not in COLLISION_HERMITIAN:
+        raise _gate("td_collision", f"collision_hermitian = "
+                    f"{vals['lorrax.collision_hermitian']!r}", " | ".join(COLLISION_HERMITIAN),
+                    "set [lorrax] collision_hermitian")
+    for key in ("lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"):
+        try:
+            ok = float(vals[key]) >= 0.0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            raise _gate("td_collision_refresh", f"{key} = {vals[key]!r}",
+                        ">= 0 (0 = that trigger off)", f"set [lorrax] {key.split('.')[1]}")
+        vals[key] = float(vals[key])
+    if form == "off":
+        return
+    if vals["lorrax.system"] != "bundle":
+        raise _gate("td_collision_source", "collision with system = 'tdgw_header'",
+                    "system = 'bundle' (the rates are measured on the bundle's own "
+                    "wavefunctions, the header's gauge)", "build the system from the bundle")
+    if vals["lorrax.collision_source"] not in ("", vals["lorrax.bundle_input"]):
+        raise _gate("td_collision_source", "collision_source differs from bundle_input",
+                    "the GN-PPM GW deck of the bundle (one wavefunction gauge)",
+                    "leave collision_source unset")
+    vals["lorrax.collision_source"] = vals["lorrax.bundle_input"]
+    if vals["control.files.load_checkpoint_from"]:
+        raise _gate("td_collision_restart", "load_checkpoint_from with collision",
+                    "a fresh run (the held rates and Delta Sigma^h are not in the carry)",
+                    "rerun from t0, or set collision = 'off'")
 
 
 def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
@@ -300,6 +345,7 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
                     "model = 'isdf' (a dense kernel.h5 carries its own TDA flag)",
                     "drop tda, or use the ISDF model")
     vals["lorrax.model"] = model
+    _check_collision(vals)
 
     # units: as -> a.u., eV -> Ha
     for k in ("control.timesteps.t0", "control.timesteps.dt_measure",
@@ -312,6 +358,7 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         vals["lorrax.pair_gap_ev"] = float(vals["system.esmear"])
     for k in ("system.esmear", "system.depopulation", "system.dephasing"):
         vals[k] = float(vals[k]) / HA_IN_EV
+    vals["lorrax.collision_refresh_fs"] *= 1000.0 / T_IN_ATTOSEC
     if vals["lorrax.dt"] == "auto":
         if vals["lorrax.method"] not in ("magnus2", "cfm4"):
             raise _gate("td_dt", f"dt = 'auto' with method {vals['lorrax.method']!r}",
@@ -426,6 +473,9 @@ def inactive_keys(deck) -> dict:
          "no kernel.h5 or WFN.h5 is read from it on this route"),
         (("system.ivbm",), model == "none" and not bundle,
          "model none on a TDGW header (occupations come from the header)"),
+        (("lorrax.collision_source", "lorrax.collision_hermitian",
+          "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"),
+         v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
     ]
     out = {}
     for keys, inactive, why in rules:
@@ -740,4 +790,33 @@ TD_KEY_DOCS = {
     "lorrax.stiff_iter": (
         "", "Node-map evaluations (each: the exponentials to the two nodes, no ΔΣ call) of "
         "the closing solve per step, at least 1.", ("td_stiff_solve",)),
+    "lorrax.collision": (
+        "", "The on-shell GW collision term of the GN-PPM run, W frozen at its own poles "
+        "([td_agw_dynamical.md §1.5](theory/td_agw_dynamical.md)): `off`; `subtracted`, "
+        "C[ρ] − C[ρ_eq] at full rates, so ρ_eq is an exact fixed point; `raw`, C[ρ] (ρ_eq "
+        "drifts by C[ρ_eq], the regularization tails). The dissipative flow "
+        "x' = −½{G̃, x} + S is solved exactly in the eigenbasis of G̃ = G̃> + G̃< "
+        "in the remainder slot (Magnus) or added to the right-hand side (dp54, rk4, "
+        "etdrk4). Needs `system = bundle` on a GN-PPM bundle; the GW driver reruns on a "
+        "copy of `bundle_input` in `outdir/collision_source` at the start (no restart "
+        "written) to recover the poles. The log's `Collision refreshes` section has one "
+        "line per refresh.",
+        ("td_collision", "td_collision_source", "td_collision_restart",
+         "dynsig_gnppm_mode", "dynsig_collision_occupations")),
+    "lorrax.collision_source": (
+        "= `bundle_input`", "The GN-PPM GW deck of the rates; it must be (or default to) "
+        "`bundle_input` (one wavefunction gauge).", ("td_collision_source",)),
+    "lorrax.collision_hermitian": (
+        "", "The held Hermitian part ΔΣ^h added to K δρ at each refresh: `dynamic`, "
+        "Herm S̃[ρ] − Herm S̃[ρ_eq] less its static-W limit (the population response of "
+        "W^c(0), which K already holds); `full`, Herm S̃[ρ] − Herm S̃[ρ_eq]; `none`.",
+        ("td_collision",)),
+    "lorrax.collision_refresh_fs": (
+        "= never", "Refresh the rates, the dissipator and ΔΣ^h every this many fs (at "
+        "the first chunk end past it); 0 holds the rates of ρ_eq.",
+        ("td_collision_refresh",)),
+    "lorrax.collision_refresh_df": (
+        "= never", "Refresh at the first chunk end where max |f − f_last| over the "
+        "window's populations exceeds this; 0 = no population trigger.",
+        ("td_collision_refresh",)),
 }

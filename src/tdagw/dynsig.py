@@ -69,7 +69,8 @@ from distrib_la import eigh_local
 __all__ = ["DynsigKernels", "assemble_dynsig_bundle", "check_state", "chi0_split", "split_bundle",
            "dynamic_correction", "dynsig_model", "equilibrium_sigma", "exchange_sigma",
            "instantaneous_basis", "literal_sx", "make_dynsig_kernels", "probe_rule",
-           "screened_update", "static_rule"]
+           "screened_update", "static_rule", "gnppm_source", "gnppm_collision",
+           "window_branch_rates"]
 
 GREEN_SPEC = P(None, "x", None, "y", None)        # (k, mu, s, nu, t)
 CHI_SPEC = P(None, "x", "y")                      # (q, mu, nu)
@@ -707,3 +708,284 @@ def check_state(dyn: dict, flags: dict) -> None:
         _refuse("dynsig_degenerate_population", f"{f['degenerate']} same-side pairs with "
                 "|dE| <= deg_tol and different populations", "none", "the static limit of "
                 "such a pair is a Drude term (design page, 'carriers')")
+
+
+
+# ===========================================================================
+# The GN-PPM member's on-shell collision term (§1.5): W frozen at the run's own poles
+# ===========================================================================
+
+def _copy_gw_deck(deck: str, workdir: str) -> str:
+    """The GW deck in ``workdir`` with ``write_restart_tensors = false`` (rank 0 writes)."""
+    import os
+    os.makedirs(workdir, exist_ok=True)
+    lines = open(deck).read().splitlines()
+    lines = [("write_restart_tensors = false" if ln.strip().startswith("write_restart_tensors")
+              else ln) for ln in lines]
+    out = os.path.join(workdir, os.path.basename(deck))
+    open(out, "w").write("\n".join(lines) + "\n")
+    for name in ("dipole.h5",):              # the deck's implicit companions (not on the deck)
+        src = os.path.join(os.path.dirname(os.path.abspath(deck)), name)
+        dst = os.path.join(workdir, name)
+        if os.path.exists(src) and not os.path.lexists(dst):
+            os.symlink(os.path.realpath(src), dst)
+    return out
+
+
+def gnppm_source(gw_deck: str, mesh: Mesh, *, workdir: str, say=print) -> dict:
+    """The frozen-W source of the GN-PPM collision term: the GW run's own carrier, poles and head.
+
+    A GN-PPM run persists W(0) but neither W(i w_p) nor its pole model, so the
+    GW driver (``gw.gw_jax.main``) runs in this process on a copy of ``gw_deck``
+    in ``workdir`` (``write_restart_tensors = false``: the run's own restart is
+    never written) and ``gw.ppm_pipeline.observe_window_sigma_source`` reads the
+    Sigma stage at its return: no GW stage is re-implemented, and the window
+    Sigma at rho_eq is the run's (§6.1).  Collective: every process calls it.
+    Must run outside another driver's ``RunSession`` (the GW driver owns the
+    timing table and stdout while it runs).  Returns the observer's dict
+    (``wfns``, ``meta``, ``config``, ``poles``, ``head``, ``efermi_ry``,
+    ``request``, ``V_q``, ``quad``) plus ``plan`` (``gw.ppm_sigma.window_sigma_plan``
+    on the run's own on-shell frequency list), ``deck``, ``workdir``, ``rc``,
+    ``wall_s``.
+    """
+    import os
+    import time
+    import gw.gw_jax as gw_driver
+    from jax.experimental import multihost_utils
+    from gw.ppm_pipeline import observe_window_sigma_source
+    from gw.ppm_sigma import window_sigma_plan
+    t0 = time.perf_counter()
+    workdir = os.path.abspath(workdir)
+    copy = os.path.join(workdir, os.path.basename(gw_deck))
+    if jax.process_index() == 0:
+        _copy_gw_deck(gw_deck, workdir)
+    multihost_utils.sync_global_devices("dynsig gnppm_source deck")
+    cwd = os.getcwd()
+    os.chdir(workdir)
+    try:
+        with observe_window_sigma_source() as src:
+            rc = gw_driver.main(["-i", os.path.basename(copy)])
+    finally:
+        os.chdir(cwd)
+    if "poles" not in src:
+        _refuse("dynsig_gnppm_source", f"no GN/HL-PPM Sigma stage ran in {gw_deck}",
+                "a compute_mode = gn_ppm deck", "point the source at the GN-PPM GW run")
+    mode = str(getattr(src["config"].compute_mode, "value", src["config"].compute_mode))
+    if mode != "gn_ppm":
+        _refuse("dynsig_gnppm_mode", f"compute_mode = {mode}", "gn_ppm (the ordered GN fit the "
+                "branch rates are measured on)", "use a GN-PPM run")
+    req = src["request"]
+    freqs = None if req is None else np.asarray(req.frequencies_ry) + float(src["efermi_ry"])
+    src = dict(src, plan=window_sigma_plan(src["config"], head=src["head"],
+                                           frequencies_abs_ry=freqs),
+               deck=os.path.abspath(gw_deck), workdir=workdir, rc=rc,
+               wall_s=time.perf_counter() - t0)
+    say(f"  collision source: GW driver on {gw_deck} in {workdir} (rc {rc}, "
+        f"{src['wall_s']:.1f} s): GN-PPM poles at the run's own W_0, "
+        f"{int(src['meta'].nk_tot)} k, N_mu {int(src['meta'].n_rmu)}")
+    return src
+
+
+def window_branch_rates(tabs: dict):
+    """(G~>, G~<, S~) host (nk, n, n) Ry from ``window_sigma_c``'s ``branch_pair`` (Eq. 8)."""
+    from tdagw import collision as C
+    g_out, g_in = (np.asarray(g) for g in C.rates(jnp.asarray(tabs["cond"]),
+                                                   jnp.asarray(tabs["val"])))
+    s = 0.5 * (tabs["cond"][0] + tabs["cond"][1] + tabs["val"][0] + tabs["val"][1]
+               ) + tabs["static"]
+    return g_out, g_in, s
+
+
+def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: int,
+                    form: str = "subtracted", hermitian: str = "dynamic", policy=None,
+                    say=print, record=None):
+    """The held collision term of the GN-PPM member at t0 and its refresh hook (§1.5, §7.1).
+
+    Parameters
+    ----------
+    source : :func:`gnppm_source`.
+    ops : the propagator's ``tdagw.eom.TdOperators`` of the window [b_lo, b_lo + nb)
+        (its ``rho_eq``, ``w_k`` and k padding); ``k_frac`` (nk, 3) its k list.
+    b_lo : the window's first band, 0-based on the GW run's band axis.
+    ntr : the propagator's trials (each gets its own rates).
+    form : ``tdagw.collision.FORMS``; ``hermitian`` : ``tdagw.collision.HERMITIAN_MODES``.
+    policy : ``tdagw.collision.RefreshPolicy`` (None: the rates of t0 throughout).
+    say : the stdout line of each refresh; ``record`` (or None) gets each
+        refresh's dict (the run log's section, the case scripts' tables).
+
+    The instantaneous basis is the band basis (``dress = "none"``: U = 1, e =
+    eps^G of the run, f = diag rho of the window), the coherences are not in the
+    rates.  Every rate and table is per trial and per k on the propagator's k
+    rows; the window Sigma runs one tau sweep per trial with both branches kept
+    (``gw.ppm_sigma.window_sigma_c(branches=True)``).  Returns dict: ``diss`` the
+    t0 :class:`tdagw.collision.Dissipator` (k-sharded), ``held`` the t0 held
+    Delta Sigma^h (zeros; None when ``hermitian == "none"``), ``refresh`` the hook of
+    ``tdagw.propagate.run_propagation``, ``t0`` the equilibrium receipt and
+    ``state`` (the hook's history), ``eq`` the t0 sweep (:func:`window_branch_rates`
+    and ``window_sigma_c``'s raw output) and ``bundle_of`` (TD k row -> GW row).
+    The basis is the band basis (U = 1), so the window outputs' instantaneous
+    basis and the propagator's coincide.
+    """
+    import time
+    from common.collectives import gather_to_host
+    from common.units import RYD_TO_EV
+    from gw.ppm_sigma import window_sigma_c
+    from tdagw import collision as C
+    from tdagw import propagate as tp
+    from tdagw.self_energy import held_term
+    if form not in C.FORMS:
+        _refuse("dynsig_collision_form", repr(form), " | ".join(C.FORMS), "pick one")
+    if hermitian not in C.HERMITIAN_MODES:
+        _refuse("dynsig_collision_hermitian", repr(hermitian), " | ".join(C.HERMITIAN_MODES),
+                "pick one")
+    policy = C.RefreshPolicy() if policy is None else policy
+    wfns, meta, poles, splan = source["wfns"], source["meta"], source["poles"], source["plan"]
+    nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
+    kplan = wfns.green_parent.plan
+    kb_frac = np.asarray(kplan.k_parent_frac, np.float64)
+    irr = np.asarray(getattr(kplan, "irr_idx", np.arange(kb_frac.shape[0])))
+    if (kb_frac.shape[0] != np.asarray(k_frac).shape[0]
+            or not np.array_equal(irr, np.arange(irr.size))):
+        _refuse("dynsig_collision_kplan", f"GW carrier of {kb_frac.shape[0]} k (irreducible "
+                f"map identity: {np.array_equal(irr, np.arange(irr.size))}) for "
+                f"{np.asarray(k_frac).shape[0]} TD k", "the full k grid of the TD system, "
+                "no symmetry reduction", "run the GN-PPM bundle without symmetry")
+    kgrid = tuple(int(n) for n in meta.kgrid)
+    from tdagw.model import flat_k_rows
+    rows_td, rows_b = flat_k_rows(np.asarray(k_frac), kgrid), flat_k_rows(kb_frac, kgrid)
+    nk = int(rows_td.size)
+    bundle_of = np.argsort(rows_b)[rows_td]             # TD k row i <- bundle row bundle_of[i]
+    win = slice(int(b_lo), int(b_lo) + nb)
+    e_g = np.asarray(jax.device_get(wfns.enk), np.float64)[:, win]          # Ry, bundle rows
+    f_b = np.asarray(jax.device_get(wfns.occ), np.float64)[:, win]
+    f_td = np.real(np.einsum("kii->ki", np.asarray(gather_to_host(ops.rho_eq))[:nk]))
+    if not np.array_equal(f_b[bundle_of], f_td):
+        _refuse("dynsig_collision_occupations", "the GW run's window occupations differ from "
+                "the TD system's", "one equilibrium", "build the TD system from the same bundle "
+                "and window")
+    eye = np.broadcast_to(np.eye(nb, dtype=complex), (kb_frac.shape[0], nb, nb)).copy()
+    dynamic = hermitian == "dynamic"
+    half = 0.5                                                              # Ry -> Ha
+
+    def to_td(a):                         # bundle rows (nk, ...) -> TD rows
+        return np.asarray(a)[bundle_of]
+
+    def sweep(f_bundle):
+        """One window Sigma (both branches) at window populations f (bundle rows)."""
+        out = window_sigma_c(wfns, poles, dict(b_lo=int(b_lo), U=eye, e=e_g, f=f_bundle),
+                             splan, meta=meta, mesh_xy=mesh, branches=True,
+                             static_limit=dynamic)
+        g_out, g_in, s = window_branch_rates(out["branch_pair"])
+        static = None
+        if dynamic:
+            idx = np.arange(nb)
+            static = out["static_limit"]["sx"].copy()
+            static[:, idx, idx] += out["static_limit"]["head"]
+        return dict(g_out=to_td(g_out), g_in=to_td(g_in), s=to_td(s),
+                    static=None if static is None else to_td(static), raw=out)
+
+    put = lambda a: tp.place_window_blocks(a, mesh, nk_pad)
+    stack = lambda key, parts: np.stack([p[key] for p in parts]) * half
+    program = tp.collision_program(mesh, raw=(form == "raw"))
+    pops = jax.jit(lambda r: jnp.real(jnp.diagonal(r, axis1=-2, axis2=-1)))
+
+    def populations(rho):
+        return np.asarray(gather_to_host(pops(rho)))[:, :nk]               # (ntr, nk, nb)
+
+    # ---- t0: the equilibrium rates, C[rho_eq], the first dissipator
+    t_a = time.perf_counter()
+    eq = sweep(f_b)
+    t_b = time.perf_counter()
+    g_out_eq, g_in_eq = put(stack("g_out", [eq] * ntr)), put(stack("g_in", [eq] * ntr))
+    rho0 = put(np.broadcast_to(np.asarray(gather_to_host(ops.rho_eq))[:nk], (ntr, nk, nb, nb)))
+    res = program(g_out_eq, g_in_eq, rho0, ops.rho_eq, g_out_eq, g_in_eq, ops.w_k)
+    c_eq = res["c_eq"]
+    jax.block_until_ready(res["diss"])
+    t_c = time.perf_counter()
+    ry_mev = RYD_TO_EV * 1e3
+    geq_h = np.stack([eq["g_out"], eq["g_in"]])                            # Ry
+    d_out, d_in = (np.real(np.einsum("kii->ki", g)) for g in geq_h)
+    receipt = dict(
+        t_fs=0.0, why="t0", wall_s=t_c - t_a, sweep_s=t_b - t_a, build_s=t_c - t_b,
+        min_rate_mev=float(res["min_rate"]) * 2.0 * ry_mev,
+        rate_out_diag_mev=[float(d_out.min() * ry_mev), float(d_out.max() * ry_mev)],
+        rate_in_diag_mev=[float(d_in.min() * ry_mev), float(d_in.max() * ry_mev)],
+        min_eig_out_mev=float(np.linalg.eigvalsh(0.5 * (eq["g_out"] + np.conj(
+            np.swapaxes(eq["g_out"], -1, -2)))).min() * ry_mev),
+        min_eig_in_mev=float(np.linalg.eigvalsh(0.5 * (eq["g_in"] + np.conj(
+            np.swapaxes(eq["g_in"], -1, -2)))).min() * ry_mev),
+        c_eq_diag=float(res["c_eq_diag"]), c_eq_offdiag=float(res["c_eq_offdiag"]),
+        trace=[float(v) for v in np.asarray(res["trace"])], form=form, hermitian=hermitian)
+    s_eq = np.stack([eq["s"]] * ntr)
+    static_eq = None if not dynamic else np.stack([eq["static"]] * ntr)
+    held0 = None if hermitian == "none" else put(np.zeros((ntr, nk, nb, nb), complex))
+    state = dict(t_last=0.0, f_last=np.broadcast_to(f_td, (ntr, nk, nb)).copy(), n=0,
+                 trace_last=np.asarray(res["trace"]).copy(), history=[receipt],
+                 held_max_mev=0.0)
+    line = (f"  collision t0     : {form}, hermitian {hermitian}; rates at rho_eq: diag "
+            f"out [{receipt['rate_out_diag_mev'][0]:.3g}, {receipt['rate_out_diag_mev'][1]:.3g}] meV, "
+            f"in [{receipt['rate_in_diag_mev'][0]:.3g}, {receipt['rate_in_diag_mev'][1]:.3g}] meV, "
+            f"min eig G~ {receipt['min_rate_mev']:.3g} meV (G~> {receipt['min_eig_out_mev']:.3g}, "
+            f"G~< {receipt['min_eig_in_mev']:.3g}); ||C[rho_eq]|| diag {receipt['c_eq_diag']:.3e} "
+            f"off-diag {receipt['c_eq_offdiag']:.3e} Ha/hbar; wall {receipt['wall_s']:.2f} s "
+            f"(sweep {receipt['sweep_s']:.2f}, build {receipt['build_s']:.2f})")
+    say(line)
+    if record is not None:
+        record(dict(receipt, line=line))
+    fs = 1000.0 / 24.188843265857                       # a.u. of time per fs
+
+    def refresh(t, rho, ops_now, params):
+        f = populations(rho)
+        due, df, why = C.refresh_due(policy, t, state["t_last"], f, state["f_last"])
+        if not due:
+            return None
+        t1 = time.perf_counter()
+        parts = []
+        for tr in range(ntr):
+            fb = np.empty((kb_frac.shape[0], nb))
+            fb[bundle_of] = f[tr]
+            parts.append(sweep(fb))
+        t2 = time.perf_counter()
+        g_out, g_in = put(stack("g_out", parts)), put(stack("g_in", parts))
+        t3 = time.perf_counter()
+        out = program(g_out, g_in, rho, ops_now.rho_eq, g_out_eq, g_in_eq, ops_now.w_k)
+        new_ops = ops_now._replace(collision=out["diss"])
+        jax.block_until_ready(out["diss"])
+        t4 = time.perf_counter()
+        new_params, delta, held_max = params, None, 0.0
+        if hermitian != "none":
+            s_t = np.stack([p["s"] for p in parts])
+            st_t = None if not dynamic else np.stack([p["static"] for p in parts])
+            h = np.asarray(C.hermitian_update(s_t, s_eq, st_t, static_eq)) * half   # Ha
+            held_max = float(np.max(np.abs(h))) * 2.0 * ry_mev
+            term, set_term = held_term(params)
+            new = put(h)
+            delta = new - term
+            new_params = set_term(new)
+        t5 = time.perf_counter()
+        trace = np.asarray(out["trace"])
+        state["n"] += 1
+        rec = dict(n=state["n"], t_fs=float(t) / fs, why=why, df=df,
+                   wall_s=t5 - t1, sweep_s=t2 - t1, rates_s=t3 - t2, build_s=t4 - t3,
+                   hermitian_s=t5 - t4, out_per_fs=[float(v) * fs for v in np.asarray(out["out"])],
+                   in_per_fs=[float(v) * fs for v in np.asarray(out["inn"])],
+                   d_trace=[float(v) for v in (trace - state["trace_last"])],
+                   min_rate_mev=float(out["min_rate"]) * 2.0 * ry_mev, held_max_mev=held_max,
+                   c_eq_diag=receipt["c_eq_diag"], c_eq_offdiag=receipt["c_eq_offdiag"])
+        state.update(t_last=float(t), f_last=f, trace_last=trace)
+        state["history"].append(rec)
+        line = (f"  collision refresh {rec['n']:3d} at {rec['t_fs']:9.4f} fs ({why}): wall "
+                f"{rec['wall_s']:.2f} s (sweep {rec['sweep_s']:.2f}, rates {rec['rates_s']:.3f}, "
+                f"dissipator {rec['build_s']:.3f}, hermitian {rec['hermitian_s']:.3f}), max|df| "
+                f"{df:.3e}, dTr rho {max(rec['d_trace'], key=abs):+.3e} since last; d(Tr rho)/dt "
+                f"out {min(rec['out_per_fs']):+.3e} in {max(rec['in_per_fs']):+.3e} per fs; min "
+                f"eig G~ {rec['min_rate_mev']:.3g} meV; max|dSigma^h| {held_max:.3g} meV; "
+                f"||C[rho_eq]|| diag {rec['c_eq_diag']:.2e} off {rec['c_eq_offdiag']:.2e}")
+        say(line)
+        if record is not None:
+            record(dict(rec, line=line))
+        return dict(ops=new_ops, params=new_params, delta=delta)
+
+    return dict(diss=res["diss"], held=held0, refresh=refresh, t0=receipt, state=state,
+                c_eq=c_eq, rates_eq=(g_out_eq, g_in_eq), sweep=sweep, program=program, eq=eq,
+                bundle_of=bundle_of)

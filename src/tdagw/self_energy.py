@@ -44,7 +44,8 @@ import numpy as np
 import jax.numpy as jnp
 
 __all__ = ["SelfEnergyModel", "zero_model", "dense_kernel_model",
-           "lowrank_kernel_model", "isdf_model", "dense_kernel_from_tdgw_layout"]
+           "lowrank_kernel_model", "isdf_model", "dense_kernel_from_tdgw_layout",
+           "with_held_term", "held_term"]
 
 
 class SelfEnergyModel(NamedTuple):
@@ -70,6 +71,34 @@ def zero_model() -> SelfEnergyModel:
     """dSigma = 0: TDGW ``calc_type = "IP"``."""
     return SelfEnergyModel(apply=_zero_apply, params=(), linear=True,
                            name="independent particle (dSigma = 0)")
+
+
+def _held_apply(inner, params, rho, t):
+    """``inner`` plus the held operator: params = (inner params, term)."""
+    p, term = params
+    return inner(p, rho, t) + term.astype(rho.dtype)
+
+
+def with_held_term(model: SelfEnergyModel, term) -> SelfEnergyModel:
+    """``model`` plus a held Hermitian operator, refreshed between chunks.
+
+    dSigma = model(rho) + term, ``term`` (ntr, nk, nb, nb) Ha in ρ's layout: the
+    population part of the instantaneous self-energy held between refreshes,
+    Delta Sigma^dyn_last of docs/theory/td_agw_dynamical.md §7.1 (the collision
+    member's ``tdagw.collision.hermitian_update``).  The term is a jit operand
+    (in ``params``), so replacing it (:func:`held_term` reads it back,
+    ``params`` with a new term of the same shape is the refresh) changes no
+    program; constant in ρ, the model stays affine when ``model`` is.
+    """
+    return SelfEnergyModel(apply=functools.partial(_held_apply, model.apply),
+                           params=(model.params, term), linear=model.linear,
+                           name=f"{model.name} + held Delta Sigma^h")
+
+
+def held_term(params):
+    """The held operator of :func:`with_held_term`'s params, and the setter: (term, replace)."""
+    inner, term = params
+    return term, (lambda new: (inner, new))
 
 
 def _tda_apply(params, rho, t):

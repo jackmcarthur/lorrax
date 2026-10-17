@@ -77,12 +77,14 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local, gather_to_host
 from runtime.padding import round_up
 from solvers import time_integrators as ti
+from tdagw import collision as coll
 from tdagw import eom
 from tdagw.self_energy import SelfEnergyModel
 from distrib_la import eigh_local
 
 __all__ = ["METHODS", "PROGRESS", "COUNTERS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
            "place_operators", "place_kernel", "place_state", "make_conj_dev",
+           "make_collision_maps", "collision_program", "place_window_blocks",
            "sample_plan", "chunk_plan", "initial_carry", "carry_to_host",
            "carry_from_host", "coupling_radius", "magnus_dt_limit", "step_growth",
            "coupling_arnoldi", "stiff_basis", "run_propagation"]
@@ -307,6 +309,80 @@ def make_conj_dev(mesh) -> Callable:
 
 
 # ---------------------------------------------------------------------------
+# The held collision term (docs/theory/td_agw_dynamical.md §1.5), per k
+# ---------------------------------------------------------------------------
+
+def _dissipator_spec():
+    return coll.Dissipator(vecs=_spec(4, 1), vals=_spec(3, 1), source=_spec(4, 1))
+
+
+def make_collision_maps(mesh) -> tuple:
+    """(flow, rate) of ``tdagw.collision`` on the k-sharded state, inside ``shard_map``.
+
+    flow(d, x, tau) is Eq. (4) of that module (the exact held flow), rate(d, x)
+    its generator; d a :class:`tdagw.collision.Dissipator` and x a
+    (ntr, nk, nb, nb) deviation, both at ``P(None, ('x','y'), None, None)``.
+    Each device transforms its own k block (four nb x nb products and an
+    elementwise update): no collective, no host transfer.
+    """
+    spec4, dspec = _spec(4, 1), _dissipator_spec()
+    flow = shard_map(coll.flow, mesh=mesh, in_specs=(dspec, spec4, P()), out_specs=spec4,
+                     check_vma=False)
+    rate = shard_map(coll.rate, mesh=mesh, in_specs=(dspec, spec4), out_specs=spec4,
+                     check_vma=False)
+    return flow, rate
+
+
+def place_window_blocks(blocks, mesh, nk_pad: int):
+    """Host (ntr, nk, nb, nb) blocks (propagator k order) -> k-sharded and k-padded."""
+    return _place(_pad_k(np.asarray(blocks, np.complex128), 1, nk_pad), mesh, 1)
+
+
+def collision_program(mesh, *, raw: bool):
+    """The device half of a collision refresh, one jitted ``shard_map`` (k-local).
+
+    ``run(g_out, g_in, rho, rho_eq, g_out_eq, g_in_eq, w_k)``: the held rates
+    G~>, G~< (ntr, nk, nb, nb) Ha at the refresh state, the state ρ, the
+    equilibrium density diag(f) (nk, nb, nb), the rates at ρ_eq, the k weights.
+    Returns dict: ``diss`` the :class:`tdagw.collision.Dissipator` of
+    G~ = G~> + G~< and S (Eq. 3, less C[ρ_eq] at the equilibrium rates unless
+    ``raw``); ``c_eq`` that C[ρ_eq]; per trial ``out``/``in`` the out- and
+    in-scattering parts of d(sum_k w_k Tr ρ_k)/dt (subtracted: minus the same at
+    equilibrium), ``trace`` sum_k w_k Tr ρ_k, ``min_rate`` the smallest eigenvalue
+    of G~ (pads excluded), ``c_eq_diag``/``c_eq_offdiag`` max |C[ρ_eq]| on and off
+    the diagonal.  One all-reduce of a few (ntr,) scalars.
+    """
+    spec4, spec3, spec2 = _spec(4, 1), _spec(3, 0), _spec(1, 0)
+    dspec = _dissipator_spec()
+
+    def local(g_out, g_in, rho, rho_eq, g_out_eq, g_in_eq, w):
+        req = rho_eq[None].astype(rho.dtype)
+        c0 = coll.collision(g_out_eq, g_in_eq, req)
+        src = coll.source(g_out, g_in, req, None if raw else c0)
+        d = coll.dissipator(g_out + g_in, src, eigh=eigh_local)
+        out, inn = (coll.trace_rates(g_out, g_in, rho) if raw else
+                    coll.trace_rates(g_out, g_in, rho, g_out_eq, g_in_eq, req))
+        wk = w.astype(jnp.float64)[None, :]
+        tsum = lambda a: jax.lax.psum(jnp.sum(wk * a, axis=1), K_AXES)
+        live = (w > 0.0)[None, :, None]
+        big = jnp.asarray(jnp.inf, jnp.float64)
+        nb = rho.shape[-1]
+        eye = jnp.eye(nb, dtype=bool)
+        dmax = lambda m: jax.lax.pmax(jnp.max(jnp.where(live[..., None] & m, jnp.abs(c0), 0.0)),
+                                      K_AXES)
+        return dict(diss=d, c_eq=c0, out=tsum(out), inn=tsum(inn),
+                    trace=tsum(jnp.real(jnp.trace(rho, axis1=-2, axis2=-1))),
+                    min_rate=jax.lax.pmin(jnp.min(jnp.where(live, jnp.real(d.vals), big)), K_AXES),
+                    c_eq_diag=dmax(eye), c_eq_offdiag=dmax(~eye))
+
+    out_specs = dict(diss=dspec, c_eq=spec4, out=P(), inn=P(), trace=P(), min_rate=P(),
+                     c_eq_diag=P(), c_eq_offdiag=P())
+    return jax.jit(shard_map(local, mesh=mesh,
+                             in_specs=(spec4, spec4, spec4, spec3, spec4, spec4, spec2),
+                             out_specs=out_specs, check_vma=False))
+
+
+# ---------------------------------------------------------------------------
 # One chunk: the physics callables, the step, the samples
 # ---------------------------------------------------------------------------
 
@@ -317,12 +393,23 @@ def _physics(ops, mparams, model: SelfEnergyModel, drive: Callable, mesh):
     conj = make_conj_dev(mesh)
     occ = jnp.real(jnp.diagonal(ops.rho_eq, axis1=-2, axis2=-1))      # (nk, nb)
     delta = ops.e_qp[:, :, None] - ops.e_qp[:, None, :]                 # (nk, nb, nb)
+    # The held collision term (ops.collision): its exact flow in the remainder
+    # (Magnus steps), its generator in the right-hand side (explicit steps).
+    diss = ops.collision
+    if diss is not None:
+        cflow, crate = make_collision_maps(mesh)
+
+    def collide(x):
+        return crate(diss, x)
 
     def dsig(t, rho):
         return pin(model.apply(mparams, rho, t))
 
     def rhs(t, rho):
-        return pin(eom.eom_rhs(ops, drive(t), dsig(t, rho), rho))
+        out = eom.eom_rhs(ops, drive(t), dsig(t, rho), rho)
+        if diss is not None:
+            out = out + collide(rho - ops.rho_eq[None])
+        return pin(out)
 
     def field(t):
         """E(t)·r^inter, Schrödinger picture (the cheap part of the coupling)."""
@@ -339,15 +426,29 @@ def _physics(ops, mparams, model: SelfEnergyModel, drive: Callable, mesh):
         drv = eom.commutator(eom.field_coupling(ops, e) + dsig(t, rho), rho)
         if ops.intra is not None:
             drv = drv + eom.field_intraband(ops.intra, e, rho)
-        return pin(-1j * drv + ops.gamma.astype(rho.dtype) * ops.rho_eq[None])
+        out = -1j * drv + ops.gamma.astype(rho.dtype) * ops.rho_eq[None]
+        if diss is not None:
+            out = out + collide(rho - ops.rho_eq[None])
+        return pin(out)
 
     def remainder(t, x, tau):
-        """The non-commutator flow on Delta rho: Gamma decay (exact) around intraband (RK4)."""
+        """The non-commutator flow on Delta rho: Gamma decay (exact) around the held
+        collision flow (exact, tdagw.collision Eq. 4) and the intraband term (RK4).
+
+        Palindromic, so the Strang step stays symmetric and its triple jump fourth
+        order: decay(tau/2) [D(tau/2) intra(tau) D(tau/2) | D(tau)] decay(tau/2).
+        """
         decay = jnp.exp(-0.5 * tau * ops.gamma).astype(x.dtype)
         x = decay * x
         if ops.intra is not None:
+            if diss is not None:
+                x = cflow(diss, x, 0.5 * tau)
             f = lambda s, y: -1j * eom.field_intraband(ops.intra, drive(s), ops.rho_eq[None] + y)
             x = ti.rk4_step(f, t, x, tau)
+            if diss is not None:
+                x = cflow(diss, x, 0.5 * tau)
+        elif diss is not None:
+            x = cflow(diss, x, tau)
         return pin(decay * x)
 
     def explicit(t):
@@ -1058,6 +1159,48 @@ def _chunk_program(cfg: PropagatorConfig, spec: SampleSpec, model_apply,
     return jax.jit(run, donate_argnums=(0,))
 
 
+def _state_rho(cfg: PropagatorConfig, ops, carry):
+    """The density ρ of a carry, on the device (the propagator's layout)."""
+    if cfg.method == "dp54":
+        return carry.y
+    if cfg.method in ("rk4", "etdrk4") or (cfg.method == "magnus2" and cfg.frame == "whole_rho"):
+        return carry[0]
+    return ops.rho_eq[None] + carry[0]
+
+
+def _refresh_program(cfg: PropagatorConfig, model: SelfEnergyModel, drive, mesh):
+    """``run(carry, ops, mparams, delta, t) -> carry``: the carry after a refresh, one jit per run.
+
+    A refresh replaces ``ops.collision`` and the model's held term (by ``delta``,
+    Ha, constant in ρ).  What the carry remembers of the old ones is made
+    consistent with the new: the explicit methods' first-same-as-last
+    derivative is re-evaluated (one ΔΣ call); the Magnus predictor history,
+    node values of ΔΣ in the interaction picture of the next step's start at
+    offsets o h, gains free(delta, -o h) for each, the history of a ΔΣ that had
+    always held the new term (no ΔΣ call; exact, since the change is constant
+    in ρ).  The collision flow itself is not in the history (it is the remainder).
+    """
+    def refresh_carry(carry, ops, mparams, delta, t):
+        ph = _physics(ops, mparams, model, drive, mesh)
+        if cfg.method == "dp54":
+            return carry._replace(f=ph["rhs"](carry.t, carry.y), n_rhs=carry.n_rhs + 1)
+        if cfg.method == "rk4":
+            return (carry[0], ph["rhs"](t, carry[0]))
+        if cfg.method == "etdrk4":
+            return (carry[0], carry[1], ph["nonlin"](t, carry[0]))
+        if cfg.method == "magnus2" and cfg.frame == "whole_rho":
+            rho, hist, k = carry
+            return (rho, hist + delta[None], k)
+        offsets = _magnus_parts(cfg)[3]
+        shift = jnp.stack([ph["free"](delta, -float(o) * cfg.dt) for o in offsets])
+        if _split(cfg, ph):
+            x, sl, ha, k, st = carry               # the slow history carries the held term
+            return (x, sl + shift, ha, k, st)
+        x, hist, k = carry
+        return (x, hist + shift, k)
+    return jax.jit(refresh_carry, donate_argnums=(0,))
+
+
 def _fixed_counters(cfg: PropagatorConfig, s_start: int, s_end: int, fresh: bool) -> dict:
     """Steps and ΔΣ calls of a fixed-step run over steps [s_start, s_end).
 
@@ -1074,10 +1217,16 @@ def _fixed_counters(cfg: PropagatorConfig, s_start: int, s_end: int, fresh: bool
     return dict(accepted=n, rejected=0, dsigma=dsig + (1 if fresh else 0))
 
 
+def _jit_cache_size(programs) -> int:
+    """Traced specializations held by this run's chunk programs (one per program
+    unless an operand's structure, shape, dtype or sharding changed: a retrace)."""
+    return int(sum(int(getattr(p, "_cache_size", lambda: 0)()) for p in programs.values()))
+
+
 def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                     model: SelfEnergyModel, drive: Callable, mesh, *,
                     cell_volume: float, nspinor: int, count: int,
-                    mtsteps: np.ndarray, on_chunk: Callable, resume=None):
+                    mtsteps: np.ndarray, on_chunk: Callable, resume=None, refresh=None):
     """Integrate over ``mtsteps`` in chunks; ``on_chunk`` writes each.
 
     ``on_chunk(i0, i1, samples_host, checkpoint, t_state)`` receives the
@@ -1093,6 +1242,18 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     closing-solve counters (``fast``).  A chunk in which any step's closing
     solve missed its tolerance refuses (``td_stiff_solve``) before its
     samples reach ``on_chunk``.
+
+    ``refresh`` (the held collision term, docs/theory/td_agw_dynamical.md §1.5,
+    §7.1): None, or ``refresh(t, rho, ops, params) -> None | dict(ops, params,
+    delta)``, called after every chunk but the last with the state's time and
+    the state ρ on the devices (the propagator's layout; the host decision and
+    its window Sigma are the hook's).  A dict replaces the operators (their
+    ``collision``) and the model's parameters (its held term) for the chunks
+    that follow, with the same shapes and shardings, so no chunk program is
+    rebuilt (``COUNTERS``' ``jit_cache`` counts traced specializations);
+    ``delta`` is the held ΔΣ term's change (Ha, ρ's layout), which the carry
+    absorbs (:func:`_refresh_program`).  A collision on the operators needs
+    ``cfg.remainder`` for the Magnus steps (its flow is the remainder).
     """
     nk_pad = int(ops.e_qp.shape[0])
     split = cfg.method == "cfm4" and int(cfg.stiff) > 0
@@ -1100,6 +1261,11 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
         raise ValueError("GATE td_stiff_basis: got: stiff = %d with no basis on the operators; "
                          "want: ops.stiff from tdagw.propagate.stiff_basis; fix: internal "
                          "(stages.propagate builds it)" % int(cfg.stiff))
+    if ops.collision is not None and cfg.method in ("magnus2", "cfm4") and not cfg.remainder:
+        raise ValueError("GATE td_collision_remainder: got: a collision term with remainder = "
+                         "False; want: remainder = True (the Magnus steps apply the held "
+                         "collision flow as their remainder); fix: internal (stages.propagate "
+                         "sets it)")
     s_start = i_start = 0
     if resume is None:
         carry = initial_carry(cfg, rho0, ops, model.params, model, drive, mesh)
@@ -1114,6 +1280,9 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     programs = {}                       # static key -> jitted chunk, this run only
     needs = any(kind == "current" and not dict(opts).get("use_v0", False)
                 for _, kind, opts in spec.kinds)        # one ΔΣ call per sample
+    params = model.params
+    refreshed = dict(count=0, dsigma=0)
+    rebase = None
 
     def program(key, n_steps, last):
         """The jitted chunk of ``key`` and whether this call built it."""
@@ -1124,12 +1293,30 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                                            int(count), int(n_steps), bool(last))
         return programs[key], new
 
+    def after_chunk(carry, t):
+        """The refresh hook at a chunk boundary: (carry, ops, params)."""
+        nonlocal rebase
+        if refresh is None:
+            return carry, ops, params
+        upd = refresh(float(t), _state_rho(cfg, ops, carry), ops, params)
+        if upd is None:
+            return carry, ops, params
+        if rebase is None:
+            rebase = _refresh_program(cfg, model, drive, mesh)
+        delta = upd.get("delta")
+        if delta is None:
+            delta = jnp.zeros_like(_state_rho(cfg, ops, carry))
+        carry = rebase(carry, upd["ops"], upd["params"], delta, jnp.asarray(t, jnp.float64))
+        refreshed["count"] += 1
+        refreshed["dsigma"] += int(cfg.method in ("dp54", "rk4", "etdrk4"))
+        return carry, upd["ops"], upd["params"]
+
     if fixed:
         sstep, stheta, n_total = sample_plan(cfg, mtsteps)
         s_end = s_start
         for i0, i1, s0, s1 in chunk_plan(sstep, n_total, cfg.chunk, i_start, s_start):
             prog, new = program(("fixed", s1 - s0, i1 - i0), s1 - s0, False)
-            carry, samples = prog(carry, ops, model.params, jnp.asarray(mtsteps[i0:i1]),
+            carry, samples = prog(carry, ops, params, jnp.asarray(mtsteps[i0:i1]),
                                   jnp.asarray(sstep[i0:i1]), jnp.asarray(stheta[i0:i1]), s0)
             if split:
                 fc = fast_solve_counters(carry)
@@ -1147,12 +1334,16 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
             host = jax.tree.map(gather_to_host, samples)
             host[COUNTERS] = dict(_fixed_counters(cfg, s_start, s1, resume is None),
                                   sample_dsigma=(i1 - i_start) if needs else 0,
-                                  new_program=new)
+                                  new_program=new, jit_cache=_jit_cache_size(programs),
+                                  refreshes=refreshed["count"],
+                                  refresh_dsigma=refreshed["dsigma"])
             state = (lambda c=carry, s=s1: (gather_to_host(c[0] if cfg.method in ("rk4", "etdrk4")
                                                           else ops.rho_eq[None] + c[0]),
                                             carry_to_host(c), s))
             on_chunk(i0, i1, host, state, cfg.t0 + s1 * cfg.dt)
             s_end = s1
+            if s1 < n_total:
+                carry, ops, params = after_chunk(carry, cfg.t0 + s1 * cfg.dt)
         stats = _fixed_counters(cfg, s_start, s_end, resume is None)
         stats["t_final"] = cfg.t0 + s_end * cfg.dt
         if split:
@@ -1165,7 +1356,7 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
             last = i1 == n_meas
             prog, new = program(("dp54", i1 - i0, last), 0, last)
             times = jnp.asarray(mtsteps[i0:i1])
-            carry, samples = prog(carry, ops, model.params, times,
+            carry, samples = prog(carry, ops, params, times,
                                   jnp.zeros(i1 - i0, jnp.int64), jnp.zeros(i1 - i0), 0)
             host = jax.tree.map(gather_to_host, samples)
             done = [int(gather_to_host(v))
@@ -1173,9 +1364,14 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
             host[COUNTERS] = dict(accepted=done[0] - base[0], rejected=done[1] - base[1],
                                   dsigma=done[2] - base[2],
                                   sample_dsigma=(i1 - i_start) if needs else 0,
-                                  new_program=new)
+                                  new_program=new, jit_cache=_jit_cache_size(programs),
+                                  refreshes=refreshed["count"],
+                                  refresh_dsigma=refreshed["dsigma"])
             state = (lambda c=carry: (gather_to_host(c.y), carry_to_host(c), 0))
-            on_chunk(i0, i1, host, state, float(gather_to_host(carry.t)))
+            t_now = float(gather_to_host(carry.t))
+            on_chunk(i0, i1, host, state, t_now)
+            if not last:
+                carry, ops, params = after_chunk(carry, t_now)
         if bool(gather_to_host(carry.failed)):
             raise RuntimeError(
                 "GATE td_dp54_step_too_small: got: the RK45 controller's step fell "
@@ -1186,4 +1382,8 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                      dsigma=int(gather_to_host(carry.n_rhs)) - base[2],
                      t_final=float(gather_to_host(carry.t)))
     stats["sample_dsigma"] = (n_meas - i_start) if needs else 0
+    stats["refreshes"] = refreshed["count"]
+    stats["refresh_dsigma"] = refreshed["dsigma"]
+    stats["jit_cache"] = _jit_cache_size(programs)
+    stats["programs"] = len(programs)
     return stats, carry

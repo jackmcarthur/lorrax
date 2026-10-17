@@ -39,13 +39,24 @@ G3  screening_update with W0 held and dchi0 of an excited state at both
 G4  window_sigma_c at rho_eq: pair Sigma_ij(e_i), Sigma_ij(e_j) == dense    rel <= 1e-5
 G5  window_sigma_c at an excited state in a rotated instantaneous basis
     (populations f of U^H rho U) == dense with rotated orbitals            rel <= 1e-5
-G6  its static operator U [1/2 (pair_0 + pair_1)]^h U^H is Hermitian and
-    == dense; Sigma^c_ij(omega) at requested energies == dense              rel <= 1e-5
+G6  its on-shell operator U [1/2 (pair_0 + pair_1)] U^H (complex, no Hermitian
+    projection) == dense; Sigma^c_ij(omega) at requested energies == dense  rel <= 1e-5
+G7  branches=True at the same state, one sweep: cond + val + static == pair
+    (rel <= 1e-12) and pair unchanged by keeping the branches (rel <= 1e-12);
+    each branch == the dense branch (particle R_+ retarded, hole R_- time
+    ordered, invalid-pole static term)                                      rel <= 1e-5
+    tdagw.collision.rates: G~> == i(S~_p - S~_p^H) of the dense particle branch
+    and G~< == i(S~^R_h - S~^R_h^H) of the dense RETARDED hole branch (+i eta):
+    HOLE_BRANCH_SIGN maps the sweep's time-ordered hole branch to it        rel <= 1e-5
+G8  static_limit=True: sx == the dense -sum_s f_s <s| W^c(0) |s> exchange on
+    every mode (window block, instantaneous basis)                          rel <= 1e-8
+    and the head part is zero (no head on this bundle)
 R0  the conjugate particle-hole orientation at i w_p (z -> -z) fails G0
 R1  chi0^fa dropped fails G2 (W)
 R2  pole order swapped (D -> -D: R_+ <-> R_-) fails G5
 R3  frozen bands omitted from G fails G5
 R4  populations read in the fixed basis fails G5
+R5  the hole sign flipped (G~< = +i(S~_h - S~_h^H)) fails G7 (G~<)
 """
 import json
 import sys
@@ -143,7 +154,7 @@ def _dense_fit(W0, Wp, V, fallback=2.0):
     return Om, B, D, good, Wc0
 
 
-def _dense_sigma(psi_g, e_g, f_g, proj, E_eval, poles, eta):
+def _dense_sigma(psi_g, e_g, f_g, proj, E_eval, poles, eta, part=None, hole_retarded=False):
     """Sigma^c_ij(k, E) of gn-ppm-nonhermitian.md §4 with the retarded broadening, Ry.
 
     psi_g/e_g/f_g: the Green orbitals of every band (nk, nb, ns, mu), energies,
@@ -152,6 +163,8 @@ def _dense_sigma(psi_g, e_g, f_g, proj, E_eval, poles, eta):
     absolute energies Sigma_i. is read at.  Invalid modes (static_limit): the
     Omega -> inf limit, weight (1/2 - f) on W^c(0).  Returns (nk, n_E, nP, nP)
     with entry [k, w, i, j] = Sigma_ij(k, E_eval[k, i or j, w]) per ``mode``.
+    ``part``: None (all), "val", "cond" or "static" alone; ``hole_retarded``:
+    the valence branch with +i eta (the retarded hole part) instead.
     """
     Om, B, D, good, Wc0 = poles
     nk = psi_g.shape[0]
@@ -167,11 +180,20 @@ def _dense_sigma(psi_g, e_g, f_g, proj, E_eval, poles, eta):
             for iE in range(E_eval.shape[-1]):
                 for i in range(proj.shape[1]):
                     E = E_eval[k, i, iE]
-                    dm = E - e_g[kb][:, None, None] + Om[q][None] - 1j * eta     # valence
+                    dm = (E - e_g[kb][:, None, None] + Om[q][None]
+                          + (1j if hole_retarded else -1j) * eta)               # valence
                     dp = E - e_g[kb][:, None, None] - Om[q][None] + 1j * eta     # conduction
-                    Wa = (f_g[kb][:, None, None] * Rm[q][None] / dm
-                          + (1.0 - f_g[kb][:, None, None]) * Rp[q][None] / dp
-                          + (0.5 - f_g[kb][:, None, None]) * Ws[q][None])       # (nb, mu, nu)
+                    if part is None:
+                        Wa = (f_g[kb][:, None, None] * Rm[q][None] / dm
+                              + (1.0 - f_g[kb][:, None, None]) * Rp[q][None] / dp
+                              + (0.5 - f_g[kb][:, None, None]) * Ws[q][None])   # (nb, mu, nu)
+                    elif part == "val":
+                        Wa = f_g[kb][:, None, None] * Rm[q][None] / dm
+                    elif part == "cond":
+                        Wa = (1.0 - f_g[kb][:, None, None]) * Rp[q][None] / dp
+                    else:
+                        Wa = np.broadcast_to((0.5 - f_g[kb][:, None, None]) * Ws[q][None],
+                                             (e_g.shape[1],) + Ws[q].shape)
                     row = np.einsum("au,auv,jav->j", a[i], Wa, np.conj(a))
                     out.setdefault((k, iE, i), 0.0)
                     out[(k, iE, i)] = out[(k, iE, i)] + row / nk
@@ -182,15 +204,34 @@ def _dense_sigma(psi_g, e_g, f_g, proj, E_eval, poles, eta):
     return S
 
 
-def _dense_pair(psi_g, e_g, f_g, proj, e_proj, poles, eta):
-    """(2, nk, nP, nP): [0] Sigma_ij(e_i), [1] Sigma_ij(e_j)."""
+def _dense_pair(psi_g, e_g, f_g, proj, e_proj, poles, eta, **kw):
+    """(2, nk, nP, nP): [0] Sigma_ij(e_i), [1] Sigma_ij(e_j) (``kw``: :func:`_dense_sigma`'s)."""
     nk, nP = e_proj.shape
     S = np.zeros((2, nk, nP, nP), complex)
     for j in range(nP):
         Ej = np.repeat(e_proj[:, j][:, None, None], nP, axis=1)               # (nk, nP, 1)
-        S[1, :, :, j] = _dense_sigma(psi_g, e_g, f_g, proj, Ej, poles, eta)[:, 0, :, j]
-    S[0] = _dense_sigma(psi_g, e_g, f_g, proj, e_proj[:, :, None], poles, eta)[:, 0]
+        S[1, :, :, j] = _dense_sigma(psi_g, e_g, f_g, proj, Ej, poles, eta, **kw)[:, 0, :, j]
+    S[0] = _dense_sigma(psi_g, e_g, f_g, proj, e_proj[:, :, None], poles, eta, **kw)[:, 0]
     return S
+
+
+def _dense_sx(psi_g, f_g, proj, Wc0):
+    """-1/nk sum_q sum_s f_s <i|s> W^c0_q <s|j> on every mode: (nk, nP, nP) Ry."""
+    nk = psi_g.shape[0]
+    kmq = _kmq()
+    S = np.zeros((nk, proj.shape[1], proj.shape[1]), complex)
+    for k in range(nk):
+        for q in range(nk):
+            kb = kmq[q, k]
+            a = np.einsum("isu,asu->iau", np.conj(proj[k]), psi_g[kb])         # (nP, nb, mu)
+            S[k] -= np.einsum("iau,a,uv,jav->ij", a, f_g[kb], Wc0[q], np.conj(a)) / nk
+    return S
+
+
+def _width(pair):
+    """i (S~ - S~^H) of a pair table, S~ = 1/2 (pair_0 + pair_1)."""
+    st = 0.5 * (pair[0] + pair[1])
+    return 1j * (st - np.conj(np.swapaxes(st, -1, -2)))
 
 
 def _excited(rng, nk):
@@ -444,15 +485,34 @@ def run_checks(mesh):
         ref = _dense_pair(psi_r, e_r, f_r, psi_r[:, B_LO:B_LO + NA], ev, dpo, eta)
         rows["G5"] = _rel(out["pair"], ref)
         Sd = 0.5 * (ref[0] + ref[1])
-        Sd = 0.5 * (Sd + np.conj(np.swapaxes(Sd, -1, -2)))
-        static_d = Uv @ Sd @ np.conj(np.swapaxes(Uv, -1, -2))
-        rows["G6_static"] = _rel(out["static"], static_d)
-        rows["G6_hermitian"] = float(np.max(np.abs(out["static"] - np.conj(np.swapaxes(out["static"], -1, -2)))))
+        rows["G6_onshell"] = _rel(out["onshell"], Uv @ Sd @ np.conj(np.swapaxes(Uv, -1, -2)))
         Ew = np.broadcast_to((req + out["efermi_ry"])[None, None, :], (nk, NA, req.size))
         Sw = _dense_sigma(psi_r, e_r, f_r, psi_r[:, B_LO:B_LO + NA], Ew, dpo, eta)
         Sw = np.moveaxis(Sw, 1, 0)                                              # (w, k, i, j)
         Uh = np.conj(np.swapaxes(Uv, -1, -2))
         rows["G6_omega"] = _rel(out["omega"], Uv[None] @ Sw @ Uh[None])
+        # ---- G7 / G8: the branches of the same sweep, the rates, the static limit
+        from tdagw import collision as C
+        outb = PS.window_sigma_c(wfns, poles, win, splan, meta=meta, mesh_xy=mesh,
+                                 branches=True, static_limit=True)
+        tabs = outb["branch_pair"]
+        rows["G7_split"] = _rel(tabs["cond"] + tabs["val"] + tabs["static"][None], outb["pair"])
+        rows["G7_pair_same"] = _rel(outb["pair"], out["pair"])
+        args = (psi_r, e_r, f_r, psi_r[:, B_LO:B_LO + NA], ev, dpo, eta)
+        ref_c, ref_v = _dense_pair(*args, part="cond"), _dense_pair(*args, part="val")
+        ref_s = _dense_pair(*args, part="static")[0]
+        rows["G7_cond"], rows["G7_val"] = _rel(tabs["cond"], ref_c), _rel(tabs["val"], ref_v)
+        rows["G7_static"] = _rel(tabs["static"], ref_s)
+        g_out, g_in = (np.asarray(g) for g in C.rates(tabs["cond"], tabs["val"]))
+        width_hr = _width(_dense_pair(*args, part="val", hole_retarded=True))
+        rows["G7_gout"] = _rel(g_out, _width(ref_c))
+        rows["G7_gin"] = _rel(g_in, width_hr)
+        rows["G7_min_diag_rate_ev"] = float(min(np.real(np.einsum("kii->ki", g)).min()
+                                                for g in (g_out, g_in))) * RYD_TO_EV
+        rows["R5"] = _rel(-g_in, width_hr)
+        rows["G8_sx"] = _rel(outb["static_limit"]["sx"],
+                             _dense_sx(psi_r, f_r, psi_r[:, B_LO:B_LO + NA], gather(poles.Wc0_q)))
+        rows["G8_head"] = float(np.max(np.abs(outb["static_limit"]["head"])))
         # R2: pole order swapped; R3: frozen bands omitted; R4: fixed-basis populations
         import dataclasses
         swapped = dataclasses.replace(poles, B_odd_q=-poles.B_odd_q)
@@ -468,9 +528,11 @@ def run_checks(mesh):
 
 GATES = dict(G0_W0=1e-8, G0_Wp=1e-8, G1_static=1e-8, G1_probe=1e-8, G2_W0=1e-8, G2_Wp=1e-8,
              G2_poles_vs_driver=1e-8, G2_poles_vs_dense=1e-8, G3_W=1e-8, G3_poles_vs_dense=1e-8,
-             G4=1e-5, G5=1e-5, G6_static=1e-5, G6_omega=1e-5, G6_hermitian=1e-14)
+             G4=1e-5, G5=1e-5, G6_onshell=1e-5, G6_omega=1e-5, G7_split=1e-12,
+             G7_pair_same=1e-12, G7_cond=1e-5, G7_val=1e-5, G7_static=1e-5, G7_gout=1e-5,
+             G7_gin=1e-5, G8_sx=1e-8, G8_head=0.0)
 COUNTS = ("G2_valid_vs_driver", "G2_valid_vs_dense", "G3_valid_vs_dense")
-TWINS = dict(R0="G0_Wp", R1="G2_W0", R2="G5", R3="G5", R4="G5")
+TWINS = dict(R0="G0_Wp", R1="G2_W0", R2="G5", R3="G5", R4="G5", R5="G7_gin")
 
 
 def verdict(rows):

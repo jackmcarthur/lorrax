@@ -308,6 +308,10 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
         keys.append("control.timesteps.tf")
     fp = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in keys}
     fp["lorrax.magnus_frame"] = magnus_frame(v)
+    if v.get("lorrax.collision", "off") != "off":     # absent when off: those carries unchanged
+        fp["collision"] = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in (
+            "lorrax.collision", "lorrax.collision_source", "lorrax.collision_hermitian",
+            "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df")}
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
               nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
               measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
@@ -527,9 +531,75 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
     return cfg, receipt
 
 
+def collision_source(deck: TdDeck, mesh, *, say=None):
+    """The GN-PPM source of ``[lorrax] collision`` (None when off).
+
+    Runs the GW driver on a copy of ``collision_source`` in
+    ``outdir/collision_source`` (``tdagw.dynsig.gnppm_source``: the run's own
+    carrier, poles and head; no restart written).  Collective; call it before
+    the TD driver's ``RunSession`` (the GW driver owns the timing table and
+    stdout while it runs).  ``say`` gets its one line (None: kept in the
+    returned dict's ``line`` for the run log).
+    """
+    v = deck.values
+    if v["lorrax.collision"] == "off":
+        return None
+    from tdagw.dynsig import gnppm_source
+    lines = []
+    work = os.path.join(os.path.abspath(str(v["control.files.outdir"])), "collision_source")
+    src = gnppm_source(v["lorrax.collision_source"], mesh, workdir=work,
+                       say=say or lines.append)
+    src["line"] = lines[0] if lines else ""
+    return src
+
+
+def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cfg, source,
+                      mesh, *, say, log):
+    """The held collision term on the operators (``ops.collision``) and the model (§1.5).
+
+    ``tdagw.dynsig.gnppm_collision`` at ρ_eq: the dissipator of the equilibrium
+    rates (``ops.collision``; the Magnus steps' remainder, ``cfg.remainder``),
+    the held ΔΣ^h (zero at t0; ``tdagw.self_energy.with_held_term``) and the
+    refresh hook.  Its stdout lines go to ``log.refresh`` (the log's
+    ``Collision refreshes`` section) or ``say``.  Returns (built, system,
+    model, cfg).
+    """
+    from tdagw import collision as C
+    from tdagw.dynsig import gnppm_collision
+    from tdagw.self_energy import with_held_term
+    v = deck.values
+    emit = say if log is None else log.refresh
+    if source.get("line"):
+        emit(source["line"])
+    policy = C.RefreshPolicy(every=float(v["lorrax.collision_refresh_fs"]),
+                             df=float(v["lorrax.collision_refresh_df"]))
+    built = gnppm_collision(source, system.ops, mesh=mesh, k_frac=system.hdr["kpts"],
+                            b_lo=int(system.bands[0]) - 1, ntr=len(deck.trials),
+                            form=v["lorrax.collision"], hermitian=v["lorrax.collision_hermitian"],
+                            policy=policy, say=emit)
+    every = policy.every * tdgw_io.T_IN_ATTOSEC / 1000.0
+    say(f"  collision       : {v['lorrax.collision']}, hermitian "
+        f"{v['lorrax.collision_hermitian']}; refresh "
+        + (" or ".join(([f"every {every:g} fs"] if policy.every else [])
+                       + ([f"max|df| >= {policy.df:g}"] if policy.df else []))
+           or "never (rates of rho_eq)")
+        + ("; the exact held flow in the remainder" if cfg.method in ("magnus2", "cfm4")
+           else "; its generator in the right-hand side"))
+    system = system._replace(ops=system.ops._replace(collision=built["diss"]))
+    if built["held"] is not None:
+        model = with_held_term(model, built["held"])
+    return built, system, model, cfg._replace(remainder=True)
+
+
 def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
-              outs: TdOutputs, mesh, *, say=print, stiff=None, log=None) -> dict:
+              outs: TdOutputs, mesh, *, say=print, stiff=None, log=None,
+              collision=None) -> dict:
     """Run the propagation from t0, or from the checkpoint the deck names.
+
+    ``collision`` (:func:`collision_source`, or None) adds the held on-shell
+    collision term of ``[lorrax] collision`` after the stability gate (the gate
+    measures the coherent problem, unchanged; :func:`_attach_collision`) and
+    refreshes it at chunk ends by the deck's policy.
 
     ``[control.files] load_checkpoint_from`` continues that run exactly
     (:func:`load_checkpoint`: its rows are copied, its carry resumed).
@@ -602,6 +672,11 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
     if cfg.method in ("magnus2", "cfm4"):
         with timing.section("tdagw.stability_gate"):
             cfg, check = _magnus_step_check(cfg, system, model, drive, mesh, auto=auto, say=say)
+    coll = None
+    if collision is not None:
+        with timing.section("tdagw.collision"):
+            coll, system, model, cfg = _attach_collision(deck, system, model, cfg, collision,
+                                                         mesh, say=say, log=log)
     resume = load_checkpoint(deck, system, model, outs, cfg.dt)
     count = ntr * system.nk * system.nb * system.nb
     fingerprint = restart_fingerprint(deck, system, model, cfg.dt)
@@ -635,7 +710,8 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             cfg, sample_spec(deck, system), tp.place_state(rho0, mesh),
             system.ops, model, drive, mesh, cell_volume=system.cell_volume,
             nspinor=system.nspinor, count=count, mtsteps=outs.mtsteps,
-            on_chunk=on_chunk, resume=resume)
+            on_chunk=on_chunk, resume=resume,
+            refresh=None if coll is None else coll["refresh"])
     stats["check_dsigma"] = 0 if check is None else int(check["dsigma"])
     stats["check_probes"] = [] if check is None else check["probes"]
     stats["gate"] = check
@@ -643,6 +719,9 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
     stats["rows"] = rows
     stats["stiff_dsigma"] = 0 if (basis is None or stiff is not None) else int(basis["dsigma"])
     stats["stiff_modes"] = int(cfg.stiff) if cfg.method == "cfm4" else 0
+    stats["collision"] = None if coll is None else dict(
+        t0=coll["t0"], history=coll["state"]["history"], source_wall_s=collision["wall_s"],
+        form=v["lorrax.collision"], hermitian=v["lorrax.collision_hermitian"])
     stats["dt"] = cfg.dt
     stats["wall"] = time.perf_counter() - t_start
     stats["wall_first_chunk"] = (walls[0] - t_start) if walls else 0.0

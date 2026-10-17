@@ -80,6 +80,11 @@ class TdOperators(NamedTuple):
         dSigma[rho_eq + u] - dSigma[rho_eq] (Ha), both k-sharded like ρ, zero
         on pads.  Not an operator of Eq. (1): which part of dSigma the
         integrator treats implicitly.
+    collision : ``tdagw.collision.Dissipator`` or None, the held on-shell GW
+        collision term (docs/theory/td_agw_dynamical.md §1.5, Eq. 8): Eq. (1)
+        gains -1/2 {G~, rho - rho^eq} + S per trial, (ntr, nk, nb, nb) arrays
+        k-sharded like ρ (rates in Ha), refreshed between chunks
+        (``tdagw.propagate.run_propagation``'s ``refresh``).  None: no term.
     """
     e_qp: jax.Array
     rho_eq: jax.Array
@@ -91,6 +96,7 @@ class TdOperators(NamedTuple):
     intra: Optional[IntraBand]
     proj: Optional[jax.Array] = None
     stiff: Optional[tuple] = None
+    collision: Optional[object] = None
 
 
 def dissipation_rates(depopulation_ha: float, dephasing_ha: float, nb: int):
