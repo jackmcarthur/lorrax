@@ -71,12 +71,23 @@ echo "$REV" > "$CAND/source/SOURCE_COMMIT"
 
 BUNDLE_ID="$("$VENV/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["bundle_id"])' \
     "$CAND/bundle/lorrax_ffi_bundle.json")"
+# Every jax*/nvidia-* package at its uv.lock version (setup_env.sh's export).
+EXPECT="$("$VENV/bin/python" - "$VENV/lorrax-locked-requirements.txt" <<'PY'
+import json, re, sys
+want = {}
+for line in open(sys.argv[1]):
+    m = re.match(r"^((?:jax|nvidia)[A-Za-z0-9_.-]*)(?:\[[^]]*\])?==([^\s;\\]+)", line)
+    if m:
+        want[m.group(1).lower().replace("_", "-")] = m.group(2)
+print(json.dumps(want, sort_keys=True))
+PY
+)"
 cat > "$CAND/CANDIDATE" <<EOF
 REV=$REV
 BUNDLE_ID=$BUNDLE_ID
 MODULE_NAME=$MODULE_NAME
 MODULE_VERSION=$MODULE_VERSION
-EXPECT='{"jax": "$JAX_VERSION", "jaxlib": "$JAX_VERSION", "jax-cuda13-plugin": "$JAX_VERSION", "jax-cuda13-pjrt": "$JAX_VERSION", "nvidia-cudnn-cu13": "$CUDNN_VERSION", "nvidia-mathdx": "$MATHDX_VERSION", "nvidia-nccl-cu13": "$NCCL_VERSION"}'
+EXPECT='$EXPECT'
 EOF
 bash "$HERE/install_module.sh" "$CAND/source" "$CAND/bundle" \
     "$CAND/modulefiles/$MODULE_NAME/$MODULE_VERSION.lua"

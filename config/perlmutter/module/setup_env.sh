@@ -4,14 +4,17 @@
 #
 #   LORRAX_MODULE_PREFIX=/abs/prefix bash setup_env.sh <clean lorrax checkout>
 #
-# Third-party packages come from the checkout's uv.lock (no workspace members:
-# the module puts a source snapshot on PYTHONPATH instead).  JAX is the
-# `cuda13-local` build, which uses the site CUDA toolkit and installs no CUDA
-# runtime.  cuDNN and nvidia-mathdx install with --no-deps: their dependency
-# closures would add a second CUDA runtime that shadows the toolkit's.  NCCL is
-# the nvidia-nccl-cu13 wheel (stack.sh NCCL_VERSION, the clone's uv.lock pin),
-# also --no-deps: the one NCCL of every route; never the HPC SDK's comm_libs.
-# The venv is never refreshed in place: a pin change is a new prefix.
+# Every third-party package, the CUDA wheels included, comes from the
+# checkout's uv.lock with the `cuda13` extra a clone syncs (stack.sh
+# LOCK_EXTRA): the export is installed --no-deps, so the venv holds exactly
+# the clone's versions (cuBLAS, cuFFT, cuSOLVER, cuSPARSE, the CUDA runtime,
+# NVRTC, nvJitLink, cuDNN, NCCL, nvidia-mathdx, JAX's cuda13 plugin) and no
+# resolver can move one.  No workspace member is installed: the module puts a
+# source snapshot on PYTHONPATH instead.  lorrax-launch/libcudart.so links the
+# wheel's CUDA runtime under the unversioned name libfabric dlopens (site.toml
+# [nccl] launch_libraries); the modulefile puts that directory first on
+# LD_LIBRARY_PATH.  The venv is never refreshed in place: a pin change is a
+# new prefix.
 # ============================================================================
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -29,28 +32,45 @@ UV_PYTHON_INSTALL_DIR="$PREFIX/python" \
 
 REQ="$PREFIX/venv/lorrax-locked-requirements.txt"
 "$UV" export --quiet --project "$SRC" --frozen --no-emit-workspace --no-hashes \
-    --format requirements-txt --output-file "$REQ"
-echo "[setup_env] installing $(grep -c '==' "$REQ") locked packages + jax[cuda13-local]==$JAX_VERSION"
-"$UV" pip install --quiet --python "$VENV/bin/python" -r "$REQ" \
-    "jax[cuda13-local]==$JAX_VERSION"
-"$UV" pip install --quiet --python "$VENV/bin/python" --no-deps \
-    "nvidia-cudnn-cu13==$CUDNN_VERSION" \
-    "nvidia-mathdx==$MATHDX_VERSION" \
-    "nvidia-nccl-cu13==$NCCL_VERSION"
+    --extra "$LOCK_EXTRA" --format requirements-txt --output-file "$REQ"
+echo "[setup_env] installing $(grep -c '==' "$REQ") locked packages (uv.lock, extra $LOCK_EXTRA)"
+"$UV" pip install --quiet --python "$VENV/bin/python" --no-deps -r "$REQ"
 
 SITE="$(lorrax_module_site_packages)"
 for p in "$SITE/nvidia/mathdx/include/cufftdx.hpp" "$SITE/nvidia/cudnn/lib" \
-         "$SITE/nvidia/nccl/lib/libnccl.so.2" "$SITE/nvidia/nccl/include/nccl.h"; do
+         "$SITE/nvidia/nccl/lib/libnccl.so.2" "$SITE/nvidia/nccl/include/nccl.h" \
+         "$SITE/nvidia/cu13/lib/libcudart.so.13" "$SITE/nvidia/cu13/lib/libcublas.so.13" \
+         "$SITE/nvidia/cu13/lib/libcufft.so.12"; do
     [[ -e "$p" ]] || lorrax_module_die "the wheels did not supply $p"
 done
-if ls -d "$SITE"/nvidia/cuda_runtime "$SITE"/nvidia/cu13/lib/libcudart.so* >/dev/null 2>&1; then
-    lorrax_module_die "a pip CUDA runtime is in the venv; it would shadow $TOOLKIT_MODULE"
-fi
-"$VENV/bin/python" - <<'PY'
-import importlib.metadata as md
-import jax_plugins.xla_cuda13  # noqa: F401  the local-CUDA plugin
-print("[setup_env] " + " ".join(f"{n}={md.version(n)}" for n in
-      ("jax", "jaxlib", "jax-cuda13-plugin", "jax-cuda13-pjrt",
-       "nvidia-cudnn-cu13", "nvidia-mathdx", "nvidia-nccl-cu13")))
+# Every locked package installed at its locked version; the stack pins agree.
+"$VENV/bin/python" - "$REQ" "$JAX_VERSION" "$NCCL_VERSION" <<'PY' \
+    || lorrax_module_die "the venv does not match uv.lock"
+import importlib.metadata as md, re, sys
+req, jax_v, nccl_v = sys.argv[1:]
+want = {}
+for line in open(req):
+    m = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^]]*\])?==([^\s;\\]+)", line)
+    if m and "sys_platform == 'win32'" not in line:
+        want[m.group(1).lower().replace("_", "-")] = m.group(2)
+bad = {}
+for name, v in want.items():
+    try:
+        got = md.version(name)
+    except md.PackageNotFoundError:
+        got = None
+    if got != v:
+        bad[name] = (v, got)
+pins = {"jax": jax_v, "nvidia-nccl-cu13": nccl_v}
+bad.update({n: (v, want.get(n)) for n, v in pins.items() if want.get(n) != v})
+import jax_plugins.xla_cuda13  # noqa: F401  the wheel-CUDA plugin
+print("[setup_env] " + " ".join(f"{n}={want[n]}" for n in sorted(want)
+                                if n.startswith(("jax", "nvidia-"))))
+if bad:
+    print(f"[setup_env] REFUSED: locked (want, got): {bad}", file=sys.stderr)
+    sys.exit(1)
 PY
+LAUNCH="$VENV/lorrax-launch"
+mkdir -p "$LAUNCH"
+ln -sfn "$(realpath -e "$SITE/nvidia/cu13/lib/libcudart.so.13")" "$LAUNCH/libcudart.so"
 echo "[setup_env] venv: $VENV"

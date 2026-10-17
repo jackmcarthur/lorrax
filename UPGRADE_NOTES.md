@@ -80,9 +80,14 @@ failed with `status=7`), and the site-default LibSci/HDF5 mapped cray-mpich
   the documented routes already ran. Measured against aff42ce37 (DEP_ENFORCE.md):
   Fe V2 P=4 bitwise on both machines; Fe V2 P=16 on 4 Perlmutter nodes bitwise,
   NCCL 2.30.7 over AWS Libfabric with GDRDMA on all 16 ranks and no `NCCL WARN`.
-  Per-rank device peaks are unchanged. A module run is not bitwise-equal to a
-  clone run: the module maps the toolkit's math libraries
-  ([Perlmutter](docs/installation/perlmutter.md)).
+  Per-rank device peaks are unchanged.
+- **The Perlmutter module carries a clone's CUDA wheels.** Its venv is
+  `uv export --extra cuda13` of the lock (cuBLAS 13.6.1, cuFFT 12.3, the CUDA
+  runtime 13.3, cuDNN 9.24, …), no longer `jax[cuda13-local]` on the toolkit's
+  libraries (cuBLAS 13.4.1). Build a new module prefix: `setup_env.sh` never
+  refreshes a venv. The modulefile lists no toolkit library directory
+  ([Perlmutter](docs/installation/perlmutter.md)). Measured: module Fe V2 P=4
+  is bitwise identical to the clone run of the same tree.
 
 ## 2026-10-16 — rocm/integration8: follow-ups on the release
 
