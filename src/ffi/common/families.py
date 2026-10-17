@@ -158,13 +158,15 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         gate="tests/test_distrib_la_elpa_gate.py (residual, orthogonality and eigenvalues vs "
              "jnp.linalg.eigh on the same GCDs, P=4 2x2, float64 + complex128, padded and "
              "unpadded sides)", tol=1e-12,
-        note="ROCM distributed eigh: ELPA 2026.02.001, the one-stage GPU solver by default "
+        note="ROCM distributed eigh: ELPA 2026.02.001, the one-stage GPU solver only "
              "(tridiagonalization, divide-and-conquer and back-transformation on the GPU; the "
-             "two-stage path is selectable and refuses where it was measured wrong), built by "
-             "config/frontier/build_elpa_hip.sh into a content-keyed prefix with the LORRAX "
-             "device-allocator patch (ELPA's buffers come from the FFI workspace, inside the "
-             "arena) and ScaLAPACK hidden inside libelpa.  Shares the SLATE family's mesh "
-             "context.  Measured against SLATE-HIP: ELPA_ROCM_REPORT.md."),
+             "two-stage path is not reachable: slower everywhere and non-orthonormal on 4x4 at "
+             "n >= 47104), built by config/frontier/build_elpa_hip.sh into a content-keyed "
+             "prefix with the LORRAX patches (ELPA's device buffers from the FFI workspace; "
+             "rocBLAS/rocSOLVER status accounting and handle registry, so every ELPA rocBLAS "
+             "handle runs on a workspace region and a failed call refuses) and ScaLAPACK hidden "
+             "inside libelpa.  Shares the SLATE family's mesh context.  Measured: "
+             "ELPA_ROCM_REPORT.md."),
     "rocsolver": Family(
         ("lorrax_rocsolver_",), "rocsolver",
         _legs(("xla", "jnp.linalg.eigh (jaxlib cuSOLVER)"), ("built", ""), ("xla", "jnp.linalg.eigh (LAPACK)")),
