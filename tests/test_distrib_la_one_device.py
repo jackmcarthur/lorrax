@@ -67,13 +67,18 @@ def test_size_route_rows_and_room_legs():
         assert resolve_mod.one_device_max_n(op, "CUDA", need) == 312
         assert resolve_mod.one_device_max_n(op, "CUDA", need - 1) == 311
     assert resolve_mod.one_device_max_n("eigh", "cpu", 1 << 40) is None
+    # ROCM solve_lu is one GCD's capacity: the priced one-device program within the allocator.
+    lim = resolve_mod._ROCM_GCD_BYTES_LIMIT
+    assert resolve_mod._ROCM_LU_BYTES_PER_N2 == od.one_device_bytes("solve_lu", 1)
+    n = resolve_mod.ONE_DEVICE_MAX_N[("solve_lu", "ROCM")]
+    assert n == 27427 and od.one_device_bytes("solve_lu", n) <= lim < od.one_device_bytes("solve_lu", n + 1)
     assert "one_device" in resolve_mod.EIGH_BACKENDS and "one_device" in resolve_mod.LU_BACKENDS
 
 
 def test_distributed_takes_the_size_route_on_rocm(mesh, rocm, capsys):
     bound = resolve_mod.ONE_DEVICE_MAX_N[("eigh", "ROCM")]
     assert resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64) == "one_device"
-    lu_bound = resolve_mod.ONE_DEVICE_MAX_N[("solve_lu", "ROCM")]
+    lu_bound = resolve_mod.ONE_DEVICE_MAX_N[("solve_lu", "ROCM")] // 2 * 2   # n divisible by the 2x2 mesh
     assert resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=lu_bound) == "one_device"
     # Beyond the bound and with n unknown: the leg library, refused on this host by name.
     for n in (bound + 4, None):
