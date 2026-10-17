@@ -111,16 +111,16 @@ static ffi::Error PotrfImpl(
         {sl::Option::Target, sl::Target::Devices},
     };
 
-    // Seed the pool: the reservation (one block per local lower tile) plus the
-    // remote tiles in flight -- at one tile per rank the reserved block serves
-    // the one received tile on a 2 x 2 grid; larger grids hold two more.
+    // Seed the pool with SLATE's own reservation, one block per local lower tile
+    // (reserveDeviceWorkspace; the measured high-water never exceeds it, PoolWatch).
+    // distrib_la._slate.potrf_workspace_bytes sizes the buffer to it only when it is
+    // larger than the outside allowance main budgets for it, and to nothing otherwise
+    // (the carve then seeds nothing and SLATE allocates exactly what main does).
     int64_t local_lower = 0;
     for (int64_t j = 0; j < L.nt(); ++j)
         for (int64_t i = j; i < L.mt(); ++i)
             if (L.tileIsLocal(i, j)) ++local_lower;
-    const bool one_tile = (L.mt() == p);
-    const int64_t want = one_tile ? std::max<int64_t>(1, local_lower) + (p > 2 ? 2 : 0)
-                                  : local_lower + 2 * (L.mt() + L.nt()) + 8;
+    const int64_t want = local_lower;
     lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);
     const int64_t seeded = ws.seed(L, want);
     lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
