@@ -87,11 +87,15 @@ static int64_t local_tiles(M& A, bool lower_only) {
     return k;
 }
 
-// Workspace tiles a Devices driver holds beside the local ones (a panel column and
-// row of remote tiles, twice for the lookahead), the same rule as
-// distrib_la._slate._pool_blocks.
+// A's seed: he2hb's measured high-water on A's pool (PoolWatch, MI250X 2x2, n = 4096 ...
+// 30720): every local tile of the FULL matrix less half a tile column, never below the
+// lower tiles.  Z and Z1d are seeded with their local tiles only (their measured
+// high-water).  Lower envelopes, so a seed never exceeds what unseeded SLATE holds;
+// distrib_la._slate._eigh_a_blocks / eigh_workspace_bytes is the same rule.
 template <typename M>
-static int64_t extra_tiles(M& A) { return 2 * (A.mt() + A.nt()) + 8; }
+static int64_t a_seed_tiles(M& A) {
+    return std::max(local_tiles(A, true), local_tiles(A, false) - A.mt() / 2);
+}
 
 static double now_s() {
     return std::chrono::duration<double>(
@@ -200,7 +204,7 @@ static void heev_seeded(sl::HermitianMatrix<T>& A, std::vector<typename RealOf<T
         {
             sl::Matrix<T> Z1d(Z->m(), Z->n(), Z->tileNb(0), 1, mpi_size, comm);
             st.at(3);
-            const int64_t want1 = local_tiles(Z1d, false) + extra_tiles(Z1d);
+            const int64_t want1 = local_tiles(Z1d, false);
             const int64_t got1 = ws.seed(Z1d, want1);
             st.seeded += got1;
             Z1d.insertLocalTiles(sl::Target::Devices);
@@ -303,7 +307,7 @@ static ffi::Error EighImpl(
         // stride assert).  The local buffer holds the rank's block-cyclic tiles at
         // fromDevices' offsets (lld = n/p); the copy is the inverse of Z's below.
         sl::HermitianMatrix<T> A(sl::Uplo::Lower, n, nb, p, q, ctx->comm);
-        const int64_t gotA = ws.seed(A, local_tiles(A, true) + extra_tiles(A));
+        const int64_t gotA = ws.seed(A, a_seed_tiles(A));
         st.seeded += gotA;
         A.insertLocalTiles(sl::Target::Devices);
         lorrax_ffi::slate::PoolWatchScope wa(pw, A, "A", gotA, local_tiles(A, true));
@@ -339,7 +343,7 @@ static ffi::Error EighImpl(
 
         if (compute_evecs) {
             sl::Matrix<T> Z(n, n, nb, p, q, ctx->comm);
-            const int64_t gotZ = ws.seed(Z, local_tiles(Z, false) + extra_tiles(Z));
+            const int64_t gotZ = ws.seed(Z, local_tiles(Z, false));
             st.seeded += gotZ;
             Z.insertLocalTiles(sl::Target::Devices);
             lorrax_ffi::slate::PoolWatchScope wz(pw, Z, "Z", gotZ, local_tiles(Z, false));
