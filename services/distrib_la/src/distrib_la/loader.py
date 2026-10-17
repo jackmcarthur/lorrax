@@ -211,6 +211,19 @@ _BUILD_HINTS = {
     "ROCM": "bash config/frontier/build_slate_hip.sh && bash config/frontier/build_ffi_rocm.sh",
     "cpu": 'bash config/perlmutter/build_ffi_host.sh --fresh',
 }
+#: Per-target overrides of the leg's not-found build command.  A target whose handler needs a
+#: library the leg's command does not name gets that library's script first: ROCM's ELPA eigh
+#: (cpp/elpa/) is ELPA's (config/frontier/build_elpa_hip.sh), not SLATE's.  The SLATE targets
+#: and every other ROCM target keep the leg's command above; CUDA and cpu have no override.
+_TARGET_BUILD_HINTS = {
+    ("ROCM", t): "bash config/frontier/build_elpa_hip.sh && bash config/frontier/build_ffi_rocm.sh"
+    for t in _ROCM_ELPA_SYMBOLS
+}
+
+
+def target_build_hint(platform: str, target_name: Optional[str] = None) -> str:
+    """The rebuild command a missing ``target_name`` on ``platform`` names: its own, else the leg's."""
+    return _TARGET_BUILD_HINTS.get((platform, target_name), _BUILD_HINTS[platform])
 
 _PLATFORMS = {
     key: dict(so_name=leg.so_name, env=leg.so_env, build_subdir=leg.build_subdir,
@@ -672,7 +685,7 @@ def probe_target(target_name: str, platform: str):
         return ProbeResult(False, borrowed)
     if not hasattr(lib, sym):
         return missing_symbol(target_name, sym, _LIB_PATHS.get(platform, "?"),
-                              build_hint=spec["build_hint"])
+                              build_hint=target_build_hint(platform, target_name))
     return AVAILABLE
 
 
