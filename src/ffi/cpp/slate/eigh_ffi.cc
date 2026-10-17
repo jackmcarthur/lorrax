@@ -30,8 +30,8 @@
 // those; the eigenvector tiles are copied into Q after heev returns.
 //
 // Device memory: A, Z and the 1-D eigenvector matrix Z1d are SLATE-owned device
-// tiles whose pool is SEEDED from the workspace output (pool_seed.h), so they and
-// SLATE's reserveDeviceWorkspace() live in XLA's buffer assignment.  The driver
+// tiles whose pool is SEEDED with this rank's bytes from XLA's scratch allocator
+// (pool_seed.h ScratchSeed), so they live in XLA's arena.  The driver
 // below is slate::heev's own stage sequence (v2025.05.28-1, src/heev.cc), made
 // explicit so Z1d can be seeded and each stage timed: LORRAX_SLATE_TIMERS=1 prints
 // one line per call per rank, plus the device bytes in use per stage (a sampler
@@ -90,8 +90,9 @@ static int64_t local_tiles(M& A, bool lower_only) {
 // A's seed: he2hb's measured high-water on A's pool (PoolWatch, MI250X 2x2, n = 4096 ...
 // 30720): every local tile of the FULL matrix less half a tile column, never below the
 // lower tiles.  Z and Z1d are seeded with their local tiles only (their measured
-// high-water).  Lower envelopes, so a seed never exceeds what unseeded SLATE holds;
-// distrib_la._slate._eigh_a_blocks / eigh_workspace_bytes is the same rule.
+// high-water).  Lower envelopes, so a seed never exceeds what unseeded SLATE holds
+// on any rank (min over ranks of A's high-water = full local tiles - mt/2 at every
+// measured n; Z, Z1d = local exactly).
 template <typename M>
 static int64_t a_seed_tiles(M& A) {
     return std::max(local_tiles(A, true), local_tiles(A, false) - A.mt() / 2);
@@ -129,6 +130,7 @@ struct EighStages {
     int64_t seeded = 0, fallback = 0;
     lorrax_ffi::slate::StageMemSampler* mem = nullptr;
     lorrax_ffi::slate::PoolWatch* pw = nullptr;
+    bool scratch_failed = false;
     void at(int s) { if (mem) mem->at(s); }
 };
 // Stage indices of StageMemSampler: 0 copy-in, 1 he2hb, 2 gather+hb2st, 3 tridiag,
@@ -257,7 +259,7 @@ static ffi::Error EighImpl(
     T* d_A_local,
     typename RealOf<T>::type* d_W,
     T* d_Q_local,
-    void* d_ws, std::size_t ws_bytes)
+    ffi::ScratchAllocator& scratch)
 {
     using real_t = typename RealOf<T>::type;
 
@@ -285,7 +287,9 @@ static ffi::Error EighImpl(
         return ffi::Error(ffi::ErrorCode::kFailedPrecondition, os.str());
     }
 
-    PoolSeed ws(d_ws, ws_bytes);
+    // This rank's seed bytes (pool_seed.h ScratchSeed), sized once A exists.
+    lorrax_ffi::slate::ScratchSeed smem;
+    PoolSeed ws(nullptr, 0);
     EighStages st;
     const char* tv = std::getenv("LORRAX_SLATE_TIMERS");
     const bool report = (tv != nullptr && tv[0] != '\0' && tv[0] != '0') ||
@@ -307,6 +311,23 @@ static ffi::Error EighImpl(
         // stride assert).  The local buffer holds the rank's block-cyclic tiles at
         // fromDevices' offsets (lld = n/p); the copy is the inverse of Z's below.
         sl::HermitianMatrix<T> A(sl::Uplo::Lower, n, nb, p, q, ctx->comm);
+        {
+            // Per-rank seed: A at he2hb's high-water rule, Z at this rank's local
+            // tiles, Z1d at this rank's columns of the 1 x P column-cyclic grid
+            // (tile column j on rank j mod P) -- each from this rank's own tiles.
+            int rank = 0, size = 1;
+            MPI_Comm_rank(ctx->comm, &rank);
+            MPI_Comm_size(ctx->comm, &size);
+            const int64_t a_want = a_seed_tiles(A);
+            const int64_t z_want = compute_evecs ? local_tiles(A, false) : 0;
+            const int64_t z1d_cols = rank < A.nt() ? (A.nt() - 1 - rank) / size + 1 : 0;
+            const int64_t z1d_want = compute_evecs ? A.mt() * z1d_cols : 0;
+            const std::size_t bs = lorrax_ffi::slate::block_bytes(A);
+            smem = lorrax_ffi::slate::ScratchSeed(
+                scratch, lorrax_ffi::slate::seed_bytes({{a_want, bs}, {z_want, bs}, {z1d_want, bs}}));
+            ws = PoolSeed(smem.base, smem.size);
+            st.scratch_failed = smem.failed;
+        }
         const int64_t gotA = ws.seed(A, a_seed_tiles(A));
         st.seeded += gotA;
         A.insertLocalTiles(sl::Target::Devices);
@@ -409,12 +430,13 @@ static ffi::Error EighImpl(
         std::fprintf(stderr,
             "[slate.eigh] rank=%d n=%lld nb=%lld total=%.2f scale=%.2f he2hb=%.2f "
             "gather=%.2f hb2st=%.2f tridiag=%.2f redist1=%.2f unmtr_hb2st=%.2f redist2=%.2f "
-            "unmtr_he2hb=%.2f pool_seeded_blocks=%lld pool_fallback_blocks=%lld ws_used=%.3fGB "
-            "ws=%.3fGB\n",
+            "unmtr_he2hb=%.2f pool_seeded_blocks=%lld pool_fallback_blocks=%lld seeded_GB=%.3f "
+            "scratch=%.3fGB%s\n",
             r, (long long) n, (long long) nb,
             now_s() - t_all, st.scale, st.he2hb, st.gather, st.hb2st, st.tridiag, st.redist1,
             st.unmtr_hb2st, st.redist2, st.unmtr_he2hb, (long long) st.seeded,
-            (long long) st.fallback, ws.used / 1e9, ws.size / 1e9);
+            (long long) st.fallback, ws.used / 1e9, ws.size / 1e9,
+            st.scratch_failed ? " (scratch allocation FAILED: unseeded)" : "");
         pw.report("eigh", r, n, nb, (int) sizeof(T));
     }
 
@@ -445,7 +467,7 @@ static ffi::Error EighDispatch(
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> W_out,
     ffi::Result<ffi::AnyBuffer> Q_out,
-    ffi::Result<ffi::AnyBuffer> WS_out,
+    ffi::ScratchAllocator scratch,
     int64_t n, int64_t nb,
     int64_t ctx_key, bool compute_evecs)
 {
@@ -474,8 +496,6 @@ static ffi::Error EighDispatch(
             ffi::ErrorCode::kInvalidArgument,
             "slate.eigh: W output dtype must be the real part of A's dtype");
     }
-    void* ws = WS_out->untyped_data();
-    const std::size_t ws_bytes = WS_out->size_bytes();
 
     switch (dtype) {
         case ffi::DataType::F64:
@@ -483,14 +503,14 @@ static ffi::Error EighDispatch(
                 n, nb, compute_evecs, stream, ctx,
                 static_cast<double*>(const_cast<void*>(A.untyped_data())),
                 static_cast<double*>(W_out->untyped_data()),
-                static_cast<double*>(Q_out->untyped_data()), ws, ws_bytes);
+                static_cast<double*>(Q_out->untyped_data()), scratch);
         case ffi::DataType::C128:
             using C128 = std::complex<double>;
             return EighImpl<C128>(
                 n, nb, compute_evecs, stream, ctx,
                 static_cast<C128*>(const_cast<void*>(A.untyped_data())),
                 static_cast<double*>(W_out->untyped_data()),
-                static_cast<C128*>(Q_out->untyped_data()), ws, ws_bytes);
+                static_cast<C128*>(Q_out->untyped_data()), scratch);
         default: {
             std::ostringstream os;
             os << "slate.eigh: unsupported dtype " << static_cast<int>(dtype)
@@ -512,7 +532,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()              // A (local shard)
         .Ret<xla::ffi::AnyBuffer>()              // W (n,) real, replicated
         .Ret<xla::ffi::AnyBuffer>()              // Q (local shard, same dtype as A)
-        .Ret<xla::ffi::AnyBuffer>()              // workspace (u8): SLATE's pool seed
+        .Ctx<xla::ffi::ScratchAllocator>()       // this rank's pool seed (pool_seed.h)
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
         .Attr<int64_t>("ctx_key")

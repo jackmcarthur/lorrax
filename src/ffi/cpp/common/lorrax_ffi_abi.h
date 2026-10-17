@@ -89,12 +89,14 @@
 //                trees, whose union handler still took operands -- would get
 //                one Arg where it expects three; refused by name at load.
 //
-//   ABI 8 -> 9   (2026-10-17, dlascale).  The device-leg SLATE handlers
-//                lorrax_slate_eigh, lorrax_slate_potrf and the three
-//                lorrax_slate_batched_{solve_lu_factors,getrf,getrs} each take
-//                one more Ret, a u8 workspace that seeds SLATE's device pool
-//                (slate/pool_seed.h).  An ABI-8 library would get a Ret it does
-//                not bind; refused by name at load instead.
+//   ABI 8 -> 9   (2026-10-17, dlascale).  lorrax_slate_potrf takes one more
+//                attribute, seed_min_bytes (the outside allowance past which a
+//                rank's SLATE pool is seeded).  The device-leg SLATE handlers
+//                (eigh, potrf, batched_{solve_lu_factors,getrf,getrs}) also bind
+//                xla::ffi::ScratchAllocator for their per-rank pool seed
+//                (slate/pool_seed.h); their operands and results are ABI 8's.
+//                An ABI-8 library would reject the attribute; refused by name at
+//                load instead.
 //
 // ---------------------------------------------------------------------------
 // THE RULE
