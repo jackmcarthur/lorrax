@@ -13,14 +13,13 @@
 // task and therefore an abort of every rank (MI250X P4: eigh c128 n=20480; pool
 // logs dlascale probe1/probe2).
 //
-// WHAT.  The handler receives one extra XLA output buffer (a workspace the Python
-// wrapper sizes with distrib_la._slate's *_workspace_bytes and never reads), and
-// SEEDS a matrix's pool with blocks carved from it before any tile is inserted.
+// WHAT.  The handler takes this rank's seed bytes from XLA's ScratchAllocator
+// (ScratchSeed below: per rank, per call, from the arena) and SEEDS a matrix's pool
+// with blocks carved from them before any tile is inserted.
 // slate::Memory::alloc then pops seeded blocks; reserveDeviceWorkspace() finds the
 // capacity already there and allocates nothing.  Only when the seeded blocks run
 // out does the pool fall back to device_malloc (counted, see PoolSeed::fallback).
-// So SLATE's working set is part of the compiled program's memory (XLA's
-// memory_analysis and the arena), not a hidden allocation beside it.
+// So SLATE's working set lives in XLA's arena, not in a hidden allocation beside it.
 //
 // HOW.  slate::Memory, slate::internal MatrixStorage and slate::BaseMatrix all
 // declare `friend class Debug` (slate::Debug, defined only in SLATE's own
@@ -31,7 +30,7 @@
 // config/frontier/build_slate_hip.sh).  Every member is static and inline with a
 // lorrax_ prefix, so no symbol can meet one of SLATE's.  Seeded blocks are never
 // in Memory::allocated_mem_, so clearDeviceBlocks() (the storage's destructor)
-// drops them without freeing; the XLA buffer outlives every SLATE object because
+// drops them without freeing; the scratch bytes outlive every SLATE object because
 // all of them are scoped inside the handler.
 #pragma once
 
@@ -44,6 +43,8 @@
 #include <chrono>
 #include <vector>
 #include <mutex>
+#include <initializer_list>
+#include <utility>
 
 #include "../common/gpu_runtime.h"
 
@@ -128,6 +129,44 @@ struct PoolSeed {
         return n;
     }
 };
+
+// PER-RANK seed memory.  Each rank's seed is a function of that rank's own tiles
+// (its local tiles plus the remote tiles it was measured to hold), so its bytes come
+// from XLA's ScratchAllocator inside the handler -- XLA's arena, this rank only, this
+// call only -- not from an output buffer, whose shape would be the same on every rank
+// (dlascale hwf: a uniform potrf workspace put a 3.77 GB tile on the rank that owns no
+// lower tile).  A rank whose seed is 0 allocates nothing, so its call allocates exactly
+// what unseeded SLATE does.  If the allocator cannot provide the bytes, nothing is
+// seeded and SLATE allocates as it would unseeded (`failed`, reported).
+struct ScratchSeed {
+    void*       base = nullptr;
+    std::size_t size = 0;
+    bool        failed = false;
+    ScratchSeed() = default;
+    template <class Alloc>
+    ScratchSeed(Alloc& scratch, std::size_t bytes) {
+        if (bytes == 0) return;
+        auto got = scratch.Allocate(bytes);
+        if (got.has_value()) { base = *got; size = bytes; }
+        else failed = true;
+    }
+};
+
+// Bytes PoolSeed needs to carve `pools` = {(blocks, block bytes), ...} in order
+// (each pool starts on a 256-byte boundary, as PoolSeed::seed carves).
+inline std::size_t seed_bytes(std::initializer_list<std::pair<std::int64_t, std::size_t>> pools) {
+    std::size_t total = 0;
+    for (const auto& pb : pools) {
+        if (pb.first <= 0 || pb.second == 0) continue;
+        total = (total + 255) / 256 * 256 + static_cast<std::size_t>(pb.first) * pb.second;
+    }
+    return total;
+}
+
+template <typename T>
+inline std::size_t block_bytes(::slate::BaseMatrix<T>& M) {
+    return ::slate::Debug::lorrax_block_bytes(M);
+}
 
 // Blocks the pool allocated past its seed (device_malloc fallbacks), read
 // before the matrix dies.  Reported on stderr when LORRAX_SLATE_POOL_REPORT is

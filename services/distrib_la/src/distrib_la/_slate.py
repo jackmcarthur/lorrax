@@ -181,135 +181,30 @@ def validate_tile_layout(n: int, nb: int, p: int, q: int, *, what: str,
 
 
 # -------------------------------------------------------------------------
-#  Device workspace: SLATE's tile pool inside XLA's buffer assignment
+#  Device memory: SLATE's tile pools inside XLA's arena, per rank
 # -------------------------------------------------------------------------
 # SLATE's Target::Devices drivers keep their device tiles in a per-matrix pool
-# that, left alone, allocates with a raw device_malloc OUTSIDE the XLA arena:
-# insertLocalTiles takes one block per local tile, and getrf / potrf / he2hb /
-# trsm / unmqr's reserveDeviceWorkspace() one more per local tile where the tiles
-# are user-owned.  On ROCM the BFC arena is preallocated (runtime.pool_fraction,
-# 60.18 of 68.70 GB per MI250X GCD), so SLATE got ~7 GB: eigh needed ~4.5 n^2/P
-# bytes there (A, Z, Z1d, he2hb's W) and aborted every rank above n ~ 20k c128
-# at P4 (blas::Error "out of memory, in function device_malloc", thrown from an
-# OpenMP task: no FFI error, an abort).  The device handlers now take one more
-# output, a u8 workspace sized here and never read, and seed each matrix's pool
-# from it (cpp/slate/pool_seed.h), so the tiles are XLA buffers: in the compiled
-# program's memory_analysis and in the arena.  The C++ side applies the same
-# per-matrix rules and falls back to device_malloc past the end of the buffer
-# (LORRAX_SLATE_POOL_REPORT=1 counts it).
-#
-# THE RULES ARE LOWER ENVELOPES OF MEASURED HIGH-WATER (owner rule: a rank's device
-# peak must not rise above unseeded main).  A seeded block SLATE never touches is a
-# byte main never allocated; a block SLATE needs beyond the seed is one main also
-# allocated (outside the arena), so a seed at or below SLATE's high-water cannot
-# raise a peak.  The high-water is pool_seed.h's PoolWatch (blocks in use, read under
-# SLATE's own slate_memory lock), MI250X 2x2, f64 + c128, n = 4096 ... 30720 (dlascale
-# hwc, pool_hw lines; tests/test_slate_pool_rules.py carries the table):
-#   eigh A (lower, nb 128): min over ranks = full local tiles - mt/2, exactly, every n
-#   eigh Z, Z1d:            local tiles exactly (no remote tiles)
-#   LU A (nb 256):          local + 10..243 (>= (mt/p + nt/q)/2 at every n)
-#   LU X (nrhs = q):        local + 0..1
-#   potrf (one tile/rank):  0..1 blocks in use; SLATE reserves one block per local
-#                           lower tile (reserveDeviceWorkspace), on 3 of the 4 ranks.
-_POOL_ALIGN = 256
+# that, left alone, allocates with a raw device_malloc OUTSIDE the XLA arena.  On
+# ROCM the BFC arena is preallocated (runtime.pool_fraction, 60.18 of 68.70 GB per
+# MI250X GCD), so SLATE got ~7 GB: eigh aborted every rank above n ~ 20k c128 at P4
+# (blas::Error "out of memory, in function device_malloc", thrown from an OpenMP
+# task) and potrf hung at 51200 c128.  The device handlers seed each matrix's pool
+# from XLA's ScratchAllocator (cpp/slate/pool_seed.h ScratchSeed): THIS rank's
+# bytes, sized from this rank's own tiles at the measured lower envelope of the
+# pool's high-water, so no rank's device peak rises above unseeded SLATE's and a
+# rank whose seed is 0 allocates nothing.  The rules live in the handlers
+# (eigh_ffi.cc a_seed_tiles, batched_solve_lu_ffi.cc seed_want, potrf_ffi.cc); the
+# Python calls are main's, plus potrf's ``seed_min_bytes``.
 #: The outside-pool allowance the memory model grants distributed linalg (the value of
 #: ``runtime.DISTRIBUTED_LINALG_OUTSIDE_BYTES``; distrib_la cannot import ``runtime`` --
-#: layering -- so tests/test_slate_pool_rules.py pins the two equal).  potrf's
-#: reservation is seeded into the arena only past it: within it, main's outside
-#: allocation is the budgeted one and seeding would only add an unused block on the
-#: rank that owns no lower tile (the workspace is the same shape on every rank).
+#: layering -- so tests/test_slate_pool_rules.py pins the two equal).  A rank's potrf
+#: reservation is seeded only past it: within it unseeded SLATE fits outside the arena.
 _SLATE_OUTSIDE_ALLOWANCE_BYTES = 3e9
 
 
 def _device_leg(mesh: Mesh) -> bool:
-    """The device handlers (ROCM, CUDA) take the workspace; the host leg's do not."""
+    """The device handlers (ROCM, CUDA) take ``seed_min_bytes``; the host leg's do not."""
     return _mesh_platform(mesh) in ("ROCM", "CUDA")
-
-
-def _lu_extra(mt: int, nt: int, p: int, q: int) -> int:
-    """getrf's remote tiles beside A's local ones: half a panel column + row per rank,
-    ``(mt/p + nt/q) / 2`` -- the measured lower envelope (cpp/slate owned(), same rule)."""
-    return (mt // p + nt // q) // 2
-
-
-def _eigh_a_blocks(mt: int, nt: int, p: int, q: int) -> int:
-    """he2hb's high-water on A's pool: every local tile of the FULL matrix less half a
-    tile column, the measured minimum over ranks (cpp/slate eigh_ffi.cc, same rule)."""
-    return max(_max_local_tiles(mt, nt, p, q, lower=True),
-               _max_local_tiles(mt, nt, p, q) - mt // 2)
-
-
-def _max_local_tiles(mt: int, nt: int, p: int, q: int, *, lower: bool = False) -> int:
-    """The most tiles any rank of a 2-D block-cyclic ``p x q`` grid holds (lower
-    triangle only for a Hermitian matrix): every rank gets the same workspace shape."""
-    import numpy as np
-    i = np.arange(mt)[:, None]
-    j = np.arange(nt)[None, :]
-    best = 0
-    for x in range(p):
-        for y in range(q):
-            m = (i % p == x) & (j % q == y)
-            if lower:
-                m = m & (i >= j)
-            best = max(best, int(m.sum()))
-    return best
-
-
-def _pool_bytes(*matrices) -> int:
-    """Workspace bytes for ``(blocks, block_bytes)`` pools carved in order."""
-    total = 0
-    for blocks, block_bytes in matrices:
-        total = -(-total // _POOL_ALIGN) * _POOL_ALIGN + int(blocks) * int(block_bytes)
-    return max(total, _POOL_ALIGN)
-
-
-def eigh_workspace_bytes(side: int, nb: int, p: int, q: int, itemsize: int,
-                         compute_evecs: bool = True) -> int:
-    """The seeded heev driver's pools: A (he2hb's high-water), Z (2-D) and Z1d (1 x P
-    columns), each at its measured lower envelope (module comment)."""
-    mt = nt = side // nb
-    tile = nb * nb * itemsize
-    pools = [(_eigh_a_blocks(mt, nt, p, q), tile)]
-    if compute_evecs:
-        ranks = p * q
-        pools.append((_max_local_tiles(mt, nt, p, q), tile))
-        pools.append((-(-nt // ranks) * mt, tile))
-    return _pool_bytes(*pools)
-
-
-def lu_workspace_bytes(n: int, nrhs: int | None, nb: int, p: int, q: int,
-                       itemsize: int) -> int:
-    """getrf / getrs pools: A (n x n, nb x nb) and, with ``nrhs``, X (n x nrhs, nb x nrhs/q).
-
-    X is seeded with its local tiles only: trsmB holds at most one remote row of B
-    beside them (measured 0..1 blocks), and A's panel rule on X's nb x nrhs/q tiles
-    was ~2 n^2/q elements of unused workspace at nrhs = n
-    (cpp/slate/batched_solve_lu_ffi.cc ``owned``, the same rules).
-    """
-    mt = nt = n // nb
-    pools = [((n // p // nb) * (n // q // nb) + _lu_extra(mt, nt, p, q), nb * nb * itemsize)]
-    if nrhs:
-        nb_b = nrhs // q
-        pools.append(((n // p // nb), nb * nb_b * itemsize))
-    return _pool_bytes(*pools)
-
-
-def potrf_workspace_bytes(n: int, nb: int, p: int, q: int, itemsize: int) -> int:
-    """potrf's pool: SLATE's own reservation, one block per local lower tile
-    (reserveDeviceWorkspace; the measured high-water never exceeds it), seeded into the
-    arena only when it is larger than the outside allowance main budgets for it
-    (:data:`_SLATE_OUTSIDE_ALLOWANCE_BYTES`); otherwise the minimum buffer and SLATE
-    allocates exactly what main does."""
-    mt = nt = n // nb
-    tile = nb * nb * itemsize
-    reserve = _max_local_tiles(mt, nt, p, q, lower=True)
-    if reserve * tile <= _SLATE_OUTSIDE_ALLOWANCE_BYTES:
-        return _POOL_ALIGN
-    return _pool_bytes((reserve, tile))
-
-
-def _ws_struct(nbytes: int):
-    return jax.ShapeDtypeStruct((int(nbytes),), jnp.uint8)
 
 
 def _make_ctx(mesh: Mesh) -> int:
@@ -506,20 +401,17 @@ def distributed_cholesky(
     # correctly for any p x q mesh.
     L_local_T = jax.ShapeDtypeStruct((n // q, n // p), A.dtype)
     attrs = dict(n=n, nb=nb, ctx_key=int(ctx_key))
-    device = _device_leg(mesh)
-    results = ((L_local_T, _ws_struct(potrf_workspace_bytes(n, nb, p, q, A.dtype.itemsize)))
-               if device else L_local_T)
+    if _device_leg(mesh):
+        # The device handler seeds a rank's SLATE pool (from XLA's scratch, that rank
+        # only) only when its reservation exceeds this allowance (cpp/slate/potrf_ffi.cc).
+        attrs["seed_min_bytes"] = int(_SLATE_OUTSIDE_ALLOWANCE_BYTES)
 
     @partial(shard_map, mesh=mesh,
              in_specs=P("x", "y"), out_specs=P("y", "x"),
              check_vma=False)
     def _potrf(local_A):
         local_A_T = jnp.transpose(local_A, (1, 0))
-        out = jax.ffi.ffi_call(_POTRF_FFI_TARGET, results,
-                               input_output_aliases={0: 0} if device else None,
-                               )(local_A_T, **attrs)
-        # The device handlers' second result is SLATE's pool seed (never read).
-        return out[0] if device else out
+        return jax.ffi.ffi_call(_POTRF_FFI_TARGET, L_local_T)(local_A_T, **attrs)
 
     L_raw_T = _potrf(A)
     return SlateLowerL(raw=L_raw_T, mesh=mesh, n=n, nb=nb)
@@ -654,9 +546,8 @@ def distributed_eigh(
             f"distributed_eigh: tile {nb} does not divide the solve tile "
             f"{side // p} (side {side}, {p}x{q} mesh).")
 
-    device = _device_leg(mesh)
     key = ("eigh", mesh_key(mesh), A.dtype, n, side, nb,
-           bool(compute_evecs), int(ctx_key), device)
+           bool(compute_evecs), int(ctx_key))
     jit_eigh = _JIT_CACHE.get(key)
     if jit_eigh is None:
         local = side // p
@@ -670,10 +561,6 @@ def distributed_eigh(
         Q_local_T = jax.ShapeDtypeStruct((local, local), A.dtype)
         attrs = dict(n=side, nb=nb, ctx_key=int(ctx_key),
                      compute_evecs=bool(compute_evecs))
-        results = (W_local, Q_local_T)
-        if device:
-            results = results + (_ws_struct(eigh_workspace_bytes(
-                side, nb, p, q, A.dtype.itemsize, bool(compute_evecs))),)
 
         @partial(shard_map,
                  mesh=mesh,
@@ -686,7 +573,7 @@ def distributed_eigh(
             # rank-remap).  Same convention as distributed_cholesky.
             local_A_T = jnp.transpose(local_A, (1, 0))
             W, Q_T = jax.ffi.ffi_call(
-                _EIGH_FFI_TARGET, results)(local_A_T, **attrs)[:2]
+                _EIGH_FFI_TARGET, (W_local, Q_local_T))(local_A_T, **attrs)
             # Q_T's rows are Q's columns: the eigenvalue index, over 'y',
             # laid out block-cyclically at nb < N/p.  Put them in W's
             # ascending order, then untranspose (Q at P('x','y')).
@@ -845,7 +732,6 @@ def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh,
     if fn is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // q, n // p), A.dtype)
         LU_local_T = jax.ShapeDtypeStruct((nq, n // q, n // p), A.dtype)
-        WS = _ws_struct(lu_workspace_bytes(n, nrhs, nb, p, q, A.dtype.itemsize))
         attrs = dict(nq=nq, n=n, nrhs=nrhs, nb=nb, nb_b=nb_b, ctx_key=ctx_key)
 
         @partial(shard_map, mesh=mesh,
@@ -853,8 +739,8 @@ def batched_distributed_solve_lu(A: jax.Array, B: jax.Array, *, mesh: Mesh,
                  out_specs=P(None, "x", "y"), check_vma=False)
         def _solve(local_A, local_B):
             # Row-major shard -> col-major local block (the wrappers' convention).
-            X_T, _, _ = jax.ffi.ffi_call(
-                _SOLVE_LU_TARGET, (X_local_T, LU_local_T, WS),
+            X_T, _ = jax.ffi.ffi_call(
+                _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
                 input_output_aliases={0: 1, 1: 0},
             )(jnp.transpose(local_A, (0, 2, 1)), jnp.transpose(local_B, (0, 2, 1)), **attrs)
             return _rows_in_order(jnp.transpose(X_T, (0, 2, 1)), n=n, p=p, q=q, nb=nb)
@@ -882,14 +768,13 @@ def batched_distributed_getrf(A: jax.Array, *, mesh: Mesh,
     if fn is None:
         LU_local_T = jax.ShapeDtypeStruct((nq, n // q, n // p), A.dtype)
         piv_local = jax.ShapeDtypeStruct((nq, piv_len), jnp.int64)
-        WS = _ws_struct(lu_workspace_bytes(n, None, nb, p, q, A.dtype.itemsize))
         attrs = dict(nq=nq, n=n, nb=nb, piv_len=piv_len, ctx_key=ctx_key)
 
         @partial(shard_map, mesh=mesh, in_specs=(P(None, "x", "y"),),
                  out_specs=(P(None, "x", "y"), P(None, ("x", "y"))), check_vma=False)
         def _getrf(local_A):
-            LU_T, piv, _ = jax.ffi.ffi_call(
-                _GETRF_TARGET, (LU_local_T, piv_local, WS),
+            LU_T, piv = jax.ffi.ffi_call(
+                _GETRF_TARGET, (LU_local_T, piv_local),
                 input_output_aliases={0: 0},
             )(jnp.transpose(local_A, (0, 2, 1)), **attrs)
             return jnp.transpose(LU_T, (0, 2, 1)), piv
@@ -919,7 +804,6 @@ def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
     fn = _LU_JIT_CACHE.get(key)
     if fn is None:
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // q, n // p), B.dtype)
-        WS = _ws_struct(lu_workspace_bytes(n, nrhs, nb, p, q, LU.dtype.itemsize))
         attrs = dict(nq=nq, n=n, nrhs=nrhs, nb=nb, nb_b=nb_b, piv_len=piv_len,
                      ctx_key=ctx_key)
 
@@ -927,8 +811,8 @@ def batched_distributed_getrs(LU: jax.Array, piv: jax.Array, B: jax.Array, *,
                  in_specs=(P(None, "x", "y"), P(None, ("x", "y")), P(None, "x", "y")),
                  out_specs=P(None, "x", "y"), check_vma=False)
         def _getrs(local_LU, local_piv, local_B):
-            X_T, _ = jax.ffi.ffi_call(
-                _GETRS_TARGET, (X_local_T, WS), input_output_aliases={2: 0},
+            X_T = jax.ffi.ffi_call(
+                _GETRS_TARGET, X_local_T, input_output_aliases={2: 0},
             )(jnp.transpose(local_LU, (0, 2, 1)), local_piv,
               jnp.transpose(local_B, (0, 2, 1)), **attrs)
             return _rows_in_order(jnp.transpose(X_T, (0, 2, 1)), n=n, p=p, q=q, nb=nb)

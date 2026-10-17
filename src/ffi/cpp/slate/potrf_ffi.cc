@@ -21,10 +21,10 @@
 //
 // Device memory: SLATE's potrf calls reserveDeviceWorkspace(), one pool block per
 // local (lower) tile, which also receives the remote tiles each step needs.  Its
-// pool is seeded from the u8 WORKSPACE output (pool_seed.h;
-// distrib_la._slate.potrf_workspace_bytes sizes it), so at one tile per rank the
-// n/p x n/p block SLATE needs lives in XLA's arena, not in a device_malloc beside
-// it (MI250X P4: L outside the arena per rank, 5.2 GB at n=30720 c128).
+// pool is seeded per rank from XLA's scratch allocator when that reservation is
+// larger than the outside allowance (pool_seed.h ScratchSeed), so the n/p x n/p
+// block SLATE needs at 51200 c128 on 2x2 lives in XLA's arena, not in a
+// device_malloc beside it that does not fit.
 
 #include "../common/ctx_registry.h"
 #include <algorithm>
@@ -55,7 +55,7 @@ static ffi::Error PotrfImpl(
     lorrax_ffi::slate::SlateCtx* ctx,
     const T* d_A_in,
     T* d_L_out,
-    void* d_ws, std::size_t ws_bytes)
+    ffi::ScratchAllocator& scratch, int64_t seed_min_bytes)
 {
     lrx::gpu::Error ce = lrx::gpu::stream_synchronize(xla_stream);
     if (ce != lrx::gpu::kSuccess) {
@@ -78,11 +78,9 @@ static ffi::Error PotrfImpl(
     const int q = ctx->q;
     const int64_t lld = (n + p - 1) / p;
 
-    // Copy the input shard into the output buffer (unless XLA aliased them), then
-    // factor in place.
+    // Copy the input shard into the output buffer, then factor in-place.
     const int64_t local_rows = (n + p - 1) / p;
     const int64_t local_cols = (n + q - 1) / q;
-    if (static_cast<const void*>(d_L_out) != static_cast<const void*>(d_A_in))
     ce = lrx::gpu::memcpy_async(d_L_out, d_A_in,
                          local_rows * local_cols * sizeof(T),
                          lrx::gpu::kDeviceToDevice, xla_stream);
@@ -111,17 +109,24 @@ static ffi::Error PotrfImpl(
         {sl::Option::Target, sl::Target::Devices},
     };
 
-    // Seed the pool with SLATE's own reservation, one block per local lower tile
-    // (reserveDeviceWorkspace; the measured high-water never exceeds it, PoolWatch).
-    // distrib_la._slate.potrf_workspace_bytes sizes the buffer to it only when it is
-    // larger than the outside allowance main budgets for it, and to nothing otherwise
-    // (the carve then seeds nothing and SLATE allocates exactly what main does).
+    // Seed THIS rank's pool with SLATE's own reservation on this rank, one block per
+    // local lower tile (reserveDeviceWorkspace: what unseeded SLATE allocates here;
+    // the measured high-water never exceeds it, PoolWatch), and only when it is larger
+    // than the outside allowance the memory model grants distributed linalg
+    // (`seed_min_bytes`, distrib_la._slate._SLATE_OUTSIDE_ALLOWANCE_BYTES): within it
+    // unseeded SLATE fits outside the arena, past it (51200 c128 on 2x2) it does not.
+    // The bytes come from XLA's scratch allocator, this rank only: a rank that owns no
+    // lower tile allocates nothing, and below the allowance no rank does.
     int64_t local_lower = 0;
     for (int64_t j = 0; j < L.nt(); ++j)
         for (int64_t i = j; i < L.mt(); ++i)
             if (L.tileIsLocal(i, j)) ++local_lower;
-    const int64_t want = local_lower;
-    lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);
+    const std::size_t bs = lorrax_ffi::slate::block_bytes(L);
+    const bool seed_it = local_lower > 0 &&
+        static_cast<double>(local_lower) * static_cast<double>(bs) > static_cast<double>(seed_min_bytes);
+    const int64_t want = seed_it ? local_lower : 0;
+    lorrax_ffi::slate::ScratchSeed smem(scratch, lorrax_ffi::slate::seed_bytes({{want, bs}}));
+    lorrax_ffi::slate::PoolSeed ws(smem.base, smem.size);
     const int64_t seeded = ws.seed(L, want);
     lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
     lorrax_ffi::slate::PoolWatchScope wl(pw, L, "L", seeded, local_lower);
@@ -133,10 +138,11 @@ static ffi::Error PotrfImpl(
             int r = 0;
             MPI_Comm_rank(ctx->comm, &r);
             pw.report("potrf", r, n, nb, (int) sizeof(T));
-            std::fprintf(stderr, "[slate.potrf] rank=%d n=%lld nb=%lld pool seeded=%lld "
-                         "fallback=%lld blocks ws=%.3fGB\n", r, (long long) n, (long long) nb,
-                         (long long) seeded,
-                         (long long) lorrax_ffi::slate::pool_fallback(L, seeded), ws.size / 1e9);
+            std::fprintf(stderr, "[slate.potrf] rank=%d n=%lld nb=%lld local_lower=%lld pool "
+                         "seeded=%lld fallback=%lld blocks scratch=%.3fGB%s\n", r, (long long) n,
+                         (long long) nb, (long long) local_lower, (long long) seeded,
+                         (long long) lorrax_ffi::slate::pool_fallback(L, seeded), smem.size / 1e9,
+                         smem.failed ? " (scratch allocation FAILED: unseeded)" : "");
         }
         if (info != 0) {
             std::ostringstream os;
@@ -163,9 +169,9 @@ static ffi::Error PotrfDispatch(
     lrx::gpu::Stream stream,
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> L_out,
-    ffi::Result<ffi::AnyBuffer> WS,
+    ffi::ScratchAllocator scratch,
     int64_t n, int64_t nb,
-    int64_t ctx_key)
+    int64_t ctx_key, int64_t seed_min_bytes)
 {
     const int64_t ctx_handle = ::lorrax_ffi::ctx_registry::resolve(ctx_key, "slate");
     auto* ctx = reinterpret_cast<lorrax_ffi::slate::SlateCtx*>(ctx_handle);
@@ -187,14 +193,14 @@ static ffi::Error PotrfDispatch(
                 n, nb, stream, ctx,
                 static_cast<const double*>(A.untyped_data()),
                 static_cast<double*>(L_out->untyped_data()),
-                WS->untyped_data(), WS->size_bytes());
+                scratch, seed_min_bytes);
         case ffi::DataType::C128:
             using C128 = std::complex<double>;
             return PotrfImpl<C128>(
                 n, nb, stream, ctx,
                 static_cast<const C128*>(A.untyped_data()),
                 static_cast<C128*>(L_out->untyped_data()),
-                WS->untyped_data(), WS->size_bytes());
+                scratch, seed_min_bytes);
         default: {
             std::ostringstream os;
             os << "slate.potrf: unsupported dtype "
@@ -212,7 +218,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ctx<xla::ffi::PlatformStream<lrx::gpu::Stream>>()
         .Arg<xla::ffi::AnyBuffer>()              // A (Hermitian input)
         .Ret<xla::ffi::AnyBuffer>()              // L (Cholesky factor, lower)
-        .Ret<xla::ffi::AnyBuffer>()              // workspace (u8): SLATE's pool seed
+        .Ctx<xla::ffi::ScratchAllocator>()       // this rank's pool seed (pool_seed.h)
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
-        .Attr<int64_t>("ctx_key"));
+        .Attr<int64_t>("ctx_key")
+        .Attr<int64_t>("seed_min_bytes"));
