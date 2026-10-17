@@ -69,9 +69,20 @@ failed with `status=7`), and the site-default LibSci/HDF5 mapped cray-mpich
   loads another MPI, HDF5, cuBLAS, NCCL, rocBLAS, … beside the recorded one
   (for example an mpi4py built against the site-default MPI), now refuses at
   start-up instead of running.
-- Results: unchanged. The enforced libraries are the ones the documented
-  routes already ran. Fe V2 P=4 is bitwise against aff42ce37 on both
-  machines (measured: DEP_ENFORCE.md).
+- **Source the site launch script before a multi-node `srun`.**
+  `config/perlmutter/gpu_env.sh` now links `libcudart.so`, which libfabric
+  dlopens by that name, to the venv's CUDA runtime, first on
+  `LD_LIBRARY_PATH` (Frontier's `rocm_env.sh` already did this for
+  `libhsa-runtime64.so`). A multi-node step whose `libcudart.so` names another
+  file refuses at start-up. Before this, a 4-node clone step ran the
+  toolkit's cudart 13.2.75 for the plugin and the leg, unrecorded.
+- Results: unchanged on the clone route. The enforced libraries are the ones
+  the documented routes already ran. Measured against aff42ce37 (DEP_ENFORCE.md):
+  Fe V2 P=4 bitwise on both machines; Fe V2 P=16 on 4 Perlmutter nodes bitwise,
+  NCCL 2.30.7 over AWS Libfabric with GDRDMA on all 16 ranks and no `NCCL WARN`.
+  Per-rank device peaks are unchanged. A module run is not bitwise-equal to a
+  clone run: the module maps the toolkit's math libraries
+  ([Perlmutter](docs/installation/perlmutter.md)).
 
 ## 2026-10-16 — rocm/integration8: follow-ups on the release
 

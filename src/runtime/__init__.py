@@ -2105,6 +2105,46 @@ class RuntimeStack:
                 f"proc={self.process_index}/{self.process_count})")
 
 
+def _open_device_leg_before_collectives() -> None:
+    """Step 5e of :func:`initialize_communicator_stack`: open this process's
+    device FFI leg before the first collective communicator exists.
+
+    The leg's open maps its recorded closure by exact path
+    (:func:`lxkit.native_provider.open_and_attest`).  Opened after (6), the
+    collective library has already dlopened the site network plugin
+    (Perlmutter: aws-ofi-nccl, ``NEEDED libcudart.so.13``, no RUNPATH) and
+    the loader has satisfied that plugin from ``LD_LIBRARY_PATH``; the
+    recorded copy then maps second and the closure gate refuses the process
+    (measured: Fe P=16, 4 nodes, two ``libcudart`` copies on rank 0).
+    Opened here, every later SONAME request binds to the recorded copy.
+
+    A leg that cannot open is refused at (6b), by the same ``get_lib`` call,
+    in the mesh-aware wording of :mod:`ffi.gate`.  What refuses here is a
+    multi-node launch whose site transport would dlopen a second copy of a
+    recorded library by an unversioned name (``site.toml``
+    ``launch_libraries``; :func:`lxkit.native_provider.check_launch_libraries`).
+    A CPU-platform process has no device leg and returns at once.
+    """
+    import jax
+    if jax.default_backend() == "cpu":
+        return
+    from ffi.common import ffi_loader
+    try:
+        ffi_loader.get_lib(None)
+    except Exception:                                          # noqa: BLE001
+        return                  # (6b) re-raises it with the gate's remedy
+    # The site transport's unversioned dlopens (site.toml launch_libraries)
+    # happen inside (6); a name that would map a second copy refuses here.
+    from runtime.network_env import network_configuration
+    decision = network_configuration() or {}
+    if decision.get("launch_libraries"):
+        from lxkit import native_provider
+        native_provider.check_launch_libraries(
+            decision["launch_libraries"], os.environ.get("LD_LIBRARY_PATH", ""),
+            remedy=decision.get("launch_libraries_remedy", ""),
+            unusable_cls=ffi_loader.FfiLibraryUnusable)
+
+
 def initialize_communicator_stack(*, platform: str = "gpu",
                                   axis_names=("x", "y"),
                                   print_fn=None) -> RuntimeStack:
@@ -2175,6 +2215,13 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        refusal after the live coordination client and supported JAX surface
        exist, but before the mesh warmup performs the first compile.  A
        rank-divergent warmup is therefore covered rather than grandfathered.
+    5e. :func:`_open_device_leg_before_collectives` -- the device FFI leg
+       opens here, so its recorded dependency closure is mapped by exact
+       path before (6) creates the first NCCL/RCCL communicator.  That is
+       when the collective library dlopens a site network plugin, which
+       binds its own NEEDED runtime (``libcudart.so.13``) by SONAME: with
+       the closure already mapped it gets the recorded copy, not whatever
+       ``LD_LIBRARY_PATH`` offers (a second runtime the closure gate refuses).
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
@@ -2261,6 +2308,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     # -- 5d -----------------------------------------------------------------
     from common.jax_compile_cache import install_compile_agreement
     install_compile_agreement()
+    # -- 5e -----------------------------------------------------------------
+    _open_device_leg_before_collectives()
     _t_boot = time.perf_counter()
     # -- 6 ------------------------------------------------------------------
     from common.collectives import prepare_mesh

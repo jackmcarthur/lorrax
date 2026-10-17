@@ -108,7 +108,15 @@ GATE native-closure: got <wrong file>; want <recorded file>; fix: <remedy>
 
 The remedy is to remove what maps the other copy (an `LD_PRELOAD`, or a
 package such as mpi4py built against another MPI), or to rebuild the leg in the
-environment you run in. Setting `LD_LIBRARY_PATH` neither causes nor fixes it.
+environment you run in. Setting `LD_LIBRARY_PATH` neither causes nor fixes it,
+with one exception: on a multi-node step libfabric dlopens `libcudart.so` by
+that name, through `LD_LIBRARY_PATH`. The wheel ships only `libcudart.so.13`,
+so `cudatoolkit/13.2`'s `libcudart.so` (13.2.75) would be mapped beside the
+recorded wheel runtime. `gpu_env.sh` links `libcudart.so` to the venv's
+runtime, first on `LD_LIBRARY_PATH`. A multi-node step whose `libcudart.so`
+names another file refuses at start-up with a `GATE native-closure` line
+naming both files ([launch libraries](ffi-build.md#closure)). Source
+`gpu_env.sh` in the shell that runs `srun`.
 Moving or purging `.build`, or a `uv sync` that changes the CUDA wheels, makes
 the record stale, and the next run refuses until the legs are rebuilt.
 
@@ -207,6 +215,13 @@ clone's `uv.lock` pin) with `--no-deps`; the modulefile puts its `lib`, not
 `comm_libs`, on `LD_LIBRARY_PATH`; `verify_runtime.py` requires exactly that
 `libnccl` to be mapped. `accept.sh`'s `verify_runtime.py` prints and checks both
 legs' enforced closure identities.
+
+A module run and a clone run of one tree are therefore not bitwise identical:
+NCCL, cuSOLVERMp, cuBLASMp, MPI and HDF5 are the same files, but cuBLAS,
+cuSOLVER, cuFFT, cuSPARSE and the CUDA runtime are the toolkit's (HPC SDK 26.5:
+cuBLAS 13.4.1) in the module and the wheels' (cuBLAS 13.6.1) in a clone.
+Measured on Fe V2 P=4 (2026-10-17): sigma_diag identical, `eqp1` max |Δ|
+1.3e-6 eV. Compare module runs with module runs.
 
 | path under `$LORRAX_MODULE_PREFIX` | written by |
 |---|---|

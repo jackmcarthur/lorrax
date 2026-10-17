@@ -118,7 +118,8 @@ PERLMUTTER_DEFAULTS = {
     "NCCL_NET_GDR_LEVEL": "PHB", "FI_CXI_DISABLE_HOST_REGISTER": "1",
     "FI_CXI_RDZV_THRESHOLD": "0", "NCCL_CROSS_NIC": "2", "NCCL_SOCKET_IFNAME": "hsn",
 }
-TWO_NODES = dict(SLURM_STEP_NODELIST="nid[001000-001001]", SLURM_NETWORK="no_vni")
+TWO_NODES = dict(SLURM_STEP_NODELIST="nid[001000-001001]", SLURM_NETWORK="no_vni",
+                 LD_LIBRARY_PATH="/shim")      # gpu_env.sh's libcudart.so link
 
 
 def plan(env, **kw):
@@ -144,6 +145,12 @@ def test_perlmutter_profile_applies_the_site_module_settings():
 def test_perlmutter_profile_refuses_a_sockets_step(env, cause):
     with pytest.raises(RuntimeError, match=cause):
         plan({"NERSC_HOST": "perlmutter", **env})
+
+
+def test_perlmutter_profile_refuses_a_launch_without_the_cudart_name():
+    with pytest.raises(RuntimeError, match="GATE launch_libraries.*libcudart.so.*gpu_env.sh"):
+        ne.plan_network_environment({"NERSC_HOST": "perlmutter", **TWO_NODES},
+                                    is_file=lambda path: not path.endswith("libcudart.so"))
 
 
 def test_perlmutter_profile_refuses_a_missing_plugin():
@@ -227,8 +234,10 @@ def test_frontier_explicit_transport_keeps_the_site_start_up_requirements():
 
 def test_perlmutter_explicit_transport_fills_only_the_fabric_settings():
     result = plan({"NERSC_HOST": "perlmutter", "NCCL_NET": "AWS Libfabric",
-                   "FI_CXI_RDZV_THRESHOLD": "0", "SLURM_STEP_NODELIST": "nid[001000-001001]"})
+                   "FI_CXI_RDZV_THRESHOLD": "0", "SLURM_STEP_NODELIST": "nid[001000-001001]",
+                   "LD_LIBRARY_PATH": "/shim"})
     assert result["policy"] == "explicit transport"
+    assert result["launch_libraries"] == ["libcudart.so"]
     assert set(result["applied"]) == {"NCCL_NET_GDR_LEVEL", "FI_CXI_DISABLE_HOST_REGISTER",
                                       "NCCL_CROSS_NIC", "NCCL_SOCKET_IFNAME"}
     assert result["mpi_before_collectives"] is False
