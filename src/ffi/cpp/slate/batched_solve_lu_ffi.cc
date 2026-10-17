@@ -153,18 +153,28 @@ static ffi::Error copy_out(const char* what, sl::Matrix<T>& M, T* dst, int64_t l
 }
 
 // SLATE-owned device tiles: A (n x n, nb x nb) or B / X (n x nrhs, nb x nb_b),
-// their pool seeded from the workspace with one block per local tile plus a
-// panel's worth (2 (mt + nt) + 8: distrib_la._slate._pool_blocks, the same rule).
+// their pool seeded from the workspace with one block per local tile plus the
+// remote tiles the driver holds at once (distrib_la._slate.lu_workspace_bytes,
+// the same rule):
+//   A (getrf):  a panel column and row, twice for the lookahead: 2 (mt + nt) + 8.
+//   X (getrs):  trsmB broadcasts one row of B per step k and releases it after
+//               the step (work_trsm.cc: B_panel.releaseRemoteWorkspace), with at
+//               most lookahead + 2 steps in flight: 4 nt + 8.  The panel rule
+//               here seeded 2 (mt + nt) + 8 blocks of nb x nrhs/q -- at
+//               nrhs = n that is ~2 n^2 / q elements of never-used workspace
+//               (50 GiB at n = 51200 c128 on 2x2), the OOM it caused.
 template <typename T>
 static sl::Matrix<T> owned(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
                            const lorrax_ffi::slate::SlateCtx* ctx,
-                           lorrax_ffi::slate::PoolSeed& ws, int64_t* seeded) {
+                           lorrax_ffi::slate::PoolSeed& ws, int64_t* seeded,
+                           bool rhs = false) {
     sl::Matrix<T> M(m, ncols, mb, nb_cols, ctx->p, ctx->q, ctx->comm);
     int64_t local = 0;
     for (int64_t j = 0; j < M.nt(); ++j)
         for (int64_t i = 0; i < M.mt(); ++i)
             if (M.tileIsLocal(i, j)) ++local;
-    *seeded = ws.seed(M, local + 2 * (M.mt() + M.nt()) + 8);
+    const int64_t extra = rhs ? 4 * M.nt() + 8 : 2 * (M.mt() + M.nt()) + 8;
+    *seeded = ws.seed(M, local + extra);
     M.insertLocalTiles(sl::Target::Devices);
     return M;
 }
@@ -250,7 +260,7 @@ static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate:
         lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);     // matrix iq's SLATE objects die below
         int64_t sa = 0, sx = 0;
         auto Aq = owned<T>(n, n, nb, nb, ctx, ws, &sa);
-        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx, ws, &sx);
+        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx, ws, &sx, /*rhs=*/true);
         if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
@@ -338,7 +348,7 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
         lorrax_ffi::slate::PoolSeed ws(d_ws, ws_bytes);
         int64_t sa = 0, sx = 0;
         auto Aq = owned<T>(n, n, nb, nb, ctx, ws, &sa);
-        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx, ws, &sx);
+        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx, ws, &sx, /*rhs=*/true);
         if (auto e = copy_in<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         const int64_t* in = h_piv.data() + iq * piv_len;
