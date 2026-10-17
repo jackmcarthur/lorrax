@@ -184,53 +184,75 @@ carries no $q\to0$ head. The head change is $q\cdot\delta S\cdot q$ from the
 window's dipoles and populations (the `qsgw_head` route), plus a Drude term
 once carriers exist (§4).
 
-### 1.5 The on-shell operator keeps its damping {#damping}
+### 1.5 The on-shell collision term {#damping}
 
-The dynamical members use the on-shell average without a Hermitian
-projection,
+The dynamical members keep the anti-Hermitian part of the on-shell average and
+add its in-scattering partner. The branches of the Σ sweep split
+$\Sigma^R(\omega)$ into a particle part $\Sigma^R_p$ (weight $1-f_n$; the cond
+branch of `_population_branches`) and a hole part $\Sigma^R_h$ (weight $f_n$;
+the val branch). A time-ordered hole branch is the adjoint of the retarded
+one. The anti-Hermitian parts are the out- and in-scattering rates,
 
 $$
-\tilde\Sigma_{ij}=\tfrac12\big[\Sigma_{ij}(e_i)+\Sigma_{ij}(e_j)\big]
-=\tilde\Sigma^{\rm h}_{ij}-\tfrac i2\tilde\Gamma_{ij},\qquad
-\tilde\Gamma_{ij}=\tfrac12\big[\Gamma_{ij}(e_i)+\Gamma_{ij}(e_j)\big],\quad
-\Gamma(\omega)=i\big[\Sigma^R(\omega)-\Sigma^A(\omega)\big], \tag{8}
+\Gamma^>(\omega)=i\big[\Sigma^R_p-\Sigma^{R\dagger}_p\big](\omega)=i\Sigma^>(\omega),\qquad
+\Gamma^<(\omega)=i\big[\Sigma^R_h-\Sigma^{R\dagger}_h\big](\omega)=-i\Sigma^<(\omega),
 $$
 
-a limit of the two-time collision integral with quasiparticle propagators
-(owner's prescription, 2026-10-17). The equation of motion becomes
-$i\dot\rho=H\rho-\rho H^\dagger$: the Hermitian part enters the commutator and
-$\tilde\Gamma$ enters as $-\tfrac12\{\tilde\Gamma,\rho\}$, an out-scattering
-rate. $\Gamma(\omega)$ is positive semidefinite, so the diagonal
-$\tilde\Gamma_{ii}=\Gamma_{ii}(e_i)\ge0$; the off-diagonal average over two
-energies carries no such guarantee. Open points, to settle before the member
-is wired:
+both positive semidefinite, with $\Gamma=\Gamma^>+\Gamma^<=i(\Sigma^R-\Sigma^A)$.
+The on-shell average of any of them is $\tilde X_{ij}=\tfrac12[X_{ij}(e_i)+X_{ij}(e_j)]$.
+The Markov limit of the collision integral with quasiparticle propagators
+(GKBA; Langreth form $\Sigma^RG^<+\Sigma^<G^A$ and its adjoint), with the
+energies of both indices entering (owner's prescription, 2026-10-17), is
 
-* **Difference form.** $H$ carries $\Delta\tilde\Sigma=\tilde\Sigma[\rho]-\tilde\Sigma[\rho^{\rm eq}]$.
-  The equilibrium widths sit in the real $\varepsilon^{\rm QP}$ and drop out,
-  so the rate is the carrier-induced change $\Delta\tilde\Gamma$. It is not
-  sign-definite: Pauli blocking of a decay channel lowers a width, and a
-  negative eigenvalue of $\Delta\tilde\Gamma$ grows. Using the full
-  $\tilde\Gamma[\rho]$ instead makes $\rho^{\rm eq}$ decay unless the
-  in-scattering term is present.
-* **Particle number.** Out-scattering alone changes $\mathrm{Tr}\,\rho_k$ at the
-  rate $-\mathrm{Tr}\,\Delta\tilde\Gamma_k\rho_k$. The in-scattering partner of
-  the same collision integral ($\Sigma^<G^A$) restores it and, with the full
-  widths, keeps $\rho^{\rm eq}$ a fixed point.
-* **Linear response.** The $O(E)$ dynamical correction of §2 acquires an
-  anti-Hermitian part (damping of the coherences). The static-$W$ limit is
-  unchanged: $\Sigma$ is static and Hermitian there.
-* **GN-PPM.** With real pole energies, $\mathrm{Im}\,\Sigma(\omega)$ is a sum of
-  broadened $\delta$ functions at $e_n\pm\Omega$; on a 30×30 mesh it depends on
-  the broadening. The shared-pole member gives a smoother width.
-* **Integrator.** CFM4 takes the non-Hermitian exponent as is,
-  $\rho\mapsto e^{-i\Omega}\rho\,e^{i\Omega^\dagger}$ with
-  $\Omega=\tau\sum_la_lH_l$: the left and right factors commute as
-  superoperators, so the order is kept. `eigh` no longer applies; a batched
-  `expm` (scaling and squaring) on $n_A\times n_A$ blocks is cheap. The
-  $\Gamma$ remainder is unchanged.
-* **Code.** `window_sigma_c` (§9 item 5) returns
-  $U[\tfrac12(\cdot+\cdot)]^{\rm h}U^\dagger$; it should return
-  $U\tilde\Sigma U^\dagger$ and leave the split to the propagator.
+$$
+\dot\rho=-i\big(\tilde H\rho-\rho\tilde H^\dagger\big)+\tilde\Gamma^<
+=-i[\tilde H^{\rm h},\rho]-\tfrac12\{\tilde\Gamma^>,\rho\}+\tfrac12\{\tilde\Gamma^<,1-\rho\}, \tag{8}
+$$
+
+where $\tilde H=H+\tilde\Sigma$ and $\tilde\Sigma=\tfrac12[\Sigma^R(e_i)+\Sigma^R(e_j)]$.
+The anti-Hermitian part of $\tilde\Sigma$ is the total width
+$-\tfrac i2\tilde\Gamma$, and the $\Sigma^<G^A$ piece is the source
+$+\tilde\Gamma^<$. Occupied weight scatters out at $\Gamma^>$ and empty
+weight is filled at $\Gamma^<$, Pauli-blocked. The principal-value parts of
+the half-range transforms add up to the Hermitian part of $\Sigma^R$ and
+nothing else. In the code's terms,
+$\tilde\Gamma^{\gtrless}=i(\tilde\Sigma_{p/h}-\tilde\Sigma_{p/h}^\dagger)$ with
+$\tilde\Sigma_{p/h}=\tfrac12(T_1+T_2)$, $T_1=\Sigma_{ij}(e_i)$ and
+$T_2=\Sigma_{ij}(e_j)$ being `window_sigma_c`'s two on-shell tables of the
+branch.
+
+**Equilibrium subtraction.** The propagator carries $C[\rho]-C[\rho^{\rm eq}]$,
+where $C[\rho]=-\tfrac12\{\tilde\Gamma[\rho],\rho\}+\tilde\Gamma^<[\rho]$ is the
+dissipative part of Eq. (8) at the full rates. Then $\rho^{\rm eq}$ is a fixed
+point exactly, and the deviation $x=\rho-\rho^{\rm eq}$ is damped by the full
+$\tilde\Gamma[\rho]\ge0$: no negative width, unlike a difference of rates.
+For a gapped $T=0$ state the diagonal of $C[\rho^{\rm eq}]$ vanishes up to
+the regularization tails. Its off-diagonal (occupied–empty) part comes from
+the widths of the correlated ground state, and the subtraction removes both.
+
+* **Particle number.** $\mathrm{Tr}\,\rho$ changes only through scattering
+  partners outside the window and through the asymmetry of the ordered PPM
+  residues ($R_+$ on particle branches, $R_-$ on hole branches). This is
+  measured, not assumed.
+* **Linear response.** The $O(E)$ coherences decay at
+  $\tfrac12(\tilde\Gamma_{ii}+\tilde\Gamma_{jj})$ of equilibrium: the BSE
+  with quasiparticle widths. At the band edges these widths are the
+  regularization tails. The static-$W$ limit is unchanged, $\Sigma$ being
+  static and Hermitian there.
+* **GN-PPM.** With real pole energies the rates are sums of broadened
+  $\delta$ functions at $e_n\pm\Omega$; on a 30×30 mesh they depend on the
+  regularization width. The shared-pole member gives smoother rates.
+* **Integrator.** $\tilde\Gamma$ and the source
+  $S=-\tfrac12\{\tilde\Gamma,\rho^{\rm eq}\}+\tilde\Gamma^<-C[\rho^{\rm eq}]$
+  are held between refreshes (§7.1), like $\Delta\Sigma^{\rm dyn}$. The
+  dissipative flow $\dot x=-\tfrac12\{\tilde\Gamma,x\}+S$ is then affine and is
+  solved exactly in the eigenbasis of $\tilde\Gamma$,
+  $x'_{ab}(\tau)=e^{-(\gamma_a+\gamma_b)\tau/2}x'_{ab}(0)+\tau\,\varphi_1\big((\gamma_a+\gamma_b)\tau/2\big)S'_{ab}$
+  with $\varphi_1(z)=(1-e^{-z})/z$. It is composed with the commutator flow
+  by the triple jump, as the $\Gamma$ remainder is now, and is $k$-local: two
+  $n_A\times n_A$ products per $k$ and application.
+* **Code.** `window_sigma_c` returns both branches' pair tables from one τ
+  sweep and the complex $U\tilde\Sigma U^\dagger$, not its Hermitian part.
 
 ### 1.6 The active space: band window or disentangled subspace (proposed) {#active-space}
 
@@ -337,7 +359,8 @@ is the term their split drops.
 * for the static and frozen members: $\mathrm{Tr}\,\rho_k$ per $k$, Hermiticity
   of $\Delta\Sigma$ (measured $\le1.2\times10^{-17}$), unitarity of the
   commutator flow (the spectrum of $\rho$ at $\Gamma=0$). The dynamical members
-  keep the Hermiticity of $\rho$ but not $\mathrm{Tr}\,\rho_k$ (§1.5);
+  keep the Hermiticity of $\rho$; their $\mathrm{Tr}\,\rho$ is conserved up to
+  the terms named in §1.5, which are measured;
 * $\rho=\rho^{\rm eq}$ is a fixed point, $\Delta\Sigma=0$ exactly;
 * covariance under a rotation of the window basis: the populations are those
   of the instantaneous basis, not of the band gauge (the red twin that reads
@@ -353,10 +376,10 @@ is the term their split drops.
   two-time $G$, and Eq. (2) is not its stationarity condition), so the energy
   is not conserved exactly. The frozen-W member is Φ-derivable from
   $\tfrac12\mathrm{Tr}\,\delta\rho K\delta\rho$ and conserves its energy.
-* **In-scattering and equilibrium widths.** The on-shell operator keeps
-  $\mathrm{Im}\,\Sigma$ as out-scattering (§1.5). Without the in-scattering
-  partner $\mathrm{Tr}\,\rho$ is not conserved and no carrier distribution
-  relaxes; the difference form carries only the change of the widths.
+* **Memory in the rates.** The collision term (§1.5) is the on-shell Markov
+  limit, built from the populations of the instantaneous basis and held
+  between refreshes; there is no non-Markovian dephasing and no
+  coherence-driven scattering.
 * **Coherence-driven screening** ($\delta W/\delta G$ at the drive frequency),
   by construction (§1.1).
 
@@ -591,8 +614,9 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    head and the on-shell frequency list. It returns $\Sigma_{ij}(e_i)$,
    $\Sigma_{ij}(e_j)$, the static operator
    $U[\tfrac12(\cdot+\cdot)]^{\rm h}U^\dagger$ and, on request,
-   $\Sigma(\omega)$. Under §1.5 the operator is to be returned without the
-   Hermitian projection, $U\tilde\Sigma U^\dagger$ (to do). Limits: the projection is the band prefix $[0,b_{\rm hi})$,
+   $\Sigma(\omega)$. Under §1.5 it is to return both branches' pair tables
+   from one sweep and $U\tilde\Sigma U^\dagger$ without the Hermitian
+   projection (to do). Limits: the projection is the band prefix $[0,b_{\rm hi})$,
    not the window alone, because the invalid-mode static term sums the
    occupied bands (window decode is item 6); the head is the run's
    `HeadSigmaDiag` at the instantaneous $e$, $f$ (frozen $W_h$, §1.4); only
