@@ -63,6 +63,7 @@ static ffi::Error BatchedPotrsImpl(
     int64_t mb_a, int64_t nb_a, int64_t mb_b, int64_t nb_b,
     cudaStream_t xla_stream,
     LorraxCusolverMpCtx* ctx,
+    ffi::ScratchAllocator& scratch,
     const T* d_L, const T* d_B_in, T* d_X_out)
 {
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
@@ -123,13 +124,32 @@ static ffi::Error BatchedPotrsImpl(
         os << "cusolverMpPotrs_bufferSize failed: status=" << (int)mp_st;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
+    // Device workspace from XLA's scratch allocator (inside the pool, released
+    // when the call's stream work is done -- the exit cross-stream wait orders
+    // it), as eigh_ffi.cc does.  The context's grow-only cudaMalloc workspace
+    // used here before stayed resident outside the pool after the call:
+    // 23.5 GB/rank after a one-tile 51200 c128 potrf on 2x2, which every later
+    // op in the process then ran out of memory against.  Host side unchanged.
     try {
         NvtxRange range("potrs.ensure_workspace");
-        ensure_workspace(ctx, d_ws, h_ws);
+        ensure_workspace(ctx, 0, h_ws);
     } catch (const std::exception& ex) {
         cusolverMpDestroyMatrixDesc(descA);
         cusolverMpDestroyMatrixDesc(descB);
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
+    }
+    void* d_work = nullptr;
+    if (d_ws > 0) {
+        auto ws_opt = scratch.Allocate(d_ws);
+        if (!ws_opt.has_value()) {
+            cusolverMpDestroyMatrixDesc(descA);
+            cusolverMpDestroyMatrixDesc(descB);
+            std::ostringstream os;
+            os << "cuSOLVERMp potrs: XLA scratch allocator failed to provide " << d_ws
+               << " bytes of workspace (n=" << n << ")";
+            return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
+        }
+        d_work = *ws_opt;
     }
 
     for (int64_t q = 0; q < nq; ++q) {
@@ -148,7 +168,7 @@ static ffi::Error BatchedPotrsImpl(
             ctx->handle, CUBLAS_FILL_MODE_LOWER, n, mrhs,
             A_slice_ptr, 1, 1, descA,
             X_slice_ptr, 1, 1, descB,
-            ctx->d_workspace, ctx->d_workspace_bytes,
+            d_work, d_ws,
             ctx->h_workspace, ctx->h_workspace_bytes,
             ctx->d_info);
         if (mp_st != CUSOLVER_STATUS_SUCCESS) {
@@ -182,6 +202,7 @@ static ffi::Error BatchedPotrsImpl(
 
 static ffi::Error BatchedPotrsDispatch(
     cudaStream_t stream,
+    ffi::ScratchAllocator scratch,
     ffi::AnyBuffer L,
     ffi::AnyBuffer B,
     ffi::Result<ffi::AnyBuffer> X_out,
@@ -203,14 +224,14 @@ static ffi::Error BatchedPotrsDispatch(
     switch (dtype) {
         case ffi::DataType::F64:
             return BatchedPotrsImpl<double>(
-                nq, n, mrhs, mb_a, nb_a, mb_b, nb_b, stream, ctx,
+                nq, n, mrhs, mb_a, nb_a, mb_b, nb_b, stream, ctx, scratch,
                 static_cast<const double*>(L.untyped_data()),
                 static_cast<const double*>(B.untyped_data()),
                 static_cast<double*>(X_out->untyped_data()));
         case ffi::DataType::C128:
             using C128 = std::complex<double>;
             return BatchedPotrsImpl<C128>(
-                nq, n, mrhs, mb_a, nb_a, mb_b, nb_b, stream, ctx,
+                nq, n, mrhs, mb_a, nb_a, mb_b, nb_b, stream, ctx, scratch,
                 static_cast<const C128*>(L.untyped_data()),
                 static_cast<const C128*>(B.untyped_data()),
                 static_cast<C128*>(X_out->untyped_data()));
@@ -230,6 +251,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     lorrax_ffi::cusolvermp_batched_potrs::BatchedPotrsDispatch,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()      // L
         .Arg<xla::ffi::AnyBuffer>()      // B
         .Ret<xla::ffi::AnyBuffer>()      // X
