@@ -46,7 +46,7 @@ def test_chi_unfold_write_equals_zero_acc_and_rows_refuse(backend):
     rnd = lambda *s: jnp.asarray(rng.standard_normal(s) + 1j * rng.standard_normal(s))
     Gv, Gvt, Gc, Gct = (rnd(n_parent, m, NS, m, NS) for _ in range(4))
     alpha = rnd(n_out)
-    mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    mesh = Mesh(np.array(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
     with (F.xla_reference() if backend == "xla" else contextlib.nullcontext()):
         assert F.kconv_backend(mesh, KG) == backend
         fn = F.make_kconv_chi_unfold(mesh, KG, tables, n_out=n_out, complete=True, norm="ortho")
