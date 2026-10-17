@@ -104,6 +104,22 @@ without the room, so a new room exchanges, reads and compiles nothing to decide.
   name ("has a room that differs across processes") instead of routing divergently.
 - **What you must change:** nothing.
 
+## 2026-10-17 — W response: warm rule nodes cost 0 in the planner; the q-span row window gathers through its cached program
+
+Two schedule-only changes in `src/gw/response_bank.py`. No rule, energy or output byte moves.
+
+- **Warm rule-tree nodes cost 0 in the round planner** (`_attempt_cost`). A node that holds an
+  earlier map's rule on the same member set is tried first on that rule's nodes: one projection
+  pass and no pencil when it fits. It was priced as a cold attempt (2.4–3.4 s on the device
+  route), so on Fe 8³ SC maps 1–3 the planner deferred warm needed nodes to a round of their own
+  and filled it with cold speculation. They now ride in the round of the failing shared fit.
+  Fe 8³ P4, `sc_max_iter 3`: rule construction −7.6 s and W response −6.7 s summed over the four
+  maps; quadrature lines, `eqp0_iter*.dat` and per-rank peak memory identical.
+- **`_RowWindow.__getitem__` takes rows through the cached `_MemberRows` gather program**
+  instead of eager indexing (1.64 → 0.12 ms dispatch per take; bitwise, same sharding). Fe 8³ P4,
+  `sc_max_iter 1`, two A/B pairs: W response 158.8 / 159.0 s → 157.2 / 157.0 s; `eqp0.dat`,
+  `eqp1.dat` and `sigma_diag.dat` identical.
+- **What you must change:** nothing.
 
 ## 2026-10-17 — k-convolution kernels: faster mathdx modes 7, 9 and 11 (CUDA); a new native target
 
