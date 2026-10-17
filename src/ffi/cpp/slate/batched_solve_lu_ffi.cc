@@ -154,15 +154,16 @@ static ffi::Error copy_out(const char* what, sl::Matrix<T>& M, T* dst, int64_t l
 
 // SLATE-owned device tiles: A (n x n, nb x nb) or B / X (n x nrhs, nb x nb_b),
 // their pool seeded from the workspace with one block per local tile plus the
-// remote tiles the driver holds at once (distrib_la._slate.lu_workspace_bytes,
-// the same rule):
-//   A (getrf):  a panel column and row, twice for the lookahead: 2 (mt + nt) + 8.
-//   X (getrs):  trsmB broadcasts one row of B per step k and releases it after
-//               the step (work_trsm.cc: B_panel.releaseRemoteWorkspace), with at
-//               most lookahead + 2 steps in flight: 4 nt + 8.  The panel rule
-//               here seeded 2 (mt + nt) + 8 blocks of nb x nrhs/q -- at
-//               nrhs = n that is ~2 n^2 / q elements of never-used workspace
-//               (50 GiB at n = 51200 c128 on 2x2), the OOM it caused.
+// remote tiles the driver holds at once, at the measured lower envelope of the
+// pool's high-water (pool_seed.h PoolWatch, MI250X 2x2, n = 4096 ... 30720), so a
+// seed never exceeds what unseeded SLATE holds (distrib_la._slate.lu_workspace_bytes,
+// the same rules):
+//   A (getrf):  (mt/p + nt/q) / 2 remote tiles (measured 10 ... 243 beside the local).
+//   X (getrs):  none (measured 0 ... 1: trsmB releases B's broadcast row after each
+//               step, work_trsm.cc B_panel.releaseRemoteWorkspace).  The panel rule
+//               this replaced seeded 2 (mt + nt) + 8 blocks of nb x nrhs/q -- at
+//               nrhs = n ~2 n^2 / q elements of never-used workspace (50 GiB at
+//               n = 51200 c128 on 2x2), the OOM it caused.
 template <typename T>
 static sl::Matrix<T> owned(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
                            const lorrax_ffi::slate::SlateCtx* ctx,
@@ -173,7 +174,7 @@ static sl::Matrix<T> owned(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols
     for (int64_t j = 0; j < M.nt(); ++j)
         for (int64_t i = 0; i < M.mt(); ++i)
             if (M.tileIsLocal(i, j)) ++local;
-    const int64_t extra = rhs ? 4 * M.nt() + 8 : 2 * (M.mt() + M.nt()) + 8;
+    const int64_t extra = rhs ? 0 : (M.mt() / ctx->p + M.nt() / ctx->q) / 2;
     *seeded = ws.seed(M, local + extra);
     M.insertLocalTiles(sl::Target::Devices);
     return M;

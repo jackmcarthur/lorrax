@@ -195,9 +195,30 @@ def validate_tile_layout(n: int, nb: int, p: int, q: int, *, what: str,
 # output, a u8 workspace sized here and never read, and seed each matrix's pool
 # from it (cpp/slate/pool_seed.h), so the tiles are XLA buffers: in the compiled
 # program's memory_analysis and in the arena.  The C++ side applies the same
-# per-matrix rule (local tiles + _pool_extra) and falls back to device_malloc
-# only past the end of the buffer (LORRAX_SLATE_POOL_REPORT=1 counts it).
+# per-matrix rules and falls back to device_malloc past the end of the buffer
+# (LORRAX_SLATE_POOL_REPORT=1 counts it).
+#
+# THE RULES ARE LOWER ENVELOPES OF MEASURED HIGH-WATER (owner rule: a rank's device
+# peak must not rise above unseeded main).  A seeded block SLATE never touches is a
+# byte main never allocated; a block SLATE needs beyond the seed is one main also
+# allocated (outside the arena), so a seed at or below SLATE's high-water cannot
+# raise a peak.  The high-water is pool_seed.h's PoolWatch (blocks in use, read under
+# SLATE's own slate_memory lock), MI250X 2x2, f64 + c128, n = 4096 ... 30720 (dlascale
+# hwc, pool_hw lines; tests/test_slate_pool_rules.py carries the table):
+#   eigh A (lower, nb 128): min over ranks = full local tiles - mt/2, exactly, every n
+#   eigh Z, Z1d:            local tiles exactly (no remote tiles)
+#   LU A (nb 256):          local + 10..243 (>= (mt/p + nt/q)/2 at every n)
+#   LU X (nrhs = q):        local + 0..1
+#   potrf (one tile/rank):  0..1 blocks in use; SLATE reserves one block per local
+#                           lower tile (reserveDeviceWorkspace), on 3 of the 4 ranks.
 _POOL_ALIGN = 256
+#: The outside-pool allowance the memory model grants distributed linalg (the value of
+#: ``runtime.DISTRIBUTED_LINALG_OUTSIDE_BYTES``; distrib_la cannot import ``runtime`` --
+#: layering -- so tests/test_slate_pool_rules.py pins the two equal).  potrf's
+#: reservation is seeded into the arena only past it: within it, main's outside
+#: allocation is the budgeted one and seeding would only add an unused block on the
+#: rank that owns no lower tile (the workspace is the same shape on every rank).
+_SLATE_OUTSIDE_ALLOWANCE_BYTES = 3e9
 
 
 def _device_leg(mesh: Mesh) -> bool:
@@ -205,15 +226,17 @@ def _device_leg(mesh: Mesh) -> bool:
     return _mesh_platform(mesh) in ("ROCM", "CUDA")
 
 
-def _pool_extra(mt: int, nt: int) -> int:
-    """Remote tiles a Devices driver holds beside the local ones: a panel column and
-    row, twice for the lookahead (cpp/slate: extra_tiles / owned)."""
-    return 2 * (mt + nt) + 8
+def _lu_extra(mt: int, nt: int, p: int, q: int) -> int:
+    """getrf's remote tiles beside A's local ones: half a panel column + row per rank,
+    ``(mt/p + nt/q) / 2`` -- the measured lower envelope (cpp/slate owned(), same rule)."""
+    return (mt // p + nt // q) // 2
 
 
-def _rhs_pool_extra(nt: int) -> int:
-    """Remote tiles of a right-hand side (``nt`` tile columns) under getrs's trsmB."""
-    return 4 * nt + 8
+def _eigh_a_blocks(mt: int, nt: int, p: int, q: int) -> int:
+    """he2hb's high-water on A's pool: every local tile of the FULL matrix less half a
+    tile column, the measured minimum over ranks (cpp/slate eigh_ffi.cc, same rule)."""
+    return max(_max_local_tiles(mt, nt, p, q, lower=True),
+               _max_local_tiles(mt, nt, p, q) - mt // 2)
 
 
 def _max_local_tiles(mt: int, nt: int, p: int, q: int, *, lower: bool = False) -> int:
@@ -242,14 +265,15 @@ def _pool_bytes(*matrices) -> int:
 
 def eigh_workspace_bytes(side: int, nb: int, p: int, q: int, itemsize: int,
                          compute_evecs: bool = True) -> int:
-    """The seeded heev driver's pools: A (lower), Z (2-D) and Z1d (1 x P columns)."""
+    """The seeded heev driver's pools: A (he2hb's high-water), Z (2-D) and Z1d (1 x P
+    columns), each at its measured lower envelope (module comment)."""
     mt = nt = side // nb
     tile = nb * nb * itemsize
-    pools = [(_max_local_tiles(mt, nt, p, q, lower=True) + _pool_extra(mt, nt), tile)]
+    pools = [(_eigh_a_blocks(mt, nt, p, q), tile)]
     if compute_evecs:
         ranks = p * q
-        pools.append((_max_local_tiles(mt, nt, p, q) + _pool_extra(mt, nt), tile))
-        pools.append((-(-nt // ranks) * mt + _pool_extra(mt, nt), tile))
+        pools.append((_max_local_tiles(mt, nt, p, q), tile))
+        pools.append((-(-nt // ranks) * mt, tile))
     return _pool_bytes(*pools)
 
 
@@ -257,27 +281,31 @@ def lu_workspace_bytes(n: int, nrhs: int | None, nb: int, p: int, q: int,
                        itemsize: int) -> int:
     """getrf / getrs pools: A (n x n, nb x nb) and, with ``nrhs``, X (n x nrhs, nb x nrhs/q).
 
-    X's remote tiles are trsmB's in-flight B rows (one per step, released after
-    it, lookahead + 2 steps live): ``4 q + 8`` blocks, not A's panel rule -- at
-    ``nrhs = n`` a panel's worth of ``nb x n/q`` blocks is ~2 n^2/q elements
-    (cpp/slate/batched_solve_lu_ffi.cc ``owned``, the same rule).
+    X is seeded with its local tiles only: trsmB holds at most one remote row of B
+    beside them (measured 0..1 blocks), and A's panel rule on X's nb x nrhs/q tiles
+    was ~2 n^2/q elements of unused workspace at nrhs = n
+    (cpp/slate/batched_solve_lu_ffi.cc ``owned``, the same rules).
     """
     mt = nt = n // nb
-    pools = [((n // p // nb) * (n // q // nb) + _pool_extra(mt, nt), nb * nb * itemsize)]
+    pools = [((n // p // nb) * (n // q // nb) + _lu_extra(mt, nt, p, q), nb * nb * itemsize)]
     if nrhs:
         nb_b = nrhs // q
-        pools.append(((n // p // nb) + _rhs_pool_extra(q), nb * nb_b * itemsize))
+        pools.append(((n // p // nb), nb * nb_b * itemsize))
     return _pool_bytes(*pools)
 
 
 def potrf_workspace_bytes(n: int, nb: int, p: int, q: int, itemsize: int) -> int:
-    """potrf's pool: its reservation (one block per local lower tile) plus the
-    remote tiles in flight; at one tile per rank one block on 2 x 2, three beyond."""
+    """potrf's pool: SLATE's own reservation, one block per local lower tile
+    (reserveDeviceWorkspace; the measured high-water never exceeds it), seeded into the
+    arena only when it is larger than the outside allowance main budgets for it
+    (:data:`_SLATE_OUTSIDE_ALLOWANCE_BYTES`); otherwise the minimum buffer and SLATE
+    allocates exactly what main does."""
     mt = nt = n // nb
-    if mt == p:
-        return _pool_bytes((1 + (2 if p > 2 else 0), nb * nb * itemsize))
-    return _pool_bytes((_max_local_tiles(mt, nt, p, q, lower=True) + _pool_extra(mt, nt),
-                        nb * nb * itemsize))
+    tile = nb * nb * itemsize
+    reserve = _max_local_tiles(mt, nt, p, q, lower=True)
+    if reserve * tile <= _SLATE_OUTSIDE_ALLOWANCE_BYTES:
+        return _POOL_ALIGN
+    return _pool_bytes((reserve, tile))
 
 
 def _ws_struct(nbytes: int):
