@@ -14,7 +14,7 @@ in this file, in execution order:
                                                            #   ⊕ q→0 head channel        (sigma_dispatch)
     Σ_total         = solve_qp(Σ) | run_sc_driver(...)     # update_H per qp_solver      (qsgw_utils, sc_iteration)
     E_qp, U_qp      = eigh(kin_ion + Σ_total)
-	eqp0/eqp1[/eqp2]/σ.dat = write_results(...)            # writers, debug tables       (gw_output)
+	eqp0/eqp1/σ.dat = write_results(...)            # writers, debug tables       (gw_output)
 
 Two orthogonal config axes pivot the flow: ``compute_mode`` — the
 self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm`` /
@@ -117,7 +117,6 @@ from .sigma_dispatch import (
 	SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE, compute_sigma_xc,
 	sigma_result_on_kset, validate_band_extrapolation)
 from .qsgw_utils import solve_qp
-from .dynamic_sigma import extract_sigma_diag_logical
 from .degen_average import (
 	average_within_degenerate_sets,
 )
@@ -967,16 +966,7 @@ def _solve_qp_stage(
             sigma_total = solve_qp(
                 qp_solver, sigma_result, kin_ion,
                 config=config, mesh_xy=mesh_xy, print_fn=print0)
-    eqp2_result = None
-    if config.eqp2.enabled:
-        from .sc_iteration import run_fixed_sigma_evsc
-        with timing.section("gw_jax.eqp2_evsc", announce=True,
-                            label="fixed-Sigma eigenvalue self-consistency"):
-            eqp2_result = run_fixed_sigma_evsc(
-                sigma_result, kin_ion, enk_dft,
-                config=config, meta=meta, band_slices=band_slices, wfn=wfn,
-                mesh_xy=mesh_xy, sym=sym, print_fn=print0)
-    return (enk_dft, eqp2_result, final_static_head_terms, kin_ion, rotations_written, sc_result, sigma_result, sigma_total)
+    return (enk_dft, final_static_head_terms, kin_ion, rotations_written, sc_result, sigma_result, sigma_total)
 
 
 def _sigma_output_fields(
@@ -1006,17 +996,14 @@ def _sigma_output_fields(
     omega_dft_rel_ev    = sigma_result.omega_dft_rel_ev
     e_eval_ev           = sigma_result.e_eval_ev
     efermi_dft_ev       = sigma_result.efermi_dft_ev
-    sigma_c_omega       = sigma_result.sigma_c_omega_kij_ry
-    head_sigma_diag_w_kn_ry = (
-        sc_result.head_sigma_diag_dft_w_kn_ry
-        if qp_solver is QPSolver.SELF_CONSISTENT
-        else sigma_result.head_sigma_diag_w_kn_ry)
-    omega_grid_ev = (
-        np.asarray(sigma_result.omega_grid_ev, dtype=np.float64)
-        if sigma_result.omega_grid_ev is not None else None)
-    omega_grid_ry = (
-        np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
-        if sigma_result.omega_grid_ry is not None else None)
+    # The dynamic head at E_DFT (the on-shell ``dft0`` table), for the
+    # debug tables; an SC run has no DFT-basis Sigma_c(E_DFT) on shell.
+    head_at_dft_ry = None
+    head = sigma_result.head_sigma_diag_w_kn_ry
+    if (qp_solver is not QPSolver.SELF_CONSISTENT and head is not None
+            and sigma_result.sigma_c_on_shell is not None):
+        request = sigma_result.sigma_c_on_shell.request
+        head_at_dft_ry = head.on_shell(request.tables_ry[request.slot("dft0")])[0]
     # Average extracted reporting arrays only. Keep every full operator
     # intact for diagonalization, including the one-shot Hamiltonian.
     if not config.no_degen_averaging:
@@ -1048,9 +1035,8 @@ def _sigma_output_fields(
                 sigma_coh_diag=_average_head_diag(
                     final_static_head_terms.sigma_coh_diag),
             )
-        if head_sigma_diag_w_kn_ry is not None:
-            head_sigma_diag_w_kn_ry = _average_head_diag(
-                head_sigma_diag_w_kn_ry)
+        if head_at_dft_ry is not None:
+            head_at_dft_ry = _average_head_diag(head_at_dft_ry)
         photon_head_sigma_diag_tskn_ry = average_within_degenerate_sets(
             np.asarray(photon_head_sigma_diag_tskn_ry),
             energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
@@ -1065,7 +1051,7 @@ def _sigma_output_fields(
         sig_x_diag_ry * RYD_TO_EV
         + sigma_c_at_dft_ev
         if sigma_c_at_dft_ev is not None else None)
-    return (e_eval_ev, efermi_dft_ev, final_static_head_terms, h_transverse, head_sigma_diag_w_kn_ry, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, sig_coh, sig_h, sig_h_scalar, sig_sx, sig_x, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev, sigma_c_omega, sigma_lorentz_skij_ry, sigma_omega_h5_path, sigma_total, sigma_xc_at_dft_ev)
+    return (e_eval_ev, efermi_dft_ev, final_static_head_terms, h_transverse, head_at_dft_ry, omega_dft_rel_ev, photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, sig_coh, sig_h, sig_h_scalar, sig_sx, sig_x, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev, sigma_lorentz_skij_ry, sigma_omega_h5_path, sigma_total, sigma_xc_at_dft_ev)
 
 
 def _diagonalize_qp_hamiltonian(
@@ -1112,36 +1098,12 @@ def _diagonalize_qp_hamiltonian(
 
 
 def _sigma_diagnostic_fields(
-        config, enk_dft, final_static_head_terms, h_transverse, head_sigma_diag_w_kn_ry,
-        mesh_xy, mode, omega_dft_rel_ev, omega_grid_ev, photon_head_sigma_diag_tskn_ry,
-        sig_coh, sig_h, sig_h_scalar, sig_sx, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
-        sigma_c_omega, sigma_lorentz_skij_ry, sigma_result, sigma_xc_at_dft_ev):
+        config, enk_dft, final_static_head_terms, h_transverse, head_at_dft_ry,
+        mesh_xy, mode, photon_head_sigma_diag_tskn_ry,
+        sig_coh, sig_h, sig_h_scalar, sig_sx, sigma_c_at_dft_ev,
+        sigma_lorentz_skij_ry, sigma_xc_at_dft_ev):
     """Produce the existing host diagnostic diagonals and head-sector split."""
     from gw.qsgw_utils import static_sigma_diag_to_host
-    if sigma_c_omega is not None:
-        # The (n_omega, nk, nb) diagonal is read only by the writers, which
-        # run on the reporting rank: the other ranks keep no host copy.
-        sigma_c_omega_diag_ev = extract_sigma_diag_logical(
-            sigma_c_omega, mesh_xy,
-            band_axis=sigma_result.sigma_band_axis,
-            host=jax.process_index() == 0)
-        if sigma_c_omega_diag_ev is not None:
-            sigma_c_omega_diag_ev = sigma_c_omega_diag_ev * RYD_TO_EV
-        if not config.no_degen_averaging:
-            if sigma_c_omega_diag_ev is not None:
-                sigma_c_omega_diag_ev = average_within_degenerate_sets(
-                    sigma_c_omega_diag_ev,
-                    energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-                    tol_ry=float(config.degen_avg_tol_ry))
-            if sigma_c_odd_at_dft_ev is not None:
-                sigma_c_odd_at_dft_ev = average_within_degenerate_sets(
-                    np.asarray(sigma_c_odd_at_dft_ev),
-                    energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-                    tol_ry=float(config.degen_avg_tol_ry))
-        omega_rel_ev = omega_grid_ev
-    else:
-        sigma_c_omega_diag_ev = None
-        omega_rel_ev = None
     sigma_c_diag_at_dft_ry = (
         sigma_c_at_dft_ev / RYD_TO_EV
         if (mode.is_dynamic and sigma_c_at_dft_ev is not None)
@@ -1163,15 +1125,9 @@ def _sigma_diagnostic_fields(
             if charge_head.ndim == 1:
                 charge_head = np.broadcast_to(
                     charge_head, np.asarray(enk_dft).shape)
-        if mode.is_dynamic and head_sigma_diag_w_kn_ry is not None:
-            from .qsgw_utils import interp_along_omega
-            charge_corr = interp_along_omega(
-                np.asarray(head_sigma_diag_w_kn_ry),
-                np.asarray(omega_grid_ev), np.asarray(omega_dft_rel_ev),
-                context="charge-head Sigma_c at E_DFT",
-                print_fn=lambda *args, **kwargs: None)
-            charge_head = (charge_corr if charge_head is None
-                           else charge_head + charge_corr)
+        if mode.is_dynamic and head_at_dft_ry is not None:
+            charge_head = (head_at_dft_ry if charge_head is None
+                           else charge_head + head_at_dft_ry)
         if charge_head is not None:
             head_sigma_split_skn_ry[0] += charge_head
     sig_sx_diag_ry = static_sigma_diag_to_host(sig_sx, mesh_xy)
@@ -1208,73 +1164,48 @@ def _sigma_diagnostic_fields(
             sigma_lorentz_diag_skn_ry[0] = (
                 _output_total_ry - sigma_lorentz_diag_skn_ry[1]
                 - sigma_lorentz_diag_skn_ry[2])
-    return (h_transverse_diag_ry, head_sigma_split_skn_ry, omega_rel_ev, sig_coh_diag_ry, sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry, sigma_c_odd_at_dft_ev, sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry)
+    return (h_transverse_diag_ry, head_sigma_split_skn_ry, sig_coh_diag_ry, sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry, sigma_lorentz_diag_skn_ry)
 
 
 def _attach_raw_sigma(results, config, enk_dft, sigma_result):
-    """Carry the raw (no band tail) Σ_c diagonals, conditioned as the main pair.
+    """Carry the on-shell eqp operand and its raw (no band tail) twin, averaged.
 
-    Same unit conversion and degenerate-set averaging as
-    ``_sigma_output_fields``/``_sigma_diagnostic_fields`` apply to the
-    extrapolated pair, so the raw columns equal an extrapolation-off run's.
+    Same degenerate-set averaging as ``_sigma_output_fields`` applies to the
+    extrapolated diagonals, so the raw columns equal an extrapolation-off run's.
     """
-    import dataclasses
-    if sigma_result.sigma_c_on_shell_diag is not None:
-        # On shell: the eqp operand and its raw twin, averaged within
-        # degenerate sets as the curve is.
-        return dataclasses.replace(
-            results,
-            sigma_c_on_shell_diag=_averaged_on_shell(
-                sigma_result.sigma_c_on_shell_diag, config, enk_dft),
-            sigma_c_on_shell_diag_raw=_averaged_on_shell(
-                sigma_result.sigma_c_on_shell_diag_unextrap, config, enk_dft))
-    raw_omega_ry = sigma_result.sigma_c_omega_diag_unextrap_ry
-    raw_at_dft_ev = sigma_result.sigma_c_at_dft_diag_unextrap_ev
-    if raw_omega_ry is None or raw_at_dft_ev is None:
-        return results
-    raw_omega_ev = np.asarray(raw_omega_ry) * RYD_TO_EV
-    raw_at_dft_ev = np.asarray(raw_at_dft_ev, dtype=np.complex128)
-    if not config.no_degen_averaging:
-        energies = np.asarray(enk_dft, dtype=np.float64)
-        tol = float(config.degen_avg_tol_ry)
-        raw_omega_ev = average_within_degenerate_sets(
-            raw_omega_ev, energies_kn_ry=energies, tol_ry=tol)
-        raw_at_dft_ev = average_within_degenerate_sets(
-            raw_at_dft_ev, energies_kn_ry=energies, tol_ry=tol)
     import dataclasses
     return dataclasses.replace(
-        results, sigma_c_omega_diag_raw_ev=raw_omega_ev,
-        sigma_c_diag_at_dft_raw_ry=raw_at_dft_ev / RYD_TO_EV)
+        results,
+        sigma_c_on_shell_diag=_averaged_on_shell(
+            sigma_result.sigma_c_on_shell_diag, config, enk_dft),
+        sigma_c_on_shell_diag_raw=_averaged_on_shell(
+            sigma_result.sigma_c_on_shell_diag_unextrap, config, enk_dft))
 
 
-def _averaged_on_shell(diag, config, enk_dft):
+def _averaged_on_shell(operand, config, enk_dft):
     """An on-shell eqp operand averaged within degenerate sets (None passes through).
 
-    The three complex members are averaged exactly as the grid's diagonal
-    curve is, so Z is formed from the averaged derivative as the grid formed
-    it from the averaged curve; the coverage mask is a per-state fact.
+    Its three complex rows (``eqp_bgw.ON_SHELL_AT_DFT`` ... ``ON_SHELL_DSIGMA``)
+    are averaged, so Z is formed from the averaged derivative; the coverage
+    row is a per-state fact.
     """
-    if diag is None or config.no_degen_averaging:
-        return diag
-    import dataclasses
+    if operand is None or config.no_degen_averaging:
+        return operand
     energies = np.asarray(enk_dft, dtype=np.float64)
     tol = float(config.degen_avg_tol_ry)
-
-    def avg(a):
-        return average_within_degenerate_sets(
-            np.asarray(a, dtype=np.complex128), energies_kn_ry=energies, tol_ry=tol)
-    return dataclasses.replace(diag, at_dft_ev=avg(diag.at_dft_ev),
-                               at_eval_ev=avg(diag.at_eval_ev),
-                               dsigma_at_eval=avg(diag.dsigma_at_eval))
+    rows = [average_within_degenerate_sets(
+        np.asarray(row, dtype=np.complex128), energies_kn_ry=energies, tol_ry=tol)
+        for row in operand[:3]]
+    return np.stack(rows + [operand[3]])
 
 
 def _assemble_gw_results(
-        E_full, U_full, band_slices, config, e_eval_ev, efermi_dft_ev, enk_dft, eqp2_result,
-        h_transverse, h_transverse_diag_ry, kin_ion, mode, omega_rel_ev,
+        E_full, U_full, band_slices, config, e_eval_ev, efermi_dft_ev, enk_dft,
+        h_transverse, h_transverse_diag_ry, kin_ion, mode,
         photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, qp_solver, sig_coh,
         sig_coh_diag_ry, sig_h, sig_h_diag_ry, sig_h_scalar, sig_h_scalar_diag_ry, sig_sx,
         sig_sx_diag_ry, sig_x, sig_x_diag_ry, sigma_c_diag_at_dft_ry, sigma_c_odd_at_dft_ev,
-        sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry, sigma_omega_h5_path, sigma_result,
+        sigma_lorentz_diag_skn_ry, sigma_omega_h5_path, sigma_result,
         sigma_xc_at_dft_ev, tensors_filename):
     """Produce the existing GW result record from resolved output fields."""
     results = GWResults(
@@ -1301,20 +1232,10 @@ def _assemble_gw_results(
         sigma_kset=sigma_result.kset,
         sigma_c_diag_at_dft_ry=sigma_c_diag_at_dft_ry,
         sigma_xc_at_dft_ev=sigma_xc_at_dft_ev,
-        sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
-        omega_rel_ev=omega_rel_ev,
         e_eval_ev=e_eval_ev,
         efermi_ev=efermi_dft_ev,
         sigma_omega_h5_path=sigma_omega_h5_path,
         tensors_filename=tensors_filename,
-        E_eqp2_ry=(None if eqp2_result is None
-                     else np.asarray(eqp2_result.energies_ry)),
-        eqp2_iterations=(None if eqp2_result is None
-                         else int(eqp2_result.iterations)),
-        eqp2_residual_ev=(None if eqp2_result is None
-                          else float(eqp2_result.residual_ev)),
-        eqp2_tol_ev=(None if eqp2_result is None
-                     else float(config.eqp2.tol_ev)),
         photon_head_sigma_diag_tskn_ry=np.asarray(
             photon_head_sigma_diag_tskn_ry),
         photon_head_sigma_basis=photon_head_sigma_basis,
@@ -1327,17 +1248,16 @@ def _assemble_gw_results(
 
 
 def _write_gw_results(
-        _t_out, config, e_eval_ev, final_static_head_terms, head_sigma_diag_w_kn_ry,
-        input_dir, meta, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, print0, qp_solver,
-        results, rotations_written, sigma_c_omega, sym, wfn):
+        _t_out, config, e_eval_ev, final_static_head_terms, head_at_dft_ry,
+        input_dir, meta, omega_dft_rel_ev, print0, qp_solver,
+        results, rotations_written, sym, wfn):
     """Write the QP and diagnostic results on the reporting rank."""
     if meta.rank == 0:
         write_freq_debug(
             results, config=config,
             static_head_terms=final_static_head_terms,
             omega_dft_rel_ev=omega_dft_rel_ev,
-            head_sigma_diag_w_kn_ry=head_sigma_diag_w_kn_ry,
-            omega_grid_ry=omega_grid_ry,
+            head_at_dft_ry=head_at_dft_ry,
             sym=sym, file_sym=wfn.symmetry(),
             e_eval_ev=e_eval_ev,
             print_fn=print0,
@@ -1345,8 +1265,6 @@ def _write_gw_results(
         write_qsgw_qp_ladders(
             results, config=config,
             e_qp_ry=results.E_qp_ry,
-            omega_grid_ev=omega_grid_ev,
-            sigma_c_omega=sigma_c_omega,
             print_fn=print0,
         )
         write_results(
@@ -1354,7 +1272,6 @@ def _write_gw_results(
             sigma_diag_file=config.paths.sigma_diag_file,
             eqp0_file=config.paths.eqp0_file,
             eqp1_file=config.paths.eqp1_file,
-            eqp2_file=config.paths.eqp2_file,
             input_dir=input_dir,
             kgrid=meta.kgrid,
             sym=sym,
@@ -1393,7 +1310,7 @@ def _close_timing(_pre_main, _t_main, meta, print0):
 
 
 def _report_final_observables(
-        E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
+        E_full, band_slices, config, enk_dft, head_sigma_split_skn_ry,
         q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
         sigma_lorentz_diag_skn_ry, sigma_result):
     """Report the final Sigma coverage, sector summaries and QP gaps."""
@@ -1461,13 +1378,6 @@ def _report_final_observables(
     report.qp_gap(
         band_slices=band_slices, e_dft_ry=enk_dft,
         e_qp_ry=E_full)
-    if eqp2_result is not None:
-        report.eqp2_summary(
-            band_slices=band_slices,
-            e_eqp2_ry=eqp2_result.energies_ry,
-            iterations=eqp2_result.iterations,
-            residual_ev=eqp2_result.residual_ev,
-            tol_ev=config.eqp2.tol_ev)
 
 
 def _published_artifacts(rows, *, print_fn):
@@ -1544,10 +1454,6 @@ def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tens
             os.path.join(input_dir, "WFN_qp.h5")) else "absent",
          os.path.join(input_dir, "WFN_qp.h5")),
     ]
-    if config.eqp2.enabled:
-        _file_rows.append((
-            "fixed-Sigma evSC energies", "written" if os.path.exists(
-                config.paths.eqp2_file) else "absent", config.paths.eqp2_file))
     if config.paths.centroids_file_current:
         _file_rows.insert(3, (
             "current centroids", "read", config.paths.centroids_file_current))
@@ -1657,7 +1563,7 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    wfns_transverse)
 	(kin_ion) = _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn)
 	(
-	    enk_dft, eqp2_result, final_static_head_terms, kin_ion, rotations_written, sc_result,
+	    enk_dft, final_static_head_terms, kin_ion, rotations_written, sc_result,
 	    sigma_result, sigma_total) = _solve_qp_stage(
 	    V_q, band_slices, bispinor_v_q_path, centroid_indices, config, e_ref, enk_dft,
 	    head_resolver, input_dir, isdf, kin_ion, material_class, mesh_xy, meta, print0,
@@ -1665,9 +1571,9 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    wfns_sigma, wfns_transverse)
 	(
 	    e_eval_ev, efermi_dft_ev, final_static_head_terms, h_transverse,
-	    head_sigma_diag_w_kn_ry, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry,
+	    head_at_dft_ry, omega_dft_rel_ev,
 	    photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, sig_coh, sig_h, sig_h_scalar,
-	    sig_sx, sig_x, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev, sigma_c_omega,
+	    sig_sx, sig_x, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
 	    sigma_lorentz_skij_ry, sigma_omega_h5_path, sigma_total, sigma_xc_at_dft_ev) = _sigma_output_fields(
 	    config, enk_dft, final_static_head_terms, mesh_xy, qp_solver, sc_result, sigma_result,
 	    sigma_total)
@@ -1676,29 +1582,29 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn,
 	    sc_result)
 	(
-	    h_transverse_diag_ry, head_sigma_split_skn_ry, omega_rel_ev, sig_coh_diag_ry,
+	    h_transverse_diag_ry, head_sigma_split_skn_ry, sig_coh_diag_ry,
 	    sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry,
-	    sigma_c_odd_at_dft_ev, sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry) = _sigma_diagnostic_fields(
-	    config, enk_dft, final_static_head_terms, h_transverse, head_sigma_diag_w_kn_ry,
-	    mesh_xy, mode, omega_dft_rel_ev, omega_grid_ev, photon_head_sigma_diag_tskn_ry, sig_coh,
-	    sig_h, sig_h_scalar, sig_sx, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev, sigma_c_omega,
-	    sigma_lorentz_skij_ry, sigma_result, sigma_xc_at_dft_ev)
+	    sigma_lorentz_diag_skn_ry) = _sigma_diagnostic_fields(
+	    config, enk_dft, final_static_head_terms, h_transverse, head_at_dft_ry,
+	    mesh_xy, mode, photon_head_sigma_diag_tskn_ry, sig_coh,
+	    sig_h, sig_h_scalar, sig_sx, sigma_c_at_dft_ev,
+	    sigma_lorentz_skij_ry, sigma_xc_at_dft_ev)
 	(
 	    results) = _assemble_gw_results(
-	    E_full, U_full, band_slices, config, e_eval_ev, efermi_dft_ev, enk_dft, eqp2_result,
-	    h_transverse, h_transverse_diag_ry, kin_ion, mode, omega_rel_ev,
+	    E_full, U_full, band_slices, config, e_eval_ev, efermi_dft_ev, enk_dft,
+	    h_transverse, h_transverse_diag_ry, kin_ion, mode,
 	    photon_head_sigma_basis, photon_head_sigma_diag_tskn_ry, qp_solver, sig_coh,
 	    sig_coh_diag_ry, sig_h, sig_h_diag_ry, sig_h_scalar, sig_h_scalar_diag_ry, sig_sx,
 	    sig_sx_diag_ry, sig_x, sig_x_diag_ry, sigma_c_diag_at_dft_ry, sigma_c_odd_at_dft_ev,
-	    sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry, sigma_omega_h5_path, sigma_result,
+	    sigma_lorentz_diag_skn_ry, sigma_omega_h5_path, sigma_result,
 	    sigma_xc_at_dft_ev, tensors_filename)
 	_write_gw_results(
-	    _t_out, config, e_eval_ev, final_static_head_terms, head_sigma_diag_w_kn_ry, input_dir,
-	    meta, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, print0, qp_solver, results,
-	    rotations_written, sigma_c_omega, sym, wfn)
+	    _t_out, config, e_eval_ev, final_static_head_terms, head_at_dft_ry, input_dir,
+	    meta, omega_dft_rel_ev, print0, qp_solver, results,
+	    rotations_written, sym, wfn)
 	(_wall) = _close_timing(_pre_main, _t_main, meta, print0)
 	_report_final_observables(
-	    E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
+	    E_full, band_slices, config, enk_dft, head_sigma_split_skn_ry,
 	    q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
 	    sigma_lorentz_diag_skn_ry, sigma_result)
 	(

@@ -1890,7 +1890,6 @@ def read_eqp_assembly_receipt(filepath):
 		EQP_ASSEMBLY_SCHEMA_VERSION_ATTR,
 		EQP_ASSEMBLY_STATE_ATTR,
 		EQP_ASSEMBLY_STATE_READY,
-		OMEGA_DATASET,
 		SIGMA_DIRECT_COMPONENT_DATASETS,
 		SIGMA_EVAL_DATASET,
 		SIGMA_OPERATOR_STATE_ATTR,
@@ -1913,20 +1912,22 @@ def read_eqp_assembly_receipt(filepath):
 		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
 			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
 		canonical_present = EQP_ASSEMBLY_DATASET in h5
-		on_shell = EQP_ASSEMBLY_C_ONSHELL_DATASET in h5
-		curve_name = (EQP_ASSEMBLY_C_ONSHELL_DATASET if on_shell
-		              else EQP_ASSEMBLY_C_OMEGA_DATASET)
-		if on_shell and EQP_ASSEMBLY_C_OMEGA_DATASET in h5:
+		retired = [name for name in (EQP_ASSEMBLY_C_OMEGA_DATASET,
+		                             EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET) if name in h5]
+		if retired:
 			raise ValueError(
-				f"{os.path.basename(abs_path)} carries both a C(omega) curve and an "
-				"on-shell EQP operand; refusing an ambiguous receipt.")
+				f"GATE omega_grid_receipt_retired: {os.path.basename(abs_path)} carries "
+				f"{retired[0]}, the C(omega) receipt of the retired omega-grid Sigma "
+				"evaluation (sigma_omega_grid_debug); it is no longer read.  Regenerate "
+				"the file with the current driver (UPGRADE_NOTES.md, 'Sigma_c on shell "
+				"only').")
+		curve_name = EQP_ASSEMBLY_C_ONSHELL_DATASET
 		curve_present = curve_name in h5
 		components_present = EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET in h5
 		raw_component_present = any(
 			name in h5 for name in SIGMA_DIRECT_COMPONENT_DATASETS)
 		candidate_names = [name for name in (
 			EQP_ASSEMBLY_CANDIDATE_DATASET,
-			EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
 			EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET,
 			EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET) if name in h5]
 		new_schema = bool(
@@ -2071,21 +2072,13 @@ def read_eqp_assembly_receipt(filepath):
 			_assert_direct_field_sum(
 				np.real(values[0]), np.real(h_components[0]),
 				np.real(h_components[1]), where="persisted EQP receipt")
-		if (c_omega.ndim != 3 or c_omega.shape[1:] != values.shape[1:]
-				or (on_shell and c_omega.shape[0] != 4)
+		if (c_omega.shape != (4,) + values.shape[1:]
 				or not np.all(np.isfinite(c_omega))):
 			raise ValueError(
 				f"malformed {curve_name} shape "
 				f"{c_omega.shape} for H/X/C {values.shape}, or non-finite values.")
-		omega_rel_ev, omega_reference_ev, omega_reference_provenance = (
-			_omega_metadata_from_open_h5(h5))
-		if on_shell:
-			pass
-		elif omega_rel_ev is None or omega_rel_ev.shape != (c_omega.shape[0],):
-			raise ValueError(
-				f"{EQP_ASSEMBLY_C_OMEGA_DATASET} has {c_omega.shape[0]} omega "
-				f"rows but {OMEGA_DATASET!r} is absent or has shape "
-				f"{None if omega_rel_ev is None else omega_rel_ev.shape}.")
+		omega_reference_ev, omega_reference_provenance = (
+			_omega_reference_from_open_h5(h5))
 		if (file_rows.ndim != 1 or file_rows.shape[0] != values.shape[1]
 				or (file_rows.size and np.min(file_rows) < 0)
 				or np.unique(file_rows).size != file_rows.size):
@@ -2128,10 +2121,8 @@ def read_eqp_assembly_receipt(filepath):
 				None if h_components is None else np.real(h_components[1])),
 			"sigma_x_diag_ev": np.real(values[1]),
 			"sigma_c_at_dft_diag_ev": values[2],
-			"sigma_c_omega_diag_ev": None if on_shell else c_omega,
-			# On shell: C(E_DFT), C(E_eval), dC/domega, coverage (rows).
-			"sigma_c_on_shell": c_omega if on_shell else None,
-			"omega_rel_ev": omega_rel_ev,
+			# C(E_DFT), C(E_eval), dC/domega, coverage (eqp_bgw.ON_SHELL_*).
+			"sigma_c_on_shell": c_omega,
 			"omega_reference_ev": omega_reference_ev,
 			"omega_reference_provenance": omega_reference_provenance,
 			"eval_energies_rel_ev": eval_rel_ev,
@@ -2704,9 +2695,9 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
 
 	``k_axis`` names WHICH axis of the stored dataset is the k axis, and
 	it exists because ``sigma_mnk.h5``'s dynamic cubes are
-	``(n_omega, nk, nb, nb)`` — axis 0 there is frequency, and a check
-	that read ``shape[0]`` would compare the star count against the
-	frequency count and refuse every correctly-written cube.  It defaults
+	``(2, nk, nb, nb)`` — axis 0 there is the on-shell pair slot, and a
+	check that read ``shape[0]`` would compare the star count against the
+	slot count and refuse every correctly-written cube.  It defaults
 	to 0, which is every ``kin_ion.h5`` array, so no existing caller
 	changes.  ONE implementation of the stamp contract for both files was
 	the point: a second copy in ``sigma_output`` would be a second place
@@ -2823,32 +2814,24 @@ def _eval_metadata_from_open_h5(h5):
 	return arr, str(prov), cov
 
 
-def _omega_metadata_from_open_h5(h5):
-	"""Return the small omega axis plus its optional reference stamps."""
+def _omega_reference_from_open_h5(h5):
+	"""The omega reference stamp ``(ref_ev, provenance)`` of an on-shell file.
+
+	It rides on the ``pair`` table's evaluation energies (no omega axis).
+	"""
 	from file_io.sigma_output import (
-		OMEGA_DATASET,
+		ON_SHELL_ENERGIES_DATASET,
 		OMEGA_REFERENCE_ATTR,
 		OMEGA_REFERENCE_PROVENANCE_ATTR,
 	)
-	from file_io.sigma_output import ON_SHELL_ENERGIES_DATASET
-	on_shell_axis = ON_SHELL_ENERGIES_DATASET.format(table="pair")
-	if OMEGA_DATASET not in h5:
-		if on_shell_axis not in h5:
-			return None, None, None
-		# An on-shell file has no omega axis; its reference rides on the
-		# evaluation energies.
-		ds = h5[on_shell_axis]
-		omega = None
-	else:
-		ds = h5[OMEGA_DATASET]
-		omega = np.asarray(ds[()], dtype=np.float64)
-	if OMEGA_REFERENCE_ATTR not in ds.attrs:
-		return omega, None, None
-	ref = float(ds.attrs[OMEGA_REFERENCE_ATTR])
+	name = ON_SHELL_ENERGIES_DATASET.format(table="pair")
+	if name not in h5 or OMEGA_REFERENCE_ATTR not in h5[name].attrs:
+		return None, None
+	ds = h5[name]
 	prov = ds.attrs.get(OMEGA_REFERENCE_PROVENANCE_ATTR, "unstated")
 	if isinstance(prov, bytes):
 		prov = prov.decode("utf-8")
-	return omega, ref, str(prov)
+	return float(ds.attrs[OMEGA_REFERENCE_ATTR]), str(prov)
 
 
 def open_pole_reader(src, *, mesh_xy, allow_partial=False, mode="r"):
