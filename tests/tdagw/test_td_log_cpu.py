@@ -40,10 +40,17 @@ CHUNK = re.compile(r"^  samples +(\d+)- *(\d+)  t = +([0-9.]+) as  wall +([0-9.]
 NATIVE_MISSING = ("Could not locate liblorrax_ffi", "FfiLibraryNotBuilt")
 
 
+#: Launcher variables the runtime reads to form a multi-process world; the child driver
+#: drops them, so it is one process with four host devices also inside a srun step.
+_LAUNCHER = ("SLURM_", "PMI_", "PMIX_", "OMPI_", "PALS_", "JAX_COORDINATOR", "JAX_NUM_PROCESSES",
+             "JAX_PROCESS_")
+
+
 def _env():
-    return dict(os.environ, JAX_PLATFORMS="cpu",
-                XLA_FLAGS="--xla_force_host_platform_device_count=4",
-                PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    env = {k: v for k, v in os.environ.items() if not k.startswith(_LAUNCHER)}
+    env.update(JAX_PLATFORMS="cpu", XLA_FLAGS="--xla_force_host_platform_device_count=4",
+               PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    return env
 
 
 @pytest.fixture(scope="module")

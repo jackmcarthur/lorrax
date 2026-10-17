@@ -326,7 +326,8 @@ class TdReport(ScientificProductionReport):
             pw = gate["power"]
             self.emit(f"  one dSigma call : {gate['dsigma_wall_s']:.4g} s (the gate's power "
                       f"iteration: {pw['dsigma']} calls in {pw['exec_s']:.3f} s; its compile, "
-                      f"{pw['compile_s']:.2f} s, excluded)")
+                      f"{pw['compile_s']:.2f} s, excluded; on a cold kernel cache it also holds "
+                      f"first-use kernel builds, which the summary's steady bound exposes)")
         else:
             self.emit(f"  one dSigma call : not timed (no stability gate for "
                       f"{cfg.method}); the summary bounds it by the steady step wall")
@@ -467,14 +468,21 @@ class TdReport(ScientificProductionReport):
                    f"{g_wall:.2f} of {total_wall:.2f} s ({100.0 * g_wall / max(total_wall, 1e-30):.1f} %)"
                    + ("; no gate for this method" if g is None else "")
                    + (f"; stiff basis {basis} calls" if b is not None else ""))
+        bound = np.mean(steady) / (prop / fs) if (steady and prop) else None
         if g is not None and g["power"]["dsigma"]:
             w = g["dsigma_wall_s"]
-            out.append(f"  dSigma wall     : {w:.4g} s per call (gate) x {prop} calls = "
-                       f"{w * prop:.2f} s, {100.0 * w * prop / max(stats['wall'], 1e-30):.0f} % "
-                       f"of the propagation wall")
-        elif steady and prop:
-            out.append(f"  dSigma wall     : <= {np.mean(steady) / (prop / fs):.4g} s per call "
-                       f"(steady s/fs over dSigma calls per fs; not timed alone without a gate)")
+            line = f"  dSigma wall     : {w:.4g} s per call (gate)"
+            if bound is not None:
+                line += (f"; the steady chunks bound it by <= {bound:.4g} s (s/fs over dSigma "
+                         f"calls per fs)" + ("; the gate's figure is above the bound, so it holds "
+                                             "first-use kernel builds" if w > bound else ""))
+                w = min(w, bound)
+            out.append(line)
+            out.append(f"  dSigma share    : ~{100.0 * min(w * prop / max(stats['wall'], 1e-30), 1.0):.0f} % "
+                       f"of the propagation wall ({prop} calls x {w:.4g} s)")
+        elif bound is not None:
+            out.append(f"  dSigma wall     : <= {bound:.4g} s per call (steady s/fs over dSigma calls "
+                       f"per fs; not timed alone without a gate)")
         dtr = [r["d_trace"] for r in rows if r["d_trace"] is not None]
         dpu = [r["d_purity"] for r in rows if r["d_purity"] is not None]
         if dtr:
