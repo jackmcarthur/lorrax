@@ -613,5 +613,62 @@ def test_input_reference_every_registered_table_can_fail():
         assert "`k_wrong` is documented" in "\n".join(twin), (name, twin)
 
 
+def test_input_reference_generated_table_can_fail():
+    """A ``DOC_TABLES`` section's table is generated whole from the parser's docs.
+
+    A hand-edited row is rewritten (so ``--check`` fails on the committed
+    page), a key without a docs entry and an entry without a key refuse, the
+    section's prose survives.  Red twin: without ``docs`` the same page goes
+    through the row check and keeps the hand edit.
+    """
+    tool = _load_input_reference_tool()
+    assert "td" in tool.DOC_TABLES
+    page = "\n".join([
+        "## TD-aGW — the `tdgw.toml` deck",
+        "prose before",
+        "| key | default | meaning | refused by |",
+        "|---|---|---|---|",
+        "| `lorrax.method` | `dp54` | hand-edited meaning | — |",
+        "",
+        "prose after",
+    ])
+    defaults = {"td": {"lorrax.method": "dp54", "lorrax.dt": None}}
+    docs = {"td": {"lorrax.method": ("", "The integrator.", ("td_method",)),
+                   "lorrax.gone": ("", "A stale entry.", ())}}
+    new, errors = tool.sync(page, defaults, "", docs=docs)
+    joined = "\n".join(errors)
+    assert "| `lorrax.method` | `dp54` | The integrator. | `td_method` |" in new, new
+    assert "hand-edited" not in new and "prose before" in new and "prose after" in new
+    assert "`lorrax.dt` (td deck) has no docs entry" in joined, joined
+    assert "`lorrax.gone` (td deck) has a docs entry but is not in" in joined, joined
+    bad = {"td": {"lorrax.method": ("", "", ()), "lorrax.dt": ("", "The step.", ())}}
+    _, errors = tool.sync(page, defaults, "", docs=bad)
+    assert any("meaning non-empty" in e for e in errors), errors
+    twin, twin_errors = tool.sync(page, defaults, "")
+    assert "hand-edited meaning" in twin
+    assert any("`lorrax.dt` (td deck) has no row" in e for e in twin_errors), twin_errors
+
+
+def test_td_key_docs_name_raised_refusals():
+    """Every refusal ``TD_KEY_DOCS`` names is raised by the TD-aGW sources.
+
+    The ids are read from the parser's literal (AST) and looked up as
+    ``GATE <id>`` or ``_gate("<id>"`` in ``src/tdagw``; a planted id is the
+    red twin.
+    """
+    tool = _load_input_reference_tool()
+    docs = tool.harvest_docs()["td"]
+    import glob
+    import re
+    text = "".join(open(f, encoding="utf-8").read()
+                   for f in glob.glob(os.path.join(_REPO, "src", "tdagw", "*.py")))
+    raised = {a or b for a, b in re.findall(r'GATE (td_[a-z0-9_]+)|_gate\("(td_[a-z0-9_]+)"', text)}
+    named = {g for _note, _meaning, gates in docs.values() for g in gates}
+    assert named, "no refusals named"
+    assert sorted(named - raised) == []
+    planted = named | {"td_no_such_refusal"}
+    assert sorted(planted - raised) == ["td_no_such_refusal"]
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

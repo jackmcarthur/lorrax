@@ -325,7 +325,8 @@ E\cdot[\mathbf r^\mathrm{intra}, \rho] - \Gamma\circ(\rho - \rho^\mathrm{eq})$
 with $H = \mathrm{diag}(E^\mathrm{QP}) + \mathbf E\cdot\mathbf r +
 \Delta\Sigma[\rho]$, in TDGW's units and conventions. It reads a TDGW deck,
 takes energies, k grid and dipoles from the header of a TDGW run, and writes
-`tdgw.h5` + `tdgw.toml` that `tdgw-pp` reads unchanged. The equation, the
+`tdgw.h5` + `tdgw.toml` that `tdgw-pp` reads unchanged, and one run log,
+`tdagw.out`, in `outdir` ([reading it](how-to/td-agw-run.md#log)). The equation, the
 integrators, the layout and the output are on
 [TD-aGW propagation](theory/td_agw_propagation.md); the whole chain, from the GW
 run to a drive, is [TD-aGW end to end](how-to/td-agw-workflow.md).

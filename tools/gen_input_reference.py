@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Keep docs/input_reference.md in step with the deck parsers.
 
-The page's meanings and prose are written by hand; its key set and its
-default column come from the parsers.  From the repo root::
+The page's prose is written by hand; its key set and its default column come
+from the parsers, and a table registered in ``DOC_TABLES`` (the TD-aGW deck)
+is generated whole: key, default, meaning and the refusals that name the key,
+all read from its parser.  From the repo root::
 
     python3 tools/gen_input_reference.py          # rewrite the default cells
     python3 tools/gen_input_reference.py --check  # exit 1 if the page differs
@@ -17,6 +19,12 @@ when a key has no row, when a key has two rows, or when a row names a key
 the parser no longer accepts; a row whose default cell is ``retired`` is
 allowed only if ``gw_config.py`` still refuses that key by name.
 ``tests/test_env_registry.py`` runs the check, so gate0 fails on drift.
+
+A ``DOC_TABLES`` section's table is replaced by the rendering of the parser's
+docs dict (``tdagw.td_config.TD_KEY_DOCS``: key -> (default note, meaning,
+refusals)), one row per defaults key in the parser's order; a key without an
+entry, an entry without a key, or a malformed entry refuses, and ``--check``
+fails on any hand edit of the rows.  Edit the parser, not the table.
 
 Default-cell grammar: ``HEAD``, ``HEAD (note)`` or ``HEAD — note``.  HEAD is
 the rendered code default: ``unset`` for None, `` `true` `` / `` `false` ``,
@@ -50,6 +58,15 @@ TABLES = (
     ("epsmat", "## Epsmat", REPO / "src" / "gw" / "epsmat_config.py",
      "EPSMAT_DEFAULTS"),
 )
+
+#: Tables generated whole from their parser: table -> (parser module, docs dict).
+#: The docs dict maps each defaults key to (default note, meaning, refusals).
+DOC_TABLES = {
+    "td": (REPO / "src" / "tdagw" / "td_config.py", "TD_KEY_DOCS"),
+}
+
+#: The header of a generated table.
+DOC_HEADER = ("| key | default | meaning | refused by |", "|---|---|---|---|")
 
 
 def _module_consts(path):
@@ -115,6 +132,45 @@ def harvest_tables(tables=TABLES):
             for name, _heading, path, const in tables}
 
 
+def harvest_docs(doc_tables=DOC_TABLES):
+    """``{table: docs}`` for every ``DOC_TABLES`` row, read by AST (no import)."""
+    return {name: harvest_defaults(path, const)
+            for name, (path, const) in doc_tables.items()}
+
+
+def _cell(text):
+    """One table cell: a pipe that is not already escaped is escaped."""
+    return re.sub(r"(?<!\\)\|", r"\\|", " ".join(str(text).split()))
+
+
+def doc_rows(defaults, docs, table):
+    """(generated rows, refusals) of a ``DOC_TABLES`` table, in the parser's order."""
+    errors = []
+    rows = []
+    for key in sorted(set(docs) - set(defaults)):
+        errors.append(f"`{key}` ({table} deck) has a docs entry but is not in the "
+                      f"parser's defaults; delete the entry")
+    for key, default in defaults.items():
+        entry = docs.get(key)
+        if entry is None:
+            errors.append(f"`{key}` ({table} deck) has no docs entry; add one to the "
+                          f"parser's docs dict")
+            continue
+        if not (isinstance(entry, tuple) and len(entry) == 3
+                and isinstance(entry[0], str) and isinstance(entry[1], str) and entry[1]
+                and isinstance(entry[2], tuple)
+                and all(isinstance(g, str) and g for g in entry[2])):
+            errors.append(f"`{key}` ({table} deck): a docs entry is (default note, "
+                          f"meaning, refusals tuple), meaning non-empty")
+            continue
+        note, meaning, refusals = entry
+        head = render_default(default)
+        cell = f"{head} ({note})" if note else head
+        refused = ", ".join(f"`{g}`" for g in refusals) or "—"
+        rows.append(f"| `{key}` | {_cell(cell)} | {_cell(meaning)} | {refused} |")
+    return rows, errors
+
+
 def render_default(v):
     if v is None:
         return "unset"
@@ -133,12 +189,16 @@ _CELL_SPLIT = re.compile(r"(?<!\\)\|")
 _HEAD = re.compile(r"^(.*?)((?:\s+\(|\s+—).*)?$")
 
 
-def sync(text, defaults, config_source, tables=TABLES):
+def sync(text, defaults, config_source, tables=TABLES, docs=None):
     """Return (page with generated default heads, list of refusals).
 
     ``defaults`` maps ``TABLES`` names to their parser's defaults; a table it
     leaves out is empty, so every row in that section refuses as unknown.
     ``config_source`` is ``gw_config.py``'s text (the ``retired`` rule).
+    ``docs`` maps ``DOC_TABLES`` names to their parser's docs dict: such a
+    section's first table is replaced by :func:`doc_rows` (its header,
+    separator and rows; the section's prose is kept) and a section without a
+    table refuses.
     """
     names = [row[0] for row in tables]
     stray = sorted(set(defaults) - set(names))
@@ -148,15 +208,34 @@ def sync(text, defaults, config_source, tables=TABLES):
     headings = [(heading, name) for name, heading, _path, _const in tables
                 if heading]
     errors = []
+    docs = dict(docs or {})
+    stray = sorted(set(docs) - set(names))
+    if stray:
+        raise ValueError(f"sync: doc tables {stray} are not in the registry {names}")
+    generated = set()
     seen = {name: {} for name in names}
     default_col = None
     out = []
     table = names[0]
+    skipping = False
     for lineno, line in enumerate(text.split("\n"), 1):
         for heading, name in headings:
             if line.startswith(heading):
                 table = name
+                skipping = False
                 break
+        if skipping:
+            if line.startswith("|"):
+                continue
+            skipping = False
+        if table in docs and table not in generated and line.startswith("| key |"):
+            rows, errs = doc_rows(defaults[table], docs[table], table)
+            errors += errs
+            out.extend(DOC_HEADER + tuple(rows))
+            generated.add(table)
+            seen[table] = dict.fromkeys(defaults[table], lineno)
+            skipping = True
+            continue
         cells = _CELL_SPLIT.split(line)
         if len(cells) > 2 and cells[1].strip() == "key":
             heads = [c.strip() for c in cells]
@@ -183,7 +262,11 @@ def sync(text, defaults, config_source, tables=TABLES):
         note = _HEAD.match(cell).group(2) or ""
         cells[default_col] = f" {render_default(defaults[table][key])}{note} "
         out.append("|".join(cells))
+    for table in sorted(set(docs) - generated):
+        errors.append(f"the {table} deck's section has no `| key |` table to generate")
     for table, table_defaults in defaults.items():
+        if table in docs:
+            continue
         for key in table_defaults:
             if key not in seen[table]:
                 errors.append(f"`{key}` ({table} deck) has no row; add one by "
@@ -194,11 +277,11 @@ def sync(text, defaults, config_source, tables=TABLES):
 def problems():
     """Every way the committed page differs from the parsers (empty = in step)."""
     text = OUT.read_text()
-    new, errors = sync(text, harvest_tables(), CONFIG.read_text())
+    new, errors = sync(text, harvest_tables(), CONFIG.read_text(), docs=harvest_docs())
     if not errors and new != text:
         diff = difflib.unified_diff(text.split("\n"), new.split("\n"),
                                     "committed", "generated", lineterm="", n=0)
-        errors.append("default cells differ from the parser; run "
+        errors.append("default cells or generated tables differ from the parser; run "
                       "python3 tools/gen_input_reference.py\n" + "\n".join(diff))
     return errors, new
 
@@ -206,7 +289,7 @@ def problems():
 def main(argv):
     check = "--check" in argv
     errors, new = problems()
-    refusals = [e for e in errors if not e.startswith("default cells differ")]
+    refusals = [e for e in errors if not e.startswith("default cells")]
     if refusals or (check and errors):
         print("gen_input_reference: docs/input_reference.md is out of step:")
         for e in errors:

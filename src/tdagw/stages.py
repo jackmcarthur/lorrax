@@ -23,7 +23,7 @@ from tdagw.td_config import TdDeck
 
 __all__ = ["TdSystem", "load_system", "build_self_energy", "open_outputs",
            "sample_spec", "restart_fingerprint", "load_checkpoint", "propagate",
-           "describe", "summarize"]
+           "describe", "describe_rows", "output_files", "summarize"]
 
 
 class TdSystem(NamedTuple):
@@ -47,6 +47,7 @@ class TdSystem(NamedTuple):
     receipts: dict = None
 
 
+@timing.timed("tdagw.system")
 def load_system(deck: TdDeck, mesh) -> TdSystem:
     """The header (``load_header_from``, or built from a GW bundle) and Eq. (1)-(2)."""
     v = deck.values
@@ -121,6 +122,7 @@ def _projector(kw: dict, hdr: dict) -> np.ndarray:
     return A[:n]
 
 
+@timing.timed("tdagw.self_energy")
 def build_self_energy(deck: TdDeck, system: TdSystem, mesh) -> SelfEnergyModel:
     """The dSigma[rho] model the deck names (``[lorrax] model``)."""
     v = deck.values
@@ -203,6 +205,7 @@ def sample_spec(deck: TdDeck, system: TdSystem) -> tp.SampleSpec:
     return tp.SampleSpec(kinds=tuple(kinds))
 
 
+@timing.timed("tdagw.outputs")
 def open_outputs(deck: TdDeck, system: TdSystem) -> TdOutputs:
     """``tdgw.h5`` + ``tdgw.toml`` per trial (outdir, or outdir/trial-<i>)."""
     v = deck.values
@@ -379,10 +382,15 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
     0.01 as; magnus2: dt_measure / n).  The whole_rho frame of magnus2 has no
     recurrence (its predictor extrapolates the lab-frame dSigma): the probe
     alone decides, and 'auto' starts at dt_measure.  Returns (cfg with dt, the
-    receipt).
+    receipt): sigma, the static limit, every probe (step, growth, wall), the
+    power iteration's measured walls (its program compiled ahead of time, so
+    exec / calls is the wall of one dSigma call), the gate's exact dSigma
+    count and wall, and the settings it judged.
     """
     T = tdgw_io.T_IN_ATTOSEC
-    sigma, est = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0)
+    t_gate = time.perf_counter()
+    sigma, est, power = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0,
+                                           timed=True)
     if not np.isfinite(sigma):
         raise ValueError(
             f"GATE td_magnus_stability: got: coupling radius sigma = {sigma} (power iteration on "
@@ -404,12 +412,14 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
 
     def probe(dt):
         h = tp.PROBE_STEP_FACTOR * dt
+        t_probe = time.perf_counter()
         if cfg.method == "cfm4" and cfg.stiff:
             g, _, fc = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0,
                                       counters=True)
         else:
             g, fc = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0)[0], None
-        row = dict(dt_as=dt * T, probe_dt_as=h * T, growth=g)
+        row = dict(dt_as=dt * T, probe_dt_as=h * T, growth=g,
+                   wall_s=time.perf_counter() - t_probe)
         if fc is not None:              # the split: a probe whose closing solve failed did not pass
             row.update(fast_unconverged=fc["unconverged"], fast_max_evaluations=fc["max_evaluations"],
                        fast_worst_rel=fc["worst_rel"])
@@ -438,10 +448,20 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
         stable = True
     else:
         stable = (cfg.frame == "whole_rho" or cfg.dt <= dt_sig) and probe(cfg.dt)
+    n_hist = len(tp._magnus_parts(cfg)[3])
+    per_probe = n_hist + tp.PROBE_STEPS * tp.dsigma_per_step(cfg.method, cfg.n_corr)
     receipt = dict(sigma_ev=sigma * tdgw_io.HA_IN_EV, y=cfg.dt * sigma, y_lim=y_lim,
                    dt_max_as=dt_sig * T,
                    change=float(abs(est[-1] - est[-2]) / est[-1]) if sigma > 0.0 else 0.0,
-                   probes=probes)
+                   probes=probes, auto=bool(auto), dt_as=cfg.dt * T, method=cfg.method,
+                   n_corr=int(cfg.n_corr), predictor=cfg.predictor, frame=cfg.frame,
+                   stiff=int(cfg.stiff), margin=tp.STABILITY_MARGIN,
+                   probe_factor=tp.PROBE_STEP_FACTOR, probe_steps=tp.PROBE_STEPS,
+                   probe_tolerance=tp.PROBE_TOLERANCE, power_iterations=len(est),
+                   power=power, dsigma_wall_s=(power["exec_s"] / power["dsigma"]
+                                               if power["dsigma"] else float("nan")),
+                   dsigma=int(power["dsigma"]) + len(probes) * per_probe,
+                   wall_s=time.perf_counter() - t_gate)
     if sigma <= 0.0:
         say(f"  stability       : no coupling (sigma = 0: the dSigma commutator map vanishes on "
             f"this model, below {tp.COUPLING_ZERO_FLOOR:.0e} Ha), any step is stable"
@@ -508,7 +528,7 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
 
 
 def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
-              outs: TdOutputs, mesh, *, say=print, stiff=None) -> dict:
+              outs: TdOutputs, mesh, *, say=print, stiff=None, log=None) -> dict:
     """Run the propagation from t0, or from the checkpoint the deck names.
 
     ``[control.files] load_checkpoint_from`` continues that run exactly
@@ -517,7 +537,15 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
     (:func:`tdagw.propagate.stiff_basis`) before the stability gate, or
     takes ``stiff`` (its dict, already built for this system and model, of
     the deck's stiff_modes) so several runs of one system pay it once.
-    Returns counters and walls (seconds).
+    ``say`` gets the stdout lines (the stiff split, the gate's verdict, one
+    line per chunk).  ``log`` (the run's ``tdagw.td_log.TdReport``, or None)
+    gets the structured record: ``hold()`` before the split and the gate,
+    ``integrator(...)`` after them (the self-energy and gate blocks, the
+    progress table's header), ``chunk(line, row)`` per chunk (the stdout line
+    and the table row), each row computed from the chunk's host samples and
+    counters (:data:`tdagw.propagate.PROGRESS`, ``COUNTERS``) with no device
+    work of its own.  Returns counters, walls (seconds), the gate's receipt,
+    the basis receipt and the progress rows.
     """
     v = deck.values
     ntr = len(deck.trials)
@@ -546,15 +574,21 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
         stiff=int(v["lorrax.stiff_modes"]), stiff_tol=float(v["lorrax.stiff_tol"]),
         stiff_iter=int(v["lorrax.stiff_iter"]))
     basis = None
+    basis_wall = 0.0
+    if log is not None:
+        log.hold()                 # the split and gate lines: stdout now, the log after the gate
     if cfg.stiff:
         if not model.linear:
             raise ValueError(f"GATE td_stiff_model: got: stiff_modes = {cfg.stiff} with the "
                              f"model {model.name!r} (not affine in rho - rho_eq); want: an affine "
                              f"dSigma; why: the split dSigma[x] = dSigma[(1 - Pi) x] + sum_j <u_j, x> "
                              f"b_j is exact only for a linear model; fix: stiff_modes = 0")
-        basis = stiff if stiff is not None else tp.stiff_basis(
-            system.ops, model, mesh, t0=cfg.t0, n_s=cfg.stiff,
-            krylov=int(v["lorrax.stiff_krylov"]))
+        t_basis = time.perf_counter()
+        with timing.section("tdagw.stiff_basis"):
+            basis = stiff if stiff is not None else tp.stiff_basis(
+                system.ops, model, mesh, t0=cfg.t0, n_s=cfg.stiff,
+                krylov=int(v["lorrax.stiff_krylov"]))
+        basis_wall = time.perf_counter() - t_basis
         system = system._replace(ops=system.ops._replace(stiff=(basis["u"], basis["b"])))
         cfg = cfg._replace(stiff=int(basis["n_s"]))
         top = np.abs(basis["ritz_ev"])
@@ -566,18 +600,35 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             + ("" if stiff is None else " (reused)"))
     check = None
     if cfg.method in ("magnus2", "cfm4"):
-        cfg, check = _magnus_step_check(cfg, system, model, drive, mesh, auto=auto, say=say)
+        with timing.section("tdagw.stability_gate"):
+            cfg, check = _magnus_step_check(cfg, system, model, drive, mesh, auto=auto, say=say)
     resume = load_checkpoint(deck, system, model, outs, cfg.dt)
     count = ntr * system.nk * system.nb * system.nb
     fingerprint = restart_fingerprint(deck, system, model, cfg.dt)
+    basis_info = None if basis is None else dict(
+        n_s=int(basis["n_s"]), krylov=int(basis["krylov"]), cut_ev=float(basis["cut_ev"]),
+        residual_ev=float(basis["residual_ev"]), moduli_ev=np.abs(basis["ritz_ev"]).tolist(),
+        dsigma=0 if stiff is not None else int(basis["dsigma"]), reused=stiff is not None,
+        wall_s=basis_wall)
+    if log is not None:
+        log.integrator(deck=deck, system=system, model=model, cfg=cfg, gate=check,
+                       basis=basis_info, resume=resume)
     walls = []
+    rows = []
     t_start = time.perf_counter()
+    progress = _progress_reference(deck, system, outs, cfg, resume)
 
     def on_chunk(i0, i1, samples, state_fn, t_state):
         _write_chunk(outs, system, i0, i1, samples, state_fn, t_state, fingerprint)
         walls.append(time.perf_counter())
-        say(f"  samples {i0:7d}-{i1 - 1:7d}  t = {t_state * tdgw_io.T_IN_ATTOSEC:12.3f} as"
-            f"  wall {walls[-1] - t_start:9.2f} s")
+        line = (f"  samples {i0:7d}-{i1 - 1:7d}  t = {t_state * tdgw_io.T_IN_ATTOSEC:12.3f} as"
+                f"  wall {walls[-1] - t_start:9.2f} s")
+        rows.append(_progress_row(progress, rows, i0, i1, samples, t_state,
+                                  walls[-1] - t_start))
+        if log is None:
+            say(line)
+        else:
+            log.chunk(line, rows[-1])
 
     with timing.section("tdagw.propagate"):
         stats, _ = tp.run_propagation(
@@ -585,10 +636,11 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             system.ops, model, drive, mesh, cell_volume=system.cell_volume,
             nspinor=system.nspinor, count=count, mtsteps=outs.mtsteps,
             on_chunk=on_chunk, resume=resume)
-    stats["check_dsigma"] = 0 if check is None else (
-        2 * tp.COUPLING_POWER_ITERATIONS + len(check["probes"]) * tp.PROBE_STEPS
-        * tp.dsigma_per_step(cfg.method, cfg.n_corr))
+    stats["check_dsigma"] = 0 if check is None else int(check["dsigma"])
     stats["check_probes"] = [] if check is None else check["probes"]
+    stats["gate"] = check
+    stats["basis"] = basis_info
+    stats["rows"] = rows
     stats["stiff_dsigma"] = 0 if (basis is None or stiff is not None) else int(basis["dsigma"])
     stats["stiff_modes"] = int(cfg.stiff) if cfg.method == "cfm4" else 0
     stats["dt"] = cfg.dt
@@ -600,37 +652,105 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
     return stats
 
 
+def _progress_reference(deck: TdDeck, system: TdSystem, outs: TdOutputs, cfg, resume) -> dict:
+    """What the progress rows are measured against: the t0 invariants, the run's span.
+
+    tr0 = Σ_k w_k Σ_n f_kn and pur0 = Σ_k w_k Σ_n f_kn² are Tr ρ and Tr ρ² of
+    the equilibrium state every trial starts from (host, exact); the rows
+    report |X(t) - X0| / X0 for both.  ``hamiltonian``: no Γ, so both are
+    invariants of the exact flow (the intraband term moves charge between k
+    but keeps the sums).
+    """
+    f = np.asarray(system.hdr["f_kn"], float)
+    w = np.asarray(system.hdr["w_k"], float)
+    v = deck.values
+    names = {typ: name for name, typ, _ in reversed(deck.measurements)}
+    t_from = cfg.t0 if resume is None else float(resume["tchkp"])
+    return dict(tr0=float(np.sum(w[:, None] * f)), pur0=float(np.sum(w[:, None] * f * f)),
+                hamiltonian=v["system.depopulation"] == 0.0 and v["system.dephasing"] == 0.0,
+                polarization=names.get("polarization"), carriers=names.get("carrier_density"),
+                t_from_fs=t_from * tdgw_io.T_IN_ATTOSEC / 1000.0,
+                t_end_fs=cfg.tf * tdgw_io.T_IN_ATTOSEC / 1000.0)
+
+
+def _progress_row(ref: dict, rows: list, i0, i1, samples, t_state, wall) -> dict:
+    """One progress row from a chunk's host samples (no device work).
+
+    Rate s/fs of this chunk; ETA from the mean rate of the chunks after the
+    first (the first carries the compile), or the first's alone; the ΔΣ
+    count of the run so far (steps and samples); |P|, n_c and |E| at the
+    chunk's last sample (max over drives; P and n_c only when measured); the
+    largest relative drift of Tr ρ and Tr ρ² over the chunk's samples and
+    drives.
+    """
+    t_fs = t_state * tdgw_io.T_IN_ATTOSEC / 1000.0
+    prev_t, prev_w = (rows[-1]["t_fs"], rows[-1]["wall_s"]) if rows else (ref["t_from_fs"], 0.0)
+    span = max(t_fs - prev_t, 1e-30)
+    rate = (wall - prev_w) / span
+    steady = [r["s_per_fs"] for r in rows[1:]] + ([rate] if rows else [])
+    eta_rate = float(np.mean(steady)) if steady else rate
+    prog = np.asarray(samples[tp.PROGRESS], float)                   # (n, ntr, 3)
+    cnt = samples[tp.COUNTERS]
+    row = dict(i0=int(i0), i1=int(i1), t_fs=t_fs, wall_s=float(wall), s_per_fs=rate,
+               eta_s=max(ref["t_end_fs"] - t_fs, 0.0) * eta_rate,
+               dsigma=int(cnt["dsigma"]) + int(cnt.get("sample_dsigma", 0)),
+               steps=int(cnt["accepted"]), rejected=int(cnt["rejected"]),
+               p_abs=None, n_c=None, e_abs=None, d_trace=None, d_purity=None)
+    if prog.shape[0]:
+        row.update(e_abs=float(np.max(prog[-1, :, 2])) * tdgw_io.EFIELD_IN_VPERM,
+                   d_trace=float(np.max(np.abs(prog[..., 0] - ref["tr0"])) / abs(ref["tr0"])),
+                   d_purity=float(np.max(np.abs(prog[..., 1] - ref["pur0"])) / abs(ref["pur0"])))
+        if ref["polarization"] is not None:
+            p = np.asarray(samples[ref["polarization"]])[-1]          # (ntr, 3)
+            row["p_abs"] = float(np.max(np.sqrt(np.sum(np.abs(p) ** 2, axis=-1))))
+        if ref["carriers"] is not None:
+            row["n_c"] = float(np.max(np.asarray(samples[ref["carriers"]])[-1, :, 0]))
+    return row
+
+
 def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) -> str:
-    """The run header: what will be integrated, how, where."""
+    """The run header: what will be integrated, how, where (stdout)."""
+    return "\n".join(describe_rows(deck, system, model, runtime).values())
+
+
+def describe_rows(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) -> dict:
+    """The run header's lines by name, in stdout order (``describe`` joins them).
+
+    Names: title, deck, header, window, integrator, self_energy, intraband,
+    drives, time, mesh, then td_system and gauge (bundle route), restart and
+    unused when they apply.  The run log (``tdagw.td_log``) files each line
+    under its section.
+    """
     v = deck.values
     T = tdgw_io.T_IN_ATTOSEC
     step = ("adaptive (SciPy RK45 controller), atol %.3g rtol %.3g, first step "
             "dt_measure" % (v["control.ivp.atol"], v["control.ivp.rtol"])
             if v["lorrax.method"] == "dp54" else
+            "fixed dt = auto (the stability gate picks it below)" if v["lorrax.dt"] == "auto" else
             "fixed dt = %.6g as (dt_measure / dt = %.6g)" % (
                 v["lorrax.dt"] * T, v["control.timesteps.dt_measure"] / v["lorrax.dt"]))
-    lines = [
-        "TD-aGW propagation (TDGW conventions)",
-        f"  deck            : {deck.source}",
-        f"  header          : {system.hdr['path'] or 'built from the GW bundle ' + str(v['lorrax.bundle_input'])}",
-        f"  window          : bands {system.bands[0]}..{system.bands[1] - 1}, "
+    rows = dict(
+        title="TD-aGW propagation (TDGW conventions)",
+        deck=f"  deck            : {deck.source}",
+        header=f"  header          : {system.hdr['path'] or 'built from the GW bundle ' + str(v['lorrax.bundle_input'])}",
+        window=f"  window          : bands {system.bands[0]}..{system.bands[1] - 1}, "
         f"nb = {system.nb}, nk = {system.nk} (padded {system.nk_pad}), "
         f"nspinor = {system.nspinor}",
-        f"  integrator      : {v['lorrax.method']}, {step}"
+        integrator=f"  integrator      : {v['lorrax.method']}, {step}"
         + (f", n_corr = {v['lorrax.n_corr']}" if v["lorrax.method"] in ("magnus2", "cfm4") else ""),
-        f"  self-energy     : {model.name}",
-        f"  intraband [r,.] : {'on' if system.ops.intra is not None else 'off'}",
-        f"  drives          : {len(deck.trials)}",
-        f"  window in time  : {v['control.timesteps.t0'] * T:.3f} .. "
+        self_energy=f"  self-energy     : {model.name}",
+        intraband=f"  intraband [r,.] : {'on' if system.ops.intra is not None else 'off'}",
+        drives=f"  drives          : {len(deck.trials)}",
+        time=f"  window in time  : {v['control.timesteps.t0'] * T:.3f} .. "
         f"{v['control.timesteps.tf'] * T:.3f} as, samples every "
         f"{v['control.timesteps.dt_measure'] * T:.6g} as",
-        f"  mesh            : {runtime.mesh_shape} on {runtime.n_devices} "
+        mesh=f"  mesh            : {runtime.mesh_shape} on {runtime.n_devices} "
         f"{runtime.platform} device(s)",
-    ]
+    )
     rec = system.receipts
     if rec:                                  # the bundle route's receipts (also in the header)
         pr, vr = rec["pairs"], rec["velocity"]
-        lines.append(
+        rows["td_system"] = (
             f"  TD system       : {'bse_k_grid' if rec['densified'] else 'native'} bundle, "
             f"energies {rec['energy_source']}, r = v/(i dE_DFT) from {vr['route']}; "
             f"pair rule {pr['rule']} at {pr['gap_ev']:g} eV (vv' below: {pr['vv']['below_gap']} "
@@ -638,18 +758,25 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
             f"min c-v gap {pr['min_cv_gap_ev']:.4f} eV, max|r| {pr['max_abs_r_bohr']:.3g} bohr")
         if "bse_dipoles" in rec:
             bd = rec["bse_dipoles"]
-            lines.append(
+            rows["gauge"] = (
                 f"  gauge receipt   : <0|r|S> of {bd['n_states']} BSE states from the header r "
                 f"and the eigenvectors vs bse_jax's: rel dev {bd['dipole_rel_dev']:.2e}, "
                 f"I+ {bd['i_plus_rel_dev']:.2e}, I- {bd['i_minus_rel_dev']:.2e}")
     if v["control.files.load_checkpoint_from"]:
-        lines.append(f"  restart from    : {v['control.files.load_checkpoint_from']} "
-                     f"(its integrator carry; values continue bitwise)")
+        rows["restart"] = (f"  restart from    : {v['control.files.load_checkpoint_from']} "
+                           f"(its integrator carry; values continue bitwise)")
     unused = td_config.unused_keys(deck)
     if unused:
-        lines.append("  read, not used  : " + ", ".join(unused)
-                     + " (TDGW logging / vacuum centring / snapshot stride)")
-    return "\n".join(lines)
+        rows["unused"] = ("  read, not used  : " + ", ".join(unused)
+                          + " (TDGW logging / vacuum centring / snapshot stride)")
+    return rows
+
+
+def output_files(outs: TdOutputs) -> list:
+    """The file table of a finished run: each trial's ``tdgw.h5`` and ``tdgw.toml``."""
+    return ([("tdgw.h5", "written", p) for p in outs.paths]
+            + [("tdgw.toml", "written", os.path.join(os.path.dirname(p), "tdgw.toml"))
+               for p in outs.paths])
 
 
 def summarize(deck: TdDeck, stats: dict) -> str:

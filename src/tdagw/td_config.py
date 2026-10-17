@@ -4,9 +4,13 @@ A TDGW deck (TDGW README "Variables of TDGW config file") is accepted as is;
 the ``[lorrax]`` table selects the integrator, the step, the self-energy
 model and batched drives.  ``TD_DEFAULTS`` is the accepted key set (dotted
 TOML paths; ``measurements.<i>.<keyword>`` rows are checked against
-``MEASUREMENT_KEYWORDS``); ``docs/input_reference.md`` is generated from it
-(``tools/gen_input_reference.py``).  Every unknown key refuses in one
-error naming all of them; a ``None`` default marks a required key.
+``MEASUREMENT_KEYWORDS``) and ``TD_KEY_DOCS`` says what each key means, its
+default's reading and the refusals that name it; the TD-aGW table of
+``docs/input_reference.md`` is generated from the two
+(``tools/gen_input_reference.py``; edit them, never the table).  Every
+unknown key refuses in one error naming all of them; a ``None`` default
+marks a required key.  :func:`resolved_deck_rows` is the run log's record of
+the deck: every key, its value and whether the deck set it.
 
 Units are TDGW's: times in attoseconds, energies in eV, fields in V/m; the
 parsed :class:`TdDeck` holds Hartree atomic units.
@@ -17,9 +21,10 @@ import math
 import os
 from typing import NamedTuple
 
-__all__ = ["TD_DEFAULTS", "TD_REQUIRED", "MEASUREMENT_KEYWORDS",
-           "MEASUREMENT_TYPES", "SYSTEMS", "TdDeck", "read_td_deck", "parse_td_deck",
-           "UNUSED_TDGW_KEYS", "unused_keys"]
+__all__ = ["TD_DEFAULTS", "TD_REQUIRED", "TD_KEY_DOCS", "MEASUREMENT_KEYWORDS",
+           "MEASUREMENT_TYPES", "SYSTEMS", "RESERVED_SAMPLE_PREFIX", "TdDeck", "read_td_deck",
+           "parse_td_deck", "UNUSED_TDGW_KEYS", "unused_keys", "inactive_keys",
+           "resolved_deck_rows"]
 
 #: The accepted keys and their defaults.  None = required or unset.
 TD_DEFAULTS = {
@@ -94,6 +99,9 @@ MEASUREMENT_KEYWORDS = ("dataset_name", "itrange", "ntsave", "brange1",
 SYSTEMS = ("tdgw_header", "bundle")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
+#: Sample names the driver keeps for its own per-chunk record (``tdagw.propagate.PROGRESS``);
+#: a measurement ``dataset_name`` may not start with it (``td_measurement_names``).
+RESERVED_SAMPLE_PREFIX = "lorrax."
 
 
 class TdDeck(NamedTuple):
@@ -104,12 +112,15 @@ class TdDeck(NamedTuple):
     measurements : tuple of (dset_name, type, kwargs dict).
     trials : tuple of Efunc dicts (one per batched drive).
     source : the deck path.
+    given : {dotted key: value as written} for the TD_DEFAULTS keys the deck sets
+        (TDGW units, before conversion; the run log's resolved deck).
     """
     tdgw: dict
     values: dict
     measurements: tuple
     trials: tuple
     source: str
+    given: dict = None
 
 
 def _gate(gid, got, want, fix):
@@ -343,8 +354,10 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         raise _gate("td_exciton_projection", "two exciton_projection measurements",
                     "one", "project onto one eigenvector file (raise n_states)")
     names = [m[0] for m in meas]
-    if len(set(names)) != len(names):
-        raise _gate("td_measurement_names", names, "unique dataset names",
+    if len(set(names)) != len(names) or any(
+            str(n).startswith(RESERVED_SAMPLE_PREFIX) for n in names):
+        raise _gate("td_measurement_names", names, "unique dataset names, none starting "
+                    f"with {RESERVED_SAMPLE_PREFIX!r} (the driver's own per-chunk record)",
                     "set measurements.<i>.dataset_name")
     efunc = raw.get("system", {}).get("Efunc", {})
     trials = tuple(dict(t) for t in (vals["lorrax.trials"] or [efunc]))
@@ -354,8 +367,9 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
             raise _gate("td_unknown_key", ", ".join(f"lorrax.trials.{b}" for b in bad),
                         "E_x, E_y, E_z", "fix the trial table")
     tdgw = {k: v for k, v in raw.items() if k != "lorrax"}
+    given = {k: flat[k] for k in flat if k in TD_DEFAULTS}
     return TdDeck(tdgw=tdgw, values=vals, measurements=tuple(meas),
-                  trials=trials, source=source)
+                  trials=trials, source=source, given=given)
 
 
 #: TDGW keys a deck may carry that this driver reads and does not use: TDGW's
@@ -377,3 +391,353 @@ def unused_keys(deck) -> list:
     out += [f"measurements.{i}.ntsave" for i, (_, _, kw) in enumerate(deck.measurements)
             if "ntsave" in kw]
     return out
+
+
+def inactive_keys(deck) -> dict:
+    """{key: why} for the keys the deck sets that this run does not read.
+
+    The parser refuses a key that contradicts the configuration (a ``dt``
+    with ``dp54``, ``stiff_modes`` with another method); these are the
+    accepted-but-ignored ones: the SciPy controller of ``dp54`` under a
+    fixed-step method, the Magnus corrections under a non-Magnus one, the
+    closing solve without a split, a model's or a route's files under
+    another, ``ntcheck`` when ``lorrax.chunk`` sets the chunk.  The run log
+    flags each; nothing refuses.
+    """
+    v, given = deck.values, deck.given or {}
+    method, model, bundle = v["lorrax.method"], v["lorrax.model"], v["lorrax.system"] == "bundle"
+    rules = [
+        (("control.ivp.rtol", "control.ivp.atol", "control.timesteps.max_step"),
+         method != "dp54", f"dp54's step controller; method is {method}"),
+        (("lorrax.n_corr", "lorrax.predictor"), method not in ("magnus2", "cfm4"),
+         f"magnus2 / cfm4 only; method is {method}"),
+        (("lorrax.stiff_krylov", "lorrax.stiff_tol", "lorrax.stiff_iter"),
+         not v["lorrax.stiff_modes"], "the stiff split's; stiff_modes = 0"),
+        (("lorrax.kernel_file",), model != "tdgw_kernel", f"model tdgw_kernel only; model is {model}"),
+        (("lorrax.isdf_zeta", "lorrax.isdf_terms"), model != "isdf",
+         f"model isdf only; model is {model}"),
+        (("lorrax.isdf_input",), model != "isdf", f"model isdf only; model is {model}"),
+        (("lorrax.pair_rule", "lorrax.pair_gap_ev"), not bundle,
+         "system = 'bundle' only (the r of a TDGW header is TDGW's)"),
+        (("control.timesteps.ntcheck",), bool(v["lorrax.chunk"]),
+         "lorrax.chunk sets the samples per chunk and checkpoint"),
+        (("control.files.indir",), bundle or model == "none" or (
+            model == "tdgw_kernel" and bool(v["lorrax.kernel_file"])),
+         "no kernel.h5 or WFN.h5 is read from it on this route"),
+        (("system.ivbm",), model == "none" and not bundle,
+         "model none on a TDGW header (occupations come from the header)"),
+    ]
+    out = {}
+    for keys, inactive, why in rules:
+        for key in keys:
+            if inactive and key in given:
+                out[key] = why
+    return out
+
+
+def _deck_text(value) -> str:
+    """A deck value as TOML writes it (strings quoted, lists and tables inline)."""
+    import json
+    if value is None:
+        return "unset"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{k} = {_deck_text(x)}" for k, x in value.items()) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_deck_text(x) for x in value) + "]"
+    return repr(value)
+
+
+def resolved_deck_rows(deck) -> list:
+    """The run log's resolved deck: (key, value, status, notes) rows.
+
+    One row per ``TD_DEFAULTS`` key in its order: the value as the deck
+    writes it (TDGW units: as, eV, V/m) or the default; ``status`` is
+    ``set``, ``default`` or ``unset``; ``notes`` say that a set value equals
+    the default, what the parser resolved an empty default to
+    (``lorrax.model``, ``pair_gap_ev``, ``isdf_input``), and flag the keys
+    of :func:`inactive_keys` and ``UNUSED_TDGW_KEYS``.  Then one row per
+    measurement (its options) and per drive.  The step of ``dt = 'auto'``
+    is the stability gate's and is reported there.
+    """
+    v, given = deck.values, deck.given or {}
+    inactive = inactive_keys(deck)
+    resolved = {"lorrax.model": v["lorrax.model"],
+                "lorrax.pair_gap_ev": f"{v['lorrax.pair_gap_ev'] * 1.0:g} eV",
+                "lorrax.isdf_input": v["lorrax.isdf_input"] or None}
+    rows = []
+    for key, default in TD_DEFAULTS.items():
+        if key == "lorrax.trials":
+            continue
+        notes = []
+        if key in given:
+            value, status = given[key], "set"
+            if value == default:
+                notes.append("equals the default")
+        else:
+            value, status = default, ("unset" if default is None else "default")
+        if key in resolved and resolved[key] is not None and value in (None, ""):
+            notes.append(f"resolved to {resolved[key]}")
+        if key in inactive:
+            notes.append(f"not used: {inactive[key]}")
+        if key in UNUSED_TDGW_KEYS and key in given:
+            notes.append("read, not used by this driver")
+        rows.append((key, _deck_text(value), status, notes))
+    for i, (name, typ, kw) in enumerate(deck.measurements):
+        opts = ", ".join(f"{k} = {_deck_text(x)}" for k, x in sorted(kw.items()))
+        rows.append((f"measurements.{i}", f"{typ} as {name!r}" + (f" {{{opts}}}" if opts else ""),
+                     "set", ["ntsave read, not used (every sample is written)"]
+                     if "ntsave" in kw else []))
+    trials_given = "lorrax.trials" in given
+    for j, trial in enumerate(deck.trials):
+        rows.append((f"lorrax.trials[{j}]" if trials_given else "system.Efunc",
+                     _deck_text(dict(trial)),
+                     "set" if (trials_given or trial) else "default", []))
+    return rows
+
+
+#: The deck reference, one entry per TD_DEFAULTS key:
+#: (default note, meaning, refusals).  ``tools/gen_input_reference.py`` renders the
+#: TD-aGW table of docs/input_reference.md from it: the default cell is the
+#: TD_DEFAULTS value plus the note in parentheses, the meaning cell the text (Markdown;
+#: ``|`` is escaped by the generator), the last cell the GATE ids that refuse a bad
+#: value or combination.  A key without an entry, or an entry without a key, refuses
+#: the generator (and ``--check``, so gate0).
+TD_KEY_DOCS = {
+    "control.loglevel": (
+        "", "TDGW's log level. Accepted for compatibility and not used: the driver writes "
+        "its own log, `tdagw.out` in `outdir`.", ()),
+    "control.calc_type": (
+        "required", "`IP` (no self-energy update) or `COHSEX` (ΔΣ[ρ] from `lorrax.model`).",
+        ("td_missing_key", "td_calc_type")),
+    "control.timesteps.t0": (
+        "required", "Start time, as.", ("td_missing_key",)),
+    "control.timesteps.dt_measure": (
+        "required", "Sampling interval, as. Samples are TDGW's grid t0 + i·dt_measure. The "
+        "fixed-step methods sample it by dense output, so `lorrax.dt` need not divide it, "
+        "except `magnus2`, which needs an integer ratio.",
+        ("td_missing_key", "td_dense_output")),
+    "control.timesteps.tf": (
+        "required", "Final time, as.", ("td_missing_key",)),
+    "control.timesteps.ntcheck": (
+        "", "Samples per checkpoint, as in TDGW: every ntcheck samples the driver appends "
+        "the measurements and rewrites `tdgw_data/checkpoint`. It is also the jitted chunk "
+        "length (one row of the log's progress table each) unless `lorrax.chunk` is set.",
+        ()),
+    "control.timesteps.max_step": (
+        "= no limit", "`dp54` only: SciPy's `max_step`, as.", ()),
+    "control.ivp.rtol": (
+        "", "`dp54` relative tolerance (SciPy RK45 semantics: RMS error norm over the "
+        "logical, unpadded entries).", ("td_dp54_step_too_small",)),
+    "control.ivp.atol": (
+        "", "`dp54` absolute tolerance, in units of ρ.", ("td_dp54_step_too_small",)),
+    "control.files.indir": (
+        "required by `tdgw_kernel` without `kernel_file`, and by `isdf` on a TDGW header",
+        "TDGW's input directory: `kernel.h5` for `lorrax.model = tdgw_kernel`, `WFN.h5` for "
+        "`isdf` on a TDGW header. Unused by `lorrax.system = bundle`.",
+        ("td_kernel_file", "td_indir")),
+    "control.files.outdir": (
+        "required", "Output directory: `tdgw.h5` and `tdgw.toml`, or one `trial-<i>/` per "
+        "drive with `lorrax.trials`, and the run log `tdagw.out` (one per run).",
+        ("td_missing_key", "td_checkpoint_outdir")),
+    "control.files.use_vmtxel": (
+        "", "`true` refuses: the dipole comes from the TDGW header (a `use_vmtxel` run's "
+        "header carries BerkeleyGW's dipoles) or from the bundle.", ("td_header_source",)),
+    "control.files.load_header_from": (
+        "required with `system = tdgw_header`", "A TDGW output directory; its `tdgw.h5` "
+        "header supplies energies, the k grid and the dipole, and is copied into the "
+        "output. Empty with `system = tdgw_header`, or set with `system = bundle`, refuses; "
+        "its band window must be the deck's.", ("td_header_source", "td_band_window")),
+    "control.files.load_checkpoint_from": (
+        "", "An earlier run's output directory: the run continues from its last checkpoint "
+        "exactly (the integrator's carry in `tdgw_data/checkpoint/lorrax`; the same samples, "
+        "bitwise, as the uninterrupted run) and copies the rows before it. `outdir` must "
+        "differ; a TDGW checkpoint, which holds no carry, refuses, and so do settings other "
+        "than `outdir`, `load_checkpoint_from`, `lorrax.chunk` and, for fixed steps, `tf`.",
+        ("td_checkpoint_outdir", "td_restart_carry", "td_restart_settings")),
+    "system.ibndmin": (
+        "required", "First band of the window, 1-based (TDGW). It must equal the header's "
+        "window.", ("td_missing_key", "td_band_window")),
+    "system.ibndmax": (
+        "required", "Last band of the window, 1-based, inclusive.",
+        ("td_missing_key", "td_band_window")),
+    "system.ivbm": (
+        "", "Valence-band maximum, 1-based. Required by `tdgw_kernel` and by "
+        "`system = bundle`; `isdf` takes the occupied count from it.",
+        ("td_ivbm", "td_window_occupation")),
+    "system.geometry": (
+        "required", "`bulk`, `slab` or `wire`: the periodic directions of the intraband "
+        "k-derivative. `box` refuses.", ("td_missing_key", "td_geometry")),
+    "system.center_of_vacuum": (
+        "", "TDGW's position origin for its own dipole build; accepted and unused, since "
+        "the header carries the dipole.", ()),
+    "system.esmear": (
+        "", "Gaussian width, eV, of the energy mask in TDGW's covariant overlap S̃ (the "
+        "intraband connection), reproduced from the header's overlaps; also the default "
+        "of `lorrax.pair_gap_ev`.", ()),
+    "system.depopulation": (
+        "", "Diagonal relaxation rate Γ_nn toward ρ_eq, eV. Nonzero makes Tr ρ² decay, so "
+        "the log's purity drift is then not an invariant check.", ()),
+    "system.dephasing": (
+        "", "Off-diagonal relaxation rate Γ_nm, eV (as `depopulation` for the log's "
+        "purity drift).", ()),
+    "system.patched_sampling": (
+        "", "`true` refuses: a regular k grid only.", ("td_patched_sampling",)),
+    "system.Efunc.E_x": (
+        "", "Field component along x, V/m: a number or a TDGW expression in `t` (as) with "
+        "numpy as `np` and `HBAR_IN_EV_AS`, `EFIELD_IN_VPERM` in scope. The how-to's "
+        "[example decks](how-to/td-agw-run.md#decks) give a δ kick and Gaussian pulses.",
+        ()),
+    "system.Efunc.E_y": (
+        "", "As `E_x`, along y.", ()),
+    "system.Efunc.E_z": (
+        "", "As `E_x`, along z.", ()),
+    "measurements.types": (
+        "required", "The measurement list: `Efield`, `polarization`, `current`, "
+        "`density_matrix`, `lessG` (TDGW's), and LORRAX's own `carrier_density` (conduction "
+        "electrons and valence holes per cell, (2,) per sample) and `exciton_projection` "
+        "(amplitudes c_S = Σ conj(A^S_kcv) ρ_cv(k) on the states of a BSE "
+        "`eigenvectors.h5`; |c_S|²/N_k excitons per cell). `velocity_operator` refuses. "
+        "Per-measurement options are `[measurements.<i>]` tables (below); dataset names "
+        "are unique and do not start with `lorrax.`.",
+        ("td_missing_key", "td_measurement_unsupported", "td_measurement_names",
+         "td_exciton_projection", "td_brange", "td_krange", "td_projection_window",
+         "td_projection_kpoints")),
+    "lorrax.method": (
+        "", "`dp54` (SciPy RK45, adaptive; takes TDGW's steps), `rk4`, `etdrk4` (Krogstad), "
+        "`magnus2` (exponential midpoint) or `cfm4` (fourth-order commutator-free Magnus; "
+        "fourth order also with Γ and the intraband term). The Magnus schemes integrate "
+        "Δρ = ρ − ρ_eq in the interaction picture of the band energies and check their "
+        "step at the start of the run. Which to use: "
+        "[choosing an integrator](how-to/td-agw-run.md#integrators).", ("td_method",)),
+    "lorrax.dt": (
+        "required by every method but `dp54`", "The fixed step, as, for every method but "
+        "`dp54` (refused there). `auto` (`magnus2`, `cfm4`): the largest step the start-of-run "
+        "stability gate accepts, from the static limit down by 0.85 per try, floored to "
+        "0.01 as (`magnus2`: dt_measure / n). A `magnus2` / `cfm4` step above the static "
+        "limit, or one whose step probe at 1.25 dt grows, refuses, naming the limit or "
+        "the measured growth; the log's gate block records both.",
+        ("td_dt", "td_dense_output", "td_magnus_stability")),
+    "lorrax.n_corr": (
+        "", "Corrections per step of `magnus2` (midpoint Hamiltonian) and `cfm4` "
+        "(Gauss-node Hamiltonians); each costs one ΔΣ evaluation per node, so `cfm4` makes "
+        "2·n_corr ΔΣ calls per step. At least 1. The stable step is not monotone in "
+        "`n_corr`: `cfm4` with the cubic predictor is stable for h·σ ≤ 0.117 / 0.730 / "
+        "1.144 with 1 / 2 / 3 corrections, σ the spectral radius of the linearized ΔΣ "
+        "commutator map, estimated at the start of the run.",
+        ("td_n_corr", "td_magnus_stability")),
+    "lorrax.predictor": (
+        "", "The ΔΣ predictor of `magnus2` / `cfm4` before the corrections: `cubic` "
+        "(`cfm4`: through the last two steps' four Gauss-node values; `magnus2`: quadratic "
+        "through three midpoints) or `linear` (`cfm4` only, through the last step's two: "
+        "the same order, about twice the error, a 1.6× larger stable step, h·σ ≤ 1.203 "
+        "with two corrections).", ("td_predictor",)),
+    "lorrax.magnus_frame": (
+        "= `whole_rho` for `magnus2`, `interaction` for `cfm4`", "The frame of `magnus2`: "
+        "`whole_rho`, the exponential midpoint on the whole ρ with ΔΣ at the average of "
+        "the end states (the post-pulse energy is conserved up to rounding; a rounding "
+        "floor ∝ 1/E₀ in weak fields), or `interaction`, Δρ in the interaction picture of "
+        "the band energies (no floor, exact band phases, an O(h²) energy drift). `cfm4` "
+        "runs in the interaction picture only.", ("td_magnus_frame",)),
+    "lorrax.model": (
+        "= `none` for IP, `tdgw_kernel` for COHSEX", "The self-energy update: `none`, "
+        "`tdgw_kernel` (TDGW's dense `kernel.h5`) or `isdf` (the LORRAX ISDF model of a GW "
+        "restart bundle). The log's self-energy block names the terms, N_μ and the wall "
+        "of one ΔΣ call.", ("td_model",)),
+    "lorrax.kernel_file": (
+        "= `indir/kernel.h5`", "The BerkeleyGW-layout kernel for `tdgw_kernel`: complex "
+        "flavor, TDA (one block) or full (four), on the header's k list and inside the "
+        "window.", ("td_kernel_file", "td_kernel_kpoints", "td_kernel_flavor",
+                    "td_kernel_blocks", "td_kernel_bands")),
+    "lorrax.isdf_input": (
+        "= `bundle_input` with `system = bundle`", "The GW deck of the restart bundle, "
+        "required by `isdf`; with `system = bundle` it must be (or default to) "
+        "`bundle_input`.", ("td_isdf_input", "td_isdf_window", "td_isdf_kpoints")),
+    "lorrax.isdf_zeta": (
+        "= the deck's", "The bundle's ζ file, when not at the deck's location.", ()),
+    "lorrax.isdf_terms": (
+        "", "Terms of the ISDF model: `both`, `sex` (screened exchange) or `hartree`.",
+        ("td_isdf_terms",)),
+    "lorrax.intraband": (
+        "", "Keep the intraband term E·[r^intra, ρ] (TDGW keeps it); `false` drops it. The "
+        "bundle route has no intraband term.", ()),
+    "lorrax.chunk": (
+        "= `ntcheck`", "Samples per jitted chunk: one host write, one checkpoint and one row "
+        "of the log's progress table each; capped so a density-matrix buffer fits the "
+        "streaming tile.", ()),
+    "lorrax.trials": (
+        "", "A list of `{E_x, E_y, E_z}` tables propagated together on a leading trial axis "
+        "(for example two circular polarizations); one output directory per trial, one "
+        "log.", ("td_unknown_key",)),
+    "lorrax.system": (
+        "", "Where the header comes from: `tdgw_header` (a TDGW run's `tdgw.h5`, "
+        "`load_header_from`) or `bundle` (built from the GW restart bundle `bundle_input` by "
+        "`tdagw.td_system`, no TDGW WFN). `bundle` refuses `load_header_from` and needs "
+        "`bundle_input`, `dipole_file` and `system.ivbm`; the bundle-only keys refuse with "
+        "`tdgw_header`.", ("td_system", "td_header_source", "td_bundle_input", "td_ivbm",
+                           "td_bundle_key")),
+    "lorrax.bundle_input": (
+        "", "The GW deck of the restart bundle (`system = bundle`); a deck with "
+        "`bse_k_grid` builds the densified system. With `model = isdf` it is also the "
+        "model's deck.", ("td_bundle_input", "td_bundle_key", "td_densified_velocity",
+                          "td_densified_k_order")),
+    "lorrax.eqp_file": (
+        "= DFT energies", "The BSE run's `eqp1.dat` (`system = bundle`): QP energies by DFT "
+        "index on a coarse deck, the htransform's QP f(H) states and energies on a "
+        "`bse_k_grid` deck.", ("td_bundle_key",)),
+    "lorrax.dipole_file": (
+        "", "The coarse WFN's `dipole.h5` (`psp.get_dipole_mtxels`) for r = v/(iΔE) with the "
+        "velocity's own (DFT) energies (`system = bundle`); it must cover the window and "
+        "carry the restart's DFT energies.", ("td_bundle_input", "td_bundle_key",
+                                               "td_dipole_bands", "td_dipole_energies")),
+    "lorrax.pair_rule": (
+        "", "Same-occupation pairs (vv', cc') of the bundle's r: `mask` multiplies r by "
+        "1 − exp(−ΔE²/(2 gap²)), `cut` zeroes pairs with |ΔE| < gap, `cv` keeps the c↔v "
+        "blocks only (TDGW's `use_vmtxel` layout). n = m is always zero (no intraband "
+        "commutator on this route).", ("td_pair_rule", "td_pair_gap_route_b")),
+    "lorrax.pair_gap_ev": (
+        "= `system.esmear`", "The energy scale of `pair_rule`, eV; also the smallest "
+        "accepted c↔v gap.", ("td_cv_gap", "td_pair_gap_route_b")),
+    "lorrax.check_eigenvectors": (
+        "", "A `bse_jax --write-eigs --dipole` file on the same bundle and window: the "
+        "builder reproduces its ⟨0|r|S⟩ from the header (the gauge receipt, logged and "
+        "stored in the header). It costs a load of the eigenvectors; leave it unset in "
+        "production once the receipt has been read.", ("td_bundle_key", "td_eigenvector_kpts")),
+    "lorrax.degeneracy_mode": (
+        "= `strict`", "The band-window degeneracy gate of the bundle load (`strict` refuses a "
+        "window edge inside a QP multiplet, `snap` widens the window, `off` keeps it; TDGW "
+        "applies no such check, so reproducing a TDGW window may need `off`).",
+        ("td_degeneracy_mode", "td_bundle_key")),
+    "lorrax.tda": (
+        "", "TDGW's TDA semantics for the ISDF ΔΣ: only δρ_cv drives, only ΔΣ_cv (and its "
+        "Hermitian conjugate) is kept, the resonant–antiresonant coupling is dropped (the "
+        "projection of `tdagw_bridge --tda`). ISDF model only.", ("td_tda_model",)),
+    "lorrax.stiff_modes": (
+        "= no split", "`cfm4` only: split ΔΣ exactly on the invariant subspace of the n "
+        "largest eigenvalues of the coupling map L (a real Arnoldi on L at the start of the "
+        "run, `stiff_krylov` steps; n raised to the end of a ± / conjugate group): "
+        "ΔΣ[x] = (ΔΣ[x] − Σ_j ⟨u_j, x⟩ b_j) + Σ_j ⟨u_j, x⟩ b_j, b_j = ΔΣ[u_j]. The first "
+        "part keeps the predictor and `n_corr` corrections; the second is solved "
+        "implicitly at the Gauss nodes (simplified Newton on exponentials and "
+        "projections, no ΔΣ call), so the static limit and the probe bind the slow map "
+        "L(1 − Π) only. Needs an affine model. On the 30×30 CrI3 ISDF model 10 modes "
+        "double the stable step (50 → 100 as); it pays at P(t) errors near 1e-4, not at "
+        "1e-5 ([choosing an integrator](how-to/td-agw-run.md#integrators)).",
+        ("td_stiff_modes", "td_stiff_method", "td_stiff_model", "td_stiff_basis")),
+    "lorrax.stiff_krylov": (
+        "= max(80, 5·stiff_modes)", "Arnoldi steps on L for the stiff basis (one ΔΣ call "
+        "each, once per run); above `stiff_modes`. The log records the selected moduli, "
+        "the next one, the cut and the invariance residual; 120 resolved the 10 outliers "
+        "of the 30×30 CrI3 model to a zero residual.", ("td_stiff_krylov",)),
+    "lorrax.stiff_tol": (
+        "", "Relative residual ‖⟨u, x(a)⟩ − a‖ / ‖a‖ of the stiff coefficients a at the "
+        "nodes that ends a step's closing solve. A step that misses it in `stiff_iter` "
+        "node-map evaluations refuses the run at its chunk end, before the chunk's samples "
+        "are written; so does a probe of the stability gate.", ("td_stiff_solve",)),
+    "lorrax.stiff_iter": (
+        "", "Node-map evaluations (each: the exponentials to the two nodes, no ΔΣ call) of "
+        "the closing solve per step, at least 1.", ("td_stiff_solve",)),
+}

@@ -6,7 +6,9 @@ It restates no equation, key or refusal: the equation of motion, the
 integrators and the output are on [TD-aGW propagation](../theory/td_agw_propagation.md),
 the interaction ΔΣ[ρ] on [TD-aGW interaction](../theory/td_agw.md), every
 deck key in the [input reference](../input_reference.md#td-agw), and each
-invocation on [drivers](../drivers.md#td-agw-tdagwtdgw_jax).
+invocation on [drivers](../drivers.md#td-agw-tdagwtdgw_jax). Running one
+propagation (example drives, the run log, the integrator) is
+[Running TD-aGW](td-agw-run.md).
 
 ## The chain
 

@@ -57,10 +57,15 @@ weight, which every term of Eq. (1) leaves at zero.  dSigma is the injected
 A chunk of samples is ONE jitted call (a ``lax`` loop over steps, samples
 written into device buffers); the host sees the state only between chunks,
 and each chunk's checkpoint carries the integrator's whole carry, so a run
-restarted from it continues bitwise.
+restarted from it continues bitwise.  Every sample also records, on the
+device and without a ΔΣ call, the run log's invariants (``PROGRESS``: per
+trial Σ_k w_k Tr ρ_k, Σ_k w_k Tr ρ_k², |E(t)|), and every chunk hands the
+host its cumulative step and ΔΣ counters (``COUNTERS``), from the same
+counting as the final ones.
 """
 from __future__ import annotations
 
+import time
 from typing import Callable, NamedTuple, Optional
 
 import numpy as np
@@ -76,7 +81,7 @@ from tdagw import eom
 from tdagw.self_energy import SelfEnergyModel
 from distrib_la import eigh_local
 
-__all__ = ["METHODS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
+__all__ = ["METHODS", "PROGRESS", "COUNTERS", "dsigma_per_step", "PropagatorConfig", "SampleSpec",
            "place_operators", "place_kernel", "place_state", "make_conj_dev",
            "sample_plan", "chunk_plan", "initial_carry", "carry_to_host",
            "carry_from_host", "coupling_radius", "magnus_dt_limit", "step_growth",
@@ -112,6 +117,12 @@ PROBE_BACKTRACKS = 8
 STIFF_KRYLOV_MIN = 80
 STIFF_KRYLOV_PER_MODE = 5
 STIFF_GROUP_GAP = 1e-6
+#: The sample entry of the run log's invariants, (n, ntr, 3) per chunk on the host:
+#: Σ_k w_k Tr ρ_k, Σ_k w_k Tr ρ_k² (real parts) and |E(t)| (a.u.) per trial.
+PROGRESS = "lorrax.progress"
+#: The host entry of the cumulative counters at a chunk's end: steps, rejected tries,
+#: ΔΣ calls in steps and at samples (this run, not a resumed checkpoint's).
+COUNTERS = "lorrax.counters"
 
 
 def dsigma_per_step(method: str, n_corr: int) -> int:
@@ -410,8 +421,24 @@ def _sample(ph, ops, spec: SampleSpec, drive, *, cell_volume, nspinor):
                 raise ValueError(f"GATE td_measurement_kind: got: {kind!r}; want: one of "
                                  f"the kinds _sample implements; fix: internal (the deck "
                                  f"parser admits only those)")
+        out[PROGRESS] = _invariants(ops, rho, drive(t))
         return out
     return fn
+
+
+def _invariants(ops, rho, efield):
+    """(ntr, 3): Σ_k w_k Tr ρ_k, Σ_k w_k Re Tr ρ_k², |E| (a.u.), on the device.
+
+    Both traces are conserved by a Hamiltonian flow (Γ = 0): the commutators
+    -i[H, ρ] keep Tr ρ_k and Tr ρ_k^2 at every k, and the intraband term moves
+    charge between k only.  w_k is zero on the padding, so the padded rows do
+    not enter.  No ΔΣ evaluation; two reductions over k per sample.
+    """
+    w = ops.w_k.astype(jnp.float64)[None, :]                             # (1, nk)
+    tr = jnp.sum(w * jnp.real(jnp.trace(rho, axis1=-2, axis2=-1)), axis=1)
+    pur = jnp.sum(w * jnp.real(jnp.sum(rho * jnp.swapaxes(rho, -1, -2), axis=(-2, -1))),
+                  axis=1)
+    return jnp.stack([tr, pur, jnp.sqrt(jnp.sum(jnp.abs(efield) ** 2, axis=-1))], axis=-1)
 
 
 def _magnus_parts(cfg: PropagatorConfig):
@@ -612,7 +639,8 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
 # ---------------------------------------------------------------------------
 
 def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float,
-                    n_iter: int = COUPLING_POWER_ITERATIONS, seed: int = 0):
+                    n_iter: int = COUPLING_POWER_ITERATIONS, seed: int = 0,
+                    timed: bool = False):
     """Power-iteration estimate of the spectral radius σ (Ha) of the coupling map.
 
         L(x) = -i [dSigma[rho^eq + x] - dSigma[rho^eq], rho^eq]
@@ -642,7 +670,11 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
     iteration keeps x and the estimate is 0, never 0/0, and a radius below
     the floor (1e-12 Ha, 2.7e-11 eV: it would bound only steps above 1e11
     a.u.) returns σ = 0.0.  A map that returns non-finite values gives
-    σ = nan (the gate refuses it by name).  Returns (σ, the n_iter estimates).
+    σ = nan (the gate refuses it by name).  Returns (σ, the n_iter estimates);
+    ``timed = True`` adds dict(compile_s, exec_s, dsigma): the program is
+    lowered and compiled ahead of time and its one execution timed, so
+    exec_s / dsigma (2 n_iter + 1 calls; the rest of an iteration is
+    elementwise) is the measured wall of one ΔΣ call at no extra cost.
     """
     nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
     rng = np.random.default_rng(seed)
@@ -653,7 +685,8 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
     x = x * (np.abs(gap) > 0.5) * w[None, :, None, None]
     x = 0.5 * (x + np.conj(np.swapaxes(x, -1, -2)))
     if not np.any(x):                                 # no cv pair on a logical k: nothing couples
-        return 0.0, np.zeros(int(n_iter))
+        return (0.0, np.zeros(int(n_iter))) + (
+            (dict(compile_s=0.0, exec_s=0.0, dsigma=0),) if timed else ())
     x0 = place_state(x, mesh)
     gap_d = place_state(np.broadcast_to(gap, x.shape).astype(complex), mesh)
     zero = place_state(np.zeros_like(x), mesh)
@@ -678,9 +711,18 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
         _, est = jax.lax.scan(body, x / nrm(x), None, length=int(n_iter), unroll=1)
         return est
 
-    est = np.asarray(gather_to_host(jax.jit(run)(x0, gap_d, zero, ops, model.params)))
+    args = (x0, gap_d, zero, ops, model.params)
+    t_lower = time.perf_counter()
+    prog = jax.jit(run).lower(*args).compile()
+    t_run = time.perf_counter()
+    est = np.asarray(gather_to_host(prog(*args)))
+    t_done = time.perf_counter()
     sigma = float(est[-1])
-    return (0.0 if 0.0 <= sigma < COUPLING_ZERO_FLOOR else sigma), est
+    sigma = 0.0 if 0.0 <= sigma < COUPLING_ZERO_FLOOR else sigma
+    if not timed:
+        return sigma, est
+    return sigma, est, dict(compile_s=t_run - t_lower, exec_s=t_done - t_run,
+                            dsigma=2 * int(n_iter) + 1)
 
 
 def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:
@@ -1013,6 +1055,22 @@ def _chunk_program(cfg: PropagatorConfig, spec: SampleSpec, model_apply,
     return jax.jit(run, donate_argnums=(0,))
 
 
+def _fixed_counters(cfg: PropagatorConfig, s_start: int, s_end: int, fresh: bool) -> dict:
+    """Steps and ΔΣ calls of a fixed-step run over steps [s_start, s_end).
+
+    dsigma_per_step per step, the Magnus bootstrap's extra node calls on the
+    steps it covers, and the initial carry's one call of a run from t0
+    (``fresh``).  The per-chunk ``COUNTERS`` and the final counters are both
+    this count.
+    """
+    n = int(s_end) - int(s_start)
+    dsig = n * dsigma_per_step(cfg.method, cfg.n_corr)
+    if cfg.method in ("magnus2", "cfm4"):
+        boot = max(0, min(int(s_end), _magnus_parts(cfg)[4]) - int(s_start))
+        dsig += boot * BOOTSTRAP_EXTRA * (1 if cfg.method == "magnus2" else 2)
+    return dict(accepted=n, rejected=0, dsigma=dsig + (1 if fresh else 0))
+
+
 def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                     model: SelfEnergyModel, drive: Callable, mesh, *,
                     cell_volume: float, nspinor: int, count: int,
@@ -1020,10 +1078,12 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     """Integrate over ``mtsteps`` in chunks; ``on_chunk`` writes each.
 
     ``on_chunk(i0, i1, samples_host, checkpoint, t_state)`` receives the
-    samples of measurement indices [i0, i1) gathered to host (every rank),
-    a zero-argument callable ``checkpoint() -> (rho_host, carry_leaves,
-    step)`` gathering the state, the integrator's whole carry and its step
-    counter (every rank), and the state's time.  ``resume`` = dict(carry=
+    samples of measurement indices [i0, i1) gathered to host (every rank;
+    with the ``PROGRESS`` invariants of each sample and the run's cumulative
+    ``COUNTERS`` at the chunk's end), a zero-argument callable
+    ``checkpoint() -> (rho_host, carry_leaves, step)`` gathering the state,
+    the integrator's whole carry and its step counter (every rank), and the
+    state's time.  ``resume`` = dict(carry=
     host leaves, step=int, i_next=int) continues a checkpointed run from its
     next sample.  Returns (counters, carry): steps taken by this run,
     rejected tries, dSigma evaluations; with the stiff split also the
@@ -1049,6 +1109,8 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     n_meas = int(mtsteps.size)
     fixed = cfg.method != "dp54"
     programs = {}                       # static key -> jitted chunk, this run only
+    needs = any(kind == "current" and not dict(opts).get("use_v0", False)
+                for _, kind, opts in spec.kinds)        # one ΔΣ call per sample
 
     def program(key, n_steps, last):
         if key not in programs:
@@ -1078,19 +1140,14 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                         f"the split scheme and its stability is unknown; fix: a smaller dt, more "
                         f"stiff_iter, or stiff_modes = 0")
             host = jax.tree.map(gather_to_host, samples)
+            host[COUNTERS] = dict(_fixed_counters(cfg, s_start, s1, resume is None),
+                                  sample_dsigma=(i1 - i_start) if needs else 0)
             state = (lambda c=carry, s=s1: (gather_to_host(c[0] if cfg.method in ("rk4", "etdrk4")
                                                           else ops.rho_eq[None] + c[0]),
                                             carry_to_host(c), s))
             on_chunk(i0, i1, host, state, cfg.t0 + s1 * cfg.dt)
             s_end = s1
-        n_steps = s_end - s_start
-        stats = dict(accepted=n_steps, rejected=0,
-                     dsigma=n_steps * dsigma_per_step(cfg.method, cfg.n_corr))
-        if cfg.method in ("magnus2", "cfm4"):
-            boot = max(0, min(s_end, _magnus_parts(cfg)[4]) - s_start)
-            per = 1 if cfg.method == "magnus2" else 2
-            stats["dsigma"] += boot * BOOTSTRAP_EXTRA * per
-        stats["dsigma"] += 1 if resume is None else 0          # the initial carry's call
+        stats = _fixed_counters(cfg, s_start, s_end, resume is None)
         stats["t_final"] = cfg.t0 + s_end * cfg.dt
         if split:
             stats["fast"] = fast_solve_counters(carry)
@@ -1105,6 +1162,11 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
             carry, samples = prog(carry, ops, model.params, times,
                                   jnp.zeros(i1 - i0, jnp.int64), jnp.zeros(i1 - i0), 0)
             host = jax.tree.map(gather_to_host, samples)
+            done = [int(gather_to_host(v))
+                    for v in (carry.n_accepted, carry.n_rejected, carry.n_rhs)]
+            host[COUNTERS] = dict(accepted=done[0] - base[0], rejected=done[1] - base[1],
+                                  dsigma=done[2] - base[2],
+                                  sample_dsigma=(i1 - i_start) if needs else 0)
             state = (lambda c=carry: (gather_to_host(c.y), carry_to_host(c), 0))
             on_chunk(i0, i1, host, state, float(gather_to_host(carry.t)))
         if bool(gather_to_host(carry.failed)):
@@ -1116,7 +1178,5 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
                      rejected=int(gather_to_host(carry.n_rejected)) - base[1],
                      dsigma=int(gather_to_host(carry.n_rhs)) - base[2],
                      t_final=float(gather_to_host(carry.t)))
-    needs = any(kind == "current" and not dict(opts).get("use_v0", False)
-                for _, kind, opts in spec.kinds)
     stats["sample_dsigma"] = (n_meas - i_start) if needs else 0
     return stats, carry

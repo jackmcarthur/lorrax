@@ -377,7 +377,11 @@ in strong fields (3.2e-6 at 5 as at 5e9 V/m); the triple jump restores order
 
 ### Choosing a method {#choosing}
 
-Measured operating points (2026-10-16). Cost is ΔΣ evaluations per
+The choice for a production run, with the costs measured on the 30×30 CrI3 ISDF
+model (`cfm4` at 50 as, the stiff split near 1e-4), is on
+[Running TD-aGW](../how-to/td-agw-run.md#integrators); the run log that records
+the gate and the cost per fs is described there too. Measured operating points
+(2026-10-16). Cost is ΔΣ evaluations per
 simulated fs; error is the relative L2 error of P(t) over 30 fs.
 
 | system | DP54 | ETDRK4 | CFM4 (2 corrections) | RK4 |
