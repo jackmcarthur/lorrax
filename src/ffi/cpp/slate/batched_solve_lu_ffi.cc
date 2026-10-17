@@ -296,10 +296,10 @@ static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate:
         int64_t sa = 0, sx = 0;
         auto Aq = shell<T>(n, n, nb, nb, ctx);
         auto Xq = shell<T>(n, nrhs, nb, nb_b, ctx);
-        const int64_t wa = seed_want(Aq, ctx, false), wx = seed_want(Xq, ctx, true);
-        lorrax_ffi::slate::PoolSeed ws = seed.carve(Aq, wa, &Xq, wx);   // matrix iq's SLATE objects die below
-        fill(Aq, ws, wa, &sa);
-        fill(Xq, ws, wx, &sx);
+        const int64_t want_a = seed_want(Aq, ctx, false), want_x = seed_want(Xq, ctx, true);
+        lorrax_ffi::slate::PoolSeed ws = seed.carve(Aq, want_a, &Xq, want_x);   // matrix iq's SLATE objects die below
+        fill(Aq, ws, want_a, &sa);
+        fill(Xq, ws, want_x, &sx);
         lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
         lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
         lorrax_ffi::slate::PoolWatchScope wx(pw, Xq, "X", sx, local_of(Xq));
@@ -337,9 +337,9 @@ static ffi::Error GetrfImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
     for (int64_t iq = 0; iq < nq; ++iq) {
         int64_t sa = 0;
         auto Aq = shell<T>(n, n, nb, nb, ctx);
-        const int64_t wa = seed_want(Aq, ctx, false);
-        lorrax_ffi::slate::PoolSeed ws = seed.carve<T>(Aq, wa, nullptr, 0);
-        fill(Aq, ws, wa, &sa);
+        const int64_t want_a = seed_want(Aq, ctx, false);
+        lorrax_ffi::slate::PoolSeed ws = seed.carve<T>(Aq, want_a, nullptr, 0);
+        fill(Aq, ws, want_a, &sa);
         lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
         lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
         if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
@@ -398,10 +398,10 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
         int64_t sa = 0, sx = 0;
         auto Aq = shell<T>(n, n, nb, nb, ctx);
         auto Xq = shell<T>(n, nrhs, nb, nb_b, ctx);
-        const int64_t wa = seed_want(Aq, ctx, false), wx = seed_want(Xq, ctx, true);
-        lorrax_ffi::slate::PoolSeed ws = seed.carve(Aq, wa, &Xq, wx);   // matrix iq's SLATE objects die below
-        fill(Aq, ws, wa, &sa);
-        fill(Xq, ws, wx, &sx);
+        const int64_t want_a = seed_want(Aq, ctx, false), want_x = seed_want(Xq, ctx, true);
+        lorrax_ffi::slate::PoolSeed ws = seed.carve(Aq, want_a, &Xq, want_x);   // matrix iq's SLATE objects die below
+        fill(Aq, ws, want_a, &sa);
+        fill(Xq, ws, want_x, &sx);
         lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
         lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
         lorrax_ffi::slate::PoolWatchScope wx(pw, Xq, "X", sx, local_of(Xq));
