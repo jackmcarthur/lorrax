@@ -2577,7 +2577,7 @@ def x_block_rows(rows) -> np.ndarray:
 #   four blocks, 0.387 at two; the fixed-column store beside it was 1.05x slower); m9b, mode 9's persistent orbit-blocked
 #   split plane pass where the tiles fill 90% of their waves (20^3 427 tiles 6.33 -> 5.96, 24^3
 #   17.3 -> 13.6; 0.995-1.006x on 18 of 24 measured rows, 15^3 0.88x).  Their measured cost on the
-#   45-case sweep (prune / previous, per call): mode 7 14^3 n_s 1 1.123, 15^3 1.07 (before the
+#   45-case sweep (prune / previous, per call): mode 7 14^3 n_s 1 1.123, 15^3s 1.07, 15^3 1.06 (before the
 #   XLA tables also Fe 8^3 1.033, 12^3 n_s 1 1.127, 13^3 n_s 2 1.077); mode 9 6^3 1.20-1.22 (W2 at two blocks; W2 off below nk 256 instead
 #   measured 6^3 1.10 and 12x12x1 1.33, so W2 from nk 128), 14^3-24^3 1.11-1.23; the rest
 #   <= 1.02 (kc_prune/sweep_ratio.csv, w2_ratio.csv).
