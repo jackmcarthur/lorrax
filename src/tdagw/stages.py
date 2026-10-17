@@ -304,7 +304,7 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
         keys.append("control.timesteps.tf")
     if v["lorrax.node_solver"] != "truncated":      # converged nodes: the solve's settings
         keys += ["lorrax.node_solver", "lorrax.node_tol", "lorrax.node_memory",
-                 "lorrax.node_recycle"]
+                 "lorrax.node_recycle", "lorrax.node_frame", "lorrax.node_shift_ev"]
     fp = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in keys}
     fp["lorrax.magnus_frame"] = magnus_frame(v)
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
@@ -551,7 +551,8 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
         n_corr=int(v["lorrax.n_corr"]), predictor=v["lorrax.predictor"], frame=magnus_frame(v),
         node_solver=v["lorrax.node_solver"], node_tol=float(v["lorrax.node_tol"]),
         node_max_iter=int(v["lorrax.node_max_iter"]), node_memory=int(v["lorrax.node_memory"]),
-        node_recycle=bool(v["lorrax.node_recycle"]),
+        node_recycle=bool(v["lorrax.node_recycle"]), node_frame=v["lorrax.node_frame"],
+        node_shift=float(v["lorrax.node_shift_ev"]) / tdgw_io.HA_IN_EV,
         atol=float(v["control.ivp.atol"]), rtol=float(v["control.ivp.rtol"]),
         max_step=float(v["control.timesteps.max_step"]), chunk=min(chunk, nt),
         remainder=bool(v["system.depopulation"] != 0.0
@@ -610,6 +611,9 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
         + ((f", Gauss nodes converged ({v['lorrax.node_solver']}, node_tol "
             f"{v['lorrax.node_tol']:.3g}, memory {v['lorrax.node_memory']}"
             + (", Anderson pairs recycled across steps" if v["lorrax.node_recycle"] else "")
+            + (f", predictor in the {v['lorrax.node_frame']} frame"
+               + (f" (shift {v['lorrax.node_shift_ev']:g} eV)" if v["lorrax.node_frame"] == "slow" else "")
+               if v["lorrax.node_frame"] != "interaction" else "")
             + ", at most "
             f"{v['lorrax.node_max_iter']} node-map evaluations per step)")
            if v["lorrax.node_solver"] != "truncated" else

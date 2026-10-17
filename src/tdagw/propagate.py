@@ -145,6 +145,12 @@ class PropagatorConfig(NamedTuple):
         Anderson memory.
     node_recycle : the converged solve starts each step from the previous
         step's Anderson column pairs (carried, and checkpointed, with the state).
+    node_frame : the frame the converged solve's predictor extrapolates the
+        node history in: "interaction" (as the truncated step), "lab" (the
+        Schrödinger picture: a collective response oscillates at one frequency
+        in every cv element there) or "slow" (the interaction picture of
+        H0 - node_shift P_c).  Only the guess changes: the converged step does not.
+    node_shift : Ha, the conduction shift of the "slow" frame.
     """
     method: str
     t0: float
@@ -164,6 +170,8 @@ class PropagatorConfig(NamedTuple):
     node_max_iter: int = 40
     node_memory: int = 5
     node_recycle: bool = False
+    node_frame: str = "interaction"
+    node_shift: float = 0.0
 
 
 def converged_nodes(cfg: PropagatorConfig) -> bool:
@@ -200,6 +208,20 @@ def _account_zero() -> NodeAccount:
     return NodeAccount(jnp.int64(0), jnp.int32(0), jnp.int32(0), jnp.int64(-1),
                        jnp.float64(0.0), jnp.float64(0.0), jnp.zeros(z, jnp.int64),
                        jnp.zeros(z, jnp.int32), jnp.zeros(z, jnp.int64))
+
+
+def _frame_rotation(cfg: PropagatorConfig, ph):
+    """(nk, nb, nb) d_nm with frame(V)(s) = e^{-i s d} V_I(s) for cfg.node_frame (None: interaction).
+
+    lab: d = E_n - E_m (the free flow itself); slow: d = shift ([n in c] - [m in c]),
+    the interaction picture of H0 - shift P_c seen from that of H0.
+    """
+    if cfg.node_frame == "lab":
+        return ph["delta"]
+    if cfg.node_frame == "slow":
+        cond = (ph["occ"] < 0.5).astype(jnp.float64)                        # (nk, nb)
+        return float(cfg.node_shift) * (cond[:, :, None] - cond[:, None, :])
+    return None
 
 
 def _recycle_zero(cfg: PropagatorConfig, x0, ph):
@@ -418,7 +440,7 @@ def _physics(ops, mparams, model: SelfEnergyModel, drive: Callable, mesh):
     no_occ = jnp.zeros_like(occ)
     return dict(dsig=dsig, rhs=rhs, field=field, free=free, nonlin=nonlin,
                 lam=lam, remainder=remainder, pin=pin, explicit=explicit,
-                dsig_nodes=dsig_nodes,
+                dsig_nodes=dsig_nodes, delta=delta, occ=occ,
                 pin_stack=lambda a: jax.lax.with_sharding_constraint(a, stack_spec),
                 conj_dev=lambda w, x, tau: pin(conj(w, x, occ, tau)),
                 conjugate=lambda w, y, tau: pin(conj(w, y, no_occ, tau)),
@@ -526,10 +548,21 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
 
         implicit = converged_nodes(cfg)
         recycle = implicit and bool(cfg.node_recycle)
+        rot = _frame_rotation(cfg, ph) if implicit else None
+
+        def predict(hist, h):
+            """The cubic guess at the nodes, extrapolated in cfg.node_frame (IP of t in and out)."""
+            if rot is None:
+                return tuple(jnp.tensordot(w, hist, axes=1))
+            to_f = jnp.stack([jnp.exp((-1j * o * h) * rot).astype(hist.dtype) * hist[j]
+                              for j, o in enumerate(hist_offsets)])
+            pred = jnp.tensordot(w, to_f, axes=1)
+            return tuple(jnp.exp((1j * ci * h) * rot).astype(hist.dtype) * pred[i]
+                         for i, ci in enumerate(nodes))
 
         def step(t, c, h, t_next):
             x, hist, k = c[:3]
-            guess = tuple(jnp.tensordot(w, hist, axes=1))
+            guess = predict(hist, h) if implicit else tuple(jnp.tensordot(w, hist, axes=1))
             if implicit:
                 out = ti.ip_magnus_implicit_step(
                     ph["field"], ph["dsig_nodes"], inner, ph["free"], t, x, h, guess,

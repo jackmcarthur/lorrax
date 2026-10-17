@@ -89,6 +89,9 @@ def main():
                ref=run(dt_max / 16.0, "ref", dict(conv, node_tol=1e-12)),
                trunc_q=run(0.25 * dt_max, "trunc_q"),
                conv_q=run(0.25 * dt_max, "conv_q", conv),
+               conv_q_lab=run(0.25 * dt_max, "conv_q_lab", dict(conv, node_frame="lab")),
+               conv_q_slow=run(0.25 * dt_max, "conv_q_slow", dict(conv, node_frame="slow",
+                                                                    node_shift_ev=1.0)),
                starved=run(2.0 * dt_max, "starved", dict(conv, node_max_iter=2)))
     tp.step_growth = lambda *a, **k: ((1.0, np.ones(1), dict(n_eval=0, n_eval_max=0, n_fail=0,
                                                              dsigma=0))

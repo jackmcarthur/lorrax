@@ -59,6 +59,8 @@ TD_DEFAULTS = {
     "lorrax.node_max_iter": 40,
     "lorrax.node_memory": 5,
     "lorrax.node_recycle": False,
+    "lorrax.node_frame": "interaction",
+    "lorrax.node_shift_ev": 0.0,
     "lorrax.magnus_frame": "",
     "lorrax.model": "",
     "lorrax.kernel_file": "",
@@ -247,6 +249,14 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
                     f"node_memory = {mem!r}", "0 < node_tol <= 1e-3, node_max_iter >= 2, "
                     "node_memory >= 1 (integers)", "set them in [lorrax]")
     vals["lorrax.node_tol"] = float(tol)
+    if vals["lorrax.node_frame"] not in ("interaction", "lab", "slow") or (
+            vals["lorrax.node_frame"] != "interaction" and solver == "truncated") or (
+            vals["lorrax.node_frame"] != "slow" and float(vals["lorrax.node_shift_ev"]) != 0.0):
+        raise _gate("td_node_solve_settings", f"node_frame = {vals['lorrax.node_frame']!r}, "
+                    f"node_shift_ev = {vals['lorrax.node_shift_ev']!r} with node_solver = "
+                    f"{solver!r}", "interaction | lab | slow (lab, slow: node_solver = anderson; "
+                    "node_shift_ev with slow only)", "set [lorrax] node_frame")
+    vals["lorrax.node_shift_ev"] = float(vals["lorrax.node_shift_ev"])
     if not isinstance(vals["lorrax.node_recycle"], bool) or (
             vals["lorrax.node_recycle"] and solver == "truncated"):
         raise _gate("td_node_solve_settings", f"node_recycle = {vals['lorrax.node_recycle']!r} "

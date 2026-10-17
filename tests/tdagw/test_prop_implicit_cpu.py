@@ -325,6 +325,9 @@ def test_converged_nodes_run_where_truncated_refuses(fixture_runs):
     assert "refused" not in a and a["finite"], a
     err_at = np.linalg.norm(_p(a) - ref) / np.linalg.norm(ref)
     assert err_at <= err / 8.0, (err, err_at)          # order >= 3 above the truncated limit
+    for fr in ("conv_q_lab", "conv_q_slow"):             # another predictor frame: the same step
+        d = np.linalg.norm(_p(r[fr]) - _p(r["conv_q"])) / np.linalg.norm(_p(r["conv_q"]))
+        assert "refused" not in r[fr] and d <= 1e-8, (fr, d)
     e_c = np.linalg.norm(_p(r["conv_q"]) - ref) / np.linalg.norm(ref)
     e_t = np.linalg.norm(_p(r["trunc_q"]) - ref) / np.linalg.norm(ref)
     assert e_c <= e_t and e_c <= 1e-4, (e_c, e_t)      # the truncated node error adds here
@@ -355,7 +358,10 @@ def _deck_raw(**lor):
     (dict(node_solver="anderson", node_tol=0.0), "td_node_solve_settings"),
     (dict(node_solver="anderson", node_max_iter=1), "td_node_solve_settings"),
     (dict(node_solver="anderson", node_memory=0), "td_node_solve_settings"),
-    (dict(node_recycle=True), "td_node_solve_settings")])
+    (dict(node_recycle=True), "td_node_solve_settings"),
+    (dict(node_frame="lab"), "td_node_solve_settings"),
+    (dict(node_solver="anderson", node_frame="lab", node_shift_ev=1.0), "td_node_solve_settings"),
+    (dict(node_solver="anderson", node_frame="rotating"), "td_node_solve_settings")])
 def test_deck_refuses_bad_node_settings(lor, gate):
     from tdagw.td_config import parse_td_deck
     with pytest.raises(ValueError, match=f"GATE {gate}"):
