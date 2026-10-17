@@ -53,7 +53,41 @@ def replicated(mesh_xy):
         if hit is None or hit.is_deleted():
             hit = _PLACED[key] = device_put_process_local(value, sharding)
         return hit
+    put.mesh = mesh_xy
     return put
+
+
+# Device scalar indices (compiled constants): ``common.device_index``.
+from common.device_index import device_index  # noqa: E402,F401  (re-exported)
+
+
+@lru_cache(maxsize=None)
+def _point_table(mesh_xy, points):
+    """The recipe's sample points ``z[sample_id]`` (complex128, replicated): a compiled constant,
+    made once per (mesh, recipe points)."""
+    table = np.asarray(points, np.complex128)
+    return jax.jit(lambda: jnp.asarray(table), out_shardings=NamedSharding(mesh_xy, P()))()
+
+
+def sample_points(mesh_xy, recipe):
+    """:func:`_point_table` of ``recipe``: every distinct sample's physical point, by sample id."""
+    ids = sorted({int(i) for i in np.asarray(recipe["distinct_id"]).reshape(-1)})
+    points = [0j] * (max(ids) + 1)
+    for sid in ids:
+        points[sid] = _sample_point(recipe, sid)
+    return _point_table(mesh_xy, tuple(complex(z) for z in points))
+
+
+def _node_scale(zs, jz, scale):
+    """A state's derivative scale from the sample point ``zs[jz]`` (traced): ``scale`` is ``None``
+    (1, the time-reversal route) or ``(factor, conjugate)``: factor * (conj z if conjugate else z).
+    The products are exact (a factor of +-2), so the value is the host's ``np.complex128`` bit
+    for bit."""
+    if scale is None:
+        return jnp.asarray(1.0, jnp.complex128)
+    factor, conjugate = scale
+    z = jax.lax.dynamic_index_in_dim(zs, jz, axis=0, keepdims=False)
+    return factor * (jnp.conj(z) if conjugate else z)
 
 
 def _sample_point(recipe, sample_id):
@@ -107,14 +141,15 @@ def _round_kernels(mesh, layout="batch"):
         return program(lambda w: jnp.take(w, jnp.asarray(indices), axis=1), (batch,), batch)
 
     @lru_cache(maxsize=None)
-    def act(conjugate):
-        # Output and action of state x at sample j: W x, dW x (adjoints for a conjugate state).
-        def body(w, dw, j, x, scale):
+    def act(conjugate, scale=None):
+        # Output and action of state x at sample j: W x, dW x (adjoints for a conjugate state);
+        # the action's scale is formed from the sample point zs[jz] (``_node_scale``).
+        def body(w, dw, j, x, zs, jz):
             a, d = sample(w, j), sample(dw, j)
             if conjugate:
                 a, d = adjoint(a), adjoint(d)
-            return mm(a,x), mm(d,x) * scale
-        return program(body, (batch, batch, rep, batch, rep), (batch, batch))
+            return mm(a,x), mm(d,x) * _node_scale(zs, jz, scale)
+        return program(body, (batch, batch, rep, batch, rep, rep), (batch, batch))
 
     @lru_cache(maxsize=None)
     def minus_q_partner(flags):
@@ -125,14 +160,15 @@ def _round_kernels(mesh, layout="batch"):
         derivative is with respect to s at -conj z; ``scales`` converts it to
         the derivative with respect to z there.
         """
-        def body(w, dw, xs, j, scales):
+        def body(w, dw, xs, j, zs, jz):
             a, d = sample(w, j), sample(dw, j)
             outputs = []
             for k, conjugate in enumerate(flags):
                 op_a, op_d = ((a, d) if conjugate else (adjoint(a), adjoint(d)))
-                outputs.extend((mm(op_a,xs[:,k]), mm(op_d,xs[:,k]) * scales[k]))
+                # dW/dz at the mirror node -node: -2 node, node = conj z (conjugate state) or z.
+                outputs.extend((mm(op_a,xs[:,k]), mm(op_d,xs[:,k]) * _node_scale(zs, jz, (-2, conjugate))))
             return tuple(outputs)
-        return program(body, (batch, batch, batch, rep, rep),
+        return program(body, (batch, batch, batch, rep, rep, rep),
                        (batch,) * (2 * len(flags)))
 
     def dedupe(q, o):
@@ -282,7 +318,7 @@ def _needs_partner(z, kind, *, ordered):
 
 
 def _sample_states(k, W, dW, j, z, kind, direction, widths, recipe, *, ordered, real, eigh_plan,
-                   column_extent, put, prepared=None):
+                   column_extent, put, prepared=None, points=None, jz=None):
     """The states one fitted role of one sample contributes, before its mirrors.
 
     ``direction`` [.., n, r] is the role's selection. The state at the node
@@ -312,15 +348,15 @@ def _sample_states(k, W, dW, j, z, kind, direction, widths, recipe, *, ordered, 
                 tol=recipe["multiplet_relative_tolerance"]))
         elif conjugate:
             direction = states[-1][2]
-        scale = put(np.complex128(2 * (s.conjugate() if conjugate else s) if ordered else 1.0))
-        output, action = k.act(bool(conjugate))(W, dW, j, direction, scale)
+        output, action = k.act(bool(conjugate), (2, bool(conjugate)) if ordered else None)(
+            W, dW, j, direction, points, jz)
         states.append((s.conjugate() if conjugate else s, direction, output, action))
         flags.append(conjugate)
         counts.append(state_widths)
     return states, flags, counts
 
 
-def _mirror_states(k, states, flags, z, *, W=None, dW=None, j=None, partner=None, put):
+def _mirror_states(k, states, flags, z, *, W=None, dW=None, j=None, partner=None, put, points, jz):
     """Ordered states X(-node) on each state's directions (W 25).
 
     They act with W_q(-conj z) = conj(W_{-q}(z)): the original state at z needs
@@ -335,13 +371,12 @@ def _mirror_states(k, states, flags, z, *, W=None, dW=None, j=None, partner=None
                              "needs W_q(-conj z) on the ordered route")
         xs = k.stack(*[st[1] for st in states])
         flat = k.minus_q_partner(tuple(flags))(
-            partner[0], partner[1], xs, put(np.int32(0)),
-            put(np.asarray([-2 * st[0] for st in states], np.complex128)))
+            partner[0], partner[1], xs, device_index(put.mesh, 0), points, jz)
         results = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(states))]
         del xs
     else:
         # An imaginary support's states act one at a time, each on its own panel.
-        results = [k.act(not flag)(W, dW, j, st[1], put(np.complex128(-2 * st[0])))
+        results = [k.act(not flag, (-2, bool(flag)))(W, dW, j, st[1], points, jz)
                    for st, flag in zip(states, flags)]
     return [(-st[0], st[1], output, action) for st, (output, action) in zip(states, results)]
 
@@ -380,13 +415,14 @@ def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan,
     put = replicated(mesh_xy)
     q_all, values = _select(k, W, entries[:1], "line", {sid: 0}, recipe, real=real, eigh_plan=eigh_plan,
                             column_extent=column_extent, logical_n=logical_n)
-    direction = k.column(q_all, put(np.int32(0)))
+    direction = k.column(q_all, device_index(mesh_xy, 0))
     widths = tuple(int(row[0].size) for row in values)
     if any(w < 1 or w > logical_n for w in widths[:real]):
         raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
-    states, flags, counts = _sample_states(k, W, dW, put(np.int32(0)), z, "line", direction, widths, recipe,
-                                           ordered=ordered, real=real, eigh_plan=eigh_plan,
-                                           column_extent=column_extent, put=put)
+    states, flags, counts = _sample_states(k, W, dW, device_index(mesh_xy, 0), z, "line", direction, widths,
+                                           recipe, ordered=ordered, real=real, eigh_plan=eigh_plan,
+                                           column_extent=column_extent, put=put,
+                                           points=sample_points(mesh_xy, recipe), jz=device_index(mesh_xy, sid))
     return dict(states=states, flags=flags, counts=np.asarray(widths, np.int64))
 
 
@@ -395,7 +431,8 @@ def line_sample_mirrors(line, partner, recipe, *, sid, mesh_xy):
     k = _round_kernels(mesh_xy, "face" if is_face_stack(partner[0]) else "batch")
     put = replicated(mesh_xy)
     return _mirror_states(k, line["states"], line["flags"], _sample_point(recipe, sid),
-                          partner=partner, put=put)
+                          partner=partner, put=put, points=sample_points(mesh_xy, recipe),
+                          jz=device_index(mesh_xy, sid))
 
 
 @lru_cache(maxsize=None)
@@ -601,6 +638,7 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
     if any(sid not in index and sid not in line_states for sid, _ in entries):
         raise ValueError("GATE shared_pole_sample_identity: a fitted sample is neither dense nor a stored line sample")
     put = replicated(mesh_xy)
+    points = sample_points(mesh_xy, recipe)
     kinds = {kind: [(sid, label) for sid, label in entries
                     if sid not in line_states and label.split(":", 1)[0] == kind]
              for kind in ("line", "imaginary")}
@@ -609,7 +647,7 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
                 for kind in kinds if kinds[kind]}
     prepared = _prepare_partners(k, W, dW, recipe, kinds, selected, index, real=real, ordered=ordered,
                                  eigh_plan=eigh_plan, column_extent=column_extent,
-                                 logical_n=logical_n, put=put, line_states=line_states)
+                                 logical_n=logical_n, put=put, line_states=line_states, points=points)
     states, counts, records, mirrors, mirror_counts, mirror_records = [], [], [], [], [], []
     for sid in (int(i) for i in recipe["fit_ids"]):
         labels = [label for s, label in entries if s == sid]
@@ -623,21 +661,21 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
                 mirror_counts += [widths] * len(mirrored)
                 mirror_records += [(sid, label, i == 1) for i in range(len(mirrored))]
             continue
-        z, j = _sample_point(recipe, sid), put(np.int32(index[sid]))
+        z, j, jz = _sample_point(recipe, sid), device_index(mesh_xy, index[sid]), device_index(mesh_xy, sid)
         sample_states, sample_flags, sample_counts, sample_records = [], [], [], []
         for kind in ("line", "imaginary"):
             for e, (esid, label) in enumerate(kinds[kind]):
                 if esid != sid:
                     continue
                 q_all, values = selected[kind]
-                direction = k.column(q_all, put(np.int32(e)))
+                direction = k.column(q_all, device_index(mesh_xy, e))
                 widths = tuple(int(row[e].size) for row in values)
                 if any(w < 1 or w > logical_n for w in widths[:real]):
                     raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
                 new, flags, new_counts = _sample_states(
                     k, W, dW, j, z, kind, direction, widths, recipe, ordered=ordered, real=real,
                     eigh_plan=eigh_plan, column_extent=column_extent, put=put,
-                    prepared=prepared.get((kind, e)))
+                    prepared=prepared.get((kind, e)), points=points, jz=jz)
                 sample_states += new
                 sample_flags += flags
                 sample_counts += new_counts
@@ -646,7 +684,8 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
         counts += sample_counts
         records += sample_records
         if ordered and sample_states:
-            mirrors += _mirror_states(k, sample_states, sample_flags, z, W=W, dW=dW, j=j, put=put)
+            mirrors += _mirror_states(k, sample_states, sample_flags, z, W=W, dW=dW, j=j, put=put,
+                                      points=points, jz=jz)
             mirror_counts += sample_counts
             mirror_records += sample_records
     roles = _roles(records, counts, ranks, column_extent)
@@ -658,7 +697,7 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
 
 
 def _prepare_partners(k, W, dW, recipe, kinds, selected, index, *, real, ordered, eigh_plan,
-                      column_extent, logical_n, put, line_states):
+                      column_extent, logical_n, put, line_states, points):
     """Every partner-taking role's original state and partner directions, for the whole round.
 
     The roles are independent (each reads its own sample of W), so their partner
@@ -667,7 +706,7 @@ def _prepare_partners(k, W, dW, recipe, kinds, selected, index, *, real, ordered
     original states are those :func:`_sample_states` forms (same programs, same
     operands). Returns ``{(kind, entry): (state, (directions, widths))}``.
     """
-    jobs = []
+    jobs, mesh_xy = [], put.mesh
     for sid in (int(i) for i in recipe["fit_ids"]):
         if sid in line_states:
             continue
@@ -677,13 +716,13 @@ def _prepare_partners(k, W, dW, recipe, kinds, selected, index, *, real, ordered
                 if esid != sid or not _needs_partner(z, kind, ordered=ordered):
                     continue
                 q_all, values = selected[kind]
-                direction = k.column(q_all, put(np.int32(e)))
+                direction = k.column(q_all, device_index(mesh_xy, e))
                 widths = tuple(int(row[e].size) for row in values)
                 if any(w < 1 or w > logical_n for w in widths[:real]):
                     raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
                 s = z if ordered else z ** 2
-                output, action = k.act(False)(W, dW, put(np.int32(index[sid])), direction,
-                                              put(np.complex128(2 * s if ordered else 1.0)))
+                output, action = k.act(False, (2, False) if ordered else None)(
+                    W, dW, device_index(mesh_xy, index[sid]), direction, points, device_index(mesh_xy, sid))
                 jobs.append(((kind, e), (s, direction, output, action)))
     if not jobs:
         return {}
@@ -700,14 +739,14 @@ def _round_partner_directions_many(pairs, cutoff, *, real, kernels, eigh_plan, c
     rank its own slots' rows) so the leading eigensystems of all pairs are TWO
     batch-layout eigh calls (the scale ``top`` and the complement ``perp``), on the
     leg's batched route where its row covers the stack (``distrib_la.local_eigh``),
-    and every row's spectrum reaches the host in one read. Each pair's retained
+    and only every row's count reaches the host, in one read (``leading_eigenvectors_above``). Each pair's retained
     directions are then cut back to its own carrier, the column extent of its own
     largest count (the stacked carrier's further columns are the exact zero tail),
     so the shapes are the per-pair call's. Face stacks, a single pair and pairs of
     unequal shape take the per-pair call.
     """
     from gw.shared_pole_execution import is_face
-    from gw.shared_pole_local import _pad_columns, host_tree
+    from gw.shared_pole_local import _pad_columns
     count = len(pairs)
     if (count < 2 or any(is_face(q) for q, _ in pairs)
             or len({(tuple(q.shape), tuple(o.shape)) for q, o in pairs}) != 1):
@@ -719,24 +758,15 @@ def _round_partner_directions_many(pairs, cutoff, *, real, kernels, eigh_plan, c
     top = kernels.interleave(count)(*(t for t, _ in dedupe))
     perp = kernels.interleave(count)(*(p for _, p in dedupe))
     del dedupe
-    m = int(perp.shape[-1])
-    _, largest = distrib_la.leading_eigenvectors(top, 1, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                 multiplet_tol=tol, real_rows=rows)
-    del top
-    directions, spectrum = distrib_la.leading_eigenvectors(
-        perp, m, eigh_plan=eigh_plan, column_extent=column_extent, multiplet_tol=tol, real_rows=rows)
-    del perp
-    spectrum_h, largest_h = host_tree((tuple(spectrum), tuple(largest)))
-    counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
-                   if i // count < real else 0 for i, (values, t) in enumerate(zip(spectrum_h, largest_h)))
-    per_pair = [tuple(counts[s * count + e] for s in range(slots)) for e in range(count)]
-    if max(counts) == 0:
+    # Both eighs, the cut against each row's largest top eigenvalue and the
+    # multiplet closure in one service call; the host reads only the counts.
+    kept_directions, sizes = distrib_la.leading_eigenvectors_above(
+        perp, top, cutoff, real=rows, eigh_plan=eigh_plan, column_extent=column_extent,
+        multiplet_tol=tol, real_rows=rows)
+    del top, perp
+    per_pair = [tuple(sizes[s * count + e] for s in range(slots)) for e in range(count)]
+    if kept_directions is None:
         return [(_times_zero(q), c) for (q, _), c in zip(pairs, per_pair)]
-    kept_directions, kept = distrib_la.retain_leading_eigenvectors(
-        directions, spectrum, counts, mesh=eigh_plan.mesh,
-        column_extent=column_extent, multiplet_tol=tol, real_rows=rows)
-    del directions
-    sizes = tuple(int(v.size) for v in kept)
     out = []
     for e, (part, (q, _)) in enumerate(zip(kernels.deinterleave(count)(kept_directions), pairs)):
         if max(per_pair[e]) == 0:
@@ -779,23 +809,15 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     from gw.shared_pole_execution import is_face
     spectral_rows = None if is_face(q) else real
     top, perp = kernels.dedupe(q, output)
-    m = int(perp.shape[-1])
-    _, largest = distrib_la.leading_eigenvectors(top, 1, eigh_plan=eigh_plan, column_extent=column_extent,
-                                                 multiplet_tol=tol, real_rows=spectral_rows)
-    directions, spectrum = distrib_la.leading_eigenvectors(
-        perp, m, eigh_plan=eigh_plan, column_extent=column_extent,
+    directions, counts = distrib_la.leading_eigenvectors_above(
+        perp, top, cutoff, real=real, eigh_plan=eigh_plan, column_extent=column_extent,
         multiplet_tol=tol, real_rows=spectral_rows)
-    counts = tuple(int(np.sum(np.asarray(values) > float(cutoff) ** 2 * float(np.asarray(t)[0])))
-                   if i < real else 0 for i, (values, t) in enumerate(zip(spectrum, largest)))
-    if max(counts) == 0:
+    if directions is None:
         return _times_zero(q), counts
     from gw.shared_pole_local import _pad_columns
-    directions, kept = distrib_la.retain_leading_eigenvectors(
-        directions, spectrum, counts, mesh=eigh_plan.mesh,
-        column_extent=column_extent, multiplet_tol=tol, real_rows=spectral_rows)
     if directions.shape[-1] < q.shape[-1]:
         directions = _pad_columns(directions.sharding, directions.shape, int(q.shape[-1]))(directions)
-    return directions, tuple(int(v.size) for v in kept)
+    return directions, counts
 
 
 def _model_diagnostics(model, moments, infinity_directions, *, matmul):

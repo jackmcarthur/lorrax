@@ -19,6 +19,7 @@ import numpy as np
 from typing import Callable
 
 import jax
+from lxkit import ordered_norm
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -213,7 +214,7 @@ def _normal_svd(A, eigh):
     return _singular_values(evals), v
 
 
-def _shifted_normal_eigh(g, eigh):
+def _shifted_normal_eigh(g, eigh, mesh=None):
     """eigh of the PSD normal matrix G as I + G/||G||_F, eigenvalues mapped back.
 
     cuSOLVERMp STEDC failed (info 4, in58730813.3/.4) on the zero cluster of a
@@ -224,7 +225,8 @@ def _shifted_normal_eigh(g, eigh):
     tau * sigma_max moves by ~eps sqrt(r) / tau**2 relative: 3e-8 at
     r = 2e4, tau = 1e-3, against the 1e-6 multiplet tolerance.
     """
-    scale = jnp.linalg.norm(g, axis=(-2, -1))
+    scale = (jnp.linalg.norm(g, axis=(-2, -1)) if mesh is None else
+             ordered_norm(g, axis=(-2, -1), mesh=mesh, spec=P(*((None,) * (g.ndim - 2)), "x", "y")))
     scale = jnp.where(scale > 0, scale, 1)
     eye = jnp.eye(g.shape[-1], dtype=g.dtype)
     mu, v = eigh(g / scale[..., None, None] + eye)
@@ -247,7 +249,7 @@ def _agree_kernel(mesh):
         root = jnp.asarray(True)
         for a in axes:
             root = root & (jax.lax.axis_index(a) == 0)
-        bits = jax.lax.psum(jnp.where(root, bits, jnp.zeros_like(bits)), axes)
+        bits = jax.lax.psum(jnp.where(root, bits, jnp.zeros_like(bits)), axes)  # exact-reduce: root's bits, zeros elsewhere
         return jax.lax.bitcast_convert_type(bits, s.dtype)
     return jax.jit(shard_map(body, mesh=mesh, in_specs=P(), out_specs=P(), check_vma=False))
 
@@ -278,18 +280,15 @@ def _close_cut_xp(xp, rows, count, tolerance):
     return xp.where((count > 0) & (count < n), first, count)
 
 
-@lru_cache(maxsize=64)
-def _device_cut_program(mesh, kind, shape, cut, max_rank, tolerance, real_rows, rcond):
-    """Per-row retained counts from the agreed device spectrum: the host cut, on the device.
+def _cut_counts(kind, cut, max_rank, tolerance, real_rows, rcond):
+    """The per-row retained counts of an agreed (ascending) device spectrum: the host cut, on the device.
 
     ``kind`` 'singular' (``right_singular_vectors``: relative cutoff ``cut``,
-    optional ``max_rank``) or 'leading' (``leading_eigenvectors`` with a scalar
-    width ``cut`` and optional ``rcond``); rows at index >= ``real_rows`` keep
-    none.  The host makes the same decisions from the same bits (its read of
-    the agreed spectrum), so the count operand never crosses from the host.
+    optional ``max_rank``) or 'leading' (``leading_eigenvectors``: width ``cut``,
+    a scalar or one per row, and optional ``rcond``); rows at index >= ``real_rows``
+    keep none.  Element for element the comparisons of the host cut
+    (``_close_spectral_cut``, ``_leading_counts``, ``_real_row_counts``).
     """
-    replicated = NamedSharding(mesh, P())
-
     def counts(agreed):
         rows = agreed[..., ::-1]
         if kind == "singular":
@@ -297,14 +296,111 @@ def _device_cut_program(mesh, kind, shape, cut, max_rank, tolerance, real_rows, 
             if max_rank is not None:
                 width = jnp.minimum(width, max_rank)
         else:
-            width = jnp.full(rows.shape[:-1], cut, jnp.int64)
+            if isinstance(cut, tuple):
+                width = jnp.asarray(np.asarray(cut, np.int64).reshape(rows.shape[:-1]))
+            else:
+                width = jnp.full(rows.shape[:-1], cut, jnp.int64)
             if rcond is not None:
                 width = jnp.minimum(width, jnp.sum(rows > rcond * jnp.max(jnp.abs(rows), axis=-1, keepdims=True), axis=-1))
         width = _close_cut_xp(jnp, rows, width.astype(jnp.int64), tolerance)
         if real_rows is not None and rows.ndim > 1:
             width = jnp.where(jnp.arange(rows.shape[0]) < real_rows, width, 0)
         return width.astype(jnp.int64)
-    return jax.jit(counts, out_shardings=replicated)
+    return counts
+
+
+@lru_cache(maxsize=64)
+def _device_cut_program(mesh, kind, shape, cut, max_rank, tolerance, real_rows, rcond):
+    """:func:`_cut_counts` as a replicated program (the select's count operand)."""
+    return jax.jit(_cut_counts(kind, cut, max_rank, tolerance, real_rows, rcond),
+                   out_shardings=NamedSharding(mesh, P()))
+
+
+def _nonfinite_rows(agreed):
+    """How many rows of a spectrum hold a non-finite value (a 1-D spectrum is one row)."""
+    return jnp.sum(~jnp.all(jnp.isfinite(agreed), axis=-1)).astype(jnp.int64).reshape(1)
+
+
+@lru_cache(maxsize=64)
+def _device_cut_word(mesh, kind, shape, cut, max_rank, tolerance, real_rows, rcond):
+    """``(counts, word)``: the select's count operand and ``[counts..., nonfinite rows]``.
+
+    The word is everything the host decides from the spectrum (the carrier
+    extent, the per-row widths and the finite refusal): one small int64 read
+    per eigh family instead of the spectrum itself.
+    """
+    counts = _cut_counts(kind, cut, max_rank, tolerance, real_rows, rcond)
+
+    def word(agreed):
+        c = counts(agreed)
+        return c, jnp.concatenate([c.reshape(-1), _nonfinite_rows(agreed)])
+    replicated = NamedSharding(mesh, P())
+    return jax.jit(word, out_shardings=(replicated, replicated))
+
+
+class _SpectrumRead:
+    """One eigh family's agreed device spectrum, read to the host on first use, once."""
+
+    __slots__ = ("_device", "_host")
+
+    def __init__(self, agreed):
+        self._device, self._host = agreed, None
+
+    def host(self):
+        """The descending spectrum rows as NumPy (one read for the whole family)."""
+        if self._host is None:
+            self._host = np.asarray(self._device)[..., ::-1].copy()
+            self._device = None
+        return self._host
+
+
+class RetainedSpectrum:
+    """A retained descending spectrum: its length on the host, its values read on first use.
+
+    The selection decides from the device counts alone, so the values never
+    cross unless a caller asks for them: ``size``, ``shape`` and ``len`` need
+    no transfer; ``np.asarray`` (or indexing, iteration) reads the whole eigh
+    family once (:class:`_SpectrumRead`) and returns float64 values, as before.
+    """
+
+    __slots__ = ("_read", "_row", "size")
+    ndim = 1
+    dtype = np.dtype(np.float64)
+
+    def __init__(self, read, row, size):
+        self._read, self._row, self.size = read, row, int(size)
+
+    @property
+    def shape(self):
+        return (self.size,)
+
+    def __len__(self):
+        return self.size
+
+    def __array__(self, dtype=None, copy=None):
+        host = self._read.host()
+        row = host if self._row is None else host[self._row]
+        out = np.array(row[:self.size], dtype=np.float64, copy=True)
+        return out if dtype is None else out.astype(dtype, copy=False)
+
+    def __getitem__(self, key):
+        return np.asarray(self)[key]
+
+    def __iter__(self):
+        return iter(np.asarray(self))
+
+    def __repr__(self):
+        return f"RetainedSpectrum(size={self.size})"
+
+
+def _check_tolerance(tolerance):
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("multiplet_tol must be finite and nonnegative")
+
+
+def _word_counts(word, ndim):
+    """The host counts of a cut word: an int for one spectrum, else a per-row tuple."""
+    return int(word[0]) if ndim == 1 else tuple(int(v) for v in word[:-1])
 
 
 def _host_spectrum(s):
@@ -380,8 +476,6 @@ def _retained_columns(
         raise ValueError("leading direction carrier does not cover the retained rank")
     select = _retained_column_kernel(
         mesh, isinstance(count, tuple), extent, layout, descending)
-    retained = (tuple(row[:n] for row, n in zip(values, count))
-                if isinstance(count, tuple) else values[:count])
     replicated = NamedSharding(mesh, P())
     # The counts are the select's runtime mask operand, placed once per
     # distinct count vector.  The spectra are host values already (the
@@ -390,6 +484,14 @@ def _retained_columns(
     # host arrays, never re-placed on the device (one transfer per row before).
     counts = (device_put_process_local_cached(np.asarray(count, dtype=np.int64), replicated)
               if device_counts is None else device_counts)
+    if isinstance(values, _SpectrumRead):
+        # A device family: the counts came from the device word; the values stay
+        # there until a caller reads them (RetainedSpectrum).
+        spectra = (tuple(RetainedSpectrum(values, i, n) for i, n in enumerate(count))
+                   if isinstance(count, tuple) else RetainedSpectrum(values, None, count))
+        return select(Q, counts), spectra
+    retained = (tuple(row[:n] for row, n in zip(values, count))
+                if isinstance(count, tuple) else values[:count])
     spectra = jax.tree.map(lambda row: np.array(row, dtype=np.float64, copy=True), retained)
     return select(Q, counts), spectra
 
@@ -478,7 +580,7 @@ def _direction_svd_kernel(eigh_plan, ndim):
             g = matmul(stack, stack, mesh=eigh_plan.mesh, transa="C",
                        backend=gemm_backend, batched_route="auto")
             if eigh_plan.backend == "cusolvermp":
-                evals, v = _shifted_normal_eigh(g, eigh_plan.batched)
+                evals, v = _shifted_normal_eigh(g, eigh_plan.batched, eigh_plan.mesh)
             else:
                 evals, v = eigh_plan.batched(g)
             s = _singular_values(evals)
@@ -560,24 +662,39 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         s, v = batch_layout_eigh_call("normal_eigh", eigh_plan.mesh, W, real_rows=real_rows)
     else:
         s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
-    agreed = _agreed(s)
-    values = (np.asarray(agreed)[..., ::-1].copy() if agreed is not None else _host_spectrum(s))
-    if not np.all(np.isfinite(values)):
-        raise ValueError("nonfinite singular spectrum")
-    if max_rank is not None and operator.index(max_rank) < 1:
-        raise ValueError("max_rank must be a positive integer")
     def cut(row):
         count = int(np.count_nonzero(row > tau * row[0]))
         if max_rank is not None:
             count = min(count, operator.index(max_rank))
         return _close_spectral_cut(row, count, multiplet_tol)
-    count = cut(values) if values.ndim == 1 else _real_row_counts(values, cut, real_rows)
-    device_counts = None if agreed is None else _device_cut_program(
+
+    def host_cut(values):
+        return cut(values) if values.ndim == 1 else _real_row_counts(values, cut, real_rows)
+    agreed = _agreed(s)
+    if agreed is None:
+        values = _host_spectrum(s)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("nonfinite singular spectrum")
+        if max_rank is not None and operator.index(max_rank) < 1:
+            raise ValueError("max_rank must be a positive integer")
+        return _retained_columns(v, values, host_cut(values), mesh=eigh_plan.mesh,
+                                 column_extent=column_extent, layout=layout)
+    if max_rank is not None and operator.index(max_rank) < 1:
+        raise ValueError("max_rank must be a positive integer")
+    _check_tolerance(multiplet_tol)
+    # The host decides the widths and the refusal from one int64 word; the
+    # spectrum stays on the device (RetainedSpectrum reads it only on request).
+    device_counts, word = _device_cut_word(
         eigh_plan.mesh, "singular", tuple(agreed.shape), float(tau),
         None if max_rank is None else operator.index(max_rank), float(multiplet_tol),
         None if real_rows is None else int(real_rows), None)(agreed)
-    _check_device_counts(device_counts, count)
-    return _retained_columns(v, values, count, mesh=eigh_plan.mesh,
+    word = np.asarray(word)
+    read = _SpectrumRead(agreed)
+    if word[-1]:
+        raise ValueError("nonfinite singular spectrum")
+    count = _word_counts(word, agreed.ndim)
+    _check_device_counts(count, lambda: host_cut(read.host()))
+    return _retained_columns(v, read, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent, layout=layout,
                              device_counts=device_counts)
 
@@ -612,56 +729,180 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
         return _over_leading_axes(lambda w, rows: leading_eigenvectors(
             w, r, eigh_plan=eigh_plan, column_extent=column_extent,
             multiplet_tol=multiplet_tol, real_rows=rows, rcond=rcond), W, eigh_plan.mesh, layout, real_rows)
+    s, q = _leading_eigh(W, eigh_plan, layout, real_rows)
+    return _leading_selection(W, s, q, r, eigh_plan=eigh_plan, column_extent=column_extent,
+                              layout=layout, multiplet_tol=multiplet_tol, real_rows=real_rows,
+                              rcond=rcond)
+
+
+def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_extent,
+                               multiplet_tol=1e-6, real_rows=None):
+    """Leading eigenvectors of each row of ``perp`` above ``cutoff**2`` times ``top``'s largest eigenvalue.
+
+    The partner cut of the shared-pole rounds in one call: both Hermitian
+    stacks [b, m, m] (face or batch layout, ``real_rows`` as for
+    :func:`leading_eigenvectors`) are solved on their route, and row ``i < real``
+    keeps the eigenvalues of ``perp`` strictly above ``cutoff**2 * max eig(top_i)``,
+    closed over the boundary multiplet; rows ``>= real`` keep none. The counts,
+    the threshold and the closure are decided on the device; the host reads
+    one int64 word (the counts and both families' finite verdicts). Returns
+    ``(Q, counts)``: ``Q`` the retained directions on ``perp``'s carrier, as
+    ``retain_leading_eigenvectors(*leading_eigenvectors(perp, m), counts)``
+    returns them, or ``None`` when every count is zero; ``counts`` a per-row tuple.
+    Identical decisions to the host sequence (``LORRAX_CHECK_COUNTS=1`` checks it).
+    """
+    layout = _direction_input(perp, eigh_plan, real_rows)
+    if perp.ndim != 3 or top.ndim != 3 or perp.shape[0] != top.shape[0]:
+        raise ValueError("leading_eigenvectors_above needs two [b,m,m] stacks of equal b")
+    if _direction_input(top, eigh_plan, real_rows) != layout:
+        raise ValueError("leading_eigenvectors_above needs perp and top in one layout")
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
+    cutoff = _as_rcond(cutoff)
+    if cutoff is None:
+        raise ValueError("cutoff must be an explicit relative cutoff")
+    _check_tolerance(multiplet_tol)
+    s_top, _ = _leading_eigh(top, eigh_plan, layout, real_rows)
+    s, q = _leading_eigh(perp, eigh_plan, layout, real_rows)
+    top_agreed, agreed = _agreed(s_top), _agreed(s)
+    if top_agreed is None or agreed is None:
+        raise ValueError("GATE spectral_cut_agreement: leading_eigenvectors_above needs "
+                         "mesh-replicated spectra (an eigh on the plan's mesh)")
+    b, m = int(perp.shape[0]), int(perp.shape[-1])
+    full_dev, closed_dev, word = _partner_cut_program(
+        eigh_plan.mesh, tuple(agreed.shape), float(cutoff) ** 2, float(multiplet_tol),
+        int(real), None if real_rows is None else int(real_rows))(top_agreed, agreed)
+    word = np.asarray(word)                      # [counts..., nonfinite top, nonfinite perp]
+    top_read, read = _SpectrumRead(top_agreed), _SpectrumRead(agreed)
+    if word[-2]:
+        _refuse_nonfinite_spectrum(top, top_read.host(), mesh=eigh_plan.mesh,
+                                   what="leading eigenvalue spectra")
+    if word[-1]:
+        _refuse_nonfinite_spectrum(perp, read.host(), mesh=eigh_plan.mesh,
+                                   what="leading eigenvalue spectra")
+    counts = tuple(int(v) for v in word[:-2])
+    full = tuple(m if real_rows is None or i < real_rows else 0 for i in range(b))
+
+    def host_counts():
+        # The host sequence this replaces: the threshold on the full spectra, then
+        # retain_leading_eigenvectors' closure.
+        top_rows, rows = top_read.host(), read.host()
+        widths = tuple(int(np.sum(rows[i] > float(cutoff) ** 2 * float(top_rows[i][0])))
+                       if i < real else 0 for i in range(b))
+        return _leading_counts(tuple(rows[i][:full[i]] for i in range(b)), widths,
+                               multiplet_tol=multiplet_tol, real_rows=real_rows, batched=True)
+    _check_device_counts(counts, host_counts)
+    if max(counts) == 0:
+        return None, counts
+    # The two selects of the host sequence, on the same carriers: perp's full
+    # leading set, then the retained prefix of it.
+    directions, _ = _retained_columns(q, read, full, mesh=eigh_plan.mesh,
+                                      column_extent=column_extent, layout=layout,
+                                      device_counts=full_dev)
+    kept, _ = _retained_columns(directions, read, counts, mesh=eigh_plan.mesh,
+                                column_extent=column_extent,
+                                layout=_direction_output_layout(directions, eigh_plan.mesh),
+                                descending=True, device_counts=closed_dev)
+    return kept, counts
+
+
+@lru_cache(maxsize=16)
+def _partner_cut_program(mesh, shape, threshold, tolerance, real, real_rows):
+    """``(full, closed, word)`` of :func:`leading_eigenvectors_above` from the two agreed spectra.
+
+    ``full`` the leading set's counts (m per real row), ``closed`` the retained
+    counts, ``word`` = ``[closed..., nonfinite top rows, nonfinite perp rows]``.
+    ``threshold`` is ``cutoff**2`` (a host float, as the host product used it).
+    """
+    b, m = shape
+
+    def program(top, agreed):
+        rows = agreed[..., ::-1]
+        largest = top[..., -1]                   # the descending spectrum's first value
+        index = jnp.arange(b)
+        width = jnp.sum(rows > threshold * largest[:, None], axis=-1).astype(jnp.int64)
+        width = jnp.where(index < real, width, 0)
+        closed = _close_cut_xp(jnp, rows, width, tolerance)
+        if real_rows is not None:
+            closed = jnp.where(index < real_rows, closed, 0)
+        closed = closed.astype(jnp.int64)
+        full = jnp.where(index < (b if real_rows is None else real_rows), m, 0).astype(jnp.int64)
+        word = jnp.concatenate([closed, _nonfinite_rows(top), _nonfinite_rows(agreed)])
+        return full, closed, word
+    replicated = NamedSharding(mesh, P())
+    return jax.jit(program, out_shardings=(replicated, replicated, replicated))
+
+
+def _leading_eigh(W, eigh_plan, layout, real_rows):
+    """``(s, q)`` of a Hermitian direction operand on its route (ascending, as the solvers return)."""
     if layout == 'batch':
         from distrib_la._batch_reshard import batch_layout_eigh_call
-        s, q = batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
-    else:
-        # Checked once on the faces, before either route: a non-Hermitian W
-        # is the caller's, refused by name, never a solver failure to retry.
-        # A distributed solver never owns complete local rows; checking
-        # arbitrary off-diagonal faces still requires peer communication.
-        # W - W^H = 2 (W - Herm W), with Herm W kept on W's faces (blocks.hermitian_part):
-        # an eager swapaxes difference of a face stack comes back replicated.
-        from distrib_la.blocks import hermitian_part
-        from distrib_la.tolerance import roundoff_tol
-        defect = 2 * jnp.max(jnp.abs(W - hermitian_part(W)), axis=(-2, -1))
-        scale = jnp.max(jnp.abs(W), axis=(-2, -1))
-        tol = roundoff_tol(W.shape[-1], dtype=W.dtype)
-        if not bool(jnp.all(jnp.isfinite(scale) & (defect <= tol * scale))):
-            raise ValueError("leading_eigenvectors requires finite Hermitian W")
-        # One decision: Plan.batched runs the stack on the route it decides.
-        if W.ndim == 2:
-            s, q = eigh_plan.batched(W[None])
-            s, q = s[0], q[0]
-        else:
-            s, q = eigh_plan.batched(W)
+        return batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
+    # Checked once on the faces, before either route: a non-Hermitian W
+    # is the caller's, refused by name, never a solver failure to retry.
+    # A distributed solver never owns complete local rows; checking
+    # arbitrary off-diagonal faces still requires peer communication.
+    # W - W^H = 2 (W - Herm W), with Herm W kept on W's faces (blocks.hermitian_part):
+    # an eager swapaxes difference of a face stack comes back replicated.
+    from distrib_la.blocks import hermitian_part
+    from distrib_la.tolerance import roundoff_tol
+    defect = 2 * jnp.max(jnp.abs(W - hermitian_part(W)), axis=(-2, -1))
+    scale = jnp.max(jnp.abs(W), axis=(-2, -1))
+    tol = roundoff_tol(W.shape[-1], dtype=W.dtype)
+    if not bool(jnp.all(jnp.isfinite(scale) & (defect <= tol * scale))):
+        raise ValueError("leading_eigenvectors requires finite Hermitian W")
+    # One decision: Plan.batched runs the stack on the route it decides.
+    if W.ndim == 2:
+        s, q = eigh_plan.batched(W[None])
+        return s[0], q[0]
+    return eigh_plan.batched(W)
+
+
+def _leading_selection(W, s, q, r, *, eigh_plan, column_extent, layout, multiplet_tol,
+                       real_rows, rcond):
+    """The leading cut of one eigh family: widths and refusal from one int64 word."""
     agreed = _agreed(s)
-    values = (np.asarray(agreed)[..., ::-1].copy() if agreed is not None else _host_spectrum(s))
-    _refuse_nonfinite_spectrum(W, values, mesh=eigh_plan.mesh,
-                               what="leading eigenvalue spectra")
-    count = _leading_counts(
-        values, r, multiplet_tol=multiplet_tol, real_rows=real_rows,
-        batched=values.ndim > 1, rcond=rcond)
-    device_counts = None
-    if agreed is not None and not isinstance(r, tuple):
-        device_counts = _device_cut_program(
-            eigh_plan.mesh, "leading", tuple(agreed.shape), int(r), None, float(multiplet_tol),
-            None if real_rows is None else int(real_rows),
-            None if rcond is None else float(rcond))(agreed)
-        _check_device_counts(device_counts, count)
-    return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
+    if agreed is None:
+        values = _host_spectrum(s)
+        _refuse_nonfinite_spectrum(W, values, mesh=eigh_plan.mesh,
+                                   what="leading eigenvalue spectra")
+        count = _leading_counts(
+            values, r, multiplet_tol=multiplet_tol, real_rows=real_rows,
+            batched=values.ndim > 1, rcond=rcond)
+        return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
+                                 column_extent=column_extent, layout=layout)
+    _check_tolerance(multiplet_tol)
+    device_counts, word = _device_cut_word(
+        eigh_plan.mesh, "leading", tuple(agreed.shape), r, None, float(multiplet_tol),
+        None if real_rows is None else int(real_rows),
+        None if rcond is None else float(rcond))(agreed)
+    word = np.asarray(word)
+    read = _SpectrumRead(agreed)
+    if word[-1]:
+        _refuse_nonfinite_spectrum(W, read.host(), mesh=eigh_plan.mesh,
+                                   what="leading eigenvalue spectra")
+    count = _word_counts(word, agreed.ndim)
+    _check_device_counts(count, lambda: _leading_counts(
+        read.host(), r, multiplet_tol=multiplet_tol, real_rows=real_rows,
+        batched=agreed.ndim > 1, rcond=rcond))
+    return _retained_columns(q, read, count, mesh=eigh_plan.mesh,
                              column_extent=column_extent, layout=layout,
                              device_counts=device_counts)
 
 
-def _check_device_counts(device_counts, count):
-    """``LORRAX_CHECK_COUNTS=1``: refuse unless the device cut equals the host cut (one read)."""
+def _check_device_counts(count, host_count):
+    """``LORRAX_CHECK_COUNTS=1``: refuse unless the device cut equals the host cut.
+
+    ``host_count()`` recomputes the cut on the host from the family's spectrum
+    (the read the device word otherwise avoids).
+    """
     import os
-    if device_counts is None or os.environ.get("LORRAX_CHECK_COUNTS", "0") in ("", "0"):
+    if os.environ.get("LORRAX_CHECK_COUNTS", "0") in ("", "0"):
         return
-    if not np.array_equal(np.asarray(device_counts), np.asarray(count, np.int64)):
-        raise ValueError(f"GATE spectral_cut_agreement: device counts {np.asarray(device_counts)} "
-                         f"!= host counts {np.asarray(count)}")
+    want = host_count()
+    if not np.array_equal(np.asarray(count, np.int64), np.asarray(want, np.int64)):
+        raise ValueError(f"GATE spectral_cut_agreement: device counts {np.asarray(count)} "
+                         f"!= host counts {np.asarray(want)}")
 
 
 def _as_extent(n) -> int:

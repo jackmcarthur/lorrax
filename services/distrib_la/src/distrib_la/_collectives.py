@@ -123,7 +123,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     groups = list(axes) + ([tuple(axes)] if len(axes) > 1 else [])
     for ax in groups:
         f = jax.jit(shard_map(
-            lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,
+            lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,  # exact-reduce: warm-up of zeros
             in_specs=(P(None),), out_specs=P(None), check_vma=False))
         jax.block_until_ready(f(tiny))
 

@@ -306,6 +306,7 @@ from symmetry_maps.qgrid_trs import (
     QgridTrsPolicy,
     build_qgrid_trs_policy,
     little_group_covariance_residual,
+    little_group_projection_is_identity,
     minus_q_parent_partners,
     project_little_group_operator,
     self_negative_q_mask,
@@ -405,7 +406,8 @@ __all__ = [
     # covariance statistic the unfold's own contract rests on
     "QgridTrsPolicy", "build_qgrid_trs_policy",
     "little_group_covariance_residual", "minus_q_parent_partners",
-    "project_little_group_operator", "self_negative_q_mask",
+    "project_little_group_operator", "little_group_projection_is_identity",
+    "self_negative_q_mask",
     "trs_pair_coherent_unfold_sym_idx", "trs_project_self_negative_q_rows",
     # ---------------------------------------------------------------
     # PRE-SWEEP SPELLINGS.  Aliases, not definitions — see

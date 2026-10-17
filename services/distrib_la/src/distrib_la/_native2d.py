@@ -167,7 +167,7 @@ def _chol_2d_single(mesh: Mesh, J: int, b: int):
                 A_local)
 
             # 2. Broadcast Lkk via psum (tree-based, O(log P)).
-            Lkk = lax.psum(
+            Lkk = lax.psum(  # exact-reduce: diagonal-block owner's tile, zeros elsewhere
                 jnp.where(is_diag_owner, Lkk_local, jnp.zeros((b, b), dtype)),
                 ("x", "y"))
 
@@ -199,7 +199,7 @@ def _chol_2d_single(mesh: Mesh, J: int, b: int):
                     panel.at[i_glob].set(A_local[i_loc, k_loc_col]),
                     panel)
 
-            panel = lax.psum(
+            panel = lax.psum(  # exact-reduce: column-k owners fill disjoint rows
                 lax.fori_loop(0, J_row, fill_panel, panel_init), ("x", "y"))
 
             # 5. SYRK: update blocks (i, j) with i > k, j > k, i >= j.

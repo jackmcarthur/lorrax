@@ -308,9 +308,11 @@ def _local_eigh_errors(a, values, vectors, *, mesh=None):
     x = probes(a.shape[-1], vectors.dtype)
     vx = vectors @ x
     left = jnp.conj(jnp.swapaxes(jnp.conj(jnp.swapaxes(vx, -1, -2)) @ a, -1, -2))
-    residual = _norm(0.5 * (a @ vx + left) - vectors @ (values[..., :, None] * x)) / (
-        jnp.maximum(_norm(a), jnp.finfo(values.dtype).tiny) * _norm(x))
-    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x) / _norm(x)
+    from distrib_la._result_check import _face, _rows
+    nd = a.ndim
+    residual = _norm(0.5 * (a @ vx + left) - vectors @ (values[..., :, None] * x), mesh, _rows(nd)) / (
+        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * _norm(x))
+    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x, mesh, _rows(nd)) / _norm(x)
     finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
     return (jnp.where(finite, jnp.max(residual), jnp.inf),
             jnp.where(finite, jnp.max(orthogonality), jnp.inf))
@@ -901,8 +903,8 @@ class Plan:
             # The face SUMMA (panel_matmul): a single matrix never batch-reshards onto one device.
             gemm = partial(matmul, mesh=mesh, backend="distributed", batched_route="auto")
             pin = eigh_layout(mesh, A.ndim)
-            deflate = partial(deflate_zero_rows, constrain=pin)
-            attempts = [deflate(solve), deflate(shifted(solve, matmul=gemm))]
+            deflate = partial(deflate_zero_rows, constrain=pin, mesh=mesh)
+            attempts = [deflate(solve), deflate(shifted(solve, matmul=gemm, mesh=mesh))]
             n = int(A.shape[-1])
             if backend == "cusolvermp":
                 # cuSOLVERMp 0.9.1 syevd returns vectors that are not orthonormal
@@ -938,10 +940,10 @@ class Plan:
             # The sketch is taken before the call, which consumes A and B: the LU
             # factors are an output aliased to A and X one aliased to B.  The
             # barrier keeps XLA from scheduling the sketch after the call.
-            sketch = (*matrix_sketch(A), *rhs_sketch(B))
+            sketch = (*matrix_sketch(A, mesh), *rhs_sketch(B, mesh))
             sketch, A, B = jax.lax.optimization_barrier((sketch, A, B))
             X = call(A, B, mesh=mesh, **kwargs)
-            return checked("solve_lu", (lambda x: x,), lambda x: solve_errors(sketch, x),
+            return checked("solve_lu", (lambda x: x,), lambda x: solve_errors(sketch, x, mesh),
                            (X,), n=A.shape[-1], dtype=A.dtype)
         return safe
 

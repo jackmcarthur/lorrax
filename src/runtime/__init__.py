@@ -264,7 +264,12 @@ def bootstrap(*, platform: str = "gpu") -> None:
     fallback_to_cpu_if_no_gpu_backend()
     init_mpi_before_device_collectives()
     install_failfast_excepthook()
+    install_ordered_exit()
     pin_matmul_precision()
+    # LORRAX_REDUCTION_GUARD=log|raise: record or refuse raw floating sums over
+    # more than two ranks (topology-ordered); a no-op when unset.
+    from lxkit import install_reduction_guard_from_env
+    install_reduction_guard_from_env()
     # Every sharding is explicit, so a legacy ``with mesh:`` would only add its
     # mesh to every program's key and re-trace held programs: JAX refuses one.
     _import_jax().config.update("jax_disallow_mesh_context_manager", True)
@@ -357,6 +362,34 @@ def pin_matmul_precision() -> str:
     jax = _import_jax()
     jax.config.update("jax_default_matmul_precision", precision)
     return precision
+
+
+def install_ordered_exit() -> None:
+    """At P > 1, make :func:`finalize_process` the end of the process for EVERY entry point.
+
+    A CLI that ends with ``sys.exit(main())``, ``raise SystemExit(...)`` or by
+    falling off the end used to reach interpreter teardown, where a non-main
+    Python thread still inside jaxlib aborted the process (rc 134 on every
+    rank after a successful run, Frontier 2026-10-16;
+    :mod:`runtime.ordered_exit` has the measurement and what is not known).
+    :mod:`runtime.ordered_exit` hooks the start of interpreter shutdown: exit
+    status 0 runs :func:`finalize_process` (ordered, collective teardown, then
+    ``os._exit(0)``); a nonzero status exits with it at once, without collective
+    teardown, as :func:`run_main_and_finalize` does.  Drivers that call
+    :func:`run_main_and_finalize` end before the hook runs; nothing changes
+    for them.  No-op at P = 1.  Idempotent.  Standard library only.
+    """
+    if _resolve_proc_count() <= 1:
+        return
+    from . import ordered_exit
+    state = ordered_exit.install(finalize_process)
+    if state["installed"]:
+        debug_print("[runtime] ordered process end armed: interpreter shutdown runs "
+                    "finalize_process (status 0) or exits with the status (nonzero).")
+    elif state["reason"]:
+        rank0_print(f"[runtime] WARNING: ordered process end NOT armed ({state['reason']}); "
+                    "an entry point that does not call run_main_and_finalize ends by "
+                    "interpreter teardown.")
 
 
 def install_failfast_excepthook() -> None:
@@ -841,7 +874,7 @@ def apply_site_scratch(*, say=print) -> None:
 #: readings (sandbox claim 3978).  With ``M`` the card total and ``O`` the bytes
 #: outside the XLA pool:
 #:
-#:     planner budget    B = (M - 1.2 O) / (1 + 1.2 phi)     (planner_budget_bytes)
+#:     planner budget    B = (M - 1.2 O) / (1 + 1.2 phi) - T_ord   (planner_budget_bytes)
 #:     pool reservation  R = M - 1.2 O_max                  (pool_fraction)
 #:
 #: ``O`` is 3 GB (the CUDA context and modules, XLA's NCCL communicators, cuFFT
@@ -855,7 +888,8 @@ def apply_site_scratch(*, say=print) -> None:
 #: #pool-growth).  The pool is reserved before the deck is read, so
 #: ``R`` leaves room for the larger ``O``; the reservation is not a cap.  Both
 #: read only ``M`` and the deck's resolved ``linalg``: the same on every rank
-#: and every run.
+#: and every run.  ``T_ord`` (16 MiB, :func:`ordered_reduction_transient_bytes`)
+#: is the rank-order reductions' fixed transient inside the pool.
 OUTSIDE_POOL_BYTES = 3e9
 #: The cuSOLVERMp/cuBLASMp contexts, their NCCL communicators and workspace
 #: under ``linalg = distributed`` (5.9 GB outside at P4 against 2.9).  Owner:
@@ -885,11 +919,23 @@ def outside_pool_allowance_bytes(linalg: str = "local") -> float:
                                  if linalg == "distributed" else 0.0)
 
 
+def ordered_reduction_transient_bytes() -> float:
+    """``T_ord``: the named cap of the rank-order reductions' transient.
+
+    ``lxkit.ordered_transient_bytes()``, ``ORDERED_TRANSIENT_SLABS`` (2) slabs of
+    ``LORRAX_ORDERED_SLAB_MB`` (8 MiB): 16 MiB.  Fixed: an ordered all-reduce or
+    reduce-scatter of any size holds at most this much beyond the library
+    collective (docs/environment/transports.md#rank-order-reductions), so the
+    rule reserves it once, out of ``B``, for every planner and route."""
+    from lxkit import ordered_transient_bytes
+    return float(ordered_transient_bytes())
+
+
 def planner_budget_bytes(total_bytes: float, linalg: str = "local") -> float:
-    """``B = (M - 1.2 O) / (1 + 1.2 phi)``, at most the reservation and at least ``M / 4``."""
+    """``B = (M - 1.2 O) / (1 + 1.2 phi) - T_ord``, at most the reservation and at least ``M / 4``."""
     total = float(total_bytes)
     budget = ((total - MEMORY_MARGIN * outside_pool_allowance_bytes(linalg))
-              / (1.0 + MEMORY_MARGIN * POOL_OVERSHOOT))
+              / (1.0 + MEMORY_MARGIN * POOL_OVERSHOOT)) - ordered_reduction_transient_bytes()
     return max(min(budget, pool_reservation_bytes(total)), 0.25 * total)
 
 
@@ -2059,6 +2105,46 @@ class RuntimeStack:
                 f"proc={self.process_index}/{self.process_count})")
 
 
+def _open_device_leg_before_collectives() -> None:
+    """Step 5e of :func:`initialize_communicator_stack`: open this process's
+    device FFI leg before the first collective communicator exists.
+
+    The leg's open maps its recorded closure by exact path
+    (:func:`lxkit.native_provider.open_and_attest`).  Opened after (6), the
+    collective library has already dlopened the site network plugin
+    (Perlmutter: aws-ofi-nccl, ``NEEDED libcudart.so.13``, no RUNPATH) and
+    the loader has satisfied that plugin from ``LD_LIBRARY_PATH``; the
+    recorded copy then maps second and the closure gate refuses the process
+    (measured: Fe P=16, 4 nodes, two ``libcudart`` copies on rank 0).
+    Opened here, every later SONAME request binds to the recorded copy.
+
+    A leg that cannot open is refused at (6b), by the same ``get_lib`` call,
+    in the mesh-aware wording of :mod:`ffi.gate`.  What refuses here is a
+    multi-node launch whose site transport would dlopen a second copy of a
+    recorded library by an unversioned name (``site.toml``
+    ``launch_libraries``; :func:`lxkit.native_provider.check_launch_libraries`).
+    A CPU-platform process has no device leg and returns at once.
+    """
+    import jax
+    if jax.default_backend() == "cpu":
+        return
+    from ffi.common import ffi_loader
+    try:
+        ffi_loader.get_lib(None)
+    except Exception:                                          # noqa: BLE001
+        return                  # (6b) re-raises it with the gate's remedy
+    # The site transport's unversioned dlopens (site.toml launch_libraries)
+    # happen inside (6); a name that would map a second copy refuses here.
+    from runtime.network_env import network_configuration
+    decision = network_configuration() or {}
+    if decision.get("launch_libraries"):
+        from lxkit import native_provider
+        native_provider.check_launch_libraries(
+            decision["launch_libraries"], os.environ.get("LD_LIBRARY_PATH", ""),
+            remedy=decision.get("launch_libraries_remedy", ""),
+            unusable_cls=ffi_loader.FfiLibraryUnusable)
+
+
 def initialize_communicator_stack(*, platform: str = "gpu",
                                   axis_names=("x", "y"),
                                   print_fn=None) -> RuntimeStack:
@@ -2129,6 +2215,13 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        refusal after the live coordination client and supported JAX surface
        exist, but before the mesh warmup performs the first compile.  A
        rank-divergent warmup is therefore covered rather than grandfathered.
+    5e. :func:`_open_device_leg_before_collectives` -- the device FFI leg
+       opens here, so its recorded dependency closure is mapped by exact
+       path before (6) creates the first NCCL/RCCL communicator.  That is
+       when the collective library dlopens a site network plugin, which
+       binds its own NEEDED runtime (``libcudart.so.13``) by SONAME: with
+       the closure already mapped it gets the recorded copy, not whatever
+       ``LD_LIBRARY_PATH`` offers (a second runtime the closure gate refuses).
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
@@ -2215,6 +2308,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     # -- 5d -----------------------------------------------------------------
     from common.jax_compile_cache import install_compile_agreement
     install_compile_agreement()
+    # -- 5e -----------------------------------------------------------------
+    _open_device_leg_before_collectives()
     _t_boot = time.perf_counter()
     # -- 6 ------------------------------------------------------------------
     from common.collectives import prepare_mesh
@@ -2343,6 +2438,10 @@ def debug_print(*a, **k):
 _print_rank0 = rank0_print
 
 
+#: Set by the first :func:`finalize_process` call (it never returns normally).
+_FINALIZE_STARTED = False
+
+
 def finalize_process(rc: int = 0):
     """End the process by EXPLICIT, ORDERED finalization.  Does not return.
 
@@ -2386,6 +2485,12 @@ def finalize_process(rc: int = 0):
     import atexit
     import sys
 
+    global _FINALIZE_STARTED
+    if _FINALIZE_STARTED:
+        # Re-entered (an atexit duty or the ordered-exit hook reaching it
+        # again): the first call owns the teardown and ends the process.
+        return
+    _FINALIZE_STARTED = True
     try:
         import jax
         try:

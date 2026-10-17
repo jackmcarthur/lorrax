@@ -88,7 +88,9 @@ def test_distributed_takes_the_size_route_on_rocm(mesh, rocm, capsys):
 
 def test_cuda_resolution_is_unchanged(mesh, monkeypatch):
     monkeypatch.setattr(resolve_mod, "mesh_platform", lambda m: "CUDA")
-    with pytest.raises(RuntimeError, match="cusolvermp"):
+    # RuntimeError: no loadable CUDA library on this host; ValueError: it loads (a GPU node)
+    # and the ladder refuses later (one JAX process per mesh device), as the ROCM case above.
+    with pytest.raises((RuntimeError, ValueError), match="cusolvermp"):
         resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64)
     with pytest.raises(ValueError, match="GATE one_device"):
         resolve_mod.resolve_backend("eigh", "one_device", mesh, n=64)

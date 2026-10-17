@@ -11,6 +11,7 @@ from functools import lru_cache
 import sys
 
 import jax
+from lxkit import ordered_psum
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -194,7 +195,7 @@ def _interband_program(mesh: Mesh, nb_logical: int):
         def contract(weight):
             value = jnp.einsum("akij,kij,bkij->ab", jnp.conj(vertex),
                                 weight, vertex, optimize=True)
-            return jax.lax.psum(value, (ax_x, ax_y))
+            return ordered_psum(value, (ax_x, ax_y))
 
         def both(pairs_weight):
             """Interband tensor plus the Hall part of the intraband pairs."""
@@ -303,10 +304,11 @@ def metal_intraband_photon_response(q_cart, z, drude_tensor, static_dos,
             jnp.where(z == 0, 0.0, derivative))
 
 
-@jax.jit
-def _direct_gamma_chunk(q, bare, weight, interband, slopes, coefficients,
+def _direct_gamma_local(q, bare, weight, interband, slopes, coefficients,
                         frequencies, drude, dos, contact, atom_w, atom_u):
-    """One small-matrix Γ cubature chunk; large centroid matrices never enter."""
+    """One rank's samples of a Γ cubature chunk: its partial q sums and its error.
+
+    Large centroid matrices never enter."""
     from gw.head_correction import _solve_photon_head
 
     identity = jnp.eye(4, dtype=jnp.complex128)[None]
@@ -363,6 +365,27 @@ def _direct_gamma_chunk(q, bare, weight, interband, slopes, coefficients,
         one, None, (frequencies, interband, slopes), unroll=1)
     return (value, slope, partner_value, partner_slope, constant_sum,
             moment_sum, bare_sum, jnp.max(errors))
+
+
+@lru_cache(maxsize=8)
+def _direct_gamma_program(mesh):
+    """The direct-Γ chunk on ``mesh``: the samples split over every rank, each rank's
+    q sums local, then added in rank order (``lxkit.ordered_psum``) so the head does not
+    depend on the GCD placement (as a plain ``jax.jit`` over sharded samples XLA summed
+    q with a library all-reduce in topology order; det lane 2026-10-16)."""
+    axes = tuple(mesh.axis_names)
+    split, rep = P(axes), P()
+
+    def body(q, bare, weight, *operands):
+        out = _direct_gamma_local(q, bare, weight, *operands)
+        return (*ordered_psum(tuple(out[:-1]), axes), jax.lax.pmax(out[-1], axes))
+    return jax.jit(shard_map(body, mesh=mesh, in_specs=(split, split, split) + (rep,) * 9,
+                             out_specs=rep, check_vma=False))
+
+
+def _direct_gamma_chunk(q, bare, weight, *operands):
+    """One small-matrix Γ cubature chunk (samples ``P(('x', 'y'))``-sharded)."""
+    return _direct_gamma_program(q.sharding.mesh)(q, bare, weight, *operands)
 
 
 def _bulk_sphere_rule(geometry, kgrid, analytic_bare, chunk_size):
@@ -437,7 +460,7 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     """(chunk, sharding) of the direct-Γ cubature calls.
 
     The samples of one call are split over every rank (``P(('x', 'y'))``: the
-    q sums in :func:`_direct_gamma_chunk` become one small all-reduce), so no
+    q sums in :func:`_direct_gamma_chunk` become one small rank-order sum), so no
     rank repeats another's samples.  The chunk starts at the floor
     (``_GAMMA_MIN_LOCAL`` samples per rank, and at least the sphere rule's
     points) and doubles while it stays within ``nsamples`` (one call per
@@ -450,7 +473,7 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     split = NamedSharding(mesh, P(tuple(mesh.axis_names)))
     probe = n_dev * _GAMMA_MIN_LOCAL
     sds = jax.ShapeDtypeStruct
-    compiled = _direct_gamma_chunk.lower(
+    compiled = _direct_gamma_program(mesh).lower(
         sds((probe, 3), jnp.float64, sharding=split),
         sds((probe, 4, 4), jnp.float64, sharding=split),
         sds((probe,), jnp.float64, sharding=split), *operands).compile()
@@ -555,7 +578,7 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
     padded = int(receipt.padded_counts[-1])
     rows = -(-padded // n_dev) * n_dev
     sds = jax.ShapeDtypeStruct
-    compiled = _direct_gamma_chunk.lower(
+    compiled = _direct_gamma_program(mesh).lower(
         sds((rows, 3), jnp.float64, sharding=split),
         sds((rows, 4, 4), jnp.float64, sharding=split),
         sds((rows,), jnp.float64, sharding=split), *operands).compile()

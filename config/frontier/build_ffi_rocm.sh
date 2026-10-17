@@ -25,8 +25,9 @@ export LMOD_PAGER=none
 module load PrgEnv-gnu/8.7.0 "$MPICH_MOD" "$HDF5_MOD" "$ROCM_MOD" cmake cray-python/3.12.12
 # No wrapper-injected LibSci: PrgEnv-gnu loads the site-default cray-libsci and
 # the CC wrapper would add its threaded pair to the link.  The leg's one host
-# BLAS is the SEQUENTIAL LibSci its SLATE links (build_slate_hip.sh), which
-# arrives through SLATE's CMake interface.
+# BLAS is the sequential, locking OpenBLAS its SLATE links (build_openblas_seq.sh,
+# copied into the SLATE-HIP install by build_slate_hip.sh), which arrives through
+# SLATE's CMake interface.
 module unload cray-libsci 2>/dev/null || true
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"         # cmake probes jax.ffi.include_dir() from here
@@ -45,3 +46,20 @@ echo "[build_ffi_rocm] built $SO"
 readelf -d "$SO" | grep -E "NEEDED|RUNPATH|RPATH"
 echo "[build_ffi_rocm] exported LORRAX surface:"
 nm -D --defined-only "$SO" | grep -E " T (lrx_|lorrax_ffi_|Phdf)" | awk '{print "  " $3}'
+
+# Dependency closure (lxkit.native_provider).  The ROCm libraries resolve from
+# the directories the venv's JAX ROCm plugin maps them from (the rocm-sdk
+# wheels: one rocBLAS/rocSOLVER/hipBLASLt/RCCL/HIP runtime per process), the
+# SLATE-HIP stack and its OpenBLAS from the leg's own RPATH, MPI/HDF5 from the
+# pinned directories.  The loader opens exactly those files and refuses a
+# process that maps another copy of any of them.
+# shellcheck disable=SC1091
+source "$ROOT/config/frontier/ffi_mpi.sh"
+"$VENV/bin/python" "$ROOT/src/ffi/cpp/stage/write_checkout_closure.py" "$SO" \
+    --python "$VENV/bin/python" --library-dirs "$LORRAX_OLCF_RUNTIME_LIB_DIRS" || {
+        echo "[build_ffi_rocm] FAILED: dependency closure" >&2; exit 1; }
+"$ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO" \
+    leg=rocm site=frontier rocm_module="$ROCM_MOD" mpi="$MPICH_MOD" hdf5="$HDF5_MOD" \
+    venv="$VENV" \
+    closure_sha256="$("$VENV/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "$SO.closure.json")" \
+    || echo "[build_ffi_rocm] WARNING: provenance stamp failed" >&2

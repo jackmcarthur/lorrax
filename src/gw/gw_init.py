@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import jax
+from lxkit import ordered_sum
 import jax.numpy as jnp
 import numpy as np
 import h5py
@@ -2538,7 +2539,7 @@ def _finalize_vq_views(
         G0 = G0[0]
     print_fn(f"\n  V_q computed:")
     print_fn(f"    Shape: {V_qmunu.shape}")
-    _vq0_trace = float(jnp.trace(V_q_raw[0]).real)
+    _vq0_trace = float(ordered_sum(jnp.diagonal(V_q_raw[0])).real)
     print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
     from common import sanity
     sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from functools import lru_cache
+from common.device_index import device_index
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -421,11 +422,14 @@ def _placed_counts(b, K):
 
 
 @timing.timed("factor_validation")
-def _check_factor(b, poles2, K, pending=None):
+def _check_factor(b, poles2, K, pending=None, device_counts=None):
     """Gate the physical active prefix and exact inactive sentinel.
 
     ``pending`` (a list): the device half of the verdict is appended there instead of
     read now, and the caller refuses on all of them in one read (:func:`_refuse_invalid`).
+    ``device_counts``: the same counts ``K`` already on the devices (replicated int64, the
+    constructor's own), used by the device half so no count crosses from the host; the host
+    predicates on ``K`` are unchanged.
     """
     if b.dtype != np.complex128 or poles2.dtype != np.float64 or K.dtype != np.int64:
         _refuse(f"dtypes {(b.dtype, poles2.dtype, K.dtype)}")
@@ -438,9 +442,9 @@ def _check_factor(b, poles2, K, pending=None):
         # host, the factor's on the device with the counts placed once.
         if not _poles_valid_host(poles2, K):
             _refuse_invalid([False])
-        ok = _factor_b_valid(b, _placed_counts(b, K))
+        ok = _factor_b_valid(b, _placed_counts(b, K) if device_counts is None else device_counts)
     else:
-        ok = _factor_valid(b, poles2, K)
+        ok = _factor_valid(b, poles2, K if device_counts is None else device_counts)
     if pending is not None:
         pending.append(ok)
         return
@@ -479,7 +483,8 @@ def preview_model_write(meta, shape, *, basis=None):
 
 @timing.timed("shared_pole_store.write_model")
 def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
-                            recipe, receipts, ordered=False, basis=None, sector=None):
+                            recipe, receipts, ordered=False, basis=None, sector=None,
+                            device_counts=None):
     """Stage a bounded q batch and finalize automatically at complete K census.
 
     Parameters
@@ -490,6 +495,10 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         Sorted squared poles in Ry², same padded column capacity as b.
     K : array, int64, (b,)
         Physical active counts; inactive b=0 and poles2=1 exactly.
+    device_counts : jax.Array, int64, (b,), replicated, optional
+        The same counts on the devices (the constructor's, read to the host as ``K``). The
+        device checks, the final pole rows and a whole-model digest take them, so no count
+        crosses from the host; without them ``K`` is placed (once per distinct vector).
     q_span : slice or pair of int
         Contiguous canonical raw-parent range [start, stop).
     meta, tables, recipe, receipts : bundles / dict
@@ -527,7 +536,9 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         _admit(ledger, "write_model", output, temporary+arg+3*int(poles2.size)*8,
                device_panel=max(arg,output,8*int(poles2.size)), native_host=True)
         K = np.asarray(K)
-        _check_factor(b, poles2, K)
+        if device_counts is not None and tuple(device_counts.shape) != K.shape:
+            _refuse("device counts do not match K")
+        _check_factor(b, poles2, K, device_counts=device_counts)
         lo, hi = _span(q_span, header["n_q_irr"], "q_span")
         if hi - lo != b.shape[0]:
             _refuse("q_span does not match factor batch")
@@ -591,7 +602,8 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
     with SlabIO(path, mode="a", mesh=mesh) as io:
         if extent:
             with timing.section("write_slab"):
-                _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent)
+                _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent,
+                                   device_counts=device_counts)
             width, name = extent, None
         elif width:
             io.create_dataset(name + "/factor", shape=(hi-lo, header["n_mu_logical"], components, width), dtype=np.complex128)
@@ -610,8 +622,19 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
             io.sync_writes()
     del canonical
     if all(header["written_q"]):
-        return _finalize_model(path, meta=meta, header=header, basis=basis)
+        # The writer's device counts cover the model only when this batch is all of it.
+        whole = device_counts if (lo, hi) == (0, header["n_q_irr"]) else None
+        return _finalize_model(path, meta=meta, header=header, basis=basis, device_counts=whole)
     return header
+
+
+@lru_cache(maxsize=None)
+def _window_counts(batch, width):
+    """A digest window's counts from the model's device counts: rows ``[q0, q0 + batch)``
+    less the column start ``c0``, clipped to ``[0, width]`` (``np.clip`` of the host's)."""
+    def cut(K, q0, c0):
+        return jnp.clip(jax.lax.dynamic_slice_in_dim(K, q0, batch) - c0.astype(K.dtype), 0, width)
+    return jax.jit(cut)
 
 
 def _held_key(header):
@@ -635,9 +658,10 @@ def _direct_extent(meta, header, live, *, whole):
     return extent if 0 < live <= extent else None
 
 
-def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent):
+def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent, device_counts=None):
     """One batch into the final datasets at rows ``[lo, lo + b)``: every column written
-    (the native provider never fills), exact zeros past the carrier, unit poles past K."""
+    (the native provider never fills), exact zeros past the carrier, unit poles past K
+    (from ``device_counts`` when the caller has them on the devices)."""
     spec = P(None, "x", None, "y")
     components = header.get("factor_components", 1)
     # The datasets were created by an earlier transaction, so each write names
@@ -650,10 +674,27 @@ def _write_final_batch(io, mesh, basis, header, canonical, poles2, K, lo, extent
         pad = mesh_divisible_shape((b, basis.n_canonical, components, extent-written), mesh, spec)
         io.write_slab("factor", _zeros(mesh, spec, tuple(pad)), offset=(lo, 0, 0, written),
                       global_shape=shape)
-    active = jnp.arange(extent)[None, :] < jnp.asarray(K)[:, None]
-    poles = jnp.pad(poles2[:, :extent], ((0, 0), (0, max(extent-int(poles2.shape[-1]), 0))),
-                    constant_values=1.0)
-    io.write_slab("poles2_ry2", jnp.where(active, poles, 1.0), offset=(lo, 0), global_shape=shape[::3])
+    if device_counts is not None and isinstance(poles2, jax.Array):
+        rows = _final_pole_rows(int(extent))(poles2, device_counts)
+    else:
+        active = jnp.arange(extent)[None, :] < jnp.asarray(K)[:, None]
+        poles = jnp.pad(poles2[:, :extent], ((0, 0), (0, max(extent-int(poles2.shape[-1]), 0))),
+                        constant_values=1.0)
+        rows = jnp.where(active, poles, 1.0)
+    io.write_slab("poles2_ry2", rows, offset=(lo, 0), global_shape=shape[::3])
+
+
+@lru_cache(maxsize=None)
+def _final_pole_rows(extent):
+    """:func:`_write_final_batch`'s pole rows as one program: ``poles2`` cut or padded to
+    ``extent`` with 1.0 and 1.0 past each count (the eager path's operations, value for value;
+    the constants are the program's)."""
+    def rows(poles2, K):
+        active = jnp.arange(extent)[None, :] < K[:, None]
+        poles = jnp.pad(poles2[:, :extent], ((0, 0), (0, max(extent-int(poles2.shape[-1]), 0))),
+                        constant_values=1.0)
+        return jnp.where(active, poles, 1.0)
+    return jax.jit(rows)
 
 
 def _stage_direct(path, header):
@@ -727,7 +768,7 @@ def _zeros(mesh, spec, shape):
 
 
 @timing.timed("shared_pole_store.finalize")
-def _finalize_model(path, *, meta, header, basis=None):
+def _finalize_model(path, *, meta, header, basis=None, device_counts=None):
     """Write the final datasets and commit the census with the digest.
 
     A direct model (``direct_extent``: its batches landed in the final
@@ -796,7 +837,7 @@ def _finalize_model(path, *, meta, header, basis=None):
             del factor, poles
         io.write_attr("K", np.asarray(header["K"], np.int64))
         _write_header(io, header)
-    header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta))
+    header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta), device_counts=device_counts)
     def finish():
         with h5py.File(path, "a") as f:
             set_commit_state(f, False)
@@ -865,7 +906,7 @@ def _covering_windows(total, span):
 
 
 @timing.timed("shared_pole_store.digest")
-def _model_digest(path, header, mesh, *, capacity):
+def _model_digest(path, header, mesh, *, capacity, device_counts=None):
     """Grid-independent SHA256 of metadata and canonical row digests.
 
     Read a bounded q batch and column panel through SlabIO. Each canonical row
@@ -918,7 +959,11 @@ def _model_digest(path, header, mesh, *, capacity):
                     b = io.read_slab("factor", shape=(batch,ncan,components,width), offset=(q0,0,0,c0),
                                      partition_spec=P(None,"x",None,None))
                     counts = np.clip(active_counts-c0, 0, width)
-                    _check_factor(b, host_poles[:,c0:c1], counts, pending=verdicts)
+                    # The writer's own counts on the devices (a whole model): the window's
+                    # counts are cut there, so none crosses from the host.
+                    window = (None if device_counts is None else _window_counts(batch, width)(
+                        device_counts, device_index(mesh, q0), device_index(mesh, c0)))
+                    _check_factor(b, host_poles[:,c0:c1], counts, pending=verdicts, device_counts=window)
                 with timing.section('host_digest_hashing'):
                     for shard in b.addressable_shards:
                         if shard.replica_id != 0:
@@ -1482,6 +1527,9 @@ class ResidentBankPayload:
         self._stored = {}
         self._pending = set()
         self._depth, self._read = 0, False
+        # name -> replicated device bool: every ``require_finite`` write of the
+        # field was all-finite.  Read ONCE, when the masks publish (write_attr).
+        self._finite = {}
 
     def __str__(self):
         tier = {"device": "device-resident", "host": "host-resident",
@@ -1517,6 +1565,7 @@ class ResidentBankPayload:
             for store in self._fields.values():
                 store.release()
         self._fields.clear()
+        self._finite.clear()
         self.header_json = None
 
     def _spec(self, ndim):
@@ -1581,12 +1630,37 @@ class ResidentBankPayload:
     def write_attr(self, name, value):
         # Masks and typed tables are authenticated by the JSON header alone.
         if name == "header_json":
+            # The header carries the masks: no span of a non-finite write
+            # publishes (the deferred check of ``write_slab(require_finite)``).
+            self._refuse_nonfinite_writes()
             self.header_json = bytes(value).decode()
+
+    def _refuse_nonfinite_writes(self):
+        """The deferred finite check: ONE device read for every checked write.
+
+        A resident write has no host copy to scan (the file route checks the
+        writer's staging bytes), so each ``require_finite`` write ANDs a device
+        reduction into its field's flag without a sync; the flags are read here,
+        together, where the masks publish.  The flags are global reductions, so
+        every rank reads the same verdict and refuses identically.
+        """
+        if not self._finite:
+            return
+        names = sorted(self._finite)
+        flags = _flag_stack(self.mesh, len(names))(*(self._finite[n] for n in names))
+        self._finite.clear()
+        ok = np.asarray(flags.addressable_shards[0].data)
+        bad = [n for n, good in zip(names, ok) if not good]
+        if bad:
+            _refuse(f"scratch {bad[0]} contains nonfinite values "
+                    f"(resident bank {self.label}; fields {bad})")
 
     def sync_writes(self):
         return None
 
-    def write_slab(self, name, A, *, offset):
+    def write_slab(self, name, A, *, offset, require_finite=False):
+        """``require_finite``: the check is deferred to the mask publish
+        (:meth:`_refuse_nonfinite_writes`), never a per-write sync."""
         if name not in self._fields:
             _refuse(f"resident bank {name} was not created")
         store, stored = self._fields[name], self._stored[name]
@@ -1596,6 +1670,10 @@ class ResidentBankPayload:
                 or any(o + s > n for o, s, n in zip(offset, A.shape, stored))
                 or not A.sharding.is_equivalent_to(NamedSharding(self.mesh, self._spec(A.ndim)), A.ndim)):
             _refuse(f"resident bank {name} write must be a face-tiled full-carrier span")
+        if require_finite:
+            flag = _all_finite(self.mesh)(A)
+            prev = self._finite.get(name)
+            self._finite[name] = flag if prev is None else _both_finite(self.mesh)(prev, flag)
         # A square operator is zeroed past its logical extent, as the file
         # stores it; a direction panel is stored whole.
         logical = None if name.startswith("line_") else self._logical[name][-1]
@@ -1654,6 +1732,23 @@ class ResidentBankPayload:
                                dtype=r["dtype"], partition_spec=partition_spec,
                                valid_shape=r.get("valid_shape"))
                 for r in requests]
+
+
+@lru_cache(maxsize=None)
+def _all_finite(mesh):
+    """``all(isfinite(a))`` as a replicated device bool (no host read)."""
+    return jax.jit(lambda a: jnp.all(jnp.isfinite(a)), out_shardings=NamedSharding(mesh, P()))
+
+
+@lru_cache(maxsize=None)
+def _both_finite(mesh):
+    return jax.jit(jnp.logical_and, out_shardings=NamedSharding(mesh, P()))
+
+
+@lru_cache(maxsize=None)
+def _flag_stack(mesh, n):
+    """``n`` replicated device bools -> one replicated vector (one host read)."""
+    return jax.jit(lambda *flags: jnp.stack(flags), out_shardings=NamedSharding(mesh, P()))
 
 
 @lru_cache(maxsize=None)
@@ -1886,6 +1981,39 @@ def _bank_io(path, mode, mesh):
 def open_shared_pole_bank(path, *, mesh_xy):
     """Read handle for an authenticated bank, file or device resident."""
     return _bank_io(path, "r", mesh_xy)
+
+
+class RoundReader:
+    """One read handle of a bank for every round of a constructor.
+
+    A file bank is ONE ``SlabIO`` read transaction for all rounds (the file is
+    opened, its datasets opened and their geometry queried once, not once per
+    round and phase). A resident bank keeps its per-phase ``with``: the tier's
+    reads are checked and agreed when each phase ends, before the caller uses
+    them. ``phase()`` yields the handle for one read phase.
+    """
+
+    def __init__(self, path, *, mesh_xy):
+        self.path, self.mesh, self._io = path, mesh_xy, None
+
+    def __enter__(self):
+        if not isinstance(self.path, ResidentBankPayload):
+            self._io = SlabIO(self.path, mode="r", mesh=self.mesh).__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        io, self._io = self._io, None
+        return io.__exit__(*exc) if io is not None else False
+
+    @contextmanager
+    def phase(self):
+        if isinstance(self.path, ResidentBankPayload):
+            with self.path as io:
+                yield io
+        else:
+            if self._io is None:
+                _refuse("round reader phase outside its open transaction")
+            yield self._io
 
 
 def line_panel_geometry(meta, *, ordered, photon_bases=None):
@@ -2361,16 +2489,6 @@ def _complete_bank(path, header):
         _stamp_header(path, header, "shared_pole_bank.complete")
 
 
-def _refuse_nonfinite(finite):
-    """Refuse the first ``(name, all-finite)`` entry that is false: one read for the call."""
-    if not finite:
-        return
-    flags = np.asarray(jnp.stack([ok for _, ok in finite]))
-    for (name, _), ok in zip(finite, flags):
-        if not ok:
-            _refuse(f"scratch {name} contains nonfinite values")
-
-
 def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
     """Validate/admit one line sample's panels for parents [q0, q1).
 
@@ -2394,7 +2512,7 @@ def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
     charge = "photon_layout" not in header
     basis = meta.mu_basis
     spec = P(None, None, "x", "y")
-    pending, finite = [], []
+    pending = []
     for family, array in line["panels"].items():
         width = int(array.shape[-1])
         stored = panels_meta["width"][family][sample - p0]
@@ -2421,9 +2539,9 @@ def _prepare_line_write(header, line, *, q0, q1, meta, mesh_xy, ledger):
                 temporary = 0
             _admit(ledger, "write_bank_" + name, output, temporary + arg,
                    device_panel=max(arg, output), native_host=True)
-            finite.append((name, jnp.all(jnp.isfinite(value))))
+            # Finite: checked by the writer on its host copy (write_slab
+            # require_finite in _write_bank_payload), not by a D2H read here.
             pending.append((family, name, value, counts))
-    _refuse_nonfinite(finite)
     return sample, pending
 
 
@@ -2462,7 +2580,6 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
     masks = _bank_masks(header)
     # Validate every argument before opening the writer: a bad second field
     # must not leave an otherwise legal first field queued in the same call.
-    finite = []
     for name, array in pending:
         geometry = _sample_field(header, name)
         sample = geometry is not None
@@ -2487,11 +2604,12 @@ def _prepare_bank_write(header, *, q_span, meta, mesh_xy,
             temporary = 0
         else:
             arg, output, temporary = _conversion_bytes(basis,array.shape,spec,unpack=True,operator=True)
-        # Factor-sized finite-check envelope, separate from caller input.
+        # Factor-sized conversion envelope, separate from caller input.
         _admit(ledger,"write_bank_"+name,output,temporary+arg,
                device_panel=max(arg,output),native_host=True)
-        finite.append((name, jnp.all(jnp.isfinite(array))))
-    _refuse_nonfinite(finite)
+        # Finite: checked by the writer on its host copy (write_slab
+        # require_finite in _write_bank_payload); a non-finite field raises
+        # at the transaction's close, before its masks publish.
     line = (None if line is None else
             _prepare_line_write(header, line, q0=q0, q1=q1, meta=meta, mesh_xy=mesh_xy, ledger=ledger))
     return q0, q1, rows, pending, line, masks
@@ -2513,7 +2631,7 @@ def _write_bank_payload(io, header, meta, prepared):
         io.create_dataset(name, shape=disk_shape, dtype=np.complex128)
         canonical = array if "photon_layout" in header else basis.unpack_operator(array, spec=spec)
         offset = (q0, rows[0], 0, 0) if geometry else (q0, 0, 0)
-        io.write_slab(name, canonical, offset=offset)
+        io.write_slab(name, canonical, offset=offset, require_finite=True)
         # SlabIO's write queue owns canonical until drained. Drain each
         # field so endpoint staging cannot accumulate across fields.
         io.sync_writes()
@@ -2532,7 +2650,7 @@ def _write_bank_payload(io, header, meta, prepared):
             charge = "photon_layout" not in header and not name.endswith("_cross")
             value = basis.unpack_axis(array, 2, spec=spec) if charge else array
             io.create_dataset(name, shape=(shape["nq"],) + tuple(value.shape[1:]), dtype=np.complex128)
-            io.write_slab(name, value, offset=(q0, 0, 0, 0))
+            io.write_slab(name, value, offset=(q0, 0, 0, 0), require_finite=True)
             io.sync_writes()
             del value
             if not name.endswith("_cross"):
@@ -2695,30 +2813,16 @@ def _restore_parent_order(value, ids, layout, contiguous, interval, mesh):
     return value
 
 
-def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sample_ids=None,
-                          fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None, sector=None):
-    """Read committed bounded scratch fields into packed distributed operators.
+def _dense_plan(io, q_span, *, meta, header, sample_span, sample_ids, fields, q_ids,
+                partition_spec, sector):
+    """Validated read requests of committed bank fields (no I/O).
 
-    Returns a plain dict of complex128 arrays. Dense samples require explicit
-    ``sample_span`` (a contiguous id span) or ``sample_ids`` (ids whose dense
-    rows are contiguous, e.g. the fitted samples on either side of the
-    line-panel span); no implicit all-bank read is offered, and a line-panel
-    sample is read with ``read_line_panels``. The caller authenticates
-    ``header`` before opening ``io``.
-
-    Parents are a contiguous ``q_span`` or a list ``q_ids`` (repeats allowed:
-    a round's synthetic slots repeat its last parent); the leading axis of
-    every field follows that order. ``partition_spec`` chooses the layout:
-    ``None`` returns face tiles (``[q, s, mu_X, nu_Y]`` samples,
-    ``[q, mu_X, nu_Y]`` moments); ``P(('x','y'), None, ...)`` returns batch
-    layout, whole matrices on the rank that owns each parent (rank
-    ``x*Py + y`` owns rows ``[r*q/P, (r+1)*q/P)``), for which the number of
-    parents must be a multiple of P. A contiguous ascending run is one
-    collective read in the requested layout: in batch layout each rank reads
-    only its own whole rows. A permuted complete interval is read once in face
-    layout, reordered, then moved to batch layout by the staged x-then-y
-    exchange. Sparse lists use one face read per parent. Values are identical
-    either way.
+    Returns ``(ledger, entries)``: one ``(name, spec, parts, pack, assemble)``
+    per field, ``parts`` one ``(request, price)`` per parent run (``price`` is
+    ``(argument, output, temporary)`` bytes; a sector read carries its
+    ``prefix``/``offset`` and ``price=None``). One plan serves
+    :func:`read_shared_pole_bank` and :func:`read_round_samples`, so both
+    return the same arrays.
     """
     if header.get("schema") != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
@@ -2767,8 +2871,7 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sa
             _refuse(f"scratch bank has no {name} field")
         if not marked.all():
             _refuse(f"scratch bank {name} requested span is incomplete")
-    out = {}
-    retained = 0
+    entries = []
     for name in fields:
         geometry = _sample_field(header, name)
         sample = geometry is not None
@@ -2780,9 +2883,7 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sa
             prefix = (count, len(rows)) if sample else (count,)
             offset = (q, rows[0], 0, 0) if sample else (q, 0, 0)
             if sector is not None:
-                row = _read_photon_bank_sector(io, name, prefix, offset, spec, header, sector, ledger, retained)
-                retained += _local_bytes(row.shape, row.dtype, mesh, spec)
-                parts.append(row)
+                parts.append((dict(prefix=prefix, offset=offset), None))
                 continue
             d = shape["d"] if "photon_layout" in header else basis.n_canonical
             logical = shape["d"] if "photon_layout" in header else basis.n_logical
@@ -2792,20 +2893,122 @@ def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sa
             else:
                 arg, output, temporary = _conversion_bytes(basis,
                     prefix+(d,d),spec,unpack=False,operator=True)
+            parts.append((dict(name=name, shape=prefix + (d, d), valid_shape=prefix + (logical, logical),
+                               offset=offset, dtype=np.complex128), (arg, output, temporary)))
+
+        def pack(value, spec=spec):
+            return value if "photon_layout" in header else basis.pack_operator(value, spec=spec)
+
+        def assemble(packed, spec=spec):
+            value = packed[0] if len(packed) == 1 else _bank_stack_rows(mesh, spec)(tuple(packed))
+            del packed[:]
+            return _restore_parent_order(value, ids, layout, contiguous, interval, mesh)
+        entries.append((name, spec, parts, pack, assemble))
+    return ledger, entries
+
+
+def read_shared_pole_bank(io, q_span=None, *, meta, header, sample_span=None, sample_ids=None,
+                          fields=("Wc", "dWc_ds"), q_ids=None, partition_spec=None, sector=None):
+    """Read committed bounded scratch fields into packed distributed operators.
+
+    Returns a plain dict of complex128 arrays. Dense samples require explicit
+    ``sample_span`` (a contiguous id span) or ``sample_ids`` (ids whose dense
+    rows are contiguous, e.g. the fitted samples on either side of the
+    line-panel span); no implicit all-bank read is offered, and a line-panel
+    sample is read with ``read_line_panels``. The caller authenticates
+    ``header`` before opening ``io``.
+
+    Parents are a contiguous ``q_span`` or a list ``q_ids`` (repeats allowed:
+    a round's synthetic slots repeat its last parent); the leading axis of
+    every field follows that order. ``partition_spec`` chooses the layout:
+    ``None`` returns face tiles (``[q, s, mu_X, nu_Y]`` samples,
+    ``[q, mu_X, nu_Y]`` moments); ``P(('x','y'), None, ...)`` returns batch
+    layout, whole matrices on the rank that owns each parent (rank
+    ``x*Py + y`` owns rows ``[r*q/P, (r+1)*q/P)``), for which the number of
+    parents must be a multiple of P. A contiguous ascending run is one
+    collective read in the requested layout: in batch layout each rank reads
+    only its own whole rows. A permuted complete interval is read once in face
+    layout, reordered, then moved to batch layout by the staged x-then-y
+    exchange. Sparse lists use one face read per parent. Values are identical
+    either way.
+    """
+
+    ledger, entries = _dense_plan(io, q_span, meta=meta, header=header, sample_span=sample_span,
+                                  sample_ids=sample_ids, fields=fields, q_ids=q_ids,
+                                  partition_spec=partition_spec, sector=sector)
+    mesh = meta.mu_basis.mesh_xy
+    out = {}
+    retained = 0
+    for name, spec, parts, pack, assemble in entries:
+        packed = []
+        for request, price in parts:
+            if sector is not None:
+                row = _read_photon_bank_sector(io, name, request["prefix"], request["offset"], spec,
+                                               header, sector, ledger, retained)
+                retained += _local_bytes(row.shape, row.dtype, mesh, spec)
+                packed.append(row)
+                continue
+            arg, output, temporary = price
             _admit(ledger,"read_bank_"+name,retained+arg+output,temporary,
                    device_panel=arg,native_host=True,io=io)
             canonical = io.read_slab(
-                name, shape=prefix + (d,d),
-                valid_shape=prefix + (logical,logical),
-                offset=offset, dtype=np.complex128, partition_spec=spec)
-            row = canonical if "photon_layout" in header else basis.pack_operator(canonical, spec=spec)
+                name, shape=request["shape"], valid_shape=request["valid_shape"],
+                offset=request["offset"], dtype=np.complex128, partition_spec=spec)
+            packed.append(pack(canonical))
             retained += output
             del canonical
-            parts.append(row)
-        value = parts[0] if len(parts) == 1 else _bank_stack_rows(mesh, spec)(tuple(parts))
-        del parts
-        out[name] = _restore_parent_order(value, ids, layout, contiguous, interval, mesh)
+        out[name] = assemble(packed)
     return out
+
+
+def read_round_samples(io, q_span=None, *, meta, header, fields, sample_span=None, sample_ids=None,
+                       q_ids=None, partition_spec=None, line_family=None, line_samples=()):
+    """A round's committed bank fields and line panels in ONE collective read.
+
+    ``(dense, line)``: ``dense`` is :func:`read_shared_pole_bank`'s dict for
+    ``fields`` and ``line`` is :func:`read_line_panel_round`'s dict for
+    ``line_samples`` of ``line_family`` (empty without samples); every value
+    is exactly what those readers return (one plan each). All their parent
+    runs go to ``io.read_multi`` together, so they share one rank: sample
+    fields with line panels (4-D), or moment fields alone (3-D). No sector
+    reads (the photon sector reader keeps its own route).
+
+    Device bytes: the read's outputs are the raw fields and panels; each is
+    packed and released in turn, so the store admits the worst point of that
+    sequence (raw parts not yet packed, packed parts so far, the part's
+    conversion temporary). On an identity basis the outputs are the values.
+    """
+    line_samples = [int(v) for v in line_samples]
+    ledger, entries = _dense_plan(io, q_span, meta=meta, header=header, sample_span=sample_span,
+                                  sample_ids=sample_ids, fields=fields, q_ids=q_ids,
+                                  partition_spec=partition_spec, sector=None)
+    lines = [_line_panel_plan(io, q_span, meta=meta, header=header, family=line_family,
+                              sample=sid, cross=False, q_ids=q_ids, partition_spec=partition_spec)
+             for sid in line_samples]
+    groups = [(spec, parts) for _, spec, parts, _, _ in entries + lines]
+    specs = {spec for spec, _ in groups}
+    ranks = {len(request["shape"]) for _, parts in groups for request, _ in parts}
+    if len(specs) != 1 or len(ranks) != 1:
+        _refuse("round sample read needs one layout and one rank for every field and line panel")
+    spec, = specs
+    prices = [price for _, parts in groups for _, price in parts]
+    args = [arg for arg, _, _ in prices]
+    resident = max(sum(args[k:]) + sum(o for _, o, _ in prices[:k + 1]) for k in range(len(prices)))
+    _admit(ledger, "read_round_" + "_".join(name for name, *_ in entries) + (
+        f"_line{len(lines)}" if lines else ""), resident, max(t for _, _, t in prices),
+        device_panel=sum(args), native_host=True, io=io)
+    values = io.read_multi([request for _, parts in groups for request, _ in parts],
+                           partition_spec=spec)
+    out, k = [], 0
+    for _, _, parts, pack, assemble in entries + lines:
+        packed = []
+        for j in range(k, k + len(parts)):
+            packed.append(pack(values[j]))
+            values[j] = None             # each raw part is released as it is packed
+        out.append(assemble(packed))
+        k += len(parts)
+    dense = {name: value for (name, *_), value in zip(entries, out)}
+    return dense, dict(zip(line_samples, out[len(entries):]))
 
 
 def _line_panel_plan(io, q_span, *, meta, header, family, sample, cross, q_ids, partition_spec):

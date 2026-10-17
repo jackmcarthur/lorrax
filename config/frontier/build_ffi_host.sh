@@ -264,6 +264,14 @@ fi
 echo "[build_ffi_host] GATE 9 PASSED: 0 lorrax_ffi internals exported, all $(grep -cE '^lrx_' <<<"$_dynsyms") lrx_* entry points leg-suffixed"
 unset _dynsyms
 
+# Dependency closure (lxkit.native_provider), as on Perlmutter: the SLATE
+# install and the pinned MPI/HDF5/LibSci files, enforced by the loader.
+"$LORRAX_VENV_PY" "$LORRAX_ROOT/src/ffi/cpp/stage/write_checkout_closure.py" \
+    "$SO_FILE" --private-dir "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" \
+    --library-dirs "$LORRAX_OLCF_RUNTIME_LIB_DIRS" || {
+        echo "[build_ffi_host] FAILED: dependency closure" >&2; exit 1; }
+_closure_sha="$("$LORRAX_VENV_PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "$SO_FILE.closure.json")"
+
 # All five host backends are built here.  GATE 8 needs a python that imports
 # jax and must run inside an allocation; LORRAX_GATE_FFTW_PY is passed so a
 # run on a compute node executes it (on a login node it is not evidence).
@@ -283,6 +291,7 @@ GATE_TAG=build_ffi_host \
 "$LORRAX_ROOT/src/ffi/cpp/stage/stamp_provenance.sh" "$SO_FILE" \
     "leg=host" \
     "site=frontier" \
+    "closure_sha256=$_closure_sha" \
     "prgenv=$LORRAX_OLCF_PRGENV" \
     "mpi=$LORRAX_OLCF_MPICH_MODULE" \
     "mpi_root=$LORRAX_OLCF_MPICH_ROOT" \

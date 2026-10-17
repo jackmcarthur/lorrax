@@ -267,6 +267,20 @@ def _reflected_eigh(a, UPLO, symmetrize_input, solve=None):
     return w, v
 
 
+def eigh_local_jacobi(a):
+    """``(w, v)`` of a full Hermitian stack by jaxlib's Jacobi eigensolver (rocSOLVER/cuSOLVER
+    syevj/heevj), ascending.  The re-solve route of a caller whose round reported non-finite
+    eigenpairs from :func:`eigh_local` (the rocSOLVER zheevd silent mode, module docstring); never
+    the first solve (4-30x slower; measured XLA temp equal to the default solver's at n 234-3120)."""
+    try:
+        from jax.lax.linalg import EighImplementation
+    except ImportError:                               # jax 0.9.1 keeps the enum private
+        from jax._src.lax.linalg import EighImplementation
+    v, w = jax.lax.linalg.eigh(jnp.asarray(a), symmetrize_input=True, sort_eigenvalues=True,
+                               implementation=EighImplementation.JACOBI)
+    return EighResult(w, v)
+
+
 def eigh_local(a, UPLO=None, symmetrize_input=True):
     """``jnp.linalg.eigh(a, UPLO, symmetrize_input)``: ascending eigenvalues and the
     eigenvector columns, batched over leading axes, driven by the leg's route."""

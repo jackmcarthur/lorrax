@@ -135,7 +135,7 @@ from distrib_la.plan import (
 )
 from distrib_la.polar import (PolarPlan, plan_polar_factor, polar_factor,
                              right_singular_vectors, leading_eigenvectors,
-                             retain_leading_eigenvectors)
+                             leading_eigenvectors_above, retain_leading_eigenvectors)
 from distrib_la.resolve import (
     BACKEND_CHOICES,
     CHOLESKY_BACKENDS,
@@ -151,8 +151,9 @@ from distrib_la.resolve import (
     resolve_backend,
 )
 
+from ._active_local import active_weights_on_load
 from ._batch_reshard import batch_layout, is_batch_layout, local_batch
-from ._result_check import checked_program, checked_shapes
+from ._result_check import checked_program, checked_shapes, native_eigh_jacobi
 from distrib_la.local_eigh import eigh_local, eigh_route, COMPLEX_EIGH_ROUTE
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
@@ -165,12 +166,12 @@ __all__ = [
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
     # plan
-    "Plan", "plan", "StackRoute", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes",
+    "Plan", "plan", "StackRoute", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
     # native dense workspace queries (no allocation)
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local", "eigh_stack_bytes",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
-    "right_singular_vectors", "leading_eigenvectors",
+    "right_singular_vectors", "leading_eigenvectors", "leading_eigenvectors_above",
     "retain_leading_eigenvectors",
     # distributed matrix multiplication
     "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
@@ -184,6 +185,8 @@ __all__ = [
     "resolve_backend", "list_backends", "backend_module",
     "BACKEND_CHOICES", "EIGH_BACKENDS", "CHOLESKY_BACKENDS", "LU_BACKENDS",
     "OPS", "NATIVE", "mesh_platform", "mesh_is_cpu", "mesh_key",
+    # whether a platform's active-range GEMM weights its operand as it loads it
+    "active_weights_on_load",
     # capability
     "probe_target", "has_target", "dial_key",
     # round-off tolerance of every linear-algebra check

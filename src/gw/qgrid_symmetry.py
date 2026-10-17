@@ -135,6 +135,13 @@ def shared_pole_operator_realizer(meta, header, *, q_full_idx, mesh_xy):
             return project_little_group_operator(
                 operator, transposed_partner=transposed_partner,
                 kgrid=grid, n_sym_spatial=nsp, mesh=mesh_xy, **kwargs)
+        # Static: the realization is the identity pair (every stabilizer is the identity
+        # alone), so a consumer that reads one orientation need not form the other.
+        from symmetry_maps import little_group_projection_is_identity
+        realize.is_identity = bool(little_group_projection_is_identity(
+            kwargs["q_full_idx"], kgrid=grid, sym_mats_k=kwargs["sym_mats_k"],
+            sym_perm=kwargs["sym_perm"], L_table=kwargs["L_table"],
+            active_symmetry_rows=kwargs["active_symmetry_rows"], n_sym_spatial=nsp))
         _SHARED_POLE_REALIZERS[key] = realize
     return realize
 

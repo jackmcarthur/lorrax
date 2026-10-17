@@ -84,6 +84,7 @@ __all__ = [
     "build_qgrid_trs_policy",
     "little_group_covariance_residual",
     "project_little_group_operator",
+    "little_group_projection_is_identity",
     "minus_q_parent_partners",
     "self_negative_q_mask",
     "trs_pair_coherent_unfold_sym_idx",
@@ -487,6 +488,27 @@ def _little_group_segments(counts, *, tile_bytes):
                  for lo, hi in zip(bounds[:-1], bounds[1:]))
 
 
+def little_group_projection_is_identity(q_full_idx, *, kgrid, sym_mats_k, sym_perm, L_table,
+                                        active_symmetry_rows, n_sym_spatial):
+    """Whether :func:`project_little_group_operator` is the identity on these q rows.
+
+    True exactly when every stabilizer is one authenticated identity row (identity rotation,
+    identity source map, zero wraps): the Reynolds average of one element of weight 1 is the
+    pair itself, so neither orientation reads the other.  Host metadata only.
+    """
+    rotations, perm, wraps = (np.asarray(x) for x in (sym_mats_k, sym_perm, L_table))
+    active, nsp = np.asarray(active_symmetry_rows), int(n_sym_spatial)
+    m = int(perm.shape[1])
+    identity = {int(s) for s in active if s < nsp
+                and np.array_equal(rotations[s], np.eye(3, dtype=int))
+                and np.array_equal(perm[s], np.arange(m)) and np.all(wraps[s] == 0)}
+    if not identity:
+        return False
+    stabilizers = _little_group_operations(
+        np.asarray(q_full_idx), kgrid=kgrid, sym_mats_k=rotations, active_symmetry_rows=active)
+    return all(rows.size == 1 and int(rows[0]) in identity for rows in stabilizers)
+
+
 def project_little_group_operator(
     operator, *, transposed_partner, q_full_idx, q_irr_frac, sym_mats_k,
     sym_perm, L_table, active_symmetry_rows, kgrid, n_sym_spatial, mesh,
@@ -578,6 +600,16 @@ def project_little_group_operator(
         for parent, rows in enumerate(stabilizers):
             ops[:rows.size, parent] = rows
             valid[:rows.size, parent] = 1./rows.size
+        if steps == 1 and np.isin(ops[0], identity).all():
+            # Every stabilizer is the authenticated identity alone (identity rotation, identity
+            # source map, zero wraps, weight 1): the Reynolds average IS the pair.  Return it
+            # instead of a gather-and-phase pass over both tiles (Fe 4x4x4 noncollinear: 272 ms
+            # of 5.83 s Sigma GPU time, 2 x 24.9 MB per tau per rank; syn lane 2026-10-16).
+            # Same values; only the sign of an exact zero can differ from 1*(+0j) arithmetic.
+            def identity_pair(plus, partner):
+                return plus, partner
+            compiled = _LITTLE_GROUP_PROJECTORS[key] = identity_pair
+            return compiled(operator, transposed_partner)
         # Steps run in segments; a segment [lo, hi) transforms only the parents
         # whose group has operations past lo.  Padding every parent to the
         # largest group made the loop cost n_parents x max|G_q| tile transforms

@@ -37,6 +37,7 @@ import sys
 import traceback
 
 import jax
+from lxkit import ordered_norm, ordered_sum
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -63,20 +64,38 @@ def _eye_like(a):
             == jax.lax.broadcasted_iota(jnp.int32, (n, n), 1)).astype(a.dtype)
 
 
-def _norm(a):
-    return jnp.linalg.norm(a, axis=(-2, -1))
+def _face(nd):
+    """The face tile of a (..., n, n) stack: rows on 'x', columns on 'y'."""
+    return P(*((None,) * (nd - 2)), "x", "y")
 
 
-def _live_norm(a):
+def _rows(nd):
+    """A tall (..., n, k) stack: rows on 'x' (k probe columns whole)."""
+    return P(*((None,) * (nd - 2)), "x", None)
+
+
+def _norm(a, mesh=None, spec=None):
+    """Frobenius norm of the matrix axes.  With ``mesh`` the ranks' partials are added in
+    rank order on ``spec`` (lxkit.ordered_norm), not by an XLA all-reduce in topology order."""
+    if mesh is None:
+        return jnp.linalg.norm(a, axis=(-2, -1))
+    return ordered_norm(a, axis=(-2, -1), mesh=mesh, spec=spec)
+
+
+def _live_norm(a, mesh=None):
     """||A||_F without the rows that carry only a diagonal entry (sentinels, zero rows)."""
     diagonal = jnp.diagonal(a, axis1=-2, axis2=-1)
     decoupled = jnp.all((a == 0) | (_eye_like(a) != 0), axis=-1)
-    live = jnp.sum(jnp.abs(a) ** 2, axis=(-2, -1)) - jnp.sum(
-        jnp.where(decoupled, jnp.abs(diagonal) ** 2, 0), axis=-1)
+    if mesh is None:
+        live = jnp.sum(jnp.abs(a) ** 2, axis=(-2, -1)) - jnp.sum(
+            jnp.where(decoupled, jnp.abs(diagonal) ** 2, 0), axis=-1)
+    else:   # rank order on the face; the diagonal is one-owner (exact), summed in rank order too
+        live = ordered_sum(jnp.abs(a) ** 2, axis=(-2, -1), mesh=mesh, spec=_face(a.ndim)) - ordered_sum(
+            jnp.where(decoupled, jnp.abs(diagonal) ** 2, 0), axis=-1, mesh=mesh, spec=P(*((None,) * (a.ndim - 1))))
     return jnp.sqrt(jnp.maximum(live, 0))
 
 
-def deflate_zero_rows(eigh, *, constrain=None, shift=False):
+def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
     """Wrap a Hermitian eigensolver so exact zero rows never reach it.
 
     Capacity padding and unselected columns reach eigensolvers as exact zero
@@ -106,10 +125,12 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False):
         n = a.shape[-1]
         dead = jnp.all(a == 0, axis=-1)
         # Every live eigenvalue lies in [-b, b] (Gershgorin).
-        bound = jnp.max(jnp.sum(jnp.abs(a), axis=-1), axis=-1)
+        rows = (jnp.sum(jnp.abs(a), axis=-1) if mesh is None else
+                ordered_sum(jnp.abs(a), axis=-1, mesh=mesh, spec=_face(a.ndim)))
+        bound = jnp.max(rows, axis=-1)
         bound = jnp.where(bound > 0, bound, 1)
         sentinel = -2 * bound[..., None] * (1 + jnp.arange(n, dtype=bound.dtype) / n)
-        s = _live_norm(a)[..., None] if shift else 0
+        s = _live_norm(a, mesh)[..., None] if shift else 0
         diagonal = jnp.where(dead, sentinel, s).astype(a.dtype)
         values, vectors = pin(eigh(a + diagonal[..., :, None] * _eye_like(a)))
         restored = jnp.where(values < -1.5 * bound[..., None], 0, values - s)
@@ -129,9 +150,13 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False):
 #: leg's implementation, :mod:`distrib_la.local_eigh`), deflated.
 from distrib_la.local_eigh import eigh_local as _eigh_local
 native_eigh = jax.jit(deflate_zero_rows(_eigh_local))
+#: The same deflated eigh by Jacobi: the one re-solve of a round whose native eigh came back
+#: non-finite (shared_pole_constructor / shared_pole_sectors, on their host-read diagnostics).
+from distrib_la.local_eigh import eigh_local_jacobi as _eigh_local_jacobi
+native_eigh_jacobi = jax.jit(deflate_zero_rows(_eigh_local_jacobi))
 
 
-def orthonormalize(vectors, *, matmul):
+def orthonormalize(vectors, *, matmul, mesh=None):
     """Newton-Schulz polar iteration V <- V (3I - V^H V) / 2, GEMMs only.
 
     Returns the vectors and the number of steps taken. A solve whose vectors
@@ -149,7 +174,7 @@ def orthonormalize(vectors, *, matmul):
 
     def gram(v):
         g = matmul(v, v, transa="C")
-        return g, jnp.max(_norm(g - eye)) / np.sqrt(n)
+        return g, jnp.max(_norm(g - eye, mesh, _face(g.ndim))) / np.sqrt(n)
 
     def unfinished(state):
         steps, _, _, defect = state
@@ -166,7 +191,7 @@ def orthonormalize(vectors, *, matmul):
     return vectors, steps
 
 
-def shifted(eigh, *, matmul):
+def shifted(eigh, *, matmul, mesh=None):
     """Solve A + s I, s = ||live part of A||_F, re-orthonormalize, return A's eigenpairs.
 
     The shift moves a large (near-)zero cluster away from the origin.
@@ -181,9 +206,9 @@ def shifted(eigh, *, matmul):
     n eps lambda_max support line of the response callers.
     """
     def solve(a):
-        s = _live_norm(a)
+        s = _live_norm(a, mesh)
         values, vectors = eigh(a + s[..., None, None] * _eye_like(a))
-        vectors, _ = orthonormalize(vectors, matmul=matmul)
+        vectors, _ = orthonormalize(vectors, matmul=matmul, mesh=mesh)
         return values - s[..., None], vectors
     return solve
 
@@ -218,9 +243,10 @@ def eigh_errors(a, values, vectors, *, mesh=None):
     """Largest probe residual and orthogonality error of a (stack of) eigh result(s)."""
     x = probes(a.shape[-1], vectors.dtype)
     vx = vectors @ x
-    residual = _norm(a @ vx - vectors @ (values[..., :, None] * x)) / (
-        jnp.maximum(_norm(a), jnp.finfo(values.dtype).tiny) * _norm(x))
-    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x) / _norm(x)
+    nd = a.ndim
+    residual = _norm(a @ vx - vectors @ (values[..., :, None] * x), mesh, _rows(nd)) / (
+        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * _norm(x))
+    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x, mesh, _rows(nd)) / _norm(x)
     finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
     return (jnp.where(finite, jnp.max(residual), jnp.inf),
             jnp.where(finite, jnp.max(orthogonality), jnp.inf))
@@ -563,25 +589,28 @@ def raise_if_failed(status, op, n, dtype, site):
         raise ValueError(refusal_message(op, n, dtype, site, "every"))
 
 
-def matrix_sketch(a):
-    """Before a factorization or solve that may consume ``a``: (A^H W, ||A||)."""
+def matrix_sketch(a, mesh=None):
+    """Before a factorization or solve that may consume ``a``: (A^H W, ||A||).  ``mesh``: ``a``
+    is face-tiled there and its norm is added in rank order."""
     w = probes(a.shape[-1], a.dtype, salt=1)
-    return jnp.conj(jnp.swapaxes(a, -1, -2)) @ w, _norm(a)
+    return jnp.conj(jnp.swapaxes(a, -1, -2)) @ w, _norm(a, mesh, _face(a.ndim))
 
 
-def rhs_sketch(b):
-    """Before a solve that may consume ``b``: (W^H B, ||B||)."""
+def rhs_sketch(b, mesh=None):
+    """Before a solve that may consume ``b``: (W^H B, ||B||) (``b`` face-tiled on ``mesh``)."""
     w = probes(b.shape[-2], b.dtype, salt=1)
-    return jnp.conj(w.T) @ b, _norm(b)
+    return jnp.conj(w.T) @ b, _norm(b, mesh, _face(b.ndim))
 
 
-def solve_errors(sketch, x):
+def solve_errors(sketch, x, mesh=None):
     """||W^H (A X - B)|| / (sqrt(k) (||A|| ||X|| + ||B||)) from the pre-solve sketches, largest over the stack.
 
     ``sketch`` is ``matrix_sketch(A) + rhs_sketch(B)``; W^H A X = (A^H W)^H X.
     """
     ahw, norm_a, whb, norm_b = sketch
     projected = jnp.conj(jnp.swapaxes(ahw, -1, -2)) @ x - whb
-    scale = np.sqrt(PROBES) * (norm_a * _norm(x) + norm_b)
-    error = _norm(projected) / jnp.maximum(scale, jnp.finfo(scale.dtype).tiny)
+    nd = x.ndim
+    scale = np.sqrt(PROBES) * (norm_a * _norm(x, mesh, _face(nd)) + norm_b)
+    # W^H (A X - B): k probe rows, the right-hand-side columns on 'y' as in X
+    error = _norm(projected, mesh, P(*((None,) * (nd - 1)), "y")) / jnp.maximum(scale, jnp.finfo(scale.dtype).tiny)
     return (jnp.where(jnp.all(jnp.isfinite(x)), jnp.max(error), jnp.inf),)

@@ -27,6 +27,7 @@ import math
 from functools import partial
 
 import jax
+from lxkit import ordered_psum
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import io_callback
@@ -462,7 +463,7 @@ def make_sharded_pivoted_cholesky_select(
             local_diag_raw = jnp.real(
                 G_slab[jnp.arange(M_slab), col_ids_local])
             local_diag = jnp.maximum(local_diag_raw, 0.0)
-            trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
+            trG = ordered_psum(jnp.sum(local_diag), axis_name=mesh_axis)
             col_ids_k = jnp.arange(k_keep)
             # The floor moves ABOVE the loop, same as the reference kernel:
             # it is the stopping rule, and ``pmax`` makes it identical on
@@ -560,7 +561,7 @@ def make_sharded_pivoted_cholesky_select(
                     my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]),
                 )
                 if orbit_id_slab is None:
-                    L_p = lax.psum(local_Lp, mesh_axis)
+                    L_p = lax.psum(local_Lp, mesh_axis)  # exact-reduce: masked broadcast, one owner of row p
                 else:
                     # ONE psum, not two.  The orbit id of the picked pivot
                     # rides the SAME masked broadcast as L[p, :] — it is the
@@ -572,7 +573,7 @@ def make_sharded_pivoted_cholesky_select(
                     _oid_term = jnp.where(
                         my_has_p, orbit_id_slab[safe_idx], jnp.int32(0),
                     ).astype(G_slab.dtype)
-                    _fused = lax.psum(
+                    _fused = lax.psum(  # exact-reduce: masked broadcast, one owner of row p
                         jnp.concatenate([local_Lp, _oid_term[None]]),
                         mesh_axis)
                     L_p = _fused[:k_keep]
@@ -630,7 +631,7 @@ def make_sharded_pivoted_cholesky_select(
                 0, k_keep, body, init)
             d_final = jnp.where(jnp.isfinite(d_final), d_final, 0.0)
             # The one psum the per-iteration diagnostic was costing.
-            trR_over_trG = lax.psum(trR_over_trG, axis_name=mesh_axis) / trG
+            trR_over_trG = ordered_psum(trR_over_trG, axis_name=mesh_axis) / trG
             rank = jnp.sum(d_taken > floor).astype(jnp.int32)
             # THREE reductions, ONCE, after the loop — not per iteration:
             # the global minimum, then the row and step that attained it,
@@ -727,7 +728,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
             active0 = (jnp.ones((M_slab,), dtype=bool)
                        if active_slab is None else active_slab.astype(bool))
             local_diag = jnp.where(active0, local_diag, 0.0)
-            trG = lax.psum(jnp.sum(local_diag), axis_name=mesh_axis)
+            trG = ordered_psum(jnp.sum(local_diag), axis_name=mesh_axis)
             d0max = lax.pmax(
                 jnp.max(jnp.where(active0, local_diag_raw, minus_inf)),
                 axis_name=mesh_axis)
@@ -738,7 +739,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
             local_sizes = jax.ops.segment_sum(
                 active0.astype(jnp.int32), group_id_slab,
                 num_segments=n_groups + 1, indices_are_sorted=False)
-            group_sizes = lax.psum(local_sizes, axis_name=mesh_axis)
+            group_sizes = lax.psum(local_sizes, axis_name=mesh_axis)  # exact-reduce: int32 counts
 
             initial_for_min = jnp.where(active0, local_diag_raw, jnp.inf)
             at0_loc = jnp.argmin(initial_for_min).astype(jnp.int32)
@@ -776,7 +777,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
                         jnp.where(unadmitted & (d > floor), d, 0.0),
                         group_id_slab,
                         num_segments=n_groups + 1, indices_are_sorted=False)
-                    values = lax.psum(local_values, axis_name=mesh_axis)
+                    values = ordered_psum(local_values, axis_name=mesh_axis)
                     remaining_budget = jnp.int32(point_budget) - committed
                     eligible = ((group_sizes > 0)
                                 & ~chosen
@@ -831,7 +832,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
                 safe_idx = jnp.clip(local_p_rel, 0, M_slab - 1)
                 local_Lp = jnp.where(
                     my_has_p, L[safe_idx, :], jnp.zeros_like(L[safe_idx, :]))
-                L_p = lax.psum(local_Lp, axis_name=mesh_axis)
+                L_p = lax.psum(local_Lp, axis_name=mesh_axis)  # exact-reduce: masked broadcast, one owner of row p
 
                 prev_mask = (col_ids < j).astype(G_slab.dtype)
                 corr = L @ (jnp.conj(L_p) * prev_mask)
@@ -885,7 +886,7 @@ def make_sharded_group_block_pivoted_cholesky_select(
              d_min_raw, d_min_at, d_min_j) = lax.fori_loop(
                 0, point_budget, body, init)
             d_final = jnp.where(available, d, 0.0)
-            trR = lax.psum(trR, axis_name=mesh_axis) / trG
+            trR = ordered_psum(trR, axis_name=mesh_axis) / trG
             rank = jnp.sum(d_taken > floor).astype(jnp.int32)
             g_min = -lax.pmax(-d_min_raw, axis_name=mesh_axis)
             mine = d_min_raw == g_min

@@ -178,6 +178,10 @@ struct LORRAX_PHDF_CTX_TYPE {
     std::atomic<size_t> pinned_capacity{0};
     void*        read_buf            = nullptr;
     std::atomic<size_t> read_capacity{0};
+    // Bytes of ``read_buf`` held against the PROCESS-WIDE retained-staging
+    // budget (context.cc settle_read_buf); 0 when the buffer is within the
+    // per-file bound or is not retained.  XLA thread, like read_buf.
+    size_t       read_reserved       = 0;
     // std::hash of ``writer_thread``'s id, published by the thread itself
     // before it runs any task.  A plain integer rather than a
     // std::atomic<std::thread::id> so the guard needs nothing exotic; a hash
@@ -198,6 +202,12 @@ struct LORRAX_PHDF_CTX_TYPE {
     // the Python worker / writer thread.
     lrx::gpu::Event  d2h_event           = nullptr;
     lrx::gpu::Event  h2d_event           = nullptr;
+    // ABI 7 ordering fence: recorded on xla_stream and waited on by
+    // ``stream`` before every read H2D / write D2H, so the copy follows the
+    // work that produced its buffer (the donated destination's fill, the
+    // write operand).  Until ABI 6 the control copy-in's xla_stream sync did
+    // that as a side effect, on the host.  Device-side only: no host wait.
+    lrx::gpu::Event  order_event         = nullptr;
 #endif
 
     // ─── Async-write worker ─────────────────────────────────────────
@@ -260,6 +270,15 @@ bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes);
 // copy here. On the host build, release is immediate after memcpy.
 void retire_read_buf(PhdfCtx* ctx);
 
+// After a synchronous read: keep ``read_buf`` for the next read when it is
+// within the per-file bound (32 MiB) or when it fits the process-wide
+// retained budget (``LORRAX_PHDF5_READ_STAGING_RETAIN_MB``, default 256);
+// otherwise retire it.  A buffer above the per-file bound used to be
+// retired after every read and re-pinned by the next: the Fe V2 shared-pole
+// constructor paid 16 x ~50 MB re-pins per run, 0.25 s of handler time on
+// the dispatch thread (lane slabmr diagnostic run d7a, before this change).
+void settle_read_buf(PhdfCtx* ctx);
+
 // ─── THE LIVE-CTX REGISTRY (SLAB_IO_ROOT_CAUSE_AUDIT.md B2) ──────────────
 //
 // A handler's ctx handle arrives as an int64 in a DEVICE buffer and is turned
@@ -314,5 +333,38 @@ bool ctx_is_live(const PhdfCtx* ctx, size_t* n_live);
 // samples with acquire semantics.  The registry lock separately keeps every
 // context alive for the duration of the walk.
 bool staging_totals(const PhdfCtx* ctx, size_t* n_live, size_t* pinned_bytes);
+
+// ─── POSTED CONTROL (handler ABI 7) ──────────────────────────────────────
+// The read, read_multi, read_kchunk_union, write and write_independent
+// handlers take NO control operand.  SlabIO posts each call's control values (ctx, dataset ids,
+// origin, valid extent) here through a ctypes entry point, keyed by the
+// address of the call's OWN data buffer and the handler kind: the output the
+// caller allocated and aliased into the call (reads), or the operand (writes).
+// The handler takes its entry by that address.  So no device array carries a
+// descriptor, there is no D2H copy-in and no xla_stream sync, and the match
+// does not depend on the order XLA runs the calls in (a FIFO would: the CPU
+// client runs ready programs concurrently, and two same-shape writes would
+// swap offsets).  A missing entry is a refusal (GATE phdf5_posted_control),
+// never a guess: it means the buffer the handler got is not the one SlabIO
+// posted for (an XLA copy defeated the alias), or nothing was posted.
+enum ControlKind : int64_t {
+    kCtlRead = 1, kCtlReadMulti = 2, kCtlWrite = 3, kCtlWriteIndependent = 4,
+    kCtlReadKchunkUnion = 5,
+};
+// A write's control is {ctx, ds_id, offset[N], valid_shape[N]} and may carry
+// ONE trailing flags word.  kWriteFlagRequireFinite: the writer thread checks
+// the bytes it already holds (the pinned D2H copy on a device leg, the
+// operand on the host leg) before H5Dwrite.  A rank holding a NaN/Inf writes
+// nothing (empty selection, still inside the collective) and fails the
+// write's Promise, so every rank raises at the next read or at close and a
+// store's masks never publish (SlabIO.write_slab require_finite).  This
+// replaces a separate jnp.isfinite reduction + D2H read per array.
+constexpr int64_t kWriteFlagRequireFinite = 1;
+// 0 = posted; 1 = an entry for (addr, kind) is already pending (refused).
+int  post_control(uint64_t addr, int64_t kind, const int64_t* v, int64_t n);
+bool retract_control(uint64_t addr, int64_t kind);
+bool take_control(uint64_t addr, int64_t kind, std::vector<int64_t>* out,
+                  std::string* err);
+size_t pending_controls();
 
 }  // namespace lorrax_ffi::phdf5

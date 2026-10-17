@@ -34,14 +34,19 @@ launch_libraries_remedy = "Source config/frontier/rocm_env.sh before srun: it li
 # start-up, before any collective.
 mpi_before_collectives = true
 
-# The settings of the site module rccl-net-plugin/1.0 (`module show`, OLCF
-# 2026-07-01: aws-ofi-nccl 1.19.2 built per ROCm), filled in where the caller
-# has not exported them.  The plugin is the ROCm 7.13.0 build, the newest
-# beside the wheel's ROCm 7.14.1; it links libamdhip64.so.7, which resolves to
-# the HIP runtime the ROCm PJRT plugin already mapped, and libfabric 2.3.1
-# from the Cray PE library path.  NCCL_NET names the plugin's transport, so a
-# plugin that does not load fails RCCL's init by name instead of falling back
-# to sockets.  Measured at P=16 (2 nodes x 8 GCDs, 512 MiB per rank, one rank
+# The Slingshot settings OLCF's rccl-net-plugin/1.0 module sets (`module show`,
+# OLCF 2026-07-01: aws-ofi-nccl 1.19.2 built per ROCm), plus the transport
+# choice, filled in where the caller has not exported them.  The module itself
+# does NOT set NCCL_NET or NCCL_NET_PLUGIN (its lua prepends the plugin's lib
+# directory to LD_LIBRARY_PATH and needs a module ROCm); LORRAX names both: an
+# absolute plugin path because LD_LIBRARY_PATH cannot change once Python has
+# started, and NCCL_NET so a plugin that does not load fails RCCL's init by name
+# instead of falling back to sockets.  A caller who exports either chooses the
+# transport; the other settings here are still filled in (runtime.network_env,
+# explicit transport).  The plugin is the ROCm 7.13.0 build, the newest beside
+# the wheel's ROCm 7.14.1; it links libamdhip64.so.7, which resolves to the HIP
+# runtime the ROCm PJRT plugin already mapped, and libfabric 2.3.1 from the Cray
+# PE library path.  Measured at P=16 (2 nodes x 8 GCDs, 512 MiB per rank, one rank
 # per node in each group): without this section RCCL ran NET/Socket over bond0
 # and hsn0-3, psum 1.25 GB/s and all_to_all 1.11 GB/s (bus bandwidth); with it
 # NET/AWS Libfabric/GDRDMA, all_to_all 11.4-11.6 GB/s and psum 11.6-22.0 GB/s

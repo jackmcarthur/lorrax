@@ -101,6 +101,7 @@ from typing import NamedTuple
 import numpy as np
 
 import jax
+from lxkit import ordered_psum, ordered_psum_scatter
 import jax.numpy as jnp
 from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -558,7 +559,7 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
             # m on 'x': gather ψ's 'y' blocks, whose band order is x-major.
             psi_m = jax.lax.all_gather(psi_t, "y", axis=1, tiled=True)
             part = jnp.einsum("kmn,kmsg->knsg", U_t, psi_m, optimize=True)
-            phi = jax.lax.psum_scatter(part, "x", scatter_dimension=1,
+            phi = ordered_psum_scatter(part, "x", scatter_dimension=1,
                                        tiled=True)
             n0 = (jax.lax.axis_index("y") * (nb_carrier // p_y)
                   + jax.lax.axis_index("x") * nb_rank)
@@ -611,7 +612,6 @@ def _density_scan_body(mesh: Mesh, plan: DensityScanPlan, *, n_k: int,
         # mesh for the field before this line.
         # Rank-order sum (lxkit.ordered_psum): the library all-reduce's order follows
         # the GCD placement (det lane 2026-10-16: the exact Hartree's rho, Fe V2).
-        from lxkit import ordered_psum
         return jax.tree_util.tree_map(lambda v: ordered_psum(v, band_axes),
                                       per_k_fields if per_k else acc)
 

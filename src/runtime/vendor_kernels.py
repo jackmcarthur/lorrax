@@ -9,7 +9,8 @@ declares none (CUDA, the host) gets no-ops, so its behaviour is unchanged.
   with hipRTC.  Its kernels are keyed by their own content (name, arch, HIP
   version, generator checksum), like LORRAX's kconv image store
   (:func:`ffi.fft.cubin_cache_dir`), so they live in
-  ``lxkit.user_cache_dir(name)`` and outlive any compile-cache namespace.  The
+  ``lxkit.user_cache_dir(name)/<ffi-tag>`` (the enforced native closure
+  identity) and outlive any compile-cache namespace.  The
   library reads one snapshot (``reader_env``) and writes new kernels to one
   file per process (``writer_env``; several writers on one SQLite file on
   Lustre spin without progress).  At exit each process folds its file into a
@@ -61,6 +62,14 @@ def arm_runtime_kernel_stores(*, proc_idx: int = 0, say=print) -> list:
     except Exception:                                      # noqa: BLE001
         return []
     from lxkit import user_cache_dir
+    try:
+        from common.jax_compile_cache import native_cache_tag
+        tag = native_cache_tag()
+    except Exception as exc:                               # noqa: BLE001
+        if proc_idx == 0 and leg is not None and leg.runtime_kernel_stores:
+            say(f"  [vendor-kernels] no native closure identity ({type(exc).__name__}: "
+                f"{exc}); the {leg.key} kernel stores are not armed.")
+        return []
     armed = []
     for writer_env, reader_env, name in (leg.runtime_kernel_stores if leg is not None else ()):
         if os.environ.get(writer_env) or os.environ.get(reader_env):
@@ -68,7 +77,9 @@ def arm_runtime_kernel_stores(*, proc_idx: int = 0, say=print) -> list:
                 say(f"  [vendor-kernels] {name}: {writer_env} or {reader_env} exported by "
                     f"the caller; the {leg.key} kernel store is not armed.")
             continue
-        root = user_cache_dir(name)
+        # One store per native closure: kernels compiled by one vendor library
+        # set are never read by another (lxkit.native_provider).
+        root = user_cache_dir(name) / tag
         snapshot = root / f"{name}_kernel_cache.db"
         writer = root / "writers" / f"{socket.gethostname()}.{os.getpid()}.db"
         try:

@@ -169,7 +169,7 @@ a backend, striping, ROMIO hints, or a mesh-divisible extent.
 | `write_slab(name, A, *, offset=None, global_shape=None, valid_shape=None)` | yes, **asynchronous** | Enqueues and returns. Bytes are on disk after `sync_writes()` or `close()`. |
 | `read_slab(name, *, shape=None, dtype=None, offset=None, valid_shape=None, mesh=None, partition_spec=None, as_numpy=False)` | yes, synchronous | Returns a `jax.Array` sharded `partition_spec` on `mesh` (default: the handle's). `as_numpy=True` returns host numpy through `device_get`, which is valid for a replicated read. |
 | `read_slabs(name, *, shape, offsets, valid_shapes, partition_spec, window_axis, dtype=None, mesh=None)` | yes (every rank calls it; a band-block transfer is independent) | n windows of one slab shape, stacked on a new axis at `window_axis`, read in chunks of output rows ([tuning](#tuning)). Returns an async result that the caller's next op sequences. |
-| `read_multi(requests, *, partition_spec, mesh=None)` | yes (every rank passes the same list in the same order) | N `read_slab` requests (`name`, `shape`, `offset`, optional `valid_shape`, `dtype`) of one rank and one `partition_spec`, in ONE `PhdfReadMulti` dispatch: one replicated descriptor table, one collective `H5Dread_multi` (HDF5 >= 1.14), one staging region, N H2D copies behind one event. Each value is exactly `read_slab`'s; the outputs are the only device bytes. Returns before the read lands (no host sync); the next HDF5 entry point and `close` wait for it. HDF5 refuses overlapping selections in one `H5Dread_multi`, so identical requests are read once and shared, and requests whose boxes overlap on one dataset go in a later disjoint wave (one more dispatch each; normally one wave). Requests `read_slab` would move as file rows keep that route; a library without the handler refuses (`GATE slab_io_read_multi`). |
+| `read_multi(requests, *, partition_spec, mesh=None)` | yes (every rank passes the same list in the same order) | N `read_slab` requests (`name`, `shape`, `offset`, optional `valid_shape`, `dtype`) of one rank and one `partition_spec`, in ONE `PhdfReadMulti` dispatch: one posted control (handler ABI 8, [control](#stream-race)), one collective `H5Dread_multi` (HDF5 >= 1.14), one staging region, N H2D copies behind one event. Each value is exactly `read_slab`'s; the outputs are the only device bytes. Returns before the read lands (no host sync); the next HDF5 entry point and `close` wait for it. HDF5 refuses overlapping selections in one `H5Dread_multi`, so identical requests are read once and shared, and requests whose boxes overlap on one dataset go in a later disjoint wave (one more dispatch each; normally one wave). Requests `read_slab` would move as file rows keep that route; a library without the handler refuses (`GATE slab_io_read_multi`). |
 | `read_small(name, *, dtype=None)` | yes | A whole small dataset as host numpy on every rank, scalars included. |
 | `write_attr(name, value)` | no (queues) | A small replicated dataset, written by rank 0 at close. It replaces any existing dataset of that name. |
 | `stamp_dataset_attrs(name, attrs)` | no (queues) | HDF5 attributes on an existing dataset, stamped by rank 0 at close. |
@@ -635,6 +635,25 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
 ---
 
 ## Control operands and handle validation {#stream-race}
+
+**Since handler ABI 8 the read, read_multi, read_kchunk_union and write handlers
+take no control operand.** SlabIO posts each call's control values (ctx, dataset id, origin,
+valid extent; read_multi: all N of them plus the N destination addresses)
+through `lrx_phdf5_post_control`, keyed by the address of the call's own
+buffer on this rank: a destination SlabIO allocated and donated, aliased to the
+result (reads), or the operand (writes). The handler takes its entry by the
+address of the buffer it was handed; a missing entry refuses
+(`GATE phdf5_posted_control`). No descriptor is placed on the device, the
+handler makes no D2H copy and no `xla_stream` sync, and the match does not
+depend on the order XLA runs the calls (an operand-free FIFO would: the CPU
+client runs ready programs concurrently). The k-chunk union reader
+(`read_slabs`) posts `{ctx, ds_id, n, ndim, offsets[n][ndim], counts[n][ndim]}`,
+the counts being this rank's own rows, and records a device-side order fence
+before its worker's copies (the operand copy-in's host sync used to order them).
+File-order pieces compute their slice starts in the piece program from a
+device-resident counter, so no start vector is placed per piece either. Only
+`phdf5_read_kchunk`, which has no caller, keeps the operand form the paragraphs
+below describe.
 
 `(ctx handle, ds_id)`, `offset` and `valid_shape` travel as replicated int64
 device operands rather than FFI attributes. As a result, one compiled

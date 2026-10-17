@@ -62,6 +62,7 @@ nav:
       - Installation:
           - Overview: installation/index.md
           - Perlmutter (NERSC): installation/perlmutter.md
+          - Frontier (OLCF): installation/frontier.md
           - Building the FFI libraries: installation/ffi-build.md
       - Inputs from DFT: preprocessing.md
       - Drivers: drivers.md

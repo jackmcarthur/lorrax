@@ -70,11 +70,10 @@ def test_reciprocity_rows_resolve_in_order_from_one_read():
 
 
 def test_store_verdicts_refuse_the_first_bad_entry():
+    # The bank's finite verdicts moved to the writer (SlabIO write_slab
+    # require_finite) and the resident bank's deferred flags
+    # (tests/test_resident_bank_finite_cpu.py); the sentinel verdicts stay here.
     from file_io import shared_pole_store as sps
-    sps._refuse_nonfinite([])
-    sps._refuse_nonfinite([("a", jnp.asarray(True)), ("b", jnp.asarray(True))])
-    with pytest.raises(Exception, match="scratch b contains nonfinite"):
-        sps._refuse_nonfinite([("a", jnp.asarray(True)), ("b", jnp.asarray(False)), ("c", jnp.asarray(False))])
     sps._refuse_invalid([True, jnp.asarray(True)])
     with pytest.raises(Exception, match="invalid inactive sentinel"):
         sps._refuse_invalid([True, jnp.asarray(True), jnp.asarray(False)])

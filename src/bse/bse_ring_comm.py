@@ -17,6 +17,7 @@ from common.collectives import prepare_mesh, resolve_mesh
 from common.contract_bands import contract_bands_block_reshard
 from common.fft_helpers import make_kconv_kminor
 from lxkit import mark_varying
+from lxkit import ordered_psum, ordered_psum_scatter
 
 from .bse_preconditioner import exchange_spin_weight
 
@@ -587,7 +588,7 @@ def apply_V_ring(
     S_total = (jnp.sum(S_total, axis=2) / sqrt_nk) * exchange_spin_weight(nspinor)  # (b, nu_local)
 
     U_partial = jnp.einsum("MN,bN->bM", V_q0, S_total)  # (b, mu_local)
-    U = lax.psum(U_partial, axis_name="y")
+    U = ordered_psum(U_partial, axis_name="y")
     # U whole on μ: one all_gather of a (b, μ) vector over x.  The decode then
     # contracts M's own (c_x, v_y) tile over all of μ -- no reshard of M and no
     # psum_scatter of a (b, c, v, k) partial.  (Until 2026-09-26 the decode read
@@ -1175,7 +1176,7 @@ def build_realspace_random_transition_generator(
     def _map(r, psi_c_X, psi_v_X, V_q0):
         # r: (batch, nu_local, nk), column-sharded on y.
         U_partial = jnp.einsum("MN,bNk->bMk", V_q0, r)
-        U = lax.psum(U_partial, axis_name="y")  # (batch, mu_local_x, nk), mu on x
+        U = ordered_psum(U_partial, axis_name="y")  # (batch, mu_local_x, nk), mu on x
 
         axis_index_y = jnp.asarray(lax.axis_index("y"), dtype=jnp.int32)
         v_start = axis_index_y * jnp.asarray(v_chunk, dtype=jnp.int32)
@@ -1199,7 +1200,7 @@ def build_realspace_random_transition_generator(
         VX_partial = jnp.einsum("kcvM,bMk->bcvk", M_X, U)                    # local-mu, c full
         # psum over x completes the mu sum across x-slices AND scatters the
         # conduction index onto x -> (b, c_chunk_x, v_chunk_y, k).
-        X_local = lax.psum_scatter(
+        X_local = ordered_psum_scatter(
             VX_partial, axis_name="x", scatter_dimension=1, tiled=True)
 
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X_local.real.dtype))
@@ -1329,7 +1330,7 @@ def build_density_snapshot_operator(
         U_partial = jnp.einsum("MN,bNk->bMk", V_q0, S_total)  # (b, mu_local_x, k)
 
         if not scatter_nu_on_y:
-            U = lax.psum(U_partial, axis_name="y")  # finish N sum, replicate on y
+            U = ordered_psum(U_partial, axis_name="y")  # finish N sum, replicate on y
             return jnp.sum(U, axis=-1)              # (b, mu_local_x)
 
         # Reduce-scatter tail (mirror of ppm_tau_kernel reduce-scatter): sum the
@@ -1339,7 +1340,7 @@ def build_density_snapshot_operator(
         # scatter axis; psum_scatter reduces over y and tiles nu across y.
         d_partial = jnp.sum(U_partial, axis=-1)          # (b, mu_local_x)
         d_local = jnp.swapaxes(d_partial, 0, 1)          # (mu_local_x, b)
-        return lax.psum_scatter(
+        return ordered_psum_scatter(
             d_local, axis_name="y", scatter_dimension=1, tiled=True
         )                                                # (mu_local_x, b/py)
 

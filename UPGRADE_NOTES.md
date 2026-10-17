@@ -100,6 +100,135 @@ process).
 - **Decks.** A bulk export of `eps0mat` adds `q0_body_3d = omit_head_wing`
   or exports `files = epsmat`.
 
+## 2026-10-16 — Native dependencies: recorded at build, enforced at start-up, on every route
+
+Every FFI leg's build records the exact library set it resolved, and every
+start-up enforces it, on every route (a clone, the Perlmutter module, a sealed
+bundle) and for every leg (CUDA, ROCm, host)
+([the dependency closure](docs/installation/ffi-build.md#closure)). This closes
+the defect where a plain clone launch on Perlmutter mapped the HPC SDK's
+cuSOLVERMp 0.8 in place of the staged 0.9.1 (the first distributed LU/eigh
+failed with `status=7`), and the site-default LibSci/HDF5 mapped cray-mpich
+9.1.0 beside 9.0.1.
+
+- **Recorded.** `<leg>.closure.json` beside each leg (schema 2): the leg's
+  SHA-256 and every library of its `DT_NEEDED` closure (path, size, mtime,
+  SHA-256, SONAME, family). That covers the cuSOLVERMp/cuBLASMp stage, the
+  GPU math and collective libraries the venv's JAX plugin maps (cuBLAS,
+  cuSOLVER, cuFFT, NCCL; rocBLAS, rocSOLVER, HIP; RCCL attested once JAX maps
+  it), MPI, HDF5, LibSci, SLATE/BLAS++/LAPACK++ and the HIP SLATE's OpenBLAS.
+  `PROVENANCE` gains `closure_sha256`. Sealed bundles (manifest schema 2)
+  carry both records.
+- **Enforced.** The loader opens the recorded files by exact path before the
+  leg. After the leg's `dlopen` it requires every recorded family to be
+  mapped exactly once, as the recorded file (or byte-identical). Otherwise:
+  `GATE native-closure: got <wrong>; want <expected>; fix: <remedy>`. A missing
+  or stale record refuses too. There is no fallback and no warning mode.
+  `LD_LIBRARY_PATH` no longer decides a leg's libraries, so a clone needs no
+  hand-built library path. Each leg logs one `closure … enforced` line and one
+  `closure … libraries:` line naming every family's file and hash: the
+  identity lines for HIP, rocSOLVER, rocBLAS, RCCL, HDF5, MPI, cuSOLVERMp,
+  NCCL and the rest.
+- **Caches.** `lxkit.native_provider.native_closure_identity(platform)` keys
+  every cache that depends on native libraries:
+  - the JAX compile-cache namespace, schema `k2`, so every `k1` namespace is
+    retired by the age pruner. An explicit `ISDF_JAX_CACHE_DIR` is split by
+    the same `ffi-<12 hex>` tag;
+  - the kconv image store and the rocFFT kernel store.
+
+  The first run after upgrading recompiles once.
+
+- **NCCL: one pin, every route.** The `nvidia-nccl-cu13` 2.30.7 wheel (the
+  `uv.lock` pin). The CUDA leg now compiles and links against the wheel, not
+  the HPC SDK's `comm_libs` 2.29.3. The module venv installs the same wheel,
+  its modulefile drops `comm_libs` NCCL, and its sealed bundle records the
+  wheel. A run that maps any other `libnccl` refuses. The NCCL net plugin is
+  unchanged (`config/perlmutter/site.toml`, AWS OFI).
+
+**What a user must change.**
+- **Rebuild every FFI leg** with this tree's build scripts, and build a new
+  module prefix (the module venv gains the NCCL wheel; `setup_env.sh` never
+  refreshes a venv in place). Perlmutter:
+  `config/perlmutter/build_ffi_host.sh`, `build_ffi_cuda.sh`. Frontier:
+  `config/frontier/build_ffi_host.sh`, `build_ffi_rocm.sh`. A leg without a
+  schema-2 record refuses at start-up (`no closure record`). Reseal bundles
+  with this tree's `seal_bundle.py`; a schema-1 bundle refuses.
+- **Rebuild after changing a recorded library**: a `uv sync` that changes the
+  CUDA or ROCm wheels, a SLATE or OpenBLAS rebuild, a moved or purged `.build`,
+  or a site module upgrade in place. The next run refuses with
+  `stale closure record` until the legs are rebuilt.
+- **Drop hand-built library paths.** Launch scripts that prepend the stage or
+  the pinned directories to `LD_LIBRARY_PATH` are no longer needed; they
+  change nothing a leg maps.
+- **No second copy may be mapped.** An `LD_PRELOAD`, or a Python package that
+  loads another MPI, HDF5, cuBLAS, NCCL, rocBLAS, … beside the recorded one
+  (for example an mpi4py built against the site-default MPI), now refuses at
+  start-up instead of running.
+- **A host-leg SLATE op refuses in a device process.** There the device leg's
+  SLATE (Frontier: SLATE-HIP with OpenBLAS) answers the SLATE SONAMEs, so the
+  host leg's `lorrax_slate_*` handlers would run against a library they were
+  not built against. They are not registered, and calling one raises
+  `GATE native-closure: host-leg <target> needs SLATE-CPU but the device leg's
+  SLATE serves this process`. Run SLATE ops on the device mesh, or in a
+  CPU-only process. Closures now merge in `dlopen` order, shared by every
+  loader; before this, a process whose two loaders finished their checks in
+  the other order refused at its first batched eigh (Frontier P=16).
+- **Source the site launch script before a multi-node `srun`.**
+  `config/perlmutter/gpu_env.sh` now links `libcudart.so`, which libfabric
+  dlopens by that name, to the venv's CUDA runtime, first on
+  `LD_LIBRARY_PATH` (Frontier's `rocm_env.sh` already did this for
+  `libhsa-runtime64.so`). A multi-node step whose `libcudart.so` names another
+  file refuses at start-up. Before this, a 4-node clone step ran the
+  toolkit's cudart 13.2.75 for the plugin and the leg, unrecorded.
+- Results: unchanged on the clone route. The enforced libraries are the ones
+  the documented routes already ran. Measured against aff42ce37 (DEP_ENFORCE.md):
+  Fe V2 P=4 bitwise on both machines; Fe V2 P=16 on 4 Perlmutter nodes bitwise,
+  NCCL 2.30.7 over AWS Libfabric with GDRDMA on all 16 ranks and no `NCCL WARN`.
+  Per-rank device peaks are unchanged.
+- **The Perlmutter module carries a clone's CUDA wheels.** Its venv is
+  `uv export --extra cuda13` of the lock (cuBLAS 13.6.1, cuFFT 12.3, the CUDA
+  runtime 13.3, cuDNN 9.24, …), no longer `jax[cuda13-local]` on the toolkit's
+  libraries (cuBLAS 13.4.1). Build a new module prefix: `setup_env.sh` never
+  refreshes a venv. The modulefile lists no toolkit library directory
+  ([Perlmutter](docs/installation/perlmutter.md)). Measured: module Fe V2 P=4
+  is bitwise identical to the clone run of the same tree.
+
+## 2026-10-16 — rocm/integration8: follow-ups on the release
+
+Integration 8 lands the follow-up lanes below on the release `aff42ce37`. Fe V2, MI250X,
+P=4, one node (`/lustre/orion/mat280/scratch/jackmc/int8/<run>/run.r0.log`):
+- Total 89.33 s (release, `int7/feR1`) → 84.92 s (`h5fe1`). Rule construction
+  32.91 → 27.40 s, constructor 14.27 → 12.85 s, Σ τ other 6.13 → 3.73 s.
+- eqp0 / eqp1 are bitwise equal to the release after every group. From syn/w12 on,
+  `sigma_mnk.h5` moves by ≤ 2.2e-14 relative (per dataset, max |Δ| / max |ref|) and
+  `qp_wfn_rotations.h5` `U_mnk` by ≤ 2.6e-11; before it every file is bitwise.
+- Device peak per rank 6.77 GB, as the release, in every stage row. On ROCm a stage row
+  reads the allocator's `peak_bytes_in_use`, which never resets, so every row shows the
+  run's high-water mark (set in ζ), not the stage's own peak.
+- Rank-0 transfer census, release → integration 8 (`int7/cenR` → `int8/h5fe2`): H2D
+  `device_put` 737 → 238, D2H 433 → 348, explicit D2H 74 → 70, `jax.block_until_ready`
+  18 → 5.
+- hsuite P=4: 16/16. Na SC completes (the release refused it, `GATE shared_pole_zero_ritz`
+  at q=2) and matches its reference: eqp max |Δ| 4.0e-7 eV.
+
+**What a user must change.**
+- **Rebuild the FFI libraries** from this tree (`config/frontier/build_ffi_rocm.sh`; host
+  and CUDA likewise). The handler ABI goes 6 → 8: SlabIO's read, read_multi, k-chunk union
+  and write handlers take no control operand ([SlabIO](docs/architecture/slab_io.md#stream-race)),
+  and `active_gemm_device` takes `conj_b`. A library of another ABI refuses at load.
+- New refusals: `GATE phdf5_posted_control`, `GATE slab_io_write_finite`,
+  `GATE shared_pole_round_tables_device`, `GATE shared_pole_ritz_eigh_finite` (an
+  eigensolver failure left after the Jacobi re-solve; such a round used to refuse as
+  `shared_pole_zero_ritz`).
+
+| lane (commit) | what | measured effect (Fe V2 P=4 unless noted) | gate |
+|---|---|---|---|
+| lsync/w5 polar (7e5898496, 005699355), slabmr/w8 (473f3bde9), comm7 T1 (9265e080a), ctor5/w12 (49ada1eaf, 3a7876794) | polar cuts from one device word; SlabIO posted control (ABI 8), device order fence, k-chunk union reader, staging budget; transpose partner without self pairs; constructor round tables, directions recipe and pole counts on the device | constructor 14.27 → 12.77 s; census as above | Fe bitwise (2 runs); phdf5 read_multi, active, kdft gates at P=4 |
+| crash/w9 (b697bce69; int8 bf8041aee: public import) | distinct inert sentinels; Jacobi re-solve of a non-finite local round; `shared_pole_ritz_eigh_finite` | Na SC completes; no re-solve fired in hsuite (the sentinels suffice) | hsuite 16/16; Fe bitwise |
+| syn/w12-i8 (dfce55663) | active GEMM reads B conjugated on load; identity little-group projector; per-branch W orientation | Σ τ other 5.84 → 3.70 s | eqp bitwise, Σ ≤ 2.2e-14 relative |
+| rcgpu (6b8629482) | the rule tree abandons a geometry on its error forecast's prediction bound | rule construction 32.42 → 27.40 s | Fe bitwise |
+
+||||||| parent of 491fd4afc (docs: the build records, and the runtime enforces, every leg's dependency closure)
 ## 2026-10-16 — rocm/integration7: the ROCm leg's host syncs, transfers and kernels
 
 Integration 7 lands the lane branches listed below on `rocm/integration6` 4e6b28dfc. The rules

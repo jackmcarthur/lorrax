@@ -128,7 +128,11 @@ def report(figures, *, rcond: float, n_log: int,
            where: str = "zeta rank_truncate") -> None:
     """Print a :func:`factor` program's notices and conditioning receipt on the host, and record its findings."""
     from isdf.core import _report_the_cut
-    figures = jax.tree.map(_host, figures)
+    from common.host_read import host_tree
+    # Replicated figures in ONE device-to-host read; otherwise each leaf from its own copy.
+    replicated = all(getattr(a, "is_fully_replicated", False) for a in jax.tree.leaves(figures)
+                     if isinstance(a, jax.Array))
+    figures = host_tree(figures) if replicated else jax.tree.map(_host, figures)
     _report_the_cut(figures, where=where,
                     kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM, rcond=rcond)
     if "rank" in figures:

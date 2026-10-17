@@ -80,6 +80,46 @@ legs after a pull that changes `src/ffi/cpp/`: a stale leg refuses with
 prints `LEGACY-UNSEALED` with the file hash; that is expected for a private
 build.
 
+**The build records, and every run enforces, each leg's dependency closure**
+([the dependency closure](ffi-build.md#closure)). Each build writes
+`<leg>.closure.json` beside its leg, naming every library the leg maps:
+
+- the staged cuSOLVERMp 0.9.1 and cuBLASMp 0.10;
+- the cuBLAS, cuSOLVER, cuFFT and CUDA runtime files that the venv's JAX
+  plugin loads (the `nvidia-*-cu13` wheels);
+- NCCL: the `nvidia-nccl-cu13` 2.30.7 wheel (the `uv.lock` pin), on every
+  route. The CUDA leg compiles and links against it, and `build_ffi_cuda.sh`
+  refuses another wheel version or a record whose NCCL is not that wheel. The
+  HPC SDK's `comm_libs` NCCL (2.29.3) is never used;
+- the pinned MPI, HDF5 and LibSci of `config/perlmutter/ffi_mpi.sh`;
+- SLATE, for the host leg.
+
+At start-up the loader opens exactly those files, then refuses the process if
+any other copy of one of them is mapped. So a clone runs on what its build
+verified, whatever the shell's `LD_LIBRARY_PATH` holds. `cudatoolkit/13.2`
+puts the HPC SDK's cuSOLVERMp 0.8 there under the same SONAME, and with it the
+first distributed LU or eigh fails with `status=7`. The site-default LibSci
+maps cray-mpich 9.1.0. Neither can be loaded in place of the recorded file.
+A refusal reads
+
+```text
+GATE native-closure: got <wrong file>; want <recorded file>; fix: <remedy>
+```
+
+The remedy is to remove what maps the other copy (an `LD_PRELOAD`, or a
+package such as mpi4py built against another MPI), or to rebuild the leg in the
+environment you run in. Setting `LD_LIBRARY_PATH` neither causes nor fixes it,
+with one exception: on a multi-node step libfabric dlopens `libcudart.so` by
+that name, through `LD_LIBRARY_PATH`. The wheel ships only `libcudart.so.13`,
+so `cudatoolkit/13.2`'s `libcudart.so` (13.2.75) would be mapped beside the
+recorded wheel runtime. `gpu_env.sh` links `libcudart.so` to the venv's
+runtime, first on `LD_LIBRARY_PATH`. A multi-node step whose `libcudart.so`
+names another file refuses at start-up with a `GATE native-closure` line
+naming both files ([launch libraries](ffi-build.md#closure)). Source
+`gpu_env.sh` in the shell that runs `srun`.
+Moving or purging `.build`, or a `uv sync` that changes the CUDA wheels, makes
+the record stale, and the next run refuses until the legs are rebuilt.
+
 ### 1.3 Run the test suite {#suite}
 
 ```bash
@@ -137,6 +177,14 @@ The module sets:
   `LORRAX_FFI_EXPECT_BACKENDS`, which only the m4598 `lx` launcher and
   `src/ffi/cpp/in_container.sh` read; `srun` ignores them.
 
+The bundle's manifest carries each leg's dependency closure. Its libraries
+are the toolkit's CUDA math files (the module venv has no CUDA math wheels),
+the venv's `nvidia-nccl-cu13` 2.30.7 wheel (the same NCCL as a clone), the
+sealed cuSOLVERMp/cuBLASMp/SLATE copies, and the pinned MPI and HDF5. Every start-up enforces that closure exactly as for a clone
+([the dependency closure](ffi-build.md#closure)). The module's
+`LD_LIBRARY_PATH` serves JAX and the external system libraries; it cannot
+change which file a leg uses.
+
 It sets no allocator, compile-cache, HDF5 or profiling policy: the runtime
 owns those ([GPU pool](../environment/overview.md#gpu-pool)), and an export
 would override it. `gpu_env.sh` is not needed with a module. Do not add a
@@ -149,21 +197,37 @@ The recipe is `config/perlmutter/module/`; it works for any install prefix.
 
 | what | pinned in |
 |---|---|
-| Python 3.12 (uv-managed, under the prefix), JAX 0.9.1 `cuda13-local`, cuDNN, nvidia-mathdx, `cudatoolkit/13.2` | `module/stack.sh` |
-| every other Python package | the checkout's `uv.lock` |
+| Python 3.12 (uv-managed, under the prefix), `cudatoolkit/13.2` (nvcc; no library at run time) | `module/stack.sh` |
+| every Python package, the CUDA wheels included (JAX 0.9.1 `cuda13`, cuBLAS, cuFFT, cuSOLVER, cuSPARSE, CUDA runtime, NVRTC, cuDNN, nvidia-mathdx): the clone's set | the checkout's `uv.lock`, extra `cuda13` |
 | cuSOLVERMp, cuBLASMp | `build_ffi_cuda.sh` (repeated in `stack.sh`) |
+| NCCL: `nvidia-nccl-cu13` 2.30.7 (the clone's `uv.lock` pin) | `build_ffi_cuda.sh`, `stack.sh` |
 | Cray MPICH, LibSci | `ffi_mpi.sh` |
 | parallel HDF5 | `build_ffi_cuda.sh`, `build_ffi_host.sh` |
 
-The JAX plugin uses the toolkit's CUDA and installs no CUDA runtime;
-`setup_env.sh` installs cuDNN and nvidia-mathdx without their dependency
-closures and refuses a pip CUDA runtime in the venv, because one would shadow
-the toolkit's.
+The module venv holds a clone's CUDA libraries. `setup_env.sh` installs
+`uv export --extra cuda13` of the checkout's lock with `--no-deps`, refuses a
+package at any other version (and a lock whose JAX or NCCL disagrees with
+`stack.sh`), and links `venv/lorrax-launch/libcudart.so` to the wheel's CUDA
+runtime, the name libfabric dlopens. Each leg's closure therefore records the
+wheels, as for a clone (the JAX plugin's directories come before the toolkit's
+in `build_ffi_cuda.sh`). The modulefile lists no toolkit library directory;
+`install_module.sh` refuses one. The toolkit module stays loaded for nvcc and
+ptxas, so `PATH` and `CUDA_HOME` are those of a clone shell. `verify_runtime.py`
+refuses a mapped toolkit CUDA library, requires the wheels' cudart, cuBLAS and
+cuFFT and every `jax*`/`nvidia-*` package at its locked version, requires
+exactly the NCCL wheel's `libnccl`, and prints both legs' enforced closure
+identities. A module run and a clone run of one tree map the same CUDA, NCCL,
+cuSOLVERMp, cuBLASMp, MPI and HDF5 files. Measured on Fe V2 P=4 (2026-10-17):
+the module run is bitwise identical to the clone run.
+
+The wheel venv is about 4.3 GB. The project's `/global/common/software` quota
+is 10 GiB, so check `showquota --cmn <project>` before `setup_env.sh`: a build
+over quota fails in `seal_bundle.py` with `Disk quota exceeded`.
 
 | path under `$LORRAX_MODULE_PREFIX` | written by |
 |---|---|
-| `python/`, `venv/` | `setup_env.sh` (once per prefix) |
-| `build/` (SLATE, cuSOLVERMp stage) | `build.sh` (first build only) |
+| `python/`, `venv/` (or `LORRAX_MODULE_VENV`, an absolute path: `lorrax_cuda13_runtime` keeps `.venv`) | `setup_env.sh` (once per prefix) |
+| `native/` (SLATE, cuSOLVERMp stage; `build/` before 2026-10-17, which `seal_bundle.py` refuses as a search-path directory) | `build.sh` (first build only) |
 | `releases/source-<rev8>/`, `releases/<rev8>-bundle-<id12>/` | `publish.sh` (read-only, never replaced) |
 | `modulefiles/<name>/<version>.lua` | `publish.sh` (the previous file kept as `.before-<rev8>`) |
 

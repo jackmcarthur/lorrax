@@ -3,8 +3,8 @@
 This page states what a LORRAX installation consists of, which installation
 route is the default on which machine, and what refuses at startup when a
 piece is missing. Read it before the page for your machine
-([Perlmutter](perlmutter.md), or [Building the FFI libraries](ffi-build.md)
-on any other site); the [Quickstart](../quickstart.md) assumes it is done.
+([Perlmutter](perlmutter.md), [Frontier](frontier.md), or [Building the FFI
+libraries](ffi-build.md) on any other site); the [Quickstart](../quickstart.md) assumes it is done.
 
 ## What an installation is
 
@@ -82,6 +82,7 @@ explains how to port one.
 | `HANDLER ABI MISMATCH` | the library and the Python tree disagree on `LORRAX_FFI_ABI_VERSION` | rebuild and reseal both legs from the same tree ([the ABI rule](ffi-build.md#abi)) |
 | `partial sealed-bundle override refused` | only one leg of the bundle's pair is pinned (`LORRAX_FFI_HOST_SO` with `LORRAX_FFI_SO` or `LORRAX_FFI_ROCM_SO`) | unset both, or pin both legs of one sealed bundle |
 | `mixed native providers` | the two selected legs claim different bundle manifests | select both legs from one bundle |
+| `GATE native-closure: got …; want …; fix: …` | the leg has no or a stale dependency record, or the process maps a library other than the recorded one, or two copies of one | the message's fix; the table in [the dependency closure](ffi-build.md#closure) |
 | `JAX09_ENV_REFUSED` (from `tools/require_jax09.py`), or the `runtime.jax_support` refusal before the first `jit` | JAX or JAXLIB outside the 0.9 series, or a `jax._src` of the wrong shape | install the 0.9 series (§ [JAX contract](#jax)) |
 | `GATE mathdx-headers` | a CUDA run without `nvidia-mathdx` in the venv | `uv sync --extra cuda13` (or `cuda12`) |
 

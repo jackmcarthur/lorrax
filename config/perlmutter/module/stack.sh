@@ -7,16 +7,24 @@
 #
 # Layout under the prefix:
 #   python/                          uv-managed CPython the venv is built on
-#   venv/                            the runtime venv (setup_env.sh)
-#   build/                           SLATE + cuSOLVERMp stage, shared by builds
+#   venv/                            the runtime venv (setup_env.sh); LORRAX_MODULE_VENV
+#                                    names another absolute path
+#   native/                          SLATE + cuSOLVERMp stage, shared by builds
+#                                    (not build/: the sealer refuses search paths
+#                                    through a directory named build)
 #   releases/source-<rev8>/          git-archive snapshots (publish.sh)
 #   releases/<rev8>-bundle-<id12>/   sealed FFI bundles (publish.sh)
 #   modulefiles/<name>/<version>.lua the published module (publish.sh)
 #
-# The CUDA toolkit comes from the site's cudatoolkit module; the JAX CUDA
-# plugin is the `cuda13-local` build, which installs no CUDA runtime of its
-# own.  The FFI legs are built by ../build_ffi_{host,cuda}.sh, whose MPI and
-# HDF5 pins (../ffi_mpi.sh) this file does not repeat.
+# The CUDA runtime and math libraries are a clone's: the wheels of the
+# checkout's uv.lock `cuda13` extra (JAX's cuda13 plugin, nvidia-cublas,
+# -cufft, -cusolver, -cusparse, -cuda-runtime, -cuda-nvrtc, -nvjitlink,
+# cuDNN, NCCL, nvidia-mathdx), installed by setup_env.sh exactly as locked.
+# The site's cudatoolkit module supplies nvcc for building the legs, and the
+# modulefile loads it so PATH and CUDA_HOME are those of a clone shell; none
+# of its CUDA libraries is on the module's LD_LIBRARY_PATH or in a leg's
+# closure.  The FFI legs are built by ../build_ffi_{host,cuda}.sh, whose MPI
+# and HDF5 pins (../ffi_mpi.sh) this file does not repeat.
 # ============================================================================
 
 LORRAX_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +36,11 @@ lorrax_module_die() { echo "[lorrax-module] REFUSED: $*" >&2; exit 2; }
 [[ "$LORRAX_MODULE_PREFIX" == /* ]] \
     || lorrax_module_die "LORRAX_MODULE_PREFIX must be absolute: $LORRAX_MODULE_PREFIX"
 PREFIX="$(realpath -m "$LORRAX_MODULE_PREFIX")"
-VENV="$PREFIX/venv"
+# LORRAX_MODULE_VENV: an absolute venv path for a prefix that predates this
+# layout (lorrax_cuda13_runtime keeps its runtime venv at $PREFIX/.venv).
+[[ "${LORRAX_MODULE_VENV:-/}" == /* ]] \
+    || lorrax_module_die "LORRAX_MODULE_VENV must be absolute: $LORRAX_MODULE_VENV"
+VENV="$(realpath -m "${LORRAX_MODULE_VENV:-$PREFIX/venv}")"
 RELEASES="$PREFIX/releases"
 MODULE_NAME="${LORRAX_MODULE_NAME:-lorrax}"
 MODULE_VERSION="${LORRAX_MODULE_VERSION:-0.1.0}"
@@ -36,11 +48,13 @@ MODULE_VERSION="${LORRAX_MODULE_VERSION:-0.1.0}"
 # --- pins --------------------------------------------------------------------
 PYTHON_VERSION="3.12"
 TOOLKIT_MODULE="cudatoolkit/13.2"
-JAX_VERSION="0.9.1"
-CUDNN_VERSION="9.12.0.46"            # nvidia-cudnn-cu13 (NERSC cuDNN targets CUDA 12)
+JAX_VERSION="0.9.1"                  # asserted against the lock by setup_env.sh
+LOCK_EXTRA="cuda13"                  # the extra a clone syncs (uv sync --extra cuda13)
 CUSOLVERMP_VERSION="0.9.1.9318.post1" # also pinned in ../build_ffi_cuda.sh
 CUBLASMP_VERSION="0.10.0.3695"        # also pinned in ../build_ffi_cuda.sh
-MATHDX_VERSION="25.6.0"              # pyproject.toml [cuda13]; required on NVIDIA GPUs
+NCCL_VERSION="2.30.7"                # nvidia-nccl-cu13: the uv.lock pin, on every route
+                                     # (also ../build_ffi_cuda.sh); never comm_libs NCCL;
+                                     # asserted against the lock by setup_env.sh
 # shellcheck disable=SC1091
 source "$LORRAX_MODULE_DIR/../ffi_mpi.sh"
 

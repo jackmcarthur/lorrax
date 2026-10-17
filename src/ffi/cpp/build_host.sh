@@ -167,6 +167,14 @@ if [[ ! -f "${SO_FILE}" ]]; then
     exit 1
 fi
 
+# Dependency closure (lxkit.native_provider): every library of the leg's NEEDED
+# closure as this verify environment resolves it, recorded beside the leg; the
+# loader opens exactly those files and refuses a process mapping another copy.
+python3 "${SCRIPT_DIR}/stage/write_checkout_closure.py" "${SO_FILE}" \
+    --private-dir "${SLATE_DIR}/lib64" \
+    --library-dirs "${LD_LIBRARY_PATH:-}" --skip-missing-dirs || {
+        echo "[build_host] FAILED: dependency closure" >&2; exit 1; }
+
 # ===========================================================================
 # THE BUILD CONTRACT.  Unconditional, and a failure here fails the build.
 #
@@ -197,7 +205,8 @@ bash "${LORRAX_ROOT}/scripts/verify_ffi_build.sh" --leg host "${SO_FILE}" || {
 "${SCRIPT_DIR}/stage/stamp_provenance.sh" "${SO_FILE}" \
     "leg=host" \
     "slate=${SLATE_DIR}" \
-    "build_dir=${BUILD_DIR}"
+    "build_dir=${BUILD_DIR}" \
+    "closure_sha256=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "${SO_FILE}.closure.json")"
 
 echo
 echo "[build_host] done.  .so at: ${SO_FILE}"

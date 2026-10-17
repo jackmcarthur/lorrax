@@ -16,6 +16,12 @@ listed private redistributable library are copied as regular files beneath
 HDF5, CUDA runtime/driver libraries and NCCL are refused as private inputs:
 those are supplied and attested by the machine runtime, never vendored here.
 
+Each leg's build wrote ``<leg>.closure.json`` (``write_checkout_closure.py``):
+the exact library set it resolved and verified.  The manifest carries both
+records under ``closures`` (private entries rewritten to the sealed copies,
+which must be byte-identical to the recorded ones), so the runtime enforces the
+same closure for the sealed pair as for the checkout it came from.
+
 This is intentionally a separate pair-sealing step rather than another CMake
 post-build action.  List private libraries dependency-first; the shared
 runtime loader opens their exact paths in this order, so no run-script
@@ -50,7 +56,7 @@ ensure_source_closure()
 from lxkit import native_provider as _native  # noqa: E402
 
 MANIFEST = "lorrax_ffi_bundle.json"
-SCHEMA = 1
+SCHEMA = 2      # 2: per-leg dependency closures (lxkit.native_provider)
 # Search-path directories a published bundle may not name: purge-eligible
 # scratch, and the trees one build writes.
 _SCRATCH_ROOTS = ("/pscratch", "/scratch", "/tmp", "/var/tmp", "/dev/shm")
@@ -203,6 +209,50 @@ def _copy_regular(source: Path, destination: Path) -> Path:
     return destination
 
 
+def _publishable(path: Path, root: Path) -> bool:
+    """A machine/process file a published bundle may depend on: absolute, not
+    under scratch, not inside a build tree or the sealing checkout."""
+    scratch = [Path(r) for r in (*_SCRATCH_ROOTS, *(os.environ.get(v, "")
+               for v in ("SCRATCH", "PSCRATCH", "TMPDIR"))) if r]
+    forms = {path, Path(os.path.realpath(path))}
+    return not (any(f.is_relative_to(s) for f in forms for s in scratch)
+                or any(_BUILD_PARTS & set(f.parts) or f.is_relative_to(root)
+                       for f in forms))
+
+
+def _sealed_closure(leg: Path, platform: str, sealed_private: dict[str, Path],
+                    root: Path, *, publishable=None) -> dict[str, object]:
+    """The leg's build record, rewritten for the bundle (manifest ``closures``)."""
+    publishable = publishable or _publishable
+    record = _native.read_checkout_closure(leg, platform, unusable_cls=RuntimeError)
+    _native.check_record_files(record, unusable_cls=RuntimeError)
+    body = json.loads(_native.closure_record_path(leg).read_text(encoding="utf-8"))
+    libraries = []
+    for lib, entry in zip(body["libraries"], record.entries):
+        lib = {k: v for k, v in lib.items() if k != "mtime_ns"}
+        if entry.role == "private":
+            copy = sealed_private.get(entry.soname)
+            if copy is None:
+                raise RuntimeError(
+                    f"{leg.name}'s recorded closure needs private {entry.soname} "
+                    f"({entry.path}), which was not sealed; add --private-lib")
+            if _sha256(copy) != entry.sha256:
+                raise RuntimeError(
+                    f"sealed {copy.name} is not the file {leg.name} was built and "
+                    f"verified against ({entry.path}, SHA-256 {entry.sha256[:16]})")
+            lib.pop("path", None)
+            lib["bundle_path"] = (Path("lib") / copy.name).as_posix()
+        elif not publishable(entry.path, root):
+            raise RuntimeError(
+                f"{leg.name}'s closure maps {entry.path} ({entry.soname}): a "
+                "scratch or build-tree file cannot back a published bundle; build "
+                "against the published runtime")
+        libraries.append(lib)
+    return {"schema": body["schema"], "platform": platform,
+            "leg_sha256": body["leg_sha256"], "libraries": libraries,
+            "external": body.get("external", [])}
+
+
 def seal(*, root: Path, cuda: Path, host: Path, output: Path,
          private: list[Path]) -> Path:
     root = root.resolve(strict=True)
@@ -279,8 +329,19 @@ def seal(*, root: Path, cuda: Path, host: Path, output: Path,
             (_copy_regular(item, libdir / soname), soname, needed)
             for item, soname, needed in private_resolved
         ]
+        sealed_private = {soname: out for out, soname, _ in private_out}
+        closures = {"CUDA": _sealed_closure(cuda, "CUDA", sealed_private, root),
+                    "cpu": _sealed_closure(host, "cpu", sealed_private, root)}
+        recorded = {lib["soname"] for body in closures.values()
+                    for lib in body["libraries"] if lib.get("bundle_path")}
+        unrecorded = sorted(set(sealed_private) - recorded)
+        if unrecorded:
+            raise RuntimeError(
+                f"--private-lib {unrecorded} is in neither leg's recorded closure; "
+                "a sealed provider nothing records would never be opened")
         doc: dict[str, object] = {
             "schema": SCHEMA,
+            "closures": closures,
             "source": {"revision": revision, "dirty": False},
             "ffi_abi": abi,
             "libraries": {

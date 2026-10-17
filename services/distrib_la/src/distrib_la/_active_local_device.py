@@ -38,8 +38,11 @@ def require_active_local_device(platform: str) -> None:
             raise RuntimeError("device-bounds active-range GEMM is unavailable: " + reason)
 
 
-def device_call(a, b, bounds, weights=None, c=None, *, alpha, beta):
-    """The raw target: ``bounds`` int32 ``(1|nq, 2)``, ``weights`` ``(nq,K)`` or None."""
+def device_call(a, b, bounds, weights=None, c=None, *, alpha, beta, conj_b=False):
+    """The raw target: ``bounds`` int32 ``(1|nq, 2)``, ``weights`` ``(nq,K)`` or None.
+
+    ``conj_b``: the kernel reads ``b`` conjugated as it loads it (``a diag(w) conj(b)``), so a
+    caller holding ``b`` never forms ``conj(b)``."""
     nq, m, k = a.shape
     n = b.shape[2]
     weighted = weights is not None
@@ -47,7 +50,7 @@ def device_call(a, b, bounds, weights=None, c=None, *, alpha, beta):
     out = jax.ShapeDtypeStruct((nq, m, n), a.dtype)
     common = dict(nq=nq, m=m, k=k, n=n, weighted=int(weighted),
                   alpha_re=float(np.real(alpha)), alpha_im=float(np.imag(alpha)),
-                  cubin_dir=_cache_dir())
+                  conj_b=int(bool(conj_b) and a.dtype.kind == "c"), cubin_dir=_cache_dir())
     if c is None:
         if beta != 0:
             raise ValueError("device active GEMM requires C when beta != 0")
@@ -58,7 +61,7 @@ def device_call(a, b, bounds, weights=None, c=None, *, alpha, beta):
         a, b, w, bounds, c, beta_re=float(np.real(beta)), beta_im=float(np.imag(beta)), **common)
 
 
-def active_local_device(a, b, bounds, weights, c=None, *, alpha, beta):
+def active_local_device(a, b, bounds, weights, c=None, *, alpha, beta, conj_b=False):
     """``_active_local.active_local_matmul``'s contract on the device-bounds kernel.
 
     ``a`` ``(nq,m,K)``, ``b`` ``(nq,K,n)``, int ``bounds`` ``(nq,2)``, ``weights`` ``(nq,K)``.
@@ -84,7 +87,8 @@ def active_local_device(a, b, bounds, weights, c=None, *, alpha, beta):
         (bounds >= 0) & (bounds <= a.shape[2]), bounds, -1).astype(jnp.int32)
     if c is None and beta != 0:
         raise ValueError("device active GEMM requires C when beta != 0")
-    return device_call(a, b, b32, weights, None if beta == 0 else c, alpha=alpha, beta=beta)
+    return device_call(a, b, b32, weights, None if beta == 0 else c, alpha=alpha, beta=beta,
+                       conj_b=conj_b)
 
 
 __all__ = ["active_local_device", "device_call", "require_active_local_device"]

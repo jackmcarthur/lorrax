@@ -87,6 +87,7 @@ from ffi import _services
 _services.ensure_on_path()
 from lxkit import (device_put_process_local, device_put_process_local_cached,
                    device_put_process_tiles, placement_cache_stats)
+from lxkit import ordered_psum, ordered_psum_scatter
 
 
 __all__ = [
@@ -711,8 +712,18 @@ def to_transpose_partner(t, p: int):
     face (a block held ``[.., a_X, b_Y]`` arrives as the partner's
     ``[.., a_Y, b_X]``)."""
     import jax
-    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p)]
-    return jax.lax.ppermute(t, ("x", "y"), perm)
+    import jax.numpy as jnp
+    if p == 1:
+        return t
+    # Off-diagonal pairs only; a diagonal rank IS its own partner and keeps
+    # its block.  A self pair is not free: RCCL executes it as a 0.50 ms copy
+    # of a 24.9 MB block on MI250X (P4 Fe W tile; 0.065 ms as this select,
+    # comm7 lane 2026-10-16), against 0.59-0.74 ms for the real exchange.
+    # The select fuses into the consumer; ranks still meet in one permute.
+    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p) if i != j]
+    moved = jax.lax.ppermute(t, ("x", "y"), perm)
+    on_diagonal = jax.lax.axis_index("x") == jax.lax.axis_index("y")
+    return jnp.where(on_diagonal, t, moved)
 
 
 def xy_tile_mesh(x):
@@ -820,7 +831,6 @@ def _psum_kernel(ndim: int, mesh):
         def _body(x):
             # Rank-order sum (lxkit.ordered_psum): the library all-reduce's order
             # follows the GCD placement (det lane 2026-10-16: the exact Hartree's rho).
-            from lxkit import ordered_psum
             return ordered_psum(x[0], axes)
 
         fn = jax.jit(_body)
@@ -1366,7 +1376,7 @@ def psum_scatter_checked(x, axis, scatter_dimension, tiled=True, *, name):
             f"tiled layout.  Use lax.psum_scatter directly, unchecked, and say "
             f"so at the call site.")
 
-    out = lax.psum_scatter(x, axis, scatter_dimension=scatter_dimension,
+    out = ordered_psum_scatter(x, axis, scatter_dimension=scatter_dimension,
                            tiled=tiled)
 
     glob = [int(v) for v in x.shape]           # x carries the FULL extent
@@ -1380,7 +1390,7 @@ def psum_scatter_checked(x, axis, scatter_dimension, tiled=True, *, name):
 
     # ONE scalar all-reduce, 2 complex doubles.  psum, never psum_scatter —
     # the checker must not be built on the primitive it is checking.
-    packed = lax.psum(jnp.stack([s_in - s_out, s_in]), axis)
+    packed = ordered_psum(jnp.stack([s_in - s_out, s_in]), axis)
     # SCALE = |checksum of the correct reduction|, NOT the operand's L1 mass.
     # Measured (wk_REL job 7880840): a separate L1-mass pass costs +65 % on the
     # 0.41 MB BSE collective and +157 % at 41 MB, because `abs(x)` materialises
@@ -1476,7 +1486,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     axes = list(mesh.axis_names)
     groups = list(axes) + ([tuple(axes)] if len(axes) > 1 else [])
     for ax in groups:
-        f = jax.jit(shard_map(lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,
+        f = jax.jit(shard_map(lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,  # exact-reduce: warm-up of zeros
                               in_specs=(P(None),), out_specs=P(None),
                               check_vma=False))
         jax.block_until_ready(f(tiny))

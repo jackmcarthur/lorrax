@@ -185,3 +185,45 @@ def test_resolved_acceptance_stands_on_the_source():
     ours, ref = minimax.response_group_rules(LO, HI, z, pencil=resolved), minimax.response_group_rules(LO, HI, z)
     assert [r["count"] for r in ours] == [r["count"] for r in ref]
     assert any(np.asarray(a["t"]).tobytes() != np.asarray(b["t"]).tobytes() for a, b in zip(ours, ref))
+
+
+def test_abandon_forecast():
+    """The error forecast abandons a geometry only when its prediction bound misses the tolerance."""
+    import file_io  # noqa: F401  (service path bootstrap)
+    from minimax import complex_response as cr
+
+    k = np.arange(12)
+    def history(err_slope, err0=8.):
+        return [(int(i), err0 + err_slope*i) for i in k]
+    assert cr._abandoned(history(-0.05), 46)                # tol only at k=160: past the pencil's last count
+    assert not cr._abandoned(history(-0.25), 46)            # tol at k=32: the scan decides there
+    assert not cr._abandoned(history(0.0, 3.), 46)          # stagnation is the patience rule's call
+    assert not cr._abandoned(history(-0.05)[:2], 46)        # no residual estimate from two points
+    scattered = [(0, 8.), (1, 7.5), (2, 8.2), (3, 7.6)]     # line misses tol, but its bound is wide
+    assert not cr._abandoned(scattered, 46)
+
+
+def test_abandon_stagnation_independent_of_rounding():
+    """A constant history is stagnation at every level and window, whatever sign rounding gives its slope."""
+    import file_io  # noqa: F401  (service path bootstrap)
+    from minimax import complex_response as cr
+
+    for level in np.linspace(-5., 9., 141):
+        for start in range(6):
+            history = [(i, float(level)) for i in range(start, start + 12)]
+            assert not cr._abandoned(history, 46), level
+
+
+def test_abandon_decision_stable_under_ulp_perturbation():
+    """One-ulp perturbations of a history's errors never change the decision away from the bound's edge."""
+    import file_io  # noqa: F401  (service path bootstrap)
+    from minimax import complex_response as cr
+
+    rng = np.random.default_rng(7)
+    for _ in range(400):
+        k = np.arange(int(rng.integers(3, 12)))
+        e = rng.uniform(1., 9.) + rng.uniform(-1.3, -0.01)*k + rng.normal(0., 0.05, k.size)
+        base = cr._abandoned([(int(a), float(b)) for a, b in zip(k, e)], 46)
+        for sign in (-1., 1.):
+            moved = np.nextafter(e, sign*np.inf)
+            assert cr._abandoned([(int(a), float(b)) for a, b in zip(k, moved)], 46) == base

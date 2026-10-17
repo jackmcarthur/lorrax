@@ -14,7 +14,7 @@
 # The legs are built by the clone route's scripts (../build_ffi_host.sh,
 # ../build_ffi_cuda.sh) in a fresh clone of the revision whose .venv is the
 # module venv, so they compile against the jaxlib they will run with.  SLATE
-# and the cuSOLVERMp/cuBLASMp stage live in $PREFIX/build, built once.
+# and the cuSOLVERMp/cuBLASMp stage live in $PREFIX/native, built once.
 # ============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +39,10 @@ mkdir -p "$CAND"
 git clone --quiet --no-checkout --shared "$SRC" "$CAND/src"
 git -C "$CAND/src" checkout --quiet --detach "$REV"
 ln -s "$VENV" "$CAND/src/.venv"
-export LORRAX_BUILD_PREFIX="$PREFIX/build"
+# The shared SLATE install and cuSOLVERMp stage live in $PREFIX/native, not
+# $PREFIX/build: SLATE's install RUNPATH names its directory, and seal_bundle.py
+# refuses any search path through a directory called build (a build tree).
+export LORRAX_BUILD_PREFIX="$PREFIX/native"
 # The module venv does not install lorrax; the legs' dynamic gates (GATE 8)
 # import it from the clone being built.
 export PYTHONPATH="$CAND/src/src"
@@ -68,12 +71,23 @@ echo "$REV" > "$CAND/source/SOURCE_COMMIT"
 
 BUNDLE_ID="$("$VENV/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["bundle_id"])' \
     "$CAND/bundle/lorrax_ffi_bundle.json")"
+# Every jax*/nvidia-* package at its uv.lock version (setup_env.sh's export).
+EXPECT="$("$VENV/bin/python" - "$VENV/lorrax-locked-requirements.txt" <<'PY'
+import json, re, sys
+want = {}
+for line in open(sys.argv[1]):
+    m = re.match(r"^((?:jax|nvidia)[A-Za-z0-9_.-]*)(?:\[[^]]*\])?==([^\s;\\]+)", line)
+    if m:
+        want[m.group(1).lower().replace("_", "-")] = m.group(2)
+print(json.dumps(want, sort_keys=True))
+PY
+)"
 cat > "$CAND/CANDIDATE" <<EOF
 REV=$REV
 BUNDLE_ID=$BUNDLE_ID
 MODULE_NAME=$MODULE_NAME
 MODULE_VERSION=$MODULE_VERSION
-EXPECT='{"jax": "$JAX_VERSION", "jaxlib": "$JAX_VERSION", "jax-cuda13-plugin": "$JAX_VERSION", "jax-cuda13-pjrt": "$JAX_VERSION", "nvidia-cudnn-cu13": "$CUDNN_VERSION", "nvidia-mathdx": "$MATHDX_VERSION"}'
+EXPECT='$EXPECT'
 EOF
 bash "$HERE/install_module.sh" "$CAND/source" "$CAND/bundle" \
     "$CAND/modulefiles/$MODULE_NAME/$MODULE_VERSION.lua"
