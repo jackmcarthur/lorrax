@@ -6,7 +6,7 @@ process):
     lx run -N 1 -G 4 -n 4 -- python3 -m pytest tests/hsuite -q -p no:cacheprovider
 
 ``lx test tests/hsuite`` runs the same cell at P1.  Nothing is written in the
-source tree: the run directories live under ``rank_session.ROOT``
+source tree: the run directories live under ``rank_session.run_root()``
 (``$SCRATCH/.cache/lorrax/hsuite``), and the compile cache is the runtime's
 own (``ISDF_JAX_CACHE_DIR`` if exported, else its namespace under
 ``$SCRATCH/.cache/lorrax/jax_compile``), warm after the first run;
@@ -30,7 +30,7 @@ def test_driver_chain_matches_references(pytestconfig):
     stamp = rank_session.exchange(time.strftime("%Y%m%d-%H%M%S"))[0]
     job = os.environ.get("SLURM_JOB_ID", "local")
     worker = os.environ.get("PYTEST_XDIST_WORKER", "p")
-    out = rank_session.ROOT / f"{job}-{worker}-{stamp}"
+    out = rank_session.run_root() / f"{job}-{worker}-{stamp}"
     walls, problems = chain.run_chain(out, cache_dir=os.environ.get("HSUITE_CACHE_DIR"))
     print("hsuite walls (s):", {k: round(v, 1) for k, v in walls.items()})
     # Every rank holds every rank's problems (rank, stage, log tail); rank 0,
