@@ -503,47 +503,30 @@ def _measured_code_hash() -> str:
     return h.hexdigest()[:16]
 
 
-@lru_cache(maxsize=None)
 def native_closure_identity(platform: str) -> str:
-    """SHIM of ``lxkit.native_provider.native_closure_identity(platform) -> str`` (the Dep-enforce
-    lane's sha256 of the leg's recorded closure plus its verified mapped files), same signature:
-    until it lands, the loaded FFI library's resolved path and a sha256 over the leg, its
-    ``<leg>.closure.json`` record (the checkout closure the build verified) and every private
-    provider that record names ("none" where no library loads).  A cost measured against another
-    native closure -- another leg, another record, another staged cuSOLVERMp -- is another key."""
-    import hashlib
-    import json
-    import os
+    """The native closure the measured programs run on: the enforced dependency
+    closure identity of the platform's FFI leg
+    (:func:`lxkit.native_provider.native_closure_identity` -- every library the
+    leg maps, by path and content hash, verified at start-up), or ``"none"``
+    where no leg of that platform is open.  A cost measured against any other
+    library set is another key.  Not cached here: lxkit computes it once, at
+    enforcement, and a ``"none"`` asked before the leg opens must not stick."""
+    from lxkit import native_provider
     try:
-        from distrib_la.loader import loaded_lib_path
-        path = loaded_lib_path(platform)
-    except Exception:
-        path = None
-    if not path or not os.path.exists(path):
+        return native_provider.native_closure_identity(_lxkit_platform(platform))
+    except native_provider.ClosureNotEnforced:
         return "none"
-    h = hashlib.sha256()
 
-    def feed(label: str, file: str) -> None:
-        h.update(label.encode() + b"\0" + os.path.realpath(file).encode() + b"\0")
-        with open(file, "rb") as f:
-            for block in iter(lambda: f.read(1 << 22), b""):
-                h.update(block)
 
-    feed("leg", path)
-    record = path + ".closure.json"
-    if os.path.isfile(record):
-        feed("record", record)
-        try:
-            with open(record, encoding="utf-8") as f:
-                private = json.load(f).get("private_libraries", [])
-        except (OSError, ValueError, AttributeError):
-            private = []
-        for lib in private:
-            if isinstance(lib, str) and os.path.isfile(lib):
-                feed("private", lib)
-            else:
-                h.update(b"missing\0" + str(lib).encode() + b"\0")
-    return f"{os.path.realpath(path)}:{h.hexdigest()[:16]}"
+def _lxkit_platform(platform: str) -> str:
+    """distrib_la's platform name -> the lxkit.legs.LEGS key."""
+    from lxkit import LEGS
+    if platform in LEGS:
+        return platform
+    for key, spec in LEGS.items():
+        if platform.lower() in (key.lower(), str(getattr(spec, "vendor", "")).lower()):
+            return key
+    return platform
 
 
 def _measured_cache_dir() -> str:
