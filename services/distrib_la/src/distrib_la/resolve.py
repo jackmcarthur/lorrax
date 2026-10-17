@@ -85,6 +85,8 @@ __all__ = [
     "ONE_DEVICE",
     "ONE_DEVICE_MAX_N",
     "ONE_DEVICE_BY_ROOM",
+    "ONE_DEVICE_ROUND_N",
+    "one_device_round_n",
     "one_device_max_n",
     "size_route_note",
     "BACKEND_CHOICES",
@@ -226,6 +228,23 @@ ONE_DEVICE_MAX_N = {
     ("eigh", "ROCM"):     16384,
     ("solve_lu", "ROCM"): math.isqrt(_ROCM_GCD_BYTES_LIMIT // _ROCM_LU_BYTES_PER_N2),
 }
+
+#: ``one_device`` ROUNDS by leg row: the per-rank element allowance of one round (whole
+#: matrices of n x max(n, width) elements up to ROUND_N^2 per rank, at least one), DECOUPLED
+#: from the selection bound above so that a stack's per-rank peak never rises above main's
+#: (owner rule): these are the rows main 4bae15f55 planned its rounds with.  A single matrix
+#: above ROUND_N that ONE_DEVICE_MAX_N selects runs one matrix per rank per round.
+ONE_DEVICE_ROUND_N = {
+    ("eigh", "ROCM"):     16384,
+    ("solve_lu", "ROCM"): 8192,
+}
+
+
+def one_device_round_n(op: str, platform: str, bound: int) -> int:
+    """The rounds' bound for a selection bound ``bound``: ``min(bound, ONE_DEVICE_ROUND_N row)``
+    (the bound itself on a leg without a round row, e.g. a room leg).  A shape rule."""
+    r = ONE_DEVICE_ROUND_N.get((op, str(platform)))
+    return int(bound) if r is None else min(int(bound), int(r))
 
 #: ``distributed`` by ROOM -- the (op, leg) pairs whose ``one_device`` bound is not a number
 #: but the caller's per-rank room: the largest ``n`` whose one whole matrix's priced program

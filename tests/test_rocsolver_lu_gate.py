@@ -23,12 +23,24 @@ import numpy as np
 import pytest
 
 TOL = 1e-12
+TOL32 = 1e-5          #: float32 / complex64 (normwise backward error ~ 10-30 eps at n ~ 2e4)
+
+
+def _tol(dt):
+    return TOL32 if np.dtype(dt) in (np.float32, np.complex64) else TOL
 #: (n, dtype, nrhs, batch): handler forced (small) -- odd sizes, narrow and wide RHS, a stack.
 SMALL = ((312, "complex128", 312, 16), (312, "float64", 7, 16), (1000, "complex128", 3, 0),
          (2048, "complex128", 2048, 0), (4097, "float64", 100, 0), (3000, "complex128", 5000, 0))
 #: routed by the span rule: the sizes the defect hits, and (--big) up to one GCD's capacity.
 ROUTED = ((11776, "complex128", 11776, 0), (12288, "complex128", 12288, 0),
-          (16512, "float64", 16512, 0))
+          (16512, "float64", 16512, 0), (16512, "complex64", 16512, 0), (23296, "float32", 23296, 0))
+#: the defect's threshold pairs per dtype, (m - 128)(m + 1) itemsize >= 2^31 (native, reported)
+THRESHOLDS = ((11648, "complex128"), (11776, "complex128"), (16384, "float64"), (16512, "float64"),
+              (16384, "complex64"), (16512, "complex64"), (23168, "float32"), (23296, "float32"))
+#: triangular modes: (n, dtype, nrhs, which) -- forced small, routed large
+TRI = ((1000, "complex128", 37, "lu"), (1000, "complex128", 37, "L"), (1000, "complex128", 37, "LH"),
+       (1000, "float32", 37, "LT"), (12288, "complex128", 2048, "lu"), (12288, "complex128", 2048, "L"),
+       (12288, "complex128", 2048, "LH"), (16512, "complex64", 1024, "L"))
 BIG = ((16384, "complex128", 16384, 0), (20480, "float64", 20480, 0),
        (20480, "complex128", 20480, 0), (27427, "complex128", 27427, 0))
 
@@ -54,6 +66,35 @@ def _resid(A, X, B):
     import jax.numpy as jnp
     fro = lambda x: jnp.sqrt(jnp.sum(jnp.abs(x) ** 2))
     return float(jax.jit(lambda a, x, b: fro(jnp.matmul(a, x) - b) / (fro(a) * fro(x)))(A, X, B))
+
+
+def run_native(n, dt):
+    import jax
+    import jax.numpy as jnp
+    A, B = _system(n, dt, n, 0)
+    X = jax.jit(jnp.linalg.solve)(A, B)
+    return dict(n=n, dtype=dt, native_resid=_resid(A, X, B))
+
+
+def run_tri(n, dt, nrhs, which):
+    import jax
+    import jax.numpy as jnp
+    from distrib_la import local_lu as ll
+    row = ll.LOCAL_LU_ROUTE["ROCM"]
+    A, B = _system(n, dt, nrhs, 0)
+    routed = ll.routes(A.shape, B.shape, A.dtype)
+    if which == "lu":
+        lu, piv, _ = jax.jit(jax.lax.linalg.lu)(A)
+        fn = jax.jit(lambda lu, piv, b: ll._native_tri(row, lu, b, ll._MODE_LU, piv=piv))
+        X = fn(lu, piv, B); T = A; del lu
+    else:
+        L = jax.jit(lambda a: jnp.tril(a) + 4 * jnp.eye(n, dtype=a.dtype))(A)
+        mode = {"L": ll._MODE_L, "LT": ll._MODE_LT, "LH": ll._MODE_LT}[which]
+        fn = jax.jit(lambda l, b: ll._native_tri(row, l, b, mode, conj=(which == "LH")))
+        X = fn(L, B)
+        T = {"L": L, "LT": L.T, "LH": jnp.conj(L.T)}[which]
+    return dict(n=n, dtype=dt, nrhs=nrhs, which=which, routed=routed, resid=_resid(T, X, B),
+                finite=bool(jnp.all(jnp.isfinite(X))))
 
 
 def run_case(n, dt, nrhs, batch, force):
@@ -88,9 +129,17 @@ def main() -> int:
     bad = 0
     for (n, dt, nrhs, batch), force in cases:
         out = run_case(n, dt, nrhs, batch, force)
-        ok = out["finite"] and out["resid"] <= TOL
+        ok = out["finite"] and out["resid"] <= _tol(dt)
         bad += not ok
         print(f"[lu gate] {'PASS' if ok else 'FAIL'} {out}", flush=True)
+    for n, dt, nrhs, which in TRI:
+        out = run_tri(n, dt, nrhs, which)
+        ok = out["finite"] and out["resid"] <= _tol(dt)
+        bad += not ok
+        print(f"[lu gate] {'PASS' if ok else 'FAIL'} tri {out}", flush=True)
+    if "--thresholds" in sys.argv:          # the defect itself, on the native path (reported)
+        for n, dt in THRESHOLDS:
+            print(f"[lu gate] native {run_native(n, dt)}", flush=True)
     print(f"[lu gate] {'PASS' if not bad else f'FAIL ({bad})'}", flush=True)
     return 1 if bad else 0
 
@@ -102,7 +151,8 @@ def test_the_row_is_rocm_only_and_the_span_rule():
     assert set(LOCAL_LU_ROUTE) == {"ROCM"}
     row = LOCAL_LU_ROUTE["ROCM"]
     assert row.target == "lorrax_rocsolver_lu_solve" and row.min_span_bytes == 1 << 31
-    assert set(row.dtypes) == {"complex128", "float64"}
+    assert row.tri_target == "lorrax_rocsolver_tri_solve"
+    assert set(row.dtypes) == {"float32", "float64", "complex64", "complex128"}
     # The largest exact complex128 / float64 square systems of the native path stay native...
     assert local_lu_row((11585, 11585), (11585, 11585), np.complex128, "ROCM") is None
     assert local_lu_row((16384, 16384), (16384, 16384), np.float64, "ROCM") is None
@@ -113,7 +163,16 @@ def test_the_row_is_rocm_only_and_the_span_rule():
         assert local_lu_row((n, n), (n, 1), dt, "ROCM") is row                 # A alone spans it
     assert local_lu_row((4096, 4096), (4096, 32769), np.complex128, "ROCM") is row  # B spans it
     assert local_lu_row((4096, 4096), (4096, 32768), np.complex128, "ROCM") is None  # exactly 2^31
-    assert local_lu_row((12288, 12288), (12288, 12288), np.complex64, "ROCM") is None
+    # complex64 / float32 at theirs (the span rule contains the defect's rule for every n)
+    assert local_lu_row((16384, 16384), (16384, 16384), np.complex64, "ROCM") is None
+    assert local_lu_row((16512, 16512), (16512, 16512), np.complex64, "ROCM") is row
+    assert local_lu_row((23168, 23168), (23168, 23168), np.float32, "ROCM") is None
+    assert local_lu_row((23296, 23296), (23296, 23296), np.float32, "ROCM") is row
+    assert local_lu_row((12288, 12288), (12288,), np.complex128, "ROCM") is row     # a vector b
+    for m in range(256, 40000, 128):
+        for item in (4, 8, 16):
+            if (m - 128) * (m + 1) * item >= 1 << 31:        # the defect's condition
+                assert m * m * item > 1 << 31                # ... is always routed
     for leg in ("CUDA", "cpu"):
         assert local_lu_row((12288, 12288), (12288, 12288), np.complex128, leg) is None
 
@@ -134,12 +193,12 @@ def test_the_target_is_in_both_rocm_tables_and_the_family_row():
     pytest.importorskip("jax")
     from ffi.common import ffi_loader, families
     from distrib_la import loader
-    t = "lorrax_rocsolver_lu_solve"
-    assert loader._PLATFORMS["ROCM"]["targets"][t] == ffi_loader._PLATFORMS["ROCM"]["targets"][t] \
-        == "RocsolverLuSolveFfi"
-    assert families.family_of(t) == "rocsolver" and families.state("rocsolver", "ROCM")[0] == "built"
-    for leg in ("CUDA", "cpu"):
-        assert t not in loader._PLATFORMS[leg]["targets"] and t not in ffi_loader._PLATFORMS[leg]["targets"]
+    for t, sym in (("lorrax_rocsolver_lu_solve", "RocsolverLuSolveFfi"),
+                   ("lorrax_rocsolver_tri_solve", "RocsolverTriSolveFfi")):
+        assert loader._PLATFORMS["ROCM"]["targets"][t] == ffi_loader._PLATFORMS["ROCM"]["targets"][t] == sym
+        assert families.family_of(t) == "rocsolver" and families.state("rocsolver", "ROCM")[0] == "built"
+        for leg in ("CUDA", "cpu"):
+            assert t not in loader._PLATFORMS[leg]["targets"] and t not in ffi_loader._PLATFORMS[leg]["targets"]
 
 
 def test_the_handler_keeps_every_rocblas_operand_below_two_gib():
@@ -147,7 +206,7 @@ def test_the_handler_keeps_every_rocblas_operand_below_two_gib():
     src = open(os.path.join(os.path.dirname(__file__), "..", "src", "ffi", "cpp", "rocsolver",
                             "lu_solve_ffi.cc")).read()
     for needle in ("INT32_MAX) / static_cast<int64_t>(esize)", "b.limit / n", "(b.limit - n) / n + 1",
-                   "(limit - k) / lda + 1", "ipiv, -1)"):
+                   "(limit - k) / lda + 1", "pv, -1)", "pv, 1)"):
         assert needle in src, needle
 
 
@@ -162,13 +221,23 @@ def _on_rocm():
 
 
 @pytest.mark.skipif(not _on_rocm(), reason="GPU (ROCm) regression: needs an MI250X GCD")
-@pytest.mark.parametrize("n,dt", [(11776, "complex128"), (16512, "float64")])
+@pytest.mark.parametrize("n,dt", [(11776, "complex128"), (16512, "float64"), (16512, "complex64"),
+                                  (23296, "float32")])
 def test_large_n_route_is_exact_on_rocm(n, dt):
     """The regression: at the smallest sizes the rocBLAS trsm defect hits, the routed solve is
     exact (jnp.linalg.solve there: relative residual 5e-3 / 2e-3)."""
     import jax
     jax.config.update("jax_enable_x64", True)
     out = run_case(n, dt, n, 0, force=False)
+    assert out["routed"] and out["finite"] and out["resid"] <= _tol(dt), out
+
+
+@pytest.mark.skipif(not _on_rocm(), reason="GPU (ROCm) regression: needs an MI250X GCD")
+@pytest.mark.parametrize("which", ["lu", "L", "LH"])
+def test_large_n_triangular_route_is_exact_on_rocm(which):
+    import jax
+    jax.config.update("jax_enable_x64", True)
+    out = run_tri(12288, "complex128", 1024, which)
     assert out["routed"] and out["finite"] and out["resid"] <= TOL, out
 
 

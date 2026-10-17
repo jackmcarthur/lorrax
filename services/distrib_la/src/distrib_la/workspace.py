@@ -120,7 +120,8 @@ def _workspace_details(plan, op, shapes, dtype):
             from distrib_la import resolve as _resolve
             bound = _resolve.one_device_max_n('eigh', _resolve.mesh_platform(plan.mesh),
                                               plan.budget_bytes) or n
-            copies = held_per_rank(batch, n, px * py, bound)
+            copies = held_per_rank(batch, n, px * py, _resolve.one_device_round_n(
+                'eigh', _resolve.mesh_platform(plan.mesh), bound))
         else:
             copies = (-(-batch // (px * py))
                       if plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
@@ -337,6 +338,7 @@ def eigh_stack_bytes(plan, shape, dtype) -> int:
         from distrib_la import resolve as _resolve
         bound = _resolve.one_device_max_n("eigh", _resolve.mesh_platform(plan.mesh),
                                           plan.budget_bytes) or n
-        return held_per_rank(nb, n, ranks, bound) * BATCH_EIGH_TILES * n * n * item
+        return held_per_rank(nb, n, ranks, _resolve.one_device_round_n(
+            "eigh", _resolve.mesh_platform(plan.mesh), bound)) * BATCH_EIGH_TILES * n * n * item
     return (-(-nb * n * n * item // ranks) + nb * n * 8
             + workspace_bytes_per_rank(plan, 'eigh', ((n, n),), dtype))

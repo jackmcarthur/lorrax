@@ -155,10 +155,13 @@ from ._active_local import active_weights_on_load
 from ._batch_reshard import batch_layout, is_batch_layout, local_batch
 from ._result_check import checked_program, checked_shapes, native_eigh_jacobi
 from distrib_la.local_eigh import eigh_local, eigh_route, COMPLEX_EIGH_ROUTE
+from distrib_la.local_lu import (LOCAL_LU_ROUTE, lu_solve_local, solve_local, routes as local_lu_routes,
+                               tri_solve_local)
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
 __all__ = [
     "eigh_local", "eigh_route", "COMPLEX_EIGH_ROUTE",
+    "solve_local", "lu_solve_local", "tri_solve_local", "local_lu_routes", "LOCAL_LU_ROUTE",
     "local_batch", "batch_layout", "is_batch_layout",
     "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
     "plan_orthogonalization", "subspace_route", "SUBSPACE_ROUTE",

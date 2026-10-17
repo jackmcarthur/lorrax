@@ -178,6 +178,7 @@ _ROCM_LOCAL_EIGH_SYMBOLS: dict = {
 #: ROCM row.  CUDA solves through jaxlib's cuSOLVER (exact at every n measured): ROCM only.
 _ROCM_LOCAL_LU_SYMBOLS: dict = {
     "lorrax_rocsolver_lu_solve": "RocsolverLuSolveFfi",
+    "lorrax_rocsolver_tri_solve": "RocsolverTriSolveFfi",
 }
 #: The active-subspace family on this leg (cpp/active_subspace/active_devsize.cc: device-side
 #: sizes, no host read) -- the CUDA symbols less the one-communicator CGS2 handler (needs

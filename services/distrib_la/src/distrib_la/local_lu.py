@@ -25,6 +25,13 @@ can reach 2^31 and ``jnp.linalg.solve`` is exact (and unchanged: float64 n = 163
 2^31 bytes, is exact on the native path).  A routed solve whose target is not loadable refuses by GATE ``local_lu_target``
 (no fallback to the defective path).  Gate: ``tests/test_rocsolver_lu_gate.py``.
 
+Three entry points, each taking the caller's own computation as ``native`` (the default is the
+call it replaces), so a system below the span is the caller's original program bit for bit:
+:func:`solve_local` (``jnp.linalg.solve``), :func:`lu_solve_local` (``jax.scipy.linalg.lu_solve``
+on jax's ``(lu, piv)``), :func:`tri_solve_local` (a LOWER triangle: ``L x = b``, ``L^T x = b``,
+``L^H x = b``).  float32 / complex64 have the same defect at their own thresholds (float32:
+n = 23168 exact, 23296 wrong; complex64 as float64), so the row serves all four dtypes.
+
 CUDA has no row: jaxlib's cuSOLVER LU was measured exact through n = 16384 complex128
 (``resolve.ONE_DEVICE_BY_ROOM``'s comment), so the defect above does not occur there.
 """
@@ -36,18 +43,24 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["LOCAL_LU_ROUTE", "LocalLuRow", "local_lu_row", "solve_local"]
+__all__ = ["LOCAL_LU_ROUTE", "LocalLuRow", "local_lu_row", "routes", "solve_local",
+           "lu_solve_local", "tri_solve_local"]
 
 
 class LocalLuRow(NamedTuple):
-    """A leg's native one-device LU solve and the matrices it takes."""
-    target: str              #: XLA FFI target (distrib_la.loader's table for the leg)
-    dtypes: tuple            #: dtype names the handler serves
+    """A leg's native one-device LU / triangular solves and the systems they take."""
+    target: str              #: XLA FFI target: factor + solve (distrib_la.loader's table)
+    tri_target: str          #: XLA FFI target: apply given factors / a triangle
+    dtypes: tuple            #: dtype names the handlers serve
     min_span_bytes: int      #: a matrix whose A or B spans more than this many bytes is taken
 
 
 #: Leg key -> its one-device LU solve.  ROCM: the span rule of the module docstring (2^31).
-LOCAL_LU_ROUTE = {"ROCM": LocalLuRow("lorrax_rocsolver_lu_solve", ("complex128", "float64"), 1 << 31)}
+LOCAL_LU_ROUTE = {"ROCM": LocalLuRow("lorrax_rocsolver_lu_solve", "lorrax_rocsolver_tri_solve",
+                                     ("float32", "float64", "complex64", "complex128"), 1 << 31)}
+
+#: tri_solve_local's handler modes (src/ffi/cpp/rocsolver/lu_solve_ffi.cc).
+_MODE_LU, _MODE_L, _MODE_LT = 1, 2, 3
 
 
 def _process_leg_key():
@@ -57,19 +70,23 @@ def _process_leg_key():
 
 
 def local_lu_row(a_shape, b_shape, dtype, leg_key=None):
-    """The :data:`LOCAL_LU_ROUTE` row that solves this system, or None (``jnp.linalg.solve``).
+    """The :data:`LOCAL_LU_ROUTE` row that solves this system, or None (the caller's own call).
 
-    ``a_shape`` [..., n, n], ``b_shape`` [..., n, nrhs] (same batch).  A shape rule: every
-    rank computes the same answer, no exchange."""
+    ``a_shape`` [..., n, n], ``b_shape`` [..., n, nrhs] or [..., n].  A shape rule: every rank
+    computes the same answer, no exchange."""
     row = LOCAL_LU_ROUTE.get(_process_leg_key() if leg_key is None else leg_key)
-    if row is None or np.dtype(dtype).name not in row.dtypes:
+    if row is None or np.dtype(dtype).name not in row.dtypes or len(a_shape) < 2:
         return None
-    if len(a_shape) < 2 or len(b_shape) != len(a_shape):
-        return None
-    n, nrhs, item = int(a_shape[-1]), int(b_shape[-1]), np.dtype(dtype).itemsize
+    n, item = int(a_shape[-1]), np.dtype(dtype).itemsize
+    nrhs = 1 if len(b_shape) == len(a_shape) - 1 else int(b_shape[-1])
     if n * max(n, nrhs) * item <= row.min_span_bytes:
         return None
     return row
+
+
+def routes(a_shape, b_shape, dtype, leg_key=None) -> bool:
+    """True when :func:`local_lu_row` takes the system (for call sites that restructure it)."""
+    return local_lu_row(a_shape, b_shape, dtype, leg_key) is not None
 
 
 def _require_target(target):
@@ -81,11 +98,17 @@ def _require_target(target):
                            f"want: the leg built with src/ffi/cpp/rocsolver (LOCAL_LU_ROUTE row)")
 
 
+def _as_matrix_rhs(a, b):
+    vec = b.ndim == a.ndim - 1
+    return (b[..., None] if vec else b), vec
+
+
 def _native_solve(row, a, b):
     """One FFI call for the whole stack.  The handler reads the row-major ``a`` as A^T
     (column-major) and factors it in place; ``b`` goes in as B^T row-major (= B column-major)
     and comes back as X^T.  ``a``/``b`` alias the factor/solution (no extra n^2 buffer)."""
     _require_target(row.target)
+    b, vec = _as_matrix_rhs(a, b)
     bt = jnp.swapaxes(b, -1, -2)
     _lu, xt, _info = jax.ffi.ffi_call(
         row.target,
@@ -93,13 +116,68 @@ def _native_solve(row, a, b):
          jax.ShapeDtypeStruct(a.shape[:-2], jnp.int32)),
         input_output_aliases={0: 0, 1: 1},
         vmap_method="broadcast_all")(a, bt)
-    return jnp.swapaxes(xt, -1, -2)
+    x = jnp.swapaxes(xt, -1, -2)
+    return x[..., 0] if vec else x
 
 
-def solve_local(a, b):
-    """``jnp.linalg.solve(a, b)`` for ``a`` [..., n, n] and ``b`` [..., n, nrhs], by the leg's
-    route.  A singular matrix gives non-finite X on both routes (no info is read)."""
+def _native_tri(row, a, b, mode, piv=None, conj=False):
+    """Apply factors / a triangle held in ``a`` (read only) to ``b``: one FFI call.  ``conj``
+    conjugates B before and X after (fused into the layout copies): L^H x = b is mode 3 on
+    conj(b)."""
+    _require_target(row.tri_target)
+    b, vec = _as_matrix_rhs(a, b)
+    bt = jnp.swapaxes(b, -1, -2)
+    if conj:
+        bt = jnp.conj(bt)
+    pv = (jnp.zeros(a.shape[:-1], jnp.int32) if piv is None
+          else (piv.astype(jnp.int32) + 1))             # rocSOLVER pivots are 1-based
+    xt = jax.ffi.ffi_call(
+        row.tri_target, jax.ShapeDtypeStruct(bt.shape, bt.dtype),
+        input_output_aliases={1: 0}, vmap_method="broadcast_all")(a, bt, pv, mode=np.int64(mode))
+    if conj:
+        xt = jnp.conj(xt)
+    x = jnp.swapaxes(xt, -1, -2)
+    return x[..., 0] if vec else x
+
+
+def solve_local(a, b, native=None):
+    """``jnp.linalg.solve(a, b)`` for ``a`` [..., n, n] and ``b`` [..., n, nrhs] (or [..., n]), by
+    the leg's route; ``native(a, b)`` (default ``jnp.linalg.solve``) below it.  A singular matrix
+    gives non-finite X on both routes (no info is read)."""
     row = local_lu_row(a.shape, b.shape, a.dtype)
     if row is None or b.dtype != a.dtype:
-        return jnp.linalg.solve(a, b)
+        return (native or jnp.linalg.solve)(a, b)
     return _native_solve(row, a, b)
+
+
+def lu_solve_local(lu, piv, b, native=None):
+    """``jax.scipy.linalg.lu_solve((lu, piv), b, trans=0)`` on jax's factors (``lax.linalg.lu``
+    / ``lu_factor``: A[perm] = L U, ``piv`` 0-based), by the leg's route."""
+    row = local_lu_row(lu.shape, b.shape, lu.dtype)
+    if row is None or b.dtype != lu.dtype:
+        if native is not None:
+            return native(lu, piv, b)
+        import jax.scipy.linalg as jsl
+        return jsl.lu_solve((lu, piv), b, trans=0)
+    return _native_tri(row, lu, b, _MODE_LU, piv=piv)
+
+
+def tri_solve_local(l, b, *, transpose=False, conjugate=False, native=None):
+    """Solve with the LOWER triangle of ``l``: ``L x = b`` (default), ``L^T x = b``
+    (``transpose``) or ``L^H x = b`` (``transpose`` and ``conjugate``), by the leg's route;
+    ``native(l, b)`` below it (default ``lax.linalg.triangular_solve`` with the same flags).
+    ``conjugate`` without ``transpose`` is not served on the route (GATE)."""
+    row = local_lu_row(l.shape, b.shape, l.dtype)
+    if row is None or b.dtype != l.dtype:
+        if native is not None:
+            return native(l, b)
+        bb, vec = _as_matrix_rhs(l, b)
+        x = jax.lax.linalg.triangular_solve(l, bb, left_side=True, lower=True,
+                                            transpose_a=transpose, conjugate_a=conjugate)
+        return x[..., 0] if vec else x
+    if conjugate and not transpose:
+        raise ValueError("GATE local_lu_tri_flags: conj(L) x = b (no transpose) has no routed form; "
+                         "want L, L^T or L^H")
+    if not transpose:
+        return _native_tri(row, l, b, _MODE_L)
+    return _native_tri(row, l, b, _MODE_LT, conj=conjugate and jnp.iscomplexobj(l))

@@ -21,8 +21,9 @@ single matrix is a stack of one: rank 0 solves it, the other ranks hold the
 synthetic padding, and the inverse exchange scatters rank 0's result, so every
 rank's tile comes from ONE solve.
 
-Memory.  A rank holds at most ``max_n^2`` matrix elements' worth of whole
-matrices per round (``max_n`` the leg row, :data:`distrib_la.resolve.ONE_DEVICE_MAX_N`,
+Memory.  A rank holds at most ``round_n^2`` matrix elements' worth of whole
+matrices per round (``round_n = min(max_n, ONE_DEVICE_ROUND_N row)``,
+:func:`distrib_la.resolve.one_device_round_n`; ``max_n`` the selection row, :data:`distrib_la.resolve.ONE_DEVICE_MAX_N`,
 measured at complex128): a stack whose ``ceil(B/P)`` matrices per rank exceed
 that runs in equal rounds (:func:`rounds_for`).  A shape rule, the same on every
 rank, so no size is exchanged.
@@ -38,7 +39,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._batch_reshard import (batch_reshard_call, reshard_program,
                                        reshard_rounds_call, validate_batch_reshard_operands)
-from distrib_la.resolve import ONE_DEVICE, mesh_key, mesh_platform, one_device_max_n
+from distrib_la.resolve import (ONE_DEVICE, mesh_key, mesh_platform, one_device_max_n,
+                                one_device_round_n)
 
 __all__ = ["distributed_eigh", "batched_distributed_eigh",
            "batched_distributed_solve_lu", "rounds_for", "held_per_rank",
@@ -114,7 +116,7 @@ def batched_distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
     nb, n = int(A.shape[0]), int(A.shape[-1])
     bound = _bound("eigh", mesh, n, max_n)
     if rounds is None:
-        rounds = rounds_for(nb, n, _ranks(mesh), bound)
+        rounds = rounds_for(nb, n, _ranks(mesh), one_device_round_n("eigh", mesh_platform(mesh), bound))
     return reshard_rounds_call("eigh", mesh, A, rounds=int(rounds))
 
 
@@ -151,7 +153,8 @@ def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None,
     nb, n, nrhs = int(A.shape[0]), int(A.shape[-1]), int(B.shape[-1])
     bound = _bound("solve_lu", mesh, n, max_n)
     if rounds is None:
-        rounds = rounds_for(nb, n, _ranks(mesh), bound, width=nrhs)
+        rounds = rounds_for(nb, n, _ranks(mesh),
+                            one_device_round_n("solve_lu", mesh_platform(mesh), bound), width=nrhs)
     rounds = max(1, min(int(rounds), nb))
     if rounds == 1:
         return batch_reshard_call("solve_lu", mesh, (A, B))

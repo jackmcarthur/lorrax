@@ -161,7 +161,7 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "stack (jaxlib loops zheevd per matrix), a matrix rocSOLVER leaves non-finite with "
              "info = 0 (its silent zheevd failure) is NaN in w and v; distrib_la.local_eigh."
              "BATCHED_EIGH_ROUTE holds the drivers and stacks.  Also the one-device LU solve "
-             "(lorrax_rocsolver_lu_solve: getrf + a triangular solve blocked so no rocBLAS operand "
+             "(lorrax_rocsolver_lu_solve / _tri_solve: getrf + triangular solves blocked so no rocBLAS operand "
              "spans 2^31 bytes; distrib_la.local_lu.LOCAL_LU_ROUTE, gate "
              "tests/test_rocsolver_lu_gate.py).  rocSOLVER is the process's mapped copy."),
     "scalapack": Family(
