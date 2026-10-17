@@ -484,6 +484,10 @@ def main():
     ap.add_argument("--sizes", type=int, nargs="*", default=[])
     ap.add_argument("--dtypes", nargs="+", default=["float64", "complex128"])
     ap.add_argument("--ops", nargs="+", default=["eigh", "lu", "chol"])
+    ap.add_argument("--skip", nargs="*", default=[],
+                    help="cases not to run, op:dtype:n with * wildcards (e.g. eigh:complex128:20480 "
+                         "eigh:*:30720) -- one process can then cover a grid minus the cases a "
+                         "baseline aborts on")
     ap.add_argument("--nrhs", nargs="+", default=["min", "64", "n"],
                     help="'min' = the mesh's q (SLATE/cuSOLVERMp need q | nrhs), an int, or 'n'")
     ap.add_argument("--steady-max", type=float, default=120.0)
@@ -525,6 +529,9 @@ def main():
         for dname in args.dtypes:
             for o in args.ops:
                 op = opname[o]
+                if any(all(pat in ("*", val) for pat, val in zip(sk.split(":"), (o, dname, str(n))))
+                       for sk in args.skip):
+                    continue
                 if op != "solve_lu":
                     emit(run_case(op, n, dname, mesh, args))
                     continue
