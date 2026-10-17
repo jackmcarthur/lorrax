@@ -26,6 +26,9 @@ import numpy as np
 
 
 # ---------------------------------------------------------------- symmetry model (4/mm'm')
+_SUBGROUP = None   # --subgroup: indices into the 16 ops of D4h (a subgroup; identity first)
+
+
 def d4h_ops():
     """16 integer 3x3 matrices (reduced coordinates of a tetragonal/cubic grid, n1 == n2),
     and the antiunitary flag of the magnetic group 4/mm'm' (m || z)."""
@@ -43,6 +46,8 @@ def d4h_ops():
     for r, a, anti in rots:
         ops.append((r, a, anti, False))
         ops.append((inv @ r, a, anti, True))             # times inversion
+    if _SUBGROUP is not None:
+        ops = [ops[i] for i in _SUBGROUP]
     return ops
 
 
@@ -201,6 +206,8 @@ def main():
     ap.add_argument("--reps", type=int, default=30)
     ap.add_argument("--live", type=int, default=1)
     ap.add_argument("--mode9", type=int, default=1)
+    ap.add_argument("--mode7", type=int, default=1)
+    ap.add_argument("--subgroup", default="", help="comma list of D4h op indices (a subgroup, 0 first)")
     ap.add_argument("--save", default="", help="npz path for the outputs")
     ap.add_argument("--json", default="")
     ap.add_argument("--compare", nargs=2, default=None)
@@ -216,13 +223,19 @@ def main():
                           max_rel_elem_floor=float(np.max(ew)), bitwise=bool(np.array_equal(x, y)))
         print(json.dumps(res)); return
     import jax
+    global _SUBGROUP
+    if args.subgroup:
+        _SUBGROUP = [int(v) for v in args.subgroup.split(",")]
     run7, run9, info = build(args)
     rec = dict(info)
-    rec["mode7"] = timeit(run7, args.reps)
+    if args.subgroup:
+        rec["subgroup"] = args.subgroup
+    if args.mode7:
+        rec["mode7"] = timeit(run7, args.reps)
     if run9 is not None:
         rec["mode9"] = timeit(run9, args.reps)
     if args.save:
-        o = {"mode7": np.asarray(run7())}
+        o = {"mode7": np.asarray(run7())} if args.mode7 else {}
         if run9 is not None:
             o["mode9"] = np.asarray(run9())
         np.savez(args.save, **o)
