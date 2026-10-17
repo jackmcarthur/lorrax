@@ -24,8 +24,12 @@ G4 on the 2-level TDA toy of test_prop_stability_cpu.py, where the truncated
 G5 on the TDGW fixture with its kernel x40: at 2 dt_max of the truncated step
    (which refuses there) the converged run passes the gate (probe growth <= 1
    + 2e-3, every probe solve converged), runs finite with dSigma counted from
-   the solves, and agrees with the truncated run at dt_max / 4 to 1e-2
-   relative; the converged and truncated runs at dt_max / 4 agree to 1e-6
+   the solves, and stays within 0.1 relative of the truncated run at
+   dt_max / 4 (h sigma = 1.33: accuracy, not stability, is what is left); at
+   dt_max its error is 8x smaller (order >= 3 above the truncated limit); at
+   dt_max / 4 both run and the converged one is the more accurate (h sigma =
+   0.17: the truncated step's node error is part of its error); reference:
+   the converged run at dt_max / 16 (node_tol 1e-12)
 R3 node_max_iter = 2 at the same step: the probe refuses (GATE
    td_magnus_stability, naming the unconverged solves); with the probe
    bypassed the run itself refuses (GATE td_node_solve) and writes no chunk
@@ -302,9 +306,14 @@ def test_converged_nodes_run_where_truncated_refuses(fixture_runs):
     assert c["dsigma"] == 2 * nd["n_eval"] + 1, c
     ref = _p(r["ref"])
     err = np.linalg.norm(_p(c) - ref) / np.linalg.norm(ref)
-    assert err <= 1e-2, err
-    small = np.linalg.norm(_p(r["conv_ref"]) - ref) / np.linalg.norm(ref)
-    assert small <= 1e-6, small
+    assert err <= 0.1, err                             # bounded: the same solution, h sigma 1.33
+    a = r["conv_at"]
+    assert "refused" not in a and a["finite"], a
+    err_at = np.linalg.norm(_p(a) - ref) / np.linalg.norm(ref)
+    assert err_at <= err / 8.0, (err, err_at)          # order >= 3 above the truncated limit
+    e_c = np.linalg.norm(_p(r["conv_q"]) - ref) / np.linalg.norm(ref)
+    e_t = np.linalg.norm(_p(r["trunc_q"]) - ref) / np.linalg.norm(ref)
+    assert e_c <= e_t and e_c <= 1e-4, (e_c, e_t)      # the truncated node error adds here
 
 
 def test_red_twin_starved_solve_refuses_by_name(fixture_runs):

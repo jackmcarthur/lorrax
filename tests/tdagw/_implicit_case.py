@@ -6,8 +6,10 @@
 The fixture's TDA kernel scaled by SCALE (the strong coupling of
 _stability_case.py).  Prints one JSON line: the truncated step's sigma limit
 dt_max; cfm4 with node_solver = anderson at 2 dt_max (where the truncated
-step refuses) through the gate, its receipt and counters; the truncated run
-at dt_max / 4 as the reference; the converged run at dt_max / 4; a converged
+step refuses) and at dt_max (refused by the truncated step's probe) through
+the gate, receipts and counters; the truncated run at dt_max / 4 as the
+reference replaced by the converged run at dt_max / 16; both schemes at
+dt_max / 4; a converged
 run with node_max_iter = 2 (the gate's probe refuses: its solves do not
 converge); the same with the probe bypassed (the run itself refuses,
 GATE td_node_solve, before the chunk is written: rows left in the file).
@@ -83,8 +85,10 @@ def main():
     out = dict(dt_max_as=dt_max,
                trunc_over=run(2.0 * dt_max, "trunc_over"),
                conv_over=run(2.0 * dt_max, "conv_over", conv),
-               ref=run(0.25 * dt_max, "ref"),
-               conv_ref=run(0.25 * dt_max, "conv_ref", conv),
+               conv_at=run(1.0 * dt_max, "conv_at", conv),
+               ref=run(dt_max / 16.0, "ref", dict(conv, node_tol=1e-12)),
+               trunc_q=run(0.25 * dt_max, "trunc_q"),
+               conv_q=run(0.25 * dt_max, "conv_q", conv),
                starved=run(2.0 * dt_max, "starved", dict(conv, node_max_iter=2)))
     tp.step_growth = lambda *a, **k: ((1.0, np.ones(1), dict(n_eval=0, n_eval_max=0, n_fail=0,
                                                              dsigma=0))

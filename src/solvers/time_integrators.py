@@ -686,8 +686,9 @@ def anderson_fixed_point(fmap: Callable, g0, *, tol, max_iter: int, memory: int,
     (real inner product Re<a, b>): a real combination of Hermitian iterates
     stays Hermitian.  The first step (no columns) is the plain fixed-point
     step.  Stops when every trial has ||f_k|| <= tol ||g_k|| (Frobenius norm
-    over all leaves), or after ``max_iter`` evaluations of ``fmap``; a
-    ``lax.while_loop`` with fixed-size column buffers, so it runs inside a jit.
+    over all leaves), or after ``max_iter`` evaluations of ``fmap`` (may be
+    traced); a ``lax.while_loop`` with fixed-size column buffers, so it runs
+    inside a jit.
     ``constrain`` (optional) is applied to the stacked (memory, ...) buffers
     (a sharding constraint).  ``milestones``: relative residuals whose first
     crossing is recorded (:class:`NodeSolve` ``reached``).
@@ -695,7 +696,7 @@ def anderson_fixed_point(fmap: Callable, g0, *, tol, max_iter: int, memory: int,
     Returns (fmap(g_k) at the stopping iterate, :class:`NodeSolve`).
     """
     m = int(memory)
-    if m < 1 or int(max_iter) < 1:
+    if m < 1 or (isinstance(max_iter, int) and max_iter < 1):
         raise ValueError(f"anderson_fixed_point: memory {m} and max_iter {max_iter} must be >= 1")
     pin = (lambda a: a) if constrain is None else constrain
     g0 = tuple(g0)

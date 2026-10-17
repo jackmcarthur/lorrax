@@ -517,7 +517,9 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
             if implicit:
                 x1, g, info = ti.ip_magnus_implicit_step(
                     ph["field"], ph["dsig_nodes"], inner, ph["free"], t, x, h, guess,
-                    nodes=nodes, tol=cfg.node_tol, max_iter=int(cfg.node_max_iter),
+                    nodes=nodes, tol=cfg.node_tol,
+                    # once a step has failed the run (or probe) is refused: one evaluation per step
+                    max_iter=jnp.where(c[3].n_fail > 0, 1, int(cfg.node_max_iter)),
                     memory=int(cfg.node_memory), constrain=ph["pin_stack"],
                     milestones=NODE_MILESTONES)
             else:
