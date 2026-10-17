@@ -169,9 +169,9 @@ magnet and a helicity drive break time reversal: conduction branches take
 $R_+=B+D$, valence branches $R_-=B-D$; modes the fit marks invalid enter as
 the static $W^c(0)$ term); $\Sigma^c_{ij}(\omega)$ by
 the Σ τ sweep with $G=G_{\rm eq}+\delta G$ (symmetrized GKBA for the
-coherences, §1.1); the static operator at the instantaneous energies,
-$\Sigma_{ij}=\tfrac12[\Sigma_{ij}(e_i)+\Sigma_{ij}(e_j)]^{\rm h}$
-([on-shell Σ](sigma-on-shell.md)), rotated back with $U$.
+coherences, §1.1); the operator at the instantaneous energies, Eq. (8) of §1.5, kept complex
+(no Hermitian projection; [on-shell Σ](sigma-on-shell.md) for the
+evaluation), rotated back with $U$.
 
 **Shared-pole member** (designed). $W(z)=\sum_jb_j(q)R_j/(z-\Omega_j)$ with
 poles shared per $q$; Eq. (6) at the bank's supports, then the pencil and
@@ -183,6 +183,108 @@ constructor of `gw.shared_pole_*`. Measured on 516 the constructor alone is
 carries no $q\to0$ head. The head change is $q\cdot\delta S\cdot q$ from the
 window's dipoles and populations (the `qsgw_head` route), plus a Drude term
 once carriers exist (§4).
+
+### 1.5 The on-shell operator keeps its damping {#damping}
+
+The dynamical members use the on-shell average without a Hermitian
+projection,
+
+$$
+\tilde\Sigma_{ij}=\tfrac12\big[\Sigma_{ij}(e_i)+\Sigma_{ij}(e_j)\big]
+=\tilde\Sigma^{\rm h}_{ij}-\tfrac i2\tilde\Gamma_{ij},\qquad
+\tilde\Gamma_{ij}=\tfrac12\big[\Gamma_{ij}(e_i)+\Gamma_{ij}(e_j)\big],\quad
+\Gamma(\omega)=i\big[\Sigma^R(\omega)-\Sigma^A(\omega)\big], \tag{8}
+$$
+
+a limit of the two-time collision integral with quasiparticle propagators
+(owner's prescription, 2026-10-17). The equation of motion becomes
+$i\dot\rho=H\rho-\rho H^\dagger$: the Hermitian part enters the commutator and
+$\tilde\Gamma$ enters as $-\tfrac12\{\tilde\Gamma,\rho\}$, an out-scattering
+rate. $\Gamma(\omega)$ is positive semidefinite, so the diagonal
+$\tilde\Gamma_{ii}=\Gamma_{ii}(e_i)\ge0$; the off-diagonal average over two
+energies carries no such guarantee. Open points, to settle before the member
+is wired:
+
+* **Difference form.** $H$ carries $\Delta\tilde\Sigma=\tilde\Sigma[\rho]-\tilde\Sigma[\rho^{\rm eq}]$.
+  The equilibrium widths sit in the real $\varepsilon^{\rm QP}$ and drop out,
+  so the rate is the carrier-induced change $\Delta\tilde\Gamma$. It is not
+  sign-definite: Pauli blocking of a decay channel lowers a width, and a
+  negative eigenvalue of $\Delta\tilde\Gamma$ grows. Using the full
+  $\tilde\Gamma[\rho]$ instead makes $\rho^{\rm eq}$ decay unless the
+  in-scattering term is present.
+* **Particle number.** Out-scattering alone changes $\mathrm{Tr}\,\rho_k$ at the
+  rate $-\mathrm{Tr}\,\Delta\tilde\Gamma_k\rho_k$. The in-scattering partner of
+  the same collision integral ($\Sigma^<G^A$) restores it and, with the full
+  widths, keeps $\rho^{\rm eq}$ a fixed point.
+* **Linear response.** The $O(E)$ dynamical correction of §2 acquires an
+  anti-Hermitian part (damping of the coherences). The static-$W$ limit is
+  unchanged: $\Sigma$ is static and Hermitian there.
+* **GN-PPM.** With real pole energies, $\mathrm{Im}\,\Sigma(\omega)$ is a sum of
+  broadened $\delta$ functions at $e_n\pm\Omega$; on a 30×30 mesh it depends on
+  the broadening. The shared-pole member gives a smoother width.
+* **Integrator.** CFM4 takes the non-Hermitian exponent as is,
+  $\rho\mapsto e^{-i\Omega}\rho\,e^{i\Omega^\dagger}$ with
+  $\Omega=\tau\sum_la_lH_l$: the left and right factors commute as
+  superoperators, so the order is kept. `eigh` no longer applies; a batched
+  `expm` (scaling and squaring) on $n_A\times n_A$ blocks is cheap. The
+  $\Gamma$ remainder is unchanged.
+* **Code.** `window_sigma_c` (§9 item 5) returns
+  $U[\tfrac12(\cdot+\cdot)]^{\rm h}U^\dagger$; it should return
+  $U\tilde\Sigma U^\dagger$ and leave the split to the propagator.
+
+### 1.6 The active space: band window or disentangled subspace (proposed) {#active-space}
+
+$A$ is a band-index range. Where a band of other character enters $A$'s
+energy range in part of the zone, the window holds that character at those $k$
+only, and one Bloch character moves between $G_{\rm frozen}$ and
+$G_{\rm active}$ across the zone; $\delta\chi_0$ and the $\Delta\Sigma$ basis are
+then not smooth in $k$. The alternative is a disentangled subspace
+(Souza–Marzari–Vanderbilt) of an outer window $O\supset A$ with a frozen
+inner window $I$:
+
+$$
+\tilde w_{\alpha k}=\sum_{n\in O}\psi_{nk}V_{k,n\alpha},\qquad
+V_k^\dagger V_k=\mathbb 1_{N_w},\qquad
+\{\psi_{nk}\}_{n\in I}\subset\mathrm{span}\{\tilde w_{\alpha k}\}, \tag{9}
+$$
+
+with $N_w=56$ for CrI3 (20 Cr-3d + 36 I-5p spin orbitals, the present window
+size).
+
+Unchanged: the products $\tilde w_\alpha\tilde w_\beta^*$ lie in the span of
+the $O\times O$ band products, so a $\zeta$ fitted over $O$ represents them;
+the centroid values rotate as $\psi(r_\mu)V$; $W$ in $\mu$ space is untouched;
+every contraction of §1.2–1.4 takes any orthonormal basis.
+
+Changed:
+
+* $P_k=V_kV_k^\dagger$ commutes with $H^{\rm QP}$ only inside $I$. The active
+  Hamiltonian $V^\dagger\mathrm{diag}(\varepsilon_O)V$ is not diagonal, and its
+  eigenvalues differ from the band energies outside $I$; the field-free $P$–$Q$
+  block is dropped, at the level at which the field coupling to frozen bands
+  is dropped now.
+* $G_{\rm frozen}=G_{\rm eq}-PG_{\rm eq}P$ keeps the cross terms
+  $PG_{\rm eq}Q+QG_{\rm eq}P$, frozen at equilibrium; they vanish for the bands
+  inside $I$. $G_{\rm eq}$ is still composed from every band (Eq. 5), and
+  $\delta G=G_S[\rho(t)]-G_S[\rho^{\rm eq}_S]$ with
+  $\rho^{\rm eq}_S=V^\dagger fV$ keeps $\Delta\Sigma[\rho^{\rm eq}]=0$ exactly.
+* Inputs over $O$. $V_k$ on the TD grid in the gauge of the TD states
+  (htransform's, not the DFT states of a fine NSCF such as run 517). By
+  projection only: the leading $N_w$ eigenvectors of the Löwdin projector
+  $\langle\psi_n|P_{pd}|\psi_m\rangle_{n,m\in O}$ with $I$ enforced, a band
+  operator that `bandstructure.orbital.band_operators` forms on the parents
+  (channel table) and `interpolate_band_operator` carries onto htransform
+  states. The SMV minimization needs the overlaps $M_{mn}(k,b)$ as well. The
+  centroid values carry no inner products, so $V$ cannot come from them.
+  $O$ must lie inside htransform's fitted band range; $\zeta$ and the
+  downfolded $W$ over $O$ (DFOLD's `w88_144` covers $A$ only); QP energies
+  over $O$. Dipoles: $v$ over $O$ rotated, $r_{ij}$ re-derived in the
+  eigenbasis of the active Hamiltonian with the near-degeneracy mask.
+* Validation: BSE ≡ TD in linear response (§2) and the §6.1 identity, repeated
+  in the $S$ basis.
+
+The first step is the measurement: per $k$, the principal angles between $A$
+and the projection-only Cr-3d + I-5p subspace (run DEV/835).
 
 ## 2. The static limit is the present model {#static-limit}
 
@@ -218,9 +320,10 @@ is the term their split drops.
 
 ### 3.1 Kept
 
-* $\mathrm{Tr}\,\rho_k$ per $k$, Hermiticity of $\Delta\Sigma$ (measured
-  $\le1.2\times10^{-17}$), unitarity of the commutator flow (the spectrum of $\rho$
-  at $\Gamma=0$);
+* for the static and frozen members: $\mathrm{Tr}\,\rho_k$ per $k$, Hermiticity
+  of $\Delta\Sigma$ (measured $\le1.2\times10^{-17}$), unitarity of the
+  commutator flow (the spectrum of $\rho$ at $\Gamma=0$). The dynamical members
+  keep the Hermiticity of $\rho$ but not $\mathrm{Tr}\,\rho_k$ (§1.5);
 * $\rho=\rho^{\rm eq}$ is a fixed point, $\Delta\Sigma=0$ exactly;
 * covariance under a rotation of the window basis: the populations are those
   of the instantaneous basis, not of the band gauge (the red twin that reads
@@ -236,9 +339,10 @@ is the term their split drops.
   two-time $G$, and Eq. (2) is not its stationarity condition), so the energy
   is not conserved exactly. The frozen-W member is Φ-derivable from
   $\tfrac12\mathrm{Tr}\,\delta\rho K\delta\rho$ and conserves its energy.
-* **Damping.** The Hermitian on-shell operator drops $\mathrm{Im}\,\Sigma$:
-  no quasiparticle lifetimes, carrier relaxation or impact ionization; these
-  need $\Gamma$ or a collision term.
+* **In-scattering and equilibrium widths.** The on-shell operator keeps
+  $\mathrm{Im}\,\Sigma$ as out-scattering (§1.5). Without the in-scattering
+  partner $\mathrm{Tr}\,\rho$ is not conserved and no carrier distribution
+  relaxes; the difference form carries only the change of the widths.
 * **Coherence-driven screening** ($\delta W/\delta G$ at the drive frequency),
   by construction (§1.1).
 
@@ -473,7 +577,8 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    head and the on-shell frequency list. It returns $\Sigma_{ij}(e_i)$,
    $\Sigma_{ij}(e_j)$, the static operator
    $U[\tfrac12(\cdot+\cdot)]^{\rm h}U^\dagger$ and, on request,
-   $\Sigma(\omega)$. Limits: the projection is the band prefix $[0,b_{\rm hi})$,
+   $\Sigma(\omega)$. Under §1.5 the operator is to be returned without the
+   Hermitian projection, $U\tilde\Sigma U^\dagger$ (to do). Limits: the projection is the band prefix $[0,b_{\rm hi})$,
    not the window alone, because the invalid-mode static term sums the
    occupied bands (window decode is item 6); the head is the run's
    `HeadSigmaDiag` at the instantaneous $e$, $f$ (frozen $W_h$, §1.4); only
