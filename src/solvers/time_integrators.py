@@ -618,8 +618,8 @@ class FastPart(NamedTuple):
     reference : m -> -i[m, y_eq], the generator's first-order action on the
         stationary state (the linearization of the flow at y_eq; it builds
         the Newton matrix only, never the step).
-    newton : (len(nodes) n, len(nodes) n) complex, (1 - J)^{-1} of the
-        linearized node map J of the coefficients (:func:`fast_jacobian`).
+    newton : (len(nodes) n, len(nodes) n) real (float64), (1 - J)^{-1} of the
+        linearized node map J of the real coefficients (:func:`fast_jacobian`).
     tol : relative tolerance of the coefficient fixed point.
     max_iter : node-map evaluations of the closing solve (>= 1).
     """

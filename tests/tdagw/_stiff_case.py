@@ -50,10 +50,10 @@ def stiff_window():
 
 
 def deck(outdir, header, kernel, nb, n_val, *, dt, n_corr=2, stiff=0, tol=1e-9, it=6,
-         tf=6000.0, method="cfm4", e0=2e8, resume=""):
+         tf=6000.0, method="cfm4", e0=2e8, resume="", predictor="cubic"):
     trial = vs.trial_for(e0, 2.2, 2500.0, 700.0, "x")
     lorrax = {"method": method, "n_corr": int(n_corr), "intraband": False, "trials": [trial],
-              "kernel_file": str(kernel), "model": "tdgw_kernel", "dt": dt}
+              "kernel_file": str(kernel), "model": "tdgw_kernel", "dt": dt, "predictor": predictor}
     if stiff:
         lorrax.update(stiff_modes=int(stiff), stiff_tol=float(tol), stiff_iter=int(it))
     return {"control": {"calc_type": "COHSEX",
@@ -142,6 +142,20 @@ def main():
         bitwise=bool(np.array_equal(z["p"], pl["p"]) and np.array_equal(z["n_c"], pl["n_c"])),
         max_abs=float(np.max(np.abs(z["p"] - pl["p"]))), max_p=float(np.max(np.abs(pl["p"]))),
         fast=z["fast"])
+    # the same with the linear predictor (the last step's two nodes: a two-entry slow and coefficient
+    # history) and one correction; gate bypassed on both sides (the plain scheme's probe refuses here)
+    real_lim = tp.magnus_dt_limit
+    tp.magnus_dt_limit = lambda cfg, sigma: (np.inf, 0.0)
+    tp.step_growth = lambda *a, **k: (1.0, np.ones(1), None) if k.get("counters") else (1.0, np.ones(1))
+    tp.stiff_basis = zero_basis
+    z1 = run("zero_lin1", dt=25.0, stiff=4, n_corr=1, predictor="linear")
+    tp.stiff_basis = real_basis
+    p1 = run("plain_lin1", dt=25.0, n_corr=1, predictor="linear")
+    tp.magnus_dt_limit, tp.step_growth = real_lim, real_growth
+    out["zero_vs_plain_linear_1"] = dict(
+        max_abs=float(np.max(np.abs(z1["p"] - p1["p"]))), max_p=float(np.max(np.abs(p1["p"]))),
+        max_abs_nc=float(np.max(np.abs(z1["n_c"] - p1["n_c"]))), max_nc=float(np.max(np.abs(p1["n_c"]))),
+        fast=z1["fast"])
     # red twin: an unreachable closing tolerance with the probe bypassed -> td_stiff_solve at a chunk end
     tp.step_growth = lambda *a, **k: (1.0, np.ones(1), None) if k.get("counters") else (1.0, np.ones(1))
     out["unreachable_tol"] = run("twin_tol", dt=50.0, stiff=4, tol=1e-300, it=2)

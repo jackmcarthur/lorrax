@@ -176,6 +176,13 @@ def test_zero_basis_through_stages(stages_case):
     assert z["max_abs"] <= 1e-12 * z["max_p"], z
 
 
+def test_zero_basis_with_the_linear_predictor(stages_case):
+    """G5b: the same with the linear predictor (two-entry histories) and one correction."""
+    z = stages_case["zero_vs_plain_linear_1"]
+    assert z["max_abs"] <= 1e-12 * z["max_p"] and z["max_abs_nc"] <= 1e-12 * z["max_nc"], z
+    assert z["fast"]["unconverged"] == 0, z
+
+
 def test_red_twin_unreachable_tolerance_refuses(stages_case):
     """R1: the chunk-end refusal names the closing solve."""
     r = stages_case["unreachable_tol"]
