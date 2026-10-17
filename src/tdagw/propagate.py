@@ -129,8 +129,11 @@ class PropagatorConfig(NamedTuple):
     chunk : samples per jitted call.
     remainder : the non-commutator flow (Gamma or intraband) is nonzero; a
         purely Hamiltonian run skips it (Magnus steps exactly unitary).
-    predictor : cfm4's dSigma predictor, "cubic" (the last two steps' four
-        node values) or "linear" (the last step's two).
+    predictor : cfm4's dSigma predictor, a name of ti.CFM4_PREDICTORS: "cubic"
+        (the last two steps' four node values, Lagrange), "linear" (the last
+        step's two), or a stability-optimized set (more steps, fixed weights).
+    corr_relax : relaxations theta of the last len(corr_relax) corrections,
+        g <- g + theta (F(g) - g) (empty: 1, the plain correction).
     frame : magnus2's frame, "interaction" (Delta rho in the interaction
         picture of the band energies, ti.ip_magnus_step) or "whole_rho" (the
         whole rho, ti.magnus_midpoint_step: exact quadratic invariants);
@@ -164,6 +167,7 @@ class PropagatorConfig(NamedTuple):
     chunk: int
     remainder: bool
     predictor: str = "cubic"
+    corr_relax: tuple = ()
     frame: str = "interaction"
     node_solver: str = "truncated"
     node_tol: float = 1e-10
@@ -489,9 +493,15 @@ def _magnus_parts(cfg: PropagatorConfig):
     nodes = ti.CFM4_NODES if cfm4 else ti.MIDPOINT_NODES
     flow = ti.ip_cf4_flow if cfm4 else ti.ip_midpoint_flow
     fractions = None if not cfg.remainder else (ti.TRIPLE_JUMP if cfm4 else (1.0,))
-    hist = ((ti.CFM4_HISTORY if cfg.predictor == "cubic" else ti.CFM4_HISTORY[2:])
-            if cfm4 else ti.MIDPOINT_HISTORY)
+    hist = ti.predictor_weights(cfg.predictor)[0] if cfm4 else ti.MIDPOINT_HISTORY
     return nodes, flow, fractions, hist, -(-len(hist) // len(nodes))
+
+
+def _predictor_matrix(cfg: PropagatorConfig) -> np.ndarray:
+    """W (nodes, history) of cfg's predictor: g_new = W g_hist."""
+    if cfg.method == "cfm4":
+        return ti.predictor_weights(cfg.predictor)[1]
+    return ti.extrapolation_weights(ti.MIDPOINT_HISTORY, list(ti.MIDPOINT_NODES))
 
 
 def _fixed_parts(cfg: PropagatorConfig, ph):
@@ -538,7 +548,8 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
         return step, dense, (lambda c: c[0])
     if cfg.method in ("magnus2", "cfm4"):
         nodes, flow, fractions, hist_offsets, n_boot = _magnus_parts(cfg)
-        w = jnp.asarray(ti.extrapolation_weights(hist_offsets, list(nodes)))
+        w = jnp.asarray(_predictor_matrix(cfg))
+        relax = tuple(cfg.corr_relax) or None
 
         def inner(gen, t, x, tau):
             core = lambda a, y, s: flow(gen, ph["free"], ph["conj_dev"], a, y, s)
@@ -581,7 +592,7 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
             else:
                 n_c = jnp.where(k < n_boot, cfg.n_corr + BOOTSTRAP_EXTRA, cfg.n_corr)
                 x1, g = ti.ip_magnus_step(ph["field"], ph["dsig_dev"], inner, ph["free"],
-                                          t, x, h, guess, nodes=nodes, n_corr=n_c)
+                                          t, x, h, guess, nodes=nodes, n_corr=n_c, relax=relax)
             hist = ph["free"](jnp.concatenate([hist[len(nodes):], jnp.stack(g)]), h)
             out = (pin(x1), hist, k + 1)
             if implicit:
@@ -698,7 +709,8 @@ def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:
     if converged_nodes(cfg):
         return np.inf, np.inf
     nodes, _, _, hist, _ = _magnus_parts(cfg)
-    y_lim = ti.magnus_stability_limit(nodes, hist, int(cfg.n_corr))
+    y_lim = ti.magnus_stability_limit(nodes, hist, int(cfg.n_corr), weights=_predictor_matrix(cfg),
+                                      relax=tuple(cfg.corr_relax) or None)
     return (np.inf if sigma <= 0.0 else y_lim / (STABILITY_MARGIN * sigma)), y_lim
 
 

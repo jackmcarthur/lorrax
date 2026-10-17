@@ -51,6 +51,7 @@ __all__ = [
     "hermite_dense",
     "extrapolation_weights", "lagrange_weights",
     "CFM4_NODES", "CFM4_WEIGHTS", "CFM4_HISTORY", "MIDPOINT_NODES", "MIDPOINT_HISTORY",
+    "CFM4_PREDICTORS", "cfm4_history", "predictor_weights",
     "CF4_QUADRATURE", "TRIPLE_JUMP",
     "ip_cf4_flow", "ip_midpoint_flow", "ip_magnus_step", "frozen_generator",
     "ANDERSON_REG", "NodeSolve", "anderson_fixed_point", "ip_magnus_implicit_step",
@@ -501,6 +502,63 @@ CFM4_HISTORY = (-2.0 + 0.5 - np.sqrt(3.0) / 6.0, -2.0 + 0.5 + np.sqrt(3.0) / 6.0
                 -1.0 + 0.5 - np.sqrt(3.0) / 6.0, -1.0 + 0.5 + np.sqrt(3.0) / 6.0)
 
 
+def cfm4_history(k: int) -> tuple:
+    """Offsets (units of h) of the last k steps' two Gauss nodes, oldest first (k = 2: CFM4_HISTORY)."""
+    return tuple(float(-j + c) for j in range(int(k), 0, -1)
+                 for c in (0.5 - np.sqrt(3.0) / 6.0, 0.5 + np.sqrt(3.0) / 6.0))
+
+
+#: Named CFM4 predictors: name -> (history offsets, weights).  weights None is
+#: the Lagrange extrapolation through the offsets (:func:`extrapolation_weights`);
+#: otherwise a (2, len(offsets)) matrix W, g_new = W g_hist.  A predictor exact
+#: for polynomials of degree d in time gives node values with error O(h^(d+1));
+#: a correction (relaxation 1) multiplies the node error by O(h), so the step is
+#: of order 4 when d + n_corr >= 3 (the scheme's own node values, not the exact
+#: solution, are what the predictor extrapolates: the Gauss stage values differ
+#: from the solution at O(h^3) by a node-dependent amount, so a predictor that is
+#: also exact on node-wise constants reaches the collocation's error constant
+#: with one fewer correction).
+#: The stability-optimized sets keep that order with the corrections they are
+#: made for and maximize the imaginary-axis interval of the linearized step
+#: (:func:`magnus_stability_limit`, growth 1e-6): their free weights (beyond
+#: exactness) were chosen by a global search on that interval, subject to a
+#: principal-root error on the axis no larger than the cubic predictor's with
+#: two corrections.  Limits y = h*sigma, Lagrange cubic for comparison:
+#: cubic 0.117 / 0.730 / 1.144 (n_corr 1 / 2 / 3);
+#: "stab1": the last 4 steps' 8 node values, cubic-exact, for n_corr = 1
+#:     (2 dSigma per step): 0.645 / 0.654 / 0.299;
+#: "stab2": the last 3 steps' 6 node values, quadratic-exact, for n_corr = 2:
+#:     0.124 / 1.296 / 1.284; principal-root error on the axis 0.6 / 0.3 / 0.15 of
+#:     the cubic predictor's (n_corr 2) at h*|lambda| = 0.1 / 0.2 / 0.3.
+CFM4_PREDICTORS = {
+    "cubic": (CFM4_HISTORY, None),
+    "linear": (CFM4_HISTORY[2:], None),
+    "stab1": (cfm4_history(4), (
+          (0.8696625146383881, -1.8180039785648867, -0.489142953900717, 0.8105578679126123, 3.778239366525471, -3.411698169863966, -1.7113648379399806, 2.971750191193079),
+          (-1.2651093940010085, 1.1060777930350867, 2.396820845612762, 0.02685657294663354, -4.176749872999643, 3.010862442369981, -4.237148541982997, 4.138390155019184))),
+    "stab2": (cfm4_history(3), (
+          (0.04331356530980033, -0.14217509313969748, -0.24803277657651113, 2.354542030224016, -3.8334462720031075, 2.8257985461854997),
+          (-0.9140148635051756, 3.972748068807781, -4.2091949003631814, 3.843702781727498, -6.571552761221761, 4.878311674554839))),
+}
+
+
+def predictor_weights(name: str):
+    """(history offsets, W (2, len(offsets))) of the named CFM4 predictor (:data:`CFM4_PREDICTORS`)."""
+    offs, w = CFM4_PREDICTORS[name]
+    if w is None:
+        w = extrapolation_weights(offs, list(CFM4_NODES))
+    return tuple(offs), np.asarray(w, float)
+
+
+def _relaxations(relax, n_corr) -> tuple:
+    """Per-sweep relaxation of n_corr corrections: relax (the last len(relax) sweeps), the rest 1."""
+    rl = () if relax is None else tuple(float(t) for t in relax)
+    n = int(n_corr)
+    if len(rl) > n:
+        raise ValueError(f"relax {rl} has more entries than n_corr = {n}")
+    return (1.0,) * (n - len(rl)) + rl
+
+
 def frozen_generator(field: Callable, free: Callable, t, h, nodes, values) -> Callable:
     """generator(t') = A(t') + B_frozen(t') with B frozen as a polynomial in time.
 
@@ -593,7 +651,7 @@ def magnus_midpoint_step(explicit: Callable, state_part: Callable,
 
 
 def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
-                   free: Callable, t, x, h, guess, *, nodes, n_corr):
+                   free: Callable, t, x, h, guess, *, nodes, n_corr, relax=None):
     """One predictor–corrector Magnus step on the deviation x = y - y_eq.
 
     B is frozen as the polynomial through its values at the ``nodes``
@@ -625,6 +683,18 @@ def ip_magnus_step(field: Callable, state_part: Callable, inner: Callable,
         return tuple(free(state_part(t + c * h, inner(gen, t, x, c * h)), -c * h)
                      for c in nodes)
 
+    if relax:
+        # g <- g + theta (F(g) - g) on the last len(relax) sweeps (theta 1 before them: the
+        # bootstrap's extra sweeps); n_corr may be traced
+        th = jnp.asarray(tuple(float(v) for v in relax), jnp.float64)
+        first = n_corr - len(relax)
+        plain = corr
+
+        def corr(i, g):
+            f = plain(i, g)
+            j = i - first
+            tj = jnp.where(j >= 0, th[jnp.clip(j, 0, len(relax) - 1)], 1.0)
+            return tuple(a + tj * (b - a) for a, b in zip(g, f))
     g = jax.lax.fori_loop(0, n_corr, corr, tuple(guess))
     return inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g
 
@@ -827,7 +897,7 @@ def _node_quadrature(nodes):
     return a, b
 
 
-def magnus_amplification(nodes, history, n_corr, z) -> np.ndarray:
+def magnus_amplification(nodes, history, n_corr, z, *, weights=None, relax=None) -> np.ndarray:
     """The linearized predictor–corrector Magnus step on u' = λu, z = hλ.
 
     For a coupling B linear in the deviation (linear response), every
@@ -845,11 +915,14 @@ def magnus_amplification(nodes, history, n_corr, z) -> np.ndarray:
     converged step (:func:`ip_magnus_implicit_step`): G = (1 - zA)^{-1} z u_n 1,
     the collocation itself, u_{n+1} = R(z) u_n with R the (2,2) Padé
     approximant of e^z for the Gauss nodes (|R(iy)| = 1 for every real y);
-    the predictor drops out.  Returns the (1 + len(history))-square matrix
-    of that map.
+    the predictor drops out.  ``weights`` (m, len(history)) replaces the Lagrange
+    W (a named predictor's, :func:`predictor_weights`); ``relax`` the relaxations
+    theta of the last len(relax) corrections, G <- G + theta (z u_n 1 + z A G - G).
+    Returns the (1 + len(history))-square matrix of that map.
     """
     a, b = _node_quadrature(nodes)
-    w = extrapolation_weights(history, list(nodes))
+    w = extrapolation_weights(history, list(nodes)) if weights is None else np.asarray(weights, float)
+    th = () if n_corr is None else _relaxations(relax, n_corr)
     m, nh = w.shape
     out = np.zeros((1 + nh, 1 + nh), complex)
     for col in range(1 + nh):
@@ -859,14 +932,14 @@ def magnus_amplification(nodes, history, n_corr, z) -> np.ndarray:
         g = w @ hist
         if n_corr is None:
             g = np.linalg.solve(np.eye(m) - z * a, z * u * np.ones(m))
-        for _ in range(0 if n_corr is None else int(n_corr)):
-            g = z * u * np.ones(m) + z * (a @ g)
+        for t_k in th:
+            g = (1.0 - t_k) * g + t_k * (z * u * np.ones(m) + z * (a @ g))
         out[:, col] = np.concatenate([[u + b @ g], np.concatenate([hist, g])[-nh:]])
     return out
 
 
 def magnus_stability_limit(nodes, history, n_corr, *, growth: float = 1e-6,
-                           y_cap: float = 8.0, dy: float = 1e-3) -> float:
+                           y_cap: float = 8.0, dy: float = 1e-3, weights=None, relax=None) -> float:
     """Largest y with spectral radius of magnus_amplification(i y') <= 1 + growth for all y' <= y.
 
     The stability interval of the predictor–corrector step on the imaginary
@@ -882,18 +955,19 @@ def magnus_stability_limit(nodes, history, n_corr, *, growth: float = 1e-6,
     the imaginary axis at some truncation orders, as explicit RK of order 1
     and 2 are.  ``tests/tdagw/test_prop_stability_cpu.py`` checks the
     recurrence against the growth of the real step.  ``n_corr=None`` (the
-    converged nodes) has no limit on the axis: ``y_cap``.
+    converged nodes) has no limit on the axis: ``y_cap``.  ``weights``, ``relax``:
+    as :func:`magnus_amplification` (the named predictors of :data:`CFM4_PREDICTORS`).
     """
     for y in np.arange(dy, y_cap + 0.5 * dy, dy):
-        if magnus_growth(nodes, history, n_corr, y) > 1.0 + growth:
+        if magnus_growth(nodes, history, n_corr, y, weights=weights, relax=relax) > 1.0 + growth:
             return float(y - dy)
     return float(y_cap)
 
 
-def magnus_growth(nodes, history, n_corr, y: float) -> float:
+def magnus_growth(nodes, history, n_corr, y: float, *, weights=None, relax=None) -> float:
     """Growth per step of the recurrence at z = i y: the spectral radius of magnus_amplification."""
     return float(np.max(np.abs(np.linalg.eigvals(
-        magnus_amplification(nodes, history, n_corr, 1j * float(y))))))
+        magnus_amplification(nodes, history, n_corr, 1j * float(y), weights=weights, relax=relax)))))
 
 
 # ---------------------------------------------------------------------------

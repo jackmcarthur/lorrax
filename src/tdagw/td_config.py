@@ -54,6 +54,7 @@ TD_DEFAULTS = {
     "lorrax.dt": None,
     "lorrax.n_corr": 2,
     "lorrax.predictor": "cubic",
+    "lorrax.corr_relax": [],
     "lorrax.node_solver": "truncated",
     "lorrax.node_tol": 1e-10,
     "lorrax.node_max_iter": 40,
@@ -229,11 +230,25 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
         raise _gate("td_n_corr", vals["lorrax.n_corr"], ">= 1 (with no correction the node "
                     "history holds only predicted values and the step does not converge: "
                     "order 0)", "set [lorrax] n_corr >= 1 (2 is the default)")
-    if vals["lorrax.predictor"] not in ("cubic", "linear") or (
-            vals["lorrax.predictor"] == "linear" and vals["lorrax.method"] != "cfm4"):
+    from solvers.time_integrators import CFM4_PREDICTORS
+    if vals["lorrax.predictor"] not in CFM4_PREDICTORS or (
+            vals["lorrax.predictor"] != "cubic" and vals["lorrax.method"] != "cfm4"):
         raise _gate("td_predictor", f"predictor = {vals['lorrax.predictor']!r} with "
                     f"method {vals['lorrax.method']!r}",
-                    "cubic | linear (linear: cfm4 only)", "set [lorrax] predictor")
+                    " | ".join(CFM4_PREDICTORS) + " (all but cubic: cfm4 only)",
+                    "set [lorrax] predictor")
+    rl = vals["lorrax.corr_relax"]
+    if (not isinstance(rl, (list, tuple))
+            or any(isinstance(t, bool) or not isinstance(t, (int, float)) or not 0.0 < float(t) <= 2.0
+                   for t in rl)
+            or len(rl) > int(vals["lorrax.n_corr"])
+            or (len(rl) and (vals["lorrax.method"] != "cfm4"
+                             or vals["lorrax.node_solver"] != "truncated"))):
+        raise _gate("td_corr_relax", f"corr_relax = {rl!r} with n_corr = {vals['lorrax.n_corr']}, "
+                    f"method {vals['lorrax.method']!r}, node_solver {vals['lorrax.node_solver']!r}",
+                    "a list of at most n_corr numbers in (0, 2], the relaxations of the last "
+                    "corrections (cfm4, node_solver = truncated)", "set [lorrax] corr_relax")
+    vals["lorrax.corr_relax"] = [float(t) for t in rl]
     from tdagw.propagate import NODE_SOLVERS
     solver = vals["lorrax.node_solver"]
     if solver not in NODE_SOLVERS or (solver != "truncated" and vals["lorrax.method"] != "cfm4"):

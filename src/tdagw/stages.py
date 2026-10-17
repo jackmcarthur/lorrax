@@ -302,6 +302,8 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             "control.files.load_header_from"]
     if v["lorrax.method"] == "dp54":
         keys.append("control.timesteps.tf")
+    if v.get("lorrax.corr_relax"):                   # relaxed corrections (absent: plain)
+        keys.append("lorrax.corr_relax")
     if v["lorrax.node_solver"] != "truncated":      # converged nodes: the solve's settings
         keys += ["lorrax.node_solver", "lorrax.node_tol", "lorrax.node_memory",
                  "lorrax.node_recycle", "lorrax.node_frame", "lorrax.node_shift_ev"]
@@ -462,7 +464,8 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
                  f"by h*sigma/(2 sqrt 3) = {receipt['y'] / (2.0 * np.sqrt(3.0)):.3g} per sweep")
     elif cfg.frame != "whole_rho":
         limit = (f"limit {y_lim:.3g} ({cfg.method}, {cfg.predictor} predictor, n_corr "
-                 f"{cfg.n_corr}) -> dt <= {receipt['dt_max_as']:.4g} as")
+                 f"{cfg.n_corr}" + (f", relaxations {list(cfg.corr_relax)}" if cfg.corr_relax else "")
+                 + f") -> dt <= {receipt['dt_max_as']:.4g} as")
     else:
         limit = "whole_rho frame (no static limit)"
     say(f"  stability       : sigma = {receipt['sigma_ev']:.4g} eV (spectral radius of the "
@@ -548,7 +551,8 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
         tf=v["control.timesteps.tf"], dt_measure=v["control.timesteps.dt_measure"],
         dt=float(v["control.timesteps.dt_measure"] if auto or not v["lorrax.dt"]
                  else v["lorrax.dt"]),
-        n_corr=int(v["lorrax.n_corr"]), predictor=v["lorrax.predictor"], frame=magnus_frame(v),
+        n_corr=int(v["lorrax.n_corr"]), predictor=v["lorrax.predictor"],
+        corr_relax=tuple(float(t) for t in v["lorrax.corr_relax"]), frame=magnus_frame(v),
         node_solver=v["lorrax.node_solver"], node_tol=float(v["lorrax.node_tol"]),
         node_max_iter=int(v["lorrax.node_max_iter"]), node_memory=int(v["lorrax.node_memory"]),
         node_recycle=bool(v["lorrax.node_recycle"]), node_frame=v["lorrax.node_frame"],
@@ -617,7 +621,10 @@ def describe(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, runtime) ->
             + ", at most "
             f"{v['lorrax.node_max_iter']} node-map evaluations per step)")
            if v["lorrax.node_solver"] != "truncated" else
-           f", n_corr = {v['lorrax.n_corr']}" if v["lorrax.method"] in ("magnus2", "cfm4") else ""),
+           f", n_corr = {v['lorrax.n_corr']}"
+           + (f", predictor {v['lorrax.predictor']}" if v["lorrax.predictor"] != "cubic" else "")
+           + (f", relaxations {v['lorrax.corr_relax']}" if v["lorrax.corr_relax"] else "")
+           if v["lorrax.method"] in ("magnus2", "cfm4") else ""),
         f"  self-energy     : {model.name}",
         f"  intraband [r,.] : {'on' if system.ops.intra is not None else 'off'}",
         f"  drives          : {len(deck.trials)}",
