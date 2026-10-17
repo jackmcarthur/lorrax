@@ -124,6 +124,7 @@ struct EighStages {
            unmtr_hb2st = 0, redist2 = 0, unmtr_he2hb = 0;
     int64_t seeded = 0, fallback = 0;
     lorrax_ffi::slate::StageMemSampler* mem = nullptr;
+    lorrax_ffi::slate::PoolWatch* pw = nullptr;
     void at(int s) { if (mem) mem->at(s); }
 };
 // Stage indices of StageMemSampler: 0 copy-in, 1 he2hb, 2 gather+hb2st, 3 tridiag,
@@ -203,6 +204,8 @@ static void heev_seeded(sl::HermitianMatrix<T>& A, std::vector<typename RealOf<T
             const int64_t got1 = ws.seed(Z1d, want1);
             st.seeded += got1;
             Z1d.insertLocalTiles(sl::Target::Devices);
+            lorrax_ffi::slate::PoolWatchScope wz1(*st.pw, Z1d, "Z1d", got1,
+                                                  local_tiles(Z1d, false));
             {
                 t = now_s();
                 if constexpr (!std::is_same_v<T, real_t>) {
@@ -285,6 +288,8 @@ static ffi::Error EighImpl(
                         lorrax_ffi::slate::pool_report_enabled();
     lorrax_ffi::slate::StageMemSampler mem(9, report);
     st.mem = &mem;
+    lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
+    st.pw = &pw;
     const double t_all = now_s();
     std::vector<real_t> Lambda(n);
     sl::Options opts = {
@@ -301,6 +306,7 @@ static ffi::Error EighImpl(
         const int64_t gotA = ws.seed(A, local_tiles(A, true) + extra_tiles(A));
         st.seeded += gotA;
         A.insertLocalTiles(sl::Target::Devices);
+        lorrax_ffi::slate::PoolWatchScope wa(pw, A, "A", gotA, local_tiles(A, true));
         for (int64_t tj = 0; tj < A.nt(); ++tj) {
             for (int64_t ti = tj; ti < A.mt(); ++ti) {
                 if (!A.tileIsLocal(ti, tj)) continue;
@@ -336,6 +342,7 @@ static ffi::Error EighImpl(
             const int64_t gotZ = ws.seed(Z, local_tiles(Z, false) + extra_tiles(Z));
             st.seeded += gotZ;
             Z.insertLocalTiles(sl::Target::Devices);
+            lorrax_ffi::slate::PoolWatchScope wz(pw, Z, "Z", gotZ, local_tiles(Z, false));
             heev_seeded(A, Lambda, &Z, ws, opts, st, xla_stream);
             st.at(8);
 
@@ -404,6 +411,7 @@ static ffi::Error EighImpl(
             now_s() - t_all, st.scale, st.he2hb, st.gather, st.hb2st, st.tridiag, st.redist1,
             st.unmtr_hb2st, st.redist2, st.unmtr_he2hb, (long long) st.seeded,
             (long long) st.fallback, ws.used / 1e9, ws.size / 1e9);
+        pw.report("eigh", r, n, nb, (int) sizeof(T));
     }
 
     ce = lrx::gpu::memcpy_async(d_W, Lambda.data(), n * sizeof(real_t),
