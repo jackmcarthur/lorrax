@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import gc
 import json
 import os
 import resource
@@ -359,6 +360,11 @@ def run_case(op, n, dname, mesh, args, nrhs=None):
             except Exception as exc:                             # noqa: BLE001
                 AZ = Rm = G = None
                 row["check_full_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            # The fallback runs after the except block: the live traceback pins the
+            # failed check's operands (jit argument frames), which is the memory the
+            # sampled check needs.
+            if "check_full_error" in row:
+                gc.collect()
                 row["resid"], row["orth"], k = sampled_eigh_check(A, Z, w_, n)
                 row["check"] = f"sampled {k} eigenpairs"
             wn = np.asarray(jax.device_get(w_))
@@ -381,6 +387,8 @@ def run_case(op, n, dname, mesh, args, nrhs=None):
             except Exception as exc:                             # noqa: BLE001
                 AX = Rm = None
                 row["check_full_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if "check_full_error" in row:
+                gc.collect()
                 row["resid"], k = sampled_solve_check(A2, X2, B2, n)
                 row["check"] = f"sampled {k} columns"
             row["finite"] = bool(np.isfinite(row["resid"]))
@@ -400,6 +408,8 @@ def run_case(op, n, dname, mesh, args, nrhs=None):
             except Exception as exc:                             # noqa: BLE001
                 LLH = Rm = A = None
                 row["check_full_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if "check_full_error" in row:
+                gc.collect()
                 A = make()[0]
                 if A.ndim == 3:
                     A = jax.jit(lambda t: t[0], out_shardings=tile)(A)
