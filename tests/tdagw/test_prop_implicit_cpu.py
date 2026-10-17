@@ -135,6 +135,20 @@ def test_anderson_converges_per_trial_and_keeps_hermiticity():
     assert 2 <= int(info.n_eval) <= 40, info
 
 
+def test_anderson_recycled_columns_leave_the_fixed_point():
+    """Starting from another solve's columns (recycle) changes the path, not the answer."""
+    fmap, c = _affine_problem()
+    g0 = tuple(jnp.zeros_like(jnp.asarray(ci)) for ci in c)
+    m = 6
+    empty = (tuple(jnp.zeros((m,) + a.shape, a.dtype) for a in g0),) * 2 + (jnp.int32(0),)
+    g1, i1, rec = ti.anderson_fixed_point(fmap, g0, tol=1e-12, max_iter=60, memory=m, recycle=empty)
+    g2, i2, _ = ti.anderson_fixed_point(fmap, g0, tol=1e-12, max_iter=60, memory=m, recycle=rec)
+    assert bool(i1.converged) and bool(i2.converged) and int(rec[2]) == int(i1.n_eval) - 1
+    for a, b in zip(g1, g2):
+        assert float(jnp.max(jnp.abs(a - b))) <= 1e-10 * float(jnp.max(jnp.abs(a)))
+    assert int(i2.n_eval) <= int(i1.n_eval), (i1, i2)   # the same map: its pairs help
+
+
 def test_red_twin_anderson_starved_reports_unconverged():
     fmap, c = _affine_problem()
     g0 = tuple(jnp.zeros_like(jnp.asarray(ci)) for ci in c)
@@ -340,7 +354,8 @@ def _deck_raw(**lor):
     (dict(node_solver="anderson", dt="auto"), "td_dt"),
     (dict(node_solver="anderson", node_tol=0.0), "td_node_solve_settings"),
     (dict(node_solver="anderson", node_max_iter=1), "td_node_solve_settings"),
-    (dict(node_solver="anderson", node_memory=0), "td_node_solve_settings")])
+    (dict(node_solver="anderson", node_memory=0), "td_node_solve_settings"),
+    (dict(node_recycle=True), "td_node_solve_settings")])
 def test_deck_refuses_bad_node_settings(lor, gate):
     from tdagw.td_config import parse_td_deck
     with pytest.raises(ValueError, match=f"GATE {gate}"):

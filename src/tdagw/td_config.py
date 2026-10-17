@@ -58,6 +58,7 @@ TD_DEFAULTS = {
     "lorrax.node_tol": 1e-10,
     "lorrax.node_max_iter": 40,
     "lorrax.node_memory": 5,
+    "lorrax.node_recycle": False,
     "lorrax.magnus_frame": "",
     "lorrax.model": "",
     "lorrax.kernel_file": "",
@@ -246,6 +247,11 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
                     f"node_memory = {mem!r}", "0 < node_tol <= 1e-3, node_max_iter >= 2, "
                     "node_memory >= 1 (integers)", "set them in [lorrax]")
     vals["lorrax.node_tol"] = float(tol)
+    if not isinstance(vals["lorrax.node_recycle"], bool) or (
+            vals["lorrax.node_recycle"] and solver == "truncated"):
+        raise _gate("td_node_solve_settings", f"node_recycle = {vals['lorrax.node_recycle']!r} "
+                    f"with node_solver = {solver!r}", "true | false (true: node_solver = anderson)",
+                    "set [lorrax] node_recycle")
     frame = vals["lorrax.magnus_frame"]
     if frame not in ("", "whole_rho", "interaction") or (
             frame and vals["lorrax.method"] not in ("magnus2", "cfm4")) or (

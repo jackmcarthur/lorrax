@@ -669,7 +669,7 @@ def _per_trial(s, a):
 
 def anderson_fixed_point(fmap: Callable, g0, *, tol, max_iter: int, memory: int,
                          reg: float = ANDERSON_REG, constrain: Callable = None,
-                         milestones=()):
+                         milestones=(), recycle=None):
     """g = fmap(g) by Anderson acceleration, type II, real coefficients.
 
     ``g`` is a tuple of arrays whose leading axis is the trial (each trial an
@@ -691,9 +691,15 @@ def anderson_fixed_point(fmap: Callable, g0, *, tol, max_iter: int, memory: int,
     inside a jit.
     ``constrain`` (optional) is applied to the stacked (memory, ...) buffers
     (a sharding constraint).  ``milestones``: relative residuals whose first
-    crossing is recorded (:class:`NodeSolve` ``reached``).
+    crossing is recorded (:class:`NodeSolve` ``reached``).  ``recycle`` =
+    (E, D, n_col), the column buffers of an earlier solve of a nearby map (its
+    secant pairs: the next step's node map in that step's own frame), starts
+    the least squares from them instead of from nothing; they are
+    overwritten oldest-first as new columns arrive.  The stopping test is the
+    same, so a converged answer does not depend on them.
 
-    Returns (fmap(g_k) at the stopping iterate, :class:`NodeSolve`).
+    Returns (fmap(g_k) at the stopping iterate, :class:`NodeSolve`), and with
+    ``recycle`` a third item, the final (E, D, n_col).
     """
     m = int(memory)
     if m < 1 or (isinstance(max_iter, int) and max_iter < 1):
@@ -712,7 +718,12 @@ def anderson_fixed_point(fmap: Callable, g0, *, tol, max_iter: int, memory: int,
     f0g = tuple(fmap(g0))
     f0, done0, res0 = measure(g0, f0g)
     reached0 = jnp.where(res0 <= thr, 1, 0).astype(jnp.int32)
-    zeros = tuple(pin(jnp.zeros((m,) + a.shape, a.dtype)) for a in g0)
+    if recycle is None:
+        e0 = d0 = tuple(pin(jnp.zeros((m,) + a.shape, a.dtype)) for a in g0)
+        n_col0 = jnp.int32(0)
+    else:
+        e0, d0, n_col0 = tuple(pin(b) for b in recycle[0]), tuple(pin(b) for b in recycle[1]), \
+            jnp.asarray(recycle[2], jnp.int32)
     eye = jnp.eye(m)
 
     def cond(s):
@@ -749,15 +760,16 @@ def anderson_fixed_point(fmap: Callable, g0, *, tol, max_iter: int, memory: int,
         reached = jnp.where((reached == 0) & (res <= thr), n_eval + 1, reached).astype(jnp.int32)
         return (n_eval + 1, n_col + 1, g_new, fg_new, f_new, e_buf, d_buf, done, res, reached)
 
-    init = (jnp.int32(1), jnp.int32(0), g0, f0g, f0, zeros, zeros, done0, res0, reached0)
-    n_eval, _, _, fg, _, _, _, done, res, reached = jax.lax.while_loop(cond, body, init)
-    return fg, NodeSolve(n_eval=n_eval, converged=done, residual=res, reached=reached)
+    init = (jnp.int32(1), n_col0, g0, f0g, f0, e0, d0, done0, res0, reached0)
+    n_eval, n_col, _, fg, _, e_buf, d_buf, done, res, reached = jax.lax.while_loop(cond, body, init)
+    info = NodeSolve(n_eval=n_eval, converged=done, residual=res, reached=reached)
+    return (fg, info) if recycle is None else (fg, info, (e_buf, d_buf, n_col))
 
 
 def ip_magnus_implicit_step(field: Callable, state_nodes: Callable, inner: Callable,
                             free: Callable, t, x, h, guess, *, nodes, tol, max_iter: int,
                             memory: int, reg: float = ANDERSON_REG, constrain: Callable = None,
-                            milestones=()):
+                            milestones=(), recycle=None):
     """One Magnus step on x = y - y_eq with self-consistent (converged) node values.
 
     The node map of :func:`ip_magnus_step`,
@@ -777,8 +789,10 @@ def ip_magnus_implicit_step(field: Callable, state_nodes: Callable, inner: Calla
     imaginary axis (:func:`magnus_amplification` with ``n_corr=None``): the
     h·σ limit of the truncated step does not apply.  ``state_nodes(times,
     states) -> values`` evaluates B at every node (one batched call where the
-    caller can).  Returns (x(t + h), g in the frame of t, :class:`NodeSolve`);
-    an unconverged solve is reported, never hidden (the caller refuses it).
+    caller can).  ``recycle``: Anderson column buffers to start from (see
+    :func:`anderson_fixed_point`).  Returns (x(t + h), g in the frame of t,
+    :class:`NodeSolve`), with ``recycle`` also the final buffers; an
+    unconverged solve is reported, never hidden (the caller refuses it).
     """
     nodes = tuple(float(c) for c in nodes)
 
@@ -788,10 +802,12 @@ def ip_magnus_implicit_step(field: Callable, state_nodes: Callable, inner: Calla
         bs = state_nodes(tuple(t + c * h for c in nodes), xs)
         return tuple(free(b, -c * h) for b, c in zip(bs, nodes))
 
-    g, info = anderson_fixed_point(fmap, tuple(guess), tol=tol, max_iter=max_iter,
-                                   memory=memory, reg=reg, constrain=constrain,
-                                   milestones=milestones)
-    return inner(frozen_generator(field, free, t, h, nodes, g), t, x, h), g, info
+    out = anderson_fixed_point(fmap, tuple(guess), tol=tol, max_iter=max_iter,
+                               memory=memory, reg=reg, constrain=constrain,
+                               milestones=milestones, recycle=recycle)
+    g, info = out[0], out[1]
+    x1 = inner(frozen_generator(field, free, t, h, nodes, g), t, x, h)
+    return (x1, g, info) if recycle is None else (x1, g, info, out[2])
 
 
 def _node_quadrature(nodes):

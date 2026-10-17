@@ -83,6 +83,11 @@ NODE_SOLVERS = ("truncated", "anderson")
 #: Relative residuals whose first crossing each converged-node solve records: the
 #: evaluations a looser node_tol would have taken, from one tight run.
 NODE_MILESTONES = (1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9)
+#: The frame recycled Anderson columns are carried in: "own" (unchanged: the node
+#: map is the same operator in every step's own interaction-picture frame when
+#: the coupling is time-translation invariant) or "free" (rotated by free(., h)
+#: as the node history is).
+RECYCLE_FRAME = "own"
 #: Bootstrap: while the predictor history is incomplete (first steps) the
 #: Magnus steps take this many extra corrections.
 BOOTSTRAP_EXTRA = 3
@@ -138,6 +143,8 @@ class PropagatorConfig(NamedTuple):
         residual ||F(g) - g|| <= node_tol ||g||, its largest number of
         node-map evaluations (more refuses, GATE td_node_solve), and its
         Anderson memory.
+    node_recycle : the converged solve starts each step from the previous
+        step's Anderson column pairs (carried, and checkpointed, with the state).
     """
     method: str
     t0: float
@@ -156,6 +163,7 @@ class PropagatorConfig(NamedTuple):
     node_tol: float = 1e-10
     node_max_iter: int = 40
     node_memory: int = 5
+    node_recycle: bool = False
 
 
 def converged_nodes(cfg: PropagatorConfig) -> bool:
@@ -192,6 +200,13 @@ def _account_zero() -> NodeAccount:
     return NodeAccount(jnp.int64(0), jnp.int32(0), jnp.int32(0), jnp.int64(-1),
                        jnp.float64(0.0), jnp.float64(0.0), jnp.zeros(z, jnp.int64),
                        jnp.zeros(z, jnp.int32), jnp.zeros(z, jnp.int64))
+
+
+def _recycle_zero(cfg: PropagatorConfig, x0, ph):
+    """Empty Anderson column buffers (E, D per node, n_col 0) for node_recycle."""
+    m, n = int(cfg.node_memory), len(_magnus_parts(cfg)[0])
+    z = tuple(ph["pin_stack"](jnp.zeros((m,) + x0.shape, x0.dtype)) for _ in range(n))
+    return (z, z, jnp.int32(0))
 
 
 def _account(acct: NodeAccount, info, k) -> NodeAccount:
@@ -510,25 +525,35 @@ def _fixed_parts(cfg: PropagatorConfig, ph):
             return ti.compose_strang(core, ph["remainder"], t, x, tau, fractions)
 
         implicit = converged_nodes(cfg)
+        recycle = implicit and bool(cfg.node_recycle)
 
         def step(t, c, h, t_next):
             x, hist, k = c[:3]
             guess = tuple(jnp.tensordot(w, hist, axes=1))
             if implicit:
-                x1, g, info = ti.ip_magnus_implicit_step(
+                out = ti.ip_magnus_implicit_step(
                     ph["field"], ph["dsig_nodes"], inner, ph["free"], t, x, h, guess,
                     nodes=nodes, tol=cfg.node_tol,
                     # once a step has failed the run (or probe) is refused: one evaluation per step
                     max_iter=jnp.where(c[3].n_fail > 0, 1, int(cfg.node_max_iter)),
                     memory=int(cfg.node_memory), constrain=ph["pin_stack"],
-                    milestones=NODE_MILESTONES)
+                    milestones=NODE_MILESTONES, recycle=c[4] if recycle else None)
+                x1, g, info = out[:3]
+                if recycle:
+                    e_b, d_b, n_col = out[3]
+                    if RECYCLE_FRAME == "free":
+                        e_b = tuple(ph["free"](b, h) for b in e_b)
+                        d_b = tuple(ph["free"](b, h) for b in d_b)
+                    rec = (e_b, d_b, n_col)
             else:
                 n_c = jnp.where(k < n_boot, cfg.n_corr + BOOTSTRAP_EXTRA, cfg.n_corr)
                 x1, g = ti.ip_magnus_step(ph["field"], ph["dsig_dev"], inner, ph["free"],
                                           t, x, h, guess, nodes=nodes, n_corr=n_c)
             hist = ph["free"](jnp.concatenate([hist[len(nodes):], jnp.stack(g)]), h)
             out = (pin(x1), hist, k + 1)
-            return (out + (_account(c[3], info, k),) if implicit else out), g
+            if implicit:
+                out = out + (_account(c[3], info, k),) + ((rec,) if recycle else ())
+            return out, g
 
         def dense(t, c0, c1, g, th):
             gen = ti.frozen_generator(ph["field"], ph["free"], t, cfg.dt, nodes, g)
@@ -563,7 +588,10 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
         b0 = ph["dsig_dev"](cfg.t0, x0)
         n_hist = len(_magnus_parts(cfg)[3])
         carry = (x0, jnp.stack([b0] * n_hist), jnp.int32(0))
-        return carry + (_account_zero(),) if converged_nodes(cfg) else carry
+        if converged_nodes(cfg):
+            carry = carry + (_account_zero(),) + ((_recycle_zero(cfg, x0, ph),)
+                                                  if cfg.node_recycle else ())
+        return carry
     return jax.jit(build)(rho0, ops, mparams)
 
 
@@ -698,7 +726,8 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
         hist = jnp.stack([ph["dsig_dev"](t0, xh[j:j + 1]) for j in range(n_hist)])
         carry = (base + x0, hist, jnp.int32(n_boot))  # past the bootstrap: the predictor acts at once
         if implicit:
-            carry = carry + (_account_zero(),)
+            carry = carry + (_account_zero(),) + ((_recycle_zero(cfg, x0, ph),)
+                                                  if cfg.node_recycle else ())
 
         def body(c, i):
             t = t0 + i * h
