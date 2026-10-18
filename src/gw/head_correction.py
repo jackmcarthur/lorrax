@@ -1984,10 +1984,12 @@ class HeadSigmaDiag:
 
     Sigma^head_nk(omega) = sum_p pref_p [ f_nk / (omega - e_nk + z_p)
                                         + (1 - f_nk) / (omega - e_nk - z_p) ]
-    depends on E_nk and f_nk only, so it is evaluated where it is read and the
-    (n_omega, nk, nb) array is not held on any host: ``band_rows`` gives a rank
-    the rows of its own Sigma tile for the finalize add, ``at_slots`` the omega
-    slots an on-shell reader interpolates between.  Every value is
+    depends on E_nk and f_nk only, so it is evaluated where it is read:
+    :meth:`on_shell` at per-state energies (the on-shell Sigma's tables and
+    their derivative), ``band_rows`` on ``omega_grid_ry`` (the sampled range,
+    for the head-shift log line, and a rank's rows of its own Sigma tile for
+    the grid finalize add), ``at_slots`` the omega slots a grid reader
+    interpolates between (``sigma_omega_grid_debug``).  Every value is
     ``_head_pole_sum`` of its cell, so the readers agree to the bit.
     ``np.asarray`` evaluates the whole array (one-shot output tables).
     """

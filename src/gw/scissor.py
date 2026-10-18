@@ -1,10 +1,11 @@
 """Scissor-shift laws and the SC classification window.
 
-Two consumers extrapolate a QP correction with these laws: the SC loop's
+One consumer extrapolates a QP correction with these laws: the SC loop's
 sum-band tail beyond the Σ window (:func:`apply_conduction_scissor_to_tail`,
-one rigid conduction shift) and fixed-Sigma EQP2's out-of-grid window states
-(:func:`qsgw_out_of_range_energies`).  The SC loop itself scissors no window
-state: every QP-window identity keeps its full Σ (owner rule 2026-09-22).
+one rigid conduction shift).  The SC loop itself scissors no window state:
+every QP-window identity keeps its full Σ (owner rule 2026-09-22).  (The
+second consumer, fixed-Sigma EQP2's out-of-grid window states, retired with
+the omega grid.)
 The dynamic self-energy Σ_c(ω) is computed on a frequency grid; outside it
 these laws extrapolate the QP correction
 
@@ -22,8 +23,7 @@ the Fermi level,
 
 Equivalently every such valence state receives the same rigid displacement
 ``E_F,QP - E_F,DFT``.  :func:`fit_scissor` still reports a valence affine fit
-as a diagnostic, but :func:`qsgw_out_of_range_energies` deliberately does not
-use it for EQP2's out-of-range valence states.
+as a diagnostic.
 
 Which bands are valence and which are conduction
 ------------------------------------------------
@@ -60,25 +60,7 @@ Fermi-crossing Kramers pair (bands 9-10) sat in the VALENCE class:
 
 :func:`classify_scissor_bands` derives the three classes from an
 ``OccupationState``'s ``f_kn``; the boundary indices it returns are what
-both the fit masks and :func:`qsgw_out_of_range_energies` use, so a band is
-classified once per iteration and the fit and application cannot disagree.
-
-EQP2 applies the scissor at the **eigenvalue level**: out-of-grid
-conduction bands receive the affine law and out-of-grid valence bands
-receive the Fermi displacement above, as the diagonal of the partitioned
-Hamiltonian.
-
-Per-band classification
------------------------
-A band ``n`` is **in-grid** iff ``E_DFT[k, n]`` lies inside ``[ω_min, ω_max]``
-for **every** k.  If any single k for that band lies outside the window the
-whole band is treated as out-of-grid — a Σ(E) read off the grid for the
-offending k is not that band's own Σ(E), which contaminates the QP
-correction at neighbouring k via the band's k-dispersion.  Per-band
-classification gives a discontinuity-free scissor: out-of-grid bands receive
-their class law uniformly across k (rigid Fermi displacement for valence,
-affine fit for conduction), and the fit itself is restricted to data from
-in-grid bands so the contaminated points never enter.
+the fit masks use, so a band is classified once per iteration.
 
 The fit is a REDUCTION OVER k and therefore needs k WEIGHTS
 ----------------------------------------------------------
@@ -179,57 +161,6 @@ class ScissorFit:
         )
 
 
-def qsgw_out_of_range_energies(
-    E_dft_kn_ev: np.ndarray,
-    fit: ScissorFit,
-    valence_mask_kn: np.ndarray,
-    *,
-    fermi_displacement_ev: float,
-    crossing_mask_kn: np.ndarray | None = None,
-) -> np.ndarray:
-    """Build EQP2's candidates for out-of-range diagonals.
-
-    This is the single application policy of fixed-Sigma EQP2:
-
-    * valence: ``E_QP = E_DFT + (E_F,QP - E_F,DFT)``;
-    * conduction: ``E_QP = fit.alpha_c * E_DFT + fit.beta_c_ev``;
-    * Fermi-crossing: ``E_QP = E_DFT`` (neither scissor class).
-
-    The valence fields in ``fit`` are intentionally not read.  They remain
-    useful fit diagnostics, but extrapolating a regression obtained from
-    higher-lying valence states into a deep out-of-range shell changes that
-    shell's binding relative to ``E_F``.  The rigid Fermi displacement keeps
-    ``E_band - E_F`` exactly invariant instead.
-
-    This function returns candidates for every entry.  The band-partition
-    primitive remains the sole owner of deciding which candidates are used:
-    protected/in-range diagonals retain the full QSGW Hamiltonian.
-    """
-    E = np.asarray(E_dft_kn_ev, dtype=np.float64)
-    valence = np.asarray(valence_mask_kn, dtype=bool)
-    if E.shape != valence.shape:
-        raise ValueError(
-            "qsgw_out_of_range_energies: E_DFT and valence mask must have "
-            f"the same shape; got {E.shape} and {valence.shape}.")
-    shift = float(fermi_displacement_ev)
-    if not np.isfinite(shift):
-        raise ValueError(
-            "qsgw_out_of_range_energies: fermi_displacement_ev must be "
-            f"finite; got {shift!r}.")
-
-    valence_qp = E + shift
-    conduction_qp = float(fit.alpha_c) * E + float(fit.beta_c_ev)
-    out = np.where(valence, valence_qp, conduction_qp)
-    if crossing_mask_kn is not None:
-        crossing = np.asarray(crossing_mask_kn, dtype=bool)
-        if crossing.shape != E.shape:
-            raise ValueError(
-                "qsgw_out_of_range_energies: E_DFT and crossing mask must "
-                f"have the same shape; got {E.shape} and {crossing.shape}.")
-        out = np.where(crossing, E, out)
-    return out
-
-
 def apply_conduction_scissor_to_tail(
     E_dft_kn_ev: np.ndarray,
     fit: ScissorFit,
@@ -283,7 +214,7 @@ def apply_conduction_scissor_to_tail(
 
 
 # ---------------------------------------------------------------------------
-# Per-band in-grid classification
+# The SC classification window pads
 # ---------------------------------------------------------------------------
 
 _SC_PAD_BASE_EV = 0.5
@@ -351,37 +282,6 @@ def sc_window_pad_ev(energy_relative_to_mu_ev):
     """The outer Sigma rule state pad: max(2 eV, 10% |E - mu|)."""
     return np.maximum(SC_WINDOW_PAD_EV, SC_WINDOW_PAD_FRACTION * np.abs(
         np.asarray(energy_relative_to_mu_ev, dtype=np.float64)))
-
-
-def classify_bands_in_grid(
-    E_kn_ev: np.ndarray,
-    omega_min_ev: float,
-    omega_max_ev: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(band_in_grid, kn_in_grid_band)``.
-
-    A band is **in-grid** iff ``E_kn`` lies in ``[ω_min, ω_max]`` for every k.
-
-    Parameters
-    ----------
-    E_kn_ev : np.ndarray, (nk, nb)
-        Per-(k, n) energies, same reference as the ω-grid.
-    omega_min_ev, omega_max_ev : float
-        Σ_c(ω) grid bounds.
-
-    Returns
-    -------
-    band_in_grid : np.ndarray, (nb,) of bool
-        True for bands whose every k lies in the window.
-    kn_in_grid_band : np.ndarray, (nk, nb) of bool
-        ``band_in_grid`` broadcast to ``(nk, nb)`` for ``np.where`` callers.
-    """
-    E = np.asarray(E_kn_ev, dtype=np.float64)
-    in_window_kn = (E >= float(omega_min_ev)) & (E <= float(omega_max_ev))
-    band_in_grid = np.all(in_window_kn, axis=0)
-    kn_in_grid_band = np.broadcast_to(
-        band_in_grid[None, :], E.shape).astype(bool)
-    return band_in_grid, kn_in_grid_band
 
 
 # ---------------------------------------------------------------------------
@@ -469,8 +369,7 @@ class ScissorBandClasses:
 
         ``valence_kn`` is what ``fit_scissor`` wants as ``valence_mask_kn``;
         ``crossing_kn`` is what the caller ANDs OUT of its ``fit_mask_kn``
-        and passes to :func:`qsgw_out_of_range_energies` as
-        ``crossing_mask_kn``.  Everything that is neither is conduction, so
+        (crossing bands are not fit data).  Everything that is neither is conduction, so
         two masks describe three classes.
         """
         nk, nb = int(shape[0]), int(shape[1])
@@ -698,7 +597,7 @@ def fit_scissor(
         Replace the conduction affine regression by ONE rigid shift: the
         k-weighted mean of ``E_QP - E_DFT`` over every trusted conduction
         sample (``fit_mask_kn`` and not valence).  The SC sum-band tail
-        uses it; EQP2 keeps the affine fit.
+        uses it.
     state_weights_kn : np.ndarray, optional
         Per-sample weights multiplying ``k_weights`` (the SC tail's
         quasiparticle weights Z), in DFT-identity order like the masks.
@@ -816,9 +715,7 @@ __all__ = [
     "ScissorBandClasses",
     "ScissorFit",
     "apply_conduction_scissor_to_tail",
-    "classify_bands_in_grid",
     "classify_scissor_bands",
     "fit_scissor",
     "k_star_weights",
-    "qsgw_out_of_range_energies",
 ]

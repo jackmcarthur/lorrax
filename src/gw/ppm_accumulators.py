@@ -1,37 +1,34 @@
-"""Accumulate time-domain Sigma matrices into dynamic Sigma at real frequencies.
+"""Accumulate time-domain Sigma matrices into the on-shell dynamic Sigma.
 
 For each quadrature node, the spatial kernel produces one ``sigma(tau)``
-matrix. ``DeviceOmegaAccumulator.integrate_window`` runs a whole window's
-nodes as one executable: each ``sigma(tau)`` is multiplied by its scalar
-coefficient at every output frequency and added to ``sigma(omega)`` on
-device. It serves MPA, one-pole GN/HL-PPM and shared-pole data and never
-stores a history of time-domain matrices or moves them to a host calculation.
+matrix. :meth:`DeviceOmegaAccumulator.run_window` runs a whole window's nodes
+as one executable and folds each ``sigma(tau)`` into what the QSGW ansatz
+``½[Σ_mn(E_m) + Σ_mn(E_n)]`` and the eqp writers read
+(``gw.ppm_sigma.OnShellRequest``),
+
+    pair[0, k, m, n] = Σ_mn(k, ω_km)        pair[1, k, m, n] = Σ_mn(k, ω_kn)
+    slot[j, k, n]    = Σ_nn(k, ω^(j)_kn)    slot[-1, k, n]   = dΣ_nn/dω (k, ω_kn)
+
+with ``ω_kn`` the per-state evaluation energies.  The coefficient of a node
+is the scalar ``prefactor·α·exp(-i(E_ref − s·|ω|)t)`` evaluated per state on
+the device, so the fold reads each ``σ(τ)`` once and writes a depth-2 matrix;
+the derivative slot is the exact ω-derivative of the same quadrature,
+``i·s·s_ext·t`` times it.  It serves MPA, one-pole GN/HL-PPM and shared-pole
+data and never stores a history of time-domain matrices.
 
 Some one-sided control quadratures first sum their time-node contributions
 into a temporary ``Z`` and then add ``(Z - Z†) / (2i)`` to the result. All
 matrices retain the result's distribution over the two band axes.
 
-Two evaluations share the one window runner (:func:`_device_window_runner`):
-
-* the GRID evaluation (``sigma_omega_grid_debug``): ``Σ_mn(k, ω)`` at every
-  output frequency, ``(n_omega, k, nb, nb)``;
-* the ON-SHELL evaluation (the default, :class:`OnShellTables`): only what the
-  QSGW ansatz ``½[Σ_mn(E_m) + Σ_mn(E_n)]`` and the eqp writers read,
-
-      pair[0, k, m, n] = Σ_mn(k, ω_km)        pair[1, k, m, n] = Σ_mn(k, ω_kn)
-      slot[j, k, n]    = Σ_nn(k, ω^(j)_kn)    slot[-1, k, n]   = dΣ_nn/dω (k, ω_kn)
-
-  with ``ω_kn`` the per-state evaluation energies.  The coefficient of a node
-  is the same scalar ``prefactor·α·exp(-i(E_ref − s·|ω|)t)`` evaluated per
-  state on the device, so the fold reads each ``σ(τ)`` once and writes a
-  depth-2 matrix instead of a depth-``n_omega`` one; the derivative slot is
-  the exact ω-derivative of the same quadrature, ``i·s·s_ext·t`` times it.
+``sigma_omega_grid_debug`` (opt-in) keeps the GRID evaluation beside it:
+``Σ_mn(k, ω)`` at every output frequency, ``(n_omega, k, nb, nb)``, through
+the same window runner with a ``(capacity, n_omega)`` coefficient
+(:func:`_omega_coefficient`, :meth:`DeviceOmegaAccumulator.grid`).
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import NamedTuple
 
 
 import jax
@@ -47,27 +44,6 @@ def _omega_coefficient(xp, omega, t, alpha, sign, prefactor, e_ref=0.0):
             * xp.exp(-1j * (e_ref - sign * omega) * t))
 
 
-class OnShellTables(NamedTuple):
-    """The per-state evaluation energies of an on-shell Sigma, on the parent k rows.
-
-    ``omega`` ``(n_table, n_parent, nb_carrier)`` float64, Ry, measured from
-    the run's omega reference (the same frame as the planner's frequency
-    list).  Table 0 is the ``pair`` table: both matrix slots and the
-    derivative slot read it.  ``index`` (same shape, int32) is each entry's
-    position in the planner's frequency list, ``-1`` on a padded carrier
-    band; a window owns an entry when it owns that position.  Both are
-    replicated on the devices.
-    """
-    omega: jax.Array
-    index: np.ndarray
-    omega_host: np.ndarray
-
-    @property
-    def n_slot(self) -> int:
-        """Diagonal slots: one value per table, then the derivative on table 0."""
-        return int(self.omega.shape[0]) + 1
-
-
 def _omega_fold(acc, sigma, coeff, omega_axis):
     """Add one time-domain Sigma matrix to every represented frequency."""
     coeff_shape = ((1,) * omega_axis + (coeff.shape[0],)
@@ -76,45 +52,68 @@ def _omega_fold(acc, sigma, coeff, omega_axis):
         sigma, axis=omega_axis)
 
 
+
 class WindowTable:
     """Every planned window's coefficient inputs, placed once per Σ call.
 
     ``fields`` are replicated device arrays with one leading row per window:
     ``t``/``alpha`` padded to the node capacity, ``n`` the active node count,
-    ``omega``/``columns`` the window's frequencies on the full output axis,
-    ``scalars`` (omega_sign, prefactor, e_ref_sum) and caller ``extras``
-    (``x_<name>``).  :meth:`DeviceOmegaAccumulator.window_pick` reads one row
-    on device behind a device-carried window counter, so a window transfers
-    nothing from the host.  ``nodes`` are the host node counts (progress).
+    ``own`` ``(n_table, n_parent, nb_carrier)`` the states whose energy the
+    window's frequencies hold, ``scal`` (prefactor, e_ref_sum, omega_sign,
+    s_ext) and caller ``extras`` (``x_<name>``).  A grid table
+    (``sigma_omega_grid_debug``) carries ``omega``/``columns``, the window's
+    frequencies on the full output axis, and ``scalars`` (omega_sign,
+    prefactor, e_ref_sum) in place of ``own``/``scal``.
+    :meth:`DeviceOmegaAccumulator.window_pick` reads one row on device behind
+    a device-carried window counter, so a window transfers nothing from the
+    host.  ``nodes`` are the host node counts (progress).
     """
 
     def __init__(self, fields, nodes):
         self.fields = fields
         self.nodes = tuple(int(n) for n in nodes)
-        self.on_shell = None  # on-shell packs (sigma._sigma_window_table), else None
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes of the table on each device (every field is replicated)."""
+        return sum(int(v.nbytes) for v in self.fields.values())
 
 
 @lru_cache(maxsize=None)
-def _window_pick_program(replicated):
-    """``(table, w) -> (t_pad, coeff, n_active, extras, w + 1)`` for row ``w``, on device.
+def _window_pick_program(replicated, grid=False):
+    """``(table, w) -> (t_pad, pack, n_active, extras, w + 1)`` for row ``w``, on device.
 
-    The coefficient is :func:`_omega_coefficient` on the row's padded nodes
-    and full-axis frequencies, zero outside the active nodes and columns:
-    the host table of :meth:`DeviceOmegaAccumulator.integrate_window`,
-    evaluated by the device's complex ``exp`` (rounding-level differences
-    from the host's libm, owner-accepted 2026-10-16).
+    ``pack`` is the row's ``alpha``, ``own`` and ``scal``: the node
+    coefficients are made per state inside the window
+    (:func:`_on_shell_node_coefficients`).
+
+    ``grid`` (a grid table): ``pack`` is the coefficient instead,
+    :func:`_omega_coefficient` on the row's padded nodes and full-axis
+    frequencies, zero outside the active nodes and columns: the host table
+    of :meth:`DeviceOmegaAccumulator.integrate_window`, evaluated by the
+    device's complex ``exp`` (rounding-level differences from the host's
+    libm, owner-accepted 2026-10-16).
     """
+    if grid:
+        def pick(fields, w):
+            row = {k: jax.lax.dynamic_index_in_dim(v, w, 0, keepdims=False)
+                   for k, v in fields.items()}
+            t, alpha, n = row["t"], row["alpha"], row["n"]
+            sign, prefactor, e_ref = (row["scalars"][i] for i in range(3))
+            valid = row["columns"][None, :] & (jnp.arange(t.shape[0])[:, None] < n)
+            coeff = _omega_coefficient(jnp, row["omega"][None, :], t[:, None],
+                                       alpha[:, None], sign, prefactor, e_ref)
+            coeff = jnp.where(valid, coeff, jnp.zeros((), coeff.dtype))
+            extras = {k[2:]: v for k, v in row.items() if k.startswith("x_")}
+            return t, coeff, n, extras, w + jnp.ones((), w.dtype)
+        return jax.jit(pick, out_shardings=replicated)
+
     def pick(fields, w):
         row = {k: jax.lax.dynamic_index_in_dim(v, w, 0, keepdims=False)
                for k, v in fields.items()}
-        t, alpha, n = row["t"], row["alpha"], row["n"]
-        sign, prefactor, e_ref = (row["scalars"][i] for i in range(3))
-        valid = row["columns"][None, :] & (jnp.arange(t.shape[0])[:, None] < n)
-        coeff = _omega_coefficient(jnp, row["omega"][None, :], t[:, None],
-                                   alpha[:, None], sign, prefactor, e_ref)
-        coeff = jnp.where(valid, coeff, jnp.zeros((), coeff.dtype))
+        pack = {k: row[k] for k in ("alpha", "own", "scal")}
         extras = {k[2:]: v for k, v in row.items() if k.startswith("x_")}
-        return t, coeff, n, extras, w + jnp.ones((), w.dtype)
+        return row["t"], pack, row["n"], extras, w + jnp.ones((), w.dtype)
     return jax.jit(pick, out_shardings=replicated)
 
 
@@ -129,7 +128,6 @@ def _zeros_program(sharding, shapes):
 def _window_counter_program(replicated):
     """The first window's counter, made on device (a compiled constant, no transfer)."""
     return jax.jit(lambda: jnp.zeros((), jnp.int32), out_shardings=replicated)
-
 
 _WINDOW_COMPILED = {}
 
@@ -219,52 +217,54 @@ def _on_shell_antihermitian(total, Z):
     return matrices, diagonals
 
 
+
 @lru_cache(maxsize=16)
-def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian,
-                          reduce=None, overlap=False, on_shell=False):
+def _device_window_runner(tau_kernel, sharding, antihermitian, reduce, overlap=False,
+                          omega_axis=None):
     """ONE executable for a whole quadrature window: loop the time nodes on device.
 
-    ``coeff`` is ``(capacity, n_omega)`` over the COMPLETE output frequency
-    axis, exactly zero outside the window's frequencies, so every window of a
-    plan shares one signature (``capacity`` is the plan's largest node count)
-    and one compile.  The node loop runs ``n_active`` iterations; nothing
-    returns to the host between nodes.  An anti-Hermitian window sums its
-    one-sided ``Z`` first and adds ``(Z - Z†)/(2i)`` once.
+    ``pack`` is the window's on-shell coefficient pack (``alpha`` padded to
+    the plan's node capacity, the ``own`` mask, ``scal`` and the resident
+    ``omega`` tables), so every window of a plan shares one signature and one
+    compile.  The node loop runs ``n_active`` iterations; nothing returns to
+    the host between nodes.  An anti-Hermitian window sums its one-sided
+    ``Z`` first and adds ``(Z - Z†)/(2i)`` once
+    (:func:`_on_shell_antihermitian`).
 
     ``reduce`` maps each ``sigma(t)`` to ``(matrices, diagonals)``, two tuples
-    of arrays, before the fold; ``total`` has that structure, so only what is
-    folded is stored at every frequency.  A diagonal's dagger is its
-    conjugate.
+    of arrays, before the fold; ``total`` has that structure
+    (:func:`_on_shell_fold`).
 
     ``overlap`` (:data:`WINDOW_OVERLAP`): the loop runs two nodes per trip,
     folded in node order, and an odd last node after it; the program is
     compiled with the latency-hiding scheduler.
 
-    ``on_shell``: ``coeff`` is the on-shell pack (``alpha`` padded to
-    ``capacity``, ``omega``/``own`` tables, ``scal``) and the node's
-    coefficients are made on the device per state
-    (:func:`_on_shell_node_coefficients`); ``reduce`` is required and ``total``
-    is ``(matrices, diagonals)`` (:func:`_on_shell_fold`).
+    ``omega_axis`` (the grid, ``sigma_omega_grid_debug``): ``coeff`` is
+    ``(capacity, n_omega)`` over the COMPLETE output frequency axis, exactly
+    zero outside the window's frequencies, and each ``sigma(t)`` (or, with
+    ``reduce``, each member of its reduction) is folded into every frequency
+    on that axis (:func:`_omega_fold`).  ``reduce`` None: ``total`` is the
+    cube itself.
     """
-    if on_shell and reduce is None:
-        raise ValueError("the on-shell window folds a reduced sigma(t); reduce is required")
+    grid = omega_axis is not None
+
     def pinned(tree):
         return jax.tree.map(
             lambda a: jax.lax.with_sharding_constraint(a, sharding), tree)
 
     def run(total, tau_arguments, t_nodes, coeff, n_active, active_count):
         def node(i):
-            # The node's time and coefficients are read from the counter once,
+            # The node's time and weight are read from the counter once,
             # behind a barrier: remat may otherwise clone a counter-indexed
             # slice after the counter's in-place increment (the R82 hazard).
-            if not on_shell:
+            if grid:
                 return jax.lax.optimization_barrier((t_nodes[i], coeff[i]))
             t, a = jax.lax.optimization_barrier((t_nodes[i], coeff["alpha"][i]))
             pack = dict(coeff, scal=coeff["scal"].at[0].multiply(a))
             return t, _on_shell_node_coefficients(pack, t)
 
         def fold(acc, sigma, c):
-            if on_shell:
+            if not grid:
                 return pinned(_on_shell_fold(acc, reduce(sigma), c))
             if reduce is None:
                 return _omega_fold(acc, sigma, c, omega_axis)
@@ -293,81 +293,111 @@ def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian,
             return jax.lax.cond(n_active % 2 == 1, lambda a: one(n_active - 1, a),
                                 lambda a: a, acc)
 
+        if grid:
+            return _grid_window_tail(total, nodes, antihermitian, reduce, sharding, pinned)
         if not antihermitian:
-            out = nodes(total)
-            return out if reduce is None else pinned(out)
-        if on_shell:
-            Z = nodes(pinned(jax.tree.map(jnp.zeros_like, total)))
-            return pinned(_on_shell_antihermitian(total, Z))
-        if reduce is None:
-            Z = jax.lax.with_sharding_constraint(jnp.zeros_like(total), sharding)
-            Z = nodes(Z)
-            return total + (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j
-        matrices, diagonals = nodes(pinned(jax.tree.map(jnp.zeros_like, total)))
-        return pinned((
-            tuple(a + (z - jnp.conj(jnp.swapaxes(z, -1, -2))) / 2j
-                  for a, z in zip(total[0], matrices)),
-            tuple(a + (z - jnp.conj(z)) / 2j
-                  for a, z in zip(total[1], diagonals))))
+            return pinned(nodes(total))
+        Z = nodes(pinned(jax.tree.map(jnp.zeros_like, total)))
+        return pinned(_on_shell_antihermitian(total, Z))
 
     options = WINDOW_OVERLAP if overlap else None
-    if reduce is None:
+    if grid and reduce is None:
         return jax.jit(run, donate_argnums=(0,), out_shardings=sharding,
                        compiler_options=options)
     return jax.jit(run, donate_argnums=(0,), compiler_options=options)
 
 
-class DeviceOmegaAccumulator:
-    """Build real-frequency Sigma without retaining time-domain matrices.
+def _grid_window_tail(total, nodes, antihermitian, reduce, sharding, pinned):
+    """The grid window's node loop and its anti-Hermitian completion (:func:`_device_window_runner`)."""
+    if not antihermitian:
+        out = nodes(total)
+        return out if reduce is None else pinned(out)
+    if reduce is None:
+        Z = jax.lax.with_sharding_constraint(jnp.zeros_like(total), sharding)
+        Z = nodes(Z)
+        return total + (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j
+    matrices, diagonals = nodes(pinned(jax.tree.map(jnp.zeros_like, total)))
+    return pinned((
+        tuple(a + (z - jnp.conj(jnp.swapaxes(z, -1, -2))) / 2j
+              for a, z in zip(total[0], matrices)),
+        tuple(a + (z - jnp.conj(z)) / 2j
+              for a, z in zip(total[1], diagonals))))
 
-    :meth:`integrate_window` evaluates one window's quadrature nodes in a
-    device loop and folds each ``sigma(t)`` into the output frequencies with
-    its coefficient ``prefactor * alpha * exp(-i(E_ref_sum - sign*omega) t)``.
-    A one-sided window first forms ``Z(omega) = sum_t coefficient * sigma(t)``
-    and then adds ``(Z-Z†)/(2i)`` on the band indices.  ``alpha`` is the
+
+class DeviceOmegaAccumulator:
+    """Build the on-shell Sigma (or, :meth:`grid`, Sigma on the omega grid) without
+    retaining time-domain matrices.
+
+    :meth:`run_window` evaluates one window's quadrature nodes in a device
+    loop and folds each ``sigma(t)`` into every state's slots with its
+    coefficient ``prefactor * alpha * exp(-i(E_ref_sum - sign*|omega|) t)``.
+    A one-sided window first forms ``Z = sum_t coefficient * sigma(t)`` and
+    then adds ``(Z-Z†)/(2i)`` on the band indices.  ``alpha`` is the
     quadrature weight before the reference energy is included; combining
     ``E_ref_sum`` and omega in one exponential avoids separately evaluating
     two large factors whose product is well conditioned.
     """
 
-    def __init__(self, omega_vec, *, shape, sharding, omega_axis, reduce=None,
-                 on_shell: OnShellTables | None = None):
-        """With ``reduce`` (:func:`_device_window_runner`), ``shape`` is the
-        ``(matrices, diagonals)`` pair of shape tuples it folds into, every
-        member at ``sharding``, and :meth:`finalize` returns that pair.
-
-        ``on_shell`` (:class:`OnShellTables`): the on-shell evaluation.
-        ``omega_vec`` is then the planner's frequency list (the windows'
-        ``omega_indices`` index it), ``reduce`` returns the kept matrices and
-        the diagonal of EVERY count, and ``shape`` is the
-        ``(matrices, diagonals)`` pair with leading extents 2 and
-        ``on_shell.n_slot``."""
+    def __init__(self, request, *, carrier, shape, sharding, reduce):
+        """``request`` (``gw.ppm_sigma.OnShellRequest``): its parent-row tables
+        and frequency list (the windows' ``omega_indices`` index it), padded
+        here to the band ``carrier``.  ``reduce`` returns the kept matrices
+        and the diagonal of EVERY count; ``shape`` is the ``(matrices,
+        diagonals)`` pair of shape tuples it folds into, with leading extents
+        2 and ``request.n_slot``, every member at ``sharding``;
+        :meth:`finalize` returns that pair."""
         self._sharding = sharding
         self._reduce = reduce
-        self._on_shell = on_shell
+        self._omega_axis = None
         self._replicated = NamedSharding(sharding.mesh, P())
         from lxkit import device_vendor
         self._gpu = device_vendor(sharding.mesh.devices.flat[0]) in ("cuda", "rocm")
-        self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
+        self._frequencies = np.asarray(request.frequencies_ry, np.float64)
+        pad = int(carrier) - int(request.parent_ry.shape[-1])
+        if pad < 0:
+            raise ValueError(f"on-shell tables carry {request.parent_ry.shape[-1]} bands, "
+                             f"the Sigma carrier {carrier}")
+        widths = ((0, 0), (0, 0), (0, pad))
+        self._index = np.pad(request.parent_index, widths, constant_values=-1)
+        self._omega = device_put_process_local(
+            np.pad(request.parent_ry, widths), self._replicated)
+        shapes = tuple(tuple(int(n) for n in one) for one in (*shape[0], *shape[1]))
+        want = ((2,),) * len(shape[0]) + ((request.n_slot,),) * len(shape[1])
+        if tuple(one[:1] for one in shapes) != want:
+            raise ValueError(
+                "DeviceOmegaAccumulator: on-shell matrices carry 2 slots and "
+                f"diagonals {request.n_slot}; got {shapes}")
+        # Each rank stores every slot and parent-k point for its assigned
+        # block of the two band axes.
+        totals = _zeros_program(sharding, shapes)()
+        self._total = (totals[:len(shape[0])], totals[len(shape[0]):])
+
+    @classmethod
+    def grid(cls, omega_vec, *, shape, sharding, omega_axis, reduce=None):
+        """The omega-grid evaluation (``sigma_omega_grid_debug``).
+
+        Each window folds ``sigma(t)`` into every output frequency of
+        ``omega_vec`` along ``omega_axis`` (:func:`_omega_fold`).  With
+        ``reduce`` (:func:`_device_window_runner`), ``shape`` is the
+        ``(matrices, diagonals)`` pair of shape tuples it folds into, every
+        member at ``sharding``, and :meth:`finalize` returns that pair;
+        otherwise ``shape`` is the cube's.
+        """
+        self = cls.__new__(cls)
+        self._sharding = sharding
+        self._reduce = reduce
+        self._replicated = NamedSharding(sharding.mesh, P())
+        from lxkit import device_vendor
+        self._gpu = device_vendor(sharding.mesh.devices.flat[0]) in ("cuda", "rocm")
+        self._grid_omega = np.asarray(jax.device_get(omega_vec), np.complex128)
         self._omega_axis = int(omega_axis)
         shapes = ((shape,) if reduce is None else (*shape[0], *shape[1]))
         shapes = tuple(tuple(int(n) for n in one) for one in shapes)
-        if on_shell is not None:
-            if reduce is None:
-                raise ValueError("DeviceOmegaAccumulator: on-shell needs a reduce")
-            want = ((2,),) * len(shape[0]) + ((on_shell.n_slot,),) * len(shape[1])
-            if tuple(one[:1] for one in shapes) != want:
-                raise ValueError(
-                    "DeviceOmegaAccumulator: on-shell matrices carry 2 slots and "
-                    f"diagonals {on_shell.n_slot}; got {shapes}")
-            shapes_checked = ()
-        else:
-            shapes_checked = shapes
-        for one in shapes_checked:
+        for one in shapes:
             if not 0 <= self._omega_axis < len(one):
                 raise ValueError(
                     "DeviceOmegaAccumulator: omega_axis outside output rank")
-            if one[self._omega_axis] != self._omega.size:
+            if one[self._omega_axis] != self._grid_omega.size:
                 raise ValueError(
                     "DeviceOmegaAccumulator: shape[omega_axis] must equal "
                     "n_omega")
@@ -377,44 +407,56 @@ class DeviceOmegaAccumulator:
         n_matrix = 1 if reduce is None else len(shape[0])
         self._total = (totals[0] if reduce is None else
                        (totals[:n_matrix], totals[n_matrix:]))
+        return self
+
+    @property
+    def is_grid(self) -> bool:
+        """Whether this accumulator folds onto the omega grid (:meth:`grid`)."""
+        return self._omega_axis is not None
 
     def integrate_window(self, tau_kernel, tau_arguments, t, alpha, *,
-                         n_active, active_count, capacity, omega_sign,
-                         prefactor, e_ref_sum=0.0, antihermitian=False,
-                         omega_indices=None, omega_values=None,
-                         overlap=False, compile_only=False):
-        """Evaluate ``tau_kernel`` at a window's first ``n_active`` nodes and fold them in.
+                         active_count, capacity, omega_sign, prefactor,
+                         e_ref_sum=0.0, antihermitian=False, omega_indices,
+                         omega_values, overlap=False, compile_only=False):
+        """Evaluate ``tau_kernel`` at a window's nodes and fold them in.
 
-        The window's coefficients (``omega_indices`` places ``omega_values``;
-        omitted, every output frequency), scattered into the complete
-        frequency axis and padded to ``capacity`` nodes, go to the
-        device once; the node loop is one executable
-        (:func:`_device_window_runner`).  ``compile_only`` lowers and compiles
-        that executable without running it and returns the compiled
-        executable (for a caller that admits its peak).  ``overlap``: the
-        overlapped window (:data:`WINDOW_OVERLAP`) on GPU, the plain one elsewhere.
+        The window is a one-row :meth:`window_table` (its frequencies are the
+        list positions ``omega_indices`` holding ``omega_values``), read by
+        :meth:`window_pick`: the sweep's one coefficient path.  ``compile_only``
+        compiles the window executable without running it and returns it
+        (for a caller that admits its peak).  ``overlap``: the overlapped
+        window (:data:`WINDOW_OVERLAP`) on GPU, the plain one elsewhere.
+
+        A grid accumulator (:meth:`grid`) builds the window's coefficient
+        on the host instead, scattered into the complete frequency axis and
+        padded to ``capacity`` nodes, and places it once.
         """
-        t, alpha, columns, omega = self._window_rows(dict(
-            t=jax.device_get(t), alpha=jax.device_get(alpha),
-            omega_indices=omega_indices, omega_values=omega_values))
-        if not 0 < int(n_active) <= t.size <= int(capacity):
-            raise ValueError("require 0 < n_active <= len(t) <= capacity")
-        t_pad = np.zeros(int(capacity), np.complex128)
-        t_pad[:t.size] = t
-        if self._on_shell is None:
-            coeff = np.zeros((int(capacity), self._omega.size), np.complex128)
+        if self.is_grid:
+            t, alpha, columns, omega = self._window_rows(dict(
+                t=jax.device_get(t), alpha=jax.device_get(alpha),
+                omega_indices=omega_indices, omega_values=omega_values))
+            n_active = t.size
+            if not t.size <= int(capacity):
+                raise ValueError("require 0 < n_active <= len(t) <= capacity")
+            t_pad = np.zeros(int(capacity), np.complex128)
+            t_pad[:t.size] = t
+            coeff = np.zeros((int(capacity), self._grid_omega.size), np.complex128)
             coeff[:t.size, columns] = _omega_coefficient(
                 np, omega[None, :], t[:, None], alpha[:, None],
                 float(omega_sign), float(prefactor), float(e_ref_sum))
             coeff = device_put_process_local(coeff, self._replicated)
-        else:
-            coeff = self._on_shell_pack(alpha, columns, omega, capacity=capacity,
-                                        omega_sign=omega_sign, prefactor=prefactor,
-                                        e_ref_sum=e_ref_sum)
-        t_pad, n_active = (
-            device_put_process_local(np.asarray(x), self._replicated)
-            for x in (t_pad, np.int32(n_active)))
-        return self.run_window(tau_kernel, tau_arguments, t_pad, coeff, n_active, active_count,
+            t_pad, n_active = (
+                device_put_process_local(np.asarray(x), self._replicated)
+                for x in (t_pad, np.int32(n_active)))
+            return self.run_window(tau_kernel, tau_arguments, t_pad, coeff, n_active,
+                                   active_count, antihermitian=antihermitian,
+                                   overlap=overlap, compile_only=compile_only)
+        table = self.window_table([dict(
+            t=jax.device_get(t), alpha=jax.device_get(alpha), omega_indices=omega_indices,
+            omega_values=omega_values, omega_sign=omega_sign, prefactor=prefactor,
+            e_ref_sum=e_ref_sum)], capacity=capacity)
+        t_pad, pack, n_active, _, _ = self.window_pick(table, self.window_counter())
+        return self.run_window(tau_kernel, tau_arguments, t_pad, pack, n_active, active_count,
                                antihermitian=antihermitian, overlap=overlap,
                                compile_only=compile_only)
 
@@ -428,12 +470,12 @@ class DeviceOmegaAccumulator:
         if indices is None:
             if values is not None:
                 raise ValueError("omega_values requires omega_indices")
-            columns, omega = np.arange(self._omega.size), self._omega
+            columns, omega = np.arange(self._grid_omega.size), self._grid_omega
         else:
             columns = np.asarray(indices, dtype=np.int64)
             omega = np.asarray(values, dtype=np.complex128)
             if (columns.ndim != 1 or omega.shape != columns.shape
-                    or np.any(columns < 0) or np.any(columns >= self._omega.size)
+                    or np.any(columns < 0) or np.any(columns >= self._grid_omega.size)
                     or np.unique(columns).size != columns.size):
                 raise ValueError("invalid active frequency indices/values")
         return t, alpha, columns, omega
@@ -442,13 +484,56 @@ class DeviceOmegaAccumulator:
         """Place every window's coefficient inputs (and ``extras``) once: a :class:`WindowTable`.
 
         ``windows`` are dicts with ``t``, ``alpha``, ``omega_indices``,
-        ``omega_values``, ``omega_sign``, ``prefactor``, ``e_ref_sum`` (the
-        :meth:`integrate_window` arguments); ``extras`` maps a name to one host
-        array per window (equal shapes).  One process-local placement per
-        field per Σ call replaces the per-window transfers of the coefficient
-        table (``capacity x n_omega`` complex) and the window operands.
+        ``omega_values``, ``omega_sign``, ``prefactor``, ``e_ref_sum``;
+        ``extras`` maps a name to one host array per window (equal shapes).
+        A state belongs to a window when its frequency-list position is one
+        of the window's ``omega_indices``; the window's frequencies all lie on
+        one half, whose sign ``s_ext`` turns the state's signed ``ω`` into the
+        window's ``|ω|``.  One process-local placement per field per Σ call.
+        A grid accumulator places the grid fields instead (:meth:`_grid_window_table`).
         """
-        n_w, n_omega, capacity = len(windows), int(self._omega.size), int(capacity)
+        if self.is_grid:
+            return self._grid_window_table(windows, capacity=capacity, extras=extras)
+        n_w, capacity = len(windows), int(capacity)
+        host = dict(t=np.zeros((n_w, capacity), np.complex128),
+                    alpha=np.zeros((n_w, capacity), np.complex128),
+                    n=np.zeros(n_w, np.int32),
+                    own=np.zeros((n_w,) + self._index.shape, bool),
+                    scal=np.zeros((n_w, 4), np.complex128))
+        for i, window in enumerate(windows):
+            t = np.asarray(window["t"], np.complex128)
+            alpha = np.asarray(window["alpha"], np.complex128)
+            columns = np.asarray(window["omega_indices"], dtype=np.int64)
+            omega_abs = np.asarray(window["omega_values"], dtype=np.complex128)
+            if t.ndim != 1 or alpha.shape != t.shape or not 0 < t.size <= capacity:
+                raise ValueError("t and alpha must be nonempty equal vectors within capacity")
+            if (columns.ndim != 1 or omega_abs.shape != columns.shape
+                    or np.any(columns < 0) or np.any(columns >= self._frequencies.size)
+                    or np.unique(columns).size != columns.size):
+                raise ValueError("invalid active frequency indices/values")
+            signed = self._frequencies[columns]
+            ext = -1.0 if np.any(signed < 0.0) else 1.0
+            if not np.allclose(ext * signed, np.real(omega_abs), rtol=0.0, atol=1.0e-12):
+                raise ValueError("on-shell window: its frequencies straddle omega = 0 or do "
+                                 "not match their list positions")
+            host["t"][i, :t.size], host["alpha"][i, :t.size], host["n"][i] = t, alpha, t.size
+            host["own"][i] = np.isin(self._index, columns)
+            host["scal"][i] = (window["prefactor"], window.get("e_ref_sum", 0.0),
+                               window["omega_sign"], ext)
+        for name, rows in (extras or {}).items():
+            host["x_" + name] = np.stack([np.asarray(r) for r in rows])
+        fields = {k: device_put_process_local(np.ascontiguousarray(v), self._replicated)
+                  for k, v in host.items()}
+        return WindowTable(fields, host["n"])
+
+    def _grid_window_table(self, windows, *, capacity, extras=None):
+        """The grid :class:`WindowTable`: each window's frequencies on the full output axis.
+
+        One process-local placement per field per Σ call replaces the
+        per-window transfers of the coefficient table (``capacity x n_omega``
+        complex) and the window operands.
+        """
+        n_w, n_omega, capacity = len(windows), int(self._grid_omega.size), int(capacity)
         host = dict(t=np.zeros((n_w, capacity), np.complex128),
                     alpha=np.zeros((n_w, capacity), np.complex128),
                     n=np.zeros(n_w, np.int32),
@@ -469,43 +554,24 @@ class DeviceOmegaAccumulator:
                   for k, v in host.items()}
         return WindowTable(fields, host["n"])
 
-    @property
-    def on_shell(self):
-        """Whether this accumulator folds on-shell windows (``_on_shell_pack`` coefficients)."""
-        return self._on_shell is not None
-
-    def on_shell_coefficients(self, windows, *, capacity):
-        """Every window's on-shell pack (:meth:`_on_shell_pack`), placed once per Σ call.
-
-        The on-shell twin of :meth:`window_table`'s coefficient: ``windows`` are
-        its dicts; the energy table stays resident (``tables.omega``), so a pack
-        is the padded node weights, the ownership mask and four scalars.
-        """
-        packs = []
-        for window in windows:
-            _, alpha, columns, omega = self._window_rows(window)
-            packs.append(self._on_shell_pack(
-                alpha, columns, omega, capacity=capacity,
-                omega_sign=window["omega_sign"], prefactor=window["prefactor"],
-                e_ref_sum=window.get("e_ref_sum", 0.0)))
-        return packs
-
     def window_counter(self):
         """A device window counter at 0 for :meth:`window_pick`."""
         return _window_counter_program(self._replicated)()
 
     def window_pick(self, table, counter):
-        """Row ``counter`` of ``table`` on device: ``(t_pad, coeff, n_active, extras, counter + 1)``."""
-        return _window_pick_program(self._replicated)(table.fields, counter)
+        """Row ``counter`` of ``table`` on device: ``(t_pad, pack, n_active, extras, counter + 1)``.
 
-    def run_window(self, tau_kernel, tau_arguments, t_pad, coeff, n_active, active_count, *,
+        On the grid ``pack`` is the window's ``(capacity, n_omega)`` coefficient."""
+        return _window_pick_program(self._replicated, self.is_grid)(table.fields, counter)
+
+    def run_window(self, tau_kernel, tau_arguments, t_pad, pack, n_active, active_count, *,
                    antihermitian=False, overlap=False, compile_only=False):
         """Run (or, ``compile_only``, compile) one window from its device operands."""
         run = _device_window_runner(
-            tau_kernel, self._sharding, self._omega_axis, bool(antihermitian),
-            self._reduce, bool(overlap) and self._gpu, self._on_shell is not None)
-        arguments = (self._total, tuple(tau_arguments), t_pad, coeff,
-                     n_active, active_count)
+            tau_kernel, self._sharding, bool(antihermitian), self._reduce,
+            bool(overlap) and self._gpu, self._omega_axis)
+        coeff = pack if self.is_grid else dict(pack, omega=self._omega)
+        arguments = (self._total, tuple(tau_arguments), t_pad, coeff, n_active, active_count)
         if compile_only:
             # A later SC map asks again for the same runner and signature;
             # the admitted executable is the same, so compile it once.
@@ -517,30 +583,6 @@ class DeviceOmegaAccumulator:
             return _WINDOW_COMPILED[key]
         self._total = run(*arguments)
         return self._total
-
-    def _on_shell_pack(self, alpha, columns, omega_abs, *, capacity, omega_sign,
-                       prefactor, e_ref_sum):
-        """The window's on-shell coefficient pack (:func:`_device_window_runner`).
-
-        A state belongs to the window when its frequency-list position is one
-        of the window's ``columns``; the window's frequencies all lie on one
-        half, whose sign ``s_ext`` turns the state's signed ``ω`` into the
-        window's ``|ω|``.  Only the node weights, the ownership mask and four
-        scalars travel per window: the energy tables stay on the devices.
-        """
-        tables = self._on_shell
-        signed = np.real(self._omega[columns])
-        ext = -1.0 if np.any(signed < 0.0) else 1.0
-        if not np.allclose(ext * signed, np.real(omega_abs), rtol=0.0, atol=1.0e-12):
-            raise ValueError("on-shell window: its frequencies straddle omega = 0 or do not "
-                             "match their list positions")
-        own = np.isin(tables.index, columns)
-        alpha_pad = np.zeros(int(capacity), np.complex128)
-        alpha_pad[:alpha.size] = alpha
-        scal = np.asarray([prefactor, e_ref_sum, omega_sign, ext], np.complex128)
-        alpha_pad, own, scal = (device_put_process_local(np.asarray(x), self._replicated)
-                                for x in (alpha_pad, own, scal))
-        return dict(alpha=alpha_pad, own=own, omega=tables.omega, scal=scal)
 
     def finalize(self):
         return self._total

@@ -1,11 +1,12 @@
 """Checkpoints of sharded cubes plus a small host record, read back by authenticated identity.
 
 Two owners use it. ``gw.sigma_dispatch`` keeps a one-shot shared-pole Σ sweep
-(over an hour on large decks) between the τ sweep and finalize: a rerun with
-``restart = true`` whose state authenticates goes straight to finalize. The SC
-loop (``gw.sc_iteration``) keeps its Anderson window and carry beside each
-warm seed, ``sc_seed/sc_checkpoint.h5`` (``SC_SCHEMA``), so a fresh process
-continues the trajectory (docs/self_consistency.md §8).
+on the omega grid (``sigma_omega_grid_debug``; over an hour on large decks)
+between the τ sweep and finalize: a rerun with ``restart = true`` whose state
+authenticates goes straight to finalize (an on-shell sweep checkpoint is not
+implemented).  The SC loop (``gw.sc_iteration``) keeps its Anderson window and
+carry beside each warm seed, ``sc_seed/sc_checkpoint.h5`` (``SC_SCHEMA``), so a
+fresh process continues the trajectory (docs/self_consistency.md §8).
 
 The cubes go through SlabIO from their own shards: no gather, no copy. The
 host record (JSON) and, for the SC loop, one ``state`` blob are written by

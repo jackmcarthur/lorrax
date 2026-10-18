@@ -730,7 +730,7 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
 
 
 def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
-                         on_shell=None, linalg=None, **options):
+                         lorentz_shell=None, linalg=None, **options):
     """Integrate CC, TT and the mixed pair CT + TC (one fused window) on their own pole sets.
 
     ``options`` is the common MPA/shared-pole quadrature contract; its live
@@ -820,9 +820,9 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 sigma_w_model='shared_pole',fit_identity=sectors[names[0]]['identity'],
                 fit_digest=sectors[names[0]]['digest'],sector_context=context,**opts)
             for builder in bound:builder.close(value.sigma_c_kij)
-            if on_shell is not None and (a or b):
+            if lorentz_shell is not None and (a or b):
                 channel=int(bool(a and b))  # 0: CT+TC, 1: TT
-                shell=on_shell(value)
+                shell=lorentz_shell(value)
                 currents[channel]=(shell if currents[channel] is None
                                    else currents[channel]+shell)
             if isinstance(value.sigma_c_kij,BandCountCube):
@@ -846,8 +846,8 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
             stage=f"{handle['model_stage']}.CC")
     constant=instantaneous_sector_sigma(handle['constant'],families,bases,meta,mesh_xy,
         occupation_state=options.get('occupation_state'),
-        return_components=on_shell is not None)
-    if on_shell is not None:
+        return_components=lorentz_shell is not None)
+    if lorentz_shell is not None:
         constant, ct_constant, tt_constant=constant
         for channel, part in enumerate((ct_constant, tt_constant)):
             # QSGW Hermitises the total constant after interpolation.
@@ -856,14 +856,14 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     # Static band axes use the same carrier as dynamic Sigma; pad only through
     # the existing semantic band-axis owner before broadcasting in omega.
     constant=pad_square(constant,total.band_axis,axes=(1,2))
-    from gw.ppm_sigma import OnShellSigma, add_on_shell_term
+    from gw.ppm_sigma import add_on_shell_term, is_on_shell
     result=replace(total,sigma_c_kij=(
         add_on_shell_term(total.sigma_c_kij,constant)
-        if isinstance(total.sigma_c_kij,OnShellSigma) else total.sigma_c_kij+constant[None]))
+        if is_on_shell(total.sigma_c_kij) else total.sigma_c_kij+constant[None]))
     if counts is not None:
         # TT, CT, TC and W∞ − V enter every CC count alike.
         result=replace(counts,sigma_c_kij=replace(counts.sigma_c_kij,term=result.sigma_c_kij))
-    return (result, tuple(currents)) if on_shell is not None else result
+    return (result, tuple(currents)) if lorentz_shell is not None else result
 
 
 @lru_cache(maxsize=None)
