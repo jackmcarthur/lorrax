@@ -132,8 +132,8 @@ the cube instead of reading a table. It writes:
 - `sigma_freq_debug.dat` (with `sigma_freq_debug_output`) read on the C(ω)
   curve, the head interpolated on the grid; `qp_omega0_ev` (with
   `write_qsgw_datasets`), the H₀ + Σ_x + Σ_c(ω ≈ 0) ladder, on an
-  unsharded cube only (the rank-0 appendix names a band-sharded one as
-  omitted).
+  unsharded cube only (the rank-0 appendix names a band-sharded one, under
+  `sigma_omega_layout = sharded`, as omitted).
 - Under SC: the QSGW pair interpolated from the cube, Z from the stencil,
   the cube rotated to the DFT basis at the end so `sigma_diag.dat` carries
   `sigC`/`sigXC` at E_DFT, and the edge census read on the cube.

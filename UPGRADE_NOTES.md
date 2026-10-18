@@ -14,8 +14,12 @@ output is the one `c2975e450` wrote with the same key. That covers the
 `(n_ω, nk, nb, nb)` cube and `omega_ev` in `sigma_mnk.h5`, eqp0/eqp1 from the
 interpolated Σ_c and the stencil Z, the C(ω) eqp receipt (and
 `python -m gw.eqp_bgw --finite-difference-spacing`), `sigma_freq_debug.dat`,
-`qp_omega0_ev`, the SC `sigC`/`sigXC` columns, and the one-shot sweep
-checkpoint (`tmp/sigma_checkpoint_oneshot.h5`, written and read on restart).
+the SC `sigC`/`sigXC` columns, and the one-shot sweep checkpoint
+(`tmp/sigma_checkpoint_oneshot.h5`, written and read on restart).
+`qp_omega0_ev` (`write_qsgw_datasets`) is back as `c2975e450` had it: written
+for an unsharded cube only. Under `sigma_omega_layout = sharded` it is
+omitted by name, as before; that held on every validation leg (4 ranks and
+1), so it was not compared bitwise.
 
 - **Default path unchanged.** With the key unset, results are bitwise those
   of `663c27863` (the on-shell entry below). Measured on Fe 8^3 (MPA shared
