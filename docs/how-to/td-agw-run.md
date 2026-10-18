@@ -1,8 +1,8 @@
 # Running TD-aGW: decks, the log, the integrator
 
 This page is for running `tdagw.tdgw_jax` on a system you already have: three
-example drives, how to read the run log `tdagw.out`, and which integrator to
-pick, with costs measured on the production 30×30 CrI3 model. It restates no
+example drives, how to read the run log `tdagw.out`, the collision term, and
+which integrator to pick, with costs measured on the production 30×30 CrI3 model. It restates no
 equation and no key. The equation of motion and the schemes are on
 [TD-aGW propagation](../theory/td_agw_propagation.md), every deck key with its
 default and refusals in the [input reference](../input_reference.md#td-agw)
@@ -182,6 +182,53 @@ a drift far above rounding in a Γ = 0 run is a defect. With Γ ≠ 0, Tr ρ² d
 design. The energy is not logged: it needs ΔΣ[ρ] at every sample. A run that a
 gate refuses still closes its log: the gate's lines, the refusal's message and a
 `REFUSED (… GATE <id>)` line.
+
+## The collision term {#collision}
+
+`[lorrax] collision = "subtracted"` adds the on-shell GW collision term of a
+GN-PPM bundle ([TD-aGW dynamical §1.5](../theory/td_agw_dynamical.md#damping)):
+out- and in-scattering rates from the two branches of the bundle's own Σ
+sweep, held between refreshes, and the dissipative flow solved exactly. It
+needs `system = "bundle"` on a `compute_mode = gn_ppm` run; the keys are in the
+[input reference](../input_reference.md#td-agw).
+
+```toml
+[lorrax]
+system = "bundle"
+bundle_input = "<07>/oneshot.in"          # a GN-PPM GW deck
+dipole_file = "<07>/dipole.h5"
+model = "isdf"
+method = "cfm4"
+dt = 25.0
+collision = "subtracted"                  # C[rho] - C[rho_eq]: rho_eq is a fixed point
+collision_refresh_fs = 0.5                # refresh the rates every 0.5 fs ...
+collision_refresh_df = 1e-3               # ... or when a population moves by 1e-3
+```
+
+At the start the driver reruns the GW deck in its own process
+(`outdir/collision_source`, no restart written; 34.7 s on the 516 6×6 bundle,
+warm cache) to recover the pole model. The log's `Collision refreshes` section
+(after the progress table) has the t0 receipt and one line per refresh; from the
+516 drive (5e8 V/m, 8 fs, 4 A100):
+
+```text
+  collision t0     : subtracted, hermitian dynamic; rates at rho_eq: diag out [-3.33, 132] meV, in [24.6, 196] meV, min eig G~ 122 meV (G~> -3.64, G~< 24); ||C[rho_eq]|| diag 1.047e-03 off-diag 4.785e-04 Ha/hbar; wall 4.20 s (sweep 4.13, build 0.07)
+  collision refresh   5 at    2.5000 fs (cadence): wall 4.40 s (sweep 4.40, rates 0.000, dissipator 0.001, hermitian 0.002), max|df| 1.274e-04, dTr rho +6.011e-07 since last; ...
+```
+
+Read the t0 line first. Rates of the size of the GW run's regularization width
+(`sigma_regularization_ev`, 0.25 eV by default) at band edges are its tails, not
+scattering: on the 516 2v2c window they shrink five-fold at 0.05 eV. Use
+`raw` only to see that drift: `C[rho_eq]` is not zero, and on 516 the raw form
+moves Tr ρ by 0.14 per k in 2.5 fs. A refresh costs one window Σ sweep (3.2 s on
+516 at P4, the incumbent call's cost; the flow and the dissipator are below a
+millisecond), so the refresh cadence, not the step, sets the wall: two
+refreshes per fs made the 516 drive 8.1 s per fs (steady chunks) against 0.31 s per
+fs without the term.
+`collision_hermitian = "dynamic"` (default) holds the dynamical part of the
+on-shell Hermitian change; `full` also re-adds its static-W limit, which K
+already holds (0.08 % of P(t) on the 516 drive). A collision run does not
+restart from a checkpoint.
 
 ## Choosing an integrator {#integrators}
 

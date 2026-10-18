@@ -254,6 +254,82 @@ the widths of the correlated ground state, and the subtraction removes both.
 * **Code.** `window_sigma_c` returns both branches' pair tables from one τ
   sweep and the complex $U\tilde\Sigma U^\dagger$, not its Hermitian part.
 
+**As implemented (GN-PPM member, W frozen at the run's poles).** The path is
+`window_sigma_c(branches=True)` → `tdagw.collision` (rates, $C[\rho]$, the
+held flow, the Hermitian update) → `tdagw.propagate.collision_program` (one
+jitted `shard_map`: the dissipator, $C[\rho^{\rm eq}]$, the trace split) →
+`ops.collision`, refreshed by `run_propagation`'s chunk-end hook
+(`tdagw.dynsig.gnppm_collision`); deck keys `[lorrax] collision*`
+([input reference](../input_reference.md#td-agw)). Where it differs from the
+text above:
+
+* **One sweep, branches kept.** `gw.mpa.sigma._integrate_sigma_batches(keep_branches=True)`
+  folds each window into its branch's accumulator (cond, val) instead of one;
+  the total is their sum after finalization, equal to the incumbent's to
+  rounding, and with the option off the incumbent's accumulator and outputs are
+  unchanged bitwise. The head splits by its own terms: $f/(\delta+z)$ to the hole
+  branch, $(1-f)/(\delta-z)$ to the particle branch; the invalid-pole static term
+  is a third, Hermitian table. `window_sigma_c` now returns `onshell`
+  ($U\tilde\Sigma U^\dagger$, complex) in place of the Hermitian `static`, and
+  slices the window blocks on the device.
+* **Hole sign.** The sweep's hole branch is time ordered ($E-\epsilon+\Omega-i\eta$),
+  so the code takes $\tilde\Gamma^<=-i(\tilde\Sigma_h-\tilde\Sigma_h^\dagger)$
+  (`tdagw.collision.HOLE_BRANCH_SIGN`), equal to the retarded form above because
+  both GN-PPM residues are Hermitian ([GN-PPM §3](gn-ppm-nonhermitian.md)); the
+  synthetic dense reference pins it (`tests/test_tdagw_dynsig_sigma.py` G7, twin R5).
+* **Positivity is measured, not assumed.** The on-shell average of the
+  off-diagonal pairs and residues that are Hermitian but not positive make
+  $\tilde\Gamma^>$, $\tilde\Gamma^<$ indefinite in general; each refresh logs the
+  smallest eigenvalue of $\tilde\Gamma$, and the flow is exact for either sign.
+* **The held Hermitian part.** $K\delta\rho$ already carries the static screened
+  exchange of the populations, $-W^c(0)\,\delta f$, which is the static-$W$
+  limit of the GN-PPM population response. The default
+  (`collision_hermitian = dynamic`) therefore holds
+  $\mathrm{Herm}\,\tilde\Sigma[\rho]-\mathrm{Herm}\,\tilde\Sigma[\rho^{\rm eq}]$
+  minus the same change of that static limit (`window_sigma_c(static_limit=True)`:
+  the window block of $-\langle G_{\rm occ}W^c(0)\rangle$ on every mode plus the
+  head's static limit), the correction that vanishes as the pole energies go to
+  infinity (§2). `full` is the literal difference (it counts the static part
+  twice); `none` drops it.
+* **Explicit methods.** dp54, rk4 and etdrk4 carry the generator
+  $-\tfrac12\{\tilde\Gamma,x\}+S$ in the right-hand side; magnus2 and cfm4 apply
+  the exact flow in the remainder slot (Strang, triple jump for cfm4), on the
+  Schrödinger-picture $\Delta\rho$, so cfm4 stays fourth order.
+* **Refresh.** At a chunk end, by cadence (`collision_refresh_fs`) and/or
+  $\max|f-f_{\rm last}|$ (`collision_refresh_df`): one window sweep per trial at
+  $f=\mathrm{diag}\,\rho$ (dress none: $U=1$, $e=\epsilon^G$, the coherences not in
+  the rates), the rates, the dissipator and $\Delta\Sigma^{\rm h}$, all handed
+  to the next chunk as jit operands of the same shapes, so no chunk program is
+  rebuilt. The carry absorbs the change: the explicit methods' last derivative
+  is re-evaluated, and the Magnus predictor history gains the held term's change
+  in each entry's frame (exact for a term constant in $\rho$).
+* **Source of the poles.** A GN-PPM run persists $W(0)$ but not its pole model,
+  so with `collision` on the TD driver runs the GW driver in its own process on
+  a copy of `bundle_input` (`outdir/collision_source`, no restart written) and
+  reads the Σ stage's carrier, poles and head at its return
+  (`gw.ppm_pipeline.observe_window_sigma_source`). A restart with the collision
+  on refuses (`GATE td_collision_restart`): the held rates are not in the carry.
+* **Stability gate.** The gate measures the coherent problem; the collision is
+  attached after it (the flow is a contraction where $\tilde\Gamma\ge0$).
+* **Measured (CrI3 516, 07 GN-PPM arm, 4 A100, 2026-10-18).** The branches of
+  one sweep sum to the incumbent pair to $1.5\times10^{-16}$ (relative);
+  $\tilde\Gamma^>$, $\tilde\Gamma^<$ match an explicit $(q,s,\mu,\nu)$ NumPy sum with
+  the run's residues to $4\times10^{-5}$ and $2\times10^{-3}$ of their maxima
+  (the sweep's τ quadrature, $\sim5\times10^{-5}$ of $|\Sigma|$). At the run's
+  regularization, 0.25 eV, the band-edge rates of the 2v2c window are
+  regularization tails, $\propto\eta$: $\tilde\Gamma^>_{cc}$ 113–132 meV and
+  $\tilde\Gamma^<_{vv}$ 125–196 meV, five times smaller at 0.05 eV; so are those of
+  the 10v14c window [120, 144) (up to 222 meV, 44 meV at 0.05 eV: no
+  $\eta$-independent channel inside it). $C[\rho^{\rm eq}]$ is 28 meV on the
+  diagonal and 13 meV off it; the subtracted form keeps $\rho^{\rm eq}$ exactly
+  (deviation 0 over 2.45 fs), the raw form drifts by 0.14 in $\mathrm{Tr}\,\rho$ per
+  $k$. A refresh costs one window sweep (3.24 s against the incumbent call's
+  3.22 s; 6.29 s against 6.27 s on one A100); the flow is 0.08 ms per call
+  against 1.5 ms for one ΔΣ apply; one chunk program per run, no retrace across
+  15–31 refreshes; the chunk program's collectives are unchanged. Physical
+  rates at band edges therefore need a smaller regularization width than the
+  Σ quadrature uses, or the shared-pole member.
+
 ### 1.6 The active space: band window or disentangled subspace (proposed) {#active-space}
 
 $A$ is a band-index range. Where a band of other character enters $A$'s
@@ -538,7 +614,10 @@ Eq. (6) and the pole model when $\max_k|\delta f|$ has moved by a set
 tolerance since the last refresh, and in between applies
 $\Delta\Sigma=K\delta\rho+\Delta\Sigma^{\rm dyn}_{\rm last}$ (its coherent part
 exact, its population part held). The refresh is a host-side decision at a
-chunk boundary, so the jitted step stays one program. At one refresh per fs,
+chunk boundary, so the jitted step stays one program. The collision term
+(§1.5) refreshes this way now: `[lorrax] collision_refresh_fs` (cadence) and
+`collision_refresh_df` (population tolerance), one line per refresh in the log's
+`Collision refreshes` section. At one refresh per fs,
 a 30 fs 12×12 drive costs at most 30 × 82 s + 2400 × 0.31 s ≈ 53 min on 4 A100.
 
 ## 8. Validation {#validation}
@@ -614,9 +693,11 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    head and the on-shell frequency list. It returns $\Sigma_{ij}(e_i)$,
    $\Sigma_{ij}(e_j)$, the static operator
    $U[\tfrac12(\cdot+\cdot)]^{\rm h}U^\dagger$ and, on request,
-   $\Sigma(\omega)$. Under §1.5 it is to return both branches' pair tables
-   from one sweep and $U\tilde\Sigma U^\dagger$ without the Hermitian
-   projection (to do). Limits: the projection is the band prefix $[0,b_{\rm hi})$,
+   $\Sigma(\omega)$. Under §1.5 it returns both branches' pair tables from one
+   sweep (`branches=True`), $U\tilde\Sigma U^\dagger$ without the Hermitian
+   projection (`onshell`) and the static-$W$ limit of the populations'
+   exchange (`static_limit=True`), done on branch
+   `feat/td-agw-dynsig-collision-2026-10-17`. Limits: the projection is the band prefix $[0,b_{\rm hi})$,
    not the window alone, because the invalid-mode static term sums the
    occupied bands (window decode is item 6); the head is the run's
    `HeadSigmaDiag` at the instantaneous $e$, $f$ (frozen $W_h$, §1.4); only
