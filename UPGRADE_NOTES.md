@@ -5,6 +5,43 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-18 — Sigma(omega) grid debug restored
+
+The ω-grid Σ_c(ω) path is back as an opt-in debug path,
+`sigma_omega_grid_debug = true` (default false; [On-shell Σ_c §grid
+debug](docs/theory/sigma-on-shell.md#grid-debug)). With the key set, every
+output is the one `c2975e450` wrote with the same key. That covers the
+`(n_ω, nk, nb, nb)` cube and `omega_ev` in `sigma_mnk.h5`, eqp0/eqp1 from the
+interpolated Σ_c and the stencil Z, the C(ω) eqp receipt (and
+`python -m gw.eqp_bgw --finite-difference-spacing`), `sigma_freq_debug.dat`,
+`qp_omega0_ev`, the SC `sigC`/`sigXC` columns, and the one-shot sweep
+checkpoint (`tmp/sigma_checkpoint_oneshot.h5`, written and read on restart).
+
+- **Default path unchanged.** With the key unset, results are bitwise those
+  of `663c27863` (the on-shell entry below). Measured on Fe 8^3 (MPA shared
+  pole, 4 A100 ranks, SC map and one-shot): the eqp0/eqp1/sigma_diag bodies,
+  every `sigma_mnk.h5` dataset and attribute, the Response-quadrature lines
+  and the per-rank device peak.
+- **Grid outputs as before.** With the key, on the same deck, the same files
+  plus the cube, `omega_ev`, `sigma_freq_debug.dat`, the C(ω) receipt and the
+  sweep checkpoint (written, and read on restart) are bitwise those of
+  `c2975e450`.
+- **Cost under the key.** On that deck (n_ω = 271) `sigma_mnk.h5` grows
+  from 7.9 MiB to 714 MiB and the τ sweep from 105.3 s to 122.3 s; the
+  per-rank device peak does not move (the W response sets it). A one-shot
+  run also writes a 2.99 GiB sweep checkpoint.
+- **eqp2 stays retired.** `write_eqp2`, `eqp2_tol_ev`, `eqp2_max_iter`,
+  `eqp2_accelerator`, `eqp2_history_depth` and `eqp2_file` still refuse by
+  name at parse time, now as `GATE eqp2_retired`; `sigma_omega_grid_debug`
+  no longer refuses. `eqp2.dat` is not written.
+- **Not restored:** the `omega_ev`/`sigc_omega_ev_{re,im}` curve of
+  `python -m gw.plane_wave_pipeline --deck` (it stays on shell).
+- **API:** `DebugConfig.sigma_omega_grid_debug` is back;
+  `DeviceOmegaAccumulator.grid(...)` builds the grid accumulator.
+  `LorraxConfig.eqp2`, `EQP2Config` and `FilePaths.eqp2_file` stay removed.
+- **What you must change:** nothing for default decks. A deck that dropped
+  `sigma_omega_grid_debug = true` because of the retirement may set it again.
+
 ## 2026-10-17 — ROCm: ELPA is the distributed eigensolver
 
 On Frontier (ROCm), `eigh` with `linalg = "distributed"` above the one-device
@@ -39,6 +76,59 @@ Residual and orthogonality ~1e-14.
 `config/frontier/build_elpa_hip.sh` (two LORRAX source patches) into a
 content-keyed prefix. The leg's closure record gains `libelpa_openmp.so.19`
 (private). Unset any `ELPA_FORCE_*` variable.
+
+## 2026-10-17 — Sigma_c on shell only: the ω-grid path and eqp2 are retired
+
+Dynamic Σ_c is evaluated on shell only
+([On-shell Σ_c](docs/theory/sigma-on-shell.md)). The ω-grid debug path
+(`sigma_omega_grid_debug = true`) and everything only it fed are removed.
+That includes the grid fold, the ω-cube unfold and writer, the interpolating
+readers, the finite-difference Z, the streamed ω combination, the C(ω) eqp
+receipt, the sweep checkpoint and fixed-Σ evSC (`eqp2.dat`).
+
+- **Results do not move** on the remaining paths. Measured on Fe 8^3 P4
+  (one SC map, A100), against the previous commit: the eqp0/eqp1 bodies are
+  bitwise identical. The sigma_diag body is identical on every column the
+  two files share; the SC `sigC`/`sigXC` columns are omitted (below). The
+  P4 hsuite passes against its references.
+- **Deck keys removed.** Each one refuses by name at parse time, with any
+  value (`GATE omega_grid_retired`): `sigma_omega_grid_debug`, `write_eqp2`,
+  `eqp2_tol_ev`, `eqp2_max_iter`, `eqp2_accelerator`, `eqp2_history_depth`,
+  `eqp2_file`. Delete the lines; nothing replaces them.
+- **Outputs removed:**
+  - `eqp2.dat` and its report section.
+  - The `(n_ω, nk, nb, nb)` Σ_c(ω) cube and `omega_ev` in `sigma_mnk.h5`.
+  - `qp_omega0_ev` (`write_qsgw_datasets`): named as omitted, permanently.
+  - The C(ω) curve in the eqp receipt (`eqp_assembly_conditioned_sigma_c_omega_diag_ev`).
+  - The `omega_ev` and `sigc_omega_ev_{re,im}` keys of
+    `python -m gw.plane_wave_pipeline --deck`. Its `sigc_at_e_ev` is now the
+    exact on-shell Σ_c,nn(E_DFT): the `dft0` table, Σ(0) outside the covered
+    range, where the old value was a clamped interpolation.
+- **`sigma_diag.dat` under SC** no longer carries a column of zeros for the
+  DFT-basis Σ_c(E_DFT), which on shell does not exist. The `sigC` and
+  `sigXC` columns are omitted and named in a `# omitted:` header line.
+- **`sigma_freq_debug.dat`** (one-shot) reads the on-shell operand: Σ_c at
+  E_DFT and E_eval, dΣ/dω, Z, and the q→0 head at E_DFT. Under SC it is
+  omitted by name.
+- **`eqp_bgw.make_eqp_bgw`** reassembles from the on-shell receipt only. An
+  old ω-grid `sigma_mnk.h5` refuses (`GATE omega_grid_receipt_retired`). The
+  CLI option `--finite-difference-spacing` is gone.
+- **Z guard.** eqp1 and the SC tail weights share one Z
+  (`eqp_bgw.on_shell_z_factor`). It prints one line counting states with Z
+  outside (0, 1] or non-finite, and a non-finite Z refuses
+  (`GATE z_factor_finite`).
+- **SC grid-edge census** (`sigma_out_of_grid = static`) runs on shell again,
+  from two diagonal-only tables, Σ(0) and Σ at the nearer range edge, that
+  the request adds in that mode only.
+- **Restart:** a `sigma_checkpoint_oneshot.h5` from the grid path is no
+  longer read. The on-shell sweep is recomputed on restart, as before.
+- **API:** `mixing.acceleration.rcrop_nojit`, `band_partition.
+  apply_band_partition`/`build_omega_band_partition` and `scissor.
+  qsgw_out_of_range_energies`/`classify_bands_in_grid` are removed (their one
+  caller was eqp2). `LorraxConfig.eqp2`, `EQP2Config`,
+  `DebugConfig.sigma_omega_grid_debug` and `FilePaths.eqp2_file` are gone.
+- **What you must change:** delete the removed keys from decks, and stop
+  reading `eqp2.dat`, `qp_omega0_ev` or an ω axis from `sigma_mnk.h5`.
 
 ## 2026-10-17 — k-convolution kernels: four sub-1.15× arms removed (CUDA)
 
