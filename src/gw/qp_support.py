@@ -53,9 +53,9 @@ SUPPORT_PAD_EV = 2.0
 def read_halfwidth_ev():
     """Half-width of the Σ(ω) samples one state's evaluation reads.
 
-    A state is counted on its grid while [E − dE, E + dE] is, dE the
-    historical Z stencil spacing (``eqp_bgw.Z_FINITE_DIFFERENCE_EV``); on shell
-    Z is exact, so this is only the support pad's coverage margin.
+    Σ(E) is read at E and the Z stencil at E ± dE
+    (``eqp_bgw.compute_z_factor_from_omega_grid``), so a state is on its grid
+    while [E − dE, E + dE] is.
     """
     from .eqp_bgw import Z_FINITE_DIFFERENCE_EV
     return float(Z_FINITE_DIFFERENCE_EV)
@@ -65,7 +65,8 @@ def quasiparticle_mask(z_kn):
     """``Z ∈ (0, 1]`` per state: a quasiparticle.
 
     The upper bound is read on the build grid (``sigma_box_plan.snap_outward``,
-    1e-4 cells): a flat-Σ state sits at Z = 1 to within its round-off, and an exact ``z <= 1`` lets round-off drop it (Fe 4^3 SC: 76 vs 75
+    1e-4 cells): a flat-Σ state sits at Z = 1 to within its finite-difference
+    noise, and an exact ``z <= 1`` lets round-off drop it (Fe 4^3 SC: 76 vs 75
     tail samples).
     """
     from .sigma_box_plan import snap_outward

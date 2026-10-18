@@ -123,23 +123,32 @@ class GWResults:
     sigma_kset: str = SIGMA_KSET_FULL_BZ
     sigma_c_diag_at_dft_ry: np.ndarray | None = None
     sigma_xc_at_dft_ev: np.ndarray | None = None
-    #: The on-shell eqp operand (``eqp_bgw.ON_SHELL_*`` rows, (4, nk, nb),
-    #: full BZ, degeneracy-averaged): the live assembler reads BOTH C(E_DFT)
-    #: and Z from it.  None in static modes ⇒ Z=1.  ``_raw`` is its twin
-    #: with the band sum truncated at N bands, no spectral_shell tail
-    #: (``SigmaResult.sigma_c_on_shell_diag_unextrap``), present only on
-    #: one-shot runs with band extrapolation on; it feeds sigma_diag.dat's
-    #: sigC_raw, eqp0_raw and eqp1_raw columns.
-    sigma_c_on_shell_diag: np.ndarray | None = None
-    sigma_c_on_shell_diag_raw: np.ndarray | None = None
+    # Output-conditioned ω-grid Σ_c diagonal (PPM modes only).  The live
+    # assembler derives BOTH C(E_DFT) and Z from this one curve; the persisted
+    # full operator cube remains raw.  Shape (n_omega, nk, nb_sigma), eV; ω
+    # is relative to the run's stamped reference.  None in static modes ⇒ Z=1.
+    sigma_c_omega_diag_ev: np.ndarray | None = None
+    # The RAW twins of the two Σ_c diagonals above: the band sum truncated
+    # at N bands, no spectral_shell tail (``SigmaResult.sigma_c_*_unextrap``),
+    # same conditioning.  Present only on one-shot runs with band
+    # extrapolation on; they feed sigma_diag.dat's sigC_raw, eqp0_raw and
+    # eqp1_raw columns.
+    sigma_c_omega_diag_raw_ev: np.ndarray | None = None
+    sigma_c_diag_at_dft_raw_ry: np.ndarray | None = None
+    #: The on-shell operands (``eqp_bgw.OnShellDiagonal``, full-BZ (nk, nb),
+    #: degeneracy-averaged like the curve) in place of the two curves above
+    #: when Sigma was evaluated on shell (``sigma_omega_grid_debug`` off).
+    sigma_c_on_shell_diag: object | None = None
+    sigma_c_on_shell_diag_raw: object | None = None
+    omega_rel_ev: np.ndarray | None = None
     # The energies Σ WAS EVALUATED AT this call (``SigmaResult.e_eval_ev``),
     # absolute eV, shape (nk_result, nb_sigma).  E_DFT for a one-shot run;
     # the map's input QP energies on the loop k-set under self-consistency.
     # eqp1's
     # linearization is centred here — ``eqp_bgw.compute_eqp_diag``.
     e_eval_ev: np.ndarray | None = None
-    # The ω reference the Σ body was built with and the finalize read
-    # at — a fixed-N μ on a metal, mid-gap on an insulator.
+    # The ω reference the Σ(ω) grid was built with and the finalize
+    # interpolated at — a fixed-N μ on a metal, mid-gap on an insulator.
     # Computed once in the dynamic finalize (``dynamic_sigma``) from
     # ``meta.nelec`` (NOT from the sigma-window band count) and carried,
     # never re-derived.  Required by the eqp.dat writer in dynamic modes;
@@ -147,6 +156,13 @@ class GWResults:
     efermi_ev: float | None = None
     sigma_omega_h5_path: str | None = None
     tensors_filename: str | None = None
+    # Optional fixed-Sigma eigenvalue-self-consistent ladder.  This is an
+    # additional result beside the ordinary one-shot E_qp_ry/U_qp pair;
+    # screening and Sigma were not rebuilt to obtain it.
+    E_eqp2_ry: np.ndarray | None = None
+    eqp2_iterations: int | None = None
+    eqp2_residual_ev: float | None = None
+    eqp2_tol_ev: float | None = None
     #: Exact final-block q=0 photon-head diagonals in Ry, axes
     #: (term=X/SX/COH, sector=CC/CT+TC/TT, k, band).  ``None`` is accepted
     #: for historical constructors; the debug writer emits exact-zero columns.
@@ -707,7 +723,8 @@ def write_freq_debug(
     config,
     static_head_terms,
     omega_dft_rel_ev,
-    head_at_dft_ry,
+    head_sigma_diag_w_kn_ry,
+    omega_grid_ry,
     sym,
     file_sym=None,
     e_eval_ev=None,
@@ -717,17 +734,16 @@ def write_freq_debug(
 
     Single seam at the H-build output: dumps the diagonal pieces that
     feed the BGW-format ``eqp0`` (Σ_tot at E_DFT) and ``eqp1`` (the same
-    Σ_tot − E_DFT extrapolated by the on-shell Z, the exact slope of
-    dRe[Σ_c]/dω at the evaluation energies).  By construction
+    Σ_tot − E_DFT extrapolated by the Z-factor central-difference slope
+    of dRe[Σ_c]/dω at E=E_DFT).  By construction
     ``eqp0 ≟ kin_ion + V_H + x_bare + sig_c(Edft).Re`` exactly, and
     ``eqp1 ≟ E_ref + Z·Δ(E_ref)`` with Z=1 in static modes
     (degenerate eqp1==eqp0) and E_ref = ``e_eval_ev`` — the energies Σ
     was evaluated at, E_DFT unless a self-consistent run says otherwise
     (``eqp_bgw.compute_eqp_diag``).  Head corrections are also exposed as
     their own columns: ``x_head`` (always when the head is computed)
-    and either ``sig_c_head(Edft)`` (PPM, ``head_at_dft_ry``: the dynamic
-    head on the on-shell ``dft0`` table) or ``sex_head/coh_head`` (static,
-    screened mode).
+    and either ``sig_c_head(Edft)`` (PPM) or ``sex_head/coh_head``
+    (static, screened mode).
 
     No-op unless ``config.debug.sigma_freq_debug_output`` is set.
     Physical head completion does not enable diagnostic output.
@@ -735,17 +751,17 @@ def write_freq_debug(
     _has_photon_head = results.photon_head_sigma_basis is not None
     if not config.debug.sigma_freq_debug_output:
         return
-    if results.use_ppm and results.sigma_c_on_shell_diag is None:
-        # The table's Sigma columns are reads of the on-shell operand, which
-        # an SC run drops (its slots carry the QP basis's band labels).
-        print_fn("  sigma_freq_debug.dat: omitted: an SC run's on-shell Sigma_c has "
-                 "no DFT-basis Sigma_c(E_DFT)")
+    if results.use_ppm and results.sigma_c_omega_diag_ev is None:
+        # The table's Sigma columns are reads of the omega curve.
+        print_fn("  sigma_freq_debug.dat: omitted, Sigma_c was evaluated on shell "
+                 "(no omega curve); set sigma_omega_grid_debug = true for this table")
         return
     from file_io import write_sigma_freq_debug_table
     from .eqp_bgw import (
-        ON_SHELL_AT_DFT, ON_SHELL_AT_EVAL, compute_eqp_diag, on_shell_z_factor)
+        compute_eqp_diag, compute_z_factor_from_omega_grid)
 
-    use_ppm_c = results.use_ppm
+    use_ppm_c = (
+        results.use_ppm and results.sigma_c_diag_at_dft_ry is not None)
     _e_dft_ev_full = np.asarray(results.E_dft_ry, dtype=np.float64) * RYD_TO_EV
     _kin_diag_ev = np.real(
         np.diagonal(np.asarray(results.kin_ion_ry), axis1=1, axis2=2)) * RYD_TO_EV
@@ -849,12 +865,19 @@ def write_freq_debug(
         ))
     _sigma_c_at_eval_for_eqp = _e_eval_for_eqp = None
     if use_ppm_c:
-        # Σ_c(E_DFT) and Z from the SAME on-shell operand the eqp{0,1}.dat
-        # writer reads, so this table's sig_c(Edft) and eqp0/eqp1 columns
-        # are bit-consistent with those files.
-        _operand = np.asarray(results.sigma_c_on_shell_diag)
-        _sigma_c_at_dft_for_eqp = _operand[ON_SHELL_AT_DFT]
-        _z_factor = on_shell_z_factor(_operand)
+        # Compute Σ_c(E_DFT) + Z via the SAME recipe the eqp{0,1}.dat
+        # writer uses, so the freq_debug sig_c(Edft) column and the
+        # eqp0/eqp1 columns are bit-consistent.  PPM pipeline's own
+        # interp produces a numerically slightly different value (~10
+        # meV) due to a different vectorisation path.
+        _e_dft_rel_ev = np.asarray(omega_dft_rel_ev, dtype=np.float64)
+        _sigma_c_at_dft_for_eqp, _z_factor = (
+            compute_z_factor_from_omega_grid(
+                sigma_c_omega_diag_ev=np.asarray(
+                    results.sigma_c_omega_diag_ev, dtype=np.complex128),
+                omega_rel_ev=np.asarray(results.omega_rel_ev, dtype=np.float64),
+                e_dft_rel_ev=_e_dft_rel_ev,
+            ))
         _cols.append(("sig_c(Edft)", _sigma_c_at_dft_for_eqp))
         # The eqp1 linearization point, when Σ was evaluated away from
         # E_DFT.  The ``sig_c(Edft)`` column above stays at E_DFT — that is
@@ -864,16 +887,39 @@ def write_freq_debug(
         if e_eval_ev is not None:
             _e_eval_ev = np.asarray(e_eval_ev, dtype=np.float64)
             _e_eval_rel_ev = _e_eval_ev - float(results.efermi_ev or 0.0)
-            if not np.array_equal(_e_eval_rel_ev,
-                                  np.asarray(omega_dft_rel_ev, dtype=np.float64)):
-                _sigma_c_at_eval_for_eqp = _operand[ON_SHELL_AT_EVAL]
+            if not np.array_equal(_e_eval_rel_ev, _e_dft_rel_ev):
+                _sigma_c_at_eval_for_eqp, _z_factor = (
+                    compute_z_factor_from_omega_grid(
+                        sigma_c_omega_diag_ev=np.asarray(
+                            results.sigma_c_omega_diag_ev,
+                            dtype=np.complex128),
+                        omega_rel_ev=np.asarray(
+                            results.omega_rel_ev, dtype=np.float64),
+                        e_dft_rel_ev=_e_eval_rel_ev,
+                    ))
                 _e_eval_for_eqp = _e_eval_ev
                 _cols.append(("E_eval", _e_eval_ev))
                 _cols.append(("sig_c(Eeval)", _sigma_c_at_eval_for_eqp))
-        # The analytic head at the same E_DFT (the ``dft0`` table) as
-        # ``sig_c(Edft)``, so cancellation analyses work column-by-column.
-        if head_at_dft_ry is not None:
-            _cols.append(("sig_c_head(Edft)", np.asarray(head_at_dft_ry) * RYD_TO_EV))
+        # PPM analytic head interpolated at the same E_DFT − E_F used
+        # for ``sig_c(Edft)`` (same ω-grid, same linear-interp recipe
+        # → cancellation analyses work column-by-column).
+        if head_sigma_diag_w_kn_ry is not None:
+            from .qsgw_utils import interp_along_omega
+            _eval_ry = (np.asarray(omega_dft_rel_ev, np.float64)
+                        / RYD_TO_EV)
+            _cols.append((
+                "sig_c_head(Edft)",
+                # ``clamp``, named: this is a DEBUG decomposition column and
+                # it must use the same recipe as ``sig_c(Edft)`` beside it or
+                # a column-by-column cancellation analysis stops working.
+                # Its coverage is the coverage already reported at the
+                # output path -- same grid, same eval energies.
+                interp_along_omega(
+                    head_sigma_diag_w_kn_ry,
+                    omega_grid_ry,
+                    _eval_ry,
+                ) * RYD_TO_EV,
+            ))
     else:
         _cols.append(
             ("sex_0", np.real(
@@ -961,7 +1007,7 @@ def _runnable_modes_building(*channels: SigmaChannel) -> str:
 # ---------------------------------------------------------------------------
 # The QP ladders of sigma_mnk.h5's plotting appendix
 # ---------------------------------------------------------------------------
-# LADDERS OF ONE H₀, which is the whole reason they are worth
+# TWO LADDERS OF ONE H₀, which is the whole reason they are worth
 # plotting together: ``kin_ion + V_H`` is common to both and only
 # the Σ_xc added to it changes, so the vertical distance between two
 # curves IS the difference between two approximations at that (k, n) and
@@ -983,9 +1029,9 @@ def _runnable_modes_building(*channels: SigmaChannel) -> str:
 # ``compute_mode = cohsex`` (``sigma_dispatch``: the dynamic branch calls
 # ``compute_sigma_x``, which touches W not at all).  A PPM run could
 # be made to produce SOMETHING for that name — its Σ_x + Σ_c(ω=0) is also
-# a static self-energy — but that is a different operator (the retired
-# ``qp_omega0_ev``), and a plot that plots one quantity under another's
-# label is worse than a plot with one curve missing.  So a run
+# a static self-energy — but that is a different operator, it already has
+# a name here (``qp_omega0_ev``), and a plot that plots one quantity twice
+# under two labels is worse than a plot with one curve missing.  So a run
 # that did not build the channels omits the dataset and says so.
 #
 # WHICH RUNS THOSE ARE IS NOT DECIDED HERE ANY MORE.  This writer used to
@@ -1002,6 +1048,8 @@ def write_qsgw_qp_ladders(
     *,
     config,
     e_qp_ry,
+    omega_grid_ev,
+    sigma_c_omega=None,
     print_fn=print,
 ):
     """Append the QP energy ladders to ``sigma_mnk.h5`` (rank-0 caller).
@@ -1028,6 +1076,7 @@ def write_qsgw_qp_ladders(
             " for the appendix.")
         return []
     from file_io import append_qsgw_datasets_h5
+    from .qsgw_utils import is_band_sharded_sigma_omega
 
     def _band_sharded(a):
         spec = getattr(getattr(a, "sharding", None), "spec", None)
@@ -1072,10 +1121,39 @@ def write_qsgw_qp_ladders(
             kin_ion + sig_h + np.asarray(results.sig_sx)
             + np.asarray(results.sig_coh))
 
-    # ---- qp_omega0_ev: retired with the omega grid --------------------
-    # H₀ + Σ_x + Σ_c(ω = 0) needs the full (nk, nb, nb) Σ_c at ω = 0, which
-    # the on-shell Σ does not hold (UPGRADE_NOTES.md, "Sigma_c on shell only").
-    omitted.append("qp_omega0_ev (retired: the on-shell Σ_c holds no ω = 0 matrix)")
+    # ---- qp_omega0_ev: H₀ + Σ_x + Σ_c(ω ≈ 0) --------------------------
+    # ω₀ is the grid point nearest zero, i.e. nearest E_F, since the Σ_c
+    # grid is Fermi-relative by construction (``ppm_pipeline``).  The ONE
+    # ω slice is taken before the host transfer for the same reason
+    # ``sigma_star_spread_stats`` takes one: the cube is (nω, nk, nb, nb)
+    # and pulling all of it back to read 1/nω of it is 1.3 GB on the
+    # mos2_4x4 deck for a 33 MB answer.
+    #
+    # AND IT IS SKIPPED ON THE BAND-SHARDED LAYOUT, because THIS caller is
+    # rank-0-only (it sits in ``gw_jax``'s rank-0 output block, beside
+    # ``write_freq_debug``).  A ``sigma_omega_layout = sharded`` cube is
+    # tiled across every process, so the host transfer of one ω slice from
+    # one rank is the "spans non-addressable devices" error, not a slow
+    # success.  Gathering it here would mean a collective inside a
+    # single-rank block; naming the layout costs the operator one line and
+    # one rerun.
+    if sigma_c_omega is None or omega_grid_ev is None:
+        omitted.append("qp_omega0_ev (no Σ_c(ω) cube in this run: a static mode, or Σ_c on shell — sigma_omega_grid_debug keeps it)")
+    elif is_band_sharded_sigma_omega(sigma_c_omega):
+        omitted.append(
+            "qp_omega0_ev (sigma_omega_layout = sharded; the optional "
+            "rank-0 appendix does not gather its omega slice)")
+    elif static_band_sharded:
+        omitted.append(
+            "qp_omega0_ev (a required operator is band-sharded; the optional "
+            "rank-0 appendix does not gather it)")
+    else:
+        i0 = int(np.argmin(np.abs(np.asarray(omega_grid_ev))))
+        sigma_c_0 = np.asarray(sigma_c_omega[i0])
+        sig_h = np.asarray(results.sig_h)
+        sig_x = np.asarray(results.sig_x)
+        payload["qp_omega0_ev"] = _eigen_ladder_ev(
+            kin_ion + sig_h + sig_x + sigma_c_0)
 
     if omitted:
         print_fn(
@@ -1379,8 +1457,10 @@ def write_results(
     wfn,
     print_fn=print,
     *,
+    eqp2_file: str | None = None,
     degeneracy_policy: str,
     degeneracy_tol_ry: float,
+    eqp_dE_ev: float = 0.5,
     write_qp_rotations: bool = True,
     qp_rotations_k_storage: str = "auto",
     qp_solver,
@@ -1392,25 +1472,27 @@ def write_results(
     1. ``sigma_diag.dat``  — LORRAX per-(k,n) Σ-decomposition diagnostic.
     2. ``eqp0.dat``        — BGW-format zeroth-order QP energies (one-shot).
     3. ``eqp1.dat``        — BGW-format Z-linearized QP energies (Z=1 in
-       static COHSEX, the exact on-shell Z in dynamic modes), centred
+       static COHSEX, BGW central-difference Z in dynamic modes), centred
        on E_DFT (one-shot).  A self-consistent run's eqp pair is the SC
        spectrum, written by ``sc_iteration._write_sc_result_eqp``; this
        writer writes none for it.
     Conditional:
 
-    4. ``qp_wfn_rotations.h5`` — QP eigenvectors for band-structure interp;
+    4. ``eqp2.dat`` — fixed-Sigma eigenvalue-self-consistent QP energies,
+       when explicitly requested.  This uses the same BGW formatter.
+    5. ``qp_wfn_rotations.h5`` — QP eigenvectors for band-structure interp;
        skipped when the SC artifact owner already wrote the converged file.
 
     Conditional (PPM, non-SC):
 
-    5. ``eqp_g0w0.dat``    — explicit Re/Im of (H₀ + Σ_xc(E_DFT)) for
+    6. ``eqp_g0w0.dat``    — explicit Re/Im of (H₀ + Σ_xc(E_DFT)) for
        hand-debugging convergence.
 
     BGW-style degenerate-set averaging is applied **upstream** at the
     H-build seam in :mod:`gw.gw_jax`, so the writer just serializes
     whatever ``GWResults`` carries — no re-averaging here.  For a dynamic
     run it first completes the shared EQP assembly and then persists that
-    assembly's exact H/X/C(E_DFT) plus its on-shell operand beside
+    assembly's exact H/X/C(E_DFT) plus its conditioned C(omega) curve beside
     the raw ``sigma_mnk.h5`` operators.  A post-hoc rebuild therefore consumes
     the exact live value-and-derivative operand rather than reconstructing it.
 
@@ -1448,6 +1530,8 @@ def write_results(
         The already-applied output conditioning (``"bgw_average"`` or
         ``"disabled"``) and its tolerance.  These are receipt provenance,
         not instructions: this function never applies the projection itself.
+    eqp_dE_ev : float
+        Central-difference spacing for the Z-factor in eqp1.dat.
     write_qp_rotations : bool
         Write ``qp_wfn_rotations.h5`` here.  Self-consistent runs that
         already wrote the converged SC rotation pass ``False`` so this
@@ -1584,9 +1668,9 @@ def write_results(
 
     # ── BGW-format eqp0.dat / eqp1.dat ────────────────────────────────────
     # Single source of truth for the linearization math: ``eqp_bgw``
-    # provides the on-shell Z-factor and the Newton update.  Static modes
-    # (COHSEX) hand in no on-shell operand ⇒ Z=1 ⇒ eqp1 == eqp0, matching
-    # BGW's behavior for static runs.
+    # provides the central-difference Z-factor and the Newton update.
+    # Static modes (COHSEX) hand in ``sigma_c_omega_diag_ev=None`` ⇒ Z=1
+    # ⇒ eqp1 == eqp0, matching BGW's behavior for static runs.
     #
     # ``_wedge`` and ``kpts_irr`` are the ones resolved above, for every
     # file this function writes; the eqp pair is no longer the exception.
@@ -1613,29 +1697,49 @@ def write_results(
     # writer already uses sx_out, which is why the two disagreed by exactly
     # Sigma_SX (4.474 eV at Gamma band 1).
     sigma_x_diag_ev = np.real(_wedge(sx_out))
-    # A dynamic SC run has no Sigma_c(E_DFT): its on-shell Sigma's slots
-    # carry the QP basis's band labels and the SC finalize drops them, so
-    # sigma_diag.dat omits sigC/sigXC (named in its header), never a NaN or
-    # the zero static COH column.
-    c_omitted = results.use_ppm and results.sigma_c_diag_at_dft_ry is None
-    if c_omitted:
-        print_fn("  sigma_diag.dat: sigC/sigXC omitted: an SC run's on-shell Sigma_c "
-                 "has no DFT-basis Sigma_c(E_DFT)")
+    # Σ_c at E_DFT diagonal: in PPM mode this is the interpolated value
+    # the driver already computed; in static modes it is the static Σ_COH
+    # diagonal (post-degen-averaging if enabled).
+    if results.use_ppm and results.sigma_c_diag_at_dft_ry is not None:
+        sigma_c_at_dft_diag_ev = (
+            _wedge_sigma_c(results.sigma_c_diag_at_dft_ry) * r2e
+        )
+    elif results.use_ppm:
+        # A dynamic run with no Sigma_c(E_DFT): an SC run on shell, whose
+        # Sigma has no DFT-basis omega cube to read it from.  NaN, named,
+        # never the static COH column (zero in a dynamic mode).
+        print_fn("  sigma_diag.dat: sigC(E_DFT) omitted (NaN): the on-shell Sigma of an "
+                 "SC run has no DFT-basis Sigma(omega); sigma_omega_grid_debug restores it")
+        sigma_c_at_dft_diag_ev = np.full(np.shape(_wedge(corr_out)), np.nan + 0.0j)
+    else:
+        sigma_c_at_dft_diag_ev = _wedge(corr_out)
 
     # E_DFT relative to the run's ω reference (matches gw_jax convention).
+    # Only needed when there is a finite ω-grid to interpolate against.
     # ``results.efermi_ev`` is the canonical value computed once upstream
     # in ``dynamic_sigma.eval_sigma_c_at_dft_energies`` from the actual
-    # number of occupied bands (``meta.nelec``).
+    # number of occupied bands (``meta.nelec``); the writer used to
+    # recompute it from ``band_stop - band_start`` which silently treats
+    # every sigma-window band as occupied → efermi = top-of-window-band.
+    sigma_c_omega_diag_ev_irr = None
     e_dft_rel_ev_irr = None
     e_eval_ev_irr = e_eval_rel_ev_irr = None
     on_shell_irr = (None if results.sigma_c_on_shell_diag is None
-                    else np.stack([_wedge_sigma_c(row)
-                                   for row in results.sigma_c_on_shell_diag]))
-    if on_shell_irr is not None:
+                    else results.sigma_c_on_shell_diag.map_rows(_wedge_sigma_c))
+    if on_shell_irr is not None or (
+            results.sigma_c_omega_diag_ev is not None and results.omega_rel_ev is not None):
+        if on_shell_irr is None:
+            sigma_c_omega_diag_ev_irr = np.asarray(
+                results.sigma_c_omega_diag_ev, dtype=np.complex128
+            ).transpose(1, 0, 2)
+            # k axis is 1 on the omega cube; reduce on axis 0 and put it back.
+            sigma_c_omega_diag_ev_irr = _wedge_sigma_c(
+                sigma_c_omega_diag_ev_irr).transpose(1, 0, 2)
         if results.efermi_ev is None:
             raise ValueError(
                 "write_results: results.efermi_ev required for PPM Z-factor; "
-                "fill GWResults.efermi_ev from ppm_outputs.efermi_dft_ev.")
+                "fill GWResults.efermi_ev from ppm_outputs.efermi_dft_ev."
+            )
         e_dft_rel_ev_irr = e_dft_ev_irr - float(results.efermi_ev)
         # WHERE eqp1 IS LINEARIZED.  Same k subset, same band window and —
         # load-bearing — the SAME single ω reference as the line above, so
@@ -1660,9 +1764,10 @@ def write_results(
                     "driver's tagged result k-set and the sigma band window.")
             e_eval_rel_ev_irr = e_eval_ev_irr - float(results.efermi_ev)
 
-    # Assemble FIRST.  This object is the one producer of the exact H/X,
-    # C(E_DFT) and Z that live output used.  A dynamic call supplies no
-    # independent C(E_DFT): both it and Z come from the on-shell operand.
+    # Assemble FIRST.  This object is now the one producer of the exact H/X,
+    # derived C(E_DFT), conditioned C(omega), and Z that live output used.
+    # A dynamic call deliberately supplies no independent C(E_DFT): both that
+    # value and its derivative come from the same conditioned diagonal curve.
     assembly = assemble_eqp(
         kpoints_irr_frac=kpts_irr,
         band_offset=results.band_start,
@@ -1672,29 +1777,30 @@ def write_results(
         hartree_scalar_diag_ev=hartree_scalar_diag_ev,
         hartree_transverse_diag_ev=hartree_transverse_diag_ev,
         sigma_x_diag_ev=sigma_x_diag_ev,
-        # An SC dynamic run's assembly (no on-shell operand) only runs the
-        # mean-field gate: its eqp pair is the SC spectrum, written elsewhere.
-        sigma_c_at_dft_diag_ev=(None if on_shell_irr is not None else _wedge(corr_out)),
+        sigma_c_at_dft_diag_ev=(
+            None if (sigma_c_omega_diag_ev_irr is not None or on_shell_irr is not None)
+            else sigma_c_at_dft_diag_ev),
+        sigma_c_omega_diag_ev=sigma_c_omega_diag_ev_irr,
         sigma_c_on_shell=on_shell_irr,
+        omega_rel_ev=results.omega_rel_ev,
         e_dft_rel_ev=e_dft_rel_ev_irr,
         e_eval_ev=e_eval_ev_irr,
         e_eval_rel_ev=e_eval_rel_ev_irr,
+        dE_ev=eqp_dE_ev,
         nspin=1,
         print_fn=print_fn,
     )
 
     # ── THE RAW (NO BAND TAIL) TWIN ───────────────────────────────────────
-    # One-shot runs with band extrapolation carry the raw on-shell operand
-    # from the same Σ evaluation (the band sum at N, before the tail fit).
-    # The SAME assembler on the SAME operands, so sigma_diag.dat's
-    # eqp0_raw/eqp1_raw columns equal an extrapolation-off run's
-    # eqp0.dat/eqp1.dat.  The eqp files themselves carry the tail.
+    # One-shot runs with band extrapolation carry the raw Σ_c diagonals from
+    # the same Σ evaluation (the band sum at N, before the tail fit).  The
+    # SAME assembler on the SAME operands, only the C(ω) curve differs, so
+    # sigma_diag.dat's eqp0_raw/eqp1_raw columns equal an extrapolation-off
+    # run's eqp0.dat/eqp1.dat.  The eqp files themselves carry the tail.
     raw_assembly = None
     sigma_c_raw_kn_ev = None
     if results.sigma_c_on_shell_diag_raw is not None and on_shell_irr is not None:
-        from .eqp_bgw import ON_SHELL_AT_DFT
-        raw_irr = np.stack([_wedge_sigma_c(row)
-                            for row in results.sigma_c_on_shell_diag_raw])
+        raw_irr = results.sigma_c_on_shell_diag_raw.map_rows(_wedge_sigma_c)
         raw_assembly = assemble_eqp(
             kpoints_irr_frac=kpts_irr,
             band_offset=results.band_start,
@@ -1711,7 +1817,32 @@ def write_results(
             nspin=1,
             print_fn=lambda *args, **kwargs: None,
         )
-        sigma_c_raw_kn_ev = raw_irr[ON_SHELL_AT_DFT]
+        sigma_c_raw_kn_ev = np.asarray(raw_irr.at_dft_ev)
+    elif (results.sigma_c_omega_diag_raw_ev is not None
+            and sigma_c_omega_diag_ev_irr is not None):
+        raw_omega_irr = _wedge_sigma_c(np.asarray(
+            results.sigma_c_omega_diag_raw_ev, dtype=np.complex128
+        ).transpose(1, 0, 2)).transpose(1, 0, 2)
+        raw_assembly = assemble_eqp(
+            kpoints_irr_frac=kpts_irr,
+            band_offset=results.band_start,
+            e_dft_ev=e_dft_ev_irr,
+            kin_ion_diag_ev=kin_ion_diag_ev,
+            hartree_diag_ev=hartree_diag_ev,
+            hartree_scalar_diag_ev=hartree_scalar_diag_ev,
+            hartree_transverse_diag_ev=hartree_transverse_diag_ev,
+            sigma_x_diag_ev=sigma_x_diag_ev,
+            sigma_c_omega_diag_ev=raw_omega_irr,
+            omega_rel_ev=results.omega_rel_ev,
+            e_dft_rel_ev=e_dft_rel_ev_irr,
+            e_eval_ev=e_eval_ev_irr,
+            e_eval_rel_ev=e_eval_rel_ev_irr,
+            dE_ev=eqp_dE_ev,
+            nspin=1,
+            print_fn=lambda *args, **kwargs: None,
+        )
+        sigma_c_raw_kn_ev = (
+            _wedge_sigma_c(results.sigma_c_diag_at_dft_raw_ry) * r2e)
 
     write_sigma_to_file(
         _wedge(sx_out),
@@ -1720,9 +1851,7 @@ def write_results(
         star_spread_per_band_ev=_spread_per_band,
         star_spread_multiplet_ev=_spread_multiplet,
         n_star_members=_nstar,
-        sigma_coh_kij_eV=None if c_omitted else _wedge(corr_out),
-        omitted_note=("sigC, sigXC: an SC run's on-shell Sigma_c has no DFT-basis "
-                      "Sigma_c(E_DFT)" if c_omitted else None),
+        sigma_coh_kij_eV=_wedge(corr_out),
         hartree_kij_eV=_wedge(sig_h_out),
         energies_dft_ev=(
             r2e * _wedge(np.asarray(results.E_dft_ry, dtype=np.float64))),
@@ -1741,7 +1870,9 @@ def write_results(
         # Z, the eqp1 stencil, only where eqp1 was linearized at E_DFT.
         z_factor_kn=(None if assembly.e_eval_ev is not None
                      else assembly.z_factor),
-        z_note="1/(1 - dRe sigC/dw) from the exact on-shell derivative at E_DFT",
+        z_note=("1/(1 - dRe sigC/dw) from the exact on-shell derivative at "
+                "E_DFT" if getattr(assembly, "sigma_c_on_shell", None)
+                is not None else "the eqp1 central difference at E_DFT"),
         sigma_c_raw_kn_eV=sigma_c_raw_kn_ev,
         eqp_raw_kn_eV=(None if raw_assembly is None else
                        (raw_assembly.eqp0_ev, raw_assembly.eqp1_ev)),
@@ -1777,6 +1908,43 @@ def write_results(
     # by the SC driver; the diagonal assembly stays a sigma_diag/receipt fact.
     if not results.self_consistent:
         assembly.write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
+
+    # ── eqp2.dat: fixed-Sigma eigenvalue self-consistency ─────────────────
+    if results.E_eqp2_ry is not None:
+        if not eqp2_file:
+            raise ValueError(
+                "write_results: GWResults.E_eqp2_ry is populated but no "
+                "eqp2_file path was supplied.")
+        e_eqp2_ev_irr = _wedge(
+            np.asarray(results.E_eqp2_ry, dtype=np.float64) * r2e)
+        if e_eqp2_ev_irr.shape != e_dft_ev_irr.shape:
+            raise ValueError(
+                "write_results: E_eqp2_ry has wedge shape "
+                f"{e_eqp2_ev_irr.shape} against E_DFT "
+                f"{e_dft_ev_irr.shape}.")
+        from .eqp_bgw import write_bgw_eqp
+        write_bgw_eqp(
+            eqp2_file,
+            kpoints_irr_frac=kpts_irr,
+            e_dft_ev=e_dft_ev_irr,
+            e_qp_ev=e_eqp2_ev_irr,
+            band_offset=results.band_start,
+            nspin=1,
+            comments=(
+                "fixed-Sigma eigenvalue self-consistency; screening, W, "
+                "and Sigma diagrams were not recomputed",
+                f"converged in {int(results.eqp2_iterations or 0)} "
+                f"fixed-map evaluations: max|dE|="
+                f"{float(results.eqp2_residual_ev or 0.0) * 1e3:.6f} meV; "
+                f"cutoff={float(results.eqp2_tol_ev or 0.0) * 1e3:.6f} meV "
+                "over protected/non-scissored states; final post-rotation "
+                "map verified",
+                "off-diagonal Sigma_mn uses "
+                "0.5*[Sigma_mn(E_m)+Sigma_mn(E_n)] in each updated QP basis",
+                "out-of-grid semicore preserves E-E_F; out-of-grid high "
+                "conduction uses the in-grid affine scissor",
+            ),
+        )
 
     # ── eqp_g0w0.dat (PPM non-SC only) — explicit Re/Im of H₀+Σ_xc(E_DFT) ──
     if (
@@ -1855,6 +2023,8 @@ def write_results(
     if raw_assembly is not None:
         print_fn("  raw columns:  sigC_raw, eqp0_raw, eqp1_raw in "
                  f"{sigma_diag_file} (no band tail; BGW-comparable)")
+    if results.E_eqp2_ry is not None:
+        print_fn(f"  BGW eqp2:     {eqp2_file}")
     if results.sigma_omega_h5_path:
         print_fn(f"  Sigma(ω):     {results.sigma_omega_h5_path}")
     if results.tensors_filename:

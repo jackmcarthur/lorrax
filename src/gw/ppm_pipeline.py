@@ -21,6 +21,7 @@ from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common.units import RYD_TO_EV
@@ -54,7 +55,7 @@ from runtime.padding import PaddedAxis
 class PPMOutputs:
     """Ansatz-specific PPM outputs handed to the dynamic finalizer."""
 
-    sigma_c_body_omega: object             # ppm_sigma.OnShellSigma: the Sigma_c body (full band sum or extrapolated), Ry
+    sigma_c_body_omega: jax.Array          # (n_omega, nk, nb, nb)  Ry
     band_axis: PaddedAxis | None = None
     # Kept separate: injection is shared by every dynamic ansatz in
     # ``dynamic_sigma.add_head_sigma_diag``.
@@ -188,10 +189,11 @@ def _compute_analytic_head_diag(
     n_occ = min(meta.nelec, enk_full_np.shape[1])
 
     # The head is band-diagonal and kept as its closed form, the one MPA's
-    # head is (``HeadSigmaDiag``): the finalize adds its value and derivative
-    # at the evaluation energies.  Its cells are ``compute_ppm_head_sigma_diag``'s
+    # head is (``HeadSigmaDiag``): the grid finalize evaluates its rows where
+    # it adds them, the on-shell one its value and derivative at the
+    # evaluation energies.  Its cells are ``compute_ppm_head_sigma_diag``'s
     # arithmetic (one real pole Omega_h - i*eta, residue R_h, the same
-    # occupation step).
+    # occupation step), so the grid numbers are unchanged.
     if occupations is None:
         occupations = np.zeros((enk_full_np.shape[1],), dtype=np.float64)
         occupations[: max(0, min(int(n_occ), enk_full_np.shape[1]))] = 1.0
@@ -249,11 +251,15 @@ def _extrapolation_kernel(sharding, donate):
 
 
 def band_count_point(cube, i: int):
-    """Count ``i`` of a ``BandCountCube`` on the full BZ (an ``OnShellSigma``)."""
+    """Count ``i`` of a ``BandCountCube`` on the full BZ, ``(ω, k, m, n)``.
+
+    A fresh buffer at ``P(None, None, 'x', 'y')``: consumers read the layout
+    off the array (``qsgw_utils.is_band_sharded_sigma_omega``).
+    """
     return cube.point(i)
 
 
-def _extrapolated_point(cube, weights):
+def _extrapolated_point(cube, weights, top=None):
     """``S_extrap = sum_b w_b * S(N_b)`` over the points that carry weight.
 
     THE OPERATION THAT MAKES THE EXTRAPOLATED Σ A LEGITIMATE HAMILTONIAN.
@@ -279,7 +285,10 @@ def _extrapolated_point(cube, weights):
 
     MEMORY.  The matrix of a point is needed only where its weight is not
     zero: N₁ and N₃ (N₂ fixes Ω from its band diagonal, which is all the
-    sweep keeps of it).
+    sweep keeps of it).  The first live point gives its buffer to the
+    result, so the cube no longer serves that point afterwards; ``top`` is
+    the caller's N₃ cube (the raw twin), read and kept.  Two full-BZ cubes
+    are resident: the two this stage returns.
     """
     w = np.asarray(weights, dtype=np.float64)
     n_count, carrier = int(cube.shape[0]), int(cube.shape[-1])
@@ -305,14 +314,25 @@ def _extrapolated_point(cube, weights):
         raise ValueError(
             f"_extrapolated_point: band counts {between} carry weight, but "
             f"the sweep keeps only their band diagonal (BandCountCube)")
-    return _on_shell_combination(cube, live, w[live])
+    if cube.on_shell is not None:
+        return _on_shell_combination(cube, live, w[live])
+    if cube.fresh:
+        return _streamed_combination(cube, live, w[live])
+    first = cube.point(live[0])
+    rest = tuple(
+        top if (top is not None and b == n_count - 1) else cube.point(b)
+        for b in live[1:])
+    # ``first`` is the caller's own N3 cube only where no state has a tail;
+    # it is then read, not taken.
+    return _extrapolation_kernel(first.sharding, first is not top)(
+        first, rest, w[live])
 
 
 def _on_shell_combination(cube, live, w):
     """``sum_b w_b * S(N_b)`` of an on-shell cube: its pair and its slots.
 
-    The pair is combined by :func:`_combine_extrapolation`, with the two pair
-    slots on its leading axis; each
+    The pair is combined by :func:`_combine_extrapolation`, the grid's
+    arithmetic, with the two pair slots in the omega axis's place; each
     diagonal slot of state ``(k, n)`` takes ``w_b[k, n]``, the pair rule's
     ``½(w_n + w_n)`` on the diagonal.  Every count's slots are kept
     (``BandCountCube.slot_diagonals``), so the derivative and the eqp tables
@@ -339,6 +359,50 @@ def _slot_combination_fn(sharding):
     return jax.jit(combine, out_shardings=sharding)
 
 
+#: omega slabs of one streamed combination (a slab's unfolded counts are
+#: its only temporaries).
+_COMBINE_SLABS = 8
+
+
+def _streamed_combination(cube, live, w):
+    """``sum_b w_b * S(N_b)`` written omega slab by omega slab from the wedge.
+
+    Each slab unfolds its live counts, combines them in count order
+    (:func:`_combine_extrapolation`, the same elementwise arithmetic) and is
+    written into the one output cube, so no full-BZ count is ever resident.
+    """
+    members = tuple(cube._matrix(b) for b in live)
+    n_omega = int(members[0].shape[0])
+    step = -(-n_omega // _COMBINE_SLABS)
+    shape = (n_omega, int(cube.nk), *members[0].shape[2:])
+    sharding = NamedSharding(cube.mesh_xy, P(None, None, "x", "y"))
+    out = jnp.zeros(shape, jnp.complex128, device=sharding)
+    run = _combination_slab_fn(cube.unfold, step,
+                               0 if cube.term is None else cube.term.ndim, sharding)
+    for lo in range(0, n_omega, step):
+        out = run(out, members, cube.term, w, jnp.asarray(
+            min(lo, n_omega - step), dtype=jnp.int32))
+    return out
+
+
+@lru_cache(maxsize=16)
+def _combination_slab_fn(unfold, step, term_ndim, sharding):
+    """One ω slab of the combination; ``term_ndim`` 0 (no term), 3 (one term
+    for every ω) or 4 (a term per ω, sliced with the slab)."""
+    def slab(out, members, term, w, lo):
+        parts = []
+        for m in members:
+            part = unfold(jax.lax.dynamic_slice_in_dim(m, lo, step, axis=0))
+            if term_ndim == 3:
+                part = part + term[None, ...]
+            elif term_ndim == 4:
+                part = part + jax.lax.dynamic_slice_in_dim(term, lo, step, axis=0)
+            parts.append(part)
+        value = _combine_extrapolation(parts[0], tuple(parts[1:]), w)
+        return jax.lax.dynamic_update_slice_in_dim(out, value, lo, axis=0)
+    return jax.jit(slab, donate_argnums=(0,), out_shardings=sharding)
+
+
 def _report_band_extrapolation(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
     e_state_ev, plan, config, band_slices, wfn, mesh_xy, print_fn,
@@ -348,8 +412,8 @@ def _report_band_extrapolation(
     ``e_state_ev`` [k, n] (eV, absolute) is the energy each row of the cube
     is read at: the caller's ``e_qp_ev``, E_DFT in a one-shot and the map's
     read energies in SC.  Reads the band DIAGONAL of each cumulative point at
-    that SAME external evaluation energy − E_F, under the same read rule —
-    so nothing but the band count differs between the three.  The analytic q→0
+    that SAME external evaluation energy − E_F, on the SAME ω grid — so
+    nothing but the band count differs between the three.  The analytic q→0
     head is added to every point identically (it is a band-diagonal ω-dependent term with no
     unoccupied-state sum, hence bracket-independent), so the reported values
     are the physical Σ_c rather than the body alone; being a common offset it
@@ -364,6 +428,8 @@ def _report_band_extrapolation(
     twice, and the two copies could disagree.  The caller applies them to the
     Σ cube.
     """
+    from .qsgw_utils import interp_sigma_diag_along_omega
+
     cube = sigma_omega.sigma_c_kij
     # THE ROW'S OWN ENERGY, NOT THE DFT ENERGY OF ITS SORTED INDEX.  The
     # cube's rows are the states of the bundle Sigma was built in; in SC they
@@ -375,11 +441,36 @@ def _report_band_extrapolation(
     enk_ev = np.asarray(e_state_ev, dtype=np.float64)
     omega_eval_ev = enk_ev - (float(wfn.efermi) if sigma_omega.efermi_ry is None
                               else float(sigma_omega.efermi_ry)) * RYD_TO_EV
-    # The fit reads each state where H reads it: the pair table's diagonal
-    # (``sigma_out_of_grid``) with the closed-form head added there, in eV
-    # like every other Σ line in the log.
-    points = [cube.diagonal(i).with_head(head_sigma_diag_w_kn_ry).diagonal(
-        "pair", sigma_omega.band_axis) * RYD_TO_EV for i in range(cube.shape[0])]
+    omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+    # The closed-form head is read at the slots; a host array as it is.
+    head = (head_sigma_diag_w_kn_ry
+            if head_sigma_diag_w_kn_ry is None
+            or hasattr(head_sigma_diag_w_kn_ry, "at_slots")
+            else np.asarray(head_sigma_diag_w_kn_ry))
+
+    points = []
+    if cube.on_shell is not None:
+        # On shell the fit reads each state where H reads it: the pair
+        # table's diagonal (``sigma_out_of_grid``), the head added there.
+        for i in range(cube.shape[0]):
+            points.append(cube.diagonal(i).with_head(head).diagonal(
+                "pair", sigma_omega.band_axis) * RYD_TO_EV)
+    for i in (range(cube.shape[0]) if cube.on_shell is None else ()):
+        # The cube lives on the padded band carrier; the head, the DFT
+        # energies and the fit are logical.  The reader strips at this
+        # consumer boundary and adds the head at the two omega slots each
+        # (k, n) reads: no (n_omega, nk, nb) diagonal is made on the host.
+        # Ry -> eV here, exactly where ``eval_sigma_c_at_dft_energies`` does
+        # it, so the reported numbers are in the same unit as every other Σ
+        # line in the log and the formatter needs no scale of its own.
+        # ``clamp``, named.  These three points are a band-count FIT input,
+        # and the fit's own trust verdict is what judges them; masking an
+        # uncovered state to nan here would poison the fit for the covered
+        # ones through the same least squares.  The count is reported once
+        # at the output path, on the same grid and the same eval energies.
+        points.append(interp_sigma_diag_along_omega(
+            cube.diagonal(i), mesh_xy, omega_grid_ev, omega_eval_ev,
+            band_axis=sigma_omega.band_axis, add_w_kn=head, scale=RYD_TO_EV))
     s_at_counts = np.stack(points)
 
     # ── THE ESTIMATOR ───────────────────────────────────────────────────
@@ -555,10 +646,11 @@ def extrapolate_sigma_body(
 
     THE RAW TWIN.  Its readers by default are the raw columns (sigC_raw,
     eqp0_raw, eqp1_raw), which read its band diagonal, so the twin returned
-    is N₃'s diagonal slots (a pair-less ``OnShellSigma``): one pair leaves
-    this stage.  N₃'s pair (the second QSGW matrix and the per-map
-    "extrapolation effect on E_nk" eigvalsh block) is kept only under
-    ``sigma_freq_debug_output``.
+    is ``BandDiagonalSlots`` of N₃ and no full N₃ cube is made: one Σ(ω)
+    cube leaves this stage.  The full N₃ cube
+    (the second QSGW matrix and the per-map "extrapolation effect on E_nk"
+    eigvalsh block) is kept only under ``sigma_freq_debug_output``.  The
+    caller drops its own ``top`` reference.
     """
     cube = sigma_omega.sigma_c_kij
     last = int(cube.shape[0]) - 1
@@ -569,8 +661,8 @@ def extrapolate_sigma_body(
     if bool(config.debug.sigma_freq_debug_output):
         twin = top if top is not None else band_count_point(cube, last)
     else:
-        twin = cube.diagonal(last)
-    extrapolated = _extrapolated_point(cube, extrap_weights)
+        twin, top = cube.diagonal(last), None
+    extrapolated = _extrapolated_point(cube, extrap_weights, top=top)
     cube.release()
     return extrapolated, extrap_payload, twin
 
@@ -750,6 +842,7 @@ def compute_ppm_sigma_pipeline(
                 ppm_cfg=config.ppm,
                 sigma_cfg=config.sigma,
                 mpa_cfg=config.mpa,
+                omega_grid_ry=config.omega_grid_ry,
                 ansatz=config.compute_mode,
                 screening_diagrams=config.screening.diagrams,
                 occupation_state=occupation_state,
@@ -757,9 +850,11 @@ def compute_ppm_sigma_pipeline(
                 fixed_quadrature_session=(
                     None if fixed_quadrature_session is None else
                     fixed_quadrature_session.setdefault("primary", {})),
-                request_for=lambda efermi_ry: sigma_on_shell_request(
-                    config, e_eval_ev=e_qp_ev, wfn=wfn, sym=sym, meta=meta,
-                    band_slices=band_slices, efermi_ry=efermi_ry, print_fn=print_fn),
+                on_shell_for=(
+                    None if bool(config.debug.sigma_omega_grid_debug) else
+                    lambda efermi_ry: sigma_on_shell_request(
+                        config, e_eval_ev=e_qp_ev, wfn=wfn, sym=sym, meta=meta,
+                        band_slices=band_slices, efermi_ry=efermi_ry)),
                 print_fn=print_fn,
             )
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries

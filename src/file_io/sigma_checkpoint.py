@@ -1,10 +1,11 @@
 """Checkpoints of sharded cubes plus a small host record, read back by authenticated identity.
 
-The SC loop (``gw.sc_iteration``) keeps its Anderson window and carry beside
-each warm seed, ``sc_seed/sc_checkpoint.h5`` (``SC_SCHEMA``), so a fresh
-process continues the trajectory (docs/self_consistency.md §8).  (The
-one-shot omega-grid Σ sweep checkpoint, ``SCHEMA``, retired with the grid;
-an on-shell sweep checkpoint is not implemented.)
+Two owners use it. ``gw.sigma_dispatch`` keeps a one-shot shared-pole Σ sweep
+(over an hour on large decks) between the τ sweep and finalize: a rerun with
+``restart = true`` whose state authenticates goes straight to finalize. The SC
+loop (``gw.sc_iteration``) keeps its Anderson window and carry beside each
+warm seed, ``sc_seed/sc_checkpoint.h5`` (``SC_SCHEMA``), so a fresh process
+continues the trajectory (docs/self_consistency.md §8).
 
 The cubes go through SlabIO from their own shards: no gather, no copy. The
 host record (JSON) and, for the SC loop, one ``state`` blob are written by
@@ -31,6 +32,21 @@ SC_SCHEMA = "sc-anderson-checkpoint-v1"
 #: Staging files older than this process's first checkpoint use are orphans.
 _STARTED = time.time()
 CUBES = ("body", "unextrap", "odd")
+#: Measured SlabIO write rate of a swept cube, one node at P4 (Na 8^3, 61.4 GB
+#: in 47.7 s); more ranks write faster, so this predicts long.
+WRITE_BYTES_PER_S = 1.3e9
+#: The checkpoint is written only when the sweep it protects took at least
+#: this many times its predicted write.
+PAYOFF = 5.0
+
+
+def checkpoint_pays(cubes, sweep_seconds):
+    """Return (write?, predicted write seconds) for these cubes."""
+    nbytes = sum(int(np.prod(c.shape)) * np.dtype(c.dtype).itemsize
+                 for c in cubes.values() if c is not None)
+    predicted = nbytes / WRITE_BYTES_PER_S
+    return sweep_seconds >= PAYOFF * predicted, predicted
+
 
 def _encode(value):
     # Floats go through repr, which round-trips float64 exactly.
@@ -66,12 +82,38 @@ def _json(value):
     return json.dumps(value, default=_encode, sort_keys=True, allow_nan=False)
 
 
+def sweep_identity(**parts):
+    """One digest of everything the swept state depends on.
+
+    Arrays enter by dtype, shape and bytes; everything else by canonical JSON.
+    """
+    digest = hashlib.sha256()
+    for key in sorted(parts):
+        value = parts[key]
+        digest.update(key.encode())
+        if isinstance(value, np.ndarray):
+            value = np.ascontiguousarray(value)
+            digest.update(f"{value.dtype}{value.shape}".encode())
+            digest.update(value.tobytes())
+        else:
+            # Identity only: an option without a JSON form (an enum) enters by repr.
+            digest.update(json.dumps(value, sort_keys=True, allow_nan=False, default=lambda v: (
+                _encode(v) if isinstance(v, (np.ndarray, np.generic, complex)) else repr(v))
+            ).encode())
+    return digest.hexdigest()
+
+
 def _spec(cube):
     from jax.sharding import NamedSharding
     sharding = getattr(cube, "sharding", None)
     if not isinstance(sharding, NamedSharding):
         return None
     return [list(a) if isinstance(a, tuple) else a for a in sharding.spec]
+
+
+def checkpointable(cubes):
+    """True when every present cube is a NamedSharding jax array."""
+    return all(cube is None or _spec(cube) is not None for cube in cubes.values())
 
 
 #: The classes a pickle of plain containers and numpy arrays names (numpy 1

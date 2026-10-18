@@ -1088,15 +1088,18 @@ _DEFAULTS = {
     # Empty string == "not set" (cfg.centroids_file_current is None then).
     "centroids_file_current": "",
     "kin_ion_file": "kin_ion.h5",
-    # Three human-readable text outputs (always written):
+    # Three human-readable text outputs (always written), plus one opt-in
+    # fixed-Sigma eigenvalue-self-consistent QP ladder:
     #   sigma_diag.dat — LORRAX-native per-(k,n) Σ-decomposition dump.
     #   eqp0.dat       — BGW-format zeroth-order QP energies.
     #   eqp1.dat       — BGW-format Z-linearized QP energies (Z=1 in
     #                    static COHSEX; in dynamic modes Z from the exact
-    #                    on-shell dSigma/domega).
+    #                    on-shell dSigma/domega, or the +/-0.5 eV central
+    #                    difference under sigma_omega_grid_debug).
     "sigma_diag_file": "sigma_diag.dat",
     "eqp0_file": "eqp0.dat",
     "eqp1_file": "eqp1.dat",
+    "eqp2_file": "eqp2.dat",
     # Rank-zero, human-readable calculation report.  This is the clean
     # application output; launcher placement and rank-binding diagnostics
     # remain in the launcher's own log.
@@ -1176,6 +1179,10 @@ _DEFAULTS = {
     #       Hermitian Σ_xc the QSGW ansatz builds, written in the basis
     #       the rest of the file's cubes are in (the QP basis under
     #       self-consistency, the DFT basis one-shot).
+    #   qp_omega0_ev               (nk, nb) real — the QP ladder of
+    #       H₀ + Σ_x + Σ_c(ω≈0), one extra eigh of an (nk, nb, nb).
+    #       Needs the Σ_c(ω) cube (sigma_omega_grid_debug = true); on
+    #       shell it is omitted and named.
     #   qp_static_cohsex_ev        (nk, nb) real — the static COHSEX
     #       ladder, H₀ + Σ_SX + Σ_COH.  Written only by a run that BUILT
     #       those two channels, which today means compute_mode = cohsex;
@@ -1348,6 +1355,17 @@ _DEFAULTS = {
     # protected-semicore element reads Sigma at E_DFT; mixing kept.
     # "qp": it reads Sigma at its own QP energy and moves.
     "sc_semicore": "dft",
+    # Optional fourth text output beside the ordinary one-shot eqp0/eqp1
+    # pair.  This iterates ONLY the eigenvalues/eigenvectors against the
+    # already-computed full Sigma_c(omega) table: W, screening, and Sigma
+    # diagrams are never recomputed.  The 1 meV default is a max|dE| test.
+    # The table exists only under sigma_omega_grid_debug = true; on shell
+    # it refuses (GATE eqp2_needs_omega_grid).
+    "write_eqp2": False,
+    "eqp2_tol_ev": 1.0e-3,
+    "eqp2_max_iter": 20,
+    "eqp2_accelerator": "rcrop",  # rcrop | linear (Picard)
+    "eqp2_history_depth": 5,
     "use_ppm_sigma": False,
     # BGW-style averaging of diagonal Σ within degenerate sets (mirrors
     # ``Sigma/shiftenergy.f90`` band-averaging).  ``no_degen_averaging =
@@ -1618,8 +1636,9 @@ _DEFAULTS = {
     # Sigma frequency grid
     # None (unset): the grid comes from the protected Sigma band range under
     # the SC window plan; a value is a minimum extent honoured every map.
-    # Sigma is evaluated on shell, so only the grid's extent is read, as the
-    # covered range (docs/theory/sigma-on-shell.md).
+    # On shell (the default) only the grid's extent is read, as the covered
+    # range; Sigma is sampled on its steps and patches only under
+    # sigma_omega_grid_debug (docs/theory/sigma-on-shell.md).
     "sigma_omega_min_ev": None,
     "sigma_omega_max_ev": None,
     "sigma_omega_step_ev": 0.25,
@@ -1750,6 +1769,15 @@ _DEFAULTS = {
     "sigma_freq_debug_output": False,
     "sigma_freq_debug_file": "sigma_freq_debug.dat",
     "sigma_lorentz_debug_output": False,
+    # Sigma_c on the omega GRID, ``(n_omega, nk, nb, nb)``, instead of on
+    # shell.  Default false: a dynamic Sigma folds only the QSGW pair
+    # Sigma_mn(E_m), Sigma_mn(E_n) and the eqp readers' band diagonals
+    # (value, exact dSigma/domega) at the map's energies (gw.ppm_accumulators,
+    # docs/theory/sigma-on-shell.md).  True keeps the grid cube for the
+    # readers only it serves: fixed-Sigma evSC (write_eqp2 = true), the
+    # sigma_mnk.h5 omega cube, the freq-debug tables, qp_omega0_ev and the
+    # DFT-basis Sigma_c(E_DFT) of an SC run.
+    "sigma_omega_grid_debug": False,
     # QP wavefunction file dump.  Default True: end-of-run write of
     # ``WFN_qp.h5`` (BGW format, ψ rotated by the final U, energies
     # replaced by E_QP).  Fires for both one-shot and SC; set False to
@@ -1783,21 +1811,12 @@ _DEFAULTS = {
 
 }
 
-#: Deck keys retired with the Sigma omega grid (UPGRADE_NOTES.md, "Sigma_c on
-#: shell only"): each refuses by name at parse time, any value.
-_OMEGA_GRID_RETIRED_KEYS = (
-    "sigma_omega_grid_debug", "write_eqp2", "eqp2_tol_ev", "eqp2_max_iter",
-    "eqp2_accelerator", "eqp2_history_depth", "eqp2_file")
-
-
 # Deck keys REMOVED from _DEFAULTS but still handled by an explicit
 # legacy/deprecation branch in ``read_lorrax_input`` (raise or dedicated
 # DeprecationWarning).  The unknown-key check skips these so one deck key
 # never draws two messages.  Keys that are deprecated but still in
 # _DEFAULTS (self_consistent, sigma_at_dft_energies) need no entry here.
 _LEGACY_DECK_KEYS = frozenset({
-    # 2026-10: Sigma_c is evaluated on shell only (refused by name).
-    *_OMEGA_GRID_RETIRED_KEYS,
     "use_shipped_minimax_tables",   # refused with replacement named
     "chunk_size",                   # warn-and-ignore (planner-owned)
     "output_file",                  # warn-and-ignore (sigma_diag_file)
@@ -2405,6 +2424,7 @@ def _input_paths(
         sigma_diag_file=str(params["sigma_diag_file"]),
         eqp0_file=str(params["eqp0_file"]),
         eqp1_file=str(params["eqp1_file"]),
+        eqp2_file=str(params["eqp2_file"]),
         report_file=str(params["report_file"]),
         sigma_omega_h5_file=str(params["sigma_omega_h5_file"]),
     )
@@ -2565,7 +2585,7 @@ def _input_response(
 
 def _input_iteration(
         _linalg, params, print_fn):
-    """Produce the self-consistency settings with their environment precedence."""
+    """Produce self-consistency and EQP2 settings with their environment precedence."""
     def _sc_env(env_key: str, cast, file_val, input_key: str):
         raw_env = os.environ.get(env_key)
         if raw_env is None or raw_env == "":
@@ -2602,7 +2622,14 @@ def _input_iteration(
         initial_qp_rotations_file=(
             str(params["sc_initial_qp_rotations_file"]).strip() or None),
     )
-    return sc
+    eqp2 = EQP2Config(
+        enabled=bool(params["write_eqp2"]),
+        tol_ev=float(params["eqp2_tol_ev"]),
+        max_iter=int(params["eqp2_max_iter"]),
+        accelerator=str(params["eqp2_accelerator"]).strip().lower(),
+        history_depth=int(params["eqp2_history_depth"]),
+    )
+    return (sc, eqp2)
 
 
 def _input_memory_group(
@@ -2664,6 +2691,7 @@ def _input_storage(
         sigma_freq_debug_output=bool(params["sigma_freq_debug_output"]),
         sigma_freq_debug_file=str(params["sigma_freq_debug_file"]),
         sigma_lorentz_debug_output=bool(params["sigma_lorentz_debug_output"]),
+        sigma_omega_grid_debug=bool(params["sigma_omega_grid_debug"]),
         write_wfn_h5=bool(params["write_wfn_h5"]),
         write_w=bool(params["write_w"]),
     )
@@ -2727,7 +2755,7 @@ def _band_request_form(params, named_keys):
 
 def _assemble_input_config(
         _bands, _effective_named_keys, _occ_family, _occ_width, _qp_rot_k_storage,
-        _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug,
+        _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug, eqp2,
         filename, head, input_dir, memory, mpa, params, paths, ppm, sc, screening, sigma):
     """Produce the typed configuration from its resolved groups."""
     resolved = cls(
@@ -2770,6 +2798,7 @@ def _assemble_input_config(
         ppm=ppm,
         mpa=mpa,
         sc=sc,
+        eqp2=eqp2,
         memory=memory,
         backend=backend,
         debug=debug,
@@ -2921,19 +2950,6 @@ def _read_input_section(
 def _report_early_retired_keys(
         section):
     """Produce the early retired-key findings after dedicated refusals."""
-    named = [key for key in _OMEGA_GRID_RETIRED_KEYS
-             if section.get(key, fallback=None) is not None]
-    if named:
-        raise ValueError(
-            f"GATE omega_grid_retired: input key(s) {', '.join(named)} "
-            "have been REMOVED with the Sigma omega grid.\n"
-            "  why:  Sigma_c is evaluated on shell only (the QSGW pair, the "
-            "eqp readers' values and the exact dSigma/domega); the omega-grid "
-            "debug path and the fixed-Sigma eqp2 ladder it alone fed are "
-            "gone.\n"
-            "  fix:  delete the line(s); nothing replaces them.\n"
-            "  doc:  UPGRADE_NOTES.md, \"Sigma_c on shell only\"; "
-            "docs/theory/sigma-on-shell.md.")
     if section.get("use_shipped_minimax_tables", fallback=None) is not None:
         raise ValueError(
             "Input key 'use_shipped_minimax_tables' is no longer supported, "
@@ -3324,6 +3340,7 @@ class FilePaths:
     sigma_diag_file: str
     eqp0_file: str
     eqp1_file: str
+    eqp2_file: str
     report_file: str
     sigma_omega_h5_file: str
 
@@ -4400,6 +4417,29 @@ class SCConfig:
 
 
 @dataclass(frozen=True)
+class EQP2Config:
+    """Fixed-Sigma eigenvalue self-consistency for the opt-in eqp2 file; see docs/dev/gw_config_contracts.md."""
+
+    enabled: bool = False
+    tol_ev: float = 1.0e-3
+    max_iter: int = 20
+    accelerator: str = "rcrop"
+    history_depth: int = 5
+
+    def __post_init__(self):
+        if self.tol_ev <= 0.0:
+            raise ValueError("eqp2_tol_ev must be > 0.")
+        if self.max_iter < 1:
+            raise ValueError("eqp2_max_iter must be >= 1.")
+        if self.accelerator not in ("rcrop", "linear"):
+            raise ValueError(
+                "eqp2_accelerator must be 'rcrop' or 'linear'; got "
+                f"{self.accelerator!r}.")
+        if self.history_depth < 1:
+            raise ValueError("eqp2_history_depth must be >= 1.")
+
+
+@dataclass(frozen=True)
 class MemoryConfig:
     """Per-device memory budget + chunk sizing; see docs/dev/gw_config_contracts.md."""
     per_device_gb: float
@@ -4431,6 +4471,9 @@ class DebugConfig:
     sigma_freq_debug_output: bool
     sigma_freq_debug_file: str
     sigma_lorentz_debug_output: bool
+    #: Sigma_c on the omega grid (``sigma_omega_grid_debug``); False is the
+    #: on-shell evaluation (``gw.ppm_sigma.OnShellSigma``).
+    sigma_omega_grid_debug: bool
     write_wfn_h5: bool
     #: Dump the WHOLE shared-pole Wc frequency sample bank (every fixed
     #: sample, plus ``dWc_ds``/M1/M3) to ``<map>_w.h5``.  Debugging only.
@@ -4707,6 +4750,7 @@ class LorraxConfig:
     ppm: PPMConfig
     mpa: MPAConfig
     sc: SCConfig
+    eqp2: EQP2Config
     memory: MemoryConfig
     backend: BackendConfig
     debug: DebugConfig
@@ -4758,6 +4802,19 @@ class LorraxConfig:
                     "mpa_fit_reuse_file currently supports only "
                     "qp_solver = one_shot_dft; self-consistent maps must "
                     "rebuild W from their current occupations")
+        if self.eqp2.enabled:
+            if self.qp_solver is not QPSolver.ONE_SHOT_DFT:
+                raise ValueError(
+                    "write_eqp2=true is an additional fixed-Sigma result "
+                    "for qp_solver=one_shot_dft; it cannot be combined with "
+                    f"qp_solver={self.qp_solver.value}.  Use one_shot_dft, "
+                    "or disable write_eqp2 and choose self_consistent as "
+                    "the primary QP treatment.")
+            if not self.compute_mode.is_dynamic:
+                raise ValueError(
+                    "write_eqp2=true requires a dynamic full-matrix "
+                    "Sigma_c(omega) table; choose compute_mode=gn_ppm, "
+                    "hl_ppm, or mpa, or disable write_eqp2.")
         if (self.qp_solver is QPSolver.SELF_CONSISTENT
                 and self.head.correction is HeadCorrection.OFF
                 and self.sc.head_update != "off"):
@@ -4947,7 +5004,7 @@ class LorraxConfig:
             _bgw_q0_mode, _bgw_q0_vector, _mc_average_vcoul_body, _named_keys, params, print_fn)
         (screening, ppm, mpa, sigma, _occ_family, _occ_width) = _input_response(
             _named_keys, params)
-        (sc) = _input_iteration(
+        (sc, eqp2) = _input_iteration(
             _linalg, params, print_fn)
         (memory) = _input_memory_group(
             memory_per_device_gb, params, print_fn)
@@ -4959,7 +5016,7 @@ class LorraxConfig:
             params)
         (resolved) = _assemble_input_config(
             _bands, _effective_named_keys, _occ_family, _occ_width, _qp_rot_k_storage,
-            _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug,
+            _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug, eqp2,
             filename, head, input_dir, memory, mpa, params, paths, ppm, sc, screening, sigma)
         (resolved) = _apply_input_envelope(
             _named_keys, print_fn, resolved)

@@ -1984,11 +1984,12 @@ class HeadSigmaDiag:
 
     Sigma^head_nk(omega) = sum_p pref_p [ f_nk / (omega - e_nk + z_p)
                                         + (1 - f_nk) / (omega - e_nk - z_p) ]
-    depends on E_nk and f_nk only, so it is evaluated where it is read:
-    :meth:`on_shell` at per-state energies (the on-shell Sigma's tables and
-    their derivative), ``band_rows`` on ``omega_grid_ry`` (the sampled range,
-    for the head-shift log line).  Every value is ``_head_pole_sum`` of its
-    cell, so the readers agree to the bit.
+    depends on E_nk and f_nk only, so it is evaluated where it is read and the
+    (n_omega, nk, nb) array is not held on any host: ``band_rows`` gives a rank
+    the rows of its own Sigma tile for the finalize add, ``at_slots`` the omega
+    slots an on-shell reader interpolates between.  Every value is
+    ``_head_pole_sum`` of its cell, so the readers agree to the bit.
+    ``np.asarray`` evaluates the whole array (one-shot output tables).
     """
 
     omega_grid_ry: np.ndarray
@@ -2027,6 +2028,9 @@ class HeadSigmaDiag:
     def shape(self) -> tuple[int, int, int]:
         return (int(self.omega_grid_ry.size),) + tuple(self.enk_ry.shape)
 
+    ndim = 3
+    dtype = np.dtype(np.complex128)
+
     def band_rows(self, start: int, stop: int) -> np.ndarray:
         """Host (n_omega, nk, stop - start): bands [start, stop)."""
         return compute_complex_pole_head_sigma_diag(
@@ -2035,6 +2039,27 @@ class HeadSigmaDiag:
             occupations=self.occupations[:, start:stop],
             poles_ry=self.poles_ry, residues_ry=self.residues_ry,
             cell_volume=self.cell_volume, nk_tot=self.nk_tot)
+
+    def at_slots(self, slots_s_kn) -> np.ndarray:
+        """Host (n_slot, nk, nb): the head at omega index ``slots[s, k, n]``."""
+        slots = np.asarray(slots_s_kn)
+        if slots.shape[1:] != self.enk_ry.shape:
+            raise ValueError(
+                f"omega slots must be (n_slot,) + {self.enk_ry.shape}, got "
+                f"{slots.shape}")
+        out = np.zeros(slots.size, dtype=np.complex128)
+        if self.poles_ry.size == 0 or slots.size == 0:
+            return out.reshape(slots.shape)
+        eps_rel = self.enk_ry - self.efermi_ry
+        delta = (self.omega_grid_ry[slots] - eps_rel[None, :, :]).reshape(1, -1)
+        f = np.broadcast_to(self.occupations[None, :, :], slots.shape).reshape(-1)
+        pref = self.residues_ry / (self.cell_volume * float(self.nk_tot))
+        pole = self.poles_ry[:, None, None]
+        step = _head_cell_limit(self.poles_ry.size)
+        for i in range(0, slots.size, step):
+            cells = slice(i, i + step)
+            out[cells] = _head_pole_sum(delta[:, cells], f[cells], pole, pref)[0]
+        return out.reshape(slots.shape)
 
     def on_shell(self, omega_kn_ry) -> tuple[np.ndarray, np.ndarray]:
         """``(value, dvalue/domega)`` host (nk, nb) at per-state ``omega_kn_ry``.
@@ -2069,6 +2094,10 @@ class HeadSigmaDiag:
         return replace(
             self, enk_ry=np.asarray(select_rows(self.enk_ry)),
             occupations=np.asarray(select_rows(np.ascontiguousarray(self.occupations))))
+
+    def __array__(self, dtype=None, copy=None):
+        full = self.band_rows(0, int(self.enk_ry.shape[1]))
+        return full if dtype is None else full.astype(dtype, copy=False)
 
 
 def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:

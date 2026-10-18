@@ -17,10 +17,9 @@ opt-in and unwired: ``gw.gw_jax`` never imports it, and it runs only as
                 ``w_isdf.solve_w``)
     Σ_x         the same pair convolution, ``'scalar'`` (K2), with B = v_q(G) on the
                 χ sphere at the q-IBZ = the k-parents
-    Σ_c(E)      ``--deck``: χ at the MPA samples through ``mpa.model._evaluate_samples``
+    Σ_c(ω)      ``--deck``: χ at the MPA samples through ``mpa.model._evaluate_samples``
                 (this basis as its χ producer), W^c and ``SphereScreening.fit_poles``,
-                then ``mpa.sigma.compute_sigma_c_mpa_omega_grid`` on shell at E_DFT
-                (the JSON's ``sigc_at_e_ev``; no Σ_c(ω) curve) with a τ body that
+                then ``mpa.sigma.compute_sigma_c_mpa_omega_grid`` with a τ body that
                 chains ``build_G_tau`` → the ``'scalar'`` pair convolution → the face
                 projector (``PlaneWaveGW.sigma_c``)
 
@@ -408,10 +407,9 @@ class PlaneWaveGW:
         return Omega, B, float(cond)
 
     # ------------------------------------------------------------------ Σ_c(ω)
-    def sigma_c(self, config, wfns, Omega, B, *, request, print_fn=print):
-        """Σ_c on shell (``request``, ``gw.ppm_sigma.OnShellRequest``) through the Σ owner
-        (``mpa.sigma.compute_sigma_c_mpa_omega_grid``): its planner, windows and
-        accumulator, with this basis's τ body.
+    def sigma_c(self, config, wfns, Omega, B, *, print_fn=print):
+        """Σ_c,nm(k, ω) through the Σ owner (``mpa.sigma.compute_sigma_c_mpa_omega_grid``):
+        its planner, windows and accumulator, with this basis's τ body.
 
         ``_sigma_kij``: ``build_G_tau`` on the ψ(G) faces → the ``'scalar'`` pair convolution
         against W(τ) on the response sphere → Σ_k = −X/(Ω·N_r²) → the face projector
@@ -463,7 +461,7 @@ class PlaneWaveGW:
         return compute_sigma_c_mpa_omega_grid(
             wfns, poles, SimpleNamespace(nkx=self.s.kgrid[0], nky=self.s.kgrid[1],
                                          nkz=self.s.kgrid[2], mu_basis=None), mesh,
-            request=request, efermi_ry=self.mu,
+            omega_grid_ry=config.omega_grid_ry, efermi_ry=self.mu,
             regularization_width_ry=xi.resolved_ry,
             edge_factor=float(config.sigma.window_edge_factor),
             quadrature_eps=float(config.sigma.quadrature_eps),
@@ -506,7 +504,7 @@ def _host(x, mesh):
 
 
 def _one_shot(args, mesh, system, gw, say, t_read):
-    """Σ_x and Σ_c(E_DFT) at the k-parents; per-stage walls and the running per-rank peak."""
+    """Σ_x and Σ_c(ω) at the k-parents; per-stage walls and the running per-rank peak."""
     import jax
     from .gw_config import LorraxConfig, resolve_mpa_sampling_alpha
     # the cut is insulating (a gapped minimax interval), so the MPA sampling exponent resolves
@@ -531,20 +529,16 @@ def _one_shot(args, mesh, system, gw, say, t_read):
     Omega, B, cond = gw.mpa_poles(config, z, chi_z)
     del chi_z
     stage("w_dyson_and_mpa_fit")
-    # Σ_c is evaluated on shell: its dft0 table is Σ_c,nn(E_n − μ) inside the sampled
-    # range and Σ_c,nn(0) outside it (gw.ppm_sigma.on_shell_request), on the full BZ.
-    from .ppm_sigma import on_shell_request
-    plan = system.plan
-    e_rel_ev = (np.asarray(system.enk, np.float64)[np.asarray(plan.irr_idx)] - gw.mu) * _RY_EV
-    request = on_shell_request(
-        e_eval_rel_ev=e_rel_ev, e_dft_rel_ev=e_rel_ev,
-        omega_range_ev=np.asarray(config.omega_grid_ev, np.float64),
-        out_of_grid=config.sigma.out_of_grid, irr_idx=plan.irr_idx, n_parent=plan.n_parent)
-    body = gw.sigma_c(config, wfns, Omega, B, request=request, print_fn=say)
+    body = gw.sigma_c(config, wfns, Omega, B, print_fn=say)
     stage("sigma_c_tau_sweep")
     # the diagonal at the raw parents (the full-k rows that ARE the parents)
-    diag = body.sigma_c_kij.diagonal("dft0", body.band_axis)             # (nk, nb) Ry
-    at = np.asarray(diag)[np.asarray(plan.parent_full_rows), :gw.nb]
+    rows = np.asarray(system.plan.parent_full_rows)
+    diag = jax.jit(lambda a: jax.numpy.diagonal(a[:, rows], axis1=-2, axis2=-1))(body.sigma_c_kij)
+    sc = _host(diag, mesh)[:, :, :gw.nb]                                  # (n_ω, n_par, nb) Ry
+    om = np.asarray(body.omega_ry)
+    x = system.enk - gw.mu                                               # Σ_c(E) at E − μ
+    at = np.array([[np.interp(x[k, n], om, sc[:, k, n].real) + 1j * np.interp(x[k, n], om, sc[:, k, n].imag)
+                    for n in range(gw.nb)] for k in range(gw.n_par)])
     walls = {k: dict(n=len(v), total_s=float(np.sum(v)), warm_s=float(np.min(v[1:] if len(v) > 1 else v)))
              for k, v in gw.walls.items()}
     res = dict(kgrid=system.kgrid, fft_grid=system.fft_grid, n_r=gw.n_r, P=gw.P, nb=gw.nb, nval=gw.nval,
@@ -553,6 +547,8 @@ def _one_shot(args, mesh, system, gw, say, t_read):
                enk_ev=(system.enk * _RY_EV).tolist(), mu_ev=gw.mu * _RY_EV,
                sigx_ev=(sigx * _RY_EV).tolist(),
                sigc_at_e_ev_re=(at.real * _RY_EV).tolist(), sigc_at_e_ev_im=(at.imag * _RY_EV).tolist(),
+               omega_ev=(om * _RY_EV).tolist(),
+               sigc_omega_ev_re=(sc.real * _RY_EV).tolist(), sigc_omega_ev_im=(sc.imag * _RY_EV).tolist(),
                mpa_z_ry_re=np.real(z).tolist(), mpa_z_ry_im=np.imag(z).tolist(), mpa_fit_cond=cond,
                stages=stages, walls=walls, t_read_s=t_read, t_plans_s=gw.t_plans,
                chi_law=gw.chi_conv.describe(), sigma_law=gw.sig_conv.describe(),
@@ -581,9 +577,8 @@ def main(argv=None):
     ap.add_argument("--screened-coulomb-cutoff", type=float, default=None)
     ap.add_argument("--wedge", action="store_true")
     ap.add_argument("--deck", default=None,
-                    help="a gw_jax deck (compute_mode = mpa): run Σ_x + the MPA Σ_c(E_DFT) one-shot "
-                         "(on shell, inside its Σ range) at its η, ε and MPA plan instead of the iω "
-                         "χ/W diagnostic")
+                    help="a gw_jax deck (compute_mode = mpa): run Σ_x + the MPA Σ_c(ω) one-shot on its "
+                         "Σ grid, η, ε and MPA plan instead of the iω χ/W diagnostic")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
     import jax
