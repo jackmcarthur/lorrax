@@ -177,8 +177,12 @@ only"). The deck keys refuse by name at parse time (`GATE eqp2_retired`).
   back under the grid debug path.
 - On shell, `sigma_freq_debug.dat` keeps its one-shot columns from the
   on-shell operand and the head at E_DFT; under SC it is omitted by name.
-- The on-shell sweep is recomputed on restart (an on-shell checkpoint is a
-  follow-up).
+- A one-shot on-shell sweep is checkpointed as its pair and slots
+  (`tmp/sigma_checkpoint_oneshot_on_shell.h5`, `file_io.sigma_checkpoint`),
+  under the payoff rule of the grid path. Its identity adds the evaluation
+  and the request's tables (E_eval, E_DFT, coverage) to the grid's, so moved
+  energies recompute and neither evaluation reads the other's file. An SC
+  run continues at map granularity (`sc_seed/sc_checkpoint.h5`).
 - `python -m gw.plane_wave_pipeline --deck` runs on shell only: the JSON keeps
   `sigc_at_e_ev` (the exact on-shell `dft0` diagonal) and has no `omega_ev`
   or `sigc_omega_ev` curve.

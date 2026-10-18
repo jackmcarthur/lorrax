@@ -1,10 +1,11 @@
 """Checkpoints of sharded cubes plus a small host record, read back by authenticated identity.
 
 Two owners use it. ``gw.sigma_dispatch`` keeps a one-shot shared-pole Σ sweep
-on the omega grid (``sigma_omega_grid_debug``; over an hour on large decks)
-between the τ sweep and finalize: a rerun with ``restart = true`` whose state
-authenticates goes straight to finalize (an on-shell sweep checkpoint is not
-implemented).  The SC loop (``gw.sc_iteration``) keeps its Anderson window and
+between the τ sweep and finalize: on shell (the default) its pair and slots,
+``tmp/sigma_checkpoint_oneshot_on_shell.h5``, and on the omega grid
+(``sigma_omega_grid_debug``) its cubes, ``tmp/sigma_checkpoint_oneshot.h5``.
+A rerun with ``restart = true`` whose state authenticates goes straight to
+finalize.  The SC loop (``gw.sc_iteration``) keeps its Anderson window and
 carry beside each warm seed, ``sc_seed/sc_checkpoint.h5`` (``SC_SCHEMA``), so a
 fresh process continues the trajectory (docs/self_consistency.md §8).
 

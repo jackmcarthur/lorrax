@@ -962,7 +962,7 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
 
 
 def _sweep_checkpoint(config, input_dir, fit_identity, fit_digest, head, lorentz_output,
-                      *, e_qp_ev, body_options, band_slices, efermi_ry):
+                      *, e_qp_ev, body_options, band_slices, efermi_ry, request=None):
     """Path and identity of a one-shot shared-pole sweep checkpoint, or None.
 
     Only one-shots: an SC run continues at map granularity from its own
@@ -970,25 +970,65 @@ def _sweep_checkpoint(config, input_dir, fit_identity, fit_digest, head, lorentz
     earlier map directories.
     The identity binds the W model (its digest names its identity, the WFN
     included), the energies Σ is read at, the ω grid and every sweep option.
+    On shell (``request``) the file is its own and the identity adds the
+    evaluation and the request's tables: the grid and on-shell sweeps never
+    read each other's, and moved on-shell energies recompute.
     """
     from .gw_output import restart_tensor_writes_enabled
     if (fit_digest is None or lorentz_output
             or str((fit_identity or {}).get("iteration_id")) != "oneshot"):
         return None
     from pathlib import Path
-    path = Path(input_dir) / "tmp" / "sigma_checkpoint_oneshot.h5"
+    path = Path(input_dir) / "tmp" / ("sigma_checkpoint_oneshot.h5" if request is None
+                                      else "sigma_checkpoint_oneshot_on_shell.h5")
     if not restart_tensor_writes_enabled(config, str(path)):
         return None
     from file_io.sigma_checkpoint import sweep_identity
     options = {k: v for k, v in body_options.items()
-               if k not in ("print_fn", "occupation_state", "fixed_quadrature_session")}
+               if k not in ("print_fn", "occupation_state", "fixed_quadrature_session",
+                            "request")}
+    on_shell = {} if request is None else dict(
+        evaluation="on_shell", on_shell_tables_ry=request.tables_ry,
+        on_shell_parent_ry=request.parent_ry, on_shell_covered_kn=request.covered_kn,
+        on_shell_names=list(request.names), on_shell_aliases=dict(request.aliases),
+        on_shell_range_ev=list(request.omega_range_ev))
     return path, sweep_identity(
         schema="sigma-sweep-checkpoint-v1", w_digest=fit_digest, w_identity=fit_identity,
         head=None if head is None else (head.get("identity"), head.get("body_digest")),
         e_qp_ev=np.asarray(e_qp_ev, np.float64), options=options,
         sigma_bands=[int(band_slices.b0), int(band_slices.b3), str(band_slices.sigma_range)],
         band_extrapolation=bool(config.sigma.band_extrapolation),
-        efermi_ry=float(efermi_ry))
+        efermi_ry=float(efermi_ry), **on_shell)
+
+
+def _checkpoint_arrays(values, request):
+    """The arrays a sweep checkpoint stores: an on-shell value as its pair and
+    slots (its request is the dispatch's), a grid cube as itself.  None when
+    an on-shell value carries another request."""
+    from .ppm_sigma import is_on_shell
+    if request is None:
+        return values
+    arrays = {}
+    for name, value in values.items():
+        if is_on_shell(value):
+            if value.request is not request:
+                return None
+            arrays[f"{name}_pair"], arrays[f"{name}_slots"] = value.pair, value.slots
+        elif value is not None:
+            return None
+    return arrays
+
+
+def _checkpoint_values(arrays, request, mesh_xy):
+    """Inverse of :func:`_checkpoint_arrays`: the request is the live one (its
+    tables are in the checkpoint identity)."""
+    from .ppm_sigma import OnShellSigma
+    if request is None:
+        return arrays
+    return {name: None if arrays.get(f"{name}_slots") is None else OnShellSigma(
+                pair=arrays.get(f"{name}_pair"), slots=arrays[f"{name}_slots"],
+                request=request, mesh_xy=mesh_xy)
+            for name in ("body", "unextrap", "odd")}
 
 
 def _validate_sigma_stage(
@@ -1466,15 +1506,10 @@ def _compute_mpa_sigma(
             where="sigma_dispatch MPA plan seam")
         # Before the checkpoint: the bracket plan is part of the sweep's identity.
         body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
-    checkpoint = None
-    if request is None:
-        checkpoint = _sweep_checkpoint(
-            config, input_dir, fit_identity, fit_digest, head, lorentz_output,
-            e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
-            efermi_ry=sigma_efermi_ry)
-    elif bool(getattr(config, "restart", False)):
-        print_fn("Sigma checkpoint: none (the on-shell sweep is not checkpointed); "
-                 "the sweep is recomputed")
+    checkpoint = _sweep_checkpoint(
+        config, input_dir, fit_identity, fit_digest, head, lorentz_output,
+        e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
+        efermi_ry=sigma_efermi_ry, request=request)
 
     def finalize(cubes, host):
         from runtime.padding import PaddedAxis
@@ -1513,7 +1548,7 @@ def _compute_mpa_sigma(
             restored = read_sigma_checkpoint(checkpoint[0], identity=checkpoint[1],
                                              mesh=mesh_xy, print_fn=print_fn)
         if restored[0] is not None:
-            return finalize(*restored[:2])
+            return finalize(_checkpoint_values(restored[0], request, mesh_xy), restored[1])
     import time
     sweep_started = time.monotonic()
     if sector_handle.get("representation") == "sector-ordered-ph":
@@ -1589,72 +1624,53 @@ def _compute_mpa_sigma(
             replace(body, efermi_ry=sigma_efermi_ry), head_diag,
             e_state_ev=e_qp_ev, plan=plan, config=config, band_slices=band_slices,
             wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
-    if request is None:
-        # The raw twin is the N3 band diagonal (BandDiagonalSlots) unless
-        # sigma_freq_debug_output keeps its cube; its slots are what is kept.
-        twin_slots = hasattr(body_unextrap, "at_omega_slots")
-        cubes = dict(body=body_omega, odd=body_odd,
-                     unextrap=body_unextrap.values if twin_slots else body_unextrap)
-        axis = body.band_axis
-        host = dict(head_diag=head_diag, band_extrapolation=extrap_payload,
-                    unextrap_diagonal_slots=twin_slots,
-                    odd_even_residue_ratio=body.odd_even_residue_ratio,
-                    band_axis=(None if axis is None else dict(
-                        name=axis.name, logical=axis.logical, carrier=axis.carrier,
-                        divisor=axis.divisor)))
-        if checkpoint is not None:
-            from file_io.sigma_checkpoint import (
-                PAYOFF, checkpoint_pays, checkpointable, write_sigma_checkpoint)
-            # The write finishes before finalize: finalize donates the body cube
-            # to the head add, so nothing may still be reading it.
-            jax.block_until_ready(cubes["body"])
-            sweep_seconds = time.monotonic() - sweep_started
-            pays, predicted = checkpoint_pays(cubes, sweep_seconds)
-            named = checkpointable(cubes)
-            print_fn(f"Sigma checkpoint: {'written' if pays and named else 'skipped'} (sweep "
-                     f"{sweep_seconds:.0f} s{' >= ' if pays else ' < '}{PAYOFF:g} x "
-                     f"write est {predicted:.0f} s"
-                     f"{'' if named else '; a cube has no named sharding'})")
-            if pays and named:
-                import common.timing as timing
-                from file_io.sigma_checkpoint import discard_sigma_checkpoint
-                try:
-                    with timing.section("sigma.checkpoint_write", announce=True):
-                        # The head diagonal is stored as its closed form's fields.
-                        nbytes, seconds = write_sigma_checkpoint(
-                            checkpoint[0], identity=checkpoint[1], cubes=cubes,
-                            host=dict(host, head_diag=None if head_diag is None else
-                                      asdict(head_diag)),
-                            mesh=mesh_xy)
-                    print_fn(f"Sigma checkpoint: {nbytes / 2**30:.2f} GiB of swept cubes "
-                             f"written in {seconds:.1f} s to {checkpoint[0]}")
-                except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                    # A restart point never costs the sweep it protects; the
-                    # collective writers raise the same refusal on every rank.
-                    discard_sigma_checkpoint(checkpoint[0])
-                    print_fn(f"WARNING Sigma checkpoint: write failed and {checkpoint[0]} was "
-                             f"removed; finalizing without it ({type(exc).__name__}: "
-                             f"{str(exc)[:300]})")
-        return finalize(cubes, host)
-    return finalize_dynamic_sigma(
-        body_omega, head_diag,
-        sigma_band_axis=body.band_axis,
-        sig_x=sig_x, sig_h=sig_h,
-        v_h_scalar=v_h_scalar, h_transverse=h_transverse,
-        hartree_omitted=bool(omit_v_h),
-        e_qp_ev=e_qp_ev,
-        config=config, meta=meta, mesh_xy=mesh_xy,
-        sym=sym, wfn=wfn, band_slices=band_slices,
-        input_dir=input_dir,
-        write_sigma_omega_h5=write_sigma_omega_h5,
-        sigma_lorentz_static_skij_ry=sigma_lorentz,
-        sigma_c_odd_body_omega=body_odd,
-        band_extrapolation=extrap_payload,
-        sigma_c_body_omega_unextrap=body_unextrap,
-        ppm_odd_even_residue_ratio=body.odd_even_residue_ratio,
-        print_fn=print_fn,
-        efermi_ry=sigma_efermi_ry,
-        efermi_provenance=sigma_efermi_provenance)
+    # The raw twin is the N3 band diagonal (BandDiagonalSlots) unless
+    # sigma_freq_debug_output keeps its cube; its slots are what is kept.
+    twin_slots = hasattr(body_unextrap, "at_omega_slots")
+    cubes = dict(body=body_omega, odd=body_odd,
+                 unextrap=body_unextrap.values if twin_slots else body_unextrap)
+    axis = body.band_axis
+    host = dict(head_diag=head_diag, band_extrapolation=extrap_payload,
+                unextrap_diagonal_slots=twin_slots,
+                odd_even_residue_ratio=body.odd_even_residue_ratio,
+                band_axis=(None if axis is None else dict(
+                    name=axis.name, logical=axis.logical, carrier=axis.carrier,
+                    divisor=axis.divisor)))
+    if checkpoint is not None:
+        from file_io.sigma_checkpoint import (
+            PAYOFF, checkpoint_pays, checkpointable, write_sigma_checkpoint)
+        stored = _checkpoint_arrays(cubes, request)
+        # The write finishes before finalize: finalize donates the body cube
+        # to the head add, so nothing may still be reading it.
+        jax.block_until_ready(cubes["body"])
+        sweep_seconds = time.monotonic() - sweep_started
+        pays, predicted = checkpoint_pays(stored or {}, sweep_seconds)
+        named = stored is not None and checkpointable(stored)
+        print_fn(f"Sigma checkpoint: {'written' if pays and named else 'skipped'} (sweep "
+                 f"{sweep_seconds:.0f} s{' >= ' if pays else ' < '}{PAYOFF:g} x "
+                 f"write est {predicted:.0f} s"
+                 f"{'' if named else '; a value has no named sharding or its own request'})")
+        if pays and named:
+            import common.timing as timing
+            from file_io.sigma_checkpoint import discard_sigma_checkpoint
+            try:
+                with timing.section("sigma.checkpoint_write", announce=True):
+                    # The head diagonal is stored as its closed form's fields.
+                    nbytes, seconds = write_sigma_checkpoint(
+                        checkpoint[0], identity=checkpoint[1], cubes=stored,
+                        host=dict(host, head_diag=None if head_diag is None else
+                                  asdict(head_diag)),
+                        mesh=mesh_xy)
+                print_fn(f"Sigma checkpoint: {nbytes / 2**30:.2f} GiB of swept cubes "
+                         f"written in {seconds:.1f} s to {checkpoint[0]}")
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                # A restart point never costs the sweep it protects; the
+                # collective writers raise the same refusal on every rank.
+                discard_sigma_checkpoint(checkpoint[0])
+                print_fn(f"WARNING Sigma checkpoint: write failed and {checkpoint[0]} was "
+                         f"removed; finalizing without it ({type(exc).__name__}: "
+                         f"{str(exc)[:300]})")
+    return finalize(cubes, host)
 
 
 def _compute_ppm_sigma(

@@ -36,6 +36,33 @@ observer field. Nothing in a deck has to change.
   observer, or without the opt-in, the driver does nothing new.
   `gw.ppm_sigma.window_sigma_c` takes `static_limit_wc0=`.
 
+## 2026-10-18 — On-shell Sigma sweep checkpointed (one-shot restart)
+
+A one-shot shared-pole run on the default on-shell path now writes its swept
+Σ_c, the pair and diagonal slots, to `tmp/sigma_checkpoint_oneshot_on_shell.h5`
+(`file_io.sigma_checkpoint`, the grid path's mechanism and payoff rule). A
+rerun with `restart = true` whose checkpoint authenticates skips the τ sweep
+and goes straight to finalize. Before this, the on-shell sweep was recomputed
+on every restart. The identity is the grid path's plus the evaluation and the
+on-shell request tables (E_eval, E_DFT, coverage). A run whose energies moved
+recomputes, and the old file is removed with a named WARNING. The grid and
+on-shell sweeps never read each other's file. SC runs are unchanged: they
+continue at map granularity from `sc_seed/sc_checkpoint.h5`.
+
+- **Results unchanged.** Measured on Fe 8^3 (MPA shared pole, one-shot,
+  4 A100 ranks) against `6f7b2ca26`: the eqp0/eqp1/eqp_g0w0/sigma_diag
+  bodies, every `sigma_mnk.h5` and `qp_wfn_rotations.h5` dataset and
+  attribute, and the per-rank device peak are bitwise equal. The restart
+  that reads the checkpoint reproduces them bitwise.
+- **Cost.** 27.3 MiB, written in 0.3 s after a 105 s sweep. The restart
+  reads it in 0.5 s, and its wall falls from 144.3 s to 49.8 s.
+- **Grid debug path** (`sigma_omega_grid_debug = true`): outputs and its
+  checkpoint file are byte-identical to `6f7b2ca26`, and its restart still
+  reads it.
+- **Files.** A new `tmp/` file per one-shot run. It is written only when
+  `write_restart_tensors` is on and the sweep took at least 5× its predicted
+  write.
+
 ## 2026-10-18 — Sigma(omega) grid debug restored
 
 The ω-grid Σ_c(ω) path is back as an opt-in debug path,
