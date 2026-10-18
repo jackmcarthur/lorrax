@@ -61,6 +61,8 @@ G9  the split band sum (td_agw_dynamical.md §1.6) at the excited state of G5:
 G10 tdagw.dynsig.delta_chi0 of the excited populations of G3 (dress none) at both
     supports == the dense ordered dchi0 (same-side pairs exact at i w_p)    rel <= 1e-8;
     at rho_eq it is exactly zero at both supports
+    with same_side_gamma (the static support's principal value) == the dense
+    chi0 with the same-side pairs at their principal value                rel <= 1e-8
 G11 the refreshed screening of the collision term (dynsig.collision_screening,
     screen_populations) on the run's own W samples and fit plan: its rules ==
     the driver's; at rho_eq dchi0 = 0, W == W0 and the poles == the run's   rel <= 1e-14;
@@ -153,6 +155,30 @@ def _dense_chi(psi, e, f, z=0.0):
             den = dE - z
             ok = (np.abs(den) > 1e-12) & (np.abs(df) > 0)
             cab = np.where(ok, df / np.where(ok, den, 1.0), 0.0)
+            chi[q] += np.einsum("abu,ab,abv->uv", rho, cab, np.conj(rho))
+    return chi / nk
+
+
+def _dense_chi_pv(psi, e, f, gamma, e_sep):
+    """chi_q(0) with the same-side pairs at their principal value of width ``gamma``, Ry^-1.
+
+    Cross-gap pairs exact; pairs with both legs on one side of ``e_sep`` take
+    (f_a - f_b)(E_a - E_b)/((E_a - E_b)^2 + gamma^2) (tdagw.dynsig.delta_chi0's
+    ``same_side_gamma``).
+    """
+    nk = psi.shape[0]
+    kmq = _kmq()
+    chi = np.zeros((nk, NMU, NMU), complex)
+    for q in range(nk):
+        for k in range(nk):
+            kb = kmq[q, k]
+            rho = np.einsum("asu,bsu->abu", psi[k], np.conj(psi[kb]))
+            dE = e[k][:, None] - e[kb][None, :]
+            df = f[k][:, None] - f[kb][None, :]
+            same = ((e[k][:, None] - e_sep) < 0.0) == ((e[kb][None, :] - e_sep) < 0.0)
+            ok = (np.abs(dE) > 1e-12) & (np.abs(df) > 0)
+            exact = np.where(ok, df / np.where(ok, dE, 1.0), 0.0)
+            cab = np.where(same, df * dE / (dE * dE + gamma * gamma), exact)
             chi[q] += np.einsum("abu,ab,abv->uv", rho, cab, np.conj(rho))
     return chi / nk
 
@@ -589,6 +615,13 @@ def run_checks(mesh):
         rows["R7"] = _rel(d10["p_even"], dchi[1])
         rows["G10_eq"] = max(float(np.max(np.abs(gather(dfn[t_](*args10, putrep(f[:, wsl]))))))
                              for t_ in ("0", "p"))
+        GAMMA_PV = 0.05                                    # Ry: wide enough to matter here
+        d_pv = gather(jax.jit(lambda A__, U_, e_, f_: D.delta_chi0(
+            {**S_, **A__}, kern, U_, e_, f_, same_side_gamma=GAMMA_PV)[0])(
+                *args10, putrep(f_t[:, wsl])))
+        ref_pv = _dense_chi_pv(psi, e, f_t, GAMMA_PV, rule["e_sep"]) - _dense_chi(psi, e, f, 0.0)
+        rows["G10_pv"] = _rel(d_pv, ref_pv)
+        rows["G10_pv_vs_exact"] = _rel(d_pv, dchi[0])
         # ---- G11 / R8: the refreshed screening of the collision term
         src = dict(wfns=wfns, meta=meta, poles=poles, fit_plan=plan, W_supports=(W0_u, Wp_u),
                    quad=quad, config=SimpleNamespace(minimax_config=mm))
@@ -644,7 +677,7 @@ GATES = dict(G0_W0=1e-8, G0_Wp=1e-8, G1_static=1e-8, G1_probe=1e-8, G2_W0=1e-8, 
              G7_pair_same=1e-12, G7_cond=1e-5, G7_val=1e-5, G7_static=1e-5, G7_gout=1e-5,
              G7_gin=1e-5, G8_sx=1e-8, G8_head=0.0, G9_pair=1e-5, G9_branches=1e-5,
              G9_static_limit=1e-5, G9_window_only=1e-5, G9_affine=1e-12, G10_static=1e-8,
-             G10_probe=1e-8, G10_eq=0.0, G11_rules=0.0, G11_eq_dchi=0.0, G11_eq_W=1e-14,
+             G10_probe=1e-8, G10_eq=0.0, G10_pv=1e-8, G11_rules=0.0, G11_eq_dchi=0.0, G11_eq_W=1e-14,
              G11_eq_poles=1e-14, G11_W=1e-8, G11_sigma=1e-5, G11_static_limit_W0=1e-8,
              G11_split=1e-5, G11_static_W_limit=1e-8)
 COUNTS = ("G2_valid_vs_driver", "G2_valid_vs_dense", "G3_valid_vs_dense", "G9_affine_rebuilds",

@@ -92,7 +92,7 @@ class CompileLog(logging.Handler):
 def _td_deck(ref, bands, outdir, *, tf_fs, dtm_as=50.0, efield=None, collision="off",
              refresh_fs=0.0, refresh_df=0.0, hermitian="dynamic", method="cfm4", dt_as=25.0,
              chunk=5, degeneracy="", ivbm=130, sweep="full", screening="frozen",
-             frozen_bands=None):
+             frozen_bands=None, gamma_ev=None):
     b_lo, b_hi = bands
     ex = efield or 0.0
     raw = {"control": {"calc_type": "COHSEX",
@@ -118,6 +118,8 @@ def _td_deck(ref, bands, outdir, *, tf_fs, dtm_as=50.0, efield=None, collision="
         raw["lorrax"]["collision_screening"] = screening
     if frozen_bands is not None:
         raw["lorrax"]["collision_frozen_bands"] = [int(v) for v in frozen_bands]
+    if gamma_ev is not None and screening == "refreshed":
+        raw["lorrax"]["collision_screening_gamma_ev"] = float(gamma_ev)
     return raw
 
 
@@ -176,6 +178,8 @@ def main():
     ap.add_argument("--cd-check-trunc", action="store_true",
                     help="CD refreshed with frozen bands: also sweep the whole frozen part")
     ap.add_argument("--cd-tag", default="", help="CD: suffix of the run tags")
+    ap.add_argument("--cd-gamma-ev", type=float, default=None,
+                    help="CD refreshed: collision_screening_gamma_ev (default: the deck's)")
     ap.add_argument("--drive-cases", default="off,sub,raw,sub_full,sub_norebase")
     a = ap.parse_args()
     sections = set(a.sections.split(","))
@@ -767,7 +771,8 @@ def main():
                     f_hot[:, 2] += a.hot2v_amount
                 rec = {}
                 t1 = time.perf_counter()
-                scr = D.collision_screening(src, mesh=mesh, b_lo=lo, n_active=n)
+                scr = D.collision_screening(src, mesh=mesh, b_lo=lo, n_active=n,
+                                            gamma_ry=0.001 / ev)
                 rec["setup_s"] = time.perf_counter() - t1
                 ru = scr["rules"]
                 rec["rules"] = dict(static_nodes=len(ru["static"]["tau"]),
@@ -879,7 +884,8 @@ def main():
                                        tf_fs=a.drive_fs, efield=_pulse(amp), collision="subtracted",
                                        refresh_fs=cad, refresh_df=a.refresh_df, sweep="active",
                                        screening=scr_, degeneracy=deg,
-                                       frozen_bands=fb if scr_ == "refreshed" else None)
+                                       frozen_bands=fb if scr_ == "refreshed" else None,
+                                       gamma_ev=a.cd_gamma_ev)
                         orig = D.gnppm_collision
                         if a.cd_check_trunc and scr_ == "refreshed" and fb is not None:
                             D.gnppm_collision = lambda *x, **kw: orig(

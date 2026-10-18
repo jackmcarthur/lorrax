@@ -73,6 +73,7 @@ _CASES = [
     ("lorrax.collision_refresh_df", "often", "td_collision_refresh"),
     ("lorrax.collision_screening", "dynamic", "td_collision"),
     ("lorrax.collision_frozen_bands", [4], "td_collision"),
+    ("lorrax.collision_screening_gamma_ev", -1.0, "td_collision"),
     ("lorrax.collision", "subtracted", "td_collision_source"),
 ]
 
@@ -183,6 +184,12 @@ def test_collision_screening_and_frozen_bands():
     assert _refuses(_bundle(collision="subtracted", collision_screening="refreshed",
                             collision_frozen_bands=[4, 8]), "td_collision")
     assert _refuses(_bundle(**on, collision_frozen_bands=[4, -1]), "td_collision")
+    from tdagw.td_config import inactive_keys
+    assert parse_td_deck(_bundle(**on)).values["lorrax.collision_screening_gamma_ev"] == 0.001
+    frozen = parse_td_deck(_bundle(collision="subtracted", collision_screening_gamma_ev=0.01))
+    assert "lorrax.collision_screening_gamma_ev" in inactive_keys(frozen)
+    assert "lorrax.collision_screening_gamma_ev" not in inactive_keys(
+        parse_td_deck(_bundle(**on, collision_screening_gamma_ev=0.01)))
 
 
 def test_collision_keys_inactive_when_off_and_fingerprint():

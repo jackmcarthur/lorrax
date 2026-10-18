@@ -89,6 +89,7 @@ TD_DEFAULTS = {
     "lorrax.collision_refresh_sweep": "full",
     "lorrax.collision_screening": "frozen",
     "lorrax.collision_frozen_bands": None,
+    "lorrax.collision_screening_gamma_ev": 0.001,
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -196,6 +197,15 @@ def _check_collision(vals: dict) -> None:
                         "collision_screening = 'refreshed' and collision_refresh_sweep = 'active'",
                         "the truncation is of the frozen part's change under W(t); unset it")
         vals["lorrax.collision_frozen_bands"] = [int(n) for n in fb]
+    try:
+        ok = float(vals["lorrax.collision_screening_gamma_ev"]) >= 0.0
+    except (TypeError, ValueError):
+        ok = False
+    if not ok:
+        raise _gate("td_collision", f"collision_screening_gamma_ev = "
+                    f"{vals['lorrax.collision_screening_gamma_ev']!r}", ">= 0 (eV; 0 = exact, "
+                    "degenerate pairs refused)", "set [lorrax] collision_screening_gamma_ev")
+    vals["lorrax.collision_screening_gamma_ev"] = float(vals["lorrax.collision_screening_gamma_ev"])
     for key in ("lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"):
         try:
             ok = float(vals[key]) >= 0.0
@@ -507,8 +517,11 @@ def inactive_keys(deck) -> dict:
         (("lorrax.collision_source", "lorrax.collision_hermitian",
           "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
           "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
-          "lorrax.collision_frozen_bands"),
+          "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
+        (("lorrax.collision_screening_gamma_ev",),
+         v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "refreshed",
+         "collision_screening = 'refreshed' only"),
     ]
     out = {}
     for keys, inactive, why in rules:
@@ -883,5 +896,14 @@ TD_KEY_DOCS = {
         "part is re-swept under W(t) — [b_lo − n_below, b_lo) and [b_hi, b_hi + n_above); "
         "the others keep their part at W0 (Σ^F[W(t)] ≈ Σ^F[W0] + Σ^F_kept[W(t)] − "
         "Σ^F_kept[W0], exact at ρ_eq). A truncation: its error is measured, not bounded.",
+        ("td_collision",)),
+    "lorrax.collision_screening_gamma_ev": (
+        "", "With `collision_screening = refreshed`: the width (eV) of the principal value "
+        "taken for the static support's same-side pairs, (f_a − f_b)(E_a − E_b)/((E_a − "
+        "E_b)² + γ²): exact for |E_a − E_b| ≫ γ, zero for a degenerate pair. A driven "
+        "carrier distribution makes symmetry-equivalent k unequal, and the exact static "
+        "term of such a pair is a Drude pole; 0 keeps the exact term and refuses those "
+        "pairs by name (`dynsig_degenerate_population`). The refresh lines count the "
+        "degenerate pairs taken at their principal value.",
         ("td_collision",)),
 }

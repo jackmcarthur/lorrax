@@ -356,7 +356,7 @@ def chi0_split(dyn: dict, kern: DynsigKernels, rule: dict | None = None):
 
 
 def _same_side_chi(dyn, kern, psi_A, e_A, f_A, x_sep, omega_p: float = 0.0,
-                   odd: bool = True):
+                   odd: bool = True, gamma: float = 0.0):
     """Exact sum over ordered same-side pairs with an active leg, (nq, mu, nu), Ry^-1.
 
     chi^ss_q(z) = (g_s/N_k) sum_k sum_ab c_ab rho_ab(mu) rho_ab*(nu), a at k, b at k-q,
@@ -367,9 +367,14 @@ def _same_side_chi(dyn, kern, psi_A, e_A, f_A, x_sep, omega_p: float = 0.0,
     ``omega_p`` 0: the static support z = 0; > 0: z = i omega_p, the ordered orientation of
     the GW run's chi0(i omega_p), c_ab = (f_a - f_b)(E_a - E_b + i omega_p)/((E_a - E_b)^2 +
     omega_p^2); ``odd = False`` keeps its real part alone (the time-reversal-even
-    coefficient; a comparison, not the run's chi0 on a magnet).  Returns (chi, bad):
-    bad counts near-degenerate same-side pairs whose populations differ at z = 0 (their
-    static limit is a Drude term this prototype refuses); none at i omega_p.
+    coefficient; a comparison, not the run's chi0 on a magnet).  ``gamma`` > 0 (z = 0
+    only): the principal value of width gamma, c_ab = (f_a - f_b)(E_a - E_b)/((E_a -
+    E_b)^2 + gamma^2): exact for |E_a - E_b| >> gamma, zero for a degenerate pair (a
+    driven carrier distribution makes symmetry-equivalent k unequal).  Returns (chi,
+    bad, n_deg): bad counts near-degenerate same-side pairs whose populations differ
+    at z = 0 with gamma = 0 (their static limit is a Drude term this prototype
+    refuses); n_deg counts them under the principal value (not refused); none at
+    i omega_p.
     """
     nk, mesh = int(np.prod(kern.kgrid)), kern.mesh
     b_lo, nA = dyn["band_lo"], dyn["n_active"]
@@ -384,13 +389,17 @@ def _same_side_chi(dyn, kern, psi_A, e_A, f_A, x_sep, omega_p: float = 0.0,
     def coeff(Ea, Eb, fa, fb, mask):
         same = ((Ea - x_sep) < 0.0) == ((Eb - x_sep) < 0.0)
         dE, df = Ea - Eb, fa - fb
+        zero = jnp.zeros((), jnp.int32)
         if omega_p > 0.0:
             w = float(omega_p)
             c = df * ((dE + 1j * w) if odd else dE) / (dE * dE + w * w)
-            return jnp.where(same & mask, c, 0.0), jnp.zeros((), jnp.int32)
+            return jnp.where(same & mask, c, 0.0), zero, zero
+        deg = same & (jnp.abs(dE) <= tol) & (jnp.abs(df) > otol) & mask
+        if gamma > 0.0:
+            g2 = float(gamma) ** 2
+            return jnp.where(same & mask, df * dE / (dE * dE + g2), 0.0), zero, jnp.sum(deg)
         ok = same & (jnp.abs(dE) > tol) & mask
-        bad = same & (jnp.abs(dE) <= tol) & (jnp.abs(df) > otol) & mask
-        return jnp.where(ok, df / jnp.where(ok, dE, 1.0), 0.0), jnp.sum(bad)
+        return jnp.where(ok, df / jnp.where(ok, dE, 1.0), 0.0), jnp.sum(deg), zero
 
     def pair_chi(r, c):
         return jnp.einsum("kabu,kab,kabv->uv", r, c.astype(r.dtype), jnp.conj(r))
@@ -398,15 +407,16 @@ def _same_side_chi(dyn, kern, psi_A, e_A, f_A, x_sep, omega_p: float = 0.0,
     def per_q(kmq):
         tk = lambda a: jnp.take(a, kmq, axis=0)
         r1 = jnp.einsum("kasu,kbsu->kabu", psi_A, jnp.conj(tk(psi_all)))
-        c1, n1 = coeff(e_A[:, :, None], tk(e_all)[:, None, :], f_A[:, :, None],
-                       tk(f_all)[:, None, :], tk(live)[:, None, :] > 0)
+        c1, n1, d1 = coeff(e_A[:, :, None], tk(e_all)[:, None, :], f_A[:, :, None],
+                           tk(f_all)[:, None, :], tk(live)[:, None, :] > 0)
         r2 = jnp.einsum("kasu,kbsu->kabu", psi_all, jnp.conj(tk(psi_A)))
-        c2, n2 = coeff(e_all[:, :, None], tk(e_A)[:, None, :], f_all[:, :, None],
-                       tk(f_A)[:, None, :], frozen[:, :, None] > 0)
-        return (pair_chi(r1, c1) + pair_chi(r2, c2)) * (gs / nk), n1 + n2
+        c2, n2, d2 = coeff(e_all[:, :, None], tk(e_A)[:, None, :], f_all[:, :, None],
+                           tk(f_A)[:, None, :], frozen[:, :, None] > 0)
+        return (pair_chi(r1, c1) + pair_chi(r2, c2)) * (gs / nk), n1 + n2, d1 + d2
 
-    chis, bads = lax.map(per_q, jnp.asarray(kern.kmq))
-    return lax.with_sharding_constraint(chis, NamedSharding(mesh, CHI_SPEC)), jnp.sum(bads)
+    chis, bads, degs = lax.map(per_q, jnp.asarray(kern.kmq))
+    return (lax.with_sharding_constraint(chis, NamedSharding(mesh, CHI_SPEC)), jnp.sum(bads),
+            jnp.sum(degs))
 
 
 def _gate_flags(dyn, e_A, x_sep):
@@ -428,7 +438,8 @@ def _gate_flags(dyn, e_A, x_sep):
 
 
 def delta_chi0(dyn: dict, kern: DynsigKernels, U, e_A, f_A, *, pauli: bool = True,
-               same_side: bool = True, rule: dict | None = None, odd_same_side: bool = True):
+               same_side: bool = True, rule: dict | None = None, odd_same_side: bool = True,
+               same_side_gamma: float = 0.0):
     """dchi0 of Eq. (4) for the instantaneous window state (U, e_A, f_A), (nq, mu, nu), Ry^-1.
 
     G_eq(tau) of every band (G_frozen + G_active(0)) is composed at each node and
@@ -441,6 +452,9 @@ def delta_chi0(dyn: dict, kern: DynsigKernels, U, e_A, f_A, *, pauli: bool = Tru
     alpha_l - i beta_l (the Pauli product is the same kernel with the opposite
     sign at any support) and the same-side pairs take (f_a - f_b)/(E_a - E_b -
     i omega_p) (``odd_same_side=False``: its real part alone, a comparison).
+    ``same_side_gamma`` > 0 (Ry, static support): the same-side pairs' principal value
+    of that width (:func:`_same_side_chi`; ``flags['degenerate_pv']`` counts the
+    degenerate pairs it zeroes, which ``gamma = 0`` refuses).
     Returns (dchi, flags) with flags the NaN-gate counters.
     """
     nk, mesh = int(np.prod(kern.kgrid)), kern.mesh
@@ -482,12 +496,13 @@ def delta_chi0(dyn: dict, kern: DynsigKernels, U, e_A, f_A, *, pauli: bool = Tru
     acc, _ = lax.scan(body, _chi_zero(mesh, nk, dyn["nmu_pad"]), (taus, weights), unroll=1)
     dchi = kern.c_fft((-2.0 * dyn["g_s"] / np.sqrt(nk)) * jnp.real(acc).astype(jnp.complex128))
     crossed, out = _gate_flags(dyn, e_A, x_sep)
-    bad = jnp.zeros((), jnp.int32)
+    bad = n_pv = jnp.zeros((), jnp.int32)
     if same_side:
-        chi_ss, bad = _same_side_chi(dyn, kern, psiA_X, e_A, f_A, x_sep, omega_p=omega_p,
-                                     odd=odd_same_side)
+        chi_ss, bad, n_pv = _same_side_chi(dyn, kern, psiA_X, e_A, f_A, x_sep, omega_p=omega_p,
+                                           odd=odd_same_side, gamma=float(same_side_gamma))
         dchi = dchi + chi_ss
-    return dchi, dict(crossed=crossed, out_of_rule=out, degenerate=bad.astype(jnp.int32))
+    return dchi, dict(crossed=crossed, out_of_rule=out, degenerate=bad.astype(jnp.int32),
+                      degenerate_pv=n_pv.astype(jnp.int32))
 
 
 # ===========================================================================
@@ -815,7 +830,7 @@ COLLISION_SCREENINGS = ("frozen", "refreshed")
 
 
 def collision_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
-                        odd_same_side: bool = True) -> dict:
+                        odd_same_side: bool = True, gamma_ry: float = 0.0) -> dict:
     """The held objects of the refreshed screening of the GN-PPM collision term (§7.1).
 
     W(z_s, t) = [1 - W0(z_s) dchi0(z_s, t)]^-1 W0(z_s) at the GN supports z_s = 0 and
@@ -828,6 +843,10 @@ def collision_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     run's chi0 when the window populations move: cross-gap pairs on the rules,
     same-side pairs exact at each support, chi0^ff never formed.  k rows go to flat
     C order (the run's q convention); the screening bundle is not the propagator's.
+    ``gamma_ry`` > 0: the static support's same-side pairs take the principal value of
+    that width (:func:`delta_chi0`'s ``same_side_gamma``; a driven distribution makes
+    symmetry-equivalent k unequal, whose exact static term is a Drude pole); 0 refuses
+    such pairs by name.
 
     Returns dict: ``dchi`` (the two jitted dchi0 maps (arrays, U, e, f) -> (dchi,
     flags), static then probe), ``arrays``, ``dyn`` (static part), ``U``, ``e_A``
@@ -893,8 +912,10 @@ def collision_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     put = lambda a: device_put_process_local(np.ascontiguousarray(a), rep_)
 
     def dchi_map(r):
+        g = float(gamma_ry) if r is None else 0.0
         return jax.jit(lambda A, U, e, f: delta_chi0(
-            {**static, **A}, kern, U, e, f, rule=r, odd_same_side=odd_same_side))
+            {**static, **A}, kern, U, e, f, rule=r, odd_same_side=odd_same_side,
+            same_side_gamma=g))
 
     @jax.jit
     def census(om, valid, valid_prev, w_t0, w_tp, om0, valid0, w00, w0p):
@@ -912,7 +933,8 @@ def collision_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
                 U=put(np.broadcast_to(np.eye(int(n_active), dtype=complex),
                                       (nk, int(n_active), int(n_active))).copy()),
                 e_A=put(e_all[:, win]), flat_rows=flat_rows, W0=W0, plan=plan,
-                rules=dict(static=rule, probe=prule), census=census, nbf=nbf, poles0=poles0)
+                rules=dict(static=rule, probe=prule), census=census, nbf=nbf, poles0=poles0,
+                gamma_ry=float(gamma_ry))
 
 
 def screen_populations(scr: dict, f_rows, *, valid_prev=None):
@@ -951,7 +973,8 @@ def screen_populations(scr: dict, f_rows, *, valid_prev=None):
     rec = dict(dchi_s=t1 - t0, fit_s=t2 - t1, n_invalid=int(c["n_invalid"]),
                flips_prev=int(c["flips_prev"]), flips_eq=int(c["flips_eq"]),
                d_omega_mev=c["d_omega"] * RYD_TO_EV * 1e3, dW=[c["dW_static"], c["dW_probe"]],
-               n_logical=int(c["n_logical"]), dchi_max=dchi_max)
+               n_logical=int(c["n_logical"]), dchi_max=dchi_max,
+               degenerate_pv=int(jax.device_get(outs[0][1]["degenerate_pv"])))
     return poles, W, rec
 
 
@@ -1000,8 +1023,8 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                     form: str = "subtracted", hermitian: str = "dynamic", policy=None,
                     sweep: str = "full", check_full: bool = False, screening: str = "frozen",
                     frozen_bands=None, frozen_plan: str = "window",
-                    check_truncation: bool = False, odd_same_side: bool = True, say=print,
-                    record=None):
+                    check_truncation: bool = False, odd_same_side: bool = True,
+                    screening_gamma_ev: float = 0.0, say=print, record=None):
     """The held collision term of the GN-PPM member at t0 and its refresh hook (§1.5, §7.1).
 
     Parameters
@@ -1044,6 +1067,8 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         part at each refresh and record the differences (``truncation`` in each record).
     odd_same_side : :func:`delta_chi0`'s (False: the time-reversal-even same-side
         coefficient at i omega_p, a comparison).
+    screening_gamma_ev : the static support's same-side principal-value width
+        (:func:`collision_screening`), eV; 0 refuses degenerate pairs.
     say : the stdout line of each refresh; ``record`` (or None) gets each
         refresh's dict (the run log's section, the case scripts' tables).
 
@@ -1145,8 +1170,10 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     scr, screen_eq = None, None
     if refreshed:
         t_s = time.perf_counter()
+        from common.units import RYD_TO_EV as _ev
         scr = collision_screening(source, mesh=mesh, b_lo=int(b_lo), n_active=nb,
-                                  odd_same_side=odd_same_side)
+                                  odd_same_side=odd_same_side,
+                                  gamma_ry=float(screening_gamma_ev) / _ev)
         t_b0 = time.perf_counter()
         poles_eq, _, screen_eq = screen_populations(scr, f_b)
         same = lambda a, b: (a is None and b is None) or (
@@ -1156,7 +1183,8 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                                                  for k in ("Omega_q", "B_q", "B_odd_q",
                                                            "valid_mask_q", "Wc0_q")),
             rule_nodes=[len(scr["rules"]["static"]["tau"]), len(scr["rules"]["probe"]["tau"])],
-            frozen_bands=None if keep is None else int(keep.sum()), frozen_plan=frozen_plan)
+            frozen_bands=None if keep is None else int(keep.sum()), frozen_plan=frozen_plan,
+            gamma_ev=float(screening_gamma_ev))
         del poles_eq
 
     held_parts, plans = {}, {}
@@ -1384,7 +1412,8 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                 d_omega_mev=worst("d_omega_mev"),
                 dW=[max(sr["dW"][0] for sr in screens), max(sr["dW"][1] for sr in screens)],
                 dchi_max=[max(sr["dchi_max"][0] for sr in screens),
-                          max(sr["dchi_max"][1] for sr in screens)]))
+                          max(sr["dchi_max"][1] for sr in screens)],
+                degenerate_pv=max(sr["degenerate_pv"] for sr in screens)))
             if sweep == "active":
                 rec.update(frozen_s=sum(p_["frozen_s"] for p_ in parts),
                            active_s=sum(p_["active_s"] for p_ in parts),
@@ -1433,7 +1462,9 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                    + f"; invalid {rec['screen']['n_invalid']}/{rec['screen']['n_logical']} modes "
                    f"({rec['screen']['flips_prev']} flips since last, {rec['screen']['flips_eq']} vs "
                    f"rho_eq), max|dOmega| {rec['screen']['d_omega_mev']:.3g} meV, max|dW|/|W0| "
-                   f"{rec['screen']['dW'][0]:.2e} (0) {rec['screen']['dW'][1]:.2e} (i w_p)")
+                   f"{rec['screen']['dW'][0]:.2e} (0) {rec['screen']['dW'][1]:.2e} (i w_p)"
+                   + (f"; {rec['screen']['degenerate_pv']} degenerate same-side pairs at "
+                      f"their principal value" if rec['screen']['degenerate_pv'] else ""))
                 + ("" if "truncation" not in rec else
                    f"; vs whole frozen part: rates {rec['truncation']['rate_rel']:.2e} rel, "
                    f"dSigma^h {rec['truncation'].get('herm_mev', 0.0):.2e} meV")

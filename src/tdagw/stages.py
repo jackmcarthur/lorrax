@@ -313,7 +313,7 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             "lorrax.collision", "lorrax.collision_source", "lorrax.collision_hermitian",
             "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
             "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
-            "lorrax.collision_frozen_bands")}
+            "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev")}
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
               nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
               measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
@@ -581,12 +581,15 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
                             form=v["lorrax.collision"], hermitian=v["lorrax.collision_hermitian"],
                             policy=policy, sweep=v["lorrax.collision_refresh_sweep"],
                             screening=v["lorrax.collision_screening"],
-                            frozen_bands=v["lorrax.collision_frozen_bands"], say=emit)
+                            frozen_bands=v["lorrax.collision_frozen_bands"],
+                            screening_gamma_ev=v["lorrax.collision_screening_gamma_ev"], say=emit)
     every = policy.every * tdgw_io.T_IN_ATTOSEC / 1000.0
     fb = v["lorrax.collision_frozen_bands"]
     say(f"  collision       : {v['lorrax.collision']}, hermitian "
         f"{v['lorrax.collision_hermitian']}, {v['lorrax.collision_refresh_sweep']} sweep, "
         f"{v['lorrax.collision_screening']} screening"
+        + ("" if v["lorrax.collision_screening"] != "refreshed" else
+           f" (same-side principal value {v['lorrax.collision_screening_gamma_ev']:g} eV)")
         + ("" if fb is None else f" (frozen change over {fb[0]} + {fb[1]} bands)") + "; refresh "
         + (" or ".join(([f"every {every:g} fs"] if policy.every else [])
                        + ([f"max|df| >= {policy.df:g}"] if policy.df else []))
