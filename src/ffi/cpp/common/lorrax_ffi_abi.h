@@ -100,6 +100,14 @@
 //                An ABI-8 library would reject the attribute and miss the result;
 //                refused by name at load instead.
 //
+//   ABI 9 -> 10  (2026-10-18, eighmem).  lorrax_cusolvermp_eigh takes one more
+//                result, the operand cuSOLVERMp destroys, aliased to its Arg
+//                (input_output_aliases={0: 2}); the handler solves in it and its
+//                scratch is the vendor workspace alone (no private operand tile),
+//                and lrx_eigh_workspace_bytes_block reports that workspace alone.
+//                An ABI-9 library would see one Ret more than it binds; refused
+//                by name at load instead.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -124,4 +132,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 9
+#define LORRAX_FFI_ABI_VERSION 10

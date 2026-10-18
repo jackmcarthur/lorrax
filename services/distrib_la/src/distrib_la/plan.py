@@ -86,7 +86,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._result_check import (_flag, _notices, deflate_zero_rows, in_checked_retry, native_eigh,
-                                      traced_phase)
+                                      read_flags, traced_phase)
 from distrib_la.resolve import (NATIVE, NATIVE2D, ONE_DEVICE, OPS, backend_module,
                                 mesh_key, mesh_platform, resolve_backend,
                                 resolve_eigh_capacity, size_route_note)
@@ -256,6 +256,28 @@ def _stack_price(op, mesh, nb, n, dtype, rounds) -> int:
     if op != "normal_eigh" and _gathered_admitted((n, n), dtype):
         checked += GATHERED_EIGH_FACTOR * n * n * item
     return per_rank * whole + checked
+
+
+_SORTED_PAIRS: dict = {}
+
+
+def _sorted_pairs(mesh, ndim):
+    """The eager eigh's deferred reorder: one cached program, its operands donated.
+
+    Run only when the first program's flag says a live eigenvalue is negative
+    beside zero rows (:func:`distrib_la._result_check.deflate_zero_rows`);
+    the column permutation is gather-free (``_permute_columns``) and bitwise
+    the one the chain would have applied in-program.
+    """
+    from distrib_la._result_check import eigh_layout, sort_eigenpairs
+    key = (mesh_key(mesh), int(ndim))
+    program = _SORTED_PAIRS.get(key)
+    if program is None:
+        pin = eigh_layout(mesh, ndim)
+        program = _SORTED_PAIRS[key] = jax.jit(
+            lambda w, v: sort_eigenpairs(w, v, mesh=mesh, constrain=pin),
+            donate_argnums=(0, 1))
+    return program
 
 
 def _gathered_admitted(shape, dtype) -> bool:
@@ -1306,31 +1328,50 @@ class Plan:
             return fn(*ops, mesh=self.mesh, _phase=traced_phase(), **kwargs)
         mesh = self.mesh
 
-        def program(phase, donate):
+        def program(phase, donate, **extra):
             key = scan_signature(self.op, self.backend, mesh, ops, kwargs,
-                                 extra=(tag, phase))
+                                 extra=(tag, phase, tuple(sorted(extra.items()))))
             return cached_scan(key, lambda: jax.jit(
-                lambda *o: fn(*o, mesh=mesh, _phase=phase, **kwargs),
+                lambda *o: fn(*o, mesh=mesh, _phase=phase, **extra, **kwargs),
                 donate_argnums=donate))
         if self.op != "eigh":
             return program("all", self.donates)(*ops)
+        n, dtype = int(ops[0].shape[-1]), ops[0].dtype
+        donate = bool(kwargs.pop("_donate", False))
         # An eager eigh runs its first attempt and check alone; the retries
         # are a separate program, compiled and run only on the reduced
         # failure flag, so their buffers are never reserved beside the first
-        # attempt's (EIGHSTACK: n 18304, P4, 80 GB).
-        out = program("first", ())(*ops)
-        if not _flag(out[-1], int(ops[0].shape[-1]), ops[0].dtype):
-            return out
-        _notices(out[-1], self.op, int(ops[0].shape[-1]), ops[0].dtype, site, final=False)
+        # attempt's (EIGHSTACK: n 18304, P4, 80 GB). Each returns its vectors in
+        # the solver's order with the deferred-reorder flag, read with the
+        # failure bit in one transfer; the reorder is a third program, run only
+        # on that flag (a live negative eigenvalue beside zero rows), so its
+        # exchanges are never reserved beside the solve either (EIGHMEM).
+        if donate:
+            out = program("all", (0,), _defer=True, _donate=True)(*ops)
+            failed, needs = read_flags(out[-1], out[-2], n, dtype)
+        else:
+            out = program("first", (), _defer=True)(*ops)
+            failed, needs = read_flags(out[-1], out[-2], n, dtype)
+            if failed:
+                _notices(out[-1], self.op, n, dtype, site, final=False)
+                del out
+                out = program("retry", (), _defer=True)(*ops)
+                failed, needs = read_flags(out[-1], out[-2], n, dtype)
+        values, vectors, _, status = out
         del out
-        return program("retry", ())(*ops)
+        if needs and not failed:
+            values, vectors = _sorted_pairs(mesh, values.ndim + 1)(values, vectors)
+        return values, vectors, status
 
     def _checked_eigh(self, call, post):
         from distrib_la._result_check import checked_eigh, eigh_layout, shifted
         from distrib_la.matmul import matmul
         backend = self.backend
 
-        def safe(A, *, mesh, _phase="all", **kwargs):
+        def safe(A, *, mesh, _phase="all", _defer=False, _donate=False, **kwargs):
+            from distrib_la._result_check import (eigh_sketch, reorder_if,
+                                                  sketch_eigh_errors)
+
             def solve(a, **extra):
                 return post(backend, *call(a, mesh=mesh, **kwargs, **extra))
             # Zero rows leave the solver as distinct sentinels (deflate_zero_rows),
@@ -1340,7 +1381,27 @@ class Plan:
             # The face SUMMA (panel_matmul): a single matrix never batch-reshards onto one device.
             gemm = partial(matmul, mesh=mesh, backend="distributed", batched_route="auto")
             pin = eigh_layout(mesh, A.ndim)
-            deflate = partial(deflate_zero_rows, constrain=pin, mesh=mesh)
+            # Every attempt defers its reorder (a cross-device column permutation, needed only
+            # when a live eigenvalue is negative beside zero rows): the chain reorders once,
+            # after its check, or, eager, in a separate program on the flag (EIGHMEM).
+            deflate = partial(deflate_zero_rows, constrain=pin, mesh=mesh, defer=True)
+            if _donate:
+                # The opt-in donated eigh: A is consumed (the deflated operand is written over
+                # it and the solver destroys it), so the check reads a sketch taken before the
+                # solve and nothing can solve again: one attempt, refused by name if it fails
+                # (as an LU solve is).
+                sketch = eigh_sketch(A, mesh=mesh)
+                # The in-place deflation depends on the sketch through a zero token: an
+                # optimization barrier does not survive to copy insertion (XLA:CPU
+                # scheduled the sketch's dot after the solve and copied A for it).
+                token = (jnp.real(jnp.sum(sketch[0])) + sketch[2]) * 0
+                (values, vectors, needs), failed = checked_eigh(
+                    [deflate(solve, in_place=token)], A, mesh=mesh, final=_phase != "first",
+                    errors_of=lambda r: sketch_eigh_errors(sketch, r[0], r[1], mesh=mesh))
+                if _defer:
+                    return values, vectors, needs, failed
+                values, vectors = reorder_if(needs, values, vectors, mesh=mesh, constrain=pin)
+                return values, vectors, failed
             attempts = [deflate(solve), deflate(shifted(solve, matmul=gemm, mesh=mesh))]
             n = int(A.shape[-1])
             if backend == "cusolvermp":
@@ -1362,11 +1423,15 @@ class Plan:
             # that holds it, so a caller's room (a face plan's budget) does
             # not raise the limit.
             if _gathered_admitted(A.shape, A.dtype):
-                attempts.append(partial(_gathered_eigh, mesh=mesh))
+                attempts.append(lambda a: (*_gathered_eigh(a, mesh=mesh), jnp.bool_(False)))
             # An eager call's first program holds the first attempt; its retry
             # program the rest (Plan._program). A traced call holds them all.
             attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[_phase]
-            (values, vectors), failed = checked_eigh(attempts, A, mesh=mesh, final=_phase != "first")
+            (values, vectors, needs), failed = checked_eigh(attempts, A, mesh=mesh,
+                                                            final=_phase != "first")
+            if _defer:
+                return values, vectors, needs, failed
+            values, vectors = reorder_if(needs, values, vectors, mesh=mesh, constrain=pin)
             return values, vectors, failed
         return safe
 
@@ -1384,7 +1449,7 @@ class Plan:
                            (X,), n=A.shape[-1], dtype=A.dtype)
         return safe
 
-    def __call__(self, A, *args, _rounds: int | None = None, **kwargs):
+    def __call__(self, A, *args, _rounds: int | None = None, donate: bool = False, **kwargs):
         """Run the op on ONE tile (no batch axis).
 
         ``A`` (and any further matrix operands, e.g. ``solve_lu``'s RHS)
@@ -1392,7 +1457,22 @@ class Plan:
         :func:`ensure_sharding`.  A native plan runs the in-tree JAX call
         where one exists (``eigh``) and raises otherwise, naming what owns
         that route.
+
+        ``donate=True`` (a distributed library eigh only, opt-in) consumes
+        ``A``: the deflated operand is written over it and the solver
+        destroys it, so a rank holds A's tile, the vectors and the library's
+        workspace and nothing else operand-sized. The check reads a sketch of
+        ``A`` taken before the solve (:func:`distrib_la._result_check.sketch_eigh_errors`),
+        and nothing can solve again: a result that fails its check is refused
+        by name, as a consumed LU solve is. An eager ``A`` is deleted by the
+        call (a reshard by :func:`ensure_sharding` donates the copy instead).
         """
+        if donate:
+            if self.op != "eigh" or not self._is_checked() or self.backend == ONE_DEVICE:
+                raise ValueError(
+                    f"donate=True is the distributed library eigh's opt-in only; "
+                    f"{self.op} on backend {self.backend!r} keeps its operand")
+            kwargs = {**kwargs, "_donate": True}
         if self.is_native:
             fn = _NATIVE_CALLABLE.get(self.op)
             if fn is None:
@@ -1406,7 +1486,8 @@ class Plan:
             return fn(A, *args, **kwargs)
         if (_rounds is None and self.op == "eigh" and self._measured_applies()
                 and _measured_rounds(self, A, args, True) == 0):
-            return self._library_plan()(A, *args, **kwargs)
+            kwargs.pop("_donate", None)
+            return self._library_plan()(A, *args, donate=donate, **kwargs)
         one, post = self._entry("one")
         if one is None:
             raise NotImplementedError(

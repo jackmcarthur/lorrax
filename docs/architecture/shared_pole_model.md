@@ -554,8 +554,9 @@ $N_{\rm line}(1+2S)\,n\,r_{\rm cap}/n^2$ (`selection_face_count`);
 reduction $D=14R^2+12nR$, $s_f=0$ (on the face route $16\,c_b D$ at the conservative side, an ordered round's kept span on `face_ritz_carrier`, admits a batch, priced from these terms and never compiled to be measured: `face_batch_width` starts at every parent and steps down in proportion to the room; the staged sector route bounds its stage programs by the same price, `stage_width`; a local paired, ordered round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
 checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction (local) $D=CT+8R^2+4nR+\max(C,T)R$,
 on the face the program price alone (no dense term beside it). A local round has $b=P$. The native cuSOLVERMp `eigh`
-adds a private $n^2/P$ operand tile beside its workspace, which
-`distrib_la.workspace_bytes_per_rank` includes. The ledger
+solves in the checked chain's deflated $n^2/P$ copy (an XLA buffer aliased to
+its input), beside its workspace; `distrib_la.workspace_bytes_per_rank`
+includes both. The ledger
 (`CapacityLedger`) owns admission: when a stage's aggregate with the named
 concurrent stages exceeds the device budget (`memory.per_device_gb`) less the
 runtime reserve, the row is recorded FAIL, one warning line is printed, and

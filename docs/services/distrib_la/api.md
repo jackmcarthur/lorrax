@@ -601,9 +601,11 @@ nothing and accept `float64` or `complex128` only.
 
 - `workspace_bytes_per_rank(plan, op, shapes, dtype)`: the device workspace
   per rank of a resolved CUDA `Plan` or `GemmPlan`. For a distributed `eigh`
-  it is the cuSOLVERMp workspace rounded to 256 bytes plus one private operand
-  tile `(n/P_x)(n/P_y)·itemsize`, which keeps eigh non-donating despite the
-  destructive tridiagonalization; do not add that tile again. A local eigh
+  it is the cuSOLVERMp workspace rounded to 256 bytes, plus the checked
+  chain's XLA tiles (`checked_device_bytes`). The operand the
+  tridiagonalization destroys is no longer a private tile in the handler's
+  scratch: it is an XLA result aliased to the solver's input (ABI 10), the
+  chain's deflated copy, counted among those tiles. A local eigh
   returns the cuSolverDn workspace plus a 4-byte info word. A distributed
   `gemm` has none: `panel_matmul`'s panels are XLA's. Query collectively on
   the real mesh; off CUDA it returns 0.

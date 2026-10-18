@@ -95,7 +95,7 @@ def _live_norm(a, mesh=None):
     return jnp.sqrt(jnp.maximum(live, 0))
 
 
-def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
+def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None, defer=False, in_place=False):
     """Wrap a Hermitian eigensolver so exact zero rows never reach it.
 
     Capacity padding and unselected columns reach eigensolvers as exact zero
@@ -119,6 +119,20 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
     cluster sits at s, away from the origin (:func:`shifted`, without its
     re-orthonormalization). The eigenvalues come back with an absolute error
     ~ eps (||A|| + s) <= eps sqrt(n) ||A||_2.
+
+    ``defer`` leaves the reorder to the caller: the solve returns
+    ``(values, vectors, live_negative)`` in the solver's order, with the
+    replicated flag that says whether :func:`sort_eigenpairs` must still run
+    (a distributed checked chain reorders once, after its check, and an eager
+    call in a separate program only when the flag is set, so no program
+    reserves the reorder's buffers beside the solve: EIGHMEM).
+    ``in_place`` (the donated eigh, whose ``a`` is consumed; True or a scalar
+    token, see below) adds the diagonal
+    with a scatter on each rank's own tile (:func:`_add_diagonal`), an in-place
+    update XLA performs in ``a``'s buffer, where ``a + diag I`` is a new
+    buffer. Its off-diagonal entries are ``a``'s exactly; ``a + diag I`` turns
+    a ``-0.0`` in a live row into ``+0.0``, so the two operands can differ in
+    the sign of a zero, nowhere else.
     """
     pin = (lambda r: r) if constrain is None else constrain
     def solve(a):
@@ -132,18 +146,97 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
         sentinel = -2 * bound[..., None] * (1 + jnp.arange(n, dtype=bound.dtype) / n)
         s = _live_norm(a, mesh)[..., None] if shift else 0
         diagonal = jnp.where(dead, sentinel, s).astype(a.dtype)
-        values, vectors = pin(eigh(a + diagonal[..., :, None] * _eye_like(a)))
+        if in_place is not False and in_place is not None:
+            # A token (the donated chain's sketch, times 0) the diagonal depends on, so
+            # every read of ``a`` it stands for is ordered before the in-place update;
+            # +0 leaves every finite diagonal value bitwise as it was.
+            token = jnp.asarray(0 if in_place is True else in_place)
+            operand = _add_diagonal(a, diagonal + token.astype(diagonal.dtype), mesh)
+        else:
+            operand = a + diagonal[..., :, None] * _eye_like(a)
+        values, vectors = pin(eigh(operand))
         restored = jnp.where(values < -1.5 * bound[..., None], 0, values - s)
         # Sentinels come out first; only a negative live eigenvalue must move ahead of the zeros.
         live_negative = jnp.any((restored < 0) & jnp.any(dead, axis=-1, keepdims=True))
-
-        def reorder(operands):
-            w, v = operands
-            order = jnp.argsort(w, axis=-1, stable=True)
-            return pin((jnp.take_along_axis(w, order, axis=-1),
-                        jnp.take_along_axis(v, order[..., None, :], axis=-1)))
-        return pin(jax.lax.cond(live_negative, reorder, pin, (restored, vectors)))
+        if defer:
+            return (*pin((restored, vectors)), live_negative)
+        return reorder_if(live_negative, restored, vectors, mesh=mesh, constrain=constrain)
     return solve
+
+
+def _add_diagonal(a, diagonal, mesh):
+    """``a`` with ``diagonal`` added to its diagonal, by a scatter-add on each rank's tile.
+
+    A scatter updates its operand in place where the operand is dead after it (a
+    donated ``a``), so the deflated operand takes ``a``'s buffer. Each rank adds the
+    entries of the global diagonal its ``(n/p, n/q)`` tile holds (none off the
+    diagonal blocks): ``min(n/p, n/q)`` slots, the ones past the overlap dropped.
+    """
+    n = int(a.shape[-1])
+    if mesh is None:
+        k = jnp.arange(n)
+        return a.at[..., k, k].add(diagonal, mode="drop")
+    from jax import shard_map
+    p, q = int(mesh.shape["x"]), int(mesh.shape["y"])
+    rl, cl = n // p, n // q
+    nd = a.ndim
+    lead = (None,) * (nd - 2)
+
+    def local(d, tile):
+        x, y = jax.lax.axis_index("x"), jax.lax.axis_index("y")
+        lo = jnp.maximum(x * rl, y * cl)
+        hi = jnp.minimum((x + 1) * rl, (y + 1) * cl)
+        g = lo + jnp.arange(min(rl, cl))
+        ok = g < hi
+        row = jnp.where(ok, g - x * rl, rl)          # out of range: dropped
+        col = jnp.where(ok, g - y * cl, cl)
+        vals = jnp.take(d, jnp.minimum(g, n - 1), axis=-1)
+        return tile.at[..., row, col].add(vals, mode="drop")
+    return shard_map(local, mesh=mesh, in_specs=(P(*lead, None), P(*lead, "x", "y")),
+                     out_specs=P(*lead, "x", "y"), check_vma=False)(diagonal, a)
+
+
+def _permute_columns(vectors, order, mesh):
+    """``take_along_axis(vectors, order[..., None, :], -1)`` of a face-sharded matrix, gather-free.
+
+    The column permutation of a ``P(.., 'x', 'y')`` matrix: one all_to_all over
+    ``'y'`` gives each rank ``n/(p q)`` whole rows, the replicated ``order``
+    permutes them locally, and the inverse all_to_all restores the faces. Two
+    ``n^2/P`` exchanges and ``n^2/P`` temporaries per rank, where XLA's own
+    lowering of the global take all-gathers ``n^2/p`` (q tiles; 4.0 n^2/P at
+    4x4, EIGHMEM step 1). Pure data movement: the result is bitwise the take's.
+    A tile whose rows do not split over ``'y'`` keeps the global take.
+    """
+    nd = vectors.ndim
+    p, q = int(mesh.shape["x"]), int(mesh.shape["y"])
+    n = int(vectors.shape[-1])
+    if n % p or n % q or (n // p) % q:
+        return jnp.take_along_axis(vectors, order[..., None, :], axis=-1)
+    from jax import shard_map
+    lead = (None,) * (nd - 2)
+
+    def local(o, v):
+        rows = jax.lax.all_to_all(v, "y", nd - 2, nd - 1, tiled=True)     # (.., n/(pq), n)
+        rows = jnp.take_along_axis(rows, o[..., None, :], axis=-1)
+        return jax.lax.all_to_all(rows, "y", nd - 1, nd - 2, tiled=True)  # (.., n/p, n/q)
+    return shard_map(local, mesh=mesh, in_specs=(P(*lead, None), P(*lead, "x", "y")),
+                     out_specs=P(*lead, "x", "y"), check_vma=False)(order, vectors)
+
+
+def sort_eigenpairs(values, vectors, *, mesh=None, constrain=None):
+    """Eigenpairs in ascending (stable) order: the reorder :func:`deflate_zero_rows` defers."""
+    pin = (lambda r: r) if constrain is None else constrain
+    order = jnp.argsort(values, axis=-1, stable=True)
+    taken = (jnp.take_along_axis(vectors, order[..., None, :], axis=-1) if mesh is None
+             else _permute_columns(vectors, order, mesh))
+    return pin((jnp.take_along_axis(values, order, axis=-1), taken))
+
+
+def reorder_if(flag, values, vectors, *, mesh=None, constrain=None):
+    """:func:`sort_eigenpairs` when the replicated ``flag`` is set (``lax.cond``), else unchanged."""
+    pin = (lambda r: r) if constrain is None else constrain
+    return pin(jax.lax.cond(flag, lambda r: sort_eigenpairs(*r, mesh=mesh, constrain=constrain),
+                            pin, (values, vectors)))
 
 
 #: The local (one-device) eigh of every native route: eigh_local (jnp.linalg.eigh with the
@@ -291,7 +384,7 @@ def _remember(table, array, bit):
     table[id(array)] = (array, bit)
 
 
-def _word_program(tols):
+def _word_program(tols, extras=0):
     """``[failed, notice_0, ..]`` of a status and its tables on the device: one int32 word, one host read.
 
     ``notice_i`` is exactly :func:`_notices`' print condition for table ``i``: some
@@ -299,12 +392,13 @@ def _word_program(tols):
     the first such row).
     """
     @jax.jit
-    def word(failed, tables):
+    def word(failed, tables, flags=()):
         bits = [jnp.any(failed)]
         for tol, errors in zip(tols, tables):
             first = errors.reshape(-1, *errors.shape[-2:])[:, 0]
             shown = ~jnp.all(jnp.isnan(first), axis=-1) & ~jnp.all(first <= tol, axis=-1)
             bits.append(jnp.any(shown))
+        bits.extend(jnp.any(f) for f in flags)
         return jnp.stack(bits).astype(jnp.int32)
     return word
 
@@ -312,22 +406,41 @@ def _word_program(tols):
 _WORDS: dict = {}
 
 
-def _read_status(failed, tables, infos):
+def _read_status(failed, tables, infos, flags=()):
     """Read a replicated status's failure bit and every table's notice bit in ONE transfer.
 
     Every rank calls it for the same status (it gates the retry and the refusal on all of
     them), so every rank compiles and runs the same program, on its own replica
     (INVARIANTS 21: no rank-conditional compile); only the printing is rank 0's.
-    ``infos`` are the tables' ``(n, dtype)``.
+    ``infos`` are the tables' ``(n, dtype)``. ``flags`` are further replicated
+    booleans read in the same word (a deferred reorder's, :func:`read_flags`);
+    their bits are returned after the failure bit.
     """
     tols = tuple(float(accept(int(n), dtype)) for n, dtype in infos)
-    program = _WORDS.get(tols) or _WORDS.setdefault(tols, _word_program(tols))
+    key = (tols, len(flags))
+    program = _WORDS.get(key) or _WORDS.setdefault(key, _word_program(tols, len(flags)))
     word = np.asarray(program(failed.addressable_data(0),
-                              tuple(t.addressable_data(0) for t in tables)))
-    for table, bit in zip(tables, word[1:]):
+                              tuple(t.addressable_data(0) for t in tables),
+                              tuple(f.addressable_data(0) for f in flags)))
+    for table, bit in zip(tables, word[1:1 + len(tables)]):
         _remember(_NOTICE, table, bool(bit))
     _remember(_FAILED, failed, bool(word[0]))
+    if flags:
+        return (bool(word[0]), *(bool(b) for b in word[1 + len(tables):]))
     return bool(word[0])
+
+
+def read_flags(status, flag, n, dtype):
+    """``(failed, flag)`` of an eager checked eigh: its status and a replicated flag, ONE transfer.
+
+    The failure and notice bits are remembered as :func:`_flag` reads them, so
+    the :func:`raise_if_failed` that follows reads nothing more. Every rank
+    reads the same word (INVARIANTS 21).
+    """
+    if isinstance(status[1], np.ndarray):
+        failed = _flag(status, n, dtype)
+        return failed, bool(np.asarray(jax.device_get(flag.addressable_data(0))))
+    return _read_status(status[0], (status[1],), ((n, dtype),), (flag,))
 
 
 def _status(status, n=None, dtype=None):
@@ -422,7 +535,9 @@ def checked(op, attempts, errors_of, operands, *, n=None, dtype=None, constrain=
             return pin(r), jnp.bool_(False), table
         if index + 1 == k:
             def refuse(r):
-                return (pin(jax.tree.map(lambda a: jnp.full_like(a, jnp.nan if final else 0), r)),
+                # A flag riding with the result (a deferred reorder) is cleared, not poisoned.
+                return (pin(jax.tree.map(lambda a: jnp.zeros_like(a) if a.dtype == jnp.bool_ else
+                                         jnp.full_like(a, jnp.nan if final else 0), r)),
                         jnp.bool_(True), table)
             out, failed, table = jax.lax.cond(verdict(errors), accepted, refuse, result)
             return pin(out), failed, table
@@ -441,11 +556,50 @@ def eigh_layout(mesh, ndim):
                       jax.lax.with_sharding_constraint(r[1], vectors))
 
 
-def checked_eigh(attempts, a, *, mesh=None, final=True):
-    """A distributed eigh, checked: ``attempts`` solve ``a`` in order of preference; ``(result, failed)``."""
-    constrain = None if mesh is None else eigh_layout(mesh, a.ndim)
-    return checked("eigh", attempts, lambda r: eigh_errors(a, *r, mesh=mesh), (a,),
+def checked_eigh(attempts, a, *, mesh=None, final=True, errors_of=None):
+    """A distributed eigh, checked: ``attempts`` solve ``a`` in order of preference; ``(result, failed)``.
+
+    A result is ``(values, vectors)`` or, from attempts that defer their reorder
+    (:func:`deflate_zero_rows` ``defer``), ``(values, vectors, live_negative)``:
+    the check reads the first two, which are an eigendecomposition in any column
+    order. ``errors_of`` replaces :func:`eigh_errors` (the donated route's sketch
+    check, :func:`sketch_eigh_errors`).
+    """
+    layout = None if mesh is None else eigh_layout(mesh, a.ndim)
+    constrain = None if layout is None else (lambda r: (*layout(r[:2]), *r[2:]))
+    errors_of = errors_of or (lambda r: eigh_errors(a, r[0], r[1], mesh=mesh))
+    return checked("eigh", attempts, errors_of, (a,), n=a.shape[-1], dtype=a.dtype,
                    constrain=constrain, final=final)
+
+
+def eigh_sketch(a, *, mesh=None):
+    """What :func:`sketch_eigh_errors` keeps of ``a``: ``(a @ X, X, ||a||_F)``, ``X`` the probes.
+
+    Taken before a donated solve destroys ``a`` (n x PROBES per rank row, not n^2).
+    """
+    x = probes(a.shape[-1], a.dtype)
+    return a @ x, x, _norm(a, mesh, _face(a.ndim))
+
+
+def sketch_eigh_errors(sketch, values, vectors, *, mesh=None):
+    """:func:`eigh_errors` from a sketch of the (consumed) operand.
+
+    The residual is ``||V^H (A X) - W V^H X|| / (||A|| ||X||)``, the left
+    eigen-relation ``V^H A = W V^H`` on the probes: for Hermitian ``A`` it is
+    the adjoint of ``A V - V W``, the relation :func:`eigh_errors` probes from
+    the right, so the same defect is measured with ``A`` read once, before the
+    solve. The orthogonality is :func:`eigh_errors`' (V alone).
+    """
+    ax, x, norm = sketch
+    nd = vectors.ndim
+    vh = jnp.conj(jnp.swapaxes(vectors, -1, -2))
+    vx = vectors @ x
+    residual = _norm(vh @ ax - values[..., :, None] * (vh @ x), mesh, _rows(nd)) / (
+        jnp.maximum(norm, jnp.finfo(values.dtype).tiny) * _norm(x))
+    orthogonality = _norm(vh @ vx - x, mesh, _rows(nd)) / _norm(x)
+    finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
+    return (jnp.where(finite, jnp.max(residual), jnp.inf),
+            jnp.where(finite, jnp.max(orthogonality), jnp.inf))
 
 
 #: Inside :func:`checked_program`'s trace: (phase, entries, trace). A checked
