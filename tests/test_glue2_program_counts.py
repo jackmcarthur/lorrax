@@ -71,28 +71,12 @@ def test_dirac_cct_gamma_pairs_share_one_program():
     assert len({v.tobytes() for v in out.values()}) == len(out)
 
 
-def _on_shell_accumulator(mesh):
-    """An on-shell accumulator over (k, nb) = (2, 4) energies in [0, 0.5] Ry."""
-    from common.units import RYD_TO_EV
-    from gw.mpa.sigma import _on_shell_reduce
-    from gw.ppm_accumulators import DeviceOmegaAccumulator
-    from gw.ppm_sigma import on_shell_request
-    e_ev = np.linspace(0.0, 0.5, 8).reshape(2, 4) * RYD_TO_EV
-    request = on_shell_request(e_eval_rel_ev=e_ev, e_dft_rel_ev=e_ev,
-                               omega_range_ev=np.asarray([-1.0, 10.0]), out_of_grid="cover",
-                               irr_idx=np.arange(2), n_parent=2)
-    p_y = int(mesh.shape["y"])
-    acc = DeviceOmegaAccumulator(
-        request, carrier=4, shape=(((2, 2, 4, 4),), ((request.n_slot, 2, 4, p_y),)),
-        sharding=NamedSharding(mesh, P(None, None, "x", "y")), reduce=_on_shell_reduce(mesh, None))
-    return request, acc
-
-
 @pytest.mark.parametrize("route", ["synthesis", "kconv_tables"])
 def test_window_runner_branches_share_one_program(route):
     """Both W branches run one window program: the branch's tables arrive as operands, from
     the synthesis's window operands (scalar route) or from ``kconv_tables(space)`` (sectors)."""
     from gw.mpa.sigma import SynthesisTau, WSynthesis
+    from gw.ppm_accumulators import DeviceOmegaAccumulator
     mesh = _mesh()
     face = NamedSharding(mesh, P(None, "x", "y"))
     rep = NamedSharding(mesh, P())
@@ -105,36 +89,34 @@ def test_window_runner_branches_share_one_program(route):
     xn = jax.device_put(np.ones((2, 4, 4), np.complex128), face)
     tau = SynthesisTau(spatial, synthesis, None, None, 0, "glue2", None, ("glue2-toy", route), (),
                        kconv_tables=None if by_synthesis else tables.__getitem__)
-    request, acc = _on_shell_accumulator(mesh)
-    F = request.frequencies_ry
+    acc = DeviceOmegaAccumulator(np.arange(3.0), shape=(3, 2, 4, 4),
+                                 sharding=NamedSharding(mesh, P(None, None, "x", "y")), omega_axis=0)
     count, zero = jax.device_put((np.int32(1), np.float64(0.0)), rep)
 
     def window(space, **kw):
         args = tau.window_arguments(xn, xn, None, None, zero, zero, space, None)
         return acc.integrate_window(tau.window_kernel(), args, np.ones(2), np.ones(2),
-                                    active_count=count, capacity=2, omega_sign=1.0,
-                                    prefactor=1.0, omega_indices=np.arange(F.size),
-                                    omega_values=F, **kw)
+                                    n_active=2, active_count=count, capacity=2, omega_sign=1.0,
+                                    prefactor=1.0, **kw)
 
     window("cond", compile_only=True)
     before = _lowerings()
     for space in ("cond", "val", "cond", "val"):
         window(space)
     assert _lowerings() == before
-    # Two nodes per window, two windows per branch, each node's sigma(t) = the branch table:
-    # the pair Sigma_mn(E_m), Sigma_mn(E_n) is 4 (1 + 2) exp(i E) at the row / column energy.
-    (pair,), _ = acc.finalize()
-    e = request.parent_ry[0]                                  # (k, nb) Ry
-    expect = 4 * (1.0 + 2.0) * np.stack([
-        np.broadcast_to(np.exp(1j * e)[:, :, None], (2, 4, 4)),
-        np.broadcast_to(np.exp(1j * e)[:, None, :], (2, 4, 4))])
-    assert np.allclose(np.asarray(pair), expect, rtol=1e-12)
+    # Two nodes per window, two windows per branch, each node's sigma(t) = the branch table.
+    total = np.asarray(acc.finalize())
+    coeff = np.exp(1j * np.arange(3.0))[:, None, None, None]
+    expect = 4 * coeff * (1.0 + 2.0) * np.ones((3, 2, 4, 4))
+    assert np.allclose(total, expect, rtol=1e-12)
 
 
 def test_accumulator_zeros_are_native_and_lower_once():
+    from gw.ppm_accumulators import DeviceOmegaAccumulator
     mesh = _mesh()
     sh = NamedSharding(mesh, P(None, None, "x", "y"))
-    make = lambda: _on_shell_accumulator(mesh)[1].finalize()[0][0]
+    make = lambda: DeviceOmegaAccumulator(np.arange(3.0), shape=(3, 2, 4, 4), sharding=sh,
+                                          omega_axis=0).finalize()
     first = make()
     before = _lowerings()
     again = make()
