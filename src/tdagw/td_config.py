@@ -799,10 +799,11 @@ TD_KEY_DOCS = {
         "in the remainder slot (Magnus) or added to the right-hand side (dp54, rk4, "
         "etdrk4). Needs `system = bundle` on a GN-PPM bundle; the GW driver reruns on a "
         "copy of `bundle_input` in `outdir/collision_source` at the start (no restart "
-        "written) to recover the poles. The log's `Collision refreshes` section has one "
+        "written) to recover the poles (a non-GN-PPM run, or one whose window occupations "
+        "differ from the TD system's, refuses there: `dynsig_gnppm_mode`, "
+        "`dynsig_collision_occupations`). The log's `Collision refreshes` section has one "
         "line per refresh.",
-        ("td_collision", "td_collision_source", "td_collision_restart",
-         "dynsig_gnppm_mode", "dynsig_collision_occupations")),
+        ("td_collision", "td_collision_source", "td_collision_restart")),
     "lorrax.collision_source": (
         "= `bundle_input`", "The GN-PPM GW deck of the rates; it must be (or default to) "
         "`bundle_input` (one wavefunction gauge).", ("td_collision_source",)),

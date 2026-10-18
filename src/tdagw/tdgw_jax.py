@@ -56,12 +56,25 @@ STAGES = (("TD system", "tdagw.system"), ("self-energy model", "tdagw.self_energ
 COLLISION_STAGE = ("collision term", "tdagw.collision")
 
 
+def _deck_and_source(path):
+    """The deck and its ``[lorrax] collision`` source (None when off).
+
+    The source is the GN-PPM GW run's own poles: the GW driver runs here, in
+    this process, before the TD run's session (``stages.collision_source``).
+    """
+    deck = read_td_deck(path)
+    return deck, stages.collision_source(deck, RUNTIME.mesh)
+
+
+def _stage_rows(source):
+    """The stage table: STAGES, with the collision term's build when it is on."""
+    return STAGES if source is None else STAGES[:-1] + (COLLISION_STAGE, STAGES[-1])
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    deck = read_td_deck(args.input)
-    source = stages.collision_source(deck, RUNTIME.mesh)         # [lorrax] collision: GW poles
-    rows = STAGES if source is None else STAGES[:-1] + (COLLISION_STAGE, STAGES[-1])
-    with RunSession(RUNTIME, "tdagw", TdReport, log_path(deck), stages=rows,
+    deck, source = _deck_and_source(args.input)                  # [lorrax] collision: GW poles
+    with RunSession(RUNTIME, "tdagw", TdReport, log_path(deck), stages=_stage_rows(source),
                     deck=deck) as run:                           # the log: outdir/tdagw.out
         system = stages.load_system(deck, RUNTIME.mesh)          # header, Eq. (1)-(2) operators
         model = stages.build_self_energy(deck, system, RUNTIME.mesh)  # dSigma[rho]

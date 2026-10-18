@@ -47,6 +47,18 @@ FS_AU = 1000.0 * AS_AU
 PULSE = "5e8 * np.exp(-((t - 3000.0) / 1000.0)**2) * np.cos(0.07 * t / 24.188843265857)"
 
 
+def _jsonable(o):
+    """json.dump's default: complex -> [re, im], numpy scalars and arrays -> Python."""
+    if isinstance(o, complex) or np.iscomplexobj(o):
+        a = np.asarray(o)
+        return [np.real(a).tolist(), np.imag(a).tolist()]
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, (np.floating, np.integer, np.bool_)):
+        return o.item()
+    return str(o)
+
+
 class CompileLog(logging.Handler):
     PAT = re.compile(r"Compiling (\S+)")
 
@@ -162,7 +174,7 @@ def main():
     def _save():
         if rank0:
             with open(os.path.join(a.out, "collision_516.json"), "w") as f:
-                json.dump(out, f, indent=1, default=float)
+                json.dump(out, f, indent=1, default=_jsonable)
 
     def section(name):
         class _S:
@@ -178,7 +190,10 @@ def main():
                     out.setdefault("errors", {})[name] = "".join(
                         traceback.format_exception(et, e, tb))[-3000:]
                     say(f"[collision_516] section {name} FAILED:\n{out['errors'][name]}", flush=True)
-                _save()
+                try:
+                    _save()
+                except Exception as exc:        # a record that does not serialize stays unsaved
+                    say(f"[collision_516] save after {name} failed: {exc}", flush=True)
                 return True                     # the next section still runs
         return _S()
 
@@ -444,9 +459,11 @@ def main():
         pops = np.real(np.einsum("tkii->ti", rho_t)) / rho_t.shape[1]
         dev = np.max(np.abs(rho_t - rho_eq[None]), axis=(1, 2, 3))
         keep = {k: v for k, v in r.items() if k not in ("rho_t", "pol", "nc", "lines", "times_fs")}
+        pol, nc = (np.asarray(r[k]).reshape(len(tr), -1) for k in ("pol", "nc"))
         keep.update(max_dev=float(dev.max()), dev_t=dev.tolist(), trace_t=(tr - tr[0]).tolist(),
-                    pops_t=pops.tolist(), pol_t=np.asarray(r["pol"]).reshape(len(tr), -1).tolist(),
-                    nc_t=np.asarray(r["nc"]).reshape(len(tr), -1).tolist(),
+                    pops_t=pops.tolist(), pol_t=np.real(pol).tolist(),
+                    pol_imag_max=float(np.max(np.abs(np.imag(pol)))),
+                    nc_t=np.real(nc).tolist(), nc_imag_max=float(np.max(np.abs(np.imag(nc)))),
                     times_fs=np.asarray(r["times_fs"]).tolist(), lines=r["lines"][-40:])
         return keep
 
