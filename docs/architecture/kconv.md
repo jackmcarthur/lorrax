@@ -133,7 +133,8 @@ four host devices, and stage-time measurements use it to time the XLA arm.
 
 **Startup.** `runtime.initialize_communicator_stack` calls
 `ffi.fft.require_kconv(mesh)`. On CUDA it finds the wheel (`mathdx_root`),
-probes every target in `ffi.fft.KCONV_TARGETS` in the loaded library, and
+probes every target in `ffi.fft.KCONV_TARGETS` in the loaded library (the q-row store's
+included, so a stale library refuses here, not at the first W stream), and
 compiles and runs one probe kernel (mode 3 on a 2×1×1 grid). A device that
 the installed cuFFTDx cannot compile for is therefore found at startup
 (`GATE mathdx-probe` text, naming its compute capability and the wheel version)
@@ -187,7 +188,7 @@ One handler file serves modes 0–11, each a value of the compile-time
 | 4 `kconv_kminor` | `make_kconv_kminor`, `make_local_kconv_kminor` | $U = s\,F_k(F^{-1}X\cdot K_R)$, k trailing, $K_R$ made by mode 5 | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | k moved to the front, the transforms and the product, k moved back |
 | 5 `kfft_kminor` | `make_kfft_kminor`, `make_local_kfft_kminor` | $Y = s\,F^{\pm}_k X$, k trailing | `(rows, N_k)` | the same transpose around one transform |
 | 6 `kconv_plane` | `make_fused_conv_kplane` | mode 0 read from route G's plane-transform output (`g` planes of `p` points, `c` centroids per side): the Bloch phase `F[k,g,p]` applied and the `2c` axis split on the load into the left projector (slots `[0, c)`) and the right one (`[c, 2c)`) | `D` `(N_k, g, n_s, 2c, n_s, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | phase, split and transpose in XLA, then mode 0's composition |
-| 7 `kconv_klead_unfold_xblock` | `make_kconv_klead_unfold` | mode 2 on the typed unfold of the raw-parent Green ([§5](#unfold-on-load)) | `G`, `Gt` `(n_parent, μ, n_s, ν, n_s)`, `V_R` `(N_k, μ, ν)` → `U` `(n_out, n_s, μ or an x block, n_s, ν)` | `symmetry_maps.apply_unfold_load_tables_local` (a full-k copy), mode 2's composition, the row selection |
+| 7 `kconv_klead_unfold_kf` | `make_kconv_klead_unfold` | mode 2 on the typed unfold of the raw-parent Green ([§5](#unfold-on-load)) | `G`, `Gt` `(n_parent, μ, n_s, ν, n_s)`, `V_R` `(N_k, μ, ν)` → `U` `(n_out, n_s, μ or an x block, n_s, ν)` | `symmetry_maps.apply_unfold_load_tables_local` (a full-k copy), mode 2's composition, the row selection |
 | 8 `kconv_klead_lorentz_wparent` | `make_kconv_lorentz_unfold` | the four-current Σ: $U = s\,F_k\sum_{A,B}\gamma_A(F^{-1}\hat G)\gamma_B^\dagger\circ\hat W_R[k,\mu,A,\nu,B]$, $A$ ($B$) over the $n_A$ ($n_B$) Lorentz components of the left (right) endpoint (1 for charge, 3 for current), $\gamma_A$ channel $A$'s signed spin permutation, with $\hat G$ and $\hat W$ both unfolded from parents on the load | `G`, `Gt` as mode 7; `W`, `Wt` `(n_{q,parent}, μ, n_A, ν, n_B)`, $n_A, n_B \le 4$ → `U` `(n_out, n_s, μ, n_s, ν)` | both unfolds, the transforms and the γ block sum |
 | 9 `kfft_klead_unfold` | `make_kfft_klead_unfold` | $Y_k = s\,F^{-1}_k(\mathcal L_k\hat O_k \mathcal R_k^\dagger)$: the R-space operand of modes 2 and 7, read from an interaction's q wedge | `W`, `Wt` `(n_wedge, μ·n_l, ν·n_r)` → `Y` `(N_k, μ·n_l, ν·n_r)` | the unfold in XLA, then mode 2's `prep` |
 | 10 `plane_fft_gather` | `make_plane_fft_gather` (`LocalFourierPlan(in_gather=…)`) | the route-G plane FFT, gathered on load ([§10](#mode-10)) | `F` `(…, n_col)` → `Y` `(…, n_b, n_c)` | the XLA route: a static-run concatenate, then `jnp.fft.fftn` |
@@ -213,9 +214,11 @@ Where each mode is used, by owner module:
 | 10 | route G, through `common.fourier_plan.LocalFourierPlan` |
 | 11 | the χ₀ streams of `gw.w_isdf` ([§5](#unfold-consumers)) |
 
-The library also exports four mathdx targets that no current factory calls
+The library also exports five mathdx targets that no current factory calls
 (`kconv_klead_unfold_rows`, `kconv_klead_lorentz_rows`,
-`kconv_klead_unfold_block`, `kconv_klead_lorentz_conj`). They stay because a
+`kconv_klead_unfold_block`, `kconv_klead_unfold_xblock`, `kconv_klead_lorentz_conj`). They exist
+only for older source trees: the mode-7 ones carry no k-fastest tables, so their single arm is
+the chain (the same values, slower; [arms](#arms)). They stay because a
 target string never changes its operand contract: a new contract is a new
 target, so source trees built against the old ones keep loading
 ([FFI layer §8](ffi_layout.md#8-hard-invariants)).
@@ -279,6 +282,68 @@ so the arms agree bit for bit.
 | 8 | tiles of whole $n_s^2$ groups plus the pair's $n_A n_B$ W columns | plane and group-pencil passes, chunked over pairs through scratch |
 | 9 | tiles of whole $n_l n_r$ groups | plane tiles of whole groups, then the x pencil in place |
 | 11 | $t_r$ whole pairs ($2n_s^2$ columns each) | plane passes on 16-column tiles, then a warp-shuffle x pencil per pair (it stages nothing), chunked over pairs through scratch |
+
+### The arms of modes 7, 9 and 11 {#arms}
+
+`build()` in `kconv_mathdx_cuda_ffi.cc` picks one arm per image from the k-grid, $n_s$, the
+variant and the device's attributes (opt-in, per-SM and reserved shared memory, threads per SM,
+the SM count), and names it in the build log line (`[kconv_mathdx] … arm=<name>`, rank 0). Every
+arm gives the same values bit for bit. The CUDA gate (`tests/test_kconv_xla_gate.py`
+`ARM_CASES`) runs one grid per arm against the XLA reference and asserts the logged arm on an
+A100. The grids per device class come from the host rules evaluated at each class's opt-in
+memory (A100 sm_80 163 KiB, H100 sm_90 227 KiB, sm_86/89/120 99 KiB), not from kernel logs;
+only the A100 column is measured. The performance thresholds (the tile and block rules, $N_k \ge 128$
+for W2) are A100-tuned; elsewhere they are correctness-safe, because every residency bound is
+read from the device. "Gain" is the speedup over the plain k-box arm it replaced, from the
+measured record above `ffi.fft.make_kconv_klead_unfold`.
+
+| mode | arm (`arm=`) | condition (`build()`) | cubic grids A100 / H100 / 99 KiB | gain (A100) |
+|---|---|---|---|---|
+| 7 | `m7f`: fused single-arm tile, reading the k-fastest tables | the `_kf` target (the tables present), single arm (a block holds a spin group of ≥ 2 columns), whole group ($d = n_s$), $n_s \le 2$, no tile tables, `pinfo` fits | $n_s$ 1: 2³–13³ / 2³–15³ / 2³–11³; $n_s$ 2: the same | Fe 8³ 7.84 → 4.06 ms |
+| 7 | `tt`: tile tables | single arm, $n_s = 4$, `tile_table_plan` finds a tile at ≥ 2 blocks per SM | 2³–8³ / 2³–9³ / 2³–7³ | 1.90× |
+| 7 | `chain`: stage, transform3, Mid, transform3, store | single arm otherwise: the legacy targets (no k-fastest tables; an output spin block $d < n_s$ only through `_block`), or $n_s = 4$ without a tile | no current caller | (the reference) |
+| 7 | `m7s`: orbit-blocked persistent plane pass, pair-major $W_R$, overlapped column pass | arm 2 (one padded column fits a block), $n_s = 2$, whole group, its static tables fit | 14³–21³ / 16³–23³ / 12³–18³ | 1.10–1.30× |
+| 7 | `arm2`: plane pass, column-resident pass | arm 2 otherwise ($n_s$ 1 and 4) | $n_s$ 1: 14³–21³ / 16³–24³ / 12³–18³; $n_s$ 4: 9³–21³ / 10³–24³ / 8³–18³ | (the reference) |
+| 7 | `arm1`: plane, x pencil, plane, pencil and store | split, one padded column exceeds a block | ≥ 22³ / ≥ 25³ / ≥ 19³ ($n_s$ 4 refused from 26³ / 30³ / 20³) | (the reference) |
+| 9 | `w2`: batched scalar gather, fixed-column store, two blocks a SM | single arm, $n_l = n_r = 1$, sm_80+, $N_k \ge 128$ | 6³–13³ / 6³–15³ / 6³–11³ | Fe 8³ 1.317 → 0.950 ms |
+| 9 | `single` | single arm otherwise | 2³–5³ (all classes) | (the reference) |
+| 9 | `split` | no block holds a group of two columns | ≥ 14³ / ≥ 16³ / ≥ 12³ | (the reference) |
+| 11 | `m11f` (`m11q` with `rows=`): fused single-arm tile | single arm, $n_s = 2$, no vertices, no tile tables, `pinfo` fits | 2³–10³ / 2³–11³ / 2³–9³ | Fe 8³ 9.92 → about 5.0 ms (`acc=None` 2.5×, `rows=` 2.8×) |
+| 11 | `tt` | single arm, $n_s = 4$, no vertices | 2³–6³ / 2³–7³ / 2³–5³ | 1.73× |
+| 11 | `single` | single arm otherwise ($n_s$ 1, vertices) | $n_s$ 1: 2³–17³ / 2³–19³ / 2³–14³ | (the reference) |
+| 11 | `split` | a pair's $2n_s^2$ columns exceed a block | $n_s$ 2: ≥ 11³ / ≥ 12³ / ≥ 10³ | (the reference) |
+
+**k-fastest tables.** m7f reads the endpoint tables in the layout `(m, N_k, n_s)`
+(`ffi.fft.klead_unfold_kf`; a warp's gather items read one run along k per centroid) and nothing
+else. The factory forms them with `jnp.transpose` from the tables it is handed: constant-folded
+once per plan from baked host tables, one XLA transpose of a row pass's cut tables when the
+consumer passes `load`. They are `4·N_k·(μ_x + ν_y)·n_s` B a call or pass (Fe 8³ rank tile
+80 × 640: 2.95 MB; 13³, 16 × 640: 11.5 MB), counted by the program's `memory_analysis`, no
+handler scratch. They replace M7KF, a per-call transpose kernel into the handler's scratch (its
+gain is kept: Fe 8³ 4.06 ms, end to end equal to M7KF's within 0.6 % at Fe 8³, 12³ and 13³).
+
+Pruned 2026-10-17 (each below 1.15× where it was measured; a host rule and kernel text apiece;
+record above `ffi.fft.make_kconv_klead_unfold`): mode 7's per-call k-fastest index tables (M7KF,
+replaced by the XLA-formed tables above), m7s at $n_s = 1$, mode 9's four-block W2 rule below $N_k = 256$ with its fixed-column exception
+(W2 there now runs two blocks a SM), and mode 9's persistent split plane pass (m9b). Their cost
+against the previous kernels, per call on an A100: mode 7 up to 1.12× at 14³–15³ $n_s = 1$ (the
+m7s rule); mode 9 1.20–1.22× at 6³ (0.30 → 0.36 ms) and 1.11–1.23× at ≥ 14³; every other case
+of the 45 within 1.02×.
+
+**Why the chain stays.** m7f's gather issues a pair's $n_s^2$ raw source cells by `cp.async`
+into that pair's $n_s^2$ bank columns before it forms $U g U^\dagger$ in place. An output spin
+block $d < n_s$ has only $d^2$ columns a pair, so the raw cells have no slot; holding the whole
+group and storing the block would transform $(n_s/d)^2$ times the columns (4× at $n_s = 2$,
+$d = 1$). No current caller asks for $d < n_s$: `gw.greens_function_kernel.sigma_spin_block`'s
+$d$ selects x blocks of the whole group (`_xblock`), so the chain serves older trees through the
+legacy `_block` target, and $n_s = 4$ where no tile-table tile fits two blocks per SM.
+
+**Early failure.** The startup probe compiles mode 3 only; each arm's image first compiles at
+its first call, and an NVRTC failure there is loud and sticky (no XLA demotion). Prebuilding the
+images a run will use at factory time, as ROCm's `ffi.fft._kbox_prebuild` does, is a follow-up:
+the CUDA leg exports no host prebuild entry, and a demotion through `record_demotion` needs every
+process to agree, which only `require_kconv` (a collective point that does not know the grids)
+provides.
 
 Each pass of a split arm is its own entry point of one NVRTC program, with its
 own thread count, because the heaviest pass's register count would otherwise
@@ -381,7 +446,13 @@ a pole field read from its q wedge, with the endpoint actions $\mathcal L_k$, $\
   sign, gives one quadrant's sign relative to the shared unfold tables.
 
 `make_kconv_chi_unfold`'s `complete` flag adds the complex-conjugate term,
-which a real-frequency contour needs. A grid mode 11 cannot hold takes the
+which a real-frequency contour needs. `acc=None` returns $\alpha_o\chi_\tau$ itself, bit for bit
+the call on a zero `acc`: the CUDA handler takes a rank-1 one-element placeholder for `acc`
+(`ffi.fft._CHI_WRITE_PLACEHOLDER`, not aliased) and writes without reading; other routes add to
+zeros. `acc=None, rows=q` (`fn.q_store`, the rule `ffi.fft.chi_q_store_ok`: CUDA, $n_s = 2$,
+`n_out` 1, the m11f arm) returns the rows `q` of the flat-k forward transform of that value,
+formed in the tile with no full-k accumulator, through `lorrax_mathdx_kconv_chi_unfold_q`
+(`KCONV_CHI_UNFOLD_Q_TARGET`, in `KCONV_TARGETS`); a static `rows=` outside $[0, N_k)$ refuses. A grid mode 11 cannot hold takes the
 XLA backend ([router](#router)): every grid whose split-arm plane tile fits
 holds mode 11 too.
 
@@ -413,7 +484,7 @@ intermediate that XLA's scratch allocator grants per call:
 
 | mode | intermediate | bound | refusal when not granted |
 |---|---|---|---|
-| 7 | `(N_k, chunk·d²)`, d the stored spin block | ≤ 1 GiB | `GATE mathdx-kconv-unfold-scratch` |
+| 7 | `(N_k, chunk·d²)`, d the stored spin block; m7s adds the chunk's pair-major $W_R$, `16·N_k` B a pair, and rounds a chunk to whole waves of plane tiles | ≤ 1 GiB (`ffi.fft.klead_unfold_scratch_bytes`) | `GATE mathdx-kconv-unfold-scratch` |
 | 8 | `(N_k, chunk·(n_s² + n_A n_B))` | ≤ the call's output size and ≤ 1 GiB | `GATE mathdx-kconv-lorentz-scratch` |
 | 11 | `(N_k, chunk·2n_s²)` | `scratch_bytes`; default the smaller of one local parent-Green tile and 1 GiB, at least one pair (`ffi.fft.chi_unfold_scratch_bytes`) | `GATE mathdx-kconv-chi-scratch` |
 
@@ -422,7 +493,7 @@ the chunk size never changes a value. The compiled program's
 `memory_analysis()` does not count this scratch, so callers price it
 ([memory model](memory-model.md#native-handlers)). Apart from these
 intermediates the kernels allocate no device workspace beyond dynamic shared
-memory.
+memory and their static tile tables (`pinfo`, counted in the opt-in check).
 
 **Tile-table load** (modes 7 and 11, single arm, $n_s = 4$, sm_80 and newer).
 The plain load keeps one pair's gathered values $g$, $U_k$ and the right
@@ -644,6 +715,7 @@ not of the traffic.
 | `GATE mathdx-kconv-axis` | handler | a direct mathdx call with a k-grid axis above 40 (`KCONV_AXIS_MAX`); the factories send such grids to the XLA backend | call through the factories |
 | `GATE mathdx-kconv-residency` | kernel build | a direct call of mode 0, 1 or 6 whose row exceeds the opt-in memory; the router streams such grids instead ([§8](#resident-rows)) | call through the router |
 | `GATE mathdx-kconv-kbox-residency` | kernel build | the tile, plane or pencil the launch rule picked exceeds the opt-in memory (modes 2, 3, 8, 9); one whole column exceeds it (modes 4 and 5, which have no split arm); a split plane tile of one spin group exceeds it (mode 7: $n_s = 4$ at 26³ and larger on A100) | none at the factories, which send these grids to the XLA backend ([router](#router)); reaching it means `mathdx_refusal` and the handler disagree |
+| `GATE mathdx-kconv-chi-q` | apply | a q-row store (`rows=`) on a grid whose image is not the m11f arm | none at the factory, which allows `rows=` only where `ffi.fft.chi_q_store_ok` holds; reaching it means that rule and `build()` disagree |
 | `GATE mathdx-kconv-chi-residency` | kernel build | mode 11 cannot hold the grid | none here: the router sends such grids to the XLA backend (`mathdx_refusal`), so this gate means that rule and the handler's disagree, which is a bug |
 | `GATE mathdx-kconv-unfold-scratch`, `-lorentz-scratch`, `-chi-scratch` | apply | XLA's scratch allocator refuses the split-arm intermediate of mode 7, 8 or 11 ([§7](#tiles)) | for mode 11, a smaller `scratch_bytes` |
 | `GATE mathdx-kconv-outer-tile`, `-outer-decode-tile`, `-outer-arch`, `-outer-rank` | kernel build | the BSE outer load's bank or accumulator does not fit, the device is older than sm_80, or K is not a multiple of 4 | call through the factories, which check `klead_outer_refusal` / `klead_outer_decode_refusal` and pad K |
@@ -690,12 +762,12 @@ CUDA leg always compiles this family; a missing `cufft.h`, `libcufft`,
 the right width (mode 9), the precision, the variant (mode 7: the output spin
 block; mode 8: the vertex widths $8n_a + n_b$; mode 11: completion and
 vertices) and the `live` bit of a windowed pass, plus the device's compute
-capability and shared-memory limits (`kconv_mathdx_cuda_ffi.cc:2155`, options
-at `:2492`). Never $N_\mu$, the band counts or P. Two kinds depend on the
-system instead of the k-grid: mode 10 on the FFT plane $(n_b, n_c)$ and its
-occupied rows (`:3680`), and the BSE outer kernels on the band rank
-$K = \min(n_c, n_v)$ padded to 4 and, for decode, $\lceil n_c/8 \rceil$
-c-blocks (`kconv_outer_cuda_ffi.cc:283,835`). The image key hashes the
+capability and shared-memory limits (the `Key` tuple and `build()`'s `-D` options in
+`kconv_mathdx_cuda_ffi.cc`; every arm choice is a function of them). Never $N_\mu$, the band
+counts or P. Two kinds depend on the system instead of the k-grid: mode 10 on the FFT plane
+$(n_b, n_c)$ and its occupied rows (`build()`'s mode-10 branch), and the BSE outer kernels on the
+band rank $K = \min(n_c, n_v)$ padded to 4 and, for decode, $\lceil n_c/8 \rceil$ c-blocks (the
+build functions of `kconv_outer_cuda_ffi.cc`). The image key hashes the
 kernel text, comments included, so measurement notes live at the Python
 owners, not in the kernel text.
 

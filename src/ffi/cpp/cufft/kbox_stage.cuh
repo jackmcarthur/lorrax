@@ -310,37 +310,91 @@ __device__ __forceinline__ void line_of(int l, int n, int& j, int& li) {
 struct BlockSync {
     __device__ void operator()() const { __syncthreads(); }
 };
-template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, class C, class Sync>
-__device__ void transform3(C* bank, int tid, int nthr, const Sync& sync) {
-    constexpr int tr = TR;
+// One axis pass of transform3 (AX 2 = z, 1 = y, 0 = x) over TR resident padded rows, row j at
+// bank + j * RSTR (RSTR: G::RS for adjacent rows; a mode that transforms every GRP-th row of its
+// tile passes GRP * G::RS), lines dealt as transform3 deals them; ends with sync() when the axis has
+// more than one point.  A fused tile (m7f, m11f) calls the passes it does not fuse with its Mid.
+template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, int AX, int RSTR = Geo<NX, NY, NZ>::RS,
+          class C, class Sync>
+__device__ __forceinline__ void axis_pass(C* bank, int tid, int nthr, const Sync& sync) {
     using G = Geo<NX, NY, NZ>;
-    int j, li;
-    if constexpr (NZ > 1) {
-        for (int l = tid; l < tr * NX * NY; l += nthr) {
-            line_of<TR>(l, NX * NY, j, li);
-            line_fft<NZ, Arch, Dir>(bank + j * G::RS + li * G::ZP, 1);
-        }
-        sync();
-    }
-    if constexpr (NY > 1) {
-        for (int l = tid; l < tr * NX * NZ; l += nthr) {
-            line_of<TR>(l, NX * NZ, j, li);
-            line_fft<NY, Arch, Dir>(bank + j * G::RS + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
-        }
-        sync();
-    }
-    if constexpr (NX > 1) {
-        for (int l = tid; l < tr * NY * NZ; l += nthr) {
-            line_of<TR>(l, NY * NZ, j, li);
-            line_fft<NX, Arch, Dir>(bank + j * G::RS + G::plane_at(li), NY * G::ZP);
+    constexpr int N = AX == 2 ? NZ : (AX == 1 ? NY : NX), n = NX * NY * NZ / N;   // n: lines per row
+    if constexpr (N > 1) {
+        int j, li;
+        for (int l = tid; l < TR * n; l += nthr) {
+            line_of<TR>(l, n, j, li);
+            C* r = bank + j * RSTR;
+            if constexpr (AX == 2) line_fft<NZ, Arch, Dir>(r + li * G::ZP, 1);
+            else if constexpr (AX == 1) line_fft<NY, Arch, Dir>(r + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
+            else line_fft<NX, Arch, Dir>(r + G::plane_at(li), NY * G::ZP);
         }
         sync();
     }
 }
-template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, class C>
+template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, int AX, int RSTR = Geo<NX, NY, NZ>::RS,
+          class C>
+__device__ __forceinline__ void axis_pass(C* bank) {
+    axis_pass<NX, NY, NZ, TR, Arch, Dir, AX, RSTR>(bank, (int)threadIdx.x, (int)blockDim.x, BlockSync{});
+}
+template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, int RSTR = Geo<NX, NY, NZ>::RS,
+          class C, class Sync>
+__device__ void transform3(C* bank, int tid, int nthr, const Sync& sync) {
+    axis_pass<NX, NY, NZ, TR, Arch, Dir, 2, RSTR>(bank, tid, nthr, sync);
+    axis_pass<NX, NY, NZ, TR, Arch, Dir, 1, RSTR>(bank, tid, nthr, sync);
+    axis_pass<NX, NY, NZ, TR, Arch, Dir, 0, RSTR>(bank, tid, nthr, sync);
+}
+template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, int RSTR = Geo<NX, NY, NZ>::RS, class C>
 __device__ void transform3(C* bank) {
-    transform3<NX, NY, NZ, TR, Arch, Dir>(bank, (int)threadIdx.x, (int)blockDim.x, BlockSync{});
+    transform3<NX, NY, NZ, TR, Arch, Dir, RSTR>(bank, (int)threadIdx.x, (int)blockDim.x, BlockSync{});
 }
+// The (ky, kz) plane passes of a split arm's TP plane columns (column t at sm + t * PR): the z lines,
+// a barrier, the y lines, a barrier (both barriers also where an axis is 1).
+template <int NX, int NY, int NZ, int TP, int Arch, fft_direction Dir, class C>
+__device__ __forceinline__ void plane_zy(C* sm) {
+    using G = Geo<NX, NY, NZ>;
+    if constexpr (NZ > 1) {
+        for (int l = threadIdx.x; l < TP * NY; l += blockDim.x)
+            line_fft<NZ, Arch, Dir>(sm + (l / NY) * G::PR + (l % NY) * G::ZP, 1);
+    }
+    __syncthreads();
+    if constexpr (NY > 1) {
+        for (int l = threadIdx.x; l < TP * NZ; l += blockDim.x)
+            line_fft<NY, Arch, Dir>(sm + (l / NZ) * G::PR + l % NZ, G::ZP);
+    }
+    __syncthreads();
+}
+
+// ---- the fused tiles' pair order and tables (CUDA modes 7 and 11) -------------------------------
+#if !LRX_KBOX_DIRECT_DFT
+// Pair q of nrow block rows x my right centroids in blocks of kOBX rows x kOBY right centroids, the
+// right centroid fastest -> (row r from the first live row, right centroid y).  A symmetry star's
+// sources are the pair's orbit images, so the blocks of a wave of tiles share their parent sources
+// in L2.  Which pairs share a tile changes no pair's arithmetic.
+constexpr int kOBX = 16, kOBY = 32;
+__device__ __forceinline__ void orbit_pair(int q, int nrow, int my, int& r, int& y) {
+    const int rb = q / (kOBX * my), r0 = rb * kOBX, h = min(kOBX, nrow - r0);
+    int rem = q - rb * kOBX * my;
+    const int cbk = rem / (h * kOBY), c0 = cbk * kOBY, w = min(kOBY, my - c0);
+    rem -= cbk * h * kOBY;
+    r = r0 + rem / w;
+    y = c0 + rem % w;
+}
+// A tile pair, formed once per tile: left centroid, right centroid, block row, flags (bit 0 live,
+// bit 1 a real source pair).
+struct PairInfo { int xx, yy, rx, flags; };
+// NS consecutive int32 table entries (one aligned 8-byte load for NS = 2: the merged endpoint
+// tables are (nk, m*NS) with the NS slots of a centroid adjacent).
+template <int NS>
+__device__ __forceinline__ void load_ns(const int* __restrict__ p, int (&v)[NS]) {
+    if constexpr (NS == 2) {
+        const int2 q = *reinterpret_cast<const int2*>(p);
+        v[0] = q.x; v[1] = q.y;
+    } else {
+#pragma unroll
+        for (int c = 0; c < NS; ++c) v[c] = p[c];
+    }
+}
+#endif
 
 // The staged tile as a direct Load writes it: v(k, j) is element k of tile column j.
 template <int NX, int NY, int NZ, class C>
@@ -531,16 +585,7 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
             }
             __syncthreads();
         }
-        if constexpr (NZ > 1) {
-            for (int l = threadIdx.x; l < TP * NY; l += blockDim.x)
-                line_fft<NZ, Arch, Dir>(sm + (l / NY) * G::PR + (l % NY) * G::ZP, 1);
-        }
-        __syncthreads();
-        if constexpr (NY > 1) {
-            for (int l = threadIdx.x; l < TP * NZ; l += blockDim.x)
-                line_fft<NY, Arch, Dir>(sm + (l / NZ) * G::PR + l % NZ, G::ZP);
-        }
-        __syncthreads();
+        plane_zy<NX, NY, NZ, TP, Arch, Dir>(sm);
         for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
             const int t = KMINOR ? i / (NY * NZ) : i % TP, p = KMINOR ? i % (NY * NZ) : i / TP;
             if (c0 + t < e) st.put(kx * NY * NZ + p, c0 + t, sm[t * G::PR + G::plane_at(p)]);

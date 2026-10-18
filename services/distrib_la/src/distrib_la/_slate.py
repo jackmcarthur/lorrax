@@ -180,6 +180,88 @@ def validate_tile_layout(n: int, nb: int, p: int, q: int, *, what: str,
             f"layout at one tile per rank.  Omit block_size.")
 
 
+# -------------------------------------------------------------------------
+#  Device memory: SLATE's tile pools inside XLA's arena, per rank
+# -------------------------------------------------------------------------
+# SLATE's Target::Devices drivers keep their device tiles in a per-matrix pool
+# that, left alone, allocates with a raw device_malloc OUTSIDE the XLA arena.  On
+# ROCM the BFC arena is preallocated (runtime.pool_fraction, 60.18 of 68.70 GB per
+# MI250X GCD), so SLATE got ~7 GB: eigh aborted every rank above n ~ 20k c128 at P4
+# (blas::Error "out of memory, in function device_malloc", thrown from an OpenMP
+# task) and potrf hung at 51200 c128.  The device handlers seed each matrix's pool
+# with arena bytes at the measured lower envelope of the pool's high-water, from
+# THIS rank's own tiles, so no rank's device peak rises above unseeded SLATE's.
+# Where the bytes come from depends on whether the ranks' seeds are equal:
+#   * eigh: a u8 workspace OUTPUT sized here (eigh_workspace_bytes).  On every
+#     square grid the per-rank A / Z / Z1d counts are equal, and a workspace output
+#     is live only during the call, so XLA's buffer assignment overlaps it with the
+#     program's temporaries before and after the call.  Scratch-allocator bytes sit
+#     ON TOP of the whole temp allocation: measured +0.15 .. +1.06 GB per rank at
+#     n = 8192 ... 20480 against unseeded lufix, where the workspace output is
+#     -0.03 .. -1.17 GB (DISTRIB_LA_SCALE_REPORT addendum, round 2).
+#   * potrf, LU: xla::ffi::ScratchAllocator inside the handler (pool_seed.h
+#     ScratchSeed), each rank its own bytes; a rank whose seed is 0 allocates
+#     nothing, and the Python calls are main's (plus potrf's ``seed_min_bytes``).
+#     potrf's reservation is one block per local LOWER tile -- 0 on a rank that owns
+#     none -- so a uniform buffer would raise that rank's peak by the others' seed.
+#     LU's measured arena bytes are the same either way.
+# The rules live in the handlers (eigh_ffi.cc a_seed_tiles, batched_solve_lu_ffi.cc
+# seed_want, potrf_ffi.cc); eigh_workspace_bytes below is eigh's rule, max over ranks.
+#: The outside-pool allowance the memory model grants distributed linalg (the value of
+#: ``runtime.DISTRIBUTED_LINALG_OUTSIDE_BYTES``; distrib_la cannot import ``runtime`` --
+#: layering -- so tests/test_slate_pool_rules.py pins the two equal).  A rank's potrf
+#: reservation is seeded only past it: within it unseeded SLATE fits outside the arena.
+_SLATE_OUTSIDE_ALLOWANCE_BYTES = 3e9
+
+
+def _device_leg(mesh: Mesh) -> bool:
+    """The device handlers (ROCM, CUDA) take eigh's workspace and potrf's
+    ``seed_min_bytes``; the host leg's do not."""
+    return _mesh_platform(mesh) in ("ROCM", "CUDA")
+
+
+_POOL_ALIGN = 256   # pool_seed.h PoolSeed's carve alignment
+
+
+def _rank_tiles(mt: int, nt: int, p: int, q: int, x: int, y: int, *,
+                lower: bool = False) -> int:
+    """Tiles of grid rank ``(x, y)`` in a 2-D block-cyclic ``p x q`` layout (lower
+    triangle only for a Hermitian matrix)."""
+    rows = [i for i in range(mt) if i % p == x]
+    cols = [j for j in range(nt) if j % q == y]
+    if not lower:
+        return len(rows) * len(cols)
+    return sum(1 for i in rows for j in cols if i >= j)
+
+
+def eigh_workspace_bytes(side: int, nb: int, p: int, q: int, itemsize: int,
+                         compute_evecs: bool = True) -> int:
+    """The seeded heev driver's workspace: the largest per-rank seed over the grid.
+
+    Rank ``(x, y)`` seeds A with ``max(lower, full - mt/2)`` of its own tiles (he2hb's
+    measured high-water, min over ranks), Z with its local tiles and Z1d with its
+    columns of the ``1 x P`` column-cyclic grid -- the same rules as eigh_ffi.cc,
+    carved at :data:`_POOL_ALIGN`.  Equal on every rank of a square grid.
+    """
+    mt = nt = side // nb
+    tile = nb * nb * itemsize
+    ranks = p * q
+    best = 0
+    for x in range(p):
+        for y in range(q):
+            r = x * q + y
+            pools = [max(_rank_tiles(mt, nt, p, q, x, y, lower=True),
+                         _rank_tiles(mt, nt, p, q, x, y) - mt // 2)]
+            if compute_evecs:
+                z1d_cols = (nt - 1 - r) // ranks + 1 if r < nt else 0
+                pools += [_rank_tiles(mt, nt, p, q, x, y), mt * z1d_cols]
+            total = 0
+            for blocks in pools:
+                total = -(-total // _POOL_ALIGN) * _POOL_ALIGN + blocks * tile
+            best = max(best, total)
+    return max(best, _POOL_ALIGN)
+
+
 def _make_ctx(mesh: Mesh) -> int:
     ensure_registered(mesh)
     rank = int(jax.process_index())
@@ -374,6 +456,10 @@ def distributed_cholesky(
     # correctly for any p x q mesh.
     L_local_T = jax.ShapeDtypeStruct((n // q, n // p), A.dtype)
     attrs = dict(n=n, nb=nb, ctx_key=int(ctx_key))
+    if _device_leg(mesh):
+        # The device handler seeds a rank's SLATE pool (from XLA's scratch, that rank
+        # only) only when its reservation exceeds this allowance (cpp/slate/potrf_ffi.cc).
+        attrs["seed_min_bytes"] = int(_SLATE_OUTSIDE_ALLOWANCE_BYTES)
 
     @partial(shard_map, mesh=mesh,
              in_specs=P("x", "y"), out_specs=P("y", "x"),
@@ -530,6 +616,10 @@ def distributed_eigh(
         Q_local_T = jax.ShapeDtypeStruct((local, local), A.dtype)
         attrs = dict(n=side, nb=nb, ctx_key=int(ctx_key),
                      compute_evecs=bool(compute_evecs))
+        results = (W_local, Q_local_T)
+        if _device_leg(mesh):
+            results = results + (jax.ShapeDtypeStruct((eigh_workspace_bytes(
+                side, nb, p, q, A.dtype.itemsize, bool(compute_evecs)),), jnp.uint8),)
 
         @partial(shard_map,
                  mesh=mesh,
@@ -542,7 +632,7 @@ def distributed_eigh(
             # rank-remap).  Same convention as distributed_cholesky.
             local_A_T = jnp.transpose(local_A, (1, 0))
             W, Q_T = jax.ffi.ffi_call(
-                _EIGH_FFI_TARGET, (W_local, Q_local_T))(local_A_T, **attrs)
+                _EIGH_FFI_TARGET, results)(local_A_T, **attrs)[:2]
             # Q_T's rows are Q's columns: the eigenvalue index, over 'y',
             # laid out block-cyclically at nb < N/p.  Put them in W's
             # ascending order, then untranspose (Q at P('x','y')).

@@ -173,11 +173,13 @@ def start_blas_host_warmup(*, proc_idx: int = 0, say=print) -> dict:
         import numpy as np
         import jax
         import jax.numpy as jnp
+        from jax.sharding import SingleDeviceSharding
+        from lxkit import device_put_process_local
         dev = jax.local_devices()[0]
         t0 = time.perf_counter()
         progs = []
         for name in dtypes:
-            a = jax.device_put(np.ones((8, 8), dtype=name), dev)
+            a = device_put_process_local(np.ones((8, 8), dtype=name), SingleDeviceSharding(dev))
             progs.append((jax.jit(jnp.matmul).lower(a, a).compile(), a))
         _WARMUP["compile_s"] = time.perf_counter() - t0
     except Exception as exc:                               # noqa: BLE001

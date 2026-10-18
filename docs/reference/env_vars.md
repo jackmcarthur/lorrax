@@ -198,6 +198,9 @@ refusals stay on by default; per-file and per-operation instruments are opt-in.
 | `LORRAX_REDUCTION_TRACE` | unset | debug | Path (`{rank}` expanded). With `LORRAX_REDUCTION_GUARD` set, each process writes at exit a JSON list of the reductions it traced: site, op, rank count, shape, dtype, bytes, path (one-shot, slabbed, exact-marked, UNORDERED) and the extra transient bytes. |
 | `LORRAX_DAV_TRACE` | unset | debug | Path to an `.npz`. Process 0 writes the Davidson per-iteration history (iteration, matvec count, subspace size, eigenvalues, residuals, wall) and the distinct-program count (`bse/bse_lanczos.py`). |
 | `LORRAX_FFI_PROFILE` | off | debug | C++, exactly a leading `1`. Per-call timing split inside the cuSOLVERMp eigh handler (`cpp/cusolvermp/eigh_ffi.cc`). |
+| `LORRAX_ELPA_POOL_REPORT` | unset (off) | debug | C++ (`cpp/elpa/eigh_ffi.cc`): set, non-empty and not starting with `0` is on. After every ELPA eigh call each rank prints one `[elpa.eigh]` stderr line (n, tile, wall, the workspace pool and its high-water, fallbacks and their high-water, the small-allocation high-water, rocBLAS handles and workspace, degraded and aliased counts). Changes no result. |
+| `LORRAX_SLATE_POOL_REPORT` | unset (off) | debug | C++ (`cpp/slate/pool_seed.h`): set, non-empty and not starting with `0` is on. Each SLATE handler prints its seeded device pools' high-water on stderr and samples the device bytes in use per stage (a 20 ms side thread); also turns on the `LORRAX_SLATE_TIMERS` report. Changes no result. |
+| `LORRAX_SLATE_TIMERS` | unset (off) | debug | C++ (`cpp/slate/eigh_ffi.cc`): set, non-empty and not starting with `0` is on. The SLATE eigh handler prints one stage-timing line per call per rank plus the device bytes in use per stage (the same sampler thread). Changes no result. |
 | `ISDF_JAX_PROFILE_DIR` / `ISDF_JAX_PROFILE_SECTIONS` | unset / unset (every section) | debug | Directory for `jax.profiler` traces of timed sections (`common/jax_profile.py`) / comma list of substrings selecting which sections open a trace. A session live across a multi-node PHDF5 collective write segfaults rank 0, so name the sections above P=4. |
 
 ### 3b. A/B switches, probes and test hooks
@@ -305,6 +308,16 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `LORRAX_FFI_SO_PHDF5` | `$LORRAX_FFI_STAGE/build_phdf5/liblorrax_ffi.so` | launch | The PHDF5-enabled CUDA FFI `.so` that `ffi_env.sh` exports as `LORRAX_FFI_SO`. |
 | `LORRAX_MPI_PROVIDER` | `auto` | launch | `auto` unsets `FI_PROVIDER` and `FI_TCP_IFACE` so Intel MPI picks the native provider (`mlx` on CLX); `tcp` pins IPoIB with `FI_TCP_IFACE=ib0` (the rtx/mlx4 escape); any other value requests that provider (never `verbs` at P ≥ 144). The unset is load-bearing: TACC's default impi module exports `FI_PROVIDER=mlx` into every shell. |
 | `LORRAX_MPI_FABRICS` / `LORRAX_PMI2_LIB` | `shm` / `$WORK/host_pmi/libpmi2.so.0` | launch | `ffi_env.sh` overrides for `I_MPI_FABRICS` (use `shm:ofi` for multi-node) and `I_MPI_PMI_LIBRARY`. |
+
+### 4c. Frontier ELPA build (`config/frontier/build_elpa_hip.sh`)
+
+| var | default | class | grammar and effect |
+|---|---|---|---|
+| `LORRAX_ELPA_ROOT` | `$HOME/software/elpa_builds` | build | Directory under which the script installs the immutable, content-keyed prefix `elpa-2026.02.001-<key>` (read-only once complete; verified on rerun). |
+| `LORRAX_ELPA_GFX` | `gfx90a` | build | GPU target of ELPA's AMD kernels; part of the prefix key. |
+| `LORRAX_ELPA_MAKE_J` | `16` | build | Parallel jobs of the ELPA `make`. |
+| `LORRAX_ELPA_OPENMP` | `1` | build | `1` builds ELPA with OpenMP (`libelpa_openmp`, threaded host stages); part of the prefix key. |
+| `LORRAX_ELPA_ROCM_DIR` | unset (`build_elpa_hip.sh --print-prefix`; built when incomplete) | build | `config/frontier/build_ffi_rocm.sh`: the ELPA prefix the ROCM leg links (passed as CMake `-DLORRAX_ELPA_ROCM_DIR`). |
 
 ---
 

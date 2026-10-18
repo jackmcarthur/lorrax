@@ -3650,7 +3650,7 @@ class _FfiBackend(_DatasetGeometry):
             note_close(self.path, self._owner_token)
             self._owner_token = None
         from common.collectives import agree_io_error, rank0_transaction
-        from .commit_state import set_commit_state
+        from .commit_state import open_h5_settled, set_commit_state
 
         # Phase 1: no process may materialize metadata or publish anything
         # until every process has completed data teardown successfully.
@@ -3685,7 +3685,7 @@ class _FfiBackend(_DatasetGeometry):
                             where="_FfiBackend.close deferred-attr reopen"), \
                     _journal.op_scope("attr_w", self.path, stack=_J_H5PY,
                                       mode="a", cnt=(len(attrs), len(ds_attrs))), \
-                    h5py.File(self.path, "a") as h5:
+                    open_h5_settled(self.path, "a") as h5:
                 for name, host in deferred_hosts:
                     if name in h5:
                         del h5[name]

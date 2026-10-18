@@ -16,13 +16,14 @@ backends' operand contract, so a ``distributed`` call site runs it unchanged:
 The movement is route (c)'s (:mod:`distrib_la._batch_reshard`): one
 all_to_all puts whole matrices on ranks, the local kernel solves them
 (``native_eigh``: the leg's eigh route with zero-row deflation;
-``jnp.linalg.solve``), the inverse all_to_all returns the face layout.  A
+``local_lu.solve_local``: ``jnp.linalg.solve``, or the leg's span-blocked LU), the inverse all_to_all returns the face layout.  A
 single matrix is a stack of one: rank 0 solves it, the other ranks hold the
 synthetic padding, and the inverse exchange scatters rank 0's result, so every
 rank's tile comes from ONE solve.
 
-Memory.  A rank holds at most ``max_n^2`` matrix elements' worth of whole
-matrices per round (``max_n`` the leg row, :data:`distrib_la.resolve.ONE_DEVICE_MAX_N`,
+Memory.  A rank holds at most ``round_n^2`` matrix elements' worth of whole
+matrices per round (``round_n = min(max_n, ONE_DEVICE_ROUND_N row)``,
+:func:`distrib_la.resolve.one_device_round_n`; ``max_n`` the selection row, :data:`distrib_la.resolve.ONE_DEVICE_MAX_N`,
 measured at complex128): a stack whose ``ceil(B/P)`` matrices per rank exceed
 that runs in equal rounds (:func:`rounds_for`).  A shape rule, the same on every
 rank, so no size is exchanged.
@@ -38,7 +39,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._batch_reshard import (batch_reshard_call, reshard_program,
                                        reshard_rounds_call, validate_batch_reshard_operands)
-from distrib_la.resolve import ONE_DEVICE, mesh_key, mesh_platform, one_device_max_n
+from distrib_la.resolve import (ONE_DEVICE, mesh_key, mesh_platform, one_device_max_n,
+                                one_device_round_n)
 
 __all__ = ["distributed_eigh", "batched_distributed_eigh",
            "batched_distributed_solve_lu", "rounds_for", "held_per_rank",
@@ -101,7 +103,8 @@ def _ranks(mesh: Mesh) -> int:
 
 
 def batched_distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
-                             block_size=None, side=None, max_n: int | None = None):
+                             block_size=None, side=None, max_n: int | None = None,
+                             rounds: int | None = None):
     """Eigh of a face stack ``(B, n, n)`` at ``P(None,'x','y')``, each matrix on one device.
 
     ``compute_evecs``, ``block_size`` and ``side`` are the library wrappers'
@@ -112,7 +115,9 @@ def batched_distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
     del compute_evecs, block_size, side
     nb, n = int(A.shape[0]), int(A.shape[-1])
     bound = _bound("eigh", mesh, n, max_n)
-    return reshard_rounds_call("eigh", mesh, A, rounds=rounds_for(nb, n, _ranks(mesh), bound))
+    if rounds is None:
+        rounds = rounds_for(nb, n, _ranks(mesh), one_device_round_n("eigh", mesh_platform(mesh), bound))
+    return reshard_rounds_call("eigh", mesh, A, rounds=int(rounds))
 
 
 def distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
@@ -136,7 +141,8 @@ def distributed_eigh(A, *, mesh: Mesh, compute_evecs: bool = True,
     return fn(A)
 
 
-def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None):
+def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None,
+                                 rounds: int | None = None):
     """Solve ``A[q] X[q] = B[q]`` with each matrix on one device (``jnp.linalg.solve``).
 
     ``A`` (B, n, n) and ``B`` (B, n, NRHS) at ``P(None,'x','y')``; X in B's
@@ -146,7 +152,10 @@ def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None):
     validate_batch_reshard_operands("solve_lu", mesh, (A, B))
     nb, n, nrhs = int(A.shape[0]), int(A.shape[-1]), int(B.shape[-1])
     bound = _bound("solve_lu", mesh, n, max_n)
-    rounds = rounds_for(nb, n, _ranks(mesh), bound, width=nrhs)
+    if rounds is None:
+        rounds = rounds_for(nb, n, _ranks(mesh),
+                            one_device_round_n("solve_lu", mesh_platform(mesh), bound), width=nrhs)
+    rounds = max(1, min(int(rounds), nb))
     if rounds == 1:
         return batch_reshard_call("solve_lu", mesh, (A, B))
     m = -(-nb // rounds)
@@ -168,7 +177,8 @@ def batched_distributed_solve_lu(A, B, *, mesh: Mesh, max_n: int | None = None):
                             jax.lax.with_sharding_constraint(cut(b), face))
                 return jax.lax.with_sharding_constraint(
                     jax.lax.dynamic_update_slice_in_dim(x_all, x, start, axis=0), face), None
-            x, _ = jax.lax.scan(body, jax.lax.with_sharding_constraint(jnp.zeros_like(b), face), starts)
+            x, _ = jax.lax.scan(body, jax.lax.with_sharding_constraint(jnp.zeros_like(b), face), starts,
+                                unroll=1)
             return x
         _JIT_CACHE[key] = fn
     return fn(A, B)

@@ -527,6 +527,9 @@ if(LORRAX_CUFFT_ON)
     add_library(build_kconv_mathdx_cuda OBJECT
         cufft/kconv_mathdx_cuda_ffi.cc
         cufft/kconv_outer_cuda_ffi.cc
+        # The active-range GEMM with DEVICE-side bounds (active_gemm/: the ROCM leg's
+        # leg-neutral source, NVRTC-built here; DMMA f64 on compute capability >= 8.0).
+        active_gemm/active_gemm_device_ffi.cc
         common/rtc_build.cc)
     set_target_properties(build_kconv_mathdx_cuda PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
@@ -538,7 +541,14 @@ if(LORRAX_CUFFT_ON)
     target_include_directories(build_kconv_mathdx_cuda PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/common"
+        "${CMAKE_CURRENT_BINARY_DIR}"
         "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    # The device-bounds active-range GEMM kernel as text for NVRTC (the ROCM leg's same rule).
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h" LRX_ACTIVE_GEMM_SRC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_src.h.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/generated/active_gemm_src.h" @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h")
     # The k-box stage's text for NVRTC (cufft/kbox_stage_src.h.in): regenerated whenever
     # kbox_stage.cuh changes, so the embedded header and the host launch rule are one file.
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh" LRX_KBOX_SRC)
@@ -1480,7 +1490,9 @@ elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
 # transform, modes 2/3, and the k-minor pair, modes 4/5, run-time compiled);  slate (distributed
 # eigh / potrf / trsm and their batched forms over a gpu_backend=hip SLATE);
 # rocsolver (the batched local Hermitian eigh, one rocsolver_{z,d}{heevd,syevd}_strided_batched
-# call per stack, resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked);
+# call per stack, and the one-device LU solve on a 2^31-byte-span-blocked rocBLAS trsm/gemm path
+# (rocsolver/lu_solve_ffi.cc: rocBLAS trsm's in-place path is wrong past that span), both
+# resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked);
 # fourier_plan_rocm (LocalFourierPlan's ROCM leg, the port of the CUDA leg's fourier_plan_cuda_ffi.cc:
 # rocBLAS ZGEMM axes + hipFFT groups, both resolved from the wheel copies JAX mapped, and a
 # hipRTC remap kernel);
@@ -1538,6 +1550,7 @@ set(LORRAX_FFI_ROCM_SOURCES
     kdft/kbox_parent_ffi.cc
     kdft/plane_gather_ffi.cc
     rocsolver/batched_eigh_ffi.cc
+    rocsolver/lu_solve_ffi.cc
     hipfft/fourier_plan_rocm_ffi.cc
     active_subspace/active_devsize.cc
     # The local active-range GEMM: the CUDA leg's own leg-neutral source (cuBLAS there,
@@ -1733,6 +1746,43 @@ if(LORRAX_ROCM_HAVE_SLATE)
         INSTALL_RPATH "$ORIGIN;${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64")
     target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--disable-new-dtags")
     message(STATUS "  slate/{context,eigh,potrf,trsm,batched_potrf,batched_trsm}")
+endif()
+# ---- ELPA (AMD GPU kernels): the elpa/ family on this leg ------------------
+# ELPA 2026.02.001 built by config/frontier/build_elpa_hip.sh into its
+# content-keyed prefix (OpenMP, the LORRAX device-allocator patch, ScaLAPACK
+# static and hidden inside libelpa).  The handler shares the SLATE family's
+# per-mesh MPI context (as ScaLAPACK does), so it needs LORRAX_ROCM_HAVE_SLATE.
+# The prefix joins the RPATH AFTER SLATE's: the leg's libopenblas.so.0 stays
+# SLATE's copy (the closure writer and ld.so both resolve a SONAME once).
+option(LORRAX_ROCM_HAVE_ELPA
+    "Build the ELPA eigh handler (needs config/frontier/build_elpa_hip.sh's prefix)" ON)
+if(LORRAX_ROCM_HAVE_ELPA)
+    if(NOT LORRAX_ROCM_HAVE_SLATE)
+        message(FATAL_ERROR "GATE rocm-elpa: the ELPA handler uses the SLATE family's mesh "
+            "context; fix: -DLORRAX_ROCM_HAVE_SLATE=ON or -DLORRAX_ROCM_HAVE_ELPA=OFF")
+    endif()
+    if(NOT DEFINED LORRAX_ELPA_ROCM_DIR AND DEFINED ENV{LORRAX_ELPA_ROCM_DIR})
+        set(LORRAX_ELPA_ROCM_DIR "$ENV{LORRAX_ELPA_ROCM_DIR}")
+    endif()
+    if(NOT DEFINED LORRAX_ELPA_ROCM_DIR OR NOT EXISTS "${LORRAX_ELPA_ROCM_DIR}/LORRAX_ELPA_COMPLETE")
+        message(FATAL_ERROR "GATE rocm-elpa: no finished ELPA prefix at '${LORRAX_ELPA_ROCM_DIR}'; "
+            "fix: bash config/frontier/build_elpa_hip.sh (build_ffi_rocm.sh passes its "
+            "--print-prefix), or -DLORRAX_ROCM_HAVE_ELPA=OFF")
+    endif()
+    file(GLOB _elpa_inc "${LORRAX_ELPA_ROCM_DIR}/include/elpa*-*")
+    # Uncached: a new content-keyed prefix must re-resolve (a cached path would link the
+    # previous prefix's library; an existing cache entry would also short-circuit NO_CACHE).
+    unset(LORRAX_ELPA_LIBRARY CACHE)
+    find_library(LORRAX_ELPA_LIBRARY NAMES elpa_openmp elpa
+                 PATHS "${LORRAX_ELPA_ROCM_DIR}/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+    target_sources(lorrax_ffi_rocm PRIVATE elpa/eigh_ffi.cc)
+    target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE ${_elpa_inc})
+    target_link_libraries(lorrax_ffi_rocm PRIVATE "${LORRAX_ELPA_LIBRARY}")
+    get_target_property(_rp lorrax_ffi_rocm INSTALL_RPATH)
+    set_target_properties(lorrax_ffi_rocm PROPERTIES
+        INSTALL_RPATH "${_rp};${LORRAX_ELPA_ROCM_DIR}/lib")
+    message(STATUS "ELPA (hip): ${LORRAX_ELPA_ROCM_DIR} (${LORRAX_ELPA_LIBRARY})")
+    message(STATUS "  elpa/eigh")
 endif()
 else()
     message(FATAL_ERROR

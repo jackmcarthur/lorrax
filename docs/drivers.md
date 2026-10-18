@@ -182,7 +182,7 @@ G(τ) is never materialized; it exists only as $\psi\psi^*$ phases inside the
 | `eqp0.dat`, `eqp1.dat` | BerkeleyGW-format QP energies on the WFN wedge; in SC runs, the converged SC spectrum |
 | `sigma_diag.dat` | the Σ diagonal decomposition per k and band |
 | `eqp_g0w0.dat` | dynamic one-shot runs: $H_0 + \Sigma_{xc}(E_\mathrm{DFT})$ |
-| `sigma_mnk.h5` | dynamic modes: the on-shell Σ band matrices Σ_mn(E_m), Σ_mn(E_n) and diagonals; the Σ(ω) cube under `sigma_omega_grid_debug = true` |
+| `sigma_mnk.h5` | dynamic modes: the on-shell Σ band matrices Σ_mn(E_m), Σ_mn(E_n) and diagonals |
 | `qp_wfn_rotations.h5` | the QP eigensystem $U$, $E_\mathrm{QP}$ with the source-WFN fingerprint, read by htransform, BSE and SC seeding |
 | `WFN_qp.h5` | ψ rotated by U with QP energies (`write_wfn_h5`); a one-shot run on a symmetry-reduced WFN writes none |
 | `tmp/zeta_q.h5` | ζ, plus `zeta_q_mu{1,2,3}.h5` on bispinor runs |
@@ -204,7 +204,7 @@ Invoke: `python -m gw.gw_jax -i gw.in`.
 | `number_bands` / `nval` / `ncond` | 100 / 5 / 5 | χ₀ and Σ band-sum top / interior valence edge / Σ conduction count. `number_bands_chi` and `number_bands_sigma` split the two sums |
 | `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)). Production: `mpa` with `sigma_w_model = shared_pole` ([production QSGW](how-to/production-qsgw.md)) |
 | `qp_solver` | `auto` → `one_shot_dft` | `one_shot_dft`: full-matrix effective H with Σ at $E_\mathrm{DFT}$, Hermitian-symmetrized; `self_consistent`: the QSGW loop, Σ read at each map's own energies. No QP equation is solved; `fixed_point` is retired and refuses by name ([self-consistency](self_consistency.md)) |
-| `write_eqp2` | false | dynamic one-shot with `sigma_omega_grid_debug = true`: iterate the fixed Σ(ω) matrix in the evolving QP basis and write `eqp2.dat`; screening and Σ are not rebuilt. Keys `eqp2_*` in the [input reference](input_reference.md) |
+| `sigma_omega_grid_debug` | false | debug: Σ_c on the whole ω grid instead of on shell (the `sigma_mnk.h5` Σ(ω) cube, the grid freq-debug table, `qp_omega0_ev`, the ±0.5 eV Z); see [on-shell Σ_c](theory/sigma-on-shell.md#grid-debug). `write_eqp2` and the `eqp2_*` keys are retired and refuse by name |
 | `restart` | false | `true` reuses `tmp/isdf_tensors_<N_mu>.h5` after authentication |
 | `linalg` | `local` | the one layout dial for dense solves ([input reference](input_reference.md)) |
 

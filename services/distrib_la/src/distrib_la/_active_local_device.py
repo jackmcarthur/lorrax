@@ -9,8 +9,8 @@ only, and no inactive column of ``a``, row of ``b`` or entry of ``w`` is read, s
 never enters arithmetic.  Invalid bounds give an all-NaN result (as the guarded arms).
 
 Callers import it only for a mesh whose route row is ``"device"`` and pass that platform key
-to :func:`require_active_local_device`.  It is the CUDA leg's design as well: the same
-targets once the CUDA leg lists ``active_gemm/active_gemm_device_ffi.cc``.
+to :func:`require_active_local_device`.  Both device legs build the targets (the inner product
+on MFMA f64 on gfx90a / gfx94x, DMMA f64 on CUDA compute capability >= 8.0, FMA elsewhere).
 """
 from __future__ import annotations
 

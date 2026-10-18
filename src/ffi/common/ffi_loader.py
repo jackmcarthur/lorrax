@@ -113,6 +113,10 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
     "lorrax_cublas_local_active_range_gemm_out": "CublasLocalActiveRangeGemmOutFfi",
     "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
+    # The active-range GEMM with DEVICE-side bounds (cpp/active_gemm/, leg-neutral, run-time
+    # compiled; DMMA f64 on compute capability >= 8.0): ACTIVE_LOCAL_ROUTE's "device" row.
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
     # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
     # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
     # (mode, grid, ns, context) and disk-cached.  CUDA-only; the ffi.fft router
@@ -134,10 +138,12 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_mathdx_kconv_klead_lorentz_rows": "KConvMathdxKleadLorentzRowsCudaFfi",
     "lorrax_mathdx_kconv_klead_unfold_block": "KConvMathdxKleadUnfoldBlockCudaFfi",
     "lorrax_mathdx_kconv_klead_unfold_xblock": "KConvMathdxKleadUnfoldXBlockCudaFfi",
+    "lorrax_mathdx_kconv_klead_unfold_kf": "KConvMathdxKleadUnfoldKfCudaFfi",
     "lorrax_mathdx_kconv_klead_lorentz_conj": "KConvMathdxKleadLorentzConjCudaFfi",
     "lorrax_mathdx_kconv_klead_lorentz_wparent": "KConvMathdxKleadLorentzWParentCudaFfi",
     "lorrax_mathdx_kfft_klead_unfold": "KFftMathdxKleadUnfoldCudaFfi",
     "lorrax_mathdx_kconv_chi_unfold": "KConvMathdxChiUnfoldCudaFfi",
+    "lorrax_mathdx_kconv_chi_unfold_q": "KConvMathdxChiUnfoldQCudaFfi",
     "lorrax_mathdx_kconv_chi_vertex": "KConvMathdxChiVertexCudaFfi",
     "lorrax_mathdx_kfft_klead":     "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor":   "KConvMathdxKminorCudaFfi",
@@ -231,6 +237,8 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     "lorrax_slate_batched_solve_lu_factors": "SlateBatchedSolveLuFactorsFfi",
     "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
     "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
+    # The ELPA eigh (cpp/elpa/eigh_ffi.cc): the ROCM distributed eigh (distrib_la.resolve).
+    "lorrax_elpa_eigh":                      "ElpaEighFfi",
     # k-box modes 9 and 11 (cpp/kdft/kbox_rspace_ffi.cc): ffi.fft._ROCM_KBOX_TARGETS.
     "lorrax_kdft_kfft_klead_unfold": "KDftKfftKleadUnfoldFfi",
     "lorrax_kdft_kconv_chi_unfold":  "KDftKconvChiUnfoldFfi",
@@ -250,14 +258,15 @@ _ROCM_OWN_TARGET_SYMBOLS = {
     # The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc), called by
     # distrib_la.local_eigh (BATCHED_EIGH_ROUTE); CUDA uses jaxlib's cuSOLVER for it.
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
+    # The one-device LU solve (cpp/rocsolver/lu_solve_ffi.cc), called by distrib_la.local_lu
+    # (LOCAL_LU_ROUTE) for a system spanning >= 2^31 bytes; CUDA uses jaxlib's cuSOLVER for it.
+    "lorrax_rocsolver_lu_solve": "RocsolverLuSolveFfi",
+    "lorrax_rocsolver_tri_solve": "RocsolverTriSolveFfi",
     # LocalFourierPlan's ROCM leg (cpp/hipfft/fourier_plan_rocm_ffi.cc, the port of the CUDA
     # leg's cufft/fourier_plan_cuda_ffi.cc): ffi.fft.FOURIER_PLAN_TARGETS["ROCM"].
     "lorrax_fourier_plan_rocm":      "LorraxFourierPlanRocmFfi",
-    # The active-range GEMM with device-side bounds (cpp/active_gemm/, leg-neutral, run-time
-    # compiled), distrib_la ACTIVE_LOCAL_ROUTE's ROCM "device" row; the CUDA leg serves the
-    # operation with cublas_local (and adopts this source by listing it).
-    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
-    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
+    # (The device-bounds active-range GEMM, cpp/active_gemm/, is built on both legs now: its
+    # targets reach this table through _ROCM_FAMILIES from the CUDA table above.)
 }
 _ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
                            if target.startswith(_ROCM_FAMILIES)},
@@ -333,7 +342,7 @@ class FfiLibraryNotBuilt(FileNotFoundError):
 #: this boundary is unavoidable; what IS avoidable is the mirror drifting
 #: silently, and ``tests/test_ffi_abi_stamp.py`` parses the header and fails if
 #: these two numbers disagree.
-LORRAX_FFI_ABI_VERSION = 8
+LORRAX_FFI_ABI_VERSION = 9
 
 #: platform -> the C entry point that reports the library's ABI.  Per leg on
 #: purpose: both libraries are dlopened RTLD_GLOBAL in a GPU process and

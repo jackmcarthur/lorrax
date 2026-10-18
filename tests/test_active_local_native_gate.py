@@ -366,7 +366,7 @@ def test_rows():
     pytest.importorskip("jax")
     from distrib_la._active_local import (ACTIVE_LOCAL_GUARD, ACTIVE_LOCAL_ROUTE,
                                           active_local_guard, active_local_route)
-    assert ACTIVE_LOCAL_ROUTE["CUDA"] == "native" and ACTIVE_LOCAL_ROUTE["ROCM"] == "device"
+    assert ACTIVE_LOCAL_ROUTE["CUDA"] == "device" and ACTIVE_LOCAL_ROUTE["ROCM"] == "device"
     assert active_local_route("cpu") == "interval"
     assert ACTIVE_LOCAL_GUARD == {"CUDA": "cond", "ROCM": "select"}
     assert active_local_guard("tpu") == "cond"
@@ -411,10 +411,12 @@ def test_targets_in_both_rocm_tables_and_the_family_row():
     from ffi.common import ffi_loader, families
     from distrib_la import loader
     for t in ("lorrax_active_gemm_device", "lorrax_active_gemm_device_out"):
-        assert loader._PLATFORMS["ROCM"]["targets"][t] == ffi_loader._PLATFORMS["ROCM"]["targets"][t]
-        assert t not in loader._PLATFORMS["CUDA"]["targets"]
+        sym = loader._PLATFORMS["CUDA"]["targets"][t]          # built on both device legs
+        assert ffi_loader._PLATFORMS["CUDA"]["targets"][t] == sym
+        assert loader._PLATFORMS["ROCM"]["targets"][t] == sym == ffi_loader._PLATFORMS["ROCM"]["targets"][t]
         assert families.family_of(t) == "active_gemm"
     assert families.state("active_gemm", "ROCM")[0] == "built"
+    assert families.state("active_gemm", "CUDA")[0] == "built"
     assert families.FAMILIES["active_gemm"].tol == TOL
     for t in ("lorrax_cublas_local_active_range_gemm", "lorrax_cublas_local_active_range_gemm_out",
               "lorrax_cublas_local_prepared_active_range_gemm"):

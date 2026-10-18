@@ -202,7 +202,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     shared = {t: s for t, s in rocm.items() if t not in own}
     prefixes = tuple(p for p in built_prefixes("ROCM")
                      if any(t.startswith(p) for t in ffi_loader._CUDA_TARGET_SYMBOLS))
-    assert set(prefixes) == {"lorrax_phdf5_", "lorrax_slate_", "lorrax_cublas_local_"}
+    assert set(prefixes) == {"lorrax_phdf5_", "lorrax_slate_", "lorrax_cublas_local_", "lorrax_active_gemm_"}
     assert shared and all(t.startswith(prefixes) for t in shared)
     assert all(ffi_loader._CUDA_TARGET_SYMBOLS[t] == s for t, s in shared.items())
     assert {t for t in ffi_loader._CUDA_TARGET_SYMBOLS if t.startswith(prefixes)} == set(shared)
@@ -211,12 +211,18 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     lu = {"lorrax_slate_batched_solve_lu_factors", "lorrax_slate_batched_getrf",
           "lorrax_slate_batched_getrs"}
     eigh = {"lorrax_rocsolver_batched_eigh"}
+    lulocal = {"lorrax_rocsolver_lu_solve", "lorrax_rocsolver_tri_solve"}   # the one-device LU solve (cpp/rocsolver/)
     fplan = {"lorrax_fourier_plan_rocm"}          # LocalFourierPlan's ROCM leg (cpp/hipfft/)
     agemm = {"lorrax_active_gemm_device", "lorrax_active_gemm_device_out"}
-    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | fplan | agemm for t in own)
+    elpa = {"lorrax_elpa_eigh"}                  # the ROCM distributed eigh (cpp/elpa/)
+    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | lulocal | fplan | elpa
+                       for t in own)
+    assert elpa <= set(own)
     assert fplan <= set(own)
-    assert agemm <= set(own)
+    # The device-bounds active GEMM is built on both legs: shared (from the CUDA table), not own.
+    assert agemm <= set(shared) and not agemm & set(own)
     assert eigh <= set(own)
+    assert lulocal <= set(own)
     assert lu <= set(own)
     assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)
     assert all(rocm[t] == s for t, s in own.items())
@@ -225,7 +231,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     # the local active-range GEMM (the CUDA leg's leg-neutral source, the same symbols).
     dl_rocm = dl._PLATFORMS["ROCM"]["targets"]
     assert dl_rocm and all(t.startswith(("lorrax_slate_", "lorrax_active_subspace_", "lorrax_cublas_local_"))
-                           or t in eigh | agemm for t in dl_rocm)
+                           or t in eigh | lulocal | agemm | elpa for t in dl_rocm)
     active = {t for t in dl_rocm if t.startswith("lorrax_active_subspace_")}
     assert active == {t for t in dl._CUDA_TARGET_SYMBOLS if t.startswith("lorrax_active_subspace_")
                       } - {"lorrax_active_subspace_distributed_ortho", "lorrax_active_subspace_eigh"}
@@ -233,7 +239,7 @@ def test_the_rocm_leg_carries_exactly_its_ported_families():
     assert all(dl_rocm[t] == rocm[t] for t in agemm)
     assert all(dl_rocm[t] == ffi_loader._CUDA_TARGET_SYMBOLS[t] for t in dl_rocm
                if t.startswith("lorrax_cublas_local_"))
-    assert lu | eigh <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu | eigh)
+    assert lu | eigh | elpa <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu | eigh | elpa)
     cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
     section = cmake[cmake.index('STREQUAL "rocm"'):]
     block = section[:section.index("add_library(lorrax_ffi_rocm")]

@@ -1,7 +1,7 @@
 """Backend resolution — the ONE guard ladder.
 
 A requested backend name (``auto | off | distributed | native2d |
-cusolvermp | slate | scalapack``, per op) becomes a concrete,
+cusolvermp | slate | elpa | scalapack``, per op) becomes a concrete,
 *guaranteed-callable* backend, or a clear resolve-time error.  Every guard
 lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
 
@@ -10,7 +10,8 @@ lives here, applied in ONE fixed order — SEVEN steps, all at resolve time:
                       distributed library FIRST, then runs the whole
                       ladder as if it had been named explicitly)
     1b. size        — ``distributed`` on a leg with a size row
-                      (:data:`ONE_DEVICE_MAX_N`, the ROCM leg) and a known
+                      (:data:`ONE_DEVICE_MAX_N`, ROCM; or a room on a
+                      :data:`ONE_DEVICE_BY_ROOM` leg, CUDA) and a known
                       ``n`` at or below the row's bound resolves to
                       ``one_device`` instead: the matrix fits one device,
                       where the library's fixed per-call cost is the whole
@@ -70,6 +71,8 @@ Backend choice is a deck key; the environment grants a CAPABILITY (which
 """
 from __future__ import annotations
 
+import math
+
 
 from lxkit import FFI_PLATFORM_MAP, announce_once, mesh_ffi_platform
 
@@ -81,6 +84,9 @@ __all__ = [
     "NATIVE2D",
     "ONE_DEVICE",
     "ONE_DEVICE_MAX_N",
+    "ONE_DEVICE_BY_ROOM",
+    "ONE_DEVICE_ROUND_N",
+    "one_device_round_n",
     "one_device_max_n",
     "size_route_note",
     "BACKEND_CHOICES",
@@ -136,7 +142,7 @@ ONE_DEVICE = "one_device"
 #: drift).  ``cholesky`` deliberately does NOT: its CPU story is a
 #: channel-policy ladder in the caller, not one library.
 BACKEND_CHOICES = {
-    "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate",
+    "eigh":     ("auto", "off", "distributed", "cusolvermp", "slate", "elpa",
                  "scalapack", ONE_DEVICE),
     "cholesky": ("auto", "off", "native2d", "cusolvermp", "slate"),
     "solve_lu": ("auto", "off", "distributed", "cusolvermp", "scalapack",
@@ -162,9 +168,16 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 #: ScaLAPACK's routines on the same library and MPI context are clean, so
 #: there is no configuration in which slate is the right CPU eigh.  On
 #: **CUDA** it is cuSOLVERMp, the only library there with a distributed
-#: syevd.  On **ROCM** it is SLATE (gpu_backend=hip), the only one of the
-#: three that builds for ROCm; eigh/potrf are gated against the native route
-#: on MI250X at P=4 (``ffi.common.families`` 'slate' row).
+#: syevd.  On **ROCM** eigh is ELPA (``distrib_la._elpa``: ELPA 2026.02.001's
+#: one-stage GPU solver, config/frontier/build_elpa_hip.sh), gated against the
+#: native route at P=4 (``ffi.common.families`` 'elpa' row).  MEASURED against
+#: SLATE-HIP, the former row, on MI250X (ELPA_ROCM_REPORT.md; cold wall, sampled
+#: residual / orthogonality <= 2.4e-14 for ELPA):
+#:     P=4 (2x2)   c128 20480: ELPA 23.0 s vs SLATE 121.8 s;  c128 30720: ELPA
+#:                 runs, SLATE aborts (he2hb workspace outside the arena);
+#:                 f64 20480: 15.3 vs 84.4 s;  f64 30720: 33.7 vs 213.6 s.
+#:     P=16 (4x4)  c128 30720: ELPA 27.3 s vs SLATE 218 s.
+#: SLATE stays selectable (``backend='slate'``) and keeps potrf / solve_lu.
 #:
 #: ``('solve_lu', 'ROCM')`` is SLATE too: ``slate::getrf`` (PartialPiv,
 #: Target::Devices) + ``slate::getrs`` (cpp/slate/batched_solve_lu_ffi.cc),
@@ -172,7 +185,7 @@ FFI_PLATFORMS = FFI_PLATFORM_MAP
 _DISTRIBUTED_DEFAULT = {
     ("eigh", "cpu"):      "scalapack",
     ("eigh", "CUDA"):     "cusolvermp",
-    ("eigh", "ROCM"):     "slate",
+    ("eigh", "ROCM"):     "elpa",
     # solve_lu: the same one-library-per-platform rule.  ScaLAPACK's
     # pXgetrf/pXgetrs on the host lib, cuSOLVERMp's batched getrf/getrs
     # on CUDA — the two backends _IMPL already lists for this op.
@@ -184,26 +197,74 @@ _DISTRIBUTED_DEFAULT = {
 #: ``distributed`` by SIZE — (op, leg) → the largest ``n`` that
 #: ``distributed`` serves with ``one_device`` (each matrix whole on one
 #: device, the leg's native solver).  ONE row per leg that measured it; a
-#: leg without a row keeps its library for every ``n`` (CUDA has no row:
-#: its routing is unchanged).  The bound is in ``n`` and was measured at
-#: complex128, the larger of the two dtypes, so float64 is inside it.
+#: leg without a row keeps its library for every ``n``.  The bound is in
+#: ``n`` and was measured at complex128, the larger of the two dtypes, so
+#: float64 is inside it.  A caller's room still caps the route
+#: (:func:`_size_route`), so a row never puts a matrix on a rank that the
+#: caller found it does not fit.
 #:
 #: ROCM (MI250X GCD, 64 GB; pool logs ``distla_bound1``, ``distla_lubig*``):
 #:   eigh 16384: the one-device program at n = 16384 complex128 takes 42.4 s
 #:     (native 42.1 s, SLATE 2x2 76.4 s), peak 27.9 GB per rank, resid 9e-15;
 #:     SLATE eigh steady is 64-147x the native wall at n = 32-128 complex128
 #:     (0.22-0.29 s vs 0.0016-0.0045 s, ``distla_bound1``) and 2.7-33x at
-#:     n = 2048-8192 (SLATE_PERF_REPORT).  Beyond 16384 one
-#:     GCD is not measured, so the library takes over (the capacity route).
-#:   solve_lu 8192: the native complex128 LU (jaxlib getrf/getrs on rocSOLVER,
-#:     ROCm 7.14.1) returns a WRONG solution with no error at n = 12288 and
-#:     16384 (residual 8e-3; float64 16384 and complex128 <= 11616 are exact),
-#:     so the bound is the largest n the gate covered (512-8192, f64/c128).
-#:     One-device LU at 8192 c128 takes 1.06 s against SLATE's 3.63 s.
+#:     n = 2048-8192 (SLATE_PERF_REPORT).  Beyond 16384 the SLATE comparison is
+#:     not measured, so the library takes over (the capacity route).  16384 is a
+#:     MEASURED-COVERAGE bound, not a correctness one: jnp.linalg.eigh (rocSOLVER
+#:     zheevd) is exact at n = 20480 (60.5 s, peak 35.2 GB, resid 8.4e-15) and
+#:     24576 (120.2 s, 50.75 GB, 8.1e-15) complex128 (pool logs lurc_e_*).
+#:   solve_lu: the CAPACITY of one GCD, an explicit rule: the largest n whose
+#:     priced one-device program (``_one_device.one_device_bytes``: 5 n^2 x 16 B,
+#:     complex128) fits the GCD's XLA allocator, :data:`_ROCM_GCD_BYTES_LIMIT`
+#:     -> isqrt(60183563895 // 80) = 27427.  There is no speed crossover below
+#:     it: one-device (distrib_la.local_lu) vs SLATE 2x2 complex128, n = 8192
+#:     0.72 vs 3.63 s, 12288 1.53 vs 10.4 s, 16384 4.10 vs 16.1 s; one-device
+#:     20480 6.18 s, 24576 13.3 s, 26624 14.2 s, 28672 22.7 s (peak 52.9 GB,
+#:     resid <= 1.1e-14), 30720 out of memory (pool logs lurc_f_*, lurc_k_*,
+#:     distla_lubigs).  The former 8192 was a correctness cap: rocBLAS trsm's
+#:     in-place path is wrong past a 2^31-byte span (ROCSOLVER_LU_REPORT.md);
+#:     local_lu solves such systems on a span-blocked path, so the native LU is
+#:     exact at every n here.
+#: One MI250X GCD's XLA allocator limit (``memory_stats()['bytes_limit']``, ROCm 7.14.1
+#: wheels, jax 0.9.1, measured on frontier07938).  The ROCM solve_lu capacity row's input.
+_ROCM_GCD_BYTES_LIMIT = 60_183_563_895
+#: ``_one_device.ONE_DEVICE_LU_TILES`` x complex128 itemsize (that module imports this one;
+#: tests/test_distrib_la_one_device.py pins the two equal).
+_ROCM_LU_BYTES_PER_N2 = 5 * 16
 ONE_DEVICE_MAX_N = {
+    ("eigh", "ROCM"):     16384,
+    ("solve_lu", "ROCM"): math.isqrt(_ROCM_GCD_BYTES_LIMIT // _ROCM_LU_BYTES_PER_N2),
+}
+
+#: ``one_device`` ROUNDS by leg row: the per-rank element allowance of one round (whole
+#: matrices of n x max(n, width) elements up to ROUND_N^2 per rank, at least one), DECOUPLED
+#: from the selection bound above so that a stack's per-rank peak never rises above main's
+#: (owner rule): these are the rows main 4bae15f55 planned its rounds with.  A single matrix
+#: above ROUND_N that ONE_DEVICE_MAX_N selects runs one matrix per rank per round.
+ONE_DEVICE_ROUND_N = {
     ("eigh", "ROCM"):     16384,
     ("solve_lu", "ROCM"): 8192,
 }
+
+
+def one_device_round_n(op: str, platform: str, bound: int) -> int:
+    """The rounds' bound for a selection bound ``bound``: ``min(bound, ONE_DEVICE_ROUND_N row)``
+    (the bound itself on a leg without a round row, e.g. a room leg).  A shape rule."""
+    r = ONE_DEVICE_ROUND_N.get((op, str(platform)))
+    return int(bound) if r is None else min(int(bound), int(r))
+
+#: ``distributed`` by ROOM -- the (op, leg) pairs whose ``one_device`` bound is not a number
+#: but the caller's per-rank room: the largest ``n`` whose one whole matrix's priced program
+#: (:func:`distrib_la._one_device.one_device_bytes`) fits it, and the rounds hold whole
+#: matrices within the same room.  Without a room (or a zero room) the leg's library runs, so
+#: no matrix is ever put on a rank that a caller has not priced; the size ceiling is the
+#: library's.  CUDA: jaxlib's cuSOLVER per device against cuSOLVERMp, measured on A100-SXM4
+#: (P=4 2x2, complex128, ``dla_sweep``): eigh n=312 x64 0.022 s vs 1.97 s, n=8192 x4 2.05 vs
+#: 6.53 s, n=16384 x4 13.7 vs 29.0 s; solve_lu n=312 x64 0.0075 vs 0.307 s, n=8192 x4 0.44 vs
+#: 1.72 s, n=16384 x4 2.88 s (cuSOLVERMp ran out of device memory); residuals <= 1.7e-14 on
+#: both, cuSOLVER's LU exact through 16384 (the rocBLAS trsm defect of distrib_la.local_lu
+#: does not occur there).
+ONE_DEVICE_BY_ROOM = frozenset({("eigh", "CUDA"), ("solve_lu", "CUDA")})
 
 #: ``auto`` cholesky / solve_lu: the leg's FFI candidate on a true-2-D mesh
 #: (else native).  CUDA only: cuSOLVERMp.  A leg without a row resolves
@@ -227,6 +288,8 @@ _NATIVE_IMPL = {
 _SPEC = {
     ("eigh", "cusolvermp"):     ("lorrax_cusolvermp_eigh",          ("CUDA",)),
     ("eigh", "slate"):          ("lorrax_slate_eigh",       ("CUDA", "cpu", "ROCM")),
+    # ELPA (cpp/elpa/, config/frontier/build_elpa_hip.sh): built on the ROCM leg only.
+    ("eigh", "elpa"):           ("lorrax_elpa_eigh",        ("ROCM",)),
     ("eigh", "scalapack"):      ("lorrax_scalapack_eigh",           ("cpu",)),
     ("cholesky", "cusolvermp"): ("lorrax_cusolvermp_batched_potrf", ("CUDA",)),
     ("cholesky", "slate"):      ("lorrax_slate_potrf",      ("CUDA", "cpu", "ROCM")),
@@ -346,7 +409,7 @@ def _platform_phrase(platforms: tuple[str, ...]) -> str:
 def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
     """Guard 5 — mesh-geometry constraints, per (op, backend).  Raises
     ValueError with the reason; silent-pass otherwise."""
-    if op == "eigh" and backend in ("cusolvermp", "slate"):
+    if op == "eigh" and backend in ("cusolvermp", "slate", "elpa"):
         # These two FFI eigh wrappers reject p != q; for cusolvermp this is
         # a DEADLOCK guard (cusolverMpSyevd hangs in a collective on
         # rectangular one-tile-per-rank blocks — observed 4x1/1x4,
@@ -358,7 +421,8 @@ def _check_geometry(op: str, backend: str, px: int, py: int) -> None:
             raise ValueError(
                 f"eigh backend {backend!r} needs a SQUARE mesh "
                 f"(cusolverMpSyevd DEADLOCKS on rectangular blocks; SLATE "
-                f"heev rejects them); got {px}x{py}.")
+                f"heev rejects them; ELPA's wrapper relabels one tile edge for "
+                f"both axes); got {px}x{py}.")
     elif backend == "slate":
         # These two rules MIRROR ``_slate.validate_tile_layout`` (the
         # call-time guard) exactly, in the same order.  Keep them in sync:
@@ -594,7 +658,7 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
         if sized is not None:
             requested = sized
     if requested == ONE_DEVICE:
-        return _resolve_one_device(op, mesh_xy, n, requested_spelling)
+        return _resolve_one_device(op, mesh_xy, n, requested_spelling, room)
     if requested == "distributed":
         # "Spread ONE tile over the whole mesh, with whatever library this
         # platform's distributed eigh is."  Explicit — every guard below
@@ -816,9 +880,22 @@ def resolve_backend(op: str, requested: str, mesh_xy, *,
 _SIZE_DECISIONS: dict = {}
 
 
-def one_device_max_n(op: str, platform: str) -> int | None:
-    """The leg's ``one_device`` bound for ``op`` (:data:`ONE_DEVICE_MAX_N`), or None."""
-    return ONE_DEVICE_MAX_N.get((op, str(platform)))
+def one_device_max_n(op: str, platform: str, room: int | None = None) -> int | None:
+    """The leg's ``one_device`` bound for ``op``, or None (the leg's library).
+
+    A size row (:data:`ONE_DEVICE_MAX_N`) is the bound.  A room leg
+    (:data:`ONE_DEVICE_BY_ROOM`) derives it from the caller's per-rank ``room``: the
+    largest ``n`` with ``one_device_bytes(op, n) <= room``; no room, no bound.  A shape
+    rule on a value every rank shares: no exchange, no sync."""
+    bound = ONE_DEVICE_MAX_N.get((op, str(platform)))
+    if bound is not None:
+        return bound
+    if (op, str(platform)) in ONE_DEVICE_BY_ROOM and room is not None and int(room) > 0:
+        import math
+        from distrib_la._one_device import one_device_bytes
+        n = math.isqrt(int(room) // one_device_bytes(op, 1))
+        return n if n >= 1 else None
+    return None
 
 
 def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
@@ -831,7 +908,7 @@ def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
     has found does not fit (``common.gpu_utils.admit_local``, memory-model.md#routes).
     A shape price against a caller value every rank shares: no exchange, no sync."""
     platform = mesh_platform(mesh_xy)
-    bound = one_device_max_n(op, platform)
+    bound = one_device_max_n(op, platform, room)
     if bound is None or n is None:
         return None
     px, py = _mesh_shape(mesh_xy)
@@ -848,12 +925,13 @@ def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
     _SIZE_DECISIONS.setdefault(
         (op, platform, px, py, int(n), None if room is None else int(room)),
         f"{op} 'distributed' n={int(n)} on the {px}x{py} {platform} mesh: {chosen}, "
-        f"size route (ONE_DEVICE_MAX_N: n <= {bound} -> {ONE_DEVICE}, larger -> {library}"
+        f"size route ({'room' if (op, platform) in ONE_DEVICE_BY_ROOM else 'ONE_DEVICE_MAX_N'}: "
+        f"n <= {bound} -> {ONE_DEVICE}, larger -> {library}"
         f"{priced})")
     announce_once(
         ("distrib_la.resolve", op, "size-route", platform, px, py, chosen),
         f"  [distrib_la.resolve] {op} 'distributed' on the {px}x{py} {platform} "
-        f"mesh: size route (leg row ONE_DEVICE_MAX_N, n <= {bound} -> "
+        f"mesh: size route ({'the room' if (op, platform) in ONE_DEVICE_BY_ROOM else 'leg row ONE_DEVICE_MAX_N'}, n <= {bound} -> "
         f"'{ONE_DEVICE}', larger -> '{library}'): n={int(n)} -> '{chosen}'.  "
         f"'{ONE_DEVICE}' solves each matrix whole on one device with the native "
         f"kernel and returns the caller's P(None,'x','y') layout; an explicit "
@@ -861,13 +939,14 @@ def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
     return ONE_DEVICE if chosen == ONE_DEVICE else None
 
 
-def size_route_note(op: str, requested: str, mesh_xy, n, backend: str) -> str | None:
+def size_route_note(op: str, requested: str, mesh_xy, n, backend: str,
+                    room: int | None = None) -> str | None:
     """The plan record of guard 1b: what the size route decided, or None when it
     did not apply (no leg row, ``n`` unknown, or a request other than ``distributed``)."""
     if str(requested).strip().lower() != "distributed":
         return None
     platform = mesh_platform(mesh_xy)
-    bound = one_device_max_n(op, platform)
+    bound = one_device_max_n(op, platform, room)
     if bound is None or n is None:
         return None
     rel = "<=" if int(n) <= bound else ">"
@@ -875,23 +954,24 @@ def size_route_note(op: str, requested: str, mesh_xy, n, backend: str) -> str | 
     return f"size route {platform}: n={int(n)} {rel} {bound} -> {backend}{over}"
 
 
-def _resolve_one_device(op: str, mesh_xy, n, spelling: str) -> str:
+def _resolve_one_device(op: str, mesh_xy, n, spelling: str, room: int | None = None) -> str:
     """The ``one_device`` guards: a leg row (its bound plans the rounds), the bound,
     and divisibility (route (c) moves face tiles).  Refusals name GATE one_device."""
     platform = mesh_platform(mesh_xy)
-    bound = one_device_max_n(op, platform)
+    bound = one_device_max_n(op, platform, room)
     via = "" if spelling == ONE_DEVICE else f" (requested as {spelling!r})"
     if bound is None:
         raise ValueError(
-            f"GATE one_device: {op} backend '{ONE_DEVICE}'{via} has no size row on "
-            f"platform {platform!r} (ONE_DEVICE_MAX_N rows: {sorted(ONE_DEVICE_MAX_N)}); "
-            f"its per-device bound is a measured leg fact.  Use 'off' (native) or "
-            f"'distributed'.")
+            f"GATE one_device: {op} backend '{ONE_DEVICE}'{via} has no bound on "
+            f"platform {platform!r}: no size row (ONE_DEVICE_MAX_N rows: "
+            f"{sorted(ONE_DEVICE_MAX_N)}) and no room for a room leg "
+            f"(ONE_DEVICE_BY_ROOM: {sorted(ONE_DEVICE_BY_ROOM)}); its per-device bound is "
+            f"a measured leg fact or the caller's room.  Use 'off' (native) or 'distributed'.")
     px, py = _mesh_shape(mesh_xy)
     if n is not None and int(n) > bound:
         raise ValueError(
             f"GATE one_device: {op} backend '{ONE_DEVICE}'{via} at n={int(n)} exceeds "
-            f"the {platform} bound {bound} (ONE_DEVICE_MAX_N).  Use 'distributed'.")
+            f"the {platform} bound {bound} (ONE_DEVICE_MAX_N or the room).  Use 'distributed'.")
     if n is not None and (int(n) % px or int(n) % py):
         raise ValueError(
             f"GATE one_device: {op} backend '{ONE_DEVICE}'{via} needs n ({n}) "
@@ -1013,10 +1093,13 @@ def backend_module(backend: str):
     if backend == "slate":
         from distrib_la import _slate
         return _slate
+    if backend == "elpa":
+        from distrib_la import _elpa
+        return _elpa
     if backend == "scalapack":
         from distrib_la import _scalapack
         return _scalapack
     raise ValueError(
         f"no FFI backend module named {backend!r} "
-        f"(known: cusolvermp, slate, scalapack, native2d, one_device; 'native' is "
+        f"(known: cusolvermp, slate, elpa, scalapack, native2d, one_device; 'native' is "
         f"jnp + the caller's own routes and has no module).")

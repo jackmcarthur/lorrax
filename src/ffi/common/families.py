@@ -115,15 +115,16 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "masked); masked and interval stay as the XLA references."),
     "active_gemm": Family(
         ("lorrax_active_gemm_",), "active_gemm",
-        _legs(("elsewhere", "cublas_local (this leg-neutral source builds on CUDA once listed)"),
-              ("built", ""), ("xla", "distrib_la._active_local (interval: ACTIVE_LOCAL_ROUTE)")),
+        _legs(("built", ""), ("built", ""),
+              ("xla", "distrib_la._active_local (interval: ACTIVE_LOCAL_ROUTE)")),
         gate="tests/test_active_local_native_gate.py (device vs masked vs interval vs dense on "
              "the same device, P=1 and P=4)", tol=1e-13,
         note="Sigma's active-range GEMM with DEVICE-side bounds: one run-time-compiled kernel "
              "(hipRTC / NVRTC via rtc_build), K loop clamped per row from the device bounds, "
              "weights applied on load; no host read or sync, no operand copy, no workspace. "
-             "Inner product on the FP64 matrix cores (MFMA f64 16x16x4, complex as the exact 4M "
-             "form) on gfx90a / gfx94x; the FMA path elsewhere (CUDA until a DMMA arm is gated). "
+             "Inner product on the FP64 matrix cores, complex as the exact 4M form: MFMA f64 16x16x4 "
+             "on gfx90a / gfx94x, DMMA m8n8k4 f64 on CUDA compute capability >= 8.0; the FMA "
+             "path elsewhere. "
              "ROCM's ACTIVE_LOCAL_ROUTE row."),
     "active_subspace": Family(
         ("lorrax_active_subspace_",), "active_subspace",
@@ -141,7 +142,7 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "CUDA-only (ROCM: JAX psum; native_collectives refuses by GATE)."),
     "cusolvermp": Family(
         ("lorrax_cusolvermp_",), "cusolvermp",
-        _legs(("built", ""), ("elsewhere", "slate (distrib_la.resolve eigh/ROCM row)"),
+        _legs(("built", ""), ("elsewhere", "elpa (distrib_la.resolve eigh/ROCM row), slate"),
               ("elsewhere", "scalapack, slate")),
         note="NVIDIA-only library; no ROCm equivalent."),
     "slate": Family(
@@ -151,6 +152,21 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
              "sequential LibSci; eigh/potrf gated against the native route at P=4, n=512-8192. "
              "ROCM also builds the LU family (getrf PartialPiv + getrs: distributed solve_lu, "
              "gated against jnp.linalg.solve at P=4); CUDA's LU is cusolvermp, the host's scalapack."),
+    "elpa": Family(
+        ("lorrax_elpa_",), "elpa",
+        _legs(("elsewhere", "cusolvermp"), ("built", ""), ("elsewhere", "scalapack")),
+        gate="tests/test_distrib_la_elpa_gate.py (residual, orthogonality and eigenvalues vs "
+             "jnp.linalg.eigh on the same GCDs, P=4 2x2, float64 + complex128, padded and "
+             "unpadded sides)", tol=1e-12,
+        note="ROCM distributed eigh: ELPA 2026.02.001, the one-stage GPU solver only "
+             "(tridiagonalization, divide-and-conquer and back-transformation on the GPU; the "
+             "two-stage path is not reachable: slower everywhere and non-orthonormal on 4x4 at "
+             "n >= 47104), built by config/frontier/build_elpa_hip.sh into a content-keyed "
+             "prefix with the LORRAX patches (ELPA's device buffers from the FFI workspace; "
+             "rocBLAS/rocSOLVER status accounting and handle registry, so every ELPA rocBLAS "
+             "handle runs on a workspace region and a failed call refuses) and ScaLAPACK hidden "
+             "inside libelpa.  Shares the SLATE family's mesh context.  Measured: "
+             "ELPA_ROCM_REPORT.md."),
     "rocsolver": Family(
         ("lorrax_rocsolver_",), "rocsolver",
         _legs(("xla", "jnp.linalg.eigh (jaxlib cuSOLVER)"), ("built", ""), ("xla", "jnp.linalg.eigh (LAPACK)")),
@@ -159,10 +175,14 @@ FAMILIES: Mapping[str, Family] = MappingProxyType({
         note="ROCM batched local eigh: one rocsolver_{z,d}{heevd,syevd}_strided_batched call per "
              "stack (jaxlib loops zheevd per matrix), a matrix rocSOLVER leaves non-finite with "
              "info = 0 (its silent zheevd failure) is NaN in w and v; distrib_la.local_eigh."
-             "BATCHED_EIGH_ROUTE holds the drivers and stacks.  rocSOLVER is the process's mapped copy."),
+             "BATCHED_EIGH_ROUTE holds the drivers and stacks.  Also the one-device LU solve "
+             "(lorrax_rocsolver_lu_solve / _tri_solve: getrf + triangular solves blocked so no rocBLAS operand "
+             "spans 2^31 bytes; distrib_la.local_lu.LOCAL_LU_ROUTE, gate "
+             "tests/test_rocsolver_lu_gate.py).  rocSOLVER is the process's mapped copy."),
     "scalapack": Family(
         ("lorrax_scalapack_",), "scalapack",
-        _legs(("elsewhere", "cusolvermp"), ("elsewhere", "slate"), ("built", "")),
+        _legs(("elsewhere", "cusolvermp"), ("elsewhere", "elpa (eigh), slate (solve_lu)"),
+              ("built", "")),
         note="Host-only."),
 })
 

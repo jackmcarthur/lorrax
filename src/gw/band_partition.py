@@ -18,10 +18,10 @@ pairs.  All other off-diagonals are zeroed each iteration so the
 non-protected / out-of-range bands never mix into the protected
 subspace's eigenproblem.
 
-Masks follow DFT reference identities at each k.  Only fixed-Sigma EQP2
-builds a non-trivial partition (:func:`build_omega_band_partition`); the SC
-loop keeps every QP-window identity protected (owner rule 2026-09-22), so its
-partition is :meth:`BandPartition.all_protected`.
+Masks follow DFT reference identities at each k.  The SC loop keeps every
+QP-window identity protected (owner rule 2026-09-22), so its partition is
+:meth:`BandPartition.all_protected` (the fixed-Sigma EQP2 partition that masked
+non-protected bands retired with the omega grid).
 
 THE QP MATRIX AND ITS SIGMA READ CLASSES (dynamic SC; owner 2026-09-29: "b3
 will count bands as on main yes, and only bands between b0 and b3 will be
@@ -235,110 +235,6 @@ class BandPartition:
                              in_range_mask=jnp.asarray(in_range))
 
 
-def build_omega_band_partition(
-    e_dft_kn_ry,
-    e_dft_full_kn_ry,
-    *,
-    band_offset: int,
-    omega_min_abs_ev: float,
-    omega_max_abs_ev: float,
-    label: str = "EQP2",
-    print_fn=print,
-) -> BandPartition:
-    """Classify reference identities with an all-k window (fixed-Sigma EQP2).
-
-    Parameters
-    ----------
-    e_dft_kn_ry : (nk, nb_active) real
-        Current energies in Ry, already gathered into DFT identity order.
-    e_dft_full_kn_ry : (nk, nb_full) real
-        Immutable full DFT reference ladder in Ry for local multiplet closure.
-
-    Notes
-    -----
-    A label is protected and in range when its entire k range is inside the
-    requested window. Reference multiplets close locally.
-    """
-    from common.units import RYD_TO_EV
-    from .scissor import classify_bands_in_grid
-
-    e_ev = np.asarray(e_dft_kn_ry, dtype=np.float64) * RYD_TO_EV
-    lo, hi = float(omega_min_abs_ev), float(omega_max_abs_ev)
-    band_in_grid, _ = classify_bands_in_grid(e_ev, lo, hi)
-    in_range = np.broadcast_to(band_in_grid, e_ev.shape).copy()
-    protected = in_range.copy()
-    partition = BandPartition(jnp.asarray(protected), jnp.asarray(in_range))
-    partition = partition.promoted_to_multiplets(
-        e_dft_full_kn_ry, int(band_offset), label=label, print_fn=print_fn)
-    protected = np.asarray(partition.protected_mask)
-    all_k = np.flatnonzero(np.all(protected, axis=0)) + int(band_offset) + 1
-    print_fn(f"  {label} partition: protected at all k bands={all_k.tolist()}; "
-             f"protected {int(protected.sum())}/{protected.size} (k,state)")
-    return partition
-
-
-# ---------------------------------------------------------------------------
-# Per-iteration mask primitive
-# ---------------------------------------------------------------------------
-
-@jax.jit
-def apply_band_partition(
-    H_full: jax.Array,
-    *,
-    protected_mask: jax.Array,
-    in_range_mask: jax.Array,
-    scissor_E_qp_kn: jax.Array,
-) -> jax.Array:
-    """Apply the three-way band partition to a full QSGW Hamiltonian.
-
-    Parameters
-    ----------
-    H_full : (nk, nb_active, nb_active) complex
-        The full QSGW H = ``kin_ion + V_H + Σ_xc`` in the DFT basis,
-        as if every band were protected.
-    protected_mask, in_range_mask : (nk, nb_active) or (nb_active,) bool
-        See :class:`BandPartition`.
-    scissor_E_qp_kn : (nk, nb_active) real
-        Scissor-extrapolated QP energies E_QP = α·E_DFT + β computed by
-        the caller.  Used as the diagonal of ``H_partitioned`` for
-        out-of-range bands; ignored for in-range bands.  Pass zeros if
-        no scissor is in play (in-range ≡ all bands).
-
-    Returns
-    -------
-    H_partitioned : (nk, nb_active, nb_active) complex
-        ``H_full`` with:
-          - off-diagonals zeroed for any (m, n) where m or n is not protected;
-          - diagonals replaced by ``scissor_E_qp_kn`` for non-protected
-            out-of-range bands; otherwise kept from ``H_full``.
-
-    Identity case
-    -------------
-    When all bands are protected and in range
-    (``BandPartition.all_protected``), this returns ``H_full`` unchanged.
-    """
-    nk, nb, _ = H_full.shape
-    eye = jnp.eye(nb, dtype=H_full.dtype)
-
-    # Off-diagonal keep-mask: 1 where both m and n are protected, else 0.
-    p = protected_mask.astype(H_full.dtype)
-    offdiag_keep = p[..., :, None] * p[..., None, :]
-    # Zero the off-diagonal portion outside protected×protected.
-    offdiag_part = H_full * (1.0 - eye) * offdiag_keep
-
-    # The protected class owns its full diagonal even after multiplet
-    # promotion across the grid edge. Only the third class is scissored;
-    # this is the same protected | in_range set used by convergence.
-    diag_full = jnp.diagonal(H_full, axis1=1, axis2=2)            # (nk, nb)
-    diag_kept = jnp.where(
-        (protected_mask | in_range_mask), diag_full,
-        scissor_E_qp_kn.astype(H_full.dtype),
-    )                                                              # (nk, nb)
-
-    # Reassemble: off-diag matrix + diag(diag_kept).
-    return offdiag_part + diag_kept[:, :, None] * eye[None, :, :]
-
-
 __all__ = [
-    "BandPartition", "apply_band_partition", "build_omega_band_partition",
+    "BandPartition",
 ]

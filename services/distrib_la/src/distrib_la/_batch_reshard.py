@@ -43,6 +43,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._result_check import native_eigh
 from jax import shard_map
+from distrib_la.local_lu import solve_local
 from distrib_la.resolve import mesh_key
 
 __all__ = ["batch_layout", "batch_layout_eigh_call", "batch_reshard_call",
@@ -232,7 +233,7 @@ def _dense_real_rows(
             operand = (A1, B1)
 
             def _work(ab):
-                return jnp.linalg.solve(ab[0], ab[1])
+                return solve_local(ab[0], ab[1])
 
             def _skip(ab):
                 return jnp.zeros_like(ab[1])
@@ -546,7 +547,7 @@ def reshard_program(op: str, mesh: Mesh, signature, rcond=None):
 
             X = (_dense_real_rows(
                     op, A, local[1], nbatch=nbatch, py=py)
-                 if batch_pad else jnp.linalg.solve(A, local[1]))
+                 if batch_pad else solve_local(A, local[1]))
             return _batch_to_face(X, px=px, py=py)[:nbatch]
 
         mapped = shard_map(

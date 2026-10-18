@@ -297,12 +297,14 @@ def verify_eqp_file(
 
 
 # ---------------------------------------------------------------------------
-# Numerics: eqp0 / eqp1 from per-state Σ on a global ω-grid
+# Numerics: eqp0 / eqp1 from the on-shell Σ_c diagonal (or, sigma_omega_grid_debug,
+# per-state Σ on the global ω-grid)
 # ---------------------------------------------------------------------------
 
-#: BerkeleyGW's ``finite_difference_spacing`` default, in eV: the Z stencil
-#: reads Sigma at E +/- this.  The SC window hold reads the same value
-#: (``qp_support.read_halfwidth_ev``).
+#: BerkeleyGW's ``finite_difference_spacing`` default, in eV.  The on-shell
+#: derivative is exact; the omega-grid Z stencil (``sigma_omega_grid_debug``)
+#: reads Sigma at E +/- this, and the SC support pad keeps it as a state's
+#: read half-width (``qp_support.read_halfwidth_ev``).
 Z_FINITE_DIFFERENCE_EV = 0.5
 
 
@@ -375,46 +377,45 @@ def compute_z_factor_from_omega_grid(
 		0.0)
 	z_factor = 1.0 / (1.0 - dsigma_dE)
 	return sigma_c_at_dft, z_factor
+#: Rows of the on-shell eqp operand, a ``(4, nk, nb)`` complex array (its
+#: on-disk form, ``file_io.sigma_output.EQP_ASSEMBLY_C_ONSHELL_DATASET``):
+#: Sigma_c(E_DFT) in eV (eqp0's centre), Sigma_c(E_eval) in eV (eqp1's, equal
+#: to the first one-shot), dSigma_c/domega at E_eval (dimensionless, the
+#: exact derivative of the sweep's quadrature) and 1 where E_eval lies on the
+#: sampled range, 0 elsewhere (Z = 1 there, as the grid's clamped probes gave).
+ON_SHELL_AT_DFT, ON_SHELL_AT_EVAL, ON_SHELL_DSIGMA, ON_SHELL_COVERED = range(4)
 
 
-@dataclass(frozen=True)
-class OnShellDiagonal:
-	"""The on-shell Sigma_c band diagonal the eqp assembly reads, (nk, nb) each.
+def on_shell_z_factor(operand, *, print_fn=None, what="eqp1") -> np.ndarray:
+	"""``Z = 1 / (1 - Re dSigma_c/domega)`` at E_eval, 1 off the sampled range.
 
-	The on-shell evaluation (``gw.ppm_sigma.OnShellSigma``) has no omega
-	axis to interpolate or difference: it carries Sigma_c at the two centres
-	the assembly reads and the EXACT derivative of the same quadrature at the
-	linearization centre.  ``at_dft_ev`` is Sigma_c(E_DFT) (eqp0's centre),
-	``at_eval_ev`` Sigma_c(E_eval) (eqp1's, equal to ``at_dft_ev`` one-shot),
-	``dsigma_at_eval`` dSigma_c/domega there (dimensionless) and
-	``covered_kn`` where E_eval lies on the sampled range: outside it Z = 1,
-	as the grid's two clamped probes gave.  All eV, complex, except the mask.
+	``operand`` is the on-shell eqp operand (:data:`ON_SHELL_AT_DFT` ...).
+	The exact derivative sees the eta-scale pole structure a +/-0.5 eV
+	stencil smoothed, so Re dSigma/domega >= 1 gives Z <= 0 or +/-inf: the
+	states with Z outside (0, 1] are counted on one line, and a non-finite Z
+	is refused (``GATE z_factor_finite``) before it reaches eqp1 or the next
+	SC map's tail weights.
 	"""
-	at_dft_ev: np.ndarray
-	at_eval_ev: np.ndarray
-	dsigma_at_eval: np.ndarray
-	covered_kn: np.ndarray
-
-	def z_factor(self) -> np.ndarray:
-		"""``1 / (1 - dRe Sigma_c/domega)`` at E_eval, 1 off the sampled range."""
-		d = np.real(np.asarray(self.dsigma_at_eval))
-		return np.where(np.asarray(self.covered_kn, dtype=bool),
-		                1.0 / (1.0 - d), 1.0)
-
-	def map_rows(self, fn) -> "OnShellDiagonal":
-		"""Apply one (nk, nb) -> (nk', nb') host reduction to every member."""
-		return OnShellDiagonal(
-			at_dft_ev=np.asarray(fn(np.asarray(self.at_dft_ev))),
-			at_eval_ev=np.asarray(fn(np.asarray(self.at_eval_ev))),
-			dsigma_at_eval=np.asarray(fn(np.asarray(self.dsigma_at_eval))),
-			covered_kn=np.asarray(fn(np.asarray(self.covered_kn, dtype=bool)), dtype=bool))
-
-	def select_k(self, select_rows) -> "OnShellDiagonal":
-		return self.map_rows(lambda a: np.asarray(select_rows(a)))
-
-	@property
-	def shape(self):
-		return tuple(np.shape(self.at_dft_ev))
+	op = np.asarray(operand)
+	d = np.real(op[ON_SHELL_DSIGMA])
+	with np.errstate(divide="ignore", invalid="ignore"):
+		z = np.where(np.real(op[ON_SHELL_COVERED]) != 0.0, 1.0 / (1.0 - d), 1.0)
+	finite = np.isfinite(z)
+	n_outside = int(np.count_nonzero(finite & ((z <= 0.0) | (z > 1.0))))
+	n_bad = int(z.size - np.count_nonzero(finite))
+	if (n_outside or n_bad) and print_fn is not None:
+		zf = z[finite]
+		print_fn(f"  Z factor ({what}): {n_outside} of {z.size} states outside (0, 1], "
+		         f"{n_bad} non-finite"
+		         + (f"; Z in [{float(zf.min()):.4f}, {float(zf.max()):.4f}]" if zf.size else ""))
+	if n_bad:
+		k, n = np.argwhere(~finite)[0]
+		raise ValueError(
+			f"GATE z_factor_finite ({what}): {n_bad} state(s) have a non-finite "
+			f"Z = 1/(1 - Re dSigma/domega), first at k={int(k)}, band {int(n)} "
+			f"(Re dSigma/domega = {float(d[k, n])!r}): Sigma_c has a pole at that "
+			"state's evaluation energy.")
+	return z
 
 
 def _implied_vxc_window_ev() -> tuple[float, float]:
@@ -506,8 +507,8 @@ def compute_eqp_diag(
 	spectrum a one-shot run has, and this function does the same whenever
 	``e_eval_ev is None`` — bit-for-bit the historical expression.  Under
 	self-consistency the spectrum Σ was built from is the converged QP
-	one, so E_DFT is the wrong place to linearize: the central difference
-	then samples Σ(ω) eV away from the pole it is meant to characterise
+	one, so E_DFT is the wrong place to linearize: the derivative is then
+	taken eV away from the pole it is meant to characterise
 	(2.4 eV at Γ on the sodium 8×8×8 deck), and the residual Δ it
 	multiplies is not small.  Passing the evaluation energies makes the
 	step consistent — at convergence Δ(E_qp) ≈ 0 and eqp1 reproduces the
@@ -517,12 +518,13 @@ def compute_eqp_diag(
 	that pairs with the ``E_DFT`` column of the file, in every mode.
 
 	For static modes (COHSEX) the on-shell Σ_c is just the static value and
-	there is no ω-grid to differentiate, so callers pass ``z_factor=None``
+	there is no derivative, so callers pass ``z_factor=None``
 	and ``eqp1 == eqp0`` trivially — matching BGW's behavior in static runs.
 
 	For dynamic modes (GN-PPM, HL-PPM, MPA) the caller obtains
 	``sigma_c_at_dft_diag_ev``, ``sigma_c_at_eval_diag_ev`` and
-	``z_factor`` from :func:`compute_z_factor_from_omega_grid`.
+	``z_factor`` from the on-shell operand (:func:`on_shell_z_factor`) or, on the
+	omega grid, :func:`compute_z_factor_from_omega_grid`.
 	eqp1 is the raw BerkeleyGW column: a Z outside (0, 1] is not replaced.
 	No QP equation is solved: eqp0 reads Σ at the energies it was
 	evaluated at, and eqp1 is the one linearized step.
@@ -598,10 +600,9 @@ class EqpAssembly:
 	implied_vxc_ev: np.ndarray | None
 	hartree_transverse_diag_ev: np.ndarray | None = None
 	nspin: int = 1
-	#: The on-shell operand (:class:`OnShellDiagonal`) that produced
-	#: ``sigma_c_at_dft_diag_ev`` and ``z_factor``, when the run had no omega
-	#: curve; ``sigma_c_omega_diag_ev`` is then None.
-	sigma_c_on_shell: "OnShellDiagonal | None" = None
+	#: The on-shell operand (:data:`ON_SHELL_AT_DFT` ...) that produced
+	#: ``sigma_c_at_dft_diag_ev`` and ``z_factor`` (dynamic modes).
+	sigma_c_on_shell: np.ndarray | None = None
 	#: Where eqp1 was linearized, when that was not E_DFT (self-consistent
 	#: runs).  None on every one-shot path, where it IS E_DFT.
 	e_eval_ev: np.ndarray | None = None
@@ -625,9 +626,8 @@ def assemble_eqp(
 	kin_ion_diag_ev: np.ndarray,                           # (nk, nb)
 	hartree_diag_ev: np.ndarray,                           # (nk, nb) pre-seam
 	sigma_x_diag_ev: np.ndarray,                           # (nk, nb)
-	sigma_c_at_dft_diag_ev: np.ndarray | None = None,      # (nk, nb)
-	# Optional: full ω-grid for the Z-factor (PPM modes only).
-	# If None ⇒ Z=1 ⇒ eqp1 == eqp0 (BGW behaviour in static modes).
+	sigma_c_at_dft_diag_ev: np.ndarray | None = None,      # (nk, nb), static modes
+	# Optional: full ω-grid for the Z-factor (sigma_omega_grid_debug).
 	sigma_c_omega_diag_ev: np.ndarray | None = None,       # (n_omega, nk, nb)
 	omega_rel_ev: np.ndarray | None = None,                # (n_omega,)
 	e_dft_rel_ev: np.ndarray | None = None,                # (nk, nb)
@@ -635,9 +635,9 @@ def assemble_eqp(
 	# ω-relative eV of the SAME energies; both or neither.
 	e_eval_ev: np.ndarray | None = None,                   # (nk, nb)
 	e_eval_rel_ev: np.ndarray | None = None,               # (nk, nb)
-	# The on-shell operand (no omega curve): Sigma_c(E_DFT), Sigma_c(E_eval)
-	# and the exact dSigma_c/domega at E_eval.  Exclusive with the curve.
-	sigma_c_on_shell: "OnShellDiagonal | None" = None,
+	# The on-shell operand (dynamic modes): Sigma_c(E_DFT), Sigma_c(E_eval)
+	# and the exact dSigma_c/domega at E_eval.  Exclusive with the above.
+	sigma_c_on_shell: np.ndarray | None = None,           # (4, nk, nb)
 	dE_ev: float = Z_FINITE_DIFFERENCE_EV,
 	nspin: int = 1,
 	hartree_scalar_diag_ev: np.ndarray | None = None,
@@ -653,25 +653,24 @@ def assemble_eqp(
 	2. the mean-field gate on H₀
 	   (``gw.gw_output._warn_on_unphysical_h0`` — the live-field
 	   implied-V_xc check; warn-only, never raises);
-	3. for a dynamic run, derive both Σ_c(E_DFT) and Z from the SAME
-	   output-conditioned diagonal C(omega) curve; for a static run, consume
-	   the supplied Σ_c diagonal.  When the
-	   caller says the Σ spectrum was evaluated somewhere else
-	   (``e_eval_ev``), a SECOND interpolation and central-difference
-	   Z there, which is where eqp1 is linearized
-	   (:func:`compute_z_factor_from_omega_grid`, and
-	   :func:`compute_eqp_diag` for why);
+	3. for a dynamic run, read Σ_c(E_DFT) and Z from the on-shell operand
+	   (:func:`on_shell_z_factor`); for a static run, consume the supplied
+	   Σ_c diagonal.  When the caller says the Σ spectrum was evaluated
+	   somewhere else (``e_eval_ev``), Σ_c(E_eval) beside it, which is where
+	   eqp1 is linearized (:func:`compute_eqp_diag` for why);
+	   on the omega grid (``sigma_omega_grid_debug``), both Σ_c(E_DFT) and Z
+	   from the SAME output-conditioned diagonal C(omega) curve, a second
+	   interpolation and central-difference Z at E_eval
+	   (:func:`compute_z_factor_from_omega_grid`);
 	4. the Newton update (:func:`compute_eqp_diag`), eqp1 raw as BGW's.
 	   No QP equation is solved.
 
 	**The evaluation point, and the one-omega-reference rule.**
 	``e_eval_ev`` / ``e_eval_rel_ev`` are the same energies in absolute
 	and ω-relative eV, and the caller forms the relative one with the SAME
-	reference it formed ``e_dft_rel_ev`` with — the reference the Σ(ω)
-	grid was built with, never a second opinion about it.  Passing them
-	equal to the DFT arrays is not merely allowed but the one-shot case,
-	and the code then takes the single-interpolation path and reproduces
-	the historical numbers bit-for-bit.
+	reference it formed ``e_dft_rel_ev`` with — the reference the Σ body
+	was built with, never a second opinion about it.  Passing them equal to
+	the DFT arrays is the one-shot case, which then linearizes at E_DFT.
 
 	The gate lives HERE rather than in ``compute_eqp_diag`` (which must
 	stay a silent pure function — pinned by
@@ -725,18 +724,18 @@ def assemble_eqp(
 			"neither")
 	sigma_c_at_eval = None
 	if sigma_c_on_shell is not None:
-		# THE ON-SHELL OPERAND: the same two centres and derivative the curve
-		# branch below forms, read where the Sigma sweep evaluated them.
+		# THE ON-SHELL OPERAND: the two centres and the exact derivative, read
+		# where the Sigma sweep evaluated them.
 		if sigma_c_omega_diag_ev is not None or sigma_c_at_dft_diag_ev is not None:
 			raise ValueError(
 				"assemble_eqp: the on-shell operand is the one correlation "
 				"producer; a C(omega) curve or a second C(E_DFT) would duplicate it.")
-		sigma_c_at_dft = np.asarray(sigma_c_on_shell.at_dft_ev, dtype=np.complex128)
-		z_factor = sigma_c_on_shell.z_factor()
+		sigma_c_at_dft = np.asarray(sigma_c_on_shell[ON_SHELL_AT_DFT], dtype=np.complex128)
+		z_factor = on_shell_z_factor(sigma_c_on_shell, print_fn=print_fn)
 		if e_eval_rel_ev is not None and e_dft_rel_ev is not None and not np.array_equal(
 				np.asarray(e_eval_rel_ev, dtype=np.float64),
 				np.asarray(e_dft_rel_ev, dtype=np.float64)):
-			sigma_c_at_eval = np.asarray(sigma_c_on_shell.at_eval_ev, dtype=np.complex128)
+			sigma_c_at_eval = np.asarray(sigma_c_on_shell[ON_SHELL_AT_EVAL], dtype=np.complex128)
 			print_fn(
 				"  eqp1 linearization: Σ was evaluated away from E_DFT this "
 				f"call (max |E_eval − E_DFT| = "
@@ -750,8 +749,8 @@ def assemble_eqp(
 		if sigma_c_at_dft_diag_ev is None:
 			raise ValueError(
 				"assemble_eqp needs either sigma_c_at_dft_diag_ev (static "
-				"modes) or sigma_c_omega_diag_ev + omega_rel_ev + "
-				"e_dft_rel_ev (dynamic modes)")
+				"modes), the on-shell operand sigma_c_on_shell (dynamic modes) or "
+				"sigma_c_omega_diag_ev + omega_rel_ev + e_dft_rel_ev (omega grid)")
 		z_factor = None
 		sigma_c_at_dft = sigma_c_at_dft_diag_ev
 		# No derivative to centre; eqp1 == eqp0 whatever was passed.
@@ -1089,8 +1088,8 @@ def make_eqp_bgw(
 	print(f"  omega reference = {efermi_ev:.6f} eV ({stamped_provenance})")
 	e_dft_rel_ev = e_dft_ev - efermi_ev
 	# THE LIVE WRITER'S OWN E_DFT − E_F, when the receipt stamps its
-	# evaluation energies at E_DFT.  The conditioned C(omega) curve was
-	# interpolated at exactly those numbers; the WFN energies re-derived
+	# evaluation energies at E_DFT.  The on-shell operand was evaluated at
+	# exactly those numbers; the WFN energies re-derived
 	# above reach them by a different float path (measured <= 3.3e-13 eV,
 	# 113/270 cells, on tests/regression/bispinor_debug), which moves the
 	# re-derived C(E_DFT) by 2e-14 eV and fails the EXACT persisted-C check
@@ -1236,10 +1235,7 @@ def make_eqp_bgw(
 		hartree_diag_ev=np.real(hartree_diag),
 		sigma_x_diag_ev=np.real(sigma_x_diag),
 		sigma_c_omega_diag_ev=sigma_c_omega_diag,
-		sigma_c_on_shell=(None if _on_shell_rows is None else OnShellDiagonal(
-			at_dft_ev=_on_shell_rows[0], at_eval_ev=_on_shell_rows[1],
-			dsigma_at_eval=_on_shell_rows[2],
-			covered_kn=np.real(_on_shell_rows[3]) != 0.0)),
+		sigma_c_on_shell=_on_shell_rows,
 		omega_rel_ev=omega_rel_ev,
 		e_dft_rel_ev=e_dft_rel_ev,
 		e_eval_ev=e_eval_ev,
@@ -1255,8 +1251,8 @@ def make_eqp_bgw(
 				np.asarray(receipt_c_at_dft))):
 		raise ValueError(
 			f"{os.path.basename(sigma_mnk_path)}'s persisted C(E_DFT) does not "
-			"equal the shared assembler's value re-derived from the persisted "
-			"conditioned C(omega) curve.")
+			"equal the shared assembler's value read from the persisted "
+			"on-shell operand (or re-derived from the conditioned C(omega) curve).")
 	return assembly.write(eqp0_path=eqp0_path, eqp1_path=eqp1_path)
 
 

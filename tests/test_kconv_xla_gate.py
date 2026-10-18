@@ -29,6 +29,12 @@ complex64, the router's decision on each grid (a grid that silently took XLA fai
 named refusals past the bound.  One GCD or a 2x2 mesh:
 ``prun.sh <lane> <name> 1|4 <wt> -- python3 tests/test_kconv_xla_gate.py``.
 
+CUDA also runs :func:`arm_cases`: one grid per arm the mathdx handler keeps (``ARM_CASES``,
+``docs/architecture/kconv.md#arms``), each against the XLA reference, with the arm the build log
+line names (``[kconv_mathdx] ... arm=<name>``, rank 0) asserted on an A100 (opt-in ``ARM_OPTIN``);
+mode 11 there also runs ``acc=None`` and the q-row store ``rows=`` (against the XLA call on zeros,
+its flat-k forward transform and the row gather), and an out-of-range ``rows=`` must refuse.
+
 The router's fallback (``ffi.fft.mathdx_refusal``) is gated too.  CUDA: with
 ``KCONV_AXIS_MAX`` forced to 1, every factory takes the XLA backend and must
 match mathdx on the same grid.  cpu: with the mesh reported as CUDA, a k axis of
@@ -49,6 +55,20 @@ KDFT_GRIDS = ((16, 16, 16), (20, 20, 20), (97, 97, 1), (16, 16, 30), (128, 64, 1
 KDFT_GRIDS_C64 = ((16, 16, 16), (97, 97, 1), (20, 20, 20))
 #: Past the bound: the router keeps these on XLA and names the gate.
 KDFT_REFUSED = (((128, 81, 1), "GATE kdft-nk"), ((129, 1, 1), "GATE kdft-axis"))
+#: The CUDA arm list (kconv.md#arms): (mode, k-grid, n_s, the arm the build log names on an A100).
+#: "chain" is mode 7's stage / transform3 / store chain, reached through the legacy
+#: ``lorrax_mathdx_kconv_klead_unfold_block`` target at an output spin block d < n_s.  Mode 9:
+#: single below N_k = 128 (4^3), w2 from it (6^3, the bottom of its range, and 8^3).
+ARM_OPTIN = 166912
+ARM_CASES = (
+    (7, (6, 6, 6), 2, "m7f"), (7, (6, 6, 6), 1, "m7f"), (7, (4, 4, 4), 4, "tt"), (7, (6, 6, 6), 2, "chain"),
+    (7, (14, 14, 14), 2, "m7s"), (7, (14, 14, 14), 1, "arm2"), (7, (9, 9, 9), 4, "arm2"),
+    (7, (22, 22, 22), 1, "arm1"),
+    (9, (4, 4, 4), 1, "single"), (9, (6, 6, 6), 1, "w2"), (9, (8, 8, 8), 1, "w2"),
+    (9, (14, 14, 14), 1, "split"),
+    (11, (8, 8, 8), 2, "m11f"), (11, (8, 8, 8), 2, "m11q"), (11, (4, 4, 4), 1, "single"),
+    (11, (4, 4, 4), 4, "tt"), (11, (11, 11, 11), 2, "split"),
+)
 
 
 def _rel(a, b):
@@ -267,6 +287,147 @@ def run_cases(mesh, kg=(3, 2, 2), arm=None, skip=()):
     return out
 
 
+@contextlib.contextmanager
+def _stderr_into(lines):
+    """fd 2 into ``lines`` inside the block (the C++ build log is unbuffered fprintf)."""
+    import tempfile
+    sys.stderr.flush()
+    saved = os.dup(2)
+    with tempfile.TemporaryFile() as tf:
+        os.dup2(tf.fileno(), 2)
+        try:
+            yield
+        finally:
+            sys.stderr.flush()
+            os.dup2(saved, 2)
+            os.close(saved)
+            tf.seek(0)
+            lines.extend(tf.read().decode(errors="replace").splitlines())
+
+
+def _logged_arms(lines, mode, kg, ns):
+    """The ``arm=`` names of the build log lines of (mode, k-grid, n_s)."""
+    import re
+    pat = re.compile(r"\[kconv_mathdx\] .* mode=(\d+) kgrid=\((\d+),(\d+),(\d+)\) ns=(\d+) variant=(\d+) arm=(\S+)")
+    want = (mode, *kg, ns)
+    return [m.group(7) for m in map(pat.search, lines)
+            if m and tuple(int(m.group(i)) for i in range(1, 6)) == want]
+
+
+def arm_cases(mesh):
+    """One case per mathdx arm (``ARM_CASES``): ``({name: rel_error}, [failures])``.  The arm
+    named by the build log is checked on process 0 when the device's opt-in memory is the A100's."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from ffi import fft as F
+    from symmetry_maps import local_unfold_load_tables
+
+    rng = np.random.default_rng(20261017)
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    m, n_parent, mult = 6, 5, 0.7
+    mu = m * px
+    check_arm = jax.process_index() == 0 and F._optin_smem_bytes() == ARM_OPTIN
+    out, wrong = {}, []
+
+    def put(a, spec):
+        from lxkit import device_put_process_local
+        return device_put_process_local(np.asarray(a), NamedSharding(mesh, spec))
+
+    def rnd(*shape):
+        return rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+
+    def both(build, call):
+        a = _gather(jax.block_until_ready(call(build())))
+        with F.xla_reference():
+            fn = build()
+        return a, _gather(jax.block_until_ready(call(fn)))
+
+    g_spec, w_spec, u_spec = P(None, "x", None, "y", None), P(None, "x", "y"), P(None, None, "x", None, "y")
+    for mode, kg, ns, arm in ARM_CASES:
+        nk = int(np.prod(kg))
+        name = f"arm {arm} mode{mode} {'x'.join(map(str, kg))} ns{ns}"
+        lines = []
+        with _stderr_into(lines):
+            if mode == 7:
+                tg = _tables(rng, nk, n_parent, m, m, ns, ns, ns, (px, py))
+                G = put(rnd(n_parent, mu, ns, mu, ns), g_spec)
+                Gt = put(rnd(n_parent, mu, ns, mu, ns), g_spec)
+                Wk = put(rnd(nk, mu, mu), w_spec)
+                rows = [0, 3, 7, 11]
+
+                def build(tg=tg, kg=kg, rows=rows):
+                    return (F.make_kconv_klead_unfold(mesh, kg, tg, store_rows=rows, norm="ortho", mult=mult),
+                            F.make_kconv_klead(mesh, kg, P(None, None, None, None, "x", None, "y"),
+                                               P(None, None, None, "x", "y"), norm="ortho", mult=mult))
+                a, b = both(build, lambda fs: fs[0](G, Gt, fs[1].prep(Wk)))
+                if arm == "chain":            # d = 1 of n_s = 2 through the legacy _block target
+                    _, kout = F._store_row_map(rows, nk, "gate")
+                    scale = F.ffi_fft_scale("ifftn", "ortho", nk) * F.ffi_fft_scale("fftn", "ortho", nk) * mult
+                    fs = build()
+                    wp = fs[1].prep(Wk)
+
+                    def local(g, gt, v, tg=tg, kg=kg, kout=kout, scale=scale):
+                        t = local_unfold_load_tables(tg)
+                        n_par, mx, _, my, _ = (int(s) for s in g.shape)
+                        flat = lambda x: x.reshape(n_par, mx * ns, my * ns)
+                        o = jax.ShapeDtypeStruct((len(rows), 1, mx, 1, my), g.dtype)
+                        return jax.ffi.ffi_call("lorrax_mathdx_kconv_klead_unfold_block", o)(
+                            flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                            jnp.asarray(kout), v, nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                            scale=np.float64(scale), conj_src=np.int64(0), spin_block=np.int64(1),
+                            a0=np.int64(1), b0=np.int64(0), **F._mathdx_common())
+                    blk = _gather(jax.block_until_ready(
+                        F._sharded(local, mesh, (g_spec, g_spec, w_spec), u_spec)(G, Gt, wp)))
+                    a, b = np.asarray(blk), np.asarray(a)[:, 1:2, :, 0:1, :]   # against m7f's full group
+            elif mode == 9:
+                tw = _tables(rng, nk, n_parent, m, m, 1, 1, 1, (px, py))._replace(
+                    spin=np.ones((nk, 1, 1), np.complex128))
+                Wp, Wt = put(rnd(n_parent, mu, mu), w_spec), put(rnd(n_parent, mu, mu), w_spec)
+                a, b = both(lambda tw=tw, kg=kg: F.make_kfft_klead_unfold(mesh, kg, tw, norm="ortho"),
+                            lambda f: f(Wp, Wt))
+            else:
+                tg = _tables(rng, nk, n_parent, m, m, ns, ns, ns, (px, py))
+                Gv, Gvt, Gc, Gct = (put(rnd(n_parent, mu, ns, mu, ns), g_spec) for _ in range(4))
+                n_out = 1 if arm == "m11q" else 2
+                alpha = put(rnd(n_out), P())
+                acc0 = rnd(n_out, nk, mu, mu)
+                build = lambda tg=tg, kg=kg, n_out=n_out: F.make_kconv_chi_unfold(
+                    mesh, kg, tg, n_out=n_out, complete=True, norm="ortho")
+                if arm != "m11q":
+                    a, b = both(build, lambda f: f(put(acc0, P(None, None, "x", "y")), Gv, Gc, alpha, Gvt, Gct))
+                    out[name + " acc=None"] = _rel(*both(build, lambda f: f(None, Gv, Gc, alpha, Gvt, Gct)))
+                else:
+                    q = [0, 5, 17, nk - 1]
+                    fn = build()
+                    if not fn.q_store:
+                        wrong.append(f"{name}: fn.q_store is False")
+                        continue
+                    a = np.asarray(_gather(jax.block_until_ready(fn(None, Gv, Gc, alpha, Gvt, Gct, rows=q))))
+                    with F.xla_reference():
+                        fx = build()
+                        fft = F.make_kfft_klead(mesh, kg, P(None, None, None, "x", "y"), kind="fftn", norm="ortho")
+                    z = fx(put(np.zeros((1, nk, mu, mu), np.complex128), P(None, None, "x", "y")), Gv, Gc, alpha, Gvt, Gct)
+                    b = np.take(np.asarray(_gather(jax.block_until_ready(fft(z[0])))), q, axis=0)[None]
+                    try:
+                        fn(None, Gv, Gc, alpha, Gvt, Gct, rows=[nk])
+                        wrong.append(f"{name}: rows=[{nk}] did not refuse")
+                    except ValueError:
+                        pass
+        out[name] = _rel(a, b)
+        if check_arm:
+            got = _logged_arms(lines, mode, kg, ns)
+            if arm not in got:
+                wrong.append(f"{name}: the build log names {got or 'no build'} (an image built earlier "
+                             f"in this process logs nothing)")
+    from jax.experimental import multihost_utils
+    n_wrong = int(np.max(multihost_utils.process_allgather(np.int32(len(wrong)))))
+    if n_wrong and not wrong:
+        wrong.append("arm checks failed on process 0")
+    return out, wrong
+
+
 def kdft_cases(mesh, grids=KDFT_GRIDS, grids_c64=KDFT_GRIDS_C64):
     """The ROCm kdft routes on large and split-arm grids: ``({name: (rel_error, tol)}, [decision
     failures])``.  Each factory is built by default (kdft) and inside ``ffi.fft.xla_reference()``
@@ -388,6 +549,10 @@ def main() -> int:
     out = run_cases(mesh)
     extra, wrong = _fallback_cases(mesh, backend)
     out.update(extra)
+    if backend == "mathdx":
+        extra, wrong_arm = arm_cases(mesh)
+        out.update(extra)
+        wrong += wrong_arm
     bad = {k: v for k, v in out.items() if not v <= TOL}
     if jax.process_index() == 0:
         for k, v in out.items():

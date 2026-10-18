@@ -82,7 +82,7 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, c
     try:
         header = validate_shared_pole_bank(
             bank_path, expected_identity=identity, mesh_xy=None,
-            require_complete=True, expected_recipe=recipe)
+            require_complete=True, expected_recipe=recipe, collective=False)
     except (KeyError, OSError, TypeError, ValueError):
         return False
     return ('photon_layout' in header) == photon

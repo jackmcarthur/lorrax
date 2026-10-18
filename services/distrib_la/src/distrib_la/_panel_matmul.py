@@ -155,12 +155,18 @@ def _panel_contraction(mesh, active=True):
             return _native(left, right, bounds, c, alpha=one, beta=one)
     elif active_local_route(platform) == "device":
         from ._active_local_device import device_call, require_active_local_device
-        if active:
-            require_active_local_device(platform)
+        require_active_local_device(platform)
 
         def contract(left, right, bounds, c):
             if bounds is None:
-                return c + left @ right                       # every column: XLA folds one GEMM
+                # Every column into ``c``, accumulated IN PLACE (``c`` aliased to the result,
+                # beta = 1), as the native route's prepared target does.  Not ``c + left @
+                # right``: inside the panel scan XLA keeps that add beside the running sum,
+                # one more output tile per rank (A100 Fe V2 P=4: spole moments 1.07 vs 1.05
+                # GB on the native/library route).  Full-interval bounds, a host constant.
+                every = np.broadcast_to(np.array([0, left.shape[2]], np.int32),
+                                        (left.shape[0], 2))
+                return device_call(left, right, jnp.asarray(every), None, c, alpha=one, beta=one)
             if c is None:
                 return device_call(left, right, bounds, None, None, alpha=one, beta=0)
             return device_call(left, right, bounds, None, c, alpha=one, beta=one)

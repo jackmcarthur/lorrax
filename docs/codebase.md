@@ -39,7 +39,7 @@ else.
 | `file_io` | L1 readers and writers; L3 transport | SlabIO (the sharded HDF5 transport) and every format: the restart bundle, Σ outputs, model stores, `dipole.h5`, `kin_ion.h5`, WFN | library | `gw`, `bse`, `psp`, `bandstructure`, `centroid` |
 | `common` | mixed: L1 physics helpers, L2 `rank_criterion`, `spectral_closure`, `pivoted_cholesky`, L3 collectives and glue | shared helpers: collectives, sharding and FFT glue, timing, units, WFN transforms, parallel-transport kernels | library | every package |
 | `solvers` | L2 | iterative eigensolvers and spectral methods with no physics: Davidson, Lanczos, KPM, contour quadrature, pseudobands, Sternheimer CG | library | `bse`, `psp` |
-| `mixing` | L2 | fixed-point acceleration: Anderson, rCROP | library | `gw.sc_iteration` (the SC loop and eqp2) |
+| `mixing` | L2 | fixed-point acceleration: Anderson | library | `gw.sc_iteration` (the SC loop) |
 | `runtime` | L3, except two modules (below the table) | process bootstrap, the driver session and report stream, padding receipts, compiled-memory checks, environment grammar, source closure, the fixed streaming tile | library; every driver calls `runtime.initialize_communicator_stack()` first | every driver |
 | `ffi` | L3 | the bridge to native libraries: loading and attestation, capability gates, FFT and k-convolution router, GEMM, parallel HDF5, the contour accumulator; the C++ sources | library; `ffi/cpp/stage/seal_bundle.py` seals a native bundle | `gw`, `bse`, `common`, `file_io`, `psp`, `bandstructure` |
 
@@ -241,7 +241,7 @@ else.
 | `read_bgw_vcoul.py` | Compatibility shim over the `vcoul` service's parser of BerkeleyGW's `vcoul` file. |
 | `restart_bundle.py` | Reads the GW restart bundle. |
 | `shared_pole_store.py` | Shared real-pole model and construction-scratch I/O. |
-| `sigma_checkpoint.py` | The swept Σ(ω) state kept between the τ sweep and finalize (`tmp/sigma_checkpoint_oneshot.h5`); `sigma_omega_grid_debug` only. |
+| `sigma_checkpoint.py` | The sweep-checkpoint schema (`tmp/sigma_checkpoint_oneshot.h5`); written only by the one-shot ω-grid debug sweep (`sigma_omega_grid_debug = true`; an on-shell checkpoint is a follow-up). |
 | `sigma_output.py` | Writes self-energy and quasiparticle outputs. |
 | `slab_io.py` | Exposes sharded slab reads and writes. |
 | `static_gauge_head.py` | Reads and writes static-gauge head data. |
@@ -382,7 +382,7 @@ modules meet at one contract, ΔΣ = `apply(params, rho, t)`.
 
 | Module | Role |
 |---|---|
-| `mixing/acceleration.py` | Anderson (the SC loop) and rCROP (eqp2) acceleration. |
+| `mixing/acceleration.py` | Anderson acceleration (the SC loop). |
 | `postprocess/rotate_wfn_to_qp.py` | `WFN.h5` + `qp_wfn_rotations.h5` → `WFN_qp.h5`, on the WFN's own k wedge. |
 
 ## `src/runtime`

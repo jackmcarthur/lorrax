@@ -5,6 +5,222 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-18 — Sigma(omega) grid debug restored
+
+The ω-grid Σ_c(ω) path is back as an opt-in debug path,
+`sigma_omega_grid_debug = true` (default false; [On-shell Σ_c §grid
+debug](docs/theory/sigma-on-shell.md#grid-debug)). With the key set, every
+output is the one `c2975e450` wrote with the same key. That covers the
+`(n_ω, nk, nb, nb)` cube and `omega_ev` in `sigma_mnk.h5`, eqp0/eqp1 from the
+interpolated Σ_c and the stencil Z, the C(ω) eqp receipt (and
+`python -m gw.eqp_bgw --finite-difference-spacing`), `sigma_freq_debug.dat`,
+the SC `sigC`/`sigXC` columns, and the one-shot sweep checkpoint
+(`tmp/sigma_checkpoint_oneshot.h5`, written and read on restart).
+`qp_omega0_ev` (`write_qsgw_datasets`) is back as `c2975e450` had it: written
+for an unsharded cube only. Under `sigma_omega_layout = sharded` it is
+omitted by name, as before; that held on every validation leg (4 ranks and
+1), so it was not compared bitwise.
+
+- **Default path unchanged.** With the key unset, results are bitwise those
+  of `663c27863` (the on-shell entry below). Measured on Fe 8^3 (MPA shared
+  pole, 4 A100 ranks, SC map and one-shot): the eqp0/eqp1/sigma_diag bodies,
+  every `sigma_mnk.h5` dataset and attribute, the Response-quadrature lines
+  and the per-rank device peak.
+- **Grid outputs as before.** With the key, on the same deck, the same files
+  plus the cube, `omega_ev`, `sigma_freq_debug.dat`, the C(ω) receipt and the
+  sweep checkpoint (written, and read on restart) are bitwise those of
+  `c2975e450`.
+- **Cost under the key.** On that deck (n_ω = 271) `sigma_mnk.h5` grows
+  from 7.9 MiB to 714 MiB and the τ sweep from 105.3 s to 122.3 s; the
+  per-rank device peak does not move (the W response sets it). A one-shot
+  run also writes a 2.99 GiB sweep checkpoint.
+- **eqp2 stays retired.** `write_eqp2`, `eqp2_tol_ev`, `eqp2_max_iter`,
+  `eqp2_accelerator`, `eqp2_history_depth` and `eqp2_file` still refuse by
+  name at parse time, now as `GATE eqp2_retired`; `sigma_omega_grid_debug`
+  no longer refuses. `eqp2.dat` is not written.
+- **Not restored:** the `omega_ev`/`sigc_omega_ev_{re,im}` curve of
+  `python -m gw.plane_wave_pipeline --deck` (it stays on shell).
+- **API:** `DebugConfig.sigma_omega_grid_debug` is back;
+  `DeviceOmegaAccumulator.grid(...)` builds the grid accumulator.
+  `LorraxConfig.eqp2`, `EQP2Config` and `FilePaths.eqp2_file` stay removed.
+- **What you must change:** nothing for default decks. A deck that dropped
+  `sigma_omega_grid_debug = true` because of the retirement may set it again.
+
+## 2026-10-17 — ROCm: ELPA is the distributed eigensolver
+
+On Frontier (ROCm), `eigh` with `linalg = "distributed"` above the one-device
+bound (`ONE_DEVICE_MAX_N`, unchanged) now runs ELPA 2026.02.001's one-stage GPU
+solver (`backend elpa`), in place of SLATE's `heev`. SLATE stays selectable
+(`backend = "slate"`) and still serves `potrf` and `solve_lu`. Measured on 2x2
+MI250X GCDs (`ELPA_ROCM_REPORT.md`): complex128 n = 20480 in 26 s through
+`distributed` (SLATE: 122 s), n = 51200 in 211 s (SLATE aborts at 30720).
+Residual and orthogonality ~1e-14.
+
+- **Which results move.** Only runs that diagonalise a matrix above the
+  one-device bound on ROCm: eigenvalues and eigenvectors change at rounding
+  level (a different algorithm). Runs at or below the bound (Fe P=4 among
+  them) are bitwise unchanged.
+- **Memory.** During the solve, ELPA's device buffers and the workspaces of
+  all of its rocBLAS/rocSOLVER handles come from one XLA workspace (inside the
+  arena, sized from measured high-waters). ELPA's input is the operand's
+  transposed temporary, aliased, so there is no copy. Between calls the
+  handles hold no device memory. Measured at n = 51200 on 2x2, the process's
+  device memory outside the arena peaked at 2.30 GB (allowance
+  `DISTRIBUTED_LINALG_OUTSIDE_BYTES` = 3 GB). If a rocBLAS workspace region is
+  too small, the solve **refuses** with
+  `rocBLAS/rocSOLVER call(s) failed during the solve`; it never returns a
+  result.
+- **Two-stage ELPA is not available.** It was slower everywhere measured and
+  returns wrong eigenvectors on 4x4 grids at n >= 47104. There is no option
+  for it, and an `ELPA_FORCE_*` environment variable makes the solve refuse
+  (ELPA would let it override the pinned settings).
+
+**What a user must change.** Rebuild the ROCm leg with
+`config/frontier/build_ffi_rocm.sh`. On first use it builds ELPA with
+`config/frontier/build_elpa_hip.sh` (two LORRAX source patches) into a
+content-keyed prefix. The leg's closure record gains `libelpa_openmp.so.19`
+(private). Unset any `ELPA_FORCE_*` variable.
+
+## 2026-10-17 — Sigma_c on shell only: the ω-grid path and eqp2 are retired
+
+Dynamic Σ_c is evaluated on shell only
+([On-shell Σ_c](docs/theory/sigma-on-shell.md)). The ω-grid debug path
+(`sigma_omega_grid_debug = true`) and everything only it fed are removed.
+That includes the grid fold, the ω-cube unfold and writer, the interpolating
+readers, the finite-difference Z, the streamed ω combination, the C(ω) eqp
+receipt, the sweep checkpoint and fixed-Σ evSC (`eqp2.dat`).
+
+- **Results do not move** on the remaining paths. Measured on Fe 8^3 P4
+  (one SC map, A100), against the previous commit: the eqp0/eqp1 bodies are
+  bitwise identical. The sigma_diag body is identical on every column the
+  two files share; the SC `sigC`/`sigXC` columns are omitted (below). The
+  P4 hsuite passes against its references.
+- **Deck keys removed.** Each one refuses by name at parse time, with any
+  value (`GATE omega_grid_retired`): `sigma_omega_grid_debug`, `write_eqp2`,
+  `eqp2_tol_ev`, `eqp2_max_iter`, `eqp2_accelerator`, `eqp2_history_depth`,
+  `eqp2_file`. Delete the lines; nothing replaces them.
+- **Outputs removed:**
+  - `eqp2.dat` and its report section.
+  - The `(n_ω, nk, nb, nb)` Σ_c(ω) cube and `omega_ev` in `sigma_mnk.h5`.
+  - `qp_omega0_ev` (`write_qsgw_datasets`): named as omitted, permanently.
+  - The C(ω) curve in the eqp receipt (`eqp_assembly_conditioned_sigma_c_omega_diag_ev`).
+  - The `omega_ev` and `sigc_omega_ev_{re,im}` keys of
+    `python -m gw.plane_wave_pipeline --deck`. Its `sigc_at_e_ev` is now the
+    exact on-shell Σ_c,nn(E_DFT): the `dft0` table, Σ(0) outside the covered
+    range, where the old value was a clamped interpolation.
+- **`sigma_diag.dat` under SC** no longer carries a column of zeros for the
+  DFT-basis Σ_c(E_DFT), which on shell does not exist. The `sigC` and
+  `sigXC` columns are omitted and named in a `# omitted:` header line.
+- **`sigma_freq_debug.dat`** (one-shot) reads the on-shell operand: Σ_c at
+  E_DFT and E_eval, dΣ/dω, Z, and the q→0 head at E_DFT. Under SC it is
+  omitted by name.
+- **`eqp_bgw.make_eqp_bgw`** reassembles from the on-shell receipt only. An
+  old ω-grid `sigma_mnk.h5` refuses (`GATE omega_grid_receipt_retired`). The
+  CLI option `--finite-difference-spacing` is gone.
+- **Z guard.** eqp1 and the SC tail weights share one Z
+  (`eqp_bgw.on_shell_z_factor`). It prints one line counting states with Z
+  outside (0, 1] or non-finite, and a non-finite Z refuses
+  (`GATE z_factor_finite`).
+- **SC grid-edge census** (`sigma_out_of_grid = static`) runs on shell again,
+  from two diagonal-only tables, Σ(0) and Σ at the nearer range edge, that
+  the request adds in that mode only.
+- **Restart:** a `sigma_checkpoint_oneshot.h5` from the grid path is no
+  longer read. The on-shell sweep is recomputed on restart, as before.
+- **API:** `mixing.acceleration.rcrop_nojit`, `band_partition.
+  apply_band_partition`/`build_omega_band_partition` and `scissor.
+  qsgw_out_of_range_energies`/`classify_bands_in_grid` are removed (their one
+  caller was eqp2). `LorraxConfig.eqp2`, `EQP2Config`,
+  `DebugConfig.sigma_omega_grid_debug` and `FilePaths.eqp2_file` are gone.
+- **What you must change:** delete the removed keys from decks, and stop
+  reading `eqp2.dat`, `qp_omega0_ev` or an ω axis from `sigma_mnk.h5`.
+
+## 2026-10-17 — k-convolution kernels: four sub-1.15× arms removed (CUDA)
+
+A simplification pass on the mathdx modes 7, 9 and 11 (`src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`,
+`kbox_stage.cuh`). Removed: mode 7's per-call k-fastest index-table kernel (M7KF; the factory now
+forms the k-fastest tables in XLA and passes them to a new target), the m7s split arm at
+n_s = 1, mode 9's four-block W2 rule below N_k = 256 and its fixed-column exception (W2 there now
+runs two blocks a SM), and mode 9's
+persistent split plane pass (m9b); the dead tuning bits of the kernel text; and the duplicated
+pair-order, table-load and axis-pass helpers (now in `kbox_stage.cuh`). The arms that remain are
+listed per mode in [k-convolution §4](docs/architecture/kconv.md#arms).
+
+- **Results do not move:** every remaining arm computes the same lines in the same order (bitwise
+  on the 45-case modes 7/9 sweep, the 21 mode-11 comparisons and the Fe 8³ P4 deck bodies).
+- **Speed:** per call (A100, 45 k-grid cases x modes 7 and 9 against the previous kernels): mode 7
+  up to 1.12× at n_s = 1 on 14³/15³ (the m7s rule), mode 9 1.20–1.22× at 6³ (0.30 -> 0.36 ms) and
+  1.11–1.23× at ≥ 14³; every other case within 1.02× (M7KF's gain is kept: Fe 8³ mode 7 4.06 ms).
+  Mode 11 is unchanged.
+- **Memory:** `ffi.fft.klead_unfold_scratch_bytes` now prices the m7s arm's pair-major W_R (16·N_k B
+  a pair at n_s = 2 on 14³–21³ A100 grids), which the Σ τ window checks already add; before, that
+  arm took up to 25 % more scratch than priced. M7KF's unpriced handler workspace is gone; the
+  k-fastest tables are XLA buffers of `4·N_k·(μ_x + ν_y)·n_s` B a call (2.95 MB on a Fe 8³ P4
+  rank), counted by `memory_analysis`.
+- **New target:** mode 7 calls `lorrax_mathdx_kconv_klead_unfold_kf` (`_xblock` plus the k-fastest
+  tables; a new handler, so no ABI bump). A CUDA leg without it refuses at startup
+  (`GATE kconv-target`); `_xblock` stays for older trees and runs the chain arm there.
+- **Startup:** `require_kconv` also probes `lorrax_mathdx_kconv_chi_unfold_q`, so a CUDA leg older than
+  that target refuses at startup (`GATE kconv-target`), not at the first W stream.
+- **`make_kconv_chi_unfold(rows=...)`:** a static `rows` outside `[0, N_k)` raises `ValueError`.
+- **Build log:** the `[kconv_mathdx]` line names `variant=` and `arm=`.
+- **What you must change:** nothing in decks or environment, and no handler signature moved (ABI
+  unchanged). The kernel text changed, so the cubin store recompiles each (mode, grid) once
+  (about 8 s each); the module is republished with a bundle from this commit.
+
+## 2026-10-17 — Dyson response programs: one compile per LU decision on the CUDA room leg
+
+Under `linalg = distributed` on CUDA, the W response's Dyson programs keyed on a figure
+(`one_device`'s bound) that moves with almost any change of the ledger room, so a moved
+room recompiled them. They now key on what the program runs, `(backend, route, rounds)`
+(`distrib_la` `Plan.decision`), and the measured size route's agreed costs are memoised
+without the room, so a new room exchanges, reads and compiles nothing to decide.
+
+- **Results do not move:** the same routes and rounds are chosen as before.
+- **New refusal:** a measured size route whose ranks hold different rooms now refuses by
+  name ("has a room that differs across processes") instead of routing divergently.
+- **What you must change:** nothing.
+
+## 2026-10-17 — W response: warm rule nodes cost 0 in the planner; the q-span row window gathers through its cached program
+
+Two schedule-only changes in `src/gw/response_bank.py`. No rule, energy or output byte moves.
+
+- **Warm rule-tree nodes cost 0 in the round planner** (`_attempt_cost`). A node that holds an
+  earlier map's rule on the same member set is tried first on that rule's nodes: one projection
+  pass and no pencil when it fits. It was priced as a cold attempt (2.4–3.4 s on the device
+  route), so on Fe 8³ SC maps 1–3 the planner deferred warm needed nodes to a round of their own
+  and filled it with cold speculation. They now ride in the round of the failing shared fit.
+  Fe 8³ P4, `sc_max_iter 3`: rule construction −7.6 s and W response −6.7 s summed over the four
+  maps; quadrature lines, `eqp0_iter*.dat` and per-rank peak memory identical.
+- **`_RowWindow.__getitem__` takes rows through the cached `_MemberRows` gather program**
+  instead of eager indexing (1.64 → 0.12 ms dispatch per take; bitwise, same sharding). Fe 8³ P4,
+  `sc_max_iter 1`, two A/B pairs: W response 158.8 / 159.0 s → 157.2 / 157.0 s; `eqp0.dat`,
+  `eqp1.dat` and `sigma_diag.dat` identical.
+- **What you must change:** nothing.
+
+## 2026-10-17 — k-convolution kernels: faster mathdx modes 7, 9 and 11 (CUDA); a new native target
+
+The NVRTC-built k-convolution kernels (`src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`) gain
+faster arms; every output is bitwise identical to the previous kernels.
+
+- **Mode 7** (W_R pass): a fused single-arm tile for n_s <= 2 (cp.async gather,
+  orbit-blocked tiles, k-fastest index tables) and a split arm (persistent plane pass,
+  pair-major W_R, overlapped column pass) with an n_s = 1 rule. **Mode 9**: batched W2
+  gather and a fixed-column store. **Mode 11** (chi0 from the raw-parent Greens, n_s = 2):
+  a fused single-arm tile; `make_kconv_chi_unfold(acc=None)` writes without an
+  accumulator, and `acc=None, rows=q` stores only the q rows of the flat-k transform
+  through the new target `lorrax_mathdx_kconv_chi_unfold_q`, which `gw.w_isdf`'s direct
+  stream uses wherever `fn.q_store` holds.
+- **Results do not move:** bitwise on 45 k-grid cases x modes 7 and 9 and 21 mode-11
+  comparisons (A100), and Fe 8^3 P4 eqp0/eqp1/sigma_diag bodies. Fe 8^3 P4 one map, warm
+  (A100, BFC default pool): W response 198.6 -> 159.6 s, Sigma tau sweep 141.4 -> 107.0 s,
+  map wall 346.9 -> 273.4 s.
+- **What you must change:** nothing in decks. The Python needs a `liblorrax_ffi.so` built
+  from this source: with an older CUDA leg, an n_s = 2 mode-11 deck fails loudly
+  (`lorrax_mathdx_kconv_chi_unfold_q` unregistered; the old handler refuses `acc=None`).
+  Rebuild a clone's pair (`config/perlmutter/build_ffi_cuda.sh`); the Perlmutter module is
+  republished with a bundle from this commit. The kernel source changed, so the cubin
+  store recompiles each (mode, grid) once (about 8 s each).
+
 ## 2026-10-16 — undensified BSE: the `--dipole` file must be stamped for the deck WFN
 
 `absorption_common.window_dipoles` now checks the file's `prov_wfn_sha256`

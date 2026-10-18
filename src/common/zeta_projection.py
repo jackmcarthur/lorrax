@@ -192,12 +192,15 @@ def least_squares_transfer(
                 f"projection downstream.")
 
         def _body(L_loc, O_loc):
-            y = jax.lax.linalg.triangular_solve(
-                L_loc, O_loc, left_side=True, lower=True,
-                transpose_a=False, conjugate_a=False)
-            return jax.lax.linalg.triangular_solve(
-                L_loc, y, left_side=True, lower=True,
-                transpose_a=True, conjugate_a=True)
+            # distrib_la.local_lu: these calls below 2^31 bytes, the span route above (ROCM).
+            from distrib_la import tri_solve_local
+            y = tri_solve_local(L_loc, O_loc, native=lambda l, o: jax.lax.linalg.triangular_solve(
+                l, o, left_side=True, lower=True,
+                transpose_a=False, conjugate_a=False))
+            return tri_solve_local(L_loc, y, transpose=True, conjugate=True,
+                                   native=lambda l, o: jax.lax.linalg.triangular_solve(
+                l, o, left_side=True, lower=True,
+                transpose_a=True, conjugate_a=True))
 
         return shard_map(
             _body, mesh=mesh_xy,

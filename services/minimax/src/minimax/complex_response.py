@@ -485,6 +485,10 @@ class ResponseGroupTree:
             out.append((size, len(ps), len(_pencil_columns(size, len(ps)))))
         return out
 
+    def warm(self, members):
+        """True when an earlier rule on the node's member set is tried first (``previous``)."""
+        return frozenset(members) in self._old
+
     def children(self, members):
         """The two halves of a node; () for one sample."""
         half = len(members)//2

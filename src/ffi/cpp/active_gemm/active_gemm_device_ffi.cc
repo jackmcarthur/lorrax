@@ -16,8 +16,9 @@
 // guarded Python arm's contract), never a clamped interval.
 //
 // Leg-neutral: written against lrx::gpu (gpu_runtime.h) and rtc (rtc_build.h) only; the
-// kernel text has no vendor spelling.  CMake builds it into the ROCM leg; the CUDA leg adopts
-// it by listing this file (and its generated header) in LORRAX_FFI_SOURCES, nothing else.
+// kernel text has no vendor spelling except the matrix-core arm each leg selects by its
+// device (MFMA on gfx90a / gfx94x, DMMA on CUDA compute capability >= 8.0).  CMake builds it
+// into both legs (the CUDA leg in the NVRTC object library beside rtc_build.cc).
 // Images: one program, two entry points (complex128, float64), compiled once per (device)
 // and disk-cached as active_gemm_t<TM>x<TN>x<TK>_<arch>_<key><ext> with the common key rule.
 #include <cstdint>
@@ -57,6 +58,22 @@ static bool mfma_target(const std::string& arch) {
     return false;
 #endif
 }
+// Targets with FP64 tensor cores reachable as mma.sync.m8n8k4 f64 (DMMA): every CUDA device of
+// compute capability 8.0 or newer ("sm_80", "sm_90", "sm_100", ...).  A rule on the capability,
+// not a list of parts, so newer SMs take the arm without an edit; older ones the FMA path.
+static bool dmma_target(const std::string& arch) {
+#if defined(LRX_LEG_ROCM)
+    (void)arch;
+    return false;
+#else
+    if (arch.rfind("sm_", 0) != 0 || arch.size() < 5) return false;
+    // "sm_<major><minor>": the minor is the last digit, the major everything before it.
+    const std::string digits = arch.substr(3);
+    for (char ch : digits)
+        if (ch < '0' || ch > '9') return false;
+    return std::stoi(digits.substr(0, digits.size() - 1)) >= 8;
+#endif
+}
 static std::mutex g_mu;
 static std::map<int, Kernels> g_cache;
 static std::map<int, std::string> g_fail;
@@ -75,20 +92,23 @@ static ffi::Error kernels(std::string_view cache_dir, Kernels* out) {
     prog.name = "lrx_active_gemm";
     prog.kernel = "lrx_active_gemm_z";
     prog.entries = {"lrx_active_gemm_d", "lrx_active_gemm_zc"};
-    // The FP64 matrix-core path where the device has one (ROCM gfx90a / gfx94x: MFMA f64 16x16x4);
-    // every other target (and the CUDA leg, until a DMMA arm is gated) takes the FMA path.
+    // The FP64 matrix-core path where the device has one (ROCM gfx90a / gfx94x: MFMA f64 16x16x4;
+    // CUDA compute capability >= 8.0: DMMA m8n8k4 f64); every other target takes the FMA path.
     const int mfma = mfma_target(arch) ? 1 : 0;
-    if (mfma) prog.entries = {"lrx_active_gemm_d", "lrx_active_gemm_zc", "lrx_active_gemm_z32",
-                              "lrx_active_gemm_d32", "lrx_active_gemm_z32c"};
+    const int dmma = dmma_target(arch) ? 1 : 0;
+    if (mfma || dmma) prog.entries = {"lrx_active_gemm_d", "lrx_active_gemm_zc", "lrx_active_gemm_z32",
+                                      "lrx_active_gemm_d32", "lrx_active_gemm_z32c"};
     prog.defs = {rtc::kOptOption, "-std=c++17", rtc::arch_option(arch),
                  "-DLRX_TM=" + std::to_string(kTm), "-DLRX_TN=" + std::to_string(kTn),
-                 "-DLRX_TK=" + std::to_string(kTk), "-DLRX_MFMA=" + std::to_string(mfma)};
+                 "-DLRX_TK=" + std::to_string(kTk), "-DLRX_MFMA=" + std::to_string(mfma),
+                 "-DLRX_DMMA=" + std::to_string(dmma)};
     const std::string key_hex = rtc::hex16(rtc::key(prog, nullptr));
     const std::string dir(cache_dir);
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
-        name << dir << "/active_gemm_t" << kTm << "x" << kTn << "x" << kTk << (mfma ? "_mfma" : "") << "_"
+        name << dir << "/active_gemm_t" << kTm << "x" << kTn << "x" << kTk
+             << (mfma ? "_mfma" : (dmma ? "_dmma" : "")) << "_"
              << rtc::arch_tag(arch) << "_" << key_hex << rtc::kImageExt;
         path = name.str();
     }
@@ -101,7 +121,8 @@ static ffi::Error kernels(std::string_view cache_dir, Kernels* out) {
     if (!img.from_disk)
         std::fprintf(stderr, "[active_gemm] " LRX_RTC_API " %s tile %dx%dx%d%s %s in %.1f ms%s\n",
                      img.rebuilt_bad ? "rebuilt (cached image refused)" : "built", kTm, kTn, kTk,
-                     mfma ? " mfma" : "", arch.c_str(), img.ms, img.stored ? " (stored)" : "");
+                     mfma ? " mfma" : (dmma ? " dmma" : ""), arch.c_str(), img.ms,
+                     img.stored ? " (stored)" : "");
     Kernels k;
     k.z = img.fn;
     k.d = img.fns.empty() ? nullptr : img.fns[0];
@@ -154,7 +175,7 @@ static ffi::Error Launch(lrx::gpu::Stream stream, ffi::AnyBuffer a, ffi::AnyBuff
 
     Kernels ks;
     FFI_RETURN_IF_ERROR(kernels(cache_dir, &ks));
-    // Block tile per call: 64 x 64, or 32 x 32 (MFMA images) where it pads clearly less --
+    // Block tile per call: 64 x 64, or 32 x 32 (matrix-core images) where it pads clearly less --
     // Fe's W synthesis (m = n = 156): 64-row tiles cover 192 x 192 (66 % useful), 32-row tiles
     // 160 x 160 (95 %).  A pure function of (m, n): no device or host data is read.
     const auto useful = [&](int64_t t) {

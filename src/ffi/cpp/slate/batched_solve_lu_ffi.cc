@@ -34,6 +34,10 @@
 //     non-uniform-stride class of SLATE's device batching (internal_batch.hh:290),
 //     and the owned tiles are uniform by construction (eigh_ffi.cc's rule).
 //     At nb = n/max(p, q) this is the former one-tile-per-rank layout.
+//   - Device memory: A's and X's SLATE pools are seeded with this rank's bytes
+//     from XLA's scratch allocator (pool_seed.h ScratchSeed; seed_want below), so
+//     the owned tiles and getrf/getrs's remote tiles live in XLA's arena, not in
+//     device_malloc calls outside it.
 //
 // Pivots.  slate::Pivots is vector<vector<Pivot>>, one vector per block
 // column k with min(tileMb(k), tileNb(k)) entries; getrf MPI_Bcasts every
@@ -63,6 +67,7 @@
 
 #include "../common/ffi_helpers.h"
 #include "ctx.h"
+#include "pool_seed.h"
 
 namespace lorrax_ffi::slate_lu {
 
@@ -146,14 +151,98 @@ static ffi::Error copy_out(const char* what, sl::Matrix<T>& M, T* dst, int64_t l
     return ffi::Error::Success();
 }
 
-// SLATE-owned device tiles: A (n x n, nb x nb) or B / X (n x nrhs, nb x nb_b).
+// SLATE-owned device tiles: A (n x n, nb x nb) or B / X (n x nrhs, nb x nb_b), each
+// pool seeded with THIS rank's LOCAL tiles only; the bytes are this rank's, from
+// XLA's scratch allocator (pool_seed.h ScratchSeed).  A seed block is held for the
+// whole call, while unseeded SLATE holds a remote tile only while the driver needs
+// it, so a seed at the pool's high-water can still raise the device peak where the
+// peak falls after the pool shrinks:
+//   A (getrf):  high-water local + 10 ... 243 (pool_seed.h PoolWatch, MI250X 2x2,
+//               n = 4096 ... 30720), but getrf releases the remote tiles
+//               (releaseWorkspace) before getrs.  Seeding (mt/p + nt/q) / 2 of them
+//               held 30 MB per rank above unseeded lufix through getrs at 30720 f64
+//               (+10 ... +26 MiB measured, 3 same-node repeats); they now come from
+//               device_malloc exactly as in lufix (measured 173 ... 235 blocks at
+//               30720, 500 at 51200 c128 = 0.5 GB per rank: inside the outside
+//               allowance).
+//   X (getrs):  high-water local + 0 ... 1: trsmB releases B's broadcast row after
+//               each step (work_trsm.cc B_panel.releaseRemoteWorkspace).
+// A pool whose seed is below one device allocation granule (2 MiB) is not seeded:
+// unseeded SLATE takes such tiles from slack in allocations the process already
+// holds, so arena bytes for them are a net rise (X at nrhs = 2: +64 ... +160 KiB per
+// rank, exactly X's local bytes, 3 same-node repeats).  At nrhs = n X's tiles are
+// tens of MB and are seeded.
 template <typename T>
-static sl::Matrix<T> owned(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
+static sl::Matrix<T> shell(int64_t m, int64_t ncols, int64_t mb, int64_t nb_cols,
                            const lorrax_ffi::slate::SlateCtx* ctx) {
-    sl::Matrix<T> M(m, ncols, mb, nb_cols, ctx->p, ctx->q, ctx->comm);
-    M.insertLocalTiles(sl::Target::Devices);
-    return M;
+    return sl::Matrix<T>(m, ncols, mb, nb_cols, ctx->p, ctx->q, ctx->comm);
 }
+
+template <typename T>
+static void fill(sl::Matrix<T>& M, lorrax_ffi::slate::PoolSeed& ws, int64_t want, int64_t* seeded) {
+    *seeded = ws.seed(M, want);
+    M.insertLocalTiles(sl::Target::Devices);
+}
+
+template <typename T>
+static void pool_report(const char* what, const lorrax_ffi::slate::SlateCtx* ctx, int64_t iq,
+                        sl::Matrix<T>& A, int64_t sa, sl::Matrix<T>* X, int64_t sx,
+                        const lorrax_ffi::slate::PoolSeed& ws) {
+    if (!lorrax_ffi::slate::pool_report_enabled()) return;
+    int r = 0;
+    MPI_Comm_rank(ctx->comm, &r);
+    std::fprintf(stderr, "[slate.%s] rank=%d q=%lld pool seeded A=%lld X=%lld fallback A=%lld "
+                 "X=%lld blocks; ws_used=%.3fGB ws=%.3fGB\n", what, r, (long long) iq,
+                 (long long) sa, (long long) sx,
+                 (long long) lorrax_ffi::slate::pool_fallback(A, sa),
+                 (long long) (X ? lorrax_ffi::slate::pool_fallback(*X, sx) : 0),
+                 ws.used / 1e9, ws.size / 1e9);
+}
+
+template <typename T>
+static int64_t local_of(sl::Matrix<T>& M) {
+    int64_t k = 0;
+    for (int64_t j = 0; j < M.nt(); ++j)
+        for (int64_t i = 0; i < M.mt(); ++i)
+            if (M.tileIsLocal(i, j)) ++k;
+    return k;
+}
+
+// The pools' measured high-water (pool_seed.h PoolWatch), one line per matrix.
+static void hw_report(lorrax_ffi::slate::PoolWatch& pw, const char* what,
+                      const lorrax_ffi::slate::SlateCtx* ctx, int64_t n, int64_t nb, int itemsize) {
+    if (!lorrax_ffi::slate::pool_report_enabled()) return;
+    int r = 0;
+    MPI_Comm_rank(ctx->comm, &r);
+    pw.report(what, r, n, nb, itemsize);
+}
+
+template <typename T>
+static int64_t seed_want(sl::Matrix<T>& M, const lorrax_ffi::slate::SlateCtx* ctx, bool rhs) {
+    (void) ctx; (void) rhs;     // A and X alike: this rank's local tiles (comment above)
+    constexpr std::size_t kGranule = std::size_t(2) << 20;
+    const int64_t k = local_of(M);
+    return std::size_t(k) * lorrax_ffi::slate::block_bytes(M) < kGranule ? 0 : k;
+}
+
+// One call's seed memory: this rank's bytes, from XLA's scratch allocator, sized from
+// the first matrix of the batch (every matrix of a call has the same geometry).
+struct LuSeed {
+    ffi::ScratchAllocator& scratch;
+    lorrax_ffi::slate::ScratchSeed mem;
+    bool sized = false;
+    explicit LuSeed(ffi::ScratchAllocator& s) : scratch(s) {}
+    template <typename T>
+    lorrax_ffi::slate::PoolSeed carve(sl::Matrix<T>& A, int64_t wa, sl::Matrix<T>* X, int64_t wx) {
+        if (!sized) {
+            mem = lorrax_ffi::slate::ScratchSeed(scratch, lorrax_ffi::slate::seed_bytes(
+                {{wa, lorrax_ffi::slate::block_bytes(A)},
+                 {X ? wx : 0, X ? lorrax_ffi::slate::block_bytes(*X) : 0}}));
+            sized = true;
+        }
+        return lorrax_ffi::slate::PoolSeed(mem.base, mem.size);
+    }
+};
 
 static const sl::Options& lu_opts() {
     static const sl::Options opts = {
@@ -209,21 +298,33 @@ static std::vector<int64_t> panel_lengths(const sl::Matrix<T>& A) {
 template <typename T>
 static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx* ctx,
                                      int64_t nq, int64_t n, int64_t nrhs, int64_t nb, int64_t nb_b,
-                                     const T* A, const T* B, T* X, T* LU) {
+                                     const T* A, const T* B, T* X, T* LU,
+                                     ffi::ScratchAllocator& scratch) {
     const char* what = "batched_solve_lu";
     if (auto e = preflight(what, stream, ctx, n, nb); !e.success()) return e;
     const int p = ctx->p, q = ctx->q;
     const int64_t lld = n / p;
     const int64_t a_elems = lld * (n / q);
     const int64_t b_elems = lld * (nrhs / q);
+    LuSeed seed(scratch);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        auto Aq = owned<T>(n, n, nb, nb, ctx);
-        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx);
+        int64_t sa = 0, sx = 0;
+        auto Aq = shell<T>(n, n, nb, nb, ctx);
+        auto Xq = shell<T>(n, nrhs, nb, nb_b, ctx);
+        const int64_t want_a = seed_want(Aq, ctx, false), want_x = seed_want(Xq, ctx, true);
+        lorrax_ffi::slate::PoolSeed ws = seed.carve(Aq, want_a, &Xq, want_x);   // matrix iq's SLATE objects die below
+        fill(Aq, ws, want_a, &sa);
+        fill(Xq, ws, want_x, &sx);
+        lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
+        lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
+        lorrax_ffi::slate::PoolWatchScope wx(pw, Xq, "X", sx, local_of(Xq));
         if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
         if (auto e = factor_one<T>(what, Aq, piv, iq); !e.success()) return e;
         if (auto e = solve_one<T>(Aq, piv, Xq, iq); !e.success()) return e;
+        pool_report<T>(what, ctx, iq, Aq, sa, &Xq, sx, ws);
+        hw_report(pw, what, ctx, n, nb, (int) sizeof(T));
         if (auto e = copy_out<T>(what, Xq, X + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_out<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
     }
@@ -234,7 +335,8 @@ static ffi::Error SolveLuFactorsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate:
 template <typename T>
 static ffi::Error GetrfImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx* ctx,
                             int64_t nq, int64_t n, int64_t nb, int64_t piv_len,
-                            const T* A, T* LU, int64_t* d_piv) {
+                            const T* A, T* LU, int64_t* d_piv,
+                            ffi::ScratchAllocator& scratch) {
     const char* what = "batched_getrf";
     if (auto e = preflight(what, stream, ctx, n, nb); !e.success()) return e;
     if (piv_len != 2 * n) {
@@ -246,11 +348,20 @@ static ffi::Error GetrfImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
     const int64_t lld = n / p;
     const int64_t a_elems = lld * (n / q);
     std::vector<int64_t> h_piv(static_cast<std::size_t>(nq * piv_len), 0);
+    LuSeed seed(scratch);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        auto Aq = owned<T>(n, n, nb, nb, ctx);
+        int64_t sa = 0;
+        auto Aq = shell<T>(n, n, nb, nb, ctx);
+        const int64_t want_a = seed_want(Aq, ctx, false);
+        lorrax_ffi::slate::PoolSeed ws = seed.carve<T>(Aq, want_a, nullptr, 0);
+        fill(Aq, ws, want_a, &sa);
+        lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
+        lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
         if (auto e = copy_in<T>(what, Aq, A + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         sl::Pivots piv;
         if (auto e = factor_one<T>(what, Aq, piv, iq); !e.success()) return e;
+        pool_report<T>(what, ctx, iq, Aq, sa, nullptr, 0, ws);
+        hw_report(pw, what, ctx, n, nb, (int) sizeof(T));
         if (auto e = copy_out<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         int64_t* out = h_piv.data() + iq * piv_len;
         int64_t at = 0;
@@ -279,7 +390,7 @@ template <typename T>
 static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx* ctx,
                             int64_t nq, int64_t n, int64_t nrhs, int64_t nb, int64_t nb_b,
                             int64_t piv_len, const T* LU, const int64_t* d_piv,
-                            const T* B, T* X) {
+                            const T* B, T* X, ffi::ScratchAllocator& scratch) {
     const char* what = "batched_getrs";
     if (auto e = preflight(what, stream, ctx, n, nb); !e.success()) return e;
     if (piv_len != 2 * n) {
@@ -297,9 +408,18 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
     if (ce != lrx::gpu::kSuccess) return gpu_fail(what, LRX_GPU_API "MemcpyAsync(piv D2H)", ce);
     ce = lrx::gpu::stream_synchronize(stream);
     if (ce != lrx::gpu::kSuccess) return gpu_fail(what, LRX_GPU_API "StreamSynchronize(piv)", ce);
+    LuSeed seed(scratch);
     for (int64_t iq = 0; iq < nq; ++iq) {
-        auto Aq = owned<T>(n, n, nb, nb, ctx);
-        auto Xq = owned<T>(n, nrhs, nb, nb_b, ctx);
+        int64_t sa = 0, sx = 0;
+        auto Aq = shell<T>(n, n, nb, nb, ctx);
+        auto Xq = shell<T>(n, nrhs, nb, nb_b, ctx);
+        const int64_t want_a = seed_want(Aq, ctx, false), want_x = seed_want(Xq, ctx, true);
+        lorrax_ffi::slate::PoolSeed ws = seed.carve(Aq, want_a, &Xq, want_x);   // matrix iq's SLATE objects die below
+        fill(Aq, ws, want_a, &sa);
+        fill(Xq, ws, want_x, &sx);
+        lorrax_ffi::slate::PoolWatch pw(lorrax_ffi::slate::pool_report_enabled());
+        lorrax_ffi::slate::PoolWatchScope wa(pw, Aq, "A", sa, local_of(Aq));
+        lorrax_ffi::slate::PoolWatchScope wx(pw, Xq, "X", sx, local_of(Xq));
         if (auto e = copy_in<T>(what, Aq, LU + iq * a_elems, lld, p, q, stream); !e.success()) return e;
         if (auto e = copy_in<T>(what, Xq, B + iq * b_elems, lld, p, q, stream); !e.success()) return e;
         const int64_t* in = h_piv.data() + iq * piv_len;
@@ -317,6 +437,8 @@ static ffi::Error GetrsImpl(lrx::gpu::Stream stream, lorrax_ffi::slate::SlateCtx
                               "slate.batched_getrs: pivot buffer does not match this A geometry "
                               "(feed back getrf's piv verbatim, same mesh)");
         if (auto e = solve_one<T>(Aq, piv, Xq, iq); !e.success()) return e;
+        pool_report<T>(what, ctx, iq, Aq, sa, &Xq, sx, ws);
+        hw_report(pw, what, ctx, n, nb, (int) sizeof(T));
         if (auto e = copy_out<T>(what, Xq, X + iq * b_elems, lld, p, q, stream); !e.success()) return e;
     }
     return ffi::Error::Success();
@@ -337,6 +459,7 @@ static ffi::Error bad_dtype(const char* what, ffi::DataType dt) {
 static ffi::Error SolveLuFactorsDispatch(
     lrx::gpu::Stream stream, ffi::AnyBuffer A, ffi::AnyBuffer B,
     ffi::Result<ffi::AnyBuffer> X, ffi::Result<ffi::AnyBuffer> LU,
+    ffi::ScratchAllocator scratch,
     int64_t nq, int64_t n, int64_t nrhs, int64_t nb, int64_t nb_b, int64_t ctx_key)
 {
     auto* ctx = ctx_of(ctx_key);
@@ -351,11 +474,13 @@ static ffi::Error SolveLuFactorsDispatch(
         case ffi::DataType::F64:
             return SolveLuFactorsImpl<double>(stream, ctx, nq, n, nrhs, nb, nb_b,
                 static_cast<const double*>(A.untyped_data()), static_cast<const double*>(B.untyped_data()),
-                static_cast<double*>(X->untyped_data()), static_cast<double*>(LU->untyped_data()));
+                static_cast<double*>(X->untyped_data()), static_cast<double*>(LU->untyped_data()),
+                scratch);
         case ffi::DataType::C128:
             return SolveLuFactorsImpl<C128>(stream, ctx, nq, n, nrhs, nb, nb_b,
                 static_cast<const C128*>(A.untyped_data()), static_cast<const C128*>(B.untyped_data()),
-                static_cast<C128*>(X->untyped_data()), static_cast<C128*>(LU->untyped_data()));
+                static_cast<C128*>(X->untyped_data()), static_cast<C128*>(LU->untyped_data()),
+                scratch);
         default: return bad_dtype("batched_solve_lu", dt);
     }
 }
@@ -363,6 +488,7 @@ static ffi::Error SolveLuFactorsDispatch(
 static ffi::Error GetrfDispatch(
     lrx::gpu::Stream stream, ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> LU, ffi::Result<ffi::AnyBuffer> piv,
+    ffi::ScratchAllocator scratch,
     int64_t nq, int64_t n, int64_t nb, int64_t piv_len, int64_t ctx_key)
 {
     auto* ctx = ctx_of(ctx_key);
@@ -378,10 +504,12 @@ static ffi::Error GetrfDispatch(
     switch (dt) {
         case ffi::DataType::F64:
             return GetrfImpl<double>(stream, ctx, nq, n, nb, piv_len,
-                static_cast<const double*>(A.untyped_data()), static_cast<double*>(LU->untyped_data()), d_piv);
+                static_cast<const double*>(A.untyped_data()), static_cast<double*>(LU->untyped_data()), d_piv,
+                scratch);
         case ffi::DataType::C128:
             return GetrfImpl<C128>(stream, ctx, nq, n, nb, piv_len,
-                static_cast<const C128*>(A.untyped_data()), static_cast<C128*>(LU->untyped_data()), d_piv);
+                static_cast<const C128*>(A.untyped_data()), static_cast<C128*>(LU->untyped_data()), d_piv,
+                scratch);
         default: return bad_dtype("batched_getrf", dt);
     }
 }
@@ -389,6 +517,7 @@ static ffi::Error GetrfDispatch(
 static ffi::Error GetrsDispatch(
     lrx::gpu::Stream stream, ffi::AnyBuffer LU, ffi::AnyBuffer piv, ffi::AnyBuffer B,
     ffi::Result<ffi::AnyBuffer> X,
+    ffi::ScratchAllocator scratch,
     int64_t nq, int64_t n, int64_t nrhs, int64_t nb, int64_t nb_b, int64_t piv_len,
     int64_t ctx_key)
 {
@@ -407,11 +536,13 @@ static ffi::Error GetrsDispatch(
         case ffi::DataType::F64:
             return GetrsImpl<double>(stream, ctx, nq, n, nrhs, nb, nb_b, piv_len,
                 static_cast<const double*>(LU.untyped_data()), d_piv,
-                static_cast<const double*>(B.untyped_data()), static_cast<double*>(X->untyped_data()));
+                static_cast<const double*>(B.untyped_data()), static_cast<double*>(X->untyped_data()),
+                scratch);
         case ffi::DataType::C128:
             return GetrsImpl<C128>(stream, ctx, nq, n, nrhs, nb, nb_b, piv_len,
                 static_cast<const C128*>(LU.untyped_data()), d_piv,
-                static_cast<const C128*>(B.untyped_data()), static_cast<C128*>(X->untyped_data()));
+                static_cast<const C128*>(B.untyped_data()), static_cast<C128*>(X->untyped_data()),
+                scratch);
         default: return bad_dtype("batched_getrs", dt);
     }
 }
@@ -426,6 +557,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()              // B
         .Ret<xla::ffi::AnyBuffer>()              // X (aliased to B)
         .Ret<xla::ffi::AnyBuffer>()              // LU factors (aliased to A)
+        .Ctx<xla::ffi::ScratchAllocator>()       // this rank's pool seed (pool_seed.h)
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nrhs")
@@ -440,6 +572,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()              // A (donated; factored in place)
         .Ret<xla::ffi::AnyBuffer>()              // LU (aliased to A)
         .Ret<xla::ffi::AnyBuffer>()              // piv (int64, 2n per matrix, replicated)
+        .Ctx<xla::ffi::ScratchAllocator>()       // this rank's pool seed (pool_seed.h)
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nb")
@@ -454,6 +587,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()              // piv (as getrf returned it)
         .Arg<xla::ffi::AnyBuffer>()              // B (donated; solved in place)
         .Ret<xla::ffi::AnyBuffer>()              // X (aliased to B)
+        .Ctx<xla::ffi::ScratchAllocator>()       // this rank's pool seed (pool_seed.h)
         .Attr<int64_t>("nq")
         .Attr<int64_t>("n")
         .Attr<int64_t>("nrhs")

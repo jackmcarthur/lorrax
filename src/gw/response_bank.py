@@ -6,7 +6,7 @@ Disk conversion belongs to the scratch writer. Dense products and solves
 enter through ``distrib_la``.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from functools import lru_cache
 import hashlib
@@ -42,8 +42,10 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     Returns
     -------
     dyson, slope, moments, receipt
-        Jitted functions accepting complex128 ``[b,n,n]`` operators at
-        ``P(None,'x','y')``, and the resolved backend/prefactor description.
+        Compiled-program callables (``__call__``, ``lower``, ``finish``) accepting
+        complex128 ``[b,n,n]`` operators at ``P(None,'x','y')``, and the resolved
+        backend/prefactor description.  The programs that hold the Dyson solve are
+        keyed on its LU plan's decision, never on the room (:class:`_Decided`).
         ``dyson.value(H, chi_raw)`` returns Wc (Ry); ``slope(H, Wc, dchi_raw)``
         returns its s derivative (Ry^-1), restoring the bare operator internally (photon input is W-V). ``moments(H, A0, A1)`` takes already scaled
         bare-response expansion coefficients and returns M1/M3 (Ry^3/Ry^5).
@@ -65,9 +67,11 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     pref = _w_solve_pref_scalar(meta)
-    dyson, slope, moments, lu = _response_programs(
-        mesh_xy, n, backend, route, pref, ordered,
-        float(meta.cell_volume) if photon else None)
+    built = _response_programs(mesh_xy, n, backend, route, pref, ordered,
+                               float(meta.cell_volume) if photon else None)
+    room = _dyson_room(meta, mesh_xy, n) if backend == "distributed" else None
+    dyson, moments, lu = built.bind(room)
+    slope = built.slope
     algebra = {
         "linalg": resolution.layout,
         "solve": lu.describe(),
@@ -89,15 +93,87 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     return dyson, slope, moments, algebra
 
 
+def _dyson_room(meta, mesh_xy, n):
+    """Per-rank room of the Dyson solve, for distrib_la's size route (resolve guard 1b).
+
+    The shared ledger's room beside its bound live reservations
+    (``CapacityLedger.room_bytes_per_rank``) less the solve's own face operands (H, chi
+    and W: 3 nq n^2 complex128 over the P ranks, the pricing of ``w_isdf._dyson_route``). A shape-and-ledger rule every rank shares: no
+    exchange, no sync. None (the leg's library, never one_device) on one rank, with no
+    ledger, or with the ledger's caller lifetimes unbound (unknown live bytes are not zero).
+    """
+    ledger = getattr(meta, "shared_pole_capacity", None)
+    ranks = int(mesh_xy.size)
+    if ledger is None or ranks <= 1:
+        return None
+    try:
+        live = ledger.live_stages
+    except ValueError:
+        return None
+    faces = 16 * int(n) * int(n) * 3 * int(meta.nk_tot) // ranks
+    return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - faces)
+
+
+#: The solve-bearing programs per (builder, program, call signature, LU decision): never the room.
+_VARIANTS: dict = {}
+
+
+@dataclass(frozen=True)
+class _Decided:
+    """A solve-bearing response program keyed on the Dyson LU plan's decision.
+
+    The room enters the HLO only through ``Plan.decision`` (backend, route, rounds).  Every
+    solve in these bodies takes ``(b, n, n)`` operands at the face, ``b`` the leading
+    extent of operand 1, so each call signature takes the variant cached on ``(builder,
+    name, signature, decision)``, built with this room's plan on a miss and only ever traced
+    on that signature: a room that moves without moving the decision lowers and compiles
+    nothing again (COMPILEAUDIT 2026-10-05 rule 4).  A value (``builder`` is
+    :func:`_response_programs`' key; ``lu``, that room's plan, is not compared), so equal
+    programs compare equal.  The check-then-set needs no lock: ``compile_ahead`` lowers on
+    the calling thread (INVARIANTS 21/25).
+    """
+    builder: tuple
+    name: str
+    room: object
+    lu: object = field(compare=False, repr=False)
+
+    def resolve(self, *args):
+        """The variant program for this call signature."""
+        x, n = args[1], self.builder[1]
+        face = jax.ShapeDtypeStruct((int(x.shape[0]), n, n), x.dtype)
+        key = (self.builder, self.name, tuple((tuple(a.shape), str(a.dtype)) for a in args),
+               self.lu.decision(face, face))
+        if key not in _VARIANTS:
+            builder = _response_programs(*self.builder)
+            _VARIANTS[key] = builder.program_for(self.name, self.lu.batched)
+        return _VARIANTS[key]
+
+    def __call__(self, *args):
+        return self.resolve(*args)(*args)
+
+    def lower(self, *args):
+        return self.resolve(*args).lower(*args)
+
+    def finish(self, args, result):
+        return self.resolve(*args).finish(args, result)
+
+
 @lru_cache(maxsize=None)
 def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
-    """Reuse compiled algebra across SC maps without retaining state arrays."""
+    """Reuse compiled algebra across SC maps without retaining state arrays.
+
+    Returns the builder: ``slope``, the charge ``moments`` (no solve), and
+    ``bind(room) -> (dyson, moments, lu)`` with the Dyson LU plan ``lu`` at ``room``
+    (:func:`_dyson_room`: on every leg distrib_la takes one_device only where one whole
+    matrix fits it, else the distributed library).  On the distributed backend the
+    programs that hold the solve are :class:`_Decided`, keyed on that plan's decision and
+    never on the room that decides it; on ``off`` they solve locally and are built once.
+    """
     from types import SimpleNamespace
     from distrib_la import batch_layout, checked_program, local_batch, matmul, plan
 
-    lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
-              batched_route=route)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    key = (mesh_xy, n, backend, route, pref, ordered, volume)
 
     def program(inputs, outputs=1, resident=(), layout="face"):
         def wrap(fn):
@@ -108,8 +184,6 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                                    in_shardings=(face,) * inputs)
         return wrap
 
-    solve = jnp.linalg.solve if backend == "off" else lu.batched
-
     def mm(a, b):
         if backend == "off":
             return a @ b
@@ -119,62 +193,33 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def congruence(h, a):
         return mm(mm(h, a), h)
 
-    def wc(h, chi_raw):
-        x = pref * congruence(h, chi_raw)
-        identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
-        e = solve(identity - x, identity.copy())
-        return congruence(h, mm(x, e))
-
     def derivative(w, dchi_raw):
         # Full W on BOTH sides; no adjoint at complex frequency.
         return mm(mm(w, pref * dchi_raw), w)
 
-    @program(3)
-    def slope(h, wc, dchi_raw):
-        return derivative(wc + mm(h, h), dchi_raw)
+    def bodies(solve):
+        """The solve-bearing bodies over ``solve``: name -> (body, inputs, outputs,
+        resident, layout)."""
+        def wc(h, chi_raw):
+            x = pref * congruence(h, chi_raw)
+            identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
+            e = solve(identity - x, identity.copy())
+            return congruence(h, mm(x, e))
 
-    def pair(h, chi_raw, dchi_raw):
-        value = wc(h, chi_raw)
-        return value, derivative(value + mm(h, h), dchi_raw)
+        def pair(h, chi_raw, dchi_raw):
+            value = wc(h, chi_raw)
+            return value, derivative(value + mm(h, h), dchi_raw)
 
-    # One sample's value and slope in one program: the roots H stay laid out
-    # for every sample (no exchange), only the two chi stacks move in, and a
-    # 'batch' consumer takes both outputs without the exchange back.
-    resident = (0,) if backend == "off" else ()
-    pairs = {layout: program(3, 2, resident, layout)(pair)
-             for layout in (("face", "batch") if backend == "off" else ("face",))}
-    dyson = SimpleNamespace(value=program(2)(wc), pair=pairs.get,
-                            place=(lambda h: batch_layout(h, mesh_xy)) if resident else (lambda h: h))
+        if volume is None:
+            # One sample's value and slope in one program: the roots H stay laid out
+            # for every sample (no exchange), only the two chi stacks move in, and a
+            # 'batch' consumer takes both outputs without the exchange back.
+            resident = (0,) if backend == "off" else ()
+            out = {"value": (wc, 2, 1, (), "face")}
+            for layout in (("face", "batch") if backend == "off" else ("face",)):
+                out["pair:" + layout] = (pair, 3, 2, resident, layout)
+            return out
 
-    @program(3, 2)
-    def moments(h, a0, a1):
-        # chi_scaled=A0/s+A1/s²; whitened Dyson coefficients are
-        # B0=H A0 H, B1=H A1 H, S0=B0, S1=B1+B0².
-        b0 = congruence(h, a0)
-        b1 = congruence(h, a1)
-        return (0.5 * congruence(h, b0),
-                0.5 * congruence(h, b1 + mm(b0, b0)))
-
-    if ordered:
-        @program(5, 4)
-        def moments(h, a0, a1, o0, o1):
-            # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
-            # reversal or reality assumption; X_k = H chi_k H and
-            # Wc = H X (I-X)^-1 H. Coefficients C1..C4 of 1/z..1/z^4 keep
-            # every X1 cross term (o0 vanishes only in a complete basis).
-            # Returns M0=C1/2, M1=C2/2, M2=C3/2, M3=C4/2 (M_k = C_(k+1)/2, the
-            # constructor's convention); with o0=o1=0 the even pair reduces
-            # to the incumbent M1/M3 exactly.
-            x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
-            x11 = mm(x1, x1)
-            c2 = x2 + x11
-            c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
-            c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
-                  + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
-            return (0.5 * congruence(h, x1), 0.5 * congruence(h, c2),
-                    0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
-
-    if volume is not None:
         def infinity(v, contact):
             # chi(z)=chi_param(z)-contact, so W_inf=(I+V contact)^-1 V.
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
@@ -190,16 +235,8 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             # slope reads W = (Wc + (W_inf - V)) + V.
             value = w_minus_v(v, chi_raw, contact) - constant
             return value, derivative((value + constant) + v, dchi_raw)
-        dyson = SimpleNamespace(value=program(3)(w_minus_v),
-                                pair={"face": program(5, 2)(photon_pair)}.get,
-                                place=lambda v: v)
 
-        @program(3)
-        def slope(v, wc, dchi_raw):
-            return derivative(wc + v, dchi_raw)
-
-        @program(6, 5)
-        def moments(v, a0, a1, o0, o1, contact):
+        def photon_moments(v, a0, a1, o0, o1, contact):
             # W=W_inf + sum C_k/z^k. Dyson recurrence
             # C_k=W_inf [chi_k W_inf + sum_{i=1}^{k-1} chi_i C_(k-i)].
             # Bare coefficients are already physically scaled.
@@ -213,7 +250,66 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                 result.append(mm(winf, rhs))
             return (winf - v, *(0.5 * c for c in result))
 
-    return dyson, slope, moments, lu
+        return {"value": (w_minus_v, 3, 1, (), "face"),
+                "pair:face": (photon_pair, 5, 2, (), "face"),
+                "moments": (photon_moments, 6, 5, (), "face")}
+
+    def program_for(name, solve):
+        body, inputs, outputs, resident, layout = bodies(solve)[name]
+        return program(inputs, outputs, resident, layout)(body)
+
+    local = ({name: program_for(name, jnp.linalg.solve) for name in bodies(jnp.linalg.solve)}
+             if backend == "off" else None)
+    names = tuple(bodies(None))
+
+    def bind(room):
+        lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
+        progs = local or {name: _Decided(key, name, room, lu) for name in names}
+        pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
+        resident = backend == "off" and volume is None
+        dyson = SimpleNamespace(value=progs["value"], pair=pairs.get,
+                                place=(lambda h: batch_layout(h, mesh_xy)) if resident else (lambda h: h))
+        return dyson, progs.get("moments", moments), lu
+
+    if volume is None:
+        @program(3)
+        def slope(h, wc, dchi_raw):
+            return derivative(wc + mm(h, h), dchi_raw)
+
+        @program(3, 2)
+        def moments(h, a0, a1):
+            # chi_scaled=A0/s+A1/s²; whitened Dyson coefficients are
+            # B0=H A0 H, B1=H A1 H, S0=B0, S1=B1+B0².
+            b0 = congruence(h, a0)
+            b1 = congruence(h, a1)
+            return (0.5 * congruence(h, b0),
+                    0.5 * congruence(h, b1 + mm(b0, b0)))
+        if ordered:
+            @program(5, 4)
+            def moments(h, a0, a1, o0, o1):
+                # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
+                # reversal or reality assumption; X_k = H chi_k H and
+                # Wc = H X (I-X)^-1 H. Coefficients C1..C4 of 1/z..1/z^4 keep
+                # every X1 cross term (o0 vanishes only in a complete basis).
+                # Returns M0=C1/2, M1=C2/2, M2=C3/2, M3=C4/2 (M_k = C_(k+1)/2, the
+                # constructor's convention); with o0=o1=0 the even pair reduces
+                # to the incumbent M1/M3 exactly.
+                x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
+                x11 = mm(x1, x1)
+                c2 = x2 + x11
+                c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
+                c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
+                      + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
+                return (0.5 * congruence(h, x1), 0.5 * congruence(h, c2),
+                        0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
+
+    else:
+        @program(3)
+        def slope(v, wc, dchi_raw):
+            return derivative(wc + v, dchi_raw)
+        moments = None
+
+    return SimpleNamespace(program_for=program_for, bind=bind, slope=slope, moments=moments)
 
 
 def response_weights(wfns, meta):
@@ -859,6 +955,8 @@ def _compiled(kernel, args, *, ahead=False):
     executable or waits for it.
     """
     from common.jax_compile_cache import compile_ahead
+    if isinstance(kernel, _Decided):
+        kernel = kernel.resolve(*args)          # the variant its LU decision names
     key = (kernel, jax.tree.structure(args), tuple(
         (tuple(x.shape), str(x.dtype), getattr(x, "sharding", None))
         if hasattr(x, "shape") else x for x in jax.tree.leaves(args)))
@@ -1652,7 +1750,14 @@ def _attempt_cost(tree, node):
     (size/1000)^3 + 1.96 s + 3.17 s per one-sample node, rms 1.1 s against 1.8
     s for the host form; pool log rcgpu_ab1). Only the planner's balance reads
     it, never a rule.
+
+    A warm node (an earlier map's rule on the same member set) is tried first
+    on that rule's nodes: one projection pass and no pencil when it fits, so
+    it costs 0 here (Fe 8^3 SC maps 1-3: 0.2-0.8 s, against 2.4 s modelled,
+    whose speculation then outlasted the round's needed work by ~3 s).
     """
+    if tree.warm(node):
+        return 0.
     one = len(node) == 1
     if getattr(tree, "pencil", None) is not None:
         return (tree.size(node)/1000.)**3 + 1.9 + (3.0 if one else 0.)
@@ -2296,7 +2401,8 @@ class _RowWindow:
 
     def __getitem__(self, key):
         i, rows = key
-        return self.value[int(i), np.asarray(rows) - self.first]
+        # The cached gather program, not eager indexing (several dispatches per take).
+        return _MemberRows(self.value, 0)[i, np.asarray(rows) - self.first]
 
 
 class _MemberRows:

@@ -17,6 +17,55 @@ def assert_committed(h5, *, path=None):
             "Do not reuse this incomplete artifact; rebuild in a new run directory.")
 
 
+#: How long a reopen waits out a transiently short size view (``open_h5_settled``).
+SETTLE_TIMEOUT_S = 60.0
+
+
+def open_h5_settled(path, mode="r", **kwargs):
+    """``h5py.File(path, mode)`` for a file another process just committed.
+
+    HDF5 refuses an open when the size this client reports is below the end of
+    allocation stored in the superblock (``truncated file: eof < stored_eof``),
+    before it touches the file. On Frontier Lustre at P=16 over two nodes,
+    many ranks reopening a just-closed file at once see that size transiently
+    short, at an exact stripe (1 MiB) boundary, on the writer's own node too,
+    and NOT monotonically: one open succeeds and the next, milliseconds later,
+    is refused (a ``stat`` threshold cannot fence it; ``fsync`` does not
+    either). The data is complete: the same file reports its full size again
+    at once. So this refusal, and only this one, is retried (each refusal
+    logged) with bounded
+    backoff; a file that stays short for ``SETTLE_TIMEOUT_S`` is truly
+    truncated and the original error is raised. Every other error is raised
+    at once. Close-time metadata opens only; no hot path. Prefer one reader
+    (``common.collectives.rank0_read``): this is for the opens that remain,
+    rank 0's reopen of what other clients wrote and per-rank data reads.
+    """
+    import sys
+    import time
+
+    import h5py
+
+    t0, nap, tries = time.monotonic(), 0.01, 0
+    while True:
+        try:
+            handle = h5py.File(path, mode, **kwargs)
+        except OSError as exc:
+            if "truncated file" not in str(exc):
+                raise
+            if time.monotonic() - t0 > SETTLE_TIMEOUT_S:
+                raise
+            tries += 1
+            print(f"  [open_h5_settled] {path}: refused open {tries} ({exc}); "
+                  f"retrying in {nap:.3f} s", file=sys.stderr, flush=True)
+            time.sleep(nap)
+            nap = min(2 * nap, 0.2)
+            continue
+        if tries:
+            print(f"  [open_h5_settled] {path}: size view settled after {tries} "
+                  f"refused open(s), {time.monotonic() - t0:.3f} s", file=sys.stderr, flush=True)
+        return handle
+
+
 def agree_io_refusal(error, *, path, stage):
     """Agree an artifact refusal across ranks without losing its reason.
 

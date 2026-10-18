@@ -1,24 +1,22 @@
 """QSGW Σ_xc build, the one-shot update_H seam, and SC-COHSEX diagnostics.
 
 The post-self-energy plumbing in ``gw_jax`` accepts replicated or
-band-sharded ``(nk, nb, nb)`` arrays.  The dynamic correlation
-``Σ_c(ω, k, m_X, n_Y)`` and any matrix derived from its sharded path retain
-their band tiles; diagonal-only operations extract and return only the bounded
+band-sharded ``(nk, nb, nb)`` arrays.  The dynamic correlation's on-shell
+pair ``(2, k, m_X, n_Y)`` and any matrix derived from it retain their band
+tiles; diagonal-only operations extract and return only the bounded
 ``(nk, nb)`` diagonal.  Everything in this module is structured around that
 seam:
 
 - :func:`solve_qp` is the one-shot pass-through ``Σ_xc + V_H``; no QP
   equation is solved anywhere (Σ is read at the present energies).
 - :func:`build_qsgw_sigma_xc` is a JIT'd JAX kernel that takes the
-  on-device sharded ``Σ_c(ω)`` and the QP energies ``E_kn`` (replicated)
-  and returns the Hermitised QSGW Σ_xc in the selected replicated or
-  two-axis band-sharded layout.  No disk round-trip; restart-friendly because
-  the same kernel can be re-called with refreshed ``Σ_c(ω)`` and ``E_kn``.
+  on-device sharded on-shell pair ``Σ_mn(E_m)``, ``Σ_mn(E_n)``
+  (``ppm_sigma.OnShellSigma``) and returns the Hermitised QSGW Σ_xc in the
+  selected replicated or two-axis band-sharded layout.
 """
 
 from __future__ import annotations
 
-import os
 
 import numpy as np
 from functools import lru_cache
@@ -42,8 +40,8 @@ def omega_coverage(omega_grid: np.ndarray,
     """``(covered_mask, n_uncovered, fraction_uncovered)`` for an ω request.
 
     ``covered_mask[k, n]`` is True where ``eval_kn[k, n]`` lies inside
-    ``[ω_min, ω_max]``, i.e. where Σ(ω) was actually SAMPLED and the linear
-    interpolation is an interpolation rather than an edge value.  Interior
+    ``[ω_min, ω_max]``, the sampled range Σ(E) is read in rather than
+    replaced by Σ(ω = 0).  Interior
     holes in a patched grid are a different question and are owned by
     :func:`assert_omega_grid_covers`; this answers the outer one.
     """
@@ -169,8 +167,9 @@ def interp_sigma_diag_along_omega(
 
 
 def sigma_grid_edge_ambiguity(
-    sigma_c_diag_w_kn_ev: np.ndarray,
-    omega_grid_ev: np.ndarray,
+    at_zero_kn_ev: np.ndarray,
+    at_edge_kn_ev: np.ndarray,
+    omega_range_ev,
     e_kn_ev: np.ndarray,
     growth_window_ev: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -194,9 +193,10 @@ def sigma_grid_edge_ambiguity(
     edge, Δ = 1.87 eV, one branch per accelerator (sandbox claim 2688).
 
     No threshold: the band is the jump itself.  Parameters are the diagonal
-    Σ_c(ω) samples ``(nω, nk, nb)`` (eV, complex or real), the increasing
-    grid ``(nω,)`` and the evaluation energies ``(nk, nb)``, all on the same
-    E_F-relative reference.  Returns ``(ambiguous_kn, jump_kn_ev)``.
+    Σ_c,nn(0) and Σ_c,nn(ω_e) ``(nk, nb)`` (eV, complex or real; the on-shell
+    ``zero`` and ``edge`` tables, ``ppm_sigma.on_shell_request``), the sampled
+    range ``(ω_min, ω_max)`` and the evaluation energies ``(nk, nb)``, all on
+    the same E_F-relative reference.  Returns ``(ambiguous_kn, jump_kn_ev)``.
 
     ``growth_window_ev`` is the SC loop's padded window (``scissor.
     sc_padded_window_ev``): a state inside it GROWS the grid instead of
@@ -206,20 +206,17 @@ def sigma_grid_edge_ambiguity(
     Fe 4^3 at +28 eV: without this, 12 states near the +28 grid edge were
     flagged at map 0 although the grid would have grown under them.
     """
-    omega = np.asarray(omega_grid_ev, dtype=np.float64)
     e = np.asarray(e_kn_ev, dtype=np.float64)
-    sig = np.real(np.asarray(sigma_c_diag_w_kn_ev))
-    if sig.shape != (omega.size,) + e.shape:
+    at_zero, at_edge = (np.real(np.asarray(a)) for a in (at_zero_kn_ev, at_edge_kn_ev))
+    if at_zero.shape != e.shape or at_edge.shape != e.shape:
         raise ValueError(
-            f"sigma_grid_edge_ambiguity: Sigma diag {sig.shape} does not match "
-            f"grid {omega.shape} x energies {e.shape}")
-    at_zero = interp_along_omega(sig, omega, np.zeros_like(e))
-    lo, hi = float(omega[0]), float(omega[-1])
+            f"sigma_grid_edge_ambiguity: Sigma diagonals {at_zero.shape}/{at_edge.shape} "
+            f"do not match the energies {e.shape}")
+    lo, hi = float(omega_range_ev[0]), float(omega_range_ev[-1])
     if growth_window_ev is not None:
         lo, hi = min(lo, float(growth_window_ev[0])), max(hi, float(growth_window_ev[1]))
     use_top = np.abs(e - hi) <= np.abs(e - lo)
     edge = np.where(use_top, hi, lo)
-    at_edge = np.where(use_top, sig[-1], sig[0])
     jump = at_zero - at_edge
     outward = np.where(use_top, jump > 0.0, jump < 0.0)
     ambiguous = outward & (np.abs(e - edge) < np.abs(jump))
@@ -273,7 +270,7 @@ def assert_omega_grid_covers(E_kn_ry, in_grid_mask, omega_grid_ry, *,
 
 
 # ---------------------------------------------------------------------------
-# Σ diagonal extraction from sharded Σ_c(ω, k, m_X, n_Y)
+# Static-operator diagonal extraction from a band-sharded (k, m_X, n_Y)
 # ---------------------------------------------------------------------------
 
 def is_band_sharded_sigma_omega(a) -> bool:
@@ -655,7 +652,7 @@ def static_sigma_diag_to_host(sigma_knn, mesh_xy: Mesh) -> np.ndarray:
     """Return only a static operator's bounded ``(nk,nb)`` diagonal.
 
     A canonical ``P(None,'x','y')`` input stays tiled: it is promoted by a
-    length-one leading axis and uses the dynamic-Sigma diagonal psum.  A
+    length-one leading axis and uses the sharded diagonal psum.  A
     replicated/local input retains the historical host diagonal.  Any other
     matrix-axis partition refuses instead of causing an implicit all-gather.
     """
@@ -679,13 +676,13 @@ def static_sigma_diag_to_host(sigma_knn, mesh_xy: Mesh) -> np.ndarray:
                 jnp.expand_dims(arr, axis=0),
                 NamedSharding(mesh_xy, P(None, None, "x", "y")))
             return np.asarray(gather_to_host(
-                extract_sigma_diag_replicated(arr4, mesh_xy)))[0]
+                _extract_diag_sharded_kernel(mesh_xy)(arr4)))[0]
     host = np.asarray(gather_to_host(arr))
     return np.diagonal(host, axis1=1, axis2=2).copy()
 
 
 # ---------------------------------------------------------------------------
-# QSGW Σ_xc build — sharded ω-tensor + replicated E_kn → selected layout
+# QSGW Σ_xc build — the sharded on-shell pair → selected layout
 # ---------------------------------------------------------------------------
 
 # Kernel cache: one jit'd QSGW-build kernel per mesh (the index/weight
@@ -749,63 +746,15 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
     return fn
 
 
-def build_qsgw_sigma_xc(
-    sigma_c_omega_ry: jax.Array,
-    sigma_x_kij_ry: jax.Array,
-    omega_ev: np.ndarray,
-    e_qp_kn_ev: np.ndarray,
-    mesh_xy: Mesh,
-    *,
-    replicated_output: bool = True,
-    band_axis=None,
-    out_of_grid: str = "cover",
-) -> tuple[jax.Array, dict[str, float]]:
-    """Build the static Hermitian QSGW Σ_xc[k, m, n].
+def _build_qsgw_sigma_xc_grid(sigma_c_omega_ry, sigma_x_kij_ry, omega, E, mesh_xy, *,
+                              replicated_output, band_axis, out_of_grid):
+    """:func:`build_qsgw_sigma_xc` of an omega-grid Sigma (``sigma_omega_grid_debug``).
 
-    Implements the standard QSGW ansatz
-
-        Σ_xc^QSGW_ij(k) = ½[ Σ_xc_ij(k, E_i(k)) + Σ_xc_ij(k, E_j(k)) ]ʰ
-
-    where ``[·]ʰ`` denotes the Hermitian part (real-symmetrisation against
-    interpolation noise).  Σ_xc = Σ_c + Σ_x; Σ_x is ω-independent so it
-    is added once after the Σ_c(ω) interpolation.
-
-    Energy domain
-    -------------
-    ``omega_ev`` and ``e_qp_kn_ev`` must share a common reference (typically
-    Fermi-relative — ω-grid is centered on E_F by construction in
-    ``ppm_pipeline``, and ``E_qp - E_F`` is what the diagonal fixed point
-    produces after applying the scissor).
-
-    Sharding
-    --------
-    - ``sigma_c_omega_ry`` is consumed in place at its native sharding
-      ``P(None, None, 'x', 'y')``; the per-shard ``take_along_axis``
-      gather is local because the ω-axis (over which we interp) is fully
-      replicated and ``e_qp_kn_ev`` is broadcast to all shards.
-    - The intermediate ``A``, ``B`` arrays inherit ``P(None, 'x', 'y')``
-      sharding for ``(k, m, n)``.
-    - The final result is replicated by default, preserving the historical
-      caller contract.  ``replicated_output=False`` returns
-      ``P(None,'x','y')`` and performs the Hermitian transpose collectively;
-      the fixed-Sigma evSC loop uses that layout so a large QP Hamiltonian is
-      never gathered merely to feed a distributed eigensolver.
-
-    Returns
-    -------
-    sigma_xc_qsgw_kij_ry : jax.Array, (nk, nb, nb), complex128, replicated
-        unless ``replicated_output=False``, then two-axis band sharded.
-    diagnostics : dict with ``n_clipped`` (count of ``E_kn`` outside
-        ``[ω_min, ω_max]``, read per ``out_of_grid`` through
-        :func:`sigma_eval_omega`) and ``omega_min/max_ev``.
+    ``sigma_c_omega_ry`` is the ``(nω, nk, nb, nb)`` cube on the E_F-relative
+    grid ``omega`` (eV); A[k, m, n] = Σ_c(E_m(k)) and B[k, m, n] = Σ_c(E_n(k))
+    are interpolated linearly along ω (:func:`_qsgw_build_kernel`), with the
+    same out-of-grid read rule (:func:`sigma_eval_omega`).
     """
-    omega = np.asarray(omega_ev, dtype=np.float64)
-    E = np.asarray(e_qp_kn_ev, dtype=np.float64)
-    if hasattr(sigma_c_omega_ry, "request"):
-        return _build_qsgw_sigma_xc_on_shell(
-            sigma_c_omega_ry, sigma_x_kij_ry, omega, E, mesh_xy,
-            replicated_output=replicated_output, band_axis=band_axis,
-            out_of_grid=out_of_grid)
     if sigma_c_omega_ry.ndim != 4:
         raise ValueError(
             f"sigma_c_omega_ry must have shape (nω, nk, nb, nb); "
@@ -934,25 +883,59 @@ def _qsgw_on_shell_kernel(mesh_xy: Mesh, replicated_output: bool):
     return _kernel
 
 
-def _build_qsgw_sigma_xc_on_shell(sigma, sigma_x_kij_ry, omega, E, mesh_xy, *,
-                                  replicated_output, band_axis, out_of_grid):
-    """:func:`build_qsgw_sigma_xc` of an on-shell Sigma (``ppm_sigma.OnShellSigma``).
+def build_qsgw_sigma_xc(
+    sigma_c,
+    sigma_x_kij_ry: jax.Array,
+    omega_ev: np.ndarray,
+    e_qp_kn_ev: np.ndarray,
+    mesh_xy: Mesh,
+    *,
+    replicated_output: bool = True,
+    band_axis=None,
+    out_of_grid: str = "cover",
+) -> tuple[jax.Array, dict[str, float]]:
+    """Build the static Hermitian QSGW Σ_xc[k, m, n] from an on-shell Sigma
+    (or, ``sigma_omega_grid_debug``, from the Σ_c(ω) cube: :func:`_build_qsgw_sigma_xc_grid`).
 
-    Same ansatz, same out-of-grid rule, no interpolation: the pair holds
-    Sigma_mn at the read energies :func:`sigma_eval_omega` gives, which is
-    checked (``GATE on_shell_reads``) rather than assumed.
+    Implements the standard QSGW ansatz
+
+        Σ_xc^QSGW_ij(k) = ½[ Σ_xc_ij(k, E_i(k)) + Σ_xc_ij(k, E_j(k)) ]ʰ
+
+    where ``[·]ʰ`` denotes the Hermitian part.  Σ_xc = Σ_c + Σ_x; Σ_x is
+    ω-independent so it is added once.  ``sigma_c`` is a
+    ``ppm_sigma.OnShellSigma``: its pair holds Σ_mn at the read energies
+    :func:`sigma_eval_omega` gives for ``e_qp_kn_ev`` on the sampled range
+    ``omega_ev`` (both E_F-relative) under ``out_of_grid``, which is checked
+    (``GATE on_shell_reads``) rather than assumed.  No interpolation.
+
+    The result is replicated by default; ``replicated_output=False`` returns
+    ``P(None,'x','y')`` and performs the Hermitian transpose collectively
+    (the fixed-Sigma consumers that feed a distributed eigensolver).
+
+    Returns ``(sigma_xc_qsgw_kij_ry, diagnostics)``; ``diagnostics`` has
+    ``n_clipped`` (count of ``E_kn`` outside ``[ω_min, ω_max]``) and
+    ``omega_min/max_ev``.
     """
-    if sigma.pair is None:
+    omega = np.asarray(omega_ev, dtype=np.float64)
+    E = np.asarray(e_qp_kn_ev, dtype=np.float64)
+    from .ppm_sigma import is_on_shell
+    if not is_on_shell(sigma_c):
+        return _build_qsgw_sigma_xc_grid(
+            sigma_c, sigma_x_kij_ry, omega, E, mesh_xy,
+            replicated_output=replicated_output, band_axis=band_axis,
+            out_of_grid=out_of_grid)
+    if sigma_c.pair is None:
         raise ValueError("build_qsgw_sigma_xc: a diagonal-only on-shell Sigma has no pair")
     read, inside = sigma_eval_omega(omega, E, out_of_grid)
-    check_on_shell_reads(sigma.request.table_ev("pair"), read, what="QSGW pair")
+    check_on_shell_reads(sigma_c.request.table_ev("pair"), read, what="QSGW pair")
     n_clipped = int(np.count_nonzero(~inside))
     if band_axis is not None:
         from runtime.padding import authenticate_axis, pad_square
-        authenticate_axis(sigma.pair, band_axis, axis=-1, where="QSGW on-shell Sigma_c")
+        authenticate_axis(sigma_c.pair, band_axis, axis=-1, where="QSGW on-shell Sigma_c")
         sigma_x_kij_ry = pad_square(sigma_x_kij_ry, band_axis)
-    out = _qsgw_on_shell_kernel(mesh_xy, bool(replicated_output))(sigma.pair, sigma_x_kij_ry)
-    out.block_until_ready()
+    out = _qsgw_on_shell_kernel(mesh_xy, bool(replicated_output))(sigma_c.pair, sigma_x_kij_ry)
+    from common.timing import stage_wait
+    stage_wait(out)   # a timing-only wait (LORRAX_STAGE_SYNC)
     if band_axis is not None and replicated_output:
         from runtime.padding import strip_axis
         out = strip_axis(strip_axis(out, band_axis, axis=-2), band_axis, axis=-1)
@@ -1153,6 +1136,7 @@ def remove_managed(dir_path, pattern, *, keep=(), barrier_tag, print_fn=print):
 
 __all__ = [
     "build_qsgw_sigma_xc",
+    "check_on_shell_reads",
     "extract_sigma_diag_replicated",
     "static_sigma_diag_to_host",
     "interp_along_omega",

@@ -1388,8 +1388,9 @@ def _sigma_window_table(accumulator, synthesis, plan, capacity):
 
     Rows follow the plan (the sweep's one pass).  Fields: the coefficient
     inputs of :meth:`DeviceOmegaAccumulator.window_table` (nodes padded to
-    ``capacity``, frequencies on the full axis, sign, prefactor, reference
-    sum) and the window operands -- the active pole count, the band mask
+    ``capacity``, the states the window's frequencies own (on the grid, its
+    frequencies on the full axis), sign, prefactor, reference sum) and the
+    window operands -- the active pole count, the band mask
     (flattened, padded to the widest branch), the two reference energies and
     the synthesis's pole intervals (``WSynthesis.window_intervals``).
     """
@@ -1407,11 +1408,7 @@ def _sigma_window_table(accumulator, synthesis, plan, capacity):
                     omega_indices=row.omega_idx, omega_values=row.omega_abs,
                     omega_sign=row.window.omega_sign, prefactor=row.window.prefactor,
                     e_ref_sum=row.window.E_ref_A + row.window.E_ref_B) for row in plan]
-    table = accumulator.window_table(windows, capacity=capacity, extras=extras)
-    # On shell the window's coefficient is its ownership pack, placed with the table.
-    table.on_shell = (accumulator.on_shell_coefficients(windows, capacity=capacity)
-                      if accumulator.on_shell else None)
-    return table
+    return accumulator.window_table(windows, capacity=capacity, extras=extras)
 
 
 @lru_cache(maxsize=None)
@@ -1433,7 +1430,7 @@ def _integrate_sigma_batches(
     batches,
     n_poles,
     plan,
-    omega_grid_ry,
+    request,
     meta,
     mesh_xy,
     *,
@@ -1445,7 +1442,7 @@ def _integrate_sigma_batches(
     tau_kernel_factory=None,
     q_wedge=None,
     tau_capacity=None,
-    on_shell_request=None,
+    omega_grid_ry=None,
     keep_branches=False,
     print_fn,
 ):
@@ -1463,11 +1460,12 @@ def _integrate_sigma_batches(
     wedge's unfold tables (mathdx mode 9), whose device tables ride the
     residue argument.
 
-    ``on_shell_request`` (``gw.ppm_sigma.OnShellRequest``): fold only the on-shell
-    pair and diagonal slots (``gw.ppm_accumulators``); ``omega_grid_ry`` is
-    then the request's frequency list, which the windows were planned on.
-    The result is an ``OnShellSigma`` (no brackets) or an on-shell
-    ``BandCountCube``.
+    ``request`` (``gw.ppm_sigma.OnShellRequest``): the sweep folds the on-shell
+    pair and diagonal slots (``gw.ppm_accumulators``) at its energies; its
+    frequency list is the one the windows were planned on.  The result is an
+    ``OnShellSigma`` (no brackets) or a ``BandCountCube``.  ``request`` None
+    (``sigma_omega_grid_debug``) folds Sigma_c onto ``omega_grid_ry``: the
+    result is the ``(n_omega, nk, nb, nb)`` cube or a grid ``BandCountCube``.
 
     ``keep_branches``: keep the causal branch axis.  Every planned window
     belongs to one branch (``row.space``: ``"cond"``, the particle branch of
@@ -1486,9 +1484,6 @@ def _integrate_sigma_batches(
     fence = _band_fence if synthesis else _unfenced
     fence('tau.setup', sync_ranks=True)
     with timing.section('tau.setup'):
-        omega = np.asarray(omega_grid_ry, np.float64)
-        if omega.ndim != 1 or not omega.size:
-            raise ValueError("omega_grid_ry must be a nonempty vector")
         s = wfns.slices
         sigma_axis = sigma_band_axis(
             int(s.nb_sigma), mesh_xy, ansatz="dynamic")
@@ -1518,41 +1513,38 @@ def _integrate_sigma_batches(
         spatial_shape = (
             int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
         face_kwargs["face_band_extent"] = sigma_axis.carrier
-        shape = (omega.size, *spatial_shape)
         output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
-        reduce = None
-        if bracketed:
-            # The sweep folds only what the band counts keep: the matrix of
-            # the first and the last count and the diagonals between.
-            reduce = _band_count_reduce(mesh_xy, len(brackets))
-            n_between = max(len(brackets) - 2, 0)
-            shape = ((shape,) * (len(brackets) - n_between),
-                     ((omega.size, spatial_shape[0], sigma_axis.carrier,
-                       int(mesh_xy.shape["y"])),) * n_between)
-        tables = None
-        if on_shell_request is not None:
-            if not np.array_equal(omega, np.asarray(on_shell_request.frequencies_ry, np.float64)):
-                raise ValueError("on-shell Sigma: the windows were planned on a frequency "
-                                 "list other than the request's")
-            tables = _on_shell_parent_tables(on_shell_request, k_unfold_plan, sigma_axis, mesh_xy)
-            n_counts = len(brackets) if bracketed else 1
-            reduce = _on_shell_reduce(mesh_xy, len(brackets) if bracketed else None)
-            shape = (((2, *spatial_shape),) * (2 if n_counts > 1 else 1),
-                     ((tables.n_slot, spatial_shape[0], sigma_axis.carrier,
-                       int(mesh_xy.shape["y"])),) * n_counts)
-        accumulators = None
-        if keep_branches:
-            # One total per causal branch, both always present (a branch with no
-            # window finalizes to zeros); the window table, its on-shell packs
-            # and the window counter read no total, so any one serves them.
-            accumulators = {space: DeviceOmegaAccumulator(
-                omega, shape=shape, sharding=output_sharding, omega_axis=0,
-                reduce=reduce, on_shell=tables) for space in BRANCH_SPACES}
-            accumulator = accumulators[BRANCH_SPACES[0]]
+        if request is None:
+            omega = np.asarray(omega_grid_ry, np.float64)
+            if omega.ndim != 1 or not omega.size:
+                raise ValueError("omega_grid_ry must be a nonempty vector")
+
+            def new_accumulator():
+                return _grid_accumulator(omega, spatial_shape, output_sharding,
+                                         brackets if bracketed else None,
+                                         sigma_axis, mesh_xy)
         else:
-            accumulator = DeviceOmegaAccumulator(
-                omega, shape=shape, sharding=output_sharding, omega_axis=0,
-                reduce=reduce, on_shell=tables)
+            if request.parent_ry.shape[1] != int(k_unfold_plan.n_parent):
+                raise ValueError(f"on-shell Sigma: the request holds {request.parent_ry.shape[1]} "
+                                 f"parent k rows, the k plan {k_unfold_plan.n_parent}")
+            n_counts = len(brackets) if bracketed else 1
+
+            def new_accumulator():
+                return DeviceOmegaAccumulator(
+                    request, carrier=sigma_axis.carrier, sharding=output_sharding,
+                    reduce=_on_shell_reduce(mesh_xy, len(brackets) if bracketed else None),
+                    shape=(((2, *spatial_shape),) * (2 if n_counts > 1 else 1),
+                           ((request.n_slot, spatial_shape[0], sigma_axis.carrier,
+                             int(mesh_xy.shape["y"])),) * n_counts))
+        # keep_branches: one total per causal branch, both always present (a
+        # branch with no window finalizes to zeros).  The window table, the
+        # window counter and the parent tables read no total and are the same
+        # for every accumulator of this call, so the first one serves them.
+        accumulators = ({space: new_accumulator() for space in BRANCH_SPACES}
+                        if keep_branches else None)
+        accumulator = (new_accumulator() if accumulators is None
+                       else accumulators[BRANCH_SPACES[0]])
+
         kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
         if tau_kernel_factory is not None:
@@ -1613,6 +1605,9 @@ def _integrate_sigma_batches(
             # call; a window reads its row on device behind the counter.
             window_table = _sigma_window_table(accumulator, w_synthesis, plan, tau_capacity)
             counter = accumulator.window_counter()
+            if request is not None:
+                print_fn(f"  Sigma window table: {len(window_table.nodes)} windows, "
+                         f"{window_table.nbytes / 2**20:.2f} MiB per device")
 
         n_sweeps = n_tau = 0
         batch_size = int(pole_batch_size)
@@ -1678,8 +1673,6 @@ def _integrate_sigma_batches(
                     t_pad, coeff, n_active, operands, counter = accumulator.window_pick(
                         window_table, counter)
                     n_nodes = window_table.nodes[window_index]
-                    if window_table.on_shell is not None:
-                        coeff = window_table.on_shell[window_index]
                     window_index += 1
                     active_count = operands["active"]
                     selector = _window_selector(np.shape(win.mask_A), weight is not None)(
@@ -1741,8 +1734,7 @@ def _integrate_sigma_batches(
                         overlap=window_options["overlap"], compile_only=True)
                 return target.integrate_window(
                     row_kernel, tau_arguments, win.nodes.t,
-                    win.nodes.alpha, n_active=len(win.nodes.t),
-                    compile_only=True, **window_options)
+                    win.nodes.alpha, compile_only=True, **window_options)
             if not sweep_started:
                 fence('tau.initial_compile_and_probe', sync_ranks=True)
                 with timing.section('tau.initial_compile_and_probe'):
@@ -1791,8 +1783,7 @@ def _integrate_sigma_batches(
                         jax.device_get(win.nodes.alpha), np.complex128)
                 # One executable per window: the node loop runs on device.
                 total = target.integrate_window(
-                    row_kernel, tau_arguments, t_nodes, alpha_nodes,
-                    n_active=len(t_nodes), **window_options)
+                    row_kernel, tau_arguments, t_nodes, alpha_nodes, **window_options)
                 n_nodes = len(t_nodes)
             for _ in range(n_nodes):
                 progress.step(wait=total)
@@ -1804,32 +1795,23 @@ def _integrate_sigma_batches(
 
     fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
-        def finish(sigma):
-            """One total (the accumulator's fold) -> the result's Sigma object."""
-            if bracketed or on_shell_request is not None:
-                # The counts stay on the wedge; each is unfolded when it is read.
-                matrices, diagonals = sigma
-                sym = k_unfold_plan.sym
-                full = _wedge_is_full_bz(sym)
-                unfold = ((lambda value: value) if full else
-                          _on_shell_unfold_fn(sym, output_sharding) if on_shell_request is not None
-                          else _unfold_sigma_cube_fn(sym, 1, output_sharding))
-                sigma = BandCountCube(
-                    matrices=list(matrices),
-                    diagonals=[] if on_shell_request is not None else list(diagonals),
-                    unfold=unfold,
-                    unfold_rows=((lambda slots: slots) if full else
-                                 _band_count_rows_fn(sym, mesh_xy)),
-                    nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy,
-                    on_shell=on_shell_request,
-                    slot_diagonals=list(diagonals) if on_shell_request is not None else [])
-                if not bracketed:
-                    # One count: the on-shell Sigma itself.
-                    sigma = sigma.point(0)
-            else:
-                sigma = _unfold_sigma_cube(
-                    sigma, k_unfold_plan.sym, k_axis=1, sharding=output_sharding)
-            return sigma
+        def finish(total):
+            """One accumulator's fold -> the result's Sigma object."""
+            if request is None:
+                return _grid_finalize(total, k_unfold_plan.sym, bracketed,
+                                      output_sharding, mesh_xy)
+            # The counts stay on the wedge; each is unfolded when it is read.
+            matrices, diagonals = total
+            sym = k_unfold_plan.sym
+            full = _wedge_is_full_bz(sym)
+            sigma = BandCountCube(
+                matrices=list(matrices), slot_diagonals=list(diagonals),
+                unfold=(lambda value: value) if full else _on_shell_unfold_fn(sym, output_sharding),
+                unfold_rows=((lambda slots: slots) if full else
+                             _band_count_rows_fn(sym, mesh_xy)),
+                nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=request)
+            # One count: the on-shell Sigma itself.
+            return sigma if bracketed else sigma.point(0)
 
         branches = None
         if accumulators is None:
@@ -1837,6 +1819,7 @@ def _integrate_sigma_batches(
         else:
             branches = {space: finish(acc.finalize()) for space, acc in accumulators.items()}
             sigma = sum_sigma_branches(branches)
+
         if bracketed:
             if band_counts is None:
                 band_counts = tuple(
@@ -1863,12 +1846,13 @@ def _integrate_sigma_batches(
                 f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
                 f"max|D|/max|B|={ratio:.12e}")
         return SigmaOmegaResult(
-            omega_ry=omega,
-            omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
             sigma_c_kij=sigma,
             band_axis=sigma_axis,
             band_counts=(() if band_counts is None else tuple(band_counts)),
             odd_even_residue_ratio=ratio,
+            omega_ry=None if request is not None else omega,
+            omega_ev=(None if request is not None else
+                      np.asarray(omega * RYD_TO_EV, np.float64)),
             branches=branches)
 
 
@@ -1890,6 +1874,41 @@ def sum_sigma_branches(branches: dict):
         value = branches[space]
         out = value if out is None else out + value
     return out
+
+
+def _grid_accumulator(omega, spatial_shape, output_sharding, brackets, sigma_axis, mesh_xy):
+    """The omega-grid accumulator (``sigma_omega_grid_debug``) of one Sigma sweep.
+
+    Unbracketed it folds the ``(n_omega, n_parent, nb, nb)`` cube; bracketed,
+    only what the band counts keep: the matrix of the first and the last
+    count and the diagonals between (:func:`_band_count_reduce`).
+    """
+    shape = (omega.size, *spatial_shape)
+    reduce = None
+    if brackets is not None:
+        reduce = _band_count_reduce(mesh_xy, len(brackets))
+        n_between = max(len(brackets) - 2, 0)
+        shape = ((shape,) * (len(brackets) - n_between),
+                 ((omega.size, spatial_shape[0], sigma_axis.carrier,
+                   int(mesh_xy.shape["y"])),) * n_between)
+    return DeviceOmegaAccumulator.grid(
+        omega, shape=shape, sharding=output_sharding, omega_axis=0, reduce=reduce)
+
+
+def _grid_finalize(sigma, sym, bracketed, output_sharding, mesh_xy):
+    """The grid sweep's result: the full-BZ cube, or the counts kept on the wedge."""
+    if not bracketed:
+        return _unfold_sigma_cube(sigma, sym, k_axis=1, sharding=output_sharding)
+    # The counts stay on the wedge; each is unfolded when it is read.
+    matrices, diagonals = sigma
+    full = _wedge_is_full_bz(sym)
+    return BandCountCube(
+        matrices=list(matrices), slot_diagonals=[], diagonals=list(diagonals),
+        unfold=((lambda value: value) if full else
+                _unfold_sigma_cube_fn(sym, 1, output_sharding)),
+        unfold_rows=((lambda slots: slots) if full else
+                     _band_count_rows_fn(sym, mesh_xy)),
+        nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=None)
 
 
 def _unfold_sigma_cube(sigma, sym, *, k_axis, sharding):
@@ -1974,11 +1993,7 @@ def _on_shell_reduce(mesh_xy, n_brackets):
     slots the extrapolation combines.
     """
     from gw.ppm_sigma import band_diagonal_slots
-    if int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
-        raise ValueError(
-            "GATE on_shell_square_mesh: the on-shell Sigma keeps band diagonals in "
-            "place, which needs a square processor mesh; run sigma_omega_grid_debug "
-            "on this mesh")
+    # A square mesh is resolve_mesh's invariant (band_diagonal_slots checks it).
     diag_slots = band_diagonal_slots(mesh_xy, 3)
 
     def reduce(sigma):
@@ -2005,7 +2020,9 @@ def _on_shell_unfold_fn(sym, sharding):
     carries the frequency of the ROW state and slot 1 that of the COLUMN
     state, and a transpose exchanges them, so there
     ``pair[0](k') = pair[1](k)^T``: an antiunitary row reads the slot-swapped
-    pair.  A diagonal is unchanged (``_band_count_rows_fn``).
+    pair.  The base transport acts on each slot alone, so the swapped pair's
+    transport is the transported pair swapped: one unfold.  A diagonal is
+    unchanged (``_band_count_rows_fn``).
     """
     from symmetry_maps import star_tables_of
     base = _unfold_sigma_cube_fn(sym, 1, sharding)
@@ -2016,37 +2033,9 @@ def _on_shell_unfold_fn(sym, sharding):
     anti = jnp.asarray(anti)
 
     def unfold(pair):
-        return jnp.where(anti[None, :, None, None], base(pair[::-1]), base(pair))
+        out = base(pair)
+        return jnp.where(anti[None, :, None, None], out[::-1], out)
     return jax.jit(unfold, out_shardings=sharding)
-
-
-def _on_shell_parent_tables(request, k_unfold_plan, sigma_axis, mesh_xy):
-    """The request's tables on the parent k rows and the padded band carrier.
-
-    ``GATE on_shell_star_invariant``: the per-state energies must be the same
-    at every k of a star, since the wedge Sigma is evaluated at its parent's
-    energies and transported to the star.  A QP spectrum is (the SC loop's
-    states are symmetric); a violation would put one star partner's Sigma at
-    another's energy.
-    """
-    from gw.ppm_accumulators import OnShellTables
-    full = np.asarray(request.tables_ry, np.float64)
-    parent = np.asarray(k_unfold_plan.parent_rows(full, axis=1))
-    irr = np.asarray(k_unfold_plan.irr_idx)
-    drift = float(np.max(np.abs(parent[:, irr] - full), initial=0.0))
-    if drift > 1.0e-9:
-        raise ValueError(
-            f"GATE on_shell_star_invariant: the on-shell energies differ by {drift:.3e} Ry "
-            "between k points of one star")
-    index = np.asarray(k_unfold_plan.parent_rows(np.asarray(request.index), axis=1))
-    pad = int(sigma_axis.carrier) - int(parent.shape[-1])
-    if pad < 0:
-        raise ValueError(f"on-shell tables carry {parent.shape[-1]} bands, the Sigma "
-                         f"carrier {sigma_axis.carrier}")
-    parent = np.pad(parent, ((0, 0), (0, 0), (0, pad)))
-    index = np.pad(index.astype(np.int32), ((0, 0), (0, 0), (0, pad)), constant_values=-1)
-    omega = device_put_process_local(parent, NamedSharding(mesh_xy, P()))
-    return OnShellTables(omega=omega, index=index, omega_host=parent)
 
 
 def _attach_ordered_odd_sigma(total, even):
@@ -2164,7 +2153,7 @@ def integrate_sigma_store(
     fit_src,
     n_poles,
     plan,
-    omega_grid_ry,
+    request,
     meta,
     mesh_xy,
     *,
@@ -2174,7 +2163,7 @@ def integrate_sigma_store(
     odd_residue_off=False,
     tau_capacity=None,
     tau_kernel_factory=None,
-    on_shell_request=None,
+    omega_grid_ry=None,
     keep_branches=False,
     print_fn=print,
 ):
@@ -2190,10 +2179,10 @@ def integrate_sigma_store(
 
     ``brackets`` optionally partitions the intermediate-state band sum into
     disjoint slices.  The spatial kernel then returns a leading bracket axis;
-    this executor folds the cumulative first and last counts and the
-    diagonals between (``_band_count_reduce``) on the FILE wedge and returns
-    a ``BandCountCube``, which unfolds one count at a time.  ``None``
-    preserves the ordinary MPA rank-4 result.
+    this executor folds the cumulative first and last pairs and every count's
+    diagonal slots (``_on_shell_reduce``) on the FILE wedge and returns a
+    ``BandCountCube``, which unfolds one count at a time.  ``None`` returns
+    the ``OnShellSigma`` itself.
 
     ``tau_kernel_factory`` replaces the resident pole route's τ body (the
     plane-wave path's ``get_shared_sigma_tau_kernel(_sigma_kij=...)``); see
@@ -2215,11 +2204,11 @@ def integrate_sigma_store(
 
     def run(reader):
         return _integrate_sigma_batches(
-            wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
+            wfns, batches(reader), int(n_poles), plan, request, meta,
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
             q_wedge=q_wedge, tau_capacity=tau_capacity,
-            tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
+            tau_kernel_factory=tau_kernel_factory, omega_grid_ry=omega_grid_ry,
             keep_branches=keep_branches, print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
@@ -2286,7 +2275,8 @@ def compute_sigma_c_mpa_omega_grid(
     meta,
     mesh_xy,
     *,
-    omega_grid_ry,
+    request=None,
+    omega_grid_ry=None,
     efermi_ry,
     regularization_width_ry,
     edge_factor=1.5,
@@ -2311,7 +2301,6 @@ def compute_sigma_c_mpa_omega_grid(
     omega_group=None,
     group_fixed=None,
     linalg=None,
-    on_shell_request=None,
     keep_branches=False,
     print_fn=print,
 ):
@@ -2321,10 +2310,10 @@ def compute_sigma_c_mpa_omega_grid(
     per-frequency broadening and window labels (``sigma_box_plan.plan_sigma_windows``).
     ``linalg``: the deck's resolved dense layout, which places a shared-pole
     model's W(τ) synthesis (:func:`_shared_pole_memory_schedule`).
-    ``on_shell_request`` (``gw.ppm_sigma.OnShellRequest``): evaluate Sigma_c on shell
-    only; ``omega_grid_ry`` must then be the request's ``frequencies_ry``
-    (the planner's frequency list, on which ``omega_eta_ry``/``omega_group``
-    are labelled).  None is the grid (``sigma_omega_grid_debug``).
+    ``request`` (``gw.ppm_sigma.OnShellRequest``): where Sigma_c is evaluated;
+    the windows are planned on its ``frequencies_ry`` (on which
+    ``omega_eta_ry``/``omega_group`` are labelled).  ``omega_grid_ry`` in its
+    place (``sigma_omega_grid_debug``) evaluates Sigma_c on that grid.
 
     ``occupation_state`` (duck-typed ``gw.efermi.OccupationState``): None is
     the incumbent insulating semantics, bit-exact.  With a state, the causal
@@ -2358,10 +2347,14 @@ def compute_sigma_c_mpa_omega_grid(
     """
     if sigma_w_model not in ("mpa", "shared_pole"):
         raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
-    if on_shell_request is not None and not np.array_equal(
-            np.asarray(omega_grid_ry, np.float64), on_shell_request.frequencies_ry):
-        raise ValueError("compute_sigma_c_mpa_omega_grid: an on-shell call plans its windows "
-                         "on the request's frequency list (omega_grid_ry)")
+    if (request is None) == (omega_grid_ry is None):
+        raise ValueError("compute_sigma_c_mpa_omega_grid: pass request (on shell) or "
+                         "omega_grid_ry (the grid), not both")
+    # The grid sweep folds onto omega_grid_ry; on shell the windows are
+    # planned on the request's frequencies.
+    grid_ry = omega_grid_ry if request is None else None
+    if request is not None:
+        omega_grid_ry = request.frequencies_ry
     shared_pole = sigma_w_model == "shared_pole"
     if shared_pole and tau_kernel_factory is not None:
         raise ValueError(
@@ -2591,12 +2584,12 @@ def compute_sigma_c_mpa_omega_grid(
                 try:
                     total = _integrate_sigma_batches(
                         wfns, ((0, None, None, None),), n_poles, plan,
-                        omega_grid_ry, meta, mesh_xy, pole_batch_size=n_poles,
+                        request, meta, mesh_xy, pole_batch_size=n_poles,
                         brackets=band_brackets, band_counts=band_counts,
                         w_synthesis=synthesis,
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
-                        tau_capacity=geometry.get("sc_tau_capacity"), on_shell_request=on_shell_request,
+                        tau_capacity=geometry.get("sc_tau_capacity"), omega_grid_ry=grid_ry,
                         keep_branches=keep_branches, print_fn=print_fn)
                 except BaseException:
                     if owned:
@@ -2607,11 +2600,11 @@ def compute_sigma_c_mpa_omega_grid(
                 del synthesis
             else:
                 total = integrate_sigma_store(
-                    wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+                    wfns, reader, n_poles, plan, request, meta, mesh_xy,
                     pole_batch_size=pole_batch_size, brackets=band_brackets,
                     band_counts=band_counts,
                     tau_capacity=geometry.get("sc_tau_capacity"),
-                    tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
+                    tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
                     keep_branches=keep_branches, print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
@@ -2624,10 +2617,10 @@ def compute_sigma_c_mpa_omega_grid(
         # A debug-off arm deliberately emits a zero twin, letting the public
         # sigC_odd column check its own A/B.
         even = integrate_sigma_store(
-            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+            wfns, reader, n_poles, plan, request, meta, mesh_xy,
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=True,
-            tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
+            tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
             print_fn=lambda *args, **kwargs: None)
         return _attach_ordered_odd_sigma(total, even)
 

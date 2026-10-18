@@ -2706,9 +2706,10 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
 
 	``k_axis`` names WHICH axis of the stored dataset is the k axis, and
 	it exists because ``sigma_mnk.h5``'s dynamic cubes are
-	``(n_omega, nk, nb, nb)`` — axis 0 there is frequency, and a check
-	that read ``shape[0]`` would compare the star count against the
-	frequency count and refuse every correctly-written cube.  It defaults
+	``(2, nk, nb, nb)`` — axis 0 there is the on-shell pair slot (on the
+	omega grid, frequency), and a check that read ``shape[0]`` would compare
+	the star count against the slot count and refuse every correctly-written
+	cube.  It defaults
 	to 0, which is every ``kin_ion.h5`` array, so no existing caller
 	changes.  ONE implementation of the stamp contract for both files was
 	the point: a second copy in ``sigma_output`` would be a second place

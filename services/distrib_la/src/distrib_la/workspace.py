@@ -82,7 +82,10 @@ def _workspace_details(plan, op, shapes, dtype):
     if mesh_platform(plan.mesh) != 'CUDA':
         return _XLA_MANAGED
     px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
-    local = isinstance(plan, Plan) and (plan.is_native or (
+    # one_device (the size route) runs each matrix whole on one device with the native
+    # kernel: a local workspace, held_per_rank copies per round (the one-device formula).
+    one_device = isinstance(plan, Plan) and plan.backend == ONE_DEVICE
+    local = isinstance(plan, Plan) and (plan.is_native or one_device or (
         (op != 'eigh' or len(shapes[0]) == 3)
         and plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD))
     if op == 'eigh':
@@ -112,8 +115,16 @@ def _workspace_details(plan, op, shapes, dtype):
         # ceil(b/P) local rows, in one batched call; reserve one vendor
         # workspace/info per member rather than assume serial reuse.
         batch = int(shapes[0][0]) if local and len(shapes[0]) == 3 else 1
-        copies = (-(-batch // (px * py))
-                  if plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
+        if one_device:
+            from distrib_la._one_device import held_per_rank
+            from distrib_la import resolve as _resolve
+            bound = _resolve.one_device_max_n('eigh', _resolve.mesh_platform(plan.mesh),
+                                              plan.budget_bytes) or n
+            copies = held_per_rank(batch, n, px * py, _resolve.one_device_round_n(
+                'eigh', _resolve.mesh_platform(plan.mesh), bound))
+        else:
+            copies = (-(-batch // (px * py))
+                      if plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
         scratch = copies*(device + (4 if local else 0))
         checked = 0
         if not local:
@@ -136,7 +147,8 @@ def _workspace_details(plan, op, shapes, dtype):
                     local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes include aligned vendor workspace and a private operand tile; checked = CHECKED_EIGH_TILES n^2/P (+ 2 N^2/P at a padded solve side N, + GATHERED_EIGH_FACTOR n^2 when admitted)',
                     checked_device_bytes=checked,
                     copies=copies,
-                    provider='cusolverDn' if local else 'cusolverMp')
+                    provider=('cusolverDn (one_device)' if one_device else 'cusolverDn')
+                    if local else 'cusolverMp')
     if op not in ('gemm', 'matmul'):
         raise ValueError('workspace op must be eigh or gemm')
     if (len(shapes) != 2 or len(shapes[0]) not in (2, 3)
@@ -323,8 +335,10 @@ def eigh_stack_bytes(plan, shape, dtype) -> int:
     if plan.backend == ONE_DEVICE:
         # Whole matrices per rank, in the route's bounded rounds.
         from distrib_la._one_device import held_per_rank
-        from distrib_la.resolve import one_device_max_n
-        bound = one_device_max_n("eigh", mesh_platform(plan.mesh)) or n
-        return held_per_rank(nb, n, ranks, bound) * BATCH_EIGH_TILES * n * n * item
+        from distrib_la import resolve as _resolve
+        bound = _resolve.one_device_max_n("eigh", _resolve.mesh_platform(plan.mesh),
+                                          plan.budget_bytes) or n
+        return held_per_rank(nb, n, ranks, _resolve.one_device_round_n(
+            "eigh", _resolve.mesh_platform(plan.mesh), bound)) * BATCH_EIGH_TILES * n * n * item
     return (-(-nb * n * n * item // ranks) + nb * n * 8
             + workspace_bytes_per_rank(plan, 'eigh', ((n, n),), dtype))

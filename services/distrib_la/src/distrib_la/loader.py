@@ -74,7 +74,7 @@ __all__ = ["get_lib", "has_target", "probe_target", "loaded_lib_path",
 #: header whenever the monorepo is reachable and FAILS if the two disagree.
 #: That is the whole mechanism keeping a copy honest: a copy nothing compares
 #: is how the ten dispatch sites drifted.
-LORRAX_FFI_ABI_VERSION = 8
+LORRAX_FFI_ABI_VERSION = 9
 
 #: platform -> the C entry point reporting the library's ABI.  Per leg,
 #: because both libraries are dlopened RTLD_GLOBAL and already share sixteen
@@ -118,6 +118,10 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
     "lorrax_cublas_local_active_range_gemm_out": "CublasLocalActiveRangeGemmOutFfi",
     "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
+    # The active-range GEMM with DEVICE-side bounds (cpp/active_gemm/, leg-neutral, run-time
+    # compiled; DMMA f64 on compute capability >= 8.0): ACTIVE_LOCAL_ROUTE's "device" row.
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
     "lorrax_cusolvermp_eigh":             "EighMpFfi",
     "lorrax_cusolvermp_batched_potrf":    "CusolverMpBatchedPotrfFfi",
     "lorrax_cusolvermp_batched_potrs":    "CusolverMpBatchedPotrsFfi",
@@ -169,6 +173,13 @@ _ROCM_SLATE_LU_SYMBOLS: dict = {
 _ROCM_LOCAL_EIGH_SYMBOLS: dict = {
     "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
 }
+#: The one-device LU solve (cpp/rocsolver/lu_solve_ffi.cc: rocSOLVER getrf + a triangular solve
+#: blocked so that no rocBLAS operand spans 2^31 bytes), the target of local_lu.LOCAL_LU_ROUTE's
+#: ROCM row.  CUDA solves through jaxlib's cuSOLVER (exact at every n measured): ROCM only.
+_ROCM_LOCAL_LU_SYMBOLS: dict = {
+    "lorrax_rocsolver_lu_solve": "RocsolverLuSolveFfi",
+    "lorrax_rocsolver_tri_solve": "RocsolverTriSolveFfi",
+}
 #: The active-subspace family on this leg (cpp/active_subspace/active_devsize.cc: device-side
 #: sizes, no host read) -- the CUDA symbols less the one-communicator CGS2 handler (needs
 #: cuSolverMp's NCCL context) and the active-block eigh (the ROCM plan solves the capacity
@@ -181,16 +192,16 @@ _ROCM_ACTIVE_SUBSPACE_SYMBOLS: dict = {
 #: ROCM leg compiles the CUDA leg's source on rocBLAS (common/gpu_blas.h), so it exports
 #: the same three symbols (ACTIVE_LOCAL_ROUTE's "native" row on both legs).
 #: The active-range GEMM with device-side bounds (cpp/active_gemm/: leg-neutral, run-time
-#: compiled), ACTIVE_LOCAL_ROUTE's ROCM "device" row; the CUDA leg does not list it yet.
-_ROCM_ACTIVE_GEMM_SYMBOLS: dict = {
-    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
-    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
-}
+#: compiled) is built on both legs: ACTIVE_LOCAL_ROUTE's "device" row, in the CUDA table above.
+#: The ELPA eigh (cpp/elpa/eigh_ffi.cc over config/frontier/build_elpa_hip.sh's ELPA): the
+#: ROCM ``distributed`` eigh above the one-device bound (distrib_la.resolve).  ROCM only.
+_ROCM_ELPA_SYMBOLS: dict = {"lorrax_elpa_eigh": "ElpaEighFfi"}
 _ROCM_TARGET_SYMBOLS: dict = {**{t: s for t, s in _CUDA_TARGET_SYMBOLS.items()
-                                 if t.startswith(("lorrax_slate_", "lorrax_cublas_local_"))},
-                              **_ROCM_ACTIVE_GEMM_SYMBOLS,
+                                 if t.startswith(("lorrax_slate_", "lorrax_cublas_local_",
+                                                  "lorrax_active_gemm_"))},
                               **_ROCM_SLATE_LU_SYMBOLS, **_ROCM_LOCAL_EIGH_SYMBOLS,
-                              **_ROCM_ACTIVE_SUBSPACE_SYMBOLS}
+                              **_ROCM_LOCAL_LU_SYMBOLS,
+                              **_ROCM_ACTIVE_SUBSPACE_SYMBOLS, **_ROCM_ELPA_SYMBOLS}
 
 #: Leg key -> this loader's target table and not-found build command.
 _TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,
@@ -200,6 +211,19 @@ _BUILD_HINTS = {
     "ROCM": "bash config/frontier/build_slate_hip.sh && bash config/frontier/build_ffi_rocm.sh",
     "cpu": 'bash config/perlmutter/build_ffi_host.sh --fresh',
 }
+#: Per-target overrides of the leg's not-found build command.  A target whose handler needs a
+#: library the leg's command does not name gets that library's script first: ROCM's ELPA eigh
+#: (cpp/elpa/) is ELPA's (config/frontier/build_elpa_hip.sh), not SLATE's.  The SLATE targets
+#: and every other ROCM target keep the leg's command above; CUDA and cpu have no override.
+_TARGET_BUILD_HINTS = {
+    ("ROCM", t): "bash config/frontier/build_elpa_hip.sh && bash config/frontier/build_ffi_rocm.sh"
+    for t in _ROCM_ELPA_SYMBOLS
+}
+
+
+def target_build_hint(platform: str, target_name: Optional[str] = None) -> str:
+    """The rebuild command a missing ``target_name`` on ``platform`` names: its own, else the leg's."""
+    return _TARGET_BUILD_HINTS.get((platform, target_name), _BUILD_HINTS[platform])
 
 _PLATFORMS = {
     key: dict(so_name=leg.so_name, env=leg.so_env, build_subdir=leg.build_subdir,
@@ -661,7 +685,7 @@ def probe_target(target_name: str, platform: str):
         return ProbeResult(False, borrowed)
     if not hasattr(lib, sym):
         return missing_symbol(target_name, sym, _LIB_PATHS.get(platform, "?"),
-                              build_hint=spec["build_hint"])
+                              build_hint=target_build_hint(platform, target_name))
     return AVAILABLE
 
 
